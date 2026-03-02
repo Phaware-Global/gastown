@@ -19,6 +19,9 @@
 {"issue_id":"gt-6oio","label":"result:success"}
 {"issue_id":"gt-6oio","label":"rig:gastown"}
 {"issue_id":"gt-7w6cq","label":"desire-path"}
+{"issue_id":"gt-87s6","label":"plugin:rebuild-gt"}
+{"issue_id":"gt-87s6","label":"result:success"}
+{"issue_id":"gt-87s6","label":"rig:gastown"}
 {"issue_id":"gt-8ik","label":"reconciliation"}
 {"issue_id":"gt-8ik","label":"zfc"}
 {"issue_id":"gt-8l3w","label":"formula"}
@@ -53,7 +56,6 @@
 {"issue_id":"gt-gastown-polecat-coma","label":"gt:agent"}
 {"issue_id":"gt-gastown-polecat-dag","label":"gt:agent"}
 {"issue_id":"gt-gastown-polecat-dementus","label":"gt:agent"}
-{"issue_id":"gt-gastown-polecat-furiosa","label":"gt:agent"}
 {"issue_id":"gt-gastown-polecat-furiosa","label":"gt:agent"}
 {"issue_id":"gt-gastown-polecat-keeper","label":"gt:agent"}
 {"issue_id":"gt-gastown-polecat-nux","label":"gt:agent"}
@@ -127,7 +129,7 @@
 {"issue_id":"gt-tit8","label":"memory"}
 {"issue_id":"gt-tsut","label":"zfc-violation"}
 {"issue_id":"gt-utbjv","label":"worker-lifecycle"}
-{"issue_id":"gt-wisp-7dbhy","label":"gt:merge-request"}
+{"issue_id":"gt-wisp-4xbll","label":"gt:merge-request"}
 {"issue_id":"gt-witness-role","label":"migrated-to:hq-witness-role"}
 {"issue_id":"gt-wrdz","label":"cleanup"}
 {"issue_id":"gt-xpgh8","label":"desire-path"}
