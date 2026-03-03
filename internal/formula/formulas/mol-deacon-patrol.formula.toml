@@ -1147,12 +1147,18 @@ The idle counter was auto-incremented. Continue to next patrol cycle
 
 After await-signal returns (either by signal or timeout):
 1. Generate a brief summary of this patrol cycle's observations
-2. Close current patrol and start next cycle:
+2. Build a step audit: for each step in this formula, record whether you
+   executed it (OK) or skipped it (SKIP). This makes shortcutting visible
+   in the ledger. Format: comma-separated step_id:STATUS pairs.
+3. Close current patrol and start next cycle:
 ```bash
-gt patrol report --summary "<brief summary of patrol observations>"
+gt patrol report --summary "<brief summary>" \
+  --steps "heartbeat:OK,inbox-check:OK,orphan-process-cleanup:SKIP,..."
 ```
+The --steps flag is REQUIRED. List ALL 26 steps with their actual status.
+Steps you executed get OK, steps you skipped get SKIP.
 This closes the current patrol wisp and automatically creates a new one.
-3. Continue executing from the first step of the new patrol cycle
+4. Continue executing from the first step of the new patrol cycle
 
 **If context HIGH** (approaching limit):
 1. Write handoff mail with notable observations:
