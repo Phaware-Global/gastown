@@ -21,8 +21,60 @@ import (
 // validDBName matches safe database names (alphanumeric + underscore only).
 var validDBName = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 
-// DefaultDatabases returns the list of known production databases.
-var DefaultDatabases = []string{"hq", "beads", "gastown"}
+// DefaultDatabases is the static fallback list of known production databases.
+var DefaultDatabases = []string{"hq", "beads", "gt"}
+
+// testPollutionPrefixes are database name prefixes created by tests.
+var testPollutionPrefixes = []string{"testdb_", "beads_t", "beads_pt", "doctest_"}
+
+// DiscoverDatabases queries SHOW DATABASES on the Dolt server and returns
+// all production databases, filtering out system databases and test pollution.
+// Falls back to DefaultDatabases on any error.
+func DiscoverDatabases(host string, port int) []string {
+	dsn := fmt.Sprintf("root@tcp(%s:%d)/?parseTime=true&timeout=5s", host, port)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return DefaultDatabases
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	rows, err := db.QueryContext(ctx, "SHOW DATABASES")
+	if err != nil {
+		return DefaultDatabases
+	}
+	defer rows.Close()
+
+	var databases []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			continue
+		}
+		if name == "information_schema" || name == "mysql" {
+			continue
+		}
+		lower := strings.ToLower(name)
+		skip := false
+		for _, prefix := range testPollutionPrefixes {
+			if strings.HasPrefix(lower, prefix) {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+		databases = append(databases, name)
+	}
+
+	if len(databases) == 0 {
+		return DefaultDatabases
+	}
+	return databases
+}
 
 // ScanResult holds the results of scanning a database for reaper candidates.
 type ScanResult struct {

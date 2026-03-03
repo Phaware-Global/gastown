@@ -11,7 +11,7 @@ func TestValidateDBName(t *testing.T) {
 	}{
 		{"hq", false},
 		{"beads", false},
-		{"gastown", false},
+		{"gt", false},
 		{"test_db_123", false},
 		{"", true},
 		{"drop table", true},
