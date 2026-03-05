@@ -723,29 +723,6 @@ func NewExampleAgentRegistry() *AgentRegistry {
 	}
 }
 
-// HookInstallerFunc is the signature for agent-specific hook/settings installers.
-// settingsDir is the gastown-managed parent (used by agents with --settings flag).
-// workDir is the agent's working directory.
-// role is the Gas Town role (e.g., "polecat", "crew", "witness").
-// hooksDir and hooksFile come from the preset's HooksDir and HooksSettingsFile.
-type HookInstallerFunc func(settingsDir, workDir, role, hooksDir, hooksFile string) error
-
-// hookInstallers maps provider names to their hook installation functions.
-// Registration happens via RegisterHookInstaller, typically from agent package init() or runtime init().
-var hookInstallers = make(map[string]HookInstallerFunc)
-
-// RegisterHookInstaller registers a hook installation function for an agent provider.
-// This replaces the switch statement in runtime.EnsureSettingsForRole.
-func RegisterHookInstaller(provider string, fn HookInstallerFunc) {
-	hookInstallers[provider] = fn
-}
-
-// GetHookInstaller returns the registered hook installer for a provider.
-// Returns nil if no installer is registered.
-func GetHookInstaller(provider string) HookInstallerFunc {
-	return hookInstallers[provider]
-}
-
 // ResetRegistryForTesting clears all registry state.
 // This is intended for use in tests only to ensure test isolation.
 func ResetRegistryForTesting() {
@@ -765,7 +742,3 @@ func RegisterAgentForTesting(name string, info AgentPresetInfo) {
 	globalRegistry.Agents[name] = &info
 }
 
-// ResetHookInstallersForTesting clears all hook installer registrations.
-func ResetHookInstallersForTesting() {
-	hookInstallers = make(map[string]HookInstallerFunc)
-}
