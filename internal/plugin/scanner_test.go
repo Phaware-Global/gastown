@@ -3,6 +3,7 @@ package plugin
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -401,14 +402,24 @@ func TestParsePluginMD_GitHubSheriff(t *testing.T) {
 
 func TestParsePluginMD_SessionHygiene(t *testing.T) {
 	// Verify the actual session-hygiene plugin.md parses correctly.
-	content, err := os.ReadFile(filepath.Join("..", "..", "plugins", "session-hygiene", "plugin.md"))
+	pluginDir := filepath.Join("..", "..", "plugins", "session-hygiene")
+	content, err := os.ReadFile(filepath.Join(pluginDir, "plugin.md"))
 	if err != nil {
 		t.Skipf("session-hygiene plugin not found (expected in plugins/): %v", err)
 	}
 
-	plugin, err := parsePluginMD(content, "/test/session-hygiene", LocationRig, "gastown")
+	plugin, err := parsePluginMD(content, pluginDir, LocationRig, "gastown")
 	if err != nil {
 		t.Fatalf("parsePluginMD failed: %v", err)
+	}
+
+	// Verify run.sh detection (loadPlugin does this, not parsePluginMD)
+	runScriptPath := filepath.Join(pluginDir, "run.sh")
+	if info, statErr := os.Stat(runScriptPath); statErr == nil && !info.IsDir() {
+		plugin.HasRunScript = true
+	}
+	if !plugin.HasRunScript {
+		t.Error("expected HasRunScript=true for session-hygiene (has run.sh)")
 	}
 
 	if plugin.Name != "session-hygiene" {
@@ -507,5 +518,125 @@ version = 1
 	}
 	if plugins[0].Location != LocationRig {
 		t.Errorf("expected location 'rig', got %q", plugins[0].Location)
+	}
+}
+
+func TestLoadPlugin_DetectsRunScript(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "plugin-runsh-test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create plugin dir with plugin.md AND run.sh
+	pluginDir := filepath.Join(tmpDir, "plugins", "with-script")
+	if err := os.MkdirAll(pluginDir, 0755); err != nil {
+		t.Fatalf("failed to create plugin dir: %v", err)
+	}
+	pluginContent := []byte(`+++
+name = "with-script"
+description = "Plugin with run.sh"
+version = 1
++++
+
+# Instructions (should be ignored when run.sh exists)
+`)
+	if err := os.WriteFile(filepath.Join(pluginDir, "plugin.md"), pluginContent, 0644); err != nil {
+		t.Fatalf("failed to write plugin.md: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginDir, "run.sh"), []byte("#!/bin/bash\necho hello\n"), 0755); err != nil {
+		t.Fatalf("failed to write run.sh: %v", err)
+	}
+
+	// Create plugin dir with plugin.md only (no run.sh)
+	pluginDirNoScript := filepath.Join(tmpDir, "plugins", "no-script")
+	if err := os.MkdirAll(pluginDirNoScript, 0755); err != nil {
+		t.Fatalf("failed to create plugin dir: %v", err)
+	}
+	noScriptContent := []byte(`+++
+name = "no-script"
+description = "Plugin without run.sh"
+version = 1
++++
+
+# Instructions
+`)
+	if err := os.WriteFile(filepath.Join(pluginDirNoScript, "plugin.md"), noScriptContent, 0644); err != nil {
+		t.Fatalf("failed to write plugin.md: %v", err)
+	}
+
+	scanner := NewScanner(tmpDir, nil)
+	plugins, err := scanner.DiscoverAll()
+	if err != nil {
+		t.Fatalf("DiscoverAll failed: %v", err)
+	}
+
+	if len(plugins) != 2 {
+		t.Fatalf("expected 2 plugins, got %d", len(plugins))
+	}
+
+	byName := make(map[string]*Plugin)
+	for _, p := range plugins {
+		byName[p.Name] = p
+	}
+
+	if p, ok := byName["with-script"]; !ok {
+		t.Fatal("expected to find 'with-script' plugin")
+	} else if !p.HasRunScript {
+		t.Error("expected HasRunScript=true for plugin with run.sh")
+	}
+
+	if p, ok := byName["no-script"]; !ok {
+		t.Fatal("expected to find 'no-script' plugin")
+	} else if p.HasRunScript {
+		t.Error("expected HasRunScript=false for plugin without run.sh")
+	}
+}
+
+func TestFormatMailBody_WithRunScript(t *testing.T) {
+	p := &Plugin{
+		Name:         "test-plugin",
+		Description:  "A test plugin",
+		Path:         "/home/user/gt/plugins/test-plugin",
+		HasRunScript: true,
+	}
+
+	body := p.FormatMailBody()
+
+	// Must contain the bash command to run the script
+	if !strings.Contains(body, "cd /home/user/gt/plugins/test-plugin && bash run.sh") {
+		t.Error("expected mail body to contain run.sh execution command")
+	}
+	// Must instruct dog NOT to interpret markdown
+	if !strings.Contains(body, "Do NOT interpret the plugin.md instructions") {
+		t.Error("expected mail body to warn against interpreting markdown")
+	}
+	// Must NOT contain "## Instructions" section
+	if strings.Contains(body, "## Instructions") {
+		t.Error("expected mail body to NOT contain markdown instructions section")
+	}
+}
+
+func TestFormatMailBody_WithoutRunScript(t *testing.T) {
+	p := &Plugin{
+		Name:         "test-plugin",
+		Description:  "A test plugin",
+		Path:         "/home/user/gt/plugins/test-plugin",
+		Instructions: "Do the thing.",
+		HasRunScript: false,
+	}
+
+	body := p.FormatMailBody()
+
+	// Must contain the instructions section
+	if !strings.Contains(body, "## Instructions") {
+		t.Error("expected mail body to contain instructions section")
+	}
+	if !strings.Contains(body, "Do the thing.") {
+		t.Error("expected mail body to contain plugin instructions")
+	}
+	// Must NOT contain run.sh dispatch
+	if strings.Contains(body, "bash run.sh") {
+		t.Error("expected mail body to NOT contain run.sh command")
 	}
 }

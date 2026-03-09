@@ -130,7 +130,18 @@ func (s *Scanner) loadPlugin(pluginDir string, location Location, rigName string
 		return nil, fmt.Errorf("reading plugin.md: %w", err)
 	}
 
-	return parsePluginMD(content, pluginDir, location, rigName)
+	plugin, err := parsePluginMD(content, pluginDir, location, rigName)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check for run.sh alongside plugin.md
+	runScriptPath := filepath.Join(pluginDir, "run.sh")
+	if info, statErr := os.Stat(runScriptPath); statErr == nil && !info.IsDir() {
+		plugin.HasRunScript = true
+	}
+
+	return plugin, nil
 }
 
 // parsePluginMD parses a plugin.md file with TOML frontmatter.

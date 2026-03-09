@@ -44,6 +44,11 @@ type Plugin struct {
 
 	// Instructions is the markdown body (after frontmatter).
 	Instructions string `json:"instructions,omitempty"`
+
+	// HasRunScript is true when a run.sh exists alongside plugin.md.
+	// When true, FormatMailBody instructs the dog to execute the script
+	// instead of interpreting the markdown instructions.
+	HasRunScript bool `json:"has_run_script,omitempty"`
 }
 
 // Location indicates where a plugin was discovered.
@@ -159,6 +164,20 @@ func (p *Plugin) Summary() PluginSummary {
 // This is the canonical formatting used by both the daemon dispatcher
 // and the gt dog dispatch command.
 func (p *Plugin) FormatMailBody() string {
+	if p.HasRunScript {
+		return fmt.Sprintf(
+			"Execute the following plugin script:\n\n"+
+				"**Plugin**: %s\n"+
+				"**Description**: %s\n\n"+
+				"```bash\ncd %s && bash run.sh\n```\n\n"+
+				"Run this command EXACTLY. Do NOT interpret the plugin.md instructions.\n"+
+				"Do NOT write your own implementation. Just run the script and report the output.\n\n"+
+				"After completion:\n"+
+				"1. Create a wisp to record the result (success/failure)\n"+
+				"2. Run `gt dog done` — this clears your work and auto-terminates the session\n",
+			p.Name, p.Description, p.Path)
+	}
+
 	var sb strings.Builder
 
 	sb.WriteString("Execute the following plugin:\n\n")
