@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -204,6 +205,9 @@ func TestInstallForRole_CodexRoleAware(t *testing.T) {
 	if string(got) != string(want) {
 		t.Error("codex interactive: content mismatch")
 	}
+	if !strings.Contains(string(got), "gt costs record >/dev/null 2>&1 &") {
+		t.Error("codex interactive: stop hook should silence gt costs record output")
+	}
 
 	dir2 := t.TempDir()
 	err = InstallForRole("codex", dir2, dir2, "polecat", ".codex", "hooks.json", false)
@@ -215,6 +219,9 @@ func TestInstallForRole_CodexRoleAware(t *testing.T) {
 	want, _ = templateFS.ReadFile("templates/codex/hooks-autonomous.json")
 	if string(got) != string(want) {
 		t.Error("codex autonomous: content mismatch")
+	}
+	if !strings.Contains(string(got), "gt costs record >/dev/null 2>&1 &") {
+		t.Error("codex autonomous: stop hook should silence gt costs record output")
 	}
 }
 
