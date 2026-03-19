@@ -665,30 +665,42 @@ func CheckPortConflict(townRoot string) (int, string) {
 }
 
 // findDoltServerOnPort finds a process listening on the given port.
-// Returns the PID or 0 if not found. Uses lsof to identify the listener PID.
+// Returns the PID or 0 if not found.
 // Does not verify process identity via ps string matching (ZFC fix: gt-utuk).
+//
+// Tries lsof first (macOS and most Linux), then ss (iproute2) as a fallback
+// for Linux systems where lsof is not installed.
 func findDoltServerOnPort(port int) int {
-	// Use lsof to find the LISTENING process on port (not clients connected to it).
+	// Try lsof — preferred when available (cross-platform).
 	// Without -sTCP:LISTEN, lsof returns client PIDs (e.g., gt daemon) first,
 	// which aren't dolt processes — causing false negatives.
 	cmd := exec.Command("lsof", "-i", fmt.Sprintf(":%d", port), "-sTCP:LISTEN", "-t")
-	output, err := cmd.Output()
-	if err != nil {
-		return 0
+	if output, err := cmd.Output(); err == nil {
+		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+		if len(lines) > 0 && lines[0] != "" {
+			if pid, err := strconv.Atoi(lines[0]); err == nil {
+				return pid
+			}
+		}
 	}
 
-	// Parse first PID from output
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if len(lines) == 0 || lines[0] == "" {
-		return 0
+	// Fall back to ss (iproute2) — standard on modern Linux, no extra packages needed.
+	// Example output line: LISTEN 0 128 *:3307 *:* users:(("dolt",pid=12345,fd=7))
+	cmd = exec.Command("ss", "-tlnp", fmt.Sprintf("sport = :%d", port))
+	if output, err := cmd.Output(); err == nil {
+		for _, line := range strings.Split(string(output), "\n") {
+			if idx := strings.Index(line, "pid="); idx >= 0 {
+				rest := line[idx+4:]
+				if end := strings.IndexAny(rest, ",)"); end > 0 {
+					if pid, err := strconv.Atoi(rest[:end]); err == nil && pid > 0 {
+						return pid
+					}
+				}
+			}
+		}
 	}
 
-	pid, err := strconv.Atoi(lines[0])
-	if err != nil {
-		return 0
-	}
-
-	return pid
+	return 0
 }
 
 // DoltListener represents a Dolt process listening on a TCP port.
@@ -1508,18 +1520,19 @@ func Start(townRoot string) error {
 	}
 
 	// Wait for the server to be accepting connections, not just alive.
-	// IsRunning only checks PID — we need CheckServerReachable to confirm
-	// the port is listening. Retry with backoff since startup takes time.
+	// We check process liveness directly via signal(0) rather than calling
+	// IsRunning, because IsRunning removes the PID file when the process is
+	// alive but not yet listening — treating a starting-up process as stale.
+	// On systems with slow storage (CSI/NFS), dolt can take 1-2s to bind its
+	// port, well past the first 500ms check. By using cmd.Process.Signal(0)
+	// we detect true process death without the PID-file side effect.
 	var lastErr error
 	for attempt := 0; attempt < 10; attempt++ {
 		time.Sleep(500 * time.Millisecond)
 
-		running, _, err = IsRunning(townRoot)
-		if err != nil {
-			return fmt.Errorf("verifying server started: %w", err)
-		}
-		if !running {
-			return fmt.Errorf("Dolt server failed to start (check logs with 'gt dolt logs')")
+		// Check if the process we started is still alive.
+		if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+			return fmt.Errorf("Dolt server process died during startup (check logs with 'gt dolt logs'): %w", err)
 		}
 
 		if err := CheckServerReachable(townRoot); err == nil {
