@@ -290,6 +290,13 @@ func TestDeaconPatrolHasHeartbeatSteps(t *testing.T) {
 			if !strings.Contains(step.Description, "gt deacon heartbeat") {
 				t.Error("loop-or-exit step must refresh heartbeat before await-signal")
 			}
+			heartbeatPos := strings.Index(step.Description, "gt deacon heartbeat \"pre-await checkpoint\"")
+			awaitPos := strings.Index(step.Description, "gt mol step await-signal")
+			if heartbeatPos == -1 || awaitPos == -1 {
+				t.Error("loop-or-exit step must contain both pre-await heartbeat and await-signal commands")
+			} else if heartbeatPos > awaitPos {
+				t.Error("pre-await heartbeat must appear before await-signal to close the stale-heartbeat window")
+			}
 		}
 	}
 	if !foundMid {
