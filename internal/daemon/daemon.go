@@ -37,6 +37,7 @@ import (
 	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/telegraph"
 	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
@@ -462,6 +463,15 @@ func (d *Daemon) Run() (err error) {
 		}
 	}
 
+	// Start Telegraph if configured (~gt/settings/telegraph.toml exists and enabled).
+	// Telegraph is a long-running HTTP listener (not a periodic patrol) that converts
+	// external webhooks into Mayor-addressed mail. It runs as a supervised goroutine.
+	if telegraphCfg, err := telegraph.LoadConfig(d.config.TownRoot); err != nil {
+		d.logger.Printf("Warning: failed to load telegraph config: %v", err)
+	} else if telegraphCfg != nil && telegraphCfg.Enabled {
+		d.startTelegraph(telegraphCfg)
+	}
+
 	// Start dedicated Dolt health check ticker if Dolt server is configured.
 	// This runs at a much higher frequency (default 30s) than the general
 	// heartbeat (3 min) so Dolt crashes are detected quickly.
@@ -722,6 +732,54 @@ func (d *Daemon) Run() (err error) {
 // Default: 3 minutes — fast enough to detect stuck agents promptly.
 func (d *Daemon) recoveryHeartbeatInterval() time.Duration {
 	return d.loadOperationalConfig().GetDaemonConfig().RecoveryHeartbeatIntervalD()
+}
+
+// startTelegraph launches the Telegraph L1 HTTP listener as a supervised goroutine.
+// If the goroutine panics, it restarts with exponential backoff (max 10 min).
+// The goroutine exits cleanly when the daemon context is canceled.
+func (d *Daemon) startTelegraph(cfg *telegraph.TelegraphConfig) {
+	// No L2 translators yet — populated by providers bead (gt-2tg).
+	translators := make(map[string]telegraph.Translator)
+
+	logf := func(format string, args ...any) {
+		d.logger.Printf("[telegraph] "+format, args...)
+	}
+
+	go func() {
+		backoff := 5 * time.Second
+		const maxBackoff = 10 * time.Minute
+		for {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						logf("panic recovered: %v — restarting in %v", r, backoff)
+					}
+				}()
+				telegraph.Run(d.ctx, cfg, translators, nil, logf)
+			}()
+
+			// Exit if context is done.
+			select {
+			case <-d.ctx.Done():
+				return
+			default:
+			}
+
+			// Wait before restarting, unless context is canceled during sleep.
+			select {
+			case <-d.ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}()
+
+	d.logger.Printf("Telegraph started on %s", cfg.ListenAddr)
 }
 
 // heartbeat performs one heartbeat cycle.
