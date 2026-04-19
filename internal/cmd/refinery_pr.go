@@ -305,7 +305,11 @@ func runRefineryPrThreads(cmd *cobra.Command, args []string) error {
 		return json.NewEncoder(os.Stdout).Encode(threads)
 	}
 	if len(threads) == 0 {
-		fmt.Fprintln(os.Stdout, "no unresolved threads")
+		if refPrThreadsUnresolved {
+			fmt.Fprintln(os.Stdout, "no unresolved threads")
+		} else {
+			fmt.Fprintln(os.Stdout, "no review threads")
+		}
 		return nil
 	}
 	for _, t := range threads {
@@ -323,6 +327,14 @@ func runRefineryPrWaitApproval(cmd *cobra.Command, args []string) error {
 	minApprovals := refPrWaitApprovalMin
 	if minApprovals < 0 {
 		return fmt.Errorf("--min-approvals must be non-negative, got %d", minApprovals)
+	}
+	// Require at least one active gate so callers can't accidentally bypass
+	// the approval wait by omitting --approver and setting --min-approvals=0
+	// (or letting it default to 0). An explicit "no gates" configuration is
+	// almost always a scripting error.
+	if approver == "" && minApprovals == 0 {
+		return fmt.Errorf("wait-approval requires at least one gate: " +
+			"set --approver=<user> and/or --min-approvals=<n≥1>")
 	}
 	provider, _, err := getRefineryPRContext()
 	if err != nil {
@@ -358,6 +370,7 @@ func runRefineryPrWaitApproval(cmd *cobra.Command, args []string) error {
 		}
 
 		if approverOK && countOK {
+			// The no-gate case is unreachable — we reject it above.
 			switch {
 			case approver != "" && minApprovals > 0:
 				fmt.Fprintf(os.Stdout, "%s PR #%d approved by %s (%d/%d total approvals)\n",
@@ -368,9 +381,6 @@ func runRefineryPrWaitApproval(cmd *cobra.Command, args []string) error {
 			case minApprovals > 0:
 				fmt.Fprintf(os.Stdout, "%s PR #%d has %d/%d required approvals\n",
 					style.Bold.Render("✓"), prNumber, count, minApprovals)
-			default:
-				fmt.Fprintf(os.Stdout, "%s PR #%d: no approval gate configured\n",
-					style.Bold.Render("✓"), prNumber)
 			}
 			return nil
 		}

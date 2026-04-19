@@ -274,6 +274,17 @@ func validateMergeQueueConfig(c *MergeQueueConfig) error {
 
 	// PR-strategy-specific validation
 	if c.MergeStrategy == MergeStrategyPR {
+		// Phase 1 only ships a GitHub PRProvider. The Bitbucket provider
+		// returns ErrUnsupported for CreatePR, RequestReview, CountApprovals,
+		// IsPRApprovedBy, UnresolvedThreads, AllThreads, and ChecksRollup —
+		// i.e. the PR merge path cannot run on Bitbucket yet. Fail fast here
+		// rather than at merge time so misconfiguration surfaces during
+		// `gt rig settings set` instead of mid-queue.
+		if c.VCSProvider == VCSProviderBitbucket {
+			return fmt.Errorf("merge_strategy=%q with vcs_provider=%q is not yet supported — "+
+				"Bitbucket implementation is incomplete. Use vcs_provider=%q or merge_strategy=%q.",
+				MergeStrategyPR, VCSProviderBitbucket, VCSProviderGitHub, MergeStrategyDirect)
+		}
 		if c.PRApprover == "" {
 			return fmt.Errorf("pr_approver is required when merge_strategy=%q", MergeStrategyPR)
 		}

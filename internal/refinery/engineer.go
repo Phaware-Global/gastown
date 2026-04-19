@@ -544,6 +544,14 @@ func (e *Engineer) LoadConfig() error {
 			e.config.VCSProvider, "github", "bitbucket")
 	}
 	if e.config.MergeStrategy == "pr" {
+		// Phase 1 only ships a functional GitHub PRProvider. Reject
+		// vcs_provider=bitbucket eagerly so the refinery refuses to start on
+		// an unreachable configuration rather than blowing up mid-merge.
+		if e.config.VCSProvider == "bitbucket" {
+			return fmt.Errorf("merge_strategy=%q with vcs_provider=%q is not yet supported — "+
+				"Bitbucket PR provider is stubbed. Use vcs_provider=%q or merge_strategy=%q.",
+				"pr", "bitbucket", "github", "direct")
+		}
 		if e.config.PRApprover == "" {
 			return fmt.Errorf("pr_approver is required when merge_strategy=%q", "pr")
 		}
