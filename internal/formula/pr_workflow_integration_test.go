@@ -223,6 +223,111 @@ func TestRefineryPatrolReviewLoopIsPatrolResumable(t *testing.T) {
 	}
 }
 
+// TestRefineryPatrolHasOrphanBranchCheck asserts the orphan-branch-check
+// step exists and contains the escalation contract.
+//
+// Real-world failure this guards against (2026-04-19 dogfood of gastown
+// under merge_strategy=pr): a polecat's MR bead creation failed (separate
+// bug), the refinery patrol found a polecat branch on origin with no MR,
+// and reasoned from the branch contents alone that it was "ready to merge".
+// It ran `git push origin FETCH_HEAD:refs/heads/main` and closed the bead.
+// Unreviewed code landed on main; the entire PR workflow was bypassed on
+// the first bead that tried to use it.
+//
+// The step's job is to make "polecat branch exists, no MR bead" a
+// recognized, enumerated state in the formula — so the refinery LLM
+// escalates rather than improvising. Key assertions:
+//
+//  1. The step exists and is reached from queue-scan.
+//  2. queue-scan carries the "NEVER merge without an MR bead" rule.
+//  3. The step names the escalation primitive (bd create with the
+//     gt:escalation label) so the refinery has an explicit outlet.
+//  4. The step explicitly bans the failure shape
+//     (FETCH_HEAD:refs/heads/main and plain "git push ... :main").
+func TestRefineryPatrolHasOrphanBranchCheck(t *testing.T) {
+	data, err := formulasFS.ReadFile("formulas/mol-refinery-patrol.formula.toml")
+	if err != nil {
+		t.Fatalf("reading formula: %v", err)
+	}
+	f, err := Parse(data)
+	if err != nil {
+		t.Fatalf("parsing formula: %v", err)
+	}
+
+	// 1 — orphan-branch-check step exists and depends on queue-scan.
+	var orphanStep *Step
+	for i := range f.Steps {
+		if f.Steps[i].ID == "orphan-branch-check" {
+			orphanStep = &f.Steps[i]
+			break
+		}
+	}
+	if orphanStep == nil {
+		t.Fatal("mol-refinery-patrol is missing the `orphan-branch-check` step (regression — see 2026-04-19 dogfood trace)")
+	}
+	if !containsString(orphanStep.Needs, "queue-scan") {
+		t.Errorf("orphan-branch-check must depend on queue-scan (got needs=%v)", orphanStep.Needs)
+	}
+
+	desc := orphanStep.Description
+
+	// 3 — escalation primitive is named so the refinery can't "miss" it.
+	for _, must := range []string{
+		"gt:escalation",
+		"bd create",
+	} {
+		if !strings.Contains(desc, must) {
+			t.Errorf("orphan-branch-check description missing escalation primitive %q — refinery needs an explicit outlet or it will improvise", must)
+		}
+	}
+
+	// 2 — queue-scan carries the "never merge without MR" rule. Find it.
+	var queueScan *Step
+	for i := range f.Steps {
+		if f.Steps[i].ID == "queue-scan" {
+			queueScan = &f.Steps[i]
+			break
+		}
+	}
+	if queueScan == nil {
+		t.Fatal("mol-refinery-patrol is missing the `queue-scan` step")
+	}
+	qsDesc := queueScan.Description
+	mustInQueueScan := []string{
+		"NEVER merge",      // the headline rule
+		"MR bead",          // the primitive it hinges on
+		"improvise",        // the anti-improvisation anchor (any phrasing around it is fine)
+	}
+	for _, s := range mustInQueueScan {
+		// Case-insensitive match — the phrasing can evolve; the anchor words must stay.
+		if !strings.Contains(strings.ToLower(qsDesc), strings.ToLower(s)) {
+			t.Errorf("queue-scan description missing %q — without this, the refinery LLM can rationalize improvising a merge when the queue is empty", s)
+		}
+	}
+
+	// 4 — explicit ban on the exact failure shape. The dogfood trace
+	// ran `git push origin FETCH_HEAD:refs/heads/main`; the formula's
+	// rules should name "refs/heads/main" and "push" in proximity.
+	// We don't require the exact phrase — just that both anchors
+	// appear in the queue-scan rules block.
+	hasPushKeyword := strings.Contains(qsDesc, "push")
+	hasMainRef := strings.Contains(qsDesc, "refs/heads/main") || strings.Contains(qsDesc, ":main")
+	if !hasPushKeyword || !hasMainRef {
+		t.Errorf("queue-scan must explicitly name push-to-main as a forbidden shape (push=%v, main-ref=%v) — the 2026-04-19 incident used `git push origin FETCH_HEAD:refs/heads/main`", hasPushKeyword, hasMainRef)
+	}
+}
+
+// containsString is a small local helper — avoids importing slices just
+// for this test and keeps the test file dependency-free.
+func containsString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}
+
 // TestRefineryPatrolHasMergeStrategyVar asserts the formula exposes the
 // merge_strategy variable to operators. Without this, rigs can't opt into
 // the PR workflow via rig settings + formula vars propagation.
