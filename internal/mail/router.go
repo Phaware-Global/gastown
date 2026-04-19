@@ -859,6 +859,17 @@ func (r *Router) shouldBeWisp(msg *Message) bool {
 // - Queues (queue:name) - stores single message for worker claiming
 // - Announces (announce:name) - bulletin board, no claiming, retention-limited
 func (r *Router) Send(msg *Message) error {
+	// Defense-in-depth: refuse sends from `go test` binaries so unit
+	// tests under other packages can't pollute the production
+	// Dolt-backed mail queue. The mail package's own tests opt in via
+	// `allowTestSend = true` in TestMain. Surfaced during Telegraph v1
+	// dogfood (G8): polecat `go test ./...` runs were flooding the
+	// mayor's inbox with ~36 fake MERGED notifications per cycle, each
+	// a Dolt commit, starving the rest of the engine.
+	if err := checkTestSendGuard(); err != nil {
+		return err
+	}
+
 	// Check for mailing list address
 	if isListAddress(msg.To) {
 		return r.sendToList(msg)
