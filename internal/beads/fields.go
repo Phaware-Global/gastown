@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -26,6 +27,8 @@ type AttachmentFields struct {
 	MergeStrategy    string // Convoy merge strategy: "direct", "mr", "local", or "" (default = mr)
 	ConvoyOwned      bool   // If true, convoy has gt:owned label (caller-managed lifecycle)
 	FormulaVars      string // Newline-separated key=value pairs for formula template substitution
+	ReviewPR         int    // If >0, polecat should check out this GitHub PR's branch (review-fix dispatch)
+	ReviewBranch     string // Explicit branch name for the polecat to check out (takes precedence over polecat/<worker>)
 }
 
 // ParseAttachmentFields extracts attachment fields from an issue's description.
@@ -97,6 +100,14 @@ func ParseAttachmentFields(issue *Issue) *AttachmentFields {
 		case "formula_vars", "formula-vars", "formulavars":
 			fields.FormulaVars = value
 			hasFields = true
+		case "review_pr", "review-pr", "reviewpr":
+			if n, err := strconv.Atoi(value); err == nil && n > 0 {
+				fields.ReviewPR = n
+				hasFields = true
+			}
+		case "review_branch", "review-branch", "reviewbranch":
+			fields.ReviewBranch = value
+			hasFields = true
 		}
 	}
 
@@ -154,6 +165,12 @@ func FormatAttachmentFields(fields *AttachmentFields) string {
 	if fields.FormulaVars != "" {
 		lines = append(lines, "formula_vars: "+fields.FormulaVars)
 	}
+	if fields.ReviewPR > 0 {
+		lines = append(lines, "review_pr: "+strconv.Itoa(fields.ReviewPR))
+	}
+	if fields.ReviewBranch != "" {
+		lines = append(lines, "review_branch: "+fields.ReviewBranch)
+	}
 
 	return strings.Join(lines, "\n")
 }
@@ -202,6 +219,12 @@ func SetAttachmentFields(issue *Issue, fields *AttachmentFields) string {
 		"formula_vars":      true,
 		"formula-vars":      true,
 		"formulavars":       true,
+		"review_pr":         true,
+		"review-pr":         true,
+		"reviewpr":          true,
+		"review_branch":     true,
+		"review-branch":     true,
+		"reviewbranch":      true,
 	}
 
 	// Collect non-attachment lines from existing description

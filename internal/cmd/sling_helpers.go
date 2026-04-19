@@ -274,6 +274,8 @@ type beadFieldUpdates struct {
 	MergeStrategy    string // Convoy merge strategy: "direct", "mr", "local"
 	ConvoyOwned      bool   // Convoy has gt:owned label (caller-managed lifecycle)
 	FormulaVars      string // Newline-separated key=value pairs for formula template substitution
+	ReviewPR         int    // GitHub PR number (0 = not a review-fix dispatch)
+	ReviewBranch     string // Explicit branch for polecat to check out
 }
 
 // storeFieldsInBead performs a single read-modify-write to update all attachment fields
@@ -354,6 +356,11 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 	if updates.FormulaVars != "" {
 		fields.FormulaVars = updates.FormulaVars
 	}
+	// Review-dispatch metadata is per-dispatch: always overwrite (including to
+	// zero/empty) so a re-sling without --pr/--branch doesn't inherit stale
+	// review-fix context from a previous dispatch.
+	fields.ReviewPR = updates.ReviewPR
+	fields.ReviewBranch = updates.ReviewBranch
 
 	// Write back once
 	newDesc := beads.SetAttachmentFields(issue, fields)

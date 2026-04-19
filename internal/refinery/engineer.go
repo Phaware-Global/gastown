@@ -1450,15 +1450,25 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 	// Run convoy check to auto-close and notify subscribers.
 	e.postMergeConvoyCheck(mr)
 
-	// 4. Nudge mayor about successful merge so dispatcher can unblock
-	// dependent work. Without this, mayor only discovers completion by polling.
-	// Uses nudge (not mail) to avoid permanent Dolt commits for routine signals (GH#2434).
-	nudgeMsg := fmt.Sprintf("MERGED: %s issue=%s branch=%s", mr.ID, mr.SourceIssue, mr.Branch)
-	nudgeCmd := exec.Command("gt", "nudge", "mayor/", nudgeMsg)
-	util.SetDetachedProcessGroup(nudgeCmd)
-	nudgeCmd.Dir = e.workDir
-	if err := nudgeCmd.Run(); err != nil {
-		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge mayor about merge: %v\n", err)
+	// 4. Notify mayor about the successful merge so it has a persistent
+	// record and can unblock dependent work. Previously this used `gt nudge`,
+	// which is ephemeral — if the mayor was busy or in another context, the
+	// signal was lost and the human had to learn about completion by polling
+	// git log / GitHub. Switching to `gt mail send` creates a persistent
+	// inbox entry (the mayor gets an auto-nudge as a side effect, so the
+	// push-notification semantics are preserved). See
+	// docs/notes/refinery-merge-notification-to-mayor.md.
+	mailSubject := fmt.Sprintf("MERGED: %s", mr.SourceIssue)
+	mailBody := fmt.Sprintf("MR: %s\nIssue: %s\nBranch: %s\nRig: %s\nMerged-At: %s",
+		mr.ID, mr.SourceIssue, mr.Branch, e.rig.Name, time.Now().UTC().Format(time.RFC3339))
+	// --permanent: `gt mail send` defaults to wisp/ephemeral delivery, which
+	// can be garbage-collected. The point of routing through mail (instead of
+	// the old ephemeral nudge) is a durable inbox record, so force permanent.
+	mailCmd := exec.Command("gt", "mail", "send", "mayor/", "-s", mailSubject, "-m", mailBody, "--permanent")
+	util.SetDetachedProcessGroup(mailCmd)
+	mailCmd.Dir = e.workDir
+	if err := mailCmd.Run(); err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to notify mayor of merge: %v\n", err)
 	}
 
 	// 5. Log success

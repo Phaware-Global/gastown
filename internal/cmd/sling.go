@@ -135,6 +135,8 @@ var (
 	slingFormula       string // --formula: override formula for dispatch (default: mol-polecat-work)
 	slingCrew          string // --crew: target a crew member in the specified rig
 	slingReviewOnly    bool   // --review-only: mark work as review-only (no merge/commit/push)
+	slingPR            int    // --pr: check out and work on an existing PR branch (for review-fix dispatch)
+	slingBranchOverride string // --branch: explicit branch override (pairs with --pr or standalone)
 )
 
 func init() {
@@ -163,6 +165,8 @@ func init() {
 	slingCmd.Flags().StringVar(&slingFormula, "formula", "", "Formula to apply (default: mol-polecat-work for polecat targets)")
 	slingCmd.Flags().StringVar(&slingCrew, "crew", "", "Target a crew member in the specified rig (e.g., --crew mel with target gastown → gastown/crew/mel)")
 	slingCmd.Flags().BoolVar(&slingReviewOnly, "review-only", false, "Mark work as review-only: assignee evaluates and reports back, must NOT merge/commit/push")
+	slingCmd.Flags().IntVar(&slingPR, "pr", 0, "Dispatch polecat to work on an existing GitHub PR (checks out the PR's branch)")
+	slingCmd.Flags().StringVar(&slingBranchOverride, "branch", "", "Explicit branch for the polecat to check out (overrides default polecat/<worker> naming; pair with --pr for review-fix dispatches)")
 
 	slingCmd.AddCommand(slingRespawnResetCmd)
 	rootCmd.AddCommand(slingCmd)
@@ -950,6 +954,10 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	// Store all attachment fields in a single read-modify-write cycle.
 	// This eliminates the race condition where sequential independent updates
 	// (dispatcher, args, no_merge, attached_molecule) could overwrite each other.
+	//
+	// Fixes #3320: previously `gt sling --merge=<strategy>` was recorded only
+	// on the auto-convoy, so `gt done` couldn't find it on the work bead and
+	// fell through to default merge-queue routing. Stamp it on the bead too.
 	fieldUpdates := beadFieldUpdates{
 		Dispatcher:       actor,
 		Args:             slingArgs,
@@ -958,7 +966,10 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		AttachedFormula:  formulaName,
 		NoMerge:          slingNoMerge,
 		ReviewOnly:       slingReviewOnly,
+		MergeStrategy:    slingMerge,
 		FormulaVars:      strings.Join(slingVars, "\n"),
+		ReviewPR:         slingPR,
+		ReviewBranch:     slingBranchOverride,
 	}
 	if err := storeFieldsInBead(beadID, fieldUpdates); err != nil {
 		// Warn but don't fail - polecat will still complete work

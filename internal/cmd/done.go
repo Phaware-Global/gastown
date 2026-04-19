@@ -834,7 +834,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					fmt.Printf("%s\n", style.Dim.Render("Work stays on feature branch for human review."))
 				}
 
-				// Mail dispatcher with READY_FOR_REVIEW
+				// Mail dispatcher with READY_FOR_REVIEW.
+				// Track whether the notification actually landed so the close
+				// reason reflects reality (not an aspirational "dispatcher
+				// notified" label when DispatchedBy was empty or mail failed).
+				dispatcherNotified := false
 				if dispatcher := attachmentFields.DispatchedBy; dispatcher != "" {
 					townRouter := mail.NewRouter(townRoot)
 					defer townRouter.WaitPendingNotifications()
@@ -852,7 +856,64 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						style.PrintWarning("could not notify dispatcher: %v", err)
 					} else {
 						fmt.Printf("%s Dispatcher notified: READY_FOR_REVIEW\n", style.Bold.Render("✓"))
+						dispatcherNotified = true
 					}
+				}
+
+				// Close the work bead so it doesn't sit `open` forever — this is
+				// the fix for #3363. Without this, no_merge polecats with commits
+				// (implement-stage work in Linear pipelines, review-fix dispatches
+				// under merge_strategy=pr, etc.) would stamp READY_FOR_REVIEW and
+				// exit, but the bead stayed open, stalling dispatchers that check
+				// convoy completion. Force-close bypasses molecule dep checks; the
+				// polecat is already done and about to be nuked.
+				//
+				// Compose the reason from observed state so the audit trail is
+				// accurate (matters when DispatchedBy was empty or mail failed).
+				closeReason := "No-merge work completed"
+				if prURL != "" {
+					closeReason += fmt.Sprintf("; PR %s opened for human review", prURL)
+				}
+				switch {
+				case dispatcherNotified:
+					closeReason += "; dispatcher notified"
+				case attachmentFields.DispatchedBy == "":
+					closeReason += "; no dispatcher recorded"
+				default:
+					closeReason += "; dispatcher notification failed"
+				}
+
+				// Close the attached molecule (wisp) FIRST — same ordering the
+				// regular gt done path uses in updateAgentStateOnDone. Once we
+				// force-close the work bead below, it becomes terminal and
+				// updateAgentStateOnDone's wisp-close guard skips the molecule,
+				// leaving the wisp + its step descendants orphaned. Mirror that
+				// cleanup here so the no-merge path doesn't leak wisps.
+				if attachmentFields.AttachedMolecule != "" {
+					if n := closeDescendants(bd, attachmentFields.AttachedMolecule); n > 0 {
+						fmt.Fprintf(os.Stderr, "Closed %d molecule step(s) for %s\n", n, attachmentFields.AttachedMolecule)
+					}
+					if closeErr := bd.ForceCloseWithReason("done", attachmentFields.AttachedMolecule); closeErr != nil {
+						if !errors.Is(closeErr, beads.ErrNotFound) {
+							style.PrintWarning("couldn't close attached molecule %s: %v", attachmentFields.AttachedMolecule, closeErr)
+						}
+					}
+				}
+
+				var noMergeCloseErr error
+				for attempt := 1; attempt <= 3; attempt++ {
+					noMergeCloseErr = bd.ForceCloseWithReason(closeReason, issueID)
+					if noMergeCloseErr == nil {
+						fmt.Printf("%s Work bead %s closed\n", style.Bold.Render("✓"), issueID)
+						break
+					}
+					if attempt < 3 {
+						style.PrintWarning("bead close attempt %d/3 failed: %v (retrying in %ds)", attempt, noMergeCloseErr, attempt*2)
+						time.Sleep(time.Duration(attempt*2) * time.Second)
+					}
+				}
+				if noMergeCloseErr != nil {
+					style.PrintWarning("could not close no-merge bead %s: %v — dispatcher must close manually", issueID, noMergeCloseErr)
 				}
 
 				// Skip MR creation, go to witness notification
