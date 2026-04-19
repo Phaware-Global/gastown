@@ -67,6 +67,31 @@ func TestIsPushToMain(t *testing.T) {
 		{"single-arg HEAD:feature", "git push HEAD:feature", false},
 		{"single-arg :feature (delete)", "git push :feature", false},
 		{"single-arg feat:feat", "git push feat/x:feat/x", false},
+
+		// Iter-3 positives — global-flag + subcommand forms.
+		// `git -C <dir> push origin main` must behave the same as
+		// `git push origin main` from the guard's perspective.
+		{"git -C dir push to main", "git -C /tmp/x push origin main", true},
+		{"git -c ... push to main", "git -c foo=bar push origin main", true},
+		{"git --git-dir=... push to main", "git --git-dir=/tmp/.git push origin main", true},
+		{"git --paginate push to main (boolean)", "git --paginate push origin main", true},
+
+		// Iter-3 positives — shell-quoted refspecs must be unquoted
+		// before the classifier decides.
+		{"single-quoted refspec to main", "git push origin 'HEAD:refs/heads/main'", true},
+		{"double-quoted refspec to main", `git push origin "HEAD:refs/heads/main"`, true},
+		{"single-quoted bare main", "git push origin 'main'", true},
+
+		// Iter-3 negatives — global-flag form that isn't a push.
+		{"git -C dir status", "git -C /tmp/x status", false},
+
+		// Iter-3 negatives — quoted non-main refspec should stay allowed.
+		{"single-quoted refspec not-main", "git push origin 'HEAD:feature'", false},
+
+		// Iter-3 negative — unknown global flag fails closed
+		// (classifier returns false / "not a push", letting the real
+		// git binary surface its own error).
+		{"unknown global flag", "git --bogus-flag push origin main", false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

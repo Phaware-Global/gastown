@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -128,10 +129,28 @@ func isPushToMain(command string) bool {
 	if len(fields) < 2 {
 		return false
 	}
-	if fields[0] != "git" || fields[1] != "push" {
+
+	// strings.Fields respects whitespace but not shell quoting. A token
+	// like `'HEAD:refs/heads/main'` keeps the quotes, which would defeat
+	// the refspec check. Strip surrounding single/double quotes from
+	// each field. This is not a full shell lexer (doesn't handle
+	// embedded escapes or quote concatenation); it's a best-effort
+	// normalization that makes the common `git push origin
+	// 'HEAD:refs/heads/main'` shape visible to the refspec logic.
+	for i, f := range fields {
+		fields[i] = unquote(f)
+	}
+
+	// Accept `git -C <dir> push ...` and similar forms with global
+	// options before the subcommand. Walk past any leading global flag
+	// (recognized prefixes like -C / -c / --git-dir / --work-tree) and
+	// their values, stopping at the first non-flag token — that token
+	// must be "push". Otherwise treat as non-push.
+	i := skipGitGlobalArgs(fields)
+	if i < 0 || i >= len(fields) || fields[i] != "push" {
 		return false
 	}
-	argv := fields[2:]
+	argv := fields[i+1:]
 
 	// `--all` / `--mirror` push multiple refs, including main. `--tags`
 	// alone doesn't touch branches, but in combination with other refspecs
@@ -215,6 +234,92 @@ func isPushToMain(command string) bool {
 	}
 }
 
+// unquote strips surrounding matched single or double quotes from a
+// token. It is NOT a shell lexer — no escape-handling, no concatenation
+// of quoted and unquoted pieces. Intentional: the guard is defense-in-
+// depth, not a general shell parser. If a caller smuggles in a push
+// via fancy quoting (e.g. `"HEAD:refs"/heads/main`), we accept the
+// miss and rely on other layers.
+func unquote(s string) string {
+	if len(s) >= 2 {
+		if (s[0] == '\'' && s[len(s)-1] == '\'') ||
+			(s[0] == '"' && s[len(s)-1] == '"') {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
+}
+
+// skipGitGlobalArgs returns the index of the git subcommand token
+// (e.g., "push"), given `fields` where fields[0] is "git". Handles
+// global options that appear between "git" and the subcommand:
+//
+//	-C <dir>             (run in directory)
+//	-c <name>=<value>    (config override)
+//	--git-dir=<path>     (long form with =)
+//	--git-dir <path>     (long form with separate value)
+//	--work-tree=<path>
+//	--work-tree <path>
+//	-p / --paginate      (boolean, no value)
+//	-P / --no-pager      (boolean, no value)
+//
+// Returns -1 if fields[0] isn't "git" or the subcommand can't be found.
+// Conservative: any unknown flag aborts to -1 rather than blindly
+// skipping, so the guard can't be bypassed by inserting a novel
+// global flag.
+func skipGitGlobalArgs(fields []string) int {
+	if len(fields) == 0 || fields[0] != "git" {
+		return -1
+	}
+	// Flags that consume the NEXT argv as their value (space form).
+	consumesNext := map[string]bool{
+		"-C":          true,
+		"-c":          true,
+		"--git-dir":   true,
+		"--work-tree": true,
+		"--namespace": true,
+	}
+	// Boolean flags that take no value.
+	booleanFlags := map[string]bool{
+		"-p":         true,
+		"--paginate": true,
+		"-P":         true,
+		"--no-pager": true,
+		"--bare":     true,
+		"--no-replace-objects": true,
+	}
+	i := 1
+	for i < len(fields) {
+		f := fields[i]
+		// Subcommand reached.
+		if !strings.HasPrefix(f, "-") {
+			return i
+		}
+		// `--foo=value` form — value is embedded, just skip the token.
+		if strings.Contains(f, "=") {
+			i++
+			continue
+		}
+		// Known boolean flag.
+		if booleanFlags[f] {
+			i++
+			continue
+		}
+		// Known flag with separate value.
+		if consumesNext[f] {
+			i += 2
+			continue
+		}
+		// Unknown flag — fail closed. We'd rather mis-classify "git
+		// <new-flag> push origin main" as "not a push" and rely on
+		// the caller's git to produce its own error, than blindly skip
+		// an unknown flag whose semantics might consume the next token
+		// or the whole rest of argv.
+		return -1
+	}
+	return -1
+}
+
 // refspecTargetsMain returns true if a single refspec token (one of the
 // `<src>:<dst>` / `<ref>` forms) names main on the destination side.
 func refspecTargetsMain(token string) bool {
@@ -277,17 +382,27 @@ func currentRigRequiresPRStrategy() bool {
 
 	rigPath := filepath.Join(townRoot, rigName)
 	settings, err := config.LoadRigSettings(config.RigSettingsPath(rigPath))
-	if err != nil {
-		// In a rig workspace but settings unreadable — fail closed.
-		// Defense-in-depth: an unreviewed push to main is a bigger
-		// problem than a noisy block the user can investigate.
-		return true
-	}
-	if settings == nil || settings.MergeQueue == nil {
-		// No merge_queue block → no policy → let the push through.
+	switch {
+	case errors.Is(err, config.ErrNotFound):
+		// Rig exists but has no settings file. That's a legitimate
+		// "no policy configured" state — a rig without
+		// `settings/config.json` can't possibly be on
+		// merge_strategy=pr, so let the push through. Blocking here
+		// would break direct-merge rigs that simply haven't written a
+		// settings file.
 		return false
+	case err != nil:
+		// Any OTHER load error (malformed JSON, I/O failure with a file
+		// that does exist, etc.) is ambiguous — under defense-in-depth
+		// we'd rather surface a block the human can investigate than
+		// let an unreviewed push slip past.
+		return true
+	case settings == nil || settings.MergeQueue == nil:
+		// Settings loaded but no merge_queue section → no policy → allow.
+		return false
+	default:
+		return settings.MergeQueue.MergeStrategy == config.MergeStrategyPR
 	}
-	return settings.MergeQueue.MergeStrategy == config.MergeStrategyPR
 }
 
 // identifyCurrentRig resolves the rig name from GT_RIG (preferred) or
