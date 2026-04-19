@@ -393,10 +393,20 @@ Phase 3 — fixes that unblock the loop:
 8. `gt done` no-merge close path (#3363)
 9. Mayor mail-send on merge (replaces nudge)
 
-Phase 4 — delete the overlay:
-10. Remove `jira_claude_channel/formula-overlays/mol-refinery-patrol.toml`
-    and `~/.gt/hooks-overrides/jira_claude_channel__refinery.json` as a
-    chore; end-to-end test passes without them.
+Phase 4 — acceptance + cleanup:
+10. Add an integration test in this repo that loads `mol-refinery-patrol`
+    with `merge_strategy=pr` and asserts the formula resolves to the new
+    `gt refinery pr …` orchestration (no raw `gh pr create` in the
+    rendered step, no direct `git push origin main`). This protects the
+    Phase 2 refactor from silent regression.
+11. **Out of this repo** — in the user's `~/gt` workspace, remove
+    `jira_claude_channel/formula-overlays/mol-refinery-patrol.toml` and
+    `~/.gt/hooks-overrides/jira_claude_channel__refinery.json` as a
+    chore. Once Phases 1-3 land, the overlay becomes a no-op (references
+    the same step IDs). Delete is a chore, not a migration. This item
+    lives in the user's workspace because per-rig overlays and
+    hooks-overrides are runtime state, not source code; there is no
+    gastown PR for this step.
 
 Each phase is a standalone PR. Phase 1+2 get the flow working against a
 test rig; phase 3 makes it pleasant; phase 4 is the acceptance test.
