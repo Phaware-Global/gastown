@@ -317,10 +317,14 @@ Rules, in order of bindingness:
    path (direct: ff-only + push; pr: `gh pr merge`). If the queue is
    empty, there is nothing to merge — go to orphan-branch-check.
 3. **Under `merge_strategy = "pr"` the refinery does NOT push to main
-   at all.** GitHub does, via `gh pr merge`. A direct push to main
-   from the refinery under pr-mode is a workflow violation even if it
-   appears to work (the `push-main` tap guard will block it; don't
-   try to work around the guard).
+   at all.** Merges go through `gt refinery pr merge` (the subcommand
+   the merge-push step uses in pr mode), which itself invokes
+   `gh pr merge` — GitHub performs the actual squash-merge server-side.
+   A direct push to main from the refinery under pr-mode is a workflow
+   violation even if it appears to work (the `push-main` tap guard will
+   block it; don't try to work around the guard). Do not invoke `gh`
+   directly from this step — stay inside the `gt refinery pr …`
+   subcommand tree (see TestRefineryPatrolMergePushHasPRBranch).
 4. **If you find yourself about to do something the formula doesn't
    name explicitly: stop and escalate.** Open an escalation bead
    describing what you observed; do not act. "The formula doesn't
@@ -344,17 +348,26 @@ ORPHAN_CANDIDATES=$(git branch -r | grep -oE 'origin/polecat/[^ ]+' | sed 's|ori
 ```
 
 **Step 2: enumerate branches referenced by open MR beads**
+Guard the `capture()` with `// empty` so a description that doesn't
+match the `branch:` pattern is dropped quietly instead of aborting the
+pipeline (which would defeat the whole orphan-check under `set -e`):
 ```bash
 MR_BRANCHES=$(gt mq list <rig> --json 2>/dev/null | \\
-  jq -r '.[] | (.description // "") | capture("branch:\\\\s*(?<b>\\\\S+)") | .b' | sort -u)
+  jq -r '.[] | (.description // "") | capture("branch:\\\\s*(?<b>\\\\S+)") // empty | .b' | sort -u)
 ```
 
 If `gt mq list` has no `--json` output or the queue is empty, `MR_BRANCHES`
 is empty — that's fine, every candidate is then a potential orphan.
 
 **Step 3: diff candidates against MR-covered branches**
+`comm` with `<(echo "$VAR")` emits a blank line for an empty variable,
+which turns into a bogus "empty-named" orphan. Use `printf '%s\\n'`
+(which prints nothing for an empty var) and `grep -v '^$'` to guarantee
+a clean set-difference:
 ```bash
-ORPHANS=$(comm -23 <(echo "$ORPHAN_CANDIDATES") <(echo "$MR_BRANCHES"))
+ORPHANS=$(comm -23 \\
+  <(printf '%s\\n' "$ORPHAN_CANDIDATES" | grep -v '^$' | sort -u) \\
+  <(printf '%s\\n' "$MR_BRANCHES"       | grep -v '^$' | sort -u))
 ```
 
 **Step 4: for each orphan, decide escalate vs skip**
@@ -363,7 +376,13 @@ ORPHANS=$(comm -23 <(echo "$ORPHAN_CANDIDATES") <(echo "$MR_BRANCHES"))
   record in scratch state), skip — don't duplicate-escalate.
 - If the orphan is very recent (<5 minutes since last commit), skip
   this cycle — the polecat's `gt done` may still be in flight. Next
-  cycle will re-check.
+  cycle will re-check. Compute the age explicitly rather than eyeballing:
+  ```bash
+  LAST_COMMIT_TIME=$(git log -1 --format=%ct "origin/$branch")
+  NOW=$(date +%s)
+  AGE=$(( NOW - LAST_COMMIT_TIME ))
+  if [ "$AGE" -lt 300 ]; then continue; fi   # <5 minutes old → skip
+  ```
 - Otherwise, escalate via an escalation bead (one bead per orphan,
   keyed on branch name to dedupe across cycles):
 
@@ -398,13 +417,18 @@ EOD
   --repo=<rig>
 ```
 
-**Step 5: message overseer**
-After escalations are filed, send one consolidated mail to overseer
-summarizing the orphans (so they're not sitting in mail hell):
+**Step 5: message overseer (only when there were actual orphans)**
+After escalations are filed — and only then — send one consolidated
+mail to overseer summarizing the orphans (so they're not sitting in
+mail hell). Skip the mail entirely if `$ORPHANS` is empty; otherwise
+the overseer gets a pointless notification every patrol cycle.
 ```bash
-gt mail send overseer -s "Refinery: <N> orphan polecat branches" \\
-  --body-file=<(printf 'Patrol %s found orphan branches:\\n\\n%s\\n\\nEscalations filed.' \\
-                       "$(date -u +%FT%TZ)" "$ORPHANS")
+if [ -n "$ORPHANS" ]; then
+  N=$(printf '%s\\n' "$ORPHANS" | wc -l | tr -d ' ')
+  gt mail send overseer -s "Refinery: $N orphan polecat branches" \\
+    --body-file=<(printf 'Patrol %s found orphan branches:\\n\\n%s\\n\\nEscalations filed.' \\
+                         "$(date -u +%FT%TZ)" "$ORPHANS")
+fi
 ```
 
 **Step 6: proceed**
@@ -415,7 +439,14 @@ process-branch as before."""
 [[steps]]
 id = "process-branch"
 title = "Mechanical rebase"
-needs = ["queue-scan"]
+# Serialize on orphan-branch-check so the orphan scan runs BEFORE any
+# branch processing in a single patrol cycle. Without this, both steps
+# had `needs = ["queue-scan"]` and a fan-out runner could schedule them
+# in parallel — meaning process-branch could start on MR-queued work
+# while orphans are still unescalated. Keeping them strictly sequential
+# is cheap (orphan-branch-check is bounded and fast) and makes the
+# ordering invariant explicit.
+needs = ["orphan-branch-check"]
 description = """
 Pick next branch from queue. Attempt mechanical rebase on the MR's effective target branch.
 

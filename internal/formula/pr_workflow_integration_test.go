@@ -269,6 +269,26 @@ func TestRefineryPatrolHasOrphanBranchCheck(t *testing.T) {
 		t.Errorf("orphan-branch-check must depend on queue-scan (got needs=%v)", orphanStep.Needs)
 	}
 
+	// 1b — process-branch must depend on orphan-branch-check, not just
+	// queue-scan. Otherwise a fan-out runner could schedule both
+	// process-branch AND orphan-branch-check in parallel off queue-scan,
+	// and process-branch could race to start on MR-queued work while
+	// orphans are still unescalated. Serialization via `needs` is the
+	// single source of truth for ordering.
+	var processBranch *Step
+	for i := range f.Steps {
+		if f.Steps[i].ID == "process-branch" {
+			processBranch = &f.Steps[i]
+			break
+		}
+	}
+	if processBranch == nil {
+		t.Fatal("mol-refinery-patrol is missing the `process-branch` step")
+	}
+	if !containsString(processBranch.Needs, "orphan-branch-check") {
+		t.Errorf("process-branch must depend on orphan-branch-check so orphan escalation happens before branch processing (got needs=%v)", processBranch.Needs)
+	}
+
 	desc := orphanStep.Description
 
 	// 3 — escalation primitive is named so the refinery can't "miss" it.
