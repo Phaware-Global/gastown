@@ -348,12 +348,21 @@ ORPHAN_CANDIDATES=$(git branch -r | grep -oE 'origin/polecat/[^ ]+' | sed 's|ori
 ```
 
 **Step 2: enumerate branches referenced by open MR beads**
-Guard the `capture()` with `// empty` so a description that doesn't
-match the `branch:` pattern is dropped quietly instead of aborting the
-pipeline (which would defeat the whole orphan-check under `set -e`):
+Two hazards in this pipeline, both of which would abort the orphan
+scan under `set -e`-style execution — and both trigger in exactly
+the cases this step is meant to handle (empty queue, MRs with
+non-standard descriptions):
+
+1. `gt mq list --json` encodes an empty queue as JSON `null`, not
+   `[]`. `jq '.[]'` errors on `null`. Coerce to an array with
+   `(. // []) | .[]` so the empty-queue path is a clean no-op.
+2. `capture()` errors when the input doesn't match the regex. The
+   `// empty` alternative drops non-matching descriptions quietly.
+
 ```bash
 MR_BRANCHES=$(gt mq list <rig> --json 2>/dev/null | \\
-  jq -r '.[] | (.description // "") | capture("branch:\\\\s*(?<b>\\\\S+)") // empty | .b' | sort -u)
+  jq -r '(. // []) | .[] | (.description // "") | capture("branch:\\\\s*(?<b>\\\\S+)") // empty | .b' \\
+  | sort -u)
 ```
 
 If `gt mq list` has no `--json` output or the queue is empty, `MR_BRANCHES`
