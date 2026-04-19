@@ -143,6 +143,86 @@ func TestRefineryPatrolMergePushHasPRBranch(t *testing.T) {
 	}
 }
 
+// TestRefineryPatrolReviewLoopIsPatrolResumable asserts Phase 5's
+// non-blocking review-fix loop:
+//
+//   - Step PR.5 must not contain a `while true` (busy-waiting blocks the
+//     merge queue behind a single PR's review cycle).
+//   - Step PR.5 must use `gt mq set-review-state` to persist iteration
+//     state on the MR bead. That's the primitive that makes the loop
+//     resumable across patrol cycles; without it, iteration count
+//     resets on every cycle and the loop cap is meaningless.
+//   - Step PR.5 must read `review_fix_polecat` from the MR bead (the
+//     "is a polecat in flight?" gate), not track it in a bash variable.
+func TestRefineryPatrolReviewLoopIsPatrolResumable(t *testing.T) {
+	data, err := formulasFS.ReadFile("formulas/mol-refinery-patrol.formula.toml")
+	if err != nil {
+		t.Fatalf("reading formula: %v", err)
+	}
+	f, err := Parse(data)
+	if err != nil {
+		t.Fatalf("parsing formula: %v", err)
+	}
+
+	var mergePush *Step
+	for i := range f.Steps {
+		if f.Steps[i].ID == "merge-push" {
+			mergePush = &f.Steps[i]
+			break
+		}
+	}
+	if mergePush == nil {
+		t.Fatal("merge-push step not found in mol-refinery-patrol")
+	}
+	desc := mergePush.Description
+
+	prBranchIdx := strings.Index(desc, `If merge_strategy = "pr":`)
+	if prBranchIdx < 0 {
+		t.Fatal("missing PR-branch gate marker")
+	}
+	prBranchRest := desc[prBranchIdx:]
+	prBranchEnd := len(prBranchRest)
+	for _, stopMarker := range []string{
+		"\n**Step 2: Send MERGED",
+		"\nIf merge_strategy = \"",
+	} {
+		if idx := strings.Index(prBranchRest, stopMarker); idx >= 0 && idx < prBranchEnd {
+			prBranchEnd = idx
+		}
+	}
+	prBranchDesc := prBranchRest[:prBranchEnd]
+
+	// Busy-wait regression guard: no `while true`. The original Phase-2
+	// implementation blocked the merge queue behind each PR's review loop;
+	// Phase 5 made it patrol-resumable. If someone reintroduces `while true`
+	// (or `while :` or a bare `while [ ]` waiting loop) inside Step PR.5,
+	// the refinery stops processing other MRs.
+	for _, forbidden := range []string{
+		"while true",
+		"while :",
+	} {
+		if strings.Contains(prBranchDesc, forbidden) {
+			t.Errorf("PR-mode branch contains busy-wait %q — Step PR.5 should be patrol-resumable, not block inside the formula",
+				forbidden)
+		}
+	}
+
+	// Persistence regression guard: Step PR.5 must use `gt mq set-review-state`
+	// to record iter / in-flight polecat on the MR bead. Without this, the
+	// patrol-resumable flow can't carry state across cycles.
+	requiredPatrolResumableMarkers := []string{
+		"mq set-review-state",              // the command that writes MR state
+		"review_fix_polecat",                // the MR field holding the in-flight polecat
+		"review_loop_iter",                  // the MR field holding iteration count
+	}
+	for _, marker := range requiredPatrolResumableMarkers {
+		if !strings.Contains(prBranchDesc, marker) {
+			t.Errorf("PR-mode branch missing patrol-resumable marker %q — review-fix loop may have regressed to a blocking form",
+				marker)
+		}
+	}
+}
+
 // TestRefineryPatrolHasMergeStrategyVar asserts the formula exposes the
 // merge_strategy variable to operators. Without this, rigs can't opt into
 // the PR workflow via rig settings + formula vars propagation.

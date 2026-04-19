@@ -177,9 +177,43 @@ queue-scan → process-branch → rebase → run-tests → handle-failures
 ```
 
 `pr-review-loop` is a formula step with an explicit counter bounded by
-`PRReviewLoopMax`. Each iteration: poll unresolved review threads; if none,
-advance; if some, sling a review-fix polecat with `no_merge=true` and wait
-for its completion signal; on any loop error, escalate and park.
+`PRReviewLoopMax`. Crucially, the loop is **patrol-resumable** — on each
+refinery patrol cycle the step takes a single action and returns control
+to the patrol, it does not busy-wait inside a `while true` for the polecat.
+This keeps the merge queue moving: the refinery can process other MRs
+while a polecat is addressing review threads on one PR.
+
+State per MR (stored on the MR bead's description as attachment fields):
+
+- `review_loop_iter` int — number of review-fix dispatches already made.
+- `review_fix_polecat` string — name of the currently-dispatched polecat,
+  or empty when no polecat is in flight.
+
+Step logic on each patrol cycle, for an MR bead that has reached
+`pr-review-loop`:
+
+1. If `review_fix_polecat` is set and that polecat is still alive
+   (`gt polecat status` reports non-terminal): the previous dispatch is
+   still working. Record the MR as "awaiting-review-fix" and skip to
+   `loop-check` so the refinery can process other MRs. On the next
+   patrol cycle, re-enter at step 1.
+2. If `review_fix_polecat` is set and the polecat has terminated (either
+   normally — `gt done` sent `REVIEW_FIX_DONE` mail — or abnormally —
+   nuked by witness, exited with error): clear the field; proceed.
+3. Poll `gt refinery pr threads $PR --unresolved`.
+4. If zero unresolved threads: advance to `pr-wait-human`.
+5. Else if `review_loop_iter >= PRReviewLoopMax`: open an escalation,
+   park the MR; proceed to `loop-check`.
+6. Else: sling a review-fix polecat (`gt sling review-fix/<issue> <rig>
+   --pr $PR --branch <polecat-branch>`); record
+   `review_fix_polecat=<polecat-name>` and
+   `review_loop_iter=<iter+1>` on the MR bead; proceed to `loop-check`.
+
+`REVIEW_FIX_DONE` mail from the polecat is an optimization, not a
+correctness requirement: it surfaces the refinery's next patrol sooner
+(via `gt mail check --inject`), but even without it the patrol's normal
+cadence would re-enter step 1 and observe the polecat's terminal status
+within one cycle.
 
 The template (`internal/templates/roles/refinery.md.tmpl`) removes its
 hardcoded `merge-push` summary (lines 231-239 today) and instead renders
@@ -357,6 +391,17 @@ Secondary / tests:
 3. What's the budget for `pr-wait-approval`? Hard-cap at 24h with
    re-escalation at 4h stale? Defer to the escalation subsystem's stale
    detection — don't re-invent it here.
+
+### Resolved
+
+- **Should the review-fix loop block the refinery?** No. Phase 5 (the
+  top of this stack) converted Step PR.5 from a `while true` bash loop
+  inside the formula to a patrol-resumable state machine: each patrol
+  cycle takes one action (check polecat status / poll threads / dispatch /
+  advance) and returns to `loop-check`, letting the refinery continue
+  processing other MRs. State (iteration counter + in-flight polecat
+  name) lives on the MR bead. See the "Formula + template rewrites"
+  section above.
 
 ## Related Issues
 
