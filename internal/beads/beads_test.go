@@ -95,11 +95,12 @@ func TestCreateOptionsRig(t *testing.T) {
 // even if the field name or call sites get refactored later.
 func TestBuildBdCreateArgsRigMapsToRepoFlag(t *testing.T) {
 	tests := []struct {
-		name     string
-		opts     CreateOptions
-		actor    string
-		wantFlag string // flag that MUST be present (exact match)
-		banned   string // flag that MUST NOT be present (prefix match)
+		name      string
+		opts      CreateOptions
+		actor     string
+		wantFlag  string   // flag that MUST be present (exact match)
+		banned    string   // single prefix that MUST NOT appear (prefix match)
+		bannedAll []string // multiple prefixes that MUST NOT appear (prefix match)
 	}{
 		{
 			name: "Rig set emits --repo, never --rig",
@@ -118,8 +119,12 @@ func TestBuildBdCreateArgsRigMapsToRepoFlag(t *testing.T) {
 			opts: CreateOptions{
 				Title: "plain bead",
 			},
-			actor:  "",
-			banned: "--repo=",
+			actor: "",
+			// Both prefixes banned — the test name says "neither --repo
+			// nor --rig" and the check enforces that. Listing both means
+			// a regression that appends either flag on the empty-Rig
+			// path flips the test.
+			bannedAll: []string{"--repo=", "--rig="},
 		},
 		{
 			name: "actor passed through alongside --repo",
@@ -149,10 +154,14 @@ func TestBuildBdCreateArgsRigMapsToRepoFlag(t *testing.T) {
 				}
 			}
 
+			bannedPrefixes := append([]string{}, tc.bannedAll...)
 			if tc.banned != "" {
+				bannedPrefixes = append(bannedPrefixes, tc.banned)
+			}
+			for _, prefix := range bannedPrefixes {
 				for _, a := range args {
-					if strings.HasPrefix(a, tc.banned) {
-						t.Errorf("args contained banned flag %q (full arg %q); got %v", tc.banned, a, args)
+					if strings.HasPrefix(a, prefix) {
+						t.Errorf("args contained banned flag %q (full arg %q); got %v", prefix, a, args)
 					}
 				}
 			}
