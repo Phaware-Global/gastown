@@ -274,6 +274,8 @@ type beadFieldUpdates struct {
 	MergeStrategy    string // Convoy merge strategy: "direct", "mr", "local"
 	ConvoyOwned      bool   // Convoy has gt:owned label (caller-managed lifecycle)
 	FormulaVars      string // Newline-separated key=value pairs for formula template substitution
+	ReviewPR         int    // GitHub PR number (0 = not a review-fix dispatch)
+	ReviewBranch     string // Explicit branch for polecat to check out
 }
 
 // storeFieldsInBead performs a single read-modify-write to update all attachment fields
@@ -353,6 +355,12 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 	}
 	if updates.FormulaVars != "" {
 		fields.FormulaVars = updates.FormulaVars
+	}
+	if updates.ReviewPR > 0 {
+		fields.ReviewPR = updates.ReviewPR
+	}
+	if updates.ReviewBranch != "" {
+		fields.ReviewBranch = updates.ReviewBranch
 	}
 
 	// Write back once
