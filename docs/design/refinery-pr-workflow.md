@@ -677,3 +677,171 @@ first-batch polecats were nuked before I could inspect their hook
 beads), I'm noting this here as something to watch for on the next
 cycle rather than a definitive G-item. If it recurs, promote to a
 numbered observation.
+
+### G7 — abbreviated-patrol rules bypass the new `orphan-branch-check` step
+
+The B2 fix added `orphan-branch-check` as an explicit step between
+queue-scan and process-branch, with rule language in queue-scan's
+description that reads *"Do NOT skip past orphan-branch-check on an
+empty queue"*. During Telegraph v1 round two I confirmed the refinery
+is seeing the new step (it lists it as a known step in its patrol
+report), but **it's marking the step as SKIP on empty-queue cycles**:
+
+    Steps: inbox-check OK | queue-scan OK | orphan-branch-check SKIP
+           | process-branch SKIP | run-tests SKIP | ...
+
+Root cause: the molecule's top-level "Abbreviated Patrol Mode" block
+(lines ~96-108 of `mol-refinery-patrol.formula.toml`) has rules
+predating my fix that say:
+
+    - queue-scan: Quick `gt mq list` check. If queue is empty, skip
+      directly to check-integration-branches.
+    - process-branch through merge-push: Only run if queue-scan
+      found work. Otherwise SKIP all.
+
+The refinery is following the abbreviated rules' "skip directly to
+check-integration-branches" instruction and treating orphan-branch-check
+as part of the "everything between queue-scan and merge-push that
+SKIPs on empty" block. My queue-scan rule update conflicts with
+these top-level abbreviated rules, and the top-level rules win.
+
+Consequence: 10+ orphan polecat branches have accumulated on origin
+(e.g. `polecat/rictus-gt-8vr` carrying real work), and none have
+been escalated. The formula guard that was supposed to catch this
+state isn't firing in the cycle where it matters (empty-queue idle
+loop).
+
+Fix direction (tight scope):
+
+1. Update the "Abbreviated Patrol Mode" section to list
+   orphan-branch-check as a REQUIRED step on every cycle,
+   independent of queue state. Rewrite the bullet as:
+
+       - queue-scan: Quick `gt mq list` check.
+       - orphan-branch-check: ALWAYS run — orphan polecat branches
+         on origin are a failure signal regardless of queue state,
+         and detecting them in the idle cycle is exactly when the
+         check matters.
+       - process-branch through merge-push: Only run if queue-scan
+         found work. Otherwise SKIP all.
+
+2. Extend TestRefineryPatrolHasOrphanBranchCheck to assert the
+   abbreviated-patrol rules mention orphan-branch-check (or at
+   minimum, don't list it in a SKIP-all group). Without this, any
+   future rewrite of the abbreviated rules can re-introduce the
+   same conflict silently.
+
+3. Consider lifting orphan-branch-check out of the "if queue empty"
+   branch entirely and running it unconditionally after queue-scan
+   in both abbreviated and full modes. The step is token-cheap
+   (one `git branch -r` + one `gt mq list --json` + a `comm`).
+
+This is the second round of "my own fix had a silent gap that only
+real-world dogfood exposes". The first was the no-merge close path
+(G1); this is the abbreviated-patrol skip. Both share a pattern:
+the formula is long enough that top-level flow-control rules and
+per-step rules can disagree, and the refinery LLM resolves the
+conflict by following whichever it sees first. File as a follow-up
+PR on top of this stack — not blocking, but wanted before the next
+dogfood.
+
+### G8 — polecats emit spurious `MERGED:` mail using formula example placeholders
+
+While monitoring Telegraph v1 round two, the mayor's inbox filled
+with ~8 MERGED notifications from `gastown/nux` and `gastown/rictus`,
+each with literal placeholder values that match no real work:
+
+    Subject: MERGED:
+    MR: mr-a          (or mr-b, mr-c)
+    Issue:            (empty)
+    Branch: feature-a (or feature-b, feature-c)
+    Rig: test-rig
+    Merged-At: <timestamp>
+
+Origin `main` did not advance during this window (it's still at my
+`7273b09` G6 doc commit). No real merge happened. The polecats were
+emitting example mail bodies from their role documentation or formula
+prose — probably `mol-polecat-work` has a `gt mail send` example
+with `feature-a` / `mr-a` / `test-rig` placeholder fields, and the
+polecat's Claude session treated the example as a template to
+execute verbatim.
+
+This is a classic "LLM executes documentation example" failure. The
+noise is load-bearing under merge_strategy=pr because MERGED mail
+is how the mayor learns work has landed — an attacker (or a confused
+LLM) filling the mayor's inbox with fake MERGED notifications would
+be indistinguishable from real completion signals. Under direct-merge
+it's less critical because the mayor can cross-check with
+`git log origin/main`; under pr mode it should cross-check with
+`gh pr view <n> --json state` per MR.
+
+Fix direction:
+
+1. Remove or guard concrete placeholder values from formula / role
+   doc examples. Replace `mr-a` / `feature-a` / `test-rig` with
+   clearly-abstract markers like `<MR-ID>` / `<BRANCH>` / `<RIG>`
+   so the LLM can't "helpfully" substitute them with real-looking
+   literals.
+2. Mayor should validate incoming MERGED mail against known MR state
+   before acting: match the MR ID to an open MR bead in the rig's
+   DB, match the branch to an actually-merged-on-main commit.
+   Unmatched MERGED mail → discard + log (don't close issues or
+   advance state).
+3. Consider adding a sender-identity check: a polecat claiming to
+   have merged something should be cross-referenced against the
+   refinery's merge log (refinery is the only legitimate sender of
+   MERGED mail under merge_strategy=pr).
+
+Not directly a merge_strategy=pr issue, but surfaces during dogfood
+because the mayor's inbox becomes the signal source for "work
+landed" coordination, and stale/fake mail pollutes the coordination
+surface.
+
+### G9 — embedded Dolt lock contention blocks MR bead creation under concurrent gt done
+
+The refinery, polecats, and witness all write to
+`~/gt/<rig>/mayor/rig/.beads/embeddeddolt`. Observed in the rictus
+polecat pane after it tried to commit work:
+
+    Warning: couldn't write checkpoint pushed on
+    gts-gastown-polecat-rictus: bd update …: Error: failed to open
+    database: embeddeddolt: waiting for lock on
+    /Users/agent/gt/gastown/mayor/rig/.beads/embeddeddolt:
+    context canceled
+
+Embedded Dolt serializes writers via a file lock with a bounded
+timeout. When four polecats call `gt done` around the same time
+(plus the refinery's patrol cycle writes, plus the witness's
+heartbeat writes), lock acquisition can time out — which fails
+silently for the MR-bead-creation step. The branch gets pushed,
+the polecat sends the witness notification (also mail-via-Dolt, so
+also potentially locked), and exits as "failed" — which the witness
+sees as a stuck polecat and nukes.
+
+Consequence: rictus's real `gt-8vr` work is on origin as
+`polecat/rictus-gt-8vr` with a clean commit, no MR bead was created
+(lock timeout), no escalation fires (G7 — orphan-branch-check was
+skipped), so the work sits stranded. Without the witness nuking
+polecats on the timeout, a retry loop inside `gt done` would likely
+handle it; but the nuke prevents the retry.
+
+Fix direction:
+
+1. **`gt done` should retry MR-bead creation with exponential
+   backoff on lock-contention errors** (distinguish
+   `context canceled` / lock-timeout from other `bd create` errors
+   — retry the former, fail fast on the latter).
+2. **Queue the Dolt writes outside the polecat's critical path.**
+   Current design synchronously writes the MR bead from the polecat;
+   a small write-ahead buffer (filesystem journal) that the refinery
+   drains on its next cycle would decouple polecat completion from
+   Dolt availability.
+3. Short-term: widen the Dolt lock timeout and document the
+   contention failure mode in `gt done`'s output so the witness
+   doesn't nuke on a retryable error.
+
+Adjacent to G6 (witness nuking working polecats) — these two
+compound: Dolt lock timeouts look like stuck polecats, witness
+false-positives as INSERT mode stalls, polecat gets nuked before
+retry, work stranded. Either one alone would be survivable; together
+they make the PR workflow unreliable under load.
