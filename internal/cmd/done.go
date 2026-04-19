@@ -882,6 +882,24 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				default:
 					closeReason += "; dispatcher notification failed"
 				}
+
+				// Close the attached molecule (wisp) FIRST — same ordering the
+				// regular gt done path uses in updateAgentStateOnDone. Once we
+				// force-close the work bead below, it becomes terminal and
+				// updateAgentStateOnDone's wisp-close guard skips the molecule,
+				// leaving the wisp + its step descendants orphaned. Mirror that
+				// cleanup here so the no-merge path doesn't leak wisps.
+				if attachmentFields.AttachedMolecule != "" {
+					if n := closeDescendants(bd, attachmentFields.AttachedMolecule); n > 0 {
+						fmt.Fprintf(os.Stderr, "Closed %d molecule step(s) for %s\n", n, attachmentFields.AttachedMolecule)
+					}
+					if closeErr := bd.ForceCloseWithReason("done", attachmentFields.AttachedMolecule); closeErr != nil {
+						if !errors.Is(closeErr, beads.ErrNotFound) {
+							style.PrintWarning("couldn't close attached molecule %s: %v", attachmentFields.AttachedMolecule, closeErr)
+						}
+					}
+				}
+
 				var noMergeCloseErr error
 				for attempt := 1; attempt <= 3; attempt++ {
 					noMergeCloseErr = bd.ForceCloseWithReason(closeReason, issueID)

@@ -1461,7 +1461,10 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 	mailSubject := fmt.Sprintf("MERGED: %s", mr.SourceIssue)
 	mailBody := fmt.Sprintf("MR: %s\nIssue: %s\nBranch: %s\nRig: %s\nMerged-At: %s",
 		mr.ID, mr.SourceIssue, mr.Branch, e.rig.Name, time.Now().UTC().Format(time.RFC3339))
-	mailCmd := exec.Command("gt", "mail", "send", "mayor/", "-s", mailSubject, "-m", mailBody)
+	// --permanent: `gt mail send` defaults to wisp/ephemeral delivery, which
+	// can be garbage-collected. The point of routing through mail (instead of
+	// the old ephemeral nudge) is a durable inbox record, so force permanent.
+	mailCmd := exec.Command("gt", "mail", "send", "mayor/", "-s", mailSubject, "-m", mailBody, "--permanent")
 	util.SetDetachedProcessGroup(mailCmd)
 	mailCmd.Dir = e.workDir
 	if err := mailCmd.Run(); err != nil {
