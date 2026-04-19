@@ -69,6 +69,7 @@ type RoleData struct {
 	IssuePrefix    string   // beads issue prefix
 	MayorSession   string   // e.g., "gt-ai-mayor" - dynamic mayor session name
 	DeaconSession  string   // e.g., "gt-ai-deacon" - dynamic deacon session name
+	MergeStrategy  string   // rig's merge_queue.merge_strategy ("direct" or "pr"); used by refinery quick-reference
 }
 
 // SpawnData contains information for spawn assignment messages.

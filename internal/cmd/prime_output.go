@@ -64,10 +64,18 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 
 	// Get default branch from rig config (default to "main" if not set)
 	defaultBranch := "main"
+	mergeStrategy := ""
 	if ctx.Rig != "" && ctx.TownRoot != "" {
 		rigPath := filepath.Join(ctx.TownRoot, ctx.Rig)
 		if rigCfg, err := rig.LoadRigConfig(rigPath); err == nil && rigCfg.DefaultBranch != "" {
 			defaultBranch = rigCfg.DefaultBranch
+		}
+		// Look up merge_strategy so role templates (esp. refinery) can render
+		// a strategy-specific quick-reference section. Failure is non-fatal —
+		// the template falls back to the direct-merge text when empty.
+		if settings, err := config.LoadRigSettings(config.RigSettingsPath(rigPath)); err == nil &&
+			settings != nil && settings.MergeQueue != nil {
+			mergeStrategy = settings.MergeQueue.MergeStrategy
 		}
 	}
 
@@ -82,6 +90,7 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 		DogName:       ctx.Polecat, // ctx.Polecat holds the dog name for RoleDog
 		MayorSession:  session.MayorSessionName(),
 		DeaconSession: session.DeaconSessionName(),
+		MergeStrategy: mergeStrategy,
 	}
 
 	// Render and output

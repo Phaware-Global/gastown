@@ -228,6 +228,24 @@ GATE: Cannot proceed to merge without fix OR bead filed
 ```
 **FORBIDDEN**: Note failure and merge without tracking.
 
+{{- if eq .MergeStrategy "pr" }}
+**merge-push** (merge_strategy=pr): Create and shepherd a GitHub PR, then squash-merge
+```bash
+## Resolve <merge-target> per Target Resolution Rule above.
+git checkout temp
+git push origin temp:refs/heads/<polecat-branch> --force-with-lease
+PR=$({{ cmd }} refinery pr create --branch <polecat-branch> --base <merge-target> \
+       --title "<issue-title> (<issue-id>)" --body-file /tmp/pr-body.md --json | jq -r .number)
+{{ cmd }} refinery pr wait-ci $PR
+{{ cmd }} refinery pr request-review $PR --user <pr_reviewer>   # if pr_reviewer set
+# ... bounded review-fix loop (see Step 7 detail) ...
+{{ cmd }} refinery pr wait-approval $PR --approver <pr_approver> --min-approvals <n>
+{{ cmd }} refinery pr merge $PR --method squash
+```
+Do NOT run `git push origin <merge-target>` in this mode — branch protection blocks it
+and the PR workflow is the supported path. Full step-by-step details live in the
+formula step `bd show <merge-push>` / the pr-* steps after overlay resolution.
+{{- else }}
 **merge-push**: Merge to effective target and push immediately
 ```bash
 ## Resolve <merge-target> per Target Resolution Rule above.
@@ -237,6 +255,7 @@ git push origin <merge-target>
 git branch -d temp
 git branch -d polecat/<worker>
 ```
+{{- end }}
 
 **loop-check**: More branches? Return to process-branch.
 
