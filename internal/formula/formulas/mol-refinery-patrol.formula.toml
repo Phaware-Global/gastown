@@ -183,7 +183,7 @@ description = "GitHub user whose approving review gates the merge. Required when
 default = ""
 
 [vars.pr_required_approvals]
-description = "Minimum distinct APPROVED reviewers required before merge. Default 1 when merge_strategy=pr. Set to 0 for CI-only (no approvals required). Only applies when merge_strategy=pr."
+description = "Minimum distinct APPROVED reviewers required before merge (the count gate, in addition to the pr_approver gate). Default 1 when merge_strategy=pr. Setting to 0 disables only the count gate — the pr_approver's approval is still required because it's a separate gate (and pr_approver is required by config validation when merge_strategy=pr). Only applies when merge_strategy=pr."
 default = "1"
 
 [vars.pr_review_loop_max]
@@ -711,7 +711,7 @@ Branch: <branch>
 Issue: <issue-id>
 PR: ${PR_URL}
 Failure-Type: ci-checks
-Error: (see `gh pr checks $PR`)
+Error: run 'gh pr checks $PR' for details
 Attempt-Number: 1
 BODY
 ```

@@ -1285,17 +1285,18 @@ type MergeQueueConfig struct {
 	// MergeStrategy="pr". Valid values: "github" (default), "bitbucket".
 	VCSProvider string `json:"vcs_provider,omitempty"`
 
-	// RequireReview controls whether the refinery requires at least one approving
-	// review before merging a PR. Only meaningful when merge_strategy="pr".
+	// RequireReview controls whether the refinery's count-gate requires at
+	// least one approving review beyond PRApprover before merging a PR.
+	// Only meaningful when merge_strategy="pr".
 	//
 	// Resolution when merge_strategy="pr":
-	//   - RequireReview=true  → 1 approval required (same as PRRequiredApprovals=1)
-	//   - RequireReview=false → 0 approvals required (CI-only gate)
+	//   - RequireReview=true  → 1 approval required on the count gate (same as PRRequiredApprovals=1)
+	//   - RequireReview=false → count gate disabled; only PRApprover's gate applies
 	//   - RequireReview=nil (unset), PRRequiredApprovals also unset → default 1
 	//
-	// Note: the "nil defaults to no review" pre-PRRequiredApprovals behavior
-	// no longer applies — in PR mode the default is now 1 approval. Set
-	// `pr_required_approvals: 0` explicitly for CI-only.
+	// Note: `pr_required_approvals: 0` disables only the count gate. The
+	// PRApprover gate is independent and always active under
+	// merge_strategy="pr" because PRApprover is required by config validation.
 	//
 	// Deprecated: use PRRequiredApprovals (>0 is equivalent to RequireReview=true).
 	// Kept for one release for backward compatibility.
@@ -1313,11 +1314,14 @@ type MergeQueueConfig struct {
 	// time. Only meaningful when merge_strategy="pr".
 	PRApprover string `json:"pr_approver,omitempty"`
 
-	// PRRequiredApprovals is the number of approving reviews required before
-	// the refinery will merge. Nil defaults to 1 when merge_strategy="pr".
-	// Explicit zero ("pr_required_approvals": 0) means "no approvals
-	// required — CI only"; use *int so zero is distinguishable from unset.
-	// Only meaningful when merge_strategy="pr".
+	// PRRequiredApprovals is the count gate: the minimum distinct APPROVED
+	// reviewers required before the refinery will merge, in addition to the
+	// PRApprover gate. Nil defaults to 1 when merge_strategy="pr". Explicit
+	// zero disables ONLY the count gate — the PRApprover's approving review
+	// is still required because it's a separate gate (and PRApprover is
+	// required by config validation when merge_strategy="pr"). Use *int so
+	// zero is distinguishable from unset. Only meaningful when
+	// merge_strategy="pr".
 	PRRequiredApprovals *int `json:"pr_required_approvals,omitempty"`
 
 	// PRReviewLoopMax is the maximum number of review-fix polecat dispatch
@@ -1479,7 +1483,7 @@ func (c *MergeQueueConfig) IsRequireReviewEnabled() bool {
 // merges. Returns 0 when merge_strategy != "pr".
 //
 // When merge_strategy == "pr", resolution is:
-//  1. PRRequiredApprovals (if explicitly set — including 0 for "CI only")
+//  1. PRRequiredApprovals (if explicitly set — including 0 to disable only the count gate)
 //  2. Deprecated RequireReview (if non-nil) — true → 1, false → 0
 //  3. DefaultPRRequiredApprovals (1)
 //
