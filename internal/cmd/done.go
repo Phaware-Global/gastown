@@ -834,7 +834,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					fmt.Printf("%s\n", style.Dim.Render("Work stays on feature branch for human review."))
 				}
 
-				// Mail dispatcher with READY_FOR_REVIEW
+				// Mail dispatcher with READY_FOR_REVIEW.
+				// Track whether the notification actually landed so the close
+				// reason reflects reality (not an aspirational "dispatcher
+				// notified" label when DispatchedBy was empty or mail failed).
+				dispatcherNotified := false
 				if dispatcher := attachmentFields.DispatchedBy; dispatcher != "" {
 					townRouter := mail.NewRouter(townRoot)
 					defer townRouter.WaitPendingNotifications()
@@ -852,6 +856,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						style.PrintWarning("could not notify dispatcher: %v", err)
 					} else {
 						fmt.Printf("%s Dispatcher notified: READY_FOR_REVIEW\n", style.Bold.Render("✓"))
+						dispatcherNotified = true
 					}
 				}
 
@@ -862,9 +867,20 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// exit, but the bead stayed open, stalling dispatchers that check
 				// convoy completion. Force-close bypasses molecule dep checks; the
 				// polecat is already done and about to be nuked.
-				closeReason := "No-merge work completed; dispatcher notified"
+				//
+				// Compose the reason from observed state so the audit trail is
+				// accurate (matters when DispatchedBy was empty or mail failed).
+				closeReason := "No-merge work completed"
 				if prURL != "" {
-					closeReason = fmt.Sprintf("No-merge work completed; PR %s opened for human review", prURL)
+					closeReason += fmt.Sprintf("; PR %s opened for human review", prURL)
+				}
+				switch {
+				case dispatcherNotified:
+					closeReason += "; dispatcher notified"
+				case attachmentFields.DispatchedBy == "":
+					closeReason += "; no dispatcher recorded"
+				default:
+					closeReason += "; dispatcher notification failed"
 				}
 				var noMergeCloseErr error
 				for attempt := 1; attempt <= 3; attempt++ {
