@@ -342,9 +342,16 @@ previously resolved by improvising a direct push to main. Under
 a failure signal, not a work item — escalate, don't merge.
 
 **Step 1: enumerate polecat branches on origin**
+Wrap `grep -oE` in `{ … || true; }` so "no polecat branches" doesn't
+exit non-zero and abort the step under `set -e` / `pipefail`. A
+healthy rig's steady state IS "no orphans" — the naïve pipeline
+would treat that expected state as a hard failure:
 ```bash
 git fetch --prune origin
-ORPHAN_CANDIDATES=$(git branch -r | grep -oE 'origin/polecat/[^ ]+' | sed 's|origin/||' | sort -u)
+ORPHAN_CANDIDATES=$(git branch -r \\
+  | { grep -oE 'origin/polecat/[^ ]+' || true; } \\
+  | sed 's|origin/||' \\
+  | sort -u)
 ```
 
 **Step 2: enumerate branches referenced by open MR beads**

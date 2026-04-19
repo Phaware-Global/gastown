@@ -330,8 +330,13 @@ func TestRefineryPatrolHasOrphanBranchCheck(t *testing.T) {
 	// rules should name "refs/heads/main" and "push" in proximity.
 	// We don't require the exact phrase — just that both anchors
 	// appear in the queue-scan rules block.
-	hasPushKeyword := strings.Contains(qsDesc, "push")
-	hasMainRef := strings.Contains(qsDesc, "refs/heads/main") || strings.Contains(qsDesc, ":main")
+	// Case-insensitive anchors. mustInQueueScan above already lowercases
+	// both sides for phrasing-drift tolerance; these two anchors should
+	// be equally forgiving so "Push" at the start of a sentence doesn't
+	// flip the test even though the contract is still met.
+	qsLower := strings.ToLower(qsDesc)
+	hasPushKeyword := strings.Contains(qsLower, "push")
+	hasMainRef := strings.Contains(qsLower, "refs/heads/main") || strings.Contains(qsLower, ":main")
 	if !hasPushKeyword || !hasMainRef {
 		t.Errorf("queue-scan must explicitly name push-to-main as a forbidden shape (push=%v, main-ref=%v) — the 2026-04-19 incident used `git push origin FETCH_HEAD:refs/heads/main`", hasPushKeyword, hasMainRef)
 	}
