@@ -745,57 +745,74 @@ conflict by following whichever it sees first. File as a follow-up
 PR on top of this stack — not blocking, but wanted before the next
 dogfood.
 
-### G8 — polecats emit spurious `MERGED:` mail using formula example placeholders
+### G8 — mail subsystem has no test-mode isolation; `go test ./...` pollutes production mail
 
 While monitoring Telegraph v1 round two, the mayor's inbox filled
-with ~8 MERGED notifications from `gastown/nux` and `gastown/rictus`,
-each with literal placeholder values that match no real work:
+with ~36 `MERGED:` notifications from `gastown/nux` and
+`gastown/rictus` in under five minutes. Each one had placeholder
+values (`mr-a` / `feature-b` / `test-rig`) that matched no real
+work — and origin `main` did not advance during the window.
 
-    Subject: MERGED:
-    MR: mr-a          (or mr-b, mr-c)
-    Issue:            (empty)
-    Branch: feature-a (or feature-b, feature-c)
-    Rig: test-rig
-    Merged-At: <timestamp>
+My initial hypothesis was "LLM is executing documentation examples
+verbatim" — **wrong**. The mayor's own diagnosis (mail
+`hq-wisp-603p`, 14:27) identified the real cause:
 
-Origin `main` did not advance during this window (it's still at my
-`7273b09` G6 doc commit). No real merge happened. The polecats were
-emitting example mail bodies from their role documentation or formula
-prose — probably `mol-polecat-work` has a `gt mail send` example
-with `feature-a` / `mr-a` / `test-rig` placeholder fields, and the
-polecat's Claude session treated the example as a template to
-execute verbatim.
+> Polecats run `go test ./...` which exercises the L3 mail envelope
+> code paths against the real Dolt-backed mail backend. There is no
+> test-mode/mock backend.
+> Volume was tens of mails per minute, growing — every mail is a
+> Dolt commit.
 
-This is a classic "LLM executes documentation example" failure. The
-noise is load-bearing under merge_strategy=pr because MERGED mail
-is how the mayor learns work has landed — an attacker (or a confused
-LLM) filling the mayor's inbox with fake MERGED notifications would
-be indistinguishable from real completion signals. Under direct-merge
-it's less critical because the mayor can cross-check with
-`git log origin/main`; under pr mode it should cross-check with
-`gh pr view <n> --json state` per MR.
+So `gt-eef` (the Telegraph L3 bead — "Mail envelope + rate-limited
+Mayor nudge") has unit tests that call the real `mail.Router.Send`
+path, and those tests ship real mail into the mayor's inbox. Every
+test run = a wave of `MERGED:` messages to the mayor. The `mr-a` /
+`feature-a` / `test-rig` values are just the test fixtures that
+`mail_test.go` uses.
 
-Fix direction:
+This is a real architectural gap: the mail subsystem has no
+`test-mode` / mock backend, so any code under test that touches the
+mail API writes to the shared Dolt-backed queue.
 
-1. Remove or guard concrete placeholder values from formula / role
-   doc examples. Replace `mr-a` / `feature-a` / `test-rig` with
-   clearly-abstract markers like `<MR-ID>` / `<BRANCH>` / `<RIG>`
-   so the LLM can't "helpfully" substitute them with real-looking
-   literals.
-2. Mayor should validate incoming MERGED mail against known MR state
-   before acting: match the MR ID to an open MR bead in the rig's
-   DB, match the branch to an actually-merged-on-main commit.
-   Unmatched MERGED mail → discard + log (don't close issues or
-   advance state).
-3. Consider adding a sender-identity check: a polecat claiming to
-   have merged something should be cross-referenced against the
-   refinery's merge log (refinery is the only legitimate sender of
-   MERGED mail under merge_strategy=pr).
+Consequences under merge_strategy=pr specifically:
 
-Not directly a merge_strategy=pr issue, but surfaces during dogfood
-because the mayor's inbox becomes the signal source for "work
-landed" coordination, and stale/fake mail pollutes the coordination
-surface.
+- **Mayor inbox DoS.** MERGED mail is how the mayor learns that
+  work has landed. Tests flooding the inbox with fake MERGED mail
+  makes real completion signals indistinguishable from noise. The
+  mayor is forced into a "validate everything against git state"
+  posture that erases the whole point of the mail-based signal.
+- **Dolt write amplification.** Every test-mail is a Dolt commit.
+  Combined with G9's lock contention, the test runs actively make
+  the rest of the engine slower — the more tests you run, the more
+  the engine blocks on Dolt.
+- **Polecat self-cancellation.** The mayor correctly paused all 4
+  Telegraph polecats on 2026-04-19 14:27 to stop the flood. That's
+  the right call, but it means no Telegraph work can land until a
+  test-isolation policy is in place — the PR workflow is paused on
+  an infrastructure issue unrelated to the workflow itself.
+
+Fix direction (mayor's proposal, reproduced with endorsement):
+
+1. **L3 (`gt-eef`) must ship a test-mode mail backend** (in-memory
+   sink or explicit dev-null) and its own tests must use it. Land
+   before any other Telegraph bead so the mail-test pollution
+   doesn't keep recurring.
+2. **Town-level safeguard**: `mail.Router.Send` should refuse
+   (or redirect to the in-memory sink) when `GT_TEST_MODE=1` (or
+   `go test` is detected via `testing.Short()` / build tag) is
+   active. Fail-loud so a test trying to send real mail gets an
+   explicit error instead of silently polluting production.
+3. **Sender validation in mayor**: under merge_strategy=pr, only
+   the refinery is a legitimate sender of `MERGED:` mail. The mayor
+   should reject MERGED mail from other senders (or quarantine +
+   warn) rather than processing it as a completion signal.
+
+Not blocking the B1/B2/B3 fixes that already shipped — those were
+about the refinery's merge path. This is about the test surface of
+the work that FLOWS through the merge path, and it's a
+precondition for Telegraph v1 (or any feature whose tests touch
+mail) to complete cleanly under the PR workflow. Mayor is holding
+Telegraph work pending this policy call.
 
 ### G9 — embedded Dolt lock contention blocks MR bead creation under concurrent gt done
 
