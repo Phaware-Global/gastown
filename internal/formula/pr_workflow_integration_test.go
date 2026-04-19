@@ -110,15 +110,23 @@ func TestRefineryPatrolMergePushHasPRBranch(t *testing.T) {
 	// logical line with no backslashes — check for the flag combo instead of
 	// looking for a literal `\\` sequence (which never existed post-parse).
 	//
-	// Patterns are intentionally tiered:
-	//   - Flag-combo patterns catch the specific pre-Phase-2 multi-line form.
-	//   - Word-boundary `gh pr create ` catches any regression regardless
-	//     of arg ordering/spelling (the PR branch now uses `gt refinery pr
-	//     create` only; a bare `gh pr create` should never appear).
-	//   - `gh pr merge ` / `gh pr checks ` are broader guards for future
-	//     regressions with different flags/placeholders. Trailing space
-	//     keeps them from matching prose mentions like "`gh pr checks $PR`"
-	//     inside backticked code snippets in error messages.
+	// Patterns are intentionally specific (not broader word-boundary prefixes
+	// like bare `gh pr create `):
+	//   - The PR branch's prose legitimately references `gh pr checks $PR`
+	//     inside single-quoted prose ("Error: run 'gh pr checks $PR' for
+	//     details") as a user-facing hint. A broader `gh pr checks ` prefix
+	//     would false-positive on that prose.
+	//   - For `gh pr create`, we enumerate the common pre-Phase-2 flag combos
+	//     (`--base`/`--head`/`--title`/`--fill`). A regression reintroducing
+	//     the old raw-gh form will almost certainly include one of these,
+	//     since `gh pr create` requires at least some of them to be useful.
+	//   - For `gh pr merge`/`gh pr checks`, anchoring to the `<polecat-branch>`
+	//     placeholder catches the exact pre-refactor named-arg form the
+	//     original PR-mode code used.
+	// If a future regression slips through these specific patterns (e.g.,
+	// a new flag combo on `gh pr create`, or `gh pr merge $VAR` without
+	// `<polecat-branch>`), add the specific pattern here — don't broaden
+	// to a trailing-space prefix that'd false-positive on the prose hint.
 	forbiddenInPRBranch := []string{
 		`gh pr create --base`,           // pre-Phase-2 multi-line create form, --base first
 		`gh pr create --head`,           // pre-Phase-2 multi-line create form, --head first
