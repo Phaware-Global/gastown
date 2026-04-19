@@ -861,8 +861,11 @@ func (r *Router) shouldBeWisp(msg *Message) bool {
 func (r *Router) Send(msg *Message) error {
 	// Defense-in-depth: refuse sends from `go test` binaries so unit
 	// tests under other packages can't pollute the production
-	// Dolt-backed mail queue. The mail package's own tests opt in via
-	// `allowTestSend = true` in TestMain. Surfaced during Telegraph v1
+	// Dolt-backed mail queue. The mail package's own tests opt in by
+	// calling `setAllowTestSend(true)` from TestMain (see
+	// internal/mail/test_guard.go and internal/mail/testmain_test.go —
+	// the flag is an atomic.Bool named `allowTestSendFlag` so future
+	// parallel tests stay race-free). Surfaced during Telegraph v1
 	// dogfood (G8): polecat `go test ./...` runs were flooding the
 	// mayor's inbox with ~36 fake MERGED notifications per cycle, each
 	// a Dolt commit, starving the rest of the engine.
