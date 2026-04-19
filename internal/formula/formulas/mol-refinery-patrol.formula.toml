@@ -752,10 +752,24 @@ REVIEW_LOOP_ITER=$(echo "$MR_JSON" | jq -r '.description' \
 REVIEW_LOOP_ITER=${REVIEW_LOOP_ITER:-0}
 
 # 2. If a review-fix polecat is already in flight, check whether it's done.
+# Use a two-stage command so we can distinguish "status lookup failed" from
+# "status lookup succeeded but polecat is gone". Without this, a transient
+# `gt polecat status` failure (lock contention, rig stopped, network blip)
+# produces an empty jq result that falls through to the terminal clause
+# below and clears `review_fix_polecat` — losing track of the in-flight
+# polecat and re-dispatching on the next patrol.
 if [ -n "$REVIEW_FIX_POLECAT" ]; then
-  POLECAT_STATUS=$({{ cmd }} polecat status "{{rig}}/$REVIEW_FIX_POLECAT" --json 2>/dev/null \
-                    | jq -r '.state // "unknown"')
-  case "$POLECAT_STATUS" in
+  POLECAT_STATUS_JSON=$({{ cmd }} polecat status "{{rig}}/$REVIEW_FIX_POLECAT" --json 2>/dev/null)
+  POLECAT_STATUS_RC=$?
+  if [ $POLECAT_STATUS_RC -ne 0 ] || [ -z "$POLECAT_STATUS_JSON" ]; then
+    # Status lookup failed (non-zero exit or empty stdout). Keep the
+    # "polecat in flight" state and try again next patrol. DO NOT clear
+    # review_fix_polecat — we can't prove the polecat is gone.
+    echo "PR #$PR: polecat $REVIEW_FIX_POLECAT status check failed (rc=$POLECAT_STATUS_RC); retrying next patrol"
+    return 0 2>/dev/null || exit 0
+  fi
+  POLECAT_STATE=$(echo "$POLECAT_STATUS_JSON" | jq -r '.state // empty')
+  case "$POLECAT_STATE" in
     alive|idle|working)
       # Still addressing threads. Skip this MR this cycle — we'll
       # re-check on the next patrol. Proceed to loop-check so OTHER
@@ -764,12 +778,21 @@ if [ -n "$REVIEW_FIX_POLECAT" ]; then
       # Skip directly to loop-check (not to merge — PR isn't ready yet).
       return 0 2>/dev/null || exit 0
       ;;
-    *)
-      # Terminal (done/nuked/error): clear the in-flight marker and
-      # re-request review since the polecat may have pushed new commits.
+    done|dead|nuked|killed|error|failed)
+      # Terminal: clear the in-flight marker and re-request review since
+      # the polecat may have pushed new commits.
       {{ cmd }} mq set-review-state "$MR" --clear-polecat
       [ -n "{{pr_reviewer}}" ] && {{ cmd }} refinery pr request-review $PR --user {{pr_reviewer}}
       REVIEW_FIX_POLECAT=""
+      ;;
+    *)
+      # Unknown state (including empty). Treat as transient — keep the
+      # marker and retry next patrol rather than assume terminal. If the
+      # polecat really is gone, a subsequent patrol will observe a
+      # recognized terminal state or the status lookup will start
+      # returning an error we can classify.
+      echo "PR #$PR: polecat $REVIEW_FIX_POLECAT in unrecognized state %q=$POLECAT_STATE; retrying next patrol"
+      return 0 2>/dev/null || exit 0
       ;;
   esac
 fi

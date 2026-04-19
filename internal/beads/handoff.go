@@ -199,6 +199,18 @@ func (b *Beads) lockBead(beadID string) (func(), error) {
 	return lock.FlockAcquire(lockPath)
 }
 
+// LockBead is the exported form of lockBead for callers outside the beads
+// package that need to serialize cross-process read-modify-write cycles on a
+// single bead's description (e.g., the refinery's patrol formula mutating MR
+// fields concurrently with other MR-description writers). Returns a cleanup
+// function that releases the lock; callers MUST defer it.
+//
+// Lock scope is per-bead; different bead IDs contend on different lock files,
+// so this does not introduce global serialization.
+func (b *Beads) LockBead(beadID string) (func(), error) {
+	return b.lockBead(beadID)
+}
+
 // AttachMolecule attaches a molecule to a pinned bead by updating its description.
 // The moleculeID is the root issue ID of the molecule to attach.
 // Uses advisory file locking to prevent concurrent read-modify-write races.

@@ -67,19 +67,28 @@ func init() {
 	mqCmd.AddCommand(mqSetReviewStateCmd)
 }
 
-func runMqSetReviewState(_ *cobra.Command, args []string) error {
+func runMqSetReviewState(cmd *cobra.Command, args []string) error {
 	mrID := args[0]
+
+	// The int flag's default is -1 (sentinel for "unset"). Bare default-
+	// comparison would silently accept `--iter -5` as "not provided", which
+	// is surprising. Read Changed() to distinguish "flag not passed" from
+	// "flag passed with a negative value" and reject the latter explicitly.
+	iterProvided := cmd.Flags().Changed("iter")
+	if iterProvided && mqSetReviewStateIter < 0 {
+		return fmt.Errorf("--iter must be ≥0, got %d", mqSetReviewStateIter)
+	}
 
 	// Conflicting flag combinations fail fast so the caller finds out
 	// immediately rather than after the read-modify-write round trip.
 	if mqSetReviewStatePolecat != "" && mqSetReviewStateClearPolecat {
 		return fmt.Errorf("--polecat and --clear-polecat are mutually exclusive")
 	}
-	if mqSetReviewStateIter >= 0 && mqSetReviewStateClearIter {
+	if iterProvided && mqSetReviewStateClearIter {
 		return fmt.Errorf("--iter and --clear-iter are mutually exclusive")
 	}
 	if mqSetReviewStatePolecat == "" && !mqSetReviewStateClearPolecat &&
-		mqSetReviewStateIter < 0 && !mqSetReviewStateClearIter {
+		!iterProvided && !mqSetReviewStateClearIter {
 		return fmt.Errorf("no-op: set at least one of --polecat/--clear-polecat/--iter/--clear-iter")
 	}
 
@@ -87,6 +96,17 @@ func runMqSetReviewState(_ *cobra.Command, args []string) error {
 	// path uses for cross-rig writes). We don't need a rig name on the
 	// command line because the MR prefix routes us to the correct .beads.
 	bd := beads.New(resolveBeadDir(mrID))
+
+	// Acquire a per-bead advisory lock so the read-modify-write below is
+	// serialized against other writers of the same MR's description
+	// (refinery patrol, mq reject, direct `bd update`, etc.). Without
+	// this, a concurrent writer's change to another field (e.g.,
+	// close_reason) could race with ours and be lost on last-writer-wins.
+	unlock, err := bd.LockBead(mrID)
+	if err != nil {
+		return fmt.Errorf("acquiring bead lock for %s: %w", mrID, err)
+	}
+	defer unlock()
 
 	issue, err := bd.Show(mrID)
 	if err != nil {
@@ -113,7 +133,8 @@ func runMqSetReviewState(_ *cobra.Command, args []string) error {
 	switch {
 	case mqSetReviewStateClearIter:
 		fields.ReviewLoopIter = 0
-	case mqSetReviewStateIter >= 0:
+	case iterProvided:
+		// Negative values were rejected above; at this point mqSetReviewStateIter ≥ 0.
 		fields.ReviewLoopIter = mqSetReviewStateIter
 	}
 
