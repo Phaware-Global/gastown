@@ -86,6 +86,103 @@ func TestCreateOptionsRig(t *testing.T) {
 	}
 }
 
+// TestBuildBdCreateArgsRigMapsToRepoFlag guards against regression of the
+// Rig-vs-Repo flag mismatch. `bd create` has no `--rig` flag — only
+// `--repo` — so passing `--rig=<name>` fails every rig-scoped MR bead
+// create. This broke silently in production: polecats pushed branches
+// but no MR bead was stamped, which in turn led the refinery to
+// improvise a direct push to main. Keep this test as a regression guard
+// even if the field name or call sites get refactored later.
+func TestBuildBdCreateArgsRigMapsToRepoFlag(t *testing.T) {
+	tests := []struct {
+		name      string
+		opts      CreateOptions
+		actor     string
+		wantFlag  string   // flag that MUST be present (exact match)
+		banned    string   // single prefix that MUST NOT appear (prefix match)
+		bannedAll []string // multiple prefixes that MUST NOT appear (prefix match)
+	}{
+		{
+			name: "Rig set emits --repo, never --rig",
+			opts: CreateOptions{
+				Title:    "Merge: gt-abc",
+				Labels:   []string{"gt:merge-request"},
+				Priority: 1,
+				Rig:      "gastown",
+			},
+			actor:    "",
+			wantFlag: "--repo=gastown",
+			banned:   "--rig=",
+		},
+		{
+			name: "empty Rig emits neither --repo nor --rig",
+			opts: CreateOptions{
+				Title: "plain bead",
+			},
+			actor: "",
+			// Both prefixes banned — the test name says "neither --repo
+			// nor --rig" and the check enforces that. Listing both means
+			// a regression that appends either flag on the empty-Rig
+			// path flips the test.
+			bannedAll: []string{"--repo=", "--rig="},
+		},
+		{
+			name: "actor passed through alongside --repo",
+			opts: CreateOptions{
+				Title: "Merge: hq-xyz",
+				Rig:   "heartworks",
+			},
+			actor:    "gastown/polecats/nux",
+			wantFlag: "--repo=heartworks",
+			banned:   "--rig=",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			args := buildBdCreateArgs(tc.opts, tc.actor)
+
+			if tc.wantFlag != "" {
+				found := false
+				for _, a := range args {
+					if a == tc.wantFlag {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("args missing expected flag %q; got %v", tc.wantFlag, args)
+				}
+			}
+
+			bannedPrefixes := append([]string{}, tc.bannedAll...)
+			if tc.banned != "" {
+				bannedPrefixes = append(bannedPrefixes, tc.banned)
+			}
+			for _, prefix := range bannedPrefixes {
+				for _, a := range args {
+					if strings.HasPrefix(a, prefix) {
+						t.Errorf("args contained banned flag %q (full arg %q); got %v", prefix, a, args)
+					}
+				}
+			}
+
+			if tc.actor != "" {
+				expected := "--actor=" + tc.actor
+				found := false
+				for _, a := range args {
+					if a == expected {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("args missing %q; got %v", expected, args)
+				}
+			}
+		})
+	}
+}
+
 // TestIsFlagLikeTitle verifies flag-like title detection (gt-e0kx5).
 func TestIsFlagLikeTitle(t *testing.T) {
 	tests := []struct {

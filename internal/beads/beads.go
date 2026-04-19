@@ -298,7 +298,24 @@ type CreateOptions struct {
 	Parent      string
 	Actor       string // Who is creating this issue (populates created_by)
 	Ephemeral   bool   // Create as ephemeral (wisp) - not synced to git
-	Rig         string // Target rig database (e.g., "gastown"). When set, passes --rig to bd create.
+	// Rig names the target rig database (e.g., "gastown"). When non-empty
+	// it is passed as `--repo=<Rig>` to `bd create`, which overrides bd's
+	// auto-routing and forces the new bead into that rig's database.
+	//
+	// SCOPE: Rig only affects the CLI path (shelling out to `bd`). The
+	// in-process store path (when `Beads.store` is set) ignores Rig —
+	// that path is already bound to a specific database at construction
+	// time, and re-routing to a different rig would need a separate
+	// `Beads` instance. Callers that need rig-scoped creates under the
+	// store path must construct a `Beads` rooted at that rig's beads dir.
+	//
+	// Historically this field sent `--rig=<Rig>` on the wire, but bd has
+	// no `--rig` flag — only `--repo` — so every rig-scoped create
+	// silently failed with "unknown flag: --rig" until this was
+	// corrected. The Go-side field name is kept as `Rig` because the
+	// rest of the codebase calls the target "rig" (polecats, refinery,
+	// etc.); only the on-wire flag differs.
+	Rig string
 }
 
 // UpdateOptions specifies options for updating an issue.
@@ -1188,19 +1205,12 @@ func (b *Beads) Blocked() ([]*Issue, error) {
 	return issues, nil
 }
 
-// Create creates a new issue and returns it.
-// If opts.Actor is empty, it defaults to the BD_ACTOR environment variable.
-// This ensures created_by is populated for issue provenance tracking.
-func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
-	// Guard against flag-like titles (gt-e0kx5: --help garbage beads)
-	if IsFlagLikeTitle(opts.Title) {
-		return nil, fmt.Errorf("refusing to create bead: %w (got %q)", ErrFlagTitle, opts.Title)
-	}
-
-	if b.store != nil && !opts.Ephemeral {
-		return b.storeCreate(opts)
-	}
-
+// buildBdCreateArgs constructs the argv for `bd create` from CreateOptions.
+// Extracted so the flag mapping (especially Rig → `--repo`) can be unit-tested
+// without execing `bd` — the mismatch between the Go-side `Rig` field and
+// bd's on-wire `--repo` flag has caused a silent "every MR bead create fails"
+// bug before, so it deserves a regression guard.
+func buildBdCreateArgs(opts CreateOptions, actor string) []string {
 	args := []string{"create", "--json"}
 
 	if opts.Title != "" {
@@ -1227,17 +1237,34 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 		args = append(args, "--ephemeral")
 	}
 	if opts.Rig != "" {
-		args = append(args, "--rig="+opts.Rig)
-	}
-	// Default Actor from BD_ACTOR env var if not specified
-	// Uses getActor() to respect isolated mode (tests)
-	actor := opts.Actor
-	if actor == "" {
-		actor = b.getActor()
+		// bd's flag is `--repo`, not `--rig`. See CreateOptions.Rig for
+		// the history.
+		args = append(args, "--repo="+opts.Rig)
 	}
 	if actor != "" {
 		args = append(args, "--actor="+actor)
 	}
+	return args
+}
+
+// Create creates a new issue and returns it.
+// If opts.Actor is empty, it defaults to the BD_ACTOR environment variable.
+// This ensures created_by is populated for issue provenance tracking.
+func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
+	// Guard against flag-like titles (gt-e0kx5: --help garbage beads)
+	if IsFlagLikeTitle(opts.Title) {
+		return nil, fmt.Errorf("refusing to create bead: %w (got %q)", ErrFlagTitle, opts.Title)
+	}
+
+	if b.store != nil && !opts.Ephemeral {
+		return b.storeCreate(opts)
+	}
+
+	actor := opts.Actor
+	if actor == "" {
+		actor = b.getActor()
+	}
+	args := buildBdCreateArgs(opts, actor)
 
 	out, err := b.run(args...)
 	if err != nil {
