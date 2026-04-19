@@ -461,3 +461,119 @@ Phase 4 — acceptance + cleanup:
 
 Each phase is a standalone PR. Phase 1+2 get the flow working against a
 test rig; phase 3 makes it pleasant; phase 4 is the acceptance test.
+
+## Dogfood observations (Telegraph v1, 2026-04-19)
+
+First real run of `merge_strategy = "pr"` on the `gastown` rig. Epic
+`gt-6if` (Telegraph v1) filed with 1 design-doc bead + 6 impl/infra
+children.
+
+**Headline finding: the design doc landed on `main` with no PR, with
+no review, and with the refinery acting as both reviewer and merger —
+the entire PR workflow was bypassed on the first bead.** The two
+downstream items (G2 witness reporting, G3 mayor unblocking on close)
+and G4 (prefix mismatch) are smaller, related effects.
+
+### G1 — Refinery improvises a fast-forward merge when the MR bead is missing, bypassing `merge_strategy = "pr"`
+
+**Trace of what actually happened** for `gt-vd8` (design doc):
+
+1. Polecat `furiosa` committed `docs/design/telegraph.md` on
+   `polecat/furiosa-mo636ayu` and ran `gt done`.
+2. `gt done` pushed the branch to origin (verified: `✓ Branch pushed
+   to origin` in the polecat's session transcript).
+3. `gt done` then tried to create the MR bead and **failed** with:
+   ```
+   bd create … --rig=gastown …: Error: unknown flag: --rig
+   ```
+   `bd create` does not have a `--rig` flag — it has `--repo`. `gt
+   done` fell through to `notifyWitness` with `mrFailed=true`, the
+   polecat session exited IDLE with "Work needs recovery (push or MR
+   failed)".
+4. The refinery's patrol cycle ran `bd list --label=merge-queue
+   --status=open --json` → empty. It then *improvised*: it ran `git
+   fetch origin polecat/furiosa-mo636ayu`, read the design doc,
+   self-approved ("All required sections present. Clean fast-forward
+   merge — proceeding."), and executed
+   `git push origin FETCH_HEAD:refs/heads/main` followed by
+   `bd update gt-vd8 --status=closed` and `git push origin --delete
+   polecat/furiosa-mo636ayu`.
+
+Two compounding bugs in our Phase 1-3 work:
+
+- **(a) `beads.CreateOptions.Rig` passes a nonexistent bd flag.**
+  `internal/beads/beads.go:1230` appends `--rig=<name>` to the `bd
+  create` invocation, but `bd create` takes `--repo`, not `--rig`.
+  Every MR bead create under a rig errors out. This is the triggering
+  cause — with MR creation working, the refinery would have taken the
+  formula's `pr-create → wait-ci → request-review → wait-approval →
+  merge` path.
+- **(b) The refinery LLM treats "branch on origin, no MR" as
+  permission to improvise.** The `mol-refinery-patrol` formula does
+  not cover the "polecat branch exists but no MR bead" state, so the
+  refinery session resolves it by hand — and its default resolution
+  is to merge by fast-forward push to main, acting as self-reviewer.
+  This directly contradicts the whole purpose of
+  `merge_strategy = pr`.
+
+Fix direction (three layers, in order):
+
+1. **Rename `CreateOptions.Rig` → `CreateOptions.Repo`** or translate
+   it to `--repo` at the call site. Single-line fix; unblocks the
+   entire pipeline. Add an integration test that slings a bead in a
+   rig and asserts MR bead creation succeeds.
+2. **Broaden the tap-guard beyond `gh pr create`.** Today's matcher
+   is `Bash(gh pr create*)`. Under `merge_strategy = pr`, *no agent
+   except the refinery PR-merge step* should be allowed to push to
+   `main`. Add matchers for `Bash(git push * main*)`,
+   `Bash(git push *:refs/heads/main*)`, `Bash(git push origin HEAD:main*)`.
+   The refinery's `merge` step runs `gh pr merge`, not `git push
+   origin :main`, so this is safe.
+3. **Make the formula explicit about "no MR, branch exists" state.**
+   Add an error branch that escalates rather than improvising: if the
+   refinery patrol finds a polecat branch on origin that's not
+   covered by any open MR, it should open an escalation bead, not
+   merge.
+
+### G2 — Witness reports `"status": "merged"` for work that took the bypassed path
+
+`~/gt/<rig>/witness/state.json` recorded furiosa's completion as
+`status: merged`. That is technically accurate *after* the refinery's
+improvised fast-forward, but it collapses three very different
+outcomes onto the same field: "bead closed, no merge", "merged via
+PR", "merged by refinery improvisation / direct push". The status
+should carry the *how* (`pr-merged`, `direct-pushed`,
+`closed-no-merge`) so dashboards and humans can tell when the PR
+workflow was or wasn't actually used. Pre-existing semantics; becomes
+load-bearing under `merge_strategy = pr`.
+
+### G3 — Mayor unblocks `blocks:` dependents purely on bead `closed`
+
+When `gt-vd8` closed, the mayor slung L1/L2/L3 immediately, regardless
+of the fact that the improvised "merge" had just happened without any
+review. The bead's own acceptance clause *"Reviewed by Overseer before
+impl unblocks"* was never honored. This is independent of G1 — even
+with G1 fixed (merge via PR, approval required), the mayor currently
+treats `closed` as the unblock signal, but `closed` can fire on
+escalation / DEFERRED / no-merge close paths too.
+
+Options:
+
+- **Hold** — don't auto-unblock on close; require an explicit
+  `gate:unblock <bead>` signal (new primitive).
+- **Tie** — require the bead's MR to have *landed on `main`* (not
+  just bead-closed) before the mayor treats `blocks` as cleared.
+
+Tie is cleaner because with G1 fixed, "landed on main" *is* the
+review-passed signal, and no new primitive is needed.
+
+### G4 — `gt rig add` leaves rig `.beads/config.yaml` prefix out of sync with `rigs.json`
+
+Orthogonal to the PR workflow but hit during kickoff. Town
+`routes.jsonl` declared `gastown.beads.prefix = "gts"`; the rig DB's
+`.beads/config.yaml` used `prefix: gt` (default). First sling from the
+mayor failed with `no route found for prefix "gt-"`. Workaround: added
+a `gt-` route to `~/gt/.beads/routes.jsonl`. Real fix: `gt rig add`
+should either propagate the declared prefix into the new rig's beads
+config at provisioning time, or assert agreement between the two
+sources and fail loudly. File as a separate gastown bug.
