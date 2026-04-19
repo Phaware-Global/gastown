@@ -356,12 +356,11 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 	if updates.FormulaVars != "" {
 		fields.FormulaVars = updates.FormulaVars
 	}
-	if updates.ReviewPR > 0 {
-		fields.ReviewPR = updates.ReviewPR
-	}
-	if updates.ReviewBranch != "" {
-		fields.ReviewBranch = updates.ReviewBranch
-	}
+	// Review-dispatch metadata is per-dispatch: always overwrite (including to
+	// zero/empty) so a re-sling without --pr/--branch doesn't inherit stale
+	// review-fix context from a previous dispatch.
+	fields.ReviewPR = updates.ReviewPR
+	fields.ReviewBranch = updates.ReviewBranch
 
 	// Write back once
 	newDesc := beads.SetAttachmentFields(issue, fields)

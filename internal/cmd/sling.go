@@ -166,7 +166,7 @@ func init() {
 	slingCmd.Flags().StringVar(&slingCrew, "crew", "", "Target a crew member in the specified rig (e.g., --crew mel with target gastown → gastown/crew/mel)")
 	slingCmd.Flags().BoolVar(&slingReviewOnly, "review-only", false, "Mark work as review-only: assignee evaluates and reports back, must NOT merge/commit/push")
 	slingCmd.Flags().IntVar(&slingPR, "pr", 0, "Dispatch polecat to work on an existing GitHub PR (checks out the PR's branch)")
-	slingCmd.Flags().StringVar(&slingBranchOverride, "branch", "", "Explicit branch for the polecat to check out (overrides default polecat/<worker> naming; implies --pr if PR exists for branch)")
+	slingCmd.Flags().StringVar(&slingBranchOverride, "branch", "", "Explicit branch for the polecat to check out (overrides default polecat/<worker> naming; pair with --pr for review-fix dispatches)")
 
 	slingCmd.AddCommand(slingRespawnResetCmd)
 	rootCmd.AddCommand(slingCmd)
