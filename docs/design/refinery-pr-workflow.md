@@ -614,3 +614,66 @@ whole dispatch pipeline. Worth filing as a separate gastown bug
 (alongside the rig-provisioning fix from G4) and covering with an
 integration test that starts a deacon and asserts a patrol cycle
 advances within N seconds.
+
+### G6 — witness false-positives `-- INSERT --` status as "stuck in INSERT mode"
+
+After the fix-stack landed and polecats were re-dispatched, the
+witness fired two HIGH escalations in rapid succession:
+
+- `hq-14a` (14:04) — "Sling succeeded (created 4 convoys) but work
+  never reached hooks. All polecats completed empty and hung in
+  INSERT mode. **Polecats nuked**. Investigate sling→polecat work
+  routing."
+- `hq-ihh` (14:13) — "Systemic INSERT mode failure: Polecats
+  stalling on interactive prompts during work dispatch. furiosa
+  stuck in INSERT mode on gt-ipc task."
+
+But peeking directly at each polecat's tmux pane at the time of the
+second escalation showed them ACTIVELY working:
+
+    ✽ Orchestrating… (4m 5s · ↓ 6.1k tokens · thinking)
+    …
+    -- INSERT -- ⏵⏵ bypass permissions on
+
+Claude Code's status line shows `-- INSERT --` during the normal
+between-turn state — that's how Claude Code displays idle input mode
+whenever it's not actively emitting a tool call. A polecat thinking
+for 4 minutes shows the same banner as one that's genuinely stuck;
+the witness can't distinguish from that alone.
+
+The 14:04 escalation's first batch was probably a real failure (the
+routing issue it names), but the 14:13 alert was a false positive
+that triggered a destructive action: the witness nuked 4 actively
+working polecats based on the same signal Claude shows during normal
+thinking cycles.
+
+Fix direction:
+
+1. **Witness stuck-detection must not rely on tmux screen scraping
+   for `-- INSERT --`.** That string is visible during normal
+   operation. Use a real liveness signal instead — polecat heartbeat
+   bead updates (the same mechanism the deacon/refinery use), token
+   rate, or an explicit "last-activity" timestamp surfaced by Claude
+   Code's session state.
+2. **Don't nuke on a single alarm.** The witness should require
+   multiple stale heartbeats across >N cycles before nuking, and
+   polecats with active git activity (commits landing on their
+   branch after the heartbeat check started) should be exempt.
+
+This is adjacent to the PR workflow but becomes visible under it:
+the PR path extends polecat work time (design/implementation is
+longer than quick fixes), which gives the witness more opportunities
+to false-alarm on what looks like "stuck" sessions.
+
+### Tangent observation: sling→hook routing (first-batch failure, self-corrected)
+
+The `hq-14a` escalation's "Sling succeeded but work never reached
+hooks" description is a separate real issue from G6 — the first
+post-restart batch genuinely didn't get its work (polecats spawned
+with empty hooks). The mayor re-dispatched a second batch at ~14:13
+and that second batch did receive work correctly. Since I can't
+reproduce the routing failure from the existing evidence (the failed
+first-batch polecats were nuked before I could inspect their hook
+beads), I'm noting this here as something to watch for on the next
+cycle rather than a definitive G-item. If it recurs, promote to a
+numbered observation.
