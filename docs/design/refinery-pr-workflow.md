@@ -394,11 +394,17 @@ Phase 3 — fixes that unblock the loop:
 9. Mayor mail-send on merge (replaces nudge)
 
 Phase 4 — acceptance + cleanup:
-10. Add an integration test in this repo that loads `mol-refinery-patrol`
-    with `merge_strategy=pr` and asserts the formula resolves to the new
-    `gt refinery pr …` orchestration (no raw `gh pr create` in the
-    rendered step, no direct `git push origin main`). This protects the
-    Phase 2 refactor from silent regression.
+10. Add an integration test in this repo that parses the embedded
+    `mol-refinery-patrol.formula.toml`, locates the `merge-push` step,
+    and asserts under the `If merge_strategy = "pr":` gate marker that
+    the step's description drives the flow through `gt refinery pr …`
+    subcommands (not raw `gh pr create --base/--head`, `gh pr merge
+    <branch>`, or `gh pr checks <branch>`). The test is a substring
+    guard on the parsed step text — it does not instantiate a wisp or
+    substitute vars; instantiation-time validation is orthogonal and
+    remains the domain of `TestParseRealFormulas` +
+    `variable_validation_test`. This cheap static check is enough to
+    protect the Phase 2 refactor from silent regression.
 11. **Out of this repo** — in the user's `~/gt` workspace, remove
     `jira_claude_channel/formula-overlays/mol-refinery-patrol.toml` and
     `~/.gt/hooks-overrides/jira_claude_channel__refinery.json` as a

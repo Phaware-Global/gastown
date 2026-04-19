@@ -36,19 +36,32 @@ func TestRefineryPatrolMergePushHasPRBranch(t *testing.T) {
 	}
 	desc := mergePush.Description
 
+	// Gate assertion: the PR orchestration must live inside a branch that's
+	// explicitly gated on merge_strategy="pr". Without this check, a
+	// regression could move the `gt refinery pr …` calls outside the
+	// conditional (e.g., accidentally running them on every merge path)
+	// and the PR-subcommand checks below would still pass.
+	prBranchMarker := `If merge_strategy = "pr":`
+	prBranchIdx := strings.Index(desc, prBranchMarker)
+	if prBranchIdx < 0 {
+		t.Fatalf("merge-push description missing the %q gate marker — PR orchestration must be gated on merge_strategy", prBranchMarker)
+	}
+	prBranchDesc := desc[prBranchIdx:]
+
 	// Phase 2 contract: the PR branch must drive the workflow through
-	// `gt refinery pr …` subcommands. If any of these disappear, the
-	// formula has silently regressed to embedding raw gh plumbing.
-	mustContain := []string{
+	// `gt refinery pr …` subcommands. Scoped to prBranchDesc so we're
+	// asserting orchestration under the strategy gate, not anywhere in
+	// the step text.
+	mustContainInPRBranch := []string{
 		`{{ cmd }} refinery pr create`,
 		`{{ cmd }} refinery pr wait-ci`,
 		`{{ cmd }} refinery pr request-review`,
 		`{{ cmd }} refinery pr wait-approval`,
 		`{{ cmd }} refinery pr merge`,
 	}
-	for _, pattern := range mustContain {
-		if !strings.Contains(desc, pattern) {
-			t.Errorf("merge-push description missing expected PR orchestration: %q\n(indicates Phase 2 regression)",
+	for _, pattern := range mustContainInPRBranch {
+		if !strings.Contains(prBranchDesc, pattern) {
+			t.Errorf("PR-mode branch missing expected orchestration: %q\n(indicates Phase 2 regression — subcommand may have moved outside the merge_strategy=pr gate)",
 				pattern)
 		}
 	}
@@ -67,19 +80,21 @@ func TestRefineryPatrolMergePushHasPRBranch(t *testing.T) {
 		}
 	}
 
-	// Negative assertion: the old raw-gh PR-create path must NOT appear
-	// in the PR branch anymore. Allow the marker inside the direct path's
-	// "check for open PR on branch" code (gas-fk4) — that's `gh pr list`,
-	// not `gh pr create`. Matching `gh pr create --base` catches the
-	// specific pattern the refactor removed.
-	forbiddenInPR := []string{
-		`gh pr create \\`, // the multi-line `gh pr create --base ... --head ... ` form
-		`gh pr merge <polecat-branch>`,
-		`gh pr checks <polecat-branch> --repo`,
+	// Negative assertion: the old raw-gh PR-create/merge/checks calls must
+	// not reappear inside the PR branch. TOML multi-line basic strings strip
+	// `\`-newline line continuations on parse, so the original
+	// `gh pr create --base ... --head ...` multi-line form lands as a single
+	// logical line with no backslashes — check for the flag combo instead of
+	// looking for a literal `\\` sequence (which never existed post-parse).
+	forbiddenInPRBranch := []string{
+		`gh pr create --base`,               // the multi-line gh pr create form
+		`gh pr create --head`,               // either arg ordering
+		`gh pr merge <polecat-branch>`,      // old named-arg merge call
+		`gh pr checks <polecat-branch>`,     // old named-arg checks call
 	}
-	for _, pattern := range forbiddenInPR {
-		if strings.Contains(desc, pattern) {
-			t.Errorf("merge-push description still contains pre-Phase-2 raw-gh plumbing: %q\n(should be replaced by `gt refinery pr …` subcommands)",
+	for _, pattern := range forbiddenInPRBranch {
+		if strings.Contains(prBranchDesc, pattern) {
+			t.Errorf("PR-mode branch still contains pre-Phase-2 raw-gh plumbing: %q\n(should be replaced by `gt refinery pr …` subcommands)",
 				pattern)
 		}
 	}
