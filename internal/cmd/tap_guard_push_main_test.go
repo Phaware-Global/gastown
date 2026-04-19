@@ -59,6 +59,14 @@ func TestIsPushToMain(t *testing.T) {
 		{"--push-option main (flag value)", "git push origin feature --push-option main", false},
 		{"--receive-pack main (flag value)", "git push origin feature --receive-pack main", false},
 		{"--push-option=main (= form already filtered)", "git push origin feature --push-option=main", false},
+
+		// Iter-2 negatives — single-positional refspec pushes (the
+		// "one-arg refspec" case). A single token with a colon is a
+		// refspec even without a remote; we must evaluate it as a
+		// refspec (fully), never fall through to currentBranchIsMain.
+		{"single-arg HEAD:feature", "git push HEAD:feature", false},
+		{"single-arg :feature (delete)", "git push :feature", false},
+		{"single-arg feat:feat", "git push feat/x:feat/x", false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

@@ -183,17 +183,26 @@ func isPushToMain(command string) bool {
 	case len(positionals) == 0:
 		return currentBranchIsMain()
 	case len(positionals) == 1:
-		// Either "git push <remote>" (no refspec → upstream push) or
-		// "git push <refspec>" (no remote). Treat as a no-refspec case
-		// if the single token looks like a remote name (no ':' and not
-		// starting with a ref-ish token like HEAD/refs/*). If it looks
-		// like a refspec, fall through to the refspec test.
+		// One positional: either "git push <remote>" (no refspec, push the
+		// current branch's upstream) or "git push <refspec>" (no remote).
 		only := positionals[0]
 		if refspecTargetsMain(only) {
 			return true
 		}
-		// Bare push on main → push to main. If we can't tell, fail-open
-		// here (current branch check returns false on any error).
+		// If the single token is a refspec (contains a colon — e.g.
+		// "HEAD:feature", ":feature", "main:feature"), we've fully
+		// evaluated it above. Don't fall through to currentBranchIsMain —
+		// that would false-positive on "git push HEAD:feature" when
+		// the user happens to be on main but is clearly pushing to
+		// feature.
+		if strings.Contains(only, ":") {
+			return false
+		}
+		// No colon: the token could be either a remote name ("origin")
+		// or a short branch name ("main"). "main" was already caught
+		// by refspecTargetsMain above, so any remaining single no-colon
+		// token is treated as a remote name — push targets the current
+		// branch's upstream, which is main only when HEAD=main.
 		return currentBranchIsMain()
 	default:
 		// First positional is the remote; check every subsequent positional.
