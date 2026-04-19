@@ -758,6 +758,11 @@ REVIEW_FIX_POLECAT=$(echo "$MR_DESC" \
   | awk -F': ' '/^review_fix_polecat:/ {print $2; exit}')
 REVIEW_LOOP_ITER=$(echo "$MR_DESC" \
   | awk -F': ' '/^review_loop_iter:/ {print $2; exit}')
+# Sanitize to digits only. A non-numeric or trailing-whitespace value here
+# would blow up the `-ge` test and the `$((... + 1))` arithmetic below and
+# could leave the loop in a broken state. Strip non-digits and fall back
+# to 0 — conservative for a hand-edited MR bead.
+REVIEW_LOOP_ITER=$(printf '%s' "$REVIEW_LOOP_ITER" | tr -cd '0-9')
 REVIEW_LOOP_ITER=${REVIEW_LOOP_ITER:-0}
 
 # 2. If a review-fix polecat is already in flight, check whether it's done.

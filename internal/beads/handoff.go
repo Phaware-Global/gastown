@@ -187,10 +187,35 @@ func (b *Beads) ClearMail(reason string) (*ClearMailResult, error) {
 	return result, nil
 }
 
+// validateLockBeadID rejects bead IDs that could produce unexpected filesystem
+// paths when used to construct `<beadsDir>/locks/<beadID>.flock`. Bead IDs
+// are short tokens like `gt-abc123`; anything containing path separators,
+// `.`/`..`, or whitespace/control characters has no business here and is
+// almost certainly a bug in the caller or an untrusted input that slipped
+// through validation.
+func validateLockBeadID(beadID string) error {
+	if beadID == "" {
+		return fmt.Errorf("bead ID is empty")
+	}
+	if beadID == "." || beadID == ".." {
+		return fmt.Errorf("bead ID %q is a reserved path component", beadID)
+	}
+	if strings.ContainsAny(beadID, "/\\") {
+		return fmt.Errorf("bead ID %q contains a path separator", beadID)
+	}
+	if strings.ContainsAny(beadID, "\x00\n\r\t ") {
+		return fmt.Errorf("bead ID %q contains whitespace or a control character", beadID)
+	}
+	return nil
+}
+
 // lockBead acquires a cross-process advisory lock for a bead operation.
 // Returns a cleanup function that releases the lock.
 // Lock files are stored in <beadsDir>/locks/<beadID>.flock.
 func (b *Beads) lockBead(beadID string) (func(), error) {
+	if err := validateLockBeadID(beadID); err != nil {
+		return nil, err
+	}
 	locksDir := filepath.Join(b.getResolvedBeadsDir(), "locks")
 	if err := os.MkdirAll(locksDir, 0755); err != nil {
 		return nil, fmt.Errorf("creating locks directory: %w", err)
@@ -207,6 +232,11 @@ func (b *Beads) lockBead(beadID string) (func(), error) {
 //
 // Lock scope is per-bead; different bead IDs contend on different lock files,
 // so this does not introduce global serialization.
+//
+// The underlying lock file path is derived from `beadID`, so this method
+// validates the ID shape (no path separators, no `.`/`..`, no whitespace/
+// control characters) as defense-in-depth. Callers can still pre-validate
+// for earlier error paths, but they don't have to — bad IDs fail here.
 func (b *Beads) LockBead(beadID string) (func(), error) {
 	return b.lockBead(beadID)
 }
