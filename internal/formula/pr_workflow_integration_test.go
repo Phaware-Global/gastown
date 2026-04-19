@@ -46,7 +46,30 @@ func TestRefineryPatrolMergePushHasPRBranch(t *testing.T) {
 	if prBranchIdx < 0 {
 		t.Fatalf("merge-push description missing the %q gate marker — PR orchestration must be gated on merge_strategy", prBranchMarker)
 	}
-	prBranchDesc := desc[prBranchIdx:]
+
+	// Bound the branch slice to just the PR section. Step PR.7 is the last
+	// PR-strategy step; after it the merge-push text continues with shared
+	// post-merge sections (`**Step 2: Send MERGED Notification`, Step 3
+	// cleanup, etc.) that apply to both direct and pr paths. Without bounding,
+	// a regression that puts raw gh plumbing in the shared section would
+	// false-positive as a PR-branch regression, and — worse — a check moving
+	// OUT of the PR branch into the shared section would still pass the
+	// must-contain assertion.
+	//
+	// We stop at the first "**Step N:" header where N is NOT "PR.…". If no
+	// such marker is found (the PR section happens to be the last thing in
+	// the step), fall back to end-of-string.
+	prBranchRest := desc[prBranchIdx:]
+	prBranchEnd := len(prBranchRest)
+	for _, stopMarker := range []string{
+		"\n**Step 2: Send MERGED",   // the first shared post-merge step
+		"\nIf merge_strategy = \"",   // any future additional strategy branch
+	} {
+		if idx := strings.Index(prBranchRest, stopMarker); idx >= 0 && idx < prBranchEnd {
+			prBranchEnd = idx
+		}
+	}
+	prBranchDesc := prBranchRest[:prBranchEnd]
 
 	// Phase 2 contract: the PR branch must drive the workflow through
 	// `gt refinery pr …` subcommands. Scoped to prBranchDesc so we're
@@ -86,11 +109,23 @@ func TestRefineryPatrolMergePushHasPRBranch(t *testing.T) {
 	// `gh pr create --base ... --head ...` multi-line form lands as a single
 	// logical line with no backslashes — check for the flag combo instead of
 	// looking for a literal `\\` sequence (which never existed post-parse).
+	//
+	// Patterns are intentionally tiered:
+	//   - Flag-combo patterns catch the specific pre-Phase-2 multi-line form.
+	//   - Word-boundary `gh pr create ` catches any regression regardless
+	//     of arg ordering/spelling (the PR branch now uses `gt refinery pr
+	//     create` only; a bare `gh pr create` should never appear).
+	//   - `gh pr merge ` / `gh pr checks ` are broader guards for future
+	//     regressions with different flags/placeholders. Trailing space
+	//     keeps them from matching prose mentions like "`gh pr checks $PR`"
+	//     inside backticked code snippets in error messages.
 	forbiddenInPRBranch := []string{
-		`gh pr create --base`,               // the multi-line gh pr create form
-		`gh pr create --head`,               // either arg ordering
-		`gh pr merge <polecat-branch>`,      // old named-arg merge call
-		`gh pr checks <polecat-branch>`,     // old named-arg checks call
+		`gh pr create --base`,           // pre-Phase-2 multi-line create form, --base first
+		`gh pr create --head`,           // pre-Phase-2 multi-line create form, --head first
+		`gh pr create --title`,          // create with --title at head of args
+		`gh pr create --fill`,           // another common form
+		`gh pr merge <polecat-branch>`,  // pre-refactor named-arg merge
+		`gh pr checks <polecat-branch>`, // pre-refactor named-arg checks
 	}
 	for _, pattern := range forbiddenInPRBranch {
 		if strings.Contains(prBranchDesc, pattern) {
