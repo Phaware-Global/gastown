@@ -579,3 +579,38 @@ a `gt-` route to `~/gt/.beads/routes.jsonl`. Real fix: `gt rig add`
 should either propagate the declared prefix into the new rig's beads
 config at provisioning time, or assert agreement between the two
 sources and fail loudly. File as a separate gastown bug.
+
+### G5 — `gt deacon start` / `restart` leaves the Claude session parked in INSERT mode
+
+After the fix-stack landed and I restarted services for round two of
+the Telegraph v1 dogfood, `gt deacon restart` reported "✓ Deacon
+session started" and `gt deacon status` showed the session running —
+but the deacon's heartbeat stayed **45+ minutes stale** and no work
+moved. Peeking at the tmux pane revealed the cause: the Claude Code
+process inside the deacon's tmux session was sitting at an empty
+prompt in `-- INSERT --` mode, waiting for human input. No patrol
+loop ever started, which is why the earlier witness escalation
+(`hq-kgm` at 13:02) read *"Deacon stuck in editor mode - preventing
+polecat spawning"* — same failure mode, hit twice in one session.
+
+Workaround: `tmux send-keys -t hq-deacon "gt prime --hook" Enter`
+manually, which kicks Claude into the priming sequence and the patrol
+starts. The same failure likely applies to mayor/witness restarts,
+but my mayor session carried over from the pre-fix run so I didn't
+observe it there.
+
+Fix direction:
+
+- `gt deacon start` / `restart` should pipe the initial patrol
+  invocation (`gt prime --hook` or equivalent) to the new Claude
+  process automatically, not rely on a human attaching to type it.
+- Or: the SessionStart hook already runs `gt prime --hook`, but it's
+  executing in the wrong context (doesn't feed the prompt to Claude).
+  Verify and wire it up properly.
+
+Not a blocker for merge_strategy=pr itself — but every polecat dispatch
+flows through the deacon, so a stuck deacon is load-bearing on the
+whole dispatch pipeline. Worth filing as a separate gastown bug
+(alongside the rig-provisioning fix from G4) and covering with an
+integration test that starts a deacon and asserts a patrol cycle
+advances within N seconds.
