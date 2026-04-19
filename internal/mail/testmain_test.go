@@ -14,7 +14,7 @@ func TestMain(m *testing.M) {
 	// test-binary guard in Router.Send (see test_guard.go). Other
 	// packages that test mail-using code must use an in-memory fake;
 	// they do NOT get this opt-in.
-	allowTestSend = true
+	setAllowTestSend(true)
 
 	code := m.Run()
 	testutil.TerminateDoltContainer()

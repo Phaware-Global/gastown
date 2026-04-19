@@ -5,15 +5,36 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 )
 
-// allowTestSend short-circuits the test-binary guard in Router.Send.
-// It is ONLY set by this package's own TestMain so the mail package's
-// routing tests can exercise the real Send path. It is unexported so
-// other packages cannot opt in.
+// allowTestSendFlag short-circuits the test-binary guard in Router.Send.
+// It is ONLY flipped on by this package's own TestMain so the mail
+// package's routing tests can exercise the real Send path. It is
+// unexported so other packages cannot opt in.
 //
+// sync/atomic.Bool so any future test that uses t.Parallel() can't
+// race with other tests reading the flag inside checkTestSendGuard.
 // Production code must never touch this variable.
-var allowTestSend bool
+var allowTestSendFlag atomic.Bool
+
+// setAllowTestSend flips the opt-in for this package's own tests.
+// Unexported — callers outside the package cannot bypass the guard.
+func setAllowTestSend(v bool) { allowTestSendFlag.Store(v) }
+
+// isTestBinaryName reports whether `name` (expected to be
+// filepath.Base(os.Args[0])) looks like a Go test binary. Shared
+// between the production `runningAsTestBinary` classifier and the
+// tests that cover it, so the two can't drift.
+//
+// Go's `go test` produces binaries whose names end in `.test` on
+// Unix or `.test.exe` on Windows. We rely on that convention rather
+// than env vars or build tags — see runningAsTestBinary's docstring
+// for the trade-off analysis.
+func isTestBinaryName(name string) bool {
+	return strings.HasSuffix(name, ".test") ||
+		strings.HasSuffix(name, ".test.exe")
+}
 
 // runningAsTestBinary reports whether the current process was launched
 // by `go test`. Go's test framework compiles each package into a binary
@@ -31,16 +52,14 @@ func runningAsTestBinary() bool {
 	if len(os.Args) == 0 {
 		return false
 	}
-	exe := filepath.Base(os.Args[0])
-	return strings.HasSuffix(exe, ".test") || strings.HasSuffix(exe, ".test.exe")
+	return isTestBinaryName(filepath.Base(os.Args[0]))
 }
 
-// errTestSendRefused is returned by Router.Send when a test binary
-// tries to send mail through the production backend.
+// errTestSendRefused is returned (wrapped) by Router.Send when a test
+// binary tries to send mail through the production backend.
 //
-// Exported as a package sentinel so tests that want to VERIFY the guard
-// fires can match on `errors.Is(err, errTestSendRefused)`. Unexported
-// so external callers can't silence the guard by checking for it.
+// Unexported — in-package tests can match on it via errors.Is, but
+// external callers cannot silence the guard by checking for it.
 var errTestSendRefused = fmt.Errorf("mail.Router.Send refused under test binary")
 
 // checkTestSendGuard returns a non-nil error when the current process
@@ -51,7 +70,7 @@ var errTestSendRefused = fmt.Errorf("mail.Router.Send refused under test binary"
 // Split out from Router.Send so it can be unit-tested without spinning
 // up a real Router.
 func checkTestSendGuard() error {
-	if allowTestSend || !runningAsTestBinary() {
+	if allowTestSendFlag.Load() || !runningAsTestBinary() {
 		return nil
 	}
 	return fmt.Errorf("%w (binary=%q): code under test called mail.Router.Send against the production Dolt-backed mail queue. "+
