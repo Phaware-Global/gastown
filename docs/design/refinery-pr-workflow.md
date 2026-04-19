@@ -862,3 +862,76 @@ compound: Dolt lock timeouts look like stuck polecats, witness
 false-positives as INSERT mode stalls, polecat gets nuked before
 retry, work stranded. Either one alone would be survivable; together
 they make the PR workflow unreliable under load.
+
+### G10 — Layer 1 mail guard is bypassed by subprocess `gt mail send`
+
+PR #9's `checkTestSendGuard` fires inside `mail.Router.Send()` when
+`os.Args[0]` ends in `.test` — it catches any in-process call from
+a Go test binary. That closes the "`go test` invokes Router.Send
+directly" path, but misses the path the refinery actually uses in
+production:
+
+    // internal/refinery/engineer.go
+    mailCmd := exec.Command("gt", "mail", "send", "mayor/", "-s",
+        mailSubject, "-m", mailBody, "--permanent")
+
+The refinery spawns a fresh `gt` subprocess for every MERGED / REWORK
+mail. From that subprocess's perspective, `os.Args[0]` is `gt`, not
+`*.test`. My guard doesn't fire. `gt mail send` runs normally and
+pushes mail to the mayor.
+
+Trigger in the Telegraph v1 dogfood: `internal/refinery/batch_test.go`
+exercises `engineer.doMergePR()` with fixtures `mr-a` / `feature-a`
+/ `test-rig` and `mr-b` / `feature-b` / `test-rig` etc. When a
+polecat runs `go test ./...` in a worktree that includes the refinery
+package, those tests execute the production code path, which spawns
+`gt mail send` subprocesses carrying the fixture values. The mayor
+sees real mail with the exact fixture placeholders — 10+ mails in
+2 min on the mayor's escalation at 16:38, all the mr-*/feature-*/
+test-rig shapes from `batch_test.go:232-306`.
+
+**So the Layer 1 diagnosis was right AND wrong at once**: the `go
+test` binary is the root cause, but the damage path is test →
+production subprocess, not test → direct Send. My guard checks the
+wrong process.
+
+Fix direction (layered, pick-one or combine):
+
+1. **Seam the refinery's mail exec path behind an interface**
+   (cleanest but more code). `engineer.doMergePR` takes a `MailSender`
+   interface with a real exec-based impl for production and a
+   no-op / memory impl for tests. `batch_test.go` injects the no-op.
+   Zero changes to the mail package needed.
+
+2. **Environment-variable subprocess inheritance**
+   (quickest, still fail-loud). The mail package's TestMain (or any
+   test's TestMain that wants to catch subprocess propagation) sets
+   `GT_MAIL_REFUSE_SUBPROC=1` in the process env. `gt mail send`
+   checks it at startup and exits with an error. Because child
+   processes inherit env by default, this blocks ALL subprocess-
+   spawned `gt mail send` calls from any test binary, not just the
+   mail package's own. Trade-off: test-author must remember to set
+   it — same footgun as the general env-var approach, but scoped
+   narrowly to mail, so it's less easy to forget.
+
+3. **Parent-process walk** (defensive, platform-fragile). `gt mail
+   send` at startup reads `/proc/<ppid>/cmdline` (Linux) or
+   `ps -p <ppid>` (macOS) and refuses if any ancestor looks like a
+   `.test` binary. Catches everything automatically with no test-
+   author cooperation, but cross-platform robustness is a headache.
+
+Recommended path forward: **land Option 1 first** (proper seam —
+right thing architecturally), fall back to Option 2 as a quick
+fix if the seam refactor is too large to fit in the current
+iteration. Option 3 can be the safety net under Option 2 later.
+
+Also worth noting: this bypass means every refinery test run in
+every rig (not just gastown, not just Telegraph) could be
+emitting real mail to its mayor. The blast radius is bigger than
+"Telegraph v1 is blocked" — any rig that has a polecat running
+`go test ./...` with the refinery package in scope is affected.
+
+**Mayor's current ask** (hq-6g5, 16:38 — still open): mayor paused
+dispatch pending guidance on (a) whether to nuke furiosa, (b)
+whether to dispatch gt-eef/gt-ipc, (c) nuke stale nux worktree,
+(d) mail overseer directly about this hole.
