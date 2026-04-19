@@ -3,11 +3,35 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/style"
 )
+
+// validateBeadIDShape rejects bead IDs that could produce unexpected
+// filesystem paths when used in lock files, routing lookups, etc. Bead IDs
+// are expected to be short tokens like `gt-abc123` or `hq-mr-xyz456`.
+// The refinery never programmatically constructs a bead ID with a path
+// separator or `.`/`..`, so it's always safe to reject them at this layer.
+func validateBeadIDShape(id string) error {
+	if id == "" {
+		return fmt.Errorf("empty")
+	}
+	if id == "." || id == ".." {
+		return fmt.Errorf("reserved value %q", id)
+	}
+	if strings.ContainsAny(id, "/\\") {
+		return fmt.Errorf("contains path separator")
+	}
+	// Defensive: also reject NUL / newline / whitespace, which would break
+	// downstream tooling even though they're not path-traversal per se.
+	if strings.ContainsAny(id, "\x00\n\r\t ") {
+		return fmt.Errorf("contains whitespace or control character")
+	}
+	return nil
+}
 
 // mq_set_review_state.go: write the review-fix loop state fields on an MR bead
 // (review_loop_iter, review_fix_polecat). Called by the refinery patrol formula
@@ -69,6 +93,16 @@ func init() {
 
 func runMqSetReviewState(cmd *cobra.Command, args []string) error {
 	mrID := args[0]
+
+	// Validate the bead ID shape before we use it to compute filesystem
+	// paths (lock file under <beadsDir>/locks/<mrID>.flock, routing table
+	// lookup, etc.). Bead IDs are expected to be short alphanumeric strings
+	// with a prefix separator like `gt-abc123` — path separators, absolute
+	// paths, and `.` / `..` have no business here and could produce
+	// unexpected lock paths or escape the beads dir.
+	if err := validateBeadIDShape(mrID); err != nil {
+		return fmt.Errorf("invalid MR ID %q: %w", mrID, err)
+	}
 
 	// The int flag's default is -1 (sentinel for "unset"). Bare default-
 	// comparison would silently accept `--iter -5` as "not provided", which

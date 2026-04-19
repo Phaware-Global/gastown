@@ -741,13 +741,22 @@ lives on the MR bead's attachment fields (`review_loop_iter`,
 MR=<mr-bead-id>
 MAX={{pr_review_loop_max}}       # rig-level cap; default 3
 
-# 1. Read MR-bead state. `exit` after the first awk match so a later
-# prose reference to these keys (in a comment or embedded narrative
-# further down the description) can't shadow the structured value.
+# 1. Read MR-bead state. Two subtleties:
+#
+#   - `bd show <id> --json` returns a JSON array (one element per matching
+#     ID), not a single object. A bare `jq -r '.description'` would yield
+#     `null` on that array and the awk parse would come up empty, making
+#     REVIEW_FIX_POLECAT always look unset — we'd re-dispatch on every
+#     cycle and the cap would never trip. Normalize the shape first: if
+#     the top-level is an array, take element 0; otherwise use it as-is.
+#   - `; exit` after the first awk match so a later prose reference to
+#     these keys (a comment or embedded narrative further down the
+#     description) can't shadow the structured value.
 MR_JSON=$(bd show "$MR" --json)
-REVIEW_FIX_POLECAT=$(echo "$MR_JSON" | jq -r '.description' \
+MR_DESC=$(echo "$MR_JSON" | jq -r 'if type == "array" then .[0].description else .description end // ""')
+REVIEW_FIX_POLECAT=$(echo "$MR_DESC" \
   | awk -F': ' '/^review_fix_polecat:/ {print $2; exit}')
-REVIEW_LOOP_ITER=$(echo "$MR_JSON" | jq -r '.description' \
+REVIEW_LOOP_ITER=$(echo "$MR_DESC" \
   | awk -F': ' '/^review_loop_iter:/ {print $2; exit}')
 REVIEW_LOOP_ITER=${REVIEW_LOOP_ITER:-0}
 
@@ -808,7 +817,7 @@ if [ -n "$REVIEW_FIX_POLECAT" ]; then
       # If this recurs, either the polecat state set expanded and we
       # need to classify the new value, or the lookup is returning
       # garbage that the earlier rc/empty check didn't catch.
-      echo "PR #$PR: polecat $REVIEW_FIX_POLECAT in unrecognized state %q=$POLECAT_STATE; retrying next patrol"
+      echo "PR #$PR: polecat $REVIEW_FIX_POLECAT in unrecognized state '$POLECAT_STATE'; retrying next patrol"
       return 0 2>/dev/null || exit 0
       ;;
   esac

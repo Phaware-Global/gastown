@@ -812,7 +812,11 @@ func SetMRFields(issue *Issue, fields *MRFields) string {
 		return FormatMRFields(fields)
 	}
 
-	// Known MR field keys (lowercase)
+	// Known MR field keys (lowercase). Every key that ParseMRFields honors
+	// (and FormatMRFields emits) must appear here — otherwise SetMRFields's
+	// "other content" pass-through will preserve the OLD value-line while
+	// FormatMRFields writes a new one, producing duplicated keys in the
+	// rewritten description.
 	mrKeys := map[string]bool{
 		"branch":             true,
 		"target":             true,
@@ -821,6 +825,9 @@ func SetMRFields(issue *Issue, fields *MRFields) string {
 		"sourceissue":        true,
 		"worker":             true,
 		"rig":                true,
+		"commit_sha":         true,
+		"commit-sha":         true,
+		"commitsha":          true,
 		"merge_commit":       true,
 		"merge-commit":       true,
 		"mergecommit":        true,
