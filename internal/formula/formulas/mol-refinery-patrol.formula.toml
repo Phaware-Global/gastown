@@ -741,17 +741,19 @@ lives on the MR bead's attachment fields (`review_loop_iter`,
 MR=<mr-bead-id>
 MAX={{pr_review_loop_max}}       # rig-level cap; default 3
 
-# 1. Read MR-bead state.
+# 1. Read MR-bead state. `exit` after the first awk match so a later
+# prose reference to these keys (in a comment or embedded narrative
+# further down the description) can't shadow the structured value.
 MR_JSON=$(bd show "$MR" --json)
 REVIEW_FIX_POLECAT=$(echo "$MR_JSON" | jq -r '.description' \
-  | awk -F': ' '/^review_fix_polecat:/ {print $2}')
+  | awk -F': ' '/^review_fix_polecat:/ {print $2; exit}')
 REVIEW_LOOP_ITER=$(echo "$MR_JSON" | jq -r '.description' \
-  | awk -F': ' '/^review_loop_iter:/ {print $2}')
+  | awk -F': ' '/^review_loop_iter:/ {print $2; exit}')
 REVIEW_LOOP_ITER=${REVIEW_LOOP_ITER:-0}
 
 # 2. If a review-fix polecat is already in flight, check whether it's done.
 if [ -n "$REVIEW_FIX_POLECAT" ]; then
-  POLECAT_STATUS=$({{ cmd }} polecat status "<rig>/$REVIEW_FIX_POLECAT" --json 2>/dev/null \
+  POLECAT_STATUS=$({{ cmd }} polecat status "{{rig}}/$REVIEW_FIX_POLECAT" --json 2>/dev/null \
                     | jq -r '.state // "unknown"')
   case "$POLECAT_STATUS" in
     alive|idle|working)
@@ -793,17 +795,28 @@ else
   # Dispatch a fresh review-fix polecat, record state on the MR bead,
   # return to patrol. Next cycle re-enters at step 1 and observes the
   # in-flight polecat.
-  NEW_ITER=$((REVIEW_LOOP_ITER + 1))
-  POLECAT_NAME=$({{ cmd }} sling review-fix/<issue-id> <rig> \
+  #
+  # Only advance the iter counter when a polecat was actually dispatched.
+  # If `gt sling` fails (auth issue, rig paused, beads lock contention,
+  # etc.), incrementing the counter would consume an iteration without
+  # any work happening — we'd hit the cap prematurely and escalate on
+  # spurious failures. On failure we leave the state untouched; the next
+  # patrol cycle retries from the same iter value.
+  POLECAT_NAME=$({{ cmd }} sling review-fix/<issue-id> {{rig}} \
     --pr $PR \
     --branch <polecat-branch> \
     --args "Address these PR threads:
 $THREADS" \
     --json | jq -r '.polecat_name // empty')
-  {{ cmd }} mq set-review-state "$MR" \
-    --polecat "$POLECAT_NAME" \
-    --iter "$NEW_ITER"
-  echo "PR #$PR: dispatched review-fix polecat $POLECAT_NAME (iter=$NEW_ITER of $MAX)"
+  if [ -n "$POLECAT_NAME" ]; then
+    NEW_ITER=$((REVIEW_LOOP_ITER + 1))
+    {{ cmd }} mq set-review-state "$MR" \
+      --polecat "$POLECAT_NAME" \
+      --iter "$NEW_ITER"
+    echo "PR #$PR: dispatched review-fix polecat $POLECAT_NAME (iter=$NEW_ITER of $MAX)"
+  else
+    echo "PR #$PR: review-fix dispatch FAILED — iter stays at $REVIEW_LOOP_ITER, will retry next patrol"
+  fi
   return 0 2>/dev/null || exit 0
 fi
 ```
