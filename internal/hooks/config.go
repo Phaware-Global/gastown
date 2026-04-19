@@ -857,6 +857,41 @@ func DefaultBase() *HooksConfig {
 					Command: hookChain(pathSetup, "gt tap guard dangerous-command"),
 				}},
 			},
+			// Broad matchers: every `git push` triggers the push-main
+			// guard. The guard is a near-no-op when the push doesn't
+			// target main or the rig isn't on merge_strategy=pr. It only
+			// blocks when BOTH conditions hold — defense-in-depth against
+			// the refinery (or any agent) improvising a direct push to
+			// main under the PR workflow.
+			//
+			// Three matcher forms cover the common shapes of `git push`:
+			//   - direct invocation                         (git push ...)
+			//   - with -C <dir> before the subcommand       (git -C /path push ...)
+			//   - with a global config override             (git -c <k>=<v> push ...)
+			// The guard itself (skipGitGlobalArgs) is the source of truth
+			// for interpreting these forms; the matchers are just the
+			// hook-system trigger surface.
+			{
+				Matcher: "Bash(git push*)",
+				Hooks: []Hook{{
+					Type:    "command",
+					Command: hookChain(pathSetup, "gt tap guard push-main"),
+				}},
+			},
+			{
+				Matcher: "Bash(git -C * push*)",
+				Hooks: []Hook{{
+					Type:    "command",
+					Command: hookChain(pathSetup, "gt tap guard push-main"),
+				}},
+			},
+			{
+				Matcher: "Bash(git -c * push*)",
+				Hooks: []Hook{{
+					Type:    "command",
+					Command: hookChain(pathSetup, "gt tap guard push-main"),
+				}},
+			},
 		},
 		SessionStart: []HookEntry{
 			{

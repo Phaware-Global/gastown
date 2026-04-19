@@ -61,6 +61,14 @@ func runTapList(cmd *cobra.Command, args []string) error {
 			matchers:    []string{"Bash(sudo *)", "Bash(apt install*)", "Bash(dnf install*)", "Bash(brew install*)", "Bash(rm -rf /*)", "Bash(git push --force*)", "Bash(git push -f*)"},
 			implemented: true,
 		},
+		{
+			name:        "push-main",
+			kind:        "guard",
+			description: "Block direct git push to main under merge_strategy=pr (no-op otherwise)",
+			event:       "PreToolUse",
+			matchers:    []string{"Bash(git push*)"},
+			implemented: true,
+		},
 	}
 
 	// Try to load registry for additional handlers
