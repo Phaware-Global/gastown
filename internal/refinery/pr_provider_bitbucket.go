@@ -75,6 +75,14 @@ func (p *bitbucketPRProvider) UnresolvedThreads(prNumber int) ([]ReviewThread, e
 	return nil, ErrUnsupported
 }
 
+func (p *bitbucketPRProvider) AllThreads(prNumber int) ([]ReviewThread, error) {
+	return nil, ErrUnsupported
+}
+
+func (p *bitbucketPRProvider) CountApprovals(prNumber int) (int, error) {
+	return 0, ErrUnsupported
+}
+
 func (p *bitbucketPRProvider) ChecksRollup(prNumber int) (string, bool, error) {
 	return "", false, ErrUnsupported
 }

@@ -43,6 +43,18 @@ func (p *githubPRProvider) UnresolvedThreads(prNumber int) ([]ReviewThread, erro
 	return gitReviewThreadsToProvider(threads), nil
 }
 
+func (p *githubPRProvider) AllThreads(prNumber int) ([]ReviewThread, error) {
+	threads, err := p.git.GhPrReviewThreads(prNumber)
+	if err != nil {
+		return nil, err
+	}
+	return gitReviewThreadsToProvider(threads), nil
+}
+
+func (p *githubPRProvider) CountApprovals(prNumber int) (int, error) {
+	return p.git.GhPrApprovalCount(prNumber)
+}
+
 func (p *githubPRProvider) ChecksRollup(prNumber int) (string, bool, error) {
 	return p.git.GhPrChecksRollup(prNumber)
 }

@@ -198,12 +198,16 @@ interface:
 type PRProvider interface {
     FindPRNumber(branch string) (int, error)
     IsPRApproved(prNumber int) (bool, error)
+    IsPRApprovedBy(prNumber int, user string) (bool, error)
     MergePR(prNumber int, method string) (string, error)
 
-    // New:
+    // New in Phase 1:
     CreatePR(opts CreatePROptions) (prNumber int, url string, err error)
-    RequestReview(prNumber int, reviewer string) error
+    RequestReview(prNumber int, reviewers []string) error
     UnresolvedThreads(prNumber int) ([]ReviewThread, error)
+    AllThreads(prNumber int) ([]ReviewThread, error)
+    CountApprovals(prNumber int) (int, error)
+    ChecksRollup(prNumber int) (state string, done bool, err error)
 }
 ```
 
@@ -217,13 +221,15 @@ A new `gt refinery pr` command tree, used by the formula:
 
 | Command | Purpose |
 |---------|---------|
-| `gt refinery pr push <branch>` | Force-push rebased branch safely (`--force-with-lease`) |
-| `gt refinery pr create <branch>` | Create PR with title/body from source issue; idempotent (returns existing PR if one exists) |
-| `gt refinery pr wait-ci <pr>` | Block until required checks pass; exit non-zero on fail |
-| `gt refinery pr request-review <pr> <reviewer>` | `gh api … /requested_reviewers` |
-| `gt refinery pr threads <pr>` | JSON: unresolved threads with body + file/line + author |
-| `gt refinery pr wait-approval <pr> --approver=<user> --escalate` | Poll for approval; on first call, open an escalation; return when approved |
-| `gt refinery pr merge <pr> --method=squash` | Delegates to `prProvider.MergePR` |
+| `gt refinery pr create --branch=<b> --base=<t> --title=<s> --body=<s>` | Idempotent PR create; returns existing PR if one is already open for the branch |
+| `gt refinery pr wait-ci <pr>` | Poll until checks rollup is terminal; exit non-zero on failure or timeout |
+| `gt refinery pr request-review <pr> --user=<u>` | `gh pr edit --add-reviewer` (repeatable) |
+| `gt refinery pr threads <pr> [--unresolved]` | JSON threads with body + file/line + author; `--unresolved` (default) filters |
+| `gt refinery pr wait-approval <pr> --approver=<u> --min-approvals=<n> --escalate` | Two gates: specific-user approval + distinct-reviewer count; poll until both met |
+| `gt refinery pr merge <pr> --method=squash` | Delegates to `PRProvider.MergePR` |
+
+Branch push is not a subcommand — the formula runs `git push` directly (with
+`--force-with-lease` on rebased branches). Wrapping it in Go would add no value.
 
 These keep Go as the implementation but let the formula express the
 orchestration, which is where conditional branching and loops are natural.

@@ -277,8 +277,8 @@ func validateMergeQueueConfig(c *MergeQueueConfig) error {
 		if c.PRApprover == "" {
 			return fmt.Errorf("pr_approver is required when merge_strategy=%q", MergeStrategyPR)
 		}
-		if c.PRRequiredApprovals < 0 {
-			return fmt.Errorf("pr_required_approvals must be non-negative, got %d", c.PRRequiredApprovals)
+		if c.PRRequiredApprovals != nil && *c.PRRequiredApprovals < 0 {
+			return fmt.Errorf("pr_required_approvals must be non-negative, got %d", *c.PRRequiredApprovals)
 		}
 		if c.PRReviewLoopMax < 0 {
 			return fmt.Errorf("pr_review_loop_max must be non-negative, got %d", c.PRReviewLoopMax)

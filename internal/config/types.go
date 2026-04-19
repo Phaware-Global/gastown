@@ -1306,9 +1306,11 @@ type MergeQueueConfig struct {
 	PRApprover string `json:"pr_approver,omitempty"`
 
 	// PRRequiredApprovals is the number of approving reviews required before
-	// the refinery will merge. Defaults to 1 when merge_strategy="pr".
+	// the refinery will merge. Nil defaults to 1 when merge_strategy="pr".
+	// Explicit zero ("pr_required_approvals": 0) means "no approvals
+	// required — CI only"; use *int so zero is distinguishable from unset.
 	// Only meaningful when merge_strategy="pr".
-	PRRequiredApprovals int `json:"pr_required_approvals,omitempty"`
+	PRRequiredApprovals *int `json:"pr_required_approvals,omitempty"`
 
 	// PRReviewLoopMax is the maximum number of review-fix polecat dispatch
 	// cycles per PR before the refinery escalates. Defaults to 3 when
@@ -1457,32 +1459,39 @@ func (c *MergeQueueConfig) IsJudgmentEnabled() bool {
 	return *c.JudgmentEnabled
 }
 
-// IsRequireReviewEnabled returns whether PR reviews are required before merging.
-// Honors the new PRRequiredApprovals field first; falls back to the deprecated
-// RequireReview pointer for one release. Nil-safe, defaults to false.
+// IsRequireReviewEnabled returns whether PR reviews are required before
+// merging. Single source of truth: GetPRRequiredApprovals() > 0. Previously
+// this could report `false` while GetPRRequiredApprovals() still returned 1
+// (the default), which led callers into inconsistent states. Nil-safe.
 func (c *MergeQueueConfig) IsRequireReviewEnabled() bool {
-	if c.PRRequiredApprovals > 0 {
-		return true
-	}
-	if c.RequireReview == nil {
-		return false
-	}
-	return *c.RequireReview
+	return c.GetPRRequiredApprovals() > 0
 }
 
 // GetPRRequiredApprovals returns the number of approvals required for PR
-// merges. Returns 0 when merge_strategy != "pr". When merge_strategy == "pr",
-// returns PRRequiredApprovals if set, else 1 when RequireReview=true
-// (backward-compat), else DefaultPRRequiredApprovals.
+// merges. Returns 0 when merge_strategy != "pr".
+//
+// When merge_strategy == "pr", resolution is:
+//  1. PRRequiredApprovals (if explicitly set — including 0 for "CI only")
+//  2. Deprecated RequireReview (if non-nil) — true → 1, false → 0
+//  3. DefaultPRRequiredApprovals (1)
+//
+// The *int type on PRRequiredApprovals lets callers express "zero approvals
+// required" without colliding with Go's zero-value semantics.
 func (c *MergeQueueConfig) GetPRRequiredApprovals() int {
 	if c.MergeStrategy != MergeStrategyPR {
 		return 0
 	}
-	if c.PRRequiredApprovals > 0 {
-		return c.PRRequiredApprovals
+	if c.PRRequiredApprovals != nil {
+		if *c.PRRequiredApprovals < 0 {
+			return 0
+		}
+		return *c.PRRequiredApprovals
 	}
-	if c.RequireReview != nil && *c.RequireReview {
-		return 1
+	if c.RequireReview != nil {
+		if *c.RequireReview {
+			return 1
+		}
+		return 0
 	}
 	return DefaultPRRequiredApprovals
 }

@@ -1069,6 +1069,11 @@ func (g *Git) GhPrCreate(branch, base, title, body string) (int, string, error) 
 			number = n
 		}
 	}
+	if number == 0 {
+		// Callers downstream (wait-ci, request-review, merge) can't operate
+		// without a number; surface the failure rather than returning zero.
+		return 0, url, fmt.Errorf("gh pr create succeeded but could not determine PR number (url=%q)", url)
+	}
 	return number, url, nil
 }
 
@@ -1103,47 +1108,31 @@ type GhReviewThread struct {
 	URL        string `json:"url"`
 }
 
-// GhPrReviewThreads returns all review threads on a PR.
-// Uses `gh api graphql` because the REST API doesn't expose thread resolution.
+// GhPrReviewThreads returns every review thread on a PR.
+// Uses `gh api graphql` because the REST API doesn't expose thread resolution,
+// and paginates so the full thread set is returned rather than the first 100.
+// Each thread's Body/Path/Line/Author/URL reflect the *first* comment on that
+// thread (consistent with how gemini/augment post their top-level remarks).
 func (g *Git) GhPrReviewThreads(prNumber int) ([]GhReviewThread, error) {
 	owner, repo, err := g.ghRepoOwnerName()
 	if err != nil {
 		return nil, err
 	}
-	query := `query($owner:String!,$name:String!,$number:Int!){
-		repository(owner:$owner,name:$name){
-			pullRequest(number:$number){
-				reviewThreads(first:100){
-					nodes{
-						id isResolved isOutdated
-						comments(first:1){
-							nodes{
-								path line url body
-								author{login}
-							}
-						}
-					}
-				}
-			}
-		}
-	}`
-	args := []string{"api", "graphql",
-		"-f", "query=" + query,
-		"-F", "owner=" + owner,
-		"-F", "name=" + repo,
-		"-F", fmt.Sprintf("number=%d", prNumber)}
-	cmd := exec.Command("gh", args...)
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("gh api graphql (reviewThreads) failed: %w", err)
-	}
+	// Page size deliberately small enough that a single call is fast but large
+	// enough that most PRs fit in one page.
+	const pageSize = 100
+	// Safety cap so a pathological PR can't pin us forever; raise if needed.
+	const maxPages = 20
 
-	var resp struct {
+	type respT struct {
 		Data struct {
 			Repository struct {
 				PullRequest struct {
 					ReviewThreads struct {
+						PageInfo struct {
+							HasNextPage bool   `json:"hasNextPage"`
+							EndCursor   string `json:"endCursor"`
+						} `json:"pageInfo"`
 						Nodes []struct {
 							ID         string `json:"id"`
 							IsResolved bool   `json:"isResolved"`
@@ -1165,28 +1154,76 @@ func (g *Git) GhPrReviewThreads(prNumber int) ([]GhReviewThread, error) {
 			} `json:"repository"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(out, &resp); err != nil {
-		return nil, fmt.Errorf("parsing reviewThreads response: %w", err)
-	}
 
-	threads := make([]GhReviewThread, 0, len(resp.Data.Repository.PullRequest.ReviewThreads.Nodes))
-	for _, n := range resp.Data.Repository.PullRequest.ReviewThreads.Nodes {
-		t := GhReviewThread{
-			ID:         n.ID,
-			IsResolved: n.IsResolved,
-			IsOutdated: n.IsOutdated,
+	var threads []GhReviewThread
+	cursor := ""
+	for page := 0; page < maxPages; page++ {
+		query := `query($owner:String!,$name:String!,$number:Int!,$first:Int!,$after:String){
+			repository(owner:$owner,name:$name){
+				pullRequest(number:$number){
+					reviewThreads(first:$first,after:$after){
+						pageInfo{ hasNextPage endCursor }
+						nodes{
+							id isResolved isOutdated
+							comments(first:1){
+								nodes{
+									path line url body
+									author{login}
+								}
+							}
+						}
+					}
+				}
+			}
+		}`
+		args := []string{"api", "graphql",
+			"-f", "query=" + query,
+			"-F", "owner=" + owner,
+			"-F", "name=" + repo,
+			"-F", fmt.Sprintf("number=%d", prNumber),
+			"-F", fmt.Sprintf("first=%d", pageSize)}
+		if cursor != "" {
+			args = append(args, "-F", "after="+cursor)
+		} else {
+			// Pass explicit null so graphql doesn't complain about a missing variable.
+			args = append(args, "-F", "after=")
 		}
-		if len(n.Comments.Nodes) > 0 {
-			c := n.Comments.Nodes[0]
-			t.Path = c.Path
-			t.Line = c.Line
-			t.URL = c.URL
-			t.Body = c.Body
-			t.Author = c.Author.Login
+		cmd := exec.Command("gh", args...)
+		cmd.Dir = g.workDir
+		out, err := cmd.Output()
+		if err != nil {
+			return nil, fmt.Errorf("gh api graphql (reviewThreads page %d) failed: %w", page, err)
 		}
-		threads = append(threads, t)
+
+		var resp respT
+		if err := json.Unmarshal(out, &resp); err != nil {
+			return nil, fmt.Errorf("parsing reviewThreads response (page %d): %w", page, err)
+		}
+
+		rt := resp.Data.Repository.PullRequest.ReviewThreads
+		for _, n := range rt.Nodes {
+			t := GhReviewThread{
+				ID:         n.ID,
+				IsResolved: n.IsResolved,
+				IsOutdated: n.IsOutdated,
+			}
+			if len(n.Comments.Nodes) > 0 {
+				c := n.Comments.Nodes[0]
+				t.Path = c.Path
+				t.Line = c.Line
+				t.URL = c.URL
+				t.Body = c.Body
+				t.Author = c.Author.Login
+			}
+			threads = append(threads, t)
+		}
+
+		if !rt.PageInfo.HasNextPage || rt.PageInfo.EndCursor == "" {
+			return threads, nil
+		}
+		cursor = rt.PageInfo.EndCursor
 	}
-	return threads, nil
+	return threads, fmt.Errorf("reviewThreads pagination hit maxPages=%d — PR has unusually many threads", maxPages)
 }
 
 // GhPrUnresolvedThreads returns only threads that are not resolved and not outdated.
@@ -1205,8 +1242,15 @@ func (g *Git) GhPrUnresolvedThreads(prNumber int) ([]GhReviewThread, error) {
 }
 
 // GhPrChecksRollup returns the CI status rollup for a PR:
-//   - state:  "SUCCESS", "FAILURE", "ERROR", "PENDING", or "" if unknown
+//   - state:  "SUCCESS", "FAILURE", "ERROR", "PENDING", "NO_CHECKS", or "" if unknown
 //   - done:   true if all checks have finished (success or failure)
+//
+// On a freshly-created PR, the checks list can be empty for a short window
+// before CI systems register their status. Rather than silently greenlighting
+// that case (which would let a caller merge before CI ran), return
+// state="NO_CHECKS" done=false so the caller's polling loop waits. After the
+// caller's configured timeout they can treat "NO_CHECKS" as acceptable if
+// that's their policy.
 func (g *Git) GhPrChecksRollup(prNumber int) (state string, done bool, err error) {
 	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber),
 		"--json", "statusCheckRollup")
@@ -1227,8 +1271,9 @@ func (g *Git) GhPrChecksRollup(prNumber int) (state string, done bool, err error
 	}
 
 	if len(resp.StatusCheckRollup) == 0 {
-		// No checks configured — treat as finished + success.
-		return "SUCCESS", true, nil
+		// Could be a brand-new PR whose CI hasn't registered yet, or a repo
+		// with no required checks. Either way we can't prove SUCCESS.
+		return "NO_CHECKS", false, nil
 	}
 
 	allDone := true
@@ -1299,6 +1344,51 @@ func (g *Git) GhPrApprovedBy(prNumber int, user string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// GhPrApprovalCount returns the number of distinct reviewers whose most recent
+// terminal review on the PR is APPROVED. A reviewer who later submits
+// CHANGES_REQUESTED or whose approval was DISMISSED does not count. Used to
+// enforce pr_required_approvals > 1.
+func (g *Git) GhPrApprovalCount(prNumber int) (int, error) {
+	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber),
+		"--json", "reviews")
+	cmd.Dir = g.workDir
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("gh pr view (reviews) failed: %w", err)
+	}
+	var resp struct {
+		Reviews []struct {
+			Author struct {
+				Login string `json:"login"`
+			} `json:"author"`
+			State       string `json:"state"`
+			SubmittedAt string `json:"submittedAt"`
+		} `json:"reviews"`
+	}
+	if jerr := json.Unmarshal(bytes.TrimSpace(out), &resp); jerr != nil {
+		return 0, fmt.Errorf("parsing reviews: %w", jerr)
+	}
+	// latest[user] = terminal state of that user's most recent review
+	latest := make(map[string]string, len(resp.Reviews))
+	for _, r := range resp.Reviews {
+		login := strings.ToLower(r.Author.Login)
+		if login == "" {
+			continue
+		}
+		switch r.State {
+		case "APPROVED", "CHANGES_REQUESTED", "DISMISSED":
+			latest[login] = r.State
+		}
+	}
+	count := 0
+	for _, state := range latest {
+		if state == "APPROVED" {
+			count++
+		}
+	}
+	return count, nil
 }
 
 // ghRepoOwnerName returns (owner, repoName) by parsing the origin remote URL.

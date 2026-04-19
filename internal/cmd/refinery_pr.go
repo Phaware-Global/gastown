@@ -291,11 +291,7 @@ func runRefineryPrThreads(cmd *cobra.Command, args []string) error {
 	if refPrThreadsUnresolved {
 		threads, err = provider.UnresolvedThreads(prNumber)
 	} else {
-		// Full list requires a non-interface method; fall back to unresolved +
-		// note: the GitHub impl's graphql always returns all, then filters.
-		// For now, callers who need everything can inspect the json output
-		// path via gh api directly. Phase 1 only needs unresolved.
-		threads, err = provider.UnresolvedThreads(prNumber)
+		threads, err = provider.AllThreads(prNumber)
 	}
 	if err != nil {
 		return err
@@ -320,6 +316,10 @@ func runRefineryPrWaitApproval(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	approver := refPrWaitApproverUser
+	minApprovals := refPrWaitApprovalMin
+	if minApprovals < 0 {
+		return fmt.Errorf("--min-approvals must be non-negative, got %d", minApprovals)
+	}
 	provider, _, err := getRefineryPRContext()
 	if err != nil {
 		return err
@@ -330,19 +330,56 @@ func runRefineryPrWaitApproval(cmd *cobra.Command, args []string) error {
 	// formula can pass the flag and the command works.
 	_ = refPrWaitApprovalEsc
 
+	// Two gates, both must pass to return success:
+	//   1. --approver set  → that specific user must have an active APPROVED
+	//   2. --min-approvals → distinct APPROVED reviewers count >= min
 	deadline := time.Now().Add(refPrWaitApprovalTO)
 	for {
-		approved, err := provider.IsPRApprovedBy(prNumber, approver)
-		if err != nil {
-			return fmt.Errorf("polling approval: %w", err)
+		approverOK := true
+		if approver != "" {
+			approverOK, err = provider.IsPRApprovedBy(prNumber, approver)
+			if err != nil {
+				return fmt.Errorf("polling approval by %s: %w", approver, err)
+			}
 		}
-		if approved {
-			fmt.Fprintf(os.Stdout, "%s PR #%d approved by %s\n",
-				style.Bold.Render("✓"), prNumber, fallback(approver, "any reviewer"))
+
+		countOK := true
+		var count int
+		if minApprovals > 0 {
+			count, err = provider.CountApprovals(prNumber)
+			if err != nil {
+				return fmt.Errorf("counting approvals: %w", err)
+			}
+			countOK = count >= minApprovals
+		}
+
+		if approverOK && countOK {
+			switch {
+			case approver != "" && minApprovals > 0:
+				fmt.Fprintf(os.Stdout, "%s PR #%d approved by %s (%d/%d total approvals)\n",
+					style.Bold.Render("✓"), prNumber, approver, count, minApprovals)
+			case approver != "":
+				fmt.Fprintf(os.Stdout, "%s PR #%d approved by %s\n",
+					style.Bold.Render("✓"), prNumber, approver)
+			case minApprovals > 0:
+				fmt.Fprintf(os.Stdout, "%s PR #%d has %d/%d required approvals\n",
+					style.Bold.Render("✓"), prNumber, count, minApprovals)
+			default:
+				fmt.Fprintf(os.Stdout, "%s PR #%d: no approval gate configured\n",
+					style.Bold.Render("✓"), prNumber)
+			}
 			return nil
 		}
+
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timeout waiting for approval from %s", fallback(approver, "any reviewer"))
+			var parts []string
+			if approver != "" && !approverOK {
+				parts = append(parts, fmt.Sprintf("approval from %s pending", approver))
+			}
+			if minApprovals > 0 && !countOK {
+				parts = append(parts, fmt.Sprintf("have %d/%d approvals", count, minApprovals))
+			}
+			return fmt.Errorf("timeout waiting for approval: %s", strings.Join(parts, ", "))
 		}
 		time.Sleep(refPrWaitApprovalInt)
 	}

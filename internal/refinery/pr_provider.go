@@ -60,9 +60,23 @@ type PRProvider interface {
 	// resolved and not outdated.
 	UnresolvedThreads(prNumber int) ([]ReviewThread, error)
 
+	// AllThreads returns every review thread on the PR, including resolved
+	// and outdated ones. Used by callers that want the full picture rather
+	// than the filtered unresolved list.
+	AllThreads(prNumber int) ([]ReviewThread, error)
+
+	// CountApprovals returns the number of distinct users whose most recent
+	// terminal review on the PR is APPROVED. Reviews that have been dismissed
+	// or superseded by a CHANGES_REQUESTED review from the same user do not
+	// count. Used to enforce pr_required_approvals > 1.
+	CountApprovals(prNumber int) (int, error)
+
 	// ChecksRollup returns the CI status rollup for the PR:
-	//   state: "SUCCESS", "FAILURE", "ERROR", "PENDING", or "" if unknown
+	//   state: "SUCCESS", "FAILURE", "ERROR", "PENDING", "NO_CHECKS", or "" if unknown
 	//   done:  true once every check has reached a terminal state
+	// When no checks are configured on the PR, state="NO_CHECKS" and done=false
+	// so callers decide whether the absence of checks is acceptable (rather
+	// than the provider silently greenlighting the merge).
 	ChecksRollup(prNumber int) (state string, done bool, err error)
 }
 

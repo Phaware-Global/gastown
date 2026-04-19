@@ -196,8 +196,10 @@ type MergeQueueConfig struct {
 	PRApprover string `json:"pr_approver,omitempty"`
 
 	// PRRequiredApprovals is the number of approving reviews required before
-	// the refinery will merge. Defaults to 1 when MergeStrategy="pr".
-	PRRequiredApprovals int `json:"pr_required_approvals,omitempty"`
+	// the refinery will merge. Nil defaults to 1 when MergeStrategy="pr".
+	// Explicit zero means "no approvals required — CI only"; *int lets us
+	// distinguish the two.
+	PRRequiredApprovals *int `json:"pr_required_approvals,omitempty"`
 
 	// PRReviewLoopMax caps review-fix polecat dispatches per PR. Defaults to 3.
 	PRReviewLoopMax int `json:"pr_review_loop_max,omitempty"`
@@ -208,6 +210,30 @@ type MergeQueueConfig struct {
 	// Batch holds configuration for the batch-then-bisect merge queue.
 	// When nil or MaxBatchSize <= 1, batching is disabled and MRs process sequentially.
 	Batch *BatchConfig `json:"batch,omitempty"`
+}
+
+// GetPRRequiredApprovals resolves the number of approvals required before the
+// refinery will merge a PR. Returns 0 when MergeStrategy != "pr". When
+// MergeStrategy == "pr", resolves PRRequiredApprovals → deprecated
+// RequireReview → default (1). Mirrors config.MergeQueueConfig.GetPRRequiredApprovals.
+func (c *MergeQueueConfig) GetPRRequiredApprovals() int {
+	if c.MergeStrategy != "pr" {
+		return 0
+	}
+	if c.PRRequiredApprovals != nil {
+		v := *c.PRRequiredApprovals
+		if v < 0 {
+			return 0
+		}
+		return v
+	}
+	if c.RequireReview != nil {
+		if *c.RequireReview {
+			return 1
+		}
+		return 0
+	}
+	return 1
 }
 
 // DefaultMergeQueueConfig returns sensible defaults for merge queue configuration.
@@ -484,7 +510,8 @@ func (e *Engineer) LoadConfig() error {
 		e.config.PRApprover = *mqRaw.PRApprover
 	}
 	if mqRaw.PRRequiredApprovals != nil {
-		e.config.PRRequiredApprovals = *mqRaw.PRRequiredApprovals
+		v := *mqRaw.PRRequiredApprovals
+		e.config.PRRequiredApprovals = &v
 	}
 	if mqRaw.PRReviewLoopMax != nil {
 		e.config.PRReviewLoopMax = *mqRaw.PRReviewLoopMax
@@ -857,30 +884,69 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
 	}
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Found PR #%d for branch %s\n", prNumber, branch)
 
-	// Step PR.2: Check approval status if require_review is enabled
-	requireReview := e.config.RequireReview != nil && *e.config.RequireReview
-	if requireReview {
-		approved, err := e.prProvider.IsPRApproved(prNumber)
+	// Step PR.2: Check approval policy.
+	//
+	// Policy is driven by the new MergeQueueConfig fields (PRApprover,
+	// PRRequiredApprovals). Two independent gates, both must pass:
+	//
+	//   a) If PRApprover is set, that specific user must have an active
+	//      APPROVED review (not dismissed, not superseded by CHANGES_REQUESTED).
+	//   b) If PRRequiredApprovals (resolved) > 0, the total count of distinct
+	//      APPROVED reviewers must meet the threshold.
+	//
+	// The deprecated RequireReview still works because GetPRRequiredApprovals
+	// treats RequireReview=true as PRRequiredApprovals=1.
+	requiredApprovals := e.config.GetPRRequiredApprovals()
+	approver := e.config.PRApprover
+
+	if approver != "" {
+		approved, err := e.prProvider.IsPRApprovedBy(prNumber, approver)
 		if err != nil {
 			return ProcessResult{
 				Success: false,
-				Error:   fmt.Sprintf("failed to check PR #%d approval status: %v", prNumber, err),
+				Error:   fmt.Sprintf("failed to check PR #%d approval by %s: %v", prNumber, approver, err),
 			}
 		}
 		if !approved {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d awaiting human approval — deferring merge\n", prNumber)
+			_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d awaiting approval from %s — deferring merge\n", prNumber, approver)
 			return ProcessResult{
 				Success:       false,
 				NeedsApproval: true,
-				Error:         fmt.Sprintf("PR #%d requires approving review before merge", prNumber),
+				Error:         fmt.Sprintf("PR #%d requires approving review from %s before merge", prNumber, approver),
 			}
 		}
-		_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d has approving review\n", prNumber)
+		_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d has approving review from %s\n", prNumber, approver)
 	}
 
-	// Step PR.3: Merge via VCS provider API using squash merge
-	_, _ = fmt.Fprintf(e.output, "[Engineer] Merging PR #%d via %s API (squash)...\n", prNumber, provider)
-	mergeCommit, err := e.prProvider.MergePR(prNumber, "squash")
+	if requiredApprovals > 0 {
+		count, err := e.prProvider.CountApprovals(prNumber)
+		if err != nil {
+			return ProcessResult{
+				Success: false,
+				Error:   fmt.Sprintf("failed to count approvals on PR #%d: %v", prNumber, err),
+			}
+		}
+		if count < requiredApprovals {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d has %d/%d required approvals — deferring merge\n",
+				prNumber, count, requiredApprovals)
+			return ProcessResult{
+				Success:       false,
+				NeedsApproval: true,
+				Error: fmt.Sprintf("PR #%d has %d of %d required approvals",
+					prNumber, count, requiredApprovals),
+			}
+		}
+		_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d has %d/%d required approvals\n",
+			prNumber, count, requiredApprovals)
+	}
+
+	// Step PR.3: Merge via VCS provider API using the configured method.
+	method := e.config.PRMergeMethod
+	if method == "" {
+		method = "squash"
+	}
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Merging PR #%d via %s API (%s)...\n", prNumber, provider, method)
+	mergeCommit, err := e.prProvider.MergePR(prNumber, method)
 	if err != nil {
 		return ProcessResult{
 			Success: false,
