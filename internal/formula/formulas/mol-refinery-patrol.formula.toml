@@ -703,7 +703,7 @@ until the PR is actually merged.**
 
 The command blocks until every check reaches a terminal state. Exit 0 iff
 all checks succeeded. On `FAILURE` or timeout, non-zero exit — send
-FIX_NEEDED back to the polecat and skip to Step 4 (archive mail):
+FIX_NEEDED back to the polecat and skip to the shared post-merge "Step 4: Archive the MERGE_READY mail" section further down the merge-push step (NOT Step PR.4 "Request automated review" — that's only reached on CI success):
 
 ```bash
 gt mail send <rig>/polecats/<polecat-name> -s "FIX_NEEDED <polecat-name>" --stdin <<BODY

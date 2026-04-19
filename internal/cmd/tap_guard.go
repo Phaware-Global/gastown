@@ -186,11 +186,25 @@ func refineryAllowedForPR() bool {
 			return false
 		}
 		rel = filepath.ToSlash(rel)
+		// A relative path starting with ".." means cwd is outside townRoot
+		// (common with symlink/realpath mismatches). Fail closed rather than
+		// let `filepath.Join(townRoot, "..")` escape.
+		if strings.HasPrefix(rel, "..") {
+			return false
+		}
 		parts := strings.Split(rel, "/")
 		if len(parts) == 0 || parts[0] == "" || parts[0] == "." {
 			return false
 		}
 		rigName = parts[0]
+	}
+
+	// Belt-and-suspenders: if rigName somehow resolves outside townRoot
+	// (e.g., an env-provided GT_RIG value containing path separators or `..`),
+	// refuse to trust it rather than reading settings from an unintended
+	// location.
+	if strings.ContainsAny(rigName, "/\\") || rigName == ".." || rigName == "." {
+		return false
 	}
 
 	rigPath := filepath.Join(townRoot, rigName)

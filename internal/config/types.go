@@ -1479,16 +1479,20 @@ func (c *MergeQueueConfig) IsRequireReviewEnabled() bool {
 	return c.GetPRRequiredApprovals() > 0
 }
 
-// GetPRRequiredApprovals returns the number of approvals required for PR
-// merges. Returns 0 when merge_strategy != "pr".
+// GetPRRequiredApprovals returns the count gate — how many distinct APPROVED
+// reviewers are required beyond the PRApprover gate. Returns 0 when
+// merge_strategy != "pr".
 //
 // When merge_strategy == "pr", resolution is:
-//  1. PRRequiredApprovals (if explicitly set — including 0 to disable only the count gate)
+//  1. PRRequiredApprovals (if explicitly set — including 0 to disable the count gate)
 //  2. Deprecated RequireReview (if non-nil) — true → 1, false → 0
 //  3. DefaultPRRequiredApprovals (1)
 //
-// The *int type on PRRequiredApprovals lets callers express "zero approvals
-// required" without colliding with Go's zero-value semantics.
+// Note: a return value of 0 disables only this count gate. The PRApprover
+// gate is a separate, independent gate and is always active under
+// merge_strategy="pr" (config validation requires pr_approver). The *int
+// type on PRRequiredApprovals lets callers explicitly disable the count
+// gate without colliding with Go's zero-value semantics.
 func (c *MergeQueueConfig) GetPRRequiredApprovals() int {
 	if c.MergeStrategy != MergeStrategyPR {
 		return 0
