@@ -834,6 +834,63 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					fmt.Printf("%s\n", style.Dim.Render("Work stays on feature branch for human review."))
 				}
 
+				// When a PR was created under merge_strategy=pr, hand the PR
+				// off to the refinery by creating an MR bead that carries
+				// `review_pr: <N>`. Without this, the refinery never sees
+				// the PR, so no `augment review` is requested, no CI-gate
+				// runs, no human-approval escalation fires — the PR sits
+				// orphaned from the review/merge pipeline. See G11 in
+				// docs/design/refinery-pr-workflow.md. Skipped for
+				// non-pr no_merge (the work legitimately ends here with a
+				// READY_FOR_REVIEW mail + closed bead).
+				refineryOwnsMerge := false
+				if prURL != "" {
+					prNumber, parseErr := parsePRNumberFromURL(prURL)
+					switch {
+					case parseErr != nil:
+						style.PrintWarning("could not parse PR number from %q: %v — skipping MR bead (refinery won't pick up this PR)", prURL, parseErr)
+					default:
+						mrDesc := fmt.Sprintf(
+							"branch: %s\ntarget: %s\nsource_issue: %s\nrig: %s\nreview_pr: %d\nworker: %s\nmerge_strategy: pr",
+							branch, defaultBranch, issueID, rigName, prNumber, worker,
+						)
+						// Retry count / conflict tracking fields mirror the
+						// regular MR-bead path (see ~line 1089) so the refinery
+						// treats this MR the same as any other.
+						mrDesc += "\nretry_count: 0\nlast_conflict_sha: null\nconflict_task_id: null"
+						// Mirror the priority-inheritance logic from the main MR
+						// creation path (see ~line 1067): prefer an explicit
+						// --priority, fall back to the source bead's priority,
+						// default to 2. sourceIssueForNoMerge is already loaded
+						// so we don't repeat bd.Show here.
+						mrPriority := 2
+						switch {
+						case donePriority >= 0:
+							mrPriority = donePriority
+						case sourceIssueForNoMerge != nil:
+							mrPriority = sourceIssueForNoMerge.Priority
+						}
+						mrIssue, mrCreateErr := bd.Create(beads.CreateOptions{
+							Title:       fmt.Sprintf("Merge: %s", issueID),
+							Labels:      []string{"gt:merge-request"},
+							Priority:    mrPriority,
+							Description: mrDesc,
+							Ephemeral:   true,
+							Rig:         rigName,
+						})
+						switch {
+						case mrCreateErr != nil:
+							style.PrintWarning("could not create MR bead for PR %d: %v — PR is open but refinery won't see it; dispatcher must intervene", prNumber, mrCreateErr)
+						case mrIssue == nil || mrIssue.ID == "":
+							style.PrintWarning("MR bead created with empty ID for PR %d — refinery may not pick up this PR", prNumber)
+						default:
+							mrID = mrIssue.ID
+							refineryOwnsMerge = true
+							fmt.Printf("%s MR bead %s queued for PR #%d — refinery will run review+merge\n", style.Bold.Render("✓"), mrID, prNumber)
+						}
+					}
+				}
+
 				// Mail dispatcher with READY_FOR_REVIEW.
 				// Track whether the notification actually landed so the close
 				// reason reflects reality (not an aspirational "dispatcher
@@ -860,35 +917,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					}
 				}
 
-				// Close the work bead so it doesn't sit `open` forever — this is
-				// the fix for #3363. Without this, no_merge polecats with commits
-				// (implement-stage work in Linear pipelines, review-fix dispatches
-				// under merge_strategy=pr, etc.) would stamp READY_FOR_REVIEW and
-				// exit, but the bead stayed open, stalling dispatchers that check
-				// convoy completion. Force-close bypasses molecule dep checks; the
-				// polecat is already done and about to be nuked.
-				//
-				// Compose the reason from observed state so the audit trail is
-				// accurate (matters when DispatchedBy was empty or mail failed).
-				closeReason := "No-merge work completed"
-				if prURL != "" {
-					closeReason += fmt.Sprintf("; PR %s opened for human review", prURL)
-				}
-				switch {
-				case dispatcherNotified:
-					closeReason += "; dispatcher notified"
-				case attachmentFields.DispatchedBy == "":
-					closeReason += "; no dispatcher recorded"
-				default:
-					closeReason += "; dispatcher notification failed"
-				}
-
-				// Close the attached molecule (wisp) FIRST — same ordering the
-				// regular gt done path uses in updateAgentStateOnDone. Once we
-				// force-close the work bead below, it becomes terminal and
-				// updateAgentStateOnDone's wisp-close guard skips the molecule,
-				// leaving the wisp + its step descendants orphaned. Mirror that
-				// cleanup here so the no-merge path doesn't leak wisps.
+				// Close the attached molecule (wisp) — the polecat is done
+				// with its work regardless of who owns the merge. Same
+				// ordering the regular gt done path uses (see
+				// updateAgentStateOnDone). Do this FIRST so the guard there
+				// doesn't skip it if we later close the work bead too.
 				if attachmentFields.AttachedMolecule != "" {
 					if n := closeDescendants(bd, attachmentFields.AttachedMolecule); n > 0 {
 						fmt.Fprintf(os.Stderr, "Closed %d molecule step(s) for %s\n", n, attachmentFields.AttachedMolecule)
@@ -898,6 +931,37 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 							style.PrintWarning("couldn't close attached molecule %s: %v", attachmentFields.AttachedMolecule, closeErr)
 						}
 					}
+				}
+
+				// If the refinery now owns merge (MR bead queued for the
+				// PR we just created), leave the work bead open. The
+				// refinery will close it on merge — same lifecycle as any
+				// other MR. Closing here would strand the MR without its
+				// source_issue.
+				if refineryOwnsMerge {
+					fmt.Printf("%s Work bead %s left open — refinery will close on merge\n", style.Bold.Render("→"), issueID)
+					goto notifyWitness
+				}
+
+				// No-merge path without a PR (or with MR-bead creation
+				// failure) — close the work bead so it doesn't sit open
+				// forever. This is the fix for #3363. Compose the reason
+				// from observed state so the audit trail is accurate
+				// (matters when DispatchedBy was empty or mail failed).
+				closeReason := "No-merge work completed"
+				if prURL != "" {
+					// prURL is non-empty but refineryOwnsMerge is false —
+					// MR bead creation failed. Flag that so the audit
+					// trail explains why the refinery never picked up.
+					closeReason += fmt.Sprintf("; PR %s opened but MR bead handoff failed", prURL)
+				}
+				switch {
+				case dispatcherNotified:
+					closeReason += "; dispatcher notified"
+				case attachmentFields.DispatchedBy == "":
+					closeReason += "; no dispatcher recorded"
+				default:
+					closeReason += "; dispatcher notification failed"
 				}
 
 				var noMergeCloseErr error
@@ -916,7 +980,6 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					style.PrintWarning("could not close no-merge bead %s: %v — dispatcher must close manually", issueID, noMergeCloseErr)
 				}
 
-				// Skip MR creation, go to witness notification
 				goto notifyWitness
 			}
 		}
@@ -1942,6 +2005,51 @@ func stripOverlayCLAUDEmd(g *git.Git, defaultBranch string) bool {
 	fmt.Printf("%s Created cleanup commit to remove Gas Town overlay files\n",
 		style.Bold.Render("✓"))
 	return true
+}
+
+// parsePRNumberFromURL extracts the PR number from a GitHub PR URL of
+// the shape `https://github.com/<owner>/<repo>/pull/<N>`. Anything
+// trailing a fragment or query string is tolerated.
+//
+// Used by the no-merge+pr path in gt done to hand off the just-created
+// PR to the refinery via an MR bead's `review_pr` field (G11 fix).
+// Kept local to done.go because this is the only caller; if that
+// changes, promote to internal/git or similar.
+func parsePRNumberFromURL(url string) (int, error) {
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return 0, fmt.Errorf("empty URL")
+	}
+	// Strip any fragment/query so "…/pull/10#issuecomment-…" still parses.
+	for _, cut := range []string{"#", "?"} {
+		if i := strings.Index(url, cut); i >= 0 {
+			url = url[:i]
+		}
+	}
+	// Look for "/pull/" so we don't grab numbers from unrelated URL paths.
+	idx := strings.LastIndex(url, "/pull/")
+	if idx < 0 {
+		return 0, fmt.Errorf("URL has no /pull/ segment: %s", url)
+	}
+	tail := url[idx+len("/pull/"):]
+	// Trim any trailing slash.
+	tail = strings.TrimRight(tail, "/")
+	// Stop at the first non-digit so "/pull/10/files" → "10".
+	end := 0
+	for end < len(tail) && tail[end] >= '0' && tail[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0, fmt.Errorf("no digits after /pull/: %s", url)
+	}
+	n, err := strconv.Atoi(tail[:end])
+	if err != nil {
+		return 0, fmt.Errorf("parsing PR number %q: %w", tail[:end], err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("parsed non-positive PR number %d", n)
+	}
+	return n, nil
 }
 
 // purgeClosedEphemeralBeads removes closed ephemeral beads (wisps) that accumulated
