@@ -38,6 +38,13 @@ func (p *bitbucketPRProvider) IsPRApproved(prNumber int) (bool, error) {
 	return p.git.IsBitbucketPRApproved(p.workspace, p.repoSlug, prNumber)
 }
 
+func (p *bitbucketPRProvider) IsPRApprovedBy(prNumber int, user string) (bool, error) {
+	if user == "" {
+		return p.IsPRApproved(prNumber)
+	}
+	return false, ErrUnsupported
+}
+
 func (p *bitbucketPRProvider) MergePR(prNumber int, method string) (string, error) {
 	// Map generic merge methods to Bitbucket strategy names.
 	bbStrategy := method
@@ -50,4 +57,24 @@ func (p *bitbucketPRProvider) MergePR(prNumber int, method string) (string, erro
 		bbStrategy = "fast_forward"
 	}
 	return p.git.BitbucketPRMerge(p.workspace, p.repoSlug, prNumber, bbStrategy)
+}
+
+// Phase 1 stubs for the extended PRProvider surface. Bitbucket support for
+// these methods is a follow-up — the refinery's PR workflow runs on GitHub
+// initially.
+
+func (p *bitbucketPRProvider) CreatePR(opts CreatePROptions) (int, string, error) {
+	return 0, "", ErrUnsupported
+}
+
+func (p *bitbucketPRProvider) RequestReview(prNumber int, reviewers []string) error {
+	return ErrUnsupported
+}
+
+func (p *bitbucketPRProvider) UnresolvedThreads(prNumber int) ([]ReviewThread, error) {
+	return nil, ErrUnsupported
+}
+
+func (p *bitbucketPRProvider) ChecksRollup(prNumber int) (string, bool, error) {
+	return "", false, ErrUnsupported
 }

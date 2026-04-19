@@ -183,7 +183,27 @@ type MergeQueueConfig struct {
 	// RequireReview controls whether the refinery requires at least one approving
 	// review before merging a PR. Only meaningful when MergeStrategy="pr".
 	// Nil defaults to false (no review required).
+	//
+	// Deprecated: kept for backward compatibility. Use PRRequiredApprovals.
 	RequireReview *bool `json:"require_review,omitempty"`
+
+	// PRReviewer is the GitHub user/bot to request an automated review from.
+	// Empty disables the AI review loop entirely. Only meaningful when MergeStrategy="pr".
+	PRReviewer string `json:"pr_reviewer,omitempty"`
+
+	// PRApprover is the GitHub user whose approving review gates the merge.
+	// Required when MergeStrategy="pr". Only meaningful when MergeStrategy="pr".
+	PRApprover string `json:"pr_approver,omitempty"`
+
+	// PRRequiredApprovals is the number of approving reviews required before
+	// the refinery will merge. Defaults to 1 when MergeStrategy="pr".
+	PRRequiredApprovals int `json:"pr_required_approvals,omitempty"`
+
+	// PRReviewLoopMax caps review-fix polecat dispatches per PR. Defaults to 3.
+	PRReviewLoopMax int `json:"pr_review_loop_max,omitempty"`
+
+	// PRMergeMethod is passed to the VCS provider on merge ("squash" default).
+	PRMergeMethod string `json:"pr_merge_method,omitempty"`
 
 	// Batch holds configuration for the batch-then-bisect merge queue.
 	// When nil or MaxBatchSize <= 1, batching is disabled and MRs process sequentially.
@@ -365,6 +385,11 @@ func (e *Engineer) LoadConfig() error {
 		MergeStrategy        *string                    `json:"merge_strategy"`
 		VCSProvider          *string                    `json:"vcs_provider"`
 		RequireReview        *bool                      `json:"require_review"`
+		PRReviewer           *string                    `json:"pr_reviewer"`
+		PRApprover           *string                    `json:"pr_approver"`
+		PRRequiredApprovals  *int                       `json:"pr_required_approvals"`
+		PRReviewLoopMax      *int                       `json:"pr_review_loop_max"`
+		PRMergeMethod        *string                    `json:"pr_merge_method"`
 	}
 
 	if err := json.Unmarshal(rawConfig.MergeQueue, &mqRaw); err != nil {
@@ -452,6 +477,21 @@ func (e *Engineer) LoadConfig() error {
 	if mqRaw.RequireReview != nil {
 		e.config.RequireReview = mqRaw.RequireReview
 	}
+	if mqRaw.PRReviewer != nil {
+		e.config.PRReviewer = *mqRaw.PRReviewer
+	}
+	if mqRaw.PRApprover != nil {
+		e.config.PRApprover = *mqRaw.PRApprover
+	}
+	if mqRaw.PRRequiredApprovals != nil {
+		e.config.PRRequiredApprovals = *mqRaw.PRRequiredApprovals
+	}
+	if mqRaw.PRReviewLoopMax != nil {
+		e.config.PRReviewLoopMax = *mqRaw.PRReviewLoopMax
+	}
+	if mqRaw.PRMergeMethod != nil {
+		e.config.PRMergeMethod = *mqRaw.PRMergeMethod
+	}
 
 	// Initialize the PR provider when merge_strategy=pr.
 	if e.config.MergeStrategy == "pr" {
@@ -461,6 +501,34 @@ func (e *Engineer) LoadConfig() error {
 	}
 
 	return nil
+}
+
+// PRProvider returns the engineer's PR provider, initializing it if needed.
+// Callers outside the refinery package use this to issue ad-hoc PR operations
+// from the formula (via gt refinery pr ...) without reaching into the engineer.
+// Returns nil when no VCS provider could be constructed (e.g., unknown provider).
+func (e *Engineer) PRProvider() (PRProvider, error) {
+	if e.prProvider != nil {
+		return e.prProvider, nil
+	}
+	if err := e.initPRProvider(); err != nil {
+		return nil, err
+	}
+	return e.prProvider, nil
+}
+
+// NewPRProvider is a package-level factory that constructs a PRProvider
+// without needing an Engineer. Used by the gt refinery pr subcommands.
+// vcsProvider defaults to "github" when empty.
+func NewPRProvider(vcsProvider string, g *git.Git) (PRProvider, error) {
+	switch vcsProvider {
+	case "", "github":
+		return newGitHubPRProvider(g), nil
+	case "bitbucket":
+		return newBitbucketPRProvider(g)
+	default:
+		return nil, fmt.Errorf("unknown vcs_provider %q (supported: github, bitbucket)", vcsProvider)
+	}
 }
 
 // initPRProvider creates the appropriate PRProvider based on vcs_provider config.
@@ -782,7 +850,9 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
 	if prNumber == 0 {
 		return ProcessResult{
 			Success: false,
-			Error:   fmt.Sprintf("no open PR found for branch %s — merge_strategy=pr requires a PR", branch),
+			Error: fmt.Sprintf("no open PR found for branch %s — merge_strategy=pr requires a PR. "+
+				"Under the refinery PR workflow the formula is responsible for PR creation "+
+				"via `gt refinery pr create` before reaching this step.", branch),
 		}
 	}
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Found PR #%d for branch %s\n", prNumber, branch)

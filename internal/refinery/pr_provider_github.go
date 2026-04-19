@@ -19,6 +19,30 @@ func (p *githubPRProvider) IsPRApproved(prNumber int) (bool, error) {
 	return p.git.IsPRApproved(prNumber)
 }
 
+func (p *githubPRProvider) IsPRApprovedBy(prNumber int, user string) (bool, error) {
+	return p.git.GhPrApprovedBy(prNumber, user)
+}
+
 func (p *githubPRProvider) MergePR(prNumber int, method string) (string, error) {
 	return p.git.GhPrMerge(prNumber, method)
+}
+
+func (p *githubPRProvider) CreatePR(opts CreatePROptions) (int, string, error) {
+	return p.git.GhPrCreate(opts.Branch, opts.Base, opts.Title, opts.Body)
+}
+
+func (p *githubPRProvider) RequestReview(prNumber int, reviewers []string) error {
+	return p.git.GhPrRequestReview(prNumber, reviewers)
+}
+
+func (p *githubPRProvider) UnresolvedThreads(prNumber int) ([]ReviewThread, error) {
+	threads, err := p.git.GhPrUnresolvedThreads(prNumber)
+	if err != nil {
+		return nil, err
+	}
+	return gitReviewThreadsToProvider(threads), nil
+}
+
+func (p *githubPRProvider) ChecksRollup(prNumber int) (string, bool, error) {
+	return p.git.GhPrChecksRollup(prNumber)
 }

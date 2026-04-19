@@ -260,6 +260,38 @@ func validateMergeQueueConfig(c *MergeQueueConfig) error {
 		return fmt.Errorf("%w: max_concurrent must be non-negative", ErrMissingField)
 	}
 
+	// Validate merge_strategy
+	if c.MergeStrategy != "" && c.MergeStrategy != MergeStrategyDirect && c.MergeStrategy != MergeStrategyPR {
+		return fmt.Errorf("invalid merge_strategy: got %q, want %q or %q",
+			c.MergeStrategy, MergeStrategyDirect, MergeStrategyPR)
+	}
+
+	// Validate vcs_provider
+	if c.VCSProvider != "" && c.VCSProvider != VCSProviderGitHub && c.VCSProvider != VCSProviderBitbucket {
+		return fmt.Errorf("invalid vcs_provider: got %q, want %q or %q",
+			c.VCSProvider, VCSProviderGitHub, VCSProviderBitbucket)
+	}
+
+	// PR-strategy-specific validation
+	if c.MergeStrategy == MergeStrategyPR {
+		if c.PRApprover == "" {
+			return fmt.Errorf("pr_approver is required when merge_strategy=%q", MergeStrategyPR)
+		}
+		if c.PRRequiredApprovals < 0 {
+			return fmt.Errorf("pr_required_approvals must be non-negative, got %d", c.PRRequiredApprovals)
+		}
+		if c.PRReviewLoopMax < 0 {
+			return fmt.Errorf("pr_review_loop_max must be non-negative, got %d", c.PRReviewLoopMax)
+		}
+		switch c.PRMergeMethod {
+		case "", PRMergeMethodSquash, PRMergeMethodMerge, PRMergeMethodRebase:
+			// valid
+		default:
+			return fmt.Errorf("invalid pr_merge_method: got %q, want %q, %q, or %q",
+				c.PRMergeMethod, PRMergeMethodSquash, PRMergeMethodMerge, PRMergeMethodRebase)
+		}
+	}
+
 	return nil
 }
 
