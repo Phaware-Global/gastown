@@ -4,9 +4,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 // tapGuardPushMainCmd blocks `git push ... main` and its refspec variants
@@ -73,8 +77,12 @@ func runTapGuardPushMain(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Only block under merge_strategy=pr. For any other strategy,
-	// push-to-main is the normal path (Gas Town's default direct-merge).
+	// Only block when we can positively confirm merge_strategy=pr for
+	// the current rig. Fail-closed semantics are inside the helper:
+	// when the caller is inside a gas town workspace but we can't load
+	// that rig's settings, the helper returns true (block). That matches
+	// the defense-in-depth intent — an ambiguous rig state shouldn't let
+	// an unreviewed push to main slip through.
 	if !currentRigRequiresPRStrategy() {
 		return nil
 	}
@@ -83,11 +91,11 @@ func runTapGuardPushMain(cmd *cobra.Command, args []string) error {
 	return NewSilentExit(2)
 }
 
-// isPushToMain reports whether a shell command is a `git push` whose
-// refspec lands on `main` (or `refs/heads/main`).
+// isPushToMain reports whether a shell command is a `git push` that can
+// land commits on `refs/heads/main` on the remote.
 //
 // The check is deliberately tokenized rather than regex — we want to be
-// robust across:
+// robust across these shapes (all positive matches):
 //
 //	git push origin main
 //	git push origin HEAD:main
@@ -97,24 +105,25 @@ func runTapGuardPushMain(cmd *cobra.Command, args []string) error {
 //	git push origin FETCH_HEAD:refs/heads/main     (the one we observed)
 //	git push -f origin main
 //	git push --force-with-lease origin main
+//	git push origin main HEAD:other                (multi-refspec — main is one of them)
+//	git push origin --all                          (implicitly includes main)
+//	git push origin --mirror                       (mirrors all refs including main)
+//	git push                                       (bare; on main branch → push to main)
+//	git push origin                                (same)
 //
-// and reject non-matches like:
+// and reject non-matches (pass through):
 //
 //	git push origin polecat/foo
 //	git push origin polecat/foo:feat/branch
 //	git fetch origin main                          (not a push)
 //	echo "git push origin main"                    (not the top-level command)
+//	git push origin feature -o main                (main is the VALUE of the -o flag, not a refspec)
 //
-// We don't try to handle every possible shell-quoting edge case; this is a
-// hook-fired best effort, not a security boundary.
+// We don't try to handle every possible shell-quoting edge case; this is
+// a hook-fired best effort, not a security boundary. Ambiguous commands
+// err on the side of blocking — defense-in-depth.
 func isPushToMain(command string) bool {
-	// Strip leading whitespace; the tool-input can include a wrapping shell
-	// invocation in some cases but Claude Code's Bash tool passes the raw
-	// command, so this is usually a no-op.
 	trimmed := strings.TrimSpace(command)
-
-	// Reject non-push commands fast. `git push` must appear as an
-	// adjacent pair at the top of the command.
 	fields := strings.Fields(trimmed)
 	if len(fields) < 2 {
 		return false
@@ -122,28 +131,89 @@ func isPushToMain(command string) bool {
 	if fields[0] != "git" || fields[1] != "push" {
 		return false
 	}
+	argv := fields[2:]
 
-	// Walk the rest of the args. The last non-flag token is the refspec
-	// (or the branch name, which is equivalent to <ref>:<ref>).
-	var lastPositional string
-	for _, f := range fields[2:] {
-		if strings.HasPrefix(f, "-") {
+	// `--all` / `--mirror` push multiple refs, including main. `--tags`
+	// alone doesn't touch branches, but in combination with other refspecs
+	// the refspec test below will catch them.
+	for _, a := range argv {
+		if a == "--all" || a == "--mirror" {
+			return true
+		}
+	}
+
+	// Walk all positional args, skipping flags and the values of flags
+	// known to take a separate-argument value (so `git push origin feature
+	// -o main` doesn't false-positive on `main` being `-o`'s value).
+	//
+	// We skip flag values for a small, well-known set of `git push` flags
+	// that use space-separated argv form. Flags using `=` form
+	// (`--push-option=main`) are already ignored because they start with
+	// `-`, so the token is dropped whole.
+	flagsTakingArg := map[string]bool{
+		"-o":              true,
+		"--push-option":   true,
+		"--receive-pack":  true,
+		"--exec":          true,
+		"--repo":          true,
+		"--signed":        true, // `--signed=<yes|no|if-asked>` uses =; only its space form takes a separate arg
+	}
+
+	var positionals []string
+	skipNext := false
+	for _, f := range argv {
+		if skipNext {
+			skipNext = false
 			continue
 		}
-		lastPositional = f
-	}
-	if lastPositional == "" {
-		return false
+		if strings.HasPrefix(f, "-") {
+			if flagsTakingArg[f] {
+				skipNext = true
+			}
+			continue
+		}
+		positionals = append(positionals, f)
 	}
 
-	// The refspec targets main if either:
-	//   - no colon and token is literally "main", or
-	//   - colon and the RHS names main / refs/heads/main
-	if lastPositional == "main" || lastPositional == "refs/heads/main" {
+	// Conventionally the first positional is the remote and everything
+	// after is refspecs. When there are zero refspecs (positionals is empty,
+	// or only the remote was provided), git pushes the current branch's
+	// upstream — which could be main.
+	switch {
+	case len(positionals) == 0:
+		return currentBranchIsMain()
+	case len(positionals) == 1:
+		// Either "git push <remote>" (no refspec → upstream push) or
+		// "git push <refspec>" (no remote). Treat as a no-refspec case
+		// if the single token looks like a remote name (no ':' and not
+		// starting with a ref-ish token like HEAD/refs/*). If it looks
+		// like a refspec, fall through to the refspec test.
+		only := positionals[0]
+		if refspecTargetsMain(only) {
+			return true
+		}
+		// Bare push on main → push to main. If we can't tell, fail-open
+		// here (current branch check returns false on any error).
+		return currentBranchIsMain()
+	default:
+		// First positional is the remote; check every subsequent positional.
+		for _, r := range positionals[1:] {
+			if refspecTargetsMain(r) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// refspecTargetsMain returns true if a single refspec token (one of the
+// `<src>:<dst>` / `<ref>` forms) names main on the destination side.
+func refspecTargetsMain(token string) bool {
+	if token == "main" || token == "refs/heads/main" {
 		return true
 	}
-	if idx := strings.Index(lastPositional, ":"); idx >= 0 {
-		dst := lastPositional[idx+1:]
+	if idx := strings.Index(token, ":"); idx >= 0 {
+		dst := token[idx+1:]
 		if dst == "main" || dst == "refs/heads/main" {
 			return true
 		}
@@ -151,30 +221,100 @@ func isPushToMain(command string) bool {
 	return false
 }
 
-// currentRigRequiresPRStrategy returns true when the rig we're currently
-// running in has merge_strategy=pr. Reuses the refineryAllowedForPR
-// settings-lookup path but without the GT_REFINERY gate — here we want
-// the strategy independent of which agent is calling.
-func currentRigRequiresPRStrategy() bool {
-	// We deliberately reuse refineryAllowedForPR's settings-lookup body
-	// rather than factoring both out, because:
-	//   - The two callers want slightly different semantics (one requires
-	//     GT_REFINERY, this one doesn't).
-	//   - Both fail-closed on any lookup error, which is the correct
-	//     behavior in both places.
-	//
-	// The temporary GT_REFINERY override lets us reuse refineryAllowedForPR
-	// as-is: set GT_REFINERY if unset, call the helper, restore. This
-	// keeps the settings-resolution logic (GT_RIG preference, CWD
-	// fallback, rigName escape guard) in exactly one place.
-	prevRefinery, hadRefinery := os.LookupEnv("GT_REFINERY")
-	if !hadRefinery {
-		os.Setenv("GT_REFINERY", "1")
-		defer os.Unsetenv("GT_REFINERY")
-	} else {
-		_ = prevRefinery // no change needed
+// currentBranchIsMain returns true if the current git branch is "main".
+// Any error (not in a repo, git unavailable) returns false — we can't
+// prove the push targets main, so fall through to the "no refspec → allow"
+// default. This is the only place the guard fails open on a push-target
+// determination; every other path is "when in doubt, block".
+func currentBranchIsMain() bool {
+	out, err := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD").Output()
+	if err != nil {
+		return false
 	}
-	return refineryAllowedForPR()
+	return strings.TrimSpace(string(out)) == "main"
+}
+
+// currentRigRequiresPRStrategy returns true when the calling process is
+// inside a gas town rig and that rig's merge_queue config declares
+// `merge_strategy = "pr"`.
+//
+// Fail-closed semantics (critical under the defense-in-depth intent):
+//
+//   - Not in a gas town workspace at all → return false (fail open).
+//     This is not a gas town push; the guard must not disturb normal dev.
+//   - Inside a workspace, but the rig can't be identified (no GT_RIG and
+//     cwd doesn't name a rig) → return false (fail open). The push isn't
+//     scoped to a specific rig, so we have no policy to enforce.
+//   - Inside a workspace, rig identified, but settings load fails →
+//     return TRUE (fail closed). An ambiguous rig state shouldn't let
+//     unreviewed pushes to main slip past; ask a human via the block.
+//   - Settings load and strategy is not pr → return false.
+//   - Settings load and strategy is pr → return true.
+//
+// Note this is intentionally NOT the same helper as refineryAllowedForPR:
+// that one requires GT_REFINERY and is about granting `gh pr create`
+// permission to the refinery only. Here we want the strategy fact
+// independently of which agent is calling.
+func currentRigRequiresPRStrategy() bool {
+	townRoot, err := workspace.FindFromCwd()
+	if err != nil || townRoot == "" {
+		return false
+	}
+
+	rigName := identifyCurrentRig(townRoot)
+	if rigName == "" {
+		return false
+	}
+
+	rigPath := filepath.Join(townRoot, rigName)
+	settings, err := config.LoadRigSettings(config.RigSettingsPath(rigPath))
+	if err != nil {
+		// In a rig workspace but settings unreadable — fail closed.
+		// Defense-in-depth: an unreviewed push to main is a bigger
+		// problem than a noisy block the user can investigate.
+		return true
+	}
+	if settings == nil || settings.MergeQueue == nil {
+		// No merge_queue block → no policy → let the push through.
+		return false
+	}
+	return settings.MergeQueue.MergeStrategy == config.MergeStrategyPR
+}
+
+// identifyCurrentRig resolves the rig name from GT_RIG (preferred) or
+// from cwd relative to townRoot. Returns "" if the rig can't be
+// identified; callers treat that as "no policy" (fail open).
+//
+// Mirrors the GT_RIG-preference logic in refineryAllowedForPR, with the
+// same defense-in-depth escape guard against path-separator injection.
+func identifyCurrentRig(townRoot string) string {
+	if rig := strings.TrimSpace(os.Getenv("GT_RIG")); rig != "" {
+		if strings.ContainsAny(rig, "/\\") || rig == ".." || rig == "." {
+			return ""
+		}
+		return rig
+	}
+	cwd, err := filepath.Abs(".")
+	if err != nil {
+		return ""
+	}
+	rel, err := filepath.Rel(townRoot, cwd)
+	if err != nil {
+		return ""
+	}
+	rel = filepath.ToSlash(rel)
+	if strings.HasPrefix(rel, "..") {
+		return ""
+	}
+	parts := strings.Split(rel, "/")
+	if len(parts) == 0 || parts[0] == "" || parts[0] == "." {
+		return ""
+	}
+	rig := parts[0]
+	if strings.ContainsAny(rig, "/\\") || rig == ".." || rig == "." {
+		return ""
+	}
+	return rig
 }
 
 func printPushMainBlock(command string) {
