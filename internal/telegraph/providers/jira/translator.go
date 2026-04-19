@@ -46,8 +46,12 @@ type Translator struct {
 }
 
 // New creates a Jira Translator with the given HMAC-SHA256 secret.
+// Panics if secret is empty — an empty secret makes HMAC trivially bypassable.
 // If logger is nil, slog.Default() is used.
 func New(secret []byte, logger *slog.Logger) *Translator {
+	if len(secret) == 0 {
+		panic("jira.New: secret must not be empty")
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -176,10 +180,10 @@ func (p *jiraPayload) eventIDStr() string {
 }
 
 // timestampUTC converts the Jira millisecond timestamp to UTC time.Time.
-// Falls back to the current time if the timestamp is zero (malformed payload).
+// Returns zero time.Time if the timestamp field is absent or zero.
 func (p *jiraPayload) timestampUTC() time.Time {
 	if p.Timestamp == 0 {
-		return time.Now().UTC()
+		return time.Time{}
 	}
 	return time.UnixMilli(p.Timestamp).UTC()
 }

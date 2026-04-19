@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +15,15 @@ import (
 
 // testSecret is the HMAC secret used in all authentication tests.
 const testSecret = "test-webhook-secret"
+
+func TestNew_EmptySecretPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("New() with empty secret should panic")
+		}
+	}()
+	New([]byte{}, nil)
+}
 
 // makeSignature computes the X-Hub-Signature value for the given body.
 func makeSignature(secret, body string) string {
@@ -94,7 +102,7 @@ func issuePayload(webhookEvent, issueKey string, extraFields map[string]any) []b
 		"issue": map[string]any{
 			"id":  "10001",
 			"key": issueKey,
-			"self": fmt.Sprintf("https://company.atlassian.net/rest/api/2/issue/10001"),
+			"self": "https://company.atlassian.net/rest/api/2/issue/10001",
 			"fields": map[string]any{
 				"summary":     "Fix login timeout",
 				"description": "When the user is idle for 30 minutes...",
