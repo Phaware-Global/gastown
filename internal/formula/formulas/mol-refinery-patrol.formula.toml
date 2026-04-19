@@ -769,8 +769,22 @@ if [ -n "$REVIEW_FIX_POLECAT" ]; then
     return 0 2>/dev/null || exit 0
   fi
   POLECAT_STATE=$(echo "$POLECAT_STATUS_JSON" | jq -r '.state // empty')
+  # Polecat lifecycle states (see internal/polecat/types.go):
+  #   working  — actively running the assigned issue (the only in-flight state)
+  #   idle     — finished work, session killed, sandbox preserved for reuse
+  #   done     — transient post-`gt done`; session should exit immediately
+  #   stuck    — self-reported needs help
+  #   stalled  — externally-detected dead session while assigned
+  #   zombie   — orphaned tmux session without worktree
+  #
+  # For the review-fix loop, `working` is the ONLY state that means "still
+  # in flight". All other recognized states indicate the polecat is past
+  # the dispatch — either done (idle/done), failed (stuck/stalled/zombie),
+  # or something external needs to intervene. In every non-`working` case
+  # the refinery should clear the in-flight marker and re-poll threads on
+  # the next patrol.
   case "$POLECAT_STATE" in
-    alive|idle|working)
+    working)
       # Still addressing threads. Skip this MR this cycle — we'll
       # re-check on the next patrol. Proceed to loop-check so OTHER
       # MRs in the queue can still be processed.
@@ -778,19 +792,22 @@ if [ -n "$REVIEW_FIX_POLECAT" ]; then
       # Skip directly to loop-check (not to merge — PR isn't ready yet).
       return 0 2>/dev/null || exit 0
       ;;
-    done|dead|nuked|killed|error|failed)
-      # Terminal: clear the in-flight marker and re-request review since
-      # the polecat may have pushed new commits.
+    idle|done|stuck|stalled|zombie)
+      # Terminal from the review-fix loop's perspective: the polecat is
+      # no longer actively working. Clear the marker and re-request
+      # review since the polecat may have pushed new commits before
+      # transitioning. The witness handles zombie/stalled cleanup on its
+      # own schedule; we don't block on it.
       {{ cmd }} mq set-review-state "$MR" --clear-polecat
       [ -n "{{pr_reviewer}}" ] && {{ cmd }} refinery pr request-review $PR --user {{pr_reviewer}}
       REVIEW_FIX_POLECAT=""
       ;;
     *)
-      # Unknown state (including empty). Treat as transient — keep the
-      # marker and retry next patrol rather than assume terminal. If the
-      # polecat really is gone, a subsequent patrol will observe a
-      # recognized terminal state or the status lookup will start
-      # returning an error we can classify.
+      # Unrecognized state (including empty). Treat as transient — keep
+      # the marker and retry next patrol rather than assume terminal.
+      # If this recurs, either the polecat state set expanded and we
+      # need to classify the new value, or the lookup is returning
+      # garbage that the earlier rc/empty check didn't catch.
       echo "PR #$PR: polecat $REVIEW_FIX_POLECAT in unrecognized state %q=$POLECAT_STATE; retrying next patrol"
       return 0 2>/dev/null || exit 0
       ;;
