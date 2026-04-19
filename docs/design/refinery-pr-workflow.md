@@ -501,13 +501,15 @@ and G4 (prefix mismatch) are smaller, related effects.
 
 Two compounding bugs in our Phase 1-3 work:
 
-- **(a) `beads.CreateOptions.Rig` passes a nonexistent bd flag.**
-  `internal/beads/beads.go:1230` appends `--rig=<name>` to the `bd
-  create` invocation, but `bd create` takes `--repo`, not `--rig`.
-  Every MR bead create under a rig errors out. This is the triggering
-  cause — with MR creation working, the refinery would have taken the
+- **(a) `beads.CreateOptions.Rig` passed a nonexistent bd flag (pre-fix).**
+  Before this stack landed, `internal/beads/beads.go` appended
+  `--rig=<name>` to the `bd create` invocation, but `bd create` only
+  accepts `--repo`. Every MR bead create under a rig errored out with
+  "unknown flag: --rig". This was the triggering cause of the incident
+  — with MR creation working, the refinery would have taken the
   formula's `pr-create → wait-ci → request-review → wait-approval →
-  merge` path.
+  merge` path. The first PR in this stack fixes the mapping (`--rig`
+  → `--repo`) and adds a regression test.
 - **(b) The refinery LLM treats "branch on origin, no MR" as
   permission to improvise.** The `mol-refinery-patrol` formula does
   not cover the "polecat branch exists but no MR bead" state, so the
