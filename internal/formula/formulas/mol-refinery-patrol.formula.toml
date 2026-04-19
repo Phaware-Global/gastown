@@ -174,6 +174,26 @@ default = "direct"
 description = "Require at least one approving GitHub review before merging (only applies when merge_strategy=pr)."
 default = "false"
 
+[vars.pr_reviewer]
+description = "GitHub user/bot to request an automated review from (e.g., augment). Empty = skip automated review, proceed directly to human-approval gate. Only applies when merge_strategy=pr."
+default = ""
+
+[vars.pr_approver]
+description = "GitHub user whose approving review gates the merge. Required when merge_strategy=pr. Only applies when merge_strategy=pr."
+default = ""
+
+[vars.pr_required_approvals]
+description = "Minimum distinct APPROVED reviewers required before merge (the count gate, in addition to the pr_approver gate). Default 1 when merge_strategy=pr. Setting to 0 disables only the count gate — the pr_approver's approval is still required because it's a separate gate (and pr_approver is required by config validation when merge_strategy=pr). Only applies when merge_strategy=pr."
+default = "1"
+
+[vars.pr_review_loop_max]
+description = "Maximum review-fix polecat dispatch cycles per PR before escalating. Only applies when merge_strategy=pr."
+default = "3"
+
+[vars.pr_merge_method]
+description = "Merge method passed to the VCS provider when merging the PR. One of: squash, merge, rebase. Only applies when merge_strategy=pr."
+default = "squash"
+
 [vars.rig]
 description = "Name of the rig this refinery belongs to (e.g., gastown, laser)"
 default = "UNSET_RIG"
@@ -626,19 +646,25 @@ Continue to Step 2.
 
 **If merge_strategy = "pr":**
 
-Push the rebased branch and create a GitHub PR instead of direct merge.
+Under the refinery PR workflow, the formula orchestrates the PR lifecycle
+through `gt refinery pr …` subcommands. The subcommands encapsulate
+gh-CLI/graphql plumbing (idempotent PR creation, paginated thread listing,
+approver-aware gating, etc.) so the formula stays short and portable.
+
+**Step PR.1: Push the rebased polecat branch**
 
 ```bash
-# Push the rebased polecat branch (force-push since we rebased)
 git checkout temp
 git push origin temp:refs/heads/<polecat-branch> --force-with-lease
+```
 
-# Create the PR using bead metadata for title/description
-PR_URL=$(gh pr create \
-  --base <merge-target> \
-  --head <polecat-branch> \
-  --title "<issue-title> (<issue-id>)" \
-  --body "## Summary
+**Step PR.2: Create the PR (idempotent — returns existing PR if one is open)**
+
+Build the PR body using bead metadata, then:
+
+```bash
+cat > /tmp/pr-body-<issue-id>.md <<'EOF'
+## Summary
 
 Automated merge from polecat branch.
 
@@ -648,96 +674,119 @@ Automated merge from polecat branch.
 - **Tests**: Passed (verified by refinery)
 
 ---
-*Created by Gas Town Refinery*")
-echo "PR created: $PR_URL"
+*Created by Gas Town Refinery*
+EOF
+
+PR_JSON=$({{ cmd }} refinery pr create \
+  --branch <polecat-branch> \
+  --base <merge-target> \
+  --title "<issue-title> (<issue-id>)" \
+  --body-file /tmp/pr-body-<issue-id>.md \
+  --json)
+PR=$(echo "$PR_JSON" | jq -r .number)
+PR_URL=$(echo "$PR_JSON" | jq -r .url)
+echo "PR #$PR: $PR_URL"
 ```
 
-If the PR already exists for this branch, `gh pr create` will fail. In that case,
-find the existing PR:
+`gt refinery pr create` is idempotent — re-running it for an existing open
+PR on the same branch returns that PR's number/url without creating a
+duplicate.
+
+**Step PR.3: Wait for CI checks**
+
+⚠️ **DO NOT PROCEED until CI reaches a terminal state. DO NOT send MERGED
+until the PR is actually merged.**
+
 ```bash
-PR_URL=$(gh pr view <polecat-branch> --json url -q '.url')
+{{ cmd }} refinery pr wait-ci $PR
 ```
 
-**Step 1.5 (pr only): VERIFY PR CREATED**
+The command blocks until every check reaches a terminal state. Exit 0 iff
+all checks succeeded. On `FAILURE` or timeout, non-zero exit — send
+FIX_NEEDED back to the polecat and skip to the shared post-merge "Step 4: Archive the MERGE_READY mail" section further down the merge-push step (NOT Step PR.4 "Request automated review" — that's only reached on CI success):
 
 ```bash
-gh pr view <polecat-branch> --json url,state -q '.url + " " + .state'
-```
-
-If the PR was not created or is in an unexpected state, debug and retry.
-
-**Step 1.6 (pr only): WAIT FOR CI CHECKS TO PASS**
-
-⚠️ **DO NOT PROCEED until CI passes. DO NOT send MERGED until the PR is actually merged.**
-
-```bash
-# Get the repo URL for gh commands
-REPO_URL=$(git remote get-url origin | sed 's/.*github.com[:/]\\(.*\\)\\.git/\\1/')
-
-# Wait for CI checks (timeout 15 minutes)
-gh pr checks <polecat-branch> --repo "$REPO_URL" --watch --fail-fast
-```
-
-**If CI checks FAIL:**
-Do NOT merge. Send FIX_NEEDED back to the polecat:
-```bash
-FAILURE_OUTPUT=$(gh pr checks <polecat-branch> --repo "$REPO_URL" 2>&1)
-gt mail send <rig>/polecats/<polecat-name> -s "FIX_NEEDED <polecat-name>" --stdin <<'BODY'
+gt mail send <rig>/polecats/<polecat-name> -s "FIX_NEEDED <polecat-name>" --stdin <<BODY
 Branch: <branch>
 Issue: <issue-id>
 PR: ${PR_URL}
 Failure-Type: ci-checks
-Error: $FAILURE_OUTPUT
+Error: run 'gh pr checks $PR' for details
 Attempt-Number: 1
 BODY
 ```
-Then skip to Step 4 (archive mail) and continue patrol.
 
-**If CI checks PASS:**
-
-**Step 1.7 (pr only): CHECK REVIEW APPROVAL STATUS (gas-fk4)**
-
-⚠️ **DO NOT merge a PR that has not been explicitly approved.**
-Plain review comments (COMMENTED) are NOT approval. Only an explicit
-"APPROVED" reviewDecision allows the merge to proceed.
+**Step PR.4: Request automated review (if pr_reviewer is configured)**
 
 ```bash
-REVIEW_DECISION=$(gh pr view <polecat-branch> --repo "$REPO_URL" --json reviewDecision -q '.reviewDecision')
-echo "Review decision: $REVIEW_DECISION"
+if [ -n "{{pr_reviewer}}" ]; then
+  {{ cmd }} refinery pr request-review $PR --user {{pr_reviewer}}
+fi
 ```
 
-| reviewDecision | Action |
-|----------------|--------|
-| `APPROVED` | Proceed to merge |
-| `CHANGES_REQUESTED` | Send FIX_NEEDED to polecat (reviewer rejected), skip merge |
-| `REVIEW_REQUIRED` or empty | PR has not been reviewed yet — skip merge, leave PR open |
+When `pr_reviewer` is empty, the review loop is skipped entirely and the
+flow proceeds directly to the human-approval gate.
 
-**If CHANGES_REQUESTED:**
+**Step PR.5: Review-fix loop (bounded by pr_review_loop_max, default 3)**
+
+```
+LOOP=0
+MAX={{pr_review_loop_max}}       # rig-level cap; default 3
+sleep 60                          # give reviewer time to post
+
+while true; do
+  THREADS=$({{ cmd }} refinery pr threads $PR --unresolved --json)
+  COUNT=$(echo "$THREADS" | jq 'length')
+  [ "$COUNT" -eq 0 ] && break
+
+  LOOP=$((LOOP + 1))
+  if [ "$LOOP" -gt "$MAX" ]; then
+    # Cap hit: escalate with a mail to mayor/ and leave the PR open.
+    gt escalate -s HIGH \
+      "PR #$PR review loop exceeded $MAX iterations" \
+      --context "$THREADS"
+    exit 1
+  fi
+
+  # Dispatch a polecat to address the unresolved threads on the PR branch.
+  # NOTE: --pr/--branch flags on gt sling land in Phase 3 — until then this
+  # loop is effectively skipped at runtime (gt sling will reject the flag).
+  # Once Phase 3 ships, the polecat checks out <polecat-branch> and addresses
+  # the threads in place.
+  gt sling review-fix/<issue-id> <rig> \
+    --pr $PR \
+    --branch <polecat-branch> \
+    --args "Address these PR threads:
+$THREADS"
+
+  # Wait for the polecat's REVIEW_FIX_DONE signal (via witness → refinery).
+  # Re-request review once the polecat signals done.
+  {{ cmd }} mail check --inject
+  [ -n "{{pr_reviewer}}" ] && {{ cmd }} refinery pr request-review $PR --user {{pr_reviewer}}
+  sleep 60
+done
+```
+
+**Step PR.6: Wait for human approval (gate)**
+
 ```bash
-gt mail send <rig>/polecats/<polecat-name> -s "FIX_NEEDED <polecat-name>" --stdin <<'BODY'
-Branch: <branch>
-Issue: <issue-id>
-PR: ${PR_URL}
-Failure-Type: review-rejected
-Error: Reviewer requested changes on the PR. Address the review feedback and resubmit.
-Attempt-Number: 1
-BODY
+{{ cmd }} refinery pr wait-approval $PR \
+  --approver {{pr_approver}} \
+  --min-approvals {{pr_required_approvals}} \
+  --escalate
 ```
-Clean up temp branch, archive MERGE_READY, skip to loop-check.
 
-**If REVIEW_REQUIRED or empty (not yet reviewed):**
-Do NOT merge. Do NOT close. Do NOT send FIX_NEEDED. Leave the PR open
-for human review. Archive the MERGE_READY mail — the PR will be picked
-up on a future patrol cycle if/when it gets approved.
-Clean up temp branch and skip to loop-check.
+The command polls until both the configured approver has APPROVED *and*
+the distinct-approver count meets `pr_required_approvals`. On timeout it
+returns non-zero with a message naming the unmet gate.
 
-**If APPROVED:**
-Merge the PR:
+**Step PR.7: Merge**
+
 ```bash
-gh pr merge <polecat-branch> --repo "$REPO_URL" --merge --delete-branch
+{{ cmd }} refinery pr merge $PR --method {{pr_merge_method}}
 ```
 
-If merge fails (conflict, branch protection), debug and retry.
+Delegates to the VCS provider's merge API, respecting branch protection.
 
 ⚠️ **STOP HERE - DO NOT PROCEED UNTIL THE PR IS ACTUALLY MERGED ON GITHUB**
 

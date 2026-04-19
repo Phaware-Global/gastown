@@ -4,9 +4,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 var tapGuardCmd = &cobra.Command{
@@ -69,6 +72,13 @@ func init() {
 func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 	// Check if we're in a Gas Town agent context
 	if isGasTownAgentContext() {
+		// Exception: the refinery running for a rig configured with
+		// merge_strategy=pr legitimately needs to call `gh pr create` and
+		// `gh pr merge` as part of its normal workflow. Polecats and other
+		// agents are still blocked.
+		if refineryAllowedForPR() {
+			return nil
+		}
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════╗")
 		fmt.Fprintln(os.Stderr, "║  ❌ PR WORKFLOW BLOCKED                                          ║")
@@ -80,6 +90,9 @@ func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(os.Stderr, "║                                                                  ║")
 		fmt.Fprintln(os.Stderr, "║  Why? PRs add friction that breaks autonomous execution.        ║")
 		fmt.Fprintln(os.Stderr, "║  See: ~/gt/docs/PRIMING.md (GUPP principle)                     ║")
+		fmt.Fprintln(os.Stderr, "║                                                                  ║")
+		fmt.Fprintln(os.Stderr, "║  Refineries: set merge_queue.merge_strategy=pr on the rig to    ║")
+		fmt.Fprintln(os.Stderr, "║  allow PR creation through the refinery PR workflow.            ║")
 		fmt.Fprintln(os.Stderr, "╚══════════════════════════════════════════════════════════════════╝")
 		fmt.Fprintln(os.Stderr, "")
 		return NewSilentExit(2) // Exit 2 = BLOCK in Claude Code hooks
@@ -136,6 +149,70 @@ func isGasTownAgentContext() bool {
 	}
 
 	return false
+}
+
+// refineryAllowedForPR returns true when the guard should permit PR-workflow
+// commands (gh pr create, etc.) because:
+//   - the caller is the refinery (GT_REFINERY is set), AND
+//   - the current rig's merge_queue config has merge_strategy=pr
+//
+// All other agents (polecats, crew, witness, deacon, mayor) remain blocked
+// even when the rig uses merge_strategy=pr — PR creation is a refinery-only
+// responsibility under the PR workflow. Fails closed on any lookup error,
+// which keeps polecats blocked when the env is degraded.
+func refineryAllowedForPR() bool {
+	if os.Getenv("GT_REFINERY") == "" {
+		return false
+	}
+	townRoot, err := workspace.FindFromCwd()
+	if err != nil || townRoot == "" {
+		return false
+	}
+
+	// Prefer GT_RIG when set — Gas Town sets it for refinery sessions and it
+	// is a more reliable identifier than CWD. The CWD path can be the town
+	// root, the mayor/rig worktree, or any ad-hoc location when a hook fires
+	// (e.g., pre-tool hooks invoked from a prompt outside the rig directory).
+	// Fall back to CWD-relative inference for older session bootstraps that
+	// don't set GT_RIG yet.
+	var rigName string
+	if rigName = strings.TrimSpace(os.Getenv("GT_RIG")); rigName == "" {
+		cwd, err := filepath.Abs(".")
+		if err != nil {
+			return false
+		}
+		rel, err := filepath.Rel(townRoot, cwd)
+		if err != nil {
+			return false
+		}
+		rel = filepath.ToSlash(rel)
+		// A relative path starting with ".." means cwd is outside townRoot
+		// (common with symlink/realpath mismatches). Fail closed rather than
+		// let `filepath.Join(townRoot, "..")` escape.
+		if strings.HasPrefix(rel, "..") {
+			return false
+		}
+		parts := strings.Split(rel, "/")
+		if len(parts) == 0 || parts[0] == "" || parts[0] == "." {
+			return false
+		}
+		rigName = parts[0]
+	}
+
+	// Belt-and-suspenders: if rigName somehow resolves outside townRoot
+	// (e.g., an env-provided GT_RIG value containing path separators or `..`),
+	// refuse to trust it rather than reading settings from an unintended
+	// location.
+	if strings.ContainsAny(rigName, "/\\") || rigName == ".." || rigName == "." {
+		return false
+	}
+
+	rigPath := filepath.Join(townRoot, rigName)
+	settings, err := config.LoadRigSettings(config.RigSettingsPath(rigPath))
+	if err != nil || settings == nil || settings.MergeQueue == nil {
+		return false
+	}
+	return settings.MergeQueue.MergeStrategy == config.MergeStrategyPR
 }
 
 // isMaintainerOrigin returns true if the origin remote points to the maintainer's repo.

@@ -180,16 +180,16 @@ type MergeQueueConfig struct {
 	// MergeStrategy="pr". Valid values: "github" (default), "bitbucket".
 	VCSProvider string `json:"vcs_provider,omitempty"`
 
-	// RequireReview controls whether the refinery requires at least one approving
-	// review before merging a PR. Only meaningful when MergeStrategy="pr".
+	// RequireReview controls the count gate (approvals beyond PRApprover).
+	// Only meaningful when MergeStrategy="pr".
 	//
 	// Resolution when MergeStrategy="pr":
-	//   - RequireReview=true  → 1 approval required
-	//   - RequireReview=false → 0 approvals (CI-only gate)
-	//   - Both this and PRRequiredApprovals unset → default 1 approval
+	//   - RequireReview=true  → count gate requires 1 approval
+	//   - RequireReview=false → count gate disabled; only PRApprover's gate applies
+	//   - Both this and PRRequiredApprovals unset → count gate defaults to 1
 	//
-	// The historical "nil → no review" behavior no longer applies — PR mode
-	// now defaults to 1 approval. Set `pr_required_approvals: 0` for CI-only.
+	// Note: `pr_required_approvals: 0` disables only the count gate. The
+	// PRApprover gate is independent and always active.
 	//
 	// Deprecated: kept for backward compatibility. Use PRRequiredApprovals.
 	RequireReview *bool `json:"require_review,omitempty"`
@@ -202,10 +202,11 @@ type MergeQueueConfig struct {
 	// Required when MergeStrategy="pr". Only meaningful when MergeStrategy="pr".
 	PRApprover string `json:"pr_approver,omitempty"`
 
-	// PRRequiredApprovals is the number of approving reviews required before
-	// the refinery will merge. Nil defaults to 1 when MergeStrategy="pr".
-	// Explicit zero means "no approvals required — CI only"; *int lets us
-	// distinguish the two.
+	// PRRequiredApprovals is the count gate: minimum distinct APPROVED
+	// reviewers required in addition to PRApprover. Nil defaults to 1 when
+	// MergeStrategy="pr". Explicit zero disables only the count gate — the
+	// PRApprover's approval is still required. *int lets us distinguish
+	// zero from unset.
 	PRRequiredApprovals *int `json:"pr_required_approvals,omitempty"`
 
 	// PRReviewLoopMax caps review-fix polecat dispatches per PR. Defaults to 3.
