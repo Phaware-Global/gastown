@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -1023,6 +1024,423 @@ func (g *Git) GhPrMerge(prNumber int, method string) (string, error) {
 		return "", nil // Merge succeeded, just can't determine SHA
 	}
 	return sha, nil
+}
+
+// GhPrCreate creates a GitHub PR for the given branch. Idempotent: if an open
+// PR already exists for the branch, returns that PR's number and URL without
+// creating a new one. base is the target branch (e.g., "main"). title and body
+// populate the PR metadata. Returns (number, url, error).
+func (g *Git) GhPrCreate(branch, base, title, body string) (int, string, error) {
+	// Idempotency: if an open PR already exists for this branch, return it.
+	cmd := exec.Command("gh", "pr", "list", "--head", branch, "--state", "open",
+		"--json", "number,url", "--limit", "1")
+	cmd.Dir = g.workDir
+	if out, err := cmd.Output(); err == nil {
+		var existing []struct {
+			Number int    `json:"number"`
+			URL    string `json:"url"`
+		}
+		if jerr := json.Unmarshal(bytes.TrimSpace(out), &existing); jerr == nil && len(existing) > 0 {
+			return existing[0].Number, existing[0].URL, nil
+		}
+	}
+
+	args := []string{"pr", "create", "--head", branch, "--base", base,
+		"--title", title, "--body", body}
+	cmd = exec.Command("gh", args...)
+	cmd.Dir = g.workDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return 0, "", fmt.Errorf("gh pr create failed: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	// gh pr create prints the PR URL on stdout. Parse number from trailing path component.
+	url := strings.TrimSpace(string(out))
+	// Grab the last whitespace-separated token — gh sometimes prints a message before the URL.
+	if fields := strings.Fields(url); len(fields) > 0 {
+		url = fields[len(fields)-1]
+	}
+	number := 0
+	if idx := strings.LastIndex(url, "/"); idx >= 0 && idx < len(url)-1 {
+		_, _ = fmt.Sscanf(url[idx+1:], "%d", &number)
+	}
+	if number == 0 {
+		// Fallback: query by branch.
+		if n, qerr := g.FindPRNumber(branch); qerr == nil && n != 0 {
+			number = n
+		}
+	}
+	if number == 0 {
+		// Callers downstream (wait-ci, request-review, merge) can't operate
+		// without a number; surface the failure rather than returning zero.
+		return 0, url, fmt.Errorf("gh pr create succeeded but could not determine PR number (url=%q)", url)
+	}
+	return number, url, nil
+}
+
+// GhPrRequestReview requests reviews on a PR from the given users. Uses
+// `gh pr edit --add-reviewer` which accepts both users and @-prefixed teams.
+// A repeated request for the same reviewer is a no-op on GitHub's side.
+func (g *Git) GhPrRequestReview(prNumber int, reviewers []string) error {
+	if len(reviewers) == 0 {
+		return nil
+	}
+	args := []string{"pr", "edit", fmt.Sprintf("%d", prNumber),
+		"--add-reviewer", strings.Join(reviewers, ",")}
+	cmd := exec.Command("gh", args...)
+	cmd.Dir = g.workDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh pr edit --add-reviewer failed: %s: %w",
+			strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
+// GhReviewThread describes one review thread on a PR.
+type GhReviewThread struct {
+	ID         string `json:"id"`
+	IsResolved bool   `json:"isResolved"`
+	IsOutdated bool   `json:"isOutdated"`
+	Path       string `json:"path"`
+	Line       int    `json:"line"`
+	Author     string `json:"author"`
+	Body       string `json:"body"`
+	URL        string `json:"url"`
+}
+
+// GhPrReviewThreads returns every review thread on a PR.
+// Uses `gh api graphql` because the REST API doesn't expose thread resolution,
+// and paginates so the full thread set is returned rather than the first 100.
+// Each thread's Body/Path/Line/Author/URL reflect the *first* comment on that
+// thread (consistent with how gemini/augment post their top-level remarks).
+func (g *Git) GhPrReviewThreads(prNumber int) ([]GhReviewThread, error) {
+	owner, repo, err := g.ghRepoOwnerName()
+	if err != nil {
+		return nil, err
+	}
+	// Page size deliberately small enough that a single call is fast but large
+	// enough that most PRs fit in one page.
+	const pageSize = 100
+	// Safety cap so a pathological PR can't pin us forever; raise if needed.
+	const maxPages = 20
+
+	type respT struct {
+		Data struct {
+			Repository struct {
+				PullRequest struct {
+					ReviewThreads struct {
+						PageInfo struct {
+							HasNextPage bool   `json:"hasNextPage"`
+							EndCursor   string `json:"endCursor"`
+						} `json:"pageInfo"`
+						Nodes []struct {
+							ID         string `json:"id"`
+							IsResolved bool   `json:"isResolved"`
+							IsOutdated bool   `json:"isOutdated"`
+							Comments   struct {
+								Nodes []struct {
+									Path   string `json:"path"`
+									Line   int    `json:"line"`
+									URL    string `json:"url"`
+									Body   string `json:"body"`
+									Author struct {
+										Login string `json:"login"`
+									} `json:"author"`
+								} `json:"nodes"`
+							} `json:"comments"`
+						} `json:"nodes"`
+					} `json:"reviewThreads"`
+				} `json:"pullRequest"`
+			} `json:"repository"`
+		} `json:"data"`
+	}
+
+	var threads []GhReviewThread
+	cursor := ""
+	for page := 0; page < maxPages; page++ {
+		// Use distinct queries for first-page vs. subsequent pages so the
+		// graphql `after:` argument is literally absent on the first page
+		// rather than being sent as an empty-string variable (which gh's
+		// `-F after=` would produce, and GitHub can reject as invalid).
+		var query string
+		if cursor == "" {
+			query = `query($owner:String!,$name:String!,$number:Int!,$first:Int!){
+				repository(owner:$owner,name:$name){
+					pullRequest(number:$number){
+						reviewThreads(first:$first){
+							pageInfo{ hasNextPage endCursor }
+							nodes{
+								id isResolved isOutdated
+								comments(first:1){
+									nodes{
+										path line url body
+										author{login}
+									}
+								}
+							}
+						}
+					}
+				}
+			}`
+		} else {
+			query = `query($owner:String!,$name:String!,$number:Int!,$first:Int!,$after:String!){
+				repository(owner:$owner,name:$name){
+					pullRequest(number:$number){
+						reviewThreads(first:$first,after:$after){
+							pageInfo{ hasNextPage endCursor }
+							nodes{
+								id isResolved isOutdated
+								comments(first:1){
+									nodes{
+										path line url body
+										author{login}
+									}
+								}
+							}
+						}
+					}
+				}
+			}`
+		}
+		args := []string{"api", "graphql",
+			"-f", "query=" + query,
+			"-F", "owner=" + owner,
+			"-F", "name=" + repo,
+			"-F", fmt.Sprintf("number=%d", prNumber),
+			"-F", fmt.Sprintf("first=%d", pageSize)}
+		if cursor != "" {
+			args = append(args, "-F", "after="+cursor)
+		}
+		cmd := exec.Command("gh", args...)
+		cmd.Dir = g.workDir
+		out, err := cmd.Output()
+		if err != nil {
+			return nil, fmt.Errorf("gh api graphql (reviewThreads page %d) failed: %w", page, err)
+		}
+
+		var resp respT
+		if err := json.Unmarshal(out, &resp); err != nil {
+			return nil, fmt.Errorf("parsing reviewThreads response (page %d): %w", page, err)
+		}
+
+		rt := resp.Data.Repository.PullRequest.ReviewThreads
+		for _, n := range rt.Nodes {
+			t := GhReviewThread{
+				ID:         n.ID,
+				IsResolved: n.IsResolved,
+				IsOutdated: n.IsOutdated,
+			}
+			if len(n.Comments.Nodes) > 0 {
+				c := n.Comments.Nodes[0]
+				t.Path = c.Path
+				t.Line = c.Line
+				t.URL = c.URL
+				t.Body = c.Body
+				t.Author = c.Author.Login
+			}
+			threads = append(threads, t)
+		}
+
+		if !rt.PageInfo.HasNextPage || rt.PageInfo.EndCursor == "" {
+			return threads, nil
+		}
+		cursor = rt.PageInfo.EndCursor
+	}
+	return threads, fmt.Errorf("reviewThreads pagination hit maxPages=%d — PR has unusually many threads", maxPages)
+}
+
+// GhPrUnresolvedThreads returns only threads that are not resolved and not outdated.
+func (g *Git) GhPrUnresolvedThreads(prNumber int) ([]GhReviewThread, error) {
+	all, err := g.GhPrReviewThreads(prNumber)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]GhReviewThread, 0, len(all))
+	for _, t := range all {
+		if !t.IsResolved && !t.IsOutdated {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
+// GhPrChecksRollup returns the CI status rollup for a PR:
+//   - state:  "SUCCESS", "FAILURE", "ERROR", "PENDING", "NO_CHECKS", or "" if unknown
+//   - done:   true if all checks have finished (success or failure)
+//
+// On a freshly-created PR, the checks list can be empty for a short window
+// before CI systems register their status. Rather than silently greenlighting
+// that case (which would let a caller merge before CI ran), return
+// state="NO_CHECKS" done=false so the caller's polling loop waits. After the
+// caller's configured timeout they can treat "NO_CHECKS" as acceptable if
+// that's their policy.
+func (g *Git) GhPrChecksRollup(prNumber int) (state string, done bool, err error) {
+	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber),
+		"--json", "statusCheckRollup")
+	cmd.Dir = g.workDir
+	out, err := cmd.Output()
+	if err != nil {
+		return "", false, fmt.Errorf("gh pr view (statusCheckRollup) failed: %w", err)
+	}
+	var resp struct {
+		StatusCheckRollup []struct {
+			Status     string `json:"status"`     // QUEUED, IN_PROGRESS, COMPLETED (checks API)
+			Conclusion string `json:"conclusion"` // SUCCESS, FAILURE, … (checks API)
+			State      string `json:"state"`      // SUCCESS, FAILURE, PENDING, ERROR (statuses API)
+		} `json:"statusCheckRollup"`
+	}
+	if jerr := json.Unmarshal(bytes.TrimSpace(out), &resp); jerr != nil {
+		return "", false, fmt.Errorf("parsing statusCheckRollup: %w", jerr)
+	}
+
+	if len(resp.StatusCheckRollup) == 0 {
+		// Could be a brand-new PR whose CI hasn't registered yet, or a repo
+		// with no required checks. Either way we can't prove SUCCESS.
+		return "NO_CHECKS", false, nil
+	}
+
+	allDone := true
+	anyFailure := false
+	for _, c := range resp.StatusCheckRollup {
+		switch {
+		case c.Status != "" && c.Status != "COMPLETED":
+			allDone = false
+		case c.Status == "COMPLETED":
+			if c.Conclusion != "SUCCESS" && c.Conclusion != "NEUTRAL" && c.Conclusion != "SKIPPED" {
+				anyFailure = true
+			}
+		case c.State == "PENDING":
+			allDone = false
+		case c.State != "" && c.State != "SUCCESS":
+			anyFailure = true
+		}
+	}
+
+	switch {
+	case !allDone:
+		return "PENDING", false, nil
+	case anyFailure:
+		return "FAILURE", true, nil
+	default:
+		return "SUCCESS", true, nil
+	}
+}
+
+// ghReview is the minimal review payload we need for approval calculations.
+type ghReview struct {
+	Author struct {
+		Login string `json:"login"`
+	} `json:"author"`
+	State       string `json:"state"`
+	SubmittedAt string `json:"submittedAt"`
+}
+
+// ghFetchReviews returns the PR's reviews sorted oldest → newest by
+// submittedAt. We do not rely on the gh CLI / GitHub API returning reviews
+// in any particular order — sorting here makes the "most recent terminal
+// state wins" logic below robust regardless of source ordering.
+func (g *Git) ghFetchReviews(prNumber int) ([]ghReview, error) {
+	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber),
+		"--json", "reviews")
+	cmd.Dir = g.workDir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("gh pr view (reviews) failed: %w", err)
+	}
+	var resp struct {
+		Reviews []ghReview `json:"reviews"`
+	}
+	if jerr := json.Unmarshal(bytes.TrimSpace(out), &resp); jerr != nil {
+		return nil, fmt.Errorf("parsing reviews: %w", jerr)
+	}
+	// ISO-8601 timestamps sort lexicographically.
+	sort.SliceStable(resp.Reviews, func(i, j int) bool {
+		return resp.Reviews[i].SubmittedAt < resp.Reviews[j].SubmittedAt
+	})
+	return resp.Reviews, nil
+}
+
+// GhPrApprovedBy returns true iff the given user has submitted an APPROVED
+// review on the PR and has not subsequently dismissed it or requested changes.
+// Passing user="" falls back to IsPRApproved (any approver).
+func (g *Git) GhPrApprovedBy(prNumber int, user string) (bool, error) {
+	if user == "" {
+		return g.IsPRApproved(prNumber)
+	}
+	reviews, err := g.ghFetchReviews(prNumber)
+	if err != nil {
+		return false, err
+	}
+	// Walk newest-first over a guaranteed oldest→newest list.
+	for i := len(reviews) - 1; i >= 0; i-- {
+		r := reviews[i]
+		if !strings.EqualFold(r.Author.Login, user) {
+			continue
+		}
+		switch r.State {
+		case "APPROVED":
+			return true, nil
+		case "CHANGES_REQUESTED", "DISMISSED":
+			return false, nil
+		}
+	}
+	return false, nil
+}
+
+// GhPrApprovalCount returns the number of distinct reviewers whose most recent
+// terminal review on the PR is APPROVED. A reviewer who later submits
+// CHANGES_REQUESTED or whose approval was DISMISSED does not count. Used to
+// enforce pr_required_approvals > 1.
+//
+// Resilient to gh returning reviews in any order — ghFetchReviews sorts by
+// submittedAt before we fold into the per-user latest-state map.
+func (g *Git) GhPrApprovalCount(prNumber int) (int, error) {
+	reviews, err := g.ghFetchReviews(prNumber)
+	if err != nil {
+		return 0, err
+	}
+	// latest[user] = terminal state of that user's newest review
+	latest := make(map[string]string, len(reviews))
+	for _, r := range reviews {
+		login := strings.ToLower(r.Author.Login)
+		if login == "" {
+			continue
+		}
+		switch r.State {
+		case "APPROVED", "CHANGES_REQUESTED", "DISMISSED":
+			latest[login] = r.State
+		}
+	}
+	count := 0
+	for _, state := range latest {
+		if state == "APPROVED" {
+			count++
+		}
+	}
+	return count, nil
+}
+
+// ghRepoOwnerName returns (owner, repoName) by parsing the origin remote URL.
+// Accepts HTTPS and SSH forms; strips a trailing .git.
+func (g *Git) ghRepoOwnerName() (string, string, error) {
+	out, err := g.run("remote", "get-url", "origin")
+	if err != nil {
+		return "", "", err
+	}
+	url := strings.TrimSpace(out)
+	url = strings.TrimSuffix(url, ".git")
+	// https://github.com/owner/repo or git@github.com:owner/repo
+	for _, sep := range []string{"github.com/", "github.com:"} {
+		if idx := strings.Index(url, sep); idx >= 0 {
+			tail := url[idx+len(sep):]
+			parts := strings.SplitN(tail, "/", 2)
+			if len(parts) == 2 {
+				return parts[0], parts[1], nil
+			}
+		}
+	}
+	return "", "", fmt.Errorf("could not parse owner/repo from origin url %q", url)
 }
 
 // FindBitbucketPRNumber returns the Bitbucket PR ID for the given branch, or 0 if none exists.

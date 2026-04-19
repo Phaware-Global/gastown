@@ -25,6 +25,9 @@ func TestEngineer_LoadConfig_MergeStrategyPR(t *testing.T) {
 		"merge_queue": map[string]interface{}{
 			"merge_strategy": "pr",
 			"require_review": requireReview,
+			// merge_strategy=pr now requires pr_approver (defense-in-depth
+			// validation added in LoadConfig).
+			"pr_approver": "gatekeeper",
 		},
 	}
 

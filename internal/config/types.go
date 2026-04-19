@@ -1287,8 +1287,48 @@ type MergeQueueConfig struct {
 
 	// RequireReview controls whether the refinery requires at least one approving
 	// review before merging a PR. Only meaningful when merge_strategy="pr".
-	// Nil defaults to false (no review required).
+	//
+	// Resolution when merge_strategy="pr":
+	//   - RequireReview=true  → 1 approval required (same as PRRequiredApprovals=1)
+	//   - RequireReview=false → 0 approvals required (CI-only gate)
+	//   - RequireReview=nil (unset), PRRequiredApprovals also unset → default 1
+	//
+	// Note: the "nil defaults to no review" pre-PRRequiredApprovals behavior
+	// no longer applies — in PR mode the default is now 1 approval. Set
+	// `pr_required_approvals: 0` explicitly for CI-only.
+	//
+	// Deprecated: use PRRequiredApprovals (>0 is equivalent to RequireReview=true).
+	// Kept for one release for backward compatibility.
 	RequireReview *bool `json:"require_review,omitempty"`
+
+	// PRReviewer is the GitHub user or bot to request an automated review from
+	// (e.g., "augment"). Empty means no automated review is requested and the
+	// review loop is skipped entirely — the flow proceeds directly to the
+	// human-approval gate. Only meaningful when merge_strategy="pr".
+	PRReviewer string `json:"pr_reviewer,omitempty"`
+
+	// PRApprover is the GitHub user whose approving review gates the merge.
+	// Required when merge_strategy="pr"; the refinery will refuse to start
+	// with this unset so misconfiguration fails loudly rather than at merge
+	// time. Only meaningful when merge_strategy="pr".
+	PRApprover string `json:"pr_approver,omitempty"`
+
+	// PRRequiredApprovals is the number of approving reviews required before
+	// the refinery will merge. Nil defaults to 1 when merge_strategy="pr".
+	// Explicit zero ("pr_required_approvals": 0) means "no approvals
+	// required — CI only"; use *int so zero is distinguishable from unset.
+	// Only meaningful when merge_strategy="pr".
+	PRRequiredApprovals *int `json:"pr_required_approvals,omitempty"`
+
+	// PRReviewLoopMax is the maximum number of review-fix polecat dispatch
+	// cycles per PR before the refinery escalates. Defaults to 3 when
+	// merge_strategy="pr". Only meaningful when merge_strategy="pr".
+	PRReviewLoopMax int `json:"pr_review_loop_max,omitempty"`
+
+	// PRMergeMethod is the merge method passed to the VCS provider
+	// (e.g., "squash", "merge", "rebase"). Defaults to "squash" when
+	// merge_strategy="pr". Only meaningful when merge_strategy="pr".
+	PRMergeMethod string `json:"pr_merge_method,omitempty"`
 
 	// OnConflict specifies conflict resolution strategy: "assign_back" or "auto_rebase".
 	OnConflict string `json:"on_conflict"`
@@ -1347,6 +1387,31 @@ const (
 	OnConflictAutoRebase = "auto_rebase"
 )
 
+// MergeStrategy constants.
+const (
+	MergeStrategyDirect = "direct"
+	MergeStrategyPR     = "pr"
+)
+
+// VCSProvider constants.
+const (
+	VCSProviderGitHub    = "github"
+	VCSProviderBitbucket = "bitbucket"
+)
+
+// PRMergeMethod constants (passed to the VCS provider).
+const (
+	PRMergeMethodSquash = "squash"
+	PRMergeMethodMerge  = "merge"
+	PRMergeMethodRebase = "rebase"
+)
+
+// Defaults for merge_strategy=pr.
+const (
+	DefaultPRRequiredApprovals = 1
+	DefaultPRReviewLoopMax     = 3
+)
+
 // IsPolecatIntegrationEnabled returns whether polecat integration branch
 // sourcing is enabled. Nil-safe, defaults to true.
 func (c *MergeQueueConfig) IsPolecatIntegrationEnabled() bool {
@@ -1402,13 +1467,73 @@ func (c *MergeQueueConfig) IsJudgmentEnabled() bool {
 	return *c.JudgmentEnabled
 }
 
-// IsRequireReviewEnabled returns whether PR reviews are required before merging.
-// Nil-safe, defaults to false.
+// IsRequireReviewEnabled returns whether PR reviews are required before
+// merging. Single source of truth: GetPRRequiredApprovals() > 0. Previously
+// this could report `false` while GetPRRequiredApprovals() still returned 1
+// (the default), which led callers into inconsistent states. Nil-safe.
 func (c *MergeQueueConfig) IsRequireReviewEnabled() bool {
-	if c.RequireReview == nil {
-		return false
+	return c.GetPRRequiredApprovals() > 0
+}
+
+// GetPRRequiredApprovals returns the number of approvals required for PR
+// merges. Returns 0 when merge_strategy != "pr".
+//
+// When merge_strategy == "pr", resolution is:
+//  1. PRRequiredApprovals (if explicitly set — including 0 for "CI only")
+//  2. Deprecated RequireReview (if non-nil) — true → 1, false → 0
+//  3. DefaultPRRequiredApprovals (1)
+//
+// The *int type on PRRequiredApprovals lets callers express "zero approvals
+// required" without colliding with Go's zero-value semantics.
+func (c *MergeQueueConfig) GetPRRequiredApprovals() int {
+	if c.MergeStrategy != MergeStrategyPR {
+		return 0
 	}
-	return *c.RequireReview
+	if c.PRRequiredApprovals != nil {
+		if *c.PRRequiredApprovals < 0 {
+			return 0
+		}
+		return *c.PRRequiredApprovals
+	}
+	if c.RequireReview != nil {
+		if *c.RequireReview {
+			return 1
+		}
+		return 0
+	}
+	return DefaultPRRequiredApprovals
+}
+
+// GetPRReviewLoopMax returns the cap on review-fix dispatch cycles.
+// Returns 0 when merge_strategy != "pr". Defaults to DefaultPRReviewLoopMax.
+func (c *MergeQueueConfig) GetPRReviewLoopMax() int {
+	if c.MergeStrategy != MergeStrategyPR {
+		return 0
+	}
+	if c.PRReviewLoopMax > 0 {
+		return c.PRReviewLoopMax
+	}
+	return DefaultPRReviewLoopMax
+}
+
+// GetPRMergeMethod returns the merge method for PR merges.
+// Returns "" when merge_strategy != "pr". Defaults to PRMergeMethodSquash.
+func (c *MergeQueueConfig) GetPRMergeMethod() string {
+	if c.MergeStrategy != MergeStrategyPR {
+		return ""
+	}
+	if c.PRMergeMethod != "" {
+		return c.PRMergeMethod
+	}
+	return PRMergeMethodSquash
+}
+
+// GetVCSProvider returns the VCS provider, defaulting to github.
+func (c *MergeQueueConfig) GetVCSProvider() string {
+	if c.VCSProvider != "" {
+		return c.VCSProvider
+	}
+	return VCSProviderGitHub
 }
 
 // GetReviewDepth returns the configured review depth.
