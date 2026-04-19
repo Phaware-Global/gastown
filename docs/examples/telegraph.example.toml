@@ -1,0 +1,65 @@
+# Telegraph configuration — copy to ~/gt/settings/telegraph.toml and edit.
+#
+# Telegraph is the town-level inbound external event transport.
+# See docs/design/telegraph.md for the full architecture.
+#
+# Scope: single instance per town (not per rig).
+# Location: ~/gt/settings/telegraph.toml
+# Daemon restart required after changes (v1 — no hot-reload).
+
+[telegraph]
+
+# TCP address for the HTTP webhook listener.
+# Required.
+listen_addr = ":8765"
+
+# Maximum number of RawEvents buffered between L1 and L2.
+# When full, L1 returns HTTP 503 (Jira will retry with its own backoff).
+# Default: 256. At one event/second that is ~4 minutes of headroom.
+buffer_size = 256
+
+# Minimum interval between Mayor nudges.
+# At most one `gt nudge mayor/` is sent per this window, regardless of
+# how many events are delivered. Go duration string (e.g. "30s", "1m").
+# Default: "30s"
+nudge_window = "30s"
+
+# Maximum bytes of external (untrusted) text included in the mail body.
+# Content beyond this limit is truncated with a notice inside the
+# EXTERNAL CONTENT block. Default: 4096.
+body_cap = 4096
+
+# Log file path for structured JSON log output.
+# Empty string (default) means stderr / daemon log.
+log_file = ""
+
+# ─── Providers ────────────────────────────────────────────────────────────────
+#
+# Each [telegraph.providers.<name>] stanza configures one inbound provider.
+# The <name> key must match Translator.Provider() for that implementation.
+#
+# To disable a provider without removing its config, set enabled = false
+# and restart the daemon. The secret env var is not required when disabled.
+#
+# Secrets are NEVER stored here. Set secret_env to the name of the
+# environment variable that holds the shared secret or API token.
+# The daemon reads os.Getenv(secret_env) at startup; if unset, startup fails.
+
+[telegraph.providers.jira]
+
+# Enable or disable this provider.
+enabled = true
+
+# Environment variable name holding the HMAC-SHA256 shared secret.
+# Set this in your shell profile or systemd unit — never commit the value.
+# Example: export GT_TELEGRAPH_JIRA_SECRET="your-webhook-secret-here"
+secret_env = "GT_TELEGRAPH_JIRA_SECRET"
+
+# Jira event types to accept (v1 scope).
+# All other event types are rejected with ErrUnknownEventType (logged, HTTP 200).
+events = [
+    "issue_created",
+    "issue_updated",
+    "comment_added",
+    "comment_updated",
+]
