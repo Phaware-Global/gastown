@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -1158,24 +1159,50 @@ func (g *Git) GhPrReviewThreads(prNumber int) ([]GhReviewThread, error) {
 	var threads []GhReviewThread
 	cursor := ""
 	for page := 0; page < maxPages; page++ {
-		query := `query($owner:String!,$name:String!,$number:Int!,$first:Int!,$after:String){
-			repository(owner:$owner,name:$name){
-				pullRequest(number:$number){
-					reviewThreads(first:$first,after:$after){
-						pageInfo{ hasNextPage endCursor }
-						nodes{
-							id isResolved isOutdated
-							comments(first:1){
-								nodes{
-									path line url body
-									author{login}
+		// Use distinct queries for first-page vs. subsequent pages so the
+		// graphql `after:` argument is literally absent on the first page
+		// rather than being sent as an empty-string variable (which gh's
+		// `-F after=` would produce, and GitHub can reject as invalid).
+		var query string
+		if cursor == "" {
+			query = `query($owner:String!,$name:String!,$number:Int!,$first:Int!){
+				repository(owner:$owner,name:$name){
+					pullRequest(number:$number){
+						reviewThreads(first:$first){
+							pageInfo{ hasNextPage endCursor }
+							nodes{
+								id isResolved isOutdated
+								comments(first:1){
+									nodes{
+										path line url body
+										author{login}
+									}
 								}
 							}
 						}
 					}
 				}
-			}
-		}`
+			}`
+		} else {
+			query = `query($owner:String!,$name:String!,$number:Int!,$first:Int!,$after:String!){
+				repository(owner:$owner,name:$name){
+					pullRequest(number:$number){
+						reviewThreads(first:$first,after:$after){
+							pageInfo{ hasNextPage endCursor }
+							nodes{
+								id isResolved isOutdated
+								comments(first:1){
+									nodes{
+										path line url body
+										author{login}
+									}
+								}
+							}
+						}
+					}
+				}
+			}`
+		}
 		args := []string{"api", "graphql",
 			"-f", "query=" + query,
 			"-F", "owner=" + owner,
@@ -1184,9 +1211,6 @@ func (g *Git) GhPrReviewThreads(prNumber int) ([]GhReviewThread, error) {
 			"-F", fmt.Sprintf("first=%d", pageSize)}
 		if cursor != "" {
 			args = append(args, "-F", "after="+cursor)
-		} else {
-			// Pass explicit null so graphql doesn't complain about a missing variable.
-			args = append(args, "-F", "after=")
 		}
 		cmd := exec.Command("gh", args...)
 		cmd.Dir = g.workDir
@@ -1303,6 +1327,40 @@ func (g *Git) GhPrChecksRollup(prNumber int) (state string, done bool, err error
 	}
 }
 
+// ghReview is the minimal review payload we need for approval calculations.
+type ghReview struct {
+	Author struct {
+		Login string `json:"login"`
+	} `json:"author"`
+	State       string `json:"state"`
+	SubmittedAt string `json:"submittedAt"`
+}
+
+// ghFetchReviews returns the PR's reviews sorted oldest → newest by
+// submittedAt. We do not rely on the gh CLI / GitHub API returning reviews
+// in any particular order — sorting here makes the "most recent terminal
+// state wins" logic below robust regardless of source ordering.
+func (g *Git) ghFetchReviews(prNumber int) ([]ghReview, error) {
+	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber),
+		"--json", "reviews")
+	cmd.Dir = g.workDir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("gh pr view (reviews) failed: %w", err)
+	}
+	var resp struct {
+		Reviews []ghReview `json:"reviews"`
+	}
+	if jerr := json.Unmarshal(bytes.TrimSpace(out), &resp); jerr != nil {
+		return nil, fmt.Errorf("parsing reviews: %w", jerr)
+	}
+	// ISO-8601 timestamps sort lexicographically.
+	sort.SliceStable(resp.Reviews, func(i, j int) bool {
+		return resp.Reviews[i].SubmittedAt < resp.Reviews[j].SubmittedAt
+	})
+	return resp.Reviews, nil
+}
+
 // GhPrApprovedBy returns true iff the given user has submitted an APPROVED
 // review on the PR and has not subsequently dismissed it or requested changes.
 // Passing user="" falls back to IsPRApproved (any approver).
@@ -1310,29 +1368,13 @@ func (g *Git) GhPrApprovedBy(prNumber int, user string) (bool, error) {
 	if user == "" {
 		return g.IsPRApproved(prNumber)
 	}
-	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber),
-		"--json", "reviews")
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	reviews, err := g.ghFetchReviews(prNumber)
 	if err != nil {
-		return false, fmt.Errorf("gh pr view (reviews) failed: %w", err)
+		return false, err
 	}
-	var resp struct {
-		Reviews []struct {
-			Author struct {
-				Login string `json:"login"`
-			} `json:"author"`
-			State       string `json:"state"`
-			SubmittedAt string `json:"submittedAt"`
-		} `json:"reviews"`
-	}
-	if jerr := json.Unmarshal(bytes.TrimSpace(out), &resp); jerr != nil {
-		return false, fmt.Errorf("parsing reviews: %w", jerr)
-	}
-	// Reviews are ordered oldest -> newest. Walk newest-first; last terminal
-	// review from the user wins.
-	for i := len(resp.Reviews) - 1; i >= 0; i-- {
-		r := resp.Reviews[i]
+	// Walk newest-first over a guaranteed oldest→newest list.
+	for i := len(reviews) - 1; i >= 0; i-- {
+		r := reviews[i]
 		if !strings.EqualFold(r.Author.Login, user) {
 			continue
 		}
@@ -1350,29 +1392,17 @@ func (g *Git) GhPrApprovedBy(prNumber int, user string) (bool, error) {
 // terminal review on the PR is APPROVED. A reviewer who later submits
 // CHANGES_REQUESTED or whose approval was DISMISSED does not count. Used to
 // enforce pr_required_approvals > 1.
+//
+// Resilient to gh returning reviews in any order — ghFetchReviews sorts by
+// submittedAt before we fold into the per-user latest-state map.
 func (g *Git) GhPrApprovalCount(prNumber int) (int, error) {
-	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber),
-		"--json", "reviews")
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	reviews, err := g.ghFetchReviews(prNumber)
 	if err != nil {
-		return 0, fmt.Errorf("gh pr view (reviews) failed: %w", err)
+		return 0, err
 	}
-	var resp struct {
-		Reviews []struct {
-			Author struct {
-				Login string `json:"login"`
-			} `json:"author"`
-			State       string `json:"state"`
-			SubmittedAt string `json:"submittedAt"`
-		} `json:"reviews"`
-	}
-	if jerr := json.Unmarshal(bytes.TrimSpace(out), &resp); jerr != nil {
-		return 0, fmt.Errorf("parsing reviews: %w", jerr)
-	}
-	// latest[user] = terminal state of that user's most recent review
-	latest := make(map[string]string, len(resp.Reviews))
-	for _, r := range resp.Reviews {
+	// latest[user] = terminal state of that user's newest review
+	latest := make(map[string]string, len(reviews))
+	for _, r := range reviews {
 		login := strings.ToLower(r.Author.Login)
 		if login == "" {
 			continue

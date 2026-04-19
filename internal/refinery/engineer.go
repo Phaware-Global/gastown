@@ -182,7 +182,14 @@ type MergeQueueConfig struct {
 
 	// RequireReview controls whether the refinery requires at least one approving
 	// review before merging a PR. Only meaningful when MergeStrategy="pr".
-	// Nil defaults to false (no review required).
+	//
+	// Resolution when MergeStrategy="pr":
+	//   - RequireReview=true  → 1 approval required
+	//   - RequireReview=false → 0 approvals (CI-only gate)
+	//   - Both this and PRRequiredApprovals unset → default 1 approval
+	//
+	// The historical "nil → no review" behavior no longer applies — PR mode
+	// now defaults to 1 approval. Set `pr_required_approvals: 0` for CI-only.
 	//
 	// Deprecated: kept for backward compatibility. Use PRRequiredApprovals.
 	RequireReview *bool `json:"require_review,omitempty"`
@@ -518,6 +525,43 @@ func (e *Engineer) LoadConfig() error {
 	}
 	if mqRaw.PRMergeMethod != nil {
 		e.config.PRMergeMethod = *mqRaw.PRMergeMethod
+	}
+
+	// Validate PR-strategy invariants before any caller can observe the
+	// loaded config. This is a defense-in-depth check — the config package
+	// validator runs when rig settings are written, but LoadConfig here is
+	// invoked by the refinery (and by `gt refinery pr ...`) reading the
+	// file at runtime, so an externally edited config.json could bypass
+	// the write-time check.
+	if e.config.MergeStrategy != "" &&
+		e.config.MergeStrategy != "direct" && e.config.MergeStrategy != "pr" {
+		return fmt.Errorf("invalid merge_strategy %q (want %q or %q)",
+			e.config.MergeStrategy, "direct", "pr")
+	}
+	if e.config.VCSProvider != "" &&
+		e.config.VCSProvider != "github" && e.config.VCSProvider != "bitbucket" {
+		return fmt.Errorf("invalid vcs_provider %q (want %q or %q)",
+			e.config.VCSProvider, "github", "bitbucket")
+	}
+	if e.config.MergeStrategy == "pr" {
+		if e.config.PRApprover == "" {
+			return fmt.Errorf("pr_approver is required when merge_strategy=%q", "pr")
+		}
+		if e.config.PRRequiredApprovals != nil && *e.config.PRRequiredApprovals < 0 {
+			return fmt.Errorf("pr_required_approvals must be non-negative, got %d",
+				*e.config.PRRequiredApprovals)
+		}
+		if e.config.PRReviewLoopMax < 0 {
+			return fmt.Errorf("pr_review_loop_max must be non-negative, got %d",
+				e.config.PRReviewLoopMax)
+		}
+		switch e.config.PRMergeMethod {
+		case "", "squash", "merge", "rebase":
+			// valid
+		default:
+			return fmt.Errorf("invalid pr_merge_method %q (want %q, %q, or %q)",
+				e.config.PRMergeMethod, "squash", "merge", "rebase")
+		}
 	}
 
 	// Initialize the PR provider when merge_strategy=pr.

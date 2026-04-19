@@ -1287,7 +1287,15 @@ type MergeQueueConfig struct {
 
 	// RequireReview controls whether the refinery requires at least one approving
 	// review before merging a PR. Only meaningful when merge_strategy="pr".
-	// Nil defaults to false (no review required).
+	//
+	// Resolution when merge_strategy="pr":
+	//   - RequireReview=true  → 1 approval required (same as PRRequiredApprovals=1)
+	//   - RequireReview=false → 0 approvals required (CI-only gate)
+	//   - RequireReview=nil (unset), PRRequiredApprovals also unset → default 1
+	//
+	// Note: the "nil defaults to no review" pre-PRRequiredApprovals behavior
+	// no longer applies — in PR mode the default is now 1 approval. Set
+	// `pr_required_approvals: 0` explicitly for CI-only.
 	//
 	// Deprecated: use PRRequiredApprovals (>0 is equivalent to RequireReview=true).
 	// Kept for one release for backward compatibility.

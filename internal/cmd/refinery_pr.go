@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -181,10 +182,13 @@ func getRefineryPRContext() (refinery.PRProvider, *rig.Rig, error) {
 }
 
 func parsePRNumber(arg string) (int, error) {
+	raw := arg
 	arg = strings.TrimPrefix(arg, "#")
-	var n int
-	if _, err := fmt.Sscanf(arg, "%d", &n); err != nil || n <= 0 {
-		return 0, fmt.Errorf("invalid PR number %q", arg)
+	// strconv.Atoi rejects trailing garbage (unlike fmt.Sscanf("%d", ...)),
+	// so "123abc" fails fast instead of being silently treated as PR 123.
+	n, err := strconv.Atoi(arg)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("invalid PR number %q", raw)
 	}
 	return n, nil
 }
