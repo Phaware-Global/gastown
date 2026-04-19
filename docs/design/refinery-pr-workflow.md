@@ -935,3 +935,92 @@ emitting real mail to its mayor. The blast radius is bigger than
 dispatch pending guidance on (a) whether to nuke furiosa, (b)
 whether to dispatch gt-eef/gt-ipc, (c) nuke stale nux worktree,
 (d) mail overseer directly about this hole.
+
+### G11 — `gt done`'s no-merge+pr path creates PRs outside the refinery workflow, so no review loop fires
+
+Observed on PR #10 (`feat(telegraph): per-provider config + secret
+surface (gt-8vr)`): the PR got created, real work landed on the
+branch, but **no `augment review` comment was ever posted**. Only
+Gemini Code Assist reviewed it — and only because Gemini runs on
+every new PR at the repo level, independent of any trigger.
+
+Root cause: `internal/cmd/done.go:819` has a shortcut path that
+fires when `attachmentFields.NoMerge == true` AND the rig is on
+`merge_strategy = "pr"`:
+
+    ghCmd := exec.CommandContext(context.Background(), "gh", "pr", "create",
+        "--base", defaultBranch, "--head", branch,
+        "--title", prTitle, "--body", prBody,
+    )
+
+That path is invoked inside `gt done` running in the polecat's
+worktree. It bypasses:
+
+1. **The refinery** — no MR bead is created, so the refinery's
+   patrol never picks up this work. Verified: `bd list --label=gt:merge-request --all` returned zero results for gt-8vr.
+2. **The tap-guard** — the `gh pr create` call is a subprocess of
+   `gt`, not an agent's Bash tool, so `tap guard pr-workflow`
+   (matcher `Bash(gh pr create*)`) doesn't fire.
+3. **The `request-review` step** — that step only runs inside the
+   refinery formula's `merge-push` branch when `merge_strategy=pr`,
+   and only when the refinery created the PR via
+   `gt refinery pr create`. For PRs created via this
+   no-merge+pr shortcut, the refinery has no handle to request
+   review on.
+
+So the invariant "every PR goes through pr-create → wait-ci →
+request-review → wait-approval → merge" is only enforced when the
+refinery owns the PR. Any path that creates a PR outside the
+refinery (done.go's no-merge shortcut here; in principle also any
+future shortcut) orphans it from the review/merge pipeline.
+
+Sequence for PR #10:
+
+- Mayor slung gt-8vr to furiosa with `no_merge=true` attachment.
+  (The mayor may have set no_merge when interpreting my
+  test-pollution pause — unclear from the history, but
+  `attachmentFields.NoMerge` was true at `gt done` time, which is
+  the only way this shortcut path fires.)
+- Furiosa did the work, committed, ran `gt done`.
+- `gt done` took the no-merge path, closed the bead, created PR #10
+  via `gh pr create` subprocess.
+- Refinery patrolled, saw empty queue + no MRs, marked most steps
+  SKIP (see G7), did nothing about PR #10.
+- Gemini auto-reviewed PR #10 at the repo level (no trigger
+  required).
+- No `augment review` comment was ever posted. The review loop
+  never started.
+
+Fix directions (pick one or combine):
+
+1. **Make the no-merge+pr path request review itself.** After
+   `gh pr create` succeeds in `done.go:819`, immediately `gh pr
+   comment <N> --body "augment review"` (or call the same
+   `gt refinery pr request-review` subcommand the refinery uses).
+   Smallest change, keeps the shortcut but closes the orphaning.
+2. **Always create an MR bead, even on the no-merge path.** Instead
+   of force-closing the bead and shell-forking to `gh pr create`,
+   create an MR bead that tells the refinery "this PR already
+   exists, pick up the review+merge from here". The refinery's
+   `merge-push` step's pr branch then gets an optional "PR already
+   created" short-circuit that skips `pr create` and starts at
+   `request-review`. Keeps the refinery as the single owner of
+   PR-workflow state.
+3. **Forbid the shortcut entirely** under merge_strategy=pr and
+   always route through MR bead + refinery. Simplest model
+   invariant but requires rethinking what no_merge means in
+   pr-mode (presumably: still no MR → no merge, but also no PR
+   without refinery involvement).
+
+Recommended: **Option 1 as a fast fix**, **Option 2 as the proper
+architectural resolution**. Option 3 is philosophically cleaner but
+the most disruptive to existing rigs that rely on no-merge
+behavior.
+
+Also worth noting: this is the SECOND time my own B1/B2/B3
+fix stack has had a silent gap only real-world dogfood exposes.
+Pattern: the "pr workflow" is actually TWO workflows (refinery-
+owned vs polecat-owned-with-shortcut) and the review/merge
+invariants are written for the refinery-owned one. Every
+polecat-owned shortcut needs its own invariant coverage or a
+redirect back into the refinery-owned path.
