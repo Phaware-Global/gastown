@@ -44,10 +44,13 @@ func isTestBinaryName(name string) bool {
 // which is easy to forget; a binary-name check is automatic and fails
 // loud for every test binary regardless of setup.
 //
-// Accepted false-positive risk: a production binary intentionally named
-// `*.test` or stored under a path fragment that ends that way. Nobody
-// ships production binaries with those names. If that ever changes,
-// switching to a `go test`-only build-tag gate is the next step.
+// Accepted false-positive risk: a production binary whose basename
+// happens to end in `.test` / `.test.exe`. Only the basename matters
+// here (filepath.Base is applied before the suffix check), so a
+// directory like `/opt/foo.test/bin/gt` does NOT trigger — the base
+// is `gt`. Nobody ships production binaries with those exact
+// basenames; if that ever changes, switching to a `go test`-only
+// build-tag gate is the next step.
 func runningAsTestBinary() bool {
 	if len(os.Args) == 0 {
 		return false
