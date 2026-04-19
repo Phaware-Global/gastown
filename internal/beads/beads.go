@@ -298,16 +298,23 @@ type CreateOptions struct {
 	Parent      string
 	Actor       string // Who is creating this issue (populates created_by)
 	Ephemeral   bool   // Create as ephemeral (wisp) - not synced to git
-	// Rig names the target rig database (e.g., "gastown"). When non-empty it
-	// is passed as `--repo=<Rig>` to `bd create`, which overrides `bd`'s
+	// Rig names the target rig database (e.g., "gastown"). When non-empty
+	// it is passed as `--repo=<Rig>` to `bd create`, which overrides bd's
 	// auto-routing and forces the new bead into that rig's database.
 	//
-	// Historically this sent `--rig=<Rig>`, but `bd create` has no `--rig`
-	// flag — only `--repo` — so every rig-scoped create failed with
-	// "unknown flag: --rig" until this was corrected. The Go-side field name
-	// is kept as `Rig` because that's what the rest of the codebase calls
-	// the target (polecats, refinery, etc. all speak "rig"); only the
-	// on-wire flag differs.
+	// SCOPE: Rig only affects the CLI path (shelling out to `bd`). The
+	// in-process store path (when `Beads.store` is set) ignores Rig —
+	// that path is already bound to a specific database at construction
+	// time, and re-routing to a different rig would need a separate
+	// `Beads` instance. Callers that need rig-scoped creates under the
+	// store path must construct a `Beads` rooted at that rig's beads dir.
+	//
+	// Historically this field sent `--rig=<Rig>` on the wire, but bd has
+	// no `--rig` flag — only `--repo` — so every rig-scoped create
+	// silently failed with "unknown flag: --rig" until this was
+	// corrected. The Go-side field name is kept as `Rig` because the
+	// rest of the codebase calls the target "rig" (polecats, refinery,
+	// etc.); only the on-wire flag differs.
 	Rig string
 }
 
