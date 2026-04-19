@@ -727,45 +727,101 @@ fi
 When `pr_reviewer` is empty, the review loop is skipped entirely and the
 flow proceeds directly to the human-approval gate.
 
-**Step PR.5: Review-fix loop (bounded by pr_review_loop_max, default 3)**
+**Step PR.5: Review-fix (patrol-resumable, bounded by pr_review_loop_max, default 3)**
 
-```
-LOOP=0
+⚠️ **This is NOT a blocking loop.** Each patrol cycle, this step takes
+**one** action — check in-flight polecat / poll threads / dispatch /
+advance — and returns control to `loop-check` so the refinery keeps
+processing other MRs. The next patrol cycle re-enters this step and picks
+up where it left off. State (iteration counter + in-flight polecat name)
+lives on the MR bead's attachment fields (`review_loop_iter`,
+`review_fix_polecat`).
+
+```bash
+MR=<mr-bead-id>
 MAX={{pr_review_loop_max}}       # rig-level cap; default 3
-sleep 60                          # give reviewer time to post
 
-while true; do
-  THREADS=$({{ cmd }} refinery pr threads $PR --unresolved --json)
-  COUNT=$(echo "$THREADS" | jq 'length')
-  [ "$COUNT" -eq 0 ] && break
+# 1. Read MR-bead state.
+MR_JSON=$(bd show "$MR" --json)
+REVIEW_FIX_POLECAT=$(echo "$MR_JSON" | jq -r '.description' \
+  | awk -F': ' '/^review_fix_polecat:/ {print $2}')
+REVIEW_LOOP_ITER=$(echo "$MR_JSON" | jq -r '.description' \
+  | awk -F': ' '/^review_loop_iter:/ {print $2}')
+REVIEW_LOOP_ITER=${REVIEW_LOOP_ITER:-0}
 
-  LOOP=$((LOOP + 1))
-  if [ "$LOOP" -gt "$MAX" ]; then
-    # Cap hit: escalate with a mail to mayor/ and leave the PR open.
-    gt escalate -s HIGH \
-      "PR #$PR review loop exceeded $MAX iterations" \
-      --context "$THREADS"
-    exit 1
-  fi
+# 2. If a review-fix polecat is already in flight, check whether it's done.
+if [ -n "$REVIEW_FIX_POLECAT" ]; then
+  POLECAT_STATUS=$({{ cmd }} polecat status "<rig>/$REVIEW_FIX_POLECAT" --json 2>/dev/null \
+                    | jq -r '.state // "unknown"')
+  case "$POLECAT_STATUS" in
+    alive|idle|working)
+      # Still addressing threads. Skip this MR this cycle — we'll
+      # re-check on the next patrol. Proceed to loop-check so OTHER
+      # MRs in the queue can still be processed.
+      echo "PR #$PR awaiting review-fix polecat $REVIEW_FIX_POLECAT (iter=$REVIEW_LOOP_ITER)"
+      # Skip directly to loop-check (not to merge — PR isn't ready yet).
+      return 0 2>/dev/null || exit 0
+      ;;
+    *)
+      # Terminal (done/nuked/error): clear the in-flight marker and
+      # re-request review since the polecat may have pushed new commits.
+      {{ cmd }} mq set-review-state "$MR" --clear-polecat
+      [ -n "{{pr_reviewer}}" ] && {{ cmd }} refinery pr request-review $PR --user {{pr_reviewer}}
+      REVIEW_FIX_POLECAT=""
+      ;;
+  esac
+fi
 
-  # Dispatch a polecat to address the unresolved threads on the PR branch.
-  # NOTE: --pr/--branch flags on gt sling land in Phase 3 — until then this
-  # loop is effectively skipped at runtime (gt sling will reject the flag).
-  # Once Phase 3 ships, the polecat checks out <polecat-branch> and addresses
-  # the threads in place.
-  gt sling review-fix/<issue-id> <rig> \
+# 3. No polecat in flight — poll unresolved threads.
+THREADS=$({{ cmd }} refinery pr threads $PR --unresolved --json)
+COUNT=$(echo "$THREADS" | jq 'length')
+
+if [ "$COUNT" -eq 0 ]; then
+  # Nothing unresolved — advance to Step PR.6 (human-approval gate).
+  echo "PR #$PR: no unresolved review threads, advancing to wait-approval"
+  # Fall through to Step PR.6 below.
+elif [ "$REVIEW_LOOP_ITER" -ge "$MAX" ]; then
+  # Cap hit: escalate, park this MR. The refinery does not block here —
+  # the human closes the escalation when ready and the next patrol picks
+  # the MR back up.
+  {{ cmd }} escalate -s HIGH \
+    "PR #$PR review loop exceeded $MAX iterations; $COUNT threads still unresolved" \
+    --mail mayor/ \
+    --context "$THREADS"
+  return 0 2>/dev/null || exit 0
+else
+  # Dispatch a fresh review-fix polecat, record state on the MR bead,
+  # return to patrol. Next cycle re-enters at step 1 and observes the
+  # in-flight polecat.
+  NEW_ITER=$((REVIEW_LOOP_ITER + 1))
+  POLECAT_NAME=$({{ cmd }} sling review-fix/<issue-id> <rig> \
     --pr $PR \
     --branch <polecat-branch> \
     --args "Address these PR threads:
-$THREADS"
-
-  # Wait for the polecat's REVIEW_FIX_DONE signal (via witness → refinery).
-  # Re-request review once the polecat signals done.
-  {{ cmd }} mail check --inject
-  [ -n "{{pr_reviewer}}" ] && {{ cmd }} refinery pr request-review $PR --user {{pr_reviewer}}
-  sleep 60
-done
+$THREADS" \
+    --json | jq -r '.polecat_name // empty')
+  {{ cmd }} mq set-review-state "$MR" \
+    --polecat "$POLECAT_NAME" \
+    --iter "$NEW_ITER"
+  echo "PR #$PR: dispatched review-fix polecat $POLECAT_NAME (iter=$NEW_ITER of $MAX)"
+  return 0 2>/dev/null || exit 0
+fi
 ```
+
+`{{ cmd }} mq set-review-state` does an atomic read-modify-write on the
+MR bead's description, mutating only the `review_fix_polecat` and
+`review_loop_iter` fields. Other MR fields (branch, target, source_issue,
+etc.) are preserved. Flags:
+  --polecat <name>   — set review_fix_polecat
+  --iter <n>         — set review_loop_iter
+  --clear-polecat    — clear review_fix_polecat (polecat terminated)
+  --clear-iter       — clear review_loop_iter
+
+`REVIEW_FIX_DONE` mail from the polecat (sent by `gt done` when the
+bead is a no_merge review-fix dispatch) is an optimization: it triggers
+an `inbox-check` on the next cycle which brings the refinery back to
+this step sooner. Even without the mail, the patrol's normal cadence
+picks the MR back up within one cycle.
 
 **Step PR.6: Wait for human approval (gate)**
 

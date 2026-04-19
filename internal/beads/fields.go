@@ -617,6 +617,13 @@ type MRFields struct {
 	PreVerified     bool   // Polecat ran full gates after rebasing onto target
 	PreVerifiedAt   string // ISO 8601 timestamp when verification completed
 	PreVerifiedBase string // Target branch SHA at verification time
+
+	// Review-fix loop state (merge_strategy=pr only).
+	// These fields make Step PR.5 patrol-resumable: each patrol cycle takes
+	// one action (dispatch polecat / check polecat / advance) and returns
+	// control to `loop-check` instead of busy-waiting inside the step.
+	ReviewLoopIter   int    // Number of review-fix dispatches already made for this PR
+	ReviewFixPolecat string // Name of the currently-dispatched review-fix polecat, or empty
 }
 
 // ParseMRFields extracts structured merge-request fields from an issue's description.
@@ -703,6 +710,14 @@ func ParseMRFields(issue *Issue) *MRFields {
 		case "pre_verified_base", "pre-verified-base", "preverifiedbase":
 			fields.PreVerifiedBase = value
 			hasFields = true
+		case "review_loop_iter", "review-loop-iter", "reviewloopiter":
+			if n, err := parseIntField(value); err == nil {
+				fields.ReviewLoopIter = n
+				hasFields = true
+			}
+		case "review_fix_polecat", "review-fix-polecat", "reviewfixpolecat":
+			fields.ReviewFixPolecat = value
+			hasFields = true
 		}
 	}
 
@@ -779,6 +794,12 @@ func FormatMRFields(fields *MRFields) string {
 	if fields.PreVerifiedBase != "" {
 		lines = append(lines, "pre_verified_base: "+fields.PreVerifiedBase)
 	}
+	if fields.ReviewLoopIter > 0 {
+		lines = append(lines, fmt.Sprintf("review_loop_iter: %d", fields.ReviewLoopIter))
+	}
+	if fields.ReviewFixPolecat != "" {
+		lines = append(lines, "review_fix_polecat: "+fields.ReviewFixPolecat)
+	}
 
 	return strings.Join(lines, "\n")
 }
@@ -834,6 +855,12 @@ func SetMRFields(issue *Issue, fields *MRFields) string {
 		"pre_verified_base":  true,
 		"pre-verified-base":  true,
 		"preverifiedbase":    true,
+		"review_loop_iter":   true,
+		"review-loop-iter":   true,
+		"reviewloopiter":     true,
+		"review_fix_polecat": true,
+		"review-fix-polecat": true,
+		"reviewfixpolecat":   true,
 	}
 
 	// Collect non-MR lines from existing description
