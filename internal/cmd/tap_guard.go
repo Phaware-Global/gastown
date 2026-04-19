@@ -168,20 +168,32 @@ func refineryAllowedForPR() bool {
 	if err != nil || townRoot == "" {
 		return false
 	}
-	cwd, err := filepath.Abs(".")
-	if err != nil {
-		return false
+
+	// Prefer GT_RIG when set — Gas Town sets it for refinery sessions and it
+	// is a more reliable identifier than CWD. The CWD path can be the town
+	// root, the mayor/rig worktree, or any ad-hoc location when a hook fires
+	// (e.g., pre-tool hooks invoked from a prompt outside the rig directory).
+	// Fall back to CWD-relative inference for older session bootstraps that
+	// don't set GT_RIG yet.
+	var rigName string
+	if rigName = strings.TrimSpace(os.Getenv("GT_RIG")); rigName == "" {
+		cwd, err := filepath.Abs(".")
+		if err != nil {
+			return false
+		}
+		rel, err := filepath.Rel(townRoot, cwd)
+		if err != nil {
+			return false
+		}
+		rel = filepath.ToSlash(rel)
+		parts := strings.Split(rel, "/")
+		if len(parts) == 0 || parts[0] == "" || parts[0] == "." {
+			return false
+		}
+		rigName = parts[0]
 	}
-	rel, err := filepath.Rel(townRoot, cwd)
-	if err != nil {
-		return false
-	}
-	rel = filepath.ToSlash(rel)
-	parts := strings.Split(rel, "/")
-	if len(parts) == 0 || parts[0] == "" || parts[0] == "." {
-		return false
-	}
-	rigPath := filepath.Join(townRoot, parts[0])
+
+	rigPath := filepath.Join(townRoot, rigName)
 	settings, err := config.LoadRigSettings(config.RigSettingsPath(rigPath))
 	if err != nil || settings == nil || settings.MergeQueue == nil {
 		return false

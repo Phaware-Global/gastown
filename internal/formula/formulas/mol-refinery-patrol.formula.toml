@@ -174,6 +174,26 @@ default = "direct"
 description = "Require at least one approving GitHub review before merging (only applies when merge_strategy=pr)."
 default = "false"
 
+[vars.pr_reviewer]
+description = "GitHub user/bot to request an automated review from (e.g., augment). Empty = skip automated review, proceed directly to human-approval gate. Only applies when merge_strategy=pr."
+default = ""
+
+[vars.pr_approver]
+description = "GitHub user whose approving review gates the merge. Required when merge_strategy=pr. Only applies when merge_strategy=pr."
+default = ""
+
+[vars.pr_required_approvals]
+description = "Minimum distinct APPROVED reviewers required before merge. Default 1 when merge_strategy=pr. Set to 0 for CI-only (no approvals required). Only applies when merge_strategy=pr."
+default = "1"
+
+[vars.pr_review_loop_max]
+description = "Maximum review-fix polecat dispatch cycles per PR before escalating. Only applies when merge_strategy=pr."
+default = "3"
+
+[vars.pr_merge_method]
+description = "Merge method passed to the VCS provider when merging the PR. One of: squash, merge, rebase. Only applies when merge_strategy=pr."
+default = "squash"
+
 [vars.rig]
 description = "Name of the rig this refinery belongs to (e.g., gastown, laser)"
 default = "UNSET_RIG"
@@ -643,7 +663,7 @@ git push origin temp:refs/heads/<polecat-branch> --force-with-lease
 Build the PR body using bead metadata, then:
 
 ```bash
-cat > /tmp/pr-body-${ISSUE_ID}.md <<'EOF'
+cat > /tmp/pr-body-<issue-id>.md <<'EOF'
 ## Summary
 
 Automated merge from polecat branch.
@@ -661,7 +681,7 @@ PR_JSON=$({{ cmd }} refinery pr create \
   --branch <polecat-branch> \
   --base <merge-target> \
   --title "<issue-title> (<issue-id>)" \
-  --body-file /tmp/pr-body-${ISSUE_ID}.md \
+  --body-file /tmp/pr-body-<issue-id>.md \
   --json)
 PR=$(echo "$PR_JSON" | jq -r .number)
 PR_URL=$(echo "$PR_JSON" | jq -r .url)
@@ -691,7 +711,7 @@ Branch: <branch>
 Issue: <issue-id>
 PR: ${PR_URL}
 Failure-Type: ci-checks
-Error: (see \`gh pr checks $PR\`)
+Error: (see `gh pr checks $PR`)
 Attempt-Number: 1
 BODY
 ```
