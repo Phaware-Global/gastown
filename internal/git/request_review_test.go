@@ -74,6 +74,53 @@ func TestBuildRequestReviewArgv(t *testing.T) {
 			wantCommentArgv: []string{"pr", "comment", "42", "--body", "augment review"},
 			wantEditArgv:    []string{"pr", "edit", "42", "--add-reviewer", "alice,bob"},
 		},
+		// Whitespace normalization — augment classification must tolerate
+		// whitespace padding (config fields often carry trailing newlines or
+		// stray spaces; silently routing "augment " to --add-reviewer would
+		// reproduce G12a).
+		{
+			name:            "augment with trailing whitespace — matches comment path",
+			reviewers:       []string{"augment "},
+			wantCommentArgv: []string{"pr", "comment", "42", "--body", "augment review"},
+			wantEditArgv:    nil,
+		},
+		{
+			name:            "augment with leading whitespace — matches comment path",
+			reviewers:       []string{" augment"},
+			wantCommentArgv: []string{"pr", "comment", "42", "--body", "augment review"},
+			wantEditArgv:    nil,
+		},
+		{
+			name:            "augment surrounded by tabs/newlines — matches comment path",
+			reviewers:       []string{"\taugment\n"},
+			wantCommentArgv: []string{"pr", "comment", "42", "--body", "augment review"},
+			wantEditArgv:    nil,
+		},
+		// Empty-after-trim dropping — never emit "a,,b" to gh, which would fail.
+		{
+			name:            "empty string in list — dropped, no blank reviewer emitted",
+			reviewers:       []string{"alice", "", "bob"},
+			wantCommentArgv: nil,
+			wantEditArgv:    []string{"pr", "edit", "42", "--add-reviewer", "alice,bob"},
+		},
+		{
+			name:            "whitespace-only string in list — dropped",
+			reviewers:       []string{"alice", "   ", "bob"},
+			wantCommentArgv: nil,
+			wantEditArgv:    []string{"pr", "edit", "42", "--add-reviewer", "alice,bob"},
+		},
+		{
+			name:            "all entries empty/whitespace — both argvs nil",
+			reviewers:       []string{"", "  ", "\t"},
+			wantCommentArgv: nil,
+			wantEditArgv:    nil,
+		},
+		{
+			name:            "augment alongside empty entries — still routes cleanly",
+			reviewers:       []string{"", "  augment  ", "alice", "\t", "bob"},
+			wantCommentArgv: []string{"pr", "comment", "42", "--body", "augment review"},
+			wantEditArgv:    []string{"pr", "edit", "42", "--add-reviewer", "alice,bob"},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
