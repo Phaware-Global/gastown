@@ -383,7 +383,7 @@ func TierDescription(tier CostTier) string {
 	case TierEconomy:
 		return "Patrol roles use Sonnet/Haiku, workers use Opus"
 	case TierBudget:
-		return "Patrol roles use Haiku, workers use Sonnet"
+		return "Deacon/Refinery use Haiku; Witness, Mayor, Polecat, Crew use Sonnet"
 	case TierCustomGroqOpus:
 		return "Mayor/Crew → Claude Opus; Deacon/Witness/Refinery/Polecat/Boot/Dog → Groq compound-beta"
 	case TierCustomGroqSonnet:
