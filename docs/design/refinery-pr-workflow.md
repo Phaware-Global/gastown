@@ -1558,3 +1558,110 @@ silently inside gt done rather than loud-erroring in bd create —
 but the consequence is the same: work sits on an origin branch, a
 bead records "done", downstream unblocks, and nothing actually
 lands.
+
+### G10 proper-fix validation (2026-04-20 ~04:42Z)
+
+After PR #17 landed (MailSender interface seam + memoryMailSender
+default under test binaries), Telegraph v1 ran a fresh 25-minute
+window with all three L-layer polecats (furiosa, nux, slit) exercising
+`go test ./...` as part of their normal verification cycle.
+
+Pre-fix reference (same workload, 2026-04-19 21:24–21:26Z): 56 junk
+MERGED-with-empty-issue mails in 2 minutes; inbox grew 192 → 248.
+
+Post-fix observation (2026-04-20 04:17–04:42Z): inbox grew 24 → 28,
+and all four new mails are real HIGH escalations (refinery status,
+deacon wisp-blocked, orphan-branch escalation from refinery, mayor
+session alert from witness). Zero `MERGED: ` (empty-issue) or
+`mr-a/mr-b/feature-a/feature-b/test-rig` fixture-shaped mails.
+
+G10 closed: `go test` in the refinery package — and by extension any
+downstream package that builds an Engineer — no longer spawns `gt mail
+send` subprocesses because `defaultMailSender()` returns the
+memory-backed impl under a `.test` argv[0]. The Engineer's two mail
+dispatch sites (HandleMRInfoSuccess, notifyConvoyCompletion) route
+through `e.mailSenderOrDefault()` which enforces the default even for
+struct-literal constructions.
+
+### G18 — witness false-positive on refinery "session dead" during normal thinking cycles (G6 recurrence)
+
+Observed 2026-04-20 04:42Z, mid-validation window. The witness
+escalated `hq-g8m` *"[HIGH] Refinery: session dead (was operational in
+cycle 22, now offline). Polecats running, Dolt healthy, Mayor alive.
+Requires investigation."* Two minutes later, the refinery's pane
+showed it actively acknowledging a subsequent witness health check:
+
+    [from gastown/witness] HEALTH_CHECK: Witness cycle 25 starting,
+    checking refinery status
+    ⏺ Bash(gt nudge gastown/witness "HEALTH_CHECK_ACK: Refinery alive...")
+    ✓ Nudged gastown/witness (wait-idle)
+
+So the refinery was not dead between cycles 22 and 25 — it was
+mid-turn (Sonnet thinking, likely 30–90s) and the witness's liveness
+heuristic read the absence of recent activity as offline. This is
+the same family as G6 (witness-nukes-working-polecats on INSERT-mode
+scraping) but for a different target: the refinery instead of
+polecats, and escalation instead of nuking.
+
+The witness's earlier G6-class escalation was already documented as a
+risk; G18 formalizes the recurrence at the refinery-liveness level.
+Unlike G6, G18 doesn't cause destructive action (no nuking), but it
+does generate HIGH-severity inbox noise that competes for mayor
+attention with legitimate issues — reducing signal-to-noise in a way
+that will feel familiar after G8/G10.
+
+Fix direction (same shape as G6's):
+
+1. Liveness should rely on a real signal, not screen-scraping or
+   fixed-interval "should've checked in by now" heuristics. Gas Town
+   already has heartbeat beads; the witness should require N stale
+   heartbeats (not 1) before calling a session dead, and the
+   threshold should scale with the session's observed activity
+   cadence (a refinery in the middle of a long bash or a long LLM
+   turn has larger legitimate gaps than one idling between patrols).
+
+2. Severity downgrade for liveness-only signals without corroborating
+   evidence. "Polecats running, Dolt healthy, Mayor alive, Refinery
+   thinking" is ambient, not HIGH — HIGH should be reserved for
+   failures that trigger human action. This keeps HIGH a rare,
+   meaningful level and reduces inbox drowning under normal LLM
+   think-time pauses.
+
+3. The witness should cross-check with a lightweight probe before
+   escalating — e.g. try a `gt nudge refinery "ping"` with short
+   timeout; if the nudge is accepted, the session isn't dead regardless
+   of activity cadence. Only if the nudge fails AND N heartbeats are
+   stale should liveness escalate.
+
+### Monitoring note: human-approval latency (PR #16)
+
+PR #16 (L3 gt-ahf, `feat(telegraph): L3 mail envelope + rate-limited
+nudge`) opened 2026-04-20 03:25Z. At 04:42Z (77 min later) it remains
+open with no reviewDecision — sitting on kevinpjones. Reference: PR
+#10 was merged 15 min after open by the same reviewer. This is the
+first substantial human-approval wait since `merge_strategy=pr` was
+enabled.
+
+Not a bug — the workflow correctly gates on the configured approver.
+But this is the friction pattern the user asked me to watch for: work
+is done, tests pass, CI green, the automation has nowhere to advance
+until a human clicks merge. If the epic's downstream children (gt-6ev
+integration test, gt-78h observability) are blocked on L3 landing,
+and L3 is blocked on kevinpjones, the engine has capacity idle behind
+a human gate.
+
+Mitigation options (design follow-ups, not load-bearing for current
+workflow):
+
+- Configurable auto-merge for low-risk PRs (tests-only changes, doc
+  changes) where the approver is the polecat/refinery rather than a
+  human.
+- Epic-level dispatch policy where downstream children that don't
+  *structurally* depend on the parent being merged (just on its code
+  being visible) can be dispatched onto the parent PR's branch as a
+  preview. L1/L2/L3 are independent implementations of a Translator
+  interface; they could land in parallel PRs rather than serial
+  merges. The fact that they share a base branch is orthogonal.
+- SLA-based escalation: if a PR sits without a reviewDecision for N
+  hours (configurable), mayor sends a reminder to the approver's
+  inbox/external channel. Not the refinery's concern.
