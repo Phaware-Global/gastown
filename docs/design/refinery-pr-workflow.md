@@ -1757,3 +1757,58 @@ Fix stack:
   `.claude/settings.json` before starting the Claude Code session.
   If that fsync-before-start ordering is not explicit in the spawn
   code, a future reorg could reintroduce the race.
+
+### PR #16 (Telegraph L3) merge-cycle postmortem (2026-04-20 15:34Z)
+
+Opened: 2026-04-20T03:25:01Z. Merged: 2026-04-20T15:34:14Z. Total
+human-approval wait: **12h 9min** (vs PR #10's 15min for the same
+reviewer). The long wait is the friction pattern the user flagged —
+nothing actionable to fix in gastown; the gate is by design. But
+the merge itself has a signal worth recording.
+
+What actually happened at merge time:
+
+- PR #16 was created by the polecat directly (slit, via manual
+  `gh pr create` — the G19b bypass). No MR bead. No refinery
+  ownership.
+- Because the refinery never saw the PR, the PR.4 step (`gt
+  refinery pr request-review --user augment`) never fired. No
+  `augment review` comment was ever posted.
+- Gemini's repo-level auto-review ran automatically on PR open and
+  left 4 unresolved threads. The review-fix loop (PR.5) also never
+  fired, because the refinery has no handle on a PR not in its
+  queue.
+- 12 hours later, the human reviewer (kevinpjones) approved and
+  squash-merged the PR directly via GitHub. Gemini's threads
+  remained unresolved at merge time.
+- The refinery observed the merge (its pane: "L3 merge proceeded
+  correctly; no new action needed") and treated gt-ahf as complete.
+
+Takeaways:
+
+1. **G19 fixes protect forward, not back.** The tap-guard hardening
+   (G19b) + gt-done banner (G19c) will prevent the next polecat
+   from taking this same shortcut. They don't retroactively route
+   PR #16 through the refinery; the orphan state was already
+   established.
+
+2. **Human can act as a bypass.** When a PR exists but isn't in
+   the refinery's queue, the human reviewer is the only path to
+   merge. The human's approve+merge operates entirely on GitHub's
+   UI — the refinery has no involvement, no review-loop
+   mechanism, no thread-resolution bookkeeping. For orphan PRs
+   this is actually the correct recovery path today (short of
+   manually backfilling an MR bead as the G11 dogfood did).
+
+3. **Gemini threads at merge time ≠ code correctness.** Four
+   unresolved high/medium threads survived into main because the
+   review loop wasn't owning the PR. For L3 specifically this is
+   probably OK (the threads are advisory / stylistic); for a
+   future PR the same path could land a real bug. The review-fix
+   loop is a defense-in-depth; when it doesn't run, the safety
+   delta shifts entirely to the human's diligence.
+
+No new G-entry needed — this is G11 + G17 + G19 playing out as
+already documented. Filed here as a concrete postmortem so the
+numbers (12h wait, 0 augment reviews, 4 unresolved threads at
+merge) are preserved.
