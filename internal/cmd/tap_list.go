@@ -69,6 +69,14 @@ func runTapList(cmd *cobra.Command, args []string) error {
 			matchers:    []string{"Bash(git push*)"},
 			implemented: true,
 		},
+		{
+			name:        "memory-write",
+			kind:        "guard",
+			description: "Block Write/Edit/NotebookEdit to Claude Code memory paths for worker roles",
+			event:       "PreToolUse",
+			matchers:    []string{"Write|Edit|NotebookEdit"},
+			implemented: true,
+		},
 	}
 
 	// Try to load registry for additional handlers

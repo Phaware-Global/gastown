@@ -26,6 +26,7 @@ Available guards:
   bd-init            - Block bd init in wrong directories
   mol-patrol         - Block mol patrol from agent contexts
   dangerous-command  - Block rm -rf, force push, hard reset, git clean
+  memory-write       - Block Write/Edit/NotebookEdit to Claude Code memory paths for worker roles
 
 External guards (standalone scripts, not compiled into gt):
   context-budget   - scripts/guards/context-budget-guard.sh
