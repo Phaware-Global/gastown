@@ -115,8 +115,12 @@ func (c *Config) Validate() error {
 	if t.BodyCap <= 0 {
 		return errors.New("telegraph.body_cap must be positive")
 	}
-	if _, err := time.ParseDuration(t.NudgeWindow); err != nil {
+	nw, err := time.ParseDuration(t.NudgeWindow)
+	if err != nil {
 		return fmt.Errorf("telegraph.nudge_window %q is not a valid duration: %w", t.NudgeWindow, err)
+	}
+	if nw < 0 {
+		return fmt.Errorf("telegraph.nudge_window %q must be non-negative", t.NudgeWindow)
 	}
 	for id, p := range t.Providers {
 		if p == nil {
@@ -124,6 +128,9 @@ func (c *Config) Validate() error {
 		}
 		if p.Enabled && p.SecretEnv == "" {
 			return fmt.Errorf("telegraph.providers.%s: secret_env is required when enabled=true", id)
+		}
+		if p.Enabled && len(p.Events) == 0 {
+			return fmt.Errorf("telegraph.providers.%s: events list must be non-empty when enabled=true", id)
 		}
 	}
 	return nil
@@ -154,6 +161,16 @@ func (p *ProviderConfig) ResolveSecret() (string, error) {
 type ResolvedProvider struct {
 	Config *ProviderConfig
 	Secret string // resolved from Config.SecretEnv at startup
+}
+
+// String redacts Secret so ResolvedProvider is safe to pass to log/fmt.
+func (r *ResolvedProvider) String() string {
+	return fmt.Sprintf("ResolvedProvider{Config:%v Secret:[REDACTED]}", r.Config)
+}
+
+// GoString redacts Secret in %#v output.
+func (r *ResolvedProvider) GoString() string {
+	return fmt.Sprintf("&telegraph.ResolvedProvider{Config:%#v, Secret:\"[REDACTED]\"}", r.Config)
 }
 
 // ResolveProviders resolves secrets for all enabled providers.
