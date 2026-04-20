@@ -778,7 +778,12 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 				// When merge_strategy=pr, create a GitHub PR for human review
 				// instead of just leaving the branch on origin (gas-rfi).
+				// prURL and prNumber are declared at outer scope so the
+				// refinery-handoff block after this if/else can consume them
+				// regardless of whether gh pr create succeeded, fell back to
+				// FindPRNumber, or was skipped entirely (non-pr no_merge).
 				var prURL string
+				var prNumber int
 				noMergeSettingsPath := filepath.Join(townRoot, rigName, "settings", "config.json")
 				if noMergeSettings, noMergeSettingsErr := config.LoadRigSettings(noMergeSettingsPath); noMergeSettingsErr == nil &&
 					noMergeSettings.MergeQueue != nil && noMergeSettings.MergeQueue.MergeStrategy == "pr" {
@@ -816,6 +821,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					prBodyBuilder.WriteString("---\n")
 					prBodyBuilder.WriteString(fmt.Sprintf("*Polecat: %s | Issue: %s*\n", worker, issueID))
 					prBody := prBodyBuilder.String()
+
 					ghCmd := exec.CommandContext(context.Background(), "gh", "pr", "create",
 						"--base", defaultBranch,
 						"--head", branch,
@@ -825,13 +831,103 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					ghCmd.Dir = cwd
 					prOutput, prErr := ghCmd.Output()
 					if prErr != nil {
-						style.PrintWarning("could not create GitHub PR: %v", prErr)
+						// `gh pr create` commonly fails with "A pull request
+						// for branch X already exists" on `gt done` retries
+						// (first run created the PR, second run sees it).
+						// Fall back to a lookup so we still hand off to the
+						// refinery — orphaning the PR on retry would defeat
+						// the whole G11 fix. Non-fatal: if lookup also
+						// fails, we proceed without prURL/prNumber and the
+						// MR-creation block below skips, and the existing
+						// force-close path records the failure.
+						style.PrintWarning("gh pr create failed: %v — looking up existing PR on branch %s", prErr, branch)
+						if existingNumber, findErr := g.FindPRNumber(branch); findErr != nil {
+							style.PrintWarning("PR lookup also failed: %v", findErr)
+						} else if existingNumber > 0 {
+							prNumber = existingNumber
+							prURL = fmt.Sprintf("#%d on branch %s", existingNumber, branch) // display only; real URL not needed for the MR handoff
+							fmt.Printf("%s Found existing PR #%d on branch %s — reusing for refinery handoff\n", style.Bold.Render("✓"), existingNumber, branch)
+						}
 					} else {
 						prURL = strings.TrimSpace(string(prOutput))
 						fmt.Printf("%s GitHub PR created: %s\n", style.Bold.Render("✓"), prURL)
+						if n, parseErr := parsePRNumberFromURL(prURL); parseErr != nil {
+							// URL parse fell over (unexpected gh output
+							// format, truncated stdout, etc.). The PR is
+							// almost certainly open — fall back to
+							// FindPRNumber so we don't orphan it. Same
+							// strategy as the create-error branch above.
+							style.PrintWarning("could not parse PR number from %q: %v — falling back to FindPRNumber", prURL, parseErr)
+							if existingNumber, findErr := g.FindPRNumber(branch); findErr != nil {
+								style.PrintWarning("PR lookup also failed: %v — MR bead handoff will be skipped", findErr)
+							} else if existingNumber > 0 {
+								prNumber = existingNumber
+								fmt.Printf("%s Resolved PR #%d via FindPRNumber — reusing for refinery handoff\n", style.Bold.Render("✓"), existingNumber)
+							}
+						} else {
+							prNumber = n
+						}
 					}
 				} else {
 					fmt.Printf("%s\n", style.Dim.Render("Work stays on feature branch for human review."))
+				}
+
+				// Above sets prNumber > 0 exactly when we have a PR to hand
+				// off. Declare the flag at outer scope so the work-bead
+				// close guard below can read it.
+				refineryOwnsMerge := false
+
+				// When a PR exists for this work under merge_strategy=pr,
+				// hand it off to the refinery by creating an MR bead that
+				// carries `review_pr: <N>`. Without this, the refinery
+				// never sees the PR, so no `augment review` is requested,
+				// no CI-gate runs, no human-approval escalation fires —
+				// the PR sits orphaned from the review/merge pipeline.
+				// See G11 in docs/design/refinery-pr-workflow.md. Skipped
+				// for non-pr no_merge (the work legitimately ends there
+				// with a READY_FOR_REVIEW mail + closed bead).
+				if prNumber > 0 {
+					mrID, refineryOwnsMerge = handoffPRToRefinery(bd, handoffPRArgs{
+						branch:            branch,
+						target:            defaultBranch,
+						sourceIssueID:     issueID,
+						rigName:           rigName,
+						prNumber:          prNumber,
+						worker:            worker,
+						donePriority:      donePriority,
+						sourceIssueForPri: sourceIssueForNoMerge,
+					})
+					// When the handoff fails (MR bead create/readback
+					// didn't land), the PR exists on GitHub but the
+					// refinery won't see it. Surface this up to the
+					// witness-completion metadata so the audit trail
+					// (and any orphaned-PR debugging) reflects it
+					// properly — otherwise downstream sees
+					// MRFailed=false and assumes the merge pipeline is
+					// healthy. Specific-log the handoff failure so the
+					// witness's error summary is actionable instead of
+					// a generic "done completed with errors".
+					if !refineryOwnsMerge {
+						mrFailed = true
+						doneErrors = append(doneErrors, fmt.Sprintf(
+							"MR bead handoff for PR #%d failed: refinery will not pick up branch %s; dispatcher intervention required",
+							prNumber, branch))
+					}
+				} else if prURL != "" {
+					// Edge case: `gh pr create` succeeded (or reported a
+					// URL) but BOTH parsePRNumberFromURL AND the
+					// FindPRNumber fallback failed — prNumber stays 0 so
+					// we never called the handoff. The PR is almost
+					// certainly open on GitHub, but the refinery won't
+					// see it. Flag as MR failure so the witness metadata
+					// (MRFailed=true, doneErrors listing the branch)
+					// accurately reflects the orphaned state. Without
+					// this, downstream would treat the run as a clean
+					// completion despite the orphan.
+					mrFailed = true
+					doneErrors = append(doneErrors, fmt.Sprintf(
+						"PR appears to exist on branch %s but PR number could not be resolved (URL parse + FindPRNumber both failed); refinery will not pick up and manual dispatcher intervention is required",
+						branch))
 				}
 
 				// Mail dispatcher with READY_FOR_REVIEW.
@@ -860,35 +956,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					}
 				}
 
-				// Close the work bead so it doesn't sit `open` forever — this is
-				// the fix for #3363. Without this, no_merge polecats with commits
-				// (implement-stage work in Linear pipelines, review-fix dispatches
-				// under merge_strategy=pr, etc.) would stamp READY_FOR_REVIEW and
-				// exit, but the bead stayed open, stalling dispatchers that check
-				// convoy completion. Force-close bypasses molecule dep checks; the
-				// polecat is already done and about to be nuked.
-				//
-				// Compose the reason from observed state so the audit trail is
-				// accurate (matters when DispatchedBy was empty or mail failed).
-				closeReason := "No-merge work completed"
-				if prURL != "" {
-					closeReason += fmt.Sprintf("; PR %s opened for human review", prURL)
-				}
-				switch {
-				case dispatcherNotified:
-					closeReason += "; dispatcher notified"
-				case attachmentFields.DispatchedBy == "":
-					closeReason += "; no dispatcher recorded"
-				default:
-					closeReason += "; dispatcher notification failed"
-				}
-
-				// Close the attached molecule (wisp) FIRST — same ordering the
-				// regular gt done path uses in updateAgentStateOnDone. Once we
-				// force-close the work bead below, it becomes terminal and
-				// updateAgentStateOnDone's wisp-close guard skips the molecule,
-				// leaving the wisp + its step descendants orphaned. Mirror that
-				// cleanup here so the no-merge path doesn't leak wisps.
+				// Close the attached molecule (wisp) — the polecat is done
+				// with its work regardless of who owns the merge. Same
+				// ordering the regular gt done path uses (see
+				// updateAgentStateOnDone). Do this FIRST so the guard there
+				// doesn't skip it if we later close the work bead too.
 				if attachmentFields.AttachedMolecule != "" {
 					if n := closeDescendants(bd, attachmentFields.AttachedMolecule); n > 0 {
 						fmt.Fprintf(os.Stderr, "Closed %d molecule step(s) for %s\n", n, attachmentFields.AttachedMolecule)
@@ -898,6 +970,37 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 							style.PrintWarning("couldn't close attached molecule %s: %v", attachmentFields.AttachedMolecule, closeErr)
 						}
 					}
+				}
+
+				// If the refinery now owns merge (MR bead queued for the
+				// PR we just created), leave the work bead open. The
+				// refinery will close it on merge — same lifecycle as any
+				// other MR. Closing here would strand the MR without its
+				// source_issue.
+				if refineryOwnsMerge {
+					fmt.Printf("%s Work bead %s left open — refinery will close on merge\n", style.Bold.Render("→"), issueID)
+					goto notifyWitness
+				}
+
+				// No-merge path without a PR (or with MR-bead creation
+				// failure) — close the work bead so it doesn't sit open
+				// forever. This is the fix for #3363. Compose the reason
+				// from observed state so the audit trail is accurate
+				// (matters when DispatchedBy was empty or mail failed).
+				closeReason := "No-merge work completed"
+				if prURL != "" {
+					// prURL is non-empty but refineryOwnsMerge is false —
+					// MR bead creation failed. Flag that so the audit
+					// trail explains why the refinery never picked up.
+					closeReason += fmt.Sprintf("; PR %s opened but MR bead handoff failed", prURL)
+				}
+				switch {
+				case dispatcherNotified:
+					closeReason += "; dispatcher notified"
+				case attachmentFields.DispatchedBy == "":
+					closeReason += "; no dispatcher recorded"
+				default:
+					closeReason += "; dispatcher notification failed"
 				}
 
 				var noMergeCloseErr error
@@ -916,7 +1019,6 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					style.PrintWarning("could not close no-merge bead %s: %v — dispatcher must close manually", issueID, noMergeCloseErr)
 				}
 
-				// Skip MR creation, go to witness notification
 				goto notifyWitness
 			}
 		}
@@ -1942,6 +2044,141 @@ func stripOverlayCLAUDEmd(g *git.Git, defaultBranch string) bool {
 	fmt.Printf("%s Created cleanup commit to remove Gas Town overlay files\n",
 		style.Bold.Render("✓"))
 	return true
+}
+
+// handoffPRArgs bundles the parameters for handoffPRToRefinery so the
+// call site stays readable inside the already-dense no-merge path in
+// `gt done`.
+type handoffPRArgs struct {
+	branch            string
+	target            string
+	sourceIssueID     string
+	rigName           string
+	prNumber          int
+	worker            string
+	donePriority      int
+	sourceIssueForPri *beads.Issue
+}
+
+// handoffPRToRefinery creates (or reuses) an MR bead carrying
+// `review_pr: <N>` so the refinery picks up an already-open PR on
+// its next queue-scan. Returns the MR bead ID and whether the refinery
+// now owns the merge (true only when the bead is verifiably in place).
+//
+// Idempotent on retry: if an open MR bead already exists for the same
+// branch, the existing one is reused rather than creating a duplicate.
+// After creation, a read-back verifies the bead is queryable so we
+// don't falsely claim the refinery owns merge when the write didn't
+// persist (Dolt lock timeouts, corrupt state, etc. — mirrors the
+// main MR-creation path's guard around ~line 1142).
+//
+// Lives in done.go alongside its caller because this is the only
+// site that needs it. If a future path needs the same handoff,
+// promote to a shared helper.
+func handoffPRToRefinery(bd *beads.Beads, args handoffPRArgs) (string, bool) {
+	// Idempotent on retry: reuse an existing open MR bead for this
+	// branch instead of creating a duplicate. Mirrors the regular
+	// MR-creation path's dedup (see ~line 1060).
+	if existingMR, findErr := bd.FindMRForBranch(args.branch); findErr != nil {
+		style.PrintWarning("could not check for existing MR bead: %v — proceeding with create (may duplicate on retry)", findErr)
+	} else if existingMR != nil {
+		fmt.Printf("%s MR bead %s already exists for branch %s (idempotent retry) — refinery still owns merge for PR #%d\n",
+			style.Bold.Render("✓"), existingMR.ID, args.branch, args.prNumber)
+		return existingMR.ID, true
+	}
+
+	mrDesc := fmt.Sprintf(
+		"branch: %s\ntarget: %s\nsource_issue: %s\nrig: %s\nreview_pr: %d\nworker: %s\nmerge_strategy: pr",
+		args.branch, args.target, args.sourceIssueID, args.rigName, args.prNumber, args.worker,
+	)
+	// Retry count / conflict tracking fields mirror the regular MR-bead
+	// path (~line 1089) so the refinery treats this MR identically.
+	mrDesc += "\nretry_count: 0\nlast_conflict_sha: null\nconflict_task_id: null"
+
+	// Priority inheritance: prefer explicit --priority, fall back to
+	// the source bead's priority, default to 2. Mirrors the main path
+	// at ~line 1067.
+	mrPriority := 2
+	switch {
+	case args.donePriority >= 0:
+		mrPriority = args.donePriority
+	case args.sourceIssueForPri != nil:
+		mrPriority = args.sourceIssueForPri.Priority
+	}
+
+	mrIssue, mrCreateErr := bd.Create(beads.CreateOptions{
+		Title:       fmt.Sprintf("Merge: %s", args.sourceIssueID),
+		Labels:      []string{"gt:merge-request"},
+		Priority:    mrPriority,
+		Description: mrDesc,
+		Ephemeral:   true,
+		Rig:         args.rigName,
+	})
+	switch {
+	case mrCreateErr != nil:
+		style.PrintWarning("could not create MR bead for PR %d: %v — PR is open but refinery won't see it; dispatcher must intervene", args.prNumber, mrCreateErr)
+		return "", false
+	case mrIssue == nil || mrIssue.ID == "":
+		style.PrintWarning("MR bead created with empty ID for PR %d — refinery may not pick up this PR", args.prNumber)
+		return "", false
+	}
+
+	// Read-back verification: bd.Create can succeed locally but fail
+	// to persist (Dolt lock timeout, corrupt state). Mirror the main
+	// path's guard (~line 1142) so we don't claim the refinery owns
+	// merge unless the bead is queryable.
+	if verified, verifyErr := bd.Show(mrIssue.ID); verifyErr != nil || verified == nil {
+		style.PrintWarning("MR bead %s created but verification read-back failed: %v — refinery may not pick up PR %d", mrIssue.ID, verifyErr, args.prNumber)
+		return "", false
+	}
+
+	fmt.Printf("%s MR bead %s queued for PR #%d — refinery will run review+merge\n", style.Bold.Render("✓"), mrIssue.ID, args.prNumber)
+	return mrIssue.ID, true
+}
+
+// parsePRNumberFromURL extracts the PR number from a GitHub PR URL of
+// the shape `https://github.com/<owner>/<repo>/pull/<N>`. Anything
+// trailing a fragment or query string is tolerated.
+//
+// Used by the no-merge+pr path in gt done to hand off the just-created
+// PR to the refinery via an MR bead's `review_pr` field (G11 fix).
+// Kept local to done.go because this is the only caller; if that
+// changes, promote to internal/git or similar.
+func parsePRNumberFromURL(url string) (int, error) {
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return 0, fmt.Errorf("empty URL")
+	}
+	// Strip any fragment/query so "…/pull/10#issuecomment-…" still parses.
+	for _, cut := range []string{"#", "?"} {
+		if i := strings.Index(url, cut); i >= 0 {
+			url = url[:i]
+		}
+	}
+	// Look for "/pull/" so we don't grab numbers from unrelated URL paths.
+	idx := strings.LastIndex(url, "/pull/")
+	if idx < 0 {
+		return 0, fmt.Errorf("URL has no /pull/ segment: %s", url)
+	}
+	tail := url[idx+len("/pull/"):]
+	// Trim any trailing slash.
+	tail = strings.TrimRight(tail, "/")
+	// Stop at the first non-digit so "/pull/10/files" → "10".
+	end := 0
+	for end < len(tail) && tail[end] >= '0' && tail[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0, fmt.Errorf("no digits after /pull/: %s", url)
+	}
+	n, err := strconv.Atoi(tail[:end])
+	if err != nil {
+		return 0, fmt.Errorf("parsing PR number %q: %w", tail[:end], err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("parsed non-positive PR number %d", n)
+	}
+	return n, nil
 }
 
 // purgeClosedEphemeralBeads removes closed ephemeral beads (wisps) that accumulated
