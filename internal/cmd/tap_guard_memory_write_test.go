@@ -39,6 +39,16 @@ func TestIsClaudeCodeMemoryPath(t *testing.T) {
 			"/root/.claude/projects/x/memory/y.md",
 			true,
 		},
+		{
+			"relative path (no leading slash) — matches at start of string",
+			".claude/projects/abc/memory/feedback.md",
+			true,
+		},
+		{
+			"relative path via cwd prefix",
+			"some/cwd/.claude/projects/abc/memory/feedback.md",
+			true,
+		},
 
 		// Negatives — paths that superficially look memory-adjacent but
 		// are not a memory write.
@@ -71,6 +81,14 @@ func TestIsClaudeCodeMemoryPath(t *testing.T) {
 		{
 			"substring collision — 'memory' in filename but not directory",
 			"/Users/agent/.claude/projects/x/notes-memory.md",
+			false,
+		},
+		{
+			// Segment-boundary: "foo.claude/projects/..." has no path
+			// separator before ".claude", so it's NOT a Claude Code path,
+			// it's just a directory named "foo.claude".
+			"segment-boundary: prefix attached to non-separator — not matched",
+			"/tmp/foo.claude/projects/x/memory/y.md",
 			false,
 		},
 		{

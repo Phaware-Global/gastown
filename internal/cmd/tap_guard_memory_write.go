@@ -121,21 +121,44 @@ func extractFilePath(input []byte) string {
 // isClaudeCodeMemoryPath returns true iff the path targets a Claude
 // Code per-project memory directory. The canonical layout on any
 // platform Claude Code supports is
-// ~/.claude/projects/<project-hash>/memory/<file>.md; we match the
-// "/.claude/projects/" prefix followed (anywhere after) by "/memory/"
-// to cover variations without binding to a specific hash scheme.
+// ~/.claude/projects/<project-hash>/memory/<file>.md.
+//
+// Matching strategy: look for ".claude/projects/" anywhere in the
+// path (accepting both "/.claude/projects/..." and
+// ".claude/projects/..." — the latter covers relative paths a tool
+// might pass unresolved), followed later by "/memory/". We reject
+// cases where a filename coincidentally contains ".claude" (e.g.
+// "foo.claude/..." ) by requiring the match to be at a path segment
+// boundary: either the start of the string, or immediately after a
+// path separator.
 //
 // Exported-lowercase for testability from the cmd package's tests.
 func isClaudeCodeMemoryPath(filePath string) bool {
 	if filePath == "" {
 		return false
 	}
-	idx := strings.Index(filePath, "/.claude/projects/")
-	if idx < 0 {
-		return false
+	const needle = ".claude/projects/"
+	// Walk through every occurrence of needle; accept the first one that
+	// sits at a path-segment boundary.
+	start := 0
+	for {
+		idx := strings.Index(filePath[start:], needle)
+		if idx < 0 {
+			return false
+		}
+		absIdx := start + idx
+		// Segment-boundary check: absIdx == 0 (relative path starting
+		// with ".claude/") OR the preceding byte is a path separator.
+		boundaryOK := absIdx == 0 || filePath[absIdx-1] == '/'
+		if boundaryOK {
+			rest := filePath[absIdx+len(needle):]
+			if strings.Contains(rest, "/memory/") {
+				return true
+			}
+			return false
+		}
+		start = absIdx + 1
 	}
-	rest := filePath[idx+len("/.claude/projects/"):]
-	return strings.Contains(rest, "/memory/")
 }
 
 func printMemoryWriteBlock(filePath string) {
