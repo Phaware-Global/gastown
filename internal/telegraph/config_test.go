@@ -3,6 +3,7 @@ package telegraph_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -274,5 +275,70 @@ func TestResolveProviders_MissingSecret(t *testing.T) {
 	_, err := cfg.ResolveProviders()
 	if err == nil {
 		t.Error("expected error when secret env var is missing")
+	}
+}
+
+func TestResolvedProvider_StringRedactsSecret(t *testing.T) {
+	t.Parallel()
+	r := &telegraph.ResolvedProvider{
+		Config: &telegraph.ProviderConfig{SecretEnv: "GT_SECRET_ENV"},
+		Secret: "supersecret",
+	}
+	s := r.String()
+	if strings.Contains(s, "supersecret") {
+		t.Errorf("String() leaked secret: %s", s)
+	}
+	if !strings.Contains(s, "REDACTED") {
+		t.Errorf("String() missing REDACTED marker: %s", s)
+	}
+}
+
+func TestResolvedProvider_GoStringRedactsSecret(t *testing.T) {
+	t.Parallel()
+	r := &telegraph.ResolvedProvider{
+		Config: &telegraph.ProviderConfig{SecretEnv: "GT_SECRET_ENV"},
+		Secret: "supersecret",
+	}
+	s := r.GoString()
+	if strings.Contains(s, "supersecret") {
+		t.Errorf("GoString() leaked secret: %s", s)
+	}
+	if !strings.Contains(s, "REDACTED") {
+		t.Errorf("GoString() missing REDACTED marker: %s", s)
+	}
+}
+
+func TestValidate_NegativeNudgeWindow(t *testing.T) {
+	t.Parallel()
+	cfg := telegraph.DefaultConfig()
+	cfg.Telegraph.NudgeWindow = "-1s"
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for negative nudge_window")
+	}
+}
+
+func TestValidate_EnabledProviderEmptyEvents(t *testing.T) {
+	t.Parallel()
+	cfg := telegraph.DefaultConfig()
+	cfg.Telegraph.Providers["jira"] = &telegraph.ProviderConfig{
+		Enabled:   true,
+		SecretEnv: "GT_JIRA_SECRET",
+		Events:    []string{}, // empty — should fail
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for enabled provider with empty events list")
+	}
+}
+
+func TestValidate_DisabledProviderEmptyEventsOK(t *testing.T) {
+	t.Parallel()
+	cfg := telegraph.DefaultConfig()
+	cfg.Telegraph.Providers["jira"] = &telegraph.ProviderConfig{
+		Enabled:   false,
+		SecretEnv: "GT_JIRA_SECRET",
+		Events:    []string{}, // OK when disabled
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil for disabled provider with empty events", err)
 	}
 }
