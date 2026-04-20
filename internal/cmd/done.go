@@ -852,7 +852,18 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						prURL = strings.TrimSpace(string(prOutput))
 						fmt.Printf("%s GitHub PR created: %s\n", style.Bold.Render("✓"), prURL)
 						if n, parseErr := parsePRNumberFromURL(prURL); parseErr != nil {
-							style.PrintWarning("could not parse PR number from %q: %v — skipping MR bead (refinery won't pick up this PR)", prURL, parseErr)
+							// URL parse fell over (unexpected gh output
+							// format, truncated stdout, etc.). The PR is
+							// almost certainly open — fall back to
+							// FindPRNumber so we don't orphan it. Same
+							// strategy as the create-error branch above.
+							style.PrintWarning("could not parse PR number from %q: %v — falling back to FindPRNumber", prURL, parseErr)
+							if existingNumber, findErr := g.FindPRNumber(branch); findErr != nil {
+								style.PrintWarning("PR lookup also failed: %v — MR bead handoff will be skipped", findErr)
+							} else if existingNumber > 0 {
+								prNumber = existingNumber
+								fmt.Printf("%s Resolved PR #%d via FindPRNumber — reusing for refinery handoff\n", style.Bold.Render("✓"), existingNumber)
+							}
 						} else {
 							prNumber = n
 						}
@@ -902,6 +913,21 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 							"MR bead handoff for PR #%d failed: refinery will not pick up branch %s; dispatcher intervention required",
 							prNumber, branch))
 					}
+				} else if prURL != "" {
+					// Edge case: `gh pr create` succeeded (or reported a
+					// URL) but BOTH parsePRNumberFromURL AND the
+					// FindPRNumber fallback failed — prNumber stays 0 so
+					// we never called the handoff. The PR is almost
+					// certainly open on GitHub, but the refinery won't
+					// see it. Flag as MR failure so the witness metadata
+					// (MRFailed=true, doneErrors listing the branch)
+					// accurately reflects the orphaned state. Without
+					// this, downstream would treat the run as a clean
+					// completion despite the orphan.
+					mrFailed = true
+					doneErrors = append(doneErrors, fmt.Sprintf(
+						"PR appears to exist on branch %s but PR number could not be resolved (URL parse + FindPRNumber both failed); refinery will not pick up and manual dispatcher intervention is required",
+						branch))
 				}
 
 				// Mail dispatcher with READY_FOR_REVIEW.
