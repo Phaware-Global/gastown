@@ -1,16 +1,80 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
+
+// prWorkflowCommandPatterns matches the forbidden commands this guard
+// covers. Each pattern allows the target command to appear at one of
+// three boundaries: (1) line start (possibly indented); (2) after a
+// shell command-separator operator (|, &&, ||, ;, ( — the characters
+// that end the previous command in a compound); (3) immediately after
+// a `-c '` or `-c "` wrapper (sh -c / bash -c / dash -c). Together
+// those cover every real polecat invocation shape the 2026-04-20
+// dogfood surfaced (G19b) without false-positives on mentions inside
+// double- or single-quoted string literals like `echo "gh pr create"`.
+//
+// Patterns deliberately do NOT use a plain word boundary (\b) before
+// the command. Word boundaries match inside quoted strings, which
+// would block `echo "Don't run: gh pr create"` — a legitimate
+// diagnostic/logging command. The "at-boundary-or-wrapper" rule is
+// the tightest pattern that catches real invocations without that
+// false positive.
+//
+// The sh -c wrapper boundary is only applied to `gh pr create`
+// because the wrapper boundary regex fragment `(-c\s+['"])` would
+// accidentally match the `-c` option of `git switch -c`. Keeping the
+// wrapper boundary scoped to the gh pattern is the simplest safe
+// option.
+var prWorkflowCommandPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?m)(^\s*|[|&;(]\s*|-c\s+['"]\s*)gh\s+pr\s+create\b`),
+	regexp.MustCompile(`(?m)(^\s*|[|&;(]\s*)git\s+checkout\s+-b\b`),
+	regexp.MustCompile(`(?m)(^\s*|[|&;(]\s*)git\s+switch\s+-c\b`),
+}
+
+// isPRWorkflowCommand returns true when cmd looks like any of the PR-
+// creation / feature-branch commands this guard blocks.
+func isPRWorkflowCommand(cmd string) bool {
+	if cmd == "" {
+		return false
+	}
+	for _, p := range prWorkflowCommandPatterns {
+		if p.MatchString(cmd) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractBashToolCommand pulls tool_input.command out of the Claude
+// Code hook input. Parallels extractCommand in tap_guard_dangerous.go;
+// keeping a per-guard extractor means each guard can fail-open
+// independently on parse errors.
+func extractBashToolCommand(input []byte) string {
+	if len(input) == 0 {
+		return ""
+	}
+	var hookInput struct {
+		ToolInput struct {
+			Command string `json:"command"`
+		} `json:"tool_input"`
+	}
+	if err := json.Unmarshal(input, &hookInput); err != nil {
+		return ""
+	}
+	return hookInput.ToolInput.Command
+}
 
 var tapGuardCmd = &cobra.Command{
 	Use:   "guard",
@@ -71,6 +135,26 @@ func init() {
 }
 
 func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
+	// Read tool_input from stdin. With the catch-all `Bash` matcher
+	// in the hook config, every Bash call reaches this guard — the
+	// guard itself decides whether the specific command is relevant.
+	// Before G19b, the matcher was `Bash(gh pr create*)` + siblings;
+	// Claude Code's glob matching doesn't cross newlines, so a multi-
+	// line `gh pr create` (with a heredoc body, etc.) slipped past.
+	// Moving the pattern check inside the guard removes that
+	// fragility.
+	//
+	// Fast path: if stdin carries a Bash command AND that command
+	// isn't one we guard, exit clean immediately. Per-invocation
+	// overhead is one fork+exec + a regex match for the common case.
+	input, _ := io.ReadAll(os.Stdin)
+	if command := extractBashToolCommand(input); command != "" && !isPRWorkflowCommand(command) {
+		return nil
+	}
+	// If stdin was empty (e.g. guard invoked manually for testing)
+	// or the command IS a PR-workflow command, fall through to the
+	// existing block-or-allow logic.
+
 	// Check if we're in a Gas Town agent context
 	if isGasTownAgentContext() {
 		// Exception: the refinery running for a rig configured with
