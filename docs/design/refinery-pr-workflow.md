@@ -1024,3 +1024,307 @@ owned vs polecat-owned-with-shortcut) and the review/merge
 invariants are written for the refinery-owned one. Every
 polecat-owned shortcut needs its own invariant coverage or a
 redirect back into the refinery-owned path.
+
+### G12 — `pr-request-review` uses `gh pr edit --add-reviewer`, which never triggers Augment; refinery also holds off dispatching the review-fix polecat on existing threads while "waiting for augment"
+
+Observed on PR #10 after the G11 fix landed and `gt-idw` was
+backfilled. The refinery picked up the MR from the queue, ran
+`gt refinery pr create` (idempotent — returned existing PR #10),
+skipped `wait-ci` (no checks configured), and executed
+`gt refinery pr request-review 10 --user augment`. That emitted
+"✓ Review requested on PR #10 from augment" — but no `augment
+review` comment was posted, no review from augment followed, and
+`gh api repos/Phaware-Global/gastown/pulls/10/requested_reviewers`
+returned `{"users":[],"teams":[]}`.
+
+**Sub-issue a: request-review doesn't trigger Augment.**
+`internal/git/git.go:GhPrRequestReview` implements request-review
+as `gh pr edit <N> --add-reviewer augment`. That is the
+GitHub-native "request review" metadata action — which either
+(i) silently succeeds as a no-op because `augment` isn't a valid
+GitHub user on this repo (the actual bot is a GitHub App whose
+comments appear under `augmentcode[bot]` or `augmentcode-free[bot]`
+depending on the installation, neither of which can be requested as
+a reviewer via `--add-reviewer`), or (ii) adds a dismissible
+metadata marker that nothing responds to. Augment Code's trigger is a PR
+**comment** whose body is exactly `augment review`. That's what
+the review loop used in this dogfood's earlier PRs (#6-#9, #11)
+to trigger augment — a hand-typed comment, not a reviewer
+request. The refinery code path for `merge_strategy=pr` was
+written to match the GitHub metadata model, not augment's
+comment-trigger model, so the automated loop never actually
+invokes augment even though the formula ran the right step.
+
+Manual unstick (this session): `gh pr comment 10 --body
+"augment review"` — augment responds to that.
+
+**Sub-issue b: refinery withholds review-fix dispatch on
+non-augment threads.** After `request-review`, the refinery's
+PR.5 step polled `gt refinery pr threads 10` and saw 3 unresolved
+threads — all from gemini-code-assist (repo-level auto-review,
+not triggered by the workflow). With `review_loop_iter=0` and
+`max=3`, the formula invariant is "threads > 0 AND iter < max →
+sling a review-fix polecat". The refinery instead filed a patrol
+report with language *"waiting for augment's response before
+dispatching review-fix polecat"* and set `iter=0` — parking the
+MR instead of dispatching.
+
+That's a silent policy the formula doesn't carry. There's
+nothing in `mol-refinery-patrol` that says "only augment's
+threads count"; the step description says "threads" (any
+unresolved thread). The refinery LLM added author-awareness on
+its own, presumably reasoning that gemini threads aren't
+"officially requested" and dispatching a polecat to address them
+is unnecessary work. But the threads ARE unresolved, the PR
+CAN'T merge with them open (augment's eventual approval won't
+resolve gemini's unresolved threads; the wait-approval step
+gates on distinct approvals AND thread resolution), and the
+whole point of the review-fix loop is to get threads to zero.
+
+So the cost of the LLM's "wait for augment" heuristic is: with
+sub-issue (a) in effect, augment NEVER responds, so the refinery
+waits forever, gemini's threads accumulate, the PR stays parked.
+Even if (a) is fixed so augment does respond, (b) still wastes a
+full patrol cycle (the one before augment's first review
+arrives) where the gemini threads could have been addressed in
+parallel.
+
+Fix direction:
+
+1. **(a) Change `GhPrRequestReview` to post an `augment review`
+   PR comment when the reviewer is `augment`** (the configured
+   `PRReviewer` for this rig), and fall back to the
+   `--add-reviewer` path only for non-augment reviewers. This
+   keeps the interface (`RequestReview(prNumber, reviewers)`)
+   but makes the implementation reviewer-aware. A richer
+   generalization: `PRProvider` grows a notion of "review
+   trigger style" per reviewer — `comment` for augment,
+   `request` for human/team reviewers — and the GitHub impl
+   dispatches accordingly. Short term, the if-reviewer-is-augment
+   special case is enough.
+
+2. **(b) Tighten the formula's PR.5 step description to be
+   author-agnostic.** The step today reads
+   "If zero unresolved threads: advance to `pr-wait-human`.
+   Else if `review_loop_iter >= PRReviewLoopMax`: escalate.
+   Else: sling a review-fix polecat". Add an explicit sentence
+   like "Threads from ANY author count — gemini's auto-review
+   comments, augment's review, human review all trigger the
+   review-fix loop. Do not distinguish by author." A
+   substring-guard test on the parsed formula step (same
+   pattern as the Phase 4 acceptance test described in the
+   Implementation Plan) can pin this rule so a future LLM
+   interpreting the step can't silently reintroduce the
+   author-aware variant.
+
+3. **Integration test for the trigger mechanism.** An end-to-end
+   test that provisions a rig with `pr_reviewer=augment`, opens
+   a real PR, runs `gt refinery pr request-review`, and asserts
+   an `augment review` comment appears on the PR within N
+   seconds. This is the cheap test that would have caught (a)
+   before it shipped.
+
+Recommended ordering: ship (1) as a one-line fix in
+`GhPrRequestReview` so the automated loop works for the current
+Telegraph v1 run; ship (2) in the same PR as formula rule
+tightening; (3) as a follow-up PR.
+
+This is the THIRD silent gap in my B1/B2/B3/G11 stack that
+real-world dogfood has exposed. The pattern is now clear enough
+to generalize: **formula steps that embed policy (what counts,
+when to wait, which author matters) should either be expressed
+as explicit data (`pr_reviewer_trigger_style` config) or
+protected by static tests on the parsed formula text**. The
+free-form natural-language steps give the LLM too much room to
+insert its own policy, and "silent wait forever" is a frequent
+failure mode.
+
+### G13 — review-fix polecat replies to threads but never resolves them; review loop cannot converge
+
+Observed on PR #10 iter 1 (polecat furiosa, bead gt-5pk). The
+polecat correctly addressed all 3 gemini-code-assist threads:
+added `String()`/`GoString()` redaction to `ResolvedProvider`,
+added `Validate()` rejection of negative `NudgeWindow`, added
+`Validate()` rejection of enabled-but-empty `Events`. Committed
+as `419a320`, pushed to `polecat/furiosa-mo6c8x8n`, replied to
+each thread. But after `gt done` exited clean, all 4 threads on
+PR #10 (3 gemini + 1 new augment inline) were still
+`isResolved: false`.
+
+The polecat used `~/.claude/skills/address-pr-comments/scripts/respond-to-thread.mjs`
+with `--reply "..."` but without `--resolve <THREAD_ID>`. The
+skill supports both (examples at lines 149, 199, 206 of the
+skill doc show the `--reply ... --resolve` pattern), but the
+dispatch args from the refinery only said *"reply to each
+GitHub thread, then run gt done"* — they never instructed the
+polecat to resolve.
+
+**User's explicit policy (confirmed during dogfood):**
+
+> The threads should be resolved by the polecat after creating
+> fixes, there will never be an auto-resolve and there should
+> not be a requirement for help from a human in this review
+> loop.
+
+Three facts that compound to make this load-bearing:
+
+1. **No auto-resolve exists.** The gemini-code-assist bot never
+   resolves its own threads. Augment doesn't either unless
+   explicitly prompted. GitHub doesn't auto-resolve on replies
+   or on commit addressing.
+2. **The review loop's exit condition is "zero unresolved
+   threads"** (PR.5 step: "If zero unresolved threads: advance
+   to `pr-wait-human`"). If the polecat never resolves, the
+   count never drops, the loop never advances.
+3. **No human escalation inside the loop.** PR.5's only
+   escape hatch before hitting `PRReviewLoopMax` is polecat
+   success; there is no "park for human help with
+   resolution". Hitting `PRReviewLoopMax` opens an escalation
+   but that's the wrong signal — the CODE is fine, only the
+   thread-close bookkeeping isn't done.
+
+Consequence on PR #10 iter 1: furiosa's code was correct, but
+the refinery's next patrol saw 3 still-unresolved gemini threads
++ 1 augment thread that arrived mid-work, (correctly) dispatched
+iter 2 (nux) against the same bead. Iter 2 then had to redo the
+thread-resolution work. In the pessimistic case where every
+iteration replies-without-resolving, the loop burns all
+`PRReviewLoopMax` iterations, escalates, and lands a PR whose
+threads are still open — a confusing state for the human who
+gets paged.
+
+**Fix direction (three layers, most-impactful first):**
+
+1. **Refinery dispatch args MUST include "reply AND resolve"
+   wording.** Change `mol-refinery-patrol.formula.toml` PR.5's
+   sling-args template (or the template fragment that becomes
+   the `attached_args`) to explicitly read *"Commit fixes, then
+   for each thread: reply AND resolve (use
+   `respond-to-thread.mjs --reply ... --resolve <THREAD_ID>`
+   or `--commit <hash> <hash> <owner> <repo> <pr> --resolve
+   <THREAD_ID>`). Leaving a thread unresolved means the review
+   loop cannot converge; there is no human fallback for
+   resolution."* This is the load-bearing fix — the refinery
+   LLM follows the formula's review-fix template verbatim, and
+   today that template doesn't mention resolution.
+
+2. **Address-pr-comments skill doc: bold a top-of-file
+   invariant.** Add a prominent "POLECAT REVIEW-FIX
+   INVARIANT" section near the top of the skill doc that
+   reads *"When invoked by a review-fix polecat dispatch
+   (`attached_args` mentions review threads), you MUST
+   resolve every thread you address. Replying without
+   resolving leaves the review loop unable to converge — the
+   refinery has no auto-resolve and no human fallback inside
+   the loop."* Some polecats may reach the skill through
+   instruction paths that don't route through PR.5's
+   dispatch args (future formula changes, reused skill calls);
+   this invariant lives at the skill layer so it survives
+   formula rewrites.
+
+3. **Refinery PR.5 pre-dispatch sanity check.** Before
+   advancing to `pr-wait-human`, the refinery should assert
+   that the count of unresolved threads is *zero*, not just
+   "the polecat returned OK". If the polecat exited clean but
+   unresolved threads remain, that's a policy violation —
+   treat it as a failed iter (same as a non-zero exit) and
+   re-dispatch with explicit "you MUST resolve" wording. This
+   is the safety net that makes (1) and (2) load-bearing: if
+   the polecat layer ever regresses on resolution, the
+   refinery catches it immediately and re-dispatches.
+
+**Short-term action taken this session:** nudged nux (iter 2)
+and the refinery directly. Nux was already mid-work on iter 2;
+the nudge adds "also resolve each thread" to its context. The
+refinery was nudged with the policy statement above so its
+next PR.5 dispatch's sling-args will include the resolve
+wording. Both are band-aids; the permanent fix is (1)-(3)
+above.
+
+Pattern connection: G13 is the same family as G12b (LLM
+drifting from what the formula actually prescribes). The
+difference is G12b was "LLM added a policy the formula
+doesn't have", G13 is "LLM omitted a policy the formula
+*should* have but doesn't". Both argue for (a) tightening
+formula wording and (b) static tests that pin the formula
+text so future rewrites can't silently weaken the
+contract.
+
+### G14 — refinery dispatch args enumerate a paraphrased subset of unresolved threads, silently dropping one per iteration
+
+Observed on PR #10 iter 2 (polecat nux, bead gt-ag4). At
+dispatch time, `gt refinery pr threads $PR --unresolved
+--json` returned four unresolved threads (the three gemini
+threads still carrying `isResolved: false` from iter 1 plus
+one freshly-posted augment inline thread on `os.Unsetenv`).
+The refinery's PR.5 dispatch step took that JSON and
+composed a narrative `--args` payload that enumerated only
+three of the four:
+
+    Three unresolved threads on PR #10 (polecat/furiosa-mo6c8x8n):
+      1. [AUGMENT] config_test.go:218 and :268 — os.Unsetenv in t.Parallel()…
+      2. [GEMINI] ResolvedProvider.String() redaction — ALREADY FIXED in 419a320
+      3. [GEMINI] Empty events list validation — ALREADY FIXED in 419a320
+
+The fourth gemini thread (`NudgeWindow` validation) was
+ALSO already fixed in 419a320 but was omitted from the
+dispatch args entirely. Nux processed the three it was
+handed, replied-and-resolved each, ran `gt done`, and
+exited clean. The refinery's next patrol re-polled and
+found one still-unresolved thread — the dropped one — so
+it dispatched iter 3 against the same bead.
+
+That's one full iteration wasted. In the pessimistic case
+where every iter drops one thread, the loop chews through
+all `PRReviewLoopMax` iterations and escalates a PR whose
+code has been correct since iter 1, with only
+thread-resolution bookkeeping outstanding on a thread the
+polecat was never told about.
+
+Root cause: the formula text used to read
+
+    --args "Address these PR threads:
+    $THREADS" \
+
+with `$THREADS` being the full JSON. The refinery LLM,
+when acting on that step, replaced the JSON with its own
+prose summary. That's the same class of deviation as G12b
+(LLM inserts policy the formula doesn't have) and G13 (LLM
+omits policy the formula should have). Here the LLM
+substituted narrative for data — an arguably well-meaning
+"cleanup" that silently weakened the dispatch contract.
+
+Fix direction:
+
+1. **Mandate verbatim enumeration in the dispatch-args
+   template.** The formula's PR.5 step now reads "Do not
+   paraphrase it into your own list" and pins `$THREADS`
+   explicitly inside the `--args` string, so the LLM has
+   no ergonomic path to rewrite the payload. Paired with
+   the G13 mandate to pass the fresh poll result.
+
+2. **Regression test pins `$THREADS` + "do not paraphrase"
+   markers.** Same mechanism as G12b/G13 protections —
+   `TestRefineryPatrolReviewLoopEnforcesResolveAndEnumeration`
+   asserts both markers are present in the PR-mode branch
+   of the merge-push step. A future "cleanup" PR that
+   drops either marker fails the test.
+
+3. **(Follow-up)** Once the formula is stable across a few
+   real runs, consider adding a sanity check inside PR.5:
+   after dispatching, re-poll threads and compare the
+   count the polecat's task description received (parsed
+   out of the bead) against the fresh count. If they
+   differ, log a warning — the next iter will pick up the
+   missing threads, but the warning catches the drift for
+   review.
+
+Pattern connection: G14 is the third variant of the same
+underlying issue G12b and G13 point at — the refinery
+LLM treating the formula as a flexible suggestion rather
+than an invariant contract. The more the formula embeds
+policy (what counts, when to wait, what data to pass
+through), the more mechanism we need to pin that policy
+against silent rewrites. Free-form prose loses; explicit
+text + static tests + runtime sanity checks together hold
+the line.
