@@ -2,15 +2,72 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
+
+// prWorkflowCommandPatterns matches the forbidden commands this guard
+// covers. Each pattern allows the target command to appear at one of
+// three boundaries: (1) line start (possibly indented); (2) after a
+// shell command-separator operator in the set `` [|&;(`] ``
+// (backtick inclusion covers command-substitution shapes like
+// `` `gh pr create` ``, flagged in iter-1 review); (3) immediately
+// after a shell `-c` wrapper — `sh -c '...'`, `bash -lc "..."`,
+// `dash -ic '...'`, etc. The wrapper-boundary fragment accepts any
+// `-<short-opts>c` form (with `c` as the LAST short opt) to cover
+// common login-shell (`-lc`) and interactive-shell (`-ic`)
+// invocations alongside plain `-c`. Flagged in iter-2 review.
+//
+// Not covered by design (documented intentional limits rather than
+// silent gaps):
+//   - Wrappers like `env FOO=1 gh pr create` or `command gh pr
+//     create` require shell-aware parsing. The cwd+env-var-based
+//     agent context check in isGasTownAgentContext() +
+//     refineryAllowedForPR() still applies — the guard WILL block
+//     them if it fires. Expanding the regex to catch `env X=Y ...`
+//     broadens the false-positive surface (any value with `gh pr
+//     create` in it) more than the real-world benefit justifies.
+//   - Quoted-string corner cases like `echo "|| gh pr create"` can
+//     match because the boundary set `` [|&;(`] `` doesn't know it's
+//     inside a quote. Accepted: over-block on an unusual diagnostic
+//     command beats silently missing a real PR-creation.
+//
+// Patterns deliberately do NOT use a plain word boundary (\b) before
+// the command — that matches inside all quoted strings and blocks
+// too many legitimate diagnostic/logging commands.
+//
+// The -c-wrapper boundary is only applied to `gh pr create` because
+// its regex fragment would accidentally match the `-c` option of
+// `git switch -c`. Keeping the wrapper boundary scoped to the gh
+// pattern is the simplest safe option.
+var prWorkflowCommandPatterns = []*regexp.Regexp{
+	regexp.MustCompile("(?m)(^\\s*|[|&;(`]\\s*|-[a-z]*c\\s+['\"]\\s*)gh\\s+pr\\s+create\\b"),
+	regexp.MustCompile("(?m)(^\\s*|[|&;(`]\\s*)git\\s+checkout\\s+-b\\b"),
+	regexp.MustCompile("(?m)(^\\s*|[|&;(`]\\s*)git\\s+switch\\s+-c\\b"),
+}
+
+// isPRWorkflowCommand returns true when cmd looks like any of the PR-
+// creation / feature-branch commands this guard blocks.
+func isPRWorkflowCommand(cmd string) bool {
+	if cmd == "" {
+		return false
+	}
+	for _, p := range prWorkflowCommandPatterns {
+		if p.MatchString(cmd) {
+			return true
+		}
+	}
+	return false
+}
 
 var tapGuardCmd = &cobra.Command{
 	Use:   "guard",
@@ -71,6 +128,42 @@ func init() {
 }
 
 func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
+	// Read tool_input from stdin. With the catch-all `Bash` matcher
+	// in the hook config, every Bash call reaches this guard — the
+	// guard itself decides whether the specific command is relevant.
+	// Before G19b, the matcher was `Bash(gh pr create*)` + siblings;
+	// Claude Code's glob matching doesn't cross newlines, so a multi-
+	// line `gh pr create` (with a heredoc body, etc.) slipped past.
+	// Moving the pattern check inside the guard removes that
+	// fragility.
+	//
+	// Skip the stdin read entirely when stdin is a terminal — that
+	// happens when a human invokes `gt tap guard pr-workflow`
+	// directly from a shell (the G19b iter-1 review flagged this as
+	// a hang risk). Under Claude Code hooks, stdin is always a pipe
+	// carrying the hook JSON, never a terminal.
+	var command string
+	if !isStdinTerminal() {
+		input, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			// Read failure is unusual (Claude Code always provides a
+			// pipe). Fail-closed into the block-or-allow logic below;
+			// letting a real pr-workflow command slip past is worse
+			// than over-blocking a manual-invocation edge case.
+			style.PrintWarning("tap guard pr-workflow: stdin read failed (%v) — falling back to agent-context block", err)
+		} else {
+			command = extractCommand(input)
+		}
+	}
+	// Fast path: if we successfully extracted a Bash command AND that
+	// command isn't one we guard, exit clean immediately.
+	if command != "" && !isPRWorkflowCommand(command) {
+		return nil
+	}
+	// If stdin was empty/terminal (e.g. guard invoked manually for
+	// testing) or the command IS a PR-workflow command, fall through
+	// to the existing block-or-allow logic.
+
 	// Check if we're in a Gas Town agent context
 	if isGasTownAgentContext() {
 		// Exception: the refinery running for a rig configured with
