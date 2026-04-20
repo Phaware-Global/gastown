@@ -234,16 +234,22 @@ func TestRefineryPatrolReviewLoopIsPatrolResumable(t *testing.T) {
 //     gemini threads indefinitely.
 //
 //  2. **Reply AND RESOLVE** (G13). The dispatch-args template must tell
-//     the polecat to call `--resolve` (not just `--reply`). Gastown has
-//     no auto-resolve; reply-only leaves threads open; the loop cannot
-//     converge. Check that the step references `--resolve` and the
-//     `respond-to-thread.mjs` script by name.
+//     the polecat to both reply to and resolve each thread, and must
+//     state *why* (no auto-resolve). The specific markers pinned are
+//     deliberately tool-agnostic — `RESOLVE` in emphatic caps,
+//     `resolveReviewThread` (the canonical GraphQL primitive), and
+//     `auto-resolve` (the justification). A specific skill-script name
+//     is NOT pinned: polecats may have different helpers installed, so
+//     binding the test to one script would false-alarm on unrelated
+//     repo-layout changes. If a future rewrite dropped resolve semantics
+//     entirely, at least one of these three markers would disappear.
 //
 //  3. **Enumerate every thread verbatim** (G14). The --args string must
 //     reference the `$THREADS` shell variable (not paraphrase it into
 //     a narrative summary). The iter-2 dispatch in the 2026-04-19 dogfood
 //     listed 3 of 4 unresolved threads in prose form; the missing thread
-//     went to iter-3 and burned an iteration.
+//     went to iter-3 and burned an iteration. The "do not paraphrase"
+//     marker is the prose-side complement to the `$THREADS` pin.
 //
 // This test protects the formula text against silent LLM-driven rewrites
 // or future refactors that "clean up" the prose in a way that weakens
@@ -270,6 +276,16 @@ func TestRefineryPatrolReviewLoopEnforcesResolveAndEnumeration(t *testing.T) {
 	}
 	desc := mergePush.Description
 
+	// NOTE: these section markers match the existing formula text exactly.
+	// Exact-match (not regex) is deliberate — the whole point of this
+	// test is to detect rewrites of that text. A fuzzy matcher would
+	// accept rewrites like "If merge_strategy=='pr':" or a restructured
+	// section heading that silently changed the gate semantics. The
+	// trade-off is that legitimate cosmetic edits to the gate marker
+	// itself must update this test in the same commit. That's a feature:
+	// anyone touching the gate marker should re-read the invariants the
+	// test pins before shipping. If the formula refactor is large enough
+	// that these markers really need to move, update both in lockstep.
 	prBranchIdx := strings.Index(desc, `If merge_strategy = "pr":`)
 	if prBranchIdx < 0 {
 		t.Fatal("missing PR-branch gate marker")

@@ -1248,3 +1248,82 @@ doesn't have", G13 is "LLM omitted a policy the formula
 formula wording and (b) static tests that pin the formula
 text so future rewrites can't silently weaken the
 contract.
+
+### G14 — refinery dispatch args enumerate a paraphrased subset of unresolved threads, silently dropping one per iteration
+
+Observed on PR #10 iter 2 (polecat nux, bead gt-ag4). At
+dispatch time, `gt refinery pr threads $PR --unresolved
+--json` returned four unresolved threads (the three gemini
+threads still carrying `isResolved: false` from iter 1 plus
+one freshly-posted augment inline thread on `os.Unsetenv`).
+The refinery's PR.5 dispatch step took that JSON and
+composed a narrative `--args` payload that enumerated only
+three of the four:
+
+    Three unresolved threads on PR #10 (polecat/furiosa-mo6c8x8n):
+      1. [AUGMENT] config_test.go:218 and :268 — os.Unsetenv in t.Parallel()…
+      2. [GEMINI] ResolvedProvider.String() redaction — ALREADY FIXED in 419a320
+      3. [GEMINI] Empty events list validation — ALREADY FIXED in 419a320
+
+The fourth gemini thread (`NudgeWindow` validation) was
+ALSO already fixed in 419a320 but was omitted from the
+dispatch args entirely. Nux processed the three it was
+handed, replied-and-resolved each, ran `gt done`, and
+exited clean. The refinery's next patrol re-polled and
+found one still-unresolved thread — the dropped one — so
+it dispatched iter 3 against the same bead.
+
+That's one full iteration wasted. In the pessimistic case
+where every iter drops one thread, the loop chews through
+all `PRReviewLoopMax` iterations and escalates a PR whose
+code has been correct since iter 1, with only
+thread-resolution bookkeeping outstanding on a thread the
+polecat was never told about.
+
+Root cause: the formula text used to read
+
+    --args "Address these PR threads:
+    $THREADS" \
+
+with `$THREADS` being the full JSON. The refinery LLM,
+when acting on that step, replaced the JSON with its own
+prose summary. That's the same class of deviation as G12b
+(LLM inserts policy the formula doesn't have) and G13 (LLM
+omits policy the formula should have). Here the LLM
+substituted narrative for data — an arguably well-meaning
+"cleanup" that silently weakened the dispatch contract.
+
+Fix direction:
+
+1. **Mandate verbatim enumeration in the dispatch-args
+   template.** The formula's PR.5 step now reads "Do not
+   paraphrase it into your own list" and pins `$THREADS`
+   explicitly inside the `--args` string, so the LLM has
+   no ergonomic path to rewrite the payload. Paired with
+   the G13 mandate to pass the fresh poll result.
+
+2. **Regression test pins `$THREADS` + "do not paraphrase"
+   markers.** Same mechanism as G12b/G13 protections —
+   `TestRefineryPatrolReviewLoopEnforcesResolveAndEnumeration`
+   asserts both markers are present in the PR-mode branch
+   of the merge-push step. A future "cleanup" PR that
+   drops either marker fails the test.
+
+3. **(Follow-up)** Once the formula is stable across a few
+   real runs, consider adding a sanity check inside PR.5:
+   after dispatching, re-poll threads and compare the
+   count the polecat's task description received (parsed
+   out of the bead) against the fresh count. If they
+   differ, log a warning — the next iter will pick up the
+   missing threads, but the warning catches the drift for
+   review.
+
+Pattern connection: G14 is the third variant of the same
+underlying issue G12b and G13 point at — the refinery
+LLM treating the formula as a flexible suggestion rather
+than an invariant contract. The more the formula embeds
+policy (what counts, when to wait, what data to pass
+through), the more mechanism we need to pin that policy
+against silent rewrites. Free-form prose loses; explicit
+text + static tests + runtime sanity checks together hold
+the line.
