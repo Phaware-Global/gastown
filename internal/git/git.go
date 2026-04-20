@@ -1078,22 +1078,128 @@ func (g *Git) GhPrCreate(branch, base, title, body string) (int, string, error) 
 	return number, url, nil
 }
 
-// GhPrRequestReview requests reviews on a PR from the given users. Uses
-// `gh pr edit --add-reviewer` which accepts both users and @-prefixed teams.
-// A repeated request for the same reviewer is a no-op on GitHub's side.
+// buildRequestReviewArgv splits the given reviewers into the two trigger
+// modes GhPrRequestReview uses and returns the gh argv slices it will
+// execute (in order).
+//
+// Exported-for-test via unexported func + test-only access: the unit
+// test covers the reviewer classification without invoking `gh`. See
+// TestBuildRequestReviewArgv.
+//
+// Returns (commentArgv, editArgv):
+//   - commentArgv is non-nil iff "augment" (case-insensitive, after
+//     whitespace trim) is in the reviewers slice; it carries the
+//     `gh pr comment ... --body "augment review"` invocation that
+//     triggers Augment Code.
+//   - editArgv is non-nil iff at least one non-augment, non-empty
+//     reviewer remains; it carries the `gh pr edit ... --add-reviewer
+//     <csv>` invocation for humans/teams.
+//
+// Either or both may be nil; if reviewers is empty (or contains only
+// whitespace entries), both are nil.
+//
+// Reviewer normalization:
+//   - Each entry is TrimSpace'd before classification. "augment ",
+//     " augment", and "\taugment\n" all route to the comment path.
+//   - Empty-after-trim entries are dropped entirely, so callers can
+//     pass a list that includes blanks (e.g. from a config field that
+//     may be unset) without producing "alice,,bob" — which `gh pr
+//     edit --add-reviewer` rejects.
+func buildRequestReviewArgv(prNumber int, reviewers []string) (commentArgv, editArgv []string) {
+	var userReviewers []string
+	augmentRequested := false
+	for _, r := range reviewers {
+		r = strings.TrimSpace(r)
+		if r == "" {
+			continue
+		}
+		if strings.EqualFold(r, "augment") {
+			augmentRequested = true
+			continue
+		}
+		userReviewers = append(userReviewers, r)
+	}
+	if augmentRequested {
+		commentArgv = []string{"pr", "comment", fmt.Sprintf("%d", prNumber),
+			"--body", "augment review"}
+	}
+	if len(userReviewers) > 0 {
+		editArgv = []string{"pr", "edit", fmt.Sprintf("%d", prNumber),
+			"--add-reviewer", strings.Join(userReviewers, ",")}
+	}
+	return commentArgv, editArgv
+}
+
+// GhPrRequestReview requests reviews on a PR from the given users and
+// bot-style reviewers.
+//
+// Two trigger modes, selected per reviewer name:
+//
+//   - "augment" (case-insensitive, whitespace-trimmed) is the Augment
+//     Code review bot and is triggered by posting a PR comment whose
+//     body is the literal string "augment review". `gh pr edit
+//     --add-reviewer augment` does NOT trigger the bot — augment is a
+//     GitHub App, not a user, and --add-reviewer only accepts
+//     users/teams. This was the G12a dogfood finding on 2026-04-19.
+//
+//   - All other reviewer names are assumed to be GitHub users or
+//     @-prefixed teams and go through `gh pr edit --add-reviewer`.
+//     A repeated request for the same user is a no-op on GitHub's
+//     side.
+//
+// If the caller passes a mix (e.g. ["augment", "alice"]), augment gets
+// the comment, alice gets the reviewer-add.
+//
+// Execution order: comment-path first, then edit-path. This is
+// deliberate, though imperfect — the tradeoffs:
+//
+//   - If the comment-path fails: we return an error before touching
+//     reviewers. The caller sees the failure and can retry cleanly.
+//   - If the comment-path succeeds but the edit-path fails: we return
+//     the edit error, but the comment is already posted. The refinery
+//     formula's typical caller (`gt refinery pr request-review`) will
+//     propagate the error; a retry will re-post the augment comment
+//     and re-attempt the edit. The extra comment is cosmetic — Augment
+//     responds to each trigger and tolerates re-review — so comment
+//     duplication on retry is preferable to the inverse (edit succeeds
+//     but augment never gets triggered, leaving the review loop unable
+//     to converge). Augment-trigger is the critical path for the
+//     automated loop; reviewer-add is convenience metadata.
+//
+// Idempotency: neither path is idempotent in the sense of "never posts
+// a duplicate on retry". By design, the refinery re-calls this
+// function once per review-loop iteration to re-trigger augment after
+// the polecat pushes fixes, so posting "augment review" multiple times
+// across a PR's lifetime is the expected workflow — each call fires a
+// fresh review. Transient-retry dedup (e.g. "skip if an augment-review
+// comment was posted within the last 30s") is a possible follow-up if
+// operational retries prove noisy; not implemented here to keep the
+// function's behavior predictable.
 func (g *Git) GhPrRequestReview(prNumber int, reviewers []string) error {
 	if len(reviewers) == 0 {
 		return nil
 	}
-	args := []string{"pr", "edit", fmt.Sprintf("%d", prNumber),
-		"--add-reviewer", strings.Join(reviewers, ",")}
-	cmd := exec.Command("gh", args...)
-	cmd.Dir = g.workDir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("gh pr edit --add-reviewer failed: %s: %w",
-			strings.TrimSpace(string(out)), err)
+
+	commentArgv, editArgv := buildRequestReviewArgv(prNumber, reviewers)
+
+	if commentArgv != nil {
+		commentCmd := exec.Command("gh", commentArgv...)
+		commentCmd.Dir = g.workDir
+		if out, err := commentCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("gh pr comment (augment review trigger) failed: %s: %w",
+				strings.TrimSpace(string(out)), err)
+		}
 	}
+
+	if editArgv != nil {
+		cmd := exec.Command("gh", editArgv...)
+		cmd.Dir = g.workDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("gh pr edit --add-reviewer failed: %s: %w",
+				strings.TrimSpace(string(out)), err)
+		}
+	}
+
 	return nil
 }
 
