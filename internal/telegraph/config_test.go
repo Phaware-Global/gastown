@@ -215,7 +215,6 @@ func TestResolveSecret_OK(t *testing.T) {
 
 func TestResolveSecret_Missing(t *testing.T) {
 	t.Parallel()
-	os.Unsetenv("GT_TELEGRAPH_JIRA_SECRET_MISSING")
 	p := &telegraph.ProviderConfig{
 		Enabled:   true,
 		SecretEnv: "GT_TELEGRAPH_JIRA_SECRET_MISSING",
@@ -266,7 +265,6 @@ func TestResolveProviders_OK(t *testing.T) {
 
 func TestResolveProviders_MissingSecret(t *testing.T) {
 	t.Parallel()
-	os.Unsetenv("GT_TELEGRAPH_NO_SUCH_VAR")
 	cfg := telegraph.DefaultConfig()
 	cfg.Telegraph.Providers["jira"] = &telegraph.ProviderConfig{
 		Enabled:   true,
