@@ -223,6 +223,119 @@ func TestRefineryPatrolReviewLoopIsPatrolResumable(t *testing.T) {
 	}
 }
 
+// TestRefineryPatrolReviewLoopEnforcesResolveAndEnumeration pins the three
+// invariants Step PR.5's header promises and the dogfood on 2026-04-19
+// demonstrated are load-bearing:
+//
+//  1. **Author-agnostic dispatch** (G12b). The step must instruct that
+//     unresolved threads count regardless of author. Without this marker,
+//     the refinery LLM is free to reintroduce author-aware heuristics
+//     like "wait for augment's response before dispatching" that strand
+//     gemini threads indefinitely.
+//
+//  2. **Reply AND RESOLVE** (G13). The dispatch-args template must tell
+//     the polecat to call `--resolve` (not just `--reply`). Gastown has
+//     no auto-resolve; reply-only leaves threads open; the loop cannot
+//     converge. Check that the step references `--resolve` and the
+//     `respond-to-thread.mjs` script by name.
+//
+//  3. **Enumerate every thread verbatim** (G14). The --args string must
+//     reference the `$THREADS` shell variable (not paraphrase it into
+//     a narrative summary). The iter-2 dispatch in the 2026-04-19 dogfood
+//     listed 3 of 4 unresolved threads in prose form; the missing thread
+//     went to iter-3 and burned an iteration.
+//
+// This test protects the formula text against silent LLM-driven rewrites
+// or future refactors that "clean up" the prose in a way that weakens
+// the contract.
+func TestRefineryPatrolReviewLoopEnforcesResolveAndEnumeration(t *testing.T) {
+	data, err := formulasFS.ReadFile("formulas/mol-refinery-patrol.formula.toml")
+	if err != nil {
+		t.Fatalf("reading formula: %v", err)
+	}
+	f, err := Parse(data)
+	if err != nil {
+		t.Fatalf("parsing formula: %v", err)
+	}
+
+	var mergePush *Step
+	for i := range f.Steps {
+		if f.Steps[i].ID == "merge-push" {
+			mergePush = &f.Steps[i]
+			break
+		}
+	}
+	if mergePush == nil {
+		t.Fatal("merge-push step not found in mol-refinery-patrol")
+	}
+	desc := mergePush.Description
+
+	prBranchIdx := strings.Index(desc, `If merge_strategy = "pr":`)
+	if prBranchIdx < 0 {
+		t.Fatal("missing PR-branch gate marker")
+	}
+	prBranchRest := desc[prBranchIdx:]
+	prBranchEnd := len(prBranchRest)
+	for _, stopMarker := range []string{
+		"\n**Step 2: Send MERGED",
+		"\nIf merge_strategy = \"",
+	} {
+		if idx := strings.Index(prBranchRest, stopMarker); idx >= 0 && idx < prBranchEnd {
+			prBranchEnd = idx
+		}
+	}
+	prBranchDesc := prBranchRest[:prBranchEnd]
+
+	// Invariant 1: author-agnostic dispatch (G12b). The step header lists
+	// this explicitly; the threads-poll block also reaffirms it. Either
+	// marker is enough; require the stronger "regardless of" phrasing to
+	// catch rewrites that soften into vague "consider all threads".
+	authorAgnosticMarkers := []string{
+		"Author-agnostic",
+		"regardless of",
+	}
+	for _, marker := range authorAgnosticMarkers {
+		if !strings.Contains(prBranchDesc, marker) {
+			t.Errorf("PR-mode branch missing author-agnostic marker %q — dispatch may regress to per-author heuristics (G12b)",
+				marker)
+		}
+	}
+
+	// Invariant 2: reply AND resolve (G13). Check for resolve-semantics
+	// markers without prescribing a specific tool. The formula is
+	// deliberately tool-agnostic (polecats may have different skills
+	// installed); what we pin is the behavioral contract and the
+	// canonical GitHub primitive it references.
+	resolveMarkers := []string{
+		"RESOLVE",                // emphasized in prose to survive LLM summarization
+		"resolveReviewThread",    // GitHub GraphQL primitive named explicitly
+		"auto-resolve",           // the justification ("gastown has no auto-resolve")
+	}
+	for _, marker := range resolveMarkers {
+		if !strings.Contains(prBranchDesc, marker) {
+			t.Errorf("PR-mode branch missing resolve-enforcement marker %q — review-fix polecats may reply without resolving (G13)",
+				marker)
+		}
+	}
+
+	// Invariant 3: enumerate every thread verbatim (G14). The --args block
+	// must splice the polled $THREADS JSON directly, not paraphrase it.
+	// Check that $THREADS appears inside an --args string and that the
+	// step warns against narrative paraphrasing.
+	enumerationMarkers := []string{
+		"$THREADS",                  // the poll result referenced verbatim
+		"do not paraphrase",          // warning against prose substitution
+	}
+	for _, marker := range enumerationMarkers {
+		// case-insensitive contains so future capitalization tweaks don't
+		// break the test for cosmetic reasons
+		if !strings.Contains(strings.ToLower(prBranchDesc), strings.ToLower(marker)) {
+			t.Errorf("PR-mode branch missing thread-enumeration marker %q — dispatch args may drop unresolved threads (G14)",
+				marker)
+		}
+	}
+}
+
 // TestRefineryPatrolHasOrphanBranchCheck asserts the orphan-branch-check
 // step exists and contains the escalation contract.
 //

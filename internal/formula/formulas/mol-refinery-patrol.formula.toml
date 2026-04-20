@@ -901,6 +901,39 @@ up where it left off. State (iteration counter + in-flight polecat name)
 lives on the MR bead's attachment fields (`review_loop_iter`,
 `review_fix_polecat`).
 
+⚠️ **Three invariants this step MUST preserve** (each guarded by a
+regression test in `pr_workflow_integration_test.go`):
+
+1. **Author-agnostic thread counting.** Every unresolved thread counts
+   toward the dispatch decision, regardless of who opened it — gemini,
+   augment, a human, any bot. Never filter by author. Never park the
+   MR "waiting for <specific reviewer>'s response" while other
+   unresolved threads exist. If `gt refinery pr threads $PR --unresolved`
+   returns N > 0, dispatch (unless the cap is hit).
+
+2. **Reply AND RESOLVE, always.** The dispatch-args string handed to
+   the review-fix polecat MUST tell the polecat to both reply to and
+   resolve every thread it addresses (via
+   `respond-to-thread.mjs --reply "..." --resolve <THREAD_ID>` or the
+   `--commit` variant with `--resolve`). There is no auto-resolve on
+   gastown PRs: gemini bots never resolve their own threads, augment
+   only resolves its own on explicit re-review, and humans are out of
+   the loop inside PR.5. If the polecat only replies (no resolve),
+   the unresolved count stays non-zero, the loop iterates until cap,
+   and the refinery escalates a PR whose code is fine — just the
+   thread-close bookkeeping wasn't done. This is the G13 failure mode
+   from the 2026-04-19 dogfood.
+
+3. **Enumerate EVERY unresolved thread in dispatch args.** When composing
+   `--args`, the polled `$THREADS` JSON MUST appear verbatim in the
+   string — no paraphrasing into prose that silently drops threads.
+   The polecat reads `$THREADS` to know which thread IDs to address.
+   Dropping one thread from the summary means that thread stays
+   unresolved, iter increments, and the refinery re-dispatches next
+   cycle, wasting an iteration. This is the G14 failure mode from
+   the same dogfood (iter-2 dispatch listed 3 of 4 threads in
+   narrative form; the 4th thread went to iter-3).
+
 ```bash
 MR=<mr-bead-id>
 MAX={{pr_review_loop_max}}       # rig-level cap; default 3
@@ -992,7 +1025,13 @@ if [ -n "$REVIEW_FIX_POLECAT" ]; then
   esac
 fi
 
-# 3. No polecat in flight — poll unresolved threads.
+# 3. No polecat in flight — poll unresolved threads. Author-agnostic:
+# the --unresolved filter counts every open thread regardless of who
+# opened it (gemini-code-assist auto-review, augment review, human
+# review). Do NOT filter THREADS by author before the COUNT check;
+# doing so reintroduces the G12b dogfood bug where the refinery
+# parked an MR "waiting for augment" while three gemini threads sat
+# unresolved.
 THREADS=$({{ cmd }} refinery pr threads $PR --unresolved --json)
 COUNT=$(echo "$THREADS" | jq 'length')
 
@@ -1020,10 +1059,48 @@ else
   # any work happening — we'd hit the cap prematurely and escalate on
   # spurious failures. On failure we leave the state untouched; the next
   # patrol cycle retries from the same iter value.
+  # The --args string MUST satisfy two invariants from the step-header
+  # preamble. The wording here is deliberately tool-agnostic — polecats
+  # may have different skills or helpers installed; the contract is
+  # behavioral (reply AND resolve; enumerate every thread), not
+  # implementation-specific.
+  #
+  #   (a) "Reply AND RESOLVE" — the polecat must both reply to and
+  #       resolve every thread it addresses. GitHub's GraphQL
+  #       resolveReviewThread mutation is the primitive (available via
+  #       `gh api graphql` in any environment); skill-based helpers may
+  #       also be available but are not required. Reply-only leaves
+  #       threads unresolved; the loop never converges; the refinery
+  #       escalates a PR whose code is fine.
+  #
+  #   (b) "Enumerate every thread" — the polled $THREADS JSON MUST appear
+  #       verbatim inside --args. Do not paraphrase it into a narrative
+  #       list that could silently drop items. The polecat reads $THREADS
+  #       to know which thread IDs to address; a dropped ID = an
+  #       unresolved thread = a wasted iteration.
+  #
+  # Both (a) and (b) are enforced by the regression test
+  # TestRefineryPatrolReviewLoopEnforcesResolveAndEnumeration.
   POLECAT_NAME=$({{ cmd }} sling review-fix/<issue-id> {{rig}} \
     --pr $PR \
     --branch <polecat-branch> \
-    --args "Address these PR threads:
+    --args "You are a review-fix polecat for PR #$PR.
+
+For EACH unresolved thread below: (1) apply the code fix, (2) commit and
+push to the PR branch, (3) reply AND RESOLVE the thread. Use whatever
+tool you have available — GitHub's resolveReviewThread GraphQL mutation
+(via 'gh api graphql') is the canonical primitive; skill-based helpers
+are fine if present. Do NOT reply without resolving — gastown has no
+auto-resolve and the review loop cannot converge while any thread stays
+unresolved.
+
+Address every thread in the JSON below. Do not paraphrase it into your
+own list. Do not drop, skip, or filter any thread based on who authored
+it (gemini, augment, human — all count). Poll 'gt refinery pr threads
+$PR --unresolved --json' when you think you're done to verify zero
+threads remain, then run gt done.
+
+THREADS (unresolved, fresh poll at dispatch time):
 $THREADS" \
     --json | jq -r '.polecat_name // empty')
   if [ -n "$POLECAT_NAME" ]; then
