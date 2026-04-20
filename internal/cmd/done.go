@@ -1296,6 +1296,23 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			fmt.Printf("%s Work submitted to merge queue (verified)\n", style.Bold.Render("✓"))
 			fmt.Printf("  MR ID: %s\n", style.Bold.Render(mrID))
 
+			// G19c: Under merge_strategy=pr the refinery — NOT the polecat —
+			// opens the PR once it picks up the MR bead. Without this
+			// explicit callout, LLM polecats trained on GitHub-first
+			// workflows probe `gh pr list` after `gt done`, see no PR, and
+			// improvise with `gh pr create` directly. That exact sequence
+			// reproduced on slit's PR #16 (2026-04-20 Telegraph v1 L3).
+			// The tap-guard pr-workflow blocks the improvised command
+			// (G19b), but the clearer signal here prevents the LLM from
+			// reaching for it at all.
+			//
+			// Banner is config-aware: the step list matches what the rig's
+			// MergeQueue actually does. If PRReviewer is unset, the
+			// automated-review and review-fix-loop steps drop; if
+			// PRApprover is set, the approval step names the specific
+			// approver.
+			printPRModeNextSteps(townRoot, rigName)
+
 			// NOTE: Refinery nudge is deferred to AFTER the Dolt branch merge
 			// (see post-merge nudge below). Nudging here would race with the
 			// merge — refinery wakes up and queries main before the polecat's
@@ -2200,4 +2217,55 @@ func purgeClosedEphemeralBeads(bd *beads.Beads) {
 	if outStr != "" && outStr != "0" {
 		fmt.Fprintf(os.Stderr, "Purged closed ephemeral beads: %s\n", outStr)
 	}
+}
+
+// printPRModeNextSteps emits the "what happens next" banner that
+// follows a successful MR-bead submission under merge_strategy=pr.
+// The goal is to STOP an LLM polecat from improvising a manual
+// `gh pr create` after `gt done` — the G19c failure mode from the
+// 2026-04-20 Telegraph v1 dogfood.
+//
+// No-op when the rig config can't be loaded or merge_strategy is
+// not "pr". Step list is config-aware: reviewer/approver names are
+// substituted from the rig's MergeQueueConfig so the banner matches
+// the workflow the specific rig actually runs. If PRReviewer is
+// empty the automated-review step is dropped; if PRApprover is
+// empty the approval step becomes generic.
+//
+// Extracted from the inline block at the call site so (1) the logic
+// is testable in isolation, and (2) the iter-1 review's "a bare
+// `{...}` scope is not idiomatic Go" concern is resolved.
+func printPRModeNextSteps(townRoot, rigName string) {
+	settingsPath := filepath.Join(townRoot, rigName, "settings", "config.json")
+	rigSettings, err := config.LoadRigSettings(settingsPath)
+	if err != nil || rigSettings.MergeQueue == nil {
+		return
+	}
+	mq := rigSettings.MergeQueue
+	if mq.MergeStrategy != "pr" {
+		return
+	}
+
+	fmt.Println()
+	fmt.Printf("%s This rig is on merge_strategy=pr. The refinery will:\n", style.Bold.Render("→"))
+	step := 1
+	fmt.Printf("    %d. Pick up your MR bead on its next patrol\n", step)
+	step++
+	fmt.Printf("    %d. Open the GitHub PR for your branch\n", step)
+	step++
+	if mq.PRReviewer != "" {
+		fmt.Printf("    %d. Trigger automated review (%s)\n", step, mq.PRReviewer)
+		step++
+		fmt.Printf("    %d. Drive the review-fix loop if needed\n", step)
+		step++
+	}
+	if mq.PRApprover != "" {
+		fmt.Printf("    %d. Wait for approval from %s and merge\n", step, mq.PRApprover)
+	} else {
+		fmt.Printf("    %d. Wait for the configured approver and merge\n", step)
+	}
+	fmt.Println()
+	fmt.Println("  DO NOT run `gh pr create` yourself — the refinery owns PR")
+	fmt.Println("  creation. Your work is complete; exit cleanly. The tap-guard")
+	fmt.Println("  will block any manual PR-creation attempt regardless.")
 }
