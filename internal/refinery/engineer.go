@@ -2285,23 +2285,21 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 
 // notifyConvoyCompletion sends notifications to convoy owner and notify addresses.
 //
-// Dispatch goes through e.mailSender (MailSender interface) so tests can
-// inject a memory-backed impl. The convoy-completion path was historically
-// the second subprocess-fork mail site in the refinery; like the MERGED-
-// to-mayor path, it contributes to the G10 test-pollution flood when
-// batch_test.go or similar exercises convoy logic.
-//
-// townRoot is accepted but no longer used to cd a subprocess — kept in the
-// signature for call-site stability; future refactor can drop it.
+// Dispatch goes through e.mailSender.SendWithOptions so we can pass
+// townRoot as the per-call WorkDir. That preserves the pre-refactor
+// semantics: the production (exec) impl runs `gt mail send` from the
+// town root so addresses without a rig scope (mayor/, witness/, etc.)
+// resolve via the town-level workspace rather than the engineer's
+// rig-scoped default cwd. The memory (test) impl ignores WorkDir.
 func (e *Engineer) notifyConvoyCompletion(townRoot, convoyID, title, description string) {
-	_ = townRoot // kept for call-site compatibility; exec path removed
 	// ZFC: Use typed accessor instead of parsing description text
 	fields := beads.ParseConvoyFields(&beads.Issue{Description: description})
 	for _, addr := range fields.NotificationAddresses() {
 		subject := fmt.Sprintf("🚚 Convoy landed: %s", title)
 		body := fmt.Sprintf("Convoy %s has completed.\n\nAll tracked issues are now closed.\n\nClosed by: %s/refinery",
 			convoyID, e.rig.Name)
-		if err := e.mailSender.Send(context.Background(), addr, subject, body, false); err != nil {
+		opts := MailSendOptions{WorkDir: townRoot}
+		if err := e.mailSender.SendWithOptions(context.Background(), addr, subject, body, opts); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not notify %s: %v\n", addr, err)
 		}
 	}

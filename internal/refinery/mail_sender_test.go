@@ -131,3 +131,35 @@ func TestExecMailSender_ConstructorPreservesWorkDir(t *testing.T) {
 		t.Errorf("workDir = %q; want %q", s.workDir, wd)
 	}
 }
+
+// TestMemoryMailSender_SendWithOptionsCapturesPermanent verifies the
+// extended-options entry point on the memory impl. WorkDir is
+// deliberately NOT recorded in the envelope — it's a cwd hint for
+// the exec impl only — but the Permanent flag from opts must flow
+// through so convoy-path tests can assert permanent=false semantics
+// (the convoy notification is not permanent, unlike the MERGED
+// notification to mayor which is).
+func TestMemoryMailSender_SendWithOptionsCapturesPermanent(t *testing.T) {
+	s := newMemoryMailSender()
+	ctx := context.Background()
+
+	if err := s.SendWithOptions(ctx, "crew/alice", "subj1", "body1",
+		MailSendOptions{WorkDir: "/town/root", Permanent: false}); err != nil {
+		t.Fatalf("SendWithOptions: %v", err)
+	}
+	if err := s.SendWithOptions(ctx, "mayor/", "subj2", "body2",
+		MailSendOptions{WorkDir: "/town/root", Permanent: true}); err != nil {
+		t.Fatalf("SendWithOptions: %v", err)
+	}
+
+	got := s.Sent()
+	if len(got) != 2 {
+		t.Fatalf("got %d envelopes; want 2", len(got))
+	}
+	if got[0].Permanent {
+		t.Errorf("envelope[0].Permanent = true; want false")
+	}
+	if !got[1].Permanent {
+		t.Errorf("envelope[1].Permanent = false; want true")
+	}
+}

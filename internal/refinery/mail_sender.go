@@ -48,6 +48,26 @@ func defaultMailSender(workDir string) MailSender {
 	return newExecMailSender(workDir)
 }
 
+// MailSendOptions carries optional per-call overrides. Zero-value
+// defaults reproduce the primary Send path; callers set fields only
+// for the rare cases that need to differ from the sender's defaults.
+type MailSendOptions struct {
+	// Permanent requests durable (non-wisp) delivery. The receiving
+	// mailbox keeps the message indefinitely; the sender's inbox
+	// subscription still gets an auto-nudge on receipt.
+	Permanent bool
+
+	// WorkDir overrides the cwd the production (exec) impl runs
+	// `gt mail send` in. When empty, the sender's configured default
+	// is used. Set this when the message targets a mailbox that the
+	// sender's default cwd might not resolve to — e.g. convoy-
+	// completion notifications going to town-level subscribers when
+	// the Engineer is configured with a rig-level workDir.
+	// The memory (test) impl ignores this field; envelope capture
+	// doesn't depend on filesystem resolution.
+	WorkDir string
+}
+
 // MailSender abstracts the refinery's outbound mail path so tests can
 // swap in a non-exec impl.
 //
@@ -85,7 +105,19 @@ func defaultMailSender(workDir string) MailSender {
 // etc.), extend Send's signature or add a sibling method rather than
 // fattening this up speculatively.
 type MailSender interface {
+	// Send delivers a mail with the sender's configured defaults.
+	// The permanent flag maps to `gt mail send --permanent` in the
+	// exec impl; the memory impl records it on the envelope.
 	Send(ctx context.Context, to, subject, body string, permanent bool) error
+
+	// SendWithOptions delivers a mail with per-call overrides. Use
+	// this when a specific message needs a cwd that differs from the
+	// sender's default (e.g. convoy notifications targeting
+	// town-level mailboxes from a rig-scoped sender). The Permanent
+	// field in MailSendOptions takes precedence over any legacy
+	// permanent flag — callers should prefer SendWithOptions when
+	// setting WorkDir so both dimensions stay in one struct.
+	SendWithOptions(ctx context.Context, to, subject, body string, opts MailSendOptions) error
 }
 
 // execMailSender is the default production MailSender. It preserves the
@@ -109,13 +141,24 @@ func newExecMailSender(workDir string) *execMailSender {
 // to the caller as a wrapped error that includes stdout/stderr so the
 // caller can log a useful message.
 func (s *execMailSender) Send(ctx context.Context, to, subject, body string, permanent bool) error {
+	return s.SendWithOptions(ctx, to, subject, body, MailSendOptions{Permanent: permanent})
+}
+
+// SendWithOptions honors opts.WorkDir (overriding the sender's default
+// cwd for this call only) and opts.Permanent. Other fields of
+// MailSendOptions extend in the future without breaking the simpler
+// Send signature.
+func (s *execMailSender) SendWithOptions(ctx context.Context, to, subject, body string, opts MailSendOptions) error {
 	args := []string{"mail", "send", to, "-s", subject, "-m", body}
-	if permanent {
+	if opts.Permanent {
 		args = append(args, "--permanent")
 	}
 	cmd := exec.CommandContext(ctx, "gt", args...)
 	util.SetDetachedProcessGroup(cmd)
 	cmd.Dir = s.workDir
+	if opts.WorkDir != "" {
+		cmd.Dir = opts.WorkDir
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		// Avoid a double-colon error message when stdout/stderr is empty
@@ -160,14 +203,21 @@ func newMemoryMailSender() *memoryMailSender {
 }
 
 // Send captures the envelope and returns nil. No subprocess, no network.
-func (s *memoryMailSender) Send(_ context.Context, to, subject, body string, permanent bool) error {
+func (s *memoryMailSender) Send(ctx context.Context, to, subject, body string, permanent bool) error {
+	return s.SendWithOptions(ctx, to, subject, body, MailSendOptions{Permanent: permanent})
+}
+
+// SendWithOptions captures the envelope including opts.Permanent. The
+// WorkDir field is deliberately not recorded — it's a cwd hint for the
+// exec impl only, not something test assertions need to inspect.
+func (s *memoryMailSender) SendWithOptions(_ context.Context, to, subject, body string, opts MailSendOptions) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sent = append(s.sent, MailEnvelope{
 		To:        to,
 		Subject:   subject,
 		Body:      body,
-		Permanent: permanent,
+		Permanent: opts.Permanent,
 	})
 	return nil
 }
