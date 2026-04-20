@@ -103,10 +103,13 @@ func TestCostTierRoleAgents(t *testing.T) {
 		if ra == nil {
 			t.Fatal("budget tier returned nil")
 		}
+		// Witness is sonnet on Budget despite the tier name — liveness
+		// heuristics over-fire on haiku (G6/G18). See the inline
+		// comment on the TierBudget branch in CostTierRoleAgents.
 		expected := map[string]string{
 			"mayor":    "claude-sonnet",
 			"deacon":   "claude-haiku",
-			"witness":  "claude-haiku",
+			"witness":  "claude-sonnet",
 			"refinery": "claude-haiku",
 			"polecat":  "claude-sonnet",
 			"crew":     "claude-sonnet",

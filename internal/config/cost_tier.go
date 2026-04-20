@@ -14,7 +14,10 @@ const (
 	TierStandard CostTier = "standard"
 	// TierEconomy uses sonnet/haiku for patrol roles, keeps opus for workers.
 	TierEconomy CostTier = "economy"
-	// TierBudget uses haiku/sonnet for patrols, sonnet for workers.
+	// TierBudget uses haiku for deacon/refinery patrols, sonnet for
+	// witness (reliability — witness liveness heuristics mis-fire on
+	// haiku, see G6/G18 in docs/design/refinery-pr-workflow.md), and
+	// sonnet for mayor + polecat + crew.
 	TierBudget CostTier = "budget"
 	// TierCustomGroqOpus routes patrol/utility roles to Groq Compound (fast +
 	// cheap) while keeping Opus for mayor and crew (quality-critical work).
@@ -89,7 +92,14 @@ func CostTierRoleAgents(tier CostTier) map[string]string {
 		return map[string]string{
 			"mayor":    "claude-sonnet",
 			"deacon":   "claude-haiku",
-			"witness":  "claude-haiku",
+			// Witness is sonnet even on Budget tier — its liveness
+			// heuristics over-fire on haiku (G6: nuking actively-working
+			// polecats on INSERT-mode scrape; G18: HIGH-severity
+			// false-positive "refinery session dead" during normal
+			// thinking). The cost delta is minor; the operational cost
+			// of the false-positives (destructive action, inbox noise
+			// drowning real signals) is not worth the savings.
+			"witness":  "claude-sonnet",
 			"refinery": "claude-haiku",
 			"polecat":  "claude-sonnet",
 			"crew":     "claude-sonnet",
@@ -373,7 +383,7 @@ func TierDescription(tier CostTier) string {
 	case TierEconomy:
 		return "Patrol roles use Sonnet/Haiku, workers use Opus"
 	case TierBudget:
-		return "Patrol roles use Haiku, workers use Sonnet"
+		return "Deacon/Refinery use Haiku; Witness, Mayor, Polecat, Crew use Sonnet"
 	case TierCustomGroqOpus:
 		return "Mayor/Crew → Claude Opus; Deacon/Witness/Refinery/Polecat/Boot/Dog → Groq compound-beta"
 	case TierCustomGroqSonnet:
