@@ -1438,3 +1438,123 @@ verbatim. That's arguably a sub-issue worth a follow-up
 (expand match to also accept `augmentcode` case-
 insensitively, and/or pin the rig-config value through
 to the subcommand without LLM reshaping).
+
+### G16 — Telegraph L1/L2/L3 dispatch stamps `merge_strategy: mr` on work beads despite rig being `pr`
+
+Observed 2026-04-20 ~03:17Z after restarting gastown with v1.0.0-99-gc3aac53b
+(post-G12–G14 binary). Mayor dispatched three child work items for the
+Telegraph v1 epic (gt-d0t / L1 HTTP webhook, gt-458 / L2 Jira translator,
+gt-ahf / L3 mail envelope). All three work beads were created with the
+same shape of attached fields:
+
+    attached_vars: ["base_branch=main","test_command=go test ./...","merge_strategy=pr","require_review=true"]
+    ...
+    merge_strategy: mr
+
+The `attached_vars` carry the correct rig-level strategy (`pr`), but the
+top-level `merge_strategy` attachment field on the bead is stamped
+`mr` — the old direct-merge flow identifier. This is the same class of
+gap as #3320: the dispatch path knows the rig intends PR-mode
+(attached_vars reflect it), but the structured merge_strategy field
+recorded on the bead says otherwise. Any downstream code that reads
+`attachmentFields.MergeStrategy` instead of the rig config will take
+the direct-merge branch.
+
+Likely root cause: the dispatch code (`gt sling` or a similar helper
+invoked by the mayor) has two writes of merge_strategy — one into
+`attached_vars` from the formula template, one as a direct attachment
+field — and the second isn't being updated under the G12 stack's
+changes. The G11 fix to `gt done` checks the rig config directly, not
+the bead's attachment, so G11 is unaffected; but any other code that
+reads the bead's attachment gets the wrong answer.
+
+Fix direction: audit every write-site of `merge_strategy` in the
+dispatch path (`internal/cmd/sling*.go`, the mayor's dispatch helpers)
+and ensure the bead's stored `merge_strategy` attachment matches the
+rig config at dispatch time. Add a regression test that slings a work
+item in a `merge_strategy=pr` rig and asserts the bead's stored
+attachment is `pr`, not `mr`.
+
+### G17 — `gt done` under `merge_strategy=pr` closes the work bead without creating an MR bead or PR; work strands on origin
+
+Observed in the same Telegraph v1 dispatch as G16. After L1 (furiosa
+on polecat/furiosa-mo6miet2) and L2 (nux on polecat/nux-mo6mj4rx)
+polecats completed their implementation work (434 LOC and 682 LOC
+respectively, committed under the gt-pvx safety-net commit label
+which covers real implementation despite the misleading name), both
+polecats ran `gt done`. Outcome:
+
+- Both branches exist on origin with real work.
+- Both work beads (gt-d0t, gt-458) are CLOSED with reason "Closed" (no
+  detail).
+- `bd list --all -l gt:merge-request` returns zero results — no MR
+  bead was ever created for either branch.
+- `gh pr list --state all` shows no PR for either branch.
+- The polecat sessions' own recap says "Work is pushed and in the
+  merge queue; no further action needed" — a claim the state
+  contradicts.
+- The refinery's patrol reports "queue empty, no pending work" — which
+  is true, and also the bug: the queue never saw gt-d0t or gt-458.
+
+Only L3 (slit on polecat/slit-mo6mjs8m, gt-ahf) produced PR #16,
+which is the happy path I expected for all three.
+
+Three polecats, same dispatch path, same formula, but two of three
+never emitted an MR bead. That's a real-world reliability delta the
+test matrix for PR #11 (G11 fix) didn't surface.
+
+Candidate root causes:
+
+1. **G16 downstream effect.** If `gt done` reads
+   `attachmentFields.MergeStrategy` (= `mr` from G16) instead of the
+   rig config, it takes a direct-merge code path that assumes someone
+   else creates the MR bead. For direct-merge that's the refinery's
+   merge-push step; under pr-mode that step never fires, so nothing
+   creates an MR bead. The bead closes cleanly, the orphan branch
+   sits on origin, and the epic's blocks-chain unblocks (G3) even
+   though nothing landed on main.
+2. **Mail-flood collateral.** G10's subprocess mail flood was active
+   during the L1/L2 polecat work windows (furiosa and nux each ran
+   `go test ./...`). If the mayor / refinery mistakenly treated the
+   flood of MERGED mails as real completions for some MR IDs, the
+   expected MR-bead-create path in `gt done` might have early-exited
+   on a "MR already exists" check — without the MR actually being
+   real. L3 (slit) didn't run the polluting test suite (its pane
+   shows no test-suite execution), which is why L3 produced a real
+   PR.
+3. **orphan-branch-check didn't fire after restart.** PR #8 added
+   escalation when a polecat branch exists on origin without an MR
+   bead. After the restart, the refinery has been idle-reporting
+   "queue empty" without scanning for orphan branches. Either the
+   step is skipping on abbreviated-patrol cycles (G7 pattern) or
+   it's running but not detecting these specific branches.
+
+Fix direction:
+
+1. **Diagnose first**: add a `gt done` verbose/debug mode that logs
+   which merge_strategy it reads (bead vs rig), whether it creates
+   an MR bead, and the resulting state. Re-run the same dispatch
+   (gt sling gt-XXX gastown under the Telegraph rig) and capture
+   the trace. That separates G16-downstream from mail-flood
+   collateral without guessing.
+2. **Regression coverage**: an integration test that dispatches a
+   polecat under merge_strategy=pr, lets it exit via gt done
+   normally (not the no_merge path), and asserts an MR bead exists
+   for its branch. That test would fail on the current codebase.
+3. **Self-healing**: if gt done detects `merge_strategy=pr` and
+   finds no MR bead was created (and no_merge is false), escalate
+   directly from the polecat rather than exiting clean. Loud-fail
+   beats silent-strand.
+4. **Orphan-branch escalation coverage**: the refinery's
+   orphan-branch-check should run on every patrol cycle, abbreviated
+   or not. Adding a second test (beyond G7's test) that asserts
+   orphan-branch-check is listed as REQUIRED in abbreviated-patrol
+   mode would catch future regressions.
+
+Pattern: G16 + G17 together rhyme with the original G1 incident
+(refinery improvises merge when MR bead creation fails). The
+failure mode has moved one layer — MR bead creation is now failing
+silently inside gt done rather than loud-erroring in bd create —
+but the consequence is the same: work sits on an origin branch, a
+bead records "done", downstream unblocks, and nothing actually
+lands.
