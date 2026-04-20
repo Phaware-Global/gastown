@@ -118,8 +118,14 @@ func (s *execMailSender) Send(ctx context.Context, to, subject, body string, per
 	cmd.Dir = s.workDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("gt mail send to %q failed: %s: %w",
-			to, strings.TrimSpace(string(out)), err)
+		// Avoid a double-colon error message when stdout/stderr is empty
+		// (common for some exec failure modes). Format with or without
+		// the output snippet as appropriate.
+		trimmed := strings.TrimSpace(string(out))
+		if trimmed == "" {
+			return fmt.Errorf("gt mail send to %q failed: %w", to, err)
+		}
+		return fmt.Errorf("gt mail send to %q failed: %s: %w", to, trimmed, err)
 	}
 	return nil
 }

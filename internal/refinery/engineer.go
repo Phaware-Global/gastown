@@ -375,8 +375,17 @@ func NewEngineer(r *rig.Rig) *Engineer {
 // SetMailSender overrides the Engineer's mail-send path. Intended for
 // tests: inject a memoryMailSender so `go test` does not fork a
 // `gt mail send` subprocess and flood the real mayor. Production code
-// should not call this — the default (execMailSender) is correct.
+// should not call this — the default (chosen by defaultMailSender
+// based on runtime context) is correct.
+//
+// Nil input is treated as "reset to default" rather than a literal
+// nil — storing nil would cause a panic in HandleMRInfoSuccess /
+// notifyConvoyCompletion, and there's no legitimate use case for
+// a no-op sender that isn't already covered by memoryMailSender.
 func (e *Engineer) SetMailSender(s MailSender) {
+	if s == nil {
+		s = defaultMailSender(e.workDir)
+	}
 	e.mailSender = s
 }
 

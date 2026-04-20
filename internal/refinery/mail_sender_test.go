@@ -3,8 +3,6 @@ package refinery
 import (
 	"context"
 	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -13,16 +11,24 @@ import (
 // stops recognizing the `.test` suffix, every refinery test would
 // silently revert to subprocess-forking `gt mail send` and the G10
 // flood would resurface on the next `go test` run.
+//
+// The subtests exercise runningAsTestBinary() itself (not a mirror of
+// its logic) by swapping os.Args[0] through t.Cleanup. NOT
+// t.Parallel-safe — os.Args is process-global — but the rest of the
+// refinery package doesn't run subtests concurrently with this one,
+// and the cleanup restores argv before the test returns.
 func TestRunningAsTestBinary(t *testing.T) {
-	// We are, in fact, running as a test binary right now.
+	// Sanity: we are, in fact, running as a test binary right now.
 	if !runningAsTestBinary() {
 		t.Errorf("runningAsTestBinary() = false in a test; expected true (os.Args[0]=%q)", os.Args[0])
 	}
 
-	// Extra coverage for path-prefixed and Windows forms, via a
-	// standalone check that mirrors the same suffix rule. We can't
-	// rewrite os.Args without racing other tests in this package, so
-	// exercise the suffix check directly on the constants.
+	if len(os.Args) == 0 {
+		t.Skip("os.Args is empty — can't exercise argv swap")
+	}
+	orig := os.Args[0]
+	t.Cleanup(func() { os.Args[0] = orig })
+
 	for _, tc := range []struct {
 		name string
 		arg0 string
@@ -36,10 +42,11 @@ func TestRunningAsTestBinary(t *testing.T) {
 		{"unrelated with 'test' in middle", "foo.testing", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			base := filepath.Base(tc.arg0)
-			got := strings.HasSuffix(base, ".test") || strings.HasSuffix(base, ".test.exe")
+			os.Args[0] = tc.arg0
+			got := runningAsTestBinary()
 			if got != tc.want {
-				t.Errorf("suffix check on %q (base=%q) = %v; want %v", tc.arg0, base, got, tc.want)
+				t.Errorf("runningAsTestBinary() with os.Args[0]=%q = %v; want %v",
+					tc.arg0, got, tc.want)
 			}
 		})
 	}
