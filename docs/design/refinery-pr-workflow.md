@@ -1328,3 +1328,113 @@ through), the more mechanism we need to pin that policy
 against silent rewrites. Free-form prose loses; explicit
 text + static tests + runtime sanity checks together hold
 the line.
+
+### G15 — `gt down` purges embedded Dolt; restart with a newer binary then hits schema drift that blocks patrols
+
+Observed when restarting gastown on 2026-04-20 after the
+stack merge (PR #12–#15). The stop sequence I ran earlier
+was `cd ~/gt && gt down`, which terminated services *and*
+executed `Beads dolt dirs: removed 1` on the embedded
+Dolt directory. Intended behavior per the `gt down`
+output, but load-bearing data went with it:
+
+- `gt-idw` (the MR bead tracking PR #10, backfilled
+  manually during the G11 session) was gone on restart.
+  `bd list --all --label gt:merge-request` returned "No
+  issues found" in the rig DB. Without the MR bead, the
+  refinery's `gt mq list gastown` is empty; PR #10 never
+  re-enters the queue; the review/merge path has no
+  handle to pick it up.
+- Mayor's post-restart hook queries began failing with
+  `column started_at could not be found in any table in
+  scope`, escalated as hq-s2l: *"bd list --json
+  --status=hooked returns error. Hook cannot be read.
+  Refinery patrol blocked."*. Mayor then nudged the
+  refinery: *"Hook query failure is schema drift in
+  gastown Dolt DB (missing started_at column), not
+  transient. Hold patrol. Investigating infra fix."* The
+  refinery is parked on that instruction until the schema
+  drift is fixed.
+
+Two distinct problems surfaced by one `gt down`:
+
+1. **Data-loss on stop.** `gt down` purges embedded Dolt
+   directories for rigs that appear to be "only" holding
+   ephemeral state, but merge-request beads (created by
+   `gt done`'s handoff or backfilled manually) live in
+   that same Dolt. When those beads disappear between
+   `gt down` and `gt up`, the refinery loses its map of
+   in-flight PRs. The workflow has no recovery path to
+   re-synthesize gt-idw from origin state — it would
+   have to be re-backfilled by hand.
+
+2. **Schema drift on restart with newer binary.** The gt
+   binary from this stack (v1.0.0-99-gc3aac53b) expects
+   a Dolt schema where the hooks/wisps table has a
+   `started_at` column. The existing Dolt DB doesn't
+   carry that column. The mismatch surfaces on the very
+   first `bd list --json --status=hooked` query that the
+   mayor/refinery runs. No automatic migration fires on
+   binary-upgrade, and the older DB on disk survived the
+   `Beads dolt dirs: removed 1` (evidently only the
+   *removed* rig dolt dir was purged; another subsystem
+   carries the schema I'm hitting).
+
+Fix direction (each standalone; this section lives as a
+follow-up for whoever picks up the infra side):
+
+1. **Make `gt down` conservative about Dolt purges.**
+   Before removing a `.beads/embeddeddolt` directory,
+   snapshot any `gt:merge-request`-labeled beads whose
+   corresponding branch still exists on origin and
+   which have `review_pr` set — those are in-flight PRs
+   the refinery owns. Either refuse to remove them,
+   exit non-zero with a prompt, or export them to a
+   JSON that a subsequent `gt up` auto-imports.
+
+2. **Schema migration on binary upgrade.** `gt up` /
+   service start should detect schema-version drift
+   between the binary's expected schema and the
+   on-disk Dolt schema and run migrations before the
+   first query fires. If migration isn't safe (data
+   loss risk), exit loud with instructions rather than
+   letting the mayor/refinery hit failing queries in a
+   loop.
+
+3. **Refinery self-recovery from missing MR beads.**
+   Orthogonal to G15 but highlighted by it: when the
+   refinery finds a polecat branch on origin with an
+   open PR but no MR bead, the formula today has an
+   `orphan-branch-check` step that escalates. Under
+   merge_strategy=pr, that escalation could
+   alternatively *synthesize* an MR bead (same content
+   as G11's `handoffPRToRefinery` backfill) rather
+   than requiring manual backfill. Not load-bearing;
+   quality-of-life.
+
+Status for the Telegraph v1 dogfood: PR #10's four review
+threads are all resolved as of 2026-04-20 (the NudgeWindow
+thread `58Dm_p` closed in the time between `gt down` and
+`gt up` — possibly by a post-hoc resolve that hit before
+the Dolt purge; exact attribution unclear). The PR itself
+is open, approvable, and mergeable; it just needs a human
+(kevinpjones) to review and merge because the automated
+escalation path from refinery → mayor mail requires the
+patrol cycle to fire, which schema drift is blocking. The
+workflow fixes from this stack (G12a / G12b / G13 / G14
+plus the memory-write guard and findMRForBranch robust
+dedup) are all in the binary on disk at
+`~/.local/bin/gt`; they'll exercise against the next MR
+the refinery processes once schema drift is resolved.
+
+Binary-level verification seen this restart:
+`gt refinery pr request-review 10 --user augmentcode` was
+called by the patrol — the new GhPrRequestReview code
+path executed, though the refinery LLM substituted
+`augmentcode` for `augment` in the args, sidestepping the
+case-insensitive "augment" match. So the code is live but
+only protects the name the formula / rig config passes
+verbatim. That's arguably a sub-issue worth a follow-up
+(expand match to also accept `augmentcode` case-
+insensitively, and/or pin the rig-config value through
+to the subcommand without LLM reshaping).
