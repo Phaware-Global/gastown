@@ -27,6 +27,15 @@ func (b *Beads) FindMRForBranchAny(branch string) (*Issue, error) {
 // Returns nil if no MR matches both branch and SHA. Callers should create a
 // new MR in that case and supersede old MRs for the same source issue.
 func (b *Beads) FindMRForBranchAndSHA(branch, commitSHA string) (*Issue, error) {
+	// Reject empty branch input. Otherwise an MR bead whose description
+	// parses successfully (has other MR fields) but lacks a branch: field
+	// would have fields.Branch == "" and match branch == "", returning a
+	// spurious "found" result. Callers always pass a real branch name;
+	// fail fast if they don't.
+	if branch == "" {
+		return nil, nil
+	}
+
 	issues, err := b.ListMergeRequests(ListOptions{
 		Status: "all",
 		Label:  "gt:merge-request",
@@ -94,7 +103,16 @@ func (b *Beads) findMRForBranch(branch string, skipClosed bool) (*Issue, error) 
 // semantics (one MR per branch) instead of an accidental encoding of it.
 //
 // Returns nil if no MR matches.
+//
+// Empty-branch input is rejected outright. Otherwise an MR bead whose
+// description parses successfully (has other MR fields) but lacks a
+// branch: field would have fields.Branch == "" and accidentally match
+// branch == "". Callers always pass a real branch name; fail fast if
+// they don't.
 func pickMRForBranch(issues []*Issue, branch string, skipClosed bool) *Issue {
+	if branch == "" {
+		return nil
+	}
 	for _, issue := range issues {
 		if skipClosed && issue.Status == "closed" {
 			continue

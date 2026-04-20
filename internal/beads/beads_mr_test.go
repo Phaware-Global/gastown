@@ -163,6 +163,19 @@ func TestPickMRForBranch(t *testing.T) {
 			"polecat/foo", true, "",
 		},
 		{
+			// Without the empty-branch guard, an MR whose description parses
+			// but has no branch: line would have fields.Branch == "" and
+			// accidentally match an empty branch argument.
+			"empty branch input — MR lacks branch field — guard returns nil",
+			[]*Issue{mk("gt-e1", noBranchDesc, "open")},
+			"", true, "",
+		},
+		{
+			"empty branch input — MR has branch field — guard still returns nil",
+			[]*Issue{mk("gt-e2", standardDesc, "open")},
+			"", true, "",
+		},
+		{
 			"closed match excluded when skipClosed=true",
 			[]*Issue{mk("gt-10", standardDesc, "closed")},
 			"polecat/foo", true, "",
