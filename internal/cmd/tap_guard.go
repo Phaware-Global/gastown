@@ -18,42 +18,39 @@ import (
 // prWorkflowCommandPatterns matches the forbidden commands this guard
 // covers. Each pattern allows the target command to appear at one of
 // three boundaries: (1) line start (possibly indented); (2) after a
-// shell command-separator operator (|, &&, ||, ;, (, or `` ` ``); (3)
-// immediately after a `-c '` or `-c "` wrapper (sh -c / bash -c /
-// dash -c). The backtick inclusion covers command substitution like
-// `` `gh pr create` ``, which the 2026-04-20 iter-1 review flagged as
-// an escape hatch.
+// shell command-separator operator in the set `` [|&;(`] ``
+// (backtick inclusion covers command-substitution shapes like
+// `` `gh pr create` ``, flagged in iter-1 review); (3) immediately
+// after a shell `-c` wrapper — `sh -c '...'`, `bash -lc "..."`,
+// `dash -ic '...'`, etc. The wrapper-boundary fragment accepts any
+// `-<short-opts>c` form (with `c` as the LAST short opt) to cover
+// common login-shell (`-lc`) and interactive-shell (`-ic`)
+// invocations alongside plain `-c`. Flagged in iter-2 review.
 //
 // Not covered by design (documented intentional limits rather than
 // silent gaps):
 //   - Wrappers like `env FOO=1 gh pr create` or `command gh pr
-//     create` require shell-aware parsing; a polecat LLM reaching for
-//     those to bypass is already an adversarial-ish scenario and the
-//     cwd-based + env-var-based guard in isGasTownAgentContext() +
+//     create` require shell-aware parsing. The cwd+env-var-based
+//     agent context check in isGasTownAgentContext() +
 //     refineryAllowedForPR() still applies — the guard WILL block
-//     them if it fires, and the matcher-side gap is the only risk.
-//     Expanding the regex to catch `env X=Y ...` broadens the
-//     false-positive surface (any value with `gh pr create` in it)
-//     more than the real-world benefit justifies.
+//     them if it fires. Expanding the regex to catch `env X=Y ...`
+//     broadens the false-positive surface (any value with `gh pr
+//     create` in it) more than the real-world benefit justifies.
 //   - Quoted-string corner cases like `echo "|| gh pr create"` can
-//     technically still match because the `[|&;(]` boundary doesn't
-//     know it's inside a quote. Accepted: the failure mode is an
-//     over-block on an unusual diagnostic command, which is
-//     preferable to silently letting a real PR-creation slip by.
-//     The original justification against \b was to avoid quoted-
-//     string blocks; we're stricter than \b but not shell-aware.
+//     match because the boundary set `` [|&;(`] `` doesn't know it's
+//     inside a quote. Accepted: over-block on an unusual diagnostic
+//     command beats silently missing a real PR-creation.
 //
 // Patterns deliberately do NOT use a plain word boundary (\b) before
 // the command — that matches inside all quoted strings and blocks
 // too many legitimate diagnostic/logging commands.
 //
-// The sh -c wrapper boundary is only applied to `gh pr create`
-// because the wrapper boundary regex fragment `(-c\s+['"])` would
-// accidentally match the `-c` option of `git switch -c`. Keeping the
-// wrapper boundary scoped to the gh pattern is the simplest safe
-// option.
+// The -c-wrapper boundary is only applied to `gh pr create` because
+// its regex fragment would accidentally match the `-c` option of
+// `git switch -c`. Keeping the wrapper boundary scoped to the gh
+// pattern is the simplest safe option.
 var prWorkflowCommandPatterns = []*regexp.Regexp{
-	regexp.MustCompile("(?m)(^\\s*|[|&;(`]\\s*|-c\\s+['\"]\\s*)gh\\s+pr\\s+create\\b"),
+	regexp.MustCompile("(?m)(^\\s*|[|&;(`]\\s*|-[a-z]*c\\s+['\"]\\s*)gh\\s+pr\\s+create\\b"),
 	regexp.MustCompile("(?m)(^\\s*|[|&;(`]\\s*)git\\s+checkout\\s+-b\\b"),
 	regexp.MustCompile("(?m)(^\\s*|[|&;(`]\\s*)git\\s+switch\\s+-c\\b"),
 }

@@ -45,6 +45,16 @@ func TestIsPRWorkflowCommand(t *testing.T) {
 			true,
 		},
 		{
+			"gh pr create wrapped in bash -lc (login shell)",
+			"bash -lc 'gh pr create --title foo'",
+			true,
+		},
+		{
+			"gh pr create wrapped in dash -ic (interactive shell)",
+			`dash -ic "gh pr create --title foo"`,
+			true,
+		},
+		{
 			"gh pr create later in a compound command",
 			"git push origin HEAD && \\\n  gh pr create --title foo",
 			true,
