@@ -1307,9 +1307,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// reaching for it at all.
 			//
 			// Banner is config-aware: the step list matches what the rig's
-			// MergeQueue actually does. If PRReviewer is unset, the review
-			// step drops; if PRApprover is set, the approval step mentions
-			// the specific reviewer.
+			// MergeQueue actually does. If PRReviewer is unset, the
+			// automated-review and review-fix-loop steps drop; if
+			// PRApprover is set, the approval step names the specific
+			// approver.
 			printPRModeNextSteps(townRoot, rigName)
 
 			// NOTE: Refinery nudge is deferred to AFTER the Dolt branch merge
