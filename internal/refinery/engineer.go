@@ -328,6 +328,7 @@ type Engineer struct {
 	workDir               string
 	output                io.Writer    // Output destination for user-facing messages
 	router                *mail.Router // Mail router for sending protocol messages
+	mailSender            MailSender   // Outbound mail for merge / convoy notifications; see mail_sender.go
 	mergeSlotEnsureExists func() (string, error)
 	mergeSlotAcquire      func(holder string, addWaiter bool) (*beads.MergeSlotStatus, error)
 	mergeSlotRelease      func(holder string) error
@@ -349,13 +350,14 @@ func NewEngineer(r *rig.Rig) *Engineer {
 	beadsClient := beads.New(r.Path)
 
 	return &Engineer{
-		rig:     r,
-		beads:   beadsClient,
-		git:     git.NewGit(gitDir),
-		config:  cfg,
-		workDir: gitDir,
-		output:  os.Stdout,
-		router:  mail.NewRouter(r.Path),
+		rig:        r,
+		beads:      beadsClient,
+		git:        git.NewGit(gitDir),
+		config:     cfg,
+		workDir:    gitDir,
+		output:     os.Stdout,
+		router:     mail.NewRouter(r.Path),
+		mailSender: defaultMailSender(gitDir),
 		mergeSlotEnsureExists: func() (string, error) {
 			return beadsClient.MergeSlotEnsureExists()
 		},
@@ -368,6 +370,14 @@ func NewEngineer(r *rig.Rig) *Engineer {
 		mergeSlotMaxRetries:   10,
 		mergeSlotRetryBackoff: 500 * time.Millisecond,
 	}
+}
+
+// SetMailSender overrides the Engineer's mail-send path. Intended for
+// tests: inject a memoryMailSender so `go test` does not fork a
+// `gt mail send` subprocess and flood the real mayor. Production code
+// should not call this — the default (execMailSender) is correct.
+func (e *Engineer) SetMailSender(s MailSender) {
+	e.mailSender = s
 }
 
 // SetOutput sets the output writer for user-facing messages.
@@ -1464,10 +1474,12 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 	// --permanent: `gt mail send` defaults to wisp/ephemeral delivery, which
 	// can be garbage-collected. The point of routing through mail (instead of
 	// the old ephemeral nudge) is a durable inbox record, so force permanent.
-	mailCmd := exec.Command("gt", "mail", "send", "mayor/", "-s", mailSubject, "-m", mailBody, "--permanent")
-	util.SetDetachedProcessGroup(mailCmd)
-	mailCmd.Dir = e.workDir
-	if err := mailCmd.Run(); err != nil {
+	//
+	// Dispatch goes through e.mailSender (MailSender interface) so that in
+	// tests a memory-backed impl can capture the envelope without a
+	// subprocess fork. See mail_sender.go — this seam closes the G10
+	// "subprocess `gt mail send` bypasses the Layer 1 test guard" gap.
+	if err := e.mailSender.Send(context.Background(), "mayor/", mailSubject, mailBody, true); err != nil {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to notify mayor of merge: %v\n", err)
 	}
 
@@ -2263,16 +2275,24 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 }
 
 // notifyConvoyCompletion sends notifications to convoy owner and notify addresses.
+//
+// Dispatch goes through e.mailSender (MailSender interface) so tests can
+// inject a memory-backed impl. The convoy-completion path was historically
+// the second subprocess-fork mail site in the refinery; like the MERGED-
+// to-mayor path, it contributes to the G10 test-pollution flood when
+// batch_test.go or similar exercises convoy logic.
+//
+// townRoot is accepted but no longer used to cd a subprocess — kept in the
+// signature for call-site stability; future refactor can drop it.
 func (e *Engineer) notifyConvoyCompletion(townRoot, convoyID, title, description string) {
+	_ = townRoot // kept for call-site compatibility; exec path removed
 	// ZFC: Use typed accessor instead of parsing description text
 	fields := beads.ParseConvoyFields(&beads.Issue{Description: description})
 	for _, addr := range fields.NotificationAddresses() {
-		mailCmd := exec.Command("gt", "mail", "send", addr,
-			"-s", fmt.Sprintf("🚚 Convoy landed: %s", title),
-			"-m", fmt.Sprintf("Convoy %s has completed.\n\nAll tracked issues are now closed.\n\nClosed by: %s/refinery", convoyID, e.rig.Name))
-		util.SetDetachedProcessGroup(mailCmd)
-		mailCmd.Dir = townRoot
-		if err := mailCmd.Run(); err != nil {
+		subject := fmt.Sprintf("🚚 Convoy landed: %s", title)
+		body := fmt.Sprintf("Convoy %s has completed.\n\nAll tracked issues are now closed.\n\nClosed by: %s/refinery",
+			convoyID, e.rig.Name)
+		if err := e.mailSender.Send(context.Background(), addr, subject, body, false); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not notify %s: %v\n", addr, err)
 		}
 	}
