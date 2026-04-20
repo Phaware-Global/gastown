@@ -1296,6 +1296,37 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			fmt.Printf("%s Work submitted to merge queue (verified)\n", style.Bold.Render("✓"))
 			fmt.Printf("  MR ID: %s\n", style.Bold.Render(mrID))
 
+			// G19c: Under merge_strategy=pr the refinery — NOT the polecat —
+			// opens the PR once it picks up the MR bead. Without this
+			// explicit callout, LLM polecats trained on GitHub-first
+			// workflows probe `gh pr list` after `gt done`, see no PR, and
+			// improvise with `gh pr create` directly. That exact sequence
+			// reproduced on slit's PR #16 (2026-04-20 Telegraph v1 L3).
+			// The tap-guard pr-workflow blocks the improvised command
+			// (G19b), but the clearer signal here prevents the LLM from
+			// reaching for it at all.
+			prModeRig := false
+			{
+				settingsPath := filepath.Join(townRoot, rigName, "settings", "config.json")
+				if rigSettings, settingsErr := config.LoadRigSettings(settingsPath); settingsErr == nil &&
+					rigSettings.MergeQueue != nil && rigSettings.MergeQueue.MergeStrategy == "pr" {
+					prModeRig = true
+				}
+			}
+			if prModeRig {
+				fmt.Println()
+				fmt.Printf("%s This rig is on merge_strategy=pr. The refinery will:\n", style.Bold.Render("→"))
+				fmt.Println("    1. Pick up your MR bead on its next patrol")
+				fmt.Println("    2. Open the GitHub PR for your branch")
+				fmt.Println("    3. Trigger automated review (augment)")
+				fmt.Println("    4. Drive the review-fix loop if needed")
+				fmt.Println("    5. Wait for human approval and merge")
+				fmt.Println()
+				fmt.Println("  DO NOT run `gh pr create` yourself — the refinery owns PR")
+				fmt.Println("  creation. Your work is complete; exit cleanly. The tap-guard")
+				fmt.Println("  will block any manual PR-creation attempt regardless.")
+			}
+
 			// NOTE: Refinery nudge is deferred to AFTER the Dolt branch merge
 			// (see post-merge nudge below). Nudging here would race with the
 			// merge — refinery wakes up and queries main before the polecat's
