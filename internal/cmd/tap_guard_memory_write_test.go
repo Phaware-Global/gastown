@@ -111,10 +111,12 @@ func TestIsClaudeCodeMemoryPath(t *testing.T) {
 	}
 }
 
-// TestExtractFilePath covers the JSON hook-input parser. If the hook
-// protocol ever changes the "tool_input.file_path" key name, this
-// test fails and the maintainer knows to update both extract and the
-// test together.
+// TestExtractFilePath covers the JSON hook-input parser. The parser
+// probes two fields: tool_input.file_path (Write/Edit) and
+// tool_input.notebook_path (NotebookEdit). If the hook protocol ever
+// renames either field, or adds a third file-producing tool with a
+// different field name, this test fails and the maintainer knows to
+// update both extract and the test together.
 func TestExtractFilePath(t *testing.T) {
 	tests := []struct {
 		name  string

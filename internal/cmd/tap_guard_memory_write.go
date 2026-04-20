@@ -121,7 +121,11 @@ func extractFilePath(input []byte) string {
 // isClaudeCodeMemoryPath returns true iff the path targets a Claude
 // Code per-project memory directory. The canonical layout on any
 // platform Claude Code supports is
-// ~/.claude/projects/<project-hash>/memory/<file>.md.
+// ~/.claude/projects/<project-hash>/memory/<filename>. Filename
+// extension is not constrained: markdown files (.md) are the common
+// case for Write/Edit, but NotebookEdit targets (.ipynb) living under
+// a memory/ subdir are also blocked — the guard pins the directory,
+// not the file extension.
 //
 // Matching strategy: look for ".claude/projects/" anywhere in the
 // path (accepting both "/.claude/projects/..." and
