@@ -389,6 +389,22 @@ func (e *Engineer) SetMailSender(s MailSender) {
 	e.mailSender = s
 }
 
+// mailSenderOrDefault returns e.mailSender, lazily initializing it if
+// the Engineer was constructed via struct literal (common in older
+// tests like engineer_merge_slot_test.go) and never went through
+// NewEngineer or SetMailSender. All call sites that dispatch mail —
+// HandleMRInfoSuccess, notifyConvoyCompletion — should go through
+// this accessor instead of touching e.mailSender directly so a nil
+// field can't panic. Under a test binary the lazy default is
+// memoryMailSender, so no subprocess mail escapes; under prod it's
+// execMailSender anchored to e.workDir.
+func (e *Engineer) mailSenderOrDefault() MailSender {
+	if e.mailSender == nil {
+		e.mailSender = defaultMailSender(e.workDir)
+	}
+	return e.mailSender
+}
+
 // SetOutput sets the output writer for user-facing messages.
 // This is useful for testing or redirecting output.
 func (e *Engineer) SetOutput(w io.Writer) {
@@ -1488,7 +1504,7 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 	// tests a memory-backed impl can capture the envelope without a
 	// subprocess fork. See mail_sender.go — this seam closes the G10
 	// "subprocess `gt mail send` bypasses the Layer 1 test guard" gap.
-	if err := e.mailSender.Send(context.Background(), "mayor/", mailSubject, mailBody, true); err != nil {
+	if err := e.mailSenderOrDefault().Send(context.Background(), "mayor/", mailSubject, mailBody, true); err != nil {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to notify mayor of merge: %v\n", err)
 	}
 
@@ -2299,7 +2315,7 @@ func (e *Engineer) notifyConvoyCompletion(townRoot, convoyID, title, description
 		body := fmt.Sprintf("Convoy %s has completed.\n\nAll tracked issues are now closed.\n\nClosed by: %s/refinery",
 			convoyID, e.rig.Name)
 		opts := MailSendOptions{WorkDir: townRoot}
-		if err := e.mailSender.SendWithOptions(context.Background(), addr, subject, body, opts); err != nil {
+		if err := e.mailSenderOrDefault().SendWithOptions(context.Background(), addr, subject, body, opts); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not notify %s: %v\n", addr, err)
 		}
 	}

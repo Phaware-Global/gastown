@@ -132,6 +132,33 @@ func TestExecMailSender_ConstructorPreservesWorkDir(t *testing.T) {
 	}
 }
 
+// TestEngineer_MailSenderOrDefaultLazyInits covers the lazy-init
+// accessor added so that struct-literal-constructed Engineers (common
+// in older tests like engineer_merge_slot_test.go) don't panic when
+// they hit HandleMRInfoSuccess or notifyConvoyCompletion with a nil
+// mailSender field. NewEngineer always sets it; this guards the
+// struct-literal path.
+func TestEngineer_MailSenderOrDefaultLazyInits(t *testing.T) {
+	// Struct-literal Engineer with nil mailSender — no NewEngineer, no
+	// SetMailSender. Simulates the existing tests' construction pattern.
+	e := &Engineer{workDir: t.TempDir()}
+	if e.mailSender != nil {
+		t.Fatalf("precondition: struct-literal Engineer should have nil mailSender; got %T", e.mailSender)
+	}
+	got := e.mailSenderOrDefault()
+	if got == nil {
+		t.Fatal("mailSenderOrDefault returned nil")
+	}
+	// Under a test binary, defaultMailSender returns memory impl.
+	if _, ok := got.(*memoryMailSender); !ok {
+		t.Errorf("lazy default under test binary returned %T; want *memoryMailSender", got)
+	}
+	// Second call returns the same instance (no double-init).
+	if e.mailSenderOrDefault() != got {
+		t.Errorf("mailSenderOrDefault returned a different instance on second call; want cached")
+	}
+}
+
 // TestMemoryMailSender_SendWithOptionsCapturesPermanent verifies the
 // extended-options entry point on the memory impl. WorkDir is
 // deliberately NOT recorded in the envelope — it's a cwd hint for
