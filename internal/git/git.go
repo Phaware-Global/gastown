@@ -1078,22 +1078,90 @@ func (g *Git) GhPrCreate(branch, base, title, body string) (int, string, error) 
 	return number, url, nil
 }
 
-// GhPrRequestReview requests reviews on a PR from the given users. Uses
-// `gh pr edit --add-reviewer` which accepts both users and @-prefixed teams.
-// A repeated request for the same reviewer is a no-op on GitHub's side.
+// buildRequestReviewArgv splits the given reviewers into the two trigger
+// modes GhPrRequestReview uses and returns the gh argv slices it will
+// execute (in order).
+//
+// Exported-for-test via unexported func + test-only access: the unit
+// test covers the reviewer classification without invoking `gh`. See
+// TestBuildRequestReviewArgv.
+//
+// Returns (commentArgv, editArgv):
+//   - commentArgv is non-nil iff "augment" (case-insensitive) is in
+//     the reviewers slice; it carries the `gh pr comment ... --body
+//     "augment review"` invocation that triggers Augment Code.
+//   - editArgv is non-nil iff at least one non-augment reviewer
+//     remains; it carries the `gh pr edit ... --add-reviewer <csv>`
+//     invocation for humans/teams.
+//
+// Either or both may be nil; if reviewers is empty, both are nil.
+func buildRequestReviewArgv(prNumber int, reviewers []string) (commentArgv, editArgv []string) {
+	var userReviewers []string
+	augmentRequested := false
+	for _, r := range reviewers {
+		if strings.EqualFold(r, "augment") {
+			augmentRequested = true
+			continue
+		}
+		userReviewers = append(userReviewers, r)
+	}
+	if augmentRequested {
+		commentArgv = []string{"pr", "comment", fmt.Sprintf("%d", prNumber),
+			"--body", "augment review"}
+	}
+	if len(userReviewers) > 0 {
+		editArgv = []string{"pr", "edit", fmt.Sprintf("%d", prNumber),
+			"--add-reviewer", strings.Join(userReviewers, ",")}
+	}
+	return commentArgv, editArgv
+}
+
+// GhPrRequestReview requests reviews on a PR from the given users and
+// bot-style reviewers.
+//
+// Two trigger modes, selected per reviewer name:
+//
+//   - "augment" (the Augment Code review bot) is triggered by posting
+//     a PR comment whose body is the literal string "augment review".
+//     `gh pr edit --add-reviewer augment` does NOT trigger the bot —
+//     augment is a GitHub App, not a user, and --add-reviewer only
+//     accepts users/teams. This was the G12a dogfood finding on
+//     2026-04-19: the formula called request-review, the command
+//     appeared to succeed, but augment never responded because no
+//     comment was posted.
+//
+//   - All other reviewer names are assumed to be GitHub users or
+//     @-prefixed teams and go through `gh pr edit --add-reviewer`.
+//     A repeated request for the same user is a no-op on GitHub's
+//     side.
+//
+// If the caller passes a mix (e.g. ["augment", "alice"]), augment gets
+// the comment, alice gets the reviewer-add, both in one call.
 func (g *Git) GhPrRequestReview(prNumber int, reviewers []string) error {
 	if len(reviewers) == 0 {
 		return nil
 	}
-	args := []string{"pr", "edit", fmt.Sprintf("%d", prNumber),
-		"--add-reviewer", strings.Join(reviewers, ",")}
-	cmd := exec.Command("gh", args...)
-	cmd.Dir = g.workDir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("gh pr edit --add-reviewer failed: %s: %w",
-			strings.TrimSpace(string(out)), err)
+
+	commentArgv, editArgv := buildRequestReviewArgv(prNumber, reviewers)
+
+	if commentArgv != nil {
+		commentCmd := exec.Command("gh", commentArgv...)
+		commentCmd.Dir = g.workDir
+		if out, err := commentCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("gh pr comment (augment review trigger) failed: %s: %w",
+				strings.TrimSpace(string(out)), err)
+		}
 	}
+
+	if editArgv != nil {
+		cmd := exec.Command("gh", editArgv...)
+		cmd.Dir = g.workDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("gh pr edit --add-reviewer failed: %s: %w",
+				strings.TrimSpace(string(out)), err)
+		}
+	}
+
 	return nil
 }
 
