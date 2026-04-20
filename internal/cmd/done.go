@@ -886,6 +886,22 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						donePriority:      donePriority,
 						sourceIssueForPri: sourceIssueForNoMerge,
 					})
+					// When the handoff fails (MR bead create/readback
+					// didn't land), the PR exists on GitHub but the
+					// refinery won't see it. Surface this up to the
+					// witness-completion metadata so the audit trail
+					// (and any orphaned-PR debugging) reflects it
+					// properly — otherwise downstream sees
+					// MRFailed=false and assumes the merge pipeline is
+					// healthy. Specific-log the handoff failure so the
+					// witness's error summary is actionable instead of
+					// a generic "done completed with errors".
+					if !refineryOwnsMerge {
+						mrFailed = true
+						doneErrors = append(doneErrors, fmt.Sprintf(
+							"MR bead handoff for PR #%d failed: refinery will not pick up branch %s; dispatcher intervention required",
+							prNumber, branch))
+					}
 				}
 
 				// Mail dispatcher with READY_FOR_REVIEW.
