@@ -122,6 +122,26 @@ func TestExtractFilePath(t *testing.T) {
 			`{"hook_event_name": "PreToolUse", "tool_name": "Write", "tool_input": {"file_path": "/x.md"}}`,
 			"/x.md",
 		},
+		{
+			"NotebookEdit uses notebook_path instead of file_path",
+			`{"tool_input": {"notebook_path": "/tmp/notebook.ipynb"}}`,
+			"/tmp/notebook.ipynb",
+		},
+		{
+			"file_path takes precedence over notebook_path when both present",
+			`{"tool_input": {"file_path": "/tmp/a.md", "notebook_path": "/tmp/b.ipynb"}}`,
+			"/tmp/a.md",
+		},
+		{
+			"both path fields empty — returns empty",
+			`{"tool_input": {"file_path": "", "notebook_path": ""}}`,
+			"",
+		},
+		{
+			"memory path via notebook_path should flow into classifier as-is",
+			`{"tool_input": {"notebook_path": "/Users/x/.claude/projects/y/memory/nb.ipynb"}}`,
+			"/Users/x/.claude/projects/y/memory/nb.ipynb",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

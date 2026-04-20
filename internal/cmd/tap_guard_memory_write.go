@@ -36,9 +36,12 @@ targets a Claude Code memory directory, but only when the caller is a
 Gas Town agent. Non-agent Claude Code sessions (a human using Claude
 Code directly for other work) are unaffected.
 
-Path pattern: any file_path containing "/.claude/projects/" followed
-later by "/memory/". That covers all the current Claude Code memory
-layouts on macOS/Linux regardless of the specific project hash.
+Path pattern: any tool_input.file_path / tool_input.notebook_path
+containing "/.claude/projects/" followed later by "/memory/". That
+covers all the current Claude Code memory layouts on macOS/Linux
+regardless of the specific project hash. Windows (backslash) paths
+are out of scope — gastown is macOS/Linux only; if that changes, add
+a Windows-path case to the classifier test.
 
 Exit codes:
   0 - Operation allowed (not an agent, or path is not a memory file)
@@ -48,7 +51,10 @@ Hook configuration (applied to Write, Edit, NotebookEdit):
   {
     "PreToolUse": [{
       "matcher": "Write|Edit|NotebookEdit",
-      "hooks": [{"command": "gt tap guard memory-write"}]
+      "hooks": [{
+        "type": "command",
+        "command": "gt tap guard memory-write"
+      }]
     }]
   }`,
 	RunE: runTapGuardMemoryWrite,
@@ -82,21 +88,34 @@ func runTapGuardMemoryWrite(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// extractFilePath pulls tool_input.file_path out of the hook JSON.
-// Write/Edit/NotebookEdit all use the same "file_path" field name.
+// extractFilePath pulls the target path out of the hook JSON.
+//
+// Different tools use different field names in tool_input:
+//   - Write and Edit:       "file_path"
+//   - NotebookEdit:         "notebook_path"
+//
+// We probe both and return the first non-empty value. If Claude Code
+// adds a new file-producing tool with a third field name later, this
+// function needs a new probe — the guard's hook matcher is
+// "Write|Edit|NotebookEdit", so any tool added to the matcher must
+// have its path field represented here too.
 func extractFilePath(input []byte) string {
 	if len(input) == 0 {
 		return ""
 	}
 	var hookInput struct {
 		ToolInput struct {
-			FilePath string `json:"file_path"`
+			FilePath     string `json:"file_path"`
+			NotebookPath string `json:"notebook_path"`
 		} `json:"tool_input"`
 	}
 	if err := json.Unmarshal(input, &hookInput); err != nil {
 		return ""
 	}
-	return hookInput.ToolInput.FilePath
+	if hookInput.ToolInput.FilePath != "" {
+		return hookInput.ToolInput.FilePath
+	}
+	return hookInput.ToolInput.NotebookPath
 }
 
 // isClaudeCodeMemoryPath returns true iff the path targets a Claude
