@@ -1665,3 +1665,95 @@ workflow):
 - SLA-based escalation: if a PR sits without a reviewDecision for N
   hours (configurable), mayor sends a reminder to the approver's
   inbox/external channel. Not the refinery's concern.
+
+### G19 — Polecat manually creates PR after `gt done --pre-verified` silently fails to, bypassing the entire refinery review loop
+
+Observed on PR #16 (slit polecat, gt-ahf, Telegraph L3), 2026-04-20.
+The polecat pushed its branch, ran `gt done --pre-verified --target
+main`, then — seeing no PR had been created (`gh pr list --head
+polecat/slit-mo6mjs8m` returned empty) — ran `gh pr create` directly
+to open PR #16. That PR has four unresolved gemini-code-assist
+threads and was never `augment review`-tagged. The refinery never
+saw it enter the merge queue.
+
+Three compounding bugs reproduced together:
+
+**G19a — `gt done --pre-verified` skips the G11 MR-bead handoff.**
+The G11 fix in PR #11 routes `gt done`'s no-merge+pr path through
+`handoffPRToRefinery` so the refinery sees a new MR bead for the
+just-opened PR. But the `--pre-verified` flag (intended for polecats
+that rebased + gated before submission so the refinery can fast-path
+merge) takes a DIFFERENT code path — and that path doesn't create an
+MR bead. slit's pane shows `gt done` reported a warning about a
+`done-intent label` failing but otherwise completed cleanly. No PR,
+no MR bead, nothing for the refinery to patrol. G11's coverage is a
+gap.
+
+**G19b — The `tap-guard pr-workflow` hook didn't block the polecat's
+manual `gh pr create`.** The guard logic itself is correct: any
+polecat context calling `gh pr create` should block (only refinery
+on pr-mode rigs is allowed). But two mechanism-level issues appear
+to have let slit through:
+
+1. *Matcher shape*. The hook matcher is `Bash(gh pr create*)`. Claude
+   Code's glob matching typically does not cross newlines. slit's
+   `gh pr create` was a multi-line command (heredoc body), so the
+   matcher may have failed to recognize it.
+2. *Session-init race*. Slit's tmux session was created at
+   `2026-04-19 21:17:37`. The polecats' shared
+   `.claude/settings.json` mtime is also `2026-04-19 21:17:37` — the
+   same second. Claude Code reads settings at session init; if the
+   settings write landed after the read, slit's session never had
+   the hook wired up at all.
+
+Either (or both) is sufficient to explain the bypass. The mechanism
+is fragile: the same invariant ("polecats never create PRs") is
+expressed three times (guard logic, matcher pattern, session-init
+ordering) and any one slipping breaks the whole thing.
+
+**G19c — `gt done` exits clean even when it knows the refinery won't
+see the branch.** The `--pre-verified` path completed normally from
+slit's perspective (no PR, no MR bead, exit 0, friendly "work
+complete" output). A polecat looking at that output has no signal
+that something went wrong — so slit's LLM did the reasonable thing
+and asked "is there a PR? no? create one manually." Loud-fail with a
+clear message would have stopped slit from freelancing.
+
+Pattern: G19 is the third or fourth variant of the same theme —
+*when the workflow produces unexpected state, the LLM improvises,
+and the improvisation bypasses downstream invariants*. G1 was
+refinery-improvises-merge; G17 was gt-done-closes-bead-without-PR;
+G19 is polecat-manually-creates-PR. Each time, the fix is to close
+the improvisation path AT ITS SOURCE (fix the upstream command so
+the state is correct) AND defensively prevent the improvisation
+(guard, loud-fail, or both).
+
+Fix stack:
+
+- **PR-A (G19b)**: Tighten `tap-guard pr-workflow`. Move from a
+  glob-matcher-dependent pattern to a catch-all `Bash` matcher with
+  in-guard command inspection (pattern-match on stdin tool_input.
+  command). That removes the matcher-shape dependency entirely —
+  the guard fires on every Bash call and fast-paths to exit 0 for
+  non-relevant commands. Regression tests pin the block for
+  multi-line commands, leading-whitespace invocations, and the
+  refinery/polecat distinction.
+
+- **PR-B (G19a + G19c)**: In `internal/cmd/done.go`:
+  - G19a: The `--pre-verified` path must create the MR bead when
+    the rig is on `merge_strategy=pr`. Reuse the existing
+    `handoffPRToRefinery` helper (or an equivalent) so the refinery
+    sees the branch. Mirror the no-merge+pr path's invariant:
+    MR bead exists before `gt done` returns clean.
+  - G19c: Belt-and-suspenders safety net. After the expected
+    MR-bead creation (or find-existing path), assert the MR bead
+    is queryable; if not, loud-fail with a clear error ("refinery
+    will not see this branch; dispatcher intervention required")
+    and a non-zero exit so the polecat LLM cannot interpret the
+    outcome as success.
+
+- **Follow-up (session-init race)**: Out of scope for this stack
+  but worth filing: `gt up` / `gt polecat spawn` should fsync
+  `.claude/settings.json` before starting the Claude Code session.
+  If that fsync-before-start ordering is not explicit in the spawn
+  code, a future reorg could reintroduce the race.
