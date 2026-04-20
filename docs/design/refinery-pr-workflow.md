@@ -1042,10 +1042,11 @@ returned `{"users":[],"teams":[]}`.
 as `gh pr edit <N> --add-reviewer augment`. That is the
 GitHub-native "request review" metadata action — which either
 (i) silently succeeds as a no-op because `augment` isn't a valid
-GitHub user on this repo (the actual bot is
-`augmentcode-free[bot]`, which cannot be requested as a reviewer
-via `--add-reviewer`), or (ii) adds a dismissible metadata marker
-that nothing responds to. Augment Code's trigger is a PR
+GitHub user on this repo (the actual bot is a GitHub App whose
+comments appear under `augmentcode[bot]` or `augmentcode-free[bot]`
+depending on the installation, neither of which can be requested as
+a reviewer via `--add-reviewer`), or (ii) adds a dismissible
+metadata marker that nothing responds to. Augment Code's trigger is a PR
 **comment** whose body is exactly `augment review`. That's what
 the review loop used in this dogfood's earlier PRs (#6-#9, #11)
 to trigger augment — a hand-typed comment, not a reviewer

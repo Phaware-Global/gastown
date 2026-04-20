@@ -1122,9 +1122,10 @@ unresolved.
 
 Address every thread in the JSON below. Do not paraphrase it into your
 own list. Do not drop, skip, or filter any thread based on who authored
-it (gemini, augment, human — all count). Poll 'gt refinery pr threads
-$PR --unresolved --json' when you think you're done to verify zero
-threads remain, then run gt done.
+it (gemini, augment, human — all count). When you think you're done,
+run `gt refinery pr threads <PR-number> --unresolved --json` (with the
+PR number substituted, not a shell variable) and verify the result is
+an empty array. Then run gt done.
 
 THREADS (unresolved, fresh poll at dispatch time):
 $THREADS" \
