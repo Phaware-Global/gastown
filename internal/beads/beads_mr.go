@@ -35,19 +35,18 @@ func (b *Beads) FindMRForBranchAndSHA(branch, commitSHA string) (*Issue, error) 
 		return nil, err
 	}
 
-	branchPrefix := "branch: " + branch + "\n"
 	for _, issue := range issues {
 		if issue.Status == "closed" {
 			continue
 		}
-		if !strings.HasPrefix(issue.Description, branchPrefix) {
+		fields := ParseMRFields(issue)
+		if fields == nil || fields.Branch != branch {
 			continue
 		}
 		// Branch matches — check commit SHA.
-		// If the MR has no commit_sha field (legacy), fall back to branch-only
-		// match for backward compatibility.
-		fields := ParseMRFields(issue)
-		if fields != nil && fields.CommitSHA != "" && commitSHA != "" {
+		// If the MR has no commit_sha field (legacy), fall back to
+		// branch-only match for backward compatibility.
+		if fields.CommitSHA != "" && commitSHA != "" {
 			if fields.CommitSHA != commitSHA {
 				// Same branch but different SHA — this is a stale MR.
 				// Don't return it; caller will create a new MR and supersede.
@@ -61,13 +60,13 @@ func (b *Beads) FindMRForBranchAndSHA(branch, commitSHA string) (*Issue, error) 
 }
 
 // findMRForBranch searches the wisps table (Dolt) for a merge-request
-// bead matching the given branch.
+// bead whose `branch:` field (parsed via ParseMRFields) matches the given
+// branch name exactly.
+//
 // Uses status=all which includes all issue statuses with full descriptions.
 // Ephemeral=true routes to the wisps table where MR beads live (GH#2446).
 // When skipClosed is true, closed beads are excluded (for open-MR checks).
 func (b *Beads) findMRForBranch(branch string, skipClosed bool) (*Issue, error) {
-	branchPrefix := "branch: " + branch + "\n"
-
 	issues, err := b.ListMergeRequests(ListOptions{
 		Status: "all",
 		Label:  "gt:merge-request",
@@ -75,16 +74,40 @@ func (b *Beads) findMRForBranch(branch string, skipClosed bool) (*Issue, error) 
 	if err != nil {
 		return nil, err
 	}
+	return pickMRForBranch(issues, branch, skipClosed), nil
+}
+
+// pickMRForBranch is the pure matching logic exercised by tests: given a
+// list of MR-labeled issues and a branch name, return the first open
+// (or any, if skipClosed=false) MR whose parsed `branch:` field matches.
+//
+// Field extraction (via ParseMRFields) is deliberately chosen over the
+// previous strings.HasPrefix(description, "branch: X\n") approach. The
+// G11 dogfood on 2026-04-19 surfaced a real breakage of the old prefix
+// match: an MR bead backfilled with a description whose first bytes were
+// NOT exactly "branch: X\n" (common real shapes: a leading blank line, a
+// different field order, a header comment, or fields interleaved with
+// prose) failed the HasPrefix test and looked like "no MR for this
+// branch". The caller then tried to create a duplicate MR, which in turn
+// failed with "MR bead handoff failed" even though an MR for the exact
+// branch existed. Parsing the structured field matches the intended
+// semantics (one MR per branch) instead of an accidental encoding of it.
+//
+// Returns nil if no MR matches.
+func pickMRForBranch(issues []*Issue, branch string, skipClosed bool) *Issue {
 	for _, issue := range issues {
 		if skipClosed && issue.Status == "closed" {
 			continue
 		}
-		if strings.HasPrefix(issue.Description, branchPrefix) {
-			return issue, nil
+		fields := ParseMRFields(issue)
+		if fields == nil {
+			continue
+		}
+		if fields.Branch == branch {
+			return issue
 		}
 	}
-
-	return nil, nil
+	return nil
 }
 
 // FindOpenMRsForIssue returns all open merge-request beads whose source_issue
