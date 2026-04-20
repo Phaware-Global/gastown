@@ -95,6 +95,15 @@
             "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gt tap guard dangerous-command"
           }
         ]
+      },
+      {
+        "matcher": "Write|Edit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{GT_BIN}} tap guard memory-write"
+          }
+        ]
       }
     ],
     "SessionStart": [
