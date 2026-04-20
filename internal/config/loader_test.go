@@ -5111,7 +5111,11 @@ func TestTryResolveFromEphemeralTier(t *testing.T) {
 		}
 	})
 
-	t.Run("budget tier witness gets haiku", func(t *testing.T) {
+	t.Run("budget tier witness gets sonnet (G6/G18 reliability upgrade)", func(t *testing.T) {
+		// Witness moved from haiku to sonnet on Budget tier — see the
+		// TierBudget comment in cost_tier.go for the G6/G18 rationale.
+		// Deacon and refinery still get haiku on Budget; witness and
+		// the worker roles (mayor, polecat, crew) get sonnet.
 		t.Setenv("GT_COST_TIER", "budget")
 		rc, handled := tryResolveFromEphemeralTier("witness")
 		if !handled {
@@ -5125,13 +5129,13 @@ func TestTryResolveFromEphemeralTier(t *testing.T) {
 		}
 		found := false
 		for i, arg := range rc.Args {
-			if arg == "--model" && i+1 < len(rc.Args) && rc.Args[i+1] == "haiku" {
+			if arg == "--model" && i+1 < len(rc.Args) && rc.Args[i+1] == "sonnet[1m]" {
 				found = true
 				break
 			}
 		}
 		if !found {
-			t.Errorf("Args %v missing --model haiku", rc.Args)
+			t.Errorf("Args %v missing --model sonnet[1m] (witness should be sonnet on budget tier)", rc.Args)
 		}
 	})
 
@@ -5199,15 +5203,17 @@ func TestResolveRoleAgentConfig_WithEphemeralTier(t *testing.T) {
 	if !isClaudeCommand(rc.Command) {
 		t.Errorf("Command = %q, want claude", rc.Command)
 	}
+	// Witness is sonnet on Budget (G6/G18 reliability upgrade; see
+	// TierBudget comment in cost_tier.go).
 	found := false
 	for i, arg := range rc.Args {
-		if arg == "--model" && i+1 < len(rc.Args) && rc.Args[i+1] == "haiku" {
+		if arg == "--model" && i+1 < len(rc.Args) && rc.Args[i+1] == "sonnet[1m]" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("Args %v missing --model haiku for budget witness", rc.Args)
+		t.Errorf("Args %v missing --model sonnet[1m] for budget witness", rc.Args)
 	}
 }
 
@@ -5226,20 +5232,30 @@ func TestResolveRoleAgentConfig_EphemeralOverridesPersistent(t *testing.T) {
 	// Set ephemeral to budget — should override
 	t.Setenv("GT_COST_TIER", "budget")
 
-	// witness is sonnet in economy, haiku in budget
-	rc := ResolveRoleAgentConfig("witness", townRoot, "")
+	// Witness is sonnet in both economy and budget (budget witness was
+	// haiku historically but moved to sonnet for reliability — G6/G18).
+	// This test previously asserted the override changed witness's
+	// model; under the current tier matrix the model is the same
+	// sonnet in both, so we retarget the override check at a role
+	// that IS different between the two tiers.
+	//
+	// In economy: polecat = "" (default/opus); in budget: polecat =
+	// "claude-sonnet". Asserting the budget override puts polecat on
+	// sonnet verifies the ephemeral override replaces the persistent
+	// tier's mapping.
+	rc := ResolveRoleAgentConfig("polecat", townRoot, "")
 	if rc == nil {
-		t.Fatal("expected RuntimeConfig for witness")
+		t.Fatal("expected RuntimeConfig for polecat")
 	}
 	found := false
 	for i, arg := range rc.Args {
-		if arg == "--model" && i+1 < len(rc.Args) && rc.Args[i+1] == "haiku" {
+		if arg == "--model" && i+1 < len(rc.Args) && rc.Args[i+1] == "sonnet[1m]" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("ephemeral budget should override persistent economy; witness Args %v missing --model haiku", rc.Args)
+		t.Errorf("ephemeral budget should override persistent economy; polecat Args %v missing --model sonnet[1m]", rc.Args)
 	}
 }
 
