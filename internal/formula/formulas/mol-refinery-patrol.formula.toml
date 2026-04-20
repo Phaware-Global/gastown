@@ -951,6 +951,33 @@ MAX={{pr_review_loop_max}}       # rig-level cap; default 3
 #     description) can't shadow the structured value.
 MR_JSON=$(bd show "$MR" --json)
 MR_DESC=$(echo "$MR_JSON" | jq -r 'if type == "array" then .[0].description else .description end // ""')
+
+# Extract every per-MR variable PR.5 uses in one place, right after
+# MR_DESC is read. PR.5 is patrol-resumable: no shell state survives
+# across patrols, so every variable referenced anywhere in this step
+# (including step 2's polecat-state echo / request-review and the
+# later escalate / sling calls) must be derivable from MR_DESC here,
+# before any other bash runs.
+#
+# review_pr was introduced by the G11 no-merge+pr handoff path and is
+# now also set on MR beads created by the refinery's own pr-create
+# step (see the dispatch flow under "If merge_strategy = \"pr\":" in
+# Step 2). For regular merge-push MRs without a PR yet, PR.5 isn't
+# reached — we only enter this step once the PR exists.
+PR=$(echo "$MR_DESC" | awk -F': ' '/^review_pr:/ {print $2; exit}')
+ISSUE_ID=$(echo "$MR_DESC" | awk -F': ' '/^source_issue:/ {print $2; exit}')
+BRANCH=$(echo "$MR_DESC" | awk -F': ' '/^branch:/ {print $2; exit}')
+if [ -z "$PR" ] || [ -z "$ISSUE_ID" ] || [ -z "$BRANCH" ]; then
+  # Missing fields should be impossible for an MR bead that reached
+  # PR.5 — if it happens, treat as a corrupted MR and escalate rather
+  # than try to muddle through.
+  {{ cmd }} escalate -s HIGH \
+    "MR $MR missing PR.5 fields: review_pr='$PR' source_issue='$ISSUE_ID' branch='$BRANCH'" \
+    --mail mayor/ \
+    --context "$MR_DESC"
+  return 0 2>/dev/null || exit 0
+fi
+
 REVIEW_FIX_POLECAT=$(echo "$MR_DESC" \
   | awk -F': ' '/^review_fix_polecat:/ {print $2; exit}')
 REVIEW_LOOP_ITER=$(echo "$MR_DESC" \
@@ -1025,33 +1052,7 @@ if [ -n "$REVIEW_FIX_POLECAT" ]; then
   esac
 fi
 
-# 3. No polecat in flight — extract the per-MR metadata this step needs
-# (PR number, source-issue ID, branch name) from the same MR_DESC we
-# already read at step 1. This step is patrol-resumable, so NOTHING
-# here can rely on shell state from a prior patrol — every variable
-# must be derivable from the MR bead's description, which is persisted
-# across patrols by `gt mq set-review-state` and similar writes.
-#
-# review_pr was introduced by the G11 no-merge+pr handoff path and is
-# now also set on MR beads created by the refinery's own pr-create
-# step (see the dispatch flow under "If merge_strategy = \"pr\":" in
-# Step 2). For regular merge-push MRs without a PR yet, PR.5 isn't
-# reached — we only poll threads once the PR exists.
-PR=$(echo "$MR_DESC" | awk -F': ' '/^review_pr:/ {print $2; exit}')
-ISSUE_ID=$(echo "$MR_DESC" | awk -F': ' '/^source_issue:/ {print $2; exit}')
-BRANCH=$(echo "$MR_DESC" | awk -F': ' '/^branch:/ {print $2; exit}')
-if [ -z "$PR" ] || [ -z "$ISSUE_ID" ] || [ -z "$BRANCH" ]; then
-  # Missing fields should be impossible for an MR bead that reached
-  # PR.5 — if it happens, treat as a corrupted MR and escalate rather
-  # than try to muddle through.
-  {{ cmd }} escalate -s HIGH \
-    "MR $MR missing PR.5 fields: review_pr='$PR' source_issue='$ISSUE_ID' branch='$BRANCH'" \
-    --mail mayor/ \
-    --context "$MR_DESC"
-  return 0 2>/dev/null || exit 0
-fi
-
-# Poll unresolved threads. Author-agnostic: the --unresolved filter
+# 3. No polecat in flight — poll unresolved threads. Author-agnostic: the --unresolved filter
 # counts every open thread regardless of who opened it
 # (gemini-code-assist auto-review, augment review, human review). Do
 # NOT filter THREADS by author before the COUNT check; doing so

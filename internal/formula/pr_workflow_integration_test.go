@@ -336,17 +336,47 @@ func TestRefineryPatrolReviewLoopEnforcesResolveAndEnumeration(t *testing.T) {
 
 	// Invariant 3: enumerate every thread verbatim (G14). The --args block
 	// must splice the polled $THREADS JSON directly, not paraphrase it.
-	// Check that $THREADS appears inside an --args string and that the
-	// step warns against narrative paraphrasing.
+	//
+	// IMPORTANT: these markers are checked INSIDE the dispatch `--args`
+	// string specifically, not anywhere in the PR-mode branch. A
+	// previous iteration of this test did a whole-branch Contains(),
+	// which is load-bearing for invariants 1 and 2 (the preamble and
+	// bash-prose there are the right place to assert those), but for
+	// invariant 3 the preamble *also* uses the word "$THREADS" when
+	// explaining the contract. So a rewrite that kept the preamble
+	// intact but stripped `$THREADS` out of the actual --args string
+	// (the only place it's load-bearing at dispatch time) would still
+	// pass a whole-branch check. Scoping to the --args substring
+	// closes that gap.
+	argsStart := strings.Index(prBranchDesc, `--args "You are a review-fix polecat`)
+	if argsStart < 0 {
+		t.Fatal(`missing --args "You are a review-fix polecat ..." marker in PR-mode branch — dispatch template was rewritten without the test being updated (G14)`)
+	}
+	// Delimit the --args block by searching for the `--json` pipe that
+	// closes the multi-line sling invocation. The raw TOML source
+	// ends the args string with `$THREADS" \` + newline + `    --json`,
+	// but TOML multi-line basic strings collapse unescaped `\` +
+	// newline + leading whitespace, so the parsed text reads
+	// `$THREADS"    --json` (or similar) with no stable end-of-string
+	// quote we can search for in isolation. `--json | jq -r` is a
+	// stable, unique sentinel that sits immediately after the --args
+	// string terminates in the source.
+	argsRest := prBranchDesc[argsStart:]
+	argsEnd := strings.Index(argsRest, "--json | jq -r")
+	if argsEnd < 0 {
+		t.Fatal(`could not find end of --args block (missing "--json | jq -r" sentinel after --args)`)
+	}
+	argsBlock := argsRest[:argsEnd]
+
 	enumerationMarkers := []string{
-		"$THREADS",                  // the poll result referenced verbatim
-		"do not paraphrase",          // warning against prose substitution
+		"$THREADS",          // the poll result referenced verbatim INSIDE --args
+		"do not paraphrase", // warning against prose substitution INSIDE --args
 	}
 	for _, marker := range enumerationMarkers {
 		// case-insensitive contains so future capitalization tweaks don't
 		// break the test for cosmetic reasons
-		if !strings.Contains(strings.ToLower(prBranchDesc), strings.ToLower(marker)) {
-			t.Errorf("PR-mode branch missing thread-enumeration marker %q — dispatch args may drop unresolved threads (G14)",
+		if !strings.Contains(strings.ToLower(argsBlock), strings.ToLower(marker)) {
+			t.Errorf("dispatch --args block missing thread-enumeration marker %q — dispatch args may drop unresolved threads (G14)",
 				marker)
 		}
 	}
