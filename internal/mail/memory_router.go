@@ -30,13 +30,38 @@ func (r *MemoryRouter) Send(msg *Message) error {
 	return nil
 }
 
-// Messages returns a snapshot of all messages received so far.
+// Messages returns a deep-copy snapshot of all messages received so far.
+// Callers may freely mutate the returned messages without affecting stored state.
 func (r *MemoryRouter) Messages() []*Message {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	out := make([]*Message, len(r.messages))
-	copy(out, r.messages)
+	for i, m := range r.messages {
+		out[i] = deepCopyMessage(m)
+	}
 	return out
+}
+
+// deepCopyMessage returns a copy of m with slice and pointer fields duplicated
+// so the caller cannot mutate shared state.
+func deepCopyMessage(m *Message) *Message {
+	if m == nil {
+		return nil
+	}
+	cp := *m // copy all value fields
+	if m.CC != nil {
+		cp.CC = make([]string, len(m.CC))
+		copy(cp.CC, m.CC)
+	}
+	if m.ClaimedAt != nil {
+		t := *m.ClaimedAt
+		cp.ClaimedAt = &t
+	}
+	if m.DeliveryAckedAt != nil {
+		t := *m.DeliveryAckedAt
+		cp.DeliveryAckedAt = &t
+	}
+	return &cp
 }
 
 // Reset clears all stored messages.

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/telegraph"
@@ -131,15 +132,28 @@ func buildSubject(event *telegraph.NormalizedEvent) string {
 }
 
 // safeTitle returns at most the first line of text (no raw body content in subject).
+// Truncation is rune-based to avoid splitting multi-byte UTF-8 sequences.
 func safeTitle(text string) string {
 	if idx := strings.IndexByte(text, '\n'); idx >= 0 {
 		text = text[:idx]
 	}
-	const maxTitleLen = 80
-	if len(text) > maxTitleLen {
-		text = text[:maxTitleLen]
+	const maxTitleRunes = 80
+	if utf8.RuneCountInString(text) > maxTitleRunes {
+		text = string([]rune(text)[:maxTitleRunes])
 	}
 	return text
+}
+
+// sanitizeHeaderValue strips CR and LF characters from a value that will be
+// written into a header line. A newline in a header value would allow
+// injection of arbitrary header lines into the mail body.
+func sanitizeHeaderValue(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // buildBody constructs the full mail body: Telegraph-* metadata headers followed
@@ -149,22 +163,29 @@ func (t *Transformer) buildBody(event *telegraph.NormalizedEvent) string {
 	var b strings.Builder
 
 	// Metadata block — all values come from NormalizedEvent structured fields.
+	// sanitizeHeaderValue strips CR/LF to prevent header-injection via untrusted fields.
 	b.WriteString("Telegraph-Transport: http-webhook\n")
-	fmt.Fprintf(&b, "Telegraph-Provider: %s\n", event.Provider)
-	fmt.Fprintf(&b, "Telegraph-Event-Type: %s\n", event.EventType)
-	fmt.Fprintf(&b, "Telegraph-Event-ID: %s\n", event.EventID)
+	fmt.Fprintf(&b, "Telegraph-Provider: %s\n", sanitizeHeaderValue(event.Provider))
+	fmt.Fprintf(&b, "Telegraph-Event-Type: %s\n", sanitizeHeaderValue(event.EventType))
+	fmt.Fprintf(&b, "Telegraph-Event-ID: %s\n", sanitizeHeaderValue(event.EventID))
 	fmt.Fprintf(&b, "Telegraph-Timestamp: %s\n", event.Timestamp.UTC().Format(time.RFC3339))
-	fmt.Fprintf(&b, "Telegraph-Actor: %s\n", event.Actor)
-	fmt.Fprintf(&b, "Telegraph-Subject: %s\n", event.Subject)
+	fmt.Fprintf(&b, "Telegraph-Actor: %s\n", sanitizeHeaderValue(event.Actor))
+	fmt.Fprintf(&b, "Telegraph-Subject: %s\n", sanitizeHeaderValue(event.Subject))
 	if event.CanonicalURL != "" {
-		fmt.Fprintf(&b, "Telegraph-URL: %s\n", event.CanonicalURL)
+		fmt.Fprintf(&b, "Telegraph-URL: %s\n", sanitizeHeaderValue(event.CanonicalURL))
 	}
 	if len(event.Labels) > 0 {
-		fmt.Fprintf(&b, "Telegraph-Labels: %s\n", strings.Join(event.Labels, ", "))
+		sanitizedLabels := make([]string, len(event.Labels))
+		for i, l := range event.Labels {
+			sanitizedLabels[i] = sanitizeHeaderValue(l)
+		}
+		fmt.Fprintf(&b, "Telegraph-Labels: %s\n", strings.Join(sanitizedLabels, ", "))
 	}
 
 	// External content block with explicit trust delimiter.
-	fmt.Fprintf(&b, "\n--- EXTERNAL CONTENT (untrusted: %s/%s) ---\n", event.Provider, event.Actor)
+	// Provider and Actor are sanitized to prevent delimiter spoofing.
+	fmt.Fprintf(&b, "\n--- EXTERNAL CONTENT (untrusted: %s/%s) ---\n",
+		sanitizeHeaderValue(event.Provider), sanitizeHeaderValue(event.Actor))
 
 	text := event.Text
 	if t.bodyCap > 0 && len(text) > t.bodyCap {
