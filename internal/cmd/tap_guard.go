@@ -55,6 +55,19 @@ var prWorkflowCommandPatterns = []*regexp.Regexp{
 	regexp.MustCompile("(?m)(^\\s*|[|&;(`]\\s*)git\\s+switch\\s+-c\\b"),
 }
 
+// prMergeCommandPattern matches direct `gh pr merge` invocations. This is
+// split out from prWorkflowCommandPatterns because the refinery-allowed
+// exception for PR-mode rigs covers `gh pr create` but NOT `gh pr merge`
+// (G21 fix). The refinery must route merges through `gt refinery pr merge`
+// — that subcommand enforces PR.6 wait-approval gates via VerifyPRApproval
+// before calling the provider's MergePR. Shelling out to `gh pr merge`
+// directly is the exact G21 bypass this guard closes.
+//
+// The boundary set matches prWorkflowCommandPatterns (line-start, shell
+// operator, or shell `-c` wrapper) so heredoc/wrapper variants are caught
+// consistently with G19b's existing coverage.
+var prMergeCommandPattern = regexp.MustCompile("(?m)(^\\s*|[|&;(`]\\s*|-[a-z]*c\\s+['\"]\\s*)gh\\s+pr\\s+merge\\b")
+
 // isPRWorkflowCommand returns true when cmd looks like any of the PR-
 // creation / feature-branch commands this guard blocks.
 func isPRWorkflowCommand(cmd string) bool {
@@ -67,6 +80,16 @@ func isPRWorkflowCommand(cmd string) bool {
 		}
 	}
 	return false
+}
+
+// isPRMergeCommand returns true when cmd looks like a direct `gh pr merge`
+// invocation. Separate from isPRWorkflowCommand because merge and create
+// have different refinery-context policies (G21 fix).
+func isPRMergeCommand(cmd string) bool {
+	if cmd == "" {
+		return false
+	}
+	return prMergeCommandPattern.MatchString(cmd)
 }
 
 var tapGuardCmd = &cobra.Command{
@@ -106,7 +129,9 @@ Gas Town workers push directly to main. PRs add friction that breaks
 the autonomous execution model (GUPP principle).
 
 This guard blocks:
-  - gh pr create
+  - gh pr create (allowed for refinery on pr-mode rigs only)
+  - gh pr merge (blocked for ALL agents — refinery must use
+    'gt refinery pr merge' which enforces PR.6 wait-approval, G21 fix)
   - git checkout -b (feature branches)
   - git switch -c (feature branches)
 
@@ -156,20 +181,54 @@ func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 		}
 	}
 	// Fast path: if we successfully extracted a Bash command AND that
-	// command isn't one we guard, exit clean immediately.
-	if command != "" && !isPRWorkflowCommand(command) {
+	// command isn't one we guard (neither create/branch nor direct
+	// merge), exit clean immediately.
+	isMerge := isPRMergeCommand(command)
+	isCreateOrBranch := isPRWorkflowCommand(command)
+	if command != "" && !isCreateOrBranch && !isMerge {
 		return nil
 	}
 	// If stdin was empty/terminal (e.g. guard invoked manually for
-	// testing) or the command IS a PR-workflow command, fall through
-	// to the existing block-or-allow logic.
+	// testing) or the command IS a guarded command, fall through
+	// to the block-or-allow logic.
+
+	// G21 fix: direct `gh pr merge` is blocked for ALL Gas Town agents,
+	// including the refinery — the refinery exception that covers
+	// `gh pr create` does NOT extend to merge. The refinery must route
+	// merges through `gt refinery pr merge <n>` which enforces PR.6
+	// wait-approval via refinery.VerifyPRApproval. Shelling out to
+	// `gh pr merge` directly is the G21 bypass shape: create-then-
+	// merge back-to-back without running PR.4/PR.5/PR.6.
+	//
+	// The gt subcommand internally subprocesses `gh pr merge` — that
+	// subprocess is not a Bash tool call from Claude Code, so the
+	// PreToolUse hook doesn't fire on it. Only direct Bash invocations
+	// from the LLM agent are guarded here.
+	if isMerge && isGasTownAgentContext() {
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════╗")
+		fmt.Fprintln(os.Stderr, "║  ❌ DIRECT `gh pr merge` BLOCKED (G21 fix)                       ║")
+		fmt.Fprintln(os.Stderr, "╠══════════════════════════════════════════════════════════════════╣")
+		fmt.Fprintln(os.Stderr, "║  Refinery must route PR merges through `gt refinery pr merge`   ║")
+		fmt.Fprintln(os.Stderr, "║  which enforces PR.6 wait-approval gates before calling the     ║")
+		fmt.Fprintln(os.Stderr, "║  GitHub merge API.                                              ║")
+		fmt.Fprintln(os.Stderr, "║                                                                  ║")
+		fmt.Fprintln(os.Stderr, "║  Instead of:  gh pr merge <n> --squash                          ║")
+		fmt.Fprintln(os.Stderr, "║  Do this:     gt refinery pr merge <n>                          ║")
+		fmt.Fprintln(os.Stderr, "║                                                                  ║")
+		fmt.Fprintln(os.Stderr, "║  See: docs/design/refinery-pr-workflow.md §G21                  ║")
+		fmt.Fprintln(os.Stderr, "╚══════════════════════════════════════════════════════════════════╝")
+		fmt.Fprintln(os.Stderr, "")
+		return NewSilentExit(2) // Exit 2 = BLOCK in Claude Code hooks
+	}
 
 	// Check if we're in a Gas Town agent context
 	if isGasTownAgentContext() {
 		// Exception: the refinery running for a rig configured with
-		// merge_strategy=pr legitimately needs to call `gh pr create` and
-		// `gh pr merge` as part of its normal workflow. Polecats and other
-		// agents are still blocked.
+		// merge_strategy=pr legitimately needs to call `gh pr create`
+		// as part of its normal workflow (PR.2 pr-create step). Polecats
+		// and other agents are still blocked. Direct `gh pr merge` was
+		// handled above — that's blocked for the refinery too.
 		if refineryAllowedForPR() {
 			return nil
 		}
