@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -90,7 +89,7 @@ func newPipeline(t *testing.T, bodyCap int, nudgeWindow time.Duration) *pipeline
 	handler := transport.NewHandlerWithWriter(
 		[]telegraph.Translator{jiraTr},
 		rawCh,
-		io.Discard,
+		nil, // nil logger suppresses output in tests
 	)
 	srv := httptest.NewServer(handler)
 
