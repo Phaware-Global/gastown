@@ -411,16 +411,37 @@ func (e *Engineer) SetOutput(w io.Writer) {
 	e.output = w
 }
 
-// LoadConfig loads merge queue configuration from the rig's config.json.
+// LoadConfig loads merge queue configuration from the rig's settings file.
+//
+// The merge-queue JSON lives at `<rig>/settings/config.json` alongside
+// the rest of the rig's behavioral settings (theme, workflow, crew,
+// agents, etc.). The rig-root `<rig>/config.json` is the rig IDENTITY
+// file (type, version, name, git_url, default_branch, beads) and does
+// not contain `merge_queue` — reading it here silently returned a
+// zero-valued MergeQueueConfig, which made the PR #25 approval-proof
+// gate a no-op in production (G23). See docs/design/refinery-pr-workflow.md §G23.
+//
+// Fallback: if settings/config.json is missing or has no merge_queue
+// section, fall back to rig-root config.json. Rigs that had merge_queue
+// written to the root by older tooling continue to work; the settings
+// path is preferred.
 func (e *Engineer) LoadConfig() error {
-	configPath := filepath.Join(e.rig.Path, "config.json")
-	data, err := os.ReadFile(configPath)
+	settingsPath := filepath.Join(e.rig.Path, "settings", "config.json")
+	data, err := os.ReadFile(settingsPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			// Use defaults if no config file
-			return nil
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("reading settings: %w", err)
 		}
-		return fmt.Errorf("reading config: %w", err)
+		// Fallback: try rig-root config.json for legacy compatibility.
+		rootPath := filepath.Join(e.rig.Path, "config.json")
+		data, err = os.ReadFile(rootPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Use defaults if neither file exists
+				return nil
+			}
+			return fmt.Errorf("reading config: %w", err)
+		}
 	}
 
 	// Parse config file to extract merge_queue section
