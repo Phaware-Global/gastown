@@ -314,8 +314,9 @@ Rules, in order of bindingness:
    confident you are, or how close to trivial the change is.
 2. **Never construct your own `git push … :main` / `… :refs/heads/main`
    refspec.** Merges happen via the `merge-push` step's documented
-   path (direct: ff-only + push; pr: `gh pr merge`). If the queue is
-   empty, there is nothing to merge — go to orphan-branch-check.
+   path (direct: ff-only + push; pr: `gt refinery pr merge` — see
+   rule 3 for why direct `gh pr merge` is tap-guarded). If the queue
+   is empty, there is nothing to merge — go to orphan-branch-check.
 3. **Under `merge_strategy = "pr"` the refinery does NOT push to main
    at all.** Merges go through `gt refinery pr merge` (the subcommand
    the merge-push step uses in pr mode), which internally subprocesses
@@ -1184,11 +1185,13 @@ Delegates to the VCS provider's merge API, respecting branch protection.
 subcommand runs the same `VerifyPRApproval` gates that PR.6 polled for —
 so if you somehow reach PR.7 without a satisfied approval, the merge is
 refused with a clear pointer back to PR.4 and PR.6. `gh pr merge` is
-blocked by the `pr-workflow` tap-guard (G21 fix); attempting it returns
-a non-zero DIRECT-MERGE-BLOCKED error. If this step fails with
-`requires approving review from … before merge` or `N of M required
-approvals`, DO NOT try to work around it — go back to PR.4
-(request-review) or PR.6 (wait-approval) and resolve the gate.
+blocked by the `pr-workflow` tap-guard (G21 fix); attempting it prints
+a banner titled `❌ DIRECT gh pr merge BLOCKED (G21 fix)` and exits
+non-zero. If `gt refinery pr merge` fails with an error like
+`PR #<n> requires approving review from <user> before merge` or
+`PR #<n> has N of M required approvals`, DO NOT try to work around
+it — go back to PR.4 (request-review) or PR.6 (wait-approval) and
+resolve the gate.
 
 ⚠️ **STOP HERE - DO NOT PROCEED UNTIL THE PR IS ACTUALLY MERGED ON GITHUB**
 
