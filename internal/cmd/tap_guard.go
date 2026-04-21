@@ -251,7 +251,18 @@ func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 		return NewSilentExit(2) // Exit 2 = BLOCK in Claude Code hooks
 	}
 
-	// Check if origin is the maintainer's repo (steveyegge/gastown)
+	// Check if origin is the maintainer's repo (steveyegge/gastown).
+	// The maintainer-origin block targets create/feature-branch commands
+	// (the philosophy: maintainers push directly to main rather than open
+	// PRs against their own repo). It does NOT cover `gh pr merge` — a
+	// maintainer who happens to land an incoming contributor PR with
+	// `gh pr merge` from a maintainer clone is exercising normal review
+	// workflow, not the `create-your-own-PR-to-your-own-repo` antipattern
+	// this block exists to stop. The earlier agent-context branch already
+	// blocked `gh pr merge` for Gas Town agents regardless of origin.
+	if isMerge {
+		return nil
+	}
 	if isMaintainerOrigin() {
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════╗")
