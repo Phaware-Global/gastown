@@ -974,58 +974,22 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
 
 	// Step PR.2: Check approval policy.
 	//
-	// Policy is driven by the new MergeQueueConfig fields (PRApprover,
-	// PRRequiredApprovals). Two independent gates, both must pass:
-	//
-	//   a) If PRApprover is set, that specific user must have an active
-	//      APPROVED review (not dismissed, not superseded by CHANGES_REQUESTED).
-	//   b) If PRRequiredApprovals (resolved) > 0, the total count of distinct
-	//      APPROVED reviewers must meet the threshold.
-	//
-	// The deprecated RequireReview still works because GetPRRequiredApprovals
-	// treats RequireReview=true as PRRequiredApprovals=1.
-	requiredApprovals := e.config.GetPRRequiredApprovals()
-	approver := e.config.PRApprover
-
-	if approver != "" {
-		approved, err := e.prProvider.IsPRApprovedBy(prNumber, approver)
-		if err != nil {
-			return ProcessResult{
-				Success: false,
-				Error:   fmt.Sprintf("failed to check PR #%d approval by %s: %v", prNumber, approver, err),
-			}
-		}
-		if !approved {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d awaiting approval from %s — deferring merge\n", prNumber, approver)
+	// Policy is driven by MergeQueueConfig (PRApprover + GetPRRequiredApprovals).
+	// Shared with the `gt refinery pr merge` CLI subcommand via VerifyPRApproval
+	// so patrol and CLI paths enforce identical gates.
+	if err := VerifyPRApproval(e.prProvider, e.config, prNumber, e.output); err != nil {
+		var needsApproval *NeedsApprovalError
+		if errors.As(err, &needsApproval) {
 			return ProcessResult{
 				Success:       false,
 				NeedsApproval: true,
-				Error:         fmt.Sprintf("PR #%d requires approving review from %s before merge", prNumber, approver),
+				Error:         err.Error(),
 			}
 		}
-		_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d has approving review from %s\n", prNumber, approver)
-	}
-
-	if requiredApprovals > 0 {
-		count, err := e.prProvider.CountApprovals(prNumber)
-		if err != nil {
-			return ProcessResult{
-				Success: false,
-				Error:   fmt.Sprintf("failed to count approvals on PR #%d: %v", prNumber, err),
-			}
+		return ProcessResult{
+			Success: false,
+			Error:   err.Error(),
 		}
-		if count < requiredApprovals {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d has %d/%d required approvals — deferring merge\n",
-				prNumber, count, requiredApprovals)
-			return ProcessResult{
-				Success:       false,
-				NeedsApproval: true,
-				Error: fmt.Sprintf("PR #%d has %d of %d required approvals",
-					prNumber, count, requiredApprovals),
-			}
-		}
-		_, _ = fmt.Fprintf(e.output, "[Engineer] PR #%d has %d/%d required approvals\n",
-			prNumber, count, requiredApprovals)
 	}
 
 	// Step PR.3: Merge via VCS provider API using the configured method.

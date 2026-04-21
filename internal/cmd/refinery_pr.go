@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -152,33 +153,35 @@ func init() {
 }
 
 // getRefineryPRContext builds the PRProvider for the rig inferred from cwd.
-// Returns the provider + the rig-relative git working directory for diagnostics.
-func getRefineryPRContext() (refinery.PRProvider, *rig.Rig, error) {
+// Returns the provider + the rig-level MergeQueueConfig (needed for approval
+// gate enforcement in the CLI merge path, G21 fix) + the rig-relative git
+// working directory for diagnostics.
+func getRefineryPRContext() (refinery.PRProvider, *refinery.MergeQueueConfig, *rig.Rig, error) {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
-		return nil, nil, fmt.Errorf("not in a Gas Town workspace: %w", err)
+		return nil, nil, nil, fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 	rigName, err := inferRigFromCwd(townRoot)
 	if err != nil {
-		return nil, nil, fmt.Errorf("could not determine rig: %w", err)
+		return nil, nil, nil, fmt.Errorf("could not determine rig: %w", err)
 	}
 	_, r, err := getRig(rigName)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	eng := refinery.NewEngineer(r)
 	if lerr := eng.LoadConfig(); lerr != nil {
-		return nil, nil, fmt.Errorf("loading rig merge_queue config: %w", lerr)
+		return nil, nil, nil, fmt.Errorf("loading rig merge_queue config: %w", lerr)
 	}
 	provider, err := eng.PRProvider()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if provider == nil {
-		return nil, nil, fmt.Errorf("no PR provider for rig %s (merge_strategy=%q)", rigName, eng.Config().MergeStrategy)
+		return nil, nil, nil, fmt.Errorf("no PR provider for rig %s (merge_strategy=%q)", rigName, eng.Config().MergeStrategy)
 	}
-	return provider, r, nil
+	return provider, eng.Config(), r, nil
 }
 
 func parsePRNumber(arg string) (int, error) {
@@ -209,7 +212,7 @@ func runRefineryPrCreate(cmd *cobra.Command, args []string) error {
 		body = string(data)
 	}
 
-	provider, _, err := getRefineryPRContext()
+	provider, _, _, err := getRefineryPRContext()
 	if err != nil {
 		return err
 	}
@@ -236,7 +239,7 @@ func runRefineryPrWaitCI(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	provider, _, err := getRefineryPRContext()
+	provider, _, _, err := getRefineryPRContext()
 	if err != nil {
 		return err
 	}
@@ -269,7 +272,7 @@ func runRefineryPrRequestReview(cmd *cobra.Command, args []string) error {
 	if len(refPrRequestReviewers) == 0 {
 		return fmt.Errorf("at least one --user is required")
 	}
-	provider, _, err := getRefineryPRContext()
+	provider, _, _, err := getRefineryPRContext()
 	if err != nil {
 		return err
 	}
@@ -286,7 +289,7 @@ func runRefineryPrThreads(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	provider, _, err := getRefineryPRContext()
+	provider, _, _, err := getRefineryPRContext()
 	if err != nil {
 		return err
 	}
@@ -336,7 +339,7 @@ func runRefineryPrWaitApproval(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("wait-approval requires at least one gate: " +
 			"set --approver=<user> and/or --min-approvals=<n≥1>")
 	}
-	provider, _, err := getRefineryPRContext()
+	provider, _, _, err := getRefineryPRContext()
 	if err != nil {
 		return err
 	}
@@ -404,8 +407,31 @@ func runRefineryPrMerge(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	provider, _, err := getRefineryPRContext()
+	provider, cfg, _, err := getRefineryPRContext()
 	if err != nil {
+		return err
+	}
+
+	// G21 fix: enforce the same approval gate the patrol formula asserts at
+	// PR.6 (wait-approval). Before this check, the CLI subcommand called
+	// provider.MergePR() directly — making `gt refinery pr merge <n>` a
+	// one-step review bypass if the refinery LLM reached it without running
+	// request-review / wait-approval first. Sharing VerifyPRApproval with
+	// doMergePR ensures both paths reject on the same gates.
+	//
+	// Rigs that leave both PRApprover and PRRequiredApprovals unconfigured
+	// get no gate (opt-in) — existing behavior for rigs that haven't
+	// adopted the approval policy is preserved.
+	if err := refinery.VerifyPRApproval(provider, cfg, prNumber, nil); err != nil {
+		var needsApproval *refinery.NeedsApprovalError
+		if errors.As(err, &needsApproval) {
+			return fmt.Errorf("%w\n\n"+
+				"The refinery patrol formula requires `gt refinery pr request-review` (PR.4) "+
+				"and `gt refinery pr wait-approval` (PR.6) to run between pr-create and pr-merge. "+
+				"If PR #%d is genuinely ready to land, re-run those steps; if this is an operator "+
+				"adoption path for an orphan branch, merge via `gh pr merge` on the CLI outside "+
+				"the refinery session", err, prNumber)
+		}
 		return err
 	}
 
