@@ -13,6 +13,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/telegraph"
+	"github.com/steveyegge/gastown/internal/telegraph/tlog"
 )
 
 // MailSender abstracts mail delivery. Satisfied by *mail.Router in production
@@ -42,6 +43,7 @@ type Transformer struct {
 	nudger      Nudger
 	bodyCap     int
 	nudgeWindow time.Duration
+	log         *tlog.Logger // nil disables logging
 
 	mu        sync.Mutex
 	lastNudge time.Time
@@ -50,20 +52,27 @@ type Transformer struct {
 // New returns a Transformer. bodyCap is the maximum bytes of external text
 // written into the mail body; content beyond the cap is truncated. nudgeWindow
 // is the minimum interval between consecutive Mayor nudges; zero disables nudges.
-func New(sender MailSender, nudger Nudger, bodyCap int, nudgeWindow time.Duration) *Transformer {
+// logger may be nil to disable structured logging.
+func New(sender MailSender, nudger Nudger, bodyCap int, nudgeWindow time.Duration, logger ...*tlog.Logger) *Transformer {
+	var l *tlog.Logger
+	if len(logger) > 0 {
+		l = logger[0]
+	}
 	return &Transformer{
 		sender:      sender,
 		nudger:      nudger,
 		bodyCap:     bodyCap,
 		nudgeWindow: nudgeWindow,
+		log:         l,
 	}
 }
 
 // NewProduction returns a Transformer wired to a production mail router and an
 // exec-based nudger. townRoot is used to construct the Router's working directory.
-func NewProduction(townRoot string, bodyCap int, nudgeWindow time.Duration) *Transformer {
+// logger may be nil to disable structured logging.
+func NewProduction(townRoot string, bodyCap int, nudgeWindow time.Duration, logger *tlog.Logger) *Transformer {
 	router := mail.NewRouterWithTownRoot(townRoot, townRoot)
-	return New(router, &ExecNudger{}, bodyCap, nudgeWindow)
+	return New(router, &ExecNudger{}, bodyCap, nudgeWindow, logger)
 }
 
 // Transform builds a Mayor-addressed mail envelope from event, sends it via the
@@ -81,12 +90,16 @@ func (t *Transformer) Transform(event *telegraph.NormalizedEvent) error {
 		return fmt.Errorf("telegraph/transform: mail send: %w", err)
 	}
 
-	t.maybeNudge()
+	// mail_id is not returned by MailSender.Send in v1; omit from log.
+	t.log.Deliver(event.Provider, event.EventType, event.EventID, event.Actor, event.Subject, "")
+
+	t.maybeNudge(event)
 	return nil
 }
 
 // maybeNudge sends a nudge to Mayor if the rate-limit window has elapsed.
-func (t *Transformer) maybeNudge() {
+// event is used for logging context only.
+func (t *Transformer) maybeNudge(_ *telegraph.NormalizedEvent) {
 	if t.nudgeWindow <= 0 || t.nudger == nil {
 		return
 	}
@@ -95,6 +108,7 @@ func (t *Transformer) maybeNudge() {
 	now := time.Now()
 	if now.Sub(t.lastNudge) < t.nudgeWindow {
 		t.mu.Unlock()
+		t.log.NudgeSuppressed()
 		return
 	}
 	t.lastNudge = now
@@ -102,6 +116,7 @@ func (t *Transformer) maybeNudge() {
 
 	// Nudge failure is non-fatal: Mayor will discover mail on next inbox check.
 	_ = t.nudger.Nudge("mayor/", "Telegraph: new events pending")
+	t.log.NudgeSent()
 }
 
 // buildFrom returns the sender address: telegraph/<provider>/<actor>.
