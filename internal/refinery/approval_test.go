@@ -51,10 +51,14 @@ func (f *fakePRProvider) ChecksRollup(int) (string, bool, error)        { panic(
 func intPtr(i int) *int { return &i }
 
 func TestVerifyPRApproval_NoGatesConfigured_ReturnsNil(t *testing.T) {
-	// Rig opts out of approval policy by leaving both PRApprover unset and
-	// PRRequiredApprovals=0. Preserves existing rig behavior.
+	// A config with no approval gates — neither PRApprover set nor a
+	// positive PRRequiredApprovals — is a no-op. Engineer.LoadConfig
+	// rejects this combination when MergeStrategy="pr", but callers
+	// can still reach VerifyPRApproval with it (non-pr strategy that
+	// opted in elsewhere, or test-constructed configs that bypass
+	// LoadConfig). The helper must be safe for both.
 	cfg := &MergeQueueConfig{
-		MergeStrategy:       "pr",
+		MergeStrategy:       "direct",
 		PRApprover:          "",
 		PRRequiredApprovals: intPtr(0),
 	}

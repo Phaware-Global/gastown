@@ -34,8 +34,21 @@ func (e *NeedsApprovalError) Error() string { return e.Detail }
 //	b) If cfg.GetPRRequiredApprovals() > 0, the count of distinct
 //	   approving reviewers must meet the threshold.
 //
-// When neither gate is configured, returns nil immediately (preserves
-// opt-in behavior for rigs that haven't defined approval policy).
+// Under MergeStrategy="pr", config validation in Engineer.LoadConfig
+// requires a non-empty PRApprover, so the "both gates absent → return
+// nil" branch below is not reachable on a production pr-mode rig. It
+// is kept as a defense-in-depth no-op for call sites that reach
+// VerifyPRApproval with a non-pr or test-constructed config (e.g., the
+// CLI subcommand under an mr-mode rig that opted in to approval
+// via PRRequiredApprovals only, or unit tests that build
+// MergeQueueConfig directly bypassing LoadConfig). Returning nil in
+// those cases is correct: there is no gate to enforce.
+//
+// Context plumbing: VerifyPRApproval performs network I/O via the
+// PRProvider methods but does not accept a context.Context yet —
+// neither PRProvider.IsPRApprovedBy nor CountApprovals take one. When
+// the provider interface is updated to be context-aware, this helper
+// and doMergePR should thread context through. Out of scope for G21.
 //
 // out is optional — when non-nil, VerifyPRApproval emits
 // [Engineer]-prefixed progress lines for each gate consulted, matching

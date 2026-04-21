@@ -154,8 +154,8 @@ func init() {
 
 // getRefineryPRContext builds the PRProvider for the rig inferred from cwd.
 // Returns the provider + the rig-level MergeQueueConfig (needed for approval
-// gate enforcement in the CLI merge path, G21 fix) + the rig-relative git
-// working directory for diagnostics.
+// gate enforcement in the CLI merge path, G21 fix) + the *rig.Rig handle
+// (used by callers that need rig metadata beyond MergeQueue).
 func getRefineryPRContext() (refinery.PRProvider, *refinery.MergeQueueConfig, *rig.Rig, error) {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
