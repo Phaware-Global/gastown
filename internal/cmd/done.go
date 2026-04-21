@@ -577,10 +577,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// which avoids unreliable cross-rig dep resolution at gt done time.
 		// Fallback: dep-based lookup via getConvoyInfoForIssue (for issues dispatched
 		// before this fix, or where attachment fields weren't set).
-		convoyInfo = getConvoyInfoFromIssue(issueID, cwd)
-		if convoyInfo == nil {
-			convoyInfo = getConvoyInfoForIssue(issueID)
-		}
+		// G22 fix: use resolveConvoyInfoForIssue which applies the pr-mode
+		// override (direct/local → mr when rig is pr-mode). Both this
+		// primary site and the late-detected fallback below must route
+		// through the same helper — if the override only fires at one
+		// site, the bypass walks past it to the other. See the helper's
+		// doc for the full rationale.
+		convoyInfo = resolveConvoyInfoForIssue(issueID, cwd, townRoot, rigName)
 
 		// Handle "local" strategy: skip push and MR entirely
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "local" {
@@ -1028,10 +1031,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// attachment-field fix, or where dep-based lookup failed at that point.
 		// At this stage the branch was pushed to origin/<branch> (feature branch),
 		// NOT to main. So we must push to main now before skipping MR creation.
-		convoyInfo = getConvoyInfoFromIssue(issueID, cwd)
-		if convoyInfo == nil {
-			convoyInfo = getConvoyInfoForIssue(issueID)
-		}
+		//
+		// G22 fix: use the pr-mode-aware resolver so the late-detected path
+		// ALSO honors the rig's pr-mode override, not just the primary site.
+		convoyInfo = resolveConvoyInfoForIssue(issueID, cwd, townRoot, rigName)
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Late-detected direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
 			fmt.Printf("  Convoy: %s\n", convoyInfo.ID)
