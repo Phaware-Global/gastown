@@ -6,12 +6,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/telegraph"
 )
+
+const bodyReadLimit = 1 << 20 // 1 MiB
 
 // Handler is an http.Handler that routes POST /webhook/<provider> requests,
 // authenticates them via the appropriate Translator, and enqueues RawEvents.
@@ -24,8 +28,11 @@ type Handler struct {
 // NewHandler creates a Handler for the given translators and raw-event channel.
 // Only translators whose Provider() key is present are accepted; callers should
 // exclude disabled providers before calling.
-// logW receives one JSON line per accept/reject event. Pass os.Stderr if unset.
+// logW receives one JSON line per accept/reject event. Defaults to os.Stderr if nil.
 func NewHandler(translators []telegraph.Translator, rawCh chan<- telegraph.RawEvent, logW io.Writer) *Handler {
+	if logW == nil {
+		logW = os.Stderr
+	}
 	m := make(map[string]telegraph.Translator, len(translators))
 	for _, t := range translators {
 		m[t.Provider()] = t
@@ -48,7 +55,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	provider := after
-	sourceIP := r.RemoteAddr
+	sourceIP := remoteIP(r.RemoteAddr)
 
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -62,11 +69,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cap reads at 1 MiB to prevent OOM from oversized payloads.
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	// Read up to bodyReadLimit bytes. Use LimitedReader so we can detect
+	// truncation: if N reaches 0 the body was at or beyond the limit.
+	lr := &io.LimitedReader{R: r.Body, N: bodyReadLimit}
+	body, err := io.ReadAll(lr)
 	if err != nil {
 		h.writeReject(provider, sourceIP, "parse_error", "")
 		http.Error(w, "failed to read request body", http.StatusBadRequest)
+		return
+	}
+	if lr.N == 0 {
+		// Body was exactly at or exceeded the limit; reject rather than
+		// silently forwarding a truncated (and HMAC-mismatching) payload.
+		h.writeReject(provider, sourceIP, "parse_error", "")
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -99,6 +115,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Event ID is not available at L1 (extracted by L2). Omit from accept log.
 	h.writeAccept(provider, sourceIP, "")
 	w.WriteHeader(http.StatusOK)
+}
+
+// remoteIP extracts the IP address from an "ip:port" RemoteAddr string.
+// Falls back to the raw value if parsing fails.
+func remoteIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
 }
 
 // lowerHeaders returns a map of HTTP headers with all keys in lowercase.
@@ -152,7 +178,6 @@ func (h *Handler) writeReject(provider, sourceIP, reason, eventID string) {
 func (h *Handler) writeEntry(e logEntry) {
 	data, err := json.Marshal(e)
 	if err != nil {
-		// Should never happen with this struct; fall back to plain text.
 		fmt.Fprintf(h.logW, `{"component":"telegraph","event":"log_error","err":%q}`+"\n", err.Error())
 		return
 	}

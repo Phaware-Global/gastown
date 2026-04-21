@@ -272,3 +272,95 @@ var _ http.Handler = (*transport.Handler)(nil)
 
 // Ensure io.Writer is accepted (compile-time check via io.Discard).
 var _ io.Writer = io.Discard
+
+// ---- fixes for PR #22 review comments ----
+
+func TestHandler_NilLogWDefaultsToStderr(t *testing.T) {
+	// NewHandler with nil logW must not panic; it falls back to os.Stderr.
+	tr := &fakeTranslator{provider: "jira"}
+	rawCh := make(chan telegraph.RawEvent, 8)
+	h := transport.NewHandler([]telegraph.Translator{tr}, rawCh, nil)
+
+	w := post(h, "/webhook/jira", `{}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d (nil logW should not panic)", w.Code)
+	}
+}
+
+func TestHandler_SourceIPStripsPort(t *testing.T) {
+	tr := &fakeTranslator{provider: "jira"}
+	_, rawCh, logBuf := makeHandler(t, []telegraph.Translator{tr}, 8)
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/jira", strings.NewReader(`{}`))
+	// httptest sets RemoteAddr; override it to a realistic "ip:port" value.
+	req.RemoteAddr = "203.0.113.42:54321"
+	w := httptest.NewRecorder()
+	transport.NewHandler([]telegraph.Translator{tr}, rawCh, logBuf).ServeHTTP(w, req)
+
+	lines := logLines(logBuf)
+	if len(lines) == 0 {
+		t.Fatal("no log lines")
+	}
+	sourceIP := lines[0]["source_ip"]
+	if strings.Contains(sourceIP, ":") {
+		t.Errorf("source_ip contains port: %q — expected bare IP", sourceIP)
+	}
+	if sourceIP != "203.0.113.42" {
+		t.Errorf("source_ip = %q, want 203.0.113.42", sourceIP)
+	}
+}
+
+func TestHandler_SourceIPStripsPort_RawEventAlso(t *testing.T) {
+	tr := &fakeTranslator{provider: "jira"}
+	rawCh := make(chan telegraph.RawEvent, 8)
+	logBuf := &bytes.Buffer{}
+	h := transport.NewHandler([]telegraph.Translator{tr}, rawCh, logBuf)
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/jira", strings.NewReader(`{}`))
+	req.RemoteAddr = "198.51.100.7:12345"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	evt := <-rawCh
+	if strings.Contains(evt.SourceIP, ":") {
+		t.Errorf("RawEvent.SourceIP contains port: %q", evt.SourceIP)
+	}
+}
+
+func TestHandler_OversizeBodyReturns413(t *testing.T) {
+	tr := &fakeTranslator{provider: "jira"}
+	_, rawCh, logBuf := makeHandler(t, []telegraph.Translator{tr}, 8)
+
+	// Body exactly at the limit (1 MiB) should be rejected with 413.
+	oversizeBody := strings.Repeat("x", 1<<20)
+	req := httptest.NewRequest(http.MethodPost, "/webhook/jira", strings.NewReader(oversizeBody))
+	w := httptest.NewRecorder()
+	transport.NewHandler([]telegraph.Translator{tr}, rawCh, logBuf).ServeHTTP(w, req)
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("want 413, got %d", w.Code)
+	}
+	if len(rawCh) != 0 {
+		t.Error("oversize body must not be enqueued")
+	}
+	lines := logLines(logBuf)
+	if len(lines) != 1 || lines[0]["reason"] != "parse_error" {
+		t.Errorf("unexpected log: %v", lines)
+	}
+}
+
+func TestHandler_UndersizeBodyAccepted(t *testing.T) {
+	tr := &fakeTranslator{provider: "jira"}
+	h, rawCh, _ := makeHandler(t, []telegraph.Translator{tr}, 8)
+
+	// Body 1 byte under the limit must be accepted normally.
+	body := strings.Repeat("x", (1<<20)-1)
+	w := post(h, "/webhook/jira", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", w.Code)
+	}
+	evt := <-rawCh
+	if len(evt.Body) != (1<<20)-1 {
+		t.Errorf("body len = %d, want %d", len(evt.Body), (1<<20)-1)
+	}
+}
