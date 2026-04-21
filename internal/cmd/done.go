@@ -577,38 +577,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// which avoids unreliable cross-rig dep resolution at gt done time.
 		// Fallback: dep-based lookup via getConvoyInfoForIssue (for issues dispatched
 		// before this fix, or where attachment fields weren't set).
-		convoyInfo = getConvoyInfoFromIssue(issueID, cwd)
-		if convoyInfo == nil {
-			convoyInfo = getConvoyInfoForIssue(issueID)
-		}
-
-		// G22 fix: the rig's merge_strategy wins over the bead-stamped
-		// merge_strategy when they disagree. G16 documented that the
-		// dispatcher can stamp `direct`/`local` on work beads under a
-		// pr-mode rig; the rig config is authoritative. Under pr-mode
-		// the direct/local convoy shortcuts close the work bead without
-		// ever creating a PR — that's the silent data-loss shape
-		// gt-78h exhibited (bead closed, commit never merged).
-		//
-		// The override is narrow (see shouldForcePRPath): only when
-		// the rig is pr-mode AND the bead says direct/local do we
-		// force "mr" so the default mr-path runs and the G11 fix
-		// creates a PR for the work. Non-pr rigs preserve existing
-		// behavior — the bead's strategy is honored as before.
-		if convoyInfo != nil {
-			rigSettingsPath := filepath.Join(townRoot, rigName, "settings", "config.json")
-			var rigStrategy string
-			if rigSettings, rigErr := config.LoadRigSettings(rigSettingsPath); rigErr == nil &&
-				rigSettings.MergeQueue != nil {
-				rigStrategy = rigSettings.MergeQueue.MergeStrategy
-			}
-			if shouldForcePRPath(convoyInfo.MergeStrategy, rigStrategy) {
-				style.PrintWarning("G22: bead-stamped merge_strategy=%q conflicts with rig pr-mode — "+
-					"forcing pr-path to prevent silent close-without-merge",
-					convoyInfo.MergeStrategy)
-				convoyInfo.MergeStrategy = "mr"
-			}
-		}
+		// G22 fix: use resolveConvoyInfoForIssue which applies the pr-mode
+		// override (direct/local → mr when rig is pr-mode). Both this
+		// primary site and the late-detected fallback below must route
+		// through the same helper — if the override only fires at one
+		// site, the bypass walks past it to the other. See the helper's
+		// doc for the full rationale.
+		convoyInfo = resolveConvoyInfoForIssue(issueID, cwd, townRoot, rigName)
 
 		// Handle "local" strategy: skip push and MR entirely
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "local" {
@@ -1056,10 +1031,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// attachment-field fix, or where dep-based lookup failed at that point.
 		// At this stage the branch was pushed to origin/<branch> (feature branch),
 		// NOT to main. So we must push to main now before skipping MR creation.
-		convoyInfo = getConvoyInfoFromIssue(issueID, cwd)
-		if convoyInfo == nil {
-			convoyInfo = getConvoyInfoForIssue(issueID)
-		}
+		//
+		// G22 fix: use the pr-mode-aware resolver so the late-detected path
+		// ALSO honors the rig's pr-mode override, not just the primary site.
+		convoyInfo = resolveConvoyInfoForIssue(issueID, cwd, townRoot, rigName)
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Late-detected direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
 			fmt.Printf("  Convoy: %s\n", convoyInfo.ID)

@@ -12,6 +12,8 @@ import (
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -132,6 +134,46 @@ type ConvoyInfo struct {
 // This is the key check for skipping witness/refinery merge pipeline.
 func (c *ConvoyInfo) IsOwnedDirect() bool {
 	return c != nil && c.Owned && c.MergeStrategy == "direct"
+}
+
+// resolveConvoyInfoForIssue fetches the convoy info for an issue (primary:
+// attachment-field lookup, fallback: dep-based lookup) and applies the G22
+// pr-mode override — when the rig is pr-mode but the bead is stamped with
+// a `direct`/`local` convoy strategy, the MergeStrategy is rewritten to
+// `mr` so the default mr-path runs and the work goes through PR review
+// instead of silently closing.
+//
+// Both `gt done` convoy-resolution sites (the primary at the top of the
+// merge logic and the "late-detected direct convoy" fallback further
+// down) must consult the same resolver — if the override only fires at
+// one site, the bypass simply walks past to the other site. This helper
+// is the single source of truth for convoy-info-with-override; call
+// this, never getConvoyInfoFromIssue / getConvoyInfoForIssue directly,
+// from gt-done's merge decision path.
+//
+// townRoot and rigName are required for the rig-settings lookup. Returns
+// nil when no convoy tracks the issue.
+func resolveConvoyInfoForIssue(issueID, cwd, townRoot, rigName string) *ConvoyInfo {
+	info := getConvoyInfoFromIssue(issueID, cwd)
+	if info == nil {
+		info = getConvoyInfoForIssue(issueID)
+	}
+	if info == nil {
+		return nil
+	}
+	rigSettingsPath := config.RigSettingsPath(filepath.Join(townRoot, rigName))
+	var rigStrategy string
+	if rigSettings, err := config.LoadRigSettings(rigSettingsPath); err == nil &&
+		rigSettings.MergeQueue != nil {
+		rigStrategy = rigSettings.MergeQueue.MergeStrategy
+	}
+	if shouldForcePRPath(info.MergeStrategy, rigStrategy) {
+		style.PrintWarning("G22: bead-stamped merge_strategy=%q conflicts with rig pr-mode — "+
+			"forcing pr-path to prevent silent close-without-merge",
+			info.MergeStrategy)
+		info.MergeStrategy = "mr"
+	}
+	return info
 }
 
 // shouldForcePRPath returns true when a bead-stamped convoy merge_strategy
