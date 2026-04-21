@@ -1813,36 +1813,206 @@ already documented. Filed here as a concrete postmortem so the
 numbers (12h wait, 0 augment reviews, 4 unresolved threads at
 merge) are preserved.
 
-### G20 — Coordination deadlock after dispatcher "re-dispatch vs adopt" prompt
 
-Observed 2026-04-20 ~18:00Z after the maintainer prompted the mayor to re-sling the stuck L1/L2 beads (gt-d0t, gt-458). The mayor did re-sling work wisps (gt-wisp-xt05 → furiosa, gt-wisp-09nw → nux) but then entered a holding pattern that no role breaks:
+### G20 — Missing "resume-after-hold" clearance protocol
 
-- **Mayor**: "Idle — waiting on polecat completion signals"
-- **Witness**: "(redispatch vs adopt) before L1/L2 can land" — sautéing cycle after cycle
-- **Polecats** (furiosa, nux): held per witness instruction *"STAND BY IDLE — do NOT create a PR or run gt done. Your branch is on HOLD per Mayor instruction. Awaiting overseer decision on orphan branch disposition."*
-- **Refinery**: "Queue empty, no open PRs... MERGE_READY hasn't arrived yet. Monitoring; will process immediately when it lands."
+#### Problem
 
-Each role is waiting on a different role's action:
+Gas Town's safety model gives the **witness** authority to place a hold on
+a polecat's forward progress — *"STAND BY IDLE — do not create a PR or run
+gt done"* — when it detects a risky state (orphan branch, policy-violation
+risk, unresolved escalation). The hold is enforcement-only: it tells the
+polecat to stop, and the polecat complies.
 
-- Mayor waits for polecat completion.
-- Polecats wait for witness clearance.
-- Witness waits for dispatcher decision (re-dispatch vs adopt).
-- Refinery waits for MERGE_READY from polecats.
+What's missing is a symmetric **clearance** signal that the hold-putter
+receives when the condition that caused the hold is resolved. Today there
+is no channel for *"the situation is now safe to resume"* that any role
+emits automatically. The hold-then-resume sequence requires the hold to be
+lifted explicitly, and nothing in the current protocol does that.
 
-The "dispatcher decision" the witness is waiting on was supposed to be the mayor's re-sling — but the mayor interpreted the re-sling as resolved-enough to move on to monitoring, without issuing an explicit "OK, proceed" to clear the witness's hold. The witness's hold message itself names "overseer" as the decider, which resolves to the human maintainer, so the deadlock is actually: *everyone is waiting for the human to say "OK, proceed" again*. Zero motion in 25+ minutes.
+Concrete deadlock (observed 2026-04-20 ~18:00Z, dogfood reproduction):
 
-This is a coordination-protocol gap, not a bug in any one role. The mayor's re-sling action is observable (wisp dispatch) but not semantically equivalent to "clearance granted" from the witness's perspective. The witness's hold phrasing ("awaiting overseer decision") doesn't distinguish between mayor decisions and human decisions.
+- The maintainer prompted the mayor to re-sling stuck L1/L2 beads
+  (gt-d0t, gt-458 from Telegraph v1).
+- Mayor re-slung work wisps (gt-wisp-xt05 → furiosa, gt-wisp-09nw → nux),
+  then went idle: *"waiting on polecat completion signals"*.
+- Witness still held polecats per its previous instruction:
+  *"STAND BY IDLE — awaiting overseer decision on orphan branch
+  disposition."*
+- Polecats complied: idle, no `gt done`, no PR.
+- Refinery monitored for a MERGE_READY that can't arrive until polecats
+  complete.
+- Zero motion for 25+ minutes.
 
-Side-observation that compounds G20: **nux polecat ran `gt done --pre-verified --target main --issue gt-458` prematurely** — before witness clearance — and reported "MR bead created (gt-wisp-4qd), witness notified". The bead ID gt-wisp-4qd is not findable via `bd show` nor by grep across any beads DB on disk; the polecat appears to have hallucinated the success. Witness then told nux "STOP — do NOT run gt done again", but the horse was already out of the barn from the polecat's point of view (it believes it's done). This is a variant of G19-family improvisation: when a polecat receives a re-sling signal, its LLM interprets "work here" without waiting for explicit go-ahead from the witness that would normally gate post-resume completion.
+Each role was waiting on a different role's action:
 
-Fix direction:
+```
+  Mayor ────(waits for)────▶ polecat completion
+  Polecats ──(wait for)───▶ witness clearance
+  Witness ───(waits for)──▶ "overseer decision" (ambiguous: mayor or human?)
+  Refinery ──(waits for)──▶ MERGE_READY from polecats
+```
 
-1. **Mayor's re-sling should issue an explicit witness clearance.** When the mayor re-slings work and has authorization to proceed, it should send the witness a "CLEAR gt-d0t / gt-458" message so the witness can relay "OK, gt done is allowed" to the polecats. Without this, the witness holds indefinitely on an ambiguous "overseer" signal.
+The witness's *"awaiting overseer decision"* phrasing resolves, in
+practice, to the human maintainer because no automated role emits a
+clearance matching that shape. The mayor's re-sling action is observable
+(wisp dispatch) but not semantically equivalent to *"clearance granted"*
+from the witness's perspective. Until the human (or an explicitly-scripted
+mayor prompt) says *"OK, proceed"*, every role sits.
 
-2. **Witness hold messages should name the decider explicitly.** "Awaiting overseer decision" is too vague when the overseer could be the mayor (automated) or the human (manual). A polecat reading the hold can't know whether to expect clearance from mayor mail vs an external human signal. Phrasings like "Awaiting clearance from mayor/ for gt-d0t disposition" would make the dependency chain legible.
+#### Why G20 is visible now (and wasn't before)
 
-3. **Polecats should wait for witness clearance before `gt done`, not just on "work hooked" signals.** Nux's premature gt done suggests the polecat prompt treats any inbound wisp/nudge as permission to act. In the hold-then-resume pattern a re-sling isn't enough — the polecat must also have a "proceed" from the witness. The witness's existing "STAND BY IDLE" nudge is enforcement; what's missing is a symmetric "CLEAR" nudge that the polecat waits for.
+G20 is not a regression of any landed fix. It's a **protocol gap that was
+previously masked by G1-class bugs**.
 
-4. **Hallucinated MR-bead IDs are a real failure mode.** Nux's "MR bead gt-wisp-4qd created" report matches no bead on disk. Either gt done's output was misread, or the LLM fabricated the ID. Either way, downstream roles that trust polecat self-reports of MR creation will chase ghost IDs. A simple defense: the witness or refinery should verify the claimed MR bead exists before trusting the polecat's completion signal.
+Before the fix stack:
 
-Not blocking — the coordination hold resolves as soon as the human (or an automated clearance) unsticks it. But in an autonomous gastown that wants to run without daily human handholding, this specific hold pattern is load-bearing on external input.
+- **G1** (refinery improvising direct-to-main merges on orphan branches):
+  the refinery didn't respect holds — it would short-circuit the hold and
+  land work. Wrong outcome, but fast — no persistent hold state formed.
+- **G19b/c** (polecat manually creating PRs): polecats bypassed the
+  refinery entirely. Holds in the refinery/mayor didn't matter because
+  the polecat acted independently.
+
+After the fix stack (G8 orphan-branch-check, G19b tap-guard, G19c gt-done
+banner): refinery correctly escalates-and-parks, polecats correctly defer
+PR creation, witness correctly enforces holds. Every role respects the
+safety boundary. **That correctness is what exposes the missing clearance
+channel.** The system is now safe by default *and* stuck by default when
+a hold needs clearing.
+
+#### Scope: this is broader than re-sling
+
+Re-sling is the first path that hit G20 in the wild, but the underlying
+gap is the general **"hold-then-resume after recovery"** pattern. Other
+paths that land in the same deadlock shape:
+
+| Trigger | Who places the hold | Who should clear it | Same gap? |
+|---|---|---|---|
+| Re-sling stranded beads (this observation) | witness | mayor (on re-sling) | yes |
+| Restart recovery (binary upgrade, `gt down`/`gt up` mid-flight) | witness (post-restart safety) | mayor (on resume) | yes |
+| Polecat crash recovery (context overflow, zombie) | witness (detects dead polecat) | mayor (on re-dispatch) | yes |
+| Refinery conflict-resolution hold (MR conflict, re-gate) | refinery (conflict MR) | polecat (on resolve) | yes |
+| `gt estop` → `gt thaw` | boot / emergency-stop | operator (on thaw) | yes |
+| Infra blip recovery (G9 Dolt lock, G15 schema drift) | affected role | mayor/operator (on heal) | yes |
+
+All share the same missing element: the **action that logically should
+clear the hold does not emit a clearance signal**. Re-sling is the most
+common path during active development and binary upgrades — exactly the
+mode Gas Town is in during dogfood phases.
+
+#### Frequency
+
+| Operational mode | Re-sling / resume-after-hold frequency |
+|---|---|
+| Stable, unchanging gastown (no upgrades, no crashes) | rare — weeks between incidents |
+| Active development with binary upgrades | **very common** — every `gt down` / `gt up` cycle risks it if polecats are mid-flight |
+| Infra-flaky gastown (Dolt lock, schema drift, mail flood) | **very common** — each infra blip strands work that needs resume |
+
+Even in "rare" mode, the deadlock is **unrecoverable-by-gastown-itself**
+and requires maintainer intervention every time. That's a worse property
+than a low-frequency bug that self-heals; it's a permanent dependency on
+external input every time the code path is exercised.
+
+#### Compound failure observed
+
+Side-observation that compounds G20 into a harder problem: **nux polecat
+ran `gt done --pre-verified --target main --issue gt-458` prematurely** —
+before any witness clearance — and reported *"MR bead created
+(gt-wisp-4qd), witness notified"*. The bead ID gt-wisp-4qd is not
+findable via `bd show` nor by grep across any beads DB on disk. The
+polecat appears to have hallucinated the success. The witness responded
+with *"STOP — do NOT run gt done again"*, but from the polecat's point of
+view the horse was already out of the barn — it believes it's done.
+
+This is G19-family improvisation applied to the resume case. When a
+polecat receives a re-sling signal, its LLM treats *"work here"* as
+permission to advance without waiting for explicit witness go-ahead. The
+existing hold (*"STAND BY IDLE"*) is enforcement; what's missing from the
+polecat's mental model is a symmetric *"CLEAR"* signal that it should
+wait for before acting on a resumed task.
+
+#### Proposed solution: "resume actions emit clearance"
+
+A single protocol convention that, if applied uniformly across the
+resume-triggering call sites, resolves G20 for every trigger in the
+table above:
+
+> **Every action that resumes work past a hold must emit an explicit
+> clearance message to the role that placed the hold.**
+
+Concrete mechanics, in roughly increasing order of scope:
+
+1. **Mayor's re-sling emits witness clearance.** When the mayor calls
+   `gt sling` with intent to resume (or specifically to adopt a stranded
+   branch), it follows up with `gt mail send <rig>/witness --subject
+   "CLEAR <source-issue-id>" --body "Re-slung; proceed with gt done"`.
+   The witness's current hold, which names the source-issue in its
+   "STAND BY" message, matches on the issue ID and emits a matching
+   *"CLEAR"* to the affected polecat. Polecat then runs `gt done`
+   normally.
+
+2. **Polecat waits for witness CLEAR before gt done on resume paths.**
+   If a polecat was previously held (detects this by reading its own
+   recent inbox for a "STAND BY IDLE" message on the current issue),
+   it must receive a matching *"CLEAR"* before running `gt done`. If a
+   wisp lands and no hold exists, the polecat proceeds normally as
+   today. This prevents the nux hallucinated-success pattern.
+
+3. **Witness hold messages name the specific decider.** *"Awaiting
+   overseer decision"* becomes *"Awaiting CLEAR from mayor/ for
+   gt-d0t"* (or *"from kevinpjones"* when the witness has reason to
+   escalate past the mayor). The polecat reading the hold can then
+   know which inbox to expect clearance from, and downstream automation
+   can pattern-match the phrasing.
+
+4. **Generalize to all holds, not just witness holds.** The refinery's
+   conflict-parked MRs, the boot/emergency-stop freeze, and the
+   infra-blip escalations all benefit from the same convention:
+   *whoever resumes work past a hold must clear the hold*. This
+   requires each hold-placing role to document the clearance pattern
+   the resumer should emit, and each resumer-role to emit it as part
+   of the resume action.
+
+5. **Downstream verification of polecat completion claims.** The
+   nux-hallucinated-MR-bead observation motivates a standalone defense
+   independent of G20's primary fix: the witness (or refinery) that
+   receives a *"work complete"* signal from a polecat should verify
+   `bd show <claimed-mr-id>` succeeds before forwarding or acting on
+   the signal. A `bd show` failure on a polecat-claimed MR-bead ID
+   means the polecat is confused; park the claim and request
+   re-verification rather than passing a ghost ID downstream.
+
+Proposed artifacts:
+
+- `internal/cmd/sling.go` (or wherever `gt sling` entry points live) —
+  add a `--clear-hold <role>/<address>` flag that posts a "CLEAR" mail
+  to the named recipient after a successful dispatch. The mayor's
+  prompt gets updated to include this flag when the sling is a
+  resume-from-hold operation.
+- `docs/roles/witness.md` — codify the "AWAITING CLEAR from
+  \<role\>" phrasing so polecats and automation can reliably
+  pattern-match.
+- `docs/roles/polecat.md` — add a "resume protocol" section: when you
+  receive a wisp/nudge on an issue for which your inbox contains an
+  unresolved "STAND BY IDLE" for the same issue, wait for a matching
+  CLEAR before running `gt done`.
+- Integration test (Go) — spin a test rig, place a witness hold on a
+  work bead, simulate a mayor re-sling without a CLEAR, and assert the
+  polecat does NOT run `gt done` until a CLEAR arrives. Then send the
+  CLEAR, assert the polecat runs `gt done` and an MR bead is produced.
+
+#### Priority
+
+Not blocking for steady-state operation. Load-bearing for:
+
+- Any dogfood phase (frequent upgrades → frequent re-slings).
+- Autonomous operation without daily human handholding (holds that sit
+  forever are indistinguishable from dead agents).
+- Incident recovery at scale (Dolt infra blips, crash recoveries,
+  emergency-stop/thaw cycles).
+
+A targeted PR covering (1)+(2)+(5) — mayor emits clearance, polecat
+waits for clearance, verify claimed MR bead — delivers most of the
+value without requiring a full protocol rewrite. (3) and (4) can
+follow incrementally.
