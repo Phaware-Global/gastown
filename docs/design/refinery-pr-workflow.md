@@ -1389,8 +1389,10 @@ follow-up for whoever picks up the infra side):
    corresponding branch still exists on origin and
    which have `review_pr` set — those are in-flight PRs
    the refinery owns. Either refuse to remove them,
-   exit non-zero with a prompt, or export them to a
-   JSON that a subsequent `gt up` auto-imports.
+   export them to a JSON that a subsequent `gt up`
+   auto-imports, or require an explicit `--force` flag
+   to proceed with the purge (so CI / automated cleanup
+   can opt in but default-interactive invocations abort).
 
 2. **Schema migration on binary upgrade.** `gt up` /
    service start should detect schema-version drift
@@ -1435,9 +1437,11 @@ path executed, though the refinery LLM substituted
 case-insensitive "augment" match. So the code is live but
 only protects the name the formula / rig config passes
 verbatim. That's arguably a sub-issue worth a follow-up
-(expand match to also accept `augmentcode` case-
-insensitively, and/or pin the rig-config value through
-to the subcommand without LLM reshaping).
+(expand match via an explicit alias table mapping
+`augmentcode` → `augment`, and/or pin the rig-config
+value through to the subcommand without LLM reshaping —
+plain case-insensitivity does not cover this because the
+strings differ in more than case).
 
 ### G16 — Telegraph L1/L2/L3 dispatch stamps `merge_strategy: mr` on work beads despite rig being `pr`
 
@@ -1955,9 +1959,15 @@ Concrete mechanics, in roughly increasing order of scope:
 2. **Polecat waits for witness CLEAR before gt done on resume paths.**
    If a polecat was previously held (detects this by reading its own
    recent inbox for a "STAND BY IDLE" message on the current issue),
-   it must receive a matching *"CLEAR"* before running `gt done`. If a
-   wisp lands and no hold exists, the polecat proceeds normally as
-   today. This prevents the nux hallucinated-success pattern.
+   it must receive a matching *"CLEAR"* (or hit a configurable
+   timeout, after which it escalates to the mayor rather than
+   proceeding silently) before running `gt done`. A human operator
+   can force-clear via `gt mail send` with a reserved clearance
+   tag, bypassing the wait when the mayor/witness path is wedged.
+   If a wisp lands and no hold exists, the polecat proceeds normally
+   as today. This prevents the nux hallucinated-success pattern
+   without introducing a new indefinite-wait deadlock if the CLEAR
+   signal is lost.
 
 3. **Witness hold messages name the specific decider.** *"Awaiting
    overseer decision"* becomes *"Awaiting CLEAR from mayor/ for
