@@ -5,6 +5,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/telegraph"
@@ -220,6 +221,101 @@ func TestTransform_SubjectNoRawUserTextInDefault(t *testing.T) {
 	subject := mr.Messages()[0].Subject
 	if strings.Contains(subject, "SYSTEM") {
 		t.Errorf("subject leaks user text for issue.updated: %q", subject)
+	}
+}
+
+// ---- tests for review-comment fixes ----
+
+func TestTransform_HeaderInjection_NewlineInActor(t *testing.T) {
+	t.Parallel()
+	mr := mail.NewMemoryRouter()
+	tr := transform.New(mr, &captureNudger{}, 4096, 0)
+
+	// A newline in Actor would split the line, injecting an extra header.
+	event := makeEvent("jira", "issue.created", "alice\nX-Injected: evil", "PROJ-11", "text")
+	_ = tr.Transform(event)
+
+	body := mr.Messages()[0].Body
+	// The attack is a newline-separated header line — check no such line exists.
+	if strings.Contains(body, "\nX-Injected:") {
+		t.Errorf("header injection succeeded — newline in actor created extra header:\n%s", body)
+	}
+	// The actor field should still appear (sanitized, on one line).
+	if !strings.Contains(body, "Telegraph-Actor:") {
+		t.Errorf("Telegraph-Actor header missing\n%s", body)
+	}
+}
+
+func TestTransform_HeaderInjection_NewlineInSubject(t *testing.T) {
+	t.Parallel()
+	mr := mail.NewMemoryRouter()
+	tr := transform.New(mr, &captureNudger{}, 4096, 0)
+
+	event := makeEvent("jira", "issue.created", "bob", "PROJ-12\nX-Injected: evil", "text")
+	_ = tr.Transform(event)
+
+	body := mr.Messages()[0].Body
+	if strings.Contains(body, "\nX-Injected:") {
+		t.Errorf("header injection succeeded — newline in subject created extra header:\n%s", body)
+	}
+}
+
+func TestTransform_HeaderInjection_NewlineInLabel(t *testing.T) {
+	t.Parallel()
+	mr := mail.NewMemoryRouter()
+	tr := transform.New(mr, &captureNudger{}, 4096, 0)
+
+	event := &telegraph.NormalizedEvent{
+		Provider:  "jira",
+		EventType: "issue.created",
+		Actor:     "carol",
+		Subject:   "PROJ-13",
+		Text:      "text",
+		Labels:    []string{"bug\nX-Injected: evil", "p1"},
+		Timestamp: time.Now(),
+	}
+	_ = tr.Transform(event)
+
+	body := mr.Messages()[0].Body
+	if strings.Contains(body, "\nX-Injected:") {
+		t.Errorf("header injection via label newline succeeded:\n%s", body)
+	}
+}
+
+func TestTransform_SafeTitle_RuneTruncation(t *testing.T) {
+	t.Parallel()
+	mr := mail.NewMemoryRouter()
+	tr := transform.New(mr, &captureNudger{}, 4096, 0)
+
+	// Each emoji is 4 bytes. 20 emojis = 80 bytes but only 20 runes.
+	// Without rune-aware truncation at 80 bytes we'd cut mid-codepoint.
+	emoji := strings.Repeat("😀", 100) // 100 runes, 400 bytes
+	event := makeEvent("jira", "issue.created", "dan", "PROJ-14", emoji)
+	_ = tr.Transform(event)
+
+	subject := mr.Messages()[0].Subject
+	// Subject must be valid UTF-8 — rune-truncation ensures no split codepoints.
+	if !utf8.ValidString(subject) {
+		t.Errorf("subject contains invalid UTF-8 after truncation: %q", subject)
+	}
+}
+
+func TestMemoryRouter_DeepCopy_MutationIsolation(t *testing.T) {
+	t.Parallel()
+	mr := mail.NewMemoryRouter()
+
+	msg := mail.NewMessage("from/", "to/", "subj", "body")
+	msg.CC = []string{"cc1", "cc2"}
+	_ = mr.Send(msg)
+
+	// Mutate the CC slice on the copy returned by Messages().
+	copies := mr.Messages()
+	copies[0].CC[0] = "MUTATED"
+
+	// The stored message must be unchanged.
+	stored := mr.Messages()
+	if stored[0].CC[0] == "MUTATED" {
+		t.Errorf("Messages() returned a shallow copy — mutation affected stored state")
 	}
 }
 
