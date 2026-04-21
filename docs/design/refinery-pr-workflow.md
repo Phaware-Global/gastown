@@ -2090,3 +2090,83 @@ Each option attacks a different layer; (4) is the most targeted and recommended 
 Meaningful, not blocking. Same category as G1/G17/G19/G20: a privileged role taking a shortcut under pressure. Unlike G20 (which is a true deadlock), G21 produces the right outcome (work on main) by the wrong path (review bypass). The cost is the review-loop fixes (G12a/G13/G14/G19c) are being *defined but not exercised* — we don't know if they work end-to-end against fresh polecat work because the only paths exercised this cycle were the bypass.
 
 Recommended first pass: **(4) `gt refinery pr merge` requires an approval bead; drop `gh pr merge` from refinery allowlist.** That's the tightest in-gastown enforcement without requiring GitHub branch-protection configuration. Add (5) in the same PR so the operator retains an explicit adopt path for G20-class recoveries.
+
+### G22 — Mayor closes subtask/epic beads without verifying PR is merged to main
+
+Observed 2026-04-21 ~03:00Z during Telegraph v1 phase-2 monitoring. After gt-6ev (integration test) landed via the G21 bypass path, the mayor declared the Telegraph epic complete:
+
+```
+$ bd show gt-3k1
+✓ gt-3k1 · Telegraph v1: Town-Level Inbound External Event Transport (epic)   [CLOSED]
+  Close reason: Telegraph v1 complete: L1 (PR #22), L2 (PR #21), L3 (PR #16),
+                integration test (PR #23), observability (gt-78h) all merged to main
+```
+
+But origin/main contained **no observability commit**:
+
+```
+$ git log --oneline origin/main | head -5
+ee3ad6f5 test(telegraph): end-to-end integration test L1→L2→L3→Mayor mail (gt-6ev) (#23)
+ab593bd7 feat(telegraph): implement L1 HTTP webhook transport (gt-d0t) (#22)
+b3ba9b7a feat(telegraph): implement Jira L2 Translator (gt-458) (#21)
+3ea5e107 feat(telegraph): L3 mail envelope + rate-limited nudge (gt-ahf) (#16)
+059b19e9 fix(cost-tier): witness uses sonnet on Budget tier (G6/G18 reliability) (#20)
+```
+
+The actual observability commit — `c928cbc feat(telegraph): observability log events + metrics (gt-78h)` (759 LOC across `tlog/`, `transport/`, `transform/`) — existed only on the remote polecat branch `origin/polecat/furiosa-gt-78h`. No PR was ever opened for it. Yet:
+
+- `bd show gt-78h`: `[CLOSED]` with `Close reason: Closed` (no PR reference at all)
+- `bd show gt-3k1`: `[CLOSED]` with the victory-lap close reason above — explicitly declaring observability "merged to main"
+
+The mayor closed the subtask + epic based on the polecat's DONE signal alone, never verifying the commit reached `origin/main`. Under pr-mode, "done" should mean "PR merged on GitHub", not "polecat pushed a branch".
+
+#### Distinct from G21
+
+G21 is a **merge-gate gap**: the refinery merged a PR without running PR.4–PR.6 review gates. The work landed on main, just via the wrong path.
+
+G22 is a **close-verification gap**: the work did *not* land on main at all, but the tracking bead was closed as if it had. Not a merge bypass — a phantom merge. The tracking record diverges from repository reality.
+
+#### Likely close path
+
+The bead's dispatch metadata shows:
+
+```
+attached_vars: ["base_branch=main","test_command=go test ./...","merge_strategy=pr","require_review=true"]
+merge_strategy: mr     ← mis-stamped (G16)
+```
+
+The rig is configured `merge_strategy=pr` and the dispatcher's own `attached_vars` agrees. But the bead's top-level `merge_strategy` field is stamped `mr` — the G16 bug documented earlier in this doc. When `gt done` (or any close path) consults the top-level field, it takes the direct-merge branch: close the work bead outright, skip MR-bead creation, skip PR verification.
+
+The gt-78h polecat (furiosa) ran `gt done`, which saw `merge_strategy: mr` on the bead, took the non-PR path, and closed the bead locally. The remote branch got pushed (so the commit is preserved), but no PR was ever opened. The mayor later surveyed the epic's children — all CLOSED — and closed the epic with the observation that they "all merged to main", never actually inspecting `git log origin/main` to confirm.
+
+**Two distinct failures compound:**
+
+1. **G16 propagation**: the mis-stamped `merge_strategy: mr` on the work bead causes `gt done` to take the wrong code path. Attached_vars is authoritative; the top-level field is a redundant denormalization that got desynchronized. Either source-of-truth should win, but the code currently trusts the wrong one.
+
+2. **Epic-close assumes children == merged**: the mayor reasons "all subtask beads are CLOSED, therefore all subtask work is on main." That implication holds only when every close path verifies the merge. Once any close path (G22's) can close without merging, the epic-close inference is no longer sound.
+
+#### Consequences
+
+Telegraph v1 is declared complete but observability is ~760 LOC of reviewed-zero, unmerged, unused code sitting on a polecat branch. Future polecats starting from main will not see `tlog.Logger`. The Telegraph daemon deployed from main will have no structured observability. The bead system reports success; the repository reports nothing.
+
+The failure is silent. No escalation, no witness alarm, no gemini post-merge thread — the gap was only visible by cross-checking `bd list` against `git log origin/main`, which no agent does routinely.
+
+#### Fix directions
+
+Each option attacks a different layer; (1) is the smallest change with the biggest immediate effect.
+
+1. **`gt done` in pr-mode ignores the top-level `merge_strategy` field and trusts `attached_vars` (or the rig config).** When the rig is `merge_strategy=pr`, the pr-path must run regardless of what the bead claims. This fixes the G16 propagation directly: mis-stamping on the work bead stops mattering because the rig is authoritative. Small, surgical, low-risk. Should land first.
+
+2. **`gt done` in pr-mode never closes the work bead directly.** It only ever creates an MR bead (G11 fix already implemented this for the `--pre-verified` path; extend it to *every* path in pr-mode). The work bead closes when `gt refinery pr merge` succeeds, not before. Forces the close-on-merge invariant at the earliest point.
+
+3. **Epic close verifies `origin/main` contains every subtask's target SHA.** Before closing an epic with "all merged to main", the mayor runs `git log origin/main` (or calls GitHub API) and checks each subtask bead's target-SHA or PR-number is actually present. If any subtask bead is closed but not on main, the mayor escalates instead of closing the epic. Catches future close-verification gaps even if new paths are added.
+
+4. **Cross-check audit: periodic reconciliation between bead state and `origin/main`.** A deacon/witness patrol diffs "subtask beads closed under pr-mode" against "commits on origin/main matching their PR number" and files a bead for every mismatch. Doesn't prevent G22 but surfaces it within a patrol cycle instead of at arbitrary discovery time.
+
+5. **MR-bead required invariant.** Under pr-mode, any work bead close requires an associated MR bead in `merged` state (bd label `gt:merge-request` + status closed + `merged_sha` field set). gt-done refuses to close the work bead without it. If the MR bead isn't there, gt-done creates it and returns — never closes the work bead itself.
+
+#### Priority
+
+High. G22 produces silent data loss: closed beads + unmerged code + no audit signal. Unlike G21 (work is on main, just via wrong path), G22 means the work is *nowhere* from the repository's perspective, but the tracking system says it's done. Easy to accumulate dark state this way: a Telegraph daemon deployed from main today would be missing its entire observability layer, and the system wouldn't tell anyone.
+
+Recommended first pass: **(1) + (2) together in the same PR.** Together they ensure (a) the pr-path always runs under pr-mode rigs regardless of bead mis-stamping, and (b) the work bead never closes without an MR bead intermediary. Add (3) in a follow-up if epic-close verification is worth the extra GitHub API calls.
