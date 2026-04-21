@@ -87,7 +87,7 @@ func newPipeline(t *testing.T, bodyCap int, nudgeWindow time.Duration) *pipeline
 	nudger := &captureNudger{}
 	transformer := transform.New(mr, nudger, bodyCap, nudgeWindow)
 
-	handler := transport.NewHandler(
+	handler := transport.NewHandlerWithWriter(
 		[]telegraph.Translator{jiraTr},
 		rawCh,
 		io.Discard,
