@@ -119,3 +119,64 @@ func TestIsPRWorkflowCommand(t *testing.T) {
 		})
 	}
 }
+
+// TestIsPRMergeCommand pins the `gh pr merge` classifier added in the
+// G21 fix. Unlike TestIsPRWorkflowCommand, these cases must be
+// blocked EVEN for the refinery running on a pr-mode rig — the
+// refinery-allow exception covers `gh pr create` but not `gh pr merge`
+// (see tap_guard.go:runTapGuardPRWorkflow).
+//
+// Positive-case coverage mirrors the G19b create pattern: bare
+// invocations, shell-operator prefixes (|, &, ;, backtick), and
+// `sh -c` / `bash -lc` / `dash -ic` wrapper forms — so a refinery LLM
+// can't dodge the block by wrapping the command.
+//
+// Negative-case coverage protects diagnostic commands that mention
+// "gh pr merge" in string-literal / comment positions and unrelated
+// `gh pr` subcommands (view, list, checks, etc.).
+func TestIsPRMergeCommand(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  string
+		want bool
+	}{
+		// Positives — the G21 bypass shape and its wrapper variants.
+		{"bare gh pr merge", "gh pr merge 23", true},
+		{"gh pr merge with squash flag", "gh pr merge 23 --squash", true},
+		{"gh pr merge with repo flag", "gh pr merge 23 --repo Phaware-Global/gastown --squash", true},
+		{"gh pr merge indented", "    gh pr merge 23", true},
+		{"gh pr merge tab-indented", "\tgh pr merge 23", true},
+		{"gh pr merge after semicolon", "echo starting; gh pr merge 23 --squash", true},
+		{"gh pr merge after &&", "go test && gh pr merge 23", true},
+		{"gh pr merge after pipe", "echo 23 | gh pr merge", true},
+		{"gh pr merge after backtick", "FOO=`gh pr merge 23` echo $FOO", true},
+		{"gh pr merge via sh -c", "sh -c 'gh pr merge 23 --squash'", true},
+		{"gh pr merge via bash -lc login shell", "bash -lc 'gh pr merge 23 --squash'", true},
+		{"gh pr merge via dash -ic interactive shell", "dash -ic 'gh pr merge 23 --squash'", true},
+
+		// Negatives — superficially similar commands that are NOT
+		// the bypass shape. Must NOT match or we over-block.
+		{"gh pr view (diagnostic)", "gh pr view 23 --json state,mergedAt", false},
+		{"gh pr list (diagnostic)", "gh pr list --state open", false},
+		{"gh pr checks (diagnostic)", "gh pr checks 23", false},
+		{"gh pr edit (non-merge mutation)", "gh pr edit 23 --title foo", false},
+		{"gh pr merge in a literal string argument", "echo 'gh pr merge is forbidden'", false},
+		{"gh pr merge in a shell comment", "ls # we used to gh pr merge here", false},
+		{"command with pr merge but not gh", "git pr merge", false},
+		{"empty string", "", false},
+		{
+			// Case-sensitive: gh is case-sensitive at the command layer.
+			"uppercase GH PR MERGE is not a match",
+			"GH PR MERGE 23",
+			false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isPRMergeCommand(tc.cmd)
+			if got != tc.want {
+				t.Errorf("isPRMergeCommand(%q) = %v; want %v", tc.cmd, got, tc.want)
+			}
+		})
+	}
+}
