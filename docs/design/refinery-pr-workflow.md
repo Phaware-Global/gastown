@@ -2180,3 +2180,155 @@ Each option attacks a different layer; (1) is the smallest change with the bigge
 High. G22 produces silent data loss: closed beads + unmerged code + no audit signal. Unlike G21 (work is on main, just via wrong path), G22 means the work is *nowhere* from the repository's perspective, but the tracking system says it's done. Easy to accumulate dark state this way: a Telegraph daemon deployed from main today would be missing its entire observability layer, and the system wouldn't tell anyone.
 
 Recommended first pass: **(1) + (2) together in the same PR.** Together they ensure (a) the pr-path always runs under pr-mode rigs regardless of bead mis-stamping, and (b) the work bead never closes without an MR bead intermediary. Add (3) in a follow-up if epic-close verification is worth the extra GitHub API calls.
+
+### G23 — Approval-proof gate reads wrong config file (silently empty)
+
+Observed 2026-04-21 after v1.0.0-117 deploy. The G21 fix shipped in PR #25 added `refinery.VerifyPRApproval` with gates keyed to `MergeQueueConfig.PRApprover` + `MergeQueueConfig.GetPRRequiredApprovals()`. Live run on the gastown rig merged three PRs (#30, #31, #32) in 5 / 6 / 0.9 minutes respectively — all with zero approving reviews. The rig config has `pr_approver: kevinpjones` + `pr_required_approvals: 1`.
+
+Investigation trace:
+
+```
+cd ~/gt/gastown/refinery/rig
+gt refinery pr merge 99999 2>&1
+  → Error: gh pr merge failed: GraphQL: Could not resolve to a PullRequest
+```
+
+`VerifyPRApproval` did NOT error out first. It was called, it returned nil, and the MergePR call then hit GitHub. Tracing the config load:
+
+- `getRefineryPRContext` (internal/cmd/refinery_pr.go:158) builds an Engineer and calls `eng.LoadConfig()`.
+- `Engineer.LoadConfig` (internal/refinery/engineer.go:416) reads `<rig.Path>/config.json`.
+- For the gastown rig, `<rig.Path>/config.json` is the RIG IDENTITY file — `{type, version, name, git_url, default_branch, beads}`. It contains no `merge_queue` section.
+- The actual merge-queue config lives at `<rig.Path>/settings/config.json` — a different file.
+
+Result: `eng.Config()` returns a zero-valued `MergeQueueConfig` with `MergeStrategy=""`, `PRApprover=""`, and `GetPRRequiredApprovals()` returning 0 (because `MergeStrategy != "pr"`). Both gates in `VerifyPRApproval` skip. Merge proceeds.
+
+#### Why this wasn't caught in PR #25's tests
+
+`internal/refinery/approval_test.go` builds `MergeQueueConfig` objects directly in memory:
+
+```go
+cfg := &MergeQueueConfig{
+    MergeStrategy:       "pr",
+    PRApprover:          "gatekeeper",
+    PRRequiredApprovals: intPtr(1),
+}
+provider := &fakePRProvider{...}
+VerifyPRApproval(provider, cfg, 42, nil)
+```
+
+The file-load path is never exercised. 13 unit tests passed; the feature was never end-to-end tested against a real rig layout.
+
+#### Why the formula's `pr wait-approval` kept working
+
+The refinery patrol formula populates `{{pr_approver}}` and `{{pr_required_approvals}}` at instantiation time from a separate rig-settings load path (same `config.LoadRigSettings(settings/config.json)` that other `gt` commands use). These values are passed as CLI flags:
+
+```bash
+gt refinery pr wait-approval $PR --approver kevinpjones --min-approvals 1
+```
+
+`runRefineryPrWaitApproval` reads the flags, never touches `Engineer.config`, and worked correctly. The config-path bug only affects code paths that consult `Engineer.config` directly — which `runRefineryPrMerge` started doing in PR #25.
+
+#### Why this is worse than "just another bug"
+
+The tap-guard + approval-proof pair from PR #25 + #26 was the wall designed to stop the G1 / G21 bypass from reaching merge. The tap-guard wall works (smoke test confirms it blocks direct `gh pr merge` for refinery). But the approval-proof gate is a no-op because it reads from an empty config, and the tap-guard routes all refinery merges THROUGH the subcommand that has the no-op gate. Net effect: the entire defensive pair is pass-through.
+
+#### Fix directions
+
+1. **Correct the config read to `settings/config.json`.** Replace `Engineer.LoadConfig`'s path with `config.LoadRigSettings(config.RigSettingsPath(rig.Path))`. Same pattern already used by `resolveConvoyInfoForIssue` (G22 fix PR #28) and by `runRefineryPrWaitApproval` indirectly via formula vars. Smallest change, highest confidence.
+
+2. **Add an end-to-end test that writes a real rig-settings layout to a tempdir and asserts the loaded config has the expected `PRApprover`.** The in-memory-only test was the thing that let this ship. Future gate code will keep missing unless the test uses the actual filesystem shape.
+
+3. **Unify the config-loading path across the codebase.** There are currently at least two distinct loaders — `Engineer.LoadConfig` (rig-root) and `config.LoadRigSettings` (rig-settings). Unifying prevents future drift where a third consumer grabs the wrong file.
+
+#### Priority
+
+Blocking. G23 silently disables the approval gate on every refinery merge. Until fixed, G21's defense-in-depth reduces to "tap-guard + a comment that says we wanted approval-proof." Recommended first pass: (1) alone, with (2) as the regression test. (3) is good hygiene but not required for the fix.
+
+### G24 — Unresolved review threads do not block merge
+
+Observed 2026-04-21 during the same cycle as G23. After G23 was understood, thread state on the merged PRs:
+
+| PR | Unresolved threads at merge | Priority |
+|---|---|---|
+| #29 gt-n50 | 3 | 1× HIGH (gemini), 2× augmentcode (low) |
+| #30 gt-0vd | 4 | 4× MEDIUM (gemini) |
+| #31 gt-clz | — (threads posted same minute as merge; race) |
+| #32 gt-l3m | — (gemini review landed 41 seconds AFTER merge; see G25) |
+
+PR #29's HIGH-priority gemini thread flagged a real issue in `safeTitle()` — "only looks for `\n`, so if the text uses CRLF (`\r\n`) the returned value preserves the `\r`". That fix is NOT on main. Neither are any of PR #30's four MEDIUM threads. The review loop mechanism exists (formula PR.5 review-fix loop) but isn't enforced — the refinery skipped from pr-create straight to pr-merge.
+
+#### Distinct from G23
+
+G23 is the approval-count gate being a no-op. G24 is that EVEN IF the approval gate passed (e.g., kevinpjones eventually approves a PR), unresolved reviewer-posted threads still sit on the PR after merge — their guidance never reaches main.
+
+`provider.UnresolvedThreads(prNumber)` is a PRProvider method that already exists (used by formula PR.5 to decide whether to loop). It's just not consulted at the merge gate.
+
+#### Fix directions
+
+1. **Add `refinery.VerifyReviewThreadsResolved(provider, prNumber, out) error`.** Sibling of `VerifyPRApproval`. Calls `provider.UnresolvedThreads(prNumber)`, filters out `IsOutdated=true`, returns a structured error listing each remaining thread (URL + author + first line of body + priority tag if present) so the refinery LLM knows exactly which threads to address before retrying.
+
+2. **Gate in `runRefineryPrMerge` AND `Engineer.doMergePR`.** Both merge paths must check — if only the CLI path checks, a future refactor could route through doMergePR and skip again.
+
+3. **Error-type parity with NeedsApprovalError.** Define `NeedsReviewResolutionError` so callers can distinguish "block-on-review" from "tooling-broken" the same way they distinguish NeedsApproval. The refinery patrol formula maps this to the review-fix loop entry (PR.5) rather than escalating.
+
+#### Priority
+
+High. Together with G23, this is the difference between "reviewer guidance reaches main" and "reviewer guidance is a write-only advisory that gets ignored under time pressure." Recommended first pass: (1) + (2) in the same PR. (3) in the same PR for API consistency.
+
+### G25 — Refinery merges before reviewer has time to post
+
+Observed 2026-04-21 on PR #32 (gt-l3m):
+
+- Created 15:01:56Z
+- Merged 15:02:50Z — **54 seconds after creation**
+- gemini-code-assist auto-review landed 15:03:34Z — **41 seconds AFTER the merge**
+
+Neither G23 fix nor G24 fix would have caught this because at merge time there were literally zero reviews and zero threads. The refinery raced ahead of the review infrastructure.
+
+Similar patterns on #30 (5 min, gemini reviewed ~2 min after merge) and #31 (same-minute merge and review). Augment review was never triggered on any of #30, #31, #32 because the refinery skipped PR.4 (request-review).
+
+#### The race is not solvable by wait-approval tuning
+
+`gt refinery pr wait-approval` can poll indefinitely for approval, but it only helps if the refinery RUNS it. The refinery's LLM is the decision-maker here, and it's reasoning "PR created successfully, tests pass, merge." The formula PR.4-PR.5-PR.6 steps are prose the LLM can optimize away — and under any schedule pressure, does.
+
+The imperative fix must (a) post the trigger comment that wakes augment, (b) ENFORCE a minimum elapsed time before merge is allowed, (c) gate merge on review-from-pr_reviewer existing on the current HEAD SHA.
+
+#### Fix directions
+
+1. **New `gt refinery pr await-review <pr>` command.** Single imperative step that:
+   - Posts the trigger comment "augment review" (or `{{pr_trigger_comment}}` from config) on the PR if not already posted for the current HEAD SHA. This is the (existing) mechanism that invokes Augment Code's review bot.
+   - Sleeps `pr_review_wait` (configurable, default **5 minutes**) before the first mergeability check. This is the physical-reality gate: the reviewer bot cannot produce output in zero time.
+   - Polls `provider.UnresolvedThreads` + review state with `pr_review_poll_interval` (default 30s) until either:
+     - A review from `pr_reviewer` exists on the current HEAD SHA AND all unresolved threads are resolved, OR
+     - `pr_review_timeout` (default 30m) elapses → escalate to mayor.
+   - Returns success only when the above conditions are met. Blocks otherwise — the formula can't advance to merge.
+
+2. **`runRefineryPrMerge` enforces review-on-current-SHA.** Merge refuses unless a review from `pr_reviewer` exists on the PR's current HEAD commit (not just any commit). This closes the race where a review lands on an earlier commit, the polecat force-pushes a fix, and the refinery merges the new HEAD before augment re-reviews.
+
+3. **Formula PR.4 / PR.5 / PR.6 collapse into a single step.** Replace the three prose-driven steps with one `gt refinery pr await-review $PR` call. Prose still documents what's happening for human operators, but the LLM's only actionable instruction is the one command. Fewer steps = fewer opportunities to skip.
+
+4. **New config fields:**
+
+   ```json
+   "merge_queue": {
+     ...
+     "pr_review_wait": "5m",              // minimum wait after trigger before first check
+     "pr_review_poll_interval": "30s",   // poll interval for review-completion check
+     "pr_review_timeout": "30m",         // max wait before escalating
+     "pr_trigger_comment": "augment review"  // text to post to wake the reviewer bot
+   }
+   ```
+
+   Defaults conservative; rigs without pr_reviewer configured skip the trigger-comment step and only enforce the threads-resolved gate from G24.
+
+#### Priority
+
+Blocking for the review-loop invariant. Without this, even G23+G24 combined leave the race open — merges that win against augment's latency slip through with zero threads to resolve and zero approvals to gate on.
+
+#### Implementation order
+
+1. G23 fix (read correct config) — foundation; G24 and G25 both depend on config being live.
+2. G24 fix (threads-resolved gate in merge) — tightens the path that has reviews but unresolved threads.
+3. G25 fix (await-review + wait + current-SHA gate) — closes the race and makes the review loop imperative.
+
+The three together produce: no merge until `(augment has reviewed current SHA) AND (all threads resolved) AND (approval gate passes) AND (at least pr_review_wait elapsed since trigger)`. The refinery LLM's shortest path from "PR exists" to "merged" now includes waiting and checking — no prose-level step it can skip.
