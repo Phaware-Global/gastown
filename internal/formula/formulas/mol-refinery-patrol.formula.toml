@@ -318,13 +318,14 @@ Rules, in order of bindingness:
    empty, there is nothing to merge — go to orphan-branch-check.
 3. **Under `merge_strategy = "pr"` the refinery does NOT push to main
    at all.** Merges go through `gt refinery pr merge` (the subcommand
-   the merge-push step uses in pr mode), which itself invokes
-   `gh pr merge` — GitHub performs the actual squash-merge server-side.
+   the merge-push step uses in pr mode), which internally subprocesses
+   `gh pr merge` *after* verifying the configured PR.6 approval gates.
    A direct push to main from the refinery under pr-mode is a workflow
    violation even if it appears to work (the `push-main` tap guard will
-   block it; don't try to work around the guard). Do not invoke `gh`
-   directly from this step — stay inside the `gt refinery pr …`
-   subcommand tree (see TestRefineryPatrolMergePushHasPRBranch).
+   block it; don't try to work around the guard). **The `pr-workflow`
+   tap guard also blocks `gh pr merge` invoked directly from Bash (G21
+   fix)** — stay inside the `gt refinery pr …` subcommand tree (see
+   TestRefineryPatrolMergePushHasPRBranch).
 4. **If you find yourself about to do something the formula doesn't
    name explicitly: stop and escalate.** Open an escalation bead
    describing what you observed; do not act. "The formula doesn't
@@ -1178,6 +1179,16 @@ returns non-zero with a message naming the unmet gate.
 ```
 
 Delegates to the VCS provider's merge API, respecting branch protection.
+
+**You MUST use `gt refinery pr merge` here, not `gh pr merge`.** The gt
+subcommand runs the same `VerifyPRApproval` gates that PR.6 polled for —
+so if you somehow reach PR.7 without a satisfied approval, the merge is
+refused with a clear pointer back to PR.4 and PR.6. `gh pr merge` is
+blocked by the `pr-workflow` tap-guard (G21 fix); attempting it returns
+a non-zero DIRECT-MERGE-BLOCKED error. If this step fails with
+`requires approving review from … before merge` or `N of M required
+approvals`, DO NOT try to work around it — go back to PR.4
+(request-review) or PR.6 (wait-approval) and resolve the gate.
 
 ⚠️ **STOP HERE - DO NOT PROCEED UNTIL THE PR IS ACTUALLY MERGED ON GITHUB**
 
