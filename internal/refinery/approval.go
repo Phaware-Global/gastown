@@ -1,0 +1,109 @@
+package refinery
+
+import (
+	"fmt"
+	"io"
+)
+
+// NeedsApprovalError indicates a PR does not yet satisfy its configured
+// approval gates. Callers can distinguish this from a lookup/provider
+// failure via errors.As.
+//
+// Both doMergePR (refinery patrol path) and the `gt refinery pr merge`
+// CLI subcommand check approval through VerifyPRApproval and branch on
+// this type: NeedsApproval sets ProcessResult.NeedsApproval=true in the
+// patrol path (so the MR stays in queue); the CLI surfaces the detail
+// and exits non-zero.
+type NeedsApprovalError struct {
+	PRNumber int
+	Detail   string
+}
+
+func (e *NeedsApprovalError) Error() string { return e.Detail }
+
+// VerifyPRApproval checks the PR's approval state against cfg's gates
+// (PRApprover and GetPRRequiredApprovals). Returns nil when all
+// configured gates are satisfied, a *NeedsApprovalError when a gate is
+// unmet, or a plain error on provider-lookup failure.
+//
+// Gate semantics — evaluated independently, both must pass when both are
+// configured:
+//
+//	a) If cfg.PRApprover is non-empty, that specific user must have an
+//	   active APPROVED review.
+//	b) If cfg.GetPRRequiredApprovals() > 0, the count of distinct
+//	   approving reviewers must meet the threshold.
+//
+// Under MergeStrategy="pr", config validation in Engineer.LoadConfig
+// requires a non-empty PRApprover, so the "both gates absent → return
+// nil" branch below is not reachable on a production pr-mode rig. It
+// is kept as a defense-in-depth no-op for call sites that reach
+// VerifyPRApproval with a non-pr or test-constructed config (e.g., the
+// CLI subcommand under an mr-mode rig that opted in to approval
+// via PRRequiredApprovals only, or unit tests that build
+// MergeQueueConfig directly bypassing LoadConfig). Returning nil in
+// those cases is correct: there is no gate to enforce.
+//
+// Context plumbing: VerifyPRApproval performs network I/O via the
+// PRProvider methods but does not accept a context.Context yet —
+// neither PRProvider.IsPRApprovedBy nor CountApprovals take one. When
+// the provider interface is updated to be context-aware, this helper
+// and doMergePR should thread context through. Out of scope for G21.
+//
+// out is optional — when non-nil, VerifyPRApproval emits
+// [Engineer]-prefixed progress lines for each gate consulted, matching
+// the original inline logging in doMergePR so patrol output is
+// unchanged. Pass nil from contexts that don't want progress noise
+// (e.g., the CLI subcommand which has its own output format).
+func VerifyPRApproval(provider PRProvider, cfg *MergeQueueConfig, prNumber int, out io.Writer) error {
+	if provider == nil {
+		return fmt.Errorf("no PR provider configured")
+	}
+	if cfg == nil {
+		return fmt.Errorf("no MergeQueueConfig provided")
+	}
+
+	approver := cfg.PRApprover
+	requiredApprovals := cfg.GetPRRequiredApprovals()
+
+	if approver != "" {
+		approved, err := provider.IsPRApprovedBy(prNumber, approver)
+		if err != nil {
+			return fmt.Errorf("failed to check PR #%d approval by %s: %w", prNumber, approver, err)
+		}
+		if !approved {
+			if out != nil {
+				_, _ = fmt.Fprintf(out, "[Engineer] PR #%d awaiting approval from %s — deferring merge\n", prNumber, approver)
+			}
+			return &NeedsApprovalError{
+				PRNumber: prNumber,
+				Detail:   fmt.Sprintf("PR #%d requires approving review from %s before merge", prNumber, approver),
+			}
+		}
+		if out != nil {
+			_, _ = fmt.Fprintf(out, "[Engineer] PR #%d has approving review from %s\n", prNumber, approver)
+		}
+	}
+
+	if requiredApprovals > 0 {
+		count, err := provider.CountApprovals(prNumber)
+		if err != nil {
+			return fmt.Errorf("failed to count approvals on PR #%d: %w", prNumber, err)
+		}
+		if count < requiredApprovals {
+			if out != nil {
+				_, _ = fmt.Fprintf(out, "[Engineer] PR #%d has %d/%d required approvals — deferring merge\n",
+					prNumber, count, requiredApprovals)
+			}
+			return &NeedsApprovalError{
+				PRNumber: prNumber,
+				Detail:   fmt.Sprintf("PR #%d has %d of %d required approvals", prNumber, count, requiredApprovals),
+			}
+		}
+		if out != nil {
+			_, _ = fmt.Fprintf(out, "[Engineer] PR #%d has %d/%d required approvals\n", prNumber, count, requiredApprovals)
+		}
+	}
+
+	return nil
+}
