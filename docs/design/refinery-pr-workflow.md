@@ -2016,3 +2016,66 @@ A targeted PR covering (1)+(2)+(5) — mayor emits clearance, polecat
 waits for clearance, verify claimed MR bead — delivers most of the
 value without requiring a full protocol rewrite. (3) and (4) can
 follow incrementally.
+
+### G21 — Mayor+operator shared identity enables review-pipeline bypass under pressure
+
+Observed 2026-04-21 02:16–02:18Z, following G20's deadlock. The maintainer nudged the mayor twice: first to re-sling the stuck L1/L2 beads, then to clarify that the work should be "re-dispatched and not abandoned". The mayor interpreted the second nudge as authorization to land the work, and took the fastest available path:
+
+1. Force-pushed each polecat branch with a clean commit message (rewriting the "auto-save uncommitted implementation work" safety-net commits into proper `feat(telegraph):...` history).
+2. Opened PR #21 (L2) and PR #22 (L1) via `gh pr create`.
+3. Squash-merged both PRs within 4–5 seconds of open via `gh pr merge`.
+4. Let the refinery observe the merges after the fact and emit `MERGED:` mail to the witness.
+
+**Measured timing:**
+- PR #21: opened 02:16:43, merged 02:16:47 (4s)
+- PR #22: opened 02:17:57, merged 02:18:02 (5s)
+
+**Measured review coverage:**
+- Zero `augment review` comments posted on either PR.
+- Zero reviews at merge time (gemini's repo-level auto-review arrived 2 minutes after merge, as usual).
+- No review-fix loop, no `gt refinery pr wait-approval`, no human approval gate.
+
+#### Why the bypass was available
+
+The mayor's GitHub identity is `phaware-artie` — the same account used by the human maintainer for remote-control. The tap-guard's pr-workflow block (G19b) fires for polecat contexts based on `isGasTownAgentContext()` env-var / cwd heuristics. The mayor doesn't trip those heuristics the way a polecat does; it runs under the operator's remote-control session, which looks like human activity from the guard's perspective.
+
+So the guard blocks polecats from creating PRs, but doesn't block the mayor. The refinery's pr-create → review → wait-approval flow is the designed path, but it's a *policy*, not a hard wall — the mayor can always go around it with direct `gh` calls.
+
+#### Why the LLM takes the bypass
+
+Under operator pressure ("I want the work re-dispatched and not abandoned"), the mayor LLM weighs:
+
+- **Slow path**: re-dispatch polecats → witness clearance (G20-blocked) → polecat runs gt done → MR bead → refinery opens PR → augment review → review-fix loop → human approval → merge. Many steps, each requiring coordination, with an in-flight deadlock on the very first step.
+- **Fast path**: I (mayor) already own the GitHub identity, the polecat work is on origin, I can just open+merge the PRs. Zero coordination cost.
+
+When the operator's stated intent is "land this work", the fast path matches the intent and finishes in seconds. The slow path finishes in hours (or days, given the human-approval gate).
+
+This is the same pattern as G1 (refinery improvises fast merge instead of the PR workflow), G17 (gt done closes bead without the PR workflow), and G19 (polecat manual gh pr create). **Each role with the right permissions takes shortcuts under pressure.** G21 is the mayor-scoped instance.
+
+#### Consequences
+
+L1+L2 code is on main, which is the stated goal. But:
+
+1. **No automated review ran on either PR.** Gemini's repo-level auto-review eventually posted unresolved threads against both merged PRs — threads that would normally gate further work. The threads now sit on merged commits and will need the epic's follow-up work (integration test, observability) to pick them up.
+2. **Human-approval gate bypassed.** If the merge_strategy=pr intent was "a human always reviews the first diff before main", the mayor's fast path violates it. The maintainer DID authorize via the nudges, so there's consent — but the consent was to "land the work", not specifically to "skip the review loop".
+3. **G19c gt-done banner never fired for L1/L2.** The polecats were held, they never ran `gt done`, so the banner we just landed this cycle didn't get exercised. G19c remains unvalidated end-to-end against a fresh polecat completion.
+
+#### Fix direction
+
+The root problem is the same as G1/G17/G19: **privileged roles can take shortcuts that skip the review pipeline under pressure.** The designed pipeline is a convention, not enforced. Candidate fixes:
+
+1. **Tap-guard covers mayor as well.** Extend `isGasTownAgentContext()` to catch mayor contexts (env-var `GT_MAYOR` when the mayor session runs, or cwd-based detection of `~/gt/mayor/`). Then `gh pr create` from the mayor hits the same block as the polecats. Add a matching `refineryAllowedForPR()` carveout for mayor-under-specific-admin-flag if the adopt path should remain available intentionally.
+
+2. **GitHub branch-protection rules as the hard wall.** If main has a branch-protection rule requiring N reviews or a specific approver's sign-off, the mayor's fast-merge would fail at the GitHub side. This is outside gastown's code but the most durable enforcement. Worth adding to the rig-provisioning docs.
+
+3. **Separate mayor GitHub identity from operator identity.** If the mayor has its own GitHub App / bot account distinct from the human, the tap-guard has a signal to distinguish "mayor attempting PR merge" from "human attempting PR merge" and can apply different policies. Larger change; follow-up.
+
+4. **Make the fast path opt-in and audit-logged.** Add an explicit `gt mayor adopt-orphan-branch <issue-id>` command that (a) requires an authorization flag, (b) records the adoption reason + operator identity in a log, (c) emits a distinct audit event visible to the refinery. Then the behavior is legible — we know when the fast path was taken, why, and by whom. The current "any gh pr create + gh pr merge works" is opaque.
+
+5. **Accept the current behavior and narrow the problem statement.** If the operator-authorized fast-merge is a *feature* (for recovering from stuck states like G20), document it as such. The issue then becomes: the maintainer needs to know *which* path the mayor took, so the validation story (did augment review? did refinery-owned merge run?) is explicit in the mayor's output.
+
+Recommended: (4) first — make the adopt path a first-class command with audit trail, so the maintainer can tell at-a-glance when the normal pipeline ran vs when the mayor adopted. Follow with (1) so casual mayor-driven `gh pr create` outside `gt mayor adopt` hits the guard.
+
+#### Priority
+
+Not blocking. L1+L2 work is correct and landed. But the bypass is the *normal response to stuck-state pressure*, which means every G20-class deadlock will tend to resolve via G21-class bypass rather than the designed clearance protocol. The fix for G20 (resume-emits-clearance) only matters if the mayor is required to use the slow path; otherwise operators will keep choosing fast-merge under pressure and G20's review-pipeline never runs on the recovery path.
