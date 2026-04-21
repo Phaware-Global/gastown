@@ -152,7 +152,7 @@ func translateIssueCreated(p *payload) (*telegraph.NormalizedEvent, error) {
 		EventID:      issueEventID(p),
 		Actor:        userName(p.User),
 		Subject:      p.Issue.Key,
-		CanonicalURL: p.Issue.Self,
+		CanonicalURL: browseURL(p.Issue.Self, p.Issue.Key),
 		Text:         issueText(p.Issue.Fields),
 		Labels:       labels(p.Issue.Fields),
 		Timestamp:    msToTime(p.Timestamp),
@@ -169,8 +169,8 @@ func translateIssueUpdated(p *payload) (*telegraph.NormalizedEvent, error) {
 		EventID:      issueEventID(p),
 		Actor:        userName(p.User),
 		Subject:      p.Issue.Key,
-		CanonicalURL: p.Issue.Self,
-		Text:         changelogText(p.Changelog),
+		CanonicalURL: browseURL(p.Issue.Self, p.Issue.Key),
+		Text:         changelogTextOrSummary(p.Changelog, p.Issue.Fields),
 		Labels:       labels(p.Issue.Fields),
 		Timestamp:    msToTime(p.Timestamp),
 	}, nil
@@ -193,7 +193,7 @@ func translateCommentAdded(p *payload) (*telegraph.NormalizedEvent, error) {
 		EventID:      p.Comment.ID,
 		Actor:        userName(p.Comment.Author),
 		Subject:      p.Issue.Key,
-		CanonicalURL: p.Issue.Self,
+		CanonicalURL: browseURL(p.Issue.Self, p.Issue.Key),
 		Text:         p.Comment.Body,
 		Labels:       labels(p.Issue.Fields),
 		Timestamp:    ts,
@@ -221,7 +221,7 @@ func translateCommentUpdated(p *payload) (*telegraph.NormalizedEvent, error) {
 		EventID:      p.Comment.ID,
 		Actor:        actor,
 		Subject:      p.Issue.Key,
-		CanonicalURL: p.Issue.Self,
+		CanonicalURL: browseURL(p.Issue.Self, p.Issue.Key),
 		Text:         p.Comment.Body,
 		Labels:       labels(p.Issue.Fields),
 		Timestamp:    ts,
@@ -281,7 +281,7 @@ func changelogText(cl *changelog) string {
 	var parts []string
 	for _, item := range cl.Items {
 		switch item.Field {
-		case "status", "priority", "assignee":
+		case "status", "priority", "assignee", "summary":
 			if item.FromString != "" {
 				parts = append(parts, fmt.Sprintf("%s: %s → %s", item.Field, item.FromString, item.ToString))
 			} else if item.ToString != "" {
@@ -290,6 +290,30 @@ func changelogText(cl *changelog) string {
 		}
 	}
 	return strings.Join(parts, "; ")
+}
+
+// changelogTextOrSummary returns changelogText if non-empty, otherwise the issue summary.
+func changelogTextOrSummary(cl *changelog, f *issueFields) string {
+	if t := changelogText(cl); t != "" {
+		return t
+	}
+	if f != nil {
+		return f.Summary
+	}
+	return ""
+}
+
+// browseURL derives the user-facing browse URL from the Jira REST API self URL and issue key.
+// Input:  https://company.atlassian.net/rest/api/2/issue/99291
+// Output: https://company.atlassian.net/browse/PROJ-1234
+func browseURL(self, key string) string {
+	if self == "" || key == "" {
+		return self
+	}
+	if idx := strings.Index(self, "/rest/"); idx >= 0 {
+		return self[:idx] + "/browse/" + key
+	}
+	return self
 }
 
 func labels(f *issueFields) []string {
