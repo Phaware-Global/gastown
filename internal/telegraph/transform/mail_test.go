@@ -1,6 +1,8 @@
 package transform_test
 
 import (
+	"bytes"
+	"encoding/json"
 	"strings"
 	"sync"
 	"testing"
@@ -8,6 +10,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/telegraph"
+	"github.com/steveyegge/gastown/internal/telegraph/tlog"
 	"github.com/steveyegge/gastown/internal/telegraph/transform"
 )
 
@@ -244,5 +247,141 @@ func TestMemoryRouter_Concurrent(t *testing.T) {
 
 	if got := len(mr.Messages()); got != n {
 		t.Errorf("messages = %d, want %d", got, n)
+	}
+}
+
+// ---- observability tests ----
+
+func parseLogLines(buf *bytes.Buffer) []map[string]interface{} {
+	var out []map[string]interface{}
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var m map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func strF(m map[string]interface{}, k string) string {
+	v, _ := m[k].(string)
+	return v
+}
+
+func TestTransform_LogsDeliverEvent(t *testing.T) {
+	t.Parallel()
+	mr := mail.NewMemoryRouter()
+	nudger := &captureNudger{}
+	logBuf := &bytes.Buffer{}
+	logger := tlog.New(logBuf)
+	tr := transform.New(mr, nudger, 4096, 0, logger)
+
+	event := makeEvent("jira", "issue.created", "alice", "PROJ-1", "text")
+	if err := tr.Transform(event); err != nil {
+		t.Fatalf("Transform: %v", err)
+	}
+
+	lines := parseLogLines(logBuf)
+	var deliverLine map[string]interface{}
+	for _, l := range lines {
+		if strF(l, "event") == "deliver" {
+			deliverLine = l
+			break
+		}
+	}
+	if deliverLine == nil {
+		t.Fatal("no deliver log line emitted")
+	}
+	checks := map[string]string{
+		"event":      "deliver",
+		"provider":   "jira",
+		"event_type": "issue.created",
+		"event_id":   "evt-001",
+		"actor":      "alice",
+		"subject":    "PROJ-1",
+	}
+	for k, want := range checks {
+		if strF(deliverLine, k) != want {
+			t.Errorf("deliver log %s = %q, want %q", k, strF(deliverLine, k), want)
+		}
+	}
+}
+
+func TestTransform_DeliverCounterIncrements(t *testing.T) {
+	t.Parallel()
+	mr := mail.NewMemoryRouter()
+	logBuf := &bytes.Buffer{}
+	logger := tlog.New(logBuf)
+	tr := transform.New(mr, &captureNudger{}, 4096, 0, logger)
+
+	event := makeEvent("jira", "issue.created", "alice", "PROJ-1", "text")
+	for range 3 {
+		_ = tr.Transform(event)
+	}
+	if v := logger.Counters.Deliver.Load(); v != 3 {
+		t.Errorf("Deliver counter = %d, want 3", v)
+	}
+}
+
+func TestTransform_LogsNudgeSent(t *testing.T) {
+	t.Parallel()
+	mr := mail.NewMemoryRouter()
+	nudger := &captureNudger{}
+	logBuf := &bytes.Buffer{}
+	logger := tlog.New(logBuf)
+	tr := transform.New(mr, nudger, 4096, 30*time.Second, logger)
+
+	event := makeEvent("jira", "issue.created", "alice", "PROJ-1", "text")
+	_ = tr.Transform(event)
+
+	lines := parseLogLines(logBuf)
+	var found bool
+	for _, l := range lines {
+		if strF(l, "event") == "nudge_sent" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("nudge_sent log line not emitted")
+	}
+	if v := logger.Counters.NudgeSent.Load(); v != 1 {
+		t.Errorf("NudgeSent counter = %d, want 1", v)
+	}
+}
+
+func TestTransform_LogsNudgeSuppressed(t *testing.T) {
+	t.Parallel()
+	mr := mail.NewMemoryRouter()
+	nudger := &captureNudger{}
+	logBuf := &bytes.Buffer{}
+	logger := tlog.New(logBuf)
+	// Large window: second Transform call's nudge is suppressed.
+	tr := transform.New(mr, nudger, 4096, 10*time.Minute, logger)
+
+	event := makeEvent("jira", "issue.created", "alice", "PROJ-1", "text")
+	_ = tr.Transform(event) // nudge sent
+	_ = tr.Transform(event) // nudge suppressed
+
+	if v := logger.Counters.NudgeSent.Load(); v != 1 {
+		t.Errorf("NudgeSent counter = %d, want 1", v)
+	}
+	if v := logger.Counters.NudgeSuppressed.Load(); v != 1 {
+		t.Errorf("NudgeSuppressed counter = %d, want 1", v)
+	}
+}
+
+func TestTransform_NilLogger_NoPanic(t *testing.T) {
+	t.Parallel()
+	mr := mail.NewMemoryRouter()
+	// No logger passed — nil default.
+	tr := transform.New(mr, &captureNudger{}, 4096, 30*time.Second)
+	event := makeEvent("jira", "issue.created", "alice", "PROJ-1", "text")
+	if err := tr.Transform(event); err != nil {
+		t.Fatalf("Transform with nil logger: %v", err)
 	}
 }

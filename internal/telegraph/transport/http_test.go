@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/telegraph"
+	"github.com/steveyegge/gastown/internal/telegraph/tlog"
 	"github.com/steveyegge/gastown/internal/telegraph/transport"
 )
 
@@ -33,11 +33,22 @@ func (f *fakeTranslator) Translate(body []byte) (*telegraph.NormalizedEvent, err
 	return &telegraph.NormalizedEvent{Provider: f.provider, EventType: "test.event"}, nil
 }
 
+// makeHandlerWithLogger returns a Handler wired to a fresh tlog.Logger and buffer.
+func makeHandlerWithLogger(t *testing.T, translators []telegraph.Translator, chSize int) (*transport.Handler, chan telegraph.RawEvent, *tlog.Logger, *bytes.Buffer) {
+	t.Helper()
+	rawCh := make(chan telegraph.RawEvent, chSize)
+	logBuf := &bytes.Buffer{}
+	logger := tlog.New(logBuf)
+	h := transport.NewHandler(translators, rawCh, logger)
+	return h, rawCh, logger, logBuf
+}
+
+// makeHandler is a backward-compatible helper using the Writer convenience constructor.
 func makeHandler(t *testing.T, translators []telegraph.Translator, chSize int) (*transport.Handler, chan telegraph.RawEvent, *bytes.Buffer) {
 	t.Helper()
 	rawCh := make(chan telegraph.RawEvent, chSize)
 	logBuf := &bytes.Buffer{}
-	h := transport.NewHandler(translators, rawCh, logBuf)
+	h := transport.NewHandlerWithWriter(translators, rawCh, logBuf)
 	return h, rawCh, logBuf
 }
 
@@ -49,13 +60,13 @@ func post(h http.Handler, path, body string) *httptest.ResponseRecorder {
 }
 
 // logLines parses the log buffer into a slice of JSON objects.
-func logLines(buf *bytes.Buffer) []map[string]string {
-	var out []map[string]string
+func logLines(buf *bytes.Buffer) []map[string]interface{} {
+	var out []map[string]interface{}
 	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
 		if line == "" {
 			continue
 		}
-		var m map[string]string
+		var m map[string]interface{}
 		if err := json.Unmarshal([]byte(line), &m); err != nil {
 			continue
 		}
@@ -64,9 +75,14 @@ func logLines(buf *bytes.Buffer) []map[string]string {
 	return out
 }
 
+func strField(m map[string]interface{}, key string) string {
+	v, _ := m[key].(string)
+	return v
+}
+
 func TestHandler_Accept(t *testing.T) {
 	tr := &fakeTranslator{provider: "jira"}
-	h, rawCh, logBuf := makeHandler(t, []telegraph.Translator{tr}, 8)
+	h, rawCh, _, logBuf := makeHandlerWithLogger(t, []telegraph.Translator{tr}, 8)
 
 	w := post(h, "/webhook/jira", `{"webhookEvent":"jira:issue_created"}`)
 	if w.Code != http.StatusOK {
@@ -89,8 +105,8 @@ func TestHandler_Accept(t *testing.T) {
 	if len(lines) != 1 {
 		t.Fatalf("want 1 log line, got %d", len(lines))
 	}
-	if lines[0]["event"] != "accept" {
-		t.Errorf("log event = %q, want accept", lines[0]["event"])
+	if strField(lines[0], "event") != "accept" {
+		t.Errorf("log event = %q, want accept", strField(lines[0], "event"))
 	}
 }
 
@@ -110,7 +126,7 @@ func TestHandler_AuthFailure(t *testing.T) {
 	if len(lines) != 1 {
 		t.Fatalf("want 1 log line, got %d", len(lines))
 	}
-	if lines[0]["event"] != "reject" || lines[0]["reason"] != "hmac_invalid" {
+	if strField(lines[0], "event") != "reject" || strField(lines[0], "reason") != "hmac_invalid" {
 		t.Errorf("unexpected log: %v", lines[0])
 	}
 }
@@ -130,8 +146,8 @@ func TestHandler_UnknownProvider(t *testing.T) {
 	if len(lines) != 1 {
 		t.Fatalf("want 1 log line, got %d", len(lines))
 	}
-	if lines[0]["reason"] != "provider_disabled" {
-		t.Errorf("unexpected reason: %v", lines[0]["reason"])
+	if strField(lines[0], "reason") != "provider_disabled" {
+		t.Errorf("unexpected reason: %v", strField(lines[0], "reason"))
 	}
 }
 
@@ -140,7 +156,7 @@ func TestHandler_Backpressure(t *testing.T) {
 	// Channel size 0 → immediately full.
 	rawCh := make(chan telegraph.RawEvent, 0)
 	logBuf := &bytes.Buffer{}
-	h := transport.NewHandler([]telegraph.Translator{tr}, rawCh, logBuf)
+	h := transport.NewHandlerWithWriter([]telegraph.Translator{tr}, rawCh, logBuf)
 
 	req := httptest.NewRequest(http.MethodPost, "/webhook/jira", strings.NewReader(`{}`))
 	w := httptest.NewRecorder()
@@ -151,7 +167,7 @@ func TestHandler_Backpressure(t *testing.T) {
 	}
 
 	lines := logLines(logBuf)
-	if len(lines) != 1 || lines[0]["reason"] != "backpressure" {
+	if len(lines) != 1 || strField(lines[0], "reason") != "backpressure" {
 		t.Errorf("unexpected log: %v", lines)
 	}
 }
@@ -189,13 +205,7 @@ func TestHandler_BadPaths(t *testing.T) {
 }
 
 func TestHandler_HeadersLowercased(t *testing.T) {
-	var gotHeaders map[string]string
-	tr := &fakeTranslator{
-		provider: "jira",
-		// Capture headers by inspecting through Authenticate (headers are passed in).
-	}
-	// Override Authenticate to capture headers.
-	tr2 := &capturingTranslator{fakeTranslator: tr}
+	tr2 := &capturingTranslator{fakeTranslator: &fakeTranslator{provider: "jira"}}
 	h, rawCh, _ := makeHandler(t, []telegraph.Translator{tr2}, 8)
 
 	req := httptest.NewRequest(http.MethodPost, "/webhook/jira", strings.NewReader(`{}`))
@@ -209,17 +219,14 @@ func TestHandler_HeadersLowercased(t *testing.T) {
 	}
 
 	evt := <-rawCh
-	gotHeaders = evt.Headers
-
-	for k := range gotHeaders {
+	for k := range evt.Headers {
 		if k != strings.ToLower(k) {
 			t.Errorf("header key %q is not lowercase", k)
 		}
 	}
-	if gotHeaders["x-hub-signature"] == "" {
+	if evt.Headers["x-hub-signature"] == "" {
 		t.Error("x-hub-signature header missing or not lowercased")
 	}
-	_ = gotHeaders
 }
 
 func TestHandler_BodyPreserved(t *testing.T) {
@@ -247,13 +254,94 @@ func TestHandler_LogFieldsPresent(t *testing.T) {
 	}
 	line := lines[0]
 	for _, field := range []string{"ts", "component", "event", "provider", "source_ip"} {
-		if line[field] == "" {
+		if strField(line, field) == "" {
 			t.Errorf("log field %q missing or empty", field)
 		}
 	}
-	if line["component"] != "telegraph" {
-		t.Errorf("component = %q, want telegraph", line["component"])
+	if strField(line, "component") != "telegraph" {
+		t.Errorf("component = %q, want telegraph", strField(line, "component"))
 	}
+}
+
+func TestHandler_LogBytesLenAndLatency(t *testing.T) {
+	tr := &fakeTranslator{provider: "jira"}
+	h, _, _, logBuf := makeHandlerWithLogger(t, []telegraph.Translator{tr}, 8)
+
+	const body = `{"webhookEvent":"jira:issue_created"}`
+	post(h, "/webhook/jira", body)
+
+	lines := logLines(logBuf)
+	if len(lines) != 1 {
+		t.Fatalf("want 1 line, got %d", len(lines))
+	}
+	line := lines[0]
+
+	bytesLen, ok := line["bytes_len"].(float64)
+	if !ok || bytesLen == 0 {
+		t.Errorf("bytes_len missing or zero: %v", line["bytes_len"])
+	}
+	if int(bytesLen) != len(body) {
+		t.Errorf("bytes_len = %v, want %d", bytesLen, len(body))
+	}
+	if _, ok := line["latency_ms"]; !ok {
+		t.Error("latency_ms field missing from accept log entry")
+	}
+}
+
+func TestHandler_Counters(t *testing.T) {
+	trOK := &fakeTranslator{provider: "jira"}
+	trFail := &fakeTranslator{provider: "jira", authErr: errors.New("bad sig")}
+
+	t.Run("accept increments counter", func(t *testing.T) {
+		rawCh := make(chan telegraph.RawEvent, 8)
+		logger := tlog.New(&bytes.Buffer{})
+		h := transport.NewHandler([]telegraph.Translator{trOK}, rawCh, logger)
+		post(h, "/webhook/jira", `{}`)
+		if v := logger.Counters.Accept.Load(); v != 1 {
+			t.Errorf("Accept counter = %d, want 1", v)
+		}
+	})
+
+	t.Run("hmac_invalid increments counter", func(t *testing.T) {
+		rawCh := make(chan telegraph.RawEvent, 8)
+		logger := tlog.New(&bytes.Buffer{})
+		h := transport.NewHandler([]telegraph.Translator{trFail}, rawCh, logger)
+		post(h, "/webhook/jira", `{}`)
+		if v := logger.Counters.RejectHMACInvalid.Load(); v != 1 {
+			t.Errorf("RejectHMACInvalid counter = %d, want 1", v)
+		}
+	})
+
+	t.Run("provider_disabled increments counter", func(t *testing.T) {
+		rawCh := make(chan telegraph.RawEvent, 8)
+		logger := tlog.New(&bytes.Buffer{})
+		h := transport.NewHandler(nil, rawCh, logger)
+		post(h, "/webhook/jira", `{}`)
+		if v := logger.Counters.RejectProviderDis.Load(); v != 1 {
+			t.Errorf("RejectProviderDis counter = %d, want 1", v)
+		}
+	})
+
+	t.Run("backpressure increments counter", func(t *testing.T) {
+		rawCh := make(chan telegraph.RawEvent, 0) // always full
+		logger := tlog.New(&bytes.Buffer{})
+		h := transport.NewHandler([]telegraph.Translator{trOK}, rawCh, logger)
+		post(h, "/webhook/jira", `{}`)
+		if v := logger.Counters.RejectBackpressure.Load(); v != 1 {
+			t.Errorf("RejectBackpressure counter = %d, want 1", v)
+		}
+	})
+}
+
+func TestHandler_NilLogger_NoPanic(t *testing.T) {
+	tr := &fakeTranslator{provider: "jira"}
+	rawCh := make(chan telegraph.RawEvent, 8)
+	h := transport.NewHandler([]telegraph.Translator{tr}, rawCh, nil)
+
+	// All code paths with nil logger must not panic.
+	post(h, "/webhook/jira", `{}`)                   // accept
+	post(h, "/webhook/unknown", `{}`)                // provider_disabled
+	_ = <-rawCh
 }
 
 // capturingTranslator wraps a fakeTranslator but always succeeds auth.
@@ -262,13 +350,10 @@ type capturingTranslator struct {
 	lastHeaders map[string]string
 }
 
-func (c *capturingTranslator) Authenticate(headers map[string]string, body []byte) error {
+func (c *capturingTranslator) Authenticate(headers map[string]string, _ []byte) error {
 	c.lastHeaders = headers
 	return nil
 }
 
 // Ensure Handler satisfies http.Handler at compile time.
 var _ http.Handler = (*transport.Handler)(nil)
-
-// Ensure io.Writer is accepted (compile-time check via io.Discard).
-var _ io.Writer = io.Discard
