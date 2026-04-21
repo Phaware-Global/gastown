@@ -134,6 +134,28 @@ func (c *ConvoyInfo) IsOwnedDirect() bool {
 	return c != nil && c.Owned && c.MergeStrategy == "direct"
 }
 
+// shouldForcePRPath returns true when a bead-stamped convoy merge_strategy
+// must be overridden to "mr" because the rig is running pr-mode (G22 fix).
+//
+// The rule: the rig config is authoritative. When the rig is pr-mode but
+// the bead was stamped with "direct" or "local" (G16 propagation bug),
+// taking those shortcuts would close the work bead without creating a PR
+// — the silent close-without-merge gt-78h exhibited. This helper exists
+// so gt done can consult it at the convoy-resolution site, and tests
+// can pin the override semantics independently of the gt-done call
+// graph.
+//
+// Rigs that aren't pr-mode preserve existing behavior (the bead's
+// strategy is honored as-is). "mr" and "" convoy strategies on pr-mode
+// rigs don't need an override — the default mr-path is already
+// pr-aware via G11.
+func shouldForcePRPath(beadStrategy string, rigStrategy string) bool {
+	if rigStrategy != "pr" {
+		return false
+	}
+	return beadStrategy == "direct" || beadStrategy == "local"
+}
+
 // getConvoyInfoForIssue checks if an issue is tracked by a convoy and returns its info.
 // Returns nil if not tracked by any convoy.
 func getConvoyInfoForIssue(issueID string) *ConvoyInfo {

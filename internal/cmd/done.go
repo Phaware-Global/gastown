@@ -582,6 +582,34 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			convoyInfo = getConvoyInfoForIssue(issueID)
 		}
 
+		// G22 fix: the rig's merge_strategy wins over the bead-stamped
+		// merge_strategy when they disagree. G16 documented that the
+		// dispatcher can stamp `direct`/`local` on work beads under a
+		// pr-mode rig; the rig config is authoritative. Under pr-mode
+		// the direct/local convoy shortcuts close the work bead without
+		// ever creating a PR — that's the silent data-loss shape
+		// gt-78h exhibited (bead closed, commit never merged).
+		//
+		// The override is narrow (see shouldForcePRPath): only when
+		// the rig is pr-mode AND the bead says direct/local do we
+		// force "mr" so the default mr-path runs and the G11 fix
+		// creates a PR for the work. Non-pr rigs preserve existing
+		// behavior — the bead's strategy is honored as before.
+		if convoyInfo != nil {
+			rigSettingsPath := filepath.Join(townRoot, rigName, "settings", "config.json")
+			var rigStrategy string
+			if rigSettings, rigErr := config.LoadRigSettings(rigSettingsPath); rigErr == nil &&
+				rigSettings.MergeQueue != nil {
+				rigStrategy = rigSettings.MergeQueue.MergeStrategy
+			}
+			if shouldForcePRPath(convoyInfo.MergeStrategy, rigStrategy) {
+				style.PrintWarning("G22: bead-stamped merge_strategy=%q conflicts with rig pr-mode — "+
+					"forcing pr-path to prevent silent close-without-merge",
+					convoyInfo.MergeStrategy)
+				convoyInfo.MergeStrategy = "mr"
+			}
+		}
+
 		// Handle "local" strategy: skip push and MR entirely
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "local" {
 			fmt.Printf("%s Local merge strategy: skipping push and merge queue\n", style.Bold.Render("→"))
