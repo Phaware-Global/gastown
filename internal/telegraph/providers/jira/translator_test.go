@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -220,8 +221,9 @@ func TestTranslate_IssueUpdated_EmptyChangelog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Translate() error = %v", err)
 	}
-	if evt.Text != "" {
-		t.Errorf("expected empty Text for no changelog, got %q", evt.Text)
+	// No tracked changelog fields → falls back to issue summary
+	if evt.Text != "Test issue summary" {
+		t.Errorf("Text = %q, want issue summary fallback", evt.Text)
 	}
 }
 
@@ -334,6 +336,104 @@ func TestTranslate_InvalidJSON(t *testing.T) {
 	}
 	if errors.Is(err, telegraph.ErrUnknownEventType) {
 		t.Error("parse error should not be ErrUnknownEventType")
+	}
+}
+
+// ---- CanonicalURL is browse URL, not REST API URL ----
+
+func TestTranslate_CanonicalURL_IsBrowseURL(t *testing.T) {
+	t.Parallel()
+	tr := newTranslator()
+	body := mustMarshal(t, issuePayload{
+		Timestamp:    1713571200000,
+		WebhookEvent: "jira:issue_created",
+		User:         baseUser("alice"),
+		Issue:        baseIssue("PROJ-1"),
+	})
+	evt, err := tr.Translate(body)
+	if err != nil {
+		t.Fatalf("Translate() error = %v", err)
+	}
+	want := "https://example.atlassian.net/browse/PROJ-1"
+	if evt.CanonicalURL != want {
+		t.Errorf("CanonicalURL = %q, want %q", evt.CanonicalURL, want)
+	}
+}
+
+func TestTranslate_CanonicalURL_NoRestPath(t *testing.T) {
+	t.Parallel()
+	tr := newTranslator()
+	issue := map[string]any{
+		"key":    "PROJ-9",
+		"self":   "https://example.atlassian.net/browse/PROJ-9",
+		"fields": map[string]any{"summary": "Already browse URL"},
+	}
+	body := mustMarshal(t, issuePayload{
+		Timestamp:    1713571200000,
+		WebhookEvent: "jira:issue_created",
+		User:         baseUser("alice"),
+		Issue:        issue,
+	})
+	evt, err := tr.Translate(body)
+	if err != nil {
+		t.Fatalf("Translate() error = %v", err)
+	}
+	// No /rest/ prefix — self returned unchanged
+	if evt.CanonicalURL != "https://example.atlassian.net/browse/PROJ-9" {
+		t.Errorf("CanonicalURL = %q", evt.CanonicalURL)
+	}
+}
+
+// ---- issue_updated falls back to summary when changelog yields no tracked fields ----
+
+func TestTranslate_IssueUpdated_FallbackToSummary(t *testing.T) {
+	t.Parallel()
+	tr := newTranslator()
+	body := mustMarshal(t, issuePayload{
+		Timestamp:    1713571200000,
+		WebhookEvent: "jira:issue_updated",
+		User:         baseUser("bob"),
+		Issue:        baseIssue("PROJ-10"),
+		Changelog: map[string]any{
+			"items": []map[string]any{
+				{"field": "attachment", "fromString": "", "toString": "file.png"},
+			},
+		},
+	})
+	evt, err := tr.Translate(body)
+	if err != nil {
+		t.Fatalf("Translate() error = %v", err)
+	}
+	if evt.Text != "Test issue summary" {
+		t.Errorf("Text = %q, want issue summary as fallback", evt.Text)
+	}
+}
+
+// ---- summary field tracked in changelog ----
+
+func TestTranslate_IssueUpdated_SummaryInChangelog(t *testing.T) {
+	t.Parallel()
+	tr := newTranslator()
+	body := mustMarshal(t, issuePayload{
+		Timestamp:    1713571200000,
+		WebhookEvent: "jira:issue_updated",
+		User:         baseUser("bob"),
+		Issue:        baseIssue("PROJ-11"),
+		Changelog: map[string]any{
+			"items": []map[string]any{
+				{"field": "summary", "fromString": "Old title", "toString": "New title"},
+			},
+		},
+	})
+	evt, err := tr.Translate(body)
+	if err != nil {
+		t.Fatalf("Translate() error = %v", err)
+	}
+	if !strings.Contains(evt.Text, "summary") {
+		t.Errorf("Text = %q, want summary change reflected", evt.Text)
+	}
+	if !strings.Contains(evt.Text, "Old title") || !strings.Contains(evt.Text, "New title") {
+		t.Errorf("Text = %q, want old→new summary values", evt.Text)
 	}
 }
 
