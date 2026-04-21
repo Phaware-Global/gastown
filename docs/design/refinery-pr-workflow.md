@@ -1812,3 +1812,37 @@ No new G-entry needed — this is G11 + G17 + G19 playing out as
 already documented. Filed here as a concrete postmortem so the
 numbers (12h wait, 0 augment reviews, 4 unresolved threads at
 merge) are preserved.
+
+### G20 — Coordination deadlock after dispatcher "re-dispatch vs adopt" prompt
+
+Observed 2026-04-20 ~18:00Z after the maintainer prompted the mayor to re-sling the stuck L1/L2 beads (gt-d0t, gt-458). The mayor did re-sling work wisps (gt-wisp-xt05 → furiosa, gt-wisp-09nw → nux) but then entered a holding pattern that no role breaks:
+
+- **Mayor**: "Idle — waiting on polecat completion signals"
+- **Witness**: "(redispatch vs adopt) before L1/L2 can land" — sautéing cycle after cycle
+- **Polecats** (furiosa, nux): held per witness instruction *"STAND BY IDLE — do NOT create a PR or run gt done. Your branch is on HOLD per Mayor instruction. Awaiting overseer decision on orphan branch disposition."*
+- **Refinery**: "Queue empty, no open PRs... MERGE_READY hasn't arrived yet. Monitoring; will process immediately when it lands."
+
+Each role is waiting on a different role's action:
+
+- Mayor waits for polecat completion.
+- Polecats wait for witness clearance.
+- Witness waits for dispatcher decision (re-dispatch vs adopt).
+- Refinery waits for MERGE_READY from polecats.
+
+The "dispatcher decision" the witness is waiting on was supposed to be the mayor's re-sling — but the mayor interpreted the re-sling as resolved-enough to move on to monitoring, without issuing an explicit "OK, proceed" to clear the witness's hold. The witness's hold message itself names "overseer" as the decider, which resolves to the human maintainer, so the deadlock is actually: *everyone is waiting for the human to say "OK, proceed" again*. Zero motion in 25+ minutes.
+
+This is a coordination-protocol gap, not a bug in any one role. The mayor's re-sling action is observable (wisp dispatch) but not semantically equivalent to "clearance granted" from the witness's perspective. The witness's hold phrasing ("awaiting overseer decision") doesn't distinguish between mayor decisions and human decisions.
+
+Side-observation that compounds G20: **nux polecat ran `gt done --pre-verified --target main --issue gt-458` prematurely** — before witness clearance — and reported "MR bead created (gt-wisp-4qd), witness notified". The bead ID gt-wisp-4qd is not findable via `bd show` nor by grep across any beads DB on disk; the polecat appears to have hallucinated the success. Witness then told nux "STOP — do NOT run gt done again", but the horse was already out of the barn from the polecat's point of view (it believes it's done). This is a variant of G19-family improvisation: when a polecat receives a re-sling signal, its LLM interprets "work here" without waiting for explicit go-ahead from the witness that would normally gate post-resume completion.
+
+Fix direction:
+
+1. **Mayor's re-sling should issue an explicit witness clearance.** When the mayor re-slings work and has authorization to proceed, it should send the witness a "CLEAR gt-d0t / gt-458" message so the witness can relay "OK, gt done is allowed" to the polecats. Without this, the witness holds indefinitely on an ambiguous "overseer" signal.
+
+2. **Witness hold messages should name the decider explicitly.** "Awaiting overseer decision" is too vague when the overseer could be the mayor (automated) or the human (manual). A polecat reading the hold can't know whether to expect clearance from mayor mail vs an external human signal. Phrasings like "Awaiting clearance from mayor/ for gt-d0t disposition" would make the dependency chain legible.
+
+3. **Polecats should wait for witness clearance before `gt done`, not just on "work hooked" signals.** Nux's premature gt done suggests the polecat prompt treats any inbound wisp/nudge as permission to act. In the hold-then-resume pattern a re-sling isn't enough — the polecat must also have a "proceed" from the witness. The witness's existing "STAND BY IDLE" nudge is enforcement; what's missing is a symmetric "CLEAR" nudge that the polecat waits for.
+
+4. **Hallucinated MR-bead IDs are a real failure mode.** Nux's "MR bead gt-wisp-4qd created" report matches no bead on disk. Either gt done's output was misread, or the LLM fabricated the ID. Either way, downstream roles that trust polecat self-reports of MR creation will chase ghost IDs. A simple defense: the witness or refinery should verify the claimed MR bead exists before trusting the polecat's completion signal.
+
+Not blocking — the coordination hold resolves as soon as the human (or an automated clearance) unsticks it. But in an autonomous gastown that wants to run without daily human handholding, this specific hold pattern is load-bearing on external input.
