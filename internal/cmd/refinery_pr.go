@@ -51,6 +51,14 @@ var (
 
 	// gt refinery pr merge
 	refPrMergeMethod string
+
+	// gt refinery pr await-review
+	refPrAwaitReviewer       string
+	refPrAwaitTriggerComment string
+	refPrAwaitWait           time.Duration
+	refPrAwaitPollInterval   time.Duration
+	refPrAwaitTimeout        time.Duration
+	refPrAwaitNoTrigger      bool
 )
 
 var refineryPrCmd = &cobra.Command{
@@ -119,6 +127,28 @@ var refineryPrMergeCmd = &cobra.Command{
 	RunE:  runRefineryPrMerge,
 }
 
+var refineryPrAwaitReviewCmd = &cobra.Command{
+	Use:   "await-review <pr-number>",
+	Short: "Post the reviewer trigger, wait, then block until review + threads clear",
+	Long: `Run the imperative review-wait gate on a PR.
+
+Three-phase sequence:
+  1. Post the trigger comment (default "augment review") to wake the
+     reviewer bot. Skippable via --no-trigger.
+  2. Sleep --wait (default from rig config; ultimate fallback 5m)
+     before the first review check. Physical-reality delay.
+  3. Poll every --poll-interval until either:
+       - the reviewer has engaged AND no unresolved threads remain → 0 exit
+       - unresolved threads exist → non-zero, caller runs review-fix loop
+       - --timeout elapses with no review landed → non-zero, escalate
+
+Replaces the prose-driven request-review/wait-approval steps with one
+imperative command that cannot be optimized away under schedule
+pressure.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runRefineryPrAwaitReview,
+}
+
 func init() {
 	refineryCmd.AddCommand(refineryPrCmd)
 	refineryPrCmd.AddCommand(refineryPrCreateCmd)
@@ -127,6 +157,7 @@ func init() {
 	refineryPrCmd.AddCommand(refineryPrThreadsCmd)
 	refineryPrCmd.AddCommand(refineryPrWaitApprovalCmd)
 	refineryPrCmd.AddCommand(refineryPrMergeCmd)
+	refineryPrCmd.AddCommand(refineryPrAwaitReviewCmd)
 
 	refineryPrCreateCmd.Flags().StringVar(&refPrCreateBranch, "branch", "", "head branch (required)")
 	refineryPrCreateCmd.Flags().StringVar(&refPrCreateBase, "base", "main", "target branch")
@@ -150,6 +181,19 @@ func init() {
 	refineryPrWaitApprovalCmd.Flags().BoolVar(&refPrWaitApprovalEsc, "escalate", false, "open an escalation on first call (reserved; Phase 3)")
 
 	refineryPrMergeCmd.Flags().StringVar(&refPrMergeMethod, "method", "squash", "merge method: squash, merge, or rebase")
+
+	refineryPrAwaitReviewCmd.Flags().StringVar(&refPrAwaitReviewer, "reviewer", "",
+		"GitHub user whose review must land (defaults to rig merge_queue.pr_reviewer)")
+	refineryPrAwaitReviewCmd.Flags().StringVar(&refPrAwaitTriggerComment, "trigger-comment", "",
+		"body to post as the review trigger (defaults to rig merge_queue.pr_trigger_comment or \"augment review\")")
+	refineryPrAwaitReviewCmd.Flags().DurationVar(&refPrAwaitWait, "wait", 0,
+		"min wait after trigger before first check (defaults to rig merge_queue.pr_review_wait or 5m)")
+	refineryPrAwaitReviewCmd.Flags().DurationVar(&refPrAwaitPollInterval, "poll-interval", 0,
+		"poll cadence after min wait (defaults to rig merge_queue.pr_review_poll_interval or 30s)")
+	refineryPrAwaitReviewCmd.Flags().DurationVar(&refPrAwaitTimeout, "timeout", 0,
+		"max total wait (defaults to rig merge_queue.pr_review_timeout or 30m)")
+	refineryPrAwaitReviewCmd.Flags().BoolVar(&refPrAwaitNoTrigger, "no-trigger", false,
+		"skip posting the trigger comment (use when request-review already triggered the bot)")
 }
 
 // getRefineryPRContext builds the PRProvider for the rig inferred from cwd.
@@ -412,11 +456,11 @@ func runRefineryPrMerge(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// G24 fix: unresolved review threads block merge. Checked BEFORE the
-	// approval gate so the refinery LLM sees the thread list first — if
-	// threads are outstanding, fixing them often produces the missing
-	// approval as a side effect, whereas approving in the absence of
-	// thread resolution lets reviewer guidance slip through to main.
+	// Unresolved threads block merge, checked BEFORE the approval gate
+	// so the refinery LLM sees the thread list first — if threads are
+	// outstanding, fixing them often produces the missing approval as a
+	// side effect, whereas approving without thread resolution lets
+	// reviewer guidance slip through to main.
 	if err := refinery.VerifyReviewThreadsResolved(provider, prNumber, nil); err != nil {
 		var needsResolution *refinery.NeedsReviewResolutionError
 		if errors.As(err, &needsResolution) {
@@ -462,9 +506,77 @@ func runRefineryPrMerge(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func runRefineryPrAwaitReview(cmd *cobra.Command, args []string) error {
+	prNumber, err := parsePRNumber(args[0])
+	if err != nil {
+		return err
+	}
+	provider, cfg, _, err := getRefineryPRContext()
+	if err != nil {
+		return err
+	}
+
+	// CLI flag overrides rig config; rig config carries the defaults
+	// seeded by DefaultMergeQueueConfig, so a zero-valued flag falls
+	// through to the rig's effective value.
+	reviewer := firstNonEmpty(refPrAwaitReviewer, cfg.PRReviewer)
+	if reviewer == "" {
+		return fmt.Errorf("await-review: --reviewer required (or set merge_queue.pr_reviewer in rig config)")
+	}
+	triggerComment := firstNonEmpty(refPrAwaitTriggerComment, cfg.PRTriggerComment)
+	if refPrAwaitNoTrigger {
+		triggerComment = ""
+	}
+	wait := firstNonZero(refPrAwaitWait, cfg.PRReviewWait)
+	pollInterval := firstNonZero(refPrAwaitPollInterval, cfg.PRReviewPollInterval)
+	timeout := firstNonZero(refPrAwaitTimeout, cfg.PRReviewTimeout)
+
+	err = refinery.AwaitReview(provider, prNumber, refinery.AwaitReviewOptions{
+		Reviewer:       reviewer,
+		TriggerComment: triggerComment,
+		MinWait:        wait,
+		PollInterval:   pollInterval,
+		Timeout:        timeout,
+	}, os.Stdout)
+	if err != nil {
+		var needsResolution *refinery.NeedsReviewResolutionError
+		if errors.As(err, &needsResolution) {
+			return fmt.Errorf("%w\nRun the review-fix loop (address each thread, reply, and mark resolved) "+
+				"then retry `gt refinery pr await-review`", err)
+		}
+		var timeoutErr *refinery.AwaitReviewTimeoutError
+		if errors.As(err, &timeoutErr) {
+			return fmt.Errorf("%w\nThe reviewer bot did not engage within --timeout. Inspect the PR "+
+				"and escalate — do NOT proceed to merge", err)
+		}
+		return err
+	}
+	fmt.Fprintf(os.Stdout, "%s PR #%d review gate satisfied (reviewer=%s)\n",
+		style.Bold.Render("✓"), prNumber, reviewer)
+	return nil
+}
+
 // Keep the git dependency referenced so `go vet` doesn't complain about unused
 // imports when the file is edited during development.
 var _ = git.NewGit
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func firstNonZero(vals ...time.Duration) time.Duration {
+	for _, v := range vals {
+		if v != 0 {
+			return v
+		}
+	}
+	return 0
+}
 
 func firstLine(s string) string {
 	if idx := strings.IndexByte(s, '\n'); idx >= 0 {

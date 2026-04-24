@@ -47,6 +47,8 @@ func (f *fakePRProvider) RequestReview(int, []string) error             { panic(
 func (f *fakePRProvider) UnresolvedThreads(int) ([]ReviewThread, error) { panic("unused") }
 func (f *fakePRProvider) AllThreads(int) ([]ReviewThread, error)        { panic("unused") }
 func (f *fakePRProvider) ChecksRollup(int) (string, bool, error)        { panic("unused") }
+func (f *fakePRProvider) PostComment(int, string) error                 { panic("unused") }
+func (f *fakePRProvider) HasReviewFrom(int, string) (bool, error)       { panic("unused") }
 
 func intPtr(i int) *int { return &i }
 

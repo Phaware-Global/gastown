@@ -58,3 +58,11 @@ func (p *githubPRProvider) CountApprovals(prNumber int) (int, error) {
 func (p *githubPRProvider) ChecksRollup(prNumber int) (string, bool, error) {
 	return p.git.GhPrChecksRollup(prNumber)
 }
+
+func (p *githubPRProvider) PostComment(prNumber int, body string) error {
+	return p.git.GhPrComment(prNumber, body)
+}
+
+func (p *githubPRProvider) HasReviewFrom(prNumber int, user string) (bool, error) {
+	return p.git.GhPrHasReviewFrom(prNumber, user)
+}

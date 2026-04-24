@@ -35,6 +35,8 @@ func (p *threadsFakeProvider) RequestReview(int, []string) error             { p
 func (p *threadsFakeProvider) AllThreads(int) ([]ReviewThread, error)        { panic("unused") }
 func (p *threadsFakeProvider) CountApprovals(int) (int, error)               { panic("unused") }
 func (p *threadsFakeProvider) ChecksRollup(int) (string, bool, error)        { panic("unused") }
+func (p *threadsFakeProvider) PostComment(int, string) error                 { panic("unused") }
+func (p *threadsFakeProvider) HasReviewFrom(int, string) (bool, error)       { panic("unused") }
 
 func TestVerifyReviewThreadsResolved_Empty_ReturnsNil(t *testing.T) {
 	provider := &threadsFakeProvider{threads: nil}

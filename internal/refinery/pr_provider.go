@@ -78,6 +78,19 @@ type PRProvider interface {
 	// so callers decide whether the absence of checks is acceptable (rather
 	// than the provider silently greenlighting the merge).
 	ChecksRollup(prNumber int) (state string, done bool, err error)
+
+	// PostComment posts body as a new top-level PR comment. Used by the
+	// refinery's await-review step to post the reviewer-bot trigger
+	// comment (e.g. "augment review") as an imperative gate before
+	// polling. The comment is NOT deduplicated against prior comments —
+	// callers that want idempotency must check existing comments first.
+	PostComment(prNumber int, body string) error
+
+	// HasReviewFrom returns true iff the given user has submitted any
+	// review on the PR (any state — COMMENTED / APPROVED /
+	// CHANGES_REQUESTED / DISMISSED). This is the "reviewer has engaged"
+	// gate, distinct from IsPRApprovedBy (which is the approval gate).
+	HasReviewFrom(prNumber int, user string) (bool, error)
 }
 
 // gitReviewThreadsToProvider converts the git package representation to the
