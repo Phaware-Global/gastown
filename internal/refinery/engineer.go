@@ -1011,7 +1011,26 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
 	}
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Found PR #%d for branch %s\n", prNumber, branch)
 
-	// Step PR.2: Check approval policy.
+	// Step PR.2a: Check unresolved review threads (G24 fix).
+	// Unresolved threads block merge regardless of approval state —
+	// reviewer guidance must reach main, not slip through under time
+	// pressure. Shared with the CLI path via VerifyReviewThreadsResolved.
+	if err := VerifyReviewThreadsResolved(e.prProvider, prNumber, e.output); err != nil {
+		var needsResolution *NeedsReviewResolutionError
+		if errors.As(err, &needsResolution) {
+			return ProcessResult{
+				Success:       false,
+				NeedsApproval: true, // stays in queue; review-fix loop must run
+				Error:         err.Error(),
+			}
+		}
+		return ProcessResult{
+			Success: false,
+			Error:   err.Error(),
+		}
+	}
+
+	// Step PR.2b: Check approval policy.
 	//
 	// Policy is driven by MergeQueueConfig (PRApprover + GetPRRequiredApprovals).
 	// Shared with the `gt refinery pr merge` CLI subcommand via VerifyPRApproval

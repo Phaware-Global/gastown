@@ -412,6 +412,21 @@ func runRefineryPrMerge(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// G24 fix: unresolved review threads block merge. Checked BEFORE the
+	// approval gate so the refinery LLM sees the thread list first — if
+	// threads are outstanding, fixing them often produces the missing
+	// approval as a side effect, whereas approving in the absence of
+	// thread resolution lets reviewer guidance slip through to main.
+	if err := refinery.VerifyReviewThreadsResolved(provider, prNumber, nil); err != nil {
+		var needsResolution *refinery.NeedsReviewResolutionError
+		if errors.As(err, &needsResolution) {
+			return fmt.Errorf("%w\nResolve each thread (fix the issue + mark resolved on GitHub) "+
+				"before retrying `gt refinery pr merge`. The refinery patrol formula's PR.5 "+
+				"review-fix loop exists for this — do not merge around unresolved threads", err)
+		}
+		return err
+	}
+
 	// G21 fix: enforce the same approval gate the patrol formula asserts at
 	// PR.6 (wait-approval). Before this check, the CLI subcommand called
 	// provider.MergePR() directly — making `gt refinery pr merge <n>` a
