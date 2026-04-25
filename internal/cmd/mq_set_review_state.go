@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
@@ -40,10 +41,12 @@ func validateBeadIDShape(id string) error {
 // patrol.
 
 var (
-	mqSetReviewStatePolecat      string
-	mqSetReviewStateIter         int
-	mqSetReviewStateClearPolecat bool
-	mqSetReviewStateClearIter    bool
+	mqSetReviewStatePolecat            string
+	mqSetReviewStateIter               int
+	mqSetReviewStateClearPolecat       bool
+	mqSetReviewStateClearIter          bool
+	mqSetReviewStateAwaitStartedAt     string
+	mqSetReviewStateClearAwaitStartedAt bool
 )
 
 var mqSetReviewStateCmd = &cobra.Command{
@@ -87,6 +90,10 @@ func init() {
 		"Clear review_fix_polecat (mutually exclusive with --polecat)")
 	mqSetReviewStateCmd.Flags().BoolVar(&mqSetReviewStateClearIter, "clear-iter", false,
 		"Clear review_loop_iter to 0 (mutually exclusive with --iter)")
+	mqSetReviewStateCmd.Flags().StringVar(&mqSetReviewStateAwaitStartedAt, "await-started-at", "",
+		"RFC3339 timestamp when the await-review trigger was posted (sets await_review_started_at)")
+	mqSetReviewStateCmd.Flags().BoolVar(&mqSetReviewStateClearAwaitStartedAt, "clear-await-started-at", false,
+		"Clear await_review_started_at (mutually exclusive with --await-started-at)")
 
 	mqCmd.AddCommand(mqSetReviewStateCmd)
 }
@@ -121,9 +128,19 @@ func runMqSetReviewState(cmd *cobra.Command, args []string) error {
 	if iterProvided && mqSetReviewStateClearIter {
 		return fmt.Errorf("--iter and --clear-iter are mutually exclusive")
 	}
+	if mqSetReviewStateAwaitStartedAt != "" && mqSetReviewStateClearAwaitStartedAt {
+		return fmt.Errorf("--await-started-at and --clear-await-started-at are mutually exclusive")
+	}
+	if mqSetReviewStateAwaitStartedAt != "" {
+		if _, perr := time.Parse(time.RFC3339, mqSetReviewStateAwaitStartedAt); perr != nil {
+			return fmt.Errorf("--await-started-at must be RFC3339, got %q: %w",
+				mqSetReviewStateAwaitStartedAt, perr)
+		}
+	}
 	if mqSetReviewStatePolecat == "" && !mqSetReviewStateClearPolecat &&
-		!iterProvided && !mqSetReviewStateClearIter {
-		return fmt.Errorf("no-op: set at least one of --polecat/--clear-polecat/--iter/--clear-iter")
+		!iterProvided && !mqSetReviewStateClearIter &&
+		mqSetReviewStateAwaitStartedAt == "" && !mqSetReviewStateClearAwaitStartedAt {
+		return fmt.Errorf("no-op: set at least one of --polecat/--clear-polecat/--iter/--clear-iter/--await-started-at/--clear-await-started-at")
 	}
 
 	// Resolve the bead directory via routes.jsonl (same helper the sling
@@ -171,14 +188,20 @@ func runMqSetReviewState(cmd *cobra.Command, args []string) error {
 		// Negative values were rejected above; at this point mqSetReviewStateIter ≥ 0.
 		fields.ReviewLoopIter = mqSetReviewStateIter
 	}
+	switch {
+	case mqSetReviewStateClearAwaitStartedAt:
+		fields.AwaitReviewStartedAt = ""
+	case mqSetReviewStateAwaitStartedAt != "":
+		fields.AwaitReviewStartedAt = mqSetReviewStateAwaitStartedAt
+	}
 
 	newDesc := beads.SetMRFields(issue, fields)
 	if err := bd.Update(mrID, beads.UpdateOptions{Description: &newDesc}); err != nil {
 		return fmt.Errorf("writing MR bead description: %w", err)
 	}
 
-	fmt.Fprintf(os.Stdout, "%s MR %s review-fix state: polecat=%q iter=%d\n",
+	fmt.Fprintf(os.Stdout, "%s MR %s review-fix state: polecat=%q iter=%d await_started_at=%q\n",
 		style.Bold.Render("✓"), mrID,
-		fields.ReviewFixPolecat, fields.ReviewLoopIter)
+		fields.ReviewFixPolecat, fields.ReviewLoopIter, fields.AwaitReviewStartedAt)
 	return nil
 }

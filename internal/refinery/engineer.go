@@ -215,20 +215,18 @@ type MergeQueueConfig struct {
 	// PRMergeMethod is passed to the VCS provider on merge ("squash" default).
 	PRMergeMethod string `json:"pr_merge_method,omitempty"`
 
-	// PRReviewWait is the minimum duration `gt refinery pr await-review`
-	// waits after posting the trigger comment before its first
-	// mergeability check. The physical-reality gate — the reviewer bot
-	// cannot produce output in zero time, so the refinery must not even
-	// look until at least this much elapsed. Default 5 minutes.
+	// PRReviewWait is the minimum duration that must elapse between
+	// `gt refinery pr await-review` posting the trigger comment and
+	// the next call running the first mergeability check. The
+	// physical-reality gate — the reviewer bot cannot produce output
+	// in zero time, so the refinery must not even look until at least
+	// this much elapsed. Default 5 minutes.
 	PRReviewWait time.Duration `json:"pr_review_wait,omitempty"`
 
-	// PRReviewPollInterval is how often await-review re-checks for a
-	// review + resolved threads after PRReviewWait elapses. Default 30s.
-	PRReviewPollInterval time.Duration `json:"pr_review_poll_interval,omitempty"`
-
-	// PRReviewTimeout caps total await-review wall time before the
-	// command fails (so the refinery patrol can escalate instead of
-	// polling forever). Default 30 minutes.
+	// PRReviewTimeout caps total await-review wall time (from trigger
+	// post) before the gate escalates. The patrol cycle's own poll
+	// cadence drives re-entry, so a separate poll-interval field is
+	// not needed. Default 30 minutes.
 	PRReviewTimeout time.Duration `json:"pr_review_timeout,omitempty"`
 
 	// PRTriggerComment is the body await-review posts to wake the
@@ -284,7 +282,6 @@ func DefaultMergeQueueConfig() *MergeQueueConfig {
 		MaxRetryCount:           5,
 		AutoPush:                true,
 		PRReviewWait:            DefaultPRReviewWait,
-		PRReviewPollInterval:    DefaultPRReviewPollInterval,
 		PRReviewTimeout:         DefaultPRReviewTimeout,
 		PRTriggerComment:        DefaultPRTriggerComment,
 	}
@@ -525,7 +522,6 @@ func (e *Engineer) LoadConfig() error {
 		PRReviewLoopMax      *int                       `json:"pr_review_loop_max"`
 		PRMergeMethod        *string                    `json:"pr_merge_method"`
 		PRReviewWait         *string                    `json:"pr_review_wait"`
-		PRReviewPollInterval *string                    `json:"pr_review_poll_interval"`
 		PRReviewTimeout      *string                    `json:"pr_review_timeout"`
 		PRTriggerComment     *string                    `json:"pr_trigger_comment"`
 	}
@@ -635,11 +631,6 @@ func (e *Engineer) LoadConfig() error {
 		return err
 	} else if ok {
 		e.config.PRReviewWait = dur
-	}
-	if dur, ok, err := parseDurationField(mqRaw.PRReviewPollInterval, "pr_review_poll_interval", false); err != nil {
-		return err
-	} else if ok {
-		e.config.PRReviewPollInterval = dur
 	}
 	if dur, ok, err := parseDurationField(mqRaw.PRReviewTimeout, "pr_review_timeout", false); err != nil {
 		return err

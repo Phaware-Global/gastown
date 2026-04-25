@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/rig"
@@ -56,9 +57,9 @@ var (
 	refPrAwaitReviewer       string
 	refPrAwaitTriggerComment string
 	refPrAwaitWait           time.Duration
-	refPrAwaitPollInterval   time.Duration
 	refPrAwaitTimeout        time.Duration
 	refPrAwaitNoTrigger      bool
+	refPrAwaitMR             string
 )
 
 var refineryPrCmd = &cobra.Command{
@@ -129,22 +130,30 @@ var refineryPrMergeCmd = &cobra.Command{
 
 var refineryPrAwaitReviewCmd = &cobra.Command{
 	Use:   "await-review <pr-number>",
-	Short: "Post the reviewer trigger, wait, then block until review + threads clear",
-	Long: `Run the imperative review-wait gate on a PR.
+	Short: "Post the reviewer trigger, then enforce wait + thread gate (one-shot, patrol-resumable)",
+	Long: `Run one cycle of the imperative review-wait gate on a PR.
 
-Three-phase sequence:
-  1. Post the trigger comment (default "augment review") to wake the
-     reviewer bot. Skippable via --no-trigger.
-  2. Sleep --wait (default from rig config; ultimate fallback 5m)
-     before the first review check. Physical-reality delay.
-  3. Poll every --poll-interval until either:
-       - the reviewer has engaged AND no unresolved threads remain → 0 exit
-       - unresolved threads exist → non-zero, caller runs review-fix loop
-       - --timeout elapses with no review landed → non-zero, escalate
+Single-shot, NOT a blocking poll: each invocation takes at most one
+action and returns immediately. State (when the trigger was posted)
+lives on the MR bead's description so the patrol formula re-enters
+on each cycle without busy-waiting. This keeps the merge queue
+unblocked while one PR awaits its reviewer.
 
-Replaces the prose-driven request-review/wait-approval steps with one
-imperative command that cannot be optimized away under schedule
-pressure.`,
+State machine:
+  - first call (no await_review_started_at on the MR bead) → post the
+    trigger comment, record the timestamp, exit 1 (still waiting).
+  - subsequent call inside --wait window → exit 1 (still waiting).
+  - subsequent call past --wait, threads clean, reviewer engaged →
+    exit 0 (advance).
+  - threads unresolved at any point past --wait → exit 2 (review-fix
+    loop required).
+  - --timeout elapsed with reviewer still absent → exit 3 (escalate).
+
+Exit codes:
+  0  ready to advance
+  1  still waiting (post-trigger or inside the wait window)
+  2  unresolved threads — caller dispatches review-fix
+  3  reviewer never engaged — caller escalates`,
 	Args: cobra.ExactArgs(1),
 	RunE: runRefineryPrAwaitReview,
 }
@@ -182,16 +191,17 @@ func init() {
 
 	refineryPrMergeCmd.Flags().StringVar(&refPrMergeMethod, "method", "squash", "merge method: squash, merge, or rebase")
 
+	refineryPrAwaitReviewCmd.Flags().StringVar(&refPrAwaitMR, "mr", "",
+		"MR bead ID for state persistence (required for patrol-resumable use; "+
+			"omit only for one-off CLI debugging — without --mr each call posts a fresh trigger)")
 	refineryPrAwaitReviewCmd.Flags().StringVar(&refPrAwaitReviewer, "reviewer", "",
 		"GitHub user whose review must land (defaults to rig merge_queue.pr_reviewer)")
 	refineryPrAwaitReviewCmd.Flags().StringVar(&refPrAwaitTriggerComment, "trigger-comment", "",
 		"body to post as the review trigger (defaults to rig merge_queue.pr_trigger_comment or \"augment review\")")
 	refineryPrAwaitReviewCmd.Flags().DurationVar(&refPrAwaitWait, "wait", 0,
-		"min wait after trigger before first check (defaults to rig merge_queue.pr_review_wait or 5m)")
-	refineryPrAwaitReviewCmd.Flags().DurationVar(&refPrAwaitPollInterval, "poll-interval", 0,
-		"poll cadence after min wait (defaults to rig merge_queue.pr_review_poll_interval or 30s)")
+		"min wait between trigger and first check (defaults to rig merge_queue.pr_review_wait or 5m)")
 	refineryPrAwaitReviewCmd.Flags().DurationVar(&refPrAwaitTimeout, "timeout", 0,
-		"max total wait (defaults to rig merge_queue.pr_review_timeout or 30m)")
+		"max total wait before escalating (defaults to rig merge_queue.pr_review_timeout or 30m)")
 	refineryPrAwaitReviewCmd.Flags().BoolVar(&refPrAwaitNoTrigger, "no-trigger", false,
 		"skip posting the trigger comment (use when request-review already triggered the bot)")
 }
@@ -516,9 +526,6 @@ func runRefineryPrAwaitReview(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// CLI flag overrides rig config; rig config carries the defaults
-	// seeded by DefaultMergeQueueConfig, so a zero-valued flag falls
-	// through to the rig's effective value.
 	reviewer := firstNonEmpty(refPrAwaitReviewer, cfg.PRReviewer)
 	if reviewer == "" {
 		return fmt.Errorf("await-review: --reviewer required (or set merge_queue.pr_reviewer in rig config)")
@@ -528,32 +535,124 @@ func runRefineryPrAwaitReview(cmd *cobra.Command, args []string) error {
 		triggerComment = ""
 	}
 	wait := firstNonZero(refPrAwaitWait, cfg.PRReviewWait)
-	pollInterval := firstNonZero(refPrAwaitPollInterval, cfg.PRReviewPollInterval)
 	timeout := firstNonZero(refPrAwaitTimeout, cfg.PRReviewTimeout)
 
-	err = refinery.AwaitReview(provider, prNumber, refinery.AwaitReviewOptions{
+	startedAt, mrBd, err := readAwaitReviewState(refPrAwaitMR)
+	if err != nil {
+		return err
+	}
+
+	res, err := refinery.AwaitReviewStep(provider, prNumber, refinery.AwaitReviewStepInput{
 		Reviewer:       reviewer,
 		TriggerComment: triggerComment,
 		MinWait:        wait,
-		PollInterval:   pollInterval,
 		Timeout:        timeout,
-	}, os.Stdout)
+		StartedAt:      startedAt,
+	})
 	if err != nil {
-		var needsResolution *refinery.NeedsReviewResolutionError
-		if errors.As(err, &needsResolution) {
-			return fmt.Errorf("%w\nRun the review-fix loop (address each thread, reply, and mark resolved) "+
-				"then retry `gt refinery pr await-review`", err)
-		}
-		var timeoutErr *refinery.AwaitReviewTimeoutError
-		if errors.As(err, &timeoutErr) {
-			return fmt.Errorf("%w\nThe reviewer bot did not engage within --timeout. Inspect the PR "+
-				"and escalate — do NOT proceed to merge", err)
-		}
 		return err
 	}
-	fmt.Fprintf(os.Stdout, "%s PR #%d review gate satisfied (reviewer=%s)\n",
-		style.Bold.Render("✓"), prNumber, reviewer)
-	return nil
+
+	if !res.NewStartedAt.IsZero() {
+		if err := writeAwaitReviewStartedAt(mrBd, refPrAwaitMR, res.NewStartedAt); err != nil {
+			return fmt.Errorf("persisting await_review_started_at to MR %s: %w", refPrAwaitMR, err)
+		}
+	}
+
+	refinery.EmitAwaitReviewProgress(os.Stdout, res)
+
+	switch res.Status {
+	case refinery.AwaitStatusReady:
+		fmt.Fprintf(os.Stdout, "%s PR #%d review gate satisfied (reviewer=%s)\n",
+			style.Bold.Render("✓"), prNumber, reviewer)
+		return nil
+	case refinery.AwaitStatusTriggerPosted, refinery.AwaitStatusWaiting:
+		return NewSilentExit(1)
+	case refinery.AwaitStatusNeedsResolution:
+		fmt.Fprintf(os.Stdout, "%d unresolved review thread(s) — run the review-fix loop\n",
+			len(res.UnresolvedThreads))
+		for i, t := range res.UnresolvedThreads {
+			loc := t.URL
+			if t.Path != "" {
+				loc = fmt.Sprintf("%s:%d", t.Path, t.Line)
+			}
+			prio := ""
+			if t.Priority != "" {
+				prio = fmt.Sprintf("[%s] ", strings.ToUpper(t.Priority))
+			}
+			fmt.Fprintf(os.Stdout, "  %d. %s%s@%s — %s\n", i+1, prio, t.Author, loc, t.Preview)
+		}
+		return NewSilentExit(2)
+	case refinery.AwaitStatusTimedOut:
+		fmt.Fprintf(os.Stdout,
+			"reviewer %q never engaged — escalate; do NOT proceed to merge\n", reviewer)
+		return NewSilentExit(3)
+	default:
+		return fmt.Errorf("await-review: unrecognized status %d", res.Status)
+	}
+}
+
+// readAwaitReviewState reads the persisted await_review_started_at
+// timestamp from the MR bead, returning a zero time when no MR is
+// passed or the field is unset/empty. The bd handle is returned so
+// the caller can pass it back to writeAwaitReviewStartedAt without
+// re-resolving the bead directory.
+func readAwaitReviewState(mrID string) (time.Time, *beads.Beads, error) {
+	if mrID == "" {
+		return time.Time{}, nil, nil
+	}
+	if err := validateBeadIDShape(mrID); err != nil {
+		return time.Time{}, nil, fmt.Errorf("invalid --mr %q: %w", mrID, err)
+	}
+	bd := beads.New(resolveBeadDir(mrID))
+	issue, err := bd.Show(mrID)
+	if err != nil {
+		return time.Time{}, nil, fmt.Errorf("loading MR bead %s: %w", mrID, err)
+	}
+	if issue == nil {
+		return time.Time{}, nil, fmt.Errorf("MR bead %s not found", mrID)
+	}
+	fields := beads.ParseMRFields(issue)
+	if fields == nil || fields.AwaitReviewStartedAt == "" {
+		return time.Time{}, bd, nil
+	}
+	t, perr := time.Parse(time.RFC3339, fields.AwaitReviewStartedAt)
+	if perr != nil {
+		return time.Time{}, nil, fmt.Errorf(
+			"MR %s has invalid await_review_started_at %q: %w",
+			mrID, fields.AwaitReviewStartedAt, perr)
+	}
+	return t, bd, nil
+}
+
+func writeAwaitReviewStartedAt(bd *beads.Beads, mrID string, t time.Time) error {
+	if bd == nil || mrID == "" {
+		return nil
+	}
+	unlock, err := bd.LockBead(mrID)
+	if err != nil {
+		return fmt.Errorf("acquiring bead lock: %w", err)
+	}
+	defer unlock()
+
+	// Re-read under the lock so we don't clobber a concurrent writer's
+	// changes to other MR fields (review_loop_iter, review_fix_polecat,
+	// etc.) — read-modify-write needs to see the latest snapshot.
+	latest, err := bd.Show(mrID)
+	if err != nil {
+		return fmt.Errorf("re-reading MR under lock: %w", err)
+	}
+	if latest == nil {
+		return fmt.Errorf("MR %s vanished under lock", mrID)
+	}
+	latestFields := beads.ParseMRFields(latest)
+	if latestFields == nil {
+		latestFields = &beads.MRFields{}
+	}
+	latestFields.AwaitReviewStartedAt = t.UTC().Format(time.RFC3339)
+
+	newDesc := beads.SetMRFields(latest, latestFields)
+	return bd.Update(mrID, beads.UpdateOptions{Description: &newDesc})
 }
 
 // Keep the git dependency referenced so `go vet` doesn't complain about unused

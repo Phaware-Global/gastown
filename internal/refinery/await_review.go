@@ -10,52 +10,95 @@ import (
 // Default durations for AwaitReview. Seeded into DefaultMergeQueueConfig
 // so LoadConfig'd rigs pick them up automatically.
 const (
-	DefaultPRReviewWait         = 5 * time.Minute
-	DefaultPRReviewPollInterval = 30 * time.Second
-	DefaultPRReviewTimeout      = 30 * time.Minute
-	DefaultPRTriggerComment     = "augment review"
+	DefaultPRReviewWait     = 5 * time.Minute
+	DefaultPRReviewTimeout  = 30 * time.Minute
+	DefaultPRTriggerComment = "augment review"
 )
 
-// AwaitReviewOptions carries the runtime inputs for AwaitReview.
-// Callers resolve defaults at their own layer (CLI reads rig config;
-// tests pass explicit short values) so AwaitReview does not silently
-// fill in behavior the caller didn't intend.
-type AwaitReviewOptions struct {
-	// Reviewer is the GitHub user whose review must land before
-	// AwaitReview returns success. Required.
+// AwaitReviewStatus is the outcome of one AwaitReviewStep call.
+// Single-step + status enum is what makes await-review patrol-resumable
+// — the formula re-enters this function on every patrol cycle, takes
+// at most one action, and returns immediately. No inline sleep.
+type AwaitReviewStatus int
+
+const (
+	// AwaitStatusTriggerPosted means the trigger was just posted on
+	// this call. The caller persists the new StartedAt timestamp and
+	// waits for the next patrol cycle.
+	AwaitStatusTriggerPosted AwaitReviewStatus = iota
+
+	// AwaitStatusWaiting means the min-wait window has not yet
+	// elapsed, OR it has elapsed but the reviewer hasn't engaged yet
+	// and we're still inside the timeout. Caller skips this MR for
+	// this cycle and re-enters on the next patrol.
+	AwaitStatusWaiting
+
+	// AwaitStatusReady means the reviewer has engaged AND no
+	// unresolved non-outdated threads remain. The PR can advance to
+	// the approval gate.
+	AwaitStatusReady
+
+	// AwaitStatusNeedsResolution means unresolved non-outdated threads
+	// exist. The caller maps this to the review-fix loop (PR.5).
+	AwaitStatusNeedsResolution
+
+	// AwaitStatusTimedOut means total elapsed time has exceeded
+	// Timeout AND the reviewer never engaged. Caller escalates.
+	AwaitStatusTimedOut
+)
+
+// AwaitReviewStepInput carries one patrol cycle's inputs. The caller
+// (CLI subcommand) reads the persisted timestamp from the MR bead,
+// fills this in, calls AwaitReviewStep, then persists any returned
+// timestamp change back to the bead.
+type AwaitReviewStepInput struct {
+	// Reviewer is the GitHub user whose review must land. Required.
 	Reviewer string
 
-	// TriggerComment is the body posted to wake the reviewer bot.
-	// Empty skips the trigger-post step entirely — useful in tests and
-	// for rigs that trigger the reviewer elsewhere (e.g. via
-	// request-review).
+	// TriggerComment is the body posted on the FIRST call (when
+	// StartedAt is zero). Empty skips the trigger-post step entirely.
 	TriggerComment string
 
-	// MinWait is the imperative physical-reality delay — AwaitReview
-	// will not check for a review until this much wall time has elapsed
-	// since the trigger was posted. Pass 0 in tests to skip.
+	// MinWait is the minimum wall-time delay between trigger-posted
+	// and the first reviewer/threads check. Pass 0 in tests.
 	MinWait time.Duration
 
-	// PollInterval is how often to re-check for a review + resolved
-	// threads after MinWait elapses. Must be > 0.
-	PollInterval time.Duration
-
-	// Timeout caps total wall time (MinWait + polling phase). Must be
-	// strictly greater than MinWait.
+	// Timeout caps total wall time from StartedAt. After this elapses
+	// without reviewer engagement, AwaitReviewStep returns
+	// AwaitStatusTimedOut. Must exceed MinWait.
 	Timeout time.Duration
 
-	// Sleep is injected for testability. nil falls back to time.Sleep.
-	Sleep func(time.Duration)
+	// StartedAt is the persisted timestamp from the prior call's
+	// AwaitStatusTriggerPosted result. Zero (time.Time{}) means
+	// "trigger has not been posted yet — post it now."
+	StartedAt time.Time
 
-	// Now is injected for testability. nil falls back to time.Now.
+	// Now overrides time.Now for tests. nil → time.Now.
 	Now func() time.Time
 }
 
-// AwaitReviewTimeoutError is returned when AwaitReview exhausts Timeout
-// waiting for the reviewer to engage. Distinct from
-// NeedsReviewResolutionError — this one means "the reviewer never
-// showed up, escalate," whereas NeedsReviewResolutionError means "the
-// reviewer engaged and left threads, run the fix loop."
+// AwaitReviewStepResult carries the outcome of one cycle. NewStartedAt
+// is non-zero when the caller must persist a timestamp change back to
+// the MR bead. UnresolvedThreads is populated only when Status is
+// AwaitStatusNeedsResolution.
+type AwaitReviewStepResult struct {
+	Status            AwaitReviewStatus
+	NewStartedAt      time.Time
+	UnresolvedThreads []UnresolvedThread
+
+	// Message is a single-line operator-friendly summary suitable for
+	// patrol logs. Always populated.
+	Message string
+
+	// RemainingWait is non-zero when Status is AwaitStatusWaiting and
+	// we're still inside the min-wait window. Zero outside that case.
+	RemainingWait time.Duration
+}
+
+// AwaitReviewTimeoutError remains as a thin sentinel so existing
+// callers that do errors.As(err, *AwaitReviewTimeoutError{}) continue
+// to compile. It is constructed from an AwaitStatusTimedOut result
+// when the CLI subcommand exits with a wrapped error.
 type AwaitReviewTimeoutError struct {
 	PRNumber int
 	Reviewer string
@@ -71,117 +114,127 @@ func (e *AwaitReviewTimeoutError) Error() string {
 		e.Waited.Round(time.Second), e.Reviewer, e.PRNumber)
 }
 
-// AwaitReview posts opts.TriggerComment, sleeps opts.MinWait, then
-// polls until the reviewer has engaged AND no unresolved threads
-// remain, or Timeout elapses.
+// AwaitReviewStep performs one patrol-cycle's worth of work on the
+// await-review gate for prNumber and returns the outcome.
 //
-// Return-case ordering is load-bearing: when threads are blocking we
-// surface *NeedsReviewResolutionError regardless of timeout so the
-// caller gets actionable findings instead of a generic "timed out"
-// that hides them. The timeout branch fires only when the reviewer
-// never engaged AND threads stayed clean — the "reviewer never showed
-// up" escalation case, distinct from the review-fix loop case.
-func AwaitReview(provider PRProvider, prNumber int, opts AwaitReviewOptions, out io.Writer) error {
+// State machine (in.StartedAt = "is trigger posted yet?"):
+//
+//   - StartedAt zero       → post trigger, return AwaitStatusTriggerPosted
+//                            with NewStartedAt = Now(). Caller persists.
+//   - elapsed < MinWait    → AwaitStatusWaiting (RemainingWait set).
+//   - threads unresolved   → AwaitStatusNeedsResolution.
+//   - reviewer engaged AND threads clean → AwaitStatusReady.
+//   - elapsed >= Timeout AND reviewer absent → AwaitStatusTimedOut.
+//   - reviewer absent (within timeout) → AwaitStatusWaiting.
+//
+// Threads-first ordering: actionable findings beat both the timeout
+// and the reviewer-absent branch — a polecat dispatch can fix the
+// findings while the reviewer is still engaging on subsequent
+// commits.
+func AwaitReviewStep(provider PRProvider, prNumber int, in AwaitReviewStepInput) (AwaitReviewStepResult, error) {
 	if provider == nil {
-		return fmt.Errorf("no PR provider configured")
+		return AwaitReviewStepResult{}, fmt.Errorf("no PR provider configured")
 	}
-	if opts.Reviewer == "" {
-		return fmt.Errorf("await-review: reviewer must be non-empty")
+	if in.Reviewer == "" {
+		return AwaitReviewStepResult{}, fmt.Errorf("await-review: reviewer must be non-empty")
 	}
-	if opts.PollInterval <= 0 {
-		return fmt.Errorf("await-review: poll-interval must be positive (got %v)", opts.PollInterval)
+	if in.Timeout <= 0 {
+		return AwaitReviewStepResult{}, fmt.Errorf("await-review: timeout must be positive (got %v)", in.Timeout)
 	}
-	if opts.Timeout <= 0 {
-		return fmt.Errorf("await-review: timeout must be positive (got %v)", opts.Timeout)
+	if in.Timeout <= in.MinWait {
+		return AwaitReviewStepResult{}, fmt.Errorf("await-review: timeout (%s) must exceed min-wait (%s)",
+			in.Timeout, in.MinWait)
 	}
-	if opts.Timeout <= opts.MinWait {
-		return fmt.Errorf("await-review: timeout (%s) must exceed min-wait (%s)",
-			opts.Timeout, opts.MinWait)
-	}
-	sleep := opts.Sleep
-	if sleep == nil {
-		sleep = time.Sleep
-	}
-	now := opts.Now
+	now := in.Now
 	if now == nil {
 		now = time.Now
 	}
 
-	start := now()
-
-	if opts.TriggerComment != "" {
-		if out != nil {
-			_, _ = fmt.Fprintf(out,
-				"[Engineer] PR #%d: posting review trigger (%q) to wake %s\n",
-				prNumber, opts.TriggerComment, opts.Reviewer)
-		}
-		if err := provider.PostComment(prNumber, opts.TriggerComment); err != nil {
-			return fmt.Errorf("posting review trigger comment: %w", err)
-		}
-	}
-
-	if opts.MinWait > 0 {
-		if out != nil {
-			_, _ = fmt.Fprintf(out,
-				"[Engineer] PR #%d: min-wait %s before first review check\n",
-				prNumber, opts.MinWait.Round(time.Second))
-		}
-		sleep(opts.MinWait)
-	}
-
-	deadline := start.Add(opts.Timeout)
-	// Only log "still waiting" on the first poll; subsequent polls are
-	// silent until state changes, so a 30-minute wait doesn't scroll 60
-	// identical lines past the operator.
-	firstPoll := true
-	for {
-		// Threads first: if unresolved findings exist we can return
-		// without even spending an API call on HasReviewFrom, and the
-		// caller gets actionable output regardless of reviewer state.
-		threadsErr := VerifyReviewThreadsResolved(provider, prNumber, out)
-		if threadsErr != nil {
-			var needs *NeedsReviewResolutionError
-			if errors.As(threadsErr, &needs) {
-				return threadsErr
-			}
-			return threadsErr
-		}
-
-		hasReview, err := provider.HasReviewFrom(prNumber, opts.Reviewer)
-		if err != nil {
-			return fmt.Errorf("checking for review from %s: %w", opts.Reviewer, err)
-		}
-
-		if hasReview {
-			if out != nil {
-				_, _ = fmt.Fprintf(out,
-					"[Engineer] PR #%d: %s has reviewed, no unresolved threads — proceeding\n",
-					prNumber, opts.Reviewer)
-			}
-			return nil
-		}
-
-		nowT := now()
-		remaining := deadline.Sub(nowT)
-		if remaining <= 0 {
-			return &AwaitReviewTimeoutError{
-				PRNumber: prNumber,
-				Reviewer: opts.Reviewer,
-				Waited:   nowT.Sub(start),
+	// First entry: trigger has never been posted. Post it (if the
+	// caller wants one), record the timestamp, and bail. The caller
+	// returns to the patrol loop; the next cycle re-enters here with
+	// StartedAt set.
+	if in.StartedAt.IsZero() {
+		if in.TriggerComment != "" {
+			if err := provider.PostComment(prNumber, in.TriggerComment); err != nil {
+				return AwaitReviewStepResult{}, fmt.Errorf("posting review trigger comment: %w", err)
 			}
 		}
-		if firstPoll && out != nil {
-			_, _ = fmt.Fprintf(out,
-				"[Engineer] PR #%d: no review from %s yet, polling every %s\n",
-				prNumber, opts.Reviewer, opts.PollInterval.Round(time.Second))
-			firstPoll = false
-		}
-		// Cap sleep at remaining budget so one last check fires right at
-		// the deadline instead of after it.
-		wait := opts.PollInterval
-		if remaining < wait {
-			wait = remaining
-		}
-		sleep(wait)
+		t := now()
+		return AwaitReviewStepResult{
+			Status:       AwaitStatusTriggerPosted,
+			NewStartedAt: t,
+			Message: fmt.Sprintf(
+				"PR #%d: posted trigger %q to wake %s; checking again after min-wait %s",
+				prNumber, in.TriggerComment, in.Reviewer, in.MinWait.Round(time.Second)),
+		}, nil
 	}
+
+	elapsed := now().Sub(in.StartedAt)
+
+	// Still inside the min-wait window — refuse to even check threads
+	// or reviewer state. This is the imperative gate.
+	if elapsed < in.MinWait {
+		remaining := in.MinWait - elapsed
+		return AwaitReviewStepResult{
+			Status:        AwaitStatusWaiting,
+			RemainingWait: remaining,
+			Message: fmt.Sprintf("PR #%d: %s left in min-wait window before first check",
+				prNumber, remaining.Round(time.Second)),
+		}, nil
+	}
+
+	// Threads first: actionable findings outweigh both the timeout
+	// branch and the reviewer-absent branch.
+	threadsErr := VerifyReviewThreadsResolved(provider, prNumber, nil)
+	if threadsErr != nil {
+		var needs *NeedsReviewResolutionError
+		if errors.As(threadsErr, &needs) {
+			return AwaitReviewStepResult{
+				Status:            AwaitStatusNeedsResolution,
+				UnresolvedThreads: needs.Threads,
+				Message: fmt.Sprintf("PR #%d: %d unresolved thread(s) — review-fix loop required",
+					prNumber, len(needs.Threads)),
+			}, nil
+		}
+		return AwaitReviewStepResult{}, threadsErr
+	}
+
+	hasReview, err := provider.HasReviewFrom(prNumber, in.Reviewer)
+	if err != nil {
+		return AwaitReviewStepResult{}, fmt.Errorf("checking for review from %s: %w", in.Reviewer, err)
+	}
+
+	if hasReview {
+		return AwaitReviewStepResult{
+			Status: AwaitStatusReady,
+			Message: fmt.Sprintf("PR #%d: %s has reviewed, no unresolved threads — ready to advance",
+				prNumber, in.Reviewer),
+		}, nil
+	}
+
+	// Wait elapsed, no threads, no reviewer. Either still inside the
+	// polling window (Waiting) or past the timeout (TimedOut).
+	if elapsed >= in.Timeout {
+		return AwaitReviewStepResult{
+			Status: AwaitStatusTimedOut,
+			Message: fmt.Sprintf("PR #%d: %s never engaged after %s — escalate",
+				prNumber, in.Reviewer, elapsed.Round(time.Second)),
+		}, nil
+	}
+	return AwaitReviewStepResult{
+		Status: AwaitStatusWaiting,
+		Message: fmt.Sprintf("PR #%d: no review from %s yet (elapsed=%s, timeout=%s)",
+			prNumber, in.Reviewer, elapsed.Round(time.Second), in.Timeout),
+	}, nil
+}
+
+// EmitAwaitReviewProgress writes a one-line [Engineer] summary of a
+// step result to out, matching the shape used by VerifyPRApproval and
+// VerifyReviewThreadsResolved. Safe to call with out == nil.
+func EmitAwaitReviewProgress(out io.Writer, r AwaitReviewStepResult) {
+	if out == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(out, "[Engineer] %s\n", r.Message)
 }

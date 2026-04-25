@@ -624,6 +624,13 @@ type MRFields struct {
 	// control to `loop-check` instead of busy-waiting inside the step.
 	ReviewLoopIter   int    // Number of review-fix dispatches already made for this PR
 	ReviewFixPolecat string // Name of the currently-dispatched review-fix polecat, or empty
+
+	// AwaitReviewStartedAt records when the await-review trigger was
+	// posted. Empty until PR.4 first posts the trigger; cleared by PR.5
+	// when a fresh polecat dispatch completes (so the next patrol cycle
+	// re-posts and restarts the wait window). Stored as RFC3339 to keep
+	// time math identical across patrols, hosts, and DST transitions.
+	AwaitReviewStartedAt string
 }
 
 // ParseMRFields extracts structured merge-request fields from an issue's description.
@@ -718,6 +725,9 @@ func ParseMRFields(issue *Issue) *MRFields {
 		case "review_fix_polecat", "review-fix-polecat", "reviewfixpolecat":
 			fields.ReviewFixPolecat = value
 			hasFields = true
+		case "await_review_started_at", "await-review-started-at", "awaitreviewstartedat":
+			fields.AwaitReviewStartedAt = value
+			hasFields = true
 		}
 	}
 
@@ -799,6 +809,9 @@ func FormatMRFields(fields *MRFields) string {
 	}
 	if fields.ReviewFixPolecat != "" {
 		lines = append(lines, "review_fix_polecat: "+fields.ReviewFixPolecat)
+	}
+	if fields.AwaitReviewStartedAt != "" {
+		lines = append(lines, "await_review_started_at: "+fields.AwaitReviewStartedAt)
 	}
 
 	return strings.Join(lines, "\n")
