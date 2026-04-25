@@ -2297,15 +2297,17 @@ The imperative fix must (a) post the trigger comment that wakes augment, (b) ENF
 
 1. **New `gt refinery pr await-review <pr>` command.** Single imperative step that:
    - Posts the trigger comment "augment review" (or `{{pr_trigger_comment}}` from config) on the PR if not already posted for the current HEAD SHA. This is the (existing) mechanism that invokes Augment Code's review bot.
-   - Sleeps `pr_review_wait` (configurable, default **5 minutes**) before the first mergeability check. This is the physical-reality gate: the reviewer bot cannot produce output in zero time.
-   - Polls `provider.UnresolvedThreads` + review state with `pr_review_poll_interval` (default 30s) until either:
-     - A review from `pr_reviewer` exists on the current HEAD SHA AND all unresolved threads are resolved, OR
-     - `pr_review_timeout` (default 30m) elapses → escalate to mayor.
-   - Returns success only when the above conditions are met. Blocks otherwise — the formula can't advance to merge.
+   - Enforces a minimum **`pr_review_wait`** (configurable, default **5 minutes**) elapsed since PR creation before the first mergeability check is allowed to succeed. This is the physical-reality gate: the reviewer bot cannot produce output in zero time.
+   - **Patrol-resumable, not blocking** — the command does NOT sleep inline. If the wait window has not yet elapsed it exits with a distinct `AwaitReviewWaitingError` (non-zero, non-fatal), and the patrol cycle resumes the PR on its next pass. This preserves the patrol loop's ability to process other MRs concurrently rather than stalling the merge queue on a single 5-minute sleep.
+   - Once the wait window has elapsed, checks `provider.UnresolvedThreads` + review state. Returns:
+     - Success — when a review from `pr_reviewer` exists on the current HEAD SHA AND all unresolved threads are resolved.
+     - `NeedsReviewResolutionError` — when threads are still unresolved (caller dispatches the review-fix polecat).
+     - `AwaitReviewTimeoutError` — when `pr_review_timeout` (default 30m) has elapsed since PR creation without reviewer engagement → escalate to mayor.
+   - The patrol loop calls `gt refinery pr await-review` once per pass; the imperative gate enforces the minimum wait through repeated invocations rather than a single inline sleep.
 
 2. **`runRefineryPrMerge` enforces review-on-current-SHA.** Merge refuses unless a review from `pr_reviewer` exists on the PR's current HEAD commit (not just any commit). This closes the race where a review lands on an earlier commit, the polecat force-pushes a fix, and the refinery merges the new HEAD before augment re-reviews.
 
-3. **Formula PR.4 / PR.5 / PR.6 collapse into a single step.** Replace the three prose-driven steps with one `gt refinery pr await-review $PR` call. Prose still documents what's happening for human operators, but the LLM's only actionable instruction is the one command. Fewer steps = fewer opportunities to skip.
+3. **Formula PR.4 replaced by `gt refinery pr await-review`; PR.5 / PR.6 retained.** The collapse is targeted at PR.4 only. PR.5 (review-fix polecat dispatch on `NeedsReviewResolutionError`) and PR.6 (final approval poll) stay in the formula because they orchestrate cross-binary work — slinging a review-fix polecat is a refinery-level decision, not an in-binary one. The await-review command's role is the **wait + reviewer-engaged + threads-resolved** triad; dispatch on those signals stays in prose where the patrol cycle can re-enter on each pass. Fewer prose steps = fewer opportunities to skip the imperative gate, without moving polecat orchestration into Go.
 
 4. **New config fields:**
 
