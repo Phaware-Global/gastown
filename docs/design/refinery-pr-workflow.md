@@ -2195,8 +2195,8 @@ gt refinery pr merge 99999 2>&1
 
 `VerifyPRApproval` did NOT error out first. It was called, it returned nil, and the MergePR call then hit GitHub. Tracing the config load:
 
-- `getRefineryPRContext` (internal/cmd/refinery_pr.go:158) builds an Engineer and calls `eng.LoadConfig()`.
-- `Engineer.LoadConfig` (internal/refinery/engineer.go:416) reads `<rig.Path>/config.json`.
+- `getRefineryPRContext` (`internal/cmd/refinery_pr.go`) builds an Engineer and calls `eng.LoadConfig()`.
+- `Engineer.LoadConfig` (`internal/refinery/engineer.go`) reads `<rig.Path>/config.json`.
 - For the gastown rig, `<rig.Path>/config.json` is the RIG IDENTITY file — `{type, version, name, git_url, default_branch, beads}`. It contains no `merge_queue` section.
 - The actual merge-queue config lives at `<rig.Path>/settings/config.json` — a different file.
 
@@ -2314,12 +2314,13 @@ The imperative fix must (a) post the trigger comment that wakes augment, (b) ENF
    ```json
    "merge_queue": {
      ...
-     "pr_review_wait": "5m",              // minimum wait after trigger before first check
-     "pr_review_poll_interval": "30s",   // poll interval for review-completion check
-     "pr_review_timeout": "30m",         // max wait before escalating
-     "pr_trigger_comment": "augment review"  // text to post to wake the reviewer bot
+     "pr_review_wait": "5m",                  // minimum elapsed since PR creation before await-review can succeed
+     "pr_review_timeout": "30m",              // max wait from PR creation before escalating
+     "pr_trigger_comment": "augment review"   // text to post to wake the reviewer bot
    }
    ```
+
+   No internal poll-interval field — `await-review` is patrol-resumable and exits immediately on each pass; the patrol cadence (`poll_interval` at the rig level) drives re-entry. A separate review-poll interval would either reintroduce inline blocking or duplicate the patrol cadence.
 
    Defaults conservative; rigs without pr_reviewer configured skip the trigger-comment step and only enforce the threads-resolved gate from G24.
 
