@@ -3842,6 +3842,11 @@ func moveDir(src, dest string) error {
 // Always connects via explicit --host/--port flags to ensure the command goes
 // through the running sql-server process. Without these flags, `dolt sql` runs
 // in embedded mode (even from the data directory), which creates databases on
+// applyWaitTimeoutFn is the SQL-exec seam used by applyWaitTimeout. Tests
+// override it to verify the policy decision (skip vs. send) and the
+// query-formatting without spawning a real dolt subprocess.
+var applyWaitTimeoutFn = serverExecSQL
+
 // applyWaitTimeout sets MySQL's `wait_timeout` server variable on the running
 // Dolt server so idle connections close in seconds rather than Dolt's 8-hour
 // default. Under sustained load this is the difference between healthy
@@ -3855,10 +3860,16 @@ func applyWaitTimeout(townRoot string, config *Config) {
 	if config.WaitTimeoutSec <= 0 {
 		return
 	}
-	query := fmt.Sprintf("SET GLOBAL wait_timeout = %d", config.WaitTimeoutSec)
-	if err := serverExecSQL(townRoot, query); err != nil {
+	query := buildWaitTimeoutQuery(config.WaitTimeoutSec)
+	if err := applyWaitTimeoutFn(townRoot, query); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not set Dolt wait_timeout=%ds: %v\n", config.WaitTimeoutSec, err)
 	}
+}
+
+// buildWaitTimeoutQuery returns the SET GLOBAL statement applyWaitTimeout
+// dispatches. Extracted for direct testability.
+func buildWaitTimeoutQuery(seconds int) string {
+	return fmt.Sprintf("SET GLOBAL wait_timeout = %d", seconds)
 }
 
 // disk but does NOT register them with the live server catalog. This caused
