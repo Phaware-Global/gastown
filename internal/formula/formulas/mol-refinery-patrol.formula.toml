@@ -869,7 +869,7 @@ until the PR is actually merged.**
 
 The command blocks until every check reaches a terminal state. Exit 0 iff
 all checks succeeded. On `FAILURE` or timeout, non-zero exit — send
-FIX_NEEDED back to the polecat and skip to the shared post-merge "Step 4: Archive the MERGE_READY mail" section further down the merge-push step (NOT Step PR.4 "Request automated review" — that's only reached on CI success):
+FIX_NEEDED back to the polecat and skip to the shared post-merge "Step 4: Archive the MERGE_READY mail" section further down the merge-push step (NOT Step PR.4 "Await reviewer engagement" — that's only reached on CI success):
 
 ```bash
 gt mail send <rig>/polecats/<polecat-name> -s "FIX_NEEDED <polecat-name>" --stdin <<BODY
@@ -882,16 +882,44 @@ Attempt-Number: 1
 BODY
 ```
 
-**Step PR.4: Request automated review (if pr_reviewer is configured)**
+**Step PR.4: Await reviewer engagement (imperative wait + thread gate)**
 
 ```bash
 if [ -n "{{pr_reviewer}}" ]; then
-  {{ cmd }} refinery pr request-review $PR --user {{pr_reviewer}}
+  set +e
+  {{ cmd }} refinery pr await-review $PR
+  AWAIT_RC=$?
+  set -e
+  # AWAIT_RC == 0  → reviewer engaged AND no unresolved threads → fall
+  #                  through to PR.6 (human-approval gate). PR.5's
+  #                  thread poll will see zero threads and advance.
+  # AWAIT_RC != 0  → either unresolved threads (NeedsReviewResolutionError)
+  #                  or reviewer-never-engaged (AwaitReviewTimeoutError),
+  #                  or a lookup failure. PR.5's polecat-dispatch logic
+  #                  handles the threads case; the other cases surface
+  #                  as a non-empty thread poll OR escalation by PR.5's
+  #                  cap-hit branch. Either way the formula advances to
+  #                  PR.5 below.
 fi
 ```
 
-When `pr_reviewer` is empty, the review loop is skipped entirely and the
-flow proceeds directly to the human-approval gate.
+`gt refinery pr await-review` is the imperative replacement for the
+old `request-review`-then-trust-the-LLM flow. It posts the trigger
+comment (`augment review` by default; see `pr_trigger_comment`),
+sleeps `pr_review_wait` (default 5 minutes — the physical-reality
+gate; the reviewer bot cannot produce output in zero time), then
+polls every `pr_review_poll_interval` until either the reviewer
+posts a review AND no unresolved threads remain, or
+`pr_review_timeout` elapses.
+
+This step exists because earlier dogfood runs showed the refinery
+LLM reasoning "PR created, tests pass → merge" and reaching PR.7
+in ~54 seconds, beating the augment review by 41 seconds. Prose
+steps were optimized away under schedule pressure; an imperative
+command that enforces the minimum wait cannot be.
+
+When `pr_reviewer` is empty, the review loop is skipped entirely
+and the flow proceeds directly to the human-approval gate.
 
 **Step PR.5: Review-fix (patrol-resumable, bounded by pr_review_loop_max, default 3)**
 
@@ -1190,7 +1218,7 @@ a banner titled `❌ DIRECT gh pr merge BLOCKED (G21 fix)` and exits
 non-zero. If `gt refinery pr merge` fails with an error like
 `PR #<n> requires approving review from <user> before merge` or
 `PR #<n> has N of M required approvals`, DO NOT try to work around
-it — go back to PR.4 (request-review) or PR.6 (wait-approval) and
+it — go back to PR.4 (await-review) or PR.6 (wait-approval) and
 resolve the gate.
 
 ⚠️ **STOP HERE - DO NOT PROCEED UNTIL THE PR IS ACTUALLY MERGED ON GITHUB**
