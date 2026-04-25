@@ -436,7 +436,7 @@ func (e *Engineer) LoadConfig() error {
 		filepath.Join(e.rig.Path, "config.json"),
 	}
 
-	var data []byte
+	var mergeQueueRaw json.RawMessage
 	for _, path := range candidates {
 		fileData, err := os.ReadFile(path)
 		if err != nil {
@@ -453,27 +453,21 @@ func (e *Engineer) LoadConfig() error {
 			return fmt.Errorf("parsing %s: %w", path, err)
 		}
 
-		if probe.MergeQueue != nil {
-			data = fileData
-			break
+		// json.RawMessage carries the literal bytes of the field's value.
+		// `nil` means the key was absent; `[]byte("null")` means an
+		// explicit `"merge_queue": null`. Both should fall through to
+		// the next candidate so a misconfigured file can't silently
+		// re-disable the approval gate.
+		if len(probe.MergeQueue) == 0 || string(probe.MergeQueue) == "null" {
+			continue
 		}
+
+		mergeQueueRaw = probe.MergeQueue
+		break
 	}
 
-	if data == nil {
-		// No candidate file had a merge_queue section — use defaults.
-		return nil
-	}
-
-	// Parse config file to extract merge_queue section
-	var rawConfig struct {
-		MergeQueue json.RawMessage `json:"merge_queue"`
-	}
-	if err := json.Unmarshal(data, &rawConfig); err != nil {
-		return fmt.Errorf("parsing merge_queue: %w", err)
-	}
-
-	if rawConfig.MergeQueue == nil {
-		// No merge_queue section, use defaults
+	if mergeQueueRaw == nil {
+		// No candidate file had a meaningful merge_queue section — use defaults.
 		return nil
 	}
 
@@ -502,7 +496,7 @@ func (e *Engineer) LoadConfig() error {
 		PRMergeMethod        *string                    `json:"pr_merge_method"`
 	}
 
-	if err := json.Unmarshal(rawConfig.MergeQueue, &mqRaw); err != nil {
+	if err := json.Unmarshal(mergeQueueRaw, &mqRaw); err != nil {
 		return fmt.Errorf("parsing merge_queue config: %w", err)
 	}
 

@@ -14,6 +14,19 @@ import (
 	"github.com/steveyegge/gastown/internal/rig"
 )
 
+// mustMarshalIndent is a test helper that fails the test immediately if
+// MarshalIndent returns an error. Failure here means a test fixture became
+// non-marshalable (e.g., a value type sneaked in that JSON can't represent),
+// which is a programming error in the test rather than a runtime concern.
+func mustMarshalIndent(t *testing.T, v interface{}) []byte {
+	t.Helper()
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		t.Fatalf("marshaling test fixture: %v", err)
+	}
+	return data
+}
+
 func TestEngineer_LoadConfig_MergeStrategyPR(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -31,7 +44,7 @@ func TestEngineer_LoadConfig_MergeStrategyPR(t *testing.T) {
 		},
 	}
 
-	data, _ := json.MarshalIndent(config, "", "  ")
+	data := mustMarshalIndent(t, config)
 	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +92,7 @@ func TestEngineer_LoadConfig_ReadsSettingsPath(t *testing.T) {
 			"pr_reviewer":           "augment",
 		},
 	}
-	data, _ := json.MarshalIndent(settings, "", "  ")
+	data := mustMarshalIndent(t, settings)
 	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), data, 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +106,7 @@ func TestEngineer_LoadConfig_ReadsSettingsPath(t *testing.T) {
 		"name":           "test-rig",
 		"default_branch": "main",
 	}
-	identityData, _ := json.MarshalIndent(identity, "", "  ")
+	identityData := mustMarshalIndent(t, identity)
 	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), identityData, 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +151,7 @@ func TestEngineer_LoadConfig_SettingsPathWins(t *testing.T) {
 			"pr_approver":    "from-settings",
 		},
 	}
-	data, _ := json.MarshalIndent(settings, "", "  ")
+	data := mustMarshalIndent(t, settings)
 	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), data, 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +165,7 @@ func TestEngineer_LoadConfig_SettingsPathWins(t *testing.T) {
 			"pr_approver":    "from-root",
 		},
 	}
-	rootData, _ := json.MarshalIndent(root, "", "  ")
+	rootData := mustMarshalIndent(t, root)
 	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), rootData, 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +198,7 @@ func TestEngineer_LoadConfig_RootFallback(t *testing.T) {
 			"pr_approver":    "legacy-approver",
 		},
 	}
-	data, _ := json.MarshalIndent(legacyConfig, "", "  ")
+	data := mustMarshalIndent(t, legacyConfig)
 	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +237,7 @@ func TestEngineer_LoadConfig_SettingsExistsNoMergeQueue(t *testing.T) {
 		"version": 1,
 		"theme":   "dark",
 	}
-	data, _ := json.MarshalIndent(settings, "", "  ")
+	data := mustMarshalIndent(t, settings)
 	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), data, 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +252,7 @@ func TestEngineer_LoadConfig_SettingsExistsNoMergeQueue(t *testing.T) {
 			"pr_approver":    "from-root-fallback",
 		},
 	}
-	rootData, _ := json.MarshalIndent(root, "", "  ")
+	rootData := mustMarshalIndent(t, root)
 	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), rootData, 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -257,6 +270,56 @@ func TestEngineer_LoadConfig_SettingsExistsNoMergeQueue(t *testing.T) {
 	}
 }
 
+// TestEngineer_LoadConfig_SettingsExplicitNullMergeQueue covers the edge
+// case flagged on PR #35 iteration 2: an explicit `"merge_queue": null` in
+// settings/config.json should be treated as "not configured here" and fall
+// through to the rig-root file, not selected as the winning candidate.
+// Without this, a settings file that explicitly nulls out merge_queue
+// would silently disable the approval gate even when the root file has a
+// real config — same end-state as the original G23 failure.
+func TestEngineer_LoadConfig_SettingsExplicitNullMergeQueue(t *testing.T) {
+	tmpDir := t.TempDir()
+	settingsDir := filepath.Join(tmpDir, "settings")
+	if err := os.MkdirAll(settingsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// settings/config.json carries an explicit `"merge_queue": null`.
+	// json.Unmarshal of null into json.RawMessage stores the literal
+	// bytes []byte("null"), not nil — so a naive `!= nil` check would
+	// pick this file as the winning candidate.
+	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"),
+		[]byte(`{"type":"rig-settings","version":1,"merge_queue":null}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// rig-root config.json holds the real merge_queue.
+	root := map[string]interface{}{
+		"type":    "rig",
+		"version": 1,
+		"name":    "test-rig",
+		"merge_queue": map[string]interface{}{
+			"merge_strategy": "pr",
+			"pr_approver":    "from-root-when-settings-null",
+		},
+	}
+	rootData := mustMarshalIndent(t, root)
+	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), rootData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
+	e := NewEngineer(r)
+	if err := e.LoadConfig(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if e.config.PRApprover != "from-root-when-settings-null" {
+		t.Errorf("expected explicit `merge_queue: null` in settings to fall through "+
+			"to rig-root config.json, got PRApprover=%q", e.config.PRApprover)
+	}
+}
+
 func TestEngineer_LoadConfig_MergeStrategyDefault(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -267,7 +330,7 @@ func TestEngineer_LoadConfig_MergeStrategyDefault(t *testing.T) {
 		"merge_queue": map[string]interface{}{},
 	}
 
-	data, _ := json.MarshalIndent(config, "", "  ")
+	data := mustMarshalIndent(t, config)
 	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
 		t.Fatal(err)
 	}
