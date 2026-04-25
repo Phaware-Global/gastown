@@ -2234,7 +2234,7 @@ The tap-guard + approval-proof pair from PR #25 + #26 was the wall designed to s
 
 #### Fix directions
 
-1. **Correct the config read to `settings/config.json`.** Replace `Engineer.LoadConfig`'s path with `config.LoadRigSettings(config.RigSettingsPath(rig.Path))`. Same pattern already used by `resolveConvoyInfoForIssue` (G22 fix PR #28) and by `runRefineryPrWaitApproval` indirectly via formula vars. Smallest change, highest confidence.
+1. **Correct the config read to `settings/config.json`.** Change `Engineer.LoadConfig`'s read path from `<rig.Path>/config.json` to `<rig.Path>/settings/config.json` (with fallback to the rig-root path for legacy rigs). Smallest change, highest confidence — keeps the in-memory `MergeQueueConfig` shape unchanged. (Reusing `config.LoadRigSettings(config.RigSettingsPath(...))` would also work but returns `*config.RigSettings` rather than `*MergeQueueConfig`, so it'd require an extra mapping from `settings.MergeQueue` into the Engineer config — strictly more work.)
 
 2. **Add an end-to-end test that writes a real rig-settings layout to a tempdir and asserts the loaded config has the expected `PRApprover`.** The in-memory-only test was the thing that let this ship. Future gate code will keep missing unless the test uses the actual filesystem shape.
 
@@ -2265,7 +2265,7 @@ G23 is the approval-count gate being a no-op. G24 is that EVEN IF the approval g
 
 #### Fix directions
 
-1. **Add `refinery.VerifyReviewThreadsResolved(provider, prNumber, out) error`.** Sibling of `VerifyPRApproval`. Calls `provider.UnresolvedThreads(prNumber)`, filters out `IsOutdated=true`, returns a structured error listing each remaining thread (URL + author + first line of body + priority tag if present) so the refinery LLM knows exactly which threads to address before retrying.
+1. **Add `refinery.VerifyReviewThreadsResolved(provider, prNumber, out) error`.** Sibling of `VerifyPRApproval`. Calls `provider.UnresolvedThreads(prNumber)` (which by interface contract already excludes resolved AND outdated threads — no extra `IsOutdated` filter needed at the gate), and returns a structured error listing each remaining thread (URL + author + first line of body + priority tag if present) so the refinery LLM knows exactly which threads to address before retrying.
 
 2. **Gate in `runRefineryPrMerge` AND `Engineer.doMergePR`.** Both merge paths must check — if only the CLI path checks, a future refactor could route through doMergePR and skip again.
 
