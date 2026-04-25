@@ -421,27 +421,47 @@ func (e *Engineer) SetOutput(w io.Writer) {
 // zero-valued MergeQueueConfig, which made the PR #25 approval-proof
 // gate a no-op in production (G23). See docs/design/refinery-pr-workflow.md §G23.
 //
-// Fallback: if settings/config.json is missing or has no merge_queue
-// section, fall back to rig-root config.json. Rigs that had merge_queue
-// written to the root by older tooling continue to work; the settings
-// path is preferred.
+// Fallback semantics: candidate paths are tried in order
+// (settings/config.json, then rig-root config.json) and the first one
+// that contains a `merge_queue` section wins. A settings file that
+// EXISTS but lacks the merge_queue section continues to fall through
+// to the rig-root file — important because some rigs split identity
+// fields into the root and behavior fields into settings, but legacy
+// tooling may still have written merge_queue to the root only.
+// Without this, a settings file with no merge_queue section would
+// silently re-disable the approval gate (the original G23 failure mode).
 func (e *Engineer) LoadConfig() error {
-	settingsPath := filepath.Join(e.rig.Path, "settings", "config.json")
-	data, err := os.ReadFile(settingsPath)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("reading settings: %w", err)
-		}
-		// Fallback: try rig-root config.json for legacy compatibility.
-		rootPath := filepath.Join(e.rig.Path, "config.json")
-		data, err = os.ReadFile(rootPath)
+	candidates := []string{
+		filepath.Join(e.rig.Path, "settings", "config.json"),
+		filepath.Join(e.rig.Path, "config.json"),
+	}
+
+	var data []byte
+	for _, path := range candidates {
+		fileData, err := os.ReadFile(path)
 		if err != nil {
 			if os.IsNotExist(err) {
-				// Use defaults if neither file exists
-				return nil
+				continue
 			}
-			return fmt.Errorf("reading config: %w", err)
+			return fmt.Errorf("reading %s: %w", path, err)
 		}
+
+		var probe struct {
+			MergeQueue json.RawMessage `json:"merge_queue"`
+		}
+		if err := json.Unmarshal(fileData, &probe); err != nil {
+			return fmt.Errorf("parsing %s: %w", path, err)
+		}
+
+		if probe.MergeQueue != nil {
+			data = fileData
+			break
+		}
+	}
+
+	if data == nil {
+		// No candidate file had a merge_queue section — use defaults.
+		return nil
 	}
 
 	// Parse config file to extract merge_queue section
@@ -449,7 +469,7 @@ func (e *Engineer) LoadConfig() error {
 		MergeQueue json.RawMessage `json:"merge_queue"`
 	}
 	if err := json.Unmarshal(data, &rawConfig); err != nil {
-		return fmt.Errorf("parsing config: %w", err)
+		return fmt.Errorf("parsing merge_queue: %w", err)
 	}
 
 	if rawConfig.MergeQueue == nil {

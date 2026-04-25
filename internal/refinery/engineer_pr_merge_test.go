@@ -202,6 +202,61 @@ func TestEngineer_LoadConfig_RootFallback(t *testing.T) {
 	}
 }
 
+// TestEngineer_LoadConfig_SettingsExistsNoMergeQueue covers the failure mode
+// flagged on PR #35: a rig has settings/config.json (e.g. for theme/crew),
+// but the merge_queue section was written to the rig-root config.json by
+// legacy tooling. Before the fix, the loader returned defaults as soon as
+// settings/config.json was readable, silently re-disabling the approval
+// gate — the original G23 failure mode reintroduced through a different
+// path. This test asserts the loader keeps falling through to the
+// rig-root file when the settings file lacks a merge_queue section.
+func TestEngineer_LoadConfig_SettingsExistsNoMergeQueue(t *testing.T) {
+	tmpDir := t.TempDir()
+	settingsDir := filepath.Join(tmpDir, "settings")
+	if err := os.MkdirAll(settingsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// settings/config.json EXISTS but only carries unrelated fields —
+	// no merge_queue section. The loader must NOT stop here.
+	settings := map[string]interface{}{
+		"type":    "rig-settings",
+		"version": 1,
+		"theme":   "dark",
+	}
+	data, _ := json.MarshalIndent(settings, "", "  ")
+	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// rig-root config.json holds merge_queue (legacy layout).
+	root := map[string]interface{}{
+		"type":    "rig",
+		"version": 1,
+		"name":    "test-rig",
+		"merge_queue": map[string]interface{}{
+			"merge_strategy": "pr",
+			"pr_approver":    "from-root-fallback",
+		},
+	}
+	rootData, _ := json.MarshalIndent(root, "", "  ")
+	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), rootData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
+	e := NewEngineer(r)
+	if err := e.LoadConfig(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if e.config.PRApprover != "from-root-fallback" {
+		t.Errorf("expected fallthrough to rig-root config.json when settings/config.json "+
+			"has no merge_queue section, got PRApprover=%q (G23 fallthrough regression)",
+			e.config.PRApprover)
+	}
+}
+
 func TestEngineer_LoadConfig_MergeStrategyDefault(t *testing.T) {
 	tmpDir := t.TempDir()
 
