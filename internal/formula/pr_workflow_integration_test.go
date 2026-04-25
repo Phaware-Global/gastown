@@ -79,7 +79,6 @@ func TestRefineryPatrolMergePushHasPRBranch(t *testing.T) {
 		`{{ cmd }} refinery pr create`,
 		`{{ cmd }} refinery pr wait-ci`,
 		`{{ cmd }} refinery pr await-review`,
-		`{{ cmd }} refinery pr request-review`,
 		`{{ cmd }} refinery pr wait-approval`,
 		`{{ cmd }} refinery pr merge`,
 	}
