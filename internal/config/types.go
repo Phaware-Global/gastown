@@ -1304,12 +1304,14 @@ type MergeQueueConfig struct {
 
 	// PRReviewer is the GitHub *login* of the reviewer bot (e.g., "augmentcode",
 	// "gemini-code-assist", "Copilot"). The await-review gate looks up reviews
-	// by exact login match, so this MUST be the bot's actual GitHub username,
-	// not the trigger keyword. The trigger phrase posted on the PR (e.g.,
-	// "augment review", "/gemini review") is configured separately via
-	// PRTriggerComment. Empty means no automated review is requested and the
-	// review loop is skipped entirely — the flow proceeds directly to the
-	// human-approval gate. Only meaningful when merge_strategy="pr".
+	// by case-insensitive login match (no abbreviation, no aliasing — the
+	// match is exact-string on the login field), so this MUST be the bot's
+	// actual GitHub username, not the trigger keyword. The trigger phrase
+	// posted on the PR (e.g., "augment review", "/gemini review") is
+	// configured separately via PRTriggerComment. Empty means no automated
+	// review is requested and the review loop is skipped entirely — the flow
+	// proceeds directly to the human-approval gate. Only meaningful when
+	// merge_strategy="pr".
 	PRReviewer string `json:"pr_reviewer,omitempty"`
 
 	// PRApprover is the GitHub user whose approving review gates the merge.
