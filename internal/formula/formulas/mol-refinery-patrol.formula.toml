@@ -1228,13 +1228,18 @@ fi
 ```
 
 `{{ cmd }} mq set-review-state` does an atomic read-modify-write on the
-MR bead's description, mutating only the `review_fix_polecat` and
-`review_loop_iter` fields. Other MR fields (branch, target, source_issue,
-etc.) are preserved. Flags:
-  --polecat <name>   — set review_fix_polecat
-  --iter <n>         — set review_loop_iter
-  --clear-polecat    — clear review_fix_polecat (polecat terminated)
-  --clear-iter       — clear review_loop_iter
+MR bead's description, mutating only the `review_fix_polecat`,
+`review_loop_iter`, and `await_review_started_at` fields. Other MR
+fields (branch, target, source_issue, etc.) are preserved. Flags:
+  --polecat <name>            — set review_fix_polecat
+  --iter <n>                  — set review_loop_iter
+  --clear-polecat             — clear review_fix_polecat (polecat terminated)
+  --clear-iter                — clear review_loop_iter
+  --clear-await-started-at    — clear await_review_started_at so the
+                                next patrol re-enters PR.4 for a new HEAD
+                                (used after a review-fix polecat lands
+                                changes; resets the await-review wait
+                                window for the new SHA)
 
 `REVIEW_FIX_DONE` mail from the polecat (sent by `gt done` when the
 bead is a no_merge review-fix dispatch) is an optimization: it triggers
