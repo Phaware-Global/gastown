@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -155,6 +156,15 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 	rawCh := make(chan telegraph.RawEvent, cfg.Telegraph.BufferSize)
 	handler := transport.NewHandler(translators, rawCh, logger)
 
+	// wg tracks in-flight HTTP handlers so we never close rawCh while a handler
+	// goroutine might still be executing its non-blocking send.
+	var wg sync.WaitGroup
+	wgHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wg.Add(1)
+		defer wg.Done()
+		handler.ServeHTTP(w, r)
+	})
+
 	listenFn := deps.listenFn
 	if listenFn == nil {
 		listenFn = func(addr string) (net.Listener, error) {
@@ -190,7 +200,7 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 		}
 	}()
 
-	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Handler: wgHandler, ReadHeaderTimeout: 10 * time.Second}
 	serveDone := make(chan error, 1)
 	go func() {
 		err := srv.Serve(ln)
@@ -213,6 +223,7 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 		srvErr = err
 	}
 
+	wg.Wait() // all handler goroutines have returned; rawCh is now safe to close
 	close(rawCh)
 	<-dispatchDone
 	fmt.Println("[Telegraph] shutdown complete")
