@@ -1614,6 +1614,13 @@ func (g *Git) GhPrReviewAuthors(prNumber int) ([]string, error) {
 // prevents that false-positive — the gate only advances when the configured
 // reviewer has actually reviewed the commit currently up for merge.
 //
+// sha MUST be the full 40-character commit OID. Short SHAs are
+// intentionally NOT supported via prefix-match: two commits can share a
+// prefix and a HasPrefix gate would silently advance on the wrong one.
+// The only in-tree caller pairs this with GhPrHeadSHA, which always
+// returns the full OID from gh; supplying a short SHA is a programming
+// error and yields false (no match) deliberately rather than approximating.
+//
 // Pass sha="" to fall back to GhPrHasReviewFrom (any commit).
 func (g *Git) GhPrHasReviewFromOnSHA(prNumber int, user, sha string) (bool, error) {
 	if user == "" {
