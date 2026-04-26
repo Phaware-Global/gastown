@@ -68,6 +68,28 @@ var prWorkflowCommandPatterns = []*regexp.Regexp{
 // consistently with G19b's existing coverage.
 var prMergeCommandPattern = regexp.MustCompile("(?m)(^\\s*|[|&;(`]\\s*|-[a-z]*c\\s+['\"]\\s*)gh\\s+pr\\s+merge\\b")
 
+// prMergeViaApiPattern matches the GitHub merge endpoint reached through
+// `gh api repos/<owner>/<repo>/pulls/<n>/merge`. Closes the G40 sibling of
+// the G21 bypass: a refinery LLM that hits the tap-guard on `gh pr merge`
+// can fall back to the same operation via the raw API. The path segment
+// alone uniquely identifies the merge endpoint, so any match — GET probe
+// or PUT mutation — is treated as a merge attempt; if a refinery wants to
+// inspect mergeability it should use `gh pr view --json mergeable`,
+// which the guard does not block.
+//
+// Anchoring details:
+//   - `(?s)` mode makes `.` cross newlines so a multi-line invocation
+//     (e.g. `gh api ... \` continuation followed by `pulls/<n>/merge`
+//     on the next line) still matches — the iter-1 review flagged the
+//     original `[^\n]*` form as bypassable via a backslash-newline
+//     escape.
+//   - The PR-number segment is `[^/\s]+` rather than `[0-9]+` so shell
+//     variables (`$PR`), gh placeholders (`:number`), and command
+//     substitution (`` `cmd` ``) match too — the digit-only form was
+//     bypassable by anything that wasn't a literal integer.
+var prMergeViaApiPattern = regexp.MustCompile(
+	"(?ms)(^\\s*|[|&;(`]\\s*|-[a-z]*c\\s+['\"]\\s*)gh\\s+api\\b.*?pulls/[^/\\s]+/merge\\b")
+
 // isPRWorkflowCommand returns true when cmd looks like any of the PR-
 // creation / feature-branch commands this guard blocks.
 func isPRWorkflowCommand(cmd string) bool {
@@ -83,13 +105,18 @@ func isPRWorkflowCommand(cmd string) bool {
 }
 
 // isPRMergeCommand returns true when cmd looks like a direct `gh pr merge`
-// invocation. Separate from isPRWorkflowCommand because merge and create
-// have different refinery-context policies (G21 fix).
+// invocation OR an `gh api …pulls/<n>/merge` API-level merge (G40). Both
+// shapes hit the same GitHub merge endpoint and bypass the
+// `gt refinery pr merge` approval gate. Any match returns true — there is
+// no method-aware filtering; a GET probe on the merge path is blocked
+// alongside a PUT mutation, which is intentional defense-in-depth.
+// Separate from isPRWorkflowCommand because merge and create have
+// different refinery-context policies (G21 fix).
 func isPRMergeCommand(cmd string) bool {
 	if cmd == "" {
 		return false
 	}
-	return prMergeCommandPattern.MatchString(cmd)
+	return prMergeCommandPattern.MatchString(cmd) || prMergeViaApiPattern.MatchString(cmd)
 }
 
 var tapGuardCmd = &cobra.Command{
@@ -207,16 +234,17 @@ func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 	if isMerge && isGasTownAgentContext() {
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════╗")
-		fmt.Fprintln(os.Stderr, "║  ❌ DIRECT `gh pr merge` BLOCKED (G21 fix)                       ║")
+		fmt.Fprintln(os.Stderr, "║  ❌ DIRECT MERGE BLOCKED (G21 / G40 fix)                         ║")
 		fmt.Fprintln(os.Stderr, "╠══════════════════════════════════════════════════════════════════╣")
 		fmt.Fprintln(os.Stderr, "║  Refinery must route PR merges through `gt refinery pr merge`   ║")
 		fmt.Fprintln(os.Stderr, "║  which enforces PR.6 wait-approval gates before calling the     ║")
 		fmt.Fprintln(os.Stderr, "║  GitHub merge API.                                              ║")
 		fmt.Fprintln(os.Stderr, "║                                                                  ║")
 		fmt.Fprintln(os.Stderr, "║  Instead of:  gh pr merge <n> --squash                          ║")
+		fmt.Fprintln(os.Stderr, "║  Or:          gh api repos/.../pulls/<n>/merge -X PUT (G40)     ║")
 		fmt.Fprintln(os.Stderr, "║  Do this:     gt refinery pr merge <n>                          ║")
 		fmt.Fprintln(os.Stderr, "║                                                                  ║")
-		fmt.Fprintln(os.Stderr, "║  See: docs/design/refinery-pr-workflow.md §G21                  ║")
+		fmt.Fprintln(os.Stderr, "║  See: docs/design/refinery-pr-workflow.md §G21, §G40            ║")
 		fmt.Fprintln(os.Stderr, "╚══════════════════════════════════════════════════════════════════╝")
 		fmt.Fprintln(os.Stderr, "")
 		return NewSilentExit(2) // Exit 2 = BLOCK in Claude Code hooks
