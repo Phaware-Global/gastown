@@ -2665,47 +2665,70 @@ This commit landed directly on `origin/main`. Mayor reverted at `bab51596` (also
 
 **Priority:** Blocking. Auto-pushes to main bypass everything. The system already detected this (witness filed `gt-i71` P0 bug + `hq-wisp-cvefz` CRITICAL escalation) — the response infrastructure works; the prevention layer is missing.
 
-### G42 — Tap-guard blocks legitimate `git checkout -b` for polecats, creating a recovery deadlock
+### G42 — Tap-guard's intentional block on `git checkout -b` has no `gt`-side recovery path
 
 **Observed:** Phase 2 of the Telegraph spec, polecat rictus picked up gt-mwy.5 (regenerated runbook task, generic content). Per witness escalation `hq-wisp-ra6s6`:
 
 > *Blocked on gt-mwy.5: Mayor requires PR workflow, tap guard blocks 'git checkout -b', gt done fails on main. Standing by.*
 
-Rictus tried to create a polecat branch (the right thing to do given the gt-pvx lesson) and the tap-guard prevented it.
+Witness initially diagnosed this as "tap guard misconfigured" and mailed mayor accordingly (`hq-wisp-qjvlr`).
 
-**Root cause:** The tap-guard introduced for G21 (`internal/cmd/tap_guard_pr_workflow.go`) is matching too broadly. Its pattern likely catches `git checkout` or `git push` invocations that aren't dangerous (`gh pr merge` direct, `git push origin main`, `git push origin HEAD:main`).
+**Mayor's corrected diagnosis** (after consulting `internal/cmd/tap_guard_pr_workflow_test.go`):
 
-**Distinct from prior G-entries:** Inverse of G21 — that fix was "block dangerous direct merges". G42 is "the block is too aggressive, blocking legitimate operations".
+> *Tap guard is working as designed — it intentionally blocks `git checkout -b`, `git switch -c`, and `gh pr create` to force the gt formula path. Real root cause: rictus's worktree was on main — leftover from the gt-mwy.4 auto-save incident (G41), where the unauthorized commit landed on main in the rictus worktree, and the polecat branch was never restored.*
 
-**Fix directions:**
-1. Narrow the tap-guard pattern to *only* match the specific dangerous invocations:
-   - `gh pr merge` (any args)
-   - `git push origin main`
-   - `git push origin HEAD:main`
-   - `git push origin <something>:main`
-   - `git push --force origin main`
-2. Add unit tests with the false-positive cases (`git checkout -b polecat/...`, `git push origin polecat/...`) asserting the tap-guard does NOT fire.
-3. The deadlock recovery: when rictus is in this state, mayor should be able to issue an override (e.g., `GT_TAP_GUARD_OVERRIDE=mayor-approval-<token>`) to unblock; today the only escape is human intervention.
+Mayor (not subject to the polecat tap-guard) recovered manually by running `git checkout -b polecat/rictus-gt-mwy.5` directly in rictus's worktree, then mailing rictus to proceed.
 
-**Priority:** Blocking — currently causing rictus to be permanently stuck on gt-mwy.5.
+**Root cause (revised):** The tap-guard correctly blocks raw `git checkout -b` to force polecats through the formula path — but the formula path **doesn't expose a `gt`-side branch-creation step** that polecats can use. So a polecat that finds itself on main (via G41 residue, or because its worktree was just initialized, or because it pulled main between assignments) has *no permitted way* to create its polecat branch. The right action and the only available action are mutually exclusive.
 
-### G43 — Polecat formula doesn't enforce branch creation as first imperative step
+The original "G42 is a tap-guard regression" framing was wrong. The real shape: **G42 is the missing `gt`-side affordance that pairs with the tap-guard's intentional block**. This makes G42 effectively a duplicate of G43; treating them as one in the fix.
 
-**Observed:** Inferred from G41 (rictus's worktree was on main when gt-pvx fired) and G42 (rictus tried to fix that by creating a branch but the tap-guard blocked it). The root design issue: the polecat formula doesn't have an imperative step that *must* happen before any edit work — `gt polecat checkout-branch <bead-id>` (or equivalent) — that fails closed if not on a polecat-namespaced branch.
+Secondary observation surfaced by this incident: **witness's diagnosis of subsystem misconfiguration didn't consult the relevant test file** (`tap_guard_pr_workflow_test.go`). The test file is ground truth for tap-guard behavior; consulting it would have flipped the diagnosis from "guard misconfigured" to "intended block + missing recovery affordance". Worth capturing as G44 below.
 
-**Root cause:** Formula prose can be optimized away by the LLM (the same pattern G19/G21/G25 closed for refinery steps). The polecat side is still prose-driven.
+**Distinct from prior G-entries:** G21 introduced the tap-guard. G42 is the design oversight in pairing the tap-guard with its corresponding `gt`-side affordance.
+
+**Fix directions:** **MERGED with G43 below.** The single fix — introducing `gt polecat checkout-branch <bead-id>` — closes both gaps. Keep this entry as the symptom-side documentation; G43 holds the implementation specification.
+
+**Priority:** Blocking. Currently a hand-recovery path (mayor manually creates the branch with mayor's tap-guard exemption) is the only way out.
+
+### G43 — Polecat formula needs an imperative `gt polecat checkout-branch` first step
+
+**Observed:** Inferred from G41 (rictus's worktree was on main when gt-pvx fired) and G42 (rictus tried to fix that via raw `git checkout -b` and got the by-design tap-guard block). The root design issue: the polecat formula doesn't have an imperative step that *must* happen before any edit work — `gt polecat checkout-branch <bead-id>` (or equivalent) — that fails closed if not on a polecat-namespaced branch.
+
+**Root cause:** Formula prose can be optimized away by the LLM (the same pattern G19/G21/G25 closed for refinery steps). The polecat side is still prose-driven. Combined with G42's tap-guard block, the polecat has no permitted way to recover from a "started on main" state.
 
 **Distinct from prior G-entries:** G19/G21/G25 closed prose-bypass on the *refinery* side. G43 is the *polecat* side equivalent.
 
 **Fix directions:**
-1. Introduce `gt polecat checkout-branch <bead-id>` as the first imperative step in `mol-polecat-work.formula.toml` (and the monorepo / TDD variants). Atomic responsibilities:
+1. Introduce `gt polecat checkout-branch <bead-id>` as the first imperative step in `mol-polecat-work.formula.toml` (and the monorepo / TDD variants). The subcommand is **inside the tap-guard's allowlist** (it's the canonical gt-formula path; tap-guard's job is to redirect raw `git checkout -b` to this). Atomic responsibilities:
    - Read the bead, derive `polecat/<name>/<id>` branch name.
    - If the worktree is already on that branch → exit 0 (idempotent).
-   - If the worktree is on `main` / `master` / etc. → `git checkout -b <name>` and exit 0.
-   - If the worktree is on a *different* polecat branch → exit 4 (operational error; polecat session was reused incorrectly).
-2. Polecat formula prose collapses to one command line at the top. The LLM can't skip it; if it does, every subsequent `git` operation works on `main` and gets caught by the (correctly-narrowed) tap-guard from G42.
+   - If the worktree is on `main` / `master` / `develop` → invoke the underlying `git checkout -b <name>` (tap-guard exempts the gt path).
+   - If the worktree is on a *different* polecat branch → exit 4 (operational error; polecat session was reused incorrectly; mayor must intervene).
+2. Polecat formula prose collapses to one command line at the top. The LLM can't skip it; if it does, every subsequent `git` operation works on `main` and gets caught by the tap-guard, producing the recovery deadlock G42 documents (which now has a fix: re-run step 1).
+3. Audit: `mol-polecat-work*.formula.toml` for any `git checkout` invocations and replace with `gt polecat checkout-branch <bead-id>`.
+4. Mayor-side: when escalations like `hq-wisp-ra6s6` arrive, the standard remediation becomes "tell the polecat to run `gt polecat checkout-branch <bead-id>`" instead of mayor manually doing the checkout in the worktree.
 
 **Priority:** Blocking. Combined with G41 + G42, this is the polecat-side dual of G19/G21/G25 — the LLM-optimization-resistant first step that anchors all the subsequent guarantees.
+
+### G44 — Witness diagnoses subsystem misconfiguration without consulting the corresponding test file
+
+**Observed:** During the gt-mwy.5 deadlock, witness's escalation `hq-wisp-qjvlr` to mayor read:
+
+> *Subject: Tap guard misconfigured: blocks `git checkout -b`, breaks rictus/gt-mwy.5*
+
+That diagnosis was **wrong**. Mayor's response (after consulting `internal/cmd/tap_guard_pr_workflow_test.go`) corrected it: the block is intentional, not misconfigured. Witness's escalation framed the gap incorrectly and proposed a fix direction (loosen the tap-guard) that would have weakened the G21 hardening.
+
+**Root cause:** Witness's diagnostic process for subsystem behavior questions doesn't reach for the relevant test file as ground truth. Witness can read tmux panes (`gt peek`), bd state, mail inboxes — all *runtime* observation. Tests are *intent* declarations. When a runtime symptom looks like "subsystem X is misbehaving", the test file for X is the fastest disambiguation step ("is this behavior intentional or accidental?"). Witness's role prompt likely doesn't include "consult tests before declaring misconfiguration".
+
+**Distinct from prior G-entries:** Different layer than G29 (witness role-prompt drift). G29 is "what the witness is told to do is wrong"; G44 is "the witness's diagnostic protocol is missing a step that would prevent miscalled escalations".
+
+**Fix directions:**
+1. Update `witness.md.tmpl` to add a "diagnosis playbook" section: when escalating subsystem misbehavior, the escalation must include a one-line citation of the relevant test file's expected behavior (or "no test found" if absent — itself a lower-severity gap).
+2. Add a `gt witness explain <subsystem>` (or similar) that returns the relevant test files + their stated invariants for a named subsystem (`tap-guard`, `await-review`, `mr-bead-creation`, etc.). Witness invokes it before composing escalations on those subsystems.
+3. Mayor-side defense: when receiving witness escalations of the form "subsystem X misconfigured", reflexively grep the test file before acting. (Mayor in this incident did this on her own — encode it as a routine check.)
+
+**Priority:** Medium. Today's misdiagnosis was caught by mayor's care; a less attentive coordinator could have shipped the wrong "fix" (loosening the tap-guard, which would re-open G19).
 
 ### F1 — Optional bypass of human approval before merging (FEATURE REQUEST, not a gap)
 
@@ -2731,19 +2754,18 @@ Rictus tried to create a polecat branch (the right thing to do given the gt-pvx 
 
 ---
 
-## G26-G43 implementation order (when work resumes)
+## G26-G44 implementation order (when work resumes)
 
-Recommended ordering, smallest dependency-set first, ending with the architectural items:
+Recommended ordering, smallest dependency-set first, ending with the architectural items. Updated after mayor's diagnosis correction on G42 (was "tap-guard regression"; actually "tap-guard intentional, missing gt-side affordance" — merged with G43).
 
-1. **G42** — narrow tap-guard pattern to unblock rictus and any other deadlocked polecats.
-2. **G43** — `gt polecat checkout-branch <bead-id>` imperative step.
-3. **G41** — gt-pvx safety-net pre-commit guard (refuse to commit on main).
-4. **G33 + G34 + G35 + G36** — `gt refinery pr dispatch-review-fix <pr> --mr <bead> --max-iter <n>` imperative subcommand + bead metadata sync.
-5. **G37 + G38** — SHA-scoped + state-widened `HasReviewFrom`.
-6. **G40** — close the refinery-side merge bypass (whichever path is found by tracing).
-7. **F1** — `pr_approval_mode = reviewer-clean` (depends on G37+G38 working correctly).
-8. **G29** — sync witness role prompt with `done.go:1390-1395` self-managed-completion intent.
-9. **G39** — fail CRITICAL/HIGH escalations hard when contacts unset.
-10. **G26 + G27 + G28** — POLECAT_DONE noise sources + cross-rig leak + nudge-poller drain semantics.
-11. **G30 + G32** — UX cleanup (await-review error formatting, PR-body template).
-12. **G31** — refinery-as-sole-pusher architectural redesign (longest tail).
+1. **G42 + G43** — `gt polecat checkout-branch <bead-id>` imperative step. Single fix closes both: gives polecats a tap-guard-permitted recovery from the on-main state, AND becomes the imperative first step in the polecat formula. Highest priority — currently rictus is hand-recovered by mayor each time this hits.
+2. **G41** — gt-pvx safety-net pre-commit guard (refuse to commit on `main`/`master`/`develop`; stash to `~/gt/state/lost-work/<rig>/<polecat>/<timestamp>.diff` instead). Closes the auto-push-to-main attack vector independently of G43.
+3. **G33 + G34 + G35 + G36** — `gt refinery pr dispatch-review-fix <pr> --mr <bead> --max-iter <n>` imperative subcommand + bead metadata sync. The refinery-side dual of G43 (PR.5 dispatch is imperative, not prose).
+4. **G37 + G38** — SHA-scoped + state-widened `HasReviewFrom`.
+5. **G40** — close the refinery-side merge bypass (whichever path is found by tracing).
+6. **F1** — `pr_approval_mode = reviewer-clean` (depends on G37+G38 working correctly).
+7. **G29 + G44** — sync witness role prompt with `done.go:1390-1395` self-managed-completion intent (G29) AND add the test-file-citation requirement to witness's escalation protocol (G44). Both are role-prompt template edits.
+8. **G39** — fail CRITICAL/HIGH escalations hard when contacts unset.
+9. **G26 + G27 + G28** — POLECAT_DONE noise sources + cross-rig leak + nudge-poller drain semantics.
+10. **G30 + G32** — UX cleanup (await-review error formatting, PR-body template).
+11. **G31** — refinery-as-sole-pusher architectural redesign (longest tail).
