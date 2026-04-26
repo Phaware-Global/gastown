@@ -1,7 +1,14 @@
-# Telegraph: Configurable Per-Event-Type Operator Prompts
+# Telegraph: Operator-Side Event Handling — Prompts + Actor Filtering
 
 **Status:** Draft proposal
 **Companions:** [docs/design/telegraph.md](telegraph.md) · [docs/runbooks/telegraph.md](../runbooks/telegraph.md)
+
+This doc specs two related operator-side controls layered over the existing Telegraph L1→L2→L3 pipeline:
+
+1. **Per-event-type operator prompts** (sections below up to the prompts acceptance criteria) — operator-supplied trusted text attached to Mayor mail to frame how the receiving agent should interpret each event class.
+2. **Actor filtering for self-echo prevention** (companion section after the prompts spec) — operator-supplied list of event actors whose webhooks Telegraph silently drops at L2, preventing the feedback loop where Mayor's own outbound Jira comments fire webhooks that come back to Mayor's mailbox.
+
+Both features share a deployment surface (config in `telegraph.toml`, opt-in via explicit operator action, no behavior change for existing deployments without config edits) and a trust class (operator-controlled config, sanitized against webhook-payload-derived inputs). They're spec'd in one PR because reviewing them as a unit lets reviewers catch any interaction risks early — e.g., does an actor-filtered event produce a misleading `prompt_key` log line? (No — actor filtering happens before prompt resolution, the filtered event never reaches L3.)
 
 ## Problem
 
@@ -267,3 +274,172 @@ Telegraph at startup:
 - New tests covering: exact-key resolve, default fallback, empty-fallback, cap truncation at rune boundary (including a multi-byte UTF-8 input that would corrupt under naive byte-slicing), start-delimiter rejection, end-delimiter rejection, multi-segment key acceptance, variable substitution including empty fields, `{labels}` rendering with multi-element and empty inputs, CR/LF stripping in substituted values, exact-delimiter-match redaction in substituted values, `prompt_key` field present in delivery log.
 - End-to-end smoke test (manual): trigger a real Jira comment, confirm the OPERATOR PROMPT block appears between metadata and external content with the expected substituted values, and confirm the `event=deliver` log line carries `prompt_key=jira:comment.added`.
 - Runbook update at `docs/runbooks/telegraph.md` documenting the prompts config + restart-to-apply flow.
+
+---
+
+# Companion feature: Actor filtering for self-echo prevention
+
+## Problem
+
+When Mayor (or any agent operating as a configured "self" persona) posts a comment to Jira via the Atlassian MCP, the resulting webhook fires back to Telegraph and lands in Mayor's mailbox as if from an external user — even though Mayor's own action originated it. Worse, every Mayor outbound comment produces **two** webhooks: a `comment.added` event for the comment itself, plus an `issue.updated` event because the issue's lastUpdated timestamp moved. Both arrive with `actor=<operator persona>`. Mayor sees its own actions echoed back as new mail, processes them, and enters a feedback loop.
+
+Filtering this at Jira's webhook config (JQL filter) is **not possible**: JQL is an issue-level query language, and the comment-author / event-actor field is not exposed to JQL. Even with a separate bot account for Mayor's outbound API calls, the JQL filter (e.g. `assignee = currentUser()`) still matches the issue when Mayor edits it, because the issue's assignee is unchanged. The filter must live downstream of Jira.
+
+Telegraph already has the actor in `NormalizedEvent.Actor`. It's the natural place to drop self-echo events — sooner than Mayor's mail handler, with structured-log visibility, and without requiring every receiver to encode the same dedup logic.
+
+## Goals
+
+1. Operator can name one or more actor display-names whose events Telegraph silently drops at L2, before mail is produced and before Mayor is nudged.
+2. Drops produce a structured audit log entry naming the filtered actor and event type, so it's clear what was silenced and why.
+3. The filter is per-provider (Jira-specific in v1), defined alongside the existing provider config in `telegraph.toml`.
+4. Existing deployments without `ignore_actors` configured see no behavior change.
+
+## Non-goals
+
+- **Pattern matching on actor names** (regex, glob, prefix). Single-string exact-match is enough for the dogfood case; if multiple operators share a town, list them explicitly. Pattern matching can be added later without breaking the v1 schema.
+- **Auto-derivation of "self" from MCP credentials or environment.** Operator names the actor explicitly. "Telegraph automatically knows it's me" couples Telegraph to outbound infrastructure it shouldn't know about, and would mis-fire if the operator persona's display name differs from the API caller's identity.
+- **Subject-based filtering.** JQL handles "which issues fire" upstream of Telegraph; that's the right layer for issue-scope filtering. This feature is exclusively about the actor field.
+- **Cross-provider actor filtering.** Each provider's actor field has different semantics; the GitHub equivalent (when added) gets its own `ignore_actors` under `[telegraph.providers.github]`.
+
+## Configuration
+
+Extend the existing `[telegraph.providers.jira]` block with a new `ignore_actors` field:
+
+```toml
+[telegraph.providers.jira]
+enabled       = true
+secret_env    = "GT_TELEGRAPH_JIRA_SECRET"
+events        = [
+    "jira:issue_created",
+    "jira:issue_updated",
+    "jira:comment_added",
+    "jira:comment_updated",
+]
+ignore_actors = ["Artie"]   # NEW — drop events whose actor exactly matches any entry
+```
+
+`ignore_actors` accepts a list of strings. Empty list (or absent) means no actor filtering — current behavior. Strings are compared **case-sensitively** against `NormalizedEvent.Actor` for exact equality. No partial matches, no regex, no whitespace trimming during comparison (config-load can trim entries; runtime comparison is exact against the post-translation Actor field).
+
+## Where the check happens
+
+After successful authentication and translation, but before the event is enqueued to L3:
+
+```
+L1 receives request
+  → Authenticate (existing — drops with reason=hmac_invalid on failure)
+  → Translate to NormalizedEvent (existing — drops with reason=unknown_event_type on unknown webhookEvent)
+  → if event.Actor matches an entry in providerConfig.IgnoreActors:
+        log Drop(reason="actor_filtered", event_type, event_id, actor)
+        return  // silently dropped, no L3 mail produced, no Mayor nudge
+  → enqueue to L3 (existing)
+```
+
+The check sits in the same place as the existing `unknown_event_type` drop, just one rung down. The semantic distinction is intentional: `unknown_event_type` is a Telegraph gap (we don't know how to translate this), while `actor_filtered` is an operator decision (we know how, but the operator said don't deliver). Both produce `event=drop` lines, but with different `reason` codes so dashboards can distinguish "Telegraph needs a code update" from "Telegraph is doing what the operator asked."
+
+## New reason code
+
+Add `ReasonActorFiltered = "actor_filtered"` to the existing constants in `internal/telegraph/tlog/logger.go`:
+
+```go
+const (
+    ReasonHMACInvalid       = "hmac_invalid"
+    ReasonUnknownEventType  = "unknown_event_type"
+    ReasonParseError        = "parse_error"
+    ReasonBackpressure      = "backpressure"
+    ReasonProviderDisabled  = "provider_disabled"
+    ReasonActorFiltered     = "actor_filtered"   // NEW
+)
+```
+
+The structured log line on a filtered event:
+
+```json
+{
+  "ts": "2026-04-26T23:30:14Z",
+  "component": "telegraph",
+  "event": "drop",
+  "provider": "jira",
+  "event_type": "comment.added",
+  "event_id": "22360",
+  "actor": "Artie",
+  "reason": "actor_filtered"
+}
+```
+
+The `actor` field is included in this drop log — even though it's not part of the generic `Drop()` signature today — because audit trail of "who got filtered" is the entire value of the feature. The `Drop()` helper in `tlog/logger.go` gains an `actor` parameter (passed empty string for non-actor-filtered drop reasons to preserve current log shape for those reasons).
+
+## Code organization
+
+In `internal/telegraph/providers/jira/translator.go`, the Translator gains an `ignoreActors map[string]struct{}` set populated at construction:
+
+```go
+func New(secret string, ignoreActors []string, logger *slog.Logger) *Translator {
+    set := make(map[string]struct{}, len(ignoreActors))
+    for _, a := range ignoreActors {
+        set[a] = struct{}{}
+    }
+    return &Translator{
+        secret:       []byte(secret),
+        ignoreActors: set,
+        logger:       logger,
+    }
+}
+```
+
+After translation succeeds, before returning the NormalizedEvent:
+
+```go
+evt, err := translateXxx(&p)
+if err != nil {
+    return nil, err
+}
+if _, filtered := t.ignoreActors[evt.Actor]; filtered {
+    return nil, ErrActorFiltered
+}
+return evt, nil
+```
+
+New sentinel error `ErrActorFiltered` defined in `internal/telegraph/types.go` alongside `ErrUnknownEventType`:
+
+```go
+var ErrActorFiltered = errors.New("actor filtered by provider config")
+```
+
+The L1 HTTP handler (`internal/telegraph/transport/http.go`) maps `ErrActorFiltered` to `Drop(reason="actor_filtered", actor=...)` — same shape as the existing `ErrUnknownEventType` mapping. **HTTP response remains 200 OK** to the caller (Jira), same convention as `unknown_event_type` — non-200 would trigger Jira's webhook-retry logic and produce repeated drops for events the operator already said to ignore.
+
+## Failure modes / interactions
+
+| Condition | Telegraph behavior | Receiver behavior |
+|---|---|---|
+| Actor not in `ignore_actors` list | Event flows normally to L3 | Receives mail as today |
+| Actor in `ignore_actors` list | `event=drop, reason=actor_filtered` logged with actor field | No Mayor mail, no nudge |
+| `ignore_actors` empty or absent | No filtering applied | No behavior change from today |
+| Actor field empty (e.g. translator couldn't extract) | Treated as not-matching (empty string never matches a non-empty list entry) | Event flows through |
+| `ignore_actors` contains an empty string `""` | Config-load rejects with error: empty entries are meaningless | Telegraph never started |
+| Same comment fires both `comment.added` AND `issue.updated` from same actor | Both events are filtered (both events have actor=<persona>) | Both echoes silenced |
+| Operator persona renamed in Jira (display name change) | Old name no longer matches; events flow through until config updated | Echoes resume until operator updates `ignore_actors` |
+
+## Trust model
+
+- `ignore_actors` is operator-controlled config, same trust class as the rest of `[telegraph.providers.jira]`.
+- The filter trusts `NormalizedEvent.Actor`, which derives from webhook payload. An attacker who can spoof the actor field (i.e., compromise Jira) could either bypass the filter (events from a different actor) or grief by impersonating the operator persona (events disappear). HMAC verification gates payload integrity at L1; if HMAC is broken, this filter is the least of your concerns.
+- Filtering is **silent at the receiver** — no Mayor mail, no nudge. The audit trail lives only in `~/gt/logs/telegraph.log`. Operators who need to detect "is my filter masking real events I should have seen?" should sample the log periodically. Adding a counter for actor-filtered events is a v2 polish item if it becomes worth tracking.
+- The filter does NOT interact with the prompts feature: actor filtering happens at L2, prompt resolution happens at L3 inside `buildBody`. A filtered event never reaches `buildBody`, so the `prompt_key` log field is naturally absent (the entire `event=deliver` line is absent — there's only an `event=drop` line). Reviewers should confirm this ordering when implementing both features in tandem.
+
+## Acceptance criteria for v1
+
+- `ignore_actors` parsed from `[telegraph.providers.jira]` as a list of strings; empty/absent means no filtering.
+- Config-load rejects empty-string entries in the list (`ignore_actors = ["Artie", ""]` → error at startup).
+- Translator's `New(...)` constructor accepts the list, builds an internal set for O(1) lookup.
+- After successful translation, translator checks `evt.Actor` against the set and returns new `ErrActorFiltered` sentinel on match.
+- L1 HTTP handler maps `ErrActorFiltered` to `Drop(reason="actor_filtered", actor=evt.Actor)` log line; HTTP response stays 200.
+- New `ReasonActorFiltered` constant added to `tlog/logger.go`; `Drop()` helper gains `actor` parameter (passed empty string for existing reasons to preserve current log shape).
+- New tests covering: empty `ignore_actors` list (no drop), set with non-matching actor (no drop), set with matching actor (drop on `comment.added`), drop on `issue.updated` from same actor (verifies both echo paths are closed), case-sensitivity (mixed-case actor with lowercase entry → no drop), HTTP response stays 200 on filtered drop, structured log line includes the `actor` field.
+- End-to-end smoke test (manual): set `ignore_actors = ["Artie"]` in `~/gt/settings/telegraph.toml`, restart Telegraph, post a comment to a Jira issue assigned to Artie via the Atlassian MCP, confirm `~/gt/logs/telegraph.log` shows two `event=drop, reason=actor_filtered` entries (one for `comment.added`, one for `issue.updated`) and Mayor mailbox is unchanged.
+- Runbook update at `docs/runbooks/telegraph.md` documenting the filter, why it exists (self-echo prevention from Mayor's outbound Jira API calls), and the audit-log expectation.
+
+## Open questions (actor filtering)
+
+1. **Filter on `Actor` (display name) vs on the underlying `user.name` (Atlassian login).** Display names can be edited in Atlassian profiles; `user.name` (account ID or login) is more stable. v1 uses display name to match the existing `Telegraph-Actor` header convention and the dogfood instance's data. If operators report drift, an `ignore_actor_ids` companion field is a clean future addition that lookup-checks the same set against the more stable identifier.
+2. **Counters for filtered events.** `tlog.Counters` already has slots for reject reasons; a `Counters.ActorFiltered` increment is two lines and would let operators quickly answer "how many events am I dropping per hour?" without grep. Not in v1 but flagged as cheap polish.
+3. **Cross-provider unification.** When the GitHub provider lands, the same pattern (`[telegraph.providers.github]` with its own `ignore_actors`) is the right shape. Worth pinning the convention now via this Jira implementation rather than retrofitting later.
