@@ -120,7 +120,10 @@ func telegraphSetup(cfgPath string) (*telegraph.Config, map[string]*telegraph.Re
 
 func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot string, resolved map[string]*telegraph.ResolvedProvider, deps telegraphDeps) error {
 	logger := deps.log
-	nudgeWindow, _ := cfg.Telegraph.ParsedNudgeWindow()
+	nudgeWindow, err := cfg.Telegraph.ParsedNudgeWindow()
+	if err != nil {
+		return fmt.Errorf("telegraph: nudge_window: %w", err)
+	}
 
 	// Build L3 transformer.
 	var transformer *transform.Transformer
@@ -220,6 +223,9 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 		}
 		srvErr = <-serveDone
 	case err := <-serveDone:
+		// Serve exited unexpectedly; Close prevents keep-alive connections from
+		// starting new handlers that would race with wg.Wait().
+		srv.Close()
 		srvErr = err
 	}
 
