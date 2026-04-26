@@ -151,7 +151,7 @@ Tokens replaced verbatim before the prompt is written into the mail body:
 | `{actor}` | `Actor` | "" |
 | `{subject}` | `Subject` | "" |
 | `{canonical_url}` | `CanonicalURL` | "" |
-| `{timestamp}` | `Timestamp.UTC().Format(RFC3339)` | "" |
+| `{timestamp}` | `Timestamp.UTC().Format(time.RFC3339)` (Go's `time.RFC3339` constant, e.g. `2026-04-26T23:16:54Z`) | "" |
 | `{labels}` | `Labels` joined with `, ` (each element CR/LF-stripped) | "" |
 
 **Non-string fields require a defined serialization.** `{labels}` is the only multi-valued field exposed in v1; it renders as a comma-space-joined string (e.g. `bug, critical, security`). Each element passes through CR/LF stripping individually before joining so a maliciously-crafted label can't break out of the prompt block. If a future field needs serialization (e.g. an array of users), the spec for that field must define its rendering before being added to the substitution table.
@@ -175,7 +175,9 @@ For a NormalizedEvent with `Provider="jira"`, `EventType="comment.added"`:
 
 ### Length cap
 
-`prompt_cap` (default 2048 bytes) bounds the resolved prompt text after variable substitution. Prompts that exceed the cap are truncated with `\n[… prompt truncated]` and a warning is logged at L3 (parallel to the existing `body_cap` behavior for external content). The cap is per-mail, not per-config-entry — relevant when a `{canonical_url}` or `{subject}` substitution unexpectedly inflates the rendered length.
+`prompt_cap` (default 2048 bytes) bounds the **substituted prompt text before the truncation marker is appended**. Prompts whose post-substitution length exceeds the cap are sliced to `prompt_cap` bytes (rune-bounded, see below), then the literal marker `\n[… prompt truncated]` is appended on top, and a warning is logged at L3. This matches the existing `body_cap` convention in `internal/telegraph/transform/mail.go` (line 207: `text[:t.bodyCap] + "\n[… truncated]"`) so operators have a single mental model for how Telegraph's size limits compose. The actual emitted prompt-block size is therefore `min(len(prompt), prompt_cap) + len(marker)` — operators sizing mail-body budgets should account for the marker length (~24 bytes) being added on top of `prompt_cap` when truncation fires.
+
+The cap is per-mail, not per-config-entry — relevant when a `{canonical_url}` or `{subject}` substitution unexpectedly inflates the rendered length.
 
 **Truncation is rune-bounded, not byte-bounded.** A naive byte-slice at `prompt_cap` could split a multi-byte UTF-8 sequence (any non-ASCII actor name, label, or comment URL slug) and emit invalid UTF-8 into the mail body. The implementation must scan back from the cap to the nearest rune boundary before truncating — same convention already used by `safeTitle` in `internal/telegraph/transform/mail.go` for the subject line. The cap is documented in bytes (not runes) because operators reason about mail body size in bytes, but the slicing operation respects rune boundaries.
 
