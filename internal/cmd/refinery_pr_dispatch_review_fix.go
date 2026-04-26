@@ -143,27 +143,32 @@ func extractDescField(desc, key string) string {
 }
 
 func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
+	// Operational/config errors return exit 4 per the documented exit-code
+	// contract — exit 1 means "wait, retry next patrol", and we don't want
+	// the caller silently looping on a config-shape error. Each failure
+	// path below wraps its return with NewSilentExit(4) where the failure
+	// is operational rather than transient.
 	prNumberArg, err := parsePRNumber(args[0])
 	if err != nil {
-		return err
+		return wrapOperationalErr(err)
 	}
 	provider, cfg, rigPtr, err := getRefineryPRContext()
 	if err != nil {
-		return err
+		return wrapOperationalErr(err)
 	}
 	if rigPtr == nil || rigPtr.Name == "" {
-		return fmt.Errorf("dispatch-review-fix: rig name unknown (cwd not in a rig)")
+		return wrapOperationalErr(fmt.Errorf("dispatch-review-fix: rig name unknown (cwd not in a rig)"))
 	}
 	rigName := rigPtr.Name
 
 	state, err := parseDispatchMRFields(refPrDispatchReviewFixMR)
 	if err != nil {
-		return err
+		return wrapOperationalErr(err)
 	}
 	if state.PRNumber != prNumberArg {
-		return fmt.Errorf(
+		return wrapOperationalErr(fmt.Errorf(
 			"dispatch-review-fix: PR arg #%d disagrees with MR %s review_pr=%d — refusing to dispatch on a different PR",
-			prNumberArg, refPrDispatchReviewFixMR, state.PRNumber)
+			prNumberArg, refPrDispatchReviewFixMR, state.PRNumber))
 	}
 
 	maxIter := 3
@@ -194,7 +199,7 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 		// HEAD. The G35/G36 drift detection in await-review (PR #50) will
 		// then re-post the trigger automatically when it sees the new SHA.
 		if err := mqClearReviewState(refPrDispatchReviewFixMR); err != nil {
-			return fmt.Errorf("clearing review-fix state on MR %s: %w", refPrDispatchReviewFixMR, err)
+			return wrapOperationalErr(fmt.Errorf("clearing review-fix state on MR %s: %w", refPrDispatchReviewFixMR, err))
 		}
 		fmt.Fprintf(os.Stdout,
 			"PR #%d: review-fix polecat %s done — cleared review_fix_polecat + await_review_started_at; next patrol re-enters PR.4\n",
@@ -208,7 +213,7 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 	// mode (refinery parked "waiting for X" while threads from Y sit open).
 	threads, err := provider.UnresolvedThreads(state.PRNumber)
 	if err != nil {
-		return fmt.Errorf("polling unresolved threads: %w", err)
+		return wrapOperationalErr(fmt.Errorf("polling unresolved threads: %w", err))
 	}
 	if len(threads) == 0 {
 		fmt.Fprintf(os.Stdout, "PR #%d: no unresolved review threads, advancing to wait-approval\n",
@@ -226,7 +231,7 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 			fmt.Sprintf("PR #%d review loop exceeded %d iterations; %d thread(s) still unresolved",
 				state.PRNumber, maxIter, len(threads)),
 			string(threadsJSON)); err != nil {
-			return fmt.Errorf("escalating iteration cap: %w", err)
+			return wrapOperationalErr(fmt.Errorf("escalating iteration cap: %w", err))
 		}
 		fmt.Fprintf(os.Stdout, "PR #%d: review loop iteration cap (%d) reached — escalated to mayor\n",
 			state.PRNumber, maxIter)
@@ -252,7 +257,21 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 
 	newIter := state.ReviewLoopIter + 1
 	if err := mqRecordDispatch(refPrDispatchReviewFixMR, polecatName, newIter); err != nil {
-		return fmt.Errorf("recording dispatch on MR %s: %w", refPrDispatchReviewFixMR, err)
+		// Dangerous corner: gt sling already spawned the polecat (it's
+		// "working" right now), but the bead doesn't record
+		// review_fix_polecat. The next patrol cycle will see the bead as
+		// idle and re-dispatch a SECOND polecat against the same PR —
+		// two cooks in the same kitchen. Escalate hard so an operator
+		// can clean up; this is a rare beads-lock-or-disk-failure case.
+		// Iter counter is not advanced (we never wrote it), so the
+		// re-dispatch is at least bounded by max-iter.
+		threadsJSON, _ := json.Marshal(threads)
+		_ = escalateReviewLoopCap(
+			fmt.Sprintf("PR #%d: review-fix polecat %s spawned but MR-bead update FAILED (%v) — manual intervention required to prevent double-dispatch",
+				state.PRNumber, polecatName, err),
+			string(threadsJSON))
+		return wrapOperationalErr(fmt.Errorf("recording dispatch on MR %s after polecat %s spawned: %w (escalation filed)",
+			refPrDispatchReviewFixMR, polecatName, err))
 	}
 	fmt.Fprintf(os.Stdout, "%s PR #%d: dispatched review-fix polecat %s (iter=%d of %d)\n",
 		style.Bold.Render("→"), state.PRNumber, polecatName, newIter, maxIter)
@@ -392,6 +411,22 @@ func mqRecordDispatch(mrID, polecatName string, iter int) error {
 			strings.TrimSpace(string(out)), err)
 	}
 	return nil
+}
+
+// wrapOperationalErr returns a SilentExit(4) carrying the error's message
+// for stderr, distinguishing operational/config failures from the wait/
+// advance/escalate exit codes (1/0/3) the patrol formula's `case` block
+// dispatches on. Without this, a normal returned error maps to exit 1
+// (cobra's default), which the formula reads as "still waiting" — the
+// caller would silently spin on a config-shape problem instead of
+// surfacing it. The original error message is preserved on stderr via the
+// SilentExitError wrapping in cli.go.
+func wrapOperationalErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	fmt.Fprintln(os.Stderr, err.Error())
+	return NewSilentExit(4)
 }
 
 // escalateReviewLoopCap shells out to `gt escalate` to file an escalation
