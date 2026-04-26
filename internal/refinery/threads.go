@@ -135,6 +135,22 @@ func parseThreadPriority(body string) string {
 	return ""
 }
 
+// isSeverityHeaderLine reports whether trimmedLine is solely an
+// augmentcode-style severity marker (e.g., `**Severity: medium**` or
+// `Severity: low`). Used by firstLinePreview to skip past these
+// non-prose preamble lines so the preview surfaces actionable text
+// rather than the priority label, which is already extracted by
+// parseThreadPriority.
+func isSeverityHeaderLine(trimmedLine string) bool {
+	lower := strings.ToLower(trimmedLine)
+	for _, p := range []string{"high", "medium", "low"} {
+		if lower == "severity: "+p || lower == "**severity: "+p+"**" {
+			return true
+		}
+	}
+	return false
+}
+
 // firstLinePreview returns the first non-empty line of body, trimmed
 // of whitespace, truncated to max chars with an ellipsis when longer.
 // Used to give the refinery LLM enough context to recognize a thread
@@ -142,9 +158,17 @@ func parseThreadPriority(body string) string {
 func firstLinePreview(body string, max int) string {
 	for _, line := range strings.Split(body, "\n") {
 		trimmed := strings.TrimSpace(line)
-		// Skip image-shield lines and empty lines — the interesting
-		// content is usually the first prose sentence after them.
+		// Skip preamble lines that don't carry the actionable prose:
+		//   - empty lines
+		//   - image-shield priority markers (gemini-code-assist):
+		//     `![high](https://www.gstatic.com/codereviewagent/high-priority.svg)`
+		//   - augmentcode severity headers in either bold or plain form:
+		//     `**Severity: medium**`, `Severity: low`
+		// The actionable sentence usually follows on the next non-skip line.
 		if trimmed == "" || strings.HasPrefix(trimmed, "![") {
+			continue
+		}
+		if isSeverityHeaderLine(trimmed) {
 			continue
 		}
 		// Slice on rune boundaries so multi-byte UTF-8 characters (e.g.,

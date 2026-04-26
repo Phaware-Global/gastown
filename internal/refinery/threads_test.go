@@ -270,6 +270,33 @@ func TestFirstLinePreview(t *testing.T) {
 			15,
 			"héllo wörld 🎯 w" + "…",
 		},
+		{
+			// Augmentcode bodies start with a bold severity header that
+			// carries no actionable content. The preview must skip past
+			// it to the prose, otherwise the refinery LLM and CLI just
+			// see the priority label (which is already extracted via
+			// parseThreadPriority).
+			"skip augmentcode severity header (bold)",
+			"**Severity: medium**\n\nThe new control-flow branch lacks a regression test.",
+			120,
+			"The new control-flow branch lacks a regression test.",
+		},
+		{
+			// Plain (non-bold) severity form is also possible.
+			"skip augmentcode severity header (plain)",
+			"Severity: low\n\nMinor nit on the error wrap message.",
+			120,
+			"Minor nit on the error wrap message.",
+		},
+		{
+			// Combined preamble: image-shield priority + augmentcode
+			// severity (occasionally happens when a thread is double-
+			// reviewed). Both must be skipped.
+			"skip both image-shield and severity preamble",
+			"![high](https://www.gstatic.com/codereviewagent/high-priority.svg)\n\n**Severity: high**\n\nUTF-8 byte slicing breaks multi-byte chars.",
+			120,
+			"UTF-8 byte slicing breaks multi-byte chars.",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

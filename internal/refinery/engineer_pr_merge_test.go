@@ -467,6 +467,86 @@ func TestHandleMRInfoFailure_NeedsApproval_StaysInQueue(t *testing.T) {
 	}
 }
 
+// threadGateFakeProvider returns a non-zero PR number, configurable
+// unresolved threads, and panics on MergePR — so a test can verify
+// that the threads-resolved gate (PR.2a) short-circuits doMergePR
+// before any merge is attempted. Distinct from fakePRProvider in
+// approval_test.go which is shaped for the approval gate.
+type threadGateFakeProvider struct {
+	prNumber          int
+	unresolvedThreads []ReviewThread
+	mergeCalls        int
+}
+
+func (f *threadGateFakeProvider) FindPRNumber(string) (int, error) {
+	return f.prNumber, nil
+}
+func (f *threadGateFakeProvider) UnresolvedThreads(int) ([]ReviewThread, error) {
+	return f.unresolvedThreads, nil
+}
+func (f *threadGateFakeProvider) MergePR(int, string) (string, error) {
+	f.mergeCalls++
+	panic("MergePR called — threads-resolved gate failed to short-circuit")
+}
+
+func (f *threadGateFakeProvider) IsPRApproved(int) (bool, error)                { panic("unused") }
+func (f *threadGateFakeProvider) IsPRApprovedBy(int, string) (bool, error)      { panic("unused") }
+func (f *threadGateFakeProvider) CountApprovals(int) (int, error)               { panic("unused") }
+func (f *threadGateFakeProvider) CreatePR(CreatePROptions) (int, string, error) { panic("unused") }
+func (f *threadGateFakeProvider) RequestReview(int, []string) error             { panic("unused") }
+func (f *threadGateFakeProvider) AllThreads(int) ([]ReviewThread, error)        { panic("unused") }
+func (f *threadGateFakeProvider) ChecksRollup(int) (string, bool, error)        { panic("unused") }
+
+// TestDoMergePR_UnresolvedThreads_ShortCircuits asserts the contract of
+// the new PR.2a thread gate: when VerifyReviewThreadsResolved returns
+// *NeedsReviewResolutionError, doMergePR sets ProcessResult.
+// NeedsReviewResolution=true and returns BEFORE calling MergePR. The
+// fake provider panics on MergePR to make a regression unmistakable —
+// any future refactor that bypasses the gate will fail the test loudly
+// rather than silently letting a thread-blocked PR merge.
+func TestDoMergePR_UnresolvedThreads_ShortCircuits(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	createFeatureBranch(t, workDir, "feat/with-threads", "test.txt", "hello")
+
+	provider := &threadGateFakeProvider{
+		prNumber: 42,
+		unresolvedThreads: []ReviewThread{
+			{
+				ID:         "PRRT_test_thread",
+				IsResolved: false,
+				IsOutdated: false,
+				URL:        "https://github.com/example/repo/pull/42#discussion_r1",
+				Path:       "internal/foo.go",
+				Line:       100,
+				Author:     "gemini-code-assist",
+				Body:       "**Severity: high**\n\nThis function leaks a goroutine on error.",
+			},
+		},
+	}
+	e.prProvider = provider
+
+	result := e.doMergePR(context.Background(), "feat/with-threads", "main")
+
+	if result.Success {
+		t.Errorf("expected Success=false when threads block, got Success=true")
+	}
+	if !result.NeedsReviewResolution {
+		t.Errorf("expected NeedsReviewResolution=true (G24 gate fired), got false. Result: %+v", result)
+	}
+	if result.NeedsApproval {
+		t.Errorf("threads-blocking path must NOT set NeedsApproval — that misattributes "+
+			"the gate to observability. Result: %+v", result)
+	}
+	if provider.mergeCalls != 0 {
+		t.Errorf("MergePR was invoked %d time(s) despite blocking threads — gate did not short-circuit",
+			provider.mergeCalls)
+	}
+	if !strings.Contains(result.Error, "thread") && !strings.Contains(result.Error, "Thread") {
+		t.Errorf("expected error to mention thread blocking, got: %s", result.Error)
+	}
+}
+
 // TestProcessResult_NeedsReviewResolution verifies the field exists and
 // is independent of NeedsApproval — distinguishing "blocked by unresolved
 // reviewer threads" from "blocked by missing approving review" so
