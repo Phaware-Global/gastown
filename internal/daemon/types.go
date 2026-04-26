@@ -131,6 +131,89 @@ type PatrolsConfig struct {
 	MainBranchTest         *MainBranchTestConfig          `json:"main_branch_test,omitempty"`
 	QuotaDog               *QuotaDogConfig                `json:"quota_dog,omitempty"`
 	RestartTracker         *RestartTrackerConfig          `json:"restart_tracker,omitempty"`
+	Telegraph              *TelegraphServerConfig         `json:"telegraph,omitempty"`
+}
+
+// TelegraphServerConfig holds configuration for the daemon-managed Telegraph subprocess.
+type TelegraphServerConfig struct {
+	// Enabled controls whether the daemon starts and supervises Telegraph.
+	Enabled bool `json:"enabled"`
+
+	// ConfigPath is the path to telegraph.toml. Defaults to <town-root>/settings/telegraph.toml.
+	ConfigPath string `json:"config_path,omitempty"`
+
+	// LogFile is where the Telegraph subprocess stdout/stderr is routed.
+	// Defaults to <town-root>/daemon/telegraph.log.
+	LogFile string `json:"log_file,omitempty"`
+
+	// AutoRestart controls whether to restart Telegraph after a crash.
+	// Defaults to false (conservative): daemon starts Telegraph once but
+	// does not auto-restart on crash. Set to true for full supervision.
+	AutoRestart bool `json:"auto_restart,omitempty"`
+
+	// RestartDelay is the initial delay before restarting after a crash (default 5s).
+	RestartDelay time.Duration `json:"restart_delay,omitempty"`
+
+	// MaxRestartDelay is the maximum backoff delay (default 5min).
+	MaxRestartDelay time.Duration `json:"max_restart_delay,omitempty"`
+
+	// MaxRestartsInWindow is the maximum restarts allowed within RestartWindow (default 5).
+	MaxRestartsInWindow int `json:"max_restarts_in_window,omitempty"`
+
+	// RestartWindow is the time window for counting restarts (default 10min).
+	RestartWindow time.Duration `json:"restart_window,omitempty"`
+
+	// HealthCheckInterval is how often to check whether Telegraph is alive (default 30s).
+	HealthCheckInterval time.Duration `json:"health_check_interval,omitempty"`
+}
+
+// UnmarshalJSON allows duration fields to be specified as human-readable strings
+// (e.g. "5s", "10m") in daemon.json, consistent with other duration config fields.
+func (c *TelegraphServerConfig) UnmarshalJSON(data []byte) error {
+	type wire struct {
+		Enabled             bool   `json:"enabled"`
+		ConfigPath          string `json:"config_path,omitempty"`
+		LogFile             string `json:"log_file,omitempty"`
+		AutoRestart         bool   `json:"auto_restart,omitempty"`
+		RestartDelay        string `json:"restart_delay,omitempty"`
+		MaxRestartDelay     string `json:"max_restart_delay,omitempty"`
+		MaxRestartsInWindow int    `json:"max_restarts_in_window,omitempty"`
+		RestartWindow       string `json:"restart_window,omitempty"`
+		HealthCheckInterval string `json:"health_check_interval,omitempty"`
+	}
+	var w wire
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	c.Enabled = w.Enabled
+	c.ConfigPath = w.ConfigPath
+	c.LogFile = w.LogFile
+	c.AutoRestart = w.AutoRestart
+	c.MaxRestartsInWindow = w.MaxRestartsInWindow
+	parseDur := func(s, field string) (time.Duration, error) {
+		if s == "" {
+			return 0, nil
+		}
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return 0, fmt.Errorf("telegraph.%s: %w", field, err)
+		}
+		return d, nil
+	}
+	var err error
+	if c.RestartDelay, err = parseDur(w.RestartDelay, "restart_delay"); err != nil {
+		return err
+	}
+	if c.MaxRestartDelay, err = parseDur(w.MaxRestartDelay, "max_restart_delay"); err != nil {
+		return err
+	}
+	if c.RestartWindow, err = parseDur(w.RestartWindow, "restart_window"); err != nil {
+		return err
+	}
+	if c.HealthCheckInterval, err = parseDur(w.HealthCheckInterval, "health_check_interval"); err != nil {
+		return err
+	}
+	return nil
 }
 
 // DoltRemotesConfig holds configuration for the dolt_remotes patrol.
@@ -307,6 +390,12 @@ func IsPatrolEnabled(config *DaemonPatrolConfig, patrol string) bool {
 			return false
 		}
 		return config.Patrols.QuotaDog.Enabled
+	}
+	if patrol == "telegraph" {
+		if config == nil || config.Patrols == nil || config.Patrols.Telegraph == nil {
+			return false
+		}
+		return config.Patrols.Telegraph.Enabled
 	}
 
 	if config == nil || config.Patrols == nil {

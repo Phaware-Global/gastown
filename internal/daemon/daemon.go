@@ -59,8 +59,9 @@ type Daemon struct {
 	curator       *feed.Curator
 	convoyManager *ConvoyManager
 	beadsStores   map[string]beadsdk.Storage
-	doltServer    *DoltServerManager
-	krcPruner     *KRCPruner
+	doltServer       *DoltServerManager
+	telegraphServer  *TelegraphServerManager
+	krcPruner        *KRCPruner
 
 	// disabledPatrols is loaded from town settings (disabled_patrols field).
 	// Provides a simple way to disable individual patrol dogs without editing
@@ -281,6 +282,14 @@ func New(config *Config) (*Daemon, error) {
 		logger.Printf("Warning: bd not found in PATH, subprocess calls may fail")
 	}
 
+	// Initialize Telegraph server manager if configured (opt-in, default disabled).
+	var telegraphServer *TelegraphServerManager
+	if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.Telegraph != nil &&
+		patrolConfig.Patrols.Telegraph.Enabled {
+		telegraphServer = NewTelegraphServerManager(config.TownRoot, gtPath, patrolConfig.Patrols.Telegraph, logger.Printf)
+		logger.Printf("Telegraph daemon management enabled")
+	}
+
 	// Initialize restart tracker with exponential backoff.
 	// Parameters are configurable via patrols.restart_tracker in daemon.json.
 	var rtCfg RestartTrackerConfig
@@ -327,6 +336,7 @@ func New(config *Config) (*Daemon, error) {
 		ctx:             ctx,
 		cancel:          cancel,
 		doltServer:      doltServer,
+		telegraphServer: telegraphServer,
 		gtPath:          gtPath,
 		bdPath:          bdPath,
 		restartTracker:  restartTracker,
@@ -481,6 +491,17 @@ func (d *Daemon) Run() (err error) {
 		doltHealthChan = doltHealthTicker.C
 		defer doltHealthTicker.Stop()
 		d.logger.Printf("Dolt health check ticker started (interval %v)", interval)
+	}
+
+	// Start dedicated Telegraph health check ticker if Telegraph management is enabled.
+	var telegraphHealthTicker *time.Ticker
+	var telegraphHealthChan <-chan time.Time
+	if d.telegraphServer != nil && d.telegraphServer.IsEnabled() {
+		interval := d.telegraphServer.HealthCheckInterval()
+		telegraphHealthTicker = time.NewTicker(interval)
+		telegraphHealthChan = telegraphHealthTicker.C
+		defer telegraphHealthTicker.Stop()
+		d.logger.Printf("Telegraph health check ticker started (interval %v)", interval)
 	}
 
 	// Start dedicated Dolt remotes push ticker if configured.
@@ -645,6 +666,13 @@ func (d *Daemon) Run() (err error) {
 				d.ensureDoltServerRunning()
 			}
 
+		case <-telegraphHealthChan:
+			// Dedicated Telegraph health check — ensures the subprocess is alive
+			// and restarts it on crash without affecting other gastown services.
+			if !d.isShutdownInProgress() {
+				d.ensureTelegraphRunning()
+			}
+
 		case <-doltRemotesChan:
 			// Periodic Dolt remote push — pushes databases to their configured
 			// git remotes on a 15-minute cadence (independent of heartbeat).
@@ -779,6 +807,10 @@ func (d *Daemon) heartbeat(state *State) {
 	// 0. Ensure Dolt server is running (if configured)
 	// This must happen before beads operations that depend on Dolt.
 	d.ensureDoltServerRunning()
+
+	// 0c. Ensure Telegraph subprocess is running (if configured, opt-in).
+	// Failures are isolated: Telegraph down never blocks heartbeat.
+	d.ensureTelegraphRunning()
 
 	// 1. Ensure Deacon is running (restart if dead)
 	// Check patrol config - can be disabled in mayor/daemon.json
@@ -947,6 +979,15 @@ func (d *Daemon) ensureDoltServerRunning() {
 			h.Healthy,
 		)
 	}
+}
+
+// ensureTelegraphRunning ensures the Telegraph subprocess is alive if configured.
+// Failures are logged but never propagated — Telegraph is an optional service.
+func (d *Daemon) ensureTelegraphRunning() {
+	if d.telegraphServer == nil || !d.telegraphServer.IsEnabled() {
+		return
+	}
+	d.telegraphServer.EnsureRunning()
 }
 
 // pourDoctorMolecule creates a mol-dog-doctor molecule to track a health anomaly.
@@ -2127,6 +2168,12 @@ func (d *Daemon) shutdown(state *State) error { //nolint:unparam // error return
 
 	// Push Dolt remotes before stopping the server (if patrol is enabled)
 	d.pushDoltRemotes()
+
+	// Stop Telegraph subprocess if we're managing it
+	if d.telegraphServer != nil && d.telegraphServer.IsEnabled() {
+		d.telegraphServer.Stop()
+		d.logger.Println("Telegraph subprocess stopped")
+	}
 
 	// Stop Dolt server if we're managing it
 	if d.doltServer != nil && d.doltServer.IsEnabled() && !d.doltServer.IsExternal() {
