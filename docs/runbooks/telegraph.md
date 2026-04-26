@@ -181,7 +181,9 @@ with HTTP 401 and logged as `reason=hmac_invalid`.
 ### Tail the log file
 
 ```bash
-tail -f ~/gt/logs/telegraph.log | jq .
+LOG_FILE="$(grep -m1 'log_file' ~/gt/settings/telegraph.toml | awk -F'"' '{print $2}')"
+LOG_FILE="${LOG_FILE:-~/gt/logs/telegraph.log}"  # fallback if log_file not set (stderr mode)
+tail -f "$LOG_FILE" | jq .
 ```
 
 A successful round-trip produces two log lines:
@@ -257,16 +259,16 @@ They reset on restart. The counters are:
 
 ```bash
 # Count by event class
-jq -s 'group_by(.event) | map({event: .[0].event, count: length})' ~/gt/logs/telegraph.log
+jq -s 'group_by(.event) | map({event: .[0].event, count: length})' "$LOG_FILE"
 
 # Show only rejections
-jq 'select(.event == "reject")' ~/gt/logs/telegraph.log
+jq 'select(.event == "reject")' "$LOG_FILE"
 
 # Watch backpressure in real time (buffer full)
-tail -f ~/gt/logs/telegraph.log | jq 'select(.reason == "backpressure")'
+tail -f "$LOG_FILE" | jq 'select(.reason == "backpressure")'
 
 # All delivers for a specific issue key
-jq 'select(.event == "deliver" and .subject == "PROJ-1234")' ~/gt/logs/telegraph.log
+jq 'select(.event == "deliver" and .subject == "PROJ-1234")' "$LOG_FILE"
 ```
 
 ---
