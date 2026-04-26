@@ -1552,6 +1552,47 @@ func (g *Git) GhPrHasReviewFrom(prNumber int, user string) (bool, error) {
 	return false, nil
 }
 
+// GhPrReviewAuthors returns the unique GitHub logins of every user who has
+// submitted at least one review on the PR (any state). Logins preserve their
+// original case as returned by the gh CLI; the slice is sorted
+// case-insensitively (the comparison key is the lowercased login, but the
+// returned strings carry the original case from the PR). Used by the
+// await-review timeout path so a misconfigured pr_reviewer surfaces as "PR
+// has reviews from: ..." in the patrol log on first occurrence rather than
+// as a silent 30-minute timeout cycle.
+//
+// Sort order detail: keys (lowercased logins) are sorted directly via
+// sort.Strings so we don't repeatedly lowercase during O(N log N) compares.
+// The de-dup map tracks lowercased→original mapping; the output is built by
+// looking each sorted key back up in that map.
+func (g *Git) GhPrReviewAuthors(prNumber int) ([]string, error) {
+	reviews, err := g.ghFetchReviews(prNumber)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]string, len(reviews))
+	for _, r := range reviews {
+		login := r.Author.Login
+		if login == "" {
+			continue
+		}
+		key := strings.ToLower(login)
+		if _, ok := seen[key]; !ok {
+			seen[key] = login
+		}
+	}
+	keys := make([]string, 0, len(seen))
+	for k := range seen {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, len(keys))
+	for i, k := range keys {
+		out[i] = seen[k]
+	}
+	return out, nil
+}
+
 // GhPrApprovedBy returns true iff the given user has submitted an APPROVED
 // review on the PR and has not subsequently dismissed it or requested changes.
 // Passing user="" falls back to IsPRApproved (any approver).

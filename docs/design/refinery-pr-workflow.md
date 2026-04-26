@@ -109,7 +109,7 @@ Rig settings (`<rig>/settings/config.json`):
     "enabled": true,
     "merge_strategy": "pr",
     "vcs_provider": "github",
-    "pr_reviewer": "augment",
+    "pr_reviewer": "augmentcode",
     "pr_approver": "kevinpjones",
     "pr_required_approvals": 1,
     "pr_review_loop_max": 3,

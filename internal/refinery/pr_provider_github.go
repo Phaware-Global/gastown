@@ -66,3 +66,7 @@ func (p *githubPRProvider) PostComment(prNumber int, body string) error {
 func (p *githubPRProvider) HasReviewFrom(prNumber int, user string) (bool, error) {
 	return p.git.GhPrHasReviewFrom(prNumber, user)
 }
+
+func (p *githubPRProvider) ListReviewAuthors(prNumber int) ([]string, error) {
+	return p.git.GhPrReviewAuthors(prNumber)
+}

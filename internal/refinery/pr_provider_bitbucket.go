@@ -94,3 +94,7 @@ func (p *bitbucketPRProvider) PostComment(prNumber int, body string) error {
 func (p *bitbucketPRProvider) HasReviewFrom(prNumber int, user string) (bool, error) {
 	return false, ErrUnsupported
 }
+
+func (p *bitbucketPRProvider) ListReviewAuthors(prNumber int) ([]string, error) {
+	return nil, ErrUnsupported
+}
