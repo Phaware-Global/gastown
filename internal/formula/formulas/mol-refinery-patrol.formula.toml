@@ -1007,6 +1007,38 @@ regression test in `pr_workflow_integration_test.go`):
    the same dogfood (iter-2 dispatch listed 3 of 4 threads in
    narrative form; the 4th thread went to iter-3).
 
+⚠️ **G33 — imperative dispatch.** As of the G33 refactor, the entire PR.5
+state machine is a single subcommand. The bash blob below is preserved for
+reference (and as the spec the subcommand implements), but the refinery
+formula calls **`gt refinery pr dispatch-review-fix $PR --mr $MR`** instead
+— that subcommand consolidates the logic into Go, returning the same exit
+codes (0 advance / 1 wait / 3 escalate / 4 error) and the LLM has no prose
+to optimize away into "do it myself".
+
+```bash
+{{ cmd }} refinery pr dispatch-review-fix $PR --mr $MR
+
+case $? in
+  0)  ;;                                  # advance to PR.6
+  1)  return 0 2>/dev/null || exit 0 ;;   # still in flight or just dispatched
+  3)  return 0 2>/dev/null || exit 0 ;;   # cap hit; escalation already filed
+  *)  echo "PR #$PR: dispatch-review-fix returned operational error"
+      return 0 2>/dev/null || exit 0 ;;
+esac
+```
+
+The subcommand reads `review_pr`, `branch`, `source_issue`,
+`review_fix_polecat`, and `review_loop_iter` directly from the MR bead, polls
+unresolved threads via the configured PRProvider, dispatches via `gt sling`
+(passing the polecat the `THREADS` JSON verbatim — G14 invariant — and the
+imperative mission template that includes `gt polecat checkout-branch` as
+step 1), updates the bead via `gt mq set-review-state`, and escalates via
+`gt escalate` on cap. Author-agnostic thread counting (G12b invariant) and
+reply-AND-resolve mission language (G13 invariant) are baked into the Go
+implementation and unit-tested there.
+
+The bash reference implementation (kept in this comment as the spec):
+
 ```bash
 MR=<mr-bead-id>
 MAX={{pr_review_loop_max}}       # rig-level cap; default 3
