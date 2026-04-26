@@ -2141,3 +2141,34 @@ func TestBranchPushedToRemote_NoPushURL(t *testing.T) {
 		t.Errorf("BranchPushedToRemote unpushed = %d, want >= 1", unpushed)
 	}
 }
+
+func TestIsProtectedBranch(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		// Positives — the canonical integration branches.
+		{"main", true},
+		{"master", true},
+		{"develop", true},
+		{"MAIN", true},      // case-insensitive
+		{"Master", true},    // case-insensitive
+		{"  main  ", true},  // whitespace tolerant (LLM-typed input)
+		// Negatives — anything else, including PR-style names that
+		// look adjacent to the protected ones.
+		{"main-feature", false},
+		{"feature/main", false},
+		{"polecat/nux-gt-clz", false},
+		{"fix/refinery-thing", false},
+		{"refactor/whatever", false},
+		{"trunk", false}, // not in the allowlist (other VCSes use trunk; we don't)
+		{"", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsProtectedBranch(tc.name); got != tc.want {
+				t.Errorf("IsProtectedBranch(%q) = %v; want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}

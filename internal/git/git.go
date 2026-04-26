@@ -1500,6 +1500,34 @@ func (g *Git) GhPrComment(prNumber int, body string) error {
 	return nil
 }
 
+// protectedBranchSet is the canonical list of branches the gt-pvx safety net
+// and checkpoint dog refuse to commit onto. main/master cover the
+// long-running default-branch convention; develop covers the gitflow style
+// some downstream rigs adopt.
+var protectedBranchSet = map[string]struct{}{
+	"main":    {},
+	"master":  {},
+	"develop": {},
+}
+
+// IsProtectedBranch returns true if the given branch name is one of the
+// long-running integration branches that automated commit paths (gt-pvx
+// safety net in `gt done`, checkpoint dog) must refuse to write onto. G41
+// closes the failure mode where a polecat session that ended up on `main`
+// (e.g., via worktree-init residue) had its in-progress edits auto-saved
+// to that branch and pushed to origin/main, bypassing the entire PR
+// workflow. The guard is intentionally a closed allowlist — comparing
+// against an open list of "non-feature branches" is undecidable; the
+// three names here are the ones we've actually seen weaponized.
+//
+// Match is case-insensitive on the branch name (git treats branch names
+// case-insensitively on macOS/Windows filesystems anyway, and an LLM that
+// types "Main" should still hit the guard).
+func IsProtectedBranch(name string) bool {
+	_, ok := protectedBranchSet[strings.ToLower(strings.TrimSpace(name))]
+	return ok
+}
+
 // GhPrHasReviewFrom returns true iff the given user has submitted at
 // least one review on the PR (in any state — COMMENTED, APPROVED,
 // CHANGES_REQUESTED, or DISMISSED). Case-insensitive on login.
