@@ -593,10 +593,15 @@ func TestHandleMRInfoFailure_NeedsReviewResolution_StaysInQueue(t *testing.T) {
 		SourceIssue: "gt-src",
 		Worker:      "polecats/test",
 	}
+	// Detailed-error string mimics what VerifyReviewThreadsResolved
+	// produces (file:line, author, priority preview). The handler must
+	// surface this to patrol output so the polecat dispatcher knows
+	// WHICH threads need attention.
+	detailedErr := "PR #42 has 2 unresolved review threads:\n  - internal/foo.go:42 by gemini-code-assist [high] - off-by-one\n  - internal/bar.go:7 by augmentcode [medium] - nil deref"
 	result := ProcessResult{
 		Success:               false,
 		NeedsReviewResolution: true,
-		Error:                 "PR #42 has 2 unresolved review threads",
+		Error:                 detailedErr,
 	}
 
 	e.HandleMRInfoFailure(mr, result)
@@ -611,6 +616,12 @@ func TestHandleMRInfoFailure_NeedsReviewResolution_StaysInQueue(t *testing.T) {
 	}
 	if strings.Contains(output, "MERGE_FAILED") {
 		t.Error("NeedsReviewResolution should not trigger MERGE_FAILED notification")
+	}
+	// The detailed thread list must reach patrol output — without it
+	// the polecat dispatcher only sees that SOMETHING is blocking, not
+	// WHAT, so the review-fix loop can't run with focused context.
+	if !strings.Contains(output, "off-by-one") || !strings.Contains(output, "gemini-code-assist") {
+		t.Errorf("expected detailed thread list (from result.Error) to surface in output, got: %s", output)
 	}
 }
 

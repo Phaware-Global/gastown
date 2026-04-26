@@ -311,7 +311,10 @@ func (e *Engineer) processSingleMR(ctx context.Context, mr *MRInfo, target strin
 	} else if processResult.NeedsReviewResolution {
 		// PR has unresolved reviewer threads — leave in queue for the
 		// review-fix loop (formula PR.5) to address on the next pass.
-		_, _ = fmt.Fprintf(e.output, "[Batch] MR %s: PR has unresolved review threads, will retry\n", mr.ID)
+		// Surface the detailed thread list (file:line, author, priority,
+		// preview) carried in `processResult.Error` so the polecat
+		// dispatcher has enough context to act on the right threads.
+		_, _ = fmt.Fprintf(e.output, "[Batch] MR %s: PR has unresolved review threads, will retry\n%s\n", mr.ID, processResult.Error)
 		e.HandleMRInfoFailure(mr, processResult)
 	} else if processResult.NeedsApproval {
 		// PR awaiting human approval — leave in queue for retry on next poll.

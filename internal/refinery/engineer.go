@@ -1563,7 +1563,12 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 	// approving review. Logged separately so observability accurately
 	// reflects which gate is blocking the merge.
 	if result.NeedsReviewResolution {
-		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: PR has unresolved review threads, will retry next poll (review-fix loop will run)\n", mr.ID)
+		// Log the detailed blocking-thread list (file:line, author, priority,
+		// preview) from VerifyReviewThreadsResolved alongside the retry
+		// message. Without `result.Error`, patrol output only shows that
+		// SOMETHING is blocking — not WHAT — and the polecat dispatcher
+		// has no actionable context.
+		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: PR has unresolved review threads, will retry next poll (review-fix loop will run)\n%s\n", mr.ID, result.Error)
 		return
 	}
 
