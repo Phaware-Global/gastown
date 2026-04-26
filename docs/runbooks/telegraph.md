@@ -148,7 +148,8 @@ fits your infrastructure:
 
 ```bash
 curl -s -o /dev/null -w "%{http_code}" https://<TELEGRAPH_PUBLIC_URL>/webhook/jira
-# 405 = tunnel live, Telegraph running (GET rejected; POST is the correct method)
+# 405 = tunnel live, Telegraph running, Jira provider enabled (GET rejected; POST required)
+# 404 = tunnel live, Telegraph running, but Jira provider not enabled or unknown path
 # 502/504 = tunnel cannot reach :8765 (Telegraph not running)
 ```
 
@@ -182,7 +183,7 @@ with HTTP 401 and logged as `reason=hmac_invalid`.
 
 ```bash
 LOG_FILE="$(grep -m1 'log_file' ~/gt/settings/telegraph.toml | awk -F'"' '{print $2}')"
-LOG_FILE="${LOG_FILE:-~/gt/logs/telegraph.log}"  # fallback if log_file not set (stderr mode)
+LOG_FILE="${LOG_FILE:-$HOME/gt/logs/telegraph.log}"  # fallback if log_file not set (stderr mode)
 tail -f "$LOG_FILE" | jq .
 ```
 
