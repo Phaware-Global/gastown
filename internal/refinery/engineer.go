@@ -718,15 +718,16 @@ func (e *Engineer) Config() *MergeQueueConfig {
 
 // ProcessResult contains the result of processing a merge request.
 type ProcessResult struct {
-	Success        bool
-	MergeCommit    string
-	Error          string
-	Conflict       bool
-	TestsFailed    bool
-	SlotTimeout    bool // Merge slot contention timeout (distinct from build/test failure)
-	BranchNotFound bool // Source branch no longer exists (e.g. cleaned up after cherry-pick)
-	NoMerge        bool // Source issue has no_merge flag — intentionally blocked, not a failure
-	NeedsApproval  bool // PR exists but lacks required approving review (merge_strategy=pr)
+	Success               bool
+	MergeCommit           string
+	Error                 string
+	Conflict              bool
+	TestsFailed           bool
+	SlotTimeout           bool // Merge slot contention timeout (distinct from build/test failure)
+	BranchNotFound        bool // Source branch no longer exists (e.g. cleaned up after cherry-pick)
+	NoMerge               bool // Source issue has no_merge flag — intentionally blocked, not a failure
+	NeedsApproval         bool // PR exists but lacks required approving review (merge_strategy=pr)
+	NeedsReviewResolution bool // PR has unresolved reviewer threads — review-fix loop must run before merge
 }
 
 // doMerge performs the actual git merge operation.
@@ -1019,9 +1020,9 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
 		var needsResolution *NeedsReviewResolutionError
 		if errors.As(err, &needsResolution) {
 			return ProcessResult{
-				Success:       false,
-				NeedsApproval: true, // stays in queue; review-fix loop must run
-				Error:         err.Error(),
+				Success:               false,
+				NeedsReviewResolution: true, // stays in queue; review-fix loop must run
+				Error:                 err.Error(),
 			}
 		}
 		return ProcessResult{
@@ -1552,6 +1553,17 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 	// No polecat or mayor notification needed; the MR is simply dequeued.
 	if result.NoMerge {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: no_merge flag set on source issue, dequeued\n", mr.ID)
+		return
+	}
+
+	// NeedsReviewResolution: reviewer-posted threads on the PR are unresolved.
+	// Not a failure — the MR stays in queue and the formula's review-fix loop
+	// (PR.5) is responsible for slinging a polecat to address the threads.
+	// Distinct from NeedsApproval: the blocker is reviewer guidance, not an
+	// approving review. Logged separately so observability accurately
+	// reflects which gate is blocking the merge.
+	if result.NeedsReviewResolution {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: PR has unresolved review threads, will retry next poll (review-fix loop will run)\n", mr.ID)
 		return
 	}
 

@@ -308,6 +308,11 @@ func (e *Engineer) processSingleMR(ctx context.Context, mr *MRInfo, target strin
 		// Source issue has no_merge flag — intentionally blocked. Dequeue silently.
 		_, _ = fmt.Fprintf(e.output, "[Batch] MR %s: no_merge flag set, dequeuing\n", mr.ID)
 		e.HandleMRInfoFailure(mr, processResult)
+	} else if processResult.NeedsReviewResolution {
+		// PR has unresolved reviewer threads — leave in queue for the
+		// review-fix loop (formula PR.5) to address on the next pass.
+		_, _ = fmt.Fprintf(e.output, "[Batch] MR %s: PR has unresolved review threads, will retry\n", mr.ID)
+		e.HandleMRInfoFailure(mr, processResult)
 	} else if processResult.NeedsApproval {
 		// PR awaiting human approval — leave in queue for retry on next poll.
 		_, _ = fmt.Fprintf(e.output, "[Batch] MR %s: PR awaiting approval, will retry\n", mr.ID)

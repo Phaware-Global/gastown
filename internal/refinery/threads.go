@@ -147,8 +147,12 @@ func firstLinePreview(body string, max int) string {
 		if trimmed == "" || strings.HasPrefix(trimmed, "![") {
 			continue
 		}
-		if len(trimmed) > max {
-			return trimmed[:max] + "…"
+		// Slice on rune boundaries so multi-byte UTF-8 characters (e.g.,
+		// emoji or non-ASCII text in reviewer comments) don't get cut
+		// mid-codepoint and produce invalid output.
+		runes := []rune(trimmed)
+		if len(runes) > max {
+			return string(runes[:max]) + "…"
 		}
 		return trimmed
 	}

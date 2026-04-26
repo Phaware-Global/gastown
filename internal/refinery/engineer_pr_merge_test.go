@@ -467,6 +467,73 @@ func TestHandleMRInfoFailure_NeedsApproval_StaysInQueue(t *testing.T) {
 	}
 }
 
+// TestProcessResult_NeedsReviewResolution verifies the field exists and
+// is independent of NeedsApproval — distinguishing "blocked by unresolved
+// reviewer threads" from "blocked by missing approving review" so
+// observability accurately attributes the gate that's holding up merge.
+func TestProcessResult_NeedsReviewResolution(t *testing.T) {
+	r := ProcessResult{
+		Success:               false,
+		NeedsReviewResolution: true,
+		Error:                 "PR #42 has 2 unresolved review threads",
+	}
+
+	if r.Success {
+		t.Error("expected Success=false")
+	}
+	if !r.NeedsReviewResolution {
+		t.Error("expected NeedsReviewResolution=true")
+	}
+	if r.NeedsApproval {
+		t.Error("NeedsReviewResolution must not imply NeedsApproval — distinct queue states")
+	}
+}
+
+// TestHandleMRInfoFailure_NeedsReviewResolution_StaysInQueue mirrors the
+// NeedsApproval test but for the threads-blocking path. The MR must stay
+// in queue, the log line must say "unresolved review threads" (not
+// "awaiting human approval"), and no MERGE_FAILED notification fires.
+func TestHandleMRInfoFailure_NeedsReviewResolution_StaysInQueue(t *testing.T) {
+	workDir := t.TempDir()
+	r := &rig.Rig{Name: "test-rig", Path: workDir}
+	e := NewEngineer(r)
+	var buf bytes.Buffer
+	e.output = &buf
+	e.workDir = workDir
+	e.mergeSlotEnsureExists = func() (string, error) { return "test-slot", nil }
+	e.mergeSlotAcquire = func(holder string, addWaiter bool) (*beads.MergeSlotStatus, error) {
+		return &beads.MergeSlotStatus{Available: true, Holder: holder}, nil
+	}
+	e.mergeSlotRelease = func(holder string) error { return nil }
+
+	mr := &MRInfo{
+		ID:          "gt-test",
+		Branch:      "polecat/test/gt-test",
+		Target:      "main",
+		SourceIssue: "gt-src",
+		Worker:      "polecats/test",
+	}
+	result := ProcessResult{
+		Success:               false,
+		NeedsReviewResolution: true,
+		Error:                 "PR #42 has 2 unresolved review threads",
+	}
+
+	e.HandleMRInfoFailure(mr, result)
+
+	output := buf.String()
+	if !strings.Contains(output, "unresolved review threads") {
+		t.Errorf("expected 'unresolved review threads' message, got: %s", output)
+	}
+	if strings.Contains(output, "awaiting human approval") {
+		t.Errorf("NeedsReviewResolution must NOT log 'awaiting human approval' — that "+
+			"misattributes the blocker. Output: %s", output)
+	}
+	if strings.Contains(output, "MERGE_FAILED") {
+		t.Error("NeedsReviewResolution should not trigger MERGE_FAILED notification")
+	}
+}
+
 func TestDoMergePR_RequireReview_NoApproval(t *testing.T) {
 	// When require_review is true and the PR is not approved,
 	// doMergePR should return NeedsApproval=true.

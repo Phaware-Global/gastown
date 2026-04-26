@@ -262,6 +262,14 @@ func TestFirstLinePreview(t *testing.T) {
 			120,
 			"indented comment",
 		},
+		{
+			// Multi-byte UTF-8 (each emoji = 4 bytes, each accented char = 2 bytes)
+			// must be sliced on rune boundaries, not byte boundaries.
+			"truncate at rune boundary, not byte",
+			"héllo wörld 🎯 with extra trailing text",
+			15,
+			"héllo wörld 🎯 w" + "…",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
