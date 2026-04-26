@@ -185,23 +185,39 @@ func AwaitReviewStep(provider PRProvider, prNumber int, in AwaitReviewStepInput)
 	// Guard against a StartedAt in the future (clock skew across hosts,
 	// or a manually-edited MR bead). A negative `elapsed` would compare
 	// less than MinWait by definition and unexpectedly extend the wait
-	// window — potentially indefinitely if the skew is large. Treat
-	// future timestamps as "min-wait window starts now" rather than
-	// rolling backwards.
-	elapsed := now().Sub(in.StartedAt)
+	// window — potentially indefinitely if the skew is large.
+	//
+	// Local clamping alone is not sufficient: the bead's persisted
+	// StartedAt would stay in the future, every subsequent patrol cycle
+	// would re-detect the skew, and the patrol would wait until wall
+	// clock passes the future timestamp + MinWait. Instead, when we
+	// detect a future StartedAt, propose `NewStartedAt = now()` so the
+	// caller persists the corrected timestamp, and treat this cycle as
+	// if the min-wait window starts now.
+	currentTime := now()
+	elapsed := currentTime.Sub(in.StartedAt)
+	var correctedStartedAt time.Time
 	if elapsed < 0 {
 		elapsed = 0
+		correctedStartedAt = currentTime
 	}
 
 	// Still inside the min-wait window — refuse to even check threads
 	// or reviewer state. This is the imperative gate.
 	if elapsed < in.MinWait {
 		remaining := in.MinWait - elapsed
+		msg := fmt.Sprintf("PR #%d: %s left in min-wait window before first check",
+			prNumber, remaining.Round(time.Second))
+		if !correctedStartedAt.IsZero() {
+			msg = fmt.Sprintf("PR #%d: StartedAt was in the future (clock skew or manual edit); "+
+				"corrected to %s, %s left in min-wait window",
+				prNumber, currentTime.Format(time.RFC3339), remaining.Round(time.Second))
+		}
 		return AwaitReviewStepResult{
 			Status:        AwaitStatusWaiting,
 			RemainingWait: remaining,
-			Message: fmt.Sprintf("PR #%d: %s left in min-wait window before first check",
-				prNumber, remaining.Round(time.Second)),
+			NewStartedAt:  correctedStartedAt,
+			Message:       msg,
 		}, nil
 	}
 

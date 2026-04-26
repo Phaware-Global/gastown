@@ -172,6 +172,37 @@ func TestAwaitReviewStep_FutureStartedAt_ClampsElapsedToZero(t *testing.T) {
 			"future-StartedAt guard did not fire and the patrol could get stuck",
 			res.RemainingWait)
 	}
+	// The persisted StartedAt must be corrected to `now` so subsequent
+	// patrol cycles don't re-detect the same skew. Without this, every
+	// future cycle would clamp elapsed=0 and keep waiting until wall
+	// clock passed the future timestamp + MinWait.
+	if res.NewStartedAt.IsZero() {
+		t.Error("expected NewStartedAt to be set to current time so the bead's StartedAt " +
+			"gets corrected — without persistence, every patrol cycle re-hits the same skew")
+	}
+	if !res.NewStartedAt.Equal(now) {
+		t.Errorf("NewStartedAt = %v, want %v (current clock)", res.NewStartedAt, now)
+	}
+}
+
+// TestAwaitReviewStep_NormalElapsed_NoStartedAtCorrection verifies that
+// the future-StartedAt correction is scoped — when elapsed is non-negative,
+// AwaitReviewStep must NOT propose a NewStartedAt (which would otherwise
+// cause the caller to overwrite a perfectly valid bead timestamp on every
+// cycle, losing the original "wait window started at X" record).
+func TestAwaitReviewStep_NormalElapsed_NoStartedAtCorrection(t *testing.T) {
+	started := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	now := started.Add(2 * time.Minute) // 2m in, still inside MinWait=5m
+	provider := &awaitFakeProvider{}
+	res, err := AwaitReviewStep(provider, 42, baseInput(now,
+		func(in *AwaitReviewStepInput) { in.StartedAt = started }))
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if !res.NewStartedAt.IsZero() {
+		t.Errorf("NewStartedAt = %v, want zero (only set on first call or future-StartedAt correction)",
+			res.NewStartedAt)
+	}
 }
 
 func TestAwaitReviewStep_TriggerPostError_IsReturned(t *testing.T) {
