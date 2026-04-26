@@ -19,6 +19,16 @@ type awaitFakeProvider struct {
 	hasReview    bool
 	hasReviewErr error
 
+	// reviewBySHA[sha] = whether HasReviewFromOnSHA returns true for that SHA.
+	// Populated by tests exercising the G37 SHA-scoped gate. Lookups against
+	// SHAs not in the map return false (matches "reviewer hasn't reviewed
+	// this commit yet"). hasReviewBySHAErr lets a single test exercise the
+	// provider-error path independently of the unscoped HasReviewFrom.
+	reviewBySHA       map[string]bool
+	reviewBySHAErr    error
+	headSHA           string
+	headSHAErr        error
+
 	threads    []ReviewThread
 	threadsErr error
 
@@ -40,6 +50,22 @@ func (p *awaitFakeProvider) HasReviewFrom(prNumber int, user string) (bool, erro
 
 func (p *awaitFakeProvider) ListReviewAuthors(prNumber int) ([]string, error) {
 	return p.reviewAuthors, p.reviewAuthorsErr
+}
+
+func (p *awaitFakeProvider) HasReviewFromOnSHA(prNumber int, user, sha string) (bool, error) {
+	if p.reviewBySHAErr != nil {
+		return false, p.reviewBySHAErr
+	}
+	if p.reviewBySHA == nil {
+		// Tests that don't configure reviewBySHA fall back to the unscoped
+		// flag — keeps existing tests valid before they opt into G37.
+		return p.hasReview, p.hasReviewErr
+	}
+	return p.reviewBySHA[sha], nil
+}
+
+func (p *awaitFakeProvider) CurrentHeadSHA(prNumber int) (string, error) {
+	return p.headSHA, p.headSHAErr
 }
 
 func (p *awaitFakeProvider) UnresolvedThreads(prNumber int) ([]ReviewThread, error) {
@@ -388,6 +414,96 @@ func TestAwaitReviewStep_TimeoutElapsed_AuthorListErrorFallsBackToBareMessage(t 
 	}
 	if strings.Contains(res.Message, "PR has reviews from") || strings.Contains(res.Message, "no reviews submitted") {
 		t.Errorf("expected bare timeout message when ListReviewAuthors errors, got %q", res.Message)
+	}
+}
+
+// G37: when HeadSHA is supplied, the gate must require a review whose
+// commit OID equals HeadSHA. A reviewer who reviewed a PRIOR head (and
+// nothing since) must NOT satisfy the gate, so a force-pushed fix commit
+// can't slip through on the strength of an obsolete review.
+//
+// Test SHAs are 40-character hex strings to honor the
+// GhPrHasReviewFromOnSHA full-OID contract — iter-1 review on PR #45
+// flagged shorter synthetic forms as a contract mismatch that could
+// mask a real integration regression.
+func TestAwaitReviewStep_HeadSHAScoped_ReviewOnStaleSHA_DoesNotCount(t *testing.T) {
+	const (
+		oldHeadSHA = "1111111111111111111111111111111111111111"
+		newHeadSHA = "2222222222222222222222222222222222222222"
+	)
+	started := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	now := started.Add(10 * time.Minute) // past min-wait, within timeout
+	provider := &awaitFakeProvider{
+		// Unscoped HasReviewFrom would return true (legacy semantics)…
+		hasReview: true,
+		// …but the reviewer has only reviewed the OLD head, not the new one.
+		reviewBySHA: map[string]bool{
+			oldHeadSHA: true,
+		},
+	}
+	res, err := AwaitReviewStep(provider, 42, baseInput(now,
+		func(in *AwaitReviewStepInput) {
+			in.StartedAt = started
+			in.HeadSHA = newHeadSHA
+		}))
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Status != AwaitStatusWaiting {
+		t.Errorf("status = %v, want AwaitStatusWaiting (review on stale SHA must not satisfy gate)", res.Status)
+	}
+}
+
+// G37 happy path: reviewer reviewed the current HEAD → Ready, and the
+// message includes the short SHA so operators see which commit was reviewed.
+func TestAwaitReviewStep_HeadSHAScoped_ReviewOnCurrentSHA_Ready(t *testing.T) {
+	const headSHA = "abcdef1234567890abcdef1234567890abcdef12"
+	started := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	now := started.Add(10 * time.Minute)
+	provider := &awaitFakeProvider{
+		reviewBySHA: map[string]bool{
+			headSHA: true,
+		},
+	}
+	res, err := AwaitReviewStep(provider, 42, baseInput(now,
+		func(in *AwaitReviewStepInput) {
+			in.StartedAt = started
+			in.HeadSHA = headSHA
+		}))
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Status != AwaitStatusReady {
+		t.Errorf("status = %v, want AwaitStatusReady", res.Status)
+	}
+	// Short-SHA in the Ready message helps operators correlate the
+	// patrol log with the actual commit that satisfied the gate.
+	if !strings.Contains(res.Message, "abcdef12") {
+		t.Errorf("expected short SHA in Ready message, got %q", res.Message)
+	}
+}
+
+// Empty HeadSHA must keep legacy semantics: any review counts. Guards the
+// fallback path used by Bitbucket and any provider that can't surface a
+// HEAD SHA.
+func TestAwaitReviewStep_NoHeadSHA_FallsBackToUnscopedHasReviewFrom(t *testing.T) {
+	started := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	now := started.Add(10 * time.Minute)
+	provider := &awaitFakeProvider{
+		hasReview: true,
+		// reviewBySHA explicitly nil — this lookup must NOT fire.
+		reviewBySHA: nil,
+	}
+	res, err := AwaitReviewStep(provider, 42, baseInput(now,
+		func(in *AwaitReviewStepInput) {
+			in.StartedAt = started
+			// HeadSHA left unset → fallback path
+		}))
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Status != AwaitStatusReady {
+		t.Errorf("status = %v, want AwaitStatusReady (legacy semantics)", res.Status)
 	}
 }
 

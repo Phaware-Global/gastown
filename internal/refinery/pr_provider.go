@@ -103,6 +103,21 @@ type PRProvider interface {
 	// don't yet support this should return ErrUnsupported; callers
 	// tolerate that by emitting the bare timeout message.
 	ListReviewAuthors(prNumber int) ([]string, error)
+
+	// HasReviewFromOnSHA is the SHA-scoped variant: returns true iff the
+	// user reviewed the PR at the given commit SHA. After a force-push,
+	// the unscoped HasReviewFrom would false-positive on a stale prior
+	// review; this variant constrains the match to the commit currently
+	// up for merge. Pass sha="" to fall back to HasReviewFrom semantics
+	// (any commit).
+	HasReviewFromOnSHA(prNumber int, user, sha string) (bool, error)
+
+	// CurrentHeadSHA returns the current head commit OID of the PR's
+	// source branch as known to the upstream provider — authoritative
+	// over local refs or MR-bead state (which can drift after a
+	// force-push). Used by callers that need an authoritative SHA to
+	// pair with HasReviewFromOnSHA.
+	CurrentHeadSHA(prNumber int) (string, error)
 }
 
 // gitReviewThreadsToProvider converts the git package representation to the

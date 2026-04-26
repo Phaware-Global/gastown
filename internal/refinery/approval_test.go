@@ -50,6 +50,10 @@ func (f *fakePRProvider) ChecksRollup(int) (string, bool, error)        { panic(
 func (f *fakePRProvider) PostComment(int, string) error                 { panic("unused") }
 func (f *fakePRProvider) HasReviewFrom(int, string) (bool, error)       { panic("unused") }
 func (f *fakePRProvider) ListReviewAuthors(int) ([]string, error)        { panic("unused") }
+func (f *fakePRProvider) HasReviewFromOnSHA(int, string, string) (bool, error) {
+	panic("unused")
+}
+func (f *fakePRProvider) CurrentHeadSHA(int) (string, error) { panic("unused") }
 
 func intPtr(i int) *int { return &i }
 

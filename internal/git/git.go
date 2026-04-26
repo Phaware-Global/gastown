@@ -1448,10 +1448,19 @@ func (g *Git) GhPrChecksRollup(prNumber int) (state string, done bool, err error
 }
 
 // ghReview is the minimal review payload we need for approval calculations.
+//
+// Commit.OID identifies the head commit of the PR at the moment the review
+// was submitted. The await-review SHA-scoped check (G37) uses it to refuse
+// counting reviews against stale HEADs after a force-push, so a "review
+// against the current HEAD" gate can't be satisfied by an old review for a
+// commit the polecat has since rewritten.
 type ghReview struct {
 	Author struct {
 		Login string `json:"login"`
 	} `json:"author"`
+	Commit struct {
+		OID string `json:"oid"`
+	} `json:"commit"`
 	State       string `json:"state"`
 	SubmittedAt string `json:"submittedAt"`
 }
@@ -1591,6 +1600,81 @@ func (g *Git) GhPrReviewAuthors(prNumber int) ([]string, error) {
 		out[i] = seen[k]
 	}
 	return out, nil
+}
+
+// GhPrHasReviewFromOnSHA returns true iff the given user has submitted at
+// least one review on the PR whose recorded commit OID equals sha. The check
+// is case-insensitive on login and case-insensitive on the SHA (gh and the
+// GitHub API both return lowercase hex, but we normalize defensively).
+//
+// This is the G37 SHA-scoped variant of GhPrHasReviewFrom: after a polecat
+// force-pushes a fix commit, the bare HasReviewFrom would return true on
+// the strength of the reviewer's PRIOR review against the old HEAD, even
+// though the new HEAD has not been seen by the reviewer at all. SHA-scoping
+// prevents that false-positive — the gate only advances when the configured
+// reviewer has actually reviewed the commit currently up for merge.
+//
+// sha MUST be the full 40-character commit OID. Short SHAs are
+// intentionally NOT supported via prefix-match: two commits can share a
+// prefix and a HasPrefix gate would silently advance on the wrong one.
+// The only in-tree caller pairs this with GhPrHeadSHA, which always
+// returns the full OID from gh; supplying a short SHA is a programming
+// error and yields false (no match) deliberately rather than approximating.
+//
+// Pass sha="" to fall back to GhPrHasReviewFrom (any commit).
+func (g *Git) GhPrHasReviewFromOnSHA(prNumber int, user, sha string) (bool, error) {
+	if user == "" {
+		return false, fmt.Errorf("GhPrHasReviewFromOnSHA: user must be non-empty")
+	}
+	if sha == "" {
+		return g.GhPrHasReviewFrom(prNumber, user)
+	}
+	reviews, err := g.ghFetchReviews(prNumber)
+	if err != nil {
+		return false, err
+	}
+	wantSHA := strings.ToLower(sha)
+	for _, r := range reviews {
+		if !strings.EqualFold(r.Author.Login, user) {
+			continue
+		}
+		if strings.ToLower(r.Commit.OID) == wantSHA {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// GhPrHeadSHA returns the current head commit OID of the PR's source branch
+// as known to GitHub. Used by the await-review SHA-scoped gate to drive
+// HasReviewFromOnSHA without trusting potentially stale local refs or
+// MR-bead state (G36 — bead's commit_sha can drift after a force-push).
+func (g *Git) GhPrHeadSHA(prNumber int) (string, error) {
+	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber),
+		"--json", "headRefOid")
+	cmd.Dir = g.workDir
+	// Capture stdout and stderr separately so an auth/permission failure
+	// from gh surfaces in the wrapped error rather than being lost behind
+	// a bare exit-status. await-review escalations on PR #N going dark
+	// because of a token expiry is the kind of misconfiguration this
+	// helper has to make legible (iter-1 review on PR #45).
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("gh pr view (headRefOid) failed: %s: %w",
+			strings.TrimSpace(stderr.String()), err)
+	}
+	var resp struct {
+		HeadRefOid string `json:"headRefOid"`
+	}
+	if jerr := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &resp); jerr != nil {
+		return "", fmt.Errorf("parsing headRefOid: %w", jerr)
+	}
+	if resp.HeadRefOid == "" {
+		return "", fmt.Errorf("gh pr view returned empty headRefOid for PR #%d", prNumber)
+	}
+	return resp.HeadRefOid, nil
 }
 
 // GhPrApprovedBy returns true iff the given user has submitted an APPROVED

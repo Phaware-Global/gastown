@@ -98,3 +98,11 @@ func (p *bitbucketPRProvider) HasReviewFrom(prNumber int, user string) (bool, er
 func (p *bitbucketPRProvider) ListReviewAuthors(prNumber int) ([]string, error) {
 	return nil, ErrUnsupported
 }
+
+func (p *bitbucketPRProvider) HasReviewFromOnSHA(prNumber int, user, sha string) (bool, error) {
+	return false, ErrUnsupported
+}
+
+func (p *bitbucketPRProvider) CurrentHeadSHA(prNumber int) (string, error) {
+	return "", ErrUnsupported
+}

@@ -580,12 +580,26 @@ func awaitReviewInner(args []string) error {
 		return err
 	}
 
+	// G37: pass the PR's CURRENT head SHA into AwaitReviewStep so the
+	// reviewer-engagement check is SHA-scoped. Querying the provider
+	// (rather than reading the MR bead's commit_sha field) sidesteps G36
+	// — bead state can drift after a force-push, while the upstream PR
+	// always has the live HEAD. Tolerate ErrUnsupported (Bitbucket) by
+	// passing an empty SHA, which retains the legacy "any review counts"
+	// semantics; refinery-pr-workflow.md §G37 marks SHA-scoping as
+	// load-bearing only for the GitHub path that augment runs on.
+	headSHA, sErr := provider.CurrentHeadSHA(prNumber)
+	if sErr != nil && !errors.Is(sErr, refinery.ErrUnsupported) {
+		return fmt.Errorf("await-review: fetching current head SHA: %w", sErr)
+	}
+
 	res, err := refinery.AwaitReviewStep(provider, prNumber, refinery.AwaitReviewStepInput{
 		Reviewer:       reviewer,
 		TriggerComment: triggerComment,
 		MinWait:        wait,
 		Timeout:        timeout,
 		StartedAt:      startedAt,
+		HeadSHA:        headSHA,
 	})
 	if err != nil {
 		return err
