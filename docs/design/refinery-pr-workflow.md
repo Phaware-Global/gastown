@@ -2594,11 +2594,18 @@ The exact same break applies to the other comment-only bots that run on the rig 
 **Distinct from prior G-entries:** Different from G37 (SHA-scoping — *which commit* counts). G38 is about *which login* counts.
 
 **Fix directions:**
-1. **Case-insensitive prefix match in `HasReviewFrom`**: try exact match first, fall back to "any review whose `author.login` starts with `reviewer`" (case-insensitive). Handles `augment`→`augmentcode`, `gemini`→`gemini-code-assist`, etc., without per-bot aliases.
-2. Document the prefix-match contract on the `pr_reviewer` config field so operators know they can use a short name OR an exact login. Exact login still works (it satisfies the exact-match branch first).
-3. Regression test: review by `augmentcode`, lookup by `augment` returns true. Review by `evil-augment-fake`, lookup by `augment` returns false (prefix match is anchored at the start, not substring).
 
-**Priority:** Blocking. Without this, the await-review gate ALWAYS times out for augment/copilot/gemini-style reviewers, regardless of how often they actually run.
+The two concerns — *which phrase wakes the bot* (the trigger) and *which login proves the bot reviewed* (the lookup) — already live in distinct config fields and stay distinct:
+
+- `pr_trigger_comment` (default `"augment review"`) is the literal phrase posted on the PR. Differs per bot (`augment review` vs `/gemini review` vs the eventual Copilot trigger).
+- `pr_reviewer` is the actual GitHub login of the reviewer (`augmentcode`, `gemini-code-assist`, `Copilot`). Operators MUST set this to the bot's exact login or no review will satisfy the gate.
+
+1. **Diagnostic improvement at timeout**: when `AwaitStatusTimedOut` fires, augment the error message with the unique review-authors observed on the PR — e.g., `"'augment' never engaged after 33m24s — escalate (PR has reviews from: augmentcode, gemini-code-assist, phaware-artie). If your reviewer-bot's login differs from the trigger keyword, update merge_queue.pr_reviewer."` This makes the misconfiguration self-evident in the patrol log on first occurrence.
+2. **Update the doc comment on `PRReviewer` config field** in `internal/config/types.go` to spell out: this is the *GitHub login* of the reviewer, not the trigger keyword. Replace the misleading `e.g., "augment"` example with `e.g., "augmentcode"`.
+3. **Operator-side**: update each rig's `settings/config.json` `merge_queue.pr_reviewer` to the actual GitHub login. (Not part of this code change — operator config lives outside the source repo.)
+4. Regression test: timeout error message includes review-author list when reviews exist; falls back to a clear "no reviews submitted yet" tail when the PR has none.
+
+**Priority:** Blocking. Without the diagnostic, the misconfiguration manifests only as a 30-minute timeout-then-escalate cycle every cycle, with no log line pointing the operator at the cause.
 
 ### G39 — Escalation `email:human` action silently skipped when `contacts.human_email` unset
 
