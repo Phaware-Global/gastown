@@ -2360,9 +2360,8 @@ Each entry below uses the same structure as G1-G25: Observed / Root cause / Dist
 **Fix directions:**
 1. Add a `gt done`-side guard: don't emit `POLECAT_DONE` for a rig the polecat isn't actually a member of (validate against the rig's polecat list before firing).
 2. Trace and identify the non-`gt done` source of the spurious signals; add a unique-prefix or HMAC-style envelope so the witness can reject signals not emitted by `gt done` itself.
-3. Witness-side: defer escalation on first DEFERRED signal until at least one `gt peek` confirms the polecat is actually inactive (cheap; eliminates the premature-escalation class).
 
-**Priority:** Medium. Today the noise is harmless because `gt done`'s eventual COMPLETED supersedes; but if a real DEFERRED happens during a noise burst, the recovery escalation is lost (G28).
+**Priority:** Medium. Today the noise is harmless because `gt done`'s eventual COMPLETED supersedes; but if a real DEFERRED happens during a noise burst, the witness's escalation is lost (G28).
 
 ### G27 — `POLECAT_DONE` signals leak across rig boundaries
 
@@ -2395,8 +2394,7 @@ The behavior is plausibly aggravated when an operator is attached to the session
 **Fix directions:**
 1. Don't launch `gt nudge-poller` for Claude Code agents (the hook-drain is sufficient). Trace launcher in `gt crew start` / `internal/dog/manager.go`.
 2. Set `ReadyPromptPrefix` on the claude-sonnet preset so the busy-detection works there too.
-3. `gt nudge` queueing: buffer to a queue rather than push directly into the recipient's REPL when the recipient is mid-Bash (requires the recipient to expose a busy-marker — Claude Code's hook system already provides one).
-4. Formula-side: mark long-running steps as "interruption-resistant" (re-attempt after agent recovers) so a dropped step is automatically re-driven on the next patrol cycle.
+3. `gt nudge` queueing: buffer to a queue rather than push directly into the recipient's REPL when the recipient is mid-Bash (Claude Code's hook system already exposes a busy-marker).
 
 **Priority:** High. Drops escalation mail (G26 + this) and silently aborts test runs. Currently masked when operators stay detached, but the system shouldn't depend on that.
 
@@ -2415,7 +2413,6 @@ So the binary-side intent is "log only"; the witness's role prompt is still wire
 **Fix directions:**
 1. Update `witness.md.tmpl` to match the gt-1qlg intent: log routine completions, don't escalate on DEFERRED unless additional evidence (e.g., the agent bead's `mr_failed` flag is true) is present.
 2. Add a regression test that inspects the role prompt template for the specific guidance and fails if drift recurs.
-3. Establish a convention: any `internal/cmd/done.go` comment of the form "// Self-managed completion: witness no longer processes …" must reference the role-prompt section it superseded, so future grep-based audits can find divergence.
 
 **Priority:** Medium. The drift is the source of every premature escalation (compounds with G26).
 
@@ -2461,7 +2458,7 @@ Push is the durability mechanism. But it pollutes origin with orphan branches wh
 
 **Priority:** Architectural — file as design-spec follow-up under the same epic the merge-workflow hardening lives in.
 
-### G32 — PR body composition uses double-quoted bash strings (literal `\n` escapes) and lacks a Problem/Solution/Test-plan template
+### G32 — PR bodies reference internal beads, not Problem/Solution prose readable by external reviewers
 
 **Observed:** PR #40's body was the literal string:
 
@@ -2469,20 +2466,25 @@ Push is the durability mechanism. But it pollutes origin with orphan branches wh
 Closes gt-mwy.2\n\nAdds `gt telegraph start` cobra subcommand that constructs and runs the full Telegraph pipeline for a single town, mirroring the integration test wiring with production substitutions.\n\nWorker: furiosa
 ```
 
-Two compounding issues:
-- `\n\n` rendered as escape characters because the body was passed inside a bash double-quoted string (no expansion of `\n`)
-- Even if the escapes had rendered, the body has no Problem/Solution/Test-plan structure and no `Closes #<issue>` reference (the `gt-mwy.2` token isn't a GitHub issue ref so auto-close doesn't fire)
+Three compounding issues, in increasing severity:
 
-**Root cause:** Whoever composes the PR body (polecat in `gt done` create-PR step, or refinery in `gt refinery pr create`) builds a single-line bash string instead of using a heredoc or `--body-file`. Plus there's no template — the body is whatever ad-hoc prose the LLM emits.
+1. **Escape-rendering bug.** `\n\n` rendered as literal characters because the body was passed inside a bash double-quoted string (no expansion of `\n`). Mechanical, easy to fix.
+2. **No Problem/Solution/Test-plan structure.** Even when the escapes are fixed, the body is one undifferentiated paragraph. Reviewers can't tell what problem the PR solves, what alternatives were considered, or how to verify the fix.
+3. **References to internal bead IDs that are opaque to external reviewers** (the *real* design gap). `gt-mwy.2`, `Worker: furiosa`, references to "Phase 1 / Phase 2", citations of `hq-wisp-*` escalation IDs — none of these are visible outside the gastown town. A reviewer browsing the PR on GitHub (especially upstream `gastownhall/gastown` or a fork's contributors who don't run a town) sees opaque tokens with no way to look them up. Even worse, `Closes gt-mwy.2` looks like a GitHub auto-close ref but isn't — so the bead never gets closed, and the reviewer has no idea what `gt-mwy.2` is.
 
-**Distinct from prior G-entries:** Pure content/UX — doesn't gate any behavior, just makes PRs unreviewable as written.
+The PR description must stand alone for **anyone with PR access**, not just town members. Internal artifacts (bead IDs, polecat names, escalation IDs, patrol-cycle references) belong in commit trailers or town-side audit logs, not in the PR description that GitHub Reviewers see.
+
+**Root cause:** Whoever composes the PR body (polecat in `gt done` create-PR step, or refinery in `gt refinery pr create`) builds a one-line bash string from internal context the polecat had to hand. There's no template that asks the composer to translate from internal-token-language to externally-readable prose, and no validator that flags bead-IDs / polecat-names / wisp-IDs in the body.
+
+**Distinct from prior G-entries:** Pure content/UX — doesn't gate any merge behavior, but renders PRs unreviewable for any audience beyond the producing town.
 
 **Fix directions:**
-1. The polecat's task formula writes a structured body to a tempfile during `gt done` and stashes the path on the MR bead.
+1. The polecat's task formula writes a structured body to a tempfile during `gt done`, with mandatory sections **Problem** / **Solution** / **Test plan** (and optionally **Risks** / **Out of scope**). The polecat fills the sections from the bead's description and the work it actually did. Stash the path on the MR bead so the refinery can pass it through.
 2. `gt refinery pr create` defaults to `--body-file` when the bead has a body-path field.
-3. Add `gt refinery pr create --template <name>` with a built-in Problem/Solution/Test-plan skeleton (default `default-pr-body.md`).
+3. Add `gt refinery pr create --template <name>` with a built-in Problem/Solution/Test-plan skeleton (default `default-pr-body.md`). The template uses placeholder text that the body composer is required to fill in — empty placeholders fail PR creation, forcing the composer to write real prose rather than dropping the template through verbatim.
+4. **Validator: reject internal-token leakage.** Before opening the PR, scan the body for patterns matching `\b(gt-|hq-|gts-)[a-z0-9.]+`, polecat names against the rig's polecat roster, and `\b(Worker|Polecat|Patrol|Wisp):\s*\S+` headers. Any match → fail PR creation with a message listing the offending tokens. Forces the composer to explain the work in domain language an external reviewer can read.
 
-**Priority:** Medium. Reviewers (human and bot) need to read the body to gauge scope; today they can't.
+**Priority:** Medium. Reviewers (human and bot) need to read the body to gauge scope; today external reviewers see only town-internal jargon. The validator (#4) is the load-bearing piece — without it, templates can be filled with the same opaque tokens.
 
 ### G33 — Refinery does review-fix work inline instead of dispatching a polecat (PR.5 bypass)
 
@@ -2607,9 +2609,8 @@ Out-of-band human notification didn't fire. Mayor + witness were notified via ga
 **Root cause:** `gt escalate`'s action runner skips email/SMS when contacts aren't configured, with a warning line that's easy to miss. For a CRITICAL escalation this is an unsafe default.
 
 **Fix directions:**
-1. For severities `CRITICAL` and `HIGH`, fail the escalation hard if any configured action skipped — surfaces misconfiguration before a real incident.
-2. Add a "fallback notification" path: write a flag file to `~/gt/escalations/<severity>/<id>.flag` so external monitors can detect unhandled escalations.
-3. `gt doctor` check: assert `settings/escalation.json` has at least one human-reachable contact for any severity ≥ HIGH the rig supports.
+1. For severities `CRITICAL` and `HIGH`, fail the escalation hard if any configured action is skipped — surfaces misconfiguration before a real incident.
+2. `gt doctor` check: assert `settings/escalation.json` has at least one human-reachable contact for any severity ≥ HIGH the rig supports.
 
 **Priority:** Medium-high. Bites quietly today; bites loudly the day a real incident depends on it.
 
@@ -2659,11 +2660,10 @@ This commit landed directly on `origin/main`. Mayor reverted at `bab51596` (also
 **Distinct from prior G-entries:** G19/G20 closed the *polecat-LLM-conscious-decision* class of "push to main bypassing MR/refinery". G41 is the *automation-side* equivalent — a hook that pushes to main without any LLM involvement at all.
 
 **Fix directions:**
-1. Pre-commit guard in the gt-pvx safety net: if `HEAD` is `main`, `master`, `develop`, or any branch whose upstream is one of those, **do NOT auto-commit**. Instead stash the working changes to `~/gt/state/lost-work/<rig>/<polecat>/<timestamp>.diff` (recoverable, never visible on origin).
-2. Polecat formula change (G43): enforce branch creation as imperatively as G25 enforces await-review — a `gt polecat checkout-branch <bead-id>` subcommand that's the first step, fails closed if not on a polecat branch by step 2.
-3. Mayor-side `gt town doctor` check: scan origin for direct commits to main authored by a polecat identity and warn.
+1. Pre-commit guard in the gt-pvx safety net: if `HEAD` is `main`, `master`, `develop`, or any branch whose upstream is one of those, **refuse to auto-commit at all** — exit with a clear message that the polecat is on a protected branch, no work will be saved automatically. Combined with G43 (the polecat must be on a polecat-namespaced branch before any edit work begins), this means the safety net only ever acts on legitimate polecat branches.
+2. Polecat formula change (covered by G43): enforce branch creation as imperatively as G25 enforces await-review — `gt polecat checkout-branch <bead-id>` as the first step, fails closed if not on a polecat branch by step 2.
 
-**Priority:** Blocking. Auto-pushes to main bypass everything. The system already detected this (witness filed `gt-i71` P0 bug + `hq-wisp-cvefz` CRITICAL escalation) — the response infrastructure works; the prevention layer is missing.
+**Priority:** Blocking. Auto-pushes to main bypass everything. The system already detected this (witness filed `gt-i71` P0 bug + `hq-wisp-cvefz` CRITICAL escalation) — the prevention layer is missing.
 
 ### G42 — Tap-guard's intentional block on `git checkout -b` has no `gt`-side recovery path
 
@@ -2704,10 +2704,9 @@ Secondary observation surfaced by this incident: **witness's diagnosis of subsys
    - Read the bead, derive `polecat/<name>/<id>` branch name.
    - If the worktree is already on that branch → exit 0 (idempotent).
    - If the worktree is on `main` / `master` / `develop` → invoke the underlying `git checkout -b <name>` (tap-guard exempts the gt path).
-   - If the worktree is on a *different* polecat branch → exit 4 (operational error; polecat session was reused incorrectly; mayor must intervene).
-2. Polecat formula prose collapses to one command line at the top. The LLM can't skip it; if it does, every subsequent `git` operation works on `main` and gets caught by the tap-guard, producing the recovery deadlock G42 documents (which now has a fix: re-run step 1).
+   - If the worktree is on a *different* polecat branch → exit non-zero with a structured "stale-state" error; mayor adjudicates.
+2. Polecat formula prose collapses to one command line at the top. The LLM can't skip it; if it does, every subsequent `git` operation works on `main` and gets caught by the tap-guard.
 3. Audit: `mol-polecat-work*.formula.toml` for any `git checkout` invocations and replace with `gt polecat checkout-branch <bead-id>`.
-4. Mayor-side: when escalations like `hq-wisp-ra6s6` arrive, the standard remediation becomes "tell the polecat to run `gt polecat checkout-branch <bead-id>`" instead of mayor manually doing the checkout in the worktree.
 
 **Priority:** Blocking. Combined with G41 + G42, this is the polecat-side dual of G19/G21/G25 — the LLM-optimization-resistant first step that anchors all the subsequent guarantees.
 
@@ -2724,11 +2723,10 @@ That diagnosis was **wrong**. Mayor's response (after consulting `internal/cmd/t
 **Distinct from prior G-entries:** Different layer than G29 (witness role-prompt drift). G29 is "what the witness is told to do is wrong"; G44 is "the witness's diagnostic protocol is missing a step that would prevent miscalled escalations".
 
 **Fix directions:**
-1. Update `witness.md.tmpl` to add a "diagnosis playbook" section: when escalating subsystem misbehavior, the escalation must include a one-line citation of the relevant test file's expected behavior (or "no test found" if absent — itself a lower-severity gap).
-2. Add a `gt witness explain <subsystem>` (or similar) that returns the relevant test files + their stated invariants for a named subsystem (`tap-guard`, `await-review`, `mr-bead-creation`, etc.). Witness invokes it before composing escalations on those subsystems.
-3. Mayor-side defense: when receiving witness escalations of the form "subsystem X misconfigured", reflexively grep the test file before acting. (Mayor in this incident did this on her own — encode it as a routine check.)
+1. Update `witness.md.tmpl` to require: when an escalation's subject claims a subsystem is *misconfigured / misbehaving / broken*, the escalation body must include a one-line citation of the relevant test file's expected behavior (or "no test found for this subsystem" if absent — itself a lower-severity gap to surface separately). Without that line, the escalation is rejected at the witness's `gt mail send` step.
+2. Add `gt witness explain <subsystem>` (or similar) that returns the relevant test files + their stated invariants for a named subsystem (`tap-guard`, `await-review`, `mr-bead-creation`, etc.). Gives the witness deterministic data to cite in step 1, rather than asking the LLM to guess where ground truth lives.
 
-**Priority:** Medium. Today's misdiagnosis was caught by mayor's care; a less attentive coordinator could have shipped the wrong "fix" (loosening the tap-guard, which would re-open G19).
+**Priority:** Medium. Today's misdiagnosis was caught by mayor's care; the prevention layer is making the witness cite tests before declaring something misconfigured.
 
 ### F1 — Optional bypass of human approval before merging (FEATURE REQUEST, not a gap)
 
