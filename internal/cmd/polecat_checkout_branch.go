@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // G42 + G43: the polecat formula needs an imperative branch-creation step
@@ -81,13 +82,40 @@ func init() {
 // hq-wisp-ku6, gt-1qlg. Rejects shell-injection-friendly characters
 // (whitespace, `/`, `;`, backticks, `$()`) so a mistyped or hostile
 // arg can't leak into the constructed branch name.
+//
+// Pattern alone is necessary but not sufficient — additional git
+// ref-rule checks (no `..`, no leading/trailing `.`, no `.lock`
+// suffix) live in validateBeadID, since they don't compose cleanly
+// with a single regex.
 var beadIDPattern = regexp.MustCompile(`^[a-z]{2,3}(-[a-z0-9.]+)+$`)
+
+// validateBeadID applies the bead-id pattern AND the git-ref-rule
+// fragments that don't fit a single regex (git refuses refs containing
+// `..`, components ending in `.`, and `.lock` suffixes). Iter-2 review
+// flagged that a strict pattern match still admitted refs git would
+// reject — surface those as clear bead-id errors here rather than at
+// the `git checkout -b` step where the failure mode is opaque.
+func validateBeadID(id string) error {
+	if !beadIDPattern.MatchString(id) {
+		return fmt.Errorf("bead-id %q is not a valid bd issue id "+
+			"(expected lowercase prefix-suffix, e.g. gt-mwy.5)", id)
+	}
+	if strings.Contains(id, "..") {
+		return fmt.Errorf("bead-id %q contains \"..\" which git refs reject", id)
+	}
+	if strings.HasSuffix(id, ".") {
+		return fmt.Errorf("bead-id %q ends with \".\" which git refs reject", id)
+	}
+	if strings.HasSuffix(id, ".lock") {
+		return fmt.Errorf("bead-id %q ends with \".lock\" which git treats as a lock file", id)
+	}
+	return nil
+}
 
 func runPolecatCheckoutBranch(cmd *cobra.Command, args []string) error {
 	beadID := strings.TrimSpace(args[0])
-	if !beadIDPattern.MatchString(beadID) {
-		return fmt.Errorf("checkout-branch: bead-id %q is not a valid bd issue id "+
-			"(expected lowercase prefix-suffix, e.g. gt-mwy.5)", beadID)
+	if err := validateBeadID(beadID); err != nil {
+		return fmt.Errorf("checkout-branch: %w", err)
 	}
 
 	polecatName := strings.TrimSpace(polecatCheckoutBranchPolecat)
@@ -135,24 +163,51 @@ func runPolecatCheckoutBranch(cmd *cobra.Command, args []string) error {
 	// new git package surface.
 	fetchCmd := exec.Command("git", "fetch", "origin", "main")
 	fetchCmd.Dir = cwd
+	util.SetDetachedProcessGroup(fetchCmd)
 	if out, fErr := fetchCmd.CombinedOutput(); fErr != nil {
 		return fmt.Errorf("checkout-branch: git fetch origin main failed: %s: %w",
 			strings.TrimSpace(string(out)), fErr)
 	}
 
-	// `git checkout -b <new> origin/main` creates the branch from the
-	// freshly-fetched main tip and checks it out. exec.Command runs as a
-	// subprocess of `gt`, NOT a Bash tool call from the LLM, so the
-	// tap-guard PreToolUse hook does not fire here — the imperative step
-	// proceeds where the raw form would block. That's the whole point.
-	checkoutCmd := exec.Command("git", "checkout", "-b", targetBranch, "origin/main")
+	// Branch already exists locally? Plain `checkout -b` would fail; the
+	// polecat may have created the branch on a prior session and ended up
+	// back on main without it being deleted (post-merge cleanup, gt-pvx
+	// guard re-runs, etc.). Iter-2 review flagged this as a re-entry
+	// case. Detect with `rev-parse --verify`; if present, do a plain
+	// checkout rather than -b. Either way the polecat ends up on the
+	// target branch.
+	branchExists := false
+	probe := exec.Command("git", "rev-parse", "--verify", "--quiet", "refs/heads/"+targetBranch)
+	probe.Dir = cwd
+	util.SetDetachedProcessGroup(probe)
+	if err := probe.Run(); err == nil {
+		branchExists = true
+	}
+
+	// exec.Command runs as a subprocess of `gt`, NOT a Bash tool call
+	// from the LLM, so the tap-guard PreToolUse hook does not fire here —
+	// the imperative step proceeds where the raw form would block. That's
+	// the whole point.
+	var checkoutCmd *exec.Cmd
+	if branchExists {
+		checkoutCmd = exec.Command("git", "checkout", targetBranch)
+	} else {
+		checkoutCmd = exec.Command("git", "checkout", "-b", targetBranch, "origin/main")
+	}
 	checkoutCmd.Dir = cwd
+	util.SetDetachedProcessGroup(checkoutCmd)
 	if out, cErr := checkoutCmd.CombinedOutput(); cErr != nil {
-		return fmt.Errorf("checkout-branch: git checkout -b %s origin/main failed: %s: %w",
+		return fmt.Errorf("checkout-branch: git checkout %s failed: %s: %w",
 			targetBranch, strings.TrimSpace(string(out)), cErr)
 	}
 
-	fmt.Fprintf(os.Stdout, "%s Created and checked out %s (from origin/main)\n",
-		style.Bold.Render("✓"), targetBranch)
+	switch {
+	case branchExists:
+		fmt.Fprintf(os.Stdout, "%s Resumed existing %s (no rebase, no -b)\n",
+			style.Bold.Render("✓"), targetBranch)
+	default:
+		fmt.Fprintf(os.Stdout, "%s Created and checked out %s (from origin/main)\n",
+			style.Bold.Render("✓"), targetBranch)
+	}
 	return nil
 }

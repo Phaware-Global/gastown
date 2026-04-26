@@ -1,6 +1,9 @@
 package cmd
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestBeadIDPattern pins the regex used by `gt polecat checkout-branch` to
 // validate the bead-id arg before constructing the branch name. The pattern
@@ -44,6 +47,57 @@ func TestBeadIDPattern(t *testing.T) {
 			got := beadIDPattern.MatchString(c.in)
 			if got != c.want {
 				t.Errorf("beadIDPattern.MatchString(%q) = %v; want %v", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// validateBeadID layers git-ref-rule checks on top of the regex. The
+// pattern alone admits some refs git would reject — `..` in a ref name,
+// trailing `.`, and `.lock` suffixes — so callers seeing a stricter regex
+// might still hit confusing failures at the `git checkout -b` step. This
+// test pins the additional rejections so future regex relaxation can't
+// silently regress git-ref safety. Iter-2 review on PR #49 flagged the
+// gap.
+func TestValidateBeadID_RejectsGitRefRuleViolations(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string // expected substring of the error message
+	}{
+		{"double dot rejected", "gt-mwy..5", `".."`},
+		{"trailing dot rejected", "gt-mwy.", `"."`},
+		{"lock suffix rejected", "gt-mwy.lock", `".lock"`},
+		{"chained .lock rejected", "gt-wisp-ku6.lock", `".lock"`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateBeadID(c.in)
+			if err == nil {
+				t.Fatalf("validateBeadID(%q) = nil; want error mentioning %q", c.in, c.want)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("validateBeadID(%q) error %q; want to contain %q", c.in, err.Error(), c.want)
+			}
+		})
+	}
+}
+
+// Positive cases for validateBeadID: anything that passes the regex AND
+// the additional ref-rule checks must validate. Mostly redundant with
+// TestBeadIDPattern's positives, but proves the layered checks compose
+// correctly — they don't accidentally reject legitimate IDs.
+func TestValidateBeadID_AcceptsLegitimateIDs(t *testing.T) {
+	for _, id := range []string{
+		"gt-mwy",
+		"gt-mwy.5",
+		"gt-mwy.5.2",
+		"hq-wisp-ku6",
+		"gt-i71",
+	} {
+		t.Run(id, func(t *testing.T) {
+			if err := validateBeadID(id); err != nil {
+				t.Errorf("validateBeadID(%q) = %v; want nil", id, err)
 			}
 		})
 	}
