@@ -72,14 +72,23 @@ func (t *Translator) Translate(body []byte) (*telegraph.NormalizedEvent, error) 
 		return translateIssueCreated(&p)
 	case "jira:issue_updated":
 		return translateIssueUpdated(&p)
-	case "jira:comment_added":
+	// Comment events: Jira's webhook API drops the `jira:` prefix and uses the
+	// verb `created` (instead of `added`) for creation events. We accept both
+	// the prefixed legacy form and the bare form Jira actually sends in
+	// production. Discovered during dogfooding when bare comment events
+	// triggered ErrUnknownEventType.
+	case "jira:comment_added", "comment_created":
 		return translateCommentAdded(&p)
-	case "jira:comment_updated":
+	case "jira:comment_updated", "comment_updated":
 		return translateCommentUpdated(&p)
 	default:
 		t.logger.Info("telegraph: unknown jira event type",
 			"event_type", p.WebhookEvent,
 			"event_id", bestEventID(&p),
+			"issue_key", issueKey(&p),
+			"has_comment", p.Comment != nil,
+			"has_issue", p.Issue != nil,
+			"has_changelog", p.Changelog != nil,
 		)
 		return nil, telegraph.ErrUnknownEventType
 	}
@@ -178,10 +187,10 @@ func translateIssueUpdated(p *payload) (*telegraph.NormalizedEvent, error) {
 
 func translateCommentAdded(p *payload) (*telegraph.NormalizedEvent, error) {
 	if p.Issue == nil {
-		return nil, fmt.Errorf("jira:comment_added: missing issue field")
+		return nil, fmt.Errorf("comment_added: missing issue field")
 	}
 	if p.Comment == nil {
-		return nil, fmt.Errorf("jira:comment_added: missing comment field")
+		return nil, fmt.Errorf("comment_added: missing comment field")
 	}
 	ts := parseJiraTime(p.Comment.Created)
 	if ts.IsZero() {
@@ -202,10 +211,10 @@ func translateCommentAdded(p *payload) (*telegraph.NormalizedEvent, error) {
 
 func translateCommentUpdated(p *payload) (*telegraph.NormalizedEvent, error) {
 	if p.Issue == nil {
-		return nil, fmt.Errorf("jira:comment_updated: missing issue field")
+		return nil, fmt.Errorf("comment_updated: missing issue field")
 	}
 	if p.Comment == nil {
-		return nil, fmt.Errorf("jira:comment_updated: missing comment field")
+		return nil, fmt.Errorf("comment_updated: missing comment field")
 	}
 	actor := userName(p.Comment.UpdateAuthor)
 	if actor == "" {
@@ -338,4 +347,11 @@ func bestEventID(p *payload) string {
 		return p.Comment.ID
 	}
 	return issueEventID(p)
+}
+
+func issueKey(p *payload) string {
+	if p.Issue == nil {
+		return ""
+	}
+	return p.Issue.Key
 }

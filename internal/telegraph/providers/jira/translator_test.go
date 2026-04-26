@@ -264,6 +264,40 @@ func TestTranslate_CommentAdded(t *testing.T) {
 	}
 }
 
+// Jira's actual webhook API drops the `jira:` prefix and uses the verb
+// `created` rather than `added` for comment-creation events. The bare form
+// is what production Jira instances send.
+func TestTranslate_CommentCreated_BareForm(t *testing.T) {
+	t.Parallel()
+	tr := newTranslator()
+	body := mustMarshal(t, map[string]any{
+		"timestamp":    1713571200000,
+		"webhookEvent": "comment_created",
+		"user":         baseUser("carol"),
+		"issue":        baseIssue("PROJ-42"),
+		"comment": map[string]any{
+			"id":      "777",
+			"author":  baseUser("carol"),
+			"body":    "Production-style comment.",
+			"created": "2024-04-19T16:00:00.000+0000",
+			"updated": "2024-04-19T16:00:00.000+0000",
+		},
+	})
+	evt, err := tr.Translate(body)
+	if err != nil {
+		t.Fatalf("Translate() error = %v", err)
+	}
+	if evt.EventType != "comment.added" {
+		t.Errorf("EventType = %q, want comment.added (bare comment_created routes to same handler as jira:comment_added)", evt.EventType)
+	}
+	if evt.EventID != "777" {
+		t.Errorf("EventID = %q, want 777", evt.EventID)
+	}
+	if evt.Subject != "PROJ-42" {
+		t.Errorf("Subject = %q, want PROJ-42", evt.Subject)
+	}
+}
+
 func TestTranslate_CommentAdded_MissingComment(t *testing.T) {
 	t.Parallel()
 	tr := newTranslator()
@@ -307,6 +341,36 @@ func TestTranslate_CommentUpdated(t *testing.T) {
 	}
 	if evt.Text != "Updated comment text." {
 		t.Errorf("Text = %q, want updated body", evt.Text)
+	}
+}
+
+// Bare-name comment_updated (no `jira:` prefix) — same Jira API quirk as
+// comment_created. Routes to the comment-updated handler.
+func TestTranslate_CommentUpdated_BareForm(t *testing.T) {
+	t.Parallel()
+	tr := newTranslator()
+	body := mustMarshal(t, map[string]any{
+		"timestamp":    1713571200000,
+		"webhookEvent": "comment_updated",
+		"issue":        baseIssue("PROJ-43"),
+		"comment": map[string]any{
+			"id":           "888",
+			"author":       baseUser("dave"),
+			"updateAuthor": baseUser("eve"),
+			"body":         "Edited comment.",
+			"created":      "2024-04-19T15:00:00.000+0000",
+			"updated":      "2024-04-19T16:30:00.000+0000",
+		},
+	})
+	evt, err := tr.Translate(body)
+	if err != nil {
+		t.Fatalf("Translate() error = %v", err)
+	}
+	if evt.EventType != "comment.updated" {
+		t.Errorf("EventType = %q, want comment.updated", evt.EventType)
+	}
+	if evt.Actor != "eve" {
+		t.Errorf("Actor = %q, want eve (updateAuthor)", evt.Actor)
 	}
 }
 
