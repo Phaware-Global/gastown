@@ -11,7 +11,7 @@ import (
 // newTestTelegraphManager creates a TelegraphServerManager with test hooks wired.
 func newTestTelegraphManager(t *testing.T, cfg *TelegraphServerConfig) *TelegraphServerManager {
 	t.Helper()
-	return NewTelegraphServerManager("/tmp/test-town", "gt", cfg, func(format string, v ...interface{}) {
+	return NewTelegraphServerManager(t.TempDir(), "gt", cfg, func(format string, v ...interface{}) {
 		t.Logf("[telegraph] "+format, v...)
 	})
 }

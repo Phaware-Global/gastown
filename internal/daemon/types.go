@@ -147,6 +147,8 @@ type TelegraphServerConfig struct {
 	LogFile string `json:"log_file,omitempty"`
 
 	// AutoRestart controls whether to restart Telegraph after a crash.
+	// Defaults to false (conservative): daemon starts Telegraph once but
+	// does not auto-restart on crash. Set to true for full supervision.
 	AutoRestart bool `json:"auto_restart,omitempty"`
 
 	// RestartDelay is the initial delay before restarting after a crash (default 5s).

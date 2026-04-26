@@ -293,7 +293,7 @@ func (m *TelegraphServerManager) startLocked() error {
 	}()
 
 	m.process = cmd.Process
-	m.startedAt = time.Now()
+	m.startedAt = m.now()
 
 	if _, err := writePIDFile(m.pidFile(), cmd.Process.Pid); err != nil {
 		m.logger("Telegraph: warning: failed to write PID file: %v", err)
@@ -346,6 +346,10 @@ func (m *TelegraphServerManager) stopLocked() {
 	case <-time.After(10 * time.Second):
 		m.logger("Telegraph: subprocess did not stop gracefully, forcing termination")
 		_ = sendKillSignal(process)
+		// Give SIGKILL a moment to take effect before clearing state.
+		// If the process is still alive after SIGKILL (extremely rare), we accept
+		// the stale state; the next EnsureRunning cycle will re-detect via isRunning.
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	_ = os.Remove(m.pidFile())
