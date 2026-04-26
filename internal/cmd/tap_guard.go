@@ -68,6 +68,18 @@ var prWorkflowCommandPatterns = []*regexp.Regexp{
 // consistently with G19b's existing coverage.
 var prMergeCommandPattern = regexp.MustCompile("(?m)(^\\s*|[|&;(`]\\s*|-[a-z]*c\\s+['\"]\\s*)gh\\s+pr\\s+merge\\b")
 
+// prMergeViaApiPattern matches the GitHub merge endpoint reached through
+// `gh api repos/<owner>/<repo>/pulls/<n>/merge`. Closes the G40 sibling of
+// the G21 bypass: a refinery LLM that hits the tap-guard on `gh pr merge`
+// can fall back to the same operation via the raw API. Any HTTP method
+// other than GET on the …/pulls/<n>/merge endpoint mutates merge state
+// (PUT performs the merge; DELETE on the same path doesn't exist on
+// GitHub's API but we err on the side of blocking anything beyond GET) —
+// the regex matches the path itself and lets the command-level checker
+// classify the remainder.
+var prMergeViaApiPattern = regexp.MustCompile(
+	"(?m)(^\\s*|[|&;(`]\\s*|-[a-z]*c\\s+['\"]\\s*)gh\\s+api\\b[^\\n]*pulls/[0-9]+/merge\\b")
+
 // isPRWorkflowCommand returns true when cmd looks like any of the PR-
 // creation / feature-branch commands this guard blocks.
 func isPRWorkflowCommand(cmd string) bool {
@@ -83,13 +95,23 @@ func isPRWorkflowCommand(cmd string) bool {
 }
 
 // isPRMergeCommand returns true when cmd looks like a direct `gh pr merge`
-// invocation. Separate from isPRWorkflowCommand because merge and create
-// have different refinery-context policies (G21 fix).
+// invocation OR an `gh api …pulls/<n>/merge` API-level merge (G40). Both
+// shapes hit the same GitHub merge endpoint and bypass the
+// `gt refinery pr merge` approval gate. Separate from isPRWorkflowCommand
+// because merge and create have different refinery-context policies
+// (G21 fix).
+//
+// The merge-via-API match is intentionally path-only — a `gh api` GET on
+// …/pulls/<n>/merge to inspect mergeability would also match. We accept
+// that false-positive: if a refinery LLM needs that probe, it should be
+// reading mergeability through `gh pr view --json mergeable` (which the
+// guard does not block); the raw-API form is rare enough in practice that
+// blocking is the safer default.
 func isPRMergeCommand(cmd string) bool {
 	if cmd == "" {
 		return false
 	}
-	return prMergeCommandPattern.MatchString(cmd)
+	return prMergeCommandPattern.MatchString(cmd) || prMergeViaApiPattern.MatchString(cmd)
 }
 
 var tapGuardCmd = &cobra.Command{
@@ -214,9 +236,10 @@ func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(os.Stderr, "║  GitHub merge API.                                              ║")
 		fmt.Fprintln(os.Stderr, "║                                                                  ║")
 		fmt.Fprintln(os.Stderr, "║  Instead of:  gh pr merge <n> --squash                          ║")
+		fmt.Fprintln(os.Stderr, "║  Or:          gh api repos/.../pulls/<n>/merge -X PUT (G40)     ║")
 		fmt.Fprintln(os.Stderr, "║  Do this:     gt refinery pr merge <n>                          ║")
 		fmt.Fprintln(os.Stderr, "║                                                                  ║")
-		fmt.Fprintln(os.Stderr, "║  See: docs/design/refinery-pr-workflow.md §G21                  ║")
+		fmt.Fprintln(os.Stderr, "║  See: docs/design/refinery-pr-workflow.md §G21, §G40            ║")
 		fmt.Fprintln(os.Stderr, "╚══════════════════════════════════════════════════════════════════╝")
 		fmt.Fprintln(os.Stderr, "")
 		return NewSilentExit(2) // Exit 2 = BLOCK in Claude Code hooks

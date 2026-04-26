@@ -170,6 +170,23 @@ func TestIsPRMergeCommand(t *testing.T) {
 			"GH PR MERGE 23",
 			false,
 		},
+
+		// G40: the API-level sibling of `gh pr merge`. Same endpoint, different
+		// CLI surface. Must be blocked too or the LLM can fall back to the API
+		// form when the gh-pr-merge guard fires.
+		{"gh api PUT pulls/N/merge", "gh api repos/Phaware-Global/gastown/pulls/41/merge -X PUT", true},
+		{"gh api with field flags", "gh api repos/owner/repo/pulls/123/merge -X PUT -f merge_method=squash", true},
+		{"gh api merge after pipe", "echo go | gh api repos/o/r/pulls/9/merge -X PUT", true},
+		{"gh api merge via sh -c", "sh -c 'gh api repos/o/r/pulls/9/merge -X PUT'", true},
+		{"gh api merge via bash -lc", "bash -lc 'gh api repos/o/r/pulls/9/merge -X PUT'", true},
+		// We accept the false-positive of catching a GET probe on the same path —
+		// the LLM should use `gh pr view --json mergeable` for that information.
+		{"gh api default-method (GET) on merge path", "gh api repos/o/r/pulls/9/merge", true},
+		// Negatives for the API form: the path must include /pulls/<n>/merge.
+		{"gh api pulls list (no merge segment)", "gh api repos/o/r/pulls", false},
+		{"gh api PR comments (different endpoint)", "gh api repos/o/r/pulls/9/comments", false},
+		{"gh api unrelated", "gh api repos/o/r", false},
+		{"gh api pulls/N/files (read endpoint)", "gh api repos/o/r/pulls/9/files", false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
