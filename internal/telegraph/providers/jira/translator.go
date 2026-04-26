@@ -72,14 +72,22 @@ func (t *Translator) Translate(body []byte) (*telegraph.NormalizedEvent, error) 
 		return translateIssueCreated(&p)
 	case "jira:issue_updated":
 		return translateIssueUpdated(&p)
-	case "jira:comment_added":
+	// Comment events: Jira's webhook API drops the `jira:` prefix and uses the
+	// verb `created`/`updated` (not `added`/`updated`) for comment events. We
+	// accept both the prefixed legacy form and the bare form Jira actually
+	// sends in production. Discovered when a real comment_created webhook from
+	// phaware.atlassian.net hit ErrUnknownEventType during dogfood.
+	case "jira:comment_added", "comment_created":
 		return translateCommentAdded(&p)
-	case "jira:comment_updated":
+	case "jira:comment_updated", "comment_updated":
 		return translateCommentUpdated(&p)
 	default:
 		t.logger.Info("telegraph: unknown jira event type",
 			"event_type", p.WebhookEvent,
 			"event_id", bestEventID(&p),
+			"issue_key", issueKey(&p),
+			"has_comment", p.Comment != nil,
+			"has_issue", p.Issue != nil,
 		)
 		return nil, telegraph.ErrUnknownEventType
 	}
@@ -338,4 +346,11 @@ func bestEventID(p *payload) string {
 		return p.Comment.ID
 	}
 	return issueEventID(p)
+}
+
+func issueKey(p *payload) string {
+	if p.Issue == nil {
+		return ""
+	}
+	return p.Issue.Key
 }
