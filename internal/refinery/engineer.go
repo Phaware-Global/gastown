@@ -718,15 +718,16 @@ func (e *Engineer) Config() *MergeQueueConfig {
 
 // ProcessResult contains the result of processing a merge request.
 type ProcessResult struct {
-	Success        bool
-	MergeCommit    string
-	Error          string
-	Conflict       bool
-	TestsFailed    bool
-	SlotTimeout    bool // Merge slot contention timeout (distinct from build/test failure)
-	BranchNotFound bool // Source branch no longer exists (e.g. cleaned up after cherry-pick)
-	NoMerge        bool // Source issue has no_merge flag — intentionally blocked, not a failure
-	NeedsApproval  bool // PR exists but lacks required approving review (merge_strategy=pr)
+	Success               bool
+	MergeCommit           string
+	Error                 string
+	Conflict              bool
+	TestsFailed           bool
+	SlotTimeout           bool // Merge slot contention timeout (distinct from build/test failure)
+	BranchNotFound        bool // Source branch no longer exists (e.g. cleaned up after cherry-pick)
+	NoMerge               bool // Source issue has no_merge flag — intentionally blocked, not a failure
+	NeedsApproval         bool // PR exists but lacks required approving review (merge_strategy=pr)
+	NeedsReviewResolution bool // PR has unresolved reviewer threads — review-fix loop must run before merge
 }
 
 // doMerge performs the actual git merge operation.
@@ -1011,7 +1012,26 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
 	}
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Found PR #%d for branch %s\n", prNumber, branch)
 
-	// Step PR.2: Check approval policy.
+	// Step PR.2a: Check unresolved review threads (G24 fix).
+	// Unresolved threads block merge regardless of approval state —
+	// reviewer guidance must reach main, not slip through under time
+	// pressure. Shared with the CLI path via VerifyReviewThreadsResolved.
+	if err := VerifyReviewThreadsResolved(e.prProvider, prNumber, e.output); err != nil {
+		var needsResolution *NeedsReviewResolutionError
+		if errors.As(err, &needsResolution) {
+			return ProcessResult{
+				Success:               false,
+				NeedsReviewResolution: true, // stays in queue; review-fix loop must run
+				Error:                 err.Error(),
+			}
+		}
+		return ProcessResult{
+			Success: false,
+			Error:   err.Error(),
+		}
+	}
+
+	// Step PR.2b: Check approval policy.
 	//
 	// Policy is driven by MergeQueueConfig (PRApprover + GetPRRequiredApprovals).
 	// Shared with the `gt refinery pr merge` CLI subcommand via VerifyPRApproval
@@ -1533,6 +1553,22 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 	// No polecat or mayor notification needed; the MR is simply dequeued.
 	if result.NoMerge {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: no_merge flag set on source issue, dequeued\n", mr.ID)
+		return
+	}
+
+	// NeedsReviewResolution: reviewer-posted threads on the PR are unresolved.
+	// Not a failure — the MR stays in queue and the formula's review-fix loop
+	// (PR.5) is responsible for slinging a polecat to address the threads.
+	// Distinct from NeedsApproval: the blocker is reviewer guidance, not an
+	// approving review. Logged separately so observability accurately
+	// reflects which gate is blocking the merge.
+	if result.NeedsReviewResolution {
+		// Log the detailed blocking-thread list (file:line, author, priority,
+		// preview) from VerifyReviewThreadsResolved alongside the retry
+		// message. Without `result.Error`, patrol output only shows that
+		// SOMETHING is blocking — not WHAT — and the polecat dispatcher
+		// has no actionable context.
+		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: PR has unresolved review threads, will retry next poll (review-fix loop will run)\n%s\n", mr.ID, result.Error)
 		return
 	}
 
