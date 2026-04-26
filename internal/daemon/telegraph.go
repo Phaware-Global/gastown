@@ -137,8 +137,13 @@ func (m *TelegraphServerManager) EnsureRunning() {
 	defer m.mu.Unlock()
 
 	if _, running := m.isRunning(); running {
+		// If discovered via PID file (process not started by this manager instance),
+		// mark startedAt so AutoRestart=false correctly blocks restarts after a crash.
+		if m.startedAt.IsZero() {
+			m.startedAt = m.now()
+		}
 		// Reset backoff if the process has been running stably beyond the restart window.
-		if !m.startedAt.IsZero() && m.now().Sub(m.startedAt) > m.restartWindow() {
+		if m.now().Sub(m.startedAt) > m.restartWindow() {
 			m.currentDelay = 0
 			m.escalated = false
 		}
@@ -219,7 +224,9 @@ func (m *TelegraphServerManager) advanceBackoff() {
 		maxD = 5 * time.Minute
 	}
 	if m.currentDelay <= 0 {
+		// First restart: use base delay without doubling so RestartDelay is the actual first wait.
 		m.currentDelay = base
+		return
 	}
 	m.currentDelay *= 2
 	if m.currentDelay > maxD {

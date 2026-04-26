@@ -156,12 +156,14 @@ func TestTelegraph_RestartCapPreventsStorm(t *testing.T) {
 	}
 	m.sleepFn = func(d time.Duration) {}
 
-	// Fix time so all restarts fall within the same window.
+	// Advance time by 30s per iteration so each call clears the backoff delay,
+	// while staying within the 10m restart window to exercise the cap.
 	now := time.Now()
 	m.nowFn = func() time.Time { return now }
 
 	for i := 0; i < 10; i++ {
 		m.EnsureRunning()
+		now = now.Add(30 * time.Second)
 	}
 
 	got := atomic.LoadInt32(&starts)
