@@ -826,21 +826,46 @@ git push origin temp:refs/heads/<polecat-branch> --force-with-lease
 
 **Step PR.2: Create the PR (idempotent — returns existing PR if one is open)**
 
-Build the PR body using bead metadata, then:
+Compose the PR body as a Markdown file with mandatory **Problem / Solution / Test plan** sections (optionally **Risks** / **Out of scope**). The body must stand alone for any reviewer with PR access — including reviewers outside this town. Internal artifacts (bead IDs, polecat names, escalation IDs, patrol-cycle references) belong in commit trailers, NOT in the PR body.
+
+⚠️ **External-reviewer litmus test (G32 — run this against the body BEFORE invoking `gt refinery pr create`):**
+
+> Imagine a reviewer opening this PR cold — no access to your beads, your patrol logs, your mayor escalations, no membership in this town. They have only the PR body and the diff. Read what you wrote and ask:
+>
+> 1. **Problem clarity** — does the body name a concrete user-visible (or operator-visible) problem? "Refinery edits files inline instead of dispatching a polecat" is good. "Closes G33" alone is not. Internal symptoms ("commit_sha drift", "iteration cap hit") need a sentence of plain-English context, OR they need to come out.
+> 2. **Solution concreteness** — does the body name what changes in concrete terms (file paths, function names, behavior diffs)? Internal vocabulary (*polecat*, *refinery*, *tap-guard*, *await-review*) is fine ONLY when the surrounding text gives a non-member enough context to follow.
+> 3. **No bare task IDs.** Strip `gt-*`, `hq-*`, `wisp-*`, `gts-*` from the body unless each one is paired with what it actually was. External reviewers can't open these beads.
+> 4. **No bare G-numbers.** "G33", "G12b", "the G19 hole" must either be replaced with the underlying problem statement or include it inline. A `Closes-Bead: G33` trailer at the bottom is fine if the body above explains the problem; it is NOT acceptable as the entire summary.
+> 5. **No bare cross-PR refs.** "Stacks on PR #50" is opaque; summarize what that PR did in one sentence if the cross-ref is essential to understanding this change.
+> 6. **Test plan tells a stranger what to verify.** Concrete commands (`go test ./internal/refinery/`) beat names of invariants only town members would recognize.
+>
+> **Litmus test:** could a reviewer with access to only the PR (body + diff) leave a useful review? If they'd have to ask "what's a polecat?" or "what's gt-mwy.5?" before they can engage with the code, the body needs more context. Rewrite, don't post.
+
+Internal references move to commit trailers, where GitHub's UI strips them by default but `git log` keeps them queryable for town-internal audit:
+
+```
+Closes-Bead: gt-mwy.5
+Polecat: furiosa
+Patrol-Cycle: hq-wisp-ku6
+```
+
+After running the litmus test against the body and revising as needed, build and create:
 
 ```bash
 cat > /tmp/pr-body-<issue-id>.md <<'EOF'
-## Summary
+## Problem
 
-Automated merge from polecat branch.
+<plain-English description of the user/operator-visible problem this PR addresses. Concrete enough that a reviewer outside this town understands what's broken or missing.>
 
-- **Issue**: <issue-id>
-- **Polecat**: <polecat-name>
-- **Branch**: <polecat-branch>
-- **Tests**: Passed (verified by refinery)
+## Solution
 
----
-*Created by Gas Town Refinery*
+<concrete description of what changes — file paths, function names, behavior diffs. Internal vocabulary used only when the surrounding text gives non-members enough context.>
+
+## Test plan
+
+- [ ] <concrete verification step a stranger could run>
+- [ ] <e.g. `go test ./internal/<package>/`>
+
 EOF
 
 PR_JSON=$({{ cmd }} refinery pr create \

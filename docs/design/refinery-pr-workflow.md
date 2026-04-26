@@ -2490,12 +2490,34 @@ The PR description must stand alone for **anyone with PR access**, not just town
 **Distinct from prior G-entries:** Pure content/UX — doesn't gate any merge behavior, but renders PRs unreviewable for any audience beyond the producing town.
 
 **Fix directions:**
-1. The polecat's task formula writes a structured body to a tempfile during `gt done`, with mandatory sections **Problem** / **Solution** / **Test plan** (and optionally **Risks** / **Out of scope**). The polecat fills the sections from the bead's description and the work it actually did. Stash the path on the MR bead so the refinery can pass it through.
-2. `gt refinery pr create` defaults to `--body-file` when the bead has a body-path field.
-3. Add `gt refinery pr create --template <name>` with a built-in Problem/Solution/Test-plan skeleton (default `default-pr-body.md`). The template uses placeholder text that the body composer is required to fill in — empty placeholders fail PR creation, forcing the composer to write real prose rather than dropping the template through verbatim.
-4. **Validator: reject internal-token leakage.** Before opening the PR, scan the body for patterns matching `\b(gt-|hq-|gts-)[a-z0-9.]+`, polecat names against the rig's polecat roster, and `\b(Worker|Polecat|Patrol|Wisp):\s*\S+` headers. Any match → fail PR creation with a message listing the offending tokens. Forces the composer to explain the work in domain language an external reviewer can read.
 
-**Priority:** Medium. Reviewers (human and bot) need to read the body to gauge scope; today external reviewers see only town-internal jargon. The validator (#4) is the load-bearing piece — without it, templates can be filled with the same opaque tokens.
+The intervention is prose, not validation. A regex check catches *some* tokens but can't catch every form of internal-context leakage, and it'll give writers a false sense of done-ness once they've defeated the regex. Instead, encode the criterion the body should meet, and run it as a **self-check** the body composer (LLM polecat, LLM refinery, or human operator) performs before posting.
+
+1. The polecat's `gt done` create-PR path and the refinery's `gt refinery pr create` path both compose the body from a structured template with mandatory **Problem / Solution / Test plan** sections (optionally **Risks** / **Out of scope**). The composer fills the sections from the bead's description and the work actually done; empty placeholders are rejected so the template can't be dropped through verbatim.
+
+2. **Before posting, the composer runs the external-reviewer litmus test against the body** (this prose lives in the formula step that composes the body, so the LLM author sees it in-context rather than having to remember it from this design doc):
+
+   > Imagine a reviewer opening this PR cold — no access to your beads, your patrol logs, your mayor escalations, no membership in this town. They have only the PR body and the diff. Read what you wrote and ask:
+   >
+   > 1. **Problem clarity** — does the body name a concrete user-visible (or operator-visible) problem? "Refinery edits files inline instead of dispatching a polecat" is good. "G33" alone is not. Internal symptoms ("commit_sha drift", "iteration cap hit") need a sentence of plain-English context, OR they need to come out.
+   >
+   > 2. **Solution concreteness** — does the body name what changes in concrete terms (file paths, function names, behavior diffs)? Internal vocabulary like *polecat*, *refinery*, *tap-guard*, *await-review*, *mol patrol* is fine ONLY when the surrounding text gives a non-member enough context to follow.
+   >
+   > 3. **No bare task IDs.** Strip `gt-*`, `hq-*`, `wisp-*`, `gts-*` IDs unless each one is paired with what it actually was — "the iter-2 dogfood escalation that flagged ..." rather than "hq-wisp-rhxf6". External reviewers can't open these beads.
+   >
+   > 4. **No bare G-numbers.** "G33", "G12b", "the G19 hole" should either be replaced with the underlying problem statement or include it inline ("G33 — refinery doing review-fix work inline instead of dispatching a polecat"). A `Closes G33` trailer at the bottom is fine if the body above explains the problem; it is NOT acceptable as the entire summary.
+   >
+   > 5. **No bare cross-PR refs.** "Stacks on PR #50" is opaque; "stacks on PR #50, which detects when a polecat force-pushes a fix and resets the await-review timer" is OK. If the cross-ref is essential to understanding this change, summarize what the other PR did in one sentence.
+   >
+   > 6. **Test plan tells a stranger what to verify.** `go test ./internal/refinery/` is concrete. "All G12b/G13/G14 invariants pinned" is not, unless the invariants are explained or the test names are listed.
+   >
+   > **Litmus test:** could a reviewer with access to only the PR (body + diff) leave a useful review? If they'd have to ask "what's a polecat?", "what's gt-mwy.5?", or "what does G33 mean?" before they can engage with the code, the body needs more context. Rewrite, don't post.
+
+3. `gt refinery pr create` defaults to `--body-file` when the bead has a body-path field, so the composer is editing a file (which the litmus test can be performed against) rather than building a string in argv.
+
+4. Internal artifacts (bead IDs, polecat names, escalation IDs, patrol-cycle references) belong in commit trailers (`Closes-Bead: gt-mwy.2`, `Polecat: furiosa`) or town-side audit logs, not in the PR description body that external reviewers see. Trailers are stripped by GitHub's UI by default but remain queryable in `git log` for town-internal audit.
+
+**Priority:** Medium. Reviewers (human and bot) need to read the body to gauge scope; without the litmus test, the structured-template fix from #1 alone fills with the same opaque tokens that motivated this entry. Pairing the template with the self-check prose is the load-bearing combination.
 
 ### G33 — Refinery does review-fix work inline instead of dispatching a polecat (PR.5 bypass)
 
