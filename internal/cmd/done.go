@@ -288,7 +288,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			fmt.Printf("\n%s Uncommitted changes detected — auto-saving to prevent work loss\n", style.Bold.Render("⚠"))
 			fmt.Printf("  Files: %s\n\n", workStatus.String())
 
-			// Stage all changes (git add -A), then unstage overlay files (gt-p35).
+			// Stage all changes (git add -A), then unstage overlay/runtime files (gt-p35)
+			// and any deletions of tracked files (gt-pvx safety: never commit deletions).
 			if addErr := g.Add("-A"); addErr != nil {
 				style.PrintWarning("auto-commit: git add failed: %v — uncommitted work may be at risk", addErr)
 			} else {
@@ -300,6 +301,18 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					if strings.Contains(string(claudeData), templates.PolecatLifecycleMarker) {
 						_ = g.ResetFiles("CLAUDE.md")
 					}
+				}
+				// Unstage runtime/ephemeral directories (mirrors checkpoint_dog exclusions).
+				for _, dir := range []string{".beads/", ".claude/", ".runtime/", "__pycache__/"} {
+					_ = g.ResetFiles(dir)
+				}
+				// Unstage deletions of tracked files. A safety-net auto-commit should
+				// preserve work (additions + modifications), never destroy it (deletions).
+				// This prevents the bug where a polecat's working tree has a missing
+				// tracked file (e.g. .beads/metadata.json) and the auto-save commits
+				// the deletion, breaking infrastructure for subsequent sessions.
+				if stagedDeletions, delErr := g.StagedDeletions(); delErr == nil && len(stagedDeletions) > 0 {
+					_ = g.ResetFiles(stagedDeletions...)
 				}
 				// Build a descriptive commit message
 				autoMsg := "fix: auto-save uncommitted implementation work (gt-pvx safety net)"

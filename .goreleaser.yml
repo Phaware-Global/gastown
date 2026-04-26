@@ -113,17 +113,17 @@ builds:
 
 archives:
   - id: gt-archive
-    format: tar.gz
+    formats: [tar.gz]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     format_overrides:
       - goos: windows
-        format: zip
+        formats: [zip]
     files:
       - LICENSE
       - README.md
 
 checksum:
-  name_template: "checksums.txt"
+  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
   algorithm: sha256
 
 snapshot:
@@ -150,10 +150,11 @@ changelog:
 
 release:
   github:
-    owner: steveyegge
+    owner: gastownhall
     name: gastown
   draft: false
   prerelease: auto
+  replace_existing_artifacts: true
   name_template: "v{{.Version}}"
   header: |
     ## Gas Town v{{.Version}}

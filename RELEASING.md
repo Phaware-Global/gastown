@@ -5,7 +5,8 @@
 | Channel | Mechanism | Automatic? |
 |---------|-----------|------------|
 | **GitHub Release** | GoReleaser via Actions on tag push | Yes |
-| **Homebrew** (homebrew-core) | Homebrew bot detects new release | Yes (24-48h delay) |
+| **Homebrew tap** (`gastownhall/gastown`) | Actions writes an asset-based formula after archives upload | Yes |
+| **Homebrew core** (if listed) | Homebrew bot detects new release | Yes (24-48h delay) |
 | **npm** (`@gastown/gt`) | Actions workflow, OIDC trusted publishing | Yes (when org is set up) |
 
 ## How to Release
@@ -54,12 +55,13 @@ The `release.yml` workflow triggers automatically:
 1. **Verify tag matches Version constant** — runs `make check-version-tag` and
    aborts the release if the pushed tag (`vX.Y.Z`) doesn't match the `Version`
    constant in `internal/cmd/version.go`. Prevents recurrence of
-   [#3459](https://github.com/steveyegge/gastown/issues/3459) where v0.13.0
+   [#3459](https://github.com/gastownhall/gastown/issues/3459) where v0.13.0
    shipped reporting 0.12.1.
 2. **goreleaser** job builds binaries for all platforms and creates the GitHub Release
-3. **publish-npm** job publishes to npm (best-effort, `continue-on-error: true`)
+3. **update-homebrew-formula** job writes an asset-based formula to `gastownhall/homebrew-gastown` when tap credentials are configured
+4. **publish-npm** job publishes to npm (best-effort, `continue-on-error: true`)
 
-Homebrew is NOT updated by the workflow. See below.
+Manual dispatch is only for rerunning a release from a `v*` tag. Publishing jobs are guarded to skip branch refs.
 
 ### Running the tag/version check locally
 
@@ -72,9 +74,25 @@ It only fails when HEAD is tagged `vX.Y.Z` and the `Version` constant doesn't
 match. Run it after `scripts/bump-version.sh` and before pushing the tag if you
 want to catch drift before CI does.
 
-## Homebrew (homebrew-core)
+## Homebrew tap (`gastownhall/gastown`)
 
-Gastown is in **homebrew-core** (not a custom tap). The formula lives at:
+The release workflow automatically overwrites `Formula/gastown.rb` in the `gastownhall/homebrew-gastown` repo on every tag push. It prefers the GitHub App credentials `HOMEBREW_TAP_APP_ID` and `HOMEBREW_TAP_APP_PRIVATE_KEY`, and falls back to `HOMEBREW_TAP_TOKEN` if present.
+
+The tap formula installs prebuilt release assets:
+
+```bash
+brew install gastownhall/gastown/gastown
+```
+
+The normal user-facing Homebrew path remains homebrew-core:
+
+```bash
+brew install gastown
+```
+
+## Homebrew core
+
+If Gastown is listed in **homebrew-core**, the formula lives at:
 `https://github.com/Homebrew/homebrew-core/blob/HEAD/Formula/g/gastown.rb`
 
 ### How it updates
@@ -112,7 +130,7 @@ The `@gastown` npm organization must exist and be linked to this repo:
 
 1. Go to https://www.npmjs.com and create (or join) the `@gastown` org
 2. Under org settings, enable "Require 2FA" and configure trusted publishing
-3. Link `steveyegge/gastown` as a trusted publisher for `@gastown/gt`
+3. Link `gastownhall/gastown` as a trusted publisher for `@gastown/gt`
 
 ### Current status (as of 2026-03-06)
 
@@ -138,6 +156,7 @@ gt version
 | `internal/cmd/version.go` | `Version` constant |
 | `npm-package/package.json` | `version` field |
 | `flake.nix` | version + vendorHash (only if `nix` is in PATH) |
+| `gastownhall/homebrew-gastown/Formula/gastown.rb` | asset URLs + `sha256` updated by release workflow |
 
 ## Troubleshooting
 
@@ -151,11 +170,12 @@ The workflow rejects `go.mod` files with `replace` directives (they break
 The `@gastown` npm org doesn't exist or you don't have publish access.
 See the npm section above. The release still succeeds — npm is best-effort.
 
-### Homebrew shows old version after 6+ hours
+### Homebrew shows old version after a release
 
-Gastown is on BrewTestBot's autobump list (checked every ~3h). Check
-https://github.com/Homebrew/homebrew-core/pulls?q=gastown for stuck PRs.
-Manual `brew bump-formula-pr` is blocked for autobump formulae.
+For the `gastownhall/gastown` tap, check the `update-homebrew-formula` job and
+the tap's `Formula/gastown.rb` commit history. For homebrew-core, check
+https://github.com/Homebrew/homebrew-core/pulls?q=gastown for stuck BrewTestBot
+PRs. Manual `brew bump-formula-pr` is blocked for autobump formulae.
 
 ### `make install` shows `-dirty` suffix
 

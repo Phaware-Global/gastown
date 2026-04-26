@@ -620,6 +620,20 @@ func (g *Git) ResetFiles(paths ...string) error {
 	return err
 }
 
+// StagedDeletions returns the list of tracked files staged for deletion.
+// Used by auto-save to unstage deletions — safety nets should preserve work, not destroy it.
+func (g *Git) StagedDeletions() ([]string, error) {
+	out, err := g.run("diff", "--cached", "--name-only", "--diff-filter=D")
+	if err != nil {
+		return nil, err
+	}
+	trimmed := strings.TrimSpace(out)
+	if trimmed == "" {
+		return nil, nil
+	}
+	return strings.Split(trimmed, "\n"), nil
+}
+
 // ShowFile returns the contents of a file at a given ref (e.g., "origin/main:CLAUDE.md").
 // Returns empty string and no error if the file does not exist at that ref.
 func (g *Git) ShowFile(ref, path string) (string, error) {

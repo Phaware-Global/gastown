@@ -106,6 +106,87 @@ esac
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
+func setupCanonicalBranchManagerTest(t *testing.T) (*Manager, string) {
+	t.Helper()
+	installMockBd(t)
+
+	root := t.TempDir()
+	mayorRig := filepath.Join(root, "mayor", "rig")
+	if err := os.MkdirAll(mayorRig, 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig: %v", err)
+	}
+
+	rigBeads := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(rigBeads, 0755); err != nil {
+		t.Fatalf("mkdir rig .beads: %v", err)
+	}
+	mayorBeads := filepath.Join(mayorRig, ".beads")
+	if err := os.MkdirAll(mayorBeads, 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig/.beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigBeads, "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatalf("write rig redirect: %v", err)
+	}
+
+	cmd := exec.Command("git", "init", "-b", "main")
+	cmd.Dir = mayorRig
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+
+	readmePath := filepath.Join(mayorRig, "README.md")
+	if err := os.WriteFile(readmePath, []byte("# Test\n"), 0644); err != nil {
+		t.Fatalf("write README.md: %v", err)
+	}
+	mayorGit := git.NewGit(mayorRig)
+	if err := mayorGit.Add("README.md"); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if err := mayorGit.Commit("Initial commit"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+
+	cmd = exec.Command("git", "remote", "add", "origin", mayorRig)
+	cmd.Dir = mayorRig
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v\n%s", err, out)
+	}
+	cmd = exec.Command("git", "update-ref", "refs/remotes/origin/main", "HEAD")
+	cmd.Dir = mayorRig
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git update-ref: %v\n%s", err, out)
+	}
+
+	r := &rig.Rig{Name: "rig", Path: root}
+	return NewManager(r, git.NewGit(root), nil), mayorRig
+}
+
+func createStalePolecatCommit(t *testing.T, repoPath, startPoint, branchName string) string {
+	t.Helper()
+
+	repoGit := git.NewGit(repoPath)
+	if err := repoGit.CheckoutNewBranch(branchName, startPoint); err != nil {
+		t.Fatalf("checkout stale branch %s from %s: %v", branchName, startPoint, err)
+	}
+
+	fileName := strings.NewReplacer("/", "-", "@", "-").Replace(branchName) + ".txt"
+	if err := os.WriteFile(filepath.Join(repoPath, fileName), []byte(branchName+"\n"), 0644); err != nil {
+		t.Fatalf("write stale branch marker: %v", err)
+	}
+	if err := repoGit.Add(fileName); err != nil {
+		t.Fatalf("git add stale branch marker: %v", err)
+	}
+	if err := repoGit.Commit("Create stale polecat branch"); err != nil {
+		t.Fatalf("git commit stale branch marker: %v", err)
+	}
+
+	sha, err := repoGit.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("resolve stale branch commit: %v", err)
+	}
+	return sha
+}
+
 func TestStateIsWorking(t *testing.T) {
 	tests := []struct {
 		state   State
@@ -212,6 +293,92 @@ func TestAssigneeID(t *testing.T) {
 	expected := "test-rig/polecats/Toast"
 	if id != expected {
 		t.Errorf("assigneeID = %q, want %q", id, expected)
+	}
+}
+
+// TestAgentBeadID_Deterministic verifies that agentBeadID returns the same string
+// on repeated calls regardless of process working directory. Regression test for
+// gt-lph: the old implementation called workspace.Find on each invocation, which
+// could resolve differently depending on cwd, causing non-deterministic IDs across
+// Manager instances for the same rig path.
+func TestAgentBeadID_Deterministic(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "myrig")
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatalf("mkdir rig: %v", err)
+	}
+
+	r := &rig.Rig{
+		Name: "myrig",
+		Path: rigPath,
+	}
+
+	// Construct two Managers from the same rig path — they must produce
+	// identical agentBeadIDs regardless of construction context.
+	m1 := NewManager(r, git.NewGit(rigPath), nil)
+	m2 := NewManager(r, git.NewGit(rigPath), nil)
+
+	id1a := m1.agentBeadID("Toast")
+	id1b := m1.agentBeadID("Toast")
+	id2 := m2.agentBeadID("Toast")
+
+	// Same Manager, repeated calls — must be identical.
+	if id1a != id1b {
+		t.Errorf("agentBeadID not stable across calls: %q vs %q", id1a, id1b)
+	}
+
+	// Different Manager, same rig — must be identical.
+	if id1a != id2 {
+		t.Errorf("agentBeadID differs across Managers for same rig: %q vs %q", id1a, id2)
+	}
+
+	// Verify the ID is non-empty and contains expected components.
+	if id1a == "" {
+		t.Fatal("agentBeadID returned empty string")
+	}
+
+	// Change process working directory and construct a third Manager —
+	// the ID must still match (the old bug: workspace.Find resolved
+	// differently from different cwds).
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(townRoot); err != nil {
+		t.Fatalf("Chdir to townRoot: %v", err)
+	}
+	defer func() { _ = os.Chdir(origDir) }()
+
+	m3 := NewManager(r, git.NewGit(rigPath), nil)
+	id3 := m3.agentBeadID("Toast")
+	if id1a != id3 {
+		t.Errorf("agentBeadID differs after cwd change: %q (original) vs %q (after chdir)", id1a, id3)
+	}
+}
+
+func TestNewManager_NamepoolFromRigConfig(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "myrig")
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write rig config.json with polecat_names (no settings/config.json)
+	rigConfig := `{"polecat_names": ["alpha", "beta", "gamma"]}`
+	if err := os.WriteFile(filepath.Join(rigPath, "config.json"), []byte(rigConfig), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &rig.Rig{Name: "myrig", Path: rigPath}
+	m := NewManager(r, git.NewGit(rigPath), nil)
+	pool := m.GetNamePool()
+
+	name, err := pool.Allocate()
+	if err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+	if name != "alpha" {
+		t.Errorf("expected first name from rig config (alpha), got %q", name)
 	}
 }
 
@@ -982,6 +1149,78 @@ func TestAddWithOptions_NoPrimeMDCreatedLocally(t *testing.T) {
 	mayorPrimeMD := filepath.Join(mayorBeads, "PRIME.md")
 	if _, err := os.Stat(mayorPrimeMD); os.IsNotExist(err) {
 		t.Errorf("PRIME.md should exist at mayor/rig/.beads/: %s", mayorPrimeMD)
+	}
+}
+
+func TestAddWithOptions_UsesCanonicalOriginDefaultBranch(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+
+	mayorGit := git.NewGit(mayorRig)
+	baseSHA, err := mayorGit.Rev("origin/main")
+	if err != nil {
+		t.Fatalf("resolve origin/main: %v", err)
+	}
+	staleSHA := createStalePolecatCommit(t, mayorRig, "main", "polecat/stale-source")
+
+	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+
+	worktreeGit := git.NewGit(polecat.ClonePath)
+	staleAncestor, err := worktreeGit.IsAncestor(staleSHA, polecat.Branch)
+	if err != nil {
+		t.Fatalf("check stale ancestry: %v", err)
+	}
+	if staleAncestor {
+		t.Fatalf("new polecat branch %q unexpectedly includes stale local commit %s", polecat.Branch, staleSHA)
+	}
+
+	baseAncestor, err := worktreeGit.IsAncestor(baseSHA, polecat.Branch)
+	if err != nil {
+		t.Fatalf("check canonical ancestry: %v", err)
+	}
+	if !baseAncestor {
+		t.Fatalf("new polecat branch %q should descend from origin/main commit %s", polecat.Branch, baseSHA)
+	}
+}
+
+func TestReuseIdlePolecat_UsesCanonicalOriginDefaultBranch(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+
+	mayorGit := git.NewGit(mayorRig)
+	baseSHA, err := mayorGit.Rev("origin/main")
+	if err != nil {
+		t.Fatalf("resolve origin/main: %v", err)
+	}
+
+	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+
+	staleSHA := createStalePolecatCommit(t, polecat.ClonePath, "HEAD", "polecat/toast-stale")
+
+	reused, err := mgr.ReuseIdlePolecat("toast", AddOptions{HookBead: "gt-next"})
+	if err != nil {
+		t.Fatalf("ReuseIdlePolecat: %v", err)
+	}
+
+	worktreeGit := git.NewGit(reused.ClonePath)
+	staleAncestor, err := worktreeGit.IsAncestor(staleSHA, reused.Branch)
+	if err != nil {
+		t.Fatalf("check stale ancestry: %v", err)
+	}
+	if staleAncestor {
+		t.Fatalf("reused polecat branch %q unexpectedly includes stale local commit %s", reused.Branch, staleSHA)
+	}
+
+	baseAncestor, err := worktreeGit.IsAncestor(baseSHA, reused.Branch)
+	if err != nil {
+		t.Fatalf("check canonical ancestry: %v", err)
+	}
+	if !baseAncestor {
+		t.Fatalf("reused polecat branch %q should descend from origin/main commit %s", reused.Branch, baseSHA)
 	}
 }
 

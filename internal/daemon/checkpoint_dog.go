@@ -143,6 +143,20 @@ func (d *Daemon) checkpointWorktree(workDir, rigName, polecatName string) bool {
 		_, _ = runGitCmd(workDir, "reset", "HEAD", "--", dir)
 	}
 
+	// Unstage deletions of tracked files. A checkpoint should preserve work
+	// (additions + modifications), never commit deletions of tracked files.
+	// This prevents the bug where a polecat's working tree has a missing
+	// tracked file and the checkpoint commits the deletion (gt-pvx fix).
+	if delOut, err := runGitCmd(workDir, "diff", "--cached", "--name-only", "--diff-filter=D"); err == nil {
+		if dels := strings.TrimSpace(delOut); dels != "" {
+			for _, f := range strings.Split(dels, "\n") {
+				if f != "" {
+					_, _ = runGitCmd(workDir, "reset", "HEAD", "--", f)
+				}
+			}
+		}
+	}
+
 	// Check if anything is staged after exclusions
 	diffOut, err := runGitCmd(workDir, "diff", "--cached", "--quiet")
 	if err == nil && strings.TrimSpace(diffOut) == "" {

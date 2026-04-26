@@ -11,8 +11,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/lock"
-	"github.com/steveyegge/gastown/internal/util"
 )
 
 const (
@@ -174,6 +174,7 @@ func (p *NamePool) getNames() []string {
 		if resolved, err := ResolveThemeNames(p.townRoot, p.Theme); err == nil {
 			names = resolved
 		} else {
+			fmt.Fprintf(os.Stderr, "Warning: namepool theme %q not found (not built-in, no custom theme file); using default\n", p.Theme)
 			names = BuiltinThemes[DefaultTheme]
 		}
 	} else {
@@ -260,7 +261,7 @@ func (p *NamePool) Save() error {
 		MaxSize:      p.MaxSize,
 	}
 
-	return util.AtomicWriteJSON(p.stateFile, state)
+	return atomicfile.WriteJSON(p.stateFile, state)
 }
 
 // Allocate returns a name from the pool.
