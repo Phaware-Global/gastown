@@ -116,7 +116,7 @@ func TestCollectMissingContactSkips_HighSeverity_FailsOnSkippedEmail(t *testing.
 	statuses := []deliveryStatus{
 		{Channel: "bead", Created: true},
 		{Channel: "mail", Target: "mayor", Persisted: true},
-		{Channel: "email", Target: "human", Warning: "contacts.human_email not configured"},
+		{Channel: "email", Target: "human", Warning: "contacts.human_email not configured", Skipped: true},
 		{Channel: "log", RuntimeNotified: true},
 	}
 	for _, sev := range []string{"high", "critical", "HIGH", "CRITICAL"} {
@@ -134,7 +134,7 @@ func TestCollectMissingContactSkips_HighSeverity_FailsOnSkippedEmail(t *testing.
 
 func TestCollectMissingContactSkips_MediumLow_DoesNotFail(t *testing.T) {
 	statuses := []deliveryStatus{
-		{Channel: "email", Target: "human", Warning: "contacts.human_email not configured"},
+		{Channel: "email", Target: "human", Warning: "contacts.human_email not configured", Skipped: true},
 	}
 	for _, sev := range []string{"medium", "low", ""} {
 		t.Run(sev, func(t *testing.T) {
@@ -145,24 +145,39 @@ func TestCollectMissingContactSkips_MediumLow_DoesNotFail(t *testing.T) {
 	}
 }
 
-func TestCollectMissingContactSkips_BeadOrMailWarnings_Ignored(t *testing.T) {
-	// Bead/mail-channel warnings are unrelated misconfigurations
-	// (annotation lookups, etc.) — they must NOT trip the G39 hard-fail,
-	// which is scoped to external out-of-band notification channels.
+// Iter-1 review (augment medium): Skipped flag is the load-bearing
+// signal, not the warning string. A status with the historical
+// "not configured" warning text but Skipped=false must NOT trip the
+// gate — otherwise future copy changes silently disable the guardrail.
+func TestCollectMissingContactSkips_WarningWithoutSkippedFlag_Ignored(t *testing.T) {
 	statuses := []deliveryStatus{
+		{Channel: "email", Warning: "contacts.human_email not configured"}, // Skipped=false
 		{Channel: "bead", Warning: "annotation lookup failed"},
 		{Channel: "mail", Target: "mayor", Warning: "annotation update failed"},
 	}
 	if skips := collectMissingContactSkips("critical", statuses); len(skips) != 0 {
-		t.Errorf("expected no skips for non-external-channel warnings, got %v", skips)
+		t.Errorf("expected no skips when Skipped flag is unset, got %v", skips)
+	}
+}
+
+func TestCollectMissingContactSkips_SkippedOnInternalChannel_Ignored(t *testing.T) {
+	// Defense-in-depth: only external-notification channels can legitimately
+	// be "skipped" today, but constraining the channel set in the collector
+	// keeps the guardrail explicit if a future caller mistakenly sets
+	// Skipped on a bead/mail status.
+	statuses := []deliveryStatus{
+		{Channel: "bead", Skipped: true, Warning: "test future-proofing"},
+	}
+	if skips := collectMissingContactSkips("critical", statuses); len(skips) != 0 {
+		t.Errorf("expected non-external-channel skip to be ignored, got %v", skips)
 	}
 }
 
 func TestCollectMissingContactSkips_AggregatesMultipleChannels(t *testing.T) {
 	statuses := []deliveryStatus{
-		{Channel: "email", Warning: "contacts.human_email not configured"},
-		{Channel: "sms", Warning: "contacts.human_sms not configured"},
-		{Channel: "slack", Warning: "contacts.slack_webhook not configured"},
+		{Channel: "email", Warning: "contacts.human_email not configured", Skipped: true},
+		{Channel: "sms", Warning: "contacts.human_sms not configured", Skipped: true},
+		{Channel: "slack", Warning: "contacts.slack_webhook not configured", Skipped: true},
 	}
 	skips := collectMissingContactSkips("critical", statuses)
 	if len(skips) != 3 {
