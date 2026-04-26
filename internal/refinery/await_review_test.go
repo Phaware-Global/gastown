@@ -48,10 +48,10 @@ func (p *awaitFakeProvider) HasReviewFrom(prNumber int, user string) (bool, erro
 	return p.hasReview, p.hasReviewErr
 }
 
-<<<<<<< HEAD
 func (p *awaitFakeProvider) ListReviewAuthors(prNumber int) ([]string, error) {
 	return p.reviewAuthors, p.reviewAuthorsErr
-=======
+}
+
 func (p *awaitFakeProvider) HasReviewFromOnSHA(prNumber int, user, sha string) (bool, error) {
 	if p.reviewBySHAErr != nil {
 		return false, p.reviewBySHAErr
@@ -66,7 +66,6 @@ func (p *awaitFakeProvider) HasReviewFromOnSHA(prNumber int, user, sha string) (
 
 func (p *awaitFakeProvider) CurrentHeadSHA(prNumber int) (string, error) {
 	return p.headSHA, p.headSHAErr
->>>>>>> a683a083 (fix(refinery): SHA-scope await-review reviewer gate (G37))
 }
 
 func (p *awaitFakeProvider) UnresolvedThreads(prNumber int) ([]ReviewThread, error) {
@@ -422,7 +421,16 @@ func TestAwaitReviewStep_TimeoutElapsed_AuthorListErrorFallsBackToBareMessage(t 
 // commit OID equals HeadSHA. A reviewer who reviewed a PRIOR head (and
 // nothing since) must NOT satisfy the gate, so a force-pushed fix commit
 // can't slip through on the strength of an obsolete review.
+//
+// Test SHAs are 40-character hex strings to honor the
+// GhPrHasReviewFromOnSHA full-OID contract — iter-1 review on PR #45
+// flagged shorter synthetic forms as a contract mismatch that could
+// mask a real integration regression.
 func TestAwaitReviewStep_HeadSHAScoped_ReviewOnStaleSHA_DoesNotCount(t *testing.T) {
+	const (
+		oldHeadSHA = "1111111111111111111111111111111111111111"
+		newHeadSHA = "2222222222222222222222222222222222222222"
+	)
 	started := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
 	now := started.Add(10 * time.Minute) // past min-wait, within timeout
 	provider := &awaitFakeProvider{
@@ -430,13 +438,13 @@ func TestAwaitReviewStep_HeadSHAScoped_ReviewOnStaleSHA_DoesNotCount(t *testing.
 		hasReview: true,
 		// …but the reviewer has only reviewed the OLD head, not the new one.
 		reviewBySHA: map[string]bool{
-			"old-head-aaaaaaaaaaaaaaaaaaaa": true,
+			oldHeadSHA: true,
 		},
 	}
 	res, err := AwaitReviewStep(provider, 42, baseInput(now,
 		func(in *AwaitReviewStepInput) {
 			in.StartedAt = started
-			in.HeadSHA = "new-head-bbbbbbbbbbbbbbbbbbbb"
+			in.HeadSHA = newHeadSHA
 		}))
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
@@ -449,17 +457,18 @@ func TestAwaitReviewStep_HeadSHAScoped_ReviewOnStaleSHA_DoesNotCount(t *testing.
 // G37 happy path: reviewer reviewed the current HEAD → Ready, and the
 // message includes the short SHA so operators see which commit was reviewed.
 func TestAwaitReviewStep_HeadSHAScoped_ReviewOnCurrentSHA_Ready(t *testing.T) {
+	const headSHA = "abcdef1234567890abcdef1234567890abcdef12"
 	started := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
 	now := started.Add(10 * time.Minute)
 	provider := &awaitFakeProvider{
 		reviewBySHA: map[string]bool{
-			"abcdef1234567890abcdef": true,
+			headSHA: true,
 		},
 	}
 	res, err := AwaitReviewStep(provider, 42, baseInput(now,
 		func(in *AwaitReviewStepInput) {
 			in.StartedAt = started
-			in.HeadSHA = "abcdef1234567890abcdef"
+			in.HeadSHA = headSHA
 		}))
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)

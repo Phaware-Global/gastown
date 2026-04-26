@@ -1653,14 +1653,22 @@ func (g *Git) GhPrHeadSHA(prNumber int) (string, error) {
 	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber),
 		"--json", "headRefOid")
 	cmd.Dir = g.workDir
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("gh pr view (headRefOid) failed: %w", err)
+	// Capture stdout and stderr separately so an auth/permission failure
+	// from gh surfaces in the wrapped error rather than being lost behind
+	// a bare exit-status. await-review escalations on PR #N going dark
+	// because of a token expiry is the kind of misconfiguration this
+	// helper has to make legible (iter-1 review on PR #45).
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("gh pr view (headRefOid) failed: %s: %w",
+			strings.TrimSpace(stderr.String()), err)
 	}
 	var resp struct {
 		HeadRefOid string `json:"headRefOid"`
 	}
-	if jerr := json.Unmarshal(bytes.TrimSpace(out), &resp); jerr != nil {
+	if jerr := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &resp); jerr != nil {
 		return "", fmt.Errorf("parsing headRefOid: %w", jerr)
 	}
 	if resp.HeadRefOid == "" {

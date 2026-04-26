@@ -49,14 +49,11 @@ func (f *fakePRProvider) AllThreads(int) ([]ReviewThread, error)        { panic(
 func (f *fakePRProvider) ChecksRollup(int) (string, bool, error)        { panic("unused") }
 func (f *fakePRProvider) PostComment(int, string) error                 { panic("unused") }
 func (f *fakePRProvider) HasReviewFrom(int, string) (bool, error)       { panic("unused") }
-<<<<<<< HEAD
 func (f *fakePRProvider) ListReviewAuthors(int) ([]string, error)        { panic("unused") }
-=======
 func (f *fakePRProvider) HasReviewFromOnSHA(int, string, string) (bool, error) {
 	panic("unused")
 }
 func (f *fakePRProvider) CurrentHeadSHA(int) (string, error) { panic("unused") }
->>>>>>> a683a083 (fix(refinery): SHA-scope await-review reviewer gate (G37))
 
 func intPtr(i int) *int { return &i }
 
