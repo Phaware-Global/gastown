@@ -93,24 +93,30 @@ func TestCreateOptionsRig(t *testing.T) {
 // but no MR bead was stamped, which in turn led the refinery to
 // improvise a direct push to main. Keep this test as a regression guard
 // even if the field name or call sites get refactored later.
+//
+// These cases run with a *Beads constructed at a tempdir with no
+// `.beads/routes.jsonl`, so getTownRoot returns "" (or finds nothing
+// resolvable) and buildBdCreateArgs falls back to passing opts.Rig
+// raw — that fallback is what keeps the test fixture-light. The
+// resolved-path branch is covered separately by
+// TestBuildBdCreateArgsRigResolvesToDirWhenRoutesPresent.
 func TestBuildBdCreateArgsRigMapsToRepoFlag(t *testing.T) {
 	tests := []struct {
 		name      string
 		opts      CreateOptions
-		actor     string
 		wantFlag  string   // flag that MUST be present (exact match)
 		banned    string   // single prefix that MUST NOT appear (prefix match)
 		bannedAll []string // multiple prefixes that MUST NOT appear (prefix match)
+		wantActor string   // when non-empty, --actor=<this> must be present
 	}{
 		{
-			name: "Rig set emits --repo, never --rig",
+			name: "Rig set emits --repo=<rig-name>, never --rig",
 			opts: CreateOptions{
 				Title:    "Merge: gt-abc",
 				Labels:   []string{"gt:merge-request"},
 				Priority: 1,
 				Rig:      "gastown",
 			},
-			actor:    "",
 			wantFlag: "--repo=gastown",
 			banned:   "--rig=",
 		},
@@ -119,7 +125,6 @@ func TestBuildBdCreateArgsRigMapsToRepoFlag(t *testing.T) {
 			opts: CreateOptions{
 				Title: "plain bead",
 			},
-			actor: "",
 			// Both prefixes banned — the test name says "neither --repo
 			// nor --rig" and the check enforces that. Listing both means
 			// a regression that appends either flag on the empty-Rig
@@ -131,15 +136,33 @@ func TestBuildBdCreateArgsRigMapsToRepoFlag(t *testing.T) {
 			opts: CreateOptions{
 				Title: "Merge: hq-xyz",
 				Rig:   "heartworks",
+				Actor: "gastown/polecats/nux",
 			},
-			actor:    "gastown/polecats/nux",
-			wantFlag: "--repo=heartworks",
-			banned:   "--rig=",
+			wantFlag:  "--repo=heartworks",
+			banned:    "--rig=",
+			wantActor: "gastown/polecats/nux",
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			args := buildBdCreateArgs(tc.opts, tc.actor)
+			// Tempdir with no routes file → fallback to rig-name.
+			//
+			// Precondition: this test asserts the rig-name fallback,
+			// which only fires when getTownRoot() returns "". On a dev
+			// machine where TMPDIR happens to be inside a Gas Town
+			// workspace (e.g., a tmp dir nested under a town root that
+			// has mayor/town.json), FindTownRoot would walk up and
+			// find that ancestor, the path-resolution branch would
+			// fire, and the assertions on `--repo=<rig-name>` would
+			// fail in confusing ways. Skip with an explicit message
+			// rather than producing a misleading red.
+			b := NewIsolated(t.TempDir())
+			if tr := b.getTownRoot(); tr != "" {
+				t.Skipf("rig-name fallback test requires TMPDIR outside any Gas Town "+
+					"workspace, but FindTownRoot resolved an ancestor town root at %q. "+
+					"Set TMPDIR to a path outside the Gas Town tree to run this test.", tr)
+			}
+			args := b.buildBdCreateArgs(tc.opts)
 
 			if tc.wantFlag != "" {
 				found := false
@@ -166,8 +189,8 @@ func TestBuildBdCreateArgsRigMapsToRepoFlag(t *testing.T) {
 				}
 			}
 
-			if tc.actor != "" {
-				expected := "--actor=" + tc.actor
+			if tc.wantActor != "" {
+				expected := "--actor=" + tc.wantActor
 				found := false
 				for _, a := range args {
 					if a == expected {
@@ -180,6 +203,131 @@ func TestBuildBdCreateArgsRigMapsToRepoFlag(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestBuildBdCreateArgsRigResolvesToDirWhenRoutesPresent covers the
+// resolved-path branch added when buildBdCreateArgs became a method on
+// *Beads. When the workDir is inside a town with `.beads/routes.jsonl`,
+// the rig name in opts.Rig must be resolved to its absolute directory
+// path via GetRigDirForName so bd's `--repo=<dir>` gets a usable path
+// instead of relying on bd to re-run its own routing.
+func TestBuildBdCreateArgsRigResolvesToDirWhenRoutesPresent(t *testing.T) {
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// FindTownRoot keys off `<dir>/mayor/town.json` — minimum stub
+	// that's enough for getTownRoot() to return townRoot here.
+	mayorDir := filepath.Join(townRoot, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mayorDir, "town.json"),
+		[]byte(`{}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Routes mapping: prefix "ga-" lives at <town>/gantry, prefix
+	// "hq-" at the town root (path="."). Town-level routes
+	// (path=".") are explicitly NOT returned by GetRigDirForName so
+	// they should fall through to rig-name behavior.
+	routesContent := `{"prefix": "ga-", "path": "gantry"}
+{"prefix": "hq-", "path": "."}
+`
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"),
+		[]byte(routesContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	b := NewIsolated(townRoot)
+
+	t.Run("rig in routes resolves to absolute path", func(t *testing.T) {
+		args := b.buildBdCreateArgs(CreateOptions{Title: "x", Rig: "gantry"})
+		want := "--repo=" + filepath.Join(townRoot, "gantry")
+		if !containsArg(args, want) {
+			t.Errorf("expected resolved-path arg %q; got %v", want, args)
+		}
+		if containsArg(args, "--repo=gantry") {
+			t.Errorf("rig-name fallback fired despite routes match; got %v", args)
+		}
+	})
+
+	t.Run("rig not in routes falls back to rig-name", func(t *testing.T) {
+		args := b.buildBdCreateArgs(CreateOptions{Title: "x", Rig: "unknown-rig"})
+		// GetRigDirForName returns "" → fallback path appends raw rig name.
+		// (This is also the path "hq-prefix-with-path=." routes take —
+		// `GetRigDirForName` skips path="." entries internally, so any
+		// rig name that would have matched such a route falls through
+		// here too. There's no separate observable behavior to assert
+		// for that branch from outside the helper, so we don't try.)
+		if !containsArg(args, "--repo=unknown-rig") {
+			t.Errorf("expected rig-name fallback for unrouted rig; got %v", args)
+		}
+	})
+}
+
+// containsArg reports whether the slice contains the exact string.
+func containsArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestBuildBdCreateArgsRigAbsolutizesRelativeWorkDir guards the
+// filepath.Abs normalization on the resolved rigDir path: when *Beads
+// is constructed with a relative workDir (e.g. "." for commands run
+// from the rig root), the --repo arg must still be absolute so bd's
+// behavior doesn't depend on the cwd at exec time.
+func TestBuildBdCreateArgsRigAbsolutizesRelativeWorkDir(t *testing.T) {
+	townRoot := t.TempDir()
+	mayorDir := filepath.Join(townRoot, "mayor")
+	beadsDir := filepath.Join(townRoot, ".beads")
+	for _, d := range []string{mayorDir, beadsDir} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"),
+		[]byte(`{"prefix": "ga-", "path": "gantry"}`+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run with cwd = townRoot, but pass workDir as the RELATIVE form ".".
+	// Without filepath.Abs, --repo would be a relative "gantry" that
+	// depends on whatever cwd bd is exec'd from later.
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origCwd) })
+	if err := os.Chdir(townRoot); err != nil {
+		t.Fatal(err)
+	}
+
+	b := NewIsolated(".")
+	args := b.buildBdCreateArgs(CreateOptions{Title: "x", Rig: "gantry"})
+
+	// The --repo arg must be absolute (start with "/").
+	var repoArg string
+	for _, a := range args {
+		if strings.HasPrefix(a, "--repo=") {
+			repoArg = a
+			break
+		}
+	}
+	if repoArg == "" {
+		t.Fatalf("no --repo arg emitted; got %v", args)
+	}
+	repoPath := strings.TrimPrefix(repoArg, "--repo=")
+	if !filepath.IsAbs(repoPath) {
+		t.Errorf("expected absolute --repo path, got %q (relative path makes bd behavior cwd-dependent)", repoPath)
 	}
 }
 
