@@ -215,6 +215,26 @@ type MergeQueueConfig struct {
 	// PRMergeMethod is passed to the VCS provider on merge ("squash" default).
 	PRMergeMethod string `json:"pr_merge_method,omitempty"`
 
+	// PRReviewWait is the minimum duration that must elapse between
+	// `gt refinery pr await-review` posting the trigger comment and
+	// the next call running the first mergeability check. The
+	// physical-reality gate — the reviewer bot cannot produce output
+	// in zero time, so the refinery must not even look until at least
+	// this much elapsed. Default 5 minutes.
+	PRReviewWait time.Duration `json:"pr_review_wait,omitempty"`
+
+	// PRReviewTimeout caps total await-review wall time (from trigger
+	// post) before the gate escalates. The patrol cycle's own poll
+	// cadence drives re-entry, so a separate poll-interval field is
+	// not needed. Default 30 minutes.
+	PRReviewTimeout time.Duration `json:"pr_review_timeout,omitempty"`
+
+	// PRTriggerComment is the body await-review posts to wake the
+	// reviewer bot (e.g. "augment review"). Empty disables the trigger
+	// step — await-review still enforces the minimum wait + threads
+	// gate, just doesn't post. Default "augment review".
+	PRTriggerComment string `json:"pr_trigger_comment,omitempty"`
+
 	// Batch holds configuration for the batch-then-bisect merge queue.
 	// When nil or MaxBatchSize <= 1, batching is disabled and MRs process sequentially.
 	Batch *BatchConfig `json:"batch,omitempty"`
@@ -261,6 +281,9 @@ func DefaultMergeQueueConfig() *MergeQueueConfig {
 		StaleClaimCriticalAfter: 6 * time.Hour,
 		MaxRetryCount:           5,
 		AutoPush:                true,
+		PRReviewWait:            DefaultPRReviewWait,
+		PRReviewTimeout:         DefaultPRReviewTimeout,
+		PRTriggerComment:        DefaultPRTriggerComment,
 	}
 }
 
@@ -498,6 +521,9 @@ func (e *Engineer) LoadConfig() error {
 		PRRequiredApprovals  *int                       `json:"pr_required_approvals"`
 		PRReviewLoopMax      *int                       `json:"pr_review_loop_max"`
 		PRMergeMethod        *string                    `json:"pr_merge_method"`
+		PRReviewWait         *string                    `json:"pr_review_wait"`
+		PRReviewTimeout      *string                    `json:"pr_review_timeout"`
+		PRTriggerComment     *string                    `json:"pr_trigger_comment"`
 	}
 
 	if err := json.Unmarshal(mergeQueueRaw, &mqRaw); err != nil {
@@ -601,6 +627,31 @@ func (e *Engineer) LoadConfig() error {
 	if mqRaw.PRMergeMethod != nil {
 		e.config.PRMergeMethod = *mqRaw.PRMergeMethod
 	}
+	if dur, ok, err := parseDurationField(mqRaw.PRReviewWait, "pr_review_wait", true); err != nil {
+		return err
+	} else if ok {
+		e.config.PRReviewWait = dur
+	}
+	if dur, ok, err := parseDurationField(mqRaw.PRReviewTimeout, "pr_review_timeout", false); err != nil {
+		return err
+	} else if ok {
+		e.config.PRReviewTimeout = dur
+	}
+	// Cross-field invariant: timeout must exceed wait, otherwise the
+	// timeout fires while still inside the min-wait window and
+	// await-review can never reach the threads/reviewer checks. Fail
+	// fast at config-load rather than at the first runtime invocation.
+	if e.config.PRReviewWait > 0 && e.config.PRReviewTimeout > 0 &&
+		e.config.PRReviewTimeout <= e.config.PRReviewWait {
+		return fmt.Errorf(
+			"pr_review_timeout (%v) must be greater than pr_review_wait (%v); "+
+				"otherwise the timeout fires while still inside the min-wait window and "+
+				"await-review never reaches the threads/reviewer checks",
+			e.config.PRReviewTimeout, e.config.PRReviewWait)
+	}
+	if mqRaw.PRTriggerComment != nil {
+		e.config.PRTriggerComment = *mqRaw.PRTriggerComment
+	}
 
 	// Validate PR-strategy invariants before any caller can observe the
 	// loaded config. This is a defense-in-depth check — the config package
@@ -655,6 +706,30 @@ func (e *Engineer) LoadConfig() error {
 	}
 
 	return nil
+}
+
+// parseDurationField parses an optional JSON-originated duration string.
+// Returns (duration, seen=true, nil) when raw is non-nil and parses;
+// (0, false, nil) when raw is nil (field absent, caller keeps the
+// default); and an error when parsing or the sign check fails.
+// allowZero distinguishes fields where 0 is a legal "disable" value
+// (e.g. pr_review_wait) from fields where it isn't (poll intervals).
+func parseDurationField(raw *string, name string, allowZero bool) (time.Duration, bool, error) {
+	if raw == nil {
+		return 0, false, nil
+	}
+	dur, err := time.ParseDuration(*raw)
+	if err != nil {
+		return 0, false, fmt.Errorf("invalid %s %q: %w", name, *raw, err)
+	}
+	if allowZero {
+		if dur < 0 {
+			return 0, false, fmt.Errorf("%s must be non-negative, got %v", name, dur)
+		}
+	} else if dur <= 0 {
+		return 0, false, fmt.Errorf("%s must be positive, got %v", name, dur)
+	}
+	return dur, true, nil
 }
 
 // PRProvider returns the engineer's PR provider, initializing it if needed.
@@ -1012,10 +1087,10 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
 	}
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Found PR #%d for branch %s\n", prNumber, branch)
 
-	// Step PR.2a: Check unresolved review threads (G24 fix).
-	// Unresolved threads block merge regardless of approval state —
-	// reviewer guidance must reach main, not slip through under time
-	// pressure. Shared with the CLI path via VerifyReviewThreadsResolved.
+	// Unresolved review threads block merge regardless of approval
+	// state — reviewer guidance must reach main, not slip through under
+	// time pressure. Shared with the CLI path via
+	// VerifyReviewThreadsResolved.
 	if err := VerifyReviewThreadsResolved(e.prProvider, prNumber, e.output); err != nil {
 		var needsResolution *NeedsReviewResolutionError
 		if errors.As(err, &needsResolution) {

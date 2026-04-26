@@ -1467,6 +1467,49 @@ func (g *Git) ghFetchReviews(prNumber int) ([]ghReview, error) {
 	return resp.Reviews, nil
 }
 
+// GhPrComment posts a body as a new top-level comment on the PR.
+// Used by the refinery's await-review step to post the reviewer-bot
+// trigger comment (e.g. "augment review") independently of the
+// reviewer-assignment path in GhPrRequestReview. Unlike that function,
+// this one does nothing but post — no classification, no edits.
+func (g *Git) GhPrComment(prNumber int, body string) error {
+	if body == "" {
+		return fmt.Errorf("gh pr comment: body must be non-empty")
+	}
+	cmd := exec.Command("gh", "pr", "comment", fmt.Sprintf("%d", prNumber),
+		"--body", body)
+	cmd.Dir = g.workDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("gh pr comment failed: %s: %w",
+			strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
+// GhPrHasReviewFrom returns true iff the given user has submitted at
+// least one review on the PR (in any state — COMMENTED, APPROVED,
+// CHANGES_REQUESTED, or DISMISSED). Case-insensitive on login.
+//
+// Distinct from GhPrApprovedBy — this only proves the reviewer ran at
+// all, not that they approved. The refinery's await-review step uses
+// this as the "reviewer has engaged" gate, separate from the approval
+// gate in wait-approval.
+func (g *Git) GhPrHasReviewFrom(prNumber int, user string) (bool, error) {
+	if user == "" {
+		return false, fmt.Errorf("GhPrHasReviewFrom: user must be non-empty")
+	}
+	reviews, err := g.ghFetchReviews(prNumber)
+	if err != nil {
+		return false, err
+	}
+	for _, r := range reviews {
+		if strings.EqualFold(r.Author.Login, user) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // GhPrApprovedBy returns true iff the given user has submitted an APPROVED
 // review on the PR and has not subsequently dismissed it or requested changes.
 // Passing user="" falls back to IsPRApproved (any approver).

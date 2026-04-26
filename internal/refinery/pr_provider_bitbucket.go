@@ -86,3 +86,11 @@ func (p *bitbucketPRProvider) CountApprovals(prNumber int) (int, error) {
 func (p *bitbucketPRProvider) ChecksRollup(prNumber int) (string, bool, error) {
 	return "", false, ErrUnsupported
 }
+
+func (p *bitbucketPRProvider) PostComment(prNumber int, body string) error {
+	return ErrUnsupported
+}
+
+func (p *bitbucketPRProvider) HasReviewFrom(prNumber int, user string) (bool, error) {
+	return false, ErrUnsupported
+}
