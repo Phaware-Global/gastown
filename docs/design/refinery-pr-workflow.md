@@ -2495,27 +2495,27 @@ The intervention is prose, not validation. A regex check catches *some* tokens b
 
 1. The polecat's `gt done` create-PR path and the refinery's `gt refinery pr create` path both compose the body from a structured template with mandatory **Problem / Solution / Test plan** sections (optionally **Risks** / **Out of scope**). The composer fills the sections from the bead's description and the work actually done; empty placeholders are rejected so the template can't be dropped through verbatim.
 
-2. **Before posting, the composer runs the external-reviewer litmus test against the body** (this prose lives in the formula step that composes the body, so the LLM author sees it in-context rather than having to remember it from this design doc):
+2. **Before posting, the composer runs the external-reviewer litmus test against the prose sections** (this prose lives in the formula step that composes the body, so the LLM author sees it in-context rather than having to remember it from this design doc):
 
-   > Imagine a reviewer opening this PR cold — no access to your beads, your patrol logs, your mayor escalations, no membership in this town. They have only the PR body and the diff. Read what you wrote and ask:
+   > Imagine a reviewer opening this PR cold — no access to your beads, your patrol logs, your mayor escalations, no membership in this town. They have only the PR body and the diff. Read the prose sections (Problem / Solution / Test plan, optionally Risks / Out of scope) and ask:
    >
-   > 1. **Problem clarity** — does the body name a concrete user-visible (or operator-visible) problem? "Refinery edits files inline instead of dispatching a polecat" is good. "G33" alone is not. Internal symptoms ("commit_sha drift", "iteration cap hit") need a sentence of plain-English context, OR they need to come out.
+   > 1. **Problem clarity** — does the prose name a concrete user-visible (or operator-visible) problem? "Refinery edits files inline instead of dispatching a polecat" is good. "G33" alone is not. Internal symptoms ("commit_sha drift", "iteration cap hit") need a sentence of plain-English context, OR they need to come out.
    >
-   > 2. **Solution concreteness** — does the body name what changes in concrete terms (file paths, function names, behavior diffs)? Internal vocabulary like *polecat*, *refinery*, *tap-guard*, *await-review*, *mol patrol* is fine ONLY when the surrounding text gives a non-member enough context to follow.
+   > 2. **Solution concreteness** — does the prose name what changes in concrete terms (file paths, function names, behavior diffs)? Internal vocabulary like *polecat*, *refinery*, *tap-guard*, *await-review*, *mol patrol* is fine ONLY when the surrounding text gives a non-member enough context to follow.
    >
-   > 3. **No bare task IDs.** Strip `gt-*`, `hq-*`, `wisp-*`, `gts-*` IDs unless each one is paired with what it actually was — "the iter-2 dogfood escalation that flagged ..." rather than "hq-wisp-rhxf6". External reviewers can't open these beads.
+   > 3. **No bare task IDs in prose.** Strip `gt-*`, `hq-*`, `wisp-*`, `gts-*` IDs from prose unless each one is paired with what it actually was — "the iter-2 dogfood escalation that flagged ..." rather than "hq-wisp-rhxf6". External reviewers can't open these beads. The bead ID itself goes in the `Closes-Bead:` trailer at the bottom.
    >
-   > 4. **No bare G-numbers.** "G33", "G12b", "the G19 hole" should either be replaced with the underlying problem statement or include it inline ("G33 — refinery doing review-fix work inline instead of dispatching a polecat"). A `Closes G33` trailer at the bottom is fine if the body above explains the problem; it is NOT acceptable as the entire summary.
+   > 4. **No bare G-numbers in prose.** "G33", "G12b", "the G19 hole" should either be replaced with the underlying problem statement or include it inline ("G33 — refinery doing review-fix work inline instead of dispatching a polecat"). A `Design-Ref: G33` trailer at the bottom is fine if the prose above explains the problem; the G-number alone is NOT acceptable as the entire summary.
    >
    > 5. **No bare cross-PR refs.** "Stacks on PR #50" is opaque; "stacks on PR #50, which detects when a polecat force-pushes a fix and resets the await-review timer" is OK. If the cross-ref is essential to understanding this change, summarize what the other PR did in one sentence.
    >
    > 6. **Test plan tells a stranger what to verify.** `go test ./internal/refinery/` is concrete. "All G12b/G13/G14 invariants pinned" is not, unless the invariants are explained or the test names are listed.
    >
-   > **Litmus test:** could a reviewer with access to only the PR (body + diff) leave a useful review? If they'd have to ask "what's a polecat?", "what's gt-mwy.5?", or "what does G33 mean?" before they can engage with the code, the body needs more context. Rewrite, don't post.
+   > **Litmus test:** could a reviewer with access to only the PR (body + diff) leave a useful review? If they'd have to ask "what's a polecat?", "what's gt-mwy.5?", or "what does G33 mean?" before they can engage with the code, the prose needs more context. Rewrite, don't post.
 
 3. `gt refinery pr create` defaults to `--body-file` when the bead has a body-path field, so the composer is editing a file (which the litmus test can be performed against) rather than building a string in argv.
 
-4. Internal artifacts (bead IDs, polecat names, escalation IDs, patrol-cycle references) belong in commit trailers (`Closes-Bead: gt-mwy.2`, `Polecat: furiosa`) or town-side audit logs, not in the PR description body that external reviewers see. Trailers are stripped by GitHub's UI by default but remain queryable in `git log` for town-internal audit.
+4. Internal artifacts (bead IDs, polecat names, escalation IDs, patrol-cycle references, design-ledger anchors) belong in a **structured trailer block at the bottom of the PR body**, separated from the prose by a blank line — `Closes-Bead: gt-mwy.2`, `Design-Ref: G33`, `Polecat: furiosa`, `Patrol-Cycle: hq-wisp-ku6`. After squash-merge GitHub uses the PR body as the commit message, so the trailers flow into `git log` and stay queryable for town-internal audit. They remain visible in GitHub's PR description and commit views — that's expected and intentional — but the structured form keeps them visually segregated from the prose so reviewers don't have to parse them while reading the change. Each trailer key has a fixed token shape: `Closes-Bead:` takes a bead ID (`gt-*`, `hq-*`), `Design-Ref:` takes a design-ledger anchor (G-number). Don't mix the two — a G-number is not a bead ID and must not appear after `Closes-Bead:`.
 
 **Priority:** Medium. Reviewers (human and bot) need to read the body to gauge scope; without the litmus test, the structured-template fix from #1 alone fills with the same opaque tokens that motivated this entry. Pairing the template with the self-check prose is the load-bearing combination.
 
