@@ -869,7 +869,7 @@ until the PR is actually merged.**
 
 The command blocks until every check reaches a terminal state. Exit 0 iff
 all checks succeeded. On `FAILURE` or timeout, non-zero exit — send
-FIX_NEEDED back to the polecat and skip to the shared post-merge "Step 4: Archive the MERGE_READY mail" section further down the merge-push step (NOT Step PR.4 "Request automated review" — that's only reached on CI success):
+FIX_NEEDED back to the polecat and skip to the shared post-merge "Step 4: Archive the MERGE_READY mail" section further down the merge-push step (NOT Step PR.4 "Await reviewer engagement" — that's only reached on CI success):
 
 ```bash
 gt mail send <rig>/polecats/<polecat-name> -s "FIX_NEEDED <polecat-name>" --stdin <<BODY
@@ -882,16 +882,87 @@ Attempt-Number: 1
 BODY
 ```
 
-**Step PR.4: Request automated review (if pr_reviewer is configured)**
+**Step PR.4: Await reviewer engagement (patrol-resumable wait + thread gate)**
 
 ```bash
 if [ -n "{{pr_reviewer}}" ]; then
-  {{ cmd }} refinery pr request-review $PR --user {{pr_reviewer}}
+  set +e
+  {{ cmd }} refinery pr await-review $PR --mr $MR --reviewer "{{pr_reviewer}}"
+  AWAIT_RC=$?
+  set -e
+  # await-review is patrol-resumable: it does at most ONE action per
+  # invocation and returns immediately. State (when the trigger was
+  # posted) lives on the MR bead's await_review_started_at field, so
+  # subsequent patrols re-enter and check elapsed time without any
+  # inline sleep. This is what keeps the merge queue unblocked while
+  # one PR awaits its reviewer.
+  case $AWAIT_RC in
+    0)
+      # Reviewer engaged AND threads clean — advance. PR.5's thread
+      # poll below sees zero threads and falls through to PR.6.
+      ;;
+    1)
+      # Trigger just posted, OR still inside the wait window, OR wait
+      # elapsed but reviewer absent (within timeout). Either way we
+      # take no further action this cycle — return to loop-check so
+      # OTHER MRs can be processed. The next patrol re-enters here
+      # with the persisted await_review_started_at.
+      return 0 2>/dev/null || exit 0
+      ;;
+    2)
+      # Unresolved threads — the await-review command already printed
+      # the thread list. Fall through to PR.5 which will dispatch a
+      # review-fix polecat (or hit the cap and escalate).
+      ;;
+    3)
+      # Reviewer never engaged within --timeout. await-review printed
+      # the escalation message; we open an escalation bead and park
+      # the MR. The human closes the escalation when ready and the
+      # next patrol picks the MR back up.
+      {{ cmd }} escalate -s HIGH \
+        "PR #$PR await-review timed out — reviewer {{pr_reviewer}} did not engage" \
+        --mail mayor/ \
+        --context "MR=$MR PR=$PR reviewer={{pr_reviewer}}"
+      return 0 2>/dev/null || exit 0
+      ;;
+    4)
+      # Operational/config error in await-review (config load failed,
+      # provider lookup failed, validation rejected, etc.). The error
+      # was printed to stderr by the CLI. This is distinct from exit 1
+      # ("still waiting") so the patrol does not silently retry forever
+      # on an unrecoverable failure. Escalate and park the MR.
+      {{ cmd }} escalate -s HIGH \
+        "PR #$PR await-review hit operational error — see stderr above" \
+        --mail mayor/ \
+        --context "MR=$MR PR=$PR reviewer={{pr_reviewer}}"
+      return 0 2>/dev/null || exit 0
+      ;;
+    *)
+      echo "PR #$PR: await-review returned unexpected exit $AWAIT_RC; retrying next patrol"
+      return 0 2>/dev/null || exit 0
+      ;;
+  esac
 fi
 ```
 
-When `pr_reviewer` is empty, the review loop is skipped entirely and the
-flow proceeds directly to the human-approval gate.
+`gt refinery pr await-review` is the imperative replacement for the
+old `request-review`-then-trust-the-LLM flow. On its first
+invocation for an MR it posts the trigger comment (`augment review`
+by default; see `pr_trigger_comment`) and records the timestamp on
+the MR bead. Subsequent invocations check elapsed time against
+`pr_review_wait` (default 5 minutes — the physical-reality gate)
+and `pr_review_timeout` (default 30 minutes), exiting non-zero
+until either the reviewer engages with no unresolved threads or
+the timeout escalates.
+
+The wait is enforced by the binary, not by formula prose, so the
+LLM cannot optimize it away. Earlier dogfood runs showed the
+refinery merging PRs in ~54 seconds with the reviewer's response
+landing 41 seconds after — patrol-resumable + bead-persisted state
+means we get the wait without giving up parallel MR processing.
+
+When `pr_reviewer` is empty, the review loop is skipped entirely
+and the flow proceeds directly to the human-approval gate.
 
 **Step PR.5: Review-fix (patrol-resumable, bounded by pr_review_loop_max, default 3)**
 
@@ -1034,13 +1105,24 @@ if [ -n "$REVIEW_FIX_POLECAT" ]; then
       ;;
     idle|done|stuck|stalled|zombie)
       # Terminal from the review-fix loop's perspective: the polecat is
-      # no longer actively working. Clear the marker and re-request
-      # review since the polecat may have pushed new commits before
-      # transitioning. The witness handles zombie/stalled cleanup on its
-      # own schedule; we don't block on it.
-      {{ cmd }} mq set-review-state "$MR" --clear-polecat
-      [ -n "{{pr_reviewer}}" ] && {{ cmd }} refinery pr request-review $PR --user {{pr_reviewer}}
+      # no longer actively working. Clear the in-flight polecat AND the
+      # await_review_started_at timestamp so the next patrol cycle's
+      # PR.4 re-posts the trigger comment for the new HEAD and restarts
+      # the wait window. The witness handles zombie/stalled cleanup on
+      # its own schedule; we don't block on it.
+      #
+      # CRITICAL: After clearing the await timestamp we MUST return so
+      # the next patrol re-enters PR.4 for the new HEAD. Falling through
+      # here would let the rest of PR.5 / PR.6 / PR.7 run with stale
+      # review state — if the polecat's force-pushed HEAD already
+      # happens to satisfy the thread + approval gates from a prior
+      # cycle's reviews, we'd merge WITHOUT await-review running for
+      # the new HEAD, recreating the G25 race the await-review gate
+      # was built to prevent.
+      {{ cmd }} mq set-review-state "$MR" --clear-polecat --clear-await-started-at
       REVIEW_FIX_POLECAT=""
+      echo "PR #$PR: review-fix polecat done — cleared await_review_started_at; next patrol re-enters PR.4 for new HEAD"
+      return 0 2>/dev/null || exit 0
       ;;
     *)
       # Unrecognized state (including empty). Treat as transient — keep
@@ -1146,13 +1228,18 @@ fi
 ```
 
 `{{ cmd }} mq set-review-state` does an atomic read-modify-write on the
-MR bead's description, mutating only the `review_fix_polecat` and
-`review_loop_iter` fields. Other MR fields (branch, target, source_issue,
-etc.) are preserved. Flags:
-  --polecat <name>   — set review_fix_polecat
-  --iter <n>         — set review_loop_iter
-  --clear-polecat    — clear review_fix_polecat (polecat terminated)
-  --clear-iter       — clear review_loop_iter
+MR bead's description, mutating only the `review_fix_polecat`,
+`review_loop_iter`, and `await_review_started_at` fields. Other MR
+fields (branch, target, source_issue, etc.) are preserved. Flags:
+  --polecat <name>            — set review_fix_polecat
+  --iter <n>                  — set review_loop_iter
+  --clear-polecat             — clear review_fix_polecat (polecat terminated)
+  --clear-iter                — clear review_loop_iter
+  --clear-await-started-at    — clear await_review_started_at so the
+                                next patrol re-enters PR.4 for a new HEAD
+                                (used after a review-fix polecat lands
+                                changes; resets the await-review wait
+                                window for the new SHA)
 
 `REVIEW_FIX_DONE` mail from the polecat (sent by `gt done` when the
 bead is a no_merge review-fix dispatch) is an optimization: it triggers
@@ -1190,7 +1277,7 @@ a banner titled `❌ DIRECT gh pr merge BLOCKED (G21 fix)` and exits
 non-zero. If `gt refinery pr merge` fails with an error like
 `PR #<n> requires approving review from <user> before merge` or
 `PR #<n> has N of M required approvals`, DO NOT try to work around
-it — go back to PR.4 (request-review) or PR.6 (wait-approval) and
+it — go back to PR.4 (await-review) or PR.6 (wait-approval) and
 resolve the gate.
 
 ⚠️ **STOP HERE - DO NOT PROCEED UNTIL THE PR IS ACTUALLY MERGED ON GITHUB**
