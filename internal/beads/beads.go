@@ -1210,7 +1210,21 @@ func (b *Beads) Blocked() ([]*Issue, error) {
 // without execing `bd` — the mismatch between the Go-side `Rig` field and
 // bd's on-wire `--repo` flag has caused a silent "every MR bead create fails"
 // bug before, so it deserves a regression guard.
-func buildBdCreateArgs(opts CreateOptions, actor string) []string {
+//
+// Method on *Beads (rather than a free function) so it can:
+//   - resolve the rig NAME in opts.Rig (e.g. "gastown") to its absolute
+//     directory path via GetRigDirForName + getTownRoot — `bd --repo`
+//     is happiest with a path it can open directly.
+//   - default opts.Actor from b.getActor() (BD_ACTOR / isolated-mode
+//     fallback) without making each caller repeat the same boilerplate.
+//
+// Path-resolution falls back to passing opts.Rig raw when the town root
+// or routes file can't be located. This preserves the prior behavior
+// for callers/test fixtures that don't construct a full town layout,
+// at the cost of a slightly less-precise --repo arg in those edge
+// cases. A test that exercises the resolved-path branch is added
+// alongside the existing rig-name fallback regression.
+func (b *Beads) buildBdCreateArgs(opts CreateOptions) []string {
 	args := []string{"create", "--json"}
 
 	if opts.Title != "" {
@@ -1238,8 +1252,22 @@ func buildBdCreateArgs(opts CreateOptions, actor string) []string {
 	}
 	if opts.Rig != "" {
 		// bd's flag is `--repo`, not `--rig`. See CreateOptions.Rig for
-		// the history.
-		args = append(args, "--repo="+opts.Rig)
+		// the history. Resolve the rig name to its absolute directory
+		// path when possible so bd gets a path it can open without
+		// re-running its own auto-routing; fall back to the rig name
+		// if the town root or routes lookup fails (e.g. unit tests
+		// running outside a town layout).
+		repo := opts.Rig
+		if townRoot := b.getTownRoot(); townRoot != "" {
+			if rigDir := GetRigDirForName(townRoot, opts.Rig); rigDir != "" {
+				repo = rigDir
+			}
+		}
+		args = append(args, "--repo="+repo)
+	}
+	actor := opts.Actor
+	if actor == "" {
+		actor = b.getActor()
 	}
 	if actor != "" {
 		args = append(args, "--actor="+actor)
@@ -1260,11 +1288,7 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 		return b.storeCreate(opts)
 	}
 
-	actor := opts.Actor
-	if actor == "" {
-		actor = b.getActor()
-	}
-	args := buildBdCreateArgs(opts, actor)
+	args := b.buildBdCreateArgs(opts)
 
 	out, err := b.run(args...)
 	if err != nil {
