@@ -2338,7 +2338,7 @@ The three together produce: no merge until `(augment has reviewed current SHA) A
 
 ---
 
-## G26-G43: Telegraph wiring dogfood (PR #40 + phase 2 cycle)
+## G26-G44 + F1: Telegraph wiring dogfood (PR #40 + phase 2 cycle)
 
 Observed 2026-04-26 during the Telegraph wiring dogfood. PR #40 (`gt telegraph start` cobra subcommand, MR `gt-wisp-iau`, polecat furiosa) was the first cycle to exercise the full G21-G25 hardening end-to-end. The `await-review` + threads-gate + escalation halves of the design fired correctly, but a second class of gaps surfaced: **the refinery itself adopted the LLM-optimization patterns the polecat hardening was meant to prevent**, and the **gt-pvx auto-save safety net** was found to bypass everything.
 
