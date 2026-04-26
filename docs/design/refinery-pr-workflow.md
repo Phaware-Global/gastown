@@ -56,10 +56,20 @@ squash merge.
 
 | Actor | Responsibility under `merge_strategy=pr` |
 |-------|-------------------------------------------|
-| Polecat | Implement work on a feature branch. Push branch. Run `gt done` with no PR creation. On review-fix dispatch, check out the existing PR branch, commit fixes, reply to review threads. |
+| Polecat | Implement work on a feature branch. Push branch. Run `gt done` with no PR creation. On review-fix dispatch, check out the existing PR branch (via `gt polecat checkout-branch <bead-id>`), commit fixes addressing the unresolved threads, force-push, **resolve those threads via `gh api`**, then `gt done`. The polecat owns ALL code-mutating and thread-state-mutating work for its PR; the refinery never edits files or resolves threads on the polecat's behalf. |
 | Witness | Verify polecat work, send `MERGE_READY` to refinery. Unchanged from direct-merge flow. |
-| Refinery | Rebase branch, push, create PR, wait for CI, request AI review, detect unresolved threads, dispatch review-fix polecat, poll for human approval, squash-merge, clean up. |
+| Refinery | Pure orchestrator — rebase branch, push, create PR, wait for CI, request AI review, detect unresolved threads, **dispatch review-fix polecat**, poll for human approval, gate on standards (CI green, threads clean on current HEAD, configured approver's APPROVED review present), squash-merge, clean up. The refinery never edits source files, never force-pushes a polecat branch, never resolves review threads — its job is throughput and gate enforcement, not authorship. |
 | Mayor / Human | Review the AI's work, approve the PR on GitHub. Close the escalation that the refinery opens when it parks waiting for human merge. |
+
+### Actor-boundary principle
+
+The refinery and polecats own **non-overlapping write surfaces** under `merge_strategy=pr`. Refinery is throughput; polecat is authorship.
+
+- **Refinery may write to**: PR-level metadata (creating the PR, posting trigger comments, advancing the merge), MR-bead state fields (`await_review_started_at`, `commit_sha` mirror, `review_loop_iter`, `review_fix_polecat`), and origin/main (squash merge only, gated). Refinery may NOT push to a `polecat/...` branch, edit source files in-tree, or call `gh api ...threads/.../resolve`.
+- **Polecat may write to**: source files in its worktree, its own polecat-namespaced branch (initial push + force-push of fix commits), review-thread state on its PR (resolve via `gh api`), and the MR bead's `commit_sha` field on completion (via `gt done` plumbing). Polecat may NOT call `gh pr create`, `gh pr merge`, or anything in `gt refinery pr ...`.
+- **Tap-guard enforces** the negative half of each boundary at the Bash-tool layer. Subcommands (`gt refinery pr dispatch-review-fix`, `gt polecat checkout-branch`) are the *positive* half — the only permitted way each actor can perform its allowed write.
+
+Together this means a single PR's commit history attributes every change to the polecat that authored it; the refinery's contribution to the git log is the squash-merge commit and nothing else. Audit logs read cleanly. Per-polecat retry / replacement remains possible because the polecat is the only writer of its branch.
 
 ## End-to-End Flow
 
@@ -2507,6 +2517,21 @@ Atomic responsibilities:
 4. Returns exit 1 (waiting for polecat — patrol-resumable, identical pattern to await-review).
 
 Then PR.5's prose collapses to one command line, the LLM has nowhere to put "do it myself", and the iter counter is enforced server-side.
+
+**Polecat-side mission contract** (the review-fix polecat's prompt template MUST encode):
+1. `gt polecat checkout-branch <bead-id>` — enter the existing PR branch (idempotent against the just-shipped command from PR #49). Refuses to silently swap from a different polecat branch.
+2. Address each unresolved thread named in the dispatch payload — fix the file:line referenced, no scope creep, no "while I'm here" refactors.
+3. `git add -A && git commit -m "<descriptive>"`.
+4. `git push --force-with-lease origin polecat/<name>-<bead-id>`. The polecat owns this branch; the force-push is permitted by the actor-boundary principle.
+5. **Resolve the threads via `gh api`** — the polecat owns thread state on its own PR. The refinery never resolves threads on the polecat's behalf; doing so muddies attribution and gives the refinery a write surface it shouldn't have.
+6. `gt done` — same completion path as a feature polecat; the witness/refinery handshake takes over from there. `gt done` updates the MR bead's `commit_sha` to the new HEAD as part of its existing flow, eliminating the G36 staleness on the dispatch path.
+
+**Prerequisites — already shipped:**
+- `gt polecat checkout-branch <bead-id>` (PR #49) — the imperative polecat-side primitive that lets a review-fix polecat enter the existing PR branch despite tap-guard's `git checkout -b` block. Without this, dispatch is impossible: the polecat would land on main with no permitted way to switch.
+- G35/G36 drift detection in `await-review` (PR #50) — when the polecat force-pushes its fix, the refinery's next `await-review` cycle detects the SHA drift, resets the wait timer, and re-posts the trigger. The dispatch path doesn't have to do anything special to make subsequent reviewer-engagement checks correct.
+- Protected-branch guard in gt-pvx + checkpoint-dog (PR #48) — the review-fix polecat session can't accidentally land its diff on origin/main if its worktree state goes sideways.
+
+The remaining work is the dispatch subcommand + the polecat-mission template + the formula PR.5 collapse.
 
 **Priority:** Blocking. Today's bypass also breaks G34/G35/G36/G37 in cascade; the single fix here closes most of them.
 
