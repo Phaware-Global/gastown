@@ -223,7 +223,7 @@ func NewProduction(
 Telegraph at startup:
 
 1. Parses `[telegraph.prompts]` from the main config and `~/gt/settings/telegraph.prompts.toml` (if present), merging with the separate-file taking precedence on key collision.
-2. Validates each key matches `^[a-z]+:[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]+)+$` — provider segment, colon, then a dotted event-type with at least two segments. Allows multi-segment vocabularies (`jira:issue.field.changed`, `github:pull_request.review.submitted`) that the previous draft's single-dot regex would have rejected. Underscores allowed within segments to match existing event names like `pull_request`. Invalid keys → exit at startup with a readable error.
+2. Validates each key (**other than the literal string `default`**, which is a special-cased fallback key and is exempt from the regex) matches `^[a-z]+:[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]+)+$` — provider segment, colon, then a dotted event-type with at least two segments. Allows multi-segment vocabularies (`jira:issue.field.changed`, `github:pull_request.review.submitted`) that the previous draft's single-dot regex would have rejected. Underscores allowed within segments to match existing event names like `pull_request`. Invalid keys → exit at startup with a readable error. The `default` exemption is structural: that key is a sentinel for the resolver's fallback path, not a `<provider>:<event-type>` mapping, and the validation regex was never meant to apply to it.
 3. Validates each prompt value is non-empty after trimming. Empty strings → exit at startup.
 4. Validates each prompt template **does not contain either delimiter** of the OPERATOR PROMPT block — neither the literal start `--- OPERATOR PROMPT (trusted) ---` nor the literal end `--- END OPERATOR PROMPT ---`. The end-delimiter check is the obvious case (it would close the trust boundary mid-prompt); the start-delimiter check is the symmetrical paranoia case (a substituted value or hand-edited template containing the start delimiter could let a future template-aware tool re-open a closed trust boundary if the receiver does string-based parsing). Both checks are cheap. If either is present, refuse to start.
 5. Logs at INFO the count of registered prompt keys plus whether a `default` was configured: `[Telegraph] prompts loaded: 4 specific, default=true`.
@@ -396,10 +396,16 @@ if err != nil {
     return nil, err
 }
 if _, filtered := t.ignoreActors[evt.Actor]; filtered {
-    return nil, ErrActorFiltered
+    // Return the event alongside the sentinel — the L1 handler needs
+    // evt.Actor / evt.EventType / evt.EventID to populate the audit-log
+    // line. The L1 handler treats (evt != nil, err == ErrActorFiltered)
+    // as "drop this, don't enqueue, but log with full event metadata."
+    return evt, ErrActorFiltered
 }
 return evt, nil
 ```
+
+**Why return `(evt, ErrActorFiltered)` rather than `(nil, ErrActorFiltered)`:** the L1 handler is the single source of truth for `event=drop` log lines (it's where every other drop reason is logged today, including `unknown_event_type`, `parse_error`, `backpressure`). To keep that locality of audit-logging while still routing the actor field into the structured log, the translator must hand the event back to L1 alongside the sentinel. L1 reads the err first; on `ErrActorFiltered` it logs `Drop(reason="actor_filtered", event_type=evt.EventType, event_id=evt.EventID, actor=evt.Actor)` and short-circuits before enqueue. On any other error (or no error), the existing logic applies. Tests covering this contract: (a) translator returns non-nil event when filtered, (b) L1 handler logs the actor field on filtered drop, (c) L1 handler does not enqueue the filtered event to L3.
 
 New sentinel error `ErrActorFiltered` defined in `internal/telegraph/types.go` alongside `ErrUnknownEventType`:
 
@@ -407,7 +413,7 @@ New sentinel error `ErrActorFiltered` defined in `internal/telegraph/types.go` a
 var ErrActorFiltered = errors.New("actor filtered by provider config")
 ```
 
-The L1 HTTP handler (`internal/telegraph/transport/http.go`) maps `ErrActorFiltered` to `Drop(reason="actor_filtered", actor=...)` — same shape as the existing `ErrUnknownEventType` mapping. **HTTP response remains 200 OK** to the caller (Jira), same convention as `unknown_event_type` — non-200 would trigger Jira's webhook-retry logic and produce repeated drops for events the operator already said to ignore.
+The L1 HTTP handler (`internal/telegraph/transport/http.go`) maps `ErrActorFiltered` to `Drop(reason="actor_filtered", actor=evt.Actor, event_type=evt.EventType, event_id=evt.EventID)` — same shape as the existing `ErrUnknownEventType` mapping but populated from the event the translator returned. **HTTP response remains 200 OK** to the caller (Jira), same convention as `unknown_event_type` — non-200 would trigger Jira's webhook-retry logic and produce repeated drops for events the operator already said to ignore.
 
 ## Failure modes / interactions
 
