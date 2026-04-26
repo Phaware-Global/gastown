@@ -887,7 +887,7 @@ BODY
 ```bash
 if [ -n "{{pr_reviewer}}" ]; then
   set +e
-  {{ cmd }} refinery pr await-review $PR --mr $MR
+  {{ cmd }} refinery pr await-review $PR --mr $MR --reviewer "{{pr_reviewer}}"
   AWAIT_RC=$?
   set -e
   # await-review is patrol-resumable: it does at most ONE action per
