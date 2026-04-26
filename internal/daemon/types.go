@@ -165,6 +165,55 @@ type TelegraphServerConfig struct {
 	HealthCheckInterval time.Duration `json:"health_check_interval,omitempty"`
 }
 
+// UnmarshalJSON allows duration fields to be specified as human-readable strings
+// (e.g. "5s", "10m") in daemon.json, consistent with other duration config fields.
+func (c *TelegraphServerConfig) UnmarshalJSON(data []byte) error {
+	type wire struct {
+		Enabled             bool   `json:"enabled"`
+		ConfigPath          string `json:"config_path,omitempty"`
+		LogFile             string `json:"log_file,omitempty"`
+		AutoRestart         bool   `json:"auto_restart,omitempty"`
+		RestartDelay        string `json:"restart_delay,omitempty"`
+		MaxRestartDelay     string `json:"max_restart_delay,omitempty"`
+		MaxRestartsInWindow int    `json:"max_restarts_in_window,omitempty"`
+		RestartWindow       string `json:"restart_window,omitempty"`
+		HealthCheckInterval string `json:"health_check_interval,omitempty"`
+	}
+	var w wire
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	c.Enabled = w.Enabled
+	c.ConfigPath = w.ConfigPath
+	c.LogFile = w.LogFile
+	c.AutoRestart = w.AutoRestart
+	c.MaxRestartsInWindow = w.MaxRestartsInWindow
+	parseDur := func(s, field string) (time.Duration, error) {
+		if s == "" {
+			return 0, nil
+		}
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return 0, fmt.Errorf("telegraph.%s: %w", field, err)
+		}
+		return d, nil
+	}
+	var err error
+	if c.RestartDelay, err = parseDur(w.RestartDelay, "restart_delay"); err != nil {
+		return err
+	}
+	if c.MaxRestartDelay, err = parseDur(w.MaxRestartDelay, "max_restart_delay"); err != nil {
+		return err
+	}
+	if c.RestartWindow, err = parseDur(w.RestartWindow, "restart_window"); err != nil {
+		return err
+	}
+	if c.HealthCheckInterval, err = parseDur(w.HealthCheckInterval, "health_check_interval"); err != nil {
+		return err
+	}
+	return nil
+}
+
 // DoltRemotesConfig holds configuration for the dolt_remotes patrol.
 // This patrol periodically pushes Dolt databases to their configured remotes.
 type DoltRemotesConfig struct {

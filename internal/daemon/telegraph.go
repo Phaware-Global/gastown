@@ -137,6 +137,16 @@ func (m *TelegraphServerManager) EnsureRunning() {
 	defer m.mu.Unlock()
 
 	if _, running := m.isRunning(); running {
+		// Reset backoff if the process has been running stably beyond the restart window.
+		if !m.startedAt.IsZero() && m.now().Sub(m.startedAt) > m.restartWindow() {
+			m.currentDelay = 0
+			m.escalated = false
+		}
+		return
+	}
+
+	// If auto_restart is disabled, only allow the initial start (startedAt zero means never started).
+	if !m.config.AutoRestart && !m.startedAt.IsZero() {
 		return
 	}
 
@@ -165,12 +175,13 @@ func (m *TelegraphServerManager) restartWithBackoff() error {
 			len(m.restartTimes), m.restartWindow())
 	}
 
+	// Instead of sleeping (which would block the daemon loop), check whether the
+	// required backoff delay has elapsed since the last restart. If not, return
+	// and let the next health-check cycle retry.
 	delay := m.backoffDelay()
-	if delay > 0 {
-		m.mu.Unlock()
-		m.doSleep(delay)
-		m.mu.Lock()
-		if _, running := m.isRunning(); running {
+	if delay > 0 && len(m.restartTimes) > 0 {
+		lastRestart := m.restartTimes[len(m.restartTimes)-1]
+		if now.Sub(lastRestart) < delay {
 			return nil
 		}
 	}
@@ -314,7 +325,7 @@ func (m *TelegraphServerManager) stopLocked() {
 
 	done := make(chan struct{})
 	go func() {
-		for i := 0; i < 50; i++ {
+		for i := 0; i < 100; i++ {
 			if !isProcessAlive(process) {
 				close(done)
 				return

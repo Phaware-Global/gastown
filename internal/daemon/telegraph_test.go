@@ -107,7 +107,9 @@ func TestTelegraph_RestartWithoutGastown(t *testing.T) {
 		atomic.StoreInt32(&alive, 1)
 		return nil
 	}
-	m.sleepFn = func(d time.Duration) {}
+	// nowFn controls perceived time; start at a fixed point.
+	base := time.Now()
+	m.nowFn = func() time.Time { return base }
 
 	// First call: process is dead → should start.
 	m.EnsureRunning()
@@ -121,8 +123,9 @@ func TestTelegraph_RestartWithoutGastown(t *testing.T) {
 		t.Fatalf("expected still 1 start after alive check, got %d", atomic.LoadInt32(&starts))
 	}
 
-	// Simulate crash.
+	// Simulate crash; advance time past the backoff delay so the next EnsureRunning restarts.
 	atomic.StoreInt32(&alive, 0)
+	base = base.Add(10 * time.Second)
 
 	// Third call: process died → should restart (only Telegraph, not gastown).
 	m.EnsureRunning()
@@ -246,7 +249,7 @@ func TestTelegraph_MissingConfigSkipsStart(t *testing.T) {
 	m.EnsureRunning() // must complete without panic
 }
 
-// TestTelegraph_StopIsIdempotent verifies Stop() when not running doesn't panic.
+// TestTelegraph_StopIsIdempotent verifies Stop() can be called multiple times without panic.
 func TestTelegraph_StopIsIdempotent(t *testing.T) {
 	cfg := &TelegraphServerConfig{Enabled: true}
 	m := newTestTelegraphManager(t, cfg)
@@ -257,8 +260,10 @@ func TestTelegraph_StopIsIdempotent(t *testing.T) {
 
 	m.Stop()
 	m.Stop()
-	// No panic and stopFn is called for each Stop() invocation regardless of running state.
-	// (stopLocked delegates to stopFn which is not gated on isRunning when overridden)
+	// stopFn is called for each Stop() invocation (stopLocked delegates to stopFn unconditionally).
+	if got := atomic.LoadInt32(&stopped); got != 2 {
+		t.Errorf("Stop() called twice: stopFn invocations = %d, want 2", got)
+	}
 }
 
 // TestTelegraph_HealthCheckIntervalDefault verifies fallback to 30s.
