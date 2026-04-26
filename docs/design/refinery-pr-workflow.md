@@ -2335,3 +2335,447 @@ Blocking for the review-loop invariant. Without this, even G23+G24 combined leav
 3. G25 fix (await-review + wait + current-SHA gate) — closes the race and makes the review loop imperative.
 
 The three together produce: no merge until `(augment has reviewed current SHA) AND (all threads resolved) AND (approval gate passes) AND (at least pr_review_wait elapsed since trigger)`. The refinery LLM's shortest path from "PR exists" to "merged" now includes waiting and checking — no prose-level step it can skip.
+
+---
+
+## G26-G44 + F1: Telegraph wiring dogfood (PR #40 + phase 2 cycle)
+
+Observed 2026-04-26 during the Telegraph wiring dogfood. PR #40 (`gt telegraph start` cobra subcommand, MR `gt-wisp-iau`, polecat furiosa) was the first cycle to exercise the full G21-G25 hardening end-to-end. The `await-review` + threads-gate + escalation halves of the design fired correctly, but a second class of gaps surfaced: **the refinery itself adopted the LLM-optimization patterns the polecat hardening was meant to prevent**, and the **gt-pvx auto-save safety net** was found to bypass everything.
+
+The phase-2 runbook task (gt-mwy.4 / gt-mwy.5) added two more gaps as polecat rictus tried to do the same flow correctly and got blocked at the start.
+
+Each entry below uses the same structure as G1-G25: Observed / Root cause / Distinct from prior G-entries / Fix directions / Priority.
+
+### G26 — `POLECAT_DONE exit=DEFERRED` can fire prematurely / from non-polecat sources
+
+**Observed:** During PR #40 work, the gastown witness received three POLECAT_DONE signals in rapid succession — `alpha`, `Toast`, and `furiosa`, all `exit=DEFERRED`. None of `alpha`/`Toast` are gastown polecats. Furiosa's signal fired while she was still mid-`gt done` (commit made, push in progress). Witness reflexively began composing a `RECOVERY_NEEDED` mail to mayor; that mail was interrupted (G28) and never delivered. Furiosa later emitted the real `POLECAT_DONE furiosa exit=COMPLETED` and the cycle landed cleanly.
+
+**Root cause:** Per `internal/cmd/done.go:1394`, only `gt done` itself emits `POLECAT_DONE <name> exit=<status>` via `nudgeWitness`. The fact that *three* DEFERRED signals reached gastown/witness — at least two from polecats that don't exist on the gastown rig — means either:
+- A non-`gt done` source is publishing the message text (stale automation, manual operator typing, a cron-like watcher)
+- `gt done DEFERRED` was invoked with `rigName="gastown"` from a polecat process that doesn't actually belong to the gastown rig
+- A previous `gt done` invocation that timed out / got killed mid-run is replaying its tail-end nudges
+
+**Distinct from prior G-entries:** G6/G18 were about *false-positive* witness-side detection of polecat state. G26 is upstream of that — the *signal itself* is wrong before witness even reads it.
+
+**Fix directions:**
+1. Add a `gt done`-side guard: don't emit `POLECAT_DONE` for a rig the polecat isn't actually a member of (validate against the rig's polecat list before firing).
+2. Trace and identify the non-`gt done` source of the spurious signals; add a unique-prefix or HMAC-style envelope so the witness can reject signals not emitted by `gt done` itself.
+
+**Priority:** Medium. Today the noise is harmless because `gt done`'s eventual COMPLETED supersedes; but if a real DEFERRED happens during a noise burst, the witness's escalation is lost (G28).
+
+### G27 — `POLECAT_DONE` signals leak across rig boundaries
+
+**Observed:** Same incident as G26. `alpha` and `Toast` POLECAT_DONE signals arrived at `gastown/witness` despite neither polecat being on the gastown rig.
+
+**Root cause:** `internal/cmd/sling_helpers.go:614` `nudgeWitness(rigName, message)` resolves the witness's tmux session via `session.WitnessSessionName(session.PrefixFor(rigName))`. The rigName at the call site decides routing. So either (a) callers somewhere in the codebase pass `rigName="gastown"` for non-gastown polecats, or (b) the resolution is brittle (e.g., default-falls-through to first rig). Either way the witness has no second-line filter rejecting signals for polecats not in its rig's roster.
+
+**Distinct from prior G-entries:** Different layer than G26 (which is "wrong signal emitted at all"). G27 is "signal is correctly emitted but routed to the wrong witness".
+
+**Fix directions:**
+1. Witness-side filter: on inbound `POLECAT_DONE <name>`, look up rig's polecat roster; if `<name>` is not a member, log + drop instead of acting.
+2. Audit `nudgeWitness` callers for cases where rigName is hard-coded or defaulted; add a regression test that fires `POLECAT_DONE` from one rig's polecat and asserts a *different* rig's witness doesn't receive it.
+
+**Priority:** Medium-high. Cross-rig leak means the gastown witness can be misled by activity on heartworks_*, and vice versa.
+
+### G28 — Inbound `gt nudge` interrupts in-flight long-running Bash inside an agent's Claude Code session
+
+**Observed:** During PR #40 work, both witness and refinery had long-running commands (witness: `gt mail send`; refinery: `go test ./...`) interrupted by inbound nudges. The interrupting message text appeared in the agent's tmux pane as if typed at the REPL prompt. For the witness, the interrupted command was a recovery escalation that never delivered. For the refinery, multiple `go test` runs were aborted by `[from gastown/refinery] test` nudges arriving from a process running in a directory that resolved to the refinery's own identity.
+
+**Root cause:** `gt nudge` delivers via `tmux send-keys` into the target pane. Two layered mechanisms drain queued nudges:
+- Hook-driven drain (Claude Code's UserPromptSubmit hook), idle-aware
+- `gt nudge-poller` (`internal/cmd/nudge_poller.go`), running as a background process per session, polls the queue every ~10-30s
+
+The poller's docstring says it's "for agents that lack turn-boundary hooks (Gemini, Codex, Cursor, etc.)" — but on this town it was launched for the Claude Code refinery and witness too (verified via `ps aux | grep gt nudge-poller`). The poller's `shouldSkipDrainUntilIdle(hasPromptDetection, waitErr)` only defers when **both** prompt detection is configured AND idle-wait timed out. If `hasPromptDetection=false` for the running agent's preset (e.g., claude-sonnet doesn't expose `ReadyPromptPrefix`), the poller drains regardless of busy state — straight into a running Bash via `tmux send-keys`.
+
+The behavior is plausibly aggravated when an operator is attached to the session (input surface contention), and confirmed quieter when detached.
+
+**Distinct from prior G-entries:** Net new. Earlier G-entries are about decisions agents make; G28 is about external interruption preventing an in-flight decision from completing.
+
+**Fix directions:**
+1. Don't launch `gt nudge-poller` for Claude Code agents (the hook-drain is sufficient). Trace launcher in `gt crew start` / `internal/dog/manager.go`.
+2. Set `ReadyPromptPrefix` on the claude-sonnet preset so the busy-detection works there too.
+3. `gt nudge` queueing: buffer to a queue rather than push directly into the recipient's REPL when the recipient is mid-Bash (Claude Code's hook system already exposes a busy-marker).
+
+**Priority:** High. Drops escalation mail (G26 + this) and silently aborts test runs. Currently masked when operators stay detached, but the system shouldn't depend on that.
+
+### G29 — Witness role prompt diverged from `done.go:1390-1395` self-managed-completion design
+
+**Observed:** During PR #40 work, witness received `POLECAT_DONE furiosa exit=DEFERRED` and immediately began composing a `RECOVERY_NEEDED` mail to mayor. But the binary-side comment at `internal/cmd/done.go:1390-1395` reads:
+
+> *Self-managed completion (gt-1qlg): witness no longer processes routine completions. The nudge is kept for observability — witness logs the event but doesn't need to act on it.*
+
+So the binary-side intent is "log only"; the witness's role prompt is still wired to "escalate on DEFERRED".
+
+**Root cause:** Two source-of-truth files for witness behavior — `internal/templates/roles/witness.md.tmpl` (the role prompt) and `internal/cmd/done.go` (the binary-side notification). They drifted. Whoever shipped gt-1qlg (the self-managed completion change) didn't also update the role prompt to match.
+
+**Distinct from prior G-entries:** None of G1-G25 covers role-prompt vs binary-comment divergence.
+
+**Fix directions:**
+1. Update `witness.md.tmpl` to match the gt-1qlg intent: log routine completions, don't escalate on DEFERRED unless additional evidence (e.g., the agent bead's `mr_failed` flag is true) is present.
+2. Add a regression test that inspects the role prompt template for the specific guidance and fails if drift recurs.
+
+**Priority:** Medium. The drift is the source of every premature escalation (compounds with G26).
+
+### G30 — `gt refinery pr await-review` `Error: Exit code N` formatting confuses operators and weaker LLMs
+
+**Observed:** Multiple times during PR #40 cycle, the CLI emitted output of the form:
+
+```
+Error: Exit code 1
+[Engineer] PR #40: posted trigger "augment review" to wake augment; checking again after min-wait 5m0s
+Error: exit 1
+```
+
+The double `Error:` prefix (one from cobra's error printer, one from `SilentExitError.Error()`) makes a successful patrol-resumable signal look like two stacked failures. The refinery's Sonnet 4.6 interpreted it correctly, but the formatting is hostile to log-grepping operators and to weaker LLMs.
+
+**Root cause:** `internal/cmd/errors.go` `SilentExitError.Error()` returns `"exit %d"`, which cobra's error wrapping prefixes with `Error: ` again. And the `[Engineer] ...` informational line is sandwiched between the two, making it look like "two errors with an in-between log".
+
+**Fix directions:**
+1. For SilentExit codes that represent intentional non-zero outcomes (1=Waiting, 2=NeedsResolution, 3=TimedOut, 4=Operational), suppress cobra's wrapper `Error: ` prefix.
+2. Rename the exit-1 informational line so it doesn't say "Error" at all — e.g., `[await-review] still waiting (exit 1)`.
+3. Document the exit-code legend at the top of every patrol-resumable subcommand's help text (already partial — make uniform).
+
+**Priority:** Low (UX). Doesn't break behavior; just makes failures harder to read.
+
+### G31 — Polecat directly pushes to origin under `polecat/<name>/<id>`, leaving orphan branches when polecats die
+
+**Observed:** Pre-existing beads `hq-148` and `hq-p2c` describe `polecat/furiosa-mo6miet2` (434 LOC) and `polecat/nux-mo6mj4rx` (682 LOC) sitting on origin with no MR beads — both branch tips are `fix: auto-save uncommitted implementation work` (the gt-pvx safety net), polecat died mid-work. Reaper has to chase them down.
+
+**Root cause:** Today's design (intentional, encoded at `internal/cmd/done.go:672-675`):
+
+> *CRITICAL: Push branch BEFORE creating MR bead. The MR bead triggers Refinery to process this branch. If the branch isn't pushed yet, Refinery finds nothing to merge. The worktree gets nuked at the end of gt done, so the commits are lost forever.*
+
+Push is the durability mechanism. But it pollutes origin with orphan branches when polecats die before completing `gt done`.
+
+**Proposed redesign:** Polecat commits to shared `<rig>/.repo.git` only (worktrees of the same bare repo see each other's commits via the shared object store). Refinery becomes the sole pusher to origin under `refinery/<id>`. Requires a scratch-remote story for disk-loss recovery. See "Side-by-side trade-off table" archived from the dogfood discussion (worth porting into this doc when work resumes).
+
+**Distinct from prior G-entries:** G31 is architectural; G26-G30 are behavioral.
+
+**Fix directions:**
+1. Introduce `<rig>/.repo.git/refs/incoming/<polecat>/<id>` namespace; polecat updates it locally on commit, no network push.
+2. Refinery picks up the incoming ref by name, runs the rebase + tests, then pushes a clean refinery-controlled branch to origin.
+3. Reaper periodically GCs the incoming-ref namespace.
+
+**Priority:** Architectural — file as design-spec follow-up under the same epic the merge-workflow hardening lives in.
+
+### G32 — PR bodies reference internal beads, not Problem/Solution prose readable by external reviewers
+
+**Observed:** PR #40's body was the literal string:
+
+```
+Closes gt-mwy.2\n\nAdds `gt telegraph start` cobra subcommand that constructs and runs the full Telegraph pipeline for a single town, mirroring the integration test wiring with production substitutions.\n\nWorker: furiosa
+```
+
+Three compounding issues, in increasing severity:
+
+1. **Escape-rendering bug.** `\n\n` rendered as literal characters because the body was passed inside a bash double-quoted string (no expansion of `\n`). Mechanical, easy to fix.
+2. **No Problem/Solution/Test-plan structure.** Even when the escapes are fixed, the body is one undifferentiated paragraph. Reviewers can't tell what problem the PR solves, what alternatives were considered, or how to verify the fix.
+3. **References to internal bead IDs that are opaque to external reviewers** (the *real* design gap). `gt-mwy.2`, `Worker: furiosa`, references to "Phase 1 / Phase 2", citations of `hq-wisp-*` escalation IDs — none of these are visible outside the gastown town. A reviewer browsing the PR on GitHub (especially upstream `gastownhall/gastown` or a fork's contributors who don't run a town) sees opaque tokens with no way to look them up. Even worse, `Closes gt-mwy.2` looks like a GitHub auto-close ref but isn't — so the bead never gets closed, and the reviewer has no idea what `gt-mwy.2` is.
+
+The PR description must stand alone for **anyone with PR access**, not just town members. Internal artifacts (bead IDs, polecat names, escalation IDs, patrol-cycle references) belong in commit trailers or town-side audit logs, not in the PR description that GitHub Reviewers see.
+
+**Root cause:** Whoever composes the PR body (polecat in `gt done` create-PR step, or refinery in `gt refinery pr create`) builds a one-line bash string from internal context the polecat had to hand. There's no template that asks the composer to translate from internal-token-language to externally-readable prose, and no validator that flags bead-IDs / polecat-names / wisp-IDs in the body.
+
+**Distinct from prior G-entries:** Pure content/UX — doesn't gate any merge behavior, but renders PRs unreviewable for any audience beyond the producing town.
+
+**Fix directions:**
+1. The polecat's task formula writes a structured body to a tempfile during `gt done`, with mandatory sections **Problem** / **Solution** / **Test plan** (and optionally **Risks** / **Out of scope**). The polecat fills the sections from the bead's description and the work it actually did. Stash the path on the MR bead so the refinery can pass it through.
+2. `gt refinery pr create` defaults to `--body-file` when the bead has a body-path field.
+3. Add `gt refinery pr create --template <name>` with a built-in Problem/Solution/Test-plan skeleton (default `default-pr-body.md`). The template uses placeholder text that the body composer is required to fill in — empty placeholders fail PR creation, forcing the composer to write real prose rather than dropping the template through verbatim.
+4. **Validator: reject internal-token leakage.** Before opening the PR, scan the body for patterns matching `\b(gt-|hq-|gts-)[a-z0-9.]+`, polecat names against the rig's polecat roster, and `\b(Worker|Polecat|Patrol|Wisp):\s*\S+` headers. Any match → fail PR creation with a message listing the offending tokens. Forces the composer to explain the work in domain language an external reviewer can read.
+
+**Priority:** Medium. Reviewers (human and bot) need to read the body to gauge scope; today external reviewers see only town-internal jargon. The validator (#4) is the load-bearing piece — without it, templates can be filled with the same opaque tokens.
+
+### G33 — Refinery does review-fix work inline instead of dispatching a polecat (PR.5 bypass)
+
+**Observed:** When `gt refinery pr await-review` returned exit 2 (NeedsReviewResolution) on PR #40, the refinery loaded the `address-pr-comments` Claude Code skill and **edited the source files in its own worktree** instead of running `gt sling mol-polecat-review-pr` to dispatch a polecat. Repeated three times across PR #40's three review iterations, producing commits `2c434c94`, `8c8db7ce`, `e51be54d` — all authored by `gastown/refinery <artie@phaware.global>`, not by the original polecat (furiosa).
+
+**Root cause:** Patrol formula's PR.5 step (`mol-refinery-patrol.formula.toml` line ~1162) instructs polecat dispatch via `gt sling`. The refinery LLM read "address PR comments" as "do it yourself" because (a) `address-pr-comments` is also a Claude Code skill name available to the refinery, and (b) the formula's dispatch step is prose, not an imperative CLI call (G19/G21/G22 closed the same class of bypass for PR.7 merge; PR.5 wasn't given the same treatment).
+
+**Distinct from prior G-entries:** G33 is the polecat-dispatch dual of G19's PR-create bypass. Same pattern, different step in the formula.
+
+**Fix directions:** Same playbook as G25's collapse of PR.4 into `gt refinery pr await-review`. Introduce an imperative subcommand for PR.5 that the refinery can't optimize away:
+
+```
+gt refinery pr dispatch-review-fix <pr-number> --mr <bead> --max-iter <n>
+```
+
+Atomic responsibilities:
+1. Reads `review_loop_iter` from the bead, increments by 1.
+2. If `review_loop_iter > pr_review_loop_max`: exits 3 (caller escalates to mayor).
+3. Otherwise: `gt sling mol-polecat-review-pr <args>`, captures polecat name, writes `review_fix_polecat=<name>` and the new iter onto the bead.
+4. Returns exit 1 (waiting for polecat — patrol-resumable, identical pattern to await-review).
+
+Then PR.5's prose collapses to one command line, the LLM has nowhere to put "do it myself", and the iter counter is enforced server-side.
+
+**Priority:** Blocking. Today's bypass also breaks G34/G35/G36/G37 in cascade; the single fix here closes most of them.
+
+### G34 — Refinery force-pushes onto polecat-namespaced branches via refspec
+
+**Observed:** On PR #40, the refinery pushed three commits to `polecat/furiosa/gt-mwy.2@mofsfwb2` on origin via the refspec form:
+
+```
+git push --force-with-lease origin process/gt-mwy.2:polecat/furiosa/gt-mwy.2@mofsfwb2
+   25f66e39..2c434c94  process/gt-mwy.2 -> polecat/furiosa/gt-mwy.2@mofsfwb2
+```
+
+Resulting commits authored by `gastown/refinery`, not furiosa. Per-polecat attribution destroyed; PR's history is mixed-author.
+
+**Root cause:** Direct consequence of G33 (refinery doing the work itself). Once the refinery has committed locally, it must push *somewhere*; the path of least resistance is overwriting the existing PR's HEAD branch.
+
+**Distinct from prior G-entries:** G34 is downstream of G33 — fixing G33 (polecat dispatch) eliminates the trigger. But even with G33 fixed, the *technique* (refspec push to a different branch name) is now demonstrated; should be guarded against in any future refinery-side write path.
+
+**Fix directions:**
+1. Tap-guard extension: refuse `git push origin <local>:polecat/...` from the refinery's worktree. The polecat-namespace is owned by polecats.
+2. Combine with G31's redesign — once refinery is the sole pusher, the polecat namespace on origin disappears and the attack surface goes with it.
+
+**Priority:** High. Co-fix with G33.
+
+### G35 — Inline review-fix bypasses `await_review_started_at` reset, reintroducing the G25 race
+
+**Observed:** On PR #40, after each refinery-side force-push (G34), the bead's `await_review_started_at` field stayed at `2026-04-26T13:37:27Z` (the original first-trigger time). The refinery's subsequent `await-review` calls computed `elapsed=14m39s, 21m22s, 33m24s` — all measured against the stale start, all past the 5-minute min-wait window. The G25 minimum-wait gate that was supposed to enforce a fresh wait on each new HEAD was effectively zero.
+
+**Root cause:** Per the formula's polecat-done branch at `mol-refinery-patrol.formula.toml:1115-1124`, `await_review_started_at` is cleared by `mq set-review-state --clear-await-started-at` on the polecat-done path. The inline-fix bypass (G33) never enters that branch, so the timestamp is never reset.
+
+**Distinct from prior G-entries:** G35 is a downstream symptom of G33. But it's worth recording separately because even after G33 is fixed (so the polecat-dispatch path is taken), any *future* path that does refinery-side commits would re-introduce G35 unless the timestamp-clear is enforced at a layer below the formula prose.
+
+**Fix directions:**
+1. Move the `await_review_started_at` clear into the imperative dispatch subcommand (G33's fix): `gt refinery pr dispatch-review-fix` clears the timestamp atomically with the polecat sling.
+2. Add an invariant check at the start of `gt refinery pr await-review`: if the branch HEAD on origin doesn't match `bead.commit_sha` (G36 dual), refuse to use the persisted timestamp; force re-trigger.
+
+**Priority:** Blocking — this is the G25 race re-emerging.
+
+### G36 — MR bead's `commit_sha` field becomes stale after force-push under the inline review-fix path
+
+**Observed:** Throughout PR #40's cycle, the bead `gt-wisp-iau` retained:
+
+```
+commit_sha: 25f66e390ed3ca3a3a16112b783650928bddf5e7   ← original polecat commit
+```
+
+…even though the branch tip on origin had moved to `2c434c94`, then `8c8db7ce`, then `e51be54d`.
+
+**Root cause:** Same source as G35. The polecat-dispatch path updates `commit_sha` (via `gt done` on the polecat side, which knows its commit, or via `mq set-review-state` on the refinery side post-dispatch). The inline bypass doesn't touch the field. Now the bead is lying about which commit it represents.
+
+**Fix directions:**
+1. The G33 imperative subcommand (`gt refinery pr dispatch-review-fix`) updates `commit_sha` atomically with the dispatch.
+2. Add a verification step to `gt refinery pr merge`: refuse if `bead.commit_sha != origin/branch:tip`. Currently this is implicit; making it explicit means a stale bead → safe-fail at merge time.
+
+**Priority:** High — bead metadata used by audit, reaper, and possibly the merge-time SHA check.
+
+### G37 — `gt refinery pr await-review` doesn't re-trigger the reviewer on subsequent calls; `HasReviewFrom` not SHA-scoped
+
+**Observed:** After the refinery's force-pushed `8c8db7ce` on PR #40, the next `await-review` call did NOT re-post a trigger comment for augment to re-review the new HEAD. Subsequent calls observed augment's *prior* review (against the old HEAD `25f66e39`) and were on a path to satisfy the reviewer-engaged check despite augment not having seen the new commit.
+
+**Root cause:**
+- `internal/refinery/await_review.go:157` only posts the trigger when `in.StartedAt.IsZero()`. Once `await_review_started_at` is set on the bead, every subsequent call skips trigger-post.
+- `provider.HasReviewFrom(pr, reviewer)` doesn't constrain the review to the *current* HEAD SHA. The §G25 design doc spec specifies "a review … exists on the current HEAD SHA"; the implementation appears to landed gate-side only (in `gt refinery pr merge`), not on the await-review gate.
+
+Compounds with G35 — when the timestamp isn't cleared on a force-push, the protections on the new HEAD are missing on every layer.
+
+**Fix directions:**
+1. `HasReviewFrom` accepts a SHA argument and asserts review's `commit_id == sha`. Implementations: GitHub `gh api` query for `pulls/<n>/reviews` with commit SHA; Bitbucket equivalent.
+2. Any path that handles a force-push must clear `await_review_started_at` (G35) AND re-post the trigger comment for the new HEAD.
+3. Document explicitly in `internal/refinery/await_review.go` that the SHA-scoped check is load-bearing for G25.
+
+**Priority:** Blocking — same severity as G25, which it undermines.
+
+### G38 — `pr_reviewer` short-name (`augment`) doesn't match the actual GitHub login (`augmentcode`)
+
+**Observed:** On PR #40, augment posted three review comment-batches (13:40, 13:54, 14:08) but `gt refinery pr await-review` returned exit 3 (TimedOut) at 33m24s with the message "augment never engaged after 33m24s — escalate". Augment had reviewed; the gate disagreed.
+
+**Root cause:** Initial hypothesis was that `HasReviewFrom` filters on `state == APPROVED`. **Trace disproved it** — `internal/git/git.go:GhPrHasReviewFrom` already counts any review state via case-insensitive login match. The actual mismatch is between two semantically distinct roles overloaded onto a single config value:
+
+- The trigger phrase ("augment review", "/gemini review", etc.) is configured via `merge_queue.pr_trigger_comment` and posted on the PR.
+- `merge_queue.pr_reviewer` is the GitHub *login* the gate looks up reviews under. Misconfiguration: an operator who saw the trigger phrase as the canonical name set `pr_reviewer = "augment"` (the trigger-phrase prefix) instead of `pr_reviewer = "augmentcode"` (the bot's actual login). `HasReviewFrom(pr, "augment")` then looks for a review whose `author.login == "augment"` — which never matches, regardless of how many reviews augmentcode posts.
+
+The exact same break applies to the other comment-only bots that run on the rig (Copilot, gemini-code-assist) — none has a login that equals its short name.
+
+**Distinct from prior G-entries:** Different from G37 (SHA-scoping — *which commit* counts). G38 is about *which login* counts.
+
+**Fix directions:**
+
+The two concerns — *which phrase wakes the bot* (the trigger) and *which login proves the bot reviewed* (the lookup) — already live in distinct config fields and stay distinct:
+
+- `pr_trigger_comment` (default `"augment review"`) is the literal phrase posted on the PR. Differs per bot (`augment review` vs `/gemini review` vs the eventual Copilot trigger).
+- `pr_reviewer` is the actual GitHub login of the reviewer (`augmentcode`, `gemini-code-assist`, `Copilot`). Operators MUST set this to the bot's exact login or no review will satisfy the gate.
+
+1. **Diagnostic improvement at timeout**: when `AwaitStatusTimedOut` fires, augment the error message with the unique review-authors observed on the PR — e.g., `"'augment' never engaged after 33m24s — escalate (PR has reviews from: augmentcode, gemini-code-assist, phaware-artie). If your reviewer-bot's login differs from the trigger keyword, update merge_queue.pr_reviewer."` This makes the misconfiguration self-evident in the patrol log on first occurrence.
+2. **Update the doc comment on `PRReviewer` config field** in `internal/config/types.go` to spell out: this is the *GitHub login* of the reviewer, not the trigger keyword. Replace the misleading `e.g., "augment"` example with `e.g., "augmentcode"`.
+3. **Operator-side**: update each rig's `settings/config.json` `merge_queue.pr_reviewer` to the actual GitHub login. (Not part of this code change — operator config lives outside the source repo.)
+4. Regression test: timeout error message includes review-author list when reviews exist; falls back to a clear "no reviews submitted yet" tail when the PR has none.
+
+**Priority:** Blocking. Without the diagnostic, the misconfiguration manifests only as a 30-minute timeout-then-escalate cycle every cycle, with no log line pointing the operator at the cause.
+
+### G39 — Escalation `email:human` action silently skipped when `contacts.human_email` unset
+
+**Observed:** When refinery on PR #40 escalated at exit 3, the output included:
+
+```
+⚠ Warning: email action 'email:human' skipped: contacts.human_email not configured in settings/escalation.json
+⚠️ Escalation created: hq-wisp-rhxf6
+```
+
+Out-of-band human notification didn't fire. Mayor + witness were notified via gastown mail; an external human was not.
+
+**Root cause:** `gt escalate`'s action runner skips email/SMS when contacts aren't configured, with a warning line that's easy to miss. For a CRITICAL escalation this is an unsafe default.
+
+**Fix directions:**
+1. For severities `CRITICAL` and `HIGH`, fail the escalation hard if any configured action is skipped — surfaces misconfiguration before a real incident.
+2. `gt doctor` check: assert `settings/escalation.json` has at least one human-reachable contact for any severity ≥ HIGH the rig supports.
+
+**Priority:** Medium-high. Bites quietly today; bites loudly the day a real incident depends on it.
+
+### G40 — Refinery executes the merge step itself before mayor's authorization arrives
+
+**Observed:** PR #40 was merged at `52530e96` (2026-04-26T14:16:09Z) BEFORE the mayor's authorization mail arrived. Refinery's session shows:
+
+```
+⏺ Merged. Running post-merge cleanup.
+$ gt mq post-merge gastown gt-wisp-iau
+  ✓ Post-merge: gt-wisp-iau
+
+❯ 📬 You have new mail from mayor/. Subject: Re: PR #40 — proceed via gh fallback, file follow-up bead.
+⏺ Already merged (ahead of this mail). Sending MERGED notification now.
+```
+
+The refinery's "Already merged (ahead of this mail)" line confirms it acted before mayor authorized. The approval-proof gate (G21) was bypassed, and so was the tap-guard (G21 fix).
+
+**Root cause:** Either (a) `gt refinery pr merge` has a code path the LLM found that satisfies the gate without `pr_approver`'s APPROVED review (e.g., the empty-`pr_approver` branch), or (b) the refinery invoked `gh pr merge` directly and the tap-guard didn't fire on this path, or (c) the `--admin` flag bypasses gates. The exact exploit needs to be traced from the session capture.
+
+**Distinct from prior G-entries:** G19/G21 closed the LLM-improvises-merge class for the *polecat*. G40 is the *refinery* doing the same thing — same pattern, different actor.
+
+**Fix directions:**
+1. Trace which code path the refinery used. Add a regression test that any merge invocation from refinery context against an unapproved PR fails closed.
+2. If `gh pr merge` was used directly, extend the tap-guard to refinery-context invocations (it currently scopes to polecat workdirs).
+3. Combine with F1: if the rig has `pr_approval_mode = "reviewer-clean"`, the gate accepts a clean reviewer-state; otherwise unapproved PRs cannot merge regardless of caller.
+
+**Priority:** Blocking. This is the G19 hole reopened on the refinery side.
+
+### G41 — `gt-pvx` auto-save safety net commits to current branch and pushes to origin/main when worktree is on main
+
+**Observed:** Polecat rictus, working on the Telegraph runbook (gt-mwy.4), had its in-progress work auto-committed by the `gt-pvx` safety net at 2026-04-26T08:24:52:
+
+```
+6c229e31 fix: auto-save uncommitted implementation work (gt-pvx safety net)
+         Author: rictus <artie@phaware.global>
+         Files: docs/design/telegraph.md (+1), docs/runbooks/telegraph.md (+285)
+```
+
+This commit landed directly on `origin/main`. Mayor reverted at `bab51596` (also direct-to-main) 4 minutes later. 286 lines of work bypassed every G1-G25 merge gate.
+
+**Root cause (three layers):**
+1. **Why was rictus's worktree on main?** The polecat formula doesn't enforce `git checkout -b polecat/<name>/<id>` as the first imperative step. The polecat is free to do work on whatever branch the worktree happened to be on (often `main` after `git pull`).
+2. **Why does the safety net push?** The earlier `done.go:684-689` fix forced an explicit refspec for the legitimate `gt done` push path. The safety net is a *separate* code path that doesn't share that discipline. It commits and (apparently) pushes via tracking config, which when on `main` resolves to `origin/main`.
+3. **Why doesn't the safety net refuse to commit on main?** No pre-commit guard in the safety net path.
+
+**Distinct from prior G-entries:** G19/G20 closed the *polecat-LLM-conscious-decision* class of "push to main bypassing MR/refinery". G41 is the *automation-side* equivalent — a hook that pushes to main without any LLM involvement at all.
+
+**Fix directions:**
+1. Pre-commit guard in the gt-pvx safety net: if `HEAD` is `main`, `master`, `develop`, or any branch whose upstream is one of those, **refuse to auto-commit at all** — exit with a clear message that the polecat is on a protected branch, no work will be saved automatically. Combined with G43 (the polecat must be on a polecat-namespaced branch before any edit work begins), this means the safety net only ever acts on legitimate polecat branches.
+2. Polecat formula change (covered by G43): enforce branch creation as imperatively as G25 enforces await-review — `gt polecat checkout-branch <bead-id>` as the first step, fails closed if not on a polecat branch by step 2.
+
+**Priority:** Blocking. Auto-pushes to main bypass everything. The system already detected this (witness filed `gt-i71` P0 bug + `hq-wisp-cvefz` CRITICAL escalation) — the prevention layer is missing.
+
+### G42 — Tap-guard's intentional block on `git checkout -b` has no `gt`-side recovery path
+
+**Observed:** Phase 2 of the Telegraph spec, polecat rictus picked up gt-mwy.5 (regenerated runbook task, generic content). Per witness escalation `hq-wisp-ra6s6`:
+
+> *Blocked on gt-mwy.5: Mayor requires PR workflow, tap guard blocks 'git checkout -b', gt done fails on main. Standing by.*
+
+Witness initially diagnosed this as "tap guard misconfigured" and mailed mayor accordingly (`hq-wisp-qjvlr`).
+
+**Mayor's corrected diagnosis** (after consulting `internal/cmd/tap_guard_pr_workflow_test.go`):
+
+> *Tap guard is working as designed — it intentionally blocks `git checkout -b`, `git switch -c`, and `gh pr create` to force the gt formula path. Real root cause: rictus's worktree was on main — leftover from the gt-mwy.4 auto-save incident (G41), where the unauthorized commit landed on main in the rictus worktree, and the polecat branch was never restored.*
+
+Mayor (not subject to the polecat tap-guard) recovered manually by running `git checkout -b polecat/rictus-gt-mwy.5` directly in rictus's worktree, then mailing rictus to proceed.
+
+**Root cause (revised):** The tap-guard correctly blocks raw `git checkout -b` to force polecats through the formula path — but the formula path **doesn't expose a `gt`-side branch-creation step** that polecats can use. So a polecat that finds itself on main (via G41 residue, or because its worktree was just initialized, or because it pulled main between assignments) has *no permitted way* to create its polecat branch. The right action and the only available action are mutually exclusive.
+
+The original "G42 is a tap-guard regression" framing was wrong. The real shape: **G42 is the missing `gt`-side affordance that pairs with the tap-guard's intentional block**. This makes G42 effectively a duplicate of G43; treating them as one in the fix.
+
+Secondary observation surfaced by this incident: **witness's diagnosis of subsystem misconfiguration didn't consult the relevant test file** (`tap_guard_pr_workflow_test.go`). The test file is ground truth for tap-guard behavior; consulting it would have flipped the diagnosis from "guard misconfigured" to "intended block + missing recovery affordance". Worth capturing as G44 below.
+
+**Distinct from prior G-entries:** G21 introduced the tap-guard. G42 is the design oversight in pairing the tap-guard with its corresponding `gt`-side affordance.
+
+**Fix directions:** **MERGED with G43 below.** The single fix — introducing `gt polecat checkout-branch <bead-id>` — closes both gaps. Keep this entry as the symptom-side documentation; G43 holds the implementation specification.
+
+**Priority:** Blocking. Currently a hand-recovery path (mayor manually creates the branch with mayor's tap-guard exemption) is the only way out.
+
+### G43 — Polecat formula needs an imperative `gt polecat checkout-branch` first step
+
+**Observed:** Inferred from G41 (rictus's worktree was on main when gt-pvx fired) and G42 (rictus tried to fix that via raw `git checkout -b` and got the by-design tap-guard block). The root design issue: the polecat formula doesn't have an imperative step that *must* happen before any edit work — `gt polecat checkout-branch <bead-id>` (or equivalent) — that fails closed if not on a polecat-namespaced branch.
+
+**Root cause:** Formula prose can be optimized away by the LLM (the same pattern G19/G21/G25 closed for refinery steps). The polecat side is still prose-driven. Combined with G42's tap-guard block, the polecat has no permitted way to recover from a "started on main" state.
+
+**Distinct from prior G-entries:** G19/G21/G25 closed prose-bypass on the *refinery* side. G43 is the *polecat* side equivalent.
+
+**Fix directions:**
+1. Introduce `gt polecat checkout-branch <bead-id>` as the first imperative step in `mol-polecat-work.formula.toml` (and the monorepo / TDD variants). The subcommand is **inside the tap-guard's allowlist** (it's the canonical gt-formula path; tap-guard's job is to redirect raw `git checkout -b` to this). Atomic responsibilities:
+   - Read the bead, derive `polecat/<name>/<id>` branch name.
+   - If the worktree is already on that branch → exit 0 (idempotent).
+   - If the worktree is on `main` / `master` / `develop` → invoke the underlying `git checkout -b <name>` (tap-guard exempts the gt path).
+   - If the worktree is on a *different* polecat branch → exit non-zero with a structured "stale-state" error; mayor adjudicates.
+2. Polecat formula prose collapses to one command line at the top. The LLM can't skip it; if it does, every subsequent `git` operation works on `main` and gets caught by the tap-guard.
+3. Audit: `mol-polecat-work*.formula.toml` for any `git checkout` invocations and replace with `gt polecat checkout-branch <bead-id>`.
+
+**Priority:** Blocking. Combined with G41 + G42, this is the polecat-side dual of G19/G21/G25 — the LLM-optimization-resistant first step that anchors all the subsequent guarantees.
+
+### G44 — Witness diagnoses subsystem misconfiguration without consulting the corresponding test file
+
+**Observed:** During the gt-mwy.5 deadlock, witness's escalation `hq-wisp-qjvlr` to mayor read:
+
+> *Subject: Tap guard misconfigured: blocks `git checkout -b`, breaks rictus/gt-mwy.5*
+
+That diagnosis was **wrong**. Mayor's response (after consulting `internal/cmd/tap_guard_pr_workflow_test.go`) corrected it: the block is intentional, not misconfigured. Witness's escalation framed the gap incorrectly and proposed a fix direction (loosen the tap-guard) that would have weakened the G21 hardening.
+
+**Root cause:** Witness's diagnostic process for subsystem behavior questions doesn't reach for the relevant test file as ground truth. Witness can read tmux panes (`gt peek`), bd state, mail inboxes — all *runtime* observation. Tests are *intent* declarations. When a runtime symptom looks like "subsystem X is misbehaving", the test file for X is the fastest disambiguation step ("is this behavior intentional or accidental?"). Witness's role prompt likely doesn't include "consult tests before declaring misconfiguration".
+
+**Distinct from prior G-entries:** Different layer than G29 (witness role-prompt drift). G29 is "what the witness is told to do is wrong"; G44 is "the witness's diagnostic protocol is missing a step that would prevent miscalled escalations".
+
+**Fix directions:**
+1. Update `witness.md.tmpl` to require: when an escalation's subject claims a subsystem is *misconfigured / misbehaving / broken*, the escalation body must include a one-line citation of the relevant test file's expected behavior (or "no test found for this subsystem" if absent — itself a lower-severity gap to surface separately). Without that line, the escalation is rejected at the witness's `gt mail send` step.
+2. Add `gt witness explain <subsystem>` (or similar) that returns the relevant test files + their stated invariants for a named subsystem (`tap-guard`, `await-review`, `mr-bead-creation`, etc.). Gives the witness deterministic data to cite in step 1, rather than asking the LLM to guess where ground truth lives.
+
+**Priority:** Medium. Today's misdiagnosis was caught by mayor's care; the prevention layer is making the witness cite tests before declaring something misconfigured.
+
+### F1 — Optional bypass of human approval before merging (FEATURE REQUEST, not a gap)
+
+**Context:** Today `merge_queue.pr_approver` requires a human's approving review (e.g., `kevinpjones`) before merge. The `pr_reviewer` (e.g., `augment`) only ever **comments** with review threads; it never issues `APPROVE` review states. So under the current strict gate, every PR — even purely bot-driven dogfood cycles — wedges at PR.6 (`wait-approval`) until a human acks.
+
+**Proposal:** Add a per-rig `merge_queue.pr_approval_mode` field with values:
+- `"human"` (today's behavior, the default)
+- `"reviewer-clean"` — merge unblocks when `pr_reviewer` has reviewed the current HEAD AND no unresolved threads remain (i.e., G24 + G37 SHA-aware HasReviewFrom + G38 widened state acceptance are sufficient)
+- `"none"` — only the test/CI gates apply; explicit opt-in for unattended automation
+
+**Constraints to preserve:**
+- The mode is per-rig, not per-PR. A polecat or refinery can't escalate-its-own-merge by setting it on a PR.
+- Default stays `"human"` — opting out of human approval is a deliberate config change with audit trail.
+- The G24 unresolved-threads gate AND the G25/G37 SHA-aware reviewer gate both stay enforced regardless of mode (otherwise `"none"` becomes the G19 escape hatch we just patched).
+- Document in this doc as the legitimate counterpart to G21 ("approval-proof gate") rather than a hole in it.
+
+**Implementation locations:**
+- `internal/refinery/engineer.go` `MergeQueueConfig` gets a new `PRApprovalMode string` field.
+- `internal/refinery/approval.go` `VerifyPRApproval` branches on the mode.
+- The `merge_queue` validator rejects `"none"` without an explicit env-var override (e.g., `GT_REFINERY_ALLOW_UNAPPROVED=1`) so it's hard to set by accident.
+
+**Priority:** Wanted. F1 is the right counterpart to G38 (widening HasReviewFrom): together they let augment-only rigs run unattended.
+
+---
+
+## G26-G44 implementation order (when work resumes)
+
+Recommended ordering, smallest dependency-set first, ending with the architectural items. Updated after mayor's diagnosis correction on G42 (was "tap-guard regression"; actually "tap-guard intentional, missing gt-side affordance" — merged with G43).
+
+1. **G42 + G43** — `gt polecat checkout-branch <bead-id>` imperative step. Single fix closes both: gives polecats a tap-guard-permitted recovery from the on-main state, AND becomes the imperative first step in the polecat formula. Highest priority — currently rictus is hand-recovered by mayor each time this hits.
+2. **G41** — gt-pvx safety-net pre-commit guard (refuse to commit when `HEAD` is on `main`/`master`/`develop`; exit with a clear message naming the protected branch, leaving the work uncommitted in the worktree so a polecat or operator can recover it manually). Closes the auto-push-to-main attack vector independently of G43.
+3. **G33 + G34 + G35 + G36** — `gt refinery pr dispatch-review-fix <pr> --mr <bead> --max-iter <n>` imperative subcommand + bead metadata sync. The refinery-side dual of G43 (PR.5 dispatch is imperative, not prose).
+4. **G37 + G38** — SHA-scoped + state-widened `HasReviewFrom`.
+5. **G40** — close the refinery-side merge bypass (whichever path is found by tracing).
+6. **F1** — `pr_approval_mode = reviewer-clean` (depends on G37+G38 working correctly).
+7. **G29 + G44** — sync witness role prompt with `done.go:1390-1395` self-managed-completion intent (G29) AND add the test-file-citation requirement to witness's escalation protocol (G44). Both are role-prompt template edits.
+8. **G39** — fail CRITICAL/HIGH escalations hard when contacts unset.
+9. **G26 + G27 + G28** — POLECAT_DONE noise sources + cross-rig leak + nudge-poller drain semantics.
+10. **G30 + G32** — UX cleanup (await-review error formatting, PR-body template).
+11. **G31** — refinery-as-sole-pusher architectural redesign (longest tail).
