@@ -534,8 +534,25 @@ func runRefineryPrAwaitReview(cmd *cobra.Command, args []string) error {
 	if refPrAwaitNoTrigger {
 		triggerComment = ""
 	}
+	// Reject negative --wait / --timeout explicitly. firstNonZero would
+	// happily pass a negative value through, which would either make
+	// elapsed >= MinWait trivially true (defeating the min-wait gate
+	// the formula relies on, reintroducing the original race) or push
+	// the timeout into the past.
+	if refPrAwaitWait < 0 {
+		return fmt.Errorf("await-review: --wait must be non-negative, got %v", refPrAwaitWait)
+	}
+	if refPrAwaitTimeout < 0 {
+		return fmt.Errorf("await-review: --timeout must be non-negative, got %v", refPrAwaitTimeout)
+	}
 	wait := firstNonZero(refPrAwaitWait, cfg.PRReviewWait)
 	timeout := firstNonZero(refPrAwaitTimeout, cfg.PRReviewTimeout)
+	if timeout > 0 && wait > 0 && timeout <= wait {
+		return fmt.Errorf(
+			"await-review: timeout (%v) must be greater than wait (%v); "+
+				"otherwise the timeout fires inside the min-wait window",
+			timeout, wait)
+	}
 
 	startedAt, mrBd, err := readAwaitReviewState(refPrAwaitMR)
 	if err != nil {

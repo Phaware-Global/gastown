@@ -161,16 +161,37 @@ func AwaitReviewStep(provider PRProvider, prNumber int, in AwaitReviewStepInput)
 			}
 		}
 		t := now()
+		// Differentiate the message when no trigger was posted (pr_trigger_comment
+		// empty / --no-trigger). "Posted trigger %q" is misleading when nothing
+		// went out, and operators diagnosing a non-engaging reviewer bot need
+		// to know whether the trigger actually fired.
+		var msg string
+		if in.TriggerComment != "" {
+			msg = fmt.Sprintf(
+				"PR #%d: posted trigger %q to wake %s; checking again after min-wait %s",
+				prNumber, in.TriggerComment, in.Reviewer, in.MinWait.Round(time.Second))
+		} else {
+			msg = fmt.Sprintf(
+				"PR #%d: trigger comment disabled — starting min-wait window of %s for %s to engage",
+				prNumber, in.MinWait.Round(time.Second), in.Reviewer)
+		}
 		return AwaitReviewStepResult{
 			Status:       AwaitStatusTriggerPosted,
 			NewStartedAt: t,
-			Message: fmt.Sprintf(
-				"PR #%d: posted trigger %q to wake %s; checking again after min-wait %s",
-				prNumber, in.TriggerComment, in.Reviewer, in.MinWait.Round(time.Second)),
+			Message:      msg,
 		}, nil
 	}
 
+	// Guard against a StartedAt in the future (clock skew across hosts,
+	// or a manually-edited MR bead). A negative `elapsed` would compare
+	// less than MinWait by definition and unexpectedly extend the wait
+	// window — potentially indefinitely if the skew is large. Treat
+	// future timestamps as "min-wait window starts now" rather than
+	// rolling backwards.
 	elapsed := now().Sub(in.StartedAt)
+	if elapsed < 0 {
+		elapsed = 0
+	}
 
 	// Still inside the min-wait window — refuse to even check threads
 	// or reviewer state. This is the imperative gate.

@@ -467,6 +467,46 @@ func TestHandleMRInfoFailure_NeedsApproval_StaysInQueue(t *testing.T) {
 	}
 }
 
+// TestEngineer_LoadConfig_RejectsTimeoutLEWait covers the cross-field
+// invariant flagged on PR #37: pr_review_timeout must be greater than
+// pr_review_wait. If the timeout fires inside the min-wait window,
+// await-review can never reach the threads/reviewer checks. LoadConfig
+// must fail fast at config-load rather than letting the misconfiguration
+// surface as a runtime error on first invocation.
+func TestEngineer_LoadConfig_RejectsTimeoutLEWait(t *testing.T) {
+	tmpDir := t.TempDir()
+	settingsDir := filepath.Join(tmpDir, "settings")
+	if err := os.MkdirAll(settingsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// timeout (3m) <= wait (5m) — invalid.
+	settings := map[string]interface{}{
+		"type":    "rig-settings",
+		"version": 1,
+		"merge_queue": map[string]interface{}{
+			"merge_strategy":    "pr",
+			"pr_approver":       "kevinpjones",
+			"pr_review_wait":    "5m",
+			"pr_review_timeout": "3m",
+		},
+	}
+	data := mustMarshalIndent(t, settings)
+	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
+	e := NewEngineer(r)
+	err := e.LoadConfig()
+	if err == nil {
+		t.Fatal("expected error when pr_review_timeout <= pr_review_wait, got nil")
+	}
+	if !strings.Contains(err.Error(), "pr_review_timeout") || !strings.Contains(err.Error(), "pr_review_wait") {
+		t.Errorf("error should name both fields, got: %v", err)
+	}
+}
+
 // threadGateFakeProvider returns a non-zero PR number, configurable
 // unresolved threads, and panics on MergePR — so a test can verify
 // that the threads-resolved gate (PR.2a) short-circuits doMergePR
@@ -496,6 +536,8 @@ func (f *threadGateFakeProvider) CreatePR(CreatePROptions) (int, string, error) 
 func (f *threadGateFakeProvider) RequestReview(int, []string) error             { panic("unused") }
 func (f *threadGateFakeProvider) AllThreads(int) ([]ReviewThread, error)        { panic("unused") }
 func (f *threadGateFakeProvider) ChecksRollup(int) (string, bool, error)        { panic("unused") }
+func (f *threadGateFakeProvider) PostComment(int, string) error                 { panic("unused") }
+func (f *threadGateFakeProvider) HasReviewFrom(int, string) (bool, error)       { panic("unused") }
 
 // TestDoMergePR_UnresolvedThreads_ShortCircuits asserts the contract of
 // the new PR.2a thread gate: when VerifyReviewThreadsResolved returns

@@ -131,6 +131,47 @@ func TestAwaitReviewStep_FirstCall_EmptyTrigger_SkipsPostButRecordsTime(t *testi
 	if !res.NewStartedAt.Equal(now) {
 		t.Errorf("NewStartedAt = %v, want %v", res.NewStartedAt, now)
 	}
+	// When no trigger was posted the message must NOT claim "posted trigger";
+	// operators diagnosing a non-engaging reviewer bot need to see that
+	// the trigger was disabled rather than that a comment failed silently.
+	if strings.Contains(res.Message, "posted trigger") {
+		t.Errorf("empty-trigger path must not claim 'posted trigger', got: %s", res.Message)
+	}
+	if !strings.Contains(res.Message, "trigger comment disabled") {
+		t.Errorf("expected message to say 'trigger comment disabled', got: %s", res.Message)
+	}
+}
+
+// TestAwaitReviewStep_FutureStartedAt_ClampsElapsedToZero guards against
+// clock skew or a manually-edited MR bead pushing StartedAt into the
+// future. A negative elapsed would compare less than MinWait by definition
+// and unexpectedly extend (or freeze) the wait window. The function must
+// treat future timestamps as "min-wait window starts now" so the patrol
+// can't get stuck.
+func TestAwaitReviewStep_FutureStartedAt_ClampsElapsedToZero(t *testing.T) {
+	now := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	// StartedAt is 1 hour in the future relative to "now". Without the
+	// guard, elapsed = -1h, elapsed < MinWait (5m) is true, and the call
+	// returns Waiting with a remaining of 1h5m — much longer than the
+	// configured min-wait. With the guard, elapsed clamps to 0 and we
+	// expect Waiting with remaining ≈ MinWait.
+	future := now.Add(1 * time.Hour)
+	provider := &awaitFakeProvider{}
+	res, err := AwaitReviewStep(provider, 42, baseInput(now,
+		func(in *AwaitReviewStepInput) { in.StartedAt = future }))
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Status != AwaitStatusWaiting {
+		t.Fatalf("status = %v, want AwaitStatusWaiting (clamped elapsed=0 < MinWait)", res.Status)
+	}
+	// MinWait is 5m by baseInput. Remaining must be 5m exactly, NOT >5m
+	// (which would prove the guard didn't fire).
+	if res.RemainingWait != 5*time.Minute {
+		t.Errorf("RemainingWait = %v, want 5m (clamped). A larger value means the "+
+			"future-StartedAt guard did not fire and the patrol could get stuck",
+			res.RemainingWait)
+	}
 }
 
 func TestAwaitReviewStep_TriggerPostError_IsReturned(t *testing.T) {

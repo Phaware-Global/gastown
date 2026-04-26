@@ -637,6 +637,18 @@ func (e *Engineer) LoadConfig() error {
 	} else if ok {
 		e.config.PRReviewTimeout = dur
 	}
+	// Cross-field invariant: timeout must exceed wait, otherwise the
+	// timeout fires while still inside the min-wait window and
+	// await-review can never reach the threads/reviewer checks. Fail
+	// fast at config-load rather than at the first runtime invocation.
+	if e.config.PRReviewWait > 0 && e.config.PRReviewTimeout > 0 &&
+		e.config.PRReviewTimeout <= e.config.PRReviewWait {
+		return fmt.Errorf(
+			"pr_review_timeout (%v) must be greater than pr_review_wait (%v); "+
+				"otherwise the timeout fires while still inside the min-wait window and "+
+				"await-review never reaches the threads/reviewer checks",
+			e.config.PRReviewTimeout, e.config.PRReviewWait)
+	}
 	if mqRaw.PRTriggerComment != nil {
 		e.config.PRTriggerComment = *mqRaw.PRTriggerComment
 	}
