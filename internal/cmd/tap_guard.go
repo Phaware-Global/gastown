@@ -71,14 +71,24 @@ var prMergeCommandPattern = regexp.MustCompile("(?m)(^\\s*|[|&;(`]\\s*|-[a-z]*c\
 // prMergeViaApiPattern matches the GitHub merge endpoint reached through
 // `gh api repos/<owner>/<repo>/pulls/<n>/merge`. Closes the G40 sibling of
 // the G21 bypass: a refinery LLM that hits the tap-guard on `gh pr merge`
-// can fall back to the same operation via the raw API. Any HTTP method
-// other than GET on the …/pulls/<n>/merge endpoint mutates merge state
-// (PUT performs the merge; DELETE on the same path doesn't exist on
-// GitHub's API but we err on the side of blocking anything beyond GET) —
-// the regex matches the path itself and lets the command-level checker
-// classify the remainder.
+// can fall back to the same operation via the raw API. The path segment
+// alone uniquely identifies the merge endpoint, so any match — GET probe
+// or PUT mutation — is treated as a merge attempt; if a refinery wants to
+// inspect mergeability it should use `gh pr view --json mergeable`,
+// which the guard does not block.
+//
+// Anchoring details:
+//   - `(?s)` mode makes `.` cross newlines so a multi-line invocation
+//     (e.g. `gh api ... \` continuation followed by `pulls/<n>/merge`
+//     on the next line) still matches — the iter-1 review flagged the
+//     original `[^\n]*` form as bypassable via a backslash-newline
+//     escape.
+//   - The PR-number segment is `[^/\s]+` rather than `[0-9]+` so shell
+//     variables (`$PR`), gh placeholders (`:number`), and command
+//     substitution (`` `cmd` ``) match too — the digit-only form was
+//     bypassable by anything that wasn't a literal integer.
 var prMergeViaApiPattern = regexp.MustCompile(
-	"(?m)(^\\s*|[|&;(`]\\s*|-[a-z]*c\\s+['\"]\\s*)gh\\s+api\\b[^\\n]*pulls/[0-9]+/merge\\b")
+	"(?ms)(^\\s*|[|&;(`]\\s*|-[a-z]*c\\s+['\"]\\s*)gh\\s+api\\b.*?pulls/[^/\\s]+/merge\\b")
 
 // isPRWorkflowCommand returns true when cmd looks like any of the PR-
 // creation / feature-branch commands this guard blocks.
@@ -97,16 +107,11 @@ func isPRWorkflowCommand(cmd string) bool {
 // isPRMergeCommand returns true when cmd looks like a direct `gh pr merge`
 // invocation OR an `gh api …pulls/<n>/merge` API-level merge (G40). Both
 // shapes hit the same GitHub merge endpoint and bypass the
-// `gt refinery pr merge` approval gate. Separate from isPRWorkflowCommand
-// because merge and create have different refinery-context policies
-// (G21 fix).
-//
-// The merge-via-API match is intentionally path-only — a `gh api` GET on
-// …/pulls/<n>/merge to inspect mergeability would also match. We accept
-// that false-positive: if a refinery LLM needs that probe, it should be
-// reading mergeability through `gh pr view --json mergeable` (which the
-// guard does not block); the raw-API form is rare enough in practice that
-// blocking is the safer default.
+// `gt refinery pr merge` approval gate. Any match returns true — there is
+// no method-aware filtering; a GET probe on the merge path is blocked
+// alongside a PUT mutation, which is intentional defense-in-depth.
+// Separate from isPRWorkflowCommand because merge and create have
+// different refinery-context policies (G21 fix).
 func isPRMergeCommand(cmd string) bool {
 	if cmd == "" {
 		return false
@@ -229,7 +234,7 @@ func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 	if isMerge && isGasTownAgentContext() {
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════╗")
-		fmt.Fprintln(os.Stderr, "║  ❌ DIRECT `gh pr merge` BLOCKED (G21 fix)                       ║")
+		fmt.Fprintln(os.Stderr, "║  ❌ DIRECT MERGE BLOCKED (G21 / G40 fix)                         ║")
 		fmt.Fprintln(os.Stderr, "╠══════════════════════════════════════════════════════════════════╣")
 		fmt.Fprintln(os.Stderr, "║  Refinery must route PR merges through `gt refinery pr merge`   ║")
 		fmt.Fprintln(os.Stderr, "║  which enforces PR.6 wait-approval gates before calling the     ║")

@@ -182,6 +182,33 @@ func TestIsPRMergeCommand(t *testing.T) {
 		// We accept the false-positive of catching a GET probe on the same path —
 		// the LLM should use `gh pr view --json mergeable` for that information.
 		{"gh api default-method (GET) on merge path", "gh api repos/o/r/pulls/9/merge", true},
+
+		// Iter-1 review: the digit-only PR-number form was bypassable by
+		// shell variables and gh placeholders. The broader `[^/\s]+`
+		// segment catches both shapes. Command substitution with embedded
+		// spaces (e.g. `$(gh pr view --json number)`) intentionally does
+		// NOT match — the segment refuses whitespace, and the LLM-bypass
+		// shapes that have actually been observed are single-token
+		// variable references rather than spaces-bearing $(...) bodies.
+		{"gh api with shell variable PR number", "gh api repos/o/r/pulls/$PR_NUMBER/merge -X PUT", true},
+		{"gh api with gh placeholder", "gh api repos/:owner/:repo/pulls/:number/merge -X PUT", true},
+		{"gh api with single-token backtick substitution", "gh api repos/o/r/pulls/`echo9`/merge -X PUT", true},
+
+		// Iter-1 review: the `[^\n]*` form didn't cross a backslash-newline.
+		// (?s) + `.*?` makes the path-segment match work across line
+		// continuations — augment iter-1 flagged this as a high-severity
+		// bypass shape.
+		{
+			"gh api merge with backslash-newline continuation",
+			"gh api repos/o/r \\\n  pulls/9/merge -X PUT",
+			true,
+		},
+		{
+			"gh api merge spread over multiline",
+			"gh api \\\n  repos/o/r/pulls/9/merge \\\n  -X PUT",
+			true,
+		},
+
 		// Negatives for the API form: the path must include /pulls/<n>/merge.
 		{"gh api pulls list (no merge segment)", "gh api repos/o/r/pulls", false},
 		{"gh api PR comments (different endpoint)", "gh api repos/o/r/pulls/9/comments", false},
