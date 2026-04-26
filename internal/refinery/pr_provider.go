@@ -91,6 +91,17 @@ type PRProvider interface {
 	// CHANGES_REQUESTED / DISMISSED). This is the "reviewer has engaged"
 	// gate, distinct from IsPRApprovedBy (which is the approval gate).
 	HasReviewFrom(prNumber int, user string) (bool, error)
+
+	// ListReviewAuthors returns the unique GitHub logins of every user
+	// who has submitted at least one review on the PR (any state). The
+	// returned slice preserves the original case of each login and is
+	// sorted lexicographically for deterministic output. Used by the
+	// await-review timeout path to surface "PR has reviews from: ..."
+	// in the patrol log so a misconfigured pr_reviewer is self-evident
+	// rather than silent. Providers that don't yet support this should
+	// return ErrUnsupported; callers tolerate that by emitting the bare
+	// timeout message.
+	ListReviewAuthors(prNumber int) ([]string, error)
 }
 
 // gitReviewThreadsToProvider converts the git package representation to the

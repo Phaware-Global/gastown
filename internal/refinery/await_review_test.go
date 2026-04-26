@@ -21,6 +21,9 @@ type awaitFakeProvider struct {
 
 	threads    []ReviewThread
 	threadsErr error
+
+	reviewAuthors    []string
+	reviewAuthorsErr error
 }
 
 func (p *awaitFakeProvider) PostComment(prNumber int, body string) error {
@@ -33,6 +36,10 @@ func (p *awaitFakeProvider) PostComment(prNumber int, body string) error {
 
 func (p *awaitFakeProvider) HasReviewFrom(prNumber int, user string) (bool, error) {
 	return p.hasReview, p.hasReviewErr
+}
+
+func (p *awaitFakeProvider) ListReviewAuthors(prNumber int) ([]string, error) {
+	return p.reviewAuthors, p.reviewAuthorsErr
 }
 
 func (p *awaitFakeProvider) UnresolvedThreads(prNumber int) ([]ReviewThread, error) {
@@ -325,6 +332,62 @@ func TestAwaitReviewStep_TimeoutElapsed_NoReviewer_TimedOut(t *testing.T) {
 	}
 	if res.Status != AwaitStatusTimedOut {
 		t.Errorf("status = %v, want AwaitStatusTimedOut", res.Status)
+	}
+	// No reviews on the PR: message should signal that explicitly so the
+	// operator can distinguish "reviewer-bot never ran" from "reviewer-bot
+	// ran but my pr_reviewer config is wrong".
+	if !strings.Contains(res.Message, "no reviews submitted") {
+		t.Errorf("expected 'no reviews submitted' diagnostic in message, got %q", res.Message)
+	}
+}
+
+// G38: when augment posts reviews under login "augmentcode" but the rig has
+// pr_reviewer="augment", HasReviewFrom returns false and the gate times out.
+// The timeout message must surface the actual review-authors so the
+// misconfiguration is obvious from the patrol log alone, instead of
+// manifesting as a silent 30-minute escalation cycle.
+func TestAwaitReviewStep_TimeoutElapsed_DiagnosticListsActualReviewAuthors(t *testing.T) {
+	started := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	now := started.Add(31 * time.Minute)
+	provider := &awaitFakeProvider{
+		hasReview:     false,
+		reviewAuthors: []string{"augmentcode", "gemini-code-assist", "phaware-artie"},
+	}
+	res, err := AwaitReviewStep(provider, 42, baseInput(now,
+		func(in *AwaitReviewStepInput) { in.StartedAt = started }))
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Status != AwaitStatusTimedOut {
+		t.Fatalf("status = %v, want AwaitStatusTimedOut", res.Status)
+	}
+	for _, want := range []string{"augmentcode", "gemini-code-assist", "phaware-artie", "pr_reviewer must match"} {
+		if !strings.Contains(res.Message, want) {
+			t.Errorf("expected message to contain %q, got %q", want, res.Message)
+		}
+	}
+}
+
+// ListReviewAuthors errors (e.g., ErrUnsupported on Bitbucket) must not
+// suppress the timeout — the diagnostic is best-effort enrichment, not a
+// load-bearing gate.
+func TestAwaitReviewStep_TimeoutElapsed_AuthorListErrorFallsBackToBareMessage(t *testing.T) {
+	started := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	now := started.Add(31 * time.Minute)
+	provider := &awaitFakeProvider{
+		hasReview:        false,
+		reviewAuthorsErr: fmt.Errorf("bitbucket: not supported"),
+	}
+	res, err := AwaitReviewStep(provider, 42, baseInput(now,
+		func(in *AwaitReviewStepInput) { in.StartedAt = started }))
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Status != AwaitStatusTimedOut {
+		t.Errorf("status = %v, want AwaitStatusTimedOut", res.Status)
+	}
+	if strings.Contains(res.Message, "PR has reviews from") || strings.Contains(res.Message, "no reviews submitted") {
+		t.Errorf("expected bare timeout message when ListReviewAuthors errors, got %q", res.Message)
 	}
 }
 

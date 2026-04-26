@@ -1524,6 +1524,39 @@ func (g *Git) GhPrHasReviewFrom(prNumber int, user string) (bool, error) {
 	return false, nil
 }
 
+// GhPrReviewAuthors returns the unique GitHub logins of every user who has
+// submitted at least one review on the PR (any state). Logins preserve their
+// original case as returned by the gh CLI; the slice is sorted
+// case-insensitively for deterministic output. Used by the await-review
+// timeout path so a misconfigured pr_reviewer surfaces as "PR has reviews
+// from: ..." in the patrol log on first occurrence rather than as a silent
+// 30-minute timeout cycle.
+func (g *Git) GhPrReviewAuthors(prNumber int) ([]string, error) {
+	reviews, err := g.ghFetchReviews(prNumber)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]string, len(reviews))
+	for _, r := range reviews {
+		login := r.Author.Login
+		if login == "" {
+			continue
+		}
+		key := strings.ToLower(login)
+		if _, ok := seen[key]; !ok {
+			seen[key] = login
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for _, login := range seen {
+		out = append(out, login)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return strings.ToLower(out[i]) < strings.ToLower(out[j])
+	})
+	return out, nil
+}
+
 // GhPrApprovedBy returns true iff the given user has submitted an APPROVED
 // review on the PR and has not subsequently dismissed it or requested changes.
 // Passing user="" falls back to IsPRApproved (any approver).

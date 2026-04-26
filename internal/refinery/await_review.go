@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 )
 
@@ -253,10 +254,28 @@ func AwaitReviewStep(provider PRProvider, prNumber int, in AwaitReviewStepInput)
 	// Wait elapsed, no threads, no reviewer. Either still inside the
 	// polling window (Waiting) or past the timeout (TimedOut).
 	if elapsed >= in.Timeout {
+		// Enrich the timeout message with the unique review-authors actually
+		// observed on the PR. The classic failure mode is a misconfigured
+		// pr_reviewer (e.g. set to the trigger keyword "augment" instead of
+		// the bot's actual login "augmentcode") — surfacing the observed
+		// authors makes the cause self-evident on first timeout rather than
+		// after a 30-minute cycle. ErrUnsupported (Bitbucket) and any other
+		// provider error fall back to the bare message; the diagnostic is a
+		// best-effort enrichment, not a load-bearing piece of the gate.
+		tail := ""
+		if authors, err := provider.ListReviewAuthors(prNumber); err == nil {
+			if len(authors) == 0 {
+				tail = " (no reviews submitted on this PR yet)"
+			} else {
+				tail = fmt.Sprintf(" (PR has reviews from: %s; "+
+					"pr_reviewer must match a reviewer's GitHub login)",
+					strings.Join(authors, ", "))
+			}
+		}
 		return AwaitReviewStepResult{
 			Status: AwaitStatusTimedOut,
-			Message: fmt.Sprintf("PR #%d: %s never engaged after %s — escalate",
-				prNumber, in.Reviewer, elapsed.Round(time.Second)),
+			Message: fmt.Sprintf("PR #%d: %s never engaged after %s — escalate%s",
+				prNumber, in.Reviewer, elapsed.Round(time.Second), tail),
 		}, nil
 	}
 	return AwaitReviewStepResult{
