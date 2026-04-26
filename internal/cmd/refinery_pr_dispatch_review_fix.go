@@ -83,39 +83,39 @@ type dispatchReviewFixState struct {
 	ReviewLoopIter int    // already incremented; 0 if never dispatched
 }
 
-func parseDispatchMRFields(mrID string) (dispatchReviewFixState, *beads.Beads, error) {
+func parseDispatchMRFields(mrID string) (dispatchReviewFixState, error) {
 	if mrID == "" {
-		return dispatchReviewFixState{}, nil, fmt.Errorf("--mr is required")
+		return dispatchReviewFixState{}, fmt.Errorf("--mr is required")
 	}
 	if err := validateBeadIDShape(mrID); err != nil {
-		return dispatchReviewFixState{}, nil, fmt.Errorf("invalid --mr %q: %w", mrID, err)
+		return dispatchReviewFixState{}, fmt.Errorf("invalid --mr %q: %w", mrID, err)
 	}
 	bd := beads.New(resolveBeadDir(mrID))
 	issue, err := bd.Show(mrID)
 	if err != nil {
-		return dispatchReviewFixState{}, nil, fmt.Errorf("loading MR bead %s: %w", mrID, err)
+		return dispatchReviewFixState{}, fmt.Errorf("loading MR bead %s: %w", mrID, err)
 	}
 	if issue == nil {
-		return dispatchReviewFixState{}, nil, fmt.Errorf("MR bead %s not found", mrID)
+		return dispatchReviewFixState{}, fmt.Errorf("MR bead %s not found", mrID)
 	}
 	fields := beads.ParseMRFields(issue)
 	if fields == nil {
-		return dispatchReviewFixState{}, nil, fmt.Errorf("MR %s has no MR fields in description", mrID)
+		return dispatchReviewFixState{}, fmt.Errorf("MR %s has no MR fields in description", mrID)
 	}
 
-	prNumberStr := strings.TrimSpace(extractDescField(issue.Description, "review_pr"))
+	prNumberStr := extractDescField(issue.Description, "review_pr")
 	if prNumberStr == "" {
-		return dispatchReviewFixState{}, nil, fmt.Errorf("MR %s missing review_pr field", mrID)
+		return dispatchReviewFixState{}, fmt.Errorf("MR %s missing review_pr field", mrID)
 	}
 	prNumber, err := parsePRNumber(prNumberStr)
 	if err != nil {
-		return dispatchReviewFixState{}, nil, fmt.Errorf("MR %s review_pr=%q: %w", mrID, prNumberStr, err)
+		return dispatchReviewFixState{}, fmt.Errorf("MR %s review_pr=%q: %w", mrID, prNumberStr, err)
 	}
 	if fields.SourceIssue == "" {
-		return dispatchReviewFixState{}, nil, fmt.Errorf("MR %s missing source_issue", mrID)
+		return dispatchReviewFixState{}, fmt.Errorf("MR %s missing source_issue", mrID)
 	}
 	if fields.Branch == "" {
-		return dispatchReviewFixState{}, nil, fmt.Errorf("MR %s missing branch", mrID)
+		return dispatchReviewFixState{}, fmt.Errorf("MR %s missing branch", mrID)
 	}
 
 	return dispatchReviewFixState{
@@ -124,7 +124,7 @@ func parseDispatchMRFields(mrID string) (dispatchReviewFixState, *beads.Beads, e
 		SourceIssue:    fields.SourceIssue,
 		ReviewFixName:  fields.ReviewFixPolecat,
 		ReviewLoopIter: fields.ReviewLoopIter,
-	}, bd, nil
+	}, nil
 }
 
 // extractDescField pulls a `key: value` line out of the MR description. The
@@ -156,7 +156,7 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 	}
 	rigName := rigPtr.Name
 
-	state, _, err := parseDispatchMRFields(refPrDispatchReviewFixMR)
+	state, err := parseDispatchMRFields(refPrDispatchReviewFixMR)
 	if err != nil {
 		return err
 	}
