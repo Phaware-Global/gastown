@@ -2580,20 +2580,25 @@ Compounds with G35 — when the timestamp isn't cleared on a force-push, the pro
 
 **Priority:** Blocking — same severity as G25, which it undermines.
 
-### G38 — `provider.HasReviewFrom` likely filters APPROVED-only state, so comment-only `pr_reviewer` never satisfies the gate
+### G38 — `pr_reviewer` short-name (`augment`) doesn't match the actual GitHub login (`augmentcode`)
 
 **Observed:** On PR #40, augment posted three review comment-batches (13:40, 13:54, 14:08) but `gt refinery pr await-review` returned exit 3 (TimedOut) at 33m24s with the message "augment never engaged after 33m24s — escalate". Augment had reviewed; the gate disagreed.
 
-**Root cause:** `HasReviewFrom` likely filters on `state == APPROVED`, ignoring `COMMENTED` reviews. Augment is comment-only (it posts review-thread suggestions, never APPROVE-state reviews). So this check is structurally unsatisfiable for any `pr_reviewer` who is a comment-only bot.
+**Root cause:** Initial hypothesis was that `HasReviewFrom` filters on `state == APPROVED`. **Trace disproved it** — `internal/git/git.go:GhPrHasReviewFrom` already counts any review state via case-insensitive login match. The actual mismatch is between two semantically distinct roles overloaded onto a single config value:
 
-**Distinct from prior G-entries:** Different implementation detail than G37 (SHA-scoping). G38 is about which review *state* counts; G37 is about which review *commit* counts. Both need fixing for the gate to work.
+- `pr_reviewer = "augment"` is the trigger keyword — operators type `augment review` to wake the bot, so `augment` is the canonical short name.
+- The same value is then passed verbatim to `HasReviewFrom(pr, "augment")`, which looks for a review whose `author.login == "augment"`. Augment's actual GitHub login is `augmentcode`. The lookup never matches, regardless of how many reviews land.
+
+The exact same break applies to the other comment-only bots that run on the rig (Copilot, gemini-code-assist) — none has a login that equals its short name.
+
+**Distinct from prior G-entries:** Different from G37 (SHA-scoping — *which commit* counts). G38 is about *which login* counts.
 
 **Fix directions:**
-1. Widen `HasReviewFrom` to count any non-DISMISSED review state (closest to design intent at §G25).
-2. Add a `--review-state COMMENTED|APPROVED` flag to `gt refinery pr await-review` with sensible defaults (`COMMENTED` for `pr_reviewer`, since pr_reviewer is the comment-only role; `APPROVED` for `pr_approver`).
-3. Combined with F1's `pr_approval_mode = "reviewer-clean"`, lets a rig opt into bot-only merges where augment's clean review = sufficient to merge.
+1. **Case-insensitive prefix match in `HasReviewFrom`**: try exact match first, fall back to "any review whose `author.login` starts with `reviewer`" (case-insensitive). Handles `augment`→`augmentcode`, `gemini`→`gemini-code-assist`, etc., without per-bot aliases.
+2. Document the prefix-match contract on the `pr_reviewer` config field so operators know they can use a short name OR an exact login. Exact login still works (it satisfies the exact-match branch first).
+3. Regression test: review by `augmentcode`, lookup by `augment` returns true. Review by `evil-augment-fake`, lookup by `augment` returns false (prefix match is anchored at the start, not substring).
 
-**Priority:** Blocking. Without this, the await-review gate ALWAYS times out for augment-driven flows, regardless of timestamp resets.
+**Priority:** Blocking. Without this, the await-review gate ALWAYS times out for augment/copilot/gemini-style reviewers, regardless of how often they actually run.
 
 ### G39 — Escalation `email:human` action silently skipped when `contacts.human_email` unset
 
