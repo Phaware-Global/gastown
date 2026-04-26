@@ -270,6 +270,60 @@ func containsArg(args []string, want string) bool {
 	return false
 }
 
+// TestBuildBdCreateArgsRigAbsolutizesRelativeWorkDir guards the
+// filepath.Abs normalization on the resolved rigDir path: when *Beads
+// is constructed with a relative workDir (e.g. "." for commands run
+// from the rig root), the --repo arg must still be absolute so bd's
+// behavior doesn't depend on the cwd at exec time.
+func TestBuildBdCreateArgsRigAbsolutizesRelativeWorkDir(t *testing.T) {
+	townRoot := t.TempDir()
+	mayorDir := filepath.Join(townRoot, "mayor")
+	beadsDir := filepath.Join(townRoot, ".beads")
+	for _, d := range []string{mayorDir, beadsDir} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"),
+		[]byte(`{"prefix": "ga-", "path": "gantry"}`+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run with cwd = townRoot, but pass workDir as the RELATIVE form ".".
+	// Without filepath.Abs, --repo would be a relative "gantry" that
+	// depends on whatever cwd bd is exec'd from later.
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origCwd) })
+	if err := os.Chdir(townRoot); err != nil {
+		t.Fatal(err)
+	}
+
+	b := NewIsolated(".")
+	args := b.buildBdCreateArgs(CreateOptions{Title: "x", Rig: "gantry"})
+
+	// The --repo arg must be absolute (start with "/").
+	var repoArg string
+	for _, a := range args {
+		if strings.HasPrefix(a, "--repo=") {
+			repoArg = a
+			break
+		}
+	}
+	if repoArg == "" {
+		t.Fatalf("no --repo arg emitted; got %v", args)
+	}
+	repoPath := strings.TrimPrefix(repoArg, "--repo=")
+	if !filepath.IsAbs(repoPath) {
+		t.Errorf("expected absolute --repo path, got %q (relative path makes bd behavior cwd-dependent)", repoPath)
+	}
+}
+
 // TestIsFlagLikeTitle verifies flag-like title detection (gt-e0kx5).
 func TestIsFlagLikeTitle(t *testing.T) {
 	tests := []struct {
