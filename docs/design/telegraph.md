@@ -3,6 +3,7 @@
 **Status:** Design — blocks all implementation beads (gt-ipc, gt-2tg, gt-eef, gt-8vr, gt-q5k)
 **Epic:** gt-6if
 **Created:** 2026-04-19
+**Operator runbook:** [docs/runbooks/telegraph.md](../runbooks/telegraph.md)
 
 ## Overview
 
