@@ -163,6 +163,16 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 	// Process external notification actions (email:, sms:, slack, log)
 	statuses = append(statuses, executeExternalActions(actions, escalationConfig, issue.ID, severity, description, townRoot)...)
 
+	// G39: for HIGH and CRITICAL severities, fail the escalation hard if any
+	// configured external notification was skipped due to missing contacts.
+	// Without this, a rig can run for months with the email/SMS path silently
+	// disabled and the misconfiguration only surfaces during a real incident
+	// — exactly when the stack is least equipped to recover. Bead/mail
+	// targets have already been processed by this point so the in-band
+	// escalation record is intact; the failure tells the operator (and the
+	// LLM caller) that the out-of-band human notification did NOT fire.
+	skipFailures := collectMissingContactSkips(severity, statuses)
+
 	// Log to activity feed
 	payload := events.EscalationPayload(issue.ID, agentID, strings.Join(targets, ","), description)
 	payload["severity"] = severity
@@ -181,13 +191,26 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 				break
 			}
 		}
+		// G39: when HIGH/CRITICAL escalations skipped a configured external
+		// notification, the JSON output's status field reflects that — a
+		// machine caller piping JSON downstream should see "missing_contacts"
+		// rather than "ok" for a payload that's about to fail the runner.
+		// Order: missing_contacts > partial_failure > ok, since a missing
+		// out-of-band notification is the most actionable misconfiguration.
+		statusStr := "ok"
+		if hasFailure {
+			statusStr = "partial_failure"
+		}
+		if len(skipFailures) > 0 {
+			statusStr = "missing_contacts"
+		}
 		result := map[string]interface{}{
 			"id":       issue.ID,
 			"severity": severity,
 			"actions":  actions,
 			"targets":  targets,
 			"delivery": statuses,
-			"status":   map[bool]string{true: "partial_failure", false: "ok"}[hasFailure],
+			"status":   statusStr,
 		}
 		if escalateSource != "" {
 			result["source"] = escalateSource
@@ -209,7 +232,59 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	if len(skipFailures) > 0 {
+		// Echo the operator-friendly error AFTER the success-shaped
+		// "Escalation created" lines so the LLM caller sees the bead ID
+		// (still useful for follow-up) before the failure that the
+		// runner is about to return.
+		return fmt.Errorf(
+			"%s/%s escalation created (%s) but %d configured notification(s) were skipped: %s — "+
+				"set the missing contacts in settings/escalation.json or remove the action from the route",
+			strings.ToUpper(severity), issue.ID, issue.ID,
+			len(skipFailures), strings.Join(skipFailures, "; "))
+	}
+
 	return nil
+}
+
+// collectMissingContactSkips returns one operator-friendly summary string per
+// external notification action that was skipped because its contact field was
+// unset. Empty for any severity below HIGH (G39 only fails hard at HIGH and
+// CRITICAL — at MEDIUM and LOW the warning is enough; rigs without escalation
+// contacts are common during early bring-up). The returned strings carry the
+// channel and the missing-config field so the operator knows which
+// settings/escalation.json key to fill in.
+//
+// Detection keys off the structured `Skipped` flag set by the external-action
+// runner rather than substring-matching the human-readable Warning text. The
+// guardrail is load-bearing for HIGH/CRITICAL escalations; binding it to a
+// boolean rather than to a copy detail keeps it from silently disabling if
+// the warning text ever changes.
+func collectMissingContactSkips(severity string, statuses []deliveryStatus) []string {
+	switch strings.ToLower(severity) {
+	case config.SeverityCritical, config.SeverityHigh:
+	default:
+		return nil
+	}
+	var skips []string
+	for _, s := range statuses {
+		if !s.Skipped {
+			continue
+		}
+		// Defense-in-depth: only external-notification channels can be
+		// "skipped" today, but constraining the channel set makes the
+		// guardrail explicit if a future caller mistakenly sets Skipped
+		// on a bead/mail status.
+		switch s.Channel {
+		case "email", "sms", "slack":
+			detail := s.Warning
+			if detail == "" {
+				detail = "skipped (no detail provided)"
+			}
+			skips = append(skips, fmt.Sprintf("%s: %s", s.Channel, detail))
+		}
+	}
+	return skips
 }
 
 type deliveryStatus struct {
@@ -222,6 +297,13 @@ type deliveryStatus struct {
 	Severity          string `json:"severity,omitempty"`
 	Error             string `json:"error,omitempty"`
 	Warning           string `json:"warning,omitempty"`
+	// Skipped is set true on external-notification actions (email/sms/slack)
+	// that couldn't run because their contact field is unset in
+	// settings/escalation.json. The G39 hard-fail collector keys off this
+	// flag rather than substring-matching the human-readable Warning text,
+	// so future changes to the warning copy don't silently disable the
+	// guardrail.
+	Skipped           bool   `json:"skipped,omitempty"`
 	NotificationRoute string `json:"notification_route,omitempty"`
 }
 
@@ -648,9 +730,11 @@ func executeExternalActions(actions []string, cfg *config.EscalationConfig, bead
 			status := deliveryStatus{Channel: "email", Target: strings.TrimPrefix(action, "email:"), Severity: severity}
 			if cfg.Contacts.HumanEmail == "" {
 				status.Warning = "contacts.human_email not configured"
+				status.Skipped = true
 				style.PrintWarning("email action '%s' skipped: contacts.human_email not configured in settings/escalation.json", action)
 			} else if cfg.Contacts.SMTPHost == "" {
 				status.Warning = "contacts.smtp_host not configured"
+				status.Skipped = true
 				style.PrintWarning("email action '%s' skipped: contacts.smtp_host not configured in settings/escalation.json", action)
 			} else {
 				if err := sendEscalationEmail(cfg, beadID, severity, description); err != nil {
@@ -667,9 +751,11 @@ func executeExternalActions(actions []string, cfg *config.EscalationConfig, bead
 			status := deliveryStatus{Channel: "sms", Target: strings.TrimPrefix(action, "sms:"), Severity: severity}
 			if cfg.Contacts.HumanSMS == "" {
 				status.Warning = "contacts.human_sms not configured"
+				status.Skipped = true
 				style.PrintWarning("sms action '%s' skipped: contacts.human_sms not configured in settings/escalation.json", action)
 			} else if cfg.Contacts.SMSWebhook == "" {
 				status.Warning = "contacts.sms_webhook not configured"
+				status.Skipped = true
 				style.PrintWarning("sms action '%s' skipped: contacts.sms_webhook not configured in settings/escalation.json", action)
 			} else {
 				if err := sendEscalationSMS(cfg, beadID, severity, description); err != nil {
@@ -686,6 +772,7 @@ func executeExternalActions(actions []string, cfg *config.EscalationConfig, bead
 			status := deliveryStatus{Channel: "slack", Target: "slack", Severity: severity}
 			if cfg.Contacts.SlackWebhook == "" {
 				status.Warning = "contacts.slack_webhook not configured"
+				status.Skipped = true
 				style.PrintWarning("slack action skipped: contacts.slack_webhook not configured in settings/escalation.json")
 			} else {
 				if err := sendEscalationSlack(cfg, beadID, severity, description); err != nil {
