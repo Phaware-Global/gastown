@@ -411,28 +411,67 @@ func (e *Engineer) SetOutput(w io.Writer) {
 	e.output = w
 }
 
-// LoadConfig loads merge queue configuration from the rig's config.json.
+// LoadConfig loads merge queue configuration from the rig's settings file.
+//
+// The merge-queue JSON lives at `<rig>/settings/config.json` alongside
+// the rest of the rig's behavioral settings (theme, workflow, crew,
+// agents, etc.). The rig-root `<rig>/config.json` is the rig IDENTITY
+// file (type, version, name, git_url, default_branch, beads) and does
+// not contain `merge_queue` — reading it here silently returned a
+// zero-valued MergeQueueConfig, which made the PR #25 approval-proof
+// gate a no-op in production (G23). See docs/design/refinery-pr-workflow.md §G23.
+//
+// Fallback semantics: candidate paths are tried in order
+// (settings/config.json, then rig-root config.json) and the first one
+// that contains a `merge_queue` section wins. A settings file that
+// EXISTS but lacks the merge_queue section continues to fall through
+// to the rig-root file — important because some rigs split identity
+// fields into the root and behavior fields into settings, but legacy
+// tooling may still have written merge_queue to the root only.
+// Without this, a settings file with no merge_queue section would
+// silently re-disable the approval gate (the original G23 failure mode).
 func (e *Engineer) LoadConfig() error {
-	configPath := filepath.Join(e.rig.Path, "config.json")
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// Use defaults if no config file
-			return nil
+	candidates := []string{
+		filepath.Join(e.rig.Path, "settings", "config.json"),
+		filepath.Join(e.rig.Path, "config.json"),
+	}
+
+	var (
+		mergeQueueRaw    json.RawMessage
+		mergeQueueSource string
+	)
+	for _, path := range candidates {
+		fileData, err := os.ReadFile(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("reading %s: %w", path, err)
 		}
-		return fmt.Errorf("reading config: %w", err)
+
+		var probe struct {
+			MergeQueue json.RawMessage `json:"merge_queue"`
+		}
+		if err := json.Unmarshal(fileData, &probe); err != nil {
+			return fmt.Errorf("parsing %s: %w", path, err)
+		}
+
+		// json.RawMessage carries the literal bytes of the field's value.
+		// `nil` means the key was absent; `[]byte("null")` means an
+		// explicit `"merge_queue": null`. Both should fall through to
+		// the next candidate so a misconfigured file can't silently
+		// re-disable the approval gate.
+		if len(probe.MergeQueue) == 0 || string(probe.MergeQueue) == "null" {
+			continue
+		}
+
+		mergeQueueRaw = probe.MergeQueue
+		mergeQueueSource = path
+		break
 	}
 
-	// Parse config file to extract merge_queue section
-	var rawConfig struct {
-		MergeQueue json.RawMessage `json:"merge_queue"`
-	}
-	if err := json.Unmarshal(data, &rawConfig); err != nil {
-		return fmt.Errorf("parsing config: %w", err)
-	}
-
-	if rawConfig.MergeQueue == nil {
-		// No merge_queue section, use defaults
+	if mergeQueueRaw == nil {
+		// No candidate file had a meaningful merge_queue section — use defaults.
 		return nil
 	}
 
@@ -461,8 +500,8 @@ func (e *Engineer) LoadConfig() error {
 		PRMergeMethod        *string                    `json:"pr_merge_method"`
 	}
 
-	if err := json.Unmarshal(rawConfig.MergeQueue, &mqRaw); err != nil {
-		return fmt.Errorf("parsing merge_queue config: %w", err)
+	if err := json.Unmarshal(mergeQueueRaw, &mqRaw); err != nil {
+		return fmt.Errorf("parsing merge_queue from %s: %w", mergeQueueSource, err)
 	}
 
 	// Apply non-nil values to config (preserving defaults for missing fields)

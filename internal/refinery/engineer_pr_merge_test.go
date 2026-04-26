@@ -14,6 +14,19 @@ import (
 	"github.com/steveyegge/gastown/internal/rig"
 )
 
+// mustMarshalIndent is a test helper that fails the test immediately if
+// MarshalIndent returns an error. Failure here means a test fixture became
+// non-marshalable (e.g., a value type sneaked in that JSON can't represent),
+// which is a programming error in the test rather than a runtime concern.
+func mustMarshalIndent(t *testing.T, v interface{}) []byte {
+	t.Helper()
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		t.Fatalf("marshaling test fixture: %v", err)
+	}
+	return data
+}
+
 func TestEngineer_LoadConfig_MergeStrategyPR(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -31,7 +44,7 @@ func TestEngineer_LoadConfig_MergeStrategyPR(t *testing.T) {
 		},
 	}
 
-	data, _ := json.MarshalIndent(config, "", "  ")
+	data := mustMarshalIndent(t, config)
 	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -50,6 +63,263 @@ func TestEngineer_LoadConfig_MergeStrategyPR(t *testing.T) {
 	}
 }
 
+// TestEngineer_LoadConfig_ReadsSettingsPath is the G23 regression test:
+// merge_queue lives at <rig>/settings/config.json, NOT <rig>/config.json.
+// Before the G23 fix, Engineer.LoadConfig read the rig-root config.json
+// (identity file) which has no merge_queue section, so it silently
+// returned a zero-valued MergeQueueConfig. That made the G21
+// approval-proof gate a no-op in production.
+//
+// This test asserts that when settings/config.json contains a
+// merge_queue section, LoadConfig picks it up. The in-memory tests in
+// approval_test.go never exercised the file-based path, which is why
+// the bug shipped.
+func TestEngineer_LoadConfig_ReadsSettingsPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	settingsDir := filepath.Join(tmpDir, "settings")
+	if err := os.MkdirAll(settingsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Settings file carries the merge_queue section (the prod layout).
+	settings := map[string]interface{}{
+		"type":    "rig-settings",
+		"version": 1,
+		"merge_queue": map[string]interface{}{
+			"merge_strategy":        "pr",
+			"pr_approver":           "kevinpjones",
+			"pr_required_approvals": 1,
+			"pr_reviewer":           "augment",
+		},
+	}
+	data := mustMarshalIndent(t, settings)
+	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rig-root config.json: identity fields only, no merge_queue.
+	// If LoadConfig wrongly reads this file, PRApprover would be empty
+	// and the test would catch it.
+	identity := map[string]interface{}{
+		"type":           "rig",
+		"version":        1,
+		"name":           "test-rig",
+		"default_branch": "main",
+	}
+	identityData := mustMarshalIndent(t, identity)
+	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), identityData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
+	e := NewEngineer(r)
+	if err := e.LoadConfig(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if e.config.MergeStrategy != "pr" {
+		t.Errorf("expected MergeStrategy=pr from settings/config.json, got %q — "+
+			"likely still reading rig-root config.json (G23 regression)",
+			e.config.MergeStrategy)
+	}
+	if e.config.PRApprover != "kevinpjones" {
+		t.Errorf("expected PRApprover=kevinpjones, got %q (G23 regression)",
+			e.config.PRApprover)
+	}
+	if e.config.PRRequiredApprovals == nil || *e.config.PRRequiredApprovals != 1 {
+		t.Errorf("expected PRRequiredApprovals=1, got %v (G23 regression)",
+			e.config.PRRequiredApprovals)
+	}
+}
+
+// TestEngineer_LoadConfig_SettingsPathWins verifies that when both
+// <rig>/settings/config.json AND <rig>/config.json have merge_queue
+// sections, the settings path wins. Defensive coverage for rigs that
+// have drifted state in both files.
+func TestEngineer_LoadConfig_SettingsPathWins(t *testing.T) {
+	tmpDir := t.TempDir()
+	settingsDir := filepath.Join(tmpDir, "settings")
+	if err := os.MkdirAll(settingsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	settings := map[string]interface{}{
+		"type":    "rig-settings",
+		"version": 1,
+		"merge_queue": map[string]interface{}{
+			"merge_strategy": "pr",
+			"pr_approver":    "from-settings",
+		},
+	}
+	data := mustMarshalIndent(t, settings)
+	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	root := map[string]interface{}{
+		"type":    "rig",
+		"version": 1,
+		"name":    "test-rig",
+		"merge_queue": map[string]interface{}{
+			"merge_strategy": "direct",
+			"pr_approver":    "from-root",
+		},
+	}
+	rootData := mustMarshalIndent(t, root)
+	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), rootData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
+	e := NewEngineer(r)
+	if err := e.LoadConfig(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if e.config.PRApprover != "from-settings" {
+		t.Errorf("expected settings/config.json to win, got PRApprover=%q", e.config.PRApprover)
+	}
+}
+
+// TestEngineer_LoadConfig_RootFallback verifies legacy rigs without a
+// settings/config.json still load merge_queue from rig-root config.json.
+// Preserves backward compat for tooling that wrote merge_queue to the
+// root before settings/ became the canonical location.
+func TestEngineer_LoadConfig_RootFallback(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// No settings/ directory at all — exercises the settings-missing fallback.
+	legacyConfig := map[string]interface{}{
+		"type":    "rig",
+		"version": 1,
+		"name":    "test-rig",
+		"merge_queue": map[string]interface{}{
+			"merge_strategy": "pr",
+			"pr_approver":    "legacy-approver",
+		},
+	}
+	data := mustMarshalIndent(t, legacyConfig)
+	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
+	e := NewEngineer(r)
+	if err := e.LoadConfig(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if e.config.PRApprover != "legacy-approver" {
+		t.Errorf("fallback to rig-root config.json did not populate PRApprover: got %q",
+			e.config.PRApprover)
+	}
+}
+
+// TestEngineer_LoadConfig_SettingsExistsNoMergeQueue covers the failure mode
+// flagged on PR #35: a rig has settings/config.json (e.g. for theme/crew),
+// but the merge_queue section was written to the rig-root config.json by
+// legacy tooling. Before the fix, the loader returned defaults as soon as
+// settings/config.json was readable, silently re-disabling the approval
+// gate — the original G23 failure mode reintroduced through a different
+// path. This test asserts the loader keeps falling through to the
+// rig-root file when the settings file lacks a merge_queue section.
+func TestEngineer_LoadConfig_SettingsExistsNoMergeQueue(t *testing.T) {
+	tmpDir := t.TempDir()
+	settingsDir := filepath.Join(tmpDir, "settings")
+	if err := os.MkdirAll(settingsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// settings/config.json EXISTS but only carries unrelated fields —
+	// no merge_queue section. The loader must NOT stop here.
+	settings := map[string]interface{}{
+		"type":    "rig-settings",
+		"version": 1,
+		"theme":   "dark",
+	}
+	data := mustMarshalIndent(t, settings)
+	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// rig-root config.json holds merge_queue (legacy layout).
+	root := map[string]interface{}{
+		"type":    "rig",
+		"version": 1,
+		"name":    "test-rig",
+		"merge_queue": map[string]interface{}{
+			"merge_strategy": "pr",
+			"pr_approver":    "from-root-fallback",
+		},
+	}
+	rootData := mustMarshalIndent(t, root)
+	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), rootData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
+	e := NewEngineer(r)
+	if err := e.LoadConfig(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if e.config.PRApprover != "from-root-fallback" {
+		t.Errorf("expected fallthrough to rig-root config.json when settings/config.json "+
+			"has no merge_queue section, got PRApprover=%q (G23 fallthrough regression)",
+			e.config.PRApprover)
+	}
+}
+
+// TestEngineer_LoadConfig_SettingsExplicitNullMergeQueue covers the edge
+// case flagged on PR #35 iteration 2: an explicit `"merge_queue": null` in
+// settings/config.json should be treated as "not configured here" and fall
+// through to the rig-root file, not selected as the winning candidate.
+// Without this, a settings file that explicitly nulls out merge_queue
+// would silently disable the approval gate even when the root file has a
+// real config — same end-state as the original G23 failure.
+func TestEngineer_LoadConfig_SettingsExplicitNullMergeQueue(t *testing.T) {
+	tmpDir := t.TempDir()
+	settingsDir := filepath.Join(tmpDir, "settings")
+	if err := os.MkdirAll(settingsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// settings/config.json carries an explicit `"merge_queue": null`.
+	// json.Unmarshal of null into json.RawMessage stores the literal
+	// bytes []byte("null"), not nil — so a naive `!= nil` check would
+	// pick this file as the winning candidate.
+	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"),
+		[]byte(`{"type":"rig-settings","version":1,"merge_queue":null}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// rig-root config.json holds the real merge_queue.
+	root := map[string]interface{}{
+		"type":    "rig",
+		"version": 1,
+		"name":    "test-rig",
+		"merge_queue": map[string]interface{}{
+			"merge_strategy": "pr",
+			"pr_approver":    "from-root-when-settings-null",
+		},
+	}
+	rootData := mustMarshalIndent(t, root)
+	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), rootData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
+	e := NewEngineer(r)
+	if err := e.LoadConfig(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if e.config.PRApprover != "from-root-when-settings-null" {
+		t.Errorf("expected explicit `merge_queue: null` in settings to fall through "+
+			"to rig-root config.json, got PRApprover=%q", e.config.PRApprover)
+	}
+}
+
 func TestEngineer_LoadConfig_MergeStrategyDefault(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -60,7 +330,7 @@ func TestEngineer_LoadConfig_MergeStrategyDefault(t *testing.T) {
 		"merge_queue": map[string]interface{}{},
 	}
 
-	data, _ := json.MarshalIndent(config, "", "  ")
+	data := mustMarshalIndent(t, config)
 	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
 		t.Fatal(err)
 	}
