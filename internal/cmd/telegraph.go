@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/telegraph"
@@ -139,6 +140,8 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 		switch id {
 		case "jira":
 			translatorMap[id] = jiratr.New(rp.Secret, nil)
+		default:
+			return fmt.Errorf("telegraph: unsupported provider %q", id)
 		}
 		providerNames = append(providerNames, id)
 	}
@@ -187,7 +190,7 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 		}
 	}()
 
-	srv := &http.Server{Handler: handler}
+	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 	serveDone := make(chan error, 1)
 	go func() {
 		err := srv.Serve(ln)
@@ -200,7 +203,11 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 	var srvErr error
 	select {
 	case <-ctx.Done():
-		srv.Close()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			srv.Close()
+		}
 		srvErr = <-serveDone
 	case err := <-serveDone:
 		srvErr = err

@@ -157,12 +157,13 @@ events = ["jira:issue_created"]
 	sig := telegraphSign([]byte(testSecret), payload)
 
 	// Retry POST until the server is ready.
+	testClient := &http.Client{Timeout: 5 * time.Second}
 	var resp *http.Response
 	for i := 0; i < 200; i++ {
 		req, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/webhook/jira", bytes.NewReader(payload))
 		req.Header.Set("X-Hub-Signature", sig)
 		req.Header.Set("Content-Type", "application/json")
-		resp, err = http.DefaultClient.Do(req)
+		resp, err = testClient.Do(req)
 		if err == nil {
 			break
 		}
