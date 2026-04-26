@@ -70,3 +70,11 @@ func (p *githubPRProvider) HasReviewFrom(prNumber int, user string) (bool, error
 func (p *githubPRProvider) ListReviewAuthors(prNumber int) ([]string, error) {
 	return p.git.GhPrReviewAuthors(prNumber)
 }
+
+func (p *githubPRProvider) HasReviewFromOnSHA(prNumber int, user, sha string) (bool, error) {
+	return p.git.GhPrHasReviewFromOnSHA(prNumber, user, sha)
+}
+
+func (p *githubPRProvider) CurrentHeadSHA(prNumber int) (string, error) {
+	return p.git.GhPrHeadSHA(prNumber)
+}

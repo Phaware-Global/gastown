@@ -74,6 +74,15 @@ type AwaitReviewStepInput struct {
 	// "trigger has not been posted yet — post it now."
 	StartedAt time.Time
 
+	// HeadSHA is the current head commit OID of the PR's source branch
+	// (G37 SHA-scoped gate). When non-empty, the reviewer-engagement
+	// check requires a review whose recorded commit OID equals this
+	// SHA — preventing a stale prior review against a force-pushed-away
+	// commit from satisfying the gate. When empty, falls back to
+	// "any review by reviewer counts" (legacy semantics, kept for
+	// providers that can't surface a HEAD SHA).
+	HeadSHA string
+
 	// Now overrides time.Now for tests. nil → time.Now.
 	Now func() time.Time
 }
@@ -238,16 +247,32 @@ func AwaitReviewStep(provider PRProvider, prNumber int, in AwaitReviewStepInput)
 		return AwaitReviewStepResult{}, threadsErr
 	}
 
-	hasReview, err := provider.HasReviewFrom(prNumber, in.Reviewer)
+	// SHA-scoped check (G37) when caller supplies the current HEAD;
+	// falls back to the unscoped HasReviewFrom otherwise so providers
+	// that can't surface a head SHA still work as before.
+	var (
+		hasReview bool
+		err       error
+	)
+	if in.HeadSHA != "" {
+		hasReview, err = provider.HasReviewFromOnSHA(prNumber, in.Reviewer, in.HeadSHA)
+	} else {
+		hasReview, err = provider.HasReviewFrom(prNumber, in.Reviewer)
+	}
 	if err != nil {
 		return AwaitReviewStepResult{}, fmt.Errorf("checking for review from %s: %w", in.Reviewer, err)
 	}
 
 	if hasReview {
+		msg := fmt.Sprintf("PR #%d: %s has reviewed, no unresolved threads — ready to advance",
+			prNumber, in.Reviewer)
+		if in.HeadSHA != "" {
+			msg = fmt.Sprintf("PR #%d: %s reviewed HEAD %s, no unresolved threads — ready to advance",
+				prNumber, in.Reviewer, shortSHA(in.HeadSHA))
+		}
 		return AwaitReviewStepResult{
-			Status: AwaitStatusReady,
-			Message: fmt.Sprintf("PR #%d: %s has reviewed, no unresolved threads — ready to advance",
-				prNumber, in.Reviewer),
+			Status:  AwaitStatusReady,
+			Message: msg,
 		}, nil
 	}
 
