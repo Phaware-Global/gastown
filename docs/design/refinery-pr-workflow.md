@@ -2586,8 +2586,8 @@ Compounds with G35 — when the timestamp isn't cleared on a force-push, the pro
 
 **Root cause:** Initial hypothesis was that `HasReviewFrom` filters on `state == APPROVED`. **Trace disproved it** — `internal/git/git.go:GhPrHasReviewFrom` already counts any review state via case-insensitive login match. The actual mismatch is between two semantically distinct roles overloaded onto a single config value:
 
-- `pr_reviewer = "augment"` is the trigger keyword — operators type `augment review` to wake the bot, so `augment` is the canonical short name.
-- The same value is then passed verbatim to `HasReviewFrom(pr, "augment")`, which looks for a review whose `author.login == "augment"`. Augment's actual GitHub login is `augmentcode`. The lookup never matches, regardless of how many reviews land.
+- The trigger phrase ("augment review", "/gemini review", etc.) is configured via `merge_queue.pr_trigger_comment` and posted on the PR.
+- `merge_queue.pr_reviewer` is the GitHub *login* the gate looks up reviews under. Misconfiguration: an operator who saw the trigger phrase as the canonical name set `pr_reviewer = "augment"` (the trigger-phrase prefix) instead of `pr_reviewer = "augmentcode"` (the bot's actual login). `HasReviewFrom(pr, "augment")` then looks for a review whose `author.login == "augment"` — which never matches, regardless of how many reviews augmentcode posts.
 
 The exact same break applies to the other comment-only bots that run on the rig (Copilot, gemini-code-assist) — none has a login that equals its short name.
 
@@ -2769,7 +2769,7 @@ That diagnosis was **wrong**. Mayor's response (after consulting `internal/cmd/t
 Recommended ordering, smallest dependency-set first, ending with the architectural items. Updated after mayor's diagnosis correction on G42 (was "tap-guard regression"; actually "tap-guard intentional, missing gt-side affordance" — merged with G43).
 
 1. **G42 + G43** — `gt polecat checkout-branch <bead-id>` imperative step. Single fix closes both: gives polecats a tap-guard-permitted recovery from the on-main state, AND becomes the imperative first step in the polecat formula. Highest priority — currently rictus is hand-recovered by mayor each time this hits.
-2. **G41** — gt-pvx safety-net pre-commit guard (refuse to commit on `main`/`master`/`develop`; stash to `~/gt/state/lost-work/<rig>/<polecat>/<timestamp>.diff` instead). Closes the auto-push-to-main attack vector independently of G43.
+2. **G41** — gt-pvx safety-net pre-commit guard (refuse to commit when `HEAD` is on `main`/`master`/`develop`; exit with a clear message naming the protected branch, leaving the work uncommitted in the worktree so a polecat or operator can recover it manually). Closes the auto-push-to-main attack vector independently of G43.
 3. **G33 + G34 + G35 + G36** — `gt refinery pr dispatch-review-fix <pr> --mr <bead> --max-iter <n>` imperative subcommand + bead metadata sync. The refinery-side dual of G43 (PR.5 dispatch is imperative, not prose).
 4. **G37 + G38** — SHA-scoped + state-widened `HasReviewFrom`.
 5. **G40** — close the refinery-side merge bypass (whichever path is found by tracing).
