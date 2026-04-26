@@ -19,6 +19,7 @@ var (
 	patrolScanNotify  bool
 	patrolScanRig     string
 	patrolScanVerbose bool
+	patrolScanSince   time.Duration
 )
 
 var patrolScanCmd = &cobra.Command{
@@ -55,18 +56,34 @@ func init() {
 	patrolScanCmd.Flags().BoolVar(&patrolScanNotify, "notify", false, "Send mail to witness/mayor when active-work zombies are detected")
 	patrolScanCmd.Flags().StringVar(&patrolScanRig, "rig", "", "Rig to scan (default: infer from cwd or GT_RIG)")
 	patrolScanCmd.Flags().BoolVarP(&patrolScanVerbose, "verbose", "v", false, "Verbose output")
+	patrolScanCmd.Flags().DurationVar(&patrolScanSince, "main-since", 48*time.Hour, "Look-back window for main-integrity scan (0 to skip)")
 
 	patrolCmd.AddCommand(patrolScanCmd)
 }
 
 // PatrolScanOutput is the JSON output format for patrol scan results.
 type PatrolScanOutput struct {
-	Rig         string                    `json:"rig"`
-	Timestamp   string                    `json:"timestamp"`
-	Zombies     *PatrolScanZombieOutput   `json:"zombies"`
-	Stalls      *PatrolScanStallOutput    `json:"stalls,omitempty"`
-	Completions *PatrolScanCompleteOutput `json:"completions,omitempty"`
-	Receipts    []witness.PatrolReceipt   `json:"receipts,omitempty"`
+	Rig             string                       `json:"rig"`
+	Timestamp       string                       `json:"timestamp"`
+	Zombies         *PatrolScanZombieOutput      `json:"zombies"`
+	Stalls          *PatrolScanStallOutput       `json:"stalls,omitempty"`
+	Completions     *PatrolScanCompleteOutput    `json:"completions,omitempty"`
+	Receipts        []witness.PatrolReceipt      `json:"receipts,omitempty"`
+	MainIntegrity   *PatrolScanMainIntegrityOut  `json:"main_integrity,omitempty"`
+}
+
+// PatrolScanMainIntegrityOut holds main-integrity scan results.
+type PatrolScanMainIntegrityOut struct {
+	Checked      int                         `json:"checked"`
+	Unauthorized []PatrolScanUnauthorizedItem `json:"unauthorized,omitempty"`
+	Error        string                       `json:"error,omitempty"`
+}
+
+// PatrolScanUnauthorizedItem is a single unauthorized commit on main.
+type PatrolScanUnauthorizedItem struct {
+	SHA     string `json:"sha"`
+	Subject string `json:"subject"`
+	Author  string `json:"author"`
 }
 
 // PatrolScanZombieOutput holds zombie detection results.
@@ -159,6 +176,17 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	// Build patrol receipts for zombies
 	receipts := witness.BuildPatrolReceipts(rigName, zombieResult)
 
+	// Main-integrity scan: detect unauthorized direct pushes to main (gt-i71).
+	// Only runs on PR-mode rigs where every merge must arrive via a PR.
+	// Skipped when --main-since=0 (e.g. non-PR rigs, test/dry-run contexts).
+	var mainIntegrityResult *MainIntegrityResult
+	if patrolScanSince > 0 && rigIsPRMode(townRoot, rigName) {
+		mainIntegrityResult = detectUnauthorizedMainPushes(workDir, patrolScanSince)
+		if patrolScanNotify && mainIntegrityResult != nil && len(mainIntegrityResult.Unauthorized) > 0 {
+			sendMainIntegrityAlert(router, rigName, mainIntegrityResult)
+		}
+	}
+
 	// Notify when zombies with active work are detected.
 	// Always notify the mayor for active-work zombies (dead polecats with hooked
 	// beads) — this is the primary mechanism for detecting failed work. (GH #3584)
@@ -174,7 +202,7 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 		return outputPatrolScanJSON(rigName, timestamp, zombieResult, stallResult, completionResult, receipts)
 	}
 
-	return outputPatrolScanHuman(rigName, zombieResult, stallResult, completionResult, receipts)
+	return outputPatrolScanHuman(rigName, zombieResult, stallResult, completionResult, receipts, mainIntegrityResult)
 }
 
 func countActiveWorkZombies(result *witness.DetectZombiePolecatsResult) int {
@@ -310,7 +338,7 @@ func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.Detec
 	return enc.Encode(output)
 }
 
-func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, _ []witness.PatrolReceipt) error {
+func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePolecatsResult, stallResult *witness.DetectStalledPolecatsResult, completionResult *witness.DiscoverCompletionsResult, _ []witness.PatrolReceipt, mainIntegrity *MainIntegrityResult) error {
 	fmt.Printf("%s Patrol scan: %s\n\n", style.Bold.Render("🔍"), rigName)
 
 	// Zombies
@@ -396,6 +424,9 @@ func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePol
 		fmt.Println()
 	}
 
+	// Main integrity (only shown if the scan ran)
+	outputMainIntegrityHuman(mainIntegrity)
+
 	// Summary
 	zombieCount := 0
 	activeCount := 0
@@ -411,12 +442,16 @@ func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePol
 	if completionResult != nil {
 		completionCount = len(completionResult.Discovered)
 	}
+	unauthorizedCount := 0
+	if mainIntegrity != nil {
+		unauthorizedCount = len(mainIntegrity.Unauthorized)
+	}
 
-	if zombieCount == 0 && stallCount == 0 && completionCount == 0 {
+	if zombieCount == 0 && stallCount == 0 && completionCount == 0 && unauthorizedCount == 0 {
 		fmt.Printf("%s All clear — no issues detected\n", style.Success.Render("✓"))
 	} else {
-		fmt.Printf("Summary: %d zombie(s) (%d active-work), %d stall(s), %d completion(s)\n",
-			zombieCount, activeCount, stallCount, completionCount)
+		fmt.Printf("Summary: %d zombie(s) (%d active-work), %d stall(s), %d completion(s), %d unauthorized push(es)\n",
+			zombieCount, activeCount, stallCount, completionCount, unauthorizedCount)
 	}
 
 	return nil

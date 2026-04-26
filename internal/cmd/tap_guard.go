@@ -130,6 +130,7 @@ forbidden operation entirely.
 
 Available guards:
   pr-workflow        - Block PR creation and feature branches
+  push-main          - Block git push to origin/main under merge_strategy=pr
   bd-init            - Block bd init in wrong directories
   mol-patrol         - Block mol patrol from agent contexts
   dangerous-command  - Block rm -rf, force push, hard reset, git clean

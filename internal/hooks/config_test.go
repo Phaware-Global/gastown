@@ -1168,3 +1168,33 @@ func TestMarshalConfig(t *testing.T) {
 		t.Errorf("round-trip lost SessionStart hooks")
 	}
 }
+
+// TestDefaultBaseHasPushMainGuard verifies that the generated base hook config
+// includes the push-main guard for Bash(git push*) matchers. This test exists
+// to prevent regressions: PR #7 added the push-main guard to hooks/config.go
+// but the guard was not wired into the live settings.json files until gt hooks
+// sync was run. If the guard is ever removed from DefaultBase, this test fails
+// immediately instead of silently letting polecats push to main.
+func TestDefaultBaseHasPushMainGuard(t *testing.T) {
+	cfg := DefaultBase()
+
+	const wantMatcher = "Bash(git push*)"
+	const wantGuard = "gt tap guard push-main"
+
+	found := false
+	for _, entry := range cfg.PreToolUse {
+		if entry.Matcher != wantMatcher {
+			continue
+		}
+		for _, h := range entry.Hooks {
+			if strings.Contains(h.Command, wantGuard) {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("DefaultBase PreToolUse missing %q hook for matcher %q; "+
+			"the push-main guard must be present to block direct pushes to main (gt-i71)",
+			wantGuard, wantMatcher)
+	}
+}
