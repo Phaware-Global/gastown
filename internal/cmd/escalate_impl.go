@@ -163,6 +163,16 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 	// Process external notification actions (email:, sms:, slack, log)
 	statuses = append(statuses, executeExternalActions(actions, escalationConfig, issue.ID, severity, description, townRoot)...)
 
+	// G39: for HIGH and CRITICAL severities, fail the escalation hard if any
+	// configured external notification was skipped due to missing contacts.
+	// Without this, a rig can run for months with the email/SMS path silently
+	// disabled and the misconfiguration only surfaces during a real incident
+	// — exactly when the stack is least equipped to recover. Bead/mail
+	// targets have already been processed by this point so the in-band
+	// escalation record is intact; the failure tells the operator (and the
+	// LLM caller) that the out-of-band human notification did NOT fire.
+	skipFailures := collectMissingContactSkips(severity, statuses)
+
 	// Log to activity feed
 	payload := events.EscalationPayload(issue.ID, agentID, strings.Join(targets, ","), description)
 	payload["severity"] = severity
@@ -209,7 +219,51 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	if len(skipFailures) > 0 {
+		// Echo the operator-friendly error AFTER the success-shaped
+		// "Escalation created" lines so the LLM caller sees the bead ID
+		// (still useful for follow-up) before the failure that the
+		// runner is about to return.
+		return fmt.Errorf(
+			"%s/%s escalation created (%s) but %d configured notification(s) were skipped: %s — "+
+				"set the missing contacts in settings/escalation.json or remove the action from the route",
+			strings.ToUpper(severity), issue.ID, issue.ID,
+			len(skipFailures), strings.Join(skipFailures, "; "))
+	}
+
 	return nil
+}
+
+// collectMissingContactSkips returns one operator-friendly summary string per
+// external notification action that was skipped because its contact field was
+// unset. Empty for any severity below HIGH (G39 only fails hard at HIGH and
+// CRITICAL — at MEDIUM and LOW the warning is enough; rigs without escalation
+// contacts are common during early bring-up). The returned strings carry the
+// channel and the missing-config field so the operator knows which
+// settings/escalation.json key to fill in.
+func collectMissingContactSkips(severity string, statuses []deliveryStatus) []string {
+	switch strings.ToLower(severity) {
+	case "critical", "high":
+	default:
+		return nil
+	}
+	var skips []string
+	for _, s := range statuses {
+		// Only external-notification channels carry the missing-contact
+		// warning — the bead/mail paths warn for unrelated reasons
+		// (annotation lookup, etc.) and we don't want to block on those.
+		if s.Warning == "" {
+			continue
+		}
+		if !strings.Contains(s.Warning, "not configured") {
+			continue
+		}
+		switch s.Channel {
+		case "email", "sms", "slack":
+			skips = append(skips, fmt.Sprintf("%s: %s", s.Channel, s.Warning))
+		}
+	}
+	return skips
 }
 
 type deliveryStatus struct {

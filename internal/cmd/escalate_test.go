@@ -107,6 +107,69 @@ func TestExecuteExternalActionsReportsWarningsAndFailures(t *testing.T) {
 	}
 }
 
+// G39: at HIGH and CRITICAL severities, missing-contact skips on
+// email/sms/slack must be surfaced as failures so the operator notices the
+// misconfiguration before a real incident depends on it. At MEDIUM and LOW,
+// the existing warning-only behavior is preserved (rigs commonly bring up
+// without escalation contacts during early development).
+func TestCollectMissingContactSkips_HighSeverity_FailsOnSkippedEmail(t *testing.T) {
+	statuses := []deliveryStatus{
+		{Channel: "bead", Created: true},
+		{Channel: "mail", Target: "mayor", Persisted: true},
+		{Channel: "email", Target: "human", Warning: "contacts.human_email not configured"},
+		{Channel: "log", RuntimeNotified: true},
+	}
+	for _, sev := range []string{"high", "critical", "HIGH", "CRITICAL"} {
+		t.Run(sev, func(t *testing.T) {
+			skips := collectMissingContactSkips(sev, statuses)
+			if len(skips) != 1 {
+				t.Fatalf("expected 1 skip at %s, got %d: %v", sev, len(skips), skips)
+			}
+			if !strings.Contains(skips[0], "email") || !strings.Contains(skips[0], "human_email") {
+				t.Errorf("expected skip to name channel + missing field, got %q", skips[0])
+			}
+		})
+	}
+}
+
+func TestCollectMissingContactSkips_MediumLow_DoesNotFail(t *testing.T) {
+	statuses := []deliveryStatus{
+		{Channel: "email", Target: "human", Warning: "contacts.human_email not configured"},
+	}
+	for _, sev := range []string{"medium", "low", ""} {
+		t.Run(sev, func(t *testing.T) {
+			if skips := collectMissingContactSkips(sev, statuses); len(skips) != 0 {
+				t.Errorf("expected no skips at severity=%q, got %v", sev, skips)
+			}
+		})
+	}
+}
+
+func TestCollectMissingContactSkips_BeadOrMailWarnings_Ignored(t *testing.T) {
+	// Bead/mail-channel warnings are unrelated misconfigurations
+	// (annotation lookups, etc.) — they must NOT trip the G39 hard-fail,
+	// which is scoped to external out-of-band notification channels.
+	statuses := []deliveryStatus{
+		{Channel: "bead", Warning: "annotation lookup failed"},
+		{Channel: "mail", Target: "mayor", Warning: "annotation update failed"},
+	}
+	if skips := collectMissingContactSkips("critical", statuses); len(skips) != 0 {
+		t.Errorf("expected no skips for non-external-channel warnings, got %v", skips)
+	}
+}
+
+func TestCollectMissingContactSkips_AggregatesMultipleChannels(t *testing.T) {
+	statuses := []deliveryStatus{
+		{Channel: "email", Warning: "contacts.human_email not configured"},
+		{Channel: "sms", Warning: "contacts.human_sms not configured"},
+		{Channel: "slack", Warning: "contacts.slack_webhook not configured"},
+	}
+	skips := collectMissingContactSkips("critical", statuses)
+	if len(skips) != 3 {
+		t.Fatalf("expected 3 skips (one per external channel), got %d: %v", len(skips), skips)
+	}
+}
+
 func TestDeliveryStatusJSONContainsPartialFailure(t *testing.T) {
 	statuses := []deliveryStatus{{Channel: "bead", Created: true}, {Channel: "mail", Target: "mayor", Error: "notify failed"}}
 	hasFailure := false
