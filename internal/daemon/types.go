@@ -131,6 +131,38 @@ type PatrolsConfig struct {
 	MainBranchTest         *MainBranchTestConfig          `json:"main_branch_test,omitempty"`
 	QuotaDog               *QuotaDogConfig                `json:"quota_dog,omitempty"`
 	RestartTracker         *RestartTrackerConfig          `json:"restart_tracker,omitempty"`
+	Telegraph              *TelegraphServerConfig         `json:"telegraph,omitempty"`
+}
+
+// TelegraphServerConfig holds configuration for the daemon-managed Telegraph subprocess.
+type TelegraphServerConfig struct {
+	// Enabled controls whether the daemon starts and supervises Telegraph.
+	Enabled bool `json:"enabled"`
+
+	// ConfigPath is the path to telegraph.toml. Defaults to <town-root>/settings/telegraph.toml.
+	ConfigPath string `json:"config_path,omitempty"`
+
+	// LogFile is where the Telegraph subprocess stdout/stderr is routed.
+	// Defaults to <town-root>/daemon/telegraph.log.
+	LogFile string `json:"log_file,omitempty"`
+
+	// AutoRestart controls whether to restart Telegraph after a crash.
+	AutoRestart bool `json:"auto_restart,omitempty"`
+
+	// RestartDelay is the initial delay before restarting after a crash (default 5s).
+	RestartDelay time.Duration `json:"restart_delay,omitempty"`
+
+	// MaxRestartDelay is the maximum backoff delay (default 5min).
+	MaxRestartDelay time.Duration `json:"max_restart_delay,omitempty"`
+
+	// MaxRestartsInWindow is the maximum restarts allowed within RestartWindow (default 5).
+	MaxRestartsInWindow int `json:"max_restarts_in_window,omitempty"`
+
+	// RestartWindow is the time window for counting restarts (default 10min).
+	RestartWindow time.Duration `json:"restart_window,omitempty"`
+
+	// HealthCheckInterval is how often to check whether Telegraph is alive (default 30s).
+	HealthCheckInterval time.Duration `json:"health_check_interval,omitempty"`
 }
 
 // DoltRemotesConfig holds configuration for the dolt_remotes patrol.
@@ -307,6 +339,12 @@ func IsPatrolEnabled(config *DaemonPatrolConfig, patrol string) bool {
 			return false
 		}
 		return config.Patrols.QuotaDog.Enabled
+	}
+	if patrol == "telegraph" {
+		if config == nil || config.Patrols == nil || config.Patrols.Telegraph == nil {
+			return false
+		}
+		return config.Patrols.Telegraph.Enabled
 	}
 
 	if config == nil || config.Patrols == nil {
