@@ -153,7 +153,8 @@ Exit codes:
   0  ready to advance
   1  still waiting (post-trigger or inside the wait window)
   2  unresolved threads — caller dispatches review-fix
-  3  reviewer never engaged — caller escalates`,
+  3  reviewer never engaged — caller escalates
+  4  operational/config error — caller escalates (does NOT silently retry)`,
 	Args: cobra.ExactArgs(1),
 	RunE: runRefineryPrAwaitReview,
 }
@@ -495,7 +496,7 @@ func runRefineryPrMerge(cmd *cobra.Command, args []string) error {
 		var needsApproval *refinery.NeedsApprovalError
 		if errors.As(err, &needsApproval) {
 			return fmt.Errorf("%w\n\n"+
-				"The refinery patrol formula requires `gt refinery pr request-review` (PR.4) "+
+				"The refinery patrol formula requires `gt refinery pr await-review` (PR.4) "+
 				"and `gt refinery pr wait-approval` (PR.6) to run between pr-create and pr-merge. "+
 				"If PR #%d is genuinely ready to land, re-run those steps; if this is an operator "+
 				"adoption path for an orphan branch, merge via `gh pr merge` on the CLI outside "+
@@ -517,6 +518,26 @@ func runRefineryPrMerge(cmd *cobra.Command, args []string) error {
 }
 
 func runRefineryPrAwaitReview(cmd *cobra.Command, args []string) error {
+	// Two-tier exit code scheme so the formula can distinguish "still
+	// waiting" (retry next patrol) from "operational/config error"
+	// (escalate). awaitReviewInner returns regular errors and
+	// SilentExitErrors for the known status codes (1/2/3); this wrapper
+	// catches non-silent errors and converts them to exit 4 with the
+	// underlying message printed to stderr. Without this split, exit 1
+	// would conflate AwaitStatusWaiting with a config-load failure and
+	// the patrol would silently retry an unrecoverable failure forever.
+	err := awaitReviewInner(args)
+	if err == nil {
+		return nil
+	}
+	if _, isSilent := IsSilentExit(err); isSilent {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "Error: await-review (operational): %v\n", err)
+	return NewSilentExit(4)
+}
+
+func awaitReviewInner(args []string) error {
 	prNumber, err := parsePRNumber(args[0])
 	if err != nil {
 		return err
