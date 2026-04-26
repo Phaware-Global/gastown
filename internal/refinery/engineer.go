@@ -436,7 +436,10 @@ func (e *Engineer) LoadConfig() error {
 		filepath.Join(e.rig.Path, "config.json"),
 	}
 
-	var mergeQueueRaw json.RawMessage
+	var (
+		mergeQueueRaw    json.RawMessage
+		mergeQueueSource string
+	)
 	for _, path := range candidates {
 		fileData, err := os.ReadFile(path)
 		if err != nil {
@@ -463,6 +466,7 @@ func (e *Engineer) LoadConfig() error {
 		}
 
 		mergeQueueRaw = probe.MergeQueue
+		mergeQueueSource = path
 		break
 	}
 
@@ -497,7 +501,7 @@ func (e *Engineer) LoadConfig() error {
 	}
 
 	if err := json.Unmarshal(mergeQueueRaw, &mqRaw); err != nil {
-		return fmt.Errorf("parsing merge_queue config: %w", err)
+		return fmt.Errorf("parsing merge_queue from %s: %w", mergeQueueSource, err)
 	}
 
 	// Apply non-nil values to config (preserving defaults for missing fields)
