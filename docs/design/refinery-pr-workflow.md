@@ -2503,7 +2503,7 @@ The intervention is prose, not validation. A regex check catches *some* tokens b
    >
    > 2. **Solution concreteness** — does the prose name what changes in concrete terms (file paths, function names, behavior diffs)? Internal vocabulary like *polecat*, *refinery*, *tap-guard*, *await-review*, *mol patrol* is fine ONLY when the surrounding text gives a non-member enough context to follow.
    >
-   > 3. **No bare task IDs in prose.** Strip `gt-*`, `hq-*`, `wisp-*`, `gts-*` IDs from prose unless each one is paired with what it actually was — "the iter-2 dogfood escalation that flagged ..." rather than "hq-wisp-rhxf6". External reviewers can't open these beads. The bead ID itself goes in the `Closes-Bead:` trailer at the bottom.
+   > 3. **No bare task IDs in prose.** Strip `gt-*`, `hq-*`, `wisp-*`, `gts-*` IDs from prose unless each one is paired with what it actually was — "the iter-2 dogfood escalation that flagged ..." rather than "hq-wisp-rhxf6". External reviewers can't open these beads. Each ID family maps to its own trailer key — bead IDs (`gt-*`, `hq-*`) in `Closes-Bead:`, patrol/cycle IDs in `Patrol-Cycle:`, design-ledger anchors (G-numbers) in `Design-Ref:` — see point 4 below for the full trailer-block contract.
    >
    > 4. **No bare G-numbers in prose.** "G33", "G12b", "the G19 hole" should either be replaced with the underlying problem statement or include it inline ("G33 — refinery doing review-fix work inline instead of dispatching a polecat"). A `Design-Ref: G33` trailer at the bottom is fine if the prose above explains the problem; the G-number alone is NOT acceptable as the entire summary.
    >
