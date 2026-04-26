@@ -44,7 +44,9 @@ events     = [
 ## Secret: Generating and Rotating the Jira HMAC Secret
 
 Telegraph authenticates Jira webhooks using HMAC-SHA256. The secret is a
-32-byte random value stored in an environment variable — never committed to disk.
+32-byte random value stored in an environment variable — never committed to version
+control. `~/.zshrc` is a local disk file; treat it accordingly (restrict permissions,
+exclude from backups if sensitive).
 
 **Generate a new secret:**
 
@@ -59,7 +61,7 @@ openssl rand -hex 32
 export GT_TELEGRAPH_JIRA_SECRET="<the hex string from above>"
 ```
 
-Telegraph reads this variable at startup via `config.ResolveSecret()`. If the
+Telegraph reads this variable at startup via `ProviderConfig.ResolveSecret()` (called during `Config.ResolveProviders()`). If the
 variable is unset or empty, the process exits immediately with an error.
 
 **Rotate the secret:**
@@ -79,8 +81,8 @@ low-traffic periods — there is no overlap window.
 Telegraph runs as a foreground process. Use `nohup` to detach from the terminal:
 
 ```bash
-# Ensure the log directory exists
-mkdir -p ~/gt/logs
+# Ensure the log and run directories exist
+mkdir -p ~/gt/logs ~/gt/run
 
 # Start in background
 nohup gt telegraph start > ~/gt/logs/telegraph-boot.log 2>&1 &
@@ -107,7 +109,12 @@ gt telegraph start --town-root /path/to/gt            # override town root
 
 ## Exposing Telegraph via Tunnel or Proxy
 
-Telegraph listens on `127.0.0.1:8765` and is not exposed directly to the internet.
+Telegraph listens on `:8765` by default (all interfaces). If your firewall does
+not restrict inbound access to port 8765, Telegraph will accept connections from
+any source — not just your tunnel or proxy. Restrict the bind address to
+`127.0.0.1:8765` in `listen_addr` if you want loopback-only binding, or rely on
+OS-level firewall rules.
+
 Route the public webhook URL to the local listener using whichever ingress approach
 fits your infrastructure:
 
@@ -180,9 +187,12 @@ tail -f ~/gt/logs/telegraph.log | jq .
 A successful round-trip produces two log lines:
 
 ```json
-{"ts":"2026-04-26T08:00:00Z","component":"telegraph","event":"accept","provider":"jira","source_ip":"1.2.3.4","event_id":"TEST-1-1714118400000","bytes_len":512,"latency_ms":2}
+{"ts":"2026-04-26T08:00:00Z","component":"telegraph","event":"accept","provider":"jira","source_ip":"1.2.3.4","bytes_len":512,"latency_ms":2}
 {"ts":"2026-04-26T08:00:00Z","component":"telegraph","event":"deliver","provider":"jira","event_type":"issue.created","event_id":"TEST-1-1714118400000","actor":"testuser","subject":"TEST-1","mail_id":""}
 ```
+
+> Note: `event_id` is absent from `accept` lines — it is only extracted during L2
+> translation and appears in `deliver`/`drop` lines.
 
 ### Send a signed test POST
 
@@ -222,7 +232,7 @@ Every log line is a single JSON object. Key fields:
 | `component` | Always `"telegraph"` |
 | `event` | `accept`, `reject`, `deliver`, `drop`, `nudge_sent`, `nudge_suppressed` |
 | `provider` | e.g. `"jira"` |
-| `reason` | On `reject`/`drop`: `hmac_invalid`, `unknown_event_type`, `backpressure`, `parse_error`, `provider_disabled` |
+| `reason` | On `reject`: `hmac_invalid`, `backpressure`, `parse_error`, `provider_disabled`; on `drop`: `no_translator`, `translate_error`, `transform_error` |
 | `source_ip` | Caller IP (tunnel edge IP in production) |
 | `actor` | Who triggered the event |
 | `subject` | Issue key, e.g. `PROJ-1234` |
@@ -234,9 +244,9 @@ They reset on restart. The counters are:
 |---------|---------------|
 | `Accept` | Request authenticated and enqueued |
 | `RejectHMACInvalid` | Bad or missing `X-Hub-Signature` |
-| `RejectUnknownType` | Event type not in the configured `events` list |
+| `RejectUnknownType` | (Unused in v1) — unknown event types are logged as `drop` with `reason="translate_error"` |
 | `RejectBackpressure` | Internal buffer full (HTTP 503 returned) |
-| `RejectParseError` | JSON parse failure on known event type |
+| `RejectParseError` | HTTP body read failure or request body exceeds size limit |
 | `RejectProviderDis` | Provider set to `enabled = false` |
 | `Deliver` | Mail successfully sent to Mayor |
 | `Drop` | Event discarded post-L2 without delivery |
@@ -274,7 +284,8 @@ Telegraph has no hot-reload in v1 — config or secret changes require a restart
 kill -TERM $(cat ~/gt/run/telegraph.pid)
 # Wait for the log line: [Telegraph] shutdown complete
 
-# Start again
+# Start again (ensure dirs exist)
+mkdir -p ~/gt/logs ~/gt/run
 nohup gt telegraph start > ~/gt/logs/telegraph-boot.log 2>&1 &
 echo $! > ~/gt/run/telegraph.pid
 ```
