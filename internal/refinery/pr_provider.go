@@ -95,12 +95,13 @@ type PRProvider interface {
 	// ListReviewAuthors returns the unique GitHub logins of every user
 	// who has submitted at least one review on the PR (any state). The
 	// returned slice preserves the original case of each login and is
-	// sorted lexicographically for deterministic output. Used by the
-	// await-review timeout path to surface "PR has reviews from: ..."
-	// in the patrol log so a misconfigured pr_reviewer is self-evident
-	// rather than silent. Providers that don't yet support this should
-	// return ErrUnsupported; callers tolerate that by emitting the bare
-	// timeout message.
+	// sorted in case-insensitive lexicographic order so operators reading
+	// the patrol log don't see Copilot before augmentcode purely because
+	// of the capital C. Used by the await-review timeout path to surface
+	// "PR has reviews from: ..." in the patrol log so a misconfigured
+	// pr_reviewer is self-evident rather than silent. Providers that
+	// don't yet support this should return ErrUnsupported; callers
+	// tolerate that by emitting the bare timeout message.
 	ListReviewAuthors(prNumber int) ([]string, error)
 }
 

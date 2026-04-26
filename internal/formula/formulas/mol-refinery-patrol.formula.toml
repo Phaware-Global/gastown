@@ -175,7 +175,7 @@ description = "Require at least one approving GitHub review before merging (only
 default = "false"
 
 [vars.pr_reviewer]
-description = "GitHub user/bot to request an automated review from (e.g., augment). Empty = skip automated review, proceed directly to human-approval gate. Only applies when merge_strategy=pr."
+description = "GitHub *login* of the reviewer bot (e.g., 'augmentcode', 'gemini-code-assist', 'Copilot') — NOT the trigger keyword. The await-review gate looks up reviews by exact login match, so this MUST be the bot's actual GitHub username; the trigger phrase posted on the PR ('augment review', '/gemini review') is configured separately via pr_trigger_comment. Empty = skip automated review, proceed directly to human-approval gate. Only applies when merge_strategy=pr."
 default = ""
 
 [vars.pr_approver]

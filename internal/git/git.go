@@ -1527,10 +1527,16 @@ func (g *Git) GhPrHasReviewFrom(prNumber int, user string) (bool, error) {
 // GhPrReviewAuthors returns the unique GitHub logins of every user who has
 // submitted at least one review on the PR (any state). Logins preserve their
 // original case as returned by the gh CLI; the slice is sorted
-// case-insensitively for deterministic output. Used by the await-review
-// timeout path so a misconfigured pr_reviewer surfaces as "PR has reviews
-// from: ..." in the patrol log on first occurrence rather than as a silent
-// 30-minute timeout cycle.
+// case-insensitively (the comparison key is the lowercased login, but the
+// returned strings carry the original case from the PR). Used by the
+// await-review timeout path so a misconfigured pr_reviewer surfaces as "PR
+// has reviews from: ..." in the patrol log on first occurrence rather than
+// as a silent 30-minute timeout cycle.
+//
+// Sort order detail: keys (lowercased logins) are sorted directly via
+// sort.Strings so we don't repeatedly lowercase during O(N log N) compares.
+// The de-dup map tracks lowercased→original mapping; the output is built by
+// looking each sorted key back up in that map.
 func (g *Git) GhPrReviewAuthors(prNumber int) ([]string, error) {
 	reviews, err := g.ghFetchReviews(prNumber)
 	if err != nil {
@@ -1547,13 +1553,15 @@ func (g *Git) GhPrReviewAuthors(prNumber int) ([]string, error) {
 			seen[key] = login
 		}
 	}
-	out := make([]string, 0, len(seen))
-	for _, login := range seen {
-		out = append(out, login)
+	keys := make([]string, 0, len(seen))
+	for k := range seen {
+		keys = append(keys, k)
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		return strings.ToLower(out[i]) < strings.ToLower(out[j])
-	})
+	sort.Strings(keys)
+	out := make([]string, len(keys))
+	for i, k := range keys {
+		out[i] = seen[k]
+	}
 	return out, nil
 }
 
