@@ -282,6 +282,31 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	// Auto-commit ensures work is NEVER lost regardless of exit type or agent behavior.
 	// The commit message is clearly marked as an auto-save so reviewers know.
 	if cwdAvailable && doneCleanupStatus == "uncommitted" {
+		// G41 protected-branch guard: refuse to auto-commit when HEAD is on
+		// main/master/develop. The original failure mode landed in-progress
+		// polecat work directly on origin/main (mayor reverted via
+		// bab51596) because the safety net commits to whatever branch is
+		// checked out. With a polecat that's still on main (worktree-init
+		// residue, G42-style block on `git checkout -b`, or any path that
+		// leaves main checked out at edit time), the auto-save destination
+		// is exactly the branch the rest of the workflow refuses to push
+		// to. Skipping the auto-save leaves the work in the worktree where
+		// the operator (or the next polecat session) can recover it
+		// manually with `git stash` / `gt polecat checkout-branch`.
+		if branch != "" && git.IsProtectedBranch(branch) {
+			fmt.Printf("\n%s Uncommitted changes detected on protected branch %q — REFUSING to auto-save\n",
+				style.Bold.Render("⚠"), branch)
+			fmt.Printf("  The gt-pvx safety net does not commit on main/master/develop because\n")
+			fmt.Printf("  doing so would land in-progress work on the integration branch and\n")
+			fmt.Printf("  (with auto-push) bypass the PR workflow entirely.\n\n")
+			fmt.Printf("  Recover manually before re-running gt done:\n")
+			fmt.Printf("    git stash push -m \"recover from gt done on %s\"\n", branch)
+			fmt.Printf("    git checkout -b polecat/<your-name>-<bead-id>\n")
+			fmt.Printf("    git stash pop\n")
+			fmt.Printf("    git add . && git commit -m \"<your real message>\"\n\n")
+			return fmt.Errorf("gt done aborted: refusing to auto-save uncommitted work on protected branch %q (G41 guard)", branch)
+		}
+
 		// Re-check to get file details (cleanup detection already confirmed uncommitted changes)
 		workStatus, err := g.CheckUncommittedWork()
 		if err == nil && workStatus.HasUncommittedChanges && !workStatus.CleanExcludingRuntime() {

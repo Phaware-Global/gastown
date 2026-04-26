@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/util"
 )
@@ -129,6 +130,27 @@ func (d *Daemon) checkpointWorktree(workDir, rigName, polecatName string) bool {
 	}
 	if strings.TrimSpace(statusOut) == "" {
 		return false // Clean worktree
+	}
+
+	// G41 protected-branch guard: refuse to checkpoint when the worktree is
+	// on main/master/develop. The original incident (rictus's gt-mwy.4
+	// auto-save) landed in-progress polecat work on origin/main because
+	// the safety net commits to whatever branch is checked out. With a
+	// polecat that's still on main (worktree-init residue, blocked
+	// `git checkout -b`, or any path that leaves main checked out), the
+	// checkpoint commit's destination is exactly the branch the rest of
+	// the workflow refuses to push to. Skipping leaves the work in the
+	// worktree for manual recovery — same shape as the gt done safety
+	// net's protected-branch guard.
+	branchOut, err := runGitCmd(workDir, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		d.logger.Printf("checkpoint_dog: cannot read HEAD in %s/%s: %v — skipping for safety", rigName, polecatName, err)
+		return false
+	}
+	if branch := strings.TrimSpace(branchOut); git.IsProtectedBranch(branch) {
+		d.logger.Printf("checkpoint_dog: REFUSING to checkpoint %s/%s on protected branch %q (G41 guard) — work remains uncommitted in worktree",
+			rigName, polecatName, branch)
+		return false
 	}
 
 	// Stage everything
