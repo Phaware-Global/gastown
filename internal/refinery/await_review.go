@@ -83,6 +83,17 @@ type AwaitReviewStepInput struct {
 	// providers that can't surface a HEAD SHA).
 	HeadSHA string
 
+	// BeadCommitSHA is the commit SHA persisted on the MR bead — the
+	// HEAD that the bead currently believes is up for review
+	// (G35/G36 drift detection). When this differs from HeadSHA the
+	// polecat or refinery has force-pushed a new commit since the
+	// trigger was last posted; AwaitReviewStep treats that as a
+	// state-reset (re-post the trigger, restart the wait window) and
+	// signals NewBeadCommitSHA so the caller persists the new SHA on
+	// the bead. Empty bypasses the check, preserving behavior for
+	// callers that don't track per-bead SHA state yet.
+	BeadCommitSHA string
+
 	// Now overrides time.Now for tests. nil → time.Now.
 	Now func() time.Time
 }
@@ -95,6 +106,12 @@ type AwaitReviewStepResult struct {
 	Status            AwaitReviewStatus
 	NewStartedAt      time.Time
 	UnresolvedThreads []UnresolvedThread
+
+	// NewBeadCommitSHA is non-empty when the caller must persist an
+	// updated commit_sha to the MR bead. Set on the trigger-posted /
+	// drift-reset path so the bead's CommitSHA tracks the current PR
+	// HEAD instead of going stale after each force-push (G36).
+	NewBeadCommitSHA string
 
 	// Message is a single-line operator-friendly summary suitable for
 	// patrol logs. Always populated.
@@ -160,11 +177,31 @@ func AwaitReviewStep(provider PRProvider, prNumber int, in AwaitReviewStepInput)
 		now = time.Now
 	}
 
-	// First entry: trigger has never been posted. Post it (if the
-	// caller wants one), record the timestamp, and bail. The caller
-	// returns to the patrol loop; the next cycle re-enters here with
-	// StartedAt set.
-	if in.StartedAt.IsZero() {
+	// G35/G36 drift detection: if the bead's persisted commit_sha
+	// differs from the upstream HEAD, the polecat or refinery has
+	// force-pushed a new commit since the trigger was posted. The
+	// reviewer-engagement and timeout state on the bead refer to the
+	// OLD HEAD and are no longer load-bearing — treat this as if
+	// StartedAt were zero so the trigger gets re-posted against the
+	// new HEAD and the wait window restarts. The caller updates the
+	// bead's commit_sha via NewBeadCommitSHA so the next patrol cycle
+	// won't re-detect the same drift.
+	//
+	// Skipped when either side is empty (provider doesn't expose a
+	// HEAD SHA, or the bead hasn't been initialized with a commit_sha
+	// yet — common for the first patrol cycle on a fresh MR).
+	driftReset := false
+	if in.BeadCommitSHA != "" && in.HeadSHA != "" &&
+		!strings.EqualFold(in.BeadCommitSHA, in.HeadSHA) {
+		driftReset = true
+	}
+
+	// First entry OR drift-reset: trigger has never been posted (or
+	// needs re-posting against a new HEAD). Post it (if the caller
+	// wants one), record the timestamp, and bail. The caller returns
+	// to the patrol loop; the next cycle re-enters here with StartedAt
+	// set and the bead's commit_sha aligned with HeadSHA.
+	if in.StartedAt.IsZero() || driftReset {
 		if in.TriggerComment != "" {
 			if err := provider.PostComment(prNumber, in.TriggerComment); err != nil {
 				return AwaitReviewStepResult{}, fmt.Errorf("posting review trigger comment: %w", err)
@@ -174,21 +211,40 @@ func AwaitReviewStep(provider PRProvider, prNumber int, in AwaitReviewStepInput)
 		// Differentiate the message when no trigger was posted (pr_trigger_comment
 		// empty / --no-trigger). "Posted trigger %q" is misleading when nothing
 		// went out, and operators diagnosing a non-engaging reviewer bot need
-		// to know whether the trigger actually fired.
+		// to know whether the trigger actually fired. A drift-reset gets a
+		// dedicated prefix so operators can see WHY the timer reset, not just
+		// that it did.
 		var msg string
-		if in.TriggerComment != "" {
+		switch {
+		case driftReset && in.TriggerComment != "":
+			msg = fmt.Sprintf(
+				"PR #%d: HEAD changed since last cycle (bead=%s, upstream=%s) — re-posted trigger %q to wake %s; checking again after min-wait %s",
+				prNumber, shortSHA(in.BeadCommitSHA), shortSHA(in.HeadSHA),
+				in.TriggerComment, in.Reviewer, in.MinWait.Round(time.Second))
+		case driftReset:
+			msg = fmt.Sprintf(
+				"PR #%d: HEAD changed since last cycle (bead=%s, upstream=%s) — restarting min-wait window of %s for %s to engage",
+				prNumber, shortSHA(in.BeadCommitSHA), shortSHA(in.HeadSHA),
+				in.MinWait.Round(time.Second), in.Reviewer)
+		case in.TriggerComment != "":
 			msg = fmt.Sprintf(
 				"PR #%d: posted trigger %q to wake %s; checking again after min-wait %s",
 				prNumber, in.TriggerComment, in.Reviewer, in.MinWait.Round(time.Second))
-		} else {
+		default:
 			msg = fmt.Sprintf(
 				"PR #%d: trigger comment disabled — starting min-wait window of %s for %s to engage",
 				prNumber, in.MinWait.Round(time.Second), in.Reviewer)
 		}
+		// Always emit NewBeadCommitSHA when the caller supplied a HeadSHA,
+		// so the bead's commit_sha is initialized on the first patrol cycle
+		// AND realigned on a drift reset. When HeadSHA is empty (e.g.
+		// Bitbucket provider that can't surface it), the field stays empty
+		// and the caller does nothing — preserves legacy behavior.
 		return AwaitReviewStepResult{
-			Status:       AwaitStatusTriggerPosted,
-			NewStartedAt: t,
-			Message:      msg,
+			Status:           AwaitStatusTriggerPosted,
+			NewStartedAt:     t,
+			NewBeadCommitSHA: in.HeadSHA,
+			Message:          msg,
 		}, nil
 	}
 

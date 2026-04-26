@@ -483,6 +483,116 @@ func TestAwaitReviewStep_HeadSHAScoped_ReviewOnCurrentSHA_Ready(t *testing.T) {
 	}
 }
 
+// G35/G36: when the bead's persisted commit_sha differs from the
+// upstream HEAD, the polecat or refinery has force-pushed since the
+// trigger was last posted. AwaitReviewStep must treat that as a state
+// reset — re-post the trigger, restart the wait window, signal the
+// caller to update the bead's commit_sha to the new HEAD. Otherwise
+// the patrol loop sits on a stale wait timer and the new HEAD's
+// reviewer-engagement state is never checked against a fresh trigger.
+func TestAwaitReviewStep_DriftDetected_ResetsAndPostsTrigger(t *testing.T) {
+	const (
+		oldHeadSHA = "1111111111111111111111111111111111111111"
+		newHeadSHA = "2222222222222222222222222222222222222222"
+	)
+	// StartedAt is "fresh enough" — would normally produce a Waiting result.
+	// The drift check must override that and force a re-trigger anyway.
+	started := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	now := started.Add(15 * time.Minute) // past min-wait, well within timeout
+	provider := &awaitFakeProvider{}
+	res, err := AwaitReviewStep(provider, 42, baseInput(now,
+		func(in *AwaitReviewStepInput) {
+			in.StartedAt = started
+			in.HeadSHA = newHeadSHA
+			in.BeadCommitSHA = oldHeadSHA
+		}))
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Status != AwaitStatusTriggerPosted {
+		t.Errorf("status = %v, want AwaitStatusTriggerPosted (drift must restart)", res.Status)
+	}
+	if res.NewBeadCommitSHA != newHeadSHA {
+		t.Errorf("NewBeadCommitSHA = %q, want %q (caller must persist new SHA)",
+			res.NewBeadCommitSHA, newHeadSHA)
+	}
+	if !res.NewStartedAt.Equal(now) {
+		t.Errorf("NewStartedAt = %v, want %v (wait window restarts)", res.NewStartedAt, now)
+	}
+	if len(provider.postedComments) != 1 {
+		t.Errorf("expected 1 trigger post on drift, got %d", len(provider.postedComments))
+	}
+	for _, want := range []string{"HEAD changed", "11111111", "22222222"} {
+		if !strings.Contains(res.Message, want) {
+			t.Errorf("expected drift message to contain %q, got %q", want, res.Message)
+		}
+	}
+}
+
+// Drift check is skipped when either side is empty: providers that don't
+// expose a HEAD SHA (Bitbucket) AND first-cycle MRs that haven't yet
+// initialized commit_sha both flow through the legacy state machine.
+func TestAwaitReviewStep_DriftCheck_SkippedWhenSidesEmpty(t *testing.T) {
+	cases := []struct {
+		name string
+		head string
+		bead string
+	}{
+		{"no upstream SHA", "", "1111111111111111111111111111111111111111"},
+		{"no bead SHA", "2222222222222222222222222222222222222222", ""},
+		{"both empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			started := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+			now := started.Add(15 * time.Minute)
+			provider := &awaitFakeProvider{}
+			res, err := AwaitReviewStep(provider, 42, baseInput(now,
+				func(in *AwaitReviewStepInput) {
+					in.StartedAt = started
+					in.HeadSHA = tc.head
+					in.BeadCommitSHA = tc.bead
+				}))
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			// Drift path would post a trigger; the legacy path must not on
+			// a non-fresh StartedAt. NewBeadCommitSHA stays empty too.
+			if len(provider.postedComments) != 0 {
+				t.Errorf("expected no trigger post when drift skipped, got %d", len(provider.postedComments))
+			}
+			if res.NewBeadCommitSHA != "" {
+				t.Errorf("expected NewBeadCommitSHA empty when drift skipped, got %q", res.NewBeadCommitSHA)
+			}
+		})
+	}
+}
+
+// First-cycle initialization: when StartedAt is zero AND HeadSHA is
+// non-empty, the trigger-post result must include NewBeadCommitSHA so
+// the bead's commit_sha is initialized — the next cycle then has a
+// reference to compare against for drift detection.
+func TestAwaitReviewStep_FirstCall_InitializesBeadCommitSHA(t *testing.T) {
+	const headSHA = "abcdef1234567890abcdef1234567890abcdef12"
+	now := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	provider := &awaitFakeProvider{}
+	res, err := AwaitReviewStep(provider, 42, baseInput(now,
+		func(in *AwaitReviewStepInput) {
+			in.HeadSHA = headSHA
+			// BeadCommitSHA empty (first cycle on this MR)
+		}))
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Status != AwaitStatusTriggerPosted {
+		t.Fatalf("status = %v, want AwaitStatusTriggerPosted", res.Status)
+	}
+	if res.NewBeadCommitSHA != headSHA {
+		t.Errorf("NewBeadCommitSHA = %q, want %q (bead's commit_sha must initialize on first post)",
+			res.NewBeadCommitSHA, headSHA)
+	}
+}
+
 // Empty HeadSHA must keep legacy semantics: any review counts. Guards the
 // fallback path used by Bitbucket and any provider that can't surface a
 // HEAD SHA.

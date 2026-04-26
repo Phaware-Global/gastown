@@ -575,7 +575,7 @@ func awaitReviewInner(args []string) error {
 			timeout, wait)
 	}
 
-	startedAt, mrBd, err := readAwaitReviewState(refPrAwaitMR)
+	beadState, mrBd, err := readAwaitReviewState(refPrAwaitMR)
 	if err != nil {
 		return err
 	}
@@ -598,16 +598,17 @@ func awaitReviewInner(args []string) error {
 		TriggerComment: triggerComment,
 		MinWait:        wait,
 		Timeout:        timeout,
-		StartedAt:      startedAt,
+		StartedAt:      beadState.StartedAt,
 		HeadSHA:        headSHA,
+		BeadCommitSHA:  beadState.CommitSHA,
 	})
 	if err != nil {
 		return err
 	}
 
-	if !res.NewStartedAt.IsZero() {
-		if err := writeAwaitReviewStartedAt(mrBd, refPrAwaitMR, res.NewStartedAt); err != nil {
-			return fmt.Errorf("persisting await_review_started_at to MR %s: %w", refPrAwaitMR, err)
+	if !res.NewStartedAt.IsZero() || res.NewBeadCommitSHA != "" {
+		if err := writeAwaitReviewStateUpdates(mrBd, refPrAwaitMR, res.NewStartedAt, res.NewBeadCommitSHA); err != nil {
+			return fmt.Errorf("persisting await-review state to MR %s: %w", refPrAwaitMR, err)
 		}
 	}
 
@@ -644,41 +645,68 @@ func awaitReviewInner(args []string) error {
 	}
 }
 
-// readAwaitReviewState reads the persisted await_review_started_at
-// timestamp from the MR bead, returning a zero time when no MR is
-// passed or the field is unset/empty. The bd handle is returned so
-// the caller can pass it back to writeAwaitReviewStartedAt without
-// re-resolving the bead directory.
-func readAwaitReviewState(mrID string) (time.Time, *beads.Beads, error) {
+// awaitReviewBeadState bundles the await-review fields the patrol loop
+// reads from the MR bead and writes back. Returning a struct (rather
+// than separate scalars) keeps the call sites stable as new persisted
+// fields are added — every caller already needs the bd handle, so
+// passing the snapshot in the same payload is the lighter shape.
+type awaitReviewBeadState struct {
+	StartedAt time.Time
+	CommitSHA string
+}
+
+// readAwaitReviewState reads the persisted await-review state from the
+// MR bead — the timestamp the trigger was posted (StartedAt) and the
+// HEAD commit SHA the bead currently believes is up for review
+// (CommitSHA, used for G35/G36 drift detection). Both fields default to
+// zero values when no MR is passed or the bead is unset. The bd handle
+// is returned so the caller can pass it back to writeAwaitReviewStateUpdates
+// without re-resolving the bead directory.
+func readAwaitReviewState(mrID string) (awaitReviewBeadState, *beads.Beads, error) {
 	if mrID == "" {
-		return time.Time{}, nil, nil
+		return awaitReviewBeadState{}, nil, nil
 	}
 	if err := validateBeadIDShape(mrID); err != nil {
-		return time.Time{}, nil, fmt.Errorf("invalid --mr %q: %w", mrID, err)
+		return awaitReviewBeadState{}, nil, fmt.Errorf("invalid --mr %q: %w", mrID, err)
 	}
 	bd := beads.New(resolveBeadDir(mrID))
 	issue, err := bd.Show(mrID)
 	if err != nil {
-		return time.Time{}, nil, fmt.Errorf("loading MR bead %s: %w", mrID, err)
+		return awaitReviewBeadState{}, nil, fmt.Errorf("loading MR bead %s: %w", mrID, err)
 	}
 	if issue == nil {
-		return time.Time{}, nil, fmt.Errorf("MR bead %s not found", mrID)
+		return awaitReviewBeadState{}, nil, fmt.Errorf("MR bead %s not found", mrID)
 	}
 	fields := beads.ParseMRFields(issue)
-	if fields == nil || fields.AwaitReviewStartedAt == "" {
-		return time.Time{}, bd, nil
+	if fields == nil {
+		return awaitReviewBeadState{}, bd, nil
 	}
-	t, perr := time.Parse(time.RFC3339, fields.AwaitReviewStartedAt)
-	if perr != nil {
-		return time.Time{}, nil, fmt.Errorf(
-			"MR %s has invalid await_review_started_at %q: %w",
-			mrID, fields.AwaitReviewStartedAt, perr)
+	state := awaitReviewBeadState{CommitSHA: fields.CommitSHA}
+	if fields.AwaitReviewStartedAt != "" {
+		t, perr := time.Parse(time.RFC3339, fields.AwaitReviewStartedAt)
+		if perr != nil {
+			return awaitReviewBeadState{}, nil, fmt.Errorf(
+				"MR %s has invalid await_review_started_at %q: %w",
+				mrID, fields.AwaitReviewStartedAt, perr)
+		}
+		state.StartedAt = t
 	}
-	return t, bd, nil
+	return state, bd, nil
 }
 
-func writeAwaitReviewStartedAt(bd *beads.Beads, mrID string, t time.Time) error {
+// writeAwaitReviewStateUpdates persists any non-empty await-review fields
+// produced by an AwaitReviewStep cycle. Both inputs are optional —
+// callers pass zero/empty for "leave as-is" so the helper supports the
+// common case where only one moves on a given cycle (StartedAt updates
+// every time a trigger posts; CommitSHA updates on initial-set or on a
+// drift-reset). Read-modify-write happens under bd.LockBead so we don't
+// clobber a concurrent writer's changes to other MR fields
+// (review_loop_iter, review_fix_polecat, etc.).
+func writeAwaitReviewStateUpdates(bd *beads.Beads, mrID string, startedAt time.Time, commitSHA string) error {
 	if bd == nil || mrID == "" {
+		return nil
+	}
+	if startedAt.IsZero() && commitSHA == "" {
 		return nil
 	}
 	unlock, err := bd.LockBead(mrID)
@@ -687,9 +715,6 @@ func writeAwaitReviewStartedAt(bd *beads.Beads, mrID string, t time.Time) error 
 	}
 	defer unlock()
 
-	// Re-read under the lock so we don't clobber a concurrent writer's
-	// changes to other MR fields (review_loop_iter, review_fix_polecat,
-	// etc.) — read-modify-write needs to see the latest snapshot.
 	latest, err := bd.Show(mrID)
 	if err != nil {
 		return fmt.Errorf("re-reading MR under lock: %w", err)
@@ -701,7 +726,12 @@ func writeAwaitReviewStartedAt(bd *beads.Beads, mrID string, t time.Time) error 
 	if latestFields == nil {
 		latestFields = &beads.MRFields{}
 	}
-	latestFields.AwaitReviewStartedAt = t.UTC().Format(time.RFC3339)
+	if !startedAt.IsZero() {
+		latestFields.AwaitReviewStartedAt = startedAt.UTC().Format(time.RFC3339)
+	}
+	if commitSHA != "" {
+		latestFields.CommitSHA = commitSHA
+	}
 
 	newDesc := beads.SetMRFields(latest, latestFields)
 	return bd.Update(mrID, beads.UpdateOptions{Description: &newDesc})
