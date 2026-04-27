@@ -188,8 +188,12 @@ type MergeQueueConfig struct {
 	//   - RequireReview=false → count gate disabled; only PRApprover's gate applies
 	//   - Both this and PRRequiredApprovals unset → count gate defaults to 1
 	//
-	// Note: `pr_required_approvals: 0` disables only the count gate. The
-	// PRApprover gate is independent and always active.
+	// Note: `pr_required_approvals: 0` disables the count gate AND, when
+	// paired with an empty PRApprover, opts out of every per-user
+	// approval gate (review-loop and unresolved-threads gates remain
+	// active). With a non-empty PRApprover, `pr_required_approvals: 0`
+	// disables only the count gate and the named approver's APPROVED
+	// review is still required.
 	//
 	// Deprecated: kept for backward compatibility. Use PRRequiredApprovals.
 	RequireReview *bool `json:"require_review,omitempty"`
@@ -682,12 +686,16 @@ func (e *Engineer) LoadConfig() error {
 			return fmt.Errorf("pr_required_approvals must be non-negative, got %d",
 				*e.config.PRRequiredApprovals)
 		}
-		// pr_approver may be empty ONLY when pr_required_approvals is
-		// explicitly 0 — opt-out path for rigs that gate on review-loop
-		// completion + threads-resolved alone. See loader.go validation
-		// for the canonical rule; this duplicate enforces it on the
+		// pr_approver may be empty ONLY when the count gate resolves to
+		// zero — opt-out path for rigs that gate on review-loop
+		// completion + threads-resolved alone. Uses the same
+		// GetPRRequiredApprovals helper as the runtime so validation
+		// accepts both `pr_required_approvals: 0` and the deprecated
+		// `require_review: false` form (both resolve to 0), keeping
+		// validation aligned with the runtime gate. See loader.go for
+		// the canonical rule; this duplicate enforces it on the
 		// engineer's per-rig config load path.
-		if e.config.PRApprover == "" && (e.config.PRRequiredApprovals == nil || *e.config.PRRequiredApprovals != 0) {
+		if e.config.PRApprover == "" && e.config.GetPRRequiredApprovals() != 0 {
 			return fmt.Errorf("pr_approver is required when merge_strategy=%q "+
 				"(set pr_required_approvals=0 explicitly to opt out of all approval gates)",
 				"pr")
