@@ -104,7 +104,20 @@ func TestIsGasTownAgentContext_NoEnv(t *testing.T) {
 		t.Setenv(key, "")
 	}
 	// CWD is the test's tmp dir, which is not under /crew/ or /polecats/
-	// — the path-based fallback should also return false.
+	// — the path-based fallback should also return false. Save the
+	// original cwd and restore it via t.Cleanup so this test doesn't
+	// leak the temp-dir cwd into sibling tests in the same package
+	// (which would be flaky/order-dependent — t.TempDir cleans up the
+	// directory but not the process cwd).
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(origCwd); err != nil {
+			t.Errorf("restore cwd to %s: %v", origCwd, err)
+		}
+	})
 	tmp := t.TempDir()
 	if err := os.Chdir(tmp); err != nil {
 		t.Fatalf("chdir to tmp: %v", err)
