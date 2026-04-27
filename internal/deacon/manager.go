@@ -99,6 +99,13 @@ func (m *Manager) Start(agentOverride string) error {
 		return fmt.Errorf("creating deacon directory: %w", err)
 	}
 
+	// Sync cross-DB routes so bd show hq-* works from the deacon session.
+	// Non-fatal: the deacon still operates correctly without routes, just
+	// can't directly resolve HQ beads without explicit BEADS_DIR.
+	if err := SyncBeadsRoutes(m.townRoot, deaconDir); err != nil {
+		fmt.Printf("warning: could not sync deacon beads routes: %v\n", err)
+	}
+
 	// Ensure runtime settings exist in deaconDir where session runs.
 	runtimeConfig := config.ResolveRoleAgentConfig("deacon", m.townRoot, deaconDir)
 	if err := runtime.EnsureSettingsForRole(deaconDir, deaconDir, "deacon", runtimeConfig); err != nil {
@@ -109,7 +116,7 @@ func (m *Manager) Start(agentOverride string) error {
 		Recipient: "deacon",
 		Sender:    "daemon",
 		Topic:     "patrol",
-	}, "I am Deacon. Start patrol: run gt deacon heartbeat, then check gt hook. If no hook, run gt sling mol-deacon-patrol deacon, then execute the hook it creates.")
+	}, "I am Deacon. Start patrol: run gt deacon heartbeat, then check gt hook. If no hook, run gt patrol new, then execute the hook it creates.")
 	startupCmd, err := config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
 		Role:        "deacon",
 		TownRoot:    m.townRoot,
