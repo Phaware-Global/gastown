@@ -63,6 +63,136 @@ func TestEngineer_LoadConfig_MergeStrategyPR(t *testing.T) {
 	}
 }
 
+// TestEngineer_LoadConfig_MergeStrategyPR_NoApproverOptOut covers the
+// review-loop-only opt-out path: empty PRApprover combined with an
+// explicit pr_required_approvals=0 disables both per-user approval
+// gates, leaving only the review-loop and unresolved-threads gates
+// active. This combination must load successfully — it's the
+// supported way to run a PR-mode rig that gates merges on review-loop
+// completion alone, without naming a specific approver.
+func TestEngineer_LoadConfig_MergeStrategyPR_NoApproverOptOut(t *testing.T) {
+	tmpDir := t.TempDir()
+	config := map[string]interface{}{
+		"type":    "rig",
+		"version": 1,
+		"name":    "test-rig",
+		"merge_queue": map[string]interface{}{
+			"merge_strategy":        "pr",
+			"pr_approver":           "",
+			"pr_required_approvals": 0,
+			"pr_reviewer":           "augmentcode",
+		},
+	}
+	data := mustMarshalIndent(t, config)
+	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
+	e := NewEngineer(r)
+	if err := e.LoadConfig(); err != nil {
+		t.Fatalf("expected the no-approver opt-out combination to load, got %v", err)
+	}
+	if e.config.PRApprover != "" {
+		t.Errorf("PRApprover = %q, want empty (opt-out)", e.config.PRApprover)
+	}
+	if e.config.PRRequiredApprovals == nil || *e.config.PRRequiredApprovals != 0 {
+		t.Errorf("PRRequiredApprovals = %v, want explicit 0", e.config.PRRequiredApprovals)
+	}
+}
+
+// TestEngineer_LoadConfig_MergeStrategyPR_NoApproverOptOut_RequireReviewFalse
+// covers the deprecated opt-out shape: empty PRApprover paired with
+// `require_review: false` (instead of `pr_required_approvals: 0`).
+// Both shapes resolve to GetPRRequiredApprovals()==0, and the
+// validation uses that helper, so both must load successfully.
+// Without explicit coverage, future changes to the helper's
+// resolution rules could quietly drift the loader's acceptance set
+// away from the runtime's evaluation set.
+func TestEngineer_LoadConfig_MergeStrategyPR_NoApproverOptOut_RequireReviewFalse(t *testing.T) {
+	tmpDir := t.TempDir()
+	config := map[string]interface{}{
+		"type":    "rig",
+		"version": 1,
+		"name":    "test-rig",
+		"merge_queue": map[string]interface{}{
+			"merge_strategy": "pr",
+			"pr_approver":    "",
+			"require_review": false,
+			"pr_reviewer":    "augmentcode",
+		},
+	}
+	data := mustMarshalIndent(t, config)
+	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
+	e := NewEngineer(r)
+	if err := e.LoadConfig(); err != nil {
+		t.Fatalf("expected deprecated require_review=false opt-out to load, got %v", err)
+	}
+	if e.config.PRApprover != "" {
+		t.Errorf("PRApprover = %q, want empty (opt-out)", e.config.PRApprover)
+	}
+	if e.config.RequireReview == nil || *e.config.RequireReview {
+		t.Errorf("RequireReview = %v, want explicit false", e.config.RequireReview)
+	}
+	if got := e.config.GetPRRequiredApprovals(); got != 0 {
+		t.Errorf("GetPRRequiredApprovals() = %d, want 0 (helper must resolve require_review=false to 0)", got)
+	}
+}
+
+// TestEngineer_LoadConfig_MergeStrategyPR_EmptyApproverWithoutOptOut
+// asserts the negative cases: empty PRApprover is NOT acceptable
+// unless pr_required_approvals=0 is also explicit. The opt-out must
+// be deliberate; an unset count gate (which defaults to 1) or an
+// explicit positive count gate both still require an approver.
+func TestEngineer_LoadConfig_MergeStrategyPR_EmptyApproverWithoutOptOut(t *testing.T) {
+	cases := []struct {
+		name string
+		mq   map[string]interface{}
+	}{
+		{
+			name: "unset pr_required_approvals (defaults to 1)",
+			mq: map[string]interface{}{
+				"merge_strategy": "pr",
+				"pr_approver":    "",
+			},
+		},
+		{
+			name: "explicit positive pr_required_approvals",
+			mq: map[string]interface{}{
+				"merge_strategy":        "pr",
+				"pr_approver":           "",
+				"pr_required_approvals": 1,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			config := map[string]interface{}{
+				"type":        "rig",
+				"version":     1,
+				"name":        "test-rig",
+				"merge_queue": tc.mq,
+			}
+			data := mustMarshalIndent(t, config)
+			if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
+				t.Fatal(err)
+			}
+			r := &rig.Rig{Name: "test-rig", Path: tmpDir}
+			e := NewEngineer(r)
+			err := e.LoadConfig()
+			if err == nil {
+				t.Fatal("expected validation error for empty pr_approver without explicit pr_required_approvals=0, got nil")
+			}
+			if !strings.Contains(err.Error(), "pr_approver is required") {
+				t.Errorf("error should mention pr_approver requirement, got %v", err)
+			}
+		})
+	}
+}
+
 // TestEngineer_LoadConfig_ReadsSettingsPath is the G23 regression test:
 // merge_queue lives at <rig>/settings/config.json, NOT <rig>/config.json.
 // Before the G23 fix, Engineer.LoadConfig read the rig-root config.json

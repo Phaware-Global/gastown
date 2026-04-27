@@ -34,15 +34,20 @@ func (e *NeedsApprovalError) Error() string { return e.Detail }
 //	b) If cfg.GetPRRequiredApprovals() > 0, the count of distinct
 //	   approving reviewers must meet the threshold.
 //
-// Under MergeStrategy="pr", config validation in Engineer.LoadConfig
-// requires a non-empty PRApprover, so the "both gates absent → return
-// nil" branch below is not reachable on a production pr-mode rig. It
-// is kept as a defense-in-depth no-op for call sites that reach
-// VerifyPRApproval with a non-pr or test-constructed config (e.g., the
-// CLI subcommand under an mr-mode rig that opted in to approval
-// via PRRequiredApprovals only, or unit tests that build
-// MergeQueueConfig directly bypassing LoadConfig). Returning nil in
-// those cases is correct: there is no gate to enforce.
+// Under MergeStrategy="pr", config validation accepts an empty
+// PRApprover ONLY when the resolved count gate is zero — i.e.,
+// GetPRRequiredApprovals() returns 0. The two shapes that resolve to
+// zero are an explicit `pr_required_approvals: 0` and the deprecated
+// `require_review: false`; either, paired with empty PRApprover,
+// opts out of every per-user approval gate ("no per-user approval,
+// gate on review-loop + threads alone"). In that combination the
+// "both gates absent → return nil" branch below IS reachable on a
+// production pr-mode rig, and is the load-bearing semantic that lets
+// the refinery merge based on review-loop completion alone. The same
+// branch also covers non-pr-mode and test-constructed configs that
+// reach VerifyPRApproval without configuring approval
+// (defense-in-depth no-op). Returning nil in either case is correct:
+// there is no per-user gate to enforce.
 //
 // Context plumbing: VerifyPRApproval performs network I/O via the
 // PRProvider methods but does not accept a context.Context yet —

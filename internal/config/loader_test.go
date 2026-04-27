@@ -389,6 +389,76 @@ func TestRigSettingsValidation(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		// pr_approver opt-out cases — empty pr_approver is accepted only
+		// when the count gate resolves to zero, via either explicit
+		// pr_required_approvals=0 or the deprecated require_review=false.
+		// Any other shape (unset count gate, positive count gate) still
+		// rejects to preserve the legacy approval-required default for
+		// existing deployments.
+		{
+			name: "pr-mode opt-out: empty pr_approver with explicit pr_required_approvals=0",
+			settings: &RigSettings{
+				Type:    "rig-settings",
+				Version: 1,
+				MergeQueue: &MergeQueueConfig{
+					MergeStrategy:       MergeStrategyPR,
+					PRApprover:          "",
+					PRRequiredApprovals: intPtr(0),
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "pr-mode opt-out: empty pr_approver with deprecated require_review=false",
+			settings: &RigSettings{
+				Type:    "rig-settings",
+				Version: 1,
+				MergeQueue: &MergeQueueConfig{
+					MergeStrategy: MergeStrategyPR,
+					PRApprover:    "",
+					RequireReview: boolPtr(false),
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "pr-mode reject: empty pr_approver with unset count gate (defaults to 1)",
+			settings: &RigSettings{
+				Type:    "rig-settings",
+				Version: 1,
+				MergeQueue: &MergeQueueConfig{
+					MergeStrategy: MergeStrategyPR,
+					PRApprover:    "",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "pr-mode reject: empty pr_approver with positive pr_required_approvals",
+			settings: &RigSettings{
+				Type:    "rig-settings",
+				Version: 1,
+				MergeQueue: &MergeQueueConfig{
+					MergeStrategy:       MergeStrategyPR,
+					PRApprover:          "",
+					PRRequiredApprovals: intPtr(1),
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "pr-mode accept: non-empty pr_approver with explicit pr_required_approvals=0 (existing behavior)",
+			settings: &RigSettings{
+				Type:    "rig-settings",
+				Version: 1,
+				MergeQueue: &MergeQueueConfig{
+					MergeStrategy:       MergeStrategyPR,
+					PRApprover:          "gatekeeper",
+					PRRequiredApprovals: intPtr(0),
+				},
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {

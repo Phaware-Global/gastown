@@ -188,8 +188,12 @@ type MergeQueueConfig struct {
 	//   - RequireReview=false → count gate disabled; only PRApprover's gate applies
 	//   - Both this and PRRequiredApprovals unset → count gate defaults to 1
 	//
-	// Note: `pr_required_approvals: 0` disables only the count gate. The
-	// PRApprover gate is independent and always active.
+	// Note: `pr_required_approvals: 0` disables the count gate AND, when
+	// paired with an empty PRApprover, opts out of every per-user
+	// approval gate (review-loop and unresolved-threads gates remain
+	// active). With a non-empty PRApprover, `pr_required_approvals: 0`
+	// disables only the count gate and the named approver's APPROVED
+	// review is still required.
 	//
 	// Deprecated: kept for backward compatibility. Use PRRequiredApprovals.
 	RequireReview *bool `json:"require_review,omitempty"`
@@ -199,14 +203,25 @@ type MergeQueueConfig struct {
 	PRReviewer string `json:"pr_reviewer,omitempty"`
 
 	// PRApprover is the GitHub user whose approving review gates the merge.
-	// Required when MergeStrategy="pr". Only meaningful when MergeStrategy="pr".
+	// Required when MergeStrategy="pr" UNLESS the resolved count gate is
+	// zero — i.e., GetPRRequiredApprovals() returns 0. The two shapes
+	// that resolve to zero are an explicit `pr_required_approvals: 0`
+	// and the deprecated `require_review: false`; either, paired with
+	// empty PRApprover, opts out of every per-user approval gate. The
+	// refinery then merges based on the review-loop and
+	// unresolved-threads gates alone. Empty PRApprover with a non-zero
+	// resolved count gate is rejected at config-load. Only meaningful
+	// when MergeStrategy="pr".
 	PRApprover string `json:"pr_approver,omitempty"`
 
 	// PRRequiredApprovals is the count gate: minimum distinct APPROVED
 	// reviewers required in addition to PRApprover. Nil defaults to 1 when
-	// MergeStrategy="pr". Explicit zero disables only the count gate — the
-	// PRApprover's approval is still required. *int lets us distinguish
-	// zero from unset.
+	// MergeStrategy="pr". Explicit zero disables the count gate AND, when
+	// paired with empty PRApprover, opts out of every per-user approval
+	// gate (review-loop and unresolved-threads gates remain active).
+	// With a non-empty PRApprover, explicit zero disables only the count
+	// gate and the named approver's APPROVED review is still required.
+	// *int lets us distinguish zero from unset.
 	PRRequiredApprovals *int `json:"pr_required_approvals,omitempty"`
 
 	// PRReviewLoopMax caps review-fix polecat dispatches per PR. Defaults to 3.
@@ -678,12 +693,23 @@ func (e *Engineer) LoadConfig() error {
 				"Bitbucket PR provider is stubbed. Use vcs_provider=%q or merge_strategy=%q.",
 				"pr", "bitbucket", "github", "direct")
 		}
-		if e.config.PRApprover == "" {
-			return fmt.Errorf("pr_approver is required when merge_strategy=%q", "pr")
-		}
 		if e.config.PRRequiredApprovals != nil && *e.config.PRRequiredApprovals < 0 {
 			return fmt.Errorf("pr_required_approvals must be non-negative, got %d",
 				*e.config.PRRequiredApprovals)
+		}
+		// pr_approver may be empty ONLY when the count gate resolves to
+		// zero — opt-out path for rigs that gate on review-loop
+		// completion + threads-resolved alone. Uses the same
+		// GetPRRequiredApprovals helper as the runtime so validation
+		// accepts both `pr_required_approvals: 0` and the deprecated
+		// `require_review: false` form (both resolve to 0), keeping
+		// validation aligned with the runtime gate. See loader.go for
+		// the canonical rule; this duplicate enforces it on the
+		// engineer's per-rig config load path.
+		if e.config.PRApprover == "" && e.config.GetPRRequiredApprovals() != 0 {
+			return fmt.Errorf("pr_approver is required when merge_strategy=%q "+
+				"(set pr_required_approvals=0 explicitly to opt out of all approval gates)",
+				"pr")
 		}
 		if e.config.PRReviewLoopMax < 0 {
 			return fmt.Errorf("pr_review_loop_max must be non-negative, got %d",

@@ -1294,9 +1294,13 @@ type MergeQueueConfig struct {
 	//   - RequireReview=false → count gate disabled; only PRApprover's gate applies
 	//   - RequireReview=nil (unset), PRRequiredApprovals also unset → default 1
 	//
-	// Note: `pr_required_approvals: 0` disables only the count gate. The
-	// PRApprover gate is independent and always active under
-	// merge_strategy="pr" because PRApprover is required by config validation.
+	// Note: `pr_required_approvals: 0` disables the count gate AND, when
+	// paired with an empty PRApprover, opts out of every per-user
+	// approval gate — leaving only the review-loop and unresolved-threads
+	// gates active. Setting `pr_required_approvals: 0` while leaving
+	// PRApprover non-empty disables only the count gate (the named
+	// approver's APPROVED review is still required). See PRApprover for
+	// the full opt-out rule.
 	//
 	// Deprecated: use PRRequiredApprovals (>0 is equivalent to RequireReview=true).
 	// Kept for one release for backward compatibility.
@@ -1315,18 +1319,26 @@ type MergeQueueConfig struct {
 	PRReviewer string `json:"pr_reviewer,omitempty"`
 
 	// PRApprover is the GitHub user whose approving review gates the merge.
-	// Required when merge_strategy="pr"; the refinery will refuse to start
-	// with this unset so misconfiguration fails loudly rather than at merge
-	// time. Only meaningful when merge_strategy="pr".
+	// Required when merge_strategy="pr" UNLESS the resolved count gate is
+	// zero — i.e., GetPRRequiredApprovals() returns 0. The two shapes that
+	// resolve to zero are an explicit `pr_required_approvals: 0` and the
+	// deprecated `require_review: false`; either, paired with empty
+	// PRApprover, opts out of every per-user approval gate. The refinery
+	// then merges based on the review-loop and unresolved-threads gates
+	// alone. Empty PRApprover with a non-zero resolved count gate is
+	// rejected at config-load: the opt-out must be deliberate, not
+	// accidental. Only meaningful when merge_strategy="pr".
 	PRApprover string `json:"pr_approver,omitempty"`
 
 	// PRRequiredApprovals is the count gate: the minimum distinct APPROVED
 	// reviewers required before the refinery will merge, in addition to the
 	// PRApprover gate. Nil defaults to 1 when merge_strategy="pr". Explicit
-	// zero disables ONLY the count gate — the PRApprover's approving review
-	// is still required because it's a separate gate (and PRApprover is
-	// required by config validation when merge_strategy="pr"). Use *int so
-	// zero is distinguishable from unset. Only meaningful when
+	// zero disables the count gate; when paired with an empty PRApprover
+	// it ALSO opts out of the per-user approval gate, leaving only the
+	// review-loop and unresolved-threads gates active. With a non-empty
+	// PRApprover, `pr_required_approvals: 0` disables only the count gate
+	// and the named approver's APPROVED review is still required. Use *int
+	// so zero is distinguishable from unset. Only meaningful when
 	// merge_strategy="pr".
 	PRRequiredApprovals *int `json:"pr_required_approvals,omitempty"`
 
@@ -1494,11 +1506,13 @@ func (c *MergeQueueConfig) IsRequireReviewEnabled() bool {
 //  2. Deprecated RequireReview (if non-nil) — true → 1, false → 0
 //  3. DefaultPRRequiredApprovals (1)
 //
-// Note: a return value of 0 disables only this count gate. The PRApprover
-// gate is a separate, independent gate and is always active under
-// merge_strategy="pr" (config validation requires pr_approver). The *int
-// type on PRRequiredApprovals lets callers explicitly disable the count
-// gate without colliding with Go's zero-value semantics.
+// Note: a return value of 0 disables this count gate AND, when paired with
+// an empty PRApprover, opts out of every per-user approval gate (leaving
+// only the review-loop and unresolved-threads gates active). With a
+// non-empty PRApprover, a return of 0 disables only the count gate and the
+// named approver's APPROVED review is still required. The *int type on
+// PRRequiredApprovals lets callers explicitly disable the count gate
+// without colliding with Go's zero-value semantics.
 func (c *MergeQueueConfig) GetPRRequiredApprovals() int {
 	if c.MergeStrategy != MergeStrategyPR {
 		return 0

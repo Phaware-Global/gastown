@@ -58,14 +58,15 @@ func (f *fakePRProvider) CurrentHeadSHA(int) (string, error) { panic("unused") }
 func intPtr(i int) *int { return &i }
 
 func TestVerifyPRApproval_NoGatesConfigured_ReturnsNil(t *testing.T) {
-	// A config with no approval gates — neither PRApprover set nor a
-	// positive PRRequiredApprovals — is a no-op. Engineer.LoadConfig
-	// rejects this combination when MergeStrategy="pr", but callers
-	// can still reach VerifyPRApproval with it (non-pr strategy that
-	// opted in elsewhere, or test-constructed configs that bypass
-	// LoadConfig). The helper must be safe for both.
+	// A config with no approval gates — empty PRApprover AND
+	// PRRequiredApprovals=0 — is the supported "review-loop only"
+	// opt-out under MergeStrategy="pr". Engineer.LoadConfig now
+	// accepts this combination explicitly, and VerifyPRApproval
+	// must return nil (no per-user gate to enforce — the merge
+	// decision falls to the review-loop and unresolved-threads
+	// gates that live elsewhere in the patrol formula).
 	cfg := &MergeQueueConfig{
-		MergeStrategy:       "direct",
+		MergeStrategy:       "pr",
 		PRApprover:          "",
 		PRRequiredApprovals: intPtr(0),
 	}
