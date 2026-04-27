@@ -149,28 +149,40 @@ Example hook configuration:
 
 var tapGuardPRWorkflowCmd = &cobra.Command{
 	Use:   "pr-workflow",
-	Short: "Block PR creation and feature branches",
-	Long: `Block PR workflow operations in Gas Town.
+	Short: "Block PR creation, feature branches, and direct merges",
+	Long: `Block PR-workflow operations in Gas Town.
 
-Gas Town workers push directly to main. PRs add friction that breaks
-the autonomous execution model (GUPP principle).
+Invoked as a Claude Code PreToolUse hook on every Bash tool call. The
+hook is only installed in Gas Town agent session settings files
+(~/gt/<rig>/<role>/.claude/settings.json), so the guard's invocation
+itself is the agent-context signal — it does NOT depend on env-var
+detection (PR #58 dogfood incident showed env-var detection is
+fragile and drifts out of sync with the launch path).
 
 This guard blocks:
-  - gh pr create (allowed for refinery on pr-mode rigs only)
-  - gh pr merge (blocked for ALL agents — refinery must use
-    'gt refinery pr merge' which enforces PR.6 wait-approval, G21 fix)
-  - git checkout -b (feature branches)
-  - git switch -c (feature branches)
+  - gh pr merge / gh api .../merge — UNCONDITIONAL block. Refineries
+    must route merges through 'gt refinery pr merge' which enforces
+    the PR.4 await-review, PR.6 unresolved-threads, and PR.6
+    wait-approval gates (G21 / G40 fixes).
+  - gh pr create — blocked unless the caller is a refinery on a rig
+    configured with merge_strategy=pr (refineryAllowedForPR check).
+    Polecats, witnesses, crew, deacons, mayors are always blocked
+    from creating PRs directly.
+  - git checkout -b / git switch -c — feature branches are not the
+    Gas Town flow; agents push to the rig's base branch.
+
+Maintainer-origin specialization: when origin is steveyegge/gastown,
+gh pr create gets a maintainer-specific banner ("push to main, don't
+PR against your own repo") instead of the generic agent banner.
 
 Exit codes:
-  0 - Operation allowed (not in Gas Town agent context, not maintainer origin)
-  2 - Operation BLOCKED (in agent context OR maintainer origin)
+  0 - Allowed (command isn't guarded, or refinery-on-PR-mode-rig
+      exception applies)
+  2 - BLOCKED (forbidden command, OR uninterpretable stdin payload
+      while hook is firing — fail-closed against malformed payloads)
 
-The guard blocks in two scenarios:
-  1. Running as a Gas Town agent (crew, polecat, witness, etc.)
-  2. Origin remote is steveyegge/gastown (maintainer should push directly)
-
-Humans running outside Gas Town with a fork origin can still use PRs.`,
+Human operators are not affected: they don't have this hook installed
+in their personal shells, so the guard never fires for them.`,
 	RunE: runTapGuardPRWorkflow,
 }
 
@@ -194,23 +206,39 @@ func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 	// directly from a shell (the G19b iter-1 review flagged this as
 	// a hang risk). Under Claude Code hooks, stdin is always a pipe
 	// carrying the hook JSON, never a terminal.
+	// Pipe stdin (the production hook path) MUST yield a parseable
+	// command. Three states are distinguished:
+	//
+	//   1. Stdin is a TTY → manual invocation from a shell, no
+	//      command to evaluate, allow.
+	//   2. Stdin is a pipe AND read fails → infrastructure glitch,
+	//      fail closed (we can't see what was attempted).
+	//   3. Stdin is a pipe AND extractCommand returns "" → payload
+	//      was unparseable JSON or missing tool_input.command, fail
+	//      closed (a malformed hook payload should not silently
+	//      become a bypass — same threat model as a read failure).
+	//
+	// Only state 1 reaches the "manual invocation" allow path. State
+	// 2 + 3 collapse to fail-closed.
 	var (
 		command           string
-		stdinReadFailed   bool
+		stdinUninterpretable bool
 	)
 	if !isStdinTerminal() {
 		input, err := io.ReadAll(os.Stdin)
 		if err != nil {
-			// Read failure is unusual (Claude Code always provides a
-			// pipe). Track it so we can fail-closed below: an empty
-			// command from a stdin failure is NOT the same as an empty
-			// command from a manual-terminal invocation. The former is
-			// "we can't tell what was attempted, so don't allow guarded
-			// patterns"; the latter is "no command to evaluate, allow".
 			style.PrintWarning("tap guard pr-workflow: stdin read failed (%v) — failing closed", err)
-			stdinReadFailed = true
+			stdinUninterpretable = true
 		} else {
 			command = extractCommand(input)
+			if command == "" {
+				// Pipe stdin succeeded but the payload didn't yield a
+				// command field — same fail-closed treatment as a read
+				// error. A hook firing with an unparseable payload is
+				// not a license to allow the underlying tool call.
+				style.PrintWarning("tap guard pr-workflow: stdin payload yielded empty command (unparseable JSON or missing tool_input.command) — failing closed")
+				stdinUninterpretable = true
+			}
 		}
 	}
 	// Fast path: if we successfully extracted a Bash command AND that
@@ -221,13 +249,13 @@ func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 	if command != "" && !isCreateOrBranch && !isMerge {
 		return nil
 	}
-	// Fail-closed on stdin read failure: emit the merge banner (the
-	// most pessimistic guarded pattern) and block. The hook firing
-	// already established we're in an agent context; with no command
-	// payload to inspect, the safest behavior is to refuse the tool
-	// call entirely. The agent will see the banner and either retry
-	// (transient stdin glitch — rare) or escalate.
-	if stdinReadFailed {
+	// Fail-closed on uninterpretable stdin (read error OR unparseable
+	// payload). The hook firing already established we're in an agent
+	// context; with no command payload to inspect, the safest
+	// behavior is to refuse the tool call entirely. The agent sees
+	// the banner and either retries (transient glitch — rare) or
+	// escalates.
+	if stdinUninterpretable {
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "╔════════════════════════════════════════════════════════════════════════╗")
 		fmt.Fprintln(os.Stderr, "║  ❌ TAP GUARD FAILED CLOSED                                             ║")
@@ -427,8 +455,19 @@ func isGasTownAgentContext() bool {
 	}
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil || townRoot == "" {
-		// No town root resolvable from cwd — neither env vars nor a
-		// scoped path check confirm agent context. Fail closed.
+		// No town root resolvable from cwd — the path-based fallback
+		// can't run safely (we can't tell whether cwd is "under a
+		// town root" without knowing where one is). Returning false
+		// here means "I can't confirm agent context from the path";
+		// the env-var checks above were the primary signal and have
+		// already returned true if an agent indicator was present.
+		// Callers that interpret a false return as "allow" (e.g., the
+		// bd-init / mol-patrol / memory-write guards) are doing so
+		// because those guards have other layers (tool matchers,
+		// argument parsing) that catch the dangerous shapes. The
+		// pr-workflow guard does NOT use this function on its block
+		// path — see runTapGuardPRWorkflow header comment for why
+		// "the hook firing IS the context".
 		return false
 	}
 	rel, err := filepath.Rel(townRoot, cwd)
