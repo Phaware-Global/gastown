@@ -216,7 +216,7 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 				continue
 			}
 			if err := transformer.Transform(norm); err != nil {
-				logger.Drop(evt.Provider, norm.EventType, norm.EventID, "", "transform_error")
+				logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, "transform_error")
 			}
 		}
 	}()
@@ -264,22 +264,17 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 // on key collision with inline config.
 func buildPromptsResolver(cfg *telegraph.Config, townRoot string) (*prompts.Resolver, error) {
 	inline := cfg.Telegraph.Prompts
+	overrides, err := loadPromptsFile(townRoot)
+	if err != nil {
+		return nil, err
+	}
 	if len(inline) == 0 {
-		// Try separate file even if inline is empty.
-		overrides, err := loadPromptsFile(townRoot)
-		if err != nil {
-			return nil, err
-		}
 		if len(overrides) == 0 {
 			return nil, nil
 		}
 		inline = overrides
 	} else {
 		// Merge: start with inline, overlay with separate-file overrides.
-		overrides, err := loadPromptsFile(townRoot)
-		if err != nil {
-			return nil, err
-		}
 		merged := make(map[string]string, len(inline)+len(overrides))
 		for k, v := range inline {
 			merged[k] = v

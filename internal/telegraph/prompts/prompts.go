@@ -136,11 +136,7 @@ func substitute(tmpl string, event *telegraph.NormalizedEvent) string {
 		ts = event.Timestamp.UTC().Format(time.RFC3339)
 	}
 
-	labelParts := make([]string, len(event.Labels))
-	for i, l := range event.Labels {
-		labelParts[i] = stripCRLF(l)
-	}
-	labelsVal := sanitizeSubstituted(strings.Join(labelParts, ", "))
+	labelsVal := sanitizeSubstituted(strings.Join(event.Labels, ", "))
 
 	r := strings.NewReplacer(
 		"{provider}", sanitizeSubstituted(event.Provider),
@@ -165,13 +161,12 @@ func stripCRLF(s string) string {
 	}, s)
 }
 
-// sanitizeSubstituted strips CR/LF then checks for exact delimiter match.
-// If the stripped value (trimmed) equals a delimiter literal, it is replaced
-// with the redaction marker and a warning is emitted via the structured log.
+// sanitizeSubstituted strips CR/LF then checks whether the stripped value
+// contains either OPERATOR PROMPT delimiter as a substring. If so, it is
+// replaced with the redaction marker to prevent delimiter-spoof injection.
 func sanitizeSubstituted(s string) string {
 	stripped := stripCRLF(s)
-	trimmed := strings.TrimSpace(stripped)
-	if trimmed == delimStart || trimmed == delimEnd {
+	if strings.Contains(stripped, delimStart) || strings.Contains(stripped, delimEnd) {
 		return "[redacted: delimiter spoof]"
 	}
 	return stripped
