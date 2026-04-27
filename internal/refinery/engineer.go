@@ -203,14 +203,25 @@ type MergeQueueConfig struct {
 	PRReviewer string `json:"pr_reviewer,omitempty"`
 
 	// PRApprover is the GitHub user whose approving review gates the merge.
-	// Required when MergeStrategy="pr". Only meaningful when MergeStrategy="pr".
+	// Required when MergeStrategy="pr" UNLESS the resolved count gate is
+	// zero — i.e., GetPRRequiredApprovals() returns 0. The two shapes
+	// that resolve to zero are an explicit `pr_required_approvals: 0`
+	// and the deprecated `require_review: false`; either, paired with
+	// empty PRApprover, opts out of every per-user approval gate. The
+	// refinery then merges based on the review-loop and
+	// unresolved-threads gates alone. Empty PRApprover with a non-zero
+	// resolved count gate is rejected at config-load. Only meaningful
+	// when MergeStrategy="pr".
 	PRApprover string `json:"pr_approver,omitempty"`
 
 	// PRRequiredApprovals is the count gate: minimum distinct APPROVED
 	// reviewers required in addition to PRApprover. Nil defaults to 1 when
-	// MergeStrategy="pr". Explicit zero disables only the count gate — the
-	// PRApprover's approval is still required. *int lets us distinguish
-	// zero from unset.
+	// MergeStrategy="pr". Explicit zero disables the count gate AND, when
+	// paired with empty PRApprover, opts out of every per-user approval
+	// gate (review-loop and unresolved-threads gates remain active).
+	// With a non-empty PRApprover, explicit zero disables only the count
+	// gate and the named approver's APPROVED review is still required.
+	// *int lets us distinguish zero from unset.
 	PRRequiredApprovals *int `json:"pr_required_approvals,omitempty"`
 
 	// PRReviewLoopMax caps review-fix polecat dispatches per PR. Defaults to 3.
