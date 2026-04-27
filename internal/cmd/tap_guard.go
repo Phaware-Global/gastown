@@ -194,15 +194,21 @@ func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 	// directly from a shell (the G19b iter-1 review flagged this as
 	// a hang risk). Under Claude Code hooks, stdin is always a pipe
 	// carrying the hook JSON, never a terminal.
-	var command string
+	var (
+		command           string
+		stdinReadFailed   bool
+	)
 	if !isStdinTerminal() {
 		input, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			// Read failure is unusual (Claude Code always provides a
-			// pipe). Fail-closed into the block-or-allow logic below;
-			// letting a real pr-workflow command slip past is worse
-			// than over-blocking a manual-invocation edge case.
-			style.PrintWarning("tap guard pr-workflow: stdin read failed (%v) — falling back to agent-context block", err)
+			// pipe). Track it so we can fail-closed below: an empty
+			// command from a stdin failure is NOT the same as an empty
+			// command from a manual-terminal invocation. The former is
+			// "we can't tell what was attempted, so don't allow guarded
+			// patterns"; the latter is "no command to evaluate, allow".
+			style.PrintWarning("tap guard pr-workflow: stdin read failed (%v) — failing closed", err)
+			stdinReadFailed = true
 		} else {
 			command = extractCommand(input)
 		}
@@ -214,6 +220,25 @@ func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 	isCreateOrBranch := isPRWorkflowCommand(command)
 	if command != "" && !isCreateOrBranch && !isMerge {
 		return nil
+	}
+	// Fail-closed on stdin read failure: emit the merge banner (the
+	// most pessimistic guarded pattern) and block. The hook firing
+	// already established we're in an agent context; with no command
+	// payload to inspect, the safest behavior is to refuse the tool
+	// call entirely. The agent will see the banner and either retry
+	// (transient stdin glitch — rare) or escalate.
+	if stdinReadFailed {
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "╔════════════════════════════════════════════════════════════════════════╗")
+		fmt.Fprintln(os.Stderr, "║  ❌ TAP GUARD FAILED CLOSED                                             ║")
+		fmt.Fprintln(os.Stderr, "╠════════════════════════════════════════════════════════════════════════╣")
+		fmt.Fprintln(os.Stderr, "║  The tap-guard could not read the tool-call payload from stdin and    ║")
+		fmt.Fprintln(os.Stderr, "║  refuses to allow guarded patterns through without inspection.        ║")
+		fmt.Fprintln(os.Stderr, "║  This is rare — Claude Code always provides a pipe. If it persists,   ║")
+		fmt.Fprintln(os.Stderr, "║  escalate to the mayor via `gt mail send mayor/`.                     ║")
+		fmt.Fprintln(os.Stderr, "╚════════════════════════════════════════════════════════════════════════╝")
+		fmt.Fprintln(os.Stderr, "")
+		return NewSilentExit(2)
 	}
 	// If stdin was empty/terminal (e.g. guard invoked manually for
 	// testing) or the command IS a guarded command, fall through
@@ -364,8 +389,13 @@ func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 // session and the pr-workflow guard let `gh pr merge` through.
 //
 // CWD-based fallback: even with no env vars, a cwd under a /crew/
-// or /polecats/ subtree of the town root is sufficient evidence of
-// agent context.
+// or /polecats/ subtree OF THE TOWN ROOT is sufficient evidence of
+// agent context. The town-root scoping is load-bearing — a bare
+// `strings.Contains(cwd, "/crew/")` would false-positive on any
+// operator path that happens to include those segments (e.g.,
+// /Users/anyone/crew/foo). Resolves the town root via
+// workspace.FindFromCwd; if that fails, the path-based check is
+// skipped (the env-var check above is the primary signal anyway).
 func isGasTownAgentContext() bool {
 	envVars := []string{
 		// Legacy role-specific (kept for backwards compat / tests).
@@ -386,19 +416,41 @@ func isGasTownAgentContext() bool {
 		}
 	}
 
-	// Also check if we're in a crew or polecat worktree by path.
+	// Path-based fallback, scoped to the town root. We only accept
+	// a CWD as agent-context if it lives under <town-root>/<rig>/
+	// (crew|polecats)/. Without the town-root scoping the check
+	// would false-positive on any operator path containing /crew/
+	// or /polecats/ as a substring.
 	cwd, err := os.Getwd()
 	if err != nil {
 		return false
 	}
-
-	agentPaths := []string{"/crew/", "/polecats/"}
-	for _, path := range agentPaths {
-		if strings.Contains(cwd, path) {
+	townRoot, err := workspace.FindFromCwd()
+	if err != nil || townRoot == "" {
+		// No town root resolvable from cwd — neither env vars nor a
+		// scoped path check confirm agent context. Fail closed.
+		return false
+	}
+	rel, err := filepath.Rel(townRoot, cwd)
+	if err != nil {
+		return false
+	}
+	rel = filepath.ToSlash(rel)
+	// rel starting with ".." means cwd is outside townRoot (symlink
+	// edge cases) — definitively not a managed agent.
+	if strings.HasPrefix(rel, "..") {
+		return false
+	}
+	// Match <rig>/crew/... or <rig>/polecats/... structure. Accept
+	// the segment anywhere from path[1:] onwards to allow nested
+	// agent worktrees (e.g., <rig>/polecats/<polecat>/<rig> for
+	// polecat clones).
+	parts := strings.Split(rel, "/")
+	for i := 1; i < len(parts); i++ {
+		if parts[i] == "crew" || parts[i] == "polecats" {
 			return true
 		}
 	}
-
 	return false
 }
 
@@ -490,10 +542,29 @@ func isRefineryRole() bool {
 	if role == "" {
 		return false
 	}
-	// Accept "refinery" (ungrouped) or "<rig>/refinery" (the current
-	// gt-up shape). Use a slash boundary so a hypothetical role like
-	// "ex-refinery" doesn't match.
-	return role == "refinery" || strings.HasSuffix(role, "/refinery")
+	// Accept ONLY two exact shapes:
+	//   - "refinery" (ungrouped, single segment)
+	//   - "<rig>/refinery" (current gt-up shape, exactly two segments)
+	//
+	// A naive HasSuffix check would also match deeper paths like
+	// "gastown/polecats/refinery" — i.e., a polecat that happened to
+	// be named "refinery" would falsely gain refinery-only allowances.
+	// Use strings.Cut to require exactly one slash in the role, and
+	// verify the segment before the slash is non-empty (rejects "/refinery").
+	if role == "refinery" {
+		return true
+	}
+	rig, suffix, hasSlash := strings.Cut(role, "/")
+	if !hasSlash {
+		// No slash and not "refinery" — not a refinery role.
+		return false
+	}
+	// strings.Cut returns the part AFTER the first slash in `suffix`.
+	// For "<rig>/refinery", suffix == "refinery"; for the polecat
+	// shape "gastown/polecats/refinery", suffix == "polecats/refinery".
+	// Requiring suffix to equal exactly "refinery" rejects deeper
+	// paths.
+	return rig != "" && suffix == "refinery"
 }
 
 // isMaintainerOrigin returns true if the origin remote points to the maintainer's repo.

@@ -30,6 +30,12 @@ func TestIsRefineryRole_AcceptsBothEnvShapes(t *testing.T) {
 		// Sanity: a hypothetical "ex-refinery" role must NOT match the
 		// HasSuffix check via the slash boundary.
 		{"GT_ROLE with refinery as substring (no slash)", map[string]string{"GT_ROLE": "ex-refinery"}, false},
+		// Nested paths must NOT match — a polecat that happens to be
+		// named "refinery" should not get refinery-only allowances.
+		{"GT_ROLE polecat path ending in refinery", map[string]string{"GT_ROLE": "gastown/polecats/refinery"}, false},
+		{"GT_ROLE deeper nesting", map[string]string{"GT_ROLE": "town/rig/role/refinery"}, false},
+		// Edge: leading-slash forms must not match.
+		{"GT_ROLE with leading slash", map[string]string{"GT_ROLE": "/refinery"}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -88,6 +94,49 @@ func TestIsGasTownAgentContext_LegacyEnvVars(t *testing.T) {
 				t.Errorf("isGasTownAgentContext() with %s set = false, want true", v)
 			}
 		})
+	}
+}
+
+// TestIsGasTownAgentContext_PathFallback_RequiresTownRoot covers the
+// scoped CWD-fallback path. Pre-fix the check used a bare
+// strings.Contains(cwd, "/crew/"), which would false-positive on any
+// operator path like /Users/anyone/crew/foo. Post-fix the path-based
+// check requires the cwd to be under a resolvable town root, so an
+// arbitrary operator path with `/crew/` as a substring no longer
+// matches. We can't synthesize a town root from a unit test (it
+// requires gastown's workspace layout to exist), so this test
+// focuses on the negative case: a path that contains the magic
+// segment but is NOT under a town root must NOT be flagged.
+func TestIsGasTownAgentContext_PathFallback_RequiresTownRoot(t *testing.T) {
+	for _, key := range []string{"GT_POLECAT", "GT_CREW", "GT_WITNESS",
+		"GT_REFINERY", "GT_MAYOR", "GT_DEACON", "GT_ROLE", "GT_RIG", "GT_TOWN_ROOT"} {
+		t.Setenv(key, "")
+	}
+	// Save and restore cwd so this test doesn't leak (same pattern
+	// as TestIsGasTownAgentContext_NoEnv).
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(origCwd); err != nil {
+			t.Errorf("restore cwd to %s: %v", origCwd, err)
+		}
+	})
+	// Build a path that contains "/crew/" as a substring but is NOT
+	// under a town root (the temp dir hierarchy has no rigs.json or
+	// settings/config.json). The pre-fix code would have flagged this
+	// as agent context; the post-fix code must not.
+	tmp := t.TempDir()
+	fakeAgentLikePath := tmp + "/some/crew/path"
+	if err := os.MkdirAll(fakeAgentLikePath, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", fakeAgentLikePath, err)
+	}
+	if err := os.Chdir(fakeAgentLikePath); err != nil {
+		t.Fatalf("chdir to %s: %v", fakeAgentLikePath, err)
+	}
+	if isGasTownAgentContext() {
+		t.Errorf("isGasTownAgentContext() returned true for an operator path that contains /crew/ as a substring but is not under a town root — pre-fix false-positive regressed")
 	}
 }
 
