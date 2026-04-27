@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -13,8 +14,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/telegraph"
+	"github.com/steveyegge/gastown/internal/telegraph/prompts"
 	jiratr "github.com/steveyegge/gastown/internal/telegraph/providers/jira"
 	"github.com/steveyegge/gastown/internal/telegraph/tlog"
 	"github.com/steveyegge/gastown/internal/telegraph/transform"
@@ -125,6 +128,12 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 		return fmt.Errorf("telegraph: nudge_window: %w", err)
 	}
 
+	// Build prompts resolver from inline config (separate-file overrides applied at load time).
+	resolver, err := buildPromptsResolver(cfg, townRoot)
+	if err != nil {
+		return fmt.Errorf("telegraph: prompts: %w", err)
+	}
+
 	// Build L3 transformer.
 	var transformer *transform.Transformer
 	if deps.sender != nil {
@@ -132,9 +141,9 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 		if nudger == nil {
 			nudger = &transform.ExecNudger{}
 		}
-		transformer = transform.New(deps.sender, nudger, cfg.Telegraph.BodyCap, nudgeWindow, logger)
+		transformer = transform.New(deps.sender, nudger, cfg.Telegraph.BodyCap, nudgeWindow, resolver, logger)
 	} else {
-		transformer = transform.NewProduction(townRoot, cfg.Telegraph.BodyCap, nudgeWindow, logger)
+		transformer = transform.NewProduction(townRoot, cfg.Telegraph.BodyCap, nudgeWindow, resolver, logger)
 	}
 
 	// Build L2 translators from enabled, resolved providers.
@@ -143,7 +152,11 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 	for id, rp := range resolved {
 		switch id {
 		case "jira":
-			translatorMap[id] = jiratr.New(rp.Secret, nil)
+			var ignoreActors []string
+			if pc := cfg.Telegraph.Providers[id]; pc != nil {
+				ignoreActors = pc.IgnoreActors
+			}
+			translatorMap[id] = jiratr.New(rp.Secret, ignoreActors, nil)
 		default:
 			return fmt.Errorf("telegraph: unsupported provider %q", id)
 		}
@@ -189,16 +202,21 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 		for evt := range rawCh {
 			tr, ok := translatorMap[evt.Provider]
 			if !ok {
-				logger.Drop(evt.Provider, "", "", "no_translator")
+				logger.Drop(evt.Provider, "", "", "", "no_translator")
 				continue
 			}
 			norm, err := tr.Translate(evt.Body)
+			if errors.Is(err, telegraph.ErrActorFiltered) {
+				// norm is non-nil; use it to populate the audit log.
+				logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, tlog.ReasonActorFiltered)
+				continue
+			}
 			if err != nil {
-				logger.Drop(evt.Provider, "", "", "translate_error")
+				logger.Drop(evt.Provider, "", "", "", "translate_error")
 				continue
 			}
 			if err := transformer.Transform(norm); err != nil {
-				logger.Drop(evt.Provider, norm.EventType, norm.EventID, "transform_error")
+				logger.Drop(evt.Provider, norm.EventType, norm.EventID, "", "transform_error")
 			}
 		}
 	}()
@@ -238,4 +256,88 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 		return fmt.Errorf("telegraph: server: %w", srvErr)
 	}
 	return nil
+}
+
+// buildPromptsResolver merges inline and separate-file prompt configs and
+// constructs a Resolver. Returns nil (no-op resolver) when no prompts are
+// configured. The separate file (~/gt/settings/telegraph.prompts.toml) wins
+// on key collision with inline config.
+func buildPromptsResolver(cfg *telegraph.Config, townRoot string) (*prompts.Resolver, error) {
+	inline := cfg.Telegraph.Prompts
+	if len(inline) == 0 {
+		// Try separate file even if inline is empty.
+		overrides, err := loadPromptsFile(townRoot)
+		if err != nil {
+			return nil, err
+		}
+		if len(overrides) == 0 {
+			return nil, nil
+		}
+		inline = overrides
+	} else {
+		// Merge: start with inline, overlay with separate-file overrides.
+		overrides, err := loadPromptsFile(townRoot)
+		if err != nil {
+			return nil, err
+		}
+		merged := make(map[string]string, len(inline)+len(overrides))
+		for k, v := range inline {
+			merged[k] = v
+		}
+		for k, v := range overrides {
+			merged[k] = v
+		}
+		inline = merged
+	}
+
+	promptCap := cfg.Telegraph.PromptCap
+	if promptCap == 0 {
+		promptCap = 2048
+	}
+
+	byKey := make(map[string]string, len(inline))
+	defaultPrompt := ""
+	for k, v := range inline {
+		if k == "default" {
+			defaultPrompt = v
+		} else {
+			byKey[k] = v
+		}
+	}
+
+	r, err := prompts.NewResolver(prompts.Config{
+		Default: defaultPrompt,
+		ByKey:   byKey,
+		Cap:     promptCap,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	specific := len(byKey)
+	hasDefault := defaultPrompt != ""
+	fmt.Printf("[Telegraph] prompts loaded: %d specific, default=%v\n", specific, hasDefault)
+
+	return r, nil
+}
+
+// promptsOverrideFile is the TOML structure for telegraph.prompts.toml.
+type promptsOverrideFile struct {
+	Telegraph struct {
+		Prompts map[string]string `toml:"prompts"`
+	} `toml:"telegraph"`
+}
+
+// loadPromptsFile loads ~/gt/settings/telegraph.prompts.toml if it exists.
+// Returns nil map (no error) if the file is absent.
+func loadPromptsFile(townRoot string) (map[string]string, error) {
+	path := townRoot + "/settings/telegraph.prompts.toml"
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return nil, nil
+	}
+	var fc promptsOverrideFile
+	if _, err := toml.DecodeFile(path, &fc); err != nil {
+		return nil, fmt.Errorf("parsing prompts override file %s: %w", path, err)
+	}
+	return fc.Telegraph.Prompts, nil
 }

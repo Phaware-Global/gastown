@@ -32,8 +32,17 @@ type TelegraphConfig struct {
 	// Content beyond the cap is truncated with a "[… truncated]" notice.
 	BodyCap int `toml:"body_cap"`
 
+	// PromptCap is the maximum bytes of a resolved operator prompt before
+	// truncation. Default 2048. Truncation appends "\n[… prompt truncated]".
+	PromptCap int `toml:"prompt_cap"`
+
 	// LogFile is the path to Telegraph's log file. Empty means stderr.
 	LogFile string `toml:"log_file"`
+
+	// Prompts holds per-event-type operator prompt templates, keyed by
+	// "<provider>:<event_type>" (e.g. "jira:comment.added") or "default".
+	// If absent or empty, no OPERATOR PROMPT block is emitted.
+	Prompts map[string]string `toml:"prompts"`
 
 	// Providers is a map of provider ID → per-provider configuration.
 	// Example provider IDs: "jira", "github".
@@ -53,6 +62,12 @@ type ProviderConfig struct {
 	// Events is the list of provider event types to accept.
 	// Unrecognised event types are rejected with ErrUnknownEventType.
 	Events []string `toml:"events"`
+
+	// IgnoreActors is a list of actor display-names whose events are silently
+	// dropped before L3 enqueue. Empty or absent means no actor filtering.
+	// Strings are compared case-sensitively against NormalizedEvent.Actor.
+	// An empty-string entry is rejected at config-load time.
+	IgnoreActors []string `toml:"ignore_actors"`
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -64,6 +79,7 @@ func DefaultConfig() *Config {
 			BufferSize:  256,
 			NudgeWindow: "30s",
 			BodyCap:     4096,
+			PromptCap:   2048,
 			LogFile:     "",
 			Providers:   map[string]*ProviderConfig{},
 		},
@@ -131,6 +147,11 @@ func (c *Config) Validate() error {
 		}
 		if p.Enabled && len(p.Events) == 0 {
 			return fmt.Errorf("telegraph.providers.%s: events list must be non-empty when enabled=true", id)
+		}
+		for _, a := range p.IgnoreActors {
+			if a == "" {
+				return fmt.Errorf("telegraph.providers.%s: ignore_actors must not contain empty strings", id)
+			}
 		}
 	}
 	return nil

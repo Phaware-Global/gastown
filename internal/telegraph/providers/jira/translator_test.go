@@ -23,7 +23,7 @@ func makeHMAC(body []byte) string {
 }
 
 func newTranslator() *jira.Translator {
-	return jira.New(testSecret, nil)
+	return jira.New(testSecret, nil, nil)
 }
 
 // ---- Authenticate ----
@@ -49,7 +49,7 @@ func TestAuthenticate_MissingHeader(t *testing.T) {
 
 func TestAuthenticate_WrongSecret(t *testing.T) {
 	t.Parallel()
-	tr := jira.New("wrong-secret", nil)
+	tr := jira.New("wrong-secret", nil, nil)
 	body := []byte(`{"webhookEvent":"jira:issue_created"}`)
 	headers := map[string]string{"x-hub-signature": makeHMAC(body)}
 	err := tr.Authenticate(headers, body)
@@ -525,5 +525,137 @@ func TestTranslate_IssueCreated_NoLabels(t *testing.T) {
 	}
 	if evt.Labels == nil {
 		t.Error("Labels should not be nil — must be empty slice")
+	}
+}
+
+// ---- Actor filtering ----
+
+// mustMarshalAny marshals v to JSON, panicking on error.
+// Used for test data that doesn't have a *testing.T in scope.
+func mustMarshalAny(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+func TestActorFilter_EmptyIgnoreActors_NoFilter(t *testing.T) {
+	t.Parallel()
+	tr := jira.New(testSecret, []string{}, nil)
+	body := mustMarshalAny(issuePayload{
+		Timestamp:    1713571200000,
+		WebhookEvent: "jira:comment_added",
+		Issue:        baseIssue("PROJ-10"),
+		Comment: map[string]any{
+			"id":      "cmt-1",
+			"body":    "hello",
+			"created": "2026-04-19T12:00:00.000+0000",
+			"author":  map[string]string{"name": "Artie"},
+		},
+	})
+	evt, err := tr.Translate(body)
+	if err != nil {
+		t.Fatalf("Translate() error = %v, want nil (no filter configured)", err)
+	}
+	if evt == nil {
+		t.Fatal("expected non-nil event")
+	}
+}
+
+func TestActorFilter_NonMatchingActor_NoFilter(t *testing.T) {
+	t.Parallel()
+	tr := jira.New(testSecret, []string{"Artie"}, nil)
+	body := mustMarshalAny(issuePayload{
+		Timestamp:    1713571200000,
+		WebhookEvent: "jira:comment_added",
+		Issue:        baseIssue("PROJ-11"),
+		Comment: map[string]any{
+			"id":      "cmt-2",
+			"body":    "hello",
+			"created": "2026-04-19T12:00:00.000+0000",
+			"author":  map[string]string{"name": "alice"},
+		},
+	})
+	evt, err := tr.Translate(body)
+	if err != nil {
+		t.Fatalf("Translate() error = %v, want nil (actor not in filter list)", err)
+	}
+	if evt == nil {
+		t.Fatal("expected non-nil event")
+	}
+}
+
+func TestActorFilter_MatchingActor_CommentAdded(t *testing.T) {
+	t.Parallel()
+	tr := jira.New(testSecret, []string{"Artie"}, nil)
+	body := mustMarshalAny(issuePayload{
+		Timestamp:    1713571200000,
+		WebhookEvent: "jira:comment_added",
+		Issue:        baseIssue("PROJ-12"),
+		Comment: map[string]any{
+			"id":      "cmt-3",
+			"body":    "my comment",
+			"created": "2026-04-19T12:00:00.000+0000",
+			"author":  map[string]string{"name": "Artie"},
+		},
+	})
+	evt, err := tr.Translate(body)
+	if !errors.Is(err, telegraph.ErrActorFiltered) {
+		t.Fatalf("Translate() error = %v, want ErrActorFiltered", err)
+	}
+	// Non-nil event is required so dispatcher can log actor/eventType/eventID.
+	if evt == nil {
+		t.Fatal("Translate() returned nil event with ErrActorFiltered — event must be non-nil for audit log")
+	}
+	if evt.Actor != "Artie" {
+		t.Errorf("event.Actor = %q, want Artie", evt.Actor)
+	}
+}
+
+func TestActorFilter_MatchingActor_IssueUpdated(t *testing.T) {
+	t.Parallel()
+	tr := jira.New(testSecret, []string{"Artie"}, nil)
+	body := mustMarshalAny(issuePayload{
+		Timestamp:    1713571200000,
+		WebhookEvent: "jira:issue_updated",
+		User:         baseUser("Artie"),
+		Issue:        baseIssue("PROJ-13"),
+		Changelog: map[string]any{
+			"items": []map[string]any{
+				{"field": "status", "fromString": "Open", "toString": "In Progress"},
+			},
+		},
+	})
+	evt, err := tr.Translate(body)
+	if !errors.Is(err, telegraph.ErrActorFiltered) {
+		t.Fatalf("Translate() error = %v, want ErrActorFiltered for issue.updated", err)
+	}
+	if evt == nil {
+		t.Fatal("event must be non-nil for audit log")
+	}
+}
+
+func TestActorFilter_CaseSensitive_MixedCaseNoMatch(t *testing.T) {
+	t.Parallel()
+	// Filter has lowercase "artie", actor is "Artie" — no match expected.
+	tr := jira.New(testSecret, []string{"artie"}, nil)
+	body := mustMarshalAny(issuePayload{
+		Timestamp:    1713571200000,
+		WebhookEvent: "jira:comment_added",
+		Issue:        baseIssue("PROJ-14"),
+		Comment: map[string]any{
+			"id":      "cmt-4",
+			"body":    "hello",
+			"created": "2026-04-19T12:00:00.000+0000",
+			"author":  map[string]string{"name": "Artie"},
+		},
+	})
+	evt, err := tr.Translate(body)
+	if err != nil {
+		t.Fatalf("Translate() error = %v, want nil (case mismatch should not filter)", err)
+	}
+	if evt == nil {
+		t.Fatal("expected non-nil event")
 	}
 }

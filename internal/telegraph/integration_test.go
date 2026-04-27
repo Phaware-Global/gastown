@@ -19,7 +19,9 @@ import (
 
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/telegraph"
+	"github.com/steveyegge/gastown/internal/telegraph/prompts"
 	jiratr "github.com/steveyegge/gastown/internal/telegraph/providers/jira"
+	"github.com/steveyegge/gastown/internal/telegraph/tlog"
 	"github.com/steveyegge/gastown/internal/telegraph/transform"
 	"github.com/steveyegge/gastown/internal/telegraph/transport"
 )
@@ -81,10 +83,10 @@ func newPipeline(t *testing.T, bodyCap int, nudgeWindow time.Duration) *pipeline
 	secret := []byte(testSecret)
 
 	rawCh := make(chan telegraph.RawEvent, 64)
-	jiraTr := jiratr.New(testSecret, nil)
+	jiraTr := jiratr.New(testSecret, nil, nil)
 	mr := mail.NewMemoryRouter()
 	nudger := &captureNudger{}
-	transformer := transform.New(mr, nudger, bodyCap, nudgeWindow)
+	transformer := transform.New(mr, nudger, bodyCap, nudgeWindow, nil)
 
 	handler := transport.NewHandlerWithWriter(
 		[]telegraph.Translator{jiraTr},
@@ -466,5 +468,205 @@ func TestIntegration_BurstMailCount(t *testing.T) {
 	msgs := p.waitMessages(t, n, 5*time.Second)
 	if len(msgs) != n {
 		t.Errorf("want %d messages, got %d", n, len(msgs))
+	}
+}
+
+// ---- actor filter integration tests ----
+
+// actorPipeline wires L1+L2+L3 with an actor filter and a log buffer for Drop assertions.
+type actorPipeline struct {
+	*pipeline
+	logBuf *bytes.Buffer
+	logger *tlog.Logger
+}
+
+func newActorPipeline(t *testing.T, ignoreActors []string) *actorPipeline {
+	t.Helper()
+	const testSecret = "test-secret-xyzzy"
+	secret := []byte(testSecret)
+
+	logBuf := &bytes.Buffer{}
+	logger := tlog.New(logBuf)
+
+	rawCh := make(chan telegraph.RawEvent, 64)
+	jiraTrFiltered := jiratr.New(testSecret, ignoreActors, nil)
+	mr := mail.NewMemoryRouter()
+	nudger := &captureNudger{}
+	transformer := transform.New(mr, nudger, 4096, 0, nil, logger)
+
+	handler := transport.NewHandlerWithWriter(
+		[]telegraph.Translator{jiraTrFiltered},
+		rawCh,
+		nil,
+	)
+	srv := httptest.NewServer(handler)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for evt := range rawCh {
+			norm, err := jiraTrFiltered.Translate(evt.Body)
+			if err != nil {
+				if norm != nil {
+					// ErrActorFiltered: non-nil event for audit log
+					logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, tlog.ReasonActorFiltered)
+				}
+				continue
+			}
+			_ = transformer.Transform(norm)
+		}
+	}()
+
+	cancel := func() {
+		srv.Close()
+		close(rawCh)
+		<-done
+	}
+
+	return &actorPipeline{
+		pipeline: &pipeline{
+			srv:    srv,
+			mr:     mr,
+			nudger: nudger,
+			rawCh:  rawCh,
+			cancel: cancel,
+			secret: secret,
+		},
+		logBuf: logBuf,
+		logger: logger,
+	}
+}
+
+func TestIntegration_ActorFilter_HTTP200OnFilteredDrop(t *testing.T) {
+	ap := newActorPipeline(t, []string{"Artie"})
+	defer ap.cancel()
+
+	body := commentAddedPayload("PROJ-50", "Artie", "my own comment")
+	resp := ap.post(t, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("filtered actor: want HTTP 200 (no retry storm), got %d", resp.StatusCode)
+	}
+}
+
+func TestIntegration_ActorFilter_NoMailDelivered(t *testing.T) {
+	ap := newActorPipeline(t, []string{"Artie"})
+	defer ap.cancel()
+
+	body := commentAddedPayload("PROJ-51", "Artie", "my own comment")
+	ap.post(t, body)
+
+	// Small sleep to let the dispatch goroutine process the event.
+	time.Sleep(50 * time.Millisecond)
+
+	if n := len(ap.mr.Messages()); n != 0 {
+		t.Errorf("filtered actor: want 0 messages, got %d", n)
+	}
+}
+
+func TestIntegration_ActorFilter_DropLogIncludesActor(t *testing.T) {
+	ap := newActorPipeline(t, []string{"Artie"})
+	defer ap.cancel()
+
+	body := commentAddedPayload("PROJ-52", "Artie", "filtered comment")
+	ap.post(t, body)
+	time.Sleep(50 * time.Millisecond)
+
+	logLines := ap.logBuf.String()
+	if !strings.Contains(logLines, `"actor_filtered"`) {
+		t.Errorf("drop log missing reason=actor_filtered:\n%s", logLines)
+	}
+	if !strings.Contains(logLines, `"Artie"`) {
+		t.Errorf("drop log missing actor=Artie:\n%s", logLines)
+	}
+}
+
+func TestIntegration_ActorFilter_NonFilteredActorDelivered(t *testing.T) {
+	ap := newActorPipeline(t, []string{"Artie"})
+	defer ap.cancel()
+
+	body := commentAddedPayload("PROJ-53", "alice", "real comment")
+	ap.post(t, body)
+
+	msgs := ap.waitMessages(t, 1, 2*time.Second)
+	if len(msgs) == 0 {
+		t.Fatal("non-filtered actor: expected 1 message, got 0")
+	}
+}
+
+// ---- prompt_key in deliver log ----
+
+func TestIntegration_PromptKey_InDeliverLog(t *testing.T) {
+	const testSecret = "test-secret-xyzzy"
+	secret := []byte(testSecret)
+
+	resolver, err := prompts.NewResolver(prompts.Config{
+		ByKey: map[string]string{
+			"jira:comment.added": "Handle this comment appropriately.",
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+
+	logBuf := &bytes.Buffer{}
+	logger := tlog.New(logBuf)
+	rawCh := make(chan telegraph.RawEvent, 64)
+	jiraTr := jiratr.New(testSecret, nil, nil)
+	mr := mail.NewMemoryRouter()
+	nudger := &captureNudger{}
+	transformer := transform.New(mr, nudger, 4096, 0, resolver, logger)
+
+	handler := transport.NewHandlerWithWriter(
+		[]telegraph.Translator{jiraTr},
+		rawCh,
+		nil,
+	)
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for evt := range rawCh {
+			norm, transErr := jiraTr.Translate(evt.Body)
+			if transErr != nil {
+				continue
+			}
+			_ = transformer.Transform(norm)
+		}
+	}()
+	defer func() {
+		close(rawCh)
+		<-done
+	}()
+
+	body := commentAddedPayload("PROJ-60", "alice", "test comment")
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/webhook/jira", bytes.NewReader(body))
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(body)
+	req.Header.Set("X-Hub-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d", resp.StatusCode)
+	}
+
+	// Wait for deliver log.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(logBuf.String(), "deliver") {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	logLines := logBuf.String()
+	if !strings.Contains(logLines, `"jira:comment.added"`) {
+		t.Errorf("deliver log missing prompt_key=jira:comment.added:\n%s", logLines)
+	}
+	if !strings.Contains(logLines, `"prompt_key"`) {
+		t.Errorf("deliver log missing prompt_key field:\n%s", logLines)
 	}
 }
