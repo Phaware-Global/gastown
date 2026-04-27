@@ -100,6 +100,47 @@ func TestEngineer_LoadConfig_MergeStrategyPR_NoApproverOptOut(t *testing.T) {
 	}
 }
 
+// TestEngineer_LoadConfig_MergeStrategyPR_NoApproverOptOut_RequireReviewFalse
+// covers the deprecated opt-out shape: empty PRApprover paired with
+// `require_review: false` (instead of `pr_required_approvals: 0`).
+// Both shapes resolve to GetPRRequiredApprovals()==0, and the
+// validation uses that helper, so both must load successfully.
+// Without explicit coverage, future changes to the helper's
+// resolution rules could quietly drift the loader's acceptance set
+// away from the runtime's evaluation set.
+func TestEngineer_LoadConfig_MergeStrategyPR_NoApproverOptOut_RequireReviewFalse(t *testing.T) {
+	tmpDir := t.TempDir()
+	config := map[string]interface{}{
+		"type":    "rig",
+		"version": 1,
+		"name":    "test-rig",
+		"merge_queue": map[string]interface{}{
+			"merge_strategy": "pr",
+			"pr_approver":    "",
+			"require_review": false,
+			"pr_reviewer":    "augmentcode",
+		},
+	}
+	data := mustMarshalIndent(t, config)
+	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
+	e := NewEngineer(r)
+	if err := e.LoadConfig(); err != nil {
+		t.Fatalf("expected deprecated require_review=false opt-out to load, got %v", err)
+	}
+	if e.config.PRApprover != "" {
+		t.Errorf("PRApprover = %q, want empty (opt-out)", e.config.PRApprover)
+	}
+	if e.config.RequireReview == nil || *e.config.RequireReview {
+		t.Errorf("RequireReview = %v, want explicit false", e.config.RequireReview)
+	}
+	if got := e.config.GetPRRequiredApprovals(); got != 0 {
+		t.Errorf("GetPRRequiredApprovals() = %d, want 0 (helper must resolve require_review=false to 0)", got)
+	}
+}
+
 // TestEngineer_LoadConfig_MergeStrategyPR_EmptyApproverWithoutOptOut
 // asserts the negative cases: empty PRApprover is NOT acceptable
 // unless pr_required_approvals=0 is also explicit. The opt-out must

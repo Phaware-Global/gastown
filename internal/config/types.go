@@ -1319,13 +1319,15 @@ type MergeQueueConfig struct {
 	PRReviewer string `json:"pr_reviewer,omitempty"`
 
 	// PRApprover is the GitHub user whose approving review gates the merge.
-	// Required when merge_strategy="pr" UNLESS pr_required_approvals is
-	// explicitly 0 — in that combination both per-user approval gates are
-	// opted out and the refinery merges based on the review-loop and
-	// unresolved-threads gates alone. Empty PRApprover with unset or
-	// non-zero pr_required_approvals is rejected at config-load: the
-	// opt-out must be deliberate, not accidental. Only meaningful when
-	// merge_strategy="pr".
+	// Required when merge_strategy="pr" UNLESS the resolved count gate is
+	// zero — i.e., GetPRRequiredApprovals() returns 0. The two shapes that
+	// resolve to zero are an explicit `pr_required_approvals: 0` and the
+	// deprecated `require_review: false`; either, paired with empty
+	// PRApprover, opts out of every per-user approval gate. The refinery
+	// then merges based on the review-loop and unresolved-threads gates
+	// alone. Empty PRApprover with a non-zero resolved count gate is
+	// rejected at config-load: the opt-out must be deliberate, not
+	// accidental. Only meaningful when merge_strategy="pr".
 	PRApprover string `json:"pr_approver,omitempty"`
 
 	// PRRequiredApprovals is the count gate: the minimum distinct APPROVED
