@@ -678,12 +678,19 @@ func (e *Engineer) LoadConfig() error {
 				"Bitbucket PR provider is stubbed. Use vcs_provider=%q or merge_strategy=%q.",
 				"pr", "bitbucket", "github", "direct")
 		}
-		if e.config.PRApprover == "" {
-			return fmt.Errorf("pr_approver is required when merge_strategy=%q", "pr")
-		}
 		if e.config.PRRequiredApprovals != nil && *e.config.PRRequiredApprovals < 0 {
 			return fmt.Errorf("pr_required_approvals must be non-negative, got %d",
 				*e.config.PRRequiredApprovals)
+		}
+		// pr_approver may be empty ONLY when pr_required_approvals is
+		// explicitly 0 — opt-out path for rigs that gate on review-loop
+		// completion + threads-resolved alone. See loader.go validation
+		// for the canonical rule; this duplicate enforces it on the
+		// engineer's per-rig config load path.
+		if e.config.PRApprover == "" && (e.config.PRRequiredApprovals == nil || *e.config.PRRequiredApprovals != 0) {
+			return fmt.Errorf("pr_approver is required when merge_strategy=%q "+
+				"(set pr_required_approvals=0 explicitly to opt out of all approval gates)",
+				"pr")
 		}
 		if e.config.PRReviewLoopMax < 0 {
 			return fmt.Errorf("pr_review_loop_max must be non-negative, got %d",

@@ -301,11 +301,20 @@ func validateMergeQueueConfig(c *MergeQueueConfig) error {
 				"Bitbucket implementation is incomplete. Use vcs_provider=%q or merge_strategy=%q.",
 				MergeStrategyPR, VCSProviderBitbucket, VCSProviderGitHub, MergeStrategyDirect)
 		}
-		if c.PRApprover == "" {
-			return fmt.Errorf("pr_approver is required when merge_strategy=%q", MergeStrategyPR)
-		}
 		if c.PRRequiredApprovals != nil && *c.PRRequiredApprovals < 0 {
 			return fmt.Errorf("pr_required_approvals must be non-negative, got %d", *c.PRRequiredApprovals)
+		}
+		// pr_approver may be empty ONLY when pr_required_approvals is
+		// explicitly 0 — this is the opt-out path for rigs that gate on
+		// review-loop completion + threads-resolved alone, with no
+		// per-user approval required. Empty pr_approver with unset or
+		// non-zero pr_required_approvals is still rejected: implicit
+		// no-approver behavior would be surprising for the legacy
+		// approval-required default.
+		if c.PRApprover == "" && (c.PRRequiredApprovals == nil || *c.PRRequiredApprovals != 0) {
+			return fmt.Errorf("pr_approver is required when merge_strategy=%q "+
+				"(set pr_required_approvals=0 explicitly to opt out of all approval gates)",
+				MergeStrategyPR)
 		}
 		if c.PRReviewLoopMax < 0 {
 			return fmt.Errorf("pr_review_loop_max must be non-negative, got %d", c.PRReviewLoopMax)
