@@ -17,19 +17,26 @@ import (
 
 // Translator implements telegraph.Translator for Jira webhook payloads.
 type Translator struct {
-	secret []byte
-	logger *slog.Logger
+	secret       []byte
+	ignoreActors map[string]struct{}
+	logger       *slog.Logger
 }
 
-// New creates a Jira Translator with the given HMAC secret.
+// New creates a Jira Translator with the given HMAC secret and actor filter list.
+// ignoreActors is a list of actor display-names to silently drop; nil or empty disables filtering.
 // If logger is nil, slog.Default() is used.
-func New(secret string, logger *slog.Logger) *Translator {
+func New(secret string, ignoreActors []string, logger *slog.Logger) *Translator {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	set := make(map[string]struct{}, len(ignoreActors))
+	for _, a := range ignoreActors {
+		set[a] = struct{}{}
+	}
 	return &Translator{
-		secret: []byte(secret),
-		logger: logger,
+		secret:       []byte(secret),
+		ignoreActors: set,
+		logger:       logger,
 	}
 }
 
@@ -61,26 +68,32 @@ func (t *Translator) Authenticate(headers map[string]string, body []byte) error 
 
 // Translate converts a Jira webhook body into a NormalizedEvent.
 // Returns ErrUnknownEventType for unrecognised webhookEvent values.
+// Returns (non-nil event, ErrActorFiltered) when the event's actor matches
+// the ignore_actors list; the caller must log a drop and not enqueue to L3.
 func (t *Translator) Translate(body []byte) (*telegraph.NormalizedEvent, error) {
 	var p payload
 	if err := json.Unmarshal(body, &p); err != nil {
 		return nil, fmt.Errorf("jira: parsing webhook payload: %w", err)
 	}
 
+	var (
+		evt *telegraph.NormalizedEvent
+		err error
+	)
 	switch p.WebhookEvent {
 	case "jira:issue_created":
-		return translateIssueCreated(&p)
+		evt, err = translateIssueCreated(&p)
 	case "jira:issue_updated":
-		return translateIssueUpdated(&p)
+		evt, err = translateIssueUpdated(&p)
 	// Comment events: Jira's webhook API drops the `jira:` prefix and uses the
 	// verb `created` (instead of `added`) for creation events. We accept both
 	// the prefixed legacy form and the bare form Jira actually sends in
 	// production. Discovered during dogfooding when bare comment events
 	// triggered ErrUnknownEventType.
 	case "jira:comment_added", "comment_created":
-		return translateCommentAdded(&p)
+		evt, err = translateCommentAdded(&p)
 	case "jira:comment_updated", "comment_updated":
-		return translateCommentUpdated(&p)
+		evt, err = translateCommentUpdated(&p)
 	default:
 		t.logger.Info("telegraph: unknown jira event type",
 			"event_type", p.WebhookEvent,
@@ -92,6 +105,15 @@ func (t *Translator) Translate(body []byte) (*telegraph.NormalizedEvent, error) 
 		)
 		return nil, telegraph.ErrUnknownEventType
 	}
+	if err != nil {
+		return nil, err
+	}
+	if len(t.ignoreActors) > 0 {
+		if _, filtered := t.ignoreActors[evt.Actor]; filtered {
+			return evt, telegraph.ErrActorFiltered
+		}
+	}
+	return evt, nil
 }
 
 // ---- internal payload types ----

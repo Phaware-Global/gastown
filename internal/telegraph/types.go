@@ -17,6 +17,13 @@ import (
 // never forwarded raw. L1 returns HTTP 200 to prevent provider retry storms.
 var ErrUnknownEventType = errors.New("unknown event type")
 
+// ErrActorFiltered is returned by Translate when the event's actor matches an
+// entry in the provider's ignore_actors list. Unlike ErrUnknownEventType, the
+// translator returns a non-nil NormalizedEvent alongside this error so the
+// dispatcher can populate the audit-log line with actor/event_type/event_id.
+// The dispatcher must not enqueue a filtered event to L3.
+var ErrActorFiltered = errors.New("actor filtered by provider config")
+
 // RawEvent is the authenticated-but-uninterpreted payload from Transport.
 // L1 guarantees the request passed HMAC/signature verification before enqueuing.
 // L2 never re-verifies; it only translates.

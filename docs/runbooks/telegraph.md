@@ -16,17 +16,22 @@ listen_addr  = ":8765"
 buffer_size  = 256
 nudge_window = "30s"
 body_cap     = 4096
+prompt_cap   = 2048   # max bytes for a resolved operator prompt (default 2048)
 log_file     = "/path/to/gt/logs/telegraph.log"
 
 [telegraph.providers.jira]
-enabled    = true
-secret_env = "GT_TELEGRAPH_JIRA_SECRET"
-events     = [
+enabled       = true
+secret_env    = "GT_TELEGRAPH_JIRA_SECRET"
+events        = [
     "jira:issue_created",
     "jira:issue_updated",
     "jira:comment_added",
     "jira:comment_updated",
 ]
+# ignore_actors = ["Artie"]   # drop events whose actor exactly matches (see Actor Filtering)
+
+# [telegraph.prompts]         # optional — see Operator Prompts section
+# "jira:comment.added" = """..."""
 ```
 
 **Field reference:**
@@ -37,6 +42,7 @@ events     = [
 | `buffer_size` | `256` | Max queued events between L1 and L2; full → HTTP 503 to caller |
 | `nudge_window` | `30s` | Max one Mayor nudge per this window regardless of event volume |
 | `body_cap` | `4096` | Max bytes of Jira content in mail body; excess is truncated |
+| `prompt_cap` | `2048` | Max bytes for a single resolved operator prompt; excess truncated |
 | `log_file` | `""` (stderr) | Path to log file; empty → logs go to stderr |
 
 ---
@@ -225,6 +231,162 @@ gt mail inbox
 
 ---
 
+## Operator Prompts
+
+Operator prompts let you attach per-event-type instructions to each mail Telegraph
+delivers. The receiving agent (Mayor) reads these before the external webhook content,
+giving it policy context without requiring each receiver to infer operator intent.
+
+### Mail body shape (with a configured prompt)
+
+```
+Telegraph-Transport: http-webhook
+Telegraph-Provider: jira
+Telegraph-Event-Type: comment.added
+...
+
+--- OPERATOR PROMPT (trusted) ---
+A new comment was added to PROJ-1234 by Artie.
+If the comment is a direct question, respond inline via addCommentToJiraIssue.
+--- END OPERATOR PROMPT ---
+
+--- EXTERNAL CONTENT (untrusted: jira/Artie) ---
+<the actual comment body>
+--- END EXTERNAL CONTENT ---
+```
+
+If no prompt is configured for the event type, the OPERATOR PROMPT block is omitted
+and the mail body reverts to the current format. Existing deployments see no change
+until the operator explicitly opts in.
+
+### Configuring prompts
+
+**Option A — inline in `telegraph.toml`:**
+
+```toml
+[telegraph]
+prompt_cap = 2048
+
+[telegraph.prompts]
+default = """
+A telegraph event from {provider} ({event_type}) on {subject} by {actor}.
+Read the external content and decide whether action is required.
+"""
+
+"jira:comment.added" = """
+A comment was added to {subject} by {actor}.
+URL: {canonical_url}
+
+If the comment is a question or @-mention, respond via addCommentToJiraIssue.
+If it describes a code change, open a bead and dispatch a polecat.
+"""
+
+"jira:issue.created" = """..."""
+"jira:issue.updated" = """..."""
+"jira:comment.updated" = """..."""
+```
+
+**Option B — separate file `~/gt/settings/telegraph.prompts.toml`:**
+
+Same `[telegraph.prompts]` table at the top level. If both files define the same
+key, the separate file wins. Copy `telegraph.prompts.toml.example` from the repo
+root as a starting point.
+
+**Variable tokens** substituted per event:
+
+| Token | Value |
+|-------|-------|
+| `{provider}` | e.g. `"jira"` |
+| `{event_type}` | e.g. `"comment.added"` |
+| `{event_id}` | provider-native event ID |
+| `{actor}` | who triggered the event |
+| `{subject}` | issue key, e.g. `"PROJ-1234"` |
+| `{canonical_url}` | browse URL |
+| `{timestamp}` | RFC3339 UTC |
+| `{labels}` | comma-space-joined labels |
+
+Unknown tokens (e.g. `{foo}`) are left as literal text.
+
+### Startup validation
+
+At startup, Telegraph validates prompt config and exits with an error if:
+- A key doesn't match `^[a-z]+:[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]+)+$`
+- A value is empty after trimming
+- A template contains either OPERATOR PROMPT delimiter literal
+
+On success, Telegraph logs: `[Telegraph] prompts loaded: 4 specific, default=true`
+
+### Restart to apply
+
+Prompt changes require a Telegraph restart. See [Restart Procedure](#restart-procedure).
+
+### Delivery log
+
+The `event=deliver` log line includes `prompt_key` naming which template resolved:
+
+```json
+{"event":"deliver","event_type":"comment.added","prompt_key":"jira:comment.added",...}
+```
+
+`prompt_key` is `"default"` when the default template fired, or absent when no prompt
+block was emitted.
+
+---
+
+## Actor Filtering (Self-Echo Prevention)
+
+When Mayor posts a Jira comment via the Atlassian MCP, Jira fires webhook events back
+to Telegraph — including both a `comment.added` and an `issue.updated` event — with
+`actor=<operator persona>`. Without filtering, Mayor sees its own actions as new mail
+and enters a feedback loop.
+
+`ignore_actors` silently drops events whose actor exactly matches a configured name.
+The filter runs at L2 (before L3 enqueue) and returns HTTP 200 to Jira so Jira does
+not retry.
+
+### Configuration
+
+```toml
+[telegraph.providers.jira]
+enabled       = true
+secret_env    = "GT_TELEGRAPH_JIRA_SECRET"
+events        = ["jira:issue_created", "jira:issue_updated", "jira:comment_added", "jira:comment_updated"]
+ignore_actors = ["Artie"]   # drop events whose actor matches exactly (case-sensitive)
+```
+
+- Strings are compared **case-sensitively** against `NormalizedEvent.Actor` (the display name).
+- Empty list (or absent) means no filtering — current behavior unchanged.
+- Empty-string entries (`ignore_actors = [""]`) are rejected at startup.
+
+Restart Telegraph after editing `ignore_actors`.
+
+### Audit log
+
+Every filtered drop produces a structured log line:
+
+```json
+{"ts":"...","component":"telegraph","event":"drop","provider":"jira","event_type":"comment.added","event_id":"22360","actor":"Artie","reason":"actor_filtered"}
+```
+
+The `actor` field confirms who was filtered. Check `~/gt/logs/telegraph.log` to verify
+the filter is working and not masking events you intended to receive.
+
+**Useful query:**
+
+```bash
+jq 'select(.reason == "actor_filtered")' ~/gt/logs/telegraph.log
+```
+
+### Caveats
+
+- Filtering uses the actor's **display name** as seen by Telegraph. If the display
+  name changes in Jira (or a different API credential is used for outbound calls),
+  the `ignore_actors` list must be updated and Telegraph restarted.
+- The filter does not interact with operator prompts: a filtered event never reaches
+  L3, so no `event=deliver` line and no `prompt_key` field are emitted.
+
+---
+
 ## Reading Logs and tlog.Counters
 
 Every log line is a single JSON object. Key fields:
@@ -235,10 +397,11 @@ Every log line is a single JSON object. Key fields:
 | `component` | Always `"telegraph"` |
 | `event` | `accept`, `reject`, `deliver`, `drop`, `nudge_sent`, `nudge_suppressed` |
 | `provider` | e.g. `"jira"` |
-| `reason` | On `reject`: `hmac_invalid`, `backpressure`, `parse_error`, `provider_disabled`; on `drop`: `no_translator`, `translate_error`, `transform_error` |
+| `reason` | On `reject`: `hmac_invalid`, `backpressure`, `parse_error`, `provider_disabled`; on `drop`: `actor_filtered`, `no_translator`, `translate_error`, `transform_error` |
 | `source_ip` | Caller IP (tunnel edge IP in production) |
-| `actor` | Who triggered the event |
+| `actor` | Who triggered the event (present on `deliver` and `actor_filtered` drops) |
 | `subject` | Issue key, e.g. `PROJ-1234` |
+| `prompt_key` | On `deliver`: resolved prompt template key, or absent if no prompt emitted |
 
 **`tlog.Counters`** are in-process atomic counters that mirror the log events.
 They reset on restart. The counters are:
@@ -270,6 +433,12 @@ tail -f "$LOG_FILE" | jq 'select(.reason == "backpressure")'
 
 # All delivers for a specific issue key
 jq 'select(.event == "deliver" and .subject == "PROJ-1234")' "$LOG_FILE"
+
+# Check actor-filtered drops (self-echo prevention audit)
+jq 'select(.reason == "actor_filtered")' "$LOG_FILE"
+
+# Check which prompt template resolved for recent deliveries
+jq 'select(.event == "deliver") | {event_type, prompt_key}' "$LOG_FILE"
 ```
 
 ---

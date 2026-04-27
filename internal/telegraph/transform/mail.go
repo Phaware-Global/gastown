@@ -13,6 +13,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/telegraph"
+	"github.com/steveyegge/gastown/internal/telegraph/prompts"
 	"github.com/steveyegge/gastown/internal/telegraph/tlog"
 )
 
@@ -43,7 +44,8 @@ type Transformer struct {
 	nudger      Nudger
 	bodyCap     int
 	nudgeWindow time.Duration
-	log         *tlog.Logger // nil disables logging
+	resolver    *prompts.Resolver // nil disables operator prompt blocks
+	log         *tlog.Logger      // nil disables logging
 
 	mu        sync.Mutex
 	lastNudge time.Time
@@ -52,8 +54,9 @@ type Transformer struct {
 // New returns a Transformer. bodyCap is the maximum bytes of external text
 // written into the mail body; content beyond the cap is truncated. nudgeWindow
 // is the minimum interval between consecutive Mayor nudges; zero disables nudges.
-// logger may be nil to disable structured logging.
-func New(sender MailSender, nudger Nudger, bodyCap int, nudgeWindow time.Duration, logger ...*tlog.Logger) *Transformer {
+// resolver may be nil to disable operator prompt blocks. logger may be nil to
+// disable structured logging.
+func New(sender MailSender, nudger Nudger, bodyCap int, nudgeWindow time.Duration, resolver *prompts.Resolver, logger ...*tlog.Logger) *Transformer {
 	var l *tlog.Logger
 	if len(logger) > 0 {
 		l = logger[0]
@@ -63,27 +66,34 @@ func New(sender MailSender, nudger Nudger, bodyCap int, nudgeWindow time.Duratio
 		nudger:      nudger,
 		bodyCap:     bodyCap,
 		nudgeWindow: nudgeWindow,
+		resolver:    resolver,
 		log:         l,
 	}
 }
 
 // NewProduction returns a Transformer wired to a production mail router and an
 // exec-based nudger. townRoot is used to construct the Router's working directory.
-// logger may be nil to disable structured logging.
-func NewProduction(townRoot string, bodyCap int, nudgeWindow time.Duration, logger *tlog.Logger) *Transformer {
+// resolver may be nil to disable operator prompt blocks. logger may be nil to
+// disable structured logging.
+func NewProduction(townRoot string, bodyCap int, nudgeWindow time.Duration, resolver *prompts.Resolver, logger *tlog.Logger) *Transformer {
 	router := mail.NewRouterWithTownRoot(townRoot, townRoot)
-	return New(router, &ExecNudger{}, bodyCap, nudgeWindow, logger)
+	return New(router, &ExecNudger{}, bodyCap, nudgeWindow, resolver, logger)
 }
 
 // Transform builds a Mayor-addressed mail envelope from event, sends it via the
 // configured MailSender, and conditionally nudges Mayor within the rate-limit
 // window. It is safe to call concurrently.
 func (t *Transformer) Transform(event *telegraph.NormalizedEvent) error {
+	var promptText, promptKey string
+	if t.resolver != nil {
+		promptText, promptKey = t.resolver.Resolve(event)
+	}
+
 	msg := mail.NewMessage(
 		buildFrom(event),
 		"mayor/",
 		buildSubject(event),
-		t.buildBody(event),
+		t.buildBody(event, promptText),
 	)
 
 	if err := t.sender.Send(msg); err != nil {
@@ -91,7 +101,7 @@ func (t *Transformer) Transform(event *telegraph.NormalizedEvent) error {
 	}
 
 	// mail_id is not returned by MailSender.Send in v1; omit from log.
-	t.log.Deliver(event.Provider, event.EventType, event.EventID, event.Actor, event.Subject, "")
+	t.log.Deliver(event.Provider, event.EventType, event.EventID, event.Actor, event.Subject, "", promptKey)
 
 	t.maybeNudge(event)
 	return nil
@@ -171,10 +181,11 @@ func sanitizeHeaderValue(s string) string {
 	}, s)
 }
 
-// buildBody constructs the full mail body: Telegraph-* metadata headers followed
-// by a delimited external-content block. The external text is capped at bodyCap
-// bytes to limit context-injection surface.
-func (t *Transformer) buildBody(event *telegraph.NormalizedEvent) string {
+// buildBody constructs the full mail body: Telegraph-* metadata headers, an
+// optional OPERATOR PROMPT block (when promptText is non-empty), and a delimited
+// external-content block. The external text is capped at bodyCap bytes to limit
+// context-injection surface.
+func (t *Transformer) buildBody(event *telegraph.NormalizedEvent, promptText string) string {
 	var b strings.Builder
 
 	// Metadata block — all values come from NormalizedEvent structured fields.
@@ -195,6 +206,12 @@ func (t *Transformer) buildBody(event *telegraph.NormalizedEvent) string {
 			sanitizedLabels[i] = sanitizeHeaderValue(l)
 		}
 		fmt.Fprintf(&b, "Telegraph-Labels: %s\n", strings.Join(sanitizedLabels, ", "))
+	}
+
+	// Operator prompt block — emitted only when a prompt resolved.
+	// Sits between metadata headers and external content.
+	if promptText != "" {
+		fmt.Fprintf(&b, "\n--- OPERATOR PROMPT (trusted) ---\n%s\n--- END OPERATOR PROMPT ---", promptText)
 	}
 
 	// External content block with explicit trust delimiter.

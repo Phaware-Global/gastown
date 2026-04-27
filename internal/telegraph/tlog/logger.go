@@ -11,13 +11,14 @@ import (
 	"time"
 )
 
-// Reason constants for reject events, matching §Observability in telegraph.md.
+// Reason constants for reject/drop events, matching §Observability in telegraph.md.
 const (
 	ReasonHMACInvalid      = "hmac_invalid"
 	ReasonUnknownEventType = "unknown_event_type"
 	ReasonParseError       = "parse_error"
 	ReasonBackpressure     = "backpressure"
 	ReasonProviderDisabled = "provider_disabled"
+	ReasonActorFiltered    = "actor_filtered"
 )
 
 // Counters holds one atomic counter per event class. Safe for concurrent use.
@@ -59,6 +60,7 @@ type logEntry struct {
 	Actor     string `json:"actor,omitempty"`
 	Subject   string `json:"subject,omitempty"`
 	MailID    string `json:"mail_id,omitempty"`
+	PromptKey string `json:"prompt_key,omitempty"`
 	BytesLen  int    `json:"bytes_len,omitempty"`
 	LatencyMs int64  `json:"latency_ms"`
 	Reason    string `json:"reason,omitempty"`
@@ -109,7 +111,9 @@ func (l *Logger) Reject(provider, sourceIP, reason, eventID string) {
 
 // Deliver logs a successful mail send to Mayor from L3.
 // mailID is the bead ID of the created mail; may be empty if unavailable.
-func (l *Logger) Deliver(provider, eventType, eventID, actor, subject, mailID string) {
+// promptKey is the resolved prompt template key ("jira:comment.added", "default",
+// or "" if no operator prompt block was emitted).
+func (l *Logger) Deliver(provider, eventType, eventID, actor, subject, mailID, promptKey string) {
 	if l == nil {
 		return
 	}
@@ -122,11 +126,14 @@ func (l *Logger) Deliver(provider, eventType, eventID, actor, subject, mailID st
 		Actor:     actor,
 		Subject:   subject,
 		MailID:    mailID,
+		PromptKey: promptKey,
 	})
 }
 
-// Drop logs an event discarded after L2 without delivery (e.g. future dedup).
-func (l *Logger) Drop(provider, eventType, eventID, reason string) {
+// Drop logs an event discarded after L2 without delivery.
+// actor may be empty for drop reasons that do not have an actor (e.g. parse errors).
+// For actor_filtered drops, actor must be populated for the audit trail.
+func (l *Logger) Drop(provider, eventType, eventID, actor, reason string) {
 	if l == nil {
 		return
 	}
@@ -136,6 +143,7 @@ func (l *Logger) Drop(provider, eventType, eventID, reason string) {
 		Provider:  provider,
 		EventType: eventType,
 		EventID:   eventID,
+		Actor:     actor,
 		Reason:    reason,
 	})
 }
