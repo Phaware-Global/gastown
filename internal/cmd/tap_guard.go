@@ -219,107 +219,166 @@ func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 	// testing) or the command IS a guarded command, fall through
 	// to the block-or-allow logic.
 
-	// G21 fix: direct `gh pr merge` is blocked for ALL Gas Town agents,
-	// including the refinery — the refinery exception that covers
-	// `gh pr create` does NOT extend to merge. The refinery must route
-	// merges through `gt refinery pr merge <n>` which enforces PR.6
-	// wait-approval via refinery.VerifyPRApproval. Shelling out to
-	// `gh pr merge` directly is the G21 bypass shape: create-then-
-	// merge back-to-back without running PR.4/PR.5/PR.6.
+	// **The hook-firing IS the context signal.** This guard runs only
+	// because a PreToolUse `Bash` matcher fired, and that matcher is
+	// only installed in Gas Town agent session settings files
+	// (~/gt/<rig>/<role>/.claude/settings.json). A human operator
+	// running `gh pr merge` from their own terminal does not have the
+	// hook installed, so the guard never fires for them. Therefore:
+	// when this guard runs, we are by construction in a Gas Town
+	// agent session, and forbidden patterns (`gh pr merge`,
+	// `gh pr create` outside the refinery-on-PR-mode-rig exception)
+	// must be blocked unconditionally.
 	//
-	// The gt subcommand internally subprocesses `gh pr merge` — that
-	// subprocess is not a Bash tool call from Claude Code, so the
-	// PreToolUse hook doesn't fire on it. Only direct Bash invocations
-	// from the LLM agent are guarded here.
-	if isMerge && isGasTownAgentContext() {
+	// The previous design predicated the block on env-var detection
+	// (GT_POLECAT, GT_REFINERY, etc.). That detection drifted out of
+	// sync with the launch path — production sessions set GT_ROLE
+	// and GT_RIG, not GT_REFINERY — and the env-var-based gate
+	// returned false, letting a refinery's `gh pr merge` slip past
+	// (PR #58 dogfood incident). Removing the gate eliminates the
+	// test/prod skew and makes the block a structural property of
+	// "the hook ran" rather than a property of which env vars
+	// happen to be set.
+
+	// `gh pr merge` (and `gh api .../merge`) are NEVER allowed under
+	// this hook. The refinery is the only Gas Town agent with merge
+	// authority, and the refinery must route merges through
+	// `gt refinery pr merge <n>` which enforces PR.4 await-review,
+	// PR.6 unresolved-threads, and PR.6 wait-approval before calling
+	// the GitHub merge API. The gt subcommand's internal subprocess
+	// to `gh pr merge` does not re-trigger the PreToolUse hook (it's
+	// a child process, not a Bash tool call from Claude Code), so
+	// that legitimate path is not blocked here.
+	if isMerge {
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════╗")
-		fmt.Fprintln(os.Stderr, "║  ❌ DIRECT MERGE BLOCKED (G21 / G40 fix)                         ║")
-		fmt.Fprintln(os.Stderr, "╠══════════════════════════════════════════════════════════════════╣")
-		fmt.Fprintln(os.Stderr, "║  Refinery must route PR merges through `gt refinery pr merge`   ║")
-		fmt.Fprintln(os.Stderr, "║  which enforces PR.6 wait-approval gates before calling the     ║")
-		fmt.Fprintln(os.Stderr, "║  GitHub merge API.                                              ║")
-		fmt.Fprintln(os.Stderr, "║                                                                  ║")
-		fmt.Fprintln(os.Stderr, "║  Instead of:  gh pr merge <n> --squash                          ║")
-		fmt.Fprintln(os.Stderr, "║  Or:          gh api repos/.../pulls/<n>/merge -X PUT (G40)     ║")
-		fmt.Fprintln(os.Stderr, "║  Do this:     gt refinery pr merge <n>                          ║")
-		fmt.Fprintln(os.Stderr, "║                                                                  ║")
-		fmt.Fprintln(os.Stderr, "║  See: docs/design/refinery-pr-workflow.md §G21, §G40            ║")
-		fmt.Fprintln(os.Stderr, "╚══════════════════════════════════════════════════════════════════╝")
+		fmt.Fprintln(os.Stderr, "╔════════════════════════════════════════════════════════════════════════╗")
+		fmt.Fprintln(os.Stderr, "║  ❌ DIRECT MERGE BLOCKED (G21 / G40 fix)                                ║")
+		fmt.Fprintln(os.Stderr, "╠════════════════════════════════════════════════════════════════════════╣")
+		fmt.Fprintln(os.Stderr, "║  PR merges in Gas Town must go through the refinery's imperative       ║")
+		fmt.Fprintln(os.Stderr, "║  subcommand, which runs the await-review, threads-resolved, and        ║")
+		fmt.Fprintln(os.Stderr, "║  approval gates before calling the GitHub merge API.                   ║")
+		fmt.Fprintln(os.Stderr, "║                                                                        ║")
+		fmt.Fprintln(os.Stderr, "║  Use:    gt refinery pr merge <pr-number>                             ║")
+		fmt.Fprintln(os.Stderr, "║  Block:  gh pr merge <n>  /  gh api repos/.../pulls/<n>/merge          ║")
+		fmt.Fprintln(os.Stderr, "║                                                                        ║")
+		fmt.Fprintln(os.Stderr, "║  IF gt refinery pr merge errors out:                                   ║")
+		fmt.Fprintln(os.Stderr, "║    1. Read the error message — it names the gate that's blocking.     ║")
+		fmt.Fprintln(os.Stderr, "║    2. NeedsReviewResolution → run `gt refinery pr dispatch-review-fix` ║")
+		fmt.Fprintln(os.Stderr, "║       to send the polecat back to address unresolved review threads.  ║")
+		fmt.Fprintln(os.Stderr, "║    3. NeedsApproval / NeedsCI → wait for the gate to clear, retry.    ║")
+		fmt.Fprintln(os.Stderr, "║    4. Persistent operational error → escalate to the mayor via         ║")
+		fmt.Fprintln(os.Stderr, "║       `gt mail send mayor/`. DO NOT bypass with gh pr merge.          ║")
+		fmt.Fprintln(os.Stderr, "║                                                                        ║")
+		fmt.Fprintln(os.Stderr, "║  See: docs/design/refinery-pr-workflow.md §G21, §G40                  ║")
+		fmt.Fprintln(os.Stderr, "╚════════════════════════════════════════════════════════════════════════╝")
 		fmt.Fprintln(os.Stderr, "")
 		return NewSilentExit(2) // Exit 2 = BLOCK in Claude Code hooks
 	}
 
-	// Check if we're in a Gas Town agent context
-	if isGasTownAgentContext() {
-		// Exception: the refinery running for a rig configured with
-		// merge_strategy=pr legitimately needs to call `gh pr create`
-		// as part of its normal workflow (PR.2 pr-create step). Polecats
-		// and other agents are still blocked. Direct `gh pr merge` was
-		// handled above — that's blocked for the refinery too.
+	// `gh pr create` (and `git checkout -b` / `git switch -c` for
+	// feature branches): the refinery on a PR-mode rig is the ONLY
+	// session permitted to create PRs. Other agents (polecats, crew,
+	// witness, deacon, mayor) are blocked. A refinery on a non-PR-mode
+	// rig is blocked because the rig hasn't opted in.
+	if isCreateOrBranch {
 		if refineryAllowedForPR() {
 			return nil
 		}
+		// Distinguish maintainer-origin from generic agent contexts so
+		// the rejection cites the actually-relevant remediation. The
+		// maintainer-origin path is the historical case (operator's
+		// own clone of steveyegge/gastown — push to main, don't PR
+		// against your own repo); other agent contexts get the
+		// refinery-routing message.
+		if isMaintainerOrigin() {
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════╗")
+			fmt.Fprintln(os.Stderr, "║  ❌ PR BLOCKED — MAINTAINER ORIGIN                               ║")
+			fmt.Fprintln(os.Stderr, "╠══════════════════════════════════════════════════════════════════╣")
+			fmt.Fprintln(os.Stderr, "║  Your origin is steveyegge/gastown — push directly to main.    ║")
+			fmt.Fprintln(os.Stderr, "║  PRs are for external contributors, not maintainers.            ║")
+			fmt.Fprintln(os.Stderr, "║                                                                  ║")
+			fmt.Fprintln(os.Stderr, "║  Use:    git push origin main                                   ║")
+			fmt.Fprintln(os.Stderr, "║  Block:  gh pr create / git checkout -b / git switch -c        ║")
+			fmt.Fprintln(os.Stderr, "╚══════════════════════════════════════════════════════════════════╝")
+			fmt.Fprintln(os.Stderr, "")
+			return NewSilentExit(2)
+		}
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════╗")
-		fmt.Fprintln(os.Stderr, "║  ❌ PR WORKFLOW BLOCKED                                          ║")
-		fmt.Fprintln(os.Stderr, "╠══════════════════════════════════════════════════════════════════╣")
-		fmt.Fprintln(os.Stderr, "║  Gas Town workers push directly to main. PRs are forbidden.     ║")
-		fmt.Fprintln(os.Stderr, "║                                                                  ║")
-		fmt.Fprintln(os.Stderr, "║  Instead of:  gh pr create / git checkout -b / git switch -c    ║")
-		fmt.Fprintln(os.Stderr, "║  Do this:     git add . && git commit && git push origin main   ║")
-		fmt.Fprintln(os.Stderr, "║                                                                  ║")
-		fmt.Fprintln(os.Stderr, "║  Why? PRs add friction that breaks autonomous execution.        ║")
-		fmt.Fprintln(os.Stderr, "║  See: ~/gt/docs/PRIMING.md (GUPP principle)                     ║")
-		fmt.Fprintln(os.Stderr, "║                                                                  ║")
-		fmt.Fprintln(os.Stderr, "║  Refineries: set merge_queue.merge_strategy=pr on the rig to    ║")
-		fmt.Fprintln(os.Stderr, "║  allow PR creation through the refinery PR workflow.            ║")
-		fmt.Fprintln(os.Stderr, "╚══════════════════════════════════════════════════════════════════╝")
+		fmt.Fprintln(os.Stderr, "╔════════════════════════════════════════════════════════════════════════╗")
+		fmt.Fprintln(os.Stderr, "║  ❌ PR WORKFLOW BLOCKED                                                 ║")
+		fmt.Fprintln(os.Stderr, "╠════════════════════════════════════════════════════════════════════════╣")
+		fmt.Fprintln(os.Stderr, "║  PR creation in Gas Town is the refinery's responsibility, and only   ║")
+		fmt.Fprintln(os.Stderr, "║  on a rig configured with merge_queue.merge_strategy=pr.               ║")
+		fmt.Fprintln(os.Stderr, "║                                                                        ║")
+		fmt.Fprintln(os.Stderr, "║  Use:    gt refinery pr create --branch <branch> --base <base> \\      ║")
+		fmt.Fprintln(os.Stderr, "║                                --title <title> --body-file <file>    ║")
+		fmt.Fprintln(os.Stderr, "║  Block:  gh pr create  /  git checkout -b  /  git switch -c           ║")
+		fmt.Fprintln(os.Stderr, "║                                                                        ║")
+		fmt.Fprintln(os.Stderr, "║  IF gt refinery pr create returns a usage / flag-parse error:          ║")
+		fmt.Fprintln(os.Stderr, "║    Run `gt refinery pr create --help` to see the correct flags.        ║")
+		fmt.Fprintln(os.Stderr, "║    A flag-parse error is NOT license to fall back to gh pr create.    ║")
+		fmt.Fprintln(os.Stderr, "║    The imperative subcommand IS the only allowed path; the bypass is  ║")
+		fmt.Fprintln(os.Stderr, "║    structurally blocked here.                                          ║")
+		fmt.Fprintln(os.Stderr, "║                                                                        ║")
+		fmt.Fprintln(os.Stderr, "║  IF the rig is in merge_strategy=direct mode (no refinery PR pipe):   ║")
+		fmt.Fprintln(os.Stderr, "║    Don't open a PR. Push directly to the base branch.                  ║")
+		fmt.Fprintln(os.Stderr, "║                                                                        ║")
+		fmt.Fprintln(os.Stderr, "║  IF you're a polecat / witness / deacon / mayor (not a refinery):     ║")
+		fmt.Fprintln(os.Stderr, "║    PR creation isn't your job. Polecats finish work via `gt done`,    ║")
+		fmt.Fprintln(os.Stderr, "║    which hands off to the refinery for the create + merge pipeline.   ║")
+		fmt.Fprintln(os.Stderr, "║                                                                        ║")
+		fmt.Fprintln(os.Stderr, "║  See: docs/design/refinery-pr-workflow.md (PR.2 step)                 ║")
+		fmt.Fprintln(os.Stderr, "╚════════════════════════════════════════════════════════════════════════╝")
 		fmt.Fprintln(os.Stderr, "")
-		return NewSilentExit(2) // Exit 2 = BLOCK in Claude Code hooks
+		return NewSilentExit(2)
 	}
 
-	// Check if origin is the maintainer's repo (steveyegge/gastown).
-	// The maintainer-origin block targets create/feature-branch commands
-	// (the philosophy: maintainers push directly to main rather than open
-	// PRs against their own repo). It does NOT cover `gh pr merge` — a
-	// maintainer who happens to land an incoming contributor PR with
-	// `gh pr merge` from a maintainer clone is exercising normal review
-	// workflow, not the `create-your-own-PR-to-your-own-repo` antipattern
-	// this block exists to stop. The earlier agent-context branch already
-	// blocked `gh pr merge` for Gas Town agents regardless of origin.
-	if isMerge {
-		return nil
-	}
-	if isMaintainerOrigin() {
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "╔══════════════════════════════════════════════════════════════════╗")
-		fmt.Fprintln(os.Stderr, "║  ❌ PR BLOCKED - MAINTAINER ORIGIN                               ║")
-		fmt.Fprintln(os.Stderr, "╠══════════════════════════════════════════════════════════════════╣")
-		fmt.Fprintln(os.Stderr, "║  Your origin is steveyegge/gastown - push directly to main.     ║")
-		fmt.Fprintln(os.Stderr, "║  PRs are for external contributors, not maintainers.            ║")
-		fmt.Fprintln(os.Stderr, "║                                                                  ║")
-		fmt.Fprintln(os.Stderr, "║  Instead of:  gh pr create                                      ║")
-		fmt.Fprintln(os.Stderr, "║  Do this:     git push origin main                              ║")
-		fmt.Fprintln(os.Stderr, "╚══════════════════════════════════════════════════════════════════╝")
-		fmt.Fprintln(os.Stderr, "")
-		return NewSilentExit(2) // Exit 2 = BLOCK in Claude Code hooks
-	}
-
-	// Not in Gas Town context and not maintainer origin - allow PRs
+	// Empty stdin (manual invocation from a terminal) AND no command
+	// was extracted — nothing to act on. Allow.
 	return nil
 }
 
-// isGasTownAgentContext returns true if we're running as a Gas Town managed agent.
+// isGasTownAgentContext returns true if we're running as a Gas Town
+// managed agent. Used by the bd-init, mol-patrol, and memory-write
+// guards (the pr-workflow guard does NOT call this — see runTapGuard
+// PRWorkflow for why "the hook firing IS the context").
+//
+// The check looks for env vars set by Gas Town session management.
+// Two generations of env-var conventions are accepted because the
+// launch path has evolved:
+//
+//   - Legacy role-specific vars (GT_POLECAT, GT_REFINERY, GT_WITNESS,
+//     GT_DEACON, GT_MAYOR, GT_CREW) — set by older session bootstraps
+//     and by tests. Not all of these are set in current production
+//     sessions, but they're checked first for backwards compatibility.
+//   - Generic role/rig vars (GT_ROLE, GT_RIG, GT_TOWN_ROOT) — set by
+//     the current session-launch path on every Gas Town agent
+//     session (refinery, witness, polecat, mayor, deacon, crew). At
+//     least one of these is always set in production.
+//
+// Drift between this check and the launch path was the root cause of
+// the PR #58 dogfood incident: GT_REFINERY was the only refinery
+// signal here, but production refinery sessions only have GT_ROLE
+// and GT_RIG set. The check returned false for a real refinery
+// session and the pr-workflow guard let `gh pr merge` through.
+//
+// CWD-based fallback: even with no env vars, a cwd under a /crew/
+// or /polecats/ subtree of the town root is sufficient evidence of
+// agent context.
 func isGasTownAgentContext() bool {
-	// Check environment variables set by Gas Town session management
 	envVars := []string{
+		// Legacy role-specific (kept for backwards compat / tests).
 		"GT_POLECAT",
 		"GT_CREW",
 		"GT_WITNESS",
 		"GT_REFINERY",
 		"GT_MAYOR",
 		"GT_DEACON",
+		// Production role/rig vars (always set on launch).
+		"GT_ROLE",
+		"GT_RIG",
+		"GT_TOWN_ROOT",
 	}
 	for _, env := range envVars {
 		if os.Getenv(env) != "" {
@@ -327,7 +386,7 @@ func isGasTownAgentContext() bool {
 		}
 	}
 
-	// Also check if we're in a crew or polecat worktree by path
+	// Also check if we're in a crew or polecat worktree by path.
 	cwd, err := os.Getwd()
 	if err != nil {
 		return false
@@ -345,15 +404,25 @@ func isGasTownAgentContext() bool {
 
 // refineryAllowedForPR returns true when the guard should permit PR-workflow
 // commands (gh pr create, etc.) because:
-//   - the caller is the refinery (GT_REFINERY is set), AND
+//   - the caller is the refinery, AND
 //   - the current rig's merge_queue config has merge_strategy=pr
 //
 // All other agents (polecats, crew, witness, deacon, mayor) remain blocked
 // even when the rig uses merge_strategy=pr — PR creation is a refinery-only
 // responsibility under the PR workflow. Fails closed on any lookup error,
 // which keeps polecats blocked when the env is degraded.
+//
+// The "is refinery?" check accepts two env-var shapes for backwards
+// compatibility with older session bootstraps:
+//   - GT_REFINERY=<rig>: legacy refinery indicator, set by older bootstraps
+//     and tests.
+//   - GT_ROLE=<rig>/refinery (or GT_ROLE=refinery): the current production
+//     shape. Used everywhere by `gt up` today — GT_REFINERY is no longer
+//     set on production refinery sessions, which was the PR #58 dogfood
+//     bug: this function returned false for real refinery sessions because
+//     it only knew the legacy shape.
 func refineryAllowedForPR() bool {
-	if os.Getenv("GT_REFINERY") == "" {
+	if !isRefineryRole() {
 		return false
 	}
 	townRoot, err := workspace.FindFromCwd()
@@ -405,6 +474,26 @@ func refineryAllowedForPR() bool {
 		return false
 	}
 	return settings.MergeQueue.MergeStrategy == config.MergeStrategyPR
+}
+
+// isRefineryRole returns true when env vars indicate this session is a
+// refinery. Accepts both the legacy shape (GT_REFINERY non-empty) and
+// the production shape (GT_ROLE ending in "refinery", e.g.
+// "gastown/refinery", or GT_ROLE == "refinery"). Production refinery
+// sessions set GT_ROLE but not GT_REFINERY; tests typically set
+// GT_REFINERY. Both must be honored.
+func isRefineryRole() bool {
+	if os.Getenv("GT_REFINERY") != "" {
+		return true
+	}
+	role := strings.TrimSpace(os.Getenv("GT_ROLE"))
+	if role == "" {
+		return false
+	}
+	// Accept "refinery" (ungrouped) or "<rig>/refinery" (the current
+	// gt-up shape). Use a slash boundary so a hypothetical role like
+	// "ex-refinery" doesn't match.
+	return role == "refinery" || strings.HasSuffix(role, "/refinery")
 }
 
 // isMaintainerOrigin returns true if the origin remote points to the maintainer's repo.
