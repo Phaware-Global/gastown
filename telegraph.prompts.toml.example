@@ -1,0 +1,70 @@
+# telegraph.prompts.toml.example
+#
+# Copy to ~/gt/settings/telegraph.prompts.toml (or inline into telegraph.toml
+# under [telegraph.prompts]) and restart Telegraph to activate.
+#
+# Keys are "<provider>:<event_type>" using Telegraph's internal vocabulary
+# (post-translation dot-separated names). The special key "default" applies
+# when no exact key matches.
+#
+# Variable tokens substituted from each event:
+#   {provider}       e.g. "jira"
+#   {event_type}     e.g. "comment.added"
+#   {event_id}       provider-native event ID
+#   {actor}          who triggered the event
+#   {subject}        primary entity, e.g. "PROJ-1234"
+#   {canonical_url}  link back to entity in provider UI
+#   {timestamp}      RFC3339 UTC, e.g. "2026-04-26T23:16:54Z"
+#   {labels}         comma-space-joined label list, e.g. "bug, critical"
+#
+# Unknown tokens are left as literal text.
+# Empty fields collapse to empty strings.
+#
+# prompt_cap (default 2048 bytes) is set in the main telegraph.toml:
+#   [telegraph]
+#   prompt_cap = 2048
+
+[telegraph.prompts]
+
+# default = """
+# A telegraph event from {provider} ({event_type}) on {subject} by {actor}.
+# URL: {canonical_url}
+# Read the external content and decide whether action is required.
+# """
+
+# "jira:issue.created" = """
+# A new Jira issue {subject} was created by {actor}.
+# URL: {canonical_url}
+# Labels: {labels}
+#
+# Review the issue summary in the external content. If it describes a
+# user-facing bug or regression, open a bead and dispatch a polecat.
+# If it's a task or question, acknowledge via addCommentToJiraIssue.
+# """
+
+# "jira:issue.updated" = """
+# Jira issue {subject} was updated by {actor} at {timestamp}.
+# URL: {canonical_url}
+#
+# Review the changelog in the external content. Status transitions to
+# "Done" or "Closed" may require downstream bead closure. Field changes
+# to "assignee" may require re-routing open beads.
+# """
+
+# "jira:comment.added" = """
+# A comment was added to {subject} by {actor}.
+# URL: {canonical_url}
+#
+# If the comment is a direct question or @-mention directed at the team,
+# respond inline via the addCommentToJiraIssue MCP tool. If it describes
+# a code change or action item, open a bead and dispatch a polecat.
+# If it's purely informational or conversational, no action is needed.
+# """
+
+# "jira:comment.updated" = """
+# A comment on {subject} was edited by {actor}.
+# URL: {canonical_url}
+#
+# Review the updated comment in the external content. If the edit changes
+# the meaning or adds a new request, treat it as a new comment.added event.
+# """
