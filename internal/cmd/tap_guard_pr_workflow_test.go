@@ -1,6 +1,180 @@
 package cmd
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
+
+// TestIsRefineryRole_AcceptsBothEnvShapes pins the refinery-role
+// detection across the two env-var conventions the launch path has
+// used over time. The PR #58 dogfood incident reproduced when this
+// check only knew GT_REFINERY (legacy/test shape) but production
+// refinery sessions set GT_ROLE=<rig>/refinery instead. Both shapes
+// must be detected as "refinery role".
+func TestIsRefineryRole_AcceptsBothEnvShapes(t *testing.T) {
+	cases := []struct {
+		name     string
+		env      map[string]string
+		expected bool
+	}{
+		{"legacy GT_REFINERY only", map[string]string{"GT_REFINERY": "gastown"}, true},
+		{"production GT_ROLE=<rig>/refinery", map[string]string{"GT_ROLE": "gastown/refinery"}, true},
+		{"production GT_ROLE=refinery (ungrouped)", map[string]string{"GT_ROLE": "refinery"}, true},
+		{"both set (real production overlap)", map[string]string{
+			"GT_REFINERY": "gastown",
+			"GT_ROLE":     "gastown/refinery",
+		}, true},
+		{"GT_ROLE for a different role", map[string]string{"GT_ROLE": "gastown/witness"}, false},
+		{"GT_ROLE for polecat", map[string]string{"GT_ROLE": "gastown/polecats/furiosa"}, false},
+		{"empty environment", map[string]string{}, false},
+		// Sanity: a hypothetical "ex-refinery" role must NOT match the
+		// HasSuffix check via the slash boundary.
+		{"GT_ROLE with refinery as substring (no slash)", map[string]string{"GT_ROLE": "ex-refinery"}, false},
+		// Nested paths must NOT match — a polecat that happens to be
+		// named "refinery" should not get refinery-only allowances.
+		{"GT_ROLE polecat path ending in refinery", map[string]string{"GT_ROLE": "gastown/polecats/refinery"}, false},
+		{"GT_ROLE deeper nesting", map[string]string{"GT_ROLE": "town/rig/role/refinery"}, false},
+		// Edge: leading-slash forms must not match.
+		{"GT_ROLE with leading slash", map[string]string{"GT_ROLE": "/refinery"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Clear all relevant vars first so leftover env from the
+			// shell doesn't pollute the test.
+			t.Setenv("GT_REFINERY", "")
+			t.Setenv("GT_ROLE", "")
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			got := isRefineryRole()
+			if got != tc.expected {
+				t.Errorf("isRefineryRole() with env %v = %v, want %v", tc.env, got, tc.expected)
+			}
+		})
+	}
+}
+
+// TestIsGasTownAgentContext_ProductionEnvVars covers the specific bug
+// that motivated the broader hook-is-context refactor: production
+// sessions set GT_ROLE / GT_RIG / GT_TOWN_ROOT but not the legacy
+// GT_REFINERY / GT_POLECAT / etc. The detection must cover both
+// generations.
+func TestIsGasTownAgentContext_ProductionEnvVars(t *testing.T) {
+	productionVars := []string{"GT_ROLE", "GT_RIG", "GT_TOWN_ROOT"}
+	for _, v := range productionVars {
+		t.Run(v, func(t *testing.T) {
+			// Clear the legacy vars so we're testing the production
+			// var alone.
+			for _, legacy := range []string{"GT_POLECAT", "GT_CREW", "GT_WITNESS",
+				"GT_REFINERY", "GT_MAYOR", "GT_DEACON", "GT_ROLE", "GT_RIG", "GT_TOWN_ROOT"} {
+				t.Setenv(legacy, "")
+			}
+			t.Setenv(v, "test-value")
+			if !isGasTownAgentContext() {
+				t.Errorf("isGasTownAgentContext() with %s set = false, want true (production env shape must be detected)", v)
+			}
+		})
+	}
+}
+
+// TestIsGasTownAgentContext_LegacyEnvVars asserts the legacy env
+// vars are still recognized — backwards compatibility for older
+// session bootstraps and existing test fixtures that set GT_REFINERY
+// or GT_POLECAT directly.
+func TestIsGasTownAgentContext_LegacyEnvVars(t *testing.T) {
+	legacyVars := []string{"GT_POLECAT", "GT_CREW", "GT_WITNESS",
+		"GT_REFINERY", "GT_MAYOR", "GT_DEACON"}
+	for _, v := range legacyVars {
+		t.Run(v, func(t *testing.T) {
+			for _, key := range append(legacyVars, "GT_ROLE", "GT_RIG", "GT_TOWN_ROOT") {
+				t.Setenv(key, "")
+			}
+			t.Setenv(v, "test-value")
+			if !isGasTownAgentContext() {
+				t.Errorf("isGasTownAgentContext() with %s set = false, want true", v)
+			}
+		})
+	}
+}
+
+// TestIsGasTownAgentContext_PathFallback_RequiresTownRoot covers the
+// scoped CWD-fallback path. Pre-fix the check used a bare
+// strings.Contains(cwd, "/crew/"), which would false-positive on any
+// operator path like /Users/anyone/crew/foo. Post-fix the path-based
+// check requires the cwd to be under a resolvable town root, so an
+// arbitrary operator path with `/crew/` as a substring no longer
+// matches. We can't synthesize a town root from a unit test (it
+// requires gastown's workspace layout to exist), so this test
+// focuses on the negative case: a path that contains the magic
+// segment but is NOT under a town root must NOT be flagged.
+func TestIsGasTownAgentContext_PathFallback_RequiresTownRoot(t *testing.T) {
+	for _, key := range []string{"GT_POLECAT", "GT_CREW", "GT_WITNESS",
+		"GT_REFINERY", "GT_MAYOR", "GT_DEACON", "GT_ROLE", "GT_RIG", "GT_TOWN_ROOT"} {
+		t.Setenv(key, "")
+	}
+	// Save and restore cwd so this test doesn't leak (same pattern
+	// as TestIsGasTownAgentContext_NoEnv).
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(origCwd); err != nil {
+			t.Errorf("restore cwd to %s: %v", origCwd, err)
+		}
+	})
+	// Build a path that contains "/crew/" as a substring but is NOT
+	// under a town root (the temp dir hierarchy has no rigs.json or
+	// settings/config.json). The pre-fix code would have flagged this
+	// as agent context; the post-fix code must not.
+	tmp := t.TempDir()
+	fakeAgentLikePath := tmp + "/some/crew/path"
+	if err := os.MkdirAll(fakeAgentLikePath, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", fakeAgentLikePath, err)
+	}
+	if err := os.Chdir(fakeAgentLikePath); err != nil {
+		t.Fatalf("chdir to %s: %v", fakeAgentLikePath, err)
+	}
+	if isGasTownAgentContext() {
+		t.Errorf("isGasTownAgentContext() returned true for an operator path that contains /crew/ as a substring but is not under a town root — pre-fix false-positive regressed")
+	}
+}
+
+// TestIsGasTownAgentContext_NoEnv asserts the function returns false
+// when nothing in the env signals an agent context AND we're not in
+// an agent worktree. This is the path a human operator running gh
+// from a personal shell takes — the hook isn't installed there
+// either, so this test mostly guards against the env-detection
+// becoming over-eager and false-positiving on operator shells that
+// happen to have an unrelated GT_* var set in the future.
+func TestIsGasTownAgentContext_NoEnv(t *testing.T) {
+	for _, key := range []string{"GT_POLECAT", "GT_CREW", "GT_WITNESS",
+		"GT_REFINERY", "GT_MAYOR", "GT_DEACON", "GT_ROLE", "GT_RIG", "GT_TOWN_ROOT"} {
+		t.Setenv(key, "")
+	}
+	// CWD is the test's tmp dir, which is not under /crew/ or /polecats/
+	// — the path-based fallback should also return false. Save the
+	// original cwd and restore it via t.Cleanup so this test doesn't
+	// leak the temp-dir cwd into sibling tests in the same package
+	// (which would be flaky/order-dependent — t.TempDir cleans up the
+	// directory but not the process cwd).
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(origCwd); err != nil {
+			t.Errorf("restore cwd to %s: %v", origCwd, err)
+		}
+	})
+	tmp := t.TempDir()
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("chdir to tmp: %v", err)
+	}
+	if isGasTownAgentContext() {
+		t.Error("isGasTownAgentContext() with no env vars and a clean cwd returned true")
+	}
+}
 
 // TestIsPRWorkflowCommand pins the command classifier used by the
 // pr-workflow guard. The guard's matcher in the hook template is now
