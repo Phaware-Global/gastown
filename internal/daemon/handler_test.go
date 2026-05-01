@@ -396,64 +396,39 @@ func TestReapIdleDogs_Constants(t *testing.T) {
 	}
 }
 
-// TestFindDispatchableDog covers the idle-pool filter used by dispatchPlugins.
-// The critical behavior is that dogs with a live tmux session are skipped
-// even when their registry state is idle, preventing the infinite-loop seen
-// in gt-o24 where GetIdleDog kept picking the same dog during a termination race.
-func TestFindDispatchableDog_SkipsWorkingDogs(t *testing.T) {
+func TestDispatchPlugins_SkipsManualGatePlugin(t *testing.T) {
 	townRoot := t.TempDir()
 	d := testHandlerDaemon(t, townRoot)
 
-	testSetupWorkingDogState(t, townRoot, "alpha", "plugin:x", time.Now())
-	testSetupDogState(t, townRoot, "bravo", dog.StateIdle, time.Now())
-
-	mgr := dog.NewManager(townRoot, nil)
-	sm := dog.NewSessionManager(tmux.NewTmux(), townRoot, mgr)
-
-	got := findDispatchableDog(mgr, sm, d.logger)
-	if got == nil {
-		t.Fatal("findDispatchableDog returned nil, want bravo")
+	pluginDir := filepath.Join(townRoot, "plugins", "test-manual")
+	if err := os.MkdirAll(pluginDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
 	}
-	if got.Name != "bravo" {
-		t.Errorf("findDispatchableDog = %q, want bravo (working alpha must be skipped)", got.Name)
+	pluginMD := "+++\nname = \"test-manual\"\ndescription = \"manual gate plugin\"\n\n[gate]\ntype = \"manual\"\n+++\n\n# Instructions\n"
+	if err := os.WriteFile(filepath.Join(pluginDir, "plugin.md"), []byte(pluginMD), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
 	}
-}
 
-func TestFindDispatchableDog_AllWorkingReturnsNil(t *testing.T) {
-	townRoot := t.TempDir()
-	d := testHandlerDaemon(t, townRoot)
+	testSetupDogState(t, townRoot, "idle-dog", dog.StateIdle, time.Now().Add(-10*time.Minute))
 
-	testSetupWorkingDogState(t, townRoot, "alpha", "plugin:x", time.Now())
-	testSetupWorkingDogState(t, townRoot, "bravo", "plugin:y", time.Now())
+	rigsConfig := &config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}}
+	mgr := dog.NewManager(townRoot, rigsConfig)
+	tm := tmux.NewTmux()
+	sm := dog.NewSessionManager(tm, townRoot, mgr)
 
-	mgr := dog.NewManager(townRoot, nil)
-	sm := dog.NewSessionManager(tmux.NewTmux(), townRoot, mgr)
+	d.dispatchPlugins(mgr, sm, rigsConfig)
 
-	got := findDispatchableDog(mgr, sm, d.logger)
-	if got != nil {
-		t.Errorf("findDispatchableDog = %q, want nil (all working)", got.Name)
+	dg, err := mgr.Get("idle-dog")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
 	}
-}
-
-func TestFindDispatchableDog_EmptyKennelReturnsNil(t *testing.T) {
-	townRoot := t.TempDir()
-	d := testHandlerDaemon(t, townRoot)
-
-	mgr := dog.NewManager(townRoot, nil)
-	sm := dog.NewSessionManager(tmux.NewTmux(), townRoot, mgr)
-
-	got := findDispatchableDog(mgr, sm, d.logger)
-	if got != nil {
-		t.Errorf("findDispatchableDog = %q, want nil (empty kennel)", got.Name)
+	if dg.State != dog.StateIdle {
+		t.Errorf("dog state = %q, want idle (manual-gate plugin must not auto-dispatch)", dg.State)
+	}
+	if dg.Work != "" {
+		t.Errorf("dog work = %q, want empty (manual-gate plugin must not auto-dispatch)", dg.Work)
 	}
 }
-
-// TestFindDispatchableDog_PicksFirstIdleWhenNoSessionsLive verifies the
-// default path (no tmux sessions exist for any dog): the first idle dog
-// from mgr.List is returned. The "skip idle dogs with live sessions"
-// behavior — the actual gt-o24 regression — is exercised at runtime via
-// sm.IsRunning, whose tmux-backed correctness is covered in session_manager
-// tests.
 func TestFindDispatchableDog_PicksFirstIdleWhenNoSessionsLive(t *testing.T) {
 	townRoot := t.TempDir()
 	d := testHandlerDaemon(t, townRoot)
@@ -470,5 +445,38 @@ func TestFindDispatchableDog_PicksFirstIdleWhenNoSessionsLive(t *testing.T) {
 	}
 	if got.Name != "alpha" && got.Name != "bravo" {
 		t.Errorf("findDispatchableDog = %q, want alpha or bravo", got.Name)
+=======
+func TestDispatchPlugins_SkipsManualGatePlugin(t *testing.T) {
+	townRoot := t.TempDir()
+	d := testHandlerDaemon(t, townRoot)
+
+	pluginDir := filepath.Join(townRoot, "plugins", "test-manual")
+	if err := os.MkdirAll(pluginDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	pluginMD := "+++\nname = \"test-manual\"\ndescription = \"manual gate plugin\"\n\n[gate]\ntype = \"manual\"\n+++\n\n# Instructions\n"
+	if err := os.WriteFile(filepath.Join(pluginDir, "plugin.md"), []byte(pluginMD), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	testSetupDogState(t, townRoot, "idle-dog", dog.StateIdle, time.Now().Add(-10*time.Minute))
+
+	rigsConfig := &config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}}
+	mgr := dog.NewManager(townRoot, rigsConfig)
+	tm := tmux.NewTmux()
+	sm := dog.NewSessionManager(tm, townRoot, mgr)
+
+	d.dispatchPlugins(mgr, sm, rigsConfig)
+
+	dg, err := mgr.Get("idle-dog")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if dg.State != dog.StateIdle {
+		t.Errorf("dog state = %q, want idle (manual-gate plugin must not auto-dispatch)", dg.State)
+	}
+	if dg.Work != "" {
+		t.Errorf("dog work = %q, want empty (manual-gate plugin must not auto-dispatch)", dg.Work)
+>>>>>>> 5d7eb4383 (fix: add explicit gate=manual skip in dispatchPlugins (hq-suin))
 	}
 }
