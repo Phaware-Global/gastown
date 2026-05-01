@@ -349,17 +349,28 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// Check if session already exists.
 	// If an existing session's pane process has died, kill the stale session
 	// and proceed rather than returning ErrSessionRunning (gt-jn40ft).
+	//
+	// For zombie detection, use IsAgentAlive directly rather than the
+	// heartbeat-primary isSessionStale path. The pane process is often a
+	// shell or wrapper that outlives the agent, so heartbeat-fresh + pane-PID
+	// alive can hide a dead agent — wedging gt session restart with
+	// ErrSessionRunning on the very zombie state recovery is meant to handle
+	// (hq-k1ot / np-tt5s). A false-negative here is recoverable: Start is
+	// about to (re)create the session, so killing a transiently-misclassified
+	// healthy session just churns one creation cycle. Patrol-side cleanup
+	// (manager.go:cleanupOrphanedDirs) intentionally keeps the conservative
+	// isSessionProcessDead path to avoid killing healthy sessions during
+	// transient pgrep/ps failures.
 	running, err := m.tmux.HasSession(sessionID)
 	if err != nil {
 		return fmt.Errorf("checking session: %w", err)
 	}
 	if running {
-		if m.isSessionStale(sessionID) {
-			if err := m.tmux.KillSessionWithProcesses(sessionID); err != nil {
-				return fmt.Errorf("killing stale session %s: %w", sessionID, err)
-			}
-		} else {
+		if m.tmux.IsAgentAlive(sessionID) {
 			return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
+		}
+		if err := m.tmux.KillSessionWithProcesses(sessionID); err != nil {
+			return fmt.Errorf("killing stale session %s: %w", sessionID, err)
 		}
 	}
 
