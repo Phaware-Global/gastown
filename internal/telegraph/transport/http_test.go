@@ -26,7 +26,7 @@ func (f *fakeTranslator) Provider() string { return f.provider }
 func (f *fakeTranslator) Authenticate(_ map[string]string, _ []byte) error {
 	return f.authErr
 }
-func (f *fakeTranslator) Translate(body []byte) (*telegraph.NormalizedEvent, error) {
+func (f *fakeTranslator) Translate(_ map[string]string, body []byte) (*telegraph.NormalizedEvent, error) {
 	if f.translateFn != nil {
 		return f.translateFn(body)
 	}

@@ -67,10 +67,12 @@ func (t *Translator) Authenticate(headers map[string]string, body []byte) error 
 }
 
 // Translate converts a Jira webhook body into a NormalizedEvent.
+// The headers parameter is unused — Jira encodes the event type in the JSON
+// body's webhookEvent field, not in an HTTP header.
 // Returns ErrUnknownEventType for unrecognised webhookEvent values.
 // Returns (non-nil event, ErrActorFiltered) when the event's actor matches
 // the ignore_actors list; the caller must log a drop and not enqueue to L3.
-func (t *Translator) Translate(body []byte) (*telegraph.NormalizedEvent, error) {
+func (t *Translator) Translate(_ map[string]string, body []byte) (*telegraph.NormalizedEvent, error) {
 	var p payload
 	if err := json.Unmarshal(body, &p); err != nil {
 		return nil, fmt.Errorf("jira: parsing webhook payload: %w", err)

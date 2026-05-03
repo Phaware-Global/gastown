@@ -138,7 +138,7 @@ func TestTranslate_IssueCreated(t *testing.T) {
 		User:         baseUser("alice"),
 		Issue:        baseIssue("PROJ-1"),
 	})
-	evt, err := tr.Translate(body)
+	evt, err := tr.Translate(nil, body)
 	if err != nil {
 		t.Fatalf("Translate() error = %v", err)
 	}
@@ -170,7 +170,7 @@ func TestTranslate_IssueCreated_MissingIssue(t *testing.T) {
 	t.Parallel()
 	tr := newTranslator()
 	body := mustMarshal(t, map[string]any{"webhookEvent": "jira:issue_created"})
-	_, err := tr.Translate(body)
+	_, err := tr.Translate(nil, body)
 	if err == nil {
 		t.Fatal("expected error for missing issue field")
 	}
@@ -193,7 +193,7 @@ func TestTranslate_IssueUpdated(t *testing.T) {
 			},
 		},
 	})
-	evt, err := tr.Translate(body)
+	evt, err := tr.Translate(nil, body)
 	if err != nil {
 		t.Fatalf("Translate() error = %v", err)
 	}
@@ -217,7 +217,7 @@ func TestTranslate_IssueUpdated_EmptyChangelog(t *testing.T) {
 		User:         baseUser("bob"),
 		Issue:        baseIssue("PROJ-3"),
 	})
-	evt, err := tr.Translate(body)
+	evt, err := tr.Translate(nil, body)
 	if err != nil {
 		t.Fatalf("Translate() error = %v", err)
 	}
@@ -246,7 +246,7 @@ func TestTranslate_CommentAdded(t *testing.T) {
 			"updated": "2024-04-19T16:00:00.000+0000",
 		},
 	})
-	evt, err := tr.Translate(body)
+	evt, err := tr.Translate(nil, body)
 	if err != nil {
 		t.Fatalf("Translate() error = %v", err)
 	}
@@ -283,7 +283,7 @@ func TestTranslate_CommentCreated_BareForm(t *testing.T) {
 			"updated": "2024-04-19T16:00:00.000+0000",
 		},
 	})
-	evt, err := tr.Translate(body)
+	evt, err := tr.Translate(nil, body)
 	if err != nil {
 		t.Fatalf("Translate() error = %v", err)
 	}
@@ -305,7 +305,7 @@ func TestTranslate_CommentAdded_MissingComment(t *testing.T) {
 		"webhookEvent": "jira:comment_added",
 		"issue":        baseIssue("PROJ-5"),
 	})
-	_, err := tr.Translate(body)
+	_, err := tr.Translate(nil, body)
 	if err == nil {
 		t.Fatal("expected error for missing comment field")
 	}
@@ -329,7 +329,7 @@ func TestTranslate_CommentUpdated(t *testing.T) {
 			"updated":      "2024-04-19T16:00:00.000+0000",
 		},
 	})
-	evt, err := tr.Translate(body)
+	evt, err := tr.Translate(nil, body)
 	if err != nil {
 		t.Fatalf("Translate() error = %v", err)
 	}
@@ -362,7 +362,7 @@ func TestTranslate_CommentUpdated_BareForm(t *testing.T) {
 			"updated":      "2024-04-19T16:30:00.000+0000",
 		},
 	})
-	evt, err := tr.Translate(body)
+	evt, err := tr.Translate(nil, body)
 	if err != nil {
 		t.Fatalf("Translate() error = %v", err)
 	}
@@ -383,7 +383,7 @@ func TestTranslate_UnknownEventType(t *testing.T) {
 		"webhookEvent": "jira:sprint_started",
 		"issue":        baseIssue("PROJ-7"),
 	})
-	_, err := tr.Translate(body)
+	_, err := tr.Translate(nil, body)
 	if !errors.Is(err, telegraph.ErrUnknownEventType) {
 		t.Errorf("Translate() error = %v, want ErrUnknownEventType", err)
 	}
@@ -394,7 +394,7 @@ func TestTranslate_UnknownEventType(t *testing.T) {
 func TestTranslate_InvalidJSON(t *testing.T) {
 	t.Parallel()
 	tr := newTranslator()
-	_, err := tr.Translate([]byte(`not json`))
+	_, err := tr.Translate(nil, []byte(`not json`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
@@ -414,7 +414,7 @@ func TestTranslate_CanonicalURL_IsBrowseURL(t *testing.T) {
 		User:         baseUser("alice"),
 		Issue:        baseIssue("PROJ-1"),
 	})
-	evt, err := tr.Translate(body)
+	evt, err := tr.Translate(nil, body)
 	if err != nil {
 		t.Fatalf("Translate() error = %v", err)
 	}
@@ -438,7 +438,7 @@ func TestTranslate_CanonicalURL_NoRestPath(t *testing.T) {
 		User:         baseUser("alice"),
 		Issue:        issue,
 	})
-	evt, err := tr.Translate(body)
+	evt, err := tr.Translate(nil, body)
 	if err != nil {
 		t.Fatalf("Translate() error = %v", err)
 	}
@@ -464,7 +464,7 @@ func TestTranslate_IssueUpdated_FallbackToSummary(t *testing.T) {
 			},
 		},
 	})
-	evt, err := tr.Translate(body)
+	evt, err := tr.Translate(nil, body)
 	if err != nil {
 		t.Fatalf("Translate() error = %v", err)
 	}
@@ -489,7 +489,7 @@ func TestTranslate_IssueUpdated_SummaryInChangelog(t *testing.T) {
 			},
 		},
 	})
-	evt, err := tr.Translate(body)
+	evt, err := tr.Translate(nil, body)
 	if err != nil {
 		t.Fatalf("Translate() error = %v", err)
 	}
@@ -519,7 +519,7 @@ func TestTranslate_IssueCreated_NoLabels(t *testing.T) {
 		User:         baseUser("frank"),
 		Issue:        issue,
 	})
-	evt, err := tr.Translate(body)
+	evt, err := tr.Translate(nil, body)
 	if err != nil {
 		t.Fatalf("Translate() error = %v", err)
 	}
@@ -554,7 +554,7 @@ func TestActorFilter_EmptyIgnoreActors_NoFilter(t *testing.T) {
 			"author":  map[string]string{"name": "Artie"},
 		},
 	})
-	evt, err := tr.Translate(body)
+	evt, err := tr.Translate(nil, body)
 	if err != nil {
 		t.Fatalf("Translate() error = %v, want nil (no filter configured)", err)
 	}
@@ -577,7 +577,7 @@ func TestActorFilter_NonMatchingActor_NoFilter(t *testing.T) {
 			"author":  map[string]string{"name": "alice"},
 		},
 	})
-	evt, err := tr.Translate(body)
+	evt, err := tr.Translate(nil, body)
 	if err != nil {
 		t.Fatalf("Translate() error = %v, want nil (actor not in filter list)", err)
 	}
@@ -600,7 +600,7 @@ func TestActorFilter_MatchingActor_CommentAdded(t *testing.T) {
 			"author":  map[string]string{"name": "Artie"},
 		},
 	})
-	evt, err := tr.Translate(body)
+	evt, err := tr.Translate(nil, body)
 	if !errors.Is(err, telegraph.ErrActorFiltered) {
 		t.Fatalf("Translate() error = %v, want ErrActorFiltered", err)
 	}
@@ -627,7 +627,7 @@ func TestActorFilter_MatchingActor_IssueUpdated(t *testing.T) {
 			},
 		},
 	})
-	evt, err := tr.Translate(body)
+	evt, err := tr.Translate(nil, body)
 	if !errors.Is(err, telegraph.ErrActorFiltered) {
 		t.Fatalf("Translate() error = %v, want ErrActorFiltered for issue.updated", err)
 	}
@@ -651,7 +651,7 @@ func TestActorFilter_CaseSensitive_MixedCaseNoMatch(t *testing.T) {
 			"author":  map[string]string{"name": "Artie"},
 		},
 	})
-	evt, err := tr.Translate(body)
+	evt, err := tr.Translate(nil, body)
 	if err != nil {
 		t.Fatalf("Translate() error = %v, want nil (case mismatch should not filter)", err)
 	}

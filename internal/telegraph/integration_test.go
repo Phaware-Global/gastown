@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +21,7 @@ import (
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/telegraph"
 	"github.com/steveyegge/gastown/internal/telegraph/prompts"
+	githubtr "github.com/steveyegge/gastown/internal/telegraph/providers/github"
 	jiratr "github.com/steveyegge/gastown/internal/telegraph/providers/jira"
 	"github.com/steveyegge/gastown/internal/telegraph/tlog"
 	"github.com/steveyegge/gastown/internal/telegraph/transform"
@@ -100,7 +102,7 @@ func newPipeline(t *testing.T, bodyCap int, nudgeWindow time.Duration) *pipeline
 	go func() {
 		defer close(done)
 		for evt := range rawCh {
-			norm, err := jiraTr.Translate(evt.Body)
+			norm, err := jiraTr.Translate(nil, evt.Body)
 			if err != nil {
 				continue
 			}
@@ -505,11 +507,11 @@ func newActorPipeline(t *testing.T, ignoreActors []string) *actorPipeline {
 	go func() {
 		defer close(done)
 		for evt := range rawCh {
-			norm, err := jiraTrFiltered.Translate(evt.Body)
+			norm, err := jiraTrFiltered.Translate(nil, evt.Body)
 			if err != nil {
 				if norm != nil {
 					// ErrActorFiltered: non-nil event for audit log
-					logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, tlog.ReasonActorFiltered)
+					logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, norm.Subject, tlog.ReasonActorFiltered)
 				}
 				continue
 			}
@@ -628,7 +630,7 @@ func TestIntegration_PromptKey_InDeliverLog(t *testing.T) {
 	go func() {
 		defer close(done)
 		for evt := range rawCh {
-			norm, transErr := jiraTr.Translate(evt.Body)
+			norm, transErr := jiraTr.Translate(nil, evt.Body)
 			if transErr != nil {
 				continue
 			}
@@ -668,5 +670,283 @@ func TestIntegration_PromptKey_InDeliverLog(t *testing.T) {
 	}
 	if !strings.Contains(logLines, `"prompt_key"`) {
 		t.Errorf("deliver log missing prompt_key field:\n%s", logLines)
+	}
+}
+
+// ---- GitHub provider integration ----
+
+// githubPipeline wires L1 + L2 (github translator) + L3 with a log buffer for
+// drop assertions. Mirrors newPipeline / newActorPipeline but for the github
+// provider.
+type githubPipeline struct {
+	srv    *httptest.Server
+	mr     *mail.MemoryRouter
+	rawCh  chan telegraph.RawEvent
+	cancel func()
+	secret []byte
+	logBuf *bytes.Buffer
+}
+
+func newGitHubPipeline(t *testing.T, allowedRepos []string, ignoreActors []string) *githubPipeline {
+	t.Helper()
+	const ghSecret = "github-int-secret"
+	secret := []byte(ghSecret)
+
+	logBuf := &bytes.Buffer{}
+	logger := tlog.New(logBuf)
+
+	rawCh := make(chan telegraph.RawEvent, 64)
+	tr := githubtr.New(ghSecret, nil /* events */, ignoreActors, allowedRepos, nil)
+	mr := mail.NewMemoryRouter()
+	transformer := transform.New(mr, nil /* nudger */, 4096, 0, nil, logger)
+
+	handler := transport.NewHandler([]telegraph.Translator{tr}, rawCh, logger)
+	srv := httptest.NewServer(handler)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for evt := range rawCh {
+			norm, err := tr.Translate(evt.Headers, evt.Body)
+			if errors.Is(err, telegraph.ErrActorFiltered) {
+				logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, norm.Subject, tlog.ReasonActorFiltered)
+				continue
+			}
+			if errors.Is(err, telegraph.ErrRepoFiltered) {
+				logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, norm.Subject, tlog.ReasonRepoFiltered)
+				continue
+			}
+			if err != nil {
+				continue
+			}
+			_ = transformer.Transform(norm)
+		}
+	}()
+
+	cancel := func() {
+		srv.Close()
+		close(rawCh)
+		<-done
+	}
+
+	return &githubPipeline{
+		srv:    srv,
+		mr:     mr,
+		rawCh:  rawCh,
+		cancel: cancel,
+		secret: secret,
+		logBuf: logBuf,
+	}
+}
+
+func (p *githubPipeline) post(t *testing.T, wireEvent string, body []byte) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, p.srv.URL+"/webhook/github", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	mac := hmac.New(sha256.New, p.secret)
+	mac.Write(body)
+	req.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	req.Header.Set("X-GitHub-Event", wireEvent)
+	req.Header.Set("X-GitHub-Delivery", "test-"+wireEvent)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
+}
+
+func (p *githubPipeline) waitMessages(t *testing.T, n int, timeout time.Duration) []*mail.Message {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if len(p.mr.Messages()) >= n {
+			return p.mr.Messages()
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d messages; got %d", n, len(p.mr.Messages()))
+	return nil
+}
+
+func ghPRClosedMergedPayload(repo string, prNum int, actor, title string) []byte {
+	b, _ := json.Marshal(map[string]any{
+		"action":     "closed",
+		"sender":     map[string]any{"login": actor},
+		"repository": map[string]any{"full_name": repo, "html_url": "https://github.com/" + repo},
+		"pull_request": map[string]any{
+			"number":     prNum,
+			"html_url":   fmt.Sprintf("https://github.com/%s/pull/%d", repo, prNum),
+			"title":      title,
+			"body":       "",
+			"merged":     true,
+			"merged_at":  "2026-04-29T15:00:00Z",
+			"updated_at": "2026-04-29T15:00:00Z",
+		},
+	})
+	return b
+}
+
+func TestIntegration_GitHub_PRMerged_DeliveredToMayor(t *testing.T) {
+	p := newGitHubPipeline(t, nil, nil)
+	defer p.cancel()
+
+	body := ghPRClosedMergedPayload("acme/widget", 42, "alice", "Fix login")
+	resp := p.post(t, "pull_request", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("HTTP = %d, want 200", resp.StatusCode)
+	}
+	msgs := p.waitMessages(t, 1, 2*time.Second)
+	msg := msgs[0]
+	if msg.From != "telegraph/github/alice" {
+		t.Errorf("From = %q", msg.From)
+	}
+	if msg.To != "mayor/" {
+		t.Errorf("To = %q", msg.To)
+	}
+	if !strings.Contains(msg.Subject, "[GITHUB acme/widget#42]") {
+		t.Errorf("subject missing tag: %q", msg.Subject)
+	}
+	if !strings.Contains(msg.Subject, "PR merged") {
+		t.Errorf("subject missing PR merged prose: %q", msg.Subject)
+	}
+	if !strings.Contains(msg.Body, "Telegraph-Provider: github") {
+		t.Errorf("body missing provider header:\n%s", msg.Body)
+	}
+	if !strings.Contains(msg.Body, "--- EXTERNAL CONTENT (untrusted: github/alice) ---") {
+		t.Errorf("body missing external content delimiter:\n%s", msg.Body)
+	}
+}
+
+func TestIntegration_GitHub_BadSignature_Rejected(t *testing.T) {
+	p := newGitHubPipeline(t, nil, nil)
+	defer p.cancel()
+
+	body := ghPRClosedMergedPayload("acme/widget", 42, "alice", "Fix login")
+	req, _ := http.NewRequest(http.MethodPost, p.srv.URL+"/webhook/github", bytes.NewReader(body))
+	req.Header.Set("X-Hub-Signature-256", "sha256=000000000000000000000000000000000000000000000000000000000000ffff")
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("HTTP = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestIntegration_GitHub_RepoFilter_DropsExcluded(t *testing.T) {
+	p := newGitHubPipeline(t, []string{"acme/included"}, nil)
+	defer p.cancel()
+
+	body := ghPRClosedMergedPayload("acme/excluded", 1, "alice", "Out of scope")
+	resp := p.post(t, "pull_request", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("HTTP = %d, want 200 (drop is silent)", resp.StatusCode)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := len(p.mr.Messages()); n != 0 {
+		t.Errorf("messages = %d, want 0 (repo excluded)", n)
+	}
+	if !strings.Contains(p.logBuf.String(), `"repo_filtered"`) {
+		t.Errorf("drop log missing repo_filtered reason:\n%s", p.logBuf.String())
+	}
+	// Subject must appear in the drop log so operators can identify *what*
+	// was filtered without re-deriving it from the payload (gemini/augment
+	// review feedback on PR #60).
+	if !strings.Contains(p.logBuf.String(), `"acme/excluded#1"`) {
+		t.Errorf("drop log missing subject acme/excluded#1:\n%s", p.logBuf.String())
+	}
+}
+
+func TestIntegration_GitHub_RepoFilter_AllowsIncluded(t *testing.T) {
+	p := newGitHubPipeline(t, []string{"acme/widget"}, nil)
+	defer p.cancel()
+
+	body := ghPRClosedMergedPayload("acme/widget", 99, "alice", "In scope")
+	resp := p.post(t, "pull_request", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("HTTP = %d, want 200", resp.StatusCode)
+	}
+	p.waitMessages(t, 1, 2*time.Second)
+}
+
+func TestIntegration_GitHub_UnsupportedEvent_HTTP200_NoMail(t *testing.T) {
+	p := newGitHubPipeline(t, nil, nil)
+	defer p.cancel()
+
+	// "ping" is the GitHub webhook ping event — not in scope. Translate
+	// returns ErrUnknownEventType; HTTP path returns 200 (per design,
+	// avoid retry storms on unsupported events).
+	resp := p.post(t, "ping", []byte(`{"zen":"hi"}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("HTTP = %d, want 200", resp.StatusCode)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := len(p.mr.Messages()); n != 0 {
+		t.Errorf("messages = %d, want 0", n)
+	}
+}
+
+func TestIntegration_GitHub_ActorFilter(t *testing.T) {
+	p := newGitHubPipeline(t, nil, []string{"alice"})
+	defer p.cancel()
+
+	body := ghPRClosedMergedPayload("acme/widget", 1, "alice", "Self-merge")
+	resp := p.post(t, "pull_request", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("HTTP = %d", resp.StatusCode)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := len(p.mr.Messages()); n != 0 {
+		t.Errorf("messages = %d, want 0 (actor filtered)", n)
+	}
+	if !strings.Contains(p.logBuf.String(), `"actor_filtered"`) {
+		t.Errorf("drop log missing actor_filtered:\n%s", p.logBuf.String())
+	}
+}
+
+// ---- Startup wiring ----
+
+func TestStartup_GitHubProvider_TranslatorRegistered(t *testing.T) {
+	// Verify the GitHub translator can be constructed with the same args
+	// shape that cmd/telegraph.go uses, given a ResolvedProvider produced by
+	// telegraph.Config.ResolveProviders.
+	t.Setenv("GT_TELEGRAPH_GITHUB_TEST_SECRET", "abc123")
+	cfg := telegraph.DefaultConfig()
+	cfg.Telegraph.Providers["github"] = &telegraph.ProviderConfig{
+		Enabled:   true,
+		SecretEnv: "GT_TELEGRAPH_GITHUB_TEST_SECRET",
+		Events:    []string{"pull_request"},
+		Repos:     []string{"acme/widget"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	resolved, err := cfg.ResolveProviders()
+	if err != nil {
+		t.Fatalf("ResolveProviders: %v", err)
+	}
+	rp := resolved["github"]
+	if rp == nil {
+		t.Fatal("github not in resolved")
+	}
+	tr := githubtr.New(rp.Secret, []string{"pull_request"}, nil, []string{"acme/widget"}, nil)
+	if tr.Provider() != "github" {
+		t.Errorf("Provider() = %q", tr.Provider())
+	}
+	// Smoke test: a signed pull_request body should authenticate.
+	body := ghPRClosedMergedPayload("acme/widget", 1, "alice", "Wired")
+	mac := hmac.New(sha256.New, []byte(rp.Secret))
+	mac.Write(body)
+	headers := map[string]string{
+		"x-hub-signature-256": "sha256=" + hex.EncodeToString(mac.Sum(nil)),
+	}
+	if err := tr.Authenticate(headers, body); err != nil {
+		t.Fatalf("Authenticate: %v", err)
 	}
 }

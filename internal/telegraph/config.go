@@ -68,6 +68,19 @@ type ProviderConfig struct {
 	// Strings are compared case-sensitively against NormalizedEvent.Actor.
 	// An empty-string entry is rejected at config-load time.
 	IgnoreActors []string `toml:"ignore_actors"`
+
+	// Repos is an allow-list of repository identifiers whose events the
+	// provider accepts. Empty or absent means no repository filtering (all
+	// authenticated events from configured event types are accepted).
+	//
+	// Currently consumed by the GitHub provider only; entries are formatted
+	// as "owner/repo" and matched case-insensitively against the webhook's
+	// repository.full_name. Other providers ignore this field; rather than
+	// reject it at validation time we let provider translators enforce
+	// semantics so the option remains forward-compatible.
+	//
+	// An empty-string entry is rejected at config-load time.
+	Repos []string `toml:"repos"`
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -151,6 +164,11 @@ func (c *Config) Validate() error {
 		for _, a := range p.IgnoreActors {
 			if a == "" {
 				return fmt.Errorf("telegraph.providers.%s: ignore_actors must not contain empty strings", id)
+			}
+		}
+		for _, r := range p.Repos {
+			if r == "" {
+				return fmt.Errorf("telegraph.providers.%s: repos must not contain empty strings", id)
 			}
 		}
 	}

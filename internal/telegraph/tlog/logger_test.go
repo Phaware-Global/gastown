@@ -126,7 +126,7 @@ func TestLogger_Deliver(t *testing.T) {
 func TestLogger_Drop(t *testing.T) {
 	var buf bytes.Buffer
 	l := tlog.New(&buf)
-	l.Drop("jira", "issue.created", "evt-1", "", "dedup")
+	l.Drop("jira", "issue.created", "evt-1", "", "", "dedup")
 
 	if v := l.Counters.Drop.Load(); v != 1 {
 		t.Errorf("Drop counter = %d, want 1", v)
@@ -171,7 +171,7 @@ func TestLogger_Nil_NoPanic(t *testing.T) {
 	l.Accept("jira", "1.2.3.4", "", 0, 0)
 	l.Reject("jira", "1.2.3.4", tlog.ReasonHMACInvalid, "")
 	l.Deliver("jira", "issue.created", "", "alice", "PROJ-1", "", "")
-	l.Drop("jira", "issue.created", "", "", "dedup")
+	l.Drop("jira", "issue.created", "", "", "", "dedup")
 	l.NudgeSent()
 	l.NudgeSuppressed()
 }

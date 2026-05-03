@@ -18,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/telegraph"
 	"github.com/steveyegge/gastown/internal/telegraph/prompts"
+	githubtr "github.com/steveyegge/gastown/internal/telegraph/providers/github"
 	jiratr "github.com/steveyegge/gastown/internal/telegraph/providers/jira"
 	"github.com/steveyegge/gastown/internal/telegraph/tlog"
 	"github.com/steveyegge/gastown/internal/telegraph/transform"
@@ -150,13 +151,29 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 	translatorMap := make(map[string]telegraph.Translator, len(resolved))
 	var providerNames []string
 	for id, rp := range resolved {
+		pc := cfg.Telegraph.Providers[id]
 		switch id {
 		case "jira":
 			var ignoreActors []string
-			if pc := cfg.Telegraph.Providers[id]; pc != nil {
+			if pc != nil {
 				ignoreActors = pc.IgnoreActors
 			}
 			translatorMap[id] = jiratr.New(rp.Secret, ignoreActors, nil)
+		case "github":
+			var (
+				events       []string
+				ignoreActors []string
+				repos        []string
+			)
+			if pc != nil {
+				events = pc.Events
+				ignoreActors = pc.IgnoreActors
+				repos = pc.Repos
+			}
+			if err := githubtr.ValidateEvents(events); err != nil {
+				return fmt.Errorf("telegraph: provider %q: %w", id, err)
+			}
+			translatorMap[id] = githubtr.New(rp.Secret, events, ignoreActors, repos, nil)
 		default:
 			return fmt.Errorf("telegraph: unsupported provider %q", id)
 		}
@@ -202,21 +219,25 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 		for evt := range rawCh {
 			tr, ok := translatorMap[evt.Provider]
 			if !ok {
-				logger.Drop(evt.Provider, "", "", "", "no_translator")
+				logger.Drop(evt.Provider, "", "", "", "", "no_translator")
 				continue
 			}
-			norm, err := tr.Translate(evt.Body)
+			norm, err := tr.Translate(evt.Headers, evt.Body)
 			if errors.Is(err, telegraph.ErrActorFiltered) {
 				// norm is non-nil; use it to populate the audit log.
-				logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, tlog.ReasonActorFiltered)
+				logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, norm.Subject, tlog.ReasonActorFiltered)
+				continue
+			}
+			if errors.Is(err, telegraph.ErrRepoFiltered) {
+				logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, norm.Subject, tlog.ReasonRepoFiltered)
 				continue
 			}
 			if err != nil {
-				logger.Drop(evt.Provider, "", "", "", "translate_error")
+				logger.Drop(evt.Provider, "", "", "", "", "translate_error")
 				continue
 			}
 			if err := transformer.Transform(norm); err != nil {
-				logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, "transform_error")
+				logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, norm.Subject, "transform_error")
 			}
 		}
 	}()

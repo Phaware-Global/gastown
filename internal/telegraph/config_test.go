@@ -340,3 +340,63 @@ func TestValidate_DisabledProviderEmptyEventsOK(t *testing.T) {
 		t.Errorf("Validate() = %v, want nil for disabled provider with empty events", err)
 	}
 }
+
+func TestLoad_GitHubProvider(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "telegraph.toml", `
+[telegraph]
+listen_addr = ":9100"
+
+[telegraph.providers.github]
+enabled    = true
+secret_env = "GT_TELEGRAPH_GITHUB_SECRET"
+events     = ["pull_request", "pull_request_review", "check_run"]
+repos      = ["acme/widget", "acme/sprocket"]
+`)
+	cfg, err := telegraph.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	p := cfg.Telegraph.Providers["github"]
+	if p == nil {
+		t.Fatal("github provider missing")
+	}
+	if !p.Enabled {
+		t.Error("Enabled = false")
+	}
+	if p.SecretEnv != "GT_TELEGRAPH_GITHUB_SECRET" {
+		t.Errorf("SecretEnv = %q", p.SecretEnv)
+	}
+	if len(p.Repos) != 2 || p.Repos[0] != "acme/widget" {
+		t.Errorf("Repos = %v", p.Repos)
+	}
+}
+
+func TestValidate_RejectsEmptyRepoEntry(t *testing.T) {
+	t.Parallel()
+	cfg := telegraph.DefaultConfig()
+	cfg.Telegraph.Providers["github"] = &telegraph.ProviderConfig{
+		Enabled:   true,
+		SecretEnv: "GT_GITHUB_SECRET",
+		Events:    []string{"pull_request"},
+		Repos:     []string{"acme/widget", ""},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for empty repos entry")
+	}
+}
+
+func TestValidate_RepoFilterOptional(t *testing.T) {
+	t.Parallel()
+	cfg := telegraph.DefaultConfig()
+	cfg.Telegraph.Providers["github"] = &telegraph.ProviderConfig{
+		Enabled:   true,
+		SecretEnv: "GT_GITHUB_SECRET",
+		Events:    []string{"pull_request"},
+		// Repos absent — must validate (no filter applied).
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil with no Repos set", err)
+	}
+}

@@ -242,6 +242,24 @@ events     = [
     "comment_added",
     "comment_updated",
 ]
+
+# Optional second provider — GitHub.
+[telegraph.providers.github]
+enabled    = true
+secret_env = "GT_TELEGRAPH_GITHUB_SECRET"
+events     = [
+    "pull_request",
+    "pull_request_review",
+    "pull_request_review_comment",
+    "issue_comment",
+    "check_run",
+    "check_suite",
+    "workflow_run",
+]
+# Optional allow-list — empty/absent means accept events from every repo.
+repos = ["acme/widget", "acme/sprocket"]
+# Optional self-echo filter — drop events whose actor matches exactly.
+# ignore_actors = ["mayor-bot"]
 ```
 
 ### Secret Resolution
@@ -501,6 +519,63 @@ returned to Jira (to prevent Jira from retrying indefinitely on unsupported type
 
 Future event types are additive: new entries in the `events` config array +
 new cases in `Translate()`. No interface changes.
+
+### GitHub v1 Scope
+
+The GitHub provider notifies Mayor about PR comments/reviews, merges, and
+failing CI. The translator combines the wire-format event class (carried in
+`X-GitHub-Event`) with the JSON `action` field to choose a normalized event
+type. The configurable `events` list opts in by *wire-format* name; only the
+GitHub events the operator subscribes to are accepted.
+
+| Wire event (`X-GitHub-Event`) | Action filter | Normalized `EventType` |
+|---|---|---|
+| `pull_request` | `closed` + `merged=true` | `pull_request.merged` |
+| `pull_request` | `closed` + `merged=false` | `pull_request.closed_unmerged` |
+| `pull_request` | `opened`, `reopened`, `ready_for_review` | `pull_request.opened` |
+| `pull_request_review` | `submitted` | `pull_request.review_submitted` |
+| `pull_request_review_comment` | `created` | `pull_request.review_comment` |
+| `issue_comment` | `created` *and* `issue.pull_request` set | `pull_request.comment` |
+| `check_run` | `completed` + failure-class `conclusion` | `check_run.failed` |
+| `check_suite` | `completed` + failure-class `conclusion` | `check_suite.failed` |
+| `workflow_run` | `completed` + failure-class `conclusion` | `workflow_run.failed` |
+
+Failure-class conclusions: `failure`, `timed_out`, `cancelled`,
+`action_required`, `stale`, `startup_failure`. `success`, `neutral`, and
+`skipped` are intentionally ignored (no notification).
+
+Out-of-scope deliveries — anything not listed above (e.g. `ping`,
+`pull_request_review` with `action=edited`, `issue_comment` on a non-PR
+issue) — return `ErrUnknownEventType` and an HTTP 200 to GitHub so retries
+are not provoked.
+
+#### GitHub auth
+
+GitHub signs every webhook delivery with HMAC-SHA256 over the raw request
+body and sends the digest in `X-Hub-Signature-256` (`sha256=<hex>`). Telegraph
+verifies that header with `hmac.Equal` (constant-time) and rejects any
+delivery missing the header, with the wrong prefix, or with a mismatching
+digest. The legacy `X-Hub-Signature` (SHA-1) header is accepted by GitHub for
+backward compatibility but is deliberately ignored here — the SHA-256
+variant is GitHub's recommended posture.
+
+#### Repository allow-list
+
+The GitHub provider supports a per-provider `repos` allow-list. When set,
+events whose `repository.full_name` is not in the list are silently dropped
+(non-nil `NormalizedEvent`, `ErrRepoFiltered` sentinel) before reaching L3.
+The dispatcher logs the drop with `reason="repo_filtered"`. Comparison is
+case-insensitive (GitHub repos are case-preserving but case-insensitive
+when matched). Empty list means no filtering. Empty-string entries are
+rejected at config load.
+
+A new `ErrRepoFiltered` sentinel sits beside `ErrActorFiltered`; the
+dispatcher routes both to drop-with-audit-log without enqueueing to L3.
+
+Future event types — like the GitHub equivalent of the Jira `issue.updated`
+field-change shape, or `release` events — would land here with the same
+additive rules: register a new normalized event type, document it in this
+table, add a translator branch, no interface changes.
 
 ---
 
