@@ -552,6 +552,15 @@ func (m *Mailbox) closeInDir(id, beadsDir string) error {
 		return m.storeCloseInDir(id)
 	}
 
+	// Skip the bd close shell-out if the bead is already closed. The unguarded
+	// `bd close` issues an UPDATE+DOLT_COMMIT against the central server even
+	// when the row would not change; the parse+plan+analyze+failed-commit
+	// cycle costs more than a SELECT-shaped existence check, and the resulting
+	// "nothing to commit" warnings landed on the dolt query hot path.
+	if status, _, err := m.bdShowStatusLabels(id, beadsDir); err == nil && status == "closed" {
+		return nil
+	}
+
 	args := []string{"close", id}
 	// Pass session ID for work attribution if available
 	if sessionID := runtime.SessionIDFromEnv(); sessionID != "" {
@@ -573,6 +582,34 @@ func (m *Mailbox) closeInDir(id, beadsDir string) error {
 	}
 
 	return nil
+}
+
+// bdShowStatusLabels returns the current status and labels for a bead by
+// running `bd show <id> --json`. Returns (status, labels, ErrMessageNotFound)
+// when the bead does not exist. Used by the markReadOnly / closeInDir guards
+// to skip writes that would be no-ops.
+func (m *Mailbox) bdShowStatusLabels(id, beadsDir string) (string, []string, error) {
+	args := []string{"show", id, "--json"}
+	ctx, cancel := bdReadCtx()
+	defer cancel()
+	stdout, err := runBdCommand(ctx, args, m.workDir, beadsDir)
+	if err != nil {
+		if bdErr, ok := err.(*bdError); ok && (bdErr.ContainsError("not found") || bdErr.ContainsError("no issue found")) {
+			return "", nil, ErrMessageNotFound
+		}
+		return "", nil, err
+	}
+	if !isJSON(stdout) {
+		return "", nil, ErrMessageNotFound
+	}
+	var bms []BeadsMessage
+	if err := json.Unmarshal(stdout, &bms); err != nil {
+		return "", nil, err
+	}
+	if len(bms) == 0 {
+		return "", nil, ErrMessageNotFound
+	}
+	return bms[0].Status, bms[0].Labels, nil
 }
 
 func (m *Mailbox) markReadLegacy(id string) error {
@@ -621,6 +658,18 @@ func (m *Mailbox) markReadOnlyBeads(id string) error {
 	// Add "read" label to mark as read without closing
 	args := []string{"label", "add", id, "read"}
 	primary := beads.ResolveBeadsDirForID(m.beadsDir, id)
+
+	// Skip the bd label add shell-out if the "read" label is already present.
+	// Without this guard, a re-mark-read fires an UPSERT that matches 0 rows
+	// and produces a "nothing to commit" warning per call. See closeInDir for
+	// the same pattern's rationale.
+	if _, labels, err := m.bdShowStatusLabels(id, primary); err == nil {
+		for _, l := range labels {
+			if l == "read" {
+				return nil
+			}
+		}
+	}
 
 	ctx, cancel := bdWriteCtx()
 	defer cancel()

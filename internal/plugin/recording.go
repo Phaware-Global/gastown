@@ -102,14 +102,13 @@ func (r *Recorder) RecordRun(record PluginRunRecord) (string, error) {
 		return "", fmt.Errorf("parsing bd create output: %w", err)
 	}
 
-	// Close the receipt immediately — it exists for audit/cooldown-gate queries
-	// (which use --all to include closed beads) but should not stay open.
-	closeCtx, closeCancel := context.WithTimeout(context.Background(), constants.BdCommandTimeout)
-	defer closeCancel()
-	closeCmd := exec.CommandContext(closeCtx, "bd", "close", result.ID, "--reason", "plugin run recorded") //nolint:gosec // G204: bd is a trusted internal tool
-	closeCmd.Dir = r.townRoot
-	closeCmd.Env = append(os.Environ(), "BEADS_DIR="+beads.ResolveBeadsDir(r.townRoot))
-	_ = closeCmd.Run() // Best-effort — reaper will catch it if this fails
+	// Receipts are created with --ephemeral, which puts them in the wisps
+	// table (auto-cleaned by `bd mol wisp gc` and patrol squash). The
+	// cooldown-gate query uses --all so it sees the receipt regardless of
+	// status. The previous immediate `bd close` was a second MySQL session
+	// per dispatch (parse+plan+UPDATE+DOLT_COMMIT) for no functional gain;
+	// it ran every plugin tick (~10 plugins × heartbeat cadence) and was
+	// one of the visible contributors to the dolt empty-commit storm.
 
 	return result.ID, nil
 }
