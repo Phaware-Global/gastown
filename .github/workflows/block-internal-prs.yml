@@ -4,12 +4,17 @@ on:
   pull_request:
     types: [opened, reopened]
 
+permissions: {}
+
 jobs:
   block-internal-prs:
     name: Block Internal PRs
     # Only run if PR is from the same repo (not a fork)
     if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'renovate[bot]'
     runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
     steps:
       - name: Close PR and comment
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8

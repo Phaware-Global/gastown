@@ -70,6 +70,7 @@ func main() {
 
 	tlsCfg := &tls.Config{
 		Certificates: []tls.Certificate{clientCert},
+		MinVersion:   tls.VersionTLS12,
 		RootCAs:      pool,
 	}
 

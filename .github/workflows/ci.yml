@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+
 jobs:
   # Guard: go.mod must not contain replace directives — they break `go install`.
   # See: https://github.com/steveyegge/gastown/issues/2230
@@ -168,14 +171,14 @@ jobs:
 
       - name: Cache beads (bd)
         id: cache-beads-int
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: ~/go/bin/bd
           key: beads-${{ hashFiles('.github/workflows/ci.yml') }}
 
       - name: Install beads (bd)
         if: steps.cache-beads-int.outputs.cache-hit != 'true'
-        run: go install github.com/steveyegge/beads/cmd/bd@v0.57.0
+        run: CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@v1.0.0
 
       - name: Install gotestsum
         run: go install gotest.tools/gotestsum@latest
@@ -183,10 +186,10 @@ jobs:
       - name: Build gt
         run: |
           make build
-          cp gt $(go env GOPATH)/bin/
+          cp gt "$(go env GOPATH)/bin/"
 
       - name: Add to PATH
-        run: echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Integration Tests
         run: gotestsum --format testname --junitfile junit-integration.xml -- -tags=integration -timeout=15m -v ./internal/cmd/...

@@ -454,6 +454,10 @@ func TestBuildRefineryPatrolVars_MergeStrategy(t *testing.T) {
 
 	mq := config.DefaultMergeQueueConfig()
 	mq.MergeStrategy = "pr"
+	// PRApprover is required by validateMergeQueueConfig when merge_strategy=pr
+	// and the count gate is non-zero (PR #56). Test must satisfy validation
+	// or LoadRigSettings returns an error and the MQ block is skipped entirely.
+	mq.PRApprover = "test-approver"
 	settings := config.RigSettings{
 		Type:       "rig-settings",
 		Version:    1,
@@ -535,6 +539,8 @@ func TestBuildRefineryPatrolVars_RequireReview(t *testing.T) {
 	mq.MergeStrategy = "pr"
 	requireReview := true
 	mq.RequireReview = &requireReview
+	// PRApprover required by fork validation when merge_strategy=pr (PR #56).
+	mq.PRApprover = "test-approver"
 	settings := config.RigSettings{
 		Type:       "rig-settings",
 		Version:    1,

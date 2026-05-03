@@ -37,6 +37,9 @@ var (
 	bdAllowStaleMu     sync.Mutex
 	bdAllowStalePath   string
 	bdAllowStaleResult bool
+	// bdAllowStaleProbeTimeout bounds the capability probe so a wedged bd
+	// binary cannot hang higher-level commands such as gt status.
+	bdAllowStaleProbeTimeout = 2 * time.Second
 )
 
 // ResetBdAllowStaleCacheForTest clears the cached bd --allow-stale capability.
@@ -70,18 +73,23 @@ func BdSupportsAllowStaleWithEnv(env []string) bool {
 		return cachedResult
 	}
 
-	cmd := exec.Command(bdPath, "--allow-stale", "version") //nolint:gosec // G204: bd is a trusted internal tool
-	util.SetDetachedProcessGroup(cmd)
+	ctx, cancel := context.WithTimeout(context.Background(), bdAllowStaleProbeTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, bdPath, "--allow-stale", "version") //nolint:gosec // G204: bd is a trusted internal tool
+	util.SetProcessGroup(cmd)
 	if env != nil {
 		cmd.Env = env
 	}
 	var combinedOut bytes.Buffer
 	cmd.Stdout = &combinedOut
 	cmd.Stderr = &combinedOut
-	_ = cmd.Run()
+	err = cmd.Run()
 	// bd v0.60+ exits 0 even on unknown flags, printing the error to stderr.
-	// Check output for "unknown flag" to detect lack of support.
-	supported := !strings.Contains(combinedOut.String(), "unknown flag")
+	// Check output for "unknown flag" to detect lack of support. Treat probe
+	// errors/timeouts as unsupported so higher-level commands fail closed
+	// instead of hanging on a wedged bd subprocess.
+	supported := err == nil && !strings.Contains(combinedOut.String(), "unknown flag")
 
 	bdAllowStaleMu.Lock()
 	if bdAllowStalePath != bdPath {
@@ -408,6 +416,24 @@ func (b *Beads) getResolvedBeadsDir() string {
 	return ResolveBeadsDir(b.workDir)
 }
 
+// forIssueID returns a Beads wrapper bound to the correct beads directory for
+// the given issue ID. This is needed for cross-rig write operations that use an
+// ID to determine the owning database.
+func (b *Beads) forIssueID(id string) *Beads {
+	resolved := ResolveBeadsDirForID(b.getResolvedBeadsDir(), id)
+	if resolved == "" || resolved == b.getResolvedBeadsDir() {
+		return b
+	}
+	return &Beads{
+		workDir:    b.workDir,
+		beadsDir:   resolved,
+		isolated:   b.isolated,
+		serverPort: b.serverPort,
+		store:      b.store,
+		townRoot:   b.townRoot,
+	}
+}
+
 // Init initializes a new beads database in the working directory.
 // This uses the same environment isolation as other commands.
 // If ServerPort is set (via NewIsolatedWithPort), passes --server-port to bd init
@@ -419,10 +445,31 @@ func (b *Beads) Init(prefix string) error {
 	}
 	args = append(args, "--quiet")
 	if b.serverPort > 0 {
-		args = append(args, "--server-port", fmt.Sprintf("%d", b.serverPort))
+		args = append(args, "--server", "--server-port", fmt.Sprintf("%d", b.serverPort))
 	}
 	_, err := b.run(args...)
 	return err
+}
+
+// bdSubprocessTimeout caps how long a single bd subprocess may run before
+// being killed. Without this, bd can block indefinitely waiting on a slow
+// Dolt server (e.g. paging from swap under memory pressure), and macOS
+// Jetsam may SIGKILL the orphaned bd process before it ever returns.
+// 60s is large enough to cover normal slow-path retries (Dolt MySQL client
+// retries up to 30s) but short enough to fail fast and surface to callers.
+// Override via GT_BD_TIMEOUT_SEC env var for testing or unusual workloads.
+// Investigation: dc-1pq8 (forensic report 2026-05-02).
+const bdSubprocessTimeout = 60 * time.Second
+
+// resolveBdSubprocessTimeout returns the configured timeout, honoring the
+// GT_BD_TIMEOUT_SEC env var override (must parse as a positive integer).
+func resolveBdSubprocessTimeout() time.Duration {
+	if v := os.Getenv("GT_BD_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return bdSubprocessTimeout
 }
 
 // run executes a bd command and returns stdout.
@@ -448,10 +495,16 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 	runEnv := append(b.buildRunEnv(), "BEADS_DIR="+beadsDir)
 	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
 
+	// Bound the subprocess runtime so a slow Dolt response doesn't leave bd
+	// blocking forever (under memory pressure that invites Jetsam SIGKILL).
+	// The context covers both the initial attempt and the --flat retry.
+	ctx, cancel := context.WithTimeout(context.Background(), resolveBdSubprocessTimeout())
+	defer cancel()
+
 	// Always explicitly set BEADS_DIR to prevent inherited env vars from
 	// causing prefix mismatches. Use explicit beadsDir if set, otherwise
 	// resolve from working directory.
-	cmd := exec.Command("bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
+	cmd := exec.CommandContext(ctx, "bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 	util.SetDetachedProcessGroup(cmd)
 	cmd.Dir = b.workDir
 
@@ -475,7 +528,7 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 		}
 		stdout.Reset()
 		stderr.Reset()
-		cmd = exec.Command("bd", retryArgs...) //nolint:gosec // G204: bd is a trusted internal tool
+		cmd = exec.CommandContext(ctx, "bd", retryArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 		util.SetDetachedProcessGroup(cmd)
 		cmd.Dir = b.workDir
 		cmd.Env = runEnv
@@ -513,7 +566,11 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 	runEnv := b.buildRoutingEnv()
 	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
 
-	cmd := exec.Command("bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
+	// Bound subprocess runtime — see bdSubprocessTimeout doc comment.
+	ctx, cancel := context.WithTimeout(context.Background(), resolveBdSubprocessTimeout())
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 	util.SetDetachedProcessGroup(cmd)
 	cmd.Dir = b.workDir
 
@@ -1206,26 +1263,16 @@ func (b *Beads) Blocked() ([]*Issue, error) {
 }
 
 // buildBdCreateArgs constructs the argv for `bd create` from CreateOptions.
-// Extracted so the flag mapping (especially Rig → `--repo`) can be unit-tested
-// without execing `bd` — the mismatch between the Go-side `Rig` field and
-// bd's on-wire `--repo` flag has caused a silent "every MR bead create fails"
-// bug before, so it deserves a regression guard.
+// Extracted so the flag mapping can be unit-tested without execing `bd`.
 //
-// Method on *Beads (rather than a free function) so it can:
-//   - resolve the rig NAME in opts.Rig (e.g. "gastown") to its directory
-//     path via GetRigDirForName + getTownRoot, then absolutize via
-//     filepath.Abs — `bd --repo` is happiest with a path it can open
-//     directly, and absolutizing means bd's behavior doesn't depend on
-//     the caller's cwd at exec time.
-//   - default opts.Actor from b.getActor() (BD_ACTOR / isolated-mode
-//     fallback) without making each caller repeat the same boilerplate.
+// Rig routing is intentionally NOT done here — see resolveBdForRig. This
+// function only produces the argv; rig dispatch happens by selecting which
+// *Beads runs the argv (via BEADS_DIR), so no `--repo=<rig>` ever appears in
+// the args. (hq-1uf2)
 //
-// Path-resolution falls back to passing opts.Rig raw when the town root
-// or routes file can't be located. This preserves the prior behavior
-// for callers/test fixtures that don't construct a full town layout,
-// at the cost of a slightly less-precise --repo arg in those edge
-// cases. A test that exercises the resolved-path branch is added
-// alongside the existing rig-name fallback regression.
+// Method on *Beads (rather than a free function) so it can default opts.Actor
+// from b.getActor() (BD_ACTOR / isolated-mode fallback) without making each
+// caller repeat the same boilerplate.
 func (b *Beads) buildBdCreateArgs(opts CreateOptions) []string {
 	args := []string{"create", "--json"}
 
@@ -1252,33 +1299,6 @@ func (b *Beads) buildBdCreateArgs(opts CreateOptions) []string {
 	if opts.Ephemeral {
 		args = append(args, "--ephemeral")
 	}
-	if opts.Rig != "" {
-		// bd's flag is `--repo`, not `--rig`. See CreateOptions.Rig for
-		// the history. Resolve the rig name to its directory path when
-		// possible so bd gets a path it can open without re-running
-		// its own auto-routing; fall back to the rig name if the town
-		// root or routes lookup fails (e.g. unit tests running outside
-		// a town layout).
-		//
-		// The resolved path is filepath.Abs-normalized so callers that
-		// constructed *Beads with a relative workDir (e.g. "." for
-		// commands run from the rig's root) don't end up handing bd a
-		// path that depends on the caller's CWD at exec time. If Abs
-		// fails for any reason (extremely rare in practice — only on
-		// platforms where os.Getwd errors), fall back to the unmodified
-		// resolved path so we still pass a valid argument.
-		repo := opts.Rig
-		if townRoot := b.getTownRoot(); townRoot != "" {
-			if rigDir := GetRigDirForName(townRoot, opts.Rig); rigDir != "" {
-				if absDir, err := filepath.Abs(rigDir); err == nil {
-					repo = absDir
-				} else {
-					repo = rigDir
-				}
-			}
-		}
-		args = append(args, "--repo="+repo)
-	}
 	actor := opts.Actor
 	if actor == "" {
 		actor = b.getActor()
@@ -1287,6 +1307,38 @@ func (b *Beads) buildBdCreateArgs(opts CreateOptions) []string {
 		args = append(args, "--actor="+actor)
 	}
 	return args
+}
+
+// resolveBdForRig returns the *Beads that Create should run `bd create` against
+// when opts.Rig is set. Routes via BEADS_DIR (a separate *Beads pinned to the
+// rig's .beads dir) instead of `--repo=<dir>` so bd does not open a second
+// connection to the same database — the pthread_cond_wait deadlock root cause
+// (hq-1uf2). Returns the receiver unchanged when opts.Rig is empty, when the
+// town root cannot be determined, when the rig is not in routes.jsonl, or when
+// the rig's .beads dir is missing — the caller falls through to bd's own
+// auto-routing in those cases.
+func (b *Beads) resolveBdForRig(opts CreateOptions) *Beads {
+	if opts.Rig == "" {
+		return b
+	}
+	townRoot := b.getTownRoot()
+	if townRoot == "" {
+		return b
+	}
+	rigDir := GetRigDirForName(townRoot, opts.Rig)
+	if rigDir == "" {
+		return b
+	}
+	rigBeadsDir := filepath.Join(rigDir, ".beads")
+	if _, err := os.Stat(rigBeadsDir); err != nil {
+		return b
+	}
+	return &Beads{
+		workDir:    b.workDir,
+		beadsDir:   rigBeadsDir,
+		serverPort: b.serverPort,
+		isolated:   b.isolated,
+	}
 }
 
 // Create creates a new issue and returns it.
@@ -1303,8 +1355,9 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 	}
 
 	args := b.buildBdCreateArgs(opts)
+	bdForCreate := b.resolveBdForRig(opts)
 
-	out, err := b.run(args...)
+	out, err := bdForCreate.run(args...)
 	if err != nil {
 		return nil, err
 	}

@@ -6,6 +6,8 @@ on:
     - cron: '37 9 * * *'
   workflow_dispatch:
 
+permissions: {}
+
 jobs:
   close-needs-info:
     runs-on: ubuntu-latest
