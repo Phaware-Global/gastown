@@ -629,22 +629,23 @@ func titleAndBody(title, body string) string {
 	}
 }
 
-// parseGHTime parses a GitHub-issued RFC3339 timestamp string. Empty / "null" /
-// unparseable inputs return time.Now().UTC() rather than the zero value so the
-// downstream event always carries a non-zero Timestamp. GitHub timestamps are
-// always RFC3339 in practice; the fallback covers the open-PR null case for
-// fields like merged_at as well as defensive handling of malformed payloads.
+// parseGHTime parses a GitHub-issued RFC3339 timestamp string. Empty, JSON
+// "null", or unparseable inputs return the zero time so callers can detect
+// missing/malformed data explicitly (see Jira's parseJiraTime for the same
+// pattern). Returning time.Now() here would mask malformed payloads as
+// "events that happened just now," which would surface as drift in the
+// Telegraph-Timestamp header on tests and audit logs.
 func parseGHTime(s string) time.Time {
 	s = strings.TrimSpace(s)
 	if s == "" || s == "null" {
-		return time.Now().UTC()
+		return time.Time{}
 	}
 	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
 		if t, err := time.Parse(layout, s); err == nil {
 			return t.UTC()
 		}
 	}
-	return time.Now().UTC()
+	return time.Time{}
 }
 
 // deliveryOrFallback prefers the X-GitHub-Delivery UUID (stable, GitHub-issued)

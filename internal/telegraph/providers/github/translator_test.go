@@ -639,3 +639,72 @@ func TestSupportedWireEvents(t *testing.T) {
 		}
 	}
 }
+
+// ---- timestamp fallback ----
+
+// TestTranslate_MalformedTimestampYieldsZero pins the parseGHTime contract:
+// when a timestamp field is missing, JSON null, or unparseable, the resulting
+// NormalizedEvent.Timestamp is the zero value rather than time.Now() — masking
+// malformed payloads as "events from right now" was the gemini-code-assist
+// concern on PR #60. Callers / dashboards can detect the zero explicitly.
+func TestTranslate_MalformedTimestampYieldsZero(t *testing.T) {
+	cases := []struct {
+		name     string
+		mergedAt any // any so we can emit JSON null
+	}{
+		{name: "empty", mergedAt: ""},
+		{name: "null", mergedAt: nil},
+		{name: "garbage", mergedAt: "not-a-timestamp"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, _ := json.Marshal(map[string]any{
+				"action":     "closed",
+				"sender":     map[string]any{"login": "alice"},
+				"repository": map[string]any{"full_name": "acme/widget"},
+				"pull_request": map[string]any{
+					"number":     1,
+					"html_url":   "https://github.com/acme/widget/pull/1",
+					"title":      "x",
+					"merged":     true,
+					"merged_at":  tc.mergedAt,
+					"updated_at": tc.mergedAt,
+				},
+			})
+			tr := newTranslator(t)
+			evt, err := tr.Translate(headersFor("pull_request"), body)
+			if err != nil {
+				t.Fatalf("Translate: %v", err)
+			}
+			if !evt.Timestamp.IsZero() {
+				t.Errorf("Timestamp = %v, want zero (malformed input must not be substituted with time.Now())", evt.Timestamp)
+			}
+		})
+	}
+}
+
+// TestTranslate_ValidTimestampParsed confirms the happy path still parses.
+func TestTranslate_ValidTimestampParsed(t *testing.T) {
+	body, _ := json.Marshal(map[string]any{
+		"action":     "closed",
+		"sender":     map[string]any{"login": "alice"},
+		"repository": map[string]any{"full_name": "acme/widget"},
+		"pull_request": map[string]any{
+			"number":     1,
+			"html_url":   "https://github.com/acme/widget/pull/1",
+			"title":      "x",
+			"merged":     true,
+			"merged_at":  "2026-04-29T15:00:00Z",
+			"updated_at": "2026-04-29T15:00:00Z",
+		},
+	})
+	tr := newTranslator(t)
+	evt, err := tr.Translate(headersFor("pull_request"), body)
+	if err != nil {
+		t.Fatalf("Translate: %v", err)
+	}
+	want, _ := time.Parse(time.RFC3339, "2026-04-29T15:00:00Z")
+	if !evt.Timestamp.Equal(want) {
+		t.Errorf("Timestamp = %v, want %v", evt.Timestamp, want)
+	}
+}
