@@ -466,10 +466,12 @@ func (b *Beads) EnforceChannelRetention(name string) error {
 		}
 	}
 
-	// Delete marked messages (best-effort)
+	// Delete marked messages (best-effort). CloseWithReason routes through
+	// the in-process store when one is attached (via SetStore or
+	// NewWithStore), eliminating per-message subprocess+session overhead
+	// during retention sweeps. Falls back to `bd close` shell-out otherwise.
 	for id := range toDeleteIDs {
-		// Use close instead of delete for audit trail
-		_, _ = b.run("close", id, "--reason=channel retention pruning")
+		_ = b.CloseWithReason("channel retention pruning", id)
 	}
 
 	return nil
@@ -554,9 +556,11 @@ func (b *Beads) PruneAllChannels() (int, error) {
 			}
 		}
 
-		// Delete marked messages
+		// Delete marked messages. CloseWithReason routes through the
+		// in-process store when one is attached, eliminating per-message
+		// subprocess+session overhead during retention sweeps.
 		for id := range toDeleteIDs {
-			if _, err := b.run("close", id, "--reason=patrol retention pruning"); err == nil {
+			if err := b.CloseWithReason("patrol retention pruning", id); err == nil {
 				pruned++
 			}
 		}

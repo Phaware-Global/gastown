@@ -1944,6 +1944,34 @@ func (d *Daemon) killDefaultPrefixGhosts() {
 	}
 }
 
+// BeadsStore returns the in-process beadsdk.Storage for the given rig name,
+// or nil if the rig has no open store. Use "hq" for the town-level store.
+//
+// The returned store is shared — callers MUST NOT call Close() on it. The
+// daemon owns the store lifecycle and closes all stores during shutdown via
+// closeBeadsStores().
+//
+// This is the single accessor exposed to other daemon-resident packages
+// (mail.Router, plugin.Recorder, beads.Beads) so they can route through the
+// long-lived in-process pool instead of spawning bd subprocesses.
+func (d *Daemon) BeadsStore(rigName string) beadsdk.Storage {
+	if d.beadsStores == nil {
+		return nil
+	}
+	return d.beadsStores[rigName]
+}
+
+// BeadsStores returns the full map of open in-process stores keyed by rig
+// name (and "hq" for the town-level store). Returns nil when stores are not
+// yet open. The returned map and its values are shared — callers MUST NOT
+// mutate the map or close any of the stores.
+//
+// This is for callers that need to iterate stores (e.g., to attach all of
+// them to a router); for single-rig lookups use BeadsStore(rigName).
+func (d *Daemon) BeadsStores() map[string]beadsdk.Storage {
+	return d.beadsStores
+}
+
 // openBeadsStores opens beads stores for the town (hq) and all known rigs.
 // Returns a map keyed by "hq" for town-level and rig names for per-rig stores.
 // Stores that fail to open are logged and skipped. Successfully opened stores
