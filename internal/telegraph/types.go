@@ -24,6 +24,13 @@ var ErrUnknownEventType = errors.New("unknown event type")
 // The dispatcher must not enqueue a filtered event to L3.
 var ErrActorFiltered = errors.New("actor filtered by provider config")
 
+// ErrRepoFiltered is returned by Translate when the event's source repository
+// is not in the provider's allow-list. Like ErrActorFiltered, the translator
+// returns a non-nil NormalizedEvent alongside this error so the dispatcher can
+// populate the audit-log with subject/event_type/event_id. The dispatcher must
+// not enqueue a filtered event to L3.
+var ErrRepoFiltered = errors.New("repository filtered by provider config")
+
 // RawEvent is the authenticated-but-uninterpreted payload from Transport.
 // L1 guarantees the request passed HMAC/signature verification before enqueuing.
 // L2 never re-verifies; it only translates.
@@ -60,9 +67,14 @@ type Translator interface {
 	// Must not log secrets.
 	Authenticate(headers map[string]string, body []byte) error
 
-	// Translate converts a raw body to a NormalizedEvent.
+	// Translate converts a raw body to a NormalizedEvent. Headers are the
+	// authenticated request headers (lowercased keys); providers that select
+	// the event type from a header (e.g. GitHub's X-GitHub-Event) read it from
+	// here. Implementations that derive the event type entirely from the body
+	// (e.g. Jira) may ignore headers.
+	//
 	// Returns ErrUnknownEventType if the event type is not in scope.
 	// Unknown types MUST be logged (with EventID if extractable) and returned
 	// as ErrUnknownEventType — never silently dropped, never forwarded raw.
-	Translate(body []byte) (*NormalizedEvent, error)
+	Translate(headers map[string]string, body []byte) (*NormalizedEvent, error)
 }

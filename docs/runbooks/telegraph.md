@@ -1,6 +1,8 @@
 # Telegraph Operator Runbook
 
-**Production path:** `<JIRA_BASE_URL>` → `<TELEGRAPH_PUBLIC_URL>/webhook/jira` (via tunnel/proxy) → Telegraph on `localhost:8765`
+**Production paths:**
+- Jira: `<JIRA_BASE_URL>` → `<TELEGRAPH_PUBLIC_URL>/webhook/jira` (via tunnel/proxy) → Telegraph on `localhost:8765`
+- GitHub: GitHub webhook → `<TELEGRAPH_PUBLIC_URL>/webhook/github` (via tunnel/proxy) → Telegraph on `localhost:8765`
 
 Design reference: [docs/design/telegraph.md](../design/telegraph.md)
 
@@ -29,6 +31,15 @@ events        = [
     "jira:comment_updated",
 ]
 # ignore_actors = ["Artie"]   # drop events whose actor exactly matches (see Actor Filtering)
+
+# Optional second provider — GitHub. See "GitHub Provider" section below.
+# [telegraph.providers.github]
+# enabled       = true
+# secret_env    = "GT_TELEGRAPH_GITHUB_SECRET"
+# events        = ["pull_request", "pull_request_review", "pull_request_review_comment",
+#                  "issue_comment", "check_run", "workflow_run"]
+# repos         = ["acme/widget", "acme/sprocket"]   # allow-list; empty = all repos
+# ignore_actors = ["mayor-bot"]
 
 # [telegraph.prompts]         # optional — see Operator Prompts section
 # "jira:comment.added" = """..."""
@@ -387,6 +398,143 @@ jq 'select(.reason == "actor_filtered")' ~/gt/logs/telegraph.log
 
 ---
 
+## GitHub Provider
+
+The GitHub Telegraph provider notifies Mayor about PR activity (comments,
+reviews, merges) and failing CI checks. It mirrors the Jira provider's
+shape: HMAC-authenticated webhook deliveries → normalized event → Mayor
+mail. The differences are documented here.
+
+### Supported events
+
+| Wire event (`X-GitHub-Event`) | Action filter | Normalized type |
+|---|---|---|
+| `pull_request` | `closed` + merged=true | `pull_request.merged` |
+| `pull_request` | `closed` + merged=false | `pull_request.closed_unmerged` |
+| `pull_request` | `opened`, `reopened`, `ready_for_review` | `pull_request.opened` |
+| `pull_request_review` | `submitted` | `pull_request.review_submitted` |
+| `pull_request_review_comment` | `created` | `pull_request.review_comment` |
+| `issue_comment` | `created` *and* the issue is a PR | `pull_request.comment` |
+| `check_run` | `completed` + failure-class conclusion | `check_run.failed` |
+| `check_suite` | `completed` + failure-class conclusion | `check_suite.failed` |
+| `workflow_run` | `completed` + failure-class conclusion | `workflow_run.failed` |
+
+Failure-class conclusions: `failure`, `timed_out`, `cancelled`,
+`action_required`, `stale`, `startup_failure`. Successful, neutral, and
+skipped check outcomes are intentionally not forwarded.
+
+Out-of-scope deliveries (e.g. `ping`, `pull_request_review` action=`edited`,
+`issue_comment` on a non-PR issue) return HTTP 200 with a `reject`/`drop`
+log entry — GitHub's own retry policy then leaves them alone.
+
+### Generating the GitHub HMAC secret
+
+```bash
+openssl rand -hex 32
+# 64 hex characters (32 bytes)
+```
+
+```bash
+export GT_TELEGRAPH_GITHUB_SECRET="<the hex string from above>"
+```
+
+Add to `~/.zshrc` (or your shell's equivalent). Telegraph reads this env var
+at startup and exits if the configured `secret_env` resolves to an empty
+value.
+
+### Configuring the GitHub webhook
+
+In GitHub: repo (or org) **Settings → Webhooks → Add webhook**.
+
+| Field | Value |
+|---|---|
+| Payload URL | `https://<TELEGRAPH_PUBLIC_URL>/webhook/github` |
+| Content type | `application/json` (required — Telegraph expects JSON bodies) |
+| Secret | The value of `GT_TELEGRAPH_GITHUB_SECRET` (paste the hex string verbatim) |
+| SSL verification | Enabled |
+| Which events? | "Let me select individual events" — check at minimum: **Pull requests**, **Pull request reviews**, **Pull request review comments**, **Issue comments**, **Check runs**, **Workflow runs** |
+
+GitHub signs every delivery with HMAC-SHA256 over the raw request body and
+sends the digest in `X-Hub-Signature-256` (`sha256=<hex>`). Telegraph uses
+constant-time HMAC comparison and returns HTTP 401 with a structured
+`reject` line on mismatch. The legacy `X-Hub-Signature` (SHA-1) header is
+accepted by GitHub for backward compatibility but is deliberately ignored
+here — only the SHA-256 form authenticates.
+
+### Repository allow-list
+
+`repos` restricts which GitHub repositories Telegraph forwards events for.
+Comparison is case-insensitive against the webhook's `repository.full_name`.
+
+```toml
+[telegraph.providers.github]
+enabled    = true
+secret_env = "GT_TELEGRAPH_GITHUB_SECRET"
+events     = ["pull_request", "pull_request_review", "check_run", "workflow_run"]
+repos      = ["acme/widget", "acme/sprocket"]
+```
+
+- Empty list (or absent) means no repository filtering.
+- Empty-string entries are rejected at startup.
+- Filtered events are logged with `event=drop, reason=repo_filtered` and
+  return HTTP 200 (no GitHub retry storm).
+
+```bash
+# Audit: which repos got dropped
+jq 'select(.reason == "repo_filtered")' "$LOG_FILE"
+```
+
+### Self-echo prevention (`ignore_actors`)
+
+The same actor-filter mechanism documented for Jira applies:
+
+```toml
+[telegraph.providers.github]
+ignore_actors = ["mayor-bot"]   # GitHub login of the operator persona
+```
+
+Useful when Mayor posts back to the PR via a bot account; GitHub fires a
+fresh `issue_comment` event back, which would otherwise feed back into
+Mayor's inbox. Filtering uses GitHub login (case-sensitive), not the
+display name. Filtered drops emit `reason=actor_filtered`.
+
+### Sending a signed test POST
+
+```bash
+SECRET="${GT_TELEGRAPH_GITHUB_SECRET}"
+
+BODY='{"action":"closed","sender":{"login":"testuser"},"repository":{"full_name":"acme/widget","html_url":"https://github.com/acme/widget"},"pull_request":{"number":1,"html_url":"https://github.com/acme/widget/pull/1","title":"Runbook test","merged":true,"merged_at":"2026-04-29T15:00:00Z","updated_at":"2026-04-29T15:00:00Z"}}'
+
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}')
+
+curl -s -X POST http://127.0.0.1:8765/webhook/github \
+  -H "Content-Type: application/json" \
+  -H "X-Hub-Signature-256: sha256=${SIG}" \
+  -H "X-GitHub-Event: pull_request" \
+  -H "X-GitHub-Delivery: runbook-test-$(date +%s)" \
+  -d "$BODY"
+# Expected: HTTP 200, empty body
+```
+
+Then check Mayor's inbox:
+
+```bash
+gt mail inbox   # should show telegraph/github/testuser → mayor/
+```
+
+### Recovering from secret rotation
+
+1. `openssl rand -hex 32` → new value.
+2. Update `GT_TELEGRAPH_GITHUB_SECRET` in your shell environment.
+3. Update the GitHub webhook secret in the repo/org settings.
+4. Restart Telegraph (see [Restart Procedure](#restart-procedure)).
+
+GitHub queues a single redelivery of recent failed webhooks via the
+"Recent Deliveries" panel, useful for catching events delivered during the
+rotation window.
+
+---
+
 ## Reading Logs and tlog.Counters
 
 Every log line is a single JSON object. Key fields:
@@ -397,7 +545,7 @@ Every log line is a single JSON object. Key fields:
 | `component` | Always `"telegraph"` |
 | `event` | `accept`, `reject`, `deliver`, `drop`, `nudge_sent`, `nudge_suppressed` |
 | `provider` | e.g. `"jira"` |
-| `reason` | On `reject`: `hmac_invalid`, `backpressure`, `parse_error`, `provider_disabled`; on `drop`: `actor_filtered`, `no_translator`, `translate_error`, `transform_error` |
+| `reason` | On `reject`: `hmac_invalid`, `backpressure`, `parse_error`, `provider_disabled`; on `drop`: `actor_filtered`, `repo_filtered`, `no_translator`, `translate_error`, `transform_error` |
 | `source_ip` | Caller IP (tunnel edge IP in production) |
 | `actor` | Who triggered the event (present on `deliver` and `actor_filtered` drops) |
 | `subject` | Issue key, e.g. `PROJ-1234` |

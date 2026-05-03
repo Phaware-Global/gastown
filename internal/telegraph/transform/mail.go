@@ -151,9 +151,40 @@ func buildSubject(event *telegraph.NormalizedEvent) string {
 		return fmt.Sprintf("%s Comment added by %s", tag, event.Actor)
 	case "comment.updated":
 		return fmt.Sprintf("%s Comment updated by %s", tag, event.Actor)
+	case "pull_request.opened":
+		return fmt.Sprintf("%s PR opened: %s", tag, safeTitle(event.Text))
+	case "pull_request.merged":
+		return fmt.Sprintf("%s PR merged: %s", tag, safeTitle(event.Text))
+	case "pull_request.closed_unmerged":
+		return fmt.Sprintf("%s PR closed (not merged): %s", tag, safeTitle(event.Text))
+	case "pull_request.review_submitted":
+		return fmt.Sprintf("%s Review %s by %s", tag, reviewState(event.Labels), event.Actor)
+	case "pull_request.review_comment":
+		return fmt.Sprintf("%s Review comment by %s", tag, event.Actor)
+	case "pull_request.comment":
+		return fmt.Sprintf("%s Comment added by %s", tag, event.Actor)
+	case "check_run.failed":
+		return fmt.Sprintf("%s Check run failed", tag)
+	case "check_suite.failed":
+		return fmt.Sprintf("%s Check suite failed", tag)
+	case "workflow_run.failed":
+		return fmt.Sprintf("%s Workflow run failed", tag)
 	default:
 		return fmt.Sprintf("%s %s", tag, event.EventType)
 	}
+}
+
+// reviewState extracts the review state from a NormalizedEvent.Labels slice.
+// The GitHub translator emits the state as "review:<state>" so the subject
+// builder can surface it without poking provider payloads.
+func reviewState(labels []string) string {
+	const prefix = "review:"
+	for _, l := range labels {
+		if strings.HasPrefix(l, prefix) {
+			return l[len(prefix):]
+		}
+	}
+	return "submitted"
 }
 
 // safeTitle returns at most the first line of text (no raw body content in subject).

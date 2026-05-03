@@ -18,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/telegraph"
 	"github.com/steveyegge/gastown/internal/telegraph/prompts"
+	githubtr "github.com/steveyegge/gastown/internal/telegraph/providers/github"
 	jiratr "github.com/steveyegge/gastown/internal/telegraph/providers/jira"
 	"github.com/steveyegge/gastown/internal/telegraph/tlog"
 	"github.com/steveyegge/gastown/internal/telegraph/transform"
@@ -150,13 +151,26 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 	translatorMap := make(map[string]telegraph.Translator, len(resolved))
 	var providerNames []string
 	for id, rp := range resolved {
+		pc := cfg.Telegraph.Providers[id]
 		switch id {
 		case "jira":
 			var ignoreActors []string
-			if pc := cfg.Telegraph.Providers[id]; pc != nil {
+			if pc != nil {
 				ignoreActors = pc.IgnoreActors
 			}
 			translatorMap[id] = jiratr.New(rp.Secret, ignoreActors, nil)
+		case "github":
+			var (
+				events       []string
+				ignoreActors []string
+				repos        []string
+			)
+			if pc != nil {
+				events = pc.Events
+				ignoreActors = pc.IgnoreActors
+				repos = pc.Repos
+			}
+			translatorMap[id] = githubtr.New(rp.Secret, events, ignoreActors, repos, nil)
 		default:
 			return fmt.Errorf("telegraph: unsupported provider %q", id)
 		}
@@ -205,10 +219,14 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 				logger.Drop(evt.Provider, "", "", "", "no_translator")
 				continue
 			}
-			norm, err := tr.Translate(evt.Body)
+			norm, err := tr.Translate(evt.Headers, evt.Body)
 			if errors.Is(err, telegraph.ErrActorFiltered) {
 				// norm is non-nil; use it to populate the audit log.
 				logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, tlog.ReasonActorFiltered)
+				continue
+			}
+			if errors.Is(err, telegraph.ErrRepoFiltered) {
+				logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, tlog.ReasonRepoFiltered)
 				continue
 			}
 			if err != nil {

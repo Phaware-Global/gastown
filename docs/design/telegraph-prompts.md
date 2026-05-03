@@ -130,7 +130,7 @@ Same `[telegraph.prompts]` table at the top level. Loaded only if the file exist
 
 Keys use `jira:comment.added` (the NormalizedEvent EventType, dotted), not `jira:comment_added` or `comment_created` (the wire-format strings). This decouples prompt config from provider webhook quirks like the bare-name comment events Jira emits — operators write prompts against Telegraph's stable internal vocabulary, not Atlassian's wire format.
 
-The full set for v1, matching what the Jira translator currently emits:
+The full set for v1, matching what the Jira and GitHub translators currently emit:
 
 | Key | Fires on |
 |---|---|
@@ -138,6 +138,15 @@ The full set for v1, matching what the Jira translator currently emits:
 | `jira:issue.updated` | Issue field change (status, assignee, summary, etc.) |
 | `jira:comment.added` | New comment |
 | `jira:comment.updated` | Comment edited |
+| `github:pull_request.opened` | PR opened / reopened / marked ready-for-review |
+| `github:pull_request.merged` | PR closed with merged=true |
+| `github:pull_request.closed_unmerged` | PR closed without merging |
+| `github:pull_request.review_submitted` | Review submitted (approved / changes_requested / commented) |
+| `github:pull_request.review_comment` | Line-level review comment created |
+| `github:pull_request.comment` | Top-level PR comment (issue_comment on a PR) |
+| `github:check_run.failed` | check_run completed with a failure-class conclusion |
+| `github:check_suite.failed` | check_suite completed with a failure-class conclusion |
+| `github:workflow_run.failed` | workflow_run completed with conclusion=failure |
 
 ### Variable substitution
 

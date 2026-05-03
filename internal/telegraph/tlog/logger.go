@@ -19,6 +19,7 @@ const (
 	ReasonBackpressure     = "backpressure"
 	ReasonProviderDisabled = "provider_disabled"
 	ReasonActorFiltered    = "actor_filtered"
+	ReasonRepoFiltered     = "repo_filtered"
 )
 
 // Counters holds one atomic counter per event class. Safe for concurrent use.
