@@ -253,6 +253,7 @@ events     = [
     "pull_request_review_comment",
     "issue_comment",
     "check_run",
+    "check_suite",
     "workflow_run",
 ]
 # Optional allow-list — empty/absent means accept events from every repo.

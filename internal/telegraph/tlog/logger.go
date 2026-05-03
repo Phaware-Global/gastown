@@ -134,7 +134,10 @@ func (l *Logger) Deliver(provider, eventType, eventID, actor, subject, mailID, p
 // Drop logs an event discarded after L2 without delivery.
 // actor may be empty for drop reasons that do not have an actor (e.g. parse errors).
 // For actor_filtered drops, actor must be populated for the audit trail.
-func (l *Logger) Drop(provider, eventType, eventID, actor, reason string) {
+// subject identifies the entity (e.g. Jira issue key, GitHub repo#PR), and is
+// included in the audit log to distinguish "what was filtered" from logs alone;
+// pass empty string for drop reasons where subject is unavailable.
+func (l *Logger) Drop(provider, eventType, eventID, actor, subject, reason string) {
 	if l == nil {
 		return
 	}
@@ -145,6 +148,7 @@ func (l *Logger) Drop(provider, eventType, eventID, actor, reason string) {
 		EventType: eventType,
 		EventID:   eventID,
 		Actor:     actor,
+		Subject:   subject,
 		Reason:    reason,
 	})
 }

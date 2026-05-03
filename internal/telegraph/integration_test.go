@@ -511,7 +511,7 @@ func newActorPipeline(t *testing.T, ignoreActors []string) *actorPipeline {
 			if err != nil {
 				if norm != nil {
 					// ErrActorFiltered: non-nil event for audit log
-					logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, tlog.ReasonActorFiltered)
+					logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, norm.Subject, tlog.ReasonActorFiltered)
 				}
 				continue
 			}
@@ -709,11 +709,11 @@ func newGitHubPipeline(t *testing.T, allowedRepos []string, ignoreActors []strin
 		for evt := range rawCh {
 			norm, err := tr.Translate(evt.Headers, evt.Body)
 			if errors.Is(err, telegraph.ErrActorFiltered) {
-				logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, tlog.ReasonActorFiltered)
+				logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, norm.Subject, tlog.ReasonActorFiltered)
 				continue
 			}
 			if errors.Is(err, telegraph.ErrRepoFiltered) {
-				logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, tlog.ReasonRepoFiltered)
+				logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, norm.Subject, tlog.ReasonRepoFiltered)
 				continue
 			}
 			if err != nil {
@@ -755,6 +755,7 @@ func (p *githubPipeline) post(t *testing.T, wireEvent string, body []byte) *http
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
+	t.Cleanup(func() { resp.Body.Close() })
 	return resp
 }
 
@@ -832,6 +833,7 @@ func TestIntegration_GitHub_BadSignature_Rejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("HTTP = %d, want 401", resp.StatusCode)
 	}
@@ -852,6 +854,12 @@ func TestIntegration_GitHub_RepoFilter_DropsExcluded(t *testing.T) {
 	}
 	if !strings.Contains(p.logBuf.String(), `"repo_filtered"`) {
 		t.Errorf("drop log missing repo_filtered reason:\n%s", p.logBuf.String())
+	}
+	// Subject must appear in the drop log so operators can identify *what*
+	// was filtered without re-deriving it from the payload (gemini/augment
+	// review feedback on PR #60).
+	if !strings.Contains(p.logBuf.String(), `"acme/excluded#1"`) {
+		t.Errorf("drop log missing subject acme/excluded#1:\n%s", p.logBuf.String())
 	}
 }
 

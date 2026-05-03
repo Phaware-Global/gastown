@@ -37,7 +37,7 @@ events        = [
 # enabled       = true
 # secret_env    = "GT_TELEGRAPH_GITHUB_SECRET"
 # events        = ["pull_request", "pull_request_review", "pull_request_review_comment",
-#                  "issue_comment", "check_run", "workflow_run"]
+#                  "issue_comment", "check_run", "check_suite", "workflow_run"]
 # repos         = ["acme/widget", "acme/sprocket"]   # allow-list; empty = all repos
 # ignore_actors = ["mayor-bot"]
 
@@ -470,7 +470,7 @@ Comparison is case-insensitive against the webhook's `repository.full_name`.
 [telegraph.providers.github]
 enabled    = true
 secret_env = "GT_TELEGRAPH_GITHUB_SECRET"
-events     = ["pull_request", "pull_request_review", "check_run", "workflow_run"]
+events     = ["pull_request", "pull_request_review", "check_run", "check_suite", "workflow_run"]
 repos      = ["acme/widget", "acme/sprocket"]
 ```
 

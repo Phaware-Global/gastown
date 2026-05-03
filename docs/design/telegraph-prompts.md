@@ -146,7 +146,7 @@ The full set for v1, matching what the Jira and GitHub translators currently emi
 | `github:pull_request.comment` | Top-level PR comment (issue_comment on a PR) |
 | `github:check_run.failed` | check_run completed with a failure-class conclusion |
 | `github:check_suite.failed` | check_suite completed with a failure-class conclusion |
-| `github:workflow_run.failed` | workflow_run completed with conclusion=failure |
+| `github:workflow_run.failed` | workflow_run completed with a failure-class conclusion (failure, timed_out, cancelled, action_required, stale, startup_failure) |
 
 ### Variable substitution
 

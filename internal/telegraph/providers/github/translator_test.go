@@ -683,6 +683,40 @@ func TestTranslate_MalformedTimestampYieldsZero(t *testing.T) {
 	}
 }
 
+// ---- ValidateEvents ----
+
+func TestValidateEvents_Empty(t *testing.T) {
+	if err := github.ValidateEvents(nil); err != nil {
+		t.Errorf("nil: %v, want nil", err)
+	}
+	if err := github.ValidateEvents([]string{}); err != nil {
+		t.Errorf("[]: %v, want nil", err)
+	}
+}
+
+func TestValidateEvents_AllSupported(t *testing.T) {
+	if err := github.ValidateEvents([]string{"pull_request", "check_run"}); err != nil {
+		t.Errorf("supported set: %v", err)
+	}
+}
+
+func TestValidateEvents_AnyUnsupportedRejected(t *testing.T) {
+	// Mix of supported and typo — must fail to prevent the silent-drop footgun.
+	err := github.ValidateEvents([]string{"pull_request", "puul_request"})
+	if err == nil {
+		t.Fatal("expected error for typo'd entry")
+	}
+	if !strings.Contains(err.Error(), "puul_request") {
+		t.Errorf("error should name the bad entry, got: %v", err)
+	}
+}
+
+func TestValidateEvents_AllTyposRejected(t *testing.T) {
+	if err := github.ValidateEvents([]string{"foo", "bar"}); err == nil {
+		t.Fatal("expected error for all-typo events list")
+	}
+}
+
 // TestTranslate_ValidTimestampParsed confirms the happy path still parses.
 func TestTranslate_ValidTimestampParsed(t *testing.T) {
 	body, _ := json.Marshal(map[string]any{

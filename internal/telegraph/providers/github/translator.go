@@ -52,6 +52,34 @@ var SupportedWireEvents = []string{
 	"workflow_run",
 }
 
+// ValidateEvents returns an error if any entry in events is not a recognised
+// X-GitHub-Event wire-format name. Empty events is valid and means "accept
+// every supported event."
+//
+// Callers (the daemon startup path) should invoke this before constructing a
+// Translator so an all-typo events list fails fast at startup instead of
+// silently dropping every webhook delivery as ErrUnknownEventType at runtime.
+func ValidateEvents(events []string) error {
+	if len(events) == 0 {
+		return nil
+	}
+	supported := make(map[string]struct{}, len(SupportedWireEvents))
+	for _, e := range SupportedWireEvents {
+		supported[e] = struct{}{}
+	}
+	var unknown []string
+	for _, e := range events {
+		if _, ok := supported[e]; !ok {
+			unknown = append(unknown, e)
+		}
+	}
+	if len(unknown) > 0 {
+		return fmt.Errorf("github: unsupported event(s) %v — must be one of %v",
+			unknown, SupportedWireEvents)
+	}
+	return nil
+}
+
 // New creates a GitHub Translator.
 //
 // secret is the HMAC-SHA256 key registered with GitHub's webhook config.
