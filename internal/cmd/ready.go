@@ -452,10 +452,9 @@ func filterIdentityBeads(issues []*beads.Issue) []*beads.Issue {
 			continue
 		}
 
-		// Filter refinery workflow step beads (created by "<rig>/refinery").
-		// These are internal orchestration work and should never be dispatched
-		// to polecats via the normal ready/scheduler path.
-		if strings.HasSuffix(issue.CreatedBy, "/refinery") {
+		// Filter refinery workflow step beads — internal orchestration work
+		// that should never be dispatched to polecats via the scheduler.
+		if beads.IsRefineryWorkflowBead(issue) {
 			continue
 		}
 

@@ -162,10 +162,17 @@ func TestFilterIdentityBeads_SkipsRefineryWorkflowBeads(t *testing.T) {
 	filtered := filterIdentityBeads(issues)
 
 	if len(filtered) != 3 {
-		t.Errorf("got %d issues, want 3 (refinery workflow beads should be filtered)", len(filtered))
+		t.Errorf("got %d issues, want 3 (refinery beads should be filtered), got IDs: %v",
+			len(filtered), func() []string {
+				ids := make([]string, len(filtered))
+				for i, f := range filtered {
+					ids[i] = f.ID
+				}
+				return ids
+			}())
 	}
 	for _, issue := range filtered {
-		if issue.ID == "ha-wfs-ntqxq" || issue.ID == "ha-wfs-pzclw" {
+		if beads.IsRefineryWorkflowBead(issue) {
 			t.Errorf("refinery workflow bead %q should have been filtered out", issue.ID)
 		}
 	}

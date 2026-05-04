@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -99,7 +100,7 @@ func ScanStaleHooks(townRoot string, cfg *StaleHookConfig) (*StaleHookScanResult
 	for _, bead := range hookedBeads {
 		// Refinery workflow step beads are refinery-internal orchestration work.
 		// They should never be unhooked and re-dispatched to polecats.
-		if isRefineryCreatedBead(bead.CreatedBy) {
+		if beads.IsRefineryWorkflowBead(&beads.Issue{CreatedBy: bead.CreatedBy}) {
 			continue
 		}
 
@@ -265,9 +266,3 @@ func unhookBead(townRoot, beadID string) error {
 	return cmd.Run()
 }
 
-// isRefineryCreatedBead returns true if a bead was created by a refinery agent.
-// Refinery workflow step beads are internal orchestration work that should
-// never be dispatched to polecats. Created-by address format: "<rig>/refinery".
-func isRefineryCreatedBead(createdBy string) bool {
-	return strings.HasSuffix(createdBy, "/refinery")
-}

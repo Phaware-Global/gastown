@@ -5,6 +5,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 func TestAssigneeToSessionName(t *testing.T) {
@@ -272,7 +274,7 @@ func TestStaleHookResult_PartialWorkFields(t *testing.T) {
 	}
 }
 
-func TestIsRefineryCreatedBead(t *testing.T) {
+func TestIsRefineryWorkflowBead(t *testing.T) {
 	tests := []struct {
 		createdBy string
 		want      bool
@@ -290,9 +292,10 @@ func TestIsRefineryCreatedBead(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.createdBy, func(t *testing.T) {
-			got := isRefineryCreatedBead(tt.createdBy)
+			issue := &beads.Issue{CreatedBy: tt.createdBy}
+			got := beads.IsRefineryWorkflowBead(issue)
 			if got != tt.want {
-				t.Errorf("isRefineryCreatedBead(%q) = %v, want %v", tt.createdBy, got, tt.want)
+				t.Errorf("IsRefineryWorkflowBead(%q) = %v, want %v", tt.createdBy, got, tt.want)
 			}
 		})
 	}
