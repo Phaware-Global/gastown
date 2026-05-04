@@ -19,6 +19,14 @@ const (
 	bdReadTimeout = 60 * time.Second
 	// bdWriteTimeout is the timeout for bd write operations (create, close, label, reopen).
 	bdWriteTimeout = 60 * time.Second
+	// bdProbeTimeout is a short timeout for "is this no-op?" probe reads that
+	// run before a write to skip an already-satisfied UPDATE+DOLT_COMMIT cycle.
+	// Bounded at 5s so a slow/dead Dolt cannot double the tail latency of
+	// MarkRead / closeInDir on the failure path: worst case is one probe miss
+	// (5s) followed by the actual write hitting bdWriteTimeout (60s), instead
+	// of two back-to-back 60s timeouts. The probe failing falls through to
+	// the unguarded write — semantically a no-op, just no fast path.
+	bdProbeTimeout = 5 * time.Second
 )
 
 // bdError represents an error from running a bd command.
@@ -138,5 +146,15 @@ func bdReadCtx() (context.Context, context.CancelFunc) {
 //nolint:gosec // The cancel function is returned to callers, who are responsible for invoking it.
 func bdWriteCtx() (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithTimeout(context.Background(), bdWriteTimeout)
+	return ctx, cancel
+}
+
+// bdProbeCtx returns a context with the short probe timeout for is-this-noop
+// reads that gate a subsequent write. Bounded so a slow Dolt cannot double
+// the tail latency of the gated operation.
+//
+//nolint:gosec // The cancel function is returned to callers, who are responsible for invoking it.
+func bdProbeCtx() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), bdProbeTimeout)
 	return ctx, cancel
 }

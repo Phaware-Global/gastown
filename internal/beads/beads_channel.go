@@ -13,12 +13,19 @@ import (
 
 // ChannelFields holds structured fields for channel beads.
 // These are stored as "key: value" lines in the description.
+//
+// Retention semantics: RetentionCount and RetentionHours both apply to OPEN
+// (un-closed) messages only. Closed beads do not count toward the retention
+// limit and are not re-closed by retention sweeps — re-closing an
+// already-closed bead is a no-op write that contributes only to dolt log
+// noise and CPU. EnforceChannelRetention and PruneAllChannels both filter
+// to open messages before computing retention thresholds.
 type ChannelFields struct {
 	Name           string   // Unique channel name (e.g., "alerts", "builds")
 	Subscribers    []string // Addresses subscribed to this channel
 	Status         string   // active, closed
-	RetentionCount int      // Number of recent messages to retain (0 = unlimited)
-	RetentionHours int      // Hours to retain messages (0 = forever)
+	RetentionCount int      // Number of recent OPEN messages to retain (0 = unlimited; closed beads excluded)
+	RetentionHours int      // Hours to retain OPEN messages (0 = forever; closed beads excluded)
 	CreatedBy      string   // Who created the channel
 	CreatedAt      string   // ISO 8601 timestamp
 }

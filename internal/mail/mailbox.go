@@ -588,9 +588,15 @@ func (m *Mailbox) closeInDir(id, beadsDir string) error {
 // running `bd show <id> --json`. Returns (status, labels, ErrMessageNotFound)
 // when the bead does not exist. Used by the markReadOnly / closeInDir guards
 // to skip writes that would be no-ops.
+//
+// Uses the SHORT probe timeout (bdProbeTimeout) rather than the full read
+// timeout so a slow/dead Dolt cannot double the tail latency of the gated
+// MarkRead / closeInDir call: on probe failure, the caller falls through to
+// the actual write (which has its own bdWriteTimeout). Worst case = probe
+// timeout + write timeout, not 2× write timeout.
 func (m *Mailbox) bdShowStatusLabels(id, beadsDir string) (string, []string, error) {
 	args := []string{"show", id, "--json"}
-	ctx, cancel := bdReadCtx()
+	ctx, cancel := bdProbeCtx()
 	defer cancel()
 	stdout, err := runBdCommand(ctx, args, m.workDir, beadsDir)
 	if err != nil {
@@ -659,16 +665,12 @@ func (m *Mailbox) markReadOnlyBeads(id string) error {
 	args := []string{"label", "add", id, "read"}
 	primary := beads.ResolveBeadsDirForID(m.beadsDir, id)
 
-	// Skip the bd label add shell-out if the "read" label is already present.
-	// Without this guard, a re-mark-read fires an UPSERT that matches 0 rows
-	// and produces a "nothing to commit" warning per call. See closeInDir for
-	// the same pattern's rationale.
-	if _, labels, err := m.bdShowStatusLabels(id, primary); err == nil {
-		for _, l := range labels {
-			if l == "read" {
-				return nil
-			}
-		}
+	// Skip the bd label add shell-out if the "read" label is already present
+	// in the bead's resolved location. Without this guard, a re-mark-read
+	// fires an UPSERT that matches 0 rows and produces a "nothing to commit"
+	// warning per call. See closeInDir for the same pattern's rationale.
+	if hasReadLabel(m.bdShowStatusLabels(id, primary)) {
+		return nil
 	}
 
 	ctx, cancel := bdWriteCtx()
@@ -678,6 +680,13 @@ func (m *Mailbox) markReadOnlyBeads(id string) error {
 		if bdErr, ok := err.(*bdError); ok && bdErr.ContainsError("not found") || bdErr.ContainsError("no issue found") {
 			if primary != m.beadsDir {
 				// Cross-rig bead IDs (e.g. ne-*) may live in the home DB. See ne-bgr.
+				// Apply the same "already labeled" probe to the fallback DB so the
+				// no-op avoidance covers this path too — otherwise repeated
+				// MarkReadOnly on a cross-rig bead would still hit the unguarded
+				// label-add UPSERT and emit "nothing to commit" warnings.
+				if hasReadLabel(m.bdShowStatusLabels(id, m.beadsDir)) {
+					return nil
+				}
 				ctx2, cancel2 := bdWriteCtx()
 				defer cancel2()
 				_, err2 := runBdCommand(ctx2, args, m.workDir, m.beadsDir)
@@ -695,6 +704,23 @@ func (m *Mailbox) markReadOnlyBeads(id string) error {
 	}
 
 	return nil
+}
+
+// hasReadLabel reports whether the given (status, labels, err) tuple from
+// bdShowStatusLabels indicates the bead already carries the "read" label.
+// Returns false on any error (probe failed → caller should attempt the
+// write), or when the label is absent. Centralised so both the primary
+// and cross-rig fallback paths in markReadOnlyBeads share the same logic.
+func hasReadLabel(_ string, labels []string, err error) bool {
+	if err != nil {
+		return false
+	}
+	for _, l := range labels {
+		if l == "read" {
+			return true
+		}
+	}
+	return false
 }
 
 // MarkUnreadOnly marks a message as unread (removes "read" label).
