@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
@@ -48,6 +49,36 @@ type Router struct {
 	IdleNotifyTimeout time.Duration
 
 	notifyWg sync.WaitGroup // tracks in-flight async notifications
+
+	// stores holds optional in-process beadsdk.Storage handles keyed by rig
+	// name (and "hq" for the town-level store). When set, Mailboxes returned
+	// by GetMailbox are constructed with the matching store attached so they
+	// bypass the bd subprocess. Set via SetStores. The router does not own
+	// the lifecycle — callers retain ownership and must close stores.
+	stores map[string]beadsdk.Storage
+}
+
+// SetStores attaches a map of in-process beadsdk.Storage handles to the
+// router. Keys must match the rig name conventions used by Daemon.BeadsStores
+// ("hq" for the town-level store, rig names for per-rig stores). When set,
+// GetMailbox uses the matching store to construct Mailboxes that bypass the
+// bd subprocess.
+//
+// Callers retain ownership of the stores and are responsible for closing
+// them; the router does not call Close().
+func (r *Router) SetStores(stores map[string]beadsdk.Storage) {
+	r.stores = stores
+}
+
+// townBeads returns a *beads.Beads bound to the town root, with the in-process
+// hq store attached when one is available. Used by router methods that operate
+// on town-level beads (channels, agent notification settings, etc.).
+func (r *Router) townBeads() *beads.Beads {
+	b := beads.New(r.townRoot)
+	if hq := r.stores["hq"]; hq != nil {
+		b.SetStore(hq)
+	}
+	return b
 }
 
 // NewRouter creates a new mail router.
@@ -1423,7 +1454,7 @@ func (r *Router) sendToChannel(msg *Message) error {
 	if r.townRoot == "" {
 		return fmt.Errorf("town root not set, cannot send to channel: %s", channelName)
 	}
-	b := beads.New(r.townRoot)
+	b := r.townBeads()
 	_, fields, err := b.GetChannelBead(channelName)
 	if err != nil {
 		return fmt.Errorf("getting channel %s: %w", channelName, err)
@@ -1588,10 +1619,47 @@ func isSelfMail(from, to string) bool {
 
 // GetMailbox returns a Mailbox for the given address.
 // Routes to the correct beads database based on the address.
+//
+// When the router has stores attached (via SetStores), the returned Mailbox
+// is constructed with the matching store so subsequent operations use the
+// in-process beadsdk path instead of spawning bd subprocesses. The store
+// key is derived from the address: rig-prefixed addresses use the rig name,
+// town-level addresses (mayor/, deacon/) use "hq".
 func (r *Router) GetMailbox(address string) (*Mailbox, error) {
 	beadsDir := r.resolveBeadsDir()
 	workDir := filepath.Dir(beadsDir) // Parent of .beads
-	return NewMailboxFromAddress(address, workDir), nil
+	mb := NewMailboxFromAddress(address, workDir)
+	if store := r.storeForAddress(address); store != nil {
+		mb.SetStore(store)
+	}
+	return mb, nil
+}
+
+// storeForAddress returns the in-process store appropriate for mail
+// operations against the given address, or nil when no matching store is
+// attached.
+//
+// All Gas Town mail lives in the town-level (hq) beads database — see
+// resolveBeadsDir(), which hard-codes mail to {townRoot}/.beads regardless
+// of address. So for mail purposes, every direct address (including
+// rig-prefixed ones like "gastown/Toast" or "heartworks_ios/witness")
+// routes to the hq store. Returning a per-rig store here would create a
+// split-brain: SDK reads/writes would target the rig DB while the bd CLI
+// fallback would target hq.
+//
+// Non-direct addresses (list:foo, queue:foo, channel:foo, announce:foo)
+// return nil so the caller falls back to the bd CLI path; their
+// dispatch flow goes through code that does not call GetMailbox.
+func (r *Router) storeForAddress(address string) beadsdk.Storage {
+	if len(r.stores) == 0 {
+		return nil
+	}
+	for _, prefix := range []string{"list:", "queue:", "channel:", "announce:"} {
+		if strings.HasPrefix(address, prefix) {
+			return nil
+		}
+	}
+	return r.stores["hq"]
 }
 
 // notifyRecipient sends a notification to a recipient's tmux session.
@@ -1807,7 +1875,7 @@ func (r *Router) isRecipientMuted(address string) bool {
 		return false // Can't determine agent bead, allow notification
 	}
 
-	bd := beads.New(r.townRoot)
+	bd := r.townBeads()
 	level, err := bd.GetAgentNotificationLevel(agentBeadID)
 	if err != nil {
 		return false // Agent bead might not exist, allow notification

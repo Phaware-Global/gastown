@@ -59,6 +59,16 @@ type Daemon struct {
 	curator       *feed.Curator
 	convoyManager *ConvoyManager
 	beadsStores   map[string]beadsdk.Storage
+	// storesMu guards beadsStores. Two writers exist: the synchronous
+	// initialization in Run() (before the convoy goroutine starts) and the
+	// lazy storeOpener callback (called from the convoy poll goroutine when
+	// Dolt comes up after daemon start). Readers — including hasActiveWork
+	// from the heartbeat loop, BeadsStore/BeadsStores from downstream
+	// packages, and the close-on-shutdown path — must take the lock to
+	// avoid a Go race-detector violation in the deferred-open scenario
+	// (heartbeat reads concurrently with the convoy goroutine's late
+	// assignment).
+	storesMu sync.Mutex
 	doltServer       *DoltServerManager
 	telegraphServer  *TelegraphServerManager
 	krcPruner        *KRCPruner
@@ -440,12 +450,23 @@ func (d *Daemon) Run() (err error) {
 	}
 	var storeOpener func() map[string]beadsdk.Storage
 	if len(d.beadsStores) == 0 {
+		// Lazy opener: when stores were not available at startup (e.g.,
+		// Dolt was not yet ready), this is called from the convoy poll
+		// loop on each tick until it succeeds. We assign back into
+		// d.beadsStores under storesMu so downstream accessors
+		// (BeadsStore, BeadsStores) see the populated map for the rest
+		// of the daemon's life. Without this assignment, a deferred-open
+		// scenario would leave BeadsStore returning nil forever and force
+		// recorder/router back to bd shell-outs.
 		storeOpener = func() map[string]beadsdk.Storage {
 			stores, err := d.openBeadsStores()
 			if err != nil {
 				d.logger.Printf("Convoy: beads compatibility check failed: %v", err)
 				return nil
 			}
+			d.storesMu.Lock()
+			d.beadsStores = stores
+			d.storesMu.Unlock()
 			return stores
 		}
 	}
@@ -1320,8 +1341,19 @@ func (d *Daemon) ensureBootRunning() {
 //
 // Returns true conservatively on error or when no stores are available, so the
 // caller falls through to spawn Boot rather than suppressing it incorrectly.
+//
+// Snapshots beadsStores under storesMu so the lazy storeOpener callback (in
+// the convoy poll goroutine) cannot race with this read in the deferred-open
+// scenario.
 func (d *Daemon) hasActiveWork() bool {
-	if len(d.beadsStores) == 0 {
+	d.storesMu.Lock()
+	stores := make(map[string]beadsdk.Storage, len(d.beadsStores))
+	for k, v := range d.beadsStores {
+		stores[k] = v
+	}
+	d.storesMu.Unlock()
+
+	if len(stores) == 0 {
 		// No stores open — cannot inspect; let Boot run to be safe.
 		return true
 	}
@@ -1329,7 +1361,7 @@ func (d *Daemon) hasActiveWork() bool {
 	ctx, cancel := context.WithTimeout(d.ctx, 5*time.Second)
 	defer cancel()
 
-	for name, store := range d.beadsStores {
+	for name, store := range stores {
 		for _, rawStatus := range []string{"in_progress"} {
 			s := beadsdk.Status(rawStatus)
 			filter := beadsdk.IssueFilter{Status: &s, Limit: 1}
@@ -1944,6 +1976,51 @@ func (d *Daemon) killDefaultPrefixGhosts() {
 	}
 }
 
+// BeadsStore returns the in-process beadsdk.Storage for the given rig name,
+// or nil if the rig has no open store. Use "hq" for the town-level store.
+//
+// The returned store is shared — callers MUST NOT call Close() on it. The
+// daemon owns the store lifecycle and closes all stores during shutdown via
+// closeBeadsStores().
+//
+// This is the single accessor exposed to other daemon-resident packages
+// (mail.Router, plugin.Recorder, beads.Beads) so they can route through the
+// long-lived in-process pool instead of spawning bd subprocesses.
+//
+// Safe to call from any goroutine; takes storesMu briefly to coordinate
+// with the lazy storeOpener callback that may populate beadsStores after
+// daemon start.
+func (d *Daemon) BeadsStore(rigName string) beadsdk.Storage {
+	d.storesMu.Lock()
+	defer d.storesMu.Unlock()
+	if d.beadsStores == nil {
+		return nil
+	}
+	return d.beadsStores[rigName]
+}
+
+// BeadsStores returns a SHALLOW COPY of the map of open in-process stores,
+// keyed by rig name (and "hq" for the town-level store). Returns nil when
+// stores are not yet open.
+//
+// The map is copied so callers cannot accidentally mutate the daemon's
+// internal registry. The store handles inside the map are shared — callers
+// MUST NOT call Close() on them.
+//
+// For single-rig lookups, prefer BeadsStore(rigName).
+func (d *Daemon) BeadsStores() map[string]beadsdk.Storage {
+	d.storesMu.Lock()
+	defer d.storesMu.Unlock()
+	if d.beadsStores == nil {
+		return nil
+	}
+	stores := make(map[string]beadsdk.Storage, len(d.beadsStores))
+	for k, v := range d.beadsStores {
+		stores[k] = v
+	}
+	return stores
+}
+
 // openBeadsStores opens beads stores for the town (hq) and all known rigs.
 // Returns a map keyed by "hq" for town-level and rig names for per-rig stores.
 // Stores that fail to open are logged and skipped. Successfully opened stores
@@ -2157,7 +2234,14 @@ func (d *Daemon) shutdown(state *State) error { //nolint:unparam // error return
 		d.convoyManager.Stop()
 		d.logger.Println("Convoy manager stopped")
 	}
+	// Take storesMu when nil-ing the map so the BeadsStore/BeadsStores
+	// accessors and the lazy storeOpener path don't race against shutdown.
+	// Without the lock, a heartbeat-loop reader could observe a partially
+	// nil-ed map and panic on lookup, or storeOpener could overwrite the
+	// nil with a freshly-opened map after shutdown completes.
+	d.storesMu.Lock()
 	d.beadsStores = nil
+	d.storesMu.Unlock()
 
 	// Stop KRC pruner
 	if d.krcPruner != nil {

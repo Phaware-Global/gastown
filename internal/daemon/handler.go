@@ -236,8 +236,19 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 		return
 	}
 
-	recorder := plugin.NewRecorder(d.config.TownRoot)
+	// Plugin runs are recorded as ephemeral wisps in the town-level (hq) store.
+	// When the daemon's hq store is open, route through the in-process pool
+	// instead of spawning a `bd create` subprocess per dispatched plugin.
+	var recorder *plugin.Recorder
+	if hqStore := d.BeadsStore("hq"); hqStore != nil {
+		recorder = plugin.NewRecorderWithStore(d.config.TownRoot, hqStore)
+	} else {
+		recorder = plugin.NewRecorder(d.config.TownRoot)
+	}
 	router := mail.NewRouterWithTownRoot(d.config.TownRoot, d.config.TownRoot)
+	if stores := d.BeadsStores(); len(stores) > 0 {
+		router.SetStores(stores)
+	}
 
 	for _, p := range plugins {
 		// Never auto-dispatch manual-gate plugins — they require an explicit trigger.
