@@ -407,14 +407,15 @@ func getWispIDs(beadsPath string) map[string]bool {
 	return wispIDs
 }
 
-// filterIdentityBeads removes agent, role, and rig identity beads from the list.
-// These are status trackers, not actionable work items.
+// filterIdentityBeads removes agent, role, rig, and refinery workflow beads from the list.
+// These are status trackers or internal orchestration work, not actionable polecat tasks.
 //
 // Since bd ready --json doesn't include labels, we filter by:
 //   - issue_type "agent" (agent lifecycle beads)
 //   - Labels if present (gt:agent, gt:role, gt:rig)
 //   - ID suffix "-role" (role definition beads like hq-crew-role)
 //   - ID prefix matching "<prefix>-rig-" (rig identity beads like gt-rig-gastown)
+//   - created_by ending in "/refinery" (refinery workflow step beads)
 func filterIdentityBeads(issues []*beads.Issue) []*beads.Issue {
 	identityLabels := map[string]bool{
 		"gt:agent": true,
@@ -448,6 +449,13 @@ func filterIdentityBeads(issues []*beads.Issue) []*beads.Issue {
 
 		// Filter rig identity beads (IDs containing "-rig-")
 		if strings.Contains(issue.ID, "-rig-") {
+			continue
+		}
+
+		// Filter refinery workflow step beads (created by "<rig>/refinery").
+		// These are internal orchestration work and should never be dispatched
+		// to polecats via the normal ready/scheduler path.
+		if strings.HasSuffix(issue.CreatedBy, "/refinery") {
 			continue
 		}
 

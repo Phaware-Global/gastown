@@ -271,3 +271,29 @@ func TestStaleHookResult_PartialWorkFields(t *testing.T) {
 		t.Errorf("UnpushedCount = %d, want 3", result.UnpushedCount)
 	}
 }
+
+func TestIsRefineryCreatedBead(t *testing.T) {
+	tests := []struct {
+		createdBy string
+		want      bool
+	}{
+		{"heartworks_android/refinery", true},
+		{"gastown/refinery", true},
+		{"my-rig/refinery", true},
+		{"heartworks_android/polecats/obsidian", false},
+		{"heartworks_android/witness", false},
+		{"mayor", false},
+		{"deacon", false},
+		{"refinery", false}, // bare "refinery" without rig prefix is not a rig-scoped refinery
+		{"", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.createdBy, func(t *testing.T) {
+			got := isRefineryCreatedBead(tt.createdBy)
+			if got != tt.want {
+				t.Errorf("isRefineryCreatedBead(%q) = %v, want %v", tt.createdBy, got, tt.want)
+			}
+		})
+	}
+}

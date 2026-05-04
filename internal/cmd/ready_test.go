@@ -149,3 +149,24 @@ func TestFilterFormulaScaffolds_DotInNonScaffold(t *testing.T) {
 		t.Errorf("got %d issues, want 2 (non-formula dots should not filter)", len(filtered))
 	}
 }
+
+func TestFilterIdentityBeads_SkipsRefineryWorkflowBeads(t *testing.T) {
+	issues := []*beads.Issue{
+		{ID: "ha-wfs-ntqxq", Title: "Handle quality check or test failures", CreatedBy: "heartworks_android/refinery"},
+		{ID: "ha-wfs-pzclw", Title: "Mechanical rebase", CreatedBy: "gastown/refinery"},
+		{ID: "ha-abc", Title: "Real polecat work", CreatedBy: "heartworks_android/polecats/obsidian"},
+		{ID: "ha-def", Title: "Another task", CreatedBy: "mayor"},
+		{ID: "ha-ghi", Title: "No creator"},
+	}
+
+	filtered := filterIdentityBeads(issues)
+
+	if len(filtered) != 3 {
+		t.Errorf("got %d issues, want 3 (refinery workflow beads should be filtered)", len(filtered))
+	}
+	for _, issue := range filtered {
+		if issue.ID == "ha-wfs-ntqxq" || issue.ID == "ha-wfs-pzclw" {
+			t.Errorf("refinery workflow bead %q should have been filtered out", issue.ID)
+		}
+	}
+}

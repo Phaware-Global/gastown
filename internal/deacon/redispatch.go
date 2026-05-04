@@ -302,6 +302,14 @@ func Redispatch(townRoot, beadID, sourceRig string, maxAttempts int, cooldown ti
 		return result
 	}
 
+	// Skip refinery workflow step beads — these are internal orchestration work
+	// that should never be re-dispatched to polecats after a zombie recovery.
+	if createdBy := getBeadCreatedBy(townRoot, beadID); isRefineryCreatedBead(createdBy) {
+		result.Action = "skipped"
+		result.Message = fmt.Sprintf("refinery workflow step bead (created_by=%s)", createdBy)
+		return result
+	}
+
 	// Determine agent override from model escalation config (if any).
 	escalationAgent := resolveAgentForRedispatch(townRoot, targetRig, beadState)
 
@@ -392,6 +400,26 @@ func getBeadStatusForRedispatch(townRoot, beadID string) string {
 		return ""
 	}
 	return issues[0].Status
+}
+
+// getBeadCreatedBy returns the created_by field for a bead, or "" on failure.
+func getBeadCreatedBy(townRoot, beadID string) string {
+	cmd := exec.Command("bd", "show", beadID, "--json")
+	cmd.Dir = townRoot
+	util.SetDetachedProcessGroup(cmd)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	var issues []struct {
+		CreatedBy string `json:"created_by"`
+	}
+	if err := json.Unmarshal(output, &issues); err != nil || len(issues) == 0 {
+		return ""
+	}
+	return issues[0].CreatedBy
 }
 
 // LoadModelEscalationConfig loads model escalation rules from a rig project directory.
