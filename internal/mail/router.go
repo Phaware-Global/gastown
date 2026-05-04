@@ -1635,32 +1635,31 @@ func (r *Router) GetMailbox(address string) (*Mailbox, error) {
 	return mb, nil
 }
 
-// storeForAddress returns the in-process store appropriate for the given
-// address, or nil when no matching store is attached. Town-level addresses
-// (mayor/, deacon/, no slash prefix that matches a known rig) route to "hq".
-// Rig-prefixed addresses (e.g., "gastown/Toast", "heartworks_ios/witness")
-// route to the rig's store.
+// storeForAddress returns the in-process store appropriate for mail
+// operations against the given address, or nil when no matching store is
+// attached.
+//
+// All Gas Town mail lives in the town-level (hq) beads database — see
+// resolveBeadsDir(), which hard-codes mail to {townRoot}/.beads regardless
+// of address. So for mail purposes, every direct address (including
+// rig-prefixed ones like "gastown/Toast" or "heartworks_ios/witness")
+// routes to the hq store. Returning a per-rig store here would create a
+// split-brain: SDK reads/writes would target the rig DB while the bd CLI
+// fallback would target hq.
+//
+// Non-direct addresses (list:foo, queue:foo, channel:foo, announce:foo)
+// return nil so the caller falls back to the bd CLI path; their
+// dispatch flow goes through code that does not call GetMailbox.
 func (r *Router) storeForAddress(address string) beadsdk.Storage {
 	if len(r.stores) == 0 {
 		return nil
 	}
-	// Strip leading namespace markers and extract the first path segment.
-	// Addresses like "list:foo", "queue:foo", "channel:foo", "announce:foo"
-	// don't map to a single rig — fall back to nil and let the caller use
-	// the bd-shell-out path.
 	for _, prefix := range []string{"list:", "queue:", "channel:", "announce:"} {
 		if strings.HasPrefix(address, prefix) {
 			return nil
 		}
 	}
-	rig := address
-	if i := strings.Index(rig, "/"); i >= 0 {
-		rig = rig[:i]
-	}
-	if rig == "" || rig == "mayor" || rig == "deacon" {
-		return r.stores["hq"]
-	}
-	return r.stores[rig]
+	return r.stores["hq"]
 }
 
 // notifyRecipient sends a notification to a recipient's tmux session.

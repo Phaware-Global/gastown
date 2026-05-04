@@ -209,14 +209,29 @@ func (r *Recorder) queryRuns(pluginName string, limit int, since string) ([]*Plu
 
 // queryRunsStore reads plugin-run beads via the in-process store. Plugin run
 // receipts are ephemeral wisps; we filter on Labels (AND) for type:plugin-run
-// + plugin:<name> and include closed wisps so cooldown gates see all runs.
+// + plugin:<name> and explicitly include every status (Statuses) so the
+// cooldown gate sees closed runs as well as open ones — matching the
+// `--all` flag of the bd CLI fallback.
+//
+// The SDK's IssueFilter.Status defaults to "non-closed only" when nil
+// (per its godoc on IssueFilter.Status). Without an explicit Statuses
+// list, freshly-recorded plugin runs that the recorder closes (or the
+// reaper closes on cleanup) would silently disappear from the cooldown
+// query, allowing infinite re-dispatch.
 func (r *Recorder) queryRunsStore(pluginName string, limit int, since string) ([]*PluginRunBead, error) {
 	ctx, cancel := recorderCtx()
 	defer cancel()
 
 	ephemeral := true
 	filter := beadsdk.IssueFilter{
-		Labels:    []string{"type:plugin-run", fmt.Sprintf("plugin:%s", pluginName)},
+		Labels: []string{"type:plugin-run", fmt.Sprintf("plugin:%s", pluginName)},
+		Statuses: []beadsdk.Status{
+			beadsdk.StatusOpen,
+			beadsdk.StatusInProgress,
+			beadsdk.StatusBlocked,
+			beadsdk.StatusDeferred,
+			beadsdk.StatusClosed,
+		},
 		Ephemeral: &ephemeral,
 		Limit:     limit,
 	}
