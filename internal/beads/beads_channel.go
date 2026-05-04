@@ -13,12 +13,19 @@ import (
 
 // ChannelFields holds structured fields for channel beads.
 // These are stored as "key: value" lines in the description.
+//
+// Retention semantics: RetentionCount and RetentionHours both apply to OPEN
+// (un-closed) messages only. Closed beads do not count toward the retention
+// limit and are not re-closed by retention sweeps — re-closing an
+// already-closed bead is a no-op write that contributes only to dolt log
+// noise and CPU. EnforceChannelRetention and PruneAllChannels both filter
+// to open messages before computing retention thresholds.
 type ChannelFields struct {
 	Name           string   // Unique channel name (e.g., "alerts", "builds")
 	Subscribers    []string // Addresses subscribed to this channel
 	Status         string   // active, closed
-	RetentionCount int      // Number of recent messages to retain (0 = unlimited)
-	RetentionHours int      // Hours to retain messages (0 = forever)
+	RetentionCount int      // Number of recent OPEN messages to retain (0 = unlimited; closed beads excluded)
+	RetentionHours int      // Hours to retain OPEN messages (0 = forever; closed beads excluded)
 	CreatedBy      string   // Who created the channel
 	CreatedAt      string   // ISO 8601 timestamp
 }
@@ -398,7 +405,10 @@ func (b *Beads) EnforceChannelRetention(name string) error {
 		return nil
 	}
 
-	// Query messages in this channel (oldest first)
+	// Query messages in this channel (oldest first). We pull `status` so we
+	// can skip already-closed messages without firing a no-op `bd close` —
+	// each no-op close is an UPDATE+DOLT_COMMIT cycle that ends in "nothing
+	// to commit" and lands on the dolt query hot path.
 	out, err := b.run("list",
 		"--label=gt:message",
 		"--label=channel:"+name,
@@ -413,6 +423,7 @@ func (b *Beads) EnforceChannelRetention(name string) error {
 	var messages []struct {
 		ID        string `json:"id"`
 		CreatedAt string `json:"created_at"`
+		Status    string `json:"status"`
 	}
 	if err := json.Unmarshal(out, &messages); err != nil {
 		return fmt.Errorf("parsing channel messages: %w", err)
@@ -425,6 +436,9 @@ func (b *Beads) EnforceChannelRetention(name string) error {
 	if fields.RetentionHours > 0 {
 		cutoff := time.Now().Add(-time.Duration(fields.RetentionHours) * time.Hour)
 		for _, msg := range messages {
+			if msg.Status == "closed" {
+				continue
+			}
 			createdAt, err := time.Parse(time.RFC3339, msg.CreatedAt)
 			if err != nil {
 				continue // Skip messages with unparseable timestamps
@@ -435,11 +449,20 @@ func (b *Beads) EnforceChannelRetention(name string) error {
 		}
 	}
 
-	// Count-based retention: delete oldest messages beyond RetentionCount
+	// Count-based retention: delete oldest messages beyond RetentionCount.
+	// Filter out already-closed messages first so the count reflects live
+	// messages only (otherwise we'd "delete" closed beads that contribute
+	// nothing but a no-op write).
 	if fields.RetentionCount > 0 {
-		toDeleteByCount := len(messages) - fields.RetentionCount
-		for i := 0; i < toDeleteByCount && i < len(messages); i++ {
-			toDeleteIDs[messages[i].ID] = true
+		var openMessages []string
+		for _, msg := range messages {
+			if msg.Status != "closed" {
+				openMessages = append(openMessages, msg.ID)
+			}
+		}
+		toDeleteByCount := len(openMessages) - fields.RetentionCount
+		for i := 0; i < toDeleteByCount && i < len(openMessages); i++ {
+			toDeleteIDs[openMessages[i]] = true
 		}
 	}
 
@@ -484,6 +507,7 @@ func (b *Beads) PruneAllChannels() (int, error) {
 		var messages []struct {
 			ID        string `json:"id"`
 			CreatedAt string `json:"created_at"`
+			Status    string `json:"status"`
 		}
 		if err := json.Unmarshal(out, &messages); err != nil {
 			continue
@@ -492,10 +516,15 @@ func (b *Beads) PruneAllChannels() (int, error) {
 		// Track which messages to delete (use map to avoid duplicates)
 		toDeleteIDs := make(map[string]bool)
 
-		// Time-based retention: delete messages older than RetentionHours
+		// Time-based retention: delete messages older than RetentionHours.
+		// Skip already-closed messages — closing them again is a no-op write
+		// that ends in "nothing to commit" on the dolt query hot path.
 		if fields.RetentionHours > 0 {
 			cutoff := time.Now().Add(-time.Duration(fields.RetentionHours) * time.Hour)
 			for _, msg := range messages {
+				if msg.Status == "closed" {
+					continue
+				}
 				createdAt, err := time.Parse(time.RFC3339, msg.CreatedAt)
 				if err != nil {
 					continue // Skip messages with unparseable timestamps
@@ -506,13 +535,21 @@ func (b *Beads) PruneAllChannels() (int, error) {
 			}
 		}
 
-		// Count-based retention with 10% buffer to avoid thrashing
+		// Count-based retention with 10% buffer to avoid thrashing. The
+		// count must reflect live messages only — including closed beads
+		// makes the threshold trip on a population the close won't affect.
 		if fields.RetentionCount > 0 {
+			var openMessages []string
+			for _, msg := range messages {
+				if msg.Status != "closed" {
+					openMessages = append(openMessages, msg.ID)
+				}
+			}
 			threshold := int(float64(fields.RetentionCount) * 1.1)
-			if len(messages) > threshold {
-				toDeleteByCount := len(messages) - fields.RetentionCount
-				for i := 0; i < toDeleteByCount && i < len(messages); i++ {
-					toDeleteIDs[messages[i].ID] = true
+			if len(openMessages) > threshold {
+				toDeleteByCount := len(openMessages) - fields.RetentionCount
+				for i := 0; i < toDeleteByCount && i < len(openMessages); i++ {
+					toDeleteIDs[openMessages[i]] = true
 				}
 			}
 		}

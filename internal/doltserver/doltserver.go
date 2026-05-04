@@ -289,7 +289,7 @@ func DefaultConfig(townRoot string) *Config {
 		ReadTimeoutMs:  DefaultReadTimeoutMs,
 		WriteTimeoutMs: DefaultWriteTimeoutMs,
 		WaitTimeoutSec: DefaultWaitTimeoutSec,
-		LogLevel:       "warning",
+		LogLevel:       "error",
 	}
 
 	// Optional override for the idle-session timeout. Negative values disable
@@ -359,9 +359,13 @@ func DefaultConfig(townRoot string) *Config {
 		}
 	}
 
-	// Default to warning logging. Use GT_DOLT_LOGLEVEL=info or =debug for diagnostics.
+	// Default to error logging. The "nothing to commit" warnings emitted at
+	// `warning` level are on the dolt query hot path (logrus.WithFields shows
+	// up in goroutine dumps under load) and account for ~180k log lines per
+	// few days at current bd-shell-out rates. Use GT_DOLT_LOGLEVEL=warning or
+	// =info for diagnostics.
 	if config.LogLevel == "" {
-		config.LogLevel = "warning"
+		config.LogLevel = "error"
 	}
 
 	return config
@@ -1347,8 +1351,12 @@ data_dir: "%s"
 behavior:
   dolt_transaction_commit: false
   auto_gc_behavior:
-    enable: true
-    archive_level: 1
+    # Disabled: with the high short-write rate from bd shell-outs, the
+    # auto-archive worker kept 40+ GC goroutines runnable concurrently with
+    # foreground queries and was a measurable CPU contributor. Run
+    # 'gt dolt rebase' or 'dolt gc' on a schedule instead. (Re-enable by
+    # editing internal/doltserver/doltserver.go writeServerConfig.)
+    enable: false
 `,
 		config.LogLevel,
 		config.Port,

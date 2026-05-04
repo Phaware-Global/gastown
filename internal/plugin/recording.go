@@ -102,8 +102,20 @@ func (r *Recorder) RecordRun(record PluginRunRecord) (string, error) {
 		return "", fmt.Errorf("parsing bd create output: %w", err)
 	}
 
-	// Close the receipt immediately — it exists for audit/cooldown-gate queries
-	// (which use --all to include closed beads) but should not stay open.
+	// Close the receipt immediately so it doesn't get promoted to a
+	// persistent issue. `gt compact` (internal/cmd/compact.go:223-236) treats
+	// non-closed wisps past TTL with no comments and no parent as
+	// "proven value" and PROMOTES them to the issues table — without an
+	// immediate close, accumulated plugin-run receipts would pollute issues
+	// forever. The close also makes them eligible for `bd mol wisp gc
+	// --closed`, the fast cleanup path.
+	//
+	// The second MySQL session per dispatch is the cost we pay for proper
+	// cleanup. The "nothing to commit" log noise this used to produce is
+	// silenced by the log_level=error config change in this same PR; the
+	// per-session SQL preamble cost is addressed in the Tier 3 SDK
+	// migration. (Reverted from the original Tier 1+2 close-removal after
+	// augment review pointed out the wisp-promotion side effect.)
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), constants.BdCommandTimeout)
 	defer closeCancel()
 	closeCmd := exec.CommandContext(closeCtx, "bd", "close", result.ID, "--reason", "plugin run recorded") //nolint:gosec // G204: bd is a trusted internal tool

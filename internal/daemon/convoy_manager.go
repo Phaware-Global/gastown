@@ -19,8 +19,14 @@ import (
 
 const (
 	defaultStrandedScanInterval = 30 * time.Second
-	eventPollInterval           = 5 * time.Second
-	eventPollMaxBackoff         = 60 * time.Second
+	// eventPollInterval was 5s but at that rate the convoy alone created a
+	// 7-DB connection burst every 5 seconds against the central Dolt server
+	// (one MySQL session per beads store), each paying full
+	// parse+plan+analyze overhead. Bumped to 30s to reduce baseline
+	// connection churn; close-event detection is still well within the
+	// human-perceptible window for downstream sling/refinery handoff.
+	eventPollInterval   = 30 * time.Second
+	eventPollMaxBackoff = 5 * time.Minute
 	// Beads lifecycle events use CURRENT_TIMESTAMP in Dolt, which is second
 	// precision. Poll with a 1s overlap so transitions that happen in the same
 	// second as the previous high-water mark are still visible next cycle.
