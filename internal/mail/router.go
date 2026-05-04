@@ -104,6 +104,45 @@ func NewRouterWithTownRoot(workDir, townRoot string) *Router {
 	}
 }
 
+// NewRouterWithOpenedStore creates a router and eagerly opens a long-lived
+// hq beadsdk.Storage handle for the lifetime of the returned router. The
+// store is attached so subsequent GetMailbox calls (and townBeads helpers
+// that look up r.stores) bypass bd subprocess spawning for the command's
+// internal queries.
+//
+// Intended for short-lived gt CLI invocations (`gt mail inbox`, `gt mail
+// send`, etc.) that today spawn multiple bd subprocesses per call (one per
+// internal query). Opening one store + running N SDK queries replaces N
+// bd subprocesses with 1 MySQL session.
+//
+// Returns the router, a cleanup function that MUST be deferred to release
+// the MySQL connection, and any open error. On open failure, returns a
+// store-less router and a no-op cleanup so callers can fall through to the
+// bd-shell-out path without changing call shape.
+func NewRouterWithOpenedStore(workDir string) (*Router, func(), error) {
+	r := NewRouter(workDir)
+	beadsDir := beads.ResolveBeadsDir(workDir)
+	if r.townRoot != "" {
+		// Mail always lives in town beads; prefer the town path even when
+		// workDir resolved to a per-rig .beads (which is for project issues,
+		// not mail) — see resolveBeadsDir().
+		beadsDir = filepath.Join(r.townRoot, ".beads")
+	}
+	if beadsDir == "" {
+		return r, func() {}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, err := beadsdk.OpenFromConfig(ctx, beadsDir)
+	if err != nil {
+		// Graceful fallback: caller continues with bd-shell-out path.
+		return r, func() {}, err
+	}
+	r.SetStores(map[string]beadsdk.Storage{"hq": store})
+	cleanup := func() { _ = store.Close() }
+	return r, cleanup, nil
+}
+
 // WaitPendingNotifications blocks until all in-flight async notifications
 // have completed. CLI commands should call this before exiting to avoid
 // losing notifications that are still being delivered.

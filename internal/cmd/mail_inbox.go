@@ -15,21 +15,36 @@ import (
 	"github.com/steveyegge/gastown/internal/style"
 )
 
-// getMailbox returns the mailbox for the given address.
-func getMailbox(address string) (*mail.Mailbox, error) {
+// getMailbox returns the mailbox for the given address along with a cleanup
+// function that the caller MUST defer.
+//
+// When possible, opens a long-lived in-process beadsdk.Storage and attaches
+// it to the underlying Router so the mailbox's internal queries (assignee,
+// CC, wisp lookups) reuse a single MySQL session via the SDK instead of
+// spawning a `bd` subprocess per query. This is the dominant CPU win for
+// short-lived `gt mail inbox` invocations called from role tmux sessions —
+// each invocation drops from N bd subprocesses (one per internal query) to
+// 1 SDK session.
+//
+// On open failure (Dolt down, no metadata.json, etc.) the function falls
+// back to a store-less router transparently — callers continue to work via
+// the bd-shell-out path with a no-op cleanup.
+func getMailbox(address string) (*mail.Mailbox, func(), error) {
 	// All mail uses town beads (two-level architecture)
 	workDir, err := findMailWorkDir()
 	if err != nil {
-		return nil, fmt.Errorf("not in a Gas Town workspace: %w", err)
+		return nil, func() {}, fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 
-	// Get mailbox
-	router := mail.NewRouter(workDir)
+	// Get mailbox via the store-aware constructor. Open errors are
+	// non-fatal; the returned router falls through to bd shell-out.
+	router, cleanup, _ := mail.NewRouterWithOpenedStore(workDir)
 	mailbox, err := router.GetMailbox(address)
 	if err != nil {
-		return nil, fmt.Errorf("getting mailbox: %w", err)
+		cleanup()
+		return nil, func() {}, fmt.Errorf("getting mailbox: %w", err)
 	}
-	return mailbox, nil
+	return mailbox, cleanup, nil
 }
 
 func runMailInbox(cmd *cobra.Command, args []string) error {
@@ -48,10 +63,11 @@ func runMailInbox(cmd *cobra.Command, args []string) error {
 		address = detectSender()
 	}
 
-	mailbox, err := getMailbox(address)
+	mailbox, mailboxCleanup, err := getMailbox(address)
 	if err != nil {
 		return err
 	}
+	defer mailboxCleanup()
 
 	// Load the inbox once. Count() and ListUnread() both call List(), so using
 	// them here doubles the bd/Dolt reads on the hot patrol path.
@@ -159,10 +175,11 @@ func runMailRead(cmd *cobra.Command, args []string) error {
 	// Determine which inbox
 	address := detectSender()
 
-	mailbox, err := getMailbox(address)
+	mailbox, mailboxCleanup, err := getMailbox(address)
 	if err != nil {
 		return err
 	}
+	defer mailboxCleanup()
 
 	// Check if the argument is a numeric index (1-based)
 	var msgID string
@@ -249,10 +266,11 @@ func runMailPeek(cmd *cobra.Command, args []string) error {
 	// Determine which inbox
 	address := detectSender()
 
-	mailbox, err := getMailbox(address)
+	mailbox, mailboxCleanup, err := getMailbox(address)
 	if err != nil {
 		return NewSilentExit(1) // Silent exit - can't access mailbox
 	}
+	defer mailboxCleanup()
 
 	// Get unread messages
 	messages, err := mailbox.ListUnread()
@@ -300,10 +318,11 @@ func runMailDelete(cmd *cobra.Command, args []string) error {
 	// Determine which inbox
 	address := detectSender()
 
-	mailbox, err := getMailbox(address)
+	mailbox, mailboxCleanup, err := getMailbox(address)
 	if err != nil {
 		return err
 	}
+	defer mailboxCleanup()
 
 	// Delete all specified messages
 	deleted := 0
@@ -338,10 +357,11 @@ func runMailArchive(cmd *cobra.Command, args []string) error {
 	// Determine which inbox
 	address := detectSender()
 
-	mailbox, err := getMailbox(address)
+	mailbox, mailboxCleanup, err := getMailbox(address)
 	if err != nil {
 		return err
 	}
+	defer mailboxCleanup()
 
 	if mailArchiveStale {
 		if len(args) > 0 {
@@ -500,10 +520,11 @@ func runMailMarkRead(cmd *cobra.Command, args []string) error {
 	// Determine which inbox
 	address := detectSender()
 
-	mailbox, err := getMailbox(address)
+	mailbox, mailboxCleanup, err := getMailbox(address)
 	if err != nil {
 		return err
 	}
+	defer mailboxCleanup()
 
 	// --all: mark all unread messages as read
 	if mailMarkReadAll {
@@ -567,10 +588,11 @@ func runMailMarkUnread(cmd *cobra.Command, args []string) error {
 	// Determine which inbox
 	address := detectSender()
 
-	mailbox, err := getMailbox(address)
+	mailbox, mailboxCleanup, err := getMailbox(address)
 	if err != nil {
 		return err
 	}
+	defer mailboxCleanup()
 
 	// Mark all specified messages as unread
 	marked := 0
@@ -610,10 +632,11 @@ func runMailClear(cmd *cobra.Command, args []string) error {
 		address = detectSender()
 	}
 
-	mailbox, err := getMailbox(address)
+	mailbox, mailboxCleanup, err := getMailbox(address)
 	if err != nil {
 		return err
 	}
+	defer mailboxCleanup()
 
 	// List all messages
 	messages, err := mailbox.List()

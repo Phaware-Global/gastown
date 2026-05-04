@@ -95,10 +95,11 @@ func runMailDrain(cmd *cobra.Command, args []string) error {
 		address = detectSender()
 	}
 
-	mailbox, err := getMailbox(address)
+	mailbox, mailboxCleanup, err := getMailbox(address)
 	if err != nil {
 		return err
 	}
+	defer mailboxCleanup()
 
 	// List all messages
 	messages, err := mailbox.List()
