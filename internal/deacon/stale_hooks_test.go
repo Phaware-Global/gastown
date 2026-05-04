@@ -5,6 +5,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 func TestAssigneeToSessionName(t *testing.T) {
@@ -269,5 +271,32 @@ func TestStaleHookResult_PartialWorkFields(t *testing.T) {
 	}
 	if result.UnpushedCount != 3 {
 		t.Errorf("UnpushedCount = %d, want 3", result.UnpushedCount)
+	}
+}
+
+func TestIsRefineryWorkflowBead(t *testing.T) {
+	tests := []struct {
+		createdBy string
+		want      bool
+	}{
+		{"heartworks_android/refinery", true},
+		{"gastown/refinery", true},
+		{"my-rig/refinery", true},
+		{"heartworks_android/polecats/obsidian", false},
+		{"heartworks_android/witness", false},
+		{"mayor", false},
+		{"deacon", false},
+		{"refinery", false}, // bare "refinery" without rig prefix is not a rig-scoped refinery
+		{"", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.createdBy, func(t *testing.T) {
+			issue := &beads.Issue{CreatedBy: tt.createdBy}
+			got := beads.IsRefineryWorkflowBead(issue)
+			if got != tt.want {
+				t.Errorf("IsRefineryWorkflowBead(%q) = %v, want %v", tt.createdBy, got, tt.want)
+			}
+		})
 	}
 }

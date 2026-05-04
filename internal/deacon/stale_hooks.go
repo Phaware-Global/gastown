@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -39,6 +40,7 @@ type HookedBead struct {
 	Title     string    `json:"title"`
 	Status    string    `json:"status"`
 	Assignee  string    `json:"assignee"`
+	CreatedBy string    `json:"created_by,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
@@ -96,6 +98,12 @@ func ScanStaleHooks(townRoot string, cfg *StaleHookConfig) (*StaleHookScanResult
 	t := tmux.NewTmux()
 
 	for _, bead := range hookedBeads {
+		// Refinery workflow step beads are refinery-internal orchestration work.
+		// They should never be unhooked and re-dispatched to polecats.
+		if beads.IsRefineryWorkflowBead(&beads.Issue{CreatedBy: bead.CreatedBy}) {
+			continue
+		}
+
 		hookResult := &StaleHookResult{
 			BeadID:   bead.ID,
 			Title:    bead.Title,
@@ -257,3 +265,4 @@ func unhookBead(townRoot, beadID string) error {
 	util.SetDetachedProcessGroup(cmd)
 	return cmd.Run()
 }
+

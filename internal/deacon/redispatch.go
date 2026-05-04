@@ -287,11 +287,12 @@ func Redispatch(townRoot, beadID, sourceRig string, maxAttempts int, cooldown ti
 	}
 	result.TargetRig = targetRig
 
-	// Verify bead is still open (not already claimed or closed).
-	// Only proceed when status is explicitly "open". Empty status (query
-	// failure) is treated as "not open" to avoid re-dispatching closed
-	// beads when bd show fails. (gt-sy8)
-	beadStatus := getBeadStatusForRedispatch(townRoot, beadID)
+	// Verify bead is open and not a refinery workflow step (single bd show call).
+	// Only proceed when status is explicitly "open". Empty status (query failure)
+	// is treated as "not open" to avoid re-dispatching closed beads when bd show
+	// fails. (gt-sy8). Refinery workflow step beads are internal orchestration
+	// work and must never be re-dispatched to polecats.
+	beadStatus, beadCreatedBy := getBeadStateForRedispatch(townRoot, beadID)
 	if beadStatus != "open" {
 		result.Action = "skipped"
 		if beadStatus == "" {
@@ -299,6 +300,11 @@ func Redispatch(townRoot, beadID, sourceRig string, maxAttempts int, cooldown ti
 		} else {
 			result.Message = fmt.Sprintf("bead status is %q (expected open)", beadStatus)
 		}
+		return result
+	}
+	if beads.IsRefineryWorkflowBead(&beads.Issue{CreatedBy: beadCreatedBy}) {
+		result.Action = "skipped"
+		result.Message = fmt.Sprintf("refinery workflow step bead (created_by=%s)", beadCreatedBy)
 		return result
 	}
 
@@ -348,7 +354,7 @@ func PruneRedispatchState(townRoot string) (int, error) {
 
 	pruned := 0
 	for beadID := range state.Beads {
-		status := getBeadStatusForRedispatch(townRoot, beadID)
+		status, _ := getBeadStateForRedispatch(townRoot, beadID)
 		// Remove entries for beads that are closed, or that we can't find
 		if status == "closed" || status == "" {
 			delete(state.Beads, beadID)
@@ -374,24 +380,26 @@ func resolveRigFromBead(townRoot, beadID string) string {
 	return beads.GetRigNameForPrefix(townRoot, prefix)
 }
 
-// getBeadStatusForRedispatch returns the current status of a bead.
-func getBeadStatusForRedispatch(townRoot, beadID string) string {
+// getBeadStateForRedispatch returns the status and created_by of a bead in a
+// single bd show call. Returns ("", "") on failure.
+func getBeadStateForRedispatch(townRoot, beadID string) (status, createdBy string) {
 	cmd := exec.Command("bd", "show", beadID, "--json")
 	cmd.Dir = townRoot
 	util.SetDetachedProcessGroup(cmd)
 
 	output, err := cmd.Output()
 	if err != nil {
-		return ""
+		return "", ""
 	}
 
 	var issues []struct {
-		Status string `json:"status"`
+		Status    string `json:"status"`
+		CreatedBy string `json:"created_by"`
 	}
 	if err := json.Unmarshal(output, &issues); err != nil || len(issues) == 0 {
-		return ""
+		return "", ""
 	}
-	return issues[0].Status
+	return issues[0].Status, issues[0].CreatedBy
 }
 
 // LoadModelEscalationConfig loads model escalation rules from a rig project directory.

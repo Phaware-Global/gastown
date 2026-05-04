@@ -256,6 +256,17 @@ func IsAgentBead(issue *Issue) bool {
 	return HasLabel(issue, "gt:agent")
 }
 
+// IsRefineryWorkflowBead returns true if a bead was created by a refinery agent.
+// Refinery workflow step beads are internal orchestration work (e.g., "Mechanical
+// rebase", "Handle quality check failures") and should never be dispatched to polecats.
+// Identification: created_by ends with "/refinery" (e.g., "heartworks_android/refinery").
+func IsRefineryWorkflowBead(issue *Issue) bool {
+	if issue == nil {
+		return false
+	}
+	return strings.HasSuffix(issue.CreatedBy, "/refinery")
+}
+
 // IsProtectedBead checks if a bead has any protection labels that should
 // prevent automated status changes (AutoClose, unassign on polecat removal, etc.).
 // Protected labels: gt:standing-orders, gt:keep, gt:role, gt:rig.
