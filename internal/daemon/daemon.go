@@ -59,12 +59,15 @@ type Daemon struct {
 	curator       *feed.Curator
 	convoyManager *ConvoyManager
 	beadsStores   map[string]beadsdk.Storage
-	// storesMu guards beadsStores against races between the lazy storeOpener
-	// callback (called from the convoy poll goroutine when Dolt comes up
-	// after daemon start) and downstream accessors (BeadsStore, BeadsStores).
-	// Other readers in the daemon goroutine (hasActiveWork, closeBeadsStores)
-	// run before the convoy goroutine is started or after it is stopped, so
-	// they don't need to hold the lock — but new accessors should.
+	// storesMu guards beadsStores. Two writers exist: the synchronous
+	// initialization in Run() (before the convoy goroutine starts) and the
+	// lazy storeOpener callback (called from the convoy poll goroutine when
+	// Dolt comes up after daemon start). Readers — including hasActiveWork
+	// from the heartbeat loop, BeadsStore/BeadsStores from downstream
+	// packages, and the close-on-shutdown path — must take the lock to
+	// avoid a Go race-detector violation in the deferred-open scenario
+	// (heartbeat reads concurrently with the convoy goroutine's late
+	// assignment).
 	storesMu sync.Mutex
 	doltServer       *DoltServerManager
 	telegraphServer  *TelegraphServerManager
@@ -1338,8 +1341,19 @@ func (d *Daemon) ensureBootRunning() {
 //
 // Returns true conservatively on error or when no stores are available, so the
 // caller falls through to spawn Boot rather than suppressing it incorrectly.
+//
+// Snapshots beadsStores under storesMu so the lazy storeOpener callback (in
+// the convoy poll goroutine) cannot race with this read in the deferred-open
+// scenario.
 func (d *Daemon) hasActiveWork() bool {
-	if len(d.beadsStores) == 0 {
+	d.storesMu.Lock()
+	stores := make(map[string]beadsdk.Storage, len(d.beadsStores))
+	for k, v := range d.beadsStores {
+		stores[k] = v
+	}
+	d.storesMu.Unlock()
+
+	if len(stores) == 0 {
 		// No stores open — cannot inspect; let Boot run to be safe.
 		return true
 	}
@@ -1347,7 +1361,7 @@ func (d *Daemon) hasActiveWork() bool {
 	ctx, cancel := context.WithTimeout(d.ctx, 5*time.Second)
 	defer cancel()
 
-	for name, store := range d.beadsStores {
+	for name, store := range stores {
 		for _, rawStatus := range []string{"in_progress"} {
 			s := beadsdk.Status(rawStatus)
 			filter := beadsdk.IssueFilter{Status: &s, Limit: 1}

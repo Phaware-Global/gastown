@@ -97,12 +97,28 @@ func (r *Recorder) RecordRun(record PluginRunRecord) (string, error) {
 	return r.recordRunBd(title, labels, record.Body)
 }
 
-// recordRunStore writes a plugin-run bead via the in-process store. The
-// receipt is left open; ephemeral wisps are auto-cleaned by patrol squash
-// and `bd mol wisp gc`, so an immediate close is unnecessary.
+// recordRunStore writes a plugin-run bead via the in-process store and
+// immediately closes it.
+//
+// The close is required, not optional: `gt compact`
+// (internal/cmd/compact.go:223-236) treats non-closed wisps past TTL with
+// no comments and no parent as "proven value" and PROMOTES them to the
+// issues table. Without the close, accumulated plugin-run receipts would
+// pollute issues forever. Closed wisps are deleted on TTL expiry instead,
+// which is the desired behavior.
+//
+// The provenance string is BD_ACTOR (set to "daemon" by the dispatch
+// loop) when present, falling back to "daemon" so created_by is never
+// empty — matching the convention used by daemon-spawned bd subprocesses
+// (see daemon.go's BD_ACTOR=daemon env wiring at line 2812).
 func (r *Recorder) recordRunStore(title string, labels []string, body string) (string, error) {
 	ctx, cancel := recorderCtx()
 	defer cancel()
+
+	actor := os.Getenv("BD_ACTOR")
+	if actor == "" {
+		actor = "daemon"
+	}
 
 	issue := &beadsdk.Issue{
 		Title:       title,
@@ -110,9 +126,17 @@ func (r *Recorder) recordRunStore(title string, labels []string, body string) (s
 		Labels:      labels,
 		Ephemeral:   true,
 	}
-	if err := r.store.CreateIssue(ctx, issue, ""); err != nil {
+	if err := r.store.CreateIssue(ctx, issue, actor); err != nil {
 		return "", fmt.Errorf("creating plugin run bead via store: %w", err)
 	}
+
+	// Close immediately so the receipt is eligible for closed-wisp cleanup
+	// and isn't promoted to a persistent issue past TTL. Best-effort —
+	// reaper will catch it if this fails.
+	closeCtx, closeCancel := recorderCtx()
+	defer closeCancel()
+	_ = r.store.CloseIssue(closeCtx, issue.ID, "plugin run recorded", actor, "")
+
 	return issue.ID, nil
 }
 
