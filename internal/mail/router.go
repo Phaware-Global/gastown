@@ -121,12 +121,16 @@ func NewRouterWithTownRoot(workDir, townRoot string) *Router {
 // bd-shell-out path without changing call shape.
 func NewRouterWithOpenedStore(workDir string) (*Router, func(), error) {
 	r := NewRouter(workDir)
-	beadsDir := beads.ResolveBeadsDir(workDir)
+	// Mail always lives in town beads; prefer the town path even when
+	// workDir resolves to a per-rig .beads (which is for project issues,
+	// not mail) — see resolveBeadsDir(). Only fall back to walking the
+	// filesystem (beads.ResolveBeadsDir) when townRoot wasn't detected,
+	// since that walk is the slow path.
+	var beadsDir string
 	if r.townRoot != "" {
-		// Mail always lives in town beads; prefer the town path even when
-		// workDir resolved to a per-rig .beads (which is for project issues,
-		// not mail) — see resolveBeadsDir().
 		beadsDir = filepath.Join(r.townRoot, ".beads")
+	} else {
+		beadsDir = beads.ResolveBeadsDir(workDir)
 	}
 	if beadsDir == "" {
 		return r, func() {}, nil
