@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/runtime"
 )
 
 // RunResult represents the outcome of a plugin execution.
@@ -131,11 +133,23 @@ func (r *Recorder) recordRunStore(title string, labels []string, body string) (s
 	}
 
 	// Close immediately so the receipt is eligible for closed-wisp cleanup
-	// and isn't promoted to a persistent issue past TTL. Best-effort —
-	// reaper will catch it if this fails.
+	// and isn't promoted to a persistent issue past TTL. The session ID
+	// (when set) attributes the close to the originating runtime session
+	// for work tracking, matching the convention used by other Close paths
+	// in internal/beads/beads.go and internal/mail/mailbox.go.
+	//
+	// Returning the close error would surface a transient failure to the
+	// caller for a bead that was successfully created — bad UX. Instead we
+	// log so a silent failure leaves a trace for ops to diagnose, since a
+	// missed close means this receipt becomes a wisp-promotion candidate
+	// past TTL (per the comment above).
 	closeCtx, closeCancel := recorderCtx()
 	defer closeCancel()
-	_ = r.store.CloseIssue(closeCtx, issue.ID, "plugin run recorded", actor, "")
+	if err := r.store.CloseIssue(closeCtx, issue.ID, "plugin run recorded", actor, runtime.SessionIDFromEnv()); err != nil {
+		// Best-effort log; do not fail the create. Reaper / wisp gc will
+		// eventually catch persistently-open receipts.
+		log.Printf("plugin recorder: close after create failed for %s: %v", issue.ID, err)
+	}
 
 	return issue.ID, nil
 }

@@ -2234,7 +2234,14 @@ func (d *Daemon) shutdown(state *State) error { //nolint:unparam // error return
 		d.convoyManager.Stop()
 		d.logger.Println("Convoy manager stopped")
 	}
+	// Take storesMu when nil-ing the map so the BeadsStore/BeadsStores
+	// accessors and the lazy storeOpener path don't race against shutdown.
+	// Without the lock, a heartbeat-loop reader could observe a partially
+	// nil-ed map and panic on lookup, or storeOpener could overwrite the
+	// nil with a freshly-opened map after shutdown completes.
+	d.storesMu.Lock()
 	d.beadsStores = nil
+	d.storesMu.Unlock()
 
 	// Stop KRC pruner
 	if d.krcPruner != nil {
