@@ -304,7 +304,11 @@ func (b *Beads) storeCreate(opts CreateOptions) (*Issue, error) {
 		Ephemeral:   opts.Ephemeral,
 	}
 
-	// Set issue type from Labels, Label, or Type (same precedence as CLI path)
+	// Encode the gt-level issue type as a label (e.g. "gt:bug"), matching the
+	// CLI path's precedence: explicit Labels win, then Label, then derived
+	// from Type. This sets sdkIssue.Labels — it does NOT touch the SDK's
+	// IssueType field set above (that is the bd-CLI-equivalent "task"
+	// default required by Validate; see the comment block at the literal).
 	if len(opts.Labels) > 0 {
 		sdkIssue.Labels = opts.Labels
 	} else if opts.Label != "" {
