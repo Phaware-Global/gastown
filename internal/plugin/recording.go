@@ -123,11 +123,11 @@ func (r *Recorder) recordRunStore(title string, labels []string, body string) (s
 	}
 
 	// Status AND IssueType must both be set explicitly: the SDK's CreateIssue
-	// runs ValidateWithCustom (types.go:230,233), which rejects empty values
-	// for either field. SetDefaults exists in the SDK but CreateIssue does not
-	// call it. The bd-shell-out path (recordRunBd) doesn't need either because
-	// the bd CLI applies its own defaults (Status=open, IssueType=task) before
-	// the create call.
+	// runs Validate (types.go:230,233), which rejects empty values for either
+	// field. SetDefaults exists in the SDK but CreateIssue does not call it.
+	// The bd-shell-out path (recordRunBd) doesn't need either because the bd
+	// CLI applies its own defaults (Status=open, IssueType=task) before the
+	// create call.
 	//
 	// Without these, the create fails, no marker bead is written, and the
 	// cooldown gate (which counts marker beads) sees count=0 on every dispatch
