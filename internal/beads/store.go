@@ -284,17 +284,23 @@ func (b *Beads) storeCreate(opts CreateOptions) (*Issue, error) {
 	ctx, cancel := storeCtx()
 	defer cancel()
 
-	// Status must be set explicitly: the SDK's CreateIssue validator rejects
-	// an empty Status with `invalid status: ""`. The bd-shell-out path doesn't
-	// need this because the bd CLI defaults Status to open. New issues default
-	// to open here too — if a caller needs a different initial status, extend
-	// CreateOptions and override below. See plugin/recording.go for the same
-	// pattern (and the cooldown-bypass incident this trap caused).
+	// Status AND IssueType must both be set explicitly: the SDK's CreateIssue
+	// runs Validate (types.go:230,233), which rejects empty values for either
+	// field. SetDefaults exists in the SDK but CreateIssue does not call it.
+	// The bd-shell-out path doesn't need either because the bd CLI applies its
+	// own defaults (Status=open, IssueType=task). Default to those same values
+	// here — if a caller needs different initial values, extend CreateOptions
+	// and override below.
+	//
+	// PR #65 set Status; this also sets IssueType after the same bug surfaced
+	// against `invalid issue type:` once Status was satisfied. See
+	// plugin/recording.go for the same pattern.
 	sdkIssue := &beadsdk.Issue{
 		Title:       opts.Title,
 		Description: opts.Description,
 		Priority:    opts.Priority,
 		Status:      beadsdk.StatusOpen,
+		IssueType:   beadsdk.TypeTask,
 		Ephemeral:   opts.Ephemeral,
 	}
 
