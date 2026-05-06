@@ -122,10 +122,18 @@ func (r *Recorder) recordRunStore(title string, labels []string, body string) (s
 		actor = "daemon"
 	}
 
+	// Status must be set explicitly: the SDK's CreateIssue validates the struct
+	// directly and rejects an empty Status with `invalid status: ""`. The
+	// bd-shell-out path (recordRunBd) doesn't need this because the bd CLI
+	// defaults Status to open. Without it the create fails, no marker bead is
+	// written, and the cooldown gate (which counts marker beads) sees count=0
+	// on every dispatch tick — bypassing cooldown entirely for every cooldown-
+	// gated plugin recorded via the SDK.
 	issue := &beadsdk.Issue{
 		Title:       title,
 		Description: body,
 		Labels:      labels,
+		Status:      beadsdk.StatusOpen,
 		Ephemeral:   true,
 	}
 	if err := r.store.CreateIssue(ctx, issue, actor); err != nil {
