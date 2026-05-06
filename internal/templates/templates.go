@@ -119,6 +119,7 @@ type HandoffData struct {
 type SupervisorData struct {
 	GTPath   string // Path to the gt binary
 	TownRoot string // Path to the Gas Town workspace
+	Path     string // PATH env var to inject into the supervised daemon
 }
 
 // New creates a new Templates instance.
@@ -320,6 +321,7 @@ func ProvisionSupervisor(townRoot string) (string, error) {
 	data := SupervisorData{
 		GTPath:   gtPath,
 		TownRoot: townRoot,
+		Path:     supervisorPath(gtPath),
 	}
 
 	switch runtime.GOOS {
@@ -330,6 +332,30 @@ func ProvisionSupervisor(townRoot string) (string, error) {
 	default:
 		return fmt.Sprintf("Supervisor auto-configuration skipped on %s (not supported yet)", runtime.GOOS), nil
 	}
+}
+
+// supervisorPath builds the PATH env var to inject into the supervised daemon.
+// launchd and systemd-user spawn processes with a minimal PATH that excludes
+// /opt/homebrew/bin and ~/.local/bin, so gt's own subprocess execs (telegraph,
+// dogs, scheduler) fail with "executable file not found" unless PATH is set
+// here. Captures the user's PATH at supervisor-enable time, then prepends the
+// directory containing the gt binary in case it isn't in PATH already.
+func supervisorPath(gtPath string) string {
+	const fallback = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+	envPath := os.Getenv("PATH")
+	if envPath == "" {
+		envPath = fallback
+	}
+	gtDir := filepath.Dir(gtPath)
+	if gtDir == "" || gtDir == "." {
+		return envPath
+	}
+	for _, p := range strings.Split(envPath, ":") {
+		if p == gtDir {
+			return envPath
+		}
+	}
+	return gtDir + ":" + envPath
 }
 
 // provisionLaunchd creates and loads a launchd plist on macOS.

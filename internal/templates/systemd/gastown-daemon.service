@@ -9,6 +9,11 @@ WorkingDirectory={{.TownRoot}}
 Restart=always
 RestartSec=5s
 Environment="GT_TOWN_ROOT={{.TownRoot}}"
+Environment="PATH={{.Path}}"
+# Optional secrets file (mode 0600). Holds GT_TELEGRAPH_*_SECRET and any other
+# env vars the daemon needs but that aren't in the systemd-user environment.
+# Leading `-` makes the file optional.
+EnvironmentFile=-{{.TownRoot}}/settings/daemon.env
 StandardOutput=append:{{.TownRoot}}/daemon/daemon.log
 StandardError=append:{{.TownRoot}}/daemon/daemon.log
 
