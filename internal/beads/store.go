@@ -284,10 +284,17 @@ func (b *Beads) storeCreate(opts CreateOptions) (*Issue, error) {
 	ctx, cancel := storeCtx()
 	defer cancel()
 
+	// Status must be set explicitly: the SDK's CreateIssue validator rejects
+	// an empty Status with `invalid status: ""`. The bd-shell-out path doesn't
+	// need this because the bd CLI defaults Status to open. New issues default
+	// to open here too — if a caller needs a different initial status, extend
+	// CreateOptions and override below. See plugin/recording.go for the same
+	// pattern (and the cooldown-bypass incident this trap caused).
 	sdkIssue := &beadsdk.Issue{
 		Title:       opts.Title,
 		Description: opts.Description,
 		Priority:    opts.Priority,
+		Status:      beadsdk.StatusOpen,
 		Ephemeral:   opts.Ephemeral,
 	}
 
