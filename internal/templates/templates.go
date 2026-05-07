@@ -341,7 +341,20 @@ func ProvisionSupervisor(townRoot string) (string, error) {
 // here. Captures the user's PATH at supervisor-enable time, then prepends the
 // directory containing the gt binary in case it isn't in PATH already.
 func supervisorPath(gtPath string) string {
-	const fallback = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+	// Fallback covers the typical "boot-safe" install dirs for gt/bd/tmux on
+	// both macOS (Homebrew + ~/.local/bin) and Linux. Only used when PATH is
+	// empty at enable time, which shouldn't happen in practice.
+	homeDir, _ := os.UserHomeDir()
+	fallbackParts := []string{
+		"/opt/homebrew/bin", "/opt/homebrew/sbin",
+		"/usr/local/bin", "/usr/local/sbin",
+		"/usr/bin", "/bin", "/usr/sbin", "/sbin",
+	}
+	if homeDir != "" {
+		fallbackParts = append([]string{filepath.Join(homeDir, ".local", "bin")}, fallbackParts...)
+	}
+	fallback := strings.Join(fallbackParts, ":")
+
 	envPath := os.Getenv("PATH")
 	if envPath == "" {
 		envPath = fallback
@@ -351,7 +364,7 @@ func supervisorPath(gtPath string) string {
 		return envPath
 	}
 	for _, p := range strings.Split(envPath, ":") {
-		if p == gtDir {
+		if filepath.Clean(p) == gtDir {
 			return envPath
 		}
 	}
