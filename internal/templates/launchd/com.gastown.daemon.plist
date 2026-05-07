@@ -5,11 +5,16 @@
     <key>Label</key>
     <string>com.gastown.daemon</string>
 
+    <!-- Sources <town-root>/settings/daemon.env (if present, mode 0600) so
+         secrets like GT_TELEGRAPH_*_SECRET reach the daemon. launchd inherits
+         a stripped environment, so values from ~/.zshrc don't propagate.
+         `set -a` makes plain `KEY=value` lines auto-export, matching systemd's
+         EnvironmentFile semantics so the same file works on both supervisors. -->
     <key>ProgramArguments</key>
     <array>
-        <string>{{.GTPath}}</string>
-        <string>daemon</string>
-        <string>run</string>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>set -a; [ -r "{{.TownRoot}}/settings/daemon.env" ] &amp;&amp; . "{{.TownRoot}}/settings/daemon.env"; set +a; exec "{{.GTPath}}" daemon run</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -36,6 +41,8 @@
     <dict>
         <key>GT_TOWN_ROOT</key>
         <string>{{.TownRoot}}</string>
+        <key>PATH</key>
+        <string>{{.Path}}</string>
     </dict>
 
     <key>ProcessType</key>
