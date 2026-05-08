@@ -1765,9 +1765,38 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 		return fmt.Errorf("nudge to session %q: %w", session, err)
 	}
 
+	// 7.5. Wait for the busy indicator to appear before releasing the nudge
+	// lock. Without this hold, a rapid burst of nudges (e.g., a JIRA webhook
+	// fan-out) can race: nudge #2's WaitForIdle samples the pane in the gap
+	// between Enter and Claude rendering "esc to interrupt", sees idle, and
+	// direct-injects on top of nudge #1's still-streaming response. Capping
+	// at 800ms keeps this best-effort — if Claude never shows the indicator
+	// (e.g., trivial response), we still release the lock promptly.
+	t.waitForBusyIndicator(target, 800*time.Millisecond)
+
 	// 8. Wake the pane to trigger SIGWINCH for detached sessions
 	t.WakePaneIfDetached(session)
 	return nil
+}
+
+// waitForBusyIndicator polls the pane until "esc to interrupt" appears or the
+// timeout elapses. Best-effort: any capture error or timeout returns silently.
+// Used after a nudge's Enter to ensure the next caller's idle check sees the
+// correct busy state instead of a transient gap.
+func (t *Tmux) waitForBusyIndicator(target string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		lines, err := t.CapturePaneLines(target, 5)
+		if err != nil {
+			return
+		}
+		for _, line := range lines {
+			if hasBusyIndicator(line) {
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // NudgePane sends a message to a specific pane reliably.

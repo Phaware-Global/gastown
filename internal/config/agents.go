@@ -251,6 +251,11 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		InstructionsFile:       "CLAUDE.md",
 		EmitsPermissionWarning: true,
 		HasTurnBoundaryDrain:   true,
+		// Claude Code's TUI handles input directly (React/Ink) and gastown
+		// forces editorMode: "normal" in settings templates, so vim INSERT
+		// mode never applies. ESC during streaming interrupts Claude — same
+		// failure mode as Gemini, so opt out of the ESC step.
+		EscapeCancelsRequest: true,
 	},
 	AgentGemini: {
 		Name:                AgentGemini,
