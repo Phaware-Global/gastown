@@ -167,6 +167,16 @@ type AgentPresetInfo struct {
 	// that follows it.
 	EscapeCancelsRequest bool `json:"escape_cancels_request,omitempty"`
 
+	// RendersBusyIndicator indicates that this agent's TUI renders the
+	// "esc to interrupt" busy indicator that hasBusyIndicator/WaitForIdle
+	// detect (currently Claude Code-specific text). When true, the nudge
+	// protocol holds the per-target lock after Enter until the indicator
+	// paints (or a short timeout) so the next nudge's idle check sees the
+	// correct busy state. When false, the hold is skipped to avoid a
+	// blanket per-nudge latency penalty on agents whose busy state we
+	// can't observe.
+	RendersBusyIndicator bool `json:"renders_busy_indicator,omitempty"`
+
 	// ACP is the configuration for ACP (Agent Communication Protocol) support.
 	// nil means the agent does not support ACP.
 	ACP *ACPConfig `json:"acp,omitempty"`
@@ -257,6 +267,10 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		// mode never applies. ESC during streaming interrupts Claude — same
 		// failure mode as Gemini, so opt out of the ESC step.
 		EscapeCancelsRequest: true,
+		// Claude Code renders "esc to interrupt" while streaming; the nudge
+		// protocol uses this to hold the target lock until the busy state
+		// is observable, preventing back-to-back nudges from racing.
+		RendersBusyIndicator: true,
 	},
 	AgentGemini: {
 		Name:                AgentGemini,
@@ -413,6 +427,10 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		ReadyPromptPrefix:  "",   // GA: no ❯ prompt; Copilot uses hint text, not a detectable prefix
 		ReadyDelayMs:       5000, // Delay-based readiness detection (no prompt prefix)
 		InstructionsFile:   "AGENTS.md",
+		// Copilot CLI uses Escape to abort active generation, leaving the
+		// nudge text stranded in the input field without Enter being
+		// processed. (hq-isz)
+		EscapeCancelsRequest: true,
 	},
 	AgentPi: {
 		Name:                AgentPi,

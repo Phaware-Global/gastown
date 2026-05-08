@@ -1767,10 +1767,14 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// lock. Without this hold, a rapid burst of nudges (e.g., a JIRA webhook
 	// fan-out) can race: nudge #2's WaitForIdle samples the pane in the gap
 	// between Enter and Claude rendering "esc to interrupt", sees idle, and
-	// direct-injects on top of nudge #1's still-streaming response. Capping
-	// at 800ms keeps this best-effort — if Claude never shows the indicator
-	// (e.g., trivial response), we still release the lock promptly.
-	t.waitForBusyIndicator(target, 800*time.Millisecond)
+	// direct-injects on top of nudge #1's still-streaming response. Gated on
+	// preset.RendersBusyIndicator so agents whose busy state we can't observe
+	// don't pay the wait. Capping at 800ms keeps this best-effort — if the
+	// agent's response is trivial enough that no indicator paints, we still
+	// release the lock promptly.
+	if t.shouldWaitForBusyIndicatorSession(session) {
+		t.waitForBusyIndicator(target, 800*time.Millisecond)
+	}
 
 	// 8. Wake the pane to trigger SIGWINCH for detached sessions
 	t.WakePaneIfDetached(session)
@@ -1793,15 +1797,43 @@ func (t *Tmux) shouldSkipEscapeForSession(session string) bool {
 // shouldSkipEscapeForSession. It resolves the pane's session name first
 // because tmux show-environment requires a session target.
 func (t *Tmux) shouldSkipEscapeForPane(pane string) bool {
-	out, err := t.run("display-message", "-t", pane, "-p", "#{session_name}")
-	if err != nil {
-		return false
-	}
-	session := strings.TrimSpace(out)
+	session := t.sessionForPane(pane)
 	if session == "" {
 		return false
 	}
 	return t.shouldSkipEscapeForSession(session)
+}
+
+// shouldWaitForBusyIndicatorSession reports whether the agent in this session
+// renders the busy indicator hasBusyIndicator detects, so the post-Enter hold
+// is meaningful. False means the hold would just be dead latency.
+func (t *Tmux) shouldWaitForBusyIndicatorSession(session string) bool {
+	agentType, err := t.GetEnvironment(session, "GT_AGENT")
+	if err != nil || agentType == "" {
+		return false
+	}
+	preset := config.GetAgentPresetByName(agentType)
+	return preset != nil && preset.RendersBusyIndicator
+}
+
+// shouldWaitForBusyIndicatorPane is the pane-target equivalent.
+func (t *Tmux) shouldWaitForBusyIndicatorPane(pane string) bool {
+	session := t.sessionForPane(pane)
+	if session == "" {
+		return false
+	}
+	return t.shouldWaitForBusyIndicatorSession(session)
+}
+
+// sessionForPane resolves the session name owning a tmux pane target.
+// Returns empty string on error so callers can treat resolution failures
+// as "preset unknown" and fall through to safe defaults.
+func (t *Tmux) sessionForPane(pane string) string {
+	out, err := t.run("display-message", "-t", pane, "-p", "#{session_name}")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
 }
 
 // waitForBusyIndicator polls the pane until "esc to interrupt" appears or the
@@ -1886,8 +1918,11 @@ func (t *Tmux) NudgePane(pane, message string) error {
 
 	// 7.5. Hold the pane lock until the busy indicator paints (cap 800ms) so
 	// rapid back-to-back nudges don't race past WaitForIdle and direct-inject
-	// on top of a still-streaming response. See NudgeSessionWithOpts.
-	t.waitForBusyIndicator(pane, 800*time.Millisecond)
+	// on top of a still-streaming response. Gated on preset.RendersBusyIndicator
+	// — see NudgeSessionWithOpts.
+	if t.shouldWaitForBusyIndicatorPane(pane) {
+		t.waitForBusyIndicator(pane, 800*time.Millisecond)
+	}
 
 	// 8. Wake the pane to trigger SIGWINCH for detached sessions
 	t.WakePaneIfDetached(pane)
