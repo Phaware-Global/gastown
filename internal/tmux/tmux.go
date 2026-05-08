@@ -1724,14 +1724,12 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// enough time to process all chunks under load. (GH#gt-0b5)
 	time.Sleep(adaptiveTextDelay(len(sanitized)))
 
-	if !opts.SkipEscape {
-		// Auto-skip Escape for Copilot CLI sessions. Escape cancels in-flight
-		// generation in Copilot CLI (like Gemini), leaving the nudge text
-		// stranded in the input field without Enter being processed. (hq-isz)
-		agentType, _ := t.GetEnvironment(session, "GT_AGENT")
-		if agentType == "copilot" {
-			opts.SkipEscape = true
-		}
+	if !opts.SkipEscape && t.shouldSkipEscapeForSession(session) {
+		// Auto-skip Escape when the resolved agent preset declares ESC cancels
+		// in-flight generation. Defensive fallback so callers that forget to
+		// pass SkipEscape (e.g., the mail router) still get correct behavior
+		// based on GT_AGENT + preset.EscapeCancelsRequest.
+		opts.SkipEscape = true
 	}
 
 	if !opts.SkipEscape {
@@ -1777,6 +1775,33 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// 8. Wake the pane to trigger SIGWINCH for detached sessions
 	t.WakePaneIfDetached(session)
 	return nil
+}
+
+// shouldSkipEscapeForSession reports whether the agent running in this tmux
+// session has EscapeCancelsRequest=true in its preset. Best-effort: any
+// resolution error returns false (i.e., default to sending Escape).
+func (t *Tmux) shouldSkipEscapeForSession(session string) bool {
+	agentType, err := t.GetEnvironment(session, "GT_AGENT")
+	if err != nil || agentType == "" {
+		return false
+	}
+	preset := config.GetAgentPresetByName(agentType)
+	return preset != nil && preset.EscapeCancelsRequest
+}
+
+// shouldSkipEscapeForPane is the pane-target equivalent of
+// shouldSkipEscapeForSession. It resolves the pane's session name first
+// because tmux show-environment requires a session target.
+func (t *Tmux) shouldSkipEscapeForPane(pane string) bool {
+	out, err := t.run("display-message", "-t", pane, "-p", "#{session_name}")
+	if err != nil {
+		return false
+	}
+	session := strings.TrimSpace(out)
+	if session == "" {
+		return false
+	}
+	return t.shouldSkipEscapeForSession(session)
 }
 
 // waitForBusyIndicator polls the pane until "esc to interrupt" appears or the
@@ -1835,18 +1860,22 @@ func (t *Tmux) NudgePane(pane, message string) error {
 	// 4. Adaptive post-text delay: scales with message length. (GH#gt-0b5)
 	time.Sleep(adaptiveTextDelay(len(sanitized)))
 
-	// 5. Send Escape to exit vim INSERT mode if enabled (harmless in normal mode)
-	// See: https://github.com/anthropics/gastown/issues/307
-	_, _ = t.run("send-keys", "-t", pane, "Escape")
+	skipEscape := t.shouldSkipEscapeForPane(pane)
 
-	// 6. Wait 600ms — must exceed bash readline's keyseq-timeout (500ms default)
-	time.Sleep(600 * time.Millisecond)
+	if !skipEscape {
+		// 5. Send Escape to exit vim INSERT mode if enabled (harmless in normal mode)
+		// See: https://github.com/anthropics/gastown/issues/307
+		_, _ = t.run("send-keys", "-t", pane, "Escape")
 
-	// 6.5. Post-Escape: check if our Escape triggered Rewind mode. (GH#gt-8el)
-	if t.isInRewindMode(pane) {
-		t.dismissRewindMode(pane)
-		_ = t.sendMessageToTarget(pane, sanitized)
-		time.Sleep(adaptiveTextDelay(len(sanitized)))
+		// 6. Wait 600ms — must exceed bash readline's keyseq-timeout (500ms default)
+		time.Sleep(600 * time.Millisecond)
+
+		// 6.5. Post-Escape: check if our Escape triggered Rewind mode. (GH#gt-8el)
+		if t.isInRewindMode(pane) {
+			t.dismissRewindMode(pane)
+			_ = t.sendMessageToTarget(pane, sanitized)
+			time.Sleep(adaptiveTextDelay(len(sanitized)))
+		}
 	}
 
 	// 7. Send Enter with verification — polls pane content to confirm Enter
@@ -1854,6 +1883,11 @@ func (t *Tmux) NudgePane(pane, message string) error {
 	if err := t.sendEnterVerified(pane); err != nil {
 		return fmt.Errorf("nudge to pane %q: %w", pane, err)
 	}
+
+	// 7.5. Hold the pane lock until the busy indicator paints (cap 800ms) so
+	// rapid back-to-back nudges don't race past WaitForIdle and direct-inject
+	// on top of a still-streaming response. See NudgeSessionWithOpts.
+	t.waitForBusyIndicator(pane, 800*time.Millisecond)
 
 	// 8. Wake the pane to trigger SIGWINCH for detached sessions
 	t.WakePaneIfDetached(pane)
