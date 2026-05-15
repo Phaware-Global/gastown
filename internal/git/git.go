@@ -1979,6 +1979,27 @@ func (g *Git) StashCount() (int, error) {
 	return count, nil
 }
 
+// StashCountAll returns the total number of repo-wide stashes visible from the
+// worktree. Git stores stashes in the shared repository, so callers must not use
+// this as per-worktree risk; use StashCount for current-branch risk instead.
+func (g *Git) StashCountAll() (int, error) {
+	out, err := g.run("stash", "list")
+	if err != nil {
+		return 0, err
+	}
+	if out == "" {
+		return 0, nil
+	}
+
+	count := 0
+	for _, line := range strings.Split(out, "\n") {
+		if line != "" {
+			count++
+		}
+	}
+	return count, nil
+}
+
 // StashEntry represents one entry from `git stash list`, scoped to the current branch.
 type StashEntry struct {
 	Ref     string // e.g. "stash@{2}"

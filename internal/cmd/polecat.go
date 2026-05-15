@@ -856,7 +856,8 @@ type GitState struct {
 	Clean            bool     `json:"clean"`
 	UncommittedFiles []string `json:"uncommitted_files"`
 	UnpushedCommits  int      `json:"unpushed_commits"`
-	StashCount       int      `json:"stash_count"`
+	StashCount       int      `json:"stash_count"`                  // Current-branch stashes: per-polecat risk.
+	SharedStashCount int      `json:"shared_stash_count,omitempty"` // Other branch stashes visible through the shared repo.
 }
 
 func runPolecatGitState(cmd *cobra.Command, args []string) error {
@@ -912,9 +913,12 @@ func runPolecatGitState(cmd *cobra.Command, args []string) error {
 
 	// Stashes
 	if state.StashCount == 0 {
-		fmt.Printf("  Stashes:       %s\n", style.Dim.Render("0"))
+		fmt.Printf("  Branch Stashes: %s\n", style.Dim.Render("0"))
 	} else {
-		fmt.Printf("  Stashes:       %s\n", style.Warning.Render(fmt.Sprintf("%d", state.StashCount)))
+		fmt.Printf("  Branch Stashes: %s\n", style.Warning.Render(fmt.Sprintf("%d", state.StashCount)))
+	}
+	if state.SharedStashCount > 0 {
+		fmt.Printf("  Shared Stashes: %s\n", style.Dim.Render(fmt.Sprintf("%d (repo-wide, not this branch)", state.SharedStashCount)))
 	}
 
 	// Verdict
@@ -1007,6 +1011,9 @@ func getGitState(worktreePath string) (*GitState, error) {
 		if stashCount > 0 {
 			state.Clean = false
 		}
+	}
+	if totalStashes, stashErr := worktreeGit.StashCountAll(); stashErr == nil && totalStashes > state.StashCount {
+		state.SharedStashCount = totalStashes - state.StashCount
 	}
 
 	return state, nil
