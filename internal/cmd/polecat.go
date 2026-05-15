@@ -180,8 +180,9 @@ This is the nuclear option for post-merge cleanup. It:
   4. Closes the agent bead (if exists)
 
 SAFETY CHECKS: The command refuses to nuke a polecat if:
-  - Worktree has unpushed/uncommitted changes
-  - Polecat has an open merge request (MR bead)
+  - cleanup_status is dirty, unknown, or missing
+  - Worktree fallback detects unpushed/uncommitted/stashed changes
+  - Polecat has an open merge request (MR bead or active_mr)
   - Polecat has work on its hook
 
 Use --force to bypass safety checks (LOSES WORK).
@@ -220,12 +221,12 @@ Examples:
 var polecatCheckRecoveryCmd = &cobra.Command{
 	Use:   "check-recovery <rig>/<polecat>",
 	Short: "Check if polecat needs recovery vs safe to nuke",
-	Long: `Check recovery status of a polecat based on cleanup_status and merge queue state.
+	Long: `Check recovery status of a polecat based on cleanup_status, active_mr, and merge queue state.
 
 Used by the Witness to determine appropriate cleanup action:
-  - SAFE_TO_NUKE: cleanup_status is 'clean' AND work submitted to merge queue
+  - SAFE_TO_NUKE: cleanup_status is 'clean', active_mr is terminal, AND work submitted to merge queue
   - NEEDS_MQ_SUBMIT: git is clean but work was never submitted to the merge queue
-  - NEEDS_RECOVERY: cleanup_status indicates unpushed/uncommitted work
+  - NEEDS_RECOVERY: cleanup_status, active_mr, or fallback git predicates require recovery
 
 This prevents accidental data loss when cleaning up dormant polecats.
 The Witness should escalate NEEDS_RECOVERY and NEEDS_MQ_SUBMIT cases to the Mayor.
@@ -1432,9 +1433,9 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 	// Report results
 	if polecatNukeDryRun {
 		if dryRunBlocked > 0 {
-			fmt.Printf("\n%s Would refuse to nuke %d of %d polecat(s) without --force.\n", style.Warning.Render("⚠"), dryRunBlocked, len(targets))
+			fmt.Printf("\n%s %s\n", style.Warning.Render("⚠"), dryRunNukeSummary(len(targets), dryRunBlocked))
 		} else {
-			fmt.Printf("\n%s Would nuke %d polecat(s).\n", style.Info.Render("ℹ"), len(targets))
+			fmt.Printf("\n%s %s\n", style.Info.Render("ℹ"), dryRunNukeSummary(len(targets), dryRunBlocked))
 		}
 		return nil
 	}
@@ -1461,6 +1462,13 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func dryRunNukeSummary(total, blocked int) string {
+	if blocked > 0 {
+		return fmt.Sprintf("Would refuse to nuke %d of %d polecat(s) without --force.", blocked, total)
+	}
+	return fmt.Sprintf("Would nuke %d polecat(s).", total)
 }
 
 // nukePolecatFull performs the complete cleanup sequence for a single polecat:
