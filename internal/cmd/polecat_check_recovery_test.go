@@ -141,6 +141,49 @@ func TestCleanupStatusBlocker(t *testing.T) {
 	}
 }
 
+func TestRecoveryGitStateBlocker(t *testing.T) {
+	tests := []struct {
+		name  string
+		state *GitState
+		err   error
+		want  string
+	}{
+		{
+			name:  "clean has no blocker",
+			state: &GitState{Clean: true},
+		},
+		{
+			name:  "uncommitted work is classified",
+			state: &GitState{UncommittedFiles: []string{"a.go", "b.go"}},
+			want:  "git_state=has_uncommitted uncommitted_files=2",
+		},
+		{
+			name:  "stash is classified",
+			state: &GitState{StashCount: 1},
+			want:  "git_state=has_stash stash_count=1",
+		},
+		{
+			name:  "unpushed commits are classified",
+			state: &GitState{UnpushedCommits: 3},
+			want:  "git_state=has_unpushed unpushed_commits=3",
+		},
+		{
+			name: "git error is classified",
+			err:  errors.New("git failed"),
+			want: "git_state=unknown path=/tmp/polecat: git failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := recoveryGitStateBlocker("/tmp/polecat", tt.state, tt.err)
+			if got != tt.want {
+				t.Errorf("recoveryGitStateBlocker() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestActiveMRBlocker(t *testing.T) {
 	tests := []struct {
 		name string

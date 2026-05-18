@@ -1106,6 +1106,12 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		if blocker := cleanupStatusBlocker(status.CleanupStatus); blocker != "" {
 			status.Blockers = append(status.Blockers, blocker)
 		}
+		if status.CleanupStatus == "" || status.CleanupStatus == polecat.CleanupUnknown {
+			gitState, gitErr := getGitState(p.ClonePath)
+			if blocker := recoveryGitStateBlocker(p.ClonePath, gitState, gitErr); blocker != "" {
+				status.Blockers = append(status.Blockers, blocker)
+			}
+		}
 		if blocker := activeMRBlocker(bd, fields.ActiveMR); blocker != "" {
 			status.Blockers = append(status.Blockers, blocker)
 		}
@@ -1205,6 +1211,22 @@ func cleanupStatusBlocker(status polecat.CleanupStatus) string {
 	default:
 		return fmt.Sprintf("cleanup_status=%s", status)
 	}
+}
+
+func recoveryGitStateBlocker(worktreePath string, gitState *GitState, gitErr error) string {
+	if gitErr != nil {
+		return fmt.Sprintf("git_state=unknown path=%s: %v", worktreePath, gitErr)
+	}
+	if gitState == nil || gitState.Clean {
+		return ""
+	}
+	if gitState.UnpushedCommits > 0 {
+		return fmt.Sprintf("git_state=has_unpushed unpushed_commits=%d", gitState.UnpushedCommits)
+	}
+	if gitState.StashCount > 0 {
+		return fmt.Sprintf("git_state=has_stash stash_count=%d", gitState.StashCount)
+	}
+	return fmt.Sprintf("git_state=has_uncommitted uncommitted_files=%d", len(gitState.UncommittedFiles))
 }
 
 func activeMRBlocker(bd issueShower, mrID string) string {
