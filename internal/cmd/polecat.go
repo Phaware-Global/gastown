@@ -515,6 +515,7 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 			}
 			state := effectivePolecatState(PolecatListItem{
 				State:          p.State,
+				Issue:          p.Issue,
 				SessionRunning: running,
 			})
 			allPolecats = append(allPolecats, PolecatListItem{
@@ -582,6 +583,8 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 			stateStr = style.Warning.Render(stateStr)
 		case polecat.StateStalled:
 			stateStr = style.Error.Render(stateStr)
+		case polecat.StateReviewNeeded:
+			stateStr = style.Warning.Render(stateStr)
 		case polecat.StateDone:
 			stateStr = style.Success.Render(stateStr)
 		case polecat.StateZombie:
@@ -783,6 +786,8 @@ func runPolecatStatus(cmd *cobra.Command, args []string) error {
 		stateStr = style.Warning.Render(stateStr)
 	case polecat.StateStalled:
 		stateStr = style.Error.Render(stateStr)
+	case polecat.StateReviewNeeded:
+		stateStr = style.Warning.Render(stateStr)
 	case polecat.StateDone:
 		stateStr = style.Success.Render(stateStr)
 	default:

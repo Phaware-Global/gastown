@@ -98,6 +98,14 @@ func TestEffectivePolecatState(t *testing.T) {
 			},
 			want: polecat.StateStalled, // stalled is a detected state, session running doesn't override
 		},
+		{
+			name: "review-needed-stays-review-needed-when-session-alive",
+			item: PolecatListItem{
+				State:          polecat.StateReviewNeeded,
+				SessionRunning: true,
+			},
+			want: polecat.StateReviewNeeded,
+		},
 	}
 
 	for _, tt := range tests {

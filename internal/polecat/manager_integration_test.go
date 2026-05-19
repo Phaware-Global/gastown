@@ -152,7 +152,7 @@ func TestManagerGetPrefersHookedBeadOverStaleAgentHook(t *testing.T) {
 	}
 }
 
-func TestManagerTreatsLiveSessionWithoutWorkAsIdle(t *testing.T) {
+func TestManagerTreatsLiveSessionWithoutWorkAsReviewNeeded(t *testing.T) {
 	if _, err := exec.LookPath("bd"); err != nil {
 		t.Skip("bd not installed, skipping integration test")
 	}
@@ -215,8 +215,8 @@ func TestManagerTreatsLiveSessionWithoutWorkAsIdle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mgr.Get(toast): %v", err)
 	}
-	if p.State != StateIdle {
-		t.Fatalf("polecat state = %q, want %q when tmux session is alive without work", p.State, StateIdle)
+	if p.State != StateReviewNeeded {
+		t.Fatalf("polecat state = %q, want %q when tmux session is alive without work", p.State, StateReviewNeeded)
 	}
 	if p.Issue != "" {
 		t.Fatalf("polecat issue = %q, want empty when no active hooked/assigned work exists", p.Issue)
@@ -226,10 +226,7 @@ func TestManagerTreatsLiveSessionWithoutWorkAsIdle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mgr.FindIdlePolecat(): %v", err)
 	}
-	if idle == nil {
-		t.Fatalf("FindIdlePolecat() = nil, want toast while session %s is preserved without work", sessionName)
-	}
-	if idle.Name != "toast" {
-		t.Fatalf("FindIdlePolecat() = %q, want toast", idle.Name)
+	if idle != nil {
+		t.Fatalf("FindIdlePolecat() = %q, want nil while session %s needs review", idle.Name, sessionName)
 	}
 }

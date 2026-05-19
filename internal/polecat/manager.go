@@ -2211,8 +2211,8 @@ func (m *Manager) reuseDecisionForPolecat(name string, state State) SlotReuseDec
 // Get returns a specific polecat by name.
 // State is derived from active work beads/assignment first, with tmux liveness
 // used only to distinguish working from stalled when work exists. A live session
-// without an active issue is not work; persistent polecats can be idle while the
-// reusable sandbox/session is still present.
+// without an active issue is not work; it is reusable idle only after clean
+// cleanup status, otherwise it needs recovery review.
 func (m *Manager) Get(name string) (*Polecat, error) {
 	if !m.exists(name) {
 		return nil, ErrPolecatNotFound
@@ -2390,8 +2390,9 @@ func activeWorkBeadsForCleanup(issues []*beads.Issue) []*beads.Issue {
 //  2. Legacy agent hook_bead that still points to a currently hooked bead for this assignee
 //     → working (compatibility fallback during migration)
 //  3. Issue assigned via beads assignee (open/in_progress/hooked) → working
-//  4. No active issue → idle, even if a reusable tmux session is still alive
-//  5. Beads query failure + live/dead session → working/stalled fallback
+//  4. Live session without active issue + clean cleanup → idle
+//  5. Live session without active issue + non-clean/unknown cleanup → review-needed
+//  6. Beads query failure + live/dead session → review-needed/stalled fallback
 func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 	// Use clonePath which handles both new (polecats/<name>/<rigname>/)
 	// and old (polecats/<name>/) structures
@@ -2468,10 +2469,12 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 	issue, beadsErr := m.beads.GetAssignedIssue(assignee)
 	if beadsErr != nil {
 		// If beads query fails, cross-check tmux session state.
-		// Previously defaulted to StateWorking; now detects stalled sessions.
+		// Avoid synthesizing working with no issue when we cannot verify active work.
 		state := StateWorking
 		if sessionDead {
 			state = StateStalled
+		} else if sessionRunning {
+			state = StateReviewNeeded
 		}
 		return &Polecat{
 			Name:      name,
@@ -2483,19 +2486,18 @@ func (m *Manager) loadFromBeads(name string) (*Polecat, error) {
 	}
 
 	// Persistent model: only an active issue means working. A live tmux session
-	// without active work is an idle preserved polecat, not working with Issue:none.
+	// without active work is only idle if cleanup is explicitly clean; otherwise
+	// keep it non-reusable for recovery instead of reporting working with Issue:none.
 	issueID := ""
 	if issue != nil {
 		issueID = issue.ID
 	}
 
-	// Persistent polecat model (gt-4ac): no active work means idle. Reuse logic is
-	// responsible for cleaning up any preserved live session before assignment.
 	state := StateIdle
 	if issueID != "" {
 		state = StateWorking
-	} else if agentErr == nil && fields != nil && beads.AgentState(fields.AgentState) == beads.AgentStateIdle {
-		state = StateIdle
+	} else if sessionRunning && !sessionStale && !m.getCleanupStatusFromBead(name).IsSafe() {
+		state = StateReviewNeeded
 	}
 
 	return &Polecat{
