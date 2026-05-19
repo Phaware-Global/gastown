@@ -2,7 +2,7 @@
 // Injects gt prime context into the system prompt via experimental.chat.system.transform.
 export const GasTown = async ({ $, directory }) => {
   const role = (process.env.GT_ROLE || "").toLowerCase();
-  const gtBin = "/home/coder/.local/bin/gt";
+  const gtBin = process.env.GT_BIN || "gt";
   let didInit = false;
 
   let primePromise = null;
@@ -31,11 +31,19 @@ export const GasTown = async ({ $, directory }) => {
     return null;
   };
 
+  const shellQuote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
+
+  const gtCommand = () => {
+    if (/^[A-Za-z0-9_./-]+$/.test(gtBin)) return gtBin;
+    return shellQuote(gtBin);
+  };
+
   const isDoltBackedCommand = (cmd) =>
-    /(^|\s)(gt|bd)\s/.test(cmd) && !/(^|\s)gt\s+dolt\s+status(\s|$)/.test(cmd);
+    /(^|\s)(?:'[^']*\/|[^'\s]*\/)?(?:gt|bd)'?\s/.test(cmd) &&
+    !/(^|\s)(?:'[^']*\/|[^'\s]*\/)?gt'?\s+dolt\s+status(\s|$)/.test(cmd);
 
   const captureDoltStatus = async () => {
-    const statusCmd = "timeout 10s gt dolt status 2>&1";
+    const statusCmd = `timeout 10s ${gtCommand()} dolt status 2>&1`;
     try {
       return await $`/bin/sh -lc ${statusCmd}`.cwd(directory).text();
     } catch (err) {
@@ -74,19 +82,6 @@ export const GasTown = async ({ $, directory }) => {
     console.error(lines.join("\n"));
   };
 
-  const simpleRole = (value) => {
-    if (!value) return "";
-    const parts = value.split("/").filter(Boolean);
-    if (parts.length >= 2 && parts[1] === "polecats") return "polecat";
-    if (parts.length >= 2 && parts[1] === "crew") return "crew";
-    if (parts.length >= 2) return parts[1];
-    return parts[0];
-  };
-
-  const shellQuote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
-
-  const eventSessionID = (event) => event?.properties?.info?.id || event?.sessionID || event?.session?.id || "";
-
   const captureRun = async (cmd) => {
     try {
       return await $`/bin/sh -lc ${cmd}`.cwd(directory).text();
@@ -96,12 +91,14 @@ export const GasTown = async ({ $, directory }) => {
     }
   };
 
+  const eventSessionID = (event) => event?.properties?.info?.id || event?.sessionID || event?.session?.id || "";
+
   const loadPrime = async (source = "startup", sessionID = "") => {
     const env = [`GT_HOOK_SOURCE=${shellQuote(source)}`];
     if (sessionID) {
       env.push(`GT_SESSION_ID=${shellQuote(sessionID)}`);
     }
-    let context = await captureRun(`${env.join(" ")} ${shellQuote(gtBin)} prime --hook`);
+    let context = await captureRun(`${env.join(" ")} ${gtCommand()} prime --hook`);
     // NOTE: session-started nudge to deacon removed — it interrupted
     // the deacon's await-signal backoff. Deacon wakes on beads activity.
     return context;
@@ -122,7 +119,7 @@ export const GasTown = async ({ $, directory }) => {
       if (event?.type === "session.deleted") {
         const sessionID = event.properties?.info?.id;
         if (sessionID) {
-          await captureRun(`${shellQuote(gtBin)} costs record --session ${shellQuote(sessionID)}`);
+          await captureRun(`${gtCommand()} costs record --session ${shellQuote(sessionID)}`);
         }
       }
     },
@@ -138,7 +135,7 @@ export const GasTown = async ({ $, directory }) => {
       }
     },
     "experimental.session.compacting": async ({ sessionID }, output) => {
-      const roleDisplay = simpleRole(role) || "unknown";
+      const roleDisplay = role || "unknown";
       output.context.push(`
 ## Gas Town Multi-Agent System
 
