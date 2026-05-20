@@ -475,3 +475,110 @@ func isSessionWorking(t *tmux.Tmux, session string) bool {
 
 	return false
 }
+<<<<<<< HEAD
+=======
+
+// getMailPreviewWithRoot returns unread count and a truncated subject of the first unread message,
+// using an explicit town root.
+func getMailPreviewWithRoot(identity string, maxLen int, townRoot string) (int, string) {
+	release, ok := tryStatusDetailLock(townRoot)
+	if !ok {
+		return 0, ""
+	}
+	defer release()
+
+	// Use NewMailboxFromAddress to normalize identity (e.g., gastown/crew/gus -> gastown/gus)
+	mailbox := mail.NewMailboxFromAddress(identity, townRoot)
+
+	// Get unread messages
+	messages, err := mailbox.ListUnread()
+	if err != nil || len(messages) == 0 {
+		return 0, ""
+	}
+
+	// Get first message subject, truncated
+	subject := messages[0].Subject
+	if len(subject) > maxLen {
+		subject = subject[:maxLen-1] + "…"
+	}
+
+	return len(messages), subject
+}
+
+// getHookedWork returns a truncated title of the hooked bead for an agent.
+// Returns empty string if nothing is hooked.
+// beadsDir should be the directory containing .beads (for rig-level) or
+// empty to use the town root (for town-level roles).
+func getHookedWork(identity string, maxLen int, beadsDir string) string {
+	// If no beadsDir specified, use town root
+	if beadsDir == "" {
+		var err error
+		beadsDir, err = findMailWorkDir()
+		if err != nil {
+			return ""
+		}
+	}
+	if townRoot, err := workspace.Find(beadsDir); err == nil {
+		release, ok := tryStatusDetailLock(townRoot)
+		if !ok {
+			return ""
+		}
+		defer release()
+	}
+
+	b := beads.New(beadsDir)
+
+	// Query for hooked beads assigned to this agent
+	hookedBeads, err := b.List(beads.ListOptions{
+		Status:   beads.StatusHooked,
+		Assignee: identity,
+		Priority: -1,
+	})
+	if err != nil || len(hookedBeads) == 0 {
+		return ""
+	}
+
+	// Return first hooked bead's ID and title, truncated
+	bead := hookedBeads[0]
+	display := fmt.Sprintf("%s: %s", bead.ID, bead.Title)
+	if len(display) > maxLen {
+		display = display[:maxLen-1] + "…"
+	}
+	return display
+}
+
+// getCurrentWork returns a truncated title of the first in_progress issue assigned to identity.
+// Uses the pane's working directory to find the beads.
+func getCurrentWork(t *tmux.Tmux, session string, identity string, maxLen int) string {
+	// Get the pane's working directory
+	workDir, err := t.GetPaneWorkDir(session)
+	if err != nil || workDir == "" {
+		return ""
+	}
+
+	// Check if there's a .beads directory
+	beadsDir := filepath.Join(workDir, ".beads")
+	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
+		return ""
+	}
+
+	// Query beads for in_progress issues assigned to this agent
+	b := beads.New(workDir)
+	issues, err := b.List(beads.ListOptions{
+		Status:   "in_progress",
+		Assignee: identity,
+		Priority: -1,
+	})
+	if err != nil || len(issues) == 0 {
+		return ""
+	}
+
+	// Return first issue's ID and title, truncated
+	issue := issues[0]
+	display := fmt.Sprintf("%s: %s", issue.ID, issue.Title)
+	if len(display) > maxLen {
+		display = display[:maxLen-1] + "…"
+	}
+	return display
+}
+>>>>>>> 4da19009 (WIP: checkpoint (auto))
