@@ -1082,26 +1082,28 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Determine target branch for the MR.
 		// Priority: explicit --target flag > formula_vars base_branch > integration branch auto-detect > rig default.
 		target := defaultBranch
+		explicitTarget := false
 
 		// 1. Explicit --target flag (highest priority — polecat knows its base branch).
 		// This is the most reliable path: the formula passes {{base_branch}} directly,
 		// avoiding any dependency on bd.Show() or Dolt availability.
 		if doneTarget != "" {
 			target = doneTarget
+			explicitTarget = true
 			fmt.Printf("  Target branch: %s (from --target flag)\n", target)
 		}
 
 		// 2. Check for --base-branch override in formula vars (stored on bead at sling time).
 		// Fallback for polecats dispatched before --target flag existed, or when
 		// the formula doesn't pass --target explicitly.
-		if target == defaultBranch && sourceIssueForNoMerge != nil {
+		if !explicitTarget && target == defaultBranch && sourceIssueForNoMerge != nil {
 			if af := beads.ParseAttachmentFields(sourceIssueForNoMerge); af != nil {
 				if bb := extractFormulaVar(af.FormulaVars, "base_branch"); bb != "" && bb != defaultBranch {
 					target = bb
 					fmt.Printf("  Target branch override: %s (from formula_vars)\n", target)
 				}
 			}
-		} else if target == defaultBranch && sourceIssueForNoMerge == nil && issueID != "" {
+		} else if !explicitTarget && target == defaultBranch && sourceIssueForNoMerge == nil && issueID != "" {
 			// sourceIssueForNoMerge is nil — bd.Show(issueID) failed earlier.
 			// This is the silent failure path that caused 150+ procedure beads to
 			// target main instead of feat/contract-review-procedure.
@@ -1110,7 +1112,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 		// 3. Auto-detect integration branch from epic hierarchy (if enabled).
 		// Only overrides if no explicit target was set above.
-		if target == defaultBranch {
+		if !explicitTarget && target == defaultBranch {
 			refineryEnabled := true
 			settingsPath := filepath.Join(townRoot, rigName, "settings", "config.json")
 			if settings, err := config.LoadRigSettings(settingsPath); err == nil && settings.MergeQueue != nil {
