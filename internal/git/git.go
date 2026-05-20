@@ -697,6 +697,32 @@ func (g *Git) DiffNameOnly(base, head string) ([]string, error) {
 	return strings.Split(strings.TrimSpace(out), "\n"), nil
 }
 
+// HasDiff reports whether two refs have different tree content using a normal
+// two-dot diff. Unlike DiffNameOnly, this does not use merge-base semantics;
+// it answers whether the content at head differs from base.
+func (g *Git) HasDiff(base, head string) (bool, error) {
+	args := []string{"diff", base, head, "--quiet"}
+	if g.gitDir != "" {
+		args = append([]string{"--git-dir=" + g.gitDir}, args...)
+	}
+	cmd := exec.Command("git", args...)
+	util.SetDetachedProcessGroup(cmd)
+	if g.workDir != "" {
+		cmd.Dir = g.workDir
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return true, nil
+		}
+		return false, g.wrapError(err, stdout.String(), stderr.String(), args)
+	}
+	return false, nil
+}
+
 // GitStatus represents the status of the working directory.
 type GitStatus struct {
 	Clean     bool

@@ -1022,6 +1022,10 @@ type RecoveryStatus struct {
 	Branch        string                `json:"branch,omitempty"`
 	Issue         string                `json:"issue,omitempty"`
 	MQStatus      string                `json:"mq_status,omitempty"` // "submitted", "not_submitted", "not_required", "unknown"
+	ActiveMR      string                `json:"active_mr,omitempty"`
+	Reusable      bool                  `json:"reusable"`
+	SafeToNuke    bool                  `json:"safe_to_nuke"`
+	Reason        string                `json:"reason,omitempty"`
 }
 
 func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
@@ -1030,86 +1034,30 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	mgr, r, err := getPolecatManager(rigName)
+	mgr, _, err := getPolecatManager(rigName)
 	if err != nil {
 		return err
 	}
 
-	// Verify polecat exists and get info
-	p, err := mgr.Get(polecatName)
+	// Verify polecat exists and get shared recovery/reuse verdict.
+	workState, err := mgr.EvaluateWorkState(polecatName)
 	if err != nil {
 		return fmt.Errorf("polecat '%s' not found in rig '%s'", polecatName, rigName)
 	}
 
-	// Get cleanup_status from agent bead
-	// We need to read it directly from beads since manager doesn't expose it
-	rigPath := r.Path
-	bd := beads.New(rigPath)
-	agentBeadID := polecatBeadIDForRig(r, rigName, polecatName)
-	_, fields, err := bd.GetAgentBead(agentBeadID)
-
 	status := RecoveryStatus{
-		Rig:     rigName,
-		Polecat: polecatName,
-		Branch:  p.Branch,
-		Issue:   p.Issue,
-	}
-
-	if err != nil || fields == nil {
-		// No agent bead or no cleanup_status - fall back to git check
-		// This handles polecats that haven't self-reported yet
-		gitState, gitErr := getGitState(p.ClonePath)
-		if gitErr != nil {
-			status.CleanupStatus = polecat.CleanupUnknown
-			status.NeedsRecovery = true
-			status.Verdict = "NEEDS_RECOVERY"
-		} else if gitState.Clean {
-			status.CleanupStatus = polecat.CleanupClean
-			status.NeedsRecovery = false
-			status.Verdict = "SAFE_TO_NUKE"
-		} else if gitState.UnpushedCommits > 0 {
-			status.CleanupStatus = polecat.CleanupUnpushed
-			status.NeedsRecovery = true
-			status.Verdict = "NEEDS_RECOVERY"
-		} else if gitState.StashCount > 0 {
-			status.CleanupStatus = polecat.CleanupStash
-			status.NeedsRecovery = true
-			status.Verdict = "NEEDS_RECOVERY"
-		} else {
-			status.CleanupStatus = polecat.CleanupUncommitted
-			status.NeedsRecovery = true
-			status.Verdict = "NEEDS_RECOVERY"
-		}
-	} else {
-		// Use cleanup_status from agent bead
-		status.CleanupStatus = polecat.CleanupStatus(fields.CleanupStatus)
-		if status.CleanupStatus.IsSafe() && isActiveMRTerminal(bd, fields.ActiveMR) {
-			status.NeedsRecovery = false
-			status.Verdict = "SAFE_TO_NUKE"
-		} else {
-			// RequiresRecovery covers uncommitted, stash, unpushed
-			// Unknown/empty also treated conservatively
-			status.NeedsRecovery = true
-			status.Verdict = "NEEDS_RECOVERY"
-		}
-	}
-
-	// MQ check: if verdict is SAFE_TO_NUKE and polecat has a branch,
-	// verify the work was actually submitted to the merge queue.
-	// Without this check, polecats that crashed between push and MQ submission
-	// would be nuked with orphaned branches on the remote. See #1035.
-	//
-	// Exception: if the polecat's assigned bead is already CLOSED/TOMBSTONE,
-	// the work is terminal and MQ submission is moot. Reporting NEEDS_MQ_SUBMIT
-	// on a closed bead triggered a zombie-restart loop (see aa-55d8): witness
-	// patrols kept auto-restarting the polecat to "finish" work that was already
-	// done, which just ran `gt done` again and died, over and over.
-	if status.Verdict == "SAFE_TO_NUKE" && status.Branch != "" {
-		mqBd := beads.New(r.Path)
-		beadTerminal := isAssignedBeadTerminal(mqBd, status.Issue)
-		gitState, gitErr := getGitState(p.ClonePath)
-		hasSubmittableWork := gitErr != nil || gitState.UnpushedCommits > 0
-		applyMQCheck(&status, mqBd, beadTerminal, hasSubmittableWork)
+		Rig:           rigName,
+		Polecat:       polecatName,
+		Branch:        workState.Branch,
+		Issue:         workState.Issue,
+		CleanupStatus: workState.CleanupStatus,
+		NeedsRecovery: workState.NeedsRecovery,
+		Verdict:       workState.Verdict,
+		MQStatus:      workState.MQStatus,
+		ActiveMR:      workState.ActiveMR,
+		Reusable:      workState.Reusable,
+		SafeToNuke:    workState.SafeToNuke,
+		Reason:        workState.Reason,
 	}
 
 	// JSON output
@@ -1139,9 +1087,22 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		fmt.Println("  Submit to MQ before cleanup, or the branch will be orphaned.")
 	case "NEEDS_RECOVERY":
 		fmt.Printf("  Verdict:         %s\n", style.Error.Render("NEEDS_RECOVERY"))
+		if status.MQStatus != "" {
+			fmt.Printf("  MQ Status:       %s\n", status.MQStatus)
+		}
+		if status.ActiveMR != "" {
+			fmt.Printf("  Active MR:       %s\n", status.ActiveMR)
+		}
+		if status.Reason != "" {
+			fmt.Printf("  Reason:          %s\n", status.Reason)
+		}
 		fmt.Println()
-		fmt.Printf("  %s This polecat has unpushed/uncommitted work.\n", style.Warning.Render("⚠"))
-		fmt.Println("  Escalate to Mayor for recovery before cleanup.")
+		if status.Reusable {
+			fmt.Printf("  %s Work is preserved/submitted; the slot may be reusable, but cleanup/nuke is blocked until recovery is reconciled.\n", style.Warning.Render("⚠"))
+		} else {
+			fmt.Printf("  %s This polecat is not safe for cleanup/reuse.\n", style.Warning.Render("⚠"))
+			fmt.Println("  Escalate to Mayor for recovery before cleanup or reuse.")
+		}
 	default:
 		fmt.Printf("  Verdict:         %s\n", style.Success.Render("SAFE_TO_NUKE"))
 		if status.MQStatus != "" {
@@ -1152,84 +1113,6 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
-}
-
-type issueShower interface {
-	Show(issueID string) (*beads.Issue, error)
-}
-
-func isActiveMRTerminal(bd issueShower, mrID string) bool {
-	if mrID == "" {
-		return true
-	}
-	if bd == nil {
-		return false
-	}
-	mr, err := bd.Show(mrID)
-	if errors.Is(err, beads.ErrNotFound) {
-		return true
-	}
-	if err != nil || mr == nil {
-		return false
-	}
-	return beads.IssueStatus(mr.Status).IsTerminal()
-}
-
-// mrFinder is the subset of *beads.Beads that applyMQCheck needs. It lets us
-// unit-test the verdict logic without a real bd binary.
-type mrFinder interface {
-	FindMRForBranchAny(branch string) (*beads.Issue, error)
-}
-
-// isAssignedBeadTerminal reports whether the polecat's assigned bead (if any)
-// is in a terminal status (closed/tombstone). Returns false on any lookup
-// failure — callers must only use this to *skip* further escalation, never to
-// escalate, so a false negative is safe.
-func isAssignedBeadTerminal(bd *beads.Beads, issueID string) bool {
-	if issueID == "" || bd == nil {
-		return false
-	}
-	issue, err := bd.Show(issueID)
-	if err != nil || issue == nil {
-		return false
-	}
-	return beads.IssueStatus(issue.Status).IsTerminal()
-}
-
-// applyMQCheck mutates status based on merge-queue state for the polecat's
-// branch. If beadTerminal is true, the assigned bead is already closed, so
-// there is nothing to submit and we leave the verdict as SAFE_TO_NUKE.
-//
-// This guard fixes the zombie-restart loop documented in bead aa-55d8:
-// a closed "no-op audit" bead (e.g. aa-xtee) used to report NEEDS_MQ_SUBMIT
-// forever, causing witness patrols to restart the polecat on every cycle.
-func applyMQCheck(status *RecoveryStatus, bd mrFinder, beadTerminal, hasSubmittableWork bool) {
-	if beadTerminal {
-		// Nothing to submit — the bead is already terminal.
-		status.MQStatus = "submitted"
-		return
-	}
-	if !hasSubmittableWork {
-		// No commits/content ahead of the integration branch means gt done had
-		// nothing to enqueue; treating that as missing MQ submission causes
-		// recovery loops on no-op/report-only assignments.
-		status.MQStatus = "not_required"
-		return
-	}
-	mr, mrErr := bd.FindMRForBranchAny(status.Branch)
-	if mrErr != nil {
-		// Can't verify MQ — be conservative
-		status.MQStatus = "unknown"
-		return
-	}
-	if mr != nil {
-		status.MQStatus = "submitted"
-		return
-	}
-	// Work was pushed but never entered the merge queue
-	status.MQStatus = "not_submitted"
-	status.NeedsRecovery = true
-	status.Verdict = "NEEDS_MQ_SUBMIT"
 }
 
 func runPolecatGC(cmd *cobra.Command, args []string) error {
@@ -1405,6 +1288,9 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 // This is the canonical cleanup path used by both `polecat nuke` and `polecat stale --cleanup`.
 func nukePolecatFull(polecatName, rigName string, mgr *polecat.Manager, r *rig.Rig) error {
 	t := tmux.NewTmux()
+	if state, err := mgr.EvaluateWorkState(polecatName); err == nil && state.ActiveMR != "" && !state.SafeToNuke {
+		return fmt.Errorf("cannot nuke %s/%s: active MR %s is not terminal (verdict=%s, reason=%s)", rigName, polecatName, state.ActiveMR, state.Verdict, state.Reason)
+	}
 
 	// Step 1: Kill tmux session unconditionally to prevent ghost sessions
 	// when IsRunning fails to detect the session.

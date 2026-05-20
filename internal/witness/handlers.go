@@ -783,40 +783,16 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 	if exitType != string(ExitTypeCompleted) {
 		return polecat.SlotReuseDecision{Reason: "exit-" + strings.ToLower(exitType)}
 	}
-	prefix := beads.GetPrefixForRig(townRoot, rigName)
-	agentID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
-	_, fields, err := beads.New(beads.ResolveBeadsDir(workDir)).ForAgentBead().GetAgentBead(agentID)
-	input := polecat.SlotReuseInput{State: polecat.StateIdle, CleanupStatus: polecat.CleanupUnknown, GitCheckFailed: err != nil || fields == nil}
-	if fields != nil {
-		input.HookBead = fields.HookBead
-		input.PushFailed = fields.PushFailed
-		input.MRFailed = fields.MRFailed
-		if fields.CleanupStatus != "" {
-			input.CleanupStatus = polecat.CleanupStatus(fields.CleanupStatus)
-		}
+	rigPath := filepath.Join(townRoot, rigName)
+	mgr := polecat.NewManager(&rig.Rig{Name: rigName, Path: rigPath}, git.NewGit(rigPath), tmux.NewTmux())
+	state, err := mgr.EvaluateCompletedSlotState(polecatName)
+	if err != nil {
+		return polecat.SlotReuseDecision{Reason: "workstate-error"}
 	}
-	clonePath := filepath.Join(townRoot, rigName, "polecats", polecatName, rigName)
-	g := git.NewGit(clonePath)
-	if branch, err := g.CurrentBranch(); err == nil {
-		input.Branch = branch
-		if status, err := g.CheckUncommittedWork(); err == nil {
-			input.GitDirty = !status.CleanExcludingRuntime()
-			input.StashCount = status.StashCount
-			input.UnpushedCommits = status.UnpushedCommits
-		} else {
-			input.GitCheckFailed = true
-		}
-		if pushed, unpushed, err := g.BranchPushedToRemote(branch, "origin"); err == nil {
-			if !pushed && unpushed > input.UnpushedCommits {
-				input.UnpushedCommits = unpushed
-			}
-		} else {
-			input.GitCheckFailed = true
-		}
-	} else {
-		input.GitCheckFailed = true
+	if !state.SlotOpenEligible {
+		return polecat.SlotReuseDecision{Reason: state.Reason}
 	}
-	return polecat.DecideSlotReuse(input)
+	return polecat.SlotReuseDecision{Reusable: true, Reason: "reusable"}
 }
 
 // RecoveryPayload contains data for RECOVERY_NEEDED escalation.
