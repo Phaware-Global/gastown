@@ -1675,23 +1675,22 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 	if err != nil {
 		return nil, err
 	}
+	if current.Issue == "" {
+		switch current.State {
+		case StateWorking, StateStalled, StateReviewNeeded:
+			current.State = StateIdle
+		}
+	}
+	if current.State == StateIdle {
+		// A live session with no active work is a dead prompt, not preserved work.
+		// Clear it before evaluating reuse so recovery-blocked idle slots don't
+		// continue consuming capacity.
+		if err := m.killExistingPolecatSession(name, "reuse"); err != nil {
+			return nil, err
+		}
+	}
 	if decision := m.reuseDecisionForPolecat(name, current.State); !decision.Reusable {
 		return nil, fmt.Errorf("%w: %s", ErrPolecatNeedsRecovery, decision.Reason)
-	}
-
-	// Kill any existing session unconditionally before reuse.
-	// The polecat was found idle (no hooked work), so even a "live" session is
-	// just Claude sitting at a dead ❯ prompt from the previous task. Leaving it
-	// alive prevents StartSession from creating a fresh session with a proper
-	// gt prime --hook cycle to discover the newly hooked bead.
-	//
-	// Previously, non-stale sessions returned ErrSessionRunning here, causing the
-	// caller to allocate a new polecat. But heartbeat freshness can race with
-	// session lifecycle (e.g. a compact/resume hook refreshes the heartbeat while
-	// the session is functionally idle), leaving the old session alive and the
-	// new work undiscovered.
-	if err := m.killExistingPolecatSession(name, "reuse"); err != nil {
-		return nil, err
 	}
 
 	// Get worktree path (must already exist for reuse)
