@@ -404,6 +404,22 @@ func TestValidate_RejectsWhitespaceOnlyMayorEntries(t *testing.T) {
 	}
 }
 
+func TestValidate_RejectsAtPrefixedGitHubLogin(t *testing.T) {
+	t.Parallel()
+	// Webhook payloads carry the bare login; "@artie" would pass an
+	// emptiness check but never match anything, silently turning every
+	// event into a not_relevant drop.
+	cfg := telegraph.DefaultConfig()
+	cfg.Telegraph.Mayor.GitHubLogins = []string{"@artie"}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() = nil, want error for leading '@'")
+	}
+	if !strings.Contains(err.Error(), "@") || !strings.Contains(err.Error(), "github_logins") {
+		t.Errorf("error should call out @ and github_logins: %v", err)
+	}
+}
+
 func TestValidate_RejectsEmptyRepoEntry(t *testing.T) {
 	t.Parallel()
 	cfg := telegraph.DefaultConfig()

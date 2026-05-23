@@ -33,8 +33,10 @@ import (
 // Logins are matched case-insensitively (GitHub logins are case-preserving
 // but case-insensitive in comparison).
 //
-// An empty identity disables relevance filtering; with a populated identity,
-// events that don't pertain to the mayor return ErrNotRelevant.
+// An empty identity disables relevance filtering — every successfully
+// translated event is forwarded. This is the test-only and library-caller
+// seam; production deployments go through telegraph.Config.Validate(),
+// which refuses an empty identity when the github provider is enabled.
 type MayorIdentity struct {
 	Logins []string
 }

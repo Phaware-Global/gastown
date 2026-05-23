@@ -226,8 +226,16 @@ func (c *Config) Validate() error {
 		}
 	}
 	for _, v := range t.Mayor.GitHubLogins {
-		if strings.TrimSpace(v) == "" {
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
 			return errors.New("telegraph.mayor.github_logins must not contain empty or whitespace-only entries")
+		}
+		// GitHub webhook payloads carry the bare login ("artie"), not the
+		// at-prefixed form. An entry like "@artie" passes the non-empty
+		// check but never matches anything at runtime, which silently
+		// turns every event into a not_relevant drop — fail loud instead.
+		if strings.HasPrefix(trimmed, "@") {
+			return fmt.Errorf("telegraph.mayor.github_logins entry %q: drop the leading '@' — webhook payloads use the bare login", v)
 		}
 	}
 	return nil

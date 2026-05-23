@@ -17,8 +17,6 @@ import (
 )
 
 // MayorIdentity identifies the mayor user for Jira relevance filtering.
-// At least one of AccountIDs or Usernames must be populated; with an empty
-// identity, every event would be classified as irrelevant and dropped.
 //
 //   - AccountIDs: opaque Jira Cloud account IDs. Matched exactly against
 //     issue assignee.accountId, comment author.accountId, and the
@@ -26,6 +24,12 @@ import (
 //   - Usernames: matched case-insensitively against User.name and
 //     User.displayName, and against the bracketed [~username] form of
 //     @-mentions used by Jira Server / legacy ADF payloads.
+//
+// An empty identity (no AccountIDs and no Usernames) disables relevance
+// filtering — every successfully translated event is forwarded. This is
+// the test-only and library-caller seam; production deployments go
+// through telegraph.Config.Validate(), which refuses an empty identity
+// when the jira provider is enabled.
 type MayorIdentity struct {
 	AccountIDs []string
 	Usernames  []string
