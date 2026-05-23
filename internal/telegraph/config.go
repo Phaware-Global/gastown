@@ -97,18 +97,18 @@ type ProviderConfig struct {
 	// An empty-string entry is rejected at config-load time.
 	IgnoreActors []string `toml:"ignore_actors"`
 
-	// Repos is an allow-list of repository identifiers whose events the
-	// provider accepts. Empty or absent means no repository filtering (all
-	// authenticated events from configured event types are accepted).
+	// ExtraRepos extends the GitHub provider's repository allow-list with
+	// repos that are NOT registered as town rigs (e.g. shared infrastructure
+	// repositories like "Phaware-Global/cdk-infra"). The rig-derived set is
+	// loaded from <townRoot>/mayor/rigs.json at startup and is the canonical
+	// source of allow-listed repos; ExtraRepos is unioned with it.
 	//
-	// Currently consumed by the GitHub provider only; entries are formatted
-	// as "owner/repo" and matched case-insensitively against the webhook's
-	// repository.full_name. Other providers ignore this field; rather than
-	// reject it at validation time we let provider translators enforce
-	// semantics so the option remains forward-compatible.
+	// Entries are formatted as "owner/repo" and matched case-insensitively
+	// against the webhook's repository.full_name. Empty-string entries are
+	// rejected at config-load time.
 	//
-	// An empty-string entry is rejected at config-load time.
-	Repos []string `toml:"repos"`
+	// Other providers (Jira) ignore this field.
+	ExtraRepos []string `toml:"extra_repos"`
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -194,9 +194,9 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("telegraph.providers.%s: ignore_actors must not contain empty strings", id)
 			}
 		}
-		for _, r := range p.Repos {
-			if r == "" {
-				return fmt.Errorf("telegraph.providers.%s: repos must not contain empty strings", id)
+		for _, r := range p.ExtraRepos {
+			if strings.TrimSpace(r) == "" {
+				return fmt.Errorf("telegraph.providers.%s: extra_repos must not contain empty or whitespace-only entries", id)
 			}
 		}
 		if p.Enabled {

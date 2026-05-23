@@ -95,12 +95,12 @@ const ModelEscalationConfigPath = ".gastown/model-escalation.json"
 
 // RedispatchResult describes the outcome of a re-dispatch attempt.
 type RedispatchResult struct {
-	BeadID     string `json:"bead_id"`
-	Action     string `json:"action"` // "redispatched", "cooldown", "escalated", "error"
-	TargetRig  string `json:"target_rig,omitempty"`
-	Attempts   int    `json:"attempts"`
-	Message    string `json:"message,omitempty"`
-	Error      error  `json:"error,omitempty"`
+	BeadID    string `json:"bead_id"`
+	Action    string `json:"action"` // "redispatched", "cooldown", "escalated", "error"
+	TargetRig string `json:"target_rig,omitempty"`
+	Attempts  int    `json:"attempts"`
+	Message   string `json:"message,omitempty"`
+	Error     error  `json:"error,omitempty"`
 }
 
 // RedispatchStateFile returns the path to the re-dispatch state file.

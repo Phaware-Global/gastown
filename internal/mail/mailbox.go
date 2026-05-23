@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	beadsdk "github.com/steveyegge/beads"
 	"github.com/gofrs/flock"
+	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/telemetry"

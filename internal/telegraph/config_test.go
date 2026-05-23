@@ -352,8 +352,8 @@ listen_addr = ":9100"
 [telegraph.providers.github]
 enabled    = true
 secret_env = "GT_TELEGRAPH_GITHUB_SECRET"
-events     = ["pull_request", "pull_request_review", "check_run"]
-repos      = ["acme/widget", "acme/sprocket"]
+events       = ["pull_request", "pull_request_review", "check_run"]
+extra_repos  = ["acme/widget", "acme/sprocket"]
 `)
 	cfg, err := telegraph.Load(path)
 	if err != nil {
@@ -369,8 +369,8 @@ repos      = ["acme/widget", "acme/sprocket"]
 	if p.SecretEnv != "GT_TELEGRAPH_GITHUB_SECRET" {
 		t.Errorf("SecretEnv = %q", p.SecretEnv)
 	}
-	if len(p.Repos) != 2 || p.Repos[0] != "acme/widget" {
-		t.Errorf("Repos = %v", p.Repos)
+	if len(p.ExtraRepos) != 2 || p.ExtraRepos[0] != "acme/widget" {
+		t.Errorf("ExtraRepos = %v", p.ExtraRepos)
 	}
 }
 
@@ -420,17 +420,33 @@ func TestValidate_RejectsAtPrefixedGitHubLogin(t *testing.T) {
 	}
 }
 
-func TestValidate_RejectsEmptyRepoEntry(t *testing.T) {
+func TestValidate_RejectsEmptyExtraRepoEntry(t *testing.T) {
 	t.Parallel()
 	cfg := telegraph.DefaultConfig()
+	cfg.Telegraph.Mayor = telegraph.MayorConfig{GitHubLogins: []string{"artie"}}
 	cfg.Telegraph.Providers["github"] = &telegraph.ProviderConfig{
-		Enabled:   true,
-		SecretEnv: "GT_GITHUB_SECRET",
-		Events:    []string{"pull_request"},
-		Repos:     []string{"acme/widget", ""},
+		Enabled:    true,
+		SecretEnv:  "GT_GITHUB_SECRET",
+		Events:     []string{"pull_request"},
+		ExtraRepos: []string{"acme/widget", ""},
 	}
 	if err := cfg.Validate(); err == nil {
-		t.Error("expected error for empty repos entry")
+		t.Error("expected error for empty extra_repos entry")
+	}
+}
+
+func TestValidate_RejectsWhitespaceExtraRepoEntry(t *testing.T) {
+	t.Parallel()
+	cfg := telegraph.DefaultConfig()
+	cfg.Telegraph.Mayor = telegraph.MayorConfig{GitHubLogins: []string{"artie"}}
+	cfg.Telegraph.Providers["github"] = &telegraph.ProviderConfig{
+		Enabled:    true,
+		SecretEnv:  "GT_GITHUB_SECRET",
+		Events:     []string{"pull_request"},
+		ExtraRepos: []string{"acme/widget", "  "},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for whitespace-only extra_repos entry")
 	}
 }
 

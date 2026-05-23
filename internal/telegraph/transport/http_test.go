@@ -339,8 +339,8 @@ func TestHandler_NilLogger_NoPanic(t *testing.T) {
 	h := transport.NewHandler([]telegraph.Translator{tr}, rawCh, nil)
 
 	// All code paths with nil logger must not panic.
-	post(h, "/webhook/jira", `{}`)                   // accept
-	post(h, "/webhook/unknown", `{}`)                // provider_disabled
+	post(h, "/webhook/jira", `{}`)    // accept
+	post(h, "/webhook/unknown", `{}`) // provider_disabled
 	_ = <-rawCh
 }
 

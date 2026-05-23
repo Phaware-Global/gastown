@@ -266,8 +266,13 @@ events     = [
     "check_suite",
     "workflow_run",
 ]
-# Optional allow-list — empty/absent means accept events from every repo.
-repos = ["acme/widget", "acme/sprocket"]
+# The GitHub repo allow-list is derived from <town-root>/mayor/rigs.json
+# at Telegraph startup — every registered rig with a github.com git_url
+# contributes its "owner/repo" automatically. Use extra_repos to add
+# GitHub repos that aren't registered as rigs (e.g. shared infrastructure
+# repositories). The union of (rig-derived ∪ extra_repos) is the
+# allow-list.
+extra_repos = ["acme/cdk-infra"]
 # Optional self-echo filter — drop events whose actor matches exactly.
 # ignore_actors = ["mayor-bot"]
 ```
@@ -571,16 +576,35 @@ variant is GitHub's recommended posture.
 
 #### Repository allow-list
 
-The GitHub provider supports a per-provider `repos` allow-list. When set,
-events whose `repository.full_name` is not in the list are silently dropped
+The GitHub provider runs a repository allow-list built from two sources at
+Telegraph startup:
+
+1. The town's rig registry at `<town-root>/mayor/rigs.json`. Every rig with
+   a `git_url` that parses as a GitHub URL contributes its `owner/repo`
+   automatically. This is the canonical source — adding a new rig
+   automatically extends Telegraph's coverage on the next daemon restart;
+   removing one drops it.
+2. The per-provider `extra_repos` TOML field. Use this to allow-list GitHub
+   repositories that are not registered as town rigs (e.g. shared
+   infrastructure repos).
+
+Events whose `repository.full_name` is in neither set are silently dropped
 (non-nil `NormalizedEvent`, `ErrRepoFiltered` sentinel) before reaching L3.
 The dispatcher logs the drop with `reason="repo_filtered"`. Comparison is
 case-insensitive (GitHub repos are case-preserving but case-insensitive
-when matched). Empty list means no filtering. Empty-string entries are
+when matched). Empty-string / whitespace-only `extra_repos` entries are
 rejected at config load.
 
-A new `ErrRepoFiltered` sentinel sits beside `ErrActorFiltered`; the
-dispatcher routes both to drop-with-audit-log without enqueueing to L3.
+Rigs are infrequently mutated (add / remove / park), so reading
+`rigs.json` once at startup is the right caching posture: webhook
+dispatch never touches the registry on the hot path, and operators
+restart the daemon when they want a rig change reflected. Rigs whose
+URL points at a non-GitHub host (GitLab, Bitbucket) contribute nothing;
+URLs without `github.com` in the host are not silently mapped to a
+GitHub repo with the same path.
+
+`ErrRepoFiltered` sits beside `ErrActorFiltered`; the dispatcher routes
+both to drop-with-audit-log without enqueueing to L3.
 
 Future event types — like the GitHub equivalent of the Jira `issue.updated`
 field-change shape, or `release` events — would land here with the same
