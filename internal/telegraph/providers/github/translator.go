@@ -237,6 +237,18 @@ func (t *Translator) Translate(headers map[string]string, body []byte) (*telegra
 		}
 	}
 
+	// Pre-gate on SupportedWireEvents so a wire event we don't translate
+	// (ping, future GitHub event types, typos) returns ErrUnknownEventType
+	// rather than a translate_error from the SDK's "unknown X-Github-Event"
+	// error. The allowedEvent check above only fires when the operator
+	// supplied an events list — without it, ParseWebHook would otherwise be
+	// the first gate and would log noise on harmless deliveries like ping.
+	if !isSupportedWireEvent(wireEvent) {
+		t.logger.Info("telegraph: unknown github wire event",
+			"wire_event", wireEvent, "delivery_id", deliveryID)
+		return nil, telegraph.ErrUnknownEventType
+	}
+
 	parsed, err := gogithub.ParseWebHook(wireEvent, body)
 	if err != nil {
 		return nil, fmt.Errorf("github: parsing webhook payload: %w", err)
@@ -306,11 +318,23 @@ func (t *Translator) Translate(headers map[string]string, body []byte) (*telegra
 	// Relevance filter: drop events that do not pertain to mayor. Only applied
 	// when a mayor identity is configured; an empty identity disables this
 	// stage so tests / library callers behave predictably without it.
-	if t.mayor.HasAny() && !t.isRelevant(wireEvent, parsed) {
+	if t.mayor.HasAny() && !t.isRelevant(parsed) {
 		return evt, telegraph.ErrNotRelevant
 	}
 
 	return evt, nil
+}
+
+// isSupportedWireEvent reports whether wireEvent is one this translator
+// understands. Used to gate ParseWebHook so unknown/future GitHub events
+// route through ErrUnknownEventType rather than the SDK's parse error.
+func isSupportedWireEvent(wireEvent string) bool {
+	for _, e := range SupportedWireEvents {
+		if e == wireEvent {
+			return true
+		}
+	}
+	return false
 }
 
 // isRelevant reports whether the parsed GitHub event pertains to mayor.
@@ -336,7 +360,7 @@ func (t *Translator) Translate(headers map[string]string, body []byte) (*telegra
 //     trust boundary established by the operator's repo allow-list. This is
 //     a best-effort filter — mayor may still see CI noise on collaborators'
 //     PRs in the same repo. A stricter rule would require state, deferred.
-func (t *Translator) isRelevant(wireEvent string, parsed interface{}) bool {
+func (t *Translator) isRelevant(parsed interface{}) bool {
 	switch e := parsed.(type) {
 	case *gogithub.CheckRunEvent:
 		return e.GetCheckRun() != nil && len(e.GetCheckRun().PullRequests) > 0
@@ -380,9 +404,11 @@ func (t *Translator) isRelevant(wireEvent string, parsed interface{}) bool {
 		if t.matchesLogin(e.GetComment().GetUser().GetLogin()) {
 			return true
 		}
-		// issue_comment on a PR carries the PR author in issue.user and PR
-		// assignees in issue.assignees (GitHub's webhook never inlines the
-		// full pull_request object on issue_comment deliveries).
+		// issue_comment on a PR carries the PR author in issue.user, PR
+		// assignees in issue.assignees, and the PR description in issue.body
+		// (GitHub's webhook never inlines the full pull_request object on
+		// issue_comment deliveries). Check all three to stay consistent with
+		// PullRequestEvent's prInvolvesMayor coverage.
 		if iss := e.GetIssue(); iss != nil && iss.IsPullRequest() {
 			if t.matchesLogin(iss.GetUser().GetLogin()) {
 				return true
@@ -391,6 +417,9 @@ func (t *Translator) isRelevant(wireEvent string, parsed interface{}) bool {
 				if t.matchesLogin(u.GetLogin()) {
 					return true
 				}
+			}
+			if t.bodyMentionsMayor(iss.GetBody()) {
+				return true
 			}
 		}
 		return t.bodyMentionsMayor(e.GetComment().GetBody())

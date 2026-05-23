@@ -1052,6 +1052,48 @@ func TestRelevance_GitHub_WorkflowRunNoPR_Dropped(t *testing.T) {
 	}
 }
 
+func TestRelevance_GitHub_IssueCommentOnPR_PRBodyMentionsMayor_Delivered(t *testing.T) {
+	// PR description (issue.body on issue_comment deliveries) carries the
+	// @-mention. The collaborator's comment doesn't mention Mayor and
+	// Mayor isn't the author / assignee — only the PR body does.
+	tr := newTranslator(t, withMayorLogins("artie"))
+	body := mustJSON(t, map[string]any{
+		"action":     "created",
+		"sender":     map[string]any{"login": "bob"},
+		"repository": map[string]any{"full_name": "acme/widget"},
+		"issue": map[string]any{
+			"number":       11,
+			"html_url":     "https://github.com/acme/widget/pull/11",
+			"pull_request": map[string]any{"html_url": "https://github.com/acme/widget/pull/11"},
+			"user":         map[string]any{"login": "alice"},
+			"body":         "PR description that mentions @artie for review",
+		},
+		"comment": map[string]any{
+			"id":         400,
+			"body":       "neutral comment",
+			"user":       map[string]any{"login": "bob"},
+			"created_at": "2026-04-29T18:00:00Z",
+		},
+	})
+	if _, err := tr.Translate(headersFor("issue_comment"), body); err != nil {
+		t.Fatalf("Translate: %v, want nil (PR body @-mention)", err)
+	}
+}
+
+// TestTranslate_UnknownWireEvent_NotTranslateError pins the contract that
+// wire events outside SupportedWireEvents drop with ErrUnknownEventType
+// instead of surfacing as a translate_error from the SDK's parse layer.
+// This matters because translate_error is the diagnostic-noise channel
+// (PR #69) — routing harmless "ping" deliveries through it would inflate
+// the operator-facing failure signal.
+func TestTranslate_UnknownWireEvent_NotTranslateError(t *testing.T) {
+	tr := newTranslator(t)
+	_, err := tr.Translate(headersFor("ping"), []byte(`{"zen":"hi"}`))
+	if !errors.Is(err, telegraph.ErrUnknownEventType) {
+		t.Errorf("Translate: err = %v, want ErrUnknownEventType (not translate_error)", err)
+	}
+}
+
 func TestRelevance_GitHub_EmptyIdentity_NoFiltering(t *testing.T) {
 	// Backward-compat: empty mayor identity disables relevance filtering.
 	tr := newTranslator(t) // no withMayorLogins
