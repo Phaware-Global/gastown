@@ -151,6 +151,20 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 	mayor := cfg.Telegraph.Mayor
 	translatorMap := make(map[string]telegraph.Translator, len(resolved))
 	var providerNames []string
+
+	// rigsRepos is the GitHub allow-list derived from the town's rig registry
+	// (<townRoot>/mayor/rigs.json). Computed once at startup so webhook
+	// dispatch never touches the registry on the hot path; operators who
+	// add/remove rigs restart the daemon to pick up the change.
+	var rigsRepos []string
+	if _, hasGitHub := resolved["github"]; hasGitHub {
+		var rigsErr error
+		rigsRepos, rigsErr = telegraph.LoadRigGitHubRepos(townRoot)
+		if rigsErr != nil {
+			return fmt.Errorf("telegraph: %w", rigsErr)
+		}
+	}
+
 	for id, rp := range resolved {
 		pc := cfg.Telegraph.Providers[id]
 		switch id {
@@ -167,16 +181,19 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 			var (
 				events       []string
 				ignoreActors []string
-				repos        []string
+				extraRepos   []string
 			)
 			if pc != nil {
 				events = pc.Events
 				ignoreActors = pc.IgnoreActors
-				repos = pc.Repos
+				extraRepos = pc.ExtraRepos
 			}
 			if err := githubtr.ValidateEvents(events); err != nil {
 				return fmt.Errorf("telegraph: provider %q: %w", id, err)
 			}
+			repos := unionRepos(rigsRepos, extraRepos)
+			fmt.Printf("[Telegraph] github repos: %d from rigs + %d extra = %d total\n",
+				len(rigsRepos), len(extraRepos), len(repos))
 			translatorMap[id] = githubtr.New(rp.Secret, events, ignoreActors, repos, githubtr.MayorIdentity{
 				Logins: mayor.GitHubLogins,
 			}, nil)
@@ -299,6 +316,30 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 		return fmt.Errorf("telegraph: server: %w", srvErr)
 	}
 	return nil
+}
+
+// unionRepos returns the de-duplicated union of two "owner/repo" slices.
+// Comparison is case-insensitive (matching the translator's allow-list
+// semantics) but the first-occurrence casing is preserved in the result so
+// the operator-facing startup log stays stable with the rigs.json content.
+func unionRepos(a, b []string) []string {
+	seen := make(map[string]struct{}, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, src := range [][]string{a, b} {
+		for _, r := range src {
+			r = strings.TrimSpace(r)
+			if r == "" {
+				continue
+			}
+			key := strings.ToLower(r)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // buildPromptsResolver merges inline and separate-file prompt configs and

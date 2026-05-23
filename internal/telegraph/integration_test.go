@@ -939,10 +939,10 @@ func TestStartup_GitHubProvider_TranslatorRegistered(t *testing.T) {
 	cfg := telegraph.DefaultConfig()
 	cfg.Telegraph.Mayor = telegraph.MayorConfig{GitHubLogins: []string{"alice"}}
 	cfg.Telegraph.Providers["github"] = &telegraph.ProviderConfig{
-		Enabled:   true,
-		SecretEnv: "GT_TELEGRAPH_GITHUB_TEST_SECRET",
-		Events:    []string{"pull_request"},
-		Repos:     []string{"acme/widget"},
+		Enabled:    true,
+		SecretEnv:  "GT_TELEGRAPH_GITHUB_TEST_SECRET",
+		Events:     []string{"pull_request"},
+		ExtraRepos: []string{"acme/widget"},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
