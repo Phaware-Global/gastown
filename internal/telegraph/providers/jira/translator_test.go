@@ -761,7 +761,7 @@ func TestRelevance_IssueUpdated_ChangelogAccountIDMatch_Delivered(t *testing.T) 
 				{
 					"field":      "assignee",
 					"fromString": "Bob",
-					"toString":   "Artie",   // display name only — would miss with username-only config
+					"toString":   "Artie", // display name only — would miss with username-only config
 					"from":       "acct-bob",
 					"to":         mayorAcctID, // accountId — what we want to match on
 				},

@@ -68,10 +68,10 @@ type Daemon struct {
 	// avoid a Go race-detector violation in the deferred-open scenario
 	// (heartbeat reads concurrently with the convoy goroutine's late
 	// assignment).
-	storesMu sync.Mutex
-	doltServer       *DoltServerManager
-	telegraphServer  *TelegraphServerManager
-	krcPruner        *KRCPruner
+	storesMu        sync.Mutex
+	doltServer      *DoltServerManager
+	telegraphServer *TelegraphServerManager
+	krcPruner       *KRCPruner
 
 	// disabledPatrols is loaded from town settings (disabled_patrols field).
 	// Provides a simple way to disable individual patrol dogs without editing

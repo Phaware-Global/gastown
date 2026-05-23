@@ -46,19 +46,19 @@ type HookedBead struct {
 
 // StaleHookResult represents the result of processing a stale hooked bead.
 type StaleHookResult struct {
-	BeadID      string `json:"bead_id"`
-	Title       string `json:"title"`
-	Assignee    string `json:"assignee"`
-	Age         string `json:"age"`
-	AgentAlive  bool   `json:"agent_alive"`
-	Unhooked    bool   `json:"unhooked"`
-	Error       string `json:"error,omitempty"`
+	BeadID     string `json:"bead_id"`
+	Title      string `json:"title"`
+	Assignee   string `json:"assignee"`
+	Age        string `json:"age"`
+	AgentAlive bool   `json:"agent_alive"`
+	Unhooked   bool   `json:"unhooked"`
+	Error      string `json:"error,omitempty"`
 	// PartialWork indicates uncommitted changes or unpushed commits were found
 	// in the agent's worktree before unhooking.
-	PartialWork    bool   `json:"partial_work,omitempty"`
-	WorktreeDirty  bool   `json:"worktree_dirty,omitempty"`
-	UnpushedCount  int    `json:"unpushed_count,omitempty"`
-	WorktreeError  string `json:"worktree_error,omitempty"`
+	PartialWork   bool   `json:"partial_work,omitempty"`
+	WorktreeDirty bool   `json:"worktree_dirty,omitempty"`
+	UnpushedCount int    `json:"unpushed_count,omitempty"`
+	WorktreeError string `json:"worktree_error,omitempty"`
 }
 
 // StaleHookScanResult contains the full results of a stale hook scan.
@@ -265,4 +265,3 @@ func unhookBead(townRoot, beadID string) error {
 	util.SetDetachedProcessGroup(cmd)
 	return cmd.Run()
 }
-

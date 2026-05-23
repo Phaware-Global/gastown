@@ -236,14 +236,14 @@ func TestResolve_VariableSubstitution(t *testing.T) {
 	text, _ := r.Resolve(evt)
 
 	checks := map[string]string{
-		"provider=jira":                                           "provider",
-		"type=comment.added":                                     "event_type",
-		"id=cmt-001":                                             "event_id",
-		"actor=alice":                                            "actor",
-		"subject=PROJ-1":                                         "subject",
-		"url=https://example.atlassian.net/browse/PROJ-1":        "canonical_url",
-		"ts=2026-04-26T23:16:54Z":                                "timestamp",
-		"labels=bug, p1":                                         "labels",
+		"provider=jira":      "provider",
+		"type=comment.added": "event_type",
+		"id=cmt-001":         "event_id",
+		"actor=alice":        "actor",
+		"subject=PROJ-1":     "subject",
+		"url=https://example.atlassian.net/browse/PROJ-1": "canonical_url",
+		"ts=2026-04-26T23:16:54Z":                         "timestamp",
+		"labels=bug, p1":                                  "labels",
 	}
 	for want, field := range checks {
 		if !strings.Contains(text, want) {
