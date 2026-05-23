@@ -310,8 +310,11 @@ func (t *Translator) Translate(headers map[string]string, body []byte) (*telegra
 //     a best-effort filter — mayor may still see CI noise on collaborators'
 //     PRs in the same repo. A stricter rule would require state, deferred.
 //
-// Operators who want all CI notifications can disable relevance filtering
-// entirely by leaving mayor.github_logins empty.
+// Relevance filtering is enforced in production: config validation
+// requires a non-empty mayor.github_logins when the provider is enabled.
+// The "empty identity disables filtering" branch in this translator is a
+// test-only seam — production deployments never hit it because Validate()
+// rejects an empty identity before the daemon starts.
 func (t *Translator) isRelevant(wireEvent string, p *payload) bool {
 	switch wireEvent {
 	case "check_run":
@@ -331,13 +334,6 @@ func (t *Translator) isRelevant(wireEvent string, p *payload) bool {
 		return true
 	}
 
-	pr := p.PullRequest
-	if pr == nil && p.Issue != nil && p.Issue.PullRequest != nil {
-		// issue_comment on a PR doesn't get a pull_request object; the issue
-		// stub is what we have. We still get author/comment-author/sender from
-		// the existing fields, plus body @-mentions in comment.body.
-	}
-
 	if t.matchesLogin(senderLogin(p)) {
 		return true
 	}
@@ -348,7 +344,7 @@ func (t *Translator) isRelevant(wireEvent string, p *payload) bool {
 		return true
 	}
 
-	if pr != nil {
+	if pr := p.PullRequest; pr != nil {
 		if t.matchesLogin(userLogin(pr.User)) {
 			return true
 		}
@@ -365,6 +361,14 @@ func (t *Translator) isRelevant(wireEvent string, p *payload) bool {
 		if t.bodyMentionsMayor(pr.Body) {
 			return true
 		}
+	}
+
+	// issue_comment on a PR carries the PR author in issue.user (GitHub's
+	// webhook never inlines the full pull_request object on issue_comment
+	// deliveries). Without this check, comments on Mayor-authored PRs by
+	// other users without an @-mention would be dropped as not_relevant.
+	if p.Issue != nil && p.Issue.PullRequest != nil && t.matchesLogin(userLogin(p.Issue.User)) {
+		return true
 	}
 
 	if p.Comment != nil && t.bodyMentionsMayor(p.Comment.Body) {
@@ -468,6 +472,7 @@ type ghIssue struct {
 	UpdatedAt   string    `json:"updated_at"`
 	Labels      []ghLabel `json:"labels"`
 	PullRequest *ghPRRef  `json:"pull_request"` // present iff this issue *is* a PR
+	User        *ghUser   `json:"user"`         // PR author when this issue is a PR
 }
 
 type ghPRRef struct {

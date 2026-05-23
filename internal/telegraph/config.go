@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -211,19 +212,22 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	// Whitespace-only entries would pass an `== ""` check but never match
+	// anything at runtime, which silently turns every event into a
+	// not_relevant drop. Reject them with the same error as empty strings.
 	for _, v := range t.Mayor.JiraAccountIDs {
-		if v == "" {
-			return errors.New("telegraph.mayor.jira_account_ids must not contain empty strings")
+		if strings.TrimSpace(v) == "" {
+			return errors.New("telegraph.mayor.jira_account_ids must not contain empty or whitespace-only entries")
 		}
 	}
 	for _, v := range t.Mayor.JiraUsernames {
-		if v == "" {
-			return errors.New("telegraph.mayor.jira_usernames must not contain empty strings")
+		if strings.TrimSpace(v) == "" {
+			return errors.New("telegraph.mayor.jira_usernames must not contain empty or whitespace-only entries")
 		}
 	}
 	for _, v := range t.Mayor.GitHubLogins {
-		if v == "" {
-			return errors.New("telegraph.mayor.github_logins must not contain empty strings")
+		if strings.TrimSpace(v) == "" {
+			return errors.New("telegraph.mayor.github_logins must not contain empty or whitespace-only entries")
 		}
 	}
 	return nil

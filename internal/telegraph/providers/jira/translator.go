@@ -259,7 +259,10 @@ func (t *Translator) commentMentionsMayor(body string) bool {
 	}
 	matches := jiraMentionRE.FindAllStringSubmatch(body, -1)
 	for _, m := range matches {
-		// m[1] is the captured token; may be an accountid:... form or a bare username.
+		// m[1] is the captured token; may be an accountid:... form or a bare
+		// username. Jira's UI inserts mention markup when the user @-mentions
+		// someone — the bracket form is never typed by hand — so we match the
+		// token verbatim.
 		token := m[1]
 		if strings.HasPrefix(token, "accountid:") {
 			id := strings.TrimPrefix(token, "accountid:")

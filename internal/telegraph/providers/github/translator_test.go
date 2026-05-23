@@ -846,6 +846,33 @@ func TestRelevance_GitHub_IssueCommentOnPR_MentionsMayor_Delivered(t *testing.T)
 	}
 }
 
+func TestRelevance_GitHub_IssueCommentOnPR_MayorIsPRAuthor_Delivered(t *testing.T) {
+	// Comments on Mayor-authored PRs by other users (without @-mention)
+	// must reach Mayor — issue.user carries the PR author on issue_comment
+	// deliveries.
+	tr := newTranslator(t, withMayorLogins("artie"))
+	body := mustJSON(t, map[string]any{
+		"action":     "created",
+		"sender":     map[string]any{"login": "bob"},
+		"repository": map[string]any{"full_name": "acme/widget"},
+		"issue": map[string]any{
+			"number":       8,
+			"html_url":     "https://github.com/acme/widget/pull/8",
+			"pull_request": map[string]any{"html_url": "https://github.com/acme/widget/pull/8"},
+			"user":         map[string]any{"login": "artie"}, // PR author
+		},
+		"comment": map[string]any{
+			"id":         200,
+			"body":       "Drive-by comment from collaborator",
+			"user":       map[string]any{"login": "bob"},
+			"created_at": "2026-04-29T18:00:00Z",
+		},
+	})
+	if _, err := tr.Translate(headersFor("issue_comment"), body); err != nil {
+		t.Fatalf("Translate: %v, want nil (comment on Mayor-authored PR)", err)
+	}
+}
+
 func TestRelevance_GitHub_IssueCommentOnPR_OtherAuthor_NoMention_Dropped(t *testing.T) {
 	tr := newTranslator(t, withMayorLogins("artie"))
 	body := mustJSON(t, map[string]any{

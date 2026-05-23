@@ -598,12 +598,17 @@ longer relies on upstream webhook configuration (e.g. Jira's
 routes a new `ErrNotRelevant` sentinel through the same audit-log drop path
 as `ErrActorFiltered` / `ErrRepoFiltered`, with `reason="not_relevant"`.
 
-When the mayor identity for a provider is empty (the operator did not
-configure `[telegraph.mayor]`), relevance filtering is **disabled** for
-that provider and every successfully translated event is forwarded. Config
-validation requires at least one identifier for each enabled provider, so a
-misconfigured deployment fails fast rather than silently dropping
-everything.
+Config validation requires at least one mayor identifier for each enabled
+provider — a deployment with `[telegraph.providers.jira]` or
+`[telegraph.providers.github]` enabled but no corresponding identity fails
+to start, so a misconfigured deployment surfaces immediately rather than
+silently dropping every event as `not_relevant`.
+
+`telegraph.Translator` instances constructed in tests or library code with
+an empty identity disable relevance filtering as a backward-compatibility
+seam (the failing-test signal would otherwise be ambiguous with the
+correct "filter dropped this" behavior). Production callers go through
+`Validate()` and never see that branch.
 
 ### Jira relevance rules
 
@@ -656,8 +661,10 @@ conservative rule:
   in the same allow-listed repo. A stricter rule would require maintaining
   state about PR authorship; deferred.
 
-Operators who want unfiltered CI notifications can disable relevance
-filtering for GitHub by leaving `mayor.github_logins` empty.
+Relevance filtering for GitHub is **mandatory** when the provider is
+enabled — config validation refuses to start a deployment with empty
+`mayor.github_logins`. Same rule applies to Jira: at least one of
+`mayor.jira_account_ids` or `mayor.jira_usernames` must be set.
 
 ### Diagnostics for true translation failures
 

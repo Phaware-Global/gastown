@@ -374,6 +374,36 @@ repos      = ["acme/widget", "acme/sprocket"]
 	}
 }
 
+func TestValidate_RejectsWhitespaceOnlyMayorEntries(t *testing.T) {
+	t.Parallel()
+	// Whitespace-only entries would pass an empty-string check but never
+	// match anything at runtime — every event would silently turn into a
+	// not_relevant drop. Validation must reject them.
+	cases := []struct {
+		name string
+		set  func(c *telegraph.Config)
+	}{
+		{"jira_account_ids", func(c *telegraph.Config) {
+			c.Telegraph.Mayor.JiraAccountIDs = []string{"  "}
+		}},
+		{"jira_usernames", func(c *telegraph.Config) {
+			c.Telegraph.Mayor.JiraUsernames = []string{"\t"}
+		}},
+		{"github_logins", func(c *telegraph.Config) {
+			c.Telegraph.Mayor.GitHubLogins = []string{" "}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := telegraph.DefaultConfig()
+			tc.set(cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Errorf("Validate() = nil, want error for whitespace-only %s entry", tc.name)
+			}
+		})
+	}
+}
+
 func TestValidate_RejectsEmptyRepoEntry(t *testing.T) {
 	t.Parallel()
 	cfg := telegraph.DefaultConfig()
