@@ -614,6 +614,94 @@ func TestTranslate_ActorFilterCaseSensitive(t *testing.T) {
 	}
 }
 
+// TestTranslate_ActorFilterSkippedForCIEvents pins the contract that
+// ignore_actors does not apply to check_run / check_suite / workflow_run.
+// The actor on those events is the user who triggered the workflow
+// (typically the committer), but the event reports an automated outcome
+// — a failing CI run on the agent's own PR is exactly the kind of event
+// Mayor still wants to hear about, so the actor filter must not eat it.
+func TestTranslate_ActorFilterSkippedForCIEvents(t *testing.T) {
+	cases := []struct {
+		wireEvent string
+		body      []byte
+	}{
+		{
+			wireEvent: "check_run",
+			body: mustJSON(t, map[string]any{
+				"action":     "completed",
+				"sender":     map[string]any{"login": "phaware-artie"},
+				"repository": map[string]any{"full_name": "acme/widget", "html_url": "https://github.com/acme/widget"},
+				"check_run": map[string]any{
+					"id":           1001,
+					"name":         "lint",
+					"html_url":     "https://github.com/acme/widget/runs/1001",
+					"status":       "completed",
+					"conclusion":   "failure",
+					"head_sha":     "abc1234567890",
+					"completed_at": "2026-04-29T19:00:00Z",
+					"pull_requests": []map[string]any{
+						{"number": 42, "html_url": "https://github.com/acme/widget/pull/42"},
+					},
+				},
+			}),
+		},
+		{
+			wireEvent: "check_suite",
+			body: mustJSON(t, map[string]any{
+				"action":     "completed",
+				"sender":     map[string]any{"login": "phaware-artie"},
+				"repository": map[string]any{"full_name": "acme/widget", "html_url": "https://github.com/acme/widget"},
+				"check_suite": map[string]any{
+					"id":         42,
+					"head_sha":   "deadbee123456",
+					"status":     "completed",
+					"conclusion": "failure",
+					"updated_at": "2026-04-29T20:00:00Z",
+					"pull_requests": []map[string]any{
+						{"number": 7, "html_url": "https://github.com/acme/widget/pull/7"},
+					},
+				},
+			}),
+		},
+		{
+			wireEvent: "workflow_run",
+			body: mustJSON(t, map[string]any{
+				"action":     "completed",
+				"sender":     map[string]any{"login": "phaware-artie"},
+				"repository": map[string]any{"full_name": "acme/widget", "html_url": "https://github.com/acme/widget"},
+				"workflow_run": map[string]any{
+					"id":          77,
+					"name":        "CI",
+					"head_branch": "feature",
+					"head_sha":    "deadbee123456",
+					"status":      "completed",
+					"conclusion":  "failure",
+					"updated_at":  "2026-04-29T21:00:00Z",
+					"html_url":    "https://github.com/acme/widget/actions/runs/77",
+					"pull_requests": []map[string]any{
+						{"number": 9, "html_url": "https://github.com/acme/widget/pull/9"},
+					},
+				},
+			}),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.wireEvent, func(t *testing.T) {
+			tr := newTranslator(t, withIgnoreActors("phaware-artie"))
+			evt, err := tr.Translate(headersFor(tc.wireEvent), tc.body)
+			if err != nil {
+				t.Fatalf("Translate(%s): %v (CI events must bypass ignore_actors)", tc.wireEvent, err)
+			}
+			if evt == nil {
+				t.Fatalf("Translate(%s): nil event", tc.wireEvent)
+			}
+			if evt.Actor != "phaware-artie" {
+				t.Errorf("Actor = %q, want phaware-artie", evt.Actor)
+			}
+		})
+	}
+}
+
 // ---- Provider ----
 
 func TestProvider(t *testing.T) {

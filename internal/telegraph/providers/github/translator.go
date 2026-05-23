@@ -309,7 +309,12 @@ func (t *Translator) Translate(headers map[string]string, body []byte) (*telegra
 	}
 
 	// Actor filter: drop events whose actor matches an operator-supplied entry.
-	if len(t.ignoreActors) > 0 {
+	// CI-class events (check_run, check_suite, workflow_run) are exempt — their
+	// actor is the user who triggered the workflow (typically the committer),
+	// but the event itself reports an automated outcome, not an action that
+	// user took. Filtering them would suppress CI-failure notifications about
+	// the agent's own PRs, which Mayor still wants to see.
+	if len(t.ignoreActors) > 0 && !isCIWireEvent(wireEvent) {
 		if _, filtered := t.ignoreActors[evt.Actor]; filtered {
 			return evt, telegraph.ErrActorFiltered
 		}
@@ -333,6 +338,17 @@ func isSupportedWireEvent(wireEvent string) bool {
 		if e == wireEvent {
 			return true
 		}
+	}
+	return false
+}
+
+// isCIWireEvent reports whether wireEvent reports an automated outcome rather
+// than a user-initiated action. The actor filter is bypassed for these so
+// CI failures on the agent's own commits still notify Mayor.
+func isCIWireEvent(wireEvent string) bool {
+	switch wireEvent {
+	case "check_run", "check_suite", "workflow_run":
+		return true
 	}
 	return false
 }
