@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/config"
@@ -20,8 +21,9 @@ import (
 // is usable without any rigs registered (an operator might run Telegraph for
 // extra_repos only).
 //
-// Results are de-duplicated and order-preserving so the operator-facing
-// log line in cmd/telegraph.go is deterministic across restarts.
+// Rigs are iterated in sorted name order so the de-duplicated result is
+// deterministic across restarts — important for the startup log line and
+// for which casing wins on case-duplicate URLs.
 func LoadRigGitHubRepos(townRoot string) ([]string, error) {
 	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
 	cfg, err := config.LoadRigsConfig(rigsPath)
@@ -34,9 +36,17 @@ func LoadRigGitHubRepos(townRoot string) ([]string, error) {
 	if cfg == nil {
 		return nil, nil
 	}
-	seen := make(map[string]struct{}, len(cfg.Rigs))
-	out := make([]string, 0, len(cfg.Rigs))
-	for _, entry := range cfg.Rigs {
+	// Sort rig names so map-iteration order doesn't leak into the result.
+	rigNames := make([]string, 0, len(cfg.Rigs))
+	for name := range cfg.Rigs {
+		rigNames = append(rigNames, name)
+	}
+	sort.Strings(rigNames)
+
+	seen := make(map[string]struct{}, len(rigNames))
+	out := make([]string, 0, len(rigNames))
+	for _, name := range rigNames {
+		entry := cfg.Rigs[name]
 		repo, ok := parseGitHubRepoURL(entry.GitURL)
 		if !ok {
 			continue
@@ -52,7 +62,7 @@ func LoadRigGitHubRepos(townRoot string) ([]string, error) {
 }
 
 // parseGitHubRepoURL extracts "owner/repo" from a git remote URL. Supported
-// shapes (the two GitHub actually issues):
+// shapes (the forms GitHub actually issues):
 //
 //   - https://github.com/owner/repo
 //   - https://github.com/owner/repo.git
@@ -60,11 +70,10 @@ func LoadRigGitHubRepos(townRoot string) ([]string, error) {
 //   - git@github.com:owner/repo.git
 //   - ssh://git@github.com/owner/repo(.git)
 //
-// Any host other than github.com (or its trailing-dot canonical form) is
-// rejected so a rig pointed at GitLab / Bitbucket doesn't accidentally
-// allow-list a similarly-named GitHub repo. Returns the parsed identifier
-// (preserving the original case so the audit log matches the rig registry)
-// and ok=true on a clean parse.
+// Hosts other than github.com are rejected so a rig pointed at GitLab /
+// Bitbucket doesn't accidentally allow-list a similarly-named GitHub repo.
+// Returns the parsed identifier (preserving the original case so the
+// audit log matches the rig registry) and ok=true on a clean parse.
 func parseGitHubRepoURL(raw string) (string, bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -85,12 +94,16 @@ func parseGitHubRepoURL(raw string) (string, bool) {
 		return "", false
 	}
 
-	// Strip optional ".git" suffix and any trailing slash / fragment.
-	rest = strings.TrimSuffix(rest, "/")
-	rest = strings.TrimSuffix(rest, ".git")
+	// Order matters here: strip the query / fragment first so a URL like
+	// `.../repo/?foo` doesn't leave a stray empty segment after splitting;
+	// then strip the optional ".git" suffix; finally trim trailing slashes.
+	// Doing the slashes first would leave the `?foo` attached to "repo".
 	if idx := strings.IndexAny(rest, "#?"); idx >= 0 {
 		rest = rest[:idx]
 	}
+	rest = strings.TrimRight(rest, "/")
+	rest = strings.TrimSuffix(rest, ".git")
+	rest = strings.TrimRight(rest, "/")
 
 	// Must be exactly "owner/repo" — reject deeper paths (subdirs, blob URLs,
 	// etc.) since those don't identify a repository at the webhook layer.

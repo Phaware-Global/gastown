@@ -1,7 +1,6 @@
 package telegraph_test
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
@@ -95,6 +94,13 @@ func TestParseGitHubRepoURL(t *testing.T) {
 		{"git_ssh", "git@github.com:owner/repo.git", "owner/repo"},
 		{"ssh_url", "ssh://git@github.com/owner/repo.git", "owner/repo"},
 
+		// Order-of-operations regressions: query/fragment + trailing slash
+		// must compose without leaving stray empty segments after the split.
+		{"https_query", "https://github.com/owner/repo?foo=bar", "owner/repo"},
+		{"https_fragment", "https://github.com/owner/repo#readme", "owner/repo"},
+		{"https_slash_query", "https://github.com/owner/repo/?foo", "owner/repo"},
+		{"https_dotgit_query", "https://github.com/owner/repo.git?ref=main", "owner/repo"},
+
 		{"empty", "", ""},
 		{"whitespace", "   ", ""},
 		{"gitlab", "https://gitlab.com/owner/repo", ""},
@@ -105,52 +111,20 @@ func TestParseGitHubRepoURL(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := exportedParseForTest(tc.raw)
+			got, ok := telegraph.ParseGitHubRepoURLForTest(tc.raw)
 			if tc.want == "" {
 				if ok {
-					t.Errorf("ParseGitHubRepoURL(%q) = (%q, true); want (_, false)", tc.raw, got)
+					t.Errorf("parseGitHubRepoURL(%q) = (%q, true); want (_, false)", tc.raw, got)
 				}
 				return
 			}
 			if !ok {
-				t.Errorf("ParseGitHubRepoURL(%q) = (_, false); want (%q, true)", tc.raw, tc.want)
+				t.Errorf("parseGitHubRepoURL(%q) = (_, false); want (%q, true)", tc.raw, tc.want)
 				return
 			}
 			if got != tc.want {
-				t.Errorf("ParseGitHubRepoURL(%q) = %q; want %q", tc.raw, got, tc.want)
+				t.Errorf("parseGitHubRepoURL(%q) = %q; want %q", tc.raw, got, tc.want)
 			}
 		})
 	}
-}
-
-// exportedParseForTest is a test-only seam — the parser stays unexported in
-// the package surface so external callers can't depend on it. Round-trip
-// through LoadRigGitHubRepos with a synthetic rigs.json instead, which is
-// also what we do in TestLoadRigGitHubRepos_ParsesAndDedupes.
-func exportedParseForTest(raw string) (string, bool) {
-	townRoot, err := os.MkdirTemp("", "telegraph-rigs-test-*")
-	if err != nil {
-		return "", false
-	}
-	defer os.RemoveAll(townRoot)
-	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0o755); err != nil {
-		return "", false
-	}
-	rigsJSON, _ := json.Marshal(map[string]any{
-		"version": 1,
-		"rigs": map[string]any{
-			"probe": map[string]any{
-				"git_url":  raw,
-				"added_at": "2026-04-01T00:00:00Z",
-			},
-		},
-	})
-	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "rigs.json"), rigsJSON, 0o644); err != nil {
-		return "", false
-	}
-	repos, err := telegraph.LoadRigGitHubRepos(townRoot)
-	if err != nil || len(repos) == 0 {
-		return "", false
-	}
-	return repos[0], true
 }
