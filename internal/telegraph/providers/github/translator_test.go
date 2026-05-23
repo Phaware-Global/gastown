@@ -873,6 +873,36 @@ func TestRelevance_GitHub_IssueCommentOnPR_MayorIsPRAuthor_Delivered(t *testing.
 	}
 }
 
+func TestRelevance_GitHub_IssueCommentOnPR_MayorIsAssignee_Delivered(t *testing.T) {
+	// Comments on a Mayor-assigned PR (not Mayor-authored, no @-mention)
+	// must reach Mayor — issue.assignees carries the PR assignee list on
+	// issue_comment deliveries.
+	tr := newTranslator(t, withMayorLogins("artie"))
+	body := mustJSON(t, map[string]any{
+		"action":     "created",
+		"sender":     map[string]any{"login": "bob"},
+		"repository": map[string]any{"full_name": "acme/widget"},
+		"issue": map[string]any{
+			"number":       9,
+			"html_url":     "https://github.com/acme/widget/pull/9",
+			"pull_request": map[string]any{"html_url": "https://github.com/acme/widget/pull/9"},
+			"user":         map[string]any{"login": "alice"},
+			"assignees": []map[string]any{
+				{"login": "artie"},
+			},
+		},
+		"comment": map[string]any{
+			"id":         300,
+			"body":       "Drive-by comment from collaborator",
+			"user":       map[string]any{"login": "bob"},
+			"created_at": "2026-04-29T18:00:00Z",
+		},
+	})
+	if _, err := tr.Translate(headersFor("issue_comment"), body); err != nil {
+		t.Fatalf("Translate: %v, want nil (comment on Mayor-assigned PR)", err)
+	}
+}
+
 func TestRelevance_GitHub_IssueCommentOnPR_OtherAuthor_NoMention_Dropped(t *testing.T) {
 	tr := newTranslator(t, withMayorLogins("artie"))
 	body := mustJSON(t, map[string]any{
@@ -1003,6 +1033,22 @@ func TestRelevance_GitHub_MentionBoundary(t *testing.T) {
 	_, err := tr.Translate(headersFor("pull_request"), body)
 	if !errors.Is(err, telegraph.ErrNotRelevant) {
 		t.Fatalf("Translate: err = %v, want ErrNotRelevant (no @ mention, only substring)", err)
+	}
+}
+
+// TestMayorIdentity_HasAny_IgnoresEmptyEntries asserts HasAny doesn't return
+// true when every entry is empty or whitespace-only. A library/test caller
+// that accidentally passes `[]string{""}` would otherwise enable relevance
+// filtering with zero match targets and silently drop everything.
+func TestMayorIdentity_HasAny_IgnoresEmptyEntries(t *testing.T) {
+	if (github.MayorIdentity{Logins: []string{""}}).HasAny() {
+		t.Error("HasAny() = true for [\"\"], want false")
+	}
+	if (github.MayorIdentity{Logins: []string{"  ", "\t"}}).HasAny() {
+		t.Error("HasAny() = true for whitespace-only entries, want false")
+	}
+	if !(github.MayorIdentity{Logins: []string{"", "artie"}}).HasAny() {
+		t.Error("HasAny() = false for [\"\", \"artie\"], want true")
 	}
 }
 

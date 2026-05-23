@@ -35,9 +35,23 @@ type MayorIdentity struct {
 	Usernames  []string
 }
 
-// HasAny reports whether the identity has at least one match target.
+// HasAny reports whether the identity has at least one usable match target.
+// Whitespace-only / empty entries are ignored so a slice like `[]string{""}`
+// — which the construction-time normalization would discard — does not flip
+// HasAny on and enable relevance filtering without any actual match
+// targets behind it.
 func (m MayorIdentity) HasAny() bool {
-	return len(m.AccountIDs) > 0 || len(m.Usernames) > 0
+	for _, s := range m.AccountIDs {
+		if strings.TrimSpace(s) != "" {
+			return true
+		}
+	}
+	for _, s := range m.Usernames {
+		if strings.TrimSpace(s) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // Translator implements telegraph.Translator for Jira webhook payloads.
@@ -194,9 +208,21 @@ func (t *Translator) isRelevant(p *payload) bool {
 		return true
 	}
 
-	// Rule 2: assignment changelog → mayor.
-	if assignmentTo := assignmentTargetFromChangelog(p); assignmentTo != "" {
-		if t.matchesUserName(assignmentTo) {
+	// Rule 2: assignment changelog → mayor. Cloud puts the new assignee's
+	// accountId in `to` and the display name in `toString`; legacy/Server
+	// puts the username in both. Match against either set so an operator
+	// who configured only jira_account_ids still catches assignments.
+	if to, toString := assignmentTargetFromChangelog(p); to != "" || toString != "" {
+		if to != "" {
+			if _, ok := t.mayorAccounts[to]; ok {
+				return true
+			}
+			// Legacy Server: `to` is a username, not an accountId.
+			if _, ok := t.mayorUsersLC[strings.ToLower(to)]; ok {
+				return true
+			}
+		}
+		if t.matchesUserName(toString) {
 			return true
 		}
 	}
@@ -296,21 +322,25 @@ func currentAssignee(p *payload) *jiraUser {
 	return p.Issue.Fields.Assignee
 }
 
-// assignmentTargetFromChangelog returns the toString of the most recent
-// assignee changelog item, or "" if no such item is present. Jira issues
-// emit a changelog item with field="assignee" whose toString is the new
-// assignee's display name on assignment changes — even when the issue's
-// fields.assignee snapshot is not yet reflected in the payload.
-func assignmentTargetFromChangelog(p *payload) string {
+// assignmentTargetFromChangelog returns the most recent assignee change
+// from the payload's changelog, or a zero struct if no such item is present.
+//
+// Jira's changelog is ordered oldest-first; the *last* matching item is the
+// final assignee state at the moment the webhook fired. The structured
+// result carries both the opaque "to" value (accountId on Cloud, username
+// on legacy/Server) and the human-readable "toString" so the relevance
+// check can match either AccountIDs- or Usernames-only mayor configs.
+func assignmentTargetFromChangelog(p *payload) (to, toString string) {
 	if p == nil || p.Changelog == nil {
-		return ""
+		return "", ""
 	}
-	for _, it := range p.Changelog.Items {
+	for i := len(p.Changelog.Items) - 1; i >= 0; i-- {
+		it := p.Changelog.Items[i]
 		if it.Field == "assignee" {
-			return it.ToString
+			return it.To, it.ToString
 		}
 	}
-	return ""
+	return "", ""
 }
 
 // ---- internal payload types ----
@@ -367,6 +397,10 @@ type changeItem struct {
 	Field      string `json:"field"`
 	FromString string `json:"fromString"`
 	ToString   string `json:"toString"`
+	// From / To carry the opaque value of the change. For assignee changes on
+	// Jira Cloud these are accountIds; on legacy/Server they are usernames.
+	From string `json:"from"`
+	To   string `json:"to"`
 }
 
 // ---- translators ----

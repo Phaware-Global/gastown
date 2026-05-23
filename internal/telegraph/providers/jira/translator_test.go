@@ -744,6 +744,60 @@ func TestRelevance_IssueUpdated_AssignmentChangelogToMayor_Delivered(t *testing.
 	}
 }
 
+func TestRelevance_IssueUpdated_ChangelogAccountIDMatch_Delivered(t *testing.T) {
+	t.Parallel()
+	// Operator configured ONLY jira_account_ids (no usernames). Jira Cloud
+	// puts the new assignee's accountId in changelog.items[].to and the
+	// display name in toString; we must match against `to` so this case
+	// isn't silently dropped.
+	tr := jira.New(testSecret, nil, jira.MayorIdentity{AccountIDs: []string{mayorAcctID}}, nil)
+	body := mustMarshal(t, issuePayload{
+		Timestamp:    1713571200000,
+		WebhookEvent: "jira:issue_updated",
+		User:         baseUser("alice"),
+		Issue:        baseIssue("PROJ-300"),
+		Changelog: map[string]any{
+			"items": []map[string]any{
+				{
+					"field":      "assignee",
+					"fromString": "Bob",
+					"toString":   "Artie",   // display name only — would miss with username-only config
+					"from":       "acct-bob",
+					"to":         mayorAcctID, // accountId — what we want to match on
+				},
+			},
+		},
+	})
+	if _, err := tr.Translate(nil, body); err != nil {
+		t.Fatalf("Translate: %v, want nil (accountId-only config must catch assignment by `to`)", err)
+	}
+}
+
+func TestRelevance_IssueUpdated_ChangelogLastItemWins(t *testing.T) {
+	t.Parallel()
+	// Jira changelog is oldest-first. If multiple assignee items exist, the
+	// last one is the final assignee state at webhook fire time. Mayor was
+	// assigned then immediately unassigned → the event should NOT be
+	// classified as a mayor-assignment.
+	tr := jira.New(testSecret, nil, mayorJiraIdentity(), nil)
+	body := mustMarshal(t, issuePayload{
+		Timestamp:    1713571200000,
+		WebhookEvent: "jira:issue_updated",
+		User:         baseUser("alice"),
+		Issue:        baseIssue("PROJ-301"),
+		Changelog: map[string]any{
+			"items": []map[string]any{
+				{"field": "assignee", "fromString": "Bob", "toString": "Artie", "to": mayorAcctID},
+				{"field": "assignee", "fromString": "Artie", "toString": "Carol", "to": "acct-carol"},
+			},
+		},
+	})
+	_, err := tr.Translate(nil, body)
+	if !errors.Is(err, telegraph.ErrNotRelevant) {
+		t.Fatalf("Translate err = %v, want ErrNotRelevant (final assignee is Carol)", err)
+	}
+}
+
 func TestRelevance_IssueUpdated_AssignmentChangelogToOther_Dropped(t *testing.T) {
 	t.Parallel()
 	tr := jira.New(testSecret, nil, mayorJiraIdentity(), nil)
@@ -885,6 +939,22 @@ func TestRelevance_UnknownEventType_NotShadowedByRelevance(t *testing.T) {
 	})
 	if _, err := tr.Translate(nil, body); !errors.Is(err, telegraph.ErrUnknownEventType) {
 		t.Errorf("Translate: err = %v, want ErrUnknownEventType", err)
+	}
+}
+
+// TestMayorIdentity_HasAny_IgnoresEmptyEntries asserts HasAny doesn't return
+// true when every entry is empty or whitespace-only. Without this, a caller
+// who passes `MayorIdentity{Usernames: []string{""}}` would enable relevance
+// filtering with no actual match targets.
+func TestMayorIdentity_HasAny_IgnoresEmptyEntries(t *testing.T) {
+	if (jira.MayorIdentity{Usernames: []string{""}}).HasAny() {
+		t.Error("HasAny() = true for empty username, want false")
+	}
+	if (jira.MayorIdentity{AccountIDs: []string{"  "}, Usernames: []string{"\t"}}).HasAny() {
+		t.Error("HasAny() = true for whitespace-only entries, want false")
+	}
+	if !(jira.MayorIdentity{Usernames: []string{"", "Artie"}}).HasAny() {
+		t.Error("HasAny() = false despite one populated entry, want true")
 	}
 }
 

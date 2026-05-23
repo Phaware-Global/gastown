@@ -41,8 +41,19 @@ type MayorIdentity struct {
 	Logins []string
 }
 
-// HasAny reports whether the identity has at least one match target.
-func (m MayorIdentity) HasAny() bool { return len(m.Logins) > 0 }
+// HasAny reports whether the identity has at least one usable match target.
+// Whitespace-only / empty entries are ignored so a slice like `[]string{""}`
+// — which the construction-time normalization would discard — does not flip
+// HasAny on and enable relevance filtering without any actual match
+// targets behind it.
+func (m MayorIdentity) HasAny() bool {
+	for _, s := range m.Logins {
+		if strings.TrimSpace(s) != "" {
+			return true
+		}
+	}
+	return false
+}
 
 // Translator implements telegraph.Translator for GitHub webhook payloads.
 type Translator struct {
@@ -365,12 +376,21 @@ func (t *Translator) isRelevant(wireEvent string, p *payload) bool {
 		}
 	}
 
-	// issue_comment on a PR carries the PR author in issue.user (GitHub's
-	// webhook never inlines the full pull_request object on issue_comment
-	// deliveries). Without this check, comments on Mayor-authored PRs by
-	// other users without an @-mention would be dropped as not_relevant.
-	if p.Issue != nil && p.Issue.PullRequest != nil && t.matchesLogin(userLogin(p.Issue.User)) {
-		return true
+	// issue_comment on a PR carries the PR author in issue.user and PR
+	// assignees in issue.assignees (GitHub's webhook never inlines the
+	// full pull_request object on issue_comment deliveries). Without
+	// these checks, comments on a Mayor-authored or Mayor-assigned PR
+	// by other users — and without an @-mention — would be dropped as
+	// not_relevant.
+	if p.Issue != nil && p.Issue.PullRequest != nil {
+		if t.matchesLogin(userLogin(p.Issue.User)) {
+			return true
+		}
+		for _, u := range p.Issue.Assignees {
+			if t.matchesLogin(u.Login) {
+				return true
+			}
+		}
 	}
 
 	if p.Comment != nil && t.bodyMentionsMayor(p.Comment.Body) {
@@ -475,6 +495,7 @@ type ghIssue struct {
 	Labels      []ghLabel `json:"labels"`
 	PullRequest *ghPRRef  `json:"pull_request"` // present iff this issue *is* a PR
 	User        *ghUser   `json:"user"`         // PR author when this issue is a PR
+	Assignees   []ghUser  `json:"assignees"`    // PR assignees when this issue is a PR
 }
 
 type ghPRRef struct {
