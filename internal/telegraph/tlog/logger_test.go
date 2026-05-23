@@ -3,6 +3,7 @@ package tlog_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -172,8 +173,114 @@ func TestLogger_Nil_NoPanic(t *testing.T) {
 	l.Reject("jira", "1.2.3.4", tlog.ReasonHMACInvalid, "")
 	l.Deliver("jira", "issue.created", "", "alice", "PROJ-1", "", "")
 	l.Drop("jira", "issue.created", "", "", "", "dedup")
+	l.TranslateError("jira", "", "", nil, nil, errors.New("boom"))
 	l.NudgeSent()
 	l.NudgeSuppressed()
+}
+
+func TestLogger_TranslateError_IncludesPayloadAndError(t *testing.T) {
+	var buf bytes.Buffer
+	l := tlog.New(&buf)
+	headers := map[string]string{
+		"x-github-event":      "pull_request",
+		"x-github-delivery":   "abc-123",
+		"x-hub-signature-256": "sha256=DEADBEEF-DO-NOT-LEAK",
+		"authorization":       "Bearer SECRET-DO-NOT-LEAK",
+		"content-type":        "application/json",
+	}
+	body := []byte(`{"action":"opened","pull_request":{"number":42}}`)
+	l.TranslateError("github", "pull_request.opened", "abc-123", headers, body, errors.New("schema mismatch: missing repo"))
+
+	if v := l.Counters.Drop.Load(); v != 1 {
+		t.Errorf("Drop counter = %d, want 1", v)
+	}
+	lines := parseLines(&buf)
+	if len(lines) != 1 {
+		t.Fatalf("want 1 line, got %d", len(lines))
+	}
+	line := lines[0]
+	if str(line, "event") != "drop" {
+		t.Errorf("event = %q, want drop", str(line, "event"))
+	}
+	if str(line, "reason") != tlog.ReasonTranslateError {
+		t.Errorf("reason = %q, want translate_error", str(line, "reason"))
+	}
+	if str(line, "provider") != "github" {
+		t.Errorf("provider = %q", str(line, "provider"))
+	}
+	if str(line, "err") != "schema mismatch: missing repo" {
+		t.Errorf("err = %q", str(line, "err"))
+	}
+	if str(line, "body_snippet") != string(body) {
+		t.Errorf("body_snippet = %q, want full body", str(line, "body_snippet"))
+	}
+	if str(line, "wire_event") != "pull_request" {
+		t.Errorf("wire_event = %q", str(line, "wire_event"))
+	}
+	if str(line, "delivery_id") != "abc-123" {
+		t.Errorf("delivery_id = %q", str(line, "delivery_id"))
+	}
+	// safe_headers must include vetted entries and must NOT include signature/auth.
+	rawHeaders, ok := line["safe_headers"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("safe_headers missing or wrong type: %T", line["safe_headers"])
+	}
+	if _, leaked := rawHeaders["x-hub-signature-256"]; leaked {
+		t.Errorf("safe_headers leaked x-hub-signature-256")
+	}
+	if _, leaked := rawHeaders["authorization"]; leaked {
+		t.Errorf("safe_headers leaked authorization")
+	}
+	if _, ok := rawHeaders["content-type"]; !ok {
+		t.Errorf("safe_headers missing content-type")
+	}
+	if _, ok := rawHeaders["x-github-event"]; !ok {
+		t.Errorf("safe_headers missing x-github-event")
+	}
+	// Whole log line must not contain the secret value.
+	full := buf.String()
+	if strings.Contains(full, "DEADBEEF-DO-NOT-LEAK") {
+		t.Errorf("log line leaks signature value:\n%s", full)
+	}
+	if strings.Contains(full, "Bearer SECRET-DO-NOT-LEAK") {
+		t.Errorf("log line leaks bearer token:\n%s", full)
+	}
+}
+
+func TestLogger_TranslateError_BodyTruncatedFlag(t *testing.T) {
+	var buf bytes.Buffer
+	l := tlog.New(&buf)
+	// Body larger than the snippet cap.
+	body := bytes.Repeat([]byte("X"), 8192)
+	l.TranslateError("jira", "", "", nil, body, errors.New("oversize"))
+
+	lines := parseLines(&buf)
+	if len(lines) != 1 {
+		t.Fatalf("want 1 line, got %d", len(lines))
+	}
+	line := lines[0]
+	if truncated, _ := line["body_truncated"].(bool); !truncated {
+		t.Errorf("body_truncated = false, want true for oversized body")
+	}
+	snippet := str(line, "body_snippet")
+	if len(snippet) >= len(body) {
+		t.Errorf("body_snippet not truncated: len = %d, body len = %d", len(snippet), len(body))
+	}
+	if bytesLen, _ := line["bytes_len"].(float64); int(bytesLen) != len(body) {
+		t.Errorf("bytes_len = %v, want %d", line["bytes_len"], len(body))
+	}
+}
+
+func TestLogger_TranslateError_InvalidUTF8DoesNotBreakJSON(t *testing.T) {
+	var buf bytes.Buffer
+	l := tlog.New(&buf)
+	body := []byte{0xff, 0xfe, 'a', 'b', 'c'}
+	l.TranslateError("jira", "", "", nil, body, errors.New("bad bytes"))
+
+	lines := parseLines(&buf)
+	if len(lines) != 1 {
+		t.Fatalf("invalid-utf8 body must produce a single valid JSON line; got %d", len(lines))
+	}
 }
 
 func TestLogger_CountersAreAdditive(t *testing.T) {

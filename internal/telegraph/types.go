@@ -31,6 +31,16 @@ var ErrActorFiltered = errors.New("actor filtered by provider config")
 // not enqueue a filtered event to L3.
 var ErrRepoFiltered = errors.New("repository filtered by provider config")
 
+// ErrNotRelevant is returned by Translate when the event was successfully
+// parsed and is a known event type but does not pertain to the configured
+// mayor user (e.g. a Jira comment on an issue not assigned to mayor with no
+// @-mention, or a GitHub PR event on a PR mayor isn't involved with). Like
+// ErrActorFiltered and ErrRepoFiltered, the translator returns a non-nil
+// NormalizedEvent alongside this error so the dispatcher can audit-log the
+// drop without enqueuing to L3. This is a *non-error* drop path — it must
+// not be conflated with translate_error diagnostics for real failures.
+var ErrNotRelevant = errors.New("event does not pertain to mayor")
+
 // RawEvent is the authenticated-but-uninterpreted payload from Transport.
 // L1 guarantees the request passed HMAC/signature verification before enqueuing.
 // L2 never re-verifies; it only translates.

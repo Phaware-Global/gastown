@@ -134,6 +134,7 @@ listen_addr = ":7777"
 func TestValidate_Valid(t *testing.T) {
 	t.Parallel()
 	cfg := telegraph.DefaultConfig()
+	cfg.Telegraph.Mayor = telegraph.MayorConfig{JiraAccountIDs: []string{"acct-1"}}
 	cfg.Telegraph.Providers["jira"] = &telegraph.ProviderConfig{
 		Enabled:   true,
 		SecretEnv: "GT_JIRA_SECRET",
@@ -373,6 +374,52 @@ repos      = ["acme/widget", "acme/sprocket"]
 	}
 }
 
+func TestValidate_RejectsWhitespaceOnlyMayorEntries(t *testing.T) {
+	t.Parallel()
+	// Whitespace-only entries would pass an empty-string check but never
+	// match anything at runtime — every event would silently turn into a
+	// not_relevant drop. Validation must reject them.
+	cases := []struct {
+		name string
+		set  func(c *telegraph.Config)
+	}{
+		{"jira_account_ids", func(c *telegraph.Config) {
+			c.Telegraph.Mayor.JiraAccountIDs = []string{"  "}
+		}},
+		{"jira_usernames", func(c *telegraph.Config) {
+			c.Telegraph.Mayor.JiraUsernames = []string{"\t"}
+		}},
+		{"github_logins", func(c *telegraph.Config) {
+			c.Telegraph.Mayor.GitHubLogins = []string{" "}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := telegraph.DefaultConfig()
+			tc.set(cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Errorf("Validate() = nil, want error for whitespace-only %s entry", tc.name)
+			}
+		})
+	}
+}
+
+func TestValidate_RejectsAtPrefixedGitHubLogin(t *testing.T) {
+	t.Parallel()
+	// Webhook payloads carry the bare login; "@artie" would pass an
+	// emptiness check but never match anything, silently turning every
+	// event into a not_relevant drop.
+	cfg := telegraph.DefaultConfig()
+	cfg.Telegraph.Mayor.GitHubLogins = []string{"@artie"}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() = nil, want error for leading '@'")
+	}
+	if !strings.Contains(err.Error(), "@") || !strings.Contains(err.Error(), "github_logins") {
+		t.Errorf("error should call out @ and github_logins: %v", err)
+	}
+}
+
 func TestValidate_RejectsEmptyRepoEntry(t *testing.T) {
 	t.Parallel()
 	cfg := telegraph.DefaultConfig()
@@ -390,6 +437,7 @@ func TestValidate_RejectsEmptyRepoEntry(t *testing.T) {
 func TestValidate_RepoFilterOptional(t *testing.T) {
 	t.Parallel()
 	cfg := telegraph.DefaultConfig()
+	cfg.Telegraph.Mayor = telegraph.MayorConfig{GitHubLogins: []string{"artie"}}
 	cfg.Telegraph.Providers["github"] = &telegraph.ProviderConfig{
 		Enabled:   true,
 		SecretEnv: "GT_GITHUB_SECRET",

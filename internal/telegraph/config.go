@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -17,6 +18,11 @@ type Config struct {
 
 // TelegraphConfig holds global Telegraph settings.
 type TelegraphConfig struct {
+	// Mayor identifies the mayor user across providers. Translators use this
+	// to keep notifications relevant — events that don't pertain to the mayor
+	// are dropped before L3 delivery.
+	Mayor MayorConfig `toml:"mayor"`
+
 	// ListenAddr is the TCP address for the HTTP webhook listener (e.g. ":8765").
 	ListenAddr string `toml:"listen_addr"`
 
@@ -47,6 +53,28 @@ type TelegraphConfig struct {
 	// Providers is a map of provider ID → per-provider configuration.
 	// Example provider IDs: "jira", "github".
 	Providers map[string]*ProviderConfig `toml:"providers"`
+}
+
+// MayorConfig holds identity tokens used by per-provider relevance filtering.
+// At least one identifier per enabled provider must be configured so the
+// translator has a concrete match target — otherwise every event would be
+// classified as irrelevant and silently dropped.
+//
+// Identifier semantics:
+//   - JiraAccountIDs: opaque Jira Cloud account IDs (e.g. "712020:..."),
+//     matched exactly against issue assignee accountId, comment author
+//     accountId, and @-mention account references in comment bodies.
+//   - JiraUsernames: matched case-insensitively against User.name and
+//     User.displayName (covers Jira Server / legacy payloads and any
+//     payload that still carries a legacy username).
+//   - GitHubLogins: GitHub login handles (no leading "@"), matched
+//     case-insensitively against PR author, assignees, requested
+//     reviewers, comment/review authors, sender, and @-mentions in
+//     PR/comment/review bodies.
+type MayorConfig struct {
+	JiraAccountIDs []string `toml:"jira_account_ids"`
+	JiraUsernames  []string `toml:"jira_usernames"`
+	GitHubLogins   []string `toml:"github_logins"`
 }
 
 // ProviderConfig holds per-provider Telegraph settings.
@@ -170,6 +198,44 @@ func (c *Config) Validate() error {
 			if r == "" {
 				return fmt.Errorf("telegraph.providers.%s: repos must not contain empty strings", id)
 			}
+		}
+		if p.Enabled {
+			switch id {
+			case "jira":
+				if len(t.Mayor.JiraAccountIDs) == 0 && len(t.Mayor.JiraUsernames) == 0 {
+					return fmt.Errorf("telegraph.providers.jira: enabled but telegraph.mayor has no jira_account_ids or jira_usernames; without an identity every event is irrelevant and dropped")
+				}
+			case "github":
+				if len(t.Mayor.GitHubLogins) == 0 {
+					return fmt.Errorf("telegraph.providers.github: enabled but telegraph.mayor has no github_logins; without an identity every event is irrelevant and dropped")
+				}
+			}
+		}
+	}
+	// Whitespace-only entries would pass an `== ""` check but never match
+	// anything at runtime, which silently turns every event into a
+	// not_relevant drop. Reject them with the same error as empty strings.
+	for _, v := range t.Mayor.JiraAccountIDs {
+		if strings.TrimSpace(v) == "" {
+			return errors.New("telegraph.mayor.jira_account_ids must not contain empty or whitespace-only entries")
+		}
+	}
+	for _, v := range t.Mayor.JiraUsernames {
+		if strings.TrimSpace(v) == "" {
+			return errors.New("telegraph.mayor.jira_usernames must not contain empty or whitespace-only entries")
+		}
+	}
+	for _, v := range t.Mayor.GitHubLogins {
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return errors.New("telegraph.mayor.github_logins must not contain empty or whitespace-only entries")
+		}
+		// GitHub webhook payloads carry the bare login ("artie"), not the
+		// at-prefixed form. An entry like "@artie" passes the non-empty
+		// check but never matches anything at runtime, which silently
+		// turns every event into a not_relevant drop — fail loud instead.
+		if strings.HasPrefix(trimmed, "@") {
+			return fmt.Errorf("telegraph.mayor.github_logins entry %q: drop the leading '@' — webhook payloads use the bare login", v)
 		}
 	}
 	return nil

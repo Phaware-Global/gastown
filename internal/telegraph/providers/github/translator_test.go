@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -30,7 +31,7 @@ func newTranslator(t *testing.T, opts ...translatorOpt) *github.Translator {
 	for _, o := range opts {
 		o(&cfg)
 	}
-	return github.New(cfg.secret, cfg.events, cfg.ignoreActors, cfg.allowedRepos, nil)
+	return github.New(cfg.secret, cfg.events, cfg.ignoreActors, cfg.allowedRepos, github.MayorIdentity{Logins: cfg.mayorLogins}, nil)
 }
 
 type translatorConfig struct {
@@ -38,6 +39,7 @@ type translatorConfig struct {
 	events       []string
 	ignoreActors []string
 	allowedRepos []string
+	mayorLogins  []string
 }
 
 type translatorOpt func(*translatorConfig)
@@ -56,6 +58,10 @@ func withAllowedRepos(repos ...string) translatorOpt {
 
 func withSecret(secret string) translatorOpt {
 	return func(c *translatorConfig) { c.secret = secret }
+}
+
+func withMayorLogins(logins ...string) translatorOpt {
+	return func(c *translatorConfig) { c.mayorLogins = logins }
 }
 
 // headersFor returns lowercased headers for a wire event with optional delivery ID.
@@ -222,8 +228,8 @@ func TestTranslate_PullRequestMerged(t *testing.T) {
 
 func TestTranslate_PullRequestClosedUnmerged(t *testing.T) {
 	body := mustJSON(t, map[string]any{
-		"action": "closed",
-		"sender": map[string]any{"login": "alice"},
+		"action":     "closed",
+		"sender":     map[string]any{"login": "alice"},
 		"repository": map[string]any{"full_name": "acme/widget"},
 		"pull_request": map[string]any{
 			"number":     7,
@@ -245,8 +251,8 @@ func TestTranslate_PullRequestClosedUnmerged(t *testing.T) {
 
 func TestTranslate_PullRequestOpened(t *testing.T) {
 	body := mustJSON(t, map[string]any{
-		"action": "opened",
-		"sender": map[string]any{"login": "carol"},
+		"action":     "opened",
+		"sender":     map[string]any{"login": "carol"},
 		"repository": map[string]any{"full_name": "acme/widget"},
 		"pull_request": map[string]any{
 			"number":     9,
@@ -714,6 +720,335 @@ func TestValidateEvents_AnyUnsupportedRejected(t *testing.T) {
 func TestValidateEvents_AllTyposRejected(t *testing.T) {
 	if err := github.ValidateEvents([]string{"foo", "bar"}); err == nil {
 		t.Fatal("expected error for all-typo events list")
+	}
+}
+
+// ---- Mayor relevance filtering ----
+
+// ghPRPayload builds a pull_request webhook body with fine-grained control
+// over involvement-relevant fields. Empty / nil arguments are dropped.
+func ghPRPayload(repo string, prNum int, action, sender, prAuthor string, assignees, reviewers []string, body, mergedAt string, merged bool) []byte {
+	pr := map[string]any{
+		"number":     prNum,
+		"html_url":   fmt.Sprintf("https://github.com/%s/pull/%d", repo, prNum),
+		"title":      "test",
+		"body":       body,
+		"merged":     merged,
+		"merged_at":  mergedAt,
+		"updated_at": "2026-04-29T15:00:00Z",
+	}
+	if prAuthor != "" {
+		pr["user"] = map[string]any{"login": prAuthor}
+	}
+	if len(assignees) > 0 {
+		as := make([]map[string]any, 0, len(assignees))
+		for _, a := range assignees {
+			as = append(as, map[string]any{"login": a})
+		}
+		pr["assignees"] = as
+	}
+	if len(reviewers) > 0 {
+		rs := make([]map[string]any, 0, len(reviewers))
+		for _, r := range reviewers {
+			rs = append(rs, map[string]any{"login": r})
+		}
+		pr["requested_reviewers"] = rs
+	}
+	out := map[string]any{
+		"action":       action,
+		"sender":       map[string]any{"login": sender},
+		"repository":   map[string]any{"full_name": repo, "html_url": "https://github.com/" + repo},
+		"pull_request": pr,
+	}
+	b, _ := json.Marshal(out)
+	return b
+}
+
+func TestRelevance_GitHub_PRAuthorIsMayor_Delivered(t *testing.T) {
+	tr := newTranslator(t, withMayorLogins("artie"))
+	body := ghPRPayload("acme/widget", 1, "closed", "bot", "Artie",
+		nil, nil, "", "2026-04-29T15:00:00Z", true)
+	if _, err := tr.Translate(headersFor("pull_request"), body); err != nil {
+		t.Fatalf("Translate: %v, want nil (PR author is mayor)", err)
+	}
+}
+
+func TestRelevance_GitHub_PRAssigneeIsMayor_Delivered(t *testing.T) {
+	tr := newTranslator(t, withMayorLogins("artie"))
+	body := ghPRPayload("acme/widget", 2, "closed", "bot", "alice",
+		[]string{"artie"}, nil, "", "2026-04-29T15:00:00Z", true)
+	if _, err := tr.Translate(headersFor("pull_request"), body); err != nil {
+		t.Fatalf("Translate: %v, want nil (mayor is assignee)", err)
+	}
+}
+
+func TestRelevance_GitHub_PRRequestedReviewerIsMayor_Delivered(t *testing.T) {
+	tr := newTranslator(t, withMayorLogins("artie"))
+	body := ghPRPayload("acme/widget", 3, "opened", "alice", "alice",
+		nil, []string{"artie"}, "", "2026-04-29T15:00:00Z", false)
+	if _, err := tr.Translate(headersFor("pull_request"), body); err != nil {
+		t.Fatalf("Translate: %v, want nil (mayor is requested reviewer)", err)
+	}
+}
+
+func TestRelevance_GitHub_PRSenderIsMayor_Delivered(t *testing.T) {
+	tr := newTranslator(t, withMayorLogins("artie"))
+	body := ghPRPayload("acme/widget", 4, "reopened", "Artie", "bob",
+		nil, nil, "", "", false)
+	if _, err := tr.Translate(headersFor("pull_request"), body); err != nil {
+		t.Fatalf("Translate: %v, want nil (mayor triggered the event)", err)
+	}
+}
+
+func TestRelevance_GitHub_PRBodyMentionsMayor_Delivered(t *testing.T) {
+	tr := newTranslator(t, withMayorLogins("artie"))
+	body := ghPRPayload("acme/widget", 5, "opened", "alice", "alice",
+		nil, nil, "cc @artie for review", "", false)
+	if _, err := tr.Translate(headersFor("pull_request"), body); err != nil {
+		t.Fatalf("Translate: %v, want nil (PR body mentions mayor)", err)
+	}
+}
+
+func TestRelevance_GitHub_PRNoMayorInvolvement_Dropped(t *testing.T) {
+	tr := newTranslator(t, withMayorLogins("artie"))
+	body := ghPRPayload("acme/widget", 6, "closed", "bob", "alice",
+		[]string{"carol"}, []string{"dave"}, "no mention here",
+		"2026-04-29T15:00:00Z", true)
+	evt, err := tr.Translate(headersFor("pull_request"), body)
+	if !errors.Is(err, telegraph.ErrNotRelevant) {
+		t.Fatalf("Translate: err = %v, want ErrNotRelevant", err)
+	}
+	if evt == nil || evt.Subject != "acme/widget#6" {
+		t.Errorf("ErrNotRelevant must keep audit context: %+v", evt)
+	}
+}
+
+func TestRelevance_GitHub_IssueCommentOnPR_MentionsMayor_Delivered(t *testing.T) {
+	tr := newTranslator(t, withMayorLogins("artie"))
+	body := mustJSON(t, map[string]any{
+		"action":     "created",
+		"sender":     map[string]any{"login": "alice"},
+		"repository": map[string]any{"full_name": "acme/widget"},
+		"issue": map[string]any{
+			"number":       7,
+			"html_url":     "https://github.com/acme/widget/pull/7",
+			"pull_request": map[string]any{"html_url": "https://github.com/acme/widget/pull/7"},
+		},
+		"comment": map[string]any{
+			"id":         100,
+			"body":       "Please review, @artie",
+			"user":       map[string]any{"login": "alice"},
+			"created_at": "2026-04-29T18:00:00Z",
+		},
+	})
+	if _, err := tr.Translate(headersFor("issue_comment"), body); err != nil {
+		t.Fatalf("Translate: %v, want nil (comment mentions mayor)", err)
+	}
+}
+
+func TestRelevance_GitHub_IssueCommentOnPR_MayorIsPRAuthor_Delivered(t *testing.T) {
+	// Comments on Mayor-authored PRs by other users (without @-mention)
+	// must reach Mayor — issue.user carries the PR author on issue_comment
+	// deliveries.
+	tr := newTranslator(t, withMayorLogins("artie"))
+	body := mustJSON(t, map[string]any{
+		"action":     "created",
+		"sender":     map[string]any{"login": "bob"},
+		"repository": map[string]any{"full_name": "acme/widget"},
+		"issue": map[string]any{
+			"number":       8,
+			"html_url":     "https://github.com/acme/widget/pull/8",
+			"pull_request": map[string]any{"html_url": "https://github.com/acme/widget/pull/8"},
+			"user":         map[string]any{"login": "artie"}, // PR author
+		},
+		"comment": map[string]any{
+			"id":         200,
+			"body":       "Drive-by comment from collaborator",
+			"user":       map[string]any{"login": "bob"},
+			"created_at": "2026-04-29T18:00:00Z",
+		},
+	})
+	if _, err := tr.Translate(headersFor("issue_comment"), body); err != nil {
+		t.Fatalf("Translate: %v, want nil (comment on Mayor-authored PR)", err)
+	}
+}
+
+func TestRelevance_GitHub_IssueCommentOnPR_MayorIsAssignee_Delivered(t *testing.T) {
+	// Comments on a Mayor-assigned PR (not Mayor-authored, no @-mention)
+	// must reach Mayor — issue.assignees carries the PR assignee list on
+	// issue_comment deliveries.
+	tr := newTranslator(t, withMayorLogins("artie"))
+	body := mustJSON(t, map[string]any{
+		"action":     "created",
+		"sender":     map[string]any{"login": "bob"},
+		"repository": map[string]any{"full_name": "acme/widget"},
+		"issue": map[string]any{
+			"number":       9,
+			"html_url":     "https://github.com/acme/widget/pull/9",
+			"pull_request": map[string]any{"html_url": "https://github.com/acme/widget/pull/9"},
+			"user":         map[string]any{"login": "alice"},
+			"assignees": []map[string]any{
+				{"login": "artie"},
+			},
+		},
+		"comment": map[string]any{
+			"id":         300,
+			"body":       "Drive-by comment from collaborator",
+			"user":       map[string]any{"login": "bob"},
+			"created_at": "2026-04-29T18:00:00Z",
+		},
+	})
+	if _, err := tr.Translate(headersFor("issue_comment"), body); err != nil {
+		t.Fatalf("Translate: %v, want nil (comment on Mayor-assigned PR)", err)
+	}
+}
+
+func TestRelevance_GitHub_IssueCommentOnPR_OtherAuthor_NoMention_Dropped(t *testing.T) {
+	tr := newTranslator(t, withMayorLogins("artie"))
+	body := mustJSON(t, map[string]any{
+		"action":     "created",
+		"sender":     map[string]any{"login": "bob"},
+		"repository": map[string]any{"full_name": "acme/widget"},
+		"issue": map[string]any{
+			"number":       8,
+			"html_url":     "https://github.com/acme/widget/pull/8",
+			"pull_request": map[string]any{"html_url": "https://github.com/acme/widget/pull/8"},
+		},
+		"comment": map[string]any{
+			"id":         101,
+			"body":       "Just a normal comment",
+			"user":       map[string]any{"login": "bob"},
+			"created_at": "2026-04-29T18:00:00Z",
+		},
+	})
+	_, err := tr.Translate(headersFor("issue_comment"), body)
+	if !errors.Is(err, telegraph.ErrNotRelevant) {
+		t.Fatalf("Translate: err = %v, want ErrNotRelevant", err)
+	}
+}
+
+func TestRelevance_GitHub_ReviewCommentMentionsMayor_Delivered(t *testing.T) {
+	tr := newTranslator(t, withMayorLogins("artie"))
+	body := mustJSON(t, map[string]any{
+		"action":     "submitted",
+		"sender":     map[string]any{"login": "alice"},
+		"repository": map[string]any{"full_name": "acme/widget"},
+		"pull_request": map[string]any{
+			"number":   9,
+			"html_url": "https://github.com/acme/widget/pull/9",
+			"user":     map[string]any{"login": "alice"}, // not mayor
+		},
+		"review": map[string]any{
+			"id":           7,
+			"state":        "commented",
+			"body":         "fyi @artie",
+			"user":         map[string]any{"login": "alice"},
+			"submitted_at": "2026-04-29T19:00:00Z",
+		},
+	})
+	if _, err := tr.Translate(headersFor("pull_request_review"), body); err != nil {
+		t.Fatalf("Translate: %v, want nil (review body mentions mayor)", err)
+	}
+}
+
+func TestRelevance_GitHub_CheckRunOnPR_Allowed(t *testing.T) {
+	// CI events with PR association pass relevance — best-effort, per code comment.
+	tr := newTranslator(t, withMayorLogins("artie"))
+	body := mustJSON(t, map[string]any{
+		"action":     "completed",
+		"sender":     map[string]any{"login": "github-actions[bot]"},
+		"repository": map[string]any{"full_name": "acme/widget"},
+		"check_run": map[string]any{
+			"id":         1001,
+			"name":       "lint",
+			"conclusion": "failure",
+			"head_sha":   "abc1234",
+			"pull_requests": []map[string]any{
+				{"number": 42, "html_url": "https://github.com/acme/widget/pull/42"},
+			},
+		},
+	})
+	if _, err := tr.Translate(headersFor("check_run"), body); err != nil {
+		t.Fatalf("Translate: %v, want nil (CI tied to a PR is allowed)", err)
+	}
+}
+
+func TestRelevance_GitHub_CheckRunNoPR_Dropped(t *testing.T) {
+	// CI events with no PR association cannot be tied to mayor and are dropped.
+	tr := newTranslator(t, withMayorLogins("artie"))
+	body := mustJSON(t, map[string]any{
+		"action":     "completed",
+		"sender":     map[string]any{"login": "github-actions[bot]"},
+		"repository": map[string]any{"full_name": "acme/widget"},
+		"check_run": map[string]any{
+			"id":         1002,
+			"name":       "scheduled-scan",
+			"conclusion": "failure",
+			"head_sha":   "deadbee",
+		},
+	})
+	_, err := tr.Translate(headersFor("check_run"), body)
+	if !errors.Is(err, telegraph.ErrNotRelevant) {
+		t.Fatalf("Translate: err = %v, want ErrNotRelevant (no PR association)", err)
+	}
+}
+
+func TestRelevance_GitHub_WorkflowRunNoPR_Dropped(t *testing.T) {
+	tr := newTranslator(t, withMayorLogins("artie"))
+	body := mustJSON(t, map[string]any{
+		"action":     "completed",
+		"sender":     map[string]any{"login": "github-actions[bot]"},
+		"repository": map[string]any{"full_name": "acme/widget"},
+		"workflow_run": map[string]any{
+			"id":          5,
+			"name":        "CI",
+			"conclusion":  "failure",
+			"head_branch": "main",
+			"updated_at":  "2026-04-29T21:00:00Z",
+		},
+	})
+	_, err := tr.Translate(headersFor("workflow_run"), body)
+	if !errors.Is(err, telegraph.ErrNotRelevant) {
+		t.Fatalf("Translate: err = %v, want ErrNotRelevant (no PR)", err)
+	}
+}
+
+func TestRelevance_GitHub_EmptyIdentity_NoFiltering(t *testing.T) {
+	// Backward-compat: empty mayor identity disables relevance filtering.
+	tr := newTranslator(t) // no withMayorLogins
+	body := ghPRPayload("acme/widget", 99, "closed", "bob", "alice",
+		nil, nil, "", "2026-04-29T15:00:00Z", true)
+	if _, err := tr.Translate(headersFor("pull_request"), body); err != nil {
+		t.Fatalf("Translate: %v, want nil (no mayor identity → all pass)", err)
+	}
+}
+
+// TestRelevance_GitHub_MentionBoundary checks the mention regex doesn't match
+// inside email addresses or other non-mention contexts.
+func TestRelevance_GitHub_MentionBoundary(t *testing.T) {
+	tr := newTranslator(t, withMayorLogins("artie"))
+	// "artie" appears in an email — must NOT count as a mention.
+	body := ghPRPayload("acme/widget", 10, "opened", "alice", "alice",
+		nil, nil, "Email me at foo+artie@example.com", "", false)
+	_, err := tr.Translate(headersFor("pull_request"), body)
+	if !errors.Is(err, telegraph.ErrNotRelevant) {
+		t.Fatalf("Translate: err = %v, want ErrNotRelevant (no @ mention, only substring)", err)
+	}
+}
+
+// TestMayorIdentity_HasAny_IgnoresEmptyEntries asserts HasAny doesn't return
+// true when every entry is empty or whitespace-only. A library/test caller
+// that accidentally passes `[]string{""}` would otherwise enable relevance
+// filtering with zero match targets and silently drop everything.
+func TestMayorIdentity_HasAny_IgnoresEmptyEntries(t *testing.T) {
+	if (github.MayorIdentity{Logins: []string{""}}).HasAny() {
+		t.Error("HasAny() = true for [\"\"], want false")
+	}
+	if (github.MayorIdentity{Logins: []string{"  ", "\t"}}).HasAny() {
+		t.Error("HasAny() = true for whitespace-only entries, want false")
+	}
+	if !(github.MayorIdentity{Logins: []string{"", "artie"}}).HasAny() {
+		t.Error("HasAny() = false for [\"\", \"artie\"], want true")
 	}
 }
 

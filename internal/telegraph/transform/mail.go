@@ -200,6 +200,22 @@ func safeTitle(text string) string {
 	return text
 }
 
+// replyHintFor returns the out-of-band reply tool string for a provider.
+// Telegraph never propagates Mayor replies back to the provider; this hint
+// is what tells Mayor where to actually act. Returning empty string for an
+// unknown provider keeps the field optional rather than emitting an empty
+// header.
+func replyHintFor(provider string) string {
+	switch provider {
+	case "jira":
+		return "out-of-band only — use Jira MCP tools (e.g. mcp__atlassian__addCommentToJiraIssue, mcp__atlassian__transitionJiraIssue); do NOT reply via bead"
+	case "github":
+		return "out-of-band only — use `gh` CLI or GitHub MCP (e.g. gh pr comment, gh pr review); do NOT reply via bead"
+	default:
+		return ""
+	}
+}
+
 // sanitizeHeaderValue strips CR and LF characters from a value that will be
 // written into a header line. A newline in a header value would allow
 // injection of arbitrary header lines into the mail body.
@@ -237,6 +253,14 @@ func (t *Transformer) buildBody(event *telegraph.NormalizedEvent, promptText str
 			sanitizedLabels[i] = sanitizeHeaderValue(l)
 		}
 		fmt.Fprintf(&b, "Telegraph-Labels: %s\n", strings.Join(sanitizedLabels, ", "))
+	}
+	// Telegraph is one-way. Replying inside the Mayor mail thread does NOT
+	// propagate back to the provider — there is no return-channel translator
+	// in the pipeline. Always emit a per-provider reply hint so Mayor reaches
+	// for the correct out-of-band tool instead of dropping a bead reply
+	// that goes nowhere.
+	if hint := replyHintFor(event.Provider); hint != "" {
+		fmt.Fprintf(&b, "Telegraph-Reply-Via: %s\n", hint)
 	}
 
 	// Operator prompt block — emitted only when a prompt resolved.

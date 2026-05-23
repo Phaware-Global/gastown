@@ -131,6 +131,40 @@ func TestTransform_BodyMetadataHeaders(t *testing.T) {
 	}
 }
 
+func TestTransform_BodyReplyViaHint_Jira(t *testing.T) {
+	t.Parallel()
+	mr := mail.NewMemoryRouter()
+	tr := transform.New(mr, &captureNudger{}, 4096, 30*time.Second, nil)
+	_ = tr.Transform(makeEvent("jira", "issue.updated", "carol", "PROJ-3", "x"))
+	body := mr.Messages()[0].Body
+	if !strings.Contains(body, "Telegraph-Reply-Via:") {
+		t.Fatalf("missing Telegraph-Reply-Via header\nbody:\n%s", body)
+	}
+	if !strings.Contains(body, "Jira MCP") {
+		t.Errorf("Jira reply hint must point to Jira MCP tools\nbody:\n%s", body)
+	}
+	if !strings.Contains(body, "do NOT reply via bead") {
+		t.Errorf("reply hint must warn against bead replies\nbody:\n%s", body)
+	}
+}
+
+func TestTransform_BodyReplyViaHint_GitHub(t *testing.T) {
+	t.Parallel()
+	mr := mail.NewMemoryRouter()
+	tr := transform.New(mr, &captureNudger{}, 4096, 30*time.Second, nil)
+	_ = tr.Transform(makeEvent("github", "pull_request.merged", "alice", "acme/widget#1", "x"))
+	body := mr.Messages()[0].Body
+	if !strings.Contains(body, "Telegraph-Reply-Via:") {
+		t.Fatalf("missing Telegraph-Reply-Via header\nbody:\n%s", body)
+	}
+	if !strings.Contains(body, "`gh` CLI") {
+		t.Errorf("GitHub reply hint must point to gh CLI\nbody:\n%s", body)
+	}
+	if !strings.Contains(body, "do NOT reply via bead") {
+		t.Errorf("reply hint must warn against bead replies\nbody:\n%s", body)
+	}
+}
+
 func TestTransform_BodyExternalContentDelimiters(t *testing.T) {
 	t.Parallel()
 	mr := mail.NewMemoryRouter()

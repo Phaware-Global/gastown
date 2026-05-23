@@ -85,7 +85,7 @@ func newPipeline(t *testing.T, bodyCap int, nudgeWindow time.Duration) *pipeline
 	secret := []byte(testSecret)
 
 	rawCh := make(chan telegraph.RawEvent, 64)
-	jiraTr := jiratr.New(testSecret, nil, nil)
+	jiraTr := jiratr.New(testSecret, nil, jiratr.MayorIdentity{}, nil)
 	mr := mail.NewMemoryRouter()
 	nudger := &captureNudger{}
 	transformer := transform.New(mr, nudger, bodyCap, nudgeWindow, nil)
@@ -491,7 +491,7 @@ func newActorPipeline(t *testing.T, ignoreActors []string) *actorPipeline {
 	logger := tlog.New(logBuf)
 
 	rawCh := make(chan telegraph.RawEvent, 64)
-	jiraTrFiltered := jiratr.New(testSecret, ignoreActors, nil)
+	jiraTrFiltered := jiratr.New(testSecret, ignoreActors, jiratr.MayorIdentity{}, nil)
 	mr := mail.NewMemoryRouter()
 	nudger := &captureNudger{}
 	transformer := transform.New(mr, nudger, 4096, 0, nil, logger)
@@ -613,7 +613,7 @@ func TestIntegration_PromptKey_InDeliverLog(t *testing.T) {
 	logBuf := &bytes.Buffer{}
 	logger := tlog.New(logBuf)
 	rawCh := make(chan telegraph.RawEvent, 64)
-	jiraTr := jiratr.New(testSecret, nil, nil)
+	jiraTr := jiratr.New(testSecret, nil, jiratr.MayorIdentity{}, nil)
 	mr := mail.NewMemoryRouter()
 	nudger := &captureNudger{}
 	transformer := transform.New(mr, nudger, 4096, 0, resolver, logger)
@@ -689,6 +689,11 @@ type githubPipeline struct {
 
 func newGitHubPipeline(t *testing.T, allowedRepos []string, ignoreActors []string) *githubPipeline {
 	t.Helper()
+	return newGitHubPipelineWithMayor(t, allowedRepos, ignoreActors, githubtr.MayorIdentity{})
+}
+
+func newGitHubPipelineWithMayor(t *testing.T, allowedRepos []string, ignoreActors []string, mayor githubtr.MayorIdentity) *githubPipeline {
+	t.Helper()
 	const ghSecret = "github-int-secret"
 	secret := []byte(ghSecret)
 
@@ -696,7 +701,7 @@ func newGitHubPipeline(t *testing.T, allowedRepos []string, ignoreActors []strin
 	logger := tlog.New(logBuf)
 
 	rawCh := make(chan telegraph.RawEvent, 64)
-	tr := githubtr.New(ghSecret, nil /* events */, ignoreActors, allowedRepos, nil)
+	tr := githubtr.New(ghSecret, nil /* events */, ignoreActors, allowedRepos, mayor, nil)
 	mr := mail.NewMemoryRouter()
 	transformer := transform.New(mr, nil /* nudger */, 4096, 0, nil, logger)
 
@@ -716,7 +721,21 @@ func newGitHubPipeline(t *testing.T, allowedRepos []string, ignoreActors []strin
 				logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, norm.Subject, tlog.ReasonRepoFiltered)
 				continue
 			}
+			if errors.Is(err, telegraph.ErrNotRelevant) {
+				logger.Drop(evt.Provider, norm.EventType, norm.EventID, norm.Actor, norm.Subject, tlog.ReasonNotRelevant)
+				continue
+			}
+			if errors.Is(err, telegraph.ErrUnknownEventType) {
+				logger.Drop(evt.Provider, "", "", "", "", tlog.ReasonUnknownEventType)
+				continue
+			}
 			if err != nil {
+				eventType, eventID := "", ""
+				if norm != nil {
+					eventType = norm.EventType
+					eventID = norm.EventID
+				}
+				logger.TranslateError(evt.Provider, eventType, eventID, evt.Headers, evt.Body, err)
 				continue
 			}
 			_ = transformer.Transform(norm)
@@ -918,6 +937,7 @@ func TestStartup_GitHubProvider_TranslatorRegistered(t *testing.T) {
 	// telegraph.Config.ResolveProviders.
 	t.Setenv("GT_TELEGRAPH_GITHUB_TEST_SECRET", "abc123")
 	cfg := telegraph.DefaultConfig()
+	cfg.Telegraph.Mayor = telegraph.MayorConfig{GitHubLogins: []string{"alice"}}
 	cfg.Telegraph.Providers["github"] = &telegraph.ProviderConfig{
 		Enabled:   true,
 		SecretEnv: "GT_TELEGRAPH_GITHUB_TEST_SECRET",
@@ -935,7 +955,7 @@ func TestStartup_GitHubProvider_TranslatorRegistered(t *testing.T) {
 	if rp == nil {
 		t.Fatal("github not in resolved")
 	}
-	tr := githubtr.New(rp.Secret, []string{"pull_request"}, nil, []string{"acme/widget"}, nil)
+	tr := githubtr.New(rp.Secret, []string{"pull_request"}, nil, []string{"acme/widget"}, githubtr.MayorIdentity{}, nil)
 	if tr.Provider() != "github" {
 		t.Errorf("Provider() = %q", tr.Provider())
 	}
@@ -948,5 +968,125 @@ func TestStartup_GitHubProvider_TranslatorRegistered(t *testing.T) {
 	}
 	if err := tr.Authenticate(headers, body); err != nil {
 		t.Fatalf("Authenticate: %v", err)
+	}
+}
+
+// ---- Relevance filtering integration ----
+
+func ghPRMergedPayloadWithAuthor(repo string, prNum int, sender, prAuthor string) []byte {
+	b, _ := json.Marshal(map[string]any{
+		"action":     "closed",
+		"sender":     map[string]any{"login": sender},
+		"repository": map[string]any{"full_name": repo, "html_url": "https://github.com/" + repo},
+		"pull_request": map[string]any{
+			"number":     prNum,
+			"html_url":   fmt.Sprintf("https://github.com/%s/pull/%d", repo, prNum),
+			"title":      "Some PR",
+			"body":       "",
+			"merged":     true,
+			"merged_at":  "2026-04-29T15:00:00Z",
+			"updated_at": "2026-04-29T15:00:00Z",
+			"user":       map[string]any{"login": prAuthor},
+		},
+	})
+	return b
+}
+
+func TestIntegration_GitHub_Relevance_MayorIsAuthor_Delivered(t *testing.T) {
+	p := newGitHubPipelineWithMayor(t, nil, nil, githubtr.MayorIdentity{Logins: []string{"artie"}})
+	defer p.cancel()
+
+	body := ghPRMergedPayloadWithAuthor("acme/widget", 42, "alice", "artie")
+	resp := p.post(t, "pull_request", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("HTTP = %d, want 200", resp.StatusCode)
+	}
+	msgs := p.waitMessages(t, 1, 2*time.Second)
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %d, want 1", len(msgs))
+	}
+}
+
+func TestIntegration_GitHub_Relevance_NoInvolvement_Dropped(t *testing.T) {
+	p := newGitHubPipelineWithMayor(t, nil, nil, githubtr.MayorIdentity{Logins: []string{"artie"}})
+	defer p.cancel()
+
+	body := ghPRMergedPayloadWithAuthor("acme/widget", 43, "bob", "alice")
+	resp := p.post(t, "pull_request", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("HTTP = %d, want 200 (silent drop)", resp.StatusCode)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := len(p.mr.Messages()); n != 0 {
+		t.Errorf("messages = %d, want 0 (mayor not involved)", n)
+	}
+	if !strings.Contains(p.logBuf.String(), `"not_relevant"`) {
+		t.Errorf("drop log missing not_relevant reason:\n%s", p.logBuf.String())
+	}
+	if !strings.Contains(p.logBuf.String(), `"acme/widget#43"`) {
+		t.Errorf("drop log missing subject (audit context):\n%s", p.logBuf.String())
+	}
+}
+
+func TestIntegration_GitHub_TranslateError_LogsBodyAndErr(t *testing.T) {
+	// Force a translate failure by sending a pull_request webhook with a
+	// non-object pull_request field. The translator returns a real (non-
+	// sentinel) error after JSON parsing succeeds → dispatcher must route
+	// this through TranslateError, not the generic Drop path.
+	p := newGitHubPipeline(t, nil, nil)
+	defer p.cancel()
+
+	// pull_request action that triggers an error path: closed but without a
+	// pull_request object yields a "missing pull_request field" error.
+	body := []byte(`{"action":"closed","repository":{"full_name":"acme/widget"}}`)
+	resp := p.post(t, "pull_request", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("HTTP = %d, want 200", resp.StatusCode)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(p.logBuf.String(), `"translate_error"`) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	full := p.logBuf.String()
+	if !strings.Contains(full, `"translate_error"`) {
+		t.Fatalf("expected translate_error in log:\n%s", full)
+	}
+	if !strings.Contains(full, `missing pull_request field`) {
+		t.Errorf("translate_error log missing err detail:\n%s", full)
+	}
+	if !strings.Contains(full, `"body_snippet"`) {
+		t.Errorf("translate_error log missing body_snippet:\n%s", full)
+	}
+	if !strings.Contains(full, `"wire_event":"pull_request"`) {
+		t.Errorf("translate_error log missing wire_event:\n%s", full)
+	}
+	if strings.Contains(full, `"x-hub-signature-256"`) {
+		t.Errorf("translate_error log leaked signature header:\n%s", full)
+	}
+}
+
+func TestIntegration_GitHub_UnknownEventType_NotTreatedAsTranslateError(t *testing.T) {
+	// "ping" must drop with reason=unknown_event_type, never translate_error.
+	// Regression: previous code conflated the two, masking real failures.
+	p := newGitHubPipeline(t, nil, nil)
+	defer p.cancel()
+
+	resp := p.post(t, "ping", []byte(`{"zen":"hi"}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("HTTP = %d", resp.StatusCode)
+	}
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(p.logBuf.String(), `"reason"`) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	full := p.logBuf.String()
+	if strings.Contains(full, `"translate_error"`) {
+		t.Errorf("unknown event must NOT be logged as translate_error:\n%s", full)
 	}
 }
