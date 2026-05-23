@@ -9,23 +9,53 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/telegraph"
 )
 
+// MayorIdentity identifies the mayor user for Jira relevance filtering.
+// At least one of AccountIDs or Usernames must be populated; with an empty
+// identity, every event would be classified as irrelevant and dropped.
+//
+//   - AccountIDs: opaque Jira Cloud account IDs. Matched exactly against
+//     issue assignee.accountId, comment author.accountId, and the
+//     accountid: form of @-mentions in comment bodies.
+//   - Usernames: matched case-insensitively against User.name and
+//     User.displayName, and against the bracketed [~username] form of
+//     @-mentions used by Jira Server / legacy ADF payloads.
+type MayorIdentity struct {
+	AccountIDs []string
+	Usernames  []string
+}
+
+// HasAny reports whether the identity has at least one match target.
+func (m MayorIdentity) HasAny() bool {
+	return len(m.AccountIDs) > 0 || len(m.Usernames) > 0
+}
+
 // Translator implements telegraph.Translator for Jira webhook payloads.
 type Translator struct {
-	secret       []byte
-	ignoreActors map[string]struct{}
-	logger       *slog.Logger
+	secret        []byte
+	ignoreActors  map[string]struct{}
+	mayor         MayorIdentity
+	mayorAccounts map[string]struct{} // case-sensitive (Jira account IDs are opaque)
+	mayorUsersLC  map[string]struct{} // lower-cased
+	logger        *slog.Logger
 }
 
 // New creates a Jira Translator with the given HMAC secret and actor filter list.
 // ignoreActors is a list of actor display-names to silently drop; nil or empty disables filtering.
+//
+// mayor is the mayor user identity used by relevance filtering. When the
+// identity is empty, relevance filtering is disabled (every successfully
+// translated event is forwarded); when it is non-empty, events that do not
+// pertain to the mayor are returned with ErrNotRelevant.
+//
 // If logger is nil, slog.Default() is used.
-func New(secret string, ignoreActors []string, logger *slog.Logger) *Translator {
+func New(secret string, ignoreActors []string, mayor MayorIdentity, logger *slog.Logger) *Translator {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -33,10 +63,25 @@ func New(secret string, ignoreActors []string, logger *slog.Logger) *Translator 
 	for _, a := range ignoreActors {
 		set[a] = struct{}{}
 	}
+	accounts := make(map[string]struct{}, len(mayor.AccountIDs))
+	for _, id := range mayor.AccountIDs {
+		if id != "" {
+			accounts[id] = struct{}{}
+		}
+	}
+	users := make(map[string]struct{}, len(mayor.Usernames))
+	for _, u := range mayor.Usernames {
+		if u != "" {
+			users[strings.ToLower(u)] = struct{}{}
+		}
+	}
 	return &Translator{
-		secret:       []byte(secret),
-		ignoreActors: set,
-		logger:       logger,
+		secret:        []byte(secret),
+		ignoreActors:  set,
+		mayor:         mayor,
+		mayorAccounts: accounts,
+		mayorUsersLC:  users,
+		logger:        logger,
 	}
 }
 
@@ -69,9 +114,13 @@ func (t *Translator) Authenticate(headers map[string]string, body []byte) error 
 // Translate converts a Jira webhook body into a NormalizedEvent.
 // The headers parameter is unused — Jira encodes the event type in the JSON
 // body's webhookEvent field, not in an HTTP header.
+//
 // Returns ErrUnknownEventType for unrecognised webhookEvent values.
 // Returns (non-nil event, ErrActorFiltered) when the event's actor matches
 // the ignore_actors list; the caller must log a drop and not enqueue to L3.
+// Returns (non-nil event, ErrNotRelevant) when a known event type does not
+// pertain to the mayor (no assignment, no mention, not on a mayor-assigned
+// issue). The caller must audit-log the drop and not enqueue to L3.
 func (t *Translator) Translate(_ map[string]string, body []byte) (*telegraph.NormalizedEvent, error) {
 	var p payload
 	if err := json.Unmarshal(body, &p); err != nil {
@@ -115,7 +164,146 @@ func (t *Translator) Translate(_ map[string]string, body []byte) (*telegraph.Nor
 			return evt, telegraph.ErrActorFiltered
 		}
 	}
+	if t.mayor.HasAny() && !t.isRelevant(&p) {
+		return evt, telegraph.ErrNotRelevant
+	}
 	return evt, nil
+}
+
+// isRelevant reports whether the parsed Jira payload pertains to the mayor.
+//
+// Relevance rules (any one is sufficient):
+//  1. The issue is currently assigned to mayor — covers issue_created and
+//     issue_updated where the mayor is the assignee, plus comment events on
+//     a mayor-assigned issue.
+//  2. The event is an assignment changelog whose toString resolves to mayor —
+//     covers "assign to mayor" even before fields.assignee reflects it (the
+//     changelog item is the canonical source of truth for who gained the
+//     assignment).
+//  3. A comment body explicitly @-mentions mayor (by accountId or username).
+//
+// Anything else — comments on others' issues, status updates on others'
+// issues, new issues assigned to someone else — is irrelevant for the mayor.
+func (t *Translator) isRelevant(p *payload) bool {
+	// Rule 1: assignee on the issue matches mayor.
+	if t.matchesUser(currentAssignee(p)) {
+		return true
+	}
+
+	// Rule 2: assignment changelog → mayor.
+	if assignmentTo := assignmentTargetFromChangelog(p); assignmentTo != "" {
+		if t.matchesUserName(assignmentTo) {
+			return true
+		}
+	}
+
+	// Rule 3: comment body @-mentions mayor.
+	if p.Comment != nil {
+		if t.commentMentionsMayor(p.Comment.Body) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesUser reports whether the given user (assignee, author, etc.) is the
+// mayor. Compares accountId (case-sensitive, opaque) against AccountIDs, and
+// name / displayName (case-insensitive) against Usernames.
+func (t *Translator) matchesUser(u *jiraUser) bool {
+	if u == nil {
+		return false
+	}
+	if u.AccountID != "" {
+		if _, ok := t.mayorAccounts[u.AccountID]; ok {
+			return true
+		}
+	}
+	if u.Name != "" {
+		if _, ok := t.mayorUsersLC[strings.ToLower(u.Name)]; ok {
+			return true
+		}
+	}
+	if u.DisplayName != "" {
+		if _, ok := t.mayorUsersLC[strings.ToLower(u.DisplayName)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesUserName reports whether a bare display-name string (e.g. from a
+// changelog "toString") resolves to the mayor's username set. AccountIDs are
+// never matched here because changelog toString carries the human-readable
+// label, not the opaque ID.
+func (t *Translator) matchesUserName(name string) bool {
+	if name == "" {
+		return false
+	}
+	_, ok := t.mayorUsersLC[strings.ToLower(strings.TrimSpace(name))]
+	return ok
+}
+
+// commentMentionsMayor scans a Jira comment body for @-mention markers
+// resolving to mayor. Jira renders mentions in two main forms:
+//
+//   - [~accountid:712020:abcd-...] — Cloud account-ID form (current)
+//   - [~username]                  — legacy / Server form
+//
+// Both forms are detected with simple anchored substring matches. Display
+// names of mentioned users are not embedded in the wire payload (Jira
+// substitutes them at render time), so we cannot match displayName mentions
+// here — accountId / username covers the production cases.
+func (t *Translator) commentMentionsMayor(body string) bool {
+	if body == "" {
+		return false
+	}
+	matches := jiraMentionRE.FindAllStringSubmatch(body, -1)
+	for _, m := range matches {
+		// m[1] is the captured token; may be an accountid:... form or a bare username.
+		token := m[1]
+		if strings.HasPrefix(token, "accountid:") {
+			id := strings.TrimPrefix(token, "accountid:")
+			if _, ok := t.mayorAccounts[id]; ok {
+				return true
+			}
+			continue
+		}
+		if _, ok := t.mayorUsersLC[strings.ToLower(token)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// jiraMentionRE captures the inner token of a [~...] mention. The token is
+// either "accountid:<opaque-id>" (cloud) or a bare username (server/legacy).
+// Restricted to a permissive but bounded character class so we don't read
+// past the closing bracket on adversarial input.
+var jiraMentionRE = regexp.MustCompile(`\[~([^\]]+)\]`)
+
+// currentAssignee returns the issue's current assignee, if present.
+func currentAssignee(p *payload) *jiraUser {
+	if p == nil || p.Issue == nil || p.Issue.Fields == nil {
+		return nil
+	}
+	return p.Issue.Fields.Assignee
+}
+
+// assignmentTargetFromChangelog returns the toString of the most recent
+// assignee changelog item, or "" if no such item is present. Jira issues
+// emit a changelog item with field="assignee" whose toString is the new
+// assignee's display name on assignment changes — even when the issue's
+// fields.assignee snapshot is not yet reflected in the payload.
+func assignmentTargetFromChangelog(p *payload) string {
+	if p == nil || p.Changelog == nil {
+		return ""
+	}
+	for _, it := range p.Changelog.Items {
+		if it.Field == "assignee" {
+			return it.ToString
+		}
+	}
+	return ""
 }
 
 // ---- internal payload types ----
@@ -132,6 +320,7 @@ type payload struct {
 type jiraUser struct {
 	Name        string `json:"name"`
 	DisplayName string `json:"displayName"`
+	AccountID   string `json:"accountId"`
 }
 
 type jiraIssue struct {

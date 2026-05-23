@@ -233,6 +233,16 @@ nudge_window = "30s"        # max one Mayor nudge per this window
 body_cap     = 4096         # max bytes of external text in mail body
 log_file     = ""           # empty = stderr / daemon log
 
+# Mayor identity — used by provider relevance filters so the daemon only
+# delivers events that pertain to the mayor. At least one identifier per
+# enabled provider is required (validation refuses to start otherwise).
+# Jira and GitHub identities are independent — a single login string does
+# NOT carry across providers.
+[telegraph.mayor]
+jira_account_ids = ["712020:203d8fd9-7795-4b98-aa84-a8a167e3a502"]
+jira_usernames   = ["Artie"]    # matches User.name or User.displayName
+github_logins    = ["artie"]    # GitHub login (no leading "@")
+
 [telegraph.providers.jira]
 enabled    = true
 secret_env = "GT_TELEGRAPH_JIRA_SECRET"   # env var name holding HMAC secret
@@ -576,6 +586,122 @@ Future event types — like the GitHub equivalent of the Jira `issue.updated`
 field-change shape, or `release` events — would land here with the same
 additive rules: register a new normalized event type, document it in this
 table, add a translator branch, no interface changes.
+
+---
+
+## Mayor Relevance Filtering
+
+Provider translators drop events that don't pertain to the mayor *before*
+delivering to L3. This is provider-side relevance filtering — Telegraph no
+longer relies on upstream webhook configuration (e.g. Jira's
+`assignee = <accountId>` JQL filter) to keep the inbox quiet. The dispatcher
+routes a new `ErrNotRelevant` sentinel through the same audit-log drop path
+as `ErrActorFiltered` / `ErrRepoFiltered`, with `reason="not_relevant"`.
+
+When the mayor identity for a provider is empty (the operator did not
+configure `[telegraph.mayor]`), relevance filtering is **disabled** for
+that provider and every successfully translated event is forwarded. Config
+validation requires at least one identifier for each enabled provider, so a
+misconfigured deployment fails fast rather than silently dropping
+everything.
+
+### Jira relevance rules
+
+A Jira event is relevant when **any** of the following is true:
+
+1. The issue's current assignee resolves to the mayor — covers
+   `issue_created`, `issue_updated`, and comment events on a mayor-assigned
+   issue. The assignee is matched against:
+     - `fields.assignee.accountId` (exact, case-sensitive, opaque)
+     - `fields.assignee.name` (case-insensitive)
+     - `fields.assignee.displayName` (case-insensitive)
+2. The event includes a changelog item with `field="assignee"` whose
+   `toString` resolves to a configured mayor username. This catches
+   assignments where the `fields.assignee` snapshot has not yet been
+   refreshed in the payload.
+3. The comment body explicitly @-mentions the mayor. Mention forms:
+     - `[~accountid:<account-id>]` — Cloud / current
+     - `[~<username>]` — Server / legacy
+
+Anything else (status updates on others' issues, comments on others'
+issues with no mention, assignments to other users) returns
+`ErrNotRelevant`.
+
+### GitHub relevance rules
+
+A GitHub event is relevant when **any** of the following is true:
+
+- The PR author (`pull_request.user.login`) is the mayor.
+- The mayor is in `pull_request.assignees`.
+- The mayor is in `pull_request.requested_reviewers`.
+- The event sender (`sender.login`) is the mayor.
+- The triggering comment or review author is the mayor.
+- The PR body contains an `@mayor` mention.
+- The triggering comment/review body contains an `@mayor` mention.
+
+GitHub mentions are matched case-insensitively against `mayor.github_logins`,
+restricted to `@`-prefixed tokens preceded by a non-identifier character
+(prevents matches inside email addresses or longer identifiers).
+
+**CI events** (`check_run`, `check_suite`, `workflow_run`) carry no
+PR-author or reviewer information. Telegraph applies the documented
+conservative rule:
+
+- CI events with **no PR association** are dropped — there is no signal to
+  tie the event to the mayor without keeping state, and forwarding them
+  produces org-wide CI noise.
+- CI events that **do** have a PR association are allowed through, relying
+  on the operator's `repos` allow-list for further trust. This is a
+  best-effort filter — mayor may still see CI noise on collaborators' PRs
+  in the same allow-listed repo. A stricter rule would require maintaining
+  state about PR authorship; deferred.
+
+Operators who want unfiltered CI notifications can disable relevance
+filtering for GitHub by leaving `mayor.github_logins` empty.
+
+### Diagnostics for true translation failures
+
+The dispatcher distinguishes expected drops (unknown event type, actor /
+repo / relevance filtering) from real translation failures. A real failure
+is logged with `reason="translate_error"` and includes:
+
+- the provider
+- the failing error message
+- a UTF-8-safe snippet of the request body (capped at 4 KiB; the full body
+  is bounded by `transport.bodyReadLimit`)
+- a `body_truncated` flag when the snippet was capped
+- a vetted subset of HTTP headers (`content-type`, `user-agent`,
+  `x-github-event`, `x-github-delivery`, etc.)
+- the wire event type and delivery ID when GitHub headers are present
+
+Signature, authorization, and cookie headers are intentionally **never**
+included in the structured log — `safe_headers` is an explicit allow-list,
+not a block-list. Operators reading `~/gt/logs/telegraph.log` can therefore
+debug a flapping translator without grepping past secrets.
+
+Expected drop reasons (`unknown_event_type`, `actor_filtered`,
+`repo_filtered`, `not_relevant`) are routed through `Drop`, not
+`TranslateError`. The two paths use disjoint reason constants so an
+operator querying `reason=translate_error` sees only true failures.
+
+---
+
+## Out-of-band response
+
+Telegraph is **one-way**: provider events flow in, mail lands in the
+mayor's inbox, and that is the end of the Telegraph pipeline. Replies are
+**not** routed back through the bead/mail mechanism — there is no provider
+write-back from Mayor's reply mail. If the mayor wants to comment on a
+Jira issue, transition a status, or reply to a GitHub PR review, the
+mayor must take that action **out of band** using:
+
+- the Jira MCP tool (`mcp__atlassian__addCommentToJiraIssue`,
+  `mcp__atlassian__transitionJiraIssue`, etc.) for Jira replies.
+- the `gh` CLI or GitHub MCP for PR/issue replies.
+
+Operator-prompt templates and mail subjects must reflect this — they must
+not suggest "reply via bead" or "post a follow-up bead" as a substitute
+for the out-of-band tool.
 
 ---
 

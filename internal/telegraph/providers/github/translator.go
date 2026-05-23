@@ -22,11 +22,25 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/telegraph"
 )
+
+// MayorIdentity identifies the mayor user for GitHub relevance filtering.
+// Logins are matched case-insensitively (GitHub logins are case-preserving
+// but case-insensitive in comparison).
+//
+// An empty identity disables relevance filtering; with a populated identity,
+// events that don't pertain to the mayor return ErrNotRelevant.
+type MayorIdentity struct {
+	Logins []string
+}
+
+// HasAny reports whether the identity has at least one match target.
+func (m MayorIdentity) HasAny() bool { return len(m.Logins) > 0 }
 
 // Translator implements telegraph.Translator for GitHub webhook payloads.
 type Translator struct {
@@ -34,6 +48,8 @@ type Translator struct {
 	allowedEvent map[string]struct{} // wire-format X-GitHub-Event names operator opted in to
 	ignoreActors map[string]struct{}
 	allowedRepos map[string]struct{} // case-folded "owner/repo"; nil = no filter
+	mayor        MayorIdentity
+	mayorLC      map[string]struct{} // case-folded mayor logins
 	logger       *slog.Logger
 }
 
@@ -84,12 +100,20 @@ func ValidateEvents(events []string) error {
 //
 // secret is the HMAC-SHA256 key registered with GitHub's webhook config.
 // events is the operator's opt-in list of X-GitHub-Event wire-format names
-//   (e.g. "pull_request"); empty means "accept every supported event".
-//   Names not in SupportedWireEvents are silently ignored.
+//
+//	(e.g. "pull_request"); empty means "accept every supported event".
+//	Names not in SupportedWireEvents are silently ignored.
+//
 // ignoreActors / allowedRepos are filter sets; nil/empty disables each filter.
-//   allowedRepos entries are folded to lower-case at construction time.
+//
+//	allowedRepos entries are folded to lower-case at construction time.
+//
+// mayor is the mayor user identity used by relevance filtering. An empty
+//
+//	identity disables relevance filtering.
+//
 // logger may be nil; slog.Default() is used if so.
-func New(secret string, events []string, ignoreActors []string, allowedRepos []string, logger *slog.Logger) *Translator {
+func New(secret string, events []string, ignoreActors []string, allowedRepos []string, mayor MayorIdentity, logger *slog.Logger) *Translator {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -122,11 +146,20 @@ func New(secret string, events []string, ignoreActors []string, allowedRepos []s
 		}
 	}
 
+	mayorLC := make(map[string]struct{}, len(mayor.Logins))
+	for _, l := range mayor.Logins {
+		if l != "" {
+			mayorLC[strings.ToLower(l)] = struct{}{}
+		}
+	}
+
 	return &Translator{
 		secret:       []byte(secret),
 		allowedEvent: allowedEvent,
 		ignoreActors: actorSet,
 		allowedRepos: repoSet,
+		mayor:        mayor,
+		mayorLC:      mayorLC,
 		logger:       logger,
 	}
 }
@@ -242,22 +275,159 @@ func (t *Translator) Translate(headers map[string]string, body []byte) (*telegra
 		}
 	}
 
+	// Relevance filter: drop events that do not pertain to mayor. Only applied
+	// when a mayor identity is configured; an empty identity disables this
+	// stage so existing operator deployments without mayor.* set behave as
+	// before. wireEvent is needed to interpret involvement for check-style
+	// events that lack PR objects.
+	if t.mayor.HasAny() && !t.isRelevant(wireEvent, &p) {
+		return evt, telegraph.ErrNotRelevant
+	}
+
 	return evt, nil
 }
+
+// isRelevant reports whether the parsed GitHub payload pertains to mayor.
+//
+// Involvement is established from any of:
+//   - PR author (pull_request.user.login) == mayor
+//   - mayor in pull_request.assignees
+//   - mayor in pull_request.requested_reviewers
+//   - mayor is the sender / actor of the event (sender.login or comment author)
+//   - PR body @-mentions mayor
+//   - the triggering comment / review body @-mentions mayor
+//
+// For check_run, check_suite, and workflow_run, GitHub does not carry the PR
+// author or reviewer set on the payload — only a pull_requests stub with the
+// PR number. Without state-tracking we cannot verify mayor PR involvement
+// from the payload alone, so we apply the documented conservative rule:
+//
+//   - CI events with no PR association at all (push-to-branch, scheduled
+//     workflows) are dropped. There is no PR-author signal to filter on, so
+//     forwarding them creates org-wide CI noise.
+//   - CI events that *do* have a PR association are allowed through, on the
+//     trust boundary established by the operator's repo allow-list. This is
+//     a best-effort filter — mayor may still see CI noise on collaborators'
+//     PRs in the same repo. A stricter rule would require state, deferred.
+//
+// Operators who want all CI notifications can disable relevance filtering
+// entirely by leaving mayor.github_logins empty.
+func (t *Translator) isRelevant(wireEvent string, p *payload) bool {
+	switch wireEvent {
+	case "check_run":
+		if p.CheckRun == nil || len(p.CheckRun.PullRequests) == 0 {
+			return false
+		}
+		return true
+	case "check_suite":
+		if p.CheckSuite == nil || len(p.CheckSuite.PullRequests) == 0 {
+			return false
+		}
+		return true
+	case "workflow_run":
+		if p.WorkflowRun == nil || len(p.WorkflowRun.PullRequests) == 0 {
+			return false
+		}
+		return true
+	}
+
+	pr := p.PullRequest
+	if pr == nil && p.Issue != nil && p.Issue.PullRequest != nil {
+		// issue_comment on a PR doesn't get a pull_request object; the issue
+		// stub is what we have. We still get author/comment-author/sender from
+		// the existing fields, plus body @-mentions in comment.body.
+	}
+
+	if t.matchesLogin(senderLogin(p)) {
+		return true
+	}
+	if p.Comment != nil && t.matchesLogin(userLogin(p.Comment.User)) {
+		return true
+	}
+	if p.Review != nil && t.matchesLogin(userLogin(p.Review.User)) {
+		return true
+	}
+
+	if pr != nil {
+		if t.matchesLogin(userLogin(pr.User)) {
+			return true
+		}
+		for _, u := range pr.Assignees {
+			if t.matchesLogin(u.Login) {
+				return true
+			}
+		}
+		for _, u := range pr.RequestedReviewers {
+			if t.matchesLogin(u.Login) {
+				return true
+			}
+		}
+		if t.bodyMentionsMayor(pr.Body) {
+			return true
+		}
+	}
+
+	if p.Comment != nil && t.bodyMentionsMayor(p.Comment.Body) {
+		return true
+	}
+	if p.Review != nil && t.bodyMentionsMayor(p.Review.Body) {
+		return true
+	}
+	return false
+}
+
+// matchesLogin reports whether a GitHub login matches a configured mayor
+// login (case-insensitive). Empty input is never a match.
+func (t *Translator) matchesLogin(login string) bool {
+	if login == "" {
+		return false
+	}
+	_, ok := t.mayorLC[strings.ToLower(login)]
+	return ok
+}
+
+// bodyMentionsMayor scans a comment/review/PR body for @<login> tokens
+// matching mayor. GitHub mentions are case-insensitive, must be preceded by
+// a non-identifier character (start-of-string, whitespace, punctuation),
+// and run until the next non-identifier character. The regex below mirrors
+// GitHub's actual parser closely enough for our purposes: a "@" preceded by
+// a non-word boundary, then a login of 1–39 chars from [A-Za-z0-9-].
+func (t *Translator) bodyMentionsMayor(body string) bool {
+	if body == "" {
+		return false
+	}
+	matches := ghMentionRE.FindAllStringSubmatchIndex(body, -1)
+	for _, idx := range matches {
+		// idx[2:4] is the submatch positions of the login (group 1).
+		if idx[2] < 0 {
+			continue
+		}
+		login := body[idx[2]:idx[3]]
+		if t.matchesLogin(login) {
+			return true
+		}
+	}
+	return false
+}
+
+// ghMentionRE captures a GitHub-style @login. The leading boundary uses a
+// negative lookahead alternative implemented as a non-capturing group at the
+// start of input or a non-word rune (Go's regexp lacks lookbehind).
+var ghMentionRE = regexp.MustCompile(`(?:^|[^A-Za-z0-9_])@([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))`)
 
 // ---- internal payload types ----
 
 type payload struct {
-	Action       string       `json:"action"`
-	Sender       *ghUser      `json:"sender"`
-	Repository   *ghRepo      `json:"repository"`
-	PullRequest  *ghPR        `json:"pull_request"`
-	Issue        *ghIssue     `json:"issue"`
-	Comment      *ghComment   `json:"comment"`
-	Review       *ghReview    `json:"review"`
-	CheckRun     *ghCheckRun  `json:"check_run"`
-	CheckSuite   *ghCheckSuite `json:"check_suite"`
-	WorkflowRun  *ghWorkflowRun `json:"workflow_run"`
+	Action      string         `json:"action"`
+	Sender      *ghUser        `json:"sender"`
+	Repository  *ghRepo        `json:"repository"`
+	PullRequest *ghPR          `json:"pull_request"`
+	Issue       *ghIssue       `json:"issue"`
+	Comment     *ghComment     `json:"comment"`
+	Review      *ghReview      `json:"review"`
+	CheckRun    *ghCheckRun    `json:"check_run"`
+	CheckSuite  *ghCheckSuite  `json:"check_suite"`
+	WorkflowRun *ghWorkflowRun `json:"workflow_run"`
 }
 
 type ghUser struct {
@@ -275,17 +445,19 @@ type ghRepo struct {
 // strings on demand is the same pattern the Jira translator uses.
 
 type ghPR struct {
-	Number    int       `json:"number"`
-	HTMLURL   string    `json:"html_url"`
-	Title     string    `json:"title"`
-	Body      string    `json:"body"`
-	State     string    `json:"state"`
-	Merged    bool      `json:"merged"`
-	MergedAt  string    `json:"merged_at"`
-	UpdatedAt string    `json:"updated_at"`
-	User      *ghUser   `json:"user"`
-	Labels    []ghLabel `json:"labels"`
-	Head      *ghRef    `json:"head"`
+	Number             int       `json:"number"`
+	HTMLURL            string    `json:"html_url"`
+	Title              string    `json:"title"`
+	Body               string    `json:"body"`
+	State              string    `json:"state"`
+	Merged             bool      `json:"merged"`
+	MergedAt           string    `json:"merged_at"`
+	UpdatedAt          string    `json:"updated_at"`
+	User               *ghUser   `json:"user"`
+	Labels             []ghLabel `json:"labels"`
+	Head               *ghRef    `json:"head"`
+	Assignees          []ghUser  `json:"assignees"`
+	RequestedReviewers []ghUser  `json:"requested_reviewers"`
 }
 
 type ghIssue struct {

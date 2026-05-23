@@ -134,6 +134,7 @@ listen_addr = ":7777"
 func TestValidate_Valid(t *testing.T) {
 	t.Parallel()
 	cfg := telegraph.DefaultConfig()
+	cfg.Telegraph.Mayor = telegraph.MayorConfig{JiraAccountIDs: []string{"acct-1"}}
 	cfg.Telegraph.Providers["jira"] = &telegraph.ProviderConfig{
 		Enabled:   true,
 		SecretEnv: "GT_JIRA_SECRET",
@@ -390,6 +391,7 @@ func TestValidate_RejectsEmptyRepoEntry(t *testing.T) {
 func TestValidate_RepoFilterOptional(t *testing.T) {
 	t.Parallel()
 	cfg := telegraph.DefaultConfig()
+	cfg.Telegraph.Mayor = telegraph.MayorConfig{GitHubLogins: []string{"artie"}}
 	cfg.Telegraph.Providers["github"] = &telegraph.ProviderConfig{
 		Enabled:   true,
 		SecretEnv: "GT_GITHUB_SECRET",

@@ -81,6 +81,9 @@ buffer_size = 256
 nudge_window = "30s"
 body_cap = 4096
 
+[telegraph.mayor]
+jira_account_ids = ["test-acct"]
+
 [telegraph.providers.jira]
 enabled = true
 secret_env = %q
@@ -115,6 +118,9 @@ listen_addr = ":0"
 buffer_size = 64
 nudge_window = "0s"
 body_cap = 4096
+
+[telegraph.mayor]
+jira_usernames = ["alice"]
 
 [telegraph.providers.jira]
 enabled = true
@@ -209,6 +215,8 @@ events = ["jira:issue_created"]
 }
 
 // telegraphTestIssueCreated builds a minimal Jira issue_created JSON payload.
+// The assignee is set to the actor so the relevance filter routes the event
+// through delivery when the test's mayor identity includes that actor.
 func telegraphTestIssueCreated(key, actor, summary, description string) []byte {
 	p := map[string]any{
 		"timestamp":    time.Date(2026, 4, 19, 12, 0, 0, 0, time.UTC).UnixMilli(),
@@ -221,6 +229,7 @@ func telegraphTestIssueCreated(key, actor, summary, description string) []byte {
 				"summary":     summary,
 				"description": description,
 				"labels":      []string{},
+				"assignee":    map[string]string{"name": actor},
 			},
 		},
 	}

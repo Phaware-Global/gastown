@@ -23,6 +23,16 @@
 # prompt_cap (default 2048 bytes) is set in the main telegraph.toml:
 #   [telegraph]
 #   prompt_cap = 2048
+#
+# IMPORTANT: Telegraph is one-way. Provider events flow IN, mail lands in
+# Mayor's inbox, and that is the end of the pipeline. Replies do NOT route
+# back through Telegraph — there is no return-channel translator. Your
+# prompt templates must direct Mayor to act OUT OF BAND:
+#   - Jira: use the Atlassian MCP tools (addCommentToJiraIssue,
+#     transitionJiraIssue, etc.).
+#   - GitHub: use the `gh` CLI or GitHub MCP (gh pr comment / gh pr review).
+# Do NOT instruct Mayor to "reply via bead" or "draft a follow-up bead" —
+# those replies have no path back to the provider.
 
 [telegraph.prompts]
 

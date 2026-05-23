@@ -23,7 +23,7 @@ func makeHMAC(body []byte) string {
 }
 
 func newTranslator() *jira.Translator {
-	return jira.New(testSecret, nil, nil)
+	return jira.New(testSecret, nil, jira.MayorIdentity{}, nil)
 }
 
 // ---- Authenticate ----
@@ -49,7 +49,7 @@ func TestAuthenticate_MissingHeader(t *testing.T) {
 
 func TestAuthenticate_WrongSecret(t *testing.T) {
 	t.Parallel()
-	tr := jira.New("wrong-secret", nil, nil)
+	tr := jira.New("wrong-secret", nil, jira.MayorIdentity{}, nil)
 	body := []byte(`{"webhookEvent":"jira:issue_created"}`)
 	headers := map[string]string{"x-hub-signature": makeHMAC(body)}
 	err := tr.Authenticate(headers, body)
@@ -542,7 +542,7 @@ func mustMarshalAny(v any) []byte {
 
 func TestActorFilter_EmptyIgnoreActors_NoFilter(t *testing.T) {
 	t.Parallel()
-	tr := jira.New(testSecret, []string{}, nil)
+	tr := jira.New(testSecret, []string{}, jira.MayorIdentity{}, nil)
 	body := mustMarshalAny(issuePayload{
 		Timestamp:    1713571200000,
 		WebhookEvent: "jira:comment_added",
@@ -565,7 +565,7 @@ func TestActorFilter_EmptyIgnoreActors_NoFilter(t *testing.T) {
 
 func TestActorFilter_NonMatchingActor_NoFilter(t *testing.T) {
 	t.Parallel()
-	tr := jira.New(testSecret, []string{"Artie"}, nil)
+	tr := jira.New(testSecret, []string{"Artie"}, jira.MayorIdentity{}, nil)
 	body := mustMarshalAny(issuePayload{
 		Timestamp:    1713571200000,
 		WebhookEvent: "jira:comment_added",
@@ -588,7 +588,7 @@ func TestActorFilter_NonMatchingActor_NoFilter(t *testing.T) {
 
 func TestActorFilter_MatchingActor_CommentAdded(t *testing.T) {
 	t.Parallel()
-	tr := jira.New(testSecret, []string{"Artie"}, nil)
+	tr := jira.New(testSecret, []string{"Artie"}, jira.MayorIdentity{}, nil)
 	body := mustMarshalAny(issuePayload{
 		Timestamp:    1713571200000,
 		WebhookEvent: "jira:comment_added",
@@ -615,7 +615,7 @@ func TestActorFilter_MatchingActor_CommentAdded(t *testing.T) {
 
 func TestActorFilter_MatchingActor_IssueUpdated(t *testing.T) {
 	t.Parallel()
-	tr := jira.New(testSecret, []string{"Artie"}, nil)
+	tr := jira.New(testSecret, []string{"Artie"}, jira.MayorIdentity{}, nil)
 	body := mustMarshalAny(issuePayload{
 		Timestamp:    1713571200000,
 		WebhookEvent: "jira:issue_updated",
@@ -636,10 +636,262 @@ func TestActorFilter_MatchingActor_IssueUpdated(t *testing.T) {
 	}
 }
 
+// ---- Mayor relevance filtering ----
+
+// withAssignee returns a base issue with an assignee block. accountId or name
+// can be empty to exercise different match paths.
+func issueWithAssignee(key, assigneeName, assigneeAccountID, assigneeDisplay string) map[string]any {
+	issue := baseIssue(key)
+	fields := issue["fields"].(map[string]any)
+	fields["assignee"] = map[string]any{
+		"name":        assigneeName,
+		"displayName": assigneeDisplay,
+		"accountId":   assigneeAccountID,
+	}
+	return issue
+}
+
+const (
+	mayorAcctID   = "712020:abcd-1234"
+	mayorUserName = "Artie"
+)
+
+// mayorJiraIdentity is reused across the relevance tests.
+func mayorJiraIdentity() jira.MayorIdentity {
+	return jira.MayorIdentity{
+		AccountIDs: []string{mayorAcctID},
+		Usernames:  []string{mayorUserName},
+	}
+}
+
+func TestRelevance_NoMayorIdentity_AllRelevant(t *testing.T) {
+	t.Parallel()
+	// With an empty identity, the translator must not apply relevance filtering
+	// — preserves backward compatibility for operators who don't configure mayor.
+	tr := jira.New(testSecret, nil, jira.MayorIdentity{}, nil)
+	body := mustMarshal(t, issuePayload{
+		Timestamp:    1713571200000,
+		WebhookEvent: "jira:issue_created",
+		User:         baseUser("someoneElse"),
+		Issue:        baseIssue("PROJ-1000"),
+	})
+	if _, err := tr.Translate(nil, body); err != nil {
+		t.Fatalf("Translate: %v, want nil (relevance disabled with empty identity)", err)
+	}
+}
+
+func TestRelevance_IssueCreated_AssignedToMayor_Delivered(t *testing.T) {
+	t.Parallel()
+	tr := jira.New(testSecret, nil, mayorJiraIdentity(), nil)
+	body := mustMarshal(t, issuePayload{
+		Timestamp:    1713571200000,
+		WebhookEvent: "jira:issue_created",
+		User:         baseUser("alice"),
+		Issue:        issueWithAssignee("PROJ-100", "", mayorAcctID, "Artie"),
+	})
+	evt, err := tr.Translate(nil, body)
+	if err != nil {
+		t.Fatalf("Translate: %v, want nil (mayor is the assignee)", err)
+	}
+	if evt == nil {
+		t.Fatal("expected non-nil event")
+	}
+}
+
+func TestRelevance_IssueCreated_AssignedToOther_Dropped(t *testing.T) {
+	t.Parallel()
+	tr := jira.New(testSecret, nil, mayorJiraIdentity(), nil)
+	body := mustMarshal(t, issuePayload{
+		Timestamp:    1713571200000,
+		WebhookEvent: "jira:issue_created",
+		User:         baseUser("alice"),
+		Issue:        issueWithAssignee("PROJ-101", "", "712020:other-acct", "Someone Else"),
+	})
+	evt, err := tr.Translate(nil, body)
+	if !errors.Is(err, telegraph.ErrNotRelevant) {
+		t.Fatalf("Translate: err = %v, want ErrNotRelevant", err)
+	}
+	if evt == nil {
+		t.Fatal("ErrNotRelevant must return non-nil event for audit log")
+	}
+	if evt.Subject != "PROJ-101" {
+		t.Errorf("Subject = %q, want PROJ-101 (audit context preserved)", evt.Subject)
+	}
+}
+
+func TestRelevance_IssueUpdated_AssignmentChangelogToMayor_Delivered(t *testing.T) {
+	t.Parallel()
+	// The fields.assignee may not reflect the new assignment yet — the
+	// changelog item is the canonical assignment signal.
+	tr := jira.New(testSecret, nil, mayorJiraIdentity(), nil)
+	body := mustMarshal(t, issuePayload{
+		Timestamp:    1713571200000,
+		WebhookEvent: "jira:issue_updated",
+		User:         baseUser("alice"),
+		Issue:        baseIssue("PROJ-102"), // no assignee in snapshot
+		Changelog: map[string]any{
+			"items": []map[string]any{
+				{"field": "assignee", "fromString": "Bob", "toString": "Artie"},
+			},
+		},
+	})
+	evt, err := tr.Translate(nil, body)
+	if err != nil {
+		t.Fatalf("Translate: %v, want nil (assigned to mayor via changelog)", err)
+	}
+	if evt == nil {
+		t.Fatal("expected non-nil event")
+	}
+}
+
+func TestRelevance_IssueUpdated_AssignmentChangelogToOther_Dropped(t *testing.T) {
+	t.Parallel()
+	tr := jira.New(testSecret, nil, mayorJiraIdentity(), nil)
+	body := mustMarshal(t, issuePayload{
+		Timestamp:    1713571200000,
+		WebhookEvent: "jira:issue_updated",
+		User:         baseUser("alice"),
+		Issue:        baseIssue("PROJ-103"),
+		Changelog: map[string]any{
+			"items": []map[string]any{
+				{"field": "assignee", "fromString": "Artie", "toString": "Bob"},
+			},
+		},
+	})
+	_, err := tr.Translate(nil, body)
+	if !errors.Is(err, telegraph.ErrNotRelevant) {
+		t.Fatalf("Translate: err = %v, want ErrNotRelevant (unassigned from mayor)", err)
+	}
+}
+
+func TestRelevance_IssueUpdated_OnMayorAssignedIssue_Delivered(t *testing.T) {
+	t.Parallel()
+	// Non-assignment update on an issue already assigned to mayor.
+	tr := jira.New(testSecret, nil, mayorJiraIdentity(), nil)
+	body := mustMarshal(t, issuePayload{
+		Timestamp:    1713571200000,
+		WebhookEvent: "jira:issue_updated",
+		User:         baseUser("alice"),
+		Issue:        issueWithAssignee("PROJ-104", "", mayorAcctID, "Artie"),
+		Changelog: map[string]any{
+			"items": []map[string]any{
+				{"field": "status", "fromString": "Open", "toString": "Done"},
+			},
+		},
+	})
+	if _, err := tr.Translate(nil, body); err != nil {
+		t.Fatalf("Translate: %v, want nil (status change on mayor-assigned issue)", err)
+	}
+}
+
+func TestRelevance_CommentOnMayorAssignedIssue_Delivered(t *testing.T) {
+	t.Parallel()
+	tr := jira.New(testSecret, nil, mayorJiraIdentity(), nil)
+	body := mustMarshal(t, map[string]any{
+		"timestamp":    1713571200000,
+		"webhookEvent": "comment_created",
+		"issue":        issueWithAssignee("PROJ-105", "", mayorAcctID, "Artie"),
+		"comment": map[string]any{
+			"id":     "c-1",
+			"author": baseUser("alice"),
+			"body":   "Some comment on Artie's issue.",
+		},
+	})
+	if _, err := tr.Translate(nil, body); err != nil {
+		t.Fatalf("Translate: %v, want nil (comment on mayor's issue)", err)
+	}
+}
+
+func TestRelevance_CommentMentionMayor_ByAccountID_Delivered(t *testing.T) {
+	t.Parallel()
+	tr := jira.New(testSecret, nil, mayorJiraIdentity(), nil)
+	body := mustMarshal(t, map[string]any{
+		"timestamp":    1713571200000,
+		"webhookEvent": "comment_created",
+		"issue":        baseIssue("PROJ-106"), // unassigned
+		"comment": map[string]any{
+			"id":     "c-2",
+			"author": baseUser("alice"),
+			"body":   "Hey [~accountid:712020:abcd-1234] — please look.",
+		},
+	})
+	if _, err := tr.Translate(nil, body); err != nil {
+		t.Fatalf("Translate: %v, want nil (@-mention by accountId)", err)
+	}
+}
+
+func TestRelevance_CommentMentionMayor_ByUsername_Delivered(t *testing.T) {
+	t.Parallel()
+	tr := jira.New(testSecret, nil, mayorJiraIdentity(), nil)
+	body := mustMarshal(t, map[string]any{
+		"timestamp":    1713571200000,
+		"webhookEvent": "comment_created",
+		"issue":        baseIssue("PROJ-107"),
+		"comment": map[string]any{
+			"id":     "c-3",
+			"author": baseUser("alice"),
+			"body":   "Pinging [~Artie] for visibility.",
+		},
+	})
+	if _, err := tr.Translate(nil, body); err != nil {
+		t.Fatalf("Translate: %v, want nil (@-mention by username)", err)
+	}
+}
+
+func TestRelevance_CommentOnOtherIssue_NoMention_Dropped(t *testing.T) {
+	t.Parallel()
+	tr := jira.New(testSecret, nil, mayorJiraIdentity(), nil)
+	body := mustMarshal(t, map[string]any{
+		"timestamp":    1713571200000,
+		"webhookEvent": "comment_created",
+		"issue":        issueWithAssignee("PROJ-108", "", "712020:other", "Other"),
+		"comment": map[string]any{
+			"id":     "c-4",
+			"author": baseUser("alice"),
+			"body":   "Unrelated chatter.",
+		},
+	})
+	evt, err := tr.Translate(nil, body)
+	if !errors.Is(err, telegraph.ErrNotRelevant) {
+		t.Fatalf("Translate: err = %v, want ErrNotRelevant", err)
+	}
+	if evt == nil {
+		t.Fatal("expected non-nil event for audit log")
+	}
+}
+
+func TestRelevance_AssigneeUsernameMatch_CaseInsensitive(t *testing.T) {
+	t.Parallel()
+	tr := jira.New(testSecret, nil, jira.MayorIdentity{Usernames: []string{"artie"}}, nil)
+	body := mustMarshal(t, issuePayload{
+		Timestamp:    1713571200000,
+		WebhookEvent: "jira:issue_created",
+		User:         baseUser("alice"),
+		Issue:        issueWithAssignee("PROJ-109", "Artie", "", ""),
+	})
+	if _, err := tr.Translate(nil, body); err != nil {
+		t.Fatalf("Translate: %v, want nil (case-insensitive username match)", err)
+	}
+}
+
+func TestRelevance_UnknownEventType_NotShadowedByRelevance(t *testing.T) {
+	t.Parallel()
+	// Make sure ErrUnknownEventType still wins over relevance filtering — the
+	// dispatcher uses different drop reasons for the two.
+	tr := jira.New(testSecret, nil, mayorJiraIdentity(), nil)
+	body := mustMarshal(t, map[string]any{
+		"webhookEvent": "jira:sprint_started",
+		"issue":        baseIssue("PROJ-110"),
+	})
+	if _, err := tr.Translate(nil, body); !errors.Is(err, telegraph.ErrUnknownEventType) {
+		t.Errorf("Translate: err = %v, want ErrUnknownEventType", err)
+	}
+}
+
 func TestActorFilter_CaseSensitive_MixedCaseNoMatch(t *testing.T) {
 	t.Parallel()
 	// Filter has lowercase "artie", actor is "Artie" — no match expected.
-	tr := jira.New(testSecret, []string{"artie"}, nil)
+	tr := jira.New(testSecret, []string{"artie"}, jira.MayorIdentity{}, nil)
 	body := mustMarshalAny(issuePayload{
 		Timestamp:    1713571200000,
 		WebhookEvent: "jira:comment_added",
