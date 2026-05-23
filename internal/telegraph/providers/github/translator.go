@@ -12,13 +12,18 @@
 // X-GitHub-Event header (e.g. "pull_request_review"); the action sub-type
 // lives in the JSON body's "action" field. The translator combines those
 // two values to choose a normalized event type.
+//
+// Payload parsing: webhook bodies are decoded by github.com/google/go-github
+// — its typed event/struct definitions are the canonical schema and pick up
+// new GitHub fields automatically. We retain our own HMAC verification
+// rather than swapping to github.ValidateSignature; the indirection saves
+// nothing while requiring our test fixtures to match the SDK's expectations.
 package github
 
 import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -26,6 +31,7 @@ import (
 	"strings"
 	"time"
 
+	gogithub "github.com/google/go-github/v68/github"
 	"github.com/steveyegge/gastown/internal/telegraph"
 )
 
@@ -210,7 +216,9 @@ func (t *Translator) Authenticate(headers map[string]string, body []byte) error 
 //
 // Returns (non-nil event, ErrRepoFiltered) when the repository is not in the
 // allow-list; (non-nil event, ErrActorFiltered) when the actor is in the
-// ignore list. Both are silent drops at L3 with audit logging at the dispatcher.
+// ignore list; (non-nil event, ErrNotRelevant) when the event does not
+// pertain to the mayor. All three are silent drops at L3 with audit
+// logging at the dispatcher.
 func (t *Translator) Translate(headers map[string]string, body []byte) (*telegraph.NormalizedEvent, error) {
 	wireEvent := headers["x-github-event"]
 	deliveryID := headers["x-github-delivery"]
@@ -229,30 +237,49 @@ func (t *Translator) Translate(headers map[string]string, body []byte) (*telegra
 		}
 	}
 
-	var p payload
-	if err := json.Unmarshal(body, &p); err != nil {
+	// Pre-gate on SupportedWireEvents so a wire event we don't translate
+	// (ping, future GitHub event types, typos) returns ErrUnknownEventType
+	// rather than a translate_error from the SDK's "unknown X-Github-Event"
+	// error. The allowedEvent check above only fires when the operator
+	// supplied an events list — without it, ParseWebHook would otherwise be
+	// the first gate and would log noise on harmless deliveries like ping.
+	if !isSupportedWireEvent(wireEvent) {
+		t.logger.Info("telegraph: unknown github wire event",
+			"wire_event", wireEvent, "delivery_id", deliveryID)
+		return nil, telegraph.ErrUnknownEventType
+	}
+
+	parsed, err := gogithub.ParseWebHook(wireEvent, body)
+	if err != nil {
 		return nil, fmt.Errorf("github: parsing webhook payload: %w", err)
 	}
 
 	var (
-		evt *telegraph.NormalizedEvent
-		err error
+		evt    *telegraph.NormalizedEvent
+		action string
 	)
-	switch wireEvent {
-	case "pull_request":
-		evt, err = translatePullRequest(&p, deliveryID)
-	case "pull_request_review":
-		evt, err = translatePullRequestReview(&p, deliveryID)
-	case "pull_request_review_comment":
-		evt, err = translatePullRequestReviewComment(&p, deliveryID)
-	case "issue_comment":
-		evt, err = translateIssueComment(&p, deliveryID)
-	case "check_run":
-		evt, err = translateCheckRun(&p, deliveryID)
-	case "check_suite":
-		evt, err = translateCheckSuite(&p, deliveryID)
-	case "workflow_run":
-		evt, err = translateWorkflowRun(&p, deliveryID)
+	switch e := parsed.(type) {
+	case *gogithub.PullRequestEvent:
+		action = e.GetAction()
+		evt, err = translatePullRequest(e, deliveryID)
+	case *gogithub.PullRequestReviewEvent:
+		action = e.GetAction()
+		evt, err = translatePullRequestReview(e, deliveryID)
+	case *gogithub.PullRequestReviewCommentEvent:
+		action = e.GetAction()
+		evt, err = translatePullRequestReviewComment(e, deliveryID)
+	case *gogithub.IssueCommentEvent:
+		action = e.GetAction()
+		evt, err = translateIssueComment(e, deliveryID)
+	case *gogithub.CheckRunEvent:
+		action = e.GetAction()
+		evt, err = translateCheckRun(e, deliveryID)
+	case *gogithub.CheckSuiteEvent:
+		action = e.GetAction()
+		evt, err = translateCheckSuite(e, deliveryID)
+	case *gogithub.WorkflowRunEvent:
+		action = e.GetAction()
+		evt, err = translateWorkflowRun(e, deliveryID)
 	default:
 		t.logger.Info("telegraph: unknown github wire event",
 			"wire_event", wireEvent, "delivery_id", deliveryID)
@@ -261,7 +288,7 @@ func (t *Translator) Translate(headers map[string]string, body []byte) (*telegra
 
 	if errors.Is(err, telegraph.ErrUnknownEventType) {
 		t.logger.Info("telegraph: github action not in scope",
-			"wire_event", wireEvent, "action", p.Action, "delivery_id", deliveryID)
+			"wire_event", wireEvent, "action", action, "delivery_id", deliveryID)
 		return nil, telegraph.ErrUnknownEventType
 	}
 	if err != nil {
@@ -270,7 +297,7 @@ func (t *Translator) Translate(headers map[string]string, body []byte) (*telegra
 
 	// Repo filter: GitHub repository.full_name is the canonical "owner/repo".
 	if t.allowedRepos != nil {
-		repoName := strings.ToLower(repoFullName(&p))
+		repoName := strings.ToLower(eventRepoFullName(parsed))
 		if repoName == "" {
 			// No repo on the payload — treat as filtered (we cannot enforce the
 			// allow-list, so default to drop rather than leak).
@@ -290,17 +317,27 @@ func (t *Translator) Translate(headers map[string]string, body []byte) (*telegra
 
 	// Relevance filter: drop events that do not pertain to mayor. Only applied
 	// when a mayor identity is configured; an empty identity disables this
-	// stage so existing operator deployments without mayor.* set behave as
-	// before. wireEvent is needed to interpret involvement for check-style
-	// events that lack PR objects.
-	if t.mayor.HasAny() && !t.isRelevant(wireEvent, &p) {
+	// stage so tests / library callers behave predictably without it.
+	if t.mayor.HasAny() && !t.isRelevant(parsed) {
 		return evt, telegraph.ErrNotRelevant
 	}
 
 	return evt, nil
 }
 
-// isRelevant reports whether the parsed GitHub payload pertains to mayor.
+// isSupportedWireEvent reports whether wireEvent is one this translator
+// understands. Used to gate ParseWebHook so unknown/future GitHub events
+// route through ErrUnknownEventType rather than the SDK's parse error.
+func isSupportedWireEvent(wireEvent string) bool {
+	for _, e := range SupportedWireEvents {
+		if e == wireEvent {
+			return true
+		}
+	}
+	return false
+}
+
+// isRelevant reports whether the parsed GitHub event pertains to mayor.
 //
 // Involvement is established from any of:
 //   - PR author (pull_request.user.login) == mayor
@@ -309,11 +346,12 @@ func (t *Translator) Translate(headers map[string]string, body []byte) (*telegra
 //   - mayor is the sender / actor of the event (sender.login or comment author)
 //   - PR body @-mentions mayor
 //   - the triggering comment / review body @-mentions mayor
+//   - issue_comment on a PR where mayor is author or assignee
 //
 // For check_run, check_suite, and workflow_run, GitHub does not carry the PR
-// author or reviewer set on the payload — only a pull_requests stub with the
-// PR number. Without state-tracking we cannot verify mayor PR involvement
-// from the payload alone, so we apply the documented conservative rule:
+// author or reviewer set on the payload — only a PR stub with the number.
+// Without state-tracking we cannot verify mayor PR involvement from the
+// payload alone, so we apply the documented conservative rule:
 //
 //   - CI events with no PR association at all (push-to-branch, scheduled
 //     workflows) are dropped. There is no PR-author signal to filter on, so
@@ -322,84 +360,93 @@ func (t *Translator) Translate(headers map[string]string, body []byte) (*telegra
 //     trust boundary established by the operator's repo allow-list. This is
 //     a best-effort filter — mayor may still see CI noise on collaborators'
 //     PRs in the same repo. A stricter rule would require state, deferred.
-//
-// Relevance filtering is enforced in production: config validation
-// requires a non-empty mayor.github_logins when the provider is enabled.
-// The "empty identity disables filtering" branch in this translator is a
-// test-only seam — production deployments never hit it because Validate()
-// rejects an empty identity before the daemon starts.
-func (t *Translator) isRelevant(wireEvent string, p *payload) bool {
-	switch wireEvent {
-	case "check_run":
-		if p.CheckRun == nil || len(p.CheckRun.PullRequests) == 0 {
-			return false
-		}
-		return true
-	case "check_suite":
-		if p.CheckSuite == nil || len(p.CheckSuite.PullRequests) == 0 {
-			return false
-		}
-		return true
-	case "workflow_run":
-		if p.WorkflowRun == nil || len(p.WorkflowRun.PullRequests) == 0 {
-			return false
-		}
-		return true
-	}
+func (t *Translator) isRelevant(parsed interface{}) bool {
+	switch e := parsed.(type) {
+	case *gogithub.CheckRunEvent:
+		return e.GetCheckRun() != nil && len(e.GetCheckRun().PullRequests) > 0
+	case *gogithub.CheckSuiteEvent:
+		return e.GetCheckSuite() != nil && len(e.GetCheckSuite().PullRequests) > 0
+	case *gogithub.WorkflowRunEvent:
+		return e.GetWorkflowRun() != nil && len(e.GetWorkflowRun().PullRequests) > 0
 
-	if t.matchesLogin(senderLogin(p)) {
-		return true
-	}
-	if p.Comment != nil && t.matchesLogin(userLogin(p.Comment.User)) {
-		return true
-	}
-	if p.Review != nil && t.matchesLogin(userLogin(p.Review.User)) {
-		return true
-	}
+	case *gogithub.PullRequestEvent:
+		return t.matchesLogin(e.GetSender().GetLogin()) ||
+			t.prInvolvesMayor(e.GetPullRequest())
 
-	if pr := p.PullRequest; pr != nil {
-		if t.matchesLogin(userLogin(pr.User)) {
+	case *gogithub.PullRequestReviewEvent:
+		if t.matchesLogin(e.GetSender().GetLogin()) {
 			return true
 		}
-		for _, u := range pr.Assignees {
-			if t.matchesLogin(u.Login) {
+		if t.matchesLogin(e.GetReview().GetUser().GetLogin()) {
+			return true
+		}
+		if t.prInvolvesMayor(e.GetPullRequest()) {
+			return true
+		}
+		return t.bodyMentionsMayor(e.GetReview().GetBody())
+
+	case *gogithub.PullRequestReviewCommentEvent:
+		if t.matchesLogin(e.GetSender().GetLogin()) {
+			return true
+		}
+		if t.matchesLogin(e.GetComment().GetUser().GetLogin()) {
+			return true
+		}
+		if t.prInvolvesMayor(e.GetPullRequest()) {
+			return true
+		}
+		return t.bodyMentionsMayor(e.GetComment().GetBody())
+
+	case *gogithub.IssueCommentEvent:
+		if t.matchesLogin(e.GetSender().GetLogin()) {
+			return true
+		}
+		if t.matchesLogin(e.GetComment().GetUser().GetLogin()) {
+			return true
+		}
+		// issue_comment on a PR carries the PR author in issue.user, PR
+		// assignees in issue.assignees, and the PR description in issue.body
+		// (GitHub's webhook never inlines the full pull_request object on
+		// issue_comment deliveries). Check all three to stay consistent with
+		// PullRequestEvent's prInvolvesMayor coverage.
+		if iss := e.GetIssue(); iss != nil && iss.IsPullRequest() {
+			if t.matchesLogin(iss.GetUser().GetLogin()) {
+				return true
+			}
+			for _, u := range iss.Assignees {
+				if t.matchesLogin(u.GetLogin()) {
+					return true
+				}
+			}
+			if t.bodyMentionsMayor(iss.GetBody()) {
 				return true
 			}
 		}
-		for _, u := range pr.RequestedReviewers {
-			if t.matchesLogin(u.Login) {
-				return true
-			}
-		}
-		if t.bodyMentionsMayor(pr.Body) {
-			return true
-		}
-	}
-
-	// issue_comment on a PR carries the PR author in issue.user and PR
-	// assignees in issue.assignees (GitHub's webhook never inlines the
-	// full pull_request object on issue_comment deliveries). Without
-	// these checks, comments on a Mayor-authored or Mayor-assigned PR
-	// by other users — and without an @-mention — would be dropped as
-	// not_relevant.
-	if p.Issue != nil && p.Issue.PullRequest != nil {
-		if t.matchesLogin(userLogin(p.Issue.User)) {
-			return true
-		}
-		for _, u := range p.Issue.Assignees {
-			if t.matchesLogin(u.Login) {
-				return true
-			}
-		}
-	}
-
-	if p.Comment != nil && t.bodyMentionsMayor(p.Comment.Body) {
-		return true
-	}
-	if p.Review != nil && t.bodyMentionsMayor(p.Review.Body) {
-		return true
+		return t.bodyMentionsMayor(e.GetComment().GetBody())
 	}
 	return false
+}
+
+// prInvolvesMayor reports whether mayor is the author, an assignee, a
+// requested reviewer, or @-mentioned in the body of a PR.
+func (t *Translator) prInvolvesMayor(pr *gogithub.PullRequest) bool {
+	if pr == nil {
+		return false
+	}
+	if t.matchesLogin(pr.GetUser().GetLogin()) {
+		return true
+	}
+	for _, u := range pr.Assignees {
+		if t.matchesLogin(u.GetLogin()) {
+			return true
+		}
+	}
+	for _, u := range pr.RequestedReviewers {
+		if t.matchesLogin(u.GetLogin()) {
+			return true
+		}
+	}
+	return t.bodyMentionsMayor(pr.GetBody())
 }
 
 // matchesLogin reports whether a GitHub login matches a configured mayor
@@ -424,7 +471,6 @@ func (t *Translator) bodyMentionsMayor(body string) bool {
 	}
 	matches := ghMentionRE.FindAllStringSubmatchIndex(body, -1)
 	for _, idx := range matches {
-		// idx[2:4] is the submatch positions of the login (group 1).
 		if idx[2] < 0 {
 			continue
 		}
@@ -437,189 +483,55 @@ func (t *Translator) bodyMentionsMayor(body string) bool {
 }
 
 // ghMentionRE captures a GitHub-style @login. The leading boundary uses a
-// negative lookahead alternative implemented as a non-capturing group at the
-// start of input or a non-word rune (Go's regexp lacks lookbehind).
+// non-capturing group at the start of input or a non-word rune (Go's
+// regexp lacks lookbehind).
 var ghMentionRE = regexp.MustCompile(`(?:^|[^A-Za-z0-9_])@([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))`)
-
-// ---- internal payload types ----
-
-type payload struct {
-	Action      string         `json:"action"`
-	Sender      *ghUser        `json:"sender"`
-	Repository  *ghRepo        `json:"repository"`
-	PullRequest *ghPR          `json:"pull_request"`
-	Issue       *ghIssue       `json:"issue"`
-	Comment     *ghComment     `json:"comment"`
-	Review      *ghReview      `json:"review"`
-	CheckRun    *ghCheckRun    `json:"check_run"`
-	CheckSuite  *ghCheckSuite  `json:"check_suite"`
-	WorkflowRun *ghWorkflowRun `json:"workflow_run"`
-}
-
-type ghUser struct {
-	Login string `json:"login"`
-}
-
-type ghRepo struct {
-	FullName string `json:"full_name"`
-	HTMLURL  string `json:"html_url"`
-}
-
-// Time fields are kept as strings — GitHub sends them as RFC3339 timestamps
-// or JSON null depending on the entity's state (e.g. merged_at is null on an
-// open PR). Decoding null into time.Time is fragile across Go versions; parsing
-// strings on demand is the same pattern the Jira translator uses.
-
-type ghPR struct {
-	Number             int       `json:"number"`
-	HTMLURL            string    `json:"html_url"`
-	Title              string    `json:"title"`
-	Body               string    `json:"body"`
-	State              string    `json:"state"`
-	Merged             bool      `json:"merged"`
-	MergedAt           string    `json:"merged_at"`
-	UpdatedAt          string    `json:"updated_at"`
-	User               *ghUser   `json:"user"`
-	Labels             []ghLabel `json:"labels"`
-	Head               *ghRef    `json:"head"`
-	Assignees          []ghUser  `json:"assignees"`
-	RequestedReviewers []ghUser  `json:"requested_reviewers"`
-}
-
-type ghIssue struct {
-	Number      int       `json:"number"`
-	HTMLURL     string    `json:"html_url"`
-	Title       string    `json:"title"`
-	State       string    `json:"state"`
-	UpdatedAt   string    `json:"updated_at"`
-	Labels      []ghLabel `json:"labels"`
-	PullRequest *ghPRRef  `json:"pull_request"` // present iff this issue *is* a PR
-	User        *ghUser   `json:"user"`         // PR author when this issue is a PR
-	Assignees   []ghUser  `json:"assignees"`    // PR assignees when this issue is a PR
-}
-
-type ghPRRef struct {
-	HTMLURL string `json:"html_url"`
-}
-
-type ghComment struct {
-	ID        int64   `json:"id"`
-	HTMLURL   string  `json:"html_url"`
-	Body      string  `json:"body"`
-	Path      string  `json:"path,omitempty"`
-	User      *ghUser `json:"user"`
-	UpdatedAt string  `json:"updated_at"`
-	CreatedAt string  `json:"created_at"`
-}
-
-type ghReview struct {
-	ID          int64   `json:"id"`
-	HTMLURL     string  `json:"html_url"`
-	State       string  `json:"state"` // approved | changes_requested | commented | dismissed
-	Body        string  `json:"body"`
-	User        *ghUser `json:"user"`
-	SubmittedAt string  `json:"submitted_at"`
-}
-
-type ghCheckRun struct {
-	ID           int64            `json:"id"`
-	Name         string           `json:"name"`
-	HTMLURL      string           `json:"html_url"`
-	Status       string           `json:"status"`     // queued | in_progress | completed
-	Conclusion   string           `json:"conclusion"` // success | failure | timed_out | ...
-	HeadSHA      string           `json:"head_sha"`
-	CompletedAt  string           `json:"completed_at"`
-	PullRequests []ghPRStub       `json:"pull_requests"`
-	CheckSuite   *ghCheckSuiteRef `json:"check_suite"`
-}
-
-type ghCheckSuite struct {
-	ID           int64      `json:"id"`
-	HeadSHA      string     `json:"head_sha"`
-	Status       string     `json:"status"`
-	Conclusion   string     `json:"conclusion"`
-	UpdatedAt    string     `json:"updated_at"`
-	PullRequests []ghPRStub `json:"pull_requests"`
-}
-
-type ghCheckSuiteRef struct {
-	ID         int64  `json:"id"`
-	HeadSHA    string `json:"head_sha"`
-	Status     string `json:"status"`
-	Conclusion string `json:"conclusion"`
-}
-
-type ghWorkflowRun struct {
-	ID           int64      `json:"id"`
-	Name         string     `json:"name"`
-	HTMLURL      string     `json:"html_url"`
-	HeadSHA      string     `json:"head_sha"`
-	HeadBranch   string     `json:"head_branch"`
-	Status       string     `json:"status"`
-	Conclusion   string     `json:"conclusion"`
-	Event        string     `json:"event"`
-	UpdatedAt    string     `json:"updated_at"`
-	PullRequests []ghPRStub `json:"pull_requests"`
-}
-
-type ghPRStub struct {
-	Number  int    `json:"number"`
-	HTMLURL string `json:"html_url"`
-}
-
-type ghLabel struct {
-	Name string `json:"name"`
-}
-
-type ghRef struct {
-	Ref string `json:"ref"`
-	SHA string `json:"sha"`
-}
 
 // ---- per-event translators ----
 
-func translatePullRequest(p *payload, deliveryID string) (*telegraph.NormalizedEvent, error) {
-	if p.PullRequest == nil {
+func translatePullRequest(e *gogithub.PullRequestEvent, deliveryID string) (*telegraph.NormalizedEvent, error) {
+	pr := e.GetPullRequest()
+	if pr == nil {
 		return nil, fmt.Errorf("pull_request: missing pull_request field")
 	}
-	repo := repoFullName(p)
-	subject := fmt.Sprintf("%s#%d", repo, p.PullRequest.Number)
-	actor := senderLogin(p)
-	ts := parseGHTime(p.PullRequest.UpdatedAt)
-	prText := titleAndBody(p.PullRequest.Title, p.PullRequest.Body)
+	repo := e.GetRepo().GetFullName()
+	subject := fmt.Sprintf("%s#%d", repo, pr.GetNumber())
+	actor := e.GetSender().GetLogin()
+	ts := timestampValue(pr.UpdatedAt)
+	prText := titleAndBody(pr.GetTitle(), pr.GetBody())
 
-	switch p.Action {
+	switch e.GetAction() {
 	case "closed":
 		// Telegraph cares about merges (the success path); a manual-close
 		// without a merge is also routed through so Mayor can react.
 		eventType := "pull_request.closed_unmerged"
-		if p.PullRequest.Merged {
+		if pr.GetMerged() {
 			eventType = "pull_request.merged"
-			if mergedAt := parseGHTime(p.PullRequest.MergedAt); !mergedAt.IsZero() {
+			if mergedAt := timestampValue(pr.MergedAt); !mergedAt.IsZero() {
 				ts = mergedAt
 			}
 		}
 		return &telegraph.NormalizedEvent{
 			Provider:     "github",
 			EventType:    eventType,
-			EventID:      deliveryOrFallback(deliveryID, fmt.Sprintf("pr-%d-%d", p.PullRequest.Number, ts.UnixNano())),
+			EventID:      deliveryOrFallback(deliveryID, fmt.Sprintf("pr-%d-%d", pr.GetNumber(), ts.UnixNano())),
 			Actor:        actor,
 			Subject:      subject,
-			CanonicalURL: p.PullRequest.HTMLURL,
+			CanonicalURL: pr.GetHTMLURL(),
 			Text:         prText,
-			Labels:       prLabels(p.PullRequest),
+			Labels:       prLabels(pr),
 			Timestamp:    ts,
 		}, nil
 	case "opened", "reopened", "ready_for_review":
 		return &telegraph.NormalizedEvent{
 			Provider:     "github",
 			EventType:    "pull_request.opened",
-			EventID:      deliveryOrFallback(deliveryID, fmt.Sprintf("pr-%d-%d", p.PullRequest.Number, ts.UnixNano())),
+			EventID:      deliveryOrFallback(deliveryID, fmt.Sprintf("pr-%d-%d", pr.GetNumber(), ts.UnixNano())),
 			Actor:        actor,
 			Subject:      subject,
-			CanonicalURL: p.PullRequest.HTMLURL,
+			CanonicalURL: pr.GetHTMLURL(),
 			Text:         prText,
-			Labels:       prLabels(p.PullRequest),
+			Labels:       prLabels(pr),
 			Timestamp:    ts,
 		}, nil
 	default:
@@ -627,218 +539,229 @@ func translatePullRequest(p *payload, deliveryID string) (*telegraph.NormalizedE
 	}
 }
 
-func translatePullRequestReview(p *payload, deliveryID string) (*telegraph.NormalizedEvent, error) {
-	if p.PullRequest == nil {
+func translatePullRequestReview(e *gogithub.PullRequestReviewEvent, deliveryID string) (*telegraph.NormalizedEvent, error) {
+	pr := e.GetPullRequest()
+	if pr == nil {
 		return nil, fmt.Errorf("pull_request_review: missing pull_request field")
 	}
-	if p.Review == nil {
+	review := e.GetReview()
+	if review == nil {
 		return nil, fmt.Errorf("pull_request_review: missing review field")
 	}
-	if p.Action != "submitted" {
+	if e.GetAction() != "submitted" {
 		// edited / dismissed are out of scope for v1 — they rarely add new
 		// signal beyond the original submission.
 		return nil, telegraph.ErrUnknownEventType
 	}
-	repo := repoFullName(p)
-	subject := fmt.Sprintf("%s#%d", repo, p.PullRequest.Number)
-	actor := userLogin(p.Review.User)
+	repo := e.GetRepo().GetFullName()
+	subject := fmt.Sprintf("%s#%d", repo, pr.GetNumber())
+	actor := review.GetUser().GetLogin()
 	if actor == "" {
-		actor = senderLogin(p)
+		actor = e.GetSender().GetLogin()
 	}
-	ts := parseGHTime(p.Review.SubmittedAt)
-	state := strings.ToLower(strings.TrimSpace(p.Review.State))
+	ts := timestampValue(review.SubmittedAt)
+	state := strings.ToLower(strings.TrimSpace(review.GetState()))
 	if state == "" {
 		state = "commented"
 	}
-	text := p.Review.Body
+	text := review.GetBody()
 	if text == "" {
 		text = fmt.Sprintf("Review state: %s", state)
 	}
 	return &telegraph.NormalizedEvent{
 		Provider:     "github",
 		EventType:    "pull_request.review_submitted",
-		EventID:      deliveryOrFallback(deliveryID, fmt.Sprintf("review-%d", p.Review.ID)),
+		EventID:      deliveryOrFallback(deliveryID, fmt.Sprintf("review-%d", review.GetID())),
 		Actor:        actor,
 		Subject:      subject,
-		CanonicalURL: firstNonEmpty(p.Review.HTMLURL, p.PullRequest.HTMLURL),
+		CanonicalURL: firstNonEmpty(review.GetHTMLURL(), pr.GetHTMLURL()),
 		Text:         text,
 		Labels:       []string{"review:" + state},
 		Timestamp:    ts,
 	}, nil
 }
 
-func translatePullRequestReviewComment(p *payload, deliveryID string) (*telegraph.NormalizedEvent, error) {
-	if p.PullRequest == nil {
+func translatePullRequestReviewComment(e *gogithub.PullRequestReviewCommentEvent, deliveryID string) (*telegraph.NormalizedEvent, error) {
+	pr := e.GetPullRequest()
+	if pr == nil {
 		return nil, fmt.Errorf("pull_request_review_comment: missing pull_request field")
 	}
-	if p.Comment == nil {
+	comment := e.GetComment()
+	if comment == nil {
 		return nil, fmt.Errorf("pull_request_review_comment: missing comment field")
 	}
-	if p.Action != "created" {
+	if e.GetAction() != "created" {
 		return nil, telegraph.ErrUnknownEventType
 	}
-	repo := repoFullName(p)
-	subject := fmt.Sprintf("%s#%d", repo, p.PullRequest.Number)
-	actor := userLogin(p.Comment.User)
-	ts := parseGHTime(p.Comment.CreatedAt)
+	repo := e.GetRepo().GetFullName()
+	subject := fmt.Sprintf("%s#%d", repo, pr.GetNumber())
+	actor := comment.GetUser().GetLogin()
+	ts := timestampValue(comment.CreatedAt)
 	labels := []string{"review_comment"}
-	if p.Comment.Path != "" {
-		labels = append(labels, "path:"+p.Comment.Path)
+	if path := comment.GetPath(); path != "" {
+		labels = append(labels, "path:"+path)
 	}
 	return &telegraph.NormalizedEvent{
 		Provider:     "github",
 		EventType:    "pull_request.review_comment",
-		EventID:      deliveryOrFallback(deliveryID, fmt.Sprintf("review-comment-%d", p.Comment.ID)),
+		EventID:      deliveryOrFallback(deliveryID, fmt.Sprintf("review-comment-%d", comment.GetID())),
 		Actor:        actor,
 		Subject:      subject,
-		CanonicalURL: firstNonEmpty(p.Comment.HTMLURL, p.PullRequest.HTMLURL),
-		Text:         p.Comment.Body,
+		CanonicalURL: firstNonEmpty(comment.GetHTMLURL(), pr.GetHTMLURL()),
+		Text:         comment.GetBody(),
 		Labels:       labels,
 		Timestamp:    ts,
 	}, nil
 }
 
-func translateIssueComment(p *payload, deliveryID string) (*telegraph.NormalizedEvent, error) {
-	if p.Issue == nil {
+func translateIssueComment(e *gogithub.IssueCommentEvent, deliveryID string) (*telegraph.NormalizedEvent, error) {
+	issue := e.GetIssue()
+	if issue == nil {
 		return nil, fmt.Errorf("issue_comment: missing issue field")
 	}
-	if p.Comment == nil {
+	comment := e.GetComment()
+	if comment == nil {
 		return nil, fmt.Errorf("issue_comment: missing comment field")
 	}
-	if p.Action != "created" {
+	if e.GetAction() != "created" {
 		return nil, telegraph.ErrUnknownEventType
 	}
 	// Restrict to PR comments — pure issue comments are out of Telegraph's
-	// PR-centric remit. GitHub flags PR-issues with issue.pull_request set.
-	if p.Issue.PullRequest == nil {
+	// PR-centric remit. GitHub marks PR-issues with the pull_request link.
+	if !issue.IsPullRequest() {
 		return nil, telegraph.ErrUnknownEventType
 	}
-	repo := repoFullName(p)
-	subject := fmt.Sprintf("%s#%d", repo, p.Issue.Number)
-	actor := userLogin(p.Comment.User)
-	ts := parseGHTime(p.Comment.CreatedAt)
+	repo := e.GetRepo().GetFullName()
+	subject := fmt.Sprintf("%s#%d", repo, issue.GetNumber())
+	actor := comment.GetUser().GetLogin()
+	ts := timestampValue(comment.CreatedAt)
 	return &telegraph.NormalizedEvent{
 		Provider:     "github",
 		EventType:    "pull_request.comment",
-		EventID:      deliveryOrFallback(deliveryID, fmt.Sprintf("issue-comment-%d", p.Comment.ID)),
+		EventID:      deliveryOrFallback(deliveryID, fmt.Sprintf("issue-comment-%d", comment.GetID())),
 		Actor:        actor,
 		Subject:      subject,
-		CanonicalURL: firstNonEmpty(p.Comment.HTMLURL, p.Issue.HTMLURL),
-		Text:         p.Comment.Body,
+		CanonicalURL: firstNonEmpty(comment.GetHTMLURL(), issue.GetHTMLURL()),
+		Text:         comment.GetBody(),
 		Labels:       []string{"comment"},
 		Timestamp:    ts,
 	}, nil
 }
 
-func translateCheckRun(p *payload, deliveryID string) (*telegraph.NormalizedEvent, error) {
-	if p.CheckRun == nil {
+func translateCheckRun(e *gogithub.CheckRunEvent, deliveryID string) (*telegraph.NormalizedEvent, error) {
+	cr := e.GetCheckRun()
+	if cr == nil {
 		return nil, fmt.Errorf("check_run: missing check_run field")
 	}
-	if p.Action != "completed" || !isFailureConclusion(p.CheckRun.Conclusion) {
+	if e.GetAction() != "completed" || !isFailureConclusion(cr.GetConclusion()) {
 		return nil, telegraph.ErrUnknownEventType
 	}
-	repo := repoFullName(p)
-	subject := checkSubject(repo, p.CheckRun.PullRequests, p.CheckRun.HeadSHA)
-	actor := senderLogin(p)
-	ts := parseGHTime(p.CheckRun.CompletedAt)
-	text := fmt.Sprintf("Check run %q failed (conclusion=%s)", p.CheckRun.Name, p.CheckRun.Conclusion)
+	repo := e.GetRepo().GetFullName()
+	subject := checkSubject(repo, cr.PullRequests, cr.GetHeadSHA())
+	actor := e.GetSender().GetLogin()
+	ts := timestampValue(cr.CompletedAt)
+	text := fmt.Sprintf("Check run %q failed (conclusion=%s)", cr.GetName(), cr.GetConclusion())
 	return &telegraph.NormalizedEvent{
 		Provider:     "github",
 		EventType:    "check_run.failed",
-		EventID:      deliveryOrFallback(deliveryID, fmt.Sprintf("check-run-%d", p.CheckRun.ID)),
+		EventID:      deliveryOrFallback(deliveryID, fmt.Sprintf("check-run-%d", cr.GetID())),
 		Actor:        actor,
 		Subject:      subject,
-		CanonicalURL: p.CheckRun.HTMLURL,
+		CanonicalURL: cr.GetHTMLURL(),
 		Text:         text,
-		Labels:       []string{"conclusion:" + p.CheckRun.Conclusion, "name:" + p.CheckRun.Name},
+		Labels:       []string{"conclusion:" + cr.GetConclusion(), "name:" + cr.GetName()},
 		Timestamp:    ts,
 	}, nil
 }
 
-func translateCheckSuite(p *payload, deliveryID string) (*telegraph.NormalizedEvent, error) {
-	if p.CheckSuite == nil {
+func translateCheckSuite(e *gogithub.CheckSuiteEvent, deliveryID string) (*telegraph.NormalizedEvent, error) {
+	cs := e.GetCheckSuite()
+	if cs == nil {
 		return nil, fmt.Errorf("check_suite: missing check_suite field")
 	}
-	if p.Action != "completed" || !isFailureConclusion(p.CheckSuite.Conclusion) {
+	if e.GetAction() != "completed" || !isFailureConclusion(cs.GetConclusion()) {
 		return nil, telegraph.ErrUnknownEventType
 	}
-	repo := repoFullName(p)
-	subject := checkSubject(repo, p.CheckSuite.PullRequests, p.CheckSuite.HeadSHA)
-	actor := senderLogin(p)
-	ts := parseGHTime(p.CheckSuite.UpdatedAt)
+	repo := e.GetRepo().GetFullName()
+	subject := checkSubject(repo, cs.PullRequests, cs.GetHeadSHA())
+	actor := e.GetSender().GetLogin()
+	ts := timestampValue(cs.UpdatedAt)
 	canonical := ""
-	if p.Repository != nil && p.CheckSuite.HeadSHA != "" {
-		canonical = strings.TrimRight(p.Repository.HTMLURL, "/") + "/commit/" + p.CheckSuite.HeadSHA
+	if r := e.GetRepo(); r != nil && cs.GetHeadSHA() != "" {
+		canonical = strings.TrimRight(r.GetHTMLURL(), "/") + "/commit/" + cs.GetHeadSHA()
 	}
 	return &telegraph.NormalizedEvent{
 		Provider:     "github",
 		EventType:    "check_suite.failed",
-		EventID:      deliveryOrFallback(deliveryID, fmt.Sprintf("check-suite-%d", p.CheckSuite.ID)),
+		EventID:      deliveryOrFallback(deliveryID, fmt.Sprintf("check-suite-%d", cs.GetID())),
 		Actor:        actor,
 		Subject:      subject,
 		CanonicalURL: canonical,
-		Text:         fmt.Sprintf("Check suite failed (conclusion=%s) for %s", p.CheckSuite.Conclusion, shortSHA(p.CheckSuite.HeadSHA)),
-		Labels:       []string{"conclusion:" + p.CheckSuite.Conclusion},
+		Text:         fmt.Sprintf("Check suite failed (conclusion=%s) for %s", cs.GetConclusion(), shortSHA(cs.GetHeadSHA())),
+		Labels:       []string{"conclusion:" + cs.GetConclusion()},
 		Timestamp:    ts,
 	}, nil
 }
 
-func translateWorkflowRun(p *payload, deliveryID string) (*telegraph.NormalizedEvent, error) {
-	if p.WorkflowRun == nil {
+func translateWorkflowRun(e *gogithub.WorkflowRunEvent, deliveryID string) (*telegraph.NormalizedEvent, error) {
+	wr := e.GetWorkflowRun()
+	if wr == nil {
 		return nil, fmt.Errorf("workflow_run: missing workflow_run field")
 	}
-	if p.Action != "completed" || !isFailureConclusion(p.WorkflowRun.Conclusion) {
+	if e.GetAction() != "completed" || !isFailureConclusion(wr.GetConclusion()) {
 		return nil, telegraph.ErrUnknownEventType
 	}
-	repo := repoFullName(p)
-	subject := checkSubject(repo, p.WorkflowRun.PullRequests, p.WorkflowRun.HeadSHA)
-	actor := senderLogin(p)
-	ts := parseGHTime(p.WorkflowRun.UpdatedAt)
-	text := fmt.Sprintf("Workflow %q failed on %s (conclusion=%s)", p.WorkflowRun.Name, p.WorkflowRun.HeadBranch, p.WorkflowRun.Conclusion)
+	repo := e.GetRepo().GetFullName()
+	subject := checkSubject(repo, wr.PullRequests, wr.GetHeadSHA())
+	actor := e.GetSender().GetLogin()
+	ts := timestampValue(wr.UpdatedAt)
+	text := fmt.Sprintf("Workflow %q failed on %s (conclusion=%s)", wr.GetName(), wr.GetHeadBranch(), wr.GetConclusion())
 	return &telegraph.NormalizedEvent{
 		Provider:     "github",
 		EventType:    "workflow_run.failed",
-		EventID:      deliveryOrFallback(deliveryID, fmt.Sprintf("workflow-run-%d", p.WorkflowRun.ID)),
+		EventID:      deliveryOrFallback(deliveryID, fmt.Sprintf("workflow-run-%d", wr.GetID())),
 		Actor:        actor,
 		Subject:      subject,
-		CanonicalURL: p.WorkflowRun.HTMLURL,
+		CanonicalURL: wr.GetHTMLURL(),
 		Text:         text,
-		Labels:       []string{"conclusion:" + p.WorkflowRun.Conclusion, "name:" + p.WorkflowRun.Name},
+		Labels:       []string{"conclusion:" + wr.GetConclusion(), "name:" + wr.GetName()},
 		Timestamp:    ts,
 	}, nil
 }
 
 // ---- helpers ----
 
-func repoFullName(p *payload) string {
-	if p == nil || p.Repository == nil {
-		return ""
+// eventRepoFullName extracts repository.full_name from any of the typed
+// event structs we accept. Returns "" when the event has no repository
+// field or the repo's name is missing.
+func eventRepoFullName(parsed interface{}) string {
+	switch e := parsed.(type) {
+	case *gogithub.PullRequestEvent:
+		return e.GetRepo().GetFullName()
+	case *gogithub.PullRequestReviewEvent:
+		return e.GetRepo().GetFullName()
+	case *gogithub.PullRequestReviewCommentEvent:
+		return e.GetRepo().GetFullName()
+	case *gogithub.IssueCommentEvent:
+		return e.GetRepo().GetFullName()
+	case *gogithub.CheckRunEvent:
+		return e.GetRepo().GetFullName()
+	case *gogithub.CheckSuiteEvent:
+		return e.GetRepo().GetFullName()
+	case *gogithub.WorkflowRunEvent:
+		return e.GetRepo().GetFullName()
 	}
-	return p.Repository.FullName
+	return ""
 }
 
-func senderLogin(p *payload) string {
-	if p == nil {
-		return ""
-	}
-	return userLogin(p.Sender)
-}
-
-func userLogin(u *ghUser) string {
-	if u == nil {
-		return ""
-	}
-	return u.Login
-}
-
-func prLabels(pr *ghPR) []string {
+func prLabels(pr *gogithub.PullRequest) []string {
 	if pr == nil || len(pr.Labels) == 0 {
 		return []string{}
 	}
 	out := make([]string, 0, len(pr.Labels))
 	for _, l := range pr.Labels {
-		if l.Name != "" {
-			out = append(out, l.Name)
+		if name := l.GetName(); name != "" {
+			out = append(out, name)
 		}
 	}
 	return out
@@ -857,23 +780,17 @@ func titleAndBody(title, body string) string {
 	}
 }
 
-// parseGHTime parses a GitHub-issued RFC3339 timestamp string. Empty, JSON
-// "null", or unparseable inputs return the zero time so callers can detect
-// missing/malformed data explicitly (see Jira's parseJiraTime for the same
-// pattern). Returning time.Now() here would mask malformed payloads as
-// "events that happened just now," which would surface as drift in the
-// Telegraph-Timestamp header on tests and audit logs.
-func parseGHTime(s string) time.Time {
-	s = strings.TrimSpace(s)
-	if s == "" || s == "null" {
+// timestampValue returns the UTC time value of a (possibly nil) go-github
+// Timestamp pointer. Unset/JSON-null inputs yield the zero time so callers
+// can detect missing/malformed data explicitly — see the Jira translator
+// for the same pattern. Substituting time.Now() on missing data would mask
+// malformed payloads as "events that happened just now" and surface as
+// drift in the Telegraph-Timestamp header on audit logs.
+func timestampValue(ts *gogithub.Timestamp) time.Time {
+	if ts == nil {
 		return time.Time{}
 	}
-	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
-		if t, err := time.Parse(layout, s); err == nil {
-			return t.UTC()
-		}
-	}
-	return time.Time{}
+	return ts.UTC()
 }
 
 // deliveryOrFallback prefers the X-GitHub-Delivery UUID (stable, GitHub-issued)
@@ -912,9 +829,9 @@ func isFailureConclusion(c string) bool {
 // checkSubject derives a Telegraph subject for a check-style event. When the
 // check is associated with a PR, prefer "owner/repo#N"; otherwise fall back to
 // "owner/repo@<sha7>" so the operator can correlate to a commit.
-func checkSubject(repo string, prs []ghPRStub, sha string) string {
-	if len(prs) > 0 && prs[0].Number > 0 {
-		return fmt.Sprintf("%s#%d", repo, prs[0].Number)
+func checkSubject(repo string, prs []*gogithub.PullRequest, sha string) string {
+	if len(prs) > 0 && prs[0].GetNumber() > 0 {
+		return fmt.Sprintf("%s#%d", repo, prs[0].GetNumber())
 	}
 	if sha != "" {
 		return fmt.Sprintf("%s@%s", repo, shortSHA(sha))
