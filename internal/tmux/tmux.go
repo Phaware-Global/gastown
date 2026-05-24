@@ -1794,7 +1794,15 @@ func (t *Tmux) presetForSession(session string) *config.AgentPresetInfo {
 	if err != nil || agentType == "" {
 		return nil
 	}
-	townRoot, _ := t.GetEnvironment(session, "GT_ROOT")
+	// Prefer the session's own GT_ROOT (authoritative for cross-town cases); if it
+	// is missing/unreadable, fall back to this process's GT_ROOT so the provider
+	// fallback for town custom agents still works. Without a town root,
+	// ResolvePresetForAgent can only do a built-in lookup, which returns nil for
+	// custom agents and would revert the nudge protocol to sending Escape.
+	townRoot, err := t.GetEnvironment(session, "GT_ROOT")
+	if err != nil || townRoot == "" {
+		townRoot = os.Getenv("GT_ROOT")
+	}
 	return config.ResolvePresetForAgent(agentType, townRoot)
 }
 

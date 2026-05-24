@@ -1160,38 +1160,16 @@ func SaveTownSettings(path string, settings *TownSettings) error {
 		return fmt.Errorf("encoding settings: %w", err)
 	}
 
-	// Write atomically (temp file in the same dir + rename) so concurrent
-	// readers never observe a partial/invalid config.json. ResolvePresetForAgent
-	// reads this file on the nudge delivery path; a torn read there would return
-	// nil and transiently regress the ESC-skip behavior. os.Rename is atomic
-	// within a filesystem.
-	if err := writeFileAtomic(path, data, 0644); err != nil {
+	// Write atomically (temp file in the same dir + rename) so concurrent readers
+	// never observe a partial/invalid config.json. ResolvePresetForAgent reads this
+	// file on the nudge delivery path; a torn read there would return nil and
+	// transiently regress the ESC-skip behavior. Use the shared atomicfile helper
+	// (already used by SaveRigSettings above).
+	if err := atomicfile.WriteFile(path, data, 0644); err != nil {
 		return fmt.Errorf("writing settings: %w", err)
 	}
 
 	return nil
-}
-
-// writeFileAtomic writes data to path via a temp file in the same directory
-// followed by an atomic rename, so concurrent readers never see a partial file.
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer func() { _ = os.Remove(tmpName) }() // no-op once renamed
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmpName, perm); err != nil { //nolint:gosec // G302: caller-chosen perm
-		return err
-	}
-	return os.Rename(tmpName, path)
 }
 
 // ResolveAgentConfig resolves the agent configuration for a rig.
