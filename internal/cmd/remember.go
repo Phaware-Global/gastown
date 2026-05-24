@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/style"
@@ -223,7 +225,12 @@ func bdKvClear(key string) error {
 // keep only the entries that parse as strings — the version sibling and any
 // future non-string envelope fields are silently dropped.
 func bdKvListJSON() (map[string]string, error) {
-	cmd := exec.Command("bd", "kv", "list", "--json")
+	// Bound the shell-out so callers on latency-sensitive paths (the
+	// compact/resume prime hook in particular, which must stay within tight
+	// non-Claude runtime hook timeouts) can't stall indefinitely if bd hangs.
+	ctx, cancel := context.WithTimeout(context.Background(), bdKvListTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bd", "kv", "list", "--json")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
@@ -231,6 +238,9 @@ func bdKvListJSON() (map[string]string, error) {
 
 	return parseKvListJSON(out)
 }
+
+// bdKvListTimeout bounds the `bd kv list` shell-out used for memory injection.
+var bdKvListTimeout = 5 * time.Second
 
 func parseKvListJSON(out []byte) (map[string]string, error) {
 	var raw map[string]json.RawMessage

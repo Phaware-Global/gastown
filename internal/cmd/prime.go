@@ -232,10 +232,13 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 }
 
 // runPrimeCompactResume runs a lighter prime after compaction or resume.
-// The agent already has full role context in compressed memory. This just
-// restores identity and injects any new mail. It deliberately skips
-// setupPrimeSession and findAgentWork (which hit Dolt) to stay fast
-// enough for non-Claude runtimes with short hook timeouts.
+// The agent already has full role context in compressed memory. This restores
+// identity and re-injects durable agent memories (which compaction can drop).
+// It deliberately skips setupPrimeSession and findAgentWork (which hit Dolt) to
+// stay fast enough for non-Claude runtimes with short hook timeouts; the memory
+// shell-out is timeout-bounded for the same reason. New mail is not injected
+// here — that is handled separately by the UserPromptSubmit `gt mail check
+// --inject` hook.
 //
 // Unlike the full prime path, this outputs a brief recovery line instead of
 // the full AUTONOMOUS WORK MODE block. This prevents agents from re-announcing

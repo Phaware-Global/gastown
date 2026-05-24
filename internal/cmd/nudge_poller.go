@@ -73,7 +73,9 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 	// Resolve nudge options once at startup: if the target agent uses Escape
 	// as cancel (e.g., Gemini CLI), skip the Escape keystroke during delivery
 	// to avoid canceling in-flight generation. (GH#gt-wasn)
-	nudgeOpts := tmux.NudgeOpts{}
+	// TownRoot is set so deliveries participate in the flock-based cross-process
+	// nudge lock, preventing interleaving with concurrent `gt nudge` processes.
+	nudgeOpts := tmux.NudgeOpts{TownRoot: townRoot}
 	agentName := ""
 	hasPromptDetection := false
 	if name, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && name != "" {
@@ -81,7 +83,6 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 		// Resolve via provider fallback so town custom agents (e.g. the mayor's
 		// "claude-opus-remote-mayor") inherit the claude preset's flags instead
 		// of resolving to nil. (GH#68 recurrence)
-		townRoot, _ := t.GetEnvironment(sessionName, "GT_ROOT")
 		if preset := config.ResolvePresetForAgent(agentName, townRoot); preset != nil {
 			hasPromptDetection = preset.ReadyPromptPrefix != ""
 			if preset.EscapeCancelsRequest {
