@@ -136,6 +136,23 @@ while IFS='|' read -r RIG PREFIX; do
           echo "  SKIP $SESSION_NAME: agent_state=$AGENT_STATE (intentional shutdown, not a crash)"
           continue
         fi
+        # Open-hook guard: a failed sling can leave a stale hook_bead pointing at
+        # an already-closed issue (SetAgentState "issue not found" prevents
+        # `gt done` from clearing the hook). Treating that as a crash produces
+        # false RESTART_POLECAT alerts. Only proceed when the hook bead is still
+        # live work. The canonical active-work set is open/in_progress/hooked —
+        # the sling sets a slung bead to "hooked", so it must count as live or
+        # every genuine crash would be skipped. Anything else (closed, blocked,
+        # deferred, or unresolvable) is a stale hook. Root cause: hq-k6u.
+        HOOK_STATUS=$(bd show "$HOOK_BEAD" --json 2>/dev/null \
+          | jq -r '.status // empty' 2>/dev/null)
+        case "$HOOK_STATUS" in
+          open|in_progress|hooked) ;;  # live work — fall through to CRASHED
+          *)
+            echo "  SKIP $SESSION_NAME: stale hook (hook_bead=$HOOK_BEAD status=${HOOK_STATUS:-unknown})"
+            continue
+            ;;
+        esac
         CRASHED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD")
         echo "  CRASHED: $SESSION_NAME (hook=$HOOK_BEAD)"
       fi
@@ -251,6 +268,14 @@ For each agent requiring restart:
 for ENTRY in "${CRASHED[@]}"; do
   IFS='|' read -r SESSION RIG PCAT HOOK <<< "$ENTRY"
 
+  # Empty rig/pcat guard: a malformed entry would otherwise build a degenerate
+  # "RESTART_POLECAT: /" subject and mail "/witness" (a non-existent address).
+  # Skip rather than emit a garbage restart request.
+  if [ -z "$RIG" ] || [ -z "$PCAT" ]; then
+    echo "  SKIP malformed CRASHED entry (rig='$RIG' pcat='$PCAT'): $ENTRY"
+    continue
+  fi
+
   echo "Requesting restart for $RIG/polecats/$PCAT (hook=$HOOK)"
 
   gt mail send "$RIG/witness" \
@@ -270,6 +295,13 @@ done
 # For zombie polecats — kill zombie session first, then request restart
 for ENTRY in "${STUCK[@]}"; do
   IFS='|' read -r SESSION RIG PCAT HOOK REASON <<< "$ENTRY"
+
+  # Empty rig/pcat guard: skip malformed entries before killing a session or
+  # mailing "/witness" with a degenerate "RESTART_POLECAT: /" subject.
+  if [ -z "$RIG" ] || [ -z "$PCAT" ]; then
+    echo "  SKIP malformed STUCK entry (rig='$RIG' pcat='$PCAT'): $ENTRY"
+    continue
+  fi
 
   echo "Killing zombie session $SESSION and requesting restart"
   tmux kill-session -t "$SESSION" 2>/dev/null || true
