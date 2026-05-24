@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -529,75 +530,163 @@ func TestSessionKillGateGuardLogic(t *testing.T) {
 	}
 }
 
-// TestMRVerificationSetsMRFailed verifies that if MR bead creation returns
-// success but the bead cannot be read back (verification fails), mrFailed
-// is set to true. This is the core fix for GH#1945: without verification,
-// a "successful" bd.Create that didn't actually persist would allow the
-// worktree nuke to proceed, losing the polecat's work.
-func TestMRVerificationSetsMRFailed(t *testing.T) {
+// TestMRCreationFailureModesHardFail verifies gt-5u4: all three MR-bead creation
+// failure modes in done.go (Create error, empty ID, read-back verification) now
+// hard-fail by returning a non-nil error instead of the old
+// `mrFailed=true; goto notifyWitness` silent cascade. Returning before
+// notifyWitness means the polecat does NOT transition to IDLE / report COMPLETED
+// and the source bead is NOT closed.
+//
+// The simulation maps each failure condition to the SAME production error
+// constructor done.go calls, so the asserted values come from production code,
+// not a re-encoded copy (PR #77 thread #4).
+func TestMRCreationFailureModesHardFail(t *testing.T) {
+	const branch = "polecat/furiosa/gt-5u4"
+	const mrID = "gts-mr-test"
+
+	// mrCreationOutcome mirrors the control flow of the MR-creation block in
+	// done.go, returning the production error for whichever failure fires first.
+	mrCreationOutcome := func(createErr error, gotID string, showErr error, showReturns bool) error {
+		if createErr != nil {
+			return errMRCreateFailed(branch, createErr)
+		}
+		if gotID == "" {
+			return errMREmptyID(branch)
+		}
+		if showErr != nil || !showReturns {
+			return errMRReadbackFailed(branch, gotID, showErr)
+		}
+		return nil
+	}
+
 	tests := []struct {
-		name         string
-		createErr    error  // error from bd.Create
-		showErr      error  // error from bd.Show (verification)
-		showReturns  bool   // whether Show returns a non-nil issue
-		wantMRFailed bool
+		name        string
+		createErr   error
+		gotID       string
+		showErr     error
+		showReturns bool
+		wantHardErr bool
 	}{
 		{
-			name:         "create succeeds + show succeeds → mrFailed=false",
-			createErr:    nil,
-			showErr:      nil,
-			showReturns:  true,
-			wantMRFailed: false,
+			name:        "create succeeds + valid ID + show succeeds → no error",
+			createErr:   nil,
+			gotID:       mrID,
+			showErr:     nil,
+			showReturns: true,
+			wantHardErr: false,
 		},
 		{
-			name:         "create fails → mrFailed=true (existing behavior)",
-			createErr:    fmt.Errorf("dolt write failed"),
-			showErr:      nil,
-			showReturns:  false,
-			wantMRFailed: true,
+			name:        "create fails → hard error (gt-5u4)",
+			createErr:   fmt.Errorf("dolt write failed"),
+			gotID:       "",
+			showErr:     nil,
+			showReturns: false,
+			wantHardErr: true,
 		},
 		{
-			name:         "create succeeds + show fails → mrFailed=true (GH#1945 fix)",
-			createErr:    nil,
-			showErr:      fmt.Errorf("bead not found"),
-			showReturns:  false,
-			wantMRFailed: true,
+			name:        "empty MR ID → hard error (gt-5u4, was goto notifyWitness)",
+			createErr:   nil,
+			gotID:       "",
+			showErr:     nil,
+			showReturns: false,
+			wantHardErr: true,
 		},
 		{
-			name:         "create succeeds + show returns nil → mrFailed=true (GH#1945 fix)",
-			createErr:    nil,
-			showErr:      nil,
-			showReturns:  false,
-			wantMRFailed: true,
+			name:        "show fails → hard error (gt-5u4, was mrFailed=true)",
+			createErr:   nil,
+			gotID:       mrID,
+			showErr:     fmt.Errorf("bead not found"),
+			showReturns: false,
+			wantHardErr: true,
+		},
+		{
+			name:        "show returns nil → hard error (gt-5u4, was mrFailed=true)",
+			createErr:   nil,
+			gotID:       mrID,
+			showErr:     nil,
+			showReturns: false,
+			wantHardErr: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Simulate the MR creation + verification flow from done.go
-			mrFailed := false
-
-			if tt.createErr != nil {
-				// bd.Create failed — existing behavior
-				mrFailed = true
-			} else {
-				// bd.Create succeeded — now verify (GH#1945 fix)
-				var showResult bool
-				if tt.showErr != nil || !tt.showReturns {
-					showResult = false
-				} else {
-					showResult = true
-				}
-				if !showResult {
-					mrFailed = true
-				}
+			err := mrCreationOutcome(tt.createErr, tt.gotID, tt.showErr, tt.showReturns)
+			if (err != nil) != tt.wantHardErr {
+				t.Fatalf("hardErr = %v, want hard error: %v", err, tt.wantHardErr)
 			}
-
-			if mrFailed != tt.wantMRFailed {
-				t.Errorf("mrFailed = %v, want %v", mrFailed, tt.wantMRFailed)
+			if err == nil {
+				return
 			}
+			// Every hard-fail message must guide recovery: the branch was pushed,
+			// no usable merge slot, re-run gt done. These invariants are asserted
+			// against the production error constructors, so they break if done.go
+			// drops the guidance.
+			assertMRRecoveryGuidance(t, err, branch)
 		})
 	}
+}
+
+// assertMRRecoveryGuidance asserts the shared invariants of every gt-5u4 MR
+// hard-fail error: it names the pushed branch and tells the operator to re-run
+// gt done. Coupled to the production constructors (errMR* in done.go).
+func assertMRRecoveryGuidance(t *testing.T, err error, branch string) {
+	t.Helper()
+	for _, want := range []string{branch, "merge slot", "re-run gt done"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error message missing %q; got: %s", want, err.Error())
+		}
+	}
+}
+
+// TestMRHardFailErrorsWrapCause verifies the gt-5u4 error constructors preserve
+// the underlying cause via %w (so callers/telemetry can unwrap) and include the
+// MR ID where one exists. Calls the production constructors directly.
+func TestMRHardFailErrorsWrapCause(t *testing.T) {
+	const branch = "polecat/furiosa/gt-5u4"
+
+	t.Run("create error wraps cause", func(t *testing.T) {
+		cause := fmt.Errorf("dolt: connection refused")
+		err := errMRCreateFailed(branch, cause)
+		if !errors.Is(err, cause) {
+			t.Errorf("errMRCreateFailed must wrap the cause via %%w; got %v", err)
+		}
+		assertMRRecoveryGuidance(t, err, branch)
+	})
+
+	t.Run("empty ID error guides recovery (no cause to wrap)", func(t *testing.T) {
+		err := errMREmptyID(branch)
+		if err == nil {
+			t.Fatal("errMREmptyID must return a non-nil error")
+		}
+		assertMRRecoveryGuidance(t, err, branch)
+	})
+
+	t.Run("read-back error wraps cause and names the MR", func(t *testing.T) {
+		cause := fmt.Errorf("bead not found")
+		err := errMRReadbackFailed(branch, "gts-mr-9", cause)
+		if !errors.Is(err, cause) {
+			t.Errorf("errMRReadbackFailed must wrap the cause via %%w; got %v", err)
+		}
+		if !strings.Contains(err.Error(), "gts-mr-9") {
+			t.Errorf("read-back error must name the MR bead ID; got: %s", err.Error())
+		}
+		assertMRRecoveryGuidance(t, err, branch)
+	})
+
+	t.Run("read-back error tolerates nil cause", func(t *testing.T) {
+		// done.go reaches this path when bd.Show returns (nil, nil): the bead is
+		// missing without an error. The constructor must still produce a usable
+		// error rather than a fmt %!w(<nil>) artifact.
+		err := errMRReadbackFailed(branch, "gts-mr-9", nil)
+		if err == nil {
+			t.Fatal("errMRReadbackFailed must return a non-nil error even when cause is nil")
+		}
+		if strings.Contains(err.Error(), "%!w") {
+			t.Errorf("nil cause must not produce a malformed wrap; got: %s", err.Error())
+		}
+		assertMRRecoveryGuidance(t, err, branch)
+	})
 }
 
 // TestMRBeadCreationUsesRig verifies that MR bead creation specifies the rig (gt-7y7).
