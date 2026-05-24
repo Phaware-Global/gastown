@@ -265,18 +265,13 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		return nil
 
 	default: // NudgeModeImmediate
+		// SkipEscape is intentionally not set here. NudgeSessionWithOpts derives
+		// it from the *target session's* own GT_AGENT/GT_ROOT — the authoritative
+		// source — which resolves town custom agents (e.g. the mayor's
+		// "claude-opus-remote-mayor") to their provider preset. Setting it from
+		// the caller's townRoot could override that with the sender's workspace
+		// context and wrongly skip the vim-safety Escape. (GH#gt-wasn, PR #75 review)
 		opts := tmux.NudgeOpts{TownRoot: townRoot}
-		// Check if the target agent uses Escape as cancel (e.g., Gemini CLI).
-		// For these agents, skip the Escape keystroke to avoid canceling
-		// in-flight generation. (GH#gt-wasn)
-		if agentName, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && agentName != "" {
-			// Provider fallback resolves town custom agents (e.g. the mayor's
-			// "claude-opus-remote-mayor") to the claude preset so EscapeCancelsRequest
-			// is honored instead of lost to a nil lookup. (GH#68 recurrence)
-			if preset := config.ResolvePresetForAgent(agentName, townRoot); preset != nil && preset.EscapeCancelsRequest {
-				opts.SkipEscape = true
-			}
-		}
 		return t.NudgeSessionWithOpts(sessionName, prefixedMessage, opts)
 	}
 }
