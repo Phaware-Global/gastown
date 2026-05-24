@@ -1367,32 +1367,28 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// transition and bead-close logic live past notifyWitness, which we skip),
 				// and leaves the branch on origin so a re-run of `gt done` re-attempts MR
 				// creation once the underlying error is fixed.
-				return fmt.Errorf("failed to create MR bead — branch %s was pushed but no merge slot exists; "+
-					"refinery will not pick this up. fix the underlying error and re-run gt done. "+
-					"underlying error: %w", branch, err)
+				clearDoneIntentOnHardFail(cwd, townRoot, agentBeadID, issueID)
+				return errMRCreateFailed(branch, err)
 			}
 			mrID = mrIssue.ID
 
 			// Guard against empty ID from bd create (observed in ephemeral/wisp mode).
-			// Fail fast with a clear message rather than passing "" to bd.Show.
+			// gt-5u4: Same silent-failure cascade as a Create error — an empty ID means
+			// no usable merge slot, so hard-fail rather than goto notifyWitness.
 			if mrID == "" {
-				mrFailed = true
-				errMsg := "MR bead creation returned empty ID"
-				doneErrors = append(doneErrors, errMsg)
-				style.PrintWarning("%s\nBranch is pushed but MR bead has no ID. Witness will be notified.", errMsg)
-				goto notifyWitness
+				clearDoneIntentOnHardFail(cwd, townRoot, agentBeadID, issueID)
+				return errMREmptyID(branch)
 			}
 
 			// GH#1945: Verify MR bead is readable before considering it confirmed.
 			// bd.Create() succeeds when the bead is written locally, but if the write
 			// didn't persist (Dolt failure, corrupt state), we'd nuke the worktree
 			// with no MR in the queue — losing the polecat's work permanently.
+			// gt-5u4: An unconfirmed merge slot is the same silent failure — hard-fail
+			// (which also preserves the worktree, since the nuke lives past notifyWitness).
 			if verifiedMR, verifyErr := bd.Show(mrID); verifyErr != nil || verifiedMR == nil {
-				mrFailed = true
-				errMsg := fmt.Sprintf("MR bead created but verification read-back failed (id=%s): %v", mrID, verifyErr)
-				doneErrors = append(doneErrors, errMsg)
-				style.PrintWarning("%s\nBranch is pushed but MR bead not confirmed. Preserving worktree.", errMsg)
-				goto notifyWitness
+				clearDoneIntentOnHardFail(cwd, townRoot, agentBeadID, issueID)
+				return errMRReadbackFailed(branch, mrID, verifyErr)
 			}
 
 			// gt-gpy: Validate that the MR bead landed in the rig's database.
@@ -1738,6 +1734,58 @@ func clearDoneIntentLabel(bd *beads.Beads, agentBeadID string) {
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: couldn't clear done-intent label on %s: %v\n", agentBeadID, err)
 	}
+}
+
+// clearDoneIntentOnHardFail reverses the early-exit markers when gt done aborts
+// with a hard error before reaching notifyWitness/updateAgentStateOnDone (gt-5u4).
+//
+// gt done writes a done-intent:* label and a HeartbeatExiting heartbeat EARLY
+// (before push/MR) to tell the witness the session is exiting cleanly. The MR
+// hard-fail returns bypass updateAgentStateOnDone, which is where those markers
+// are normally cleared. Left in place, they make a still-alive, failed session
+// look like one stuck mid-exit — and the witness may spuriously restart it (or
+// leave it wedged as "exiting"). Reset the heartbeat to "working" so the failure
+// reads as an active session needing recovery (fix the error, re-run gt done),
+// not a stuck exit. Best-effort: every step is non-fatal, mirroring the early
+// writers and clearDoneIntentLabel.
+func clearDoneIntentOnHardFail(cwd, townRoot, agentBeadID, issueID string) {
+	if agentBeadID != "" && cwd != "" {
+		clearDoneIntentLabel(beads.New(cwd), agentBeadID)
+	}
+	if sessionName := os.Getenv("GT_SESSION"); sessionName != "" && townRoot != "" {
+		polecat.TouchSessionHeartbeatWithState(townRoot, sessionName, polecat.HeartbeatWorking, "gt done aborted: MR creation failed", issueID)
+	}
+}
+
+// MR-creation hard-fail errors (gt-5u4). Extracted as constructors so that the
+// production error path and its tests share one source of truth — tests assert
+// against the exact values returned by runDone instead of re-encoding the strings.
+// All three describe the same condition: the branch was pushed but no usable
+// merge slot exists, so the refinery will not pick the work up and gt done must
+// be re-run after fixing the underlying cause.
+
+// errMRCreateFailed is returned when bd.Create() of the MR bead errors.
+func errMRCreateFailed(branch string, cause error) error {
+	return fmt.Errorf("failed to create MR bead — branch %s was pushed but no merge slot exists; "+
+		"refinery will not pick this up. fix the underlying error and re-run gt done. "+
+		"underlying error: %w", branch, cause)
+}
+
+// errMREmptyID is returned when bd.Create() succeeds but yields an empty MR ID
+// (observed in ephemeral/wisp mode) — there is no slot the refinery can act on.
+func errMREmptyID(branch string) error {
+	return fmt.Errorf("MR bead creation returned an empty ID — branch %s was pushed but no merge slot exists; "+
+		"refinery will not pick this up. re-run gt done to retry MR creation", branch)
+}
+
+// errMRReadbackFailed is returned when the MR bead is created but the verifying
+// read-back fails (GH#1945) — the slot is unconfirmed and may not have persisted.
+func errMRReadbackFailed(branch, mrID string, cause error) error {
+	if cause == nil {
+		cause = fmt.Errorf("read-back returned no bead")
+	}
+	return fmt.Errorf("MR bead %s created but verification read-back failed — branch %s was pushed but the merge slot is unconfirmed; "+
+		"refinery may not pick this up. re-run gt done to retry. underlying error: %w", mrID, branch, cause)
 }
 
 // DoneCheckpoint represents a checkpoint stage in the gt done flow (gt-aufru).
