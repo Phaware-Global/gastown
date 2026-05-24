@@ -257,6 +257,16 @@ func runPrimeCompactResume(ctx RoleContext) {
 	fmt.Println()
 	fmt.Println("**Continue your current task.** If you've lost context, run `gt prime` for full reload.")
 
+	// Re-inject stored memories. Compaction summarizes the conversation and can
+	// drop the agent memories that were injected at the original startup, leaving
+	// long-lived agents (notably the mayor) running without their feedback/project
+	// memories for the rest of the session. Unlike the full prime, this is the only
+	// external-tool call we make here — memories are durable context that must
+	// survive a compaction, whereas bd prime / mail are refreshed by other hooks.
+	if !primeDryRun {
+		runMemoryInject()
+	}
+
 	// Remind polecats about gt done — after compaction the agent may have lost
 	// the formula checklist and forgotten that gt done is required to submit work.
 	// Without this, polecats finish implementation and sit at the prompt forever.
