@@ -114,9 +114,6 @@ func validateBeadID(id string) error {
 
 func runPolecatCheckoutBranch(cmd *cobra.Command, args []string) error {
 	beadID := strings.TrimSpace(args[0])
-	if err := validateBeadID(beadID); err != nil {
-		return fmt.Errorf("checkout-branch: %w", err)
-	}
 
 	polecatName := strings.TrimSpace(polecatCheckoutBranchPolecat)
 	if polecatName == "" {
@@ -131,11 +128,78 @@ func runPolecatCheckoutBranch(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("checkout-branch: getwd: %w", err)
 	}
-	g := git.NewGit(cwd)
 
+	res, err := ensurePolecatWorkBranch(cwd, polecatName, beadID)
+	if err != nil {
+		return fmt.Errorf("checkout-branch: %w", err)
+	}
+
+	switch res.Action {
+	case polecatBranchNoop:
+		fmt.Fprintf(os.Stdout, "%s Already on %s — no-op\n",
+			style.Bold.Render("✓"), res.Target)
+	case polecatBranchResumed:
+		fmt.Fprintf(os.Stdout, "%s Resumed existing %s (no rebase, no -b)\n",
+			style.Bold.Render("✓"), res.Target)
+	case polecatBranchCreated:
+		fmt.Fprintf(os.Stdout, "%s Created and checked out %s (from origin/main)\n",
+			style.Bold.Render("✓"), res.Target)
+	}
+	return nil
+}
+
+// polecatBranchAction describes what ensurePolecatWorkBranch did, so callers can
+// render their own message (the CLI command prints a "✓ …" line; the prime-time
+// off-main guard prints an "⚠️ OFF-MAIN GUARD" line).
+type polecatBranchAction string
+
+const (
+	polecatBranchNoop    polecatBranchAction = "noop"    // already on the target branch
+	polecatBranchResumed polecatBranchAction = "resumed" // target existed locally, plain checkout
+	polecatBranchCreated polecatBranchAction = "created" // created fresh from origin/main
+)
+
+// polecatBranchResult reports the target branch and what ensurePolecatWorkBranch
+// did to land the worktree on it.
+type polecatBranchResult struct {
+	Target string
+	Action polecatBranchAction
+}
+
+// ensurePolecatWorkBranch creates or checks out the polecat's namespaced work
+// branch (polecat/<name>-<beadID>) and leaves the worktree on it. It is the
+// shared core behind both `gt polecat checkout-branch` (the formula-imperative
+// recovery command) and the prime-time off-main guard (gt-tk5).
+//
+// Behavior by current branch:
+//   - already on the target            → no-op (polecatBranchNoop)
+//   - on a *different* polecat/… branch → error (refuse to swap silently; the
+//     caller's uncommitted work would be lost or contaminated)
+//   - anything else (main, master,     → fetch origin/main, then check out the
+//     detached, residual)                target: plain checkout if it already
+//                                        exists locally (polecatBranchResumed),
+//                                        else `checkout -b … origin/main`
+//                                        (polecatBranchCreated)
+//
+// git operations run via exec.Command (a subprocess of `gt`), NOT a Bash tool
+// call from the LLM, so the tap-guard PreToolUse hook — which blocks raw
+// `git checkout -b` from agent contexts — does not fire here. That bypass is
+// the whole point: a polecat stuck on main has no other permitted way to reach
+// a work branch.
+func ensurePolecatWorkBranch(cwd, polecatName, beadID string) (polecatBranchResult, error) {
+	beadID = strings.TrimSpace(beadID)
+	if err := validateBeadID(beadID); err != nil {
+		return polecatBranchResult{}, err
+	}
+	polecatName = strings.TrimSpace(polecatName)
+	if polecatName == "" {
+		return polecatBranchResult{}, fmt.Errorf("polecat name is empty")
+	}
+
+	g := git.NewGit(cwd)
 	currentBranch, err := g.CurrentBranch()
 	if err != nil {
-		return fmt.Errorf("checkout-branch: reading current branch: %w", err)
+		return polecatBranchResult{}, fmt.Errorf("reading current branch: %w", err)
 	}
 	currentBranch = strings.TrimSpace(currentBranch)
 
@@ -143,16 +207,14 @@ func runPolecatCheckoutBranch(cmd *cobra.Command, args []string) error {
 
 	switch {
 	case currentBranch == targetBranch:
-		fmt.Fprintf(os.Stdout, "%s Already on %s — no-op\n",
-			style.Bold.Render("✓"), targetBranch)
-		return nil
+		return polecatBranchResult{Target: targetBranch, Action: polecatBranchNoop}, nil
 
 	case strings.HasPrefix(currentBranch, "polecat/") && currentBranch != targetBranch:
 		// Refuse to silently swap one polecat branch for another. If the
 		// polecat has uncommitted work on the existing branch, switching
 		// would either lose it (failed checkout) or contaminate the new
 		// branch with unrelated changes. Operator chooses how to recover.
-		return fmt.Errorf("checkout-branch: refusing to switch from polecat branch %q to %q — "+
+		return polecatBranchResult{}, fmt.Errorf("refusing to switch from polecat branch %q to %q — "+
 			"commit/stash on the current branch first (this would not be safe to do silently)",
 			currentBranch, targetBranch)
 	}
@@ -165,7 +227,7 @@ func runPolecatCheckoutBranch(cmd *cobra.Command, args []string) error {
 	fetchCmd.Dir = cwd
 	util.SetDetachedProcessGroup(fetchCmd)
 	if out, fErr := fetchCmd.CombinedOutput(); fErr != nil {
-		return fmt.Errorf("checkout-branch: git fetch origin main failed: %s: %w",
+		return polecatBranchResult{}, fmt.Errorf("git fetch origin main failed: %s: %w",
 			strings.TrimSpace(string(out)), fErr)
 	}
 
@@ -197,17 +259,13 @@ func runPolecatCheckoutBranch(cmd *cobra.Command, args []string) error {
 	checkoutCmd.Dir = cwd
 	util.SetDetachedProcessGroup(checkoutCmd)
 	if out, cErr := checkoutCmd.CombinedOutput(); cErr != nil {
-		return fmt.Errorf("checkout-branch: git checkout %s failed: %s: %w",
+		return polecatBranchResult{}, fmt.Errorf("git checkout %s failed: %s: %w",
 			targetBranch, strings.TrimSpace(string(out)), cErr)
 	}
 
-	switch {
-	case branchExists:
-		fmt.Fprintf(os.Stdout, "%s Resumed existing %s (no rebase, no -b)\n",
-			style.Bold.Render("✓"), targetBranch)
-	default:
-		fmt.Fprintf(os.Stdout, "%s Created and checked out %s (from origin/main)\n",
-			style.Bold.Render("✓"), targetBranch)
+	action := polecatBranchCreated
+	if branchExists {
+		action = polecatBranchResumed
 	}
-	return nil
+	return polecatBranchResult{Target: targetBranch, Action: action}, nil
 }
