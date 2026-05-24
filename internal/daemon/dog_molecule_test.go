@@ -111,6 +111,11 @@ func TestParseChildrenJSON(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:    "envelope with null parent value errors (not silent nil slice)",
+			input:   `{"hq-wisp-root":null,"schema_version":1}`,
+			wantErr: true,
+		},
+		{
 			name:    "invalid json",
 			input:   `not json`,
 			wantErr: true,

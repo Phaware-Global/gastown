@@ -259,15 +259,23 @@ func parseChildrenJSON(raw string) ([]childInfo, error) {
 	var loose map[string]json.RawMessage
 	if err := json.Unmarshal(data, &loose); err == nil {
 		for _, v := range loose {
+			// JSON null decodes into a nil slice without error, which would
+			// look identical to "no children" and silently skip discovery
+			// and cleanup. Skip nulls explicitly so a response like
+			// {"hq-wisp-root": null, "schema_version": 1} surfaces as
+			// malformed instead of being treated as empty.
+			if string(bytes.TrimSpace(v)) == "null" {
+				continue
+			}
 			var children []childInfo
 			if err := json.Unmarshal(v, &children); err == nil {
 				return children, nil
 			}
 		}
-		// An object with no array-shaped sibling is malformed — surface it
-		// rather than silently returning "no children", which would mask
-		// future bd schema changes (the exact failure mode this parser was
-		// written to fix). An envelope-only response (e.g. just
+		// An object with no non-null array-shaped sibling is malformed —
+		// surface it rather than silently returning "no children", which
+		// would mask future bd schema changes (the exact failure mode this
+		// parser was written to fix). An envelope-only response (e.g. just
 		// {"schema_version": 1}) hits this path.
 		return nil, fmt.Errorf("no childInfo array found in JSON object: %.200s", raw)
 	}
