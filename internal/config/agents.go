@@ -694,6 +694,48 @@ func GetAgentPresetByName(name string) *AgentPresetInfo {
 	return globalRegistry.Agents[name]
 }
 
+// ResolvePresetForAgent returns the effective AgentPresetInfo for an agent name,
+// resolving town-level custom agents to their provider's built-in preset.
+//
+// Built-in and registered presets (e.g. "claude", "gemini") are returned
+// directly. Town custom agents defined in settings/config.json (e.g.
+// "claude-opus-remote-mayor", "claude-sonnet") are NOT in the built-in registry,
+// so a plain GetAgentPresetByName lookup returns nil for them. That nil caused
+// the nudge protocol to lose behavioral flags like EscapeCancelsRequest and
+// RendersBusyIndicator, re-introducing the mid-stream interrupt that #68 fixed
+// for the bare "claude" preset. This resolver closes that gap by falling back to
+// the custom agent's provider preset (defaulting to claude, matching the
+// RuntimeConfig provider default), so every claude-backed custom agent inherits
+// the no-interrupt behavior.
+//
+// townRoot may be empty, in which case only the direct registry lookup is tried.
+// LoadOrCreateTownSettings is read-only when the file exists (it returns in-memory
+// defaults when missing, never writing), so this is safe to call on the nudge path.
+func ResolvePresetForAgent(agentName, townRoot string) *AgentPresetInfo {
+	if agentName == "" {
+		return nil
+	}
+	if p := GetAgentPresetByName(agentName); p != nil {
+		return p
+	}
+	if townRoot == "" {
+		return nil
+	}
+	ts, err := LoadOrCreateTownSettings(TownSettingsPath(townRoot))
+	if err != nil || ts == nil {
+		return nil
+	}
+	if rc := ts.Agents[agentName]; rc != nil {
+		provider := rc.Provider
+		if provider == "" {
+			// RuntimeConfig normalization defaults an unset provider to claude.
+			provider = string(AgentClaude)
+		}
+		return GetAgentPresetByName(provider)
+	}
+	return nil
+}
+
 // ListAgentPresets returns all known agent preset names.
 func ListAgentPresets() []string {
 	registryMu.Lock()

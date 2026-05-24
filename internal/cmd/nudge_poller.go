@@ -70,19 +70,22 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("session %q not found", sessionName)
 	}
 
-	// Resolve nudge options once at startup: if the target agent uses Escape
-	// as cancel (e.g., Gemini CLI), skip the Escape keystroke during delivery
-	// to avoid canceling in-flight generation. (GH#gt-wasn)
-	nudgeOpts := tmux.NudgeOpts{}
+	// Resolve nudge options once at startup. TownRoot is set so deliveries
+	// participate in the flock-based cross-process nudge lock, preventing
+	// interleaving with concurrent `gt nudge` processes.
+	// SkipEscape is intentionally left to NudgeSessionWithOpts, which derives it
+	// from the session's own GT_AGENT/GT_ROOT (authoritative) rather than the
+	// poller's resolution. We still resolve the preset here for hasPromptDetection,
+	// which gates defer-until-idle. (GH#gt-wasn, PR #75 review)
+	nudgeOpts := tmux.NudgeOpts{TownRoot: townRoot}
 	agentName := ""
 	hasPromptDetection := false
 	if name, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && name != "" {
 		agentName = name
-		if preset := config.GetAgentPresetByName(agentName); preset != nil {
+		// Provider fallback so town custom agents (e.g. the mayor's
+		// "claude-opus-remote-mayor") resolve to their provider preset, not nil.
+		if preset := config.ResolvePresetForAgent(agentName, townRoot); preset != nil {
 			hasPromptDetection = preset.ReadyPromptPrefix != ""
-			if preset.EscapeCancelsRequest {
-				nudgeOpts.SkipEscape = true
-			}
 		}
 	}
 

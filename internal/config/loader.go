@@ -1160,7 +1160,12 @@ func SaveTownSettings(path string, settings *TownSettings) error {
 		return fmt.Errorf("encoding settings: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil { //nolint:gosec // G306: settings files don't contain secrets
+	// Write atomically (temp file in the same dir + rename) so concurrent readers
+	// never observe a partial/invalid config.json. ResolvePresetForAgent reads this
+	// file on the nudge delivery path; a torn read there would return nil and
+	// transiently regress the ESC-skip behavior. Use the shared atomicfile helper
+	// (already used by SaveRigSettings above).
+	if err := atomicfile.WriteFile(path, data, 0644); err != nil {
 		return fmt.Errorf("writing settings: %w", err)
 	}
 

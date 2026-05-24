@@ -1776,3 +1776,66 @@ func TestACPModeConstants(t *testing.T) {
 		t.Errorf("ACPModeFlag = %q, want flag", ACPModeFlag)
 	}
 }
+
+// TestResolvePresetForAgent verifies that town-level custom agents resolve to
+// their provider's built-in preset, so behavioral flags like EscapeCancelsRequest
+// (set on the built-in "claude" preset by #68) are inherited rather than lost to
+// a nil registry lookup. This reproduces the mayor's "claude-opus-remote-mayor"
+// case, where the lost flags re-introduced mid-stream nudge interrupts.
+func TestResolvePresetForAgent(t *testing.T) {
+	townRoot := t.TempDir()
+	ts := NewTownSettings()
+	// Mayor's custom agent: explicit provider=claude.
+	ts.Agents["claude-opus-remote-mayor"] = &RuntimeConfig{
+		Provider: "claude",
+		Command:  "claude",
+		Args:     []string{"--remote-control", "--model", "opus[1m]"},
+	}
+	// Custom agent with no explicit provider (defaults to claude).
+	ts.Agents["claude-haiku"] = &RuntimeConfig{
+		Command: "claude",
+		Args:    []string{"--model", "haiku"},
+	}
+	if err := SaveTownSettings(TownSettingsPath(townRoot), ts); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+
+	t.Run("built-in name resolves directly", func(t *testing.T) {
+		p := ResolvePresetForAgent("claude", townRoot)
+		if p == nil || !p.EscapeCancelsRequest || !p.RendersBusyIndicator {
+			t.Fatalf("claude preset = %+v, want EscapeCancelsRequest+RendersBusyIndicator", p)
+		}
+	})
+
+	t.Run("custom agent with provider inherits claude flags", func(t *testing.T) {
+		p := ResolvePresetForAgent("claude-opus-remote-mayor", townRoot)
+		if p == nil {
+			t.Fatal("expected provider fallback to claude preset, got nil")
+		}
+		if !p.EscapeCancelsRequest {
+			t.Error("EscapeCancelsRequest = false, want true (mayor would be interrupted mid-stream)")
+		}
+		if !p.RendersBusyIndicator {
+			t.Error("RendersBusyIndicator = false, want true (busy-hold would be skipped)")
+		}
+	})
+
+	t.Run("custom agent without provider defaults to claude", func(t *testing.T) {
+		p := ResolvePresetForAgent("claude-haiku", townRoot)
+		if p == nil || !p.EscapeCancelsRequest {
+			t.Fatalf("claude-haiku preset = %+v, want claude defaults", p)
+		}
+	})
+
+	t.Run("unknown agent with empty townRoot returns nil", func(t *testing.T) {
+		if p := ResolvePresetForAgent("claude-opus-remote-mayor", ""); p != nil {
+			t.Fatalf("expected nil without townRoot, got %+v", p)
+		}
+	})
+
+	t.Run("unknown agent not in town settings returns nil", func(t *testing.T) {
+		if p := ResolvePresetForAgent("does-not-exist", townRoot); p != nil {
+			t.Fatalf("expected nil for unknown agent, got %+v", p)
+		}
+	})
+}

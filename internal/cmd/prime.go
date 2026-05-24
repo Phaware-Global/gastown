@@ -232,10 +232,13 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 }
 
 // runPrimeCompactResume runs a lighter prime after compaction or resume.
-// The agent already has full role context in compressed memory. This just
-// restores identity and injects any new mail. It deliberately skips
-// setupPrimeSession and findAgentWork (which hit Dolt) to stay fast
-// enough for non-Claude runtimes with short hook timeouts.
+// The agent already has full role context in compressed memory. This restores
+// identity and re-injects durable agent memories (which compaction can drop).
+// It deliberately skips setupPrimeSession and findAgentWork (which hit Dolt) to
+// stay fast enough for non-Claude runtimes with short hook timeouts; the memory
+// shell-out is timeout-bounded for the same reason. New mail is not injected
+// here — that is handled separately by the UserPromptSubmit `gt mail check
+// --inject` hook.
 //
 // Unlike the full prime path, this outputs a brief recovery line instead of
 // the full AUTONOMOUS WORK MODE block. This prevents agents from re-announcing
@@ -256,6 +259,16 @@ func runPrimeCompactResume(ctx RoleContext) {
 	fmt.Println("\n---")
 	fmt.Println()
 	fmt.Println("**Continue your current task.** If you've lost context, run `gt prime` for full reload.")
+
+	// Re-inject stored memories. Compaction summarizes the conversation and can
+	// drop the agent memories that were injected at the original startup, leaving
+	// long-lived agents (notably the mayor) running without their feedback/project
+	// memories for the rest of the session. Unlike the full prime, this is the only
+	// external-tool call we make here — memories are durable context that must
+	// survive a compaction, whereas bd prime / mail are refreshed by other hooks.
+	if !primeDryRun {
+		runMemoryInject()
+	}
 
 	// Remind polecats about gt done — after compaction the agent may have lost
 	// the formula checklist and forgotten that gt done is required to submit work.

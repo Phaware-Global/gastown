@@ -1781,15 +1781,36 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	return nil
 }
 
+// presetForSession resolves the effective agent preset for a tmux session from
+// its GT_AGENT environment value. It uses GT_ROOT (also from the session env) so
+// that town-level custom agents — e.g. the mayor's "claude-opus-remote-mayor",
+// which is not in the built-in preset registry — resolve to their provider's
+// preset rather than nil. Without this, the nudge protocol could not see the
+// EscapeCancelsRequest/RendersBusyIndicator flags for any custom agent and fell
+// back to sending the destructive Escape mid-stream (the recurrence of #68).
+// Best-effort: returns nil on any resolution error.
+func (t *Tmux) presetForSession(session string) *config.AgentPresetInfo {
+	agentType, err := t.GetEnvironment(session, "GT_AGENT")
+	if err != nil || agentType == "" {
+		return nil
+	}
+	// Prefer the session's own GT_ROOT (authoritative for cross-town cases); if it
+	// is missing/unreadable, fall back to this process's GT_ROOT so the provider
+	// fallback for town custom agents still works. Without a town root,
+	// ResolvePresetForAgent can only do a built-in lookup, which returns nil for
+	// custom agents and would revert the nudge protocol to sending Escape.
+	townRoot, err := t.GetEnvironment(session, "GT_ROOT")
+	if err != nil || townRoot == "" {
+		townRoot = os.Getenv("GT_ROOT")
+	}
+	return config.ResolvePresetForAgent(agentType, townRoot)
+}
+
 // shouldSkipEscapeForSession reports whether the agent running in this tmux
 // session has EscapeCancelsRequest=true in its preset. Best-effort: any
 // resolution error returns false (i.e., default to sending Escape).
 func (t *Tmux) shouldSkipEscapeForSession(session string) bool {
-	agentType, err := t.GetEnvironment(session, "GT_AGENT")
-	if err != nil || agentType == "" {
-		return false
-	}
-	preset := config.GetAgentPresetByName(agentType)
+	preset := t.presetForSession(session)
 	return preset != nil && preset.EscapeCancelsRequest
 }
 
@@ -1808,11 +1829,7 @@ func (t *Tmux) shouldSkipEscapeForPane(pane string) bool {
 // renders the busy indicator hasBusyIndicator detects, so the post-Enter hold
 // is meaningful. False means the hold would just be dead latency.
 func (t *Tmux) shouldWaitForBusyIndicatorSession(session string) bool {
-	agentType, err := t.GetEnvironment(session, "GT_AGENT")
-	if err != nil || agentType == "" {
-		return false
-	}
-	preset := config.GetAgentPresetByName(agentType)
+	preset := t.presetForSession(session)
 	return preset != nil && preset.RendersBusyIndicator
 }
 
