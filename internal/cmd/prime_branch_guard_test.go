@@ -9,33 +9,6 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 )
 
-// TestIsDefaultBranch pins which branch names the off-main guard treats as
-// "don't work here" for a polecat. main/master must trip the guard; polecat
-// branches, detached HEAD, and the empty string must not.
-func TestIsDefaultBranch(t *testing.T) {
-	cases := []struct {
-		in   string
-		want bool
-	}{
-		{"main", true},
-		{"master", true},
-		{"  main  ", true}, // trimmed
-		{"polecat/nux-gt-tk5", false},
-		{"polecat/nux/gt-tk5@mpkb5d9l", false},
-		{"HEAD", false}, // detached HEAD — a different problem, not ours
-		{"", false},
-		{"maintenance", false}, // substring trap
-		{"feature/main", false},
-	}
-	for _, c := range cases {
-		t.Run(c.in, func(t *testing.T) {
-			if got := isDefaultBranch(c.in); got != c.want {
-				t.Errorf("isDefaultBranch(%q) = %v; want %v", c.in, got, c.want)
-			}
-		})
-	}
-}
-
 // gitRun runs a git command in dir and fails the test on error.
 func gitRun(t *testing.T, dir string, args ...string) {
 	t.Helper()
@@ -51,17 +24,25 @@ func gitRun(t *testing.T, dir string, args ...string) {
 // looks like: it has origin/main to branch from.
 func newOriginAndClone(t *testing.T) string {
 	t.Helper()
+	return newOriginAndCloneBranch(t, "main")
+}
+
+// newOriginAndCloneBranch is newOriginAndClone parameterized on the default
+// branch name, so tests can exercise master-based repos (gt-tk5 thread #3: the
+// guard must not hardcode origin/main).
+func newOriginAndCloneBranch(t *testing.T, defaultBranch string) string {
+	t.Helper()
 	root := t.TempDir()
 	origin := filepath.Join(root, "origin.git")
 	work := filepath.Join(root, "seed")
 
-	gitRun(t, root, "init", "--bare", "-b", "main", origin)
-	gitRun(t, root, "init", "-b", "main", work)
+	gitRun(t, root, "init", "--bare", "-b", defaultBranch, origin)
+	gitRun(t, root, "init", "-b", defaultBranch, work)
 	gitRun(t, work, "config", "user.email", "test@example.com")
 	gitRun(t, work, "config", "user.name", "Test")
 	gitRun(t, work, "commit", "--allow-empty", "-m", "init")
 	gitRun(t, work, "remote", "add", "origin", origin)
-	gitRun(t, work, "push", "origin", "main")
+	gitRun(t, work, "push", "origin", defaultBranch)
 
 	clone := filepath.Join(root, "clone")
 	gitRun(t, root, "clone", origin, clone)
@@ -96,6 +77,27 @@ func TestEnsurePolecatWorkBranch_CreatesFromMain(t *testing.T) {
 	}
 	if res.Target != "polecat/nux-gt-tk5" {
 		t.Errorf("Target = %q; want polecat/nux-gt-tk5", res.Target)
+	}
+	if got := currentBranch(t, clone); got != "polecat/nux-gt-tk5" {
+		t.Errorf("worktree left on %q; want polecat/nux-gt-tk5", got)
+	}
+}
+
+// TestEnsurePolecatWorkBranch_CreatesFromMaster is gt-tk5 thread #3: on a
+// master-based repo there is no origin/main, so a hardcoded base would fail.
+// The restore must detect the actual default branch (master) and branch from it.
+func TestEnsurePolecatWorkBranch_CreatesFromMaster(t *testing.T) {
+	clone := newOriginAndCloneBranch(t, "master")
+	if got := currentBranch(t, clone); got != "master" {
+		t.Fatalf("precondition: expected to start on master, got %q", got)
+	}
+
+	res, err := ensurePolecatWorkBranch(clone, "nux", "gt-tk5")
+	if err != nil {
+		t.Fatalf("ensurePolecatWorkBranch on master-based repo: %v", err)
+	}
+	if res.Action != polecatBranchCreated {
+		t.Errorf("Action = %q; want %q", res.Action, polecatBranchCreated)
 	}
 	if got := currentBranch(t, clone); got != "polecat/nux-gt-tk5" {
 		t.Errorf("worktree left on %q; want polecat/nux-gt-tk5", got)

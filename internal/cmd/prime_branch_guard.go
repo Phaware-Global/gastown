@@ -10,18 +10,6 @@ import (
 	"github.com/steveyegge/gastown/internal/style"
 )
 
-// isDefaultBranch reports whether branch is one a polecat must never work on
-// directly. Polecats commit on polecat/<name>-<bead> branches and submit through
-// the merge queue / PR path; main and master are owned by the refinery. (gt-tk5)
-func isDefaultBranch(branch string) bool {
-	switch strings.TrimSpace(branch) {
-	case "main", "master":
-		return true
-	default:
-		return false
-	}
-}
-
 // ensurePolecatOffMain refuses to let a polecat session proceed while its
 // worktree HEAD sits on main/master, auto-restoring it to the namespaced work
 // branch (polecat/<name>-<bead>) when it has enough information to do so.
@@ -54,7 +42,10 @@ func ensurePolecatOffMain(ctx RoleContext, hookedBead *beads.Issue) error {
 		return nil
 	}
 	branch = strings.TrimSpace(branch)
-	if !isDefaultBranch(branch) {
+	// git.IsProtectedBranch is the same closed allowlist the block-push guard
+	// (gt-i71) uses — main/master plus develop for gitflow rigs. A polecat must
+	// never commit directly on ANY of them.
+	if !git.IsProtectedBranch(branch) {
 		explain(true, fmt.Sprintf("Off-main guard: worktree on %q — ok", branch))
 		return nil
 	}
@@ -104,12 +95,20 @@ func printOffMainRefusal(branch, polecatName, beadID string) {
 	fmt.Fprintf(os.Stderr, "work goes through a polecat/<name>-<bead> branch and the merge queue.\n\n")
 	fmt.Fprintf(os.Stderr, "Auto-restore could not run because the work branch name is unknown\n")
 	fmt.Fprintf(os.Stderr, "(polecat=%q bead=%q).\n\n", polecatName, beadID)
-	fmt.Fprintf(os.Stderr, "Recover before doing anything else:\n")
-	if polecatName != "" && beadID != "" {
-		fmt.Fprintf(os.Stderr, "  gt polecat checkout-branch %s\n\n", beadID)
-	} else {
-		fmt.Fprintf(os.Stderr, "  gt polecat checkout-branch <bead-id>   # the bead on your hook\n\n")
+	// The recovery command resolves its polecat name from --polecat or
+	// $GT_POLECAT; the latter is not guaranteed to be set in every session, so
+	// always spell out --polecat to give a command that works as-is. Fill in
+	// whichever halves the guard couldn't determine with <placeholders>.
+	beadArg := beadID
+	if beadArg == "" {
+		beadArg = "<bead-id>"
 	}
+	polecatArg := polecatName
+	if polecatArg == "" {
+		polecatArg = "<polecat-name>"
+	}
+	fmt.Fprintf(os.Stderr, "Recover before doing anything else:\n")
+	fmt.Fprintf(os.Stderr, "  gt polecat checkout-branch %s --polecat %s\n\n", beadArg, polecatArg)
 	fmt.Fprintf(os.Stderr, "If that fails, escalate — do NOT commit on main:\n")
 	fmt.Fprintf(os.Stderr, "  gt escalate -s HIGH \"polecat stuck on %s, cannot restore work branch\"\n\n", branch)
 }

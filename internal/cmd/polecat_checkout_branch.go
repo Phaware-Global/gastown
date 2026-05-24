@@ -175,11 +175,11 @@ type polecatBranchResult struct {
 //   - already on the target            → no-op (polecatBranchNoop)
 //   - on a *different* polecat/… branch → error (refuse to swap silently; the
 //     caller's uncommitted work would be lost or contaminated)
-//   - anything else (main, master,     → fetch origin/main, then check out the
-//     detached, residual)                target: plain checkout if it already
-//                                        exists locally (polecatBranchResumed),
-//                                        else `checkout -b … origin/main`
-//                                        (polecatBranchCreated)
+//   - anything else (main, master,     → fetch the repo's default branch, then
+//     detached, residual)                check out the target: plain checkout if
+//                                        it already exists locally
+//                                        (polecatBranchResumed), else create it
+//                                        from origin/<default> (polecatBranchCreated)
 //
 // git operations run via exec.Command (a subprocess of `gt`), NOT a Bash tool
 // call from the LLM, so the tap-guard PreToolUse hook — which blocks raw
@@ -219,16 +219,25 @@ func ensurePolecatWorkBranch(cwd, polecatName, beadID string) (polecatBranchResu
 			currentBranch, targetBranch)
 	}
 
-	// Fresh fetch so the new branch is based on the latest origin/main.
+	// Base the work branch on the repo's ACTUAL default branch, not a
+	// hardcoded "main". Master-based repos/worktrees have no origin/main, so
+	// hardcoding it makes restore fail and wedges `gt prime` — the exact
+	// failure this guard exists to prevent. RemoteDefaultBranch resolves
+	// origin/HEAD (falling back to origin/master then origin/main) from the
+	// remote-tracking refs already present after clone.
+	defaultBranch := g.RemoteDefaultBranch()
+	remoteRef := "origin/" + defaultBranch
+
+	// Fresh fetch so the new branch is based on the latest default branch.
 	// Routing through `git fetch` (rather than g.Fetch which we'd have to
 	// add) keeps this command's blast radius narrow — a single helper, no
 	// new git package surface.
-	fetchCmd := exec.Command("git", "fetch", "origin", "main")
+	fetchCmd := exec.Command("git", "fetch", "origin", defaultBranch)
 	fetchCmd.Dir = cwd
 	util.SetDetachedProcessGroup(fetchCmd)
 	if out, fErr := fetchCmd.CombinedOutput(); fErr != nil {
-		return polecatBranchResult{}, fmt.Errorf("git fetch origin main failed: %s: %w",
-			strings.TrimSpace(string(out)), fErr)
+		return polecatBranchResult{}, fmt.Errorf("git fetch origin %s failed: %s: %w",
+			defaultBranch, strings.TrimSpace(string(out)), fErr)
 	}
 
 	// Branch already exists locally? Plain `checkout -b` would fail; the
@@ -254,7 +263,7 @@ func ensurePolecatWorkBranch(cwd, polecatName, beadID string) (polecatBranchResu
 	if branchExists {
 		checkoutCmd = exec.Command("git", "checkout", targetBranch)
 	} else {
-		checkoutCmd = exec.Command("git", "checkout", "-b", targetBranch, "origin/main")
+		checkoutCmd = exec.Command("git", "checkout", "-b", targetBranch, remoteRef)
 	}
 	checkoutCmd.Dir = cwd
 	util.SetDetachedProcessGroup(checkoutCmd)
