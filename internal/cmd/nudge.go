@@ -270,7 +270,10 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		// For these agents, skip the Escape keystroke to avoid canceling
 		// in-flight generation. (GH#gt-wasn)
 		if agentName, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && agentName != "" {
-			if preset := config.GetAgentPresetByName(agentName); preset != nil && preset.EscapeCancelsRequest {
+			// Provider fallback resolves town custom agents (e.g. the mayor's
+			// "claude-opus-remote-mayor") to the claude preset so EscapeCancelsRequest
+			// is honored instead of lost to a nil lookup. (GH#68 recurrence)
+			if preset := config.ResolvePresetForAgent(agentName, townRoot); preset != nil && preset.EscapeCancelsRequest {
 				opts.SkipEscape = true
 			}
 		}

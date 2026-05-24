@@ -78,7 +78,11 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 	hasPromptDetection := false
 	if name, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && name != "" {
 		agentName = name
-		if preset := config.GetAgentPresetByName(agentName); preset != nil {
+		// Resolve via provider fallback so town custom agents (e.g. the mayor's
+		// "claude-opus-remote-mayor") inherit the claude preset's flags instead
+		// of resolving to nil. (GH#68 recurrence)
+		townRoot, _ := t.GetEnvironment(sessionName, "GT_ROOT")
+		if preset := config.ResolvePresetForAgent(agentName, townRoot); preset != nil {
 			hasPromptDetection = preset.ReadyPromptPrefix != ""
 			if preset.EscapeCancelsRequest {
 				nudgeOpts.SkipEscape = true
