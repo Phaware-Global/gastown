@@ -96,6 +96,16 @@ func TestParseChildrenJSON(t *testing.T) {
 			wantCount: 0,
 		},
 		{
+			name:      "bd >=1.0.3 envelope with schema_version sibling",
+			input:     `{"hq-wisp-root":[{"id":"hq-wisp-a","title":"Probe","status":"open"}],"schema_version":1}`,
+			wantCount: 1,
+		},
+		{
+			name:      "bd >=1.0.3 envelope with empty children",
+			input:     `{"hq-wisp-root":[],"schema_version":1}`,
+			wantCount: 0,
+		},
+		{
 			name:    "invalid json",
 			input:   `not json`,
 			wantErr: true,

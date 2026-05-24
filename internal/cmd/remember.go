@@ -216,6 +216,12 @@ func bdKvClear(key string) error {
 }
 
 // bdKvListJSON calls bd kv list --json and returns the parsed map.
+//
+// bd >=1.0.3 injects a top-level "schema_version": N (number) sibling field
+// into every object-shaped --json output, so the response now looks like
+// {"schema_version": 1, "key1": "value1", ...}. Decode into RawMessage and
+// keep only the entries that parse as strings — the version sibling and any
+// future non-string envelope fields are silently dropped.
 func bdKvListJSON() (map[string]string, error) {
 	cmd := exec.Command("bd", "kv", "list", "--json")
 	out, err := cmd.Output()
@@ -223,9 +229,21 @@ func bdKvListJSON() (map[string]string, error) {
 		return nil, err
 	}
 
-	var kvs map[string]string
-	if err := json.Unmarshal(out, &kvs); err != nil {
+	return parseKvListJSON(out)
+}
+
+func parseKvListJSON(out []byte) (map[string]string, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(out, &raw); err != nil {
 		return nil, fmt.Errorf("parsing kv list: %w", err)
+	}
+
+	kvs := make(map[string]string, len(raw))
+	for k, v := range raw {
+		var s string
+		if err := json.Unmarshal(v, &s); err == nil {
+			kvs[k] = s
+		}
 	}
 	return kvs, nil
 }

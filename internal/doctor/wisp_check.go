@@ -87,7 +87,6 @@ func (c *WispGCCheck) Run(ctx *CheckContext) *CheckResult {
 // countAbandonedWisps counts wisps older than the threshold in a rig.
 // Queries the wisps table via bd mol wisp list (Dolt server is required).
 func (c *WispGCCheck) countAbandonedWisps(rigPath string) int {
-	// Query wisps table via bd CLI
 	cmd := exec.Command("bd", "mol", "wisp", "list", "--json")
 	cmd.Dir = rigPath
 
@@ -97,20 +96,31 @@ func (c *WispGCCheck) countAbandonedWisps(rigPath string) int {
 		return 0
 	}
 
-	var wisps []struct {
-		ID        string `json:"id"`
-		Status    string `json:"status"`
-		Ephemeral bool   `json:"ephemeral"`
-		UpdatedAt string `json:"updated_at"`
+	// Use UTC for cutoff: Dolt stores timestamps in UTC (gt-ty4).
+	cutoff := time.Now().UTC().Add(-c.threshold)
+	return countAbandonedWispsFromJSON(output, cutoff)
+}
+
+// countAbandonedWispsFromJSON parses the output of `bd mol wisp list --json`
+// and returns the number of non-closed wisps last updated before cutoff.
+//
+// bd >=1.0.3 returns {"wisps": [...], "count": N, "schema_version": 1}.
+// Returns 0 on parse error (matches the previous behavior).
+func countAbandonedWispsFromJSON(output []byte, cutoff time.Time) int {
+	var wrapper struct {
+		Wisps []struct {
+			ID        string `json:"id"`
+			Status    string `json:"status"`
+			Ephemeral bool   `json:"ephemeral"`
+			UpdatedAt string `json:"updated_at"`
+		} `json:"wisps"`
 	}
-	if err := json.Unmarshal(output, &wisps); err != nil {
+	if err := json.Unmarshal(output, &wrapper); err != nil {
 		return 0
 	}
 
-	// Use UTC for cutoff: Dolt stores timestamps in UTC (gt-ty4).
-	cutoff := time.Now().UTC().Add(-c.threshold)
 	count := 0
-	for _, w := range wisps {
+	for _, w := range wrapper.Wisps {
 		if w.Status == "closed" {
 			continue
 		}
