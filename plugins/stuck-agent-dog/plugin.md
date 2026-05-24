@@ -145,7 +145,7 @@ while IFS='|' read -r RIG PREFIX; do
         # every genuine crash would be skipped. Anything else (closed, blocked,
         # deferred, or unresolvable) is a stale hook. Root cause: hq-k6u.
         HOOK_STATUS=$(bd show "$HOOK_BEAD" --json 2>/dev/null \
-          | jq -r '.status // empty' 2>/dev/null)
+          | jq -r '.[0].status // .status // empty' 2>/dev/null)
         case "$HOOK_STATUS" in
           open|in_progress|hooked) ;;  # live work — fall through to CRASHED
           *)
