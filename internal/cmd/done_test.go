@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -537,10 +538,11 @@ func TestSessionKillGateGuardLogic(t *testing.T) {
 func TestMRVerificationSetsMRFailed(t *testing.T) {
 	tests := []struct {
 		name         string
-		createErr    error  // error from bd.Create
-		showErr      error  // error from bd.Show (verification)
-		showReturns  bool   // whether Show returns a non-nil issue
+		createErr    error // error from bd.Create
+		showErr      error // error from bd.Show (verification)
+		showReturns  bool  // whether Show returns a non-nil issue
 		wantMRFailed bool
+		wantHardErr  bool // gt-5u4: bd.Create failure now hard-fails (returns error)
 	}{
 		{
 			name:         "create succeeds + show succeeds → mrFailed=false",
@@ -548,13 +550,15 @@ func TestMRVerificationSetsMRFailed(t *testing.T) {
 			showErr:      nil,
 			showReturns:  true,
 			wantMRFailed: false,
+			wantHardErr:  false,
 		},
 		{
-			name:         "create fails → mrFailed=true (existing behavior)",
+			name:         "create fails → hard error, mrFailed NOT set (gt-5u4)",
 			createErr:    fmt.Errorf("dolt write failed"),
 			showErr:      nil,
 			showReturns:  false,
-			wantMRFailed: true,
+			wantMRFailed: false,
+			wantHardErr:  true,
 		},
 		{
 			name:         "create succeeds + show fails → mrFailed=true (GH#1945 fix)",
@@ -562,6 +566,7 @@ func TestMRVerificationSetsMRFailed(t *testing.T) {
 			showErr:      fmt.Errorf("bead not found"),
 			showReturns:  false,
 			wantMRFailed: true,
+			wantHardErr:  false,
 		},
 		{
 			name:         "create succeeds + show returns nil → mrFailed=true (GH#1945 fix)",
@@ -569,17 +574,22 @@ func TestMRVerificationSetsMRFailed(t *testing.T) {
 			showErr:      nil,
 			showReturns:  false,
 			wantMRFailed: true,
+			wantHardErr:  false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Simulate the MR creation + verification flow from done.go
+			// Simulate the MR creation + verification flow from done.go.
 			mrFailed := false
+			var hardErr error
 
 			if tt.createErr != nil {
-				// bd.Create failed — existing behavior
-				mrFailed = true
+				// gt-5u4: bd.Create failure is now a hard fail. done.go returns
+				// immediately (no mrFailed, no goto notifyWitness, no IDLE transition).
+				hardErr = fmt.Errorf("failed to create MR bead — branch %s was pushed but no merge slot exists; "+
+					"refinery will not pick this up. fix the underlying error and re-run gt done. "+
+					"underlying error: %w", "polecat/test", tt.createErr)
 			} else {
 				// bd.Create succeeded — now verify (GH#1945 fix)
 				var showResult bool
@@ -596,8 +606,64 @@ func TestMRVerificationSetsMRFailed(t *testing.T) {
 			if mrFailed != tt.wantMRFailed {
 				t.Errorf("mrFailed = %v, want %v", mrFailed, tt.wantMRFailed)
 			}
+			if (hardErr != nil) != tt.wantHardErr {
+				t.Errorf("hardErr = %v, want hard error: %v", hardErr, tt.wantHardErr)
+			}
 		})
 	}
+}
+
+// TestMRBeadCreateFailureHardFails verifies gt-5u4: when bd.Create() for the MR
+// bead fails, gt done must hard-fail (return a non-nil error) rather than swallow
+// the error and transition the polecat to IDLE/COMPLETED with no merge slot.
+//
+// This is a logic/contract test mirroring the error branch in done.go. The real
+// branch returns the error verbatim instead of `goto notifyWitness`, so the IDLE
+// transition and source-bead close logic (both past notifyWitness) never run and
+// the process exits non-zero.
+func TestMRBeadCreateFailureHardFails(t *testing.T) {
+	// mrBeadCreateResult mirrors the done.go branch:
+	//   mrIssue, err := bd.Create(...)
+	//   if err != nil { return fmt.Errorf(... %w, err) }
+	mrBeadCreateResult := func(branch string, createErr error) (mrFailed bool, retErr error) {
+		if createErr != nil {
+			return false, fmt.Errorf("failed to create MR bead — branch %s was pushed but no merge slot exists; "+
+				"refinery will not pick this up. fix the underlying error and re-run gt done. "+
+				"underlying error: %w", branch, createErr)
+		}
+		return false, nil
+	}
+
+	t.Run("create error → non-nil return, no mrFailed, wraps cause", func(t *testing.T) {
+		cause := fmt.Errorf("dolt: connection refused")
+		mrFailed, err := mrBeadCreateResult("polecat/furiosa/gt-5u4", cause)
+
+		if err == nil {
+			t.Fatal("expected a non-nil error when bd.Create fails (gt done must exit non-zero)")
+		}
+		if !errors.Is(err, cause) {
+			t.Errorf("returned error must wrap the underlying cause via %%w; got %v", err)
+		}
+		if mrFailed {
+			t.Error("mrFailed must NOT be set on hard-fail: the function returns before the IDLE/notifyWitness path")
+		}
+		// The message must guide recovery: branch is pushed, no merge slot, re-run gt done.
+		for _, want := range []string{"was pushed but no merge slot", "no merge slot exists", "re-run gt done"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error message missing %q; got: %s", want, err.Error())
+			}
+		}
+	})
+
+	t.Run("create success → no error", func(t *testing.T) {
+		mrFailed, err := mrBeadCreateResult("polecat/furiosa/gt-5u4", nil)
+		if err != nil {
+			t.Errorf("expected no error when bd.Create succeeds; got %v", err)
+		}
+		if mrFailed {
+			t.Error("mrFailed must be false on success")
+		}
+	})
 }
 
 // TestMRBeadCreationUsesRig verifies that MR bead creation specifies the rig (gt-7y7).

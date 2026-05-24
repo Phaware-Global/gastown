@@ -1358,14 +1358,18 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				Rig:         rigName, // Ensure MR bead is created in the rig's database (gt-7y7)
 			})
 			if err != nil {
-				// Non-fatal: record the error and skip to notifyWitness.
-				// Push succeeded so branch is on remote, but MR bead failed.
-				// Set mrFailed so the witness knows not to send MERGE_READY.
-				mrFailed = true
-				errMsg := fmt.Sprintf("MR bead creation failed: %v", err)
-				doneErrors = append(doneErrors, errMsg)
-				style.PrintWarning("%s\nBranch is pushed but MR bead not created. Witness will be notified.", errMsg)
-				goto notifyWitness
+				// gt-5u4: Hard-fail when the MR bead cannot be created. The branch was
+				// already pushed, but without a merge slot the refinery has nothing to
+				// act on. The previous behavior (warn + mrFailed=true + goto notifyWitness)
+				// let the polecat transition to IDLE and report COMPLETED even though no
+				// merge slot existed — Layer 3 of the silent-failure cascade in gt-hwd.
+				// Returning here exits non-zero, leaves the source bead open (the IDLE
+				// transition and bead-close logic live past notifyWitness, which we skip),
+				// and leaves the branch on origin so a re-run of `gt done` re-attempts MR
+				// creation once the underlying error is fixed.
+				return fmt.Errorf("failed to create MR bead — branch %s was pushed but no merge slot exists; "+
+					"refinery will not pick this up. fix the underlying error and re-run gt done. "+
+					"underlying error: %w", branch, err)
 			}
 			mrID = mrIssue.ID
 
