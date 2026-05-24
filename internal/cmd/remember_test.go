@@ -4,6 +4,74 @@ import (
 	"testing"
 )
 
+func TestParseKvListJSON(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		want    map[string]string
+		wantErr bool
+	}{
+		{
+			name: "bd >=1.0.3 envelope with entries",
+			in:   `{"schema_version": 1, "foo": "bar", "memory.feedback.x": "be terse"}`,
+			want: map[string]string{
+				"foo":               "bar",
+				"memory.feedback.x": "be terse",
+			},
+		},
+		{
+			name: "bd >=1.0.3 empty envelope",
+			in:   `{"schema_version": 1}`,
+			want: map[string]string{},
+		},
+		{
+			name: "legacy bd <1.0.3 bare map",
+			in:   `{"foo": "bar"}`,
+			want: map[string]string{"foo": "bar"},
+		},
+		{
+			name: "empty object",
+			in:   `{}`,
+			want: map[string]string{},
+		},
+		{
+			name: "mixed non-string siblings are skipped",
+			in:   `{"schema_version": 1, "count": 5, "foo": "bar", "nested": {"a":1}}`,
+			want: map[string]string{"foo": "bar"},
+		},
+		{
+			name:    "invalid JSON",
+			in:      `not json`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseKvListJSON([]byte(tt.in))
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseKvListJSON err = %v, wantErr=%v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("len = %d, want %d (got %v)", len(got), len(tt.want), got)
+			}
+			for k, v := range tt.want {
+				gotV, ok := got[k]
+				if !ok {
+					t.Errorf("key %q missing from result (got %v)", k, got)
+					continue
+				}
+				if gotV != v {
+					t.Errorf("key %q = %q, want %q", k, gotV, v)
+				}
+			}
+		})
+	}
+}
+
 func TestAutoKey(t *testing.T) {
 	tests := []struct {
 		name    string
