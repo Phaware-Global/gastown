@@ -38,7 +38,10 @@ Related commands:
   gt hook <bead>     # Hook without starting
   gt hook      # See what's on your hook`,
 	Args: cobra.MaximumNArgs(2),
-	RunE: runUnsling,
+	// Don't dump usage on a runtime failure (e.g. dead target session) — it
+	// makes operational errors look like syntax errors. (PR: usage-on-error)
+	SilenceUsage: true,
+	RunE:         runUnsling,
 }
 
 var (
@@ -81,7 +84,10 @@ func runUnslingWith(cmd *cobra.Command, args []string, dryRun, force bool) error
 	var agentID string
 	var err error
 	if targetAgent != "" {
-		agentID, _, _, err = resolveTargetAgent(targetAgent)
+		// Resolve agent ID without requiring a live tmux session: unsling only
+		// needs the ID to find/clear the hooked bead, and is specifically needed
+		// to clear a stale hook off a dead/nuked agent. (gt hook detach on dead targets)
+		agentID, err = resolveTargetAgentID(targetAgent)
 		if err != nil {
 			return fmt.Errorf("resolving target agent: %w", err)
 		}
