@@ -264,7 +264,12 @@ func parseChildrenJSON(raw string) ([]childInfo, error) {
 				return children, nil
 			}
 		}
-		return nil, nil
+		// An object with no array-shaped sibling is malformed — surface it
+		// rather than silently returning "no children", which would mask
+		// future bd schema changes (the exact failure mode this parser was
+		// written to fix). An envelope-only response (e.g. just
+		// {"schema_version": 1}) hits this path.
+		return nil, fmt.Errorf("no childInfo array found in JSON object: %.200s", raw)
 	}
 
 	return nil, fmt.Errorf("unrecognized JSON shape: %.200s", raw)

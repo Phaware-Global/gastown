@@ -106,6 +106,11 @@ func TestParseChildrenJSON(t *testing.T) {
 			wantCount: 0,
 		},
 		{
+			name:    "envelope with no array-shaped sibling errors",
+			input:   `{"schema_version":1}`,
+			wantErr: true,
+		},
+		{
 			name:    "invalid json",
 			input:   `not json`,
 			wantErr: true,
