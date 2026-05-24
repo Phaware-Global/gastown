@@ -725,16 +725,15 @@ func ResolvePresetForAgent(agentName, townRoot string) *AgentPresetInfo {
 	if err != nil || ts == nil {
 		return nil
 	}
-	rc := ts.Agents[agentName]
-	if rc == nil {
-		return nil
+	if rc := ts.Agents[agentName]; rc != nil {
+		provider := rc.Provider
+		if provider == "" {
+			// RuntimeConfig normalization defaults an unset provider to claude.
+			provider = string(AgentClaude)
+		}
+		return GetAgentPresetByName(provider)
 	}
-	provider := rc.Provider
-	if provider == "" {
-		// RuntimeConfig normalization defaults an unset provider to claude.
-		provider = string(AgentClaude)
-	}
-	return GetAgentPresetByName(provider)
+	return nil
 }
 
 // ListAgentPresets returns all known agent preset names.
