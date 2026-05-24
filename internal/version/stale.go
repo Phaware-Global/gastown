@@ -22,6 +22,7 @@ var (
 type StaleBinaryInfo struct {
 	IsStale       bool   // True if binary commit doesn't match repo HEAD
 	IsForward     bool   // True if repo HEAD is a descendant of binary commit (safe to rebuild)
+	BinaryAhead   bool   // True if binary commit is a descendant of repo HEAD (binary newer than checkout; not stale)
 	OnMainBranch  bool   // True if the repo is on the main branch
 	BinaryCommit  string // Commit hash the binary was built from
 	RepoCommit    string // Current repo HEAD commit
@@ -122,6 +123,21 @@ func CheckStaleBinary(repoDir string) *StaleBinaryInfo {
 		// trigger a stale warning. (GH#2596)
 		if onlyBeadsChanges(repoDir, info.BinaryCommit) {
 			// HEAD advanced but only via beads-only commits — not stale
+			return info
+		}
+
+		// If repo HEAD is an ancestor of the binary commit, the binary is a
+		// DESCENDANT of HEAD — i.e. newer than this checkout, not stale. This
+		// happens when gt runs against a workspace whose gastown source checkout
+		// lags the installed binary (e.g. ~/gt/gastown/mayor/rig behind main).
+		// Without this guard the binary's own newness is misreported as
+		// staleness, and the "run make install" advice would *downgrade* the
+		// binary if followed from the lagging checkout.
+		aheadCmd := exec.Command("git", "merge-base", "--is-ancestor", info.RepoCommit, info.BinaryCommit)
+		aheadCmd.Dir = repoDir
+		util.SetDetachedProcessGroup(aheadCmd)
+		if aheadCmd.Run() == nil {
+			info.BinaryAhead = true
 			return info
 		}
 

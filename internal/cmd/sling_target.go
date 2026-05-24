@@ -43,6 +43,24 @@ func resolveTargetAgent(target string) (agentID string, pane string, hookRoot st
 	return agentID, pane, hookRoot, nil
 }
 
+// resolveTargetAgentID resolves a target string to its canonical agent ID
+// WITHOUT requiring the target's tmux session to be alive.
+//
+// resolveTargetAgent additionally fetches the session pane and working dir,
+// which fails for a dead session ("getting pane for <session>: exit status 1").
+// Hook-clearing paths (gt hook detach / clear / unhook / unsling) only need the
+// agent ID to find and clear the hooked work bead — and are most useful exactly
+// when the target's session is dead (clearing a stale hook off a nuked polecat).
+// Both resolveRoleToSession and sessionToAgentID are tmux-free, so this works
+// regardless of session liveness.
+func resolveTargetAgentID(target string) (string, error) {
+	sessionName, err := resolveRoleToSession(target)
+	if err != nil {
+		return "", err
+	}
+	return sessionToAgentID(sessionName), nil
+}
+
 // sessionToAgentID converts a session name to agent ID format.
 // Uses session.ParseSessionName for consistent parsing across the codebase.
 func sessionToAgentID(sessionName string) string {

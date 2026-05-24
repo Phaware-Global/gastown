@@ -1,6 +1,10 @@
 package version
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -103,5 +107,65 @@ func TestCheckStaleBinary_NoCommit(t *testing.T) {
 	// Both are acceptable outcomes
 	if info.BinaryCommit == "" && info.Error == nil {
 		t.Error("expected error when binary commit is empty")
+	}
+}
+
+// TestCheckStaleBinary_BinaryAhead verifies that when the installed binary's
+// commit is a DESCENDANT of the repo HEAD (the binary is newer than the source
+// checkout it's run against), it is NOT reported as stale. This reproduces the
+// false-positive that misled the mayor: the binary was current with main while
+// the workspace's gastown checkout lagged behind, and the old logic warned
+// "stale" + advised a make install that would have downgraded the binary.
+func TestCheckStaleBinary_BinaryAhead(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	original := Commit
+	defer func() { Commit = original }()
+
+	repo := t.TempDir()
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	git("init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "a.go"), []byte("package a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "-A")
+	git("commit", "-q", "-m", "commit A")
+	headCommit := git("rev-parse", "HEAD") // older — will be repo HEAD
+
+	// Second commit (non-.beads change) becomes the "binary" commit (newer).
+	if err := os.WriteFile(filepath.Join(repo, "b.go"), []byte("package a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "-A")
+	git("commit", "-q", "-m", "commit B")
+	binaryCommit := git("rev-parse", "HEAD")
+
+	// Move repo HEAD back to A, so HEAD (A) is an ancestor of the binary (B).
+	git("reset", "-q", "--hard", headCommit)
+
+	Commit = binaryCommit
+	info := CheckStaleBinary(repo)
+	if info.Error != nil {
+		t.Fatalf("unexpected error: %v", info.Error)
+	}
+	if info.IsStale {
+		t.Errorf("IsStale = true, want false (binary is ahead of checkout, not stale)")
+	}
+	if !info.BinaryAhead {
+		t.Errorf("BinaryAhead = false, want true (binary commit is a descendant of HEAD)")
 	}
 }

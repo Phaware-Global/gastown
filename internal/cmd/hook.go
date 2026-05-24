@@ -121,6 +121,9 @@ Examples:
   gt hook detach gt-abc               # Detach gt-abc from my hook
   gt hook detach gt-abc gastown/nux   # Detach gt-abc from nux's hook`,
 	Args: cobra.RangeArgs(1, 2),
+	// Don't dump usage on a runtime failure (e.g. dead target session) — it
+	// makes operational errors look like syntax errors. (PR: usage-on-error)
+	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runUnslingWith(cmd, args, hookDryRun, hookForce)
 	},
@@ -145,7 +148,9 @@ Related commands:
   gt unhook           # Same as 'gt hook clear'
   gt unsling          # Same as 'gt hook clear'`,
 	Args: cobra.MaximumNArgs(2),
-	RunE: runHookClear,
+	// Don't dump usage on a runtime failure (e.g. dead target session). (PR: usage-on-error)
+	SilenceUsage: true,
+	RunE:         runHookClear,
 }
 
 var (
