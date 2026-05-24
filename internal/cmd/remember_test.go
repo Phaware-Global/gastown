@@ -59,8 +59,13 @@ func TestParseKvListJSON(t *testing.T) {
 				t.Fatalf("len = %d, want %d (got %v)", len(got), len(tt.want), got)
 			}
 			for k, v := range tt.want {
-				if got[k] != v {
-					t.Errorf("key %q = %q, want %q", k, got[k], v)
+				gotV, ok := got[k]
+				if !ok {
+					t.Errorf("key %q missing from result (got %v)", k, got)
+					continue
+				}
+				if gotV != v {
+					t.Errorf("key %q = %q, want %q", k, gotV, v)
 				}
 			}
 		})
