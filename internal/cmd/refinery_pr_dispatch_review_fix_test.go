@@ -102,6 +102,115 @@ func TestBuildReviewFixMission_EmptyReviewer_RendersFallback(t *testing.T) {
 	}
 }
 
+// TestReviewFixSlingArgs pins the gt sling command shape for review-fix
+// dispatch. The regression that killed the whole review-fix loop (gt-o4z /
+// hq-eew) lived entirely in these arguments: the dispatch shelled out to
+// `gt sling review-fix/<id> <rig> ... --json`, but gt sling has no
+// `review-fix/<id>` target form and no --json flag, so cobra rejected the
+// unknown flag, printed its usage banner, and exited 1. These assertions fail
+// if either mistake is reintroduced.
+func TestReviewFixSlingArgs(t *testing.T) {
+	state := dispatchReviewFixState{
+		PRNumber:    42,
+		Branch:      "polecat/furiosa-gt-abc",
+		SourceIssue: "gt-abc",
+	}
+	args := reviewFixSlingArgs("gastown", state, "mission text")
+
+	if len(args) == 0 || args[0] != "sling" {
+		t.Fatalf("args[0] must be \"sling\", got %v", args)
+	}
+	// Positional bead arg must be the bare source issue — NOT the old
+	// review-fix/<id> pseudo-target that gt sling could never resolve.
+	if args[1] != "gt-abc" {
+		t.Errorf("bead arg = %q; want bare source issue \"gt-abc\" (no review-fix/ prefix)", args[1])
+	}
+	if args[2] != "gastown" {
+		t.Errorf("target arg = %q; want rig \"gastown\"", args[2])
+	}
+
+	joined := strings.Join(args, " ")
+	for _, frag := range []string{"review-fix/", "--json"} {
+		if strings.Contains(joined, frag) {
+			t.Errorf("args must not contain %q (gt sling rejects it): %v", frag, args)
+		}
+	}
+
+	// Required flags for the dispatch to land a polecat on the PR branch.
+	want := map[string]string{
+		"--pr":     "42",
+		"--branch": "polecat/furiosa-gt-abc",
+		"--args":   "mission text",
+	}
+	for flag, val := range want {
+		idx := argIndexOf(args, flag)
+		if idx < 0 {
+			t.Errorf("missing flag %q in %v", flag, args)
+			continue
+		}
+		if idx+1 >= len(args) || args[idx+1] != val {
+			t.Errorf("flag %q value = %q; want %q", flag, valueAt(args, idx+1), val)
+		}
+	}
+	if argIndexOf(args, "--force") < 0 {
+		t.Errorf("missing --force (source issue is still hooked to the terminal initial polecat): %v", args)
+	}
+}
+
+// TestPolecatNameFromAssignee pins the recovery of the spawned polecat's name
+// from the source issue's assignee. gt sling has no JSON mode, so the dispatch
+// reads the bead's `<rig>/polecats/<name>` assignee instead.
+func TestPolecatNameFromAssignee(t *testing.T) {
+	cases := []struct {
+		name     string
+		rig      string
+		assignee string
+		want     string
+		wantErr  bool
+	}{
+		{"valid", "gastown", "gastown/polecats/furiosa", "furiosa", false},
+		{"valid with whitespace", "gastown", "  gastown/polecats/max  ", "max", false},
+		{"wrong rig", "gastown", "beads/polecats/furiosa", "", true},
+		{"not a polecat", "gastown", "gastown/witness", "", true},
+		{"empty name", "gastown", "gastown/polecats/", "", true},
+		{"empty assignee", "gastown", "", "", true},
+		{"trailing path segment", "gastown", "gastown/polecats/furiosa/extra", "", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := polecatNameFromAssignee(c.rig, c.assignee)
+			if c.wantErr {
+				if err == nil {
+					t.Errorf("polecatNameFromAssignee(%q, %q) = %q, nil; want error", c.rig, c.assignee, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("polecatNameFromAssignee(%q, %q) unexpected error: %v", c.rig, c.assignee, err)
+			}
+			if got != c.want {
+				t.Errorf("polecatNameFromAssignee(%q, %q) = %q; want %q", c.rig, c.assignee, got, c.want)
+			}
+		})
+	}
+}
+
+func argIndexOf(args []string, target string) int {
+	for i, a := range args {
+		if a == target {
+			return i
+		}
+	}
+	return -1
+}
+
+func valueAt(args []string, i int) string {
+	if i < 0 || i >= len(args) {
+		return "<out-of-range>"
+	}
+	return args[i]
+}
+
 // dispatchReviewFixState parsing side-checks: the field types are simple
 // enough that we don't need a full integration test of parseDispatchMRFields
 // (that path needs a real bead store). But we can confirm the struct

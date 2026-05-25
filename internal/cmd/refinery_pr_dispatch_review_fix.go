@@ -323,9 +323,10 @@ func gtBinary() string {
 	return "gt"
 }
 
-// slingReviewFixPolecat dispatches the polecat via `gt sling`, returning
-// the polecat name from the JSON response. The mission text is
-// constructed in buildReviewFixMission.
+// slingReviewFixPolecat dispatches the polecat via `gt sling` and returns the
+// spawned polecat's name. gt sling has no JSON output mode, so the name is read
+// back from the source issue's assignee after the hook write commits (see
+// reviewFixPolecatNameFromBead). The mission text is built in buildReviewFixMission.
 func slingReviewFixPolecat(rigName string, state dispatchReviewFixState, threads []refinery.ReviewThread, reviewer string) (string, error) {
 	threadsJSON, jerr := json.MarshalIndent(threads, "", "  ")
 	if jerr != nil {
@@ -333,25 +334,130 @@ func slingReviewFixPolecat(rigName string, state dispatchReviewFixState, threads
 	}
 	mission := buildReviewFixMission(state.PRNumber, string(threadsJSON), reviewer)
 
-	cmd := exec.Command(gtBinary(), "sling",
-		fmt.Sprintf("review-fix/%s", state.SourceIssue),
+	// Divergence guard (review thread #2). The sling below passes --force, which
+	// is necessary: with a bare-rig target, sling treats "already hooked to a
+	// polecat in this rig" as an idempotent no-op and returns success WITHOUT
+	// spawning anyone (matchesSlingTarget), so dropping --force would silently
+	// fail to dispatch. But --force also triggers sling's reassign path
+	// (LIFECYCLE:Shutdown + unhook) on the current holder. Stage 1 guarantees no
+	// review-fix polecat is tracked in MR state, yet the source bead can still be
+	// hooked to a polecat whose state diverges from MR state. If that holder is
+	// actively WORKING, displacing it would disrupt a live session — so defer with
+	// a retryable error instead. A terminal/idle/absent holder is safe to displace
+	// (it's the normal case: the original polecat went terminal after gt done).
+	if held, holder, herr := reviewFixSourceHeldByWorkingPolecat(rigName, state.SourceIssue); herr != nil {
+		return "", herr
+	} else if held {
+		return "", fmt.Errorf("source issue %s is held by working polecat %s/polecats/%s — deferring review-fix dispatch to avoid disrupting an active session",
+			state.SourceIssue, rigName, holder)
+	}
+
+	// Dispatch with the documented sling form: `gt sling <bead> <rig> ...`.
+	// The bare rig target auto-spawns a fresh polecat; --pr/--branch route it
+	// onto the existing PR branch (consumed by sling's slingPR/slingBranchOverride).
+	//
+	// Earlier this passed a `review-fix/<issue-id>` pseudo-target plus a --json
+	// flag, neither of which gt sling understands — cobra rejected the unknown
+	// flag, printed its usage banner, and exited 1, so the review-fix loop never
+	// dispatched anyone (hq-eew / gt-o4z).
+	args := reviewFixSlingArgs(rigName, state, mission)
+	cmd := exec.Command(gtBinary(), args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		// Only fold captured output into the message when it's non-empty —
+		// otherwise the error reads "gt sling failed: : exit status 1" (review
+		// thread #1).
+		if trimmed := strings.TrimSpace(string(out)); trimmed != "" {
+			return "", fmt.Errorf("gt sling failed: %s: %w", trimmed, err)
+		}
+		return "", fmt.Errorf("gt sling failed: %w", err)
+	}
+
+	return reviewFixPolecatNameFromBead(rigName, state.SourceIssue)
+}
+
+// reviewFixSourceHeldByWorkingPolecat reports whether the source issue is
+// currently hooked to a same-rig polecat that is actively working. The dispatch
+// uses this to avoid --force displacing a live session (review thread #2).
+//
+// Conservative on uncertainty: an unparseable/foreign/empty assignee means
+// "nothing of ours to protect" (proceed), but a polecat whose liveness can't be
+// determined is treated as held (defer) so we never shut down a session we
+// simply failed to query.
+func reviewFixSourceHeldByWorkingPolecat(rigName, sourceIssue string) (bool, string, error) {
+	bd := beads.New(resolveBeadDir(sourceIssue))
+	issue, err := bd.Show(sourceIssue)
+	if err != nil {
+		return false, "", fmt.Errorf("reading source issue %s before dispatch: %w", sourceIssue, err)
+	}
+	if issue == nil {
+		return false, "", nil
+	}
+	name, perr := polecatNameFromAssignee(rigName, issue.Assignee)
+	if perr != nil {
+		// Unassigned, or held by a non-polecat / different-rig owner — nothing
+		// for the review-fix sling to displace.
+		return false, "", nil
+	}
+	alive, aerr := isReviewFixPolecatAlive(rigName, name)
+	if aerr != nil {
+		// Liveness query failed — assume the holder is live so we defer rather
+		// than risk shutting down an active session on a flaky status lookup.
+		return true, name, nil
+	}
+	return alive, name, nil
+}
+
+// reviewFixSlingArgs builds the argv (sans the gt binary) for the review-fix
+// dispatch sling. Factored out so the command shape is unit-testable without
+// shelling out: the regression that broke the whole loop lived entirely in
+// these arguments.
+//
+// --force avoids sling's bare-rig idempotency no-op (see the divergence guard
+// in slingReviewFixPolecat) so the dispatch reliably spawns a fresh polecat
+// even when the source bead is still hooked to a terminal/idle prior owner. The
+// caller has already confirmed the holder is not actively working before we get
+// here, so the force never tears down a live session.
+func reviewFixSlingArgs(rigName string, state dispatchReviewFixState, mission string) []string {
+	return []string{
+		"sling",
+		state.SourceIssue,
 		rigName,
 		"--pr", fmt.Sprintf("%d", state.PRNumber),
 		"--branch", state.Branch,
 		"--args", mission,
-		"--json",
-	)
-	out, err := cmd.Output()
+		"--force",
+	}
+}
+
+// reviewFixPolecatNameFromBead reads the just-slung source issue and extracts
+// the spawned polecat's short name from its assignee. gt sling commits the
+// hook write (which sets the assignee) before it returns, so this read is
+// race-free against a successful sling.
+func reviewFixPolecatNameFromBead(rigName, sourceIssue string) (string, error) {
+	bd := beads.New(resolveBeadDir(sourceIssue))
+	issue, err := bd.Show(sourceIssue)
 	if err != nil {
-		return "", fmt.Errorf("gt sling failed: %w", err)
+		return "", fmt.Errorf("reading source issue %s after sling: %w", sourceIssue, err)
 	}
-	var resp struct {
-		PolecatName string `json:"polecat_name"`
+	if issue == nil {
+		return "", fmt.Errorf("source issue %s not found after sling", sourceIssue)
 	}
-	if jerr := json.Unmarshal(out, &resp); jerr != nil {
-		return "", fmt.Errorf("parsing sling JSON: %w", jerr)
+	return polecatNameFromAssignee(rigName, issue.Assignee)
+}
+
+// polecatNameFromAssignee pulls the short polecat name out of a
+// `<rig>/polecats/<name>` assignee, validating it belongs to the expected rig.
+func polecatNameFromAssignee(rigName, assignee string) (string, error) {
+	assignee = strings.TrimSpace(assignee)
+	prefix := rigName + "/polecats/"
+	if !strings.HasPrefix(assignee, prefix) {
+		return "", fmt.Errorf("post-sling assignee %q is not a %s polecat", assignee, rigName)
 	}
-	return resp.PolecatName, nil
+	name := strings.TrimPrefix(assignee, prefix)
+	if name == "" || strings.Contains(name, "/") {
+		return "", fmt.Errorf("post-sling assignee %q has no usable polecat name", assignee)
+	}
+	return name, nil
 }
 
 // buildReviewFixMission renders the polecat's mission prompt. Imperative
