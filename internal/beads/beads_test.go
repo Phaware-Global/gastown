@@ -719,6 +719,36 @@ commit_sha: a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2`,
 				CommitSHA:   "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
 			},
 		},
+		{
+			name: "review_pr field (gt-5le)",
+			issue: &Issue{
+				Description: `branch: polecat/nux/gt-5le
+target: main
+source_issue: gt-5le
+rig: gastown
+review_pr: 78`,
+			},
+			wantFields: &MRFields{
+				Branch:      "polecat/nux/gt-5le",
+				Target:      "main",
+				SourceIssue: "gt-5le",
+				Rig:         "gastown",
+				ReviewPR:    78,
+			},
+		},
+		{
+			name: "review_pr non-positive rejected",
+			issue: &Issue{
+				Description: `branch: polecat/nux/gt-5le
+source_issue: gt-5le
+review_pr: 0`,
+			},
+			wantFields: &MRFields{
+				Branch:      "polecat/nux/gt-5le",
+				SourceIssue: "gt-5le",
+				ReviewPR:    0,
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -759,6 +789,9 @@ commit_sha: a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2`,
 			}
 			if fields.CloseReason != tt.wantFields.CloseReason {
 				t.Errorf("CloseReason = %q, want %q", fields.CloseReason, tt.wantFields.CloseReason)
+			}
+			if fields.ReviewPR != tt.wantFields.ReviewPR {
+				t.Errorf("ReviewPR = %d, want %d", fields.ReviewPR, tt.wantFields.ReviewPR)
 			}
 		})
 	}
@@ -836,6 +869,29 @@ target: main
 source_issue: es-ixjt
 rig: gastown
 commit_sha: a1b2c3d4`,
+		},
+		{
+			name: "with review_pr (gt-5le)",
+			fields: &MRFields{
+				Branch:      "polecat/nux/gt-5le",
+				Target:      "main",
+				SourceIssue: "gt-5le",
+				Rig:         "gastown",
+				ReviewPR:    78,
+			},
+			want: `branch: polecat/nux/gt-5le
+target: main
+source_issue: gt-5le
+rig: gastown
+review_pr: 78`,
+		},
+		{
+			name: "review_pr zero omitted",
+			fields: &MRFields{
+				Branch:   "polecat/nux/gt-5le",
+				ReviewPR: 0,
+			},
+			want: `branch: polecat/nux/gt-5le`,
 		},
 	}
 
@@ -944,6 +1000,50 @@ author: someone`,
 			fields: &MRFields{},
 			want:   "Keep this text.",
 		},
+		{
+			// gemini HIGH on PR #80: await_review_started_at was missing from
+			// the mrKeys map, so SetMRFields preserved the existing line as
+			// "other content" AND FormatMRFields re-emitted it → the key got
+			// duplicated on every rewrite. The rewritten description must
+			// contain exactly one await_review_started_at line.
+			name: "await_review_started_at not duplicated on rewrite",
+			issue: &Issue{
+				Description: `branch: polecat/nux/gt-5le
+source_issue: gt-5le
+await_review_started_at: 2026-05-25T01:00:00Z`,
+			},
+			fields: &MRFields{
+				Branch:               "polecat/nux/gt-5le",
+				SourceIssue:          "gt-5le",
+				AwaitReviewStartedAt: "2026-05-25T02:00:00Z",
+			},
+			want: `branch: polecat/nux/gt-5le
+source_issue: gt-5le
+await_review_started_at: 2026-05-25T02:00:00Z`,
+		},
+		{
+			// gt-5le: pr-create is idempotent, so re-running it sets
+			// review_pr again on an MR bead that already has one. The old
+			// line must be replaced, not duplicated, and unrelated fields
+			// (here commit_sha, written by the polecat) must survive.
+			name: "review_pr replaces existing without duplicating",
+			issue: &Issue{
+				Description: `branch: polecat/nux/gt-5le
+source_issue: gt-5le
+commit_sha: deadbeef
+review_pr: 77`,
+			},
+			fields: &MRFields{
+				Branch:      "polecat/nux/gt-5le",
+				SourceIssue: "gt-5le",
+				CommitSHA:   "deadbeef",
+				ReviewPR:    78,
+			},
+			want: `branch: polecat/nux/gt-5le
+source_issue: gt-5le
+commit_sha: deadbeef
+review_pr: 78`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -966,6 +1066,7 @@ func TestMRFieldsRoundTrip(t *testing.T) {
 		Rig:         "gastown",
 		MergeCommit: "abc123def789",
 		CloseReason: "merged",
+		ReviewPR:    78,
 	}
 
 	// Format to string

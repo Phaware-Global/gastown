@@ -89,6 +89,28 @@ func TestRefineryPatrolMergePushHasPRBranch(t *testing.T) {
 		}
 	}
 
+	// gt-5le: pr-create must pass --mr $MR so it persists review_pr onto the
+	// MR bead. Without this, dispatch-review-fix exits 4 ("MR missing
+	// review_pr field") and the review-fix loop never runs. Anchor the check
+	// to the pr-create invocation specifically (await-review/dispatch also
+	// take --mr $MR, so a bare "--mr $MR" check would pass even if pr-create
+	// dropped it).
+	prCreateIdx := strings.Index(prBranchDesc, `{{ cmd }} refinery pr create`)
+	if prCreateIdx < 0 {
+		t.Fatal("pr-create invocation not found in PR branch (covered above, but guarding the slice below)")
+	}
+	// The pr-create call spans several `\`-continued lines up to the closing
+	// `--json)`. Bound the slice to that invocation so the --mr assertion is
+	// scoped to pr-create, not a later subcommand.
+	prCreateRest := prBranchDesc[prCreateIdx:]
+	if end := strings.Index(prCreateRest, "--json)"); end >= 0 {
+		prCreateRest = prCreateRest[:end]
+	}
+	if !strings.Contains(prCreateRest, "--mr $MR") {
+		t.Errorf("pr-create invocation missing --mr $MR — review_pr won't be persisted, " +
+			"reintroducing the gt-5le dispatch-review-fix exit-4 failure:\n%s", prCreateRest)
+	}
+
 	// The direct-merge branch must still be present — strategy=direct
 	// is the default and shipping without it would break every existing rig.
 	directMarkers := []string{

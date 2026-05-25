@@ -878,6 +878,7 @@ PR_JSON=$({{ cmd }} refinery pr create \
   --base <merge-target> \
   --title "<issue-title> (<issue-id>)" \
   --body-file /tmp/pr-body-<issue-id>.md \
+  --mr $MR \
   --json)
 PR=$(echo "$PR_JSON" | jq -r .number)
 PR_URL=$(echo "$PR_JSON" | jq -r .url)
@@ -887,6 +888,13 @@ echo "PR #$PR: $PR_URL"
 `gt refinery pr create` is idempotent — re-running it for an existing open
 PR on the same branch returns that PR's number/url without creating a
 duplicate.
+
+`--mr $MR` is load-bearing: pr-create persists the opened PR number as
+`review_pr` onto the MR bead so PR.4 (await-review) and PR.5
+(dispatch-review-fix) can find the PR. Without it, dispatch-review-fix
+exits 4 ("MR missing review_pr field") and the review loop never runs —
+the gt-5le failure that previously forced refinery to hand-patch
+`review_pr` onto each PR's MR bead.
 
 **Step PR.3: Wait for CI checks**
 
