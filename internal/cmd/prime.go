@@ -203,6 +203,15 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 	}
 	injectWorkContext(ctx, hookedBead)
 
+	// gt-tk5: a polecat worktree must never operate on main/master. Detect the
+	// off-main state at session start and auto-restore to the namespaced work
+	// branch; refuse to proceed (non-zero exit) if it can't be restored, so the
+	// polecat never starts committing onto main. Complements the gt-i71
+	// block-push guard with a block-work guard.
+	if err := ensurePolecatOffMain(ctx, hookedBead); err != nil {
+		return err
+	}
+
 	formula, err := outputRoleContext(ctx)
 	if err != nil {
 		return err
