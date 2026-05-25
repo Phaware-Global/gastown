@@ -8,9 +8,10 @@ import (
 )
 
 // TestExtractDescField pins the small parser used to read review_pr off the
-// MR bead description. The MR-fields parser doesn't (yet) expose review_pr
-// — it's added by the G11 no-merge+pr handoff — so the dispatch subcommand
-// reads it directly. The parser must:
+// MR bead description. review_pr is now a first-class MRField (gt-5le:
+// written by `gt refinery pr create`), but the dispatch subcommand still
+// reads it directly to keep the first-match-wins guard below. The parser
+// must:
 //   - find the first occurrence of `key:` (subsequent prose references to
 //     the same key must NOT shadow the structured value)
 //   - tolerate leading whitespace on the line (a bd description rendered

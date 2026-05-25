@@ -31,6 +31,7 @@ var (
 	refPrCreateBody     string
 	refPrCreateBodyFile string
 	refPrCreateJSON     bool
+	refPrCreateMR       string
 
 	// gt refinery pr wait-ci
 	refPrWaitCITimeout  time.Duration
@@ -84,12 +85,17 @@ var refineryPrCreateCmd = &cobra.Command{
 If an open PR already exists for --branch, returns its number and URL
 without creating a new one.
 
+When --mr is given, the opened PR number is persisted as review_pr onto
+that MR bead so the refinery's await-review / dispatch-review-fix steps can
+read it. Without this, dispatch-review-fix exits 4 ("MR missing review_pr
+field") and the review loop never runs (gt-5le).
+
 Examples:
   gt refinery pr create --branch polecat/nux --base main \
     --title "Add widget (gt-abc)" --body "Closes gt-abc"
 
   gt refinery pr create --branch polecat/nux --base main \
-    --title "Add widget (gt-abc)" --body-file /tmp/pr-body.md --json`,
+    --title "Add widget (gt-abc)" --body-file /tmp/pr-body.md --mr gt-mr-xyz --json`,
 	RunE: runRefineryPrCreate,
 }
 
@@ -175,6 +181,9 @@ func init() {
 	refineryPrCreateCmd.Flags().StringVar(&refPrCreateBody, "body", "", "PR body")
 	refineryPrCreateCmd.Flags().StringVar(&refPrCreateBodyFile, "body-file", "", "read PR body from file")
 	refineryPrCreateCmd.Flags().BoolVar(&refPrCreateJSON, "json", false, "output {number,url} as JSON")
+	refineryPrCreateCmd.Flags().StringVar(&refPrCreateMR, "mr", "",
+		"MR bead ID to persist review_pr onto (so dispatch-review-fix can read it); "+
+			"omit only for one-off CLI debugging")
 
 	refineryPrWaitCICmd.Flags().DurationVar(&refPrWaitCITimeout, "timeout", 15*time.Minute, "give up after this duration")
 	refineryPrWaitCICmd.Flags().DurationVar(&refPrWaitCIInterval, "interval", 30*time.Second, "poll interval")
@@ -282,11 +291,59 @@ func runRefineryPrCreate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Persist review_pr onto the MR bead so the refinery's await-review and
+	// dispatch-review-fix steps can find the PR. pr-create is idempotent, so
+	// re-running it just rewrites the same review_pr value (SetMRFields
+	// replaces the managed line rather than appending a duplicate). A failure
+	// here is fatal: returning the PR number while leaving the MR bead without
+	// review_pr is exactly the gt-5le state that made dispatch-review-fix exit
+	// 4 and forced refinery to hand-patch the field.
+	if refPrCreateMR != "" {
+		if err := writeReviewPRToMR(refPrCreateMR, number); err != nil {
+			return fmt.Errorf("PR #%d created but persisting review_pr to MR %s failed: %w",
+				number, refPrCreateMR, err)
+		}
+	}
+
 	if refPrCreateJSON {
 		return json.NewEncoder(os.Stdout).Encode(map[string]any{"number": number, "url": url})
 	}
 	fmt.Fprintf(os.Stdout, "%d\t%s\n", number, url)
 	return nil
+}
+
+// writeReviewPRToMR persists the opened PR number as review_pr on the MR
+// bead via a locked read-modify-write, mirroring writeAwaitReviewStateUpdates:
+// the bead lock serializes against concurrent writers of other MR fields
+// (review_loop_iter, commit_sha, etc.) so we don't clobber them on
+// last-writer-wins.
+func writeReviewPRToMR(mrID string, prNumber int) error {
+	if err := validateBeadIDShape(mrID); err != nil {
+		return fmt.Errorf("invalid --mr %q: %w", mrID, err)
+	}
+	bd := beads.New(resolveBeadDir(mrID))
+
+	unlock, err := bd.LockBead(mrID)
+	if err != nil {
+		return fmt.Errorf("acquiring bead lock: %w", err)
+	}
+	defer unlock()
+
+	issue, err := bd.Show(mrID)
+	if err != nil {
+		return fmt.Errorf("loading MR bead: %w", err)
+	}
+	if issue == nil {
+		return fmt.Errorf("MR bead %s not found", mrID)
+	}
+	fields := beads.ParseMRFields(issue)
+	if fields == nil {
+		fields = &beads.MRFields{}
+	}
+	fields.ReviewPR = prNumber
+
+	newDesc := beads.SetMRFields(issue, fields)
+	return bd.Update(mrID, beads.UpdateOptions{Description: &newDesc})
 }
 
 func runRefineryPrWaitCI(cmd *cobra.Command, args []string) error {

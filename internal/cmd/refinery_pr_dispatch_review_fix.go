@@ -127,10 +127,14 @@ func parseDispatchMRFields(mrID string) (dispatchReviewFixState, error) {
 	}, nil
 }
 
-// extractDescField pulls a `key: value` line out of the MR description. The
-// MR-fields parser doesn't currently expose review_pr (it's added by the
-// G11 no-merge+pr handoff path), so we read it directly here. Stops at the
-// first match so a later prose reference can't shadow the structured value.
+// extractDescField pulls a `key: value` line out of the MR description.
+// review_pr is now a first-class MRField (gt-5le: written by `gt refinery pr
+// create`), but we still read it directly rather than via beads.ParseMRFields
+// because this stops at the FIRST match — a later prose reference to
+// `review_pr:` can't shadow the structured value, whereas ParseMRFields keeps
+// the last match. After any SetMRFields rewrite there is exactly one
+// review_pr line, so the two agree; the first-match guard only matters for a
+// hand-edited bead with stray prose.
 func extractDescField(desc, key string) string {
 	prefix := key + ":"
 	for _, line := range strings.Split(desc, "\n") {

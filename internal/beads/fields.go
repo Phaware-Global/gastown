@@ -618,6 +618,14 @@ type MRFields struct {
 	PreVerifiedAt   string // ISO 8601 timestamp when verification completed
 	PreVerifiedBase string // Target branch SHA at verification time
 
+	// ReviewPR is the GitHub PR number opened for this MR under
+	// merge_strategy=pr. Written by `gt refinery pr create` once the PR
+	// exists; read by `gt refinery pr dispatch-review-fix` (which keys its
+	// whole state machine off it). Zero until a PR is opened. Before this
+	// was a first-class field, refinery had to hand-patch review_pr onto MR
+	// beads after pr-create (the gt-5le exit-4 failure).
+	ReviewPR int
+
 	// Review-fix loop state (merge_strategy=pr only).
 	// These fields make Step PR.5 patrol-resumable: each patrol cycle takes
 	// one action (dispatch polecat / check polecat / advance) and returns
@@ -717,6 +725,14 @@ func ParseMRFields(issue *Issue) *MRFields {
 		case "pre_verified_base", "pre-verified-base", "preverifiedbase":
 			fields.PreVerifiedBase = value
 			hasFields = true
+		case "review_pr", "review-pr", "reviewpr":
+			// Only accept a positive PR number. A malformed or non-positive
+			// value leaves ReviewPR at zero so dispatch-review-fix treats it
+			// as "no PR yet" rather than dispatching against PR #0.
+			if n, err := strconv.Atoi(value); err == nil && n > 0 {
+				fields.ReviewPR = n
+				hasFields = true
+			}
 		case "review_loop_iter", "review-loop-iter", "reviewloopiter":
 			if n, err := parseIntField(value); err == nil {
 				fields.ReviewLoopIter = n
@@ -804,6 +820,9 @@ func FormatMRFields(fields *MRFields) string {
 	if fields.PreVerifiedBase != "" {
 		lines = append(lines, "pre_verified_base: "+fields.PreVerifiedBase)
 	}
+	if fields.ReviewPR > 0 {
+		lines = append(lines, fmt.Sprintf("review_pr: %d", fields.ReviewPR))
+	}
 	if fields.ReviewLoopIter > 0 {
 		lines = append(lines, fmt.Sprintf("review_loop_iter: %d", fields.ReviewLoopIter))
 	}
@@ -875,6 +894,9 @@ func SetMRFields(issue *Issue, fields *MRFields) string {
 		"pre_verified_base":  true,
 		"pre-verified-base":  true,
 		"preverifiedbase":    true,
+		"review_pr":          true,
+		"review-pr":          true,
+		"reviewpr":           true,
 		"review_loop_iter":   true,
 		"review-loop-iter":   true,
 		"reviewloopiter":     true,
