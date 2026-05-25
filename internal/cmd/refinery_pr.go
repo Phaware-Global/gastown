@@ -318,6 +318,14 @@ func runRefineryPrCreate(cmd *cobra.Command, args []string) error {
 // (review_loop_iter, commit_sha, etc.) so we don't clobber them on
 // last-writer-wins.
 func writeReviewPRToMR(mrID string, prNumber int) error {
+	// Guard before touching the bead: a non-positive PR number would make
+	// FormatMRFields omit review_pr entirely, which on an MR bead that already
+	// carries review_pr would CLEAR it — re-breaking dispatch-review-fix (the
+	// exact gt-5le failure this command fixes). A 0/negative number here means
+	// the provider returned a bogus PR; fail loudly instead of corrupting state.
+	if prNumber <= 0 {
+		return fmt.Errorf("refusing to persist non-positive review_pr %d to MR %s", prNumber, mrID)
+	}
 	if err := validateBeadIDShape(mrID); err != nil {
 		return fmt.Errorf("invalid --mr %q: %w", mrID, err)
 	}

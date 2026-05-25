@@ -1001,6 +1001,27 @@ author: someone`,
 			want:   "Keep this text.",
 		},
 		{
+			// gemini HIGH on PR #80: await_review_started_at was missing from
+			// the mrKeys map, so SetMRFields preserved the existing line as
+			// "other content" AND FormatMRFields re-emitted it → the key got
+			// duplicated on every rewrite. The rewritten description must
+			// contain exactly one await_review_started_at line.
+			name: "await_review_started_at not duplicated on rewrite",
+			issue: &Issue{
+				Description: `branch: polecat/nux/gt-5le
+source_issue: gt-5le
+await_review_started_at: 2026-05-25T01:00:00Z`,
+			},
+			fields: &MRFields{
+				Branch:               "polecat/nux/gt-5le",
+				SourceIssue:          "gt-5le",
+				AwaitReviewStartedAt: "2026-05-25T02:00:00Z",
+			},
+			want: `branch: polecat/nux/gt-5le
+source_issue: gt-5le
+await_review_started_at: 2026-05-25T02:00:00Z`,
+		},
+		{
 			// gt-5le: pr-create is idempotent, so re-running it sets
 			// review_pr again on an MR bead that already has one. The old
 			// line must be replaced, not duplicated, and unrelated fields

@@ -729,7 +729,9 @@ func ParseMRFields(issue *Issue) *MRFields {
 			// Only accept a positive PR number. A malformed or non-positive
 			// value leaves ReviewPR at zero so dispatch-review-fix treats it
 			// as "no PR yet" rather than dispatching against PR #0.
-			if n, err := strconv.Atoi(value); err == nil && n > 0 {
+			// parseIntField (used by retry_count / review_loop_iter) keeps the
+			// integer-field parsing consistent and tolerant of trailing junk.
+			if n, err := parseIntField(value); err == nil && n > 0 {
 				fields.ReviewPR = n
 				hasFields = true
 			}
@@ -903,6 +905,13 @@ func SetMRFields(issue *Issue, fields *MRFields) string {
 		"review_fix_polecat": true,
 		"review-fix-polecat": true,
 		"reviewfixpolecat":   true,
+		// await_review_started_at is parsed by ParseMRFields and emitted by
+		// FormatMRFields, so it MUST be listed here too. Otherwise SetMRFields
+		// preserves the old value-line as "other content" while FormatMRFields
+		// writes a fresh one, duplicating the key on every rewrite.
+		"await_review_started_at": true,
+		"await-review-started-at": true,
+		"awaitreviewstartedat":    true,
 	}
 
 	// Collect non-MR lines from existing description
