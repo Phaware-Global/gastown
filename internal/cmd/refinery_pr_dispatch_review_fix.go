@@ -333,25 +333,75 @@ func slingReviewFixPolecat(rigName string, state dispatchReviewFixState, threads
 	}
 	mission := buildReviewFixMission(state.PRNumber, string(threadsJSON), reviewer)
 
-	cmd := exec.Command(gtBinary(), "sling",
-		fmt.Sprintf("review-fix/%s", state.SourceIssue),
+	// Dispatch with the documented sling form: `gt sling <bead> <rig> ...`.
+	// The bare rig target auto-spawns a fresh polecat; --pr/--branch route it
+	// onto the existing PR branch (consumed by sling's slingPR/slingBranchOverride).
+	//
+	// Earlier this passed a `review-fix/<issue-id>` pseudo-target plus a --json
+	// flag, neither of which gt sling understands — cobra rejected the unknown
+	// flag, printed its usage banner, and exited 1, so the review-fix loop never
+	// dispatched anyone (hq-eew / gt-o4z). gt sling has no JSON mode; recover the
+	// spawned polecat's name from the source issue's assignee after the sling.
+	args := reviewFixSlingArgs(rigName, state, mission)
+	cmd := exec.Command(gtBinary(), args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("gt sling failed: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	return reviewFixPolecatNameFromBead(rigName, state.SourceIssue)
+}
+
+// reviewFixSlingArgs builds the argv (sans the gt binary) for the review-fix
+// dispatch sling. Factored out so the command shape is unit-testable without
+// shelling out: the regression that broke the whole loop lived entirely in
+// these arguments.
+//
+// --force is required: the source issue is still hooked to the original (now
+// terminal) polecat from the initial dispatch. Stage 1 of the dispatch loop
+// guarantees no review-fix polecat is in flight before we reach here, so the
+// force only displaces a dead owner — it never kills a working review-fix
+// polecat.
+func reviewFixSlingArgs(rigName string, state dispatchReviewFixState, mission string) []string {
+	return []string{
+		"sling",
+		state.SourceIssue,
 		rigName,
 		"--pr", fmt.Sprintf("%d", state.PRNumber),
 		"--branch", state.Branch,
 		"--args", mission,
-		"--json",
-	)
-	out, err := cmd.Output()
+		"--force",
+	}
+}
+
+// reviewFixPolecatNameFromBead reads the just-slung source issue and extracts
+// the spawned polecat's short name from its assignee. gt sling commits the
+// hook write (which sets the assignee) before it returns, so this read is
+// race-free against a successful sling.
+func reviewFixPolecatNameFromBead(rigName, sourceIssue string) (string, error) {
+	bd := beads.New(resolveBeadDir(sourceIssue))
+	issue, err := bd.Show(sourceIssue)
 	if err != nil {
-		return "", fmt.Errorf("gt sling failed: %w", err)
+		return "", fmt.Errorf("reading source issue %s after sling: %w", sourceIssue, err)
 	}
-	var resp struct {
-		PolecatName string `json:"polecat_name"`
+	if issue == nil {
+		return "", fmt.Errorf("source issue %s not found after sling", sourceIssue)
 	}
-	if jerr := json.Unmarshal(out, &resp); jerr != nil {
-		return "", fmt.Errorf("parsing sling JSON: %w", jerr)
+	return polecatNameFromAssignee(rigName, issue.Assignee)
+}
+
+// polecatNameFromAssignee pulls the short polecat name out of a
+// `<rig>/polecats/<name>` assignee, validating it belongs to the expected rig.
+func polecatNameFromAssignee(rigName, assignee string) (string, error) {
+	assignee = strings.TrimSpace(assignee)
+	prefix := rigName + "/polecats/"
+	if !strings.HasPrefix(assignee, prefix) {
+		return "", fmt.Errorf("post-sling assignee %q is not a %s polecat", assignee, rigName)
 	}
-	return resp.PolecatName, nil
+	name := strings.TrimPrefix(assignee, prefix)
+	if name == "" || strings.Contains(name, "/") {
+		return "", fmt.Errorf("post-sling assignee %q has no usable polecat name", assignee)
+	}
+	return name, nil
 }
 
 // buildReviewFixMission renders the polecat's mission prompt. Imperative
