@@ -399,16 +399,15 @@ func batchFetchBeadInfoByIDs(townRoot string, ids []string) map[string]beadStatu
 		return result
 	}
 
-	// Group IDs by prefix to route to the correct rig directory
-	// Most IDs will have a common prefix (e.g., "gt-", "bcc-", "hq-")
-	// For simplicity, try all dirs - bd show will return results only for matching IDs
-	for _, dir := range beadsSearchDirs(townRoot) {
+	idsByBeadsDir := groupBeadIDsByResolvedBeadsDir(townRoot, ids)
+	for beadsDir, groupedIDs := range idsByBeadsDir {
 		// Use Beads wrapper to get proper BEADS_DIR resolution, --allow-stale,
 		// and BEADS_DOLT_PORT translation (matching how all other bd-invoking
-		// functions work). Raw exec.Command missed these, causing stale/wrong
-		// dolt database queries. See GH#803.
-		b := beads.New(dir)
-		args := append([]string{"show", "--json"}, ids...)
+		// functions work). Route IDs directly instead of trying every beads dir;
+		// scheduler status/list/run sit on operator hot paths, and repeated bd show
+		// fanout dominates latency in large towns.
+		b := beads.NewWithBeadsDir(filepath.Dir(beadsDir), beadsDir)
+		args := append([]string{"show", "--json"}, groupedIDs...)
 		out, err := b.Run(args...)
 		if err != nil {
 			continue
@@ -432,6 +431,25 @@ func batchFetchBeadInfoByIDs(townRoot string, ids []string) map[string]beadStatu
 	return result
 }
 
+func groupBeadIDsByResolvedBeadsDir(townRoot string, ids []string) map[string][]string {
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	idsByBeadsDir := make(map[string][]string)
+	seen := make(map[string]bool)
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		beadsDir := beads.ResolveBeadsDirForID(townBeadsDir, id)
+		key := beadsDir + "\x00" + id
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		idsByBeadsDir[beadsDir] = append(idsByBeadsDir[beadsDir], id)
+	}
+	return idsByBeadsDir
+}
+
 // getReadySlingContexts queries for sling context beads whose work beads are ready.
 // This is a pure query — no destructive side effects. Call cleanupStaleContexts()
 // before this function to handle invalid/stale contexts.
@@ -446,14 +464,7 @@ func getReadySlingContexts(townRoot string) ([]capacity.PendingBead, error) {
 		return nil, nil
 	}
 
-	// 2. Build readyWorkIDs set from bd ready across all dirs
-	// (work beads live in rig-local DBs, so we need to check all dirs)
-	readyWorkIDs, readyErr := listReadyWorkBeadIDsWithError(townRoot)
-	if readyErr != nil {
-		return nil, readyErr
-	}
-
-	// 2b. Batch-fetch work bead labels so we can defensively filter messaging
+	// 2. Batch-fetch work bead labels/status so we can defensively filter messaging
 	// beads (gt:message / gt:handoff / gt:merge-request) that should never be
 	// handed to a polecat. See gt-el4 / gastownhall/gastown#3800.
 	workBeadIDs := make([]string, 0, len(allContexts))
@@ -465,6 +476,10 @@ func getReadySlingContexts(townRoot string) ([]capacity.PendingBead, error) {
 		workBeadIDs = append(workBeadIDs, fields.WorkBeadID)
 	}
 	workBeadInfo := batchFetchBeadInfoByIDs(townRoot, workBeadIDs)
+	blockedWorkIDs, blockedErr := listBlockedWorkBeadIDsWithError(townRoot, workBeadIDs)
+	if blockedErr != nil {
+		return nil, blockedErr
+	}
 
 	// 3. Build PendingBead list — pure filtering, no mutations.
 	// Sort by EnqueuedAt for deterministic deduplication: when concurrent
@@ -495,8 +510,11 @@ func getReadySlingContexts(townRoot string) ([]capacity.PendingBead, error) {
 			continue
 		}
 
-		// Only include if work bead is ready (unblocked)
-		if !readyWorkIDs[fields.WorkBeadID] {
+		// Only include open, unblocked work beads. This uses the fast blocked
+		// cache plus targeted show output instead of shelling out to bd ready for
+		// every rig, which is prohibitively expensive in large towns.
+		info, found := workBeadInfo[fields.WorkBeadID]
+		if !isScheduledWorkBeadReady(fields.WorkBeadID, info, found, blockedWorkIDs) {
 			continue
 		}
 
@@ -509,7 +527,7 @@ func getReadySlingContexts(townRoot string) ([]capacity.PendingBead, error) {
 		// Defensive filter: messaging beads (gt:message / gt:handoff /
 		// gt:merge-request) must never reach a rig polecat. Log the skip so
 		// the gap is observable and operators can chase the upstream cause.
-		workLabels := workBeadInfo[fields.WorkBeadID].Labels
+		workLabels := info.Labels
 		if capacity.IsMessagingBead(workLabels) {
 			fmt.Fprintf(os.Stderr, "%s dispatch_skip reason=messaging_label bead=%s labels=%v\n",
 				style.Dim.Render("○"), fields.WorkBeadID, workLabels)
@@ -699,48 +717,53 @@ func listAllSlingContextRecords(townRoot string) []slingContextRecord {
 	return records
 }
 
-// listReadyWorkBeadIDsWithError returns a set of work bead IDs that are unblocked.
+// listBlockedWorkBeadIDsWithError returns a set of work bead IDs that have active blockers.
 // Returns an error only when ALL dirs fail (partial success is acceptable).
-func listReadyWorkBeadIDsWithError(townRoot string) (map[string]bool, error) {
-	readyIDs := make(map[string]bool)
-	dirs := beadsSearchDirs(townRoot)
+func listBlockedWorkBeadIDsWithError(townRoot string, workBeadIDs []string) (map[string]bool, error) {
+	blockedIDs := make(map[string]bool)
+	idsByBeadsDir := groupBeadIDsByResolvedBeadsDir(townRoot, workBeadIDs)
 	failCount := 0
 	var lastErr error
-	for _, dir := range dirs {
+	for beadsDir := range idsByBeadsDir {
 		// Use Beads wrapper to get proper BEADS_DIR resolution, --allow-stale,
-		// and BEADS_DOLT_PORT translation. Raw exec.Command missed these,
-		// causing the scheduler to query stale/wrong dolt databases and return
-		// empty readyWorkIDs. See GH#803.
-		b := beads.New(dir)
-		readyOut, err := b.Run("ready", "--json", "--limit=0")
+		// and BEADS_DOLT_PORT translation.
+		b := beads.NewWithBeadsDir(filepath.Dir(beadsDir), beadsDir)
+		blockedOut, err := b.Run("blocked", "--json")
 		if err != nil {
 			failCount++
 			lastErr = err
-			fmt.Fprintf(os.Stderr, "%s Warning: bd ready failed for %s: %v\n",
-				style.Dim.Render("⚠"), dir, err)
+			fmt.Fprintf(os.Stderr, "%s Warning: bd blocked failed for %s: %v\n",
+				style.Dim.Render("⚠"), filepath.Dir(beadsDir), err)
 			continue
 		}
-		var readyBeads []struct {
+		var blockedBeads []struct {
 			ID string `json:"id"`
 		}
-		if err := json.Unmarshal(readyOut, &readyBeads); err == nil {
-			for _, b := range readyBeads {
-				readyIDs[b.ID] = true
+		if err := json.Unmarshal(blockedOut, &blockedBeads); err == nil {
+			for _, b := range blockedBeads {
+				blockedIDs[b.ID] = true
 			}
 		}
 	}
-	if failCount == len(dirs) && failCount > 0 {
-		return nil, fmt.Errorf("all %d bd ready queries failed (last: %w)", failCount, lastErr)
+	if failCount == len(idsByBeadsDir) && failCount > 0 {
+		return nil, fmt.Errorf("all %d bd blocked queries failed (last: %w)", failCount, lastErr)
 	}
-	return readyIDs, nil
+	return blockedIDs, nil
 }
 
-// listReadyWorkBeadIDs returns a set of work bead IDs that are unblocked.
+// listBlockedWorkBeadIDs returns a set of work bead IDs that have active blockers.
 // Convenience wrapper that ignores errors (used by listScheduledBeads for display).
-func listReadyWorkBeadIDs(townRoot string) map[string]bool {
-	ids, _ := listReadyWorkBeadIDsWithError(townRoot)
+func listBlockedWorkBeadIDs(townRoot string) map[string]bool {
+	ids, _ := listBlockedWorkBeadIDsWithError(townRoot, listAllScheduledBeadIDs(townRoot))
 	if ids == nil {
 		return make(map[string]bool)
 	}
 	return ids
+}
+
+func isScheduledWorkBeadReady(workBeadID string, info beadStatusInfo, found bool, blockedWorkIDs map[string]bool) bool {
+	if !found || blockedWorkIDs[workBeadID] {
+		return false
+	}
+	return info.Status == "open"
 }

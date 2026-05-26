@@ -382,8 +382,10 @@ func listScheduledBeads(townRoot string) []scheduledBeadInfo {
 		}
 	}
 
-	// Build readyIDs set and batch-fetch work bead info for specific IDs
-	readyWorkIDs := listReadyWorkBeadIDs(townRoot)
+	// Build blockedIDs set and batch-fetch work bead info for specific IDs.
+	// bd blocked is fast because it reads the cached blocked set; bd ready walks
+	// the full ready graph and is too slow for scheduler display paths.
+	blockedWorkIDs, _ := listBlockedWorkBeadIDsWithError(townRoot, workBeadIDs)
 	workBeadInfo := batchFetchBeadInfoByIDs(townRoot, workBeadIDs)
 
 	seenWork := make(map[string]bool)
@@ -408,7 +410,8 @@ func listScheduledBeads(townRoot string) []scheduledBeadInfo {
 		// Get work bead info for title/status from batch-fetched map
 		title := ctx.Title
 		status := "open"
-		if info, found := workBeadInfo[fields.WorkBeadID]; found {
+		info, found := workBeadInfo[fields.WorkBeadID]
+		if found {
 			title = info.Title
 			status = info.Status
 			// Skip if work bead is hooked/closed
@@ -422,7 +425,7 @@ func listScheduledBeads(townRoot string) []scheduledBeadInfo {
 			Title:     title,
 			Status:    status,
 			TargetRig: fields.TargetRig,
-			Blocked:   !readyWorkIDs[fields.WorkBeadID],
+			Blocked:   !isScheduledWorkBeadReady(fields.WorkBeadID, info, found, blockedWorkIDs),
 		})
 	}
 
