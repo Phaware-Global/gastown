@@ -1573,10 +1573,14 @@ func inputBoxSubmitted(lines []string, promptPrefix string) (submitted, conclusi
 	}
 
 	// Strip the prompt prefix and check whether any typed text remains in the
-	// box. TrimSpace also strips NBSP (U+00A0), so a bare or NBSP-padded prompt
-	// reads as empty regardless of which whitespace the agent renders.
-	trimmedLine := strings.TrimSpace(lines[lastIdx])
-	prefix := strings.TrimSpace(promptPrefix)
+	// box. Normalize NBSP (U+00A0) -> regular space in both line and prefix
+	// (mirroring matchesPromptPrefix) so a multi-token prefix with a space/NBSP
+	// mismatch between config and pane (e.g. prefix "beads \u276f " vs a pane
+	// rendering "beads\u00a0\u276f ") still strips correctly.
+	normLine := strings.ReplaceAll(lines[lastIdx], "\u00a0", " ")
+	normPrefix := strings.ReplaceAll(promptPrefix, "\u00a0", " ")
+	trimmedLine := strings.TrimSpace(normLine)
+	prefix := strings.TrimSpace(normPrefix)
 	rest := strings.TrimSpace(strings.TrimPrefix(trimmedLine, prefix))
 	return rest == "", true
 }

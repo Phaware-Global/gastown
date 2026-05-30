@@ -92,6 +92,23 @@ func TestInputBoxSubmitted(t *testing.T) {
 			wantSubmitted: false,
 			wantConcl:     true,
 		},
+		{
+			// Multi-token prefix where the pane renders NBSP but the configured
+			// prefix uses a regular space (or vice versa): normalization must let
+			// the prefix strip so an empty box still reads as submitted.
+			name:          "multi-word prefix with NBSP mismatch, empty box",
+			lines:         []string{"beads" + nbsp + pc + " "},
+			prefix:        "beads " + pc + " ",
+			wantSubmitted: true,
+			wantConcl:     true,
+		},
+		{
+			name:          "multi-word prefix with NBSP mismatch, holds text",
+			lines:         []string{"beads" + nbsp + pc + " status?"},
+			prefix:        "beads " + pc + " ",
+			wantSubmitted: false,
+			wantConcl:     true,
+		},
 	}
 
 	for _, tt := range tests {
