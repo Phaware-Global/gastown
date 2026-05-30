@@ -46,6 +46,7 @@ var (
 	ErrSessionRunning     = errors.New("session already running with healthy agent")
 	ErrInvalidSessionName = errors.New("invalid session name")
 	ErrIdleTimeout        = errors.New("agent not idle before timeout")
+	ErrAgentBusy          = errors.New("agent busy at delivery time")
 )
 
 // validateSessionName checks that a session name contains only safe characters.
@@ -1645,6 +1646,15 @@ type NudgeOpts struct {
 	// <townRoot>/.runtime/nudge_queue/<session>/.lock before delivery.
 	// When empty, only in-process locking is used (backward-compatible).
 	TownRoot string
+
+	// RequireIdle aborts delivery with ErrAgentBusy if the agent is not idle at
+	// the moment text would be typed. Callers that pre-check idle (e.g. the
+	// wait-idle nudge path, the mail router) race against the agent resuming work
+	// between their WaitForIdle and the actual paste — the typed text then lands
+	// on a busy TUI that accepts it into the input box but never submits it,
+	// stranding the nudge. Re-checking inside the delivery lock closes that gap;
+	// on ErrAgentBusy the caller should enqueue for cooperative drain instead.
+	RequireIdle bool
 }
 
 // canonicalPaneTarget converts a pane identifier like "%23" into a tmux target
@@ -1709,6 +1719,15 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	if inMode, _ := t.run("display-message", "-p", "-t", target, "#{pane_in_mode}"); strings.TrimSpace(inMode) == "1" {
 		_, _ = t.run("send-keys", "-t", target, "-X", "cancel")
 		time.Sleep(50 * time.Millisecond)
+	}
+
+	// 1.5. RequireIdle: re-check idle inside the delivery lock, just before we
+	// type anything. Callers that pre-checked idle race against the agent
+	// resuming work in the gap before this paste; typing into a now-busy TUI
+	// strands the text in the input box without submitting it. Abort with
+	// ErrAgentBusy so the caller can enqueue for cooperative drain instead.
+	if opts.RequireIdle && !t.IsIdle(session) {
+		return ErrAgentBusy
 	}
 
 	// 2. Sanitize control characters that corrupt delivery
