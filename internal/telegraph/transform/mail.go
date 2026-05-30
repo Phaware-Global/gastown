@@ -4,6 +4,7 @@
 package transform
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -29,20 +30,27 @@ type Nudger interface {
 	Nudge(target, message string) error
 }
 
+// nudgeExecTimeout bounds the gt nudge subprocess. Nudge runs synchronously in
+// the single-threaded dispatch loop (maybeNudge → Transform), so an unbounded
+// hang would freeze the daemon and eventually 503 incoming webhooks.
+const nudgeExecTimeout = 5 * time.Second
+
 // ExecNudger runs "gt nudge <target> --mode=queue -m <message>" as a subprocess.
 // It is the production Nudger.
 type ExecNudger struct {
 	// TownRoot, if set, is the working directory for the gt nudge subprocess.
-	// Queue mode requires a Gas Town workspace to locate the queue directory;
-	// running from the town root lets `gt nudge` resolve it even when the
-	// telegraph daemon was started from outside the workspace. Empty keeps the
-	// inherited cwd (and gt's GT_TOWN_ROOT/GT_ROOT env fallback).
+	// Queue mode requires a Gas Town workspace, and `gt nudge` resolves it from
+	// its cwd (workspace.FindFromCwd, no env fallback), so running from the town
+	// root lets it resolve the queue directory even when the telegraph daemon
+	// was started from outside the workspace. Empty keeps the inherited cwd.
 	TownRoot string
 }
 
 // Nudge delivers a nudge by running gt nudge in queue mode.
 func (n *ExecNudger) Nudge(target, message string) error {
-	cmd := exec.Command("gt", nudgeCommandArgs(target, message)...)
+	ctx, cancel := context.WithTimeout(context.Background(), nudgeExecTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gt", nudgeCommandArgs(target, message)...)
 	if n.TownRoot != "" {
 		cmd.Dir = n.TownRoot
 	}
