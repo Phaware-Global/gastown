@@ -4,9 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// busyPaneSeq guarantees unique session names across rapid/parallel calls.
+var busyPaneSeq atomic.Int64
 
 // makeBusyPane creates a session whose pane displays the "esc to interrupt"
 // busy indicator, so IsIdle reports the agent as busy. Returns the session name
@@ -14,22 +18,32 @@ import (
 // detectable busy state (environment-specific shell prompt).
 func makeBusyPane(t *testing.T, tm *Tmux) string {
 	t.Helper()
-	session := fmt.Sprintf("gt-test-requireidle-%d", time.Now().UnixNano()%100000)
+	session := fmt.Sprintf("gt-test-requireidle-%d-%d", time.Now().UnixNano(), busyPaneSeq.Add(1))
 	if err := tm.NewSession(session, os.TempDir()); err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
 	t.Cleanup(func() { _ = tm.KillSession(session) })
 	time.Sleep(200 * time.Millisecond)
 
+	// Idle baseline: the fresh shell must read as idle first. If it doesn't,
+	// this environment's shell prompt isn't detectable (IsIdle needs the ❯
+	// prompt or ⏵⏵ status marker) and the busy assertion below would pass
+	// trivially for the wrong reason — so skip rather than validate nothing.
+	if !tm.IsIdle(session) {
+		t.Skip("shell prompt not detected as idle in this environment; skipping")
+	}
+
 	// Render the busy indicator into the pane. hasBusyIndicator matches any
-	// line containing "esc to interrupt".
+	// line containing "esc to interrupt". This must flip IsIdle to busy — if it
+	// doesn't, hasBusyIndicator has stopped influencing IsIdle, which is a real
+	// regression, not an environment quirk.
 	if err := tm.SendKeys(session, "printf 'esc to interrupt\\n'"); err != nil {
 		t.Fatalf("SendKeys: %v", err)
 	}
 	time.Sleep(500 * time.Millisecond)
 
 	if tm.IsIdle(session) {
-		t.Skip("pane not detected as busy in this environment; skipping")
+		t.Fatalf("busy indicator present but IsIdle still reports idle (hasBusyIndicator not influencing IsIdle?)")
 	}
 	return session
 }

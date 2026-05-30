@@ -1726,8 +1726,17 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// resuming work in the gap before this paste; typing into a now-busy TUI
 	// strands the text in the input box without submitting it. Abort with
 	// ErrAgentBusy so the caller can enqueue for cooperative drain instead.
-	if opts.RequireIdle && !t.IsIdle(session) {
-		return ErrAgentBusy
+	//
+	// Check the resolved target pane (not the session) so multi-pane sessions
+	// observe the agent's pane, not the focused one. IsIdle also returns false
+	// when the pane can't be captured (e.g. the session died); guard with
+	// HasSession so a gone session falls through to delivery — which surfaces
+	// the terminal ErrSessionNotFound/ErrNoServer — rather than being misreported
+	// as busy and enqueued for a dead session.
+	if opts.RequireIdle && !t.IsIdle(target) {
+		if exists, err := t.HasSession(session); err == nil && exists {
+			return ErrAgentBusy
+		}
 	}
 
 	// 2. Sanitize control characters that corrupt delivery
