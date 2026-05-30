@@ -1472,7 +1472,11 @@ func (t *Tmux) sendEnterVerified(target, promptPrefix string) error {
 	const (
 		maxRetries     = 3
 		initialBackoff = 500 * time.Millisecond
-		verifyLines    = 5 // start line for capture; CapturePane returns the full pane
+		// verifyLines is the scrollback depth passed to CapturePane, which runs
+		// `capture-pane -S -<n>`: that returns the whole *visible* pane plus n
+		// lines of history (not just the last n lines), so the agent's input box
+		// is always in-frame for inputBoxSubmitted.
+		verifyLines = 5
 	)
 
 	// Snapshot pane content before Enter so we can fall back to a content-diff
@@ -1550,16 +1554,17 @@ func (t *Tmux) sendEnterVerified(target, promptPrefix string) error {
 // conclusive is false when the prompt line can't be located (promptPrefix empty,
 // or prompt not currently rendered) so callers can fall back to a content-diff.
 func inputBoxSubmitted(lines []string, promptPrefix string) (submitted, conclusive bool) {
-	// TrimSpace treats NBSP (U+00A0) as whitespace, so the prompt char (e.g. "❯")
-	// matches whether the agent renders a regular space or NBSP after it.
-	prefix := strings.TrimSpace(promptPrefix)
-	if prefix == "" {
+	if promptPrefix == "" {
 		return false, false
 	}
 
+	// Locate the live input box via matchesPromptPrefix, which preserves the
+	// space/NBSP boundary after the prompt char. (A bare TrimSpace of the prefix
+	// would match any line *starting* with the prompt char without a boundary —
+	// e.g. prefix "in " falsely matching "info".)
 	lastIdx := -1
 	for i, line := range lines {
-		if strings.HasPrefix(strings.TrimSpace(line), prefix) {
+		if matchesPromptPrefix(line, promptPrefix) {
 			lastIdx = i
 		}
 	}
@@ -1567,7 +1572,12 @@ func inputBoxSubmitted(lines []string, promptPrefix string) (submitted, conclusi
 		return false, false
 	}
 
-	rest := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(lines[lastIdx]), prefix))
+	// Strip the prompt prefix and check whether any typed text remains in the
+	// box. TrimSpace also strips NBSP (U+00A0), so a bare or NBSP-padded prompt
+	// reads as empty regardless of which whitespace the agent renders.
+	trimmedLine := strings.TrimSpace(lines[lastIdx])
+	prefix := strings.TrimSpace(promptPrefix)
+	rest := strings.TrimSpace(strings.TrimPrefix(trimmedLine, prefix))
 	return rest == "", true
 }
 

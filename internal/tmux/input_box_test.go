@@ -76,6 +76,22 @@ func TestInputBoxSubmitted(t *testing.T) {
 			wantSubmitted: false,
 			wantConcl:     false,
 		},
+		{
+			// Prompt detection must preserve the space boundary so a word-like
+			// prefix doesn't false-match an unrelated line (e.g. "in " vs "info").
+			name:          "word-like prefix does not match without boundary",
+			lines:         []string{"info: something happened", "input received"},
+			prefix:        "in ",
+			wantSubmitted: false,
+			wantConcl:     false,
+		},
+		{
+			name:          "word-like prefix matches with boundary, holds text",
+			lines:         []string{"in flight command"},
+			prefix:        "in ",
+			wantSubmitted: false,
+			wantConcl:     true,
+		},
 	}
 
 	for _, tt := range tests {
