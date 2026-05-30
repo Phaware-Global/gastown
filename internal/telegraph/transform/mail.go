@@ -31,11 +31,22 @@ type Nudger interface {
 
 // ExecNudger runs "gt nudge <target> --mode=queue -m <message>" as a subprocess.
 // It is the production Nudger.
-type ExecNudger struct{}
+type ExecNudger struct {
+	// TownRoot, if set, is the working directory for the gt nudge subprocess.
+	// Queue mode requires a Gas Town workspace to locate the queue directory;
+	// running from the town root lets `gt nudge` resolve it even when the
+	// telegraph daemon was started from outside the workspace. Empty keeps the
+	// inherited cwd (and gt's GT_TOWN_ROOT/GT_ROOT env fallback).
+	TownRoot string
+}
 
 // Nudge delivers a nudge by running gt nudge in queue mode.
 func (n *ExecNudger) Nudge(target, message string) error {
-	return exec.Command("gt", nudgeCommandArgs(target, message)...).Run()
+	cmd := exec.Command("gt", nudgeCommandArgs(target, message)...)
+	if n.TownRoot != "" {
+		cmd.Dir = n.TownRoot
+	}
+	return cmd.Run()
 }
 
 // nudgeCommandArgs builds the `gt nudge` argument vector for telegraph wakeups.
@@ -91,7 +102,7 @@ func New(sender MailSender, nudger Nudger, bodyCap int, nudgeWindow time.Duratio
 // disable structured logging.
 func NewProduction(townRoot string, bodyCap int, nudgeWindow time.Duration, resolver *prompts.Resolver, logger *tlog.Logger) *Transformer {
 	router := mail.NewRouterWithTownRoot(townRoot, townRoot)
-	return New(router, &ExecNudger{}, bodyCap, nudgeWindow, resolver, logger)
+	return New(router, &ExecNudger{TownRoot: townRoot}, bodyCap, nudgeWindow, resolver, logger)
 }
 
 // Transform builds a Mayor-addressed mail envelope from event, sends it via the

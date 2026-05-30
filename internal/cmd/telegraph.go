@@ -140,7 +140,7 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 	if deps.sender != nil {
 		nudger := deps.nudger
 		if nudger == nil {
-			nudger = &transform.ExecNudger{}
+			nudger = &transform.ExecNudger{TownRoot: townRoot}
 		}
 		transformer = transform.New(deps.sender, nudger, cfg.Telegraph.BodyCap, nudgeWindow, resolver, logger)
 	} else {
