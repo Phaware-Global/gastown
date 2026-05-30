@@ -1302,10 +1302,12 @@ func nudgeFlockPath(townRoot, session string) string {
 	// Canonicalize townRoot to an absolute path so every process locks the same
 	// file. workspace.Find already returns an absolute root, but the
 	// GT_TOWN_ROOT/GT_ROOT env fallback is used verbatim and could be relative;
-	// two same-cwd processes deriving it that way would otherwise lock different
-	// files and lose cross-process serialization. Best-effort: fall back to the
-	// raw path if Abs fails. (Different working directories with a relative root
-	// remain unserializable, but the env roots are conventionally absolute.)
+	// without this, a process holding an absolute root and one holding a
+	// relative root that points at the same town would lock different files and
+	// lose cross-process serialization. Best-effort: fall back to the raw path
+	// if Abs fails. (Processes with genuinely different working directories AND a
+	// relative root still resolve differently, but the env roots are
+	// conventionally absolute.)
 	// Guard against empty townRoot: filepath.Abs("") returns the process cwd,
 	// which would silently point the lock at an arbitrary directory.
 	if townRoot != "" {
