@@ -29,13 +29,27 @@ type Nudger interface {
 	Nudge(target, message string) error
 }
 
-// ExecNudger runs "gt nudge <target> -m <message>" as a subprocess.
+// ExecNudger runs "gt nudge <target> --mode=queue -m <message>" as a subprocess.
 // It is the production Nudger.
 type ExecNudger struct{}
 
-// Nudge delivers a nudge by running gt nudge.
+// Nudge delivers a nudge by running gt nudge in queue mode.
 func (n *ExecNudger) Nudge(target, message string) error {
-	return exec.Command("gt", "nudge", target, "-m", message).Run()
+	return exec.Command("gt", nudgeCommandArgs(target, message)...).Run()
+}
+
+// nudgeCommandArgs builds the `gt nudge` argument vector for telegraph wakeups.
+//
+// Queue mode (not the default wait-idle): telegraph fires one wakeup per inbound
+// webhook event, and its only target — the mayor — is a Claude agent with a
+// UserPromptSubmit turn-boundary drain. Wait-idle would optimistically
+// send-keys-inject each wakeup the instant the mayor looked idle; under the
+// mayor's high event volume those injections pile into its input box during
+// busy windows. Cooperative queueing drains at the next turn boundary instead.
+// The mayor is still woken promptly: each underlying message also arrives as a
+// per-message mail notification delivered by the router.
+func nudgeCommandArgs(target, message string) []string {
+	return []string{"nudge", target, "--mode=queue", "-m", message}
 }
 
 // Transformer is the L3 layer. It is safe for concurrent use.
