@@ -1755,29 +1755,10 @@ func (r *Router) notifyRecipient(msg *Message) error {
 		notification := formatNotificationMessage(msg)
 		priority := nudgePriorityForMailPriority(msg.Priority)
 
-		// Wait-idle-first delivery: try direct nudge if the agent is idle,
-		// fall back to cooperative queue if busy. WaitForIdle requires 2
-		// consecutive idle polls (prompt visible + no "esc to interrupt"
-		// in the status bar) to distinguish genuine idle from brief
-		// inter-tool-call gaps. See: https://github.com/steveyegge/gastown/issues/2032
-		waitErr := r.tmux.WaitForIdle(sessionID, timeout)
-		if waitErr == nil {
-			// Agent is idle — deliver directly for immediate wakeup.
-			if err := r.tmux.NudgeSession(sessionID, notification); err == nil {
-				r.enqueueReplyReminder(msg, sessionID)
-				return nil
-			} else if errors.Is(err, tmux.ErrSessionNotFound) {
-				continue
-			} else if errors.Is(err, tmux.ErrNoServer) {
-				return nil
-			}
-		} else if errors.Is(waitErr, tmux.ErrSessionNotFound) {
-			continue
-		} else if errors.Is(waitErr, tmux.ErrNoServer) {
-			return nil
-		} else if r.townRoot != "" {
-			// Timeout (agent busy) — queue for cooperative delivery
-			// at the next turn boundary.
+		// enqueueNotification queues the notification for cooperative drain at
+		// the recipient's next turn boundary (busy agent) and records the reply
+		// reminder. Requires a town root.
+		enqueueNotification := func() error {
 			if err := nudge.Enqueue(r.townRoot, sessionID, nudge.QueuedNudge{
 				Sender:   msg.From,
 				Message:  notification,
@@ -1790,6 +1771,48 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			}
 			r.enqueueReplyReminder(msg, sessionID)
 			return nil
+		}
+
+		// Wait-idle-first delivery: try direct nudge if the agent is idle,
+		// fall back to cooperative queue if busy. WaitForIdle requires 2
+		// consecutive idle polls (prompt visible + no "esc to interrupt"
+		// in the status bar) to distinguish genuine idle from brief
+		// inter-tool-call gaps. See: https://github.com/steveyegge/gastown/issues/2032
+		waitErr := r.tmux.WaitForIdle(sessionID, timeout)
+		if waitErr == nil {
+			// Agent looks idle — deliver directly for immediate wakeup.
+			// RequireIdle re-checks idle inside the delivery lock so an agent
+			// that resumed work between WaitForIdle and the paste isn't
+			// force-injected; on ErrAgentBusy we queue instead of stranding
+			// the typed text in its input box.
+			err := r.tmux.NudgeSessionWithOpts(sessionID, notification, tmux.NudgeOpts{RequireIdle: true})
+			switch {
+			case err == nil:
+				r.enqueueReplyReminder(msg, sessionID)
+				return nil
+			case errors.Is(err, tmux.ErrSessionNotFound):
+				continue
+			case errors.Is(err, tmux.ErrNoServer):
+				return nil
+			case errors.Is(err, tmux.ErrAgentBusy):
+				if r.townRoot != "" {
+					return enqueueNotification()
+				}
+				// Busy but no town root to queue into. Do NOT fall through to
+				// the last-resort injection below — that would strand the text
+				// in the busy input box, the very thing RequireIdle prevents.
+				return fmt.Errorf("notify %s: agent busy, no town root to queue: %w", sessionID, err)
+			}
+			// Other (unexpected) delivery error — fall through to the
+			// last-resort direct delivery below.
+		} else if errors.Is(waitErr, tmux.ErrSessionNotFound) {
+			continue
+		} else if errors.Is(waitErr, tmux.ErrNoServer) {
+			return nil
+		} else if r.townRoot != "" {
+			// Timeout (agent busy) — queue for cooperative delivery
+			// at the next turn boundary.
+			return enqueueNotification()
 		}
 		// No town root available — last resort direct delivery.
 		err = r.tmux.NudgeSession(sessionID, notification)

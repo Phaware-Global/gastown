@@ -230,7 +230,18 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 				Message:  message,
 				Priority: nudgePriorityFlag,
 			}})
-			return t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot})
+			// RequireIdle re-checks idle inside the delivery lock: the agent can
+			// resume work between WaitForIdle above and the actual paste, which
+			// would strand the text in its input box. On ErrAgentBusy, fall
+			// through to enqueue for cooperative drain instead of stranding it.
+			derr := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot, RequireIdle: true})
+			if derr == nil {
+				return nil
+			}
+			if !errors.Is(derr, tmux.ErrAgentBusy) {
+				return derr
+			}
+			// else: agent became busy — proceed to the queue path below.
 		}
 		// Terminal errors (session gone, no server) — propagate, don't queue.
 		// Queueing a nudge for a dead session means it will never be delivered.

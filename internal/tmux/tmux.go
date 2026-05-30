@@ -46,6 +46,7 @@ var (
 	ErrSessionRunning     = errors.New("session already running with healthy agent")
 	ErrInvalidSessionName = errors.New("invalid session name")
 	ErrIdleTimeout        = errors.New("agent not idle before timeout")
+	ErrAgentBusy          = errors.New("agent busy at delivery time")
 )
 
 // validateSessionName checks that a session name contains only safe characters.
@@ -1717,6 +1718,15 @@ type NudgeOpts struct {
 	// <townRoot>/.runtime/nudge_queue/<session>/.lock before delivery.
 	// When empty, only in-process locking is used (backward-compatible).
 	TownRoot string
+
+	// RequireIdle aborts delivery with ErrAgentBusy if the agent is not idle at
+	// the moment text would be typed. Callers that pre-check idle (e.g. the
+	// wait-idle nudge path, the mail router) race against the agent resuming work
+	// between their WaitForIdle and the actual paste — the typed text then lands
+	// on a busy TUI that accepts it into the input box but never submits it,
+	// stranding the nudge. Re-checking inside the delivery lock closes that gap;
+	// on ErrAgentBusy the caller should enqueue for cooperative drain instead.
+	RequireIdle bool
 }
 
 // canonicalPaneTarget converts a pane identifier like "%23" into a tmux target
@@ -1781,6 +1791,25 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	if inMode, _ := t.run("display-message", "-p", "-t", target, "#{pane_in_mode}"); strings.TrimSpace(inMode) == "1" {
 		_, _ = t.run("send-keys", "-t", target, "-X", "cancel")
 		time.Sleep(50 * time.Millisecond)
+	}
+
+	// 1.5. RequireIdle: re-check idle inside the delivery lock, just before we
+	// type anything. Callers that pre-checked idle race against the agent
+	// resuming work in the gap before this paste; typing into a now-busy TUI
+	// strands the text in the input box without submitting it. Abort with
+	// ErrAgentBusy so the caller can enqueue for cooperative drain instead.
+	//
+	// Snapshot the resolved target pane (the one that will receive send-keys, so
+	// multi-pane sessions observe the agent's pane, not the focused one) while
+	// resolving the ready-prompt prefix from the session env (show-environment is
+	// session-scoped; a pane target would force the default prefix and spuriously
+	// report busy for agents with a custom ReadyPromptPrefix). A capture error
+	// means the pane/session is gone — fall through to delivery so the terminal
+	// ErrSessionNotFound/ErrNoServer surfaces, rather than reporting busy.
+	if opts.RequireIdle {
+		if idle, captureErr := t.idleSnapshot(target, session); !idle && captureErr == nil {
+			return ErrAgentBusy
+		}
 	}
 
 	// 2. Sanitize control characters that corrupt delivery
@@ -3230,31 +3259,45 @@ func (t *Tmux) IsAtPrompt(session string, rc *config.RuntimeConfig) bool {
 // pane starting with ⏵⏵). When the agent is actively working, the status
 // bar contains "esc to interrupt". When idle, it does not.
 func (t *Tmux) IsIdle(session string) bool {
-	lines, err := t.CapturePaneLines(session, 5)
+	idle, _ := t.idleSnapshot(session, session)
+	return idle
+}
+
+// idleSnapshot is the core of IsIdle, split so callers can capture the pane from
+// one target while resolving the ready-prompt prefix from another. It snapshots
+// captureTarget (the pane that will actually receive input) for busy/idle state,
+// but resolves the prompt prefix from envSession's GT_AGENT — show-environment is
+// session-scoped, so a pane-qualified capture target can't be read against it.
+//
+// captureErr is non-nil only when the pane can't be captured (e.g. the session
+// or pane is gone), letting callers distinguish "busy" (idle=false, err=nil)
+// from "no longer there" (idle=false, err!=nil) without a second tmux call.
+func (t *Tmux) idleSnapshot(captureTarget, envSession string) (idle bool, captureErr error) {
+	lines, err := t.CapturePaneLines(captureTarget, 5)
 	if err != nil {
-		return false
+		return false, err
 	}
 
 	for _, line := range lines {
 		if hasBusyIndicator(line) {
-			return false
+			return false, nil
 		}
 	}
 
-	promptPrefix := readyPromptPrefixForSession(t, session)
+	promptPrefix := readyPromptPrefixForSession(t, envSession)
 	for _, line := range lines {
 		if matchesPromptPrefix(line, promptPrefix) {
-			return true
+			return true, nil
 		}
 	}
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if strings.Contains(trimmed, "⏵⏵") || strings.Contains(trimmed, "\u23F5\u23F5") {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // GetSessionInfo returns detailed information about a session.
