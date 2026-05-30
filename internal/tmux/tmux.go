@@ -1727,13 +1727,15 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// strands the text in the input box without submitting it. Abort with
 	// ErrAgentBusy so the caller can enqueue for cooperative drain instead.
 	//
-	// Check the resolved target pane (not the session) so multi-pane sessions
-	// observe the agent's pane, not the focused one. IsIdle also returns false
-	// when the pane can't be captured (e.g. the session died); guard with
-	// HasSession so a gone session falls through to delivery — which surfaces
-	// the terminal ErrSessionNotFound/ErrNoServer — rather than being misreported
-	// as busy and enqueued for a dead session.
-	if opts.RequireIdle && !t.IsIdle(target) {
+	// Check by session (matching WaitForIdle, which the callers already use):
+	// IsIdle resolves the agent's ready-prompt prefix from the session's
+	// GT_AGENT env, which a pane-qualified target can't be read against — passing
+	// the pane would force the default prefix and spuriously report busy for
+	// agents with a custom ReadyPromptPrefix. IsIdle also returns false when the
+	// pane can't be captured (e.g. the session died); guard with HasSession so a
+	// gone session falls through to delivery — which surfaces the terminal
+	// ErrSessionNotFound/ErrNoServer — rather than being enqueued as "busy".
+	if opts.RequireIdle && !t.IsIdle(session) {
 		if exists, err := t.HasSession(session); err == nil && exists {
 			return ErrAgentBusy
 		}
