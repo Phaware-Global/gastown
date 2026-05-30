@@ -1783,9 +1783,12 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			// Agent looks idle — deliver directly for immediate wakeup.
 			// RequireIdle re-checks idle inside the delivery lock so an agent
 			// that resumed work between WaitForIdle and the paste isn't
-			// force-injected; on ErrAgentBusy we queue instead of stranding
-			// the typed text in its input box.
-			err := r.tmux.NudgeSessionWithOpts(sessionID, notification, tmux.NudgeOpts{RequireIdle: true})
+			// force-injected; on ErrAgentBusy we queue instead of stranding the
+			// typed text. TownRoot makes the injection participate in the
+			// flock-based cross-process nudge lock so it can't interleave with
+			// concurrent `gt nudge` subprocesses (e.g. telegraph fan-out) and
+			// garble the input box. (GH#gt-ukl8)
+			err := r.tmux.NudgeSessionWithOpts(sessionID, notification, tmux.NudgeOpts{TownRoot: r.townRoot, RequireIdle: true})
 			switch {
 			case err == nil:
 				r.enqueueReplyReminder(msg, sessionID)
@@ -1802,9 +1805,13 @@ func (r *Router) notifyRecipient(msg *Message) error {
 				// the last-resort injection below — that would strand the text
 				// in the busy input box, the very thing RequireIdle prevents.
 				return fmt.Errorf("notify %s: agent busy, no town root to queue: %w", sessionID, err)
+			default:
+				// Unexpected error — e.g. a cross-process flock acquisition
+				// timeout. Do NOT fall through to the last-resort NudgeSession
+				// below: that path holds no flock and would inject anyway,
+				// exactly the interleaving routing through the lock prevents.
+				return fmt.Errorf("notify %s: %w", sessionID, err)
 			}
-			// Other (unexpected) delivery error — fall through to the
-			// last-resort direct delivery below.
 		} else if errors.Is(waitErr, tmux.ErrSessionNotFound) {
 			continue
 		} else if errors.Is(waitErr, tmux.ErrNoServer) {
