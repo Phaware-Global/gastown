@@ -3070,6 +3070,11 @@ func readyPromptPrefixForSession(t *Tmux, session string) string {
 // and bare shells can repopulate the prompt line (e.g. zsh-autosuggestions),
 // which would otherwise read as a falsely-stranded nudge.
 func (t *Tmux) submitVerifyPrefix(session string) string {
+	// Empty session (e.g. sessionForPane failed) — skip the GetEnvironment call,
+	// which would spawn a guaranteed-to-fail `show-environment -t ""`.
+	if session == "" {
+		return ""
+	}
 	if agentName, err := t.GetEnvironment(session, "GT_AGENT"); err != nil || agentName == "" {
 		return ""
 	}
