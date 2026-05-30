@@ -1794,11 +1794,17 @@ func (r *Router) notifyRecipient(msg *Message) error {
 				continue
 			case errors.Is(err, tmux.ErrNoServer):
 				return nil
-			case errors.Is(err, tmux.ErrAgentBusy) && r.townRoot != "":
-				return enqueueNotification()
+			case errors.Is(err, tmux.ErrAgentBusy):
+				if r.townRoot != "" {
+					return enqueueNotification()
+				}
+				// Busy but no town root to queue into. Do NOT fall through to
+				// the last-resort injection below — that would strand the text
+				// in the busy input box, the very thing RequireIdle prevents.
+				return fmt.Errorf("notify %s: agent busy, no town root to queue: %w", sessionID, err)
 			}
-			// Other delivery error (or busy with no town root) — fall through
-			// to the last-resort direct delivery below.
+			// Other (unexpected) delivery error — fall through to the
+			// last-resort direct delivery below.
 		} else if errors.Is(waitErr, tmux.ErrSessionNotFound) {
 			continue
 		} else if errors.Is(waitErr, tmux.ErrNoServer) {

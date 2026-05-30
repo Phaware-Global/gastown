@@ -1727,16 +1727,15 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// strands the text in the input box without submitting it. Abort with
 	// ErrAgentBusy so the caller can enqueue for cooperative drain instead.
 	//
-	// Check by session (matching WaitForIdle, which the callers already use):
-	// IsIdle resolves the agent's ready-prompt prefix from the session's
-	// GT_AGENT env, which a pane-qualified target can't be read against — passing
-	// the pane would force the default prefix and spuriously report busy for
-	// agents with a custom ReadyPromptPrefix. IsIdle also returns false when the
-	// pane can't be captured (e.g. the session died); guard with HasSession so a
-	// gone session falls through to delivery — which surfaces the terminal
-	// ErrSessionNotFound/ErrNoServer — rather than being enqueued as "busy".
-	if opts.RequireIdle && !t.IsIdle(session) {
-		if exists, err := t.HasSession(session); err == nil && exists {
+	// Snapshot the resolved target pane (the one that will receive send-keys, so
+	// multi-pane sessions observe the agent's pane, not the focused one) while
+	// resolving the ready-prompt prefix from the session env (show-environment is
+	// session-scoped; a pane target would force the default prefix and spuriously
+	// report busy for agents with a custom ReadyPromptPrefix). A capture error
+	// means the pane/session is gone — fall through to delivery so the terminal
+	// ErrSessionNotFound/ErrNoServer surfaces, rather than reporting busy.
+	if opts.RequireIdle {
+		if idle, captureErr := t.idleSnapshot(target, session); !idle && captureErr == nil {
 			return ErrAgentBusy
 		}
 	}
@@ -3168,31 +3167,45 @@ func (t *Tmux) IsAtPrompt(session string, rc *config.RuntimeConfig) bool {
 // pane starting with ⏵⏵). When the agent is actively working, the status
 // bar contains "esc to interrupt". When idle, it does not.
 func (t *Tmux) IsIdle(session string) bool {
-	lines, err := t.CapturePaneLines(session, 5)
+	idle, _ := t.idleSnapshot(session, session)
+	return idle
+}
+
+// idleSnapshot is the core of IsIdle, split so callers can capture the pane from
+// one target while resolving the ready-prompt prefix from another. It snapshots
+// captureTarget (the pane that will actually receive input) for busy/idle state,
+// but resolves the prompt prefix from envSession's GT_AGENT — show-environment is
+// session-scoped, so a pane-qualified capture target can't be read against it.
+//
+// captureErr is non-nil only when the pane can't be captured (e.g. the session
+// or pane is gone), letting callers distinguish "busy" (idle=false, err=nil)
+// from "no longer there" (idle=false, err!=nil) without a second tmux call.
+func (t *Tmux) idleSnapshot(captureTarget, envSession string) (idle bool, captureErr error) {
+	lines, err := t.CapturePaneLines(captureTarget, 5)
 	if err != nil {
-		return false
+		return false, err
 	}
 
 	for _, line := range lines {
 		if hasBusyIndicator(line) {
-			return false
+			return false, nil
 		}
 	}
 
-	promptPrefix := readyPromptPrefixForSession(t, session)
+	promptPrefix := readyPromptPrefixForSession(t, envSession)
 	for _, line := range lines {
 		if matchesPromptPrefix(line, promptPrefix) {
-			return true
+			return true, nil
 		}
 	}
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if strings.Contains(trimmed, "⏵⏵") || strings.Contains(trimmed, "\u23F5\u23F5") {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // GetSessionInfo returns detailed information about a session.
