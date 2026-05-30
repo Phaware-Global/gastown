@@ -1448,25 +1448,39 @@ func (t *Tmux) dismissRewindMode(target string) {
 	time.Sleep(300 * time.Millisecond)
 }
 
-// sendEnterVerified sends Enter to a tmux target and verifies it was processed
-// by checking that the pane content changes. Under load, tmux may buffer
-// keystrokes, causing Enter to race with text delivery — Enter arrives while
-// tmux is still processing text/Escape and gets treated as part of the text
-// stream rather than a separate submit action.
+// sendEnterVerified sends Enter to a tmux target and verifies the pasted nudge
+// was actually submitted. Under load, tmux may buffer keystrokes, causing Enter
+// to race with text delivery — Enter arrives while tmux is still processing the
+// text and gets treated as part of the text stream rather than a separate submit
+// action. The agent can also slip from idle into a busy turn during the paste,
+// so the lone Enter lands on a TUI that accepts the text into its input box but
+// does not submit it.
 //
-// After sending Enter, polls the pane content with exponential backoff. If the
-// content hasn't changed (Enter wasn't processed), retries the Enter keystroke.
-// Max 3 retries before returning an error.
+// Verification keys off the agent's live input box rather than "did the pane
+// change". An animating agent (spinner, token counter, "esc to interrupt"
+// countdown) mutates the pane every frame regardless of whether Enter
+// submitted anything, so a naive content-diff reports success while the typed
+// text is silently stranded. Instead we confirm the input box returned to a
+// bare prompt: on a successful submit the typed text moves into the transcript
+// and the prompt line clears. promptPrefix is the agent's ready-prompt marker
+// (e.g. "❯ "); pass "" to fall back to the legacy content-diff check.
 //
-// Falls back to best-effort (no verification) if pane capture fails.
-func (t *Tmux) sendEnterVerified(target string) error {
+// After sending Enter, polls with exponential backoff and retries the Enter
+// keystroke while the box still holds text. Max 3 retries before returning an
+// error. Falls back to best-effort (no verification) if pane capture fails.
+func (t *Tmux) sendEnterVerified(target, promptPrefix string) error {
 	const (
 		maxRetries     = 3
 		initialBackoff = 500 * time.Millisecond
-		verifyLines    = 5 // capture last N lines for comparison
+		// verifyLines is the scrollback depth passed to CapturePane, which runs
+		// `capture-pane -S -<n>`: that returns the whole *visible* pane plus n
+		// lines of history (not just the last n lines), so the agent's input box
+		// is always in-frame for inputBoxSubmitted.
+		verifyLines = 5
 	)
 
-	// Snapshot pane content before Enter so we can detect processing.
+	// Snapshot pane content before Enter so we can fall back to a content-diff
+	// when the input box can't be located (e.g. prompt not rendered).
 	preSnapshot, preErr := t.CapturePane(target, verifyLines)
 
 	// Send Enter
@@ -1483,18 +1497,25 @@ func (t *Tmux) sendEnterVerified(target string) error {
 	for retry := 0; retry < maxRetries; retry++ {
 		time.Sleep(backoff)
 
-		postSnapshot, err := t.CapturePane(target, verifyLines)
+		lines, err := t.CapturePaneLines(target, verifyLines)
 		if err != nil {
 			// Can't verify — assume success.
 			return nil
 		}
 
-		if postSnapshot != preSnapshot {
-			// Content changed — Enter was processed.
+		if submitted, conclusive := inputBoxSubmitted(lines, promptPrefix); conclusive {
+			if submitted {
+				// Input box returned to a bare prompt — Enter submitted.
+				return nil
+			}
+			// Box still holds the typed text — Enter did not submit. Retry.
+		} else if strings.Join(lines, "\n") != preSnapshot {
+			// Couldn't locate the input box; fall back to content-diff so we
+			// don't regress delivery on agents we can't introspect.
 			return nil
 		}
 
-		// Content unchanged — Enter may not have been processed. Retry.
+		// Not submitted (or inconclusive + unchanged) — retry Enter.
 		if _, err := t.run("send-keys", "-t", target, "Enter"); err != nil {
 			return fmt.Errorf("send Enter (retry %d): %w", retry+1, err)
 		}
@@ -1505,12 +1526,63 @@ func (t *Tmux) sendEnterVerified(target string) error {
 
 	// Final verification after last retry.
 	time.Sleep(500 * time.Millisecond)
-	postSnapshot, err := t.CapturePane(target, verifyLines)
-	if err != nil || postSnapshot != preSnapshot {
-		return nil // Can't verify or content changed — consider success.
+	lines, err := t.CapturePaneLines(target, verifyLines)
+	if err != nil {
+		return nil // Can't verify — consider success.
+	}
+	if submitted, conclusive := inputBoxSubmitted(lines, promptPrefix); conclusive {
+		if submitted {
+			return nil
+		}
+		return fmt.Errorf("nudge Enter not processed after %d retries: input box still holds text", maxRetries)
+	}
+	if strings.Join(lines, "\n") != preSnapshot {
+		return nil // Inconclusive but content changed — consider success.
+	}
+	return fmt.Errorf("nudge Enter not processed after %d retries: pane content unchanged", maxRetries)
+}
+
+// inputBoxSubmitted reports whether the agent's live input box is empty, which
+// is how we confirm a nudge's Enter actually submitted: on submit the typed text
+// moves into the transcript and the input line returns to a bare prompt.
+//
+// The live input box is the LAST line carrying the prompt prefix (earlier
+// prompt-prefixed lines are submitted messages echoed into the transcript). If
+// that line has no content after the prefix, the box is empty (submitted=true).
+// If it still carries typed text, the Enter was stranded (submitted=false).
+//
+// conclusive is false when the prompt line can't be located (promptPrefix empty,
+// or prompt not currently rendered) so callers can fall back to a content-diff.
+func inputBoxSubmitted(lines []string, promptPrefix string) (submitted, conclusive bool) {
+	if promptPrefix == "" {
+		return false, false
 	}
 
-	return fmt.Errorf("nudge Enter not processed after %d retries: pane content unchanged", maxRetries)
+	// Locate the live input box via matchesPromptPrefix, which preserves the
+	// space/NBSP boundary after the prompt char. (A bare TrimSpace of the prefix
+	// would match any line *starting* with the prompt char without a boundary —
+	// e.g. prefix "in " falsely matching "info".)
+	lastIdx := -1
+	for i, line := range lines {
+		if matchesPromptPrefix(line, promptPrefix) {
+			lastIdx = i
+		}
+	}
+	if lastIdx == -1 {
+		return false, false
+	}
+
+	// Strip the prompt prefix and check whether any typed text remains in the
+	// box. Normalize NBSP (U+00A0) -> regular space in both line and prefix
+	// (mirroring matchesPromptPrefix) so a multi-token prefix with a space/NBSP
+	// mismatch between config and pane (e.g. prefix "beads \u276f " vs a pane
+	// rendering "beads\u00a0\u276f ") still strips correctly.
+	normLine := strings.ReplaceAll(lines[lastIdx], "\u00a0", " ")
+	normPrefix := strings.ReplaceAll(promptPrefix, "\u00a0", " ")
+	trimmedLine := strings.TrimSpace(normLine)
+	prefix := strings.TrimSpace(normPrefix)
+	rest := strings.TrimSpace(strings.TrimPrefix(trimmedLine, prefix))
+	return rest == "", true
 }
 
 // adaptiveTextDelay returns the post-text-delivery delay for a message.
@@ -1757,9 +1829,10 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 		}
 	}
 
-	// 7. Send Enter with verification — polls pane content to confirm Enter
-	// was processed, retrying with exponential backoff under load. (GH#gt-0b5)
-	if err := t.sendEnterVerified(target); err != nil {
+	// 7. Send Enter with verification — confirms the input box cleared (the
+	// nudge was submitted, not just typed), retrying with exponential backoff
+	// under load. (GH#gt-0b5)
+	if err := t.sendEnterVerified(target, t.submitVerifyPrefix(session)); err != nil {
 		return fmt.Errorf("nudge to session %q: %w", session, err)
 	}
 
@@ -1927,9 +2000,10 @@ func (t *Tmux) NudgePane(pane, message string) error {
 		}
 	}
 
-	// 7. Send Enter with verification — polls pane content to confirm Enter
-	// was processed, retrying with exponential backoff under load. (GH#gt-0b5)
-	if err := t.sendEnterVerified(pane); err != nil {
+	// 7. Send Enter with verification — confirms the input box cleared (the
+	// nudge was submitted, not just typed), retrying with exponential backoff
+	// under load. (GH#gt-0b5)
+	if err := t.sendEnterVerified(pane, t.submitVerifyPrefix(t.sessionForPane(pane))); err != nil {
 		return fmt.Errorf("nudge to pane %q: %w", pane, err)
 	}
 
@@ -2987,6 +3061,24 @@ func readyPromptPrefixForSession(t *Tmux, session string) string {
 		return promptPrefix
 	}
 	return preset.ReadyPromptPrefix
+}
+
+// submitVerifyPrefix returns the ready-prompt prefix used to verify that a
+// nudge's Enter actually submitted (input box cleared), or "" when the session
+// is not a managed agent. Returning "" makes sendEnterVerified fall back to the
+// legacy content-diff: we only know the input-box layout for agents we launch,
+// and bare shells can repopulate the prompt line (e.g. zsh-autosuggestions),
+// which would otherwise read as a falsely-stranded nudge.
+func (t *Tmux) submitVerifyPrefix(session string) string {
+	// Empty session (e.g. sessionForPane failed) — skip the GetEnvironment call,
+	// which would spawn a guaranteed-to-fail `show-environment -t ""`.
+	if session == "" {
+		return ""
+	}
+	if agentName, err := t.GetEnvironment(session, "GT_AGENT"); err != nil || agentName == "" {
+		return ""
+	}
+	return readyPromptPrefixForSession(t, session)
 }
 
 func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, timeout time.Duration) error {
