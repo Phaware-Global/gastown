@@ -1299,6 +1299,16 @@ func releaseNudgeLock(session string) {
 // Lock files live alongside the nudge queue directory for self-documentation and cleanup.
 func nudgeFlockPath(townRoot, session string) string {
 	safe := strings.ReplaceAll(session, "/", "_")
+	// Canonicalize townRoot to an absolute path so every process locks the same
+	// file. workspace.Find already returns an absolute root, but the
+	// GT_TOWN_ROOT/GT_ROOT env fallback is used verbatim and could be relative;
+	// two same-cwd processes deriving it that way would otherwise lock different
+	// files and lose cross-process serialization. Best-effort: fall back to the
+	// raw path if Abs fails. (Different working directories with a relative root
+	// remain unserializable, but the env roots are conventionally absolute.)
+	if abs, err := filepath.Abs(townRoot); err == nil {
+		townRoot = abs
+	}
 	return filepath.Join(townRoot, constants.DirRuntime, "nudge_queue", safe, ".lock")
 }
 
