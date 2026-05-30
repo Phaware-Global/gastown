@@ -1306,8 +1306,12 @@ func nudgeFlockPath(townRoot, session string) string {
 	// files and lose cross-process serialization. Best-effort: fall back to the
 	// raw path if Abs fails. (Different working directories with a relative root
 	// remain unserializable, but the env roots are conventionally absolute.)
-	if abs, err := filepath.Abs(townRoot); err == nil {
-		townRoot = abs
+	// Guard against empty townRoot: filepath.Abs("") returns the process cwd,
+	// which would silently point the lock at an arbitrary directory.
+	if townRoot != "" {
+		if abs, err := filepath.Abs(townRoot); err == nil {
+			townRoot = abs
+		}
 	}
 	return filepath.Join(townRoot, constants.DirRuntime, "nudge_queue", safe, ".lock")
 }
