@@ -135,28 +135,37 @@ fi
 # --- Take action --------------------------------------------------------------
 
 # Crashed polecats: notify witness to restart
-for ENTRY in "${CRASHED[@]}"; do
-  IFS='|' read -r SESSION RIG PCAT HOOK <<< "$ENTRY"
-  log "Requesting restart for $RIG/polecats/$PCAT (hook=$HOOK)"
-  gt mail send "$RIG/witness" -s "RESTART_POLECAT: $RIG/$PCAT" --stdin <<BODY
+# Guard on array length: an empty array must skip the loop entirely. Bare
+# "${CRASHED[@]}" trips set -u on bash 3.2, and the ${CRASHED[@]:-} workaround
+# iterates once over an empty string — yielding empty RIG/PCAT and a bogus
+# "/witness" mail address (root cause of hq-wisp-ekvkez, hq-s8oa8).
+if [ "${#CRASHED[@]}" -gt 0 ]; then
+  for ENTRY in "${CRASHED[@]}"; do
+    IFS='|' read -r SESSION RIG PCAT HOOK <<< "$ENTRY"
+    log "Requesting restart for $RIG/polecats/$PCAT (hook=$HOOK)"
+    gt mail send "$RIG/witness" -s "RESTART_POLECAT: $RIG/$PCAT" --stdin <<BODY
 Polecat $PCAT crash confirmed by stuck-agent-dog plugin.
 hook_bead: $HOOK
 action: restart requested
 BODY
-done
+  done
+fi
 
 # Zombie polecats: kill zombie session, then request restart
-for ENTRY in "${STUCK[@]}"; do
-  IFS='|' read -r SESSION RIG PCAT HOOK REASON <<< "$ENTRY"
-  log "Killing zombie session $SESSION and requesting restart"
-  tmux kill-session -t "$SESSION" 2>/dev/null || true
-  gt mail send "$RIG/witness" -s "RESTART_POLECAT: $RIG/$PCAT (zombie cleared)" --stdin <<BODY
+# Same empty-array guard as the CRASHED loop above.
+if [ "${#STUCK[@]}" -gt 0 ]; then
+  for ENTRY in "${STUCK[@]}"; do
+    IFS='|' read -r SESSION RIG PCAT HOOK REASON <<< "$ENTRY"
+    log "Killing zombie session $SESSION and requesting restart"
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    gt mail send "$RIG/witness" -s "RESTART_POLECAT: $RIG/$PCAT (zombie cleared)" --stdin <<BODY
 Polecat $PCAT zombie session cleared by stuck-agent-dog plugin.
 hook_bead: $HOOK
 reason: $REASON
 action: restart requested
 BODY
-done
+  done
+fi
 
 # Deacon issues: escalate
 if [ -n "$DEACON_ISSUE" ]; then
