@@ -400,6 +400,53 @@ func TestParsePluginMD_GitHubSheriff(t *testing.T) {
 	}
 }
 
+// TestParsePluginMD_FeedbackDialogWatcher pins the shipped feedback-dialog-
+// watcher plugin (deacon-b5kah): frontmatter parses, gate is a 5m cooldown,
+// the instructions name both detection markers ('1: Bad' AND '0: Dismiss')
+// so future edits can't weaken the specificity that distinguishes the
+// dialog from incidental text, and the dismiss-only contract (no 1/2/3
+// rating keystrokes) is documented in the body.
+func TestParsePluginMD_FeedbackDialogWatcher(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("..", "..", "plugins", "feedback-dialog-watcher", "plugin.md"))
+	if err != nil {
+		t.Skipf("feedback-dialog-watcher plugin not found (expected in plugins/): %v", err)
+	}
+
+	plugin, err := parsePluginMD(content, "/test/feedback-dialog-watcher", LocationTown, "")
+	if err != nil {
+		t.Fatalf("parsePluginMD failed: %v", err)
+	}
+
+	if plugin.Name != "feedback-dialog-watcher" {
+		t.Errorf("expected name 'feedback-dialog-watcher', got %q", plugin.Name)
+	}
+	if plugin.Gate == nil || plugin.Gate.Type != GateCooldown || plugin.Gate.Duration != "5m" {
+		t.Errorf("expected 5m cooldown gate, got %+v", plugin.Gate)
+	}
+	if plugin.Tracking == nil || !plugin.Tracking.Digest {
+		t.Errorf("expected digest=true tracking, got %+v", plugin.Tracking)
+	}
+	if plugin.Execution == nil || plugin.Execution.Timeout != "1m" {
+		t.Errorf("expected execution.timeout=1m, got %+v", plugin.Execution)
+	}
+
+	// Both detection markers must be named in the body — losing either
+	// reverts the plugin to too-generic matching that fires on incidental
+	// text (any pane that just happens to contain '1: Bad' or '0: Dismiss'
+	// in isolation, e.g. a code review of this very file's strings).
+	for _, marker := range []string{"1: Bad", "0: Dismiss"} {
+		if !strings.Contains(plugin.Instructions, marker) {
+			t.Errorf("instructions missing detection marker %q — required to lock in specificity", marker)
+		}
+	}
+	// Dismiss-only contract — the body must explicitly call out that we
+	// never send a rating keystroke (1/2/3). Otherwise a future edit could
+	// silently broaden the action to "press whatever option matches".
+	if !strings.Contains(plugin.Instructions, "Dismiss") {
+		t.Errorf("instructions must document the Dismiss-only action contract")
+	}
+}
+
 func TestParsePluginMD_StuckAgentDogUsesCanonicalHeartbeatPath(t *testing.T) {
 	content, err := os.ReadFile(filepath.Join("..", "..", "plugins", "stuck-agent-dog", "plugin.md"))
 	if err != nil {
