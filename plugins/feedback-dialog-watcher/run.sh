@@ -59,7 +59,7 @@ while IFS= read -r PANE; do
   #   '1: Bad' alone matches any code/log line that lists '1: Bad' as data.
   #   '0: Dismiss' alone could match other Claude prompts that share the
   #   option label.
-  if grep -qF '1: Bad' <<<"$CONTENT" && grep -qF '0: Dismiss' <<<"$CONTENT"; then
+  if [[ "$CONTENT" == *"1: Bad"* ]] && [[ "$CONTENT" == *"0: Dismiss"* ]]; then
     # Tmux send-keys with a single literal key. No Enter needed — the
     # dialog responds to the keystroke immediately (Mayor verified).
     if tmux send-keys -t "$PANE" '0' 2>/dev/null; then

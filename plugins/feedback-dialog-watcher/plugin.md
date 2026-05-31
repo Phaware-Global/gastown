@@ -85,7 +85,7 @@ while IFS= read -r PANE; do
   [ -z "$CONTENT" ] && continue
 
   # Both markers must be present. Either alone is too generic.
-  if grep -qF '1: Bad' <<<"$CONTENT" && grep -qF '0: Dismiss' <<<"$CONTENT"; then
+  if [[ "$CONTENT" == *"1: Bad"* ]] && [[ "$CONTENT" == *"0: Dismiss"* ]]; then
     tmux send-keys -t "$PANE" '0'
     DISMISSED=$((DISMISSED + 1))
   fi
