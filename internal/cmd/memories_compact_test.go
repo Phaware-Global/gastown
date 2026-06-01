@@ -195,6 +195,13 @@ func TestBuildCompactPlan(t *testing.T) {
 		}
 	})
 
+	t.Run("rejects missing type (no silent re-typing)", func(t *testing.T) {
+		result := &memCompactResult{Memories: []compactMemory{{Type: "", Key: "k", Value: "v"}}}
+		if _, err := buildCompactPlan(originals, result); err == nil {
+			t.Fatal("expected error when model omits the type field")
+		}
+	})
+
 	t.Run("rejects empty key", func(t *testing.T) {
 		result := &memCompactResult{Memories: []compactMemory{{Type: "user", Key: "  ", Value: "v"}}}
 		if _, err := buildCompactPlan(originals, result); err == nil {

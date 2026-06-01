@@ -340,9 +340,14 @@ func buildCompactPlan(originals []storedMemory, result *memCompactResult) (*comp
 	finalFullKeys := map[string]bool{}
 
 	for i, cm := range result.Memories {
+		// Require an explicit type. Defaulting a missing type to "general"
+		// would silently re-type and re-key a memory (e.g. feedback/foo →
+		// general/foo), and since removals are set-difference based that would
+		// clear the original typed entry — a destructive move from a malformed
+		// response. Fail fast instead; nothing is mutated on error.
 		memType := strings.ToLower(strings.TrimSpace(cm.Type))
 		if memType == "" {
-			memType = "general"
+			return nil, fmt.Errorf("model returned memory %d (key %q) with no type", i, cm.Key)
 		}
 		if _, ok := validMemoryTypes[memType]; !ok {
 			return nil, fmt.Errorf("model returned memory %d with invalid type %q", i, cm.Type)
