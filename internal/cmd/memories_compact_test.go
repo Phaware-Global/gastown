@@ -15,6 +15,9 @@ func TestExtractJSONSpan(t *testing.T) {
 		{"nested braces", `prefix {"a":{"b":2}} suffix`, `{"a":{"b":2}}`},
 		{"no object", "no json here", ""},
 		{"only open brace", "text { more", ""},
+		{"json fenced block", "Here:\n```json\n{\"a\":1}\n```\nthanks", `{"a":1}`},
+		{"bare fenced block", "```\n{\"a\":1}\n```", `{"a":1}`},
+		{"fence with prose containing braces", "I think {x} maybe.\n```json\n{\"a\":1}\n```", `{"a":1}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -61,6 +64,33 @@ func TestParseCompactResponse(t *testing.T) {
 			t.Fatal("expected error when no JSON object embedded")
 		}
 	})
+}
+
+func TestValidateMemoriesFlags(t *testing.T) {
+	tests := []struct {
+		name                                           string
+		compact, hasArgs, dryRun, yes, model, typeFlag bool
+		wantErr                                        bool
+	}{
+		{name: "plain list, no flags", wantErr: false},
+		{name: "plain list with search term", hasArgs: true, wantErr: false},
+		{name: "plain list with --type", typeFlag: true, wantErr: false},
+		{name: "--dry-run without --compact", dryRun: true, wantErr: true},
+		{name: "--yes without --compact", yes: true, wantErr: true},
+		{name: "--model without --compact", model: true, wantErr: true},
+		{name: "compact alone", compact: true, wantErr: false},
+		{name: "compact with all its flags", compact: true, dryRun: true, yes: true, model: true, wantErr: false},
+		{name: "compact with search term", compact: true, hasArgs: true, wantErr: true},
+		{name: "compact with --type", compact: true, typeFlag: true, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateMemoriesFlags(tt.compact, tt.hasArgs, tt.dryRun, tt.yes, tt.model, tt.typeFlag)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateMemoriesFlags() err = %v, wantErr = %v", err, tt.wantErr)
+			}
+		})
+	}
 }
 
 func TestBuildCompactPlan(t *testing.T) {
@@ -124,6 +154,31 @@ func TestBuildCompactPlan(t *testing.T) {
 			if s.fullKey == "memory.stale-legacy" && (s.isNew || s.changed) {
 				t.Error("unchanged legacy memory marked new/changed")
 			}
+		}
+	})
+
+	t.Run("duplicate type/key prefers canonical key, clears legacy", func(t *testing.T) {
+		// Both a legacy untyped key and the canonical typed key resolve to
+		// general/dup. The canonical one must be preserved and the legacy one
+		// cleared, deterministically (not order-dependent).
+		dupOriginals := []storedMemory{
+			{fullKey: "memory.dup", memType: "general", shortKey: "dup", value: "same fact"},
+			{fullKey: "memory.general.dup", memType: "general", shortKey: "dup", value: "same fact"},
+		}
+		result := &memCompactResult{
+			Memories: []compactMemory{
+				{Type: "general", Key: "dup", Value: "same fact", Sources: []string{"general/dup"}},
+			},
+		}
+		plan, err := buildCompactPlan(dupOriginals, result)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(plan.sets) != 1 || plan.sets[0].fullKey != "memory.general.dup" {
+			t.Fatalf("expected single set op on canonical key memory.general.dup, got %+v", plan.sets)
+		}
+		if len(plan.clears) != 1 || plan.clears[0].fullKey != "memory.dup" {
+			t.Fatalf("expected to clear the legacy key memory.dup, got %+v", plan.clears)
 		}
 	})
 

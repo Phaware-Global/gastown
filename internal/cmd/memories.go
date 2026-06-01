@@ -51,6 +51,17 @@ Examples:
 }
 
 func runMemories(cmd *cobra.Command, args []string) error {
+	if err := validateMemoriesFlags(
+		memoriesCompact,
+		len(args) > 0,
+		cmd.Flags().Changed("dry-run"),
+		cmd.Flags().Changed("yes"),
+		cmd.Flags().Changed("model"),
+		cmd.Flags().Changed("type"),
+	); err != nil {
+		return err
+	}
+
 	if memoriesCompact {
 		return runMemoriesCompact()
 	}
@@ -142,6 +153,37 @@ func runMemories(cmd *cobra.Command, args []string) error {
 		fmt.Printf("    %s\n\n", m.value)
 	}
 
+	return nil
+}
+
+// validateMemoriesFlags rejects flag combinations that would silently ignore
+// user input. The --compact-only flags (--dry-run/--yes/--model) are
+// meaningless for plain listing, and a search term is ignored under --compact;
+// surfacing an error beats quietly dropping the input.
+func validateMemoriesFlags(compact, hasArgs, dryRunSet, yesSet, modelSet, typeSet bool) error {
+	if !compact {
+		var offenders []string
+		if dryRunSet {
+			offenders = append(offenders, "--dry-run")
+		}
+		if yesSet {
+			offenders = append(offenders, "--yes")
+		}
+		if modelSet {
+			offenders = append(offenders, "--model")
+		}
+		if len(offenders) > 0 {
+			return fmt.Errorf("%s only applies with --compact", strings.Join(offenders, ", "))
+		}
+		return nil
+	}
+	// compact mode
+	if hasArgs {
+		return fmt.Errorf("--compact does not take a search term")
+	}
+	if typeSet {
+		return fmt.Errorf("--type cannot be combined with --compact (compaction always considers all memories)")
+	}
 	return nil
 }
 

@@ -1,15 +1,22 @@
 package cmd
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/style"
 )
+
+// compactTimeout bounds the headless compaction model call so a hung or
+// slow `claude` invocation can't stall the command indefinitely.
+var compactTimeout = 2 * time.Minute
 
 // memCompactResult is the JSON contract the LLM must return: the complete
 // desired final memory set plus, for display only, the list of memories it
@@ -94,8 +101,13 @@ func runMemoriesCompact() error {
 	fmt.Printf("%s Compacting %d memories with %s...\n\n",
 		style.Bold.Render("🧹"), len(originals), style.Bold.Render(memoriesModel))
 
-	raw, err := invokeClaudeCompact(buildCompactPrompt(originals), memoriesModel)
+	ctx, cancel := context.WithTimeout(context.Background(), compactTimeout)
+	defer cancel()
+	raw, err := invokeClaudeCompact(ctx, buildCompactPrompt(originals), memoriesModel)
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("compaction model timed out after %s", compactTimeout)
+		}
 		return fmt.Errorf("invoking compaction model: %w", err)
 	}
 
@@ -123,8 +135,10 @@ func runMemoriesCompact() error {
 
 	if !memoriesYes {
 		fmt.Printf("\nApply this plan? [y/N] ")
-		var response string
-		_, _ = fmt.Scanln(&response)
+		// Read the whole line (not fmt.Scanln, which stops at the first space
+		// and leaves the rest in the stdin buffer) so trailing input can't
+		// bleed into a later prompt.
+		response, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 		switch strings.ToLower(strings.TrimSpace(response)) {
 		case "y", "yes":
 		default:
@@ -170,32 +184,36 @@ func buildCompactPrompt(mems []storedMemory) string {
 	b.WriteString("3. Preserve every distinct fact — never lose information, never invent new facts.\n")
 	b.WriteString("4. Keep each memory's type the same category it had (feedback, user, project, reference, general).\n")
 	b.WriteString("5. Keep values concise but complete.\n\n")
-	b.WriteString("Current memories:\n\n")
+	b.WriteString("Current memories (each value is quoted; \\n denotes a newline inside a value):\n\n")
 	for _, m := range mems {
-		fmt.Fprintf(&b, "- [%s] %s: %s\n", m.memType, m.shortKey, m.value)
+		// Identify each memory as type/key (keys can repeat across types) and
+		// quote the value with %q so embedded newlines can't break the one
+		// memory-per-line structure the model reads.
+		fmt.Fprintf(&b, "- %s/%s: %q\n", m.memType, m.shortKey, m.value)
 	}
 	b.WriteString("\nReturn ONLY a JSON object (no prose, no markdown fences) of this exact shape:\n")
 	b.WriteString(`{
   "memories": [
-    {"type": "feedback|user|project|reference|general", "key": "kebab-case-key", "value": "merged text", "sources": ["original-key-1", "original-key-2"]}
+    {"type": "feedback|user|project|reference|general", "key": "kebab-case-key", "value": "merged text", "sources": ["type/key-1", "type/key-2"]}
   ],
   "dropped": [
-    {"key": "original-key", "reason": "why it was removed"}
+    {"key": "type/key", "reason": "why it was removed"}
   ]
 }
 `)
 	b.WriteString("\n\"memories\" is the COMPLETE desired final set — include every memory you want to keep, ")
-	b.WriteString("merged or unchanged. \"sources\" lists the original keys each final memory consolidates ")
-	b.WriteString("(a single-source list is fine for unchanged memories). \"dropped\" explains memories you ")
-	b.WriteString("removed entirely. If no compaction is warranted, return every memory unchanged.")
+	b.WriteString("merged or unchanged. Identify originals in \"sources\" and \"dropped\" by their full \"type/key\" ")
+	b.WriteString("(as shown above), since the same key can appear under different types. \"sources\" lists the ")
+	b.WriteString("originals each final memory consolidates (a single-source list is fine for unchanged memories). ")
+	b.WriteString("\"dropped\" explains memories you removed entirely. If no compaction is warranted, return every memory unchanged.")
 	return b.String()
 }
 
 // invokeClaudeCompact runs the claude CLI headless and returns its raw stdout.
 // CLAUDECODE env vars are cleared so an agent running this from inside a Claude
 // Code session does not trip the nested-session guard (same approach as seance).
-func invokeClaudeCompact(prompt, model string) ([]byte, error) {
-	cmd := exec.Command("claude",
+func invokeClaudeCompact(ctx context.Context, prompt, model string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "claude",
 		"--dangerously-skip-permissions",
 		"--output-format", "json",
 		"--max-turns", "1",
@@ -243,14 +261,41 @@ func parseCompactResponse(raw []byte) (*memCompactResult, error) {
 	return &result, nil
 }
 
-// extractJSONSpan returns the substring from the first '{' to the last '}'.
+// extractJSONSpan pulls the compaction JSON object out of the model's text.
+// It first unwraps a fenced ```json … ``` (or bare ``` … ```) block if present
+// — the most common way a model wraps structured output despite being asked
+// not to — then falls back to the span from the first '{' to the last '}'.
 func extractJSONSpan(s string) string {
+	if fenced := unwrapCodeFence(s); fenced != "" {
+		s = fenced
+	}
 	start := strings.Index(s, "{")
 	end := strings.LastIndex(s, "}")
 	if start < 0 || end <= start {
 		return ""
 	}
 	return s[start : end+1]
+}
+
+// unwrapCodeFence returns the body of the first ```-fenced block in s (with an
+// optional language tag like "json"), or "" if there is no closed fence.
+func unwrapCodeFence(s string) string {
+	open := strings.Index(s, "```")
+	if open < 0 {
+		return ""
+	}
+	rest := s[open+3:]
+	// Skip an optional language tag up to the end of the line.
+	if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+		firstLine := strings.TrimSpace(rest[:nl])
+		if firstLine == "" || !strings.ContainsAny(firstLine, " \t{}") {
+			rest = rest[nl+1:]
+		}
+	}
+	if close := strings.Index(rest, "```"); close >= 0 {
+		return rest[:close]
+	}
+	return ""
 }
 
 // buildCompactPlan turns the LLM's desired final set into a deterministic set
@@ -264,11 +309,21 @@ func buildCompactPlan(originals []storedMemory, result *memCompactResult) (*comp
 	// Index originals by exact key and by (type, shortKey) so unchanged
 	// memories — including legacy untyped ones — reuse their existing key
 	// instead of being rewritten under a new memory.<type>.<key> slug.
+	//
+	// A (type, shortKey) pair can map to more than one kv key — e.g. a legacy
+	// untyped "memory.foo" and a typed "memory.general.foo" both resolve to
+	// general/foo. Pick deterministically rather than letting map-iteration
+	// order decide which survives: prefer the canonical memory.<type>.<key>
+	// form so the legacy duplicate is the one cleared.
 	origByFullKey := make(map[string]storedMemory, len(originals))
 	origByTypeKey := make(map[string]string, len(originals))
 	for _, m := range originals {
 		origByFullKey[m.fullKey] = m
-		origByTypeKey[m.memType+"/"+m.shortKey] = m.fullKey
+		typeKey := m.memType + "/" + m.shortKey
+		canonical := memoryKeyPrefix + m.memType + "." + m.shortKey
+		if existing, ok := origByTypeKey[typeKey]; !ok || (m.fullKey == canonical && existing != canonical) {
+			origByTypeKey[typeKey] = m.fullKey
+		}
 	}
 
 	plan := &compactPlan{dropReasons: map[string]string{}}
