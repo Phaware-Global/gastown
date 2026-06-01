@@ -98,12 +98,17 @@ func runMemoriesCompact() error {
 		return fmt.Errorf("claude binary not found on PATH — required for LLM-assisted compaction")
 	}
 
+	model := strings.TrimSpace(memoriesModel)
+	if model == "" {
+		return fmt.Errorf("--model must not be empty")
+	}
+
 	fmt.Printf("%s Compacting %d memories with %s...\n\n",
-		style.Bold.Render("🧹"), len(originals), style.Bold.Render(memoriesModel))
+		style.Bold.Render("🧹"), len(originals), style.Bold.Render(model))
 
 	ctx, cancel := context.WithTimeout(context.Background(), compactTimeout)
 	defer cancel()
-	raw, err := invokeClaudeCompact(ctx, buildCompactPrompt(originals), memoriesModel)
+	raw, err := invokeClaudeCompact(ctx, buildCompactPrompt(originals), model)
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("compaction model timed out after %s", compactTimeout)
@@ -213,13 +218,18 @@ func buildCompactPrompt(mems []storedMemory) string {
 // CLAUDECODE env vars are cleared so an agent running this from inside a Claude
 // Code session does not trip the nested-session guard (same approach as seance).
 func invokeClaudeCompact(ctx context.Context, prompt, model string) ([]byte, error) {
+	// Deliver the prompt on stdin rather than as a `-p <prompt>` argv element:
+	// the prompt embeds the entire memory store, which for a large store could
+	// exceed the OS argument-length limit (ARG_MAX) and fail with "argument
+	// list too long". `claude -p` with no inline prompt reads it from stdin.
 	cmd := exec.CommandContext(ctx, "claude",
 		"--dangerously-skip-permissions",
 		"--output-format", "json",
 		"--max-turns", "1",
 		"--model", model,
-		"-p", prompt,
+		"-p",
 	)
+	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Env = clearClaudeCodeEnv(os.Environ())
 	out, err := cmd.Output()
 	if err != nil {
