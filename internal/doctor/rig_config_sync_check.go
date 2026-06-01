@@ -193,7 +193,24 @@ func (c *RigConfigSyncCheck) Run(ctx *CheckContext) *CheckResult {
 			// the Dolt database identifier is the rig's directory name so that rigs
 			// with short prefixes (e.g. "ts" for trading_scripts) don't collide and
 			// bd can always locate the right database without extra config.
+			//
+			// Exception: some rigs' Dolt data physically lives in a PREFIX-named
+			// directory (e.g. .dolt-data/bd, .dolt-data/gt) from a directory rename
+			// where the rig-name DB no longer exists on the server. Mirror the
+			// prefix-fallback already used by migration_check.go (gt-85w7): default to
+			// rigName, but fall back to the prefix-named DB when .dolt-data/<rigName>
+			// is absent and .dolt-data/<prefix> exists. Without this, the check reports
+			// a false mismatch and --fix reverts metadata to the non-existent rig-name
+			// DB. (gt-5hd2)
 			expectedDBName := rigName
+			doltDataDir := filepath.Join(ctx.TownRoot, ".dolt-data")
+			if _, err := os.Stat(filepath.Join(doltDataDir, rigName)); os.IsNotExist(err) {
+				if prefix := config.GetRigPrefix(ctx.TownRoot, rigName); prefix != "" {
+					if _, err := os.Stat(filepath.Join(doltDataDir, prefix)); err == nil {
+						expectedDBName = prefix
+					}
+				}
+			}
 
 			if expectedDBName != "" {
 				// Check if database name matches the rig directory name
