@@ -10,9 +10,17 @@ import (
 )
 
 var memoriesTypeFilter string
+var memoriesCompact bool
+var memoriesDryRun bool
+var memoriesYes bool
+var memoriesModel string
 
 func init() {
 	memoriesCmd.Flags().StringVar(&memoriesTypeFilter, "type", "", "Filter by memory type: feedback, project, user, reference, general")
+	memoriesCmd.Flags().BoolVar(&memoriesCompact, "compact", false, "LLM-assisted compaction: merge overlapping and drop stale memories")
+	memoriesCmd.Flags().BoolVar(&memoriesDryRun, "dry-run", false, "With --compact: show the plan without writing changes")
+	memoriesCmd.Flags().BoolVar(&memoriesYes, "yes", false, "With --compact: apply the plan without the confirmation prompt")
+	memoriesCmd.Flags().StringVar(&memoriesModel, "model", "sonnet", "With --compact: model used for compaction reasoning")
 	memoriesCmd.GroupID = GroupWork
 	rootCmd.AddCommand(memoriesCmd)
 }
@@ -35,12 +43,18 @@ Use --type to filter by memory category:
 Examples:
   gt memories                    # List all memories
   gt memories --type feedback    # Show only behavioral corrections
-  gt memories refinery           # Search for memories about refinery`,
+  gt memories refinery           # Search for memories about refinery
+  gt memories --compact          # LLM-assisted merge/dedup (preview + confirm)
+  gt memories --compact --dry-run  # Preview the compaction plan only`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runMemories,
 }
 
 func runMemories(cmd *cobra.Command, args []string) error {
+	if memoriesCompact {
+		return runMemoriesCompact()
+	}
+
 	kvs, err := bdKvListJSON()
 	if err != nil {
 		return fmt.Errorf("listing memories: %w", err)
