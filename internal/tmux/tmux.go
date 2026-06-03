@@ -47,6 +47,11 @@ var (
 	ErrInvalidSessionName = errors.New("invalid session name")
 	ErrIdleTimeout        = errors.New("agent not idle before timeout")
 	ErrAgentBusy          = errors.New("agent busy at delivery time")
+	// ErrEmptyMessage is returned when a nudge message is empty after
+	// sanitization (e.g. whitespace/control-chars only). Delivering it would
+	// just press Enter into the agent's input box — a silent no-op that looks
+	// like success — so callers get an explicit error instead.
+	ErrEmptyMessage = errors.New("nudge message empty after sanitization")
 )
 
 // validateSessionName checks that a session name contains only safe characters.
@@ -1869,6 +1874,13 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// 2. Sanitize control characters that corrupt delivery
 	sanitized := sanitizeNudgeMessage(message)
 
+	// 2.5. Refuse an empty message: sanitization can reduce a whitespace/
+	// control-only payload to "", and delivering that would just press Enter
+	// into the input box — a silent no-op that verifies as success. Surface it.
+	if sanitized == "" {
+		return ErrEmptyMessage
+	}
+
 	// 3. Send text via send-keys -l. Messages > 512 bytes are chunked
 	//    with 10ms inter-chunk delays to avoid argument length limits.
 	if err := t.sendMessageToTarget(target, sanitized); err != nil {
@@ -2055,6 +2067,12 @@ func (t *Tmux) NudgePane(pane, message string) error {
 
 	// 2. Sanitize control characters that corrupt delivery
 	sanitized := sanitizeNudgeMessage(message)
+
+	// 2.5. Refuse an empty message (see NudgeSessionWithOpts): a whitespace/
+	// control-only payload sanitizes to "" and would deliver a bare Enter.
+	if sanitized == "" {
+		return ErrEmptyMessage
+	}
 
 	// 3. Send text via send-keys -l. Messages > 512 bytes are chunked
 	//    with 10ms inter-chunk delays to avoid argument length limits.
