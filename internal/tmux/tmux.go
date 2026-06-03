@@ -1407,26 +1407,46 @@ func isTransientSendKeysError(err error) bool {
 func sanitizeNudgeMessage(msg string) string {
 	var b strings.Builder
 	b.Grow(len(msg))
-	lastWasSpace := false
+
+	// Coalesce each run of whitespace. A run that contains a folded character
+	// (TAB or newline) collapses to a single space, regardless of where in the
+	// run it sits, so "foo \nbar" and "foo\n bar" both yield one space. A run of
+	// only literal spaces is emitted verbatim so intentional spacing in the
+	// payload (e.g. "a  b") survives untouched. Pending whitespace is flushed
+	// when a non-whitespace rune or end-of-input is reached. Stripped control
+	// chars inside a run don't break it, so "foo \r\n bar" still folds cleanly.
+	spaceRun := 0
+	foldRun := false
+	flush := func() {
+		if foldRun {
+			b.WriteRune(' ')
+		} else {
+			for i := 0; i < spaceRun; i++ {
+				b.WriteRune(' ')
+			}
+		}
+		spaceRun = 0
+		foldRun = false
+	}
+
 	for _, r := range msg {
 		switch {
+		case r == ' ':
+			spaceRun++
 		case r == '\t' || r == '\n':
 			// TAB → space avoids triggering completion; newline → space keeps
-			// the nudge a single submittable line (see doc comment). Suppress
-			// the inserted space when it would only follow an existing one.
-			if !lastWasSpace {
-				b.WriteRune(' ')
-				lastWasSpace = true
-			}
+			// the nudge a single submittable line (see doc comment).
+			foldRun = true
 		case r < 0x20: // strip all other control chars (ESC, CR, BS, etc.)
 			continue
 		case r == 0x7f: // DEL
 			continue
 		default:
+			flush()
 			b.WriteRune(r)
-			lastWasSpace = r == ' '
 		}
 	}
+	flush()
 	return strings.TrimSpace(b.String())
 }
 

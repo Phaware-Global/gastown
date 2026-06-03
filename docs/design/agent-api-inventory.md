@@ -31,7 +31,8 @@ Each touch point lists:
 - `internal/tmux/tmux.go` — `sendKeysLiteralWithRetry()` (line ~1253): exponential
   backoff (500ms→2s cap) for startup race
 - `internal/tmux/tmux.go` — `sanitizeNudgeMessage()` (line ~1179): strips ESC, CR, BS,
-  DEL; replaces TAB with space
+  DEL; folds TAB and newline runs to a single space (a multi-line buffer
+  can't be submitted to the agent input box)
 - `internal/tmux/tmux.go` — `SendKeys()`, `SendKeysDebounced()`, `SendKeysRaw()`,
   `SendKeysReplace()`, `SendKeysDelayed()` — variant entry points
 - `internal/cmd/nudge.go` — `runNudge()` (line ~196), `deliverNudge()` (line ~129):
