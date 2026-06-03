@@ -158,6 +158,14 @@ func runInstall(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("dolt identity setup failed (required for beads): %w\n\nTo fix, run:\n  dolt config --global --add user.name \"Your Name\"\n  dolt config --global --add user.email \"you@example.com\"", err)
 		}
 
+		// Disable Dolt's usage-metrics/version-check phone-home. With Gas Town's
+		// high bd/dolt subprocess rate, the per-invocation `dolt send-metrics`
+		// child and its ever-growing ~/.dolt/eventsData spool become a real
+		// CPU/memory drain. Best-effort: never block install on telemetry config.
+		if err := doltserver.EnsureDoltTelemetryDisabled(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not disable Dolt telemetry: %v\n", err)
+		}
+
 		// Preflight: check Dolt port availability before creating any files.
 		// A port conflict would leave a partial install that needs --force to retry.
 		port := doltserver.DefaultPort

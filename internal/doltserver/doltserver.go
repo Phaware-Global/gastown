@@ -103,6 +103,36 @@ func EnsureDoltIdentity() error {
 	return nil
 }
 
+// EnsureDoltTelemetryDisabled idempotently disables Dolt's usage-metrics and
+// version-check phone-home in the global config.
+//
+// Why this matters for CPU/memory: with metrics enabled, every `dolt` CLI
+// invocation (and Gas Town shells out to bd/dolt heavily) forks a
+// `dolt send-metrics` child that spools an event into ~/.dolt/eventsData and
+// attempts a gRPC flush. The spool directory is never pruned on flush failure,
+// so under Gas Town's high subprocess rate it grows without bound — observed at
+// 65k+ subdirectories / 116MB of directory metadata, large enough that merely
+// scanning it (which every send-metrics does) costs seconds of CPU and hundreds
+// of MB RSS per spawn, while the short-lived children pile up as zombies. This
+// is orthogonal to the connection-churn work (Tier 1/3) and grows worse over
+// time, so we disable it at the source. Safe: the only data discarded is
+// un-sent usage telemetry. (metrics.disabled is documented in `dolt config`.)
+func EnsureDoltTelemetryDisabled() error {
+	for _, key := range []string{"metrics.disabled", "versioncheck.disabled"} {
+		missing, err := doltConfigMissing(key)
+		if err != nil {
+			return fmt.Errorf("probing dolt %s: %w", key, err)
+		}
+		if !missing {
+			continue // already set (to anything) — don't churn the config
+		}
+		if err := setDoltGlobalConfig(key, "true"); err != nil {
+			return fmt.Errorf("failed to set dolt %s: %w", key, err)
+		}
+	}
+	return nil
+}
+
 // doltConfigMissing checks whether a dolt global config key is unset.
 // Returns (true, nil) for missing keys, (false, nil) for present keys,
 // and (false, error) when dolt itself fails unexpectedly.
