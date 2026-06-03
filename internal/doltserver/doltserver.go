@@ -119,13 +119,15 @@ func EnsureDoltIdentity() error {
 // un-sent usage telemetry. (metrics.disabled is documented in `dolt config`.)
 func EnsureDoltTelemetryDisabled() error {
 	for _, key := range []string{"metrics.disabled", "versioncheck.disabled"} {
-		missing, err := doltConfigMissing(key)
+		value, err := doltConfigValue(key)
 		if err != nil {
 			return fmt.Errorf("probing dolt %s: %w", key, err)
 		}
-		if !missing {
-			continue // already set (to anything) — don't churn the config
+		if value == "true" {
+			continue // already disabled — don't churn the config
 		}
+		// Covers both missing and an explicit non-"true" value (e.g. "false"),
+		// either of which would leave telemetry/version-check enabled.
 		if err := setDoltGlobalConfig(key, "true"); err != nil {
 			return fmt.Errorf("failed to set dolt %s: %w", key, err)
 		}
@@ -150,6 +152,23 @@ func doltConfigMissing(key string) (bool, error) {
 		return true, nil // key not found — expected
 	}
 	return false, fmt.Errorf("dolt config --global --get %s: %w", key, err)
+}
+
+// doltConfigValue returns the trimmed value of a dolt global config key, or the
+// empty string if the key is unset. Like doltConfigMissing, it treats exit code
+// 1 (key not found) as the expected "unset" signal and surfaces any other dolt
+// failure as an error.
+func doltConfigValue(key string) (string, error) {
+	cmd := exec.Command("dolt", "config", "--global", "--get", key)
+	setProcessGroup(cmd)
+	out, err := cmd.Output()
+	if err == nil {
+		return string(bytes.TrimSpace(out)), nil
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+		return "", nil // key not found — expected
+	}
+	return "", fmt.Errorf("dolt config --global --get %s: %w", key, err)
 }
 
 // setDoltGlobalConfig idempotently sets a dolt global config key.
