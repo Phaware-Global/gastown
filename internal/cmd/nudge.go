@@ -120,11 +120,11 @@ Examples:
   gt nudge deacon session-started
   gt nudge channel:workers "New priority work available"
 
-  # Use --stdin for messages with special characters or formatting:
+  # Use --stdin for messages with special characters (quotes, backticks, $).
+  # Note: newlines are folded to spaces on delivery (a multi-line buffer can't
+  # be submitted to the agent's input box), so write the directive as one line.
   gt nudge gastown/alpha --stdin <<'EOF'
-  Status update:
-  - Task 1: complete
-  - Task 2: in progress
+  Status update: Task 1 complete; Task 2 in progress.
   EOF`,
 	Args: cobra.RangeArgs(1, 2),
 	RunE: runNudge,

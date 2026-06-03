@@ -47,6 +47,11 @@ var (
 	ErrInvalidSessionName = errors.New("invalid session name")
 	ErrIdleTimeout        = errors.New("agent not idle before timeout")
 	ErrAgentBusy          = errors.New("agent busy at delivery time")
+	// ErrEmptyMessage is returned when a nudge message is empty after
+	// sanitization (e.g. whitespace/control-chars only). Delivering it would
+	// just press Enter into the agent's input box — a silent no-op that looks
+	// like success — so callers get an explicit error instead.
+	ErrEmptyMessage = errors.New("nudge message empty after sanitization")
 )
 
 // validateSessionName checks that a session name contains only safe characters.
@@ -1389,27 +1394,65 @@ func isTransientSendKeysError(err error) bool {
 
 // sanitizeNudgeMessage removes control characters that corrupt tmux send-keys
 // delivery. ESC (0x1b) triggers terminal escape sequences, CR (0x0d) acts as
-// premature Enter, BS (0x08) deletes characters. TAB is replaced with a space
-// to avoid triggering shell completion. Printable characters (including quotes,
-// backticks, and Unicode) are preserved.
+// premature Enter, BS (0x08) deletes characters. TAB and newlines are folded to
+// spaces. Printable characters (including quotes, backticks, and Unicode) are
+// preserved.
+//
+// Newlines are folded rather than preserved because send-keys -l delivers a
+// literal newline as an Enter keystroke. On Claude Code's multi-line composer
+// that turns a multi-line directive into a multi-line input buffer which the
+// trailing protocol Enter cannot submit (a bare Enter on a multi-line buffer
+// inserts a line, it does not send), so the nudge strands in the input box and
+// sendEnterVerified errors with "input box still holds text". Multi-line nudges
+// (e.g. `gt nudge --stdin` heredocs) therefore never fired, forcing operators
+// to hand-drive panes via raw tmux. Folding each newline run to a single space
+// keeps the directive one submittable line. Runs of whitespace introduced by
+// the fold collapse so blank lines don't balloon the message; literal repeated
+// spaces in the payload are left untouched. (GH#gt-nudge-multiline)
 func sanitizeNudgeMessage(msg string) string {
 	var b strings.Builder
 	b.Grow(len(msg))
+
+	// Coalesce each run of whitespace. A run that contains a folded character
+	// (TAB or newline) collapses to a single space, regardless of where in the
+	// run it sits, so "foo \nbar" and "foo\n bar" both yield one space. A run of
+	// only literal spaces is emitted verbatim so intentional spacing in the
+	// payload (e.g. "a  b") survives untouched. Pending whitespace is flushed
+	// when a non-whitespace rune or end-of-input is reached. Stripped control
+	// chars inside a run don't break it, so "foo \r\n bar" still folds cleanly.
+	spaceRun := 0
+	foldRun := false
+	flush := func() {
+		if foldRun {
+			b.WriteRune(' ')
+		} else {
+			for i := 0; i < spaceRun; i++ {
+				b.WriteRune(' ')
+			}
+		}
+		spaceRun = 0
+		foldRun = false
+	}
+
 	for _, r := range msg {
 		switch {
-		case r == '\t': // TAB → space (avoid triggering completion)
-			b.WriteRune(' ')
-		case r == '\n': // preserve newlines (send-keys -l treats as Enter, known limitation)
-			b.WriteRune(r)
+		case r == ' ':
+			spaceRun++
+		case r == '\t' || r == '\n':
+			// TAB → space avoids triggering completion; newline → space keeps
+			// the nudge a single submittable line (see doc comment).
+			foldRun = true
 		case r < 0x20: // strip all other control chars (ESC, CR, BS, etc.)
 			continue
 		case r == 0x7f: // DEL
 			continue
 		default:
+			flush()
 			b.WriteRune(r)
 		}
 	}
-	return b.String()
+	flush()
+	return strings.TrimSpace(b.String())
 }
 
 // isInRewindMode checks if a tmux target is displaying Claude Code's Rewind
@@ -1831,6 +1874,13 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// 2. Sanitize control characters that corrupt delivery
 	sanitized := sanitizeNudgeMessage(message)
 
+	// 2.5. Refuse an empty message: sanitization can reduce a whitespace/
+	// control-only payload to "", and delivering that would just press Enter
+	// into the input box — a silent no-op that verifies as success. Surface it.
+	if sanitized == "" {
+		return ErrEmptyMessage
+	}
+
 	// 3. Send text via send-keys -l. Messages > 512 bytes are chunked
 	//    with 10ms inter-chunk delays to avoid argument length limits.
 	if err := t.sendMessageToTarget(target, sanitized); err != nil {
@@ -2017,6 +2067,12 @@ func (t *Tmux) NudgePane(pane, message string) error {
 
 	// 2. Sanitize control characters that corrupt delivery
 	sanitized := sanitizeNudgeMessage(message)
+
+	// 2.5. Refuse an empty message (see NudgeSessionWithOpts): a whitespace/
+	// control-only payload sanitizes to "" and would deliver a bare Enter.
+	if sanitized == "" {
+		return ErrEmptyMessage
+	}
 
 	// 3. Send text via send-keys -l. Messages > 512 bytes are chunked
 	//    with 10ms inter-chunk delays to avoid argument length limits.
