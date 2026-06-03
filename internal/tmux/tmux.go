@@ -1389,27 +1389,45 @@ func isTransientSendKeysError(err error) bool {
 
 // sanitizeNudgeMessage removes control characters that corrupt tmux send-keys
 // delivery. ESC (0x1b) triggers terminal escape sequences, CR (0x0d) acts as
-// premature Enter, BS (0x08) deletes characters. TAB is replaced with a space
-// to avoid triggering shell completion. Printable characters (including quotes,
-// backticks, and Unicode) are preserved.
+// premature Enter, BS (0x08) deletes characters. TAB and newlines are folded to
+// spaces. Printable characters (including quotes, backticks, and Unicode) are
+// preserved.
+//
+// Newlines are folded rather than preserved because send-keys -l delivers a
+// literal newline as an Enter keystroke. On Claude Code's multi-line composer
+// that turns a multi-line directive into a multi-line input buffer which the
+// trailing protocol Enter cannot submit (a bare Enter on a multi-line buffer
+// inserts a line, it does not send), so the nudge strands in the input box and
+// sendEnterVerified errors with "input box still holds text". Multi-line nudges
+// (e.g. `gt nudge --stdin` heredocs) therefore never fired, forcing operators
+// to hand-drive panes via raw tmux. Folding each newline run to a single space
+// keeps the directive one submittable line. Runs of whitespace introduced by
+// the fold collapse so blank lines don't balloon the message; literal repeated
+// spaces in the payload are left untouched. (GH#gt-nudge-multiline)
 func sanitizeNudgeMessage(msg string) string {
 	var b strings.Builder
 	b.Grow(len(msg))
+	lastWasSpace := false
 	for _, r := range msg {
 		switch {
-		case r == '\t': // TAB → space (avoid triggering completion)
-			b.WriteRune(' ')
-		case r == '\n': // preserve newlines (send-keys -l treats as Enter, known limitation)
-			b.WriteRune(r)
+		case r == '\t' || r == '\n':
+			// TAB → space avoids triggering completion; newline → space keeps
+			// the nudge a single submittable line (see doc comment). Suppress
+			// the inserted space when it would only follow an existing one.
+			if !lastWasSpace {
+				b.WriteRune(' ')
+				lastWasSpace = true
+			}
 		case r < 0x20: // strip all other control chars (ESC, CR, BS, etc.)
 			continue
 		case r == 0x7f: // DEL
 			continue
 		default:
 			b.WriteRune(r)
+			lastWasSpace = r == ' '
 		}
 	}
-	return b.String()
+	return strings.TrimSpace(b.String())
 }
 
 // isInRewindMode checks if a tmux target is displaying Claude Code's Rewind

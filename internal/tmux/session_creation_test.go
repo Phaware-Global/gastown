@@ -174,7 +174,12 @@ func TestSanitizeNudgeMessage(t *testing.T) {
 		{"strips ESC", "hello\x1bworld", "helloworld"},
 		{"strips CR", "hello\rworld", "helloworld"},
 		{"tab to space", "hello\tworld", "hello world"},
-		{"preserves newline", "hello\nworld", "hello\nworld"},
+		{"newline to space", "hello\nworld", "hello world"},
+		{"blank lines collapse", "line one\n\n\nline two", "line one line two"},
+		{"trailing newlines trimmed", "do the thing\n\n", "do the thing"},
+		{"leading newline trimmed", "\nstart here", "start here"},
+		{"newline next to space keeps single", "foo \nbar", "foo bar"},
+		{"literal double space preserved", "a  b", "a  b"},
 		{"preserves unicode", "hello 世界", "hello 世界"},
 		{"strips BS", "hello\x08world", "helloworld"},
 	}
