@@ -143,12 +143,12 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
 
 	if schedulerStatusJSON {
 		out := struct {
-			Paused         bool               `json:"paused"`
-			PausedBy       string             `json:"paused_by,omitempty"`
-			ScheduledTotal int                `json:"queued_total"`
-			ScheduledReady int                `json:"queued_ready"`
-			ActivePolecats int                `json:"active_polecats"`
-			LastDispatchAt string             `json:"last_dispatch_at,omitempty"`
+			Paused         bool                `json:"paused"`
+			PausedBy       string              `json:"paused_by,omitempty"`
+			ScheduledTotal int                 `json:"queued_total"`
+			ScheduledReady int                 `json:"queued_ready"`
+			ActivePolecats int                 `json:"active_polecats"`
+			LastDispatchAt string              `json:"last_dispatch_at,omitempty"`
 			Beads          []scheduledBeadInfo `json:"beads"`
 		}{
 			Paused:         state.Paused,
@@ -496,9 +496,21 @@ func countActivePolecats() int {
 // Idle polecats (completed work, hook_bead=null) don't count toward capacity
 // since they're available for re-sling under the persistent polecat model.
 func countWorkingPolecats() int {
+	return countWorkingPolecatsForRig("")
+}
+
+// countWorkingPolecatsForRig counts actively-working polecat sessions, optionally
+// scoped to a single rig. An empty rigFilter counts working polecats across all
+// rigs (host-wide). A non-empty rigFilter counts only polecats whose session
+// belongs to that rig. "Working" means the agent bead has a non-null hook_bead;
+// idle polecats (hook_bead=null) are excluded since they're re-sling candidates.
+func countWorkingPolecatsForRig(rigFilter string) int {
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil {
-		return countActivePolecats() // Fallback to total count
+		if rigFilter == "" {
+			return countActivePolecats() // Fallback to total count
+		}
+		return 0
 	}
 
 	listCmd := tmux.BuildCommand("list-sessions", "-F", "#{session_name}")
@@ -516,6 +528,9 @@ func countWorkingPolecats() int {
 		identity, err := session.ParseSessionName(line)
 		if err != nil || identity.Role != session.RolePolecat {
 			continue
+		}
+		if rigFilter != "" && identity.Rig != rigFilter {
+			continue // Different rig — out of scope for this count
 		}
 
 		// Check if this polecat has hooked work

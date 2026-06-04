@@ -113,6 +113,24 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 			workingCount, defaultMaxActivePolecats)
 	}
 
+	// Per-rig concurrency cap (scheduler.max_polecats_per_rig): bound how many
+	// polecats a single rig can run at once so one busy rig cannot starve the
+	// rest of the town. Off by default (<= 0). This is the hard backstop that
+	// applies to every spawn path; the scheduler also filters at dispatch time
+	// (capacity.LimitPerRig) so deferred-mode beads stay pending instead of
+	// failing here.
+	townSettings, _ := config.LoadOrCreateTownSettings(config.TownSettingsPath(townRoot))
+	if townSettings != nil && townSettings.Scheduler.GetMaxPolecatsPerRig() > 0 {
+		maxPerRig := townSettings.Scheduler.GetMaxPolecatsPerRig()
+		rigWorking := countWorkingPolecatsForRig(rigName)
+		if rigWorking >= maxPerRig {
+			return nil, fmt.Errorf("rig %s polecat cap reached: %d working polecats (max %d). "+
+				"Raise the limit with 'gt config set scheduler.max_polecats_per_rig N', "+
+				"or wait for in-flight polecats to finish",
+				rigName, rigWorking, maxPerRig)
+		}
+	}
+
 	// Per-bead respawn circuit breaker (clown show #22):
 	// Track how many times this bead has been slung. Block after N attempts
 	// to prevent witness→deacon→sling feedback loops.

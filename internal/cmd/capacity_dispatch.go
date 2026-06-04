@@ -136,6 +136,7 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 		batchSize = batchOverride
 	}
 	spawnDelay := schedulerCfg.GetSpawnDelay()
+	maxPerRig := schedulerCfg.GetMaxPolecatsPerRig()
 
 	// Clean up invalid/stale contexts before querying for ready beads.
 	// Skip during dry-run to avoid mutating state.
@@ -157,7 +158,15 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 			return cap, nil
 		},
 		QueryPending: func() ([]capacity.PendingBead, error) {
-			return getReadySlingContexts(townRoot)
+			pending, err := getReadySlingContexts(townRoot)
+			if err != nil {
+				return nil, err
+			}
+			// Per-rig fan-out cap: drop beads for rigs already at their
+			// scheduler.max_polecats_per_rig limit so they stay pending
+			// (context open) and are reconsidered next cycle, rather than
+			// dispatching and failing the hard cap in SpawnPolecatForSling.
+			return capacity.LimitPerRig(pending, maxPerRig, countWorkingPolecatsForRig), nil
 		},
 		Validate: func(b capacity.PendingBead) error {
 			// Cross-rig prefix guard (gt-el4). A bead whose ID prefix does

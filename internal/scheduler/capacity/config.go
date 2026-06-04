@@ -10,15 +10,23 @@ import "time"
 // API rate limits, memory, and CPU are shared resources across all rigs.
 //
 // Behavior is driven entirely by MaxPolecats:
-//   -1 (default): direct dispatch — gt sling works as before, near-zero overhead
-//    0:           direct dispatch (same as -1)
-//    N > 0:       deferred dispatch — labels/metadata applied, daemon dispatches
+//
+//	-1 (default): direct dispatch — gt sling works as before, near-zero overhead
+//	 0:           direct dispatch (same as -1)
+//	 N > 0:       deferred dispatch — labels/metadata applied, daemon dispatches
 type SchedulerConfig struct {
 	// MaxPolecats is the max concurrent polecats across ALL rigs.
 	// Includes both scheduler-dispatched and directly-slung polecats.
 	// nil/absent = default (-1, direct dispatch). 0 = direct dispatch (same as -1).
 	// N > 0 = deferred dispatch with capacity control.
 	MaxPolecats *int `json:"max_polecats,omitempty"`
+
+	// MaxPolecatsPerRig caps concurrent working polecats for any single rig.
+	// Unlike MaxPolecats (host-wide), this bounds per-rig fan-out so one busy
+	// rig cannot consume the whole town's capacity. Counts both
+	// scheduler-dispatched and directly-slung polecats for that rig.
+	// nil/absent or <= 0 = no per-rig limit. N > 0 = at most N per rig.
+	MaxPolecatsPerRig *int `json:"max_polecats_per_rig,omitempty"`
 
 	// BatchSize is the number of beads to dispatch per heartbeat tick.
 	// Limits spawn rate per 3-minute cycle.
@@ -48,6 +56,14 @@ func (c *SchedulerConfig) GetMaxPolecats() int {
 		return -1
 	}
 	return *c.MaxPolecats
+}
+
+// GetMaxPolecatsPerRig returns MaxPolecatsPerRig or 0 (no per-rig limit) if unset.
+func (c *SchedulerConfig) GetMaxPolecatsPerRig() int {
+	if c == nil || c.MaxPolecatsPerRig == nil {
+		return 0
+	}
+	return *c.MaxPolecatsPerRig
 }
 
 // GetBatchSize returns BatchSize or the default (1) if unset.
