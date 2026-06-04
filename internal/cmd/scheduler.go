@@ -491,36 +491,41 @@ func countActivePolecats() int {
 	return count
 }
 
-// countWorkingPolecats counts polecat sessions that are actively working.
-// A polecat is "working" if its agent bead has a non-null hook_bead.
+// countWorkingPolecats counts polecat sessions that are actively working across
+// all rigs. A polecat is "working" if its agent bead has a non-null hook_bead.
 // Idle polecats (completed work, hook_bead=null) don't count toward capacity
 // since they're available for re-sling under the persistent polecat model.
 func countWorkingPolecats() int {
-	return countWorkingPolecatsForRig("")
-}
-
-// countWorkingPolecatsForRig counts actively-working polecat sessions, optionally
-// scoped to a single rig. An empty rigFilter counts working polecats across all
-// rigs (host-wide). A non-empty rigFilter counts only polecats whose session
-// belongs to that rig. "Working" means the agent bead has a non-null hook_bead;
-// idle polecats (hook_bead=null) are excluded since they're re-sling candidates.
-func countWorkingPolecatsForRig(rigFilter string) int {
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil {
-		if rigFilter == "" {
-			return countActivePolecats() // Fallback to total count
-		}
-		return 0
+		return countActivePolecats() // Fallback to total count
 	}
+	total := 0
+	for _, c := range workingPolecatCounts(townRoot) {
+		total += c
+	}
+	return total
+}
+
+// workingPolecatCounts scans polecat tmux sessions once and returns the number
+// of actively-working polecats (agent bead has a non-null hook_bead) bucketed by
+// rig. Idle polecats (hook_bead=null) are excluded since they're re-sling
+// candidates.
+//
+// townRoot is taken explicitly rather than re-resolved from the cwd so the
+// per-rig cap does not fail open when the caller (e.g., the daemon dispatch
+// loop) runs outside the town tree. A single tmux pass serves every rig, so the
+// dispatch filter can gate many rigs without spawning a subprocess per rig.
+func workingPolecatCounts(townRoot string) map[string]int {
+	counts := make(map[string]int)
 
 	listCmd := tmux.BuildCommand("list-sessions", "-F", "#{session_name}")
 	out, err := listCmd.Output()
 	if err != nil {
-		return 0
+		return counts
 	}
 
 	bd := beads.New(townRoot)
-	count := 0
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if line == "" {
 			continue
@@ -528,9 +533,6 @@ func countWorkingPolecatsForRig(rigFilter string) int {
 		identity, err := session.ParseSessionName(line)
 		if err != nil || identity.Role != session.RolePolecat {
 			continue
-		}
-		if rigFilter != "" && identity.Rig != rigFilter {
-			continue // Different rig — out of scope for this count
 		}
 
 		// Check if this polecat has hooked work
@@ -551,7 +553,7 @@ func countWorkingPolecatsForRig(rigFilter string) int {
 		if fields.HookBead == "" {
 			continue // Idle — don't count toward cap
 		}
-		count++
+		counts[identity.Rig]++
 	}
-	return count
+	return counts
 }

@@ -118,11 +118,14 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	// rest of the town. Off by default (<= 0). This is the hard backstop that
 	// applies to every spawn path; the scheduler also filters at dispatch time
 	// (capacity.LimitPerRig) so deferred-mode beads stay pending instead of
-	// failing here.
-	townSettings, _ := config.LoadOrCreateTownSettings(config.TownSettingsPath(townRoot))
-	if townSettings != nil && townSettings.Scheduler.GetMaxPolecatsPerRig() > 0 {
-		maxPerRig := townSettings.Scheduler.GetMaxPolecatsPerRig()
-		rigWorking := countWorkingPolecatsForRig(rigName)
+	// failing here. Surface a settings-load error rather than silently spawning
+	// past the cap — a corrupt town config should fail loud, not fail open.
+	townSettings, err := config.LoadOrCreateTownSettings(config.TownSettingsPath(townRoot))
+	if err != nil {
+		return nil, fmt.Errorf("loading town settings for per-rig cap: %w", err)
+	}
+	if maxPerRig := townSettings.Scheduler.GetMaxPolecatsPerRig(); maxPerRig > 0 {
+		rigWorking := workingPolecatCounts(townRoot)[rigName]
 		if rigWorking >= maxPerRig {
 			return nil, fmt.Errorf("rig %s polecat cap reached: %d working polecats (max %d). "+
 				"Raise the limit with 'gt config set scheduler.max_polecats_per_rig N', "+
