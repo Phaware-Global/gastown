@@ -864,8 +864,17 @@ func closeWispsByLabel(db *sql.DB, dbName, label string, maxAge time.Duration, k
 	updateQuery := fmt.Sprintf(
 		"UPDATE wisps SET status = 'closed', closed_at = NOW() WHERE id IN (%s)",
 		strings.Join(placeholders, ","))
-	if _, err := db.ExecContext(ctx, updateQuery, args...); err != nil {
+	sqlRes, err := db.ExecContext(ctx, updateQuery, args...)
+	if err != nil {
 		return nil, fmt.Errorf("close %s: %w", kind, err)
+	}
+	// Report the actual affected-row count, not the candidate count. A
+	// concurrent closer (e.g. the witness closing wisps for a dead session)
+	// can close some candidates between our SELECT and UPDATE; using the
+	// affected count keeps result.Closed — and the open-remain adjustments
+	// derived from it — in sync with what this call actually changed.
+	if affected, aerr := sqlRes.RowsAffected(); aerr == nil {
+		result.Closed = int(affected)
 	}
 
 	// Flush and commit.
