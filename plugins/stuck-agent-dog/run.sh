@@ -180,6 +180,7 @@ SUMMARY="Agent health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY heal
 log ""
 log "=== $SUMMARY ==="
 
-bd create "stuck-agent-dog: $SUMMARY" -t chore --ephemeral \
+_rid="$(bd create "stuck-agent-dog: $SUMMARY" -t chore --ephemeral \
   -l type:plugin-run,plugin:stuck-agent-dog,result:success \
-  -d "$SUMMARY" --silent 2>/dev/null || true
+  -d "$SUMMARY" --silent 2>/dev/null)" || true
+[ -n "${_rid:-}" ] && bd close "$_rid" --reason "plugin run recorded" >/dev/null 2>&1 || true

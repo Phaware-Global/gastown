@@ -279,6 +279,36 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		}
 	}
 
+	// Step 3d: Close stale one-way telegraph notification wisps. These are
+	// fire-and-forget (msg-type:notification) and never acked — the telegraph
+	// is one-way, so recipients reply out of band. Without this they sit
+	// delivery:pending and inflate the open-wisp count alongside receipts.
+	notificationAge := 1 * time.Hour
+	var totalNotifClosed int
+	for _, dbName := range databases {
+		if err := reaper.ValidateDBName(dbName); err != nil {
+			continue
+		}
+		db, err := reaper.OpenDB("127.0.0.1", port, dbName, 10*time.Second, 10*time.Second)
+		if err != nil {
+			continue
+		}
+		if ok, _ := reaper.HasReaperSchema(db); !ok {
+			db.Close()
+			continue
+		}
+		result, err := reaper.CloseStaleNotifications(db, dbName, notificationAge, dryRun)
+		db.Close()
+		if err != nil {
+			d.logger.Printf("wisp_reaper: %s: notification close error: %v", dbName, err)
+			continue
+		}
+		totalNotifClosed += result.Closed
+		if result.Closed > 0 {
+			d.logger.Printf("wisp_reaper: %s: closed %d stale notifications", dbName, result.Closed)
+		}
+	}
+
 	// Step 4: Auto-close
 	autoCloseErrors := 0
 	for _, dbName := range databases {
@@ -316,8 +346,8 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		d.logger.Printf("wisp_reaper: WARNING: %d open wisps exceed threshold %d — investigate wisp lifecycle",
 			totalOpen, wispAlertThreshold)
 	}
-	d.logger.Printf("wisp_reaper: cycle complete — reaped=%d purged=%d mail_purged=%d plugin_closed=%d dispatch_closed=%d auto_closed=%d open=%d databases=%d dryRun=%v",
-		totalReaped, totalPurged, totalMailPurged, totalPluginClosed, totalDispatchClosed, totalAutoClosed, totalOpen, len(databases), dryRun)
+	d.logger.Printf("wisp_reaper: cycle complete — reaped=%d purged=%d mail_purged=%d plugin_closed=%d dispatch_closed=%d notif_closed=%d auto_closed=%d open=%d databases=%d dryRun=%v",
+		totalReaped, totalPurged, totalMailPurged, totalPluginClosed, totalDispatchClosed, totalNotifClosed, totalAutoClosed, totalOpen, len(databases), dryRun)
 	mol.closeStep("report")
 }
 

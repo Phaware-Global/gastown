@@ -31,9 +31,10 @@ done
 
 if [[ ${#OUTDATED[@]} -eq 0 ]]; then
   log "All tools current. Nothing to do."
-  bd create "tool-updater: all tools current (beads=$(bd version 2>/dev/null | awk '{print $3}'), dolt=$(dolt version 2>/dev/null | awk '{print $3}')" \
+  _rid="$(bd create "tool-updater: all tools current (beads=$(bd version 2>/dev/null | awk '{print $3}'), dolt=$(dolt version 2>/dev/null | awk '{print $3}')" \
     -t chore --ephemeral -l type:plugin-run,plugin:tool-updater,result:success \
-    --silent 2>/dev/null || true
+    --silent 2>/dev/null)" || true
+  [ -n "${_rid:-}" ] && bd close "$_rid" --reason "plugin run recorded" >/dev/null 2>&1 || true
   exit 0
 fi
 
@@ -64,9 +65,10 @@ log "=== Done === $SUMMARY"
 RESULT="success"
 [[ ${#FAILED[@]} -gt 0 ]] && RESULT="warning"
 
-bd create "$SUMMARY" -t chore --ephemeral \
+_rid="$(bd create "$SUMMARY" -t chore --ephemeral \
   -l type:plugin-run,plugin:tool-updater,result:$RESULT \
-  --silent 2>/dev/null || true
+  --silent 2>/dev/null)" || true
+[ -n "${_rid:-}" ] && bd close "$_rid" --reason "plugin run recorded" >/dev/null 2>&1 || true
 
 if [[ ${#FAILED[@]} -gt 0 ]]; then
   gt escalate "tool-updater: ${#FAILED[@]} tool(s) failed to upgrade: ${FAILED[*]}" \
