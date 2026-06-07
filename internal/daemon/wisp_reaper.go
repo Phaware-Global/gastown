@@ -341,7 +341,16 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		mol.closeStep("auto-close")
 	}
 
-	// Step 5: Report
+	// Step 5: Report. totalOpen was summed from Reap() before steps 3b–3d
+	// closed receipts/dispatches/notifications, so subtract those closes (on a
+	// real run) before the threshold warning, otherwise it can fire on a stale,
+	// pre-close count. Dry-run closes nothing, so totalOpen stays a true snapshot.
+	if !dryRun {
+		totalOpen -= totalPluginClosed + totalDispatchClosed + totalNotifClosed
+		if totalOpen < 0 {
+			totalOpen = 0
+		}
+	}
 	if totalOpen > wispAlertThreshold {
 		d.logger.Printf("wisp_reaper: WARNING: %d open wisps exceed threshold %d — investigate wisp lifecycle",
 			totalOpen, wispAlertThreshold)

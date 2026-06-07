@@ -837,6 +837,10 @@ func closeWispsByLabel(db *sql.DB, dbName, label string, maxAge time.Duration, k
 		}
 		ids = append(ids, id)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterate %s rows: %w", kind, err)
+	}
 	rows.Close()
 
 	result.Closed = len(ids)
