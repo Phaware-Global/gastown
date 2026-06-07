@@ -20,10 +20,11 @@ log() { echo "[feedback-dialog-watcher] $*"; }
 
 if ! tmux list-sessions >/dev/null 2>&1; then
   log "No tmux server running; nothing to scan."
-  bd create "feedback-dialog-watcher: no tmux server" \
+  _rid="$(bd create "feedback-dialog-watcher: no tmux server" \
     -t chore --ephemeral \
     -l type:plugin-run,plugin:feedback-dialog-watcher,result:success \
-    --silent 2>/dev/null || true
+    --silent 2>/dev/null)" || true
+  [ -n "${_rid:-}" ] && bd close "$_rid" --reason "plugin run recorded" >/dev/null 2>&1 || true
   exit 0
 fi
 
@@ -32,10 +33,11 @@ fi
 PANE_IDS=$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null || true)
 if [[ -z "$PANE_IDS" ]]; then
   log "tmux server up but no panes returned; nothing to scan."
-  bd create "feedback-dialog-watcher: 0 panes" \
+  _rid="$(bd create "feedback-dialog-watcher: 0 panes" \
     -t chore --ephemeral \
     -l type:plugin-run,plugin:feedback-dialog-watcher,result:success \
-    --silent 2>/dev/null || true
+    --silent 2>/dev/null)" || true
+  [ -n "${_rid:-}" ] && bd close "$_rid" --reason "plugin run recorded" >/dev/null 2>&1 || true
   exit 0
 fi
 
@@ -84,6 +86,7 @@ else
   DETAIL="$SUMMARY"
 fi
 
-bd create "$SUMMARY" -t chore --ephemeral \
+_rid="$(bd create "$SUMMARY" -t chore --ephemeral \
   -l type:plugin-run,plugin:feedback-dialog-watcher,result:success \
-  -d "$DETAIL" --silent 2>/dev/null || true
+  -d "$DETAIL" --silent 2>/dev/null)" || true
+[ -n "${_rid:-}" ] && bd close "$_rid" --reason "plugin run recorded" >/dev/null 2>&1 || true

@@ -165,6 +165,29 @@ func TestPurgeBatchQueryNoDatabaseNameInjection(t *testing.T) {
 // correctly. This prevents false-positive dolt_commit_failed anomalies when the
 // reaper operates on dolt_ignored tables (wisps, wisp_*), where Dolt has nothing
 // to version after a successful SQL DELETE.
+// TestCloseByLabelSelectQueryTargetsWisps verifies the fast-track receipt /
+// notification closer queries the wisps/wisp_labels tables, not issues/labels.
+// Regression guard for the open-wisp escalation: ephemeral beads were migrated
+// off the issues table, so the old issues-table query matched zero rows and
+// receipts/notifications piled up until the 24h Reap.
+func TestCloseByLabelSelectQueryTargetsWisps(t *testing.T) {
+	q := closeByLabelSelectQuery
+	if !strings.Contains(q, "FROM wisps w") {
+		t.Errorf("closeByLabelSelectQuery must read from wisps, got: %s", q)
+	}
+	if !strings.Contains(q, "wisp_labels l") {
+		t.Errorf("closeByLabelSelectQuery must join wisp_labels, got: %s", q)
+	}
+	// Must NOT reference the issues/labels tables — that was the bug.
+	if strings.Contains(q, "issues i") || strings.Contains(q, "INNER JOIN labels") {
+		t.Errorf("closeByLabelSelectQuery must not target the issues/labels tables, got: %s", q)
+	}
+	// Must filter on open-ish status and the label/age placeholders.
+	if !strings.Contains(q, "l.label = ?") || !strings.Contains(q, "w.created_at < ?") {
+		t.Errorf("closeByLabelSelectQuery must be parameterized on label and age, got: %s", q)
+	}
+}
+
 func TestIsNothingToCommit(t *testing.T) {
 	cases := []struct {
 		msg  string

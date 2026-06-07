@@ -101,8 +101,9 @@ log "=== Summary ==="
 SUMMARY="gitignore-reconcile: $TOTAL_UNTRACKED file(s) untracked, $TOTAL_BEADS chore bead(s) created"
 log "$SUMMARY"
 
-bd create "$SUMMARY" -t chore --ephemeral \
+_rid="$(bd create "$SUMMARY" -t chore --ephemeral \
   -l "type:plugin-run,plugin:gitignore-reconcile,result:success" \
-  -d "$SUMMARY" --silent 2>/dev/null || true
+  -d "$SUMMARY" --silent 2>/dev/null)" || true
+[ -n "${_rid:-}" ] && bd close "$_rid" --reason "plugin run recorded" >/dev/null 2>&1 || true
 
 log "Done."

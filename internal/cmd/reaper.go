@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"strconv"
@@ -11,6 +12,14 @@ import (
 	"github.com/steveyegge/gastown/internal/reaper"
 	"github.com/steveyegge/gastown/internal/style"
 )
+
+// fastTrackCloseAge is the age past which ephemeral receipt and notification
+// wisps are eligible for fast-track closing during `gt reaper reap`. Far
+// shorter than the wisp max-age (24h) because these beads reach terminal value
+// within minutes — keeping them open for a full day is what pushes the
+// open-wisp count over the alert threshold. Mirrors the daemon inline path's
+// 1h plugin-receipt window (internal/daemon/wisp_reaper.go).
+const fastTrackCloseAge = 1 * time.Hour
 
 var (
 	reaperDB       string
@@ -199,12 +208,52 @@ Returns the count of reaped wisps. Use --dry-run to preview.`,
 			}
 
 			result, err := reaper.Reap(db, dbName, maxAge, reaperDryRun)
-			db.Close()
 			if err != nil {
+				db.Close()
 				fmt.Fprintf(os.Stderr, "%s: reap error: %v\n", dbName, err)
 				continue
 			}
 			results = append(results, result)
+
+			// Fast-track close of ephemeral receipt and notification wisps.
+			// These are created continuously by dog patrols (plugin-run
+			// receipts) and the telegraph (one-way notification mail); they
+			// reach terminal value within minutes but the generic Reap only
+			// closes them after maxAge (24h), leaving ~1 day's worth open at
+			// all times — over the alert threshold. Closing them on a short
+			// window here, on the live Dog-driven path, keeps the open-wisp
+			// count flat. fastTrackCloseAge is intentionally << maxAge.
+			for _, fc := range []struct {
+				name string
+				fn   func(*sql.DB, string, time.Duration, bool) (*reaper.ClosePluginReceiptResult, error)
+			}{
+				{"plugin receipts", reaper.ClosePluginReceipts},
+				{"plugin dispatches", reaper.ClosePluginDispatches},
+				{"stale notifications", reaper.CloseStaleNotifications},
+			} {
+				res, err := fc.fn(db, dbName, fastTrackCloseAge, reaperDryRun)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%s: %s close error: %v\n", dbName, fc.name, err)
+					continue
+				}
+				if res != nil && res.Closed > 0 {
+					// Keep the result consistent: these closes count toward the
+					// reaped total AND reduce the open-remaining count, so the
+					// per-db line, the multi-db summary, and the >threshold
+					// warning all reflect the post-close state. Reap() computed
+					// OpenRemain before the fast-track closes ran, so adjust it
+					// here. Only in a real run — in dry-run nothing is closed and
+					// OpenRemain stays a true snapshot of currently-open wisps.
+					result.Reaped += res.Closed
+					if !reaperDryRun {
+						result.OpenRemain -= res.Closed
+						if result.OpenRemain < 0 {
+							result.OpenRemain = 0
+						}
+					}
+				}
+			}
+			db.Close()
 		}
 
 		if reaperJSON {

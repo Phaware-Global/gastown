@@ -146,15 +146,17 @@ log "$SUMMARY"
 
 if [[ "$FAILED" -eq 0 ]]; then
   # Success — record quietly
-  bd create --title "dolt-backup: $SUMMARY" -t chore --ephemeral \
+  _rid="$(bd create --title "dolt-backup: $SUMMARY" -t chore --ephemeral \
     -l type:plugin-run,plugin:dolt-backup,result:success \
-    -d "$SUMMARY" --silent 2>/dev/null || true
+    -d "$SUMMARY" --silent 2>/dev/null)" || true
+  [ -n "${_rid:-}" ] && bd close "$_rid" --reason "plugin run recorded" >/dev/null 2>&1 || true
 else
   # Failure — record and escalate
   FAIL_MSG="$SUMMARY. Failed:$FAILED_DBS"
-  bd create --title "dolt-backup: FAILED - $FAIL_MSG" -t chore --ephemeral \
+  _rid="$(bd create --title "dolt-backup: FAILED - $FAIL_MSG" -t chore --ephemeral \
     -l type:plugin-run,plugin:dolt-backup,result:failure \
-    -d "$FAIL_MSG" --silent 2>/dev/null || true
+    -d "$FAIL_MSG" --silent 2>/dev/null)" || true
+  [ -n "${_rid:-}" ] && bd close "$_rid" --reason "plugin run recorded" >/dev/null 2>&1 || true
 
   gt escalate "dolt-backup FAILED: $FAIL_MSG" \
     --severity high \

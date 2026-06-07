@@ -768,41 +768,78 @@ type ClosePluginReceiptResult struct {
 	Anomalies []Anomaly `json:"anomalies,omitempty"`
 }
 
-// ClosePluginReceipts closes open issues labeled "type:plugin-run" that are
-// older than maxAge. These are transient run receipts created by deacon dog
-// plugins; they should be closed shortly after creation since they exist only
-// for audit/cooldown-gate purposes. The standard AutoClose path requires 7 days
-// of staleness, which lets plugin receipts accumulate into the hundreds.
+// ClosePluginReceipts closes open plugin-run receipt wisps older than maxAge.
+//
+// These are transient run receipts created by deacon dog plugins (one per
+// patrol tick) that exist only for audit/cooldown-gate purposes. They should
+// be closed shortly after creation — the standard AutoClose path requires 7
+// days of staleness, which lets receipts accumulate into the thousands.
+//
+// The receipts live in the `wisps`/`wisp_labels` tables (ephemeral beads
+// migrated off the issues table by `gt dolt migrate-wisps`), NOT the
+// `issues`/`labels` tables. This function previously queried issues and so
+// matched zero rows after the migration, which is the root cause of the
+// open-wisp-count escalation (receipts piled up until the generic 24h Reap,
+// leaving ~1 day's worth — well over the alert threshold — open at all times).
 func ClosePluginReceipts(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ClosePluginReceiptResult, error) {
+	return closeWispsByLabel(db, dbName, "type:plugin-run", maxAge, "plugin receipts", dryRun)
+}
+
+// CloseStaleNotifications closes open one-way notification mail wisps older
+// than maxAge. These are fire-and-forget telegraph notifications (e.g. deacon
+// → mayor "Re: Plugin: …" receipts) labeled `msg-type:notification`. The
+// telegraph is one-way — recipients reply out of band (Jira/gh), so these
+// notifications are never acked or delivered and sit `delivery:pending`
+// forever. They are informational, not actionable, so closing them past a
+// short window keeps the open-wisp count from drifting upward indefinitely.
+func CloseStaleNotifications(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ClosePluginReceiptResult, error) {
+	return closeWispsByLabel(db, dbName, "msg-type:notification", maxAge, "stale notifications", dryRun)
+}
+
+// closeByLabelSelectQuery selects open wisps carrying a given label past a
+// cutoff. It targets the wisps/wisp_labels tables — the post-migration home of
+// ephemeral receipt and notification beads (gt dolt migrate-wisps). The prior
+// plugin-receipt closer queried issues/labels and matched zero rows after the
+// migration, which let receipts accumulate until the generic 24h Reap and
+// pushed the open-wisp count over the alert threshold.
+const closeByLabelSelectQuery = `
+		SELECT w.id FROM wisps w
+		INNER JOIN wisp_labels l ON w.id = l.issue_id
+		WHERE w.status IN ('open', 'hooked', 'in_progress')
+		AND l.label = ?
+		AND w.created_at < ?`
+
+// closeWispsByLabel closes open wisps carrying the given label that are older
+// than maxAge. Shared by the plugin-receipt and notification fast-track
+// closers. Operates on the `wisps`/`wisp_labels` tables where ephemeral beads
+// live. The wisps table is dolt-ignored in most installs, so a "nothing to
+// commit" from DOLT_COMMIT is expected and not treated as an error.
+func closeWispsByLabel(db *sql.DB, dbName, label string, maxAge time.Duration, kind string, dryRun bool) (*ClosePluginReceiptResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultQueryTimeout)
 	defer cancel()
 
 	cutoff := time.Now().UTC().Add(-maxAge)
 	result := &ClosePluginReceiptResult{Database: dbName, DryRun: dryRun}
 
-	// Find open issues with the "type:plugin-run" label older than maxAge.
-	selectQuery := fmt.Sprintf(`
-		SELECT i.id FROM `+"`%s`"+`.issues i
-		INNER JOIN `+"`%s`"+`.labels l ON i.id = l.issue_id
-		WHERE i.status IN ('open', 'in_progress')
-		AND l.label = 'type:plugin-run'
-		AND i.created_at < ?`, dbName, dbName)
-
-	rows, err := db.QueryContext(ctx, selectQuery, cutoff)
+	rows, err := db.QueryContext(ctx, closeByLabelSelectQuery, label, cutoff)
 	if err != nil {
 		if isTableNotFound(err) {
 			return result, nil
 		}
-		return nil, fmt.Errorf("select plugin receipts: %w", err)
+		return nil, fmt.Errorf("select %s: %w", kind, err)
 	}
 	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			rows.Close()
-			return nil, fmt.Errorf("scan plugin receipt id: %w", err)
+			return nil, fmt.Errorf("scan %s id: %w", kind, err)
 		}
 		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterate %s rows: %w", kind, err)
 	}
 	rows.Close()
 
@@ -825,26 +862,36 @@ func ClosePluginReceipts(db *sql.DB, dbName string, maxAge time.Duration, dryRun
 		args[i] = id
 	}
 	updateQuery := fmt.Sprintf(
-		"UPDATE `%s`.issues SET status = 'closed', closed_at = NOW() WHERE id IN (%s)",
-		dbName, strings.Join(placeholders, ","))
-	if _, err := db.ExecContext(ctx, updateQuery, args...); err != nil {
-		return nil, fmt.Errorf("close plugin receipts: %w", err)
+		"UPDATE wisps SET status = 'closed', closed_at = NOW() WHERE id IN (%s)",
+		strings.Join(placeholders, ","))
+	sqlRes, err := db.ExecContext(ctx, updateQuery, args...)
+	if err != nil {
+		return nil, fmt.Errorf("close %s: %w", kind, err)
+	}
+	// Report the actual affected-row count, not the candidate count. A
+	// concurrent closer (e.g. the witness closing wisps for a dead session)
+	// can close some candidates between our SELECT and UPDATE; using the
+	// affected count keeps result.Closed — and the open-remain adjustments
+	// derived from it — in sync with what this call actually changed.
+	if affected, aerr := sqlRes.RowsAffected(); aerr == nil {
+		result.Closed = int(affected)
 	}
 
 	// Flush and commit.
 	if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
 		result.Anomalies = append(result.Anomalies, Anomaly{
 			Type:    "sql_commit_failed",
-			Message: fmt.Sprintf("sql commit after plugin receipt close failed: %v", err),
+			Message: fmt.Sprintf("sql commit after %s close failed: %v", kind, err),
 		})
 		return result, nil
 	}
-	commitMsg := fmt.Sprintf("reaper: close %d plugin receipts in %s", len(ids), dbName)
+	commitMsg := fmt.Sprintf("reaper: close %d %s in %s", len(ids), kind, dbName)
 	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+		// "nothing to commit" is expected when the wisps table is dolt-ignored.
 		if !isNothingToCommit(err) {
 			result.Anomalies = append(result.Anomalies, Anomaly{
 				Type:    "dolt_commit_failed",
-				Message: fmt.Sprintf("dolt commit after plugin receipt close failed: %v", err),
+				Message: fmt.Sprintf("dolt commit after %s close failed: %v", kind, err),
 			})
 		}
 	}
