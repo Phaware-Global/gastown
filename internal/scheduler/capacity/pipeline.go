@@ -4,8 +4,8 @@ import "strings"
 
 // PendingBead represents a bead that is scheduled and ready for dispatch evaluation.
 type PendingBead struct {
-	ID          string             // Context bead ID (sling context)
-	WorkBeadID  string             // The actual work bead ID
+	ID          string // Context bead ID (sling context)
+	WorkBeadID  string // The actual work bead ID
 	Title       string
 	TargetRig   string
 	Description string
@@ -118,6 +118,39 @@ func BlockerAware(readyIDs map[string]bool) ReadinessFilter {
 		}
 		return result
 	}
+}
+
+// LimitPerRig filters pending beads so no single target rig receives more than
+// maxPerRig concurrent polecats, accounting for each rig's currently-working
+// polecat count via activeFn. maxPerRig <= 0 disables the limit and returns
+// pending unchanged. Beads with an empty TargetRig carry no rig to gate on and
+// always pass through. Input order is preserved; beads beyond a rig's remaining
+// headroom are dropped (they stay pending and are reconsidered next cycle).
+func LimitPerRig(pending []PendingBead, maxPerRig int, activeFn func(rig string) int) []PendingBead {
+	if maxPerRig <= 0 {
+		return pending
+	}
+	// headroom[rig] = remaining slots for that rig this cycle, seeded lazily
+	// from maxPerRig minus its active count and decremented as we admit beads.
+	headroom := make(map[string]int)
+	result := make([]PendingBead, 0, len(pending))
+	for _, b := range pending {
+		if b.TargetRig == "" {
+			result = append(result, b)
+			continue
+		}
+		room, seen := headroom[b.TargetRig]
+		if !seen {
+			room = maxPerRig - activeFn(b.TargetRig)
+			headroom[b.TargetRig] = room
+		}
+		if room <= 0 {
+			continue
+		}
+		result = append(result, b)
+		headroom[b.TargetRig] = room - 1
+	}
+	return result
 }
 
 // PlanDispatch computes which beads to dispatch given capacity constraints.

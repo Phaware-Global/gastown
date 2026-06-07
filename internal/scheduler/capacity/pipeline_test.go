@@ -90,6 +90,109 @@ func TestFilterCircuitBroken(t *testing.T) {
 	}
 }
 
+func TestLimitPerRig(t *testing.T) {
+	ids := func(beads []PendingBead) []string {
+		out := make([]string, len(beads))
+		for i, b := range beads {
+			out[i] = b.ID
+		}
+		return out
+	}
+	eq := func(a, b []string) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for i := range a {
+			if a[i] != b[i] {
+				return false
+			}
+		}
+		return true
+	}
+
+	pending := []PendingBead{
+		{ID: "a1", TargetRig: "alpha"},
+		{ID: "a2", TargetRig: "alpha"},
+		{ID: "a3", TargetRig: "alpha"},
+		{ID: "b1", TargetRig: "beta"},
+		{ID: "b2", TargetRig: "beta"},
+	}
+
+	tests := []struct {
+		name      string
+		pending   []PendingBead
+		maxPerRig int
+		active    map[string]int
+		want      []string
+	}{
+		{
+			name:      "disabled passes everything (zero)",
+			pending:   pending,
+			maxPerRig: 0,
+			want:      []string{"a1", "a2", "a3", "b1", "b2"},
+		},
+		{
+			name:      "disabled passes everything (negative)",
+			pending:   pending,
+			maxPerRig: -1,
+			want:      []string{"a1", "a2", "a3", "b1", "b2"},
+		},
+		{
+			name:      "caps each rig independently, preserves order",
+			pending:   pending,
+			maxPerRig: 2,
+			want:      []string{"a1", "a2", "b1", "b2"},
+		},
+		{
+			name:      "accounts for already-active polecats",
+			pending:   pending,
+			maxPerRig: 2,
+			active:    map[string]int{"alpha": 1},
+			want:      []string{"a1", "b1", "b2"},
+		},
+		{
+			name:      "rig at or over cap is fully dropped",
+			pending:   pending,
+			maxPerRig: 2,
+			active:    map[string]int{"alpha": 3},
+			want:      []string{"b1", "b2"},
+		},
+		{
+			name:      "empty target rig always passes",
+			pending:   []PendingBead{{ID: "x"}, {ID: "a1", TargetRig: "alpha"}, {ID: "a2", TargetRig: "alpha"}},
+			maxPerRig: 1,
+			want:      []string{"x", "a1"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			activeFn := func(rig string) int { return tt.active[rig] }
+			got := ids(LimitPerRig(tt.pending, tt.maxPerRig, activeFn))
+			if !eq(got, tt.want) {
+				t.Errorf("LimitPerRig: got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLimitPerRig_ActiveFnCalledOncePerRig(t *testing.T) {
+	pending := []PendingBead{
+		{ID: "a1", TargetRig: "alpha"},
+		{ID: "a2", TargetRig: "alpha"},
+		{ID: "b1", TargetRig: "beta"},
+	}
+	calls := map[string]int{}
+	activeFn := func(rig string) int {
+		calls[rig]++
+		return 0
+	}
+	LimitPerRig(pending, 5, activeFn)
+	if calls["alpha"] != 1 || calls["beta"] != 1 {
+		t.Errorf("activeFn should be called once per rig, got %v", calls)
+	}
+}
+
 func TestAllReady(t *testing.T) {
 	beads := []PendingBead{
 		{ID: "a"},

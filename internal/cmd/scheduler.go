@@ -143,12 +143,12 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
 
 	if schedulerStatusJSON {
 		out := struct {
-			Paused         bool               `json:"paused"`
-			PausedBy       string             `json:"paused_by,omitempty"`
-			ScheduledTotal int                `json:"queued_total"`
-			ScheduledReady int                `json:"queued_ready"`
-			ActivePolecats int                `json:"active_polecats"`
-			LastDispatchAt string             `json:"last_dispatch_at,omitempty"`
+			Paused         bool                `json:"paused"`
+			PausedBy       string              `json:"paused_by,omitempty"`
+			ScheduledTotal int                 `json:"queued_total"`
+			ScheduledReady int                 `json:"queued_ready"`
+			ActivePolecats int                 `json:"active_polecats"`
+			LastDispatchAt string              `json:"last_dispatch_at,omitempty"`
 			Beads          []scheduledBeadInfo `json:"beads"`
 		}{
 			Paused:         state.Paused,
@@ -491,8 +491,8 @@ func countActivePolecats() int {
 	return count
 }
 
-// countWorkingPolecats counts polecat sessions that are actively working.
-// A polecat is "working" if its agent bead has a non-null hook_bead.
+// countWorkingPolecats counts polecat sessions that are actively working across
+// all rigs. A polecat is "working" if its agent bead has a non-null hook_bead.
 // Idle polecats (completed work, hook_bead=null) don't count toward capacity
 // since they're available for re-sling under the persistent polecat model.
 func countWorkingPolecats() int {
@@ -500,15 +500,32 @@ func countWorkingPolecats() int {
 	if err != nil {
 		return countActivePolecats() // Fallback to total count
 	}
+	total := 0
+	for _, c := range workingPolecatCounts(townRoot) {
+		total += c
+	}
+	return total
+}
+
+// workingPolecatCounts scans polecat tmux sessions once and returns the number
+// of actively-working polecats (agent bead has a non-null hook_bead) bucketed by
+// rig. Idle polecats (hook_bead=null) are excluded since they're re-sling
+// candidates.
+//
+// townRoot is taken explicitly rather than re-resolved from the cwd so the
+// per-rig cap does not fail open when the caller (e.g., the daemon dispatch
+// loop) runs outside the town tree. A single tmux pass serves every rig, so the
+// dispatch filter can gate many rigs without spawning a subprocess per rig.
+func workingPolecatCounts(townRoot string) map[string]int {
+	counts := make(map[string]int)
 
 	listCmd := tmux.BuildCommand("list-sessions", "-F", "#{session_name}")
 	out, err := listCmd.Output()
 	if err != nil {
-		return 0
+		return counts
 	}
 
 	bd := beads.New(townRoot)
-	count := 0
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if line == "" {
 			continue
@@ -536,7 +553,7 @@ func countWorkingPolecats() int {
 		if fields.HookBead == "" {
 			continue // Idle — don't count toward cap
 		}
-		count++
+		counts[identity.Rig]++
 	}
-	return count
+	return counts
 }
