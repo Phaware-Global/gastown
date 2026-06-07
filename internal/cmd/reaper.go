@@ -237,7 +237,20 @@ Returns the count of reaped wisps. Use --dry-run to preview.`,
 					continue
 				}
 				if res != nil && res.Closed > 0 {
+					// Keep the result consistent: these closes count toward the
+					// reaped total AND reduce the open-remaining count, so the
+					// per-db line, the multi-db summary, and the >threshold
+					// warning all reflect the post-close state. Reap() computed
+					// OpenRemain before the fast-track closes ran, so adjust it
+					// here. Only in a real run — in dry-run nothing is closed and
+					// OpenRemain stays a true snapshot of currently-open wisps.
 					result.Reaped += res.Closed
+					if !reaperDryRun {
+						result.OpenRemain -= res.Closed
+						if result.OpenRemain < 0 {
+							result.OpenRemain = 0
+						}
+					}
 				}
 			}
 			db.Close()
