@@ -756,9 +756,11 @@ func closePluginMails(dogName string) {
 
 	closed := 0
 	for _, msg := range messages {
-		if msg.Read {
-			continue
-		}
+		// Archive read AND unread plugin mail. The dog must read the dispatch
+		// mail to execute the plugin, so at done-time the current dispatch is
+		// always read — skipping read mail left every executed dispatch bead
+		// open forever, forcing the Deacon to sweep them manually each cycle.
+		// Unread ones are stale dispatches from dead sessions; close those too.
 		if !strings.HasPrefix(msg.Subject, "Plugin: ") {
 			continue
 		}
