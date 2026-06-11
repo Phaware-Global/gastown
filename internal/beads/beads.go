@@ -302,7 +302,7 @@ type ListOptions struct {
 	Parent     string // filter by parent ID
 	Assignee   string // filter by assignee (e.g., "gastown/Toast")
 	NoAssignee bool   // filter for issues with no assignee
-	Limit      int    // Max results (0 = unlimited, overrides bd default of 50)
+	Limit      int    // Max results (0 = use safe default cap; set explicitly for truly unlimited queries)
 	Ephemeral  bool   // Search wisps table (ephemeral issues) instead of issues table
 }
 
@@ -466,11 +466,11 @@ func (b *Beads) Init(prefix string) error {
 // being killed. Without this, bd can block indefinitely waiting on a slow
 // Dolt server (e.g. paging from swap under memory pressure), and macOS
 // Jetsam may SIGKILL the orphaned bd process before it ever returns.
-// 60s is large enough to cover normal slow-path retries (Dolt MySQL client
-// retries up to 30s) but short enough to fail fast and surface to callers.
+// 120s covers write operations that take 3-4s per call under Dolt load (the
+// previous 60s was too tight when issues.jsonl grows large and Dolt is paging).
 // Override via GT_BD_TIMEOUT_SEC env var for testing or unusual workloads.
-// Investigation: dc-1pq8 (forensic report 2026-05-02).
-const bdSubprocessTimeout = 60 * time.Second
+// Investigation: hq-2dr55 (OOM/kill diagnosis), dc-1pq8 (forensic report 2026-05-02).
+const bdSubprocessTimeout = 120 * time.Second
 
 // resolveBdSubprocessTimeout returns the configured timeout, honoring the
 // GT_BD_TIMEOUT_SEC env var override (must parse as a positive integer).
@@ -856,6 +856,14 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 	}
 	if opts.Limit > 0 {
 		args = append(args, fmt.Sprintf("--limit=%d", opts.Limit))
+	} else if opts.Assignee != "" {
+		// Assignee-filtered queries on large datasets (e.g. issues.jsonl > 40MB) can
+		// time out under Dolt memory pressure if run with --limit=0 (unlimited).
+		// No single assignee legitimately holds more than O(hundreds) of active beads,
+		// so capping at 500 avoids the full-scan while preventing silent truncation
+		// in practice. Callers needing truly unlimited results should set Limit explicitly.
+		// Investigation: hq-2dr55.
+		args = append(args, "--limit=500")
 	} else {
 		// Override bd's default limit of 50 to avoid silent truncation
 		args = append(args, "--limit=0")

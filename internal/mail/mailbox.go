@@ -165,7 +165,7 @@ func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
 			"--label", "gt:message",
 			"--assignee", id,
 			"--json",
-			"--limit", "0",
+			"--limit", "500", // cap unlimited scan; no inbox legitimately exceeds 500 unread messages
 		}
 
 		ctx, cancel := bdReadCtx()
@@ -211,7 +211,7 @@ func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
 			"--label", "gt:message",
 			"--label", ccLabel,
 			"--json",
-			"--limit", "0",
+			"--limit", "500", // cap unlimited scan; no inbox legitimately exceeds 500 CC'd messages
 		}
 
 		ctx, cancel := bdReadCtx()

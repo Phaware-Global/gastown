@@ -3486,12 +3486,12 @@ func TestResolveBdSubprocessTimeout(t *testing.T) {
 		envSet  bool
 		wantSec int
 	}{
-		{name: "default", envSet: false, wantSec: 60},
+		{name: "default", envSet: false, wantSec: 120},
 		{name: "override 5s", envSet: true, envVal: "5", wantSec: 5},
-		{name: "override 120s", envSet: true, envVal: "120", wantSec: 120},
-		{name: "invalid falls to default", envSet: true, envVal: "abc", wantSec: 60},
-		{name: "zero falls to default", envSet: true, envVal: "0", wantSec: 60},
-		{name: "negative falls to default", envSet: true, envVal: "-1", wantSec: 60},
+		{name: "override 60s", envSet: true, envVal: "60", wantSec: 60},
+		{name: "invalid falls to default", envSet: true, envVal: "abc", wantSec: 120},
+		{name: "zero falls to default", envSet: true, envVal: "0", wantSec: 120},
+		{name: "negative falls to default", envSet: true, envVal: "-1", wantSec: 120},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

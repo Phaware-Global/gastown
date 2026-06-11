@@ -3,7 +3,9 @@ package mail
 import (
 	"bytes"
 	"context"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,17 +16,21 @@ import (
 
 const (
 	// bdReadTimeout is the timeout for bd read operations (list, show, query).
-	// 60s accommodates concurrent agent load where multiple bd processes compete
-	// for Dolt locks and memory (was 30s, caused signal:killed under contention).
-	bdReadTimeout = 60 * time.Second
+	// 120s covers read operations under Dolt memory pressure (was 60s, caused
+	// signal:killed when issues.jsonl > 40MB slows bd past the previous ceiling).
+	// Investigation: hq-2dr55.
+	bdReadTimeout = 120 * time.Second
 	// bdWriteTimeout is the timeout for bd write operations (create, close, label, reopen).
-	bdWriteTimeout = 60 * time.Second
+	// 120s covers write paths (bd q/delete: 3-4s each) under concurrent agent load
+	// where Dolt paging pushes write latency well past the previous 60s ceiling.
+	// Investigation: hq-2dr55.
+	bdWriteTimeout = 120 * time.Second
 	// bdProbeTimeout is a short timeout for "is this no-op?" probe reads that
 	// run before a write to skip an already-satisfied UPDATE+DOLT_COMMIT cycle.
 	// Bounded at 5s so a slow/dead Dolt cannot double the tail latency of
 	// MarkRead / closeInDir on the failure path: worst case is one probe miss
-	// (5s) followed by the actual write hitting bdWriteTimeout (60s), instead
-	// of two back-to-back 60s timeouts. The probe failing falls through to
+	// (5s) followed by the actual write hitting bdWriteTimeout (120s), instead
+	// of two back-to-back 120s timeouts. The probe failing falls through to
 	// the unguarded write — semantically a no-op, just no fast path.
 	bdProbeTimeout = 5 * time.Second
 )
@@ -133,11 +139,22 @@ func firstArg(args []string) string {
 	return ""
 }
 
+// resolveBdTimeout returns the configured timeout, honoring GT_BD_TIMEOUT_SEC
+// env var override (same var as beads.resolveBdSubprocessTimeout).
+func resolveBdTimeout(defaultTimeout time.Duration) time.Duration {
+	if v := os.Getenv("GT_BD_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return defaultTimeout
+}
+
 // bdReadCtx returns a context with the standard bd read timeout.
 //
 //nolint:gosec // The cancel function is returned to callers, who are responsible for invoking it.
 func bdReadCtx() (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(context.Background(), bdReadTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), resolveBdTimeout(bdReadTimeout))
 	return ctx, cancel
 }
 
@@ -145,7 +162,7 @@ func bdReadCtx() (context.Context, context.CancelFunc) {
 //
 //nolint:gosec // The cancel function is returned to callers, who are responsible for invoking it.
 func bdWriteCtx() (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(context.Background(), bdWriteTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), resolveBdTimeout(bdWriteTimeout))
 	return ctx, cancel
 }
 
