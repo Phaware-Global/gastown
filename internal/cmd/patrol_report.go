@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/formula"
 	"github.com/steveyegge/gastown/internal/style"
 )
@@ -121,6 +122,16 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("%s Closed patrol %s\n", style.Success.Render("✓"), patrolID)
+
+	// For deacon: mechanically refresh heartbeat before creating next cycle.
+	// Ensures the daemon (which kills Deacon if heartbeat.json is >20 minutes old)
+	// sees liveness at every patrol cycle boundary, regardless of whether the
+	// formula's heartbeat step ran before gt patrol report was called.
+	if roleInfo.Role == RoleDeacon {
+		if hbErr := deacon.TouchWithAction(roleInfo.TownRoot, "starting patrol cycle", 0, 0); hbErr != nil {
+			style.PrintWarning("heartbeat refresh failed: %v", hbErr)
+		}
+	}
 
 	// Start next cycle
 	newPatrolID, err := autoSpawnPatrol(cfg)
