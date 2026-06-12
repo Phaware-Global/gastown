@@ -486,8 +486,8 @@ func runBdJSONWithOptions(dir string, allowStale bool, args ...string) ([]byte, 
 //
 // Returns deduplicated, unwrapped issue IDs (external:prefix:id → id).
 func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) {
-	// Bead IDs are system-generated alphanumeric strings with hyphens and
-	// dots — validate to prevent injection before interpolating below.
+	// Bead IDs are system-generated alphanumeric strings with hyphens, dots,
+	// and underscores — validate to prevent injection before interpolating below.
 	if !isValidBeadID(issueID) {
 		return nil, fmt.Errorf("invalid bead ID: %q", issueID)
 	}
@@ -503,8 +503,8 @@ func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) 
 		selectExpr = "issue_id"
 		parseKey = "issue_id"
 		whereClause = fmt.Sprintf(
-			"(depends_on_issue_id = '%s' OR depends_on_wisp_id = '%s' OR depends_on_external LIKE '%%:%s')",
-			issueID, issueID, issueID)
+			"(depends_on_issue_id = '%s' OR depends_on_wisp_id = '%s' OR %s)",
+			issueID, issueID, sqlExternalDepTargetClause(issueID))
 	} else {
 		selectExpr = "COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external) AS depends_on_id"
 		parseKey = "depends_on_id"
@@ -541,6 +541,12 @@ func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) 
 		}
 	}
 	return ids, nil
+}
+
+func sqlExternalDepTargetClause(issueID string) string {
+	// Use an escape character that is not valid in bead IDs so underscores stay literal.
+	escapedID := strings.ReplaceAll(issueID, "_", "!_")
+	return fmt.Sprintf("depends_on_external LIKE '%%:%s' ESCAPE '!'", escapedID)
 }
 
 // isValidBeadID checks that a string is safe for SQL interpolation in dep queries.
