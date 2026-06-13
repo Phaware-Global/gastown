@@ -607,6 +607,38 @@ func TestSQLStringListEscapesSQLLiterals(t *testing.T) {
 	}
 }
 
+func TestParseWispTimestamp(t *testing.T) {
+	want := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name  string
+		value string
+		want  time.Time
+		ok    bool
+	}{
+		{name: "rfc3339", value: "2026-06-12T12:00:00Z", want: want, ok: true},
+		{name: "rfc3339 offset", value: "2026-06-12T08:00:00-04:00", want: want, ok: true},
+		{name: "go utc", value: "2026-06-12 12:00:00 +0000 UTC", want: want, ok: true},
+		{name: "sql datetime", value: "2026-06-12 12:00:00", want: want, ok: true},
+		{name: "empty"},
+		{name: "malformed", value: "not a timestamp"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := parseWispTimestamp(tt.value)
+			if ok != tt.ok {
+				t.Fatalf("parseWispTimestamp(%q) ok = %v, want %v", tt.value, ok, tt.ok)
+			}
+			if ok && !got.Equal(tt.want) {
+				t.Fatalf("parseWispTimestamp(%q) = %v, want %v", tt.value, got, tt.want)
+			}
+			if ok && got.Location() != time.UTC {
+				t.Fatalf("parseWispTimestamp(%q) location = %v, want UTC", tt.value, got.Location())
+			}
+		})
+	}
+}
+
 func TestMailboxLegacyMultipleOperations(t *testing.T) {
 	tmpDir := t.TempDir()
 	m := NewMailbox(tmpDir)

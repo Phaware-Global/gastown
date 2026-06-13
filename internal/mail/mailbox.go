@@ -379,9 +379,7 @@ func (m *Mailbox) runWispSQL(beadsDir, query string) ([]wispQueryMessage, error)
 			Assignee:    row.Assignee,
 			Wisp:        true,
 		}
-		if t, err := time.Parse(time.RFC3339, row.CreatedAt); err == nil {
-			bm.CreatedAt = t
-		} else if t, err := time.Parse("2006-01-02 15:04:05 +0000 UTC", row.CreatedAt); err == nil {
+		if t, ok := parseWispTimestamp(row.CreatedAt); ok {
 			bm.CreatedAt = t
 		}
 		if row.LabelsCSV != "" {
@@ -394,6 +392,21 @@ func (m *Mailbox) runWispSQL(beadsDir, query string) ([]wispQueryMessage, error)
 		})
 	}
 	return msgs, nil
+}
+
+func parseWispTimestamp(value string) (time.Time, bool) {
+	for _, layout := range []string{
+		time.RFC3339,
+		"2006-01-02 15:04:05 -0700 MST",
+		// Dolt/MySQL DATETIME values are emitted without a zone; Gas Town runs
+		// managed Dolt servers in UTC, so treat bare timestamps as UTC.
+		"2006-01-02 15:04:05",
+	} {
+		if t, err := time.Parse(layout, strings.TrimSpace(value)); err == nil {
+			return t.UTC(), true
+		}
+	}
+	return time.Time{}, false
 }
 
 func sqlStringList(values []string) string {
