@@ -41,7 +41,8 @@ func (p *threadsFakeProvider) ListReviewAuthors(int) ([]string, error)        { 
 func (p *threadsFakeProvider) HasReviewFromOnSHA(int, string, string) (bool, error) {
 	panic("unused")
 }
-func (p *threadsFakeProvider) CurrentHeadSHA(int) (string, error) { panic("unused") }
+func (p *threadsFakeProvider) CurrentHeadSHA(int) (string, error)        { panic("unused") }
+func (p *threadsFakeProvider) SubmitReview(int, SubmitReviewInput) error { panic("unused") }
 
 func TestVerifyReviewThreadsResolved_Empty_ReturnsNil(t *testing.T) {
 	provider := &threadsFakeProvider{threads: nil}
@@ -212,6 +213,23 @@ func TestParseThreadPriority(t *testing.T) {
 			"high",
 		},
 		{
+			// shields.io badge emitted by `gt reviewer post` — has no
+			// contiguous "priority.svg" substring, only "priority" and ".svg".
+			"reviewer shields.io high badge",
+			"![high](https://img.shields.io/badge/priority-high-red.svg)\n**[adversarial]** boom",
+			"high",
+		},
+		{
+			"reviewer shields.io medium badge",
+			"![medium](https://img.shields.io/badge/priority-medium-orange.svg)\nnit",
+			"medium",
+		},
+		{
+			"reviewer shields.io low badge",
+			"![low](https://img.shields.io/badge/priority-low-yellow.svg)\nobservation",
+			"low",
+		},
+		{
 			"no priority marker",
 			"Just a plain comment with no shield.",
 			"",
@@ -229,6 +247,30 @@ func TestParseThreadPriority(t *testing.T) {
 				t.Errorf("parseThreadPriority(%q) = %q; want %q", tc.body, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestPriorityBadgeRoundTrip is the shared-fixture contract between the badge
+// emitter and the parser: every badge PriorityBadge emits must parse back to
+// the same priority. If either side drifts, this fails.
+func TestPriorityBadgeRoundTrip(t *testing.T) {
+	for _, p := range []string{"high", "medium", "low"} {
+		badge := PriorityBadge(p)
+		if badge == "" {
+			t.Fatalf("PriorityBadge(%q) returned empty", p)
+		}
+		body := badge + "\n**[security]** finding body"
+		if got := parseThreadPriority(body); got != p {
+			t.Errorf("round-trip for %q: PriorityBadge produced %q which parsed as %q", p, badge, got)
+		}
+	}
+	// Mixed-case input is normalized.
+	if got := PriorityBadge("HIGH"); got != PriorityBadge("high") {
+		t.Errorf("PriorityBadge not case-insensitive: %q vs %q", got, PriorityBadge("high"))
+	}
+	// Unknown priority yields no badge.
+	if got := PriorityBadge("critical"); got != "" {
+		t.Errorf("PriorityBadge(critical) = %q, want empty", got)
 	}
 }
 

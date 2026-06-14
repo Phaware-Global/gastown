@@ -347,6 +347,51 @@ func DefaultOverrides() map[string]*HooksConfig {
 				},
 			},
 		},
+		// Reviewer roles: write-surface guard (P23-2376).
+		// The Reviewer's only sanctioned write surfaces are its review bead, its
+		// own worktree (checkout only), and PR review comments posted through
+		// `gt reviewer post`. Everything below is blocked so a prompt-injected
+		// or confused reviewer session can't approve, merge, push, resolve
+		// threads, drive the refinery, or close MR beads.
+		"reviewer": {
+			PreToolUse: []HookEntry{
+				{
+					Matcher: "Bash(*gh pr review*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviewer posts reviews only via `gt reviewer post` (COMMENT reviews). Raw `gh pr review` bypasses the tested output contract and can approve/request-changes, which the merge gates do not model.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*gh pr merge*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviewer never merges. Human approval is the merge gate.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*git push*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviewer never pushes. The reviewer worktree is checkout-only.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*gt refinery pr*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviewer does not drive the refinery PR workflow — review only.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*resolveReviewThread*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Thread resolution belongs to the authoring polecat, not the Reviewer.' && exit 2",
+					}},
+				},
+			},
+		},
 	}
 }
 
@@ -484,6 +529,17 @@ func DiscoverTargets(townRoot string) ([]Target, error) {
 			})
 		}
 
+		// Reviewer — settings in the reviewer parent directory
+		reviewerDir := filepath.Join(rigPath, "reviewer")
+		if info, err := os.Stat(reviewerDir); err == nil && info.IsDir() {
+			targets = append(targets, Target{
+				Path: filepath.Join(reviewerDir, ".claude", "settings.json"),
+				Key:  rigName + "/reviewer",
+				Rig:  rigName,
+				Role: "reviewer",
+			})
+		}
+
 	}
 
 	return targets, nil
@@ -537,6 +593,7 @@ func DiscoverRoleLocations(townRoot string) ([]RoleLocation, error) {
 			{"polecats", "polecat"},
 			{"witness", "witness"},
 			{"refinery", "refinery"},
+			{"reviewer", "reviewer"},
 		} {
 			dir := filepath.Join(rigPath, sub.dir)
 			if info, err := os.Stat(dir); err == nil && info.IsDir() {
@@ -813,6 +870,7 @@ func NormalizeTarget(target string) (string, bool) {
 	validRoles := map[string]bool{
 		"crew": true, "witness": true, "refinery": true,
 		"polecats": true, "mayor": true, "deacon": true,
+		"reviewer": true,
 	}
 
 	// Simple role target

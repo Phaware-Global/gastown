@@ -672,7 +672,8 @@ func (f *threadGateFakeProvider) ListReviewAuthors(int) ([]string, error)       
 func (f *threadGateFakeProvider) HasReviewFromOnSHA(int, string, string) (bool, error) {
 	panic("unused")
 }
-func (f *threadGateFakeProvider) CurrentHeadSHA(int) (string, error) { panic("unused") }
+func (f *threadGateFakeProvider) CurrentHeadSHA(int) (string, error)        { panic("unused") }
+func (f *threadGateFakeProvider) SubmitReview(int, SubmitReviewInput) error { panic("unused") }
 
 // TestDoMergePR_UnresolvedThreads_ShortCircuits asserts the contract of
 // the new PR.2a thread gate: when VerifyReviewThreadsResolved returns

@@ -647,6 +647,7 @@ type RigSettings struct {
 	Type       string            `json:"type"`                  // "rig-settings"
 	Version    int               `json:"version"`               // schema version
 	MergeQueue *MergeQueueConfig `json:"merge_queue,omitempty"` // merge queue settings
+	Review     *ReviewConfig     `json:"review,omitempty"`      // local Reviewer-role settings (P23-2376)
 	Theme      *ThemeConfig      `json:"theme,omitempty"`       // tmux theme settings
 	Namepool   *NamepoolConfig   `json:"namepool,omitempty"`    // polecat name pool settings
 	Crew       *CrewConfig       `json:"crew,omitempty"`        // crew startup settings
@@ -1242,8 +1243,9 @@ type WindowTint struct {
 // These are used when no explicit configuration is provided.
 func BuiltinRoleThemes() map[string]string {
 	return map[string]string{
-		"witness":  "rust", // Red/rust - watchful, alert
-		"refinery": "plum", // Purple - processing, refining
+		"witness":  "rust",   // Red/rust - watchful, alert
+		"refinery": "plum",   // Purple - processing, refining
+		"reviewer": "forest", // Green - evaluative, go/no-go
 		// crew and polecat use rig theme by default (no override)
 	}
 }
@@ -1345,7 +1347,28 @@ type MergeQueueConfig struct {
 	// PRReviewLoopMax is the maximum number of review-fix polecat dispatch
 	// cycles per PR before the refinery escalates. Defaults to 3 when
 	// merge_strategy="pr". Only meaningful when merge_strategy="pr".
+	//
+	// This is the per-rig "number of review iterations" knob: it bounds how
+	// many times a PR cycles through review -> fix -> re-review before the
+	// refinery escalates instead of looping forever. Reviewer dispatch reads
+	// the effective cap via GetReviewIterations (review.max_rounds overrides
+	// this when set).
 	PRReviewLoopMax int `json:"pr_review_loop_max,omitempty"`
+
+	// ReviewerLocal controls whether the refinery dispatches the in-town
+	// Reviewer role (`gt reviewer request`) instead of relying on an external
+	// review bot trigger comment. When true, the request-review step dispatches
+	// locally and await-review polls with --no-trigger. Requires a non-empty
+	// PRReviewer (the login still drives the engagement gate). Only meaningful
+	// when merge_strategy="pr". (P23-2376; consumed by the refinery patrol step.)
+	ReviewerLocal bool `json:"reviewer_local,omitempty"`
+
+	// ReviewerTokenEnv is the NAME of the environment variable holding the
+	// Reviewer machine-user's GitHub token, resolved fail-fast at dispatch and
+	// exported as GH_TOKEN into the reviewer session. The value never touches
+	// disk or logs (telegraph secret-resolution pattern). Empty defaults to
+	// DefaultReviewerTokenEnv ("GT_REVIEWER_GITHUB_TOKEN"). (P23-2376.)
+	ReviewerTokenEnv string `json:"reviewer_token_env,omitempty"`
 
 	// PRMergeMethod is the merge method passed to the VCS provider
 	// (e.g., "squash", "merge", "rebase"). Defaults to "squash" when
@@ -1433,6 +1456,89 @@ const (
 	DefaultPRRequiredApprovals = 1
 	DefaultPRReviewLoopMax     = 3
 )
+
+// Reviewer-role defaults (P23-2376).
+const (
+	// DefaultReviewerTokenEnv is the default name of the environment variable
+	// holding the Reviewer machine-user's GitHub token.
+	DefaultReviewerTokenEnv = "GT_REVIEWER_GITHUB_TOKEN"
+
+	// DefaultMaxFindingsPerPerspective caps findings emitted per perspective
+	// pass before the reviewer summarizes the overflow.
+	DefaultMaxFindingsPerPerspective = 8
+)
+
+// DefaultPerspectives lists the perspective passes a rig gets when its review
+// config does not name any. The adversarial and security prompts ship embedded.
+func DefaultPerspectives() []string {
+	return []string{"adversarial", "security"}
+}
+
+// ReviewConfig represents per-rig settings for the local Reviewer role
+// (P23-2376). It is a sibling of merge_queue in rig settings.
+type ReviewConfig struct {
+	// Perspectives lists the enabled perspective prompt files (by name, without
+	// the .md extension) in the order they run. Empty falls back to
+	// DefaultPerspectives().
+	Perspectives []string `json:"perspectives,omitempty"`
+
+	// MaxFindingsPerPerspective caps findings emitted per perspective pass;
+	// overflow is summarized. 0 falls back to DefaultMaxFindingsPerPerspective.
+	MaxFindingsPerPerspective int `json:"max_findings_per_perspective,omitempty"`
+
+	// FailSilentPerspectives controls whether a missing perspective file is a
+	// config error (false, the default) or silently skipped (true).
+	FailSilentPerspectives bool `json:"fail_silent_perspectives,omitempty"`
+
+	// MaxRounds is the per-rig number of review iterations (review -> fix ->
+	// re-review cycles) for the local Reviewer. When > 0 it overrides
+	// merge_queue.pr_review_loop_max for reviewer dispatch. 0 falls back to
+	// pr_review_loop_max, then DefaultPRReviewLoopMax. This is the explicit
+	// per-rig knob for "number of review iterations".
+	MaxRounds int `json:"max_rounds,omitempty"`
+
+	// Parallel reserves the v2 parallel-perspective execution mode. v1 runs
+	// perspectives sequentially regardless; the field exists so enabling
+	// parallelism later is non-breaking.
+	Parallel bool `json:"parallel,omitempty"`
+}
+
+// GetPerspectives returns the configured perspective list, or the built-in
+// defaults when none are configured. Nil-safe.
+func (r *ReviewConfig) GetPerspectives() []string {
+	if r == nil || len(r.Perspectives) == 0 {
+		return DefaultPerspectives()
+	}
+	return r.Perspectives
+}
+
+// GetMaxFindingsPerPerspective returns the per-perspective finding cap,
+// defaulting to DefaultMaxFindingsPerPerspective. Nil-safe.
+func (r *ReviewConfig) GetMaxFindingsPerPerspective() int {
+	if r == nil || r.MaxFindingsPerPerspective <= 0 {
+		return DefaultMaxFindingsPerPerspective
+	}
+	return r.MaxFindingsPerPerspective
+}
+
+// ReviewIterations resolves the per-rig number of review iterations (review ->
+// fix -> re-review cycles) for the local Reviewer. Resolution order:
+//
+//	review.max_rounds (when > 0)            — the explicit per-rig knob
+//	merge_queue.pr_review_loop_max (when > 0) — the shared refinery cap
+//	DefaultPRReviewLoopMax                  — the built-in default
+//
+// Nil-safe on both sub-configs, so a rig with neither block configured still
+// gets a sane bound.
+func (s *RigSettings) ReviewIterations() int {
+	if s != nil && s.Review != nil && s.Review.MaxRounds > 0 {
+		return s.Review.MaxRounds
+	}
+	if s != nil && s.MergeQueue != nil && s.MergeQueue.PRReviewLoopMax > 0 {
+		return s.MergeQueue.PRReviewLoopMax
+	}
+	return DefaultPRReviewLoopMax
+}
 
 // IsPolecatIntegrationEnabled returns whether polecat integration branch
 // sourcing is enabled. Nil-safe, defaults to true.
@@ -1542,6 +1648,15 @@ func (c *MergeQueueConfig) GetPRReviewLoopMax() int {
 		return c.PRReviewLoopMax
 	}
 	return DefaultPRReviewLoopMax
+}
+
+// GetReviewerTokenEnv returns the name of the environment variable holding the
+// Reviewer machine-user token, defaulting to DefaultReviewerTokenEnv. Nil-safe.
+func (c *MergeQueueConfig) GetReviewerTokenEnv() string {
+	if c == nil || c.ReviewerTokenEnv == "" {
+		return DefaultReviewerTokenEnv
+	}
+	return c.ReviewerTokenEnv
 }
 
 // GetPRMergeMethod returns the merge method for PR merges.

@@ -78,3 +78,11 @@ func (p *githubPRProvider) HasReviewFromOnSHA(prNumber int, user, sha string) (b
 func (p *githubPRProvider) CurrentHeadSHA(prNumber int) (string, error) {
 	return p.git.GhPrHeadSHA(prNumber)
 }
+
+func (p *githubPRProvider) SubmitReview(prNumber int, in SubmitReviewInput) error {
+	comments := make([]git.GhReviewComment, len(in.Comments))
+	for i, c := range in.Comments {
+		comments[i] = git.GhReviewComment{Path: c.Path, Line: c.Line, Body: c.Body}
+	}
+	return p.git.GhPrSubmitReview(prNumber, in.CommitID, in.Body, comments)
+}

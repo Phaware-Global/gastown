@@ -209,7 +209,7 @@ func GetRoleWithContext(cwd, townRoot string) (RoleInfo, error) {
 
 		// If env is incomplete (missing rig/polecat for roles that need them),
 		// fill gaps from cwd detection and mark as incomplete
-		needsRig := parsedRole == RoleWitness || parsedRole == RoleRefinery || parsedRole == RolePolecat || parsedRole == RoleCrew
+		needsRig := parsedRole == RoleWitness || parsedRole == RoleRefinery || parsedRole == RoleReviewer || parsedRole == RolePolecat || parsedRole == RoleCrew
 		needsPolecat := parsedRole == RolePolecat || parsedRole == RoleCrew || parsedRole == RoleDog
 
 		if needsRig && info.Rig == "" && cwdCtx.Rig != "" {
@@ -317,6 +317,12 @@ func detectRole(cwd, townRoot string) RoleInfo {
 		return ctx
 	}
 
+	// Check for reviewer: <rig>/reviewer/rig/
+	if len(parts) >= 2 && parts[1] == "reviewer" {
+		ctx.Role = RoleReviewer
+		return ctx
+	}
+
 	// Check for polecat: <rig>/polecats/<name>/
 	if len(parts) >= 3 && parts[1] == "polecats" {
 		ctx.Role = RolePolecat
@@ -377,6 +383,8 @@ func parseRoleString(s string) (Role, string, string) {
 		return RoleWitness, rig, ""
 	case constants.RoleRefinery:
 		return RoleRefinery, rig, ""
+	case constants.RoleReviewer:
+		return RoleReviewer, rig, ""
 	case "polecats":
 		if len(parts) >= 3 {
 			return RolePolecat, rig, parts[2]
@@ -415,6 +423,11 @@ func (info RoleInfo) ActorString() string {
 			return fmt.Sprintf("%s/refinery", info.Rig)
 		}
 		return "refinery"
+	case RoleReviewer:
+		if info.Rig != "" {
+			return fmt.Sprintf("%s/reviewer", info.Rig)
+		}
+		return "reviewer"
 	case RolePolecat:
 		if info.Rig != "" && info.Polecat != "" {
 			return fmt.Sprintf("%s/polecats/%s", info.Rig, info.Polecat)
@@ -449,6 +462,11 @@ func getRoleHome(role Role, rig, polecat, townRoot string) string {
 			return ""
 		}
 		return filepath.Join(townRoot, rig, "refinery", "rig")
+	case RoleReviewer:
+		if rig == "" {
+			return ""
+		}
+		return filepath.Join(townRoot, rig, "reviewer", "rig")
 	case RolePolecat:
 		if rig == "" || polecat == "" {
 			return ""

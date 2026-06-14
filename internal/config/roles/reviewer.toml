@@ -1,0 +1,24 @@
+# Reviewer role definition
+# Rig-level on-demand code reviewer. Dispatched by the Refinery (and crew).
+# Replaces the externally-hosted Augment review app in the PR review loop.
+
+role = "reviewer"
+scope = "rig"
+nudge = "Check your hook/mail for a review request, then run 'gt prime'."
+prompt_template = "reviewer.md.tmpl"
+
+[session]
+pattern = "{prefix}-reviewer"
+work_dir = "{town}/{rig}/reviewer/rig"
+needs_pre_sync = true
+start_command = "exec claude --dangerously-skip-permissions"
+
+[env]
+GT_ROLE = "{rig}/reviewer"
+GT_SCOPE = "rig"
+
+[health]
+ping_timeout = "30s"
+consecutive_failures = 3
+kill_cooldown = "5m"
+stuck_threshold = "45m"   # reviews are bounded; well past pr_review_timeout (30m)

@@ -6,7 +6,7 @@ import "github.com/steveyegge/gastown/internal/constants"
 // IsAutonomousRole returns true if the given role operates without human
 // prompting and needs automatic mail injection on startup.
 //
-// Autonomous roles: polecat, witness, refinery, deacon, boot.
+// Autonomous roles: polecat, witness, refinery, deacon, boot, reviewer.
 // Interactive roles: mayor, crew (and anything else).
 //
 // This is the single source of truth for the autonomous/interactive
@@ -14,7 +14,7 @@ import "github.com/steveyegge/gastown/internal/constants"
 // cursor, etc.) and the runtime fallback logic.
 func IsAutonomousRole(role string) bool {
 	switch role {
-	case constants.RolePolecat, constants.RoleWitness, constants.RoleRefinery, constants.RoleDeacon, "boot":
+	case constants.RolePolecat, constants.RoleWitness, constants.RoleRefinery, constants.RoleDeacon, constants.RoleReviewer, "boot":
 		return true
 	default:
 		return false

@@ -117,8 +117,8 @@ func TestLoadRoleDefinition_UnknownRole(t *testing.T) {
 
 func TestAllRoles(t *testing.T) {
 	roles := AllRoles()
-	if len(roles) != 7 {
-		t.Errorf("AllRoles() returned %d roles, want 7", len(roles))
+	if len(roles) != 8 {
+		t.Errorf("AllRoles() returned %d roles, want 8", len(roles))
 	}
 
 	expected := map[string]bool{
@@ -129,6 +129,7 @@ func TestAllRoles(t *testing.T) {
 		"refinery": true,
 		"polecat":  true,
 		"crew":     true,
+		"reviewer": true,
 	}
 
 	for _, r := range roles {
@@ -155,10 +156,42 @@ func TestTownRoles(t *testing.T) {
 	}
 }
 
+func TestReviewerRoleDefinition(t *testing.T) {
+	def, err := loadBuiltinRoleDefinition("reviewer")
+	if err != nil {
+		t.Fatalf("loadBuiltinRoleDefinition(reviewer) error: %v", err)
+	}
+	if def.Role != "reviewer" {
+		t.Errorf("Role = %q, want reviewer", def.Role)
+	}
+	if def.Scope != "rig" {
+		t.Errorf("Scope = %q, want rig", def.Scope)
+	}
+	if def.PromptTemplate != "reviewer.md.tmpl" {
+		t.Errorf("PromptTemplate = %q, want reviewer.md.tmpl", def.PromptTemplate)
+	}
+	if def.Session.Pattern != "{prefix}-reviewer" {
+		t.Errorf("Session.Pattern = %q, want {prefix}-reviewer", def.Session.Pattern)
+	}
+	if !def.Session.NeedsPreSync {
+		t.Error("Session.NeedsPreSync = false, want true (worktree must fetch before checkout)")
+	}
+	if def.Env["GT_ROLE"] != "{rig}/reviewer" {
+		t.Errorf("Env[GT_ROLE] = %q, want {rig}/reviewer", def.Env["GT_ROLE"])
+	}
+}
+
+func TestReviewerRoleTheme(t *testing.T) {
+	themes := BuiltinRoleThemes()
+	if got := themes["reviewer"]; got != "forest" {
+		t.Errorf("BuiltinRoleThemes()[reviewer] = %q, want forest", got)
+	}
+}
+
 func TestRigRoles(t *testing.T) {
 	roles := RigRoles()
-	if len(roles) != 4 {
-		t.Errorf("RigRoles() returned %d roles, want 4", len(roles))
+	if len(roles) != 5 {
+		t.Errorf("RigRoles() returned %d roles, want 5", len(roles))
 	}
 
 	for _, r := range roles {

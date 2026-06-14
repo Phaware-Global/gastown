@@ -1509,6 +1509,84 @@ func (g *Git) GhPrComment(prNumber int, body string) error {
 	return nil
 }
 
+// CheckoutPRHeadDetached fetches the PR's head commit and checks it out in a
+// detached HEAD state in the working tree. When sha is non-empty the working
+// tree is detached at exactly that commit (the SHA the Reviewer was asked to
+// review); otherwise it detaches at the freshly fetched PR head. This is the
+// only sanctioned way the Reviewer touches git — it never creates a branch and
+// never pushes (P23-2376).
+func (g *Git) CheckoutPRHeadDetached(prNumber int, sha string) error {
+	if prNumber <= 0 {
+		return fmt.Errorf("checkout PR head: invalid PR number %d", prNumber)
+	}
+	ref := fmt.Sprintf("pull/%d/head", prNumber)
+	if _, err := g.run("fetch", "origin", ref); err != nil {
+		return fmt.Errorf("fetching %s: %w", ref, err)
+	}
+	target := "FETCH_HEAD"
+	if sha != "" {
+		target = sha
+	}
+	if _, err := g.run("-c", "advice.detachedHead=false", "checkout", "--detach", target); err != nil {
+		return fmt.Errorf("detached checkout of %s: %w", target, err)
+	}
+	return nil
+}
+
+// GhReviewComment is one inline review comment thread anchored to a file/line
+// on the RIGHT (post-change) side of the diff.
+type GhReviewComment struct {
+	Path string `json:"path"`
+	Line int    `json:"line"`
+	Side string `json:"side,omitempty"`
+	Body string `json:"body"`
+}
+
+// GhPrSubmitReview submits a single PR review via the GitHub API (one POST to
+// .../pulls/{n}/reviews), always with event=COMMENT — the Reviewer role never
+// approves or requests changes (P23-2376). body is the top-level summary;
+// comments are inline threads (each defaults to the RIGHT diff side); commitID,
+// when non-empty, anchors the review to a specific head SHA so it is
+// SHA-scoped for the refinery's engagement gate. The payload is passed on
+// stdin so an arbitrary number of comments submits atomically in one review.
+func (g *Git) GhPrSubmitReview(prNumber int, commitID, body string, comments []GhReviewComment) error {
+	if body == "" && len(comments) == 0 {
+		return fmt.Errorf("gh pr review: must have a summary body or at least one comment")
+	}
+	payload := map[string]any{"event": "COMMENT"}
+	if body != "" {
+		payload["body"] = body
+	}
+	if commitID != "" {
+		payload["commit_id"] = commitID
+	}
+	if len(comments) > 0 {
+		normalized := make([]GhReviewComment, len(comments))
+		for i, c := range comments {
+			if c.Side == "" {
+				c.Side = "RIGHT"
+			}
+			normalized[i] = c
+		}
+		payload["comments"] = normalized
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("gh pr review: marshaling payload: %w", err)
+	}
+	// {owner}/{repo} are resolved by gh from the repository in workDir.
+	cmd := exec.Command("gh", "api", "--method", "POST",
+		fmt.Sprintf("repos/{owner}/{repo}/pulls/%d/reviews", prNumber),
+		"--input", "-")
+	cmd.Dir = g.workDir
+	cmd.Stdin = bytes.NewReader(data)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("gh pr review (submit) failed: %s: %w",
+			strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
 // protectedBranchSet is the canonical list of branches the gt-pvx safety net
 // and checkpoint dog refuse to commit onto. main/master cover the
 // long-running default-branch convention; develop covers the gitflow style

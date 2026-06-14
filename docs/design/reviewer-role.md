@@ -1,6 +1,11 @@
 # Reviewer: Rig-Level Local Code Review Role
 
-**Status:** Design — implementation not started
+**Status:** In progress (P23-2376) — Phase 1 (role plumbing) + Phase 2 review
+posting (`gt reviewer post`/`checkout`/`perspectives`, `PRProvider.SubmitReview`,
+priority-badge parser widening) + the per-rig config surface (`review` block,
+`reviewer_local`, `reviewer_token_env`) landed. Remaining: Phase 2 dispatch
+(`gt reviewer request`/`done` + reviewer-worktree provisioning + session
+lifecycle), Phase 3 (refinery patrol wiring), Phase 4 (crew), Phase 5 (Telegraph).
 **Created:** 2026-06-10
 **Replaces:** Augment (GitHub-org review app) in the refinery PR review loop
 **Cross-references:** [refinery-pr-workflow.md](refinery-pr-workflow.md),

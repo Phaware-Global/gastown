@@ -250,6 +250,18 @@ type MergeQueueConfig struct {
 	// gate, just doesn't post. Default "augment review".
 	PRTriggerComment string `json:"pr_trigger_comment,omitempty"`
 
+	// ReviewerLocal dispatches the in-town Reviewer role instead of relying on
+	// an external review bot trigger comment. When true the request-review step
+	// runs `gt reviewer request` and await-review polls with --no-trigger.
+	// Requires a non-empty PRReviewer. (P23-2376.)
+	ReviewerLocal bool `json:"reviewer_local,omitempty"`
+
+	// ReviewerTokenEnv is the NAME of the env var holding the Reviewer
+	// machine-user's GitHub token, resolved fail-fast at dispatch. Empty
+	// defaults to "GT_REVIEWER_GITHUB_TOKEN". The value never touches disk or
+	// logs. (P23-2376.)
+	ReviewerTokenEnv string `json:"reviewer_token_env,omitempty"`
+
 	// Batch holds configuration for the batch-then-bisect merge queue.
 	// When nil or MaxBatchSize <= 1, batching is disabled and MRs process sequentially.
 	Batch *BatchConfig `json:"batch,omitempty"`
@@ -277,6 +289,16 @@ func (c *MergeQueueConfig) GetPRRequiredApprovals() int {
 		return 0
 	}
 	return 1
+}
+
+// GetReviewerTokenEnv returns the name of the environment variable holding the
+// Reviewer machine-user token, defaulting to "GT_REVIEWER_GITHUB_TOKEN". The
+// returned string is the env var NAME, never the secret value. (P23-2376.)
+func (c *MergeQueueConfig) GetReviewerTokenEnv() string {
+	if c.ReviewerTokenEnv == "" {
+		return "GT_REVIEWER_GITHUB_TOKEN"
+	}
+	return c.ReviewerTokenEnv
 }
 
 // DefaultMergeQueueConfig returns sensible defaults for merge queue configuration.
@@ -539,6 +561,8 @@ func (e *Engineer) LoadConfig() error {
 		PRReviewWait         *string                    `json:"pr_review_wait"`
 		PRReviewTimeout      *string                    `json:"pr_review_timeout"`
 		PRTriggerComment     *string                    `json:"pr_trigger_comment"`
+		ReviewerLocal        *bool                      `json:"reviewer_local"`
+		ReviewerTokenEnv     *string                    `json:"reviewer_token_env"`
 	}
 
 	if err := json.Unmarshal(mergeQueueRaw, &mqRaw); err != nil {
@@ -667,6 +691,12 @@ func (e *Engineer) LoadConfig() error {
 	if mqRaw.PRTriggerComment != nil {
 		e.config.PRTriggerComment = *mqRaw.PRTriggerComment
 	}
+	if mqRaw.ReviewerLocal != nil {
+		e.config.ReviewerLocal = *mqRaw.ReviewerLocal
+	}
+	if mqRaw.ReviewerTokenEnv != nil {
+		e.config.ReviewerTokenEnv = *mqRaw.ReviewerTokenEnv
+	}
 
 	// Validate PR-strategy invariants before any caller can observe the
 	// loaded config. This is a defense-in-depth check — the config package
@@ -714,6 +744,12 @@ func (e *Engineer) LoadConfig() error {
 		if e.config.PRReviewLoopMax < 0 {
 			return fmt.Errorf("pr_review_loop_max must be non-negative, got %d",
 				e.config.PRReviewLoopMax)
+		}
+		// reviewer_local needs the pr_reviewer login for the engagement gate.
+		// Mirror loader.go's write-time check on the runtime read path. (P23-2376.)
+		if e.config.ReviewerLocal && e.config.PRReviewer == "" {
+			return fmt.Errorf("reviewer_local=true requires a non-empty pr_reviewer " +
+				"(the reviewer bot login still drives the engagement gate)")
 		}
 		switch e.config.PRMergeMethod {
 		case "", "squash", "merge", "rebase":

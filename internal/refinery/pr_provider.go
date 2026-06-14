@@ -118,6 +118,34 @@ type PRProvider interface {
 	// force-push). Used by callers that need an authoritative SHA to
 	// pair with HasReviewFromOnSHA.
 	CurrentHeadSHA(prNumber int) (string, error)
+
+	// SubmitReview submits a single PR review (always event=COMMENT) with an
+	// optional top-level summary body and optional inline comment threads,
+	// anchored to in.CommitID when set. This is the sole sanctioned
+	// review-posting path for the in-town Reviewer role (P23-2376); raw
+	// `gh pr review` is tap-guard-blocked. Providers that cannot post reviews
+	// return ErrUnsupported.
+	SubmitReview(prNumber int, in SubmitReviewInput) error
+}
+
+// ReviewComment is one inline review comment thread anchored to a file and
+// line on the post-change (RIGHT) side of the diff.
+type ReviewComment struct {
+	Path string // repo-relative file path
+	Line int    // 1-based line number in the changed file
+	Body string // rendered comment body (priority badge + [perspective] tag + text)
+}
+
+// SubmitReviewInput is the payload for PRProvider.SubmitReview.
+type SubmitReviewInput struct {
+	// CommitID anchors the review to a specific head SHA so it is SHA-scoped
+	// for the refinery's engagement gate. Empty submits against the PR's
+	// current head as the provider sees it.
+	CommitID string
+	// Body is the top-level review summary (per-perspective verdicts + counts).
+	Body string
+	// Comments are the inline finding threads. May be empty (summary-only).
+	Comments []ReviewComment
 }
 
 // gitReviewThreadsToProvider converts the git package representation to the

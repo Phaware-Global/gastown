@@ -236,6 +236,28 @@ func validateRigSettings(c *RigSettings) error {
 			return err
 		}
 	}
+	if c.Review != nil {
+		if err := validateReviewConfig(c.Review); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateReviewConfig validates a ReviewConfig (P23-2376).
+func validateReviewConfig(c *ReviewConfig) error {
+	if c.MaxFindingsPerPerspective < 0 {
+		return fmt.Errorf("review.max_findings_per_perspective must be non-negative, got %d",
+			c.MaxFindingsPerPerspective)
+	}
+	if c.MaxRounds < 0 {
+		return fmt.Errorf("review.max_rounds must be non-negative, got %d", c.MaxRounds)
+	}
+	for i, p := range c.Perspectives {
+		if strings.TrimSpace(p) == "" {
+			return fmt.Errorf("review.perspectives[%d] must not be empty", i)
+		}
+	}
 	return nil
 }
 
@@ -321,6 +343,13 @@ func validateMergeQueueConfig(c *MergeQueueConfig) error {
 		}
 		if c.PRReviewLoopMax < 0 {
 			return fmt.Errorf("pr_review_loop_max must be non-negative, got %d", c.PRReviewLoopMax)
+		}
+		// reviewer_local dispatches the in-town Reviewer instead of an external
+		// bot, but the pr_reviewer login still drives the engagement gate, so it
+		// must be set. Fail fast at config time, not mid-queue. (P23-2376.)
+		if c.ReviewerLocal && c.PRReviewer == "" {
+			return fmt.Errorf("reviewer_local=true requires a non-empty pr_reviewer " +
+				"(the reviewer bot login still drives the engagement gate)")
 		}
 		switch c.PRMergeMethod {
 		case "", PRMergeMethodSquash, PRMergeMethodMerge, PRMergeMethodRebase:

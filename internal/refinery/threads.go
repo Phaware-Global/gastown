@@ -110,20 +110,32 @@ func VerifyReviewThreadsResolved(provider PRProvider, prNumber int, out io.Write
 }
 
 // parseThreadPriority extracts the priority tag embedded in reviewer-bot
-// thread bodies. Both gemini-code-assist and augmentcode inline a
+// thread bodies. Reviewer bots (and the in-town Reviewer role) inline a
 // priority shield at the top of the comment — e.g.:
 //
-//	![high](https://www.gstatic.com/codereviewagent/high-priority.svg)
-//	**Severity: medium**
+//	![high](https://www.gstatic.com/codereviewagent/high-priority.svg)   (legacy gemini gstatic)
+//	![high](https://img.shields.io/badge/priority-high-red.svg)          (shields.io, gt reviewer)
+//	**Severity: medium**                                                 (legacy augmentcode)
+//
+// The shield form is matched by `![<priority>]` plus a badge URL that
+// contains both "priority" and ".svg" — NOT the contiguous substring
+// "priority.svg", which only the legacy gstatic form satisfies. This
+// widening (P23-2376) lets the neutral shields.io badge emitted by
+// `gt reviewer post` parse while keeping the legacy gstatic and augmentcode
+// forms accepted so interim external bots coexist during migration.
 //
 // Returns "high", "medium", "low", or "" (unknown / absent). Case
 // is normalized to lowercase.
 func parseThreadPriority(body string) string {
 	lower := strings.ToLower(body)
-	// gemini-code-assist shield form
-	for _, p := range []string{"high", "medium", "low"} {
-		if strings.Contains(lower, "priority.svg") && strings.Contains(lower, "!["+p+"]") {
-			return p
+	// Shield form: ![<priority>] anchored to a badge URL containing
+	// "priority" and ".svg" (covers both gstatic and shields.io URLs).
+	hasShieldURL := strings.Contains(lower, "priority") && strings.Contains(lower, ".svg")
+	if hasShieldURL {
+		for _, p := range []string{"high", "medium", "low"} {
+			if strings.Contains(lower, "!["+p+"]") {
+				return p
+			}
 		}
 	}
 	// augmentcode severity form
@@ -133,6 +145,28 @@ func parseThreadPriority(body string) string {
 		}
 	}
 	return ""
+}
+
+// priorityBadgeColor maps a priority to its shields.io badge color.
+var priorityBadgeColor = map[string]string{
+	"high":   "red",
+	"medium": "orange",
+	"low":    "yellow",
+}
+
+// PriorityBadge renders the neutral shields.io priority badge that the in-town
+// Reviewer prepends to each finding (P23-2376). It is the emitter half of the
+// emitter/parser pair: every badge it produces is recognized by
+// parseThreadPriority, and the two share test fixtures so the contract can't
+// drift. priority must be "high", "medium", or "low"; any other value yields
+// an empty string (no badge).
+func PriorityBadge(priority string) string {
+	p := strings.ToLower(strings.TrimSpace(priority))
+	color, ok := priorityBadgeColor[p]
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("![%s](https://img.shields.io/badge/priority-%s-%s.svg)", p, p, color)
 }
 
 // isSeverityHeaderLine reports whether trimmedLine is solely an

@@ -106,3 +106,7 @@ func (p *bitbucketPRProvider) HasReviewFromOnSHA(prNumber int, user, sha string)
 func (p *bitbucketPRProvider) CurrentHeadSHA(prNumber int) (string, error) {
 	return "", ErrUnsupported
 }
+
+func (p *bitbucketPRProvider) SubmitReview(prNumber int, in SubmitReviewInput) error {
+	return ErrUnsupported
+}
