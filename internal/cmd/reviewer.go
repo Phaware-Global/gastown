@@ -5,11 +5,16 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/reviewer"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -20,6 +25,12 @@ var (
 	reviewerPostSHA         string
 	reviewerCheckoutSHA     string
 	reviewerPerspectiveShow string
+
+	reviewerRequestMR     string
+	reviewerRequestBranch string
+	reviewerRequestSHA    string
+	reviewerRequestRound  int
+	reviewerRequestOrigin string
 )
 
 var reviewerCmd = &cobra.Command{
@@ -78,6 +89,33 @@ upstream HEAD has moved.`,
 	RunE: runReviewerCheckout,
 }
 
+var reviewerRequestCmd = &cobra.Command{
+	Use:   "request <pr>",
+	Short: "Dispatch a review of a PR to the rig's Reviewer (bead + session)",
+	Long: `Dispatch a code review of a PR to the rig's on-demand Reviewer.
+
+Resolves the machine-user token from merge_queue.reviewer_token_env (fail-fast
+if unset), assembles a review-request mail carrying the PR number, head SHA,
+branch, round, and origin (refinery when --mr is given, else crew), sends it to
+<rig>/reviewer, and starts the reviewer session if one isn't already running
+(idempotent — a second request queues in the running session's mailbox).
+
+On round >= 2 the prior round's unresolved review threads are fetched and
+embedded so the Reviewer has the fix-loop context without gathering it itself.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runReviewerRequest,
+}
+
+var reviewerDoneCmd = &cobra.Command{
+	Use:   "done",
+	Short: "Clear reviewer state and self-terminate the session",
+	Long: `Signal the review is complete and self-terminate the reviewer session.
+
+Run from inside the reviewer session after posting the review. The session is
+killed after a short delay so the command can report success first.`,
+	RunE: runReviewerDone,
+}
+
 var reviewerPerspectivesCmd = &cobra.Command{
 	Use:   "perspectives",
 	Short: "List the rig's enabled review perspectives and where each resolves",
@@ -105,9 +143,20 @@ func init() {
 	reviewerPerspectivesCmd.Flags().StringVar(&reviewerPerspectiveShow, "show", "",
 		"print the resolved prompt content for a single perspective")
 
+	reviewerRequestCmd.Flags().StringVar(&reviewerRequestMR, "mr", "",
+		"MR bead ID (refinery origin); omit for a standalone/crew request")
+	reviewerRequestCmd.Flags().StringVar(&reviewerRequestBranch, "branch", "", "PR head branch (optional)")
+	reviewerRequestCmd.Flags().StringVar(&reviewerRequestSHA, "sha", "",
+		"PR head SHA to review (default: the PR's current head)")
+	reviewerRequestCmd.Flags().IntVar(&reviewerRequestRound, "round", 1, "review round number (>=2 embeds prior threads)")
+	reviewerRequestCmd.Flags().StringVar(&reviewerRequestOrigin, "origin", "",
+		"request origin: refinery|crew (default: refinery when --mr is set, else crew)")
+
 	reviewerCmd.AddCommand(reviewerPostCmd)
 	reviewerCmd.AddCommand(reviewerCheckoutCmd)
 	reviewerCmd.AddCommand(reviewerPerspectivesCmd)
+	reviewerCmd.AddCommand(reviewerRequestCmd)
+	reviewerCmd.AddCommand(reviewerDoneCmd)
 
 	rootCmd.AddCommand(reviewerCmd)
 }
@@ -276,6 +325,129 @@ func runReviewerPerspectives(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  - %-14s [skipped: not found]\n", s)
 	}
 	return nil
+}
+
+func runReviewerRequest(cmd *cobra.Command, args []string) error {
+	prNumber, err := parsePRNumber(args[0])
+	if err != nil {
+		return err
+	}
+
+	provider, cfg, r, err := getRefineryPRContext()
+	if err != nil {
+		return err
+	}
+
+	// Fail fast if the machine-user token isn't present in the dispatcher's
+	// environment — the value never touches disk; config holds only the name.
+	tokenEnv := cfg.GetReviewerTokenEnv()
+	tokenVal := os.Getenv(tokenEnv)
+	if tokenVal == "" {
+		return fmt.Errorf("reviewer token env %q is not set — add `export %s=…` to "+
+			"settings/daemon.env and restart the daemon", tokenEnv, tokenEnv)
+	}
+
+	sha := reviewerRequestSHA
+	if sha == "" {
+		if head, herr := provider.CurrentHeadSHA(prNumber); herr == nil {
+			sha = head
+		}
+	}
+
+	origin := reviewer.DefaultOrigin(reviewerRequestOrigin, reviewerRequestMR)
+	spec := reviewer.RequestSpec{
+		PR:      prNumber,
+		HeadSHA: sha,
+		Branch:  reviewerRequestBranch,
+		Round:   reviewerRequestRound,
+		Origin:  origin,
+		MRID:    reviewerRequestMR,
+	}
+
+	// On a re-review, embed the prior round's unresolved threads so the
+	// Reviewer gets fix-loop context deterministically (best-effort).
+	priorThreads := ""
+	if spec.Round >= 2 {
+		if threads, terr := provider.UnresolvedThreads(prNumber); terr == nil {
+			var pb strings.Builder
+			for _, th := range threads {
+				fmt.Fprintf(&pb, "- %s:%d [%s] %s\n", th.Path, th.Line, th.Author, firstLineOf(th.Body))
+			}
+			priorThreads = pb.String()
+		}
+	}
+
+	townRoot := filepath.Dir(r.Path)
+	from := fmt.Sprintf("%s/refinery", r.Name)
+	if origin == reviewer.OriginCrew {
+		from = fmt.Sprintf("%s/crew", r.Name)
+	}
+	to := fmt.Sprintf("%s/reviewer", r.Name)
+
+	router := mail.NewRouterWithTownRoot(townRoot, townRoot)
+	defer router.WaitPendingNotifications()
+	msg := mail.NewMessage(from, to, spec.Subject(), spec.Body(priorThreads))
+	msg.Type = mail.TypeTask
+	if err := router.Send(msg); err != nil {
+		return fmt.Errorf("sending review request to %s: %w", to, err)
+	}
+
+	// Start the reviewer session if not already running, injecting the token as
+	// GH_TOKEN/GITHUB_TOKEN. Idempotent: a running session drains the new mail.
+	mgr := reviewer.NewManager(r)
+	if serr := mgr.EnsureRunning("", map[string]string{"GH_TOKEN": tokenVal, "GITHUB_TOKEN": tokenVal}); serr != nil {
+		// The request mail persists; await-review's timeout is the safety net.
+		fmt.Fprintf(os.Stderr, "warning: review request mailed but reviewer session did not start: %v\n", serr)
+	}
+
+	fmt.Printf("Dispatched review of PR #%d (round %d, origin %s) → %s\n", prNumber, spec.Round, origin, to)
+	return nil
+}
+
+func runReviewerDone(cmd *cobra.Command, args []string) error {
+	cwd, err := requireReviewerWorktree()
+	if err != nil {
+		return err
+	}
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return err
+	}
+	rigName := detectRole(cwd, townRoot).Rig
+	if rigName == "" {
+		return fmt.Errorf("could not determine rig from %s", cwd)
+	}
+	_, r, err := getRig(rigName)
+	if err != nil {
+		return err
+	}
+
+	// Self-terminate the session after a short delay so this command reports
+	// success before the agent is killed (mirrors `gt dog done`).
+	sessionID := reviewer.NewManager(r).SessionName()
+	t := tmux.NewTmux()
+	_ = t.SetRemainOnExit(sessionID, false)
+	go func() {
+		time.Sleep(3 * time.Second)
+		_ = t.KillSession(sessionID)
+	}()
+	fmt.Printf("Reviewer done — session %s will terminate shortly.\n", sessionID)
+	time.Sleep(4 * time.Second)
+	return nil
+}
+
+// firstLineOf returns the first non-empty line of s, trimmed, for compact
+// prior-thread summaries.
+func firstLineOf(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if t := strings.TrimSpace(line); t != "" {
+			if len(t) > 120 {
+				return t[:120]
+			}
+			return t
+		}
+	}
+	return ""
 }
 
 // readFindingsInput reads the findings payload from a file path or stdin ("-").

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -658,6 +659,28 @@ func awaitReviewInner(args []string) error {
 		return fmt.Errorf("await-review: fetching current head SHA: %w", sErr)
 	}
 
+	// Local reviewer dispatch (P23-2376): when merge_queue.reviewer_local is set,
+	// the in-town Reviewer produces the review instead of an external bot. At the
+	// trigger-posting moment — the first call for a round, or a drift-reset after
+	// a fix landed at a new SHA — dispatch a review request; await-review then
+	// polls with no trigger comment. "Once per round" falls out of the same
+	// StartedAt/SHA-drift gate that governs trigger posting, so the patrol formula
+	// needs no change and the exit-code contract is untouched.
+	if cfg.ReviewerLocal {
+		triggerComment = "" // local dispatch never posts a PR comment
+		driftReset := beadState.CommitSHA != "" && headSHA != "" &&
+			!strings.EqualFold(beadState.CommitSHA, headSHA)
+		if beadState.StartedAt.IsZero() || driftReset {
+			round := 1
+			if !beadState.StartedAt.IsZero() {
+				round = 2 // a re-review after a fix round
+			}
+			if derr := dispatchLocalReviewer(prNumber, refPrAwaitMR, headSHA, round); derr != nil {
+				return fmt.Errorf("await-review: dispatching local reviewer: %w", derr)
+			}
+		}
+	}
+
 	res, err := refinery.AwaitReviewStep(provider, prNumber, refinery.AwaitReviewStepInput{
 		Reviewer:       reviewer,
 		TriggerComment: triggerComment,
@@ -708,6 +731,25 @@ func awaitReviewInner(args []string) error {
 	default:
 		return fmt.Errorf("await-review: unrecognized status %d", res.Status)
 	}
+}
+
+// dispatchLocalReviewer runs `gt reviewer request` to dispatch the in-town
+// Reviewer for a PR (P23-2376). Exec'ing the positive-half command keeps the
+// bead+mail+session-start and token-env resolution in one place. A non-nil
+// error (e.g. the reviewer token env unset) propagates out of await-review as
+// an operational error so the misconfiguration surfaces immediately.
+func dispatchLocalReviewer(prNumber int, mrID, headSHA string, round int) error {
+	cmdArgs := []string{"reviewer", "request", strconv.Itoa(prNumber),
+		"--round", strconv.Itoa(round), "--origin", "refinery"}
+	if mrID != "" {
+		cmdArgs = append(cmdArgs, "--mr", mrID)
+	}
+	if headSHA != "" {
+		cmdArgs = append(cmdArgs, "--sha", headSHA)
+	}
+	c := exec.Command("gt", cmdArgs...)
+	c.Stdout, c.Stderr = os.Stdout, os.Stderr
+	return c.Run()
 }
 
 // awaitReviewBeadState bundles the await-review fields the patrol loop
