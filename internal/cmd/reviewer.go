@@ -683,6 +683,11 @@ func readOptionalInput(path string) (string, error) {
 		return "", nil
 	}
 	if path == "-" {
+		// Guard against an unexplained hang when "-" is passed but stdin is an
+		// interactive terminal rather than a pipe.
+		if stat, statErr := os.Stdin.Stat(); statErr == nil && (stat.Mode()&os.ModeCharDevice) != 0 {
+			return "", fmt.Errorf("stdin is a terminal; pipe input or pass a file path instead of \"-\"")
+		}
 		data, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return "", err

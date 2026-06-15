@@ -41,12 +41,13 @@ func ParsePerspectiveResult(data []byte) (*PerspectiveResult, error) {
 	}
 	for i := range r.Findings {
 		// The execution contract requires every finding's perspective to match
-		// the pass. Fill it when empty; reject a mismatch rather than silently
-		// misattribute the finding (or union an unexpected tag at consolidation).
+		// the pass. Canonicalize to the pass perspective when empty OR a
+		// case-variant (so downstream tags never differ only by casing); reject a
+		// genuine mismatch rather than silently misattribute the finding.
 		fp := strings.TrimSpace(r.Findings[i].Perspective)
-		if fp == "" {
+		if fp == "" || strings.EqualFold(fp, r.Perspective) {
 			r.Findings[i].Perspective = r.Perspective
-		} else if !strings.EqualFold(fp, r.Perspective) {
+		} else {
 			return nil, fmt.Errorf("perspective result (%s): finding[%d] perspective %q "+
 				"does not match the pass perspective", r.Perspective, i, fp)
 		}
@@ -84,8 +85,13 @@ func mergeText(existing, add string) string {
 	if strings.TrimSpace(existing) == "" {
 		return add
 	}
-	if strings.Contains(existing, add) {
-		return existing
+	// Compare against whole \n\n-separated blocks, not a raw substring search:
+	// a distinct shorter explanation must not be swallowed just because it
+	// happens to be a substring of a longer block from another perspective.
+	for _, b := range strings.Split(existing, "\n\n") {
+		if strings.TrimSpace(b) == add {
+			return existing
+		}
 	}
 	return existing + "\n\n" + add
 }
@@ -99,10 +105,16 @@ func mergePerspectives(existing, add string) string {
 	for _, src := range []string{existing, add} {
 		for _, p := range strings.Split(src, ",") {
 			p = strings.TrimSpace(p)
-			if p == "" || seen[p] {
+			if p == "" {
 				continue
 			}
-			seen[p] = true
+			// Dedup case-insensitively (preserving the first tag's casing) so
+			// "adversarial" and "Adversarial" don't both appear.
+			lowered := strings.ToLower(p)
+			if seen[lowered] {
+				continue
+			}
+			seen[lowered] = true
 			parts = append(parts, p)
 		}
 	}

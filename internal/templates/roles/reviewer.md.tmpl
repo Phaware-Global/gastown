@@ -90,7 +90,7 @@ Read the request bead/mail to extract `<pr>`, the recorded head `<sha>`, and the
    silence.
 
 6. **Consolidate** all per-perspective results into one findings payload. This
-   deduplicates overlapping findings (same `file:line`) deterministically and
+   deduplicates overlapping findings (same `file:line` and title) deterministically and
    builds a summary that accounts for every perspective's verdict:
    ```bash
    {{ cmd }} reviewer consolidate perspective-*.json --sha <sha> --out findings.json

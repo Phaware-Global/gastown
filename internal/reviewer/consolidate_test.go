@@ -120,6 +120,38 @@ func TestConsolidate_MergesDifferingBodiesAndSuggestions(t *testing.T) {
 	}
 }
 
+func TestMergeText_KeepsDistinctSubstringBlock(t *testing.T) {
+	// "err" is a substring of the existing block but a distinct explanation;
+	// block-wise comparison must keep it rather than swallow it.
+	got := mergeText("the caller dereferences a nil err value", "err")
+	if !strings.Contains(got, "\n\nerr") {
+		t.Errorf("distinct substring block was swallowed: %q", got)
+	}
+	// An exact block repeat is not duplicated.
+	same := mergeText("alpha\n\nbeta", "beta")
+	if same != "alpha\n\nbeta" {
+		t.Errorf("exact block should not be re-appended: %q", same)
+	}
+}
+
+func TestMergePerspectives_CaseInsensitiveDedup(t *testing.T) {
+	got := mergePerspectives("adversarial", "Adversarial")
+	if got != "adversarial" {
+		t.Errorf("case-variant tag not deduped: %q", got)
+	}
+}
+
+func TestParsePerspectiveResult_CanonicalizesCaseVariantPerspective(t *testing.T) {
+	in := []byte(`{"perspective":"security","verdict":"ok","findings":[{"path":"a.go","line":1,"title":"t","perspective":"Security"}]}`)
+	r, err := ParsePerspectiveResult(in)
+	if err != nil {
+		t.Fatalf("case-variant perspective should be accepted: %v", err)
+	}
+	if r.Findings[0].Perspective != "security" {
+		t.Errorf("finding perspective not canonicalized: %q", r.Findings[0].Perspective)
+	}
+}
+
 func TestConsolidate_RoundTripsThroughParseFindings(t *testing.T) {
 	results := []PerspectiveResult{
 		{Perspective: "adversarial", Verdict: "v", Findings: []Finding{
