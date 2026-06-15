@@ -51,17 +51,41 @@ func ResolvePerspective(townRoot, rigPath, name string) (ResolvedPerspective, er
 	if name == "" {
 		return ResolvedPerspective{}, fmt.Errorf("perspective name must not be empty")
 	}
-	if rigPath != "" {
-		p := perspectiveRelPath(rigPath, name)
-		if data, err := os.ReadFile(p); err == nil {
-			return ResolvedPerspective{Name: name, Source: PerspectiveSourceRig, Path: p, Content: string(data)}, nil
-		}
+	// Reject path-traversal / separator characters before the name is ever
+	// joined into a filesystem path. Perspective names come from rig config
+	// (and, in later phases, possibly attacker-influenced sources), so a name
+	// like "../../etc/passwd" must not escape the perspectives directory.
+	if strings.Contains(name, "..") || strings.ContainsAny(name, `/\`) {
+		return ResolvedPerspective{}, fmt.Errorf(
+			"invalid perspective name %q: must not contain path separators or %q", name, "..")
 	}
-	if townRoot != "" {
-		p := perspectiveRelPath(townRoot, name)
-		if data, err := os.ReadFile(p); err == nil {
-			return ResolvedPerspective{Name: name, Source: PerspectiveSourceTown, Path: p, Content: string(data)}, nil
+	// readTier reads a perspective file from a rig/town root, distinguishing
+	// "file absent here, try the next tier" (nil data, nil err) from a real I/O
+	// error (permission denied, disk error) which must surface rather than be
+	// silently swallowed as a fallback.
+	readTier := func(root string, src PerspectiveSource) (*ResolvedPerspective, error) {
+		if root == "" {
+			return nil, nil
 		}
+		p := perspectiveRelPath(root, name)
+		data, err := os.ReadFile(p)
+		if err == nil {
+			return &ResolvedPerspective{Name: name, Source: src, Path: p, Content: string(data)}, nil
+		}
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("reading %s perspective %s: %w", src, p, err)
+		}
+		return nil, nil
+	}
+	if rp, err := readTier(rigPath, PerspectiveSourceRig); err != nil {
+		return ResolvedPerspective{}, err
+	} else if rp != nil {
+		return *rp, nil
+	}
+	if rp, err := readTier(townRoot, PerspectiveSourceTown); err != nil {
+		return ResolvedPerspective{}, err
+	} else if rp != nil {
+		return *rp, nil
 	}
 	if data, err := defaultPerspectivesFS.ReadFile("perspectives/" + name + ".md"); err == nil {
 		return ResolvedPerspective{

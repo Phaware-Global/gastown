@@ -76,6 +76,38 @@ func TestResolvePerspective_UnknownErrors(t *testing.T) {
 	}
 }
 
+func TestResolvePerspective_RejectsPathTraversal(t *testing.T) {
+	town := t.TempDir()
+	rig := t.TempDir()
+	for _, name := range []string{
+		"../../etc/passwd",
+		"..",
+		"foo/bar",
+		`foo\bar`,
+		"../adversarial",
+		"sub/../adversarial",
+	} {
+		if _, err := ResolvePerspective(town, rig, name); err == nil {
+			t.Errorf("ResolvePerspective(%q) should reject path-traversal name", name)
+		}
+	}
+}
+
+func TestResolvePerspective_SurfacesRealReadErrors(t *testing.T) {
+	rig := t.TempDir()
+	// Create the perspective path as a DIRECTORY so os.ReadFile fails with a
+	// non-IsNotExist error; ResolvePerspective must surface it rather than
+	// silently falling through to the built-in default.
+	dir := filepath.Join(rig, "settings", "review", "perspectives", "adversarial.md")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	_, err := ResolvePerspective("", rig, "adversarial")
+	if err == nil {
+		t.Fatal("expected a real read error to surface, got nil (silently fell through)")
+	}
+}
+
 func TestResolvePerspectives_FailSilent(t *testing.T) {
 	// Strict: unknown is a hard error.
 	if _, _, err := ResolvePerspectives("", "", []string{"adversarial", "nope"}, false); err == nil {

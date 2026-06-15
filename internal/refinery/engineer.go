@@ -291,12 +291,19 @@ func (c *MergeQueueConfig) GetPRRequiredApprovals() int {
 	return 1
 }
 
+// DefaultReviewerTokenEnv is the default name of the environment variable
+// holding the Reviewer machine-user token. It MUST stay in sync with
+// config.DefaultReviewerTokenEnv; the two cannot share one constant because
+// the refinery package cannot import config (the duplicated MergeQueueConfig
+// here exists precisely to avoid that import cycle). (P23-2376.)
+const DefaultReviewerTokenEnv = "GT_REVIEWER_GITHUB_TOKEN"
+
 // GetReviewerTokenEnv returns the name of the environment variable holding the
-// Reviewer machine-user token, defaulting to "GT_REVIEWER_GITHUB_TOKEN". The
+// Reviewer machine-user token, defaulting to DefaultReviewerTokenEnv. The
 // returned string is the env var NAME, never the secret value. (P23-2376.)
 func (c *MergeQueueConfig) GetReviewerTokenEnv() string {
 	if c.ReviewerTokenEnv == "" {
-		return "GT_REVIEWER_GITHUB_TOKEN"
+		return DefaultReviewerTokenEnv
 	}
 	return c.ReviewerTokenEnv
 }
@@ -365,7 +372,6 @@ type MRAnomaly struct {
 	Detail   string        `json:"detail"`
 }
 
-
 // errMergeSlotTimeout is returned by acquireMainPushSlot when retries are
 // exhausted due to slot contention. Infrastructure errors (beads down,
 // permission errors) return a different error so callers can distinguish
@@ -384,7 +390,7 @@ type Engineer struct {
 	beads                 *beads.Beads
 	git                   *git.Git
 	config                *MergeQueueConfig
-	prProvider            PRProvider   // VCS-specific PR operations (nil when MergeStrategy != "pr")
+	prProvider            PRProvider // VCS-specific PR operations (nil when MergeStrategy != "pr")
 	workDir               string
 	output                io.Writer    // Output destination for user-facing messages
 	router                *mail.Router // Mail router for sending protocol messages
@@ -538,31 +544,31 @@ func (e *Engineer) LoadConfig() error {
 	// Parse merge_queue section into our config struct
 	// We need special handling for poll_interval (string -> Duration)
 	var mqRaw struct {
-		Enabled              *bool                      `json:"enabled"`
-		OnConflict           *string                    `json:"on_conflict"`
-		RunTests             *bool                      `json:"run_tests"`
-		TestCommand          *string                    `json:"test_command"`
-		DeleteMergedBranches *bool                      `json:"delete_merged_branches"`
-		RetryFlakyTests      *int                       `json:"retry_flaky_tests"`
-		PollInterval         *string                    `json:"poll_interval"`
-		MaxConcurrent        *int                       `json:"max_concurrent"`
-		StaleClaimTimeout    *string                    `json:"stale_claim_timeout"`
-		Gates                map[string]*gateConfigRaw  `json:"gates"`
-		GatesParallel        *bool                      `json:"gates_parallel"`
-		AutoPush             *bool                      `json:"auto_push"`
-		MergeStrategy        *string                    `json:"merge_strategy"`
-		VCSProvider          *string                    `json:"vcs_provider"`
-		RequireReview        *bool                      `json:"require_review"`
-		PRReviewer           *string                    `json:"pr_reviewer"`
-		PRApprover           *string                    `json:"pr_approver"`
-		PRRequiredApprovals  *int                       `json:"pr_required_approvals"`
-		PRReviewLoopMax      *int                       `json:"pr_review_loop_max"`
-		PRMergeMethod        *string                    `json:"pr_merge_method"`
-		PRReviewWait         *string                    `json:"pr_review_wait"`
-		PRReviewTimeout      *string                    `json:"pr_review_timeout"`
-		PRTriggerComment     *string                    `json:"pr_trigger_comment"`
-		ReviewerLocal        *bool                      `json:"reviewer_local"`
-		ReviewerTokenEnv     *string                    `json:"reviewer_token_env"`
+		Enabled              *bool                     `json:"enabled"`
+		OnConflict           *string                   `json:"on_conflict"`
+		RunTests             *bool                     `json:"run_tests"`
+		TestCommand          *string                   `json:"test_command"`
+		DeleteMergedBranches *bool                     `json:"delete_merged_branches"`
+		RetryFlakyTests      *int                      `json:"retry_flaky_tests"`
+		PollInterval         *string                   `json:"poll_interval"`
+		MaxConcurrent        *int                      `json:"max_concurrent"`
+		StaleClaimTimeout    *string                   `json:"stale_claim_timeout"`
+		Gates                map[string]*gateConfigRaw `json:"gates"`
+		GatesParallel        *bool                     `json:"gates_parallel"`
+		AutoPush             *bool                     `json:"auto_push"`
+		MergeStrategy        *string                   `json:"merge_strategy"`
+		VCSProvider          *string                   `json:"vcs_provider"`
+		RequireReview        *bool                     `json:"require_review"`
+		PRReviewer           *string                   `json:"pr_reviewer"`
+		PRApprover           *string                   `json:"pr_approver"`
+		PRRequiredApprovals  *int                      `json:"pr_required_approvals"`
+		PRReviewLoopMax      *int                      `json:"pr_review_loop_max"`
+		PRMergeMethod        *string                   `json:"pr_merge_method"`
+		PRReviewWait         *string                   `json:"pr_review_wait"`
+		PRReviewTimeout      *string                   `json:"pr_review_timeout"`
+		PRTriggerComment     *string                   `json:"pr_trigger_comment"`
+		ReviewerLocal        *bool                     `json:"reviewer_local"`
+		ReviewerTokenEnv     *string                   `json:"reviewer_token_env"`
 	}
 
 	if err := json.Unmarshal(mergeQueueRaw, &mqRaw); err != nil {
@@ -1236,7 +1242,6 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
 		MergeCommit: mergeCommit,
 	}
 }
-
 
 func (e *Engineer) acquireMainPushSlot(ctx context.Context) (string, error) {
 	slotID, err := e.mergeSlotEnsureExists()

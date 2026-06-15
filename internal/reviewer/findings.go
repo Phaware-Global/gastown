@@ -7,6 +7,7 @@
 package reviewer
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -48,7 +49,7 @@ var validPriorities = map[string]bool{"high": true, "medium": true, "low": true}
 // positive line, and a title.
 func ParseFindings(data []byte) (*Findings, error) {
 	var fs Findings
-	dec := json.NewDecoder(strings.NewReader(string(data)))
+	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&fs); err != nil {
 		return nil, fmt.Errorf("parsing findings JSON: %w", err)

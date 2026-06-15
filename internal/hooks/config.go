@@ -363,6 +363,19 @@ func DefaultOverrides() map[string]*HooksConfig {
 					}},
 				},
 				{
+					// Defense-in-depth: `gh pr review` is sugar over the
+					// POST .../pulls/{n}/reviews API; block the raw `gh api`
+					// path too so a prompt-injected session can't bypass the
+					// `gt reviewer post` contract by hand-rolling the request.
+					// (gt reviewer post calls this API from Go, not the Bash
+					// tool, so it is unaffected.)
+					Matcher: "Bash(*gh api*pulls*reviews*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviewer posts reviews only via `gt reviewer post`. Raw `gh api .../pulls/N/reviews` bypasses the tested output contract.' && exit 2",
+					}},
+				},
+				{
 					Matcher: "Bash(*gh pr merge*)",
 					Hooks: []Hook{{
 						Type:    "command",

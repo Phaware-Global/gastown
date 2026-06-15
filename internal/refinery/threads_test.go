@@ -239,6 +239,20 @@ func TestParseThreadPriority(t *testing.T) {
 			"This is a high priority fix",
 			"",
 		},
+		{
+			// False-positive guard: ![high] alt-text whose image URL is NOT a
+			// priority badge, plus the words "priority" and ".svg" elsewhere in
+			// prose. The tightened parser must require priority+.svg inside the
+			// image URL, so this is not a priority finding.
+			"badge alt-text but non-badge URL + stray priority/.svg in prose",
+			"![high](https://example.com/icon.png)\nsee the priority docs and the foo.svg diagram",
+			"",
+		},
+		{
+			"priority.svg in prose but image URL unrelated",
+			"the priority.svg file is referenced ![high](https://example.com/x.png)",
+			"",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

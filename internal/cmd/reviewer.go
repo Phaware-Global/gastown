@@ -164,9 +164,17 @@ func runReviewerCheckout(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolving working directory: %w", err)
 	}
 	// The checkout happens in the reviewer worktree (the current directory),
-	// not the refinery worktree, so gh/git resolve the right tree.
-	if _, err := workspace.FindFromCwdOrError(); err != nil {
+	// not the refinery worktree, so gh/git resolve the right tree. Refuse to
+	// run anywhere else: a detached checkout is destructive to the working
+	// tree, so an operator (or a confused agent) running this in an arbitrary
+	// repo must fail fast rather than silently reset HEAD there.
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+	if info := detectRole(cwd, townRoot); info.Role != RoleReviewer {
+		return fmt.Errorf("gt reviewer checkout must run in a reviewer worktree "+
+			"(<rig>/reviewer/rig); current directory resolves to role %q", info.Role)
 	}
 
 	g := git.NewGit(cwd)

@@ -128,14 +128,31 @@ func VerifyReviewThreadsResolved(provider PRProvider, prNumber int, out io.Write
 // is normalized to lowercase.
 func parseThreadPriority(body string) string {
 	lower := strings.ToLower(body)
-	// Shield form: ![<priority>] anchored to a badge URL containing
-	// "priority" and ".svg" (covers both gstatic and shields.io URLs).
-	hasShieldURL := strings.Contains(lower, "priority") && strings.Contains(lower, ".svg")
-	if hasShieldURL {
-		for _, p := range []string{"high", "medium", "low"} {
-			if strings.Contains(lower, "!["+p+"]") {
+	// Shield form: a markdown image `![<priority>](<url>)` whose URL contains
+	// both "priority" and ".svg". Anchoring the check to the URL inside the
+	// image syntax (rather than scanning the whole body for the three
+	// substrings independently) avoids false positives where a body merely
+	// mentions a priority word, has a "![high]" alt-text snippet, and contains
+	// an unrelated ".svg" somewhere. Covers the gstatic, shields.io, and
+	// gt-reviewer badge URLs.
+	for _, p := range []string{"high", "medium", "low"} {
+		marker := "![" + p + "]("
+		rest := lower
+		for {
+			idx := strings.Index(rest, marker)
+			if idx == -1 {
+				break
+			}
+			rest = rest[idx+len(marker):]
+			closeIdx := strings.IndexByte(rest, ')')
+			if closeIdx == -1 {
+				break
+			}
+			url := rest[:closeIdx]
+			if strings.Contains(url, "priority") && strings.Contains(url, ".svg") {
 				return p
 			}
+			rest = rest[closeIdx+1:]
 		}
 	}
 	// augmentcode severity form
