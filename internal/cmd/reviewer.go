@@ -353,6 +353,14 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 			sha = head
 		}
 	}
+	// The Reviewer must review a specific commit: it anchors the posted review
+	// (GitHub requires commit_id with inline comments) and the refinery's
+	// SHA-scoped engagement gate keys on it. Refuse to dispatch a request with
+	// no SHA rather than mail one the Reviewer can't act on reliably.
+	if sha == "" {
+		return fmt.Errorf("could not resolve a head SHA for PR #%d to anchor the review "+
+			"(pass --sha)", prNumber)
+	}
 
 	origin := reviewer.DefaultOrigin(reviewerRequestOrigin, reviewerRequestMR)
 	spec := reviewer.RequestSpec{
@@ -441,8 +449,10 @@ func runReviewerDone(cmd *cobra.Command, args []string) error {
 func firstLineOf(s string) string {
 	for _, line := range strings.Split(s, "\n") {
 		if t := strings.TrimSpace(line); t != "" {
-			if len(t) > 120 {
-				return t[:120]
+			// Truncate on runes, not bytes, so a multi-byte character is never
+			// split into invalid UTF-8.
+			if r := []rune(t); len(r) > 120 {
+				return string(r[:120])
 			}
 			return t
 		}

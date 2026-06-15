@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/steveyegge/gastown/internal/config"
@@ -207,47 +208,61 @@ func (m *Manager) Start(agentOverride string, extraEnv map[string]string) error 
 	return nil
 }
 
-// ensureWorktree returns the reviewer worktree path, provisioning it from the
-// shared bare repo (.repo.git) if it does not yet exist. For rigs that use a
-// standard .git clone (no bare repo) it falls back to the refinery worktree, or
-// finally mayor/rig — the same resolution order the Refinery uses.
+// ensureWorktree returns the reviewer worktree path, provisioning a dedicated
+// <rig>/reviewer/rig worktree if it does not yet exist.
+//
+// The Reviewer does DESTRUCTIVE detached checkouts (`gt reviewer checkout`), so
+// it must NEVER share another agent's working tree — running its checkout in
+// the refinery's or mayor's worktree would mutate their HEAD under their feet
+// and would also fail the requireReviewerWorktree guard. So instead of falling
+// back to a shared worktree, this always adds its OWN linked worktree off the
+// shared object store: from the bare repo (.repo.git) when present, else from
+// an existing worktree (mayor/rig or refinery/rig) used only as the source repo
+// to run `git worktree add` against — the resulting reviewer worktree is fully
+// isolated.
 func (m *Manager) ensureWorktree() (string, error) {
 	reviewerRigDir := m.rigDir()
 	if _, err := os.Stat(reviewerRigDir); err == nil {
 		return reviewerRigDir, nil
 	}
 
-	bareRepoPath := filepath.Join(m.rig.Path, ".repo.git")
-	if _, err := os.Stat(bareRepoPath); err == nil {
-		if perr := m.provisionWorktree(reviewerRigDir, bareRepoPath); perr != nil {
-			return "", perr
-		}
-		return reviewerRigDir, nil
-	}
-
-	// No bare repo: rig uses a standard .git layout. Reuse the refinery
-	// worktree (also a checkout-only consumer of the same repo) if present,
-	// else mayor/rig.
-	for _, fallback := range []string{
-		filepath.Join(m.rig.Path, "refinery", "rig"),
+	sourceDir := ""
+	for _, cand := range []string{
+		filepath.Join(m.rig.Path, ".repo.git"),
 		filepath.Join(m.rig.Path, "mayor", "rig"),
+		filepath.Join(m.rig.Path, "refinery", "rig"),
 	} {
-		if _, err := os.Stat(fallback); err == nil {
-			return fallback, nil
+		if _, err := os.Stat(cand); err == nil {
+			sourceDir = cand
+			break
 		}
 	}
-	return "", fmt.Errorf("no reviewer worktree and no bare repo at %s", bareRepoPath)
+	if sourceDir == "" {
+		return "", fmt.Errorf("no source repo to provision a reviewer worktree "+
+			"(looked for %s/.repo.git, mayor/rig, refinery/rig)", m.rig.Path)
+	}
+	if err := m.provisionWorktree(reviewerRigDir, sourceDir); err != nil {
+		return "", err
+	}
+	return reviewerRigDir, nil
 }
 
-// provisionWorktree creates the reviewer/rig worktree from the bare repo,
-// mirroring repairRefineryWorktree.
-func (m *Manager) provisionWorktree(reviewerRigDir, bareRepoPath string) error {
+// provisionWorktree adds a new, isolated reviewer/rig worktree off sourceDir
+// (a bare .repo.git or an existing worktree). The reviewer worktree shares the
+// object store but has its own working tree and HEAD, so detached checkouts
+// there never disturb the source.
+func (m *Manager) provisionWorktree(reviewerRigDir, sourceDir string) error {
 	if err := os.MkdirAll(filepath.Dir(reviewerRigDir), 0o755); err != nil {
 		return fmt.Errorf("creating reviewer dir: %w", err)
 	}
-	bareGit := git.NewGitWithDir(bareRepoPath, "")
-	_ = bareGit.WorktreePrune()
-	if err := bareGit.WorktreeAddExisting(reviewerRigDir, m.rig.DefaultBranch()); err != nil {
+	var srcGit *git.Git
+	if strings.HasSuffix(sourceDir, ".repo.git") {
+		srcGit = git.NewGitWithDir(sourceDir, "")
+	} else {
+		srcGit = git.NewGit(sourceDir)
+	}
+	_ = srcGit.WorktreePrune()
+	if err := srcGit.WorktreeAddExisting(reviewerRigDir, m.rig.DefaultBranch()); err != nil {
 		return fmt.Errorf("git worktree add: %w", err)
 	}
 	if err := git.NewGit(reviewerRigDir).ConfigureHooksPath(); err != nil {

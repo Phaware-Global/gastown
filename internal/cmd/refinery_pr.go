@@ -747,7 +747,14 @@ func dispatchLocalReviewer(prNumber int, mrID, headSHA string, round int) error 
 	if headSHA != "" {
 		cmdArgs = append(cmdArgs, "--sha", headSHA)
 	}
-	c := exec.Command("gt", cmdArgs...)
+	// Re-invoke THIS gt binary (os.Executable) rather than relying on "gt" being
+	// on PATH in the daemon/service env, which avoids version skew and a
+	// PATH-dependent failure mode.
+	execPath, err := os.Executable()
+	if err != nil || execPath == "" {
+		execPath = "gt"
+	}
+	c := exec.Command(execPath, cmdArgs...)
 	c.Stdout, c.Stderr = os.Stdout, os.Stderr
 	return c.Run()
 }
