@@ -39,6 +39,12 @@ func ParsePerspectiveResult(data []byte) (*PerspectiveResult, error) {
 		return nil, fmt.Errorf("perspective result (%s): verdict is required "+
 			"(a perspective is never silent — say \"no findings\" explicitly)", r.Perspective)
 	}
+	// The verdict becomes one line in the consolidated summary; a newline would
+	// break the "one line per perspective" contract and the badge parser.
+	if strings.ContainsAny(r.Verdict, "\n\r") {
+		return nil, fmt.Errorf("perspective result (%s): verdict must be a single line (no newlines)", r.Perspective)
+	}
+	r.Verdict = strings.TrimSpace(r.Verdict)
 	for i := range r.Findings {
 		// The execution contract requires every finding's perspective to match
 		// the pass. Canonicalize to the pass perspective when empty OR a

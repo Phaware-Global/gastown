@@ -457,7 +457,9 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 	}
 
 	maxFindings := reviewerPromptMaxFindings
-	if maxFindings <= 0 {
+	if maxFindings <= 0 && reviewCfg != nil {
+		// GetMaxFindingsPerPerspective is itself nil-safe; the explicit guard
+		// keeps the nil-defaulting intent visible at the call site.
 		maxFindings = reviewCfg.GetMaxFindingsPerPerspective()
 	}
 

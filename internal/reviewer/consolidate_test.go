@@ -38,6 +38,7 @@ func TestParsePerspectiveResult_Invalid(t *testing.T) {
 		"bad priority":         `{"perspective": "x", "verdict": "ok", "findings": [{"path": "a.go", "line": 1, "title": "t", "priority": "urgent"}]}`,
 		"trailing content":     `{"perspective": "x", "verdict": "ok", "findings": []} and more`,
 		"perspective mismatch": `{"perspective": "x", "verdict": "ok", "findings": [{"path": "a.go", "line": 1, "title": "t", "perspective": "y"}]}`,
+		"multiline verdict":    `{"perspective": "x", "verdict": "line one\nline two", "findings": []}`,
 	}
 	for name, in := range cases {
 		if _, err := ParsePerspectiveResult([]byte(in)); err == nil {
