@@ -1515,6 +1515,12 @@ func (g *Git) GhPrComment(prNumber int, body string) error {
 // review); otherwise it detaches at the freshly fetched PR head. This is the
 // only sanctioned way the Reviewer touches git — it never creates a branch and
 // never pushes (P23-2376).
+//
+// NOTE: the `pull/<n>/head` ref is GitHub-specific. v1 of the Reviewer role is
+// GitHub-only by design (see docs/design/reviewer-role.md Non-Goals; the
+// Bitbucket PRProvider returns ErrUnsupported for review posting), so this
+// assumption is intentional. A non-GitHub provider would need a different ref
+// scheme here.
 func (g *Git) CheckoutPRHeadDetached(prNumber int, sha string) error {
 	if prNumber <= 0 {
 		return fmt.Errorf("checkout PR head: invalid PR number %d", prNumber)
@@ -1552,6 +1558,12 @@ type GhReviewComment struct {
 func (g *Git) GhPrSubmitReview(prNumber int, commitID, body string, comments []GhReviewComment) error {
 	if body == "" && len(comments) == 0 {
 		return fmt.Errorf("gh pr review: must have a summary body or at least one comment")
+	}
+	// GitHub's review API requires commit_id whenever inline comments are
+	// present; without it the POST fails with 422 Unprocessable Entity. Fail
+	// fast with a clear message instead of surfacing the opaque API error.
+	if len(comments) > 0 && commitID == "" {
+		return fmt.Errorf("gh pr review: commit_id is required when submitting inline comments")
 	}
 	payload := map[string]any{"event": "COMMENT"}
 	if body != "" {

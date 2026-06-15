@@ -2338,9 +2338,9 @@ func TestIsProtectedBranch(t *testing.T) {
 		{"main", true},
 		{"master", true},
 		{"develop", true},
-		{"MAIN", true},      // case-insensitive
-		{"Master", true},    // case-insensitive
-		{"  main  ", true},  // whitespace tolerant (LLM-typed input)
+		{"MAIN", true},     // case-insensitive
+		{"Master", true},   // case-insensitive
+		{"  main  ", true}, // whitespace tolerant (LLM-typed input)
 		// Negatives — anything else, including PR-style names that
 		// look adjacent to the protected ones.
 		{"main-feature", false},
@@ -2357,5 +2357,21 @@ func TestIsProtectedBranch(t *testing.T) {
 				t.Errorf("IsProtectedBranch(%q) = %v; want %v", tc.name, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestGhPrSubmitReview_Validation covers the pre-flight guards that run before
+// any `gh` subprocess: an empty review and inline comments without a commit_id
+// are both rejected up front (the latter would otherwise 422 from GitHub).
+func TestGhPrSubmitReview_Validation(t *testing.T) {
+	g := NewGit(t.TempDir())
+
+	if err := g.GhPrSubmitReview(1, "", "", nil); err == nil {
+		t.Error("expected error for empty body and no comments")
+	}
+
+	comments := []GhReviewComment{{Path: "a.go", Line: 1, Body: "x"}}
+	if err := g.GhPrSubmitReview(1, "", "summary", comments); err == nil {
+		t.Error("expected error: commit_id required when inline comments are present")
 	}
 }

@@ -113,11 +113,13 @@ func init() {
 }
 
 // requireReviewerWorktree fails unless the current directory resolves to the
-// reviewer role (<rig>/reviewer/rig), returning the cwd on success. Both `post`
-// and `checkout` use it: `post` resolves the repo (owner/repo) and PR context
-// from the current directory, and `checkout` does a destructive detached
-// checkout — so running either in the wrong repo could target an unrelated PR
-// or reset an unintended working tree. Fail fast instead.
+// reviewer role (any directory under a rig's reviewer/ tree, per detectRole),
+// returning the cwd on success. Both `post` and `checkout` use it: `post`
+// resolves rig/PR context from the current directory, and `checkout` does a
+// destructive detached checkout — so running either outside the reviewer
+// context risks targeting an unrelated PR or resetting an unintended working
+// tree. (git operations in checkout additionally fail fast if the directory
+// isn't a real worktree.)
 func requireReviewerWorktree() (string, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -128,7 +130,7 @@ func requireReviewerWorktree() (string, error) {
 		return "", fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 	if info := detectRole(cwd, townRoot); info.Role != RoleReviewer {
-		return "", fmt.Errorf("must run in a reviewer worktree (<rig>/reviewer/rig); "+
+		return "", fmt.Errorf("must run inside the reviewer worktree (a <rig>/reviewer/ directory); "+
 			"current directory resolves to role %q", info.Role)
 	}
 	return cwd, nil
@@ -170,6 +172,15 @@ func runReviewerPost(cmd *cobra.Command, args []string) error {
 		if head, herr := provider.CurrentHeadSHA(reviewerPostPR); herr == nil {
 			sha = head
 		}
+	}
+	// A review with inline findings MUST be anchored to a commit: GitHub rejects
+	// the review API call without commit_id when comments are present, and the
+	// refinery's SHA-scoped engagement gate needs it to observe the review.
+	// Fail loudly rather than post a review the refinery will never see.
+	if sha == "" && len(findings.Findings) > 0 {
+		return fmt.Errorf("could not resolve a commit SHA to anchor PR #%d's review "+
+			"(pass --sha, or set reviewed_sha in the findings payload): a review with "+
+			"inline findings requires a commit_id", reviewerPostPR)
 	}
 
 	in := findings.BuildReviewInput(sha)
