@@ -58,27 +58,40 @@ func ParseFindings(data []byte) (*Findings, error) {
 		return nil, fmt.Errorf("findings.summary is required (the review must never be silent)")
 	}
 	for i := range fs.Findings {
-		f := &fs.Findings[i]
-		if strings.TrimSpace(f.Path) == "" {
-			return nil, fmt.Errorf("findings[%d]: path is required", i)
+		if err := normalizeFinding(&fs.Findings[i], fmt.Sprintf("findings[%d]", i)); err != nil {
+			return nil, err
 		}
-		if f.Line <= 0 {
-			return nil, fmt.Errorf("findings[%d] (%s): line must be positive, got %d", i, f.Path, f.Line)
-		}
-		if strings.TrimSpace(f.Title) == "" {
-			return nil, fmt.Errorf("findings[%d] (%s): title is required", i, f.Path)
-		}
-		p := strings.ToLower(strings.TrimSpace(f.Priority))
-		if p == "" {
-			p = "medium"
-		} else if !validPriorities[p] {
-			return nil, fmt.Errorf("findings[%d] (%s): invalid priority %q (want high, medium, or low)",
-				i, f.Path, f.Priority)
-		}
-		f.Priority = p
-		f.Perspective = strings.TrimSpace(f.Perspective)
 	}
 	return &fs, nil
+}
+
+// normalizeFinding validates and canonicalizes a single finding in place: path,
+// positive line, and title are required; priority is lowercased and must be in
+// the closed set (empty defaults to "medium", a non-empty unknown is a hard
+// error so a typo cannot silently drop severity). ctx is a caller-supplied
+// prefix for error messages (e.g. "findings[3]" or "perspective security").
+// Shared by ParseFindings and ParsePerspectiveResult so the two entry points
+// cannot drift in what they accept.
+func normalizeFinding(f *Finding, ctx string) error {
+	if strings.TrimSpace(f.Path) == "" {
+		return fmt.Errorf("%s: path is required", ctx)
+	}
+	if f.Line <= 0 {
+		return fmt.Errorf("%s (%s): line must be positive, got %d", ctx, f.Path, f.Line)
+	}
+	if strings.TrimSpace(f.Title) == "" {
+		return fmt.Errorf("%s (%s): title is required", ctx, f.Path)
+	}
+	p := strings.ToLower(strings.TrimSpace(f.Priority))
+	if p == "" {
+		p = "medium"
+	} else if !validPriorities[p] {
+		return fmt.Errorf("%s (%s): invalid priority %q (want high, medium, or low)",
+			ctx, f.Path, f.Priority)
+	}
+	f.Priority = p
+	f.Perspective = strings.TrimSpace(f.Perspective)
+	return nil
 }
 
 // FormatBody renders a single finding into the inline-thread body shape the

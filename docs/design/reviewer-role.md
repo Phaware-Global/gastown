@@ -5,7 +5,9 @@ posting (`gt reviewer post`/`checkout`/`perspectives`, `PRProvider.SubmitReview`
 priority-badge parser widening) + the per-rig config surface (`review` block,
 `reviewer_local`, `reviewer_token_env`) landed. Remaining: Phase 2 dispatch
 (`gt reviewer request`/`done` + reviewer-worktree provisioning + session
-lifecycle), Phase 3 (refinery patrol wiring), Phase 4 (crew), Phase 5 (Telegraph).
+lifecycle) and Phase 3 (refinery patrol wiring) landed; deterministic
+perspective-prompt generation + parallel-subagent execution (`gt reviewer
+prompt`/`consolidate`) landed. Remaining: Phase 4 (crew), Phase 5 (Telegraph).
 **Created:** 2026-06-10
 **Replaces:** Augment (GitHub-org review app) in the refinery PR review loop
 **Cross-references:** [refinery-pr-workflow.md](refinery-pr-workflow.md),
@@ -72,10 +74,11 @@ observability. Rejected.
 
 - Reviewing PRs on repos that are not registered rigs.
 - Comment-triggered reviews of human-authored PRs (Phase 5, via Telegraph).
-- Parallel multi-session perspective review with a synthesis pass (the
-  `/code-review ultra` pattern). v1 runs perspectives sequentially in one
-  session; the config schema is designed so parallelism can be added without
-  breaking changes.
+- Multi-*session* perspective review (one ephemeral agent session per
+  perspective). v1 runs perspectives in parallel as **subagents within the one
+  reviewer session** (`gt reviewer prompt` per lens → parallel subagents → `gt
+  reviewer consolidate`); a multi-session variant remains a possible later
+  optimization but is not required for parallelism.
 - Replacing the human approver, the count gate, or any merge-gate semantics.
 - Bitbucket. The review loop's SHA-scoped engagement check (G37) is
   GitHub-only today; the Reviewer follows the same scoping.
@@ -113,7 +116,8 @@ Polecat            Witness          Refinery                Reviewer            
   │                   │                ├─ await-review          ├─ checkout PR branch│
   │                   │                │   --no-trigger (poll)  ├─ codegraph context │
   │                   │                │                       ├─ N perspective     │
-  │                   │                │                       │   passes           │
+  │                   │                │                       │   subagents ∥ then  │
+  │                   │                │                       │   consolidate       │
   │                   │                │                       ├─ gh: post review ──▶│ threads
   │                   │                │                       ├─ gt reviewer done   │
   │                   │                │   ◀── review by pr_reviewer login ──────────│
@@ -233,8 +237,11 @@ propulsion principle, completion protocol):
      dispatch). Re-review the **full diff** at the new SHA, but do NOT raise
      new findings on code unchanged since the last reviewed SHA unless a fix
      commit changed its behavior — no relitigation.
-   - Run each enabled perspective pass in order; collect findings.
-   - Deduplicate and post **one** GitHub review via
+   - Generate each enabled perspective's prompt (`gt reviewer prompt`) and run
+     the passes **in parallel** as subagents; collect one `PerspectiveResult`
+     per perspective.
+   - Consolidate (`gt reviewer consolidate`) to deduplicate findings
+     deterministically, then post **one** GitHub review via
      `gt reviewer post --pr <n> --findings <json>` — the only sanctioned
      posting path (raw `gh pr review` is tap-guard-blocked).
 3. **Output contract** (load-bearing — see next section).
@@ -313,13 +320,16 @@ useful review.
 
 ### Perspective file format
 
-Plain markdown injected verbatim as the pass's instruction block. No schema,
-no TOML — a perspective is a prompt. The role template wraps each pass with
-the shared preamble (diff location, codegraph instructions, output contract)
-so perspective files contain only the lens itself:
+Plain markdown — a perspective is a prompt, no schema, no TOML. A perspective
+file carries **only the lens** ("what to look for"). It does **not** restate how
+to review: the shared execution contract (diff/SHA targeting, round handling,
+required codegraph tooling, the evidence standard, the output JSON schema) is
+centralized in one templated block (`internal/reviewer/prompt/execution.md.tmpl`)
+and injected into every generated prompt by `gt reviewer prompt`. So a lens file
+is just:
 
 ```markdown
-# Adversarial
+# Adversarial lens
 
 You are hostile to this change. Assume it is broken and find out how.
 - For every changed function, enumerate callers (codegraph_callers) and ask
@@ -327,21 +337,33 @@ You are hostile to this change. Assume it is broken and find out how.
 - Check error paths and zero-values on every new branch.
 - Flag any changed exported symbol with "no covering tests" in codegraph's
   blast radius output.
-Report only findings you can ground in a file:line plus an explicit failure
-scenario. No style nits.
+Your verdict should name the worst unhandled failure you found.
 ```
 
 ### Execution model
 
-v1: sequential passes in a single session — one checkout, one warmed
-codegraph context, N passes, one deduplicated review. This is cheap, keeps
-findings coherent, and matches review volumes where the refinery serializes
-merges anyway (`max_concurrent: 1` default).
+The per-perspective *prompts* are generated deterministically, not hand-written
+by the agent:
 
-Later (non-breaking): `"parallel": true` in the `review` config block spawns
-one ephemeral session per perspective plus a synthesis pass — the
-`/code-review ultra` shape. The perspective file format and output contract
-do not change.
+1. `gt reviewer checkout <pr> --sha <sha>` — one detached checkout at the
+   reviewed SHA, one warmed codegraph context.
+2. `gt reviewer prompt <name> --pr <pr> --sha <sha> --round <r>` per enabled
+   perspective — emits the lens + the shared execution contract + the output
+   schema. This is the single source of truth a pass executes from.
+3. The reviewer launches **one subagent per perspective in parallel**, each
+   reviewing strictly from its generated prompt and returning a
+   `PerspectiveResult` JSON object (`perspective` + required `verdict` +
+   `findings`).
+4. `gt reviewer consolidate perspective-*.json` deduplicates findings
+   deterministically (by `path:line:title`, highest priority wins, perspective
+   tags unioned) and builds a summary with a verdict line for every perspective.
+5. `gt reviewer post` posts the single consolidated review.
+
+Determinism is the design point: prompt generation, dedup, and the output
+contract are tested Go (`internal/reviewer/prompt.go`, `consolidate.go`); only
+the per-lens judgment is left to the subagents. The `review.parallel` config flag
+is retained for a possible later multi-*session* variant, but parallelism across
+perspectives no longer depends on it — it is the default execution shape.
 
 ## Codegraph Integration
 
