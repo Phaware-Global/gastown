@@ -2,11 +2,19 @@ package reviewer
 
 import (
 	"embed"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// ErrPerspectiveNotFound is returned (wrapped) by ResolvePerspective when a
+// perspective name has no file at any tier and no embedded default. It is
+// distinct from validation errors (path traversal) and real I/O errors, so
+// fail-silent callers can skip only genuinely-missing perspectives while still
+// surfacing misconfiguration and disk/permission failures.
+var ErrPerspectiveNotFound = errors.New("perspective not found")
 
 //go:embed perspectives/*.md
 var defaultPerspectivesFS embed.FS
@@ -95,7 +103,7 @@ func ResolvePerspective(townRoot, rigPath, name string) (ResolvedPerspective, er
 			Content: string(data),
 		}, nil
 	}
-	return ResolvedPerspective{}, fmt.Errorf("perspective %q not found (looked in rig, town, and built-in defaults)", name)
+	return ResolvedPerspective{}, fmt.Errorf("perspective %q not found (looked in rig, town, and built-in defaults): %w", name, ErrPerspectiveNotFound)
 }
 
 // ResolvePerspectives resolves a list of perspective names in order. When
@@ -108,7 +116,11 @@ func ResolvePerspectives(townRoot, rigPath string, names []string, failSilent bo
 	for _, name := range names {
 		rp, err := ResolvePerspective(townRoot, rigPath, name)
 		if err != nil {
-			if failSilent {
+			// Even in fail-silent mode, only a genuinely-missing perspective is
+			// skippable. A path-traversal name or a real I/O error is
+			// misconfiguration/operational failure and must surface, never be
+			// silently dropped.
+			if failSilent && errors.Is(err, ErrPerspectiveNotFound) {
 				skipped = append(skipped, name)
 				continue
 			}

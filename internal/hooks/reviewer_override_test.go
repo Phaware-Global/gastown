@@ -23,6 +23,7 @@ func TestReviewerOverrideBlocksWriteSurfaces(t *testing.T) {
 	// hook blocks with a non-zero exit.
 	wantBlocked := []string{
 		"gh pr review",
+		"gh api*pulls*reviews", // raw review-API POST path (defense-in-depth)
 		"gh pr merge",
 		"git push",
 		"gt refinery pr",

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -111,9 +112,34 @@ func init() {
 	rootCmd.AddCommand(reviewerCmd)
 }
 
+// requireReviewerWorktree fails unless the current directory resolves to the
+// reviewer role (<rig>/reviewer/rig), returning the cwd on success. Both `post`
+// and `checkout` use it: `post` resolves the repo (owner/repo) and PR context
+// from the current directory, and `checkout` does a destructive detached
+// checkout — so running either in the wrong repo could target an unrelated PR
+// or reset an unintended working tree. Fail fast instead.
+func requireReviewerWorktree() (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("resolving working directory: %w", err)
+	}
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return "", fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+	if info := detectRole(cwd, townRoot); info.Role != RoleReviewer {
+		return "", fmt.Errorf("must run in a reviewer worktree (<rig>/reviewer/rig); "+
+			"current directory resolves to role %q", info.Role)
+	}
+	return cwd, nil
+}
+
 func runReviewerPost(cmd *cobra.Command, args []string) error {
 	if reviewerPostPR <= 0 {
 		return fmt.Errorf("--pr must be a positive PR number")
+	}
+	if _, err := requireReviewerWorktree(); err != nil {
+		return err
 	}
 
 	data, err := readFindingsInput(reviewerPostFindings)
@@ -130,10 +156,16 @@ func runReviewerPost(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Anchor the review to the requested SHA, or the PR's current head when
-	// not supplied. A best-effort lookup keeps the review SHA-scoped for the
-	// refinery's engagement gate; if it fails we still post (unanchored).
+	// Anchor the review to the SHA actually reviewed so it is SHA-scoped for
+	// the refinery's engagement gate. Resolution order: --sha flag, then the
+	// findings payload's reviewed_sha (the SHA the Reviewer checked out and
+	// reviewed), then the PR's current head as a best-effort fallback. Honoring
+	// reviewed_sha preserves the "review exactly the requested SHA" contract
+	// even if the PR head moved between checkout and post.
 	sha := reviewerPostSHA
+	if sha == "" {
+		sha = findings.ReviewedSHA
+	}
 	if sha == "" {
 		if head, herr := provider.CurrentHeadSHA(reviewerPostPR); herr == nil {
 			sha = head
@@ -159,22 +191,9 @@ func runReviewerCheckout(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	cwd, err := os.Getwd()
+	cwd, err := requireReviewerWorktree()
 	if err != nil {
-		return fmt.Errorf("resolving working directory: %w", err)
-	}
-	// The checkout happens in the reviewer worktree (the current directory),
-	// not the refinery worktree, so gh/git resolve the right tree. Refuse to
-	// run anywhere else: a detached checkout is destructive to the working
-	// tree, so an operator (or a confused agent) running this in an arbitrary
-	// repo must fail fast rather than silently reset HEAD there.
-	townRoot, err := workspace.FindFromCwdOrError()
-	if err != nil {
-		return fmt.Errorf("not in a Gas Town workspace: %w", err)
-	}
-	if info := detectRole(cwd, townRoot); info.Role != RoleReviewer {
-		return fmt.Errorf("gt reviewer checkout must run in a reviewer worktree "+
-			"(<rig>/reviewer/rig); current directory resolves to role %q", info.Role)
+		return err
 	}
 
 	g := git.NewGit(cwd)
@@ -206,10 +225,16 @@ func runReviewerPerspectives(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Load the rig's review config (best-effort: a missing/empty settings file
-	// falls back to the built-in defaults rather than erroring).
+	// Load the rig's review config. A genuinely-absent settings file falls
+	// back to the built-in defaults, but a malformed or unreadable file must
+	// surface — silently running the reviewer with an unintended config (e.g.
+	// the wrong perspectives) is worse than failing loudly.
 	var reviewCfg *config.ReviewConfig
-	if settings, lerr := config.LoadRigSettings(config.RigSettingsPath(r.Path)); lerr == nil && settings != nil {
+	settings, lerr := config.LoadRigSettings(config.RigSettingsPath(r.Path))
+	if lerr != nil && !errors.Is(lerr, config.ErrNotFound) {
+		return fmt.Errorf("loading rig review settings: %w", lerr)
+	}
+	if settings != nil {
 		reviewCfg = settings.Review
 	}
 	names := reviewCfg.GetPerspectives()

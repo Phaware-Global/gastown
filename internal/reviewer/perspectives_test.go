@@ -124,6 +124,11 @@ func TestResolvePerspectives_FailSilent(t *testing.T) {
 	if len(skipped) != 1 || skipped[0] != "nope" {
 		t.Errorf("skipped = %v, want [nope]", skipped)
 	}
+	// Even in fail-silent mode, a path-traversal name (validation error, not
+	// "not found") must surface rather than be silently skipped.
+	if _, _, err := ResolvePerspectives("", "", []string{"adversarial", "../evil"}, true); err == nil {
+		t.Error("fail-silent mode must still surface path-traversal names")
+	}
 }
 
 func TestBuiltinPerspectiveNames(t *testing.T) {

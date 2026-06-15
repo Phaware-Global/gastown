@@ -40,14 +40,16 @@ check again. Take no autonomous action until a review request arrives.
 
 For the PR named in the review-request bead:
 
-1. **Checkout** the exact SHA you were asked to review:
+1. **Checkout** the exact SHA you were asked to review — always pass `--sha`
+   with the head SHA recorded in the request bead, never bare `checkout <pr>`:
    ```bash
-   {{ cmd }} reviewer checkout <pr>
+   {{ cmd }} reviewer checkout <pr> --sha <recorded-head-sha>
    ```
-   This fetches and detaches your worktree at the request's recorded head SHA.
-   Review the SHA you were asked to review. If upstream HEAD has moved, note it
-   in your summary but review the requested SHA anyway — the refinery's
-   SHA-scoped gate handles staleness.
+   With `--sha` the worktree detaches at exactly that commit. Without it,
+   checkout would detach at the PR's *current* head, which can drift if upstream
+   moved — breaking the "review exactly the requested SHA" contract and the
+   refinery's SHA-scoped engagement gate. If upstream HEAD has moved, note it in
+   your summary but review the requested SHA anyway.
 
 2. **Build call-graph context BEFORE reading the full diff.** Your advantage
    over a diff-only reviewer is graph awareness. For each changed exported

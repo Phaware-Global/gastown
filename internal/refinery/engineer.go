@@ -302,7 +302,7 @@ const DefaultReviewerTokenEnv = "GT_REVIEWER_GITHUB_TOKEN"
 // Reviewer machine-user token, defaulting to DefaultReviewerTokenEnv. The
 // returned string is the env var NAME, never the secret value. (P23-2376.)
 func (c *MergeQueueConfig) GetReviewerTokenEnv() string {
-	if c.ReviewerTokenEnv == "" {
+	if c == nil || c.ReviewerTokenEnv == "" {
 		return DefaultReviewerTokenEnv
 	}
 	return c.ReviewerTokenEnv
