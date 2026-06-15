@@ -70,6 +70,12 @@ func BuildPerspectivePrompt(p PromptParams) (string, error) {
 	if strings.TrimSpace(p.Lens) == "" {
 		return "", fmt.Errorf("perspective %q has empty lens content", p.Perspective)
 	}
+	if p.PR <= 0 {
+		return "", fmt.Errorf("PR number must be positive, got %d", p.PR)
+	}
+	if strings.TrimSpace(p.SHA) == "" {
+		return "", fmt.Errorf("SHA is required to anchor the review")
+	}
 	if p.Round < 1 {
 		p.Round = 1
 	}
@@ -99,7 +105,9 @@ func BuildPerspectivePrompt(p PromptParams) (string, error) {
 // renderPromptTemplate parses and executes a text/template (not html/template:
 // the output is a plain-text agent prompt, not HTML, and must not be escaped).
 func renderPromptTemplate(name, tmpl string, data any) (string, error) {
-	t, err := template.New(name).Parse(tmpl)
+	// missingkey=error fails generation on a template typo (e.g. {{ .Rig }})
+	// instead of silently rendering "<no value>" into the execution contract.
+	t, err := template.New(name).Option("missingkey=error").Parse(tmpl)
 	if err != nil {
 		return "", err
 	}

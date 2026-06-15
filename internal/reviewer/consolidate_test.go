@@ -31,11 +31,13 @@ func TestParsePerspectiveResult_Valid(t *testing.T) {
 
 func TestParsePerspectiveResult_Invalid(t *testing.T) {
 	cases := map[string]string{
-		"missing verdict":     `{"perspective": "x", "findings": []}`,
-		"missing perspective": `{"verdict": "ok", "findings": []}`,
-		"unknown field":       `{"perspective": "x", "verdict": "ok", "extra": 1}`,
-		"bad finding line":    `{"perspective": "x", "verdict": "ok", "findings": [{"path": "a.go", "line": 0, "title": "t"}]}`,
-		"bad priority":        `{"perspective": "x", "verdict": "ok", "findings": [{"path": "a.go", "line": 1, "title": "t", "priority": "urgent"}]}`,
+		"missing verdict":      `{"perspective": "x", "findings": []}`,
+		"missing perspective":  `{"verdict": "ok", "findings": []}`,
+		"unknown field":        `{"perspective": "x", "verdict": "ok", "extra": 1}`,
+		"bad finding line":     `{"perspective": "x", "verdict": "ok", "findings": [{"path": "a.go", "line": 0, "title": "t"}]}`,
+		"bad priority":         `{"perspective": "x", "verdict": "ok", "findings": [{"path": "a.go", "line": 1, "title": "t", "priority": "urgent"}]}`,
+		"trailing content":     `{"perspective": "x", "verdict": "ok", "findings": []} and more`,
+		"perspective mismatch": `{"perspective": "x", "verdict": "ok", "findings": [{"path": "a.go", "line": 1, "title": "t", "perspective": "y"}]}`,
 	}
 	for name, in := range cases {
 		if _, err := ParsePerspectiveResult([]byte(in)); err == nil {
@@ -90,6 +92,31 @@ func TestConsolidate_DedupsAndEscalatesPriority(t *testing.T) {
 	// Both lenses credited on the merged finding.
 	if !strings.Contains(merged.Perspective, "adversarial") || !strings.Contains(merged.Perspective, "security") {
 		t.Errorf("merged perspective = %q, want both lenses", merged.Perspective)
+	}
+}
+
+func TestConsolidate_MergesDifferingBodiesAndSuggestions(t *testing.T) {
+	results := []PerspectiveResult{
+		{Perspective: "adversarial", Verdict: "v1", Findings: []Finding{
+			{Path: "a.go", Line: 10, Priority: "medium", Perspective: "adversarial",
+				Title: "unchecked error", Body: "caller panics on nil", Suggestion: "guard nil"},
+		}},
+		{Perspective: "security", Verdict: "v2", Findings: []Finding{
+			{Path: "a.go", Line: 10, Priority: "medium", Perspective: "security",
+				Title: "unchecked error", Body: "tainted path reaches sink", Suggestion: "validate input"},
+		}},
+	}
+	fs := Consolidate(results, "")
+	if len(fs.Findings) != 1 {
+		t.Fatalf("findings = %d, want 1 (deduped)", len(fs.Findings))
+	}
+	m := fs.Findings[0]
+	// Perspective-specific detail from BOTH lenses is preserved, not discarded.
+	if !strings.Contains(m.Body, "caller panics on nil") || !strings.Contains(m.Body, "tainted path reaches sink") {
+		t.Errorf("merged body dropped detail: %q", m.Body)
+	}
+	if !strings.Contains(m.Suggestion, "guard nil") || !strings.Contains(m.Suggestion, "validate input") {
+		t.Errorf("merged suggestion dropped detail: %q", m.Suggestion)
 	}
 }
 

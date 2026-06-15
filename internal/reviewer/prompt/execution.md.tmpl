@@ -8,8 +8,13 @@ return*. Follow it exactly — do not improvise the procedure.
 ### 1. Review target — the exact diff
 - The reviewer worktree is already checked out in detached HEAD at the reviewed
   commit `{{ .SHA }}`. Review **that commit only**.
-- Obtain the change set with `gh pr diff {{ .PR }}`. If upstream HEAD has moved
-  past `{{ .SHA }}`, still review `{{ .SHA }}` and note the drift in your verdict.
+- Obtain the change set from your **local checkout** (already at `{{ .SHA }}`),
+  not from GitHub's latest head: diff against the merge-base with the base
+  branch, e.g. `git diff $(git merge-base origin/main HEAD)..HEAD` (substitute
+  the PR's actual base branch for `origin/main`). Do **not** use
+  `gh pr diff {{ .PR }}` — it returns the PR's *current* GitHub head, which will
+  not match `{{ .SHA }}` (and your local worktree/codegraph index) if upstream
+  moved. If you detect such drift, note it in your verdict.
 - Raise findings **only** on lines this PR introduced or changed. Pre-existing
   code is out of scope unless the diff changed its behavior.
 

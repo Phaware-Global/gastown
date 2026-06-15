@@ -1,8 +1,6 @@
 package reviewer
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -30,9 +28,7 @@ type PerspectiveResult struct {
 // empty perspective inherits the result's perspective.
 func ParsePerspectiveResult(data []byte) (*PerspectiveResult, error) {
 	var r PerspectiveResult
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&r); err != nil {
+	if err := decodeStrictJSON(data, &r); err != nil {
 		return nil, fmt.Errorf("parsing perspective result JSON: %w", err)
 	}
 	r.Perspective = strings.TrimSpace(r.Perspective)
@@ -44,8 +40,15 @@ func ParsePerspectiveResult(data []byte) (*PerspectiveResult, error) {
 			"(a perspective is never silent — say \"no findings\" explicitly)", r.Perspective)
 	}
 	for i := range r.Findings {
-		if strings.TrimSpace(r.Findings[i].Perspective) == "" {
+		// The execution contract requires every finding's perspective to match
+		// the pass. Fill it when empty; reject a mismatch rather than silently
+		// misattribute the finding (or union an unexpected tag at consolidation).
+		fp := strings.TrimSpace(r.Findings[i].Perspective)
+		if fp == "" {
 			r.Findings[i].Perspective = r.Perspective
+		} else if !strings.EqualFold(fp, r.Perspective) {
+			return nil, fmt.Errorf("perspective result (%s): finding[%d] perspective %q "+
+				"does not match the pass perspective", r.Perspective, i, fp)
 		}
 		if err := normalizeFinding(&r.Findings[i], fmt.Sprintf("perspective %s finding[%d]", r.Perspective, i)); err != nil {
 			return nil, err
@@ -66,6 +69,25 @@ func priorityRank(p string) int {
 	default:
 		return 0
 	}
+}
+
+// mergeText appends add to existing when add is non-empty and not already
+// contained, separated by a blank line. Used so that when two perspectives raise
+// the same finding, their differing explanations/suggestions are preserved
+// rather than the second silently discarded.
+func mergeText(existing, add string) string {
+	add = strings.TrimSpace(add)
+	if add == "" {
+		return existing
+	}
+	existing = strings.TrimRight(existing, "\n")
+	if strings.TrimSpace(existing) == "" {
+		return add
+	}
+	if strings.Contains(existing, add) {
+		return existing
+	}
+	return existing + "\n\n" + add
 }
 
 // mergePerspectives unions two comma-separated perspective tags, preserving
@@ -121,6 +143,10 @@ func Consolidate(results []PerspectiveResult, reviewedSHA string) *Findings {
 					out[idx].Priority = f.Priority
 				}
 				out[idx].Perspective = mergePerspectives(out[idx].Perspective, f.Perspective)
+				// Preserve perspective-specific detail rather than discarding the
+				// duplicate's body/suggestion.
+				out[idx].Body = mergeText(out[idx].Body, f.Body)
+				out[idx].Suggestion = mergeText(out[idx].Suggestion, f.Suggestion)
 				continue
 			}
 			index[k] = len(out)

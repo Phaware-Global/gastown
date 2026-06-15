@@ -82,8 +82,8 @@ Read the request bead/mail to extract `<pr>`, the recorded head `<sha>`, and the
    instruction, and require it to:
    - review strictly from that generated prompt (no extra scope, no relitigation
      of unchanged code on fix rounds),
-   - return **exactly one** `PerspectiveResult` JSON object — `{"perspective",
-     "verdict", "findings": [...]}` — and nothing else.
+   - return **exactly one** `PerspectiveResult` JSON object —
+     `{"perspective": "...", "verdict": "...", "findings": []}` — and nothing else.
 
    Save each subagent's JSON output to `perspective-<name>.json`. A perspective
    that finds nothing still returns a `verdict` ("no findings: …") — never

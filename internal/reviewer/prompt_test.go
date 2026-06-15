@@ -153,4 +153,10 @@ func TestBuildPerspectivePrompt_Validation(t *testing.T) {
 	if _, err := BuildPerspectivePrompt(PromptParams{Perspective: "adversarial", Lens: "  ", SHA: "a", PR: 1}); err == nil {
 		t.Error("expected error for empty lens content")
 	}
+	if _, err := BuildPerspectivePrompt(PromptParams{Perspective: "adversarial", Lens: "x", SHA: "a", PR: 0}); err == nil {
+		t.Error("expected error for non-positive PR number")
+	}
+	if _, err := BuildPerspectivePrompt(PromptParams{Perspective: "adversarial", Lens: "x", SHA: "", PR: 1}); err == nil {
+		t.Error("expected error for empty SHA")
+	}
 }

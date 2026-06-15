@@ -443,6 +443,10 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// stdin can only be consumed once, so both inputs cannot read from it.
+	if reviewerPromptPriorThreads == "-" && reviewerPromptInstructions == "-" {
+		return fmt.Errorf("--prior-threads and --instructions cannot both read from stdin (\"-\")")
+	}
 	priorThreads, err := readOptionalInput(reviewerPromptPriorThreads)
 	if err != nil {
 		return fmt.Errorf("reading --prior-threads: %w", err)
@@ -482,6 +486,11 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 		// No file args: read a JSON array of PerspectiveResult objects from
 		// stdin. Re-marshal each element and run it through ParsePerspectiveResult
 		// so stdin and file inputs get identical validation/normalization.
+		// Guard against a hang when stdin is an interactive terminal (no pipe).
+		if stat, statErr := os.Stdin.Stat(); statErr == nil && (stat.Mode()&os.ModeCharDevice) != 0 {
+			return fmt.Errorf("no result files given and stdin is a terminal; " +
+				"pass result.json file arguments or pipe a JSON array of results")
+		}
 		data, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return fmt.Errorf("reading results from stdin: %w", err)
