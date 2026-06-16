@@ -72,7 +72,7 @@ When `await-signal` outputs `EFFORT: full`, run all steps thoroughly (normal mod
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-deacon-patrol"
-version = 14
+version = 15
 
 [vars]
 [vars.wisp_type]
@@ -154,7 +154,7 @@ Dogs return to idle automatically. The report is informational - no action neede
 unless the dog reports errors that require escalation.
 
 **CONVOY_NEEDS_FEEDING messages** (from Refinery):
-The daemon's ConvoyManager handles convoy feeding (event-driven, 5s poll).
+The daemon's ConvoyManager handles convoy feeding (event-driven + 30s periodic scan).
 Simply archive these messages — no deacon action needed.
 ```bash
 # For each CONVOY_NEEDS_FEEDING message:

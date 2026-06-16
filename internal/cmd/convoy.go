@@ -322,8 +322,9 @@ A convoy is "stranded" when:
   - Has tracked issues but none are ready (stuck — waiting on dependencies/workers), OR
   - Has 0 tracked issues (empty — needs auto-close via convoy check)
 
-Use this to detect convoys that need feeding or cleanup. The Deacon patrol
-runs this periodically and dispatches dogs to feed stranded convoys.
+Use this to detect convoys that need feeding or cleanup. The daemon's
+ConvoyManager runs this periodically (every 30s) and directly dispatches
+ready issues to polecats. The Deacon no longer feeds convoys directly.
 
 Examples:
   gt convoy stranded              # Show stranded convoys
