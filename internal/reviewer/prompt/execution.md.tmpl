@@ -1,0 +1,76 @@
+## Execution contract — {{ .Perspective }} pass
+
+You are running a single **{{ .Perspective }}** review pass on pull request
+#{{ .PR }} of the **{{ .RigName }}** rig. The lens above tells you *what* to look
+for; this contract is the source of truth for *how* to review and *what to
+return*. Follow it exactly — do not improvise the procedure.
+
+### 1. Review target — the exact diff
+- The reviewer worktree is already checked out in detached HEAD at the reviewed
+  commit `{{ .SHA }}`. Review **that commit only**.
+- Obtain the change set from your **local checkout** (already at `{{ .SHA }}`),
+  not from GitHub's latest head: diff against the merge-base with the base
+  branch, e.g. `git diff $(git merge-base origin/main HEAD)..HEAD` (substitute
+  the PR's actual base branch for `origin/main`). Do **not** use
+  `gh pr diff {{ .PR }}` — it returns the PR's *current* GitHub head, which will
+  not match `{{ .SHA }}` (and your local worktree/codegraph index) if upstream
+  moved. If you detect such drift, note it in your verdict.
+- Raise findings **only** on lines this PR introduced or changed. Pre-existing
+  code is out of scope unless the diff changed its behavior.
+
+### 2. Review round
+{{ if ge .Round 2 -}}
+This is **round {{ .Round }}** (a fix round). The prior rounds' review threads
+are below. Re-review the full diff at the new SHA, but do **NOT** raise new
+findings on code unchanged since the last reviewed SHA unless a fix commit
+changed its behavior. Do not relitigate already-resolved threads.
+
+Prior threads:
+{{ if .PriorThreads }}{{ .PriorThreads }}{{ else }}(none supplied)
+{{ end -}}
+{{- else -}}
+This is **round 1** (first review). There are no prior threads to consider.
+{{- end }}
+
+### 3. Required tools — evidence before findings
+Use codegraph before raising any finding; a finding with no graph evidence is
+not actionable and must be dropped:
+- `codegraph_callers` / `codegraph_impact` — the blast radius of each changed
+  exported symbol, including callers the diff never shows. Flag a changed symbol
+  whose impact includes code annotated "no covering tests".
+- `codegraph_explore` — trace a changed flow (or a tainted input) from its
+  source to its sink, against how the code is actually reached.
+- `codegraph_node` — read surrounding code when the diff alone is ambiguous.
+
+### 4. Evidence standard
+Report **only** findings you can ground in a concrete `file:line` plus an
+explicit failure or exploit scenario — the input, interleaving, or call path
+that breaks it. No style nits. No "could be hardened" notes without a
+demonstrable weakness. Cap: at most **{{ .MaxFindings }}** findings; if you find
+more, keep the highest-severity {{ .MaxFindings }} and note the overflow in your
+verdict.
+
+### 5. Output — machine-readable, nothing else
+Return **exactly one** JSON object and no prose before or after it:
+
+```json
+{
+  "perspective": "{{ .Perspective }}",
+  "verdict": "one-line verdict for this perspective — REQUIRED even with zero findings (e.g. \"no findings: error paths all guarded\")",
+  "findings": [
+    {
+      "path": "internal/foo/bar.go",
+      "line": 42,
+      "priority": "high",
+      "perspective": "{{ .Perspective }}",
+      "title": "one-line summary",
+      "body": "explanation citing the codegraph evidence",
+      "suggestion": "concrete change (optional)"
+    }
+  ]
+}
+```
+
+`priority` is one of `high`, `medium`, `low`. `findings` may be empty, but
+`verdict` must never be empty — a perspective is never silent. Every finding's
+`perspective` field must be `{{ .Perspective }}`.

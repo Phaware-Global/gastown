@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +32,16 @@ var (
 	reviewerRequestSHA    string
 	reviewerRequestRound  int
 	reviewerRequestOrigin string
+
+	reviewerPromptPR           int
+	reviewerPromptSHA          string
+	reviewerPromptRound        int
+	reviewerPromptPriorThreads string
+	reviewerPromptInstructions string
+	reviewerPromptMaxFindings  int
+
+	reviewerConsolidateSHA string
+	reviewerConsolidateOut string
 )
 
 var reviewerCmd = &cobra.Command{
@@ -116,6 +127,44 @@ killed after a short delay so the command can report success first.`,
 	RunE: runReviewerDone,
 }
 
+var reviewerPromptCmd = &cobra.Command{
+	Use:   "prompt <perspective>",
+	Short: "Generate the fully-resolved prompt for one perspective review pass",
+	Long: `Generate the deterministic prompt a single perspective review pass executes.
+
+The prompt is assembled from the resolved perspective content (rig → town →
+built-in) plus a shared, templated execution contract that centralizes how to
+review: which SHA/diff to target, how to handle fix rounds, the required
+codegraph tooling, the evidence standard, and the exact output JSON schema. The
+perspective markdown supplies only the lens; this command supplies the rest, so
+no part of the procedure is left to per-agent interpretation.
+
+The reviewer role generates one prompt per enabled perspective and hands each to
+a subagent, which reviews from that prompt alone and returns a PerspectiveResult
+JSON object. The prompt is written to stdout.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runReviewerPrompt,
+}
+
+var reviewerConsolidateCmd = &cobra.Command{
+	Use:   "consolidate [result.json ...]",
+	Short: "Merge per-perspective results into one findings payload for post",
+	Long: `Consolidate per-perspective subagent results into a single findings payload.
+
+Each input is a PerspectiveResult JSON object (perspective + verdict + findings),
+one per enabled perspective. Pass them as file arguments, or pipe a JSON array of
+them on stdin. The output is the findings JSON that 'gt reviewer post' consumes:
+
+  - the summary lists every perspective's verdict (perspectives with no findings
+    are still accounted for — never silent),
+  - findings are deduplicated by (path, line, title) with the highest priority
+    winning and perspective tags unioned.
+
+Deterministic dedup lives here, in Go, rather than in per-run reviewer judgment.
+Writes to --out, or stdout when --out is omitted.`,
+	RunE: runReviewerConsolidate,
+}
+
 var reviewerPerspectivesCmd = &cobra.Command{
 	Use:   "perspectives",
 	Short: "List the rig's enabled review perspectives and where each resolves",
@@ -152,9 +201,29 @@ func init() {
 	reviewerRequestCmd.Flags().StringVar(&reviewerRequestOrigin, "origin", "",
 		"request origin: refinery|crew (default: refinery when --mr is set, else crew)")
 
+	reviewerPromptCmd.Flags().IntVar(&reviewerPromptPR, "pr", 0, "PR number under review (required)")
+	reviewerPromptCmd.Flags().StringVar(&reviewerPromptSHA, "sha", "",
+		"exact head SHA the pass must review and anchor to (required)")
+	reviewerPromptCmd.Flags().IntVar(&reviewerPromptRound, "round", 1, "review round (>=2 is a fix round)")
+	reviewerPromptCmd.Flags().StringVar(&reviewerPromptPriorThreads, "prior-threads", "",
+		`file of prior-round thread context (or "-" for stdin); only used when round >= 2`)
+	reviewerPromptCmd.Flags().StringVar(&reviewerPromptInstructions, "instructions", "",
+		`file of extra execution instructions to inject (or "-" for stdin)`)
+	reviewerPromptCmd.Flags().IntVar(&reviewerPromptMaxFindings, "max-findings", 0,
+		"per-pass finding cap (default: the rig's review.max_findings_per_perspective)")
+	_ = reviewerPromptCmd.MarkFlagRequired("pr")
+	_ = reviewerPromptCmd.MarkFlagRequired("sha")
+
+	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateSHA, "sha", "",
+		"reviewed head SHA to record in the consolidated payload")
+	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateOut, "out", "",
+		"write the consolidated findings JSON here (default: stdout)")
+
 	reviewerCmd.AddCommand(reviewerPostCmd)
 	reviewerCmd.AddCommand(reviewerCheckoutCmd)
 	reviewerCmd.AddCommand(reviewerPerspectivesCmd)
+	reviewerCmd.AddCommand(reviewerPromptCmd)
+	reviewerCmd.AddCommand(reviewerConsolidateCmd)
 	reviewerCmd.AddCommand(reviewerRequestCmd)
 	reviewerCmd.AddCommand(reviewerDoneCmd)
 
@@ -327,6 +396,153 @@ func runReviewerPerspectives(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// loadRigReviewConfig resolves the current rig's review config for the
+// prompt/perspectives commands. A genuinely-absent settings file falls back to
+// defaults (nil ReviewConfig, which the getters treat as defaults), but a
+// malformed/unreadable file surfaces — silently reviewing with an unintended
+// config is worse than failing loudly.
+func loadRigReviewConfig() (townRoot, rigName, rigPath string, reviewCfg *config.ReviewConfig, err error) {
+	townRoot, err = workspace.FindFromCwdOrError()
+	if err != nil {
+		return "", "", "", nil, fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+	rigName, err = inferRigFromCwd(townRoot)
+	if err != nil {
+		return "", "", "", nil, fmt.Errorf("could not determine rig: %w", err)
+	}
+	_, r, err := getRig(rigName)
+	if err != nil {
+		return "", "", "", nil, err
+	}
+	settings, lerr := config.LoadRigSettings(config.RigSettingsPath(r.Path))
+	if lerr != nil && !errors.Is(lerr, config.ErrNotFound) {
+		return "", "", "", nil, fmt.Errorf("loading rig review settings: %w", lerr)
+	}
+	if settings != nil {
+		reviewCfg = settings.Review
+	}
+	return townRoot, rigName, r.Path, reviewCfg, nil
+}
+
+func runReviewerPrompt(cmd *cobra.Command, args []string) error {
+	perspective := args[0]
+	if reviewerPromptPR <= 0 {
+		return fmt.Errorf("--pr must be a positive PR number")
+	}
+	if strings.TrimSpace(reviewerPromptSHA) == "" {
+		return fmt.Errorf("--sha is required: a pass reviews and anchors to an exact commit")
+	}
+
+	townRoot, rigName, rigPath, reviewCfg, err := loadRigReviewConfig()
+	if err != nil {
+		return err
+	}
+
+	rp, err := reviewer.ResolvePerspective(townRoot, rigPath, perspective)
+	if err != nil {
+		return err
+	}
+
+	// stdin can only be consumed once, so both inputs cannot read from it.
+	if reviewerPromptPriorThreads == "-" && reviewerPromptInstructions == "-" {
+		return fmt.Errorf("--prior-threads and --instructions cannot both read from stdin (\"-\")")
+	}
+	priorThreads, err := readOptionalInput(reviewerPromptPriorThreads)
+	if err != nil {
+		return fmt.Errorf("reading --prior-threads: %w", err)
+	}
+	extra, err := readOptionalInput(reviewerPromptInstructions)
+	if err != nil {
+		return fmt.Errorf("reading --instructions: %w", err)
+	}
+
+	maxFindings := reviewerPromptMaxFindings
+	if maxFindings <= 0 && reviewCfg != nil {
+		// GetMaxFindingsPerPerspective is itself nil-safe; the explicit guard
+		// keeps the nil-defaulting intent visible at the call site.
+		maxFindings = reviewCfg.GetMaxFindingsPerPerspective()
+	}
+
+	out, err := reviewer.BuildPerspectivePrompt(reviewer.PromptParams{
+		Perspective:       rp.Name,
+		Lens:              rp.Content,
+		RigName:           rigName,
+		PR:                reviewerPromptPR,
+		SHA:               reviewerPromptSHA,
+		Round:             reviewerPromptRound,
+		PriorThreads:      priorThreads,
+		MaxFindings:       maxFindings,
+		ExtraInstructions: extra,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return nil
+}
+
+func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
+	var results []reviewer.PerspectiveResult
+
+	if len(args) == 0 {
+		// No file args: read a JSON array of PerspectiveResult objects from
+		// stdin. Re-marshal each element and run it through ParsePerspectiveResult
+		// so stdin and file inputs get identical validation/normalization.
+		// Guard against a hang when stdin is an interactive terminal (no pipe).
+		if stat, statErr := os.Stdin.Stat(); statErr == nil && (stat.Mode()&os.ModeCharDevice) != 0 {
+			return fmt.Errorf("no result files given and stdin is a terminal; " +
+				"pass result.json file arguments or pipe a JSON array of results")
+		}
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return fmt.Errorf("reading results from stdin: %w", err)
+		}
+		var raw []json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return fmt.Errorf("parsing results array from stdin: %w", err)
+		}
+		if len(raw) == 0 {
+			return fmt.Errorf("no perspective results on stdin")
+		}
+		for i, elem := range raw {
+			r, perr := reviewer.ParsePerspectiveResult(elem)
+			if perr != nil {
+				return fmt.Errorf("stdin result[%d]: %w", i, perr)
+			}
+			results = append(results, *r)
+		}
+	} else {
+		for _, path := range args {
+			data, err := os.ReadFile(path) //nolint:gosec // operator-supplied result file
+			if err != nil {
+				return fmt.Errorf("reading result file %s: %w", path, err)
+			}
+			r, perr := reviewer.ParsePerspectiveResult(data)
+			if perr != nil {
+				return fmt.Errorf("%s: %w", path, perr)
+			}
+			results = append(results, *r)
+		}
+	}
+
+	fs := reviewer.Consolidate(results, reviewerConsolidateSHA)
+	encoded, err := json.MarshalIndent(fs, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encoding consolidated findings: %w", err)
+	}
+	encoded = append(encoded, '\n')
+
+	if reviewerConsolidateOut != "" {
+		if err := os.WriteFile(reviewerConsolidateOut, encoded, 0o644); err != nil { //nolint:gosec // operator-facing output
+			return fmt.Errorf("writing %s: %w", reviewerConsolidateOut, err)
+		}
+		fmt.Printf("Wrote consolidated findings (%d) to %s\n", len(fs.Findings), reviewerConsolidateOut)
+		return nil
+	}
+	_, err = os.Stdout.Write(encoded)
+	return err
+}
+
 func runReviewerRequest(cmd *cobra.Command, args []string) error {
 	prNumber, err := parsePRNumber(args[0])
 	if err != nil {
@@ -458,6 +674,33 @@ func firstLineOf(s string) string {
 		}
 	}
 	return ""
+}
+
+// readOptionalInput returns the content of an optional file argument: "" for an
+// unset flag, stdin for "-", else the file's contents. Used for the prompt
+// command's --prior-threads and --instructions slots, both of which are
+// optional.
+func readOptionalInput(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	if path == "-" {
+		// Guard against an unexplained hang when "-" is passed but stdin is an
+		// interactive terminal rather than a pipe.
+		if stat, statErr := os.Stdin.Stat(); statErr == nil && (stat.Mode()&os.ModeCharDevice) != 0 {
+			return "", fmt.Errorf("stdin is a terminal; pipe input or pass a file path instead of \"-\"")
+		}
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return "", err
+		}
+		return string(data), nil
+	}
+	data, err := os.ReadFile(path) //nolint:gosec // operator-supplied prompt input file
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 // readFindingsInput reads the findings payload from a file path or stdin ("-").

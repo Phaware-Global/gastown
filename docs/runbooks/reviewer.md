@@ -20,7 +20,9 @@ Refinery (merge_strategy=pr)                Reviewer (gt-<rig>-reviewer)        
   │ wait CI green                                                                  │
   ├─ reviewer_local? → gt reviewer request <pr> --mr <id> ──▶ (bead + session)     │
   │                                          ├─ gt reviewer checkout <pr> --sha …  │
-  │                                          ├─ codegraph context + N perspectives │
+  │                                          ├─ gt reviewer prompt <p> (per lens)   │
+  │                                          ├─ N perspective subagents IN PARALLEL │
+  │                                          ├─ gt reviewer consolidate *.json      │
   │                                          ├─ gt reviewer post --pr N --findings ▶ inline threads
   │                                          └─ gt reviewer done (self-terminate)   │
   ├─ gt refinery pr await-review --no-trigger (polls for the review)               │
@@ -137,6 +139,25 @@ gt reviewer perspectives                  # lists enabled perspectives + source 
 gt reviewer perspectives --show security  # prints a perspective's resolved prompt content
 ```
 
+### Generated per-perspective prompts (deterministic execution contract)
+
+The perspective markdown is only the **lens** ("what to look for"). The
+deterministic **execution contract** ("how to review, what to return") lives in
+one place — a shared, templated instruction block — and is injected into every
+generated prompt. The Reviewer never hand-writes a pass prompt; it generates one
+per perspective:
+
+```bash
+gt reviewer prompt <name> --pr <N> --sha <head-sha> --round <r> \
+  [--prior-threads prior-threads.txt] [--instructions extra.txt]
+```
+
+The generated prompt embeds the lens, the exact SHA/diff to review, the codegraph
+tooling expectations, the evidence standard, the per-pass finding cap
+(`review.max_findings_per_perspective`), and the required output JSON schema —
+leaving no part of the procedure to agent interpretation. `--instructions` is the
+slot for injecting any additional execution instructions verbatim.
+
 A perspective named in config but missing at every tier is a **config error**
 (unless `fail_silent_perspectives: true`), so a typo surfaces loudly. Path
 separators and `..` in a perspective name are rejected (no directory traversal).
@@ -181,14 +202,29 @@ re-reviews the new SHA.
 # Request a review of PR #N for the current rig (omit --mr for a standalone/crew request)
 gt reviewer request <N> [--mr <mr-bead-id>]
 
-# Inside the reviewer session, the role checks out, reviews, and posts:
+# Inside the reviewer session, the role checks out, reviews in parallel, and posts:
 gt reviewer checkout <N> --sha <head-sha>          # detached checkout at the reviewed SHA
+gt reviewer prompt adversarial --pr <N> --sha <head-sha> --round 1 > prompt-adversarial.txt
+gt reviewer prompt security    --pr <N> --sha <head-sha> --round 1 > prompt-security.txt
+#   → launch one subagent per prompt IN PARALLEL; each returns a PerspectiveResult JSON
+#     saved to perspective-<name>.json
+gt reviewer consolidate perspective-*.json --sha <head-sha> --out findings.json
 gt reviewer post --pr <N> --findings findings.json # the ONLY sanctioned posting path
 gt reviewer done                                    # clear state + self-terminate the session
 ```
 
 `gt reviewer checkout` and `gt reviewer post` refuse to run outside a reviewer
-worktree (`<rig>/reviewer/rig`).
+worktree (`<rig>/reviewer/rig`). `gt reviewer prompt` and `gt reviewer
+consolidate` are pure generators/transformers — no GitHub calls — and run
+anywhere in the rig.
+
+The Reviewer runs perspective passes **in parallel** (one subagent per enabled
+perspective, each reviewing strictly from its generated prompt), then
+deterministically deduplicates the collected findings with `gt reviewer
+consolidate` before the single `post`. Dedup keys on `(path, line, title)`, keeps
+the highest priority, and unions the perspective tags; the consolidated summary
+carries a verdict line for **every** perspective (perspectives with no findings
+are still accounted for).
 
 ### Findings JSON shape (consumed by `gt reviewer post`)
 
