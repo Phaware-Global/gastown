@@ -2322,10 +2322,10 @@ func (e *Engineer) postMergeConvoyCheck(mr *MRInfo) {
 		e.landConvoySwarm(townRoot, convoy)
 	}
 
-	// Step 3: Notify deacon of convoy-eligible merges for immediate feeding.
-	// When the merged MR is part of a convoy, send a structured CONVOY_NEEDS_FEEDING
-	// protocol message so the deacon can immediately feed the next ready issue
-	// instead of waiting for the next patrol cycle (up to 10 minutes).
+	// Step 3: Wake deacon patrol for convoy completion check after merge.
+	// The daemon's ConvoyManager handles reactive feeding (event-driven on issue
+	// close). The nudge here wakes the deacon to run gt convoy check, which
+	// auto-closes any convoy where all tracked issues are now complete.
 	e.notifyDeaconConvoyFeeding(mr)
 
 	// Step 4: Clean up stale branches from completed work.
@@ -2335,10 +2335,10 @@ func (e *Engineer) postMergeConvoyCheck(mr *MRInfo) {
 	}
 }
 
-// notifyDeaconConvoyFeeding sends a CONVOY_NEEDS_FEEDING protocol message to
-// the deacon when the merged MR is part of a convoy. This triggers immediate
-// convoy feeding instead of waiting for the next deacon patrol cycle (up to
-// 10 minutes). An event is also emitted to wake the deacon from await-signal.
+// notifyDeaconConvoyFeeding sends a CONVOY_NEEDS_FEEDING nudge to the deacon
+// when the merged MR is part of a convoy. This wakes the deacon from
+// await-signal so it can run gt convoy check on the next patrol cycle.
+// The daemon's ConvoyManager handles reactive issue dispatch on close events.
 func (e *Engineer) notifyDeaconConvoyFeeding(mr *MRInfo) {
 	if mr.ConvoyID == "" {
 		return

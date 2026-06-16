@@ -337,7 +337,9 @@ Rate limiting:
 - Per-cycle limit (default 3): max convoys fed per invocation
 - Per-convoy cooldown (default 10m): prevents re-feeding before dog finishes
 
-This is called by the Deacon during patrol. Run manually for debugging.
+NOTE: The daemon's ConvoyManager now handles automatic stranded convoy
+feeding (event-driven + 30s periodic scan). This command is for manual
+debugging only — the Deacon no longer runs it during patrol.
 
 Examples:
   gt deacon feed-stranded                  # Feed stranded convoys
