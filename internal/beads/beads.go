@@ -473,7 +473,8 @@ func (b *Beads) targetBeadsDirForCreate(opts CreateOptions) (string, error) {
 
 	if opts.Rig != "" {
 		if targetDir, ok := ResolveRepoAliasBeadsDir(townRoot, opts.Rig); ok {
-			if prefix := GetPrefixForRig(townRoot, opts.Rig); prefix != "" {
+			if opts.Rig != "hq" && opts.Rig != "town" {
+				prefix := GetPrefixForRig(townRoot, opts.Rig)
 				if err := EnsureConfigYAML(targetDir, prefix); err != nil {
 					return "", fmt.Errorf("ensuring beads config for rig %q: %w", opts.Rig, err)
 				}

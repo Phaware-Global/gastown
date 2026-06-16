@@ -635,6 +635,98 @@ printf '{}\n'
 	}
 }
 
+func TestCreateWithTownAliasDoesNotRepairConfigPrefix(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(townBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir town .beads: %v", err)
+	}
+	if err := WriteRoutes(townBeadsDir, []Route{
+		{Prefix: "hq-", Path: "."},
+		{Prefix: "tr-", Path: "testrig/mayor/rig"},
+	}); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townBeadsDir, "config.yaml"), []byte("prefix: hq\nissue-prefix: hq\ncustom: keep\n"), 0644); err != nil {
+		t.Fatalf("write town config: %v", err)
+	}
+
+	rigBeadsDir := filepath.Join(townRoot, "testrig", "mayor", "rig", ".beads")
+	if err := os.MkdirAll(rigBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir rig .beads: %v", err)
+	}
+
+	stubDir := t.TempDir()
+	stubScript := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "create" ] || { [ "$1" = "--allow-stale" ] && [ "$2" = "create" ]; }; then
+  if [ "$BEADS_DIR" != '%s' ]; then
+    echo "create was not pinned to town beads dir: $BEADS_DIR" >&2
+    exit 41
+  fi
+  config="$BEADS_DIR/config.yaml"
+  if ! grep -q '^prefix: hq$' "$config" || ! grep -q '^issue-prefix: hq$' "$config"; then
+    echo "town config should not be repaired as a rig" >&2
+    cat "$config" >&2
+    exit 42
+  fi
+  printf '{"id":"hq-wisp-abc","title":"test","status":"open","priority":2,"labels":[]}\n'
+  exit 0
+fi
+printf '{}\n'
+`, townBeadsDir)
+	stubPath := filepath.Join(stubDir, "bd")
+	if err := os.WriteFile(stubPath, []byte(stubScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	workerDir := filepath.Join(townRoot, "testrig", "polecats", "quartz")
+	if err := os.MkdirAll(workerDir, 0755); err != nil {
+		t.Fatalf("mkdir worker: %v", err)
+	}
+
+	for _, alias := range []string{"hq", "town"} {
+		t.Run(alias, func(t *testing.T) {
+			issue, err := New(workerDir).Create(CreateOptions{
+				Title:     "Town note",
+				Rig:       alias,
+				Ephemeral: true,
+			})
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			if issue.ID != "hq-wisp-abc" {
+				t.Fatalf("Create ID = %q, want hq-wisp-abc", issue.ID)
+			}
+
+			configData, err := os.ReadFile(filepath.Join(townBeadsDir, "config.yaml"))
+			if err != nil {
+				t.Fatalf("read town config: %v", err)
+			}
+			configText := string(configData)
+			for _, want := range []string{"prefix: hq\n", "issue-prefix: hq\n", "custom: keep\n"} {
+				if !strings.Contains(configText, want) {
+					t.Fatalf("town config missing %q:\n%s", want, configText)
+				}
+			}
+			if strings.Contains(configText, "prefix: gt\n") || strings.Contains(configText, "issue-prefix: gt\n") {
+				t.Fatalf("town config was rewritten as gt:\n%s", configText)
+			}
+		})
+	}
+}
+
 func TestCreateWithUnknownRigErrors(t *testing.T) {
 	townRoot := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
