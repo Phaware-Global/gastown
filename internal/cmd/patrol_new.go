@@ -6,6 +6,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/deacon"
+	"github.com/steveyegge/gastown/internal/style"
 )
 
 var patrolNewRole string
@@ -73,6 +75,17 @@ func runPatrolNew(cmd *cobra.Command, args []string) error {
 		}
 	default:
 		return fmt.Errorf("unsupported role for patrol: %q (expected deacon, witness, or refinery)", roleName)
+	}
+
+	// For deacon: mechanically refresh heartbeat before creating the patrol cycle.
+	// Covers the cold-start case where the LLM may not have run `gt deacon heartbeat`
+	// before calling `gt patrol new`. The daemon kills the Deacon when heartbeat.json
+	// is >20 minutes old, so touching it here ensures liveness is signaled regardless
+	// of whether the formula's heartbeat step ran first.
+	if Role(roleName) == RoleDeacon {
+		if hbErr := deacon.TouchWithAction(roleInfo.TownRoot, "starting patrol cycle", 0, 0); hbErr != nil {
+			style.PrintWarning("heartbeat refresh failed: %v", hbErr)
+		}
 	}
 
 	// Create and hook the wisp
