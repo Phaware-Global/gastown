@@ -305,12 +305,21 @@ func TestScanStranded_SkipsWhenDoltUnhealthy(t *testing.T) {
 	}
 
 	m := NewConvoyManager(paths.townRoot, logger, "gt", 10*time.Minute, nil, nil, nil)
+	// Simulate a prior Dolt poll failure: recovery mode shortens the ticker to
+	// 5s. The skip must clear it so the loop backs off to the normal interval
+	// instead of re-skipping (and re-logging) every 5s during the outage.
+	m.recoveryMode.Store(true)
 	m.scan()
 
 	// No `gt convoy check` (or any convoy subprocess) should run while unhealthy.
 	if _, err := os.Stat(paths.checkLogPath); err == nil {
 		data, _ := os.ReadFile(paths.checkLogPath)
 		t.Errorf("convoy check ran while Dolt unhealthy (should skip): %s", data)
+	}
+
+	// Recovery mode must be cleared so the ticker backs off (no 5s spin loop).
+	if m.recoveryMode.Load() {
+		t.Errorf("recoveryMode should be cleared on unhealthy skip (avoids 5s re-skip spin)")
 	}
 
 	// Should log the skip.

@@ -483,6 +483,12 @@ func (m *ConvoyManager) scan() {
 	// healthy, which triggers a fresh recovery sweep, so convoys skipped here
 	// are picked up as soon as Dolt recovers.
 	if IsDoltUnhealthy(m.townRoot) {
+		// Clear recovery mode so the ticker backs off to the normal scanInterval
+		// instead of polling every 5s while Dolt stays unhealthy — otherwise this
+		// branch would re-stat the signal and re-log the skip every 5s, adding the
+		// very load we're shedding. clearUnhealthySignal fires onRecoveryFn on the
+		// unhealthy→healthy transition, so a prompt sweep still happens on recovery.
+		m.recoveryMode.Store(false)
 		m.logger("Convoy: Dolt unhealthy — skipping stranded scan (sweeps on recovery)")
 		return
 	}
