@@ -63,10 +63,10 @@ func TestHasLabel(t *testing.T) {
 // execResponses maps "command args" to (output, error) pairs.
 // runResponses maps "command args" to error.
 type mockBdResponses struct {
-	execCalls    []string
-	runCalls     []string
-	execResults  map[string]mockExecResult
-	runResults   map[string]error
+	execCalls   []string
+	runCalls    []string
+	execResults map[string]mockExecResult
+	runResults  map[string]error
 }
 
 type mockExecResult struct {
@@ -336,6 +336,13 @@ func TestTrackConvoyFailures_Integration(t *testing.T) {
 				Classification: ZombieAgentDeadInSession,
 				HookBead:       "",
 			},
+			{
+				// Submitted/orphan cleanup — should NOT be tracked as a failure
+				PolecatName:    "delta",
+				Classification: ZombieSubmittedStillRunning,
+				HookBead:       "gt-task-d",
+				WasActive:      false,
+			},
 		},
 	}
 
@@ -345,7 +352,7 @@ func TestTrackConvoyFailures_Integration(t *testing.T) {
 
 	trackConvoyFailures(mock.toBdCli(), "/tmp", result)
 
-	// Should have queried only gt-task-a (not gt-task-b or empty)
+	// Should have queried only gt-task-a (not gt-task-b, empty, or submitted idle)
 	if len(mock.execCalls) != 1 {
 		t.Errorf("expected 1 exec call, got %d: %v", len(mock.execCalls), mock.execCalls)
 	}

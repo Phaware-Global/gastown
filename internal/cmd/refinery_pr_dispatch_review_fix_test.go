@@ -139,9 +139,9 @@ func TestReviewFixSlingArgs(t *testing.T) {
 
 	// Required flags for the dispatch to land a polecat on the PR branch.
 	want := map[string]string{
-		"--pr":     "42",
-		"--branch": "polecat/furiosa-gt-abc",
-		"--args":   "mission text",
+		"--review-pr":     "42",
+		"--review-branch": "polecat/furiosa-gt-abc",
+		"--args":          "mission text",
 	}
 	for flag, val := range want {
 		idx := argIndexOf(args, flag)

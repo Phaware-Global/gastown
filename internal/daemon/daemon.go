@@ -140,6 +140,10 @@ type Daemon struct {
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	knownRigsCache      []string
 	knownRigsCacheValid bool
+
+	// legacySocketCleanupOnce ensures upgrade cleanup only runs once per daemon
+	// lifetime, before any patrol agent can be started on the current socket.
+	legacySocketCleanupOnce sync.Once
 }
 
 // sessionDeath records a detected session death for mass death analysis.
@@ -163,6 +167,12 @@ const (
 const beadsModulePath = "github.com/steveyegge/beads"
 
 var semverPattern = regexp.MustCompile(`v?(\d+\.\d+\.\d+)`)
+
+var cleanupLegacySocketsForDaemon = func(townRoot string) (int, int) {
+	defaultCleaned := session.CleanupLegacyDefaultSocket()
+	baseCleaned := session.CleanupLegacyBaseSocket(townRoot)
+	return defaultCleaned, baseCleaned
+}
 
 // New creates a new daemon instance.
 func New(config *Config) (*Daemon, error) {
@@ -281,6 +291,49 @@ func New(config *Config) (*Daemon, error) {
 	}
 
 	// PATCH-006: Resolve binary paths at startup.
+	//
+	// PATCH-007 (hq-olcb): Augment PATH with common user/local bin
+	// directories before LookPath. The daemon is often launched from a
+	// systemd unit / login shell whose PATH does not include
+	// ~/.local/bin, where pip-installed `bd` and user-installed `gt`
+	// typically live. Without this, both LookPath calls fail at
+	// startup → gtPath / bdPath fall back to literal names → every
+	// subsequent exec.Command(d.gtPath, ...) fails with "executable
+	// file not found in $PATH", which cascaded into stranded convoys
+	// (couldn't query rig beads), failed dog dispatches (wisp_reaper
+	// fell back to inline mode), and likely upstream of hq-we9c
+	// (reaper false-positives, since the polecat-has-work check uses
+	// these binaries). Augmenting the daemon's own PATH propagates to
+	// child processes via bdReadOnlyEnv()'s os.Environ() pass-through.
+	if home := os.Getenv("HOME"); home != "" {
+		extras := []string{
+			filepath.Join(home, ".local/bin"),
+			filepath.Join(home, "bin"),
+			"/usr/local/bin",
+		}
+		current := os.Getenv("PATH")
+		parts := strings.Split(current, string(os.PathListSeparator))
+		seen := make(map[string]struct{}, len(parts)+len(extras))
+		for _, p := range parts {
+			seen[p] = struct{}{}
+		}
+		augmented := parts
+		for _, extra := range extras {
+			if _, ok := seen[extra]; ok {
+				continue
+			}
+			if info, statErr := os.Stat(extra); statErr == nil && info.IsDir() {
+				augmented = append([]string{extra}, augmented...)
+				seen[extra] = struct{}{}
+			}
+		}
+		newPath := strings.Join(augmented, string(os.PathListSeparator))
+		if newPath != current {
+			_ = os.Setenv("PATH", newPath)
+			logger.Printf("PATCH-007: augmented daemon PATH with user bin dirs (was=%q, now=%q)", current, newPath)
+		}
+	}
+
 	gtPath, err := exec.LookPath("gt")
 	if err != nil {
 		gtPath = "gt"
@@ -337,7 +390,7 @@ func New(config *Config) (*Daemon, error) {
 		}
 	}
 
-	return &Daemon{
+	d := &Daemon{
 		config:          config,
 		patrolConfig:    patrolConfig,
 		disabledPatrols: disabledPatrols,
@@ -353,7 +406,20 @@ func New(config *Config) (*Daemon, error) {
 		otelProvider:    otelProvider,
 		metrics:         dm,
 		rigPool:         newRigWorkerPool(0, 0, logger), // defaults: 10 workers, 30s timeout
-	}, nil
+	}
+	return d, nil
+}
+
+func (d *Daemon) cleanupLegacySocketSessions() {
+	d.legacySocketCleanupOnce.Do(func() {
+		defaultCleaned, baseCleaned := cleanupLegacySocketsForDaemon(d.config.TownRoot)
+		if defaultCleaned > 0 {
+			d.logger.Printf("legacy_socket_cleanup: cleaned %d session(s) from default socket", defaultCleaned)
+		}
+		if baseCleaned > 0 {
+			d.logger.Printf("legacy_socket_cleanup: cleaned %d session(s) from basename socket", baseCleaned)
+		}
+	})
 }
 
 // Run starts the daemon main loop.
@@ -444,6 +510,11 @@ func (d *Daemon) Run() (err error) {
 	if err != nil {
 		return err
 	}
+
+	// Clean sessions left behind on legacy tmux sockets after daemon startup has
+	// passed fatal preflight checks but before any patrol agents can be spawned.
+	d.cleanupLegacySocketSessions()
+
 	isRigParked := func(rigName string) bool {
 		ok, _ := d.isRigOperational(rigName)
 		return !ok
@@ -1602,6 +1673,25 @@ func (d *Daemon) restartStuckDeacon(sessionName, reason string) {
 		if !d.restartTracker.CanRestart(agentID) {
 			remaining := d.restartTracker.GetBackoffRemaining(agentID)
 			d.logger.Printf("Stuck-agent-dog: Deacon restart in backoff, %s remaining", remaining.Round(time.Second))
+			return
+		}
+	}
+
+	// Distinguish a usage-limit pause from a true crash. If Claude is sitting
+	// at a rate-limit prompt the heartbeat will go stale, looking identical
+	// to a crash — but killing and respawning won't help (the new session
+	// hits the same limit) and the repeated kills burn the crash-loop budget.
+	// Detect the rate-limit signature in the pane and let quota_dog handle
+	// account rotation instead.
+	if d.tmux != nil {
+		if pane, err := d.tmux.CapturePane(sessionName, 30); err == nil && IsClaudeUsageLimit(pane) {
+			d.logger.Printf("Stuck-agent-dog: Deacon paused — Claude usage-limit detected, skipping kill (quota_dog will rotate accounts). Reason: %s", reason)
+			if d.restartTracker != nil {
+				d.restartTracker.RecordPause(agentID)
+				if err := d.restartTracker.Save(); err != nil {
+					d.logger.Printf("Warning: failed to save restart state: %v", err)
+				}
+			}
 			return
 		}
 	}
@@ -2769,7 +2859,7 @@ func (d *Daemon) isBeadClosed(beadID string) bool {
 	cmd := exec.Command(d.bdPath, "show", beadID, "--json") //nolint:gosec // G204: args are constructed internally
 	setSysProcAttr(cmd)
 	cmd.Dir = d.config.TownRoot
-	cmd.Env = os.Environ()
+	cmd.Env = bdReadOnlyEnv()
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -2802,7 +2892,7 @@ func (d *Daemon) hasAssignedOpenWork(rigName, assignee string) bool {
 		}
 		cmd := exec.Command(d.bdPath, args...) //nolint:gosec // G204: args are constructed internally
 		cmd.Dir = d.config.TownRoot
-		cmd.Env = os.Environ()
+		cmd.Env = bdReadOnlyEnv()
 		output, err := cmd.Output()
 		if err != nil {
 			continue

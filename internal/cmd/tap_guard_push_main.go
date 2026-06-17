@@ -323,7 +323,7 @@ func skipGitGlobalArgs(fields []string) int {
 // refspecTargetsMain returns true if a single refspec token (one of the
 // `<src>:<dst>` / `<ref>` forms) names main on the destination side.
 func refspecTargetsMain(token string) bool {
-	if token == "main" || token == "refs/heads/main" {
+	if token == "main" || token == "refs/heads/main" { //nolint:gosec // G101: 'token' is a parsed git ref component, not a credential
 		return true
 	}
 	if idx := strings.Index(token, ":"); idx >= 0 {

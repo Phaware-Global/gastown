@@ -389,6 +389,7 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 		m.logger("Convoy: close detected: %s (from %s)", issueID, name)
 		resolver := convoy.NewStoreResolver(m.townRoot, stores)
 		convoy.CheckConvoysForIssue(m.ctx, hqStore, m.townRoot, issueID, "Convoy", m.logger, m.gtPath, m.isRigParked, resolver)
+		convoy.FireCrossRigDepNotifications(m.ctx, issueID, m.townRoot, stores, m.logger)
 	}
 	return nil
 }
@@ -475,6 +476,24 @@ func (m *ConvoyManager) scan() {
 	m.scanMu.Lock()
 	defer m.scanMu.Unlock()
 
+	// Backpressure: skip the scan while Dolt is flagged unhealthy. Each scan
+	// shells `gt convoy stranded` + a `gt convoy check` per convoy, all of
+	// which run heavy `bd list` queries; piling them onto a degraded Dolt
+	// deepens the outage (the convoy-check death-spiral). Skipping is safe:
+	// clearUnhealthySignal fires onRecoveryFn when Dolt transitions back to
+	// healthy, which triggers a fresh recovery sweep, so convoys skipped here
+	// are picked up as soon as Dolt recovers.
+	if IsDoltUnhealthy(m.townRoot) {
+		// Clear recovery mode so the ticker backs off to the normal scanInterval
+		// instead of polling every 5s while Dolt stays unhealthy — otherwise this
+		// branch would re-stat the signal and re-log the skip every 5s, adding the
+		// very load we're shedding. clearUnhealthySignal fires onRecoveryFn on the
+		// unhealthy→healthy transition, so a prompt sweep still happens on recovery.
+		m.recoveryMode.Store(false)
+		m.logger("Convoy: Dolt unhealthy — skipping stranded scan (sweeps on recovery)")
+		return
+	}
+
 	stranded, err := m.findStranded()
 	if err != nil {
 		m.logger("Convoy: stranded scan failed: %s", util.FirstLine(err.Error()))
@@ -515,6 +534,7 @@ func (m *ConvoyManager) scan() {
 func (m *ConvoyManager) findStranded() ([]strandedConvoyInfo, error) {
 	cmd := exec.CommandContext(m.ctx, m.gtPath, "convoy", "stranded", "--json")
 	cmd.Dir = m.townRoot
+	cmd.Env = bdReadOnlyEnv()
 	util.SetProcessGroup(cmd)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
