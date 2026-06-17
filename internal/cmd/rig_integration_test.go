@@ -13,12 +13,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 )
@@ -1218,6 +1220,14 @@ func runAgentCleanTest(t *testing.T, hasTrackedBeads bool) {
 			t.Fatalf("git %v: %v\n%s", args, err, out)
 		}
 	}
+
+	// Isolate this town on its own free Dolt port. gt install starts a managed
+	// Dolt server (doltserver.Start), so towns sharing the test container's
+	// GT_DOLT_PORT collide ("port already in use"). A unique free port per town
+	// makes install self-contained and CI-deterministic.
+	isoPort := strconv.Itoa(doltserver.FindFreePort(20000))
+	t.Setenv("GT_DOLT_PORT", isoPort)
+	t.Setenv("BEADS_DOLT_PORT", isoPort)
 
 	// Step 2: Run gt install
 	cmd := exec.Command(gtBinary, "install", hqPath, "--name", "test-town")

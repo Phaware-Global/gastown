@@ -15,8 +15,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/doltserver"
 )
 
 // extractJSON finds the first JSON object in output that may contain non-JSON warnings.
@@ -144,6 +147,13 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		townRoot := filepath.Join(tmpDir, "town-prefix-test")
 
 		// Install town
+		// Isolate this town on its own free Dolt port. gt install starts a
+		// managed Dolt server (doltserver.Start), so towns sharing the test
+		// container's GT_DOLT_PORT collide ("port already in use"). A unique
+		// free port per town makes install self-contained and CI-deterministic.
+		isoPort := strconv.Itoa(doltserver.FindFreePort(20000))
+		t.Setenv("GT_DOLT_PORT", isoPort)
+		t.Setenv("BEADS_DOLT_PORT", isoPort)
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "prefix-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
 		if output, err := cmd.CombinedOutput(); err != nil {
@@ -206,6 +216,13 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		townRoot := filepath.Join(tmpDir, "town-no-issues")
 
 		// Install town
+		// Isolate this town on its own free Dolt port. gt install starts a
+		// managed Dolt server (doltserver.Start), so towns sharing the test
+		// container's GT_DOLT_PORT collide ("port already in use"). A unique
+		// free port per town makes install self-contained and CI-deterministic.
+		isoPort := strconv.Itoa(doltserver.FindFreePort(20000))
+		t.Setenv("GT_DOLT_PORT", isoPort)
+		t.Setenv("BEADS_DOLT_PORT", isoPort)
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "no-issues-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
 		if output, err := cmd.CombinedOutput(); err != nil {
@@ -267,6 +284,13 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		townRoot := filepath.Join(tmpDir, "town-mismatch")
 
 		// Install town
+		// Isolate this town on its own free Dolt port. gt install starts a
+		// managed Dolt server (doltserver.Start), so towns sharing the test
+		// container's GT_DOLT_PORT collide ("port already in use"). A unique
+		// free port per town makes install self-contained and CI-deterministic.
+		isoPort := strconv.Itoa(doltserver.FindFreePort(20000))
+		t.Setenv("GT_DOLT_PORT", isoPort)
+		t.Setenv("BEADS_DOLT_PORT", isoPort)
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "mismatch-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
 		if output, err := cmd.CombinedOutput(); err != nil {
@@ -311,6 +335,13 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		townRoot := filepath.Join(tmpDir, "town-derived")
 
 		// Install town
+		// Isolate this town on its own free Dolt port. gt install starts a
+		// managed Dolt server (doltserver.Start), so towns sharing the test
+		// container's GT_DOLT_PORT collide ("port already in use"). A unique
+		// free port per town makes install self-contained and CI-deterministic.
+		isoPort := strconv.Itoa(doltserver.FindFreePort(20000))
+		t.Setenv("GT_DOLT_PORT", isoPort)
+		t.Setenv("BEADS_DOLT_PORT", isoPort)
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "derived-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
 		if output, err := cmd.CombinedOutput(); err != nil {
@@ -366,6 +397,13 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		townRoot := filepath.Join(tmpDir, "town-reinit")
 
 		// Install town
+		// Isolate this town on its own free Dolt port. gt install starts a
+		// managed Dolt server (doltserver.Start), so towns sharing the test
+		// container's GT_DOLT_PORT collide ("port already in use"). A unique
+		// free port per town makes install self-contained and CI-deterministic.
+		isoPort := strconv.Itoa(doltserver.FindFreePort(20000))
+		t.Setenv("GT_DOLT_PORT", isoPort)
+		t.Setenv("BEADS_DOLT_PORT", isoPort)
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "reinit-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
 		if output, err := cmd.CombinedOutput(); err != nil {
