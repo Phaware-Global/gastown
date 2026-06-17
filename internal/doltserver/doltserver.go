@@ -1507,6 +1507,7 @@ behavior:
     # 'gt dolt rebase' or 'dolt gc' on a schedule instead. (Re-enable by
     # editing internal/doltserver/doltserver.go writeServerConfig.)
     enable: false
+    archive_level: 0
 `,
 		config.LogLevel,
 		config.Port,
@@ -3193,6 +3194,29 @@ func RepairWorkspace(townRoot string, ws BrokenWorkspace) (string, error) {
 // Callers that know the rig uses a short DB prefix (e.g. "be" for "beads_el")
 // should pass it as doltDatabase so metadata.json gets the right value.
 func EnsureMetadata(townRoot, rigName string, doltDatabase ...string) error {
+	// Use FindOrCreateRigBeadsDir to atomically resolve and create the directory,
+	// avoiding the TOCTOU race where the directory state changes between
+	// FindRigBeadsDir's Stat check and our subsequent file operations.
+	beadsDir, err := FindOrCreateRigBeadsDir(townRoot, rigName)
+	if err != nil {
+		return fmt.Errorf("resolving beads directory for rig %q: %w", rigName, err)
+	}
+
+	return EnsureMetadataForBeadsDir(townRoot, beadsDir, rigName, doltDatabase...)
+}
+
+// EnsureMetadataForBeadsDir writes or updates metadata.json in a known beads
+// directory. It only writes local config and does not require the Dolt server or
+// database to exist, so callers can leave a recoverable rig behind after partial
+// initialization failures.
+func EnsureMetadataForBeadsDir(townRoot, beadsDir, rigName string, doltDatabase ...string) error {
+	if beadsDir == "" {
+		return fmt.Errorf("beads directory is required")
+	}
+	if rigName == "" {
+		return fmt.Errorf("rig name is required")
+	}
+
 	// Determine the Dolt database name to write when the field is absent.
 	// Default: rigName (correct when db-name == rig-dir-name, e.g. "gastown").
 	// Callers from EnsureAllMetadata pass the actual DB prefix ("at", "be") so
@@ -3204,12 +3228,8 @@ func EnsureMetadata(townRoot, rigName string, doltDatabase ...string) error {
 		effectiveDB = doltDatabase[0]
 	}
 
-	// Use FindOrCreateRigBeadsDir to atomically resolve and create the directory,
-	// avoiding the TOCTOU race where the directory state changes between
-	// FindRigBeadsDir's Stat check and our subsequent file operations.
-	beadsDir, err := FindOrCreateRigBeadsDir(townRoot, rigName)
-	if err != nil {
-		return fmt.Errorf("resolving beads directory for rig %q: %w", rigName, err)
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		return fmt.Errorf("creating beads directory: %w", err)
 	}
 
 	metadataPath := filepath.Join(beadsDir, "metadata.json")

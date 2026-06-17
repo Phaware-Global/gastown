@@ -428,6 +428,21 @@ func configureRefspec(repoPath string, singleBranch bool) error {
 		return fmt.Errorf("configuring refspec: %s", strings.TrimSpace(stderr.String()))
 	}
 
+	// Empty remotes clone successfully but have no refs to fetch. Let callers
+	// perform their own empty-repository validation instead of returning a
+	// misleading "couldn't find remote ref" error from the fetch below.
+	var refsStderr bytes.Buffer
+	refsCmd := exec.Command("git", "--git-dir", gitDir, "show-ref", "--quiet")
+	util.SetDetachedProcessGroup(refsCmd)
+	refsCmd.Stderr = &refsStderr
+	if err := refsCmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return nil
+		}
+		return fmt.Errorf("checking refs: %s", strings.TrimSpace(refsStderr.String()))
+	}
+
 	if singleBranch {
 		// For shallow single-branch clones, fetch only the HEAD branch to create
 		// the origin/<branch> ref that worktrees need. A full `git fetch origin`
@@ -1991,6 +2006,17 @@ func (g *Git) ListRemoteRefs(remote, prefix string) ([]string, error) {
 		}
 	}
 	return refs, nil
+}
+
+// RemoteHasRefs reports whether a remote has any refs at all. It deliberately
+// includes tags so callers can distinguish a truly empty repo from a non-empty
+// repo with no branch refs or a broken remote HEAD.
+func (g *Git) RemoteHasRefs(remote string) (bool, error) {
+	out, err := g.run("ls-remote", "--refs", remote)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "", nil
 }
 
 // ListPushRemoteRefs lists remote refs from the push URL when it differs from

@@ -18,9 +18,9 @@ import (
 // reconstructed into a SlingParams and passed to executeSling().
 type SlingParams struct {
 	// What to sling
-	BeadID      string   // Base bead
-	FormulaName string   // Formula to apply ("mol-polecat-work", user formula, or "")
-	RigName     string   // Target rig (always a rig for queue)
+	BeadID      string // Base bead
+	FormulaName string // Formula to apply ("mol-polecat-work", user formula, or "")
+	RigName     string // Target rig (always a rig for queue)
 
 	// CLI flag passthrough
 	Args         string   // --args
@@ -30,14 +30,14 @@ type SlingParams struct {
 	ResumeBranch string   // --branch / --pr (resume existing PR branch, gh#3602)
 	Account      string   // --account
 	Agent        string   // --agent
-	NoConvoy   bool     // --no-convoy
-	Owned      bool     // --owned
-	NoMerge    bool     // --no-merge
-	Force      bool     // --force
-	HookRawBead bool    // --hook-raw-bead
-	NoBoot     bool     // --no-boot
-	Mode       string   // --ralph: "" (normal) or "ralph"
-	ReviewOnly bool     // --review-only: review and report back only, no merge/commit/push
+	NoConvoy     bool     // --no-convoy
+	Owned        bool     // --owned
+	NoMerge      bool     // --no-merge
+	Force        bool     // --force
+	HookRawBead  bool     // --hook-raw-bead
+	NoBoot       bool     // --no-boot
+	Mode         string   // --ralph: "" (normal) or "ralph"
+	ReviewOnly   bool     // --review-only: review and report back only, no merge/commit/push
 
 	// Execution behavior (set by caller, not serialized to queue)
 	SkipCook         bool   // Batch optimization: formula already cooked
@@ -163,6 +163,13 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	if isDeferredBead(info) && !explicitForce {
 		result.ErrMsg = "deferred"
 		return result, fmt.Errorf("bead %s is deferred (use --force to override)", params.BeadID)
+	}
+
+	if params.RigName != "" {
+		if err := verifyBeadExistsInTargetRigDatabase(params.BeadID, params.RigName, townRoot); err != nil {
+			result.ErrMsg = err.Error()
+			return result, err
+		}
 	}
 
 	// Send LIFECYCLE:Shutdown to the witness when force-stealing a bead from a

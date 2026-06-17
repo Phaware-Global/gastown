@@ -36,15 +36,15 @@ type Formula struct {
 	ReviewOnly  bool        `toml:"review_only"` // If true, all legs are analysis-only — no code commits expected (gt-kvf)
 
 	// Convoy-specific
-	Inputs    map[string]Input `toml:"inputs"`
+	Inputs    map[string]Input  `toml:"inputs"`
 	Prompts   map[string]string `toml:"prompts"`
 	Output    *Output           `toml:"output"`
 	Legs      []Leg             `toml:"legs"`
 	Synthesis *Synthesis        `toml:"synthesis"`
 
 	// Workflow-specific
-	Steps []Step           `toml:"steps"`
-	Vars  map[string]Var   `toml:"vars"`
+	Steps []Step         `toml:"steps"`
+	Vars  map[string]Var `toml:"vars"`
 
 	// Composition-specific
 	Extends []string      `toml:"extends"` // Parent formula names to inherit steps from.
@@ -123,6 +123,7 @@ type Step struct {
 	Title       string   `toml:"title"`
 	Description string   `toml:"description"`
 	Needs       []string `toml:"needs"`
+	Target      string   `toml:"target"`      // Optional gt sling target for this workflow step; defaults to the formula target rig
 	Parallel    bool     `toml:"parallel"`    // If true, this step can run concurrently with other parallel steps that share the same needs
 	Interactive bool     `toml:"interactive"` // If true, this step requires user dialog and runs in the current session instead of being dispatched to a polecat
 	Acceptance  string   `toml:"acceptance"`  // Exit criteria for this step (used by Ralph loop mode)

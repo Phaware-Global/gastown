@@ -767,13 +767,15 @@ func TestInstallWithDaemon(t *testing.T) {
 	})
 }
 
-// cleanE2EEnv returns os.Environ() with GT_* variables removed, except
-// GT_DOLT_PORT which is preserved so subprocesses connect to the ephemeral
-// Dolt test server started by TestMain instead of defaulting to port 3307.
+// cleanE2EEnv returns os.Environ() with GT_* variables removed, except Dolt
+// test routing variables so subprocesses connect to the ephemeral Dolt test
+// server started by TestMain instead of defaulting to port 3307.
 func cleanE2EEnv() []string {
 	var clean []string
 	for _, env := range os.Environ() {
-		if strings.HasPrefix(env, "GT_") && !strings.HasPrefix(env, "GT_DOLT_PORT=") {
+		if strings.HasPrefix(env, "GT_") &&
+			!strings.HasPrefix(env, "GT_DOLT_PORT=") &&
+			!strings.HasPrefix(env, "GT_TEST_EXTERNAL_DOLT=") {
 			continue
 		}
 		clean = append(clean, env)

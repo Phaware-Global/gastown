@@ -99,20 +99,30 @@ type fetchCircuitBreaker struct {
 	failures    int
 	lastAttempt time.Time
 	backoff     time.Duration
+	inFlight    bool
 }
 
 // maxBackoff is the maximum backoff duration for the circuit breaker.
 const maxBackoff = 5 * time.Minute
 
 // allow returns true if enough time has passed since the last failure to permit
-// a new attempt. Always allows the first attempt (zero failures).
+// a new attempt, and reserves that attempt so concurrent callers do not all
+// stampede through when backoff opens.
 func (cb *fetchCircuitBreaker) allow() bool {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+	if cb.inFlight {
+		return false
+	}
 	if cb.failures == 0 {
+		cb.inFlight = true
 		return true
 	}
-	return time.Since(cb.lastAttempt) >= cb.backoff
+	if time.Since(cb.lastAttempt) < cb.backoff {
+		return false
+	}
+	cb.inFlight = true
+	return true
 }
 
 // recordFailure increments the failure count and sets exponential backoff.
@@ -122,6 +132,7 @@ func (cb *fetchCircuitBreaker) recordFailure() {
 	defer cb.mu.Unlock()
 	cb.failures++
 	cb.lastAttempt = time.Now()
+	cb.inFlight = false
 	// Exponential backoff: 10s, 20s, 40s, 80s, 160s, capped at maxBackoff
 	cb.backoff = time.Duration(1<<min(cb.failures, 10)) * 5 * time.Second
 	if cb.backoff > maxBackoff {
@@ -135,6 +146,7 @@ func (cb *fetchCircuitBreaker) recordSuccess() {
 	defer cb.mu.Unlock()
 	cb.failures = 0
 	cb.backoff = 0
+	cb.inFlight = false
 }
 
 // LiveConvoyFetcher fetches convoy data from beads.
@@ -239,6 +251,7 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 		CreatedAt string `json:"created_at"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil {
+		f.convoyBreaker.recordFailure()
 		return nil, fmt.Errorf("parsing convoy list: %w", err)
 	}
 

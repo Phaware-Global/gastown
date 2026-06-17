@@ -980,6 +980,54 @@ func TestEnsureBeadsRedirect_WitnessCreatesRedirect(t *testing.T) {
 	}
 }
 
+func TestEnsureBeadsRedirect_RepairsExistingRedirectChain(t *testing.T) {
+	townRoot := t.TempDir()
+	rigRoot := filepath.Join(townRoot, "testrig")
+	rigBeadsDir := filepath.Join(rigRoot, ".beads")
+	mayorBeadsDir := filepath.Join(rigRoot, "mayor", "rig", ".beads")
+	workDir := filepath.Join(rigRoot, "polecats", "worker1", "testrig")
+	workBeadsDir := filepath.Join(workDir, ".beads")
+
+	if err := os.MkdirAll(mayorBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir mayor beads dir: %v", err)
+	}
+	if err := os.MkdirAll(rigBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir rig beads dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigBeadsDir, "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatalf("write rig redirect: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigBeadsDir, "metadata.json"), []byte(`{"dolt_database":"hq","backend":"dolt"}`), 0644); err != nil {
+		t.Fatalf("write rig metadata: %v", err)
+	}
+	if err := os.MkdirAll(workBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir work beads dir: %v", err)
+	}
+
+	// Old polecat worktrees can keep this bd-incompatible chain:
+	// worktree/.beads -> rig/.beads -> mayor/rig/.beads.
+	redirectPath := filepath.Join(workBeadsDir, "redirect")
+	if err := os.WriteFile(redirectPath, []byte("../../../.beads\n"), 0644); err != nil {
+		t.Fatalf("write stale redirect: %v", err)
+	}
+
+	ctx := RoleContext{
+		Role:     RolePolecat,
+		WorkDir:  workDir,
+		TownRoot: townRoot,
+	}
+
+	ensureBeadsRedirect(ctx)
+
+	content, err := os.ReadFile(redirectPath)
+	if err != nil {
+		t.Fatalf("read redirect: %v", err)
+	}
+	if got, want := string(content), "../../../mayor/rig/.beads\n"; got != want {
+		t.Fatalf("redirect content = %q, want %q", got, want)
+	}
+}
+
 // TestOutputRalphLoopDirective_NoSlashCommand verifies that ralph mode emits
 // inline iterative work instructions instead of referencing a nonexistent
 // /ralph-loop slash command. This is the regression test for the ralph-loop

@@ -33,6 +33,37 @@ func TestDefaultConfig(t *testing.T) {
 	}
 }
 
+func TestCleanupLegacySocketSessionsRunsOnce(t *testing.T) {
+	oldCleanup := cleanupLegacySocketsForDaemon
+	t.Cleanup(func() { cleanupLegacySocketsForDaemon = oldCleanup })
+
+	var calls int
+	var gotRoot string
+	cleanupLegacySocketsForDaemon = func(townRoot string) (int, int) {
+		calls++
+		gotRoot = townRoot
+		return 1, 2
+	}
+
+	townRoot := t.TempDir()
+	d := &Daemon{
+		config: DefaultConfig(townRoot),
+		logger: log.New(io.Discard, "", 0),
+	}
+	d.cleanupLegacySocketSessions()
+	if calls != 1 {
+		t.Fatalf("cleanup calls after first invocation = %d, want 1", calls)
+	}
+	if gotRoot != townRoot {
+		t.Fatalf("cleanup townRoot = %q, want %q", gotRoot, townRoot)
+	}
+
+	d.cleanupLegacySocketSessions()
+	if calls != 1 {
+		t.Fatalf("cleanup calls after second invocation = %d, want 1", calls)
+	}
+}
+
 func TestStateFile(t *testing.T) {
 	townRoot := "/tmp/test-town"
 	expected := filepath.Join(townRoot, "daemon", "state.json")

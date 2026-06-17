@@ -808,7 +808,7 @@ func TestE2E_Server_MergeQueueEmpty(t *testing.T) {
 	mock := &MockConvoyFetcher{
 		Convoys:    []ConvoyRow{},
 		MergeQueue: []MergeQueueRow{},
-		Workers:   []WorkerRow{},
+		Workers:    []WorkerRow{},
 	}
 
 	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
@@ -1194,6 +1194,43 @@ func TestConvoyHandler_CacheBypassOnExpand(t *testing.T) {
 	}
 }
 
+func TestConvoyHandler_ExpandCachePreventsRepeatedFetchConvoysErrors(t *testing.T) {
+	fetchCount := 0
+	mock := &CountingMockFetcher{
+		inner:      &MockConvoyFetcher{Error: errFetchFailed},
+		fetchCount: &fetchCount,
+	}
+
+	handler, err := NewConvoyHandler(mock, 8*time.Second, "test-token")
+	if err != nil {
+		t.Fatalf("NewConvoyHandler() error = %v", err)
+	}
+	handler.cacheTTL = 5 * time.Second
+
+	req1 := httptest.NewRequest("GET", "/?expand=convoys", nil)
+	w1 := httptest.NewRecorder()
+	handler.ServeHTTP(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("First expand request status = %d, want 200", w1.Code)
+	}
+	if fetchCount != 1 {
+		t.Fatalf("After first expand request, fetchCount = %d, want 1", fetchCount)
+	}
+
+	req2 := httptest.NewRequest("GET", "/?expand=convoys", nil)
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("Second expand request status = %d, want 200", w2.Code)
+	}
+	if fetchCount != 1 {
+		t.Fatalf("Second expand request should use cached error response; fetchCount = %d, want 1", fetchCount)
+	}
+	if w1.Body.String() != w2.Body.String() {
+		t.Fatal("Cached expand error response should match original response")
+	}
+}
+
 // CountingMockFetcher wraps a ConvoyFetcher and counts FetchConvoys calls.
 type CountingMockFetcher struct {
 	inner      ConvoyFetcher
@@ -1207,19 +1244,19 @@ func (m *CountingMockFetcher) FetchConvoys() ([]ConvoyRow, error) {
 func (m *CountingMockFetcher) FetchMergeQueue() ([]MergeQueueRow, error) {
 	return m.inner.FetchMergeQueue()
 }
-func (m *CountingMockFetcher) FetchWorkers() ([]WorkerRow, error)       { return m.inner.FetchWorkers() }
-func (m *CountingMockFetcher) FetchMail() ([]MailRow, error)            { return m.inner.FetchMail() }
-func (m *CountingMockFetcher) FetchRigs() ([]RigRow, error)             { return m.inner.FetchRigs() }
-func (m *CountingMockFetcher) FetchDogs() ([]DogRow, error)             { return m.inner.FetchDogs() }
+func (m *CountingMockFetcher) FetchWorkers() ([]WorkerRow, error) { return m.inner.FetchWorkers() }
+func (m *CountingMockFetcher) FetchMail() ([]MailRow, error)      { return m.inner.FetchMail() }
+func (m *CountingMockFetcher) FetchRigs() ([]RigRow, error)       { return m.inner.FetchRigs() }
+func (m *CountingMockFetcher) FetchDogs() ([]DogRow, error)       { return m.inner.FetchDogs() }
 func (m *CountingMockFetcher) FetchEscalations() ([]EscalationRow, error) {
 	return m.inner.FetchEscalations()
 }
-func (m *CountingMockFetcher) FetchHealth() (*HealthRow, error)    { return m.inner.FetchHealth() }
-func (m *CountingMockFetcher) FetchQueues() ([]QueueRow, error)    { return m.inner.FetchQueues() }
+func (m *CountingMockFetcher) FetchHealth() (*HealthRow, error)     { return m.inner.FetchHealth() }
+func (m *CountingMockFetcher) FetchQueues() ([]QueueRow, error)     { return m.inner.FetchQueues() }
 func (m *CountingMockFetcher) FetchSessions() ([]SessionRow, error) { return m.inner.FetchSessions() }
-func (m *CountingMockFetcher) FetchHooks() ([]HookRow, error)      { return m.inner.FetchHooks() }
-func (m *CountingMockFetcher) FetchMayor() (*MayorStatus, error)   { return m.inner.FetchMayor() }
-func (m *CountingMockFetcher) FetchIssues() ([]IssueRow, error)    { return m.inner.FetchIssues() }
+func (m *CountingMockFetcher) FetchHooks() ([]HookRow, error)       { return m.inner.FetchHooks() }
+func (m *CountingMockFetcher) FetchMayor() (*MayorStatus, error)    { return m.inner.FetchMayor() }
+func (m *CountingMockFetcher) FetchIssues() ([]IssueRow, error)     { return m.inner.FetchIssues() }
 func (m *CountingMockFetcher) FetchActivity() ([]ActivityRow, error) {
 	return m.inner.FetchActivity()
 }
@@ -1263,6 +1300,9 @@ func TestFetchCircuitBreaker(t *testing.T) {
 	// Initially allowed
 	if !cb.allow() {
 		t.Fatal("circuit breaker should allow first attempt")
+	}
+	if cb.allow() {
+		t.Fatal("circuit breaker should reserve the in-flight attempt")
 	}
 
 	// Record a failure — should block immediate retry

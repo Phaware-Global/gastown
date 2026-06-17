@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/townlog"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -399,8 +400,33 @@ func runLogCrash(cmd *cobra.Command, args []string) error {
 	if err := logger.Log(eventType, crashAgent, context); err != nil {
 		return fmt.Errorf("logging event: %w", err)
 	}
+	if eventType == townlog.EventCrash {
+		logCrashFeedEvent(townRoot, crashAgent, crashSession, crashExitCode)
+	}
 
 	return nil
+}
+
+func logCrashFeedEvent(townRoot, agent, session string, exitCode int) {
+	if townRoot == "" {
+		return
+	}
+	if session == "" {
+		session = "unknown"
+	}
+
+	origDir, getwdErr := os.Getwd()
+	if err := os.Chdir(townRoot); err != nil {
+		return
+	}
+	if getwdErr == nil {
+		defer func() { _ = os.Chdir(origDir) }()
+	}
+
+	reason := fmt.Sprintf("crashed with exit code %d", exitCode)
+	payload := events.SessionDeathPayload(session, agent, reason, "gt log crash")
+	payload["exit_code"] = exitCode
+	_ = events.LogFeed(events.TypeSessionDeath, agent, payload)
 }
 
 // LogEvent is a helper that logs an event from anywhere in the codebase.

@@ -569,6 +569,34 @@ func TestCloneBareHasOriginRefs(t *testing.T) {
 	}
 }
 
+func TestCloneBareEmptyRepoSkipsMissingHeadFetch(t *testing.T) {
+	tmp := t.TempDir()
+	remoteDir := filepath.Join(tmp, "remote")
+	if err := os.MkdirAll(remoteDir, 0755); err != nil {
+		t.Fatalf("mkdir remote: %v", err)
+	}
+	cmd := exec.Command("git", "init")
+	cmd.Dir = remoteDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+
+	bareDir := filepath.Join(tmp, "bare.git")
+	g := NewGit(tmp)
+	if err := g.CloneBare(remoteDir, bareDir); err != nil {
+		t.Fatalf("CloneBare empty repo: %v", err)
+	}
+
+	bareGit := NewGitWithDir(bareDir, "")
+	empty, err := bareGit.IsEmpty()
+	if err != nil {
+		t.Fatalf("IsEmpty: %v", err)
+	}
+	if !empty {
+		t.Error("expected bare clone of empty repo to be empty")
+	}
+}
+
 func TestIsEmpty_EmptyRepo(t *testing.T) {
 	dir := t.TempDir()
 	cmd := exec.Command("git", "init")

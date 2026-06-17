@@ -331,6 +331,13 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 			return err
 		}
 	}
+	if len(args) == 2 {
+		if redirected, err := applyWorkflowStepTargetOverride(args); err != nil {
+			return err
+		} else {
+			args = redirected
+		}
+	}
 
 	// Config-driven dispatch mode: check scheduler.max_polecats
 	deferred, deferErr := shouldDeferDispatch()
