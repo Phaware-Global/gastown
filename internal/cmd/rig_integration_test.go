@@ -1228,6 +1228,12 @@ func runAgentCleanTest(t *testing.T, hasTrackedBeads bool) {
 	isoPort := strconv.Itoa(doltserver.FindFreePort(20000))
 	t.Setenv("GT_DOLT_PORT", isoPort)
 	t.Setenv("BEADS_DOLT_PORT", isoPort)
+	// Stop this town's managed Dolt when the (sub)test ends so it does not
+	// linger and starve later tests of CPU/connections (port-based kill is
+	// safe: doltserver.Stop would read the bridged dolt.pid = test PID).
+	t.Cleanup(func() {
+		_ = exec.Command("bash", "-c", fmt.Sprintf("kill $(lsof -ti tcp:%s) 2>/dev/null", isoPort)).Run()
+	})
 
 	// Step 2: Run gt install
 	cmd := exec.Command(gtBinary, "install", hqPath, "--name", "test-town")
