@@ -1287,6 +1287,16 @@ func TestScheduleBead_RefusesClosed(t *testing.T) {
 // TestScheduleBead_RefusesTombstone verifies that scheduleBead refuses to
 // schedule a tombstoned bead. Companion to TestScheduleBead_RefusesClosed.
 func TestScheduleBead_RefusesTombstone(t *testing.T) {
+	// This test (introduced upstream in #3840) tombstones a bead via
+	// `bd close --tombstone`. Our fork pins bd v1.0.0 in CI (to avoid the
+	// ICU/CGO build requirement of beads >=1.0.5), and that flag is absent
+	// from bd v1.0.0's `bd close`. Skip when the installed bd lacks the flag
+	// rather than fail on an unsupported feature; the closed-bead path is still
+	// covered by TestScheduleBead_RefusesClosed.
+	if helpOut, _ := exec.Command("bd", "close", "--help").CombinedOutput(); !strings.Contains(string(helpOut), "--tombstone") {
+		t.Skip("installed bd lacks `bd close --tombstone`; skipping tombstone scheduler guard test")
+	}
+
 	hqPath, rigPath, gtBinary, env := setupSchedulerIntegrationTown(t)
 
 	beadID := createTestBead(t, rigPath, "Tombstone bead refused by scheduleBead")
