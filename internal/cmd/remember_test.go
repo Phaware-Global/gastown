@@ -48,9 +48,9 @@ func TestParseKvListJSON(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := parseKvListJSON([]byte(tt.in))
+			got, err := parseBdKvListJSON([]byte(tt.in))
 			if (err != nil) != tt.wantErr {
-				t.Fatalf("parseKvListJSON err = %v, wantErr=%v", err, tt.wantErr)
+				t.Fatalf("parseBdKvListJSON err = %v, wantErr=%v", err, tt.wantErr)
 			}
 			if tt.wantErr {
 				return
