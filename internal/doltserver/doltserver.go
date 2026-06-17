@@ -4068,7 +4068,13 @@ func applyTimeZone(townRoot string, config *Config) {
 // buildTimeZoneQuery returns the SET GLOBAL statement applyTimeZone dispatches.
 // Extracted for direct testability.
 func buildTimeZoneQuery(tz string) string {
-	return fmt.Sprintf("SET GLOBAL time_zone = '%s'", tz)
+	// Escape single quotes (and backslashes) so a misconfigured
+	// GT_DOLT_TIME_ZONE value can't break the statement or inject SQL.
+	// Valid time_zone values ("+00:00", "UTC", …) never contain these; this
+	// only guards against operator typos/footguns. (augment review, PR sync)
+	esc := strings.ReplaceAll(tz, "\\", "\\\\")
+	esc = strings.ReplaceAll(esc, "'", "''")
+	return fmt.Sprintf("SET GLOBAL time_zone = '%s'", esc)
 }
 
 // disk but does NOT register them with the live server catalog. This caused
