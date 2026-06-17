@@ -1623,10 +1623,11 @@ notifyWitness:
 			}
 		}
 		if exitType == ExitCompleted && issueID != "" && convoyInfo == nil {
-			convoyInfo = getConvoyInfoFromIssue(issueID, cwd)
-			if convoyInfo == nil {
-				convoyInfo = getConvoyInfoForIssue(issueID)
-			}
+			// Use the pr-mode-aware resolver (G22, matches the call sites above)
+			// so this idle-sync path also applies the direct/local→mr override
+			// under rig pr-mode, rather than the bare getConvoyInfo* lookups
+			// upstream added here. (augment review, PR #105)
+			convoyInfo = resolveConvoyInfoForIssue(issueID, cwd, townRoot, rigName)
 		}
 		mergeStrategy := ""
 		if convoyInfo != nil {
