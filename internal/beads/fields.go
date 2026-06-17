@@ -676,7 +676,7 @@ func ParseMRFields(issue *Issue) *MRFields {
 
 		key := strings.TrimSpace(line[:colonIdx])
 		value := strings.TrimSpace(line[colonIdx+1:])
-		if value == "" {
+		if value == "" || strings.EqualFold(value, "null") {
 			continue
 		}
 

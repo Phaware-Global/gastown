@@ -11,8 +11,9 @@ This is infrastructure cleanup work:
 1. Scan all production databases for candidates
 2. Reap (close) wisps past max_age whose parent is closed/missing
 3. Purge (delete) closed wisps past purge_age + old closed mail
-4. Auto-close stale issues (>stale_issue_age, not P0/P1, not epics, no active deps)
-5. Report findings and flag anomalies
+4. Auto-close stale issues (>stale_issue_age, not P0/P1, not epics/convoys, no active deps)
+5. Close completed convoys via `gt convoy check` (tracked-bead status, never staleness)
+6. Report findings and flag anomalies
 
 ## Variables
 
@@ -47,7 +48,7 @@ NOT anomalies (do NOT escalate these):
   race condition — the witness closes wisps for dead sessions concurrently.
   This is expected behavior, not a bug."""
 formula = "mol-dog-reaper"
-version = 2
+version = 3
 
 [squash]
 trigger = "on_complete"
@@ -161,9 +162,39 @@ gt reaper auto-close --db=<name> --port={{dolt_port}} \\
 **Exit criteria:** All eligible stale issues auto-closed."""
 
 [[steps]]
+id = "convoy-check"
+title = "Close completed convoys (tracked-bead status, not staleness)"
+needs = ["auto-close"]
+description = """
+Close convoys whose tracked beads are ALL closed. Convoy lifecycle is driven
+by tracked-bead status, never by staleness — `gt reaper auto-close` therefore
+excludes convoys entirely, and this step is what retires them (hq-jnap).
+
+The refinery closes convoys post-merge, but tracked beads closed by other
+paths (manual close, audits/sweeps, `gt done --status DEFERRED`) leave the
+convoy open with nothing left to track. This step bridges that gap.
+
+**1. Run convoy check (cross-prefix aware, town-level):**
+```bash
+gt convoy check {{#if dry_run}}# dry_run set: run 'gt convoy list' and report instead of closing{{/if}}
+```
+
+`gt convoy check` closes every open convoy whose tracked issues are all
+closed and notifies subscribers. It NEVER closes a convoy with open tracked
+issues — if a convoy looks stale but its tracked beads are open, that is a
+dispatch problem to flag, not a cleanup target.
+
+**2. Inspect results:**
+- Note which convoys were closed and why
+- If a convoy has been open >7d with all tracked issues open and unassigned,
+  flag it in the report (stranded convoy — needs feeding, not closing)
+
+**Exit criteria:** All completed convoys closed; stranded convoys flagged."""
+
+[[steps]]
 id = "report"
 title = "Report findings and return to kennel"
-needs = ["auto-close"]
+needs = ["convoy-check"]
 description = """
 Generate summary and signal completion.
 
@@ -175,7 +206,8 @@ Generate summary and signal completion.
 **Wisps reaped**: (total closed stale open wisps)
 **Wisps purged**: (total deleted old closed wisps)
 **Mail purged**: (total deleted old closed mail)
-**Issues auto-closed**: (stale > stale_issue_age, excl. epics/P0-P1/deps)
+**Issues auto-closed**: (stale > stale_issue_age, excl. epics/convoys/P0-P1/deps)
+**Convoys closed**: (all tracked beads closed, via gt convoy check)
 **Open wisps remaining**: (total)
 **Anomalies**: (list any anomalies found)
 ```

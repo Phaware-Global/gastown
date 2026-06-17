@@ -181,6 +181,7 @@ func TestContainsPromptIndicator(t *testing.T) {
 		want    bool
 	}{
 		{"claude prompt", "Hello! How can I help?\n>", true},
+		{"codex prompt", "Ready\n› ", true},
 		{"bash prompt", "user@host:~$", true},
 		{"zsh prompt", "╰─❯", true},
 		{"root prompt", "root@host:~#", true},
@@ -218,6 +219,88 @@ func TestContainsWorkspaceTrustDialog(t *testing.T) {
 			got := containsWorkspaceTrustDialog(tt.content)
 			if got != tt.want {
 				t.Errorf("containsWorkspaceTrustDialog(%q) = %v, want %v", tt.content, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestContainsBlockingStartupDialog(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		content     string
+		wantBlocked bool
+		wantName    string
+	}{
+		{
+			name: "codex update modal",
+			content: `Update available! 0.137.0 -> 0.138.0
+Update now
+Skip
+Skip until next version`,
+			wantBlocked: true,
+			wantName:    "codex update prompt",
+		},
+		{
+			name:        "codex trust modal",
+			content:     "> You are in /tmp/demo\nDo you trust the contents of this directory?",
+			wantBlocked: true,
+			wantName:    "workspace trust prompt",
+		},
+		{
+			name:        "bypass modal",
+			content:     "Bypass Permissions mode\n1. No\n2. Yes, I accept",
+			wantBlocked: true,
+			wantName:    "bypass permissions prompt",
+		},
+		{
+			name:        "ready prompt",
+			content:     "› ",
+			wantBlocked: false,
+		},
+		{
+			name: "stale bypass dialog before codex prompt",
+			content: `Bypass Permissions mode
+1. No
+2. Yes, I accept
+› `,
+			wantBlocked: false,
+		},
+		{
+			name: "stale bypass dialog before prompt and status",
+			content: `Bypass Permissions mode
+1. No
+2. Yes, I accept
+›
+session ready`,
+			wantBlocked: false,
+		},
+		{
+			name: "stale trust dialog before shell prompt",
+			content: `Quick safety check
+Do you trust this folder?
+user@host:~$`,
+			wantBlocked: false,
+		},
+		{
+			name: "old shell prompt before current bypass dialog",
+			content: `user@host:~$
+Bypass Permissions mode
+1. No
+2. Yes, I accept`,
+			wantBlocked: true,
+			wantName:    "bypass permissions prompt",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotName, gotBlocked := containsBlockingStartupDialog(tt.content)
+			if gotBlocked != tt.wantBlocked {
+				t.Fatalf("blocked = %v, want %v", gotBlocked, tt.wantBlocked)
+			}
+			if gotName != tt.wantName {
+				t.Fatalf("name = %q, want %q", gotName, tt.wantName)
 			}
 		})
 	}

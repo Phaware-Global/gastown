@@ -753,7 +753,7 @@ type RuntimeConfig struct {
 
 	// PromptMode controls how prompts are passed to the runtime.
 	// Supported values: "arg" (append prompt arg), "none" (ignore prompt).
-	// Default: "arg" for claude/generic, "none" for codex.
+	// Default: "arg" for built-in interactive runtimes.
 	PromptMode string `json:"prompt_mode,omitempty"`
 
 	// Session config controls environment integration for runtime session IDs.
@@ -973,6 +973,7 @@ func normalizeRuntimeConfig(rc *RuntimeConfig) *RuntimeConfig {
 	if rc.Args == nil {
 		rc.Args = defaultRuntimeArgs(rc.Provider)
 	}
+	rc.Args = ensureCodexAutomationArgs(rc.Command, rc.Args)
 
 	if rc.PromptMode == "" {
 		rc.PromptMode = defaultPromptMode(rc.Provider)
@@ -1038,6 +1039,32 @@ func normalizeRuntimeConfig(rc *RuntimeConfig) *RuntimeConfig {
 	}
 
 	return rc
+}
+
+const codexUpdateCheckKey = "check_for_update_on_startup"
+const codexUpdateCheckConfig = codexUpdateCheckKey + "=false"
+
+func ensureCodexAutomationArgs(command string, args []string) []string {
+	if !isCodexRuntime(command) || hasCodexUpdateCheckConfig(args) {
+		return args
+	}
+	result := make([]string, 0, len(args)+2)
+	result = append(result, "-c", codexUpdateCheckConfig)
+	result = append(result, args...)
+	return result
+}
+
+func isCodexRuntime(command string) bool {
+	return filepath.Base(command) == string(AgentCodex)
+}
+
+func hasCodexUpdateCheckConfig(args []string) bool {
+	for _, arg := range args {
+		if arg == codexUpdateCheckKey || strings.HasPrefix(arg, codexUpdateCheckKey+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 func defaultRuntimeCommand(provider string) string {

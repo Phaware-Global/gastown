@@ -22,7 +22,11 @@ heartbeat_epoch() {
   fi
 
   # Fallback for malformed legacy files: use mtime rather than failing open.
-  stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null
+  # GNU stat (-c %Y) first: on GNU, 'stat -f' is filesystem mode and dumps a
+  # multi-line "File: ..." block to stdout BEFORE failing, polluting the
+  # command substitution and breaking downstream arithmetic (hq-wisp-0vrp).
+  # BSD/macOS stat (-f %m) is the fallback.
+  stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null
 }
 
 has_in_progress_work() {
@@ -131,6 +135,7 @@ log "=== Deacon Health ==="
 
 DEACON_SESSION="hq-deacon"
 DEACON_ISSUE=""
+DEACON_DIVERGENCE=""
 DEACON_PROCESS_ALIVE=0
 
 if ! tmux has-session -t "$DEACON_SESSION" 2>/dev/null; then
@@ -154,10 +159,23 @@ else
     HEARTBEAT_AGE=$(( NOW - ${HEARTBEAT_TIME:-0} ))
 
     if [ "$HEARTBEAT_AGE" -gt 1200 ]; then
-      if [ "$DEACON_PROCESS_ALIVE" -eq 1 ] && ! has_in_progress_work; then
+      # Cross-check tmux activity before declaring stuck: heartbeat.json is
+      # only ONE of three heartbeat stores (hq-qxl9). A live session with
+      # recent activity means the file-write path diverged (e.g. a long
+      # turn, or the agent refreshing a different store) — not a stuck
+      # Deacon. Escalating that as stuck caused a false-positive storm.
+      ACTIVITY_TIME=$(tmux display-message -t "$DEACON_SESSION" -p '#{window_activity}' 2>/dev/null)
+      case "$ACTIVITY_TIME" in
+        ''|*[!0-9]*) ACTIVITY_AGE="" ;;
+        *) ACTIVITY_AGE=$(( NOW - ACTIVITY_TIME )) ;;
+      esac
+      if [ -n "$ACTIVITY_AGE" ] && [ "$ACTIVITY_AGE" -le 1200 ]; then
+        log "  DIVERGENCE: heartbeat file stale (${HEARTBEAT_AGE}s) but session active ${ACTIVITY_AGE}s ago — write divergence, not stuck"
+        DEACON_DIVERGENCE="heartbeat_write_divergence_${HEARTBEAT_AGE}s_active_${ACTIVITY_AGE}s"
+      elif [ "$DEACON_PROCESS_ALIVE" -eq 1 ] && ! has_in_progress_work; then
         log "  SKIP: Deacon heartbeat stale (${HEARTBEAT_AGE}s old) but process is alive and no in_progress work exists"
       else
-        log "  STUCK: Deacon heartbeat stale (${HEARTBEAT_AGE}s old, >20m threshold)"
+        log "  STUCK: Deacon heartbeat stale (${HEARTBEAT_AGE}s old, >20m threshold), no recent session activity"
         DEACON_ISSUE="stuck_heartbeat_${HEARTBEAT_AGE}s"
       fi
     else
@@ -229,6 +247,7 @@ fi
 
 SUMMARY="Agent health: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy"
 [ -n "$DEACON_ISSUE" ] && SUMMARY="$SUMMARY, deacon=$DEACON_ISSUE"
+[ -n "$DEACON_DIVERGENCE" ] && SUMMARY="$SUMMARY, deacon=$DEACON_DIVERGENCE (not escalated)"
 log ""
 log "=== $SUMMARY ==="
 
