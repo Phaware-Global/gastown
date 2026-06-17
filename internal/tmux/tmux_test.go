@@ -1991,6 +1991,106 @@ func TestHasBusyIndicator(t *testing.T) {
 	}
 }
 
+// TestShouldSendEscapeForLines guards against the regression where a nudge
+// sends the vim-mode Escape keystroke while the agent is actively generating,
+// interrupting its current turn (e.g. the Mayor). When the pane shows the busy
+// indicator ("esc to interrupt"), the Escape must be suppressed.
+func TestShouldSendEscapeForLines(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		lines []string
+		want  bool
+	}{
+		{
+			name:  "claude generating - suppress escape",
+			lines: []string{"✻ Cogitating… (12s · ↑ 2.1k tokens · esc to interrupt)"},
+			want:  false,
+		},
+		{
+			name:  "codex working - suppress escape",
+			lines: []string{"• Working (2m 18s • esc to interrupt)"},
+			want:  false,
+		},
+		{
+			name:  "busy indicator among multiple lines - suppress escape",
+			lines: []string{"tool output", "more output", "⏵⏵ bypass permissions on · esc to interrupt"},
+			want:  false,
+		},
+		{
+			name:  "idle ready prompt - allow escape",
+			lines: []string{"❯ "},
+			want:  true,
+		},
+		{
+			name:  "idle with typed nudge text - allow escape",
+			lines: []string{"❯ HEALTH_CHECK: heartbeat stale, respond to confirm"},
+			want:  true,
+		},
+		{
+			name:  "no lines captured - allow escape (not busy)",
+			lines: nil,
+			want:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldSendEscapeForLines(tt.lines); got != tt.want {
+				t.Errorf("shouldSendEscapeForLines(%q) = %v, want %v", tt.lines, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestShouldSendEscape_LivePane exercises the busy-state gate end-to-end against
+// a real tmux pane (capture-only, so it avoids the sendEnterVerified timing
+// flakiness of the full nudge integration tests). It confirms the wiring: when
+// the pane shows the "esc to interrupt" busy indicator, shouldSendEscape returns
+// false so a nudge will not interrupt the agent's in-flight work.
+func TestShouldSendEscape_LivePane(t *testing.T) {
+	tm := newTestTmux(t)
+	session := "gt-test-should-escape-" + t.Name()
+
+	_ = tm.KillSession(session)
+	if err := tm.NewSession(session, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(session) }()
+
+	// Idle shell prompt: no busy indicator → Escape is safe to send.
+	if !tm.shouldSendEscape(session) {
+		out, _ := tm.CapturePane(session, 20)
+		t.Fatalf("shouldSendEscape on idle pane = false, want true; pane:\n%s", out)
+	}
+
+	// Simulate an agent that is actively generating by rendering the busy
+	// indicator into the pane. The typed command line itself contains the
+	// marker, so detection does not depend on the command actually executing.
+	if err := tm.SendKeys(session, "echo esc to interrupt"); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+
+	// Poll until the gate flips to suppressed (the shell may be slow to render).
+	deadline := time.Now().Add(5 * time.Second)
+	for tm.shouldSendEscape(session) {
+		if time.Now().After(deadline) {
+			out, _ := tm.CapturePane(session, 20)
+			t.Fatalf("shouldSendEscape did not detect busy indicator within timeout; pane:\n%s", out)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func TestShouldSendEscape_CaptureErrorSuppressesEscape(t *testing.T) {
+	tm := newTestTmux(t)
+
+	if tm.shouldSendEscape("missing-session-for-escape-check") {
+		t.Fatal("shouldSendEscape on missing target = true, want false")
+	}
+}
+
 func TestDefaultReadyPromptPrefix(t *testing.T) {
 	t.Parallel()
 	// Verify the constant is set correctly

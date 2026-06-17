@@ -9,6 +9,48 @@ Thanks for your interest in contributing! Gas Town is experimental software, and
 3. Install prerequisites (see README.md)
 4. Build and test: `go build -o gt ./cmd/gt && go test ./...`
 
+## Setting up a rig to contribute to Gas Town
+
+If you run a Gas Town rig against this repo, you don't own the canonical
+repository, so the rig must **fetch from upstream but push to your fork**.
+`gt rig add` has first-class support for this through `--push-url` and
+`--upstream-url`.
+
+1. Fork `gastownhall/gastown` on GitHub (gives you
+   `https://github.com/<you>/gastown`).
+2. Add the rig with fork routing:
+
+   ```bash
+   gt rig add gastown https://github.com/gastownhall/gastown \
+     --push-url     https://github.com/<you>/gastown \
+     --upstream-url https://github.com/gastownhall/gastown
+   ```
+
+What each flag does at the git-remote level:
+
+- The positional `<git-url>` (`https://github.com/gastownhall/gastown`)
+  becomes `origin`'s **fetch** URL — the rig pulls canonical history from
+  upstream.
+- `--push-url` sets `origin`'s **push** URL to your fork, so all pushes land
+  on `https://github.com/<you>/gastown` and never on the canonical repo.
+- `--upstream-url` adds a separate named `upstream` remote pointing at the
+  canonical repo, so rebases against `upstream/main` work without juggling
+  URLs.
+
+> **Current limitation — the refinery is not yet fork-aware.** Until the
+> behavioral half of
+> [gastownhall/gastown#1794](https://github.com/gastownhall/gastown/issues/1794)
+> ships, even a correctly-configured fork rig will have its refinery attempt
+> to **merge polecat branches into the fork's `main`**, diverging it from
+> upstream. If you want strict PR-only behavior, do not start the refinery
+> (park the rig with `gt rig park <rig>`) and use the
+> polecat → branch → manual PR path instead.
+
+If you set up a rig **without** these flags and your fork's `main` has
+already been polluted, see
+[docs/guides/fork-rig-setup.md](docs/guides/fork-rig-setup.md) for
+verification and recovery steps.
+
 ## Development Workflow
 
 We use a direct-to-main workflow for trusted contributors. For external contributors:

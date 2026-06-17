@@ -879,6 +879,14 @@ func (g *Git) Checkout(ref string) error {
 	return err
 }
 
+// CheckoutDetach checks out the given ref without attaching to a local branch.
+// This is useful in shared-worktree repos where the branch may already be
+// checked out by another worktree, but this worktree only needs that commit.
+func (g *Git) CheckoutDetach(ref string) error {
+	_, err := g.run("checkout", "--detach", ref)
+	return err
+}
+
 // CheckoutNewBranch creates a new branch from startPoint and checks it out.
 // Equivalent to: git checkout -b <branch> <startPoint>
 func (g *Git) CheckoutNewBranch(branch, startPoint string) error {
@@ -1406,6 +1414,13 @@ func (g *Git) RecentCommits(n int) (string, error) {
 // DeleteRemoteBranch deletes a branch on the remote.
 func (g *Git) DeleteRemoteBranch(remote, branch string) error {
 	_, err := g.runWithTimeout(pushTimeout, "push", remote, "--delete", branch)
+	return err
+}
+
+// DeleteRemoteBranchIfAt deletes a remote branch only if it still points at expectedHash.
+func (g *Git) DeleteRemoteBranchIfAt(remote, branch, expectedHash string) error {
+	ref := "refs/heads/" + branch
+	_, err := g.runWithTimeout(pushTimeout, "push", "--force-with-lease="+ref+":"+expectedHash, remote, ":"+ref)
 	return err
 }
 

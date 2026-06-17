@@ -122,8 +122,8 @@ Pour the mol-prd-review convoy to run 6 parallel PRD reviewers.
 **1. Pour the convoy:**
 ```bash
 gt formula run mol-prd-review \\
-  --problem="{{problem}}" \\
-  --context="See .prd-reviews/{{review_id}}/prd-draft.md. {{context}}"
+  --set problem="{{problem}}" \\
+  --set context="See .prd-reviews/{{review_id}}/prd-draft.md. {{context}}"
 ```
 
 This spawns 6 polecats in parallel:
@@ -215,8 +215,8 @@ Pour the design convoy to generate an implementation plan from the refined PRD.
 **1. Pour the design convoy:**
 ```bash
 gt formula run design \\
-  --problem="{{problem}}" \\
-  --context="PRD with clarifications: .prd-reviews/{{review_id}}/prd-draft.md. {{context}}"
+  --set problem="{{problem}}" \\
+  --set context="PRD with clarifications: .prd-reviews/{{review_id}}/prd-draft.md. {{context}}"
 ```
 
 This spawns 6 polecats in parallel, each exploring a different dimension:
@@ -236,7 +236,7 @@ ls .designs/   # find the design output directory
 
 **3. Read the design doc:**
 ```bash
-cat .designs/<design-id>/design-doc.md
+cat .designs/<design-review-id>/design-doc.md
 ```
 
 Pay attention to:
@@ -268,7 +268,7 @@ Polecat A — **requirements-coverage**:
 gt sling --prompt="Review an implementation plan for PRD alignment.
 
 Read the PRD: .prd-reviews/{{review_id}}/prd-draft.md
-Read the plan: .designs/<design-id>/design-doc.md
+Read the plan: .designs/<design-review-id>/design-doc.md
 
 Walk through every REQUIREMENT in the PRD (Problem Statement, Goals, Acceptance
 Criteria, any explicitly stated requirements). For each, verify the plan has a
@@ -288,7 +288,7 @@ Polecat B — **goals-alignment**:
 gt sling --prompt="Review an implementation plan for PRD alignment.
 
 Read the PRD: .prd-reviews/{{review_id}}/prd-draft.md
-Read the plan: .designs/<design-id>/design-doc.md
+Read the plan: .designs/<design-review-id>/design-doc.md
 
 Walk through every GOAL in the PRD. For each, trace through the plan and verify
 that executing the plan as written will achieve this goal.
@@ -309,7 +309,7 @@ gt mail inbox  # wait for both polecats to report back
 
 **3. Apply fixes to the plan:**
 Read both reports. For each must-fix and should-fix finding:
-- Edit `.designs/<design-id>/design-doc.md` directly
+- Edit `.designs/<design-review-id>/design-doc.md` directly
 - Add missing tasks, expand partial coverage, fix misalignments
 - Log all changes in `.plan-reviews/{{review_id}}/prd-align-round-1.md`
 
@@ -329,7 +329,7 @@ Polecat A — **constraints-compliance**:
 gt sling --prompt="Review an implementation plan for PRD alignment (round 2).
 
 Read the PRD: .prd-reviews/{{review_id}}/prd-draft.md
-Read the plan: .designs/<design-id>/design-doc.md
+Read the plan: .designs/<design-review-id>/design-doc.md
 Read round 1 changes: .plan-reviews/{{review_id}}/prd-align-round-1.md
 
 Check every CONSTRAINT in the PRD (technical, business, timeline, resource).
@@ -350,7 +350,7 @@ Polecat B — **non-goals-enforcement**:
 gt sling --prompt="Review an implementation plan for PRD alignment (round 2).
 
 Read the PRD: .prd-reviews/{{review_id}}/prd-draft.md
-Read the plan: .designs/<design-id>/design-doc.md
+Read the plan: .designs/<design-review-id>/design-doc.md
 Read round 1 changes: .plan-reviews/{{review_id}}/prd-align-round-1.md
 
 Check the PRD's Non-Goals section. Verify the plan does NOT include work that
@@ -372,7 +372,7 @@ gt mail inbox
 ```
 
 **3. Apply fixes to the plan:**
-Read both reports. Apply must-fix and should-fix changes to `.designs/<design-id>/design-doc.md`.
+Read both reports. Apply must-fix and should-fix changes to `.designs/<design-review-id>/design-doc.md`.
 Cut scope-creep items. Add constraint-respecting guardrails. Log changes in
 `.plan-reviews/{{review_id}}/prd-align-round-2.md`.
 
@@ -392,7 +392,7 @@ Polecat A — **user-stories-coverage**:
 gt sling --prompt="Review an implementation plan for PRD alignment (round 3).
 
 Read the PRD: .prd-reviews/{{review_id}}/prd-draft.md
-Read the plan: .designs/<design-id>/design-doc.md
+Read the plan: .designs/<design-review-id>/design-doc.md
 Read prior changes: .plan-reviews/{{review_id}}/prd-align-round-1.md and round-2.md
 
 Walk through every USER STORY and SCENARIO in the PRD. For each, trace the
@@ -413,7 +413,7 @@ Polecat B — **open-questions-resolution**:
 gt sling --prompt="Review an implementation plan for PRD alignment (round 3).
 
 Read the PRD: .prd-reviews/{{review_id}}/prd-draft.md
-Read the plan: .designs/<design-id>/design-doc.md
+Read the plan: .designs/<design-review-id>/design-doc.md
 Read prior changes: .plan-reviews/{{review_id}}/prd-align-round-1.md and round-2.md
 
 Check every OPEN QUESTION from the PRD (both the original Open Questions section
@@ -437,7 +437,7 @@ gt mail inbox
 ```
 
 **3. Apply fixes to the plan:**
-Read both reports. Apply all fixes to `.designs/<design-id>/design-doc.md`.
+Read both reports. Apply all fixes to `.designs/<design-review-id>/design-doc.md`.
 Log changes in `.plan-reviews/{{review_id}}/prd-align-round-3.md`.
 
 **4. PRD alignment summary:**
@@ -475,7 +475,7 @@ Polecat A — **completeness**:
 ```bash
 gt sling --prompt="Review an implementation plan for completeness.
 
-Read the plan: .designs/<design-id>/design-doc.md
+Read the plan: .designs/<design-review-id>/design-doc.md
 Read the PRD alignment logs: .plan-reviews/{{review_id}}/prd-align-round-*.md
 
 Is the plan complete? Check for:
@@ -499,7 +499,7 @@ Polecat B — **sequencing**:
 ```bash
 gt sling --prompt="Review an implementation plan for correct sequencing.
 
-Read the plan: .designs/<design-id>/design-doc.md
+Read the plan: .designs/<design-review-id>/design-doc.md
 
 Check the ordering and dependencies of all plan phases and tasks:
 - Are tasks in the right order? Would any task fail if executed in sequence?
@@ -523,7 +523,7 @@ gt mail inbox
 
 **3. Apply fixes to the plan:**
 Read both reports. Apply all must-fix and should-fix changes to
-`.designs/<design-id>/design-doc.md`. Log in `.plan-reviews/{{review_id}}/review-round-1.md`.
+`.designs/<design-review-id>/design-doc.md`. Log in `.plan-reviews/{{review_id}}/review-round-1.md`.
 
 **Exit criteria:** Both reports received. All fixes applied."""
 
@@ -540,7 +540,7 @@ Polecat A — **risk**:
 ```bash
 gt sling --prompt="Review an implementation plan for risk.
 
-Read the plan: .designs/<design-id>/design-doc.md
+Read the plan: .designs/<design-review-id>/design-doc.md
 Read prior review changes: .plan-reviews/{{review_id}}/review-round-1.md
 
 Identify risks in the plan:
@@ -564,7 +564,7 @@ Polecat B — **scope-creep**:
 ```bash
 gt sling --prompt="Review an implementation plan for scope creep.
 
-Read the plan: .designs/<design-id>/design-doc.md
+Read the plan: .designs/<design-review-id>/design-doc.md
 Read the PRD: .prd-reviews/{{review_id}}/prd-draft.md
 Read prior review changes: .plan-reviews/{{review_id}}/review-round-1.md
 
@@ -590,7 +590,7 @@ gt mail inbox
 ```
 
 **3. Apply fixes to the plan:**
-Read both reports. Apply fixes to `.designs/<design-id>/design-doc.md`.
+Read both reports. Apply fixes to `.designs/<design-review-id>/design-doc.md`.
 Add risk mitigations, cut scope-creep items, add spikes for unknowns.
 Log in `.plan-reviews/{{review_id}}/review-round-2.md`.
 
@@ -609,7 +609,7 @@ Polecat A — **testability**:
 ```bash
 gt sling --prompt="Review an implementation plan for testability.
 
-Read the plan: .designs/<design-id>/design-doc.md
+Read the plan: .designs/<design-review-id>/design-doc.md
 Read prior review changes: .plan-reviews/{{review_id}}/review-round-1.md and round-2.md
 
 For each task/phase in the plan, check:
@@ -632,7 +632,7 @@ Polecat B — **coherence**:
 ```bash
 gt sling --prompt="Review an implementation plan for overall coherence.
 
-Read the plan: .designs/<design-id>/design-doc.md
+Read the plan: .designs/<design-review-id>/design-doc.md
 Read the PRD: .prd-reviews/{{review_id}}/prd-draft.md
 Read ALL prior review changes: .plan-reviews/{{review_id}}/*.md
 
@@ -658,7 +658,7 @@ gt mail inbox
 ```
 
 **3. Apply fixes to the plan:**
-Read both reports. Apply final fixes to `.designs/<design-id>/design-doc.md`.
+Read both reports. Apply final fixes to `.designs/<design-review-id>/design-doc.md`.
 Log in `.plan-reviews/{{review_id}}/review-round-3.md`.
 
 **4. Iterative review summary — output in conversation:**
@@ -677,7 +677,7 @@ Log in `.plan-reviews/{{review_id}}/review-round-3.md`.
 - Round 5 (risk + scope-creep): <N> fixes
 - Round 6 (testability + coherence): <N> fixes
 
-**Final plan:** .designs/<design-id>/design-doc.md
+**Final plan:** .designs/<design-review-id>/design-doc.md
 **Review logs:** .plan-reviews/{{review_id}}/
 
 Proceeding to bead creation...
@@ -694,7 +694,7 @@ Convert the refined implementation plan into beads with dependencies.
 
 **1. Read the final plan:**
 ```bash
-cat .designs/<design-id>/design-doc.md
+cat .designs/<design-review-id>/design-doc.md
 ```
 
 **2. Identify work items from the Implementation Plan section:**
@@ -734,7 +734,7 @@ Implementation of: {{problem}}
 ## Planning Artifacts
 - PRD: .prd-reviews/<review-id>/prd-draft.md
 - PRD Review: .prd-reviews/<review-id>/prd-review.md
-- Design Doc: .designs/<design-id>/design-doc.md
+- Design Doc: .designs/<design-review-id>/design-doc.md
 - Review Logs: .plan-reviews/<review-id>/
 "
 ```
@@ -773,7 +773,7 @@ First pass: find gaps between the implementation plan and the beads just created
 
 **1. Read the implementation plan:**
 ```bash
-cat .designs/<design-id>/design-doc.md
+cat .designs/<design-review-id>/design-doc.md
 ```
 
 **2. List all beads just created:**

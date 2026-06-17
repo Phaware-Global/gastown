@@ -1,9 +1,11 @@
 package beads
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -677,6 +679,226 @@ func TestBdSupportsAllowStale_TimeoutTreatsProbeAsUnsupported(t *testing.T) {
 		} else if !os.IsNotExist(err) {
 			t.Fatalf("stat timeout marker: %v", err)
 		}
+	}
+}
+
+func TestBDListSlowListDoesNotBlockUnrelatedList(t *testing.T) {
+	if os.Getenv("GT_BEADS_LIST_CONCURRENCY_HELPER") == "1" {
+		runBDListConcurrencyHelper(t)
+		return
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("process-level flock regression test is Unix-specific")
+	}
+
+	tmp := t.TempDir()
+	if outer := FindTownRoot(tmp); outer != "" {
+		t.Skipf("temp dir is nested under existing town root %s", outer)
+	}
+	townRoot := filepath.Join(tmp, "town")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("create town mayor dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+
+	slowWorkDir := filepath.Join(townRoot, "rig-a")
+	fastWorkDir := filepath.Join(townRoot, "rig-b")
+	for _, dir := range []string{slowWorkDir, fastWorkDir} {
+		if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0755); err != nil {
+			t.Fatalf("create beads dir %s: %v", dir, err)
+		}
+	}
+	if got := FindTownRoot(slowWorkDir); got != townRoot {
+		t.Fatalf("FindTownRoot(%s) = %s, want %s", slowWorkDir, got, townRoot)
+	}
+
+	markerDir := filepath.Join(tmp, "markers")
+	if err := os.MkdirAll(markerDir, 0755); err != nil {
+		t.Fatalf("create marker dir: %v", err)
+	}
+	binDir := filepath.Join(tmp, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("create bin dir: %v", err)
+	}
+	writeConcurrentBDListStub(t, binDir)
+	helperPath := binDir + string(os.PathListSeparator) + os.Getenv("PATH")
+
+	releaseSlow := func() {
+		_ = os.WriteFile(filepath.Join(markerDir, "release-slow"), []byte("ok"), 0644)
+	}
+
+	slowCtx, slowCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer slowCancel()
+	slowCmd := bdListConcurrencyHelperCommand(slowCtx, helperPath, markerDir, slowWorkDir, "open")
+	type helperResult struct {
+		output []byte
+		err    error
+	}
+	slowDone := make(chan helperResult, 1)
+	go func() {
+		out, err := slowCmd.CombinedOutput()
+		slowDone <- helperResult{output: out, err: err}
+	}()
+	slowConsumed := false
+	t.Cleanup(func() {
+		if slowConsumed {
+			return
+		}
+		releaseSlow()
+		slowCancel()
+		select {
+		case <-slowDone:
+		case <-time.After(5 * time.Second):
+		}
+	})
+
+	waitForFile(t, filepath.Join(markerDir, "slow-started"), 2*time.Second)
+
+	fastCtx, fastCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer fastCancel()
+	fastCmd := bdListConcurrencyHelperCommand(fastCtx, helperPath, markerDir, fastWorkDir, "closed")
+	started := time.Now()
+	fastOut, fastErr := fastCmd.CombinedOutput()
+	fastElapsed := time.Since(started)
+	if fastCtx.Err() == context.DeadlineExceeded {
+		t.Fatalf("fast unrelated bd list blocked behind slow list; output:\n%s", fastOut)
+	}
+	if fastErr != nil {
+		t.Fatalf("fast unrelated bd list failed after %s: %v\n%s", fastElapsed, fastErr, fastOut)
+	}
+
+	select {
+	case res := <-slowDone:
+		slowConsumed = true
+		if res.err != nil {
+			t.Fatalf("slow bd list failed early: %v\n%s", res.err, res.output)
+		}
+		t.Fatalf("slow bd list completed before overlap was verified; fake bd did not hold the slow command")
+	default:
+	}
+
+	releaseSlow()
+	select {
+	case res := <-slowDone:
+		slowConsumed = true
+		if res.err != nil {
+			t.Fatalf("slow bd list failed: %v\n%s", res.err, res.output)
+		}
+	case <-time.After(3 * time.Second):
+		slowCancel()
+		t.Fatalf("slow bd list did not finish")
+	}
+}
+
+func runBDListConcurrencyHelper(t *testing.T) {
+	ResetBdAllowStaleCacheForTest()
+	workDir := os.Getenv("GT_BEADS_LIST_HELPER_WORKDIR")
+	status := os.Getenv("GT_BEADS_LIST_HELPER_STATUS")
+	if workDir == "" || status == "" {
+		t.Fatalf("missing helper environment: workdir=%q status=%q", workDir, status)
+	}
+	if _, err := NewIsolated(workDir).List(ListOptions{Status: status}); err != nil {
+		t.Fatalf("List(%s): %v", status, err)
+	}
+}
+
+func bdListConcurrencyHelperCommand(ctx context.Context, path, markerDir, workDir, status string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestBDListSlowListDoesNotBlockUnrelatedList$")
+	cmd.Env = append(sanitizedBDListConcurrencyEnv(),
+		"GT_BEADS_LIST_CONCURRENCY_HELPER=1",
+		"GT_BEADS_LIST_MARKER_DIR="+markerDir,
+		"GT_BEADS_LIST_HELPER_WORKDIR="+workDir,
+		"GT_BEADS_LIST_HELPER_STATUS="+status,
+		"PATH="+path,
+	)
+	return cmd
+}
+
+func sanitizedBDListConcurrencyEnv() []string {
+	env := make([]string, 0, len(os.Environ()))
+	for _, item := range os.Environ() {
+		switch {
+		case strings.HasPrefix(item, "PATH="),
+			strings.HasPrefix(item, "BD_ACTOR="),
+			strings.HasPrefix(item, "BEADS_"),
+			strings.HasPrefix(item, "GT_ROOT="),
+			strings.HasPrefix(item, "HOME="),
+			strings.HasPrefix(item, "GT_BEADS_LIST_CONCURRENCY_HELPER="),
+			strings.HasPrefix(item, "GT_BEADS_LIST_MARKER_DIR="),
+			strings.HasPrefix(item, "GT_BEADS_LIST_HELPER_WORKDIR="),
+			strings.HasPrefix(item, "GT_BEADS_LIST_HELPER_STATUS="):
+			continue
+		default:
+			env = append(env, item)
+		}
+	}
+	return env
+}
+
+func waitForFile(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", path)
+}
+
+func writeConcurrentBDListStub(t *testing.T, dir string) {
+	t.Helper()
+	scriptPath := filepath.Join(dir, "bd")
+	script := `#!/bin/sh
+set -eu
+
+if [ "${1:-}" = "--allow-stale" ]; then
+  shift
+fi
+
+if [ "${1:-}" = "version" ]; then
+  exit 0
+fi
+
+if [ "${1:-}" != "list" ]; then
+  echo "unexpected bd args: $*" >&2
+  exit 1
+fi
+
+status=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "status" ]; then
+    status="$arg"
+    prev=""
+    continue
+  fi
+  case "$arg" in
+    --status=*) status="${arg#--status=}" ;;
+    --status) prev="status" ;;
+  esac
+done
+
+if [ "$status" = "open" ]; then
+  : > "${GT_BEADS_LIST_MARKER_DIR}/slow-started"
+  i=0
+  while [ ! -e "${GT_BEADS_LIST_MARKER_DIR}/release-slow" ]; do
+    i=$((i + 1))
+    if [ "$i" -ge 1000 ]; then
+      echo "timed out waiting for release-slow" >&2
+      exit 2
+    fi
+    sleep 0.01
+  done
+fi
+
+printf '[]\n'
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write bd concurrency stub: %v", err)
 	}
 }
 
@@ -4165,29 +4387,6 @@ func TestResolveBdSubprocessTimeout(t *testing.T) {
 			want := time.Duration(tt.wantSec) * time.Second
 			if got != want {
 				t.Errorf("resolveBdSubprocessTimeout() = %v, want %v", got, want)
-			}
-		})
-	}
-}
-
-func TestShouldThrottleBDRead(t *testing.T) {
-	tests := []struct {
-		name string
-		args []string
-		want bool
-	}{
-		{"list", []string{"list", "--json"}, true},
-		{"list with flags first", []string{"--flat", "list", "--json"}, true},
-		{"list with allow stale first", []string{"--allow-stale", "--flat", "list", "--json"}, true},
-		{"show", []string{"show", "gt-abc"}, false},
-		{"update", []string{"update", "gt-abc", "--status=hooked"}, false},
-		{"empty", nil, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := shouldThrottleBDRead(tt.args); got != tt.want {
-				t.Fatalf("shouldThrottleBDRead(%v) = %v, want %v", tt.args, got, tt.want)
 			}
 		})
 	}

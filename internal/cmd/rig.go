@@ -75,10 +75,16 @@ Use --adopt to register an existing directory instead of creating new:
   - Auto-detects git URL from origin remote (git-url argument not required)
   - Adds entry to mayor/rigs.json
 
+For a repo you don't own, use fork mode (fetch upstream, push to fork).
+See docs/guides/fork-rig-setup.md for setup, verification, and recovery.
+
 Example:
   gt rig add gastown https://github.com/steveyegge/gastown
   gt rig add my_project git@github.com:user/repo.git --prefix mp
-  gt rig add existing_rig --adopt`,
+  gt rig add existing_rig --adopt
+  gt rig add gastown https://github.com/gastownhall/gastown \
+    --push-url https://github.com/you/gastown \
+    --upstream-url https://github.com/gastownhall/gastown`,
 	Args: cobra.RangeArgs(1, 2),
 	RunE: runRigAdd,
 }
@@ -362,8 +368,8 @@ func init() {
 	rigAddCmd.Flags().StringVar(&rigAddPrefix, "prefix", "", "Beads issue prefix (default: derived from name)")
 	rigAddCmd.Flags().StringVar(&rigAddLocalRepo, "local-repo", "", "Local repo path to share git objects (optional)")
 	rigAddCmd.Flags().StringVar(&rigAddBranch, "branch", "", "Default branch name (default: auto-detected from remote)")
-	rigAddCmd.Flags().StringVar(&rigAddPushURL, "push-url", "", "Push URL for read-only upstreams (push to fork)")
-	rigAddCmd.Flags().StringVar(&rigAddUpstreamURL, "upstream-url", "", "Upstream repository URL (for fork workflows)")
+	rigAddCmd.Flags().StringVar(&rigAddPushURL, "push-url", "", "Push URL for read-only upstreams, i.e. push to fork (see docs/guides/fork-rig-setup.md)")
+	rigAddCmd.Flags().StringVar(&rigAddUpstreamURL, "upstream-url", "", "Upstream repository URL for fork workflows (see docs/guides/fork-rig-setup.md)")
 	rigAddCmd.Flags().BoolVar(&rigAddAdopt, "adopt", false, "Adopt an existing directory instead of creating new")
 	rigAddCmd.Flags().StringVar(&rigAddAdoptURL, "url", "", "Git remote URL for --adopt (default: auto-detected from origin)")
 	rigAddCmd.Flags().BoolVar(&rigAddAdoptForce, "force", false, "With --adopt, register even if git remote cannot be detected")

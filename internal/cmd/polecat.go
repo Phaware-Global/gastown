@@ -2217,7 +2217,7 @@ func runPolecatPrune(cmd *cobra.Command, args []string) error {
 			if polecatPruneDryRun {
 				fmt.Printf("  Would delete remote: %s\n", style.Dim.Render(branch))
 			} else {
-				if delErr := repoGit.DeleteRemoteBranch("origin", branch); delErr != nil {
+				if delErr := repoGit.DeleteRemoteBranchIfAt("origin", branch, ref.Hash); delErr != nil {
 					fmt.Printf("  %s remote %s: %v\n", style.Warning.Render("⚠"), branch, delErr)
 				} else {
 					fmt.Printf("  %s deleted remote %s\n", style.Success.Render("✓"), branch)
