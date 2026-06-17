@@ -622,4 +622,74 @@ func TestParseDurationOrDefault_AllWebTimeoutDefaults(t *testing.T) {
 	}
 }
 
+// --- IsCodeGraphIndexingEnabled ---
+
+func TestIsCodeGraphIndexingEnabled(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		town *TownSettings
+		rig  *RigSettings
+		want bool
+	}{
+		{
+			name: "nil town and rig defaults to true",
+			town: nil,
+			rig:  nil,
+			want: true,
+		},
+		{
+			name: "empty configs default to true",
+			town: &TownSettings{},
+			rig:  &RigSettings{},
+			want: true,
+		},
+		{
+			name: "town disabled, no rig override",
+			town: &TownSettings{CodeGraph: &CodeGraphConfig{Enabled: boolPtr(false)}},
+			rig:  nil,
+			want: false,
+		},
+		{
+			name: "town enabled explicitly",
+			town: &TownSettings{CodeGraph: &CodeGraphConfig{Enabled: boolPtr(true)}},
+			rig:  nil,
+			want: true,
+		},
+		{
+			name: "rig overrides town disabled",
+			town: &TownSettings{CodeGraph: &CodeGraphConfig{Enabled: boolPtr(false)}},
+			rig:  &RigSettings{CodeGraph: &CodeGraphConfig{Enabled: boolPtr(true)}},
+			want: true,
+		},
+		{
+			name: "rig disables even when town enabled",
+			town: &TownSettings{CodeGraph: &CodeGraphConfig{Enabled: boolPtr(true)}},
+			rig:  &RigSettings{CodeGraph: &CodeGraphConfig{Enabled: boolPtr(false)}},
+			want: false,
+		},
+		{
+			name: "rig nil codegraph falls back to town",
+			town: &TownSettings{CodeGraph: &CodeGraphConfig{Enabled: boolPtr(false)}},
+			rig:  &RigSettings{CodeGraph: nil},
+			want: false,
+		},
+		{
+			name: "rig codegraph nil enabled falls back to town",
+			town: &TownSettings{CodeGraph: &CodeGraphConfig{Enabled: boolPtr(false)}},
+			rig:  &RigSettings{CodeGraph: &CodeGraphConfig{Enabled: nil}},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := IsCodeGraphIndexingEnabled(tt.town, tt.rig)
+			if got != tt.want {
+				t.Errorf("IsCodeGraphIndexingEnabled() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
 
