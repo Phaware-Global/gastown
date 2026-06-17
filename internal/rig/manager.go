@@ -772,6 +772,10 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		fmt.Printf("  Warning: Could not copy overlay files to refinery: %v\n", err)
 	}
 
+	if err := EnsureCodegraphIndex(refineryRigPath, m.townRoot, rigPath); err != nil {
+		fmt.Printf("  Warning: Could not start codegraph indexing for refinery: %v\n", err)
+	}
+
 	// NOTE: Claude settings are installed by the agent at startup, not here.
 	// Claude Code does NOT traverse parent directories for settings.json.
 	// See: https://github.com/anthropics/claude-code/issues/12962
