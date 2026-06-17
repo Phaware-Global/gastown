@@ -177,10 +177,11 @@ func runInstall(cmd *cobra.Command, args []string) error {
 				port = envPort
 			}
 		}
+		externalTestDolt := useExternalTestDoltServer(port)
 		if err := doltserver.CheckPortAvailable(port); err != nil {
 			// Port is in use — but if a Dolt server is already running
 			// for this same town, we can reuse it instead of starting a new one.
-			if canReuseInstallDoltServer(absPath, port) {
+			if canReuseInstallDoltServer(absPath, port) || externalTestDolt {
 				fmt.Printf("   %s Using existing Dolt server on port %d\n",
 					style.Dim.Render("ℹ"), port)
 			} else {
@@ -356,21 +357,26 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	// Town beads (hq- prefix) stores mayor mail, cross-rig coordination, and handoffs.
 	// Rig beads are separate and have their own prefixes.
 	if !installNoBeads {
+		port := doltserver.DefaultConfig(absPath).Port
+		externalTestDolt := useExternalTestDoltServer(port)
+
 		// Set up Dolt: identity → init-rig hq → server start.
 		// This ordering works because InitRig falls through to `dolt init`
 		// when the server isn't running yet.
 		// Identity was verified in preflight above.
 		// Create HQ database before starting server.
-		if _, _, err := doltserver.InitRig(absPath, "hq"); err != nil {
-			return fmt.Errorf("initializing HQ Dolt database: %w", err)
-		}
+		if !externalTestDolt {
+			if _, _, err := doltserver.InitRig(absPath, "hq"); err != nil {
+				return fmt.Errorf("initializing HQ Dolt database: %w", err)
+			}
 
-		// Start the Dolt server — bd commands need a running server.
-		// The server stays running after install (it's lightweight infrastructure,
-		// like a database). Stop it with 'gt dolt stop' when not needed.
-		if err := doltserver.Start(absPath); err != nil {
-			if !strings.Contains(err.Error(), "already running") {
-				return fmt.Errorf("starting Dolt server for beads: %w", err)
+			// Start the Dolt server — bd commands need a running server.
+			// The server stays running after install (it's lightweight infrastructure,
+			// like a database). Stop it with 'gt dolt stop' when not needed.
+			if err := doltserver.Start(absPath); err != nil {
+				if !strings.Contains(err.Error(), "already running") {
+					return fmt.Errorf("starting Dolt server for beads: %w", err)
+				}
 			}
 		}
 
@@ -533,6 +539,24 @@ func canReuseInstallDoltServer(townRoot string, port int) bool {
 	}
 	legitimate, err := doltserver.VerifyServerDataDir(townRoot)
 	return err == nil && legitimate
+}
+
+func useExternalTestDoltServer(port int) bool {
+	if os.Getenv("GT_TEST_EXTERNAL_DOLT") == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), installDoltServerProbeTimeout)
+	defer cancel()
+
+	probeTimeout := installDoltServerProbeTimeout.String()
+	dsn := fmt.Sprintf("root:@tcp(127.0.0.1:%d)/?timeout=%s&readTimeout=%s&writeTimeout=%s",
+		port, probeTimeout, probeTimeout, probeTimeout)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return false
+	}
+	defer db.Close()
+	return db.PingContext(ctx) == nil
 }
 
 func formatInstallDoltError(status deps.DoltStatus, version, detail, goos string) error {

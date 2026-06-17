@@ -20,7 +20,8 @@ const (
 	// Closed wisps older than this are permanently deleted. Formula var: purge_age.
 	defaultWispDeleteAge = 7 * 24 * time.Hour
 	// Alert threshold: if open wisp count exceeds this, the Dog should escalate.
-	wispAlertThreshold = 500
+	// Shared with `gt reaper run` warning. See reaper.DefaultAlertThreshold.
+	wispAlertThreshold = reaper.DefaultAlertThreshold
 	// Closed mail older than this is permanently deleted. Formula var: mail_delete_age.
 	defaultMailDeleteAge = 7 * 24 * time.Hour
 	// Issues stale longer than this are auto-closed. Formula var: stale_issue_age.
@@ -127,8 +128,13 @@ func (d *Daemon) dispatchReaperDog(vars map[string]string) error {
 		args = append(args, "--var", fmt.Sprintf("%s=%s", k, v))
 	}
 
-	cmd := exec.Command("gt", args...)
+	cmd := exec.Command(d.gtPath, args...) //nolint:gosec // G204: d.gtPath resolved at daemon init via LookPath
 	cmd.Dir = d.config.TownRoot
+	// Inherit os.Environ() (cmd.Env left nil) — gt sling performs WRITES
+	// (creates wisps, dispatches dogs) so it must NOT carry
+	// BD_DOLT_AUTO_COMMIT=off from bdReadOnlyEnv(). PATH augmentation at
+	// daemon startup (PATCH-007) ensures the inherited env still finds
+	// gt/bd via os.Environ()'s PATH.
 	util.SetDetachedProcessGroup(cmd)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("gt sling: %w", err)

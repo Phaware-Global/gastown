@@ -297,13 +297,13 @@ func runTelegraphStartImpl(ctx context.Context, cfg *telegraph.Config, townRoot 
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutdownCancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			srv.Close()
+			_ = srv.Close()
 		}
 		srvErr = <-serveDone
 	case err := <-serveDone:
 		// Serve exited unexpectedly; Close prevents keep-alive connections from
 		// starting new handlers that would race with wg.Wait().
-		srv.Close()
+		_ = srv.Close()
 		srvErr = err
 	}
 

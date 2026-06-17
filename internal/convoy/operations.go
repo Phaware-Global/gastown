@@ -522,6 +522,90 @@ func fetchCrossRigBeadStatus(townRoot string, ids []string) map[string]*beadsdk.
 	return result
 }
 
+// FireCrossRigDepNotifications checks if any issues in other rigs were unblocked
+// by the closure of closedIssueID. For each affected rig, sends a nudge to that
+// rig's witness so it can react to the resolved dependency.
+//
+// Cross-rig deps are stored in the dependent issue's store as "external:<prefix>:<id>".
+// To find them, this function queries each rig store using the external-wrapped form
+// of the closed issue ID.
+//
+// This is best-effort: failures are silently logged. The closed issue's own store
+// is skipped (same-rig deps don't need cross-rig notification).
+func FireCrossRigDepNotifications(ctx context.Context, closedIssueID, townRoot string, stores map[string]beadsdk.Storage, logger func(format string, args ...interface{})) {
+	if logger == nil {
+		logger = func(format string, args ...interface{}) {}
+	}
+	if len(stores) == 0 || closedIssueID == "" || townRoot == "" {
+		return
+	}
+
+	// Determine the home store of the closed issue so we can skip it.
+	closedPrefix := beads.ExtractPrefix(closedIssueID)
+	if closedPrefix == "" {
+		return
+	}
+	closedRig := beads.GetRigNameForPrefix(townRoot, closedPrefix)
+	closedStoreKey := closedRig
+	if closedStoreKey == "" {
+		closedStoreKey = "hq"
+	}
+
+	// Build the external-wrapped form used when storing cross-rig dep records:
+	// "external:<prefix-without-trailing-dash>:<id>"
+	externalID := fmt.Sprintf("external:%s:%s", strings.TrimSuffix(closedPrefix, "-"), closedIssueID)
+
+	// Track which rigs have already been notified to avoid duplicate nudges.
+	notifiedRigs := make(map[string]bool)
+
+	for storeName, store := range stores {
+		if storeName == closedStoreKey {
+			continue // skip the closed issue's own store
+		}
+
+		dependents, err := store.GetDependentsWithMetadata(ctx, externalID)
+		if err != nil || len(dependents) == 0 {
+			continue
+		}
+
+		for _, dep := range dependents {
+			if dep == nil {
+				continue
+			}
+			depType := string(dep.DependencyType)
+			if !blockingDepTypes[depType] {
+				continue
+			}
+
+			// Determine the rig for the dependent issue.
+			depID := extractIssueID(dep.ID)
+			depPrefix := beads.ExtractPrefix(depID)
+			if depPrefix == "" {
+				continue
+			}
+			depRig := beads.GetRigNameForPrefix(townRoot, depPrefix)
+			if depRig == "" || depRig == closedRig {
+				continue
+			}
+			if notifiedRigs[depRig] {
+				continue
+			}
+			notifiedRigs[depRig] = true
+
+			depTitle := dep.Title
+			logger("CrossRig: %s closed, unblocking %s (%s) — nudging %s/witness", closedIssueID, depID, depRig, depRig)
+
+			msg := fmt.Sprintf("Dependency resolved: %s — External dependency %s has closed. Unblocked: %s (%s). This issue may now proceed.",
+				closedIssueID, closedIssueID, depID, depTitle)
+			nudgeCmd := exec.Command("gt", "nudge", depRig+"/witness", "-m", msg)
+			nudgeCmd.Dir = townRoot
+			if err := nudgeCmd.Run(); err != nil {
+				logger("CrossRig: nudge %s/witness failed: %v", depRig, err)
+			}
+		}
+	}
+}
+
 // dispatchIssue dispatches an issue to a rig via gt sling.
 // The context parameter enables cancellation on daemon shutdown.
 // gtPath is the resolved path to the gt binary.

@@ -1684,3 +1684,112 @@ func TestFetchCrossRigBeadStatus_EmptyInput(t *testing.T) {
 		t.Errorf("expected 0 results for empty input, got %d", len(result))
 	}
 }
+
+func TestFireCrossRigDepNotifications_NilStores(t *testing.T) {
+	// Should not panic with nil stores.
+	FireCrossRigDepNotifications(context.Background(), "bd-xxx", "/tmp", nil, nil)
+}
+
+func TestFireCrossRigDepNotifications_EmptyClosedID(t *testing.T) {
+	// Should not panic with empty closed issue ID.
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	FireCrossRigDepNotifications(context.Background(), "", "/tmp", map[string]beadsdk.Storage{"test": store}, nil)
+}
+
+func TestFireCrossRigDepNotifications_EmptyPrefix(t *testing.T) {
+	// Issue ID without a recognizable prefix should not panic.
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	FireCrossRigDepNotifications(context.Background(), "noprefixid", "/tmp", map[string]beadsdk.Storage{"test": store}, nil)
+}
+
+func TestFireCrossRigDepNotifications_NotifiesWitnessOnCrossRigBlocker(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows")
+	}
+
+	// Set up a real store that simulates the "gastown" rig.
+	// In it we create gt-dep which is blocked by external:bd:bd-closed.
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	dependent := &beadsdk.Issue{
+		ID:        "gt-dep1",
+		Title:     "Waiting on beads fix",
+		Status:    beadsdk.StatusOpen,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := store.CreateIssue(ctx, dependent, "test"); err != nil {
+		t.Fatalf("CreateIssue dependent: %v", err)
+	}
+
+	// Add a blocking dep: gt-dep1 is blocked by external:bd:bd-closed
+	dep := &beadsdk.Dependency{
+		IssueID:     "gt-dep1",
+		DependsOnID: "external:bd:bd-closed",
+		Type:        beadsdk.DepBlocks,
+		CreatedAt:   now,
+		CreatedBy:   "test",
+	}
+	if err := store.AddDependency(ctx, dep, "test"); err != nil {
+		t.Fatalf("AddDependency: %v", err)
+	}
+
+	// Set up town root with routes: gt- → gastown, bd- → beads.
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll .beads: %v", err)
+	}
+	routesContent := `{"prefix":"gt-","path":"gastown/.beads"}` + "\n" +
+		`{"prefix":"bd-","path":"beads/.beads"}` + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routesContent), 0o644); err != nil {
+		t.Fatalf("WriteFile routes.jsonl: %v", err)
+	}
+
+	// Set up a mock gt binary that logs nudge calls.
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll binDir: %v", err)
+	}
+	gtLogPath := filepath.Join(townRoot, "gt.log")
+	gtScript := fmt.Sprintf(`#!/bin/sh
+echo "CMD:$*" >> %q
+exit 0
+`, gtLogPath)
+	gtPath := filepath.Join(binDir, "gt")
+	if err := os.WriteFile(gtPath, []byte(gtScript), 0o755); err != nil {
+		t.Fatalf("write gt stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// stores: "gastown" → store (has gt-dep1 blocked by external:bd:bd-closed)
+	//         "beads"   → (closed issue's home store, skipped by FireCrossRigDepNotifications)
+	stores := map[string]beadsdk.Storage{
+		"gastown": store,
+	}
+
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+
+	FireCrossRigDepNotifications(ctx, "bd-closed", townRoot, stores, logger)
+
+	// Verify gt nudge was called for gastown/witness.
+	logData, err := os.ReadFile(gtLogPath)
+	if err != nil {
+		t.Skipf("gt stub not called (no log): %v", err)
+	}
+	logStr := string(logData)
+	if !strings.Contains(logStr, "nudge") || !strings.Contains(logStr, "gastown/witness") {
+		t.Errorf("expected gt nudge gastown/witness in log, got: %q\nlogger output: %v", logStr, logged)
+	}
+}

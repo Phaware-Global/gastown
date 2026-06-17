@@ -352,6 +352,9 @@ func TestSlingRollsBackSpawnedPolecatOnInstantiateFailure(t *testing.T) {
 	}
 	bdScript := `#!/bin/sh
 set -e
+if [ "$1" = "--db" ]; then
+  shift 2
+fi
 cmd="$1"
 shift || true
 case "$cmd" in
@@ -380,6 +383,10 @@ exit 0
 `
 	bdScriptWindows := `@echo off
 setlocal enableextensions
+if "%1"=="--db" (
+  shift
+  shift
+)
 set "cmd=%1"
 set "sub=%2"
 if "%cmd%"=="show" (
@@ -464,6 +471,352 @@ exit /b 0
 	}
 	if !rollbackCalled {
 		t.Fatalf("expected rollbackSlingArtifacts to be called")
+	}
+}
+
+func TestSlingRejectsBeadMissingFromTargetRigBeforeSpawn(t *testing.T) {
+	townRoot := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig: %v", err)
+	}
+	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	rigs := &config.RigsConfig{
+		Version: 1,
+		Rigs: map[string]config.RigEntry{
+			"gastown": {
+				GitURL:  "git@github.com:test/gastown.git",
+				AddedAt: time.Now().Truncate(time.Second),
+				BeadsConfig: &config.BeadsConfig{
+					Repo:   "local",
+					Prefix: "zz-",
+				},
+			},
+		},
+	}
+	if err := config.SaveRigsConfig(rigsPath, rigs); err != nil {
+		t.Fatalf("SaveRigsConfig: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig"), 0755); err != nil {
+		t.Fatalf("mkdir target rig dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	routes := strings.Join([]string{
+		`{"prefix":"gt-","path":"."}`,
+		`{"prefix":"zz-","path":"gastown/mayor/rig"}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0644); err != nil {
+		t.Fatalf("write routes.jsonl: %v", err)
+	}
+
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir binDir: %v", err)
+	}
+	logPath := filepath.Join(townRoot, "bd.log")
+	bdScript := `#!/bin/sh
+set -e
+echo "$*" >> "${BD_LOG}"
+if [ "$1" = "--db" ]; then
+  # The direct target-rig DB lookup must fail: the bead only resolves from HQ.
+  exit 1
+fi
+cmd="$1"
+shift || true
+case "$cmd" in
+  show)
+    echo '[{"title":"HQ-owned issue","status":"open","assignee":"","description":""}]'
+    ;;
+  mol|update|cook)
+    echo "unexpected side effect: $cmd" >&2
+    exit 2
+    ;;
+esac
+exit 0
+`
+	bdScriptWindows := `@echo off
+echo %*>>"%BD_LOG%"
+if "%1"=="--db" exit /b 1
+set "cmd=%1"
+if "%cmd%"=="show" (
+  echo [{"title":"HQ-owned issue","status":"open","assignee":"","description":""}]
+  exit /b 0
+)
+if "%cmd%"=="mol" exit /b 2
+if "%cmd%"=="update" exit /b 2
+if "%cmd%"=="cook" exit /b 2
+exit /b 0
+`
+	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
+
+	t.Setenv("BD_LOG", logPath)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(EnvGTRole, "mayor")
+	t.Setenv("GT_POLECAT", "")
+	t.Setenv("GT_CREW", "")
+	t.Setenv("TMUX_PANE", "")
+	t.Setenv("GT_TEST_NO_NUDGE", "1")
+	t.Setenv("GT_TEST_SKIP_HOOK_VERIFY", "1")
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(filepath.Join(townRoot, "mayor", "rig")); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	prevNoConvoy := slingNoConvoy
+	prevNoBoot := slingNoBoot
+	prevSpawn := spawnPolecatForSling
+	t.Cleanup(func() {
+		slingNoConvoy = prevNoConvoy
+		slingNoBoot = prevNoBoot
+		spawnPolecatForSling = prevSpawn
+	})
+	slingNoConvoy = true
+	slingNoBoot = true
+
+	spawnCalled := false
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		spawnCalled = true
+		return &SpawnedPolecatInfo{RigName: rigName, PolecatName: "toast", ClonePath: filepath.Join(townRoot, "fake-polecat")}, nil
+	}
+
+	err = runSling(nil, []string{"gt-r2405", "gastown"})
+	if err == nil {
+		t.Fatal("expected target-rig database validation error")
+	}
+	if !strings.Contains(err.Error(), "not present in target rig") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if spawnCalled {
+		t.Fatal("spawnPolecatForSling was called before target-rig database validation rejected the bead")
+	}
+}
+
+func setupCrossDatabaseSlingGuardTest(t *testing.T) (townRoot, logPath string) {
+	t.Helper()
+
+	townRoot = t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig: %v", err)
+	}
+	rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	rigs := &config.RigsConfig{
+		Version: 1,
+		Rigs: map[string]config.RigEntry{
+			"gastown": {
+				GitURL:  "git@github.com:test/gastown.git",
+				AddedAt: time.Now().Truncate(time.Second),
+				BeadsConfig: &config.BeadsConfig{
+					Repo:   "local",
+					Prefix: "zz-",
+				},
+			},
+		},
+	}
+	if err := config.SaveRigsConfig(rigsPath, rigs); err != nil {
+		t.Fatalf("SaveRigsConfig: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig"), 0755); err != nil {
+		t.Fatalf("mkdir target rig dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	routes := strings.Join([]string{
+		`{"prefix":"gt-","path":"."}`,
+		`{"prefix":"zz-","path":"gastown/mayor/rig"}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0644); err != nil {
+		t.Fatalf("write routes.jsonl: %v", err)
+	}
+
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir binDir: %v", err)
+	}
+	logPath = filepath.Join(townRoot, "bd.log")
+	bdScript := `#!/bin/sh
+set -e
+echo "$*" >> "${BD_LOG}"
+if [ "$1" = "--db" ]; then
+  exit 1
+fi
+cmd="$1"
+shift || true
+case "$cmd" in
+  show)
+    echo '[{"title":"HQ-owned issue","status":"open","assignee":"","description":""}]'
+    ;;
+  create|update|cook|mol|close|dep)
+    echo "unexpected side effect: $cmd" >&2
+    exit 2
+    ;;
+esac
+exit 0
+`
+	bdScriptWindows := `@echo off
+echo %*>>"%BD_LOG%"
+if "%1"=="--db" exit /b 1
+set "cmd=%1"
+if "%cmd%"=="show" (
+  echo [{"title":"HQ-owned issue","status":"open","assignee":"","description":""}]
+  exit /b 0
+)
+if "%cmd%"=="create" exit /b 2
+if "%cmd%"=="update" exit /b 2
+if "%cmd%"=="cook" exit /b 2
+if "%cmd%"=="mol" exit /b 2
+if "%cmd%"=="close" exit /b 2
+if "%cmd%"=="dep" exit /b 2
+exit /b 0
+`
+	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
+
+	t.Setenv("BD_LOG", logPath)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(EnvGTRole, "mayor")
+	t.Setenv("GT_POLECAT", "")
+	t.Setenv("GT_CREW", "")
+	t.Setenv("TMUX_PANE", "")
+	t.Setenv("GT_TEST_NO_NUDGE", "1")
+	t.Setenv("GT_TEST_SKIP_HOOK_VERIFY", "1")
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(filepath.Join(townRoot, "mayor", "rig")); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	return townRoot, logPath
+}
+
+func TestScheduleBeadRejectsMissingTargetRigDatabaseBeforeContext(t *testing.T) {
+	_, logPath := setupCrossDatabaseSlingGuardTest(t)
+
+	err := scheduleBead("gt-r2405", "gastown", ScheduleOptions{})
+	if err == nil {
+		t.Fatal("expected target-rig database validation error")
+	}
+	if !strings.Contains(err.Error(), "not present in target rig") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	logBytes, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatalf("read bd log: %v", readErr)
+	}
+	log := string(logBytes)
+	for _, sideEffect := range []string{"create", "update", "cook", "mol", "close", "dep"} {
+		if strings.Contains(log, sideEffect) {
+			t.Fatalf("bd side effect %q ran before target-rig database validation rejected the bead; log:\n%s", sideEffect, log)
+		}
+	}
+}
+
+func TestBatchSlingRejectsMissingTargetRigDatabaseBeforeSpawn(t *testing.T) {
+	townRoot, _ := setupCrossDatabaseSlingGuardTest(t)
+
+	prevDryRun := slingDryRun
+	prevForce := slingForce
+	prevSpawn := spawnPolecatForSling
+	t.Cleanup(func() {
+		slingDryRun = prevDryRun
+		slingForce = prevForce
+		spawnPolecatForSling = prevSpawn
+	})
+	slingDryRun = false
+	slingForce = false
+
+	spawnCalled := false
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		spawnCalled = true
+		return &SpawnedPolecatInfo{RigName: rigName, PolecatName: "toast", ClonePath: filepath.Join(townRoot, "fake-polecat")}, nil
+	}
+
+	err := runBatchSling([]string{"gt-r2405"}, "gastown", filepath.Join(townRoot, ".beads"))
+	if err == nil {
+		t.Fatal("expected target-rig database validation error")
+	}
+	if !strings.Contains(err.Error(), "not present in target rig") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if spawnCalled {
+		t.Fatal("spawnPolecatForSling was called before target-rig database validation rejected the bead")
+	}
+}
+
+func TestExecuteSlingRejectsMissingTargetRigDatabaseBeforeSpawn(t *testing.T) {
+	townRoot, _ := setupCrossDatabaseSlingGuardTest(t)
+
+	prevSpawn := spawnPolecatForSling
+	t.Cleanup(func() { spawnPolecatForSling = prevSpawn })
+
+	spawnCalled := false
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		spawnCalled = true
+		return &SpawnedPolecatInfo{RigName: rigName, PolecatName: "toast", ClonePath: filepath.Join(townRoot, "fake-polecat")}, nil
+	}
+
+	_, err := executeSling(SlingParams{
+		BeadID:   "gt-r2405",
+		RigName:  "gastown",
+		TownRoot: townRoot,
+		BeadsDir: filepath.Join(townRoot, ".beads"),
+	})
+	if err == nil {
+		t.Fatal("expected target-rig database validation error")
+	}
+	if !strings.Contains(err.Error(), "not present in target rig") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if spawnCalled {
+		t.Fatal("spawnPolecatForSling was called before target-rig database validation rejected the bead")
+	}
+}
+
+func TestResolveTargetRejectsLivePolecatMissingTargetRigDatabase(t *testing.T) {
+	townRoot, _ := setupCrossDatabaseSlingGuardTest(t)
+
+	prevResolve := resolveTargetAgentFn
+	t.Cleanup(func() { resolveTargetAgentFn = prevResolve })
+	resolveTargetAgentFn = func(target string) (string, string, string, error) {
+		return "gastown/polecats/toast", "%1", filepath.Join(townRoot, "gastown", "polecats", "toast"), nil
+	}
+
+	for _, target := range []string{"gastown/polecats/toast", "gastown/toast", "gt-gastown-polecat-toast"} {
+		t.Run(target, func(t *testing.T) {
+			_, err := resolveTarget(target, ResolveTargetOptions{
+				BeadID:   "gt-r2405",
+				TownRoot: townRoot,
+			})
+			if err == nil {
+				t.Fatal("expected target-rig database validation error")
+			}
+			if !strings.Contains(err.Error(), "not present in target rig") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestTargetRigDatabaseLookupFailsClosedWithoutTownRoot(t *testing.T) {
+	err := verifyBeadExistsInTargetRigDatabase("gt-r2405", "gastown", "")
+	if err == nil {
+		t.Fatal("expected fail-closed error without town root")
+	}
+	if !strings.Contains(err.Error(), "town root is unavailable") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -1659,13 +2012,17 @@ func TestCheckCrossRigGuard(t *testing.T) {
 			wantErr:     true,
 		},
 		{
-			name:        "town-level: hq bead to rig (rejected — belongs to town root)",
+			// Known town-root prefix: warn but allow. A crew member with a broken
+			// redirect chain may create hq-* beads that legitimately target a rig
+			// polecat (gt-gbu). Hard-rejecting silently drops all their polecat work.
+			name:        "town-level: hq bead to rig (warns but allows — gt-gbu)",
 			beadID:      "hq-abc123",
 			targetAgent: "gastown/polecats/Toast",
-			wantErr:     true,
+			wantErr:     false,
 		},
 		{
-			name:        "unknown prefix: rejected (no route maps to target rig)",
+			// Truly unknown prefix (not in routes.jsonl): hard reject.
+			name:        "unknown prefix: rejected (no route exists at all)",
 			beadID:      "xx-unknown",
 			targetAgent: "gastown/polecats/Toast",
 			wantErr:     true,
@@ -1686,8 +2043,8 @@ func TestCheckCrossRigGuard(t *testing.T) {
 			}
 			if err != nil && tc.wantErr {
 				errMsg := err.Error()
-				if !strings.Contains(errMsg, "cross-rig mismatch") && !strings.Contains(errMsg, "town root") {
-					t.Errorf("expected cross-rig or town-root error, got: %v", err)
+				if !strings.Contains(errMsg, "cross-rig mismatch") && !strings.Contains(errMsg, "not in routes") {
+					t.Errorf("expected cross-rig mismatch or unknown-prefix error, got: %v", err)
 				}
 				if !strings.Contains(errMsg, "--force") {
 					t.Errorf("error should mention --force override, got: %v", err)
@@ -2724,6 +3081,66 @@ func TestSlingRejectsDeferredBead(t *testing.T) {
 				if strings.Contains(err.Error(), "refusing to sling deferred") {
 					t.Fatalf("unexpected deferred rejection: %v", err)
 				}
+			}
+		})
+	}
+}
+
+// TestRunSlingResumeFlagValidation verifies the gh#3602 mutual-exclusion rules
+// for --branch / --pr / --base-branch. The validation block runs before any
+// I/O, so we can exercise it without a live workspace.
+func TestRunSlingResumeFlagValidation(t *testing.T) {
+	tests := []struct {
+		name         string
+		resumeBranch string
+		resumePR     int
+		baseBranch   string
+		wantError    string
+	}{
+		{
+			name:         "branch and pr together is rejected",
+			resumeBranch: "feature/foo",
+			resumePR:     42,
+			wantError:    "--branch and --pr are mutually exclusive",
+		},
+		{
+			name:         "branch with base-branch is rejected",
+			resumeBranch: "feature/foo",
+			baseBranch:   "develop",
+			wantError:    "--base-branch cannot be combined with --branch or --pr",
+		},
+		{
+			name:       "pr with base-branch is rejected",
+			resumePR:   42,
+			baseBranch: "develop",
+			wantError:  "--base-branch cannot be combined with --branch or --pr",
+		},
+	}
+
+	t.Setenv(EnvGTRole, "")
+	t.Setenv("GT_POLECAT", "")
+
+	prevResumeBranch := slingResumeBranch
+	prevResumePR := slingResumePR
+	prevBaseBranch := slingBaseBranch
+	t.Cleanup(func() {
+		slingResumeBranch = prevResumeBranch
+		slingResumePR = prevResumePR
+		slingBaseBranch = prevBaseBranch
+	})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			slingResumeBranch = tt.resumeBranch
+			slingResumePR = tt.resumePR
+			slingBaseBranch = tt.baseBranch
+
+			err := runSling(nil, []string{"gt-test"})
+			if err == nil {
+				t.Fatalf("expected error containing %q but got nil", tt.wantError)
+			}
+			if !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("expected error containing %q, got: %v", tt.wantError, err)
 			}
 		})
 	}

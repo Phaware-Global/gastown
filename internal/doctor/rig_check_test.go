@@ -33,9 +33,12 @@ exit 0
 		}
 	} else {
 		script := `#!/bin/sh
-target="$(pwd)/.beads"
-mkdir -p "$target"
-printf 'prefix: tr\nissue-prefix: tr-\n' > "$target/config.yaml"
+	if [ -n "$BD_ARGS_LOG" ]; then
+	  printf 'args=%s env=%s beads=%s db=%s\n' "$*" "${BEADS_DOLT_SERVER_DATABASE:-<unset>}" "${BEADS_DIR:-<unset>}" "${BEADS_DB:-<unset>}" >> "$BD_ARGS_LOG"
+	fi
+	target="$(pwd)/.beads"
+	mkdir -p "$target"
+	printf 'prefix: tr\nissue-prefix: tr-\n' > "$target/config.yaml"
 exit 0
 `
 		if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
@@ -44,6 +47,64 @@ exit 0
 	}
 
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func TestBeadsRedirectCheck_FixInitBeadsUsesCanonicalDatabase(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mock bd arg logging is shell-specific")
+	}
+	installMockBdInitOnly(t)
+
+	tmpDir := t.TempDir()
+	rigName := "testrig"
+	rigDir := filepath.Join(tmpDir, rigName)
+	if err := os.MkdirAll(rigDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	mayorDir := filepath.Join(tmpDir, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	rigsJSON := `{
+		"version": 1,
+		"rigs": {
+			"testrig": {
+				"git_url": "https://example.com/test.git",
+				"beads": {"prefix": "tr"}
+			}
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	argsLog := filepath.Join(t.TempDir(), "bd-args.log")
+	t.Setenv("BD_ARGS_LOG", argsLog)
+	t.Setenv("BEADS_DIR", filepath.Join(tmpDir, "wrong", ".beads"))
+	t.Setenv("BEADS_DB", filepath.Join(tmpDir, "wrong.db"))
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "wrong_db")
+
+	check := NewBeadsRedirectCheck()
+	ctx := &CheckContext{TownRoot: tmpDir, RigName: rigName}
+	if err := check.Fix(ctx); err != nil {
+		t.Fatalf("Fix failed: %v", err)
+	}
+
+	logData, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatalf("reading bd args log: %v", err)
+	}
+	log := string(logData)
+	if !strings.Contains(log, "args=init --prefix tr --database testrig --server --server-port") {
+		t.Fatalf("bd init did not use canonical rig database; log:\n%s", log)
+	}
+	if !strings.Contains(log, "env=testrig") || !strings.Contains(log, "beads="+filepath.Join(rigDir, ".beads")) {
+		t.Fatalf("bd init did not receive canonical env; log:\n%s", log)
+	}
+	if strings.Contains(log, "wrong_db") || strings.Contains(log, "wrong.db") || strings.Contains(log, filepath.Join(tmpDir, "wrong", ".beads")) {
+		t.Fatalf("stale BEADS env leaked into bd subprocess; log:\n%s", log)
+	}
 }
 
 func TestNewBeadsRedirectCheck(t *testing.T) {

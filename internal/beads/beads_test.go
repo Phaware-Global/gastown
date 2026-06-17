@@ -2459,7 +2459,9 @@ func TestSetupRedirect(t *testing.T) {
 	})
 
 	t.Run("crew worktree with tracked beads", func(t *testing.T) {
-		// Setup: town/rig/.beads/redirect -> mayor/rig/.beads (tracked)
+		// Setup: town/rig/.beads/redirect -> mayor/rig/.beads (tracked).
+		// Runtime metadata may coexist with the rig redirect; it must not cause
+		// SetupRedirect to create a bd-incompatible redirect chain.
 		townRoot := t.TempDir()
 		rigRoot := filepath.Join(townRoot, "testrig")
 		rigBeads := filepath.Join(rigRoot, ".beads")
@@ -2476,6 +2478,9 @@ func TestSetupRedirect(t *testing.T) {
 		// Create rig-level redirect to mayor/rig/.beads
 		if err := os.WriteFile(filepath.Join(rigBeads, "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
 			t.Fatalf("write rig redirect: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(rigBeads, "metadata.json"), []byte(`{"dolt_database":"hq","backend":"dolt"}`), 0644); err != nil {
+			t.Fatalf("write rig metadata: %v", err)
 		}
 		if err := os.MkdirAll(crewPath, 0755); err != nil {
 			t.Fatalf("mkdir crew: %v", err)

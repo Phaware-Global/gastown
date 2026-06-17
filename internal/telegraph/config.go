@@ -88,7 +88,7 @@ type ProviderConfig struct {
 	SecretEnv string `toml:"secret_env"`
 
 	// Events is the list of provider event types to accept.
-	// Unrecognised event types are rejected with ErrUnknownEventType.
+	// Unrecognized event types are rejected with ErrUnknownEventType.
 	Events []string `toml:"events"`
 
 	// IgnoreActors is a list of actor display-names whose events are silently

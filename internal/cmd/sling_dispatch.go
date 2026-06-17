@@ -18,25 +18,26 @@ import (
 // reconstructed into a SlingParams and passed to executeSling().
 type SlingParams struct {
 	// What to sling
-	BeadID      string   // Base bead
-	FormulaName string   // Formula to apply ("mol-polecat-work", user formula, or "")
-	RigName     string   // Target rig (always a rig for queue)
+	BeadID      string // Base bead
+	FormulaName string // Formula to apply ("mol-polecat-work", user formula, or "")
+	RigName     string // Target rig (always a rig for queue)
 
 	// CLI flag passthrough
-	Args       string   // --args
-	Vars       []string // --var (key=value pairs)
-	Merge      string   // --merge (convoy strategy)
-	BaseBranch string   // --base-branch
-	Account    string   // --account
-	Agent      string   // --agent
-	NoConvoy   bool     // --no-convoy
-	Owned      bool     // --owned
-	NoMerge    bool     // --no-merge
-	Force      bool     // --force
-	HookRawBead bool    // --hook-raw-bead
-	NoBoot     bool     // --no-boot
-	Mode       string   // --ralph: "" (normal) or "ralph"
-	ReviewOnly bool     // --review-only: review and report back only, no merge/commit/push
+	Args         string   // --args
+	Vars         []string // --var (key=value pairs)
+	Merge        string   // --merge (convoy strategy)
+	BaseBranch   string   // --base-branch
+	ResumeBranch string   // --branch / --pr (resume existing PR branch, gh#3602)
+	Account      string   // --account
+	Agent        string   // --agent
+	NoConvoy     bool     // --no-convoy
+	Owned        bool     // --owned
+	NoMerge      bool     // --no-merge
+	Force        bool     // --force
+	HookRawBead  bool     // --hook-raw-bead
+	NoBoot       bool     // --no-boot
+	Mode         string   // --ralph: "" (normal) or "ralph"
+	ReviewOnly   bool     // --review-only: review and report back only, no merge/commit/push
 
 	// Execution behavior (set by caller, not serialized to queue)
 	SkipCook         bool   // Batch optimization: formula already cooked
@@ -164,6 +165,13 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		return result, fmt.Errorf("bead %s is deferred (use --force to override)", params.BeadID)
 	}
 
+	if params.RigName != "" {
+		if err := verifyBeadExistsInTargetRigDatabase(params.BeadID, params.RigName, townRoot); err != nil {
+			result.ErrMsg = err.Error()
+			return result, err
+		}
+	}
+
 	// Send LIFECYCLE:Shutdown to the witness when force-stealing a bead from a
 	// live polecat. Without this, the old polecat becomes a zombie — still running
 	// but unaware it lost its hook. Mirrors the same logic in runSling (sling.go).
@@ -222,11 +230,12 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 
 	// 3. Spawn polecat (via spawnPolecatForSling)
 	spawnOpts := SlingSpawnOptions{
-		Force:      params.Force,
-		Account:    params.Account,
-		HookBead:   params.BeadID,
-		Agent:      params.Agent,
-		BaseBranch: params.BaseBranch,
+		Force:        params.Force,
+		Account:      params.Account,
+		HookBead:     params.BeadID,
+		Agent:        params.Agent,
+		BaseBranch:   params.BaseBranch,
+		ResumeBranch: params.ResumeBranch,
 		// Create is always true for rig targets: executeSling only handles
 		// rig-targeted dispatch (batch sling + queue dispatch), where a fresh
 		// polecat must be spawned. The single-sling path (runSling) handles

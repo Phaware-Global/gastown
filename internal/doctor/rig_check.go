@@ -8,11 +8,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/git"
 )
 
@@ -1056,9 +1058,17 @@ func (c *BeadsRedirectCheck) Fix(ctx *CheckContext) error {
 		if prefix != "" {
 			initArgs = append(initArgs, "--prefix", prefix)
 		}
+		initArgs = append(initArgs, "--database", ctx.RigName)
 		initArgs = append(initArgs, "--server")
+		doltCfg := doltserver.DefaultConfig(ctx.TownRoot)
+		initArgs = append(initArgs, "--server-port", strconv.Itoa(doltCfg.Port))
+		bdEnv := append(stripEnvPrefixes(os.Environ(), "BEADS_DIR=", "BEADS_DB=", "BEADS_DOLT_SERVER_DATABASE="),
+			"BEADS_DIR="+rigBeadsDir,
+			"BEADS_DOLT_SERVER_DATABASE="+ctx.RigName,
+		)
 		cmd := exec.Command("bd", initArgs...)
 		cmd.Dir = rigPath
+		cmd.Env = bdEnv
 		if output, err := cmd.CombinedOutput(); err != nil {
 			// bd might not be installed — create config.yaml via shared helper.
 			if writeErr := beads.EnsureConfigYAML(rigBeadsDir, prefix); writeErr != nil {
@@ -1070,7 +1080,11 @@ func (c *BeadsRedirectCheck) Fix(ctx *CheckContext) error {
 			// Configure custom types for Gas Town (beads v0.46.0+)
 			configCmd := exec.Command("bd", "config", "set", "types.custom", constants.BeadsCustomTypes)
 			configCmd.Dir = rigPath
+			configCmd.Env = bdEnv
 			_, _ = configCmd.CombinedOutput() // Ignore errors - older beads don't need this
+		}
+		if err := doltserver.EnsureMetadataForBeadsDir(ctx.TownRoot, rigBeadsDir, ctx.RigName, ctx.RigName); err != nil {
+			return fmt.Errorf("ensuring metadata.json: %w", err)
 		}
 		return nil
 	}
@@ -1934,8 +1948,8 @@ func (c *BareRepoExistsCheck) Fix(ctx *CheckContext) error {
 // os.RemoveAll erases .repo.git/worktrees/<name>/HEAD; without this the
 // re-registration would silently default to main.
 type bareRepoWorktreeRef struct {
-	relPath  string // rig-relative worktree directory path
-	headRef  string // contents of the worktree's HEAD (e.g. "ref: refs/heads/foo\n"), empty if unreadable
+	relPath string // rig-relative worktree directory path
+	headRef string // contents of the worktree's HEAD (e.g. "ref: refs/heads/foo\n"), empty if unreadable
 }
 
 // collectBareRepoReferences returns refs for every worktree dir whose .git
