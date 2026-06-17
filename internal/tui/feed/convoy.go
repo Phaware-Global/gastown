@@ -103,7 +103,7 @@ func FetchConvoys(townRoot string) (*ConvoyState, error) {
 
 // listConvoys returns convoys with the given status
 func listConvoys(beadsDir, status string) ([]convoyListItem, error) {
-	listArgs := []string{"list", "--type=convoy", "--status=" + status, "--json"}
+	listArgs := []string{"list", "--status=" + status, "--json", "--limit=0"}
 
 	ctx, cancel := context.WithTimeout(context.Background(), constants.BdSubprocessTimeout)
 	defer cancel()
@@ -118,20 +118,37 @@ func listConvoys(beadsDir, status string) ([]convoyListItem, error) {
 		return nil, err
 	}
 
-	var items []convoyListItem
-	if err := json.Unmarshal(stdout.Bytes(), &items); err != nil {
+	var rawItems []convoyListItem
+	if err := json.Unmarshal(stdout.Bytes(), &rawItems); err != nil {
 		return nil, err
 	}
 
+	items := make([]convoyListItem, 0, len(rawItems))
+	for _, item := range rawItems {
+		if item.IssueType == "convoy" || feedConvoyHasLabel(item.Labels, "gt:convoy") {
+			items = append(items, item)
+		}
+	}
 	return items, nil
 }
 
 type convoyListItem struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	Status    string `json:"status"`
-	CreatedAt string `json:"created_at"`
-	ClosedAt  string `json:"closed_at,omitempty"`
+	ID        string   `json:"id"`
+	Title     string   `json:"title"`
+	Status    string   `json:"status"`
+	CreatedAt string   `json:"created_at"`
+	ClosedAt  string   `json:"closed_at,omitempty"`
+	IssueType string   `json:"issue_type"`
+	Labels    []string `json:"labels"`
+}
+
+func feedConvoyHasLabel(labels []string, target string) bool {
+	for _, label := range labels {
+		if label == target {
+			return true
+		}
+	}
+	return false
 }
 
 // enrichConvoy adds tracked issue counts to a convoy
@@ -334,7 +351,7 @@ var (
 			Foreground(colorDim)
 
 	MQStatusMerging = lipgloss.NewStyle().
-				Foreground(colorPrimary)
+			Foreground(colorPrimary)
 
 	MQStatusMerged = lipgloss.NewStyle().
 			Foreground(colorSuccess).

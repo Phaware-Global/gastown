@@ -1,4 +1,4 @@
-.PHONY: build desktop-build desktop-run install safe-install check-forward-only check-version-tag clean test test-e2e-container check-up-to-date
+.PHONY: build desktop-build desktop-run install safe-install check-forward-only check-version-tag check-install-path clean test test-makefile test-e2e-container check-up-to-date
 
 BINARY := gt
 BINARY_DESKTOP := gt-desktop
@@ -91,6 +91,14 @@ ifndef SKIP_FORWARD_CHECK
 	fi
 endif
 
+check-install-path:
+	@resolved=$$(command -v $(BINARY) 2>/dev/null || true); \
+	if [ "$$resolved" != "$(INSTALL_DIR)/$(BINARY)" ]; then \
+		echo "Warning: $(BINARY) resolves to $${resolved:-nothing in PATH}, not $(INSTALL_DIR)/$(BINARY)"; \
+		echo "  Add this before other PATH entries in your shell profile:"; \
+		echo '  export PATH="$(INSTALL_DIR):$$PATH"'; \
+	fi
+
 install: check-up-to-date build
 	@mkdir -p $(INSTALL_DIR)
 	@rm -f $(INSTALL_DIR)/$(BINARY)
@@ -103,6 +111,7 @@ install: check-up-to-date build
 		fi; \
 	done
 	@echo "Installed $(BINARY) to $(INSTALL_DIR)/$(BINARY)"
+	@$(MAKE) --no-print-directory check-install-path
 	@# Restart daemon so it picks up the new binary.
 	@# A stale daemon is a recurring source of bugs (wrong session prefixes, etc.)
 	@if $(INSTALL_DIR)/$(BINARY) daemon status >/dev/null 2>&1; then \
@@ -134,6 +143,7 @@ safe-install: check-up-to-date check-forward-only build
 		fi; \
 	done
 	@echo "Installed $(BINARY) to $(INSTALL_DIR)/$(BINARY) (daemon NOT restarted)"
+	@$(MAKE) --no-print-directory check-install-path
 	@echo "Sessions will pick up new binary on next cycle."
 
 # check-version-tag: Verify that if HEAD is tagged vX.Y.Z, the Version constant
@@ -169,8 +179,11 @@ check-version-tag:
 clean:
 	rm -f $(BUILD_DIR)/$(BINARY)
 
-test:
+test: test-makefile
 	go test ./...
+
+test-makefile:
+	bash scripts/check-install-path_test.sh
 
 # Run e2e tests in isolated container (the only supported way to run them)
 test-e2e-container:

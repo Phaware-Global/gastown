@@ -2308,6 +2308,48 @@ func TestBranchPushedToRemote_SplitURL(t *testing.T) {
 	}
 }
 
+func TestUnpushedCommitsPrefersExactRemoteBranchOverUpstream(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	branch := "polecat/already-pushed"
+
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "work.go"), []byte("package work\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := g.Add("work.go"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Commit("polecat work"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := g.Push("origin", branch, false); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	runGit(t, localDir, "branch", "--set-upstream-to=origin/"+mainBranch, branch)
+
+	unpushed, err := g.UnpushedCommits()
+	if err != nil {
+		t.Fatalf("UnpushedCommits: %v", err)
+	}
+	if unpushed != 0 {
+		t.Fatalf("UnpushedCommits = %d, want 0 for pushed branch tracking origin/%s", unpushed, mainBranch)
+	}
+
+	status, err := g.CheckUncommittedWork()
+	if err != nil {
+		t.Fatalf("CheckUncommittedWork: %v", err)
+	}
+	if !status.Clean() {
+		t.Fatalf("CheckUncommittedWork should be clean, got %s", status)
+	}
+}
+
 // TestBranchPushedToRemote_NoPushURL verifies baseline behavior: when fetch and
 // push URLs are the same, BranchPushedToRemote works normally.
 func TestBranchPushedToRemote_NoPushURL(t *testing.T) {

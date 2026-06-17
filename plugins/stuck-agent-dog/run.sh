@@ -135,37 +135,34 @@ fi
 # --- Take action --------------------------------------------------------------
 
 # Crashed polecats: notify witness to restart
-# Guard on array length: an empty array must skip the loop entirely. Bare
-# "${CRASHED[@]}" trips set -u on bash 3.2, and the ${CRASHED[@]:-} workaround
-# iterates once over an empty string — yielding empty RIG/PCAT and a bogus
-# "/witness" mail address (root cause of hq-wisp-ekvkez, hq-s8oa8).
-if [ "${#CRASHED[@]}" -gt 0 ]; then
-  for ENTRY in "${CRASHED[@]}"; do
-    IFS='|' read -r SESSION RIG PCAT HOOK <<< "$ENTRY"
-    log "Requesting restart for $RIG/polecats/$PCAT (hook=$HOOK)"
-    gt mail send "$RIG/witness" -s "RESTART_POLECAT: $RIG/$PCAT" --stdin <<BODY
+# Note: `"${arr[@]:-}"` expands an empty array to a single empty string under
+# `set -u`, which would fire a phantom `RESTART_POLECAT: /` notification (root
+# cause of hq-wisp-ekvkez, hq-s8oa8). The `${arr[@]+"${arr[@]}"}` form expands
+# to nothing when the array is empty. (Converged to upstream's form during sync;
+# equivalent to the fork's prior `[ ${#arr[@]} -gt 0 ]` length guard.)
+for ENTRY in ${CRASHED[@]+"${CRASHED[@]}"}; do
+  IFS='|' read -r SESSION RIG PCAT HOOK <<< "$ENTRY"
+  log "Requesting restart for $RIG/polecats/$PCAT (hook=$HOOK)"
+  gt mail send "$RIG/witness" -s "RESTART_POLECAT: $RIG/$PCAT" --stdin <<BODY
 Polecat $PCAT crash confirmed by stuck-agent-dog plugin.
 hook_bead: $HOOK
 action: restart requested
 BODY
-  done
-fi
+done
 
 # Zombie polecats: kill zombie session, then request restart
 # Same empty-array guard as the CRASHED loop above.
-if [ "${#STUCK[@]}" -gt 0 ]; then
-  for ENTRY in "${STUCK[@]}"; do
-    IFS='|' read -r SESSION RIG PCAT HOOK REASON <<< "$ENTRY"
-    log "Killing zombie session $SESSION and requesting restart"
-    tmux kill-session -t "$SESSION" 2>/dev/null || true
-    gt mail send "$RIG/witness" -s "RESTART_POLECAT: $RIG/$PCAT (zombie cleared)" --stdin <<BODY
+for ENTRY in ${STUCK[@]+"${STUCK[@]}"}; do
+  IFS='|' read -r SESSION RIG PCAT HOOK REASON <<< "$ENTRY"
+  log "Killing zombie session $SESSION and requesting restart"
+  tmux kill-session -t "$SESSION" 2>/dev/null || true
+  gt mail send "$RIG/witness" -s "RESTART_POLECAT: $RIG/$PCAT (zombie cleared)" --stdin <<BODY
 Polecat $PCAT zombie session cleared by stuck-agent-dog plugin.
 hook_bead: $HOOK
 reason: $REASON
 action: restart requested
 BODY
-  done
-fi
+done
 
 # Deacon issues: escalate
 if [ -n "$DEACON_ISSUE" ]; then

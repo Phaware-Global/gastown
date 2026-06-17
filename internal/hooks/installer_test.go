@@ -48,6 +48,109 @@ func TestInstallForRole_RoleAware(t *testing.T) {
 	}
 }
 
+func TestInstallForRole_ClaudeSettingsSuppressStartupPrompts(t *testing.T) {
+	tests := []struct {
+		name string
+		role string
+	}{
+		{"autonomous", "polecat"},
+		{"interactive", "crew"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := InstallForRole("claude", dir, dir, tt.role, ".claude", "settings.json", true); err != nil {
+				t.Fatalf("InstallForRole: %v", err)
+			}
+
+			data, err := os.ReadFile(filepath.Join(dir, ".claude", "settings.json"))
+			if err != nil {
+				t.Fatalf("read settings: %v", err)
+			}
+			if strings.Contains(string(data), "export PATH=") {
+				t.Fatal("claude settings contain stale export PATH marker")
+			}
+			if strings.Contains(string(data), "{{GT_BIN}}") {
+				t.Fatal("claude settings contain unresolved {{GT_BIN}} placeholder")
+			}
+
+			var settings map[string]any
+			if err := json.Unmarshal(data, &settings); err != nil {
+				t.Fatalf("settings are not valid JSON: %v", err)
+			}
+			if got, ok := settings["skipDangerousModePermissionPrompt"].(bool); !ok || !got {
+				t.Fatalf("skipDangerousModePermissionPrompt = %v, want true", settings["skipDangerousModePermissionPrompt"])
+			}
+			if got, ok := settings["hasCompletedOnboarding"].(bool); !ok || !got {
+				t.Fatalf("hasCompletedOnboarding = %v, want true", settings["hasCompletedOnboarding"])
+			}
+			if got := settings["theme"]; got != "dark" {
+				t.Fatalf("theme = %v, want dark", got)
+			}
+			permissions, ok := settings["permissions"].(map[string]any)
+			if !ok {
+				t.Fatalf("permissions = %T, want object", settings["permissions"])
+			}
+			if got := permissions["defaultMode"]; got != "bypassPermissions" {
+				t.Fatalf("permissions.defaultMode = %v, want bypassPermissions", got)
+			}
+		})
+	}
+}
+
+func TestInstallForRole_ClaudeCurrentTemplatePreservesExistingSettings(t *testing.T) {
+	tests := []struct {
+		name string
+		role string
+	}{
+		{"autonomous", "polecat"},
+		{"interactive", "crew"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			settingsPath := filepath.Join(dir, ".claude", "settings.json")
+			if err := InstallForRole("claude", dir, dir, tt.role, ".claude", "settings.json", true); err != nil {
+				t.Fatalf("initial InstallForRole: %v", err)
+			}
+
+			data, err := os.ReadFile(settingsPath)
+			if err != nil {
+				t.Fatalf("read settings: %v", err)
+			}
+			var settings map[string]any
+			if err := json.Unmarshal(data, &settings); err != nil {
+				t.Fatalf("unmarshal settings: %v", err)
+			}
+			settings["customSentinel"] = true
+			updated, err := json.MarshalIndent(settings, "", "  ")
+			if err != nil {
+				t.Fatalf("marshal settings: %v", err)
+			}
+			if err := os.WriteFile(settingsPath, append(updated, '\n'), 0600); err != nil {
+				t.Fatalf("write settings: %v", err)
+			}
+
+			if err := InstallForRole("claude", dir, dir, tt.role, ".claude", "settings.json", true); err != nil {
+				t.Fatalf("second InstallForRole: %v", err)
+			}
+
+			data, err = os.ReadFile(settingsPath)
+			if err != nil {
+				t.Fatalf("read settings after second install: %v", err)
+			}
+			if err := json.Unmarshal(data, &settings); err != nil {
+				t.Fatalf("unmarshal settings after second install: %v", err)
+			}
+			if got, ok := settings["customSentinel"].(bool); !ok || !got {
+				t.Fatalf("customSentinel = %v, want true", settings["customSentinel"])
+			}
+		})
+	}
+}
+
 func TestInstallForRole_RoleAgnostic(t *testing.T) {
 	// OpenCode, Pi, OMP have single templates
 	tests := []struct {
@@ -490,6 +593,10 @@ func TestComputeExpectedTemplate_Gemini(t *testing.T) {
 	// Should contain GT_HOOK_SOURCE=compact (from autonomous template)
 	if !strings.Contains(string(content), "GT_HOOK_SOURCE=compact") {
 		t.Error("expected GT_HOOK_SOURCE=compact in autonomous template")
+	}
+
+	if strings.Contains(string(content), `"context"`) || strings.Contains(string(content), `"fileName"`) {
+		t.Error("Gemini template should not force context.fileName; GEMINI.md overlays must remain loadable")
 	}
 
 	// Interactive role should get settings-interactive.json template

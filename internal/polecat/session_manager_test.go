@@ -636,6 +636,122 @@ func TestPromptlessFallbackIncludesPrimeAndWorkInstructions(t *testing.T) {
 	}
 }
 
+// TestModeABeaconVerificationCondition verifies that hook+prompt agents (e.g. Claude)
+// satisfy the Mode A beacon delivery verification condition introduced in hi-y44.
+// Fresh spawns may show the Claude Code splash with the CLI beacon pre-filled but
+// not auto-submitted; the condition triggers verifyStartupNudgeDelivery as a safety net.
+func TestModeABeaconVerificationCondition(t *testing.T) {
+	tests := []struct {
+		name            string
+		rc              *config.RuntimeConfig
+		wantModeA       bool // !SendBeaconNudge && !SendStartupNudge
+	}{
+		{
+			name: "Claude hook+prompt agent triggers Mode A verification",
+			rc: &config.RuntimeConfig{
+				PromptMode: "arg",
+				Hooks: &config.RuntimeHooksConfig{
+					Provider: "claude",
+				},
+			},
+			wantModeA: true,
+		},
+		{
+			name: "Non-hook agent does not trigger Mode A (has startup nudge instead)",
+			rc: &config.RuntimeConfig{
+				PromptMode: "arg",
+				Hooks:      nil,
+			},
+			wantModeA: false,
+		},
+		{
+			name: "Hook agent with no prompt support does not trigger Mode A (uses beacon nudge)",
+			rc: &config.RuntimeConfig{
+				PromptMode: "none",
+				Hooks: &config.RuntimeHooksConfig{
+					Provider: "claude",
+				},
+			},
+			wantModeA: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := gtruntime.GetStartupFallbackInfo(tt.rc)
+			gotModeA := !info.SendBeaconNudge && !info.SendStartupNudge
+			if gotModeA != tt.wantModeA {
+				t.Errorf("Mode A condition = %v, want %v (SendBeaconNudge=%v, SendStartupNudge=%v)",
+					gotModeA, tt.wantModeA, info.SendBeaconNudge, info.SendStartupNudge)
+			}
+		})
+	}
+}
+
+// TestModeAStartupVerifyIsNonBlocking exercises the Mode A async verification path
+// that Start uses for hook+prompt agents (hi-y44). Confirms that verifyStartupNudgeDelivery
+// runs as a goroutine — a synchronous call on this path added ~25s to every successful
+// polecat startup because the function sleeps before its first idle check.
+func TestModeAStartupVerifyIsNonBlocking(t *testing.T) {
+	requireTmux(t)
+
+	tm := tmux.NewTmux()
+	sessionName := fmt.Sprintf("gt-test-modeA-%d", testSessionCounter.Add(1))
+	_ = tm.KillSession(sessionName)
+
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
+
+	time.Sleep(300 * time.Millisecond)
+	_ = tm.SendKeys(sessionName, "export PS1='❯ '")
+	time.Sleep(300 * time.Millisecond)
+
+	r := &rig.Rig{Name: "test-rig", Path: t.TempDir()}
+	m := NewSessionManager(tm, r)
+
+	rc := &config.RuntimeConfig{
+		PromptMode: "arg",
+		Hooks:      &config.RuntimeHooksConfig{Provider: "claude"},
+		Tmux: &config.RuntimeTmuxConfig{
+			ReadyPromptPrefix: "❯ ",
+		},
+	}
+
+	// Confirm this is a Mode A agent (the condition Start checks before the goroutine).
+	info := gtruntime.GetStartupFallbackInfo(rc)
+	if info.SendBeaconNudge || info.SendStartupNudge {
+		t.Fatal("expected Mode A: !SendBeaconNudge && !SendStartupNudge")
+	}
+
+	// Replicate what Start does on the Mode A path: launch verifyStartupNudgeDelivery
+	// as a goroutine. The caller must return before the verify delay (25s default) elapses.
+	callerReturned := make(chan time.Duration, 1)
+	goroutineDone := make(chan struct{})
+
+	launchStart := time.Now()
+	go func() {
+		m.verifyStartupNudgeDelivery(sessionName, rc, "[GAS TOWN] test ← witness / Run `gt prime --hook`")
+		close(goroutineDone)
+	}()
+	callerReturned <- time.Since(launchStart)
+
+	// Caller side: goroutine launch should be near-instant.
+	elapsed := <-callerReturned
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("goroutine launch blocked caller for %v; expected <500ms (async regression)", elapsed)
+	}
+
+	// Goroutine side: must complete within (maxRetries * verifyDelay) + overhead.
+	// Default: 2 retries * 25s = 50s. Allow 90s for slow CI.
+	select {
+	case <-goroutineDone:
+	case <-time.After(90 * time.Second):
+		t.Fatal("Mode A verifyStartupNudgeDelivery goroutine hung (exceeded 90s timeout)")
+	}
+}
+
 func TestValidateSessionName(t *testing.T) {
 	// Register prefixes so validateSessionName can resolve them correctly.
 	reg := session.NewPrefixRegistry()

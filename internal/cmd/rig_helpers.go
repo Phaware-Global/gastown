@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
@@ -160,6 +161,44 @@ func rigBeadsPrefix(townRoot, rigPath, rigName string) string {
 	return ""
 }
 
+// discoverRigsForTownRoot loads the rigs config for the given town root and
+// returns all registered rigs. Callers that don't yet have a town root
+// should use getAllRigs, which resolves it from the cwd first.
+func discoverRigsForTownRoot(townRoot string) ([]*rig.Rig, error) {
+	rigsConfig, err := config.LoadRigsConfig(constants.MayorRigsPath(townRoot))
+	if err != nil {
+		rigsConfig = &config.RigsConfig{Rigs: make(map[string]config.RigEntry)}
+	}
+
+	g := git.NewGit(townRoot)
+	rigMgr := rig.NewManager(townRoot, rigsConfig, g)
+	return rigMgr.DiscoverRigs()
+}
+
+// autoInferRig returns the sole registered rig for a given townRoot, or an
+// actionable error when the result is ambiguous. Callers use this when no
+// --rig flag was provided and cwd-based detection found nothing (e.g. Deacon
+// at HQ level on a non-default install where "gastown" rig does not exist).
+func autoInferRig(townRoot string) (name, path string, err error) {
+	rigs, err := discoverRigsForTownRoot(townRoot)
+	if err != nil {
+		return "", "", fmt.Errorf("cannot determine target rig: %w; use --rig=NAME", err)
+	}
+
+	switch len(rigs) {
+	case 1:
+		return rigs[0].Name, rigs[0].Path, nil
+	case 0:
+		return "", "", fmt.Errorf("cannot determine target rig: no rigs registered in this workspace; use --rig=NAME")
+	default:
+		names := make([]string, len(rigs))
+		for i, r := range rigs {
+			names[i] = r.Name
+		}
+		return "", "", fmt.Errorf("cannot determine target rig (available: %s); use --rig=NAME", strings.Join(names, ", "))
+	}
+}
+
 // getAllRigs discovers all rigs in the current Gas Town workspace.
 // Returns the list of rigs and any error.
 func getAllRigs() ([]*rig.Rig, error) {
@@ -167,19 +206,5 @@ func getAllRigs() ([]*rig.Rig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
-
-	rigsConfigPath := filepath.Join(townRoot, "mayor", "rigs.json")
-	rigsConfig, err := config.LoadRigsConfig(rigsConfigPath)
-	if err != nil {
-		rigsConfig = &config.RigsConfig{Rigs: make(map[string]config.RigEntry)}
-	}
-
-	g := git.NewGit(townRoot)
-	rigMgr := rig.NewManager(townRoot, rigsConfig, g)
-	rigs, err := rigMgr.DiscoverRigs()
-	if err != nil {
-		return nil, err
-	}
-
-	return rigs, nil
+	return discoverRigsForTownRoot(townRoot)
 }

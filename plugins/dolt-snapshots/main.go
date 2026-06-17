@@ -344,7 +344,10 @@ func findConvoysNeedingSnapshots(db *sql.DB) ([]convoyRow, error) {
 			CASE WHEN EXISTS (SELECT 1 FROM hq.dolt_tags t WHERE t.tag_name LIKE CONCAT('staged/%-', i.id))
 				 THEN 1 ELSE 0 END AS has_staged_tag
 		FROM hq.issues i
-		WHERE i.issue_type = 'convoy'
+		WHERE (i.issue_type = 'convoy' OR EXISTS (
+				SELECT 1 FROM hq.labels l
+				WHERE l.issue_id = i.id AND l.label = 'gt:convoy'
+			))
 			AND (
 				i.status IN ('staged_ready', 'staged_warnings', 'launched', 'open')
 				OR (i.status = 'closed' AND i.updated_at >= NOW() - INTERVAL 24 HOUR)
@@ -536,7 +539,10 @@ func escalateStale(db *sql.DB, databases []string, dryRun bool) {
 			WHERE b.name LIKE 'convoy/%%'
 				AND EXISTS (
 					SELECT 1 FROM hq.issues i
-					WHERE i.issue_type = 'convoy'
+					WHERE (i.issue_type = 'convoy' OR EXISTS (
+							SELECT 1 FROM hq.labels l
+							WHERE l.issue_id = i.id AND l.label = 'gt:convoy'
+						))
 						AND b.name LIKE CONCAT('%%-', i.id)
 						AND i.status IN ('closed', 'landed')
 						AND i.updated_at < DATE_SUB(NOW(), INTERVAL 7 DAY)

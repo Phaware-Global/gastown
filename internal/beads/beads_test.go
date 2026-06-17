@@ -189,6 +189,109 @@ exit 0
 	}
 }
 
+func TestCreateRoutesToResolvedRigBeadsDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(townBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir town .beads: %v", err)
+	}
+	if err := WriteRoutes(townBeadsDir, []Route{
+		{Prefix: "hq-", Path: "."},
+		{Prefix: "tr-", Path: "testrig"},
+	}); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	rigDir := filepath.Join(townRoot, "testrig")
+	rigBeadsDir := filepath.Join(rigDir, ".beads")
+	canonicalRigBeadsDir := filepath.Join(rigDir, "mayor", "rig", ".beads")
+	for _, dir := range []string{rigBeadsDir, canonicalRigBeadsDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(rigBeadsDir, "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatalf("write rig redirect: %v", err)
+	}
+
+	stubDir := t.TempDir()
+	logPath := filepath.Join(stubDir, "bd.log")
+	stubScript := `#!/bin/sh
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    --*) ;;
+    *) cmd="$arg"; break ;;
+  esac
+done
+if [ "$cmd" = "create" ]; then
+  printf 'beads_dir=%s\n' "$BEADS_DIR" >> "$MOCK_BD_LOG"
+  printf 'args=%s\n' "$*" >> "$MOCK_BD_LOG"
+  printf '{"id":"tr-test1","title":"test","status":"open","priority":2,"labels":[]}\n'
+fi
+exit 0
+`
+	stubPath := filepath.Join(stubDir, "bd")
+	if err := os.WriteFile(stubPath, []byte(stubScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("MOCK_BD_LOG", logPath)
+
+	workerDir := filepath.Join(rigDir, "polecats", "quartz")
+	if err := os.MkdirAll(workerDir, 0755); err != nil {
+		t.Fatalf("mkdir worker: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		opts CreateOptions
+	}{
+		{
+			name: "explicit rig",
+			opts: CreateOptions{Title: "Merge: hq-abc", Rig: "testrig", Ephemeral: true},
+		},
+		{
+			name: "parent prefix",
+			opts: CreateOptions{Title: "Child task", Parent: "tr-parent"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.Remove(logPath); err != nil && !os.IsNotExist(err) {
+				t.Fatalf("remove log: %v", err)
+			}
+
+			bd := New(workerDir)
+			if _, err := bd.Create(tc.opts); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+
+			logData, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatalf("read mock log: %v", err)
+			}
+			logOutput := string(logData)
+			if !strings.Contains(logOutput, "beads_dir="+canonicalRigBeadsDir) {
+				t.Fatalf("Create did not route to canonical rig beads dir %q:\n%s", canonicalRigBeadsDir, logOutput)
+			}
+			if strings.Contains(logOutput, "beads_dir="+rigBeadsDir+"\n") {
+				t.Fatalf("Create used intermediate redirect beads dir %q:\n%s", rigBeadsDir, logOutput)
+			}
+		})
+	}
+}
+
 // TestIsFlagLikeTitle verifies flag-like title detection (gt-e0kx5).
 func TestIsFlagLikeTitle(t *testing.T) {
 	tests := []struct {
@@ -2617,7 +2720,7 @@ func TestSetupRedirect(t *testing.T) {
 		}
 	})
 
-	t.Run("cleans runtime files but preserves tracked files", func(t *testing.T) {
+	t.Run("cleans runtime files but preserves config files", func(t *testing.T) {
 		townRoot := t.TempDir()
 		rigRoot := filepath.Join(townRoot, "testrig")
 		rigBeads := filepath.Join(rigRoot, ".beads")
@@ -2635,10 +2738,11 @@ func TestSetupRedirect(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(crewBeads, "daemon.lock"), []byte("1234"), 0644); err != nil {
 			t.Fatalf("write daemon.lock: %v", err)
 		}
+		// Local beads metadata is per-machine configuration and must survive startup.
 		if err := os.WriteFile(filepath.Join(crewBeads, "metadata.json"), []byte("{}"), 0644); err != nil {
 			t.Fatalf("write metadata.json: %v", err)
 		}
-		// Tracked files (should be preserved)
+		// Config files (should be preserved)
 		if err := os.WriteFile(filepath.Join(crewBeads, "config.yaml"), []byte("prefix: test"), 0644); err != nil {
 			t.Fatalf("write config: %v", err)
 		}
@@ -2654,11 +2758,11 @@ func TestSetupRedirect(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(crewBeads, "daemon.lock")); !os.IsNotExist(err) {
 			t.Error("daemon.lock should have been removed")
 		}
-		if _, err := os.Stat(filepath.Join(crewBeads, "metadata.json")); !os.IsNotExist(err) {
-			t.Error("metadata.json should have been removed")
+		if _, err := os.Stat(filepath.Join(crewBeads, "metadata.json")); err != nil {
+			t.Errorf("metadata.json should have been preserved: %v", err)
 		}
 
-		// Verify tracked files were preserved
+		// Verify config files were preserved
 		if _, err := os.Stat(filepath.Join(crewBeads, "config.yaml")); err != nil {
 			t.Errorf("config.yaml should have been preserved: %v", err)
 		}
@@ -2706,6 +2810,64 @@ func TestSetupRedirect(t *testing.T) {
 		err := SetupRedirect(townRoot, rigRoot)
 		if err == nil {
 			t.Error("SetupRedirect should reject rig root (too shallow)")
+		}
+	})
+
+	t.Run("rejects town root without mutating beads config", func(t *testing.T) {
+		townRoot := t.TempDir()
+		townBeads := filepath.Join(townRoot, ".beads")
+		metadata := []byte(`{"backend":"dolt","dolt_database":"hq"}`)
+
+		if err := os.MkdirAll(townBeads, 0755); err != nil {
+			t.Fatalf("mkdir town beads: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(townBeads, "metadata.json"), metadata, 0644); err != nil {
+			t.Fatalf("write metadata: %v", err)
+		}
+
+		err := SetupRedirect(townRoot, townRoot)
+		if err == nil {
+			t.Fatal("SetupRedirect should reject town root")
+		}
+		if _, err := os.Stat(filepath.Join(townBeads, "redirect")); !os.IsNotExist(err) {
+			t.Fatalf("town root redirect should not have been created, stat err=%v", err)
+		}
+		got, err := os.ReadFile(filepath.Join(townBeads, "metadata.json"))
+		if err != nil {
+			t.Fatalf("metadata.json should be preserved: %v", err)
+		}
+		if string(got) != string(metadata) {
+			t.Fatalf("metadata changed: got %q want %q", got, metadata)
+		}
+	})
+
+	t.Run("rejects worktree outside town root without mutating beads config", func(t *testing.T) {
+		townRoot := t.TempDir()
+		outsideRoot := t.TempDir()
+		outsideWorktree := filepath.Join(outsideRoot, "crew", "max")
+		outsideBeads := filepath.Join(outsideWorktree, ".beads")
+		metadata := []byte(`{"backend":"dolt","dolt_database":"hq"}`)
+
+		if err := os.MkdirAll(outsideBeads, 0755); err != nil {
+			t.Fatalf("mkdir outside beads: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(outsideBeads, "metadata.json"), metadata, 0644); err != nil {
+			t.Fatalf("write metadata: %v", err)
+		}
+
+		err := SetupRedirect(townRoot, outsideWorktree)
+		if err == nil {
+			t.Fatal("SetupRedirect should reject worktree outside town root")
+		}
+		if _, err := os.Stat(filepath.Join(outsideBeads, "redirect")); !os.IsNotExist(err) {
+			t.Fatalf("outside redirect should not have been created, stat err=%v", err)
+		}
+		got, err := os.ReadFile(filepath.Join(outsideBeads, "metadata.json"))
+		if err != nil {
+			t.Fatalf("metadata.json should be preserved: %v", err)
+		}
+		if string(got) != string(metadata) {
+			t.Fatalf("metadata changed: got %q want %q", got, metadata)
 		}
 	})
 

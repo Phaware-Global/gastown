@@ -298,10 +298,14 @@ func (d *testDAG) BdStubScript() string {
 	sb.WriteString("    exit 0\n")
 	sb.WriteString("    ;;\n")
 
-	// --- handle: list --type=convoy --all --json (overlapping convoy detection) ---
+	// --- handle: convoy list queries (overlapping convoy detection) ---
 	convoyListJSON := d.convoyListJSON()
-	sb.WriteString("  list\\ *--type=convoy*)\n")
+	sb.WriteString("  list\\ *--label=gt:convoy*)\n")
 	sb.WriteString(fmt.Sprintf("    echo '%s'\n", convoyListJSON))
+	sb.WriteString("    exit 0\n")
+	sb.WriteString("    ;;\n")
+	sb.WriteString("  list\\ --json\\ --limit=0|list\\ --json\\ --limit=0\\ --all|list\\ --json\\ --limit=0\\ --status=*)\n")
+	sb.WriteString("    echo '[]'\n")
 	sb.WriteString("    exit 0\n")
 	sb.WriteString("    ;;\n")
 
@@ -605,8 +609,8 @@ func (d *testDAG) trackersSQLJSONFor(beadID string) string {
 	return string(raw)
 }
 
-// convoyListJSON returns the JSON array for `bd list --type=convoy --all --json`.
-// Returns all convoy-type beads with their ID and status.
+// convoyListJSON returns the JSON array for convoy list queries.
+// Returns all convoy beads with their ID and status.
 func (d *testDAG) convoyListJSON() string {
 	type convoyEntry struct {
 		ID     string `json:"id"`

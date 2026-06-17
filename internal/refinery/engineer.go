@@ -1629,7 +1629,7 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 
 	// 1.5. Clear agent bead's active_mr reference (traceability cleanup)
 	if mr.AgentBead != "" {
-		if err := e.beads.UpdateAgentActiveMR(mr.AgentBead, ""); err != nil {
+		if err := e.clearAgentActiveMR(mr.AgentBead); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to clear agent bead %s active_mr: %v\n", mr.AgentBead, err)
 		}
 	}
@@ -1693,6 +1693,10 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 
 	// 5. Log success
 	_, _ = fmt.Fprintf(e.output, "[Engineer] ✓ Merged: %s (commit: %s)\n", mr.ID, result.MergeCommit)
+}
+
+func (e *Engineer) clearAgentActiveMR(agentBeadID string) error {
+	return e.beads.ForAgentBead().UpdateAgentActiveMR(agentBeadID, "")
 }
 
 // HandleMRInfoFailure handles a failed merge from MRInfo.
@@ -2368,13 +2372,22 @@ type convoyInfo struct {
 	Description string
 }
 
+func refineryHasLabel(labels []string, target string) bool {
+	for _, label := range labels {
+		if label == target {
+			return true
+		}
+	}
+	return false
+}
+
 // checkAndCloseCompletedConvoys finds and closes convoys where all tracked issues
 // are complete. Returns the list of convoys that were closed.
 func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []convoyInfo {
 	bdEnv := stripEnvKey(os.Environ(), "BEADS_DIR")
 
-	// List all open convoys
-	listArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"list", "--type=convoy", "--status=open", "--json"})
+	// List all open issues and filter locally so legacy type=convoy beads remain visible.
+	listArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"list", "--status=open", "--json", "--limit=0"})
 	listCmd := exec.Command("bd", listArgs...)
 	util.SetDetachedProcessGroup(listCmd)
 	listCmd.Dir = townBeads
@@ -2388,10 +2401,12 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 	}
 
 	var convoys []struct {
-		ID          string `json:"id"`
-		Title       string `json:"title"`
-		Status      string `json:"status"`
-		Description string `json:"description"`
+		ID          string   `json:"id"`
+		Title       string   `json:"title"`
+		Status      string   `json:"status"`
+		Description string   `json:"description"`
+		IssueType   string   `json:"issue_type"`
+		Labels      []string `json:"labels"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to parse convoy list: %v\n", err)
@@ -2401,6 +2416,9 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 	var closed []convoyInfo
 
 	for _, convoy := range convoys {
+		if convoy.IssueType != "convoy" && !refineryHasLabel(convoy.Labels, "gt:convoy") {
+			continue
+		}
 		// Get tracked issues for this convoy via bd dep list
 		depArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"dep", "list", convoy.ID, "--direction=down", "--type=tracks", "--json"})
 		depCmd := exec.Command("bd", depArgs...)

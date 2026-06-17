@@ -102,13 +102,16 @@ if [ -n "$BEADS_DIR" ]; then
 fi
 
 case "$*" in
-  "list --type=convoy --json --all")
-    if [ "$PWD" != "%s" ]; then
-      echo "expected town root, got $PWD" >&2
-      exit 1
-    fi
-    echo '[{"id":"hq-cv-town","title":"Town convoy","status":"open","created_at":"2026-03-09T00:00:00Z"}]'
-    ;;
+	  "list --label=gt:convoy --json --limit=0 --all")
+	    if [ "$PWD" != "%s" ]; then
+	      echo "expected town root, got $PWD" >&2
+	      exit 1
+	    fi
+	    echo '[{"id":"hq-cv-town","title":"Town convoy","status":"open","created_at":"2026-03-09T00:00:00Z","labels":["gt:convoy"]}]'
+	    ;;
+	  "list --json --limit=0 --all")
+	    echo '[]'
+	    ;;
   "dep list hq-cv-town --direction=down --type=tracks --allow-stale --json")
     if [ "$PWD" != "%s" ]; then
       echo "expected town root, got $PWD" >&2

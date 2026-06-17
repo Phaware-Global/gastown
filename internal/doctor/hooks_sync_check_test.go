@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -125,6 +126,48 @@ func TestHooksSyncCheck_ClaudeTargetInSync(t *testing.T) {
 		for _, d := range result.Details {
 			t.Logf("  detail: %s", d)
 		}
+	}
+}
+
+func TestHooksSyncCheck_ClaudeTargetMissingPromptDefaults(t *testing.T) {
+	townRoot := scaffoldWorkspace(t, nil)
+	syncAllClaudeTargets(t, townRoot)
+
+	targetPath := filepath.Join(townRoot, "mayor", ".claude", "settings.json")
+	data, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	delete(raw, "skipDangerousModePermissionPrompt")
+	delete(raw, "hasCompletedOnboarding")
+	delete(raw, "theme")
+	delete(raw, "permissions")
+	data, err = json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(targetPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	check := NewHooksSyncCheck()
+	ctx := &CheckContext{TownRoot: townRoot}
+	result := check.Run(ctx)
+	if result.Status != StatusWarning {
+		t.Fatalf("expected StatusWarning for missing prompt defaults, got %v: %s", result.Status, result.Message)
+	}
+
+	if err := check.Fix(ctx); err != nil {
+		t.Fatalf("Fix failed: %v", err)
+	}
+	check = NewHooksSyncCheck()
+	result = check.Run(ctx)
+	if result.Status != StatusOK {
+		t.Fatalf("expected StatusOK after fix, got %v: %s", result.Status, result.Message)
 	}
 }
 

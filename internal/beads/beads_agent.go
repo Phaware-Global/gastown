@@ -209,23 +209,14 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, 
 		return nil, fmt.Errorf("refusing to create agent bead: %w (got %q)", ErrFlagTitle, title)
 	}
 
-	// Resolve where this bead will actually be written (handles multi-repo routing)
-	targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
+	target := b.agentBeadTarget()
+	targetDir := target.getResolvedBeadsDir()
 
 	// Ensure target database has custom types configured.
 	// This is cached (sentinel file + in-memory) so repeated calls are fast.
 	// On fresh rigs, this may fail if the database can't be initialized.
 	// Don't bail out — try the bd create calls anyway (GH#1769).
 	_ = EnsureCustomTypes(targetDir)
-
-	// For routed cross-rig bead IDs, run bd from the town root so bd's own
-	// prefix router resolves the target once. Running from a rig worktree with
-	// a routed BEADS_DIR can double-stack the path for imported rigs.
-	target := b
-	townRoot := b.getTownRoot()
-	if townRoot != "" && ExtractPrefix(id) != "" {
-		target = NewWithBeadsDir(townRoot, filepath.Join(townRoot, ".beads"))
-	}
 
 	description := FormatAgentDescription(title, fields)
 
@@ -246,14 +237,6 @@ func (b *Beads) CreateAgentBead(id, title string, fields *AgentFields) (*Issue, 
 			a = append(a, "--actor="+actor)
 		}
 		return a
-	}
-
-	// Create agent bead in the target database. Use a routed Beads instance
-	// when the bead's prefix routes to a different rig than our own database.
-	// Without this, agent beads for rig polecats (e.g., be-beads-polecat-rust)
-	// would be created in the wrong database, failing type validation.
-	if targetDir != b.getResolvedBeadsDir() {
-		target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
 	}
 
 	out, err := target.run(buildArgs()...)
@@ -309,15 +292,7 @@ func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (
 	// Create failed - check if bead already exists (handles both open and closed states)
 	createErr := err
 
-	// Resolve where this bead lives. For cross-rig beads (e.g., bd-beads-polecat-obsidian
-	// created from gastown), the target database differs from b's local database.
-	// We need a Beads instance pointed at the target to run show/update/reopen,
-	// because bd show/update don't route cross-rig when BEADS_DIR is set (gt-mh3tb).
-	targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
-	target := b
-	if targetDir != b.getResolvedBeadsDir() {
-		target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
-	}
+	target := b.agentBeadTarget()
 
 	existing, showErr := target.Show(id)
 	if showErr != nil {
@@ -375,14 +350,7 @@ func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
 	}
 	defer func() { _ = fl.Unlock() }()
 
-	// Resolve where this bead lives (handles cross-rig routing).
-	// Without this, cross-rig agent beads (e.g., bd-beads-polecat-obsidian
-	// from gastown) would be looked up in the local rig's database and fail.
-	targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
-	target := b
-	if targetDir != b.getResolvedBeadsDir() {
-		target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
-	}
+	target := b.agentBeadTarget()
 
 	// Get current issue to preserve immutable fields (title, role_type, rig)
 	issue, err := target.Show(id)
@@ -423,11 +391,7 @@ func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
 // when the agent bead routes to a different beads dir via routes.jsonl.
 func (b *Beads) UpdateAgentState(id string, state string) (retErr error) {
 	defer func() { telemetry.RecordAgentStateChange(context.Background(), id, state, nil, retErr) }()
-	targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
-	target := b
-	if targetDir != b.getResolvedBeadsDir() {
-		target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
-	}
+	target := b.agentBeadTarget()
 	return target.UpdateAgentDescriptionFields(id, AgentFieldUpdates{AgentState: &state})
 }
 
@@ -460,6 +424,10 @@ type AgentFieldUpdates struct {
 // condition where concurrent callers updating different fields overwrite each
 // other because the entire description is replaced.
 func (b *Beads) UpdateAgentDescriptionFields(id string, updates AgentFieldUpdates) error {
+	if target := b.agentBeadTarget(); target != b {
+		return target.UpdateAgentDescriptionFields(id, updates)
+	}
+
 	// Validate notification level if provided
 	if updates.NotificationLevel != nil {
 		level := *updates.NotificationLevel
@@ -610,6 +578,10 @@ func (b *Beads) GetAgentNotificationLevel(id string) (string, error) {
 // GetAgentBead retrieves an agent bead by ID.
 // Returns nil if not found.
 func (b *Beads) GetAgentBead(id string) (*Issue, *AgentFields, error) {
+	if target := b.agentBeadTarget(); target != b {
+		return target.GetAgentBead(id)
+	}
+
 	issue, err := b.Show(id)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {

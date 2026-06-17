@@ -1914,6 +1914,108 @@ esac
 	}
 }
 
+func TestManagerAgentLifecycleUsesTownBeadsDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+
+	townRoot := t.TempDir()
+	rigName := "gastown"
+	rigPath := filepath.Join(townRoot, rigName)
+	mayorRig := filepath.Join(rigPath, "mayor", "rig")
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	rigBeadsDir := filepath.Join(mayorRig, ".beads")
+
+	for _, dir := range []string{
+		filepath.Join(townRoot, "mayor"),
+		townBeadsDir,
+		rigBeadsDir,
+		filepath.Join(rigPath, ".beads"),
+	} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte("{}"), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigPath, ".beads", "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatalf("write redirect: %v", err)
+	}
+	if err := beads.WriteRoutes(townBeadsDir, []beads.Route{
+		{Prefix: "hq-", Path: "."},
+		{Prefix: "gt-", Path: filepath.Join(rigName, "mayor", "rig")},
+	}); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townBeadsDir, ".gt-types-configured"), []byte("v1\n"), 0644); err != nil {
+		t.Fatalf("write types sentinel: %v", err)
+	}
+
+	binDir := t.TempDir()
+	logPath := filepath.Join(binDir, "bd.log")
+	script := fmt.Sprintf(`#!/bin/sh
+LOG=%q
+EXPECTED=%q
+printf 'env=%%s args=%%s\n' "${BEADS_DIR:-<unset>}" "$*" >> "$LOG"
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    --*) ;;
+    *) cmd="$arg"; break ;;
+  esac
+done
+if [ "$cmd" != "version" ] && [ "${BEADS_DIR:-}" != "$EXPECTED" ]; then
+  echo "wrong BEADS_DIR ${BEADS_DIR:-<unset>}" >&2
+  exit 9
+fi
+case "$cmd" in
+  version|update|config|reopen)
+    exit 0
+    ;;
+  create)
+    printf '%%s\n' '{"id":"gt-gastown-polecat-rust","title":"gt-gastown-polecat-rust","status":"open","description":"role_type: polecat\nrig: gastown\nagent_state: spawning\nhook_bead: gt-work"}'
+    exit 0
+    ;;
+  show)
+    printf '%%s\n' '[{"id":"gt-gastown-polecat-rust","title":"gt-gastown-polecat-rust","issue_type":"task","labels":["gt:agent"],"status":"open","description":"role_type: polecat\nrig: gastown\nagent_state: working\nhook_bead: gt-work\nactive_mr: gt-mr\ncleanup_status: has_unpushed"}]'
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`, logPath, townBeadsDir)
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write mock bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	m := NewManager(&rig.Rig{Name: rigName, Path: rigPath}, git.NewGit(rigPath), nil)
+	agentID := m.agentBeadID("rust")
+	if err := m.createAgentBeadWithRetry(agentID, &beads.AgentFields{RoleType: "polecat", Rig: rigName, AgentState: "spawning"}); err != nil {
+		t.Fatalf("createAgentBeadWithRetry: %v", err)
+	}
+	if err := m.resetAgentBeadForReuse(agentID, "test reset"); err != nil {
+		t.Fatalf("resetAgentBeadForReuse: %v", err)
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read mock log: %v", err)
+	}
+	logOutput := string(logBytes)
+	if strings.Contains(logOutput, "env="+rigBeadsDir) {
+		t.Fatalf("manager agent lifecycle used rig BEADS_DIR; log:\n%s", logOutput)
+	}
+	if !strings.Contains(logOutput, "env="+townBeadsDir+" args=") || !strings.Contains(logOutput, " create") {
+		t.Fatalf("manager create did not use town BEADS_DIR; log:\n%s", logOutput)
+	}
+	if !strings.Contains(logOutput, "env="+townBeadsDir+" args=") || !strings.Contains(logOutput, " show") || !strings.Contains(logOutput, " update") {
+		t.Fatalf("manager reset did not use town BEADS_DIR for show/update; log:\n%s", logOutput)
+	}
+}
+
 // TestAllocateAndAdd_NoDuplicateNames verifies that concurrent AllocateAndAdd
 // calls never produce duplicate polecat names (GH#2215). Each goroutine will
 // fail at worktree creation (no origin/main), but the allocated names must

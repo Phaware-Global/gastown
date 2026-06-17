@@ -18,14 +18,15 @@ import (
 )
 
 var (
-	awaitEventChannel     string
-	awaitEventTimeout     string
-	awaitEventBackoffBase string
-	awaitEventBackoffMult int
-	awaitEventBackoffMax  string
-	awaitEventQuiet       bool
-	awaitEventAgentBead   string
-	awaitEventCleanup     bool
+	awaitEventChannel              string
+	awaitEventTimeout              string
+	awaitEventBackoffBase          string
+	awaitEventBackoffMult          int
+	awaitEventBackoffMax           string
+	awaitEventQuiet                bool
+	awaitEventAgentBead            string
+	awaitEventCleanup              bool
+	awaitEventContextCheckInterval string
 )
 
 // validChannelName is a convenience alias for the canonical regex in channelevents.
@@ -59,8 +60,22 @@ Same as await-signal: base * multiplier^idle_cycles, capped at max.
 Idle cycles and backoff-until timestamp tracked on agent bead labels.
 If killed and restarted, backoff resumes from the stored backoff-until.
 
+CONTEXT-YIELD:
+When --context-check-interval is set, await-event returns early with reason
+"context-yield" after the specified wall-clock interval, even if no event
+arrived and the backoff timeout has not expired. This allows patrol agents
+to assess context usage between waits, preventing unbounded accumulation
+during long idle periods.
+
+Output when yielding:
+  CONTEXT: check
+  EFFORT: full
+
+After context-check, call await-event again with the same parameters if
+context is acceptable, or hand off the session if context is high.
+
 EXIT CODES:
-  0 - Event(s) found or timeout
+  0 - Event(s) found, timeout, or context-yield
   1 - Error
 
 EXAMPLES:
@@ -72,7 +87,12 @@ EXAMPLES:
     --backoff-base 60s --backoff-mult 2 --backoff-max 10m
 
   # Auto-cleanup processed events
-  gt mol step await-event --channel refinery --cleanup`,
+  gt mol step await-event --channel refinery --cleanup
+
+  # Yield every 5m for context check during long idle waits
+  gt mol step await-event --channel refinery --agent-bead VAS-refinery \
+    --backoff-base 60s --backoff-mult 2 --backoff-max 15m --cleanup \
+    --context-check-interval 5m`,
 	RunE: runMoleculeAwaitEvent,
 }
 
@@ -108,6 +128,8 @@ func init() {
 		"Suppress output (for scripting)")
 	moleculeAwaitEventCmd.Flags().BoolVar(&awaitEventCleanup, "cleanup", false,
 		"Delete event files after reading them")
+	moleculeAwaitEventCmd.Flags().StringVar(&awaitEventContextCheckInterval, "context-check-interval", "",
+		"Yield after this wall-clock interval so the caller can assess context (e.g., 5m). Returns reason 'context-yield'.")
 	moleculeAwaitEventCmd.Flags().BoolVar(&moleculeJSON, "json", false,
 		"Output as JSON")
 	_ = moleculeAwaitEventCmd.MarkFlagRequired("channel")
@@ -168,6 +190,15 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid timeout configuration: %w", err)
 	}
 
+	// Parse context-check interval (optional)
+	var contextCheckInterval time.Duration
+	if awaitEventContextCheckInterval != "" {
+		contextCheckInterval, err = time.ParseDuration(awaitEventContextCheckInterval)
+		if err != nil {
+			return fmt.Errorf("invalid context-check-interval: %w", err)
+		}
+	}
+
 	// Resume from backoff-until if interrupted (same pattern as await-signal)
 	timeout := fullTimeout
 	now := time.Now()
@@ -198,7 +229,7 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	result, err := waitForEventFiles(ctx, eventDir)
+	result, err := waitForEventFiles(ctx, eventDir, contextCheckInterval)
 	if err != nil {
 		return fmt.Errorf("event watch failed: %w", err)
 	}
@@ -227,8 +258,10 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 			}
 			result.IdleCycles = 0
 		}
+		// For "context-yield": idle cycles unchanged — we yielded early for context
+		// assessment, not because the full backoff window elapsed.
 
-		// Clear backoff-until — we completed normally
+		// Clear backoff-until — we completed (event, timeout, or context-yield)
 		_ = clearAgentBackoffUntil(awaitEventAgentBead, beadsDir)
 	}
 
@@ -240,7 +273,8 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 	}
 
 	// Set effort level based on idle cycles.
-	if result.Reason == "event" || result.IdleCycles == 0 {
+	// context-yield forces full effort: context-check must not be abbreviated.
+	if result.Reason == "event" || result.Reason == "context-yield" || result.IdleCycles == 0 {
 		result.EffortLevel = "full"
 	} else {
 		result.EffortLevel = "abbreviated"
@@ -270,6 +304,12 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 		case "timeout":
 			fmt.Printf("%s Timeout after %v (idle cycle: %d)\n",
 				style.Dim.Render("⏱"), result.Elapsed.Round(time.Millisecond), result.IdleCycles)
+		case "context-yield":
+			fmt.Printf("%s Context-check interval reached after %v\n",
+				style.Dim.Render("↺"), result.Elapsed.Round(time.Millisecond))
+			fmt.Printf("\n%s Assess context usage before re-entering event wait.\n",
+				style.Bold.Render("CONTEXT: check"))
+			fmt.Printf("If context is OK, call await-event again. If context is high, hand off.\n")
 		}
 
 		// Output effort recommendation for the next patrol cycle.
@@ -322,7 +362,12 @@ func calculateEventTimeout(idleCycles int) (time.Duration, error) {
 
 // waitForEventFiles checks for pending events, then polls until events appear or timeout.
 // Uses a polling loop instead of inotifywait for cross-platform compatibility.
-func waitForEventFiles(ctx context.Context, eventDir string) (*AwaitEventResult, error) {
+//
+// contextCheckAfter, when non-zero, causes an early return with reason "context-yield"
+// after the given wall-clock duration. This allows the caller (a patrol agent) to
+// assess context usage before re-entering the wait, preventing unbounded context
+// accumulation during long idle periods.
+func waitForEventFiles(ctx context.Context, eventDir string, contextCheckAfter time.Duration) (*AwaitEventResult, error) {
 	// Check for already-pending events
 	events, err := readPendingEvents(eventDir)
 	if err != nil {
@@ -343,6 +388,16 @@ func waitForEventFiles(ctx context.Context, eventDir string) (*AwaitEventResult,
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
 		return &AwaitEventResult{Reason: "timeout"}, nil
+	}
+
+	// Set up context-yield timer when requested.
+	// A nil channel is never selected, so when contextCheckAfter is zero
+	// the timer case never fires and existing behavior is preserved.
+	var contextYieldC <-chan time.Time
+	if contextCheckAfter > 0 {
+		t := time.NewTimer(contextCheckAfter)
+		defer t.Stop()
+		contextYieldC = t.C
 	}
 
 	// Poll with 500ms interval until event appears or timeout.
@@ -366,6 +421,17 @@ func waitForEventFiles(ctx context.Context, eventDir string) (*AwaitEventResult,
 				}, nil
 			}
 			return &AwaitEventResult{Reason: "timeout"}, nil
+		case <-contextYieldC:
+			// Context-check interval elapsed. Do a final event check before
+			// yielding — if an event just arrived, return it instead.
+			events = readPendingEventsBounded(ctx, eventDir, 500*time.Millisecond)
+			if len(events) > 0 {
+				return &AwaitEventResult{
+					Reason: "event",
+					Events: events,
+				}, nil
+			}
+			return &AwaitEventResult{Reason: "context-yield"}, nil
 		case <-ticker.C:
 			// Run readPendingEvents in a goroutine so ctx.Done() can
 			// always interrupt the wait. Without this, a slow/stuck

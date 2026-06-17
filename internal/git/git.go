@@ -2819,20 +2819,39 @@ func (g *Git) StashPop(ref string) error {
 }
 
 // UnpushedCommits returns the number of commits that are not pushed to the remote.
-// It checks if the current branch has an upstream and counts commits ahead.
-// Returns 0 if there is no upstream configured.
+// It prefers the exact remote branch when one exists, because polecat branches may
+// track origin/main while pushing work to origin/<current-branch>.
+// Returns 0 if there is no upstream or exact remote branch configured.
 func (g *Git) UnpushedCommits() (int, error) {
+	branch, branchErr := g.CurrentBranch()
+	hasBranch := branchErr == nil && branch != "" && branch != "HEAD"
+
 	// Get the upstream branch
 	upstream, err := g.run("rev-parse", "--abbrev-ref", "@{u}")
-	if err != nil {
-		// No upstream configured - this is common for polecat branches
-		// Check if we can compare against origin/main instead
-		// If we can't get any reference, return 0 (benefit of the doubt)
-		return 0, nil
+	if err == nil {
+		if !hasBranch || upstream == "origin/"+branch {
+			return g.countCommitsAhead(upstream)
+		}
+
+		if count, found, remoteErr := g.unpushedFromExactRemoteBranch(branch, "origin"); remoteErr == nil && found {
+			return count, nil
+		}
+		return g.countCommitsAhead(upstream)
 	}
 
-	// Count commits between upstream and HEAD
-	out, err := g.run("rev-list", "--count", upstream+"..HEAD")
+	if hasBranch {
+		if count, found, remoteErr := g.unpushedFromExactRemoteBranch(branch, "origin"); remoteErr == nil && found {
+			return count, nil
+		}
+	}
+
+	// No upstream configured - this is common for polecat branches.
+	// If there is no exact remote branch either, return 0 (benefit of the doubt).
+	return 0, nil
+}
+
+func (g *Git) countCommitsAhead(base string) (int, error) {
+	out, err := g.run("rev-list", "--count", base+"..HEAD")
 	if err != nil {
 		return 0, err
 	}
@@ -2844,6 +2863,16 @@ func (g *Git) UnpushedCommits() (int, error) {
 	}
 
 	return count, nil
+}
+
+func (g *Git) unpushedFromExactRemoteBranch(localBranch, remote string) (int, bool, error) {
+	remoteSHA, err := g.PushRemoteBranchTip(remote, localBranch)
+	if err != nil || remoteSHA == "" {
+		return 0, false, err
+	}
+
+	count, err := g.countCommitsAhead(remoteSHA)
+	return count, true, err
 }
 
 // UncommittedWorkStatus contains information about uncommitted work in a repo.

@@ -387,17 +387,18 @@ func getConvoyMeta(convoyID string) (*ConvoyMeta, error) {
 	}
 
 	var convoys []struct {
-		ID          string `json:"id"`
-		Title       string `json:"title"`
-		Status      string `json:"status"`
-		Description string `json:"description"`
-		Type        string `json:"issue_type"`
+		ID          string   `json:"id"`
+		Title       string   `json:"title"`
+		Status      string   `json:"status"`
+		Description string   `json:"description"`
+		Type        string   `json:"issue_type"`
+		Labels      []string `json:"labels"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil {
 		return nil, fmt.Errorf("parsing convoy data: %w", err)
 	}
 
-	if len(convoys) == 0 || convoys[0].Type != "convoy" {
+	if len(convoys) == 0 || !isConvoyIssue(convoys[0].Type, convoys[0].Labels) {
 		return nil, fmt.Errorf("'%s' is not a convoy", convoyID)
 	}
 
