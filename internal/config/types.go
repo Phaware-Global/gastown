@@ -1495,7 +1495,7 @@ const (
 const (
 	// DefaultReviewerTokenEnv is the default name of the environment variable
 	// holding the Reviewer machine-user's GitHub token.
-	DefaultReviewerTokenEnv = "GT_REVIEWER_GITHUB_TOKEN"
+	DefaultReviewerTokenEnv = "GT_REVIEWER_GITHUB_TOKEN" //nolint:gosec // G101: env-var NAME, not a secret value
 
 	// DefaultMaxFindingsPerPerspective caps findings emitted per perspective
 	// pass before the reviewer summarizes the overflow.

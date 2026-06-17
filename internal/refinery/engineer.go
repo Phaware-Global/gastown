@@ -296,7 +296,7 @@ func (c *MergeQueueConfig) GetPRRequiredApprovals() int {
 // config.DefaultReviewerTokenEnv; the two cannot share one constant because
 // the refinery package cannot import config (the duplicated MergeQueueConfig
 // here exists precisely to avoid that import cycle). (P23-2376.)
-const DefaultReviewerTokenEnv = "GT_REVIEWER_GITHUB_TOKEN"
+const DefaultReviewerTokenEnv = "GT_REVIEWER_GITHUB_TOKEN" //nolint:gosec // G101: env-var NAME, not a secret value
 
 // GetReviewerTokenEnv returns the name of the environment variable holding the
 // Reviewer machine-user token, defaulting to DefaultReviewerTokenEnv. The
