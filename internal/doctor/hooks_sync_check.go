@@ -79,10 +79,12 @@ func (c *HooksSyncCheck) Run(ctx *CheckContext) *CheckResult {
 		_, statErr := os.Stat(target.Path)
 		fileExists := statErr == nil
 
-		if !fileExists || !hooks.HooksEqual(expected, &current.Hooks) {
+		if !fileExists || !hooks.HooksEqual(expected, &current.Hooks) || !hooks.HasClaudePromptDefaults(current) {
 			c.outOfSync = append(c.outOfSync, target)
 			if !fileExists {
 				details = append(details, fmt.Sprintf("%s: missing", target.DisplayKey()))
+			} else if !hooks.HasClaudePromptDefaults(current) {
+				details = append(details, fmt.Sprintf("%s: missing Claude prompt defaults", target.DisplayKey()))
 			} else {
 				details = append(details, fmt.Sprintf("%s: out of sync", target.DisplayKey()))
 			}

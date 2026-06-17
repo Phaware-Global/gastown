@@ -22,6 +22,7 @@ import (
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -31,6 +32,11 @@ var primeState bool
 var primeStateJSON bool
 var primeExplain bool
 var primeStructuredSessionStartOutput bool
+
+// Prime's external injections are best-effort; role context should still
+// return when bd/mail is slow or wedged.
+var primeExternalToolTimeout = 5 * time.Second
+var primeExternalToolWaitDelay = time.Second
 
 // primeHookSource stores the SessionStart source ("startup", "resume", "clear", "compact")
 // when running in hook mode. Used to provide lighter output on compaction/resume.
@@ -277,7 +283,7 @@ func runPrimeCompactResume(ctx RoleContext) {
 	// external-tool call we make here — memories are durable context that must
 	// survive a compaction, whereas bd prime / mail are refreshed by other hooks.
 	if !primeDryRun {
-		runMemoryInject()
+		runMemoryInject(ctx.WorkDir)
 	}
 
 	// Remind polecats about gt done — after compaction the agent may have lost
@@ -540,22 +546,31 @@ func runPrimeExternalTools(cwd string) {
 		return
 	}
 	runBdPrime(cwd)
-	runMemoryInject()
+	runMemoryInject(cwd)
 	runMailCheckInject(cwd)
+}
+
+func runPrimeExternalCommand(workDir, name string, args ...string) (bytes.Buffer, bytes.Buffer, error) {
+	var stdout, stderr bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), primeExternalToolTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = workDir
+	cmd.Env = os.Environ()
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	cmd.WaitDelay = primeExternalToolWaitDelay
+	util.SetProcessGroup(cmd)
+
+	return stdout, stderr, cmd.Run()
 }
 
 // runBdPrime runs `bd prime` and outputs the result.
 // This provides beads workflow context to the agent.
 func runBdPrime(workDir string) {
-	cmd := exec.Command("bd", "prime")
-	cmd.Dir = workDir
-	cmd.Env = os.Environ()
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
+	stdout, stderr, err := runPrimeExternalCommand(workDir, "bd", "prime")
+	if err != nil {
 		// Skip if bd prime fails (beads might not be available)
 		// But log stderr if present for debugging
 		if errMsg := strings.TrimSpace(stderr.String()); errMsg != "" {
@@ -582,8 +597,8 @@ var memoryTypeLabels = map[string]string{
 
 // runMemoryInject loads memories from beads kv and outputs them during prime.
 // Memories are grouped by type and ordered by priority (feedback first).
-func runMemoryInject() {
-	kvs, err := bdKvListJSON()
+func runMemoryInject(workDir string) {
+	kvs, err := bdKvListJSONForPrime(workDir)
 	if err != nil {
 		return // Silently skip if kv list fails
 	}
@@ -633,17 +648,24 @@ func runMemoryInject() {
 	}
 }
 
+func bdKvListJSONForPrime(workDir string) (map[string]string, error) {
+	stdout, _, err := runPrimeExternalCommand(workDir, "bd", "kv", "list", "--json")
+	if err != nil {
+		return nil, err
+	}
+
+	var kvs map[string]string
+	if err := json.Unmarshal(stdout.Bytes(), &kvs); err != nil {
+		return nil, fmt.Errorf("parsing kv list: %w", err)
+	}
+	return kvs, nil
+}
+
 // runMailCheckInject runs `gt mail check --inject` and outputs the result.
 // This injects any pending mail into the agent's context.
 func runMailCheckInject(workDir string) {
-	cmd := exec.Command("gt", "mail", "check", "--inject")
-	cmd.Dir = workDir
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
+	stdout, stderr, err := runPrimeExternalCommand(workDir, "gt", "mail", "check", "--inject")
+	if err != nil {
 		// Skip if mail check fails, but log stderr for debugging
 		if errMsg := strings.TrimSpace(stderr.String()); errMsg != "" {
 			fmt.Fprintf(os.Stderr, "gt mail check: %s\n", errMsg)
@@ -1296,15 +1318,8 @@ func setTmuxWorkContext(workRig, workBead, workMol string) {
 // This is called on Mayor startup to surface issues needing human attention.
 func checkPendingEscalations(ctx RoleContext) {
 	// Query for open escalations using bd list with tag filter
-	cmd := exec.Command("bd", "list", "--status=open", "--tag=escalation", "--json")
-	cmd.Dir = ctx.WorkDir
-	cmd.Env = os.Environ()
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
+	stdout, _, err := runPrimeExternalCommand(ctx.WorkDir, "bd", "list", "--status=open", "--tag=escalation", "--json")
+	if err != nil {
 		// Silently skip - escalation check is best-effort
 		return
 	}

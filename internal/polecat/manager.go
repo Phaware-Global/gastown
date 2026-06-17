@@ -325,7 +325,7 @@ func (m *Manager) CheckDoltServerCapacity() error {
 func (m *Manager) createAgentBeadWithRetry(agentID string, fields *beads.AgentFields) error {
 	var lastErr error
 	for attempt := 1; attempt <= doltMaxRetries; attempt++ {
-		_, err := m.beads.CreateOrReopenAgentBead(agentID, agentID, fields)
+		_, err := m.agentBeads().CreateOrReopenAgentBead(agentID, agentID, fields)
 		if err == nil {
 			return nil
 		}
@@ -346,6 +346,14 @@ func (m *Manager) createAgentBeadWithRetry(agentID string, fields *beads.AgentFi
 		}
 	}
 	return fmt.Errorf("creating agent bead after %d attempts: %w", doltMaxRetries, lastErr)
+}
+
+func (m *Manager) agentBeads() *beads.Beads {
+	return m.beads.ForAgentBead()
+}
+
+func (m *Manager) resetAgentBeadForReuse(agentID, reason string) error {
+	return m.agentBeads().ResetAgentBeadForReuse(agentID, reason)
 }
 
 // SetAgentStateWithRetry wraps SetAgentState with retry logic.
@@ -729,7 +737,7 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 	var worktreeCreated bool
 	cleanupOnError := func() {
 		aid := m.agentBeadID(name)
-		_ = m.beads.ResetAgentBeadForReuse(aid, "spawn rollback")
+		_ = m.resetAgentBeadForReuse(aid, "spawn rollback")
 
 		if worktreeCreated {
 			if rg, repoErr := m.repoBase(); repoErr == nil {
@@ -915,7 +923,7 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
 		// Best-effort reset of agent bead (may have been partially created
 		// by a failed createAgentBeadWithRetry)
 		aid := m.agentBeadID(name)
-		_ = m.beads.ResetAgentBeadForReuse(aid, "spawn rollback")
+		_ = m.resetAgentBeadForReuse(aid, "spawn rollback")
 
 		// Remove git worktree registration if worktree was successfully added.
 		// Must happen before directory removal so git can clean up properly.
@@ -1156,7 +1164,7 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	// but MR status is a higher-level concern that should always be checked.
 	if !force {
 		agentID := m.agentBeadID(name)
-		_, fields, aErr := m.beads.GetAgentBead(agentID)
+		_, fields, aErr := m.agentBeads().GetAgentBead(agentID)
 		if aErr == nil && fields != nil && fields.ActiveMR != "" {
 			mrBead, mrErr := m.beads.Show(fields.ActiveMR)
 			if mrErr == nil && mrBead != nil && beads.IssueStatus(mrBead.Status).BlocksRemoval() {
@@ -1173,7 +1181,7 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	// simply update it without needing close/reopen (which fails on Dolt).
 	// See gt-14b8o: close/reopen cycle breaks on Dolt backend.
 	agentID := m.agentBeadID(name)
-	if err := m.beads.ResetAgentBeadForReuse(agentID, "polecat removed"); err != nil {
+	if err := m.resetAgentBeadForReuse(agentID, "polecat removed"); err != nil {
 		// Only log if not "not found" - it's ok if it doesn't exist
 		if !errors.Is(err, beads.ErrNotFound) {
 			style.PrintWarning("could not reset agent bead %s: %v", agentID, err)
@@ -1536,7 +1544,7 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 	// NOTE: We use ResetAgentBeadForReuse to avoid the close/reopen cycle
 	// that fails on Dolt backend (gt-14b8o).
 	agentID := m.agentBeadID(name)
-	if err := m.beads.ResetAgentBeadForReuse(agentID, "polecat repair"); err != nil {
+	if err := m.resetAgentBeadForReuse(agentID, "polecat repair"); err != nil {
 		if !errors.Is(err, beads.ErrNotFound) {
 			style.PrintWarning("could not reset old agent bead %s: %v", agentID, err)
 		}
@@ -1662,6 +1670,23 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 		return nil, fmt.Errorf("idle polecat worktree not found at %s: %w", clonePath, err)
 	}
 
+	// hq-x0v7v: per-bead target/ clean hook.
+	// Rust polecats accumulate huge target/ dirs (30-50 GB each) when reused
+	// across many beads; the dipgt daemon has hit 100% disk twice from this.
+	// Policy is per-town config (polecat.target_clean_policy). target/ is
+	// gitignored, so the subsequent reset/clean below won't touch it on its own.
+	// Errors are logged as warnings — reuse must not fail because a cleanup did.
+	{
+		policy := m.targetCleanPolicy()
+		polecatDir := m.polecatDir(name)
+		msg, err := RunTargetCleanHook(polecatDir, clonePath, policy)
+		if err != nil {
+			style.PrintWarning("target-clean hook for %s: %v", name, err)
+		} else if msg != "" {
+			fmt.Println(msg)
+		}
+	}
+
 	polecatGit := git.NewGit(clonePath)
 
 	// Fetch latest from origin (non-fatal: may be offline)
@@ -1753,7 +1778,7 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 
 	// Reset agent bead for reuse
 	agentID := m.agentBeadID(name)
-	if err := m.beads.ResetAgentBeadForReuse(agentID, "idle polecat reuse"); err != nil {
+	if err := m.resetAgentBeadForReuse(agentID, "idle polecat reuse"); err != nil {
 		if !errors.Is(err, beads.ErrNotFound) {
 			style.PrintWarning("could not reset agent bead %s: %v", agentID, err)
 		}
@@ -1774,7 +1799,8 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 	// The column stays stale (e.g., "idle" from previous gt done) until
 	// StartSession sets it to "working". Without this, the column and
 	// description diverge, causing dashboards to show incorrect state.
-	if err := m.beads.UpdateAgentState(agentID, "spawning"); err != nil {
+	// Agent beads live in town DB — bypass prefix routing.
+	if err := m.agentBeads().UpdateAgentState(agentID, "spawning"); err != nil {
 		style.PrintWarning("could not sync agent_state column to spawning: %v", err)
 	}
 
@@ -2101,7 +2127,9 @@ func (m *Manager) Get(name string) (*Polecat, error) {
 // Valid states: "spawning", "working", "done", "stuck", "idle"
 func (m *Manager) SetAgentState(name string, state string) error {
 	agentID := m.agentBeadID(name)
-	return m.beads.UpdateAgentState(agentID, state)
+	// Agent beads live in the town DB — bypass prefix routing that would
+	// otherwise misroute "za-*" / "my-*" agent IDs to a rig DB.
+	return m.agentBeads().UpdateAgentState(agentID, state)
 }
 
 // - StateDone: assignee cleared from issue (polecat ready for cleanup)

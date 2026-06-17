@@ -284,7 +284,7 @@ func runConvoyLaunch(cmd *cobra.Command, args []string) error {
 	// and dispatch Wave 1.
 	if len(args) == 1 {
 		result := beadTypes[args[0]]
-		if result.IssueType == "convoy" && isStagedStatus(normalizeConvoyStatus(result.Status)) {
+		if isConvoyIssue(result.IssueType, result.Labels) && isStagedStatus(normalizeConvoyStatus(result.Status)) {
 			convoyID := args[0]
 
 			if err := transitionConvoyToOpen(convoyID, convoyLaunchForce); err != nil {

@@ -50,7 +50,7 @@ func isTrackedByConvoy(beadID string) string {
 			if err != nil {
 				continue
 			}
-			if result.IssueType == "convoy" && result.Status == "open" {
+			if isConvoyIssue(result.IssueType, result.Labels) && result.Status == "open" {
 				return trackerID
 			}
 		}
@@ -69,20 +69,8 @@ func isTrackedByConvoy(beadID string) string {
 func findConvoyByDescription(townRoot, beadID string) string {
 	townBeads := filepath.Join(townRoot, ".beads")
 
-	// Query all open convoys from HQ
-	listCmd := exec.Command("bd", "list", "--type=convoy", "--status=open", "--json")
-	listCmd.Dir = townBeads
-
-	out, err := listCmd.Output()
+	convoys, err := listConvoyIssues(townBeads, "open", false)
 	if err != nil {
-		return ""
-	}
-
-	var convoys []struct {
-		ID          string `json:"id"`
-		Description string `json:"description"`
-	}
-	if err := json.Unmarshal(out, &convoys); err != nil {
 		return ""
 	}
 
@@ -390,13 +378,11 @@ func createBatchConvoy(beadIDs []string, rigName string, owned bool, mergeStrate
 
 	createArgs := []string{
 		"create",
-		"--type=convoy",
+		"--type=task",
 		"--id=" + convoyID,
 		"--title=" + convoyTitle,
 		"--description=" + description,
-	}
-	if owned {
-		createArgs = append(createArgs, "--labels=gt:owned")
+		"--labels=" + convoyLabels(owned),
 	}
 	if beads.NeedsForceForID(convoyID) {
 		createArgs = append(createArgs, "--force")
@@ -455,13 +441,11 @@ func createAutoConvoy(beadID, beadTitle string, owned bool, mergeStrategy, baseB
 
 	createArgs := []string{
 		"create",
-		"--type=convoy",
+		"--type=task",
 		"--id=" + convoyID,
 		"--title=" + convoyTitle,
 		"--description=" + description,
-	}
-	if owned {
-		createArgs = append(createArgs, "--labels=gt:owned")
+		"--labels=" + convoyLabels(owned),
 	}
 	if beads.NeedsForceForID(convoyID) {
 		createArgs = append(createArgs, "--force")

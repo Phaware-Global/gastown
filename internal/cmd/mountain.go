@@ -19,10 +19,10 @@ var mountainForce bool
 var mountainJSON bool
 
 var mountainCmd = &cobra.Command{
-	Use:   "mountain <epic-id>",
-	GroupID: GroupWork,
+	Use:         "mountain <epic-id>",
+	GroupID:     GroupWork,
 	Annotations: map[string]string{AnnotationPolecatSafe: "true"},
-	Short: "Activate Mountain-Eater: stage, label, and launch an epic",
+	Short:       "Activate Mountain-Eater: stage, label, and launch an epic",
 	Long: `Activate the Mountain-Eater on an epic for autonomous grinding.
 
 A mountain is a convoy with the 'mountain' label. This command:
@@ -563,14 +563,18 @@ func showMountainDetail(townBeads, inputID string) error {
 
 // findMountainConvoys lists all open convoys with the mountain label.
 func findMountainConvoys(townBeads string) ([]mountainConvoyInfo, error) {
-	out, err := runBdJSON(townBeads, "list", "--type=convoy", "--status=open", "--label=mountain", "--json")
+	issues, err := listConvoyIssues(townBeads, "open", false, "mountain")
 	if err != nil {
 		return nil, fmt.Errorf("listing mountain convoys: %w", err)
 	}
 
-	var convoys []mountainConvoyInfo
-	if err := json.Unmarshal(out, &convoys); err != nil {
-		return nil, fmt.Errorf("parsing mountain convoy list: %w", err)
+	convoys := make([]mountainConvoyInfo, 0, len(issues))
+	for _, issue := range issues {
+		convoys = append(convoys, mountainConvoyInfo{
+			ID:     issue.ID,
+			Title:  issue.Title,
+			Labels: issue.Labels,
+		})
 	}
 
 	return convoys, nil
@@ -585,7 +589,7 @@ func resolveMountainID(townBeads, inputID string) (string, error) {
 		return "", fmt.Errorf("cannot resolve %s: %w", inputID, err)
 	}
 
-	if result.IssueType == "convoy" {
+	if isConvoyIssue(result.IssueType, result.Labels) {
 		return inputID, nil
 	}
 

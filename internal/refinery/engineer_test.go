@@ -40,6 +40,94 @@ func TestDefaultMergeQueueConfig(t *testing.T) {
 	}
 }
 
+func TestEngineerClearAgentActiveMRUsesTownBeadsDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+
+	townRoot := t.TempDir()
+	rigName := "gastown"
+	rigPath := filepath.Join(townRoot, rigName)
+	mayorRig := filepath.Join(rigPath, "mayor", "rig")
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	rigBeadsDir := filepath.Join(mayorRig, ".beads")
+
+	for _, dir := range []string{
+		filepath.Join(townRoot, "mayor"),
+		townBeadsDir,
+		rigBeadsDir,
+	} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte("{}"), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	if err := beads.WriteRoutes(townBeadsDir, []beads.Route{
+		{Prefix: "hq-", Path: "."},
+		{Prefix: "gt-", Path: filepath.Join(rigName, "mayor", "rig")},
+	}); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	binDir := t.TempDir()
+	logPath := filepath.Join(binDir, "bd.log")
+	script := fmt.Sprintf(`#!/bin/sh
+LOG=%q
+EXPECTED=%q
+printf 'env=%%s args=%%s\n' "${BEADS_DIR:-<unset>}" "$*" >> "$LOG"
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    --*) ;;
+    *) cmd="$arg"; break ;;
+  esac
+done
+if [ "$cmd" != "version" ] && [ "${BEADS_DIR:-}" != "$EXPECTED" ]; then
+  echo "wrong BEADS_DIR ${BEADS_DIR:-<unset>}" >&2
+  exit 9
+fi
+case "$cmd" in
+  version|update)
+    exit 0
+    ;;
+  show)
+    printf '%%s\n' '[{"id":"gt-gastown-polecat-rust","title":"gt-gastown-polecat-rust","issue_type":"task","labels":["gt:agent"],"status":"open","description":"role_type: polecat\nrig: gastown\nagent_state: idle\nactive_mr: gt-mr"}]'
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`, logPath, townBeadsDir)
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write mock bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	e := &Engineer{
+		rig:    &rig.Rig{Name: rigName, Path: rigPath},
+		beads:  beads.NewWithBeadsDir(mayorRig, rigBeadsDir),
+		output: io.Discard,
+	}
+	if err := e.clearAgentActiveMR("gt-gastown-polecat-rust"); err != nil {
+		t.Fatalf("clearAgentActiveMR: %v", err)
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read mock log: %v", err)
+	}
+	logOutput := string(logBytes)
+	if strings.Contains(logOutput, "env="+rigBeadsDir) {
+		t.Fatalf("refinery active_mr cleanup used rig BEADS_DIR; log:\n%s", logOutput)
+	}
+	if !strings.Contains(logOutput, "env="+townBeadsDir+" args=") || !strings.Contains(logOutput, " show") || !strings.Contains(logOutput, " update") {
+		t.Fatalf("refinery active_mr cleanup did not use town BEADS_DIR; log:\n%s", logOutput)
+	}
+}
+
 func TestEngineer_LoadConfig_NoFile(t *testing.T) {
 	// Create a temp directory without config.json
 	tmpDir, err := os.MkdirTemp("", "engineer-test-*")
@@ -490,9 +578,9 @@ func TestRunGatesForPhase_FiltersCorrectly(t *testing.T) {
 	e.workDir = t.TempDir()
 	e.output = io.Discard
 	e.config.Gates = map[string]*GateConfig{
-		"pre-lint":    {Cmd: "true", Phase: GatePhasePreMerge},
-		"pre-test":    {Cmd: "true", Phase: GatePhasePreMerge},
-		"post-build":  {Cmd: "true", Phase: GatePhasePostSquash},
+		"pre-lint":   {Cmd: "true", Phase: GatePhasePreMerge},
+		"pre-test":   {Cmd: "true", Phase: GatePhasePreMerge},
+		"post-build": {Cmd: "true", Phase: GatePhasePostSquash},
 	}
 
 	// Pre-merge phase should only run pre-lint and pre-test
@@ -783,12 +871,12 @@ case "$*" in
   "--allow-stale version")
     exit 0
     ;;
-  "--allow-stale list --type=convoy --status=open --json"|"list --type=convoy --status=open --json")
+	  "--allow-stale list --status=open --json --limit=0"|"list --status=open --json --limit=0")
     if [ -n "$BEADS_DIR" ]; then
       echo "BEADS_DIR leaked: $BEADS_DIR" >&2
       exit 1
     fi
-    echo '[{"id":"hq-cv-l9","title":"Cross-rig convoy","status":"open","description":""}]'
+	    echo '[{"id":"hq-cv-l9","title":"Cross-rig convoy","status":"open","description":"","issue_type":"convoy"}]'
     ;;
   "--allow-stale dep list hq-cv-l9 --direction=down --type=tracks --json"|"dep list hq-cv-l9 --direction=down --type=tracks --json")
     if [ -n "$BEADS_DIR" ]; then

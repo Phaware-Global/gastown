@@ -462,3 +462,88 @@ func TestCreateAgentBead_ParsesMockCreateOutput(t *testing.T) {
 		t.Fatalf("issue.ID = %q", issue.ID)
 	}
 }
+
+func TestCreateOrReopenAgentBeadExistingUsesTownBeadsDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+
+	townRoot, _ := filepath.EvalSymlinks(t.TempDir())
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	rigDir := filepath.Join(townRoot, "gastown", "mayor", "rig")
+	rigBeadsDir := filepath.Join(rigDir, ".beads")
+	for _, dir := range []string{filepath.Join(townRoot, "mayor"), townBeadsDir, rigBeadsDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteRoutes(townBeadsDir, []Route{{Prefix: "hq-", Path: "."}, {Prefix: "gt-", Path: "gastown/mayor/rig"}}); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townBeadsDir, ".gt-types-configured"), []byte("v1\n"), 0644); err != nil {
+		t.Fatalf("write types sentinel: %v", err)
+	}
+
+	binDir := t.TempDir()
+	logPath := filepath.Join(binDir, "bd.log")
+	script := fmt.Sprintf(`#!/bin/sh
+LOG=%q
+EXPECTED=%q
+printf 'beads_dir=%%s args=%%s\n' "${BEADS_DIR:-<unset>}" "$*" >> "$LOG"
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    --*) ;;
+    *) cmd="$arg"; break ;;
+  esac
+done
+if [ "$cmd" != "version" ] && [ "${BEADS_DIR:-}" != "$EXPECTED" ]; then
+  echo "wrong BEADS_DIR ${BEADS_DIR:-<unset>}" >&2
+  exit 9
+fi
+case "$cmd" in
+  version|update|reopen)
+    exit 0
+    ;;
+  create)
+    echo 'already exists' >&2
+    exit 1
+    ;;
+  show)
+    printf '%%s\n' '[{"id":"gt-gastown-polecat-rust","title":"old","issue_type":"task","labels":["gt:agent"],"status":"open","description":"role_type: polecat\nrig: gastown\nagent_state: idle\nhook_bead: old"}]'
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`, logPath, townBeadsDir)
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write mock bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	bd := NewWithBeadsDir(rigDir, rigBeadsDir)
+	if _, err := bd.CreateOrReopenAgentBead("gt-gastown-polecat-rust", "gt-gastown-polecat-rust", &AgentFields{
+		RoleType:   "polecat",
+		Rig:        "gastown",
+		AgentState: "spawning",
+	}); err != nil {
+		t.Fatalf("CreateOrReopenAgentBead: %v", err)
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read mock log: %v", err)
+	}
+	logOutput := string(logBytes)
+	if strings.Contains(logOutput, "beads_dir="+rigBeadsDir) {
+		t.Fatalf("CreateOrReopenAgentBead used rig BEADS_DIR; log:\n%s", logOutput)
+	}
+	if !strings.Contains(logOutput, "beads_dir="+townBeadsDir) || !strings.Contains(logOutput, " show") || !strings.Contains(logOutput, " update") {
+		t.Fatalf("CreateOrReopenAgentBead did not use town BEADS_DIR for existing bead path; log:\n%s", logOutput)
+	}
+}

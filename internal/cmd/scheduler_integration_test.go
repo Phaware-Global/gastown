@@ -317,8 +317,9 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 		t.Fatalf("bd show convoy %s failed: %v\noutput: %s", fields.Convoy, err, out)
 	}
 	var convoys []struct {
-		ID        string `json:"id"`
-		IssueType string `json:"issue_type"`
+		ID        string   `json:"id"`
+		IssueType string   `json:"issue_type"`
+		Labels    []string `json:"labels"`
 	}
 	if err := json.Unmarshal(out, &convoys); err != nil {
 		t.Fatalf("parse convoy show: %v\nraw output: %s", err, out)
@@ -326,8 +327,8 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 	if len(convoys) == 0 {
 		t.Fatalf("convoy %s not found via bd show", fields.Convoy)
 	}
-	if convoys[0].IssueType != "convoy" {
-		t.Errorf("convoy issue_type = %q, want %q", convoys[0].IssueType, "convoy")
+	if convoys[0].IssueType != "task" || !hasLabel(convoys[0].Labels, "gt:convoy") {
+		t.Errorf("convoy identity = type %q labels %v, want task with gt:convoy", convoys[0].IssueType, convoys[0].Labels)
 	}
 
 	// Verify: convoy has a "tracks" dependency pointing to the rig bead.
@@ -444,7 +445,7 @@ func TestSchedulerSlingDryRun(t *testing.T) {
 	}
 
 	// Verify: no convoy created (HQ beads DB should have no convoy issues)
-	listArgs := beads.MaybePrependAllowStale([]string{"list", "--type=convoy", "--json"})
+	listArgs := beads.MaybePrependAllowStale([]string{"list", "--label=gt:convoy", "--json"})
 	cmd := exec.Command("bd", listArgs...)
 	cmd.Dir = hqPath
 	out, err := cmd.Output()

@@ -3,6 +3,7 @@ package doctor
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
@@ -58,6 +59,31 @@ func TestNoHeuristicClassification(t *testing.T) {
 	// shouldBeWisp level — that function no longer exists.
 	if check.misclassified != nil {
 		t.Error("fresh check should have no misclassified items")
+	}
+}
+
+func TestRunIgnoresJSONLWhenDoltUnavailable(t *testing.T) {
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, "gastown", ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	staleJSONL := `{"id":"gt-wisp-stale","title":"Stale wisp","ephemeral":true}` + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(staleJSONL), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	check := NewCheckMisclassifiedWisps()
+	result := check.Run(&CheckContext{TownRoot: townRoot})
+	if result.Status != StatusOK {
+		t.Fatalf("expected StatusOK when only stale JSONL exists, got %v: %s", result.Status, result.Message)
+	}
+	if !strings.Contains(result.Message, "Dolt unavailable") {
+		t.Fatalf("expected Dolt-unavailable skip message, got %q", result.Message)
+	}
+	if len(check.misclassified) != 0 {
+		t.Fatalf("expected no misclassified wisps from stale JSONL, got %d", len(check.misclassified))
 	}
 }
 

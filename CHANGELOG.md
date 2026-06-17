@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the canonical DB — a silent data split. Cleanup now removes both
   naming forms and `AddRig` fails loudly if an orphan persists (gh#3562,
   hq-j6hur.4.2).
+- **Stale hooked mail beads** — `sendHandoffMail()` now closes any `gt:message` beads left in `status=hooked` from previous sessions before creating a new handoff bead, preventing indefinite accumulation across sessions (#3859).
 
 ## [1.1.0] - 2026-05-06
 

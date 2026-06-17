@@ -15,9 +15,9 @@ import (
 
 // convoy watch flags
 var (
-	convoyWatchNudge  bool
-	convoyWatchAddr   string
-	convoyWatchJSON   bool
+	convoyWatchNudge bool
+	convoyWatchAddr  string
+	convoyWatchJSON  bool
 )
 
 func init() {
@@ -251,11 +251,12 @@ func getConvoyForWatch(townBeads, convoyID string) (*convoyForWatch, error) {
 	}
 
 	var convoys []struct {
-		ID          string `json:"id"`
-		Title       string `json:"title"`
-		Status      string `json:"status"`
-		Type        string `json:"issue_type"`
-		Description string `json:"description"`
+		ID          string   `json:"id"`
+		Title       string   `json:"title"`
+		Status      string   `json:"status"`
+		Type        string   `json:"issue_type"`
+		Description string   `json:"description"`
+		Labels      []string `json:"labels"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil {
 		return nil, fmt.Errorf("parsing convoy data: %w", err)
@@ -266,7 +267,7 @@ func getConvoyForWatch(townBeads, convoyID string) (*convoyForWatch, error) {
 	}
 
 	c := convoys[0]
-	if c.Type != "convoy" {
+	if !isConvoyIssue(c.Type, c.Labels) {
 		return nil, fmt.Errorf("'%s' is not a convoy (type: %s)", convoyID, c.Type)
 	}
 

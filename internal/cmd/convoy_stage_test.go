@@ -1975,7 +1975,7 @@ func TestCreateStagedConvoy_DescriptionFormat(t *testing.T) {
 	lines := strings.Split(logContent, "\n")
 	var createLine string
 	for _, line := range lines {
-		if strings.Contains(line, "create") && strings.Contains(line, "--type=convoy") {
+		if strings.Contains(line, "create") && strings.Contains(line, "--type=task") && strings.Contains(line, "--labels=gt:convoy") {
 			createLine = line
 			break
 		}
@@ -2148,9 +2148,9 @@ func TestRestageConvoy_DetectionLogic(t *testing.T) {
 		t.Fatalf("bdShow: %v", err)
 	}
 
-	// Verify it's a convoy.
-	if result.IssueType != "convoy" {
-		t.Fatalf("expected convoy type, got %q", result.IssueType)
+	// Verify it's recognized as a convoy.
+	if !isConvoyIssue(result.IssueType, result.Labels) {
+		t.Fatalf("expected convoy bead, got type %q labels %v", result.IssueType, result.Labels)
 	}
 
 	// Verify status is "staged_ready".

@@ -3,6 +3,8 @@ package cmd
 import (
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
@@ -56,6 +58,14 @@ func TestGetFormulaNames(t *testing.T) {
 	if len(names) != len(expected) {
 		t.Errorf("got %d formula names, want %d", len(names), len(expected))
 	}
+}
+
+func issueIDs(issues []*beads.Issue) []string {
+	ids := make([]string, 0, len(issues))
+	for _, issue := range issues {
+		ids = append(ids, issue.ID)
+	}
+	return ids
 }
 
 func TestGetFormulaNames_NonexistentDir(t *testing.T) {
@@ -135,6 +145,35 @@ func TestFilterFormulaScaffolds_EmptyIssues(t *testing.T) {
 	}
 }
 
+func TestGetWispIDsUsesBdMolWispList(t *testing.T) {
+	beadsPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(beadsPath, "issues.jsonl"), []byte(`{"id":"stale-jsonl-wisp"}`+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := t.TempDir()
+	bdPath := filepath.Join(binDir, "bd")
+	bdScript := `#!/bin/sh
+if [ "$1" = "mol" ] && [ "$2" = "wisp" ] && [ "$3" = "list" ] && [ "$4" = "--json" ]; then
+  printf '{"wisps":[{"id":"dolt-wisp-1"},{"id":"dolt-wisp-2"}],"count":2}\n'
+  exit 0
+fi
+exit 1
+`
+	if err := os.WriteFile(bdPath, []byte(bdScript), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ids := getWispIDs(beadsPath)
+	if !ids["dolt-wisp-1"] || !ids["dolt-wisp-2"] {
+		t.Fatalf("expected IDs from bd mol wisp list, got %#v", ids)
+	}
+	if ids["stale-jsonl-wisp"] {
+		t.Fatalf("getWispIDs read stale issues.jsonl; got %#v", ids)
+	}
+}
+
 func TestFilterFormulaScaffolds_DotInNonScaffold(t *testing.T) {
 	// Issue ID has a dot but prefix is not a formula name
 	formulaNames := map[string]bool{constants.MolDeaconPatrol: true}
@@ -175,5 +214,43 @@ func TestFilterIdentityBeads_SkipsRefineryWorkflowBeads(t *testing.T) {
 		if beads.IsRefineryWorkflowBead(issue) {
 			t.Errorf("refinery workflow bead %q should have been filtered out", issue.ID)
 		}
+	}
+}
+
+func TestFilterReadyIssuesByRoute(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatalf("creating town beads dir: %v", err)
+	}
+	routes := strings.Join([]string{
+		`{"prefix":"hq-","path":"."}`,
+		`{"prefix":"hq-cv-","path":"."}`,
+		`{"prefix":"bds-","path":"bd_symphony/mayor/rig"}`,
+		`{"prefix":"gt-","path":"gastown/mayor/rig"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0644); err != nil {
+		t.Fatalf("writing routes: %v", err)
+	}
+
+	issues := []*beads.Issue{
+		{ID: "hq-123", Title: "town work"},
+		{ID: "hq-cv-123", Title: "town convoy"},
+		{ID: "bds-town-stale", Title: "wrongly-created town bds row"},
+		{ID: "unknown-123", Title: "unknown route"},
+	}
+	filtered := filterReadyIssuesByRoute(townRoot, "town", issues)
+	if got, want := issueIDs(filtered), []string{"hq-123", "hq-cv-123"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("town filtered IDs = %v, want %v", got, want)
+	}
+
+	issues = []*beads.Issue{
+		{ID: "bds-123", Title: "bd_symphony work"},
+		{ID: "hq-123", Title: "town work in rig result"},
+		{ID: "gt-123", Title: "other rig work"},
+		{ID: "unknown-123", Title: "unknown route"},
+	}
+	filtered = filterReadyIssuesByRoute(townRoot, "bd_symphony", issues)
+	if got, want := issueIDs(filtered), []string{"bds-123"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("rig filtered IDs = %v, want %v", got, want)
 	}
 }
