@@ -709,7 +709,7 @@ func (m *Mailbox) markReadOnlyBeads(id string) error {
 // hasReadLabel reports whether the given (status, labels, err) tuple from
 // bdShowStatusLabels indicates the bead already carries the "read" label.
 // Returns false on any error (probe failed → caller should attempt the
-// write), or when the label is absent. Centralised so both the primary
+// write), or when the label is absent. Centralized so both the primary
 // and cross-rig fallback paths in markReadOnlyBeads share the same logic.
 func hasReadLabel(_ string, labels []string, err error) bool {
 	if err != nil {

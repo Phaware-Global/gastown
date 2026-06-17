@@ -2,13 +2,73 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
 )
+
+// TestLandConflictError_ErrorsAs verifies that callers (notably the refinery
+// formula's consolidation-failure-handler) can detect a consolidation merge
+// conflict via errors.As, instead of parsing message text. Regression test
+// for hq-j6hur.3.7 (gh#3604): refinery left dirty worktree on consolidation
+// conflict because the failure was an opaque string-wrapped error.
+func TestLandConflictError_ErrorsAs(t *testing.T) {
+	underlying := fmt.Errorf("git merge exit 1: CONFLICT in foo.go")
+	wrapped := fmt.Errorf("integration land failed: %w", &LandConflictError{
+		EpicID:        "gt-epic-99",
+		Branch:        "integration/auth",
+		TargetBranch:  "main",
+		ConflictPaths: []string{"foo.go", "bar.go"},
+		Underlying:    underlying,
+	})
+
+	var lce *LandConflictError
+	if !errors.As(wrapped, &lce) {
+		t.Fatalf("errors.As should match LandConflictError; got %T", wrapped)
+	}
+	if lce.EpicID != "gt-epic-99" {
+		t.Errorf("EpicID = %q, want gt-epic-99", lce.EpicID)
+	}
+	if len(lce.ConflictPaths) != 2 {
+		t.Errorf("ConflictPaths = %v, want 2 paths", lce.ConflictPaths)
+	}
+	if !errors.Is(lce, underlying) {
+		t.Errorf("errors.Is should unwrap to underlying merge error")
+	}
+
+	msg := lce.Error()
+	if !strings.Contains(msg, "integration/auth") || !strings.Contains(msg, "main") {
+		t.Errorf("Error() should mention branch and target, got %q", msg)
+	}
+	if !strings.Contains(msg, "foo.go") {
+		t.Errorf("Error() should list conflict files, got %q", msg)
+	}
+}
+
+// TestLandConflictError_NoFiles covers the case where conflict-file detection
+// failed (e.g., GetConflictingFiles returned nil) — the error message must
+// still be informative.
+func TestLandConflictError_NoFiles(t *testing.T) {
+	lce := &LandConflictError{
+		EpicID:       "gt-epic-99",
+		Branch:       "integration/auth",
+		TargetBranch: "main",
+		Underlying:   fmt.Errorf("merge failed"),
+	}
+	msg := lce.Error()
+	if !strings.Contains(msg, "integration/auth") || !strings.Contains(msg, "main") {
+		t.Errorf("Error() should mention branch and target, got %q", msg)
+	}
+	if !strings.Contains(msg, "merge failed") {
+		t.Errorf("Error() should embed underlying message, got %q", msg)
+	}
+}
 
 // TestMakeTestMR_RealisticFields verifies that makeTestMR produces MR beads
 // matching real beads structure: Type "task" with label "gt:merge-request",
@@ -586,6 +646,51 @@ func TestGetRigGit(t *testing.T) {
 			t.Errorf("expected empty WorkDir for bare repo, got %q", g.WorkDir())
 		}
 	})
+}
+
+// TestPostMerge_RigGitError verifies that getRigGit failure in runMQPostMerge
+// propagates as an error rather than being silently swallowed (gh#3868).
+// Before the fix, the function returned nil on getRigGit failure, giving exit
+// code 0 and causing the refinery to skip retry on branch-delete failures.
+func TestPostMerge_RigGitError(t *testing.T) {
+	// Empty temp dir: no .repo.git, no mayor/rig → getRigGit returns error.
+	tmp := t.TempDir()
+
+	_, err := getRigGit(tmp)
+	if err == nil {
+		t.Fatal("expected getRigGit to fail for empty dir, got nil")
+	}
+	if !strings.Contains(err.Error(), "no repo base found") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestPostMerge_DeleteRemoteBranchErrorPropagated verifies that a failing
+// git push --delete returns a non-nil error from DeleteRemoteBranch (gh#3868).
+// Before the fix, runMQPostMerge swallowed this error and returned exit code 0.
+func TestPostMerge_DeleteRemoteBranchErrorPropagated(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	tmp := t.TempDir()
+	bareRepo := filepath.Join(tmp, ".repo.git")
+	if err := os.MkdirAll(bareRepo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command("git", "init", "--bare", bareRepo).Run(); err != nil {
+		t.Skipf("git init --bare: %v", err)
+	}
+
+	rigGit, err := getRigGit(tmp)
+	if err != nil {
+		t.Fatalf("getRigGit: %v", err)
+	}
+
+	// No "origin" remote is configured → git push --delete must fail.
+	err = rigGit.DeleteRemoteBranch("origin", "polecat/test/gt-abc")
+	if err == nil {
+		t.Error("expected error from DeleteRemoteBranch with no remote, got nil")
+	}
 }
 
 func TestGetIntegrationBranchTemplate(t *testing.T) {

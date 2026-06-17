@@ -1659,13 +1659,17 @@ func TestCheckCrossRigGuard(t *testing.T) {
 			wantErr:     true,
 		},
 		{
-			name:        "town-level: hq bead to rig (rejected — belongs to town root)",
+			// Known town-root prefix: warn but allow. A crew member with a broken
+			// redirect chain may create hq-* beads that legitimately target a rig
+			// polecat (gt-gbu). Hard-rejecting silently drops all their polecat work.
+			name:        "town-level: hq bead to rig (warns but allows — gt-gbu)",
 			beadID:      "hq-abc123",
 			targetAgent: "gastown/polecats/Toast",
-			wantErr:     true,
+			wantErr:     false,
 		},
 		{
-			name:        "unknown prefix: rejected (no route maps to target rig)",
+			// Truly unknown prefix (not in routes.jsonl): hard reject.
+			name:        "unknown prefix: rejected (no route exists at all)",
 			beadID:      "xx-unknown",
 			targetAgent: "gastown/polecats/Toast",
 			wantErr:     true,
@@ -1686,8 +1690,8 @@ func TestCheckCrossRigGuard(t *testing.T) {
 			}
 			if err != nil && tc.wantErr {
 				errMsg := err.Error()
-				if !strings.Contains(errMsg, "cross-rig mismatch") && !strings.Contains(errMsg, "town root") {
-					t.Errorf("expected cross-rig or town-root error, got: %v", err)
+				if !strings.Contains(errMsg, "cross-rig mismatch") && !strings.Contains(errMsg, "not in routes") {
+					t.Errorf("expected cross-rig mismatch or unknown-prefix error, got: %v", err)
 				}
 				if !strings.Contains(errMsg, "--force") {
 					t.Errorf("error should mention --force override, got: %v", err)
@@ -2724,6 +2728,66 @@ func TestSlingRejectsDeferredBead(t *testing.T) {
 				if strings.Contains(err.Error(), "refusing to sling deferred") {
 					t.Fatalf("unexpected deferred rejection: %v", err)
 				}
+			}
+		})
+	}
+}
+
+// TestRunSlingResumeFlagValidation verifies the gh#3602 mutual-exclusion rules
+// for --branch / --pr / --base-branch. The validation block runs before any
+// I/O, so we can exercise it without a live workspace.
+func TestRunSlingResumeFlagValidation(t *testing.T) {
+	tests := []struct {
+		name         string
+		resumeBranch string
+		resumePR     int
+		baseBranch   string
+		wantError    string
+	}{
+		{
+			name:         "branch and pr together is rejected",
+			resumeBranch: "feature/foo",
+			resumePR:     42,
+			wantError:    "--branch and --pr are mutually exclusive",
+		},
+		{
+			name:         "branch with base-branch is rejected",
+			resumeBranch: "feature/foo",
+			baseBranch:   "develop",
+			wantError:    "--base-branch cannot be combined with --branch or --pr",
+		},
+		{
+			name:       "pr with base-branch is rejected",
+			resumePR:   42,
+			baseBranch: "develop",
+			wantError:  "--base-branch cannot be combined with --branch or --pr",
+		},
+	}
+
+	t.Setenv(EnvGTRole, "")
+	t.Setenv("GT_POLECAT", "")
+
+	prevResumeBranch := slingResumeBranch
+	prevResumePR := slingResumePR
+	prevBaseBranch := slingBaseBranch
+	t.Cleanup(func() {
+		slingResumeBranch = prevResumeBranch
+		slingResumePR = prevResumePR
+		slingBaseBranch = prevBaseBranch
+	})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			slingResumeBranch = tt.resumeBranch
+			slingResumePR = tt.resumePR
+			slingBaseBranch = tt.baseBranch
+
+			err := runSling(nil, []string{"gt-test"})
+			if err == nil {
+				t.Fatalf("expected error containing %q but got nil", tt.wantError)
+			}
+			if !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("expected error containing %q, got: %v", tt.wantError, err)
 			}
 		})
 	}
