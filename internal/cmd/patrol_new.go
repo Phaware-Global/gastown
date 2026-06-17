@@ -86,7 +86,7 @@ func runPatrolNewWithRole(cmd *cobra.Command, args []string, roleInfo RoleInfo) 
 	// before calling `gt patrol new`. The daemon kills the Deacon when heartbeat.json
 	// is >20 minutes old, so touching it here ensures liveness is signaled regardless
 	// of whether the formula's heartbeat step ran first.
-	if Role(roleName) == RoleDeacon {
+	if Role(roleName) == RoleDeacon && roleInfo.TownRoot != "" {
 		if hbErr := deacon.TouchWithAction(roleInfo.TownRoot, "starting patrol cycle", 0, 0); hbErr != nil {
 			style.PrintWarning("heartbeat refresh failed: %v", hbErr)
 		}
