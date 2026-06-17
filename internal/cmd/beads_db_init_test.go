@@ -154,10 +154,11 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		isoPort := strconv.Itoa(doltserver.FindFreePort(20000))
 		t.Setenv("GT_DOLT_PORT", isoPort)
 		t.Setenv("BEADS_DOLT_PORT", isoPort)
-		// Stop this town's managed Dolt when the subtest ends so it does not
-		// linger and starve later tests (port-based kill is safe here).
+		// Stop this town's managed Dolt (and any town process) when the (sub)test
+		// ends so it does not linger and starve later tests. pkill -f on the
+		// unique temp hqPath matches the dolt --config path; safe (unique dir).
 		t.Cleanup(func() {
-			_ = exec.Command("bash", "-c", fmt.Sprintf("kill $(lsof -ti tcp:%s) 2>/dev/null", isoPort)).Run()
+			_ = exec.Command("pkill", "-f", townRoot).Run()
 		})
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "prefix-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
@@ -228,10 +229,11 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		isoPort := strconv.Itoa(doltserver.FindFreePort(20000))
 		t.Setenv("GT_DOLT_PORT", isoPort)
 		t.Setenv("BEADS_DOLT_PORT", isoPort)
-		// Stop this town's managed Dolt when the subtest ends so it does not
-		// linger and starve later tests (port-based kill is safe here).
+		// Stop this town's managed Dolt (and any town process) when the (sub)test
+		// ends so it does not linger and starve later tests. pkill -f on the
+		// unique temp hqPath matches the dolt --config path; safe (unique dir).
 		t.Cleanup(func() {
-			_ = exec.Command("bash", "-c", fmt.Sprintf("kill $(lsof -ti tcp:%s) 2>/dev/null", isoPort)).Run()
+			_ = exec.Command("pkill", "-f", townRoot).Run()
 		})
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "no-issues-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
@@ -301,10 +303,11 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		isoPort := strconv.Itoa(doltserver.FindFreePort(20000))
 		t.Setenv("GT_DOLT_PORT", isoPort)
 		t.Setenv("BEADS_DOLT_PORT", isoPort)
-		// Stop this town's managed Dolt when the subtest ends so it does not
-		// linger and starve later tests (port-based kill is safe here).
+		// Stop this town's managed Dolt (and any town process) when the (sub)test
+		// ends so it does not linger and starve later tests. pkill -f on the
+		// unique temp hqPath matches the dolt --config path; safe (unique dir).
 		t.Cleanup(func() {
-			_ = exec.Command("bash", "-c", fmt.Sprintf("kill $(lsof -ti tcp:%s) 2>/dev/null", isoPort)).Run()
+			_ = exec.Command("pkill", "-f", townRoot).Run()
 		})
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "mismatch-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
@@ -357,10 +360,11 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		isoPort := strconv.Itoa(doltserver.FindFreePort(20000))
 		t.Setenv("GT_DOLT_PORT", isoPort)
 		t.Setenv("BEADS_DOLT_PORT", isoPort)
-		// Stop this town's managed Dolt when the subtest ends so it does not
-		// linger and starve later tests (port-based kill is safe here).
+		// Stop this town's managed Dolt (and any town process) when the (sub)test
+		// ends so it does not linger and starve later tests. pkill -f on the
+		// unique temp hqPath matches the dolt --config path; safe (unique dir).
 		t.Cleanup(func() {
-			_ = exec.Command("bash", "-c", fmt.Sprintf("kill $(lsof -ti tcp:%s) 2>/dev/null", isoPort)).Run()
+			_ = exec.Command("pkill", "-f", townRoot).Run()
 		})
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "derived-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
@@ -424,10 +428,11 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		isoPort := strconv.Itoa(doltserver.FindFreePort(20000))
 		t.Setenv("GT_DOLT_PORT", isoPort)
 		t.Setenv("BEADS_DOLT_PORT", isoPort)
-		// Stop this town's managed Dolt when the subtest ends so it does not
-		// linger and starve later tests (port-based kill is safe here).
+		// Stop this town's managed Dolt (and any town process) when the (sub)test
+		// ends so it does not linger and starve later tests. pkill -f on the
+		// unique temp hqPath matches the dolt --config path; safe (unique dir).
 		t.Cleanup(func() {
-			_ = exec.Command("bash", "-c", fmt.Sprintf("kill $(lsof -ti tcp:%s) 2>/dev/null", isoPort)).Run()
+			_ = exec.Command("pkill", "-f", townRoot).Run()
 		})
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "reinit-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
