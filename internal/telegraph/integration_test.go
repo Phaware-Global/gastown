@@ -28,6 +28,27 @@ import (
 	"github.com/steveyegge/gastown/internal/telegraph/transport"
 )
 
+// syncBuffer is a concurrency-safe bytes.Buffer for tests where the telegraph
+// logger writes from a delivery goroutine while the test goroutine reads the
+// captured log. A plain bytes.Buffer races under -race (write in emit vs read
+// in String); guarding both with a mutex removes the race.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // ---- test helpers ----
 
 // captureNudger records nudge calls for assertions.
@@ -478,7 +499,7 @@ func TestIntegration_BurstMailCount(t *testing.T) {
 // actorPipeline wires L1+L2+L3 with an actor filter and a log buffer for Drop assertions.
 type actorPipeline struct {
 	*pipeline
-	logBuf *bytes.Buffer
+	logBuf *syncBuffer
 	logger *tlog.Logger
 }
 
@@ -487,7 +508,7 @@ func newActorPipeline(t *testing.T, ignoreActors []string) *actorPipeline {
 	const testSecret = "test-secret-xyzzy"
 	secret := []byte(testSecret)
 
-	logBuf := &bytes.Buffer{}
+	logBuf := &syncBuffer{}
 	logger := tlog.New(logBuf)
 
 	rawCh := make(chan telegraph.RawEvent, 64)
@@ -610,7 +631,7 @@ func TestIntegration_PromptKey_InDeliverLog(t *testing.T) {
 		t.Fatalf("NewResolver: %v", err)
 	}
 
-	logBuf := &bytes.Buffer{}
+	logBuf := &syncBuffer{}
 	logger := tlog.New(logBuf)
 	rawCh := make(chan telegraph.RawEvent, 64)
 	jiraTr := jiratr.New(testSecret, nil, jiratr.MayorIdentity{}, nil)
@@ -684,7 +705,7 @@ type githubPipeline struct {
 	rawCh  chan telegraph.RawEvent
 	cancel func()
 	secret []byte
-	logBuf *bytes.Buffer
+	logBuf *syncBuffer
 }
 
 func newGitHubPipeline(t *testing.T, allowedRepos []string, ignoreActors []string) *githubPipeline {
@@ -697,7 +718,7 @@ func newGitHubPipelineWithMayor(t *testing.T, allowedRepos []string, ignoreActor
 	const ghSecret = "github-int-secret"
 	secret := []byte(ghSecret)
 
-	logBuf := &bytes.Buffer{}
+	logBuf := &syncBuffer{}
 	logger := tlog.New(logBuf)
 
 	rawCh := make(chan telegraph.RawEvent, 64)

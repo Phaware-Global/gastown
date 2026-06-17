@@ -310,6 +310,11 @@ func (m *Manager) repairRefineryWorktree(refineryRigDir string) error {
 		_, _ = fmt.Fprintf(m.output, "⚠ Could not configure hooks for repaired worktree: %v\n", err)
 	}
 
+	townRoot := filepath.Dir(m.rig.Path)
+	if err := rig.EnsureCodegraphIndex(refineryRigDir, townRoot, m.rig.Path); err != nil {
+		_, _ = fmt.Fprintf(m.output, "⚠ Could not start codegraph indexing for repaired worktree: %v\n", err)
+	}
+
 	_, _ = fmt.Fprintf(m.output, "✓ Auto-repaired missing refinery worktree at %s\n", refineryRigDir)
 	return nil
 }

@@ -124,6 +124,11 @@ type TownSettings struct {
 	// "main_branch_test", "handler").
 	// Example: ["doctor_dog", "compactor_dog"]
 	DisabledPatrols []string `json:"disabled_patrols,omitempty"`
+
+	// CodeGraph configures automatic codegraph indexing of new worktrees.
+	// A rig-level CodeGraph setting overrides this town-level setting.
+	// Default: enabled (nil = inherit default true).
+	CodeGraph *CodeGraphConfig `json:"codegraph,omitempty"`
 }
 
 // NewTownSettings creates a new TownSettings with defaults.
@@ -523,6 +528,26 @@ type PolecatConfig struct {
 	TargetCleanPolicy string `json:"target_clean_policy,omitempty"`
 }
 
+// CodeGraphConfig controls automatic codegraph indexing of new worktrees.
+type CodeGraphConfig struct {
+	// Enabled toggles auto `codegraph init` at polecat/refinery worktree creation.
+	// Nil = inherit (town default true; rig inherits town). Default: true.
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
+// IsCodeGraphIndexingEnabled returns whether automatic codegraph indexing is enabled.
+// Precedence: rig.Enabled → town.Enabled → true (default on).
+// Nil-safe at every level.
+func IsCodeGraphIndexingEnabled(town *TownSettings, r *RigSettings) bool {
+	if r != nil && r.CodeGraph != nil && r.CodeGraph.Enabled != nil {
+		return *r.CodeGraph.Enabled
+	}
+	if town != nil && town.CodeGraph != nil && town.CodeGraph.Enabled != nil {
+		return *town.CodeGraph.Enabled
+	}
+	return true
+}
+
 // ParseDurationOrDefault parses a Go duration string, returning fallback on error or empty input.
 func ParseDurationOrDefault(s string, fallback time.Duration) time.Duration {
 	if s == "" {
@@ -708,6 +733,10 @@ type RigSettings struct {
 	// Values are effort levels: "low", "medium", "high", "max".
 	// Example: {"crew": "max", "witness": "low"}
 	RoleEffort map[string]string `json:"role_effort,omitempty"`
+
+	// CodeGraph configures automatic codegraph indexing for this rig's new worktrees.
+	// Overrides the town-level CodeGraph setting when non-nil.
+	CodeGraph *CodeGraphConfig `json:"codegraph,omitempty"`
 }
 
 // CrewConfig represents crew workspace settings for a rig.
@@ -1495,7 +1524,7 @@ const (
 const (
 	// DefaultReviewerTokenEnv is the default name of the environment variable
 	// holding the Reviewer machine-user's GitHub token.
-	DefaultReviewerTokenEnv = "GT_REVIEWER_GITHUB_TOKEN"
+	DefaultReviewerTokenEnv = "GT_REVIEWER_GITHUB_TOKEN" //nolint:gosec // G101: env-var NAME, not a secret value
 
 	// DefaultMaxFindingsPerPerspective caps findings emitted per perspective
 	// pass before the reviewer summarizes the overflow.
