@@ -186,7 +186,7 @@ exit 0
 		t.Fatalf("bd was never called with a 'list' subcommand; log: %q", string(logData))
 	}
 
-	requiredFlags := []string{"list", "--label=gt:convoy", "--status=open", "--json", "--limit=0"}
+	requiredFlags := []string{"list", "--label=gt:convoy", "--status=open", "--json", "--limit=0", "--flat"}
 	for _, flag := range requiredFlags {
 		if !strings.Contains(listLine, flag) {
 			t.Errorf("bd list command missing %q; got: %q", flag, listLine)

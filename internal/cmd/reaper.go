@@ -29,9 +29,39 @@ var (
 	reaperPurgeAge string
 	reaperMailAge  string
 	reaperStaleAge string
+	reaperDBDelay  string
 	reaperDryRun   bool
 	reaperJSON     bool
 )
+
+func reaperDatabaseNames() []string {
+	if reaperDB == "" {
+		return reaper.DiscoverDatabases(reaperHost, reaperPort)
+	}
+	parts := strings.Split(reaperDB, ",")
+	databases := make([]string, 0, len(parts))
+	for _, part := range parts {
+		name := strings.TrimSpace(part)
+		if name != "" {
+			databases = append(databases, name)
+		}
+	}
+	return databases
+}
+
+func waitBeforeReaperDatabase(index int) error {
+	if index == 0 {
+		return nil
+	}
+	delay, err := time.ParseDuration(reaperDBDelay)
+	if err != nil {
+		return fmt.Errorf("invalid --db-delay: %w", err)
+	}
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	return nil
+}
 
 var reaperCmd = &cobra.Command{
 	Use:     "reaper",
@@ -95,13 +125,13 @@ The Dog uses this to understand the state before deciding what to reap.`,
 			return fmt.Errorf("invalid --stale-age: %w", err)
 		}
 
-		databases := reaper.DiscoverDatabases(reaperHost, reaperPort)
-		if reaperDB != "" {
-			databases = strings.Split(reaperDB, ",")
-		}
+		databases := reaperDatabaseNames()
 
 		var results []*reaper.ScanResult
-		for _, dbName := range databases {
+		for i, dbName := range databases {
+			if err := waitBeforeReaperDatabase(i); err != nil {
+				return err
+			}
 			if err := reaper.ValidateDBName(dbName); err != nil {
 				fmt.Fprintf(os.Stderr, "skip invalid db: %s\n", dbName)
 				continue
@@ -180,13 +210,13 @@ Returns the count of reaped wisps. Use --dry-run to preview.`,
 			return fmt.Errorf("invalid --max-age: %w", err)
 		}
 
-		databases := reaper.DiscoverDatabases(reaperHost, reaperPort)
-		if reaperDB != "" {
-			databases = strings.Split(reaperDB, ",")
-		}
+		databases := reaperDatabaseNames()
 
 		var results []*reaper.ReapResult
-		for _, dbName := range databases {
+		for i, dbName := range databases {
+			if err := waitBeforeReaperDatabase(i); err != nil {
+				return err
+			}
 			if err := reaper.ValidateDBName(dbName); err != nil {
 				fmt.Fprintf(os.Stderr, "skip invalid db: %s\n", dbName)
 				continue
@@ -307,13 +337,13 @@ Returns counts of purged rows. Use --dry-run to preview.`,
 			return fmt.Errorf("invalid --mail-age: %w", err)
 		}
 
-		databases := reaper.DiscoverDatabases(reaperHost, reaperPort)
-		if reaperDB != "" {
-			databases = strings.Split(reaperDB, ",")
-		}
+		databases := reaperDatabaseNames()
 
 		var results []*reaper.PurgeResult
-		for _, dbName := range databases {
+		for i, dbName := range databases {
+			if err := waitBeforeReaperDatabase(i); err != nil {
+				return err
+			}
 			if err := reaper.ValidateDBName(dbName); err != nil {
 				fmt.Fprintf(os.Stderr, "skip invalid db: %s\n", dbName)
 				continue
@@ -389,13 +419,13 @@ Returns the count of closed issues. Use --dry-run to preview.`,
 			return fmt.Errorf("invalid --stale-age: %w", err)
 		}
 
-		databases := reaper.DiscoverDatabases(reaperHost, reaperPort)
-		if reaperDB != "" {
-			databases = strings.Split(reaperDB, ",")
-		}
+		databases := reaperDatabaseNames()
 
 		var results []*reaper.AutoCloseResult
-		for _, dbName := range databases {
+		for i, dbName := range databases {
+			if err := waitBeforeReaperDatabase(i); err != nil {
+				return err
+			}
 			if err := reaper.ValidateDBName(dbName); err != nil {
 				fmt.Fprintf(os.Stderr, "skip invalid db: %s\n", dbName)
 				continue
@@ -463,10 +493,7 @@ var reaperRunCmd = &cobra.Command{
 This is the inline fallback for when Dog dispatch is unavailable.
 Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		databases := reaper.DiscoverDatabases(reaperHost, reaperPort)
-		if reaperDB != "" {
-			databases = strings.Split(reaperDB, ",")
-		}
+		databases := reaperDatabaseNames()
 
 		maxAge, err := time.ParseDuration(reaperMaxAge)
 		if err != nil {
@@ -487,7 +514,10 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 
 		var totalReaped, totalPurged, totalMailPurged, totalClosed, totalOpen int
 
-		for _, dbName := range databases {
+		for i, dbName := range databases {
+			if err := waitBeforeReaperDatabase(i); err != nil {
+				return err
+			}
 			if err := reaper.ValidateDBName(dbName); err != nil {
 				fmt.Printf("skip invalid db: %s\n", dbName)
 				continue
@@ -594,6 +624,9 @@ func init() {
 		cmd.Flags().StringVar(&reaperHost, "host", defaultHost, "Dolt server host (env: GT_DOLT_HOST)")
 		cmd.Flags().IntVar(&reaperPort, "port", defaultPort, "Dolt server port (env: GT_DOLT_PORT)")
 		cmd.Flags().BoolVar(&reaperDryRun, "dry-run", false, "Report what would happen without acting")
+	}
+	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperRunCmd} {
+		cmd.Flags().StringVar(&reaperDBDelay, "db-delay", "250ms", "Delay between databases to reduce Dolt load")
 	}
 
 	// JSON output flag for single-db commands

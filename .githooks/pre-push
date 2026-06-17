@@ -34,6 +34,32 @@ while read local_ref local_sha remote_ref remote_sha; do
 
   branch="${remote_ref#refs/heads/}"
 
+  # HEAD-mismatch guard: refuse pushing a branch you are not standing on.
+  # `git push origin <B>` pushes the local <B> ref regardless of where HEAD is, so
+  # running it from a session/feature branch silently no-ops ("Everything up-to-date")
+  # or pushes a stale ref — the work is stranded on a branch nobody merges. Git's
+  # conflict model can't catch this: it happens before any divergence exists.
+  # Only fires when a local branch ref is being pushed (not HEAD:x, tags, or deletes).
+  # Override for intentional cross-branch pushes: GT_ALLOW_OFFBRANCH_PUSH=1
+  if [[ "${GT_ALLOW_OFFBRANCH_PUSH:-0}" != "1" \
+        && "$local_ref" == refs/heads/* \
+        && "$local_sha" != "0000000000000000000000000000000000000000" ]]; then
+    head_branch=$(git symbolic-ref --short -q HEAD || echo "")
+    pushed_branch="${local_ref#refs/heads/}"
+    if [[ -n "$head_branch" && "$head_branch" != "$pushed_branch" ]]; then
+      echo "BLOCKED: pushing '$pushed_branch' while HEAD is on '$head_branch'."
+      echo ""
+      echo "You are not on the branch you are pushing. This commonly no-ops silently"
+      echo "(\"Everything up-to-date\") or pushes a stale ref, leaving the real work"
+      echo "stranded on a branch nobody merges."
+      echo ""
+      echo "  Check:  git status -sb ; git reflog | head"
+      echo "  Fix:    git switch '$pushed_branch'   (then re-push)"
+      echo "  Intentional cross-branch push? re-run with GT_ALLOW_OFFBRANCH_PUSH=1"
+      exit 1
+    fi
+  fi
+
   case "$branch" in
     "${default_branch}"|beads-sync|polecat/*|integration/*)
       # Allowed branches

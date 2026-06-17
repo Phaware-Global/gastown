@@ -46,7 +46,42 @@ Examples:
   gt estop -r "closing laptop"          # Freeze with reason
   gt estop --rig gastown                # Freeze only gastown
   gt estop --rig beads -r "maintenance" # Freeze beads rig`,
+	// Reject stray operands so `gt estop status` cannot fall through to runEstop.
+	Args: cobra.NoArgs,
 	RunE: runEstop,
+}
+
+var estopStatusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Show emergency-stop state without freezing agents",
+	Long:  "Report whether a town-wide or per-rig E-stop is active. This is read-only and never freezes agents. To clear an E-stop, use 'gt thaw'.",
+	Args:  cobra.NoArgs,
+	RunE:  runEstopStatus,
+}
+
+func runEstopStatus(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+	if !estop.IsActive(townRoot) {
+		entries, _ := filepath.Glob(filepath.Join(townRoot, "ESTOP.*"))
+		hasRigEstop := false
+		for _, entry := range entries {
+			rigName := strings.TrimPrefix(filepath.Base(entry), "ESTOP.")
+			if estop.ReadRig(townRoot, rigName) != nil {
+				hasRigEstop = true
+				break
+			}
+		}
+		if !hasRigEstop {
+			fmt.Println("No E-stop active.")
+			return nil
+		}
+	}
+	addEstopToStatus(townRoot)
+	fmt.Printf("Clear with: %s\n", style.Bold.Render("gt thaw"))
+	return nil
 }
 
 var thawCmd = &cobra.Command{
@@ -68,6 +103,7 @@ func init() {
 	estopCmd.Flags().StringVarP(&estopReason, "reason", "r", "", "Reason for the E-stop")
 	estopCmd.Flags().StringVar(&estopRig, "rig", "", "Freeze only this rig (instead of all)")
 	thawCmd.Flags().StringVar(&thawRig, "rig", "", "Thaw only this rig (instead of all)")
+	estopCmd.AddCommand(estopStatusCmd)
 	rootCmd.AddCommand(estopCmd)
 	rootCmd.AddCommand(thawCmd)
 }

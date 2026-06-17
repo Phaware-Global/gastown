@@ -289,8 +289,14 @@ func maintainBackupSync(dataDir, dbName, backupName string) error {
 
 // maintainOpenDB opens a connection to the Dolt server for a database.
 func maintainOpenDB(config *doltserver.Config, dbName string) (*sql.DB, error) {
-	dsn := fmt.Sprintf("%s@tcp(%s)/%s?parseTime=true&timeout=5s&readTimeout=30s&writeTimeout=30s",
-		config.User, config.HostPort(), dbName)
+	// wa-d6f: socket-first DSN (TCP fallback) to avoid TIME_WAIT churn from
+	// short-lived gt maintain invocations.
+	dsn := buildDoltDSNFromConfig(config, dbName, dsnOpts{
+		ParseTime:    true,
+		Timeout:      "5s",
+		ReadTimeout:  "30s",
+		WriteTimeout: "30s",
+	})
 	return sql.Open("mysql", dsn)
 }
 

@@ -72,10 +72,9 @@ func assertPrimeToolCalled(t *testing.T, want string) {
 	}
 }
 
-func TestRunPrimeExternalTools_BoundsSlowBdPrimeAndContinues(t *testing.T) {
+func TestRunPrimeExternalTools_RunsMemoryAndMail(t *testing.T) {
 	workDir := setupPrimeExternalToolTest(t, `
 case "$*" in
-  "prime") sleep 2; exit 0 ;;
   "kv list --json") printf '%s\n' '{"memory.feedback.test":"remembered"}'; exit 0 ;;
 esac
 `, `
@@ -85,17 +84,16 @@ esac
 `)
 
 	start := time.Now()
-	output := captureStdout(t, func() { runPrimeExternalTools(workDir) })
+	output := captureStdout(t, func() { runPrimeExternalTools(RoleContext{Role: RolePolecat}, workDir) })
 	assertElapsedUnder(t, time.Since(start), time.Second)
-	assertPrimeToolCalled(t, "bd:prime")
 	assertPrimeToolCalled(t, "bd:kv list --json")
 	assertPrimeToolCalled(t, "gt:mail check --inject")
 
 	if !strings.Contains(output, "remembered") {
-		t.Fatalf("memory injection did not continue after bd prime timeout: %q", output)
+		t.Fatalf("memory injection missing: %q", output)
 	}
 	if !strings.Contains(output, "MAIL OUTPUT") {
-		t.Fatalf("mail injection did not continue after bd prime timeout: %q", output)
+		t.Fatalf("mail injection missing: %q", output)
 	}
 }
 
@@ -105,7 +103,6 @@ func TestRunPrimeExternalTools_BoundsSlowMailCheck(t *testing.T) {
 	survivedPath := filepath.Join(markerDir, "child-survived")
 	workDir := setupPrimeExternalToolTest(t, `
 case "$*" in
-  "prime") printf '%s\n' 'BD PRIME OUTPUT'; exit 0 ;;
   "kv list --json") printf '%s\n' '{"memory.feedback.test":"remembered"}'; exit 0 ;;
 esac
 `, `
@@ -122,15 +119,11 @@ esac
 	t.Setenv("PRIME_CHILD_SURVIVED", survivedPath)
 
 	start := time.Now()
-	output := captureStdout(t, func() { runPrimeExternalTools(workDir) })
+	output := captureStdout(t, func() { runPrimeExternalTools(RoleContext{Role: RolePolecat}, workDir) })
 	assertElapsedUnder(t, time.Since(start), time.Second)
-	assertPrimeToolCalled(t, "bd:prime")
 	assertPrimeToolCalled(t, "bd:kv list --json")
 	assertPrimeToolCalled(t, "gt:mail check --inject")
 
-	if !strings.Contains(output, "BD PRIME OUTPUT") {
-		t.Fatalf("bd prime output missing: %q", output)
-	}
 	if !strings.Contains(output, "remembered") {
 		t.Fatalf("memory output missing: %q", output)
 	}
@@ -146,10 +139,39 @@ esac
 	}
 }
 
+func TestRunPrimeExternalTools_SkipsMailCheckForPatrolRoles(t *testing.T) {
+	for _, role := range []string{string(RoleWitness), string(RoleRefinery), string(RoleDeacon), string(RoleBoot)} {
+		t.Run(role, func(t *testing.T) {
+			workDir := setupPrimeExternalToolTest(t, `
+case "$*" in
+  "kv list --json") printf '%s\n' '{}'; exit 0 ;;
+esac
+`, `
+case "$*" in
+  "mail check --inject") printf '%s\n' 'MAIL OUTPUT'; exit 0 ;;
+esac
+`)
+
+			output := captureStdout(t, func() { runPrimeExternalTools(RoleContext{Role: Role(role)}, workDir) })
+			assertPrimeToolCalled(t, "bd:kv list --json")
+			logData, err := os.ReadFile(os.Getenv("PRIME_TOOL_CALL_LOG"))
+			if err != nil {
+				t.Fatalf("read call log: %v", err)
+			}
+			if strings.Contains(string(logData), "gt:mail check --inject") {
+				t.Fatalf("patrol role %s should not run startup mail check:\n%s", role, string(logData))
+			}
+			if strings.Contains(output, "MAIL OUTPUT") {
+				t.Fatalf("patrol role %s injected mail output: %q", role, output)
+			}
+		})
+	}
+}
+
 func TestCheckPendingEscalations_BoundsSlowBdList(t *testing.T) {
 	workDir := setupPrimeExternalToolTest(t, `
 case "$*" in
-  "list --status=open --tag=escalation --json") sleep 2; exit 0 ;;
+	  "list --status=open --tag=escalation --json --flat") sleep 2; exit 0 ;;
 esac
 `, `
 `)
@@ -159,7 +181,7 @@ esac
 		checkPendingEscalations(RoleContext{Role: RoleMayor, WorkDir: workDir})
 	})
 	assertElapsedUnder(t, time.Since(start), time.Second)
-	assertPrimeToolCalled(t, "bd:list --status=open --tag=escalation --json")
+	assertPrimeToolCalled(t, "bd:list --status=open --tag=escalation --json --flat")
 
 	if strings.Contains(output, "PENDING ESCALATIONS") {
 		t.Fatalf("timed-out escalation output should not be emitted: %q", output)

@@ -381,11 +381,11 @@ func resolveRigFromBead(townRoot, beadID string) string {
 }
 
 // getBeadStateForRedispatch returns the status and created_by of a bead in a
-// single bd show call. Returns ("", "") on failure.
+// single bd show call, routed through the town DB. Returns ("", "") on failure.
+// (fork keeps the created_by return its callers need; adopts upstream's
+// beads.Command read-only routing in place of a bare exec.Command.)
 func getBeadStateForRedispatch(townRoot, beadID string) (status, createdBy string) {
-	cmd := exec.Command("bd", "show", beadID, "--json")
-	cmd.Dir = townRoot
-	util.SetDetachedProcessGroup(cmd)
+	cmd := beads.Command(townRoot, townBeadsDir(townRoot), beads.ReadOnlyRouting, "show", beadID, "--json")
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -461,6 +461,7 @@ func slingBead(townRoot, beadID, rig, agent string) error {
 	}
 	cmd := exec.Command("gt", args...)
 	cmd.Dir = townRoot
+	cmd.Env = deaconMutationRoutingEnv(townRoot)
 	util.SetDetachedProcessGroup(cmd)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -492,6 +493,7 @@ Please investigate and either:
 
 	cmd := exec.Command("gt", "mail", "send", "mayor/", "-s", subject, "-m", body)
 	cmd.Dir = townRoot
+	cmd.Env = deaconMutationRoutingEnv(townRoot)
 	util.SetDetachedProcessGroup(cmd)
 	return cmd.Run()
 }

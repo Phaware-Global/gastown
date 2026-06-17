@@ -59,8 +59,8 @@ func setupHookTestTown(t *testing.T) (townRoot, polecatDir, rigPrefix string) {
 
 	// Create routes.jsonl
 	routes := []beads.Route{
-		{Prefix: "hq-", Path: "."},                             // Town-level beads
-		{Prefix: rigPrefix + "-", Path: "gastown/mayor/rig"},   // Gastown rig
+		{Prefix: "hq-", Path: "."},                           // Town-level beads
+		{Prefix: rigPrefix + "-", Path: "gastown/mayor/rig"}, // Gastown rig
 	}
 	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
 		t.Fatalf("write routes: %v", err)
@@ -85,6 +85,13 @@ func setupHookTestTown(t *testing.T) (townRoot, polecatDir, rigPrefix string) {
 	polecatDir = filepath.Join(townRoot, "gastown", "polecats", "toast")
 	if err := os.MkdirAll(polecatDir, 0755); err != nil {
 		t.Fatalf("mkdir polecats: %v", err)
+	}
+	gitDir := filepath.Join(polecatDir, ".git")
+	if err := os.MkdirAll(gitDir, 0755); err != nil {
+		t.Fatalf("mkdir polecat .git: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0644); err != nil {
+		t.Fatalf("write polecat .git HEAD: %v", err)
 	}
 
 	// Create redirect file for polecat -> mayor/rig/.beads

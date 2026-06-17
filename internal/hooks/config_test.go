@@ -700,8 +700,38 @@ func TestComputeExpectedWitnessRigSpecific(t *testing.T) {
 	if len(skyWitness.SessionStart) == 0 {
 		t.Error("sky/witness should inherit SessionStart from DefaultBase")
 	}
-	if len(skyWitness.UserPromptSubmit) == 0 {
-		t.Error("sky/witness should inherit UserPromptSubmit (mail-check) from DefaultBase")
+	if len(skyWitness.UserPromptSubmit) != 0 {
+		t.Error("sky/witness should disable UserPromptSubmit mail-check from DefaultBase")
+	}
+}
+
+func TestComputeExpectedPatrolRolesDisableUserPromptMailCheck(t *testing.T) {
+	tmpDir := t.TempDir()
+	setTestHome(t, tmpDir)
+
+	for _, target := range []string{"witness", "refinery", "deacon", "boot", "sky/witness", "sky/refinery"} {
+		t.Run(target, func(t *testing.T) {
+			cfg, err := ComputeExpected(target)
+			if err != nil {
+				t.Fatalf("ComputeExpected(%s): %v", target, err)
+			}
+			if len(cfg.UserPromptSubmit) != 0 {
+				t.Fatalf("%s should disable UserPromptSubmit mail-check, got %+v", target, cfg.UserPromptSubmit)
+			}
+		})
+	}
+}
+
+func TestComputeExpectedPolecatsKeepUserPromptMailCheck(t *testing.T) {
+	tmpDir := t.TempDir()
+	setTestHome(t, tmpDir)
+
+	cfg, err := ComputeExpected("polecats")
+	if err != nil {
+		t.Fatalf("ComputeExpected(polecats): %v", err)
+	}
+	if len(cfg.UserPromptSubmit) == 0 {
+		t.Fatal("polecats should retain UserPromptSubmit mail-check")
 	}
 }
 

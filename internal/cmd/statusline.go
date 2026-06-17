@@ -8,10 +8,8 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/estop"
-	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -115,49 +113,17 @@ func runStatusLine(cmd *cobra.Command, args []string) error {
 // runWorkerStatusLine outputs status for crew or polecat sessions.
 func runWorkerStatusLine(t *tmux.Tmux, session, rigName, polecat, crew, issue string) error {
 	// Determine agent type and identity
-	var icon, identity string
+	var icon string
 	if polecat != "" {
 		icon = AgentTypeIcons[AgentPolecat]
-		identity = fmt.Sprintf("%s/%s", rigName, polecat)
 	} else if crew != "" {
 		icon = AgentTypeIcons[AgentCrew]
-		identity = fmt.Sprintf("%s/crew/%s", rigName, crew)
-	}
-
-	// Get pane's working directory to find workspace
-	var townRoot string
-	if session != "" {
-		paneDir, err := t.GetPaneWorkDir(session)
-		if err == nil && paneDir != "" {
-			townRoot, _ = workspace.Find(paneDir)
-		}
 	}
 
 	// Build status parts
 	var parts []string
-
-	// Priority 1: Check for hooked work (use rig beads)
-	hookedWork := ""
-	if identity != "" && rigName != "" && townRoot != "" {
-		rigBeadsDir := filepath.Join(townRoot, rigName, "mayor", "rig")
-		hookedWork = getHookedWork(identity, 40, rigBeadsDir)
-	}
-
-	// Priority 2: Fall back to GT_ISSUE env var or in_progress beads
 	currentWork := issue
-	if currentWork == "" && hookedWork == "" && session != "" {
-		currentWork = getCurrentWork(t, session, identity, 40)
-	}
-
-	// Show hooked work (takes precedence)
-	if hookedWork != "" {
-		if icon != "" {
-			parts = append(parts, fmt.Sprintf("%s 🪝 %s", icon, hookedWork))
-		} else {
-			parts = append(parts, fmt.Sprintf("🪝 %s", hookedWork))
-		}
-	} else if currentWork != "" {
-		// Fall back to current work (in_progress)
+	if currentWork != "" {
 		if icon != "" {
 			parts = append(parts, fmt.Sprintf("%s %s", icon, currentWork))
 		} else {
@@ -165,18 +131,6 @@ func runWorkerStatusLine(t *tmux.Tmux, session, rigName, polecat, crew, issue st
 		}
 	} else if icon != "" {
 		parts = append(parts, icon)
-	}
-
-	// Mail preview - only show if hook is empty
-	if hookedWork == "" && identity != "" && townRoot != "" {
-		unread, subject := getMailPreviewWithRoot(identity, 45, townRoot)
-		if unread > 0 {
-			if subject != "" {
-				parts = append(parts, fmt.Sprintf("\U0001F4EC %s", subject))
-			} else {
-				parts = append(parts, fmt.Sprintf("\U0001F4EC %d", unread))
-			}
-		}
 	}
 
 	// Output
@@ -275,14 +229,10 @@ func runMayorStatusLine(t *tmux.Tmux) error {
 		}
 	}
 
-	// Get operational state for each rig
-	for rigName, status := range rigStatuses {
-		opState, _ := getRigOperationalState(townRoot, rigName)
-		if opState == "PARKED" || opState == "DOCKED" {
-			status.opState = opState
-		} else {
-			status.opState = "OPERATIONAL"
-		}
+	// Status-line is a tmux hot path. Do not query beads for dock/park state here;
+	// `gt rig list/status` remains the authoritative live status view.
+	for _, status := range rigStatuses {
+		status.opState = "OPERATIONAL"
 	}
 
 	// Build status
@@ -391,25 +341,6 @@ func runMayorStatusLine(t *tmux.Tmux) error {
 		parts = append(parts, strings.Join(rigParts, " "))
 	}
 
-	// Priority 1: Check for hooked work (town beads for mayor)
-	hookedWork := ""
-	if townRoot != "" {
-		hookedWork = getHookedWork("mayor", 40, townRoot)
-	}
-	if hookedWork != "" {
-		parts = append(parts, fmt.Sprintf("🪝 %s", hookedWork))
-	} else if townRoot != "" {
-		// Priority 2: Fall back to mail preview
-		unread, subject := getMailPreviewWithRoot("mayor/", 45, townRoot)
-		if unread > 0 {
-			if subject != "" {
-				parts = append(parts, fmt.Sprintf("\U0001F4EC %s", subject))
-			} else {
-				parts = append(parts, fmt.Sprintf("\U0001F4EC %d", unread))
-			}
-		}
-	}
-
 	fmt.Print(strings.Join(parts, " | ") + " |")
 	return nil
 }
@@ -423,7 +354,7 @@ func runDeaconStatusLine(t *tmux.Tmux) error {
 		return nil // Silent fail
 	}
 
-	// Get town root from deacon pane's working directory
+	// Get town root from deacon pane's working directory. Config files only; no beads.
 	var townRoot string
 	deaconSession := getDeaconSessionName()
 	paneDir, err := t.GetPaneWorkDir(deaconSession)
@@ -460,25 +391,6 @@ func runDeaconStatusLine(t *tmux.Tmux) error {
 	var parts []string
 	parts = append(parts, fmt.Sprintf("%d rigs", rigCount))
 
-	// Priority 1: Check for hooked work (town beads for deacon)
-	hookedWork := ""
-	if townRoot != "" {
-		hookedWork = getHookedWork("deacon", 35, townRoot)
-	}
-	if hookedWork != "" {
-		parts = append(parts, fmt.Sprintf("🪝 %s", hookedWork))
-	} else if townRoot != "" {
-		// Priority 2: Fall back to mail preview
-		unread, subject := getMailPreviewWithRoot("deacon/", 40, townRoot)
-		if unread > 0 {
-			if subject != "" {
-				parts = append(parts, fmt.Sprintf("\U0001F4EC %s", subject))
-			} else {
-				parts = append(parts, fmt.Sprintf("\U0001F4EC %d", unread))
-			}
-		}
-	}
-
 	fmt.Print(strings.Join(parts, " | ") + " |")
 	return nil
 }
@@ -492,14 +404,6 @@ func runWitnessStatusLine(t *tmux.Tmux, rigName string) error {
 		if identity, err := session.ParseSessionName(statusLineSession); err == nil && identity.Role == session.RoleWitness {
 			rigName = identity.Rig
 		}
-	}
-
-	// Get town root from witness pane's working directory
-	var townRoot string
-	sessionName := session.WitnessSessionName(session.PrefixFor(rigName))
-	paneDir, err := t.GetPaneWorkDir(sessionName)
-	if err == nil && paneDir != "" {
-		townRoot, _ = workspace.Find(paneDir)
 	}
 
 	// Count crew in this rig (crew are persistent, worth tracking)
@@ -519,32 +423,13 @@ func runWitnessStatusLine(t *tmux.Tmux, rigName string) error {
 		}
 	}
 
-	identity := fmt.Sprintf("%s/witness", rigName)
-
 	// Build status
 	var parts []string
 	if crewCount > 0 {
 		parts = append(parts, fmt.Sprintf("%d crew", crewCount))
 	}
-
-	// Priority 1: Check for hooked work (rig beads for witness)
-	hookedWork := ""
-	if townRoot != "" && rigName != "" {
-		rigBeadsDir := filepath.Join(townRoot, rigName, "mayor", "rig")
-		hookedWork = getHookedWork(identity, 30, rigBeadsDir)
-	}
-	if hookedWork != "" {
-		parts = append(parts, fmt.Sprintf("🪝 %s", hookedWork))
-	} else if townRoot != "" {
-		// Priority 2: Fall back to mail preview
-		unread, subject := getMailPreviewWithRoot(identity, 35, townRoot)
-		if unread > 0 {
-			if subject != "" {
-				parts = append(parts, fmt.Sprintf("\U0001F4EC %s", subject))
-			} else {
-				parts = append(parts, fmt.Sprintf("\U0001F4EC %d", unread))
-			}
-		}
+	if len(parts) == 0 {
+		parts = append(parts, "patrol")
 	}
 
 	fmt.Print(strings.Join(parts, " | ") + " |")
@@ -566,78 +451,7 @@ func runRefineryStatusLine(t *tmux.Tmux, rigName string) error {
 		return nil
 	}
 
-	// Get town root from refinery pane's working directory
-	var townRoot string
-	sessionName := session.RefinerySessionName(session.PrefixFor(rigName))
-	paneDir, err := t.GetPaneWorkDir(sessionName)
-	if err == nil && paneDir != "" {
-		townRoot, _ = workspace.Find(paneDir)
-	}
-
-	// Get refinery manager using shared helper
-	mgr, _, _, err := getRefineryManager(rigName)
-	if err != nil {
-		// Fallback to simple status if we can't access refinery
-		fmt.Printf("%s MQ: ? |", AgentTypeIcons[AgentRefinery])
-		return nil
-	}
-
-	// Get queue
-	queue, err := mgr.Queue()
-	if err != nil {
-		// Fallback to simple status if we can't read queue
-		fmt.Printf("%s MQ: ? |", AgentTypeIcons[AgentRefinery])
-		return nil
-	}
-
-	// Count pending items and find current item
-	pending := 0
-	var currentItem string
-	for _, item := range queue {
-		if item.Position == 0 && item.MR != nil {
-			// Currently processing - show issue ID
-			currentItem = item.MR.IssueID
-		} else {
-			pending++
-		}
-	}
-
-	identity := fmt.Sprintf("%s/refinery", rigName)
-
-	// Build status
-	var parts []string
-	if currentItem != "" {
-		parts = append(parts, fmt.Sprintf("merging %s", currentItem))
-		if pending > 0 {
-			parts = append(parts, fmt.Sprintf("+%d queued", pending))
-		}
-	} else if pending > 0 {
-		parts = append(parts, fmt.Sprintf("%d queued", pending))
-	} else {
-		parts = append(parts, "idle")
-	}
-
-	// Priority 1: Check for hooked work (rig beads for refinery)
-	hookedWork := ""
-	if townRoot != "" && rigName != "" {
-		rigBeadsDir := filepath.Join(townRoot, rigName, "mayor", "rig")
-		hookedWork = getHookedWork(identity, 25, rigBeadsDir)
-	}
-	if hookedWork != "" {
-		parts = append(parts, fmt.Sprintf("🪝 %s", hookedWork))
-	} else if townRoot != "" {
-		// Priority 2: Fall back to mail preview
-		unread, subject := getMailPreviewWithRoot(identity, 30, townRoot)
-		if unread > 0 {
-			if subject != "" {
-				parts = append(parts, fmt.Sprintf("\U0001F4EC %s", subject))
-			} else {
-				parts = append(parts, fmt.Sprintf("\U0001F4EC %d", unread))
-			}
-		}
-	}
-
-	fmt.Print(strings.Join(parts, " | ") + " |")
+	fmt.Print("idle |")
 	return nil
 }
 
@@ -660,95 +474,4 @@ func isSessionWorking(t *tmux.Tmux, session string) bool {
 	}
 
 	return false
-}
-
-// getMailPreviewWithRoot returns unread count and a truncated subject of the first unread message,
-// using an explicit town root.
-func getMailPreviewWithRoot(identity string, maxLen int, townRoot string) (int, string) {
-	// Use NewMailboxFromAddress to normalize identity (e.g., gastown/crew/gus -> gastown/gus)
-	mailbox := mail.NewMailboxFromAddress(identity, townRoot)
-
-	// Get unread messages
-	messages, err := mailbox.ListUnread()
-	if err != nil || len(messages) == 0 {
-		return 0, ""
-	}
-
-	// Get first message subject, truncated
-	subject := messages[0].Subject
-	if len(subject) > maxLen {
-		subject = subject[:maxLen-1] + "…"
-	}
-
-	return len(messages), subject
-}
-
-// getHookedWork returns a truncated title of the hooked bead for an agent.
-// Returns empty string if nothing is hooked.
-// beadsDir should be the directory containing .beads (for rig-level) or
-// empty to use the town root (for town-level roles).
-func getHookedWork(identity string, maxLen int, beadsDir string) string {
-	// If no beadsDir specified, use town root
-	if beadsDir == "" {
-		var err error
-		beadsDir, err = findMailWorkDir()
-		if err != nil {
-			return ""
-		}
-	}
-
-	b := beads.New(beadsDir)
-
-	// Query for hooked beads assigned to this agent
-	hookedBeads, err := b.List(beads.ListOptions{
-		Status:   beads.StatusHooked,
-		Assignee: identity,
-		Priority: -1,
-	})
-	if err != nil || len(hookedBeads) == 0 {
-		return ""
-	}
-
-	// Return first hooked bead's ID and title, truncated
-	bead := hookedBeads[0]
-	display := fmt.Sprintf("%s: %s", bead.ID, bead.Title)
-	if len(display) > maxLen {
-		display = display[:maxLen-1] + "…"
-	}
-	return display
-}
-
-// getCurrentWork returns a truncated title of the first in_progress issue assigned to identity.
-// Uses the pane's working directory to find the beads.
-func getCurrentWork(t *tmux.Tmux, session string, identity string, maxLen int) string {
-	// Get the pane's working directory
-	workDir, err := t.GetPaneWorkDir(session)
-	if err != nil || workDir == "" {
-		return ""
-	}
-
-	// Check if there's a .beads directory
-	beadsDir := filepath.Join(workDir, ".beads")
-	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
-		return ""
-	}
-
-	// Query beads for in_progress issues assigned to this agent
-	b := beads.New(workDir)
-	issues, err := b.List(beads.ListOptions{
-		Status:   "in_progress",
-		Assignee: identity,
-		Priority: -1,
-	})
-	if err != nil || len(issues) == 0 {
-		return ""
-	}
-
-	// Return first issue's ID and title, truncated
-	issue := issues[0]
-	display := fmt.Sprintf("%s: %s", issue.ID, issue.Title)
-	if len(display) > maxLen {
-		display = display[:maxLen-1] + "…"
-	}
-	return display
 }

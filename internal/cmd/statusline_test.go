@@ -1,6 +1,10 @@
 package cmd
 
 import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/session"
@@ -8,87 +12,58 @@ import (
 
 func setupCmdTestRegistry(t *testing.T) {
 	t.Helper()
-	reg := session.NewPrefixRegistry()
-	reg.Register("gt", "gastown")
-	reg.Register("mr", "myrig")
+	registry := session.NewPrefixRegistry()
+	registry.Register("gt", "gastown")
+	registry.Register("do", "coder_dotfiles")
 	old := session.DefaultRegistry()
-	session.SetDefaultRegistry(reg)
+	session.SetDefaultRegistry(registry)
 	t.Cleanup(func() { session.SetDefaultRegistry(old) })
 }
 
-func TestCategorizeSessionRig(t *testing.T) {
-	setupCmdTestRegistry(t)
-	tests := []struct {
-		session string
-		wantRig string
-	}{
-		// Standard polecat sessions (prefix-based)
-		{"gt-slit", "gastown"},
-		{"gt-Toast", "gastown"},
-		{"mr-worker", "myrig"},
-
-		// Crew sessions
-		{"gt-crew-max", "gastown"},
-		{"mr-crew-user", "myrig"},
-
-		// Witness sessions
-		{"gt-witness", "gastown"},
-		{"mr-witness", "myrig"},
-
-		// Refinery sessions
-		{"gt-refinery", "gastown"},
-		{"mr-refinery", "myrig"},
-
-		// Town-level agents (no rig, use hq- prefix)
-		{"hq-mayor", ""},
-		{"hq-deacon", ""},
+func TestStatusLineAvoidsBeadsHotPath(t *testing.T) {
+	if !beadsExemptCommands["status-line"] {
+		t.Fatal("status-line must be exempt from bd version checks")
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.session, func(t *testing.T) {
-			agent := categorizeSession(tt.session)
-			gotRig := ""
-			if agent != nil {
-				gotRig = agent.Rig
-			}
-			if gotRig != tt.wantRig {
-				t.Errorf("categorizeSession(%q).Rig = %q, want %q", tt.session, gotRig, tt.wantRig)
-			}
-		})
+	if !branchCheckExemptCommands["status-line"] {
+		t.Fatal("status-line must be exempt from git branch/stale checks")
+	}
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(file), "statusline.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	for _, forbidden := range []string{
+		`internal/beads`,
+		`internal/mail`,
+		`beads.New`,
+		`mail.New`,
+		`getHookedWork`,
+		`getMailPreview`,
+		`ListUnread`,
+		`getRefineryManager`,
+		`.Queue()`,
+	} {
+		if strings.Contains(source, forbidden) {
+			t.Fatalf("status-line hot path must not contain %q", forbidden)
+		}
 	}
 }
 
-func TestCategorizeSessionType(t *testing.T) {
-	setupCmdTestRegistry(t)
-	tests := []struct {
-		session  string
-		wantType AgentType
-	}{
-		// Polecat sessions
-		{"gt-slit", AgentPolecat},
-		{"gt-Toast", AgentPolecat},
-		{"mr-worker", AgentPolecat},
-
-		// Non-polecat sessions
-		{"gt-witness", AgentWitness},
-		{"gt-refinery", AgentRefinery},
-		{"gt-crew-max", AgentCrew},
-		{"mr-crew-user", AgentCrew},
-
-		// Town-level agents (hq- prefix)
-		{"hq-mayor", AgentMayor},
-		{"hq-deacon", AgentDeacon},
+func TestSchedulerRunAvoidsRootBeadsChecks(t *testing.T) {
+	if !beadsExemptCommands["scheduler"] {
+		t.Fatal("scheduler must be exempt from root bd version checks")
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.session, func(t *testing.T) {
-			agent := categorizeSession(tt.session)
-			if agent == nil {
-				t.Fatalf("categorizeSession(%q) returned nil", tt.session)
-			}
-			if agent.Type != tt.wantType {
-				t.Errorf("categorizeSession(%q).Type = %v, want %v", tt.session, agent.Type, tt.wantType)
-			}
-		})
+	if !branchCheckExemptCommands["scheduler"] {
+		t.Fatal("scheduler must be exempt from root git branch checks")
+	}
+	if !isCommandOrAncestorExempt(schedulerRunCmd, beadsExemptCommands) {
+		t.Fatal("scheduler run must inherit bd exemption from scheduler parent")
+	}
+	if !isCommandOrAncestorExempt(schedulerRunCmd, branchCheckExemptCommands) {
+		t.Fatal("scheduler run must inherit branch-check exemption from scheduler parent")
 	}
 }

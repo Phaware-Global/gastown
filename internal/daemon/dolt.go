@@ -836,6 +836,22 @@ func writeDaemonDoltConfig(cfg *DoltServerConfig, configPath string) error {
 	if cfg.Host != "" {
 		hostLine = fmt.Sprintf("\n  host: %s", cfg.Host)
 	}
+	eventSchedulerLine := "  event_scheduler: \"OFF\"\n"
+	if scheduler, ok := os.LookupEnv("GT_DOLT_EVENT_SCHEDULER"); ok {
+		if strings.EqualFold(scheduler, "omit") {
+			eventSchedulerLine = ""
+		} else if strings.TrimSpace(scheduler) != "" {
+			eventSchedulerLine = fmt.Sprintf("  event_scheduler: %q\n", strings.ToUpper(strings.TrimSpace(scheduler)))
+		}
+	}
+	systemVariablesBlock := "\nsystem_variables:\n  dolt_stats_enabled: 0\n"
+	if stats, ok := os.LookupEnv("GT_DOLT_STATS_ENABLED"); ok {
+		if strings.EqualFold(stats, "omit") {
+			systemVariablesBlock = ""
+		} else if strings.TrimSpace(stats) != "" {
+			systemVariablesBlock = fmt.Sprintf("\nsystem_variables:\n  dolt_stats_enabled: %s\n", strings.TrimSpace(stats))
+		}
+	}
 	content := fmt.Sprintf(`# Dolt SQL server configuration — managed by Gas Town daemon
 # Do not edit manually; overwritten on each daemon-managed server start.
 
@@ -851,13 +867,15 @@ data_dir: %q
 
 behavior:
   dolt_transaction_commit: false
-  auto_gc_behavior:
+%s  auto_gc_behavior:
     enable: false
     archive_level: 0
-`,
+%s`,
 		cfg.Port,
 		hostLine,
 		cfg.DataDir,
+		eventSchedulerLine,
+		systemVariablesBlock,
 	)
 	return os.WriteFile(configPath, []byte(content), 0600)
 }

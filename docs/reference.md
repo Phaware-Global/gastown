@@ -6,13 +6,14 @@ Technical reference for Gas Town internals. Read the README first.
 
 ## Beads Routing
 
-Gas Town routes beads commands based on issue ID prefix. You don't need to think
-about which database to use - just use the issue ID.
+Gas Town `gt` commands route beads work based on issue ID prefix. For direct
+`bd` commands, run from the owning repository/root so the active `.beads`
+directory matches the database you intend to touch.
 
 ```bash
-bd show gp-xyz    # Routes to greenplace rig's beads
-bd show hq-abc    # Routes to town-level beads
-bd show wyv-123   # Routes to wyvern rig's beads
+bd -C ~/gt/greenplace/mayor/rig show gp-xyz  # Greenplace rig beads
+bd -C ~/gt show hq-abc                       # Town-level beads
+bd -C ~/gt/wyvern/mayor/rig show wyv-123     # Wyvern rig beads
 ```
 
 **How it works**: Routes are defined in `~/gt/.beads/routes.jsonl`. Each rig's
@@ -24,7 +25,11 @@ prefix maps to its beads location (the mayor's clone in that rig).
 | `gp-*` | `~/gt/greenplace/mayor/rig/.beads/` | Greenplace project issues |
 | `wyv-*` | `~/gt/wyvern/mayor/rig/.beads/` | Wyvern project issues |
 
-Debug routing: `BD_DEBUG_ROUTING=1 bd show <id>`
+Debug routing: `BD_DEBUG_ROUTING=1 bd -C <owning-root> show <id>`
+
+`bd --global` is not Gas Town's town database. In Beads it targets a separate
+shared-server database named `beads_global`; run `bd -C ~/gt ...` for
+town-level Gas Town beads.
 
 ## Configuration
 

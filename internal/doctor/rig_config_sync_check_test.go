@@ -164,6 +164,83 @@ func TestRigConfigSyncCheck_AllConfigsPresent(t *testing.T) {
 	}
 }
 
+func TestRigConfigSyncCheck_FixDisablesRigAutoExport(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake bd stub is shell-specific")
+	}
+
+	tmpDir := t.TempDir()
+	mayorDir := filepath.Join(tmpDir, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	rigsJSON := `{
+		"version": 1,
+		"rigs": {
+			"testrig": {
+				"git_url": "https://github.com/test/test.git",
+				"beads": {"prefix": "tr"}
+			}
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	rigDir := filepath.Join(tmpDir, "testrig")
+	beadsDir := filepath.Join(rigDir, "mayor", "rig", ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	configJSON := `{
+		"type": "rig",
+		"version": 1,
+		"name": "testrig",
+		"git_url": "https://github.com/test/test.git",
+		"beads": {"prefix": "tr"}
+	}`
+	if err := os.WriteFile(filepath.Join(rigDir, "config.json"), []byte(configJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("prefix: tr\nissue-prefix: tr\nexport.auto: true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"dolt_mode":"embedded"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte("#!/usr/bin/env bash\nif [ \"$1\" = show ]; then echo \"[{\\\"id\\\":\\\"$2\\\"}]\"; fi\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx := &CheckContext{TownRoot: tmpDir}
+	check := NewRigConfigSyncCheck()
+	result := check.Run(ctx)
+	if result.Status != StatusWarning {
+		t.Fatalf("expected StatusWarning, got %v: %s", result.Status, result.Message)
+	}
+	if len(check.missingExportCfg) != 1 || check.missingExportCfg[0] != "testrig" {
+		t.Fatalf("missingExportCfg = %#v, want [testrig]", check.missingExportCfg)
+	}
+
+	if err := check.Fix(ctx); err != nil {
+		t.Fatalf("Fix failed: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(beadsDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config.yaml: %v", err)
+	}
+	if !strings.Contains(string(data), "export.auto: \"false\"\n") {
+		t.Fatalf("config.yaml did not disable export.auto:\n%s", string(data))
+	}
+	result = check.Run(ctx)
+	if result.Status != StatusOK {
+		t.Fatalf("Status after fix = %v, want %v: %s", result.Status, StatusOK, result.Message)
+	}
+}
+
 func TestRigConfigSyncCheck_FixCreatesMissingMetadata(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake bd stub is shell-specific")
@@ -439,6 +516,104 @@ exit 0
 	}
 	if strings.Contains(cmds, "wrong_db") || strings.Contains(cmds, "wrong.db") || strings.Contains(cmds, filepath.Join(tmpDir, "wrong", ".beads")) {
 		t.Fatalf("stale BEADS env leaked into bd subprocess; log:\n%s", cmds)
+	}
+}
+
+// TestRigConfigSyncCheck_PrefixNamedDoltDBNoMismatch reproduces gt-5hd2: a rig
+// whose Dolt data physically lives in a PREFIX-named directory (.dolt-data/bd)
+// rather than a rig-name directory (.dolt-data/beads) must NOT be reported as a
+// "DB name mismatch", and --fix must NOT revert its metadata.json back to the
+// non-existent rig-name database.
+func TestRigConfigSyncCheck_PrefixNamedDoltDBNoMismatch(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake dolt stub is shell-specific")
+	}
+
+	tmpDir := t.TempDir()
+	mayorDir := filepath.Join(tmpDir, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Rig "beads" with prefix "bd"; its DB lives at .dolt-data/bd.
+	rigsJSON := `{
+		"version": 1,
+		"rigs": {
+			"beads": {
+				"git_url": "https://github.com/test/beads.git",
+				"beads": {"prefix": "bd"}
+			}
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), []byte(rigsJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Physical Dolt data lives under the prefix name, not the rig name. Lay down
+	// the minimal valid-database layout (.dolt/noms/manifest) so ListDatabases'
+	// local filesystem scan recognizes it.
+	bdManifestDir := filepath.Join(tmpDir, ".dolt-data", "bd", ".dolt", "noms")
+	if err := os.MkdirAll(bdManifestDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bdManifestDir, "manifest"), []byte("0"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	rigDir := filepath.Join(tmpDir, "beads")
+	beadsDir := filepath.Join(rigDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	configJSON := `{
+		"type": "rig",
+		"version": 1,
+		"name": "beads",
+		"git_url": "https://github.com/test/beads.git",
+		"beads": {"prefix": "bd"}
+	}`
+	if err := os.WriteFile(filepath.Join(rigDir, "config.json"), []byte(configJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("prefix: bd\nissue-prefix: bd\nexport.auto: \"false\"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// metadata points at the real prefix-named DB "bd".
+	metadata := `{"backend":"dolt","database":"dolt","dolt_mode":"server","dolt_database":"bd"}`
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	if err := os.WriteFile(metadataPath, []byte(metadata), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fake bd so the identity-bead lookup succeeds.
+	binDir := t.TempDir()
+	bdScript := "#!/usr/bin/env bash\nif [ \"$1\" = show ]; then echo \"[{\\\"id\\\":\\\"$2\\\"}]\"; fi\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx := &CheckContext{TownRoot: tmpDir}
+	check := NewRigConfigSyncCheck()
+	check.Run(ctx)
+
+	// Core regression assertion: no false DB name mismatch for the prefix-named DB.
+	if len(check.dbNameMismatches) != 0 {
+		t.Fatalf("dbNameMismatches = %#v, want none for prefix-named DB", check.dbNameMismatches)
+	}
+	if len(check.missingDoltDB) != 0 {
+		t.Fatalf("missingDoltDB = %#v, want none", check.missingDoltDB)
+	}
+
+	// Fix must not revert metadata.json back to the rig-name DB.
+	if err := check.Fix(ctx); err != nil {
+		t.Fatalf("Fix failed: %v", err)
+	}
+	after, err := os.ReadFile(metadataPath)
+	if err != nil {
+		t.Fatalf("read metadata.json: %v", err)
+	}
+	if !strings.Contains(string(after), `"dolt_database":"bd"`) {
+		t.Fatalf("Fix reverted metadata away from prefix-named DB: %s", string(after))
 	}
 }
 

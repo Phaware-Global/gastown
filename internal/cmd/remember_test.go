@@ -258,3 +258,40 @@ func TestMemTypeRank(t *testing.T) {
 		t.Error("unknown type should rank after general")
 	}
 }
+
+func TestParseBdKvListJSON(t *testing.T) {
+	got, err := parseBdKvListJSON([]byte(`{
+		"memory.project.note":"keep me",
+		"memory.project.empty":"",
+		"schema_version":1,
+		"enabled":true,
+		"tags":["one"],
+		"config":{"nested":"value"},
+		"memory.project.null":null
+	}`))
+	if err != nil {
+		t.Fatalf("parseBdKvListJSON() error = %v", err)
+	}
+
+	want := map[string]string{
+		"memory.project.note":  "keep me",
+		"memory.project.empty": "",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("parseBdKvListJSON() returned %d entries, want %d: %#v", len(got), len(want), got)
+	}
+	for k, wantValue := range want {
+		if got[k] != wantValue {
+			t.Errorf("parseBdKvListJSON()[%q] = %q, want %q", k, got[k], wantValue)
+		}
+	}
+	if _, ok := got["memory.project.null"]; ok {
+		t.Error("parseBdKvListJSON() kept null memory value")
+	}
+}
+
+func TestParseBdKvListJSONMalformed(t *testing.T) {
+	if _, err := parseBdKvListJSON([]byte(`{"memory.project.note":`)); err == nil {
+		t.Fatal("parseBdKvListJSON() error = nil, want malformed JSON error")
+	}
+}

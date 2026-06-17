@@ -214,6 +214,40 @@ unset GT_INTEGRATION_LAND 2>/dev/null || true
 assert_block "FF integration merge blocked" run_hook "refs/heads/$DEFAULT_BRANCH" "$local_sha" "refs/heads/$DEFAULT_BRANCH" "$remote_sha"
 cleanup
 
+# Test 11: Off-branch push — HEAD on a session branch, pushing the default branch
+# (the classic `git push origin main` from a feature branch). HEAD mismatch — BLOCKED.
+echo "Test 11: Off-branch push (HEAD on session branch, pushing default)"
+setup_repos
+cd "$TMPDIR/local"
+git checkout -b session/x >/dev/null 2>&1
+echo "session work" >> file.txt
+git add file.txt && git commit -m "session work" >/dev/null 2>&1
+default_sha=$(get_sha "$DEFAULT_BRANCH")
+unset GT_ALLOW_OFFBRANCH_PUSH 2>/dev/null || true
+assert_block "Off-branch default push blocked (HEAD mismatch)" run_hook "refs/heads/$DEFAULT_BRANCH" "$default_sha" "refs/heads/$DEFAULT_BRANCH" "$default_sha"
+cleanup
+
+# Test 12: Off-branch push with GT_ALLOW_OFFBRANCH_PUSH=1 — ALLOWED (override).
+echo "Test 12: Off-branch push with GT_ALLOW_OFFBRANCH_PUSH=1"
+setup_repos
+cd "$TMPDIR/local"
+git checkout -b session/y >/dev/null 2>&1
+echo "session work" >> file.txt
+git add file.txt && git commit -m "session work" >/dev/null 2>&1
+default_sha=$(get_sha "$DEFAULT_BRANCH")
+GT_ALLOW_OFFBRANCH_PUSH=1 assert_pass "Off-branch push allowed with override" run_hook "refs/heads/$DEFAULT_BRANCH" "$default_sha" "refs/heads/$DEFAULT_BRANCH" "$default_sha"
+cleanup
+
+# Test 13: Off-branch deletion push (zero local sha) — not a HEAD mismatch, ALLOWED.
+echo "Test 13: Off-branch deletion push (zero local sha)"
+setup_repos
+cd "$TMPDIR/local"
+git checkout -b session/z >/dev/null 2>&1
+default_sha=$(get_sha "$DEFAULT_BRANCH")
+unset GT_ALLOW_OFFBRANCH_PUSH 2>/dev/null || true
+assert_pass "Off-branch deletion not blocked by HEAD guard" run_hook "refs/heads/$DEFAULT_BRANCH" "0000000000000000000000000000000000000000" "refs/heads/$DEFAULT_BRANCH" "$default_sha"
+cleanup
+
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 if [[ $FAIL -gt 0 ]]; then

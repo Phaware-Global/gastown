@@ -14,7 +14,8 @@
 
 export default function (pi) {
   const role = (process.env.GT_ROLE || "").toLowerCase();
-  const autonomousRoles = new Set(["polecat", "witness", "refinery", "deacon"]);
+  const shouldCheckMail = () =>
+    !role.includes("witness") && !role.includes("refinery") && !role.startsWith("deacon") && !role.includes("boot");
   let primeContext = null;
   let contextInjected = false;
   let lastMailCheck = 0;
@@ -33,31 +34,14 @@ export default function (pi) {
       console.error("[gastown] gt prime failed:", e.message);
     }
 
-    // Check mail at session start for autonomous roles.
-    if (autonomousRoles.has(role)) {
-      try {
-        const mailResult = await pi.exec("gt", ["mail", "check", "--inject"]);
-        if (mailResult.code === 0 && mailResult.stdout?.trim()) {
-          if (primeContext) {
-            primeContext += "\n\n" + mailResult.stdout.trim();
-          } else {
-            primeContext = mailResult.stdout.trim();
-          }
-          console.error("[gastown] mail context appended");
-        }
-        lastMailCheck = Date.now();
-      } catch (e) {
-        console.error("[gastown] gt mail check failed:", e.message);
-      }
-    }
   });
 
   // BeforeAgentStart — inject prime context + check mail every prompt.
   pi.on("before_agent_start", async (event, ctx) => {
     let mailContext = null;
 
-    // Check mail on every prompt (throttled to once per 30s) for autonomous roles.
-    if (autonomousRoles.has(role)) {
+    // Check mail on every prompt (throttled to once per 30s) for non-patrol roles.
+    if (shouldCheckMail()) {
       const now = Date.now();
       if (now - lastMailCheck >= 30000) {
         lastMailCheck = now;

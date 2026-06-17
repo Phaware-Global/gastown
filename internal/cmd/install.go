@@ -518,8 +518,13 @@ func canReuseInstallDoltServer(townRoot string, port int) bool {
 	defer cancel()
 
 	probeTimeout := installDoltServerProbeTimeout.String()
-	dsn := fmt.Sprintf("root:@tcp(127.0.0.1:%d)/?timeout=%s&readTimeout=%s&writeTimeout=%s",
-		port, probeTimeout, probeTimeout, probeTimeout)
+	// wa-d6f: socket-first probe DSN (TCP fallback) — even the install
+	// pre-flight should avoid TIME_WAIT churn when the server is up.
+	dsn := buildDoltDSN("root", port, "", dsnOpts{
+		Timeout:      probeTimeout,
+		ReadTimeout:  probeTimeout,
+		WriteTimeout: probeTimeout,
+	})
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return false
@@ -675,7 +680,8 @@ func initTownBeads(townPath string) error {
 	// The server may have just been started by gt install and TCP reachability
 	// alone is not sufficient; we need MySQL protocol readiness.
 	cfg := doltserver.DefaultConfig(townPath)
-	dsn := fmt.Sprintf("%s@tcp(%s)/", cfg.User, cfg.HostPort())
+	// wa-d6f: socket-first DSN (TCP fallback) — same rationale.
+	dsn := buildDoltDSNFromConfig(cfg, "", dsnOpts{})
 	var lastErr error
 	for attempt := 0; attempt < 20; attempt++ {
 		db, err := sql.Open("mysql", dsn)

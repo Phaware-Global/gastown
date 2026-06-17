@@ -330,6 +330,165 @@ func TestRunCommand(t *testing.T) {
 	})
 }
 
+func TestHandleExec_BDCreateRepoAliasPinsCanonicalBeadsDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake bd uses POSIX sh")
+	}
+
+	townRoot := t.TempDir()
+	townBeads := filepath.Join(townRoot, ".beads")
+	rigRoot := filepath.Join(townRoot, "gastown")
+	canonicalRig := filepath.Join(rigRoot, "mayor", "rig")
+	canonicalBeads := filepath.Join(canonicalRig, ".beads")
+	decoyBeads := filepath.Join(rigRoot, ".beads")
+	require.NoError(t, os.MkdirAll(canonicalBeads, 0755))
+	require.NoError(t, os.MkdirAll(decoyBeads, 0755))
+	require.NoError(t, os.MkdirAll(townBeads, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(townBeads, "routes.jsonl"), []byte(
+		`{"prefix":"hq-","path":"."}`+"\n"+
+			`{"prefix":"gt-","path":"gastown/mayor/rig"}`+"\n"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(townBeads, "metadata.json"), []byte(`{"dolt_database":"hq"}`), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(canonicalBeads, "metadata.json"), []byte(`{"dolt_database":"gastown"}`), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(decoyBeads, "metadata.json"), []byte(`{"dolt_database":"hq"}`), 0644))
+
+	scriptDir := t.TempDir()
+	scriptPath := filepath.Join(scriptDir, "bd")
+	require.NoError(t, os.WriteFile(scriptPath, []byte("#!/bin/sh\nfor arg in \"$@\"; do printf '[%s]' \"$arg\"; done\nprintf '\\nBEADS_DIR=%s\\nBEADS_DOLT_SERVER_DATABASE=%s\\nBEADS_DOLT_DATA_DIR=%s\\nBD_DOLT_AUTO_COMMIT=%s\\nBD_NO_GIT_OPS=%s\\n' \"${BEADS_DIR:-}\" \"${BEADS_DOLT_SERVER_DATABASE:-}\" \"${BEADS_DOLT_DATA_DIR:-}\" \"${BD_DOLT_AUTO_COMMIT:-}\" \"${BD_NO_GIT_OPS:-}\"\n"), 0755))
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "stale")
+	t.Setenv("BEADS_DIR", "/wrong")
+
+	srv, err := New(Config{
+		TownRoot:        townRoot,
+		AllowedCommands: []string{"bd"},
+		AllowedSubcommands: map[string][]string{
+			"bd": {"create"},
+		},
+		Logger: discardLogger(),
+	}, nil)
+	require.NoError(t, err)
+
+	run := func(body string) execResponse {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/v1/exec", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		srv.handleExec(rec, req)
+		require.Equal(t, http.StatusOK, rec.Code)
+		var resp execResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		require.Equal(t, 0, resp.ExitCode, resp.Stderr)
+		return resp
+	}
+	runStatus := func(body string) (int, string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/v1/exec", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		srv.handleExec(rec, req)
+		return rec.Code, rec.Body.String()
+	}
+
+	t.Run("space form rig alias", func(t *testing.T) {
+		resp := run(`{"argv":["bd","create","--repo","gastown","--title","x"]}`)
+		assert.Contains(t, resp.Stdout, "[create][--title][x]")
+		assert.NotContains(t, resp.Stdout, "[--repo]")
+		assert.NotContains(t, resp.Stdout, "[gastown]")
+		assert.Contains(t, resp.Stdout, "BEADS_DIR="+canonicalBeads)
+		assert.Contains(t, resp.Stdout, "BEADS_DOLT_SERVER_DATABASE=gastown\n")
+		assert.Contains(t, resp.Stdout, "BD_DOLT_AUTO_COMMIT=on")
+		assert.Contains(t, resp.Stdout, "BD_NO_GIT_OPS=true")
+		assert.NotContains(t, resp.Stdout, "BEADS_DIR="+decoyBeads)
+	})
+
+	t.Run("bd global flag before create", func(t *testing.T) {
+		resp := run(`{"argv":["bd","--allow-stale","create","--repo","gastown","--title","x"]}`)
+		assert.Contains(t, resp.Stdout, "[--allow-stale][create][--title][x]")
+		assert.NotContains(t, resp.Stdout, "[--repo]")
+		assert.Contains(t, resp.Stdout, "BEADS_DIR="+canonicalBeads)
+	})
+
+	t.Run("equals form rig alias", func(t *testing.T) {
+		resp := run(`{"argv":["bd","create","--repo=gastown","--title","x"]}`)
+		assert.Contains(t, resp.Stdout, "[create][--title][x]")
+		assert.NotContains(t, resp.Stdout, "--repo=gastown")
+		assert.NotContains(t, resp.Stdout, "[gastown]")
+		assert.Contains(t, resp.Stdout, "BEADS_DIR="+canonicalBeads)
+		assert.Contains(t, resp.Stdout, "BEADS_DOLT_SERVER_DATABASE=gastown\n")
+		assert.Contains(t, resp.Stdout, "BD_DOLT_AUTO_COMMIT=on")
+	})
+
+	t.Run("hq alias", func(t *testing.T) {
+		resp := run(`{"argv":["bd","create","--repo","hq","--title","x"]}`)
+		assert.Contains(t, resp.Stdout, "[create][--title][x]")
+		assert.NotContains(t, resp.Stdout, "[--repo]")
+		assert.NotContains(t, resp.Stdout, "[hq]")
+		assert.Contains(t, resp.Stdout, "BEADS_DIR="+townBeads)
+		assert.Contains(t, resp.Stdout, "BEADS_DOLT_SERVER_DATABASE=hq\n")
+	})
+
+	t.Run("town alias", func(t *testing.T) {
+		resp := run(`{"argv":["bd","create","--repo","town","--title","x"]}`)
+		assert.Contains(t, resp.Stdout, "[create][--title][x]")
+		assert.NotContains(t, resp.Stdout, "[--repo]")
+		assert.NotContains(t, resp.Stdout, "[town]")
+		assert.Contains(t, resp.Stdout, "BEADS_DIR="+townBeads)
+		assert.Contains(t, resp.Stdout, "BEADS_DOLT_SERVER_DATABASE=hq\n")
+	})
+
+	t.Run("path-like repo remains explicit", func(t *testing.T) {
+		resp := run(`{"argv":["bd","create","--repo","gastown/mayor/rig","--title","x"]}`)
+		assert.Contains(t, resp.Stdout, "[create][--repo][gastown/mayor/rig][--title][x]")
+		assert.Contains(t, resp.Stdout, "BEADS_DIR=\n")
+		assert.Contains(t, resp.Stdout, "BEADS_DOLT_SERVER_DATABASE=\n")
+		assert.Contains(t, resp.Stdout, "BEADS_DOLT_DATA_DIR=\n")
+		assert.Contains(t, resp.Stdout, "BD_DOLT_AUTO_COMMIT=on")
+		assert.Contains(t, resp.Stdout, "BD_NO_GIT_OPS=true")
+	})
+
+	t.Run("unknown bare repo remains explicit", func(t *testing.T) {
+		resp := run(`{"argv":["bd","create","--repo","unknown","--title","x"]}`)
+		assert.Contains(t, resp.Stdout, "[create][--repo][unknown][--title][x]")
+		assert.Contains(t, resp.Stdout, "BEADS_DIR=\n")
+		assert.Contains(t, resp.Stdout, "BD_DOLT_AUTO_COMMIT=on")
+	})
+
+	t.Run("repo after sentinel remains positional", func(t *testing.T) {
+		resp := run(`{"argv":["bd","create","--","--repo","gastown"]}`)
+		assert.Contains(t, resp.Stdout, "[create][--][--repo][gastown]")
+		assert.Contains(t, resp.Stdout, "BEADS_DIR=\n")
+		assert.Contains(t, resp.Stdout, "BEADS_DOLT_SERVER_DATABASE=\n")
+	})
+
+	t.Run("duplicate repo flags remain explicit", func(t *testing.T) {
+		resp := run(`{"argv":["bd","create","--repo","gastown","--repo","/tmp/other","--title","x"]}`)
+		assert.Contains(t, resp.Stdout, "[create][--repo][gastown][--repo][/tmp/other][--title][x]")
+		assert.Contains(t, resp.Stdout, "BEADS_DIR=\n")
+	})
+
+	t.Run("global flag before forbidden bd subcommand returns 403", func(t *testing.T) {
+		code, body := runStatus(`{"argv":["bd","--allow-stale","sql","select 1"]}`)
+		assert.Equal(t, http.StatusForbidden, code)
+		assert.Contains(t, body, "subcommand not allowed")
+	})
+
+	t.Run("unknown leading bd flag returns 403", func(t *testing.T) {
+		code, body := runStatus(`{"argv":["bd","--not-a-global","create","--repo","gastown"]}`)
+		assert.Equal(t, http.StatusForbidden, code)
+		assert.Contains(t, body, "subcommand required")
+	})
+
+	t.Run("target-selector bd global returns 403", func(t *testing.T) {
+		code, body := runStatus(`{"argv":["bd","--db","/tmp/other","create","--repo","gastown"]}`)
+		assert.Equal(t, http.StatusForbidden, code)
+		assert.Contains(t, body, "subcommand required")
+	})
+
+	t.Run("target-selector flag after subcommand returns 403", func(t *testing.T) {
+		code, body := runStatus(`{"argv":["bd","create","--db","/tmp/other","--repo","gastown"]}`)
+		assert.Equal(t, http.StatusForbidden, code)
+		assert.Contains(t, body, "target-selector")
+	})
+}
+
 // TestIsAllowed tests the Server.isAllowed helper.
 func TestIsAllowed(t *testing.T) {
 	srv := newExecTestServer(t, Config{AllowedCommands: []string{"echo", "sh"}})

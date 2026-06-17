@@ -6,10 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/steveyegge/gastown/internal/util"
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 const (
@@ -21,7 +22,7 @@ const (
 // Graceful degradation: if bd fails, the dog still does its work — molecule
 // tracking is observability, not control flow.
 type dogMol struct {
-	rootID   string // Root wisp ID (e.g., "gt-wisp-abc123"), empty if pour failed.
+	rootID   string            // Root wisp ID (e.g., "gt-wisp-abc123"), empty if pour failed.
 	stepIDs  map[string]string // step slug -> wisp issue ID
 	bdPath   string
 	townRoot string
@@ -303,8 +304,7 @@ func (dm *dogMol) runBd(args ...string) (string, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, bdPath, args...)
-	cmd.Dir = dm.townRoot
-	util.SetDetachedProcessGroup(cmd)
+	beads.ConfigureCommand(cmd, dm.townRoot, filepath.Join(dm.townRoot, ".beads"), beads.SubprocessModeForArgs(args))
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -368,5 +368,3 @@ func stripANSI(s string) string {
 	}
 	return result.String()
 }
-
-
