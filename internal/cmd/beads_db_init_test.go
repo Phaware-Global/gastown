@@ -137,6 +137,13 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 	configureTestGitIdentity(t, tmpDir)
 	gtBinary := buildGT(t)
 
+	// Kill any stale host dolt sql-server left running by an earlier integration
+	// test in this process. Otherwise gt install's port preflight sees the
+	// configured Dolt port occupied by a different town's server and aborts with
+	// "Dolt port N is already in use" (matches TestInstallCreatesCorrectStructure).
+	_ = exec.Command("pkill", "-f", "dolt sql-server").Run()
+	t.Cleanup(func() { _ = exec.Command("pkill", "-f", "dolt sql-server").Run() })
+
 	t.Run("TrackedRepoWithExistingPrefix", func(t *testing.T) {
 		// GitHub Issue #72: gt rig add --adopt should detect existing prefix and init database.
 		// When a tracked beads repo has config.yaml with a prefix, adopt should detect it.
@@ -144,6 +151,9 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		townRoot := filepath.Join(tmpDir, "town-prefix-test")
 
 		// Install town
+		// Clear any host dolt left by the previous subtest so install's port
+		// preflight sees the configured Dolt port free (test isolation).
+		_ = exec.Command("pkill", "-f", "dolt sql-server").Run()
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "prefix-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
 		if output, err := cmd.CombinedOutput(); err != nil {
@@ -206,6 +216,9 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		townRoot := filepath.Join(tmpDir, "town-no-issues")
 
 		// Install town
+		// Clear any host dolt left by the previous subtest so install's port
+		// preflight sees the configured Dolt port free (test isolation).
+		_ = exec.Command("pkill", "-f", "dolt sql-server").Run()
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "no-issues-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
 		if output, err := cmd.CombinedOutput(); err != nil {
@@ -267,6 +280,9 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		townRoot := filepath.Join(tmpDir, "town-mismatch")
 
 		// Install town
+		// Clear any host dolt left by the previous subtest so install's port
+		// preflight sees the configured Dolt port free (test isolation).
+		_ = exec.Command("pkill", "-f", "dolt sql-server").Run()
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "mismatch-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
 		if output, err := cmd.CombinedOutput(); err != nil {
@@ -311,6 +327,9 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		townRoot := filepath.Join(tmpDir, "town-derived")
 
 		// Install town
+		// Clear any host dolt left by the previous subtest so install's port
+		// preflight sees the configured Dolt port free (test isolation).
+		_ = exec.Command("pkill", "-f", "dolt sql-server").Run()
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "derived-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
 		if output, err := cmd.CombinedOutput(); err != nil {
@@ -366,6 +385,9 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		townRoot := filepath.Join(tmpDir, "town-reinit")
 
 		// Install town
+		// Clear any host dolt left by the previous subtest so install's port
+		// preflight sees the configured Dolt port free (test isolation).
+		_ = exec.Command("pkill", "-f", "dolt sql-server").Run()
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "reinit-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
 		if output, err := cmd.CombinedOutput(); err != nil {

@@ -1219,6 +1219,12 @@ func runAgentCleanTest(t *testing.T, hasTrackedBeads bool) {
 		}
 	}
 
+	// Kill any stale host dolt sql-server from an earlier integration test so
+	// gt install's port preflight doesn't see the Dolt port held by another
+	// town's server (matches TestInstallCreatesCorrectStructure).
+	_ = exec.Command("pkill", "-f", "dolt sql-server").Run()
+	t.Cleanup(func() { _ = exec.Command("pkill", "-f", "dolt sql-server").Run() })
+
 	// Step 2: Run gt install
 	cmd := exec.Command(gtBinary, "install", hqPath, "--name", "test-town")
 	cmd.Env = append(os.Environ(), "HOME="+tmpDir)
