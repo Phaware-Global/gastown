@@ -668,8 +668,9 @@ func writeJSON(path string, data interface{}) error {
 // --server-port derived from the town's Dolt configuration.
 func buildBdInitArgs(townPath string) []string {
 	cfg := doltserver.DefaultConfig(townPath)
+	// gt install --force preserves town state; bd reinit flags would destroy town beads.
 	return []string{"init", "--prefix", "hq", "--server",
-		"--server-port", strconv.Itoa(cfg.Port), "--force"}
+		"--server-port", strconv.Itoa(cfg.Port)}
 }
 
 // initTownBeads initializes town-level beads database using bd init.
@@ -700,7 +701,7 @@ func initTownBeads(townPath string) error {
 		return fmt.Errorf("Dolt server is not ready after 10s: %w", lastErr)
 	}
 
-	// Run: bd init --prefix hq --server
+	// Run: bd init --prefix hq --server --server-port <port>
 	// Dolt is the only backend since bd v0.51.0; no --backend flag needed.
 	// Filter inherited BEADS_DIR so bd init targets this town, not a parent .beads.
 	// Always pass --server-port so bd connects to the correct Dolt server.

@@ -6,9 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
-
-	"github.com/steveyegge/gastown/internal/beads"
 )
 
 // execBdShow replaces the current process with 'bd show'.
@@ -21,19 +20,27 @@ func execBdShow(args []string) error {
 		return fmt.Errorf("bd not found in PATH: %w", err)
 	}
 
-	beadsDir := ""
-	if beadID := extractBeadIDFromArgs(args); beadID != "" {
-		if dir := resolveBeadDir(beadID); dir != "" && dir != "." {
-			_ = os.Chdir(dir)
-			beadsDir = beads.ResolveBeadsDir(dir)
-		}
+	invocation := currentBdShowInvocation(args)
+	bdPath, err = prepareBdShowExec(bdPath, invocation)
+	if err != nil {
+		return err
 	}
 
-	env := pinBeadsDirEnv(os.Environ(), beadsDir)
+	return syscall.Exec(bdPath, invocation.ExecArgs, invocation.Env)
+}
 
-	// Build args: bd show <all-args>
-	// argv[0] must be the program name for exec
-	fullArgs := append([]string{"bd", "show"}, args...)
-
-	return syscall.Exec(bdPath, fullArgs, env)
+func prepareBdShowExec(bdPath string, invocation bdShowInvocation) (string, error) {
+	if !filepath.IsAbs(bdPath) {
+		abs, err := filepath.Abs(bdPath)
+		if err != nil {
+			return "", fmt.Errorf("resolve bd path %q: %w", bdPath, err)
+		}
+		bdPath = abs
+	}
+	if invocation.Dir != "" {
+		if err := os.Chdir(invocation.Dir); err != nil {
+			return "", fmt.Errorf("chdir %s: %w", invocation.Dir, err)
+		}
+	}
+	return bdPath, nil
 }

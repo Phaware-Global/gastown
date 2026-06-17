@@ -138,7 +138,7 @@ func TestSlingNewlyCreatedRigBeadRoutesBDCommandsToTargetRig(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
 		t.Fatalf("mkdir .beads: %v", err)
 	}
-	if err := os.MkdirAll(rigDir, 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0755); err != nil {
 		t.Fatalf("mkdir rigDir: %v", err)
 	}
 	routes := strings.Join([]string{
@@ -148,6 +148,12 @@ func TestSlingNewlyCreatedRigBeadRoutesBDCommandsToTargetRig(t *testing.T) {
 	}, "\n")
 	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0644); err != nil {
 		t.Fatalf("write routes.jsonl: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "metadata.json"), []byte(`{"dolt_database":"hq","dolt_server_host":"127.0.0.1","dolt_server_port":3307}`), 0644); err != nil {
+		t.Fatalf("write town metadata: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigDir, ".beads", "metadata.json"), []byte(`{"dolt_database":"gastown","dolt_server_host":"127.0.0.2","dolt_server_port":4407}`), 0644); err != nil {
+		t.Fatalf("write rig metadata: %v", err)
 	}
 
 	// Stub bd so we can observe that a newly-created rig bead's formula,
@@ -167,7 +173,7 @@ for arg in "$@"; do
   esac
   log_args="${log_args}${log_args:+ }${arg}"
 done
-printf '%s|%s|%s\n' "$(pwd)" "${BEADS_DIR:-}" "$log_args" >> "${BD_LOG}"
+printf '%s|%s|%s|%s|%s|%s|%s\n' "$(pwd)" "${BEADS_DIR:-}" "${BEADS_DOLT_SERVER_DATABASE:-}" "${BEADS_DB:-}" "${BD_DB:-}" "${BEADS_DOLT_DATA_DIR:-}" "$log_args" >> "${BD_LOG}"
 cmd="$1"
 shift || true
 while [ "$cmd" = "--db" ] || [ "$cmd" = "--allow-stale" ]; do
@@ -212,7 +218,7 @@ exit 0
 `
 	bdScriptWindows := `@echo off
 setlocal enableextensions
-echo %CD%^|%BEADS_DIR%^|%*>>"%BD_LOG%"
+echo %CD%^|%BEADS_DIR%^|%BEADS_DOLT_SERVER_DATABASE%^|%BEADS_DB%^|%BD_DB%^|%BEADS_DOLT_DATA_DIR%^|%*>>"%BD_LOG%"
 set "cmd=%1"
 set "sub=%2"
 if "%cmd%"=="--allow-stale" (
@@ -221,6 +227,10 @@ if "%cmd%"=="--allow-stale" (
 )
 if "%cmd%"=="show" (
   echo [{"title":"Test issue","status":"open","assignee":"","description":""}]
+  exit /b 0
+)
+if "%cmd%"=="create" (
+  echo {"id":"gt-new123","title":"New sling smoke","status":"open","assignee":""}
   exit /b 0
 )
 if "%cmd%"=="formula" (
@@ -289,6 +299,10 @@ exit /b 0
 	// Poison the ambient beads target: all mutating commands must override this
 	// with the route-resolved target rig database.
 	t.Setenv("BEADS_DIR", filepath.Join(townRoot, ".beads"))
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "hq")
+	t.Setenv("BEADS_DB", filepath.Join(townRoot, "wrong.db"))
+	t.Setenv("BD_DB", filepath.Join(townRoot, "wrong.bd"))
+	t.Setenv("BEADS_DOLT_DATA_DIR", filepath.Join(townRoot, "wrong-data"))
 
 	createOut, err := BdCmd("create", "--json", "--title=New sling smoke", "--type=task").
 		Dir(rigDir).
@@ -334,7 +348,7 @@ exit /b 0
 	gotTargetDBCheck := false
 	gotHook := false
 	gotMetadata := false
-	assertTargetRig := func(kind, dir, beadsDir, args string) {
+	assertTargetRig := func(kind, dir, beadsDir, database, beadsDB, bdDB, dataDir, args string) {
 		t.Helper()
 		if dir != wantDir {
 			t.Fatalf("bd %s ran in %q, want %q (args: %q)", kind, dir, wantDir, args)
@@ -342,12 +356,18 @@ exit /b 0
 		if beadsDir != wantBeadsDir {
 			t.Fatalf("bd %s used BEADS_DIR %q, want %q (args: %q)", kind, beadsDir, wantBeadsDir, args)
 		}
+		if database != "gastown" {
+			t.Fatalf("bd %s used BEADS_DOLT_SERVER_DATABASE %q, want gastown (args: %q)", kind, database, args)
+		}
+		if beadsDB != "" || bdDB != "" || dataDir != "" {
+			t.Fatalf("bd %s leaked stale DB env BEADS_DB=%q BD_DB=%q BEADS_DOLT_DATA_DIR=%q (args: %q)", kind, beadsDB, bdDB, dataDir, args)
+		}
 	}
 
 	for _, line := range logLines {
-		parts := strings.SplitN(line, "|", 3)
-		if len(parts) != 3 {
-			continue
+		parts := strings.SplitN(line, "|", 7)
+		if len(parts) != 7 {
+			t.Fatalf("malformed bd log line: %q", line)
 		}
 		dir := parts[0]
 		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
@@ -357,15 +377,19 @@ exit /b 0
 		if resolved, err := filepath.EvalSymlinks(beadsDir); err == nil {
 			beadsDir = resolved
 		}
-		args := parts[2]
+		database := parts[2]
+		beadsDB := parts[3]
+		bdDB := parts[4]
+		dataDir := parts[5]
+		args := parts[6]
 
 		switch {
 		case strings.Contains(args, "create "):
 			gotCreate = true
-			assertTargetRig("create", dir, beadsDir, args)
+			assertTargetRig("create", dir, beadsDir, database, beadsDB, bdDB, dataDir, args)
 		case strings.Contains(args, "show "+newBeadID) && strings.Contains(args, "--json"):
 			gotTargetDBCheck = true
-			assertTargetRig("target DB check", dir, beadsDir, args)
+			assertTargetRig("target DB check", dir, beadsDir, database, beadsDB, bdDB, dataDir, args)
 		case strings.Contains(args, "cook "):
 			switch {
 			case strings.Contains(args, "mol-polecat-work"):
@@ -375,7 +399,7 @@ exit /b 0
 			default:
 				t.Fatalf("bd cook args = %q, want expected formula", args)
 			}
-			assertTargetRig("cook", dir, beadsDir, args)
+			assertTargetRig("cook", dir, beadsDir, database, beadsDB, bdDB, dataDir, args)
 		case strings.Contains(args, "mol wisp "):
 			switch {
 			case strings.Contains(args, "mol-polecat-work"):
@@ -385,16 +409,23 @@ exit /b 0
 			default:
 				t.Fatalf("bd mol wisp args = %q, want expected formula", args)
 			}
-			assertTargetRig("mol wisp", dir, beadsDir, args)
+			assertTargetRig("mol wisp", dir, beadsDir, database, beadsDB, bdDB, dataDir, args)
 		case strings.Contains(args, "mol bond "):
 			gotBondCount++
-			assertTargetRig("mol bond", dir, beadsDir, args)
+			assertTargetRig("mol bond", dir, beadsDir, database, beadsDB, bdDB, dataDir, args)
 		case strings.Contains(args, "update "+newBeadID) && strings.Contains(args, "--status=hooked"):
 			gotHook = true
-			assertTargetRig("hook update", dir, beadsDir, args)
+			assertTargetRig("hook update", dir, beadsDir, database, beadsDB, bdDB, dataDir, args)
 		case strings.Contains(args, "update "+newBeadID) && strings.Contains(args, "--description=<attached-molecule-and-formula-fields>"):
 			gotMetadata = true
-			assertTargetRig("metadata update", dir, beadsDir, args)
+			assertTargetRig("metadata update", dir, beadsDir, database, beadsDB, bdDB, dataDir, args)
+		case strings.Contains(args, "update "+newBeadID) && strings.Contains(args, "--description="):
+			assertTargetRig("description update", dir, beadsDir, database, beadsDB, bdDB, dataDir, args)
+		case args == "--version" || strings.HasPrefix(args, "version") || strings.Contains(args, " version") || strings.HasPrefix(args, "formula ") || strings.Contains(args, "show gt-rig-") || strings.Contains(args, "show mol-"):
+			// Explicitly exempt non-target-bead lookups; every gt-new123 operation
+			// above must still prove it is pinned to the gastown database.
+		default:
+			t.Fatalf("unexpected bd command without routing assertion: %q", line)
 		}
 	}
 

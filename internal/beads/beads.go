@@ -473,6 +473,12 @@ func (b *Beads) targetBeadsDirForCreate(opts CreateOptions) (string, error) {
 
 	if opts.Rig != "" {
 		if targetDir, ok := ResolveRepoAliasBeadsDir(townRoot, opts.Rig); ok {
+			if opts.Rig != "hq" && opts.Rig != "town" {
+				prefix := GetPrefixForRig(townRoot, opts.Rig)
+				if err := EnsureConfigYAML(targetDir, prefix); err != nil {
+					return "", fmt.Errorf("ensuring beads config for rig %q: %w", opts.Rig, err)
+				}
+			}
 			return targetDir, nil
 		}
 		return "", fmt.Errorf("unknown repo/rig alias %q", opts.Rig)
@@ -747,8 +753,8 @@ func (b *Beads) buildRunEnv() []string {
 	// keep buildRunEnv focused on Dolt target isolation and avoid duplicate
 	// first-match-sensitive BEADS_DIR entries.
 	env := BuildPinnedBDEnv(os.Environ(), b.getResolvedBeadsDir())
-	env = stripEnvKey(env, "BEADS_DIR")
-	return stripEnvKey(env, "BEADS_DOLT_SERVER_PORT")
+	env = StripEnvKey(env, "BEADS_DIR")
+	return StripEnvKey(env, "BEADS_DOLT_SERVER_PORT")
 }
 
 // buildRoutingEnv builds the environment for runWithRouting() calls.
@@ -766,7 +772,7 @@ func (b *Beads) buildRoutingEnv() []string {
 		return SuppressBDSideEffects(env)
 	}
 	env := BuildRoutingBDEnv(os.Environ(), b.getResolvedBeadsDir())
-	return stripEnvKey(env, "BEADS_DOLT_SERVER_PORT")
+	return StripEnvKey(env, "BEADS_DOLT_SERVER_PORT")
 }
 
 // filterBeadsEnv removes beads-related environment variables from the given

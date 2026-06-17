@@ -1699,11 +1699,19 @@ func populateMailInfo(agent *AgentRuntime, router *mail.Router) {
 	if err != nil {
 		return
 	}
-	_, unread, _ := mailbox.Count()
-	agent.UnreadMail = unread
-	if unread > 0 {
-		if messages, err := mailbox.ListUnread(); err == nil && len(messages) > 0 {
-			agent.FirstSubject = messages[0].Subject
+	messages, err := mailbox.List()
+	if err != nil {
+		return
+	}
+	firstSubjectSet := false
+	for _, msg := range messages {
+		if msg.Read {
+			continue
+		}
+		agent.UnreadMail++
+		if !firstSubjectSet {
+			agent.FirstSubject = msg.Subject
+			firstSubjectSet = true
 		}
 	}
 }

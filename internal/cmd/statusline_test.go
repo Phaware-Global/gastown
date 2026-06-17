@@ -15,6 +15,7 @@ func setupCmdTestRegistry(t *testing.T) {
 	registry := session.NewPrefixRegistry()
 	registry.Register("gt", "gastown")
 	registry.Register("do", "coder_dotfiles")
+	registry.Register("mr", "myrig")
 	old := session.DefaultRegistry()
 	session.SetDefaultRegistry(registry)
 	t.Cleanup(func() { session.SetDefaultRegistry(old) })

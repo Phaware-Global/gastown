@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -690,9 +689,9 @@ func TestResolveRigFromBeadIDs_TownLevelPrefix_Errors(t *testing.T) {
 	}
 }
 
-// TestBatchSling_EmptyConvoyCleanupOnAllFailures verifies that when all beads
-// fail to sling, the empty convoy is closed with a cleanup reason.
-func TestBatchSling_EmptyConvoyCleanupOnAllFailures(t *testing.T) {
+// TestCloseConvoyPinsTownDatabaseUnderStaleEnv verifies convoy cleanup closes
+// hq-cv-* beads through the town database even when ambient bd env points away.
+func TestCloseConvoyPinsTownDatabaseUnderStaleEnv(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows")
 	}
@@ -703,9 +702,15 @@ func TestBatchSling_EmptyConvoyCleanupOnAllFailures(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"type":"town","name":"test"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
 	townBeads := filepath.Join(townRoot, ".beads")
 	if err := os.MkdirAll(townBeads, 0755); err != nil {
 		t.Fatalf("mkdir .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townBeads, "metadata.json"), []byte(`{"dolt_database":"hq","dolt_server_host":"127.0.0.1","dolt_server_port":3307}`), 0644); err != nil {
+		t.Fatalf("write metadata: %v", err)
 	}
 
 	closeLogPath := filepath.Join(townRoot, "bd-close.log")
@@ -720,7 +725,7 @@ fi
 shift || true
 case "$cmd" in
   close)
-    echo "$cmd $*" >> "` + closeLogPath + `"
+    printf '%s %s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$cmd" "$*" "$(pwd)" "${BEADS_DIR:-}" "${BEADS_DOLT_SERVER_DATABASE:-}" "${BEADS_DB:-}" "${BD_DB:-}" "${BEADS_DOLT_DATA_DIR:-}" "${BD_DOLT_AUTO_COMMIT:-}" "${BD_READONLY:-}" >> "` + closeLogPath + `"
     exit 0
     ;;
 esac
@@ -732,20 +737,25 @@ exit 0
 	}
 
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+	t.Setenv("BEADS_DIR", filepath.Join(townRoot, "wrong", ".beads"))
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "gastown")
+	t.Setenv("BEADS_DB", filepath.Join(townRoot, "wrong.db"))
+	t.Setenv("BD_DB", filepath.Join(townRoot, "wrong.bd"))
+	t.Setenv("BEADS_DOLT_DATA_DIR", filepath.Join(townRoot, "wrong-data"))
+	t.Setenv("BD_READONLY", "true")
+	t.Setenv("BD_DOLT_AUTO_COMMIT", "off")
 
-	// Simulate the cleanup logic from runBatchSling:
-	// If successCount == 0 and batchConvoyID is set, close the convoy.
-	successCount := 0
-	batchConvoyID := "hq-cv-cleanup-test"
-
-	if successCount == 0 && batchConvoyID != "" {
-		// Mirror the exact exec.Command call from sling_batch.go:303
-		cmd := exec.Command("bd", "close", batchConvoyID, "-r", "all beads failed to sling")
-		cmd.Dir = townBeads
-		if err := cmd.Run(); err != nil {
-			t.Fatalf("close convoy: %v", err)
-		}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
 	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(filepath.Join(townRoot, "mayor", "rig")); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	batchConvoyID := "hq-cv-cleanup-test"
+	closeConvoy(batchConvoyID, "all beads failed to sling")
 
 	// Verify close was called
 	closeBytes, err := os.ReadFile(closeLogPath)
@@ -758,6 +768,28 @@ exit 0
 	}
 	if !strings.Contains(closeContent, "all beads failed") {
 		t.Errorf("close log should contain failure reason:\n%s", closeContent)
+	}
+	fields := strings.Split(strings.TrimSpace(closeContent), "|")
+	if len(fields) != 9 {
+		t.Fatalf("close log fields = %v, want 9 fields in %q", fields, closeContent)
+	}
+	if fields[1] != townBeads {
+		t.Fatalf("close cwd = %q, want town beads dir %q", fields[1], townBeads)
+	}
+	if fields[2] != townBeads {
+		t.Fatalf("BEADS_DIR = %q, want %q", fields[2], townBeads)
+	}
+	if fields[3] != "hq" {
+		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want hq", fields[3])
+	}
+	if fields[4] != "" || fields[5] != "" || fields[6] != "" {
+		t.Fatalf("stale DB env should be stripped, got BEADS_DB=%q BD_DB=%q BEADS_DOLT_DATA_DIR=%q", fields[4], fields[5], fields[6])
+	}
+	if fields[7] != "on" {
+		t.Fatalf("BD_DOLT_AUTO_COMMIT = %q, want on", fields[7])
+	}
+	if fields[8] != "" {
+		t.Fatalf("BD_READONLY should be stripped, got %q", fields[8])
 	}
 }
 

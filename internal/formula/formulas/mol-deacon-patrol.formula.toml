@@ -105,11 +105,16 @@ id = "inbox-check"
 title = "Handle callbacks from agents"
 needs = ["heartbeat"]
 description = """
-First, clean up wisps from previous cycles (closed wisps + abandoned wisps):
+First, clean up CLOSED wisps from previous cycles:
 ```bash
 bd mol wisp gc --closed --force
-bd mol wisp gc --age 1h --force
 ```
+
+> **Warning (hq-3pp):** Do not run unscoped age-based wisp GC from inside
+> this patrol. Active patrol step wisps can be older than 1h before they run;
+> age cleanup can reap this molecule's open steps and make the patrol appear
+> complete early. Use closed-only cleanup here; stale open-wisp cleanup belongs
+> outside active patrol molecules.
 
 Then handle callbacks from agents.
 
