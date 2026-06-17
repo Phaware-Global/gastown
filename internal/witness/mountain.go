@@ -40,10 +40,11 @@ func trackConvoyFailures(bd *BdCli, workDir string, result *DetectZombiePolecats
 	for i := range result.Zombies {
 		zombie := &result.Zombies[i]
 
-		// Only track failures for zombies that had active work on an issue
-		// and didn't complete it. ZombieBeadClosedStillRunning means the work
-		// WAS completed — don't count that as a failure.
-		if zombie.HookBead == "" || zombie.Classification == ZombieBeadClosedStillRunning {
+		// Only track failures for zombies that had active work on an issue and
+		// didn't complete it. Submitted/orphan cleanup states can still carry a
+		// hook_bead for traceability, but they must not increment mountain failure
+		// counts.
+		if zombie.HookBead == "" || !zombieImpliesActiveFailure(*zombie) {
 			continue
 		}
 
@@ -71,6 +72,17 @@ func trackConvoyFailures(bd *BdCli, workDir string, result *DetectZombiePolecats
 
 		result.ConvoyFailures = append(result.ConvoyFailures, *cfr)
 	}
+}
+
+func zombieImpliesActiveFailure(zombie ZombieResult) bool {
+	switch zombie.Classification {
+	case ZombieBeadClosedStillRunning, ZombieSubmittedStillRunning:
+		return false
+	}
+	if zombie.Classification != "" {
+		return zombie.Classification.ImpliesActiveWork()
+	}
+	return zombie.WasActive
 }
 
 // TrackConvoyFailure checks if an issue belongs to a convoy and tracks the

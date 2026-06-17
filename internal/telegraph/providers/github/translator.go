@@ -87,7 +87,7 @@ var SupportedWireEvents = []string{
 	"workflow_run",
 }
 
-// ValidateEvents returns an error if any entry in events is not a recognised
+// ValidateEvents returns an error if any entry in events is not a recognized
 // X-GitHub-Event wire-format name. Empty events is valid and means "accept
 // every supported event."
 //
@@ -835,7 +835,7 @@ func firstNonEmpty(values ...string) string {
 // check_run / check_suite enumerations.
 func isFailureConclusion(c string) bool {
 	switch strings.ToLower(c) {
-	case "failure", "timed_out", "cancelled", "action_required", "stale", "startup_failure":
+	case "failure", "timed_out", "cancelled", "action_required", "stale", "startup_failure": //nolint:misspell // "cancelled" is GitHub's check-conclusion enum value, not prose
 		return true
 	default:
 		return false

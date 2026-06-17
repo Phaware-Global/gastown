@@ -10,7 +10,10 @@ jobs:
   block-internal-prs:
     name: Block Internal PRs
     # Only run if PR is from the same repo (not a fork)
-    if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'renovate[bot]'
+    # Fork override (Phaware-Global): PR-based workflow (augment review loop +
+    # stacked sync PRs). Set repo variable ALLOW_INTERNAL_PRS=true to no-op this
+    # guard; unset/false restores upstream's push-to-main-only behavior.
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'renovate[bot]' && vars.ALLOW_INTERNAL_PRS != 'true'
     runs-on: ubuntu-latest
     permissions:
       issues: write

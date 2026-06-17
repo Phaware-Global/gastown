@@ -2,11 +2,59 @@ package cmd
 
 import (
 	"os/exec"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
+
+func TestIsAgentSessionHealthy_DeadPane(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+
+	tm := tmux.NewTmux()
+	sessionName := "zzrig-dead-pane-test"
+	_ = tm.KillSession(sessionName)
+	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
+
+	for _, args := range [][]string{
+		{"new-session", "-d", "-s", sessionName},
+		{"set-option", "-t", sessionName, "remain-on-exit", "on"},
+		{"respawn-pane", "-k", "-t", sessionName, "false"},
+	} {
+		if out, err := tmux.BuildCommand(args...).CombinedOutput(); err != nil {
+			t.Fatalf("tmux %v: %v: %s", args, err, strings.TrimSpace(string(out)))
+		}
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	observedDead := false
+	for time.Now().Before(deadline) {
+		out, err := tmux.BuildCommand("display-message", "-p", "-t", sessionName, "#{pane_dead}").Output()
+		if err == nil && strings.TrimSpace(string(out)) == "1" {
+			observedDead = true
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !observedDead {
+		t.Fatal("expected retained pane to report pane_dead=1")
+	}
+
+	hasSession, err := tm.HasSession(sessionName)
+	if err != nil {
+		t.Fatalf("HasSession: %v", err)
+	}
+	if !hasSession {
+		t.Fatal("expected retained tmux session to exist")
+	}
+	if isAgentSessionHealthy(tm, sessionName) {
+		t.Fatal("dead retained pane must not be reported healthy")
+	}
+}
 
 func TestIsGitRemoteURL(t *testing.T) {
 	tests := []struct {
@@ -49,8 +97,8 @@ func TestIsGitRemoteURL(t *testing.T) {
 		{"-c", false},
 
 		// Malformed SCP-style — should return false
-		{"@host:path", false},    // empty user
-		{"user@:/path", false},   // empty host
+		{"@host:path", false},     // empty user
+		{"user@:/path", false},    // empty host
 		{"localhost:path", false}, // no user (not SCP-style)
 	}
 

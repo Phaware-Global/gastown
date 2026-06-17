@@ -23,12 +23,12 @@ import (
 const DoltDockerImage = "dolthub/dolt-sql-server:1.83.0"
 
 var (
-	doltCtr      *dolt.DoltContainer
-	doltCtrOnce  sync.Once
-	doltCtrErr   error
-	doltCtrPort  string
-	dockerOnce   sync.Once
-	dockerAvail  bool
+	doltCtr     *dolt.DoltContainer
+	doltCtrOnce sync.Once
+	doltCtrErr  error
+	doltCtrPort string
+	dockerOnce  sync.Once
+	dockerAvail bool
 )
 
 // isDockerAvailable returns true if the Docker daemon is reachable.
@@ -95,6 +95,7 @@ func startSharedDoltContainer() {
 	doltCtrPort = p.Port()
 	os.Setenv("GT_DOLT_PORT", doltCtrPort)    //nolint:tenv // intentional process-wide env
 	os.Setenv("BEADS_DOLT_PORT", doltCtrPort) //nolint:tenv // intentional process-wide env
+	os.Setenv("GT_TEST_EXTERNAL_DOLT", "1")   //nolint:tenv // integration tests reuse this container
 }
 
 // StartIsolatedDoltContainer starts a per-test Dolt container and returns the

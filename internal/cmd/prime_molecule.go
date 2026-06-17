@@ -206,6 +206,19 @@ func buildFormulaVarMap(f *formula.Formula, extraVars []string) map[string]strin
 	return m
 }
 
+func attachmentFormulaVars(attachment *beads.AttachmentFields) []string {
+	if attachment == nil {
+		return nil
+	}
+	if len(attachment.AttachedVars) > 0 {
+		return attachment.AttachedVars
+	}
+	if attachment.FormulaVars == "" {
+		return nil
+	}
+	return strings.Split(attachment.FormulaVars, "\n")
+}
+
 // applyFormulaVars replaces {{key}} placeholders in text with values from varMap.
 func applyFormulaVars(text string, varMap map[string]string) string {
 	for k, v := range varMap {
@@ -225,6 +238,7 @@ func extractFormulaVar(formulaVars, key string) string {
 	}
 	return ""
 }
+
 // truncateDescription truncates a multi-line description to a single line summary.
 func truncateDescription(desc string, maxLen int) string {
 	// Take just the first line
@@ -271,7 +285,6 @@ func outputMoleculeContext(ctx RoleContext) {
 	// No child-based tracking needed.
 }
 
-
 // outputDeaconPatrolContext shows patrol molecule status for the Deacon.
 // Deacon uses wisps (Wisp:true issues in main .beads/) for patrol cycles.
 // Deacon is a town-level role, so it uses town root beads (not rig beads).
@@ -284,12 +297,12 @@ func outputDeaconPatrolContext(ctx RoleContext) {
 	}
 
 	cfg := PatrolConfig{
-		RoleName:        "deacon",
-		PatrolMolName:   constants.MolDeaconPatrol,
-		BeadsDir:        ctx.TownRoot, // Town-level role uses town root beads
-		Assignee:        "deacon",
-		HeaderEmoji:     "🔄",
-		HeaderTitle:     "Patrol Status (Wisp-based)",
+		RoleName:      "deacon",
+		PatrolMolName: constants.MolDeaconPatrol,
+		BeadsDir:      ctx.TownRoot, // Town-level role uses town root beads
+		Assignee:      "deacon",
+		HeaderEmoji:   "🔄",
+		HeaderTitle:   "Patrol Status (Wisp-based)",
 		WorkLoopSteps: []string{
 			"Work through each patrol step in sequence (see checklist below)",
 			"At cycle end:\n   - If context LOW:\n     * Report and loop: `" + cli.Name() + " patrol report --summary \"<brief summary of observations>\"`\n     * This closes the current patrol and starts a new cycle\n   - If context HIGH:\n     * Send handoff: `" + cli.Name() + " handoff -s \"Deacon patrol\" -m \"<observations>\"`\n     * Exit cleanly (daemon respawns fresh session)",
@@ -308,13 +321,13 @@ func outputWitnessPatrolContext(ctx RoleContext) {
 	}
 	extraVars := buildWitnessPatrolVars(ctx)
 	cfg := PatrolConfig{
-		RoleName:        "witness",
-		PatrolMolName:   constants.MolWitnessPatrol,
-		BeadsDir:        ctx.TownRoot,
-		Assignee:        ctx.Rig + "/witness",
-		HeaderEmoji:     constants.EmojiWitness,
-		HeaderTitle:     "Witness Patrol Status",
-		ExtraVars:       extraVars,
+		RoleName:      "witness",
+		PatrolMolName: constants.MolWitnessPatrol,
+		BeadsDir:      ctx.TownRoot,
+		Assignee:      ctx.Rig + "/witness",
+		HeaderEmoji:   constants.EmojiWitness,
+		HeaderTitle:   "Witness Patrol Status",
+		ExtraVars:     extraVars,
 		WorkLoopSteps: []string{
 			"Work through each patrol step in sequence (see checklist below)",
 			"At cycle end:\n   - If context LOW:\n     * Report and loop: `" + cli.Name() + " patrol report --summary \"<brief summary of observations>\"`\n     * This closes the current patrol and starts a new cycle\n   - If context HIGH:\n     * Send handoff: `" + cli.Name() + " handoff -s \"Witness patrol\" -m \"<observations>\"`\n     * Exit cleanly (daemon respawns fresh session)",
@@ -332,13 +345,13 @@ func outputRefineryPatrolContext(ctx RoleContext) {
 		return
 	}
 	cfg := PatrolConfig{
-		RoleName:        "refinery",
-		PatrolMolName:   constants.MolRefineryPatrol,
-		BeadsDir:        ctx.TownRoot,
-		Assignee:        ctx.Rig + "/refinery",
-		HeaderEmoji:     "🔧",
-		HeaderTitle:     "Refinery Patrol Status",
-		ExtraVars:       buildRefineryPatrolVars(ctx),
+		RoleName:      "refinery",
+		PatrolMolName: constants.MolRefineryPatrol,
+		BeadsDir:      ctx.TownRoot,
+		Assignee:      ctx.Rig + "/refinery",
+		HeaderEmoji:   "🔧",
+		HeaderTitle:   "Refinery Patrol Status",
+		ExtraVars:     buildRefineryPatrolVars(ctx),
 		WorkLoopSteps: []string{
 			"Work through each patrol step in sequence (see checklist below)",
 			"At cycle end:\n   - If context LOW:\n     * Report and loop: `" + cli.Name() + " patrol report --summary \"<brief summary of observations>\"`\n     * This closes the current patrol and starts a new cycle\n   - If context HIGH:\n     * Send handoff: `" + cli.Name() + " handoff -s \"Refinery patrol\" -m \"<observations>\"`\n     * Exit cleanly (daemon respawns fresh session)",

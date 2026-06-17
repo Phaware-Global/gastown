@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -573,6 +574,112 @@ esac
 			t.Fatalf("expected timeout error, got: %v", err)
 		}
 	})
+}
+
+func TestFetchConvoysBreakerBacksOffAfterBdFailures(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based command test")
+	}
+
+	tests := []struct {
+		name   string
+		script string
+	}{
+		{
+			name: "nonzero exit",
+			script: `#!/bin/sh
+printf x >> "$0.count"
+exit 1
+`,
+		},
+		{
+			name: "invalid JSON",
+			script: `#!/bin/sh
+printf x >> "$0.count"
+printf '{invalid'
+exit 0
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bdPath := filepath.Join(t.TempDir(), "bd")
+			if err := os.WriteFile(bdPath, []byte(tt.script), 0o755); err != nil {
+				t.Fatalf("write fake bd: %v", err)
+			}
+
+			f := &LiveConvoyFetcher{townRoot: t.TempDir(), cmdTimeout: 5 * time.Second, bdBin: bdPath}
+			if _, err := f.FetchConvoys(); err == nil {
+				t.Fatal("expected first FetchConvoys call to fail")
+			}
+
+			if _, err := f.FetchConvoys(); err != nil {
+				t.Fatalf("expected immediate retry to be backed off silently, got: %v", err)
+			}
+
+			countBytes, err := os.ReadFile(bdPath + ".count")
+			if err != nil {
+				t.Fatalf("read fake bd call count: %v", err)
+			}
+			if got := len(countBytes); got != 1 {
+				t.Fatalf("fake bd calls = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestFetchConvoysBreakerPreventsConcurrentStampede(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based command test")
+	}
+
+	bdPath := filepath.Join(t.TempDir(), "bd")
+	script := `#!/bin/sh
+printf x >> "$0.count"
+sleep 0.2
+printf '{invalid'
+exit 0
+`
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+
+	f := &LiveConvoyFetcher{townRoot: t.TempDir(), cmdTimeout: 5 * time.Second, bdBin: bdPath}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errCh := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := f.FetchConvoys()
+			errCh <- err
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+
+	errCount := 0
+	for err := range errCh {
+		if err != nil {
+			errCount++
+		}
+	}
+	if errCount != 1 {
+		t.Fatalf("FetchConvoys errors = %d, want 1; backed-off callers should return nil", errCount)
+	}
+
+	countBytes, err := os.ReadFile(bdPath + ".count")
+	if err != nil {
+		t.Fatalf("read fake bd call count: %v", err)
+	}
+	if got := len(countBytes); got != 1 {
+		t.Fatalf("fake bd calls = %d, want 1", got)
+	}
 }
 
 func withMayorFetcherHooks(t *testing.T, sessionEnv func(sessionName, key string) (string, error), runCmdFunc func(time.Duration, string, ...string) (*bytes.Buffer, error)) {

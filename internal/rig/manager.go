@@ -446,7 +446,14 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		return m.git.CloneBareWithBranch(opts.GitURL, bareRepoPath, branch)
 	}
 
+	emptyRepoError := func() error {
+		return fmt.Errorf("repository %s is empty (no commits). Push at least one commit before adding it as a rig", opts.GitURL)
+	}
+
 	if err := cloneBareWith(opts.DefaultBranch); err != nil {
+		if hasRefs, refsErr := m.git.RemoteHasRefs(opts.GitURL); refsErr == nil && !hasRefs {
+			return nil, emptyRepoError()
+		}
 		return nil, wrapCloneError(err, opts.GitURL)
 	}
 	if opts.CloneFilter != "" {
@@ -462,7 +469,14 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	if empty, err := bareGit.IsEmpty(); err != nil {
 		return nil, fmt.Errorf("checking if repository is empty: %w", err)
 	} else if empty {
-		return nil, fmt.Errorf("repository %s is empty (no commits). Push at least one commit before adding it as a rig", opts.GitURL)
+		hasRefs, refsErr := m.git.RemoteHasRefs(opts.GitURL)
+		if refsErr != nil {
+			return nil, fmt.Errorf("checking if repository is empty: %w", refsErr)
+		}
+		if !hasRefs {
+			return nil, emptyRepoError()
+		}
+		return nil, fmt.Errorf("repository %s has refs, but no default branch could be cloned. Ensure the remote HEAD points to a branch, or pass --branch <branch>", opts.GitURL)
 	}
 
 	// Configure push URL if provided (for read-only upstream repos)
@@ -598,10 +612,14 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		// When metadata.json exists but the Dolt server database doesn't (fresh clone
 		// to a new workspace), we still need to run bd init to create the server-side
 		// database and set issue_prefix. Always ensure issue_prefix is set afterward.
+		sourceBdEnv := bdSubprocessEnv(sourceBeadsDir, opts.Name)
 		if !bdDatabaseExists(sourceBeadsDir) {
 			initArgs := []string{"init"}
 			if opts.BeadsPrefix != "" {
 				initArgs = append(initArgs, "--prefix", opts.BeadsPrefix)
+			}
+			if opts.Name != "" {
+				initArgs = append(initArgs, "--database", opts.Name)
 			}
 			initArgs = append(initArgs, "--server")
 			// Always pass --server-port so bd connects to gt's central Dolt
@@ -611,12 +629,14 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 			initArgs = append(initArgs, "--server-port", strconv.Itoa(doltCfg.Port))
 			cmd := exec.Command("bd", initArgs...)
 			cmd.Dir = mayorRigPath
+			cmd.Env = sourceBdEnv
 			if output, err := cmd.CombinedOutput(); err != nil {
 				fmt.Printf("  Warning: Could not init bd database: %v (%s)\n", err, strings.TrimSpace(string(output)))
 			}
-			// Drop orphaned beads_<prefix> database if it differs from rigName (gt-sv1h).
-			if orphanDB := "beads_" + opts.BeadsPrefix; orphanDB != opts.Name {
-				_ = doltserver.RemoveDatabase(m.townRoot, orphanDB, true)
+			// Drop orphan databases created by bd init (gh#3562, gt-sv1h).
+			// See dropRigOrphanDBs for naming details across bd versions.
+			if err := dropRigOrphanDBs(m.townRoot, opts.BeadsPrefix, opts.Name); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: orphan database cleanup: %v\n", err)
 			}
 		}
 
@@ -626,10 +646,12 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		// the server-side database has issue_prefix set for this workspace.
 		configCmd := exec.Command("bd", "config", "set", "types.custom", constants.BeadsCustomTypes)
 		configCmd.Dir = mayorRigPath
+		configCmd.Env = sourceBdEnv
 		_, _ = configCmd.CombinedOutput() // Ignore errors - older beads don't need this
 
 		prefixSetCmd := exec.Command("bd", "config", "set", "issue_prefix", opts.BeadsPrefix)
 		prefixSetCmd.Dir = mayorRigPath
+		prefixSetCmd.Env = sourceBdEnv
 		if prefixOutput, prefixErr := prefixSetCmd.CombinedOutput(); prefixErr != nil {
 			fmt.Printf("  Warning: Could not set issue_prefix: %v (%s)\n", prefixErr, strings.TrimSpace(string(prefixOutput)))
 		}
@@ -670,10 +692,11 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		fmt.Printf("  Run 'gt doctor --fix' to repair, or it will self-heal on next daemon start.\n")
 	}
 
-	// Safety-net: drop orphaned beads_<prefix> database if it differs from rigName (gt-sv1h).
-	// InitBeads already does this, but repeat here in case EnsureMetadata path diverges.
-	if orphanDB := "beads_" + opts.BeadsPrefix; orphanDB != opts.Name {
-		_ = doltserver.RemoveDatabase(m.townRoot, orphanDB, true)
+	// Safety-net: drop orphan databases that may have been created by bd init.
+	// InitBeads already does this, but repeat here in case EnsureMetadata path
+	// diverges, and verify post-condition: no orphan should remain (gh#3562).
+	if err := dropRigOrphanDBs(m.townRoot, opts.BeadsPrefix, opts.Name); err != nil {
+		return nil, fmt.Errorf("rig init left a duplicate Dolt database: %w", err)
 	}
 
 	// Set issue_prefix on the correct server-side database.
@@ -682,15 +705,16 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	// Now that EnsureMetadata has corrected dolt_database, re-set it.
 	{
 		resolvedBeadsDir := beads.ResolveBeadsDir(rigPath)
+		bdEnv := bdSubprocessEnv(resolvedBeadsDir, opts.Name)
 		prefixCmd := exec.Command("bd", "config", "set", "issue_prefix", opts.BeadsPrefix)
 		prefixCmd.Dir = rigPath
-		prefixCmd.Env = append(os.Environ(), "BEADS_DIR="+resolvedBeadsDir)
+		prefixCmd.Env = bdEnv
 		if out, err := prefixCmd.CombinedOutput(); err != nil {
 			fmt.Printf("  Warning: Could not set issue_prefix on rig database: %v (%s)\n", err, strings.TrimSpace(string(out)))
 		}
 		typesCmd := exec.Command("bd", "config", "set", "types.custom", constants.BeadsCustomTypes)
 		typesCmd.Dir = rigPath
-		typesCmd.Env = append(os.Environ(), "BEADS_DIR="+resolvedBeadsDir)
+		typesCmd.Env = bdEnv
 		_, _ = typesCmd.CombinedOutput()
 	}
 
@@ -1055,14 +1079,62 @@ func warnDeprecatedRigConfigKeys(data []byte, path string) {
 	}
 }
 
+// dropRigOrphanDBs drops orphan Dolt databases that bd init creates as a side
+// effect of `bd init --prefix <prefix>`. The orphan name depends on bd version:
+//
+//	bd >= 0.62: "<prefix>"        (e.g. "ma" for prefix=ma)
+//	bd <  0.62: "beads_<prefix>"  (e.g. "beads_ma")
+//
+// Either form must be removed when it differs from <rigName>, otherwise beads
+// created from the rig can silently land in the orphan DB while the mayor
+// reads from <rigName> — causing the silent data split documented in gh#3562.
+//
+// On entry the orphan is freshly created by bd init and contains only schema
+// tables, so it is safe to force-drop. If the candidate looks like a real rig
+// database (matches rigName, "hq", or doesn't exist at all) it is skipped.
+//
+// Returns an error only if at least one orphan candidate exists on disk and
+// cannot be removed — callers in AddRig treat that as fatal so the user is not
+// left with a silently-split rig.
+func dropRigOrphanDBs(townRoot, prefix, rigName string) error {
+	if prefix == "" || rigName == "" {
+		return nil
+	}
+	candidates := []string{prefix, "beads_" + prefix}
+	var failures []string
+	for _, name := range candidates {
+		if name == rigName || name == "hq" {
+			continue
+		}
+		if !doltserver.DatabaseExists(townRoot, name) {
+			continue
+		}
+		if err := doltserver.RemoveDatabase(townRoot, name, true); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", name, err))
+			continue
+		}
+		// Re-check: RemoveDatabase may report success but leave files behind
+		// in pathological cases (read-only server, partial DROP).
+		if doltserver.DatabaseExists(townRoot, name) {
+			failures = append(failures, fmt.Sprintf("%s: still present after RemoveDatabase", name))
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("orphan database(s) for rig %q (prefix %q) could not be removed: %s — run `gt dolt cleanup --force` to resolve",
+			rigName, prefix, strings.Join(failures, "; "))
+	}
+	return nil
+}
+
 // InitBeads initializes the beads database at rig level.
 // The project's .beads/config.yaml determines sync-branch settings.
 // Use `bd doctor --fix` in the project to configure sync-branch if needed.
 // TODO(bd-yaml): beads config should migrate to JSON (see beads issue)
 //
 // rigName is the rig's database name (e.g. "gastown"). When non-empty and
-// different from the default "beads_<prefix>" database that bd init creates,
-// InitBeads drops the orphan database to prevent accumulation (gt-sv1h).
+// different from the database that `bd init --prefix` creates (named "<prefix>"
+// on bd >= 0.62 or "beads_<prefix>" on older bd), InitBeads drops the orphan
+// to prevent the silent data split documented in gh#3562.
 func (m *Manager) InitBeads(rigPath, prefix, rigName string) error {
 	// Validate prefix format to prevent command injection from config files
 	if !isValidBeadsPrefix(prefix) {
@@ -1094,13 +1166,16 @@ func (m *Manager) InitBeads(rigPath, prefix, rigName string) error {
 	// Build environment with explicit BEADS_DIR to prevent bd from
 	// finding a parent directory's .beads/ database
 	env := os.Environ()
-	filteredEnv := make([]string, 0, len(env)+1)
+	filteredEnv := make([]string, 0, len(env)+2)
 	for _, e := range env {
-		if !strings.HasPrefix(e, "BEADS_DIR=") {
+		if !strings.HasPrefix(e, "BEADS_DIR=") && !strings.HasPrefix(e, "BEADS_DB=") && !strings.HasPrefix(e, "BEADS_DOLT_SERVER_DATABASE=") {
 			filteredEnv = append(filteredEnv, e)
 		}
 	}
 	filteredEnv = append(filteredEnv, "BEADS_DIR="+beadsDir)
+	if rigName != "" {
+		filteredEnv = append(filteredEnv, "BEADS_DOLT_SERVER_DATABASE="+rigName)
+	}
 
 	// Ensure BEADS_DOLT_PORT and BEADS_DOLT_SERVER_HOST are set when their GT_
 	// counterparts are present, so that bd subprocesses connect to the correct
@@ -1134,6 +1209,9 @@ func (m *Manager) InitBeads(rigPath, prefix, rigName string) error {
 	initArgs := []string{"init"}
 	if prefix != "" {
 		initArgs = append(initArgs, "--prefix", prefix)
+	}
+	if rigName != "" {
+		initArgs = append(initArgs, "--database", rigName)
 	}
 	initArgs = append(initArgs, "--server")
 	// Always pass --server-port so bd connects to gt's central Dolt server.
@@ -1174,20 +1252,30 @@ func (m *Manager) InitBeads(rigPath, prefix, rigName string) error {
 			}
 		}
 
-		// Drop the orphaned beads_<prefix> database created by bd init (gt-sv1h).
-		// bd init --prefix creates a database named beads_<prefix> on the Dolt server,
-		// but the rig uses <rigName> as its database (set by InitRig + EnsureMetadata).
-		// Without cleanup, orphans accumulate with every polecat spawn.
+		// Drop orphan databases created by bd init (gh#3562, gt-sv1h).
+		// bd init --prefix creates a database whose name depends on the bd version:
+		//   bd >= 0.62: "<prefix>"        (e.g. "ma" for prefix=ma)
+		//   bd <  0.62: "beads_<prefix>"  (e.g. "beads_ma")
+		// The rig uses <rigName> as its canonical database (set by InitRig +
+		// EnsureMetadata). Orphans must be dropped or beads created from the
+		// rig will silently land in the wrong DB and become invisible to the mayor.
 		if rigName != "" {
-			orphanDB := "beads_" + prefix
-			if orphanDB != rigName {
-				_ = doltserver.RemoveDatabase(m.townRoot, orphanDB, true)
+			if err := dropRigOrphanDBs(m.townRoot, prefix, rigName); err != nil {
+				// Non-fatal: AddRig has a post-init verification step that errors
+				// loudly if an orphan persists. Log here so the trail is visible
+				// when rig init is invoked outside AddRig.
+				fmt.Fprintf(os.Stderr, "Warning: orphan database cleanup: %v\n", err)
 			}
 		}
 	}
 
 	if err := beads.EnsureConfigYAML(beadsDir, prefix); err != nil {
 		return fmt.Errorf("ensuring config.yaml: %w", err)
+	}
+	if rigName != "" {
+		if err := doltserver.EnsureMetadataForBeadsDir(m.townRoot, beadsDir, rigName, rigName); err != nil {
+			return fmt.Errorf("ensuring metadata.json: %w", err)
+		}
 	}
 
 	// Ensure database has repository fingerprint (GH #25).
@@ -1411,6 +1499,23 @@ var beadsPrefixRegexp = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9-]{0,19}$`)
 // malicious config files.
 func isValidBeadsPrefix(prefix string) bool {
 	return beadsPrefixRegexp.MatchString(prefix)
+}
+
+func bdSubprocessEnv(beadsDir, database string) []string {
+	env := make([]string, 0, len(os.Environ())+2)
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, "BEADS_DIR=") || strings.HasPrefix(e, "BEADS_DB=") || strings.HasPrefix(e, "BEADS_DOLT_SERVER_DATABASE=") {
+			continue
+		}
+		env = append(env, e)
+	}
+	if beadsDir != "" {
+		env = append(env, "BEADS_DIR="+beadsDir)
+	}
+	if database != "" {
+		env = append(env, "BEADS_DOLT_SERVER_DATABASE="+database)
+	}
+	return env
 }
 
 // isStandardBeadHash checks if a string looks like a standard 5-char bead hash.

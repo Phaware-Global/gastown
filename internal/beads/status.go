@@ -21,6 +21,11 @@ const (
 	AgentStateRunning      AgentState = "running"
 	AgentStateNuked        AgentState = "nuked"
 	AgentStateAwaitingGate AgentState = "awaiting-gate"
+	// Deacon lifecycle states (hq-sa8de Phase A).
+	// patrolling: mid-cycle. idle (shared): cycle done, awaiting daemon poke.
+	// paused: operator-held standby via `gt deacon pause`.
+	AgentStatePatrolling AgentState = "patrolling"
+	AgentStatePaused     AgentState = "paused"
 )
 
 // ResolveAgentState returns the agent state Gastown should act on.
@@ -40,7 +45,7 @@ func ResolveAgentState(description, structured string) string {
 // States like "stuck" and "awaiting-gate" mean the polecat is paused on purpose.
 func (s AgentState) ProtectsFromCleanup() bool {
 	switch s {
-	case AgentStateStuck, AgentStateAwaitingGate:
+	case AgentStateStuck, AgentStateAwaitingGate, AgentStatePaused:
 		return true
 	default:
 		return false
@@ -50,7 +55,7 @@ func (s AgentState) ProtectsFromCleanup() bool {
 // IsActive returns true if the agent is actively doing work.
 func (s AgentState) IsActive() bool {
 	switch s {
-	case AgentStateWorking, AgentStateRunning, AgentStateSpawning:
+	case AgentStateWorking, AgentStateRunning, AgentStateSpawning, AgentStatePatrolling:
 		return true
 	default:
 		return false

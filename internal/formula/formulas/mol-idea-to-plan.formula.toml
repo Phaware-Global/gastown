@@ -115,6 +115,7 @@ echo "prd_draft=.prd-reviews/{{review_id}}/prd-draft.md" >> .prd-reviews/{{revie
 id = "prd-review"
 title = "Run parallel PRD review (6 legs)"
 needs = ["intake"]
+target = "mayor"
 description = """
 Pour the mol-prd-review convoy to run 6 parallel PRD reviewers.
 
@@ -153,6 +154,8 @@ cat .prd-reviews/<review-id>/prd-review.md
 id = "human-clarify"
 title = "Gather human clarifications on PRD"
 needs = ["prd-review"]
+target = "mayor"
+interactive = true
 description = """
 Present the consolidated questions to the human and capture their answers.
 
@@ -205,6 +208,7 @@ A: <human's answer>
 id = "generate-plan"
 title = "Generate implementation plan (6 design dimensions)"
 needs = ["human-clarify"]
+target = "mayor"
 description = """
 Pour the design convoy to generate an implementation plan from the refined PRD.
 
