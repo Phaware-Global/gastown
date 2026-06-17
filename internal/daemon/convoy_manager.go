@@ -475,6 +475,18 @@ func (m *ConvoyManager) scan() {
 	m.scanMu.Lock()
 	defer m.scanMu.Unlock()
 
+	// Backpressure: skip the scan while Dolt is flagged unhealthy. Each scan
+	// shells `gt convoy stranded` + a `gt convoy check` per convoy, all of
+	// which run heavy `bd list` queries; piling them onto a degraded Dolt
+	// deepens the outage (the convoy-check death-spiral). Skipping is safe:
+	// clearUnhealthySignal fires onRecoveryFn when Dolt transitions back to
+	// healthy, which triggers a fresh recovery sweep, so convoys skipped here
+	// are picked up as soon as Dolt recovers.
+	if IsDoltUnhealthy(m.townRoot) {
+		m.logger("Convoy: Dolt unhealthy — skipping stranded scan (sweeps on recovery)")
+		return
+	}
+
 	stranded, err := m.findStranded()
 	if err != nil {
 		m.logger("Convoy: stranded scan failed: %s", util.FirstLine(err.Error()))

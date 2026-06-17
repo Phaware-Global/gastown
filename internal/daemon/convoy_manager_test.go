@@ -279,6 +279,53 @@ func TestScanStranded_ClosesEmptyConvoys(t *testing.T) {
 	}
 }
 
+func TestScanStranded_SkipsWhenDoltUnhealthy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+
+	// An empty convoy that would normally be auto-closed via `gt convoy check`.
+	paths := mockGtForScanTest(t, scanTestOpts{
+		strandedJSON: `[{"id":"hq-empty1","title":"Empty","ready_count":0,"ready_issues":[]}]`,
+	})
+
+	// Flag Dolt unhealthy: scan() must back off and skip entirely so it does not
+	// pile heavy convoy queries onto a degraded Dolt (the death-spiral guard).
+	daemonDir := filepath.Join(paths.townRoot, "daemon")
+	if err := os.MkdirAll(daemonDir, 0755); err != nil {
+		t.Fatalf("mkdir daemon: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(daemonDir, "DOLT_UNHEALTHY"), []byte("{}"), 0644); err != nil {
+		t.Fatalf("write DOLT_UNHEALTHY: %v", err)
+	}
+
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+
+	m := NewConvoyManager(paths.townRoot, logger, "gt", 10*time.Minute, nil, nil, nil)
+	m.scan()
+
+	// No `gt convoy check` (or any convoy subprocess) should run while unhealthy.
+	if _, err := os.Stat(paths.checkLogPath); err == nil {
+		data, _ := os.ReadFile(paths.checkLogPath)
+		t.Errorf("convoy check ran while Dolt unhealthy (should skip): %s", data)
+	}
+
+	// Should log the skip.
+	found := false
+	for _, s := range logged {
+		if strings.Contains(s, "Dolt unhealthy") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected Dolt-unhealthy skip log, got: %v", logged)
+	}
+}
+
 func TestScanStranded_GracePeriodSkipsRecentConvoy(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on Windows")
