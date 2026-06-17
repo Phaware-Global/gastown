@@ -357,8 +357,10 @@ func slingReviewFixPolecat(rigName string, state dispatchReviewFixState, threads
 	}
 
 	// Dispatch with the documented sling form: `gt sling <bead> <rig> ...`.
-	// The bare rig target auto-spawns a fresh polecat; --pr/--branch route it
-	// onto the existing PR branch (consumed by sling's slingPR/slingBranchOverride).
+	// The bare rig target auto-spawns a fresh polecat; --review-pr/--review-branch
+	// route it onto the existing PR branch (consumed by sling's
+	// slingPR/slingBranchOverride). These flags are namespaced with the review-
+	// prefix because upstream's resume feature owns the bare --pr/--branch (fork-sync).
 	//
 	// Earlier this passed a `review-fix/<issue-id>` pseudo-target plus a --json
 	// flag, neither of which gt sling understands — cobra rejected the unknown
@@ -426,8 +428,8 @@ func reviewFixSlingArgs(rigName string, state dispatchReviewFixState, mission st
 		"sling",
 		state.SourceIssue,
 		rigName,
-		"--pr", fmt.Sprintf("%d", state.PRNumber),
-		"--branch", state.Branch,
+		"--review-pr", fmt.Sprintf("%d", state.PRNumber),
+		"--review-branch", state.Branch,
 		"--args", mission,
 		"--force",
 	}
