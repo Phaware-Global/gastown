@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"text/template"
@@ -796,13 +797,11 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 
 	// Step 2: Create step beads and wire dependencies
 	stepBeads := make(map[string]string) // step.ID -> bead ID
+	setVars := parseSetVars(formulaRunSet)
 
 	for _, step := range f.Steps {
 		stepBeadID := fmt.Sprintf("%s-wfs-%s", rigPrefix, generateFormulaShortID())
-
-		// Step descriptions contain {{var}} placeholders (e.g., {{problem}},
-		// {{context}}) that are instructions for the executing AGENT, not Go
-		// template vars. Do not render them — pass through verbatim.
+		stepDescription := workflowStepDescription(step, substituteFormulaVars(step.Description, setVars))
 
 		// Use --body-file=- (stdin) for the description to avoid CLI arg
 		// length limits and quoting issues with large markdown descriptions.
@@ -822,7 +821,7 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 			Dir(rigBeadsDir).
 			Stderr(os.Stderr).
 			Build()
-		createCmd.Stdin = strings.NewReader(step.Description)
+		createCmd.Stdin = strings.NewReader(stepDescription)
 		if err := createCmd.Run(); err != nil {
 			fmt.Printf("%s Failed to create step bead for %s: %v\n",
 				style.Dim.Render("Warning:"), step.ID, err)
@@ -897,16 +896,19 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 			continue
 		}
 
-		// Non-interactive step: sling to a polecat
+		// Non-interactive step: sling to the step's target, or to the rig's
+		// polecat pool by default.
 		// Agent precedence: CLI --agent > formula-level
 		stepAgent := formulaRunAgent
 		if stepAgent == "" {
 			stepAgent = f.Agent
 		}
+		stepTarget := workflowStepTarget(step, targetRig)
+		stepDescription := workflowStepDescription(step, substituteFormulaVars(step.Description, setVars))
 
 		slingArgs := []string{
-			"sling", stepBeadID, targetRig,
-			"-a", step.Description,
+			"sling", stepBeadID, stepTarget,
+			"-a", stepDescription,
 			"-s", step.Title,
 		}
 		if stepAgent != "" {
@@ -948,6 +950,24 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 	return nil
 }
 
+const workflowTargetField = "workflow_target"
+
+func workflowStepDescription(step formula.Step, description string) string {
+	target := strings.TrimSpace(step.Target)
+	if target == "" {
+		return description
+	}
+	return fmt.Sprintf("%s: %s\n\n%s", workflowTargetField, target, description)
+}
+
+func workflowStepTarget(step formula.Step, targetRig string) string {
+	target := strings.TrimSpace(step.Target)
+	if target == "" || target == "rig" {
+		return targetRig
+	}
+	return target
+}
+
 // truncate shortens a string to maxLen, appending "..." if truncated.
 // Truncates at the first newline if one appears before maxLen.
 func truncate(s string, maxLen int) string {
@@ -969,6 +989,25 @@ func parseSetVars(setArgs []string) map[string]interface{} {
 		}
 	}
 	return vars
+}
+
+var formulaVarPlaceholder = regexp.MustCompile(`\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}`)
+
+func substituteFormulaVars(text string, vars map[string]interface{}) string {
+	if len(vars) == 0 {
+		return text
+	}
+	return formulaVarPlaceholder.ReplaceAllStringFunc(text, func(match string) string {
+		sub := formulaVarPlaceholder.FindStringSubmatch(match)
+		if len(sub) < 2 {
+			return match
+		}
+		v, ok := vars[sub[1]]
+		if !ok {
+			return match
+		}
+		return fmt.Sprint(v)
+	})
 }
 
 // findFormulaFile searches for a formula file by name

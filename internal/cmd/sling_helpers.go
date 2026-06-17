@@ -109,6 +109,49 @@ func isDeferredBead(info *beadInfo) bool {
 	return false
 }
 
+func applyWorkflowStepTargetOverride(args []string) ([]string, error) {
+	if len(args) != 2 {
+		return args, nil
+	}
+	rigName, isRig := IsRigName(args[1])
+	if !isRig {
+		return args, nil
+	}
+	info, err := getBeadInfo(args[0])
+	if err != nil {
+		return args, nil
+	}
+	target := workflowStepTargetFromDescription(info.Description, rigName)
+	if target == "" || target == args[1] {
+		return args, nil
+	}
+	if err := ValidateTarget(target); err != nil {
+		return args, fmt.Errorf("invalid %s for %s: %w", workflowTargetField, args[0], err)
+	}
+	redirected := append([]string(nil), args...)
+	redirected[1] = target
+	fmt.Printf("%s Workflow step target: %s\n", style.Dim.Render("→"), target)
+	return redirected, nil
+}
+
+func workflowStepTargetFromDescription(description, targetRig string) string {
+	for _, line := range strings.Split(description, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if !ok {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(key), workflowTargetField) {
+			continue
+		}
+		target := strings.TrimSpace(value)
+		if target == "" || target == "rig" {
+			return targetRig
+		}
+		return target
+	}
+	return ""
+}
+
 // isOrphanMolecule reports whether a bead's existing attached molecule(s)
 // can be safely burned at sling time without operator confirmation. Used
 // to gate the auto-burn path that lets sling self-heal from stale state.
@@ -258,6 +301,47 @@ func verifyBeadExists(beadID string) error {
 	if len(out) == 0 {
 		return fmt.Errorf("bead '%s' not found", beadID)
 	}
+	return nil
+}
+
+// verifyBeadExistsInTargetRigDatabase checks the target rig's beads database
+// directly instead of following prefix routing. This prevents gt sling from
+// spawning polecats or creating molecule/hook side effects for beads that only
+// resolve from HQ or another rig database.
+func verifyBeadExistsInTargetRigDatabase(beadID, targetRig, townRoot string) error {
+	if beadID == "" {
+		return nil
+	}
+	if targetRig == "" {
+		return fmt.Errorf("cannot verify bead %s in target rig: target rig is empty; refusing to sling before creating hooks or molecule side effects", beadID)
+	}
+	if townRoot == "" {
+		return fmt.Errorf("cannot verify bead %s in target rig %q: town root is unavailable; refusing to sling before creating hooks or molecule side effects", beadID, targetRig)
+	}
+
+	targetRigDir := beads.GetRigDirForName(townRoot, targetRig)
+	if targetRigDir == "" {
+		return fmt.Errorf("cannot resolve target rig %q beads database for bead %s; refusing to sling before creating hooks or molecule side effects", targetRig, beadID)
+	}
+	targetBeadsDir := filepath.Join(targetRigDir, ".beads")
+
+	out, err := BdCmd("--db", targetBeadsDir, "show", beadID, "--json", "--allow-stale").
+		Dir(targetRigDir).
+		StripBeadsDir().
+		Stderr(io.Discard).
+		Output()
+	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+		return fmt.Errorf("bead %s is not present in target rig %q beads database; refusing to sling before creating hooks or molecule side effects", beadID, targetRig)
+	}
+
+	var infos []beadInfo
+	if err := json.Unmarshal(out, &infos); err != nil {
+		return fmt.Errorf("checking target rig %q database for bead %s: %w", targetRig, beadID, err)
+	}
+	if len(infos) == 0 {
+		return fmt.Errorf("bead %s is not present in target rig %q beads database; refusing to sling before creating hooks or molecule side effects", beadID, targetRig)
+	}
+
 	return nil
 }
 

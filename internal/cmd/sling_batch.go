@@ -27,10 +27,15 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 			return fmt.Errorf("bead '%s' not found", beadID)
 		}
 	}
+	townRoot := filepath.Dir(townBeadsDir)
+	for _, beadID := range beadIDs {
+		if err := verifyBeadExistsInTargetRigDatabase(beadID, rigName, townRoot); err != nil {
+			return err
+		}
+	}
 
 	// Cross-rig guard: check all beads match the target rig before spawning (gt-myecw)
 	if !slingForce {
-		townRoot := filepath.Dir(townBeadsDir)
 		for _, beadID := range beadIDs {
 			prefix := beads.ExtractPrefix(beadID)
 			beadRig := beads.GetRigNameForPrefix(townRoot, prefix)
@@ -92,7 +97,6 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 	}
 
 	// Cook formula once before the loop for efficiency
-	townRoot := filepath.Dir(townBeadsDir)
 	formulaCooked := false
 
 	// Pre-cook formula before the loop (batch optimization: cook once, instantiate many)

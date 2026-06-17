@@ -133,12 +133,12 @@ func resolveSelfTarget() (agentID string, pane string, hookRoot string, err erro
 
 // ResolveTargetOptions controls target resolution behavior.
 type ResolveTargetOptions struct {
-	DryRun   bool
-	Force    bool
-	Create   bool
-	Account  string
-	Agent    string
-	NoBoot   bool
+	DryRun       bool
+	Force        bool
+	Create       bool
+	Account      string
+	Agent        string
+	NoBoot       bool
 	HookBead     string // Bead ID to set atomically during polecat spawn (empty = skip)
 	BeadID       string // For cross-rig guard checks (empty = skip guard)
 	TownRoot     string
@@ -235,6 +235,11 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 				return nil, err
 			}
 		}
+		if opts.BeadID != "" {
+			if err := verifyBeadExistsInTargetRigDatabase(opts.BeadID, rigName, opts.TownRoot); err != nil {
+				return nil, err
+			}
+		}
 		if opts.DryRun {
 			fmt.Printf("Would spawn fresh polecat in rig '%s'\n", rigName)
 			result.Agent = fmt.Sprintf("%s/polecats/<new>", rigName)
@@ -279,6 +284,11 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 						return nil, err
 					}
 				}
+				if opts.BeadID != "" {
+					if err := verifyBeadExistsInTargetRigDatabase(opts.BeadID, rigName, opts.TownRoot); err != nil {
+						return nil, err
+					}
+				}
 				fmt.Printf("Target polecat has no active session, spawning fresh polecat in rig '%s'...\n", rigName)
 				spawnOpts := SlingSpawnOptions{
 					Force:        opts.Force,
@@ -304,6 +314,15 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 			}
 		}
 		return nil, fmt.Errorf("resolving target: %w", err)
+	}
+	if opts.BeadID != "" && isPolecatTarget(agentID) {
+		parts := strings.Split(agentID, "/")
+		if len(parts) >= 3 && parts[1] == "polecats" {
+			rigName := parts[0]
+			if err := verifyBeadExistsInTargetRigDatabase(opts.BeadID, rigName, opts.TownRoot); err != nil {
+				return nil, err
+			}
+		}
 	}
 	result.Agent = agentID
 	result.Pane = pane

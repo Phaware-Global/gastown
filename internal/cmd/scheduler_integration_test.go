@@ -1294,6 +1294,9 @@ func TestScheduleBead_RefusesTombstone(t *testing.T) {
 	closeCmd := exec.Command("bd", "close", beadID, "--tombstone")
 	closeCmd.Dir = rigPath
 	if out, err := closeCmd.CombinedOutput(); err != nil {
+		if strings.Contains(string(out), "unknown flag: --tombstone") {
+			t.Skip("bd CLI does not support close --tombstone")
+		}
 		t.Fatalf("bd close --tombstone %s failed: %v\n%s", beadID, err, out)
 	}
 
