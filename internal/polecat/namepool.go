@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -362,6 +363,10 @@ func (p *NamePool) Reconcile(existingPolecats []string) {
 	for _, name := range existingPolecats {
 		if p.isThemedName(name) {
 			p.InUse[name] = true
+			continue
+		}
+		if seq, err := strconv.Atoi(name); err == nil && seq >= p.OverflowNext {
+			p.OverflowNext = seq + 1
 		}
 	}
 }

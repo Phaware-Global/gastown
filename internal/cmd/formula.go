@@ -363,13 +363,8 @@ func dryRunFormula(f *formula.Formula, formulaName, targetRig string) error {
 		// Show output directory if configured
 		var outputDir string
 		if f.Output != nil && f.Output.Directory != "" {
-			dirCtx := map[string]interface{}{
-				"review_id":    reviewID,
-				"formula_name": formulaName,
-			}
-			for k, v := range setVars {
-				dirCtx[k] = v
-			}
+			dirCtx := formulaTemplateContext(formulaName, targetDescription, reviewID,
+				formulaRunPR, prTitle, changedFiles, formulaRunFiles, setVars)
 			outputDir = renderTemplateOrDefault(f.Output.Directory, dirCtx, ".reviews/"+reviewID)
 			fmt.Printf("\n  Output directory: %s\n", outputDir)
 		}
@@ -378,23 +373,13 @@ func dryRunFormula(f *formula.Formula, formulaName, targetRig string) error {
 		for _, leg := range f.Legs {
 			// Show rendered output path for each leg
 			if f.Output != nil && outputDir != "" {
-				legCtx := map[string]interface{}{
-					"formula_name":       formulaName,
-					"target_description": targetDescription,
-					"review_id":          reviewID,
-					"pr_number":          formulaRunPR,
-					"pr_title":           prTitle,
-					"leg": map[string]interface{}{
-						"id":          leg.ID,
-						"title":       leg.Title,
-						"focus":       leg.Focus,
-						"description": leg.Description,
-					},
-					"changed_files": changedFiles,
-					"files":         formulaRunFiles,
-				}
-				for k, v := range setVars {
-					legCtx[k] = v
+				legCtx := formulaTemplateContext(formulaName, targetDescription, reviewID,
+					formulaRunPR, prTitle, changedFiles, formulaRunFiles, setVars)
+				legCtx["leg"] = map[string]interface{}{
+					"id":          leg.ID,
+					"title":       leg.Title,
+					"focus":       leg.Focus,
+					"description": leg.Description,
 				}
 				legPattern := renderTemplateOrDefault(f.Output.LegPattern, legCtx, leg.ID+"-findings.md")
 				outputPath := filepath.Join(outputDir, legPattern)
@@ -527,14 +512,14 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 		prTitle, changedFiles = fetchPRInfo(formulaRunPR)
 	}
 
+	// Parse --set key=value pairs for template rendering.
+	setVars := parseSetVars(formulaRunSet)
+
 	// Create output directory if configured
 	var outputDir string
 	if f.Output != nil && f.Output.Directory != "" {
-		// Build minimal context for directory rendering
-		dirCtx := map[string]interface{}{
-			"review_id":    reviewID,
-			"formula_name": formulaName,
-		}
+		dirCtx := formulaTemplateContext(formulaName, targetDescription, reviewID,
+			formulaRunPR, prTitle, changedFiles, formulaRunFiles, setVars)
 		outputDir = renderTemplateOrDefault(f.Output.Directory, dirCtx, ".reviews/"+reviewID)
 
 		// Create the directory
@@ -546,9 +531,6 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 		}
 	}
 
-	// Parse --set key=value pairs for template rendering
-	setVars := parseSetVars(formulaRunSet)
-
 	// Step 2: Create leg beads and track them
 	legBeads := make(map[string]string) // leg.ID -> bead ID
 	for _, leg := range f.Legs {
@@ -559,25 +541,13 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 		if f.Prompts != nil {
 			if basePrompt, ok := f.Prompts["base"]; ok {
 				// Build template context for this leg
-				legCtx := map[string]interface{}{
-					"formula_name":       formulaName,
-					"target_description": targetDescription,
-					"review_id":          reviewID,
-					"pr_number":          formulaRunPR,
-					"pr_title":           prTitle,
-					"leg": map[string]interface{}{
-						"id":          leg.ID,
-						"title":       leg.Title,
-						"focus":       leg.Focus,
-						"description": leg.Description,
-					},
-					"changed_files": changedFiles,
-					"files":         formulaRunFiles,
-				}
-
-				// Inject --set key=value pairs into template context
-				for k, v := range setVars {
-					legCtx[k] = v
+				legCtx := formulaTemplateContext(formulaName, targetDescription, reviewID,
+					formulaRunPR, prTitle, changedFiles, formulaRunFiles, setVars)
+				legCtx["leg"] = map[string]interface{}{
+					"id":          leg.ID,
+					"title":       leg.Title,
+					"focus":       leg.Focus,
+					"description": leg.Description,
 				}
 
 				// Compute output path for this leg
@@ -585,10 +555,7 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 					legPattern := renderTemplateOrDefault(f.Output.LegPattern, legCtx, leg.ID+"-findings.md")
 					outputPath := filepath.Join(outputDir, legPattern)
 					legCtx["output_path"] = outputPath
-					legCtx["output"] = map[string]interface{}{
-						"directory": outputDir,
-						"synthesis": f.Output.Synthesis,
-					}
+					addOutputTemplateContext(legCtx, outputDir, f.Output.Synthesis)
 				}
 
 				// Render the base prompt with template context
@@ -641,6 +608,17 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 		synDesc := f.Synthesis.Description
 		if synDesc == "" {
 			synDesc = "Synthesize findings from all legs into unified output"
+		}
+		synCtx := formulaTemplateContext(formulaName, targetDescription, reviewID,
+			formulaRunPR, prTitle, changedFiles, formulaRunFiles, setVars)
+		if f.Output != nil {
+			addOutputTemplateContext(synCtx, outputDir, f.Output.Synthesis)
+		}
+		if rendered, err := renderTemplate(synDesc, synCtx); err == nil {
+			synDesc = rendered
+		} else {
+			fmt.Printf("%s Failed to render synthesis template: %v\n",
+				style.Dim.Render("Warning:"), err)
 		}
 
 		synArgs := []string{
@@ -1014,6 +992,29 @@ func parseSetVars(setArgs []string) map[string]interface{} {
 		}
 	}
 	return vars
+}
+
+func formulaTemplateContext(formulaName, targetDescription, reviewID string, prNumber int, prTitle string, changedFiles []map[string]interface{}, files []string, setVars map[string]interface{}) map[string]interface{} {
+	ctx := map[string]interface{}{
+		"formula_name":       formulaName,
+		"target_description": targetDescription,
+		"review_id":          reviewID,
+		"pr_number":          prNumber,
+		"pr_title":           prTitle,
+		"changed_files":      changedFiles,
+		"files":              files,
+	}
+	for k, v := range setVars {
+		ctx[k] = v
+	}
+	return ctx
+}
+
+func addOutputTemplateContext(ctx map[string]interface{}, outputDir, synthesisFile string) {
+	ctx["output"] = map[string]interface{}{
+		"directory": outputDir,
+		"synthesis": synthesisFile,
+	}
 }
 
 var formulaVarPlaceholder = regexp.MustCompile(`\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}`)

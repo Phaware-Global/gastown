@@ -86,6 +86,20 @@ func doneContaminationBaseRef(defaultBranch, explicitTarget string) string {
 	return "origin/" + targetBranch
 }
 
+func shouldSyncIdlePolecatWorktree(exitType, mergeStrategy string, pushFailed, mrFailed, syncSafe bool) bool {
+	if exitType != ExitCompleted || pushFailed || mrFailed || !syncSafe {
+		return false
+	}
+	return mergeStrategy != "local"
+}
+
+func cleanupStatusAfterSuccessfulPush(status string) string {
+	if status == "unpushed" || status == "has_unpushed" {
+		return "clean"
+	}
+	return status
+}
+
 func init() {
 	doneCmd.Flags().StringVar(&doneIssue, "issue", "", "Source issue ID (default: parse from branch name)")
 	doneCmd.Flags().IntVarP(&donePriority, "priority", "p", -1, "Override priority (0-4, default: inherit from issue)")
@@ -774,6 +788,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				goto notifyWitness
 			}
 			fmt.Printf("%s Branch pushed directly to %s\n", style.Bold.Render("✓"), defaultBranch)
+			doneCleanupStatus = cleanupStatusAfterSuccessfulPush(doneCleanupStatus)
 
 			// Close the base issue — no MR/refinery will close it
 			if issueID != "" {
@@ -898,9 +913,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 		// Fix cleanup_status after successful push (gt-wcr).
 		// Status was detected before push, so "unpushed" is now stale.
-		if doneCleanupStatus == "unpushed" {
-			doneCleanupStatus = "clean"
-		}
+		doneCleanupStatus = cleanupStatusAfterSuccessfulPush(doneCleanupStatus)
 
 		// Write push checkpoint for resume (gt-aufru)
 		if agentBeadID != "" {
@@ -1214,6 +1227,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					goto notifyWitness
 				}
 				fmt.Printf("%s Branch pushed directly to %s\n", style.Bold.Render("✓"), defaultBranch)
+				doneCleanupStatus = cleanupStatusAfterSuccessfulPush(doneCleanupStatus)
 
 				// Close the issue directly — refinery won't process it.
 				if issueID != "" {
@@ -1599,23 +1613,43 @@ notifyWitness:
 		// dirty on the feature branch so work can be recovered.
 		syncSafe := true
 		if cwdAvailable {
-			if ws, wsErr := g.CheckUncommittedWork(); wsErr == nil && ws.HasUncommittedChanges && !ws.CleanExcludingRuntime() {
+			if ws, wsErr := g.CheckUncommittedWork(); wsErr != nil {
+				syncSafe = false
+				style.PrintWarning("could not inspect worktree before idle sync: %v — skipping sync to preserve work", wsErr)
+			} else if ws.HasUncommittedChanges && !ws.CleanExcludingRuntime() {
 				syncSafe = false
 				style.PrintWarning("uncommitted changes still present — skipping worktree sync to preserve work")
 				fmt.Printf("  Files: %s\n", ws.String())
 			}
 		}
-		if cwdAvailable && !pushFailed && !mrFailed && syncSafe {
+		if exitType == ExitCompleted && issueID != "" && convoyInfo == nil {
+			// Use the pr-mode-aware resolver (G22, matches the call sites above)
+			// so this idle-sync path also applies the direct/local→mr override
+			// under rig pr-mode, rather than the bare getConvoyInfo* lookups
+			// upstream added here. (augment review, PR #105)
+			convoyInfo = resolveConvoyInfoForIssue(issueID, cwd, townRoot, rigName)
+		}
+		mergeStrategy := ""
+		if convoyInfo != nil {
+			mergeStrategy = convoyInfo.MergeStrategy
+		}
+		if cwdAvailable && shouldSyncIdlePolecatWorktree(exitType, mergeStrategy, pushFailed, mrFailed, syncSafe) {
 			// Remember the old branch so we can delete it after switching
 			oldBranch := branch
 
 			fmt.Printf("%s Syncing worktree to %s...\n", style.Bold.Render("→"), defaultBranch)
-			if err := g.Checkout(defaultBranch); err != nil {
-				style.PrintWarning("could not checkout %s: %v (worktree stays on feature branch)", defaultBranch, err)
-			} else if err := g.Pull("origin", defaultBranch); err != nil {
-				style.PrintWarning("could not pull %s: %v (worktree on %s but may be stale)", defaultBranch, defaultBranch, err)
+			syncRef := "origin/" + defaultBranch
+			if err := g.Fetch("origin"); err != nil {
+				style.PrintWarning("could not fetch origin before idle sync: %v (using local refs)", err)
+			}
+			if err := g.CheckoutDetach(syncRef); err != nil {
+				if fallbackErr := g.CheckoutDetach(defaultBranch); fallbackErr != nil {
+					style.PrintWarning("could not detach checkout %s: %v; fallback %s also failed: %v (worktree stays on feature branch)", syncRef, err, defaultBranch, fallbackErr)
+				} else {
+					fmt.Printf("%s Worktree synced to %s (detached fallback)\n", style.Bold.Render("✓"), defaultBranch)
+				}
 			} else {
-				fmt.Printf("%s Worktree synced to %s\n", style.Bold.Render("✓"), defaultBranch)
+				fmt.Printf("%s Worktree synced to %s (detached)\n", style.Bold.Render("✓"), syncRef)
 			}
 
 			// Delete the old polecat branch (non-fatal: cleanup only).

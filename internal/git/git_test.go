@@ -510,6 +510,56 @@ func TestCheckout(t *testing.T) {
 	}
 }
 
+func TestCheckoutDetachAllowsBranchCheckedOutInAnotherWorktree(t *testing.T) {
+	dir := initTestRepo(t)
+	g := NewGit(dir)
+
+	mainBranch, err := g.CurrentBranch()
+	if err != nil {
+		t.Fatalf("CurrentBranch: %v", err)
+	}
+	mainSHA, err := g.Rev(mainBranch)
+	if err != nil {
+		t.Fatalf("Rev %s: %v", mainBranch, err)
+	}
+
+	worktreePath := filepath.Join(t.TempDir(), "worker")
+	runGit(t, dir, "worktree", "add", "-b", "polecat/test-detach", worktreePath, "HEAD")
+	workerGit := NewGit(worktreePath)
+
+	if err := os.WriteFile(filepath.Join(dir, "after-worker.txt"), []byte("new main commit\n"), 0644); err != nil {
+		t.Fatalf("write after-worker file: %v", err)
+	}
+	runGit(t, dir, "add", "after-worker.txt")
+	runGit(t, dir, "commit", "-m", "advance main")
+	mainSHA, err = g.Rev(mainBranch)
+	if err != nil {
+		t.Fatalf("Rev advanced %s: %v", mainBranch, err)
+	}
+
+	if err := workerGit.Checkout(mainBranch); err == nil {
+		t.Fatalf("Checkout(%s) succeeded, expected branch-in-use failure", mainBranch)
+	}
+	if err := workerGit.CheckoutDetach(mainBranch); err != nil {
+		t.Fatalf("CheckoutDetach(%s): %v", mainBranch, err)
+	}
+
+	branch, err := workerGit.CurrentBranch()
+	if err != nil {
+		t.Fatalf("CurrentBranch after detach: %v", err)
+	}
+	if branch != "HEAD" {
+		t.Fatalf("branch after detach = %q, want HEAD", branch)
+	}
+	headSHA, err := workerGit.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev HEAD after detach: %v", err)
+	}
+	if headSHA != mainSHA {
+		t.Fatalf("detached HEAD = %q, want %q", headSHA, mainSHA)
+	}
+}
+
 func TestCheckoutNewBranch(t *testing.T) {
 	dir := initTestRepo(t)
 	g := NewGit(dir)
@@ -2848,6 +2898,76 @@ func TestListPushRemoteRefsWithHashesUsesPushURLHash(t *testing.T) {
 	}
 	if hashMerged {
 		t.Fatal("expected push remote hash to remain unmerged despite merged fetch tracking ref")
+	}
+}
+
+func TestDeleteRemoteBranchIfAtRejectsChangedBranch(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	branch := "polecat/lease-test"
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "lease.txt"), []byte("old"), 0644); err != nil {
+		t.Fatalf("write old: %v", err)
+	}
+	if err := g.Add("lease.txt"); err != nil {
+		t.Fatalf("Add old: %v", err)
+	}
+	if err := g.Commit("lease old"); err != nil {
+		t.Fatalf("Commit old: %v", err)
+	}
+	oldHash, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev old: %v", err)
+	}
+	if err := g.Push("origin", branch, false); err != nil {
+		t.Fatalf("Push old: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(localDir, "lease.txt"), []byte("new"), 0644); err != nil {
+		t.Fatalf("write new: %v", err)
+	}
+	if err := g.Add("lease.txt"); err != nil {
+		t.Fatalf("Add new: %v", err)
+	}
+	if err := g.Commit("lease new"); err != nil {
+		t.Fatalf("Commit new: %v", err)
+	}
+	newHash, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev new: %v", err)
+	}
+	if err := g.Push("origin", branch, false); err != nil {
+		t.Fatalf("Push new: %v", err)
+	}
+
+	if err := g.DeleteRemoteBranchIfAt("origin", branch, oldHash); err == nil {
+		t.Fatal("DeleteRemoteBranchIfAt should reject a branch that advanced")
+	}
+	exists, err := g.RemoteBranchExists("origin", branch)
+	if err != nil {
+		t.Fatalf("RemoteBranchExists after rejected delete: %v", err)
+	}
+	if !exists {
+		t.Fatal("branch should still exist after rejected delete")
+	}
+	if err := g.DeleteRemoteBranchIfAt("origin", branch, newHash); err != nil {
+		t.Fatalf("DeleteRemoteBranchIfAt current hash: %v", err)
+	}
+	exists, err = g.RemoteBranchExists("origin", branch)
+	if err != nil {
+		t.Fatalf("RemoteBranchExists after delete: %v", err)
+	}
+	if exists {
+		t.Fatal("branch should be deleted when expected hash matches")
+	}
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main: %v", err)
 	}
 }
 

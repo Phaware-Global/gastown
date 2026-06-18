@@ -474,6 +474,60 @@ func TestShouldNudgeRefinery(t *testing.T) {
 	}
 }
 
+func TestShouldSyncIdlePolecatWorktree(t *testing.T) {
+	tests := []struct {
+		name          string
+		exitType      string
+		mergeStrategy string
+		pushFailed    bool
+		mrFailed      bool
+		syncSafe      bool
+		want          bool
+	}{
+		{"completed default strategy syncs", ExitCompleted, "", false, false, true, true},
+		{"completed direct strategy syncs", ExitCompleted, "direct", false, false, true, true},
+		{"completed mr strategy syncs", ExitCompleted, "mr", false, false, true, true},
+		{"local strategy keeps branch", ExitCompleted, "local", false, false, true, false},
+		{"deferred keeps branch", ExitDeferred, "", false, false, true, false},
+		{"escalated keeps branch", ExitEscalated, "", false, false, true, false},
+		{"push failure keeps branch", ExitCompleted, "", true, false, true, false},
+		{"mr failure keeps branch", ExitCompleted, "", false, true, true, false},
+		{"unsafe sync keeps branch", ExitCompleted, "", false, false, false, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldSyncIdlePolecatWorktree(tt.exitType, tt.mergeStrategy, tt.pushFailed, tt.mrFailed, tt.syncSafe)
+			if got != tt.want {
+				t.Errorf("shouldSyncIdlePolecatWorktree(%q, %q, %v, %v, %v) = %v, want %v",
+					tt.exitType, tt.mergeStrategy, tt.pushFailed, tt.mrFailed, tt.syncSafe, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCleanupStatusAfterSuccessfulPush(t *testing.T) {
+	tests := []struct {
+		status string
+		want   string
+	}{
+		{"unpushed", "clean"},
+		{"has_unpushed", "clean"},
+		{"clean", "clean"},
+		{"uncommitted", "uncommitted"},
+		{"stash", "stash"},
+		{"unknown", "unknown"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.status, func(t *testing.T) {
+			if got := cleanupStatusAfterSuccessfulPush(tt.status); got != tt.want {
+				t.Errorf("cleanupStatusAfterSuccessfulPush(%q) = %q, want %q", tt.status, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestClearDoneIntentLabel verifies that clearDoneIntentLabel removes
 // only done-intent labels while preserving other labels.
 func TestClearDoneIntentLabel(t *testing.T) {

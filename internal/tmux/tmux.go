@@ -1903,7 +1903,9 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 		// Auto-skip Escape when the resolved agent preset declares ESC cancels
 		// in-flight generation. Defensive fallback so callers that forget to
 		// pass SkipEscape (e.g., the mail router) still get correct behavior
-		// based on GT_AGENT + preset.EscapeCancelsRequest.
+		// based on GT_AGENT + preset.EscapeCancelsRequest. This preset-driven
+		// check subsumes upstream's hardcoded copilot auto-skip (copilot's
+		// preset already sets EscapeCancelsRequest=true). (fork-sync DECISION C)
 		opts.SkipEscape = true
 	}
 
@@ -3172,6 +3174,45 @@ func hasBusyIndicator(line string) bool {
 		return false
 	}
 	return strings.Contains(trimmed, "esc to interrupt")
+}
+
+// shouldSendEscapeForLines reports whether the vim-mode Escape keystroke
+// (nudge delivery step 5) is safe to send, given a snapshot of pane lines.
+//
+// The Escape exists to exit a vim-mode composer's INSERT mode so the following
+// Enter submits the line (GH#307). But in Claude Code — and Codex/Gemini —
+// Escape also cancels in-flight generation; the status bar literally reads
+// "esc to interrupt" while the agent is working. Sending Escape in that state
+// would interrupt the agent's current turn (e.g. the Mayor). Returns false when
+// any line shows the busy indicator so the caller suppresses the Escape.
+//
+// FRAGILITY: this depends on the agent TUI rendering the literal substring
+// "esc to interrupt" while generating (via hasBusyIndicator — the same
+// assumption IsIdle/WaitForIdle already make). If that upstream status text
+// changes, the gate fails open and silently: the Escape is sent again and
+// nudges can resume interrupting the agent. Tracked in gastownhall/gastown#4240.
+func shouldSendEscapeForLines(lines []string) bool {
+	for _, line := range lines {
+		if hasBusyIndicator(line) {
+			return false
+		}
+	}
+	return true
+}
+
+// shouldSendEscape captures the target's pane and reports whether the vim-mode
+// Escape is safe to send right now (see shouldSendEscapeForLines). Callers
+// snapshot before writing nudge text so the message itself cannot masquerade as
+// the busy indicator. On capture failure it returns false: when we cannot
+// confirm the agent is idle, skipping the Escape is the safe default — it avoids
+// interrupting an active agent and is harmless for the common (non-vim) case
+// where Enter alone submits.
+func (t *Tmux) shouldSendEscape(target string) bool {
+	lines, err := t.CapturePaneLines(target, 5)
+	if err != nil {
+		return false
+	}
+	return shouldSendEscapeForLines(lines)
 }
 
 func readyPromptPrefixForSession(t *Tmux, session string) string {
