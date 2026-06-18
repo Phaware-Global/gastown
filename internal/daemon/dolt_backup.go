@@ -16,7 +16,15 @@ import (
 
 const (
 	defaultDoltBackupInterval = 15 * time.Minute
-	doltBackupTimeout         = 120 * time.Second
+	// doltBackupTimeout is generous so a large commit delta on a big database
+	// (e.g. hq under a wisp flood) does not blow the deadline mid-sync. The old
+	// 120s ceiling produced spurious exit-1 backup failures (gt-ye21).
+	doltBackupTimeout = 5 * time.Minute
+	// doltBackupRetries / doltBackupRetryDelay retry a failed sync after a short
+	// pause, so a transient lock (a concurrent dolt op holding the db) does not
+	// fail the whole backup cycle.
+	doltBackupRetries    = 1
+	doltBackupRetryDelay = 5 * time.Second
 )
 
 // doltBackupInterval returns the configured backup interval, or the default (15m).
@@ -106,23 +114,43 @@ func (d *Daemon) syncDoltBackups() {
 	mol.closeStep("report")
 }
 
-// syncBackup runs `dolt backup sync <backup-name>` for a single database.
+// syncBackup runs `dolt backup sync <backup-name>` for a single database,
+// retrying once on failure so a transient lock or large delta does not fail the
+// cycle (gt-ye21).
 func (d *Daemon) syncBackup(dataDir, db, backupName string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), doltBackupTimeout)
-	defer cancel()
-
-	dbDir := dataDir + "/" + db
-	cmd := exec.CommandContext(ctx, "dolt", "backup", "sync", backupName)
-	cmd.Dir = dbDir
-	util.SetDetachedProcessGroup(cmd)
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s: %s", err, strings.TrimSpace(string(output)))
+	parentCtx := d.ctx
+	if parentCtx == nil {
+		parentCtx = context.Background()
 	}
+	dbDir := filepath.Join(dataDir, db)
 
-	d.logger.Printf("dolt_backup: %s: synced to %s", db, backupName)
-	return nil
+	var lastErr error
+	for attempt := 0; attempt <= doltBackupRetries; attempt++ {
+		if attempt > 0 {
+			d.logger.Printf("dolt_backup: %s: retry %d/%d after error: %v", db, attempt, doltBackupRetries, lastErr)
+			timer := time.NewTimer(doltBackupRetryDelay)
+			select {
+			case <-timer.C:
+			case <-parentCtx.Done():
+				timer.Stop()
+				return parentCtx.Err()
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(parentCtx, doltBackupTimeout)
+		cmd := exec.CommandContext(ctx, "dolt", "backup", "sync", backupName)
+		cmd.Dir = dbDir
+		util.SetProcessGroup(cmd)
+
+		output, err := cmd.CombinedOutput()
+		cancel()
+		if err == nil {
+			d.logger.Printf("dolt_backup: %s: synced to %s", db, backupName)
+			return nil
+		}
+		lastErr = fmt.Errorf("%s: %s", err, strings.TrimSpace(string(output)))
+	}
+	return lastErr
 }
 
 // syncOffsiteBackup rsyncs the local backup directory to iCloud Drive.

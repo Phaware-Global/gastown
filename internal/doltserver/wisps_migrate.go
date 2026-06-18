@@ -3,11 +3,11 @@
 // The wisps table is a dolt_ignored copy of the issues table schema, used for
 // ephemeral operational data (agent beads, patrol wisps, etc.) that should not
 // be version-controlled. This migration:
-//   1. Creates the wisps table and auxiliary tables (wisp_labels, wisp_comments,
-//      wisp_events, wisp_dependencies) if they don't exist
-//   2. Copies existing agent beads (issue_type='agent') from issues to wisps
-//   3. Copies associated labels, comments, events, and dependencies
-//   4. Closes the originals in the issues table
+//  1. Creates the wisps table and auxiliary tables (wisp_labels, wisp_comments,
+//     wisp_events, wisp_dependencies) if they don't exist
+//  2. Copies existing agent beads (issue_type='agent') from issues to wisps
+//  3. Copies associated labels, comments, events, and dependencies
+//  4. Closes the originals in the issues table
 //
 // The migration uses `bd sql` for beads-side operations (copying agent beads between
 // the issues and wisps tables in bd's own database). Additionally, it ensures that
@@ -68,6 +68,9 @@ func MigrateAgentBeadsToWisps(townRoot, workDir string, dryRun bool) (*MigrateWi
 		return nil, fmt.Errorf("creating auxiliary tables: %w", err)
 	}
 	result.AuxTablesCreated = auxTables
+	if err := ensureWispDependencySchema(workDir); err != nil {
+		return nil, fmt.Errorf("updating wisp dependency schema: %w", err)
+	}
 
 	// Step 3b: Ensure wisps tables also exist on the gt Dolt server.
 	// The reaper connects directly to the gt Dolt server (port 3307), which is
@@ -205,6 +208,79 @@ func ensureWispAuxTables(workDir string) ([]string, error) {
 	return created, nil
 }
 
+func ensureWispDependencySchema(workDir string) error {
+	if !bdTableExists(workDir, "wisp_dependencies") {
+		return nil
+	}
+	columns, err := bdSQLCSV(workDir, "SHOW COLUMNS FROM wisp_dependencies")
+	if err != nil {
+		return err
+	}
+	if hasCSVColumn(columns, "depends_on_issue_id") && hasCSVColumn(columns, "depends_on_wisp_id") && hasCSVColumn(columns, "depends_on_external") {
+		if !hasCSVColumn(columns, "depends_on_id") {
+			return nil
+		}
+	}
+	if !hasCSVColumn(columns, "depends_on_id") {
+		return fmt.Errorf("wisp_dependencies missing split dependency columns")
+	}
+	return rebuildWispDependencyTable(workDir)
+}
+
+func rebuildWispDependencyTable(workDir string) error {
+	if bdTableExists(workDir, "wisp_dependencies_legacy") {
+		return fmt.Errorf("wisp_dependencies_legacy already exists; refusing to overwrite migration backup")
+	}
+	legacyCount, err := bdSQLCount(workDir, "SELECT COUNT(*) as cnt FROM wisp_dependencies")
+	if err != nil {
+		return err
+	}
+	if err := bdSQL(workDir, "RENAME TABLE wisp_dependencies TO wisp_dependencies_legacy"); err != nil {
+		return err
+	}
+	if err := bdSQL(workDir, wispDependenciesCreateDDL); err != nil {
+		return restoreWispDependencyBackup(workDir, err)
+	}
+	if err := bdSQL(workDir, `INSERT IGNORE INTO wisp_dependencies (issue_id, type, created_at, created_by, metadata, thread_id, depends_on_issue_id, depends_on_wisp_id, depends_on_external)
+SELECT wd.issue_id, wd.type, wd.created_at, wd.created_by, wd.metadata, wd.thread_id,
+       CASE WHEN w.id IS NULL AND i.id IS NOT NULL THEN wd.depends_on_id ELSE NULL END,
+       CASE WHEN w.id IS NOT NULL THEN wd.depends_on_id ELSE NULL END,
+       CASE WHEN w.id IS NULL AND i.id IS NULL THEN wd.depends_on_id ELSE NULL END
+FROM wisp_dependencies_legacy wd
+LEFT JOIN wisps w ON w.id = wd.depends_on_id
+LEFT JOIN issues i ON i.id = wd.depends_on_id`); err != nil {
+		return restoreWispDependencyBackup(workDir, err)
+	}
+	migratedCount, err := bdSQLCount(workDir, "SELECT COUNT(*) as cnt FROM wisp_dependencies")
+	if err != nil {
+		return restoreWispDependencyBackup(workDir, err)
+	}
+	if migratedCount != legacyCount {
+		return restoreWispDependencyBackup(workDir, fmt.Errorf("wisp_dependencies migration copied %d of %d rows", migratedCount, legacyCount))
+	}
+	return bdSQL(workDir, "DROP TABLE wisp_dependencies_legacy")
+}
+
+func restoreWispDependencyBackup(workDir string, cause error) error {
+	if err := bdSQL(workDir, "DROP TABLE IF EXISTS wisp_dependencies"); err != nil {
+		return fmt.Errorf("%w; restore failed dropping partial wisp_dependencies: %v", cause, err)
+	}
+	if err := bdSQL(workDir, "RENAME TABLE wisp_dependencies_legacy TO wisp_dependencies"); err != nil {
+		return fmt.Errorf("%w; restore failed renaming wisp_dependencies_legacy: %v", cause, err)
+	}
+	return cause
+}
+
+func hasCSVColumn(csvOutput, column string) bool {
+	for _, line := range strings.Split(csvOutput, "\n") {
+		fields := strings.SplitN(line, ",", 2)
+		if len(fields) > 0 && strings.Trim(fields[0], `"`) == column {
+			return true
+		}
+	}
+	return false
+}
+
 // copyAgentBeadsToWisps inserts agent beads from issues into wisps, skipping duplicates.
 func copyAgentBeadsToWisps(workDir string, result *MigrateWispsResult) error {
 	// INSERT IGNORE skips rows where the primary key already exists in wisps.
@@ -257,9 +333,21 @@ func copyAuxiliaryData(workDir string, result *MigrateWispsResult) error {
 
 	// Copy dependencies
 	if err := bdSQL(workDir,
-		"INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) SELECT d.issue_id, d.depends_on_id, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d INNER JOIN wisps w ON d.issue_id = w.id"); err != nil {
+		"INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_issue_id, depends_on_wisp_id, depends_on_external, type, created_at, created_by, metadata, thread_id) SELECT d.issue_id, CASE WHEN target_wisp.id IS NULL THEN d.depends_on_issue_id ELSE NULL END, CASE WHEN target_wisp.id IS NOT NULL THEN d.depends_on_issue_id ELSE d.depends_on_wisp_id END, d.depends_on_external, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d INNER JOIN wisps w ON d.issue_id = w.id LEFT JOIN wisps target_wisp ON target_wisp.id = d.depends_on_issue_id"); err != nil {
 		if !strings.Contains(err.Error(), "nothing") {
 			return fmt.Errorf("copying dependencies: %w", err)
+		}
+	}
+	if err := bdSQL(workDir,
+		"UPDATE wisp_dependencies wd INNER JOIN wisps target_wisp ON target_wisp.id = wd.depends_on_issue_id SET wd.depends_on_wisp_id = wd.depends_on_issue_id, wd.depends_on_issue_id = NULL"); err != nil {
+		if !strings.Contains(err.Error(), "nothing") {
+			return fmt.Errorf("retargeting wisp dependency targets: %w", err)
+		}
+	}
+	if err := bdSQL(workDir,
+		"UPDATE dependencies d INNER JOIN wisps target_wisp ON target_wisp.id = d.depends_on_issue_id SET d.depends_on_wisp_id = d.depends_on_issue_id, d.depends_on_issue_id = NULL"); err != nil {
+		if !strings.Contains(err.Error(), "nothing") {
+			return fmt.Errorf("retargeting dependency targets: %w", err)
 		}
 	}
 	cnt, _ = bdSQLCount(workDir, "SELECT COUNT(*) as cnt FROM wisp_dependencies")
@@ -333,6 +421,9 @@ func ensureWispsOnGTServer(host string, port int, dbName string) (wispsCreated b
 			fmt.Printf("  Note: dolt commit after table creation: %v\n", err)
 		}
 	}
+	if err := ensureWispDependencySchemaOnGT(ctx, db, dbName); err != nil {
+		return wispsCreated, auxCreated, err
+	}
 
 	return wispsCreated, auxCreated, nil
 }
@@ -345,6 +436,76 @@ func gtTableExists(ctx context.Context, db *sql.DB, dbName, tableName string) bo
 		"SELECT 1 FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
 		dbName, tableName).Scan(&dummy)
 	return err == nil
+}
+
+func gtWispDependencyColumnExists(ctx context.Context, db *sql.DB, dbName, columnName string) bool {
+	var dummy int
+	err := db.QueryRowContext(ctx,
+		"SELECT 1 FROM information_schema.columns WHERE table_schema = ? AND table_name = ? AND column_name = ?",
+		dbName, "wisp_dependencies", columnName).Scan(&dummy)
+	return err == nil
+}
+
+func ensureWispDependencySchemaOnGT(ctx context.Context, db *sql.DB, dbName string) error {
+	if !gtTableExists(ctx, db, dbName, "wisp_dependencies") {
+		return nil
+	}
+	if gtWispDependencyColumnExists(ctx, db, dbName, "depends_on_issue_id") &&
+		gtWispDependencyColumnExists(ctx, db, dbName, "depends_on_wisp_id") &&
+		gtWispDependencyColumnExists(ctx, db, dbName, "depends_on_external") {
+		if !gtWispDependencyColumnExists(ctx, db, dbName, "depends_on_id") {
+			return nil
+		}
+	}
+	if !gtWispDependencyColumnExists(ctx, db, dbName, "depends_on_id") {
+		return fmt.Errorf("wisp_dependencies missing split dependency columns")
+	}
+	return rebuildWispDependencyTableOnGT(ctx, db, dbName)
+}
+
+func rebuildWispDependencyTableOnGT(ctx context.Context, db *sql.DB, dbName string) error {
+	if gtTableExists(ctx, db, dbName, "wisp_dependencies_legacy") {
+		return fmt.Errorf("wisp_dependencies_legacy already exists; refusing to overwrite migration backup")
+	}
+	var legacyCount int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM wisp_dependencies").Scan(&legacyCount); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, "RENAME TABLE wisp_dependencies TO wisp_dependencies_legacy"); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, wispDependenciesCreateDDL); err != nil {
+		return restoreWispDependencyBackupOnGT(ctx, db, err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT IGNORE INTO wisp_dependencies (issue_id, type, created_at, created_by, metadata, thread_id, depends_on_issue_id, depends_on_wisp_id, depends_on_external)
+SELECT wd.issue_id, wd.type, wd.created_at, wd.created_by, wd.metadata, wd.thread_id,
+       CASE WHEN w.id IS NULL AND i.id IS NOT NULL THEN wd.depends_on_id ELSE NULL END,
+       CASE WHEN w.id IS NOT NULL THEN wd.depends_on_id ELSE NULL END,
+       CASE WHEN w.id IS NULL AND i.id IS NULL THEN wd.depends_on_id ELSE NULL END
+FROM wisp_dependencies_legacy wd
+LEFT JOIN wisps w ON w.id = wd.depends_on_id
+LEFT JOIN issues i ON i.id = wd.depends_on_id`); err != nil {
+		return restoreWispDependencyBackupOnGT(ctx, db, err)
+	}
+	var migratedCount int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM wisp_dependencies").Scan(&migratedCount); err != nil {
+		return restoreWispDependencyBackupOnGT(ctx, db, err)
+	}
+	if migratedCount != legacyCount {
+		return restoreWispDependencyBackupOnGT(ctx, db, fmt.Errorf("wisp_dependencies migration copied %d of %d rows", migratedCount, legacyCount))
+	}
+	_, err := db.ExecContext(ctx, "DROP TABLE wisp_dependencies_legacy")
+	return err
+}
+
+func restoreWispDependencyBackupOnGT(ctx context.Context, db *sql.DB, cause error) error {
+	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS wisp_dependencies"); err != nil {
+		return fmt.Errorf("%w; restore failed dropping partial wisp_dependencies: %v", cause, err)
+	}
+	if _, err := db.ExecContext(ctx, "RENAME TABLE wisp_dependencies_legacy TO wisp_dependencies"); err != nil {
+		return fmt.Errorf("%w; restore failed renaming wisp_dependencies_legacy: %v", cause, err)
+	}
+	return cause
 }
 
 // wispsCreateDDL is the CREATE TABLE statement for the wisps table.
@@ -417,6 +578,34 @@ type wispAuxTableDDL struct {
 	ddl  string
 }
 
+const wispDependenciesCreateDDL = `CREATE TABLE wisp_dependencies (
+  id char(36) NOT NULL DEFAULT (uuid()),
+  issue_id varchar(255) NOT NULL,
+  type varchar(32) NOT NULL DEFAULT 'blocks',
+  created_at datetime DEFAULT CURRENT_TIMESTAMP,
+  created_by varchar(255) DEFAULT '',
+  metadata json DEFAULT (json_object()),
+  thread_id varchar(255) DEFAULT '',
+  depends_on_issue_id varchar(255),
+  depends_on_wisp_id varchar(255),
+  depends_on_external varchar(255),
+  PRIMARY KEY (id),
+  KEY idx_wisp_dep_external_target (depends_on_external),
+  KEY idx_wisp_dep_issue_target (depends_on_issue_id),
+  KEY idx_wisp_dep_type (type),
+  KEY idx_wisp_dep_type_external (type, depends_on_external),
+  KEY idx_wisp_dep_type_issue (type, depends_on_issue_id),
+  KEY idx_wisp_dep_type_wisp (type, depends_on_wisp_id),
+  KEY idx_wisp_dep_wisp_target (depends_on_wisp_id),
+  UNIQUE KEY uk_wisp_dep_external_target (issue_id, depends_on_external),
+  UNIQUE KEY uk_wisp_dep_issue_target (issue_id, depends_on_issue_id),
+  UNIQUE KEY uk_wisp_dep_wisp_target (issue_id, depends_on_wisp_id),
+  CONSTRAINT fk_wisp_dep_issue FOREIGN KEY (issue_id) REFERENCES wisps (id) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT fk_wisp_dep_issue_target FOREIGN KEY (depends_on_issue_id) REFERENCES issues (id) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT fk_wisp_dep_wisp_target FOREIGN KEY (depends_on_wisp_id) REFERENCES wisps (id) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT ck_wisp_dep_one_target CHECK (((NOT(depends_on_issue_id IS NULL)) + (NOT(depends_on_wisp_id IS NULL)) + (NOT(depends_on_external IS NULL))) = 1)
+)`
+
 // wispAuxTableDDLs are the auxiliary tables needed alongside wisps.
 var wispAuxTableDDLs = []wispAuxTableDDL{
 	{
@@ -457,17 +646,7 @@ var wispAuxTableDDLs = []wispAuxTableDDL{
 	},
 	{
 		name: "wisp_dependencies",
-		ddl: `CREATE TABLE wisp_dependencies (
-  issue_id varchar(255) NOT NULL,
-  depends_on_id varchar(255) NOT NULL,
-  type varchar(32) NOT NULL DEFAULT 'blocks',
-  created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  created_by varchar(255) NOT NULL DEFAULT '',
-  metadata json,
-  thread_id varchar(255) DEFAULT '',
-  PRIMARY KEY (issue_id, depends_on_id),
-  KEY idx_wisp_deps_depends_on (depends_on_id)
-)`,
+		ddl:  wispDependenciesCreateDDL,
 	},
 }
 

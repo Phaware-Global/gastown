@@ -104,11 +104,13 @@ func TestBuildPinnedBDEnvUsesSelectedConnectionMetadata(t *testing.T) {
 		"BEADS_DIR=/wrong",
 		"BEADS_DB=/wrong.db",
 		"BD_DB=/wrong.bd",
+		"BEADS_DOLT_DATABASE=legacy-hq",
 		"BEADS_DOLT_SERVER_DATABASE=hq",
 		"BEADS_DOLT_SERVER_HOST=wrong-host",
 		"BEADS_DOLT_SERVER_PORT=9999",
 		"BEADS_DOLT_PORT=9999",
 		"BEADS_DOLT_DATA_DIR=/wrong/data",
+		"BEADS_DOLT_FUTURE_SELECTOR=wrong",
 		"BEADS_DOLT_AUTO_START=0",
 	}, beadsDir)
 	got := envMap(env)
@@ -128,13 +130,69 @@ func TestBuildPinnedBDEnvUsesSelectedConnectionMetadata(t *testing.T) {
 	if got["BEADS_DOLT_SERVER_PORT"] != "4407" || got["BEADS_DOLT_PORT"] != "4407" {
 		t.Fatalf("ports = server:%q legacy:%q, want 4407 in %v", got["BEADS_DOLT_SERVER_PORT"], got["BEADS_DOLT_PORT"], env)
 	}
-	for _, key := range []string{"BEADS_DB", "BD_DB", "BEADS_DOLT_DATA_DIR"} {
+	for _, key := range []string{"BEADS_DB", "BD_DB", "BEADS_DOLT_DATABASE", "BEADS_DOLT_DATA_DIR", "BEADS_DOLT_FUTURE_SELECTOR"} {
 		if value, ok := got[key]; ok {
 			t.Fatalf("%s should be stripped, got %q in %v", key, value, env)
 		}
 	}
 	if got["BEADS_DOLT_AUTO_START"] != "0" {
 		t.Fatalf("BEADS_DOLT_AUTO_START should be preserved, got %q in %v", got["BEADS_DOLT_AUTO_START"], env)
+	}
+}
+
+func TestBuildPinnedBDEnvStripsCaseVariantTargetEnvWhenKeysAreCaseInsensitive(t *testing.T) {
+	withCaseInsensitiveEnvKeys(t)
+
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	metadata := []byte(`{"dolt_database":"rigdb","dolt_server_host":"127.0.0.1","dolt_server_port":4407}`)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), metadata, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	env := BuildPinnedBDEnv([]string{
+		"PATH=/usr/bin",
+		"beads_dir=/wrong",
+		"beads_db=/wrong.db",
+		"bd_db=/wrong.bd",
+		"beads_dolt_server_database=hq",
+		"beads_dolt_server_host=wrong-host",
+		"beads_dolt_server_port=9999",
+		"beads_dolt_port=9999",
+		"beads_dolt_data_dir=/wrong/data",
+		"beads_dolt_auto_start=0",
+		"bd_export_auto=true",
+	}, beadsDir)
+	got := envMap(env)
+
+	for _, key := range []string{
+		"beads_dir",
+		"beads_db",
+		"bd_db",
+		"beads_dolt_server_database",
+		"beads_dolt_server_host",
+		"beads_dolt_server_port",
+		"beads_dolt_port",
+		"beads_dolt_data_dir",
+		"bd_export_auto",
+	} {
+		if value, ok := got[key]; ok {
+			t.Fatalf("case-variant %s should be stripped, got %q in %v", key, value, env)
+		}
+	}
+	if got["BEADS_DIR"] != beadsDir || got["BEADS_DOLT_SERVER_DATABASE"] != "rigdb" {
+		t.Fatalf("pinned target env not restored canonically: %v", env)
+	}
+	if got["BEADS_DOLT_SERVER_HOST"] != "127.0.0.1" || got["BEADS_DOLT_SERVER_PORT"] != "4407" || got["BEADS_DOLT_PORT"] != "4407" {
+		t.Fatalf("connection env not restored canonically: %v", env)
+	}
+	if got["beads_dolt_auto_start"] != "0" {
+		t.Fatalf("case-variant BEADS_DOLT_AUTO_START should be preserved, got %v", env)
+	}
+	if got["BD_EXPORT_AUTO"] != "false" {
+		t.Fatalf("BD_EXPORT_AUTO = %q, want false in %v", got["BD_EXPORT_AUTO"], env)
 	}
 }
 
@@ -327,6 +385,13 @@ func envMap(env []string) map[string]string {
 		}
 	}
 	return out
+}
+
+func withCaseInsensitiveEnvKeys(t *testing.T) {
+	t.Helper()
+	old := envKeysCaseInsensitive
+	envKeysCaseInsensitive = true
+	t.Cleanup(func() { envKeysCaseInsensitive = old })
 }
 
 // TestCreateRoutesSameDatabaseViaBEADSDIR verifies that when opts.Rig resolves

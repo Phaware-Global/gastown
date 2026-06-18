@@ -16,18 +16,18 @@ import (
 	"github.com/steveyegge/gastown/internal/doltserver"
 )
 
-func TestBuildBdInitArgs_AlwaysIncludesServerPort(t *testing.T) {
+func TestBuildBdInitArgs_AlwaysIncludesServerPortWithoutReinit(t *testing.T) {
 	townDir := t.TempDir()
 	t.Setenv("GT_DOLT_PORT", "")
 	t.Setenv("BEADS_DOLT_PORT", "")
 
 	args := buildBdInitArgs(townDir)
 
-	// 7 args: init --prefix hq --server --server-port 3307 --force
-	// --force was appended in gh#3829 to make bd 1.0+ persist issue_prefix
-	// reliably even when the dolt server-side database already exists.
-	if len(args) != 7 {
-		t.Fatalf("expected 7 args, got %d: %v", len(args), args)
+	// 6 args: init --prefix hq --server --server-port 3307. Upstream's
+	// #4274 dropped the gh#3829 --force: `gt install --force` preserves town
+	// state, whereas a bd reinit flag would destroy existing town beads.
+	if len(args) != 6 {
+		t.Fatalf("expected 6 args, got %d: %v", len(args), args)
 	}
 	if args[4] != "--server-port" {
 		t.Fatalf("expected args[4] = --server-port, got %q", args[4])
@@ -35,8 +35,10 @@ func TestBuildBdInitArgs_AlwaysIncludesServerPort(t *testing.T) {
 	if args[5] != "3307" {
 		t.Fatalf("expected default port 3307, got %q", args[5])
 	}
-	if args[6] != "--force" {
-		t.Fatalf("expected args[6] = --force, got %q", args[6])
+	for _, arg := range args {
+		if arg == "--force" || arg == "--reinit-local" {
+			t.Fatalf("expected no destructive reinit flag, got %v", args)
+		}
 	}
 }
 
