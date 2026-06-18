@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -499,6 +501,14 @@ func TestExecuteExternalActions(t *testing.T) {
 	// executeExternalActions prints warnings/info but doesn't return errors.
 	// We test that it doesn't panic with various configurations.
 
+	// Slack delivery POSTs to the configured webhook with no client timeout;
+	// point it at a local stub so the test never depends on (or hangs on) the
+	// real hooks.slack.com endpoint in sandboxed CI networks.
+	slackStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slackStub.Close()
+
 	tests := []struct {
 		name    string
 		actions []string
@@ -547,7 +557,7 @@ func TestExecuteExternalActions(t *testing.T) {
 			actions: []string{"slack"},
 			cfg: &config.EscalationConfig{
 				Contacts: config.EscalationContacts{
-					SlackWebhook: "https://hooks.slack.com/test",
+					SlackWebhook: slackStub.URL,
 				},
 			},
 		},
@@ -563,7 +573,7 @@ func TestExecuteExternalActions(t *testing.T) {
 				Contacts: config.EscalationContacts{
 					HumanEmail:   "test@example.com",
 					HumanSMS:     "+15551234567",
-					SlackWebhook: "https://hooks.slack.com/test",
+					SlackWebhook: slackStub.URL,
 				},
 			},
 		},

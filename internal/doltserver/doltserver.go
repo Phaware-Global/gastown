@@ -1396,7 +1396,7 @@ func FindIdleMonitorProcesses(townRoot string) []int {
 func findIdleMonitorProcessesFromPS(output, townRoot, absRoot string, port int) []int {
 	portStr := strconv.Itoa(port)
 	var pids []int
-	for _, line := range strings.Split(string(output), "\n") {
+	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.Contains(line, "idle-monitor") {
 			continue
@@ -2750,6 +2750,17 @@ func InitRig(townRoot, rigName string) (serverWasRunning bool, created bool, err
 // persists config.issue_prefix. This covers direct `gt dolt init-rig` usage,
 // where no later InitBeads call exists to run bd init/config repair.
 func EnsureRigIssuePrefix(townRoot, rigName string, serverMode bool) error {
+	return EnsureRigIssuePrefixValue(townRoot, rigName, "", serverMode)
+}
+
+// EnsureRigIssuePrefixValue seeds the rig database's issue_prefix via the beads
+// SDK, which opens the rig's server-side database directly (BEADS_DOLT_SERVER_DATABASE
+// override). This is reliable where a `bd config set issue_prefix` CLI call is not:
+// bd v1.0.5 resolves a nested rig directory up to the parent town workspace, so the
+// CLI set lands on the wrong database. When prefix is empty it is derived via
+// issuePrefixForRigInit (preserving the original behavior for callers that don't
+// have an explicit prefix).
+func EnsureRigIssuePrefixValue(townRoot, rigName, prefix string, serverMode bool) error {
 	if townRoot == "" {
 		return fmt.Errorf("townRoot cannot be empty")
 	}
@@ -2757,7 +2768,9 @@ func EnsureRigIssuePrefix(townRoot, rigName string, serverMode bool) error {
 		return fmt.Errorf("rig name cannot be empty")
 	}
 
-	prefix := issuePrefixForRigInit(townRoot, rigName)
+	if prefix == "" {
+		prefix = issuePrefixForRigInit(townRoot, rigName)
+	}
 	beadsDir, err := FindOrCreateRigBeadsDir(townRoot, rigName)
 	if err != nil {
 		return err
@@ -2787,7 +2800,7 @@ func EnsureRigIssuePrefix(townRoot, rigName string, serverMode bool) error {
 	if err != nil {
 		return fmt.Errorf("opening beads database: %w", err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	if err := store.SetConfig(ctx, "issue_prefix", prefix); err != nil {
 		return fmt.Errorf("setting issue_prefix: %w", err)

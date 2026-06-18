@@ -88,6 +88,13 @@ func TestAutoRespawnHookCmd_Format(t *testing.T) {
 // TestAutoRespawnHook_RespawnWorks is the primary regression test: pane dies,
 // hook fires on the correct socket, pane comes back alive.
 func TestAutoRespawnHook_RespawnWorks(t *testing.T) {
+	// Drives real tmux async respawn behavior (hook installs a 3s sleep, then we
+	// wait for the pane to die and be respawned). The timing is inherently racy
+	// under load and flakes in CI's `-race -short` Test job. Skip in -short mode;
+	// it still runs in full (non-short) test runs.
+	if testing.Short() {
+		t.Skip("flaky real-tmux timing test; skipped in -short (runs in full test runs)")
+	}
 	socket := requireTestSocket(t)
 	session := "test-respawn"
 
@@ -183,6 +190,11 @@ func getPanePIDSafe(socket, session string) string {
 // daemon restarts the pane during the hook's 3s sleep, the hook must NOT kill
 // the fresh process.
 func TestAutoRespawnHook_SkipsAlreadyAlive(t *testing.T) {
+	// Same real-tmux timing class as TestAutoRespawnHook_RespawnWorks: racy under
+	// load. Skip in -short mode; it still runs in full (non-short) test runs.
+	if testing.Short() {
+		t.Skip("flaky real-tmux timing test; skipped in -short (runs in full test runs)")
+	}
 	socket := requireTestSocket(t)
 	session := "test-skip-alive"
 

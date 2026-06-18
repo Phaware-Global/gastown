@@ -2136,7 +2136,11 @@ if [ "$cmd" != "version" ] && [ "${BEADS_DIR:-}" != "$EXPECTED" ]; then
   exit 9
 fi
 case "$cmd" in
-  version|update|config|reopen)
+  version)
+    echo "bd 0.60.0"
+    exit 0
+    ;;
+  update|config|reopen)
     exit 0
     ;;
   create)

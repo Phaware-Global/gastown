@@ -41,19 +41,28 @@ var schedulerTestCounter atomic.Int32
 func initBeadsDBForServer(t *testing.T, dir, prefix string) {
 	t.Helper()
 
-	args := []string{"init", "--prefix", prefix}
-	// Forward GT_DOLT_PORT so bd connects to the ephemeral test server
-	// instead of defaulting to port 3307.
-	// bd v1.0.0+ defaults to embedded mode; --server is required to use an
-	// external server (v0.57.0 defaulted to server mode and ignored --server).
-	if p := os.Getenv("GT_DOLT_PORT"); p != "" {
-		args = append(args, "--server", "--server-port", p)
-	}
-	cmd := exec.Command("bd", args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
+	port := os.Getenv("GT_DOLT_PORT")
+	out, err := runSchedulerBdInit(dir, prefix, "", port)
 	t.Logf("bd init --prefix %s in %s: exit=%v\n%s", prefix, dir, err, out)
-	if err != nil {
+	if err != nil && port != "" {
+		// bd v1.0.5 refuses `bd init` in a directory nested under an
+		// already-initialized workspace: it walks up, finds the town's .beads,
+		// and reports "This workspace is already initialized." Production never
+		// runs `bd init` for rigs — it seeds them via the SDK. Mirror that here
+		// by initializing the schema + server database in an isolated temp dir
+		// (no parent workspace to detect), then relocating the resulting .beads
+		// into the nested target. --database pins the server database to the
+		// prefix-based name the rest of the harness (and cleanup) expects.
+		initDir := t.TempDir()
+		if out2, err2 := runSchedulerBdInit(initDir, prefix, "beads_"+prefix, port); err2 != nil {
+			t.Fatalf("isolated bd init for %s failed: %v\n%s", dir, err2, out2)
+		}
+		target := filepath.Join(dir, ".beads")
+		if rmErr := os.RemoveAll(target); rmErr != nil {
+			t.Fatalf("clear stale .beads in %s: %v", dir, rmErr)
+		}
+		copyTreeForTest(t, filepath.Join(initDir, ".beads"), target)
+	} else if err != nil {
 		t.Fatalf("bd init failed in %s: %v\n%s", dir, err, out)
 	}
 
@@ -66,6 +75,50 @@ func initBeadsDBForServer(t *testing.T, dir, prefix string) {
 
 	if err := beads.EnsureCustomTypes(filepath.Join(dir, ".beads")); err != nil {
 		t.Fatalf("ensure custom types in %s: %v", dir, err)
+	}
+}
+
+// runSchedulerBdInit runs `bd init` for the scheduler harness. database, when
+// non-empty, pins the server database name (--database); port, when non-empty,
+// targets the shared test Dolt server. bd v1.0.0+ defaults to embedded mode, so
+// --server is required to use the external test server.
+func runSchedulerBdInit(dir, prefix, database, port string) ([]byte, error) {
+	args := []string{"init", "--prefix", prefix}
+	if database != "" {
+		args = append(args, "--database", database)
+	}
+	if port != "" {
+		args = append(args, "--server", "--server-port", port)
+	}
+	cmd := exec.Command("bd", args...)
+	cmd.Dir = dir
+	return cmd.CombinedOutput()
+}
+
+// copyTreeForTest recursively copies the contents of src into dst, used to
+// relocate an isolated `bd init` .beads directory into a nested rig path.
+func copyTreeForTest(t *testing.T, src, dst string) {
+	t.Helper()
+	err := filepath.Walk(src, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, relErr := filepath.Rel(src, path)
+		if relErr != nil {
+			return relErr
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0755)
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		return os.WriteFile(target, data, info.Mode().Perm())
+	})
+	if err != nil {
+		t.Fatalf("copy %s -> %s: %v", src, dst, err)
 	}
 }
 
@@ -1409,6 +1462,16 @@ func TestScheduleBead_RefusesClosed(t *testing.T) {
 // TestScheduleBead_RefusesTombstone verifies that scheduleBead refuses to
 // schedule a tombstoned bead. Companion to TestScheduleBead_RefusesClosed.
 func TestScheduleBead_RefusesTombstone(t *testing.T) {
+	// This test (introduced upstream in #3840) tombstones a bead via
+	// `bd close --tombstone`. Our fork pins bd v1.0.0 in CI (to avoid the
+	// ICU/CGO build requirement of beads >=1.0.5), and that flag is absent
+	// from bd v1.0.0's `bd close`. Skip when the installed bd lacks the flag
+	// rather than fail on an unsupported feature; the closed-bead path is still
+	// covered by TestScheduleBead_RefusesClosed.
+	if helpOut, _ := exec.Command("bd", "close", "--help").CombinedOutput(); !strings.Contains(string(helpOut), "--tombstone") {
+		t.Skip("installed bd lacks `bd close --tombstone`; skipping tombstone scheduler guard test")
+	}
+
 	hqPath, rigPath, gtBinary, env := setupSchedulerIntegrationTown(t)
 
 	beadID := createTestBead(t, rigPath, "Tombstone bead refused by scheduleBead")

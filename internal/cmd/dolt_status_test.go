@@ -42,6 +42,10 @@ func TestReadBeadsRuntimeConfigServerMetadata(t *testing.T) {
 }
 
 func TestReadBeadsRuntimeConfigDefaultServerAddr(t *testing.T) {
+	// Isolate from the process-wide GT_DOLT_PORT that the shared Dolt-container
+	// integration harness sets (internal/testutil/doltserver.go) — this test
+	// asserts the DefaultPort fallback when metadata omits a port.
+	t.Setenv("GT_DOLT_PORT", "")
 	townRoot := t.TempDir()
 	beadsDir := filepath.Join(townRoot, ".beads")
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
