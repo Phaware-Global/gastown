@@ -85,8 +85,13 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 	}
 
 	config := doltserver.DefaultConfig(townRoot)
-	dsn := fmt.Sprintf("%s@tcp(%s)/%s?parseTime=true&timeout=5s&readTimeout=60s&writeTimeout=300s",
-		config.User, config.HostPort(), dbName)
+	// wa-d6f: socket-first DSN (TCP fallback) — eliminates TIME_WAIT churn.
+	dsn := buildDoltDSNFromConfig(config, dbName, dsnOpts{
+		ParseTime:    true,
+		Timeout:      "5s",
+		ReadTimeout:  "60s",
+		WriteTimeout: "300s",
+	})
 
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {

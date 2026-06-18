@@ -93,26 +93,27 @@ func TestRunConvoyList_UsesTownRootAndStripsBeadsDir(t *testing.T) {
 	scriptBody := fmt.Sprintf(`
 # Allow-stale version probe is exempt from BEADS_DIR check.
 if [ "$*" = "--allow-stale version" ]; then
+  echo "bd 0.60.0"
   exit 0
 fi
 
-if [ -n "$BEADS_DIR" ]; then
-  echo "BEADS_DIR leaked: $BEADS_DIR" >&2
+if [ "$BEADS_DIR" != "%s/.beads" ]; then
+  echo "expected hardened BEADS_DIR, got $BEADS_DIR" >&2
   exit 1
 fi
 
 case "$*" in
-	  "list --label=gt:convoy --json --limit=0 --all")
+	  "list --label=gt:convoy --json --limit=0 --all --flat")
 	    if [ "$PWD" != "%s" ]; then
 	      echo "expected town root, got $PWD" >&2
 	      exit 1
 	    fi
 	    echo '[{"id":"hq-cv-town","title":"Town convoy","status":"open","created_at":"2026-03-09T00:00:00Z","labels":["gt:convoy"]}]'
 	    ;;
-	  "list --json --limit=0 --all")
+	  "list --json --limit=0 --all --flat")
 	    echo '[]'
 	    ;;
-  "dep list hq-cv-town --direction=down --type=tracks --allow-stale --json")
+  "--allow-stale dep list hq-cv-town --direction=down --type=tracks --json")
     if [ "$PWD" != "%s" ]; then
       echo "expected town root, got $PWD" >&2
       exit 1
@@ -131,7 +132,7 @@ case "$*" in
     exit 1
     ;;
 esac
-`, expectedWD, expectedWD, expectedWD)
+`, expectedWD, expectedWD, expectedWD, expectedWD)
 	writeRoutingBdStub(t, scriptBody)
 
 	oldJSON, oldAll, oldStatus, oldTree := convoyListJSON, convoyListAll, convoyListStatus, convoyListTree
@@ -169,11 +170,12 @@ func TestRunConvoyStatus_UsesTownRootAndStripsBeadsDir(t *testing.T) {
 	scriptBody := fmt.Sprintf(`
 # Allow-stale version probe is exempt from BEADS_DIR check.
 if [ "$*" = "--allow-stale version" ]; then
+  echo "bd 0.60.0"
   exit 0
 fi
 
-if [ -n "$BEADS_DIR" ]; then
-  echo "BEADS_DIR leaked: $BEADS_DIR" >&2
+if [ "$BEADS_DIR" != "%s/.beads" ]; then
+  echo "expected hardened BEADS_DIR, got $BEADS_DIR" >&2
   exit 1
 fi
 
@@ -185,7 +187,7 @@ case "$*" in
     fi
     echo '[{"id":"hq-cv-status","title":"Status convoy","status":"open","issue_type":"convoy","created_at":"2026-03-09T00:00:00Z","labels":[],"dependencies":[]}]'
     ;;
-  "dep list hq-cv-status --direction=down --type=tracks --allow-stale --json")
+  "--allow-stale dep list hq-cv-status --direction=down --type=tracks --json")
     if [ "$PWD" != "%s" ]; then
       echo "expected town root, got $PWD" >&2
       exit 1
@@ -197,7 +199,7 @@ case "$*" in
     exit 1
     ;;
 esac
-`, expectedWD, expectedWD)
+`, expectedWD, expectedWD, expectedWD)
 	writeRoutingBdStub(t, scriptBody)
 
 	oldJSON := convoyStatusJSON

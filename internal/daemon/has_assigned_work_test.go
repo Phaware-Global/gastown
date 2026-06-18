@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestHasAssignedOpenWork_UsesRepoRoutingInsteadOfRigFlag(t *testing.T) {
+func TestHasAssignedOpenWork_UsesPinnedBeadsDirInsteadOfRigOrRepoFlag(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses Unix shell script mocks")
 	}
@@ -27,24 +27,25 @@ func TestHasAssignedOpenWork_UsesRepoRoutingInsteadOfRigFlag(t *testing.T) {
 
 	binDir := t.TempDir()
 	logPath := filepath.Join(binDir, "bd.log")
-	expectedRepo := filepath.Join(townRoot, "gastown", "mayor", "rig")
+	expectedBeadsDir := filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads")
 	script := `#!/bin/sh
 for arg in "$@"; do
-  if [ "$arg" = "--repo=` + expectedRepo + `" ]; then
-    repo_seen=1
-  fi
   case "$arg" in
+    --repo=*)
+      echo "unexpected --repo flag with pinned BEADS_DIR" >&2
+      exit 1
+      ;;
     --rig=*)
       echo "Error: unknown flag: --rig" >&2
       exit 1
       ;;
-  esac
+    esac
 done
-if [ "${repo_seen:-0}" -ne 1 ]; then
-  echo "missing expected --repo flag" >&2
+if [ "$BEADS_DIR" != "` + expectedBeadsDir + `" ]; then
+  echo "unexpected BEADS_DIR: $BEADS_DIR" >&2
   exit 1
 fi
-printf '%s\n' "$*" >> "` + logPath + `"
+printf 'BEADS_DIR=%s args=%s\n' "$BEADS_DIR" "$*" >> "` + logPath + `"
 printf '[{"id":"gt-123"}]\n'
 `
 	bdPath := filepath.Join(binDir, "bd")
@@ -69,7 +70,10 @@ printf '[{"id":"gt-123"}]\n'
 	if strings.Contains(loggedArgs, "--rig=") {
 		t.Fatalf("expected bd call to avoid --rig, got %q", loggedArgs)
 	}
-	if !strings.Contains(loggedArgs, "--repo="+expectedRepo) {
-		t.Fatalf("expected bd call to include resolved --repo flag, got %q", loggedArgs)
+	if strings.Contains(loggedArgs, "--repo=") {
+		t.Fatalf("expected bd call to avoid --repo with pinned BEADS_DIR, got %q", loggedArgs)
+	}
+	if !strings.Contains(loggedArgs, "BEADS_DIR="+expectedBeadsDir) {
+		t.Fatalf("expected bd call to pin BEADS_DIR to %q, got %q", expectedBeadsDir, loggedArgs)
 	}
 }

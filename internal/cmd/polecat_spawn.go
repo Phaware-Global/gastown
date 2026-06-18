@@ -2,6 +2,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -49,13 +50,15 @@ func (s *SpawnedPolecatInfo) SessionStarted() bool {
 
 // SlingSpawnOptions contains options for spawning a polecat via sling.
 type SlingSpawnOptions struct {
-	Force        bool   // Force spawn even if polecat has uncommitted work
-	Account      string // Claude Code account handle to use
-	Create       bool   // Create polecat if it doesn't exist (currently always true for sling)
-	HookBead     string // Bead ID to set as hook_bead at spawn time (atomic assignment)
-	Agent        string // Agent override for this spawn (e.g., "gemini", "codex", "claude-haiku")
-	BaseBranch   string // Override base branch for polecat worktree (e.g., "develop", "release/v2")
-	ResumeBranch string // Resume an existing branch (e.g. PR head) instead of creating polecat/<name>/<bead>@<ts>
+	TownRoot      string // Gas Town workspace root; falls back to cwd when empty
+	Force         bool   // Force spawn even if polecat has uncommitted work
+	Account       string // Claude Code account handle to use
+	Create        bool   // Create polecat if it doesn't exist (currently always true for sling)
+	HookBead      string // Bead ID to set as hook_bead at spawn time (atomic assignment)
+	Agent         string // Agent override for this spawn (e.g., "gemini", "codex", "claude-haiku")
+	BaseBranch    string // Override base branch for polecat worktree (e.g., "develop", "release/v2")
+	ResumeBranch  string // Resume an existing branch (e.g. PR head) instead of creating polecat/<name>/<bead>@<ts>
+	SkipAdmission bool   // Caller already holds a polecat admission reservation
 }
 
 // SpawnPolecatForSling creates a fresh polecat and optionally starts its session.
@@ -63,9 +66,13 @@ type SlingSpawnOptions struct {
 // The caller (sling) handles hook attachment and nudging.
 func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
 	// Find workspace
-	townRoot, err := workspace.FindFromCwdOrError()
-	if err != nil {
-		return nil, fmt.Errorf("not in a Gas Town workspace: %w", err)
+	townRoot := opts.TownRoot
+	if townRoot == "" {
+		var err error
+		townRoot, err = workspace.FindFromCwdOrError()
+		if err != nil {
+			return nil, fmt.Errorf("not in a Gas Town workspace: %w", err)
+		}
 	}
 
 	// Load rig config
@@ -99,19 +106,21 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 		return nil, fmt.Errorf("admission control: %w", err)
 	}
 
-	// Polecat count cap (clown show #22): refuse to spawn if there are already
-	// too many working polecats. This is a last-resort safety net for the direct-dispatch
-	// path. For configurable capacity gating, use scheduler.max_polecats in town settings
-	// (see internal/scheduler/capacity/).
-	// Uses countWorkingPolecats to exclude idle polecats (completed work, no hook bead)
-	// that are available for re-sling under the persistent polecat model.
-	const defaultMaxActivePolecats = 25
-	workingCount := countWorkingPolecats()
-	if workingCount >= defaultMaxActivePolecats {
-		return nil, fmt.Errorf("polecat cap reached: %d working polecats (max %d). "+
-			"This is a safety limit to prevent spawn storms. "+
-			"Investigate why polecats are accumulating before spawning more",
-			workingCount, defaultMaxActivePolecats)
+	if blocked, reason := IsRigParkedOrDocked(townRoot, rigName); blocked {
+		undoCmd := "gt rig unpark"
+		if reason == "docked" {
+			undoCmd = "gt rig undock"
+		}
+		return nil, fmt.Errorf("cannot sling to %s rig %q\n%s %s", reason, rigName, undoCmd, rigName)
+	}
+
+	var admission *polecatAdmissionHandle
+	if !opts.SkipAdmission {
+		admission, _, err = acquirePolecatAdmissionFn(townRoot, rigName, opts.HookBead, "spawn-or-reuse")
+		if err != nil {
+			return nil, err
+		}
+		defer admission.Release()
 	}
 
 	// Per-rig concurrency cap (scheduler.max_polecats_per_rig): bound how many
@@ -149,24 +158,6 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 				opts.HookBead, rigName, opts.HookBead)
 		}
 		witness.RecordBeadRespawn(townRoot, opts.HookBead)
-	}
-
-	// Per-rig directory cap: prevent unbounded worktree accumulation even when
-	// polecats die quickly (tmux session count stays low).
-	const maxPolecatDirsPerRig = 30
-	rigPolecatDir := filepath.Join(townRoot, rigName, "polecats")
-	if entries, err := os.ReadDir(rigPolecatDir); err == nil {
-		dirCount := 0
-		for _, e := range entries {
-			if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
-				dirCount++
-			}
-		}
-		if dirCount >= maxPolecatDirsPerRig {
-			return nil, fmt.Errorf("rig %s has %d polecat directories (max %d). "+
-				"Nuke idle polecats first: gt polecat nuke %s/<name> --force",
-				rigName, dirCount, maxPolecatDirsPerRig, rigName)
-		}
 	}
 
 	// Persistent polecat model (gt-4ac): try to reuse an idle polecat first.
@@ -207,7 +198,8 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 
 		// Reuse the idle polecat with branch-only operations (no worktree add/remove).
 		// Phase 3 of persistent-polecat-pool: eliminates ~5s worktree creation overhead.
-		// Falls back to full worktree repair if branch-only reuse fails.
+		// If reuse is unsafe or fails, allocate a new polecat instead of repairing
+		// this worktree destructively.
 		addOpts := polecat.AddOptions{
 			HookBead:     opts.HookBead,
 			BaseBranch:   baseBranch,
@@ -215,12 +207,10 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 		}
 		reuseOK := false
 		if _, err := polecatMgr.ReuseIdlePolecat(polecatName, addOpts); err != nil {
-			// Branch-only reuse failed — try full worktree repair as fallback
-			fmt.Printf("  Branch-only reuse failed for idle polecat %s: %v, trying full repair...\n", polecatName, err)
-			if _, err := polecatMgr.RepairWorktreeWithOptions(polecatName, true, addOpts); err != nil {
-				fmt.Printf("  Full repair also failed for %s: %v, allocating new...\n", polecatName, err)
+			if errors.Is(err, polecat.ErrPolecatNeedsRecovery) {
+				fmt.Printf("  Idle polecat %s needs recovery before reuse: %v; allocating new...\n", polecatName, err)
 			} else {
-				reuseOK = true
+				fmt.Printf("  Branch-only reuse failed for idle polecat %s: %v; allocating new...\n", polecatName, err)
 			}
 		} else {
 			reuseOK = true
@@ -260,6 +250,25 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 				account:     opts.Account,
 				agent:       opts.Agent,
 			}, nil
+		}
+	}
+
+	// Per-rig directory cap: prevent unbounded worktree accumulation, but only
+	// after trying safe reuse. A reusable preserved polecat should not be blocked
+	// just because the rig is already at the directory cap.
+	const maxPolecatDirsPerRig = 30
+	rigPolecatDir := filepath.Join(townRoot, rigName, "polecats")
+	if entries, err := os.ReadDir(rigPolecatDir); err == nil {
+		dirCount := 0
+		for _, e := range entries {
+			if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+				dirCount++
+			}
+		}
+		if dirCount >= maxPolecatDirsPerRig {
+			return nil, fmt.Errorf("rig %s has %d polecat directories (max %d). "+
+				"Resolve recovery-needed polecats before allocating more slots: gt polecat list %s",
+				rigName, dirCount, maxPolecatDirsPerRig, rigName)
 		}
 	}
 

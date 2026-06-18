@@ -1952,8 +1952,15 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 		t.waitForBusyIndicator(target, 800*time.Millisecond)
 	}
 
-	// 8. Wake the pane to trigger SIGWINCH for detached sessions
-	t.WakePaneIfDetached(session)
+	// 8. Wake the pane to trigger SIGWINCH for detached sessions.
+	// Use the resolved target (session:window.pane) rather than the bare
+	// session name. resize-window on a bare session name resizes the
+	// session's *active* window — in a multi-window session (e.g. one with a
+	// `gt feed -w` window open and focused) that is not the agent's window,
+	// so the agent's pane never receives SIGWINCH and stays idle despite the
+	// delivered nudge. Targeting the resolved pane wakes the correct window.
+	// (fork keeps step 7.5 busy-indicator hold; upstream #4164 fixes the wake target.)
+	t.WakePaneIfDetached(target)
 	return nil
 }
 
@@ -2330,11 +2337,19 @@ func (t *Tmux) FindAgentPane(session string) (string, error) {
 	// ZFC: read declared pane identity set at session startup (gt-qmsx).
 	// This replaces process-tree inference for sessions that record GT_PANE_ID.
 	if declaredPane, err := t.GetEnvironment(session, "GT_PANE_ID"); err == nil && declaredPane != "" {
-		// Verify the pane still exists in tmux (it may have been killed/respawned).
-		if _, verifyErr := t.run("display-message", "-t", declaredPane, "-p", "#{pane_id}"); verifyErr == nil {
+		targetSession := session
+		if sessionOut, sessionErr := t.run("display-message", "-t", session, "-p", "#{session_name}"); sessionErr == nil {
+			if resolved := strings.TrimSpace(sessionOut); resolved != "" {
+				targetSession = resolved
+			}
+		}
+
+		// Verify the pane still exists in the target session. Pane IDs are tmux-global,
+		// so a stale GT_PANE_ID may still resolve in a different restarted session.
+		if paneSession, verifyErr := t.run("display-message", "-t", declaredPane, "-p", "#{session_name}"); verifyErr == nil && strings.TrimSpace(paneSession) == targetSession {
 			return declaredPane, nil
 		}
-		// Declared pane is gone — fall through to scan.
+		// Declared pane is gone or belongs to another session — fall through to scan.
 	}
 
 	// Fallback: scan all panes for legacy sessions without GT_PANE_ID.
@@ -3532,8 +3547,8 @@ func (t *Tmux) SetDynamicStatus(session string) error {
 	if _, err := t.run("set-option", "-t", session, "status-right-length", "80"); err != nil {
 		return err
 	}
-	// Set faster refresh for more responsive status
-	if _, err := t.run("set-option", "-t", session, "status-interval", "5"); err != nil {
+	// Keep refresh modest: status-line may inspect hooks/mail, which are Dolt-backed.
+	if _, err := t.run("set-option", "-t", session, "status-interval", "60"); err != nil {
 		return err
 	}
 	_, err := t.run("set-option", "-t", session, "status-right", right)

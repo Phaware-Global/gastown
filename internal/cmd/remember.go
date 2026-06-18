@@ -217,13 +217,30 @@ func bdKvClear(key string) error {
 	return cmd.Run()
 }
 
-// bdKvListJSON calls bd kv list --json and returns the parsed map.
+// parseBdKvListJSON parses bd kv list --json output, keeping only string values.
 //
 // bd >=1.0.3 injects a top-level "schema_version": N (number) sibling field
-// into every object-shaped --json output, so the response now looks like
-// {"schema_version": 1, "key1": "value1", ...}. Decode into RawMessage and
-// keep only the entries that parse as strings — the version sibling and any
-// future non-string envelope fields are silently dropped.
+// into every object-shaped --json output ({"schema_version": 1, "key1": ...}).
+// Decoding into RawMessage and keeping only entries that parse as strings
+// silently drops the version sibling and any future non-string envelope fields.
+func parseBdKvListJSON(data []byte) (map[string]string, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parsing kv list: %w", err)
+	}
+
+	kvs := make(map[string]string, len(raw))
+	for k, v := range raw {
+		var s *string
+		if err := json.Unmarshal(v, &s); err != nil || s == nil {
+			continue
+		}
+		kvs[k] = *s
+	}
+	return kvs, nil
+}
+
+// bdKvListJSON calls bd kv list --json and returns the parsed string values.
 func bdKvListJSON() (map[string]string, error) {
 	// Bound the shell-out so callers on latency-sensitive paths (the
 	// compact/resume prime hook in particular, which must stay within tight
@@ -236,24 +253,8 @@ func bdKvListJSON() (map[string]string, error) {
 		return nil, err
 	}
 
-	return parseKvListJSON(out)
+	return parseBdKvListJSON(out)
 }
 
 // bdKvListTimeout bounds the `bd kv list` shell-out used for memory injection.
 var bdKvListTimeout = 5 * time.Second
-
-func parseKvListJSON(out []byte) (map[string]string, error) {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(out, &raw); err != nil {
-		return nil, fmt.Errorf("parsing kv list: %w", err)
-	}
-
-	kvs := make(map[string]string, len(raw))
-	for k, v := range raw {
-		var s string
-		if err := json.Unmarshal(v, &s); err == nil {
-			kvs[k] = s
-		}
-	}
-	return kvs, nil
-}

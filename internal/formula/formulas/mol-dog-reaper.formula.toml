@@ -26,6 +26,7 @@ This is infrastructure cleanup work:
 | dry_run | config | If "true", report without acting |
 | databases | config | Comma-separated DB list (default: auto-discover) |
 | dolt_port | config | Dolt server port (default 3307) |
+| db_delay | config | Delay between databases to reduce Dolt load (default 250ms) |
 
 ## Safety
 
@@ -70,6 +71,7 @@ Or use configured database list from {{databases}} variable.
 gt reaper scan --db=<name> --port={{dolt_port}} \\
   --max-age={{max_age}} --purge-age={{purge_age}} \\
   --mail-age={{mail_delete_age}} --stale-age={{stale_issue_age}} \\
+  --db-delay={{db_delay}} \\
   --json
 ```
 
@@ -95,7 +97,7 @@ Close wisps past max_age whose parent molecule is closed or missing.
 **1. For each database with reap candidates:**
 ```bash
 gt reaper reap --db=<name> --port={{dolt_port}} \\
-  --max-age={{max_age}} {{#if dry_run}}--dry-run{{/if}} --json
+  --max-age={{max_age}} --db-delay={{db_delay}} {{#if dry_run}}--dry-run{{/if}} --json
 ```
 
 **2. Inspect results:**
@@ -122,6 +124,7 @@ Delete closed wisps past purge_age and closed mail past mail_delete_age.
 ```bash
 gt reaper purge --db=<name> --port={{dolt_port}} \\
   --purge-age={{purge_age}} --mail-age={{mail_delete_age}} \\
+  --db-delay={{db_delay}} \\
   {{#if dry_run}}--dry-run{{/if}} --json
 ```
 
@@ -146,6 +149,7 @@ Close issues that have been open with no status change past stale_issue_age.
 ```bash
 gt reaper auto-close --db=<name> --port={{dolt_port}} \\
   --stale-age={{stale_issue_age}} \\
+  --db-delay={{db_delay}} \\
   {{#if dry_run}}--dry-run{{/if}} --json
 ```
 
@@ -215,3 +219,7 @@ default = ""
 [vars.dolt_port]
 description = "Dolt server port"
 default = "3307"
+
+[vars.db_delay]
+description = "Delay between databases to reduce Dolt load"
+default = "250ms"

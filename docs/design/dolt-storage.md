@@ -72,6 +72,22 @@ gt dolt list           # List all databases
 If the server isn't running, `bd` fails fast with a clear message
 pointing to `gt dolt start`.
 
+## Gas Town Scope vs `bd --global`
+
+Gas Town's town-level beads are the `hq` database. Access them by running
+direct `bd` commands from the town root (`~/gt`) or with `bd -C ~/gt ...`.
+Direct `bd` commands from rig worktrees use that rig's `.beads` redirect and
+database, so do not assume an `hq-*` ID will retarget the command.
+
+Do not use `bd --global` for Gas Town town beads. In Beads, `--global`
+means the standalone shared-server database named `beads_global`; it does
+not mean Gas Town's `hq` database, and `BEADS_DOLT_DATABASE=hq` does not
+retarget `--global`.
+
+For Gas Town Dolt health, use `gt dolt status`. `bd dolt status` reports
+the Beads client/runtime view and can say no Beads-managed server is running
+even when the Gas Town Dolt server on port 3307 is healthy.
+
 ## Write Concurrency: All-on-Main
 
 All agents — polecats, crew, witness, refinery, deacon — write directly

@@ -11,7 +11,6 @@ import (
 	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/hooks"
-	"github.com/steveyegge/gastown/internal/hookutil"
 	"github.com/steveyegge/gastown/internal/templates/commands"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -197,9 +196,6 @@ func StartupFallbackCommands(role string, rc *config.RuntimeConfig) []string {
 
 	role = strings.ToLower(role)
 	command := "gt prime"
-	if isAutonomousRole(role) {
-		command += " && gt mail check --inject"
-	}
 	// NOTE: session-started nudge to deacon removed — it interrupted
 	// the deacon's await-signal backoff (exponential sleep). The deacon
 	// already wakes on beads activity via bd activity --follow.
@@ -216,13 +212,6 @@ func RunStartupFallback(t *tmux.Tmux, sessionID, role string, rc *config.Runtime
 		}
 	}
 	return nil
-}
-
-// isAutonomousRole returns true if the given role should automatically
-// inject mail check on startup. Delegates to hookutil.IsAutonomousRole
-// for the single source of truth on role classification.
-func isAutonomousRole(role string) bool {
-	return hookutil.IsAutonomousRole(role)
 }
 
 // DefaultPrimeWaitMs is the default wait time in milliseconds for non-hook agents

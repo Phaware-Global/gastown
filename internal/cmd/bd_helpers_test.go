@@ -168,6 +168,57 @@ func TestBdCmd_Run(t *testing.T) {
 	}
 }
 
+func TestBdCmd_RunTimesOut(t *testing.T) {
+	binDir := t.TempDir()
+	writeBDStub(t, binDir, `#!/usr/bin/env sh
+sleep 5
+`, `@echo off
+timeout /t 5 /nobreak >NUL
+`)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GT_BD_TIMEOUT_SEC", "1")
+
+	start := time.Now()
+	err := BdCmd("list").Run()
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("error = %v, want timeout", err)
+	}
+	if !strings.Contains(err.Error(), "bd list") {
+		t.Fatalf("error = %v, want command description bd list in timeout message", err)
+	}
+	if elapsed > 4*time.Second {
+		t.Fatalf("timeout took %v, want under 4s", elapsed)
+	}
+}
+
+func TestBdCmd_CombinedOutputDoesNotPreSetStderr(t *testing.T) {
+	binDir := t.TempDir()
+	writeBDStub(t, binDir, `#!/usr/bin/env sh
+printf 'stdout:%s\n' "$*"
+printf 'stderr:%s\n' "$*" >&2
+`, `@echo off
+echo stdout:%*
+echo stderr:%* 1>&2
+`)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	out, err := BdCmd("show", "id").CombinedOutput()
+	if err != nil {
+		t.Fatalf("CombinedOutput: %v", err)
+	}
+	text := string(out)
+	if !strings.Contains(text, "stdout:show id") {
+		t.Fatalf("missing stdout in combined output: %q", text)
+	}
+	if !strings.Contains(text, "stderr:show id") {
+		t.Fatalf("missing stderr in combined output: %q", text)
+	}
+}
+
 func TestBdCmd_Chaining(t *testing.T) {
 	// Test that all builder methods return the receiver for chaining
 	bdc := BdCmd("test")
@@ -175,6 +226,12 @@ func TestBdCmd_Chaining(t *testing.T) {
 	// Each method should return the same pointer for fluent chaining
 	if bdc.WithAutoCommit() != bdc {
 		t.Error("WithAutoCommit() should return receiver for chaining")
+	}
+	if bdc.AllowStale() != bdc {
+		t.Error("AllowStale() should return receiver for chaining")
+	}
+	if !bdc.allowStale {
+		t.Error("AllowStale() should mark stale-read compatibility as requested")
 	}
 	if bdc.WithGTRoot("/test") != bdc {
 		t.Error("WithGTRoot() should return receiver for chaining")
@@ -210,7 +267,7 @@ func TestBdCmd_WithAutoCommit_OverridesParentOff(t *testing.T) {
 	// before appending BD_DOLT_AUTO_COMMIT=on. This is critical because
 	// glibc getenv() returns the first match in the env array, so a duplicate
 	// "off" entry would shadow the appended "on".
-	baseEnv := []string{"PATH=/usr/bin", "BD_DOLT_AUTO_COMMIT=off", "HOME=/home/user"}
+	baseEnv := []string{"PATH=/usr/bin", "BD_DOLT_AUTO_COMMIT=off", "BD_READONLY=true", "HOME=/home/user"}
 
 	bdc := &bdCmd{
 		args:   []string{"show", "id"},
@@ -235,6 +292,9 @@ func TestBdCmd_WithAutoCommit_OverridesParentOff(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("found %d BD_DOLT_AUTO_COMMIT entries, want exactly 1 (dedup must remove old entry)", count)
+	}
+	if _, ok := envMap["BD_READONLY"]; ok {
+		t.Errorf("BD_READONLY should be stripped for WithAutoCommit mutation env, got %q", envMap["BD_READONLY"])
 	}
 }
 
@@ -494,6 +554,8 @@ func TestBdCmd_WithBeadsDir_OverridesInheritedDoltTarget(t *testing.T) {
 		"BEADS_DOLT_SERVER_HOST=100.107.173.83",
 		"BEADS_DOLT_SERVER_PORT=3307",
 		"BEADS_DOLT_PORT=3307",
+		"BEADS_DOLT_DATA_DIR=/wrong/data",
+		"BD_DB=/wrong.db",
 	}
 
 	bdc := &bdCmd{
@@ -510,7 +572,16 @@ func TestBdCmd_WithBeadsDir_OverridesInheritedDoltTarget(t *testing.T) {
 	if envMap["BEADS_DOLT_SERVER_DATABASE"] != "rigdb" {
 		t.Errorf("BEADS_DOLT_SERVER_DATABASE = %q, want rigdb", envMap["BEADS_DOLT_SERVER_DATABASE"])
 	}
-	for _, key := range []string{"BEADS_DB", "BEADS_DOLT_SERVER_HOST", "BEADS_DOLT_SERVER_PORT", "BEADS_DOLT_PORT"} {
+	if envMap["BEADS_DOLT_SERVER_HOST"] != "127.0.0.1" {
+		t.Errorf("BEADS_DOLT_SERVER_HOST = %q, want 127.0.0.1", envMap["BEADS_DOLT_SERVER_HOST"])
+	}
+	if envMap["BEADS_DOLT_SERVER_PORT"] != "3307" {
+		t.Errorf("BEADS_DOLT_SERVER_PORT = %q, want 3307", envMap["BEADS_DOLT_SERVER_PORT"])
+	}
+	if envMap["BEADS_DOLT_PORT"] != "3307" {
+		t.Errorf("BEADS_DOLT_PORT = %q, want 3307", envMap["BEADS_DOLT_PORT"])
+	}
+	for _, key := range []string{"BEADS_DB", "BD_DB", "BEADS_DOLT_DATA_DIR"} {
 		if value, ok := envMap[key]; ok {
 			t.Errorf("%s should be stripped when BEADS_DIR is pinned, got %q", key, value)
 		}
@@ -528,6 +599,30 @@ func TestBdCmd_EmptyBeadsDir_Skipped(t *testing.T) {
 		if strings.HasPrefix(e, "BEADS_DIR=") {
 			t.Errorf("BEADS_DIR should not be added when empty, found: %s", e)
 		}
+	}
+}
+
+func TestBdCmd_DefaultStripsTargetEnvAndSuppressesSideEffects(t *testing.T) {
+	bdc := &bdCmd{
+		args: []string{"version"},
+		env: []string{
+			"PATH=/usr/bin",
+			"BEADS_DIR=/wrong",
+			"BEADS_DOLT_SERVER_DATABASE=hq",
+			"BEADS_DOLT_SERVER_HOST=wrong-host",
+			"BD_EXPORT_AUTO=true",
+		},
+		stderr: os.Stderr,
+	}
+	cmd := bdc.Build()
+	envMap := parseEnv(cmd.Env)
+	for _, key := range []string{"BEADS_DIR", "BEADS_DOLT_SERVER_DATABASE", "BEADS_DOLT_SERVER_HOST"} {
+		if value, ok := envMap[key]; ok {
+			t.Fatalf("%s should be stripped for unpinned BdCmd, got %q in %v", key, value, cmd.Env)
+		}
+	}
+	if envMap["BD_EXPORT_AUTO"] != "false" {
+		t.Fatalf("BD_EXPORT_AUTO = %q, want false in %v", envMap["BD_EXPORT_AUTO"], cmd.Env)
 	}
 }
 
@@ -574,6 +669,39 @@ func TestBdCmd_StripBeadsDir_NoOpWhenAbsent(t *testing.T) {
 	envMap := parseEnv(cmd.Env)
 	if envMap["BEADS_DIR"] != "/town/.beads" {
 		t.Errorf("BEADS_DIR = %q, want %q", envMap["BEADS_DIR"], "/town/.beads")
+	}
+}
+
+func TestBdCmd_WithRoutingDoesNotPinBeadsDir(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	metadata := []byte(`{"dolt_database":"rigdb","dolt_server_host":"127.0.0.1","dolt_server_port":3307}`)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), metadata, 0644); err != nil {
+		t.Fatal(err)
+	}
+	workDir := filepath.Dir(beadsDir)
+	bdc := &bdCmd{
+		args: []string{"show", "gt-abc", "--json"},
+		env: []string{
+			"PATH=/usr/bin",
+			"BEADS_DIR=/wrong",
+			"BEADS_DOLT_SERVER_DATABASE=hq",
+			"BEADS_DOLT_SERVER_HOST=wrong-host",
+		},
+		stderr: os.Stderr,
+	}
+	cmd := bdc.Dir(workDir).WithRouting().Build()
+	envMap := parseEnv(cmd.Env)
+	if _, ok := envMap["BEADS_DIR"]; ok {
+		t.Fatalf("BEADS_DIR should be absent for routing command, got %v", cmd.Env)
+	}
+	if _, ok := envMap["BEADS_DOLT_SERVER_DATABASE"]; ok {
+		t.Fatalf("BEADS_DOLT_SERVER_DATABASE should be absent for routing command, got %v", cmd.Env)
+	}
+	if envMap["BEADS_DOLT_SERVER_HOST"] != "127.0.0.1" {
+		t.Fatalf("BEADS_DOLT_SERVER_HOST = %q, want 127.0.0.1 in %v", envMap["BEADS_DOLT_SERVER_HOST"], cmd.Env)
 	}
 }
 

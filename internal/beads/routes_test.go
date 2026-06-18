@@ -3,6 +3,7 @@ package beads
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/config"
@@ -423,6 +424,138 @@ func TestGetRigDirForName_TownLevelNotReturned(t *testing.T) {
 	result := GetRigDirForName(tmpDir, "hq")
 	if result != "" {
 		t.Errorf("GetRigDirForName for town-level path = %q, want empty string", result)
+	}
+}
+
+func TestResolveRepoAliasBeadsDir(t *testing.T) {
+	townRoot := t.TempDir()
+	townBeads := filepath.Join(townRoot, ".beads")
+	rigRoot := filepath.Join(townRoot, "gastown")
+	canonicalRig := filepath.Join(rigRoot, "mayor", "rig")
+	canonicalBeads := filepath.Join(canonicalRig, ".beads")
+	decoyBeads := filepath.Join(rigRoot, ".beads")
+	escapeRig := filepath.Join(townRoot, "escape", "mayor", "rig")
+	escapeBeads := filepath.Join(escapeRig, ".beads")
+	escapeTarget := filepath.Join(townRoot, "..", "outside", ".beads")
+
+	for _, dir := range []string{townBeads, canonicalBeads, decoyBeads, escapeBeads, escapeTarget} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(townBeads, "routes.jsonl"), []byte(
+		`{"prefix":"hq-","path":"."}`+"\n"+
+			`{"prefix":"gt-","path":"gastown/mayor/rig"}`+"\n"+
+			`{"prefix":"es-","path":"escape/mayor/rig"}`+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(canonicalBeads, "metadata.json"), []byte(`{"dolt_database":"gastown"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(decoyBeads, "metadata.json"), []byte(`{"dolt_database":"hq"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(escapeBeads, "redirect"), []byte(filepath.Join("..", "..", "..", "..", "outside", ".beads")+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name     string
+		repo     string
+		expected string
+		ok       bool
+	}{
+		{"rig alias uses canonical route", "gastown", canonicalBeads, true},
+		{"hq alias uses town beads", "hq", townBeads, true},
+		{"town alias uses town beads", "town", townBeads, true},
+		{"path-like remains unresolved", "gastown/mayor/rig", "", false},
+		{"unknown bare repo remains unresolved", "unknown", "", false},
+		{"redirect outside town rejected", "escape", "", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ResolveRepoAliasBeadsDir(townRoot, tc.repo)
+			if ok != tc.ok {
+				t.Fatalf("ResolveRepoAliasBeadsDir ok = %v, want %v", ok, tc.ok)
+			}
+			if got != tc.expected {
+				t.Fatalf("ResolveRepoAliasBeadsDir dir = %q, want %q", got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestRewriteBDCreateRepoAlias(t *testing.T) {
+	townRoot := t.TempDir()
+	townBeads := filepath.Join(townRoot, ".beads")
+	canonicalBeads := filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads")
+	decoyBeads := filepath.Join(townRoot, "gastown", ".beads")
+	for _, dir := range []string{townBeads, canonicalBeads, decoyBeads} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(townBeads, "routes.jsonl"), []byte(
+		`{"prefix":"hq-","path":"."}`+"\n"+
+			`{"prefix":"gt-","path":"gastown/mayor/rig"}`+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		argv    []string
+		want    []string
+		wantDir string
+	}{
+		{
+			name:    "global flags before create",
+			argv:    []string{"bd", "--allow-stale", "create", "--repo", "gastown", "--title", "x"},
+			want:    []string{"bd", "--allow-stale", "create", "--title", "x"},
+			wantDir: canonicalBeads,
+		},
+		{
+			name:    "equals form",
+			argv:    []string{"bd", "--json", "create", "--repo=gastown"},
+			want:    []string{"bd", "--json", "create"},
+			wantDir: canonicalBeads,
+		},
+		{
+			name:    "unknown bare repo unchanged",
+			argv:    []string{"bd", "create", "--repo", "unknown", "--title", "x"},
+			want:    []string{"bd", "create", "--repo", "unknown", "--title", "x"},
+			wantDir: "",
+		},
+		{
+			name:    "path-like repo unchanged",
+			argv:    []string{"bd", "create", "--repo", "gastown/mayor/rig", "--title", "x"},
+			want:    []string{"bd", "create", "--repo", "gastown/mayor/rig", "--title", "x"},
+			wantDir: "",
+		},
+		{
+			name:    "duplicate repo unchanged",
+			argv:    []string{"bd", "create", "--repo", "gastown", "--repo", "/tmp/other"},
+			want:    []string{"bd", "create", "--repo", "gastown", "--repo", "/tmp/other"},
+			wantDir: "",
+		},
+		{
+			name:    "repo after sentinel unchanged",
+			argv:    []string{"bd", "create", "--", "--repo", "gastown"},
+			want:    []string{"bd", "create", "--", "--repo", "gastown"},
+			wantDir: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, gotDir := RewriteBDCreateRepoAlias(townRoot, tc.argv)
+			if gotDir != tc.wantDir {
+				t.Fatalf("beads dir = %q, want %q", gotDir, tc.wantDir)
+			}
+			if strings.Join(got, "\x00") != strings.Join(tc.want, "\x00") {
+				t.Fatalf("argv = %#v, want %#v", got, tc.want)
+			}
+		})
 	}
 }
 

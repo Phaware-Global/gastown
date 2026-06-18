@@ -1360,6 +1360,8 @@ func resolveAgentConfigWithOverrideInternal(townRoot, rigPath, agentOverride str
 			return nil, "", fmt.Errorf("agent '%s' not found", agentName)
 		}
 
+		rc.ResolvedAgent = agentName
+
 		// Append extra arguments from the override
 		if len(extraArgs) > 0 {
 			rc.Args = append(rc.Args, extraArgs...)

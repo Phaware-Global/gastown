@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -186,11 +185,8 @@ func (r *Recorder) recordRunBd(title string, labels []string, body string) (stri
 
 	ctx, cancel := recorderCtx()
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "bd", args...) //nolint:gosec // G204: bd is a trusted internal tool
-	cmd.Dir = r.townRoot
-	// Set BEADS_DIR explicitly to prevent inherited env vars from causing
-	// prefix mismatches when redirects are in play.
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+beads.ResolveBeadsDir(r.townRoot))
+	townBeads := beads.ResolveBeadsDir(r.townRoot)
+	cmd := beads.CommandContext(ctx, r.townRoot, townBeads, beads.MutationPinned, args...)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -224,9 +220,7 @@ func (r *Recorder) recordRunBd(title string, labels []string, body string) (stri
 	// augment review pointed out the wisp-promotion side effect.)
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), constants.BdCommandTimeout)
 	defer closeCancel()
-	closeCmd := exec.CommandContext(closeCtx, "bd", "close", result.ID, "--reason", "plugin run recorded") //nolint:gosec // G204: bd is a trusted internal tool
-	closeCmd.Dir = r.townRoot
-	closeCmd.Env = append(os.Environ(), "BEADS_DIR="+beads.ResolveBeadsDir(r.townRoot))
+	closeCmd := beads.CommandContext(closeCtx, r.townRoot, townBeads, beads.MutationPinned, "close", result.ID, "--reason", "plugin run recorded")
 	_ = closeCmd.Run() // Best-effort — reaper will catch it if this fails
 
 	return result.ID, nil
@@ -347,14 +341,11 @@ func (r *Recorder) queryRunsBd(pluginName string, limit int, since string) ([]*P
 		cutoff := time.Now().Add(-d).UTC().Format(time.RFC3339)
 		args = append(args, "--created-after="+cutoff)
 	}
+	args = beads.InjectFlatForListJSON(args)
 
 	ctx, cancel := recorderCtx()
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "bd", args...) //nolint:gosec // G204: bd is a trusted internal tool
-	cmd.Dir = r.townRoot
-	// Set BEADS_DIR explicitly to prevent inherited env vars from causing
-	// prefix mismatches when redirects are in play.
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+beads.ResolveBeadsDir(r.townRoot))
+	cmd := beads.CommandContext(ctx, r.townRoot, beads.ResolveBeadsDir(r.townRoot), beads.ReadOnlyPinned, args...)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

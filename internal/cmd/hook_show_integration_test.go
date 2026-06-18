@@ -96,4 +96,14 @@ func TestHookShowShorthandResolvesToCanonical(t *testing.T) {
 		t.Fatalf("shorthand target did not normalize: got agent=%q, want %q",
 			shorthand.Agent, "gastown/polecats/toast")
 	}
+
+	inProgress := "in_progress"
+	if err := b.Update(issue.ID, beads.UpdateOptions{Status: &inProgress}); err != nil {
+		t.Fatalf("mark issue in progress: %v", err)
+	}
+	active := runShow("gastown/toast")
+	if active.BeadID != issue.ID || active.Status != "in_progress" {
+		t.Fatalf("in-progress target mismatch: got bead=%q status=%q, want bead=%q status=in_progress",
+			active.BeadID, active.Status, issue.ID)
+	}
 }

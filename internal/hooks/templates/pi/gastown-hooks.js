@@ -14,9 +14,13 @@
 // Loaded via: pi -e gastown-hooks.js
 
 export default (pi) => {
+  const role = (process.env.GT_ROLE || "").toLowerCase();
   let primeContext = null;
   let contextInjected = false;
   let lastMailCheck = 0;
+
+  const shouldCheckMail = () =>
+    !role.includes("witness") && !role.includes("refinery") && !role.startsWith("deacon") && !role.includes("boot");
 
   // SessionStart — run gt prime and capture context for injection
   pi.on("session_start", async (event, context) => {
@@ -32,22 +36,6 @@ export default (pi) => {
       console.error("[gastown] gt prime failed:", e.message);
     }
 
-    // Check mail at session start
-    try {
-      const mailResult = await pi.exec("gt", ["mail", "check", "--inject"]);
-      if (mailResult.code === 0 && mailResult.stdout.trim()) {
-        // Append mail context to prime context
-        if (primeContext) {
-          primeContext += "\n\n" + mailResult.stdout.trim();
-        } else {
-          primeContext = mailResult.stdout.trim();
-        }
-        console.error("[gastown] mail context appended");
-      }
-      lastMailCheck = Date.now();
-    } catch (e) {
-      console.error("[gastown] gt mail check failed:", e.message);
-    }
   });
 
   // BeforeAgentStart — inject prime context + check mail every prompt
@@ -56,7 +44,7 @@ export default (pi) => {
 
     // Check mail on every prompt (throttled to once per 30s)
     const now = Date.now();
-    if (now - lastMailCheck >= 30000) {
+    if (shouldCheckMail() && now - lastMailCheck >= 30000) {
       lastMailCheck = now;
       try {
         const mailResult = await pi.exec("gt", ["mail", "check", "--inject"]);

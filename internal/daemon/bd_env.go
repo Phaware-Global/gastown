@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"os"
-	"strings"
+	"path/filepath"
+
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 // bdReadOnlyEnv returns an environment slice for read-only bd/gt subprocess
@@ -17,12 +19,25 @@ import (
 // the authoritative "off" value, because glibc getenv() returns the first
 // matching entry — a stale "on" earlier in the slice would otherwise win.
 func bdReadOnlyEnv() []string {
-	base := os.Environ()
-	filtered := make([]string, 0, len(base)+1)
-	for _, e := range base {
-		if !strings.HasPrefix(e, "BD_DOLT_AUTO_COMMIT=") {
-			filtered = append(filtered, e)
-		}
+	return beads.BuildReadOnlyRoutingBDEnv(os.Environ(), "")
+}
+
+func bdReadOnlyRoutingEnv(townRoot string) []string {
+	fallback := ""
+	if townRoot != "" {
+		fallback = filepath.Join(townRoot, ".beads")
 	}
-	return append(filtered, "BD_DOLT_AUTO_COMMIT=off")
+	return beads.BuildReadOnlyRoutingBDEnv(os.Environ(), fallback)
+}
+
+func bdMutationRoutingEnv(townRoot string) []string {
+	fallback := ""
+	if townRoot != "" {
+		fallback = filepath.Join(townRoot, ".beads")
+	}
+	return beads.BuildMutationRoutingBDEnv(os.Environ(), fallback)
+}
+
+func bdReadOnlyPinnedEnv(beadsDir string) []string {
+	return beads.BuildReadOnlyPinnedBDEnv(os.Environ(), beadsDir)
 }

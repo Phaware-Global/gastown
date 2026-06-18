@@ -157,23 +157,39 @@ func TestStartupFallbackCommands_AutonomousRole(t *testing.T) {
 		},
 	}
 
-	autonomousRoles := []string{"polecat", "witness", "refinery", "deacon"}
+	autonomousRoles := []string{"polecat"}
 	for _, role := range autonomousRoles {
 		t.Run(role, func(t *testing.T) {
 			commands := StartupFallbackCommands(role, rc)
 			if commands == nil || len(commands) == 0 {
 				t.Error("StartupFallbackCommands() should return commands for autonomous role")
 			}
-			// Should contain mail check
-			found := false
 			for _, cmd := range commands {
-				if contains(cmd, "mail check --inject") {
-					found = true
-					break
+				if cmd != "gt prime" {
+					t.Fatalf("Commands for %s = %q, want gt prime", role, cmd)
 				}
 			}
-			if !found {
-				t.Errorf("Commands for %s should contain mail check --inject", role)
+		})
+	}
+}
+
+func TestStartupFallbackCommands_PatrolRolesSkipMailInject(t *testing.T) {
+	rc := &config.RuntimeConfig{
+		Hooks: &config.RuntimeHooksConfig{
+			Provider: "none",
+		},
+	}
+
+	for _, role := range []string{"witness", "refinery", "deacon", "boot", "deacon/boot"} {
+		t.Run(role, func(t *testing.T) {
+			commands := StartupFallbackCommands(role, rc)
+			if commands == nil || len(commands) == 0 {
+				t.Fatal("StartupFallbackCommands() should return commands for patrol role")
+			}
+			for _, cmd := range commands {
+				if contains(cmd, "mail check --inject") {
+					t.Fatalf("patrol role %s should not contain startup mail check: %q", role, cmd)
+				}
 			}
 		})
 	}
