@@ -465,9 +465,9 @@ shift || true
 
 case "$cmd" in
   sql)
-    # bdDepListRawIDs up: SELECT issue_id FROM dependencies WHERE depends_on_id = '<beadID>' AND type = 'tracks'
+    # bdDepListRawIDs up: match beadID against typed dependency target columns.
     case "$*" in
-      *"depends_on_id = 'gt-bbb'"*)
+      *"depends_on_issue_id = 'gt-bbb'"*)
         echo '[{"issue_id":"hq-cv-existing"}]'
         ;;
       *)

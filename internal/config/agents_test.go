@@ -1368,6 +1368,16 @@ func TestCodexRuntimeConfigHasPromptDetection(t *testing.T) {
 	if rc.Tmux.ReadyPromptPrefix != "› " {
 		t.Errorf("RuntimeConfigFromPreset(codex).Tmux.ReadyPromptPrefix = %q, want %q", rc.Tmux.ReadyPromptPrefix, "› ")
 	}
+	if rc.PromptMode != "arg" {
+		t.Errorf("RuntimeConfigFromPreset(codex).PromptMode = %q, want arg", rc.PromptMode)
+	}
+	args := strings.Join(rc.Args, " ")
+	if !strings.Contains(args, codexUpdateCheckConfig) {
+		t.Errorf("RuntimeConfigFromPreset(codex).Args = %v, want %q", rc.Args, codexUpdateCheckConfig)
+	}
+	if !strings.Contains(args, "--dangerously-bypass-approvals-and-sandbox") {
+		t.Errorf("RuntimeConfigFromPreset(codex).Args = %v, want bypass flag", rc.Args)
+	}
 }
 
 func TestPiProviderDefaults(t *testing.T) {

@@ -829,15 +829,12 @@ func runDeaconHeartbeat(cmd *cobra.Command, args []string) error {
 		action = strings.Join(args, " ")
 	}
 
+	if err := syncDeaconHeartbeatStores(townRoot, action); err != nil {
+		return fmt.Errorf("updating heartbeat: %w", err)
+	}
 	if action != "" {
-		if err := deacon.TouchWithAction(townRoot, action, 0, 0); err != nil {
-			return fmt.Errorf("updating heartbeat: %w", err)
-		}
 		fmt.Printf("%s Heartbeat updated: %s\n", style.Bold.Render("✓"), action)
 	} else {
-		if err := deacon.Touch(townRoot); err != nil {
-			return fmt.Errorf("updating heartbeat: %w", err)
-		}
 		fmt.Printf("%s Heartbeat updated\n", style.Bold.Render("✓"))
 	}
 

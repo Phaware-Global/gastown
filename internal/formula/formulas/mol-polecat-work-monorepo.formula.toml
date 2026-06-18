@@ -61,7 +61,7 @@ to post comments and address them all before submitting to the merge queue.
 | Context filling | Use gt handoff to cycle to fresh session |
 | Unsure what to do | Mail Witness, don't guess |"""
 formula = "mol-polecat-work-monorepo"
-version = 1
+version = 2
 
 [[steps]]
 id = "load-context"
@@ -115,7 +115,14 @@ id = "branch-setup"
 title = "Set up working branch"
 needs = ["load-context"]
 description = """
-Ensure you're on a clean feature branch ready for work.
+Ensure you're on a FRESH branch named for THIS bead, based on latest origin/{{base_branch}}.
+
+**The branch name is load-bearing metadata.** `gt done` infers the MR's
+source_issue from the bead-id embedded in your branch name. A reused branch
+carries the PREVIOUS bead's id: your MR gets attributed to the wrong (often
+closed) bead, close credit goes to the wrong issue, and your real issue stays
+open and hooked forever. NEVER reuse a branch from a previous assignment —
+even if your worktree is already checked out on it.
 
 **1. Check current branch state:**
 ```bash
@@ -123,11 +130,19 @@ git status
 git branch --show-current
 ```
 
-**2. If not on a feature branch, create one:**
+If the current branch name embeds a bead-id that is not {{issue}}, it is
+leftover from a previous assignment. Do NOT work on it — create a fresh
+branch in step 2.
+
+**2. Create a fresh branch NAMED FOR THE HOOKED BEAD:**
 ```bash
 git fetch origin
-git checkout -b polecat/<name> origin/{{base_branch}}
+git checkout -b "polecat/<name>/{{issue}}@$(openssl rand -hex 3)" origin/{{base_branch}}
 ```
+
+The format is `polecat/<your-name>/<bead-id>@<short-unique-suffix>`. The
+embedded bead-id is what makes MR attribution work; the suffix keeps the
+name unique across re-dispatches of the same bead.
 
 **3. Ensure clean working state:**
 ```bash
@@ -166,7 +181,7 @@ If setup_command is set, run it to install dependencies:
 This ensures dependencies are installed before you start work.
 Empty setup_command means "not configured" — skip this step.
 
-**Exit criteria:** You're on a clean feature branch, rebased on latest {{base_branch}}, dependencies installed."""
+**Exit criteria:** You're on a clean feature branch whose name embeds {{issue}}, rebased on latest {{base_branch}}, dependencies installed."""
 
 [[steps]]
 id = "implement"

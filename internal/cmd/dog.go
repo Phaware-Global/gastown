@@ -756,10 +756,18 @@ func closePluginMails(dogName string) {
 
 	closed := 0
 	for _, msg := range messages {
-		if msg.Read {
+		// Archive read AND unread direct plugin dispatch mail. The dog must read
+		// the dispatch mail to execute the plugin, so skipping read mail left
+		// every executed dispatch bead open forever. Keep this scoped to Deacon
+		// dispatches so CC or human messages with a similar subject are preserved.
+		if !strings.HasPrefix(msg.Subject, "Plugin: ") {
 			continue
 		}
-		if !strings.HasPrefix(msg.Subject, "Plugin: ") {
+		if mail.AddressToIdentity(msg.To) != mail.AddressToIdentity(dogAddress) {
+			continue
+		}
+		sender := mail.AddressToIdentity(msg.From)
+		if sender != "deacon/" && sender != "daemon" {
 			continue
 		}
 		if archErr := mailbox.Archive(msg.ID); archErr == nil {
@@ -1274,4 +1282,3 @@ func ifStr(cond bool, ifTrue, ifFalse string) string {
 	}
 	return ifFalse
 }
-

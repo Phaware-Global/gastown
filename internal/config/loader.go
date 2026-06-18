@@ -2046,6 +2046,7 @@ func fillRuntimeDefaults(rc *RuntimeConfig) *RuntimeConfig {
 	if result.Args == nil && preset != nil {
 		result.Args = append([]string(nil), preset.Args...)
 	}
+	result.Args = ensureCodexAutomationArgs(result.Command, result.Args)
 
 	// Auto-fill Hooks defaults from preset for agents that support hooks.
 	if result.Hooks == nil && preset != nil && preset.HooksProvider != "" {

@@ -160,6 +160,13 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 
 	// 1. Resolve runtime config.
 	runtimeConfig := config.ResolveRoleAgentConfig(cfg.Role, cfg.TownRoot, cfg.RigPath)
+	if cfg.AgentOverride != "" {
+		rc, _, err := config.ResolveAgentConfigWithOverride(cfg.TownRoot, cfg.RigPath, cfg.AgentOverride)
+		if err != nil {
+			return nil, fmt.Errorf("resolving agent config for %s: %w", cfg.AgentOverride, err)
+		}
+		runtimeConfig = rc
+	}
 
 	// 2. Ensure settings/plugins exist for the agent.
 	settingsDir := config.RoleSettingsDir(cfg.Role, cfg.RigPath)
@@ -244,6 +251,10 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 	// 10. Accept startup dialogs (workspace trust + bypass permissions).
 	if cfg.AcceptBypass {
 		_ = t.AcceptStartupDialogs(cfg.SessionID)
+		if err := t.CheckStartupBlocked(cfg.SessionID); err != nil {
+			_ = t.KillSessionWithProcesses(cfg.SessionID)
+			return nil, fmt.Errorf("startup blocked: %w", err)
+		}
 	}
 
 	// 11. Ready delay: wait for agent to be fully ready at the prompt.
@@ -265,6 +276,14 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 		}
 		if !running {
 			return nil, fmt.Errorf("session %s died during startup (agent command may have failed)", cfg.SessionID)
+		}
+		if err := t.CheckStartupBlocked(cfg.SessionID); err != nil {
+			_ = t.KillSessionWithProcesses(cfg.SessionID)
+			return nil, fmt.Errorf("startup blocked: %w", err)
+		}
+		if status := t.CheckSessionHealth(cfg.SessionID, 0); status != tmux.SessionHealthy {
+			_ = t.KillSessionWithProcesses(cfg.SessionID)
+			return nil, fmt.Errorf("session %s unhealthy during startup: %s", cfg.SessionID, status)
 		}
 	}
 

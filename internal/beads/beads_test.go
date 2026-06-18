@@ -552,6 +552,181 @@ exit 0
 	}
 }
 
+func TestCreateWithRigRepairsTargetConfigPrefix(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(townBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir town .beads: %v", err)
+	}
+	if err := WriteRoutes(townBeadsDir, []Route{
+		{Prefix: "hq-", Path: "."},
+		{Prefix: "tr-", Path: "testrig/mayor/rig"},
+	}); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	rigDir := filepath.Join(townRoot, "testrig", "mayor", "rig")
+	rigBeadsDir := filepath.Join(rigDir, ".beads")
+	if err := os.MkdirAll(rigBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir rig .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigBeadsDir, "config.yaml"), []byte("prefix: wrong\nissue-prefix: wrong\ncustom: keep\n"), 0644); err != nil {
+		t.Fatalf("write stale config: %v", err)
+	}
+
+	stubDir := t.TempDir()
+	stubScript := `#!/bin/sh
+if [ "$1" = "create" ] || { [ "$1" = "--allow-stale" ] && [ "$2" = "create" ]; }; then
+  config="$BEADS_DIR/config.yaml"
+  if ! grep -q '^prefix: tr$' "$config" || ! grep -q '^issue-prefix: tr$' "$config"; then
+    echo "target config was not repaired before create" >&2
+    cat "$config" >&2
+    exit 42
+  fi
+  printf '{"id":"tr-wisp-abc","title":"test","status":"open","priority":2,"labels":[]}\n'
+  exit 0
+fi
+printf '{}\n'
+`
+	stubPath := filepath.Join(stubDir, "bd")
+	if err := os.WriteFile(stubPath, []byte(stubScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	workerDir := filepath.Join(townRoot, "testrig", "polecats", "quartz")
+	if err := os.MkdirAll(workerDir, 0755); err != nil {
+		t.Fatalf("mkdir worker: %v", err)
+	}
+
+	bd := New(workerDir)
+	issue, err := bd.Create(CreateOptions{
+		Title:     "Merge: hq-abc",
+		Rig:       "testrig",
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if issue.ID != "tr-wisp-abc" {
+		t.Fatalf("Create ID = %q, want tr-wisp-abc", issue.ID)
+	}
+
+	configData, err := os.ReadFile(filepath.Join(rigBeadsDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read repaired config: %v", err)
+	}
+	configText := string(configData)
+	for _, want := range []string{"prefix: tr\n", "issue-prefix: tr\n", "custom: keep\n"} {
+		if !strings.Contains(configText, want) {
+			t.Fatalf("repaired config missing %q:\n%s", want, configText)
+		}
+	}
+}
+
+func TestCreateWithTownAliasDoesNotRepairConfigPrefix(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(townBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir town .beads: %v", err)
+	}
+	if err := WriteRoutes(townBeadsDir, []Route{
+		{Prefix: "hq-", Path: "."},
+		{Prefix: "tr-", Path: "testrig/mayor/rig"},
+	}); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townBeadsDir, "config.yaml"), []byte("prefix: hq\nissue-prefix: hq\ncustom: keep\n"), 0644); err != nil {
+		t.Fatalf("write town config: %v", err)
+	}
+
+	rigBeadsDir := filepath.Join(townRoot, "testrig", "mayor", "rig", ".beads")
+	if err := os.MkdirAll(rigBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir rig .beads: %v", err)
+	}
+
+	stubDir := t.TempDir()
+	stubScript := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "create" ] || { [ "$1" = "--allow-stale" ] && [ "$2" = "create" ]; }; then
+  if [ "$BEADS_DIR" != '%s' ]; then
+    echo "create was not pinned to town beads dir: $BEADS_DIR" >&2
+    exit 41
+  fi
+  config="$BEADS_DIR/config.yaml"
+  if ! grep -q '^prefix: hq$' "$config" || ! grep -q '^issue-prefix: hq$' "$config"; then
+    echo "town config should not be repaired as a rig" >&2
+    cat "$config" >&2
+    exit 42
+  fi
+  printf '{"id":"hq-wisp-abc","title":"test","status":"open","priority":2,"labels":[]}\n'
+  exit 0
+fi
+printf '{}\n'
+`, townBeadsDir)
+	stubPath := filepath.Join(stubDir, "bd")
+	if err := os.WriteFile(stubPath, []byte(stubScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	workerDir := filepath.Join(townRoot, "testrig", "polecats", "quartz")
+	if err := os.MkdirAll(workerDir, 0755); err != nil {
+		t.Fatalf("mkdir worker: %v", err)
+	}
+
+	for _, alias := range []string{"hq", "town"} {
+		t.Run(alias, func(t *testing.T) {
+			issue, err := New(workerDir).Create(CreateOptions{
+				Title:     "Town note",
+				Rig:       alias,
+				Ephemeral: true,
+			})
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			if issue.ID != "hq-wisp-abc" {
+				t.Fatalf("Create ID = %q, want hq-wisp-abc", issue.ID)
+			}
+
+			configData, err := os.ReadFile(filepath.Join(townBeadsDir, "config.yaml"))
+			if err != nil {
+				t.Fatalf("read town config: %v", err)
+			}
+			configText := string(configData)
+			for _, want := range []string{"prefix: hq\n", "issue-prefix: hq\n", "custom: keep\n"} {
+				if !strings.Contains(configText, want) {
+					t.Fatalf("town config missing %q:\n%s", want, configText)
+				}
+			}
+			if strings.Contains(configText, "prefix: gt\n") || strings.Contains(configText, "issue-prefix: gt\n") {
+				t.Fatalf("town config was rewritten as gt:\n%s", configText)
+			}
+		})
+	}
+}
+
 func TestCreateWithUnknownRigErrors(t *testing.T) {
 	townRoot := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
@@ -1360,6 +1535,21 @@ review_pr: 0`,
 				ReviewPR:    0,
 			},
 		},
+		{
+			name: "null optional fields are empty",
+			issue: &Issue{
+				Description: `branch: polecat/Nux/gt-null
+target: main
+source_issue: gt-null
+last_conflict_sha: null
+conflict_task_id: null`,
+			},
+			wantFields: &MRFields{
+				Branch:      "polecat/Nux/gt-null",
+				Target:      "main",
+				SourceIssue: "gt-null",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -1403,6 +1593,12 @@ review_pr: 0`,
 			}
 			if fields.ReviewPR != tt.wantFields.ReviewPR {
 				t.Errorf("ReviewPR = %d, want %d", fields.ReviewPR, tt.wantFields.ReviewPR)
+			}
+			if fields.LastConflictSHA != tt.wantFields.LastConflictSHA {
+				t.Errorf("LastConflictSHA = %q, want %q", fields.LastConflictSHA, tt.wantFields.LastConflictSHA)
+			}
+			if fields.ConflictTaskID != tt.wantFields.ConflictTaskID {
+				t.Errorf("ConflictTaskID = %q, want %q", fields.ConflictTaskID, tt.wantFields.ConflictTaskID)
 			}
 		})
 	}
@@ -1566,6 +1762,7 @@ It spans multiple lines.`,
 				Description: `branch: polecat/Nux/gt-old
 target: develop
 source_issue: gt-old
+commit_sha: oldsha
 worker: Nux
 
 Some existing prose content.`,
@@ -1574,6 +1771,7 @@ Some existing prose content.`,
 				Branch:      "polecat/Nux/gt-new",
 				Target:      "main",
 				SourceIssue: "gt-new",
+				CommitSHA:   "newsha",
 				Worker:      "Nux",
 				MergeCommit: "abc123",
 			},
@@ -1581,6 +1779,7 @@ Some existing prose content.`,
 target: main
 source_issue: gt-new
 worker: Nux
+commit_sha: newsha
 merge_commit: abc123
 
 Some existing prose content.`,

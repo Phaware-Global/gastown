@@ -52,7 +52,7 @@ stale, the refinery falls through to normal gate execution.
 | Context filling | Use gt handoff to cycle to fresh session |
 | Unsure what to do | Mail Witness, don't guess |"""
 formula = "mol-polecat-work"
-version = 10
+version = 11
 
 [[steps]]
 id = "load-context"
@@ -124,7 +124,14 @@ id = "branch-setup"
 title = "Set up working branch"
 needs = ["load-context"]
 description = """
-Ensure you're on a clean feature branch ready for work.
+Ensure you're on a FRESH branch named for THIS bead, based on latest origin/{{base_branch}}.
+
+**The branch name is load-bearing metadata.** `gt done` infers the MR's
+source_issue from the bead-id embedded in your branch name. A reused branch
+carries the PREVIOUS bead's id: your MR gets attributed to the wrong (often
+closed) bead, close credit goes to the wrong issue, and your real issue stays
+open and hooked forever. NEVER reuse a branch from a previous assignment —
+even if your worktree is already checked out on it.
 
 **1. Check current branch state:**
 ```bash
@@ -132,10 +139,14 @@ git status
 git branch --show-current
 ```
 
-**2. Check for a prior branch from a rejected MR:**
+If the current branch name embeds a bead-id that is not {{issue}}, it is
+leftover from a previous assignment. Do NOT work on it — create a fresh
+branch in step 3.
 
-If the bead notes contain "MERGE REJECTION" with a branch name, check if that
-branch still exists on the remote. Reusing it preserves all previous work:
+**2. Exception — rejected-MR rework for THIS bead only:**
+
+If the bead notes contain "MERGE REJECTION" with a branch name, that branch
+holds previous work on {{issue}} itself. Reusing it preserves all previous work:
 ```bash
 git fetch origin
 # Check for prior branch
@@ -145,13 +156,20 @@ git checkout -b <prior-branch> origin/<prior-branch>
 git rebase origin/{{base_branch}}
 ```
 
-**If no prior branch, create a fresh one:**
+This exception applies ONLY when the prior branch is for {{issue}}. A branch
+from a different bead is never reusable.
+
+**3. Otherwise, create a fresh branch NAMED FOR THE HOOKED BEAD:**
 ```bash
 git fetch origin
-git checkout -b polecat/<name> origin/{{base_branch}}
+git checkout -b "polecat/<name>/{{issue}}@$(openssl rand -hex 3)" origin/{{base_branch}}
 ```
 
-**3. Ensure clean working state:**
+The format is `polecat/<your-name>/<bead-id>@<short-unique-suffix>`. The
+embedded bead-id is what makes MR attribution work; the suffix keeps the
+name unique across re-dispatches of the same bead.
+
+**4. Ensure clean working state:**
 ```bash
 git status                  # Should show "working tree clean"
 git stash list              # Should be empty
@@ -168,7 +186,7 @@ git stash push -m "unrelated changes before {{issue}}"
 git checkout -- .
 ```
 
-**4. Sync with {{base_branch}}:**
+**5. Sync with {{base_branch}}:**
 ```bash
 git fetch origin
 git rebase origin/{{base_branch}}      # Get latest, rebase your branch
@@ -178,7 +196,7 @@ If rebase conflicts:
 - Resolve them carefully
 - If stuck, mail Witness
 
-**5. Run project setup (if configured):**
+**6. Run project setup (if configured):**
 
 If setup_command is set, run it to install dependencies:
 ```bash
@@ -188,7 +206,7 @@ If setup_command is set, run it to install dependencies:
 This ensures dependencies are installed before you start work.
 Empty setup_command means "not configured" — skip this step.
 
-**Exit criteria:** You're on a clean feature branch, rebased on latest {{base_branch}}, dependencies installed."""
+**Exit criteria:** You're on a clean feature branch whose name embeds {{issue}}, rebased on latest {{base_branch}}, dependencies installed."""
 
 [[steps]]
 id = "implement"
