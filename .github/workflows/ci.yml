@@ -196,7 +196,10 @@ jobs:
         run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Integration Tests
-        run: gotestsum --format testname --junitfile junit-integration.xml -- -tags=integration -timeout=15m -v ./internal/cmd/...
+        # 25m (was 15m): beads v1.0.5's schema runs many more migrations per
+        # `bd init`, so the full integration suite — which now completes rather
+        # than failing fast on the old schema error — needs a larger budget.
+        run: gotestsum --format testname --junitfile junit-integration.xml -- -tags=integration -timeout=25m -v ./internal/cmd/...
 
       - name: Test Report
         if: always()
