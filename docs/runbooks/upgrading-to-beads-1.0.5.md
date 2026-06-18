@@ -154,7 +154,7 @@ Revert `gt` and `bd` to their prior versions **and** restore the data dir:
 
 ```bash
 gt down
-rm -rf .dolt-data && mv .dolt-data.pre-1.0.5.bak .dolt-data
+mv .dolt-data .dolt-data.post-upgrade.bak && mv .dolt-data.pre-1.0.5.bak .dolt-data
 # reinstall the previous gt + bd, then `gt up`
 ```
 
