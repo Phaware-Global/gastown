@@ -89,7 +89,11 @@ if [ "$cmd" != "version" ] && [ "${BEADS_DIR:-}" != "$EXPECTED" ]; then
   exit 9
 fi
 case "$cmd" in
-  version|update)
+  version)
+    echo "bd 0.60.0"
+    exit 0
+    ;;
+  update)
     exit 0
     ;;
   show)
@@ -1129,9 +1133,7 @@ func TestEngineerNotifyConvoyCompletion_StampsAndSkipsDuplicate(t *testing.T) {
 
 	binDir := t.TempDir()
 	statePath := filepath.Join(binDir, "notified.state")
-	mailLogPath := filepath.Join(binDir, "mail.log")
 	bdPath := filepath.Join(binDir, "bd")
-	gtPath := filepath.Join(binDir, "gt")
 
 	bdScript := `#!/bin/sh
 STATE="` + statePath + `"
@@ -1160,28 +1162,18 @@ exit 0
 	if err := os.WriteFile(bdPath, []byte(bdScript), 0755); err != nil {
 		t.Fatalf("write bd stub: %v", err)
 	}
-
-	gtScript := `#!/bin/sh
-if [ "$1" = "mail" ] && [ "$2" = "send" ]; then
-  echo "$@" >> "` + mailLogPath + `"
-fi
-exit 0
-`
-	if err := os.WriteFile(gtPath, []byte(gtScript), 0755); err != nil {
-		t.Fatalf("write gt stub: %v", err)
-	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	e := NewEngineer(&rig.Rig{Name: "testrig", Path: rigDir})
+	// Inject the in-memory mail sender (the test-binary default) so we can
+	// assert on captured envelopes; the exec path is bypassed under `go test`.
+	ms := newMemoryMailSender()
+	e.SetMailSender(ms)
 	e.notifyConvoyCompletion(townRoot, "hq-cv-ref", "Refinery Duplicate Guard", "Owner: mayor/")
 	e.notifyConvoyCompletion(townRoot, "hq-cv-ref", "Refinery Duplicate Guard", "Owner: mayor/")
 
-	data, err := os.ReadFile(mailLogPath)
-	if err != nil {
-		t.Fatalf("read mail log: %v", err)
-	}
-	if got := strings.Count(string(data), "mail send"); got != 1 {
-		t.Fatalf("mail sends = %d, want 1; log:\n%s", got, string(data))
+	if got := len(ms.Sent()); got != 1 {
+		t.Fatalf("mail sends = %d, want 1; sent:\n%+v", got, ms.Sent())
 	}
 	if _, err := os.Stat(statePath); err != nil {
 		t.Fatalf("completion notification state was not recorded: %v", err)
