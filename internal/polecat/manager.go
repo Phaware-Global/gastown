@@ -850,6 +850,10 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 		return nil, err
 	}
 
+	if err := rig.EnsureCodegraphIndex(clonePath, townRoot, m.rig.Path); err != nil {
+		style.PrintWarning("could not start codegraph indexing: %v", err)
+	}
+
 	agentID := m.agentBeadID(name)
 	if err = m.createAgentBeadWithRetry(agentID, &beads.AgentFields{
 		RoleType:   "polecat",
@@ -1074,6 +1078,10 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (_ *Polecat, retE
 	if err := m.runSetupCommand(clonePath); err != nil {
 		cleanupOnError()
 		return nil, err
+	}
+
+	if err := rig.EnsureCodegraphIndex(clonePath, townRoot, m.rig.Path); err != nil {
+		style.PrintWarning("could not start codegraph indexing: %v", err)
 	}
 
 	// NOTE: Slash commands (.claude/commands/) are provisioned at town level by gt install.
@@ -1607,6 +1615,10 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 	// Keep worktree runtime ignores local so the tracked tree stays clean.
 	if err := rig.EnsureLocalExcludePatterns(newClonePath); err != nil {
 		style.PrintWarning("could not update local git excludes: %v", err)
+	}
+
+	if err := rig.EnsureCodegraphIndex(newClonePath, m.townRoot, m.rig.Path); err != nil {
+		style.PrintWarning("could not start codegraph indexing: %v", err)
 	}
 
 	// NOTE: Slash commands inherited from town level - no per-workspace copies needed.

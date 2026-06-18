@@ -133,7 +133,7 @@ func (t *Translator) Authenticate(headers map[string]string, body []byte) error 
 // The headers parameter is unused — Jira encodes the event type in the JSON
 // body's webhookEvent field, not in an HTTP header.
 //
-// Returns ErrUnknownEventType for unrecognised webhookEvent values.
+// Returns ErrUnknownEventType for unrecognized webhookEvent values.
 // Returns (non-nil event, ErrActorFiltered) when the event's actor matches
 // the ignore_actors list; the caller must log a drop and not enqueue to L3.
 // Returns (non-nil event, ErrNotRelevant) when a known event type does not
