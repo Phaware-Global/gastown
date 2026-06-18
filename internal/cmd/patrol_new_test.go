@@ -71,7 +71,7 @@ func TestPatrolNew_DeaconHeartbeatRefresh(t *testing.T) {
 
 	// runPatrolNewWithRole will error at autoSpawnPatrol (no beads in tests),
 	// but the heartbeat refresh runs before that point.
-	_ = runPatrolNewWithRole(patrolNewCmd, nil, roleInfo)
+	_ = runPatrolNewWithRole(roleInfo)
 
 	hb := deacon.ReadHeartbeat(tmpDir)
 	if hb == nil {
@@ -100,7 +100,7 @@ func TestPatrolNew_NonDeaconRolesSkipHeartbeat(t *testing.T) {
 				Rig:      "testrig",
 			}
 
-			_ = runPatrolNewWithRole(patrolNewCmd, nil, roleInfo)
+			_ = runPatrolNewWithRole(roleInfo)
 
 			if hb := deacon.ReadHeartbeat(tmpDir); hb != nil {
 				t.Errorf("heartbeat should not be written for %s role", roleName)

@@ -39,12 +39,12 @@ func runPatrolNew(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("detecting role: %w", err)
 	}
-	return runPatrolNewWithRole(cmd, args, roleInfo)
+	return runPatrolNewWithRole(roleInfo)
 }
 
 // runPatrolNewWithRole is the testable inner implementation; callers substitute
 // a controlled RoleInfo in tests to avoid touching the real workspace.
-func runPatrolNewWithRole(cmd *cobra.Command, args []string, roleInfo RoleInfo) error {
+func runPatrolNewWithRole(roleInfo RoleInfo) error {
 	// Allow --role flag to override; otherwise use the already-parsed role
 	// (GetRole already handles GT_ROLE env var internally)
 	roleName := string(roleInfo.Role)
