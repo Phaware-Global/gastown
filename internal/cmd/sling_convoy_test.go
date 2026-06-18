@@ -155,3 +155,11 @@ func TestBdDepListRawIDsValidation(t *testing.T) {
 		t.Error("bdDepListRawIDs should reject SQL injection in depType")
 	}
 }
+
+func TestSQLExternalDepTargetClauseEscapesUnderscore(t *testing.T) {
+	got := sqlExternalDepTargetClause("gt-a_b")
+	want := "depends_on_external LIKE '%:gt-a!_b' ESCAPE '!'"
+	if got != want {
+		t.Fatalf("sqlExternalDepTargetClause() = %q, want %q", got, want)
+	}
+}

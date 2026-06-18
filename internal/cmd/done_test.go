@@ -81,6 +81,47 @@ func TestDoneUsesResolveBeadsDir(t *testing.T) {
 	})
 }
 
+func TestForceCloseIssueWithRetryClosesNoMergeIssue(t *testing.T) {
+	var gotReason string
+	var gotIDs []string
+	calls := 0
+
+	err := forceCloseIssueWithRetry(func(reason string, ids ...string) error {
+		calls++
+		gotReason = reason
+		gotIDs = append([]string(nil), ids...)
+		return nil
+	}, "gt-abc", "No-merge work completed; merge queue skipped", "Issue %s closed (no-merge)")
+	if err != nil {
+		t.Fatalf("forceCloseIssueWithRetry returned error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("close calls = %d, want 1", calls)
+	}
+	if gotReason != "No-merge work completed; merge queue skipped" {
+		t.Errorf("reason = %q", gotReason)
+	}
+	if len(gotIDs) != 1 || gotIDs[0] != "gt-abc" {
+		t.Errorf("ids = %v, want [gt-abc]", gotIDs)
+	}
+}
+
+func TestForceCloseIssueWithRetryReturnsFinalError(t *testing.T) {
+	wantErr := errors.New("dolt locked")
+	calls := 0
+
+	err := forceCloseIssueWithRetrySleep(func(string, ...string) error {
+		calls++
+		return wantErr
+	}, "gt-abc", "No-merge work completed; merge queue skipped", "Issue %s closed (no-merge)", func(time.Duration) {})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want %v", err, wantErr)
+	}
+	if calls != 3 {
+		t.Fatalf("close calls = %d, want 3", calls)
+	}
+}
+
 // TestDoneBeadsInitWithoutRedirect verifies that beads initialization works
 // normally when no redirect file exists.
 func TestDoneBeadsInitWithoutRedirect(t *testing.T) {
@@ -275,7 +316,7 @@ func TestFindHookedBeadForAgent(t *testing.T) {
 			setupBeads: func(t *testing.T, bd *beads.Beads) {
 				// Create a task and set it to hooked with assignee
 				_, err := bd.CreateWithID("test-456", beads.CreateOptions{
-					Title: "Task to be hooked",
+					Title:  "Task to be hooked",
 					Labels: []string{"gt:task"},
 				})
 				if err != nil {
@@ -291,6 +332,33 @@ func TestFindHookedBeadForAgent(t *testing.T) {
 				}
 			},
 			wantIssueID: "test-456",
+		},
+		{
+			// Regression for hq-xa4z: polecats claim their assignment with
+			// `bd update --status=in_progress` when starting work. A
+			// hooked-only lookup returned empty here, blinding the stale-
+			// branch guard (toast re-wisp-e2q carried source_issue re-k8oa
+			// while the real assignment re-dkf sat in_progress).
+			name:    "in_progress bead assigned to agent returns issue ID",
+			agentID: "testrig/polecats/toast",
+			setupBeads: func(t *testing.T, bd *beads.Beads) {
+				_, err := bd.CreateWithID("test-789", beads.CreateOptions{
+					Title:  "Claimed task",
+					Labels: []string{"gt:task"},
+				})
+				if err != nil {
+					t.Fatalf("create task bead: %v", err)
+				}
+				inProgress := "in_progress"
+				assignee := "testrig/polecats/toast"
+				if err := bd.Update("test-789", beads.UpdateOptions{
+					Status:   &inProgress,
+					Assignee: &assignee,
+				}); err != nil {
+					t.Fatalf("update bead to in_progress: %v", err)
+				}
+			},
+			wantIssueID: "test-789",
 		},
 		{
 			name:        "no hooked beads returns empty",
@@ -326,6 +394,90 @@ func TestFindHookedBeadForAgent(t *testing.T) {
 			got := findHookedBeadForAgent(bd, tt.agentID)
 			if got != tt.wantIssueID {
 				t.Errorf("findHookedBeadForAgent(%q) = %q, want %q", tt.agentID, got, tt.wantIssueID)
+			}
+		})
+	}
+}
+
+func TestSelectAssignedIssue(t *testing.T) {
+	tests := []struct {
+		name        string
+		branchIssue string
+		assigned    []string
+		wantIssue   string
+		wantAmbig   bool
+	}{
+		{
+			name:      "single assignment selected",
+			assigned:  []string{"gt-real"},
+			wantIssue: "gt-real",
+		},
+		{
+			name:        "stale branch overridden by single assignment",
+			branchIssue: "gt-old",
+			assigned:    []string{"gt-real"},
+			wantIssue:   "gt-real",
+		},
+		{
+			name:        "branch matching assignment needs no override",
+			branchIssue: "gt-real",
+			assigned:    []string{"gt-real"},
+		},
+		{
+			name:        "subtask branch matching assignment needs no override",
+			branchIssue: "gt-real.1",
+			assigned:    []string{"gt-real"},
+		},
+		{
+			name:        "branch matching one of multiple assignments needs no override",
+			branchIssue: "gt-real",
+			assigned:    []string{"gt-real", "gt-other"},
+		},
+		{
+			name:      "duplicate assignment ids collapse",
+			assigned:  []string{"gt-real", "gt-real"},
+			wantIssue: "gt-real",
+		},
+		{
+			name:      "multiple assignments are ambiguous",
+			assigned:  []string{"gt-b", "gt-a"},
+			wantAmbig: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotIssue, gotAmbig := selectAssignedIssue(tt.branchIssue, tt.assigned)
+			if gotIssue != tt.wantIssue || gotAmbig != tt.wantAmbig {
+				t.Fatalf("selectAssignedIssue(%q, %v) = (%q, %v), want (%q, %v)",
+					tt.branchIssue, tt.assigned, gotIssue, gotAmbig, tt.wantIssue, tt.wantAmbig)
+			}
+		})
+	}
+}
+
+// TestIsStaleBranchIssue verifies the stale-branch guard (hq-l0fj): a
+// branch-derived issue id is overridden only when it conflicts with the
+// hooked bead and is not a subtask of it.
+func TestIsStaleBranchIssue(t *testing.T) {
+	tests := []struct {
+		name        string
+		branchIssue string
+		hookedIssue string
+		want        bool
+	}{
+		{"matching ids are not stale", "hq-oibv", "hq-oibv", false},
+		{"reused branch from closed bead is stale", "re-ofo", "hq-oibv", true},
+		{"subtask of hooked bead is not stale", "gt-abc.1", "gt-abc", false},
+		{"different bead with shared prefix is stale", "gt-abc1", "gt-abc", true},
+		{"no branch issue is not stale", "", "hq-oibv", false},
+		{"no hooked bead is not stale", "re-ofo", "", false},
+		{"both empty is not stale", "", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isStaleBranchIssue(tt.branchIssue, tt.hookedIssue); got != tt.want {
+				t.Errorf("isStaleBranchIssue(%q, %q) = %v, want %v", tt.branchIssue, tt.hookedIssue, got, tt.want)
 			}
 		})
 	}
@@ -398,6 +550,90 @@ func TestDoneIntentLabelFormat(t *testing.T) {
 			}
 			if parts[1] != tt.exitType {
 				t.Errorf("exit type = %q, want %q", parts[1], tt.exitType)
+			}
+		})
+	}
+}
+
+// TestShouldNudgeRefinery locks in the gh#3885 invariant: only COMPLETED
+// exits with a created MR bead may wake the refinery. DEFERRED/ESCALATED
+// exits — used by polecats finishing operational tasks with no code changes —
+// must never emit MQ_SUBMIT, even if an mrID is somehow populated. The
+// "stray MR" cases guard against a regression to a bare `mrID != ""` check.
+func TestShouldNudgeRefinery(t *testing.T) {
+	tests := []struct {
+		name     string
+		exitType string
+		mrID     string
+		want     bool
+	}{
+		{"completed with MR nudges", ExitCompleted, "gt-abc123", true},
+		{"completed without MR does not nudge", ExitCompleted, "", false},
+		{"deferred without MR does not nudge", ExitDeferred, "", false},
+		{"deferred with stray MR does not nudge", ExitDeferred, "gt-abc123", false},
+		{"escalated without MR does not nudge", ExitEscalated, "", false},
+		{"escalated with stray MR does not nudge", ExitEscalated, "gt-abc123", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldNudgeRefinery(tt.exitType, tt.mrID); got != tt.want {
+				t.Errorf("shouldNudgeRefinery(%q, %q) = %v, want %v",
+					tt.exitType, tt.mrID, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShouldSyncIdlePolecatWorktree(t *testing.T) {
+	tests := []struct {
+		name          string
+		exitType      string
+		mergeStrategy string
+		pushFailed    bool
+		mrFailed      bool
+		syncSafe      bool
+		want          bool
+	}{
+		{"completed default strategy syncs", ExitCompleted, "", false, false, true, true},
+		{"completed direct strategy syncs", ExitCompleted, "direct", false, false, true, true},
+		{"completed mr strategy syncs", ExitCompleted, "mr", false, false, true, true},
+		{"local strategy keeps branch", ExitCompleted, "local", false, false, true, false},
+		{"deferred keeps branch", ExitDeferred, "", false, false, true, false},
+		{"escalated keeps branch", ExitEscalated, "", false, false, true, false},
+		{"push failure keeps branch", ExitCompleted, "", true, false, true, false},
+		{"mr failure keeps branch", ExitCompleted, "", false, true, true, false},
+		{"unsafe sync keeps branch", ExitCompleted, "", false, false, false, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldSyncIdlePolecatWorktree(tt.exitType, tt.mergeStrategy, tt.pushFailed, tt.mrFailed, tt.syncSafe)
+			if got != tt.want {
+				t.Errorf("shouldSyncIdlePolecatWorktree(%q, %q, %v, %v, %v) = %v, want %v",
+					tt.exitType, tt.mergeStrategy, tt.pushFailed, tt.mrFailed, tt.syncSafe, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCleanupStatusAfterSuccessfulPush(t *testing.T) {
+	tests := []struct {
+		status string
+		want   string
+	}{
+		{"unpushed", "clean"},
+		{"has_unpushed", "clean"},
+		{"clean", "clean"},
+		{"uncommitted", "uncommitted"},
+		{"stash", "stash"},
+		{"unknown", "unknown"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.status, func(t *testing.T) {
+			if got := cleanupStatusAfterSuccessfulPush(tt.status); got != tt.want {
+				t.Errorf("cleanupStatusAfterSuccessfulPush(%q) = %q, want %q", tt.status, got, tt.want)
 			}
 		})
 	}
@@ -696,10 +932,10 @@ func TestMRHardFailErrorsWrapCause(t *testing.T) {
 // Without this, the refinery never finds the MR and the branch sits unmerged.
 func TestMRBeadCreationUsesRig(t *testing.T) {
 	tests := []struct {
-		name     string
-		issueID  string
-		rigName  string
-		wantRig  string
+		name    string
+		issueID string
+		rigName string
+		wantRig string
 	}{
 		{
 			name:    "same-rig bead: rig is still set",
@@ -725,10 +961,10 @@ func TestMRBeadCreationUsesRig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Simulate the CreateOptions construction in done.go.
 			opts := beads.CreateOptions{
-				Title:       "Merge: " + tt.issueID,
-				Labels:      []string{"gt:merge-request"},
-				Ephemeral:   true,
-				Rig:         tt.rigName,
+				Title:     "Merge: " + tt.issueID,
+				Labels:    []string{"gt:merge-request"},
+				Ephemeral: true,
+				Rig:       tt.rigName,
 			}
 			if opts.Rig != tt.wantRig {
 				t.Errorf("CreateOptions.Rig = %q, want %q (issue %s)", opts.Rig, tt.wantRig, tt.issueID)
@@ -1113,7 +1349,7 @@ func TestReadDoneCheckpoints(t *testing.T) {
 			},
 		},
 		{
-			name:   "mixed with done-intent and other labels",
+			name: "mixed with done-intent and other labels",
 			labels: []string{
 				"gt:agent",
 				"done-intent:COMPLETED:1738972800",
@@ -1259,12 +1495,12 @@ func TestCheckpointNilMapSafe(t *testing.T) {
 // convoy merge=direct was not propagated because cross-rig dep resolution failed.
 func TestConvoyInfoFallbackChain(t *testing.T) {
 	tests := []struct {
-		name            string
-		attachmentInfo  *ConvoyInfo // Result from getConvoyInfoFromIssue
-		depInfo         *ConvoyInfo // Result from getConvoyInfoForIssue
-		wantConvoyID    string
-		wantMerge       string
-		wantNil         bool
+		name           string
+		attachmentInfo *ConvoyInfo // Result from getConvoyInfoFromIssue
+		depInfo        *ConvoyInfo // Result from getConvoyInfoForIssue
+		wantConvoyID   string
+		wantMerge      string
+		wantNil        bool
 	}{
 		{
 			name:           "attachment fields provide convoy info",
@@ -1330,9 +1566,9 @@ func TestConvoyInfoFallbackChain(t *testing.T) {
 // closing and caused infinite dispatch loops.
 func TestHookedBeadCloseNotRestrictedToHookedStatus(t *testing.T) {
 	tests := []struct {
-		name       string
-		status     string
-		wantClose  bool
+		name      string
+		status    string
+		wantClose bool
 	}{
 		{"status hooked → close", "hooked", true},
 		{"status in_progress → close", "in_progress", true},
@@ -1571,6 +1807,75 @@ func TestAutoCommitSafetyNet(t *testing.T) {
 			t.Error("runtime-only changes should be considered clean excluding runtime")
 		}
 	})
+
+	t.Run("auto-commit excludes runtime artifacts recursively", func(t *testing.T) {
+		repo := t.TempDir()
+		testRunGit(t, repo, "init")
+		testRunGit(t, repo, "config", "user.email", "test@test.com")
+		testRunGit(t, repo, "config", "user.name", "Test")
+		if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# Test\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		testRunGit(t, repo, "add", "README.md")
+		testRunGit(t, repo, "commit", "-m", "initial commit")
+
+		writeFile := func(path, content string) {
+			t.Helper()
+			fullPath := filepath.Join(repo, path)
+			if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		writeFile("src/handler.go", "package main\n\nfunc handler() {}\n")
+		writeFile(".opencode/plugins/gastown.js", "// generated\n")
+		writeFile("services/cyrus/workflow-cyrus-edge/node_modules/pkg/index.js", "module.exports = {}\n")
+		writeFile("dashboard/public/meridian-dashboard/.vite/vitest/hash/results.json", "{}\n")
+		writeFile("services/workflows/collateral-internal/execution_log.db", "sqlite\n")
+		writeFile("api/.pytest_cache/v/cache/nodeids", "[]\n")
+		writeFile("src/__pycache__/handler.cpython-312.pyc", "pyc\n")
+		writeFile(".beads/.runtime/state.json", "{}\n")
+
+		g := gitpkg.NewGit(repo)
+		ws, err := g.CheckUncommittedWork()
+		if err != nil {
+			t.Fatalf("CheckUncommittedWork: %v", err)
+		}
+		if !ws.HasUncommittedChanges || ws.CleanExcludingRuntime() {
+			t.Fatal("expected mixed source and runtime changes")
+		}
+
+		if err := g.Add("-A"); err != nil {
+			t.Fatalf("git add: %v", err)
+		}
+		if runtimePaths := ws.RuntimeArtifactPaths(); len(runtimePaths) > 0 {
+			if err := g.ResetFiles(runtimePaths...); err != nil {
+				t.Fatalf("reset runtime artifacts: %v", err)
+			}
+		}
+		if err := g.Commit("fix: auto-save uncommitted implementation work (gt-pvx safety net)"); err != nil {
+			t.Fatalf("git commit: %v", err)
+		}
+
+		changed, err := g.DiffNameOnly("HEAD~1", "HEAD")
+		if err != nil {
+			t.Fatalf("DiffNameOnly: %v", err)
+		}
+		if len(changed) != 1 || changed[0] != "src/handler.go" {
+			t.Fatalf("auto-save committed %v, want only src/handler.go", changed)
+		}
+
+		wsAfter, err := g.CheckUncommittedWork()
+		if err != nil {
+			t.Fatalf("CheckUncommittedWork after commit: %v", err)
+		}
+		if !wsAfter.HasUncommittedChanges || !wsAfter.CleanExcludingRuntime() {
+			t.Fatalf("runtime artifacts should remain uncommitted and clean-excluded, got %#v", wsAfter)
+		}
+	})
 }
 
 // TestSyncGuardWithUncommittedChanges verifies that the worktree sync guard
@@ -1622,4 +1927,3 @@ func testRunGit(t *testing.T, dir string, args ...string) {
 		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
 	}
 }
-

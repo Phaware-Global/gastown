@@ -627,6 +627,16 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 			// port, causing "database not found" errors. (GH #2405)
 			doltCfg := doltserver.DefaultConfig(m.townRoot)
 			initArgs = append(initArgs, "--server-port", strconv.Itoa(doltCfg.Port))
+			// If the cloned repo's config.yaml has sync.remote, bd init blocks
+			// waiting for interactive confirmation (stdin is /dev/null here).
+			// Pass explicit flags to bypass the safety check. (GH #3873)
+			if beadsConfigHasSyncRemote(sourceBeadsConfig) {
+				initArgs = append(initArgs,
+					"--reinit-local",
+					"--discard-remote",
+					"--destroy-token=DESTROY-"+opts.BeadsPrefix,
+				)
+			}
 			cmd := exec.Command("bd", initArgs...)
 			cmd.Dir = mayorRigPath
 			cmd.Env = sourceBdEnv
@@ -703,14 +713,17 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	// InitBeads ran bd config set issue_prefix, but against the wrong database
 	// (beads_<prefix> from bd init, not <rigName> from the centralized server).
 	// Now that EnsureMetadata has corrected dolt_database, re-set it.
+	//
+	// Seed via the SDK rather than a `bd config set` CLI call: bd v1.0.5 resolves
+	// a nested rig directory up to the parent town workspace, so the CLI set
+	// would land on the town database and leave the rig database with the wrong
+	// (rig-name fallback) prefix. EnsureRigIssuePrefixValue opens the rig's
+	// server-side database directly and writes the explicit prefix.
 	{
 		resolvedBeadsDir := beads.ResolveBeadsDir(rigPath)
 		bdEnv := bdSubprocessEnv(resolvedBeadsDir, opts.Name)
-		prefixCmd := exec.Command("bd", "config", "set", "issue_prefix", opts.BeadsPrefix)
-		prefixCmd.Dir = rigPath
-		prefixCmd.Env = bdEnv
-		if out, err := prefixCmd.CombinedOutput(); err != nil {
-			fmt.Printf("  Warning: Could not set issue_prefix on rig database: %v (%s)\n", err, strings.TrimSpace(string(out)))
+		if err := doltserver.EnsureRigIssuePrefixValue(m.townRoot, opts.Name, opts.BeadsPrefix, true); err != nil {
+			fmt.Printf("  Warning: Could not set issue_prefix on rig database: %v\n", err)
 		}
 		typesCmd := exec.Command("bd", "config", "set", "types.custom", constants.BeadsCustomTypes)
 		typesCmd.Dir = rigPath
@@ -770,6 +783,10 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	if err := CopyOverlay(rigPath, refineryRigPath); err != nil {
 		// Non-fatal - log warning but continue
 		fmt.Printf("  Warning: Could not copy overlay files to refinery: %v\n", err)
+	}
+
+	if err := EnsureCodegraphIndex(refineryRigPath, m.townRoot, rigPath); err != nil {
+		fmt.Printf("  Warning: Could not start codegraph indexing for refinery: %v\n", err)
 	}
 
 	// NOTE: Claude settings are installed by the agent at startup, not here.
@@ -1603,6 +1620,28 @@ func detectBeadsPrefixFromConfig(configPath string) string {
 	}
 
 	return ""
+}
+
+// beadsConfigHasSyncRemote reports whether the given beads config.yaml contains
+// a non-empty sync.remote entry. bd init blocks waiting for interactive
+// confirmation when it detects this, so callers must pass --reinit-local
+// --discard-remote --destroy-token to suppress the prompt. (GH #3873)
+func beadsConfigHasSyncRemote(configPath string) bool {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "sync.remote:") {
+			value := strings.TrimSpace(strings.TrimPrefix(line, "sync.remote:"))
+			return strings.Trim(value, `"'`) != ""
+		}
+	}
+	return false
 }
 
 // RemoveRig unregisters a rig (does not delete files).

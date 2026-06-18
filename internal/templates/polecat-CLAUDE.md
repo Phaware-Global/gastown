@@ -149,7 +149,7 @@ gt dolt status                     # Check server health + latency
 ## Startup Protocol
 
 1. Announce: "Polecat {{name}}, checking in."
-2. Run: `gt prime && bd prime`
+2. Run: `gt prime`
 3. Check hook: `gt hook`
 4. If formula attached, steps are shown inline by `gt prime`
 5. Work through the checklist, then `gt done`

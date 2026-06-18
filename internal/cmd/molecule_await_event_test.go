@@ -300,7 +300,7 @@ func TestWaitForEventFilesPolling(t *testing.T) {
 	}()
 
 	start := time.Now()
-	result, err := waitForEventFiles(ctx, dir)
+	result, err := waitForEventFiles(ctx, dir, 0)
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -330,7 +330,7 @@ func TestWaitForEventFilesWithPending(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	result, err := waitForEventFiles(ctx, dir)
+	result, err := waitForEventFiles(ctx, dir, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestWaitForEventFilesTimeout(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-1*time.Second))
 	defer cancel()
 
-	result, err := waitForEventFiles(ctx, dir)
+	result, err := waitForEventFiles(ctx, dir, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -362,7 +362,7 @@ func TestWaitForEventFilesNoDeadline(t *testing.T) {
 	// With a context that has no deadline, should return timeout immediately.
 	dir := t.TempDir()
 
-	result, err := waitForEventFiles(context.Background(), dir)
+	result, err := waitForEventFiles(context.Background(), dir, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -382,7 +382,7 @@ func TestWaitForEventFilesTimeoutWithPolling(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	result, err := waitForEventFiles(ctx, dir)
+	result, err := waitForEventFiles(ctx, dir, 0)
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -419,6 +419,127 @@ func TestReadPendingEventsBoundedCtxDone(t *testing.T) {
 	elapsed := time.Since(start)
 	if elapsed > 500*time.Millisecond {
 		t.Errorf("bounded read took %v with cancelled ctx; expected prompt return", elapsed)
+	}
+}
+
+func TestWaitForEventFilesContextYield(t *testing.T) {
+	// Regression test for #3870: --context-check-interval must cause an early
+	// return with reason "context-yield" before the full backoff timeout expires.
+	dir := t.TempDir()
+
+	// Full timeout is much longer than the yield interval.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	yieldAfter := 600 * time.Millisecond
+
+	start := time.Now()
+	result, err := waitForEventFiles(ctx, dir, yieldAfter)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Reason != "context-yield" {
+		t.Errorf("expected reason 'context-yield', got %q (elapsed: %v)", result.Reason, elapsed)
+	}
+	// Must return close to the yield interval, not the full 10s timeout.
+	if elapsed < yieldAfter-100*time.Millisecond {
+		t.Errorf("returned too early (%v); yield interval was %v", elapsed, yieldAfter)
+	}
+	if elapsed > yieldAfter+2*time.Second {
+		t.Errorf("returned too late (%v); yield interval was %v", elapsed, yieldAfter)
+	}
+}
+
+func TestWaitForEventFilesContextYieldEventWins(t *testing.T) {
+	// When an event arrives before the context-yield interval, the event
+	// result takes priority.
+	dir := t.TempDir()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	yieldAfter := 5 * time.Second // yield interval is long — event arrives first
+
+	go func() {
+		time.Sleep(800 * time.Millisecond)
+		os.WriteFile(filepath.Join(dir, "early.event"), []byte(`{"type":"MERGE_READY"}`), 0644)
+	}()
+
+	result, err := waitForEventFiles(ctx, dir, yieldAfter)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Reason != "event" {
+		t.Errorf("expected reason 'event' (event arrived before yield), got %q", result.Reason)
+	}
+	if len(result.Events) != 1 {
+		t.Errorf("expected 1 event, got %d", len(result.Events))
+	}
+}
+
+func TestWaitForEventFilesContextYieldTimeoutWins(t *testing.T) {
+	// When the backoff timeout is shorter than the yield interval, timeout
+	// fires first and the result is "timeout", not "context-yield".
+	dir := t.TempDir()
+
+	// Timeout is shorter than the yield interval.
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+
+	yieldAfter := 5 * time.Second
+
+	result, err := waitForEventFiles(ctx, dir, yieldAfter)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Reason != "timeout" {
+		t.Errorf("expected reason 'timeout' (timeout < yield interval), got %q", result.Reason)
+	}
+}
+
+func TestWaitForEventFilesNoContextYieldWhenZero(t *testing.T) {
+	// When contextCheckAfter is 0 (not set), behavior is unchanged:
+	// the wait runs to the full timeout without yielding.
+	dir := t.TempDir()
+
+	deadline := 600 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	defer cancel()
+
+	start := time.Now()
+	result, err := waitForEventFiles(ctx, dir, 0) // zero = no yield
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Reason != "timeout" {
+		t.Errorf("expected reason 'timeout' with zero yield interval, got %q", result.Reason)
+	}
+	if elapsed > deadline+2*time.Second {
+		t.Errorf("wait took %v; should have returned at ~%v", elapsed, deadline)
+	}
+}
+
+func TestEffortLevelContextYield(t *testing.T) {
+	// context-yield must produce EffortLevel "full" so context-check is
+	// not abbreviated.
+	result := &AwaitEventResult{
+		Reason:     "context-yield",
+		IdleCycles: 5, // high idle count that would normally produce "abbreviated"
+	}
+
+	// Replicate the effort-level logic from runMoleculeAwaitEvent.
+	if result.Reason == "event" || result.Reason == "context-yield" || result.IdleCycles == 0 {
+		result.EffortLevel = "full"
+	} else {
+		result.EffortLevel = "abbreviated"
+	}
+
+	if result.EffortLevel != "full" {
+		t.Errorf("context-yield should produce EffortLevel 'full', got %q", result.EffortLevel)
 	}
 }
 

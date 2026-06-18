@@ -55,6 +55,7 @@ const scrubWhereClause = ` WHERE (ephemeral IS NULL OR ephemeral != 1)` +
 	` AND issue_type NOT IN ('message', 'event', 'agent', 'convoy', 'molecule', 'role', 'merge-request', 'rig')` +
 	` AND id NOT LIKE '%-wisp-%'` +
 	` AND id NOT LIKE '%-cv-%'` +
+	` AND id NOT LIKE '%-wf-%'` +
 	` AND id NOT LIKE 'test%'` +
 	` AND id NOT LIKE 'beads\_t%'` +
 	` AND id NOT LIKE 'beads\_pt%'` +

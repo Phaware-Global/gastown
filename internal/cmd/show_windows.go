@@ -18,20 +18,14 @@ func execBdShow(args []string) error {
 		return fmt.Errorf("bd not found in PATH: %w", err)
 	}
 
-	if beadID := extractBeadIDFromArgs(args); beadID != "" {
-		if dir := resolveBeadDir(beadID); dir != "" && dir != "." {
-			_ = os.Chdir(dir)
-		}
-	}
+	invocation := currentBdShowInvocation(args)
 
-	env := stripEnvKey(os.Environ(), "BEADS_DIR")
-
-	cmdArgs := append([]string{"show"}, args...)
-	cmd := exec.Command(bdPath, cmdArgs...)
+	cmd := exec.Command(bdPath, invocation.CommandArgs...)
+	cmd.Dir = invocation.Dir
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = env
+	cmd.Env = invocation.Env
 
 	if err := cmd.Run(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {

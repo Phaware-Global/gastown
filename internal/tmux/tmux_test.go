@@ -1324,6 +1324,40 @@ func TestFindAgentPane_SinglePane(t *testing.T) {
 	}
 }
 
+func TestFindAgentPane_IgnoresPaneIDFromOtherSession(t *testing.T) {
+	tm := newTestTmux(t)
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano()%10000)
+	targetSession := "gt-test-findagent-target-" + suffix
+	otherSession := "gt-test-findagent-other-" + suffix
+
+	_ = tm.KillSession(targetSession)
+	_ = tm.KillSession(otherSession)
+	if err := tm.NewSession(targetSession, ""); err != nil {
+		t.Fatalf("NewSession target: %v", err)
+	}
+	defer func() { _ = tm.KillSession(targetSession) }()
+	if err := tm.NewSession(otherSession, ""); err != nil {
+		t.Fatalf("NewSession other: %v", err)
+	}
+	defer func() { _ = tm.KillSession(otherSession) }()
+
+	otherPane, err := tm.GetPaneID(otherSession)
+	if err != nil {
+		t.Fatalf("GetPaneID other: %v", err)
+	}
+	if err := tm.SetEnvironment(targetSession, "GT_PANE_ID", otherPane); err != nil {
+		t.Fatalf("SetEnvironment GT_PANE_ID: %v", err)
+	}
+
+	paneID, err := tm.FindAgentPane(targetSession)
+	if err != nil {
+		t.Fatalf("FindAgentPane: %v", err)
+	}
+	if paneID == otherPane {
+		t.Fatalf("FindAgentPane returned pane %q from another session", paneID)
+	}
+}
+
 func TestFindAgentPane_MultiPaneWithNode(t *testing.T) {
 	tm := newTestTmux(t)
 	sessionName := "gt-test-findagent-multi-" + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
@@ -1755,6 +1789,77 @@ func TestNudgeSession_WithStoredPaneID(t *testing.T) {
 	}
 }
 
+// TestNudgeSession_WakesAgentWindowNotActiveWindow is a regression test for a
+// missed-wake bug in multi-window sessions. NudgeSessionWithOpts used to pass
+// the bare session name to WakePaneIfDetached, which resizes the session's
+// *active* window. When an agent session also has another window open and
+// focused (e.g. a `gt feed -w` window), the agent's pane lives in a now-inactive
+// window, so the SIGWINCH went to the wrong window and the agent never woke.
+//
+// The wake's resize dance ends by setting the targeted window's window-size
+// option to "latest". By pre-setting both windows to "manual" and checking which
+// one flips to "latest" after the nudge, we can assert the agent's window — not
+// the active window — was the one woken.
+func TestNudgeSession_WakesAgentWindowNotActiveWindow(t *testing.T) {
+	tm := newTestTmux(t)
+	sessionName := "gt-test-nudge-multiwin-" + fmt.Sprintf("%d", time.Now().UnixNano()%100000)
+
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	time.Sleep(200 * time.Millisecond)
+
+	// The agent pane is window 0's pane. Record it as the declared identity so
+	// FindAgentPane resolves the nudge target to it.
+	agentPane, err := tm.GetPaneID(sessionName)
+	if err != nil {
+		t.Fatalf("GetPaneID: %v", err)
+	}
+	if err := tm.SetEnvironment(sessionName, "GT_PANE_ID", agentPane); err != nil {
+		t.Fatalf("SetEnvironment GT_PANE_ID: %v", err)
+	}
+
+	// Open a second window, which tmux makes the active window. This puts the
+	// agent's pane in a non-active window — the scenario that exposed the bug.
+	if _, err := tm.run("new-window", "-t", sessionName, "-n", "feed"); err != nil {
+		t.Fatalf("new-window: %v", err)
+	}
+
+	// Pre-set both windows to window-size "manual". The wake resets only the
+	// window it targets back to "latest", giving us a deterministic signal.
+	for _, win := range []string{":0", ":1"} {
+		if _, err := tm.run("set-option", "-w", "-t", sessionName+win, "window-size", "manual"); err != nil {
+			t.Fatalf("set-option window-size manual on %s: %v", sessionName+win, err)
+		}
+	}
+
+	if err := tm.NudgeSession(sessionName, "test message"); err != nil {
+		t.Fatalf("NudgeSession: %v", err)
+	}
+
+	windowSize := func(win string) string {
+		out, err := tm.run("show-options", "-w", "-t", sessionName+win, "window-size")
+		if err != nil {
+			t.Fatalf("show-options window-size on %s: %v", sessionName+win, err)
+		}
+		fields := strings.Fields(strings.TrimSpace(out))
+		if len(fields) < 2 {
+			return ""
+		}
+		return fields[1]
+	}
+
+	// Agent window (0) must have been woken; active window (1) must be untouched.
+	if got := windowSize(":0"); got != "latest" {
+		t.Errorf("agent window (0) window-size = %q, want %q (agent's window was not woken)", got, "latest")
+	}
+	if got := windowSize(":1"); got != "manual" {
+		t.Errorf("active window (1) window-size = %q, want %q (wrong window was woken)", got, "manual")
+	}
+}
+
 // TestAdaptiveTextDelay verifies the delay scaling logic for post-text delivery.
 func TestAdaptiveTextDelay(t *testing.T) {
 	t.Parallel()
@@ -1883,6 +1988,106 @@ func TestHasBusyIndicator(t *testing.T) {
 				t.Errorf("hasBusyIndicator(%q) = %v, want %v", tt.line, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestShouldSendEscapeForLines guards against the regression where a nudge
+// sends the vim-mode Escape keystroke while the agent is actively generating,
+// interrupting its current turn (e.g. the Mayor). When the pane shows the busy
+// indicator ("esc to interrupt"), the Escape must be suppressed.
+func TestShouldSendEscapeForLines(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		lines []string
+		want  bool
+	}{
+		{
+			name:  "claude generating - suppress escape",
+			lines: []string{"✻ Cogitating… (12s · ↑ 2.1k tokens · esc to interrupt)"},
+			want:  false,
+		},
+		{
+			name:  "codex working - suppress escape",
+			lines: []string{"• Working (2m 18s • esc to interrupt)"},
+			want:  false,
+		},
+		{
+			name:  "busy indicator among multiple lines - suppress escape",
+			lines: []string{"tool output", "more output", "⏵⏵ bypass permissions on · esc to interrupt"},
+			want:  false,
+		},
+		{
+			name:  "idle ready prompt - allow escape",
+			lines: []string{"❯ "},
+			want:  true,
+		},
+		{
+			name:  "idle with typed nudge text - allow escape",
+			lines: []string{"❯ HEALTH_CHECK: heartbeat stale, respond to confirm"},
+			want:  true,
+		},
+		{
+			name:  "no lines captured - allow escape (not busy)",
+			lines: nil,
+			want:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldSendEscapeForLines(tt.lines); got != tt.want {
+				t.Errorf("shouldSendEscapeForLines(%q) = %v, want %v", tt.lines, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestShouldSendEscape_LivePane exercises the busy-state gate end-to-end against
+// a real tmux pane (capture-only, so it avoids the sendEnterVerified timing
+// flakiness of the full nudge integration tests). It confirms the wiring: when
+// the pane shows the "esc to interrupt" busy indicator, shouldSendEscape returns
+// false so a nudge will not interrupt the agent's in-flight work.
+func TestShouldSendEscape_LivePane(t *testing.T) {
+	tm := newTestTmux(t)
+	session := "gt-test-should-escape-" + t.Name()
+
+	_ = tm.KillSession(session)
+	if err := tm.NewSession(session, ""); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _ = tm.KillSession(session) }()
+
+	// Idle shell prompt: no busy indicator → Escape is safe to send.
+	if !tm.shouldSendEscape(session) {
+		out, _ := tm.CapturePane(session, 20)
+		t.Fatalf("shouldSendEscape on idle pane = false, want true; pane:\n%s", out)
+	}
+
+	// Simulate an agent that is actively generating by rendering the busy
+	// indicator into the pane. The typed command line itself contains the
+	// marker, so detection does not depend on the command actually executing.
+	if err := tm.SendKeys(session, "echo esc to interrupt"); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+
+	// Poll until the gate flips to suppressed (the shell may be slow to render).
+	deadline := time.Now().Add(5 * time.Second)
+	for tm.shouldSendEscape(session) {
+		if time.Now().After(deadline) {
+			out, _ := tm.CapturePane(session, 20)
+			t.Fatalf("shouldSendEscape did not detect busy indicator within timeout; pane:\n%s", out)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func TestShouldSendEscape_CaptureErrorSuppressesEscape(t *testing.T) {
+	tm := newTestTmux(t)
+
+	if tm.shouldSendEscape("missing-session-for-escape-check") {
+		t.Fatal("shouldSendEscape on missing target = true, want false")
 	}
 }
 

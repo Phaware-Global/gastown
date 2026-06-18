@@ -38,6 +38,14 @@ func TestExpandOutputPath(t *testing.T) {
 			legID:     "performance",
 			want:      "reviews/pr-123/findings/leg-performance-analysis.md",
 		},
+		{
+			name:      "go template expansion",
+			directory: ".designs/{{.review_id}}",
+			pattern:   "{{.leg.id}}.md",
+			reviewID:  "abc123",
+			legID:     "api",
+			want:      ".designs/abc123/api.md",
+		},
 	}
 
 	for _, tt := range tests {

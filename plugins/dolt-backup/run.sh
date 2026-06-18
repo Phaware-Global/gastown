@@ -117,6 +117,10 @@ for DB in "${PROD_DBS[@]}"; do
   if [[ "$CURRENT_HASH" = "$LAST_HASH" ]] && [[ "$CURRENT_HASH" != "unknown" ]]; then
     log "  $DB: unchanged ($CURRENT_HASH), skipping"
     SKIPPED=$((SKIPPED + 1))
+    # Signal liveness to the daemon's dir-mtime freshness check even when
+    # there is nothing to sync — otherwise checkBackupFreshness reports the
+    # backup patrol as stalled forever and pours doctor molecules.
+    touch "$BACKUP_DIR/$DB" 2>/dev/null || true
     continue
   fi
 
@@ -126,18 +130,37 @@ for DB in "${PROD_DBS[@]}"; do
     continue
   fi
 
+  # Ensure the backup remote exists before syncing. Without this, towns
+  # that never ran `dolt backup add` fail every sync (historically masked
+  # by the SYNC_RC bug below).
+  if ! (cd "$DB_DIR" && dolt backup -v 2>/dev/null | awk '{print $1}' | grep -qx "$BACKUP_NAME"); then
+    log "  $DB: backup remote $BACKUP_NAME missing, adding -> file://$BACKUP_DIR/$DB/$BACKUP_NAME"
+    if ! (cd "$DB_DIR" && dolt backup add "$BACKUP_NAME" "file://$BACKUP_DIR/$DB/$BACKUP_NAME" 2>&1); then
+      FAILED=$((FAILED + 1))
+      FAILED_DBS="$FAILED_DBS $DB(add-remote)"
+      log "  $DB: FAILED to add backup remote"
+      continue
+    fi
+  fi
+
   # Sync backup with timeout
   log "  $DB: syncing ($LAST_HASH -> $CURRENT_HASH)..."
   SYNC_START=$(date +%s)
 
-  SYNC_OUTPUT=$(cd "$DB_DIR" && timeout "$BACKUP_TIMEOUT" dolt backup sync "$BACKUP_NAME" 2>&1) || true
-  SYNC_RC=${PIPESTATUS[0]:-$?}
+  # NOTE: capture the sync exit code directly. The previous
+  # `... || true; SYNC_RC=${PIPESTATUS[0]:-$?}` pattern always yielded 0
+  # (PIPESTATUS reflects the `true`), recording failed syncs as successful
+  # and writing hash markers for backups that never happened.
+  SYNC_RC=0
+  SYNC_OUTPUT=$(cd "$DB_DIR" && timeout "$BACKUP_TIMEOUT" dolt backup sync "$BACKUP_NAME" 2>&1) || SYNC_RC=$?
   SYNC_ELAPSED=$(( $(date +%s) - SYNC_START ))
 
   if [[ $SYNC_RC -eq 0 ]]; then
     # Record the hash we just backed up
     mkdir -p "$(dirname "$HASH_FILE")"
     echo "$CURRENT_HASH" > "$HASH_FILE"
+    # Bump dir mtime for the daemon's freshness check (see skip branch).
+    touch "$BACKUP_DIR/$DB" 2>/dev/null || true
 
     DB_SIZE=$(du -sh "$BACKUP_DIR/$DB" 2>/dev/null | cut -f1 || echo "?")
     SYNCED=$((SYNCED + 1))

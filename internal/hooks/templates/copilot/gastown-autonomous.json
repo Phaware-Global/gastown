@@ -4,14 +4,14 @@
     "sessionStart": [
       {
         "type": "command",
-        "bash": "{{GT_BIN}} prime --hook && {{GT_BIN}} mail check --inject",
+        "bash": "{{GT_BIN}} prime --hook",
         "timeoutSec": 30
       }
     ],
     "userPromptSubmitted": [
       {
         "type": "command",
-        "bash": "{{GT_BIN}} mail check --inject",
+        "bash": "case \"${GT_ROLE:-}\" in *witness*|*refinery*|deacon*|*boot*) exit 0 ;; *) {{GT_BIN}} mail check --inject ;; esac",
         "timeoutSec": 10
       }
     ],

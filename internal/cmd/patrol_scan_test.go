@@ -1,11 +1,28 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/witness"
 )
+
+type progressDiagnostics struct {
+	bytes.Buffer
+	sawProgress chan struct{}
+	once        sync.Once
+}
+
+func (d *progressDiagnostics) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), "still running") {
+		d.once.Do(func() { close(d.sawProgress) })
+	}
+	return d.Buffer.Write(p)
+}
 
 func TestPatrolScanOutputJSON(t *testing.T) {
 	output := PatrolScanOutput{
@@ -100,6 +117,75 @@ func TestCountActiveWorkZombies_Empty(t *testing.T) {
 	got := countActiveWorkZombies(result)
 	if got != 0 {
 		t.Errorf("countActiveWorkZombies() = %d, want 0", got)
+	}
+}
+
+func TestRunPatrolScanPhaseEmitsProgressDiagnostics(t *testing.T) {
+	oldInterval := patrolScanProgressInterval
+	patrolScanProgressInterval = 10 * time.Millisecond
+	defer func() { patrolScanProgressInterval = oldInterval }()
+
+	diagnostics := &progressDiagnostics{sawProgress: make(chan struct{})}
+	release := make(chan struct{})
+	go func() {
+		select {
+		case <-diagnostics.sawProgress:
+		case <-time.After(time.Second):
+		}
+		close(release)
+	}()
+
+	got := runPatrolScanPhase(diagnostics, "slow phase", func() string {
+		<-release
+		return "ok"
+	})
+
+	if got != "ok" {
+		t.Fatalf("runPatrolScanPhase result = %q, want ok", got)
+	}
+
+	output := diagnostics.String()
+	select {
+	case <-diagnostics.sawProgress:
+	default:
+		t.Fatalf("diagnostics %q never emitted progress", output)
+	}
+	for _, want := range []string{
+		"gt patrol scan: starting slow phase",
+		"gt patrol scan: still running slow phase after",
+		"gt patrol scan: finished slow phase in",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("diagnostics %q missing %q", output, want)
+		}
+	}
+}
+
+func TestRunPatrolScanPhaseZeroIntervalSkipsProgressTicks(t *testing.T) {
+	oldInterval := patrolScanProgressInterval
+	patrolScanProgressInterval = 0
+	defer func() { patrolScanProgressInterval = oldInterval }()
+
+	var diagnostics bytes.Buffer
+	got := runPatrolScanPhase(&diagnostics, "fast phase", func() int {
+		return 42
+	})
+
+	if got != 42 {
+		t.Fatalf("runPatrolScanPhase result = %d, want 42", got)
+	}
+
+	output := diagnostics.String()
+	if strings.Contains(output, "still running") {
+		t.Fatalf("diagnostics should not include progress tick when interval is disabled: %q", output)
+	}
+	for _, want := range []string{
+		"gt patrol scan: starting fast phase",
+		"gt patrol scan: finished fast phase in",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("diagnostics %q missing %q", output, want)
+		}
 	}
 }
 

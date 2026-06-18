@@ -36,37 +36,52 @@ func (c *StaleBinaryCheck) Run(ctx *CheckContext) *CheckResult {
 		}
 	}
 
-	info := version.CheckStaleBinary(repoRoot)
+	return staleResult(c.Name(), version.CheckStaleBinary(repoRoot))
+}
+
+// staleResult maps a completed staleness check to a doctor CheckResult.
+// It is pure (no git/env access) so it can be unit-tested directly; Run only
+// handles repo resolution before delegating here.
+func staleResult(name string, info *version.StaleBinaryInfo) *CheckResult {
 	if info.Error != nil {
 		return &CheckResult{
-			Name:    c.Name(),
+			Name:    name,
 			Status:  StatusOK,
 			Message: "Cannot determine binary version (dev build?)",
 			Details: []string{info.Error.Error()},
 		}
 	}
 
-	if info.IsStale {
-		msg := fmt.Sprintf("Binary is stale (built from %s, repo at %s)",
-			version.ShortCommit(info.BinaryCommit), version.ShortCommit(info.RepoCommit))
-		if info.CommitsBehind > 0 {
-			msg = fmt.Sprintf("Binary is %d commits behind (built from %s, repo at %s)",
-				info.CommitsBehind, version.ShortCommit(info.BinaryCommit), version.ShortCommit(info.RepoCommit))
-		}
-
+	if info.Skipped {
 		return &CheckResult{
-			Name:    c.Name(),
+			Name:    name,
+			Status:  StatusOK,
+			Message: "Binary staleness check skipped",
+			Details: []string{info.SkipReason},
+		}
+	}
+
+	if info.IsStale {
+		return &CheckResult{
+			Name:    name,
 			Status:  StatusWarning,
-			Message: msg,
-			FixHint: "Run 'gt install' to rebuild and install",
+			Message: info.Describe("Binary"),
+			FixHint: staleFixHint(info),
 		}
 	}
 
 	return &CheckResult{
-		Name:    c.Name(),
+		Name:    name,
 		Status:  StatusOK,
 		Message: fmt.Sprintf("Binary is up to date (%s)", version.ShortCommit(info.BinaryCommit)),
 	}
+}
+
+func staleFixHint(info *version.StaleBinaryInfo) string {
+	if info.IsForward && info.OnMainBranch {
+		return "Run 'gt install' to rebuild and install"
+	}
+	return "Run 'gt stale' for details; switch to a build branch before rebuilding"
 }
 
 // Fix rebuilds and installs gt.

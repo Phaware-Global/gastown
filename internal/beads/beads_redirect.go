@@ -121,7 +121,7 @@ func cleanBeadsRuntimeFiles(beadsDir string) error {
 		// Daemon runtime
 		"daemon.lock", "daemon.log", "daemon.pid", "bd.sock",
 		// Sync state
-		"last-touched", "metadata.json",
+		"last-touched",
 		// Version tracking
 		".local_version",
 		// Redirect file (we're about to recreate it)
@@ -160,9 +160,24 @@ func cleanBeadsRuntimeFiles(beadsDir string) error {
 // Returns the redirect target path (e.g., "../../.beads" or "../../mayor/rig/.beads"),
 // or an error if the path is invalid or no beads location exists.
 func ComputeRedirectTarget(townRoot, worktreePath string) (string, error) {
+	townRootAbs, err := filepath.Abs(townRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolving town root: %w", err)
+	}
+	worktreeAbs, err := filepath.Abs(worktreePath)
+	if err != nil {
+		return "", fmt.Errorf("resolving worktree path: %w", err)
+	}
+	if worktreeAbs == townRootAbs {
+		return "", fmt.Errorf("cannot create redirect at town root")
+	}
+	if rel, err := filepath.Rel(townRootAbs, worktreeAbs); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("worktree path %s is outside town root %s", worktreePath, townRoot)
+	}
+
 	// Get rig root from worktree path
 	// worktreePath = <town>/<rig>/crew/<name> or <town>/<rig>/refinery/rig etc.
-	relPath, err := filepath.Rel(townRoot, worktreePath)
+	relPath, err := filepath.Rel(townRootAbs, worktreeAbs)
 	if err != nil {
 		return "", fmt.Errorf("computing relative path: %w", err)
 	}
@@ -180,8 +195,8 @@ func ComputeRedirectTarget(townRoot, worktreePath string) (string, error) {
 	}
 
 	rigName := parts[0]
-	rigRoot := filepath.Join(townRoot, rigName)
-	townBeadsPath := filepath.Join(townRoot, ".beads")
+	rigRoot := filepath.Join(townRootAbs, rigName)
+	townBeadsPath := filepath.Join(townRootAbs, ".beads")
 	rigBeadsPath := filepath.Join(rigRoot, ".beads")
 	mayorBeadsPath := filepath.Join(rigRoot, "mayor", "rig", ".beads")
 

@@ -7,7 +7,7 @@ import (
 	"encoding/base32"
 	"encoding/json"
 	"fmt"
-	"os/exec"
+	"io"
 	"path/filepath"
 	"strings"
 
@@ -50,7 +50,7 @@ func isTrackedByConvoy(beadID string) string {
 			if err != nil {
 				continue
 			}
-			if result.IssueType == "convoy" && result.Status == "open" {
+			if isConvoyIssue(result.IssueType, result.Labels) && result.Status == "open" {
 				return trackerID
 			}
 		}
@@ -69,20 +69,8 @@ func isTrackedByConvoy(beadID string) string {
 func findConvoyByDescription(townRoot, beadID string) string {
 	townBeads := filepath.Join(townRoot, ".beads")
 
-	// Query all open convoys from HQ
-	listCmd := exec.Command("bd", "list", "--type=convoy", "--status=open", "--json")
-	listCmd.Dir = townBeads
-
-	out, err := listCmd.Output()
+	convoys, err := listConvoyIssues(townBeads, "open", false)
 	if err != nil {
-		return ""
-	}
-
-	var convoys []struct {
-		ID          string `json:"id"`
-		Description string `json:"description"`
-	}
-	if err := json.Unmarshal(out, &convoys); err != nil {
 		return ""
 	}
 
@@ -212,14 +200,15 @@ func getConvoyInfoForIssue(issueID string) *ConvoyInfo {
 	}
 	townBeads := filepath.Join(townRoot, ".beads")
 
-	// Get convoy details (labels + description) for ownership and merge strategy
-	showCmd := exec.Command("bd", "show", convoyID, "--json")
-	showCmd.Dir = townBeads
-	var stdout, stderr bytes.Buffer
-	showCmd.Stdout = &stdout
-	showCmd.Stderr = &stderr
+	var stderr bytes.Buffer
+	stdout, err := BdCmd("show", convoyID, "--json").
+		AllowStale().
+		Dir(townRoot).
+		WithBeadsDir(townBeads).
+		Stderr(&stderr).
+		Output()
 
-	if err := showCmd.Run(); err != nil {
+	if err != nil {
 		// Check if this is a "not found" error (phantom convoy) vs transient error.
 		// Phantom convoys occur when a convoy bead is deleted from HQ but tracking
 		// deps still exist in local beads DB (gt-9xum2). Return nil to treat as
@@ -238,7 +227,7 @@ func getConvoyInfoForIssue(issueID string) *ConvoyInfo {
 		Labels      []string `json:"labels"`
 		Description string   `json:"description"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil || len(convoys) == 0 {
+	if err := json.Unmarshal(stdout, &convoys); err != nil || len(convoys) == 0 {
 		return &ConvoyInfo{ID: convoyID}
 	}
 
@@ -296,17 +285,18 @@ func printConvoyConflict(beadID, convoyID string) {
 	}
 	townBeads := filepath.Join(townRoot, ".beads")
 
-	// Get convoy title
 	var convoyTitle string
-	showCmd := exec.Command("bd", "show", convoyID, "--json")
-	showCmd.Dir = townBeads
-	var showOut bytes.Buffer
-	showCmd.Stdout = &showOut
-	if err := showCmd.Run(); err == nil {
+	showOut, err := BdCmd("show", convoyID, "--json").
+		AllowStale().
+		Dir(townRoot).
+		WithBeadsDir(townBeads).
+		Stderr(io.Discard).
+		Output()
+	if err == nil {
 		var items []struct {
 			Title string `json:"title"`
 		}
-		if json.Unmarshal(showOut.Bytes(), &items) == nil && len(items) > 0 {
+		if json.Unmarshal(showOut, &items) == nil && len(items) > 0 {
 			convoyTitle = items[0].Title
 		}
 	}
@@ -390,13 +380,11 @@ func createBatchConvoy(beadIDs []string, rigName string, owned bool, mergeStrate
 
 	createArgs := []string{
 		"create",
-		"--type=convoy",
+		"--type=task",
 		"--id=" + convoyID,
 		"--title=" + convoyTitle,
 		"--description=" + description,
-	}
-	if owned {
-		createArgs = append(createArgs, "--labels=gt:owned")
+		"--labels=" + convoyLabels(owned),
 	}
 	if beads.NeedsForceForID(convoyID) {
 		createArgs = append(createArgs, "--force")
@@ -455,13 +443,11 @@ func createAutoConvoy(beadID, beadTitle string, owned bool, mergeStrategy, baseB
 
 	createArgs := []string{
 		"create",
-		"--type=convoy",
+		"--type=task",
 		"--id=" + convoyID,
 		"--title=" + convoyTitle,
 		"--description=" + description,
-	}
-	if owned {
-		createArgs = append(createArgs, "--labels=gt:owned")
+		"--labels=" + convoyLabels(owned),
 	}
 	if beads.NeedsForceForID(convoyID) {
 		createArgs = append(createArgs, "--force")

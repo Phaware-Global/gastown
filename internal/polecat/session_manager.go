@@ -532,11 +532,19 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 
 	// Accept startup dialogs (workspace trust + bypass permissions) if they appear
 	debugSession("AcceptStartupDialogs", m.tmux.AcceptStartupDialogs(sessionID))
+	if err := m.tmux.CheckStartupBlocked(sessionID); err != nil {
+		_ = m.tmux.KillSessionWithProcesses(sessionID)
+		return fmt.Errorf("startup blocked: %w", err)
+	}
 
 	// Wait for runtime to be fully ready at the prompt (not just started).
 	// Uses prompt-based polling for agents with ReadyPromptPrefix (e.g., Claude "❯ "),
 	// falling back to ReadyDelayMs sleep for agents without prompt detection.
 	debugSession("WaitForRuntimeReady", m.tmux.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout))
+	if err := m.tmux.CheckStartupBlocked(sessionID); err != nil {
+		_ = m.tmux.KillSessionWithProcesses(sessionID)
+		return fmt.Errorf("startup blocked: %w", err)
+	}
 
 	// Handle fallback nudges for non-hook agents.
 	// See StartupFallbackInfo in runtime package for the fallback matrix.
@@ -571,6 +579,17 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		m.verifyStartupNudgeDelivery(sessionID, runtimeConfig, verifyContent)
 	}
 
+	// Verify beacon delivery for hook+prompt agents (Mode A, hi-y44).
+	// Fresh spawns may show the Claude Code splash screen with the CLI beacon
+	// pre-filled but not auto-submitted. If the agent is still idle after startup,
+	// re-deliver the work instructions via nudge to kick it into action.
+	// Runs asynchronously: verifyStartupNudgeDelivery sleeps before checking, so a
+	// synchronous call would add ~25s to every successful polecat startup on the
+	// common gt sling path. Non-fatal: the witness zombie patrol handles unrecovered stalls.
+	if !fallbackInfo.SendBeaconNudge && !fallbackInfo.SendStartupNudge {
+		go m.verifyStartupNudgeDelivery(sessionID, runtimeConfig, startupNudgeContent)
+	}
+
 	// Legacy fallback for other startup paths (non-fatal)
 	_ = runtime.RunStartupFallback(m.tmux, sessionID, "polecat", runtimeConfig)
 
@@ -582,6 +601,10 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	}
 	if !running {
 		return fmt.Errorf("session %s died during startup (agent command may have failed)", sessionID)
+	}
+	if status := m.tmux.CheckSessionHealth(sessionID, 0); status != tmux.SessionHealthy {
+		_ = m.tmux.KillSessionWithProcesses(sessionID)
+		return fmt.Errorf("session %s unhealthy during startup: %s", sessionID, status)
 	}
 
 	// Validate GT_AGENT is set. Without GT_AGENT, IsAgentAlive falls back to

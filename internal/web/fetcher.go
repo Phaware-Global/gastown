@@ -180,7 +180,7 @@ type LiveConvoyFetcher struct {
 	tmuxSocket string
 
 	// Circuit breaker for FetchConvoys — prevents process storms when
-	// bd list --type=convoy fails persistently (e.g., schema mismatch).
+	// bd list by convoy label fails persistently (e.g., schema mismatch).
 	convoyBreaker fetchCircuitBreaker
 }
 
@@ -237,18 +237,20 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 		return nil, nil // Backed off — return empty result silently
 	}
 
-	// List all open convoy issues
-	stdout, err := f.runBdCmd(f.townRoot, "list", "--type=convoy", "--status=open", "--json")
+	// List all open issues and filter locally so legacy type=convoy beads remain visible.
+	stdout, err := f.runBdCmd(f.townRoot, "list", "--status=open", "--json", "--limit=0")
 	if err != nil {
 		f.convoyBreaker.recordFailure()
 		return nil, fmt.Errorf("listing convoys: %w", err)
 	}
 
 	var convoys []struct {
-		ID        string `json:"id"`
-		Title     string `json:"title"`
-		Status    string `json:"status"`
-		CreatedAt string `json:"created_at"`
+		ID        string   `json:"id"`
+		Title     string   `json:"title"`
+		Status    string   `json:"status"`
+		CreatedAt string   `json:"created_at"`
+		IssueType string   `json:"issue_type"`
+		Labels    []string `json:"labels"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil {
 		f.convoyBreaker.recordFailure()
@@ -258,6 +260,9 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 	// Build convoy rows with activity data
 	rows := make([]ConvoyRow, 0, len(convoys))
 	for _, c := range convoys {
+		if c.IssueType != "convoy" && !webConvoyHasLabel(c.Labels, "gt:convoy") {
+			continue
+		}
 		row := ConvoyRow{
 			ID:     c.ID,
 			Title:  c.Title,
@@ -359,6 +364,15 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 
 	f.convoyBreaker.recordSuccess()
 	return rows, nil
+}
+
+func webConvoyHasLabel(labels []string, target string) bool {
+	for _, label := range labels {
+		if label == target {
+			return true
+		}
+	}
+	return false
 }
 
 // trackedIssueInfo holds info about an issue being tracked by a convoy.

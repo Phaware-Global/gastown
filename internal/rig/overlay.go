@@ -15,11 +15,13 @@ func gasTownIgnorePatterns() []string {
 	return []string{
 		".runtime/",
 		".claude/",
+		".opencode/",
 		".logs/",
 		"__pycache__/",
 		"state.json",
 		"CLAUDE.md",
 		"CLAUDE.local.md",
+		"GEMINI.md",
 	}
 }
 

@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -233,6 +235,26 @@ func TestDeliveryStatusJSONContainsSuccessfulMailPathDetails(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("json output missing %q: %s", want, text)
 		}
+	}
+}
+
+func TestEscalationFingerprintLabel(t *testing.T) {
+	got := escalationFingerprintLabel(" deacon:await-signal:hq-deacon ")
+	trimmed := escalationFingerprintLabel("deacon:await-signal:hq-deacon")
+	if got != trimmed {
+		t.Fatalf("fingerprint should trim whitespace: %q != %q", got, trimmed)
+	}
+	if !strings.HasPrefix(got, "escalation-fp:") {
+		t.Fatalf("fingerprint label %q missing prefix", got)
+	}
+	if len(got) != len("escalation-fp:")+12 {
+		t.Fatalf("fingerprint label %q has length %d, want %d", got, len(got), len("escalation-fp:")+12)
+	}
+	if got == escalationFingerprintLabel("deacon:convoy-check:hq-cv-123") {
+		t.Fatal("different raw fingerprints should produce different labels")
+	}
+	if escalationFingerprintLabel(" ") != "" {
+		t.Fatal("blank fingerprint should produce empty label")
 	}
 }
 
@@ -479,6 +501,14 @@ func TestExecuteExternalActions(t *testing.T) {
 	// executeExternalActions prints warnings/info but doesn't return errors.
 	// We test that it doesn't panic with various configurations.
 
+	// Slack delivery POSTs to the configured webhook with no client timeout;
+	// point it at a local stub so the test never depends on (or hangs on) the
+	// real hooks.slack.com endpoint in sandboxed CI networks.
+	slackStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slackStub.Close()
+
 	tests := []struct {
 		name    string
 		actions []string
@@ -527,7 +557,7 @@ func TestExecuteExternalActions(t *testing.T) {
 			actions: []string{"slack"},
 			cfg: &config.EscalationConfig{
 				Contacts: config.EscalationContacts{
-					SlackWebhook: "https://hooks.slack.com/test",
+					SlackWebhook: slackStub.URL,
 				},
 			},
 		},
@@ -543,7 +573,7 @@ func TestExecuteExternalActions(t *testing.T) {
 				Contacts: config.EscalationContacts{
 					HumanEmail:   "test@example.com",
 					HumanSMS:     "+15551234567",
-					SlackWebhook: "https://hooks.slack.com/test",
+					SlackWebhook: slackStub.URL,
 				},
 			},
 		},

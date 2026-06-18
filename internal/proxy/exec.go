@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"golang.org/x/time/rate"
 )
 
@@ -55,11 +56,15 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 
 	// Validate argv[1] (subcommand) if this command has a subcommand allowlist.
 	if subs, ok := s.allowedSubs[cmd0]; ok {
-		if len(req.Argv) < 2 {
+		sub, ok := allowedSubcommand(cmd0, req.Argv)
+		if !ok {
 			http.Error(w, "subcommand required", http.StatusForbidden)
 			return
 		}
-		sub := req.Argv[1]
+		if cmd0 == "bd" && beads.HasBDTargetSelectorFlag(req.Argv) {
+			http.Error(w, "bd target-selector global flags are not allowed", http.StatusForbidden)
+			return
+		}
 		if !subs[sub] {
 			http.Error(w, fmt.Sprintf("subcommand not allowed: %q %q", cmd0, sub), http.StatusForbidden)
 			return
@@ -68,6 +73,8 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 
 	// Build argv as a copy of req.Argv to avoid mutating the decoded request.
 	argv := append([]string(nil), req.Argv...)
+	envOverride := []string(nil)
+	argv, envOverride = s.rewriteBDCreateRepo(argv)
 	// Use the resolved absolute binary path to prevent PATH hijacking after startup.
 	if resolved, ok := s.resolvedPaths[cmd0]; ok {
 		argv[0] = resolved
@@ -100,7 +107,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		execCtx, cancel = context.WithTimeout(execCtx, s.execTimeout)
 		defer cancel()
 	}
-	out, errOut, exitCode := runCommand(execCtx, argv, identity)
+	out, errOut, exitCode := runCommand(execCtx, argv, identity, envOverride)
 
 	// Audit log (do not log full argv — it may contain tokens or secrets).
 	if exitCode == 0 {
@@ -203,7 +210,7 @@ func (s *Server) limiterFor(identity string) *rate.Limiter {
 	return v.(*rate.Limiter)
 }
 
-func runCommand(ctx context.Context, argv []string, identity string) (stdout, stderr string, exitCode int) {
+func runCommand(ctx context.Context, argv []string, identity string, envOverride ...[]string) (stdout, stderr string, exitCode int) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	var outBuf, errBuf strings.Builder
 	cmd.Stdout = &outBuf
@@ -212,7 +219,11 @@ func runCommand(ctx context.Context, argv []string, identity string) (stdout, st
 	// leaking into gt/bd calls. Pass identity via env var so commands can
 	// optionally use it without requiring a --identity CLI flag on every command.
 	env := minimalEnv()
+	if len(envOverride) > 0 && envOverride[0] != nil {
+		env = envOverride[0]
+	}
 	if identity != "" {
+		env = stripEnvKey(env, "GT_PROXY_IDENTITY")
 		env = append(env, "GT_PROXY_IDENTITY="+identity)
 	}
 	cmd.Env = env
@@ -225,4 +236,41 @@ func runCommand(ctx context.Context, argv []string, identity string) (stdout, st
 		}
 	}
 	return outBuf.String(), errBuf.String(), exitCode
+}
+
+func (s *Server) rewriteBDCreateRepo(argv []string) ([]string, []string) {
+	rewritten, beadsDir := beads.RewriteBDCreateRepoAlias(s.cfg.TownRoot, argv)
+	if beadsDir != "" {
+		return rewritten, beads.BuildMutationPinnedBDEnv(minimalEnv(), beadsDir)
+	}
+	if cmdIndex, ok := beads.BDSubcommandIndex(argv); ok && argv[cmdIndex] == "create" {
+		return argv, beads.BuildMutationNeutralBDEnv(minimalEnv())
+	}
+	return argv, nil
+}
+
+func allowedSubcommand(cmd0 string, argv []string) (string, bool) {
+	if cmd0 == "bd" {
+		idx, ok := beads.BDSubcommandIndex(argv)
+		if !ok {
+			return "", false
+		}
+		return argv[idx], true
+	}
+	if len(argv) < 2 {
+		return "", false
+	}
+	return argv[1], true
+}
+
+func stripEnvKey(env []string, key string) []string {
+	prefix := key + "="
+	filtered := make([]string, 0, len(env))
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
 }

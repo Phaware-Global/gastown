@@ -41,19 +41,28 @@ var schedulerTestCounter atomic.Int32
 func initBeadsDBForServer(t *testing.T, dir, prefix string) {
 	t.Helper()
 
-	args := []string{"init", "--prefix", prefix}
-	// Forward GT_DOLT_PORT so bd connects to the ephemeral test server
-	// instead of defaulting to port 3307.
-	// bd v1.0.0+ defaults to embedded mode; --server is required to use an
-	// external server (v0.57.0 defaulted to server mode and ignored --server).
-	if p := os.Getenv("GT_DOLT_PORT"); p != "" {
-		args = append(args, "--server", "--server-port", p)
-	}
-	cmd := exec.Command("bd", args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
+	port := os.Getenv("GT_DOLT_PORT")
+	out, err := runSchedulerBdInit(dir, prefix, "", port)
 	t.Logf("bd init --prefix %s in %s: exit=%v\n%s", prefix, dir, err, out)
-	if err != nil {
+	if err != nil && port != "" {
+		// bd v1.0.5 refuses `bd init` in a directory nested under an
+		// already-initialized workspace: it walks up, finds the town's .beads,
+		// and reports "This workspace is already initialized." Production never
+		// runs `bd init` for rigs — it seeds them via the SDK. Mirror that here
+		// by initializing the schema + server database in an isolated temp dir
+		// (no parent workspace to detect), then relocating the resulting .beads
+		// into the nested target. --database pins the server database to the
+		// prefix-based name the rest of the harness (and cleanup) expects.
+		initDir := t.TempDir()
+		if out2, err2 := runSchedulerBdInit(initDir, prefix, "beads_"+prefix, port); err2 != nil {
+			t.Fatalf("isolated bd init for %s failed: %v\n%s", dir, err2, out2)
+		}
+		target := filepath.Join(dir, ".beads")
+		if rmErr := os.RemoveAll(target); rmErr != nil {
+			t.Fatalf("clear stale .beads in %s: %v", dir, rmErr)
+		}
+		copyTreeForTest(t, filepath.Join(initDir, ".beads"), target)
+	} else if err != nil {
 		t.Fatalf("bd init failed in %s: %v\n%s", dir, err, out)
 	}
 
@@ -66,6 +75,50 @@ func initBeadsDBForServer(t *testing.T, dir, prefix string) {
 
 	if err := beads.EnsureCustomTypes(filepath.Join(dir, ".beads")); err != nil {
 		t.Fatalf("ensure custom types in %s: %v", dir, err)
+	}
+}
+
+// runSchedulerBdInit runs `bd init` for the scheduler harness. database, when
+// non-empty, pins the server database name (--database); port, when non-empty,
+// targets the shared test Dolt server. bd v1.0.0+ defaults to embedded mode, so
+// --server is required to use the external test server.
+func runSchedulerBdInit(dir, prefix, database, port string) ([]byte, error) {
+	args := []string{"init", "--prefix", prefix}
+	if database != "" {
+		args = append(args, "--database", database)
+	}
+	if port != "" {
+		args = append(args, "--server", "--server-port", port)
+	}
+	cmd := exec.Command("bd", args...)
+	cmd.Dir = dir
+	return cmd.CombinedOutput()
+}
+
+// copyTreeForTest recursively copies the contents of src into dst, used to
+// relocate an isolated `bd init` .beads directory into a nested rig path.
+func copyTreeForTest(t *testing.T, src, dst string) {
+	t.Helper()
+	err := filepath.Walk(src, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, relErr := filepath.Rel(src, path)
+		if relErr != nil {
+			return relErr
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0755)
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		return os.WriteFile(target, data, info.Mode().Perm())
+	})
+	if err != nil {
+		t.Fatalf("copy %s -> %s: %v", src, dst, err)
 	}
 }
 
@@ -317,8 +370,9 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 		t.Fatalf("bd show convoy %s failed: %v\noutput: %s", fields.Convoy, err, out)
 	}
 	var convoys []struct {
-		ID        string `json:"id"`
-		IssueType string `json:"issue_type"`
+		ID        string   `json:"id"`
+		IssueType string   `json:"issue_type"`
+		Labels    []string `json:"labels"`
 	}
 	if err := json.Unmarshal(out, &convoys); err != nil {
 		t.Fatalf("parse convoy show: %v\nraw output: %s", err, out)
@@ -326,8 +380,8 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 	if len(convoys) == 0 {
 		t.Fatalf("convoy %s not found via bd show", fields.Convoy)
 	}
-	if convoys[0].IssueType != "convoy" {
-		t.Errorf("convoy issue_type = %q, want %q", convoys[0].IssueType, "convoy")
+	if convoys[0].IssueType != "task" || !hasLabel(convoys[0].Labels, "gt:convoy") {
+		t.Errorf("convoy identity = type %q labels %v, want task with gt:convoy", convoys[0].IssueType, convoys[0].Labels)
 	}
 
 	// Verify: convoy has a "tracks" dependency pointing to the rig bead.
@@ -444,7 +498,7 @@ func TestSchedulerSlingDryRun(t *testing.T) {
 	}
 
 	// Verify: no convoy created (HQ beads DB should have no convoy issues)
-	listArgs := beads.MaybePrependAllowStale([]string{"list", "--type=convoy", "--json"})
+	listArgs := beads.MaybePrependAllowStale([]string{"list", "--label=gt:convoy", "--json"})
 	cmd := exec.Command("bd", listArgs...)
 	cmd.Dir = hqPath
 	out, err := cmd.Output()
@@ -1203,6 +1257,128 @@ func TestSchedulerInvalidJSONContextCleanup(t *testing.T) {
 	for _, ctx := range contexts {
 		if ctx.ID == ctxID {
 			t.Errorf("Invalid context %s should have been closed, but is still open", ctxID)
+		}
+	}
+}
+
+// TestSchedulerActualDispatchRoutesPollutedEnvToTargetRig verifies the non-dry-run
+// scheduler path uses the same env-routing boundary as direct sling. The parent
+// process is poisoned with HQ BEADS_* selectors; dispatch must still hook and
+// update the rig-owned work bead in the target rig database.
+func TestSchedulerActualDispatchRoutesPollutedEnvToTargetRig(t *testing.T) {
+	hqPath, rigPath, _, _ := setupSchedulerIntegrationTown(t)
+
+	beadID := createTestBead(t, rigPath, "Polluted env actual dispatch")
+	rigBeads := beads.NewWithBeadsDir(rigPath, filepath.Join(rigPath, ".beads"))
+	ctxBead, err := rigBeads.CreateSlingContext("dispatch: "+beadID, beadID, &capacity.SlingContextFields{
+		Version:     1,
+		WorkBeadID:  beadID,
+		TargetRig:   "testrig",
+		HookRawBead: true,
+		EnqueuedAt:  "2026-01-01T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("CreateSlingContext: %v", err)
+	}
+
+	prevSpawn := spawnPolecatForSling
+	t.Cleanup(func() { spawnPolecatForSling = prevSpawn })
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		if rigName != "testrig" {
+			t.Fatalf("spawn rig = %q, want testrig", rigName)
+		}
+		return &SpawnedPolecatInfo{
+			RigName:     rigName,
+			PolecatName: "envtest",
+			ClonePath:   rigPath,
+			Pane:        "test-pane", // StartSession becomes a no-op.
+		}, nil
+	}
+
+	t.Setenv("BEADS_DIR", filepath.Join(hqPath, ".beads"))
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", beads.DatabaseNameFromMetadata(filepath.Join(hqPath, ".beads")))
+	t.Setenv("BEADS_DOLT_DATA_DIR", filepath.Join(hqPath, ".wrong-dolt-data"))
+
+	dispatched, err := dispatchScheduledWork(hqPath, "test", 1, false)
+	if err != nil {
+		t.Fatalf("dispatchScheduledWork: %v", err)
+	}
+	if dispatched != 1 {
+		t.Fatalf("dispatched = %d, want 1", dispatched)
+	}
+
+	issue, err := rigBeads.Show(beadID)
+	if err != nil {
+		t.Fatalf("rig bead show after dispatch: %v", err)
+	}
+	if issue.Status != "hooked" || issue.Assignee != "testrig/polecats/envtest" {
+		t.Fatalf("rig bead state = status:%q assignee:%q, want hooked testrig/polecats/envtest", issue.Status, issue.Assignee)
+	}
+
+	openContexts, err := rigBeads.ListOpenSlingContexts()
+	if err != nil {
+		t.Fatalf("ListOpenSlingContexts: %v", err)
+	}
+	for _, ctx := range openContexts {
+		if ctx.ID == ctxBead.ID {
+			t.Fatalf("sling context %s still open after successful dispatch", ctxBead.ID)
+		}
+	}
+}
+
+func TestSchedulerDispatchFailureRecordedInContextSourceDB(t *testing.T) {
+	hqPath, rigPath, _, _ := setupSchedulerIntegrationTown(t)
+
+	beadID := createTestBead(t, rigPath, "Record dispatch failure in source DB")
+	ctxID := createSlingContext(t, hqPath, &capacity.SlingContextFields{
+		Version:     1,
+		WorkBeadID:  beadID,
+		TargetRig:   "testrig",
+		HookRawBead: true,
+		EnqueuedAt:  "2026-01-01T00:00:00Z",
+	})
+
+	prevSpawn := spawnPolecatForSling
+	t.Cleanup(func() { spawnPolecatForSling = prevSpawn })
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		if rigName != "testrig" {
+			t.Fatalf("spawn rig = %q, want testrig", rigName)
+		}
+		return nil, fmt.Errorf("forced spawn failure")
+	}
+
+	dispatched, err := dispatchScheduledWork(hqPath, "test", 1, false)
+	if err != nil {
+		t.Fatalf("dispatchScheduledWork: %v", err)
+	}
+	if dispatched != 0 {
+		t.Fatalf("dispatched = %d, want 0", dispatched)
+	}
+
+	townBeads := beads.NewWithBeadsDir(hqPath, filepath.Join(hqPath, ".beads"))
+	ctx, err := townBeads.Show(ctxID)
+	if err != nil {
+		t.Fatalf("show HQ context after failure: %v", err)
+	}
+	fields := beads.ParseSlingContextFields(ctx.Description)
+	if fields == nil {
+		t.Fatalf("context fields missing after failure: %q", ctx.Description)
+	}
+	if fields.DispatchFailures != 1 {
+		t.Fatalf("dispatch_failures = %d, want 1 (description: %s)", fields.DispatchFailures, ctx.Description)
+	}
+	if !strings.Contains(fields.LastFailure, "forced spawn failure") {
+		t.Fatalf("last_failure = %q, want forced spawn failure", fields.LastFailure)
+	}
+
+	rigBeads := beads.NewWithBeadsDir(rigPath, filepath.Join(rigPath, ".beads"))
+	rigContexts, err := rigBeads.ListOpenSlingContexts()
+	if err != nil {
+		t.Fatalf("rig ListOpenSlingContexts: %v", err)
+	}
+	for _, rigCtx := range rigContexts {
+		if rigCtx.ID == ctxID {
+			t.Fatalf("context %s unexpectedly exists in rig DB; failure should update source HQ DB", ctxID)
 		}
 	}
 }

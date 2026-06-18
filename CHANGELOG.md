@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-06-06
+
+### Fixed
+
+- **Shell integration no longer nags in arbitrary shells** — the
+  `gt install --shell` hook prompted `Add '<repo>' to Gas Town? [y/N/never]` in
+  any git repo that wasn't a known rig, and on bash it re-prompted before
+  *every* command (not just on `cd`). An interrupted prompt (Ctrl-C) never
+  recorded the answer and could loop indefinitely across restored terminal
+  sessions. The add-offer is now **opt-in** (set `GASTOWN_OFFER_ADD=1`); by
+  default the hook stays silent and only exports `GT_TOWN_ROOT`/`GT_RIG` inside
+  known rigs. bash now offers only on a real directory change, and the repo is
+  recorded before the prompt so an interrupted read can't loop.
+- **`bd create` repo aliases route canonically** (gh#4180).
+- **Mail reply-to is inferred from the inbox** so reply-reminders clear
+  correctly (gt-zzob).
+- **`gt doctor` rig-config-sync accepts prefix-named Dolt databases** (gt-5hd2).
+
+### Changed
+
+- Clarified Gas Town HQ beads routing documentation (gh#4181).
+- Internal: added a nix flake update CI workflow.
+
+## [1.2.0] - 2026-05-27
+
 ### Fixed
 
 - **Daemon crash-loop vs Claude usage limits** — Stuck-agent-dog now inspects
@@ -23,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the canonical DB — a silent data split. Cleanup now removes both
   naming forms and `AddRig` fails loudly if an orphan persists (gh#3562,
   hq-j6hur.4.2).
+- **Stale hooked mail beads** — `sendHandoffMail()` now closes any `gt:message` beads left in `status=hooked` from previous sessions before creating a new handoff bead, preventing indefinite accumulation across sessions (#3859).
 
 ## [1.1.0] - 2026-05-06
 

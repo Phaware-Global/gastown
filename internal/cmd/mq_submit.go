@@ -232,10 +232,11 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// GH#3032: Resolve HEAD commit SHA for MR dedup.
-	commitSHA, shaErr := g.Rev("HEAD")
+	// GH#3032/wa-skj: resolve the submitted branch tip for MR dedup and
+	// verification. With --branch this can differ from the checked-out HEAD.
+	commitSHA, shaErr := resolveMQSubmitCommitSHA(g, branch)
 	if shaErr != nil {
-		style.PrintWarning("could not resolve HEAD SHA: %v (falling back to branch-only dedup)", shaErr)
+		style.PrintWarning("could not resolve submitted branch SHA: %v (falling back to branch-only dedup)", shaErr)
 	}
 
 	// Build MR bead title and description
@@ -247,6 +248,13 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 	}
 	if worker != "" {
 		description += fmt.Sprintf("\nworker: %s", worker)
+	}
+
+	// Verify before either an idempotent success or a new MR registration.
+	// Refinery's later branch check is local-ref based, so missing/stale pushes
+	// must fail here instead of producing a delayed refinery rejection.
+	if err := verifyMQSubmitPushedBranch(g, branch, commitSHA); err != nil {
+		return err
 	}
 
 	// Check if MR bead already exists for this branch+SHA (idempotency)
@@ -353,6 +361,28 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 		// polecatCleanup may timeout while waiting, but MR was already created
 	}
 
+	return nil
+}
+
+func resolveMQSubmitCommitSHA(g *git.Git, branch string) (string, error) {
+	return g.Rev(fmt.Sprintf("refs/heads/%s^{commit}", branch))
+}
+
+func verifyMQSubmitPushedBranch(g *git.Git, branch, commitSHA string) error {
+	if commitSHA != "" {
+		if err := g.VerifyPushedCommit("origin", branch, commitSHA); err != nil {
+			return fmt.Errorf("%w\n\nHint: run 'git push origin %s' first (or 'gt done'), then re-run 'gt mq submit'", err, branch)
+		}
+		return nil
+	}
+
+	exists, err := g.PushRemoteBranchExists("origin", branch)
+	if err != nil {
+		return fmt.Errorf("verify branch on origin: %w\n\nHint: run 'git push origin %s' first (or 'gt done'), then re-run 'gt mq submit'", err, branch)
+	}
+	if !exists {
+		return fmt.Errorf("branch %q not found on origin\n\nHint: run 'git push origin %s' first (or 'gt done'), then re-run 'gt mq submit'", branch, branch)
+	}
 	return nil
 }
 

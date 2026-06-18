@@ -35,7 +35,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "GT_SESSION_ID=${GT_SESSION_ID:-$(uuidgen)} GT_HOOK_SOURCE=startup {{GT_BIN}} prime --hook && {{GT_BIN}} mail check --inject"
+            "command": "GT_SESSION_ID=${GT_SESSION_ID:-$(uuidgen)} GT_HOOK_SOURCE=startup {{GT_BIN}} prime --hook"
           }
         ]
       }
@@ -57,7 +57,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} mail check --inject"
+            "command": "case \"${GT_ROLE:-}\" in *witness*|*refinery*|deacon*|*boot*) exit 0 ;; *) {{GT_BIN}} mail check --inject ;; esac"
           }
         ]
       }

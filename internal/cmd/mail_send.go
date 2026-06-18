@@ -77,6 +77,18 @@ func runMailSend(cmd *cobra.Command, args []string) error {
 		from = detectSender()
 	}
 
+	// If subject looks like a reply ("Re: ...") but the user didn't pass
+	// --reply-to, try to infer the original message from the sender's inbox.
+	// When exactly one unambiguous match exists, populate mailReplyTo so the
+	// existing thread-lookup + ClearReplyReminders flow below works as designed.
+	// hq-k382x: without this, every "gt mail send <addr> -s 'Re: ...'" leaves
+	// the queued reply-reminder in place.
+	if mailReplyTo == "" && hasReplyPrefix(mailSubject) {
+		if inferred := inferReplyTo(workDir, from, to, mailSubject); inferred != "" {
+			mailReplyTo = inferred
+		}
+	}
+
 	// Create message with auto-generated ID and thread ID
 	msg := mail.NewMessage(from, to, mailSubject, mailBody)
 
@@ -240,4 +252,81 @@ func generateThreadID() string {
 	b := make([]byte, 6)
 	_, _ = rand.Read(b) // crypto/rand.Read only fails on broken system
 	return "thread-" + hex.EncodeToString(b)
+}
+
+// hasReplyPrefix reports whether subject begins with a "Re:" prefix
+// (case-insensitive, tolerating arbitrary whitespace after the colon).
+func hasReplyPrefix(subject string) bool {
+	s := strings.TrimSpace(subject)
+	if len(s) < 3 {
+		return false
+	}
+	return strings.EqualFold(s[:3], "re:")
+}
+
+// normalizeReplySubject strips leading "Re: " prefixes (case-insensitive,
+// possibly nested) and surrounding whitespace, so that two subjects with
+// different reply nesting compare equal.
+func normalizeReplySubject(subject string) string {
+	s := strings.TrimSpace(subject)
+	for hasReplyPrefix(s) {
+		s = strings.TrimSpace(s[3:])
+	}
+	return strings.ToLower(s)
+}
+
+// normalizeAddress lowercases an address and trims a trailing slash so that
+// "Mayor/" and "mayor" compare equal. Matches identityVariants behavior in
+// mail.Mailbox without depending on its internals.
+func normalizeAddress(addr string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(addr)), "/")
+}
+
+// inferReplyTo searches the sender's mailbox for a single unambiguous message
+// FROM `to` whose subject (after stripping "Re:" prefixes) matches `subject`.
+// Returns the matching message ID when exactly one match exists; returns "" on
+// no-match, ambiguity, or any error. Best-effort — used only as a convenience
+// to make `gt mail send <to> -s "Re: ..."` clear queued reply-reminders.
+func inferReplyTo(workDir, from, to, subject string) string {
+	router := mail.NewRouter(workDir)
+	mailbox, err := router.GetMailbox(from)
+	if err != nil {
+		return ""
+	}
+	messages, err := mailbox.List()
+	if err != nil {
+		return ""
+	}
+	return pickReplyTo(messages, to, subject)
+}
+
+// pickReplyTo is the pure matching logic for inferReplyTo: given a list of
+// candidate messages, returns the single matching message's ID, or "" if there
+// is no match or more than one match. Pure to keep it unit-testable.
+func pickReplyTo(messages []*mail.Message, to, subject string) string {
+	wantSubject := normalizeReplySubject(subject)
+	if wantSubject == "" {
+		return ""
+	}
+	wantFrom := normalizeAddress(to)
+
+	var matchID string
+	matches := 0
+	for _, m := range messages {
+		if normalizeAddress(m.From) != wantFrom {
+			continue
+		}
+		if normalizeReplySubject(m.Subject) != wantSubject {
+			continue
+		}
+		matches++
+		matchID = m.ID
+		if matches > 1 {
+			return ""
+		}
+	}
+	if matches != 1 {
+		return ""
+	}
+	return matchID
 }

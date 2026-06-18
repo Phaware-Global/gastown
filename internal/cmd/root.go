@@ -23,10 +23,10 @@ import (
 )
 
 var rootCmd = &cobra.Command{
-	Use:     "gt", // Updated in init() based on GT_COMMAND
-	Short:   "Gas Town - Multi-agent workspace manager",
-	Version: Version,
-	Long:    "", // Updated in init() based on GT_COMMAND
+	Use:               "gt", // Updated in init() based on GT_COMMAND
+	Short:             "Gas Town - Multi-agent workspace manager",
+	Version:           Version,
+	Long:              "", // Updated in init() based on GT_COMMAND
 	PersistentPreRunE: persistentPreRun,
 }
 
@@ -43,52 +43,56 @@ across distributed teams of AI agents working on shared codebases.`, cmdName)
 // Commands that don't require beads to be installed/checked.
 // These commands should work even when bd is missing or outdated.
 var beadsExemptCommands = map[string]bool{
-	"version":    true,
-	"help":       true,
-	"completion": true,
-	"crew":       true,
-	"polecat":    true,
-	"witness":    true,
-	"refinery":   true,
-	"status":     true,
-	"mail":       true,
-	"hook":       true,
-	"prime":      true,
-	"nudge":      true,
-	"seance":     true,
-	"doctor":     true,
-	"dolt":       true,
-	"handoff":    true,
-	"costs":      true,
-	"feed":       true,
-	"rig":        true,
-	"config":     true,
-	"install":    true,
-	"tap":        true,
-	"dnd":        true,
-	"estop":      true, // E-stop must work when Dolt is down
-	"thaw":       true, // Thaw must work when Dolt is down
+	"version":       true,
+	"help":          true,
+	"completion":    true,
+	"crew":          true,
+	"polecat":       true,
+	"witness":       true,
+	"refinery":      true,
+	"status":        true,
+	"status-line":   true,
+	"mail":          true,
+	"hook":          true,
+	"prime":         true,
+	"nudge":         true,
+	"seance":        true,
+	"doctor":        true,
+	"dolt":          true,
+	"handoff":       true,
+	"costs":         true,
+	"feed":          true,
+	"rig":           true,
+	"scheduler":     true,
+	"config":        true,
+	"install":       true,
+	"tap":           true,
+	"dnd":           true,
+	"estop":         true, // E-stop must work when Dolt is down
+	"thaw":          true, // Thaw must work when Dolt is down
 	"signal":        true, // Hook signal handlers must be fast, handle beads internally
 	"metrics":       true, // Metrics reads local JSONL, no beads needed
 	"krc":           true, // KRC doesn't require beads
-	"run-migration":       true, // Migration orchestrator handles its own beads checks
-	"health":              true, // Health check doesn't require beads
-	"upgrade":             true, // Post-install migration orchestrator
-	"heartbeat":           true, // Heartbeat state update — must be fast and dependency-free
+	"run-migration": true, // Migration orchestrator handles its own beads checks
+	"health":        true, // Health check doesn't require beads
+	"upgrade":       true, // Post-install migration orchestrator
+	"heartbeat":     true, // Heartbeat state update — must be fast and dependency-free
 }
 
 // Commands exempt from the town root branch warning.
 // These are commands that help fix the problem or are diagnostic.
 var branchCheckExemptCommands = map[string]bool{
-	"version":    true,
-	"help":       true,
-	"completion": true,
-	"doctor":     true, // Used to fix the problem
-	"estop":      true, // Emergency stop must always work
-	"thaw":       true, // Thaw must always work
-	"install":    true, // Initial setup
-	"git-init":   true, // Git setup
-	"upgrade":    true, // Post-install migration
+	"version":     true,
+	"help":        true,
+	"completion":  true,
+	"doctor":      true, // Used to fix the problem
+	"status-line": true, // tmux hot path; never run git freshness checks here
+	"estop":       true, // Emergency stop must always work
+	"thaw":        true, // Thaw must always work
+	"install":     true, // Initial setup
+	"git-init":    true, // Git setup
+	"upgrade":     true, // Post-install migration
+	"scheduler":   true, // Daemon hot path; scheduler handles beads internally
 }
 
 // persistentPreRun runs before every command.
@@ -124,16 +128,16 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Get the root command name being run
-	cmdName := cmd.Name()
+	beadsExempt := isCommandOrAncestorExempt(cmd, beadsExemptCommands)
+	branchExempt := isCommandOrAncestorExempt(cmd, branchCheckExemptCommands)
 
 	// Check for stale binary (warning only, doesn't block)
-	if !beadsExemptCommands[cmdName] {
+	if !beadsExempt {
 		checkStaleBinaryWarning()
 	}
 
 	// Check town root branch (warning only, non-blocking)
-	if !branchCheckExemptCommands[cmdName] {
+	if !branchExempt {
 		warnIfTownRootOffMain()
 	}
 
@@ -144,7 +148,7 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 	touchPolecatHeartbeat()
 
 	// Skip beads check for exempt commands
-	if beadsExemptCommands[cmdName] || isRoleCommand(cmd) {
+	if beadsExempt || isRoleCommand(cmd) {
 		return nil
 	}
 
@@ -155,6 +159,15 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "   Run %s for details.\n\n", style.Dim.Render("gt doctor"))
 	}
 	return nil
+}
+
+func isCommandOrAncestorExempt(cmd *cobra.Command, exemptions map[string]bool) bool {
+	for c := cmd; c != nil; c = c.Parent() {
+		if exemptions[c.Name()] {
+			return true
+		}
+	}
+	return false
 }
 
 // isRoleCommand returns true when the invoked command belongs to the `gt role` tree.
@@ -276,14 +289,13 @@ func checkStaleBinaryWarning() {
 		staleBinaryWarned = true
 		_ = os.Setenv("GT_STALE_WARNED", "1")
 
-		msg := fmt.Sprintf("gt binary is stale (built from %s, repo at %s)",
-			version.ShortCommit(info.BinaryCommit), version.ShortCommit(info.RepoCommit))
-		if info.CommitsBehind > 0 {
-			msg = fmt.Sprintf("gt binary is %d commits behind (built from %s, repo at %s)",
-				info.CommitsBehind, version.ShortCommit(info.BinaryCommit), version.ShortCommit(info.RepoCommit))
-		}
+		msg := info.Describe("gt binary")
 		fmt.Fprintf(os.Stderr, "%s %s\n", style.WarningPrefix, msg)
-		fmt.Fprintf(os.Stderr, "    %s Run 'make install' in gastown repo to update\n", style.ArrowPrefix)
+		if info.IsForward && info.OnMainBranch {
+			fmt.Fprintf(os.Stderr, "    %s Run 'make install' in gastown repo to update\n", style.ArrowPrefix)
+		} else {
+			fmt.Fprintf(os.Stderr, "    %s Run 'gt stale' for details; switch to a build branch before rebuilding\n", style.ArrowPrefix)
+		}
 	}
 }
 

@@ -40,6 +40,125 @@ func TestDefaultMergeQueueConfig(t *testing.T) {
 	}
 }
 
+func TestIsConflictTaskForMR(t *testing.T) {
+	task := &beads.Issue{Description: `Resolve merge conflicts for branch polecat/nux/gt-real
+
+## Metadata
+- Original MR: gt-mr1
+- Branch: polecat/nux/gt-real
+- Conflict with: main@abc123
+- Original issue: gt-real
+- Retry count: 1`}
+
+	if !isConflictTaskForMR(task, "gt-mr1", "gt-real") {
+		t.Fatal("expected task metadata to verify")
+	}
+	if isConflictTaskForMR(task, "gt-other", "gt-real") {
+		t.Fatal("task verified for wrong MR")
+	}
+	if isConflictTaskForMR(task, "gt-mr1", "gt-other") {
+		t.Fatal("task verified for wrong source issue")
+	}
+	if isConflictTaskForMR(task, "gt-mr", "gt-real") {
+		t.Fatal("task verified for MR prefix")
+	}
+	if isConflictTaskForMR(task, "gt-mr1", "gt-rea") {
+		t.Fatal("task verified for source issue prefix")
+	}
+}
+
+func TestEngineerClearAgentActiveMRUsesTownBeadsDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+
+	townRoot := t.TempDir()
+	rigName := "gastown"
+	rigPath := filepath.Join(townRoot, rigName)
+	mayorRig := filepath.Join(rigPath, "mayor", "rig")
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	rigBeadsDir := filepath.Join(mayorRig, ".beads")
+
+	for _, dir := range []string{
+		filepath.Join(townRoot, "mayor"),
+		townBeadsDir,
+		rigBeadsDir,
+	} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte("{}"), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	if err := beads.WriteRoutes(townBeadsDir, []beads.Route{
+		{Prefix: "hq-", Path: "."},
+		{Prefix: "gt-", Path: filepath.Join(rigName, "mayor", "rig")},
+	}); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	binDir := t.TempDir()
+	logPath := filepath.Join(binDir, "bd.log")
+	script := fmt.Sprintf(`#!/bin/sh
+LOG=%q
+EXPECTED=%q
+printf 'env=%%s args=%%s\n' "${BEADS_DIR:-<unset>}" "$*" >> "$LOG"
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    --*) ;;
+    *) cmd="$arg"; break ;;
+  esac
+done
+if [ "$cmd" != "version" ] && [ "${BEADS_DIR:-}" != "$EXPECTED" ]; then
+  echo "wrong BEADS_DIR ${BEADS_DIR:-<unset>}" >&2
+  exit 9
+fi
+case "$cmd" in
+  version)
+    echo "bd 0.60.0"
+    exit 0
+    ;;
+  update)
+    exit 0
+    ;;
+  show)
+    printf '%%s\n' '[{"id":"gt-gastown-polecat-rust","title":"gt-gastown-polecat-rust","issue_type":"task","labels":["gt:agent"],"status":"open","description":"role_type: polecat\nrig: gastown\nagent_state: idle\nactive_mr: gt-mr"}]'
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`, logPath, townBeadsDir)
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write mock bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	e := &Engineer{
+		rig:    &rig.Rig{Name: rigName, Path: rigPath},
+		beads:  beads.NewWithBeadsDir(mayorRig, rigBeadsDir),
+		output: io.Discard,
+	}
+	if err := e.clearAgentActiveMR("gt-gastown-polecat-rust"); err != nil {
+		t.Fatalf("clearAgentActiveMR: %v", err)
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read mock log: %v", err)
+	}
+	logOutput := string(logBytes)
+	if strings.Contains(logOutput, "env="+rigBeadsDir) {
+		t.Fatalf("refinery active_mr cleanup used rig BEADS_DIR; log:\n%s", logOutput)
+	}
+	if !strings.Contains(logOutput, "env="+townBeadsDir+" args=") || !strings.Contains(logOutput, " show") || !strings.Contains(logOutput, " update") {
+		t.Fatalf("refinery active_mr cleanup did not use town BEADS_DIR; log:\n%s", logOutput)
+	}
+}
+
 func TestEngineer_LoadConfig_NoFile(t *testing.T) {
 	// Create a temp directory without config.json
 	tmpDir, err := os.MkdirTemp("", "engineer-test-*")
@@ -490,9 +609,9 @@ func TestRunGatesForPhase_FiltersCorrectly(t *testing.T) {
 	e.workDir = t.TempDir()
 	e.output = io.Discard
 	e.config.Gates = map[string]*GateConfig{
-		"pre-lint":    {Cmd: "true", Phase: GatePhasePreMerge},
-		"pre-test":    {Cmd: "true", Phase: GatePhasePreMerge},
-		"post-build":  {Cmd: "true", Phase: GatePhasePostSquash},
+		"pre-lint":   {Cmd: "true", Phase: GatePhasePreMerge},
+		"pre-test":   {Cmd: "true", Phase: GatePhasePreMerge},
+		"post-build": {Cmd: "true", Phase: GatePhasePostSquash},
 	}
 
 	// Pre-merge phase should only run pre-lint and pre-test
@@ -760,7 +879,7 @@ func TestPostMergeConvoyCheck_NoTownBeads(t *testing.T) {
 	}
 }
 
-func TestCheckAndCloseCompletedConvoys_StripsBeadsDir(t *testing.T) {
+func TestCheckAndCloseCompletedConvoys_UsesHardenedBDEnvs(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows - shell stubs")
 	}
@@ -779,36 +898,58 @@ func TestCheckAndCloseCompletedConvoys_StripsBeadsDir(t *testing.T) {
 	binDir := t.TempDir()
 	bdPath := filepath.Join(binDir, "bd")
 	script := `#!/bin/sh
+assert_town_read_env() {
+  if [ "$BEADS_DIR" != "$TOWN_BEADS" ]; then
+    echo "BEADS_DIR = $BEADS_DIR, want $TOWN_BEADS" >&2
+    exit 1
+  fi
+  if [ "$BD_READONLY" != "true" ] || [ "$BD_DOLT_AUTO_COMMIT" != "off" ]; then
+    echo "read env not read-only: BD_READONLY=$BD_READONLY BD_DOLT_AUTO_COMMIT=$BD_DOLT_AUTO_COMMIT" >&2
+    exit 1
+  fi
+  if [ -n "$BEADS_DOLT_SERVER_DATABASE" ] || [ -n "$BEADS_DB" ] || [ -n "$BD_DB" ] || [ -n "$BEADS_DOLT_DATA_DIR" ]; then
+    echo "stale target env leaked" >&2
+    exit 1
+  fi
+}
+assert_town_write_env() {
+  if [ "$BEADS_DIR" != "$TOWN_BEADS" ]; then
+    echo "BEADS_DIR = $BEADS_DIR, want $TOWN_BEADS" >&2
+    exit 1
+  fi
+  if [ -n "$BD_READONLY" ] || [ "$BD_DOLT_AUTO_COMMIT" != "on" ]; then
+    echo "write env not mutable: BD_READONLY=$BD_READONLY BD_DOLT_AUTO_COMMIT=$BD_DOLT_AUTO_COMMIT" >&2
+    exit 1
+  fi
+}
+assert_routing_read_env() {
+  if [ -n "$BEADS_DIR" ] || [ -n "$BEADS_DOLT_SERVER_DATABASE" ]; then
+    echo "routing env pinned target: BEADS_DIR=$BEADS_DIR DB=$BEADS_DOLT_SERVER_DATABASE" >&2
+    exit 1
+  fi
+  if [ "$BD_READONLY" != "true" ] || [ "$BD_DOLT_AUTO_COMMIT" != "off" ]; then
+    echo "routing read env not read-only: BD_READONLY=$BD_READONLY BD_DOLT_AUTO_COMMIT=$BD_DOLT_AUTO_COMMIT" >&2
+    exit 1
+  fi
+}
 case "$*" in
   "--allow-stale version")
     exit 0
     ;;
-  "--allow-stale list --type=convoy --status=open --json"|"list --type=convoy --status=open --json")
-    if [ -n "$BEADS_DIR" ]; then
-      echo "BEADS_DIR leaked: $BEADS_DIR" >&2
-      exit 1
-    fi
-    echo '[{"id":"hq-cv-l9","title":"Cross-rig convoy","status":"open","description":""}]'
+	  "--allow-stale list --status=open --json --limit=0 --flat"|"list --status=open --json --limit=0 --flat")
+	assert_town_read_env
+	    echo '[{"id":"hq-cv-l9","title":"Cross-rig convoy","status":"open","description":"","issue_type":"convoy"}]'
     ;;
   "--allow-stale dep list hq-cv-l9 --direction=down --type=tracks --json"|"dep list hq-cv-l9 --direction=down --type=tracks --json")
-    if [ -n "$BEADS_DIR" ]; then
-      echo "BEADS_DIR leaked: $BEADS_DIR" >&2
-      exit 1
-    fi
+    assert_town_read_env
     echo '[{"id":"external:l9:l9-123","status":"closed"}]'
     ;;
   "--allow-stale show l9-123 --json"|"show l9-123 --json")
-    if [ -n "$BEADS_DIR" ]; then
-      echo "BEADS_DIR leaked: $BEADS_DIR" >&2
-      exit 1
-    fi
+    assert_routing_read_env
     echo '[{"status":"closed"}]'
     ;;
   "--allow-stale close hq-cv-l9 -r All tracked issues completed"|"close hq-cv-l9 -r All tracked issues completed")
-    if [ -n "$BEADS_DIR" ]; then
-      echo "BEADS_DIR leaked: $BEADS_DIR" >&2
-      exit 1
-    fi
+    assert_town_write_env
     exit 0
     ;;
   *)
@@ -821,7 +962,14 @@ esac
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TOWN_BEADS", townBeads)
 	t.Setenv("BEADS_DIR", "/wrong/.beads")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "wrong")
+	t.Setenv("BEADS_DB", "/wrong.db")
+	t.Setenv("BD_DB", "/wrong.bd")
+	t.Setenv("BEADS_DOLT_DATA_DIR", "/wrong/data")
+	t.Setenv("BD_READONLY", "true")
+	t.Setenv("BD_DOLT_AUTO_COMMIT", "off")
 
 	e := NewEngineer(&rig.Rig{
 		Name: "l9",
@@ -991,6 +1139,71 @@ func TestNotifyConvoyCompletionParsing(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestEngineerNotifyConvoyCompletion_StampsAndSkipsDuplicate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on windows - shell stubs")
+	}
+
+	tmpDir := t.TempDir()
+	townRoot := filepath.Join(tmpDir, "town")
+	rigDir := filepath.Join(townRoot, "testrig")
+	townBeads := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(townBeads, 0755); err != nil {
+		t.Fatalf("mkdir town beads: %v", err)
+	}
+	if err := os.MkdirAll(rigDir, 0755); err != nil {
+		t.Fatalf("mkdir rig: %v", err)
+	}
+
+	binDir := t.TempDir()
+	statePath := filepath.Join(binDir, "notified.state")
+	bdPath := filepath.Join(binDir, "bd")
+
+	bdScript := `#!/bin/sh
+STATE="` + statePath + `"
+if [ "$1" = "--allow-stale" ]; then
+  shift
+fi
+case "$1" in
+  version)
+    exit 0
+    ;;
+  show)
+    if [ -f "$STATE" ]; then
+      printf '%s\n' '[{"id":"hq-cv-ref","description":"Owner: mayor/\ncompletion_notified_at: 2026-05-25T02:30:00Z"}]'
+    else
+      printf '%s\n' '[{"id":"hq-cv-ref","description":"Owner: mayor/"}]'
+    fi
+    exit 0
+    ;;
+  update)
+    touch "$STATE"
+    exit 0
+    ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(bdPath, []byte(bdScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	e := NewEngineer(&rig.Rig{Name: "testrig", Path: rigDir})
+	// Inject the in-memory mail sender (the test-binary default) so we can
+	// assert on captured envelopes; the exec path is bypassed under `go test`.
+	ms := newMemoryMailSender()
+	e.SetMailSender(ms)
+	e.notifyConvoyCompletion(townRoot, "hq-cv-ref", "Refinery Duplicate Guard", "Owner: mayor/")
+	e.notifyConvoyCompletion(townRoot, "hq-cv-ref", "Refinery Duplicate Guard", "Owner: mayor/")
+
+	if got := len(ms.Sent()); got != 1 {
+		t.Fatalf("mail sends = %d, want 1; sent:\n%+v", got, ms.Sent())
+	}
+	if _, err := os.Stat(statePath); err != nil {
+		t.Fatalf("completion notification state was not recorded: %v", err)
 	}
 }
 

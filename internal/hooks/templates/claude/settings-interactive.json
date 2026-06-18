@@ -1,6 +1,11 @@
 {
   "skipDangerousModePermissionPrompt": true,
+  "hasCompletedOnboarding": true,
+  "theme": "dark",
   "editorMode": "normal",
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
   "enabledPlugins": {
     "beads@beads-marketplace": false
   },

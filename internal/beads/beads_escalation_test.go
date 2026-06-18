@@ -1,6 +1,8 @@
 package beads
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -110,6 +112,20 @@ func TestFormatEscalationDescription(t *testing.T) {
 				"last_reescalated_by: deacon",
 			},
 		},
+		{
+			name:  "fingerprint field",
+			title: "Repeated alert",
+			fields: &EscalationFields{
+				Severity:    "medium",
+				Reason:      "control-plane timeout",
+				EscalatedBy: "deacon",
+				EscalatedAt: "2024-01-15T10:00:00Z",
+				Fingerprint: "escalation-fp:abc123def456",
+			},
+			want: []string{
+				"fingerprint: escalation-fp:abc123def456",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -157,7 +173,8 @@ related_bead: gt-abc123
 original_severity: medium
 reescalation_count: 1
 last_reescalated_at: 2024-01-15T09:30:00Z
-last_reescalated_by: deacon`,
+last_reescalated_by: deacon
+fingerprint: escalation-fp:abc123def456`,
 			want: &EscalationFields{
 				Severity:          "high",
 				Reason:            "Build failed 3 times",
@@ -173,6 +190,7 @@ last_reescalated_by: deacon`,
 				ReescalationCount: 1,
 				LastReescalatedAt: "2024-01-15T09:30:00Z",
 				LastReescalatedBy: "deacon",
+				Fingerprint:       "escalation-fp:abc123def456",
 			},
 		},
 		{
@@ -239,6 +257,9 @@ last_reescalated_by: deacon`,
 			if got.LastReescalatedBy != tt.want.LastReescalatedBy {
 				t.Errorf("LastReescalatedBy = %q, want %q", got.LastReescalatedBy, tt.want.LastReescalatedBy)
 			}
+			if got.Fingerprint != tt.want.Fingerprint {
+				t.Errorf("Fingerprint = %q, want %q", got.Fingerprint, tt.want.Fingerprint)
+			}
 		})
 	}
 }
@@ -257,6 +278,7 @@ func TestEscalationFieldsRoundTrip(t *testing.T) {
 		ReescalationCount: 1,
 		LastReescalatedAt: "2024-06-15T11:30:00Z",
 		LastReescalatedBy: "deacon",
+		Fingerprint:       "escalation-fp:feedface1234",
 	}
 
 	formatted := FormatEscalationDescription("Escalation: Agent stuck", original)
@@ -298,6 +320,21 @@ func TestEscalationFieldsRoundTrip(t *testing.T) {
 	if parsed.LastReescalatedBy != original.LastReescalatedBy {
 		t.Errorf("LastReescalatedBy: got %q, want %q", parsed.LastReescalatedBy, original.LastReescalatedBy)
 	}
+	if parsed.Fingerprint != original.Fingerprint {
+		t.Errorf("Fingerprint: got %q, want %q", parsed.Fingerprint, original.Fingerprint)
+	}
+}
+
+func TestFilterEscalationRecordsSkipsMailMessages(t *testing.T) {
+	issues := []*Issue{
+		{ID: "hq-root", Labels: []string{"gt:escalation"}},
+		{ID: "hq-mail", Labels: []string{"gt:escalation", "gt:message"}},
+	}
+
+	got := filterEscalationRecords(issues)
+	if len(got) != 1 || got[0].ID != "hq-root" {
+		t.Fatalf("filterEscalationRecords() = %#v, want only root escalation", got)
+	}
 }
 
 func TestBumpSeverity(t *testing.T) {
@@ -320,5 +357,92 @@ func TestBumpSeverity(t *testing.T) {
 				t.Errorf("bumpSeverity(%q) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestCreateEscalationBead_PassesDescriptionViaStdin verifies that
+// CreateEscalationBead passes the multi-line description through bd's stdin
+// (--body-file=-) rather than embedding newlines in --description=...
+//
+// Regression test for dc-1bxe: bd 1.0.3+ rejects newlines inside --description
+// flag values, which broke `gt escalate` for any escalation containing the
+// structured YAML metadata block (severity, reason, escalated_by, etc.).
+func TestCreateEscalationBead_PassesDescriptionViaStdin(t *testing.T) {
+	stubDir := t.TempDir()
+	argsPath := filepath.Join(stubDir, "args.txt")
+	stdinPath := filepath.Join(stubDir, "stdin.txt")
+
+	// Stub bd: write each arg on its own line to args.txt, capture stdin to
+	// stdin.txt, and emit a minimal valid issue JSON so unmarshal succeeds.
+	stubScript := `#!/bin/sh
+for a in "$@"; do
+  printf '%s\n' "$a" >> "` + argsPath + `"
+done
+cat > "` + stdinPath + `"
+echo '{"id":"dc-test1","title":"x","status":"open","priority":2,"type":"task","labels":["gt:escalation"]}'
+exit 0
+`
+	stubPath := filepath.Join(stubDir, "bd")
+	if err := os.WriteFile(stubPath, []byte(stubScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// Reset --allow-stale capability cache so the stub gets probed fresh.
+	ResetBdAllowStaleCacheForTest()
+
+	b := New(t.TempDir())
+	fields := &EscalationFields{
+		Severity:    "high",
+		Reason:      "multi-line\nreason\nwith embedded newlines",
+		EscalatedBy: "test/agent",
+		EscalatedAt: "2026-05-08T15:00:00Z",
+		Fingerprint: "escalation-fp:abc123def456",
+	}
+
+	if _, err := b.CreateEscalationBead("Test escalation", fields); err != nil {
+		t.Fatalf("CreateEscalationBead: %v", err)
+	}
+
+	argsData, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read stub args: %v", err)
+	}
+	args := string(argsData)
+
+	// Must use --body-file=- to read description from stdin.
+	if !strings.Contains(args, "--body-file=-") {
+		t.Errorf("expected --body-file=- in bd args, got:\n%s", args)
+	}
+	if !strings.Contains(args, "--labels=escalation-fp:abc123def456") {
+		t.Errorf("expected fingerprint label in bd args, got:\n%s", args)
+	}
+	// Must NOT pass --description=... at all (any --description value would
+	// embed the newline-containing structured description and fail bd 1.0.3+).
+	for _, line := range strings.Split(args, "\n") {
+		if strings.HasPrefix(line, "--description=") {
+			t.Errorf("--description=... must not be used (bd rejects newlines), got %q", line)
+		}
+	}
+
+	stdinData, err := os.ReadFile(stdinPath)
+	if err != nil {
+		t.Fatalf("read stub stdin: %v", err)
+	}
+	stdin := string(stdinData)
+	// The structured description must reach bd via stdin.
+	wantInStdin := []string{
+		"Test escalation",
+		"severity: high",
+		"escalated_by: test/agent",
+	}
+	for _, want := range wantInStdin {
+		if !strings.Contains(stdin, want) {
+			t.Errorf("expected stdin to contain %q, got:\n%s", want, stdin)
+		}
+	}
+	// Sanity: stdin must contain newlines (it's the multi-line description).
+	if !strings.Contains(stdin, "\n") {
+		t.Errorf("expected stdin to be multi-line, got %q", stdin)
 	}
 }

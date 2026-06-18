@@ -1757,7 +1757,8 @@ Then use await-event to subscribe to the refinery event channel with exponential
 
 ```bash
 gt mol step await-event --channel refinery --agent-bead YOUR_AGENT_BEAD \
-  --backoff-base 30s --backoff-mult 2 --backoff-max 15m --cleanup
+  --backoff-base 30s --backoff-mult 2 --backoff-max 15m --cleanup \
+  --context-check-interval 5m
 ```
 
 This command:
@@ -1769,8 +1770,9 @@ This command:
    - Third timeout: 120s
    - ...capped at 15 minutes max
 4. Tracks `idle:N` label on refinery agent bead for backoff state
-5. `--cleanup` auto-deletes processed event files
-6. Outputs `EFFORT: reduced` or `EFFORT: full` directive for next cycle
+5. Returns `reason: context-yield` after 5m if no event arrived (see below)
+6. `--cleanup` auto-deletes processed event files
+7. Outputs `EFFORT: reduced` or `EFFORT: full` directive for next cycle
 
 **Supported events:**
 - `MERGE_READY` — from witness when polecat branch is pushed and ready to merge
@@ -1786,6 +1788,27 @@ gt agent state YOUR_AGENT_BEAD --set idle=0
 **On timeout** (no events):
 The idle counter was auto-incremented. Continue to next patrol cycle
 (the longer backoff will apply next time).
+
+**On context-yield** (5-minute interval reached, no events):
+`await-event` output shows `CONTEXT: check`. Assess session health NOW, before
+starting a new patrol cycle. This is the designed yield point — do NOT skip it.
+
+```
+1. Check RSS: ps -o rss= -p $$  (KB; divide by 1024 for MB)
+2. Check session age (see context-check step instructions above)
+3. Use your internal sense of context: are you forgetting earlier conversation?
+```
+
+If context is ACCEPTABLE (< 70% consumed, RSS < 1 GB, session < 8h):
+- Call await-event again with the same parameters to continue waiting
+- Do NOT start a full patrol cycle (avoids unnecessary token burn on idle rig)
+
+If context is HIGH (≥ 70% consumed, or RSS ≥ 1 GB, or session ≥ 8h):
+- Hand off immediately:
+  ```bash
+  gt patrol report --summary "context-yield handoff: <RSS>MB, <age>h"
+  gt handoff -s "Refinery context-yield handoff" -m "Yield after <age>h. Queue: <state>."
+  ```
 
 ## Effort-Based Patrol Routing
 
@@ -1805,14 +1828,15 @@ After await-event returns, check the EFFORT directive in the output:
 Abbreviated patrol should complete in ~10% of the tokens of a full patrol.
 Mark skipped steps as SKIP in the patrol report.
 
-After await-event returns (either by event or timeout):
+After await-event returns (either by event, timeout, or context-yield):
 1. **Re-assess session health** (check RSS, context, age again — conditions change)
-2. Close current patrol and start next cycle:
+2. If reason is `context-yield` and context is acceptable: re-enter await-event (skip steps 3-4)
+3. Close current patrol and start next cycle:
 ```bash
 gt patrol report --summary "<brief summary: branches merged, test results, queue state>"
 ```
 This closes the current patrol wisp and automatically creates a new one.
-3. Continue executing from the first step of the new patrol cycle
+4. Continue executing from the first step of the new patrol cycle
 
 **If you decide to hand off:**
 

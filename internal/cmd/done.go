@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -24,7 +25,6 @@ import (
 	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/templates"
 	"github.com/steveyegge/gastown/internal/tmux"
-	"github.com/steveyegge/gastown/internal/townlog"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -85,6 +85,20 @@ func doneContaminationBaseRef(defaultBranch, explicitTarget string) string {
 	}
 
 	return "origin/" + targetBranch
+}
+
+func shouldSyncIdlePolecatWorktree(exitType, mergeStrategy string, pushFailed, mrFailed, syncSafe bool) bool {
+	if exitType != ExitCompleted || pushFailed || mrFailed || !syncSafe {
+		return false
+	}
+	return mergeStrategy != "local"
+}
+
+func cleanupStatusAfterSuccessfulPush(status string) string {
+	if status == "unpushed" || status == "has_unpushed" {
+		return "clean"
+	}
+	return status
 }
 
 func init() {
@@ -378,6 +392,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Re-check to get file details (cleanup detection already confirmed uncommitted changes)
 		workStatus, err := g.CheckUncommittedWork()
 		if err == nil && workStatus.HasUncommittedChanges && !workStatus.CleanExcludingRuntime() {
+			if len(workStatus.UnmergedFiles) > 0 {
+				return fmt.Errorf("cannot auto-save unmerged conflicts: %s\nResolve conflicts first, or use --status DEFERRED to exit without completing", strings.Join(workStatus.UnmergedFiles, ", "))
+			}
+
 			fmt.Printf("\n%s Uncommitted changes detected — auto-saving to prevent work loss\n", style.Bold.Render("⚠"))
 			fmt.Printf("  Files: %s\n\n", workStatus.String())
 
@@ -395,9 +413,9 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						_ = g.ResetFiles("CLAUDE.md")
 					}
 				}
-				// Unstage runtime/ephemeral directories (mirrors checkpoint_dog exclusions).
-				for _, dir := range []string{".beads/", ".claude/", ".runtime/", "__pycache__/"} {
-					_ = g.ResetFiles(dir)
+				// Unstage runtime/ephemeral artifacts using the centralized git policy.
+				for _, path := range workStatus.RuntimeArtifactPaths() {
+					_ = g.ResetFiles(path)
 				}
 				// Unstage deletions of tracked files. A safety-net auto-commit should
 				// preserve work (additions + modifications), never destroy it (deletions).
@@ -436,14 +454,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 	// Determine polecat name from sender detection
 	sender := detectSender()
-	polecatName := ""
-	if parts := strings.Split(sender, "/"); len(parts) >= 2 {
-		polecatName = parts[len(parts)-1]
-	}
 
 	// Get agent bead ID for cross-referencing
 	var agentBeadID string
 	if roleInfo, err := GetRoleWithContext(cwd, townRoot); err == nil {
+		if actor := roleInfo.ActorString(); actor != "" {
+			sender = actor
+		}
 		ctx := RoleContext{
 			Role:     roleInfo.Role,
 			Rig:      roleInfo.Rig,
@@ -453,17 +470,55 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		}
 		agentBeadID = getAgentBeadID(ctx)
 
+		// Recreate the agent bead if it's missing (hq-xu4p). Done-intent
+		// labels, checkpoints, and active_mr all write to it; when it's gone
+		// every write fails 'issue not found' and witness zombie detection +
+		// done-resume silently degrade. Best-effort: a failed recreate just
+		// leaves the existing warnings.
+		ensureAgentBeadExists(beads.New(cwd).ForAgentBead(), agentBeadID, ctx)
+
 		// Persistent polecat model (gt-hdf8): no deferred session kill.
 		// Sessions stay alive after gt done — polecat transitions to IDLE.
+	}
+	polecatName := ""
+	if parts := strings.Split(sender, "/"); len(parts) >= 2 {
+		polecatName = parts[len(parts)-1]
+	}
+
+	var assignedIssueIDs []string
+	loadAssignedIssueIDs := func() []string {
+		if assignedIssueIDs == nil && sender != "" {
+			assignedIssueIDs = findAssignedBeadsForAgent(cwd, sender)
+		}
+		return assignedIssueIDs
 	}
 
 	// If issue ID not set by flag or branch name, query for hooked beads
 	// assigned to this agent. This replaces reading agent_bead.hook_bead
 	// (hq-l6mm5: direct bead tracking instead of agent bead slot).
 	if issueID == "" && sender != "" {
-		bd := beads.New(cwd)
-		if hookIssue := findHookedBeadForAgent(bd, sender); hookIssue != "" {
+		if hookIssue, ambiguous := selectAssignedIssue("", loadAssignedIssueIDs()); hookIssue != "" {
 			issueID = hookIssue
+		} else if ambiguous {
+			return fmt.Errorf("multiple active assignments found for %s; cannot infer issue from hook. Use --issue to disambiguate", sender)
+		}
+	}
+
+	// Stale-branch guard (hq-l0fj): a redispatched polecat that reuses its
+	// previous work branch carries the OLD bead-id in the branch name, which
+	// would mis-attribute this MR (close credit goes to a closed bead; the
+	// real issue stays open and hooked). When the branch-derived id differs
+	// from the hooked bead, trust the hook. An explicit --issue flag still
+	// wins, and subtask branches of the hooked bead (e.g. gt-abc.1 under
+	// hooked gt-abc) are left alone.
+	if doneIssue == "" && info.Issue != "" && sender != "" {
+		if hookIssue, ambiguous := selectAssignedIssue(info.Issue, loadAssignedIssueIDs()); isStaleBranchIssue(info.Issue, hookIssue) {
+			style.PrintWarning("branch %q embeds issue %s but your hooked bead is %s — submitting for %s (stale branch reuse?)", branch, info.Issue, hookIssue, hookIssue)
+			fmt.Printf("  Fresh branches must be named polecat/<name>/<bead-id>@<suffix> for the bead you are working.\n")
+			fmt.Printf("  Use --issue to override if the branch-derived id is actually correct.\n\n")
+			issueID = hookIssue
+		} else if ambiguous {
+			return fmt.Errorf("branch %q embeds issue %s but %s has multiple active assignments; use --issue to disambiguate", branch, info.Issue, sender)
 		}
 	}
 
@@ -477,7 +532,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	// skip those stages to avoid repeating work or hitting errors.
 	checkpoints := map[DoneCheckpoint]string{}
 	if agentBeadID != "" {
-		bd := beads.New(cwd)
+		// Agent bead lives in town DB despite rig prefix — bypass routing.
+		bd := beads.New(cwd).ForAgentBead()
 		setDoneIntentLabel(bd, agentBeadID, exitType)
 		checkpoints = readDoneCheckpoints(bd, agentBeadID)
 		if len(checkpoints) > 0 {
@@ -523,7 +579,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		}
 
 		// Block if there are uncommitted changes (would be lost on completion).
-		// Runtime artifacts (.claude/, .beads/, .runtime/, __pycache__/) are
+		// Runtime artifacts (.claude/, .opencode/, .beads/, .runtime/, __pycache__/) are
 		// excluded — these are toolchain-managed and normally gitignored.
 		// Without this filter, gt done fails on virtually every polecat because
 		// Cursor creates .claude/ at runtime in every workspace.
@@ -614,8 +670,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				skipClose := false
 				if issue, err := bd.Show(issueID); err == nil {
 					if unchecked := beads.HasUncheckedCriteria(issue); unchecked > 0 {
-						style.PrintWarning("issue %s has %d unchecked acceptance criteria — skipping close", issueID, unchecked)
+						skipReason := fmt.Sprintf("issue %s has %d unchecked acceptance criteria — skipping close", issueID, unchecked)
+						style.PrintWarning("%s", skipReason)
 						fmt.Printf("  The bead will remain open for witness/mayor review.\n")
+						notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
 						skipClose = true
 					}
 				}
@@ -768,6 +826,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				goto notifyWitness
 			}
 			fmt.Printf("%s Branch pushed directly to %s\n", style.Bold.Render("✓"), defaultBranch)
+			doneCleanupStatus = cleanupStatusAfterSuccessfulPush(doneCleanupStatus)
 
 			// Close the base issue — no MR/refinery will close it
 			if issueID != "" {
@@ -892,13 +951,12 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 		// Fix cleanup_status after successful push (gt-wcr).
 		// Status was detected before push, so "unpushed" is now stale.
-		if doneCleanupStatus == "unpushed" {
-			doneCleanupStatus = "clean"
-		}
+		doneCleanupStatus = cleanupStatusAfterSuccessfulPush(doneCleanupStatus)
 
 		// Write push checkpoint for resume (gt-aufru)
 		if agentBeadID != "" {
-			cpBd := beads.New(cwd)
+			// Agent bead lives in town DB despite rig prefix — bypass routing.
+			cpBd := beads.New(cwd).ForAgentBead()
 			writeDoneCheckpoint(cpBd, agentBeadID, CheckpointPushed, branch)
 		}
 
@@ -1133,6 +1191,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					goto notifyWitness
 				}
 
+
 				// No-merge path without a PR (or with MR-bead creation
 				// failure) — close the work bead so it doesn't sit open
 				// forever. This is the fix for #3363. Compose the reason
@@ -1206,6 +1265,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					goto notifyWitness
 				}
 				fmt.Printf("%s Branch pushed directly to %s\n", style.Bold.Render("✓"), defaultBranch)
+				doneCleanupStatus = cleanupStatusAfterSuccessfulPush(doneCleanupStatus)
 
 				// Close the issue directly — refinery won't process it.
 				if issueID != "" {
@@ -1234,26 +1294,28 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Determine target branch for the MR.
 		// Priority: explicit --target flag > formula_vars base_branch > integration branch auto-detect > rig default.
 		target := defaultBranch
+		explicitTarget := false
 
 		// 1. Explicit --target flag (highest priority — polecat knows its base branch).
 		// This is the most reliable path: the formula passes {{base_branch}} directly,
 		// avoiding any dependency on bd.Show() or Dolt availability.
-		if doneTarget != "" && doneTarget != defaultBranch {
+		if doneTarget != "" {
 			target = doneTarget
+			explicitTarget = true
 			fmt.Printf("  Target branch: %s (from --target flag)\n", target)
 		}
 
 		// 2. Check for --base-branch override in formula vars (stored on bead at sling time).
 		// Fallback for polecats dispatched before --target flag existed, or when
 		// the formula doesn't pass --target explicitly.
-		if target == defaultBranch && sourceIssueForNoMerge != nil {
+		if !explicitTarget && target == defaultBranch && sourceIssueForNoMerge != nil {
 			if af := beads.ParseAttachmentFields(sourceIssueForNoMerge); af != nil {
 				if bb := extractFormulaVar(af.FormulaVars, "base_branch"); bb != "" && bb != defaultBranch {
 					target = bb
 					fmt.Printf("  Target branch override: %s (from formula_vars)\n", target)
 				}
 			}
-		} else if target == defaultBranch && sourceIssueForNoMerge == nil && issueID != "" {
+		} else if !explicitTarget && target == defaultBranch && sourceIssueForNoMerge == nil && issueID != "" {
 			// sourceIssueForNoMerge is nil — bd.Show(issueID) failed earlier.
 			// This is the silent failure path that caused 150+ procedure beads to
 			// target main instead of feat/contract-review-procedure.
@@ -1262,7 +1324,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 		// 3. Auto-detect integration branch from epic hierarchy (if enabled).
 		// Only overrides if no explicit target was set above.
-		if target == defaultBranch {
+		if !explicitTarget && target == defaultBranch {
 			refineryEnabled := true
 			settingsPath := filepath.Join(townRoot, rigName, "settings", "config.json")
 			if settings, err := config.LoadRigSettings(settingsPath); err == nil && settings.MergeQueue != nil {
@@ -1442,9 +1504,12 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				}
 			}
 
-			// Update agent bead with active_mr reference (for traceability)
+			// Update agent bead with active_mr reference (for traceability).
+			// Agent beads live in HQ regardless of rig prefix — bypass routing
+			// via ForAgentBead() to avoid the "issue not found" warning that
+			// leaves active_mr null after every gt done (hq-e73z).
 			if agentBeadID != "" {
-				if err := bd.UpdateAgentActiveMR(agentBeadID, mrID); err != nil {
+				if err := bd.ForAgentBead().UpdateAgentActiveMR(agentBeadID, mrID); err != nil {
 					style.PrintWarning("could not update agent bead with active_mr: %v", err)
 				}
 			}
@@ -1486,7 +1551,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 		// Write MR checkpoint for resume (gt-aufru)
 		if mrID != "" && agentBeadID != "" {
-			cpBd := beads.New(cwd)
+			// Agent bead lives in town DB despite rig prefix — bypass routing.
+			cpBd := beads.New(cwd).ForAgentBead()
 			writeDoneCheckpoint(cpBd, agentBeadID, CheckpointMRCreated, mrID)
 		}
 
@@ -1511,7 +1577,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 notifyWitness:
 	// Nudge refinery — MR bead is already on main (transaction-based shared main).
-	if mrID != "" {
+	if shouldNudgeRefinery(exitType, mrID) {
 		nudgeRefinery(rigName, "MERGE_READY received - check inbox for pending work")
 	}
 
@@ -1521,7 +1587,8 @@ notifyWitness:
 	// longer processes routine completions from these fields.
 	fmt.Printf("\nNotifying Witness...\n")
 	if agentBeadID != "" {
-		completionBd := beads.New(cwd)
+		// Agent bead lives in town DB despite rig prefix — bypass routing.
+		completionBd := beads.New(cwd).ForAgentBead()
 		meta := &beads.CompletionMetadata{
 			ExitType:       exitType,
 			MRID:           mrID,
@@ -1536,16 +1603,10 @@ notifyWitness:
 		}
 	}
 
-	// Nudge witness via tmux (observability, not critical path).
-	// Self-managed completion (gt-1qlg): witness no longer processes routine completions.
-	// The nudge is kept for observability — witness logs the event but doesn't
-	// need to act on it. Nudges are free (no Dolt commit).
-	nudgeWitness(rigName, fmt.Sprintf("POLECAT_DONE %s exit=%s", polecatName, exitType))
-	fmt.Printf("%s Witness notified of %s (via nudge)\n", style.Bold.Render("✓"), exitType)
-
 	// Write witness notification checkpoint for resume (gt-aufru)
 	if agentBeadID != "" {
-		cpBd := beads.New(cwd)
+		// Agent bead lives in town DB despite rig prefix — bypass routing.
+		cpBd := beads.New(cwd).ForAgentBead()
 		writeDoneCheckpoint(cpBd, agentBeadID, CheckpointWitnessNotified, "ok")
 	}
 
@@ -1559,6 +1620,12 @@ notifyWitness:
 
 	// Update agent bead state (ZFC: self-report completion)
 	updateAgentStateOnDone(cwd, townRoot, exitType, issueID)
+
+	// Nudge witness only after hook/cleanup state is updated. Otherwise witness can
+	// evaluate slot availability against stale hook_bead or cleanup_status and emit
+	// false SLOT_BLOCKED/SLOT_OPEN signals.
+	nudgeWitness(rigName, fmt.Sprintf("POLECAT_DONE %s exit=%s", polecatName, exitType))
+	fmt.Printf("%s Witness notified of %s (via nudge)\n", style.Bold.Render("✓"), exitType)
 
 	// Persistent polecat model (gt-hdf8): polecats transition to IDLE after completion.
 	// Session stays alive, sandbox preserved, worktree synced to main for reuse.
@@ -1584,23 +1651,43 @@ notifyWitness:
 		// dirty on the feature branch so work can be recovered.
 		syncSafe := true
 		if cwdAvailable {
-			if ws, wsErr := g.CheckUncommittedWork(); wsErr == nil && ws.HasUncommittedChanges && !ws.CleanExcludingRuntime() {
+			if ws, wsErr := g.CheckUncommittedWork(); wsErr != nil {
+				syncSafe = false
+				style.PrintWarning("could not inspect worktree before idle sync: %v — skipping sync to preserve work", wsErr)
+			} else if ws.HasUncommittedChanges && !ws.CleanExcludingRuntime() {
 				syncSafe = false
 				style.PrintWarning("uncommitted changes still present — skipping worktree sync to preserve work")
 				fmt.Printf("  Files: %s\n", ws.String())
 			}
 		}
-		if cwdAvailable && !pushFailed && syncSafe {
+		if exitType == ExitCompleted && issueID != "" && convoyInfo == nil {
+			// Use the pr-mode-aware resolver (G22, matches the call sites above)
+			// so this idle-sync path also applies the direct/local→mr override
+			// under rig pr-mode, rather than the bare getConvoyInfo* lookups
+			// upstream added here. (augment review, PR #105)
+			convoyInfo = resolveConvoyInfoForIssue(issueID, cwd, townRoot, rigName)
+		}
+		mergeStrategy := ""
+		if convoyInfo != nil {
+			mergeStrategy = convoyInfo.MergeStrategy
+		}
+		if cwdAvailable && shouldSyncIdlePolecatWorktree(exitType, mergeStrategy, pushFailed, mrFailed, syncSafe) {
 			// Remember the old branch so we can delete it after switching
 			oldBranch := branch
 
 			fmt.Printf("%s Syncing worktree to %s...\n", style.Bold.Render("→"), defaultBranch)
-			if err := g.Checkout(defaultBranch); err != nil {
-				style.PrintWarning("could not checkout %s: %v (worktree stays on feature branch)", defaultBranch, err)
-			} else if err := g.Pull("origin", defaultBranch); err != nil {
-				style.PrintWarning("could not pull %s: %v (worktree on %s but may be stale)", defaultBranch, defaultBranch, err)
+			syncRef := "origin/" + defaultBranch
+			if err := g.Fetch("origin"); err != nil {
+				style.PrintWarning("could not fetch origin before idle sync: %v (using local refs)", err)
+			}
+			if err := g.CheckoutDetach(syncRef); err != nil {
+				if fallbackErr := g.CheckoutDetach(defaultBranch); fallbackErr != nil {
+					style.PrintWarning("could not detach checkout %s: %v; fallback %s also failed: %v (worktree stays on feature branch)", syncRef, err, defaultBranch, fallbackErr)
+				} else {
+					fmt.Printf("%s Worktree synced to %s (detached fallback)\n", style.Bold.Render("✓"), defaultBranch)
+				}
 			} else {
-				fmt.Printf("%s Worktree synced to %s\n", style.Bold.Render("✓"), defaultBranch)
+				fmt.Printf("%s Worktree synced to %s (detached)\n", style.Bold.Render("✓"), syncRef)
 			}
 
 			// Delete the old polecat branch (non-fatal: cleanup only).
@@ -1673,6 +1760,50 @@ func pushSubmoduleChanges(g *git.Git, defaultBranch string) {
 	}
 }
 
+func forceCloseIssueWithRetry(closeFn func(string, ...string) error, issueID, reason, successFormat string) error {
+	return forceCloseIssueWithRetrySleep(closeFn, issueID, reason, successFormat, time.Sleep)
+}
+
+func forceCloseIssueWithRetrySleep(closeFn func(string, ...string) error, issueID, reason, successFormat string, sleep func(time.Duration)) error {
+	var closeErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		closeErr = closeFn(reason, issueID)
+		if closeErr == nil {
+			fmt.Printf("%s "+successFormat+"\n", style.Bold.Render("✓"), issueID)
+			return nil
+		}
+		if attempt < 3 {
+			style.PrintWarning("close attempt %d/3 failed: %v (retrying in %ds)", attempt, closeErr, attempt*2)
+			sleep(time.Duration(attempt*2) * time.Second)
+		}
+	}
+	return closeErr
+}
+
+func notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, reason string) {
+	if townRoot == "" || rigName == "" || issueID == "" {
+		return
+	}
+	if sender == "" {
+		sender = fmt.Sprintf("%s/polecat", rigName)
+	}
+
+	router := mail.NewRouter(townRoot)
+	defer router.WaitPendingNotifications()
+	msg := &mail.Message{
+		To:      fmt.Sprintf("%s/witness", rigName),
+		From:    sender,
+		Subject: fmt.Sprintf("DONE_CLOSE_SKIPPED: %s", issueID),
+		Body: fmt.Sprintf("gt done skipped closing %s.\n\nReason: %s\n\nThe bead remains open for witness/mayor review.",
+			issueID, reason),
+	}
+	if err := router.Send(msg); err != nil {
+		style.PrintWarning("could not notify witness about skipped close: %v", err)
+	} else {
+		fmt.Printf("%s Witness notified: DONE_CLOSE_SKIPPED\n", style.Bold.Render("✓"))
+	}
+}
+
 func noteVerifiedPushFailure(cwd, issueID, branch, commit string, verifyErr error) {
 	if issueID == "" || cwd == "" {
 		return
@@ -1708,6 +1839,16 @@ func verifyPushedCommitWithBareFallback(g *git.Git, townRoot, rigName, branch, c
 		return nil
 	}
 	return verifyErr
+}
+
+// shouldNudgeRefinery reports whether a gt done invocation may wake the
+// refinery. Only COMPLETED exits create an MR bead; DEFERRED and ESCALATED
+// exits (polecats finishing operational tasks with no code changes) must
+// never emit MQ_SUBMIT, or the refinery wakes from backoff to find an empty
+// merge queue (gh#3885). The exitType check is defensive: it holds the
+// invariant even if a future code path populates mrID outside COMPLETED.
+func shouldNudgeRefinery(exitType, mrID string) bool {
+	return exitType == ExitCompleted && mrID != ""
 }
 
 // setDoneIntentLabel writes a done-intent:<type>:<unix-ts> label on the agent bead
@@ -1955,6 +2096,11 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 		beadsPath = filepath.Join(townRoot, ctx.Rig)
 	}
 	bd := beads.New(beadsPath)
+	// agentBd bypasses prefix routing — agent beads (gt:agent label) live in
+	// the town DB regardless of their ID prefix, but the rig-prefix routing
+	// would otherwise misroute them to the rig DB and silently fail with
+	// "issue not found". See beads.ForAgentBead docstring for details.
+	agentBd := bd.ForAgentBead()
 
 	// Find the hooked bead to close. Use issueID directly instead of reading
 	// agent bead's hook_bead slot (hq-l6mm5: direct bead tracking).
@@ -2040,7 +2186,7 @@ doneStateUpdate:
 	// wisp that gets reaped, the witness can't verify it was closed and flags
 	// the polecat as a zombie. Clearing hook_bead prevents this false positive.
 	emptyHook := ""
-	if err := bd.UpdateAgentDescriptionFields(agentBeadID, beads.AgentFieldUpdates{HookBead: &emptyHook}); err != nil {
+	if err := agentBd.UpdateAgentDescriptionFields(agentBeadID, beads.AgentFieldUpdates{HookBead: &emptyHook}); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: couldn't clear hook_bead on %s: %v\n", agentBeadID, err)
 	}
 
@@ -2061,7 +2207,7 @@ doneStateUpdate:
 		doneState = "stuck"
 	}
 	// Use UpdateAgentState to sync both column and description (gt-ulom).
-	if err := bd.UpdateAgentState(agentBeadID, doneState); err != nil {
+	if err := agentBd.UpdateAgentState(agentBeadID, doneState); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: couldn't set agent %s to %s: %v\n", agentBeadID, doneState, err)
 	}
 
@@ -2070,7 +2216,7 @@ doneStateUpdate:
 	if doneCleanupStatus != "" {
 		cleanupStatus := parseCleanupStatus(doneCleanupStatus)
 		if cleanupStatus != polecat.CleanupUnknown {
-			if err := bd.UpdateAgentCleanupStatus(agentBeadID, string(cleanupStatus)); err != nil {
+			if err := agentBd.UpdateAgentCleanupStatus(agentBeadID, string(cleanupStatus)); err != nil {
 				// Non-fatal: don't return — done-intent labels still need clearing (za-o9e)
 				fmt.Fprintf(os.Stderr, "Warning: couldn't update agent %s cleanup status: %v\n", agentBeadID, err)
 			}
@@ -2080,27 +2226,176 @@ doneStateUpdate:
 	// Clear done-intent label and checkpoints on clean exit — gt done completed
 	// successfully. If we don't reach here (crash/stuck), the Witness uses the
 	// lingering labels to detect the zombie and resume from checkpoints.
-	clearDoneIntentLabel(bd, agentBeadID)
-	clearDoneCheckpoints(bd, agentBeadID)
+	clearDoneIntentLabel(agentBd, agentBeadID)
+	clearDoneCheckpoints(agentBd, agentBeadID)
 }
 
-// findHookedBeadForAgent queries for beads with status=hooked assigned to this agent.
-// This is the authoritative source for what work a polecat is doing, since the
-// work bead itself tracks status and assignee (hq-l6mm5).
-// Returns empty string if no hooked bead is found.
-func findHookedBeadForAgent(bd *beads.Beads, agentID string) string {
-	if agentID == "" {
-		return ""
+// ensureAgentBeadExists recreates a missing agent bead so done-intent labels,
+// checkpoints, and active_mr writes don't silently fail (hq-xu4p). Only
+// rig-level agents are handled — town agents (mayor/deacon) are owned by
+// gt doctor. Best-effort: failures are warned, never fatal.
+func ensureAgentBeadExists(bd *beads.Beads, id string, ctx RoleContext) {
+	if id == "" {
+		return
 	}
-	hookedBeads, err := bd.List(beads.ListOptions{
+	if issue, err := bd.Show(id); err == nil && issue != nil && issue.Status != string(beads.StatusClosed) {
+		return // exists and is active
+	}
+
+	fields := &beads.AgentFields{Rig: ctx.Rig, AgentState: "idle"}
+	var title string
+	switch ctx.Role {
+	case RolePolecat:
+		fields.RoleType = "polecat"
+		title = fmt.Sprintf("Polecat worker %s in %s - autonomous worker with persistent identity.", ctx.Polecat, ctx.Rig)
+	case RoleWitness:
+		fields.RoleType = "witness"
+		title = fmt.Sprintf("Witness for %s - monitors polecat health and progress.", ctx.Rig)
+	case RoleRefinery:
+		fields.RoleType = "refinery"
+		title = fmt.Sprintf("Refinery for %s - processes merge queue.", ctx.Rig)
+	default:
+		return
+	}
+
+	if _, err := bd.CreateOrReopenAgentBead(id, title, fields); err != nil {
+		style.PrintWarning("agent bead %s missing and recreate failed: %v", id, err)
+	} else {
+		fmt.Printf("%s Recreated/reopened missing agent bead: %s\n", style.Bold.Render("✓"), id)
+	}
+}
+
+// isStaleBranchIssue reports whether a branch-derived issue id should be
+// overridden by the agent's hooked bead (hq-l0fj stale-branch guard).
+// True when both ids exist, they differ, and the branch id is not a subtask
+// of the hooked bead (e.g. branch gt-abc.1 under hooked gt-abc is fine).
+func isStaleBranchIssue(branchIssue, hookedIssue string) bool {
+	if branchIssue == "" || hookedIssue == "" {
+		return false
+	}
+	return branchIssue != hookedIssue && !strings.HasPrefix(branchIssue, hookedIssue+".")
+}
+
+// selectAssignedIssue returns the one authoritative assignment to use for
+// done attribution. Ambiguous assignment state is deliberately not guessed.
+func selectAssignedIssue(branchIssue string, assigned []string) (string, bool) {
+	unique := make(map[string]bool, len(assigned))
+	for _, id := range assigned {
+		if id != "" {
+			unique[id] = true
+		}
+	}
+	ids := make([]string, 0, len(unique))
+	for id := range unique {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	if len(ids) == 0 {
+		return "", false
+	}
+	if branchIssue != "" {
+		for _, id := range ids {
+			if branchIssue == id || strings.HasPrefix(branchIssue, id+".") {
+				return "", false
+			}
+		}
+	}
+	if len(ids) > 1 {
+		return "", true
+	}
+	return ids[0], false
+}
+
+// findAssignedBeadsForAgent queries the same assignment locations as gt hook:
+// the current rig, the target rig for rig agents, then town beads. The assigned
+// work bead is authoritative; agent-bead hook slots are intentionally ignored.
+func findAssignedBeadsForAgent(workDir, agentID string) []string {
+	if agentID == "" {
+		return nil
+	}
+
+	assigned := assignedIssueIDs(queryAssignedBeads(beads.New(workDir), agentID))
+	if len(assigned) > 0 {
+		return assigned
+	}
+
+	townRoot, err := findTownRoot()
+	if err != nil || townRoot == "" {
+		return nil
+	}
+
+	parts := strings.Split(agentID, "/")
+	rigName := ""
+	if len(parts) > 0 {
+		rigName = parts[0]
+	}
+	if rigName != "" && rigName != "mayor" && rigName != "deacon" {
+		rigWorkDir := filepath.Join(townRoot, rigName, "mayor", "rig")
+		if rigWorkDir != workDir {
+			assigned = assignedIssueIDs(queryAssignedBeads(beads.New(rigWorkDir), agentID))
+			if len(assigned) > 0 {
+				return assigned
+			}
+		}
+	}
+
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	if _, err := os.Stat(townBeadsDir); err == nil {
+		assigned = assignedIssueIDs(queryAssignedBeads(beads.New(townBeadsDir), agentID))
+		if len(assigned) > 0 {
+			return assigned
+		}
+	}
+	if isTownLevelRole(agentID) {
+		return assignedIssueIDs(scanAllRigsForHookedBeads(townRoot, agentID))
+	}
+	return nil
+}
+
+func queryAssignedBeads(bd *beads.Beads, agentID string) []*beads.Issue {
+	hooked, err := bd.List(beads.ListOptions{
 		Status:   beads.StatusHooked,
 		Assignee: agentID,
 		Priority: -1,
 	})
-	if err != nil || len(hookedBeads) == 0 {
-		return ""
+	if err == nil && len(hooked) > 0 {
+		return hooked
 	}
-	return hookedBeads[0].ID
+	inProgress, err := bd.List(beads.ListOptions{
+		Status:   "in_progress",
+		Assignee: agentID,
+		Priority: -1,
+	})
+	if err == nil {
+		return inProgress
+	}
+	return nil
+}
+
+func assignedIssueIDs(assigned []*beads.Issue) []string {
+	ids := make([]string, 0, len(assigned))
+	for _, issue := range assigned {
+		if issue != nil && issue.ID != "" {
+			ids = append(ids, issue.ID)
+		}
+	}
+	return ids
+}
+
+// findHookedBeadForAgent queries for the agent's current assignment bead.
+// This is the authoritative source for what work a polecat is doing, since the
+// work bead itself tracks status and assignee (hq-l6mm5).
+//
+// Both hooked AND in_progress are checked (hq-xa4z): polecats routinely claim
+// their assignment with `bd update --status=in_progress` when starting work,
+// which made a hooked-only lookup blind to the active assignment — the stale-
+// branch guard and the hook fallback silently no-op'd (same class of bug as
+// gt-pftz in the close path). Hooked wins over in_progress when both exist.
+// Returns empty string if no assignment bead is found.
+func findHookedBeadForAgent(bd *beads.Beads, agentID string) string {
+	issueID, _ := selectAssignedIssue("", assignedIssueIDs(queryAssignedBeads(bd, agentID)))
+	return issueID
 }
 
 // parseCleanupStatus converts a string flag value to a CleanupStatus.
@@ -2120,117 +2415,12 @@ func parseCleanupStatus(s string) polecat.CleanupStatus {
 	}
 }
 
-// selfNukePolecat deletes this polecat's worktree.
-// DEPRECATED (gt-4ac): No longer called from gt done. Polecats now go idle
-// instead of self-nuking. Kept for explicit nuke scenarios.
-// This is safe because:
-// 1. Work has been pushed to origin (verified below)
-// 2. We're about to exit anyway
-// 3. Unix allows deleting directories while processes run in them
-func selfNukePolecat(roleInfo RoleInfo, _ string) error {
-	if roleInfo.Role != RolePolecat || roleInfo.Polecat == "" || roleInfo.Rig == "" {
-		return fmt.Errorf("not a polecat: role=%s, polecat=%s, rig=%s", roleInfo.Role, roleInfo.Polecat, roleInfo.Rig)
-	}
-
-	// Get polecat manager using existing helper
-	mgr, _, err := getPolecatManager(roleInfo.Rig)
-	if err != nil {
-		return fmt.Errorf("getting polecat manager: %w", err)
-	}
-
-	// Verify branch actually exists on a remote before nuking local copy.
-	// If push didn't land (no remote, auth failure, etc.), preserve worktree
-	// so Witness/Refinery can still access the branch.
-	clonePath := mgr.ClonePath(roleInfo.Polecat)
-	polecatGit := git.NewGit(clonePath)
-	remotes, err := polecatGit.Remotes()
-	if err != nil || len(remotes) == 0 {
-		return fmt.Errorf("no git remotes configured — preserving worktree to prevent data loss")
-	}
-	branchName, err := polecatGit.CurrentBranch()
-	if err != nil {
-		return fmt.Errorf("cannot determine current branch — preserving worktree: %w", err)
-	}
-	pushed := false
-	for _, remote := range remotes {
-		exists, err := polecatGit.RemoteBranchExists(remote, branchName)
-		if err == nil && exists {
-			pushed = true
-			break
-		}
-	}
-	if !pushed {
-		return fmt.Errorf("branch %s not found on any remote — preserving worktree", branchName)
-	}
-
-	// Use nuclear=true since we verified the branch is pushed
-	// selfNuke=true because polecat is deleting its own worktree from inside it
-	if err := mgr.RemoveWithOptions(roleInfo.Polecat, true, true, true); err != nil {
-		return fmt.Errorf("removing worktree: %w", err)
-	}
-
-	return nil
-}
-
 // isPolecatActor checks if a BD_ACTOR value represents a polecat.
 // Polecat actors have format: rigname/polecats/polecatname
 // Non-polecat actors have formats like: gastown/crew/name, rigname/witness, etc.
 func isPolecatActor(actor string) bool {
 	parts := strings.Split(actor, "/")
 	return len(parts) >= 2 && parts[1] == "polecats"
-}
-
-// selfKillSession terminates the polecat's own tmux session after logging the event.
-// DEPRECATED (gt-hdf8): No longer called from gt done. Polecats now transition to
-// IDLE with session preserved instead of self-killing. Kept for explicit kill scenarios
-// (e.g., Witness-directed termination).
-//
-// The polecat determines its session from environment variables:
-// - GT_RIG: the rig name
-// - GT_POLECAT: the polecat name
-// Session name format: gt-<rig>-<polecat>
-func selfKillSession(townRoot string, roleInfo RoleInfo) error {
-	// Get session info from environment (set at session startup)
-	rigName := os.Getenv("GT_RIG")
-	polecatName := os.Getenv("GT_POLECAT")
-
-	// Fall back to roleInfo if env vars not set (shouldn't happen but be safe)
-	if rigName == "" {
-		rigName = roleInfo.Rig
-	}
-	if polecatName == "" {
-		polecatName = roleInfo.Polecat
-	}
-
-	if rigName == "" || polecatName == "" {
-		return fmt.Errorf("cannot determine session: rig=%q, polecat=%q", rigName, polecatName)
-	}
-
-	sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
-	agentID := fmt.Sprintf("%s/polecats/%s", rigName, polecatName)
-
-	// Log to townlog (human-readable audit log)
-	if townRoot != "" {
-		logger := townlog.NewLogger(townRoot)
-		_ = logger.Log(townlog.EventKill, agentID, "self-clean: done means idle")
-	}
-
-	// Log to events (JSON audit log with structured payload)
-	_ = events.LogFeed(events.TypeSessionDeath, agentID,
-		events.SessionDeathPayload(sessionName, agentID, "self-clean: done means idle", "gt done"))
-
-	// Kill our own tmux session with proper process cleanup
-	// This will terminate Claude and all child processes, completing the self-cleaning cycle.
-	// We use KillSessionWithProcessesExcluding to ensure no orphaned processes are left behind,
-	// while excluding our own PID to avoid killing ourselves before cleanup completes.
-	// The tmux kill-session at the end will terminate us along with the session.
-	t := tmux.NewTmux()
-	myPID := strconv.Itoa(os.Getpid())
-	if err := t.KillSessionWithProcessesExcluding(sessionName, []string{myPID}); err != nil {
-		return fmt.Errorf("killing session %s: %w", sessionName, err)
-	}
-
-	return nil
 }
 
 // stripOverlayCLAUDEmd detects and removes Gas Town overlay content from CLAUDE.md

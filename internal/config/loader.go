@@ -1360,6 +1360,8 @@ func resolveAgentConfigWithOverrideInternal(townRoot, rigPath, agentOverride str
 			return nil, "", fmt.Errorf("agent '%s' not found", agentName)
 		}
 
+		rc.ResolvedAgent = agentName
+
 		// Append extra arguments from the override
 		if len(extraArgs) > 0 {
 			rc.Args = append(rc.Args, extraArgs...)
@@ -2044,6 +2046,7 @@ func fillRuntimeDefaults(rc *RuntimeConfig) *RuntimeConfig {
 	if result.Args == nil && preset != nil {
 		result.Args = append([]string(nil), preset.Args...)
 	}
+	result.Args = ensureCodexAutomationArgs(result.Command, result.Args)
 
 	// Auto-fill Hooks defaults from preset for agents that support hooks.
 	if result.Hooks == nil && preset != nil && preset.HooksProvider != "" {

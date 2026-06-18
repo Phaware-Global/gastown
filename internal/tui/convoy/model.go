@@ -91,8 +91,8 @@ func loadConvoys(townBeads string) ([]ConvoyItem, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), constants.BdSubprocessTimeout)
 	defer cancel()
 
-	// Get list of open convoys
-	listArgs := []string{"list", "--type=convoy", "--json"}
+	// Get list of open issues and filter locally so legacy type=convoy beads remain visible.
+	listArgs := []string{"list", "--json", "--limit=0"}
 	listCmd := exec.CommandContext(ctx, "bd", listArgs...)
 	util.SetDetachedProcessGroup(listCmd)
 	listCmd.Dir = townBeads
@@ -104,9 +104,11 @@ func loadConvoys(townBeads string) ([]ConvoyItem, error) {
 	}
 
 	var rawConvoys []struct {
-		ID     string `json:"id"`
-		Title  string `json:"title"`
-		Status string `json:"status"`
+		ID        string   `json:"id"`
+		Title     string   `json:"title"`
+		Status    string   `json:"status"`
+		IssueType string   `json:"issue_type"`
+		Labels    []string `json:"labels"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &rawConvoys); err != nil {
 		return nil, fmt.Errorf("parsing convoy list: %w", err)
@@ -114,6 +116,9 @@ func loadConvoys(townBeads string) ([]ConvoyItem, error) {
 
 	convoys := make([]ConvoyItem, 0, len(rawConvoys))
 	for _, rc := range rawConvoys {
+		if rc.IssueType != "convoy" && !tuiConvoyHasLabel(rc.Labels, "gt:convoy") {
+			continue
+		}
 		issues, completed, total := loadTrackedIssues(townBeads, rc.ID)
 		convoys = append(convoys, ConvoyItem{
 			ID:       rc.ID,
@@ -128,6 +133,14 @@ func loadConvoys(townBeads string) ([]ConvoyItem, error) {
 	return convoys, nil
 }
 
+func tuiConvoyHasLabel(labels []string, target string) bool {
+	for _, label := range labels {
+		if label == target {
+			return true
+		}
+	}
+	return false
+}
 
 // loadTrackedIssues loads issues tracked by a convoy.
 func loadTrackedIssues(townBeads, convoyID string) ([]IssueItem, int, int) {

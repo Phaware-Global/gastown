@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -44,25 +45,88 @@ func runShow(cmd *cobra.Command, args []string) error {
 	return execBdShow(args)
 }
 
-// extractBeadIDFromArgs returns the first non-flag argument, which is the bead ID.
-// Returns empty string if no non-flag argument is found.
+// extractBeadIDFromArgs returns the first positional bead ID, falling back to
+// bd show's --id form for IDs that look like flags. bd show processes positional
+// IDs before --id values even when --id appears earlier in argv.
 func extractBeadIDFromArgs(args []string) string {
-	for _, arg := range args {
+	idFlag := ""
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+			break
+		}
+		if strings.HasPrefix(arg, "--id=") {
+			if idFlag == "" {
+				idFlag = strings.TrimPrefix(arg, "--id=")
+			}
+			continue
+		}
+		if arg == "--id" {
+			if i+1 < len(args) {
+				if idFlag == "" {
+					idFlag = args[i+1]
+				}
+				i++
+			}
+			continue
+		}
+		if showFlagConsumesNextArg(arg) {
+			i++
+			continue
+		}
 		if !strings.HasPrefix(arg, "-") {
 			return arg
 		}
 	}
-	return ""
+	return idFlag
 }
 
-// stripEnvKey removes all entries matching the given key from an environment slice.
-func stripEnvKey(env []string, key string) []string { //nolint:unparam // key is always BEADS_DIR today but the function is intentionally generic
-	prefix := key + "="
-	result := make([]string, 0, len(env))
-	for _, e := range env {
-		if !strings.HasPrefix(e, prefix) {
-			result = append(result, e)
+func showFlagConsumesNextArg(arg string) bool {
+	switch arg {
+	case "--as-of", "--actor", "--db", "--directory", "--dolt-auto-commit", "--format", "-C":
+		return true
+	default:
+		return false
+	}
+}
+
+type bdShowInvocation struct {
+	Dir         string
+	Env         []string
+	ExecArgs    []string
+	CommandArgs []string
+}
+
+func newBdShowInvocation(args []string, environ []string) bdShowInvocation {
+	dir := ""
+	if beadID := extractBeadIDFromArgs(args); beadID != "" {
+		if resolved := resolveBeadDir(beadID); resolved != "" && resolved != "." {
+			dir = resolved
 		}
 	}
-	return result
+
+	bdc := &bdCmd{
+		args:   append([]string{"show"}, args...),
+		env:    environ,
+		stderr: os.Stderr,
+	}
+	if dir != "" {
+		bdc.Dir(dir)
+	}
+	cmd := bdc.Build()
+	commandArgs := append([]string(nil), cmd.Args[1:]...)
+
+	return bdShowInvocation{
+		Dir:         cmd.Dir,
+		Env:         cmd.Env,
+		ExecArgs:    cmd.Args,
+		CommandArgs: commandArgs,
+	}
+}
+
+func currentBdShowInvocation(args []string) bdShowInvocation {
+	return newBdShowInvocation(args, os.Environ())
 }

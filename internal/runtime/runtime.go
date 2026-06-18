@@ -4,15 +4,16 @@ package runtime
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/hooks"
-	"github.com/steveyegge/gastown/internal/hookutil"
 	"github.com/steveyegge/gastown/internal/templates/commands"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 // EnsureSettingsForRole provisions all agent-specific configuration for a role.
@@ -44,16 +45,118 @@ func EnsureSettingsForRole(settingsDir, workDir, role string, rc *config.Runtime
 	if err := hooks.InstallForRole(provider, settingsDir, workDir, role, rc.Hooks.Dir, rc.Hooks.SettingsFile, useSettingsDir); err != nil {
 		return err
 	}
+	if provider == "gemini" {
+		if err := ensureGeminiContextFile(workDir); err != nil {
+			return err
+		}
+	}
 
 	// 2. Slash commands (agent-agnostic, uses shared body with provider-specific frontmatter)
-	// Only provision for known agents to maintain backwards compatibility
-	if commands.IsKnownAgent(provider) {
+	// Only provision for known agents to maintain backwards compatibility.
+	// Skip provisioning when workDir is nested inside a town root: Claude Code's
+	// path-hierarchy traversal already delivers the town root's .claude/commands/
+	// to the agent, so a duplicate copy in workDir causes each command to appear twice.
+	if commands.IsKnownAgent(provider) && !commandsInherited(workDir) {
 		if err := commands.ProvisionFor(workDir, provider); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+func ensureGeminiContextFile(workDir string) error {
+	if workDir == "" {
+		return nil
+	}
+
+	agentsPath := filepath.Join(workDir, "AGENTS.md")
+	geminiPath := filepath.Join(workDir, "GEMINI.md")
+	info, err := os.Lstat(geminiPath)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink == 0 {
+			return nil
+		}
+
+		target, err := os.Readlink(geminiPath)
+		if err != nil {
+			return fmt.Errorf("reading GEMINI.md symlink: %w", err)
+		}
+		if target == "AGENTS.md" {
+			return nil
+		}
+		if !pointsToAgentsMD(target) {
+			return nil
+		}
+		if _, err := os.Stat(agentsPath); err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return fmt.Errorf("checking AGENTS.md: %w", err)
+		}
+		if err := os.Remove(geminiPath); err != nil {
+			return fmt.Errorf("removing non-canonical GEMINI.md symlink: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("checking GEMINI.md: %w", err)
+	}
+
+	if _, err := os.Stat(agentsPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("checking AGENTS.md: %w", err)
+	}
+
+	if err := os.Symlink("AGENTS.md", geminiPath); err != nil {
+		return fmt.Errorf("creating GEMINI.md symlink: %w", err)
+	}
+	return nil
+}
+
+func pointsToAgentsMD(target string) bool {
+	return filepath.Base(filepath.Clean(target)) == "AGENTS.md"
+}
+
+// commandsInherited reports whether workDir will receive slash commands via
+// Claude Code's path-hierarchy traversal without explicit provisioning.
+// Commands are inherited when workDir is inside a Gas Town workspace root and
+// not separated from it by a nested git repo. Crew and polecat workdirs are
+// nested repos, so they still get their own command provisioning.
+func commandsInherited(workDir string) bool {
+	townRoot, err := workspace.Find(workDir)
+	if err != nil || townRoot == "" || samePath(townRoot, workDir) {
+		return false
+	}
+
+	gitRoot := gitRootOf(workDir)
+	if gitRoot != "" && !samePath(gitRoot, townRoot) {
+		return false
+	}
+	return true
+}
+
+func samePath(a, b string) bool {
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	if errA == nil && errB == nil {
+		return filepath.Clean(absA) == filepath.Clean(absB)
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
+}
+
+// gitRootOf walks up from dir to find the nearest ancestor directory containing
+// a .git entry (file or directory). Returns empty string if none found.
+func gitRootOf(dir string) string {
+	for d := dir; ; d = filepath.Dir(d) {
+		if _, err := os.Stat(filepath.Join(d, ".git")); err == nil {
+			return d
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			return ""
+		}
+	}
 }
 
 type startupPromptSession interface {
@@ -93,9 +196,6 @@ func StartupFallbackCommands(role string, rc *config.RuntimeConfig) []string {
 
 	role = strings.ToLower(role)
 	command := "gt prime"
-	if isAutonomousRole(role) {
-		command += " && gt mail check --inject"
-	}
 	// NOTE: session-started nudge to deacon removed — it interrupted
 	// the deacon's await-signal backoff (exponential sleep). The deacon
 	// already wakes on beads activity via bd activity --follow.
@@ -112,13 +212,6 @@ func RunStartupFallback(t *tmux.Tmux, sessionID, role string, rc *config.Runtime
 		}
 	}
 	return nil
-}
-
-// isAutonomousRole returns true if the given role should automatically
-// inject mail check on startup. Delegates to hookutil.IsAutonomousRole
-// for the single source of truth on role classification.
-func isAutonomousRole(role string) bool {
-	return hookutil.IsAutonomousRole(role)
 }
 
 // DefaultPrimeWaitMs is the default wait time in milliseconds for non-hook agents

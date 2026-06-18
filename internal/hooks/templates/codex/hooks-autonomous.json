@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} prime --hook && {{GT_BIN}} mail check --inject"
+            "command": "{{GT_BIN}} prime --hook"
           }
         ]
       }

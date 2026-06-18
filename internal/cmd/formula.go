@@ -118,7 +118,7 @@ the rig's settings/config.json under workflow.default_formula.
 
 Options:
   --pr=N        Run formula on GitHub PR #N
-  --rig=NAME    Target specific rig (default: current or gastown)
+  --rig=NAME    Target specific rig (default: inferred from cwd, or sole registered rig)
   --agent=ALIAS Override agent/runtime for all legs (e.g., gemini, codex)
   --dry-run     Show what would happen without executing
 
@@ -169,7 +169,7 @@ func init() {
 
 	// Run flags
 	formulaRunCmd.Flags().IntVar(&formulaRunPR, "pr", 0, "GitHub PR number to run formula on")
-	formulaRunCmd.Flags().StringVar(&formulaRunRig, "rig", "", "Target rig (default: current or gastown)")
+	formulaRunCmd.Flags().StringVar(&formulaRunRig, "rig", "", "Target rig (default: inferred from cwd, or sole registered rig)")
 	formulaRunCmd.Flags().BoolVar(&formulaRunDryRun, "dry-run", false, "Preview execution without running")
 	formulaRunCmd.Flags().StringVar(&formulaRunAgent, "agent", "", "Override agent/runtime for all legs (e.g., gemini, codex, claude-haiku)")
 	formulaRunCmd.Flags().StringSliceVar(&formulaRunFiles, "files", nil, "Files to pass to formula legs (available as {{.files}} in templates)")
@@ -232,14 +232,20 @@ func runFormulaRun(cmd *cobra.Command, args []string) error {
 					rigPath = r.Path
 				}
 			}
-			// If we still don't have a target rig but have townRoot, use gastown
+			// Still no rig — auto-select when there is exactly one registered rig,
+			// otherwise surface a helpful error (e.g. Deacon at HQ level on
+			// non-default installs where "gastown" rig does not exist).
 			if targetRig == "" {
-				targetRig = "gastown"
-				rigPath = filepath.Join(townRoot, "gastown")
+				name, path, inferErr := autoInferRig(townRoot)
+				if inferErr != nil {
+					return inferErr
+				}
+				targetRig = name
+				rigPath = path
 			}
 		} else {
-			// No town root found, fall back to gastown without rigPath
-			targetRig = "gastown"
+			// No town root found, cannot determine target rig
+			return fmt.Errorf("cannot determine target rig: not in a Gas Town workspace; use --rig=NAME")
 		}
 	} else {
 		// If rig specified, construct path
@@ -357,13 +363,8 @@ func dryRunFormula(f *formula.Formula, formulaName, targetRig string) error {
 		// Show output directory if configured
 		var outputDir string
 		if f.Output != nil && f.Output.Directory != "" {
-			dirCtx := map[string]interface{}{
-				"review_id":    reviewID,
-				"formula_name": formulaName,
-			}
-			for k, v := range setVars {
-				dirCtx[k] = v
-			}
+			dirCtx := formulaTemplateContext(formulaName, targetDescription, reviewID,
+				formulaRunPR, prTitle, changedFiles, formulaRunFiles, setVars)
 			outputDir = renderTemplateOrDefault(f.Output.Directory, dirCtx, ".reviews/"+reviewID)
 			fmt.Printf("\n  Output directory: %s\n", outputDir)
 		}
@@ -372,23 +373,13 @@ func dryRunFormula(f *formula.Formula, formulaName, targetRig string) error {
 		for _, leg := range f.Legs {
 			// Show rendered output path for each leg
 			if f.Output != nil && outputDir != "" {
-				legCtx := map[string]interface{}{
-					"formula_name":       formulaName,
-					"target_description": targetDescription,
-					"review_id":          reviewID,
-					"pr_number":          formulaRunPR,
-					"pr_title":           prTitle,
-					"leg": map[string]interface{}{
-						"id":          leg.ID,
-						"title":       leg.Title,
-						"focus":       leg.Focus,
-						"description": leg.Description,
-					},
-					"changed_files": changedFiles,
-					"files":         formulaRunFiles,
-				}
-				for k, v := range setVars {
-					legCtx[k] = v
+				legCtx := formulaTemplateContext(formulaName, targetDescription, reviewID,
+					formulaRunPR, prTitle, changedFiles, formulaRunFiles, setVars)
+				legCtx["leg"] = map[string]interface{}{
+					"id":          leg.ID,
+					"title":       leg.Title,
+					"focus":       leg.Focus,
+					"description": leg.Description,
 				}
 				legPattern := renderTemplateOrDefault(f.Output.LegPattern, legCtx, leg.ID+"-findings.md")
 				outputPath := filepath.Join(outputDir, legPattern)
@@ -484,10 +475,11 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 
 	createArgs := []string{
 		"create",
-		"--type=convoy",
+		"--type=task",
 		"--id=" + convoyID,
 		"--title=" + convoyTitle,
 		"--description=" + description,
+		"--labels=gt:convoy",
 	}
 	if beads.NeedsForceForID(convoyID) {
 		createArgs = append(createArgs, "--force")
@@ -520,14 +512,14 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 		prTitle, changedFiles = fetchPRInfo(formulaRunPR)
 	}
 
+	// Parse --set key=value pairs for template rendering.
+	setVars := parseSetVars(formulaRunSet)
+
 	// Create output directory if configured
 	var outputDir string
 	if f.Output != nil && f.Output.Directory != "" {
-		// Build minimal context for directory rendering
-		dirCtx := map[string]interface{}{
-			"review_id":    reviewID,
-			"formula_name": formulaName,
-		}
+		dirCtx := formulaTemplateContext(formulaName, targetDescription, reviewID,
+			formulaRunPR, prTitle, changedFiles, formulaRunFiles, setVars)
 		outputDir = renderTemplateOrDefault(f.Output.Directory, dirCtx, ".reviews/"+reviewID)
 
 		// Create the directory
@@ -539,9 +531,6 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 		}
 	}
 
-	// Parse --set key=value pairs for template rendering
-	setVars := parseSetVars(formulaRunSet)
-
 	// Step 2: Create leg beads and track them
 	legBeads := make(map[string]string) // leg.ID -> bead ID
 	for _, leg := range f.Legs {
@@ -552,25 +541,13 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 		if f.Prompts != nil {
 			if basePrompt, ok := f.Prompts["base"]; ok {
 				// Build template context for this leg
-				legCtx := map[string]interface{}{
-					"formula_name":       formulaName,
-					"target_description": targetDescription,
-					"review_id":          reviewID,
-					"pr_number":          formulaRunPR,
-					"pr_title":           prTitle,
-					"leg": map[string]interface{}{
-						"id":          leg.ID,
-						"title":       leg.Title,
-						"focus":       leg.Focus,
-						"description": leg.Description,
-					},
-					"changed_files": changedFiles,
-					"files":         formulaRunFiles,
-				}
-
-				// Inject --set key=value pairs into template context
-				for k, v := range setVars {
-					legCtx[k] = v
+				legCtx := formulaTemplateContext(formulaName, targetDescription, reviewID,
+					formulaRunPR, prTitle, changedFiles, formulaRunFiles, setVars)
+				legCtx["leg"] = map[string]interface{}{
+					"id":          leg.ID,
+					"title":       leg.Title,
+					"focus":       leg.Focus,
+					"description": leg.Description,
 				}
 
 				// Compute output path for this leg
@@ -578,10 +555,7 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 					legPattern := renderTemplateOrDefault(f.Output.LegPattern, legCtx, leg.ID+"-findings.md")
 					outputPath := filepath.Join(outputDir, legPattern)
 					legCtx["output_path"] = outputPath
-					legCtx["output"] = map[string]interface{}{
-						"directory": outputDir,
-						"synthesis": f.Output.Synthesis,
-					}
+					addOutputTemplateContext(legCtx, outputDir, f.Output.Synthesis)
 				}
 
 				// Render the base prompt with template context
@@ -635,6 +609,17 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 		if synDesc == "" {
 			synDesc = "Synthesize findings from all legs into unified output"
 		}
+		synCtx := formulaTemplateContext(formulaName, targetDescription, reviewID,
+			formulaRunPR, prTitle, changedFiles, formulaRunFiles, setVars)
+		if f.Output != nil {
+			addOutputTemplateContext(synCtx, outputDir, f.Output.Synthesis)
+		}
+		if rendered, err := renderTemplate(synDesc, synCtx); err == nil {
+			synDesc = rendered
+		} else {
+			fmt.Printf("%s Failed to render synthesis template: %v\n",
+				style.Dim.Render("Warning:"), err)
+		}
 
 		synArgs := []string{
 			"create",
@@ -686,18 +671,7 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 		// Agent precedence (GH#2118): per-leg > CLI --agent > formula-level
 		legAgent := resolveFormulaLegAgent(leg.Agent, formulaRunAgent, f.Agent)
 
-		// Use gt sling with args for leg-specific context
-		slingArgs := []string{
-			"sling", legBeadID, targetRig,
-			"-a", leg.Description,
-			"-s", leg.Title,
-		}
-		if legAgent != "" {
-			slingArgs = append(slingArgs, "--agent", legAgent)
-		}
-		if leg.ReviewOnly || f.ReviewOnly {
-			slingArgs = append(slingArgs, "--review-only")
-		}
+		slingArgs := buildConvoyLegSlingArgs(legBeadID, targetRig, leg.Description, leg.Title, legAgent, leg.ReviewOnly || f.ReviewOnly)
 
 		slingCmd := exec.Command("gt", slingArgs...)
 		slingCmd.Stdout = os.Stdout
@@ -776,10 +750,11 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 
 	createArgs := []string{
 		"create",
-		"--type=convoy", // reuse convoy type for workflow tracking
+		"--type=task",
 		"--id=" + workflowID,
 		"--title=" + workflowTitle,
 		"--description=" + description,
+		"--labels=gt:convoy,gt:workflow",
 	}
 	if beads.NeedsForceForID(workflowID) {
 		createArgs = append(createArgs, "--force")
@@ -906,14 +881,7 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 		stepTarget := workflowStepTarget(step, targetRig)
 		stepDescription := workflowStepDescription(step, substituteFormulaVars(step.Description, setVars))
 
-		slingArgs := []string{
-			"sling", stepBeadID, stepTarget,
-			"-a", stepDescription,
-			"-s", step.Title,
-		}
-		if stepAgent != "" {
-			slingArgs = append(slingArgs, "--agent", stepAgent)
-		}
+		slingArgs := buildWorkflowStepSlingArgs(stepBeadID, stepTarget, stepDescription, step.Title, stepAgent)
 
 		slingCmd := exec.Command("gt", slingArgs...)
 		slingCmd.Stdout = os.Stdout
@@ -980,6 +948,41 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen-3] + "..."
 }
 
+// buildConvoyLegSlingArgs constructs the gt-sling argument list for a convoy leg.
+// --no-convoy is always included: legs are tracked by the parent convoy, so per-leg
+// auto-convoy creation is redundant (closes #3856).
+func buildConvoyLegSlingArgs(beadID, targetRig, description, title, agent string, reviewOnly bool) []string {
+	args := []string{
+		"sling", beadID, targetRig,
+		"-a", description,
+		"-s", title,
+		"--no-convoy",
+	}
+	if agent != "" {
+		args = append(args, "--agent", agent)
+	}
+	if reviewOnly {
+		args = append(args, "--review-only")
+	}
+	return args
+}
+
+// buildWorkflowStepSlingArgs constructs the gt-sling argument list for a workflow step.
+// --no-convoy is always included: steps are tracked by the parent workflow bead, so
+// per-step auto-convoy creation is redundant (closes #3856).
+func buildWorkflowStepSlingArgs(beadID, targetRig, description, title, agent string) []string {
+	args := []string{
+		"sling", beadID, targetRig,
+		"-a", description,
+		"-s", title,
+		"--no-convoy",
+	}
+	if agent != "" {
+		args = append(args, "--agent", agent)
+	}
+	return args
+}
+
 // parseSetVars parses --set key=value pairs into a map for template rendering.
 func parseSetVars(setArgs []string) map[string]interface{} {
 	vars := make(map[string]interface{})
@@ -989,6 +992,29 @@ func parseSetVars(setArgs []string) map[string]interface{} {
 		}
 	}
 	return vars
+}
+
+func formulaTemplateContext(formulaName, targetDescription, reviewID string, prNumber int, prTitle string, changedFiles []map[string]interface{}, files []string, setVars map[string]interface{}) map[string]interface{} {
+	ctx := map[string]interface{}{
+		"formula_name":       formulaName,
+		"target_description": targetDescription,
+		"review_id":          reviewID,
+		"pr_number":          prNumber,
+		"pr_title":           prTitle,
+		"changed_files":      changedFiles,
+		"files":              files,
+	}
+	for k, v := range setVars {
+		ctx[k] = v
+	}
+	return ctx
+}
+
+func addOutputTemplateContext(ctx map[string]interface{}, outputDir, synthesisFile string) {
+	ctx["output"] = map[string]interface{}{
+		"directory": outputDir,
+		"synthesis": synthesisFile,
+	}
 }
 
 var formulaVarPlaceholder = regexp.MustCompile(`\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}`)

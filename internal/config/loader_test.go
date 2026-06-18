@@ -1,7 +1,9 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -3030,7 +3032,7 @@ func TestFillRuntimeDefaults(t *testing.T) {
 			Provider:      "codex",
 			Command:       "opencode",
 			Args:          []string{"-m", "gpt-5"},
-			Env:           map[string]string{"OPENCODE_PERMISSION": `{"*":"allow"}`},
+			Env:           map[string]string{"OPENCODE_PERMISSION": `{"*":"allow"}`, "OPENCODE_CONFIG_CONTENT": `{"lsp":false}`},
 			InitialPrompt: "test prompt",
 			PromptMode:    "none",
 			ResolvedAgent: "opencode",
@@ -3061,6 +3063,9 @@ func TestFillRuntimeDefaults(t *testing.T) {
 		}
 		if result.Env["OPENCODE_PERMISSION"] != input.Env["OPENCODE_PERMISSION"] {
 			t.Errorf("Env: got %v, want %v", result.Env, input.Env)
+		}
+		if result.Env["OPENCODE_CONFIG_CONTENT"] != input.Env["OPENCODE_CONFIG_CONTENT"] {
+			t.Errorf("OPENCODE_CONFIG_CONTENT was not preserved: got %v, want %v", result.Env, input.Env)
 		}
 		if result.InitialPrompt != input.InitialPrompt {
 			t.Errorf("InitialPrompt: got %q, want %q", result.InitialPrompt, input.InitialPrompt)
@@ -3650,6 +3655,9 @@ func TestLookupAgentConfigPreservesCustomFields(t *testing.T) {
 	if rc.Env["OPENCODE_PERMISSION"] != `{"*":"allow"}` {
 		t.Errorf("Env was not preserved: got %v", rc.Env)
 	}
+	if rc.Env["OPENCODE_CONFIG_CONTENT"] != `{"lsp":true}` {
+		t.Errorf("OpenCode LSP default missing: got %v", rc.Env)
+	}
 	if rc.Tmux == nil || len(rc.Tmux.ProcessNames) != 2 {
 		t.Errorf("Tmux.ProcessNames not preserved: got %+v", rc.Tmux)
 	}
@@ -3674,6 +3682,167 @@ func TestBuildCommandWithPromptRespectsPromptModeNone(t *testing.T) {
 	}
 	if !strings.HasPrefix(cmd, "opencode") {
 		t.Errorf("Command should start with opencode, got: %s", cmd)
+	}
+}
+
+// captureStderr redirects os.Stderr for the duration of fn and returns what was written.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create pipe: %v", err)
+	}
+	os.Stderr = w
+	fn()
+	_ = w.Close()
+	os.Stderr = old
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatalf("read stderr: %v", err)
+	}
+	_ = r.Close()
+	return buf.String()
+}
+
+// TestBuildCommandWithPromptWarnsOnDroppedPrompt verifies that when PromptMode
+// is "none" and a non-empty prompt is provided, a warning is emitted to stderr.
+// This makes the misconfiguration self-diagnosing (issue #3803).
+func TestBuildCommandWithPromptWarnsOnDroppedPrompt(t *testing.T) {
+	rc := &RuntimeConfig{
+		Command:    "claude",
+		Args:       []string{"--dangerously-skip-permissions"},
+		PromptMode: "none",
+	}
+
+	var cmd string
+	stderr := captureStderr(t, func() {
+		cmd = rc.BuildCommandWithPrompt("[GAS TOWN] deacon <- daemon • patrol")
+	})
+
+	if strings.Contains(cmd, "GAS TOWN") {
+		t.Errorf("prompt_mode=none should prevent prompt from appearing in command, got: %s", cmd)
+	}
+	if !strings.Contains(stderr, "warning:") {
+		t.Errorf("expected a warning on stderr when prompt is dropped, got: %q", stderr)
+	}
+	if !strings.Contains(stderr, "prompt_mode") {
+		t.Errorf("warning should mention prompt_mode, got: %q", stderr)
+	}
+	if !strings.Contains(stderr, `"claude"`) {
+		t.Errorf("warning should include the agent command name, got: %q", stderr)
+	}
+}
+
+// TestBuildCommandWithPromptNoWarnOnEmptyPrompt verifies that no warning is
+// emitted when the prompt is empty (that is the normal PromptMode:"none" use case).
+func TestBuildCommandWithPromptNoWarnOnEmptyPrompt(t *testing.T) {
+	rc := &RuntimeConfig{
+		Command:    "codex",
+		Args:       []string{},
+		PromptMode: "none",
+	}
+
+	stderr := captureStderr(t, func() {
+		_ = rc.BuildCommandWithPrompt("")
+	})
+
+	if stderr != "" {
+		t.Errorf("no warning expected when prompt is empty, got: %q", stderr)
+	}
+}
+
+func TestCodexBuildCommandWithPromptIncludesBootstrapPrompt(t *testing.T) {
+	rc := RuntimeConfigFromPreset(AgentCodex)
+
+	var cmd string
+	stderr := captureStderr(t, func() {
+		cmd = rc.BuildCommandWithPrompt("bootstrap now")
+	})
+
+	if stderr != "" {
+		t.Errorf("no warning expected for codex prompt delivery, got: %q", stderr)
+	}
+	if !strings.Contains(cmd, "bootstrap now") {
+		t.Errorf("codex startup command should include bootstrap prompt, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, codexUpdateCheckConfig) {
+		t.Errorf("codex startup command should suppress update checks, got: %s", cmd)
+	}
+}
+
+func TestFillRuntimeDefaultsCodexCustomArgsSuppressesUpdateCheck(t *testing.T) {
+	rc := fillRuntimeDefaults(&RuntimeConfig{
+		Provider: "codex",
+		Command:  "codex",
+		Args:     []string{"--profile", "fast"},
+	})
+
+	args := strings.Join(rc.Args, " ")
+	if !strings.Contains(args, codexUpdateCheckConfig) {
+		t.Fatalf("codex custom args missing update suppression: %v", rc.Args)
+	}
+	if strings.Count(args, "check_for_update_on_startup") != 1 {
+		t.Fatalf("codex update suppression duplicated: %v", rc.Args)
+	}
+}
+
+func TestFillRuntimeDefaultsCodexDoesNotOverrideExplicitUpdateCheck(t *testing.T) {
+	rc := fillRuntimeDefaults(&RuntimeConfig{
+		Provider: "codex",
+		Command:  "codex",
+		Args:     []string{"-c", "check_for_update_on_startup=true"},
+	})
+
+	args := strings.Join(rc.Args, " ")
+	if strings.Count(args, "check_for_update_on_startup") != 1 {
+		t.Fatalf("explicit codex update config should not be duplicated: %v", rc.Args)
+	}
+	if !strings.Contains(args, "check_for_update_on_startup=true") {
+		t.Fatalf("explicit codex update config should be preserved: %v", rc.Args)
+	}
+}
+
+func TestFillRuntimeDefaultsCodexIgnoresUnrelatedUpdateCheckSubstring(t *testing.T) {
+	rc := fillRuntimeDefaults(&RuntimeConfig{
+		Provider: "codex",
+		Command:  "codex",
+		Args:     []string{"--profile=check_for_update_on_startup-note"},
+	})
+
+	found := false
+	for _, arg := range rc.Args {
+		if arg == codexUpdateCheckConfig {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("codex update suppression should be injected despite unrelated substring: %v", rc.Args)
+	}
+}
+
+// TestBuildArgsWithPromptWarnsOnDroppedPrompt verifies the parallel warning in
+// BuildArgsWithPrompt when PromptMode is "none" and a non-empty prompt is provided.
+func TestBuildArgsWithPromptWarnsOnDroppedPrompt(t *testing.T) {
+	rc := &RuntimeConfig{
+		Command:    "claude",
+		Args:       []string{"--dangerously-skip-permissions"},
+		PromptMode: "none",
+	}
+
+	var args []string
+	stderr := captureStderr(t, func() {
+		args = rc.BuildArgsWithPrompt("[GAS TOWN] deacon <- daemon • patrol")
+	})
+
+	for _, arg := range args {
+		if strings.Contains(arg, "GAS TOWN") {
+			t.Errorf("prompt_mode=none should prevent prompt appearing in args, got: %v", args)
+		}
+	}
+	if !strings.Contains(stderr, "warning:") {
+		t.Errorf("expected a warning on stderr when prompt is dropped, got: %q", stderr)
 	}
 }
 
@@ -5671,5 +5840,64 @@ func TestBuildStartupCommandWithAgentOverride_NoDoubleSettingsOnNonOverridePath(
 	}
 	if count == 0 {
 		t.Errorf("default Claude agent on polecat role should still get --settings, got: %q", cmd)
+	}
+}
+
+func TestResolveAgentConfigWithOverrideSetsResolvedAgent(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	if err := SaveTownSettings(TownSettingsPath(townRoot), NewTownSettings()); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	for _, agentName := range []string{"opencode", "gemini", "codex", "claude", "copilot"} {
+		rc, resolvedAgent, err := ResolveAgentConfigWithOverride(townRoot, rigPath, agentName)
+		if err != nil {
+			t.Fatalf("ResolveAgentConfigWithOverride(%q): %v", agentName, err)
+		}
+		if resolvedAgent != agentName {
+			t.Errorf("resolved agent for %q: got %q, want %q", agentName, resolvedAgent, agentName)
+		}
+		if rc.ResolvedAgent != agentName {
+			t.Errorf("RuntimeConfig.ResolvedAgent for %q: got %q, want %q", agentName, rc.ResolvedAgent, agentName)
+		}
+	}
+}
+
+func TestBuildStartupCommandWithAgentOverrideSetsGTAgentForOpenCode(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+
+	if err := SaveTownSettings(TownSettingsPath(townRoot), NewTownSettings()); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	cmd, err := BuildStartupCommandWithAgentOverride(
+		map[string]string{"GT_ROLE": constants.RolePolecat},
+		rigPath,
+		"[GAS TOWN] test polecat beacon",
+		"opencode",
+	)
+	if err != nil {
+		t.Fatalf("BuildStartupCommandWithAgentOverride: %v", err)
+	}
+
+	if !strings.Contains(cmd, "GT_AGENT=opencode") {
+		t.Errorf("expected GT_AGENT=opencode in command, got: %q", cmd)
+	}
+	if !strings.Contains(cmd, "GT_PROCESS_NAMES=opencode") {
+		t.Errorf("expected GT_PROCESS_NAMES=opencode in command, got: %q", cmd)
+	}
+	if strings.Contains(cmd, "--settings") {
+		t.Errorf("opencode should not get Claude --settings, got: %q", cmd)
 	}
 }

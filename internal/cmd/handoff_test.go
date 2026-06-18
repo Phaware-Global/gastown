@@ -176,6 +176,86 @@ func TestBuildRestartCommand_UsesRoleAgentsWhenNoAgentOverride(t *testing.T) {
 	}
 }
 
+func TestBuildRestartCommand_MergesAgentPresetEnv(t *testing.T) {
+	// Regression test: ensure agent preset Env block (config.json [agents.X.env])
+	// is fully merged into the respawn command, not just NODE_OPTIONS.
+	// Without this, custom env vars like ANTHROPIC_BASE_URL configured for
+	// proxied Claude were silently dropped on handoff/respawn.
+	setupHandoffTestRegistry(t)
+
+	origCwd, _ := os.Getwd()
+	origGTAgent := os.Getenv("GT_AGENT")
+	origTownRoot := os.Getenv("GT_TOWN_ROOT")
+	origRoot := os.Getenv("GT_ROOT")
+
+	townRoot := t.TempDir()
+
+	t.Cleanup(func() {
+		_ = os.Chdir(origCwd)
+		_ = os.Setenv("GT_AGENT", origGTAgent)
+		_ = os.Setenv("GT_TOWN_ROOT", origTownRoot)
+		_ = os.Setenv("GT_ROOT", origRoot)
+	})
+	rigPath := filepath.Join(townRoot, "gastown")
+	witnessDir := filepath.Join(rigPath, "witness")
+
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	if err := os.MkdirAll(witnessDir, 0755); err != nil {
+		t.Fatalf("mkdir witness dir: %v", err)
+	}
+
+	townSettings := config.NewTownSettings()
+	townSettings.DefaultAgent = "claude-proxy"
+	townSettings.Agents = map[string]*config.RuntimeConfig{
+		"claude-proxy": {
+			Command: "claude",
+			Args:    []string{"--dangerously-skip-permissions"},
+			Env: map[string]string{
+				"ANTHROPIC_BASE_URL":       "http://localhost:8080",
+				"CLAUDE_CODE_OAUTH_TOKEN":  "placeholder",
+				"ANTHROPIC_CUSTOM_HEADERS": "Authorization: Bearer prx_test",
+			},
+		},
+	}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), config.NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	_ = os.Setenv("GT_AGENT", "claude-proxy")
+	_ = os.Setenv("GT_TOWN_ROOT", "")
+	_ = os.Setenv("GT_ROOT", "")
+	if err := os.Chdir(witnessDir); err != nil {
+		t.Fatalf("chdir witness dir: %v", err)
+	}
+
+	cmd, err := buildRestartCommand("gt-witness")
+	if err != nil {
+		t.Fatalf("buildRestartCommand: %v", err)
+	}
+
+	wantEnv := map[string]string{
+		"ANTHROPIC_BASE_URL":       "http://localhost:8080",
+		"CLAUDE_CODE_OAUTH_TOKEN":  "placeholder",
+		"ANTHROPIC_CUSTOM_HEADERS": "Authorization: Bearer prx_test",
+	}
+	for k, v := range wantEnv {
+		if !strings.Contains(cmd, k+"=") {
+			t.Errorf("agent preset env %q not exported in restart command\ncmd: %s", k, cmd)
+		}
+		if !strings.Contains(cmd, v) {
+			t.Errorf("agent preset env value for %q (%q) missing in restart command\ncmd: %s", k, v, cmd)
+		}
+	}
+}
+
 func TestBuildRestartCommandWithOpts_ContinuePrompt(t *testing.T) {
 	setupHandoffTestRegistry(t)
 
@@ -462,6 +542,22 @@ func TestHandoffPolecatEnvCheck(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			binDir := t.TempDir()
+			gtLog := filepath.Join(t.TempDir(), "gt.log")
+			_ = writeBDStub(t, binDir, "#!/bin/sh\nexit 0\n", "@echo off\r\nexit /b 0\r\n")
+			gtStub := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"" + gtLog + "\"\nprintf 'stub gt %s\\n' \"$*\"\nexit 0\n"
+			if err := os.WriteFile(filepath.Join(binDir, "gt"), []byte(gtStub), 0755); err != nil {
+				t.Fatalf("write gt stub: %v", err)
+			}
+			gtCmdStub := "@echo off\r\necho %* >> \"" + gtLog + "\"\r\necho stub gt %*\r\nexit /b 0\r\n"
+			if err := os.WriteFile(filepath.Join(binDir, "gt.cmd"), []byte(gtCmdStub), 0644); err != nil {
+				t.Fatalf("write gt.cmd stub: %v", err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			isolatedRoot := t.TempDir()
+			t.Setenv("GT_TOWN_ROOT", isolatedRoot)
+			t.Setenv("GT_ROOT", isolatedRoot)
+			t.Chdir(isolatedRoot)
 			t.Setenv("GT_ROLE", tt.role)
 			t.Setenv("GT_POLECAT", tt.polecat)
 			// Ensure deterministic non-tmux execution so the non-polecat
@@ -503,6 +599,11 @@ func TestHandoffPolecatEnvCheck(t *testing.T) {
 				} else {
 					t.Errorf("unexpected polecat redirect with GT_ROLE=%q GT_POLECAT=%q; output: %s", tt.role, tt.polecat, output)
 				}
+			}
+			gtLogBytes, _ := os.ReadFile(gtLog)
+			stubRan := strings.Contains(string(gtLogBytes), "done --status DEFERRED")
+			if stubRan != tt.wantBlock {
+				t.Errorf("gt stub ran = %v, want %v; log: %s", stubRan, tt.wantBlock, gtLogBytes)
 			}
 		})
 	}

@@ -168,6 +168,57 @@ const beadsModulePath = "github.com/steveyegge/beads"
 
 var semverPattern = regexp.MustCompile(`v?(\d+\.\d+\.\d+)`)
 
+func daemonPathCandidates(home, exePath string) []string {
+	candidates := make([]string, 0, 5)
+	if exePath != "" {
+		candidates = append(candidates, filepath.Dir(exePath))
+	}
+	if home != "" {
+		candidates = append(candidates,
+			filepath.Join(home, ".local/bin"),
+			filepath.Join(home, "bin"),
+		)
+	}
+	return append(candidates,
+		"/opt/homebrew/bin",
+		"/usr/local/bin",
+	)
+}
+
+func augmentDaemonPath(logger *log.Logger) {
+	exePath := ""
+	if exe, err := os.Executable(); err == nil {
+		exePath = exe
+	}
+	extras := daemonPathCandidates(os.Getenv("HOME"), exePath)
+	if len(extras) == 0 {
+		return
+	}
+
+	current := os.Getenv("PATH")
+	parts := strings.Split(current, string(os.PathListSeparator))
+	seen := make(map[string]struct{}, len(parts)+len(extras))
+	for _, p := range parts {
+		seen[p] = struct{}{}
+	}
+	additions := make([]string, 0, len(extras))
+	for _, extra := range extras {
+		if _, ok := seen[extra]; ok {
+			continue
+		}
+		if info, statErr := os.Stat(extra); statErr == nil && info.IsDir() {
+			additions = append(additions, extra)
+			seen[extra] = struct{}{}
+		}
+	}
+	augmented := append(additions, parts...)
+	newPath := strings.Join(augmented, string(os.PathListSeparator))
+	if newPath != current {
+		_ = os.Setenv("PATH", newPath)
+		logger.Printf("PATCH-007: augmented daemon PATH with user/local bin dirs (was=%q, now=%q)", current, newPath)
+	}
+}
+
 var cleanupLegacySocketsForDaemon = func(townRoot string) (int, int) {
 	defaultCleaned := session.CleanupLegacyDefaultSocket()
 	baseCleaned := session.CleanupLegacyBaseSocket(townRoot)
@@ -193,6 +244,12 @@ func New(config *Config) (*Daemon, error) {
 
 	logger := log.New(logWriter, "", log.LstdFlags)
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// PATCH-007 (hq-olcb): Augment PATH with common user/local bin
+	// directories before any subprocess lookup. The daemon is often launched
+	// from systemd / login shells / launchd without user-installed tool dirs
+	// such as ~/.local/bin or /opt/homebrew/bin.
+	augmentDaemonPath(logger)
 
 	// Initialize session prefix and agent registries from town root.
 	if err := session.InitRegistry(config.TownRoot); err != nil {
@@ -291,49 +348,6 @@ func New(config *Config) (*Daemon, error) {
 	}
 
 	// PATCH-006: Resolve binary paths at startup.
-	//
-	// PATCH-007 (hq-olcb): Augment PATH with common user/local bin
-	// directories before LookPath. The daemon is often launched from a
-	// systemd unit / login shell whose PATH does not include
-	// ~/.local/bin, where pip-installed `bd` and user-installed `gt`
-	// typically live. Without this, both LookPath calls fail at
-	// startup → gtPath / bdPath fall back to literal names → every
-	// subsequent exec.Command(d.gtPath, ...) fails with "executable
-	// file not found in $PATH", which cascaded into stranded convoys
-	// (couldn't query rig beads), failed dog dispatches (wisp_reaper
-	// fell back to inline mode), and likely upstream of hq-we9c
-	// (reaper false-positives, since the polecat-has-work check uses
-	// these binaries). Augmenting the daemon's own PATH propagates to
-	// child processes via bdReadOnlyEnv()'s os.Environ() pass-through.
-	if home := os.Getenv("HOME"); home != "" {
-		extras := []string{
-			filepath.Join(home, ".local/bin"),
-			filepath.Join(home, "bin"),
-			"/usr/local/bin",
-		}
-		current := os.Getenv("PATH")
-		parts := strings.Split(current, string(os.PathListSeparator))
-		seen := make(map[string]struct{}, len(parts)+len(extras))
-		for _, p := range parts {
-			seen[p] = struct{}{}
-		}
-		augmented := parts
-		for _, extra := range extras {
-			if _, ok := seen[extra]; ok {
-				continue
-			}
-			if info, statErr := os.Stat(extra); statErr == nil && info.IsDir() {
-				augmented = append([]string{extra}, augmented...)
-				seen[extra] = struct{}{}
-			}
-		}
-		newPath := strings.Join(augmented, string(os.PathListSeparator))
-		if newPath != current {
-			_ = os.Setenv("PATH", newPath)
-			logger.Printf("PATCH-007: augmented daemon PATH with user bin dirs (was=%q, now=%q)", current, newPath)
-		}
-	}
-
 	gtPath, err := exec.LookPath("gt")
 	if err != nil {
 		gtPath = "gt"
@@ -1363,6 +1377,17 @@ func (d *Daemon) ensureBootRunning() {
 	}
 
 	b := boot.New(d.config.TownRoot)
+
+	// Idle suppression: if Boot's last run found deacon healthy ("nothing"),
+	// suppress spawning for longer to avoid burning API calls. (fixes gt-qu883c)
+	idleSuppression := d.loadOperationalConfig().GetDaemonConfig().BootIdleSuppressionD()
+	if status, err := b.LoadStatus(); err == nil && status.LastAction == "nothing" {
+		if !status.CompletedAt.IsZero() && time.Since(status.CompletedAt) < idleSuppression {
+			d.logger.Printf("Boot last reported 'nothing' %s ago, within idle suppression (%s), skipping",
+				time.Since(status.CompletedAt).Round(time.Second), idleSuppression)
+			return
+		}
+	}
 
 	// Check for degraded mode
 	degraded := os.Getenv("GT_DEGRADED") == "true"
@@ -2859,7 +2884,7 @@ func (d *Daemon) isBeadClosed(beadID string) bool {
 	cmd := exec.Command(d.bdPath, "show", beadID, "--json") //nolint:gosec // G204: args are constructed internally
 	setSysProcAttr(cmd)
 	cmd.Dir = d.config.TownRoot
-	cmd.Env = bdReadOnlyEnv()
+	cmd.Env = bdReadOnlyRoutingEnv(d.config.TownRoot)
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -2886,13 +2911,14 @@ func (d *Daemon) hasAssignedOpenWork(rigName, assignee string) bool {
 	rigDir := beads.GetRigDirForName(d.config.TownRoot, rigName)
 
 	for _, status := range []string{"hooked", "in_progress", "open"} {
-		args := []string{"list", "--assignee=" + assignee, "--status=" + status, "--json"}
-		if rigDir != "" {
-			args = append(args, "--repo="+rigDir)
-		}
+		args := beads.InjectFlatForListJSON([]string{"list", "--assignee=" + assignee, "--status=" + status, "--json"})
 		cmd := exec.Command(d.bdPath, args...) //nolint:gosec // G204: args are constructed internally
 		cmd.Dir = d.config.TownRoot
-		cmd.Env = bdReadOnlyEnv()
+		if rigDir != "" {
+			cmd.Env = bdReadOnlyPinnedEnv(beads.ResolveBeadsDir(rigDir))
+		} else {
+			cmd.Env = bdReadOnlyRoutingEnv(d.config.TownRoot)
+		}
 		output, err := cmd.Output()
 		if err != nil {
 			continue
@@ -3009,7 +3035,7 @@ func (d *Daemon) reapIdlePolecat(rigName, polecatName string, timeout time.Durat
 			// Use 3x threshold (not 2x) to avoid killing polecats during transient
 			// infrastructure degradation when the agent process is alive but not
 			// detectable (e.g. long thinking sessions, slow process inspection).
-			if staleDuration >= timeout*3 || !d.tmux.IsAgentRunning(sessionName) && staleDuration >= timeout*2 {
+			if staleDuration >= timeout*3 || !d.tmux.IsAgentAlive(sessionName) && staleDuration >= timeout*2 {
 				d.killIdlePolecat(rigName, polecatName, sessionName, staleDuration, timeout, "working-bead-lookup-failed")
 			}
 			return
@@ -3037,7 +3063,7 @@ func (d *Daemon) reapIdlePolecat(rigName, polecatName string, timeout time.Durat
 		// No hooked work + stale heartbeat — but check if the agent process
 		// is still actively running before reaping. A failed gt sling rollback
 		// can clear the hook while the agent is still working (GH#3342).
-		if d.tmux.IsAgentRunning(sessionName) {
+		if d.tmux.IsAgentAlive(sessionName) {
 			return
 		}
 		d.killIdlePolecat(rigName, polecatName, sessionName, staleDuration, timeout, "working-no-hook")
@@ -3143,7 +3169,7 @@ func (d *Daemon) dispatchQueuedWork() {
 	cmd := exec.CommandContext(ctx, "gt", "scheduler", "run")
 	setSysProcAttr(cmd)
 	cmd.Dir = d.config.TownRoot
-	cmd.Env = append(os.Environ(), "GT_DAEMON=1", "BD_DOLT_AUTO_COMMIT=off")
+	cmd.Env = append(beads.BuildMutationRoutingBDEnv(os.Environ(), filepath.Join(d.config.TownRoot, ".beads")), "GT_DAEMON=1")
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
 		d.logger.Printf("Scheduler dispatch timed out after 5m")

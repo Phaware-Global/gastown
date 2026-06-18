@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"sort"
 	"strings"
 	"time"
@@ -230,7 +229,11 @@ func runConvoyStage(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("cannot resolve bead %s: %w", arg, err)
 		}
-		beadTypes[arg] = result.IssueType
+		if isConvoyIssue(result.IssueType, result.Labels) {
+			beadTypes[arg] = "convoy"
+		} else {
+			beadTypes[arg] = result.IssueType
+		}
 		beadResults[arg] = result
 	}
 
@@ -528,18 +531,9 @@ func findOverlappingConvoys(slingableIDs []string) ([]overlappingConvoy, error) 
 		return nil, err
 	}
 
-	// List all convoys (--all includes every status).
-	out, err := runBdJSON(townBeads, "list", "--type=convoy", "--all", "--json")
+	convoys, err := listConvoyIssues(townBeads, "", true)
 	if err != nil {
 		return nil, fmt.Errorf("listing convoys: %w", err)
-	}
-
-	var convoys []struct {
-		ID     string `json:"id"`
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal(out, &convoys); err != nil {
-		return nil, fmt.Errorf("parsing convoy list: %w", err)
 	}
 
 	// Build set of slingable IDs for fast lookup.
@@ -713,10 +707,11 @@ func createStagedConvoy(dag *ConvoyDAG, waves []Wave, status string, title strin
 	// Create the convoy via bd create in town beads, then set status via bd update.
 	createArgs := []string{
 		"create",
-		"--type=convoy",
+		"--type=task",
 		"--id=" + convoyID,
 		"--title=" + title,
 		"--description=" + description,
+		"--labels=gt:convoy",
 	}
 	if beads.NeedsForceForID(convoyID) {
 		createArgs = append(createArgs, "--force")
@@ -1415,10 +1410,11 @@ func buildGatedJSON(gated []GatedTask, dag *ConvoyDAG) []GatedTaskJSON {
 
 // bdShowResult matches the JSON output of `bd show <id> --json`.
 type bdShowResult struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	Status    string `json:"status"`
-	IssueType string `json:"issue_type"`
+	ID        string   `json:"id"`
+	Title     string   `json:"title"`
+	Status    string   `json:"status"`
+	IssueType string   `json:"issue_type"`
+	Labels    []string `json:"labels"`
 }
 
 // bdDepResult matches the JSON output of `bd dep list <id> --json`.
@@ -1434,16 +1430,14 @@ type bdDepResult struct {
 // bd shell-out helpers
 // ---------------------------------------------------------------------------
 
+func runBdJSONForBead(beadID string, args ...string) ([]byte, error) {
+	return runBdJSON(resolveBeadDir(beadID), args...)
+}
+
 // bdShow runs `bd show <id> --json` and returns the parsed bead info.
 // Returns error if bd exits non-zero or returns no results.
 func bdShow(beadID string) (*bdShowResult, error) {
-	cmd := exec.Command("bd", "show", beadID, "--json")
-	// Route to the correct rig database via prefix resolution.
-	if dir := resolveBeadDir(beadID); dir != "" && dir != "." {
-		cmd.Dir = dir
-		cmd.Env = filterEnvKey(os.Environ(), "BEADS_DIR")
-	}
-	out, err := cmd.Output()
+	out, err := runBdJSONForBead(beadID, "show", beadID, "--json")
 	if err != nil {
 		return nil, fmt.Errorf("bd show %s: %w", beadID, err)
 	}
@@ -1463,13 +1457,7 @@ func bdShow(beadID string) (*bdShowResult, error) {
 // bd dep list returns the beads that <id> depends on. Each result's
 // DependsOnID is the dependency target; IssueID is set to <id> by this func.
 func bdDepList(beadID string) ([]bdDepResult, error) {
-	cmd := exec.Command("bd", "dep", "list", beadID, "--json")
-	// Route to the correct rig database via prefix resolution.
-	if dir := resolveBeadDir(beadID); dir != "" && dir != "." {
-		cmd.Dir = dir
-		cmd.Env = filterEnvKey(os.Environ(), "BEADS_DIR")
-	}
-	out, err := cmd.Output()
+	out, err := runBdJSONForBead(beadID, "dep", "list", beadID, "--json")
 	if err != nil {
 		return nil, fmt.Errorf("bd dep list %s: %w", beadID, err)
 	}
@@ -1498,17 +1486,7 @@ func bdDepList(beadID string) ([]bdDepResult, error) {
 // `bd list --parent` doesn't see children that were added via `bd dep add ...
 // --type=parent-child`. The deps table is authoritative.
 func bdListChildren(parentID string) ([]bdShowResult, error) {
-	cmd := exec.Command("bd", "list", "--parent="+parentID, "--json")
-	// Route to the correct rig database via prefix resolution.
-	// resolveBeadDir returns the parent of .beads (the working directory bd
-	// expects), unlike beadsDirForID which returns the .beads directory itself.
-	// Also strip BEADS_DIR to prevent inherited overrides from interfering
-	// with bd's workspace detection (consistent with bdShow/bdDepList).
-	if dir := resolveBeadDir(parentID); dir != "" && dir != "." {
-		cmd.Dir = dir
-		cmd.Env = filterEnvKey(os.Environ(), "BEADS_DIR")
-	}
-	out, err := cmd.Output()
+	out, err := runBdJSONForBead(parentID, "list", "--parent="+parentID, "--json")
 	if err != nil {
 		return nil, fmt.Errorf("bd list --parent=%s: %w", parentID, err)
 	}

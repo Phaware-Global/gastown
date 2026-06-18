@@ -123,11 +123,10 @@ func TestPatrolFormulasHaveReportCycle(t *testing.T) {
 }
 
 // TestPatrolFormulasHaveWispGC verifies that all three patrol formulas
-// include `bd mol wisp gc` in their inbox-check step to clean up stale
-// wisps from abnormal exits in previous cycles.
+// include `bd mol wisp gc` in their inbox-check step for safe cleanup.
 //
-// Without this, patrol agents that die/restart abnormally before reaching
-// the loop-or-exit squash step leave their wisps open indefinitely.
+// Closed-wisp cleanup is safe inside active patrols. Stale open-wisp cleanup
+// belongs to reaper paths that are not running inside the active patrol molecule.
 //
 // Regression test for steveyegge/gastown#1712.
 func TestPatrolFormulasHaveWispGC(t *testing.T) {
@@ -169,6 +168,40 @@ func TestPatrolFormulasHaveWispGC(t *testing.T) {
 					name)
 			}
 		})
+	}
+}
+
+// TestDeaconPatrolDoesNotRunAgeBasedWispGC verifies that the Deacon patrol
+// does not reap open step wisps from its own active patrol molecule.
+//
+// Regression test for hq-3pp.
+func TestDeaconPatrolDoesNotRunAgeBasedWispGC(t *testing.T) {
+	content, err := formulasFS.ReadFile("formulas/mol-deacon-patrol.formula.toml")
+	if err != nil {
+		t.Fatalf("reading deacon patrol formula: %v", err)
+	}
+
+	f, err := Parse(content)
+	if err != nil {
+		t.Fatalf("parsing deacon patrol formula: %v", err)
+	}
+
+	var inboxDesc string
+	for _, step := range f.Steps {
+		if step.ID == "inbox-check" {
+			inboxDesc = step.Description
+			break
+		}
+	}
+	if inboxDesc == "" {
+		t.Fatal("deacon patrol formula: inbox-check step not found or has empty description")
+	}
+
+	if !strings.Contains(inboxDesc, "bd mol wisp gc --closed --force") {
+		t.Fatal("deacon inbox-check must keep closed-wisp cleanup")
+	}
+	if strings.Contains(inboxDesc, "bd mol wisp gc --age") {
+		t.Fatal("deacon inbox-check must not run age-based wisp GC inside the active patrol")
 	}
 }
 
@@ -278,6 +311,7 @@ func TestDeaconPatrolHasHeartbeatSteps(t *testing.T) {
 	// There should be a mid-cycle heartbeat step
 	foundMid := false
 	foundPreAwait := false
+	foundMandatoryHandoff := false
 	for _, step := range f.Steps {
 		if step.ID == "heartbeat-mid" {
 			foundMid = true
@@ -289,6 +323,9 @@ func TestDeaconPatrolHasHeartbeatSteps(t *testing.T) {
 			foundPreAwait = true
 			if !strings.Contains(step.Description, "gt deacon heartbeat") {
 				t.Error("loop-or-exit step must refresh heartbeat before await-signal")
+			}
+			if strings.Contains(step.Description, "gt handoff -s") && strings.Contains(step.Description, "mandatory") {
+				foundMandatoryHandoff = true
 			}
 			heartbeatPos := strings.Index(step.Description, "gt deacon heartbeat \"pre-await checkpoint\"")
 			awaitPos := strings.Index(step.Description, "gt mol step await-signal")
@@ -304,5 +341,8 @@ func TestDeaconPatrolHasHeartbeatSteps(t *testing.T) {
 	}
 	if !foundPreAwait {
 		t.Error("deacon patrol formula must refresh heartbeat again before await-signal")
+	}
+	if !foundMandatoryHandoff {
+		t.Error("deacon patrol formula must require gt handoff after patrol report")
 	}
 }

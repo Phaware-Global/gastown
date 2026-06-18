@@ -184,8 +184,13 @@ func checkDatabaseHealth(port int) []DatabaseHealth {
 	for _, dbName := range productionDBs {
 		dh := DatabaseHealth{Name: dbName}
 
-		dsn := fmt.Sprintf("root@tcp(127.0.0.1:%d)/%s?parseTime=true&timeout=5s&readTimeout=10s",
-			port, dbName)
+		// wa-d6f: socket-first DSN (TCP fallback) to avoid TIME_WAIT churn
+		// from short-lived gt-CLI calls into Dolt.
+		dsn := buildDoltDSN("root", port, dbName, dsnOpts{
+			ParseTime:   true,
+			Timeout:     "5s",
+			ReadTimeout: "10s",
+		})
 		db, err := sql.Open("mysql", dsn)
 		if err != nil {
 			results = append(results, dh)
@@ -232,8 +237,12 @@ func checkPollution(port int) []PollutionRecord {
 	}
 
 	for _, dbName := range productionDBs {
-		dsn := fmt.Sprintf("root@tcp(127.0.0.1:%d)/%s?parseTime=true&timeout=5s&readTimeout=10s",
-			port, dbName)
+		// wa-d6f: socket-first DSN (TCP fallback) — same rationale as above.
+		dsn := buildDoltDSN("root", port, dbName, dsnOpts{
+			ParseTime:   true,
+			Timeout:     "5s",
+			ReadTimeout: "10s",
+		})
 		db, err := sql.Open("mysql", dsn)
 		if err != nil {
 			continue

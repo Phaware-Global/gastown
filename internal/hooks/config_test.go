@@ -464,7 +464,7 @@ func TestComputeExpected(t *testing.T) {
 
 // TestComputeExpectedBackfillsSessionStart reproduces gt-y22: on-disk base
 // created before SessionStart was added to DefaultBase. SessionStart should
-// be backfilled from DefaultBase so settings.json files contain PATH exports.
+// be backfilled from DefaultBase so settings.json files contain startup hooks.
 func TestComputeExpectedBackfillsSessionStart(t *testing.T) {
 	tmpDir := t.TempDir()
 	setTestHome(t, tmpDir)
@@ -495,17 +495,21 @@ func TestComputeExpectedBackfillsSessionStart(t *testing.T) {
 		if len(expected.SessionStart) == 0 {
 			t.Errorf("%s: expected SessionStart to be backfilled from DefaultBase, got none", target)
 		}
-		// Verify PATH= is present (the actual doctor check)
-		hasPath := false
+		// Verify the generated hook uses a resolved gt command, not the stale
+		// export PATH= marker that causes settings to be treated as out-of-date.
+		hasPrime := false
 		for _, entry := range expected.SessionStart {
 			for _, hook := range entry.Hooks {
-				if strings.Contains(hook.Command, "PATH=") {
-					hasPath = true
+				if strings.Contains(hook.Command, "export PATH=") {
+					t.Errorf("%s: SessionStart contains stale export PATH marker: %q", target, hook.Command)
+				}
+				if strings.Contains(hook.Command, "prime --hook") {
+					hasPrime = true
 				}
 			}
 		}
-		if !hasPath {
-			t.Errorf("%s: expected PATH= in SessionStart hooks", target)
+		if !hasPrime {
+			t.Errorf("%s: expected prime --hook in SessionStart hooks", target)
 		}
 		// On-disk Stop should be preserved (not overwritten by DefaultBase)
 		if len(expected.Stop) == 0 {
@@ -608,18 +612,21 @@ func TestComputeExpectedNoBase(t *testing.T) {
 		}
 	}
 
-	// Deacon should get DefaultBase + built-in patrol-formula-guard (same as witness)
+	// Deacon should get DefaultBase + built-in patrol-formula-guard plus anti-batch guards.
 	deacon, err := ComputeExpected("deacon")
 	if err != nil {
 		t.Fatalf("ComputeExpected(deacon) failed: %v", err)
 	}
-	if len(deacon.PreToolUse) < 4 {
-		t.Errorf("expected deacon to have at least 4 PreToolUse hooks from DefaultOverrides (patrol-formula-guard), got %d", len(deacon.PreToolUse))
+	if len(deacon.PreToolUse) < 7 {
+		t.Errorf("expected deacon to have at least 7 PreToolUse hooks from DefaultOverrides (anti-batch + patrol-formula-guard), got %d", len(deacon.PreToolUse))
 	}
 	if len(deacon.SessionStart) != len(defaultBase.SessionStart) {
 		t.Error("expected deacon to inherit SessionStart from DefaultBase")
 	}
 	deaconPatrolMatchers := map[string]bool{
+		"Bash(*for *seq*)":                  false,
+		"Bash(*while true*)":                false,
+		"Bash(*while :*)":                   false,
 		"Bash(*bd mol pour*patrol*)":        false,
 		"Bash(*bd mol pour *mol-witness*)":  false,
 		"Bash(*bd mol pour *mol-deacon*)":   false,
@@ -693,8 +700,38 @@ func TestComputeExpectedWitnessRigSpecific(t *testing.T) {
 	if len(skyWitness.SessionStart) == 0 {
 		t.Error("sky/witness should inherit SessionStart from DefaultBase")
 	}
-	if len(skyWitness.UserPromptSubmit) == 0 {
-		t.Error("sky/witness should inherit UserPromptSubmit (mail-check) from DefaultBase")
+	if len(skyWitness.UserPromptSubmit) != 0 {
+		t.Error("sky/witness should disable UserPromptSubmit mail-check from DefaultBase")
+	}
+}
+
+func TestComputeExpectedPatrolRolesDisableUserPromptMailCheck(t *testing.T) {
+	tmpDir := t.TempDir()
+	setTestHome(t, tmpDir)
+
+	for _, target := range []string{"witness", "refinery", "deacon", "boot", "sky/witness", "sky/refinery"} {
+		t.Run(target, func(t *testing.T) {
+			cfg, err := ComputeExpected(target)
+			if err != nil {
+				t.Fatalf("ComputeExpected(%s): %v", target, err)
+			}
+			if len(cfg.UserPromptSubmit) != 0 {
+				t.Fatalf("%s should disable UserPromptSubmit mail-check, got %+v", target, cfg.UserPromptSubmit)
+			}
+		})
+	}
+}
+
+func TestComputeExpectedPolecatsKeepUserPromptMailCheck(t *testing.T) {
+	tmpDir := t.TempDir()
+	setTestHome(t, tmpDir)
+
+	cfg, err := ComputeExpected("polecats")
+	if err != nil {
+		t.Fatalf("ComputeExpected(polecats): %v", err)
+	}
+	if len(cfg.UserPromptSubmit) == 0 {
+		t.Fatal("polecats should retain UserPromptSubmit mail-check")
 	}
 }
 

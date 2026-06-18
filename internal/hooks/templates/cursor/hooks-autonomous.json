@@ -17,7 +17,7 @@
     ],
     "sessionStart": [
       {
-        "command": "{{GT_BIN}} prime --hook && {{GT_BIN}} mail check --inject"
+        "command": "{{GT_BIN}} prime --hook"
       }
     ],
     "preCompact": [
@@ -27,7 +27,7 @@
     ],
     "beforeSubmitPrompt": [
       {
-        "command": "{{GT_BIN}} mail check --inject"
+        "command": "case \"${GT_ROLE:-}\" in *witness*|*refinery*|deacon*|*boot*) exit 0 ;; *) {{GT_BIN}} mail check --inject ;; esac"
       }
     ],
     "stop": [

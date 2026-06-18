@@ -157,23 +157,39 @@ func TestStartupFallbackCommands_AutonomousRole(t *testing.T) {
 		},
 	}
 
-	autonomousRoles := []string{"polecat", "witness", "refinery", "deacon"}
+	autonomousRoles := []string{"polecat"}
 	for _, role := range autonomousRoles {
 		t.Run(role, func(t *testing.T) {
 			commands := StartupFallbackCommands(role, rc)
 			if commands == nil || len(commands) == 0 {
 				t.Error("StartupFallbackCommands() should return commands for autonomous role")
 			}
-			// Should contain mail check
-			found := false
 			for _, cmd := range commands {
-				if contains(cmd, "mail check --inject") {
-					found = true
-					break
+				if cmd != "gt prime" {
+					t.Fatalf("Commands for %s = %q, want gt prime", role, cmd)
 				}
 			}
-			if !found {
-				t.Errorf("Commands for %s should contain mail check --inject", role)
+		})
+	}
+}
+
+func TestStartupFallbackCommands_PatrolRolesSkipMailInject(t *testing.T) {
+	rc := &config.RuntimeConfig{
+		Hooks: &config.RuntimeHooksConfig{
+			Provider: "none",
+		},
+	}
+
+	for _, role := range []string{"witness", "refinery", "deacon", "boot", "deacon/boot"} {
+		t.Run(role, func(t *testing.T) {
+			commands := StartupFallbackCommands(role, rc)
+			if commands == nil || len(commands) == 0 {
+				t.Fatal("StartupFallbackCommands() should return commands for patrol role")
+			}
+			for _, cmd := range commands {
+				if contains(cmd, "mail check --inject") {
+					t.Fatalf("patrol role %s should not contain startup mail check: %q", role, cmd)
+				}
 			}
 		})
 	}
@@ -612,6 +628,9 @@ func TestEnsureSettingsForRole_GeminiUsesWorkDir(t *testing.T) {
 	// Gemini CLI has no --settings flag; settings must go to workDir (like OpenCode).
 	settingsDir := t.TempDir()
 	workDir := t.TempDir()
+	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0644); err != nil {
+		t.Fatalf("write AGENTS.md: %v", err)
+	}
 
 	rc := &config.RuntimeConfig{
 		Hooks: &config.RuntimeHooksConfig{
@@ -632,6 +651,132 @@ func TestEnsureSettingsForRole_GeminiUsesWorkDir(t *testing.T) {
 	}
 	if _, err := os.Stat(workDir + "/.gemini/settings.json"); err != nil {
 		t.Error("Gemini settings should be in workDir")
+	}
+	target, err := os.Readlink(workDir + "/GEMINI.md")
+	if err != nil {
+		t.Fatalf("Gemini context symlink should exist in workDir: %v", err)
+	}
+	if target != "AGENTS.md" {
+		t.Errorf("GEMINI.md target = %q, want AGENTS.md", target)
+	}
+}
+
+func TestEnsureSettingsForRole_GeminiRepairsBrokenContextSymlink(t *testing.T) {
+	settingsDir := t.TempDir()
+	workDir := t.TempDir()
+	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0644); err != nil {
+		t.Fatalf("write AGENTS.md: %v", err)
+	}
+	if err := os.Symlink("./rig/worktree/AGENTS.md", workDir+"/GEMINI.md"); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	rc := &config.RuntimeConfig{
+		Hooks: &config.RuntimeHooksConfig{
+			Provider:     "gemini",
+			Dir:          ".gemini",
+			SettingsFile: "settings.json",
+		},
+	}
+
+	if err := EnsureSettingsForRole(settingsDir, workDir, "witness", rc); err != nil {
+		t.Fatalf("EnsureSettingsForRole() error = %v", err)
+	}
+
+	target, err := os.Readlink(workDir + "/GEMINI.md")
+	if err != nil {
+		t.Fatalf("read repaired GEMINI.md symlink: %v", err)
+	}
+	if target != "AGENTS.md" {
+		t.Errorf("GEMINI.md target = %q, want AGENTS.md", target)
+	}
+}
+
+func TestEnsureSettingsForRole_GeminiRepairsResolvableAgentsSymlink(t *testing.T) {
+	settingsDir := t.TempDir()
+	workDir := t.TempDir()
+	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0644); err != nil {
+		t.Fatalf("write AGENTS.md: %v", err)
+	}
+	otherDir := t.TempDir()
+	otherAgents := otherDir + "/AGENTS.md"
+	if err := os.WriteFile(otherAgents, []byte("# Other Agents\n"), 0644); err != nil {
+		t.Fatalf("write other AGENTS.md: %v", err)
+	}
+	if err := os.Symlink(otherAgents, workDir+"/GEMINI.md"); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	rc := &config.RuntimeConfig{
+		Hooks: &config.RuntimeHooksConfig{
+			Provider:     "gemini",
+			Dir:          ".gemini",
+			SettingsFile: "settings.json",
+		},
+	}
+
+	if err := EnsureSettingsForRole(settingsDir, workDir, "witness", rc); err != nil {
+		t.Fatalf("EnsureSettingsForRole() error = %v", err)
+	}
+
+	target, err := os.Readlink(workDir + "/GEMINI.md")
+	if err != nil {
+		t.Fatalf("read repaired GEMINI.md symlink: %v", err)
+	}
+	if target != "AGENTS.md" {
+		t.Errorf("GEMINI.md target = %q, want AGENTS.md", target)
+	}
+}
+
+func TestEnsureSettingsForRole_GeminiPreservesGeminiOverlay(t *testing.T) {
+	settingsDir := t.TempDir()
+	workDir := t.TempDir()
+	geminiContent := []byte("# Gemini overlay\n")
+	if err := os.WriteFile(workDir+"/AGENTS.md", []byte("# Agents\n"), 0644); err != nil {
+		t.Fatalf("write AGENTS.md: %v", err)
+	}
+	if err := os.WriteFile(workDir+"/GEMINI.md", geminiContent, 0644); err != nil {
+		t.Fatalf("write GEMINI.md: %v", err)
+	}
+
+	rc := &config.RuntimeConfig{
+		Hooks: &config.RuntimeHooksConfig{
+			Provider:     "gemini",
+			Dir:          ".gemini",
+			SettingsFile: "settings.json",
+		},
+	}
+
+	if err := EnsureSettingsForRole(settingsDir, workDir, "crew", rc); err != nil {
+		t.Fatalf("EnsureSettingsForRole() error = %v", err)
+	}
+
+	got, err := os.ReadFile(workDir + "/GEMINI.md")
+	if err != nil {
+		t.Fatalf("read GEMINI.md: %v", err)
+	}
+	if string(got) != string(geminiContent) {
+		t.Errorf("GEMINI.md content = %q, want %q", got, geminiContent)
+	}
+}
+
+func TestEnsureSettingsForRole_GeminiNoAgentsMDNoops(t *testing.T) {
+	settingsDir := t.TempDir()
+	workDir := t.TempDir()
+
+	rc := &config.RuntimeConfig{
+		Hooks: &config.RuntimeHooksConfig{
+			Provider:     "gemini",
+			Dir:          ".gemini",
+			SettingsFile: "settings.json",
+		},
+	}
+
+	if err := EnsureSettingsForRole(settingsDir, workDir, "crew", rc); err != nil {
+		t.Fatalf("EnsureSettingsForRole() error = %v", err)
+	}
+	if _, err := os.Lstat(workDir + "/GEMINI.md"); !os.IsNotExist(err) {
+		t.Fatalf("GEMINI.md should not be created without AGENTS.md, err = %v", err)
 	}
 }
 
@@ -729,5 +874,157 @@ func TestRuntimeConfigWithMinDelay_ZeroMin(t *testing.T) {
 	result := RuntimeConfigWithMinDelay(rc, 0)
 	if result.Tmux.ReadyDelayMs != 0 {
 		t.Errorf("ReadyDelayMs = %d, want 0", result.Tmux.ReadyDelayMs)
+	}
+}
+
+func makeTownRoot(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.MkdirAll(root+"/mayor", 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(root+"/mayor/town.json", []byte(`{"type":"town"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+func makeTownRootWithGit(t *testing.T) string {
+	t.Helper()
+	root := makeTownRoot(t)
+	if err := os.MkdirAll(root+"/.git", 0755); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+func TestCommandsInherited_WorkDirIsNestedInTownRoot(t *testing.T) {
+	// workDir is a subdirectory of the town root (same git repo) → inherited
+	root := makeTownRootWithGit(t)
+	mayorDir := root + "/mayor"
+
+	if !commandsInherited(mayorDir) {
+		t.Error("commandsInherited() = false, want true for workDir nested inside town root")
+	}
+}
+
+func TestCommandsInherited_WorkDirIsTownRoot(t *testing.T) {
+	// workDir == git root → not inherited (we're provisioning at the root itself)
+	root := makeTownRootWithGit(t)
+
+	if commandsInherited(root) {
+		t.Error("commandsInherited() = true, want false when workDir equals the git root")
+	}
+}
+
+func TestCommandsInherited_WorkDirNestedInTownRootBeforeGitInit(t *testing.T) {
+	// gt install creates mayor/deacon settings before it initializes town .git.
+	// Those role dirs still inherit town-level commands once install provisions them.
+	root := makeTownRoot(t)
+	mayorDir := root + "/mayor"
+
+	if !commandsInherited(mayorDir) {
+		t.Error("commandsInherited() = false, want true for town role dir before .git exists")
+	}
+}
+
+func TestCommandsInherited_NestedGitRepoInsideTownRoot(t *testing.T) {
+	// Crew/polecat workdirs live in nested git repos under the town root. Claude
+	// Code stops at that repo boundary, so they need explicit command provisioning.
+	root := makeTownRootWithGit(t)
+	workDir := root + "/rig/polecats/chrome/repo"
+	if err := os.MkdirAll(workDir+"/.git", 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if commandsInherited(workDir) {
+		t.Error("commandsInherited() = true, want false for nested git repo inside town root")
+	}
+}
+
+func TestCommandsInherited_WorkDirIsOutsideTownRoot(t *testing.T) {
+	// workDir in a standalone git repo that is NOT a Gas Town workspace → not inherited
+	dir := t.TempDir()
+	if err := os.MkdirAll(dir+"/.git", 0755); err != nil {
+		t.Fatal(err)
+	}
+	subDir := dir + "/src"
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if commandsInherited(subDir) {
+		t.Error("commandsInherited() = true, want false for workDir in non-workspace git repo")
+	}
+}
+
+func TestCommandsInherited_NoGitRoot(t *testing.T) {
+	// workDir has no .git ancestor → not inherited
+	dir := t.TempDir()
+	// Don't create .git
+
+	if commandsInherited(dir) {
+		t.Error("commandsInherited() = true, want false when no .git ancestor found")
+	}
+}
+
+func TestEnsureSettingsForRole_SkipsCommandsWhenInheritedFromTownRoot(t *testing.T) {
+	// Mayor/deacon run inside the town root git repo. Commands provisioned at the
+	// town root are inherited by Claude Code's path-hierarchy traversal, so
+	// EnsureSettingsForRole must NOT provision a duplicate copy in the role dir.
+	root := makeTownRootWithGit(t)
+	mayorDir := root + "/mayor"
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	rc := &config.RuntimeConfig{
+		Hooks: &config.RuntimeHooksConfig{
+			Provider:     "claude",
+			Dir:          ".claude",
+			SettingsFile: "settings.json",
+		},
+	}
+
+	if err := EnsureSettingsForRole(mayorDir, mayorDir, "mayor", rc); err != nil {
+		t.Fatalf("EnsureSettingsForRole() error = %v", err)
+	}
+
+	// Commands must NOT be provisioned inside the role dir
+	for _, cmd := range []string{"done", "handoff", "review"} {
+		path := mayorDir + "/.claude/commands/" + cmd + ".md"
+		if _, err := os.Stat(path); err == nil {
+			t.Errorf("command %s.md was provisioned in mayor dir, want skipped (would duplicate town-root copy)", cmd)
+		}
+	}
+}
+
+func TestEnsureSettingsForRole_ProvisionCommandsOutsideTownRoot(t *testing.T) {
+	// Crew/polecat workDirs are outside the town root git repo.
+	// EnsureSettingsForRole must provision commands normally.
+	workDir := t.TempDir()
+	// workDir has no .git ancestor, so commandsInherited returns false.
+
+	rc := &config.RuntimeConfig{
+		Hooks: &config.RuntimeHooksConfig{
+			Provider:     "claude",
+			Dir:          ".claude",
+			SettingsFile: "settings.json",
+		},
+	}
+
+	if err := EnsureSettingsForRole(workDir, workDir, "crew", rc); err != nil {
+		t.Fatalf("EnsureSettingsForRole() error = %v", err)
+	}
+
+	// At least one command should be provisioned
+	provisioned := 0
+	for _, cmd := range []string{"done", "handoff", "review"} {
+		if _, err := os.Stat(workDir + "/.claude/commands/" + cmd + ".md"); err == nil {
+			provisioned++
+		}
+	}
+	if provisioned == 0 {
+		t.Error("no commands provisioned in workDir outside town root, want at least one")
 	}
 }

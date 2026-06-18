@@ -230,8 +230,8 @@ func (d *testDAG) BdStubScript() string {
 	}
 
 	// --- handle: sql "SELECT ..." --json (bdDepListRawIDs) ---
-	// bdDepListRawIDs calls: bd sql "SELECT depends_on_id FROM dependencies WHERE issue_id = '<id>' AND type = 'tracks'" --json
-	// or: bd sql "SELECT issue_id FROM dependencies WHERE depends_on_id = '<id>' AND type = 'tracks'" --json
+	// bdDepListRawIDs calls: bd sql "SELECT COALESCE(...) AS depends_on_id FROM dependencies WHERE issue_id = '<id>' AND type = 'tracks'" --json
+	// or: bd sql "SELECT issue_id FROM dependencies WHERE <typed target columns match id> AND type = 'tracks'" --json
 	sb.WriteString("  sql\\ *)\n")
 	sb.WriteString("    # Handle SQL queries for dependency lookups\n")
 	// For "down" direction (convoy → tracked beads): match on issue_id = '<convoyID>'
@@ -246,12 +246,12 @@ func (d *testDAG) BdStubScript() string {
 			sb.WriteString("    esac\n")
 		}
 	}
-	// For "up" direction (bead → tracking convoys): match on depends_on_id = '<beadID>'
+	// For "up" direction (bead → tracking convoys): match typed target columns.
 	for id := range d.beads {
 		trackersJSON := d.trackersSQLJSONFor(id)
 		if trackersJSON != "[]" {
 			sb.WriteString(`    case "$ALL_ARGS" in` + "\n")
-			sb.WriteString(fmt.Sprintf("      *\"depends_on_id = '%s'\"*)\n", id))
+			sb.WriteString(fmt.Sprintf("      *\"depends_on_issue_id = '%s'\"*)\n", id))
 			sb.WriteString(fmt.Sprintf("        echo '%s'\n", trackersJSON))
 			sb.WriteString("        exit 0\n")
 			sb.WriteString("        ;;\n")
@@ -298,10 +298,14 @@ func (d *testDAG) BdStubScript() string {
 	sb.WriteString("    exit 0\n")
 	sb.WriteString("    ;;\n")
 
-	// --- handle: list --type=convoy --all --json (overlapping convoy detection) ---
+	// --- handle: convoy list queries (overlapping convoy detection) ---
 	convoyListJSON := d.convoyListJSON()
-	sb.WriteString("  list\\ *--type=convoy*)\n")
+	sb.WriteString("  list\\ *--label=gt:convoy*)\n")
 	sb.WriteString(fmt.Sprintf("    echo '%s'\n", convoyListJSON))
+	sb.WriteString("    exit 0\n")
+	sb.WriteString("    ;;\n")
+	sb.WriteString("  list\\ --json\\ --limit=0|list\\ --json\\ --limit=0\\ --flat|list\\ --json\\ --limit=0\\ --all|list\\ --json\\ --limit=0\\ --all\\ --flat|list\\ --json\\ --limit=0\\ --status=*)\n")
+	sb.WriteString("    echo '[]'\n")
 	sb.WriteString("    exit 0\n")
 	sb.WriteString("    ;;\n")
 
@@ -605,8 +609,8 @@ func (d *testDAG) trackersSQLJSONFor(beadID string) string {
 	return string(raw)
 }
 
-// convoyListJSON returns the JSON array for `bd list --type=convoy --all --json`.
-// Returns all convoy-type beads with their ID and status.
+// convoyListJSON returns the JSON array for convoy list queries.
+// Returns all convoy beads with their ID and status.
 func (d *testDAG) convoyListJSON() string {
 	type convoyEntry struct {
 		ID     string `json:"id"`

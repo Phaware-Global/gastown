@@ -26,17 +26,6 @@ import (
 	"github.com/steveyegge/gastown/internal/util"
 )
 
-func stripEnvKey(env []string, key string) []string {
-	prefix := key + "="
-	filtered := env[:0]
-	for _, entry := range env {
-		if !strings.HasPrefix(entry, prefix) {
-			filtered = append(filtered, entry)
-		}
-	}
-	return filtered
-}
-
 // shortSHA returns at most 8 characters of a SHA for display.
 func shortSHA(sha string) string {
 	if len(sha) > 8 {
@@ -344,6 +333,7 @@ type MRInfo struct {
 	Priority        int        // Priority (lower = higher priority)
 	AgentBead       string     // Agent bead ID that created this MR
 	RetryCount      int        // Conflict retry count
+	ConflictTaskID  string     // Open conflict-resolution task for this MR (if any)
 	ConvoyID        string     // Parent convoy ID if part of a convoy
 	ConvoyCreatedAt *time.Time // Convoy creation time
 	CreatedAt       time.Time  // MR creation time
@@ -1627,9 +1617,14 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 		}
 	}
 
+	// 1.2. Close conflict-resolution tasks that this land has made moot (hq-jnap).
+	// Conflict beads otherwise outlive the successful re-land of their content
+	// and rot as open issues (re-dlcs/re-4i3b/re-gcii pattern).
+	e.closeSupersededConflictArtifacts(mr)
+
 	// 1.5. Clear agent bead's active_mr reference (traceability cleanup)
 	if mr.AgentBead != "" {
-		if err := e.beads.UpdateAgentActiveMR(mr.AgentBead, ""); err != nil {
+		if err := e.clearAgentActiveMR(mr.AgentBead); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to clear agent bead %s active_mr: %v\n", mr.AgentBead, err)
 		}
 	}
@@ -1693,6 +1688,10 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 
 	// 5. Log success
 	_, _ = fmt.Fprintf(e.output, "[Engineer] ✓ Merged: %s (commit: %s)\n", mr.ID, result.MergeCommit)
+}
+
+func (e *Engineer) clearAgentActiveMR(agentBeadID string) error {
+	return e.beads.ForAgentBead().UpdateAgentActiveMR(agentBeadID, "")
 }
 
 // HandleMRInfoFailure handles a failed merge from MRInfo.
@@ -1792,6 +1791,11 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 	// If this was a conflict, create a conflict-resolution task for dispatch
 	// and block the MR until the task is resolved (non-blocking delegation)
 	if result.Conflict {
+		retryCount := mr.RetryCount + 1
+		conflictSHA, revErr := e.git.Rev("origin/" + mr.Target)
+		if revErr != nil {
+			conflictSHA = "unknown-sha"
+		}
 		taskID, err := e.createConflictResolutionTaskForMR(mr, result)
 		if err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to create conflict resolution task: %v\n", err)
@@ -1801,6 +1805,12 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 			if err := e.beads.AddDependency(mr.ID, taskID); err != nil {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to block MR on task: %v\n", err)
 			} else {
+				if err := e.recordConflictTaskOnMR(mr, taskID, retryCount, conflictSHA); err != nil {
+					_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to record conflict task on MR %s: %v\n", mr.ID, err)
+				} else {
+					mr.ConflictTaskID = taskID
+					mr.RetryCount = retryCount
+				}
 				_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s blocked on conflict task %s (non-blocking delegation)\n", mr.ID, taskID)
 			}
 		}
@@ -1945,6 +1955,125 @@ The Refinery will automatically retry the merge after you force-push.`,
 	return task.ID, nil
 }
 
+func (e *Engineer) recordConflictTaskOnMR(mr *MRInfo, taskID string, retryCount int, conflictSHA string) error {
+	mrBead, err := e.beads.Show(mr.ID)
+	if err != nil {
+		return err
+	}
+	mrFields := beads.ParseMRFields(mrBead)
+	if mrFields == nil {
+		mrFields = &beads.MRFields{}
+	}
+	mrFields.ConflictTaskID = taskID
+	mrFields.RetryCount = retryCount
+	mrFields.LastConflictSHA = conflictSHA
+	newDesc := beads.SetMRFields(mrBead, mrFields)
+	return e.beads.Update(mr.ID, beads.UpdateOptions{Description: &newDesc})
+}
+
+// closeSupersededConflictArtifacts closes conflict-resolution tasks made moot
+// by a successful land of the source issue (hq-jnap). Two cases:
+//  1. The merged MR's own conflict task is still open — the conflict was
+//     resolved out-of-band (force-push) without `bd close`, so the task rots.
+//  2. Another open MR carries the same source issue (a re-land) — its conflict
+//     task is now pointless because the content is on the target branch.
+//
+// Superseded sibling MRs are closed only when their conflict task verifies it
+// belongs to that MR/source issue; this avoids unblocking stale duplicate MRs.
+// All operations are best-effort; failures are logged and don't affect the merge.
+func (e *Engineer) closeSupersededConflictArtifacts(merged *MRInfo) {
+	e.closeConflictTaskIfOpen(conflictTaskIDForMR(merged), merged.ID, merged.ID, merged.SourceIssue)
+
+	if merged.SourceIssue == "" {
+		return
+	}
+	all, err := e.ListAllOpenMRs()
+	if err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: conflict-artifact sweep skipped (list MRs): %v\n", err)
+		return
+	}
+	for _, other := range all {
+		if other.ID == merged.ID || other.SourceIssue != merged.SourceIssue {
+			continue
+		}
+		if !e.closeConflictTaskIfOpen(conflictTaskIDForMR(other), other.ID, merged.ID, merged.SourceIssue) {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Note: open MR %s shares source issue %s just merged via %s, but had no verified conflict task to close\n",
+				other.ID, merged.SourceIssue, merged.ID)
+			continue
+		}
+		reason := fmt.Sprintf("superseded by %s", merged.ID)
+		if err := e.beads.CloseWithReason(reason, other.ID); err != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close superseded MR %s: %v\n", other.ID, err)
+		} else {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Closed superseded MR %s: %s\n", other.ID, reason)
+		}
+	}
+}
+
+func conflictTaskIDForMR(mr *MRInfo) string {
+	if mr == nil {
+		return ""
+	}
+	if mr.ConflictTaskID != "" {
+		return mr.ConflictTaskID
+	}
+	return mr.BlockedBy
+}
+
+// closeConflictTaskIfOpen closes a conflict-resolution task if it is still open.
+func (e *Engineer) closeConflictTaskIfOpen(taskID, taskMRID, landedMRID, sourceIssue string) bool {
+	if taskID == "" {
+		return false
+	}
+	task, err := e.beads.Show(taskID)
+	if err != nil || task == nil {
+		return false
+	}
+	if !isConflictTaskForMR(task, taskMRID, sourceIssue) {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: refusing to close unverified conflict task %s for MR %s\n", taskID, taskMRID)
+		return false
+	}
+	if task.Status == string(beads.StatusClosed) {
+		return true
+	}
+	reason := fmt.Sprintf("conflict moot: %s landed (MR %s)", sourceIssue, landedMRID)
+	if err := e.beads.CloseWithReason(reason, taskID); err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close moot conflict task %s: %v\n", taskID, err)
+		return false
+	} else {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Closed moot conflict task: %s (%s)\n", taskID, reason)
+	}
+	return true
+}
+
+func isConflictTaskForMR(task *beads.Issue, mrID, sourceIssue string) bool {
+	if task == nil || task.Description == "" || mrID == "" {
+		return false
+	}
+	metadata := conflictTaskMetadata(task.Description)
+	if metadata["Original MR"] != mrID {
+		return false
+	}
+	return sourceIssue == "" || metadata["Original issue"] == sourceIssue
+}
+
+func conflictTaskMetadata(description string) map[string]string {
+	metadata := make(map[string]string)
+	for _, line := range strings.Split(description, "\n") {
+		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "-"))
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key != "" && value != "" {
+			metadata[key] = value
+		}
+	}
+	return metadata
+}
+
 // IsBeadOpen checks if a bead is still open (not closed).
 // This is used as a status checker to filter blocked MRs.
 func (e *Engineer) IsBeadOpen(beadID string) (bool, error) {
@@ -2000,6 +2129,7 @@ func issueToMRInfo(issue *beads.Issue, fields *beads.MRFields) *MRInfo {
 		Priority:        issue.Priority,
 		AgentBead:       fields.AgentBead,
 		RetryCount:      fields.RetryCount,
+		ConflictTaskID:  fields.ConflictTaskID,
 		ConvoyID:        fields.ConvoyID,
 		ConvoyCreatedAt: convoyCreatedAt,
 		PreVerified:     fields.PreVerified,
@@ -2368,17 +2498,26 @@ type convoyInfo struct {
 	Description string
 }
 
+func refineryHasLabel(labels []string, target string) bool {
+	for _, label := range labels {
+		if label == target {
+			return true
+		}
+	}
+	return false
+}
+
 // checkAndCloseCompletedConvoys finds and closes convoys where all tracked issues
 // are complete. Returns the list of convoys that were closed.
 func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []convoyInfo {
-	bdEnv := stripEnvKey(os.Environ(), "BEADS_DIR")
+	townReadEnv := beads.BuildReadOnlyPinnedBDEnv(os.Environ(), townBeads)
+	townMutationEnv := beads.BuildMutationPinnedBDEnv(os.Environ(), townBeads)
+	routingReadEnv := beads.BuildReadOnlyRoutingBDEnv(os.Environ(), townBeads)
 
-	// List all open convoys
-	listArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"list", "--type=convoy", "--status=open", "--json"})
-	listCmd := exec.Command("bd", listArgs...)
-	util.SetDetachedProcessGroup(listCmd)
-	listCmd.Dir = townBeads
-	listCmd.Env = bdEnv
+	// List all open issues and filter locally so legacy type=convoy beads remain visible.
+	listArgs := beads.InjectFlatForListJSON([]string{"list", "--status=open", "--json", "--limit=0"})
+	listArgs = beads.MaybePrependAllowStaleWithEnv(townReadEnv, listArgs)
+	listCmd := beads.Command(townBeads, townBeads, beads.ReadOnlyPinned, listArgs...)
 	var stdout bytes.Buffer
 	listCmd.Stdout = &stdout
 
@@ -2388,10 +2527,12 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 	}
 
 	var convoys []struct {
-		ID          string `json:"id"`
-		Title       string `json:"title"`
-		Status      string `json:"status"`
-		Description string `json:"description"`
+		ID          string   `json:"id"`
+		Title       string   `json:"title"`
+		Status      string   `json:"status"`
+		Description string   `json:"description"`
+		IssueType   string   `json:"issue_type"`
+		Labels      []string `json:"labels"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to parse convoy list: %v\n", err)
@@ -2401,12 +2542,12 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 	var closed []convoyInfo
 
 	for _, convoy := range convoys {
+		if convoy.IssueType != "convoy" && !refineryHasLabel(convoy.Labels, "gt:convoy") {
+			continue
+		}
 		// Get tracked issues for this convoy via bd dep list
-		depArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"dep", "list", convoy.ID, "--direction=down", "--type=tracks", "--json"})
-		depCmd := exec.Command("bd", depArgs...)
-		util.SetDetachedProcessGroup(depCmd)
-		depCmd.Dir = townRoot
-		depCmd.Env = bdEnv
+		depArgs := beads.MaybePrependAllowStaleWithEnv(townReadEnv, []string{"dep", "list", convoy.ID, "--direction=down", "--type=tracks", "--json"})
+		depCmd := beads.Command(townRoot, townBeads, beads.ReadOnlyPinned, depArgs...)
 		var depOut bytes.Buffer
 		depCmd.Stdout = &depOut
 
@@ -2435,11 +2576,8 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 			}
 
 			// Get fresh status from home rig via bd show with routing
-			showArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"show", depID, "--json"})
-			showCmd := exec.Command("bd", showArgs...)
-			util.SetDetachedProcessGroup(showCmd)
-			showCmd.Dir = townRoot
-			showCmd.Env = bdEnv
+			showArgs := beads.MaybePrependAllowStaleWithEnv(routingReadEnv, []string{"show", depID, "--json"})
+			showCmd := beads.Command(townRoot, townBeads, beads.ReadOnlyRouting, showArgs...)
 			var showOut bytes.Buffer
 			showCmd.Stdout = &showOut
 
@@ -2473,11 +2611,8 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 			reason = "Empty convoy — auto-closed as definitionally complete"
 		}
 
-		closeArgs := beads.MaybePrependAllowStaleWithEnv(bdEnv, []string{"close", convoy.ID, "-r", reason})
-		closeCmd := exec.Command("bd", closeArgs...)
-		util.SetDetachedProcessGroup(closeCmd)
-		closeCmd.Dir = townBeads
-		closeCmd.Env = bdEnv
+		closeArgs := beads.MaybePrependAllowStaleWithEnv(townMutationEnv, []string{"close", convoy.ID, "-r", reason})
+		closeCmd := beads.Command(townBeads, townBeads, beads.MutationPinned, closeArgs...)
 
 		if err := closeCmd.Run(); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close convoy %s: %v\n", convoy.ID, err)
@@ -2507,8 +2642,10 @@ func (e *Engineer) checkAndCloseCompletedConvoys(townRoot, townBeads string) []c
 // resolve via the town-level workspace rather than the engineer's
 // rig-scoped default cwd. The memory (test) impl ignores WorkDir.
 func (e *Engineer) notifyConvoyCompletion(townRoot, convoyID, title, description string) {
-	// ZFC: Use typed accessor instead of parsing description text
-	fields := beads.ParseConvoyFields(&beads.Issue{Description: description})
+	fields, shouldNotify := e.claimConvoyCompletionNotification(townRoot, convoyID, description)
+	if !shouldNotify {
+		return
+	}
 	for _, addr := range fields.NotificationAddresses() {
 		subject := fmt.Sprintf("🚚 Convoy landed: %s", title)
 		body := fmt.Sprintf("Convoy %s has completed.\n\nAll tracked issues are now closed.\n\nClosed by: %s/refinery",
@@ -2518,6 +2655,45 @@ func (e *Engineer) notifyConvoyCompletion(townRoot, convoyID, title, description
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not notify %s: %v\n", addr, err)
 		}
 	}
+}
+
+func (e *Engineer) claimConvoyCompletionNotification(townRoot, convoyID, fallbackDescription string) (*beads.ConvoyFields, bool) {
+	townBeads := filepath.Join(townRoot, ".beads")
+	description := fallbackDescription
+
+	readEnv := beads.BuildReadOnlyPinnedBDEnv(os.Environ(), townBeads)
+	showArgs := beads.MaybePrependAllowStaleWithEnv(readEnv, []string{"show", convoyID, "--json"})
+	showCmd := beads.Command(townBeads, townBeads, beads.ReadOnlyPinned, showArgs...)
+	var showOut bytes.Buffer
+	showCmd.Stdout = &showOut
+	if err := showCmd.Run(); err == nil && showOut.Len() > 0 {
+		var convoys []struct {
+			Description string `json:"description"`
+		}
+		if err := json.Unmarshal(showOut.Bytes(), &convoys); err == nil && len(convoys) > 0 {
+			description = convoys[0].Description
+		}
+	}
+
+	fields := beads.ParseConvoyFields(&beads.Issue{Description: description})
+	if fields == nil {
+		fields = &beads.ConvoyFields{}
+	}
+	if fields.CompletionNotifiedAt != "" {
+		return fields, false
+	}
+
+	fields.CompletionNotifiedAt = time.Now().UTC().Format(time.RFC3339)
+	newDesc := beads.SetConvoyFields(&beads.Issue{Description: description}, fields)
+	mutationEnv := beads.BuildMutationPinnedBDEnv(os.Environ(), townBeads)
+	updateArgs := beads.MaybePrependAllowStaleWithEnv(mutationEnv, []string{"update", convoyID, "--description=" + newDesc})
+	updateCmd := beads.Command(townBeads, townBeads, beads.MutationPinned, updateArgs...)
+	if err := updateCmd.Run(); err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not record convoy completion notification state for %s: %v\n", convoyID, err)
+		return fields, false
+	}
+
+	return fields, true
 }
 
 // landConvoySwarm checks if a completed convoy has an associated swarm with an

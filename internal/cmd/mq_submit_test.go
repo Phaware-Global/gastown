@@ -1,11 +1,103 @@
 package cmd
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	gitpkg "github.com/steveyegge/gastown/internal/git"
 )
+
+func TestResolveMQSubmitCommitSHAUsesSubmittedBranch(t *testing.T) {
+	repo := t.TempDir()
+	runGitForMQSubmitTest(t, repo, "init")
+	runGitForMQSubmitTest(t, repo, "config", "user.email", "test@example.com")
+	runGitForMQSubmitTest(t, repo, "config", "user.name", "Test User")
+
+	writeMQSubmitTestFile(t, repo, "file.txt", "main\n")
+	runGitForMQSubmitTest(t, repo, "add", "file.txt")
+	runGitForMQSubmitTest(t, repo, "commit", "-m", "main")
+	runGitForMQSubmitTest(t, repo, "branch", "-M", "main")
+	mainSHA := runGitForMQSubmitTest(t, repo, "rev-parse", "HEAD")
+
+	runGitForMQSubmitTest(t, repo, "checkout", "-b", "feature/pr-target")
+	writeMQSubmitTestFile(t, repo, "file.txt", "feature\n")
+	runGitForMQSubmitTest(t, repo, "commit", "-am", "feature")
+	featureSHA := runGitForMQSubmitTest(t, repo, "rev-parse", "HEAD")
+	runGitForMQSubmitTest(t, repo, "tag", "feature/pr-target", mainSHA)
+
+	runGitForMQSubmitTest(t, repo, "checkout", "main")
+	g := gitpkg.NewGit(repo)
+	got, err := resolveMQSubmitCommitSHA(g, "feature/pr-target")
+	if err != nil {
+		t.Fatalf("resolveMQSubmitCommitSHA: %v", err)
+	}
+	if got != featureSHA {
+		t.Fatalf("resolveMQSubmitCommitSHA() = %s, want submitted branch tip %s", got, featureSHA)
+	}
+	if got == mainSHA {
+		t.Fatalf("resolveMQSubmitCommitSHA() used HEAD %s instead of submitted branch tip", mainSHA)
+	}
+}
+
+func TestVerifyMQSubmitPushedBranchRequiresRemoteBranch(t *testing.T) {
+	repo := t.TempDir()
+	remote := t.TempDir()
+	runGitForMQSubmitTest(t, remote, "init", "--bare")
+
+	runGitForMQSubmitTest(t, repo, "init")
+	runGitForMQSubmitTest(t, repo, "config", "user.email", "test@example.com")
+	runGitForMQSubmitTest(t, repo, "config", "user.name", "Test User")
+	runGitForMQSubmitTest(t, repo, "remote", "add", "origin", remote)
+
+	writeMQSubmitTestFile(t, repo, "file.txt", "main\n")
+	runGitForMQSubmitTest(t, repo, "add", "file.txt")
+	runGitForMQSubmitTest(t, repo, "commit", "-m", "main")
+	runGitForMQSubmitTest(t, repo, "branch", "-M", "main")
+	runGitForMQSubmitTest(t, repo, "push", "-u", "origin", "main")
+
+	runGitForMQSubmitTest(t, repo, "checkout", "-b", "feature/pr-target")
+	writeMQSubmitTestFile(t, repo, "file.txt", "feature\n")
+	runGitForMQSubmitTest(t, repo, "commit", "-am", "feature")
+	featureSHA := runGitForMQSubmitTest(t, repo, "rev-parse", "HEAD")
+
+	g := gitpkg.NewGit(repo)
+	err := verifyMQSubmitPushedBranch(g, "feature/pr-target", featureSHA)
+	if err == nil {
+		t.Fatal("verifyMQSubmitPushedBranch() = nil, want missing remote branch error")
+	}
+	for _, want := range []string{"git push origin feature/pr-target", "gt done"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("verifyMQSubmitPushedBranch() error missing %q: %v", want, err)
+		}
+	}
+
+	runGitForMQSubmitTest(t, repo, "push", "origin", "feature/pr-target")
+	if err := verifyMQSubmitPushedBranch(g, "feature/pr-target", featureSHA); err != nil {
+		t.Fatalf("verifyMQSubmitPushedBranch() after push: %v", err)
+	}
+}
+
+func runGitForMQSubmitTest(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func writeMQSubmitTestFile(t *testing.T, dir, name, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestValidateMoleculePrereqs(t *testing.T) {
 	tests := []struct {

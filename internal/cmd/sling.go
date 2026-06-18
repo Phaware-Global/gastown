@@ -464,7 +464,10 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 			}
 			if verifyBeadExists(args[0]) != nil {
 				if verifyFormulaExists(args[0]) == nil {
-					return fmt.Errorf("standalone formula cannot be scheduled (use --on <bead>)")
+					// Standalone formula slinging (cook+wisp+attach) is not bead-based
+					// dispatch and does not consume a scheduler slot — fall through to
+					// runSlingFormula, which handles polecat spawning via resolveTarget.
+					return runSlingFormula(ctx, args)
 				}
 			}
 			beadID := args[0]
@@ -592,8 +595,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 			// Not a verified bead - try as standalone formula
 			if err := verifyFormulaExists(firstArg); err == nil {
 				// Standalone formula mode: gt sling <formula> [target]
-				// Standalone formula: deferred dispatch is handled above (formula-on-bead),
-				// so no scheduler check needed here.
+				// Deferred dispatch is handled above for the 2-arg rig case (gh#3917).
 				return runSlingFormula(ctx, args)
 			}
 			// Not a formula either - check if it looks like a bead ID (routing issue workaround).
@@ -734,9 +736,35 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	targetPane := resolved.Pane
 	hookWorkDir := resolved.WorkDir
 	hookSetAtomically := resolved.HookSetAtomically
+	var admission *polecatAdmissionHandle
+	if !slingDryRun && !hookSetAtomically && strings.Contains(targetAgent, "/polecats/") {
+		parts := strings.Split(targetAgent, "/")
+		if len(parts) >= 3 {
+			var snapshot polecatCapacitySnapshot
+			admission, snapshot, err = acquirePolecatAdmissionFn(townRoot, parts[0], beadID, "direct-target")
+			if err != nil {
+				return err
+			}
+			defer admission.Release()
+			if snapshot.Max > 0 {
+				fmt.Printf("%s Polecat capacity reserved (%d free of %d)\n", style.Dim.Render("○"), snapshot.Free, snapshot.Max)
+			}
+		}
+	}
 	delayedDogInfo := resolved.DelayedDogInfo
 	newPolecatInfo := resolved.NewPolecatInfo
 	isSelfSling := resolved.IsSelfSling
+	rollbackSpawnedPolecat := func(reason string) {
+		if newPolecatInfo == nil {
+			return
+		}
+		fmt.Printf("%s %s, rolling back spawned polecat %s...\n", style.Warning.Render("⚠"), reason, newPolecatInfo.PolecatName)
+		rollbackSlingArtifactsFn(newPolecatInfo, beadID, hookWorkDir, "")
+		// Under --force, rollback's unhook can clear a pinned bead's original state.
+		if force && originalStatus == "pinned" {
+			restorePinnedBead(townRoot, beadID, originalAssignee)
+		}
+	}
 
 	// Inject base_branch var for formula instantiation (non-main only; formula default handles main)
 	if newPolecatInfo != nil && newPolecatInfo.BaseBranch != "" && newPolecatInfo.BaseBranch != "main" {
@@ -754,6 +782,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	// Skip for self-sling (user knows what they're doing) and --force overrides.
 	if strings.Contains(targetAgent, "/polecats/") && !force && !isSelfSling {
 		if err := checkCrossRigGuard(beadID, targetAgent, townRoot); err != nil {
+			rollbackSpawnedPolecat("Cross-rig guard failed")
 			return err
 		}
 	}
@@ -805,9 +834,11 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		}
 
 		// Unhook the bead from old owner (set status back to open)
-		unhookCmd := exec.Command("bd", "update", beadID, "--status=open", "--assignee=")
-		unhookCmd.Dir = beads.ResolveHookDir(townRoot, beadID, "")
-		if err := unhookCmd.Run(); err != nil {
+		unhookDir := beads.ResolveHookDir(townRoot, beadID, "")
+		if err := BdCmd("update", beadID, "--status=open", "--assignee=").
+			Dir(unhookDir).
+			WithAutoCommit().
+			Run(); err != nil {
 			fmt.Printf("%s Could not unhook bead from old owner: %v\n", style.Dim.Render("Warning:"), err)
 		}
 	}
@@ -970,7 +1001,8 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	}
 	defer assigneeUnlock()
 	hookDir := beads.ResolveHookDir(townRoot, beadID, hookWorkDir)
-	if err := hookBeadWithRetry(beadID, targetAgent, hookDir); err != nil {
+	if err := hookBeadWithRetryFn(beadID, targetAgent, hookDir); err != nil {
+		rollbackSpawnedPolecat("Hook failed")
 		return err
 	}
 
@@ -1162,11 +1194,10 @@ func restorePinnedBead(townRoot, beadID, assignee string) {
 		return
 	}
 	dir := beads.ResolveHookDir(townRoot, beadID, "")
-	cmd := exec.Command("bd", "update", beadID, "--status=pinned", "--assignee="+assignee)
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	if err := cmd.Run(); err != nil {
+	if err := BdCmd("update", beadID, "--status=pinned", "--assignee="+assignee).
+		Dir(dir).
+		WithAutoCommit().
+		Run(); err != nil {
 		fmt.Printf("  %s Could not restore pinned state for bead %s: %v\n", style.Dim.Render("Warning:"), beadID, err)
 	} else {
 		fmt.Printf("  %s Restored pinned state for bead %s\n", style.Dim.Render("○"), beadID)
@@ -1278,9 +1309,10 @@ func rollbackSlingArtifacts(spawnInfo *SpawnedPolecatInfo, beadID, hookWorkDir, 
 
 			// 2. Unhook the bead (set status back to open so it can be re-slung).
 			unhookDir := beads.ResolveHookDir(townRoot, beadID, hookWorkDir)
-			unhookCmd := exec.Command("bd", "update", beadID, "--status=open", "--assignee=")
-			unhookCmd.Dir = unhookDir
-			if err := unhookCmd.Run(); err != nil {
+			if err := BdCmd("update", beadID, "--status=open", "--assignee=").
+				Dir(unhookDir).
+				WithAutoCommit().
+				Run(); err != nil {
 				fmt.Printf("  %s Could not unhook bead %s: %v\n", style.Dim.Render("Warning:"), beadID, err)
 			} else {
 				fmt.Printf("  %s Unhooked bead %s\n", style.Dim.Render("○"), beadID)
