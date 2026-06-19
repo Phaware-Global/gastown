@@ -2066,3 +2066,178 @@ func TestEnqueueReplyReminder_DisabledByConfig(t *testing.T) {
 		t.Errorf("reply_reminder_delay=0s should disable reminders, got %d pending", pending)
 	}
 }
+
+// TestEnqueueReplyReminder_TelegraphJira verifies that a message from a
+// telegraph/jira/* sender enqueues a reminder pointing to addCommentToJiraIssue
+// instead of suggesting `gt mail send`.
+func TestEnqueueReplyReminder_TelegraphJira(t *testing.T) {
+	townRoot := t.TempDir()
+	r := &Router{workDir: t.TempDir(), townRoot: townRoot}
+	msg := &Message{
+		From:    "telegraph/jira/PROJ-123",
+		To:      "gastown/crew/alice",
+		Subject: "Bug report",
+		Type:    TypeNotification,
+	}
+	r.enqueueReplyReminder(msg, "gt-gastown-crew-alice")
+
+	pending, err := nudge.Pending(townRoot, "gt-gastown-crew-alice")
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
+	if pending != 1 {
+		t.Fatalf("expected 1 queued reminder, got %d", pending)
+	}
+
+	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", "gt-gastown-crew-alice")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 file in queue dir, got %d", len(entries))
+	}
+	data, err := os.ReadFile(filepath.Join(dir, entries[0].Name()))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var q nudge.QueuedNudge
+	if err := json.Unmarshal(data, &q); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// The reminder must not instruct "gt mail send <telegraph-address>" — it's fine to
+	// mention "gt mail send" in the context of "don't do this", but not as the action to take.
+	if strings.Contains(q.Message, "gt mail send telegraph/") {
+		t.Errorf("jira telegraph reminder must not instruct 'gt mail send telegraph/...', got: %q", q.Message)
+	}
+	if !strings.Contains(q.Message, "addCommentToJiraIssue") {
+		t.Errorf("jira telegraph reminder should mention 'addCommentToJiraIssue', got: %q", q.Message)
+	}
+}
+
+// TestEnqueueReplyReminder_TelegraphGitHub verifies that a message from a
+// telegraph/github/* sender enqueues a reminder pointing to the GitHub PR/issue
+// instead of suggesting `gt mail send`.
+func TestEnqueueReplyReminder_TelegraphGitHub(t *testing.T) {
+	townRoot := t.TempDir()
+	r := &Router{workDir: t.TempDir(), townRoot: townRoot}
+	msg := &Message{
+		From:    "telegraph/github/gemini-code-assist[bot]",
+		To:      "gastown/crew/alice",
+		Subject: "review comment",
+		Type:    TypeNotification,
+	}
+	r.enqueueReplyReminder(msg, "gt-gastown-crew-alice")
+
+	pending, err := nudge.Pending(townRoot, "gt-gastown-crew-alice")
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
+	if pending != 1 {
+		t.Fatalf("expected 1 queued reminder, got %d", pending)
+	}
+
+	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", "gt-gastown-crew-alice")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 file in queue dir, got %d", len(entries))
+	}
+	data, err := os.ReadFile(filepath.Join(dir, entries[0].Name()))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var q nudge.QueuedNudge
+	if err := json.Unmarshal(data, &q); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if strings.Contains(q.Message, "gt mail send telegraph/") {
+		t.Errorf("github telegraph reminder must not instruct 'gt mail send telegraph/...', got: %q", q.Message)
+	}
+	if !strings.Contains(q.Message, "GitHub") {
+		t.Errorf("github telegraph reminder should mention 'GitHub', got: %q", q.Message)
+	}
+}
+
+// TestEnqueueReplyReminder_TelegraphUnknown verifies that a message from an
+// unrecognized telegraph/* sender suppresses the reply reminder entirely.
+func TestEnqueueReplyReminder_TelegraphUnknown(t *testing.T) {
+	townRoot := t.TempDir()
+	r := &Router{workDir: t.TempDir(), townRoot: townRoot}
+	msg := &Message{
+		From:    "telegraph/slack/somebot",
+		To:      "gastown/crew/alice",
+		Subject: "notification",
+		Type:    TypeNotification,
+	}
+	r.enqueueReplyReminder(msg, "gt-gastown-crew-alice")
+
+	pending, err := nudge.Pending(townRoot, "gt-gastown-crew-alice")
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
+	if pending != 0 {
+		t.Errorf("unknown telegraph sender should suppress reminder, got %d queued", pending)
+	}
+}
+
+// TestBuildReplyReminderMessage exercises all branches of buildReplyReminderMessage.
+func TestBuildReplyReminderMessage(t *testing.T) {
+	cases := []struct {
+		from            string
+		subject         string
+		wantEmpty       bool
+		wantContains    []string
+		wantNotContains []string
+	}{
+		{
+			from:         "telegraph/jira/PROJ-42",
+			subject:      "Bug",
+			wantContains: []string{"addCommentToJiraIssue", "telegraph/jira/PROJ-42"},
+			// Must not instruct "gt mail send telegraph/..." as the reply action.
+			// (Mentioning it in "not gt mail send" context is fine.)
+			wantNotContains: []string{"gt mail send telegraph/"},
+		},
+		{
+			from:            "telegraph/github/dependabot[bot]",
+			subject:         "PR update",
+			wantContains:    []string{"GitHub", "telegraph/github/dependabot[bot]"},
+			wantNotContains: []string{"gt mail send telegraph/"},
+		},
+		{
+			from:      "telegraph/slack/somebot",
+			subject:   "ping",
+			wantEmpty: true,
+		},
+		{
+			from:            "gastown/witness",
+			subject:         "status check",
+			wantContains:    []string{"gt mail send gastown/witness", "gastown/witness"},
+			wantNotContains: []string{"addCommentToJiraIssue", "GitHub PR"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.from, func(t *testing.T) {
+			got := buildReplyReminderMessage(tc.from, tc.subject)
+			if tc.wantEmpty {
+				if got != "" {
+					t.Errorf("expected empty message for %q, got %q", tc.from, got)
+				}
+				return
+			}
+			for _, want := range tc.wantContains {
+				if !strings.Contains(got, want) {
+					t.Errorf("message for %q should contain %q, got: %q", tc.from, want, got)
+				}
+			}
+			for _, notWant := range tc.wantNotContains {
+				if strings.Contains(got, notWant) {
+					t.Errorf("message for %q must not contain %q, got: %q", tc.from, notWant, got)
+				}
+			}
+		})
+	}
+}
