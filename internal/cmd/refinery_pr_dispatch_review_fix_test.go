@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/refinery"
 )
 
@@ -116,7 +117,8 @@ func TestReviewFixSlingArgs(t *testing.T) {
 		Branch:      "polecat/furiosa-gt-abc",
 		SourceIssue: "gt-abc",
 	}
-	args := reviewFixSlingArgs("gastown", state, "mission text")
+	// Open-source path: dispatchBeadID is the source issue itself.
+	args := reviewFixSlingArgs("gastown", state.SourceIssue, state, "mission text")
 
 	if len(args) == 0 || args[0] != "sling" {
 		t.Fatalf("args[0] must be \"sling\", got %v", args)
@@ -155,6 +157,73 @@ func TestReviewFixSlingArgs(t *testing.T) {
 	}
 	if argIndexOf(args, "--force") < 0 {
 		t.Errorf("missing --force (source issue is still hooked to the terminal initial polecat): %v", args)
+	}
+}
+
+// TestReviewFixSlingArgs_FreshBead verifies that when a fresh dispatch bead is
+// used (closed-source path), reviewFixSlingArgs substitutes the fresh bead ID
+// for the source issue in the positional arg while keeping all other flags.
+func TestReviewFixSlingArgs_FreshBead(t *testing.T) {
+	state := dispatchReviewFixState{
+		PRNumber:    103,
+		Branch:      "polecat/furiosa/gt-dws@abc123",
+		SourceIssue: "gt-dws", // the closed source bead
+	}
+	freshBeadID := "gt-cpb" // the fresh review-fix bead created for closed-source path
+	args := reviewFixSlingArgs("gastown", freshBeadID, state, "mission text")
+
+	if args[0] != "sling" {
+		t.Fatalf("args[0] must be \"sling\", got %v", args)
+	}
+	// Fresh bead ID, not the closed source issue, must be the sling target.
+	if args[1] != freshBeadID {
+		t.Errorf("bead arg = %q; want fresh bead %q (closed source %q must not appear here)", args[1], freshBeadID, state.SourceIssue)
+	}
+	if args[2] != "gastown" {
+		t.Errorf("target arg = %q; want rig \"gastown\"", args[2])
+	}
+	// PR branch routing flags must still be present.
+	for flag, val := range map[string]string{
+		"--review-pr":     "103",
+		"--review-branch": "polecat/furiosa/gt-dws@abc123",
+	} {
+		idx := argIndexOf(args, flag)
+		if idx < 0 {
+			t.Errorf("missing flag %q in fresh-bead args %v", flag, args)
+			continue
+		}
+		if idx+1 >= len(args) || args[idx+1] != val {
+			t.Errorf("flag %q value = %q; want %q", flag, valueAt(args, idx+1), val)
+		}
+	}
+	if argIndexOf(args, "--force") < 0 {
+		t.Errorf("missing --force in fresh-bead args: %v", args)
+	}
+}
+
+// TestShouldCreateReviewFixBead pins the open/closed routing logic that decides
+// whether to sling the source bead directly or create a fresh dispatch bead.
+// Closed and absent source beads take the fresh-bead path; every other status
+// (open, hooked, in_progress, etc.) uses the source bead directly.
+func TestShouldCreateReviewFixBead(t *testing.T) {
+	cases := []struct {
+		name string
+		bead *beads.Issue
+		want bool
+	}{
+		{"nil (bead not found)", nil, true},
+		{"closed (normal post-gt-done state)", &beads.Issue{Status: "closed"}, true},
+		{"open (bead still active)", &beads.Issue{Status: "open"}, false},
+		{"hooked (assigned to a polecat)", &beads.Issue{Status: "hooked"}, false},
+		{"in_progress", &beads.Issue{Status: "in_progress"}, false},
+		{"deferred", &beads.Issue{Status: "deferred"}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := shouldCreateReviewFixBead(c.bead); got != c.want {
+				t.Errorf("shouldCreateReviewFixBead(%+v) = %v; want %v", c.bead, got, c.want)
+			}
+		})
 	}
 }
 
