@@ -109,9 +109,11 @@ func (d *Daemon) cleanupStuckDogs(mgr *dog.Manager, sm *dog.SessionManager) {
 		// Clearing work here would cause the dispatcher's verify step to falsely
 		// report "cleared between dispatch and verify" and trigger re-dispatch loops.
 		const sessionStartGracePeriod = 60 * time.Second
-		if !dg.WorkStartedAt.IsZero() && time.Since(dg.WorkStartedAt) < sessionStartGracePeriod {
-			d.logger.Printf("Handler: dog %s recently assigned (%.0fs ago), skipping stuck cleanup", dg.Name, time.Since(dg.WorkStartedAt).Seconds())
-			continue
+		if !dg.WorkStartedAt.IsZero() {
+			if duration := time.Since(dg.WorkStartedAt); duration < sessionStartGracePeriod {
+				d.logger.Printf("Handler: dog %s recently assigned (%.0fs ago), skipping stuck cleanup", dg.Name, duration.Seconds())
+				continue
+			}
 		}
 
 		// Dog is marked working but session is dead — clean it up.
