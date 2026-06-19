@@ -44,6 +44,8 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 		roleName = constants.RoleWitness
 	case RoleRefinery:
 		roleName = constants.RoleRefinery
+	case RoleReviewer:
+		roleName = constants.RoleReviewer
 	case RolePolecat:
 		roleName = constants.RolePolecat
 	case RoleCrew:
@@ -174,6 +176,8 @@ func outputPrimeContextFallback(ctx RoleContext) {
 		outputWitnessContext(ctx)
 	case RoleRefinery:
 		outputRefineryContext(ctx)
+	case RoleReviewer:
+		outputReviewerContext(ctx)
 	case RolePolecat:
 		outputPolecatContext(ctx)
 	case RoleCrew:
@@ -257,6 +261,30 @@ func outputRefineryContext(ctx RoleContext) {
 	fmt.Println("## Hookable Mail")
 	fmt.Println("Mail can be hooked for ad-hoc instructions: `" + cli.Name() + " hook attach <mail-id>`")
 	fmt.Println("If mail is on your hook, read and execute its instructions (GUPP applies).")
+	fmt.Println()
+	outputCommandQuickReference(ctx)
+	fmt.Printf("Rig: %s\n", style.Dim.Render(ctx.Rig))
+}
+
+// outputReviewerContext is the degraded-mode fallback used only when role
+// template rendering fails entirely (the primary path renders
+// reviewer.md.tmpl). It states the load-bearing rule: the reviewer posts via
+// `gt reviewer post`, never by mailing the verdict or `gh pr review`.
+func outputReviewerContext(ctx RoleContext) {
+	fmt.Printf("%s\n\n", style.Bold.Render("# Reviewer Context"))
+	fmt.Printf("You are the **Reviewer** for rig: %s\n\n", style.Bold.Render(ctx.Rig))
+	fmt.Println("## Responsibilities")
+	fmt.Println("- Review the PR named in your hooked/mailed review request")
+	fmt.Println("- Post findings as a single GitHub review — you are the only agent that posts PR reviews")
+	fmt.Println("- Never approve, never merge, never push (the worktree is checkout-only)")
+	fmt.Println()
+	fmt.Println("## Review Protocol (run the commands; do not improvise)")
+	fmt.Println("1. `" + cli.Name() + " reviewer checkout <pr> --sha <sha>` - check out the requested SHA")
+	fmt.Println("2. `" + cli.Name() + " reviewer perspectives` then `" + cli.Name() + " reviewer prompt <name> ...` per perspective")
+	fmt.Println("3. `" + cli.Name() + " reviewer consolidate perspective-*.json --sha <sha> --out findings.json`")
+	fmt.Println("4. `" + cli.Name() + " reviewer post --pr <pr> --findings findings.json` - the ONLY sanctioned posting path")
+	fmt.Println("   Do NOT mail the verdict to the refinery and do NOT use `gh pr review`.")
+	fmt.Println("5. `" + cli.Name() + " reviewer done` - close your review bead and self-terminate")
 	fmt.Println()
 	outputCommandQuickReference(ctx)
 	fmt.Printf("Rig: %s\n", style.Dim.Render(ctx.Rig))
