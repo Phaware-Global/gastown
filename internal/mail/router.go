@@ -1035,7 +1035,7 @@ func (r *Router) validateRecipient(identity string) error {
 	parts := strings.SplitN(identity, "/", 3)
 	if len(parts) == 2 {
 		switch parts[1] {
-		case "witness", "refinery", "reviewer":
+		case constants.RoleWitness, constants.RoleRefinery, constants.RoleReviewer:
 			return nil
 		}
 	}
