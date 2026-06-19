@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -329,7 +330,7 @@ func gtBinary() string {
 
 // slingReviewFixPolecat dispatches the polecat via `gt sling` and returns the
 // spawned polecat's name. gt sling has no JSON output mode, so the name is read
-// back from the source issue's assignee after the hook write commits (see
+// back from the dispatch bead's assignee after the hook write commits (see
 // reviewFixPolecatNameFromBead). The mission text is built in buildReviewFixMission.
 func slingReviewFixPolecat(rigName string, state dispatchReviewFixState, threads []refinery.ReviewThread, reviewer string) (string, error) {
 	threadsJSON, jerr := json.MarshalIndent(threads, "", "  ")
@@ -337,6 +338,14 @@ func slingReviewFixPolecat(rigName string, state dispatchReviewFixState, threads
 		return "", fmt.Errorf("marshaling threads: %w", jerr)
 	}
 	mission := buildReviewFixMission(state.PRNumber, string(threadsJSON), reviewer)
+
+	// Determine which bead to sling. A closed source bead (the normal state after
+	// gt done) is refused by gt sling — so we create a fresh open bead in that
+	// case. An open source bead takes the existing path.
+	dispatchBeadID, err := resolveReviewFixDispatchBead(rigName, state)
+	if err != nil {
+		return "", err
+	}
 
 	// Divergence guard (review thread #2). The sling below passes --force, which
 	// is necessary: with a bare-rig target, sling treats "already hooked to a
@@ -349,11 +358,16 @@ func slingReviewFixPolecat(rigName string, state dispatchReviewFixState, threads
 	// actively WORKING, displacing it would disrupt a live session — so defer with
 	// a retryable error instead. A terminal/idle/absent holder is safe to displace
 	// (it's the normal case: the original polecat went terminal after gt done).
-	if held, holder, herr := reviewFixSourceHeldByWorkingPolecat(rigName, state.SourceIssue); herr != nil {
-		return "", herr
-	} else if held {
-		return "", fmt.Errorf("source issue %s is held by working polecat %s/polecats/%s — deferring review-fix dispatch to avoid disrupting an active session",
-			state.SourceIssue, rigName, holder)
+	//
+	// The guard is skipped for a fresh dispatch bead: a newly created bead has no
+	// holder, so there is nothing to protect and the check would be vacuous.
+	if dispatchBeadID == state.SourceIssue {
+		if held, holder, herr := reviewFixSourceHeldByWorkingPolecat(rigName, state.SourceIssue); herr != nil {
+			return "", herr
+		} else if held {
+			return "", fmt.Errorf("source issue %s is held by working polecat %s/polecats/%s — deferring review-fix dispatch to avoid disrupting an active session",
+				state.SourceIssue, rigName, holder)
+		}
 	}
 
 	// Dispatch with the documented sling form: `gt sling <bead> <rig> ...`.
@@ -366,7 +380,7 @@ func slingReviewFixPolecat(rigName string, state dispatchReviewFixState, threads
 	// flag, neither of which gt sling understands — cobra rejected the unknown
 	// flag, printed its usage banner, and exited 1, so the review-fix loop never
 	// dispatched anyone (hq-eew / gt-o4z).
-	args := reviewFixSlingArgs(rigName, state, mission)
+	args := reviewFixSlingArgs(rigName, dispatchBeadID, state, mission)
 	cmd := exec.Command(gtBinary(), args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		// Only fold captured output into the message when it's non-empty —
@@ -378,7 +392,55 @@ func slingReviewFixPolecat(rigName string, state dispatchReviewFixState, threads
 		return "", fmt.Errorf("gt sling failed: %w", err)
 	}
 
-	return reviewFixPolecatNameFromBead(rigName, state.SourceIssue)
+	return reviewFixPolecatNameFromBead(rigName, dispatchBeadID)
+}
+
+// shouldCreateReviewFixBead reports whether dispatch-review-fix should create a
+// fresh bead instead of slinging the original source bead. Returns true when the
+// source bead is closed, tombstoned, or absent — the normal states for a
+// completed PR after gt done (gt sling rejects both "closed" and "tombstone"
+// beads with "work already completed"). Returns false for any other (still-live)
+// status, meaning the bead can be slung directly.
+func shouldCreateReviewFixBead(sourceBead *beads.Issue) bool {
+	return sourceBead == nil || sourceBead.Status == "closed" || sourceBead.Status == "tombstone"
+}
+
+// resolveReviewFixDispatchBead returns the bead ID to sling for review-fix
+// dispatch. Returns state.SourceIssue when that bead is still open (the original
+// polecat may be idle but the bead is live). When the source bead is closed,
+// tombstoned, or absent — the normal completed-PR case after gt done — it creates
+// a fresh open bead in the rig and returns its ID, so gt sling has an open bead
+// to hook.
+func resolveReviewFixDispatchBead(rigName string, state dispatchReviewFixState) (string, error) {
+	bd := beads.New(resolveBeadDir(state.SourceIssue))
+	sourceBead, err := bd.Show(state.SourceIssue)
+	// An absent bead (ErrNotFound) is the expected post-gt-done state, not a
+	// failure: bd.Show returns (nil, ErrNotFound), which shouldCreateReviewFixBead
+	// treats as "create a fresh bead". Only surface other (real) read errors.
+	if err != nil && !errors.Is(err, beads.ErrNotFound) {
+		return "", fmt.Errorf("reading source bead %s: %w", state.SourceIssue, err)
+	}
+	if !shouldCreateReviewFixBead(sourceBead) {
+		return state.SourceIssue, nil
+	}
+	// Source bead is closed, tombstoned, or absent (the normal post-gt-done
+	// state). Create a fresh open bead so gt sling has something to hook. Embed
+	// the structured
+	// fields the review-fix polecat needs to orient itself on the PR branch.
+	desc := fmt.Sprintf("review_pr: %d\nbranch: %s\nsource_issue: %s",
+		state.PRNumber, state.Branch, state.SourceIssue)
+	bdCreate := beads.New(resolveBeadDir(refPrDispatchReviewFixMR))
+	fresh, cerr := bdCreate.Create(beads.CreateOptions{
+		Title:       fmt.Sprintf("Review-fix: PR #%d", state.PRNumber),
+		Labels:      []string{"gt:task"},
+		Priority:    2,
+		Description: desc,
+		Rig:         rigName,
+	})
+	if cerr != nil {
+		return "", fmt.Errorf("creating review-fix bead (source %s closed/tombstoned/absent): %w", state.SourceIssue, cerr)
+	}
+	return fresh.ID, nil
 }
 
 // reviewFixSourceHeldByWorkingPolecat reports whether the source issue is
@@ -418,15 +480,20 @@ func reviewFixSourceHeldByWorkingPolecat(rigName, sourceIssue string) (bool, str
 // shelling out: the regression that broke the whole loop lived entirely in
 // these arguments.
 //
+// dispatchBeadID is the bead to sling — either the original source issue (when
+// still open) or a fresh review-fix bead (when the source is closed). Callers
+// must pass the resolved ID from resolveReviewFixDispatchBead; this function does
+// not perform the open/closed check.
+//
 // --force avoids sling's bare-rig idempotency no-op (see the divergence guard
 // in slingReviewFixPolecat) so the dispatch reliably spawns a fresh polecat
-// even when the source bead is still hooked to a terminal/idle prior owner. The
-// caller has already confirmed the holder is not actively working before we get
-// here, so the force never tears down a live session.
-func reviewFixSlingArgs(rigName string, state dispatchReviewFixState, mission string) []string {
+// even when the bead is still hooked to a terminal/idle prior owner. The caller
+// has already confirmed the holder is not actively working before we get here,
+// so the force never tears down a live session.
+func reviewFixSlingArgs(rigName string, dispatchBeadID string, state dispatchReviewFixState, mission string) []string {
 	return []string{
 		"sling",
-		state.SourceIssue,
+		dispatchBeadID,
 		rigName,
 		"--review-pr", fmt.Sprintf("%d", state.PRNumber),
 		"--review-branch", state.Branch,
@@ -435,18 +502,19 @@ func reviewFixSlingArgs(rigName string, state dispatchReviewFixState, mission st
 	}
 }
 
-// reviewFixPolecatNameFromBead reads the just-slung source issue and extracts
-// the spawned polecat's short name from its assignee. gt sling commits the
-// hook write (which sets the assignee) before it returns, so this read is
-// race-free against a successful sling.
-func reviewFixPolecatNameFromBead(rigName, sourceIssue string) (string, error) {
-	bd := beads.New(resolveBeadDir(sourceIssue))
-	issue, err := bd.Show(sourceIssue)
+// reviewFixPolecatNameFromBead reads the just-slung bead and extracts the
+// spawned polecat's short name from its assignee. gt sling commits the hook
+// write (which sets the assignee) before it returns, so this read is race-free
+// against a successful sling. beadID is whichever bead was passed to gt sling —
+// the original source issue (open path) or a fresh review-fix bead (closed path).
+func reviewFixPolecatNameFromBead(rigName, beadID string) (string, error) {
+	bd := beads.New(resolveBeadDir(beadID))
+	issue, err := bd.Show(beadID)
 	if err != nil {
-		return "", fmt.Errorf("reading source issue %s after sling: %w", sourceIssue, err)
+		return "", fmt.Errorf("reading bead %s after sling: %w", beadID, err)
 	}
 	if issue == nil {
-		return "", fmt.Errorf("source issue %s not found after sling", sourceIssue)
+		return "", fmt.Errorf("bead %s not found after sling", beadID)
 	}
 	return polecatNameFromAssignee(rigName, issue.Assignee)
 }
