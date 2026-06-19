@@ -150,10 +150,13 @@ func (r *Resolver) validateAgentAddress(address string) error {
 		return fmt.Errorf("%w: %s", ErrUnknownRecipient, address)
 	}
 
-	// Well-known rig-level singletons (rig/witness, rig/refinery)
+	// Well-known rig-level singletons (rig/witness, rig/refinery, rig/reviewer).
+	// The reviewer is spawn-on-demand — its worktree/session is provisioned only
+	// when the first review request is dispatched, so its address must validate
+	// before the directory exists (otherwise the bootstrap dispatch deadlocks).
 	if len(parts) == 2 {
 		switch parts[1] {
-		case constants.RoleWitness, constants.RoleRefinery:
+		case constants.RoleWitness, constants.RoleRefinery, constants.RoleReviewer:
 			return nil
 		}
 	}
