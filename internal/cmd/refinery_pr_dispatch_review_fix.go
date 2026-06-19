@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -396,29 +397,35 @@ func slingReviewFixPolecat(rigName string, state dispatchReviewFixState, threads
 
 // shouldCreateReviewFixBead reports whether dispatch-review-fix should create a
 // fresh bead instead of slinging the original source bead. Returns true when the
-// source bead is closed or absent — the normal state for a completed PR after
-// gt done. Returns false for any other (non-closed) status, meaning the bead is
-// still live and can be slung directly.
+// source bead is closed, tombstoned, or absent — the normal states for a
+// completed PR after gt done (gt sling rejects both "closed" and "tombstone"
+// beads with "work already completed"). Returns false for any other (still-live)
+// status, meaning the bead can be slung directly.
 func shouldCreateReviewFixBead(sourceBead *beads.Issue) bool {
-	return sourceBead == nil || sourceBead.Status == "closed"
+	return sourceBead == nil || sourceBead.Status == "closed" || sourceBead.Status == "tombstone"
 }
 
 // resolveReviewFixDispatchBead returns the bead ID to sling for review-fix
 // dispatch. Returns state.SourceIssue when that bead is still open (the original
-// polecat may be idle but the bead is live). When the source bead is closed or
-// absent — the normal completed-PR case after gt done — it creates a fresh open
-// bead in the rig and returns its ID, so gt sling has an open bead to hook.
+// polecat may be idle but the bead is live). When the source bead is closed,
+// tombstoned, or absent — the normal completed-PR case after gt done — it creates
+// a fresh open bead in the rig and returns its ID, so gt sling has an open bead
+// to hook.
 func resolveReviewFixDispatchBead(rigName string, state dispatchReviewFixState) (string, error) {
 	bd := beads.New(resolveBeadDir(state.SourceIssue))
 	sourceBead, err := bd.Show(state.SourceIssue)
-	if err != nil {
+	// An absent bead (ErrNotFound) is the expected post-gt-done state, not a
+	// failure: bd.Show returns (nil, ErrNotFound), which shouldCreateReviewFixBead
+	// treats as "create a fresh bead". Only surface other (real) read errors.
+	if err != nil && !errors.Is(err, beads.ErrNotFound) {
 		return "", fmt.Errorf("reading source bead %s: %w", state.SourceIssue, err)
 	}
 	if !shouldCreateReviewFixBead(sourceBead) {
 		return state.SourceIssue, nil
 	}
-	// Source bead is closed or absent (the normal post-gt-done state). Create a
-	// fresh open bead so gt sling has something to hook. Embed the structured
+	// Source bead is closed, tombstoned, or absent (the normal post-gt-done
+	// state). Create a fresh open bead so gt sling has something to hook. Embed
+	// the structured
 	// fields the review-fix polecat needs to orient itself on the PR branch.
 	desc := fmt.Sprintf("review_pr: %d\nbranch: %s\nsource_issue: %s",
 		state.PRNumber, state.Branch, state.SourceIssue)
@@ -431,7 +438,7 @@ func resolveReviewFixDispatchBead(rigName string, state dispatchReviewFixState) 
 		Rig:         rigName,
 	})
 	if cerr != nil {
-		return "", fmt.Errorf("creating review-fix bead (source %s closed): %w", state.SourceIssue, cerr)
+		return "", fmt.Errorf("creating review-fix bead (source %s closed/tombstoned/absent): %w", state.SourceIssue, cerr)
 	}
 	return fresh.ID, nil
 }

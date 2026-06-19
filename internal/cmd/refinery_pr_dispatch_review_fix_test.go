@@ -203,8 +203,8 @@ func TestReviewFixSlingArgs_FreshBead(t *testing.T) {
 
 // TestShouldCreateReviewFixBead pins the open/closed routing logic that decides
 // whether to sling the source bead directly or create a fresh dispatch bead.
-// Closed and absent source beads take the fresh-bead path; every other status
-// (open, hooked, in_progress, etc.) uses the source bead directly.
+// Closed, tombstoned, and absent source beads take the fresh-bead path; every
+// other status (open, hooked, in_progress, etc.) uses the source bead directly.
 func TestShouldCreateReviewFixBead(t *testing.T) {
 	cases := []struct {
 		name string
@@ -213,6 +213,7 @@ func TestShouldCreateReviewFixBead(t *testing.T) {
 	}{
 		{"nil (bead not found)", nil, true},
 		{"closed (normal post-gt-done state)", &beads.Issue{Status: "closed"}, true},
+		{"tombstone (work already completed)", &beads.Issue{Status: "tombstone"}, true},
 		{"open (bead still active)", &beads.Issue{Status: "open"}, false},
 		{"hooked (assigned to a polecat)", &beads.Issue{Status: "hooked"}, false},
 		{"in_progress", &beads.Issue{Status: "in_progress"}, false},
