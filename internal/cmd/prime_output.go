@@ -282,7 +282,7 @@ func outputReviewerContext(ctx RoleContext) {
 	fmt.Println()
 	fmt.Println("## Review Protocol (run the commands; do not improvise)")
 	fmt.Println("1. `" + cli.Name() + " reviewer checkout <pr> --sha <sha>` - check out the requested SHA")
-	fmt.Println("2. `" + cli.Name() + " reviewer perspectives` then `" + cli.Name() + " reviewer prompt <name> ...` per perspective")
+	fmt.Println("2. `" + cli.Name() + " reviewer perspectives`, then per perspective `" + cli.Name() + " reviewer prompt <name> --pr <pr> --sha <sha> --round <round> > prompt-<name>.txt` and run each as a subagent")
 	fmt.Println("3. `" + cli.Name() + " reviewer consolidate perspective-*.json --sha <sha> --out findings.json`")
 	fmt.Println("4. `" + cli.Name() + " reviewer post --pr <pr> --findings findings.json` - the ONLY sanctioned posting path")
 	fmt.Println("   Do NOT mail the verdict to the refinery and do NOT use `gh pr review`.")
