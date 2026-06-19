@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -603,6 +604,45 @@ func runRefineryPrAwaitReview(cmd *cobra.Command, args []string) error {
 	return NewSilentExit(4)
 }
 
+// branchMatchesReviewBypass reports whether branch matches any of the
+// path.Match glob patterns in patterns (e.g. "release/*"). An empty branch or
+// empty pattern never matches; a malformed pattern is skipped (treated as
+// non-matching) so a config typo fails safe by running the review rather than
+// silently skipping it.
+func branchMatchesReviewBypass(patterns []string, branch string) bool {
+	if branch == "" {
+		return false
+	}
+	for _, p := range patterns {
+		if p == "" {
+			continue
+		}
+		if ok, err := path.Match(p, branch); err == nil && ok {
+			return true
+		}
+	}
+	return false
+}
+
+// mrHeadBranch returns the PR head branch recorded on the MR bead, or "" when
+// the MR ID is empty, the bead is unreadable, or it carries no branch field.
+// Used by the review-bypass check, which fails safe (no bypass) on "".
+func mrHeadBranch(mrID string) string {
+	if mrID == "" {
+		return ""
+	}
+	bd := beads.New(resolveBeadDir(mrID))
+	issue, err := bd.Show(mrID)
+	if err != nil || issue == nil {
+		return ""
+	}
+	fields := beads.ParseMRFields(issue)
+	if fields == nil {
+		return ""
+	}
+	return fields.Branch
+}
+
 func awaitReviewInner(args []string) error {
 	prNumber, err := parsePRNumber(args[0])
 	if err != nil {
@@ -611,6 +651,17 @@ func awaitReviewInner(args []string) error {
 	provider, cfg, _, err := getRefineryPRContext()
 	if err != nil {
 		return err
+	}
+
+	// Release-branch bypass: when the PR's head branch matches a configured
+	// review-bypass glob, skip the automated review loop entirely so
+	// already-reviewed commits riding a release branch aren't relitigated.
+	// The approval and unresolved-threads gates downstream still apply.
+	if branch := mrHeadBranch(refPrAwaitMR); branchMatchesReviewBypass(cfg.ReviewBypassBranches, branch) {
+		fmt.Fprintf(os.Stdout,
+			"PR #%d: head branch %q matches a review-bypass pattern — skipping automated review loop\n",
+			prNumber, branch)
+		return nil
 	}
 
 	reviewer := firstNonEmpty(refPrAwaitReviewer, cfg.PRReviewer)

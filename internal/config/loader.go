@@ -471,6 +471,9 @@ func MergeSettingsCommand(repo, local *MergeQueueConfig) *MergeQueueConfig {
 		if local.RequireReview != nil {
 			result.RequireReview = local.RequireReview
 		}
+		if len(local.ReviewBypassBranches) > 0 {
+			result.ReviewBypassBranches = local.ReviewBypassBranches
+		}
 	}
 	return result
 }
