@@ -102,6 +102,8 @@ func TestAgentEnv_Reviewer(t *testing.T) {
 	assertEnv(t, env, "GT_RIG", "myrig")
 	assertEnv(t, env, "BD_ACTOR", "myrig/reviewer")
 	assertEnv(t, env, "GIT_AUTHOR_NAME", "myrig/reviewer")
+	assertEnv(t, env, "NODE_OPTIONS", "") // cleared to prevent debugger inheritance
+	assertEnv(t, env, "CLAUDECODE", "")   // cleared to prevent nested session detection
 }
 
 func TestAgentEnv_Deacon(t *testing.T) {
@@ -352,6 +354,15 @@ func TestAgentEnv_AgentOverrideAllRoles(t *testing.T) {
 				Agent:            "codex",
 			},
 		},
+		{
+			name: "reviewer",
+			cfg: AgentEnvConfig{
+				Role:     "reviewer",
+				Rig:      "rig1",
+				TownRoot: "/town",
+				Agent:    "gemini",
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -366,7 +377,7 @@ func TestAgentEnv_AgentOverrideAllRoles(t *testing.T) {
 // Agent is empty, for all roles. This is the default behavior.
 func TestAgentEnv_NoAgentOverrideOmitsKey(t *testing.T) {
 	t.Parallel()
-	roles := []string{"polecat", "witness", "refinery", "deacon", "crew"}
+	roles := []string{"polecat", "witness", "refinery", "reviewer", "deacon", "crew"}
 	for _, role := range roles {
 		t.Run(role, func(t *testing.T) {
 			t.Parallel()
