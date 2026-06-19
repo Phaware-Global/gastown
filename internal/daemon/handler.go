@@ -103,6 +103,17 @@ func (d *Daemon) cleanupStuckDogs(mgr *dog.Manager, sm *dog.SessionManager) {
 			continue
 		}
 
+		// Grace period: skip dogs whose work was assigned very recently.
+		// Between AssignWork and the tmux session appearing in HasSession there
+		// is a brief window (~100ms) where State=working but no session exists.
+		// Clearing work here would cause the dispatcher's verify step to falsely
+		// report "cleared between dispatch and verify" and trigger re-dispatch loops.
+		const sessionStartGracePeriod = 60 * time.Second
+		if !dg.WorkStartedAt.IsZero() && time.Since(dg.WorkStartedAt) < sessionStartGracePeriod {
+			d.logger.Printf("Handler: dog %s recently assigned (%.0fs ago), skipping stuck cleanup", dg.Name, time.Since(dg.WorkStartedAt).Seconds())
+			continue
+		}
+
 		// Dog is marked working but session is dead — clean it up.
 		d.logger.Printf("Handler: dog %s is working but session is dead, clearing work", dg.Name)
 		if err := mgr.ClearWork(dg.Name); err != nil {
