@@ -876,6 +876,12 @@ func sendEscalationEmail(cfg *config.EscalationConfig, beadID, severity, descrip
 	return smtp.SendMail(addr, auth, from, []string{to}, []byte(body))
 }
 
+// escalationHTTPClient bounds outbound escalation webhook calls. The default
+// http.Post uses http.DefaultClient (no timeout), so a slow or unreachable
+// Slack/SMS webhook would hang the escalation pipeline indefinitely. Escalation
+// is best-effort notification — fail fast rather than block.
+var escalationHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
 // sendEscalationSlack posts an escalation notification to a Slack webhook.
 func sendEscalationSlack(cfg *config.EscalationConfig, beadID, severity, description string) error {
 	severityEmoji := map[string]string{
@@ -897,7 +903,7 @@ func sendEscalationSlack(cfg *config.EscalationConfig, beadID, severity, descrip
 		return fmt.Errorf("marshaling slack payload: %w", err)
 	}
 
-	resp, err := http.Post(cfg.Contacts.SlackWebhook, "application/json", strings.NewReader(string(body)))
+	resp, err := escalationHTTPClient.Post(cfg.Contacts.SlackWebhook, "application/json", strings.NewReader(string(body)))
 	if err != nil {
 		return fmt.Errorf("posting to slack: %w", err)
 	}
@@ -921,7 +927,7 @@ func sendEscalationSMS(cfg *config.EscalationConfig, beadID, severity, descripti
 		return fmt.Errorf("marshaling sms payload: %w", err)
 	}
 
-	resp, err := http.Post(cfg.Contacts.SMSWebhook, "application/json", strings.NewReader(string(body)))
+	resp, err := escalationHTTPClient.Post(cfg.Contacts.SMSWebhook, "application/json", strings.NewReader(string(body)))
 	if err != nil {
 		return fmt.Errorf("posting to sms webhook: %w", err)
 	}
