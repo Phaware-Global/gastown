@@ -624,10 +624,13 @@ func branchMatchesReviewBypass(patterns []string, branch string) bool {
 	return false
 }
 
-// mrHeadBranch returns the PR head branch recorded on the MR bead, or "" when
-// the MR ID is empty, the bead is unreadable, or it carries no branch field.
-// Used by the review-bypass check, which fails safe (no bypass) on "".
-func mrHeadBranch(mrID string) string {
+// mrHeadBranchForPR returns the PR head branch recorded on the MR bead, but
+// only when the bead's review_pr matches prNumber — guarding against a
+// mismatched --mr bypassing review for an unrelated PR (the dispatch-review-fix
+// path makes the same association check before acting). Returns "" on any
+// uncertainty (empty/invalid MR id, unreadable bead, missing or mismatched
+// review_pr, or no branch field), which fails safe to running the review.
+func mrHeadBranchForPR(mrID string, prNumber int) string {
 	if mrID == "" {
 		return ""
 	}
@@ -640,6 +643,11 @@ func mrHeadBranch(mrID string) string {
 	bd := beads.New(resolveBeadDir(mrID))
 	issue, err := bd.Show(mrID)
 	if err != nil || issue == nil {
+		return ""
+	}
+	// Confirm the MR belongs to this PR before trusting its branch for the
+	// bypass decision.
+	if pr, perr := parsePRNumber(extractDescField(issue.Description, "review_pr")); perr != nil || pr != prNumber {
 		return ""
 	}
 	fields := beads.ParseMRFields(issue)
@@ -663,7 +671,7 @@ func awaitReviewInner(args []string) error {
 	// review-bypass glob, skip the automated review loop entirely so
 	// already-reviewed commits riding a release branch aren't relitigated.
 	// The approval and unresolved-threads gates downstream still apply.
-	if branch := mrHeadBranch(refPrAwaitMR); branchMatchesReviewBypass(cfg.ReviewBypassBranches, branch) {
+	if branch := mrHeadBranchForPR(refPrAwaitMR, prNumber); branchMatchesReviewBypass(cfg.ReviewBypassBranches, branch) {
 		fmt.Fprintf(os.Stdout,
 			"PR #%d: head branch %q matches a review-bypass pattern — skipping automated review loop\n",
 			prNumber, branch)
