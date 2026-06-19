@@ -2090,7 +2090,10 @@ func TestEnqueueReplyReminder_TelegraphJira(t *testing.T) {
 	}
 
 	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", "gt-gastown-crew-alice")
-	entries, _ := os.ReadDir(dir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 file in queue dir, got %d", len(entries))
 	}
@@ -2135,7 +2138,13 @@ func TestEnqueueReplyReminder_TelegraphGitHub(t *testing.T) {
 	}
 
 	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", "gt-gastown-crew-alice")
-	entries, _ := os.ReadDir(dir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 file in queue dir, got %d", len(entries))
+	}
 	data, err := os.ReadFile(filepath.Join(dir, entries[0].Name()))
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
@@ -2165,7 +2174,10 @@ func TestEnqueueReplyReminder_TelegraphUnknown(t *testing.T) {
 	}
 	r.enqueueReplyReminder(msg, "gt-gastown-crew-alice")
 
-	pending, _ := nudge.Pending(townRoot, "gt-gastown-crew-alice")
+	pending, err := nudge.Pending(townRoot, "gt-gastown-crew-alice")
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
 	if pending != 0 {
 		t.Errorf("unknown telegraph sender should suppress reminder, got %d queued", pending)
 	}
