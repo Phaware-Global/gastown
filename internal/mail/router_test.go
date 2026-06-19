@@ -1260,6 +1260,10 @@ func TestValidateRecipient(t *testing.T) {
 		{"crew member", "testrig/alice", false, ""},
 		{"polecat", "testrig/bob", false, ""},
 
+		// Reviewer is a spawn-on-demand singleton: its address must validate
+		// before its worktree/bead exists, or the first dispatch deadlocks.
+		{"reviewer", "testrig/reviewer", false, ""},
+
 		// Dog agents (validated via workspace fallback: deacon/dogs/<name> directory)
 		{"dog agent", "deacon/dogs/fido", false, ""},
 
