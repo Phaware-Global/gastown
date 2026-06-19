@@ -8,6 +8,32 @@ import (
 	"testing"
 )
 
+// TestOutputPrimeContext_ReviewerRendersTemplate guards the actual regression
+// this fix addresses: the role→template-name mapping in outputPrimeContext must
+// route RoleReviewer to its template. A non-empty return means the template
+// path was used; an empty string means it fell through to the unknown fallback
+// (the bug that made reviewers mail the refinery instead of posting).
+func TestOutputPrimeContext_ReviewerRendersTemplate(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	ctx := RoleContext{
+		Role:     RoleReviewer,
+		Rig:      "myrig",
+		TownRoot: townRoot,
+		WorkDir:  filepath.Join(townRoot, "myrig", "reviewer", "rig"),
+	}
+	out, err := outputPrimeContext(ctx)
+	if err != nil {
+		t.Fatalf("outputPrimeContext(reviewer) error: %v", err)
+	}
+	if out == "" {
+		t.Fatal("reviewer fell through to the unknown fallback (empty output) — role→template mapping is missing")
+	}
+	if !strings.Contains(out, "reviewer post") {
+		t.Errorf("reviewer context missing the `gt reviewer post` protocol; got:\n%s", out)
+	}
+}
+
 func TestOutputRoleDirectives(t *testing.T) {
 	t.Parallel()
 

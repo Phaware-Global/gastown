@@ -266,10 +266,12 @@ func outputRefineryContext(ctx RoleContext) {
 	fmt.Printf("Rig: %s\n", style.Dim.Render(ctx.Rig))
 }
 
-// outputReviewerContext is the degraded-mode fallback used only when role
-// template rendering fails entirely (the primary path renders
-// reviewer.md.tmpl). It states the load-bearing rule: the reviewer posts via
-// `gt reviewer post`, never by mailing the verdict or `gh pr review`.
+// outputReviewerContext is the degraded-mode fallback reached only when
+// template setup fails (templates.New() error) in outputPrimeContext; the
+// primary path renders reviewer.md.tmpl. (A RenderRole error surfaces as an
+// error rather than falling back, so it stays visible.) It states the
+// load-bearing rule: the reviewer posts via `gt reviewer post`, never by
+// mailing the verdict or `gh pr review`.
 func outputReviewerContext(ctx RoleContext) {
 	fmt.Printf("%s\n\n", style.Bold.Render("# Reviewer Context"))
 	fmt.Printf("You are the **Reviewer** for rig: %s\n\n", style.Bold.Render(ctx.Rig))
