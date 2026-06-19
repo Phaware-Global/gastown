@@ -110,6 +110,18 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 		env["BD_ACTOR"] = fmt.Sprintf("%s/refinery", cfg.Rig)
 		env["GIT_AUTHOR_NAME"] = fmt.Sprintf("%s/refinery", cfg.Rig)
 
+	case constants.RoleReviewer:
+		// Without this case the reviewer session spawned with no GT_ROLE, so
+		// `gt prime` fell back to cwd detection (which can miss in the
+		// reviewer/rig worktree) and never loaded the Reviewer role context —
+		// leaving the reviewer without its `gt reviewer post` workflow and its
+		// identity defaulting to "overseer" (no BD_ACTOR). Mirrors the
+		// witness/refinery compound-identity shape above.
+		env["GT_ROLE"] = fmt.Sprintf("%s/reviewer", cfg.Rig)
+		env["GT_RIG"] = cfg.Rig
+		env["BD_ACTOR"] = fmt.Sprintf("%s/reviewer", cfg.Rig)
+		env["GIT_AUTHOR_NAME"] = fmt.Sprintf("%s/reviewer", cfg.Rig)
+
 	case constants.RolePolecat:
 		env["GT_ROLE"] = fmt.Sprintf("%s/polecats/%s", cfg.Rig, cfg.AgentName)
 		env["GT_RIG"] = cfg.Rig
