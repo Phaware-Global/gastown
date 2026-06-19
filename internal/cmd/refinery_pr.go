@@ -631,6 +631,12 @@ func mrHeadBranch(mrID string) string {
 	if mrID == "" {
 		return ""
 	}
+	// Validate the bead ID shape before it reaches resolveBeadDir — defensive
+	// against a malformed/path-traversing MR ID; a bad shape just means no
+	// bypass (fail safe).
+	if err := validateBeadIDShape(mrID); err != nil {
+		return ""
+	}
 	bd := beads.New(resolveBeadDir(mrID))
 	issue, err := bd.Show(mrID)
 	if err != nil || issue == nil {
