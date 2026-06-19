@@ -1957,9 +1957,13 @@ func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 	if delay <= 0 {
 		return // Disabled by config
 	}
+	reminderMsg := buildReplyReminderMessage(msg.From, msg.Subject)
+	if reminderMsg == "" {
+		return // Non-sendable sender (e.g. telegraph/*) — suppress reminder
+	}
 	reminder := nudge.QueuedNudge{
 		Sender:       "system",
-		Message:      fmt.Sprintf("Remember to reply to %s (subject: %q) via `gt mail send %s` — not in chat.", msg.From, msg.Subject, msg.From),
+		Message:      reminderMsg,
 		Priority:     nudge.PriorityNormal,
 		Kind:         "reply-reminder",
 		ThreadID:     msg.ThreadID,
@@ -1967,6 +1971,22 @@ func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 	}
 	if err := nudge.Enqueue(r.townRoot, sessionID, reminder); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to enqueue reply reminder for %s: %v\n", sessionID, err)
+	}
+}
+
+// buildReplyReminderMessage returns the nudge text for a reply reminder.
+// Returns "" for one-way (non-sendable) senders such as telegraph/* to suppress the reminder entirely.
+// Telegraph senders are inbound-only; gt mail send cannot address them.
+func buildReplyReminderMessage(from, subject string) string {
+	switch {
+	case strings.HasPrefix(from, "telegraph/jira/"):
+		return fmt.Sprintf("Received mail from %s (subject: %q). To respond, use the Jira MCP tool addCommentToJiraIssue — not `gt mail send`.", from, subject)
+	case strings.HasPrefix(from, "telegraph/github/"):
+		return fmt.Sprintf("Received mail from %s (subject: %q). To respond, comment on the GitHub PR/issue directly — not `gt mail send`.", from, subject)
+	case strings.HasPrefix(from, "telegraph/"):
+		return "" // Unknown telegraph provider — inbound-only, no reply channel
+	default:
+		return fmt.Sprintf("Remember to reply to %s (subject: %q) via `gt mail send %s` — not in chat.", from, subject, from)
 	}
 }
 
