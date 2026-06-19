@@ -1141,6 +1141,8 @@ func getAgentIdentity(ctx RoleContext) string {
 		return fmt.Sprintf("%s/witness", ctx.Rig)
 	case RoleRefinery:
 		return fmt.Sprintf("%s/refinery", ctx.Rig)
+	case RoleReviewer:
+		return fmt.Sprintf("%s/reviewer", ctx.Rig)
 	default:
 		return ""
 	}
