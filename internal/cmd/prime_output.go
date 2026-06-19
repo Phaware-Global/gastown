@@ -434,6 +434,14 @@ func outputCommandQuickReference(ctx RoleContext) {
 		fmt.Printf("| Message a polecat | `%s nudge %s/<name> \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c, ctx.Rig)
 		fmt.Println("| Create issues | `bd create \"title\"` | ~~gt issue create~~ (not a command) |")
 
+	case RoleReviewer:
+		fmt.Println("| Want to... | Correct command | Common mistake |")
+		fmt.Println("|------------|----------------|----------------|")
+		fmt.Printf("| Post your review | `%s reviewer post --pr <n> --findings findings.json` | ~~gh pr review~~ (blocked), ~~gt mail send .../refinery~~ (verdict never reaches GitHub) |\n", c)
+		fmt.Printf("| Check out the PR | `%s reviewer checkout <n> --sha <sha>` | ~~git checkout~~ (skips the SHA-scoped contract) |\n", c)
+		fmt.Printf("| Finish the review | `%s reviewer done` | ~~idle at the prompt~~ (leaves the session hanging) |\n", c)
+		fmt.Println("| Approve / merge | (never) | the reviewer never approves, merges, or pushes |")
+
 	case RoleDeacon:
 		fmt.Println("| Want to... | Correct command | Common mistake |")
 		fmt.Println("|------------|----------------|----------------|")
