@@ -18,9 +18,9 @@ func (e *ErrOnSuccessFailed) Error() string {
 func (e *ErrOnSuccessFailed) Unwrap() error { return e.Err }
 
 // ErrCrossRigPrefix is returned when a bead's ID prefix does not match the
-// target rig's registered prefix. This protects against cross-rig dispatch
-// where, e.g., an `hq-` bead would be handed to a rig polecat whose DB only
-// resolves `gt-` prefixes (gt-el4 / gastownhall/gastown#3800).
+// target rig's registered prefix and does not route to the rig's beads directory.
+// This protects against cross-rig dispatch where, e.g., an `hq-` bead would be
+// handed to a rig polecat whose DB cannot resolve it and would hang in prime.
 var ErrCrossRigPrefix = errors.New("cross-rig prefix dispatch refused")
 
 // BeadIDPrefix returns the prefix of a bead ID — the substring before the

@@ -62,7 +62,7 @@ func resetCrossRigEscalationStateForTest() {
 // fireCrossRigEscalation invokes `gt escalate` with a MEDIUM severity. Best
 // effort — escalation failure is logged but does not block the dispatch path.
 var fireCrossRigEscalation = func(rig, prefix, beadID string) {
-	msg := fmt.Sprintf("cross-rig dispatch refused: rig=%s prefix=%s bead=%s — see gt-el4", rig, prefix, beadID)
+	msg := fmt.Sprintf("cross-rig dispatch refused: rig=%s prefix=%s bead=%s", rig, prefix, beadID)
 	cmd := exec.Command("gt", "escalate", "--severity", "medium", "--reason", "cross-rig-prefix", msg)
 	if err := cmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "%s cross-rig escalation failed: %v\n", style.Warning.Render("⚠"), err)
@@ -484,7 +484,7 @@ func getReadySlingContexts(townRoot string) ([]capacity.PendingBead, error) {
 
 	// 2. Batch-fetch work bead labels/status so we can defensively filter messaging
 	// beads (gt:message / gt:handoff / gt:merge-request) that should never be
-	// handed to a polecat. See gt-el4 / gastownhall/gastown#3800.
+	// handed to a polecat.
 	workBeadIDs := make([]string, 0, len(allContexts))
 	for _, ctx := range allContexts {
 		fields := beads.ParseSlingContextFields(ctx.issue.Description)
@@ -645,7 +645,7 @@ func validateDryRunDispatchPlan(townRoot string, plan capacity.DispatchPlan) cap
 }
 
 func validatePendingBeadForDispatch(townRoot string, b capacity.PendingBead, escalate bool) error {
-	// Cross-rig prefix guard (gt-el4). A bead whose ID prefix does not match the
+	// Cross-rig prefix guard. A bead whose ID prefix does not match the
 	// target rig's registered prefix must not be dispatched — the polecat would
 	// land in a rig DB that cannot resolve the bead and hang in prime.
 	if b.TargetRig == "" {
@@ -656,6 +656,16 @@ func validatePendingBeadForDispatch(townRoot string, b capacity.PendingBead, esc
 	if capacity.AcceptsPrefix(rigPrefix, b.WorkBeadID) {
 		return nil
 	}
+
+	// Secondary check: does the bead's prefix route to this rig's beads directory?
+	// A rig may have more than one prefix in routes.jsonl (e.g. both "gt-" and "gts-"
+	// map to gastown/mayor/rig when the DB config and rigs.json diverge). Accepting
+	// by routing destination rather than by a single registered prefix prevents
+	// spurious cross-rig dispatch refusals for beads in these secondary namespaces.
+	if rigAcceptsBeadViaRouting(townRoot, b.TargetRig, b.WorkBeadID) {
+		return nil
+	}
+
 	gotPrefix := capacity.BeadIDPrefix(b.WorkBeadID)
 	fmt.Fprintf(os.Stderr,
 		"%s dispatch_refused reason=cross_rig_prefix bead=%s target_rig=%s rig_prefix=%s bead_prefix=%s\n",
@@ -664,6 +674,23 @@ func validatePendingBeadForDispatch(townRoot string, b capacity.PendingBead, esc
 		fireCrossRigEscalation(b.TargetRig, gotPrefix, b.WorkBeadID)
 	}
 	return capacity.ErrCrossRigPrefix
+}
+
+// rigAcceptsBeadViaRouting reports whether a bead's prefix routes to the same
+// beads directory as the target rig. This handles rigs with multiple prefixes
+// in routes.jsonl (e.g. "gts-" and "gt-" both mapping to gastown/mayor/rig).
+func rigAcceptsBeadViaRouting(townRoot, rigName, beadID string) bool {
+	rigBeadsDir := doltserver.FindRigBeadsDir(townRoot, rigName)
+	if rigBeadsDir == "" {
+		return false
+	}
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	beadBeadsDir := beads.ResolveBeadsDirForID(townBeadsDir, beadID)
+	if beadBeadsDir == "" || beadBeadsDir == townBeadsDir {
+		// Routing fell back to town-level — bead is not in the rig's DB.
+		return false
+	}
+	return filepath.Clean(rigBeadsDir) == filepath.Clean(beadBeadsDir)
 }
 
 // isDaemonDispatch returns true when dispatch is triggered by the daemon heartbeat.
