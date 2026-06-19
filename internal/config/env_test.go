@@ -819,6 +819,7 @@ func TestAgentEnv_IncludesNodeOptionsClearing(t *testing.T) {
 		{"boot", "", ""},
 		{"witness", "myrig", ""},
 		{"refinery", "myrig", ""},
+		{"reviewer", "myrig", ""},
 		{"polecat", "myrig", "Toast"},
 		{"crew", "myrig", "emma"},
 	}
@@ -850,6 +851,7 @@ func TestAgentEnv_IncludesClaudeCodeClearing(t *testing.T) {
 		{"boot", "", ""},
 		{"witness", "myrig", ""},
 		{"refinery", "myrig", ""},
+		{"reviewer", "myrig", ""},
 		{"polecat", "myrig", "Toast"},
 		{"crew", "myrig", "emma"},
 	}
@@ -883,6 +885,7 @@ func TestAgentEnv_DisablesBdBackup(t *testing.T) {
 		{"boot", "", ""},
 		{"witness", "myrig", ""},
 		{"refinery", "myrig", ""},
+		{"reviewer", "myrig", ""},
 		{"polecat", "myrig", "Toast"},
 		{"crew", "myrig", "emma"},
 	}
@@ -1254,6 +1257,7 @@ func TestAgentEnv_InjectsDoltPort(t *testing.T) {
 		{"mayor", AgentEnvConfig{Role: "mayor", TownRoot: tmpDir}},
 		{"witness", AgentEnvConfig{Role: "witness", Rig: "myrig", TownRoot: tmpDir}},
 		{"refinery", AgentEnvConfig{Role: "refinery", Rig: "myrig", TownRoot: tmpDir}},
+		{"reviewer", AgentEnvConfig{Role: "reviewer", Rig: "myrig", TownRoot: tmpDir}},
 		{"polecat", AgentEnvConfig{Role: "polecat", Rig: "myrig", AgentName: "Toast", TownRoot: tmpDir}},
 		{"crew", AgentEnvConfig{Role: "crew", Rig: "myrig", AgentName: "emma", TownRoot: tmpDir}},
 		{"deacon", AgentEnvConfig{Role: "deacon", TownRoot: tmpDir}},
