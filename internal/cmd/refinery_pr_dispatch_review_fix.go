@@ -176,6 +176,17 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 			prNumberArg, refPrDispatchReviewFixMR, state.PRNumber))
 	}
 
+	// Release-branch bypass: a PR whose head branch matches a configured
+	// review-bypass glob skips the review loop, so there is no review-fix to
+	// dispatch. Exit 0 to advance the formula to PR.6 (wait-approval) — the
+	// same exit code used when there are no unresolved threads.
+	if cfg != nil && branchMatchesReviewBypass(cfg.ReviewBypassBranches, state.Branch) {
+		fmt.Fprintf(os.Stdout,
+			"PR #%d: head branch %q matches a review-bypass pattern — no review-fix needed\n",
+			state.PRNumber, state.Branch)
+		return nil
+	}
+
 	maxIter := 3
 	if cfg != nil && cfg.PRReviewLoopMax > 0 {
 		maxIter = cfg.PRReviewLoopMax

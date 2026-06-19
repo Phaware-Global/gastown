@@ -277,6 +277,106 @@ func TestHealth_AutoClear_AgentDead(t *testing.T) {
 }
 
 // =============================================================================
+// Session-start grace period (gt-3hy)
+// =============================================================================
+
+// TestHealth_GracePeriod_RecentlyAssigned verifies that a dog assigned within
+// the last 60 seconds is NOT auto-cleared when its session appears dead.
+// Between AssignWork and the tmux session appearing there is a brief window
+// where State=working but HasSession=false; premature auto-clear here causes
+// the "cleared between dispatch and verify" re-dispatch loop.
+func TestHealth_GracePeriod_RecentlyAssigned(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now()
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name: "alpha", State: StateWorking, Work: "plugin:rebuild-gt",
+		WorkStartedAt: now.Add(-5 * time.Second), // 5 seconds ago — within grace period
+		LastActive:    now, CreatedAt: now, UpdatedAt: now,
+	})
+
+	mc := newMockChecker()
+	mc.healthResults["hq-dog-alpha"] = tmux.SessionDead
+	hc := NewHealthChecker(m, mc)
+
+	d, _ := m.Get("alpha")
+	r := hc.Check(d, 30*time.Minute, true) // autoClear=true, but should be skipped
+
+	if r.AutoCleared {
+		t.Error("recently assigned dog must NOT be auto-cleared during grace period")
+	}
+	if r.NeedsAttention {
+		t.Error("recently assigned dog must NOT need attention during grace period")
+	}
+	if r.SessionStatus != "starting" {
+		t.Errorf("session_status = %q, want 'starting'", r.SessionStatus)
+	}
+
+	// Confirm work was NOT cleared
+	d2, _ := m.Get("alpha")
+	if d2.Work == "" {
+		t.Error("work must NOT be cleared for recently assigned dog")
+	}
+	if d2.State != StateWorking {
+		t.Errorf("state = %q, want working after grace period skip", d2.State)
+	}
+}
+
+// TestHealth_GracePeriod_Expired verifies that a dog assigned long ago IS
+// auto-cleared when its session appears dead (normal zombie reclaim).
+func TestHealth_GracePeriod_Expired(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now()
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name: "alpha", State: StateWorking, Work: "plugin:rebuild-gt",
+		WorkStartedAt: now.Add(-2 * time.Hour), // 2 hours ago — grace period expired
+		LastActive:    now, CreatedAt: now, UpdatedAt: now,
+	})
+
+	mc := newMockChecker()
+	mc.healthResults["hq-dog-alpha"] = tmux.SessionDead
+	hc := NewHealthChecker(m, mc)
+
+	d, _ := m.Get("alpha")
+	r := hc.Check(d, 30*time.Minute, true)
+
+	if !r.AutoCleared {
+		t.Error("stale zombie (grace period expired) must be auto-cleared")
+	}
+	if !r.NeedsAttention {
+		t.Error("stale zombie must need attention")
+	}
+
+	// Confirm work was cleared
+	d2, _ := m.Get("alpha")
+	if d2.Work != "" {
+		t.Errorf("work = %q, want empty after zombie auto-clear", d2.Work)
+	}
+}
+
+// TestHealth_GracePeriod_ZeroWorkStartedAt verifies that dogs with a zero
+// WorkStartedAt (legacy state without the field) are still auto-cleared.
+func TestHealth_GracePeriod_ZeroWorkStartedAt(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now()
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name: "alpha", State: StateWorking, Work: "task-1",
+		// WorkStartedAt intentionally zero — legacy state file
+		LastActive: now, CreatedAt: now, UpdatedAt: now,
+	})
+
+	mc := newMockChecker()
+	mc.healthResults["hq-dog-alpha"] = tmux.SessionDead
+	hc := NewHealthChecker(m, mc)
+
+	d, _ := m.Get("alpha")
+	r := hc.Check(d, 30*time.Minute, true)
+
+	if !r.AutoCleared {
+		t.Error("zombie with zero WorkStartedAt must still be auto-cleared")
+	}
+}
+
+// =============================================================================
 // Orphan sessions
 // =============================================================================
 

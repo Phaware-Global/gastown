@@ -90,6 +90,22 @@ func TestAgentEnv_Refinery(t *testing.T) {
 	assertEnv(t, env, "GIT_AUTHOR_NAME", "myrig/refinery")
 }
 
+func TestAgentEnv_Reviewer(t *testing.T) {
+	t.Parallel()
+	env := AgentEnv(AgentEnvConfig{
+		Role:     "reviewer",
+		Rig:      "myrig",
+		TownRoot: "/town",
+	})
+
+	assertEnv(t, env, "GT_ROLE", "myrig/reviewer") // compound format
+	assertEnv(t, env, "GT_RIG", "myrig")
+	assertEnv(t, env, "BD_ACTOR", "myrig/reviewer")
+	assertEnv(t, env, "GIT_AUTHOR_NAME", "myrig/reviewer")
+	assertEnv(t, env, "NODE_OPTIONS", "") // cleared to prevent debugger inheritance
+	assertEnv(t, env, "CLAUDECODE", "")   // cleared to prevent nested session detection
+}
+
 func TestAgentEnv_Deacon(t *testing.T) {
 	t.Parallel()
 	env := AgentEnv(AgentEnvConfig{
@@ -338,6 +354,15 @@ func TestAgentEnv_AgentOverrideAllRoles(t *testing.T) {
 				Agent:            "codex",
 			},
 		},
+		{
+			name: "reviewer",
+			cfg: AgentEnvConfig{
+				Role:     "reviewer",
+				Rig:      "rig1",
+				TownRoot: "/town",
+				Agent:    "gemini",
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -352,7 +377,7 @@ func TestAgentEnv_AgentOverrideAllRoles(t *testing.T) {
 // Agent is empty, for all roles. This is the default behavior.
 func TestAgentEnv_NoAgentOverrideOmitsKey(t *testing.T) {
 	t.Parallel()
-	roles := []string{"polecat", "witness", "refinery", "deacon", "crew"}
+	roles := []string{"polecat", "witness", "refinery", "reviewer", "deacon", "crew"}
 	for _, role := range roles {
 		t.Run(role, func(t *testing.T) {
 			t.Parallel()
@@ -794,6 +819,7 @@ func TestAgentEnv_IncludesNodeOptionsClearing(t *testing.T) {
 		{"boot", "", ""},
 		{"witness", "myrig", ""},
 		{"refinery", "myrig", ""},
+		{"reviewer", "myrig", ""},
 		{"polecat", "myrig", "Toast"},
 		{"crew", "myrig", "emma"},
 	}
@@ -825,6 +851,7 @@ func TestAgentEnv_IncludesClaudeCodeClearing(t *testing.T) {
 		{"boot", "", ""},
 		{"witness", "myrig", ""},
 		{"refinery", "myrig", ""},
+		{"reviewer", "myrig", ""},
 		{"polecat", "myrig", "Toast"},
 		{"crew", "myrig", "emma"},
 	}
@@ -858,6 +885,7 @@ func TestAgentEnv_DisablesBdBackup(t *testing.T) {
 		{"boot", "", ""},
 		{"witness", "myrig", ""},
 		{"refinery", "myrig", ""},
+		{"reviewer", "myrig", ""},
 		{"polecat", "myrig", "Toast"},
 		{"crew", "myrig", "emma"},
 	}
@@ -1229,6 +1257,7 @@ func TestAgentEnv_InjectsDoltPort(t *testing.T) {
 		{"mayor", AgentEnvConfig{Role: "mayor", TownRoot: tmpDir}},
 		{"witness", AgentEnvConfig{Role: "witness", Rig: "myrig", TownRoot: tmpDir}},
 		{"refinery", AgentEnvConfig{Role: "refinery", Rig: "myrig", TownRoot: tmpDir}},
+		{"reviewer", AgentEnvConfig{Role: "reviewer", Rig: "myrig", TownRoot: tmpDir}},
 		{"polecat", AgentEnvConfig{Role: "polecat", Rig: "myrig", AgentName: "Toast", TownRoot: tmpDir}},
 		{"crew", AgentEnvConfig{Role: "crew", Rig: "myrig", AgentName: "emma", TownRoot: tmpDir}},
 		{"deacon", AgentEnvConfig{Role: "deacon", TownRoot: tmpDir}},

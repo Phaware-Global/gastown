@@ -191,6 +191,17 @@ type MergeQueueConfig struct {
 	// Empty disables the AI review loop entirely. Only meaningful when MergeStrategy="pr".
 	PRReviewer string `json:"pr_reviewer,omitempty"`
 
+	// ReviewBypassBranches is a list of path.Match globs matched against a
+	// PR's HEAD branch. When the head branch matches, the refinery skips the
+	// automated review loop for that PR: await-review (PR.4) does not request
+	// the reviewer, and dispatch-review-fix (PR.5) is a no-op. Intended for
+	// release branches carrying already-reviewed commits to a deploy target,
+	// so approved work isn't relitigated. Only the review LOOP is bypassed —
+	// the approval and unresolved-threads gates still apply. "*" does not
+	// cross "/" (e.g. "release/*" matches "release/v2", not "release/a/b").
+	// Only meaningful when MergeStrategy="pr".
+	ReviewBypassBranches []string `json:"review_bypass_branches,omitempty"`
+
 	// PRApprover is the GitHub user whose approving review gates the merge.
 	// Required when MergeStrategy="pr" UNLESS the resolved count gate is
 	// zero — i.e., GetPRRequiredApprovals() returns 0. The two shapes
@@ -550,6 +561,7 @@ func (e *Engineer) LoadConfig() error {
 		VCSProvider          *string                   `json:"vcs_provider"`
 		RequireReview        *bool                     `json:"require_review"`
 		PRReviewer           *string                   `json:"pr_reviewer"`
+		ReviewBypassBranches []string                  `json:"review_bypass_branches"`
 		PRApprover           *string                   `json:"pr_approver"`
 		PRRequiredApprovals  *int                      `json:"pr_required_approvals"`
 		PRReviewLoopMax      *int                      `json:"pr_review_loop_max"`
@@ -648,6 +660,9 @@ func (e *Engineer) LoadConfig() error {
 	}
 	if mqRaw.PRReviewer != nil {
 		e.config.PRReviewer = *mqRaw.PRReviewer
+	}
+	if mqRaw.ReviewBypassBranches != nil {
+		e.config.ReviewBypassBranches = mqRaw.ReviewBypassBranches
 	}
 	if mqRaw.PRApprover != nil {
 		e.config.PRApprover = *mqRaw.PRApprover

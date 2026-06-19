@@ -19,7 +19,7 @@ type sessionChecker interface {
 type DogHealthResult struct {
 	Name           string        `json:"name"`
 	State          State         `json:"state"`
-	SessionStatus  string        `json:"session_status"`           // from ZombieStatus.String()
+	SessionStatus  string        `json:"session_status"`           // from ZombieStatus.String(); "starting" is also valid (grace period active)
 	WorkDuration   time.Duration `json:"work_duration,omitempty"`  // how long current work has been running
 	NeedsAttention bool          `json:"needs_attention"`
 	AutoCleared    bool          `json:"auto_cleared,omitempty"`
@@ -64,6 +64,16 @@ func (hc *HealthChecker) Check(d *Dog, maxInactivity time.Duration, autoClear bo
 		switch status {
 		case tmux.SessionDead:
 			// Zombie: state says working but session is gone.
+			// Grace period: if work was assigned recently, the session may still
+			// be starting up (between AssignWork and tmux session appearing).
+			// Auto-clearing here would race with dispatch and trigger false
+			// "cleared between dispatch and verify" escalations (gt-3hy).
+			const sessionStartGracePeriod = 60 * time.Second
+			if !d.WorkStartedAt.IsZero() && time.Since(d.WorkStartedAt) < sessionStartGracePeriod {
+				result.SessionStatus = "starting"
+				result.Recommendation = "session starting (assigned recently, grace period active)"
+				break
+			}
 			result.NeedsAttention = true
 			result.Recommendation = "zombie: session dead but state=working"
 			if autoClear {
