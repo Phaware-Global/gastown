@@ -81,11 +81,13 @@ func TestProvisionWorktree_DetachedWhenRepoHoldsBaseBranch(t *testing.T) {
 	}
 
 	// The reviewer worktree must be in detached HEAD state (no branch checked out).
-	cmd := exec.Command("git", "symbolic-ref", "--quiet", "HEAD")
+	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
 	cmd.Dir = got
-	out, _ := cmd.Output()
-	if strings.TrimSpace(string(out)) != "" {
-		t.Errorf("reviewer worktree has a branch checked out (%q); expected detached HEAD",
-			strings.TrimSpace(string(out)))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git rev-parse --abbrev-ref HEAD: %v\n%s", err, out)
+	}
+	if gotBranch := strings.TrimSpace(string(out)); gotBranch != "HEAD" {
+		t.Errorf("reviewer worktree has branch %q checked out; expected detached HEAD", gotBranch)
 	}
 }
