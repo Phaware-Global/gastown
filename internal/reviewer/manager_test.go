@@ -20,27 +20,6 @@ func runTestGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
-// initReviewerTestRepo creates a minimal rig directory structure for Manager
-// tests: a source git repo at <tmp>/mayor/rig with one commit on main.
-// Returns the rig root (tmp) and the source repo path.
-func initReviewerTestRepo(t *testing.T) (rigRoot, sourceDir string) {
-	t.Helper()
-	tmp := t.TempDir()
-	sourceDir = filepath.Join(tmp, "mayor", "rig")
-	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
-		t.Fatalf("mkdir mayor/rig: %v", err)
-	}
-	runTestGit(t, sourceDir, "init", "--initial-branch=main")
-	runTestGit(t, sourceDir, "config", "user.email", "test@test.com")
-	runTestGit(t, sourceDir, "config", "user.name", "Test")
-	if err := os.WriteFile(filepath.Join(sourceDir, "README.md"), []byte("test\n"), 0o644); err != nil {
-		t.Fatalf("write README: %v", err)
-	}
-	runTestGit(t, sourceDir, "add", ".")
-	runTestGit(t, sourceDir, "commit", "-m", "initial")
-	return tmp, sourceDir
-}
-
 // TestProvisionWorktree_DetachedWhenRepoHoldsBaseBranch verifies that the
 // reviewer worktree is provisioned successfully even when another worktree
 // (e.g. refinery/rig) already has the base branch (main) checked out.
@@ -50,22 +29,43 @@ func initReviewerTestRepo(t *testing.T) (rigRoot, sourceDir string) {
 // The fix is to use `git worktree add --detach <path> main`, which detaches
 // HEAD at main's commit without taking the branch ref.
 func TestProvisionWorktree_DetachedWhenRepoHoldsBaseBranch(t *testing.T) {
-	rigRoot, sourceDir := initReviewerTestRepo(t)
+	tmp := t.TempDir()
 
-	// Simulate refinery/rig holding main by adding a worktree on main.
-	refineryDir := filepath.Join(rigRoot, "refinery", "rig")
+	// Build a bare repo at <tmp>/.repo.git so ensureWorktree picks it as the
+	// source. A linked worktree can hold "main" without conflicting with the
+	// bare repo itself (bare repos have no working tree), which gives us
+	// clean control over which worktrees hold which branches.
+	bareDir := filepath.Join(tmp, ".repo.git")
+	if err := os.MkdirAll(bareDir, 0o755); err != nil {
+		t.Fatalf("mkdir .repo.git: %v", err)
+	}
+	// Use a staging clone to create the bare repo with an initial commit on main.
+	stageDir := t.TempDir()
+	runTestGit(t, stageDir, "init", "--initial-branch=main")
+	runTestGit(t, stageDir, "config", "user.email", "test@test.com")
+	runTestGit(t, stageDir, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(stageDir, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runTestGit(t, stageDir, "add", ".")
+	runTestGit(t, stageDir, "commit", "-m", "initial")
+	runTestGit(t, stageDir, "clone", "--bare", stageDir, bareDir)
+
+	// Add refinery/rig as a linked worktree on main — simulating the refinery
+	// holding the base branch while the reviewer is being provisioned.
+	refineryDir := filepath.Join(tmp, "refinery", "rig")
 	if err := os.MkdirAll(filepath.Dir(refineryDir), 0o755); err != nil {
 		t.Fatalf("mkdir refinery: %v", err)
 	}
-	runTestGit(t, sourceDir, "worktree", "add", refineryDir, "main")
+	runTestGit(t, bareDir, "worktree", "add", refineryDir, "main")
 
 	// The reviewer worktree must not already exist (ensureWorktree short-circuits).
-	reviewerDir := filepath.Join(rigRoot, "reviewer", "rig")
+	reviewerDir := filepath.Join(tmp, "reviewer", "rig")
 	if _, err := os.Stat(reviewerDir); err == nil {
 		t.Fatal("reviewer/rig already exists before test — unexpected")
 	}
 
-	r := &rig.Rig{Name: "test", Path: rigRoot}
+	r := &rig.Rig{Name: "test", Path: tmp}
 	m := NewManager(r)
 
 	// Before the fix this would fail: "fatal: 'main' is already checked out at …"
@@ -85,6 +85,7 @@ func TestProvisionWorktree_DetachedWhenRepoHoldsBaseBranch(t *testing.T) {
 	cmd.Dir = got
 	out, _ := cmd.Output()
 	if strings.TrimSpace(string(out)) != "" {
-		t.Errorf("reviewer worktree has a branch checked out (%q); expected detached HEAD", strings.TrimSpace(string(out)))
+		t.Errorf("reviewer worktree has a branch checked out (%q); expected detached HEAD",
+			strings.TrimSpace(string(out)))
 	}
 }
