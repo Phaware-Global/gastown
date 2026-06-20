@@ -364,6 +364,12 @@ type DaemonThresholds struct {
 	// DeaconGracePeriod is time to wait after starting Deacon before checking heartbeat (default "5m").
 	DeaconGracePeriod string `json:"deacon_grace_period,omitempty"`
 
+	// RefineryHungThreshold is how long a refinery session can be process-alive
+	// but produce no tmux output before being treated as hung and eligible for
+	// respawn (default "30m"). A zombie-aware spawn-gate: avoids killing healthy
+	// idle refineries while catching sessions stalled for hours (e.g. gt-cza).
+	RefineryHungThreshold string `json:"refinery_hung_threshold,omitempty"`
+
 	// PressureCPUThreshold is the per-core load average above which new
 	// non-infrastructure spawns are deferred. Disabled by default (0).
 	// Recommended starting value: 3.0 (only trips under severe load).
