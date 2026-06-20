@@ -37,48 +37,53 @@ func CheckPressureConfig(cfg PressureConfig) PressureResult {
 		return PressureResult{OK: true}
 	}
 
+	// Collect all metrics before evaluating thresholds so the result is always
+	// fully populated (avoids truncated JSON output on the first failing check).
 	var result PressureResult
 	result.OK = true
 
+	numCPU := runtime.NumCPU()
 	if cfg.CPUThreshold > 0 {
 		result.LoadAvg1 = loadAverage1()
-		numCPU := float64(runtime.NumCPU())
-		loadPerCore := result.LoadAvg1 / numCPU
-		if loadPerCore > cfg.CPUThreshold {
-			result.OK = false
-			result.Reason = fmt.Sprintf("cpu pressure: load/core %.2f exceeds threshold %.2f (load=%.1f, cores=%d)",
-				loadPerCore, cfg.CPUThreshold, result.LoadAvg1, int(numCPU))
-			return result
-		}
 	}
-
 	if cfg.MemThresholdGB > 0 {
 		result.MemAvailableGB = availableMemoryGB()
-		if result.MemAvailableGB > 0 && result.MemAvailableGB < cfg.MemThresholdGB {
-			result.OK = false
-			result.Reason = fmt.Sprintf("memory pressure: %.1fGB available, minimum %.1fGB",
-				result.MemAvailableGB, cfg.MemThresholdGB)
-			return result
-		}
 	}
-
 	if cfg.MaxSessions > 0 {
 		t := tmux.NewTmux()
 		sessions, err := t.ListSessions()
 		if err == nil {
-			count := 0
 			for _, name := range sessions {
 				if isAgentSession(name) {
-					count++
+					result.ActiveSessions++
 				}
 			}
-			result.ActiveSessions = count
-			if result.ActiveSessions >= cfg.MaxSessions {
-				result.OK = false
-				result.Reason = fmt.Sprintf("session cap: %d active sessions, max %d",
-					result.ActiveSessions, cfg.MaxSessions)
-				return result
-			}
+		}
+	}
+
+	// Evaluate thresholds in order; first failure sets Reason and clears OK.
+	if cfg.CPUThreshold > 0 && numCPU > 0 {
+		loadPerCore := result.LoadAvg1 / float64(numCPU)
+		if loadPerCore > cfg.CPUThreshold {
+			result.OK = false
+			result.Reason = fmt.Sprintf("cpu pressure: load/core %.2f exceeds threshold %.2f (load=%.1f, cores=%d)",
+				loadPerCore, cfg.CPUThreshold, result.LoadAvg1, numCPU)
+		}
+	}
+
+	if result.OK && cfg.MemThresholdGB > 0 {
+		if result.MemAvailableGB > 0 && result.MemAvailableGB < cfg.MemThresholdGB {
+			result.OK = false
+			result.Reason = fmt.Sprintf("memory pressure: %.1fGB available, minimum %.1fGB",
+				result.MemAvailableGB, cfg.MemThresholdGB)
+		}
+	}
+
+	if result.OK && cfg.MaxSessions > 0 {
+		if result.ActiveSessions >= cfg.MaxSessions {
+			result.OK = false
+			result.Reason = fmt.Sprintf("session cap: %d active sessions, max %d",
+				result.ActiveSessions, cfg.MaxSessions)
 		}
 	}
 

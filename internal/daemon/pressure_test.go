@@ -21,22 +21,23 @@ func TestCheckPressureConfig_CPUThresholdNotExceeded(t *testing.T) {
 }
 
 func TestCheckPressureConfig_CPUThresholdExceeded(t *testing.T) {
-	// Threshold of 0.0001 per core will always fire unless the machine is idle.
-	// We synthesize the scenario by checking that the raw load avg / numCPU path works.
+	// Use an absolute threshold of 0.0001/core — fires on any non-idle machine
+	// without sampling the live load and re-reading it inside CheckPressureConfig
+	// (which would introduce a TOCTOU race and flaky results).
+	if runtime.NumCPU() < 1 {
+		t.Skip("cannot test CPU check: NumCPU < 1")
+	}
+	result := CheckPressureConfig(PressureConfig{CPUThreshold: 0.0001})
+	// The test is only meaningful if the machine has any load at all.
 	load := loadAverage1()
-	numCPU := float64(runtime.NumCPU())
-	loadPerCore := load / numCPU
-
-	// Set threshold just below current per-core load.
-	if loadPerCore > 0 {
-		result := CheckPressureConfig(PressureConfig{CPUThreshold: loadPerCore * 0.5})
-		if result.OK {
-			t.Errorf("threshold below current load should return OK=false (load/core=%.2f, threshold=%.2f)",
-				loadPerCore, loadPerCore*0.5)
-		}
-		if result.Reason == "" {
-			t.Error("blocked result should have a non-empty Reason")
-		}
+	if load <= 0 {
+		t.Skip("machine reports zero load; skipping threshold-exceeded check")
+	}
+	if result.OK {
+		t.Errorf("threshold 0.0001/core should fire on a loaded machine (load=%.2f), got OK=true", load)
+	}
+	if result.Reason == "" {
+		t.Error("blocked result should have a non-empty Reason")
 	}
 }
 
@@ -47,7 +48,11 @@ func TestCheckPressureConfig_MemThreshold(t *testing.T) {
 		t.Errorf("mem threshold 0 (disabled) should return OK=true: %s", result.Reason)
 	}
 
-	// Threshold of 999 TB should fire on any real machine.
+	// Threshold of 999 TB should fire on any real machine — skip on platforms
+	// where availableMemoryGB() returns 0 (unsupported/Windows).
+	if availableMemoryGB() == 0 {
+		t.Skip("availableMemoryGB() unsupported on this platform; skipping threshold-exceeded check")
+	}
 	result2 := CheckPressureConfig(PressureConfig{MemThresholdGB: 999999.0})
 	if result2.OK {
 		t.Error("mem threshold 999999 GB should return OK=false")

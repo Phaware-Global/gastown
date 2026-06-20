@@ -71,7 +71,7 @@ func runPressureCheck(_ *cobra.Command, _ []string) error {
 	}
 
 	if !result.OK {
-		os.Exit(1)
+		return NewSilentExit(1)
 	}
 	return nil
 }
@@ -84,8 +84,8 @@ func printPressureResult(result daemon.PressureResult, allDisabled bool, asJSON 
 			LoadAvg1       float64 `json:"load_avg_1"`
 			LoadPerCore    float64 `json:"load_per_core"`
 			NumCPU         int     `json:"num_cpu"`
-			MemAvailableGB float64 `json:"mem_available_gb,omitempty"`
-			ActiveSessions int     `json:"active_sessions,omitempty"`
+			MemAvailableGB float64 `json:"mem_available_gb"`
+			ActiveSessions int     `json:"active_sessions"`
 		}
 		numCPU := runtime.NumCPU()
 		var loadPerCore float64
