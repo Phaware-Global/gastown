@@ -188,6 +188,35 @@ func TestRenderRole_Refinery_DefaultBranch(t *testing.T) {
 	}
 }
 
+func TestRenderRole_Reviewer(t *testing.T) {
+	tmpl, err := New()
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	data := RoleData{
+		Role:     "reviewer",
+		RigName:  "myrig",
+		TownRoot: "/test/town",
+		TownName: "town",
+		WorkDir:  "/test/town/myrig/reviewer/rig",
+	}
+
+	output, err := tmpl.RenderRole("reviewer", data)
+	if err != nil {
+		t.Fatalf("RenderRole() error = %v", err)
+	}
+
+	// The reviewer must be told its sanctioned posting path; this is the
+	// load-bearing instruction whose absence made reviewers mail the refinery.
+	if !strings.Contains(output, "reviewer post") {
+		t.Error("reviewer template missing the `gt reviewer post` posting step")
+	}
+	if !strings.Contains(output, "myrig") {
+		t.Error("reviewer template did not render the rig name")
+	}
+}
+
 func TestRenderMessage_Spawn(t *testing.T) {
 	tmpl, err := New()
 	if err != nil {
