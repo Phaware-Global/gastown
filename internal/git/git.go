@@ -2042,8 +2042,9 @@ func (g *Git) GhPrSubmitReview(prNumber int, commitID, body, event string, comme
 		return fmt.Errorf("gh pr review: commit_id is required when submitting inline comments")
 	}
 	// Default to COMMENT (advisory) when the caller leaves event empty, preserving
-	// the historical behavior. A non-empty event must be one of GitHub's three
-	// review dispositions.
+	// the historical behavior. Normalize case/whitespace so a stray " comment "
+	// is accepted, then require one of GitHub's three review dispositions.
+	event = strings.ToUpper(strings.TrimSpace(event))
 	if event == "" {
 		event = "COMMENT"
 	}

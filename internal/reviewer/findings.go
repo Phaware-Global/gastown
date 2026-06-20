@@ -103,7 +103,14 @@ func (fs *Findings) ReviewEvent() string {
 	}
 	hasMedium := false
 	for _, f := range fs.Findings {
-		switch f.Priority {
+		// Normalize defensively for Findings built outside ParseFindings (tests,
+		// other callers): an empty priority is "medium" (advisory) per
+		// normalizeFinding, so it must not fall through to APPROVE.
+		priority := strings.ToLower(strings.TrimSpace(f.Priority))
+		if priority == "" {
+			priority = "medium"
+		}
+		switch priority {
 		case "high":
 			return "REQUEST_CHANGES"
 		case "medium":

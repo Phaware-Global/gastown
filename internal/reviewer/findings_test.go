@@ -181,6 +181,7 @@ func TestReviewEvent_SeverityDerived(t *testing.T) {
 		{"clean", nil, "APPROVE"},
 		{"low only", []string{"low", "low"}, "APPROVE"},
 		{"medium caps at comment", []string{"low", "medium"}, "COMMENT"},
+		{"empty priority treated as medium", []string{""}, "COMMENT"},
 		{"has high", []string{"low", "high", "medium"}, "REQUEST_CHANGES"},
 	}
 	for _, tc := range cases {
