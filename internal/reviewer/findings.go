@@ -103,17 +103,17 @@ func (fs *Findings) ReviewEvent() string {
 	}
 	hasMedium := false
 	for _, f := range fs.Findings {
-		// Normalize defensively for Findings built outside ParseFindings (tests,
-		// other callers): an empty priority is "medium" (advisory) per
-		// normalizeFinding, so it must not fall through to APPROVE.
-		priority := strings.ToLower(strings.TrimSpace(f.Priority))
-		if priority == "" {
-			priority = "medium"
-		}
-		switch priority {
+		// Normalize defensively for Findings built outside ParseFindings (which
+		// rejects bad priorities). Only an explicit "low" permits APPROVE; an
+		// empty priority is "medium" (advisory) per normalizeFinding, and any
+		// unrecognized value is treated as medium too, so a malformed/typo
+		// priority can never yield an accidental APPROVE.
+		switch strings.ToLower(strings.TrimSpace(f.Priority)) {
 		case "high":
 			return "REQUEST_CHANGES"
-		case "medium":
+		case "low":
+			// nits-only — non-blocking, permits APPROVE
+		default: // "medium", empty, or any unrecognized priority
 			hasMedium = true
 		}
 	}
