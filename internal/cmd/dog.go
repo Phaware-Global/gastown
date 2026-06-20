@@ -1211,26 +1211,30 @@ func runDogDispatch(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Verify the work state write is readable. A read-back failure here
-	// indicates state corruption, not a timing race.
-	// See: github.com/steveyegge/gastown/issues/2748
-	result.WorkConfirmed = false
-	if d, getErr := mgr.Get(targetDog.Name); getErr != nil {
-		warn := fmt.Sprintf("dog dispatch: could not verify work assignment for %s: %v", targetDog.Name, getErr)
-		result.Warnings = append(result.Warnings, warn)
-		if !dogDispatchJSON {
-			style.PrintWarning("%s", warn)
+	// Verify the work state write is readable, but only when session start
+	// succeeded. If session start failed we rolled back via ClearWork above,
+	// so Work="" is intentional — emitting "re-dispatch required" here would
+	// trigger a deacon re-dispatch loop on top of the session-start escalation
+	// already sent. See: github.com/steveyegge/gastown/issues/2748, gt-3hy.
+	if result.SessionStarted {
+		result.WorkConfirmed = false
+		if d, getErr := mgr.Get(targetDog.Name); getErr != nil {
+			warn := fmt.Sprintf("dog dispatch: could not verify work assignment for %s: %v", targetDog.Name, getErr)
+			result.Warnings = append(result.Warnings, warn)
+			if !dogDispatchJSON {
+				style.PrintWarning("%s", warn)
+			}
+			_ = dogEscalateBestEffort(warn)
+		} else if d.Work != "" {
+			result.WorkConfirmed = true
+		} else {
+			warn := fmt.Sprintf("dog dispatch: work assignment cleared for %s between dispatch and verify — re-dispatch required", targetDog.Name)
+			result.Warnings = append(result.Warnings, warn)
+			if !dogDispatchJSON {
+				style.PrintWarning("%s", warn)
+			}
+			_ = dogEscalateBestEffort(warn)
 		}
-		_ = dogEscalateBestEffort(warn)
-	} else if d.Work != "" {
-		result.WorkConfirmed = true
-	} else {
-		warn := fmt.Sprintf("dog dispatch: work assignment cleared for %s between dispatch and verify — re-dispatch required", targetDog.Name)
-		result.Warnings = append(result.Warnings, warn)
-		if !dogDispatchJSON {
-			style.PrintWarning("%s", warn)
-		}
-		_ = dogEscalateBestEffort(warn)
 	}
 
 	// Success - output result

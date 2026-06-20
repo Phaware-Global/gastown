@@ -44,6 +44,8 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 		roleName = constants.RoleWitness
 	case RoleRefinery:
 		roleName = constants.RoleRefinery
+	case RoleReviewer:
+		roleName = constants.RoleReviewer
 	case RolePolecat:
 		roleName = constants.RolePolecat
 	case RoleCrew:
@@ -174,6 +176,8 @@ func outputPrimeContextFallback(ctx RoleContext) {
 		outputWitnessContext(ctx)
 	case RoleRefinery:
 		outputRefineryContext(ctx)
+	case RoleReviewer:
+		outputReviewerContext(ctx)
 	case RolePolecat:
 		outputPolecatContext(ctx)
 	case RoleCrew:
@@ -257,6 +261,32 @@ func outputRefineryContext(ctx RoleContext) {
 	fmt.Println("## Hookable Mail")
 	fmt.Println("Mail can be hooked for ad-hoc instructions: `" + cli.Name() + " hook attach <mail-id>`")
 	fmt.Println("If mail is on your hook, read and execute its instructions (GUPP applies).")
+	fmt.Println()
+	outputCommandQuickReference(ctx)
+	fmt.Printf("Rig: %s\n", style.Dim.Render(ctx.Rig))
+}
+
+// outputReviewerContext is the degraded-mode fallback reached only when
+// template setup fails (templates.New() error) in outputPrimeContext; the
+// primary path renders reviewer.md.tmpl. (A RenderRole error surfaces as an
+// error rather than falling back, so it stays visible.) It states the
+// load-bearing rule: the reviewer posts via `gt reviewer post`, never by
+// mailing the verdict or `gh pr review`.
+func outputReviewerContext(ctx RoleContext) {
+	fmt.Printf("%s\n\n", style.Bold.Render("# Reviewer Context"))
+	fmt.Printf("You are the **Reviewer** for rig: %s\n\n", style.Bold.Render(ctx.Rig))
+	fmt.Println("## Responsibilities")
+	fmt.Println("- Review the PR named in your hooked/mailed review request")
+	fmt.Println("- Post findings as a single GitHub review — you are the only agent that posts PR reviews")
+	fmt.Println("- Never approve, never merge, never push (the worktree is checkout-only)")
+	fmt.Println()
+	fmt.Println("## Review Protocol (run the commands; do not improvise)")
+	fmt.Println("1. `" + cli.Name() + " reviewer checkout <pr> --sha <sha>` - check out the requested SHA")
+	fmt.Println("2. `" + cli.Name() + " reviewer perspectives`, then per perspective `" + cli.Name() + " reviewer prompt <name> --pr <pr> --sha <sha> --round <round> > prompt-<name>.txt` and run each as a subagent")
+	fmt.Println("3. `" + cli.Name() + " reviewer consolidate perspective-*.json --sha <sha> --out findings.json`")
+	fmt.Println("4. `" + cli.Name() + " reviewer post --pr <pr> --findings findings.json` - the ONLY sanctioned posting path")
+	fmt.Println("   Do NOT mail the verdict to the refinery and do NOT use `gh pr review`.")
+	fmt.Println("5. `" + cli.Name() + " reviewer done` - close your review bead and self-terminate")
 	fmt.Println()
 	outputCommandQuickReference(ctx)
 	fmt.Printf("Rig: %s\n", style.Dim.Render(ctx.Rig))
@@ -405,6 +435,14 @@ func outputCommandQuickReference(ctx RoleContext) {
 		fmt.Printf("| Check merge queue | `%s mq list %s` | ~~git branch -r \\| grep polecat~~ (misses MRs) |\n", c, ctx.Rig)
 		fmt.Printf("| Message a polecat | `%s nudge %s/<name> \"msg\"` | ~~tmux send-keys~~ (unreliable) |\n", c, ctx.Rig)
 		fmt.Println("| Create issues | `bd create \"title\"` | ~~gt issue create~~ (not a command) |")
+
+	case RoleReviewer:
+		fmt.Println("| Want to... | Correct command | Common mistake |")
+		fmt.Println("|------------|----------------|----------------|")
+		fmt.Printf("| Post your review | `%s reviewer post --pr <n> --findings findings.json` | ~~gh pr review~~ (blocked), ~~gt mail send .../refinery~~ (verdict never reaches GitHub) |\n", c)
+		fmt.Printf("| Check out the PR | `%s reviewer checkout <n> --sha <sha>` | ~~git checkout~~ (skips the SHA-scoped contract) |\n", c)
+		fmt.Printf("| Finish the review | `%s reviewer done` | ~~idle at the prompt~~ (leaves the session hanging) |\n", c)
+		fmt.Println("| Approve / merge | (never) | the reviewer never approves, merges, or pushes |")
 
 	case RoleDeacon:
 		fmt.Println("| Want to... | Correct command | Common mistake |")

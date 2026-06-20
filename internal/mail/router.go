@@ -1027,13 +1027,15 @@ func (r *Router) validateRecipient(identity string) error {
 		return nil
 	}
 
-	// Well-known rig-level singletons (rig/witness, rig/refinery) always
-	// valid — these agents are ephemeral and may not have an active session,
-	// but mail queues for the next session that starts.
+	// Well-known rig-level singletons (rig/witness, rig/refinery, rig/reviewer)
+	// always valid — these agents are ephemeral and may not have an active
+	// session, but mail queues for the next session that starts. The reviewer
+	// is spawn-on-demand: its worktree/session is created only when the first
+	// review request is dispatched, so it must validate before it exists.
 	parts := strings.SplitN(identity, "/", 3)
 	if len(parts) == 2 {
 		switch parts[1] {
-		case "witness", "refinery":
+		case constants.RoleWitness, constants.RoleRefinery, constants.RoleReviewer:
 			return nil
 		}
 	}
@@ -1955,9 +1957,13 @@ func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 	if delay <= 0 {
 		return // Disabled by config
 	}
+	reminderMsg := buildReplyReminderMessage(msg.From, msg.Subject)
+	if reminderMsg == "" {
+		return // Non-sendable sender (e.g. telegraph/*) — suppress reminder
+	}
 	reminder := nudge.QueuedNudge{
 		Sender:       "system",
-		Message:      fmt.Sprintf("Remember to reply to %s (subject: %q) via `gt mail send %s` — not in chat.", msg.From, msg.Subject, msg.From),
+		Message:      reminderMsg,
 		Priority:     nudge.PriorityNormal,
 		Kind:         "reply-reminder",
 		ThreadID:     msg.ThreadID,
@@ -1965,6 +1971,22 @@ func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 	}
 	if err := nudge.Enqueue(r.townRoot, sessionID, reminder); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to enqueue reply reminder for %s: %v\n", sessionID, err)
+	}
+}
+
+// buildReplyReminderMessage returns the nudge text for a reply reminder.
+// Returns "" for one-way (non-sendable) senders such as telegraph/* to suppress the reminder entirely.
+// Telegraph senders are inbound-only; gt mail send cannot address them.
+func buildReplyReminderMessage(from, subject string) string {
+	switch {
+	case strings.HasPrefix(from, "telegraph/jira/"):
+		return fmt.Sprintf("Received mail from %s (subject: %q). To respond, use the Jira MCP tool addCommentToJiraIssue — not `gt mail send`.", from, subject)
+	case strings.HasPrefix(from, "telegraph/github/"):
+		return fmt.Sprintf("Received mail from %s (subject: %q). To respond, comment on the GitHub PR/issue directly — not `gt mail send`.", from, subject)
+	case strings.HasPrefix(from, "telegraph/"):
+		return "" // Unknown telegraph provider — inbound-only, no reply channel
+	default:
+		return fmt.Sprintf("Remember to reply to %s (subject: %q) via `gt mail send %s` — not in chat.", from, subject, from)
 	}
 }
 

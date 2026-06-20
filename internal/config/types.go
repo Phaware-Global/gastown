@@ -1410,6 +1410,24 @@ type MergeQueueConfig struct {
 	// merge_strategy="pr".
 	PRReviewer string `json:"pr_reviewer,omitempty"`
 
+	// ReviewBypassBranches is a list of path.Match glob patterns matched
+	// against a PR's HEAD branch name. When a PR's head branch matches any
+	// pattern, the refinery skips the automated review loop for that PR:
+	// await-review (PR.4) does not request the reviewer bot, and
+	// dispatch-review-fix (PR.5) is a no-op. This is for release branches
+	// that carry already-reviewed commits to a deploy target — re-reviewing
+	// them just relitigates approved work.
+	//
+	// Scope is deliberately narrow: only the review LOOP is bypassed. The
+	// human approval gate (PRApprover / PRRequiredApprovals) and the
+	// unresolved-threads gate still apply, so a release PR is not an
+	// unguarded merge — it just isn't sent back through bot review. Patterns
+	// use Go path.Match syntax, so "*" does not cross "/" (e.g. "release/*"
+	// matches "release/v2" but not "release/2024/v2"). Empty/absent means no
+	// branch bypasses review (existing behavior). Only meaningful when
+	// merge_strategy="pr".
+	ReviewBypassBranches []string `json:"review_bypass_branches,omitempty"`
+
 	// PRApprover is the GitHub user whose approving review gates the merge.
 	// Required when merge_strategy="pr" UNLESS the resolved count gate is
 	// zero — i.e., GetPRRequiredApprovals() returns 0. The two shapes that

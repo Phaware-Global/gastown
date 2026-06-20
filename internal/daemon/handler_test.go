@@ -447,3 +447,59 @@ func TestFindDispatchableDog_PicksFirstIdleWhenNoSessionsLive(t *testing.T) {
 		t.Errorf("findDispatchableDog = %q, want alpha or bravo", got.Name)
 	}
 }
+
+// testSetupWorkingDogWithStartTime creates a working dog with WorkStartedAt set.
+func testSetupWorkingDogWithStartTime(t *testing.T, townRoot, name, work string, lastActive, workStartedAt time.Time) {
+	t.Helper()
+
+	kennelDir := filepath.Join(townRoot, "deacon", "dogs", name)
+	if err := os.MkdirAll(kennelDir, 0755); err != nil {
+		t.Fatalf("Failed to create kennel dir for %s: %v", name, err)
+	}
+
+	ds := &dog.DogState{
+		Name:          name,
+		State:         dog.StateWorking,
+		Work:          work,
+		LastActive:    lastActive,
+		WorkStartedAt: workStartedAt,
+		Worktrees:     map[string]string{},
+		CreatedAt:     lastActive,
+		UpdatedAt:     lastActive,
+	}
+
+	data, err := json.MarshalIndent(ds, "", "  ")
+	if err != nil {
+		t.Fatalf("Failed to marshal dog state: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(kennelDir, ".dog.json"), data, 0644); err != nil {
+		t.Fatalf("Failed to write dog state: %v", err)
+	}
+}
+
+func TestCleanupStuckDogs_GracePeriodSkipsRecentlyAssigned(t *testing.T) {
+	townRoot := t.TempDir()
+	d := testHandlerDaemon(t, townRoot)
+
+	rigsConfig := &config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}}
+	mgr := dog.NewManager(townRoot, rigsConfig)
+	sm := dog.NewSessionManager(tmux.NewTmux(), townRoot, mgr)
+
+	// Dog assigned work 5 seconds ago — within the 60s grace period.
+	// No tmux session exists (HasSession=false), but cleanup must be skipped.
+	testSetupWorkingDogWithStartTime(t, townRoot, "new-dog", "some-molecule",
+		time.Now().Add(-5*time.Second), time.Now().Add(-5*time.Second))
+
+	d.cleanupStuckDogs(mgr, sm)
+
+	dg, err := mgr.Get("new-dog")
+	if err != nil {
+		t.Fatalf("Get() error: %v", err)
+	}
+	if dg.State != dog.StateWorking {
+		t.Errorf("dog state = %q, want working (grace period should protect it)", dg.State)
+	}
+	if dg.Work == "" {
+		t.Error("dog work was cleared; grace period should have prevented cleanup")
+	}
+}
