@@ -24,7 +24,7 @@ for arg in "$@"; do
   case "$arg" in
     show) IS_SHOW=1 ;;
     list) IS_LIST=1 ;;
-    gt-rig-*) BEAD_ID="$arg" ;;
+    *-rig-*) BEAD_ID="$arg" ;;
   esac
 done
 if [ "${IS_LIST:-0}" = "1" ]; then
@@ -78,8 +78,8 @@ esac
 // that is alive AND has recent activity (current Unix timestamp).
 func writeFakeHealthyRefineryTmux(t *testing.T, dir, tmuxLog string) {
 	t.Helper()
-	// Use a timestamp far in the future so the session always looks recent.
-	recentTimestamp := fmt.Sprintf("%d", time.Now().Add(time.Hour).Unix())
+	// Use the current Unix timestamp so the session looks recently active.
+	recentTimestamp := fmt.Sprintf("%d", time.Now().Unix())
 	script := fmt.Sprintf(`#!/bin/sh
 LOG_FILE="%s"
 printf "%%s\n" "$*" >> "$LOG_FILE"

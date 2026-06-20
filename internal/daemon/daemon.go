@@ -1900,8 +1900,15 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 	hung := d.loadOperationalConfig().GetDaemonConfig().RefineryHungThresholdD()
 	if status := mgr.IsHealthy(hung); status == tmux.AgentHung {
 		d.logger.Printf("Refinery for %s is zombie (no activity for >%v), reaping for respawn", rigName, hung)
-		if err := mgr.Stop(); err != nil && err != refinery.ErrNotRunning {
-			d.logger.Printf("Error stopping hung refinery for %s: %v", rigName, err)
+		sessionName := mgr.SessionName()
+		if err := d.tmux.KillSessionWithProcesses(sessionName); err != nil {
+			d.logger.Printf("Error killing hung refinery session %s: %v", sessionName, err)
+			return
+		}
+		// Re-check the event gate after reaping: if the queue is empty, don't
+		// burn credits spawning a new session — let the next cycle handle it.
+		if !d.hasPendingEvents("refinery") {
+			d.logger.Printf("Refinery for %s reaped; no pending events, skipping respawn", rigName)
 			return
 		}
 	}
