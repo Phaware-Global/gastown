@@ -262,7 +262,13 @@ func (m *Manager) provisionWorktree(reviewerRigDir, sourceDir string) error {
 		srcGit = git.NewGit(sourceDir)
 	}
 	_ = srcGit.WorktreePrune()
-	if err := srcGit.WorktreeAddExisting(reviewerRigDir, m.rig.DefaultBranch()); err != nil {
+	// Use a detached HEAD so the reviewer worktree never holds a branch ref.
+	// WorktreeAddExisting would check out the base branch (e.g. "main"), which
+	// fails when the refinery already has it checked out in its own worktree —
+	// git forbids two non-detached worktrees on the same branch. The reviewer
+	// always does detached checkouts (gt reviewer checkout) anyway, so starting
+	// detached at the same commit is correct and collision-free.
+	if err := srcGit.WorktreeAddDetached(reviewerRigDir, m.rig.DefaultBranch()); err != nil {
 		return fmt.Errorf("git worktree add: %w", err)
 	}
 	if err := git.NewGit(reviewerRigDir).ConfigureHooksPath(); err != nil {
