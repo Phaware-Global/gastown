@@ -2018,13 +2018,20 @@ type GhReviewComment struct {
 }
 
 // GhPrSubmitReview submits a single PR review via the GitHub API (one POST to
-// .../pulls/{n}/reviews), always with event=COMMENT — the Reviewer role never
-// approves or requests changes (P23-2376). body is the top-level summary;
-// comments are inline threads (each defaults to the RIGHT diff side); commitID,
-// when non-empty, anchors the review to a specific head SHA so it is
-// SHA-scoped for the refinery's engagement gate. The payload is passed on
-// stdin so an arbitrary number of comments submits atomically in one review.
-func (g *Git) GhPrSubmitReview(prNumber int, commitID, body string, comments []GhReviewComment) error {
+// .../pulls/{n}/reviews). event is the review disposition — "APPROVE",
+// "REQUEST_CHANGES", or "COMMENT" (empty defaults to "COMMENT"); the in-town
+// Reviewer sets it from its findings so the GitHub verdict matches their
+// severity instead of always reading as an advisory comment (P23-2376). body is
+// the top-level summary; comments are inline threads (each defaults to the RIGHT
+// diff side); commitID, when non-empty, anchors the review to a specific head
+// SHA so it is SHA-scoped for the refinery's engagement gate. The payload is
+// passed on stdin so an arbitrary number of comments submits atomically in one
+// review.
+//
+// Note: GitHub rejects APPROVE/REQUEST_CHANGES on the caller's own PR. The
+// Reviewer runs as a distinct account from the PR author, so this is safe in
+// the sanctioned path; a caller that may review its own PR should pass COMMENT.
+func (g *Git) GhPrSubmitReview(prNumber int, commitID, body, event string, comments []GhReviewComment) error {
 	if body == "" && len(comments) == 0 {
 		return fmt.Errorf("gh pr review: must have a summary body or at least one comment")
 	}
@@ -2034,7 +2041,18 @@ func (g *Git) GhPrSubmitReview(prNumber int, commitID, body string, comments []G
 	if len(comments) > 0 && commitID == "" {
 		return fmt.Errorf("gh pr review: commit_id is required when submitting inline comments")
 	}
-	payload := map[string]any{"event": "COMMENT"}
+	// Default to COMMENT (advisory) when the caller leaves event empty, preserving
+	// the historical behavior. A non-empty event must be one of GitHub's three
+	// review dispositions.
+	if event == "" {
+		event = "COMMENT"
+	}
+	switch event {
+	case "APPROVE", "REQUEST_CHANGES", "COMMENT":
+	default:
+		return fmt.Errorf("gh pr review: invalid event %q (want APPROVE, REQUEST_CHANGES, or COMMENT)", event)
+	}
+	payload := map[string]any{"event": event}
 	if body != "" {
 		payload["body"] = body
 	}

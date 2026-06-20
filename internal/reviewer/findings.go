@@ -59,10 +59,55 @@ type Findings struct {
 	// Findings are the individual inline findings. May be empty (a clean review
 	// still posts a summary).
 	Findings []Finding `json:"findings"`
+	// Disposition optionally overrides the GitHub review event the Reviewer
+	// submits: "approve", "request_changes", or "comment" (case-insensitive).
+	// When empty, the event is derived from finding severity (see ReviewEvent).
+	// Lets a perspective pass assert a blocking verdict explicitly while keeping
+	// a deterministic default when the agent omits it.
+	Disposition string `json:"disposition,omitempty"`
 }
 
 // validPriorities is the closed set of priorities the badge/parser pair models.
 var validPriorities = map[string]bool{"high": true, "medium": true, "low": true}
+
+// validDispositions maps the findings-payload disposition (lowercased) to the
+// GitHub review event it selects. The closed set keeps a typo from silently
+// degrading a blocking verdict into a comment.
+var validDispositions = map[string]string{
+	"approve":         "APPROVE",
+	"request_changes": "REQUEST_CHANGES",
+	"comment":         "COMMENT",
+}
+
+// ReviewEvent returns the GitHub review disposition for these findings:
+// "APPROVE", "REQUEST_CHANGES", or "COMMENT". An explicit Disposition wins;
+// otherwise it is derived from the highest severity present:
+//
+//	high   → REQUEST_CHANGES (blocking; must be addressed)
+//	medium → COMMENT         (advisory; worth fixing, not a block)
+//	low / none → APPROVE      (nits-only or clean — the Reviewer endorses it)
+//
+// The in-town Reviewer is a real reviewer: a clean or nits-only pass APPROVEs so
+// its GitHub verdict carries weight (and can satisfy an approval gate), rather
+// than always reading as a non-committal comment.
+func (fs *Findings) ReviewEvent() string {
+	if ev, ok := validDispositions[strings.ToLower(strings.TrimSpace(fs.Disposition))]; ok {
+		return ev
+	}
+	hasMedium := false
+	for _, f := range fs.Findings {
+		switch f.Priority {
+		case "high":
+			return "REQUEST_CHANGES"
+		case "medium":
+			hasMedium = true
+		}
+	}
+	if hasMedium {
+		return "COMMENT"
+	}
+	return "APPROVE"
+}
 
 // ParseFindings unmarshals and validates the findings payload. Priorities are
 // normalized to lowercase; an empty priority defaults to "medium" (advisory),
@@ -76,6 +121,12 @@ func ParseFindings(data []byte) (*Findings, error) {
 	}
 	if strings.TrimSpace(fs.Summary) == "" {
 		return nil, fmt.Errorf("findings.summary is required (the review must never be silent)")
+	}
+	fs.Disposition = strings.ToLower(strings.TrimSpace(fs.Disposition))
+	if fs.Disposition != "" {
+		if _, ok := validDispositions[fs.Disposition]; !ok {
+			return nil, fmt.Errorf("findings.disposition %q is invalid (want approve, request_changes, or comment)", fs.Disposition)
+		}
 	}
 	for i := range fs.Findings {
 		if err := normalizeFinding(&fs.Findings[i], fmt.Sprintf("findings[%d]", i)); err != nil {
@@ -211,5 +262,6 @@ func (fs *Findings) BuildReviewInput(commitSHA string) refinery.SubmitReviewInpu
 		CommitID: commitSHA,
 		Body:     fs.SummaryBody(commitSHA),
 		Comments: fs.BuildComments(),
+		Event:    fs.ReviewEvent(),
 	}
 }

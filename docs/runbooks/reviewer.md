@@ -3,8 +3,12 @@
 The **Reviewer** is a rig-level, on-demand agent role that performs AI code
 review on pull requests and posts its findings as a GitHub PR review under a
 dedicated machine-user identity. It replaces the externally-hosted Augment app
-in the refinery's PR review loop. The Reviewer **never approves and never
-merges** — human approval stays the merge gate.
+in the refinery's PR review loop. The Reviewer's GitHub review **disposition
+matches its findings** — a high-severity finding posts `REQUEST_CHANGES`, a
+medium-only review posts `COMMENT`, and a clean or nits-only review posts
+`APPROVE`. It **never merges**, and because it must not be the `pr_approver`
+(see Security), its `APPROVE` is informational — human approval stays the merge
+gate.
 
 This runbook covers configuring, operating, and troubleshooting a local
 Reviewer for a rig. Design reference: [`docs/design/reviewer-role.md`](../design/reviewer-role.md).
@@ -262,9 +266,14 @@ bd list --label review-request           # outstanding/closed review-request bea
 gt mq list <rig>                          # the MR moving through the loop
 ```
 
-On GitHub, a successful review appears as a **COMMENTED** review by the
-`pr_reviewer` login, with one inline thread per finding and a top-level summary
-listing per-perspective verdicts, a finding count, and the reviewed SHA.
+On GitHub, a successful review appears under the `pr_reviewer` login with one
+inline thread per finding and a top-level summary listing per-perspective
+verdicts, a finding count, and the reviewed SHA. Its disposition reflects the
+findings: **CHANGES REQUESTED** when any finding is high-severity, **COMMENTED**
+when the worst is medium, and **APPROVED** when the review is clean or nits-only.
+A perspective pass may also set an explicit `disposition`
+(`approve` / `request_changes` / `comment`) in the findings payload to override
+the severity-derived default.
 
 ---
 

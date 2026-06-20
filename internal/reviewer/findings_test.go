@@ -164,6 +164,58 @@ func TestBuildReviewInput(t *testing.T) {
 	if !strings.Contains(in.Body, "Reviewed SHA: sha1") {
 		t.Errorf("body missing SHA: %s", in.Body)
 	}
+	// A high-priority finding must post REQUEST_CHANGES, not a silent COMMENT.
+	if in.Event != "REQUEST_CHANGES" {
+		t.Errorf("Event = %q, want REQUEST_CHANGES", in.Event)
+	}
 	// SubmitReviewInput is the refinery contract type.
 	var _ refinery.SubmitReviewInput = in
+}
+
+func TestReviewEvent_SeverityDerived(t *testing.T) {
+	cases := []struct {
+		name       string
+		priorities []string
+		want       string
+	}{
+		{"clean", nil, "APPROVE"},
+		{"low only", []string{"low", "low"}, "APPROVE"},
+		{"medium caps at comment", []string{"low", "medium"}, "COMMENT"},
+		{"has high", []string{"low", "high", "medium"}, "REQUEST_CHANGES"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &Findings{Summary: "s"}
+			for _, p := range tc.priorities {
+				fs.Findings = append(fs.Findings, Finding{Path: "a.go", Line: 1, Priority: p, Title: "t"})
+			}
+			if got := fs.ReviewEvent(); got != tc.want {
+				t.Errorf("ReviewEvent() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReviewEvent_ExplicitDispositionOverrides(t *testing.T) {
+	// An explicit disposition wins over the severity-derived default: a clean
+	// review can request changes, and a high finding can be downgraded to comment.
+	fs := &Findings{Summary: "s", Disposition: "request_changes"}
+	if got := fs.ReviewEvent(); got != "REQUEST_CHANGES" {
+		t.Errorf("clean+request_changes: ReviewEvent() = %q, want REQUEST_CHANGES", got)
+	}
+	fs = &Findings{
+		Summary:     "s",
+		Disposition: "comment",
+		Findings:    []Finding{{Path: "a.go", Line: 1, Priority: "high", Title: "t"}},
+	}
+	if got := fs.ReviewEvent(); got != "COMMENT" {
+		t.Errorf("high+comment: ReviewEvent() = %q, want COMMENT", got)
+	}
+}
+
+func TestParseFindings_InvalidDisposition(t *testing.T) {
+	data := []byte(`{"summary": "s", "disposition": "block", "findings": []}`)
+	if _, err := ParseFindings(data); err == nil {
+		t.Error("expected error for invalid disposition")
+	}
 }

@@ -3256,12 +3256,18 @@ func TestIsProtectedBranch(t *testing.T) {
 func TestGhPrSubmitReview_Validation(t *testing.T) {
 	g := NewGit(t.TempDir())
 
-	if err := g.GhPrSubmitReview(1, "", "", nil); err == nil {
+	if err := g.GhPrSubmitReview(1, "", "", "", nil); err == nil {
 		t.Error("expected error for empty body and no comments")
 	}
 
 	comments := []GhReviewComment{{Path: "a.go", Line: 1, Body: "x"}}
-	if err := g.GhPrSubmitReview(1, "", "summary", comments); err == nil {
+	if err := g.GhPrSubmitReview(1, "", "summary", "", comments); err == nil {
 		t.Error("expected error: commit_id required when inline comments are present")
+	}
+
+	// A non-empty event must be one of GitHub's three review dispositions; a typo
+	// must fail loudly rather than be passed to the API verbatim.
+	if err := g.GhPrSubmitReview(1, "sha", "summary", "BLOCK", nil); err == nil {
+		t.Error("expected error for invalid review event")
 	}
 }

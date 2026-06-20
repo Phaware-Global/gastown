@@ -119,7 +119,8 @@ type PRProvider interface {
 	// pair with HasReviewFromOnSHA.
 	CurrentHeadSHA(prNumber int) (string, error)
 
-	// SubmitReview submits a single PR review (always event=COMMENT) with an
+	// SubmitReview submits a single PR review with the disposition in in.Event
+	// (APPROVE / REQUEST_CHANGES / COMMENT; empty defaults to COMMENT), an
 	// optional top-level summary body and optional inline comment threads,
 	// anchored to in.CommitID when set. This is the sole sanctioned
 	// review-posting path for the in-town Reviewer role (P23-2376); raw
@@ -146,6 +147,12 @@ type SubmitReviewInput struct {
 	Body string
 	// Comments are the inline finding threads. May be empty (summary-only).
 	Comments []ReviewComment
+	// Event is the GitHub review disposition: "APPROVE", "REQUEST_CHANGES", or
+	// "COMMENT". Empty defaults to "COMMENT". The in-town Reviewer sets this from
+	// its findings so the GitHub verdict matches their severity (e.g. a
+	// high-severity finding posts REQUEST_CHANGES rather than a silent COMMENT).
+	// Providers that cannot post reviews ignore it.
+	Event string
 }
 
 // gitReviewThreadsToProvider converts the git package representation to the

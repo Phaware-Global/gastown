@@ -84,5 +84,5 @@ func (p *githubPRProvider) SubmitReview(prNumber int, in SubmitReviewInput) erro
 	for i, c := range in.Comments {
 		comments[i] = git.GhReviewComment{Path: c.Path, Line: c.Line, Body: c.Body}
 	}
-	return p.git.GhPrSubmitReview(prNumber, in.CommitID, in.Body, comments)
+	return p.git.GhPrSubmitReview(prNumber, in.CommitID, in.Body, in.Event, comments)
 }
