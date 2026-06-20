@@ -71,8 +71,9 @@ type Findings struct {
 var validPriorities = map[string]bool{"high": true, "medium": true, "low": true}
 
 // validDispositions maps the findings-payload disposition (lowercased) to the
-// GitHub review event it selects. The closed set keeps a typo from silently
-// degrading a blocking verdict into a comment.
+// GitHub review event it selects. The closed set is enforced at the contract
+// boundary: ParseFindings rejects any non-empty, unrecognized disposition, so a
+// typo fails loudly rather than silently degrading a blocking verdict.
 var validDispositions = map[string]string{
 	"approve":         "APPROVE",
 	"request_changes": "REQUEST_CHANGES",
@@ -88,8 +89,14 @@ var validDispositions = map[string]string{
 //	low / none → APPROVE      (nits-only or clean — the Reviewer endorses it)
 //
 // The in-town Reviewer is a real reviewer: a clean or nits-only pass APPROVEs so
-// its GitHub verdict carries weight (and can satisfy an approval gate), rather
-// than always reading as a non-committal comment.
+// its GitHub verdict reads as an approval rather than a non-committal comment.
+// The Reviewer is deliberately NOT the rig's pr_approver, so this APPROVE is
+// informational — human approval stays the merge gate (see the Reviewer
+// runbook); it must not be wired into branch protection as a required approval.
+//
+// An explicit Disposition is validated by ParseFindings at the contract
+// boundary, so the lookup-miss fallthrough below only fires for the empty
+// (severity-derived) case on payloads from the sanctioned path.
 func (fs *Findings) ReviewEvent() string {
 	if ev, ok := validDispositions[strings.ToLower(strings.TrimSpace(fs.Disposition))]; ok {
 		return ev
