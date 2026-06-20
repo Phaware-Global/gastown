@@ -29,6 +29,11 @@ after inspecting tmux pane output for signs of life.
 
 Reference: WAR-ROOM-SERIAL-KILLER.md, commit f3d47a96.
 
+**DO NOT gate on system load.** The daemon evaluates system pressure before
+dispatching this plugin. Do NOT check `uptime`, load average, or memory yourself.
+Do NOT emit escalations for "system overloaded" — that is not a real gate here.
+The only gate for this plugin is the 5-minute cooldown configured above.
+
 ## Scope — What You May and May NOT Touch
 
 **IN SCOPE** (these are the ONLY sessions this plugin may inspect or act on):

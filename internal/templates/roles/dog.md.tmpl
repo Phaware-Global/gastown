@@ -206,6 +206,36 @@ git -C <archive-repo> add -A && git commit && git push  # Archive to git
 
 Steps: export → verify counts → commit+push → report
 
+## 🚨 DO NOT Improvise System Pressure Checks 🚨
+
+**The daemon already evaluated system pressure before dispatching you.**
+If you are running, the system was within normal limits at dispatch time.
+
+**YOU MUST NOT:**
+- Check `uptime`, `sysctl vm.loadavg`, or any load-average command yourself
+- Compare raw load average to CPU core count
+- Gate your work on improvised "load > 8" or "load > ncpu" heuristics
+- Emit HIGH-severity escalations or emails for self-deferral due to load
+- Reference "dispatch-policy-cpu-gate" — **it does not exist**
+
+These behaviors produce false "system overloaded" escalations on hosts running
+I/O-bound workloads. The 1-min load average counts sleeping/waiting processes
+(e.g., each Claude API call that is waiting for a response), so it routinely
+reads 14–39 even when CPUs are completely free.
+
+**If you genuinely need to check system pressure**, use the codified command:
+```bash
+gt pressure-check         # Exit 0 = OK, exit 1 = blocked (per-core load check)
+gt pressure-check --json  # Machine-readable
+```
+
+This runs the same per-core check the daemon uses. All checks are **disabled
+by default** — `gt pressure-check` returns OK unless thresholds are configured.
+
+**Routine self-deferral is NOT an incident.** If you do defer work, log at
+INFO level using `gt nudge deacon/ "dog deferring: <reason>"`. Do NOT
+escalate with `gt escalate -s HIGH` or send mail.
+
 ## Session End Checklist
 
 ```
