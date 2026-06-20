@@ -49,6 +49,7 @@ const (
 	DefaultBootSpawnCooldown               = 2 * time.Minute
 	DefaultBootIdleSuppression             = 15 * time.Minute
 	DefaultDeaconGracePeriod               = 5 * time.Minute
+	DefaultRefineryHungThreshold           = 30 * time.Minute
 
 	// Pressure check defaults — fully opt-in. All zero = disabled.
 	// Configure in settings/config.json under operational.daemon to enable.
@@ -401,6 +402,16 @@ func (d *DaemonThresholds) DeaconGracePeriodD() time.Duration {
 		return ParseDurationOrDefault(d.DeaconGracePeriod, DefaultDeaconGracePeriod)
 	}
 	return DefaultDeaconGracePeriod
+}
+
+// RefineryHungThresholdD returns the configured or default refinery hung threshold.
+// Sessions alive but inactive for longer than this are considered hung and eligible
+// for respawn by the daemon spawn-gate.
+func (d *DaemonThresholds) RefineryHungThresholdD() time.Duration {
+	if d != nil {
+		return ParseDurationOrDefault(d.RefineryHungThreshold, DefaultRefineryHungThreshold)
+	}
+	return DefaultRefineryHungThreshold
 }
 
 // PressureCPUThresholdV returns the configured or default CPU pressure threshold (load per core).
