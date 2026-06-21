@@ -315,8 +315,15 @@ control plane depends on what the work image contains.
 
 ### 6.1 Host injection (the primary mechanism)
 
-The Packer AMI is **version-pinned to the orchestrator's gt release** so the proxy
-client matches the server protocol.
+**The AMI is a stable base, decoupled from the `gt` release cadence.** Baking a new
+AMI for every `gt` update would make active development painfully slow. Instead the
+Packer AMI carries only slow-moving infrastructure — `dockerd`, `amazon-ssm-agent`,
+`git`, a `gt-agent` system user, and a thin bootstrapper — and the **version-
+sensitive binaries** (`gt`/`bd`/proxy-client and the `gt-node-agent` program) are
+**injected at boot over SSM** from the orchestrator, which *is* the matching `gt`
+release. This guarantees the proxy client matches the server protocol without ever
+rebuilding the AMI on a `gt` bump; AMI rebuilds are reserved for base-OS/security
+updates. (Same SSM channel as the cert flow, §7.2.)
 
 The AMI carries **`git`** as well — host-side checkpointing (§9.2) runs `git` in
 `gt-node-agent`, so it is an AMI requirement independent of whether the *work
@@ -347,13 +354,21 @@ work container or its env.** The hop is instance-internal and never leaves the b
 Two distinct ports avoid confusion: the local relay is `…:9899`; the host proxy
 (mTLS upstream) is `:9876`.
 
-**Worktree ownership.** The agent container often runs as `root` (the default for
-many images), so files it creates on the bind-mounted EBS worktree are root-owned.
-`gt-node-agent` must be able to read and commit them for host-side checkpointing,
-so it **runs as root** (it manages `dockerd` anyway, which is already root-
-equivalent) — sidestepping the UID-mismatch that would otherwise block checkpoint /
-git / cleanup. (If a rig pins the container to a non-root `--user`, the worktree is
-created group-owned by a shared `gt` group so both sides retain access.)
+**Worktree ownership & agent UID.** `gt-node-agent` **runs as root** (it manages
+`dockerd` and must read/commit the worktree for host-side checkpointing). The
+agent's UID then depends on the mode:
+
+- **Container mode + bridge networking:** the container may run as `root` — it is
+  namespaced, and IMDS is blocked at the bridge (§10), so root inside the container
+  is contained.
+- **`native` mode / host networking:** there is no namespace isolation and IMDS is
+  firewalled **by UID** (§10), so the agent **must run as a dedicated non-root
+  `gt-agent` UID** — distinct from `gt-node-agent`'s root — or the firewall can't
+  tell them apart.
+
+In every case the worktree is created **group-owned by a shared `gt` group** (and
+group-writable), so `gt-node-agent` (root) and the agent (whatever UID) both
+retain access and checkpointing is never blocked by an ownership mismatch.
 
 #### 6.1.1 Container networking — how the agent reaches the relay
 
@@ -536,13 +551,15 @@ NAT / on a dynamic laptop IP — and `:9876` rejects certless connections via
 `internal/proxy/server.go`), delivery is **orchestrator-initiated via SSM**, which
 the daemon already has credentials for:
 
-1. **CSR over SSM (preferred).** `gt-node-agent` (a) **generates the private key
-   locally** in host tmpfs — it never leaves the instance — and (b) writes a
-   **Certificate Signing Request** (CN `gt-<rig>-<name>`) to a known path. The
-   daemon (c) retrieves the CSR and (d) returns **only the signed cert** — both
-   directions over `aws ssm` (`send-command` / a session). **No private key
-   crosses the wire, and the orchestrator opens no inbound port** (SSM is
-   orchestrator-→-instance, so it traverses NAT and survives a dynamic host IP).
+1. **CSR over SSM (preferred).** Concretely, the daemon issues a single SSM
+   `SendCommand` (`AWS-RunShellScript`) that, on the instance, **generates the
+   private key in host tmpfs and emits the CSR (CN `gt-<rig>-<name>`) on stdout**;
+   the daemon **captures the CSR directly from the command output** (no
+   poll-a-file dance), signs it with the CA, and returns the cert via a second
+   `SendCommand` (or it is written to a known path `gt-node-agent` reads). **The
+   private key never leaves the instance**, only the cert crosses the wire, and the
+   orchestrator opens **no inbound port** (SSM is orchestrator-→-instance, so it
+   traverses NAT and survives a dynamic host IP).
    **No bootstrap token is needed:** the SSM channel is itself IAM-authenticated
    and the daemon targets the exact instance ID it just launched and tagged, so the
    request binding the old token provided is inherent — and the daemon validates the
@@ -740,6 +757,15 @@ Checkpointing must stay cheap and must not pollute the branch or bloat the repo:
 - **Quiescence guard.** Trigger a checkpoint only when the worktree is momentarily
   settled (no in-flight writes for a short debounce), so a half-written file is not
   captured mid-flush. The interval is a ceiling, not a hard metronome.
+- **S3 fallback when the host is unreachable.** Normally checkpoints push to the
+  host `.repo.git` via the proxy. But if the orchestrator is offline at exactly the
+  wrong moment — a spot interrupt while the laptop is asleep — the final, unpushed
+  delta would die with the instance. So when the proxy is unreachable,
+  `gt-node-agent` falls back to uploading a **git bundle of the checkpoint ref to
+  S3** (the instance role already has scoped S3 access). On resume, the new
+  instance/daemon prefers the host `.repo.git` but pulls the S3 bundle if the host
+  never received that last push. This closes the laptop-asleep-during-interrupt
+  durability gap; it is optional and only engages on a proxy outage.
 
 ### 9.3 Spot interruption — in-instance (no-op for on-demand)
 
@@ -856,10 +882,17 @@ integration tests, testcontainers, etc.
        networking** (§6.1.1 option 2): under `--network host` there is no bridge and
        no extra hop, so both controls are bypassed — which is exactly why untrusted
        rigs MUST use bridge mode. For `native` mode (and host-net) the primary
-       control is a **host firewall scoped to `gt-node-agent`'s UID** — only that
-       user may reach `169.254.169.254`; the agent's UID cannot. **Do not simply
-       disable IMDS post-boot:** `gt-node-agent` needs it for the
-       `/spot/instance-action` poller (§9.3), so a blanket disable would break spot
+       control is a **host firewall scoped by UID** — but this only works if the two
+       sides have *different* UIDs. So the agent must **not** run as root in these
+       modes: `gt-node-agent` stays root (UID 0, for dockerd/worktree), and it drops
+       privileges to launch the agent as a **dedicated non-root `gt-agent` UID**. The
+       firewall then allows only UID 0 (and `gt-node-agent`) to reach
+       `169.254.169.254` and denies `gt-agent`. If the agent also ran as root the
+       filter could not tell them apart — hence the dedicated UID is mandatory in
+       native/host-net mode (it dovetails with the §6.1 shared-`gt`-group worktree so
+       checkpointing still works across the UID boundary). **Do not simply disable
+       IMDS post-boot:** `gt-node-agent` needs it for the `/spot/instance-action`
+       poller (§9.3), so a blanket disable would break spot
        interruption handling. The UID-scoped firewall preserves the poller while
        denying the agent.
     2. **Mandatory (not deferred) hardening for untrusted code** — rigs in
@@ -903,7 +936,7 @@ case.
 6. `EC2SpotBackend.Provision/Teardown` honoring `instance_lifecycle` (spot **and**
    on-demand), the provision hook, instance-profile credential wiring (ECR /
    agent_auth), tag-based discovery.
-7. `gt-node-agent`: bootstrap-token redemption, local relay, container launch with
+7. `gt-node-agent`: CSR-over-SSM cert acquisition (§7.2), local relay, container launch with
    bind-mounts (`/opt/gt`, worktree, docker.sock), `exec_mode` container/native.
 8. SSM-based `WrapCommand` (blocking-pane wrapper) + remote session-env injection
    (§7.4) + heartbeat-only liveness (§8.1).
