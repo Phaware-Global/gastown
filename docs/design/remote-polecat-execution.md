@@ -319,14 +319,14 @@ ECS Task (Fargate Spot)
 │     • on start: copies gt-proxy-client (as gt+bd), a static idle entrypoint,
 │       (and busybox sh if needed) and the checkpoint script into /opt/gt
 │     • redeems the bootstrap token → cert/key in its OWN tmpfs (§7.2)
-│     • runs a LOCAL relay on the task loopback (e.g. 127.0.0.1:9876 / unix
-│       socket on gt-shared); terminates mTLS to the host proxy upstream
+│     • runs a LOCAL relay on the task loopback 127.0.0.1:9899 (or a unix
+│       socket on gt-shared); terminates mTLS to the host proxy (:9876) upstream
 │     • also: spot-interrupt agent + checkpoint/push loop over the worktree
 └── container "work"            # custom or default image; carries nothing gastown
       • dependsOn gt-sidecar: HEALTHY        (relay up before the agent starts)
       • entryPoint = injected idle binary; PATH includes /opt/gt
       • gt/bd and git point at the sidecar's LOCAL relay — GT_PROXY_URL and
-        origin = http://127.0.0.1:9876/... — so it needs NO cert/key of its own
+        origin = http://127.0.0.1:9899/... — so it needs NO cert/key of its own
       • host drives the agent via:
         aws ecs execute-command --interactive --command "<resolved cmd>" ...
 ```
@@ -337,12 +337,25 @@ the shared task network (containers in one task share the network namespace), an
 the sidecar adds the client cert and forwards over mTLS to the host proxy. The
 private key therefore never leaves the sidecar's tmpfs and never enters the work
 container or its env — resolving the apparent tension with §7.2. The loopback hop
-is safe because it is task-internal and never leaves the instance.
+is safe because it is task-internal and never leaves the instance. Note the two
+hops use **distinct ports** to avoid confusion: the sidecar's local relay listens
+on `127.0.0.1:9899`, while the host proxy (the mTLS upstream) is `:9876`.
 
 Putting the **worktree on the shared volume** lets the sidecar (which we control,
 with a proper signal handler and `git`) own checkpoint+push and interrupt
 handling — so reliability does not depend on the user image being signal-aware or
 carrying `git` tooling beyond §6.1.
+
+> **Command construction (avoid an injection footgun).** `--command` takes a
+> single string, so the tokenized agent argv (`rc.Command` + `rc.Args` + prompt,
+> §8) must be flattened deliberately, not naively concatenated. Build it with the
+> same `ShellQuote` discipline `BuildStartupCommand` already applies to env values
+> (`internal/config/loader.go`): every token is individually shell-quoted, and
+> config-derived parts (model flags, custom-agent args, the prompt) are treated as
+> **untrusted data to be quoted, never interpolated raw**. The `InitialPrompt` in
+> particular is free-form and must be passed as a single quoted argument (or via
+> stdin / a file on the shared volume) so spaces and shell metacharacters cannot
+> break out of the command or inject into the SSM-spawned shell.
 
 > EFS is **not** used to deliver binaries (a versioned binary on EFS silently
 > drifts from the orchestrator; the version-pinned sidecar image does not). EFS
@@ -582,10 +595,16 @@ ECS signals both at once:
 2. *The sidecar cannot signal a process in another container's PID namespace by
    default.* The task runs with **`pidMode: task`** (Fargate platform 1.4+) so all
    containers share one PID namespace and the sidecar can directly SIGKILL the
-   agent process. Where `pidMode: task` is unavailable, the fallback is a
-   shared-volume coordination marker: the sidecar writes `/opt/gt/STOP`, and the
-   work container's idle entrypoint (watching for it) kills its own agent child
-   and reports completion via a second marker.
+   agent process. **PID-namespace sharing is necessary but not sufficient:** Linux
+   still requires the signaling process to have permission — the sidecar must run
+   as the **same UID** as the agent (the usual case — both default to the image
+   user/root) **or** hold `CAP_KILL`. The task definition must therefore align the
+   sidecar's user with the work container's, or grant the sidecar `CAP_KILL`.
+   Where `pidMode: task` is unavailable (or that UID/cap alignment is undesirable),
+   the fallback is a shared-volume coordination marker: the sidecar writes
+   `/opt/gt/STOP`, and the work container's idle entrypoint (watching for it) kills
+   its own agent child — which is always permitted, since it owns that child — and
+   reports completion via a second marker.
 
 **Shutdown sequence** (driven by the sidecar's SIGTERM handler / EC2 poller):
 (1) signal the agent to stop — SIGKILL via the shared PID namespace, or write the
