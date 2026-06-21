@@ -102,7 +102,7 @@ Orchestrator host                         AWS (per-rig backend)
 │   └─ ExecutionBackend      │ provision  │  gt-sidecar (known image)          │
 │        .Provision() ───────┼───────────►│   • copies gt/bd + idle entrypoint │
 │   └─ exec_wrapper tokens   │            │     into shared volume             │
-│        from .Attach()      │            │   • spot-interrupt agent           │
+│        from .WrapperTokens()│           │   • spot-interrupt agent           │
 │                            │            │   • checkpoint+push loop           │
 │  gt-proxy-server  ◄────mTLS─────────────┤  work container (custom/default    │
 │   /v1/exec  (gt/bd)        │            │     image) runs the agent          │
@@ -125,14 +125,24 @@ A new optional `Execution` block on `RigSettings`
 Absent or `backend: "local"` → today's behavior (this is how iOS rigs stay
 pinned to the host).
 
+The block below is annotated for readability. The on-disk `settings/config.json`
+is parsed by Go's `encoding/json` (`internal/config/loader.go`), which rejects
+comments — the **actual file must be strict, comment-free JSON**. Treat the `//`
+notes here as documentation, not literal syntax.
+
 ```jsonc
-// settings/config.json
+// settings/config.json  (illustrative — strip comments in the real file)
 "execution": {
   "backend": "fargate_spot",          // "local" | "fargate_spot" | "ec2_spot"
   "region": "us-east-1",
 
-  // resource sizing (req. #5)
-  "cpu": "2",                          // vCPU (Fargate units / EC2 instance class)
+  // Resource sizing (req. #5). Values are backend-normalized, not passed raw:
+  //  - Fargate requires specific CPU/memory *combinations* (CPU in 256-unit
+  //    steps: 256/512/1024/2048/4096/8192/16384; memory must be a valid pairing
+  //    for the chosen CPU). The backend maps cpu:"2" → 2048 units and validates
+  //    the (cpu, memory) pair at Provision, failing fast on illegal combos.
+  //  - EC2 maps (cpu, memory) to an instance type/class.
+  "cpu": "2",                          // vCPU (normalized per backend)
   "memory": "8Gi",
   "ephemeral_storage_gb": 40,          // Fargate task storage (20–200); EC2 EBS
 
@@ -162,8 +172,8 @@ pinned to the host).
 // Resolved per rig. local = no-op; fargate/ec2 provision real infra.
 type ExecutionBackend interface {
     // Provision creates the execution environment and blocks until the agent
-    // can be launched into it. Idempotent for resume (see §8). Returns the
-    // handle the daemon uses for Attach/Teardown.
+    // can be launched into it. Idempotent for resume (see §9.4). Returns the
+    // handle the daemon uses for WrapperTokens/Teardown.
     Provision(ctx context.Context, spec PolecatSpec) (Endpoint, error)
 
     // WrapperTokens returns the dynamic exec_wrapper inserted by
@@ -186,13 +196,26 @@ type ExecutionBackend interface {
 the polecat identity (`<rig>/<name>`), so backends are config-driven, not
 hard-coded.
 
+### Endpoint discovery — surviving a daemon restart
+
+`Endpoint` MUST be reconstructable from AWS, not just from daemon memory, because
+the daemon can crash or restart while remote instances are still running. Every
+backend therefore **tags its AWS resources** (ECS task / EC2 instance) with the
+polecat identity (`gt:rig`, `gt:polecat`, `gt:session`) at `Provision`. On
+startup the daemon (and `Teardown`) re-discovers live endpoints by listing
+resources filtered on those tags, rather than persisting endpoint handles
+locally. This is what makes `Provision` idempotent for resume (§9.4) and prevents
+orphaned, billable instances after a crash. The reaper additionally sweeps for
+tagged resources with no corresponding live agent bead and tears them down.
+
 ### Wiring points
 
 - **Provision hook:** inserted between `SpawnPolecatForSling` returning and the
   deferred `StartSession` call (`internal/cmd/polecat_spawn.go`) — a natural gap,
-  since session start is already deferred. This is also where the daemon issues
-  the per-polecat cert (CN `gt-<rig>-<name>`) and sets `GT_PROXY_*` / `GIT_SSL_*`.
-- **Attach:** `WrapperTokens` feeds the existing `exec_wrapper` insertion in
+  since session start is already deferred. This is also where the daemon mints the
+  per-polecat cert (CN `gt-<rig>-<name>`) and arranges its **secure delivery** to
+  the instance (§7.2 — never as plaintext task-env).
+- **WrapperTokens:** feeds the existing `exec_wrapper` insertion in
   `BuildStartupCommand` (`internal/config/loader.go`). No change to the command
   builder itself.
 - **Teardown + cooldown:** `killIdlePolecat` (`internal/daemon/daemon.go`) gains a
@@ -220,7 +243,14 @@ gastown injects everything else at launch.**
    large and version-sensitive and belong in the image.
 2. **The project toolchain** the polecat needs (language runtimes, build tools,
    linters, test frameworks) — the reason to use a custom image at all.
-3. **`git`** (used for the checkpoint/push loop against the mounted worktree).
+
+`git` is **not** required in the work image: the checkpoint/push loop and all
+proxy git traffic run in the `gt-sidecar` container (§6.4, §9.2), which carries
+its own `git` and operates on the shared-volume worktree. The work image only
+needs `git` if the polecat's *own* workflows (the agent running builds/scripts)
+invoke it — which most do, but that is a property of the toolchain in item 2, not
+a separate gastown requirement. EC2 (§6.5) likewise relies on the host-side
+tooling for checkpointing, not the work image.
 
 ### 6.2 What the image MUST NOT be expected to carry
 
@@ -290,12 +320,17 @@ not as a silently dead session.
 ## 7. Credentials & identity
 
 A single per-backend IAM-role + secret-store layer covers **four** distinct
-credential concerns. None of them place secrets in the image, the task-def
-plaintext, the `execute-command` command string, or process args.
+credential concerns. The invariant is that no secret **material** (a key, a
+token, a password, a private cert) ever appears in the image, in task-def
+plaintext, in the `execute-command` command string, or in process args. Secret
+**references** — Secrets Manager / SSM ARNs in the task-def `secrets` and
+`repositoryCredentials` fields — are expected and are not sensitive; AWS resolves
+them into the container at launch without exposing the value via
+`ecs:DescribeTasks` or CloudTrail.
 
 | Concern | Mechanism |
 |---|---|
-| **Control-plane identity** (proxy cert) | Daemon issues a short-lived leaf cert (CN `gt-<rig>-<name>`) at provision; injects `GT_PROXY_*` / `GIT_SSL_*`. Identity is the cert, enforced by `gt-proxy-server`. |
+| **Control-plane identity** (proxy cert) | Daemon mints a short-lived leaf cert (CN `gt-<rig>-<name>`) at provision and delivers it **securely** per §7.2 — never as plaintext task-env. Identity is the cert, enforced by `gt-proxy-server`. |
 | **Image pull auth** | ECR (same/cross-account): task **execution role** IAM (`ecr:*`) + repo policy for cross-account. Other registries: task-def `repositoryCredentials` → Secrets Manager secret + execution-role `secretsmanager:GetSecretValue`. |
 | **LLM auth** | Default `bedrock_role`: set `CLAUDE_CODE_USE_BEDROCK=1`, grant the task role `bedrock:InvokeModel` — **no key to inject**. Alternative `secret`: a task-def `secrets` entry sources `ANTHROPIC_API_KEY` (or provider var) from Secrets Manager into the container env. |
 | **Agent AWS identity** | The task/instance IAM role (for any AWS work the agent itself does). |
@@ -330,6 +365,31 @@ orchestrator's shell — the remote path is *more* isolated than local.
   "secret_arn": "arn:aws:secretsmanager:...:gt-anthropic-key"
 }
 ```
+
+### 7.2 Secure proxy-cert delivery
+
+The per-polecat client cert + **private key** are the most sensitive material in
+the system: they grant `gt`/`bd` and git access as that identity. They MUST NOT
+be injected as plaintext container environment overrides — those are visible via
+`ecs:DescribeTasks` and CloudTrail to anyone with read access to the account.
+Two acceptable mechanisms, in order of preference:
+
+1. **Single-use bootstrap token (preferred).** At provision the daemon injects
+   only a short-lived, one-time bootstrap token (low value, single-use) as task
+   env. On startup the `gt-sidecar` exchanges it at a dedicated proxy endpoint
+   (`POST /v1/bootstrap`, mTLS-less but token-gated) for its freshly minted cert
+   + key, which never leave the instance's memory/tmpfs. The token is burned on
+   first use; a leaked token is useless after the sidecar redeems it. This keeps
+   *all* long-lived secret material off the AWS control plane.
+2. **Per-task Secrets Manager secret.** The daemon writes the cert+key to a
+   short-TTL Secrets Manager secret scoped to the task's execution role and
+   references it via the task-def `secrets` block (a reference, not the value,
+   per §7). Acceptable, but leaves the material at rest in Secrets Manager for the
+   task lifetime; prefer (1) where the bootstrap endpoint exists.
+
+Either way the key lands only in the sidecar's tmpfs, and the cert is short-lived
+(`proxy_cert_ttl`, default 24h) so exposure is bounded even if an instance is
+compromised. The CA can revoke a leaked serial via the proxy denylist.
 
 ---
 
@@ -383,17 +443,37 @@ Interruption is handled **inside the instance**, and the AWS signal differs by
 backend — so this is a per-backend in-instance component (shipped in the sidecar
 image / AMI), **not** a method on the host-side interface:
 
-- **Fargate Spot:** ECS sends an in-container **SIGTERM**, then SIGKILL after
-  `stopTimeout`. Set `stopTimeout: 120` in the task-def (default is 30s). The
-  sidecar (PID-1-capable) traps SIGTERM.
+- **Fargate Spot:** ECS sends an in-container **SIGTERM** to **every** container
+  in the task simultaneously, then SIGKILL after each container's `stopTimeout`.
+  Set `stopTimeout: 120` (default is 30s) on **both** containers. The sidecar
+  (PID-1-capable) traps SIGTERM and runs the shutdown sequence below.
 - **EC2 Spot:** there is no reliable advance SIGTERM. An in-instance **poller**
   watches IMDS `/spot/instance-action` (and optionally the rebalance
   recommendation, which fires earlier). The ~2-min window is best-effort.
 
-On interrupt the handler: (1) SIGKILLs the agent to stop new writes, (2) flushes
-the final small delta (`git add -A && commit && push` — small because of
-continuous checkpointing), (3) exits. If the final flush fails, at most one
-checkpoint interval is lost.
+**Cross-container coordination (Fargate).** Two hazards arise because the agent
+runs in the *work* container while the shutdown logic lives in the *sidecar*, and
+ECS signals both at once:
+
+1. *The work container must not exit on SIGTERM* — if it does, the agent dies
+   uncoordinated and the container may tear down before the flush. The injected
+   idle entrypoint (PID 1 of the work container) therefore **traps and ignores
+   SIGTERM**, staying alive for its full `stopTimeout` to give the sidecar its
+   window. (It still exits promptly on the sidecar's explicit signal below.)
+2. *The sidecar cannot signal a process in another container's PID namespace by
+   default.* The task runs with **`pidMode: task`** (Fargate platform 1.4+) so all
+   containers share one PID namespace and the sidecar can directly SIGKILL the
+   agent process. Where `pidMode: task` is unavailable, the fallback is a
+   shared-volume coordination marker: the sidecar writes `/opt/gt/STOP`, and the
+   work container's idle entrypoint (watching for it) kills its own agent child
+   and reports completion via a second marker.
+
+**Shutdown sequence** (driven by the sidecar's SIGTERM handler / EC2 poller):
+(1) signal the agent to stop — SIGKILL via the shared PID namespace, or write the
+`STOP` marker in the fallback; (2) flush the final small delta (`git add -A &&
+commit && push` from the sidecar over the worktree on the shared volume — small
+because of continuous checkpointing); (3) release the idle entrypoint and exit.
+If the final flush fails, at most one `checkpoint_interval` is lost.
 
 ### 9.4 Resume
 
@@ -418,8 +498,9 @@ than restarting. `Provision` is idempotent for this re-entry.
 **Tier 1 — config + safety rails (no AWS dependency; ships value alone):**
 1. `RigSettings.Execution` block (§4) + version bump — per-rig host/cpu/mem/image.
 2. Absolute `max_runtime` cap in `reapIdlePolecat` (the genuine §9.5 gap).
-3. Auto cert-issuance (CN `gt-<rig>-<name>`) + `GT_PROXY_*`/`GIT_SSL_*` injection
-   at spawn — wires the *existing* proxy into the spawn path.
+3. Auto cert-issuance (CN `gt-<rig>-<name>`) + secure delivery (§7.2) and the
+   `GT_PROXY_*`/`GIT_SSL_*` env contract — wires the *existing* proxy into the
+   spawn path.
 
 **Tier 2 — interface + first backend:**
 4. `ExecutionBackend` interface + `LocalBackend` (refactor today's path behind
@@ -451,4 +532,9 @@ exists.
 4. **Cross-account ECR.** Standardize on execution-role + repo policy, or an
    assumed pull role ARN in `image_auth`?
 5. **Ephemeral storage ceiling.** Large monorepos may exceed Fargate's 200 GB
-   task-storage cap — EC2-only for those rigs, or EFS-backed worktrees?
+   task-storage cap. **Avoid EFS-backed worktrees:** git is metadata-intensive
+   (`git status`, `git checkout`, index scans) and performs poorly over NFS
+   latency, which would slow every checkpoint and the agent's own git ops. Prefer
+   EBS (EC2) or larger Fargate ephemeral storage for the worktree; reserve EFS for
+   bulk, latency-tolerant *shared data* (build caches), never the worktree itself.
+   So the likely answer is **EC2-only for very large repos**, not EFS worktrees.
