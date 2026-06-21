@@ -124,7 +124,8 @@ Orchestrator host                         AWS — EC2 instance (spot or on-deman
 │  GitHub (host-only)        │            │   • worktree on EBS bind-mounted in     │
 │                            │            │   • /var/run/docker.sock bind-mounted   │
 └────────────────────────────┘            │     → agent can docker compose (§10)    │
-                                          │  origin/GT_PROXY_URL → 127.0.0.1:9899   │
+                                          │  origin/GT_PROXY_URL → relay (host-net: │
+                                          │  127.0.0.1:9899; bridge: host-gw, §6.1.1)│
                                           │  no direct Dolt / GitHub / ctrl-plane   │
                                           │  (work-egress per network.mode, §7.3)   │
                                           └───────────────────────────────────────┘
@@ -236,6 +237,13 @@ type ExecutionBackend interface {
     // Teardown destroys the environment. Called by the reaper after cooldown,
     // on max_runtime expiry, or on explicit nuke.
     Teardown(ctx context.Context, ep Endpoint) error
+
+    // Discover re-finds live endpoints from AWS by the gt:* identity tags, so the
+    // daemon can reattach after a restart and the reaper can sweep orphans
+    // (§"Endpoint discovery"). This is necessarily backend-specific — EC2
+    // DescribeInstances vs ECS ListTasks — which is why it lives on the interface
+    // rather than in generic daemon code.
+    Discover(ctx context.Context, filter IdentityTags) ([]Endpoint, error)
 }
 ```
 
@@ -573,11 +581,14 @@ the daemon already has credentials for:
    than the CSR flow — prefer (1).
 
 > **Ongoing relay traffic** (the `:9876` mTLS control plane) likewise avoids an
-> inbound laptop port: either the instance dials a **stable host name** (Tailscale
-> / VPN, §9.6), or the orchestrator establishes an **SSM port-forwarding session**
-> so the relay tunnels orchestrator-→-instance. Both keep the laptop free of
-> inbound firewall holes; the `:9876`/`RequireAndVerifyClientCert` config is
-> unchanged, it just rides the tunnel.
+> inbound laptop port. The primary mechanism is a **stable host name** (Tailscale /
+> VPN, §9.6): the instance dials the laptop's stable name, which is what the
+> persistent instance→host relay needs. Note SSM Session Manager port-forwarding is
+> **client→instance** (the orchestrator forwarding to a port *on* the instance), so
+> it is **not** a clean reverse tunnel for the instance→host relay — it fits the
+> orchestrator-initiated CSR exchange and commands, but the ongoing relay relies on
+> the stable-hostname path, not SSM forwarding. The `:9876`/`RequireAndVerifyClientCert`
+> config is unchanged either way.
 
 The private key lives only in host tmpfs (never in the work container, and under
 the CSR flow never on the wire), and the cert is short-lived (`proxy_cert_ttl`,
@@ -762,10 +773,12 @@ Checkpointing must stay cheap and must not pollute the branch or bloat the repo:
   wrong moment — a spot interrupt while the laptop is asleep — the final, unpushed
   delta would die with the instance. So when the proxy is unreachable,
   `gt-node-agent` falls back to uploading a **git bundle of the checkpoint ref to
-  S3** (the instance role already has scoped S3 access). On resume, the new
-  instance/daemon prefers the host `.repo.git` but pulls the S3 bundle if the host
-  never received that last push. This closes the laptop-asleep-during-interrupt
-  durability gap; it is optional and only engages on a proxy outage.
+  S3** (the instance role already has scoped S3 access). On resume, the new instance
+  pulls the S3 bundle when the host `.repo.git` is behind it, **and immediately
+  re-pushes that state to `.repo.git` via the proxy** (or the daemon ingests the
+  bundle directly) so the host reconverges and S3 is not left as a second
+  source-of-truth. This closes the laptop-asleep-during-interrupt durability gap; it
+  is optional and only engages on a proxy outage.
 
 ### 9.3 Spot interruption — in-instance (no-op for on-demand)
 
@@ -895,6 +908,17 @@ integration tests, testcontainers, etc.
        poller (§9.3), so a blanket disable would break spot
        interruption handling. The UID-scoped firewall preserves the poller while
        denying the agent.
+       **Caveat — the Docker socket bypasses the UID firewall.** If the `gt-agent`
+       UID can write `/var/run/docker.sock`, it can `docker run` a container
+       (host-net, or mounting host `/`) whose traffic originates as **root/dockerd**,
+       not `gt-agent` — so it reaches IMDS regardless of the UID filter. The UID
+       firewall (and the bridge `iptables` control) therefore only contain the
+       *direct* escape paths; **they do not contain a Docker-socket-holding agent.**
+       For an untrusted rig that also needs Docker, the socket *is* the hole, and
+       the only real defense is mitigation (2): rootless dockerd / nested userns,
+       where the nested daemon runs unprivileged and its containers cannot reach the
+       host's IMDS credentials. Untrusted + raw host socket is not a safe
+       combination at any UID.
     2. **Mandatory (not deferred) hardening for untrusted code** — rigs in
        `sandboxed` mode or running untrusted PRs MUST use rootless dockerd / nested
        userns (or skip the socket entirely); the "single-tenant, acceptable"
@@ -931,8 +955,9 @@ case.
 **Tier 2 — interface + EC2 backend (the primary):**
 4. `ExecutionBackend` interface + `LocalBackend` (refactor today's path behind it;
    no behavior change).
-5. The Packer AMI (dockerd + amazon-ssm-agent + `gt-node-agent` + gt/bd + idle
-   binary), version-pinned to the gt release.
+5. The Packer AMI as a **stable base** (dockerd + amazon-ssm-agent + git +
+   `gt-agent` user + bootstrapper); the version-sensitive binaries (gt/bd/
+   proxy-client/`gt-node-agent`) are injected at boot over SSM, not baked (§6.1).
 6. `EC2SpotBackend.Provision/Teardown` honoring `instance_lifecycle` (spot **and**
    on-demand), the provision hook, instance-profile credential wiring (ECR /
    agent_auth), tag-based discovery.
