@@ -106,12 +106,13 @@ Orchestrator host                         AWS (per-rig backend)
 │   └─ exec_wrapper tokens   │            │     into shared volume             │
 │        from .WrapperTokens()│           │   • spot-interrupt agent           │
 │                            │            │   • checkpoint+push loop           │
-│  gt-proxy-server  ◄────mTLS─────────────┤  work container (custom/default    │
-│   /v1/exec  (gt/bd)        │            │     image) runs the agent          │
+│  gt-proxy-server  ◄────mTLS──── sidecar relay (127.0.0.1:9899) ◄── work     │
+│   /v1/exec  (gt/bd)        │            │     container runs the agent       │
 │   /v1/git/<rig> (.repo.git)│            │     against worktree on shared vol  │
-│        │ async push        │            │                                    │
-│        ▼                   │            │  origin = https://host/v1/git/<rig> │
-│  GitHub (host-only)        │            │  no direct internet / Dolt / GitHub │
+│        │ async push        │            │  gt/bd + git origin point at the    │
+│        ▼                   │            │  LOCAL relay (127.0.0.1:9899); the  │
+│  GitHub (host-only)        │            │  sidecar adds mTLS to host (§6.4).  │
+│                            │            │  no direct internet / Dolt / GitHub │
 └────────────────────────────┘            └───────────────────────────────────┘
 ```
 
@@ -260,11 +261,17 @@ gastown injects everything else at launch.**
    linters, test frameworks) — the reason to use a custom image at all.
 3. **A POSIX shell (`/bin/sh`).** ECS Exec runs `--command` through the SSM agent,
    which executes it via a shell; an interactive exec session also needs one. This
-   is present in virtually every base image (glibc, alpine/busybox). The genuine
-   exception is **`scratch`/distroless** images, which ship no shell — for those
-   the backend injects a static `busybox` (alongside `gt`/`bd` and the idle binary
-   on the shared volume, §6.4) and the resolved command runs via it. So the
-   contract is "provide `/bin/sh`, *or* accept an injected static shell."
+   is present in virtually every base image (glibc, alpine/busybox), so **v1
+   requires `/bin/sh` in the work image** and preflight (§6.6) rejects images
+   without it.
+   **`scratch`/distroless images are a known v1 limitation.** Injecting a static
+   `busybox` on the shared volume gets a shell *binary* onto the box, but it does
+   not by itself make ECS Exec work: the SSM agent's default `--command` execution
+   path expects a shell on `PATH`/`/bin/sh`, and the resolved command would have to
+   invoke the injected shell by **absolute path** (`/opt/gt/busybox sh -c '<cmd>'`)
+   — which must be validated against the SSM execution model before we rely on it.
+   Until validated, distroless rigs should use a thin shell-bearing base; see open
+   question 8.
 
 `git` is **not** required in the work image: the checkpoint/push loop and all
 proxy git traffic run in the `gt-sidecar` container (§6.4, §9.2), which carries
@@ -322,6 +329,7 @@ ECS Task (Fargate Spot)
 │     • runs a LOCAL relay on the task loopback 127.0.0.1:9899 (or a unix
 │       socket on gt-shared); terminates mTLS to the host proxy (:9876) upstream
 │     • also: spot-interrupt agent + checkpoint/push loop over the worktree
+│     • healthCheck: asserts binaries copied + relay listening (see below)
 └── container "work"            # custom or default image; carries nothing gastown
       • dependsOn gt-sidecar: HEALTHY        (relay up before the agent starts)
       • entryPoint = injected idle binary; PATH includes /opt/gt
@@ -340,6 +348,14 @@ container or its env — resolving the apparent tension with §7.2. The loopback
 is safe because it is task-internal and never leaves the instance. Note the two
 hops use **distinct ports** to avoid confusion: the sidecar's local relay listens
 on `127.0.0.1:9899`, while the host proxy (the mTLS upstream) is `:9876`.
+
+**The `dependsOn: HEALTHY` ordering requires the sidecar to define a container
+health check** — ECS only evaluates `HEALTHY` when one exists, and without it the
+dependency would either be ignored or block startup. The sidecar's `healthCheck`
+must assert the two preconditions the work container relies on: (1) the binaries
+have been copied to `/opt/gt` (e.g. `test -x /opt/gt/gt`), and (2) the local relay
+is accepting connections (e.g. a TCP probe of `127.0.0.1:9899`). Only once both
+hold does the sidecar report healthy and the work container start.
 
 Putting the **worktree on the shared volume** lets the sidecar (which we control,
 with a proper signal handler and `git`) own checkpoint+push and interrupt
@@ -688,3 +704,9 @@ exists.
    packages, standardize on a pull-through cache reachable by VPC endpoint
    (CodeArtifact, an S3-backed registry mirror) vs. requiring deps pre-baked in
    the image.
+8. **Distroless ECS Exec support (§6.1.3).** Validate whether `aws ecs
+   execute-command` can drive a shell injected by absolute path
+   (`/opt/gt/busybox sh -c ...`) into a `/bin/sh`-less image, or whether the SSM
+   execution model hard-requires a shell on the standard path. If the latter,
+   distroless work images are unsupported and the contract simply requires
+   `/bin/sh` (v1's current stance).
