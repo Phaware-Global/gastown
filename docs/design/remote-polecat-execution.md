@@ -353,17 +353,24 @@ the host — so a relay bound to host `127.0.0.1:9899` is unreachable from a def
 bridge container. Two supported wirings (the backend picks one and sets
 `GT_PROXY_URL` / git `origin` to match):
 
-1. **Host networking (default).** Run the work container with `--network host`.
-   The container then shares the host network namespace, so `127.0.0.1:9899`
-   *is* the relay. Safe here because the instance is single-tenant and ephemeral.
-   This is the default for its simplicity.
-2. **Bridge + host-gateway.** Keep bridge isolation: bind the relay to the docker
-   bridge gateway (or `0.0.0.0:9899`, firewalled to the bridge subnet) and start
-   the container with `--add-host=host.docker.internal:host-gateway`; the agent
-   reaches it at `http://host.docker.internal:9899`. Use when host networking is
-   undesirable.
+1. **Host networking** (`--network host`, default **for trusted rigs only**). The
+   container shares the host network namespace, so `127.0.0.1:9899` *is* the relay.
+   Simplest, but it **defeats the IMDS isolation mitigations** (§10): with no bridge
+   and no routing hop, the container's traffic is indistinguishable from the host's,
+   so neither the bridge `iptables` drop nor the IMDSv2 hop-limit can keep it away
+   from `169.254.169.254`. **Acceptable only for trusted rigs.**
+2. **Bridge + host-gateway** (**required for `sandboxed` / untrusted-code rigs**).
+   Keep bridge isolation: bind the relay to the docker bridge gateway (or
+   `0.0.0.0:9899`, firewalled to the bridge subnet) and start the container with
+   `--add-host=host.docker.internal:host-gateway`; the agent reaches the relay at
+   `http://host.docker.internal:9899`. This is the mode in which the §10 IMDS
+   defenses actually work, so untrusted rigs **must** use it (preflight enforces
+   this pairing).
 
-`native` mode has no container, so the agent simply uses `127.0.0.1:9899`.
+So the networking default is **trust-dependent**, not unconditional: host
+networking for trusted rigs (simplicity), bridge for untrusted ones (so IMDS
+hardening is effective). `native` mode has no container; the agent uses
+`127.0.0.1:9899`, and IMDS must be locked down at the instance level instead (§10).
 
 #### 6.1.2 Startup ordering & command construction
 
@@ -527,9 +534,13 @@ at all.** Two mechanisms, in order of preference:
    (`internal/proxy/server.go`), so the Go TLS handshake **rejects any certless
    connection before HTTP routing** — and the bootstrapping agent has no cert yet
    (that is what it is fetching). So `/v1/bootstrap` MUST be served on a **separate
-   listener/port** (e.g. `:9877`) configured for **server-auth-only TLS**
-   (`ClientAuth: tls.NoClientCert`). That listener still presents the gastown CA's
-   server cert, and the agent **pins/validates it against the bundled CA before
+   listener/port** configured for **server-auth-only TLS**
+   (`ClientAuth: tls.NoClientCert`). Note `:9877` is **already taken** — it is the
+   recommended `AdminListenAddr` for the local admin server (`internal/proxy/server.go`)
+   — so use a distinct port (e.g. `:9878`); the bootstrap listener is also the only
+   one that must be reachable from the remote instance, unlike the loopback admin
+   server. That listener still presents the gastown CA's server cert, and the agent
+   **pins/validates it against the bundled CA before
    sending the token**, so the exchange is encrypted and not interceptable even
    though it is not mutually authenticated. The main relay port (`:9876`) keeps
    `RequireAndVerifyClientCert` unchanged. (The Secrets-Manager variant in option 2
@@ -791,7 +802,12 @@ integration tests, testcontainers, etc.
     does not stop credential theft within the rig's own run. Required mitigations:
     1. **Block IMDS from the container network** — host `iptables` dropping
        `169.254.169.254` from the docker bridge, and IMDSv2 with a hop limit of 1 so
-       a container cannot reach it even via the gateway.
+       a container cannot reach it even via the gateway. **This requires bridge
+       networking** (§6.1.1 option 2): under `--network host` there is no bridge and
+       no extra hop, so both controls are bypassed — which is exactly why untrusted
+       rigs MUST use bridge mode and `native` mode must instead lock IMDS down at the
+       instance level (disable IMDS post-boot, or a host firewall scoped to
+       `gt-node-agent`'s UID).
     2. **Mandatory (not deferred) hardening for untrusted code** — rigs in
        `sandboxed` mode or running untrusted PRs MUST use rootless dockerd / nested
        userns (or skip the socket entirely); the "single-tenant, acceptable"
