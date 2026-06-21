@@ -65,7 +65,9 @@ on the first and deliberately does **not** use the second.
   mTLS CLI relay: the container runs `gt-proxy-client` as `gt`/`bd`, which
   forwards argv to the host, where the real `gt`/`bd` execute against the host's
   Dolt. Git fetch/push are relayed to `~/gt/<rig>/.repo.git`. Identity is the
-  client cert CN (`gt-<rig>-<name>`); a denylist gates subcommands.
+  client cert CN (`gt-<rig>-<name>`); an explicit **allowlist** gates permitted
+  `gt`/`bd` subcommands (anything not listed is rejected with 403). (A separate
+  denylist exists only for revoked cert serials, not subcommands.)
 
 This is exactly the control-plane transport this design needs. **Gap:** the proxy
 is a standalone binary — it is *not* wired into the spawn path. Nothing issues
@@ -271,12 +273,13 @@ tooling for checkpointing, not the work image.
 2. **A specific entrypoint or `CMD`.** gastown overrides the work container's
    entrypoint with an injected idle binary so the agent can be launched via
    `ecs execute-command` / ssm. The image need not provide a shell, `sleep`, or
-   an init. **Caveat:** because that idle binary runs as PID 1 and ECS Exec
-   spawns command processes as its children, PID 1 must reap zombies. We satisfy
-   this by setting `initProcessEnabled: true` on the work container (AWS's
-   recommended init for ECS Exec); the injected idle binary therefore does not
-   itself need to implement child reaping, but it MUST NOT exit when the agent
-   process does (it stays alive for the task lifetime — see also §9.3).
+   an init. **Caveat:** ECS Exec spawns command processes that can orphan, so PID 1
+   must reap zombies. We set `initProcessEnabled: true` on the work container,
+   which makes the Fargate-provided `tini` PID 1 (it reaps, and forwards signals
+   to the idle binary as its child). So the idle binary is **not** PID 1 and need
+   not reap children itself — it just must (a) trap/ignore the SIGTERM that `tini`
+   forwards and (b) not exit when the agent process does; it stays alive for the
+   task lifetime (see §9.3).
 3. **An SSM agent** (Fargate provides the exec bits itself).
 4. **Any credentials, certs, or Dolt config.** All injected as env/secrets (§7).
 5. **Control-plane egress.** GitHub, Dolt, and the `gt`/`bd`/git control plane
@@ -314,7 +317,8 @@ ECS Task (Fargate Spot)
       • dependsOn gt-sidecar: HEALTHY        (binaries present before it matters)
       • entryPoint = injected idle binary    (no shell/sleep assumption)
       • CWD = worktree on gt-shared; PATH includes /opt/gt
-      • host drives the agent via: aws ecs execute-command ... -- <resolved cmd>
+      • host drives the agent via:
+        aws ecs execute-command --interactive --command "<resolved cmd>" ...
 ```
 
 Putting the **worktree on the shared volume** lets the sidecar (which we control,
@@ -345,11 +349,18 @@ not as a silently dead session.
 ## 7. Credentials & identity
 
 A single per-backend IAM-role + secret-store layer covers **four** distinct
-credential concerns. The invariant is that no secret **material** (a key, a
-token, a password, a private cert) ever appears in the image, in task-def
-plaintext, in the `execute-command` command string, or in process args. Secret
-**references** — Secrets Manager / SSM ARNs in the task-def `secrets` and
-`repositoryCredentials` fields — are expected and are not sensitive; AWS resolves
+credential concerns. The invariant is that no **long-lived, high-value** secret
+material — a private key, an API key, a password, the proxy client cert/key —
+ever appears in the image, in task-def plaintext, in the `execute-command`
+command string, or in process args. The **one deliberate, bounded exception** is
+the single-use proxy bootstrap token (§7.2): it *is* secret material and *is*
+injected as task env (hence visible briefly via `ecs:DescribeTasks` / CloudTrail),
+but it is low-value by construction — single-use, short-TTL, and inert once the
+sidecar redeems it for the real cert seconds after launch. Where even that
+near-zero window is unacceptable, deliver the token itself as a secret reference
+(§7.2 option 2 collapses to this). Secret **references** — Secrets Manager / SSM
+ARNs in the task-def `secrets` and `repositoryCredentials` fields — are expected
+and are not sensitive; AWS resolves
 them into the container at launch without exposing the value via
 `ecs:DescribeTasks` or CloudTrail.
 
@@ -538,10 +549,12 @@ runs in the *work* container while the shutdown logic lives in the *sidecar*, an
 ECS signals both at once:
 
 1. *The work container must not exit on SIGTERM* — if it does, the agent dies
-   uncoordinated and the container may tear down before the flush. The injected
-   idle entrypoint (PID 1 of the work container) therefore **traps and ignores
-   SIGTERM**, staying alive for its full `stopTimeout` to give the sidecar its
-   window. (It still exits promptly on the sidecar's explicit signal below.)
+   uncoordinated and the container may tear down before the flush. With
+   `initProcessEnabled: true` the container's PID 1 is the Fargate-provided
+   `tini` init, which reaps zombies and **forwards SIGTERM to the idle entrypoint**
+   (its direct child). That entrypoint therefore **traps and ignores SIGTERM**,
+   staying alive for its full `stopTimeout` to give the sidecar its window. (It
+   still exits promptly on the sidecar's explicit signal below.)
 2. *The sidecar cannot signal a process in another container's PID namespace by
    default.* The task runs with **`pidMode: task`** (Fargate platform 1.4+) so all
    containers share one PID namespace and the sidecar can directly SIGKILL the
