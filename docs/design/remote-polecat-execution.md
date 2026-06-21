@@ -112,10 +112,10 @@ Orchestrator host                         AWS — EC2 instance (spot or on-deman
 │ GasTown daemon             │            │ EC2 instance (Packer AMI, gt-pinned)   │
 │  SpawnPolecatForSling      │            │  dockerd · amazon-ssm-agent            │
 │   └─ ExecutionBackend      │ RunInstances│                                       │
-│        .Provision() ───────┼───────────►│  gt-node-agent  (host systemd service) │
-│   └─ argv from             │            │   • redeems bootstrap token → cert     │
-│        .WrapCommand()       │            │     in host tmpfs (§7.2)               │
-│                            │            │   • LOCAL relay 127.0.0.1:9899         │
+│        .Provision() ───────┼──RunInst.──►│  gt-node-agent  (host systemd service) │
+│   └─ cert via SSM (CSR) ───┼────SSM─────►│   • keygen local; cert signed via SSM  │
+│   └─ argv from             │            │     (§7.2) → host tmpfs                 │
+│        .WrapCommand()       │            │   • LOCAL relay 127.0.0.1:9899         │
 │  gt-proxy-server ◄──mTLS──── relay ◄────┤   • checkpoint+push loop               │
 │   /v1/exec  (gt/bd)        │            │   • IMDS spot-interrupt poller (§9.3)  │
 │   /v1/git/<rig> (.repo.git)│            │                                        │
@@ -425,10 +425,20 @@ toolchain — same injection path, no special case.
 
 ### 6.3 Preflight
 
-During `Provision`, validate (container mode): the resolved agent runtime resolves
-in the image, and the image has `/bin/sh`. For any backend, reject `requires_docker`
-on a Fargate rig (§10). Fail fast so misconfiguration surfaces at provision time,
-not as a silently dead session.
+Preflight splits by *where it can run cheaply* — the orchestrator is often a
+laptop, so it must **not** pull the (potentially large) work image just to inspect
+it:
+
+- **Orchestrator-side (config only, no image pull):** reject `requires_docker` on
+  a Fargate rig (§10); sanity-check the resolved agent config, sizing, and auth
+  references. These need no image and fail instantly.
+- **Instance-side (image-content checks), in `gt-node-agent` after the instance
+  pulls the image:** verify the resolved agent runtime resolves on `PATH` and that
+  `/bin/sh` exists. The instance has already pulled the image to run it, so this is
+  free there and ruinous on the laptop. A failure is reported back over the control
+  plane (and surfaced on the bead) **before** the agent is launched, so a bad image
+  still fails fast with a clear error — just without dragging the image across the
+  developer's link.
 
 ### 6.4 Fargate backend (later, secondary)
 
@@ -718,11 +728,6 @@ Checkpointing must stay cheap and must not pollute the branch or bloat the repo:
   committing `node_modules`, build/compiler caches, and logs (bandwidth + bloat
   through the proxy). Untracked-but-wanted files are the rare exception, handled
   explicitly.
-- **Tracked-only, gitignore-respecting staging.** Stage with the repo's `.gitignore`
-  honored and **do not** blindly `git add -A` over untracked trees — avoid
-  committing `node_modules`, build/compiler caches, and logs (bandwidth + bloat
-  through the proxy). Untracked-but-wanted files are the rare exception, handled
-  explicitly.
 - **Quiescence guard.** Trigger a checkpoint only when the worktree is momentarily
   settled (no in-flight writes for a short debounce), so a half-written file is not
   captured mid-flush. The interval is a ceiling, not a hard metronome.
@@ -754,10 +759,13 @@ fails, at most one `checkpoint_interval` is lost.
 
 An interrupted polecat never reaches `gt done`; its bead stays `working` with a
 stale heartbeat. Witness's existing **restart-first** policy re-provisions. The
-resumed instance MUST `git fetch` and **reset to the pushed branch tip** before
-starting, and re-attach to the **same** bead — so interrupted work resumes rather
-than restarting. `Provision` is idempotent for this re-entry (it finds no live
-tagged instance for the identity and creates a fresh one that resumes the branch).
+resumed instance MUST `git fetch` and **reset its worktree to the checkpoint ref**
+(`refs/checkpoints/polecat/<name>`, the in-progress source of truth per §9.2 — not
+the polecat branch, which only holds completed/`gt done` work), then re-attach to
+the **same** bead — so interrupted work resumes from the last checkpoint rather
+than restarting or losing it. `Provision` is idempotent for this re-entry (it finds
+no live tagged instance for the identity and creates a fresh one that resumes from
+the checkpoint).
 
 ### 9.5 Teardown & zombie cap
 
