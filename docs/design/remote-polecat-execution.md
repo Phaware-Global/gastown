@@ -30,7 +30,7 @@ to conserve cost.
 **Spot is the desired default** (cost), but the backend **also supports on-demand**
 instances per rig (`instance_lifecycle`), for interruption-intolerant work or
 predictable capacity. Fargate is retained as a **later, secondary** backend for
-lightweight rigs that need neither Docker nor a custom host (§6.5).
+lightweight rigs that need neither Docker nor a custom host (§6.4).
 
 ### Goals
 
@@ -113,8 +113,8 @@ Orchestrator host                         AWS — EC2 instance (spot or on-deman
 │  SpawnPolecatForSling      │            │  dockerd · amazon-ssm-agent            │
 │   └─ ExecutionBackend      │ RunInstances│                                       │
 │        .Provision() ───────┼───────────►│  gt-node-agent  (host systemd service) │
-│   └─ exec_wrapper tokens   │            │   • redeems bootstrap token → cert     │
-│        from .WrapperTokens()│           │     in host tmpfs (§7.2)               │
+│   └─ argv from             │            │   • redeems bootstrap token → cert     │
+│        .WrapCommand()       │            │     in host tmpfs (§7.2)               │
 │                            │            │   • LOCAL relay 127.0.0.1:9899         │
 │  gt-proxy-server ◄──mTLS──── relay ◄────┤   • checkpoint+push loop               │
 │   /v1/exec  (gt/bd)        │            │   • IMDS spot-interrupt poller (§9.3)  │
@@ -139,7 +139,7 @@ Because we own the EC2 host, the gastown binaries, relay, checkpointing, and
 interrupt handling all live in a single host service (`gt-node-agent`) — no
 sidecar container, no shared-volume copy, no cross-container signalling. The agent
 runs in a Docker container so per-rig custom images and Docker-in-workflow both
-work (§6.4, §10).
+work (§6.1, §10).
 
 ---
 
@@ -220,14 +220,17 @@ between the two with a one-line config change and no other behavioral difference
 type ExecutionBackend interface {
     // Provision creates the execution environment and blocks until the agent
     // can be launched into it. Idempotent for resume (see §9.4). Returns the
-    // handle the daemon uses for WrapperTokens/Teardown.
+    // handle the daemon uses for WrapCommand/Teardown.
     Provision(ctx context.Context, spec PolecatSpec) (Endpoint, error)
 
-    // WrapperTokens returns the dynamic exec_wrapper inserted by
-    // BuildStartupCommand. For EC2 this is an SSM start-session / run command
-    // targeting the instance (then docker exec into the work container in
-    // container mode); for Fargate it is `aws ecs execute-command ... --command`.
-    WrapperTokens(ep Endpoint) []string
+    // WrapCommand takes the fully-resolved agent command (argv) and session env
+    // and returns the complete argv the daemon should exec on the orchestrator
+    // host to launch the agent remotely. The backend controls the ENTIRE
+    // structure — it does not merely prepend a prefix (see note below).
+    //   EC2:     aws ssm start-session … (a doc that runs `docker exec -e … <argv>`)
+    //   Fargate: aws ecs execute-command … --command "<argv>"
+    //   Local:   the argv unchanged (today's behavior).
+    WrapCommand(ep Endpoint, agentArgv []string, env map[string]string) []string
 
     // Teardown destroys the environment. Called by the reaper after cooldown,
     // on max_runtime expiry, or on explicit nuke.
@@ -235,12 +238,25 @@ type ExecutionBackend interface {
 }
 ```
 
-- `LocalBackend` — `Provision`/`Teardown` no-ops; `WrapperTokens` returns nil
-  (today's path, refactored behind the interface with **no behavior change**).
+> **`BuildStartupCommand` must be refactored — the prefix model is insufficient.**
+> Today `BuildStartupCommand` (`internal/config/loader.go`) builds the startup
+> string by appending the agent command as **trailing positional args** to the
+> `ExecWrapper` prefix (`exec env VAR=val … <prefix> <agent> <args>`). That works
+> for local wrappers (`exitbox`, `sudo`) that take a trailing command, but **breaks
+> for remote backends**: `aws ssm start-session` needs a document + parameters and
+> `aws ecs execute-command` needs the command in `--command "…"`, not as trailing
+> argv. So the existing static `ExecWrapper []string` (a pure prefix) is replaced,
+> for remote backends, by `ExecutionBackend.WrapCommand`, which receives the
+> resolved agent argv + env and returns the full argv — letting each backend place
+> the command (and env, §7.4) in the slot its launcher actually requires. Local
+> rigs keep the prefix path unchanged.
+
+- `LocalBackend` — `Provision`/`Teardown` no-ops; `WrapCommand` returns the agent
+  argv unchanged (today's path, refactored behind the interface, no behavior change).
 - `EC2SpotBackend` — **the primary, first-to-ship cloud backend.** Provisions a
   spot or on-demand instance from a Packer AMI. Despite the name it honors
   `instance_lifecycle` for both purchasing models.
-- `FargateBackend` — **later, secondary** (§6.5). For lightweight rigs needing
+- `FargateBackend` — **later, secondary** (§6.4). For lightweight rigs needing
   neither Docker nor a custom host. Supports `FARGATE_SPOT` and `FARGATE`
   (on-demand) capacity providers.
 
@@ -267,9 +283,11 @@ no corresponding live agent bead and tears them down.
   since session start is already deferred. This is also where the daemon mints the
   per-polecat cert (CN `gt-<rig>-<name>`) and arranges its **secure delivery** to
   the instance (§7.2 — never as plaintext that lingers in cleartext metadata).
-- **WrapperTokens:** feeds the existing `exec_wrapper` insertion in
-  `BuildStartupCommand` (`internal/config/loader.go`). No change to the command
-  builder itself.
+- **WrapCommand:** replaces the static `ExecWrapper` prefix-append in
+  `BuildStartupCommand` (`internal/config/loader.go`) for remote backends — the
+  command builder is refactored to delegate final-argv construction (command +
+  env placement) to the backend (see the note in §5 and §7.4). Local rigs keep the
+  prefix path.
 - **Teardown + cooldown:** `killIdlePolecat` (`internal/daemon/daemon.go`) gains a
   `backend.Teardown()` call; a cooldown timestamp in the heartbeat makes the
   reaper wait before tearing down.
@@ -279,148 +297,138 @@ no corresponding live agent bead and tears them down.
 
 ---
 
-## 6. Execution-environment contract
+## 6. EC2 execution model
 
-The polecat's environment is a Docker container (`exec_mode: container`, default)
-or the instance itself (`exec_mode: native`). In container mode the **image** is
-the dev environment; to keep custom images pristine and decoupled from gastown
-releases, the contract is split: **the image provides the toolchain and the agent
-runtime; gastown injects everything else from the host at launch.**
+The EC2 backend runs the polecat in one of two modes:
 
-### 6.1 What the image MUST provide (container mode)
+- **`native` (simplest):** the agent runs directly on the instance; the AMI *is*
+  the dev environment. Lowest overhead, full Docker, but the toolchain is the AMI.
+- **`container` (default; per-rig toolchains):** the agent runs in a Docker
+  container from the rig's `image`, with gastown bits and the worktree bind-mounted
+  in from the host. This preserves custom images per rig *and* gives Docker (§10).
 
-1. **The agent runtime binary** named by the rig's resolved agent config
-   (`RuntimeConfig.Command`): `claude`, or `codex`/`opencode`/`gemini`/etc. for
-   custom-agent rigs. Must be on `PATH` (or at the path the resolved command
-   names). gastown injects `gt`/`bd` but **not** the agent runtime — runtimes are
-   large and version-sensitive and belong in the image.
-2. **The project toolchain** the polecat needs (language runtimes, build tools,
-   linters, test frameworks) — the reason to use a custom image at all.
-3. **A POSIX shell (`/bin/sh`).** The agent is launched via `docker exec` (driven
-   over SSM), which runs the resolved command through a shell; an interactive
-   session also needs one. Present in virtually every base image, so **v1 requires
-   `/bin/sh`** and preflight (§6.6) rejects images without it. `scratch`/distroless
-   images are a **known v1 limitation** (open question 8) — prefer a thin
-   shell-bearing base.
-4. **A Docker client** *only if* the rig's workflows invoke Docker (`docker`,
-   `docker compose`). The daemon is the host's, reached via the bind-mounted
-   socket (§10); the client binary itself lives in the image's toolchain (item 2).
+Because we own the instance, gastown is delivered by **host bind-mounts**, not
+container gymnastics: a single host service (`gt-node-agent`) holds the cert, runs
+the relay, and owns checkpointing/interrupts. Nothing about the proxy, cert, or
+control plane depends on what the work image contains.
 
-`git` need only be in the image if the agent's *own* workflows call it (most do —
-it is part of the toolchain in item 2). gastown's checkpoint/push loop runs in the
-**host** `gt-node-agent` over the bind-mounted worktree, so it does not depend on
-the image carrying `git`.
+### 6.1 Host injection (the primary mechanism)
 
-### 6.2 What the image MUST NOT be expected to carry (container mode)
-
-1. **Gastown binaries** (`gt`, `bd`, the proxy client). Bind-mounted from the host
-   at `/opt/gt` (§6.4); never baked in.
-2. **A specific entrypoint or `CMD`.** The container is started with an injected
-   idle entrypoint (a static binary on the bind-mounted `/opt/gt`) so the agent
-   can be launched on demand via `docker exec`. The image need not provide a `CMD`,
-   `sleep`, or an init — but it **does** need `/bin/sh` (§6.1.3).
-3. **An SSM agent.** SSM terminates on the *host* (the AMI's `amazon-ssm-agent`);
-   the host then `docker exec`s into the work container. The image carries nothing
-   SSM-related.
-4. **Any credentials, certs, or Dolt config.** Injected as env (§7); the proxy
-   cert/key never enter the container at all (§6.4).
-5. **Direct control-plane or arbitrary egress.** GitHub, Dolt, and `gt`/`bd`/git
-   flow through the host proxy in every mode; the agent's own outbound internet is
-   governed by `network.mode` (§7.3).
-
-### 6.3 Default image
-
-When `execution.image` is empty (and `exec_mode: container`), the backend uses a
-gastown-published default dev image satisfying §6.1 for the default agent
-(`claude`) plus a common toolchain. It follows the **same** injection path — it
-does not bake gastown binaries — so there is one code path, not a special case.
-
-### 6.4 Injection mechanism (EC2) — the host owns everything
-
-Because we control the instance, injection is simple bind-mounting, not container
-gymnastics. The Packer AMI is **version-pinned to the orchestrator's gt release**
-so the proxy client matches the server protocol.
+The Packer AMI is **version-pinned to the orchestrator's gt release** so the proxy
+client matches the server protocol.
 
 ```
 EC2 instance (AMI: dockerd + amazon-ssm-agent + gt-node-agent + gt/bd + idle bin)
 │
 ├── gt-node-agent.service   (systemd; the host-side gastown supervisor)
 │     • redeems the bootstrap token → cert/key in HOST tmpfs (§7.2)
-│     • runs the LOCAL relay on 127.0.0.1:9899; terminates mTLS to host proxy :9876
+│     • runs the LOCAL relay; terminates mTLS to the host proxy (:9876) upstream
 │     • runs the checkpoint+push loop over the worktree on EBS
 │     • runs the IMDS spot-interrupt poller (§9.3)
-│     • starts the work container once the relay + cert are up (ordering below)
+│     • launches the agent once the relay + cert are up (native: child process;
+│       container: `docker run` the work image)
 │
-└── work container (custom/default image; carries nothing gastown)
-      • entrypoint = injected idle binary (from /opt/gt); PATH includes /opt/gt
-      • bind mounts:  /opt/gt (gt/bd + idle) · the EBS worktree · /var/run/docker.sock
-      • env: GT_PROXY_URL + git origin → http://127.0.0.1:9899/... (the host relay)
-      • holds NO cert/key — mTLS is the host relay's job
-      • driven via:  aws ssm start-session → docker exec -- <resolved cmd>
+└── agent (native: on the host · container: in the work container)
+      • bind mounts (container): /opt/gt (gt/bd + idle) · EBS worktree · docker.sock
+      • env: GT_PROXY_URL + git origin → the host relay (address per §6.1.1)
+      • holds NO cert/key — mTLS is gt-node-agent's job
+      • driven via:  aws ssm start-session → (container: docker exec) -- <argv>
 ```
 
-**mTLS termination lives entirely in `gt-node-agent` on the host.** The work
-container's `gt`/`bd`/git talk to the plaintext loopback relay (the container
-reaches it via the host's network — host networking, or the docker-bridge gateway,
-or `--add-host`); the host agent adds the client cert and forwards over mTLS to the
-host proxy. **The private key never enters the container or its env.** The loopback
-hop is instance-internal and never leaves the box. Two distinct ports avoid
-confusion: the local relay is `127.0.0.1:9899`; the host proxy (mTLS upstream) is
-`:9876`.
+**mTLS termination lives entirely in `gt-node-agent` on the host.** The agent's
+`gt`/`bd`/git talk to a plaintext local relay; the host service adds the client
+cert and forwards over mTLS to the host proxy. **The private key never enters the
+work container or its env.** The hop is instance-internal and never leaves the box.
+Two distinct ports avoid confusion: the local relay is `…:9899`; the host proxy
+(mTLS upstream) is `:9876`.
 
-**Startup ordering** is plain systemd/Docker dependency, not ECS health-check
-gymnastics: `gt-node-agent` starts the work container only after it has redeemed
-the cert and the relay is listening (it can probe `127.0.0.1:9899` itself before
-issuing `docker run`). No `dependsOn: HEALTHY` semantics needed.
+#### 6.1.1 Container networking — how the agent reaches the relay
 
-> **Command construction (avoid an injection footgun).** The remote command string
-> (SSM → `docker exec -- …`) must be built from the tokenized agent argv
-> (`rc.Command` + `rc.Args` + prompt, §8) with the same `ShellQuote` discipline
-> `BuildStartupCommand` already applies (`internal/config/loader.go`): every token
-> individually shell-quoted, config-derived parts (model flags, custom-agent args,
-> the free-form `InitialPrompt`) treated as **untrusted data to be quoted, never
-> interpolated raw** (pass the prompt as a single quoted arg or via stdin/file), so
-> metacharacters cannot break out of the command.
+`127.0.0.1` inside a bridge-network container is the *container's* loopback, **not**
+the host — so a relay bound to host `127.0.0.1:9899` is unreachable from a default
+bridge container. Two supported wirings (the backend picks one and sets
+`GT_PROXY_URL` / git `origin` to match):
 
-#### `exec_mode: native`
+1. **Host networking (default).** Run the work container with `--network host`.
+   The container then shares the host network namespace, so `127.0.0.1:9899`
+   *is* the relay. Safe here because the instance is single-tenant and ephemeral.
+   This is the default for its simplicity.
+2. **Bridge + host-gateway.** Keep bridge isolation: bind the relay to the docker
+   bridge gateway (or `0.0.0.0:9899`, firewalled to the bridge subnet) and start
+   the container with `--add-host=host.docker.internal:host-gateway`; the agent
+   reaches it at `http://host.docker.internal:9899`. Use when host networking is
+   undesirable.
 
-For rigs that do not need a custom image, `native` skips the work container: the
-agent runs directly on the instance, where the AMI *is* the dev environment.
-`gt-node-agent` launches it as a child process and signals it directly. Simplest
-and lowest-overhead, but the dev environment is the AMI (less per-rig flexibility);
-choose `container` when rigs need distinct toolchains.
+`native` mode has no container, so the agent simply uses `127.0.0.1:9899`.
 
-### 6.5 Fargate backend (later, secondary)
+#### 6.1.2 Startup ordering & command construction
 
-Fargate is retained for **lightweight rigs that need neither Docker (§10) nor a
-custom host** — e.g. pure code-edit/review polecats. It ships after EC2. Because
-Fargate gives no host and no shared host filesystem, injection there uses a
-**known sidecar image + a shared task volume**:
+Startup ordering is plain systemd/Docker dependency: `gt-node-agent` launches the
+agent only after it has redeemed the cert and confirmed the relay is listening (it
+probes the relay itself first). No health-check semantics needed.
 
-- A version-pinned `gt-sidecar` container copies `gt`/`bd` + the idle entrypoint
-  (+ `busybox sh` for distroless) onto a task-scoped volume, redeems the bootstrap
-  token to a cert in **its own tmpfs**, runs the loopback relay (`127.0.0.1:9899`)
-  and the checkpoint/interrupt logic — i.e. it is the in-task analogue of
-  `gt-node-agent`.
-- The work container `dependsOn` the sidecar's **container health check** (which
-  must assert binaries copied + relay listening — ECS only evaluates `HEALTHY`
-  when a health check is defined), mounts the shared volume, points gt/bd/git at
-  the relay, and is driven by `aws ecs execute-command --command "<resolved cmd>"`.
-- Set `initProcessEnabled: true` so the Fargate `tini` is PID 1 (reaps zombies,
-  forwards SIGTERM to the idle binary). Interrupt coordination across the two
-  containers needs `pidMode: task` **and** matching UID / `CAP_KILL` for the
-  sidecar to signal the agent (or the shared-volume STOP-marker fallback). See
-  §9.3.
+> **Command construction (avoid an injection footgun).** The remote command
+> (`WrapCommand` → SSM → `docker exec -- …`) is built from the tokenized agent argv
+> (§5, §8) with the same `ShellQuote` discipline `BuildStartupCommand` already
+> applies (`internal/config/loader.go`): every token individually shell-quoted,
+> config-derived parts (model flags, custom-agent args, the free-form
+> `InitialPrompt`) treated as **untrusted data to be quoted, never interpolated
+> raw** (pass the prompt as a single quoted arg or via stdin/file). Session env is
+> injected per §7.4, not via the orchestrator's local `exec env`.
 
-These are the constraints that make Fargate the *secondary* choice: more moving
-parts, and **no Docker** for the agent. The EC2 path avoids all of it.
+### 6.2 Image contract (container mode only)
 
-### 6.6 Preflight
+In `container` mode the image is the dev environment and **carries only the
+toolchain and agent runtime; gastown injects the rest from the host.** Concisely:
 
-During `Provision`, validate: (a) the resolved agent runtime (§6.1.1) resolves in
-the image (container mode); (b) the image has `/bin/sh` (§6.1.3); (c)
-`requires_docker` is not set on a Fargate rig (§10). Fail fast with a clear error
-so misconfiguration surfaces at provision time, not as a silently dead session.
+**MUST provide:** (1) the **agent runtime binary** the rig resolves to (`claude`,
+`codex`, …) on `PATH`; (2) the **project toolchain** (language runtimes, build/test
+tools — the reason for a custom image); (3) a **POSIX shell (`/bin/sh`)**, since the
+agent is launched via `docker exec` which runs the command through a shell (v1
+requires it; distroless is a known limitation — open question 8); (4) a **Docker
+client** *only if* the rig's workflows call `docker`/`docker compose` (§10).
+
+**MUST NOT be expected to carry:** gastown binaries (`gt`/`bd`/proxy client —
+bind-mounted at `/opt/gt`); a specific entrypoint/`CMD`/init (gastown supplies an
+injected idle entrypoint); an SSM agent (SSM terminates on the host); any
+credentials/certs/Dolt config (injected per §7; the proxy key never enters the
+container); or any assumption about direct egress (control plane is proxied; the
+agent's own internet is governed by `network.mode`, §7.3).
+
+`git` is needed in the image only if the agent's *own* workflows call it; gastown's
+checkpoint/push runs host-side in `gt-node-agent`, independent of the image.
+
+**Default image:** when `image` is empty, the backend uses a gastown-published
+default dev image satisfying the above for the `claude` agent plus a common
+toolchain — same injection path, no special case.
+
+### 6.3 Preflight
+
+During `Provision`, validate (container mode): the resolved agent runtime resolves
+in the image, and the image has `/bin/sh`. For any backend, reject `requires_docker`
+on a Fargate rig (§10). Fail fast so misconfiguration surfaces at provision time,
+not as a silently dead session.
+
+### 6.4 Fargate backend (later, secondary)
+
+> Deferred — for lightweight rigs that need **neither Docker (§10) nor a custom
+> host** (e.g. pure code-edit/review polecats). Ships after EC2 (Tier 4). Captured
+> here only so the interface stays backend-agnostic; skip on a first read.
+
+Fargate gives no host and no shared host filesystem, so the host-bind-mount model
+above does not apply. Injection instead uses a **version-pinned `gt-sidecar`
+container + a shared task volume**: the sidecar copies `gt`/`bd` + the idle
+entrypoint (+ `busybox sh` for distroless) onto the volume, redeems the bootstrap
+token to a cert in its own tmpfs, and runs the relay + checkpoint/interrupt logic —
+the in-task analogue of `gt-node-agent`. The work container `dependsOn` the
+sidecar's **container health check** (binaries copied + relay listening; ECS only
+honors `HEALTHY` when a health check is defined), shares the task network namespace
+(so the relay is reachable without the §6.1.1 host-gateway dance), and is driven by
+`aws ecs execute-command --command "<argv>"`. Interruption needs
+`initProcessEnabled: true` (so `tini` is PID 1 and forwards SIGTERM), plus
+`pidMode: task` and matching UID/`CAP_KILL` for the sidecar to signal the agent (or
+a shared-volume STOP-marker fallback; §9.3). The extra moving parts — and the lack
+of Docker — are exactly why Fargate is secondary.
 
 ---
 
@@ -488,16 +496,25 @@ preference:
 
 1. **Single-use bootstrap token (preferred).** At provision the daemon injects
    only a short-lived, one-time bootstrap token via launch metadata. On boot
-   `gt-node-agent` exchanges it at a dedicated proxy endpoint (`POST /v1/bootstrap`)
-   for its freshly minted cert + key, which never leave host tmpfs. The channel is
-   **not** mutually authenticated (the client has no cert yet — that is what it is
-   fetching) but is still **TLS with server authentication**: the agent validates
-   the proxy's server cert against the pinned gastown CA before sending the token,
-   so it cannot be intercepted or MITM'd in transit even on an untrusted network.
-   The token is **replay-resistant and single-use** — burned server-side on first
-   redemption and short-TTL — so a captured-but-already-redeemed token is inert,
-   and the cert is bound to the requesting session. This keeps *all* long-lived
-   secret material off launch metadata.
+   `gt-node-agent` exchanges it at a `POST /v1/bootstrap` endpoint for its freshly
+   minted cert + key, which never leave host tmpfs. The token is
+   **replay-resistant and single-use** — burned server-side on first redemption
+   and short-TTL — so a captured-but-already-redeemed token is inert, and the cert
+   is bound to the requesting session. This keeps *all* long-lived secret material
+   off launch metadata.
+
+   **This endpoint cannot live on the main proxy port.** `gt-proxy-server` today
+   listens with `ClientAuth: tls.RequireAndVerifyClientCert`
+   (`internal/proxy/server.go`), so the Go TLS handshake **rejects any certless
+   connection before HTTP routing** — and the bootstrapping agent has no cert yet
+   (that is what it is fetching). So `/v1/bootstrap` MUST be served on a **separate
+   listener/port** (e.g. `:9877`) configured for **server-auth-only TLS**
+   (`ClientAuth: tls.NoClientCert`). That listener still presents the gastown CA's
+   server cert, and the agent **pins/validates it against the bundled CA before
+   sending the token**, so the exchange is encrypted and not interceptable even
+   though it is not mutually authenticated. The main relay port (`:9876`) keeps
+   `RequireAndVerifyClientCert` unchanged. (The Secrets-Manager variant in option 2
+   sidesteps this listener entirely.)
 2. **Per-instance Secrets Manager secret.** The daemon writes the cert+key to a
    short-TTL Secrets Manager secret scoped to the instance role; `gt-node-agent`
    fetches it at boot. Acceptable, but leaves the material at rest in Secrets
@@ -566,6 +583,41 @@ shift from **isolation-by-prevention** to **mediation-by-policy + observability*
 appropriate when the agent must reach real registries, but you still want every
 byte of egress attributable and governed.
 
+### 7.4 Session-env propagation
+
+The agent needs gastown's session env to function — `GT_ROLE`, `GT_SESSION`,
+`GT_ROOT`, `BD_ACTOR`, `GT_RIG`, `GT_POLECAT`, the Dolt host/port, the
+`GT_PROXY_*`/`GIT_SSL_*` relay vars, etc., produced by `AgentEnv`
+(`internal/config/env.go`). Locally these are emitted as the `exec env VAR=val …`
+prefix in `BuildStartupCommand`. **That prefix runs on the orchestrator host and
+does not cross the boundary** — neither SSM nor `docker exec` forwards the client's
+environment to the remote process. So a naive remote launch would start the agent
+with **none** of these set, and `gt`/`bd` would fail to resolve their role, rig,
+or workspace.
+
+The backend therefore injects session env **remotely**, as part of `WrapCommand`
+(§5) — never via the orchestrator's local `exec env`:
+
+- **Container mode:** pass each var through `docker exec -e VAR=val …` (or an
+  `--env-file` that `gt-node-agent` writes to the bind-mounted `/opt/gt` and
+  references), so they are set in the agent's process, not the host's.
+- **Native mode:** `gt-node-agent` writes them to an env file it `source`s (or
+  prepends `env VAR=val …` to the launched argv) on the instance.
+
+Split by sensitivity, consistent with §7.1:
+
+- **Non-secret session env** (`GT_ROLE`, `GT_SESSION`, `GT_ROOT`, `BD_ACTOR`,
+  `GT_PROXY_URL`, …) travels in the `WrapCommand` payload / env-file. These are not
+  secrets; appearing in the SSM/`docker exec` invocation is acceptable.
+- **Secret env** (`ANTHROPIC_API_KEY`, registry creds, the proxy cert/key) is
+  **never** in the command payload — it is injected via the secret store / instance
+  profile (§7.1–7.2) or, for the proxy cert, terminated entirely in `gt-node-agent`
+  so it never reaches the agent at all.
+
+This is why `WrapCommand` takes the env map (§5): the backend, not
+`BuildStartupCommand`, is responsible for landing the session env in the remote
+process by whatever mechanism its launcher requires.
+
 ---
 
 ## 8. Model configuration carry-over
@@ -577,12 +629,12 @@ the resolved command + env cross. The config splits three ways:
 
 | Surface | Examples | Crosses to the remote? |
 |---|---|---|
-| **Command + Args + prompt** | `claude --model claude-opus-4-8`, custom `Command: codex`, `--dangerously-skip-permissions`, `InitialPrompt` | **Free** — it *is* the wrapped command string (§6.4). |
+| **Command + Args + prompt** | `claude --model claude-opus-4-8`, custom `Command: codex`, `--dangerously-skip-permissions`, `InitialPrompt` | **Free** — it *is* the wrapped command string (§6.1.2). |
 | **Env-based model config** (`rc.Env`) | `ANTHROPIC_BASE_URL` (Groq/MiniMax), `ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL` | **Inject** — same boundary as auth: non-secret → plain container env; secret → secret store. |
-| **Agent runtime binary** | the binary `Command` names | **Must be in the image/AMI** (§6.1.1). |
+| **Agent runtime binary** | the binary `Command` names | **Must be in the image/AMI** (§6.2). |
 
 So custom models carry over: CLI config for free, env config via the §7 injection
-path, and the runtime via the §6 image contract.
+path, and the runtime via the §6.2 image contract.
 
 ### 8.1 Liveness consequence
 
@@ -681,7 +733,7 @@ integration tests, testcontainers, etc.
   cannot run the repo's own compose file dynamically.
 
 **Backend gating.** `requires_docker: true` (§4) forces the rig onto EC2 and makes
-preflight (§6.6) reject a Fargate selection — so a Docker-needing rig can never be
+preflight (§6.3) reject a Fargate selection — so a Docker-needing rig can never be
 silently scheduled where the daemon is absent. This makes "needs Docker" an
 explicit, validated backend-selection criterion alongside the iOS "needs local"
 case.
@@ -708,7 +760,8 @@ case.
    agent_auth), tag-based discovery.
 7. `gt-node-agent`: bootstrap-token redemption, local relay, container launch with
    bind-mounts (`/opt/gt`, worktree, docker.sock), `exec_mode` container/native.
-8. SSM-based `WrapperTokens` (blocking-pane wrapper) + heartbeat-only liveness (§8.1).
+8. SSM-based `WrapCommand` (blocking-pane wrapper) + remote session-env injection
+   (§7.4) + heartbeat-only liveness (§8.1).
 
 **Tier 3 — full lifecycle:**
 9. Cooldown + `Teardown` from `killIdlePolecat`; continuous checkpoint loop (§9.2).
@@ -717,7 +770,7 @@ case.
     tunnel as a host service) → `open`.
 
 **Tier 4 — secondary backend + optimizations:**
-12. `FargateBackend` (§6.5) for lightweight no-Docker rigs (`FARGATE_SPOT` /
+12. `FargateBackend` (§6.4) for lightweight no-Docker rigs (`FARGATE_SPOT` /
     `FARGATE`).
 13. Pre-warmed idle instance pool per remote rig to hide cold-start latency.
 
@@ -748,7 +801,7 @@ exists.
 7. **Sandboxed-mode dependency story.** For `sandboxed` rigs that still need
    packages, standardize on a pull-through cache reachable by VPC endpoint
    (CodeArtifact, an S3-backed mirror) vs. deps pre-baked in the image/AMI.
-8. **Distroless work images (§6.1.3).** Confirm whether `docker exec` (over SSM)
+8. **Distroless work images (§6.2).** Confirm whether `docker exec` (over SSM)
    can drive a shell injected by absolute path into a `/bin/sh`-less image, or
    whether v1 simply requires `/bin/sh`.
 9. **Docker socket hardening (§10).** Default to a bind-mounted host socket
