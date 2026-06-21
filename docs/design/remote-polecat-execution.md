@@ -113,10 +113,11 @@ Orchestrator host                         AWS (per-rig backend)
 └────────────────────────────┘            └───────────────────────────────────┘
 ```
 
-The remote polecat never contacts Dolt, GitHub, or the arbitrary internet
-directly. All control-plane and git traffic flows host ↔ proxy; the host pushes
-to GitHub. (It does reach a narrow allowlist of AWS managed-service endpoints —
-ECR, SSM, Secrets Manager, Bedrock — via VPC endpoints; see §7.3.)
+The remote polecat never contacts Dolt, GitHub, or the gastown control plane
+directly — all of that flows host ↔ proxy, and the host pushes to GitHub. Its
+*own* outbound internet (package installs, APIs) is governed by a per-rig egress
+posture (`sandboxed` / Zero Trust `gateway` / `open`), and it reaches a narrow
+allowlist of AWS managed-service endpoints via VPC endpoints. See §7.3.
 
 ---
 
@@ -154,6 +155,16 @@ notes here as documentation, not literal syntax.
 
   // agent (LLM) auth (req. — see §7)
   "agent_auth": { "mode": "bedrock_role" },
+
+  // network egress posture (see §7.3). "gateway" is the default for real dev
+  // work (package installs etc.) routed through a Zero Trust egress gateway.
+  "network": {
+    "mode": "gateway",                 // "sandboxed" | "gateway" | "open"
+    "gateway": {
+      "provider": "cloudflare_zero_trust",
+      "token_secret_arn": "arn:aws:secretsmanager:...:gt-cf-egress"
+    }
+  },
 
   // lifecycle (req. #4, #6, #7)
   "checkpoint_interval": "5m",         // continuous work checkpointing
@@ -268,15 +279,14 @@ tooling for checkpointing, not the work image.
    process does (it stays alive for the task lifetime — see also §9.3).
 3. **An SSM agent** (Fargate provides the exec bits itself).
 4. **Any credentials, certs, or Dolt config.** All injected as env/secrets (§7).
-5. **General network egress.** The box reaches **no** arbitrary internet, **no**
-   GitHub, and **no** Dolt — all of that flows through the host proxy (§6.2 list
-   is about the *application* data plane). It does still need a **scoped AWS
-   control-plane allowlist** for the managed services this design uses: ECR
-   (image pull), ECS Exec / SSM Messages, Secrets Manager, and Bedrock (when
-   `agent_auth.mode = bedrock_role`). Provision these via **VPC endpoints /
-   PrivateLink** (preferred — keeps traffic off the public internet entirely) or a
-   NAT egress restricted to those service endpoints. "Locked to the proxy" means
-   the application plane, not "zero outbound packets." See §7.3.
+5. **Control-plane egress.** GitHub, Dolt, and the `gt`/`bd`/git control plane
+   are **never** reached directly — they flow through the host proxy in every
+   mode. The agent's *own* outbound internet (package installs, APIs) is **not**
+   blocked by default: it is governed by the per-rig `network.mode` (§7.3), which
+   ranges from fully `sandboxed` to a Zero Trust `gateway` (the dev default) to
+   `open`. The instance also always needs the scoped AWS control-plane allowlist
+   (ECR, SSM, Secrets Manager, Bedrock) via VPC endpoints. So: the *control*
+   plane is locked to the proxy; the *work-egress* plane is configurable.
 
 ### 6.3 Default image
 
@@ -406,27 +416,62 @@ Either way the key lands only in the sidecar's tmpfs, and the cert is short-live
 (`proxy_cert_ttl`, default 24h) so exposure is bounded even if an instance is
 compromised. The CA can revoke a leaked serial via the proxy denylist.
 
-### 7.3 Network model
+### 7.3 Network model & egress posture
 
-"No internet egress" applies to the **application data plane** (arbitrary
-internet, GitHub, Dolt) — all of which flow through the host proxy. The instance
-still requires a **narrow, explicit allowlist** to the AWS managed services this
-design depends on:
+Two **orthogonal** network planes, governed separately:
 
-| Destination | Why | Preferred path |
-|---|---|---|
-| ECR (api + dkr) | image pull | VPC interface endpoints |
-| S3 (gateway) | ECR layer storage | VPC gateway endpoint |
-| SSM / SSMMessages / EC2Messages | ECS Exec, EC2 SSM | VPC interface endpoints |
-| Secrets Manager | `secret`-mode auth, registry creds | VPC interface endpoint |
-| Bedrock runtime | `agent_auth.mode = bedrock_role` | VPC interface endpoint |
-| Host proxy (`:9876`) | all control-plane + git | direct (VPC / VPN / Tailscale) |
+- **Control plane** (`gt`/`bd`, git, beads) → **always** the host proxy, in every
+  mode. This is about identity, not isolation: it is how the polecat reaches Dolt
+  without DB auth. It never changes with the egress posture.
+- **AWS control-plane allowlist** — the instance always needs scoped access to the
+  managed services this design uses, ideally via **VPC endpoints / PrivateLink**
+  (NAT fallback), with the security group denying everything else *not* otherwise
+  permitted by the egress mode:
 
-Prefer **VPC endpoints / PrivateLink** so none of this traverses the public
-internet; a NAT gateway restricted to these endpoints is the fallback. The
-security-group egress rules deny everything else. This is what makes "the box
-never contacts GitHub/Dolt/the internet" true while still allowing the AWS
-control plane it genuinely needs.
+  | Destination | Why | Path |
+  |---|---|---|
+  | ECR (api + dkr) + S3 gateway | image pull | VPC endpoints |
+  | SSM / SSMMessages / EC2Messages | ECS Exec, EC2 SSM | VPC endpoints |
+  | Secrets Manager | `secret`-mode auth, registry creds | VPC endpoint |
+  | Bedrock runtime | `agent_auth.mode = bedrock_role` | VPC endpoint |
+  | Host proxy (`:9876`) | all control-plane + git | direct (VPC / VPN / Tailscale) |
+
+- **Work-egress plane** — the agent's *own* outbound internet (npm, PyPI,
+  crates.io, the Go module proxy, apt mirrors, GitHub for dependencies, arbitrary
+  HTTP APIs the task legitimately calls). This is what `network.mode` controls.
+
+> **Why this matters:** a fully locked-down box would break `npm install`,
+> `pip install`, `go mod download`, `apt-get`, and most real build steps. Total
+> isolation is correct for *untrusted* work but is the wrong default for ordinary
+> development. So egress is a **per-rig spectrum**, not a binary.
+
+#### `network.mode`
+
+1. **`sandboxed`** — no general egress; only the proxy + AWS allowlist above.
+   Maximum isolation — the original goal of `sandboxed-polecat-execution.md`
+   (prevent credential exfiltration / malicious-MCP reach-out). Dependencies must
+   be **pre-baked into the image** or served from an **internal mirror / pull-
+   through cache** reachable via a VPC endpoint (e.g. CodeArtifact, an S3-backed
+   registry proxy). Use for high-sensitivity rigs or untrusted code.
+
+2. **`gateway`** *(recommended default for dev work)* — full outbound internet,
+   but **mediated by a Zero Trust egress gateway** rather than raw NAT. A
+   Cloudflare Zero Trust setup (WARP / `cloudflared` running in the `gt-sidecar`,
+   with Gateway DNS/network/HTTP policies) lets legitimate package and API traffic
+   through while it **enforces destination policy, blocks known-bad endpoints, and
+   logs every flow** for audit/DLP. This is the happy medium: it keeps a real
+   security posture — exfiltration is policed and observable — without crippling
+   the agent. The gateway token is injected as a secret reference (§7), and the
+   sidecar establishes the tunnel before the work container starts.
+
+3. **`open`** — unrestricted NAT egress. Simplest, least safe; for fully trusted
+   rigs where the gateway hop is unwanted. Allowed but never the default.
+
+In **all** modes the control plane and git still flow through the gastown proxy —
+only the *work-egress* plane differs. The shift from `sandboxed` to `gateway` is a
+shift from **isolation-by-prevention** to **mediation-by-policy + observability**:
+appropriate when the agent must reach real registries, but you still want every
+byte of egress attributable and governed.
 
 ---
 
@@ -550,6 +595,8 @@ than restarting. `Provision` is idempotent for this re-entry.
 7. Cooldown + `Teardown` from `killIdlePolecat`; continuous checkpoint loop (§9.2).
 8. Per-backend spot-interrupt agents + resume logic (§9.3–9.4).
 9. `EC2SpotBackend` + Packer AMI pipeline.
+10. Network egress posture (§7.3): `sandboxed` (SG-only, ships with Tier 2) →
+    `gateway` (Zero Trust tunnel in the sidecar) → `open`.
 
 Each tier is independently testable; Tier 1 is useful before any cloud backend
 exists.
@@ -575,3 +622,13 @@ exists.
    EBS (EC2) or larger Fargate ephemeral storage for the worktree; reserve EFS for
    bulk, latency-tolerant *shared data* (build caches), never the worktree itself.
    So the likely answer is **EC2-only for very large repos**, not EFS worktrees.
+6. **Egress gateway abstraction (§7.3).** Should `network.gateway.provider` be an
+   interface (Cloudflare Zero Trust first, others later — Tailscale, a squid/HTTP
+   filtering proxy), and what is the default destination policy for `gateway`
+   mode (a curated registry allowlist — npm/PyPI/crates/Go-proxy/apt/GitHub — vs.
+   allow-all-but-log)? Where does the WARP/`cloudflared` client run — in the
+   `gt-sidecar`, or a dedicated egress container?
+7. **Sandboxed-mode dependency story.** For `sandboxed` rigs that still need
+   packages, standardize on a pull-through cache reachable by VPC endpoint
+   (CodeArtifact, an S3-backed registry mirror) vs. requiring deps pre-baked in
+   the image.
