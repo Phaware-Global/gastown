@@ -231,7 +231,7 @@ type ExecutionBackend interface {
     //   EC2:     aws ssm start-session … (a doc that runs `docker exec -e … <argv>`)
     //   Fargate: aws ecs execute-command … --command "<argv>"
     //   Local:   the argv unchanged (today's behavior).
-    WrapCommand(ep Endpoint, agentArgv []string, env map[string]string) []string
+    WrapCommand(ep Endpoint, agentArgv []string, env map[string]string) ([]string, error)
 
     // Teardown destroys the environment. Called by the reaper after cooldown,
     // on max_runtime expiry, or on explicit nuke.
@@ -326,7 +326,7 @@ image* ships git (the Fargate sidecar likewise bundles git for the same reason).
 EC2 instance (AMI: dockerd · amazon-ssm-agent · gt-node-agent · gt/bd · git · idle bin)
 │
 ├── gt-node-agent.service   (systemd; the host-side gastown supervisor)
-│     • redeems the bootstrap token → cert/key in HOST tmpfs (§7.2)
+│     • generates key locally; gets a CSR signed via SSM → cert in HOST tmpfs (§7.2)
 │     • runs the LOCAL relay; terminates mTLS to the host proxy (:9876) upstream
 │     • runs the checkpoint+push loop over the worktree on EBS
 │     • runs the IMDS spot-interrupt poller (§9.3)
@@ -346,6 +346,14 @@ cert and forwards over mTLS to the host proxy. **The private key never enters th
 work container or its env.** The hop is instance-internal and never leaves the box.
 Two distinct ports avoid confusion: the local relay is `…:9899`; the host proxy
 (mTLS upstream) is `:9876`.
+
+**Worktree ownership.** The agent container often runs as `root` (the default for
+many images), so files it creates on the bind-mounted EBS worktree are root-owned.
+`gt-node-agent` must be able to read and commit them for host-side checkpointing,
+so it **runs as root** (it manages `dockerd` anyway, which is already root-
+equivalent) — sidestepping the UID-mismatch that would otherwise block checkpoint /
+git / cleanup. (If a rig pins the container to a non-root `--user`, the worktree is
+created group-owned by a shared `gt` group so both sides retain access.)
 
 #### 6.1.1 Container networking — how the agent reaches the relay
 
@@ -377,8 +385,9 @@ hardening is effective). `native` mode has no container; the agent uses
 
 Two distinct lifecycle steps, by two different actors:
 1. **`gt-node-agent` prepares the environment** (systemd/Docker ordering, no
-   health-check gymnastics): redeem the cert, confirm the relay is listening (it
-   probes the relay itself), and — in container mode — `docker run` the **idle**
+   health-check gymnastics): obtain its cert (CSR over SSM, §7.2), confirm the relay
+   is listening (it probes the relay itself), and — in container mode — `docker run`
+   the **idle**
    work container (running only the injected idle entrypoint; no agent yet).
 2. **The orchestrator launches the agent process** on demand via `WrapCommand` →
    `aws ssm start-session` → (container) `docker exec` into the prepared container.
@@ -449,9 +458,9 @@ it:
 Fargate gives no host and no shared host filesystem, so the host-bind-mount model
 above does not apply. Injection instead uses a **version-pinned `gt-sidecar`
 container + a shared task volume**: the sidecar copies `gt`/`bd` + the idle
-entrypoint (+ `busybox sh` for distroless) onto the volume, redeems the bootstrap
-token to a cert in its own tmpfs, and runs the relay + checkpoint/interrupt logic —
-the in-task analogue of `gt-node-agent`. The work container `dependsOn` the
+entrypoint (+ static `busybox sh` for distroless) onto the volume, obtains a signed
+cert via the same key-local/CSR flow (§7.2, over ECS Exec instead of SSM), and runs
+the relay + checkpoint/interrupt logic — the in-task analogue of `gt-node-agent`. The work container `dependsOn` the
 sidecar's **container health check** (binaries copied + relay listening; ECS only
 honors `HEALTHY` when a health check is defined), shares the task network namespace
 (so the relay is reachable without the §6.1.1 host-gateway dance), and is driven by
@@ -466,18 +475,14 @@ of Docker — are exactly why Fargate is secondary.
 ## 7. Credentials & identity
 
 A single per-instance IAM-role + secret-store layer covers **four** distinct
-credential concerns. The invariant is that no **long-lived, high-value** secret
-material — a private key, an API key, a password, the proxy client cert/key — ever
-appears in the image, in instance/task metadata cleartext, in the remote command
-string, or in process args. The **one deliberate, bounded exception** is the
-single-use proxy bootstrap token (§7.2): it *is* secret material and *is* delivered
-via launch metadata (EC2 userdata / task env, hence briefly visible via
-`DescribeInstanceAttribute` / `ecs:DescribeTasks`), but it is low-value by
-construction — single-use, short-TTL, inert once `gt-node-agent` redeems it for the
-real cert seconds after boot. Where even that window is unacceptable, deliver the
-token itself as a secret reference (§7.2 option 2). Secret **references** — Secrets
-Manager / SSM ARNs — are expected and not sensitive; AWS resolves them at launch
-without exposing the value.
+credential concerns. The invariant is that **no secret material — a private key,
+an API key, a password, the proxy client cert/key — ever appears in the image, in
+launch metadata, in the remote command string, in process args, or in CloudTrail/
+SSM logs.** The SSM-driven cert flow (§7.2) honors this with no exception: the
+private key is generated on the instance and never transmitted, and no bootstrap
+secret rides launch metadata or `ssm send-command` parameters. Secret
+**references** — Secrets Manager / SSM ARNs — are expected and not sensitive; AWS
+resolves them at launch without exposing the value.
 
 | Concern | Mechanism |
 |---|---|
@@ -535,11 +540,15 @@ the daemon already has credentials for:
    locally** in host tmpfs — it never leaves the instance — and (b) writes a
    **Certificate Signing Request** (CN `gt-<rig>-<name>`) to a known path. The
    daemon (c) retrieves the CSR and (d) returns **only the signed cert** — both
-   directions over `aws ssm` (`send-command` / a session), bound to the
-   single-use bootstrap token. **No private key crosses the wire, and the
-   orchestrator opens no inbound port** (SSM is orchestrator-→-instance, so it
-   traverses NAT and survives a dynamic host IP). The token is replay-resistant
-   and single-use (burned on first redemption, short-TTL).
+   directions over `aws ssm` (`send-command` / a session). **No private key
+   crosses the wire, and the orchestrator opens no inbound port** (SSM is
+   orchestrator-→-instance, so it traverses NAT and survives a dynamic host IP).
+   **No bootstrap token is needed:** the SSM channel is itself IAM-authenticated
+   and the daemon targets the exact instance ID it just launched and tagged, so the
+   request binding the old token provided is inherent — and the daemon validates the
+   CSR's CN against the expected `gt-<rig>-<name>` before signing. (This is why §7's
+   invariant has no exception: nothing secret rides launch metadata or
+   CloudTrail-logged `send-command` parameters.)
 2. **Per-instance Secrets Manager secret (fallback).** The daemon writes the cert
    **+ key** to a short-TTL Secrets Manager secret scoped to the instance role;
    `gt-node-agent` fetches it at boot. This *does* transmit the key (and leaves it
@@ -757,15 +766,24 @@ fails, at most one `checkpoint_interval` is lost.
 
 ### 9.4 Resume
 
-An interrupted polecat never reaches `gt done`; its bead stays `working` with a
-stale heartbeat. Witness's existing **restart-first** policy re-provisions. The
-resumed instance MUST `git fetch` and **reset its worktree to the checkpoint ref**
-(`refs/checkpoints/polecat/<name>`, the in-progress source of truth per §9.2 — not
-the polecat branch, which only holds completed/`gt done` work), then re-attach to
-the **same** bead — so interrupted work resumes from the last checkpoint rather
-than restarting or losing it. `Provision` is idempotent for this re-entry (it finds
-no live tagged instance for the identity and creates a fresh one that resumes from
-the checkpoint).
+Two distinct re-entry cases, distinguished by whether the instance is still alive
+(reconciled with the tag-based discovery in §5):
+
+- **Instance still alive** (e.g. the *daemon* restarted, the *instance* did not):
+  tag-discovery finds the live instance for the identity, and `Provision`
+  **reattaches** to it — no new instance, no reprovision. This is the §5
+  discovery path.
+- **Instance gone** (spot reclamation, host crash): no live tagged instance is
+  found, so `Provision` launches a **fresh** one that resumes from the checkpoint.
+
+In the gone case the polecat never reached `gt done`; its bead stays `working` with
+a stale heartbeat, and Witness's existing **restart-first** policy drives the
+re-provision. The fresh instance MUST `git fetch` and **reset its worktree to the
+checkpoint ref** (`refs/checkpoints/polecat/<name>`, the in-progress source of truth
+per §9.2 — not the polecat branch, which only holds completed/`gt done` work), then
+re-attach to the **same** bead — so interrupted work resumes from the last
+checkpoint rather than restarting or losing it. `Provision` is idempotent across
+both cases: reattach if live, resume-from-checkpoint if not.
 
 ### 9.5 Teardown & zombie cap
 
@@ -779,6 +797,16 @@ the checkpoint).
   window (e.g. 60–120s), and only then calls `TerminateInstances`. If the grace
   window expires it terminates anyway. This preserves partial progress on a
   timed-out long task instead of discarding everything since the last checkpoint.
+- **Instance-side self-termination watchdog (cost backstop).** The host reaper is
+  not trustworthy for teardown when the orchestrator is a laptop that may sleep or
+  lose connectivity — a missed teardown means an EC2 instance billing
+  indefinitely. So `gt-node-agent` also enforces its own limits **locally**: it
+  self-terminates (after a final checkpoint) when it reaches `max_runtime`, **or**
+  when it loses contact with the orchestrator/control plane for a dead-man's-switch
+  interval (a few × `checkpoint_interval`). The host reaper is the primary,
+  graceful path; the in-instance watchdog guarantees the instance dies even if the
+  laptop never comes back. (A `shutdown -h` self-stop plus an EC2
+  `InstanceInitiatedShutdownBehavior=terminate` is the belt-and-suspenders form.)
 
 ### 9.6 Orchestrator connectivity & dynamic host
 
@@ -827,9 +855,13 @@ integration tests, testcontainers, etc.
        a container cannot reach it even via the gateway. **This requires bridge
        networking** (§6.1.1 option 2): under `--network host` there is no bridge and
        no extra hop, so both controls are bypassed — which is exactly why untrusted
-       rigs MUST use bridge mode and `native` mode must instead lock IMDS down at the
-       instance level (disable IMDS post-boot, or a host firewall scoped to
-       `gt-node-agent`'s UID).
+       rigs MUST use bridge mode. For `native` mode (and host-net) the primary
+       control is a **host firewall scoped to `gt-node-agent`'s UID** — only that
+       user may reach `169.254.169.254`; the agent's UID cannot. **Do not simply
+       disable IMDS post-boot:** `gt-node-agent` needs it for the
+       `/spot/instance-action` poller (§9.3), so a blanket disable would break spot
+       interruption handling. The UID-scoped firewall preserves the poller while
+       denying the agent.
     2. **Mandatory (not deferred) hardening for untrusted code** — rigs in
        `sandboxed` mode or running untrusted PRs MUST use rootless dockerd / nested
        userns (or skip the socket entirely); the "single-tenant, acceptable"
