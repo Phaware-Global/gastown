@@ -260,6 +260,18 @@ type ExecutionBackend interface {
 > the command (and env, §7.4) in the slot its launcher actually requires. Local
 > rigs keep the prefix path unchanged.
 
+> **Exit codes don't propagate through `start-session`.** `aws ssm start-session`
+> returns `0` when the session closes regardless of the remote process's exit
+> status, so the launch command's exit code is **not** a reliable success signal.
+> This is fine because, as with the local tmux model, gastown does **not** derive
+> success from the launcher's exit code: completion is the agent calling `gt done`
+> (heartbeat → `exiting`), and crash/abnormal-exit is caught by stale-heartbeat +
+> liveness detection (§8.1, §9.3) — not the session's return value. If a backend
+> ever needs the true remote exit status (e.g. for diagnostics), it captures it
+> out-of-band — the remote wrapper writes `$?` to a file `gt-node-agent` reads, or
+> uses `ssm send-command` (whose invocation status *does* carry the exit code)
+> rather than `start-session`.
+
 - `LocalBackend` — `Provision`/`Teardown` no-ops; `WrapCommand` returns the agent
   argv unchanged (today's path, refactored behind the interface, no behavior change).
 - `EC2SpotBackend` — **the primary, first-to-ship cloud backend.** Provisions a
@@ -367,8 +379,10 @@ Two distinct ports avoid confusion: the local relay is `…:9899`; the host prox
 agent's UID then depends on the mode:
 
 - **Container mode + bridge networking:** the container may run as `root` — it is
-  namespaced, and IMDS is blocked at the bridge (§10), so root inside the container
-  is contained.
+  namespaced and IMDS is blocked at the bridge (§10), so root inside the container
+  is contained **for the no-raw-docker-socket case**. (A container *with* the host
+  `docker.sock` is not contained by this — that escape is governed by §10's
+  rootless/userns requirement for untrusted rigs, not by namespacing.)
 - **`native` mode / host networking:** there is no namespace isolation and IMDS is
   firewalled **by UID** (§10), so the agent **must run as a dedicated non-root
   `gt-agent` UID** — distinct from `gt-node-agent`'s root — or the firewall can't
@@ -488,10 +502,13 @@ sidecar's **container health check** (binaries copied + relay listening; ECS onl
 honors `HEALTHY` when a health check is defined), shares the task network namespace
 (so the relay is reachable without the §6.1.1 host-gateway dance), and is driven by
 `aws ecs execute-command --command "<argv>"`. Interruption needs
-`initProcessEnabled: true` (so `tini` is PID 1 and forwards SIGTERM), plus
-`pidMode: task` and matching UID/`CAP_KILL` for the sidecar to signal the agent (or
-a shared-volume STOP-marker fallback; §9.3). The extra moving parts — and the lack
-of Docker — are exactly why Fargate is secondary.
+`initProcessEnabled: true` (so `tini` is PID 1 and forwards SIGTERM). Note
+**`pidMode: task` is *not* supported on Fargate** (EC2 launch type only), so the
+sidecar **cannot** signal the agent across the PID namespace there — Fargate must
+rely entirely on the **shared-volume STOP-marker** coordination (the work
+container's idle entrypoint watches for `/opt/gt/STOP` and stops its own agent
+child; §9.3). The extra moving parts — and the lack of Docker — are exactly why
+Fargate is secondary.
 
 ---
 
@@ -499,7 +516,8 @@ of Docker — are exactly why Fargate is secondary.
 
 A single per-instance IAM-role + secret-store layer covers **four** distinct
 credential concerns. The invariant is that **no secret material — a private key,
-an API key, a password, the proxy client cert/key — ever appears in the image, in
+an API key, a password, the proxy client **private key** (the signed cert is
+public, not secret) — ever appears in the image, in
 launch metadata, in the remote command string, in process args, or in CloudTrail/
 SSM logs.** The SSM-driven cert flow (§7.2) honors this with no exception: the
 private key is generated on the instance and never transmitted, and no bootstrap
@@ -563,17 +581,20 @@ the daemon already has credentials for:
    `SendCommand` (`AWS-RunShellScript`) that, on the instance, **generates the
    private key in host tmpfs and emits the CSR (CN `gt-<rig>-<name>`) on stdout**;
    the daemon **captures the CSR directly from the command output** (no
-   poll-a-file dance), signs it with the CA, and returns the cert via a second
-   `SendCommand` (or it is written to a known path `gt-node-agent` reads). **The
-   private key never leaves the instance**, only the cert crosses the wire, and the
-   orchestrator opens **no inbound port** (SSM is orchestrator-→-instance, so it
-   traverses NAT and survives a dynamic host IP).
-   **No bootstrap token is needed:** the SSM channel is itself IAM-authenticated
-   and the daemon targets the exact instance ID it just launched and tagged, so the
-   request binding the old token provided is inherent — and the daemon validates the
-   CSR's CN against the expected `gt-<rig>-<name>` before signing. (This is why §7's
-   invariant has no exception: nothing secret rides launch metadata or
-   CloudTrail-logged `send-command` parameters.)
+   poll-a-file dance), signs it with the CA, and returns the **cert** via a second
+   `SendCommand` (or a known path `gt-node-agent` reads). Returning the cert this
+   way is safe even though `send-command` output lands in CloudTrail/SSM logs: **a
+   signed certificate is public material, not a secret** — only the private key is
+   sensitive, and it never leaves the instance. **No bootstrap token is needed:** the
+   SSM channel is IAM-authenticated and the daemon targets the exact instance ID it
+   launched and tagged, so the binding the old token provided is inherent — and the
+   daemon validates the CSR's CN against the expected `gt-<rig>-<name>` before
+   signing.
+   **New CA primitive required:** the proxy CA today (`/v1/admin/issue-cert`)
+   *generates a keypair and returns the key* — which would defeat the no-key-
+   transport goal. This design needs a **CSR-signing path** (`sign(csr) → cert`,
+   key never seen by the CA) added to the CA/proxy; do not reuse the keypair-issuing
+   endpoint for the remote flow.
 2. **Per-instance Secrets Manager secret (fallback).** The daemon writes the cert
    **+ key** to a short-TTL Secrets Manager secret scoped to the instance role;
    `gt-node-agent` fetches it at boot. This *does* transmit the key (and leaves it
@@ -591,9 +612,12 @@ the daemon already has credentials for:
 > config is unchanged either way.
 
 The private key lives only in host tmpfs (never in the work container, and under
-the CSR flow never on the wire), and the cert is short-lived (`proxy_cert_ttl`,
-default 24h) so exposure is bounded even if an instance is compromised. The CA can
-revoke a leaked serial via the proxy denylist.
+the CSR flow never on the wire), and the cert is short-lived so exposure is bounded
+even if an instance is compromised. Note this design wants a **shorter
+`proxy_cert_ttl` (≈24h)** for ephemeral instances than the proxy's current
+keypair-issuance default (720h / 30d) — an intentional change; the authoritative
+default should be set on the new CSR-signing path, not inherited. The CA can revoke
+a leaked serial via the proxy denylist.
 
 ### 7.3 Network model & egress posture
 
@@ -799,9 +823,10 @@ fails, at most one `checkpoint_interval` is lost.
 
 > **Fargate (secondary) interruption** is more involved: ECS SIGTERMs every
 > container at once, so the work container's idle entrypoint must trap/ignore
-> SIGTERM (under `initProcessEnabled` `tini`), and the sidecar needs `pidMode: task`
-> + matching UID/`CAP_KILL` (or a shared-volume STOP marker) to stop the agent
-> before flushing. This asymmetry is another reason EC2 is primary.
+> SIGTERM (under `initProcessEnabled` `tini`). Since `pidMode: task` is unavailable
+> on Fargate (§6.4), the sidecar can't signal across the PID namespace, so it must
+> use the **shared-volume STOP marker** to stop the agent before flushing. This
+> asymmetry is another reason EC2 is primary.
 
 ### 9.4 Resume
 
