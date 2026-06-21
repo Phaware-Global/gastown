@@ -113,8 +113,10 @@ Orchestrator host                         AWS (per-rig backend)
 └────────────────────────────┘            └───────────────────────────────────┘
 ```
 
-The remote polecat never contacts Dolt, GitHub, or the internet directly. All
-control-plane and git traffic flows host ↔ proxy. The host pushes to GitHub.
+The remote polecat never contacts Dolt, GitHub, or the arbitrary internet
+directly. All control-plane and git traffic flows host ↔ proxy; the host pushes
+to GitHub. (It does reach a narrow allowlist of AWS managed-service endpoints —
+ECR, SSM, Secrets Manager, Bedrock — via VPC endpoints; see §7.3.)
 
 ---
 
@@ -258,10 +260,23 @@ tooling for checkpointing, not the work image.
 2. **A specific entrypoint or `CMD`.** gastown overrides the work container's
    entrypoint with an injected idle binary so the agent can be launched via
    `ecs execute-command` / ssm. The image need not provide a shell, `sleep`, or
-   an init.
+   an init. **Caveat:** because that idle binary runs as PID 1 and ECS Exec
+   spawns command processes as its children, PID 1 must reap zombies. We satisfy
+   this by setting `initProcessEnabled: true` on the work container (AWS's
+   recommended init for ECS Exec); the injected idle binary therefore does not
+   itself need to implement child reaping, but it MUST NOT exit when the agent
+   process does (it stays alive for the task lifetime — see also §9.3).
 3. **An SSM agent** (Fargate provides the exec bits itself).
 4. **Any credentials, certs, or Dolt config.** All injected as env/secrets (§7).
-5. **Network egress to GitHub/Dolt/the internet.** The box is locked to the proxy.
+5. **General network egress.** The box reaches **no** arbitrary internet, **no**
+   GitHub, and **no** Dolt — all of that flows through the host proxy (§6.2 list
+   is about the *application* data plane). It does still need a **scoped AWS
+   control-plane allowlist** for the managed services this design uses: ECR
+   (image pull), ECS Exec / SSM Messages, Secrets Manager, and Bedrock (when
+   `agent_auth.mode = bedrock_role`). Provision these via **VPC endpoints /
+   PrivateLink** (preferred — keeps traffic off the public internet entirely) or a
+   NAT egress restricted to those service endpoints. "Locked to the proxy" means
+   the application plane, not "zero outbound packets." See §7.3.
 
 ### 6.3 Default image
 
@@ -390,6 +405,28 @@ Two acceptable mechanisms, in order of preference:
 Either way the key lands only in the sidecar's tmpfs, and the cert is short-lived
 (`proxy_cert_ttl`, default 24h) so exposure is bounded even if an instance is
 compromised. The CA can revoke a leaked serial via the proxy denylist.
+
+### 7.3 Network model
+
+"No internet egress" applies to the **application data plane** (arbitrary
+internet, GitHub, Dolt) — all of which flow through the host proxy. The instance
+still requires a **narrow, explicit allowlist** to the AWS managed services this
+design depends on:
+
+| Destination | Why | Preferred path |
+|---|---|---|
+| ECR (api + dkr) | image pull | VPC interface endpoints |
+| S3 (gateway) | ECR layer storage | VPC gateway endpoint |
+| SSM / SSMMessages / EC2Messages | ECS Exec, EC2 SSM | VPC interface endpoints |
+| Secrets Manager | `secret`-mode auth, registry creds | VPC interface endpoint |
+| Bedrock runtime | `agent_auth.mode = bedrock_role` | VPC interface endpoint |
+| Host proxy (`:9876`) | all control-plane + git | direct (VPC / VPN / Tailscale) |
+
+Prefer **VPC endpoints / PrivateLink** so none of this traverses the public
+internet; a NAT gateway restricted to these endpoints is the fallback. The
+security-group egress rules deny everything else. This is what makes "the box
+never contacts GitHub/Dolt/the internet" true while still allowing the AWS
+control plane it genuinely needs.
 
 ---
 
