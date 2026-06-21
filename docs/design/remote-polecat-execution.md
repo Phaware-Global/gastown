@@ -125,7 +125,8 @@ Orchestrator host                         AWS — EC2 instance (spot or on-deman
 │                            │            │   • /var/run/docker.sock bind-mounted   │
 └────────────────────────────┘            │     → agent can docker compose (§10)    │
                                           │  origin/GT_PROXY_URL → 127.0.0.1:9899   │
-                                          │  no direct internet / Dolt / GitHub     │
+                                          │  no direct Dolt / GitHub / ctrl-plane   │
+                                          │  (work-egress per network.mode, §7.3)   │
                                           └───────────────────────────────────────┘
 ```
 
@@ -511,46 +512,36 @@ orchestrator's shell — the remote path is *more* isolated than local.
 The per-polecat client cert and its **private key** are the most sensitive
 material in the system: they grant `gt`/`bd` and git access as that identity. The
 key MUST NOT be injected as lingering plaintext (EC2 userdata and ECS task env are
-both readable via the AWS API) **and, ideally, should never travel over the network
-at all.** Two mechanisms, in order of preference:
+both readable via the AWS API) **and should never travel over the network at all.**
 
-1. **CSR + single-use bootstrap token (preferred).** At provision the daemon
-   injects only a short-lived, one-time bootstrap token via launch metadata. On
-   boot `gt-node-agent`:
-   (a) **generates the private key locally** in host tmpfs — it never leaves the
-   instance;
-   (b) builds a **Certificate Signing Request** (CN `gt-<rig>-<name>`);
-   (c) sends the **CSR + token** to `POST /v1/bootstrap`;
-   (d) the daemon validates the token and returns **only the signed certificate**
-   (never a key).
-   The token is **replay-resistant and single-use** — burned server-side on first
-   redemption and short-TTL — so a captured-but-already-redeemed token is inert,
-   and the issued cert is bound to the requesting session. Because the key is
-   generated on the instance and only the cert crosses the wire, **no private key
-   is ever transmitted or placed in launch metadata.**
+**The orchestrator drives delivery over SSM — no inbound port on the laptop.**
+Rather than expose a bootstrap listener on the orchestrator (problematic behind
+NAT / on a dynamic laptop IP — and `:9876` rejects certless connections via
+`ClientAuth: tls.RequireAndVerifyClientCert`, while `:9877` is the admin port,
+`internal/proxy/server.go`), delivery is **orchestrator-initiated via SSM**, which
+the daemon already has credentials for:
 
-   **This endpoint cannot live on the main proxy port.** `gt-proxy-server` today
-   listens with `ClientAuth: tls.RequireAndVerifyClientCert`
-   (`internal/proxy/server.go`), so the Go TLS handshake **rejects any certless
-   connection before HTTP routing** — and the bootstrapping agent has no cert yet
-   (that is what it is fetching). So `/v1/bootstrap` MUST be served on a **separate
-   listener/port** configured for **server-auth-only TLS**
-   (`ClientAuth: tls.NoClientCert`). Note `:9877` is **already taken** — it is the
-   recommended `AdminListenAddr` for the local admin server (`internal/proxy/server.go`)
-   — so use a distinct port (e.g. `:9878`); the bootstrap listener is also the only
-   one that must be reachable from the remote instance, unlike the loopback admin
-   server. That listener still presents the gastown CA's server cert, and the agent
-   **pins/validates it against the bundled CA before
-   sending the token**, so the exchange is encrypted and not interceptable even
-   though it is not mutually authenticated. The main relay port (`:9876`) keeps
-   `RequireAndVerifyClientCert` unchanged. (The Secrets-Manager variant in option 2
-   sidesteps this listener entirely.)
-2. **Per-instance Secrets Manager secret (fallback).** Where the bootstrap
-   listener is unavailable, the daemon writes the cert **+ key** to a short-TTL
-   Secrets Manager secret scoped to the instance role; `gt-node-agent` fetches it
-   at boot. This *does* transmit the key (and leaves it at rest in Secrets Manager
-   for the instance lifetime), so it is strictly weaker than the CSR flow — prefer
-   (1) whenever possible.
+1. **CSR over SSM (preferred).** `gt-node-agent` (a) **generates the private key
+   locally** in host tmpfs — it never leaves the instance — and (b) writes a
+   **Certificate Signing Request** (CN `gt-<rig>-<name>`) to a known path. The
+   daemon (c) retrieves the CSR and (d) returns **only the signed cert** — both
+   directions over `aws ssm` (`send-command` / a session), bound to the
+   single-use bootstrap token. **No private key crosses the wire, and the
+   orchestrator opens no inbound port** (SSM is orchestrator-→-instance, so it
+   traverses NAT and survives a dynamic host IP). The token is replay-resistant
+   and single-use (burned on first redemption, short-TTL).
+2. **Per-instance Secrets Manager secret (fallback).** The daemon writes the cert
+   **+ key** to a short-TTL Secrets Manager secret scoped to the instance role;
+   `gt-node-agent` fetches it at boot. This *does* transmit the key (and leaves it
+   at rest in Secrets Manager for the instance lifetime), so it is strictly weaker
+   than the CSR flow — prefer (1).
+
+> **Ongoing relay traffic** (the `:9876` mTLS control plane) likewise avoids an
+> inbound laptop port: either the instance dials a **stable host name** (Tailscale
+> / VPN, §9.6), or the orchestrator establishes an **SSM port-forwarding session**
+> so the relay tunnels orchestrator-→-instance. Both keep the laptop free of
+> inbound firewall holes; the `:9876`/`RequireAndVerifyClientCert` config is
+> unchanged, it just rides the tunnel.
 
 The private key lives only in host tmpfs (never in the work container, and under
 the CSR flow never on the wire), and the cert is short-lived (`proxy_cert_ttl`,
@@ -616,15 +607,22 @@ byte of egress attributable and governed.
 
 ### 7.4 Session-env propagation
 
-The agent needs gastown's session env to function — `GT_ROLE`, `GT_SESSION`,
-`GT_ROOT`, `BD_ACTOR`, `GT_RIG`, `GT_POLECAT`, the Dolt host/port, the
-`GT_PROXY_*`/`GIT_SSL_*` relay vars, etc., produced by `AgentEnv`
-(`internal/config/env.go`). Locally these are emitted as the `exec env VAR=val …`
-prefix in `BuildStartupCommand`. **That prefix runs on the orchestrator host and
-does not cross the boundary** — neither SSM nor `docker exec` forwards the client's
-environment to the remote process. So a naive remote launch would start the agent
-with **none** of these set, and `gt`/`bd` would fail to resolve their role, rig,
-or workspace.
+The agent needs gastown's session env to function. These fall into two groups:
+
+- **Existing session vars** — `GT_ROLE`, `GT_SESSION`, `GT_ROOT`, `BD_ACTOR`,
+  `GT_RIG`, `GT_POLECAT`, the Dolt host/port, etc. — produced today by `AgentEnv`
+  (`internal/config/env.go`) and emitted as the `exec env VAR=val …` prefix in
+  `BuildStartupCommand`.
+- **New relay vars this design adds** — `GT_PROXY_URL` and the `GIT_SSL_*` group
+  (and friends) that point gt/bd/git at the local relay (§6.1). These are **not**
+  emitted by `AgentEnv` today; they are introduced by this work (set per the chosen
+  container-networking mode, §6.1.1) and injected alongside the existing vars.
+
+The problem is the same for both groups: the local `exec env` prefix **runs on the
+orchestrator host and does not cross the boundary** — neither SSM nor `docker exec`
+forwards the client's environment to the remote process. So a naive remote launch
+would start the agent with **none** of these set, and `gt`/`bd` would fail to
+resolve their role, rig, or workspace.
 
 The backend therefore injects session env **remotely**, as part of `WrapCommand`
 (§5) — never via the orchestrator's local `exec env`:
@@ -689,21 +687,37 @@ from the reuse-the-worktree pool model and is carved out explicitly for
 
 ### 9.2 Recovery — git push via proxy (no storage snapshots)
 
-The recoverable artifact is the **polecat branch**, pushed host-side. There is no
-EBS/AMI snapshot lifecycle. To de-risk the tight interrupt window, the polecat
-**checkpoints continuously**: every `checkpoint_interval` (and on quiescence)
-`gt-node-agent` commits + pushes through the proxy, so the host is never more than
-one interval stale. Recovery = re-provision + reset to the tip. This applies to
-**on-demand** instances too (it guards host crashes, not just spot reclamation).
+There is no EBS/AMI snapshot lifecycle; durability is host-side git. **Two refs
+with two roles** (this is the source-of-truth split):
 
-Checkpointing must not pollute the real branch or bloat the repo:
+- The **polecat branch** (`polecat/<name>/<issue>`) is the artifact for
+  *completed/intentional* work — it advances only on the agent's own real commits
+  and `gt done`, and is what becomes a PR. It stays clean.
+- The **checkpoint ref** (`refs/checkpoints/polecat/<name>`) is the resume
+  source-of-truth for *in-progress/interrupted* work — force-updated every interval
+  with the latest worktree state.
 
-- **Dedicated checkpoint ref, not the polecat branch.** Checkpoints push to
-  `refs/checkpoints/polecat/<name>` (force-updated each interval), *not* the
-  `polecat/<name>/<issue>` branch. The clean branch only advances on the agent's
-  own real commits / `gt done`. Recovery resets the worktree from the latest
-  checkpoint ref; on resume the ref is squashed/dropped so checkpoint noise never
-  reaches a PR.
+To de-risk the tight interrupt window, the polecat **checkpoints continuously**:
+every `checkpoint_interval` (and on quiescence) `gt-node-agent` commits + pushes
+the **checkpoint ref** through the proxy, so the host is never more than one
+interval stale. **Recovery resets the worktree from the checkpoint ref** (not the
+branch), then the agent continues; on `gt done` the real work is already on the
+clean branch. This applies to **on-demand** instances too (it guards host crashes,
+not just spot reclamation).
+
+Checkpointing must stay cheap and must not pollute the branch or bloat the repo:
+
+- **Disposable, non-accumulating commits.** Each checkpoint is an **orphan commit**
+  (no parent) — or a single commit always re-parented on the branch tip — and the
+  ref is **force-moved**, never appended. Old checkpoint commits become
+  unreferenced and are reclaimed by periodic `git gc --prune` on `.repo.git`, so a
+  long session does not accumulate a 5-minute-granularity commit chain. (Unchanged
+  blobs/trees are shared by content-addressing; only changed trees cost objects.)
+- **Tracked-only, gitignore-respecting staging.** Stage with the repo's `.gitignore`
+  honored and **do not** blindly `git add -A` over untracked trees — avoid
+  committing `node_modules`, build/compiler caches, and logs (bandwidth + bloat
+  through the proxy). Untracked-but-wanted files are the rare exception, handled
+  explicitly.
 - **Tracked-only, gitignore-respecting staging.** Stage with the repo's `.gitignore`
   honored and **do not** blindly `git add -A` over untracked trees — avoid
   committing `node_modules`, build/compiler caches, and logs (bandwidth + bloat
@@ -894,7 +908,12 @@ exists.
    (CodeArtifact, an S3-backed mirror) vs. deps pre-baked in the image/AMI.
 8. **Distroless work images (§6.2).** Confirm whether `docker exec` (over SSM)
    can drive a shell injected by absolute path into a `/bin/sh`-less image, or
-   whether v1 simply requires `/bin/sh`.
+   whether v1 simply requires `/bin/sh`. Note a second pitfall beyond the exec
+   path: distroless images lack `glibc` and the dynamic linker
+   (`/lib64/ld-linux-x86-64.so.2`), so any injected shell/binary **must be fully
+   statically linked** (e.g. static `busybox`/`toybox`) to run at all — a
+   dynamically linked one fails with a missing-loader error. This pushes the v1
+   stance further toward simply requiring `/bin/sh`.
 9. **Docker socket hardening (§10).** Default to a bind-mounted host socket
    (single-tenant, ephemeral) or invest in rootless dockerd / nested userns for
    defense-in-depth against a malicious agent escaping to host root?
