@@ -10,6 +10,86 @@ import (
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
+// PressureConfig holds the thresholds for a standalone pressure check.
+// Zero values disable the corresponding check (matching daemon defaults).
+type PressureConfig struct {
+	// CPUThreshold is the per-core load average above which CPU is considered
+	// saturated. 0 = disabled.
+	CPUThreshold float64
+
+	// MemThresholdGB is the minimum available memory in GB below which memory
+	// is considered scarce. 0 = disabled.
+	MemThresholdGB float64
+
+	// MaxSessions is the maximum number of concurrent agent tmux sessions.
+	// 0 = disabled.
+	MaxSessions int
+}
+
+// CheckPressureConfig evaluates system pressure against explicit thresholds.
+// Unlike the Daemon method checkPressure, this is a standalone function usable
+// from CLI commands (gt pressure-check) and tests without a Daemon instance.
+//
+// CPU check is per-core: load / numCPU vs CPUThreshold. This correctly
+// handles high-I/O-wait workloads where raw load >> core count is normal.
+func CheckPressureConfig(cfg PressureConfig) PressureResult {
+	if cfg.CPUThreshold <= 0 && cfg.MemThresholdGB <= 0 && cfg.MaxSessions <= 0 {
+		return PressureResult{OK: true}
+	}
+
+	// Collect all metrics before evaluating thresholds so the result is always
+	// fully populated (avoids truncated JSON output on the first failing check).
+	var result PressureResult
+	result.OK = true
+
+	numCPU := runtime.NumCPU()
+	if cfg.CPUThreshold > 0 {
+		result.LoadAvg1 = loadAverage1()
+	}
+	if cfg.MemThresholdGB > 0 {
+		result.MemAvailableGB = availableMemoryGB()
+	}
+	if cfg.MaxSessions > 0 {
+		t := tmux.NewTmux()
+		sessions, err := t.ListSessions()
+		if err == nil {
+			for _, name := range sessions {
+				if isAgentSession(name) {
+					result.ActiveSessions++
+				}
+			}
+		}
+	}
+
+	// Evaluate thresholds in order; first failure sets Reason and clears OK.
+	if cfg.CPUThreshold > 0 && numCPU > 0 {
+		loadPerCore := result.LoadAvg1 / float64(numCPU)
+		if loadPerCore > cfg.CPUThreshold {
+			result.OK = false
+			result.Reason = fmt.Sprintf("cpu pressure: load/core %.2f exceeds threshold %.2f (load=%.1f, cores=%d)",
+				loadPerCore, cfg.CPUThreshold, result.LoadAvg1, numCPU)
+		}
+	}
+
+	if result.OK && cfg.MemThresholdGB > 0 {
+		if result.MemAvailableGB > 0 && result.MemAvailableGB < cfg.MemThresholdGB {
+			result.OK = false
+			result.Reason = fmt.Sprintf("memory pressure: %.1fGB available, minimum %.1fGB",
+				result.MemAvailableGB, cfg.MemThresholdGB)
+		}
+	}
+
+	if result.OK && cfg.MaxSessions > 0 {
+		if result.ActiveSessions >= cfg.MaxSessions {
+			result.OK = false
+			result.Reason = fmt.Sprintf("session cap: %d active sessions, max %d",
+				result.ActiveSessions, cfg.MaxSessions)
+		}
+	}
+
+	return result
+}
+
 // PressureResult holds the outcome of a pressure check.
 type PressureResult struct {
 	// OK is true if spawning should proceed.
