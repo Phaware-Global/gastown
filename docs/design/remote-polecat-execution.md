@@ -258,6 +258,13 @@ gastown injects everything else at launch.**
    large and version-sensitive and belong in the image.
 2. **The project toolchain** the polecat needs (language runtimes, build tools,
    linters, test frameworks) — the reason to use a custom image at all.
+3. **A POSIX shell (`/bin/sh`).** ECS Exec runs `--command` through the SSM agent,
+   which executes it via a shell; an interactive exec session also needs one. This
+   is present in virtually every base image (glibc, alpine/busybox). The genuine
+   exception is **`scratch`/distroless** images, which ship no shell — for those
+   the backend injects a static `busybox` (alongside `gt`/`bd` and the idle binary
+   on the shared volume, §6.4) and the resolved command runs via it. So the
+   contract is "provide `/bin/sh`, *or* accept an injected static shell."
 
 `git` is **not** required in the work image: the checkpoint/push loop and all
 proxy git traffic run in the `gt-sidecar` container (§6.4, §9.2), which carries
@@ -272,8 +279,9 @@ tooling for checkpointing, not the work image.
 1. **Gastown binaries** (`gt`, `bd`, the proxy client). Injected at launch (§6.4).
 2. **A specific entrypoint or `CMD`.** gastown overrides the work container's
    entrypoint with an injected idle binary so the agent can be launched via
-   `ecs execute-command` / ssm. The image need not provide a shell, `sleep`, or
-   an init. **Caveat:** ECS Exec spawns command processes that can orphan, so PID 1
+   `ecs execute-command` / ssm. The image need not provide a `CMD`, `sleep`, or
+   an init. (It *does* need a shell for ECS Exec — see §6.1.3.) **Caveat:** ECS
+   Exec spawns command processes that can orphan, so PID 1
    must reap zombies. We set `initProcessEnabled: true` on the work container,
    which makes the Fargate-provided `tini` PID 1 (it reaps, and forwards signals
    to the idle binary as its child). So the idle binary is **not** PID 1 and need
@@ -307,19 +315,29 @@ one ECS task:
 ```
 ECS Task (Fargate Spot)
 ├── volume: gt-shared           # task-scoped ephemeral; holds binaries + worktree
-├── container "gt-sidecar"      # known image, version-pinned
+├── container "gt-sidecar"      # known image, version-pinned; the mTLS terminator
 │     • on start: copies gt-proxy-client (as gt+bd), a static idle entrypoint,
-│       and the checkpoint script into /opt/gt on gt-shared; marks HEALTHY
-│     • then runs as the spot-interrupt agent + checkpoint/push loop over the
-│       worktree (also on gt-shared)
-│     • holds GT_PROXY_* / cert
+│       (and busybox sh if needed) and the checkpoint script into /opt/gt
+│     • redeems the bootstrap token → cert/key in its OWN tmpfs (§7.2)
+│     • runs a LOCAL relay on the task loopback (e.g. 127.0.0.1:9876 / unix
+│       socket on gt-shared); terminates mTLS to the host proxy upstream
+│     • also: spot-interrupt agent + checkpoint/push loop over the worktree
 └── container "work"            # custom or default image; carries nothing gastown
-      • dependsOn gt-sidecar: HEALTHY        (binaries present before it matters)
-      • entryPoint = injected idle binary    (no shell/sleep assumption)
-      • CWD = worktree on gt-shared; PATH includes /opt/gt
+      • dependsOn gt-sidecar: HEALTHY        (relay up before the agent starts)
+      • entryPoint = injected idle binary; PATH includes /opt/gt
+      • gt/bd and git point at the sidecar's LOCAL relay — GT_PROXY_URL and
+        origin = http://127.0.0.1:9876/... — so it needs NO cert/key of its own
       • host drives the agent via:
         aws ecs execute-command --interactive --command "<resolved cmd>" ...
 ```
+
+**mTLS termination lives entirely in the sidecar.** The work container's
+`gt`/`bd`/git talk to a plaintext **loopback** endpoint exposed by the sidecar on
+the shared task network (containers in one task share the network namespace), and
+the sidecar adds the client cert and forwards over mTLS to the host proxy. The
+private key therefore never leaves the sidecar's tmpfs and never enters the work
+container or its env — resolving the apparent tension with §7.2. The loopback hop
+is safe because it is task-internal and never leaves the instance.
 
 Putting the **worktree on the shared volume** lets the sidecar (which we control,
 with a proper signal handler and `git`) own checkpoint+push and interrupt
@@ -413,10 +431,16 @@ Two acceptable mechanisms, in order of preference:
 1. **Single-use bootstrap token (preferred).** At provision the daemon injects
    only a short-lived, one-time bootstrap token (low value, single-use) as task
    env. On startup the `gt-sidecar` exchanges it at a dedicated proxy endpoint
-   (`POST /v1/bootstrap`, mTLS-less but token-gated) for its freshly minted cert
-   + key, which never leave the instance's memory/tmpfs. The token is burned on
-   first use; a leaked token is useless after the sidecar redeems it. This keeps
-   *all* long-lived secret material off the AWS control plane.
+   (`POST /v1/bootstrap`) for its freshly minted cert + key, which never leave the
+   instance's memory/tmpfs. The channel is **not** mutually authenticated (the
+   client has no cert yet — that is what it is fetching) but is still **TLS with
+   server authentication**: the sidecar validates the proxy's server cert against
+   the pinned gastown CA before sending the token, so it cannot be intercepted or
+   MITM'd in transit even on an untrusted network. The token is **replay-resistant
+   and single-use** — burned server-side on first redemption and short-TTL — so a
+   captured-but-already-redeemed token is inert, and the cert is bound to the
+   requesting session. This keeps *all* long-lived secret material off the AWS
+   control plane.
 2. **Per-task Secrets Manager secret.** The daemon writes the cert+key to a
    short-TTL Secrets Manager secret scoped to the task's execution role and
    references it via the task-def `secrets` block (a reference, not the value,
