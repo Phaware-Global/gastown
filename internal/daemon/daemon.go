@@ -1871,42 +1871,55 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 		return
 	}
 
-	// Event gate: don't spawn a new Claude session when there's nothing to process.
-	// If a refinery session is already running, Start() returns ErrAlreadyRunning (cheap).
-	// But spawning a NEW session with an empty queue burns API credits for nothing.
-	// The refinery formula uses await-event internally, so it will wake when events appear.
-	if !d.hasPendingEvents("refinery") {
-		// Check if session already exists before skipping — let running sessions continue
-		r := &rig.Rig{
-			Name: rigName,
-			Path: filepath.Join(d.config.TownRoot, rigName),
-		}
-		mgr := refinery.NewManager(r)
-		if running, _ := mgr.IsRunning(); !running {
-			d.logger.Printf("No pending refinery events and no session running for %s, skipping spawn", rigName)
-			return
-		}
-	}
-
-	// Manager.Start() handles: zombie detection, session creation, env vars, theming,
-	// WaitForClaudeReady, and crucially - startup/propulsion nudges (GUPP).
-	// It returns ErrAlreadyRunning if Claude is already running in tmux.
 	r := &rig.Rig{
 		Name: rigName,
 		Path: filepath.Join(d.config.TownRoot, rigName),
 	}
 	mgr := refinery.NewManager(r)
 
-	// NOTE: Hung session detection removed for refineries (serial killer bug).
-	// Idle refineries legitimately produce no tmux output while waiting for MRs.
-	// The deacon's patrol health-scan step handles stuck detection with proper
-	// context (checks for active work before declaring something stuck).
-	// See: daemon.log "is hung (no activity for 30m0s), killing for restart"
+	// Event gate: don't spawn a new Claude session when there's nothing to process.
+	// If a refinery session is already running, Start() returns ErrAlreadyRunning (cheap).
+	// But spawning a NEW session with an empty queue burns API credits for nothing.
+	// The refinery formula uses await-event internally, so it will wake when events appear.
+	if !d.hasPendingEvents("refinery") {
+		// Check if session already exists before skipping — let running sessions continue
+		if running, _ := mgr.IsRunning(); !running {
+			d.logger.Printf("No pending refinery events and no session running for %s, skipping spawn", rigName)
+			return
+		}
+	}
 
+	// Zombie-aware hung-session check (gt-cza): a refinery that is process-alive
+	// but has produced no tmux output for > threshold is indistinguishable from a
+	// stalled session and must be restarted. This fixes the incident where a
+	// refinery PID was alive for 39h with no output, blocking the merge pipeline.
+	//
+	// Threshold is configurable (default 30m) so a normally idle refinery waiting
+	// on an empty queue is NOT flapped — its patrol cycle emits output well within
+	// that window. Only sessions that have gone truly silent get reaped here.
+	hung := d.loadOperationalConfig().GetDaemonConfig().RefineryHungThresholdD()
+	if status := mgr.IsHealthy(hung); status == tmux.AgentHung {
+		d.logger.Printf("Refinery for %s is zombie (no activity for >%v), reaping for respawn", rigName, hung)
+		sessionName := mgr.SessionName()
+		if err := d.tmux.KillSessionWithProcesses(sessionName); err != nil {
+			d.logger.Printf("Error killing hung refinery session %s: %v", sessionName, err)
+			return
+		}
+		// Re-check the event gate after reaping: if the queue is empty, don't
+		// burn credits spawning a new session — let the next cycle handle it.
+		if !d.hasPendingEvents("refinery") {
+			d.logger.Printf("Refinery for %s reaped; no pending events, skipping respawn", rigName)
+			return
+		}
+	}
+
+	// Manager.Start() handles: zombie detection (AgentDead), session creation,
+	// env vars, theming, WaitForClaudeReady, and startup/propulsion nudges (GUPP).
+	// It returns ErrAlreadyRunning if Claude is alive and healthy in tmux.
 	if err := mgr.Start(false, ""); err != nil {
 		if err == refinery.ErrAlreadyRunning {
-			// Already running - this is the expected case when fix is working
-			d.logger.Printf("Refinery for %s already running, skipping spawn", rigName)
+			// Session is alive and healthy — correct steady state
+			d.logger.Printf("Refinery for %s is healthy, skipping spawn", rigName)
 			return
 		}
 		d.logger.Printf("Error starting refinery for %s: %v", rigName, err)
