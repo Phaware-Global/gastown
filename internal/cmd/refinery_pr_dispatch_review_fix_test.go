@@ -337,3 +337,30 @@ func TestReviewFixCapacityDiagnostic(t *testing.T) {
 		}
 	})
 }
+
+// TestReviewFixCapacityExitCode pins the transient-vs-actionable distinction
+// for a full scheduler. A scheduler full only because of active (Working) or
+// in-flight (Reservations) polecats is at transient peak load and self-heals,
+// so it must retry quietly (exit 1) — escalating there would be a false alarm
+// (gemini review feedback on PR #124). A scheduler held full by a
+// RecoveryBlocked polecat will not free itself (the gt-cza case) and must
+// escalate (exit 4).
+func TestReviewFixCapacityExitCode(t *testing.T) {
+	cases := []struct {
+		name string
+		snap polecatCapacitySnapshot
+		want int
+	}{
+		{"all working is transient", polecatCapacitySnapshot{Max: 6, Working: 6}, 1},
+		{"working plus reservations is transient", polecatCapacitySnapshot{Max: 6, Working: 5, Reservations: 1}, 1},
+		{"recovery-blocked needs operator", polecatCapacitySnapshot{Max: 6, Working: 5, RecoveryBlocked: 1}, 4},
+		{"all recovery-blocked needs operator", polecatCapacitySnapshot{Max: 6, RecoveryBlocked: 6}, 4},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := reviewFixCapacityExitCode(c.snap); got != c.want {
+				t.Errorf("reviewFixCapacityExitCode(%+v) = %d; want %d", c.snap, got, c.want)
+			}
+		})
+	}
+}

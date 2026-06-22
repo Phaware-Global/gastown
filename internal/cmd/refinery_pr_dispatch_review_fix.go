@@ -273,7 +273,7 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 	} else if capErr != nil {
 		fmt.Fprintf(os.Stdout, "PR #%d: review-fix dispatch deferred — %s; iter stays at %d, will retry next patrol\n",
 			state.PRNumber, capErr.Error(), state.ReviewLoopIter)
-		return NewSilentExit(4)
+		return NewSilentExit(reviewFixCapacityExitCode(capErr.Snapshot))
 	}
 
 	polecatName, err := slingReviewFixPolecat(rigName, state, threads, cfg.PRReviewer)
@@ -290,14 +290,25 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 		// Defense in depth: a slot can fill between the preflight and the
 		// sling. Re-probe so the message still names the real cause (a full
 		// scheduler) rather than the bare "empty polecat name" symptom.
-		if capErr, _ := reviewFixCapacityExhausted(); capErr != nil {
+		capErr, capCheckErr := reviewFixCapacityExhausted()
+		switch {
+		case capCheckErr != nil:
+			// The re-probe itself failed — surface that cause rather than
+			// falling through to the generic empty-name symptom, which would
+			// lose the actionable failure in exactly the race this branch
+			// exists to clarify.
+			fmt.Fprintf(os.Stdout, "PR #%d: review-fix dispatch produced no polecat; capacity re-probe also failed (%v) — iter stays at %d, will retry next patrol\n",
+				state.PRNumber, capCheckErr, state.ReviewLoopIter)
+			return NewSilentExit(4)
+		case capErr != nil:
 			fmt.Fprintf(os.Stdout, "PR #%d: review-fix dispatch produced no polecat — %s; iter stays at %d, will retry next patrol\n",
 				state.PRNumber, capErr.Error(), state.ReviewLoopIter)
+			return NewSilentExit(reviewFixCapacityExitCode(capErr.Snapshot))
+		default:
+			fmt.Fprintf(os.Stdout, "PR #%d: review-fix dispatch returned empty polecat name — iter stays at %d, will retry next patrol\n",
+				state.PRNumber, state.ReviewLoopIter)
 			return NewSilentExit(4)
 		}
-		fmt.Fprintf(os.Stdout, "PR #%d: review-fix dispatch returned empty polecat name — iter stays at %d, will retry next patrol\n",
-			state.PRNumber, state.ReviewLoopIter)
-		return NewSilentExit(4)
 	}
 
 	newIter := state.ReviewLoopIter + 1
@@ -357,6 +368,23 @@ func reviewFixCapacityDiagnostic(snapshot polecatCapacitySnapshot) *polecatCapac
 		Snapshot: snapshot,
 		Reason:   "scheduler.max_polecats capacity is full — reap an idle/terminal polecat (gt reaper) or raise scheduler.max_polecats",
 	}
+}
+
+// reviewFixCapacityExitCode maps a capacity-full snapshot to the patrol exit
+// code. The distinction matters because exit 4 escalates to the operator while
+// exit 1 just retries on the next patrol:
+//
+//   - Full only because of active (Working) or in-flight (Reservations)
+//     polecats → transient peak load that frees a slot on its own. Retry
+//     quietly (exit 1); paging the operator here would be a false alarm.
+//   - Any RecoveryBlocked polecat → a stuck/un-reaped slot that will NOT free
+//     itself (the gt-cza case: capacity held by a terminal polecat awaiting a
+//     reap). Surface it as operational (exit 4) so an operator acts.
+func reviewFixCapacityExitCode(snap polecatCapacitySnapshot) int {
+	if snap.RecoveryBlocked > 0 {
+		return 4
+	}
+	return 1
 }
 
 // isReviewFixPolecatAlive shells out to `gt polecat status <rig>/<name>` and
