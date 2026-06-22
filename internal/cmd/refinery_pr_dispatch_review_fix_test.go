@@ -311,7 +311,7 @@ func TestDispatchReviewFixState_StructShape(t *testing.T) {
 //   - gate disabled (Max <= 0): never block
 //   - slot free (Free > 0):     never block
 //   - full (Free <= 0):         block, and the rendered message must name the
-//                               snapshot numbers and the remedy
+//     snapshot numbers and the remedy
 func TestReviewFixCapacityDiagnostic(t *testing.T) {
 	t.Run("gate disabled returns nil", func(t *testing.T) {
 		if got := reviewFixCapacityDiagnostic(polecatCapacitySnapshot{Max: 0, Free: 0}); got != nil {
@@ -323,8 +323,8 @@ func TestReviewFixCapacityDiagnostic(t *testing.T) {
 			t.Errorf("Free>0 must not block, got %v", got)
 		}
 	})
-	t.Run("full scheduler blocks with actionable message", func(t *testing.T) {
-		snap := polecatCapacitySnapshot{Max: 6, Working: 6, Free: 0}
+	t.Run("recovery-blocked fullness yields actionable remedy", func(t *testing.T) {
+		snap := polecatCapacitySnapshot{Max: 6, RecoveryBlocked: 6, Free: 0}
 		got := reviewFixCapacityDiagnostic(snap)
 		if got == nil {
 			t.Fatal("Free<=0 must return a capacity-full error, got nil")
@@ -332,8 +332,24 @@ func TestReviewFixCapacityDiagnostic(t *testing.T) {
 		msg := got.Error()
 		for _, frag := range []string{"max=6", "free=0", "scheduler.max_polecats", "reap"} {
 			if !strings.Contains(msg, frag) {
-				t.Errorf("capacity message missing %q (operator needs the cause + remedy): %s", frag, msg)
+				t.Errorf("actionable capacity message missing %q (operator needs cause + remedy): %s", frag, msg)
 			}
+		}
+	})
+	t.Run("transient fullness does not advise operator action", func(t *testing.T) {
+		snap := polecatCapacitySnapshot{Max: 6, Working: 6, Free: 0}
+		got := reviewFixCapacityDiagnostic(snap)
+		if got == nil {
+			t.Fatal("Free<=0 must return a capacity-full error, got nil")
+		}
+		msg := got.Error()
+		if !strings.Contains(msg, "transient") {
+			t.Errorf("transient capacity message must name the peak-load cause: %s", msg)
+		}
+		// A transient deferral must not tell the operator to reap — the exit
+		// code is self-healing (1), so reap advice here would mislead.
+		if strings.Contains(msg, "reap") {
+			t.Errorf("transient capacity message must not advise reaping: %s", msg)
 		}
 	})
 }

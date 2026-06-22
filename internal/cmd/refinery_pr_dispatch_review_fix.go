@@ -364,10 +364,29 @@ func reviewFixCapacityDiagnostic(snapshot polecatCapacitySnapshot) *polecatCapac
 	if snapshot.Max <= 0 || snapshot.Free > 0 {
 		return nil
 	}
+	// Keep the Reason consistent with reviewFixCapacityExitCode: a transient
+	// (peak-load) fullness must NOT advise an operator remedy, or the message
+	// would prompt unnecessary action during normal saturation while the exit
+	// code (1) is quietly self-healing.
+	reason := "scheduler.max_polecats capacity is full — reap an idle/terminal polecat (gt reaper) or raise scheduler.max_polecats"
+	if reviewFixCapacityIsTransient(snapshot) {
+		reason = "scheduler.max_polecats capacity is full from active/in-flight polecats (transient peak load) — no operator action needed, a slot frees as they finish; raise scheduler.max_polecats only if this persists"
+	}
 	return &polecatCapacityAdmissionError{
 		Snapshot: snapshot,
-		Reason:   "scheduler.max_polecats capacity is full — reap an idle/terminal polecat (gt reaper) or raise scheduler.max_polecats",
+		Reason:   reason,
 	}
+}
+
+// reviewFixCapacityIsTransient reports whether a capacity-full snapshot is
+// expected to self-heal. Fullness from only Working/Reservations polecats is
+// transient peak load; a RecoveryBlocked polecat holds a slot that will not
+// free without operator action (the gt-cza case). Both the deferral message
+// (reviewFixCapacityDiagnostic) and the patrol exit code
+// (reviewFixCapacityExitCode) derive from this single predicate so they never
+// disagree.
+func reviewFixCapacityIsTransient(snap polecatCapacitySnapshot) bool {
+	return snap.RecoveryBlocked == 0
 }
 
 // reviewFixCapacityExitCode maps a capacity-full snapshot to the patrol exit
@@ -381,10 +400,10 @@ func reviewFixCapacityDiagnostic(snapshot polecatCapacitySnapshot) *polecatCapac
 //     itself (the gt-cza case: capacity held by a terminal polecat awaiting a
 //     reap). Surface it as operational (exit 4) so an operator acts.
 func reviewFixCapacityExitCode(snap polecatCapacitySnapshot) int {
-	if snap.RecoveryBlocked > 0 {
-		return 4
+	if reviewFixCapacityIsTransient(snap) {
+		return 1
 	}
-	return 1
+	return 4
 }
 
 // isReviewFixPolecatAlive shells out to `gt polecat status <rig>/<name>` and
