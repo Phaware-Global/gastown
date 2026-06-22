@@ -302,3 +302,38 @@ func TestDispatchReviewFixState_StructShape(t *testing.T) {
 	// drop the import on a non-test build that excludes this file.
 	var _ = refinery.ReviewThread{}
 }
+
+// TestReviewFixCapacityDiagnostic pins the pure decision core that decides
+// whether a review-fix dispatch must defer for lack of a scheduler slot. The
+// gt-cza incident traced to `gt sling` silently no-op'ing on a full scheduler
+// and the dispatch only logging "empty polecat name", so an operator misread a
+// full scheduler as a load gate. This guards the three branches:
+//   - gate disabled (Max <= 0): never block
+//   - slot free (Free > 0):     never block
+//   - full (Free <= 0):         block, and the rendered message must name the
+//                               snapshot numbers and the remedy
+func TestReviewFixCapacityDiagnostic(t *testing.T) {
+	t.Run("gate disabled returns nil", func(t *testing.T) {
+		if got := reviewFixCapacityDiagnostic(polecatCapacitySnapshot{Max: 0, Free: 0}); got != nil {
+			t.Errorf("Max<=0 (gate disabled) must not block, got %v", got)
+		}
+	})
+	t.Run("free slot returns nil", func(t *testing.T) {
+		if got := reviewFixCapacityDiagnostic(polecatCapacitySnapshot{Max: 6, Free: 2}); got != nil {
+			t.Errorf("Free>0 must not block, got %v", got)
+		}
+	})
+	t.Run("full scheduler blocks with actionable message", func(t *testing.T) {
+		snap := polecatCapacitySnapshot{Max: 6, Working: 6, Free: 0}
+		got := reviewFixCapacityDiagnostic(snap)
+		if got == nil {
+			t.Fatal("Free<=0 must return a capacity-full error, got nil")
+		}
+		msg := got.Error()
+		for _, frag := range []string{"max=6", "free=0", "scheduler.max_polecats", "reap"} {
+			if !strings.Contains(msg, frag) {
+				t.Errorf("capacity message missing %q (operator needs the cause + remedy): %s", frag, msg)
+			}
+		}
+	})
+}
