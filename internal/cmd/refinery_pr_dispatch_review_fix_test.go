@@ -303,53 +303,61 @@ func TestDispatchReviewFixState_StructShape(t *testing.T) {
 	var _ = refinery.ReviewThread{}
 }
 
-// TestReviewFixCapacityDiagnostic pins the pure decision core that decides
-// whether a review-fix dispatch must defer for lack of a scheduler slot. The
-// gt-cza incident traced to `gt sling` silently no-op'ing on a full scheduler
-// and the dispatch only logging "empty polecat name", so an operator misread a
-// full scheduler as a load gate. This guards the three branches:
-//   - gate disabled (Max <= 0): never block
-//   - slot free (Free > 0):     never block
-//   - full (Free <= 0):         block, and the rendered message must name the
-//     snapshot numbers and the remedy
-func TestReviewFixCapacityDiagnostic(t *testing.T) {
-	t.Run("gate disabled returns nil", func(t *testing.T) {
-		if got := reviewFixCapacityDiagnostic(polecatCapacitySnapshot{Max: 0, Free: 0}); got != nil {
-			t.Errorf("Max<=0 (gate disabled) must not block, got %v", got)
-		}
-	})
-	t.Run("free slot returns nil", func(t *testing.T) {
-		if got := reviewFixCapacityDiagnostic(polecatCapacitySnapshot{Max: 6, Free: 2}); got != nil {
-			t.Errorf("Free>0 must not block, got %v", got)
-		}
-	})
-	t.Run("recovery-blocked fullness yields actionable remedy", func(t *testing.T) {
-		snap := polecatCapacitySnapshot{Max: 6, RecoveryBlocked: 6, Free: 0}
-		got := reviewFixCapacityDiagnostic(snap)
-		if got == nil {
-			t.Fatal("Free<=0 must return a capacity-full error, got nil")
-		}
-		msg := got.Error()
-		for _, frag := range []string{"max=6", "free=0", "scheduler.max_polecats", "reap"} {
+// TestReviewFixCapacityFull pins the pure full/free/disabled decision that
+// gates a review-fix deferral. The gt-cza incident traced to `gt sling`
+// silently no-op'ing on a full scheduler and the dispatch only logging "empty
+// polecat name", so an operator misread a full scheduler as a load gate.
+//   - gate disabled (Max <= 0): never full (gate off)
+//   - slot free (Free > 0):     never full
+//   - Free <= 0 with Max > 0:   full
+func TestReviewFixCapacityFull(t *testing.T) {
+	cases := []struct {
+		name string
+		snap polecatCapacitySnapshot
+		want bool
+	}{
+		{"gate disabled", polecatCapacitySnapshot{Max: 0, Free: 0}, false},
+		{"free slot", polecatCapacitySnapshot{Max: 6, Free: 2}, false},
+		{"full", polecatCapacitySnapshot{Max: 6, Free: 0}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := reviewFixCapacityFull(c.snap); got != c.want {
+				t.Errorf("reviewFixCapacityFull(%+v) = %v; want %v", c.snap, got, c.want)
+			}
+		})
+	}
+}
+
+// TestReviewFixCapacityMessage pins the deferral log line. It must render the
+// snapshot detail in both cases, but choose its remediation half from
+// transience so the message never contradicts the exit code — the bug augment
+// flagged on PR #124 was that routing through polecatCapacityAdmissionError's
+// Error() always appended operator-remediation text even for transient
+// peak-load, which the self-healing exit code (1) does not warrant.
+func TestReviewFixCapacityMessage(t *testing.T) {
+	t.Run("recovery-blocked yields actionable remedy", func(t *testing.T) {
+		msg := reviewFixCapacityMessage(polecatCapacitySnapshot{Max: 6, RecoveryBlocked: 6, Free: 0})
+		for _, frag := range []string{"max=6", "free=0", "recovery_blocked=6", "scheduler.max_polecats", "reap"} {
 			if !strings.Contains(msg, frag) {
 				t.Errorf("actionable capacity message missing %q (operator needs cause + remedy): %s", frag, msg)
 			}
 		}
 	})
-	t.Run("transient fullness does not advise operator action", func(t *testing.T) {
-		snap := polecatCapacitySnapshot{Max: 6, Working: 6, Free: 0}
-		got := reviewFixCapacityDiagnostic(snap)
-		if got == nil {
-			t.Fatal("Free<=0 must return a capacity-full error, got nil")
-		}
-		msg := got.Error()
+	t.Run("transient does not advise operator action", func(t *testing.T) {
+		msg := reviewFixCapacityMessage(polecatCapacitySnapshot{Max: 6, Working: 6, Free: 0})
 		if !strings.Contains(msg, "transient") {
 			t.Errorf("transient capacity message must name the peak-load cause: %s", msg)
 		}
-		// A transient deferral must not tell the operator to reap — the exit
-		// code is self-healing (1), so reap advice here would mislead.
-		if strings.Contains(msg, "reap") {
-			t.Errorf("transient capacity message must not advise reaping: %s", msg)
+		if !strings.Contains(msg, "max=6") {
+			t.Errorf("transient capacity message must still render the snapshot detail: %s", msg)
+		}
+		// The self-healing exit code (1) means a transient deferral must not
+		// advise the operator to reap or raise capacity.
+		for _, banned := range []string{"reap", "scheduler.max_polecats"} {
+			if strings.Contains(msg, banned) {
+				t.Errorf("transient capacity message must not advise %q: %s", banned, msg)
+			}
 		}
 	})
 }
