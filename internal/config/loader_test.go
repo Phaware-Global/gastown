@@ -1074,6 +1074,28 @@ func TestRuntimeConfigDefaults(t *testing.T) {
 	}
 }
 
+// effectiveAgentCommand returns the real agent binary token from a built
+// command line, transparently unwrapping a leading process wrapper
+// (env/sudo/nohup/...). Some environments resolve the claude preset to the
+// `env -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions --effort high`
+// form — stripping the API key so claude uses OAuth, plus the cost-tier effort
+// flag — which is a valid claude invocation. A naive parts[0] check sees "env"
+// and wrongly rejects it, so these tests unwrap the wrapper first (matching the
+// same logic ResolveProcessNames uses for liveness detection).
+func effectiveAgentCommand(cmdline string) string {
+	parts := strings.Fields(cmdline)
+	if len(parts) == 0 {
+		return ""
+	}
+	base := strings.TrimSuffix(filepath.Base(parts[0]), filepath.Ext(filepath.Base(parts[0])))
+	if wrapperCommands[base] {
+		if real := extractWrappedBinary(base, parts[1:]); real != "" {
+			return real
+		}
+	}
+	return parts[0]
+}
+
 func TestRuntimeConfigBuildCommand(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -1112,6 +1134,17 @@ func TestRuntimeConfigBuildCommand(t *testing.T) {
 			wantContains: []string{"--dangerously-skip-permissions"},
 			isClaudeCmd:  true,
 		},
+		{
+			// Regression: some environments resolve the claude preset to an
+			// `env -u ANTHROPIC_API_KEY claude ... --effort high` wrapper
+			// (strip the API key for OAuth + cost-tier effort). This is a
+			// valid claude invocation; the naive parts[0]=="claude" check used
+			// to reject it because the first token is "env" (red-gated CI).
+			name:         "env-wrapped claude is recognized as claude",
+			rc:           &RuntimeConfig{Command: "env", Args: []string{"-u", "ANTHROPIC_API_KEY", "claude", "--dangerously-skip-permissions", "--effort", "high"}},
+			wantContains: []string{"claude", "--dangerously-skip-permissions", "--effort", "high"},
+			isClaudeCmd:  true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1123,11 +1156,11 @@ func TestRuntimeConfigBuildCommand(t *testing.T) {
 					t.Errorf("BuildCommand() = %q, should contain %q", got, part)
 				}
 			}
-			// Check if command starts with claude (or path to claude)
+			// Check the command is claude (or path to claude), unwrapping any
+			// leading env/sudo/nohup process wrapper first.
 			if tt.isClaudeCmd {
-				parts := strings.Fields(got)
-				if len(parts) > 0 && !isClaudeCommand(parts[0]) {
-					t.Errorf("BuildCommand() = %q, command should be claude or path to claude", got)
+				if cmd := effectiveAgentCommand(got); cmd != "" && !isClaudeCommand(cmd) {
+					t.Errorf("BuildCommand() = %q, command should be claude or path to claude (after unwrapping any process wrapper)", got)
 				}
 			}
 		})
@@ -1196,11 +1229,11 @@ func TestRuntimeConfigBuildCommandWithPrompt(t *testing.T) {
 					t.Errorf("BuildCommandWithPrompt(%q) = %q, should contain %q", tt.prompt, got, part)
 				}
 			}
-			// Check if command starts with claude (or path to claude)
+			// Check the command is claude (or path to claude), unwrapping any
+			// leading env/sudo/nohup process wrapper first.
 			if tt.isClaudeCmd {
-				parts := strings.Fields(got)
-				if len(parts) > 0 && !isClaudeCommand(parts[0]) {
-					t.Errorf("BuildCommandWithPrompt(%q) = %q, command should be claude or path to claude", tt.prompt, got)
+				if cmd := effectiveAgentCommand(got); cmd != "" && !isClaudeCommand(cmd) {
+					t.Errorf("BuildCommandWithPrompt(%q) = %q, command should be claude or path to claude (after unwrapping any process wrapper)", tt.prompt, got)
 				}
 			}
 		})

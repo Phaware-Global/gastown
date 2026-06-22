@@ -302,3 +302,95 @@ func TestDispatchReviewFixState_StructShape(t *testing.T) {
 	// drop the import on a non-test build that excludes this file.
 	var _ = refinery.ReviewThread{}
 }
+
+// TestReviewFixCapacityFull pins the pure full/free/disabled decision that
+// gates a review-fix deferral. The gt-cza incident traced to `gt sling`
+// silently no-op'ing on a full scheduler and the dispatch only logging "empty
+// polecat name", so an operator misread a full scheduler as a load gate.
+//   - gate disabled (Max <= 0): never full (gate off)
+//   - slot free (Free > 0):     never full
+//   - Free <= 0 with Max > 0:   full
+func TestReviewFixCapacityFull(t *testing.T) {
+	cases := []struct {
+		name string
+		snap polecatCapacitySnapshot
+		want bool
+	}{
+		{"gate disabled", polecatCapacitySnapshot{Max: 0, Free: 0}, false},
+		{"free slot", polecatCapacitySnapshot{Max: 6, Free: 2}, false},
+		{"full", polecatCapacitySnapshot{Max: 6, Free: 0}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := reviewFixCapacityFull(c.snap); got != c.want {
+				t.Errorf("reviewFixCapacityFull(%+v) = %v; want %v", c.snap, got, c.want)
+			}
+		})
+	}
+}
+
+// TestReviewFixCapacityMessage pins the deferral log line. It must render the
+// snapshot detail in both cases, but choose its remediation half from
+// transience so the message never contradicts the exit code — the bug augment
+// flagged on PR #124 was that routing through polecatCapacityAdmissionError's
+// Error() always appended operator-remediation text even for transient
+// peak-load, which the self-healing exit code (1) does not warrant.
+func TestReviewFixCapacityMessage(t *testing.T) {
+	t.Run("recovery-blocked yields actionable remedy", func(t *testing.T) {
+		msg := reviewFixCapacityMessage(polecatCapacitySnapshot{Max: 6, RecoveryBlocked: 6, Free: 0})
+		// The remedy must point operators at the correct tool: `gt polecat
+		// remove` clears a terminal/recovery-blocked polecat. `gt reaper` is
+		// for wisp/issue cleanup and must NOT appear (augment review on PR #124).
+		for _, frag := range []string{"max=6", "free=0", "recovery_blocked=6", "scheduler.max_polecats", "gt polecat remove"} {
+			if !strings.Contains(msg, frag) {
+				t.Errorf("actionable capacity message missing %q (operator needs cause + remedy): %s", frag, msg)
+			}
+		}
+		if strings.Contains(msg, "gt reaper") {
+			t.Errorf("remedy must not reference `gt reaper` (wisp/issue cleanup, not polecats): %s", msg)
+		}
+	})
+	t.Run("transient does not advise operator action", func(t *testing.T) {
+		msg := reviewFixCapacityMessage(polecatCapacitySnapshot{Max: 6, Working: 6, Free: 0})
+		if !strings.Contains(msg, "transient") {
+			t.Errorf("transient capacity message must name the peak-load cause: %s", msg)
+		}
+		if !strings.Contains(msg, "max=6") {
+			t.Errorf("transient capacity message must still render the snapshot detail: %s", msg)
+		}
+		// The self-healing exit code (1) means a transient deferral must not
+		// advise the operator to remove a polecat or raise capacity.
+		for _, banned := range []string{"gt polecat remove", "scheduler.max_polecats"} {
+			if strings.Contains(msg, banned) {
+				t.Errorf("transient capacity message must not advise %q: %s", banned, msg)
+			}
+		}
+	})
+}
+
+// TestReviewFixCapacityExitCode pins the transient-vs-actionable distinction
+// for a full scheduler. A scheduler full only because of active (Working) or
+// in-flight (Reservations) polecats is at transient peak load and self-heals,
+// so it must retry quietly (exit 1) — escalating there would be a false alarm
+// (gemini review feedback on PR #124). A scheduler held full by a
+// RecoveryBlocked polecat will not free itself (the gt-cza case) and must
+// escalate (exit 4).
+func TestReviewFixCapacityExitCode(t *testing.T) {
+	cases := []struct {
+		name string
+		snap polecatCapacitySnapshot
+		want int
+	}{
+		{"all working is transient", polecatCapacitySnapshot{Max: 6, Working: 6}, 1},
+		{"working plus reservations is transient", polecatCapacitySnapshot{Max: 6, Working: 5, Reservations: 1}, 1},
+		{"recovery-blocked needs operator", polecatCapacitySnapshot{Max: 6, Working: 5, RecoveryBlocked: 1}, 4},
+		{"all recovery-blocked needs operator", polecatCapacitySnapshot{Max: 6, RecoveryBlocked: 6}, 4},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := reviewFixCapacityExitCode(c.snap); got != c.want {
+				t.Errorf("reviewFixCapacityExitCode(%+v) = %d; want %d", c.snap, got, c.want)
+			}
+		})
+	}
+}
