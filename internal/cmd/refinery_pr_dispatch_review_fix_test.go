@@ -338,10 +338,16 @@ func TestReviewFixCapacityFull(t *testing.T) {
 func TestReviewFixCapacityMessage(t *testing.T) {
 	t.Run("recovery-blocked yields actionable remedy", func(t *testing.T) {
 		msg := reviewFixCapacityMessage(polecatCapacitySnapshot{Max: 6, RecoveryBlocked: 6, Free: 0})
-		for _, frag := range []string{"max=6", "free=0", "recovery_blocked=6", "scheduler.max_polecats", "reap"} {
+		// The remedy must point operators at the correct tool: `gt polecat
+		// remove` clears a terminal/recovery-blocked polecat. `gt reaper` is
+		// for wisp/issue cleanup and must NOT appear (augment review on PR #124).
+		for _, frag := range []string{"max=6", "free=0", "recovery_blocked=6", "scheduler.max_polecats", "gt polecat remove"} {
 			if !strings.Contains(msg, frag) {
 				t.Errorf("actionable capacity message missing %q (operator needs cause + remedy): %s", frag, msg)
 			}
+		}
+		if strings.Contains(msg, "gt reaper") {
+			t.Errorf("remedy must not reference `gt reaper` (wisp/issue cleanup, not polecats): %s", msg)
 		}
 	})
 	t.Run("transient does not advise operator action", func(t *testing.T) {
@@ -353,8 +359,8 @@ func TestReviewFixCapacityMessage(t *testing.T) {
 			t.Errorf("transient capacity message must still render the snapshot detail: %s", msg)
 		}
 		// The self-healing exit code (1) means a transient deferral must not
-		// advise the operator to reap or raise capacity.
-		for _, banned := range []string{"reap", "scheduler.max_polecats"} {
+		// advise the operator to remove a polecat or raise capacity.
+		for _, banned := range []string{"gt polecat remove", "scheduler.max_polecats"} {
 			if strings.Contains(msg, banned) {
 				t.Errorf("transient capacity message must not advise %q: %s", banned, msg)
 			}

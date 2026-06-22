@@ -378,8 +378,8 @@ func reviewFixCapacityMessage(snap polecatCapacitySnapshot) string {
 			"no operator action needed, a slot frees as they finish (%s)", detail)
 	}
 	return fmt.Sprintf("scheduler at capacity with recovery-blocked polecats — "+
-		"reap an idle/terminal polecat (gt reaper) or raise scheduler.max_polecats; "+
-		"inspect with `gt scheduler status --json` (%s)", detail)
+		"clear a terminal/recovery-blocked polecat (gt polecat remove <rig>/<name>) or raise scheduler.max_polecats; "+
+		"inspect with `gt scheduler status --json` or `gt polecat list --all --json` (%s)", detail)
 }
 
 // reviewFixCapacityIsTransient reports whether a capacity-full snapshot is
@@ -399,9 +399,9 @@ func reviewFixCapacityIsTransient(snap polecatCapacitySnapshot) bool {
 //   - Full only because of active (Working) or in-flight (Reservations)
 //     polecats → transient peak load that frees a slot on its own. Retry
 //     quietly (exit 1); paging the operator here would be a false alarm.
-//   - Any RecoveryBlocked polecat → a stuck/un-reaped slot that will NOT free
-//     itself (the gt-cza case: capacity held by a terminal polecat awaiting a
-//     reap). Surface it as operational (exit 4) so an operator acts.
+//   - Any RecoveryBlocked polecat → a stuck slot that will NOT free itself
+//     (the gt-cza case: capacity held by a terminal polecat awaiting cleanup).
+//     Surface it as operational (exit 4) so an operator acts.
 func reviewFixCapacityExitCode(snap polecatCapacitySnapshot) int {
 	if reviewFixCapacityIsTransient(snap) {
 		return 1
