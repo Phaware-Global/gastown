@@ -73,3 +73,52 @@ func TestNudgeRequireIdle_OptIn(t *testing.T) {
 		t.Errorf("NudgeSessionWithOpts without RequireIdle = ErrAgentBusy, want delivery attempt")
 	}
 }
+
+// TestSendEnterVerified_StrandedReturnsErrNudgeStranded verifies that when the
+// input box still holds typed text after all Enter retries, sendEnterVerified
+// returns an error that unwraps to ErrNudgeStranded — the signal callers use to
+// recover (clear + re-queue) instead of reporting a hard failure. This is the
+// exact condition operators hit ("nudge Enter not processed ... input box still
+// holds text") when an agent slips busy mid-paste. (GH#gt-nudge-strand)
+func TestSendEnterVerified_StrandedReturnsErrNudgeStranded(t *testing.T) {
+	tm := newTestTmux(t)
+	session := fmt.Sprintf("gt-test-stranded-%d-%d", time.Now().UnixNano(), busyPaneSeq.Add(1))
+	if err := tm.NewSession(session, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSession(session) })
+	time.Sleep(200 * time.Millisecond)
+
+	// Run `cat` so the trailing Enter keystrokes are inert: cat echoes stdin
+	// without regenerating a shell prompt, so the rendered prompt-prefix line
+	// keeps holding text across all retries (a real agent that has gone busy
+	// behaves the same — Enter does not submit). Without this, Enter in a bare
+	// shell would spawn fresh prompts and the verification could read as cleared.
+	if err := tm.SendKeys(session, "cat"); err != nil {
+		t.Fatalf("SendKeys(cat): %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	// Type a prompt-prefixed line WITH leftover text, no Enter — this simulates
+	// a nudge typed into the input box but not yet submitted.
+	if _, err := tm.run("send-keys", "-t", session, "-l", DefaultReadyPromptPrefix+"stranded nudge text"); err != nil {
+		t.Fatalf("send-keys literal: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	// Precondition: the harness must actually render the stranded prompt line so
+	// inputBoxSubmitted can see it. If this terminal/locale can't (e.g. ❯ not
+	// displayed), skip rather than assert nothing.
+	lines, err := tm.CapturePaneLines(session, 5)
+	if err != nil {
+		t.Skipf("CapturePaneLines: %v", err)
+	}
+	if submitted, conclusive := inputBoxSubmitted(lines, DefaultReadyPromptPrefix); !conclusive || submitted {
+		t.Skipf("stranded prompt line not rendered in this environment (conclusive=%v submitted=%v); skipping", conclusive, submitted)
+	}
+
+	err = tm.sendEnterVerified(session, DefaultReadyPromptPrefix)
+	if !errors.Is(err, ErrNudgeStranded) {
+		t.Errorf("sendEnterVerified on stranded box = %v, want ErrNudgeStranded", err)
+	}
+}
