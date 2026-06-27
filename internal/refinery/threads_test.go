@@ -26,18 +26,19 @@ func (p *threadsFakeProvider) UnresolvedThreads(prNumber int) ([]ReviewThread, e
 }
 
 // Unused PRProvider surface — panic if exercised.
-func (p *threadsFakeProvider) FindPRNumber(string) (int, error)              { panic("unused") }
-func (p *threadsFakeProvider) IsPRApproved(int) (bool, error)                { panic("unused") }
-func (p *threadsFakeProvider) IsPRApprovedBy(int, string) (bool, error)      { panic("unused") }
-func (p *threadsFakeProvider) MergePR(int, string) (string, error)           { panic("unused") }
-func (p *threadsFakeProvider) CreatePR(CreatePROptions) (int, string, error) { panic("unused") }
-func (p *threadsFakeProvider) RequestReview(int, []string) error             { panic("unused") }
-func (p *threadsFakeProvider) AllThreads(int) ([]ReviewThread, error)        { panic("unused") }
-func (p *threadsFakeProvider) CountApprovals(int) (int, error)               { panic("unused") }
-func (p *threadsFakeProvider) ChecksRollup(int) (string, bool, error)        { panic("unused") }
-func (p *threadsFakeProvider) PostComment(int, string) error                 { panic("unused") }
-func (p *threadsFakeProvider) HasReviewFrom(int, string) (bool, error)       { panic("unused") }
-func (p *threadsFakeProvider) ListReviewAuthors(int) ([]string, error)        { panic("unused") }
+func (p *threadsFakeProvider) FindPRNumber(string) (int, error)                { panic("unused") }
+func (p *threadsFakeProvider) IsPRApproved(int) (bool, error)                  { panic("unused") }
+func (p *threadsFakeProvider) IsPRApprovedBy(int, string) (bool, error)        { panic("unused") }
+func (p *threadsFakeProvider) MergePR(int, string) (string, error)             { panic("unused") }
+func (p *threadsFakeProvider) CreatePR(CreatePROptions) (int, string, error)   { panic("unused") }
+func (p *threadsFakeProvider) RequestReview(int, []string) error               { panic("unused") }
+func (p *threadsFakeProvider) ChangesRequestedReviewers(int) ([]string, error) { panic("unused") }
+func (p *threadsFakeProvider) AllThreads(int) ([]ReviewThread, error)          { panic("unused") }
+func (p *threadsFakeProvider) CountApprovals(int) (int, error)                 { panic("unused") }
+func (p *threadsFakeProvider) ChecksRollup(int) (string, bool, error)          { panic("unused") }
+func (p *threadsFakeProvider) PostComment(int, string) error                   { panic("unused") }
+func (p *threadsFakeProvider) HasReviewFrom(int, string) (bool, error)         { panic("unused") }
+func (p *threadsFakeProvider) ListReviewAuthors(int) ([]string, error)         { panic("unused") }
 func (p *threadsFakeProvider) HasReviewFromOnSHA(int, string, string) (bool, error) {
 	panic("unused")
 }

@@ -71,6 +71,10 @@ func (p *bitbucketPRProvider) RequestReview(prNumber int, reviewers []string) er
 	return ErrUnsupported
 }
 
+func (p *bitbucketPRProvider) ChangesRequestedReviewers(prNumber int) ([]string, error) {
+	return nil, ErrUnsupported
+}
+
 func (p *bitbucketPRProvider) UnresolvedThreads(prNumber int) ([]ReviewThread, error) {
 	return nil, ErrUnsupported
 }

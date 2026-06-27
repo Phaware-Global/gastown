@@ -34,6 +34,15 @@ type awaitFakeProvider struct {
 
 	reviewAuthors    []string
 	reviewAuthorsErr error
+
+	// changesRequested is returned by ChangesRequestedReviewers; its error
+	// path exercises the best-effort tolerance in reRequestBlockingReviewers.
+	changesRequested    []string
+	changesRequestedErr error
+	// requestedReviewers records every RequestReview call's reviewer slice so
+	// tests can assert who was re-requested.
+	requestedReviewers [][]string
+	requestReviewErr   error
 }
 
 func (p *awaitFakeProvider) PostComment(prNumber int, body string) error {
@@ -77,7 +86,17 @@ func (p *awaitFakeProvider) IsPRApproved(int) (bool, error)                { pan
 func (p *awaitFakeProvider) IsPRApprovedBy(int, string) (bool, error)      { panic("unused") }
 func (p *awaitFakeProvider) MergePR(int, string) (string, error)           { panic("unused") }
 func (p *awaitFakeProvider) CreatePR(CreatePROptions) (int, string, error) { panic("unused") }
-func (p *awaitFakeProvider) RequestReview(int, []string) error             { panic("unused") }
+func (p *awaitFakeProvider) RequestReview(prNumber int, reviewers []string) error {
+	if p.requestReviewErr != nil {
+		return p.requestReviewErr
+	}
+	p.requestedReviewers = append(p.requestedReviewers, reviewers)
+	return nil
+}
+
+func (p *awaitFakeProvider) ChangesRequestedReviewers(prNumber int) ([]string, error) {
+	return p.changesRequested, p.changesRequestedErr
+}
 func (p *awaitFakeProvider) AllThreads(int) ([]ReviewThread, error)        { panic("unused") }
 func (p *awaitFakeProvider) CountApprovals(int) (int, error)               { panic("unused") }
 func (p *awaitFakeProvider) ChecksRollup(int) (string, bool, error)        { panic("unused") }
@@ -680,5 +699,67 @@ func TestDefaultMergeQueueConfig_SeedsAwaitReviewDefaults(t *testing.T) {
 	}
 	if cfg.PRTriggerComment != DefaultPRTriggerComment {
 		t.Errorf("PRTriggerComment = %q, want %q", cfg.PRTriggerComment, DefaultPRTriggerComment)
+	}
+}
+
+// Gap B: on a HEAD drift (a fix was pushed), the trigger-repost branch must
+// re-request reviewers currently blocking with CHANGES_REQUESTED, EXCLUDING the
+// configured pr_reviewer (woken by the trigger comment). Otherwise a human
+// CHANGES_REQUESTED gate stalls until manually re-requested.
+func TestAwaitReviewStep_DriftReset_ReRequestsBlockingReviewers(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	const (
+		oldSHA = "1111111111111111111111111111111111111111"
+		newSHA = "2222222222222222222222222222222222222222"
+	)
+	p := &awaitFakeProvider{
+		// augment is the configured reviewer; kevinpjones is a human gate.
+		changesRequested: []string{"augment", "kevinpjones"},
+	}
+	res, err := AwaitReviewStep(p, 45, baseInput(now, func(in *AwaitReviewStepInput) {
+		in.StartedAt = now.Add(-10 * time.Minute) // not first cycle
+		in.BeadCommitSHA = oldSHA
+		in.HeadSHA = newSHA // drift → re-post + re-request
+	}))
+	if err != nil {
+		t.Fatalf("AwaitReviewStep: %v", err)
+	}
+	if res.Status != AwaitStatusTriggerPosted {
+		t.Fatalf("Status = %v, want AwaitStatusTriggerPosted", res.Status)
+	}
+	if len(p.requestedReviewers) != 1 {
+		t.Fatalf("RequestReview called %d times, want 1: %v", len(p.requestedReviewers), p.requestedReviewers)
+	}
+	got := p.requestedReviewers[0]
+	if len(got) != 1 || got[0] != "kevinpjones" {
+		t.Errorf("re-requested %v, want [kevinpjones] (configured reviewer augment excluded)", got)
+	}
+	if !strings.Contains(res.Message, "re-requested review from kevinpjones") {
+		t.Errorf("message missing re-request note: %q", res.Message)
+	}
+}
+
+// Gap B: the re-request is best-effort — a ChangesRequestedReviewers error
+// (e.g. ErrUnsupported on Bitbucket) must NOT fail the step or call
+// RequestReview. The trigger still posts normally.
+func TestAwaitReviewStep_DriftReset_ReRequestErrorIsTolerated(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	p := &awaitFakeProvider{changesRequestedErr: ErrUnsupported}
+	res, err := AwaitReviewStep(p, 45, baseInput(now, func(in *AwaitReviewStepInput) {
+		in.StartedAt = now.Add(-10 * time.Minute)
+		in.BeadCommitSHA = "1111111111111111111111111111111111111111"
+		in.HeadSHA = "2222222222222222222222222222222222222222"
+	}))
+	if err != nil {
+		t.Fatalf("AwaitReviewStep should tolerate re-request error, got %v", err)
+	}
+	if res.Status != AwaitStatusTriggerPosted {
+		t.Fatalf("Status = %v, want AwaitStatusTriggerPosted", res.Status)
+	}
+	if len(p.requestedReviewers) != 0 {
+		t.Errorf("RequestReview should not be called when ChangesRequestedReviewers errors, got %v", p.requestedReviewers)
+	}
+	if strings.Contains(res.Message, "re-requested") {
+		t.Errorf("message should not mention re-request on error: %q", res.Message)
 	}
 }
