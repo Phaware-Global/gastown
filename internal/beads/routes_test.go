@@ -125,6 +125,69 @@ func TestGetPrefixForRig_ConfigWinsOverStaleRoute(t *testing.T) {
 	}
 }
 
+// TestGetPrefixForRig_TrimsStoredTrailingHyphen guards the hyphen-trim path: a
+// rig whose configured prefix is stored WITH the trailing hyphen ("gt-") must
+// still resolve to the bare "gt" used in bead IDs.
+func TestGetPrefixForRig_TrimsStoredTrailingHyphen(t *testing.T) {
+	tmpDir := t.TempDir()
+	rigsPath := filepath.Join(tmpDir, "mayor", "rigs.json")
+	if err := os.MkdirAll(filepath.Dir(rigsPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.RigsConfig{
+		Version: config.CurrentRigsVersion,
+		Rigs: map[string]config.RigEntry{
+			"gastown": {BeadsConfig: &config.BeadsConfig{Prefix: "gt-"}},
+		},
+	}
+	if err := config.SaveRigsConfig(rigsPath, cfg); err != nil {
+		t.Fatalf("SaveRigsConfig: %v", err)
+	}
+
+	if got := GetPrefixForRig(tmpDir, "gastown"); got != "gt" {
+		t.Errorf("GetPrefixForRig with stored \"gt-\" = %q, want %q", got, "gt")
+	}
+}
+
+// TestGetPrefixForRig_RigConfigWhenRigsJSONUnreadable ensures a present-but-
+// unparseable rigs.json does NOT drop resolution to the ambiguous routes scan:
+// it must fall through to the rig's own config.json (mirroring the scheduler's
+// rigBeadsPrefix), so a stale "gts-" route still can't win.
+func TestGetPrefixForRig_RigConfigWhenRigsJSONUnreadable(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Corrupt rigs.json (exists but is not valid JSON).
+	rigsPath := filepath.Join(tmpDir, "mayor", "rigs.json")
+	if err := os.MkdirAll(filepath.Dir(rigsPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rigsPath, []byte("{ not valid json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The rig's own config.json declares the authoritative prefix "gt".
+	rigConfigPath := filepath.Join(tmpDir, "gastown", "config.json")
+	if err := os.MkdirAll(filepath.Dir(rigConfigPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rigConfigPath, []byte(`{"type":"rig","name":"gastown","beads":{"prefix":"gt"}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stale "gts-" route that would win if we wrongly fell back to routes.jsonl.
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(`{"prefix": "gts-", "path": "gastown/mayor/rig"}`+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := GetPrefixForRig(tmpDir, "gastown"); got != "gt" {
+		t.Errorf("GetPrefixForRig with corrupt rigs.json = %q, want %q (must use rig config.json, not stale route)", got, "gt")
+	}
+}
+
 func TestExtractPrefix(t *testing.T) {
 	tests := []struct {
 		beadID   string

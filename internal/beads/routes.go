@@ -181,26 +181,39 @@ func GetTownBeadsPath(townRoot string) string {
 //
 // routes.jsonl is a *routing* table (prefix -> DB path) and may legitimately map
 // several prefixes onto one rig DB — e.g. a stale "gts-" route sitting alongside
-// the real "gt-" route, both pointing at the gastown rig. Reverse-scanning it to
-// recover a rig's prefix is ambiguous: it returns whichever matching route is
-// listed first. With "gts-" ahead of "gt-" that yielded prefix "gts" for every
+// the real "gt-" route, both pointing at the gastown rig. Scanning it to recover
+// a rig's prefix is ambiguous: it iterates in file order, so the first matching
+// route wins. With "gts-" ahead of "gt-" that yielded prefix "gts" for every
 // gastown bead mint while the scheduler expected "gt", so dispatch was refused
 // on every pass with reason=cross_rig_prefix (rig_prefix=gt bead_prefix=gts) and
-// the convoy-feed kept regenerating orphaned gts-wfs-* wisps. routes.jsonl is
-// now only a fallback for rigs that have no config entry. (gt-o1dox)
+// the convoy-feed kept regenerating orphaned gts-wfs-* wisps.
+//
+// The lookup order mirrors the scheduler's cmd.rigBeadsPrefix exactly —
+// rigs.json, then the rig's own config.json — so minting and validation can't
+// disagree (e.g. a present-but-unparseable rigs.json must not silently drop us
+// to the ambiguous routes scan). routes.jsonl is consulted last, only for rigs
+// with no config entry at all (e.g. the town "beads"/"bd" DB). (gt-o1dox)
 func GetPrefixForRig(townRoot, rigName string) string {
 	// Authoritative: the rig's configured prefix from rigs.json.
 	if prefix, ok := config.LookupRigPrefix(townRoot, rigName); ok {
 		return prefix
 	}
 
-	// Fallback: rig has no config entry — reverse-scan routes.jsonl so
-	// routes-only rigs still resolve. Routes paths are like
+	// Then the rig's own config.json (same second step as the scheduler), so a
+	// rig present in a corrupt/unreadable rigs.json still resolves from its
+	// authoritative config rather than the ambiguous routes scan.
+	rigConfigPath := filepath.Join(townRoot, rigName, "config.json")
+	if rigCfg, err := config.LoadRigConfig(rigConfigPath); err == nil && rigCfg.Beads != nil && rigCfg.Beads.Prefix != "" {
+		return strings.TrimSuffix(rigCfg.Beads.Prefix, "-")
+	}
+
+	// Fallback: rig has no config entry — scan routes.jsonl (first matching route
+	// wins) so routes-only rigs still resolve. Paths are like
 	// "gastown/mayor/rig" or "beads/mayor/rig".
 	beadsDir := filepath.Join(townRoot, ".beads")
 	routes, err := LoadRoutes(beadsDir)
 	if err != nil || routes == nil {
-		return config.GetRigPrefix(townRoot, rigName)
+		return "gt"
 	}
 	for _, r := range routes {
 		parts := strings.SplitN(r.Path, "/", 2)
@@ -210,7 +223,7 @@ func GetPrefixForRig(townRoot, rigName string) string {
 		}
 	}
 
-	return config.GetRigPrefix(townRoot, rigName)
+	return "gt"
 }
 
 // CheckPrefixAvailable verifies that a prefix is not already used by a different rig.
