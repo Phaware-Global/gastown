@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/beads"
@@ -132,8 +133,19 @@ func (c *RoutePathConflictCheck) Run(ctx *CheckContext) *CheckResult {
 		}
 	}
 
+	// Sort paths (and each path's prefixes) so the diagnostic output is stable
+	// and reproducible — Go map iteration order is randomized, which would
+	// otherwise produce flaky tests and inconsistent CLI output.
+	paths := make([]string, 0, len(conflicts))
+	for path := range conflicts {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
 	var details []string
-	for path, prefixes := range conflicts {
+	for _, path := range paths {
+		prefixes := append([]string(nil), conflicts[path]...)
+		sort.Strings(prefixes)
 		details = append(details, fmt.Sprintf("Path %q has conflicting prefixes: %s", path, strings.Join(prefixes, ", ")))
 	}
 
