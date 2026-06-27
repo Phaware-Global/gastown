@@ -1803,6 +1803,17 @@ type NudgeOpts struct {
 	// stranding the nudge. Re-checking inside the delivery lock closes that gap;
 	// on ErrAgentBusy the caller should enqueue for cooperative drain instead.
 	RequireIdle bool
+
+	// ClearOnStrand clears the input box (Ctrl-U) when delivery strands — the
+	// text was typed but the agent went busy before Enter submitted it
+	// (ErrNudgeStranded). The clear runs while this call still holds the nudge
+	// serialization lock, so it cannot race a concurrent nudge's freshly typed
+	// text. Set this when the caller will re-deliver the message via the queue
+	// (the wait-idle path), so Claude Code's deferred auto-submit of the
+	// stranded text can't duplicate the queued copy. Leave false for immediate
+	// delivery, where a strand is a genuine failure and the typed text should
+	// remain for the operator to see.
+	ClearOnStrand bool
 }
 
 // canonicalPaneTarget converts a pane identifier like "%23" into a tmux target
@@ -1822,22 +1833,6 @@ func (t *Tmux) canonicalPaneTarget(session, pane string) string {
 	}
 
 	return pane
-}
-
-// ClearInput discards any pending (unsubmitted) text in the agent's input box
-// by sending Ctrl-U to the resolved agent pane. Best-effort and idempotent: it
-// is used to drop a nudge that was typed but not submitted (the agent went busy
-// mid-paste, i.e. ErrNudgeStranded) so that a queued re-delivery does not
-// duplicate it. Some agent TUIs (e.g. Claude Code) auto-submit text left in the
-// box at the next turn boundary; clearing first makes the queue the single
-// source of delivery. Resolves the agent pane the same way NudgeSessionWithOpts
-// does so multi-pane sessions clear the agent's pane, not the focused one.
-func (t *Tmux) ClearInput(session string) {
-	target := session
-	if agentPane, err := t.FindAgentPane(session); err == nil && agentPane != "" {
-		target = t.canonicalPaneTarget(session, agentPane)
-	}
-	_, _ = t.run("send-keys", "-t", target, "C-u")
 }
 
 // NudgeSessionWithOpts is like NudgeSession but accepts delivery options.
@@ -1963,6 +1958,14 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// nudge was submitted, not just typed), retrying with exponential backoff
 	// under load. (GH#gt-0b5)
 	if err := t.sendEnterVerified(target, t.submitVerifyPrefix(session)); err != nil {
+		// On a strand (text typed but not submitted), optionally clear the
+		// orphaned text while we STILL hold the nudge lock, so a concurrent
+		// nudge can't have its own freshly typed text wiped. The caller
+		// (wait-idle) re-delivers via the queue, and clearing here prevents
+		// Claude Code's deferred auto-submit from duplicating that copy.
+		if opts.ClearOnStrand && errors.Is(err, ErrNudgeStranded) {
+			_, _ = t.run("send-keys", "-t", target, "C-u")
+		}
 		return fmt.Errorf("nudge to session %q: %w", session, err)
 	}
 
