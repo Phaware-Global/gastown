@@ -47,6 +47,15 @@ var (
 	ErrInvalidSessionName = errors.New("invalid session name")
 	ErrIdleTimeout        = errors.New("agent not idle before timeout")
 	ErrAgentBusy          = errors.New("agent busy at delivery time")
+	// ErrNudgeStranded is returned when the nudge text was typed into the
+	// agent's input box but the trailing Enter never submitted it — the agent
+	// slipped from idle into a busy turn during the paste, so the box still
+	// holds the text after all retries. This is recoverable, not a hard
+	// failure: the message WAS delivered to the box, and callers with a queue
+	// (wait-idle mode) should clear the strand and re-deliver cooperatively
+	// rather than reporting failure. Distinguished from ErrAgentBusy, which is
+	// detected *before* any text is typed. (GH#gt-nudge-strand)
+	ErrNudgeStranded = errors.New("nudge text stranded in input box: agent went busy mid-paste")
 	// ErrEmptyMessage is returned when a nudge message is empty after
 	// sanitization (e.g. whitespace/control-chars only). Delivering it would
 	// just press Enter into the agent's input box — a silent no-op that looks
@@ -1602,7 +1611,7 @@ func (t *Tmux) sendEnterVerified(target, promptPrefix string) error {
 		if submitted {
 			return nil
 		}
-		return fmt.Errorf("nudge Enter not processed after %d retries: input box still holds text", maxRetries)
+		return fmt.Errorf("nudge Enter not processed after %d retries (input box still holds text): %w", maxRetries, ErrNudgeStranded)
 	}
 	if strings.Join(lines, "\n") != preSnapshot {
 		return nil // Inconclusive but content changed — consider success.
@@ -1813,6 +1822,22 @@ func (t *Tmux) canonicalPaneTarget(session, pane string) string {
 	}
 
 	return pane
+}
+
+// ClearInput discards any pending (unsubmitted) text in the agent's input box
+// by sending Ctrl-U to the resolved agent pane. Best-effort and idempotent: it
+// is used to drop a nudge that was typed but not submitted (the agent went busy
+// mid-paste, i.e. ErrNudgeStranded) so that a queued re-delivery does not
+// duplicate it. Some agent TUIs (e.g. Claude Code) auto-submit text left in the
+// box at the next turn boundary; clearing first makes the queue the single
+// source of delivery. Resolves the agent pane the same way NudgeSessionWithOpts
+// does so multi-pane sessions clear the agent's pane, not the focused one.
+func (t *Tmux) ClearInput(session string) {
+	target := session
+	if agentPane, err := t.FindAgentPane(session); err == nil && agentPane != "" {
+		target = t.canonicalPaneTarget(session, agentPane)
+	}
+	_, _ = t.run("send-keys", "-t", target, "C-u")
 }
 
 // NudgeSessionWithOpts is like NudgeSession but accepts delivery options.

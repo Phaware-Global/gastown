@@ -252,10 +252,23 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			if derr == nil {
 				return nil
 			}
-			if !errors.Is(derr, tmux.ErrAgentBusy) {
+			// Two recoverable outcomes both mean "the agent went busy around the
+			// paste" and should cooperatively re-deliver via the queue rather than
+			// report a hard failure:
+			//   - ErrAgentBusy: detected by RequireIdle *before* any text was typed.
+			//   - ErrNudgeStranded: the text WAS typed but the agent slipped busy
+			//     before Enter submitted it, so the box still holds it. The message
+			//     reached the agent — reporting failure here is the bug operators hit
+			//     ("nudge Enter not processed" while the nudge had in fact landed).
+			// For the stranded case, clear the orphaned text first: Claude Code
+			// auto-submits text left in the box at the next turn boundary, which
+			// would duplicate the queued copy. (GH#gt-nudge-strand)
+			if errors.Is(derr, tmux.ErrNudgeStranded) {
+				t.ClearInput(sessionName)
+			} else if !errors.Is(derr, tmux.ErrAgentBusy) {
 				return derr
 			}
-			// else: agent became busy — proceed to the queue path below.
+			// else: agent became busy (or text stranded) — proceed to the queue path below.
 		}
 		// Terminal errors (session gone, no server) — propagate, don't queue.
 		// Queueing a nudge for a dead session means it will never be delivered.
