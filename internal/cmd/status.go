@@ -1225,7 +1225,7 @@ func outputStatusText(w io.Writer, status TownStatus) error {
 		}
 
 		// No agents
-		if len(witnesses) == 0 && len(refineries) == 0 && len(crews) == 0 && len(polecats) == 0 {
+		if len(witnesses) == 0 && len(refineries) == 0 && len(reviewers) == 0 && len(crews) == 0 && len(polecats) == 0 {
 			fmt.Fprintf(w, "   %s\n", style.Dim.Render("(no agents)"))
 		}
 		fmt.Fprintln(w)
@@ -1591,6 +1591,12 @@ func discoverRigHooks(r *rig.Rig, crews []string) []AgentHookInfo {
 	if r.HasRefinery {
 		hooks = append(hooks, resolveHookFromMap(allHandoffs, constants.RoleRefinery, r.Name+"/refinery", constants.RoleRefinery))
 	}
+
+	// Check reviewer. The Reviewer is spawn-on-demand (no rig-level "has
+	// reviewer" flag), so resolve its hook unconditionally — it only renders in
+	// the per-rig view while its session is live, and resolves to none when no
+	// review work is in flight, matching the other rig agents.
+	hooks = append(hooks, resolveHookFromMap(allHandoffs, constants.RoleReviewer, r.Name+"/reviewer", constants.RoleReviewer))
 
 	return hooks
 }

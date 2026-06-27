@@ -168,6 +168,8 @@ func formatAgentName(agent *AgentSession) string {
 		return fmt.Sprintf("%s/witness", agent.Rig)
 	case AgentRefinery:
 		return fmt.Sprintf("%s/refinery", agent.Rig)
+	case AgentReviewer:
+		return fmt.Sprintf("%s/reviewer", agent.Rig)
 	case AgentCrew:
 		return fmt.Sprintf("%s/crew/%s", agent.Rig, agent.AgentName)
 	case AgentPolecat:

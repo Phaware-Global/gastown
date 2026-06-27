@@ -209,8 +209,13 @@ func (m *Manager) Start(agentOverride string, extraEnv map[string]string) error 
 
 	// Surface the on-demand spawn in the feed so operators can see a reviewer
 	// spin up for a rig (the Reviewer is otherwise invisible — no persistent
-	// agent bead, and it only exists while review work is in flight).
-	_ = events.LogFeed(events.TypeSpawn, m.rig.Name+"/reviewer", events.SpawnPayload(m.rig.Name, "reviewer"))
+	// agent bead, and it only exists while review work is in flight). Use the
+	// shared role constant rather than a literal so the feed identity can't
+	// drift, and surface (don't swallow) a feed-write failure — the reviewer is
+	// ephemeral, so a silently-lost spawn event makes troubleshooting harder.
+	if err := events.LogFeed(events.TypeSpawn, m.rig.Name+"/"+constants.RoleReviewer, events.SpawnPayload(m.rig.Name, constants.RoleReviewer)); err != nil {
+		fmt.Fprintf(m.output, "⚠ reviewer spawn feed event failed for %s: %v\n", m.rig.Name, err)
+	}
 	return nil
 }
 
