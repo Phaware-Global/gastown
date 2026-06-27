@@ -75,6 +75,77 @@ func (c *PrefixConflictCheck) Run(ctx *CheckContext) *CheckResult {
 	}
 }
 
+// RoutePathConflictCheck detects when routes.jsonl maps MORE THAN ONE distinct
+// beads prefix onto the SAME rig path — e.g. a stale "gts-" route left beside
+// the real "gt-" route, both pointing at "gastown/mayor/rig".
+//
+// This is the inverse of PrefixConflictCheck (one prefix -> many rigs) and is
+// the failure that prefix-mismatch / database-prefix silently miss: those build
+// a path-keyed map, so duplicate routes collapse to last-wins and the conflict
+// disappears. A reverse path->prefix lookup over such a table is
+// non-deterministic — bead minting picked the first-listed "gts" while the
+// scheduler validated against the configured "gt", refusing every dispatch with
+// cross_rig_prefix and spawning a perpetual escalation storm (hq-o1dox). This
+// check surfaces the ambiguity loudly so an operator removes the stale route.
+type RoutePathConflictCheck struct {
+	BaseCheck
+}
+
+// NewRoutePathConflictCheck creates a new route-path conflict check.
+func NewRoutePathConflictCheck() *RoutePathConflictCheck {
+	return &RoutePathConflictCheck{
+		BaseCheck: BaseCheck{
+			CheckName:        "route-path-conflict",
+			CheckDescription: "Check for multiple beads prefixes routing to the same rig path",
+			CheckCategory:    CategoryConfig,
+		},
+	}
+}
+
+// Run checks for paths that have more than one distinct prefix in routes.jsonl.
+func (c *RoutePathConflictCheck) Run(ctx *CheckContext) *CheckResult {
+	beadsDir := filepath.Join(ctx.TownRoot, ".beads")
+
+	routesPath := filepath.Join(beadsDir, beads.RoutesFileName)
+	if _, err := os.Stat(routesPath); os.IsNotExist(err) {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusOK,
+			Message: "No routes.jsonl file (prefix routing not configured)",
+		}
+	}
+
+	conflicts, err := beads.FindConflictingPaths(beadsDir)
+	if err != nil {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("Could not check routes.jsonl: %v", err),
+		}
+	}
+
+	if len(conflicts) == 0 {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusOK,
+			Message: "No conflicting routes found",
+		}
+	}
+
+	var details []string
+	for path, prefixes := range conflicts {
+		details = append(details, fmt.Sprintf("Path %q has conflicting prefixes: %s", path, strings.Join(prefixes, ", ")))
+	}
+
+	return &CheckResult{
+		Name:    c.Name(),
+		Status:  StatusError,
+		Message: fmt.Sprintf("%d rig path(s) with conflicting routes in routes.jsonl", len(conflicts)),
+		Details: details,
+		FixHint: "Remove the stale route(s) so each rig path keeps only the prefix that matches its rigs.json / config.json entry (e.g. drop the leftover 'gts-' route, keep 'gt-')",
+	}
+}
+
 // PrefixMismatchCheck detects when rigs.json has a different prefix than what
 // routes.jsonl actually uses for a rig. This can happen when:
 // - deriveBeadsPrefix() generates a different prefix than what's in the beads DB

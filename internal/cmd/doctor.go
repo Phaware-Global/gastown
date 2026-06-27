@@ -86,6 +86,7 @@ Routing checks (fixable):
   - routes-config            Check beads routing configuration
   - prefix-mismatch          Detect rigs.json vs routes.jsonl prefix mismatches (fixable)
   - database-prefix          Detect database vs routes.jsonl prefix mismatches (fixable)
+  - route-path-conflict      Detect multiple prefixes routing to the same rig path
 
 Lifecycle checks (fixable):
   - lifecycle-defaults          Ensure daemon.json has all lifecycle patrol entries (fixable)
@@ -194,6 +195,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewFormulaCheck())
 	d.Register(doctor.NewOverlayHealthCheck())
 	d.Register(doctor.NewPrefixConflictCheck())
+	d.Register(doctor.NewRoutePathConflictCheck())
 	d.Register(doctor.NewRigNameMismatchCheck())
 	d.Register(doctor.NewRigConfigSyncCheck())      // Check all registered rigs have config.json
 	d.Register(doctor.NewStaleDoltPortCheck())      // Check for stale Dolt port files

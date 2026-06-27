@@ -38,7 +38,14 @@ func BeadIDPrefix(beadID string) string {
 // AcceptsPrefix reports whether a bead ID's prefix matches the target rig's
 // registered prefix. Empty rigPrefix means "unknown / accept" (the dispatcher
 // degrades open rather than refusing dispatch when rig config is unavailable).
+//
+// rigPrefix is normalized by trimming a trailing hyphen so a prefix configured
+// as "gt-" (e.g. stored verbatim in rigs.json / a rig's config.json) compares
+// equal to the hyphen-stripped BeadIDPrefix ("gt"). Without this, a legitimate
+// "gt-*" bead would be refused with cross_rig_prefix whenever the rig's prefix
+// happened to be stored with its trailing hyphen. (gt-o1dox)
 func AcceptsPrefix(rigPrefix, beadID string) bool {
+	rigPrefix = strings.TrimSuffix(rigPrefix, "-")
 	if rigPrefix == "" {
 		return true
 	}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/config"
@@ -239,6 +240,50 @@ func FindConflictingPrefixes(beadsDir string) (map[string][]string, error) {
 	for prefix, paths := range prefixPaths {
 		if len(paths) > 1 {
 			conflicts[prefix] = paths
+		}
+	}
+
+	return conflicts, nil
+}
+
+// FindConflictingPaths returns rig paths that have more than one DISTINCT beads
+// prefix routed to them in routes.jsonl, keyed by path -> sorted distinct
+// prefixes (trailing hyphen normalized).
+//
+// This is the inverse of FindConflictingPrefixes: instead of one prefix fanning
+// out to several rig paths, it catches several prefixes collapsing onto a single
+// rig DB — e.g. a stale "gts-" route left beside the real "gt-" route, both
+// pointing at "gastown/mayor/rig". That ambiguity is invisible to the
+// path-keyed prefix-mismatch / database-prefix checks (their maps keep only the
+// last route seen per path), yet it is exactly what makes a reverse path->prefix
+// lookup non-deterministic — bead minting picked the first-listed "gts" while
+// the scheduler validated against the configured "gt", refusing every dispatch
+// with cross_rig_prefix. (gt-o1dox)
+func FindConflictingPaths(beadsDir string) (map[string][]string, error) {
+	routes, err := LoadRoutes(beadsDir)
+	if err != nil {
+		return nil, err
+	}
+
+	// Group distinct (hyphen-normalized) prefixes by path.
+	pathPrefixes := make(map[string]map[string]struct{})
+	for _, r := range routes {
+		prefix := strings.TrimSuffix(r.Prefix, "-")
+		if pathPrefixes[r.Path] == nil {
+			pathPrefixes[r.Path] = make(map[string]struct{})
+		}
+		pathPrefixes[r.Path][prefix] = struct{}{}
+	}
+
+	conflicts := make(map[string][]string)
+	for path, set := range pathPrefixes {
+		if len(set) > 1 {
+			prefixes := make([]string, 0, len(set))
+			for p := range set {
+				prefixes = append(prefixes, p)
+			}
+			sort.Strings(prefixes)
+			conflicts[path] = prefixes
 		}
 	}
 

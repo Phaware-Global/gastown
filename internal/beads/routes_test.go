@@ -728,3 +728,68 @@ func TestValidateRigPrefix(t *testing.T) {
 		})
 	}
 }
+
+func TestFindConflictingPaths(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// The hq-o1dox shape: two prefixes ("gts-" and "gt-") route to the same
+	// gastown rig path. "hi-" is a clean single-route rig. "hq-" and "hq-cv-"
+	// share a path but normalize to distinct prefixes "hq" and "hq-cv", which is
+	// a legitimate town-level arrangement and must STILL be reported as a
+	// conflict for that path (the check reports; the operator judges).
+	routesContent := `{"prefix": "gts-", "path": "gastown/mayor/rig"}
+{"prefix": "gt-", "path": "gastown/mayor/rig"}
+{"prefix": "hi-", "path": "heartworks_ios"}
+`
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	conflicts, err := FindConflictingPaths(beadsDir)
+	if err != nil {
+		t.Fatalf("FindConflictingPaths: %v", err)
+	}
+
+	if len(conflicts) != 1 {
+		t.Fatalf("FindConflictingPaths returned %d conflicts, want 1: %v", len(conflicts), conflicts)
+	}
+	got, ok := conflicts["gastown/mayor/rig"]
+	if !ok {
+		t.Fatalf("expected conflict for gastown/mayor/rig, got %v", conflicts)
+	}
+	want := []string{"gt", "gts"} // sorted, hyphen-normalized
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("conflict prefixes = %v, want %v", got, want)
+	}
+	if _, ok := conflicts["heartworks_ios"]; ok {
+		t.Errorf("single-route path heartworks_ios should not be a conflict")
+	}
+}
+
+// TestFindConflictingPaths_DuplicateSamePrefix ensures a path that has the SAME
+// prefix listed twice (or once as "gt-" and once as "gt") is NOT a conflict —
+// only DISTINCT normalized prefixes count.
+func TestFindConflictingPaths_DuplicateSamePrefix(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	routesContent := `{"prefix": "gt-", "path": "gastown/mayor/rig"}
+{"prefix": "gt", "path": "gastown/mayor/rig"}
+`
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	conflicts, err := FindConflictingPaths(beadsDir)
+	if err != nil {
+		t.Fatalf("FindConflictingPaths: %v", err)
+	}
+	if len(conflicts) != 0 {
+		t.Errorf("same normalized prefix should not conflict, got %v", conflicts)
+	}
+}

@@ -307,6 +307,12 @@ func TestAcceptsPrefix(t *testing.T) {
 		{"empty rig prefix accepts all", "", "hq-uejt", true},
 		{"bead with no prefix vs gt rig", "gt", "barewordbead", false},
 		{"matching wisp", "wisp", "wisp-di92", true},
+		// A prefix configured WITH its trailing hyphen (e.g. stored "gt-" in
+		// rigs.json/config.json) must still accept "gt-*" beads — BeadIDPrefix
+		// strips the hyphen, so AcceptsPrefix normalizes rigPrefix too. (gt-o1dox)
+		{"rig prefix stored with hyphen", "gt-", "gt-abc", true},
+		{"rig prefix with hyphen, mismatched bead", "gt-", "hq-uejt", false},
+		{"bare hyphen rig prefix accepts all", "-", "hq-uejt", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
