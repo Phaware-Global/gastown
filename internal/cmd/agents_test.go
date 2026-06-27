@@ -89,6 +89,7 @@ func TestCategorizeSession_AllTypes(t *testing.T) {
 		// commonly registered in the default PrefixRegistry.
 		{"witness", "gt-witness", AgentWitness},
 		{"refinery", "gt-refinery", AgentRefinery},
+		{"reviewer", "gt-reviewer", AgentReviewer},
 		{"crew", "gt-crew-max", AgentCrew},
 		{"polecat", "gt-furiosa", AgentPolecat},
 	}
@@ -103,6 +104,26 @@ func TestCategorizeSession_AllTypes(t *testing.T) {
 				t.Errorf("categorizeSession(%q).Type = %d, want %d", tt.input, got.Type, tt.wantType)
 			}
 		})
+	}
+}
+
+// TestCategorizeSession_Reviewer guards the fix for the polecat-misparse: a
+// <prefix>-reviewer session must classify as AgentReviewer (a rig-level agent,
+// shown by default), not a hidden polecat named "reviewer".
+func TestCategorizeSession_Reviewer(t *testing.T) {
+	setupCmdTestRegistry(t)
+	got := categorizeSession("gt-reviewer")
+	if got == nil {
+		t.Fatal("categorizeSession(\"gt-reviewer\") = nil, want AgentReviewer")
+	}
+	if got.Type != AgentReviewer {
+		t.Errorf("Type = %d, want AgentReviewer (%d) — reviewer is misparsed as a polecat", got.Type, AgentReviewer)
+	}
+	if got.AgentName != "" {
+		t.Errorf("AgentName = %q, want empty (reviewer is one-per-rig, not named)", got.AgentName)
+	}
+	if got.Rig == "" {
+		t.Error("Rig is empty, want the reviewer's rig populated")
 	}
 }
 
