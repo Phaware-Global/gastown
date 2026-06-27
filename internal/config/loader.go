@@ -2847,28 +2847,40 @@ func GetDefaultFormula(rigPath string) string {
 	return settings.Workflow.DefaultFormula
 }
 
+// LookupRigPrefix returns the beads prefix configured for a rig in rigs.json
+// and whether that rig has an explicit prefix entry. The prefix is returned
+// without its trailing hyphen (e.g. "gt" not "gt-").
+//
+// Unlike GetRigPrefix, it does NOT substitute the "gt" default for a missing
+// entry, so callers can distinguish "rig is configured with prefix gt" from
+// "rig has no config entry" and fall back to another source (e.g. routes.jsonl)
+// only in the latter case. rigs.json is the authoritative source the scheduler
+// validates dispatched beads against, so this is the canonical answer for a
+// rig's bead prefix. (gt-o1dox)
+func LookupRigPrefix(townRoot, rigName string) (string, bool) {
+	rigsConfigPath := filepath.Join(townRoot, "mayor", "rigs.json")
+	rigsConfig, err := LoadRigsConfig(rigsConfigPath)
+	if err != nil {
+		return "", false
+	}
+
+	entry, ok := rigsConfig.Rigs[rigName]
+	if !ok || entry.BeadsConfig == nil || entry.BeadsConfig.Prefix == "" {
+		return "", false
+	}
+
+	// Strip trailing hyphen if present (prefix stored as "gt-" but used as "gt")
+	return strings.TrimSuffix(entry.BeadsConfig.Prefix, "-"), true
+}
+
 // GetRigPrefix returns the beads prefix for a rig from rigs.json.
 // Falls back to "gt" if the rig isn't found or has no prefix configured.
 // townRoot is the path to the town directory (e.g., ~/gt).
 func GetRigPrefix(townRoot, rigName string) string {
-	rigsConfigPath := filepath.Join(townRoot, "mayor", "rigs.json")
-	rigsConfig, err := LoadRigsConfig(rigsConfigPath)
-	if err != nil {
-		return "gt" // fallback
+	if prefix, ok := LookupRigPrefix(townRoot, rigName); ok {
+		return prefix
 	}
-
-	entry, ok := rigsConfig.Rigs[rigName]
-	if !ok {
-		return "gt" // fallback
-	}
-
-	if entry.BeadsConfig == nil || entry.BeadsConfig.Prefix == "" {
-		return "gt" // fallback
-	}
-
-	// Strip trailing hyphen if present (prefix stored as "gt-" but used as "gt")
-	prefix := entry.BeadsConfig.Prefix
-	return strings.TrimSuffix(prefix, "-")
+	return "gt" // fallback
 }
 
 // AllRigPrefixes returns a sorted list of all rig beads prefixes from rigs.json.

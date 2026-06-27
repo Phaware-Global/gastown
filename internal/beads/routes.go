@@ -171,17 +171,37 @@ func GetTownBeadsPath(townRoot string) string {
 
 // GetPrefixForRig returns the beads prefix for a given rig name.
 // The prefix is returned without the trailing hyphen (e.g., "bd" not "bd-").
-// If the rig is not found in routes, returns "gt" as the default.
+// If the rig is not found in any source, returns "gt" as the default.
 // The townRoot should be the Gas Town root directory (e.g., ~/gt).
+//
+// A rig's canonical beads prefix is defined by its configuration
+// (mayor/rigs.json). That is the SAME authoritative source the scheduler
+// validates dispatched beads against (cmd.rigBeadsPrefix), so every bead ID
+// minted for a rig MUST agree with it. We therefore consult config FIRST.
+//
+// routes.jsonl is a *routing* table (prefix -> DB path) and may legitimately map
+// several prefixes onto one rig DB — e.g. a stale "gts-" route sitting alongside
+// the real "gt-" route, both pointing at the gastown rig. Reverse-scanning it to
+// recover a rig's prefix is ambiguous: it returns whichever matching route is
+// listed first. With "gts-" ahead of "gt-" that yielded prefix "gts" for every
+// gastown bead mint while the scheduler expected "gt", so dispatch was refused
+// on every pass with reason=cross_rig_prefix (rig_prefix=gt bead_prefix=gts) and
+// the convoy-feed kept regenerating orphaned gts-wfs-* wisps. routes.jsonl is
+// now only a fallback for rigs that have no config entry. (gt-o1dox)
 func GetPrefixForRig(townRoot, rigName string) string {
+	// Authoritative: the rig's configured prefix from rigs.json.
+	if prefix, ok := config.LookupRigPrefix(townRoot, rigName); ok {
+		return prefix
+	}
+
+	// Fallback: rig has no config entry — reverse-scan routes.jsonl so
+	// routes-only rigs still resolve. Routes paths are like
+	// "gastown/mayor/rig" or "beads/mayor/rig".
 	beadsDir := filepath.Join(townRoot, ".beads")
 	routes, err := LoadRoutes(beadsDir)
 	if err != nil || routes == nil {
 		return config.GetRigPrefix(townRoot, rigName)
 	}
-
-	// Look for a route where the path starts with the rig name
-	// Routes paths are like "gastown/mayor/rig" or "beads/mayor/rig"
 	for _, r := range routes {
 		parts := strings.SplitN(r.Path, "/", 2)
 		if len(parts) > 0 && parts[0] == rigName {

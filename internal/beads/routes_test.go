@@ -82,6 +82,49 @@ func TestGetPrefixForRig_RigsConfigFallback(t *testing.T) {
 	}
 }
 
+// TestGetPrefixForRig_ConfigWinsOverStaleRoute is the gt-o1dox regression: when
+// routes.jsonl maps two prefixes onto the same rig DB (a stale "gts-" route
+// listed BEFORE the real "gt-" route, both -> gastown), the rig's canonical
+// prefix must come from the authoritative rigs.json ("gt"), NOT the first
+// matching route ("gts"). The old reverse-scan returned "gts", so every gastown
+// bead mint disagreed with the scheduler's rigs.json-based validation and
+// dispatch was refused with cross_rig_prefix on every pass.
+func TestGetPrefixForRig_ConfigWinsOverStaleRoute(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Stale "gts-" route is intentionally listed first, mirroring the live
+	// ~/gt/.beads/routes.jsonl that triggered the escalation storm.
+	routesContent := `{"prefix": "gts-", "path": "gastown/mayor/rig"}
+{"prefix": "gt-", "path": "gastown/mayor/rig"}
+`
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Authoritative config: gastown's prefix is "gt".
+	rigsPath := filepath.Join(tmpDir, "mayor", "rigs.json")
+	if err := os.MkdirAll(filepath.Dir(rigsPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.RigsConfig{
+		Version: config.CurrentRigsVersion,
+		Rigs: map[string]config.RigEntry{
+			"gastown": {BeadsConfig: &config.BeadsConfig{Prefix: "gt"}},
+		},
+	}
+	if err := config.SaveRigsConfig(rigsPath, cfg); err != nil {
+		t.Fatalf("SaveRigsConfig: %v", err)
+	}
+
+	if got := GetPrefixForRig(tmpDir, "gastown"); got != "gt" {
+		t.Errorf("GetPrefixForRig with stale gts- route = %q, want %q (config must win over routes.jsonl)", got, "gt")
+	}
+}
+
 func TestExtractPrefix(t *testing.T) {
 	tests := []struct {
 		beadID   string
