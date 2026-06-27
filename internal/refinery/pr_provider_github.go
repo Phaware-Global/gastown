@@ -35,6 +35,10 @@ func (p *githubPRProvider) RequestReview(prNumber int, reviewers []string) error
 	return p.git.GhPrRequestReview(prNumber, reviewers)
 }
 
+func (p *githubPRProvider) ChangesRequestedReviewers(prNumber int) ([]string, error) {
+	return p.git.GhPrChangesRequestedReviewers(prNumber)
+}
+
 func (p *githubPRProvider) UnresolvedThreads(prNumber int) ([]ReviewThread, error) {
 	threads, err := p.git.GhPrUnresolvedThreads(prNumber)
 	if err != nil {

@@ -56,6 +56,15 @@ type PRProvider interface {
 	// Repeated requests for the same reviewer are idempotent.
 	RequestReview(prNumber int, reviewers []string) error
 
+	// ChangesRequestedReviewers returns the logins of reviewers whose most
+	// recent terminal review is CHANGES_REQUESTED — the reviewers currently
+	// blocking the PR. A reviewer who later APPROVED (or whose changes-request
+	// was DISMISSED) is excluded. Used by the await-review drift-reset path to
+	// re-request blocking reviewers once per new HEAD, since GitHub does not
+	// auto re-request a reviewer after a force-push. Providers that can't
+	// enumerate review states return ErrUnsupported.
+	ChangesRequestedReviewers(prNumber int) ([]string, error)
+
 	// UnresolvedThreads returns all review threads on the PR that are not
 	// resolved and not outdated.
 	UnresolvedThreads(prNumber int) ([]ReviewThread, error)

@@ -454,9 +454,9 @@ func TestEngineer_LoadConfig_MergeStrategyDefault(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	config := map[string]interface{}{
-		"type":    "rig",
-		"version": 1,
-		"name":    "test-rig",
+		"type":        "rig",
+		"version":     1,
+		"name":        "test-rig",
 		"merge_queue": map[string]interface{}{},
 	}
 
@@ -659,16 +659,17 @@ func (f *threadGateFakeProvider) MergePR(int, string) (string, error) {
 	panic("MergePR called — threads-resolved gate failed to short-circuit")
 }
 
-func (f *threadGateFakeProvider) IsPRApproved(int) (bool, error)                { panic("unused") }
-func (f *threadGateFakeProvider) IsPRApprovedBy(int, string) (bool, error)      { panic("unused") }
-func (f *threadGateFakeProvider) CountApprovals(int) (int, error)               { panic("unused") }
-func (f *threadGateFakeProvider) CreatePR(CreatePROptions) (int, string, error) { panic("unused") }
-func (f *threadGateFakeProvider) RequestReview(int, []string) error             { panic("unused") }
-func (f *threadGateFakeProvider) AllThreads(int) ([]ReviewThread, error)        { panic("unused") }
-func (f *threadGateFakeProvider) ChecksRollup(int) (string, bool, error)        { panic("unused") }
-func (f *threadGateFakeProvider) PostComment(int, string) error                 { panic("unused") }
-func (f *threadGateFakeProvider) HasReviewFrom(int, string) (bool, error)       { panic("unused") }
-func (f *threadGateFakeProvider) ListReviewAuthors(int) ([]string, error)        { panic("unused") }
+func (f *threadGateFakeProvider) IsPRApproved(int) (bool, error)                  { panic("unused") }
+func (f *threadGateFakeProvider) IsPRApprovedBy(int, string) (bool, error)        { panic("unused") }
+func (f *threadGateFakeProvider) CountApprovals(int) (int, error)                 { panic("unused") }
+func (f *threadGateFakeProvider) CreatePR(CreatePROptions) (int, string, error)   { panic("unused") }
+func (f *threadGateFakeProvider) RequestReview(int, []string) error               { panic("unused") }
+func (f *threadGateFakeProvider) ChangesRequestedReviewers(int) ([]string, error) { panic("unused") }
+func (f *threadGateFakeProvider) AllThreads(int) ([]ReviewThread, error)          { panic("unused") }
+func (f *threadGateFakeProvider) ChecksRollup(int) (string, bool, error)          { panic("unused") }
+func (f *threadGateFakeProvider) PostComment(int, string) error                   { panic("unused") }
+func (f *threadGateFakeProvider) HasReviewFrom(int, string) (bool, error)         { panic("unused") }
+func (f *threadGateFakeProvider) ListReviewAuthors(int) ([]string, error)         { panic("unused") }
 func (f *threadGateFakeProvider) HasReviewFromOnSHA(int, string, string) (bool, error) {
 	panic("unused")
 }

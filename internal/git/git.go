@@ -2315,6 +2315,53 @@ func (g *Git) GhPrApprovalCount(prNumber int) (int, error) {
 	return count, nil
 }
 
+// GhPrChangesRequestedReviewers returns the GitHub logins of every reviewer
+// whose most recent terminal review on the PR is CHANGES_REQUESTED — i.e. the
+// reviewers currently blocking the PR who must re-review. A reviewer who later
+// APPROVED, or whose changes-request was DISMISSED, is excluded. Logins
+// preserve their original case and the slice is sorted case-insensitively
+// (same convention as GhPrReviewAuthors).
+//
+// Used by the await-review drift-reset path to re-request blocking reviewers
+// once per new HEAD: GitHub removes a reviewer from the requested list once
+// they submit a review and does NOT re-request them after a force-push, so a
+// human CHANGES_REQUESTED gate stalls silently until someone re-requests them.
+//
+// Resilient to gh returning reviews in any order — ghFetchReviews sorts by
+// submittedAt before we fold into the per-user latest-state map.
+func (g *Git) GhPrChangesRequestedReviewers(prNumber int) ([]string, error) {
+	reviews, err := g.ghFetchReviews(prNumber)
+	if err != nil {
+		return nil, err
+	}
+	// latest[lowered login] = {terminal state, original-case login} of that
+	// user's newest terminal review.
+	type entry struct{ state, login string }
+	latest := make(map[string]entry, len(reviews))
+	for _, r := range reviews {
+		login := r.Author.Login
+		if login == "" {
+			continue
+		}
+		switch r.State {
+		case "APPROVED", "CHANGES_REQUESTED", "DISMISSED":
+			latest[strings.ToLower(login)] = entry{state: r.State, login: login}
+		}
+	}
+	keys := make([]string, 0, len(latest))
+	for k, e := range latest {
+		if e.state == "CHANGES_REQUESTED" {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	out := make([]string, len(keys))
+	for i, k := range keys {
+		out[i] = latest[k].login
+	}
+	return out, nil
+}
+
 // ghRepoOwnerName returns (owner, repoName) by parsing the origin remote URL.
 // Accepts HTTPS and SSH forms; strips a trailing .git.
 func (g *Git) ghRepoOwnerName() (string, string, error) {

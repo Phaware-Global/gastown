@@ -207,6 +207,19 @@ func AwaitReviewStep(provider PRProvider, prNumber int, in AwaitReviewStepInput)
 				return AwaitReviewStepResult{}, fmt.Errorf("posting review trigger comment: %w", err)
 			}
 		}
+
+		// Re-request any reviewers currently blocking the PR with
+		// CHANGES_REQUESTED so a new HEAD re-engages them. GitHub drops a
+		// reviewer from the requested list once they submit a review and does
+		// NOT re-request them after a force-push — so a human CHANGES_REQUESTED
+		// gate stalls silently until someone re-requests them (the bug the mayor
+		// had to fix by hand on iOS PR #45). The configured pr_reviewer is woken
+		// by the trigger/dispatch above and is excluded here. This is gated by
+		// the same once-per-new-HEAD reset that re-posts the trigger and uses
+		// the idempotent RequestReview, so it can't spam. Best-effort: a
+		// re-request error (including ErrUnsupported) never fails the step.
+		rerequested := reRequestBlockingReviewers(provider, prNumber, in.Reviewer)
+
 		t := now()
 		// Differentiate the message when no trigger was posted (pr_trigger_comment
 		// empty / --no-trigger). "Posted trigger %q" is misleading when nothing
@@ -234,6 +247,9 @@ func AwaitReviewStep(provider PRProvider, prNumber int, in AwaitReviewStepInput)
 			msg = fmt.Sprintf(
 				"PR #%d: trigger comment disabled — starting min-wait window of %s for %s to engage",
 				prNumber, in.MinWait.Round(time.Second), in.Reviewer)
+		}
+		if len(rerequested) > 0 {
+			msg += fmt.Sprintf(" — re-requested review from %s", strings.Join(rerequested, ", "))
 		}
 		// Always emit NewBeadCommitSHA when the caller supplied a HeadSHA,
 		// so the bead's commit_sha is initialized on the first patrol cycle
@@ -364,6 +380,38 @@ func AwaitReviewStep(provider PRProvider, prNumber int, in AwaitReviewStepInput)
 		Message: fmt.Sprintf("PR #%d: no review from %s yet (elapsed=%s, timeout=%s)",
 			prNumber, in.Reviewer, elapsed.Round(time.Second), in.Timeout),
 	}, nil
+}
+
+// reRequestBlockingReviewers re-requests every reviewer whose most recent
+// terminal review is CHANGES_REQUESTED (i.e. currently blocking the PR), except
+// skipUser — the configured pr_reviewer, which is woken by the trigger comment
+// / local dispatch instead. It returns the reviewers it re-requested (for the
+// patrol-log message).
+//
+// Best-effort by design: any provider error — including ErrUnsupported from
+// providers that can't enumerate review states (e.g. Bitbucket) — yields nil
+// and never fails the await-review step. Idempotency and once-per-new-HEAD
+// gating come from the caller: this runs only on the trigger-post / drift-reset
+// branch, and RequestReview no-ops on already-requested reviewers.
+func reRequestBlockingReviewers(provider PRProvider, prNumber int, skipUser string) []string {
+	blocking, err := provider.ChangesRequestedReviewers(prNumber)
+	if err != nil || len(blocking) == 0 {
+		return nil
+	}
+	toRequest := make([]string, 0, len(blocking))
+	for _, u := range blocking {
+		if skipUser != "" && strings.EqualFold(u, skipUser) {
+			continue
+		}
+		toRequest = append(toRequest, u)
+	}
+	if len(toRequest) == 0 {
+		return nil
+	}
+	if err := provider.RequestReview(prNumber, toRequest); err != nil {
+		return nil
+	}
+	return toRequest
 }
 
 // EmitAwaitReviewProgress writes a one-line [Engineer] summary of a
