@@ -312,7 +312,10 @@ func TestAcceptsPrefix(t *testing.T) {
 		// strips the hyphen, so AcceptsPrefix normalizes rigPrefix too. (gt-o1dox)
 		{"rig prefix stored with hyphen", "gt-", "gt-abc", true},
 		{"rig prefix with hyphen, mismatched bead", "gt-", "hq-uejt", false},
-		{"bare hyphen rig prefix accepts all", "-", "hq-uejt", true},
+		// A non-empty but all-hyphen prefix ("-") is malformed config, not
+		// "unknown": it must NOT normalize to "" and accept-all (which would
+		// silently disable the cross-rig guard). Refuse instead, so it surfaces.
+		{"bare hyphen rig prefix refuses (malformed, not unknown)", "-", "hq-uejt", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -82,11 +82,11 @@ Rig checks (with --rig flag):
   - polecat-clones-valid     Verify polecat directories are valid clones
   - beads-config-valid       Verify beads configuration (fixable)
 
-Routing checks (fixable):
+Routing checks:
   - routes-config            Check beads routing configuration
   - prefix-mismatch          Detect rigs.json vs routes.jsonl prefix mismatches (fixable)
   - database-prefix          Detect database vs routes.jsonl prefix mismatches (fixable)
-  - route-path-conflict      Detect multiple prefixes routing to the same rig path
+  - route-path-conflict      Detect sibling prefixes routing to the same rig path (non-fixable, reports only)
 
 Lifecycle checks (fixable):
   - lifecycle-defaults          Ensure daemon.json has all lifecycle patrol entries (fixable)

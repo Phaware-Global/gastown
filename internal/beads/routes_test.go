@@ -736,14 +736,18 @@ func TestFindConflictingPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The hq-o1dox shape: two prefixes ("gts-" and "gt-") route to the same
-	// gastown rig path. "hi-" is a clean single-route rig. "hq-" and "hq-cv-"
-	// share a path but normalize to distinct prefixes "hq" and "hq-cv", which is
-	// a legitimate town-level arrangement and must STILL be reported as a
-	// conflict for that path (the check reports; the operator judges).
+	// The hq-o1dox shape: two SIBLING prefixes ("gts-" and "gt-" — neither is a
+	// hyphen-delimited extension of the other) route to the same gastown rig
+	// path; that is the real conflict. "hi-" is a clean single-route rig. "hq-"
+	// and "hq-cv-" also share a path ("."), but "hq-cv-" is a hierarchical
+	// sub-namespace of "hq-" (it starts with "hq-") — a legitimate town-level
+	// arrangement present in every town — so it must NOT be reported, otherwise
+	// the check would fire on every healthy town.
 	routesContent := `{"prefix": "gts-", "path": "gastown/mayor/rig"}
 {"prefix": "gt-", "path": "gastown/mayor/rig"}
 {"prefix": "hi-", "path": "heartworks_ios"}
+{"prefix": "hq-", "path": "."}
+{"prefix": "hq-cv-", "path": "."}
 `
 	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
 		t.Fatal(err)
@@ -767,6 +771,9 @@ func TestFindConflictingPaths(t *testing.T) {
 	}
 	if _, ok := conflicts["heartworks_ios"]; ok {
 		t.Errorf("single-route path heartworks_ios should not be a conflict")
+	}
+	if _, ok := conflicts["."]; ok {
+		t.Errorf("hierarchical hq-/hq-cv- on town path \".\" must not be a conflict, got %v", conflicts["."])
 	}
 }
 

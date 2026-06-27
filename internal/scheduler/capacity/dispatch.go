@@ -45,11 +45,19 @@ func BeadIDPrefix(beadID string) string {
 // "gt-*" bead would be refused with cross_rig_prefix whenever the rig's prefix
 // happened to be stored with its trailing hyphen. (gt-o1dox)
 func AcceptsPrefix(rigPrefix, beadID string) bool {
-	rigPrefix = strings.TrimSuffix(rigPrefix, "-")
+	// A genuinely empty rigPrefix means "unknown" — degrade open (see doc).
+	// Check this BEFORE trimming so a non-empty-but-all-hyphen value (e.g. "-")
+	// can't normalize to "" and silently trip the accept-open path, disabling
+	// the cross-rig guard on malformed config.
 	if rigPrefix == "" {
 		return true
 	}
-	return BeadIDPrefix(beadID) == rigPrefix
+	// Normalize a single trailing hyphen so a prefix stored as "gt-" compares
+	// equal to the hyphen-stripped BeadIDPrefix ("gt"). If the prefix was
+	// non-empty but normalizes to "" (malformed, e.g. "-"), it is NOT "unknown"
+	// — refuse rather than accept-all, so the misconfiguration surfaces loudly.
+	rigPrefix = strings.TrimSuffix(rigPrefix, "-")
+	return rigPrefix != "" && BeadIDPrefix(beadID) == rigPrefix
 }
 
 // DispatchCycle is a capacity-controlled dispatch orchestrator.

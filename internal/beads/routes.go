@@ -265,29 +265,62 @@ func FindConflictingPaths(beadsDir string) (map[string][]string, error) {
 		return nil, err
 	}
 
-	// Group distinct (hyphen-normalized) prefixes by path.
+	// Group the distinct raw prefixes (kept WITH their trailing hyphen, which
+	// marks the namespace boundary) by path.
 	pathPrefixes := make(map[string]map[string]struct{})
 	for _, r := range routes {
-		prefix := strings.TrimSuffix(r.Prefix, "-")
 		if pathPrefixes[r.Path] == nil {
 			pathPrefixes[r.Path] = make(map[string]struct{})
 		}
-		pathPrefixes[r.Path][prefix] = struct{}{}
+		pathPrefixes[r.Path][r.Prefix] = struct{}{}
 	}
 
 	conflicts := make(map[string][]string)
 	for path, set := range pathPrefixes {
-		if len(set) > 1 {
-			prefixes := make([]string, 0, len(set))
-			for p := range set {
-				prefixes = append(prefixes, p)
-			}
-			sort.Strings(prefixes)
-			conflicts[path] = prefixes
+		raw := make([]string, 0, len(set))
+		for p := range set {
+			raw = append(raw, p)
 		}
+		// A path legitimately hosts multiple prefixes when they are hierarchical
+		// sub-namespaces of one another — e.g. "hq-" and "hq-cv-" both in the
+		// town DB, where "hq-cv-" starts with "hq-". It is a CONFLICT only when
+		// two prefixes are siblings: neither (with its trailing hyphen as a
+		// boundary) is a string-prefix of the other. That is the gt-o1dox shape —
+		// "gt-" and "gts-" route to one rig DB but "gts-" does not start with
+		// "gt-". Reporting the legitimate hierarchical case would fire on every
+		// healthy town (every town has hq-/hq-cv-) and train operators to ignore
+		// the check, burying the real signal. (gt-o1dox)
+		if !hasSiblingPrefixes(raw) {
+			continue
+		}
+		prefixes := make([]string, 0, len(raw))
+		for _, p := range raw {
+			prefixes = append(prefixes, strings.TrimSuffix(p, "-"))
+		}
+		sort.Strings(prefixes)
+		conflicts[path] = prefixes
 	}
 
 	return conflicts, nil
+}
+
+// hasSiblingPrefixes reports whether prefixes (kept WITH trailing hyphens)
+// contains two entries where neither is a string-prefix of the other — i.e. two
+// distinct namespaces sharing a path (a real conflict like "gt-"/"gts-"), rather
+// than a nested hierarchy (a legitimate arrangement like "hq-"/"hq-cv-").
+func hasSiblingPrefixes(prefixes []string) bool {
+	for i := 0; i < len(prefixes); i++ {
+		for j := i + 1; j < len(prefixes); j++ {
+			a, b := prefixes[i], prefixes[j]
+			if a == b {
+				continue
+			}
+			if !strings.HasPrefix(a, b) && !strings.HasPrefix(b, a) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ExtractPrefix extracts the prefix from a bead ID.
