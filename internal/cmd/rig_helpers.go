@@ -145,17 +145,22 @@ func IsRigParkedOrDocked(townRoot, rigName string) (bool, string) {
 	return false, ""
 }
 
+// rigBeadsPrefix resolves a rig's configured beads prefix (rigs.json first, then
+// the rig's own config.json), normalized WITHOUT a trailing hyphen so it matches
+// capacity.BeadIDPrefix (which strips the hyphen) when the scheduler compares
+// prefixes. Returning "gt-" verbatim here would make AcceptsPrefix refuse a
+// legitimate "gt-*" bead. (gt-o1dox)
 func rigBeadsPrefix(townRoot, rigPath, rigName string) string {
 	rigsConfigPath := constants.MayorRigsPath(townRoot)
 	if rigsConfig, err := config.LoadRigsConfig(rigsConfigPath); err == nil {
 		if entry, ok := rigsConfig.Rigs[rigName]; ok && entry.BeadsConfig != nil && entry.BeadsConfig.Prefix != "" {
-			return entry.BeadsConfig.Prefix
+			return strings.TrimSuffix(entry.BeadsConfig.Prefix, "-")
 		}
 	}
 
 	rigConfigPath := filepath.Join(rigPath, "config.json")
 	if rigCfg, err := config.LoadRigConfig(rigConfigPath); err == nil && rigCfg.Beads != nil && rigCfg.Beads.Prefix != "" {
-		return rigCfg.Beads.Prefix
+		return strings.TrimSuffix(rigCfg.Beads.Prefix, "-")
 	}
 
 	return ""

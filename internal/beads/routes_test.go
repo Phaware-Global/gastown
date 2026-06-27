@@ -728,3 +728,104 @@ func TestValidateRigPrefix(t *testing.T) {
 		})
 	}
 }
+
+func TestFindConflictingPaths(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// The hq-o1dox shape: two SIBLING prefixes ("gts-" and "gt-" — neither is a
+	// hyphen-delimited extension of the other) route to the same gastown rig
+	// path; that is the real conflict. "hi-" is a clean single-route rig. "hq-"
+	// and "hq-cv-" also share a path ("."), but "hq-cv-" is a hierarchical
+	// sub-namespace of "hq-" (it starts with "hq-") — a legitimate town-level
+	// arrangement present in every town — so it must NOT be reported, otherwise
+	// the check would fire on every healthy town.
+	routesContent := `{"prefix": "gts-", "path": "gastown/mayor/rig"}
+{"prefix": "gt-", "path": "gastown/mayor/rig"}
+{"prefix": "hi-", "path": "heartworks_ios"}
+{"prefix": "hq-", "path": "."}
+{"prefix": "hq-cv-", "path": "."}
+`
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	conflicts, err := FindConflictingPaths(beadsDir)
+	if err != nil {
+		t.Fatalf("FindConflictingPaths: %v", err)
+	}
+
+	if len(conflicts) != 1 {
+		t.Fatalf("FindConflictingPaths returned %d conflicts, want 1: %v", len(conflicts), conflicts)
+	}
+	got, ok := conflicts["gastown/mayor/rig"]
+	if !ok {
+		t.Fatalf("expected conflict for gastown/mayor/rig, got %v", conflicts)
+	}
+	want := []string{"gt", "gts"} // sorted, hyphen-normalized
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("conflict prefixes = %v, want %v", got, want)
+	}
+	if _, ok := conflicts["heartworks_ios"]; ok {
+		t.Errorf("single-route path heartworks_ios should not be a conflict")
+	}
+	if _, ok := conflicts["."]; ok {
+		t.Errorf("hierarchical hq-/hq-cv- on town path \".\" must not be a conflict, got %v", conflicts["."])
+	}
+}
+
+// TestFindConflictingPaths_DuplicateSamePrefix ensures a path that has the SAME
+// prefix listed twice (or once as "gt-" and once as "gt") is NOT a conflict —
+// only DISTINCT normalized prefixes count.
+func TestFindConflictingPaths_DuplicateSamePrefix(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	routesContent := `{"prefix": "gt-", "path": "gastown/mayor/rig"}
+{"prefix": "gt", "path": "gastown/mayor/rig"}
+`
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	conflicts, err := FindConflictingPaths(beadsDir)
+	if err != nil {
+		t.Fatalf("FindConflictingPaths: %v", err)
+	}
+	if len(conflicts) != 0 {
+		t.Errorf("same normalized prefix should not conflict, got %v", conflicts)
+	}
+}
+
+// TestFindConflictingPaths_UnhyphenatedSibling ensures a real sibling conflict
+// is caught even when a route prefix is stored WITHOUT its trailing hyphen
+// (e.g. "gt" instead of "gt-"). Without canonicalizing to the namespace
+// boundary, HasPrefix("gts-", "gt") would read as hierarchical and miss it.
+func TestFindConflictingPaths_UnhyphenatedSibling(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	routesContent := `{"prefix": "gt", "path": "gastown/mayor/rig"}
+{"prefix": "gts-", "path": "gastown/mayor/rig"}
+`
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	conflicts, err := FindConflictingPaths(beadsDir)
+	if err != nil {
+		t.Fatalf("FindConflictingPaths: %v", err)
+	}
+	got, ok := conflicts["gastown/mayor/rig"]
+	if !ok {
+		t.Fatalf("expected gt/gts sibling conflict even with unhyphenated prefix, got %v", conflicts)
+	}
+	if want := []string{"gt", "gts"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("conflict prefixes = %v, want %v", got, want)
+	}
+}

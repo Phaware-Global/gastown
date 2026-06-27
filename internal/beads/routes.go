@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/config"
@@ -243,6 +244,92 @@ func FindConflictingPrefixes(beadsDir string) (map[string][]string, error) {
 	}
 
 	return conflicts, nil
+}
+
+// FindConflictingPaths returns rig paths that have more than one DISTINCT beads
+// prefix routed to them in routes.jsonl, keyed by path -> sorted distinct
+// prefixes (trailing hyphen normalized).
+//
+// This is the inverse of FindConflictingPrefixes: instead of one prefix fanning
+// out to several rig paths, it catches several prefixes collapsing onto a single
+// rig DB — e.g. a stale "gts-" route left beside the real "gt-" route, both
+// pointing at "gastown/mayor/rig". That ambiguity is invisible to the
+// path-keyed prefix-mismatch / database-prefix checks (their maps keep only the
+// last route seen per path), yet it is exactly what makes a reverse path->prefix
+// lookup non-deterministic — bead minting picked the first-listed "gts" while
+// the scheduler validated against the configured "gt", refusing every dispatch
+// with cross_rig_prefix. (gt-o1dox)
+func FindConflictingPaths(beadsDir string) (map[string][]string, error) {
+	routes, err := LoadRoutes(beadsDir)
+	if err != nil {
+		return nil, err
+	}
+
+	// Group the distinct prefixes by path, canonicalized to a trailing-hyphen
+	// form. The hyphen is the namespace boundary the hierarchy check relies on,
+	// but LoadRoutes does not normalize route.Prefix — a routes.jsonl entry may
+	// store "gt" instead of "gt-". Without canonicalizing, HasPrefix("gts-",
+	// "gt") would read as hierarchical and MISS a real gt/gts sibling conflict.
+	// Canonicalizing also collapses "gt" and "gt-" to the same prefix (they are
+	// the same namespace).
+	pathPrefixes := make(map[string]map[string]struct{})
+	for _, r := range routes {
+		prefix := r.Prefix
+		if !strings.HasSuffix(prefix, "-") {
+			prefix += "-"
+		}
+		if pathPrefixes[r.Path] == nil {
+			pathPrefixes[r.Path] = make(map[string]struct{})
+		}
+		pathPrefixes[r.Path][prefix] = struct{}{}
+	}
+
+	conflicts := make(map[string][]string)
+	for path, set := range pathPrefixes {
+		raw := make([]string, 0, len(set))
+		for p := range set {
+			raw = append(raw, p)
+		}
+		// A path legitimately hosts multiple prefixes when they are hierarchical
+		// sub-namespaces of one another — e.g. "hq-" and "hq-cv-" both in the
+		// town DB, where "hq-cv-" starts with "hq-". It is a CONFLICT only when
+		// two prefixes are siblings: neither (with its trailing hyphen as a
+		// boundary) is a string-prefix of the other. That is the gt-o1dox shape —
+		// "gt-" and "gts-" route to one rig DB but "gts-" does not start with
+		// "gt-". Reporting the legitimate hierarchical case would fire on every
+		// healthy town (every town has hq-/hq-cv-) and train operators to ignore
+		// the check, burying the real signal. (gt-o1dox)
+		if !hasSiblingPrefixes(raw) {
+			continue
+		}
+		prefixes := make([]string, 0, len(raw))
+		for _, p := range raw {
+			prefixes = append(prefixes, strings.TrimSuffix(p, "-"))
+		}
+		sort.Strings(prefixes)
+		conflicts[path] = prefixes
+	}
+
+	return conflicts, nil
+}
+
+// hasSiblingPrefixes reports whether prefixes (kept WITH trailing hyphens)
+// contains two entries where neither is a string-prefix of the other — i.e. two
+// distinct namespaces sharing a path (a real conflict like "gt-"/"gts-"), rather
+// than a nested hierarchy (a legitimate arrangement like "hq-"/"hq-cv-").
+func hasSiblingPrefixes(prefixes []string) bool {
+	for i := 0; i < len(prefixes); i++ {
+		for j := i + 1; j < len(prefixes); j++ {
+			a, b := prefixes[i], prefixes[j]
+			if a == b {
+				continue
+			}
+			if !strings.HasPrefix(a, b) && !strings.HasPrefix(b, a) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ExtractPrefix extracts the prefix from a bead ID.
