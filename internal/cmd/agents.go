@@ -30,6 +30,10 @@ const (
 	AgentPolecat
 	AgentPersonal // Non-GT session (user's terminal session)
 	AgentTest     // Session on a gt-test-* socket (integration tests)
+	// AgentReviewer is a rig's on-demand code Reviewer session
+	// (<prefix>-reviewer). Appended at the end so the existing iota values
+	// (which may be persisted in telemetry) do not renumber.
+	AgentReviewer
 )
 
 // AgentSession represents a categorized tmux session.
@@ -47,6 +51,7 @@ var AgentTypeColors = map[AgentType]string{
 	AgentDeacon:   "#[fg=yellow,bold]",
 	AgentWitness:  "#[fg=cyan]",
 	AgentRefinery: "#[fg=blue]",
+	AgentReviewer: "#[fg=magenta]",
 	AgentCrew:     "#[fg=green]",
 	AgentPolecat:  "#[fg=white,dim]",
 	AgentPersonal: "#[fg=magenta]",
@@ -57,8 +62,9 @@ var AgentTypeColors = map[AgentType]string{
 var rigTypeOrder = map[AgentType]int{
 	AgentRefinery: 0,
 	AgentWitness:  1,
-	AgentCrew:     2,
-	AgentPolecat:  3,
+	AgentReviewer: 2,
+	AgentCrew:     3,
+	AgentPolecat:  4,
 }
 
 // AgentTypeIcons maps agent types to display icons.
@@ -68,6 +74,7 @@ var AgentTypeIcons = map[AgentType]string{
 	AgentDeacon:   constants.EmojiDeacon,
 	AgentWitness:  constants.EmojiWitness,
 	AgentRefinery: constants.EmojiRefinery,
+	AgentReviewer: constants.EmojiReviewer,
 	AgentCrew:     constants.EmojiCrew,
 	AgentPolecat:  constants.EmojiPolecat,
 }
@@ -158,6 +165,17 @@ func categorizeSession(name string) *AgentSession {
 
 	sess.Rig = identity.Rig
 	sess.AgentName = identity.Name
+
+	// Reviewer sessions (<prefix>-reviewer) are not a distinct session.Role, so
+	// ParseSessionName classifies them as a polecat named "reviewer". Intercept
+	// by canonical name before the role switch so they surface as their own type
+	// rather than a hidden polecat. Guard on a non-empty prefix (town-level roles
+	// like mayor have no prefix and an empty ReviewerSessionName).
+	if identity.Prefix != "" && name == session.ReviewerSessionName(identity.Prefix) {
+		sess.Type = AgentReviewer
+		sess.AgentName = ""
+		return sess
+	}
 
 	switch identity.Role {
 	case session.RoleMayor:
@@ -384,6 +402,8 @@ func (a *AgentSession) displayLabel() string {
 		return fmt.Sprintf("%s%s %s/witness#[default]", color, icon, a.Rig)
 	case AgentRefinery:
 		return fmt.Sprintf("%s%s %s/refinery#[default]", color, icon, a.Rig)
+	case AgentReviewer:
+		return fmt.Sprintf("%s%s %s/reviewer#[default]", color, icon, a.Rig)
 	case AgentCrew:
 		return fmt.Sprintf("%s%s %s/crew/%s#[default]", color, icon, a.Rig, a.AgentName)
 	case AgentPolecat:
@@ -569,6 +589,8 @@ func runAgentsList(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  %s witness\n", icon)
 		case AgentRefinery:
 			fmt.Printf("  %s refinery\n", icon)
+		case AgentReviewer:
+			fmt.Printf("  %s reviewer\n", icon)
 		case AgentCrew:
 			fmt.Printf("  %s crew/%s\n", icon, agent.AgentName)
 		case AgentPolecat:

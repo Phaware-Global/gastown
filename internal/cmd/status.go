@@ -1078,6 +1078,7 @@ func outputStatusText(w io.Writer, status TownStatus) error {
 		constants.RoleDeacon:   constants.EmojiDeacon,
 		constants.RoleWitness:  constants.EmojiWitness,
 		constants.RoleRefinery: constants.EmojiRefinery,
+		constants.RoleReviewer: constants.EmojiReviewer,
 		constants.RoleCrew:     constants.EmojiCrew,
 		constants.RolePolecat:  constants.EmojiPolecat,
 		// Legacy names for backwards compatibility
@@ -1115,13 +1116,15 @@ func outputStatusText(w io.Writer, status TownStatus) error {
 		fmt.Fprintf(w, "─── %s ───────────────────────────────────────────\n\n", style.Bold.Render(r.Name+"/"))
 
 		// Group agents by role
-		var witnesses, refineries, crews, polecats []AgentRuntime
+		var witnesses, refineries, reviewers, crews, polecats []AgentRuntime
 		for _, agent := range r.Agents {
 			switch agent.Role {
 			case constants.RoleWitness:
 				witnesses = append(witnesses, agent)
 			case constants.RoleRefinery:
 				refineries = append(refineries, agent)
+			case constants.RoleReviewer:
+				reviewers = append(reviewers, agent)
 			case constants.RoleCrew:
 				crews = append(crews, agent)
 			case constants.RolePolecat:
@@ -1170,6 +1173,21 @@ func outputStatusText(w io.Writer, status TownStatus) error {
 						}
 					}
 					renderAgentCompactWithSuffix(w, agent, roleIcons[constants.RoleRefinery]+" ", r.Hooks, status.Location, mqSuffix)
+				}
+			}
+		}
+
+		// Reviewer (on-demand; only present while its session is up)
+		if len(reviewers) > 0 {
+			if statusVerbose {
+				fmt.Fprintf(w, "%s %s\n", roleIcons[constants.RoleReviewer], style.Bold.Render("Reviewer"))
+				for _, agent := range reviewers {
+					renderAgentDetails(w, agent, "   ", r.Hooks, status.Location)
+				}
+				fmt.Fprintln(w)
+			} else {
+				for _, agent := range reviewers {
+					renderAgentCompact(w, agent, roleIcons[constants.RoleReviewer]+" ", r.Hooks, status.Location)
 				}
 			}
 		}
@@ -1793,6 +1811,21 @@ func discoverRigAgents(allSessions map[string]bool, r *rig.Rig, crews []string, 
 			session: session.RefinerySessionName(session.PrefixFor(r.Name)),
 			role:    constants.RoleRefinery,
 			beadID:  beads.RefineryBeadIDWithPrefix(prefix, r.Name),
+		})
+	}
+
+	// Reviewer (spawn-on-demand, one per rig, drained by review work — see
+	// internal/reviewer/manager.go). It has no persistent config flag or agent
+	// bead, so surface it only while its session is actually up. That gives
+	// operators visibility into an active/idle reviewer without a permanent
+	// "not running" row on rigs that aren't currently reviewing — consistent
+	// with how an absent witness/refinery is simply omitted.
+	if reviewerSession := session.ReviewerSessionName(session.PrefixFor(r.Name)); allSessions[reviewerSession] {
+		defs = append(defs, agentDef{
+			name:    constants.RoleReviewer,
+			address: r.Name + "/reviewer",
+			session: reviewerSession,
+			role:    constants.RoleReviewer,
 		})
 	}
 
