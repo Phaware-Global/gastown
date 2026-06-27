@@ -800,3 +800,32 @@ func TestFindConflictingPaths_DuplicateSamePrefix(t *testing.T) {
 		t.Errorf("same normalized prefix should not conflict, got %v", conflicts)
 	}
 }
+
+// TestFindConflictingPaths_UnhyphenatedSibling ensures a real sibling conflict
+// is caught even when a route prefix is stored WITHOUT its trailing hyphen
+// (e.g. "gt" instead of "gt-"). Without canonicalizing to the namespace
+// boundary, HasPrefix("gts-", "gt") would read as hierarchical and miss it.
+func TestFindConflictingPaths_UnhyphenatedSibling(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	routesContent := `{"prefix": "gt", "path": "gastown/mayor/rig"}
+{"prefix": "gts-", "path": "gastown/mayor/rig"}
+`
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	conflicts, err := FindConflictingPaths(beadsDir)
+	if err != nil {
+		t.Fatalf("FindConflictingPaths: %v", err)
+	}
+	got, ok := conflicts["gastown/mayor/rig"]
+	if !ok {
+		t.Fatalf("expected gt/gts sibling conflict even with unhyphenated prefix, got %v", conflicts)
+	}
+	if want := []string{"gt", "gts"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("conflict prefixes = %v, want %v", got, want)
+	}
+}

@@ -265,14 +265,23 @@ func FindConflictingPaths(beadsDir string) (map[string][]string, error) {
 		return nil, err
 	}
 
-	// Group the distinct raw prefixes (kept WITH their trailing hyphen, which
-	// marks the namespace boundary) by path.
+	// Group the distinct prefixes by path, canonicalized to a trailing-hyphen
+	// form. The hyphen is the namespace boundary the hierarchy check relies on,
+	// but LoadRoutes does not normalize route.Prefix — a routes.jsonl entry may
+	// store "gt" instead of "gt-". Without canonicalizing, HasPrefix("gts-",
+	// "gt") would read as hierarchical and MISS a real gt/gts sibling conflict.
+	// Canonicalizing also collapses "gt" and "gt-" to the same prefix (they are
+	// the same namespace).
 	pathPrefixes := make(map[string]map[string]struct{})
 	for _, r := range routes {
+		prefix := r.Prefix
+		if !strings.HasSuffix(prefix, "-") {
+			prefix += "-"
+		}
 		if pathPrefixes[r.Path] == nil {
 			pathPrefixes[r.Path] = make(map[string]struct{})
 		}
-		pathPrefixes[r.Path][r.Prefix] = struct{}{}
+		pathPrefixes[r.Path][prefix] = struct{}{}
 	}
 
 	conflicts := make(map[string][]string)
