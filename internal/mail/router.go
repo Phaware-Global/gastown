@@ -1814,7 +1814,7 @@ func (r *Router) notifyRecipient(msg *Message) error {
 		}
 		waitErr := r.tmux.WaitForIdle(sessionID, timeout)
 		if waitErr == nil {
-			err := r.tmux.NudgeSessionWithOpts(sessionID, notification, tmux.NudgeOpts{TownRoot: r.townRoot, RequireIdle: true})
+			err := r.tmux.NudgeSessionWithOpts(sessionID, notification, tmux.NudgeOpts{TownRoot: r.townRoot, RequireIdle: true, ClearOnStrand: true})
 			if err == nil {
 				r.enqueueReplyReminder(msg, sessionID)
 				notified++
@@ -1824,8 +1824,13 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			} else if errors.Is(err, tmux.ErrNoServer) {
 				noTmuxServer = true
 				break
-			} else if errors.Is(err, tmux.ErrAgentBusy) && r.townRoot != "" {
-				// Busy — queue instead of force-injecting onto a streaming agent.
+			} else if (errors.Is(err, tmux.ErrAgentBusy) || errors.Is(err, tmux.ErrNudgeStranded)) && r.townRoot != "" {
+				// Agent went busy around the paste — queue instead of force-
+				// injecting onto a streaming agent. ErrAgentBusy is caught before
+				// any text is typed; ErrNudgeStranded means the text was typed but
+				// not submitted (ClearOnStrand above already cleared it under the
+				// delivery lock). Both re-deliver cooperatively via the queue
+				// rather than surfacing a false hard failure.
 				queueBusy()
 				continue
 			} else {

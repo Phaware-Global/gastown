@@ -1964,7 +1964,13 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 		// (wait-idle) re-delivers via the queue, and clearing here prevents
 		// Claude Code's deferred auto-submit from duplicating that copy.
 		if opts.ClearOnStrand && errors.Is(err, ErrNudgeStranded) {
-			_, _ = t.run("send-keys", "-t", target, "C-u")
+			if _, cerr := t.run("send-keys", "-t", target, "C-u"); cerr != nil {
+				// The clear is what prevents Claude Code's deferred auto-submit of
+				// the stranded text from duplicating the requeued copy. If it
+				// fails, surface it so operators can tell "cleared + requeued"
+				// from "requeued but the strand may still auto-submit".
+				fmt.Fprintf(os.Stderr, "warning: nudge strand clear (C-u) for session %q failed: %v; queued copy may duplicate if the agent auto-submits the stranded text\n", session, cerr)
+			}
 		}
 		return fmt.Errorf("nudge to session %q: %w", session, err)
 	}
