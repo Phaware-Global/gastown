@@ -47,6 +47,15 @@ var (
 	ErrInvalidSessionName = errors.New("invalid session name")
 	ErrIdleTimeout        = errors.New("agent not idle before timeout")
 	ErrAgentBusy          = errors.New("agent busy at delivery time")
+	// ErrNudgeStranded is returned when the nudge text was typed into the
+	// agent's input box but the trailing Enter never submitted it — the agent
+	// slipped from idle into a busy turn during the paste, so the box still
+	// holds the text after all retries. This is recoverable, not a hard
+	// failure: the message WAS delivered to the box, and callers with a queue
+	// (wait-idle mode) should clear the strand and re-deliver cooperatively
+	// rather than reporting failure. Distinguished from ErrAgentBusy, which is
+	// detected *before* any text is typed. (GH#gt-nudge-strand)
+	ErrNudgeStranded = errors.New("nudge text stranded in input box: agent went busy mid-paste")
 	// ErrEmptyMessage is returned when a nudge message is empty after
 	// sanitization (e.g. whitespace/control-chars only). Delivering it would
 	// just press Enter into the agent's input box — a silent no-op that looks
@@ -1602,7 +1611,7 @@ func (t *Tmux) sendEnterVerified(target, promptPrefix string) error {
 		if submitted {
 			return nil
 		}
-		return fmt.Errorf("nudge Enter not processed after %d retries: input box still holds text", maxRetries)
+		return fmt.Errorf("nudge Enter not processed after %d retries (input box still holds text): %w", maxRetries, ErrNudgeStranded)
 	}
 	if strings.Join(lines, "\n") != preSnapshot {
 		return nil // Inconclusive but content changed — consider success.
@@ -1794,6 +1803,17 @@ type NudgeOpts struct {
 	// stranding the nudge. Re-checking inside the delivery lock closes that gap;
 	// on ErrAgentBusy the caller should enqueue for cooperative drain instead.
 	RequireIdle bool
+
+	// ClearOnStrand clears the input box (Ctrl-U) when delivery strands — the
+	// text was typed but the agent went busy before Enter submitted it
+	// (ErrNudgeStranded). The clear runs while this call still holds the nudge
+	// serialization lock, so it cannot race a concurrent nudge's freshly typed
+	// text. Set this when the caller will re-deliver the message via the queue
+	// (the wait-idle path), so Claude Code's deferred auto-submit of the
+	// stranded text can't duplicate the queued copy. Leave false for immediate
+	// delivery, where a strand is a genuine failure and the typed text should
+	// remain for the operator to see.
+	ClearOnStrand bool
 }
 
 // canonicalPaneTarget converts a pane identifier like "%23" into a tmux target
@@ -1938,6 +1958,20 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	// nudge was submitted, not just typed), retrying with exponential backoff
 	// under load. (GH#gt-0b5)
 	if err := t.sendEnterVerified(target, t.submitVerifyPrefix(session)); err != nil {
+		// On a strand (text typed but not submitted), optionally clear the
+		// orphaned text while we STILL hold the nudge lock, so a concurrent
+		// nudge can't have its own freshly typed text wiped. The caller
+		// (wait-idle) re-delivers via the queue, and clearing here prevents
+		// Claude Code's deferred auto-submit from duplicating that copy.
+		if opts.ClearOnStrand && errors.Is(err, ErrNudgeStranded) {
+			if _, cerr := t.run("send-keys", "-t", target, "C-u"); cerr != nil {
+				// The clear is what prevents Claude Code's deferred auto-submit of
+				// the stranded text from duplicating the requeued copy. If it
+				// fails, surface it so operators can tell "cleared + requeued"
+				// from "requeued but the strand may still auto-submit".
+				fmt.Fprintf(os.Stderr, "warning: nudge strand clear (C-u) for session %q failed: %v; queued copy may duplicate if the agent auto-submits the stranded text\n", session, cerr)
+			}
+		}
 		return fmt.Errorf("nudge to session %q: %w", session, err)
 	}
 

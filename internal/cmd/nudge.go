@@ -248,14 +248,25 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			// resume work between WaitForIdle above and the actual paste, which
 			// would strand the text in its input box. On ErrAgentBusy, fall
 			// through to enqueue for cooperative drain instead of stranding it.
-			derr := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot, RequireIdle: true})
+			derr := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot, RequireIdle: true, ClearOnStrand: true})
 			if derr == nil {
 				return nil
 			}
-			if !errors.Is(derr, tmux.ErrAgentBusy) {
+			// Two recoverable outcomes both mean "the agent went busy around the
+			// paste" and should cooperatively re-deliver via the queue rather than
+			// report a hard failure:
+			//   - ErrAgentBusy: detected by RequireIdle *before* any text was typed.
+			//   - ErrNudgeStranded: the text WAS typed but the agent slipped busy
+			//     before Enter submitted it, so the box still holds it. The message
+			//     reached the agent — reporting failure here is the bug operators hit
+			//     ("nudge Enter not processed" while the nudge had in fact landed).
+			//     ClearOnStrand above already cleared the orphaned text under the
+			//     delivery lock (so Claude Code's deferred auto-submit can't
+			//     duplicate the queued copy); we just re-deliver via the queue.
+			if !errors.Is(derr, tmux.ErrAgentBusy) && !errors.Is(derr, tmux.ErrNudgeStranded) {
 				return derr
 			}
-			// else: agent became busy — proceed to the queue path below.
+			// else: agent became busy (or text stranded) — proceed to the queue path below.
 		}
 		// Terminal errors (session gone, no server) — propagate, don't queue.
 		// Queueing a nudge for a dead session means it will never be delivered.
