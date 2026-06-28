@@ -1836,7 +1836,18 @@ After await-event returns (either by event, timeout, or context-yield):
 gt patrol report --summary "<brief summary: branches merged, test results, queue state>"
 ```
 This closes the current patrol wisp and automatically creates a new one.
-4. Continue executing from the first step of the new patrol cycle
+4. Hand off immediately so a fresh refinery session picks up the newly-created
+   patrol wisp from the hook:
+```bash
+gt handoff -s "Refinery patrol handoff" -m "Patrol cycle reported; continue with the newly-created patrol wisp from hook."
+```
+
+Do NOT end your turn at the prompt after `gt patrol report`. The handoff is
+mandatory even when context is low; otherwise the patrol loop can stall between
+cycles with MRs waiting on the hook — the refinery sits idle until an external
+re-kick (e.g. Deacon's patrol) wakes it, dropping merge latency to ~one Deacon
+patrol interval. The handoff respawns a fresh session whose SessionStart hook
+runs `gt prime` and picks up the hooked patrol wisp, driving the next cycle.
 
 **If you decide to hand off:**
 

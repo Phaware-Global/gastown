@@ -122,6 +122,80 @@ func TestPatrolFormulasHaveReportCycle(t *testing.T) {
 	}
 }
 
+// TestHandoffPatrolFormulasSelfPerpetuate verifies that patrol formulas using
+// the handoff-respawn model end their loop step with a mandatory `gt handoff`
+// after `gt patrol report`.
+//
+// Regression test for hq-mctzr: the refinery patrol loop did not self-perpetuate.
+// `gt patrol report` correctly closed the current patrol wisp and created the next
+// one with status=hooked, but the formula's loop step ended with a bare
+// "Continue executing from the first step of the new patrol cycle" — with no
+// command to actually re-enter the loop. In practice the refinery returned to an
+// empty prompt and sat idle until an external re-kick (Deacon's patrol, ~15min
+// later) woke it for exactly one more cycle. Deacon's formula already mandated a
+// `gt handoff` here; the refinery's did not. The fix mirrors Deacon: hand off so a
+// fresh session's SessionStart hook runs `gt prime` and picks up the hooked wisp.
+//
+// NOTE: the witness patrol uses an in-session await-signal loop model rather than
+// handoff-respawn, so it is intentionally excluded here. If the witness is ever
+// migrated to the handoff model it should be added to this list.
+func TestHandoffPatrolFormulasSelfPerpetuate(t *testing.T) {
+	type patrolFormula struct {
+		name       string
+		loopStepID string
+	}
+
+	patrolFormulas := []patrolFormula{
+		{"mol-deacon-patrol.formula.toml", "loop-or-exit"},
+		{"mol-refinery-patrol.formula.toml", "burn-or-loop"},
+	}
+
+	for _, pf := range patrolFormulas {
+		t.Run(pf.name, func(t *testing.T) {
+			content, err := formulasFS.ReadFile("formulas/" + pf.name)
+			if err != nil {
+				t.Fatalf("reading %s: %v", pf.name, err)
+			}
+
+			f, err := Parse(content)
+			if err != nil {
+				t.Fatalf("parsing %s: %v", pf.name, err)
+			}
+
+			var loopDesc string
+			for _, step := range f.Steps {
+				if step.ID == pf.loopStepID {
+					loopDesc = step.Description
+					break
+				}
+			}
+			if loopDesc == "" {
+				t.Fatalf("%s: %s step not found or has empty description", pf.name, pf.loopStepID)
+			}
+
+			// The loop step must close the cycle AND hand off to respawn a fresh
+			// session that picks up the newly-hooked patrol wisp. Without the
+			// handoff the loop stalls between cycles (hq-mctzr).
+			reportIdx := strings.Index(loopDesc, "gt patrol report")
+			if reportIdx == -1 {
+				t.Fatalf("%s %s step missing \"gt patrol report\"", pf.name, pf.loopStepID)
+			}
+			if !strings.Contains(loopDesc, "gt handoff") {
+				t.Errorf("%s %s step missing \"gt handoff\" — the loop will not "+
+					"self-perpetuate.\nAfter \"gt patrol report\" creates the next "+
+					"hooked patrol wisp, the formula must hand off so a fresh session "+
+					"picks it up; otherwise the agent idles at an empty prompt until an "+
+					"external re-kick (hq-mctzr).", pf.name, pf.loopStepID)
+			}
+			// The handoff must follow the report (close current, then respawn into next).
+			if handoffIdx := strings.LastIndex(loopDesc, "gt handoff"); handoffIdx < reportIdx {
+				t.Errorf("%s %s step: \"gt handoff\" must appear after \"gt patrol report\" "+
+					"so the successor picks up the newly-created hooked wisp.", pf.name, pf.loopStepID)
+			}
+		})
+	}
+}
+
 // TestPatrolFormulasHaveWispGC verifies that all three patrol formulas
 // include `bd mol wisp gc` in their inbox-check step for safe cleanup.
 //
