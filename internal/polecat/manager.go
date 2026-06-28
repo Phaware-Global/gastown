@@ -2201,6 +2201,17 @@ func (m *Manager) workstateInputForPolecat(name string, state State, issue strin
 	if err != nil {
 		input.GitCheckFailed = true
 	}
+	// A polecat directory whose agent bead is NOT FOUND is a "ghost" (e.g. its
+	// agent bead was lost to a per-rig Dolt reset/rehydration). GetAgentBead
+	// returns (nil, nil, nil) on not-found. A ghost must NOT be reuse-eligible:
+	// FindIdlePolecat would otherwise hand it to dispatch, which dies at session
+	// start with "can't find pane" (no agent state to initialize), leaving the
+	// work bead OPEN. DecideWorkstate fails such polecats closed to needs-recovery
+	// via this flag so dispatch spawns a fresh, properly-tracked polecat instead.
+	// Note: a transient lookup *error* (err != nil) is deliberately NOT treated as
+	// a ghost — it already fails closed via GitCheckFailed above, and mislabeling
+	// it "agent-bead-missing" would mask the real (possibly transient) cause.
+	input.AgentBeadMissing = err == nil && fields == nil
 	if err == nil && fields != nil {
 		input.HookBead = fields.HookBead
 		input.PushFailed = fields.PushFailed

@@ -189,7 +189,7 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Scheduled: %d total, %d ready\n", len(scheduled), readyCount)
 	fmt.Printf("  Active:    %d polecats\n", capacitySnapshot.ActiveSessions)
 	if capacitySnapshot.Max > 0 {
-		fmt.Printf("  Capacity:  %d free of %d (working: %d, recovery: %d, reservations: %d, reusable idle: %d, pending MR: %d)\n",
+		fmt.Printf("  Capacity:  %d free of %d (working: %d, recovery: %d, reservations: %d, reusable idle: %d, pending MR: %d, stale: %d)\n",
 			capacitySnapshot.Free,
 			capacitySnapshot.Max,
 			capacitySnapshot.Working,
@@ -197,7 +197,11 @@ func runSchedulerStatus(cmd *cobra.Command, args []string) error {
 			capacitySnapshot.Reservations,
 			capacitySnapshot.ReusableIdle,
 			capacitySnapshot.PendingMR,
+			capacitySnapshot.Stale,
 		)
+		if capacitySnapshot.Stale > 0 {
+			fmt.Printf("             ⚠ %d stale polecat dir(s) (no agent bead, no session) — reap with `gt polecat nuke <rig>/<name>`\n", capacitySnapshot.Stale)
+		}
 	} else {
 		fmt.Printf("  Capacity:  direct dispatch (scheduler.max_polecats=%d)\n", capacitySnapshot.Max)
 	}

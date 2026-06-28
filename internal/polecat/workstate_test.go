@@ -43,6 +43,16 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			in:   WorkstateInput{State: StateWorking, CleanupStatus: CleanupClean},
 			want: WorkstateDisposition{Verdict: WorkstateVerdictWorking, Reason: "not-idle", NeedsRecovery: false, CountsTowardCapacity: true},
 		},
+		{
+			// Regression for the ghost-polecat dispatch bug: a polecat with no agent
+			// bead must NOT be reusable even when its worktree looks clean. Reusing
+			// it leads to a "can't find pane" dispatch no-op (no agent state to
+			// initialize); it must fail closed to needs-recovery so a fresh,
+			// tracked polecat is spawned instead.
+			name: "missing agent bead is not reusable even when clean",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "main", AgentBeadMissing: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "agent-bead-missing", NeedsRecovery: true, CountsTowardCapacity: false, ReuseStatus: "idle-recovery-needed"},
+		},
 	}
 
 	for _, tt := range tests {

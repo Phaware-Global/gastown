@@ -319,6 +319,29 @@ func TestApplyAgentFieldsToCapacitySnapshotSeparatesPendingMR(t *testing.T) {
 	}
 }
 
+// TestApplyAgentFieldsGhostDirIsStaleNotRecovery is a regression test for the
+// dispatch-stall bug where polecat directories that lost their agent beads (to a
+// per-rig Dolt reset) were counted as RecoveryBlocked. With no session AND no
+// agent bead, a directory is a reapable "ghost" — it must NOT occupy a capacity
+// slot, otherwise phantom slots exhaust scheduler.max_polecats and block all
+// dispatch even when polecats are genuinely idle. It is counted as Stale instead
+// (visible, but excluded from occupied()).
+func TestApplyAgentFieldsGhostDirIsStaleNotRecovery(t *testing.T) {
+	// fields == nil (no agent bead) and tmuxClient == nil (no running session).
+	snapshot := polecatCapacitySnapshot{}
+	applyAgentFieldsToCapacitySnapshot(&snapshot, "gastown", "ghost", nil, nil)
+
+	if snapshot.Stale != 1 {
+		t.Fatalf("ghost dir should count as Stale=1, got %+v", snapshot)
+	}
+	if snapshot.RecoveryBlocked != 0 {
+		t.Fatalf("ghost dir must NOT count as RecoveryBlocked, got %+v", snapshot)
+	}
+	if snapshot.occupied() != 0 {
+		t.Fatalf("ghost dir must NOT occupy a capacity slot, occupied=%d (%+v)", snapshot.occupied(), snapshot)
+	}
+}
+
 func TestPrintDryRunPlanUsesCapacitySnapshot(t *testing.T) {
 	out := captureStdout(t, func() {
 		printDryRunPlan(capacity.DispatchPlan{

@@ -35,6 +35,11 @@ type WorkstateInput struct {
 	AssignedBeadTerminal           bool
 	MRSubmitted                    bool
 	MQLookupFailed                 bool
+	// AgentBeadMissing is true when the polecat directory has no resolvable agent
+	// bead. Such a "ghost" cannot be safely reused (no agent state to track
+	// cleanup status or initialize a session), so it fails closed to
+	// needs-recovery rather than being reused into a "can't find pane" dispatch.
+	AgentBeadMissing bool
 }
 
 // WorkstateDisposition is the canonical polecat lifecycle decision. It is pure
@@ -80,6 +85,22 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		}
 	}
 
+	if in.AgentBeadMissing {
+		// No agent bead to track cleanup status or initialize a session: this is a
+		// reapable "ghost" directory. Fail closed so dispatch spawns a fresh polecat
+		// instead of reusing one it cannot drive (the "can't find pane" dispatch
+		// no-op). It needs recovery (reaping/recreation) but is NOT a live occupant,
+		// so it must not count toward capacity — consistent with how the bead-based
+		// capacity scanner treats a ghost dir as Stale (excluded from occupied()).
+		return WorkstateDisposition{
+			Verdict:              WorkstateVerdictNeedsRecovery,
+			Reason:               "agent-bead-missing",
+			NeedsRecovery:        true,
+			CountsTowardCapacity: false,
+			ReuseStatus:          "idle-recovery-needed",
+			Blockers:             []string{"agent_bead=<missing>"},
+		}
+	}
 	if in.HookBead != "" && !in.PartialSpawnWithoutDurableHook {
 		block("hook-still-set", "has work on hook ("+in.HookBead+")")
 	}
