@@ -111,8 +111,8 @@ func fixedClock(t time.Time) func() time.Time {
 
 func baseInput(now time.Time, overrides ...func(*AwaitReviewStepInput)) AwaitReviewStepInput {
 	in := AwaitReviewStepInput{
-		Reviewer:       "augment",
-		TriggerComment: "augment review",
+		Reviewer:       "review-bot",
+		TriggerComment: "trigger review",
 		MinWait:        5 * time.Minute,
 		Timeout:        30 * time.Minute,
 		Now:            fixedClock(now),
@@ -140,7 +140,7 @@ func TestAwaitReviewStep_EmptyReviewer_ReturnsError(t *testing.T) {
 
 func TestAwaitReviewStep_TimeoutLEMinWait_ReturnsError(t *testing.T) {
 	_, err := AwaitReviewStep(&awaitFakeProvider{}, 42, AwaitReviewStepInput{
-		Reviewer: "augment",
+		Reviewer: "review-bot",
 		MinWait:  5 * time.Minute,
 		Timeout:  5 * time.Minute,
 	})
@@ -162,8 +162,8 @@ func TestAwaitReviewStep_FirstCall_PostsTriggerAndReturnsPosted(t *testing.T) {
 	if !res.NewStartedAt.Equal(now) {
 		t.Errorf("NewStartedAt = %v, want %v", res.NewStartedAt, now)
 	}
-	if len(provider.postedComments) != 1 || provider.postedComments[0] != "augment review" {
-		t.Errorf("expected one 'augment review' comment posted, got %v", provider.postedComments)
+	if len(provider.postedComments) != 1 || provider.postedComments[0] != "trigger review" {
+		t.Errorf("expected one 'trigger review' comment posted, got %v", provider.postedComments)
 	}
 }
 
@@ -713,8 +713,8 @@ func TestAwaitReviewStep_DriftReset_ReRequestsBlockingReviewers(t *testing.T) {
 		newSHA = "2222222222222222222222222222222222222222"
 	)
 	p := &awaitFakeProvider{
-		// augment is the configured reviewer; kevinpjones is a human gate.
-		changesRequested: []string{"augment", "kevinpjones"},
+		// review-bot is the configured reviewer (baseInput); kevinpjones is a human gate.
+		changesRequested: []string{"review-bot", "kevinpjones"},
 	}
 	res, err := AwaitReviewStep(p, 45, baseInput(now, func(in *AwaitReviewStepInput) {
 		in.StartedAt = now.Add(-10 * time.Minute) // not first cycle
@@ -732,7 +732,7 @@ func TestAwaitReviewStep_DriftReset_ReRequestsBlockingReviewers(t *testing.T) {
 	}
 	got := p.requestedReviewers[0]
 	if len(got) != 1 || got[0] != "kevinpjones" {
-		t.Errorf("re-requested %v, want [kevinpjones] (configured reviewer augment excluded)", got)
+		t.Errorf("re-requested %v, want [kevinpjones] (configured reviewer review-bot excluded)", got)
 	}
 	if !strings.Contains(res.Message, "re-requested review from kevinpjones") {
 		t.Errorf("message missing re-request note: %q", res.Message)

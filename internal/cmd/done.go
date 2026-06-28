@@ -1089,7 +1089,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// When a PR exists for this work under merge_strategy=pr,
 				// hand it off to the refinery by creating an MR bead that
 				// carries `review_pr: <N>`. Without this, the refinery
-				// never sees the PR, so no `augment review` is requested,
+				// never sees the PR, so no review is requested,
 				// no CI-gate runs, no human-approval escalation fires —
 				// the PR sits orphaned from the review/merge pipeline.
 				// See G11 in docs/design/refinery-pr-workflow.md. Skipped

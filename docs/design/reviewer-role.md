@@ -90,7 +90,7 @@ What the refinery observes of "a reviewer" today (all in
 
 | Contract point | Mechanism | Config |
 |---|---|---|
-| Wake the reviewer | PR comment, body from `pr_trigger_comment` (default `"augment review"`) | `merge_queue.pr_trigger_comment` |
+| Wake the reviewer | With `reviewer_local`, the in-town Reviewer is dispatched directly (no PR comment); otherwise an optional external-bot trigger comment, body from `pr_trigger_comment` (default empty — no comment posted) | `merge_queue.reviewer_local` / `merge_queue.pr_trigger_comment` |
 | Recognize engagement | A PR review by login `pr_reviewer`, case-insensitive exact match, SHA-scoped to current PR HEAD (G37) | `merge_queue.pr_reviewer` |
 | Findings | Inline review comment threads; priority parsed from `![high\|medium\|low](…priority.svg)` shields (`internal/refinery/threads.go:121`) | — |
 | Pacing | min-wait then poll within timeout; exit codes 0/1/2/3/4 from `await-review` | `pr_review_wait` (5m), `pr_review_timeout` (30m) |

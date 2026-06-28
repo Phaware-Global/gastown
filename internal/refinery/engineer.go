@@ -244,10 +244,13 @@ type MergeQueueConfig struct {
 	// not needed. Default 30 minutes.
 	PRReviewTimeout time.Duration `json:"pr_review_timeout,omitempty"`
 
-	// PRTriggerComment is the body await-review posts to wake the
-	// reviewer bot (e.g. "augment review"). Empty disables the trigger
+	// PRTriggerComment is the optional body await-review posts to wake an
+	// external review bot (e.g. "/gemini review"). Empty disables the trigger
 	// step — await-review still enforces the minimum wait + threads
-	// gate, just doesn't post. Default "augment review".
+	// gate, just doesn't post. Default empty: the in-town Reviewer
+	// (ReviewerLocal) is the sanctioned review path and never posts a
+	// trigger comment, so a trigger is opt-in for rigs that route review to
+	// an external bot instead.
 	PRTriggerComment string `json:"pr_trigger_comment,omitempty"`
 
 	// ReviewerLocal dispatches the in-town Reviewer role instead of relying on
