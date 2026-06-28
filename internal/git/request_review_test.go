@@ -71,6 +71,11 @@ func TestBuildRequestReviewArgv(t *testing.T) {
 			reviewers:    []string{"", "  alice  ", "\t", "bob"},
 			wantEditArgv: []string{"pr", "edit", "42", "--add-reviewer", "alice,bob"},
 		},
+		{
+			name:         "duplicate reviewers — deduplicated (after trim)",
+			reviewers:    []string{"alice", "bob", "alice", "  bob  "},
+			wantEditArgv: []string{"pr", "edit", "42", "--add-reviewer", "alice,bob"},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

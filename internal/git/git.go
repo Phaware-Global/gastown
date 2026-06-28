@@ -1577,15 +1577,19 @@ func (g *Git) GhPrCreate(branch, base, title, body string) (int, string, error) 
 // Reviewer normalization: each entry is TrimSpace'd; empty-after-trim
 // entries are dropped, so callers can pass a list that includes blanks
 // (e.g. from a config field that may be unset) without producing
-// "alice,,bob" — which `gh pr edit --add-reviewer` rejects. Returns nil
-// when reviewers is empty or contains only whitespace entries.
+// "alice,,bob" — which `gh pr edit --add-reviewer` rejects. Duplicate
+// names (after trim) are collapsed so overlapping configs don't pass
+// "alice,alice" to gh. Returns nil when reviewers is empty or contains
+// only whitespace entries.
 func buildRequestReviewArgv(prNumber int, reviewers []string) (editArgv []string) {
 	var userReviewers []string
+	seen := make(map[string]bool)
 	for _, r := range reviewers {
 		r = strings.TrimSpace(r)
-		if r == "" {
+		if r == "" || seen[r] {
 			continue
 		}
+		seen[r] = true
 		userReviewers = append(userReviewers, r)
 	}
 	if len(userReviewers) > 0 {
