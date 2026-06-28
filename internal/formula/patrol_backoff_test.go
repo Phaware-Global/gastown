@@ -173,11 +173,11 @@ func TestHandoffPatrolFormulasSelfPerpetuate(t *testing.T) {
 				t.Fatalf("%s: %s step not found or has empty description", pf.name, pf.loopStepID)
 			}
 
-			// The loop step must close the cycle AND hand off to respawn a fresh
-			// session that picks up the newly-hooked patrol wisp. Without the
-			// handoff the loop stalls between cycles (hq-mctzr).
-			reportIdx := strings.Index(loopDesc, "gt patrol report")
-			if reportIdx == -1 {
+			// The loop step must close the cycle AND, after the cycle-closing
+			// patrol report, hand off to respawn a fresh session that picks up the
+			// newly-hooked patrol wisp. Without the handoff the loop stalls between
+			// cycles (hq-mctzr).
+			if !strings.Contains(loopDesc, "gt patrol report") {
 				t.Fatalf("%s %s step missing \"gt patrol report\"", pf.name, pf.loopStepID)
 			}
 			if !strings.Contains(loopDesc, "gt handoff") {
@@ -186,11 +186,13 @@ func TestHandoffPatrolFormulasSelfPerpetuate(t *testing.T) {
 					"hooked patrol wisp, the formula must hand off so a fresh session "+
 					"picks it up; otherwise the agent idles at an empty prompt until an "+
 					"external re-kick (hq-mctzr).", pf.name, pf.loopStepID)
-			}
-			// The handoff must follow the report (close current, then respawn into next).
-			if handoffIdx := strings.LastIndex(loopDesc, "gt handoff"); handoffIdx < reportIdx {
-				t.Errorf("%s %s step: \"gt handoff\" must appear after \"gt patrol report\" "+
-					"so the successor picks up the newly-created hooked wisp.", pf.name, pf.loopStepID)
+			} else if lastReport := strings.LastIndex(loopDesc, "gt patrol report"); !strings.Contains(loopDesc[lastReport:], "gt handoff") {
+				// Anchor on the LAST patrol report so an earlier prose mention or a
+				// context-yield report block can't satisfy the ordering check: the
+				// mandatory handoff must come after the cycle-closing report.
+				t.Errorf("%s %s step: \"gt handoff\" must appear after the cycle-closing "+
+					"\"gt patrol report\" so the successor picks up the newly-created "+
+					"hooked wisp.", pf.name, pf.loopStepID)
 			}
 		})
 	}

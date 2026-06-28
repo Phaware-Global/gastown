@@ -1849,9 +1849,12 @@ re-kick (e.g. Deacon's patrol) wakes it, dropping merge latency to ~one Deacon
 patrol interval. The handoff respawns a fresh session whose SessionStart hook
 runs `gt prime` and picks up the hooked patrol wisp, driving the next cycle.
 
-**If you decide to hand off:**
+**Handoff message details (every cycle ends in `gt handoff`):**
 
-Report and exit using `gt handoff` for clean session transition:
+There is no "stay idle" option — both the continue-patrolling path above and a
+context-high exit end the cycle with `gt handoff`. The only difference is the
+message you pass: use the richer form below when you have notable state to hand
+to your successor (branches merged, queue depth, RSS/age, or a context-high exit):
 
 ```bash
 gt handoff -s "Patrol complete" -m "Merged X branches, Y tests passed.
@@ -1863,7 +1866,8 @@ Next: [any notes for successor]"
 `gt handoff` sends handoff mail to yourself, respawns with a fresh Claude instance,
 SessionStart hook runs gt prime, and your successor picks up from the hook.
 
-**DO NOT just exit.** Always use `gt handoff` for proper lifecycle.
+**DO NOT just exit, and DO NOT idle at the prompt.** Always end the cycle with
+`gt handoff` for proper lifecycle.
 
 **IMPORTANT**: Never sleep-poll manually (e.g., `sleep 30 && bd list`).
 Always use `gt mol step await-event` — it's event-driven and tracks backoff state."""
