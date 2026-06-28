@@ -147,23 +147,30 @@ gt mail archive <message-id>
 
 **DOG_DONE messages**:
 Dogs report completion after infrastructure tasks (orphan-scan, session-gc, etc.).
-Subject format: `DOG_DONE <hostname>`
-Body contains: task name, counts, status.
+Subject format varies: `DOG_DONE <hostname>` or `DOG_DONE: <plugin>`. The outcome
+lives in the body as a `Status:` line (e.g. `Status: COMPLETE`), NOT in the subject.
+
+Do NOT send an acknowledgment/reply (no daemon mail-acks — that just creates
+churn) and do NOT treat the report as actionable work. But DO check the outcome
+cheaply before archiving, so a failure isn't silently buried:
 ```bash
-# Parse the report, log metrics if needed
-gt mail read <id>
-# Archive after noting completion
+# Read the short report only to inspect its Status line. Escalate BEFORE
+# archiving so a non-COMPLETE report can't be buried, then archive.
+status=$(gt mail read <message-id> | sed -n 's/^Status:[[:space:]]*//p' | head -1)
+if [ "$status" != "COMPLETE" ]; then
+  gt escalate -s HIGH "DOG_DONE not COMPLETE (status='${status:-missing}') — see <message-id>"
+fi
 gt mail archive <message-id>
 ```
-Dogs return to idle automatically. The report is informational - no action needed
-unless the dog reports errors that require escalation.
+Dogs return to idle automatically; once any non-COMPLETE status has been
+escalated above, you're done — do NOT send an ack reply.
 
 **CONVOY_NEEDS_FEEDING messages** (from Refinery):
 The daemon's ConvoyManager handles convoy feeding (event-driven + 30s periodic scan).
-Simply archive these messages — no deacon action needed.
+This is an informational daemon message — no deacon action needed. Do NOT
+`gt mail read` it; archive directly:
 ```bash
-# For each CONVOY_NEEDS_FEEDING message:
-gt mail read <id>
+# For each CONVOY_NEEDS_FEEDING message: archive without reading (daemon feeds convoys)
 gt mail archive <message-id>
 ```
 
@@ -811,13 +818,38 @@ gt dog status
 # Shows idle/working counts
 ```
 
-**Step 2: Ensure minimum idle dogs**
-If idle count is 0 and working count is at capacity, consider spawning:
+**Step 2: Ensure minimum idle dogs (deterministic — never spawn duplicates)**
+Spawn AT MOST ONE dog per patrol cycle, and ONLY when the pool genuinely needs
+one. Do NOT "consider spawning" by judgment — follow this exactly:
+
 ```bash
-# If no idle dogs available
-gt dog add <name>
-# Names: alpha, bravo, charlie, delta, etc.
+# 1. Read current pool state from the kennel (flat array of {name,state,...}).
+pool=$(gt dog list --json 2>/dev/null)
+
+# 2. If the kennel state is unreadable (non-JSON output, command failure), do
+#    NOT spawn this cycle. Treating "can't read" as "empty" would spawn blindly
+#    with no view of existing names — exactly the duplicate-dog failure mode we
+#    are preventing. Fail safe: skip spawn, leave a note, move on.
+if ! jq -e . >/dev/null 2>&1 <<<"$pool"; then
+  echo "dog-pool: kennel state unreadable; skipping spawn this cycle (fail-safe)"
+else
+  total=$(jq '. | length' <<<"$pool")
+  idle=$(jq '[.[]? | select(.state=="idle")] | length' <<<"$pool")
+
+  # 3. Spawn ONLY if: idle == 0 AND total < 4. Otherwise spawn nothing.
+  if [ "$idle" -eq 0 ] && [ "$total" -lt 4 ]; then
+    # 4. Pick the FIRST canonical name not already in the pool.
+    #    NEVER re-add a name that already exists — that creates duplicate dogs
+    #    (the alpha/bravo/delta duplication seen under runaway patrols).
+    existing=$(jq -r '.[]?.name' <<<"$pool" | sort -u)
+    for n in alpha bravo charlie delta echo foxtrot; do
+      if ! grep -qxF "$n" <<<"$existing"; then gt dog add "$n"; break; fi
+    done
+  fi
+fi
 ```
+
+If `idle >= 1` or `total >= 4`, spawn NOTHING and move on.
 
 **Step 3: Retire stale dogs (optional)**
 Dogs that have been idle for >24 hours can be removed to save resources:
@@ -1249,6 +1281,16 @@ Abbreviated patrol should complete in ~10% of the tokens of a full patrol.
 Mark skipped steps as SKIP in the patrol report.
 
 After await-signal returns (either by signal or timeout):
+0. **Heartbeat-on-wake (CRITICAL — do this FIRST, before anything else):**
+   `await-signal` may have blocked for up to its full backoff (several minutes).
+   The daemon kills the Deacon if its heartbeat goes stale, so the very first
+   action on wake is to refresh it — before summarizing, reporting, or any other
+   work:
+```bash
+gt deacon heartbeat "heartbeat-on-wake: await-signal returned"
+```
+   Skipping this risks the daemon killing the Deacon while it spins up the next
+   cycle, which looks like a crash/runaway and triggers a needless restart.
 1. Generate a brief summary of this patrol cycle's observations
 2. Build a step audit: for each step in this formula, record whether you
    executed it (OK) or skipped it (SKIP). This makes shortcutting visible
