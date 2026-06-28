@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -91,7 +92,20 @@ func (l *Lock) Acquire(sessionID string) error {
 				// We already hold it - refresh
 				return l.write(sessionID)
 			}
-			// Another process holds it
+			// Same session reclaim: the live holder is a DIFFERENT process but
+			// the SAME session (e.g. `gt prime` runs as a short-lived child of
+			// the session process that holds the lock, or a resumed session
+			// re-primes in the same tmux pane whose predecessor never released).
+			// Without this, a child/sibling invocation in our own session
+			// false-positives an "identity collision" against itself and aborts
+			// prime, leaving the worker idle with an unreadable hook. The session
+			// id (TMUX_PANE) plus a same-host guard scopes this to genuinely-ours
+			// locks; a different pane on this host, or any lock from another host,
+			// still collides as before.
+			if sameSession(sessionID, info) {
+				return l.write(sessionID)
+			}
+			// Another process, another session - real collision.
 			return fmt.Errorf("%w: PID %d (session: %s, acquired: %s)",
 				ErrLocked, info.PID, info.SessionID, info.AcquiredAt.Format(time.RFC3339))
 		}
@@ -99,6 +113,42 @@ func (l *Lock) Acquire(sessionID string) error {
 
 	// No lock or stale lock removed - acquire it
 	return l.write(sessionID)
+}
+
+// sameSession reports whether a live lock held by another PID actually belongs
+// to OUR session, so Acquire can reclaim it instead of reporting a cross-agent
+// identity collision. The match is the recorded SessionID (the caller's
+// TMUX_PANE) plus a same-host guard. A tmux pane is unique to one live session,
+// so a matching SessionID means the holder is our own session's process — a
+// short-lived `gt prime` child of the session process, or a resumed session
+// re-priming in the same pane whose predecessor never released the lock.
+//
+// Reclaim is restricted to a genuinely-unique-per-live-session token: a tmux
+// pane id ("%<n>"), which is unique to one live pane, so a match proves the
+// holder is our own session. gt prime's descriptive fallback ("<rig>/<polecat>",
+// used when TMUX_PANE is unset) is stable across distinct processes, so
+// reclaiming on it could let a SECOND live process bypass the identity
+// collision protection the lock exists to provide — it is excluded here.
+//
+// The host guard tolerates a lock written before Hostname was recorded (empty),
+// but when a hostname is present it must match ours, and a failure to resolve
+// our own hostname fails closed (no reclaim) so a lookup error can never widen
+// reclaim across hosts.
+func sameSession(sessionID string, info *LockInfo) bool {
+	// Only a unique-per-live-session token may drive reclaim (tmux pane id).
+	if !strings.HasPrefix(sessionID, "%") {
+		return false
+	}
+	if info == nil || info.SessionID != sessionID {
+		return false
+	}
+	if info.Hostname != "" {
+		host, err := os.Hostname()
+		if err != nil || info.Hostname != host {
+			return false
+		}
+	}
+	return true
 }
 
 // Release releases the lock if we hold it.

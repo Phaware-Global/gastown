@@ -2,6 +2,7 @@ package lock
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -157,6 +158,77 @@ func TestLock_AcquireStaleLock(t *testing.T) {
 	}
 
 	l.Release()
+}
+
+// TestLock_AcquireSameSessionReclaims covers the false-collision fix: a live
+// lock held by a DIFFERENT PID but the SAME session/pane on this host must be
+// reclaimed (gt prime runs as a short-lived child of the session process that
+// holds the lock), while a different session, a different host, or an empty
+// session id must still collide.
+func TestLock_AcquireSameSessionReclaims(t *testing.T) {
+	tmpDir := t.TempDir()
+	workerDir := filepath.Join(tmpDir, "worker")
+	runtimeDir := filepath.Join(workerDir, ".runtime")
+	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(runtimeDir, "agent.lock")
+	host, _ := os.Hostname()
+	// os.Getppid() is a live process that is not us — a stand-in for the
+	// session process whose child this Acquire would be.
+	livePID := os.Getppid()
+
+	writeLock := func(pid int, session, hostname string) {
+		data, _ := json.Marshal(LockInfo{
+			PID: pid, AcquiredAt: time.Now(), SessionID: session, Hostname: hostname,
+		})
+		if err := os.WriteFile(lockPath, data, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	l := New(workerDir)
+
+	// Same session id + same host + live foreign PID → reclaim (no error).
+	writeLock(livePID, "%pane-7513", host)
+	if err := l.Acquire("%pane-7513"); err != nil {
+		t.Fatalf("Acquire() same-session reclaim error = %v, want nil", err)
+	}
+	info, err := l.Read()
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if info.PID != os.Getpid() {
+		t.Errorf("after reclaim PID = %d, want %d (ours)", info.PID, os.Getpid())
+	}
+	_ = l.Release()
+
+	// Different session id, live foreign PID → real collision.
+	writeLock(livePID, "%pane-OTHER", host)
+	if err := l.Acquire("%pane-7513"); !errors.Is(err, ErrLocked) {
+		t.Errorf("Acquire() different live session = %v, want ErrLocked", err)
+	}
+
+	// Same session id but a DIFFERENT host → do not reclaim cross-host.
+	writeLock(livePID, "%pane-7513", host+"-elsewhere")
+	if err := l.Acquire("%pane-7513"); !errors.Is(err, ErrLocked) {
+		t.Errorf("Acquire() same session different host = %v, want ErrLocked", err)
+	}
+
+	// Empty session id never reclaims, even on a match.
+	writeLock(livePID, "", host)
+	if err := l.Acquire(""); !errors.Is(err, ErrLocked) {
+		t.Errorf("Acquire() empty session id = %v, want ErrLocked", err)
+	}
+
+	// Non-pane (descriptive fallback) token must NOT reclaim even when the
+	// recorded SessionID matches — it is stable across distinct processes, so
+	// reclaiming would bypass the collision protection (a second live process
+	// of the same identity must still collide).
+	writeLock(livePID, "heartworks_ios/furiosa", host)
+	if err := l.Acquire("heartworks_ios/furiosa"); !errors.Is(err, ErrLocked) {
+		t.Errorf("Acquire() non-pane fallback token = %v, want ErrLocked", err)
+	}
 }
 
 func TestLock_Read(t *testing.T) {
