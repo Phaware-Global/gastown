@@ -91,7 +91,20 @@ func (l *Lock) Acquire(sessionID string) error {
 				// We already hold it - refresh
 				return l.write(sessionID)
 			}
-			// Another process holds it
+			// Same session reclaim: the live holder is a DIFFERENT process but
+			// the SAME session (e.g. `gt prime` runs as a short-lived child of
+			// the session process that holds the lock, or a resumed session
+			// re-primes in the same tmux pane whose predecessor never released).
+			// Without this, a child/sibling invocation in our own session
+			// false-positives an "identity collision" against itself and aborts
+			// prime, leaving the worker idle with an unreadable hook. The session
+			// id (TMUX_PANE) plus a same-host guard scopes this to genuinely-ours
+			// locks; a different pane on this host, or any lock from another host,
+			// still collides as before.
+			if sameSession(sessionID, info) {
+				return l.write(sessionID)
+			}
+			// Another process, another session - real collision.
 			return fmt.Errorf("%w: PID %d (session: %s, acquired: %s)",
 				ErrLocked, info.PID, info.SessionID, info.AcquiredAt.Format(time.RFC3339))
 		}
@@ -99,6 +112,33 @@ func (l *Lock) Acquire(sessionID string) error {
 
 	// No lock or stale lock removed - acquire it
 	return l.write(sessionID)
+}
+
+// sameSession reports whether a live lock held by another PID actually belongs
+// to OUR session, so Acquire can reclaim it instead of reporting a cross-agent
+// identity collision. The match is the recorded SessionID (the caller's
+// TMUX_PANE) plus a same-host guard. A tmux pane is unique to one live session,
+// so a matching SessionID means the holder is our own session's process — a
+// short-lived `gt prime` child of the session process, or a resumed session
+// re-priming in the same pane whose predecessor never released the lock.
+//
+// Empty session ids never match (returns false), so a caller that could not
+// determine a stable session token does not get blanket reclaim. The host
+// guard tolerates a lock written before Hostname was recorded (empty), but
+// rejects a same-id lock from a different host.
+func sameSession(sessionID string, info *LockInfo) bool {
+	if sessionID == "" || info == nil || info.SessionID == "" {
+		return false
+	}
+	if info.SessionID != sessionID {
+		return false
+	}
+	if info.Hostname != "" {
+		if host, err := os.Hostname(); err == nil && info.Hostname != host {
+			return false
+		}
+	}
+	return true
 }
 
 // Release releases the lock if we hold it.
