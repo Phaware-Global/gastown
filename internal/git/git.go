@@ -1561,126 +1561,67 @@ func (g *Git) GhPrCreate(branch, base, title, body string) (int, string, error) 
 	return number, url, nil
 }
 
-// buildRequestReviewArgv splits the given reviewers into the two trigger
-// modes GhPrRequestReview uses and returns the gh argv slices it will
-// execute (in order).
+// buildRequestReviewArgv returns the `gh pr edit --add-reviewer` argv
+// GhPrRequestReview executes to assign the given reviewers, or nil when
+// there is nothing to assign.
 //
 // Exported-for-test via unexported func + test-only access: the unit
-// test covers the reviewer classification without invoking `gh`. See
+// test covers the reviewer normalization without invoking `gh`. See
 // TestBuildRequestReviewArgv.
 //
-// Returns (commentArgv, editArgv):
-//   - commentArgv is non-nil iff "augment" (case-insensitive, after
-//     whitespace trim) is in the reviewers slice; it carries the
-//     `gh pr comment ... --body "augment review"` invocation that
-//     triggers Augment Code.
-//   - editArgv is non-nil iff at least one non-augment, non-empty
-//     reviewer remains; it carries the `gh pr edit ... --add-reviewer
-//     <csv>` invocation for humans/teams.
+// All reviewers are treated as GitHub users or @-prefixed teams and go
+// through `gh pr edit --add-reviewer`. (The in-town Reviewer role is the
+// sanctioned automated-review path — see merge_queue.reviewer_local — so
+// there is no longer any external review-bot trigger-comment magic here.)
 //
-// Either or both may be nil; if reviewers is empty (or contains only
-// whitespace entries), both are nil.
-//
-// Reviewer normalization:
-//   - Each entry is TrimSpace'd before classification. "augment ",
-//     " augment", and "\taugment\n" all route to the comment path.
-//   - Empty-after-trim entries are dropped entirely, so callers can
-//     pass a list that includes blanks (e.g. from a config field that
-//     may be unset) without producing "alice,,bob" — which `gh pr
-//     edit --add-reviewer` rejects.
-func buildRequestReviewArgv(prNumber int, reviewers []string) (commentArgv, editArgv []string) {
+// Reviewer normalization: each entry is TrimSpace'd; empty-after-trim
+// entries are dropped, so callers can pass a list that includes blanks
+// (e.g. from a config field that may be unset) without producing
+// "alice,,bob" — which `gh pr edit --add-reviewer` rejects. Duplicate
+// names (after trim) are collapsed so overlapping configs don't pass
+// "alice,alice" to gh. Returns nil when reviewers is empty or contains
+// only whitespace entries.
+func buildRequestReviewArgv(prNumber int, reviewers []string) (editArgv []string) {
 	var userReviewers []string
-	augmentRequested := false
+	seen := make(map[string]bool)
 	for _, r := range reviewers {
 		r = strings.TrimSpace(r)
-		if r == "" {
+		if r == "" || seen[r] {
 			continue
 		}
-		if strings.EqualFold(r, "augment") {
-			augmentRequested = true
-			continue
-		}
+		seen[r] = true
 		userReviewers = append(userReviewers, r)
-	}
-	if augmentRequested {
-		commentArgv = []string{"pr", "comment", fmt.Sprintf("%d", prNumber),
-			"--body", "augment review"}
 	}
 	if len(userReviewers) > 0 {
 		editArgv = []string{"pr", "edit", fmt.Sprintf("%d", prNumber),
 			"--add-reviewer", strings.Join(userReviewers, ",")}
 	}
-	return commentArgv, editArgv
+	return editArgv
 }
 
-// GhPrRequestReview requests reviews on a PR from the given users and
-// bot-style reviewers.
+// GhPrRequestReview requests reviews on a PR from the given GitHub users
+// and @-prefixed teams via `gh pr edit --add-reviewer`. A repeated
+// request for the same user is a no-op on GitHub's side. Empty/whitespace
+// reviewer entries are dropped (see buildRequestReviewArgv).
 //
-// Two trigger modes, selected per reviewer name:
-//
-//   - "augment" (case-insensitive, whitespace-trimmed) is the Augment
-//     Code review bot and is triggered by posting a PR comment whose
-//     body is the literal string "augment review". `gh pr edit
-//     --add-reviewer augment` does NOT trigger the bot — augment is a
-//     GitHub App, not a user, and --add-reviewer only accepts
-//     users/teams. This was the G12a dogfood finding on 2026-04-19.
-//
-//   - All other reviewer names are assumed to be GitHub users or
-//     @-prefixed teams and go through `gh pr edit --add-reviewer`.
-//     A repeated request for the same user is a no-op on GitHub's
-//     side.
-//
-// If the caller passes a mix (e.g. ["augment", "alice"]), augment gets
-// the comment, alice gets the reviewer-add.
-//
-// Execution order: comment-path first, then edit-path. This is
-// deliberate, though imperfect — the tradeoffs:
-//
-//   - If the comment-path fails: we return an error before touching
-//     reviewers. The caller sees the failure and can retry cleanly.
-//   - If the comment-path succeeds but the edit-path fails: we return
-//     the edit error, but the comment is already posted. The refinery
-//     formula's typical caller (`gt refinery pr request-review`) will
-//     propagate the error; a retry will re-post the augment comment
-//     and re-attempt the edit. The extra comment is cosmetic — Augment
-//     responds to each trigger and tolerates re-review — so comment
-//     duplication on retry is preferable to the inverse (edit succeeds
-//     but augment never gets triggered, leaving the review loop unable
-//     to converge). Augment-trigger is the critical path for the
-//     automated loop; reviewer-add is convenience metadata.
-//
-// Idempotency: neither path is idempotent in the sense of "never posts
-// a duplicate on retry". By design, the refinery re-calls this
-// function once per review-loop iteration to re-trigger augment after
-// the polecat pushes fixes, so posting "augment review" multiple times
-// across a PR's lifetime is the expected workflow — each call fires a
-// fresh review. Transient-retry dedup (e.g. "skip if an augment-review
-// comment was posted within the last 30s") is a possible follow-up if
-// operational retries prove noisy; not implemented here to keep the
-// function's behavior predictable.
+// Automated AI review is handled by the in-town Reviewer role
+// (merge_queue.reviewer_local), not by an external review-bot trigger
+// comment, so this function no longer special-cases any vendor bot.
 func (g *Git) GhPrRequestReview(prNumber int, reviewers []string) error {
 	if len(reviewers) == 0 {
 		return nil
 	}
 
-	commentArgv, editArgv := buildRequestReviewArgv(prNumber, reviewers)
-
-	if commentArgv != nil {
-		commentCmd := exec.Command("gh", commentArgv...)
-		commentCmd.Dir = g.workDir
-		if out, err := commentCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("gh pr comment (augment review trigger) failed: %s: %w",
-				strings.TrimSpace(string(out)), err)
-		}
+	editArgv := buildRequestReviewArgv(prNumber, reviewers)
+	if editArgv == nil {
+		return nil
 	}
 
-	if editArgv != nil {
-		cmd := exec.Command("gh", editArgv...)
-		cmd.Dir = g.workDir
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("gh pr edit --add-reviewer failed: %s: %w",
-				strings.TrimSpace(string(out)), err)
-		}
+	cmd := exec.Command("gh", editArgv...)
+	cmd.Dir = g.workDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("gh pr edit --add-reviewer failed: %s: %w",
+			strings.TrimSpace(string(out)), err)
 	}
 
 	return nil
@@ -1702,7 +1643,7 @@ type GhReviewThread struct {
 // Uses `gh api graphql` because the REST API doesn't expose thread resolution,
 // and paginates so the full thread set is returned rather than the first 100.
 // Each thread's Body/Path/Line/Author/URL reflect the *first* comment on that
-// thread (consistent with how gemini/augment post their top-level remarks).
+// thread (consistent with how review bots post their top-level remarks).
 func (g *Git) GhPrReviewThreads(prNumber int) ([]GhReviewThread, error) {
 	owner, repo, err := g.ghRepoOwnerName()
 	if err != nil {
@@ -1960,10 +1901,11 @@ func (g *Git) ghFetchReviews(prNumber int) ([]ghReview, error) {
 }
 
 // GhPrComment posts a body as a new top-level comment on the PR.
-// Used by the refinery's await-review step to post the reviewer-bot
-// trigger comment (e.g. "augment review") independently of the
-// reviewer-assignment path in GhPrRequestReview. Unlike that function,
-// this one does nothing but post — no classification, no edits.
+// Used by the refinery's await-review step to post an optional
+// reviewer-bot trigger comment (configured via merge_queue.pr_trigger_comment,
+// e.g. "/gemini review") independently of the reviewer-assignment path in
+// GhPrRequestReview. Unlike that function, this one does nothing but post —
+// no classification, no edits.
 func (g *Git) GhPrComment(prNumber int, body string) error {
 	if body == "" {
 		return fmt.Errorf("gh pr comment: body must be non-empty")

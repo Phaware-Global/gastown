@@ -9,6 +9,20 @@
 Draft — implementation not started. Supersedes the ad-hoc overlay that lives
 in `jira_claude_channel`.
 
+> **Historical note (augment review loop deprecated).** This document predates
+> the in-town Reviewer role and describes an automated review loop driven by the
+> external **Augment Code** bot — woken by posting an `augment review` PR comment
+> and recognized by the `augmentcode` GitHub login. That mechanism has been
+> **removed**: automated AI review is now produced by the rig-level Reviewer role
+> (`merge_queue.reviewer_local`), which posts a real GitHub review under its own
+> identity and needs **no** trigger comment. `DefaultPRTriggerComment` is now
+> empty and the augment-specific `gh pr comment` trigger machinery in
+> `internal/git/git.go` is gone; `pr_trigger_comment` remains as an opt-in for
+> rigs that still route review to an external bot (e.g. `"/gemini review"`).
+> See [reviewer-role.md](reviewer-role.md) for the current design. The
+> augment-specific sections below (notably the G12 findings) are retained as
+> historical context only.
+
 ## Motivation
 
 Gastown ships with `merge_strategy=pr` plumbing in the Go layer

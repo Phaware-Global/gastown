@@ -209,7 +209,8 @@ func init() {
 	refineryPrAwaitReviewCmd.Flags().StringVar(&refPrAwaitReviewer, "reviewer", "",
 		"GitHub user whose review must land (defaults to rig merge_queue.pr_reviewer)")
 	refineryPrAwaitReviewCmd.Flags().StringVar(&refPrAwaitTriggerComment, "trigger-comment", "",
-		"body to post as the review trigger (defaults to rig merge_queue.pr_trigger_comment or \"augment review\")")
+		"body to post as the external-bot review trigger (defaults to rig merge_queue.pr_trigger_comment; "+
+			"empty/unset posts nothing — the in-town Reviewer needs no trigger comment)")
 	refineryPrAwaitReviewCmd.Flags().DurationVar(&refPrAwaitWait, "wait", 0,
 		"min wait between trigger and first check (defaults to rig merge_queue.pr_review_wait or 5m)")
 	refineryPrAwaitReviewCmd.Flags().DurationVar(&refPrAwaitTimeout, "timeout", 0,
@@ -718,7 +719,7 @@ func awaitReviewInner(args []string) error {
 	// always has the live HEAD. Tolerate ErrUnsupported (Bitbucket) by
 	// passing an empty SHA, which retains the legacy "any review counts"
 	// semantics; refinery-pr-workflow.md §G37 marks SHA-scoping as
-	// load-bearing only for the GitHub path that augment runs on.
+	// load-bearing only for the GitHub path the reviewer runs on.
 	headSHA, sErr := provider.CurrentHeadSHA(prNumber)
 	if sErr != nil && !errors.Is(sErr, refinery.ErrUnsupported) {
 		return fmt.Errorf("await-review: fetching current head SHA: %w", sErr)

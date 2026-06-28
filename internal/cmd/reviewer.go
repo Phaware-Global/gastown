@@ -47,7 +47,7 @@ var (
 var reviewerCmd = &cobra.Command{
 	Use:     "reviewer",
 	GroupID: GroupAgents,
-	Short:   "Rig-level on-demand code reviewer (replaces Augment)",
+	Short:   "Rig-level on-demand code reviewer (in-town replacement for external review bots)",
 	Long: `Manage the rig-level Reviewer role.
 
 The Reviewer performs AI code review on pull requests, dispatched by the

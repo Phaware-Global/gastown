@@ -1404,12 +1404,14 @@ type MergeQueueConfig struct {
 	// Kept for one release for backward compatibility.
 	RequireReview *bool `json:"require_review,omitempty"`
 
-	// PRReviewer is the GitHub *login* of the reviewer bot (e.g., "augmentcode",
-	// "gemini-code-assist", "Copilot"). The await-review gate looks up reviews
+	// PRReviewer is the GitHub *login* of the reviewer (e.g., the in-town
+	// Reviewer's machine-user login, or an external bot like
+	// "gemini-code-assist" / "Copilot"). The await-review gate looks up reviews
 	// by case-insensitive login match (no abbreviation, no aliasing — the
-	// match is exact-string on the login field), so this MUST be the bot's
-	// actual GitHub username, not the trigger keyword. The trigger phrase
-	// posted on the PR (e.g., "augment review", "/gemini review") is
+	// match is exact-string on the login field), so this MUST be the reviewer's
+	// actual GitHub username, not a trigger keyword. When ReviewerLocal is set,
+	// the in-town Reviewer produces the review and no trigger comment is posted;
+	// otherwise an optional trigger phrase (e.g., "/gemini review") is
 	// configured separately via PRTriggerComment. Empty means no automated
 	// review is requested and the review loop is skipped entirely — the flow
 	// proceeds directly to the human-approval gate. Only meaningful when

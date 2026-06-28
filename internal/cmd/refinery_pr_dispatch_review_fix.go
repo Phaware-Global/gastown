@@ -681,7 +681,7 @@ func buildReviewFixMission(prNumber int, threadsJSON, reviewer string) string {
 		b.WriteString("the configured pr_reviewer")
 	}
 	b.WriteString(" against the new HEAD.\n\n")
-	b.WriteString("Author-agnostic: address every thread regardless of opener (gemini, augment, human — all count). Do not filter, do not paraphrase the JSON below into your own list.\n\n")
+	b.WriteString("Author-agnostic: address every thread regardless of opener (the in-town Reviewer, gemini, a human, any bot — all count). Do not filter, do not paraphrase the JSON below into your own list.\n\n")
 	b.WriteString("THREADS (unresolved, fresh poll at dispatch time):\n")
 	b.WriteString(threadsJSON)
 	return b.String()

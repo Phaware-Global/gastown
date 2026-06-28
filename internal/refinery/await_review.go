@@ -11,9 +11,14 @@ import (
 // Default durations for AwaitReview. Seeded into DefaultMergeQueueConfig
 // so LoadConfig'd rigs pick them up automatically.
 const (
-	DefaultPRReviewWait     = 5 * time.Minute
-	DefaultPRReviewTimeout  = 30 * time.Minute
-	DefaultPRTriggerComment = "augment review"
+	DefaultPRReviewWait    = 5 * time.Minute
+	DefaultPRReviewTimeout = 30 * time.Minute
+	// DefaultPRTriggerComment is empty by default: the in-town Reviewer
+	// (merge_queue.reviewer_local) is the sanctioned review path, so no
+	// external review-bot trigger comment is posted out of the box. A rig
+	// that still wants to wake an external bot must opt in explicitly via
+	// merge_queue.pr_trigger_comment (e.g. "/gemini review").
+	DefaultPRTriggerComment = ""
 )
 
 // AwaitReviewStatus is the outcome of one AwaitReviewStep call.
@@ -353,8 +358,8 @@ func AwaitReviewStep(provider PRProvider, prNumber int, in AwaitReviewStepInput)
 	if elapsed >= in.Timeout {
 		// Enrich the timeout message with the unique review-authors actually
 		// observed on the PR. The classic failure mode is a misconfigured
-		// pr_reviewer (e.g. set to the trigger keyword "augment" instead of
-		// the bot's actual login "augmentcode") — surfacing the observed
+		// pr_reviewer (e.g. set to a trigger keyword instead of the
+		// reviewer's actual GitHub login) — surfacing the observed
 		// authors makes the cause self-evident on first timeout rather than
 		// after a 30-minute cycle. ErrUnsupported (Bitbucket) and any other
 		// provider error fall back to the bare message; the diagnostic is a
