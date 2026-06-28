@@ -154,12 +154,16 @@ Do NOT send an acknowledgment/reply (no daemon mail-acks — that just creates
 churn) and do NOT treat the report as actionable work. But DO check the outcome
 cheaply before archiving, so a failure isn't silently buried:
 ```bash
-# Read the short report only to inspect its Status line, then archive.
+# Read the short report only to inspect its Status line. Escalate BEFORE
+# archiving so a non-COMPLETE report can't be buried, then archive.
 status=$(gt mail read <id> | sed -n 's/^Status:[[:space:]]*//p' | head -1)
+if [ "$status" != "COMPLETE" ]; then
+  gt escalate -s HIGH "DOG_DONE not COMPLETE (status='${status:-missing}') — see <message-id>"
+fi
 gt mail archive <message-id>
 ```
-If `status` is anything other than `COMPLETE` (FAILED, ERROR, empty, etc.),
-escalate the failure; otherwise you're done — dogs return to idle automatically.
+Dogs return to idle automatically; once any non-COMPLETE status has been
+escalated above, you're done — do NOT send an ack reply.
 
 **CONVOY_NEEDS_FEEDING messages** (from Refinery):
 The daemon's ConvoyManager handles convoy feeding (event-driven + 30s periodic scan).
@@ -820,11 +824,12 @@ one. Do NOT "consider spawning" by judgment — follow this exactly:
 
 ```bash
 # 1. Read current pool state from the kennel (flat array of {name,state,...}).
-#    Default to [] if the command fails or returns empty, and use jq's `?`
-#    so a non-array/null value can't crash the patrol with a parse error.
-pool=$(gt dog list --json)
-total=$(jq '. | length' <<<"${pool:-[]}")
-idle=$(jq '[.[]? | select(.state=="idle")] | length' <<<"${pool:-[]}")
+#    Validate that stdout is actually JSON — fall back to [] on any non-JSON
+#    payload (errors, warnings) so jq can't fail and leave the counts empty.
+pool=$(gt dog list --json 2>/dev/null)
+jq -e . >/dev/null 2>&1 <<<"$pool" || pool='[]'
+total=$(jq '. | length' <<<"$pool"); total=${total:-0}
+idle=$(jq '[.[]? | select(.state=="idle")] | length' <<<"$pool"); idle=${idle:-0}
 
 # 2. Spawn ONLY if: idle == 0 AND total < 4. Otherwise spawn nothing this cycle.
 if [ "$idle" -eq 0 ] && [ "$total" -lt 4 ]; then
