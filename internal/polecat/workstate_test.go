@@ -51,7 +51,7 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			// tracked polecat is spawned instead.
 			name: "missing agent bead is not reusable even when clean",
 			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "main", AgentBeadMissing: true},
-			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "agent-bead-missing", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "agent-bead-missing", NeedsRecovery: true, CountsTowardCapacity: false, ReuseStatus: "idle-recovery-needed"},
 		},
 	}
 

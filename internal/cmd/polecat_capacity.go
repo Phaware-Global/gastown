@@ -239,17 +239,29 @@ func listPolecatDirectoryNames(rigPath string) ([]string, error) {
 
 func applyAgentFieldsToCapacitySnapshot(snapshot *polecatCapacitySnapshot, rigName, polecatName string, fields *beads.AgentFields, tmuxClient *tmux.Tmux) {
 	running := false
+	sessionCheckFailed := false
 	if tmuxClient != nil {
-		running, _ = tmuxClient.HasSession(session.PolecatSessionName(session.PrefixFor(rigName), polecatName))
+		var err error
+		running, err = tmuxClient.HasSession(session.PolecatSessionName(session.PrefixFor(rigName), polecatName))
+		if err != nil {
+			sessionCheckFailed = true
+		}
 	}
 	if fields == nil {
-		if running {
+		switch {
+		case running:
 			// A live session with no agent bead still consumes a real slot —
 			// count it as working (conservative).
 			snapshot.Working++
-		} else {
-			// No agent bead AND no session: a ghost directory. It is not a live
-			// polecat, so it must not occupy a recovery slot (that would falsely
+		case sessionCheckFailed:
+			// We could not confirm the session is dead (tmux query error). Treat it
+			// conservatively as an occupant (recovery) rather than reapable, so a
+			// transient tmux failure can't over-report free capacity by dropping a
+			// real polecat to Stale.
+			snapshot.RecoveryBlocked++
+		default:
+			// No agent bead AND confirmed no session: a ghost directory. It is not a
+			// live polecat, so it must not occupy a recovery slot (that would falsely
 			// exhaust capacity and block dispatch). Count as reapable stale.
 			snapshot.Stale++
 		}
