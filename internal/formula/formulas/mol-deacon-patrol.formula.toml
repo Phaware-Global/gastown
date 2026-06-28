@@ -156,7 +156,7 @@ cheaply before archiving, so a failure isn't silently buried:
 ```bash
 # Read the short report only to inspect its Status line. Escalate BEFORE
 # archiving so a non-COMPLETE report can't be buried, then archive.
-status=$(gt mail read <id> | sed -n 's/^Status:[[:space:]]*//p' | head -1)
+status=$(gt mail read <message-id> | sed -n 's/^Status:[[:space:]]*//p' | head -1)
 if [ "$status" != "COMPLETE" ]; then
   gt escalate -s HIGH "DOG_DONE not COMPLETE (status='${status:-missing}') — see <message-id>"
 fi
@@ -824,22 +824,28 @@ one. Do NOT "consider spawning" by judgment — follow this exactly:
 
 ```bash
 # 1. Read current pool state from the kennel (flat array of {name,state,...}).
-#    Validate that stdout is actually JSON — fall back to [] on any non-JSON
-#    payload (errors, warnings) so jq can't fail and leave the counts empty.
 pool=$(gt dog list --json 2>/dev/null)
-jq -e . >/dev/null 2>&1 <<<"$pool" || pool='[]'
-total=$(jq '. | length' <<<"$pool"); total=${total:-0}
-idle=$(jq '[.[]? | select(.state=="idle")] | length' <<<"$pool"); idle=${idle:-0}
 
-# 2. Spawn ONLY if: idle == 0 AND total < 4. Otherwise spawn nothing this cycle.
-if [ "$idle" -eq 0 ] && [ "$total" -lt 4 ]; then
-  # 3. Pick the FIRST canonical name not already in the pool.
-  #    NEVER re-add a name that already exists — that creates duplicate dogs
-  #    (the alpha/bravo/delta duplication seen under runaway patrols).
-  existing=$(jq -r '.[]?.name' <<<"${pool:-[]}" | sort -u)
-  for n in alpha bravo charlie delta echo foxtrot; do
-    if ! grep -qxF "$n" <<<"$existing"; then gt dog add "$n"; break; fi
-  done
+# 2. If the kennel state is unreadable (non-JSON output, command failure), do
+#    NOT spawn this cycle. Treating "can't read" as "empty" would spawn blindly
+#    with no view of existing names — exactly the duplicate-dog failure mode we
+#    are preventing. Fail safe: skip spawn, leave a note, move on.
+if ! jq -e . >/dev/null 2>&1 <<<"$pool"; then
+  echo "dog-pool: kennel state unreadable; skipping spawn this cycle (fail-safe)"
+else
+  total=$(jq '. | length' <<<"$pool")
+  idle=$(jq '[.[]? | select(.state=="idle")] | length' <<<"$pool")
+
+  # 3. Spawn ONLY if: idle == 0 AND total < 4. Otherwise spawn nothing.
+  if [ "$idle" -eq 0 ] && [ "$total" -lt 4 ]; then
+    # 4. Pick the FIRST canonical name not already in the pool.
+    #    NEVER re-add a name that already exists — that creates duplicate dogs
+    #    (the alpha/bravo/delta duplication seen under runaway patrols).
+    existing=$(jq -r '.[]?.name' <<<"$pool" | sort -u)
+    for n in alpha bravo charlie delta echo foxtrot; do
+      if ! grep -qxF "$n" <<<"$existing"; then gt dog add "$n"; break; fi
+    done
+  fi
 fi
 ```
 
