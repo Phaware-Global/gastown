@@ -220,6 +220,15 @@ func TestLock_AcquireSameSessionReclaims(t *testing.T) {
 	if err := l.Acquire(""); !errors.Is(err, ErrLocked) {
 		t.Errorf("Acquire() empty session id = %v, want ErrLocked", err)
 	}
+
+	// Non-pane (descriptive fallback) token must NOT reclaim even when the
+	// recorded SessionID matches — it is stable across distinct processes, so
+	// reclaiming would bypass the collision protection (a second live process
+	// of the same identity must still collide).
+	writeLock(livePID, "heartworks_ios/furiosa", host)
+	if err := l.Acquire("heartworks_ios/furiosa"); !errors.Is(err, ErrLocked) {
+		t.Errorf("Acquire() non-pane fallback token = %v, want ErrLocked", err)
+	}
 }
 
 func TestLock_Read(t *testing.T) {

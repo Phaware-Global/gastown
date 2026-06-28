@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -122,19 +123,28 @@ func (l *Lock) Acquire(sessionID string) error {
 // short-lived `gt prime` child of the session process, or a resumed session
 // re-priming in the same pane whose predecessor never released the lock.
 //
-// Empty session ids never match (returns false), so a caller that could not
-// determine a stable session token does not get blanket reclaim. The host
-// guard tolerates a lock written before Hostname was recorded (empty), but
-// rejects a same-id lock from a different host.
+// Reclaim is restricted to a genuinely-unique-per-live-session token: a tmux
+// pane id ("%<n>"), which is unique to one live pane, so a match proves the
+// holder is our own session. gt prime's descriptive fallback ("<rig>/<polecat>",
+// used when TMUX_PANE is unset) is stable across distinct processes, so
+// reclaiming on it could let a SECOND live process bypass the identity
+// collision protection the lock exists to provide — it is excluded here.
+//
+// The host guard tolerates a lock written before Hostname was recorded (empty),
+// but when a hostname is present it must match ours, and a failure to resolve
+// our own hostname fails closed (no reclaim) so a lookup error can never widen
+// reclaim across hosts.
 func sameSession(sessionID string, info *LockInfo) bool {
-	if sessionID == "" || info == nil || info.SessionID == "" {
+	// Only a unique-per-live-session token may drive reclaim (tmux pane id).
+	if !strings.HasPrefix(sessionID, "%") {
 		return false
 	}
-	if info.SessionID != sessionID {
+	if info == nil || info.SessionID != sessionID {
 		return false
 	}
 	if info.Hostname != "" {
-		if host, err := os.Hostname(); err == nil && info.Hostname != host {
+		host, err := os.Hostname()
+		if err != nil || info.Hostname != host {
 			return false
 		}
 	}
