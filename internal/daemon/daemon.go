@@ -2315,11 +2315,17 @@ func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 	issue, showErr := bd.Show(rigBeadID)
 	operational, reason, warn := classifyRigBeadStatus(issue, showErr)
 	if warn {
-		// A genuine query/connectivity error (Dolt down, network issue, etc.).
-		// Log it to help debug transient Dolt issues; the fail-safe below keeps
-		// the rig non-operational so we don't start witnesses for a possibly
-		// docked rig during an outage.
-		d.logger.Printf("Warning: failed to check rig bead %s for docked/parked status: %v (assuming not operational)", rigBeadID, showErr)
+		// A genuine query/connectivity error (Dolt down, network issue, etc.) or
+		// the defensive nil-bead case. Log it to help debug transient Dolt
+		// issues; the fail-safe below keeps the rig non-operational so we don't
+		// start witnesses for a possibly docked rig during an outage. showErr is
+		// nil in the nil-bead case, so fall back to the reason to avoid a
+		// misleading "<nil>" line.
+		cause := reason
+		if showErr != nil {
+			cause = showErr.Error()
+		}
+		d.logger.Printf("Warning: failed to check rig bead %s for docked/parked status: %s (assuming not operational)", rigBeadID, cause)
 	}
 	if !operational {
 		return false, reason
