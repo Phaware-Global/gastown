@@ -2306,22 +2306,17 @@ func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 	rigBeadID := fmt.Sprintf("%s-rig-%s", prefix, rigName)
 	rigBeadsDir := beads.ResolveBeadsDir(rigPath)
 	bd := beads.NewWithBeadsDir(rigPath, rigBeadsDir)
-	if issue, err := bd.Show(rigBeadID); err == nil {
-		for _, label := range issue.Labels {
-			if label == "status:docked" {
-				return false, "rig is docked (global)"
-			}
-			if label == "status:parked" {
-				return false, "rig is parked (global)"
-			}
-		}
-	} else {
-		// Log when rig bead lookup fails - this helps debug transient Dolt issues
-		// FAIL-SAFE: When we can't verify docked status (Dolt down, network issue, etc.),
-		// assume the rig is NOT operational. This prevents wasting API credits starting
-		// witnesses that might be docked. Better to delay work than burn credits unnecessarily.
-		d.logger.Printf("Warning: failed to check rig bead %s for docked/parked status: %v (assuming not operational)", rigBeadID, err)
-		return false, "cannot verify rig status (Dolt unavailable)"
+	issue, showErr := bd.Show(rigBeadID)
+	operational, reason, warn := classifyRigBeadStatus(issue, showErr)
+	if warn {
+		// A genuine query/connectivity error (Dolt down, network issue, etc.).
+		// Log it to help debug transient Dolt issues; the fail-safe below keeps
+		// the rig non-operational so we don't start witnesses for a possibly
+		// docked rig during an outage.
+		d.logger.Printf("Warning: failed to check rig bead %s for docked/parked status: %v (assuming not operational)", rigBeadID, showErr)
+	}
+	if !operational {
+		return false, reason
 	}
 
 	// Check auto_restart config
@@ -2340,6 +2335,43 @@ func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 	}
 
 	return true, ""
+}
+
+// classifyRigBeadStatus interprets a rig-bead lookup result for operational
+// gating, separating the three distinct outcomes the previous code conflated:
+//
+//   - err == nil: inspect the bead's labels. status:docked / status:parked →
+//     not operational. Otherwise operational (caller continues to other gates).
+//   - errors.Is(err, beads.ErrNotFound): the rig bead genuinely does not exist,
+//     which means the rig was never docked (gt rig dock creates/labels it). This
+//     is NOT a Dolt outage, so the rig is operational and we do NOT warn — a
+//     missing bead is a one-time `gt doctor --fix` repair, not a recurring
+//     "cannot verify" condition. Without this branch a rig missing its bead was
+//     wrongly gated non-operational and logged a warning every heartbeat
+//     (observed: 54k+ `failed to check rig bead gt-rig-gastown` lines).
+//   - any other err: a real query/connectivity failure (Dolt down, etc.). We
+//     cannot verify docked status, so fail-safe to non-operational AND warn,
+//     preserving the original guard against starting witnesses for a rig that
+//     might be docked during an outage.
+//
+// Returns (operational, reason, warn); reason is non-empty only when
+// !operational, and warn is true only for the genuine-error case.
+func classifyRigBeadStatus(issue *beads.Issue, err error) (operational bool, reason string, warn bool) {
+	if err == nil {
+		for _, label := range issue.Labels {
+			if label == "status:docked" {
+				return false, "rig is docked (global)", false
+			}
+			if label == "status:parked" {
+				return false, "rig is parked (global)", false
+			}
+		}
+		return true, "", false
+	}
+	if errors.Is(err, beads.ErrNotFound) {
+		return true, "", false
+	}
+	return false, "cannot verify rig status (Dolt unavailable)", true
 }
 
 // processLifecycleRequests checks for and processes lifecycle requests.

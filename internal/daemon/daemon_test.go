@@ -3,6 +3,8 @@ package daemon
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -729,6 +732,43 @@ func TestHasPendingEvents_IgnoresNonEventFiles(t *testing.T) {
 
 	if d.hasPendingEvents("refinery") {
 		t.Error("expected false when only non-.event files exist")
+	}
+}
+
+// TestClassifyRigBeadStatus pins the three-way interpretation of a rig-bead
+// lookup: a missing bead (ErrNotFound) is operational and silent (the rig was
+// never docked), a real lookup error is non-operational and warns (fail-safe
+// for Dolt outages), and a found bead is gated on its docked/parked labels.
+func TestClassifyRigBeadStatus(t *testing.T) {
+	tests := []struct {
+		name            string
+		issue           *beads.Issue
+		err             error
+		wantOp          bool
+		wantWarn        bool
+		wantReasonEmpty bool
+	}{
+		{"not found is operational + silent", nil, beads.ErrNotFound, true, false, true},
+		{"wrapped not found is operational + silent", nil, fmt.Errorf("show: %w", beads.ErrNotFound), true, false, true},
+		{"real error fails safe + warns", nil, errors.New("dolt connection refused"), false, true, false},
+		{"docked label not operational + silent", &beads.Issue{Labels: []string{"status:docked"}}, nil, false, false, false},
+		{"parked label not operational + silent", &beads.Issue{Labels: []string{"status:parked"}}, nil, false, false, false},
+		{"found without status label is operational", &beads.Issue{Labels: []string{"gt:rig"}}, nil, true, false, true},
+		{"found with no labels is operational", &beads.Issue{}, nil, true, false, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			op, reason, warn := classifyRigBeadStatus(tc.issue, tc.err)
+			if op != tc.wantOp {
+				t.Errorf("operational = %v, want %v", op, tc.wantOp)
+			}
+			if warn != tc.wantWarn {
+				t.Errorf("warn = %v, want %v", warn, tc.wantWarn)
+			}
+			if (reason == "") != tc.wantReasonEmpty {
+				t.Errorf("reason = %q, wantEmpty = %v", reason, tc.wantReasonEmpty)
+			}
+		})
 	}
 }
 
