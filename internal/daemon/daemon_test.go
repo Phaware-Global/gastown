@@ -751,6 +751,7 @@ func TestClassifyRigBeadStatus(t *testing.T) {
 		{"not found is operational + silent", nil, beads.ErrNotFound, true, false, true},
 		{"wrapped not found is operational + silent", nil, fmt.Errorf("show: %w", beads.ErrNotFound), true, false, true},
 		{"real error fails safe + warns", nil, errors.New("dolt connection refused"), false, true, false},
+		{"nil issue with nil error fails safe + warns", nil, nil, false, true, false},
 		{"docked label not operational + silent", &beads.Issue{Labels: []string{"status:docked"}}, nil, false, false, false},
 		{"parked label not operational + silent", &beads.Issue{Labels: []string{"status:parked"}}, nil, false, false, false},
 		{"found without status label is operational", &beads.Issue{Labels: []string{"gt:rig"}}, nil, true, false, true},

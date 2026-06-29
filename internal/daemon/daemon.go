@@ -2302,6 +2302,12 @@ func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 		// Fall back to registry (mayor/rigs.json) when config.json is missing
 		prefix = agentconfig.GetRigPrefix(d.config.TownRoot, rigName)
 	}
+	// Normalize a trailing hyphen: rig config.json may carry "gt-" while
+	// RigBeadIDWithPrefix expects the bare prefix. Without this the bead ID
+	// would be malformed ("gt--rig-gastown"), miss the real bead, and — now
+	// that ErrNotFound is treated as operational — silently mask a docked rig.
+	// (agentconfig.GetRigPrefix already trims; this covers the config.json path.)
+	prefix = strings.TrimSuffix(prefix, "-")
 
 	rigBeadID := fmt.Sprintf("%s-rig-%s", prefix, rigName)
 	rigBeadsDir := beads.ResolveBeadsDir(rigPath)
@@ -2358,6 +2364,11 @@ func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 // !operational, and warn is true only for the genuine-error case.
 func classifyRigBeadStatus(issue *beads.Issue, err error) (operational bool, reason string, warn bool) {
 	if err == nil {
+		if issue == nil {
+			// Unexpected (a nil-error lookup should yield a bead). Fail safe and
+			// warn rather than nil-deref on issue.Labels.
+			return false, "cannot verify rig status (invalid rig bead)", true
+		}
 		for _, label := range issue.Labels {
 			if label == "status:docked" {
 				return false, "rig is docked (global)", false
