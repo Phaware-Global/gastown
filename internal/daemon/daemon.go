@@ -2352,8 +2352,12 @@ func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 // classifyRigBeadStatus interprets a rig-bead lookup result for operational
 // gating, separating the three distinct outcomes the previous code conflated:
 //
-//   - err == nil: inspect the bead's labels. status:docked / status:parked →
-//     not operational. Otherwise operational (caller continues to other gates).
+//   - err == nil, issue == nil: an unexpected/invalid result (a nil-error
+//     lookup should yield a bead). Fail-safe to non-operational AND warn,
+//     rather than nil-deref on issue.Labels.
+//   - err == nil with a bead: inspect the bead's labels. status:docked /
+//     status:parked → not operational. Otherwise operational (caller continues
+//     to other gates).
 //   - errors.Is(err, beads.ErrNotFound): the rig bead genuinely does not exist,
 //     which means the rig was never docked (gt rig dock creates/labels it). This
 //     is NOT a Dolt outage, so the rig is operational and we do NOT warn — a
@@ -2367,7 +2371,8 @@ func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 //     might be docked during an outage.
 //
 // Returns (operational, reason, warn); reason is non-empty only when
-// !operational, and warn is true only for the genuine-error case.
+// !operational, and warn is true for the two fail-safe cases (a genuine lookup
+// error and the defensive nil-bead case), never for a missing or found bead.
 func classifyRigBeadStatus(issue *beads.Issue, err error) (operational bool, reason string, warn bool) {
 	if err == nil {
 		if issue == nil {
