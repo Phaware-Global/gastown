@@ -2410,6 +2410,15 @@ func (d *Daemon) processLifecycleRequests() {
 func (d *Daemon) shutdown(state *State) error { //nolint:unparam // error return kept for future use
 	d.logger.Println("Daemon shutting down")
 
+	// Cancel the daemon context first: the signal-driven shutdown path never
+	// goes through Stop(), and background work parented on d.ctx (e.g. the
+	// offsite backup rsync) must not outlive the daemon — an orphaned
+	// `rsync --delete` would race the restarted daemon's next offsite sync
+	// against the same destination. Idempotent when shutdown was reached via
+	// Stop()/ctx.Done(). Shutdown steps below that must still run use their
+	// own Background-parented contexts (e.g. pushDoltRemotes).
+	d.cancel()
+
 	// Stop feed curator
 	if d.curator != nil {
 		d.curator.Stop()
