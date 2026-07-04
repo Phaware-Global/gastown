@@ -259,6 +259,9 @@ func TestWorkflowStepTarget(t *testing.T) {
 		{name: "explicit rig", step: formula.Step{Target: "rig"}, want: "gastown"},
 		{name: "mayor", step: formula.Step{Target: "mayor"}, want: "mayor"},
 		{name: "crew path", step: formula.Step{Target: "gastown/crew/alex"}, want: "gastown/crew/alex"},
+		{name: "refinery role", step: formula.Step{Target: "refinery"}, want: "gastown/refinery"},
+		{name: "witness role", step: formula.Step{Target: "witness"}, want: "gastown/witness"},
+		{name: "qualified role", step: formula.Step{Target: "gastown/refinery"}, want: "gastown/refinery"},
 	}
 
 	for _, tt := range tests {
@@ -294,6 +297,8 @@ func TestWorkflowStepTargetFromDescription(t *testing.T) {
 		{name: "mayor", description: "workflow_target: mayor\n\nBody", want: "mayor"},
 		{name: "rig alias", description: "workflow_target: rig\n\nBody", want: "gastown"},
 		{name: "path target", description: "workflow_target: gastown/crew/alex\n\nBody", want: "gastown/crew/alex"},
+		{name: "refinery role", description: "workflow_target: refinery\n\nBody", want: "gastown/refinery"},
+		{name: "witness role", description: "workflow_target: witness\n\nBody", want: "gastown/witness"},
 	}
 
 	for _, tt := range tests {
@@ -301,6 +306,34 @@ func TestWorkflowStepTargetFromDescription(t *testing.T) {
 			t.Parallel()
 			if got := workflowStepTargetFromDescription(tt.description, "gastown"); got != tt.want {
 				t.Fatalf("workflowStepTargetFromDescription() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsRoleWorkflowStepBead(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		beadID      string
+		description string
+		want        bool
+	}{
+		{name: "refinery step", beadID: "hi-wfs-abc12", description: "workflow_target: refinery\n\nScan merge queue", want: true},
+		{name: "witness step", beadID: "hi-wfs-abc12", description: "workflow_target: witness\n\nSurvey workers", want: true},
+		{name: "qualified refinery step", beadID: "hi-wfs-abc12", description: "workflow_target: gastown/refinery\n\nBody", want: true},
+		{name: "pool step no target", beadID: "hi-wfs-abc12", description: "Implement the feature", want: false},
+		{name: "pool step rig target", beadID: "hi-wfs-abc12", description: "workflow_target: rig\n\nBody", want: false},
+		{name: "non-step bead with role target", beadID: "hi-abc12", description: "workflow_target: refinery\n\nBody", want: false},
+		{name: "target after attachment metadata", beadID: "hi-wfs-abc12", description: "attached_formula: mol-polecat-work\nworkflow_target: refinery\n\nBody", want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isRoleWorkflowStepBead(tt.beadID, tt.description); got != tt.want {
+				t.Fatalf("isRoleWorkflowStepBead(%q) = %v, want %v", tt.beadID, got, tt.want)
 			}
 		})
 	}

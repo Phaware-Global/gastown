@@ -151,13 +151,23 @@ func workflowStepTargetFromDescription(description, targetRig string) string {
 		if !strings.EqualFold(strings.TrimSpace(key), workflowTargetField) {
 			continue
 		}
-		target := strings.TrimSpace(value)
-		if target == "" || target == "rig" {
-			return targetRig
-		}
-		return target
+		return resolveWorkflowTarget(strings.TrimSpace(value), targetRig)
 	}
 	return ""
+}
+
+// isRoleWorkflowStepBead reports whether a bead is a workflow formula step
+// (*-wfs-*) whose declared workflow_target routes it to a role agent
+// (refinery/witness) rather than the polecat pool. Such steps are executed by
+// the role that owns the workflow; handing them to a polecat with a generic
+// code-work formula churns spawn/decline/escalate cycles (gt-ors).
+func isRoleWorkflowStepBead(beadID, description string) bool {
+	if !strings.Contains(beadID, "-wfs-") {
+		return false
+	}
+	target := strings.ToLower(workflowStepTargetFromDescription(description, ""))
+	return target == "refinery" || target == "witness" ||
+		strings.HasSuffix(target, "/refinery") || strings.HasSuffix(target, "/witness")
 }
 
 // isOrphanMolecule reports whether a bead's existing attached molecule(s)

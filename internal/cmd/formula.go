@@ -929,9 +929,23 @@ func workflowStepDescription(step formula.Step, description string) string {
 }
 
 func workflowStepTarget(step formula.Step, targetRig string) string {
-	target := strings.TrimSpace(step.Target)
+	return resolveWorkflowTarget(strings.TrimSpace(step.Target), targetRig)
+}
+
+// resolveWorkflowTarget maps a workflow step's declared target to a sling
+// target. Empty and "rig" mean the target rig's polecat pool. Bare role names
+// ("refinery", "witness") resolve to the target rig's role agent so
+// role-internal steps (e.g. mol-refinery-patrol's merge-queue chain) are never
+// handed to the polecat pool with a generic code-work formula (gt-ors).
+func resolveWorkflowTarget(target, targetRig string) string {
 	if target == "" || target == "rig" {
 		return targetRig
+	}
+	if role := strings.ToLower(target); role == "refinery" || role == "witness" {
+		if targetRig == "" {
+			return role
+		}
+		return targetRig + "/" + role
 	}
 	return target
 }

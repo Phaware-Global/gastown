@@ -247,37 +247,88 @@ func TestPatrolFormulasHaveWispGC(t *testing.T) {
 	}
 }
 
-// TestDeaconPatrolDoesNotRunAgeBasedWispGC verifies that the Deacon patrol
-// does not reap open step wisps from its own active patrol molecule.
+// TestPatrolFormulasDoNotRunAgeBasedWispGC verifies that no patrol formula
+// reaps open wisps from its own active patrol molecule. Age-based GC treats
+// any non-closed wisp older than the threshold as abandoned — including the
+// patrol's own hooked wisp and open merge-request beads.
 //
-// Regression test for hq-3pp.
-func TestDeaconPatrolDoesNotRunAgeBasedWispGC(t *testing.T) {
-	content, err := formulasFS.ReadFile("formulas/mol-deacon-patrol.formula.toml")
-	if err != nil {
-		t.Fatalf("reading deacon patrol formula: %v", err)
+// Regression test for hq-3pp (deacon) and gt-7ie/hga-27i (refinery, witness).
+// TestRigPatrolFormulaStepsDeclareRoleTarget verifies that every step of the
+// rig-level patrol formulas declares its role as the workflow step target.
+// Without a target, a patrol step bead that reaches any auto-dispatcher (e.g.
+// the daemon's stranded-convoy feed) is slung to the rig's polecat pool with
+// the generic code-work formula — the polecat correctly refuses, escalates,
+// and the patrol step silently never runs.
+//
+// Regression test for gt-ors.
+func TestRigPatrolFormulaStepsDeclareRoleTarget(t *testing.T) {
+	formulaRoles := map[string]string{
+		"mol-refinery-patrol.formula.toml": "refinery",
+		"mol-witness-patrol.formula.toml":  "witness",
 	}
 
-	f, err := Parse(content)
-	if err != nil {
-		t.Fatalf("parsing deacon patrol formula: %v", err)
+	for name, role := range formulaRoles {
+		t.Run(name, func(t *testing.T) {
+			content, err := formulasFS.ReadFile("formulas/" + name)
+			if err != nil {
+				t.Fatalf("reading %s: %v", name, err)
+			}
+
+			f, err := Parse(content)
+			if err != nil {
+				t.Fatalf("parsing %s: %v", name, err)
+			}
+			if len(f.Steps) == 0 {
+				t.Fatalf("%s: no steps parsed", name)
+			}
+
+			for _, step := range f.Steps {
+				if step.Target != role {
+					t.Errorf("%s step %q: target = %q, want %q — patrol steps must never be pool-dispatchable (gt-ors)",
+						name, step.ID, step.Target, role)
+				}
+			}
+		})
+	}
+}
+
+func TestPatrolFormulasDoNotRunAgeBasedWispGC(t *testing.T) {
+	patrolFormulas := []string{
+		"mol-witness-patrol.formula.toml",
+		"mol-deacon-patrol.formula.toml",
+		"mol-refinery-patrol.formula.toml",
 	}
 
-	var inboxDesc string
-	for _, step := range f.Steps {
-		if step.ID == "inbox-check" {
-			inboxDesc = step.Description
-			break
-		}
-	}
-	if inboxDesc == "" {
-		t.Fatal("deacon patrol formula: inbox-check step not found or has empty description")
-	}
+	for _, name := range patrolFormulas {
+		t.Run(name, func(t *testing.T) {
+			content, err := formulasFS.ReadFile("formulas/" + name)
+			if err != nil {
+				t.Fatalf("reading %s: %v", name, err)
+			}
 
-	if !strings.Contains(inboxDesc, "bd mol wisp gc --closed --force") {
-		t.Fatal("deacon inbox-check must keep closed-wisp cleanup")
-	}
-	if strings.Contains(inboxDesc, "bd mol wisp gc --age") {
-		t.Fatal("deacon inbox-check must not run age-based wisp GC inside the active patrol")
+			f, err := Parse(content)
+			if err != nil {
+				t.Fatalf("parsing %s: %v", name, err)
+			}
+
+			var inboxDesc string
+			for _, step := range f.Steps {
+				if step.ID == "inbox-check" {
+					inboxDesc = step.Description
+					break
+				}
+			}
+			if inboxDesc == "" {
+				t.Fatalf("%s: inbox-check step not found or has empty description", name)
+			}
+
+			if !strings.Contains(inboxDesc, "bd mol wisp gc --closed --force") {
+				t.Errorf("%s inbox-check must keep closed-wisp cleanup", name)
+			}
+			if strings.Contains(inboxDesc, "bd mol wisp gc --age") {
+				t.Errorf("%s inbox-check must not run age-based wisp GC inside the active patrol", name)
+			}
+		})
 	}
 }
 
