@@ -134,6 +134,7 @@ Available guards:
   mol-patrol         - Block mol patrol from agent contexts
   dangerous-command  - Block rm -rf, force push, hard reset, git clean
   memory-write       - Block Write/Edit/NotebookEdit to Claude Code memory paths for worker roles
+  interactive-input  - Block synchronous user-input tools (AskUserQuestion, plan mode) for autonomous roles
 
 External guards (standalone scripts, not compiled into gt):
   context-budget   - scripts/guards/context-budget-guard.sh
