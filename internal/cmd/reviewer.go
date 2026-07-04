@@ -469,6 +469,7 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 		RigName:           rigName,
 		PR:                reviewerPromptPR,
 		SHA:               reviewerPromptSHA,
+		BaseSHA:           resolveReviewBaseSHA(reviewerPromptPR, reviewerPromptSHA),
 		Round:             reviewerPromptRound,
 		PriorThreads:      priorThreads,
 		MaxFindings:       maxFindings,
@@ -479,6 +480,32 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Print(out)
 	return nil
+}
+
+// resolveReviewBaseSHA computes the pinned diff base for a review pass: the
+// merge-base of the reviewed SHA with the PR's actual base branch (falling
+// back to the remote default branch when GitHub can't be asked). Best-effort
+// by design — any failure returns "" and the execution contract falls back to
+// its derive-the-merge-base-yourself instruction. Pinning exists because a
+// perspective pass deriving the base from remote-tracking refs silently
+// over-scopes the diff when those refs are stale (gt-mu9: PR #136 round 1
+// reviewed the already-merged #135 as in-scope); CheckoutPRHeadDetached now
+// freshens the refs, and this pin removes the re-derivation entirely.
+func resolveReviewBaseSHA(prNumber int, sha string) string {
+	cwd, err := requireReviewerWorktree()
+	if err != nil {
+		return ""
+	}
+	g := git.NewGit(cwd)
+	baseBranch, err := g.GhPrBaseBranch(prNumber)
+	if err != nil || baseBranch == "" {
+		baseBranch = g.RemoteDefaultBranch()
+	}
+	mergeBase, err := g.MergeBase("origin/"+baseBranch, sha)
+	if err != nil {
+		return ""
+	}
+	return mergeBase
 }
 
 func runReviewerConsolidate(cmd *cobra.Command, args []string) error {

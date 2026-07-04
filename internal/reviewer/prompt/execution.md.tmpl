@@ -9,9 +9,15 @@ return*. Follow it exactly — do not improvise the procedure.
 - The reviewer worktree is already checked out in detached HEAD at the reviewed
   commit `{{ .SHA }}`. Review **that commit only**.
 - Obtain the change set from your **local checkout** (already at `{{ .SHA }}`),
-  not from GitHub's latest head: diff against the merge-base with the base
+  not from GitHub's latest head.
+{{- if .BaseSHA }} The diff base is **pinned**: run
+  `git diff {{ .BaseSHA }}..HEAD`. `{{ .BaseSHA }}` is the merge-base with the
+  PR's base branch, computed at prompt time from freshly fetched refs — do not
+  re-derive it from remote-tracking refs, which may be stale.
+{{- else }} Diff against the merge-base with the base
   branch, e.g. `git diff $(git merge-base origin/main HEAD)..HEAD` (substitute
-  the PR's actual base branch for `origin/main`). Do **not** use
+  the PR's actual base branch for `origin/main`).
+{{- end }} Do **not** use
   `gh pr diff {{ .PR }}` — it returns the PR's *current* GitHub head, which will
   not match `{{ .SHA }}` (and your local worktree/codegraph index) if upstream
   moved. If you detect such drift, note it in your verdict.

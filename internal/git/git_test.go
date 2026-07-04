@@ -3271,3 +3271,94 @@ func TestGhPrSubmitReview_Validation(t *testing.T) {
 		t.Error("expected error for invalid review event")
 	}
 }
+
+// gitIn runs a git command in dir, failing the test on error.
+func gitIn(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func TestMergeBase(t *testing.T) {
+	repo := initTestRepo(t)
+	base := gitIn(t, repo, "rev-parse", "HEAD")
+
+	// Branch off, add a commit; main also advances — merge-base stays at base.
+	gitIn(t, repo, "checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("f\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", ".")
+	gitIn(t, repo, "commit", "-m", "feature work")
+	feature := gitIn(t, repo, "rev-parse", "HEAD")
+
+	gitIn(t, repo, "checkout", "-")
+	if err := os.WriteFile(filepath.Join(repo, "m.txt"), []byte("m\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, repo, "add", ".")
+	gitIn(t, repo, "commit", "-m", "main advanced")
+
+	g := NewGit(repo)
+	got, err := g.MergeBase(gitIn(t, repo, "rev-parse", "--abbrev-ref", "HEAD"), feature)
+	if err != nil {
+		t.Fatalf("MergeBase: %v", err)
+	}
+	if got != base {
+		t.Errorf("MergeBase = %s, want %s", got, base)
+	}
+}
+
+// TestCheckoutPRHeadDetachedFreshensBaseRefs is the gt-mu9 regression test:
+// fetching a PR head must also freshen the remote-tracking branch refs, so
+// the review diff's merge-base is computed against the remote's CURRENT base
+// branch, not wherever the last full fetch left origin/<base>.
+func TestCheckoutPRHeadDetachedFreshensBaseRefs(t *testing.T) {
+	// "GitHub": a repo with a default branch and a pull/1/head ref.
+	remote := initTestRepo(t)
+	defaultBranch := gitIn(t, remote, "rev-parse", "--abbrev-ref", "HEAD")
+
+	// The PR branch, exposed under the GitHub-style pull ref.
+	gitIn(t, remote, "checkout", "-b", "pr-branch")
+	if err := os.WriteFile(filepath.Join(remote, "pr.txt"), []byte("pr\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, remote, "add", ".")
+	gitIn(t, remote, "commit", "-m", "pr work")
+	prHead := gitIn(t, remote, "rev-parse", "HEAD")
+	gitIn(t, remote, "update-ref", "refs/pull/1/head", prHead)
+	gitIn(t, remote, "checkout", defaultBranch)
+
+	// The reviewer worktree: cloned while the remote base is at its old tip.
+	clone := t.TempDir()
+	gitIn(t, clone, "clone", remote, ".")
+
+	// Remote base branch advances AFTER the clone (a PR merged upstream).
+	if err := os.WriteFile(filepath.Join(remote, "merged.txt"), []byte("merged\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, remote, "add", ".")
+	gitIn(t, remote, "commit", "-m", "another PR merged to base")
+	remoteBaseTip := gitIn(t, remote, "rev-parse", "HEAD")
+
+	g := NewGit(clone)
+	if err := g.CheckoutPRHeadDetached(1, prHead); err != nil {
+		t.Fatalf("CheckoutPRHeadDetached: %v", err)
+	}
+
+	// The worktree is detached at the PR head...
+	if head := gitIn(t, clone, "rev-parse", "HEAD"); head != prHead {
+		t.Errorf("HEAD = %s, want PR head %s", head, prHead)
+	}
+	// ...AND origin/<base> was freshened in the same fetch (gt-mu9).
+	gotBase := gitIn(t, clone, "rev-parse", "origin/"+defaultBranch)
+	if gotBase != remoteBaseTip {
+		t.Errorf("origin/%s = %s, want freshened %s (stale base over-scopes the review diff)",
+			defaultBranch, gotBase, remoteBaseTip)
+	}
+}

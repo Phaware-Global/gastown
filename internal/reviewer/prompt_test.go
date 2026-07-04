@@ -160,3 +160,39 @@ func TestBuildPerspectivePrompt_Validation(t *testing.T) {
 		t.Error("expected error for empty SHA")
 	}
 }
+
+func TestBuildPerspectivePrompt_PinnedBaseSHA(t *testing.T) {
+	out := buildBuiltin(t, PromptParams{
+		RigName: "gastown",
+		PR:      136,
+		SHA:     "deadbeef",
+		BaseSHA: "9ef12049aa",
+		Round:   1,
+	}, "adversarial")
+
+	// The pinned base must yield an exact diff command and suppress the
+	// derive-it-yourself merge-base instruction (gt-mu9).
+	if !strings.Contains(out, "git diff 9ef12049aa..HEAD") {
+		t.Error("prompt missing the pinned-base diff command")
+	}
+	if strings.Contains(out, "git merge-base origin/main HEAD") {
+		t.Error("pinned prompt must not instruct the pass to re-derive the merge-base")
+	}
+}
+
+func TestBuildPerspectivePrompt_BaseSHAFallback(t *testing.T) {
+	out := buildBuiltin(t, PromptParams{
+		RigName: "gastown",
+		PR:      136,
+		SHA:     "deadbeef",
+		Round:   1,
+	}, "adversarial")
+
+	// Without a pin, the contract falls back to deriving the merge-base.
+	if !strings.Contains(out, "git merge-base origin/main HEAD") {
+		t.Error("fallback prompt missing the derive-merge-base instruction")
+	}
+	if strings.Contains(out, "pinned") {
+		t.Error("fallback prompt must not claim the base is pinned")
+	}
+}
