@@ -143,21 +143,55 @@ func applyWorkflowStepTargetOverride(args []string) ([]string, error) {
 }
 
 func workflowStepTargetFromDescription(description, targetRig string) string {
-	for _, line := range strings.Split(description, "\n") {
-		key, value, ok := strings.Cut(strings.TrimSpace(line), ":")
-		if !ok {
+	for _, raw := range strings.Split(description, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
 			continue
 		}
-		if !strings.EqualFold(strings.TrimSpace(key), workflowTargetField) {
-			continue
+		key, value, ok := strings.Cut(line, ":")
+		if ok && strings.EqualFold(strings.TrimSpace(key), workflowTargetField) {
+			return resolveWorkflowTarget(strings.TrimSpace(value), targetRig)
 		}
-		target := strings.TrimSpace(value)
-		if target == "" || target == "rig" {
-			return targetRig
+		// Only the leading metadata header is scanned. The header is a run of
+		// key: value / key=value lines (attachment fields may be prepended
+		// above workflow_target at dispatch, with blank lines between blocks).
+		// The first body line ends the scan so prose or code examples that
+		// mention "workflow_target:" are never misread as routing metadata.
+		if !isMetadataHeaderLine(line) {
+			break
 		}
-		return target
 	}
 	return ""
+}
+
+// isMetadataHeaderLine reports whether a line has the shape of a bead
+// description metadata header entry: a lowercase snake-case key followed by
+// ":" (field) or "=" (formula-var continuation).
+func isMetadataHeaderLine(line string) bool {
+	sep := strings.IndexAny(line, ":=")
+	if sep <= 0 {
+		return false
+	}
+	for _, r := range line[:sep] {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// isRoleWorkflowStepBead reports whether a bead is a workflow formula step
+// (*-wfs-*) whose declared workflow_target routes it to a role agent
+// (refinery/witness) rather than the polecat pool. Such steps are executed by
+// the role that owns the workflow; handing them to a polecat with a generic
+// code-work formula churns spawn/decline/escalate cycles (gt-ors).
+func isRoleWorkflowStepBead(beadID, description string) bool {
+	if !strings.Contains(beadID, "-wfs-") {
+		return false
+	}
+	target := strings.ToLower(workflowStepTargetFromDescription(description, ""))
+	return target == "refinery" || target == "witness" ||
+		strings.HasSuffix(target, "/refinery") || strings.HasSuffix(target, "/witness")
 }
 
 // isOrphanMolecule reports whether a bead's existing attached molecule(s)

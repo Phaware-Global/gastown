@@ -401,11 +401,12 @@ func cleanupStaleContexts(townRoot string) {
 	}
 }
 
-// beadStatusInfo holds batch-fetched bead status, title, and labels.
+// beadStatusInfo holds batch-fetched bead status, title, labels, and description.
 type beadStatusInfo struct {
-	Status string
-	Title  string
-	Labels []string
+	Status      string
+	Title       string
+	Labels      []string
+	Description string
 }
 
 // batchFetchBeadInfoByIDs returns a map of bead ID → status+title+labels for specific beads.
@@ -431,17 +432,19 @@ func batchFetchBeadInfoByIDs(townRoot string, ids []string) map[string]beadStatu
 			continue
 		}
 		var items []struct {
-			ID     string   `json:"id"`
-			Status string   `json:"status"`
-			Title  string   `json:"title"`
-			Labels []string `json:"labels"`
+			ID          string   `json:"id"`
+			Status      string   `json:"status"`
+			Title       string   `json:"title"`
+			Labels      []string `json:"labels"`
+			Description string   `json:"description"`
 		}
 		if err := json.Unmarshal(out, &items); err == nil {
 			for _, item := range items {
 				result[item.ID] = beadStatusInfo{
-					Status: item.Status,
-					Title:  item.Title,
-					Labels: item.Labels,
+					Status:      item.Status,
+					Title:       item.Title,
+					Labels:      item.Labels,
+					Description: item.Description,
 				}
 			}
 		}
@@ -549,6 +552,16 @@ func getReadySlingContexts(townRoot string) ([]capacity.PendingBead, error) {
 		if capacity.IsMessagingBead(workLabels) {
 			fmt.Fprintf(os.Stderr, "%s dispatch_skip reason=messaging_label bead=%s labels=%v\n",
 				style.Dim.Render("○"), fields.WorkBeadID, workLabels)
+			continue
+		}
+
+		// Defensive filter: workflow formula steps routed to a role agent
+		// (refinery/witness) must never be pool-dispatched to a polecat. The
+		// sling redirect (applyWorkflowStepTargetOverride) handles interactive
+		// slings, but scheduled contexts execute without it (gt-ors).
+		if isRoleWorkflowStepBead(fields.WorkBeadID, info.Description) {
+			fmt.Fprintf(os.Stderr, "%s dispatch_skip reason=role_workflow_step bead=%s\n",
+				style.Dim.Render("○"), fields.WorkBeadID)
 			continue
 		}
 

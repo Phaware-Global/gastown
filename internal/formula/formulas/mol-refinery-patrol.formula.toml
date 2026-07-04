@@ -204,13 +204,20 @@ default = "gt"
 
 [[steps]]
 id = "inbox-check"
+target = "refinery"
 title = "Check refinery mail"
 description = """
-First, clean up wisps from previous cycles (closed wisps + abandoned wisps):
+First, clean up CLOSED wisps from previous cycles:
 ```bash
 bd mol wisp gc --closed --force
-bd mol wisp gc --age 1h --force
 ```
+
+> **Warning (gt-7ie, hga-27i):** Do not run age-based wisp GC (`--age`) from
+> inside this patrol. It treats any non-closed wisp older than the threshold
+> as abandoned — including this patrol's own hooked wisp and open
+> merge-request beads — and has repeatedly destroyed both mid-cycle.
+> Use closed-only cleanup here; stale open-wisp cleanup belongs to the reaper,
+> which runs outside active patrol molecules.
 
 Then check mail for MERGE_READY submissions, escalations, and messages.
 
@@ -269,6 +276,7 @@ Keep only: pending MRs in queue. Inbox should be near-empty."""
 
 [[steps]]
 id = "queue-scan"
+target = "refinery"
 title = "Scan merge queue"
 needs = ["inbox-check"]
 description = """
@@ -335,6 +343,7 @@ Rules, in order of bindingness:
 
 [[steps]]
 id = "orphan-branch-check"
+target = "refinery"
 title = "Detect and escalate orphan polecat branches"
 needs = ["queue-scan"]
 description = """
@@ -456,6 +465,7 @@ process-branch as before."""
 
 [[steps]]
 id = "process-branch"
+target = "refinery"
 title = "Mechanical rebase"
 # Serialize on orphan-branch-check so the orphan scan runs BEFORE any
 # branch processing in a single patrol cycle. Without this, both steps
@@ -560,6 +570,7 @@ Track: rebase result (success/conflict), conflict task ID if created."""
 
 [[steps]]
 id = "run-tests"
+target = "refinery"
 title = "Run quality checks and tests"
 needs = ["process-branch"]
 description = """
@@ -605,6 +616,7 @@ Track results: pass count, fail count, specific failures."""
 
 [[steps]]
 id = "quality-review"
+target = "refinery"
 title = "Quality review merge diff"
 needs = ["run-tests"]
 description = """
@@ -677,6 +689,7 @@ Track: review score, recommendation, issue count, duration."""
 
 [[steps]]
 id = "handle-failures"
+target = "refinery"
 title = "Handle quality check or test failures"
 needs = ["quality-review"]
 description = """
@@ -746,6 +759,7 @@ This is non-negotiable. Never disavow. Never "note and proceed." """
 
 [[steps]]
 id = "merge-push"
+target = "refinery"
 title = "Merge and push"
 needs = ["handle-failures"]
 description = """
@@ -1441,6 +1455,7 @@ Target branch has moved. Any remaining branches need rebasing on new baseline.""
 
 [[steps]]
 id = "loop-check"
+target = "refinery"
 title = "Check for more work"
 needs = ["merge-push"]
 description = """
@@ -1462,6 +1477,7 @@ This tracking feeds into generate-summary for the patrol digest."""
 
 [[steps]]
 id = "generate-summary"
+target = "refinery"
 title = "Generate handoff summary"
 needs = ["loop-check"]
 description = """
@@ -1494,6 +1510,7 @@ This becomes the digest when the patrol is squashed."""
 
 [[steps]]
 id = "check-integration-branches"
+target = "refinery"
 title = "Check integration branches for landing"
 needs = ["generate-summary"]
 description = """
@@ -1655,6 +1672,7 @@ If any box is unchecked, GO BACK and complete it. The Scotty Test applies."""
 
 [[steps]]
 id = "context-check"
+target = "refinery"
 title = "Assess session health"
 needs = ["check-integration-branches"]
 description = """
@@ -1688,6 +1706,7 @@ light and there's active work in the queue, continue."""
 
 [[steps]]
 id = "patrol-cleanup"
+target = "refinery"
 title = "End-of-cycle inbox hygiene"
 needs = ["context-check"]
 description = """
@@ -1742,6 +1761,7 @@ Keep only: pending MRs in queue."""
 
 [[steps]]
 id = "burn-or-loop"
+target = "refinery"
 title = "Burn and respawn or loop"
 needs = ["patrol-cleanup"]
 description = """
