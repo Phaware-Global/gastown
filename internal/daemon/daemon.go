@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -112,6 +113,10 @@ type Daemon struct {
 	// jsonlPushFailures tracks consecutive git push failures for JSONL backup.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	jsonlPushFailures int
+
+	// offsiteBackupRunning guards the offsite (iCloud) backup rsync goroutine
+	// so a long catch-up sync is never dispatched twice concurrently.
+	offsiteBackupRunning atomic.Bool
 
 	// lastDoctorMolTime tracks when the last mol-dog-doctor molecule was poured.
 	// Option B throttling: only pour when anomaly detected AND cooldown elapsed.
@@ -2404,6 +2409,15 @@ func (d *Daemon) processLifecycleRequests() {
 // shutdown performs graceful shutdown.
 func (d *Daemon) shutdown(state *State) error { //nolint:unparam // error return kept for future use
 	d.logger.Println("Daemon shutting down")
+
+	// Cancel the daemon context first: the signal-driven shutdown path never
+	// goes through Stop(), and background work parented on d.ctx (e.g. the
+	// offsite backup rsync) must not outlive the daemon — an orphaned
+	// `rsync --delete` would race the restarted daemon's next offsite sync
+	// against the same destination. Idempotent when shutdown was reached via
+	// Stop()/ctx.Done(). Shutdown steps below that must still run use their
+	// own Background-parented contexts (e.g. pushDoltRemotes).
+	d.cancel()
 
 	// Stop feed curator
 	if d.curator != nil {
