@@ -58,8 +58,16 @@ func (d *Daemon) syncDoltBackups() {
 	}
 
 	// Pour molecule for observability (nil-safe — all methods are no-ops on nil).
+	// When the offsite goroutine is dispatched it takes over the final close,
+	// so the offsite step reflects the real rsync outcome instead of being
+	// reported green at dispatch time.
 	mol := d.pourDogMolecule(constants.MolDogBackup, nil)
-	defer mol.close()
+	molOwnedByOffsite := false
+	defer func() {
+		if !molOwnedByOffsite {
+			mol.close()
+		}
+	}()
 
 	// Resolve data dir: use DoltServerManager if available, else conventional path.
 	var dataDir string
@@ -108,25 +116,35 @@ func (d *Daemon) syncDoltBackups() {
 		mol.closeStep("sync")
 	}
 
+	mol.closeStep("report")
+
 	// Offsite sync: rsync local backups to iCloud Drive for cloud replication.
 	// This is a stopgap until proper dolt remote push is configured.
 	// Dispatched to a guarded goroutine: syncDoltBackups runs inline in the
 	// daemon's main select loop, and a catch-up rsync of a multi-GB backup
 	// tree would block heartbeats and patrols. The guard skips the dispatch
-	// while a previous offsite sync is still running.
-	if synced > 0 {
-		if d.offsiteBackupRunning.CompareAndSwap(false, true) {
-			go func() {
-				defer d.offsiteBackupRunning.Store(false)
-				d.syncOffsiteBackup()
-			}()
-		} else {
-			d.logger.Printf("dolt_backup: offsite sync from a previous cycle still running, skipping")
-		}
+	// while a previous offsite sync is still running. The goroutine owns the
+	// molecule from here: it records the offsite step from the actual rsync
+	// outcome and performs the final close.
+	if synced == 0 {
+		mol.closeStep("offsite")
+		return
 	}
-	mol.closeStep("offsite")
-
-	mol.closeStep("report")
+	if !d.offsiteBackupRunning.CompareAndSwap(false, true) {
+		d.logger.Printf("dolt_backup: offsite sync from a previous cycle still running, skipping")
+		mol.failStep("offsite", "skipped: previous offsite sync still running")
+		return
+	}
+	molOwnedByOffsite = true
+	go func() {
+		defer d.offsiteBackupRunning.Store(false)
+		defer mol.close()
+		if err := d.syncOffsiteBackup(); err != nil {
+			mol.failStep("offsite", err.Error())
+		} else {
+			mol.closeStep("offsite")
+		}
+	}()
 }
 
 // syncBackup runs `dolt backup sync <backup-name>` for a single database,
@@ -170,36 +188,49 @@ func (d *Daemon) syncBackup(dataDir, db, backupName string) error {
 
 // syncOffsiteBackup rsyncs the local backup directory to iCloud Drive.
 // iCloud automatically syncs to Apple's cloud, providing offsite replication.
-// Non-fatal: if iCloud is unavailable or rsync fails, we just log and continue.
-func (d *Daemon) syncOffsiteBackup() {
+// Non-fatal for the daemon: the returned error feeds the molecule's offsite
+// step; the daemon logs and continues either way.
+func (d *Daemon) syncOffsiteBackup() error {
 	backupDir := filepath.Join(d.config.TownRoot, ".dolt-backup")
 	if _, err := os.Stat(backupDir); os.IsNotExist(err) {
-		return
+		return nil
 	}
 
 	// iCloud Drive path (macOS)
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		return
+		return fmt.Errorf("resolve home dir: %w", err)
 	}
 	icloudDir := filepath.Join(homeDir, "Library", "Mobile Documents", "com~apple~CloudDocs", "gt-dolt-backup")
 	if err := os.MkdirAll(icloudDir, 0755); err != nil {
 		d.logger.Printf("dolt_backup: offsite: cannot create iCloud dir: %v", err)
-		return
+		return fmt.Errorf("create iCloud dir: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), doltOffsiteBackupTimeout)
+	// Parent on the daemon context so a graceful shutdown/restart cancels the
+	// rsync: an orphaned `rsync --delete` surviving into the next daemon's
+	// cycle would race a second rsync against the same iCloud mirror (the
+	// per-process atomic guard cannot see across restarts).
+	parentCtx := d.ctx
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parentCtx, doltOffsiteBackupTimeout)
 	defer cancel()
 
-	// --partial keeps partially-transferred files so a killed sync of a large
-	// Dolt chunk file resumes instead of restarting from zero next cycle.
-	cmd := exec.CommandContext(ctx, "rsync", "-a", "--partial", "--delete", backupDir+"/", icloudDir+"/")
+	// --partial-dir keeps partially-transferred files in a side directory so
+	// a killed transfer of a large Dolt chunk file resumes next cycle without
+	// ever leaving a truncated file at its final destination name (a
+	// truncated chunk masquerading as complete would silently corrupt the
+	// offsite mirror). Verified supported by macOS openrsync.
+	cmd := exec.CommandContext(ctx, "rsync", "-a", "--partial-dir=.rsync-partial", "--delete", backupDir+"/", icloudDir+"/")
 	util.SetDetachedProcessGroup(cmd)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		d.logger.Printf("dolt_backup: offsite sync failed: %v (%s)", err, strings.TrimSpace(string(output)))
-	} else {
-		d.logger.Printf("dolt_backup: offsite synced to iCloud")
+		return fmt.Errorf("rsync: %w", err)
 	}
+	d.logger.Printf("dolt_backup: offsite synced to iCloud")
+	return nil
 }
 
 // discoverDatabasesWithBackups lists databases in the data directory
