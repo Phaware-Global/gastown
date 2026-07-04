@@ -239,7 +239,13 @@ func followRedirects(beadsDir string) string {
 		}
 		target := strings.TrimSpace(string(data))
 		if target == "" {
-			return beadsDir
+			// An empty redirect means "use this dir" in bd's resolution —
+			// but only a dir with real store content qualifies as a final
+			// target; an empty pointer over an empty dir is a broken store.
+			if hasStoreMarkers(beadsDir) {
+				return beadsDir
+			}
+			return ""
 		}
 		if !filepath.IsAbs(target) {
 			target = filepath.Clean(filepath.Join(filepath.Dir(beadsDir), target))
@@ -253,6 +259,17 @@ func followRedirects(beadsDir string) string {
 // redirect pointer (rather than a stray bootstrap).
 func isCanonicalStore(beadsDir string) bool {
 	for _, marker := range []string{"redirect", "config.yaml", "metadata.json"} {
+		if _, err := os.Stat(filepath.Join(beadsDir, marker)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// hasStoreMarkers reports whether beadsDir carries real store content (not
+// counting a redirect pointer).
+func hasStoreMarkers(beadsDir string) bool {
+	for _, marker := range []string{"config.yaml", "metadata.json"} {
 		if _, err := os.Stat(filepath.Join(beadsDir, marker)); err == nil {
 			return true
 		}

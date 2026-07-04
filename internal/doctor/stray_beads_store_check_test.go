@@ -216,3 +216,34 @@ func TestFollowRedirectsRefusesUnresolvedChain(t *testing.T) {
 		t.Errorf("followRedirects short chain = %q, want %q", got, final)
 	}
 }
+
+func TestFollowRedirectsEmptyPointerRequiresStoreMarkers(t *testing.T) {
+	root := t.TempDir()
+
+	// Empty redirect over an empty dir: broken pointer, not a target.
+	broken := filepath.Join(root, "broken", ".beads")
+	if err := os.MkdirAll(broken, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(broken, "redirect"), []byte("  \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := followRedirects(broken); got != "" {
+		t.Errorf("followRedirects(empty pointer, no markers) = %q, want empty sentinel", got)
+	}
+
+	// Empty redirect over a real store: usable target.
+	real := filepath.Join(root, "real", ".beads")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "redirect"), []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "config.yaml"), []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := followRedirects(real); got != real {
+		t.Errorf("followRedirects(empty pointer, real store) = %q, want %q", got, real)
+	}
+}
