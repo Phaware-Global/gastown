@@ -25,6 +25,12 @@ const (
 	// fail the whole backup cycle.
 	doltBackupRetries    = 1
 	doltBackupRetryDelay = 5 * time.Second
+	// doltOffsiteBackupTimeout bounds the offsite rsync to iCloud. The backup
+	// tree can reach many GB (hq alone hit 1.5GB during the hq-09sb1 wisp
+	// flood); the old 60s ceiling SIGKILLed rsync every cycle, so the offsite
+	// copy silently fell days behind. The rsync runs in a guarded goroutine,
+	// so a long catch-up sync does not block the daemon loop.
+	doltOffsiteBackupTimeout = 30 * time.Minute
 )
 
 // doltBackupInterval returns the configured backup interval, or the default (15m).
@@ -104,12 +110,21 @@ func (d *Daemon) syncDoltBackups() {
 
 	// Offsite sync: rsync local backups to iCloud Drive for cloud replication.
 	// This is a stopgap until proper dolt remote push is configured.
+	// Dispatched to a guarded goroutine: syncDoltBackups runs inline in the
+	// daemon's main select loop, and a catch-up rsync of a multi-GB backup
+	// tree would block heartbeats and patrols. The guard skips the dispatch
+	// while a previous offsite sync is still running.
 	if synced > 0 {
-		d.syncOffsiteBackup()
-		mol.closeStep("offsite")
-	} else {
-		mol.closeStep("offsite")
+		if d.offsiteBackupRunning.CompareAndSwap(false, true) {
+			go func() {
+				defer d.offsiteBackupRunning.Store(false)
+				d.syncOffsiteBackup()
+			}()
+		} else {
+			d.logger.Printf("dolt_backup: offsite sync from a previous cycle still running, skipping")
+		}
 	}
+	mol.closeStep("offsite")
 
 	mol.closeStep("report")
 }
@@ -173,10 +188,12 @@ func (d *Daemon) syncOffsiteBackup() {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), doltOffsiteBackupTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "rsync", "-a", "--delete", backupDir+"/", icloudDir+"/")
+	// --partial keeps partially-transferred files so a killed sync of a large
+	// Dolt chunk file resumes instead of restarting from zero next cycle.
+	cmd := exec.CommandContext(ctx, "rsync", "-a", "--partial", "--delete", backupDir+"/", icloudDir+"/")
 	util.SetDetachedProcessGroup(cmd)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		d.logger.Printf("dolt_backup: offsite sync failed: %v (%s)", err, strings.TrimSpace(string(output)))

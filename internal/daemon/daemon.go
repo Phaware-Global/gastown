@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -112,6 +113,10 @@ type Daemon struct {
 	// jsonlPushFailures tracks consecutive git push failures for JSONL backup.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	jsonlPushFailures int
+
+	// offsiteBackupRunning guards the offsite (iCloud) backup rsync goroutine
+	// so a long catch-up sync is never dispatched twice concurrently.
+	offsiteBackupRunning atomic.Bool
 
 	// lastDoctorMolTime tracks when the last mol-dog-doctor molecule was poured.
 	// Option B throttling: only pour when anomaly detected AND cooldown elapsed.
