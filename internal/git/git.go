@@ -1263,6 +1263,11 @@ func (g *Git) RemoteDefaultBranch() string {
 	return "main" // final fallback
 }
 
+// MergeBase returns the merge-base commit SHA of two revisions.
+func (g *Git) MergeBase(a, b string) (string, error) {
+	return g.run("merge-base", a, b)
+}
+
 // HasUncommittedChanges returns true if there are uncommitted changes.
 func (g *Git) HasUncommittedChanges() (bool, error) {
 	status, err := g.Status()
@@ -1920,6 +1925,24 @@ func (g *Git) GhPrComment(prNumber int, body string) error {
 	return nil
 }
 
+// GhPrBaseBranch returns the PR's base branch name (baseRefName) from GitHub.
+// Used by the Reviewer's prompt generation to pin the diff base against the
+// branch the PR actually targets — the repo default branch is the wrong base
+// for PRs targeting long-lived branches like develop.
+func (g *Git) GhPrBaseBranch(prNumber int) (string, error) {
+	if prNumber <= 0 {
+		return "", fmt.Errorf("gh pr base branch: invalid PR number %d", prNumber)
+	}
+	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber),
+		"--json", "baseRefName", "--jq", ".baseRefName")
+	cmd.Dir = g.workDir
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("gh pr view --json baseRefName failed: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // CheckoutPRHeadDetached fetches the PR's head commit and checks it out in a
 // detached HEAD state in the working tree. When sha is non-empty the working
 // tree is detached at exactly that commit (the SHA the Reviewer was asked to
@@ -1937,7 +1960,16 @@ func (g *Git) CheckoutPRHeadDetached(prNumber int, sha string) error {
 		return fmt.Errorf("checkout PR head: invalid PR number %d", prNumber)
 	}
 	ref := fmt.Sprintf("pull/%d/head", prNumber)
-	if _, err := g.run("fetch", "origin", ref); err != nil {
+	// Freshen ALL remote-tracking branch refs in the same fetch as the PR
+	// head. The review execution contract diffs against the merge-base with
+	// origin/<base>; fetching only pull/<n>/head leaves
+	// refs/remotes/origin/<base> wherever the last full fetch put it, and a
+	// stale base silently over-scopes the review diff with commits already
+	// merged upstream (gt-mu9: PR #136 round 1 reviewed the already-merged
+	// #135 as in-scope). The explicit branches refspec restores the default
+	// `git fetch origin` behavior, which git suppresses when an explicit ref
+	// (the pull head) is requested.
+	if _, err := g.run("fetch", "origin", ref, "+refs/heads/*:refs/remotes/origin/*"); err != nil {
 		return fmt.Errorf("fetching %s: %w", ref, err)
 	}
 	target := "FETCH_HEAD"

@@ -46,6 +46,13 @@ type PromptParams struct {
 	PR int
 	// SHA is the exact head commit the pass must review and anchor to.
 	SHA string
+	// BaseSHA, when non-empty, pins the exact diff base for the pass: the
+	// merge-base of SHA with the PR's base branch, computed at prompt time
+	// from freshly fetched refs. When empty the contract falls back to
+	// instructing the pass to derive the merge-base itself (gt-mu9: a stale
+	// origin/main over-scoped PR #136's round-1 diff with already-merged
+	// commits, so the base is pinned in Go whenever it can be).
+	BaseSHA string
 	// Round is the review round (>=2 is a fix round; prior threads apply).
 	Round int
 	// PriorThreads is the deterministically-assembled prior-round thread context
