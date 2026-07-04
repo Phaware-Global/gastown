@@ -2,6 +2,7 @@ package beads
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -72,12 +73,29 @@ func isBDTargetEnv(entry string) bool {
 	return envKeyHasPrefix(keyName, "BEADS_DOLT_") && !envKeyMatches(keyName, "BEADS_DOLT_AUTO_START")
 }
 
+// sanitizeBeadsDir rejects relative beads-dir targets. A relative path — the
+// artifact of joining a rig name or prefix onto an empty town root — resolves
+// against the subprocess's own cwd, where bd silently bootstraps a stray
+// embedded store and strands every write (the 2026-07-04 "silent write loss"
+// incident: beads vanished into <worker cwd>/<rigname>/.beads/embeddeddolt).
+// Treating it as "no target" makes bd fall back to its cwd walk plus the
+// town-derived connection env, which routes to the shared server. The warning
+// makes the broken caller findable in agent shells and daemon logs.
+func sanitizeBeadsDir(beadsDir string) string {
+	if beadsDir == "" || filepath.IsAbs(beadsDir) {
+		return beadsDir
+	}
+	fmt.Fprintf(os.Stderr, "gt: warning: ignoring relative beads dir %q (empty town root at the caller?); falling back to bd resolution\n", beadsDir)
+	return ""
+}
+
 // BuildPinnedBDEnv returns env for a bd subprocess pinned to beadsDir. BEADS_DIR
 // and the metadata-backed Dolt database are the authoritative target selectors;
 // inherited selectors are stripped first so stale shell state cannot make bd
 // write to a different database than the selected .beads directory.
 func BuildPinnedBDEnv(base []string, beadsDir string) []string {
 	env := SuppressBDSideEffects(StripBDTargetEnv(base))
+	beadsDir = sanitizeBeadsDir(beadsDir)
 	if beadsDir == "" {
 		return addGTDerivedDoltTargetEnv(env)
 	}
@@ -94,7 +112,7 @@ func BuildPinnedBDEnv(base []string, beadsDir string) []string {
 // connection host/port from fallbackBeadsDir so routing can choose the database.
 func BuildRoutingBDEnv(base []string, fallbackBeadsDir string) []string {
 	env := SuppressBDSideEffects(StripBDTargetEnv(base))
-	env = append(env, doltTargetEnvFromBeadsDir(fallbackBeadsDir)...)
+	env = append(env, doltTargetEnvFromBeadsDir(sanitizeBeadsDir(fallbackBeadsDir))...)
 	return addGTDerivedDoltTargetEnv(env)
 }
 
