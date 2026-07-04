@@ -556,15 +556,22 @@ func TestComputeExpectedNoBase(t *testing.T) {
 	tmpDir := t.TempDir()
 	setTestHome(t, tmpDir)
 
-	// Mayor should get DefaultBase (no built-in overrides)
+	// Mayor should get DefaultBase + built-in autonomy guard (interactive-input)
 	expected, err := ComputeExpected("mayor")
 	if err != nil {
 		t.Fatalf("ComputeExpected failed: %v", err)
 	}
 
 	defaultBase := DefaultBase()
-	if !HooksEqual(expected, defaultBase) {
-		t.Error("expected DefaultBase for mayor when no configs exist")
+	if len(expected.PreToolUse) != len(defaultBase.PreToolUse)+2 {
+		t.Errorf("expected mayor to have DefaultBase PreToolUse (%d) plus 2 autonomy-guard entries, got %d",
+			len(defaultBase.PreToolUse), len(expected.PreToolUse))
+	}
+	if len(expected.SessionStart) != len(defaultBase.SessionStart) {
+		t.Error("expected mayor to inherit SessionStart from DefaultBase")
+	}
+	if len(expected.UserPromptSubmit) != len(defaultBase.UserPromptSubmit) {
+		t.Error("expected mayor to retain UserPromptSubmit mail-check from DefaultBase")
 	}
 
 	// Crew should get DefaultBase + built-in crew override (PreCompact)
@@ -732,6 +739,42 @@ func TestComputeExpectedPolecatsKeepUserPromptMailCheck(t *testing.T) {
 	}
 	if len(cfg.UserPromptSubmit) == 0 {
 		t.Fatal("polecats should retain UserPromptSubmit mail-check")
+	}
+}
+
+// TestComputeExpectedMayorBlocksInteractiveInput verifies the mayor's
+// built-in autonomy guard: synchronous user-input tools are routed to
+// `gt tap guard interactive-input`, and ExitPlanMode is deliberately
+// left unguarded (a human-initiated plan mode must remain exitable).
+func TestComputeExpectedMayorBlocksInteractiveInput(t *testing.T) {
+	tmpDir := t.TempDir()
+	setTestHome(t, tmpDir)
+
+	cfg, err := ComputeExpected("mayor")
+	if err != nil {
+		t.Fatalf("ComputeExpected(mayor): %v", err)
+	}
+
+	guarded := map[string]bool{
+		"AskUserQuestion": false,
+		"EnterPlanMode":   false,
+	}
+	for _, entry := range cfg.PreToolUse {
+		if entry.Matcher == "ExitPlanMode" {
+			t.Error("mayor must NOT guard ExitPlanMode (human-initiated plan mode must remain exitable)")
+		}
+		if _, ok := guarded[entry.Matcher]; !ok {
+			continue
+		}
+		guarded[entry.Matcher] = true
+		if len(entry.Hooks) != 1 || !strings.Contains(entry.Hooks[0].Command, "tap guard interactive-input") {
+			t.Errorf("mayor %s guard should invoke `gt tap guard interactive-input`, got %+v", entry.Matcher, entry.Hooks)
+		}
+	}
+	for matcher, found := range guarded {
+		if !found {
+			t.Errorf("mayor missing autonomy-guard matcher: %s", matcher)
+		}
 	}
 }
 

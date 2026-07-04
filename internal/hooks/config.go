@@ -436,6 +436,36 @@ func DefaultOverrides() map[string]*HooksConfig {
 				},
 			},
 		},
+		// Mayor: autonomy guard — block synchronous user-input tools.
+		// The Mayor operates unattended and must never block the town on
+		// a human answer: it makes executive decisions on procedural
+		// matters itself, and escalates product/priority decisions to the
+		// overseer through asynchronous channels (gt escalate, Jira
+		// comments, GitHub comments). AskUserQuestion and agent-initiated
+		// plan mode (EnterPlanMode leads to the synchronous plan-approval
+		// prompt) freeze the session until a human notices — the exact
+		// stall GUPP exists to prevent. ExitPlanMode is intentionally NOT
+		// blocked: if a human operator manually switches the session into
+		// plan mode, the agent must still be able to present the plan and
+		// leave plan mode.
+		"mayor": {
+			PreToolUse: []HookEntry{
+				{
+					Matcher: "AskUserQuestion",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: gtCommand("gt tap guard interactive-input"),
+					}},
+				},
+				{
+					Matcher: "EnterPlanMode",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: gtCommand("gt tap guard interactive-input"),
+					}},
+				},
+			},
+		},
 		// Reviewer roles: write-surface guard (P23-2376).
 		// The Reviewer's only sanctioned write surfaces are its review bead, its
 		// own worktree (checkout only), and PR review comments posted through
