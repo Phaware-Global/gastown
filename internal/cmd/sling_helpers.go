@@ -143,17 +143,41 @@ func applyWorkflowStepTargetOverride(args []string) ([]string, error) {
 }
 
 func workflowStepTargetFromDescription(description, targetRig string) string {
-	for _, line := range strings.Split(description, "\n") {
-		key, value, ok := strings.Cut(strings.TrimSpace(line), ":")
-		if !ok {
+	for _, raw := range strings.Split(description, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
 			continue
 		}
-		if !strings.EqualFold(strings.TrimSpace(key), workflowTargetField) {
-			continue
+		key, value, ok := strings.Cut(line, ":")
+		if ok && strings.EqualFold(strings.TrimSpace(key), workflowTargetField) {
+			return resolveWorkflowTarget(strings.TrimSpace(value), targetRig)
 		}
-		return resolveWorkflowTarget(strings.TrimSpace(value), targetRig)
+		// Only the leading metadata header is scanned. The header is a run of
+		// key: value / key=value lines (attachment fields may be prepended
+		// above workflow_target at dispatch, with blank lines between blocks).
+		// The first body line ends the scan so prose or code examples that
+		// mention "workflow_target:" are never misread as routing metadata.
+		if !isMetadataHeaderLine(line) {
+			break
+		}
 	}
 	return ""
+}
+
+// isMetadataHeaderLine reports whether a line has the shape of a bead
+// description metadata header entry: a lowercase snake-case key followed by
+// ":" (field) or "=" (formula-var continuation).
+func isMetadataHeaderLine(line string) bool {
+	sep := strings.IndexAny(line, ":=")
+	if sep <= 0 {
+		return false
+	}
+	for _, r := range line[:sep] {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' && r != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 // isRoleWorkflowStepBead reports whether a bead is a workflow formula step

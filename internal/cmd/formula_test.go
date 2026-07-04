@@ -299,6 +299,9 @@ func TestWorkflowStepTargetFromDescription(t *testing.T) {
 		{name: "path target", description: "workflow_target: gastown/crew/alex\n\nBody", want: "gastown/crew/alex"},
 		{name: "refinery role", description: "workflow_target: refinery\n\nBody", want: "gastown/refinery"},
 		{name: "witness role", description: "workflow_target: witness\n\nBody", want: "gastown/witness"},
+		{name: "after attachment metadata", description: "attached_formula: mol-polecat-work\nformula_vars: base_branch=Develop\nmerge_strategy=pr\n\nworkflow_target: refinery\n\nBody", want: "gastown/refinery"},
+		{name: "mention in body prose", description: "Fix the router\n\nSteps may declare workflow_target: refinery in their header.", want: ""},
+		{name: "mention in code block", description: "Update the docs:\n```\nworkflow_target: refinery\n```", want: ""},
 	}
 
 	for _, tt := range tests {
