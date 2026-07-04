@@ -441,13 +441,18 @@ func DefaultOverrides() map[string]*HooksConfig {
 		// a human answer: it makes executive decisions on procedural
 		// matters itself, and escalates product/priority decisions to the
 		// overseer through asynchronous channels (gt escalate, Jira
-		// comments, GitHub comments). AskUserQuestion and agent-initiated
-		// plan mode (EnterPlanMode leads to the synchronous plan-approval
-		// prompt) freeze the session until a human notices — the exact
-		// stall GUPP exists to prevent. ExitPlanMode is intentionally NOT
-		// blocked: if a human operator manually switches the session into
-		// plan mode, the agent must still be able to present the plan and
-		// leave plan mode.
+		// comments, GitHub comments). AskUserQuestion presents a blocking
+		// question UI; EnterPlanMode is the model's tool-call entry into
+		// plan mode (present in Claude Code v2.1.x — verify with
+		// `strings <claude-binary> | grep EnterPlanMode` before assuming
+		// otherwise), whose planning flow terminates in the synchronous
+		// ExitPlanMode plan-approval prompt. Both stall the session until
+		// a human notices — the exact freeze GUPP exists to prevent.
+		// Guarding the entry tool keeps the Mayor from ever reaching the
+		// approval prompt on its own. ExitPlanMode itself is intentionally
+		// NOT guarded: with EnterPlanMode blocked, the only way to be in
+		// plan mode is a human operator switching the mode manually, and
+		// that human-initiated plan must remain presentable/exitable.
 		"mayor": {
 			PreToolUse: []HookEntry{
 				{

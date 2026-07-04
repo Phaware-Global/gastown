@@ -38,11 +38,14 @@ matcher restricts it to the synchronous-input tools, so the hook
 firing IS the policy decision. Stdin is read only to name the blocked
 tool in the banner; an unreadable or unparseable payload still blocks.
 
-ExitPlanMode is deliberately NOT covered by the default matchers: if
-a human operator manually switches the session into plan mode, the
-agent must still be able to present its plan and leave plan mode.
-Blocking EnterPlanMode is sufficient to stop the agent from entering
-the approval-gated flow on its own.
+Plan-mode coverage: EnterPlanMode is the model's tool-call entry into
+plan mode (present in Claude Code v2.1.x), and the planning flow it
+starts terminates in the synchronous ExitPlanMode plan-approval
+prompt. Guarding the entry tool stops the agent from ever reaching
+that prompt on its own. ExitPlanMode is deliberately NOT covered by
+the default matchers: with EnterPlanMode blocked, the only way into
+plan mode is a human operator switching the session mode manually,
+and that human-initiated plan must remain presentable/exitable.
 
 Exit codes:
   2 - Always (invocation means a blocked tool was attempted)
