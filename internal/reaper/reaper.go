@@ -10,12 +10,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 )
 
 // validDBName matches safe database names (alphanumeric, underscore, hyphen).
@@ -299,20 +300,40 @@ func hasColumns(ctx context.Context, db *sql.DB, table string, columns ...string
 		return false, err
 	}
 	for _, column := range columns {
-		if !cols[column] {
+		if !cols[strings.ToLower(column)] {
 			return false, nil
 		}
 	}
 	return true, nil
 }
 
-// showColumns returns the set of column names of table, or nil (no error)
-// when the table does not exist. Table names here are compile-time constants,
-// never user input.
+// erNoSuchTable is MySQL error code ER_NO_SUCH_TABLE, which Dolt returns
+// (verified against a live server) when the queried table does not exist.
+const erNoSuchTable = 1146
+
+// isMissingTableErr reports whether err means the queried table is absent —
+// the one benign failure for schema introspection. Typed driver errors are
+// classified strictly by error number, so a connectivity or permission error
+// whose text happens to contain "doesn't exist" is not misread as "table
+// absent"; the isTableNotFound substring check remains only as a fallback
+// for untyped errors.
+func isMissingTableErr(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		return mysqlErr.Number == erNoSuchTable
+	}
+	return isTableNotFound(err)
+}
+
+// showColumns returns the set of lowercased column names of table, or nil
+// (no error) when the table does not exist. Names are lowercased on store
+// and lookup to preserve the case-insensitive identifier semantics of the
+// information_schema queries this replaced. Table names here are
+// compile-time constants, never user input.
 func showColumns(ctx context.Context, db *sql.DB, table string) (map[string]bool, error) {
 	rows, err := db.QueryContext(ctx, fmt.Sprintf("SHOW COLUMNS FROM `%s`", table)) //nolint:gosec // G201: table is a compile-time constant
 	if err != nil {
-		if isTableNotFound(err) {
+		if isMissingTableErr(err) {
 			return nil, nil
 		}
 		return nil, err
@@ -324,18 +345,19 @@ func showColumns(ctx context.Context, db *sql.DB, table string) (map[string]bool
 		return nil, err
 	}
 	cols := make(map[string]bool)
+	// First result column is Field (the column name); discard the rest.
+	// Scan destinations are reused across rows — Scan overwrites them.
+	var field string
+	scanDest := make([]interface{}, len(resultCols))
+	scanDest[0] = &field
+	for i := 1; i < len(scanDest); i++ {
+		scanDest[i] = new(sql.RawBytes)
+	}
 	for rows.Next() {
-		// First result column is Field (the column name); discard the rest.
-		var field string
-		scanDest := make([]interface{}, len(resultCols))
-		scanDest[0] = &field
-		for i := 1; i < len(scanDest); i++ {
-			scanDest[i] = new(sql.RawBytes)
-		}
 		if err := rows.Scan(scanDest...); err != nil {
 			return nil, err
 		}
-		cols[field] = true
+		cols[strings.ToLower(field)] = true
 	}
 	return cols, rows.Err()
 }

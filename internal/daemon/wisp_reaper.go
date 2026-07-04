@@ -261,10 +261,13 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		if err != nil {
 			continue
 		}
-		if ok, schemaErr := reaper.HasReaperSchema(db); !ok {
-			if schemaErr != nil {
-				d.logger.Printf("wisp_reaper: %s: schema check error: %v", dbName, schemaErr)
-			}
+		ok, schemaErr := reaper.HasReaperSchema(db)
+		if schemaErr != nil {
+			d.logger.Printf("wisp_reaper: %s: schema check error: %v", dbName, schemaErr)
+			db.Close()
+			continue
+		}
+		if !ok {
 			db.Close()
 			continue
 		}
@@ -291,10 +294,13 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		if err != nil {
 			continue
 		}
-		if ok, schemaErr := reaper.HasReaperSchema(db); !ok {
-			if schemaErr != nil {
-				d.logger.Printf("wisp_reaper: %s: schema check error: %v", dbName, schemaErr)
-			}
+		ok, schemaErr := reaper.HasReaperSchema(db)
+		if schemaErr != nil {
+			d.logger.Printf("wisp_reaper: %s: schema check error: %v", dbName, schemaErr)
+			db.Close()
+			continue
+		}
+		if !ok {
 			db.Close()
 			continue
 		}
@@ -324,10 +330,13 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		if err != nil {
 			continue
 		}
-		if ok, schemaErr := reaper.HasReaperSchema(db); !ok {
-			if schemaErr != nil {
-				d.logger.Printf("wisp_reaper: %s: schema check error: %v", dbName, schemaErr)
-			}
+		ok, schemaErr := reaper.HasReaperSchema(db)
+		if schemaErr != nil {
+			d.logger.Printf("wisp_reaper: %s: schema check error: %v", dbName, schemaErr)
+			db.Close()
+			continue
+		}
+		if !ok {
 			db.Close()
 			continue
 		}
@@ -356,10 +365,13 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		}
 		// Auto-close operates on the issues table, not wisps, but if the database
 		// has no beads schema at all we should skip it too.
-		if ok, schemaErr := reaper.HasReaperSchema(db); !ok {
-			if schemaErr != nil {
-				d.logger.Printf("wisp_reaper: %s: schema check error: %v", dbName, schemaErr)
-			}
+		ok, schemaErr := reaper.HasReaperSchema(db)
+		if schemaErr != nil {
+			d.logger.Printf("wisp_reaper: %s: schema check error: %v", dbName, schemaErr)
+			db.Close()
+			continue
+		}
+		if !ok {
 			db.Close()
 			continue
 		}
