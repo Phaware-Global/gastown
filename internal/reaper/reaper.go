@@ -251,18 +251,24 @@ type sqlRunner interface {
 // operations (wisps and issues). Returns false (no error) when tables are missing
 // — callers use this to skip databases that have incomplete beads schema (e.g.
 // partially initialized databases on the central Dolt server).
+//
+// Schema introspection uses SHOW COLUMNS rather than information_schema:
+// Dolt's information_schema.columns materializes metadata for every database
+// on the server (multiple seconds each on a busy multi-DB server), which blew
+// the old 5s budget here and made every reaper run silently skip every
+// database — blocking all wisp/mail cleanup (hq-09sb1).
 func HasReaperSchema(db *sql.DB) (bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultQueryTimeout)
 	defer cancel()
 
-	var count int
-	err := db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM information_schema.tables WHERE table_name IN ('wisps', 'issues', 'wisp_dependencies') AND table_schema = DATABASE()").Scan(&count)
-	if err != nil {
-		return false, fmt.Errorf("check reaper schema: %w", err)
-	}
-	if count < 3 {
-		return false, nil
+	for _, table := range []string{"wisps", "issues", "wisp_dependencies"} {
+		exists, err := tableExists(ctx, db, table)
+		if err != nil {
+			return false, fmt.Errorf("check reaper schema: %w", err)
+		}
+		if !exists {
+			return false, nil
+		}
 	}
 
 	hasWispDependencyColumns, err := hasColumns(ctx, db, "wisp_dependencies", "depends_on_issue_id", "depends_on_wisp_id", "depends_on_external")
@@ -277,26 +283,61 @@ func HasReaperSchema(db *sql.DB) (bool, error) {
 }
 
 func tableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {
-	var count int
-	err := db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ? AND table_schema = DATABASE()", table).Scan(&count)
-	return count > 0, err
+	cols, err := showColumns(ctx, db, table)
+	if err != nil {
+		return false, err
+	}
+	return cols != nil, nil
 }
 
 func hasColumns(ctx context.Context, db *sql.DB, table string, columns ...string) (bool, error) {
 	if len(columns) == 0 {
 		return true, nil
 	}
-	placeholders := strings.TrimRight(strings.Repeat("?,", len(columns)), ",")
-	args := make([]interface{}, 0, len(columns)+1)
-	args = append(args, table)
-	for _, column := range columns {
-		args = append(args, column)
+	cols, err := showColumns(ctx, db, table)
+	if err != nil || cols == nil {
+		return false, err
 	}
-	var count int
-	query := fmt.Sprintf("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name IN (%s)", placeholders)
-	err := db.QueryRowContext(ctx, query, args...).Scan(&count)
-	return count == len(columns), err
+	for _, column := range columns {
+		if !cols[column] {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// showColumns returns the set of column names of table, or nil (no error)
+// when the table does not exist. Table names here are compile-time constants,
+// never user input.
+func showColumns(ctx context.Context, db *sql.DB, table string) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, fmt.Sprintf("SHOW COLUMNS FROM `%s`", table)) //nolint:gosec // G201: table is a compile-time constant
+	if err != nil {
+		if isTableNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer rows.Close()
+
+	resultCols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	cols := make(map[string]bool)
+	for rows.Next() {
+		// First result column is Field (the column name); discard the rest.
+		var field string
+		scanDest := make([]interface{}, len(resultCols))
+		scanDest[0] = &field
+		for i := 1; i < len(scanDest); i++ {
+			scanDest[i] = new(sql.RawBytes)
+		}
+		if err := rows.Scan(scanDest...); err != nil {
+			return nil, err
+		}
+		cols[field] = true
+	}
+	return cols, rows.Err()
 }
 
 // Scan counts reaper candidates in a database without modifying anything.
