@@ -436,6 +436,41 @@ func DefaultOverrides() map[string]*HooksConfig {
 				},
 			},
 		},
+		// Mayor: autonomy guard — block synchronous user-input tools.
+		// The Mayor operates unattended and must never block the town on
+		// a human answer: it makes executive decisions on procedural
+		// matters itself, and escalates product/priority decisions to the
+		// overseer through asynchronous channels (gt escalate, Jira
+		// comments, GitHub comments). AskUserQuestion presents a blocking
+		// question UI; EnterPlanMode is the model's tool-call entry into
+		// plan mode (present in Claude Code v2.1.x — verify with
+		// `strings <claude-binary> | grep EnterPlanMode` before assuming
+		// otherwise), whose planning flow terminates in the synchronous
+		// ExitPlanMode plan-approval prompt. Both stall the session until
+		// a human notices — the exact freeze GUPP exists to prevent.
+		// Guarding the entry tool keeps the Mayor from ever reaching the
+		// approval prompt on its own. ExitPlanMode itself is intentionally
+		// NOT guarded: with EnterPlanMode blocked, the only way to be in
+		// plan mode is a human operator switching the mode manually, and
+		// that human-initiated plan must remain presentable/exitable.
+		"mayor": {
+			PreToolUse: []HookEntry{
+				{
+					Matcher: "AskUserQuestion",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: gtCommand("gt tap guard interactive-input"),
+					}},
+				},
+				{
+					Matcher: "EnterPlanMode",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: gtCommand("gt tap guard interactive-input"),
+					}},
+				},
+			},
+		},
 		// Reviewer roles: write-surface guard (P23-2376).
 		// The Reviewer's only sanctioned write surfaces are its review bead, its
 		// own worktree (checkout only), and PR review comments posted through
