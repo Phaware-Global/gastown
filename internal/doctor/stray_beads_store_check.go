@@ -128,22 +128,35 @@ func findStrayBeadsStores(townRoot string) []string {
 	// Names a misrouted join can produce: rig directory names, route path
 	// heads, and bead prefixes (with and without the trailing dash — the
 	// deacon incident produced a directory literally named "gt-").
+	// Route-derived values come verbatim from routes.jsonl, so reject
+	// anything empty, degenerate, or carrying path separators/traversal:
+	// a hostile or malformed route must not make the probe collapse onto a
+	// base's own .beads (empty name) or escape the town tree ("../..").
 	nameSet := map[string]bool{}
+	addName := func(name string) {
+		if name == "" || name == "." || name == ".." {
+			return
+		}
+		if strings.ContainsAny(name, `/\`) {
+			return
+		}
+		nameSet[name] = true
+	}
 	for _, rigDir := range rigDirs {
-		nameSet[filepath.Base(rigDir)] = true
+		addName(filepath.Base(rigDir))
 	}
 	if routes, err := beads.LoadRoutes(filepath.Join(townRoot, ".beads")); err == nil {
 		for _, r := range routes {
 			if r.Prefix != "" {
-				nameSet[r.Prefix] = true
-				nameSet[strings.TrimSuffix(r.Prefix, "-")] = true
+				addName(r.Prefix)
+				addName(strings.TrimSuffix(r.Prefix, "-"))
 			}
 			if r.Path != "" && r.Path != "." {
 				head := r.Path
 				if i := strings.IndexByte(head, '/'); i > 0 {
 					head = head[:i]
 				}
-				nameSet[head] = true
+				addName(head)
 			}
 		}
 	}
@@ -187,21 +200,26 @@ func findStrayBeadsStores(townRoot string) []string {
 }
 
 // enclosingCanonicalStore walks up from dir (staying inside townRoot) and
-// returns the first sibling .beads that looks like a real store or a
-// redirect pointer — the place misrouted writes should have gone. Redirect
-// pointers are resolved to their final store so a planted redirect never
-// chains through another redirect.
+// returns the first sibling .beads that resolves — through any redirect
+// pointers — to a real store; that is where misrouted writes should have
+// gone. Candidates whose redirect chain is broken or too deep are skipped
+// so a planted redirect never chains through another redirect or points at
+// a store that does not exist.
 func enclosingCanonicalStore(townRoot, dir string) string {
+	townRoot = filepath.Clean(townRoot)
+	dir = filepath.Clean(dir)
 	for {
 		candidate := filepath.Join(dir, ".beads")
 		if isCanonicalStore(candidate) {
-			return followRedirects(candidate)
+			if resolved := followRedirects(candidate); resolved != "" && isCanonicalStore(resolved) {
+				return resolved
+			}
 		}
 		if dir == townRoot {
 			return ""
 		}
 		parent := filepath.Dir(dir)
-		if parent == dir || !strings.HasPrefix(parent, townRoot) {
+		if parent == dir || (parent != townRoot && !strings.HasPrefix(parent, townRoot+string(filepath.Separator))) {
 			return ""
 		}
 		dir = parent
@@ -210,9 +228,11 @@ func enclosingCanonicalStore(townRoot, dir string) string {
 
 // followRedirects resolves a chain of .beads redirect pointers (bounded) to
 // the store they ultimately name. Redirect content is relative to the .beads
-// directory's parent, matching gt's redirect convention.
+// directory's parent, matching gt's redirect convention. Returns "" when the
+// chain is still redirecting at the depth cap, so callers never treat an
+// unresolved pointer as a final store.
 func followRedirects(beadsDir string) string {
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 8; i++ {
 		data, err := os.ReadFile(filepath.Join(beadsDir, "redirect"))
 		if err != nil {
 			return beadsDir
@@ -226,7 +246,7 @@ func followRedirects(beadsDir string) string {
 		}
 		beadsDir = target
 	}
-	return beadsDir
+	return ""
 }
 
 // isCanonicalStore reports whether beadsDir looks like a usable store or

@@ -140,3 +140,79 @@ func TestStrayBeadsStoreCheck_FixQuarantinesAndPlantsRedirect(t *testing.T) {
 		t.Errorf("expected OK after fix, got %v: %v", result.Status, result.Details)
 	}
 }
+
+// Regression tests for round-1 review findings: degenerate and hostile route
+// values must never make the probe collapse onto a base's own store or
+// escape the town tree, and unresolved redirect chains must not be planted.
+
+func TestStrayBeadsStoreCheck_DegenerateAndHostileRoutesIgnored(t *testing.T) {
+	townRoot, strayRig, strayDeacon := buildStrayTestTown(t)
+	for _, s := range []string{strayRig, strayDeacon} {
+		if err := os.RemoveAll(filepath.Dir(s)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The town store itself contains an embeddeddolt dir (as real towns do);
+	// an empty-name probe would collapse to <base>/.beads and flag it.
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads", "embeddeddolt", "hq"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A rig canonical store with embeddeddolt too.
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", ".beads", "embeddeddolt", "gt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Victim store outside the probing bases that a traversal route would reach.
+	victim := filepath.Join(townRoot, "victim", ".beads", "embeddeddolt", "x")
+	if err := os.MkdirAll(victim, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	routes := `{"prefix":"-","path":"x"}
+{"prefix":"../victim","path":"y"}
+{"prefix":"gt-","path":"gastown"}
+`
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(routes), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	check := NewStrayBeadsStoreCheck()
+	result := check.Run(&CheckContext{TownRoot: townRoot})
+	if result.Status != StatusOK {
+		t.Fatalf("degenerate/hostile routes must not produce strays, got %v: %v", result.Status, result.Details)
+	}
+}
+
+func TestFollowRedirectsRefusesUnresolvedChain(t *testing.T) {
+	root := t.TempDir()
+	// Build a redirect chain deeper than the cap: each hop points at the next.
+	var dirs []string
+	for i := 0; i < 10; i++ {
+		d := filepath.Join(root, "hop", "n"+string(rune('a'+i)), ".beads")
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		dirs = append(dirs, d)
+	}
+	for i := 0; i < len(dirs)-1; i++ {
+		rel, err := filepath.Rel(filepath.Dir(dirs[i]), dirs[i+1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dirs[i], "redirect"), []byte(rel), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := followRedirects(dirs[0]); got != "" {
+		t.Errorf("followRedirects on an over-deep chain = %q, want empty sentinel", got)
+	}
+
+	// A short chain resolves to the final store.
+	final := dirs[2]
+	if err := os.Remove(filepath.Join(final, "redirect")); err != nil {
+		t.Fatal(err)
+	}
+	if got := followRedirects(dirs[0]); got != final {
+		t.Errorf("followRedirects short chain = %q, want %q", got, final)
+	}
+}
