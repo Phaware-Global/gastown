@@ -15,6 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/reviewer"
+	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -491,18 +492,40 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 // over-scopes the diff when those refs are stale (gt-mu9: PR #136 round 1
 // reviewed the already-merged #135 as in-scope); CheckoutPRHeadDetached now
 // freshens the refs, and this pin removes the re-derivation entirely.
+// Every failure path warns to stderr (never stdout — the prompt is consumed
+// from stdout): a silently-disabled pin would be unobservable in production,
+// the same failure mode gt-mu9 fixed, re-expressed one layer up.
 func resolveReviewBaseSHA(prNumber int, sha string) string {
 	cwd, err := requireReviewerWorktree()
 	if err != nil {
+		style.PrintWarning("review base pin disabled (not in a reviewer worktree: %v) — the pass will derive the merge-base itself", err)
 		return ""
 	}
-	g := git.NewGit(cwd)
+	return computeReviewBaseSHA(git.NewGit(cwd), prNumber, sha)
+}
+
+// reviewBaseGit is the slice of git.Git that computeReviewBaseSHA needs,
+// narrowed to an interface so the base-resolution decision logic is testable
+// without a live gh or remote.
+type reviewBaseGit interface {
+	GhPrBaseBranch(prNumber int) (string, error)
+	RemoteDefaultBranch() string
+	MergeBase(a, b string) (string, error)
+}
+
+// computeReviewBaseSHA resolves the PR's base branch (gh baseRefName, falling
+// back to the remote default branch) and returns its merge-base with sha, or
+// "" if no merge-base is computable.
+func computeReviewBaseSHA(g reviewBaseGit, prNumber int, sha string) string {
 	baseBranch, err := g.GhPrBaseBranch(prNumber)
 	if err != nil || baseBranch == "" {
-		baseBranch = g.RemoteDefaultBranch()
+		fallback := g.RemoteDefaultBranch()
+		style.PrintWarning("could not resolve PR #%d base branch from GitHub (%v) — assuming %q", prNumber, err, fallback)
+		baseBranch = fallback
 	}
 	mergeBase, err := g.MergeBase("origin/"+baseBranch, sha)
 	if err != nil {
+		style.PrintWarning("review base pin disabled (merge-base of origin/%s and %s failed: %v) — the pass will derive the merge-base itself", baseBranch, sha, err)
 		return ""
 	}
 	return mergeBase
