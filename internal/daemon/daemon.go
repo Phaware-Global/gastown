@@ -1515,17 +1515,18 @@ func (d *Daemon) runDegradedBootTriage(b *boot.Boot) {
 func (d *Daemon) ensureDeaconRunning() {
 	const agentID = "deacon"
 
-	// Check restart tracker for backoff/crash loop
-	if d.restartTracker != nil {
+	// Check restart tracker for backoff/crash loop. CanRestart is the single
+	// gate: it now allows a half-open retry once the crash-loop recovery window
+	// elapses, so a transient crash storm no longer strands the Deacon off
+	// permanently. IsInCrashLoop only selects the log message.
+	if d.restartTracker != nil && !d.restartTracker.CanRestart(agentID) {
 		if d.restartTracker.IsInCrashLoop(agentID) {
-			d.logger.Printf("Deacon is in crash loop, skipping restart (use 'gt daemon clear-backoff deacon' to reset)")
-			return
-		}
-		if !d.restartTracker.CanRestart(agentID) {
+			d.logger.Printf("Deacon is in crash loop, holding restart until recovery window (use 'gt daemon clear-backoff deacon' to reset now)")
+		} else {
 			remaining := d.restartTracker.GetBackoffRemaining(agentID)
 			d.logger.Printf("Deacon restart in backoff, %s remaining", remaining.Round(time.Second))
-			return
 		}
+		return
 	}
 
 	mgr := deacon.NewManager(d.config.TownRoot)
@@ -1693,18 +1694,18 @@ func (d *Daemon) checkDeaconHeartbeat() {
 func (d *Daemon) restartStuckDeacon(sessionName, reason string) {
 	const agentID = "deacon"
 
-	// Check restart tracker before acting
-	if d.restartTracker != nil {
+	// Check restart tracker before acting. CanRestart is the single gate: while
+	// crash-looping it holds until the recovery window elapses, then permits a
+	// half-open retry rather than requiring a manual clear-backoff forever.
+	if d.restartTracker != nil && !d.restartTracker.CanRestart(agentID) {
 		if d.restartTracker.IsInCrashLoop(agentID) {
-			d.logger.Printf("Stuck-agent-dog: Deacon in crash loop, not restarting (use 'gt daemon clear-backoff deacon')")
+			d.logger.Printf("Stuck-agent-dog: Deacon in crash loop, holding restart until recovery window (use 'gt daemon clear-backoff deacon')")
 			d.notifySlack("admin", "critical", fmt.Sprintf("Deacon crash loop detected — manual intervention required. Reason: %s", reason))
-			return
-		}
-		if !d.restartTracker.CanRestart(agentID) {
+		} else {
 			remaining := d.restartTracker.GetBackoffRemaining(agentID)
 			d.logger.Printf("Stuck-agent-dog: Deacon restart in backoff, %s remaining", remaining.Round(time.Second))
-			return
 		}
+		return
 	}
 
 	// Distinguish a usage-limit pause from a true crash. If Claude is sitting
