@@ -15,6 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/reviewer"
+	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -338,7 +339,36 @@ func runReviewerCheckout(cmd *cobra.Command, args []string) error {
 		target = shortSHA(target)
 	}
 	fmt.Printf("Checked out PR #%d (%s) in %s\n", prNumber, target, cwd)
+
+	// Deterministically (re)build the codegraph index for the checked-out head so
+	// the review runs against a real index instead of silently degrading to
+	// Read/Grep. Failures are non-fatal but surfaced loudly: a missing index is a
+	// degraded review, not a broken one.
+	ensureReviewerCodegraphIndex(cwd)
 	return nil
+}
+
+// ensureReviewerCodegraphIndex synchronously (re)builds the codegraph index for
+// the reviewer worktree. It never fails the checkout — a review can still run in
+// Read/Grep fallback mode — but it reports exactly why the index is absent so the
+// gap is diagnosable (the reviewer previously reviewed with "no binary, empty
+// index" and no explanation).
+func ensureReviewerCodegraphIndex(worktree string) {
+	townRoot, _, rigPath, _, err := loadRigReviewConfig()
+	if err != nil {
+		style.PrintWarning("codegraph index skipped (rig context unresolved: %v)", err)
+		return
+	}
+	switch err := rig.EnsureCodegraphIndexSync(worktree, townRoot, rigPath); {
+	case err == nil:
+		fmt.Println("Codegraph index refreshed for the reviewed head")
+	case errors.Is(err, rig.ErrCodegraphDisabled):
+		fmt.Println("Codegraph indexing is disabled for this rig — review uses Read/Grep")
+	case errors.Is(err, rig.ErrCodegraphUnavailable):
+		style.PrintWarning("codegraph executable not found — review will fall back to Read/Grep (install codegraph in the reviewer rig's mise Node)")
+	default:
+		style.PrintWarning("codegraph indexing failed: %v — review will fall back to Read/Grep", err)
+	}
 }
 
 func runReviewerPerspectives(cmd *cobra.Command, args []string) error {

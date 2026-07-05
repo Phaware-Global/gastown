@@ -1,9 +1,13 @@
 package rig
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/config"
@@ -41,8 +45,29 @@ func writeRigSettings(t *testing.T, rigPath string, s *config.RigSettings) {
 	}
 }
 
+// writeFakeMiseCodegraph plants an executable codegraph at the mise Node install
+// path <miseData>/installs/node/<ver>/bin/codegraph and returns its path.
+func writeFakeMiseCodegraph(t *testing.T, miseData, nodeVer, script string) string {
+	t.Helper()
+	binDir := filepath.Join(miseData, "installs", "node", nodeVer, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(binDir, "codegraph")
+	if err := os.WriteFile(exe, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return exe
+}
+
+// isolatePATH points PATH at an empty dir so exec.LookPath can't find a real
+// codegraph installed on the dev box.
+func isolatePATH(t *testing.T) {
+	t.Helper()
+	t.Setenv("PATH", filepath.Join(t.TempDir(), "empty"))
+}
+
 func TestEnsureCodegraphIndex_DisabledByTown(t *testing.T) {
-	t.Parallel()
 	tmp := t.TempDir()
 	townRoot := filepath.Join(tmp, "town")
 	rigPath := filepath.Join(townRoot, "rig")
@@ -55,14 +80,13 @@ func TestEnsureCodegraphIndex_DisabledByTown(t *testing.T) {
 		CodeGraph: &config.CodeGraphConfig{Enabled: boolPtr(false)},
 	})
 
-	// Must not fail even though codegraph binary is not installed.
+	// Must not fail even though codegraph is not installed.
 	if err := EnsureCodegraphIndex(worktree, townRoot, rigPath); err != nil {
 		t.Errorf("expected nil error when disabled, got: %v", err)
 	}
 }
 
 func TestEnsureCodegraphIndex_DisabledByRig(t *testing.T) {
-	t.Parallel()
 	tmp := t.TempDir()
 	townRoot := filepath.Join(tmp, "town")
 	rigPath := filepath.Join(townRoot, "rig")
@@ -93,10 +117,321 @@ func TestEnsureCodegraphIndex_BinaryMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Enabled but codegraph not on PATH — should silently succeed.
-	t.Setenv("PATH", tmp) // tmp has no codegraph binary
+	// Enabled but codegraph resolvable nowhere — the background path skips silently.
+	isolatePATH(t)
+	t.Setenv("MISE_DATA_DIR", filepath.Join(tmp, "empty-mise")) // no installs
 
 	if err := EnsureCodegraphIndex(worktree, townRoot, rigPath); err != nil {
 		t.Errorf("expected nil error when binary missing, got: %v", err)
+	}
+}
+
+func TestResolveCodegraphExe_FindsHighestMiseInstall(t *testing.T) {
+	tmp := t.TempDir()
+	miseData := filepath.Join(tmp, "mise")
+	writeFakeMiseCodegraph(t, miseData, "22.0.0", "#!/bin/sh\nexit 0\n")
+	hi := writeFakeMiseCodegraph(t, miseData, "24.0.0", "#!/bin/sh\nexit 0\n")
+	// A mise alias dir ("lts") must NOT win over a concrete version, even though
+	// it sorts lexically higher than any numeric version.
+	writeFakeMiseCodegraph(t, miseData, "lts", "#!/bin/sh\nexit 0\n")
+
+	isolatePATH(t) // no PATH hit → must fall back to the mise-install scan
+	t.Setenv("MISE_DATA_DIR", miseData)
+
+	if got := resolveCodegraphExe(); got != hi {
+		t.Errorf("resolveCodegraphExe = %q, want highest concrete-version install %q", got, hi)
+	}
+}
+
+func TestResolveCodegraphExe_NoneFound(t *testing.T) {
+	tmp := t.TempDir()
+	isolatePATH(t)
+	t.Setenv("MISE_DATA_DIR", filepath.Join(tmp, "empty-mise"))
+
+	if got := resolveCodegraphExe(); got != "" {
+		t.Errorf("resolveCodegraphExe = %q, want empty", got)
+	}
+}
+
+func TestResolveCodegraphExe_AcceptsNonShimPATHHit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake codegraph is a shell script")
+	}
+	// A standalone/global install (not under mise) on PATH must be accepted.
+	tmp := t.TempDir()
+	globalBin := filepath.Join(tmp, "usr", "local", "bin")
+	if err := os.MkdirAll(globalBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(globalBin, "codegraph")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", globalBin)
+	t.Setenv("MISE_DATA_DIR", filepath.Join(tmp, "empty-mise"))
+
+	if got := resolveCodegraphExe(); got != exe {
+		t.Errorf("resolveCodegraphExe = %q, want the global install %q", got, exe)
+	}
+}
+
+func TestResolveCodegraphExe_RejectsShimPATHHit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake codegraph is a shell script")
+	}
+	// A mise shim on PATH must be rejected (it delegates to mise, which refuses
+	// under a Node pin); with no real install to fall back to, resolution fails.
+	tmp := t.TempDir()
+	shimDir := filepath.Join(tmp, "mise", "shims")
+	if err := os.MkdirAll(shimDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(shimDir, "codegraph"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", shimDir)
+	t.Setenv("MISE_DATA_DIR", filepath.Join(tmp, "empty-mise"))
+
+	if got := resolveCodegraphExe(); got != "" {
+		t.Errorf("resolveCodegraphExe = %q, want empty (shim rejected, no install fallback)", got)
+	}
+}
+
+func TestCodegraphSubcommand(t *testing.T) {
+	wt := t.TempDir()
+	if got := codegraphSubcommand(wt); got != "init" {
+		t.Errorf("fresh worktree: got %q, want init", got)
+	}
+	if err := os.MkdirAll(filepath.Join(wt, ".codegraph"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := codegraphSubcommand(wt); got != "index" {
+		t.Errorf("initialized worktree: got %q, want index", got)
+	}
+}
+
+func TestEnsureCodegraphIndexSync_UnavailableSurfaces(t *testing.T) {
+	tmp := t.TempDir()
+	townRoot := filepath.Join(tmp, "town")
+	rigPath := filepath.Join(townRoot, "rig")
+	worktree := filepath.Join(tmp, "worktree")
+	if err := os.MkdirAll(worktree, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeTownSettings(t, townRoot, &config.TownSettings{
+		CodeGraph: &config.CodeGraphConfig{Enabled: boolPtr(true)},
+	})
+
+	isolatePATH(t)
+	t.Setenv("MISE_DATA_DIR", filepath.Join(tmp, "empty-mise"))
+
+	// Unlike the background path, the synchronous path must surface the gap so the
+	// reviewer knows the index is absent rather than reviewing blind.
+	if err := EnsureCodegraphIndexSync(worktree, townRoot, rigPath); !errors.Is(err, ErrCodegraphUnavailable) {
+		t.Errorf("expected ErrCodegraphUnavailable, got: %v", err)
+	}
+}
+
+func TestEnsureCodegraphIndexSync_RunsResolvedBinary(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake codegraph is a shell script")
+	}
+	tmp := t.TempDir()
+	townRoot := filepath.Join(tmp, "town")
+	rigPath := filepath.Join(townRoot, "rig")
+	worktree := filepath.Join(tmp, "worktree")
+	if err := os.MkdirAll(worktree, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeTownSettings(t, townRoot, &config.TownSettings{
+		CodeGraph: &config.CodeGraphConfig{Enabled: boolPtr(true)},
+	})
+
+	// A fake codegraph (no sibling node) that records the subcommand it was run
+	// with, proving the resolver reached a mise-install binary and ran it.
+	miseData := filepath.Join(tmp, "mise")
+	marker := filepath.Join(tmp, "invoked")
+	writeFakeMiseCodegraph(t, miseData, "24.0.0", "#!/bin/sh\nprintf '%s' \"$1\" > "+marker+"\nexit 0\n")
+
+	isolatePATH(t)
+	t.Setenv("MISE_DATA_DIR", miseData)
+
+	if err := EnsureCodegraphIndexSync(worktree, townRoot, rigPath); err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+	got, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("codegraph was not invoked: %v", err)
+	}
+	if string(got) != "init" {
+		t.Errorf("subcommand = %q, want init (fresh worktree)", string(got))
+	}
+}
+
+func TestEnsureCodegraphIndexSync_DisabledReturnsSentinel(t *testing.T) {
+	tmp := t.TempDir()
+	townRoot := filepath.Join(tmp, "town")
+	rigPath := filepath.Join(townRoot, "rig")
+	worktree := filepath.Join(tmp, "worktree")
+	if err := os.MkdirAll(worktree, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeTownSettings(t, townRoot, &config.TownSettings{
+		CodeGraph: &config.CodeGraphConfig{Enabled: boolPtr(false)},
+	})
+
+	// Disabled must be distinguishable from a successful build so the reviewer
+	// reports "disabled" rather than a false "index refreshed".
+	if err := EnsureCodegraphIndexSync(worktree, townRoot, rigPath); !errors.Is(err, ErrCodegraphDisabled) {
+		t.Errorf("expected ErrCodegraphDisabled when indexing is off, got: %v", err)
+	}
+}
+
+func TestIsSensitiveEnv(t *testing.T) {
+	cases := map[string]bool{
+		"GITHUB_TOKEN":             true,
+		"GT_REVIEWER_GITHUB_TOKEN": true,
+		"AWS_SECRET_ACCESS_KEY":    true,
+		"MY_PASSWORD":              true,
+		"NPM_CONFIG_CREDENTIAL":    true,
+		"SSH_PRIVATE_KEY":          true,
+		"PATH":                     false,
+		"HOME":                     false,
+		"NODE_ENV":                 false,
+		"MISE_DATA_DIR":            false,
+	}
+	for name, want := range cases {
+		if got := isSensitiveEnv(name); got != want {
+			t.Errorf("isSensitiveEnv(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestCodegraphEnv_StripsSecretsAndSetsPATH(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_secret")
+	t.Setenv("HOME", "/home/reviewer")
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	env := codegraphEnv("/opt/mise/node/24/bin")
+
+	var sawHome, sawToken, sawPath bool
+	for _, kv := range env {
+		switch {
+		case strings.HasPrefix(kv, "HOME="):
+			sawHome = true
+		case strings.HasPrefix(kv, "GITHUB_TOKEN="):
+			sawToken = true
+		case strings.HasPrefix(kv, "PATH="):
+			sawPath = true
+			if !strings.HasPrefix(kv, "PATH=/opt/mise/node/24/bin"+string(os.PathListSeparator)) {
+				t.Errorf("PATH not install-bin-first: %q", kv)
+			}
+		}
+	}
+	if sawToken {
+		t.Error("GITHUB_TOKEN must be stripped from the codegraph environment")
+	}
+	if !sawHome {
+		t.Error("HOME must be preserved in the codegraph environment")
+	}
+	if !sawPath {
+		t.Error("PATH must be set in the codegraph environment")
+	}
+}
+
+func writeExe(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIsNodeShebang(t *testing.T) {
+	tmp := t.TempDir()
+	nodeShim := filepath.Join(tmp, "cg-node")
+	writeExe(t, nodeShim, "#!/usr/bin/env node\nconsole.log(1)\n")
+	shScript := filepath.Join(tmp, "cg-sh")
+	writeExe(t, shScript, "#!/bin/sh\nexit 0\n")
+	binary := filepath.Join(tmp, "cg-bin")
+	writeExe(t, binary, "\x7fELF\x02\x01\x01\x00compiled")
+
+	if !isNodeShebang(nodeShim) {
+		t.Error("expected a #!/usr/bin/env node shim to be detected")
+	}
+	if isNodeShebang(shScript) {
+		t.Error("a /bin/sh script must not be detected as a node shim")
+	}
+	if isNodeShebang(binary) {
+		t.Error("a compiled binary must not be detected as a node shim")
+	}
+}
+
+func TestNodeForCodegraph(t *testing.T) {
+	tmp := t.TempDir()
+	miseData := filepath.Join(tmp, "misedata")
+	miseNode := filepath.Join(miseData, "installs", "node", "24.14.1", "bin", "node")
+	writeExe(t, miseNode, "#!/bin/sh\n")
+	t.Setenv("MISE_DATA_DIR", miseData)
+
+	// Node shim WITH a sibling node → the sibling node.
+	bin := filepath.Join(tmp, "mise", "installs", "node", "24.0.0", "bin")
+	cg := filepath.Join(bin, "codegraph")
+	writeExe(t, cg, "#!/usr/bin/env node\n")
+	sibling := filepath.Join(bin, "node")
+	writeExe(t, sibling, "#!/bin/sh\n")
+	if got := nodeForCodegraph(cg); got != sibling {
+		t.Errorf("with sibling node: got %q, want %q", got, sibling)
+	}
+
+	// npm-global node shim (no sibling node) → highest mise node.
+	globalCg := filepath.Join(tmp, "npm", "bin", "codegraph")
+	writeExe(t, globalCg, "#!/usr/bin/env node\n")
+	if got := nodeForCodegraph(globalCg); got != miseNode {
+		t.Errorf("npm-global shim: got %q, want mise node %q", got, miseNode)
+	}
+
+	// Compiled binary (no node shebang) → "" (run directly).
+	compiled := filepath.Join(tmp, "usr", "bin", "codegraph")
+	writeExe(t, compiled, "\x7fELFcompiled")
+	if got := nodeForCodegraph(compiled); got != "" {
+		t.Errorf("compiled binary: got %q, want empty (run directly)", got)
+	}
+}
+
+func TestCodegraphCommand_PATHPrependsRunningNodeDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake codegraph/node are shell scripts")
+	}
+	tmp := t.TempDir()
+
+	// npm-global codegraph shim (no sibling node) resolved via PATH.
+	globalBin := filepath.Join(tmp, "npm", "bin")
+	globalCg := filepath.Join(globalBin, "codegraph")
+	writeExe(t, globalCg, "#!/usr/bin/env node\n")
+	t.Setenv("PATH", globalBin)
+
+	// The Node it must run with comes from a mise install in a DIFFERENT dir.
+	miseData := filepath.Join(tmp, "misedata")
+	miseNodeBin := filepath.Join(miseData, "installs", "node", "24.14.1", "bin")
+	writeExe(t, filepath.Join(miseNodeBin, "node"), "#!/bin/sh\n")
+	t.Setenv("MISE_DATA_DIR", miseData)
+
+	cmd, ok := codegraphCommand(context.Background(), filepath.Join(tmp, "worktree"), "init")
+	if !ok {
+		t.Fatal("codegraphCommand returned ok=false")
+	}
+	// PATH must prepend the mise NODE's bin (so a child env-node hits it), not the
+	// npm bin (which has no node → worktree-pinned Node could be picked up).
+	var gotPath string
+	for _, kv := range cmd.Env {
+		if strings.HasPrefix(kv, "PATH=") {
+			gotPath = strings.TrimPrefix(kv, "PATH=")
+		}
+	}
+	if !strings.HasPrefix(gotPath, miseNodeBin+string(os.PathListSeparator)) {
+		t.Errorf("PATH = %q, want it to start with the running Node's bin %q", gotPath, miseNodeBin)
 	}
 }
