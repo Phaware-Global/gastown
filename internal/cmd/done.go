@@ -607,13 +607,14 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 		// Check no_merge or review_only flags on the hooked bead. When set,
 		// this is a non-code task (email, research, analysis, PRD review)
-		// where zero commits is expected.
+		// where zero commits is expected. Review-fix dispatches count too:
+		// a thread can be resolved with replies alone (zero commits).
 		// Must be checked before the zero-commit guard below (GH#2496, gt-kvf).
 		isNoMergeTask := false
 		if issueID != "" {
 			noMergeBd := beads.New(cwd)
 			if noMergeIssue, showErr := noMergeBd.Show(issueID); showErr == nil {
-				if af := beads.ParseAttachmentFields(noMergeIssue); af != nil && (af.NoMerge || af.ReviewOnly) {
+				if af := beads.ParseAttachmentFields(noMergeIssue); af != nil && (af.NoMerge || af.ReviewOnly || isReviewFixDispatch(af)) {
 					isNoMergeTask = true
 				}
 			}
@@ -975,11 +976,26 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		}
 		bd := beads.NewWithBeadsDir(cwd, resolvedBeads)
 
-		// Check for no_merge flag - if set, skip merge queue and notify for review
+		// Check for no_merge flag - if set, skip merge queue and notify for review.
+		//
+		// This read decides which merge path the completion takes, so a failure
+		// here must NOT silently fall through to the regular merge-queue path:
+		// an unreadable no_merge/review_pr flag on a review-fix bead is exactly
+		// how duplicate superseding MR beads got created against in-flight PRs
+		// (ha-z60). Fail the done and let the polecat retry instead.
 		sourceIssueForNoMerge, err := bd.Show(issueID)
-		if err == nil {
+		if err != nil {
+			return fmt.Errorf("reading source issue %s to select the merge path: %w\n"+
+				"Retry 'gt done' — completing via the merge queue without the bead's no_merge/review_pr flags risks duplicate MRs", issueID, err)
+		}
+		{
 			attachmentFields := beads.ParseAttachmentFields(sourceIssueForNoMerge)
-			if attachmentFields != nil && attachmentFields.NoMerge {
+			// Review-fix dispatches (review_pr set) are no_merge by contract:
+			// the polecat pushed fixes to an EXISTING PR branch that already
+			// has an in-flight MR bead. Entering the regular merge path would
+			// create a duplicate, superseding MR (ha-z60). Honoring review_pr
+			// here also covers beads slung before --no-merge was stamped.
+			if attachmentFields != nil && (attachmentFields.NoMerge || isReviewFixDispatch(attachmentFields)) {
 				fmt.Printf("%s No-merge mode: skipping merge queue\n", style.Bold.Render("→"))
 				fmt.Printf("  Branch: %s\n", branch)
 				fmt.Printf("  Issue: %s\n", issueID)
@@ -2512,6 +2528,15 @@ func stripOverlayCLAUDEmd(g *git.Git, defaultBranch string) bool {
 	fmt.Printf("%s Created cleanup commit to remove Gas Town overlay files\n",
 		style.Bold.Render("✓"))
 	return true
+}
+
+// isReviewFixDispatch reports whether the bead's attachment fields mark it as
+// a review-fix dispatch (slung with --review-pr against an existing PR).
+// Review-fix completions are no_merge by contract — the PR branch already has
+// an in-flight MR bead, and the regular merge path's same-branch/new-SHA
+// supersede semantics would mint a duplicate MR on every completion (ha-z60).
+func isReviewFixDispatch(fields *beads.AttachmentFields) bool {
+	return fields != nil && fields.ReviewPR > 0
 }
 
 // handoffPRArgs bundles the parameters for handoffPRToRefinery so the

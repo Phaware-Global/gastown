@@ -158,6 +158,12 @@ func TestReviewFixSlingArgs(t *testing.T) {
 	if argIndexOf(args, "--force") < 0 {
 		t.Errorf("missing --force (source issue is still hooked to the terminal initial polecat): %v", args)
 	}
+	// no_merge stamp is load-bearing: without it gt done routes the review-fix
+	// completion into the regular merge-queue path and creates a duplicate,
+	// superseding MR bead (ha-z60).
+	if argIndexOf(args, "--no-merge") < 0 {
+		t.Errorf("missing --no-merge (review-fix completions must never enter the merge queue): %v", args)
+	}
 }
 
 // TestReviewFixSlingArgs_FreshBead verifies that when a fresh dispatch bead is

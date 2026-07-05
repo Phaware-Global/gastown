@@ -623,6 +623,14 @@ func reviewFixSlingArgs(rigName string, dispatchBeadID string, state dispatchRev
 		rigName,
 		"--review-pr", fmt.Sprintf("%d", state.PRNumber),
 		"--review-branch", state.Branch,
+		// no_merge is part of the review-fix dispatch contract
+		// (docs/design/refinery-pr-workflow.md): the polecat pushes fixes to
+		// the EXISTING PR branch and must not trigger its own merge path.
+		// Without this stamp, gt done fell into the regular merge-queue path,
+		// whose same-branch/new-SHA supersede semantics created a duplicate
+		// MR bead on every review-fix completion and left the tracked MR's
+		// commit_sha stale (ha-z60).
+		"--no-merge",
 		"--args", mission,
 		"--force",
 	}
