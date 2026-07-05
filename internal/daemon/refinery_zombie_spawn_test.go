@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/refinery"
+	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -230,4 +232,209 @@ func TestEnsureRefineryRunning_HealthySessionNotReaped(t *testing.T) {
 	if strings.Contains(tmuxCalls, "kill-session") {
 		t.Errorf("kill-session must not be called for healthy refinery, tmux calls:\n%s", tmuxCalls)
 	}
+}
+
+// writeFakeSilentRefineryTmux writes a fake tmux for a session that is alive but
+// whose last activity was silentFor ago — letting a test place the session past
+// the hung threshold yet within (or beyond) the much longer wedge backstop.
+func writeFakeSilentRefineryTmux(t *testing.T, dir, tmuxLog string, silentFor time.Duration) {
+	t.Helper()
+	activity := fmt.Sprintf("%d", time.Now().Add(-silentFor).Unix())
+	script := fmt.Sprintf(`#!/bin/sh
+LOG_FILE="%s"
+printf "%%s\n" "$*" >> "$LOG_FILE"
+
+case "$*" in
+  *-V*)            echo "tmux 3.3a"; exit 0;;
+  *has-session*)   exit 0;;
+  *show-environment*) exit 1;;
+  *session_activity*) echo "%s";;
+  *display-message*) echo "claude";;
+  *list-panes*)    printf "claude\t\n"; exit 0;;
+  *kill-session*)  exit 0;;
+  *new-session*)   exit 0;;
+  *set-environment*) exit 0;;
+  *send-keys*)     exit 0;;
+  *) exit 1;;
+esac
+`, tmuxLog, activity)
+	path := filepath.Join(dir, "tmux")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake silent tmux: %v", err)
+	}
+}
+
+// runEnsureRefinerySilentTest drives ensureRefineryRunning for a running session
+// that has been silent for silentFor with a NON-EMPTY durable queue and NO pending
+// wake event, and returns the daemon log plus the recorded tmux calls.
+func runEnsureRefinerySilentTest(t *testing.T, silentFor time.Duration) (logOut, tmuxCalls string) {
+	t.Helper()
+	townRoot := setupRefineryZombieTest(t)
+	// No pending event: hasPendingEvents is false, so only the wedge backstop can reap.
+	if err := os.Remove(filepath.Join(townRoot, "events", "refinery", "pending.event")); err != nil {
+		t.Fatalf("remove pending event: %v", err)
+	}
+
+	fakeBinDir := t.TempDir()
+	tmuxLog := filepath.Join(t.TempDir(), "tmux.log")
+	if err := os.WriteFile(tmuxLog, []byte{}, 0o644); err != nil {
+		t.Fatalf("create tmux log: %v", err)
+	}
+
+	writeFakeSilentRefineryTmux(t, fakeBinDir, tmuxLog, silentFor)
+	writeFakeQueuedMRBD(t, fakeBinDir) // non-empty durable queue
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var logBuf strings.Builder
+	d := &Daemon{
+		config: &Config{TownRoot: townRoot},
+		logger: log.New(&logBuf, "", 0),
+		tmux:   tmux.NewTmux(),
+	}
+	d.ensureRefineryRunning("testrig")
+
+	data, err := os.ReadFile(tmuxLog)
+	if err != nil {
+		t.Fatalf("read tmux log: %v", err)
+	}
+	return logBuf.String(), string(data)
+}
+
+// TestEnsureRefineryRunning_IdleWithinBackstopNotReaped is the gt-pzf serial-killer
+// regression: a refinery silent past the hung threshold (default 30m) but WITHIN
+// the wedge backstop (8×), with a non-empty queue and no fresh wake event, must NOT
+// be reaped. The queued MR may be un-mergeable (blocked, failing CI, draft), so the
+// refinery is correctly idling on await-event; reaping it on queue-depth alone
+// respawns a session that idles and is killed again ("5 deaths in <20hrs").
+func TestEnsureRefineryRunning_IdleWithinBackstopNotReaped(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test requires bash for fake tmux/bd scripts")
+	}
+
+	// 1h silence: past the 30m hung threshold, well within the 4h wedge backstop.
+	got, tmuxCalls := runEnsureRefinerySilentTest(t, time.Hour)
+
+	if strings.Contains(got, "reaping for respawn") {
+		t.Errorf("idle refinery within the wedge backstop must not be reaped (serial-killer), got: %q", got)
+	}
+	if !strings.Contains(got, "not reaping") {
+		t.Errorf("expected log to note the idle session was left running, got: %q", got)
+	}
+	if strings.Contains(tmuxCalls, "kill-session") {
+		t.Errorf("kill-session must not be called for an idle refinery within the backstop, tmux calls:\n%s", tmuxCalls)
+	}
+}
+
+// TestEnsureRefineryRunning_WedgedPastBackstopReaped verifies the wedge backstop:
+// a refinery silent well beyond the backstop window (8×30m = 4h) WITH work queued
+// and no pending event is treated as wedged (froze mid-merge after consuming its
+// event) and reaped for respawn — closing the gt-cza stall the pending-event gate
+// alone would miss.
+func TestEnsureRefineryRunning_WedgedPastBackstopReaped(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test requires bash for fake tmux/bd scripts")
+	}
+
+	// 5h silence: past the 4h wedge backstop.
+	got, tmuxCalls := runEnsureRefinerySilentTest(t, 5*time.Hour)
+
+	if !strings.Contains(got, "wedge backstop") {
+		t.Errorf("expected wedge-backstop reap for a long-silent refinery with queued work, got: %q", got)
+	}
+	if !strings.Contains(tmuxCalls, "kill-session") {
+		t.Errorf("kill-session must be called to reap a wedged refinery past the backstop, tmux calls:\n%s", tmuxCalls)
+	}
+}
+
+// writeFakeQueuedMRBD writes a fake bd that reports a non-empty durable merge
+// queue: 'bd sql' (the merge-request wisp query used by Manager.Queue) returns
+// one open gt:merge-request row, 'bd show' returns a non-docked rig bead, and
+// 'bd list' returns empty. This drives refineryHasWork's durable-queue branch.
+func writeFakeQueuedMRBD(t *testing.T, dir string) {
+	t.Helper()
+	script := `#!/bin/sh
+SUB=""
+for arg in "$@"; do
+  case "$arg" in
+    -*) ;;
+    sql)  SUB=sql;  break ;;
+    list) SUB=list; break ;;
+    show) SUB=show; break ;;
+  esac
+done
+for arg in "$@"; do
+  case "$arg" in *-rig-*) BEAD_ID="$arg" ;; esac
+done
+case "$SUB" in
+  sql)
+    echo '[{"id":"xut-wisp-mr1","title":"Merge PR #1","description":"","status":"open","priority":2,"assignee":"","created_at":"2026-07-05 10:00:00","updated_at":"2026-07-05 10:00:00","created_by":"polecat","labels_csv":"gt:merge-request"}]'
+    exit 0 ;;
+  show)
+    if [ -n "${BEAD_ID:-}" ]; then
+      printf '[{"id":"%s","labels":[],"status":"open","issue_type":"rig"}]\n' "$BEAD_ID"
+    else
+      echo '[]'
+    fi
+    exit 0 ;;
+  *)
+    echo '[]'
+    exit 0 ;;
+esac
+`
+	path := filepath.Join(dir, "bd")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake queued-MR bd: %v", err)
+	}
+}
+
+// TestRefineryHasWork is the gt-pzf durable-queue regression: the daemon must
+// treat a merge-request queued in beads as work even when no transient .event
+// file is pending, so a down refinery with a queued MR is not stranded.
+func TestRefineryHasWork(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test requires bash for fake bd scripts")
+	}
+
+	newDaemon := func(townRoot string) *Daemon {
+		return &Daemon{config: &Config{TownRoot: townRoot}, logger: log.New(&strings.Builder{}, "", 0)}
+	}
+	newMgr := func(townRoot string) *refinery.Manager {
+		return refinery.NewManager(&rig.Rig{Name: "testrig", Path: filepath.Join(townRoot, "testrig")})
+	}
+
+	t.Run("pending event counts as work", func(t *testing.T) {
+		townRoot := setupRefineryZombieTest(t) // leaves a pending.event in place
+		fakeBinDir := t.TempDir()
+		writeFakeRefineryBD(t, fakeBinDir) // empty queue
+		t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		if !newDaemon(townRoot).refineryHasWork(newMgr(townRoot), "testrig") {
+			t.Error("expected a pending .event to count as work")
+		}
+	})
+
+	t.Run("empty queue and no events is no work", func(t *testing.T) {
+		townRoot := setupRefineryZombieTest(t)
+		if err := os.Remove(filepath.Join(townRoot, "events", "refinery", "pending.event")); err != nil {
+			t.Fatalf("remove pending event: %v", err)
+		}
+		fakeBinDir := t.TempDir()
+		writeFakeRefineryBD(t, fakeBinDir) // empty queue
+		t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		if newDaemon(townRoot).refineryHasWork(newMgr(townRoot), "testrig") {
+			t.Error("expected no work with an empty queue and no pending events")
+		}
+	})
+
+	t.Run("queued MR counts as work without any event", func(t *testing.T) {
+		townRoot := setupRefineryZombieTest(t)
+		if err := os.Remove(filepath.Join(townRoot, "events", "refinery", "pending.event")); err != nil {
+			t.Fatalf("remove pending event: %v", err)
+		}
+		fakeBinDir := t.TempDir()
+		writeFakeQueuedMRBD(t, fakeBinDir) // non-empty durable queue
+		t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		if !newDaemon(townRoot).refineryHasWork(newMgr(townRoot), "testrig") {
+			t.Error("expected a queued merge-request to count as work with no pending event (gt-pzf)")
+		}
+	})
 }
