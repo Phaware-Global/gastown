@@ -58,15 +58,14 @@ func (e *NeedsReviewResolutionError) Error() string {
 
 // VerifyReviewThreadsResolved calls provider.UnresolvedThreads and
 // returns a *NeedsReviewResolutionError listing any threads that are
-// still unresolved AND not outdated. Returns nil when the list is
-// empty (nothing blocking the merge) or a plain error on lookup
-// failure.
+// still unresolved. Returns nil when the list is empty (nothing
+// blocking the merge) or a plain error on lookup failure.
 //
-// Outdated threads (IsOutdated=true) are considered auto-dismissed:
-// the code they annotated has been replaced by later pushes and the
-// thread no longer applies to current HEAD. GitHub keeps outdated
-// threads in the listing for history, but they do not count as
-// "addressable" for a gate-checking purpose.
+// Outdated threads (IsOutdated=true) still block: GitHub's
+// required_review_thread_resolution branch protection blocks merge
+// based on isResolved alone, regardless of isOutdated. The code they
+// annotated may have been replaced by later pushes, but the thread
+// itself must still be explicitly resolved for GitHub to allow merge.
 //
 // out is optional — when non-nil, emits a one-line [Engineer] summary
 // of how many threads are blocking. Matches the logging shape used by
@@ -81,7 +80,7 @@ func VerifyReviewThreadsResolved(provider PRProvider, prNumber int, out io.Write
 	}
 	var blocking []UnresolvedThread
 	for _, t := range threads {
-		if t.IsResolved || t.IsOutdated {
+		if t.IsResolved {
 			continue
 		}
 		blocking = append(blocking, UnresolvedThread{
