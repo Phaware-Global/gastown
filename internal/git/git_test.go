@@ -2132,13 +2132,8 @@ func TestStashListForBranch_UndeterminedBranchReturnsNothing(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	for _, args := range [][]string{{"add", "."}, {"stash", "push", "-m", "other-worktree-stash"}} {
-		cmd := exec.Command("git", args...)
-		cmd.Dir = dir
-		if err := cmd.Run(); err != nil {
-			t.Fatalf("git %v: %v", args, err)
-		}
-	}
+	runGit(t, dir, "add", ".")
+	runGit(t, dir, "stash", "push", "-m", "other-worktree-stash")
 
 	for _, branch := range []string{"", "HEAD"} {
 		entries, err := g.StashListForBranch(branch)
@@ -2166,13 +2161,8 @@ func TestStashListForBranch_ScopesToRequestedBranch(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	for _, args := range [][]string{{"add", "."}, {"stash", "push", "-m", "mine"}} {
-		cmd := exec.Command("git", args...)
-		cmd.Dir = dir
-		if err := cmd.Run(); err != nil {
-			t.Fatalf("git %v: %v", args, err)
-		}
-	}
+	runGit(t, dir, "add", ".")
+	runGit(t, dir, "stash", "push", "-m", "mine")
 
 	// A different branch must see none of it.
 	other, err := g.StashListForBranch("polecat/someone-else")
