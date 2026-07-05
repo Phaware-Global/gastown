@@ -1846,21 +1846,20 @@ func (d *Daemon) ensureWitnessRunning(rigName string) {
 	d.logger.Printf("Witness session for %s started successfully", rigName)
 }
 
-// refineryHasWork reports whether the refinery for rigName has anything to
-// process: a pending transient wake event OR a durable merge-request queued in
-// beads. The durable-queue half is the source of truth (gt-pzf) — a refinery
-// whose wake event was already consumed must still (re)start, or be left
-// running, while an MR remains queued; keying only off .event files stranded
-// down refineries with queued work and serial-killed idle ones.
+// refineryHasWork reports whether a DOWN refinery for rigName should be
+// (re)started: true when there is a pending transient wake event OR a durable
+// merge-request queued in beads. The durable-queue half is the fix for a down
+// refinery whose wake event was already consumed while an MR stayed queued
+// (gt-pzf; graphql_api sat at MQ:1 with a dead refinery) — .event files alone
+// stranded it.
 //
-// The cheap .event check runs first; the beads queue read only happens when no
-// event is pending, and only on the down-spawn and hung-reap decision paths, so
-// the steady state (a healthy idle refinery) costs no extra subprocess.
-//
-// On a queue-read error it returns false — only confirmed work counts. That is
-// the safe default on both callers: never reap a silent session on uncertainty,
-// and never spawn-loop on a transient beads error. The next successful cycle
-// recovers, and genuine work also re-announces itself via a fresh wake event.
+// This is consulted only on the down-restart path, never for a running session:
+// a healthy idle refinery (the steady state) therefore never triggers the beads
+// query, and the reap decision does not depend on queue depth at all (a queued
+// MR may be un-mergeable, so a non-empty queue is no proof a silent session is
+// stuck). On a queue-read error it returns false — a down refinery could not act
+// during a beads outage anyway, and it restarts on the next successful cycle or
+// a fresh wake event, which is preferable to spawn-looping on a transient error.
 func (d *Daemon) refineryHasWork(mgr *refinery.Manager, rigName string) bool {
 	if d.hasPendingEvents("refinery") {
 		return true
@@ -1926,28 +1925,34 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 			return
 		}
 	} else {
-		// Session is process-alive. Hung-session check (gt-cza): a refinery that
-		// has produced no tmux output past the threshold WAS reaped as a zombie —
-		// but a refinery idling on await-event with an empty queue legitimately
-		// produces no output, so reaping it for silence killed healthy sessions
-		// every ~threshold (gt-pzf: "5 deaths in <20hrs"). This is the same
-		// serial-killer bug already removed for witnesses (see ensureWitnessRunning).
-		// A silent session is only genuinely stuck when there is work it should be
-		// doing; only then do we reap and respawn (preserving the gt-cza fix where
-		// a live-but-silent refinery blocked the merge pipeline for 39h).
+		// Session is process-alive. Hung-session reap (gt-cza): a refinery silent
+		// past the threshold may be wedged and blocking the merge pipeline (the
+		// original incident stalled merges for 39h). But a refinery idling on
+		// await-event legitimately produces no output, so reaping it for silence
+		// alone killed healthy sessions every ~threshold (gt-pzf: "5 deaths in
+		// <20hrs") — the same serial-killer bug already removed for witnesses (see
+		// ensureWitnessRunning).
+		//
+		// Reap only when a fresh, unconsumed wake event says the refinery should
+		// be acting NOW yet has gone silent. A non-empty durable queue does NOT
+		// justify a reap: the queued MR may be un-mergeable (blocked, failing CI,
+		// draft, awaiting a dependency), so the refinery is CORRECTLY idle and
+		// killing it just respawns a session that idles and is killed again. A
+		// healthy refinery consumes its wake events, so none pend; only a wedged
+		// one lets them pile up — which is exactly the reap signal we want.
 		hung := d.loadOperationalConfig().GetDaemonConfig().RefineryHungThresholdD()
 		if status := mgr.IsHealthy(hung); status == tmux.AgentHung {
-			if !d.refineryHasWork(mgr, rigName) {
-				d.logger.Printf("Refinery for %s is idle (empty queue, no pending events); leaving silent session running (not reaping)", rigName)
+			if !d.hasPendingEvents("refinery") {
+				d.logger.Printf("Refinery for %s is idle (no pending events); leaving silent session running (not reaping)", rigName)
 				return
 			}
-			d.logger.Printf("Refinery for %s is stuck (work pending, no activity for >%v), reaping for respawn", rigName, hung)
+			d.logger.Printf("Refinery for %s is stuck (pending events, no activity for >%v), reaping for respawn", rigName, hung)
 			sessionName := mgr.SessionName()
 			if err := d.tmux.KillSessionWithProcesses(sessionName); err != nil {
 				d.logger.Printf("Error killing hung refinery session %s: %v", sessionName, err)
 				return
 			}
-			// Work is still pending → fall through to Start() and respawn now.
+			// Pending events remain → fall through to Start() and respawn now.
 		}
 	}
 

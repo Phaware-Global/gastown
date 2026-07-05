@@ -236,18 +236,22 @@ func TestEnsureRefineryRunning_HealthySessionNotReaped(t *testing.T) {
 
 // TestEnsureRefineryRunning_IdleSilentSessionNotReaped is the gt-pzf serial-killer
 // regression: a refinery that is process-alive but silent past the hung threshold
-// must NOT be reaped when the merge queue is empty and no wake event is pending.
-// An idle refinery waiting on await-event legitimately produces no tmux output, so
-// reaping it for silence killed healthy sessions every ~threshold ("5 deaths in
-// <20hrs"). Only a silent session WITH pending work is genuinely stuck.
+// must NOT be reaped when no fresh wake event is pending — EVEN IF the durable
+// merge queue is non-empty. A queued MR may be un-mergeable (blocked, failing CI,
+// draft), so the refinery is correctly idling on await-event and produces no tmux
+// output; reaping it on queue-depth alone respawns a session that idles and is
+// killed again every ~threshold ("5 deaths in <20hrs"). Only a silent session
+// with a fresh, unconsumed wake event is treated as genuinely stuck.
 func TestEnsureRefineryRunning_IdleSilentSessionNotReaped(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test requires bash for fake tmux/bd scripts")
 	}
 
 	townRoot := setupRefineryZombieTest(t)
-	// Remove the pending event so hasPendingEvents is false; the fake bd returns
-	// an empty queue, so refineryHasWork reports no work — the idle case.
+	// Remove the pending event so hasPendingEvents is false. The fake bd reports a
+	// NON-EMPTY durable queue (an open MR) — proving the reap gates on the wake
+	// event, not on queue depth, so an idle refinery with a queued-but-unactionable
+	// MR is left running.
 	if err := os.Remove(filepath.Join(townRoot, "events", "refinery", "pending.event")); err != nil {
 		t.Fatalf("remove pending event: %v", err)
 	}
@@ -258,9 +262,10 @@ func TestEnsureRefineryRunning_IdleSilentSessionNotReaped(t *testing.T) {
 		t.Fatalf("create tmux log: %v", err)
 	}
 
-	// Hung tmux (silent since epoch) + empty-queue bd = idle-but-silent session.
+	// Hung tmux (silent since epoch) + non-empty queue = the serial-killer trap:
+	// silent session, work queued, but no fresh event → must NOT be reaped.
 	writeFakeHungRefineryTmux(t, fakeBinDir, tmuxLog)
-	writeFakeRefineryBD(t, fakeBinDir)
+	writeFakeQueuedMRBD(t, fakeBinDir)
 
 	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
