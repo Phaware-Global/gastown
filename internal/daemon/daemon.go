@@ -1846,6 +1846,33 @@ func (d *Daemon) ensureWitnessRunning(rigName string) {
 	d.logger.Printf("Witness session for %s started successfully", rigName)
 }
 
+// refineryHasWork reports whether the refinery for rigName has anything to
+// process: a pending transient wake event OR a durable merge-request queued in
+// beads. The durable-queue half is the source of truth (gt-pzf) — a refinery
+// whose wake event was already consumed must still (re)start, or be left
+// running, while an MR remains queued; keying only off .event files stranded
+// down refineries with queued work and serial-killed idle ones.
+//
+// The cheap .event check runs first; the beads queue read only happens when no
+// event is pending, and only on the down-spawn and hung-reap decision paths, so
+// the steady state (a healthy idle refinery) costs no extra subprocess.
+//
+// On a queue-read error it returns false — only confirmed work counts. That is
+// the safe default on both callers: never reap a silent session on uncertainty,
+// and never spawn-loop on a transient beads error. The next successful cycle
+// recovers, and genuine work also re-announces itself via a fresh wake event.
+func (d *Daemon) refineryHasWork(mgr *refinery.Manager, rigName string) bool {
+	if d.hasPendingEvents("refinery") {
+		return true
+	}
+	queue, err := mgr.Queue()
+	if err != nil {
+		d.logger.Printf("Refinery queue check for %s failed (treating as no work): %v", rigName, err)
+		return false
+	}
+	return len(queue) > 0
+}
+
 // ensureRefineriesRunning ensures refineries are running for configured rigs.
 // Called on each heartbeat to maintain refinery merge queue processing.
 // Respects the rigs filter in daemon.json patrol config.
@@ -1882,39 +1909,45 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 	}
 	mgr := refinery.NewManager(r)
 
-	// Event gate: don't spawn a new Claude session when there's nothing to process.
-	// If a refinery session is already running, Start() returns ErrAlreadyRunning (cheap).
-	// But spawning a NEW session with an empty queue burns API credits for nothing.
-	// The refinery formula uses await-event internally, so it will wake when events appear.
-	if !d.hasPendingEvents("refinery") {
-		// Check if session already exists before skipping — let running sessions continue
-		if running, _ := mgr.IsRunning(); !running {
-			d.logger.Printf("No pending refinery events and no session running for %s, skipping spawn", rigName)
-			return
-		}
-	}
+	running, _ := mgr.IsRunning()
 
-	// Zombie-aware hung-session check (gt-cza): a refinery that is process-alive
-	// but has produced no tmux output for > threshold is indistinguishable from a
-	// stalled session and must be restarted. This fixes the incident where a
-	// refinery PID was alive for 39h with no output, blocking the merge pipeline.
-	//
-	// Threshold is configurable (default 30m) so a normally idle refinery waiting
-	// on an empty queue is NOT flapped — its patrol cycle emits output well within
-	// that window. Only sessions that have gone truly silent get reaped here.
-	hung := d.loadOperationalConfig().GetDaemonConfig().RefineryHungThresholdD()
-	if status := mgr.IsHealthy(hung); status == tmux.AgentHung {
-		d.logger.Printf("Refinery for %s is zombie (no activity for >%v), reaping for respawn", rigName, hung)
-		sessionName := mgr.SessionName()
-		if err := d.tmux.KillSessionWithProcesses(sessionName); err != nil {
-			d.logger.Printf("Error killing hung refinery session %s: %v", sessionName, err)
+	if !running {
+		// Event gate: don't spawn a Claude session with nothing to process — the
+		// refinery formula await-events and wakes when work appears, so spawning
+		// on an empty queue burns API credits for nothing. But "work" is the
+		// DURABLE merge queue in beads, not just transient .event files: a wake
+		// event is consumed once, so an MR queued after its event was consumed
+		// (or whose event was lost when the session was reaped) must still bring
+		// the refinery back. Gating on .event files alone stranded down
+		// refineries with queued MRs — graphql_api sat at MQ:1 with a dead
+		// refinery (gt-pzf). refineryHasWork checks both signals.
+		if !d.refineryHasWork(mgr, rigName) {
+			d.logger.Printf("No refinery work (empty queue, no pending events) and no session running for %s, skipping spawn", rigName)
 			return
 		}
-		// Re-check the event gate after reaping: if the queue is empty, don't
-		// burn credits spawning a new session — let the next cycle handle it.
-		if !d.hasPendingEvents("refinery") {
-			d.logger.Printf("Refinery for %s reaped; no pending events, skipping respawn", rigName)
-			return
+	} else {
+		// Session is process-alive. Hung-session check (gt-cza): a refinery that
+		// has produced no tmux output past the threshold WAS reaped as a zombie —
+		// but a refinery idling on await-event with an empty queue legitimately
+		// produces no output, so reaping it for silence killed healthy sessions
+		// every ~threshold (gt-pzf: "5 deaths in <20hrs"). This is the same
+		// serial-killer bug already removed for witnesses (see ensureWitnessRunning).
+		// A silent session is only genuinely stuck when there is work it should be
+		// doing; only then do we reap and respawn (preserving the gt-cza fix where
+		// a live-but-silent refinery blocked the merge pipeline for 39h).
+		hung := d.loadOperationalConfig().GetDaemonConfig().RefineryHungThresholdD()
+		if status := mgr.IsHealthy(hung); status == tmux.AgentHung {
+			if !d.refineryHasWork(mgr, rigName) {
+				d.logger.Printf("Refinery for %s is idle (empty queue, no pending events); leaving silent session running (not reaping)", rigName)
+				return
+			}
+			d.logger.Printf("Refinery for %s is stuck (work pending, no activity for >%v), reaping for respawn", rigName, hung)
+			sessionName := mgr.SessionName()
+			if err := d.tmux.KillSessionWithProcesses(sessionName); err != nil {
+				d.logger.Printf("Error killing hung refinery session %s: %v", sessionName, err)
+				return
+			}
+			// Work is still pending → fall through to Start() and respawn now.
 		}
 	}
 
