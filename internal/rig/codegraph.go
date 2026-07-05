@@ -124,9 +124,11 @@ func codegraphCommand(ctx context.Context, worktreePath, subcmd string) (*exec.C
 
 	binDir := filepath.Dir(exe)
 	var cmd *exec.Cmd
-	if node := filepath.Join(binDir, "node"); fileExists(node) {
-		// Run the script under its sibling node explicitly, bypassing the
-		// env-node shebang entirely.
+	// Only a mise Node install's codegraph is a `#!/usr/bin/env node` shim that
+	// needs its sibling node to bypass the env-node shebang. A standalone/global
+	// install (e.g. a compiled binary in /usr/local/bin, sitting next to an
+	// unrelated `node`) must be run directly — wrapping it in `node` would fail.
+	if node := filepath.Join(binDir, "node"); isMiseNodeInstallBin(exe) && fileExists(node) {
 		cmd = exec.CommandContext(ctx, node, exe, subcmd, worktreePath)
 	} else {
 		cmd = exec.CommandContext(ctx, exe, subcmd, worktreePath)
@@ -138,15 +140,23 @@ func codegraphCommand(ctx context.Context, worktreePath, subcmd string) (*exec.C
 	return cmd, true
 }
 
-// resolveCodegraphExe finds the codegraph executable in a mise Node install,
-// robust to a Node-version pin that would send a PATH lookup to the mise shim.
-// Prefers a PATH hit that already points at a real install bin (the active
-// global Node's codegraph), then scans the mise Node installs directly.
+// resolveCodegraphExe finds the codegraph executable, robust to a Node-version
+// pin that would send a PATH lookup to the mise shim. It accepts any PATH hit
+// that is not the mise shim — a real mise install bin OR a standalone/global
+// install (npm-global, Homebrew, the standalone installer) — and only falls back
+// to scanning the mise Node installs when PATH yields nothing usable.
 func resolveCodegraphExe() string {
-	if p, err := exec.LookPath("codegraph"); err == nil && isMiseNodeInstallBin(p) {
+	if p, err := exec.LookPath("codegraph"); err == nil && !isMiseShim(p) {
 		return p
 	}
 	return bestMiseCodegraph(miseCodegraphCandidates())
+}
+
+// isMiseShim reports whether p is a mise shim (…/mise/shims/…). A shim delegates
+// to the mise binary, which refuses to run codegraph when the cwd pins a Node
+// version other than codegraph's — the exact failure this resolver routes around.
+func isMiseShim(p string) bool {
+	return strings.Contains(filepath.ToSlash(p), "/shims/")
 }
 
 // bestMiseCodegraph picks the codegraph under the highest concrete Node version,

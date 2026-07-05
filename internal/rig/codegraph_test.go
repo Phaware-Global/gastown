@@ -164,6 +164,50 @@ func TestResolveCodegraphExe_NoneFound(t *testing.T) {
 	}
 }
 
+func TestResolveCodegraphExe_AcceptsNonShimPATHHit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake codegraph is a shell script")
+	}
+	// A standalone/global install (not under mise) on PATH must be accepted.
+	tmp := t.TempDir()
+	globalBin := filepath.Join(tmp, "usr", "local", "bin")
+	if err := os.MkdirAll(globalBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(globalBin, "codegraph")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", globalBin)
+	t.Setenv("MISE_DATA_DIR", filepath.Join(tmp, "empty-mise"))
+
+	if got := resolveCodegraphExe(); got != exe {
+		t.Errorf("resolveCodegraphExe = %q, want the global install %q", got, exe)
+	}
+}
+
+func TestResolveCodegraphExe_RejectsShimPATHHit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake codegraph is a shell script")
+	}
+	// A mise shim on PATH must be rejected (it delegates to mise, which refuses
+	// under a Node pin); with no real install to fall back to, resolution fails.
+	tmp := t.TempDir()
+	shimDir := filepath.Join(tmp, "mise", "shims")
+	if err := os.MkdirAll(shimDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(shimDir, "codegraph"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", shimDir)
+	t.Setenv("MISE_DATA_DIR", filepath.Join(tmp, "empty-mise"))
+
+	if got := resolveCodegraphExe(); got != "" {
+		t.Errorf("resolveCodegraphExe = %q, want empty (shim rejected, no install fallback)", got)
+	}
+}
+
 func TestCodegraphSubcommand(t *testing.T) {
 	wt := t.TempDir()
 	if got := codegraphSubcommand(wt); got != "init" {
