@@ -130,11 +130,11 @@ func codegraphCommand(ctx context.Context, worktreePath, subcmd string) (*exec.C
 
 	binDir := filepath.Dir(exe)
 	var cmd *exec.Cmd
-	// Only a mise Node install's codegraph is a `#!/usr/bin/env node` shim that
-	// needs its sibling node to bypass the env-node shebang. A standalone/global
-	// install (e.g. a compiled binary in /usr/local/bin, sitting next to an
-	// unrelated `node`) must be run directly — wrapping it in `node` would fail.
-	if node := filepath.Join(binDir, "node"); isMiseNodeInstallBin(exe) && fileExists(node) {
+	// A `#!/usr/bin/env node` codegraph shim (mise or npm-global) must be run with
+	// an explicit Node, or the worktree's pinned Node hijacks the env-node shebang
+	// — the exact failure this resolver routes around. A standalone compiled binary
+	// (no node shebang) is run directly.
+	if node := nodeForCodegraph(exe); node != "" {
 		cmd = exec.CommandContext(ctx, node, exe, subcmd, worktreePath)
 	} else {
 		cmd = exec.CommandContext(ctx, exe, subcmd, worktreePath)
@@ -142,6 +142,40 @@ func codegraphCommand(ctx context.Context, worktreePath, subcmd string) (*exec.C
 	cmd.Dir = worktreePath
 	cmd.Env = codegraphEnv(binDir)
 	return cmd, true
+}
+
+// nodeForCodegraph returns a Node interpreter to run a `#!/usr/bin/env node`
+// codegraph shim with, chosen independently of the worktree's pinned Node.
+// Returns "" for a standalone compiled binary (no node shebang) or when no Node
+// can be found, in which case codegraph is run directly. Prefers the sibling
+// node in codegraph's own bin (the mise-install case); for an npm-global shim
+// whose bin has no node, falls back to the highest mise Node install so a
+// worktree Node pin still can't hijack the run.
+func nodeForCodegraph(exe string) string {
+	if !isNodeShebang(exe) {
+		return ""
+	}
+	if sib := filepath.Join(filepath.Dir(exe), "node"); fileExists(sib) {
+		return sib
+	}
+	return highestMiseNode()
+}
+
+// isNodeShebang reports whether exe begins with a `#!…node` shebang line (i.e. a
+// JS entrypoint that needs a Node interpreter), as opposed to a compiled binary.
+func isNodeShebang(exe string) bool {
+	f, err := os.Open(exe) //nolint:gosec // G304: exe is a resolved codegraph path, not user input
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	buf := make([]byte, 128)
+	n, _ := f.Read(buf)
+	line := string(buf[:n])
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = line[:i]
+	}
+	return strings.HasPrefix(line, "#!") && strings.Contains(line, "node")
 }
 
 // codegraphEnv returns the environment for a codegraph run: the process
@@ -201,19 +235,36 @@ func isMiseShim(p string) bool {
 	return strings.Contains(filepath.ToSlash(p), "/shims/")
 }
 
-// bestMiseCodegraph picks the codegraph under the highest concrete Node version,
-// preferring numeric version dirs over mise aliases (lts/latest/system). This
-// keeps the choice deterministic regardless of glob order, where a lexical sort
-// would rank an alias like "lts" above "24.14.1".
+// bestMiseCodegraph picks the codegraph under the highest concrete Node version.
 func bestMiseCodegraph(candidates []string) string {
+	return bestByNodeVersion(candidates)
+}
+
+// highestMiseNode returns the `node` from the highest concrete mise Node install,
+// or "" if none. Used to run an npm-global codegraph shim with a deterministic
+// Node when it has no sibling node of its own.
+func highestMiseNode() string {
+	dataDir := miseDataDir()
+	if dataDir == "" {
+		return ""
+	}
+	matches, _ := filepath.Glob(filepath.Join(dataDir, "installs", "node", "*", "bin", "node"))
+	return bestByNodeVersion(matches)
+}
+
+// bestByNodeVersion picks the path under …/installs/node/<ver>/bin/… with the
+// highest concrete Node version, preferring numeric version dirs over mise
+// aliases (lts/latest/system) so the choice is deterministic regardless of glob
+// order (a lexical sort would rank an alias like "lts" above "24.14.1").
+func bestByNodeVersion(paths []string) string {
 	best := ""
 	var bestVer []int
 	bestConcrete := false
-	for _, p := range candidates {
+	for _, p := range paths {
 		if !fileExists(p) {
 			continue
 		}
-		// …/installs/node/<ver>/bin/codegraph
+		// …/installs/node/<ver>/bin/<name>
 		ver := filepath.Base(filepath.Dir(filepath.Dir(p)))
 		parts, concrete := parseNodeVersion(ver)
 		switch {
@@ -261,27 +312,28 @@ func compareNodeVersions(a, b []int) int {
 	return 0
 }
 
-// isMiseNodeInstallBin reports whether p is a real mise Node install bin
-// (…/mise/installs/node/<ver>/bin/codegraph), not the …/mise/shims/codegraph
-// shim (which points at the mise binary and is Node-pin sensitive).
-func isMiseNodeInstallBin(p string) bool {
-	s := filepath.ToSlash(p)
-	return strings.Contains(s, "/installs/node/") && !strings.Contains(s, "/shims/")
-}
-
 // miseCodegraphCandidates returns every codegraph executable under the mise Node
-// installs, honoring MISE_DATA_DIR and falling back to the default data dir.
+// installs.
 func miseCodegraphCandidates() []string {
-	dataDir := os.Getenv("MISE_DATA_DIR")
+	dataDir := miseDataDir()
 	if dataDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil
-		}
-		dataDir = filepath.Join(home, ".local", "share", "mise")
+		return nil
 	}
 	matches, _ := filepath.Glob(filepath.Join(dataDir, "installs", "node", "*", "bin", "codegraph"))
 	return matches
+}
+
+// miseDataDir returns the mise data directory, honoring MISE_DATA_DIR and
+// falling back to the default (~/.local/share/mise).
+func miseDataDir() string {
+	if d := os.Getenv("MISE_DATA_DIR"); d != "" {
+		return d
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".local", "share", "mise")
 }
 
 func fileExists(p string) bool {

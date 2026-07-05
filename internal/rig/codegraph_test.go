@@ -125,19 +125,6 @@ func TestEnsureCodegraphIndex_BinaryMissing(t *testing.T) {
 	}
 }
 
-func TestIsMiseNodeInstallBin(t *testing.T) {
-	cases := map[string]bool{
-		"/home/u/.local/share/mise/installs/node/24.14.1/bin/codegraph": true,
-		"/home/u/.local/share/mise/shims/codegraph":                     false, // the mise shim (Node-pin sensitive)
-		"/usr/local/bin/codegraph":                                      false,
-	}
-	for p, want := range cases {
-		if got := isMiseNodeInstallBin(p); got != want {
-			t.Errorf("isMiseNodeInstallBin(%q) = %v, want %v", p, got, want)
-		}
-	}
-}
-
 func TestResolveCodegraphExe_FindsHighestMiseInstall(t *testing.T) {
 	tmp := t.TempDir()
 	miseData := filepath.Join(tmp, "mise")
@@ -348,5 +335,67 @@ func TestCodegraphEnv_StripsSecretsAndSetsPATH(t *testing.T) {
 	}
 	if !sawPath {
 		t.Error("PATH must be set in the codegraph environment")
+	}
+}
+
+func writeExe(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIsNodeShebang(t *testing.T) {
+	tmp := t.TempDir()
+	nodeShim := filepath.Join(tmp, "cg-node")
+	writeExe(t, nodeShim, "#!/usr/bin/env node\nconsole.log(1)\n")
+	shScript := filepath.Join(tmp, "cg-sh")
+	writeExe(t, shScript, "#!/bin/sh\nexit 0\n")
+	binary := filepath.Join(tmp, "cg-bin")
+	writeExe(t, binary, "\x7fELF\x02\x01\x01\x00compiled")
+
+	if !isNodeShebang(nodeShim) {
+		t.Error("expected a #!/usr/bin/env node shim to be detected")
+	}
+	if isNodeShebang(shScript) {
+		t.Error("a /bin/sh script must not be detected as a node shim")
+	}
+	if isNodeShebang(binary) {
+		t.Error("a compiled binary must not be detected as a node shim")
+	}
+}
+
+func TestNodeForCodegraph(t *testing.T) {
+	tmp := t.TempDir()
+	miseData := filepath.Join(tmp, "misedata")
+	miseNode := filepath.Join(miseData, "installs", "node", "24.14.1", "bin", "node")
+	writeExe(t, miseNode, "#!/bin/sh\n")
+	t.Setenv("MISE_DATA_DIR", miseData)
+
+	// Node shim WITH a sibling node → the sibling node.
+	bin := filepath.Join(tmp, "mise", "installs", "node", "24.0.0", "bin")
+	cg := filepath.Join(bin, "codegraph")
+	writeExe(t, cg, "#!/usr/bin/env node\n")
+	sibling := filepath.Join(bin, "node")
+	writeExe(t, sibling, "#!/bin/sh\n")
+	if got := nodeForCodegraph(cg); got != sibling {
+		t.Errorf("with sibling node: got %q, want %q", got, sibling)
+	}
+
+	// npm-global node shim (no sibling node) → highest mise node.
+	globalCg := filepath.Join(tmp, "npm", "bin", "codegraph")
+	writeExe(t, globalCg, "#!/usr/bin/env node\n")
+	if got := nodeForCodegraph(globalCg); got != miseNode {
+		t.Errorf("npm-global shim: got %q, want mise node %q", got, miseNode)
+	}
+
+	// Compiled binary (no node shebang) → "" (run directly).
+	compiled := filepath.Join(tmp, "usr", "bin", "codegraph")
+	writeExe(t, compiled, "\x7fELFcompiled")
+	if got := nodeForCodegraph(compiled); got != "" {
+		t.Errorf("compiled binary: got %q, want empty (run directly)", got)
 	}
 }
