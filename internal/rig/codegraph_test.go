@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/config"
@@ -276,5 +277,76 @@ func TestEnsureCodegraphIndexSync_RunsResolvedBinary(t *testing.T) {
 	}
 	if string(got) != "init" {
 		t.Errorf("subcommand = %q, want init (fresh worktree)", string(got))
+	}
+}
+
+func TestEnsureCodegraphIndexSync_DisabledReturnsSentinel(t *testing.T) {
+	tmp := t.TempDir()
+	townRoot := filepath.Join(tmp, "town")
+	rigPath := filepath.Join(townRoot, "rig")
+	worktree := filepath.Join(tmp, "worktree")
+	if err := os.MkdirAll(worktree, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeTownSettings(t, townRoot, &config.TownSettings{
+		CodeGraph: &config.CodeGraphConfig{Enabled: boolPtr(false)},
+	})
+
+	// Disabled must be distinguishable from a successful build so the reviewer
+	// reports "disabled" rather than a false "index refreshed".
+	if err := EnsureCodegraphIndexSync(worktree, townRoot, rigPath); !errors.Is(err, ErrCodegraphDisabled) {
+		t.Errorf("expected ErrCodegraphDisabled when indexing is off, got: %v", err)
+	}
+}
+
+func TestIsSensitiveEnv(t *testing.T) {
+	cases := map[string]bool{
+		"GITHUB_TOKEN":             true,
+		"GT_REVIEWER_GITHUB_TOKEN": true,
+		"AWS_SECRET_ACCESS_KEY":    true,
+		"MY_PASSWORD":              true,
+		"NPM_CONFIG_CREDENTIAL":    true,
+		"SSH_PRIVATE_KEY":          true,
+		"PATH":                     false,
+		"HOME":                     false,
+		"NODE_ENV":                 false,
+		"MISE_DATA_DIR":            false,
+	}
+	for name, want := range cases {
+		if got := isSensitiveEnv(name); got != want {
+			t.Errorf("isSensitiveEnv(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestCodegraphEnv_StripsSecretsAndSetsPATH(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghp_secret")
+	t.Setenv("HOME", "/home/reviewer")
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	env := codegraphEnv("/opt/mise/node/24/bin")
+
+	var sawHome, sawToken, sawPath bool
+	for _, kv := range env {
+		switch {
+		case strings.HasPrefix(kv, "HOME="):
+			sawHome = true
+		case strings.HasPrefix(kv, "GITHUB_TOKEN="):
+			sawToken = true
+		case strings.HasPrefix(kv, "PATH="):
+			sawPath = true
+			if !strings.HasPrefix(kv, "PATH=/opt/mise/node/24/bin"+string(os.PathListSeparator)) {
+				t.Errorf("PATH not install-bin-first: %q", kv)
+			}
+		}
+	}
+	if sawToken {
+		t.Error("GITHUB_TOKEN must be stripped from the codegraph environment")
+	}
+	if !sawHome {
+		t.Error("HOME must be preserved in the codegraph environment")
+	}
+	if !sawPath {
+		t.Error("PATH must be set in the codegraph environment")
 	}
 }

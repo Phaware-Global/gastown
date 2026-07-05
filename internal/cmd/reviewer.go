@@ -362,6 +362,8 @@ func ensureReviewerCodegraphIndex(worktree string) {
 	switch err := rig.EnsureCodegraphIndexSync(worktree, townRoot, rigPath); {
 	case err == nil:
 		fmt.Println("Codegraph index refreshed for the reviewed head")
+	case errors.Is(err, rig.ErrCodegraphDisabled):
+		fmt.Println("Codegraph indexing is disabled for this rig — review uses Read/Grep")
 	case errors.Is(err, rig.ErrCodegraphUnavailable):
 		style.PrintWarning("codegraph executable not found — review will fall back to Read/Grep (install codegraph in the reviewer rig's mise Node)")
 	default:

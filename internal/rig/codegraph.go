@@ -24,6 +24,11 @@ const codegraphSyncTimeout = 10 * time.Minute
 // index (the reviewer) surface this loudly rather than reviewing with no index.
 var ErrCodegraphUnavailable = errors.New("codegraph executable not found")
 
+// ErrCodegraphDisabled indicates codegraph indexing is turned off for the
+// town/rig, so no index was built. Distinct from ErrCodegraphUnavailable so a
+// caller can report "disabled" rather than a false "index refreshed".
+var ErrCodegraphDisabled = errors.New("codegraph indexing disabled")
+
 // EnsureCodegraphIndex launches a background codegraph index build on the
 // worktree when indexing is enabled for this town/rig. Non-fatal and
 // best-effort: used for polecat/refinery worktrees where the index can warm up
@@ -55,16 +60,17 @@ func EnsureCodegraphIndex(worktreePath, townRoot, rigPath string) error {
 // EnsureCodegraphIndexSync builds the codegraph index synchronously and waits
 // for completion, guaranteeing a fresh index before the caller proceeds. The
 // reviewer checkout uses this so a review runs against a real index instead of
-// silently degrading to Read/Grep. Returns ErrCodegraphUnavailable when the
-// executable can't be located so the caller can warn instead of reviewing blind;
-// nil when indexing is disabled.
+// silently degrading to Read/Grep. Returns ErrCodegraphDisabled when indexing is
+// off for the town/rig and ErrCodegraphUnavailable when the executable can't be
+// located — distinct signals so the caller reports "disabled" vs "missing"
+// accurately instead of a misleading success.
 func EnsureCodegraphIndexSync(worktreePath, townRoot, rigPath string) error {
 	enabled, err := codegraphEnabled(townRoot, rigPath)
 	if err != nil {
 		return err
 	}
 	if !enabled {
-		return nil
+		return ErrCodegraphDisabled
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), codegraphSyncTimeout)
@@ -134,10 +140,46 @@ func codegraphCommand(ctx context.Context, worktreePath, subcmd string) (*exec.C
 		cmd = exec.CommandContext(ctx, exe, subcmd, worktreePath)
 	}
 	cmd.Dir = worktreePath
-	// Prepend codegraph's own Node bin so any `node`/child resolution shadows the
-	// mise shim and the worktree's pinned Node.
-	cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	cmd.Env = codegraphEnv(binDir)
 	return cmd, true
+}
+
+// codegraphEnv returns the environment for a codegraph run: the process
+// environment with credential-bearing variables stripped, then codegraph's own
+// Node bin prepended to PATH (so any `node`/child resolution shadows the mise
+// shim and the worktree's pinned Node). The reviewer runs the index over an
+// external contributor's checked-out PR head, so secrets like GITHUB_TOKEN must
+// not be in scope — codegraph is a static indexer, but not handing it the
+// reviewer's credentials is cheap defense-in-depth if it ever touches
+// repo-resolved tooling.
+func codegraphEnv(binDir string) []string {
+	origPath := os.Getenv("PATH")
+	env := make([]string, 0, len(os.Environ())+1)
+	for _, kv := range os.Environ() {
+		i := strings.IndexByte(kv, '=')
+		if i < 0 {
+			continue
+		}
+		name := kv[:i]
+		// PATH is rebuilt below; drop the original to avoid a duplicate key.
+		if name == "PATH" || isSensitiveEnv(name) {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return append(env, "PATH="+binDir+string(os.PathListSeparator)+origPath)
+}
+
+// isSensitiveEnv reports whether an environment variable name looks like it
+// carries a secret (token, key, password, credential).
+func isSensitiveEnv(name string) bool {
+	up := strings.ToUpper(name)
+	for _, needle := range []string{"TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "_KEY", "APIKEY", "ACCESS_KEY"} {
+		if strings.Contains(up, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveCodegraphExe finds the codegraph executable, robust to a Node-version
