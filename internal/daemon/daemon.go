@@ -1539,17 +1539,19 @@ func (d *Daemon) ensureDeaconRunning() {
 			}
 			return
 		}
+		// A failed start must still be recorded: it advances backoff and the
+		// crash-loop counter. Otherwise a half-open crash-loop retry whose start
+		// keeps erroring (e.g. Claude failing to launch under a load spike) would
+		// leave LastRestart pinned, so CanRestart stays true and the daemon would
+		// re-attempt the (up to 180s, blocking) start every heartbeat with no
+		// backoff.
 		d.logger.Printf("Error starting Deacon: %v", err)
+		d.recordDeaconRestart(agentID)
 		return
 	}
 
-	// Record this restart attempt for backoff tracking
-	if d.restartTracker != nil {
-		d.restartTracker.RecordRestart(agentID)
-		if err := d.restartTracker.Save(); err != nil {
-			d.logger.Printf("Warning: failed to save restart state: %v", err)
-		}
-	}
+	// Record this restart attempt for backoff tracking.
+	d.recordDeaconRestart(agentID)
 
 	// Track when we started the Deacon to prevent race condition in checkDeaconHeartbeat.
 	// The heartbeat file will still be stale until the Deacon runs a full patrol cycle.
@@ -1557,6 +1559,27 @@ func (d *Daemon) ensureDeaconRunning() {
 	d.metrics.recordRestart(d.ctx, "deacon")
 	telemetry.RecordDaemonRestart(d.ctx, "deacon")
 	d.logger.Println("Deacon started successfully")
+}
+
+// recordDeaconRestart records a Deacon (re)start attempt — success or failure —
+// so backoff and crash-loop accounting always advance, and raises the crash-loop
+// admin alert once, on the transition into crash-loop. The alert lives here
+// rather than on the restartStuckDeacon path because checkDeaconHeartbeat skips
+// that path entirely while the Deacon is crash-looping, so it could never fire
+// there.
+func (d *Daemon) recordDeaconRestart(agentID string) {
+	if d.restartTracker == nil {
+		return
+	}
+	wasLooping := d.restartTracker.IsInCrashLoop(agentID)
+	d.restartTracker.RecordRestart(agentID)
+	if err := d.restartTracker.Save(); err != nil {
+		d.logger.Printf("Warning: failed to save restart state: %v", err)
+	}
+	if !wasLooping && d.restartTracker.IsInCrashLoop(agentID) {
+		d.logger.Printf("Deacon entered crash-loop after repeated restart failures")
+		d.notifySlack("admin", "critical", "Deacon crash loop detected — repeated restart failures. The daemon will auto-retry after the recovery window; run 'gt daemon clear-backoff deacon' to reset sooner.")
+	}
 }
 
 // deaconGracePeriod returns the config-driven deacon grace period.
@@ -1699,8 +1722,11 @@ func (d *Daemon) restartStuckDeacon(sessionName, reason string) {
 	// half-open retry rather than requiring a manual clear-backoff forever.
 	if d.restartTracker != nil && !d.restartTracker.CanRestart(agentID) {
 		if d.restartTracker.IsInCrashLoop(agentID) {
+			// The crash-loop admin alert is raised at arm time in
+			// recordDeaconRestart, not here — this path is unreachable while
+			// crash-looping (checkDeaconHeartbeat skips it), so alerting here
+			// would be dead code.
 			d.logger.Printf("Stuck-agent-dog: Deacon in crash loop, holding restart until recovery window (use 'gt daemon clear-backoff deacon')")
-			d.notifySlack("admin", "critical", fmt.Sprintf("Deacon crash loop detected — manual intervention required. Reason: %s", reason))
 		} else {
 			remaining := d.restartTracker.GetBackoffRemaining(agentID)
 			d.logger.Printf("Stuck-agent-dog: Deacon restart in backoff, %s remaining", remaining.Round(time.Second))

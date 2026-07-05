@@ -62,6 +62,34 @@ func TestRecordRestart_ClearsCrashLoopOnRecoveryRetry(t *testing.T) {
 	}
 }
 
+// TestCanRestart_RecordedRetryReimposesBackoff is the regression for the
+// hammering failure mode: after the half-open retry is permitted, the daemon
+// must RECORD the attempt (even when the start fails) so backoff is re-imposed
+// and the next heartbeat does not retry immediately. Without recording the
+// failed attempt, LastRestart stays pinned and CanRestart remains true every
+// heartbeat, re-attempting a blocking start with no backoff.
+func TestCanRestart_RecordedRetryReimposesBackoff(t *testing.T) {
+	rt := NewRestartTracker(t.TempDir(), RestartTrackerConfig{})
+	const agentID = "deacon"
+
+	old := time.Now().Add(-(rt.config.StabilityPeriod + time.Minute))
+	rt.state.Agents[agentID] = &AgentRestartInfo{
+		RestartCount:   rt.config.CrashLoopCount,
+		CrashLoopSince: old,
+		LastRestart:    old,
+	}
+	if !rt.CanRestart(agentID) {
+		t.Fatal("expected a half-open retry to be permitted after the recovery window")
+	}
+
+	// Simulate the daemon recording the (possibly failed) retry attempt.
+	rt.RecordRestart(agentID)
+
+	if rt.CanRestart(agentID) {
+		t.Fatal("CanRestart = true immediately after a recorded retry; want false (backoff re-imposed) — otherwise a failing start hammers every heartbeat")
+	}
+}
+
 // TestCanRestart_RapidCrashStormStillArmsCrashLoop guards the other direction:
 // the recovery path must not defeat crash-loop detection. Rapid restarts within
 // the window re-arm the loop and CanRestart holds.
