@@ -234,24 +234,43 @@ func TestEnsureRefineryRunning_HealthySessionNotReaped(t *testing.T) {
 	}
 }
 
-// TestEnsureRefineryRunning_IdleSilentSessionNotReaped is the gt-pzf serial-killer
-// regression: a refinery that is process-alive but silent past the hung threshold
-// must NOT be reaped when no fresh wake event is pending — EVEN IF the durable
-// merge queue is non-empty. A queued MR may be un-mergeable (blocked, failing CI,
-// draft), so the refinery is correctly idling on await-event and produces no tmux
-// output; reaping it on queue-depth alone respawns a session that idles and is
-// killed again every ~threshold ("5 deaths in <20hrs"). Only a silent session
-// with a fresh, unconsumed wake event is treated as genuinely stuck.
-func TestEnsureRefineryRunning_IdleSilentSessionNotReaped(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("test requires bash for fake tmux/bd scripts")
-	}
+// writeFakeSilentRefineryTmux writes a fake tmux for a session that is alive but
+// whose last activity was silentFor ago — letting a test place the session past
+// the hung threshold yet within (or beyond) the much longer wedge backstop.
+func writeFakeSilentRefineryTmux(t *testing.T, dir, tmuxLog string, silentFor time.Duration) {
+	t.Helper()
+	activity := fmt.Sprintf("%d", time.Now().Add(-silentFor).Unix())
+	script := fmt.Sprintf(`#!/bin/sh
+LOG_FILE="%s"
+printf "%%s\n" "$*" >> "$LOG_FILE"
 
+case "$*" in
+  *-V*)            echo "tmux 3.3a"; exit 0;;
+  *has-session*)   exit 0;;
+  *show-environment*) exit 1;;
+  *session_activity*) echo "%s";;
+  *display-message*) echo "claude";;
+  *list-panes*)    printf "claude\t\n"; exit 0;;
+  *kill-session*)  exit 0;;
+  *new-session*)   exit 0;;
+  *set-environment*) exit 0;;
+  *send-keys*)     exit 0;;
+  *) exit 1;;
+esac
+`, tmuxLog, activity)
+	path := filepath.Join(dir, "tmux")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake silent tmux: %v", err)
+	}
+}
+
+// runEnsureRefinerySilentTest drives ensureRefineryRunning for a running session
+// that has been silent for silentFor with a NON-EMPTY durable queue and NO pending
+// wake event, and returns the daemon log plus the recorded tmux calls.
+func runEnsureRefinerySilentTest(t *testing.T, silentFor time.Duration) (logOut, tmuxCalls string) {
+	t.Helper()
 	townRoot := setupRefineryZombieTest(t)
-	// Remove the pending event so hasPendingEvents is false. The fake bd reports a
-	// NON-EMPTY durable queue (an open MR) — proving the reap gates on the wake
-	// event, not on queue depth, so an idle refinery with a queued-but-unactionable
-	// MR is left running.
+	// No pending event: hasPendingEvents is false, so only the wedge backstop can reap.
 	if err := os.Remove(filepath.Join(townRoot, "events", "refinery", "pending.event")); err != nil {
 		t.Fatalf("remove pending event: %v", err)
 	}
@@ -262,11 +281,8 @@ func TestEnsureRefineryRunning_IdleSilentSessionNotReaped(t *testing.T) {
 		t.Fatalf("create tmux log: %v", err)
 	}
 
-	// Hung tmux (silent since epoch) + non-empty queue = the serial-killer trap:
-	// silent session, work queued, but no fresh event → must NOT be reaped.
-	writeFakeHungRefineryTmux(t, fakeBinDir, tmuxLog)
-	writeFakeQueuedMRBD(t, fakeBinDir)
-
+	writeFakeSilentRefineryTmux(t, fakeBinDir, tmuxLog, silentFor)
+	writeFakeQueuedMRBD(t, fakeBinDir) // non-empty durable queue
 	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	var logBuf strings.Builder
@@ -275,23 +291,58 @@ func TestEnsureRefineryRunning_IdleSilentSessionNotReaped(t *testing.T) {
 		logger: log.New(&logBuf, "", 0),
 		tmux:   tmux.NewTmux(),
 	}
-
 	d.ensureRefineryRunning("testrig")
-
-	got := logBuf.String()
-	if strings.Contains(got, "reaping for respawn") {
-		t.Errorf("idle silent refinery must not be reaped (serial-killer), got: %q", got)
-	}
-	if !strings.Contains(got, "not reaping") {
-		t.Errorf("expected log to note the idle session was left running, got: %q", got)
-	}
 
 	data, err := os.ReadFile(tmuxLog)
 	if err != nil {
 		t.Fatalf("read tmux log: %v", err)
 	}
-	if strings.Contains(string(data), "kill-session") {
-		t.Errorf("kill-session must not be called for an idle refinery with an empty queue, tmux calls:\n%s", string(data))
+	return logBuf.String(), string(data)
+}
+
+// TestEnsureRefineryRunning_IdleWithinBackstopNotReaped is the gt-pzf serial-killer
+// regression: a refinery silent past the hung threshold (default 30m) but WITHIN
+// the wedge backstop (8×), with a non-empty queue and no fresh wake event, must NOT
+// be reaped. The queued MR may be un-mergeable (blocked, failing CI, draft), so the
+// refinery is correctly idling on await-event; reaping it on queue-depth alone
+// respawns a session that idles and is killed again ("5 deaths in <20hrs").
+func TestEnsureRefineryRunning_IdleWithinBackstopNotReaped(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test requires bash for fake tmux/bd scripts")
+	}
+
+	// 1h silence: past the 30m hung threshold, well within the 4h wedge backstop.
+	got, tmuxCalls := runEnsureRefinerySilentTest(t, time.Hour)
+
+	if strings.Contains(got, "reaping for respawn") {
+		t.Errorf("idle refinery within the wedge backstop must not be reaped (serial-killer), got: %q", got)
+	}
+	if !strings.Contains(got, "not reaping") {
+		t.Errorf("expected log to note the idle session was left running, got: %q", got)
+	}
+	if strings.Contains(tmuxCalls, "kill-session") {
+		t.Errorf("kill-session must not be called for an idle refinery within the backstop, tmux calls:\n%s", tmuxCalls)
+	}
+}
+
+// TestEnsureRefineryRunning_WedgedPastBackstopReaped verifies the wedge backstop:
+// a refinery silent well beyond the backstop window (8×30m = 4h) WITH work queued
+// and no pending event is treated as wedged (froze mid-merge after consuming its
+// event) and reaped for respawn — closing the gt-cza stall the pending-event gate
+// alone would miss.
+func TestEnsureRefineryRunning_WedgedPastBackstopReaped(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test requires bash for fake tmux/bd scripts")
+	}
+
+	// 5h silence: past the 4h wedge backstop.
+	got, tmuxCalls := runEnsureRefinerySilentTest(t, 5*time.Hour)
+
+	if !strings.Contains(got, "wedge backstop") {
+		t.Errorf("expected wedge-backstop reap for a long-silent refinery with queued work, got: %q", got)
+	}
+	if !strings.Contains(tmuxCalls, "kill-session") {
+		t.Errorf("kill-session must be called to reap a wedged refinery past the backstop, tmux calls:\n%s", tmuxCalls)
 	}
 }
 
