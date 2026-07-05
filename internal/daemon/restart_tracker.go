@@ -156,9 +156,18 @@ func (rt *RestartTracker) CanRestart(agentID string) bool {
 		return true
 	}
 
-	// Check if in crash loop
+	// Crash-loop is a circuit breaker, not a permanent lockout. Once the agent
+	// has sat in crash-loop past the stability period (measured from the last
+	// restart attempt), allow a single half-open retry instead of skipping
+	// restart forever. RecordRestart's stability reset then clears the fault
+	// count on that retry (the gap now exceeds StabilityPeriod), and RecordSuccess
+	// clears it if the agent was in fact already up; a fresh crash storm re-arms
+	// the loop. Without this, one transient burst — e.g. the Deacon crashing 5x
+	// during a Dolt/load spike — stranded the agent off permanently until a manual
+	// 'gt daemon clear-backoff'. The window intentionally reuses StabilityPeriod so
+	// the recovery cadence and the fault-count reset stay in lockstep.
 	if !info.CrashLoopSince.IsZero() {
-		return false
+		return time.Now().After(info.LastRestart.Add(rt.config.StabilityPeriod))
 	}
 
 	// Check backoff period
