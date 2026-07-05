@@ -1,6 +1,7 @@
 package rig
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -397,5 +398,40 @@ func TestNodeForCodegraph(t *testing.T) {
 	writeExe(t, compiled, "\x7fELFcompiled")
 	if got := nodeForCodegraph(compiled); got != "" {
 		t.Errorf("compiled binary: got %q, want empty (run directly)", got)
+	}
+}
+
+func TestCodegraphCommand_PATHPrependsRunningNodeDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake codegraph/node are shell scripts")
+	}
+	tmp := t.TempDir()
+
+	// npm-global codegraph shim (no sibling node) resolved via PATH.
+	globalBin := filepath.Join(tmp, "npm", "bin")
+	globalCg := filepath.Join(globalBin, "codegraph")
+	writeExe(t, globalCg, "#!/usr/bin/env node\n")
+	t.Setenv("PATH", globalBin)
+
+	// The Node it must run with comes from a mise install in a DIFFERENT dir.
+	miseData := filepath.Join(tmp, "misedata")
+	miseNodeBin := filepath.Join(miseData, "installs", "node", "24.14.1", "bin")
+	writeExe(t, filepath.Join(miseNodeBin, "node"), "#!/bin/sh\n")
+	t.Setenv("MISE_DATA_DIR", miseData)
+
+	cmd, ok := codegraphCommand(context.Background(), filepath.Join(tmp, "worktree"), "init")
+	if !ok {
+		t.Fatal("codegraphCommand returned ok=false")
+	}
+	// PATH must prepend the mise NODE's bin (so a child env-node hits it), not the
+	// npm bin (which has no node → worktree-pinned Node could be picked up).
+	var gotPath string
+	for _, kv := range cmd.Env {
+		if strings.HasPrefix(kv, "PATH=") {
+			gotPath = strings.TrimPrefix(kv, "PATH=")
+		}
+	}
+	if !strings.HasPrefix(gotPath, miseNodeBin+string(os.PathListSeparator)) {
+		t.Errorf("PATH = %q, want it to start with the running Node's bin %q", gotPath, miseNodeBin)
 	}
 }

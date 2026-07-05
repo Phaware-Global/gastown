@@ -128,19 +128,24 @@ func codegraphCommand(ctx context.Context, worktreePath, subcmd string) (*exec.C
 		return nil, false
 	}
 
-	binDir := filepath.Dir(exe)
 	var cmd *exec.Cmd
+	// The PATH prepend must point at the bin dir of the Node actually used to run
+	// codegraph, so a child `#!/usr/bin/env node` resolves to that same Node and
+	// not the worktree's pinned one. Default to codegraph's own bin (standalone
+	// binary / direct run); override to the chosen Node's bin below.
+	pathDir := filepath.Dir(exe)
 	// A `#!/usr/bin/env node` codegraph shim (mise or npm-global) must be run with
 	// an explicit Node, or the worktree's pinned Node hijacks the env-node shebang
 	// — the exact failure this resolver routes around. A standalone compiled binary
 	// (no node shebang) is run directly.
 	if node := nodeForCodegraph(exe); node != "" {
 		cmd = exec.CommandContext(ctx, node, exe, subcmd, worktreePath)
+		pathDir = filepath.Dir(node)
 	} else {
 		cmd = exec.CommandContext(ctx, exe, subcmd, worktreePath)
 	}
 	cmd.Dir = worktreePath
-	cmd.Env = codegraphEnv(binDir)
+	cmd.Env = codegraphEnv(pathDir)
 	return cmd, true
 }
 
@@ -179,14 +184,14 @@ func isNodeShebang(exe string) bool {
 }
 
 // codegraphEnv returns the environment for a codegraph run: the process
-// environment with credential-bearing variables stripped, then codegraph's own
-// Node bin prepended to PATH (so any `node`/child resolution shadows the mise
-// shim and the worktree's pinned Node). The reviewer runs the index over an
-// external contributor's checked-out PR head, so secrets like GITHUB_TOKEN must
-// not be in scope — codegraph is a static indexer, but not handing it the
-// reviewer's credentials is cheap defense-in-depth if it ever touches
-// repo-resolved tooling.
-func codegraphEnv(binDir string) []string {
+// environment with credential-bearing variables stripped, then nodeBinDir (the
+// bin dir of the Node used to run codegraph) prepended to PATH — so any
+// `node`/child resolution shadows the mise shim and the worktree's pinned Node.
+// The reviewer runs the index over an external contributor's checked-out PR
+// head, so secrets like GITHUB_TOKEN must not be in scope — codegraph is a
+// static indexer, but not handing it the reviewer's credentials is cheap
+// defense-in-depth if it ever touches repo-resolved tooling.
+func codegraphEnv(nodeBinDir string) []string {
 	origPath := os.Getenv("PATH")
 	env := make([]string, 0, len(os.Environ())+1)
 	for _, kv := range os.Environ() {
@@ -201,7 +206,7 @@ func codegraphEnv(binDir string) []string {
 		}
 		env = append(env, kv)
 	}
-	return append(env, "PATH="+binDir+string(os.PathListSeparator)+origPath)
+	return append(env, "PATH="+nodeBinDir+string(os.PathListSeparator)+origPath)
 }
 
 // isSensitiveEnv reports whether an environment variable name looks like it
