@@ -313,7 +313,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	// conflicts, we stop and let the agent/user resolve — surfacing the
 	// conflict is better than silently dropping the stash.
 	if cwdAvailable && doneCleanupStatus == "stash" {
-		entries, err := g.StashListForBranch()
+		// Scope to THIS polecat's branch explicitly (from GT_BRANCH/context, valid
+		// even on a detached HEAD). The stash stack is shared across all worktrees
+		// of the repo, so auto-popping anything not scoped to this branch could
+		// apply — and destroy — another worktree's stash (gt-pvx).
+		entries, err := g.StashListForBranch(branch)
 		if err != nil {
 			style.PrintWarning("auto-pop: could not list stashes: %v — orphaned stashes may remain", err)
 		} else if len(entries) > 0 {
@@ -331,7 +335,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					break
 				}
 				// After each pop, stash refs shift; re-fetch the list before next pop.
-				entries, err = g.StashListForBranch()
+				entries, err = g.StashListForBranch(branch)
 				if err != nil || len(entries) == 0 {
 					break
 				}

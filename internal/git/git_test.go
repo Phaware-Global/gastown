@@ -2071,9 +2071,13 @@ func TestStashListForBranch(t *testing.T) {
 	t.Parallel()
 	dir := initTestRepo(t)
 	g := NewGit(dir)
+	branch, err := g.CurrentBranch()
+	if err != nil {
+		t.Fatalf("CurrentBranch: %v", err)
+	}
 
 	// Empty repo — no stashes
-	entries, err := g.StashListForBranch()
+	entries, err := g.StashListForBranch(branch)
 	if err != nil {
 		t.Fatalf("StashListForBranch (empty): %v", err)
 	}
@@ -2081,7 +2085,7 @@ func TestStashListForBranch(t *testing.T) {
 		t.Errorf("StashListForBranch (empty) = %d entries, want 0", len(entries))
 	}
 
-	// Create two stashes on main
+	// Create two stashes on the branch
 	for i, content := range []string{"first", "second"} {
 		if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte(content), 0644); err != nil {
 			t.Fatal(err)
@@ -2096,7 +2100,7 @@ func TestStashListForBranch(t *testing.T) {
 		}
 	}
 
-	entries, err = g.StashListForBranch()
+	entries, err = g.StashListForBranch(branch)
 	if err != nil {
 		t.Fatalf("StashListForBranch: %v", err)
 	}
@@ -2110,6 +2114,82 @@ func TestStashListForBranch(t *testing.T) {
 	}
 	if entries[0].Message == "" || entries[1].Message == "" {
 		t.Errorf("Empty messages: [%s, %s]", entries[0].Message, entries[1].Message)
+	}
+}
+
+// TestStashListForBranch_UndeterminedBranchReturnsNothing is the gt-pvx
+// regression: the stash stack is repo-global (shared across every worktree), so
+// when the branch can't be scoped (empty, or a detached "HEAD"),
+// StashListForBranch must return NOTHING rather than the entire shared stack.
+// Otherwise gt done's auto-pop vacuums every worktree's stash into the current
+// tree and destroys it.
+func TestStashListForBranch_UndeterminedBranchReturnsNothing(t *testing.T) {
+	t.Parallel()
+	dir := initTestRepo(t)
+	g := NewGit(dir)
+
+	// Put a stash on the (shared) stack — as if another worktree created it.
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "."}, {"stash", "push", "-m", "other-worktree-stash"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+
+	for _, branch := range []string{"", "HEAD"} {
+		entries, err := g.StashListForBranch(branch)
+		if err != nil {
+			t.Fatalf("StashListForBranch(%q): %v", branch, err)
+		}
+		if len(entries) != 0 {
+			t.Errorf("StashListForBranch(%q) = %d entries, want 0 (must not return the shared stack)", branch, len(entries))
+		}
+	}
+}
+
+// TestStashListForBranch_ScopesToRequestedBranch verifies a stash created on one
+// branch is not returned when scoping to a different branch — the isolation that
+// stops one worktree from popping another's stash off the shared stack.
+func TestStashListForBranch_ScopesToRequestedBranch(t *testing.T) {
+	t.Parallel()
+	dir := initTestRepo(t)
+	g := NewGit(dir)
+	onBranch, err := g.CurrentBranch()
+	if err != nil {
+		t.Fatalf("CurrentBranch: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "."}, {"stash", "push", "-m", "mine"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+
+	// A different branch must see none of it.
+	other, err := g.StashListForBranch("polecat/someone-else")
+	if err != nil {
+		t.Fatalf("StashListForBranch(other): %v", err)
+	}
+	if len(other) != 0 {
+		t.Errorf("StashListForBranch(other-branch) = %d, want 0 (must not see this branch's stash)", len(other))
+	}
+
+	// The stash's own branch sees it.
+	mine, err := g.StashListForBranch(onBranch)
+	if err != nil {
+		t.Fatalf("StashListForBranch(mine): %v", err)
+	}
+	if len(mine) != 1 {
+		t.Errorf("StashListForBranch(own-branch) = %d, want 1", len(mine))
 	}
 }
 
