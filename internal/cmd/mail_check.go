@@ -89,8 +89,8 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 		}
 
 		// Claim + emit queued nudges (from --mode=queue or --mode=wait-idle
-		// fallback). The nudge queue is per-session; CurrentSessionName reads
-		// GT_SESSION (no tmux subprocess, which busy-spins under load).
+		// fallback). The nudge queue is per-session; CurrentSessionName resolves
+		// the live session name with a bounded tmux query (GT_SESSION fallback).
 		sessionName := tmux.CurrentSessionName()
 		if sessionName != "" {
 			queuedNudges, claims, drainErr := nudge.DrainClaim(workDir, sessionName)

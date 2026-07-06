@@ -72,9 +72,20 @@ type QueuedNudge struct {
 
 // queueDir returns the nudge queue directory for a given session.
 // Path: <townRoot>/.runtime/nudge_queue/<session>/
+//
+// The session name is reduced to a single, traversal-safe path component. In the
+// current threat model the name comes from a trusted parent (GT_SESSION / the
+// canonical session resolver), never attacker-controlled input, but this is
+// defense-in-depth: neutralizing separators and parent-dir components guarantees
+// a malformed name can never escape <townRoot>/.runtime/nudge_queue, no matter
+// which side (enqueue or drain) constructs the path.
 func queueDir(townRoot, session string) string {
-	// Sanitize session name for filesystem safety
 	safe := strings.ReplaceAll(session, "/", "_")
+	safe = strings.ReplaceAll(safe, `\`, "_")
+	safe = strings.ReplaceAll(safe, "..", "_")
+	if safe == "" || safe == "." {
+		safe = "_"
+	}
 	return filepath.Join(townRoot, constants.DirRuntime, "nudge_queue", safe)
 }
 
@@ -202,11 +213,19 @@ func DrainClaim(townRoot, session string) ([]QueuedNudge, []string, error) {
 		return nil, nil, fmt.Errorf("reading nudge queue: %w", err)
 	}
 
-	// Requeue orphaned .claimed files from crashed drainers.
-	// A .claimed file older than staleClaimThreshold is certainly orphaned —
-	// normal processing completes in milliseconds. We rename it back to .json
-	// so it gets picked up on this or a future Drain call, rather than deleting
-	// it (which would permanently drop the nudge).
+	// Requeue orphaned .claimed files from abandoned drainers. A .claimed file
+	// older than staleClaimThreshold is treated as orphaned and renamed back to
+	// .json so it is picked up on a future drain, rather than deleted (which
+	// would permanently drop the nudge).
+	//
+	// INVARIANT: staleClaimThreshold must exceed the longest time any caller
+	// legitimately holds a claim before CommitClaims. Drain commits within
+	// milliseconds, but DrainClaim callers (the mail-check inject hook) hold a
+	// claim for the whole hook lifetime — bounded by Claude Code's hook timeout
+	// (~30s). The default threshold (5m) clears that by ~10x. Lowering
+	// operational.nudge.stale_claim_threshold below the max drain lifetime would
+	// let this sweep requeue a still-in-flight claim, delivering the same nudge
+	// twice.
 	staleThreshold := nudgeConfig(townRoot).StaleClaimThresholdD()
 	now := time.Now()
 	for _, entry := range entries {
@@ -309,15 +328,19 @@ func DrainClaim(townRoot, session string) ([]QueuedNudge, []string, error) {
 }
 
 // CommitClaims removes the claimed nudge files returned by DrainClaim. Call it
-// only after the nudges have been successfully delivered (e.g. the hook's output
-// was accepted). Files that are already gone — removed by a concurrent drainer
-// or restored by the orphan sweep — are ignored. A removal error is logged and
-// returned but is non-fatal: a leftover ".claimed" file is swept as an orphan on
-// a later drain, so the worst case is a delayed redelivery, never a lost nudge.
+// only after the nudges have been delivered (e.g. the hook's output was
+// accepted). Files that are already gone — removed by a concurrent drainer or
+// restored by the orphan sweep — are ignored.
+//
+// Removal is retried once on a transient error: a claim that survives an
+// already-accepted delivery is worse than a delay, because the orphan sweep will
+// requeue it and the agent then sees the SAME nudge a second time. A duplicate
+// wakeup is low-harm (and never a lost nudge), so a persistent failure is logged
+// and returned rather than treated as fatal.
 func CommitClaims(claimPaths []string) error {
 	var firstErr error
 	for _, claimPath := range claimPaths {
-		if err := os.Remove(claimPath); err != nil && !os.IsNotExist(err) {
+		if err := removeClaim(claimPath); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to remove committed nudge claim %s: %v\n", claimPath, err)
 			if firstErr == nil {
 				firstErr = err
@@ -325,6 +348,22 @@ func CommitClaims(claimPaths []string) error {
 		}
 	}
 	return firstErr
+}
+
+// removeClaim deletes a committed claim file. A missing file counts as success.
+// It retries once on a transient error (e.g. a Windows AV/indexer holding a
+// share lock) to avoid leaving an already-delivered claim for the orphan sweep
+// to redeliver as a duplicate.
+func removeClaim(claimPath string) error {
+	err := os.Remove(claimPath)
+	if err == nil || os.IsNotExist(err) {
+		return nil
+	}
+	time.Sleep(10 * time.Millisecond)
+	if retryErr := os.Remove(claimPath); retryErr == nil || os.IsNotExist(retryErr) {
+		return nil
+	}
+	return err
 }
 
 // Pending returns the count of queued nudges for a session without draining.

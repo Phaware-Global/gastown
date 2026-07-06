@@ -4322,29 +4322,39 @@ func SocketFromEnv() string {
 	return filepath.Base(parts[0])
 }
 
+// sessionNameQueryTimeout bounds the tmux display-message query in
+// CurrentSessionName. tmux client commands can busy-spin at high CPU under load,
+// and this runs on the mayor's per-turn UserPromptSubmit hook and in gt nudge —
+// so the query is capped and falls back rather than being allowed to hang.
+const sessionNameQueryTimeout = 2 * time.Second
+
 // CurrentSessionName returns the tmux session name for the current process.
 //
-// Prefers the GT_SESSION env var, which Gas Town sets to the session name when
-// it spawns an agent (tmux new-session -e GT_SESSION=<name>) and which every
-// process in that session inherits. Reading it avoids spawning a
-// `tmux display-message` client, which busy-spins at high CPU under load — a
-// real hazard on the hot path (this is called from the mayor's per-turn
-// UserPromptSubmit hook and from `gt nudge`). Falls back to querying tmux via
-// TMUX_PANE for non-Gas-Town contexts (e.g. a human running gt in a bare tmux
-// pane) where GT_SESSION is unset. Returns empty string if not in tmux.
+// It queries tmux via TMUX_PANE, which reports the session's CURRENT name and so
+// stays correct across a live `tmux rename-session` (e.g. gt doctor's
+// session-name repair). This matters because the nudge queue is keyed on this
+// name and the SENDER resolves the same current/canonical name — a frozen
+// creation-time value would drain the wrong queue after a rename and silently
+// lose nudges. The query is bounded by sessionNameQueryTimeout so a spinning
+// tmux client can never hang the hook.
+//
+// On query timeout/error, or outside tmux, it falls back to GT_SESSION — the
+// name Gas Town sets at session creation (tmux new-session -e GT_SESSION=<name>)
+// and every child inherits. That fallback is only stale in the narrow window
+// between a live rename and a process restart. Returns empty string when neither
+// source yields a name.
 func CurrentSessionName() string {
-	if s := strings.TrimSpace(os.Getenv("GT_SESSION")); s != "" {
-		return s
+	if pane := os.Getenv("TMUX_PANE"); pane != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), sessionNameQueryTimeout)
+		defer cancel()
+		out, err := BuildCommandContext(ctx, "display-message", "-t", pane, "-p", "#{session_name}").Output()
+		if err == nil {
+			if name := strings.TrimSpace(string(out)); name != "" {
+				return name
+			}
+		}
 	}
-	pane := os.Getenv("TMUX_PANE")
-	if pane == "" {
-		return ""
-	}
-	out, err := BuildCommand("display-message", "-t", pane, "-p", "#{session_name}").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
+	return strings.TrimSpace(os.Getenv("GT_SESSION"))
 }
 
 // CleanupOrphanedSessions scans for zombie Gas Town sessions and kills them.

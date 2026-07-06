@@ -186,6 +186,31 @@ func TestDrainClaimUncommittedRedelivered(t *testing.T) {
 	}
 }
 
+// TestQueueDirNeutralizesTraversal verifies a malformed session name can never
+// escape <townRoot>/.runtime/nudge_queue.
+func TestQueueDirNeutralizesTraversal(t *testing.T) {
+	townRoot := t.TempDir()
+	base := filepath.Join(townRoot, ".runtime", "nudge_queue")
+
+	for _, session := range []string{"..", ".", "../../etc", `..\..\win`, "a/../../b", "/abs", ""} {
+		got := queueDir(townRoot, session)
+		if !strings.HasPrefix(got, base+string(os.PathSeparator)) {
+			t.Errorf("queueDir(%q) = %q escaped base %q", session, got, base)
+		}
+		if strings.Contains(got, "..") {
+			t.Errorf("queueDir(%q) = %q still contains %q", session, got, "..")
+		}
+		if filepath.Clean(got) != got {
+			t.Errorf("queueDir(%q) = %q is not already clean (Clean=%q)", session, got, filepath.Clean(got))
+		}
+	}
+
+	// Ordinary names pass through unchanged (only '/' collapses to '_').
+	if got, want := queueDir(townRoot, "hq-mayor"), filepath.Join(base, "hq-mayor"); got != want {
+		t.Errorf("queueDir(%q) = %q, want %q", "hq-mayor", got, want)
+	}
+}
+
 // TestCommitClaimsIgnoresMissing verifies CommitClaims tolerates paths that were
 // already removed (e.g. requeued by the orphan sweep) without error.
 func TestCommitClaimsIgnoresMissing(t *testing.T) {
