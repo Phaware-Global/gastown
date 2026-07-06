@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1363,4 +1364,52 @@ func TestAgentEnv_EffortLevel(t *testing.T) {
 			t.Error("CLAUDE_CODE_EFFORT_LEVEL should always be set")
 		}
 	})
+}
+
+func TestCodeGraphWatchdogEnv(t *testing.T) {
+	writeWatchdog := func(t *testing.T, val string) string {
+		t.Helper()
+		townRoot := t.TempDir()
+		data, err := json.Marshal(&TownSettings{CodeGraph: &CodeGraphConfig{Watchdog: val}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := TownSettingsPath(townRoot)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return townRoot
+	}
+
+	// Default: no townRoot at all → watchdog disabled.
+	if env := codeGraphWatchdogEnv(""); env["CODEGRAPH_NO_WATCHDOG"] != "1" {
+		t.Errorf("empty townRoot: got %v, want CODEGRAPH_NO_WATCHDOG=1 (default disabled)", env)
+	}
+
+	cases := []struct{ val, wantKey, wantVal string }{
+		{"", "CODEGRAPH_NO_WATCHDOG", "1"},       // unset → default disabled
+		{"off", "CODEGRAPH_NO_WATCHDOG", "1"},     // explicit disable
+		{"disabled", "CODEGRAPH_NO_WATCHDOG", "1"},
+		{"5m", "CODEGRAPH_WATCHDOG_TIMEOUT_MS", "300000"},     // duration → timeout
+		{"300000", "CODEGRAPH_WATCHDOG_TIMEOUT_MS", "300000"}, // bare ms → timeout
+		{"nonsense", "CODEGRAPH_NO_WATCHDOG", "1"},            // unparseable → safe default
+	}
+	for _, c := range cases {
+		env := codeGraphWatchdogEnv(writeWatchdog(t, c.val))
+		if env[c.wantKey] != c.wantVal {
+			t.Errorf("watchdog=%q: env=%v, want %s=%s", c.val, env, c.wantKey, c.wantVal)
+		}
+		// Disable and timeout are mutually exclusive.
+		if c.wantKey == "CODEGRAPH_WATCHDOG_TIMEOUT_MS" && env["CODEGRAPH_NO_WATCHDOG"] != "" {
+			t.Errorf("watchdog=%q: set both NO_WATCHDOG and TIMEOUT_MS: %v", c.val, env)
+		}
+	}
+
+	// "on" → stock watchdog: no env vars set.
+	if env := codeGraphWatchdogEnv(writeWatchdog(t, "on")); len(env) != 0 {
+		t.Errorf("watchdog=on: got %v, want empty (stock ~60s watchdog untouched)", env)
+	}
 }

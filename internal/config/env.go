@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
 )
@@ -72,6 +73,37 @@ type AgentEnvConfig struct {
 	// Added as gt.session to OTEL_RESOURCE_ATTRIBUTES so all Claude logs from a
 	// single GT session can be correlated, and as GT_SESSION env var.
 	SessionName string
+}
+
+// codeGraphWatchdogEnv resolves the town's codegraph liveness-watchdog policy
+// (settings.codegraph.watchdog) into the env vars to apply to an agent session.
+// The watchdog SIGKILLs codegraph after ~60s of main-thread unresponsiveness,
+// which false-positive-kills slow-but-progressing indexing under CPU load. The
+// DEFAULT (unset, or an unparseable value) is DISABLED — a rare un-reaped wedge is
+// preferable to losing indexing under load. "on"/"default" restores codegraph's
+// stock watchdog; a duration or millisecond value raises the timeout instead.
+func codeGraphWatchdogEnv(townRoot string) map[string]string {
+	mode := ""
+	if townRoot != "" {
+		if ts, err := LoadOrCreateTownSettings(TownSettingsPath(townRoot)); err == nil && ts != nil && ts.CodeGraph != nil {
+			mode = strings.ToLower(strings.TrimSpace(ts.CodeGraph.Watchdog))
+		}
+	}
+	switch mode {
+	case "", "off", "disabled", "disable", "false", "none", "no", "0":
+		return map[string]string{"CODEGRAPH_NO_WATCHDOG": "1"}
+	case "on", "default", "stock", "enabled", "enable", "true", "yes":
+		return nil // leave codegraph's built-in ~60s watchdog untouched
+	}
+	// A raised timeout: a Go duration ("5m") or a bare millisecond integer.
+	if d, err := time.ParseDuration(mode); err == nil && d > 0 {
+		return map[string]string{"CODEGRAPH_WATCHDOG_TIMEOUT_MS": strconv.FormatInt(d.Milliseconds(), 10)}
+	}
+	if ms, err := strconv.Atoi(mode); err == nil && ms > 0 {
+		return map[string]string{"CODEGRAPH_WATCHDOG_TIMEOUT_MS": strconv.Itoa(ms)}
+	}
+	// Unparseable → the safe default (disabled), not the flappy watchdog.
+	return map[string]string{"CODEGRAPH_NO_WATCHDOG": "1"}
 }
 
 // AgentEnv returns all environment variables for an agent based on the config.
@@ -226,6 +258,15 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 		effort = "high"
 	}
 	env["CLAUDE_CODE_EFFORT_LEVEL"] = effort
+
+	// Codegraph liveness-watchdog policy (town-configurable via
+	// settings.codegraph.watchdog; DEFAULT: disabled). codegraph SIGKILLs itself
+	// after ~60s of main-thread unresponsiveness, which false-positive-kills
+	// slow-but-progressing indexing under CPU load. Applied to every agent
+	// session — a var codegraph-less agents simply ignore.
+	for k, v := range codeGraphWatchdogEnv(cfg.TownRoot) {
+		env[k] = v
+	}
 
 	// Clear CLAUDECODE to prevent nested session detection in Claude Code v2.x.
 	// When gt sling is invoked from within a Claude Code session, CLAUDECODE=1
