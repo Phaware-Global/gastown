@@ -1785,7 +1785,10 @@ func (g *Git) GhPrReviewThreads(prNumber int) ([]GhReviewThread, error) {
 	return threads, fmt.Errorf("reviewThreads pagination hit maxPages=%d — PR has unusually many threads", maxPages)
 }
 
-// GhPrUnresolvedThreads returns only threads that are not resolved and not outdated.
+// GhPrUnresolvedThreads returns only threads that are not resolved. GitHub's
+// required_review_thread_resolution branch protection blocks merge based on
+// isResolved alone, regardless of isOutdated, so outdated threads are not
+// excluded here.
 func (g *Git) GhPrUnresolvedThreads(prNumber int) ([]GhReviewThread, error) {
 	all, err := g.GhPrReviewThreads(prNumber)
 	if err != nil {
@@ -1793,7 +1796,7 @@ func (g *Git) GhPrUnresolvedThreads(prNumber int) ([]GhReviewThread, error) {
 	}
 	out := make([]GhReviewThread, 0, len(all))
 	for _, t := range all {
-		if !t.IsResolved && !t.IsOutdated {
+		if !t.IsResolved {
 			out = append(out, t)
 		}
 	}

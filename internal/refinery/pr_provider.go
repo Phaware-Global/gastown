@@ -65,8 +65,9 @@ type PRProvider interface {
 	// enumerate review states return ErrUnsupported.
 	ChangesRequestedReviewers(prNumber int) ([]string, error)
 
-	// UnresolvedThreads returns all review threads on the PR that are not
-	// resolved and not outdated.
+	// UnresolvedThreads returns all review threads that are not resolved
+	// (outdated threads are included, since GitHub's
+	// required_review_thread_resolution blocks merge on isResolved alone).
 	UnresolvedThreads(prNumber int) ([]ReviewThread, error)
 
 	// AllThreads returns every review thread on the PR, including resolved

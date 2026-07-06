@@ -63,15 +63,21 @@ func TestVerifyReviewThreadsResolved_AllResolved_ReturnsNil(t *testing.T) {
 	}
 }
 
-func TestVerifyReviewThreadsResolved_OutdatedSkipped(t *testing.T) {
-	// Outdated threads annotate code that's been replaced — they do
-	// NOT count as blocking.
+func TestVerifyReviewThreadsResolved_OutdatedButUnresolvedBlocks(t *testing.T) {
+	// GitHub's required_review_thread_resolution branch protection blocks
+	// merge based on isResolved alone, regardless of isOutdated — an
+	// outdated-but-unresolved thread must still block.
 	provider := &threadsFakeProvider{threads: []ReviewThread{
 		{ID: "1", IsResolved: false, IsOutdated: true, Author: "gemini-code-assist",
 			Body: "edge case in old impl"},
 	}}
-	if err := VerifyReviewThreadsResolved(provider, 42, nil); err != nil {
-		t.Fatalf("expected nil when all unresolved threads are outdated, got %v", err)
+	err := VerifyReviewThreadsResolved(provider, 42, nil)
+	var needs *NeedsReviewResolutionError
+	if !errors.As(err, &needs) {
+		t.Fatalf("expected NeedsReviewResolutionError for outdated-but-unresolved thread, got %v", err)
+	}
+	if len(needs.Threads) != 1 {
+		t.Fatalf("expected 1 blocking thread, got %d", len(needs.Threads))
 	}
 }
 
@@ -125,7 +131,7 @@ func TestVerifyReviewThreadsResolved_Unresolved_ReturnsNeedsResolution(t *testin
 }
 
 func TestVerifyReviewThreadsResolved_MixedResolvedAndUnresolved(t *testing.T) {
-	// Only the unresolved non-outdated thread blocks.
+	// Both unresolved threads block, regardless of outdated status.
 	provider := &threadsFakeProvider{threads: []ReviewThread{
 		{ID: "1", IsResolved: true, Author: "gemini-code-assist", Body: "already fixed"},
 		{ID: "2", IsResolved: false, IsOutdated: true, Author: "augmentcode",
@@ -139,11 +145,17 @@ func TestVerifyReviewThreadsResolved_MixedResolvedAndUnresolved(t *testing.T) {
 	if !errors.As(err, &needs) {
 		t.Fatalf("expected NeedsReviewResolutionError, got %v", err)
 	}
-	if len(needs.Threads) != 1 {
-		t.Fatalf("expected 1 blocking thread (filtered), got %d", len(needs.Threads))
+	if len(needs.Threads) != 2 {
+		t.Fatalf("expected 2 blocking threads, got %d", len(needs.Threads))
 	}
-	if needs.Threads[0].Priority != "medium" {
-		t.Errorf("expected augment severity parsed, got %q", needs.Threads[0].Priority)
+	var found bool
+	for _, th := range needs.Threads {
+		if th.Priority == "medium" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected augment severity parsed among blocking threads, got %+v", needs.Threads)
 	}
 }
 
