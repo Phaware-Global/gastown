@@ -313,41 +313,58 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	// conflicts, we stop and let the agent/user resolve — surfacing the
 	// conflict is better than silently dropping the stash.
 	if cwdAvailable && doneCleanupStatus == "stash" {
-		entries, err := g.StashListForBranch()
-		if err != nil {
-			style.PrintWarning("auto-pop: could not list stashes: %v — orphaned stashes may remain", err)
-		} else if len(entries) > 0 {
-			fmt.Printf("\n%s %d stash(es) detected on this branch — auto-popping (gt-pvx safety net)\n",
-				style.Bold.Render("⚠"), len(entries))
-			// Pop oldest first: iterate in reverse so newest lands on top.
-			popFailed := false
-			for i := len(entries) - 1; i >= 0; i-- {
-				e := entries[i]
-				fmt.Printf("  popping %s — %s\n", e.Ref, e.Message)
-				if popErr := g.StashPop(e.Ref); popErr != nil {
-					style.PrintWarning("auto-pop %s failed (likely conflict): %v", e.Ref, popErr)
-					style.PrintWarning("stopping pop chain — resolve conflict manually then re-run gt done")
-					popFailed = true
-					break
+		// Scope by the branch git actually labeled the stash with — the branch
+		// checked out when it was created (CurrentBranch), not the logical
+		// GT_BRANCH (which can differ from what git wrote). The stash stack is
+		// repo-global — shared across every worktree of the repo — so scoping is
+		// the only thing stopping this auto-pop from applying, and destroying,
+		// another worktree's stash (gt-pvx).
+		stashBranch, cbErr := g.CurrentBranch()
+		switch {
+		case cbErr != nil || stashBranch == "" || stashBranch == "HEAD":
+			// Detached HEAD: git labels a stash created here "WIP on (no branch):",
+			// indistinguishable from another detached worktree's stash on the
+			// shared stack. We can't attribute one to this worktree, so surface it
+			// for manual recovery rather than silently leaking it (or risking
+			// another worktree's work by guessing).
+			style.PrintWarning("auto-pop skipped: detached HEAD — gt done can't safely identify this worktree's stash on the shared stash stack. Recover manually with `git stash list` then `git stash pop <ref>`.")
+		default:
+			entries, err := g.StashListForBranch(stashBranch)
+			if err != nil {
+				style.PrintWarning("auto-pop: could not list stashes: %v — orphaned stashes may remain", err)
+			} else if len(entries) > 0 {
+				fmt.Printf("\n%s %d stash(es) detected on %s — auto-popping (gt-pvx safety net)\n",
+					style.Bold.Render("⚠"), len(entries), stashBranch)
+				// Pop oldest first: iterate in reverse so newest lands on top.
+				popFailed := false
+				for i := len(entries) - 1; i >= 0; i-- {
+					e := entries[i]
+					fmt.Printf("  popping %s — %s\n", e.Ref, e.Message)
+					if popErr := g.StashPop(e.Ref); popErr != nil {
+						style.PrintWarning("auto-pop %s failed (likely conflict): %v", e.Ref, popErr)
+						style.PrintWarning("stopping pop chain — resolve conflict manually then re-run gt done")
+						popFailed = true
+						break
+					}
+					// After each pop, stash refs shift; re-fetch the list before next pop.
+					entries, err = g.StashListForBranch(stashBranch)
+					if err != nil || len(entries) == 0 {
+						break
+					}
 				}
-				// After each pop, stash refs shift; re-fetch the list before next pop.
-				entries, err = g.StashListForBranch()
-				if err != nil || len(entries) == 0 {
-					break
-				}
-			}
-			if !popFailed {
-				// Re-evaluate cleanup status: pops likely produced uncommitted changes
-				// that the next block will auto-commit. Worst case, status was already
-				// uncommitted and the next block runs anyway.
-				if workStatus, wsErr := g.CheckUncommittedWork(); wsErr == nil && workStatus.HasUncommittedChanges {
-					doneCleanupStatus = "uncommitted"
-					fmt.Printf("%s Stash content moved to working tree — will auto-commit below.\n",
-						style.Bold.Render("✓"))
-				} else {
-					// Pops succeeded but produced nothing dirty (e.g. stashes were
-					// already merged). Recompute status normally.
-					doneCleanupStatus = ""
+				if !popFailed {
+					// Re-evaluate cleanup status: pops likely produced uncommitted
+					// changes that the next block will auto-commit. Worst case, status
+					// was already uncommitted and the next block runs anyway.
+					if workStatus, wsErr := g.CheckUncommittedWork(); wsErr == nil && workStatus.HasUncommittedChanges {
+						doneCleanupStatus = "uncommitted"
+						fmt.Printf("%s Stash content moved to working tree — will auto-commit below.\n",
+							style.Bold.Render("✓"))
+					} else {
+						// Pops succeeded but produced nothing dirty (e.g. stashes were
+						// already merged). Recompute status normally.
+						doneCleanupStatus = ""
+					}
 				}
 			}
 		}

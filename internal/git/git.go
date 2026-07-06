@@ -3309,12 +3309,25 @@ type StashEntry struct {
 	Message string // e.g. "WIP on main: <hash> <subject>"
 }
 
-// StashListForBranch returns all stash entries belonging to the current branch,
+// StashListForBranch returns the stash entries created on the given branch,
 // ordered as `git stash list` returns them (newest first, i.e. stash@{0} first).
-// Filtering matches StashCount: only entries with ": WIP on <branch>:" or
-// ": On <branch>:" prefixes are returned, since stashes are global to the repo
-// but conceptually belong to the worktree where they were created.
-func (g *Git) StashListForBranch() ([]StashEntry, error) {
+// Only entries with ": WIP on <branch>:" or ": On <branch>:" for the supplied
+// branch are returned.
+//
+// The branch MUST be supplied explicitly by the caller — it is NOT read from the
+// current HEAD. The git stash stack is repo-global (SHARED across every worktree
+// of the repo), so branch scoping is the only thing keeping this from returning,
+// and a caller from popping, another worktree's stashes. Reading it from HEAD was
+// unsafe: on a detached HEAD (common for polecat worktrees) HEAD resolves to
+// "HEAD", which the old code treated as "can't filter" and returned the ENTIRE
+// shared stack — letting `gt done` vacuum every worktree's stash into the current
+// tree and destroy it (gt-pvx). An empty or "HEAD" branch yields no entries: with
+// no way to scope safely, we return nothing rather than the whole stack.
+func (g *Git) StashListForBranch(branch string) ([]StashEntry, error) {
+	if branch == "" || branch == "HEAD" {
+		return nil, nil
+	}
+
 	out, err := g.run("stash", "list")
 	if err != nil {
 		return nil, err
@@ -3323,8 +3336,6 @@ func (g *Git) StashListForBranch() ([]StashEntry, error) {
 		return nil, nil
 	}
 
-	branch, branchErr := g.CurrentBranch()
-	filterByBranch := branchErr == nil && branch != "" && branch != "HEAD"
 	wipPrefix := ": WIP on " + branch + ":"
 	onPrefix := ": On " + branch + ":"
 
@@ -3333,10 +3344,8 @@ func (g *Git) StashListForBranch() ([]StashEntry, error) {
 		if line == "" {
 			continue
 		}
-		if filterByBranch {
-			if !strings.Contains(line, wipPrefix) && !strings.Contains(line, onPrefix) {
-				continue
-			}
+		if !strings.Contains(line, wipPrefix) && !strings.Contains(line, onPrefix) {
+			continue
 		}
 		// Lines have the form "stash@{N}: <message>"
 		colonIdx := strings.Index(line, ":")
