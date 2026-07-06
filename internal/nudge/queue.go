@@ -176,9 +176,14 @@ func Drain(townRoot, session string) ([]QueuedNudge, error) {
 	if err != nil {
 		return nil, err
 	}
-	if commitErr := CommitClaims(claims); commitErr != nil {
-		return nudges, commitErr
-	}
+	// Claim removal is best-effort and already logged inside CommitClaims. Do
+	// NOT surface its error: a removal failure never loses nudges (the orphan
+	// sweep requeues any leftover claim), and propagating it would make existing
+	// callers (nudge_poller, propulsion) that treat a non-nil error as "nothing
+	// to deliver" discard the nudges they just read. This preserves the
+	// pre-split contract — Drain's error reflects only the queue read, so a nil
+	// error means the returned nudges are the authoritative drain result.
+	_ = CommitClaims(claims)
 	return nudges, nil
 }
 
