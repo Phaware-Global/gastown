@@ -539,6 +539,18 @@ type CodeGraphConfig struct {
 	// Enabled toggles auto `codegraph init` at polecat/refinery worktree creation.
 	// Nil = inherit (town default true; rig inherits town). Default: true.
 	Enabled *bool `json:"enabled,omitempty"`
+
+	// Watchdog controls codegraph's liveness watchdog in agent sessions. codegraph
+	// SIGKILLs itself after ~60s of main-thread unresponsiveness, which
+	// false-positive-kills slow-but-progressing indexing under CPU load. Values:
+	//   "" / "off" / "disabled"                → disable it (CODEGRAPH_NO_WATCHDOG=1).
+	//     This is the DEFAULT: the false-positive kills under load are worse than a
+	//     rare un-reaped codegraph wedge.
+	//   a duration ("5m", "300s") or ms ("300000") → keep the watchdog but raise its
+	//     timeout (CODEGRAPH_WATCHDOG_TIMEOUT_MS).
+	//   "on" / "default"                       → leave codegraph's stock ~60s watchdog.
+	// Town-level only; applied to every agent session.
+	Watchdog string `json:"watchdog,omitempty"`
 }
 
 // IsCodeGraphIndexingEnabled returns whether automatic codegraph indexing is enabled.
