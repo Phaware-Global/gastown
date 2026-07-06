@@ -4323,9 +4323,19 @@ func SocketFromEnv() string {
 }
 
 // CurrentSessionName returns the tmux session name for the current process.
-// Uses TMUX_PANE to target the caller's actual pane, avoiding tmux picking
-// a random session when multiple sessions exist. Returns empty string if not in tmux.
+//
+// Prefers the GT_SESSION env var, which Gas Town sets to the session name when
+// it spawns an agent (tmux new-session -e GT_SESSION=<name>) and which every
+// process in that session inherits. Reading it avoids spawning a
+// `tmux display-message` client, which busy-spins at high CPU under load — a
+// real hazard on the hot path (this is called from the mayor's per-turn
+// UserPromptSubmit hook and from `gt nudge`). Falls back to querying tmux via
+// TMUX_PANE for non-Gas-Town contexts (e.g. a human running gt in a bare tmux
+// pane) where GT_SESSION is unset. Returns empty string if not in tmux.
 func CurrentSessionName() string {
+	if s := strings.TrimSpace(os.Getenv("GT_SESSION")); s != "" {
+		return s
+	}
 	pane := os.Getenv("TMUX_PANE")
 	if pane == "" {
 		return ""

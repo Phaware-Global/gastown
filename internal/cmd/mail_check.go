@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/estop"
@@ -15,7 +16,17 @@ import (
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
+// injectAckBudget bounds how long the inbox read may take before the inject
+// hook skips the delivery-ack. The ack writes to Dolt and scales with the
+// unread count; under load a slow read plus a slow ack can blow the Claude Code
+// hook timeout (30s by default), discarding the hook's whole output. Skipping
+// the ack when the read alone is already slow keeps the hook fast — unacked
+// deliveries are simply retried on a later turn.
+const injectAckBudget = 8 * time.Second
+
 func runMailCheck(cmd *cobra.Command, args []string) error {
+	start := time.Now()
+
 	// Determine which inbox (priority: --identity flag, auto-detect)
 	address := ""
 	if mailCheckIdentity != "" {
@@ -45,12 +56,61 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("getting mailbox: %w", err)
 	}
 
+	// Inject mode handles the nudge queue FIRST, before the (slow) inbox read
+	// below. The inbox read is a Dolt scan that can take seconds under load, and
+	// Claude Code discards a UserPromptSubmit hook's ENTIRE stdout if the hook
+	// exceeds its timeout (30s by default). Draining nudges destructively at the
+	// end of that read — as the code used to — meant a slow read could push the
+	// hook over the timeout after the nudges had already been removed from the
+	// queue, silently losing them. Instead we CLAIM the nudges here (emitting
+	// them immediately) and defer their removal to CommitClaims after the mail
+	// work; a timed-out (killed) hook never reaches the commit, so the claims
+	// survive on disk for the orphan sweep to redeliver. See nudge.DrainClaim.
+	//
+	// Guarded by !mailCheckJSON so the pure --json path (which returns early
+	// below) never claims nudges it won't emit.
+	var nudgeClaims []string
+	if mailCheckInject && !mailCheckJSON {
+		// Agent-side E-stop check (defense-in-depth). Cheap local file checks,
+		// so it runs before the slow inbox read. If an E-stop is active
+		// (town-wide or per-rig), inject a system reminder telling the agent to
+		// checkpoint and wait. This catches agents that survived the SIGTSTP freeze.
+		if townRoot, twErr := workspace.FindFromCwd(); twErr == nil {
+			rigName := os.Getenv("GT_RIG")
+			if estop.IsActive(townRoot) || (rigName != "" && estop.IsRigActive(townRoot, rigName)) {
+				fmt.Print("<system-reminder>\n")
+				fmt.Print("EMERGENCY STOP ACTIVE. All work is paused.\n")
+				fmt.Print("Do NOT start new tasks or tool calls. Checkpoint your current state\n")
+				fmt.Print("(save progress notes) and wait for the overseer to run 'gt thaw'.\n")
+				fmt.Print("This is a system-level pause — it may be due to infrastructure failure,\n")
+				fmt.Print("maintenance, or the operator traveling.\n")
+				fmt.Print("</system-reminder>\n")
+			}
+		}
+
+		// Claim + emit queued nudges (from --mode=queue or --mode=wait-idle
+		// fallback). The nudge queue is per-session; CurrentSessionName reads
+		// GT_SESSION (no tmux subprocess, which busy-spins under load).
+		sessionName := tmux.CurrentSessionName()
+		if sessionName != "" {
+			queuedNudges, claims, drainErr := nudge.DrainClaim(workDir, sessionName)
+			nudgeClaims = claims
+			if drainErr != nil {
+				fmt.Fprintf(os.Stderr, "gt mail check: nudge queue drain error: %v\n", drainErr)
+			} else if len(queuedNudges) > 0 {
+				fmt.Print(nudge.FormatForInjection(queuedNudges))
+			}
+		}
+	}
+
 	// Load the inbox once. The inject path needs unread messages later, and
 	// calling Count() followed by ListUnread() doubles bd/Dolt reads.
 	messages, _, unread, err := loadInboxSnapshot(mailbox, false)
 	if err != nil {
 		if mailCheckInject {
 			fmt.Fprintf(os.Stderr, "gt mail check: inbox load error for %s: %v\n", address, err)
+			// Clean exit: nudge output above was accepted, so finalize the claims.
+			_ = nudge.CommitClaims(nudgeClaims)
 			return nil
 		}
 		return fmt.Errorf("loading inbox: %w", err)
@@ -73,44 +133,25 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 	// at the next task boundary, normal/low is informational but still
 	// checked before going idle (prevents mail from sitting unread).
 	if mailCheckInject {
-		// Agent-side E-stop check (defense-in-depth).
-		// If an E-stop is active (town-wide or per-rig), inject a system reminder
-		// telling the agent to checkpoint and wait. This catches agents that
-		// survived the SIGTSTP freeze.
-		if townRoot, twErr := workspace.FindFromCwd(); twErr == nil {
-			rigName := os.Getenv("GT_RIG")
-			if estop.IsActive(townRoot) || (rigName != "" && estop.IsRigActive(townRoot, rigName)) {
-				fmt.Print("<system-reminder>\n")
-				fmt.Print("EMERGENCY STOP ACTIVE. All work is paused.\n")
-				fmt.Print("Do NOT start new tasks or tool calls. Checkpoint your current state\n")
-				fmt.Print("(save progress notes) and wait for the overseer to run 'gt thaw'.\n")
-				fmt.Print("This is a system-level pause — it may be due to infrastructure failure,\n")
-				fmt.Print("maintenance, or the operator traveling.\n")
-				fmt.Print("</system-reminder>\n")
-			}
-		}
-
 		if unread > 0 {
 			messages = filterUnreadMessages(messages)
 			fmt.Print(formatInjectOutput(messages))
 			// Ack after output so message is delivered before being marked acked.
-			if ackErr := mailbox.AcknowledgeDeliveries(address, messages); ackErr != nil {
-				fmt.Fprintf(os.Stderr, "gt mail check: delivery ack update failed for %s: %v\n", address, ackErr)
+			// Skip it when the inbox read already blew the budget, so a slow read
+			// under load doesn't compound into a slow write and blow the hook
+			// timeout — unacked deliveries retry on a later turn.
+			if time.Since(start) < injectAckBudget {
+				if ackErr := mailbox.AcknowledgeDeliveries(address, messages); ackErr != nil {
+					fmt.Fprintf(os.Stderr, "gt mail check: delivery ack update failed for %s: %v\n", address, ackErr)
+				}
+			} else {
+				fmt.Fprintf(os.Stderr, "gt mail check: skipped delivery ack for %s (inbox read exceeded %s budget)\n", address, injectAckBudget)
 			}
 		}
 
-		// Also drain queued nudges (from --mode=queue or --mode=wait-idle fallback).
-		// The nudge queue is per-session; detect our session name.
-		sessionName := tmux.CurrentSessionName()
-		if sessionName != "" {
-			queuedNudges, drainErr := nudge.Drain(workDir, sessionName)
-			if drainErr != nil {
-				fmt.Fprintf(os.Stderr, "gt mail check: nudge queue drain error: %v\n", drainErr)
-			} else if len(queuedNudges) > 0 {
-				fmt.Print(nudge.FormatForInjection(queuedNudges))
-			}
-		}
-
+		// Commit nudge removal LAST. A hook killed at the timeout never reaches
+		// here, leaving the claims for the orphan sweep to redeliver.
+		_ = nudge.CommitClaims(nudgeClaims)
 		return nil
 	}
 
