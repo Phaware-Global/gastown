@@ -96,8 +96,12 @@ func codeGraphWatchdogEnv(townRoot string) map[string]string {
 		return nil // leave codegraph's built-in ~60s watchdog untouched
 	}
 	// A raised timeout: a Go duration ("5m") or a bare millisecond integer.
-	if d, err := time.ParseDuration(mode); err == nil && d > 0 {
-		return map[string]string{"CODEGRAPH_WATCHDOG_TIMEOUT_MS": strconv.FormatInt(d.Milliseconds(), 10)}
+	// Guard on the EMITTED millisecond value, not the raw duration: a sub-ms
+	// duration ("500us") is >0 but truncates to 0ms, which we must not export.
+	if d, err := time.ParseDuration(mode); err == nil {
+		if ms := d.Milliseconds(); ms > 0 {
+			return map[string]string{"CODEGRAPH_WATCHDOG_TIMEOUT_MS": strconv.FormatInt(ms, 10)}
+		}
 	}
 	if ms, err := strconv.Atoi(mode); err == nil && ms > 0 {
 		return map[string]string{"CODEGRAPH_WATCHDOG_TIMEOUT_MS": strconv.Itoa(ms)}

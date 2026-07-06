@@ -1395,6 +1395,7 @@ func TestCodeGraphWatchdogEnv(t *testing.T) {
 		{"disabled", "CODEGRAPH_NO_WATCHDOG", "1"},
 		{"5m", "CODEGRAPH_WATCHDOG_TIMEOUT_MS", "300000"},     // duration → timeout
 		{"300000", "CODEGRAPH_WATCHDOG_TIMEOUT_MS", "300000"}, // bare ms → timeout
+		{"500us", "CODEGRAPH_NO_WATCHDOG", "1"},               // sub-ms → truncates to 0ms → safe default, not TIMEOUT_MS=0
 		{"nonsense", "CODEGRAPH_NO_WATCHDOG", "1"},            // unparseable → safe default
 	}
 	for _, c := range cases {
