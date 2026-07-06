@@ -72,9 +72,20 @@ type QueuedNudge struct {
 
 // queueDir returns the nudge queue directory for a given session.
 // Path: <townRoot>/.runtime/nudge_queue/<session>/
+//
+// The session name is reduced to a single, traversal-safe path component. In the
+// current threat model the name comes from a trusted parent (GT_SESSION / the
+// canonical session resolver), never attacker-controlled input, but this is
+// defense-in-depth: neutralizing separators and parent-dir components guarantees
+// a malformed name can never escape <townRoot>/.runtime/nudge_queue, no matter
+// which side (enqueue or drain) constructs the path.
 func queueDir(townRoot, session string) string {
-	// Sanitize session name for filesystem safety
 	safe := strings.ReplaceAll(session, "/", "_")
+	safe = strings.ReplaceAll(safe, `\`, "_")
+	safe = strings.ReplaceAll(safe, "..", "_")
+	if safe == "" || safe == "." {
+		safe = "_"
+	}
 	return filepath.Join(townRoot, constants.DirRuntime, "nudge_queue", safe)
 }
 
@@ -152,31 +163,74 @@ func Requeue(townRoot, session string, nudges []QueuedNudge) error {
 	return nil
 }
 
-// Drain reads and removes all queued nudges for a session, returning them
-// in FIFO order. This is called by the hook to pick up pending nudges.
+// Drain reads and removes all ready queued nudges for a session, returning them
+// in FIFO order. It is DrainClaim immediately followed by CommitClaims: the
+// delivered nudges are removed from the queue before returning.
 //
-// Uses rename-then-process to prevent concurrent Drain calls from delivering
-// the same nudge twice: each file is atomically renamed to a .claimed suffix
+// Callers that run inside a hook whose stdout is discarded on timeout, and that
+// therefore must NOT lose nudges if the process is killed before its output is
+// accepted, should use DrainClaim + CommitClaims instead — claiming here, then
+// committing only once the nudges have actually been handed off.
+func Drain(townRoot, session string) ([]QueuedNudge, error) {
+	nudges, claims, err := DrainClaim(townRoot, session)
+	if err != nil {
+		return nil, err
+	}
+	// Claim removal is best-effort and already logged inside CommitClaims. Do
+	// NOT surface its error: a removal failure never loses nudges (the orphan
+	// sweep requeues any leftover claim), and propagating it would make existing
+	// callers (nudge_poller, propulsion) that treat a non-nil error as "nothing
+	// to deliver" discard the nudges they just read. This preserves the
+	// pre-split contract — Drain's error reflects only the queue read, so a nil
+	// error means the returned nudges are the authoritative drain result.
+	_ = CommitClaims(claims)
+	return nudges, nil
+}
+
+// DrainClaim reads all ready queued nudges for a session in FIFO order, claiming
+// each by atomically renaming it to a ".claimed" file, and returns the nudges
+// together with the claimed file paths. Unlike Drain, it does NOT remove the
+// claimed files: the caller MUST call CommitClaims(paths) once the nudges have
+// been delivered.
+//
+// This two-phase drain prevents nudge loss when the caller runs inside a hook
+// whose output is discarded on timeout. If the process dies (or is killed) after
+// claiming but before CommitClaims, the ".claimed" files survive on disk and the
+// orphan-requeue sweep below restores them to ".json" for redelivery on a later
+// drain — rather than the file being removed before its content ever reached the
+// agent. Expired, malformed, and not-yet-due (deferred) nudges are still handled
+// inline (removed or unclaimed) since they are never delivered.
+//
+// Uses rename-then-process to prevent concurrent drainers from delivering the
+// same nudge twice: each file is atomically renamed to a unique .claimed suffix
 // before reading, so only one caller can claim each nudge.
 //
-// Expired nudges (past ExpiresAt) are silently discarded during drain.
-// Orphaned .claimed files from crashed drainers are swept if older than 5 minutes.
-func Drain(townRoot, session string) ([]QueuedNudge, error) {
+// Orphaned .claimed files from crashed/killed drainers are swept if older than
+// the configured stale-claim threshold.
+func DrainClaim(townRoot, session string) ([]QueuedNudge, []string, error) {
 	dir := queueDir(townRoot, session)
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, fmt.Errorf("reading nudge queue: %w", err)
+		return nil, nil, fmt.Errorf("reading nudge queue: %w", err)
 	}
 
-	// Requeue orphaned .claimed files from crashed drainers.
-	// A .claimed file older than staleClaimThreshold is certainly orphaned —
-	// normal processing completes in milliseconds. We rename it back to .json
-	// so it gets picked up on this or a future Drain call, rather than deleting
-	// it (which would permanently drop the nudge).
+	// Requeue orphaned .claimed files from abandoned drainers. A .claimed file
+	// older than staleClaimThreshold is treated as orphaned and renamed back to
+	// .json so it is picked up on a future drain, rather than deleted (which
+	// would permanently drop the nudge).
+	//
+	// INVARIANT: staleClaimThreshold must exceed the longest time any caller
+	// legitimately holds a claim before CommitClaims. Drain commits within
+	// milliseconds, but DrainClaim callers (the mail-check inject hook) hold a
+	// claim for the whole hook lifetime — bounded by Claude Code's hook timeout
+	// (~30s). The default threshold (5m) clears that by ~10x. Lowering
+	// operational.nudge.stale_claim_threshold below the max drain lifetime would
+	// let this sweep requeue a still-in-flight claim, delivering the same nudge
+	// twice.
 	staleThreshold := nudgeConfig(townRoot).StaleClaimThresholdD()
 	now := time.Now()
 	for _, entry := range entries {
@@ -207,6 +261,7 @@ func Drain(townRoot, session string) ([]QueuedNudge, error) {
 	})
 
 	var nudges []QueuedNudge
+	var claims []string
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
@@ -269,13 +324,51 @@ func Drain(townRoot, session string) ([]QueuedNudge, error) {
 
 		nudges = append(nudges, n)
 
-		// Remove the claimed file after successful processing
-		if rmErr := os.Remove(claimPath); rmErr != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to remove processed claim %s: %v\n", entry.Name(), rmErr)
-		}
+		// Defer removal to CommitClaims. If the caller dies before committing,
+		// the claim survives and the orphan sweep above redelivers it.
+		claims = append(claims, claimPath)
 	}
 
-	return nudges, nil
+	return nudges, claims, nil
+}
+
+// CommitClaims removes the claimed nudge files returned by DrainClaim. Call it
+// only after the nudges have been delivered (e.g. the hook's output was
+// accepted). Files that are already gone — removed by a concurrent drainer or
+// restored by the orphan sweep — are ignored.
+//
+// Removal is retried once on a transient error: a claim that survives an
+// already-accepted delivery is worse than a delay, because the orphan sweep will
+// requeue it and the agent then sees the SAME nudge a second time. A duplicate
+// wakeup is low-harm (and never a lost nudge), so a persistent failure is logged
+// and returned rather than treated as fatal.
+func CommitClaims(claimPaths []string) error {
+	var firstErr error
+	for _, claimPath := range claimPaths {
+		if err := removeClaim(claimPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to remove committed nudge claim %s: %v\n", claimPath, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+// removeClaim deletes a committed claim file. A missing file counts as success.
+// It retries once on a transient error (e.g. a Windows AV/indexer holding a
+// share lock) to avoid leaving an already-delivered claim for the orphan sweep
+// to redeliver as a duplicate.
+func removeClaim(claimPath string) error {
+	err := os.Remove(claimPath)
+	if err == nil || os.IsNotExist(err) {
+		return nil
+	}
+	time.Sleep(10 * time.Millisecond)
+	if retryErr := os.Remove(claimPath); retryErr == nil || os.IsNotExist(retryErr) {
+		return nil
+	}
+	return err
 }
 
 // Pending returns the count of queued nudges for a session without draining.

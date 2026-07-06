@@ -82,6 +82,147 @@ func TestDrainEmptyQueue(t *testing.T) {
 	}
 }
 
+// TestDrainClaimDefersRemoval verifies that DrainClaim returns the nudges plus
+// their claim paths WITHOUT removing them, and that CommitClaims is what
+// actually deletes the claimed files.
+func TestDrainClaimDefersRemoval(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test"
+
+	for _, msg := range []string{"first", "second"} {
+		if err := Enqueue(townRoot, session, QueuedNudge{Sender: "test", Message: msg}); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	nudges, claims, err := DrainClaim(townRoot, session)
+	if err != nil {
+		t.Fatalf("DrainClaim: %v", err)
+	}
+	if len(nudges) != 2 || len(claims) != 2 {
+		t.Fatalf("DrainClaim returned %d nudges / %d claims, want 2 / 2", len(nudges), len(claims))
+	}
+
+	// Claimed files must still exist on disk before CommitClaims — this is what
+	// makes the drain non-lossy: a process killed here loses nothing.
+	for _, c := range claims {
+		if _, statErr := os.Stat(c); statErr != nil {
+			t.Errorf("claim %s should exist before CommitClaims: %v", c, statErr)
+		}
+	}
+
+	if err := CommitClaims(claims); err != nil {
+		t.Fatalf("CommitClaims: %v", err)
+	}
+	for _, c := range claims {
+		if _, statErr := os.Stat(c); !os.IsNotExist(statErr) {
+			t.Errorf("claim %s should be gone after CommitClaims, stat err = %v", c, statErr)
+		}
+	}
+
+	// Queue is empty afterward.
+	if count, _ := Pending(townRoot, session); count != 0 {
+		t.Errorf("Pending after commit = %d, want 0", count)
+	}
+}
+
+// TestDrainClaimUncommittedRedelivered proves the loss-safety property: if a
+// caller claims nudges but dies before CommitClaims (e.g. a hook killed on
+// timeout with its output discarded), the claimed-but-uncommitted nudge is
+// redelivered by the orphan sweep on a later drain rather than being lost.
+func TestDrainClaimUncommittedRedelivered(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test"
+
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "test", Message: "important"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Claim but never commit — simulate the caller being killed mid-hook.
+	nudges, claims, err := DrainClaim(townRoot, session)
+	if err != nil {
+		t.Fatalf("DrainClaim: %v", err)
+	}
+	if len(nudges) != 1 || len(claims) != 1 {
+		t.Fatalf("DrainClaim returned %d nudges / %d claims, want 1 / 1", len(nudges), len(claims))
+	}
+
+	// Backdate the orphaned claim past the stale-claim threshold (default 5m) so
+	// the orphan sweep treats it as abandoned.
+	past := time.Now().Add(-10 * time.Minute)
+	if err := os.Chtimes(claims[0], past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	// First drain requeues the orphaned claim (renames .claimed -> .json). The
+	// restored file is picked up on the NEXT drain, not this one, because the
+	// directory snapshot still holds the old claimed name — recovery is
+	// two-phase but never lossy.
+	if first, err := Drain(townRoot, session); err != nil {
+		t.Fatalf("Drain (requeue pass): %v", err)
+	} else if len(first) != 0 {
+		t.Fatalf("requeue pass delivered %d nudges, want 0", len(first))
+	}
+	if count, _ := Pending(townRoot, session); count != 1 {
+		t.Fatalf("Pending after requeue = %d, want 1 (orphaned claim must be restored, not lost)", count)
+	}
+
+	// Second drain redelivers the recovered nudge.
+	redelivered, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain (redelivery pass): %v", err)
+	}
+	if len(redelivered) != 1 {
+		t.Fatalf("redelivered %d nudges, want 1 (orphaned claim must not be lost)", len(redelivered))
+	}
+	if redelivered[0].Message != "important" {
+		t.Errorf("redelivered message = %q, want %q", redelivered[0].Message, "important")
+	}
+
+	// And it is cleaned up after successful redelivery.
+	if count, _ := Pending(townRoot, session); count != 0 {
+		t.Errorf("Pending after redelivery = %d, want 0", count)
+	}
+}
+
+// TestQueueDirNeutralizesTraversal verifies a malformed session name can never
+// escape <townRoot>/.runtime/nudge_queue.
+func TestQueueDirNeutralizesTraversal(t *testing.T) {
+	townRoot := t.TempDir()
+	base := filepath.Join(townRoot, ".runtime", "nudge_queue")
+
+	for _, session := range []string{"..", ".", "../../etc", `..\..\win`, "a/../../b", "/abs", ""} {
+		got := queueDir(townRoot, session)
+		if !strings.HasPrefix(got, base+string(os.PathSeparator)) {
+			t.Errorf("queueDir(%q) = %q escaped base %q", session, got, base)
+		}
+		if strings.Contains(got, "..") {
+			t.Errorf("queueDir(%q) = %q still contains %q", session, got, "..")
+		}
+		if filepath.Clean(got) != got {
+			t.Errorf("queueDir(%q) = %q is not already clean (Clean=%q)", session, got, filepath.Clean(got))
+		}
+	}
+
+	// Ordinary names pass through unchanged (only '/' collapses to '_').
+	if got, want := queueDir(townRoot, "hq-mayor"), filepath.Join(base, "hq-mayor"); got != want {
+		t.Errorf("queueDir(%q) = %q, want %q", "hq-mayor", got, want)
+	}
+}
+
+// TestCommitClaimsIgnoresMissing verifies CommitClaims tolerates paths that were
+// already removed (e.g. requeued by the orphan sweep) without error.
+func TestCommitClaimsIgnoresMissing(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := CommitClaims([]string{filepath.Join(townRoot, "does-not-exist.claimed.abcd")}); err != nil {
+		t.Errorf("CommitClaims on missing path should be nil, got %v", err)
+	}
+	if err := CommitClaims(nil); err != nil {
+		t.Errorf("CommitClaims(nil) should be nil, got %v", err)
+	}
+}
+
 func TestDrainSkipsMalformed(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-test"
