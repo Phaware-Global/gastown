@@ -26,11 +26,17 @@ func TestSuspectedWorktreeReset(t *testing.T) {
 			want: false,
 		},
 		{
-			name:          "report-only task exempt even at base tip",
+			name:          "explicit --cleanup-status=clean report-only task exempt at base tip",
 			isPolecat:     true,
 			cleanupStatus: "clean",
 			headSHA:       base, baseTipSHA: base,
 			want: false,
+		},
+		{
+			name:      "auto-detected clean (empty explicit) still triggers on reset",
+			isPolecat: true, cleanupStatus: "", // a reset worktree is clean+pushed, but --cleanup-status was NOT explicitly passed
+			headSHA: base, baseTipSHA: base,
+			want: true,
 		},
 		{
 			name:          "no_merge task exempt even at base tip",

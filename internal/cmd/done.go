@@ -129,8 +129,13 @@ func init() {
 // MR-already-merged completion (GH#wd7) has HEAD on the polecat's own feature
 // commit — an ancestor of the advanced base, never equal to the base tip.
 // A missing baseTip ("" on rev-parse failure) fails open (returns false).
-func suspectedWorktreeReset(isPolecat bool, cleanupStatus string, isNoMergeTask bool, headSHA, baseTipSHA string) bool {
-	if !isPolecat || cleanupStatus == "clean" || isNoMergeTask {
+//
+// explicitCleanupStatus must be the value EXPLICITLY passed via --cleanup-status,
+// NOT the auto-detected doneCleanupStatus: the latter resolves to "clean" for any
+// clean+pushed tree, which a reset worktree always is, so passing it would exempt
+// the exact case this guard catches.
+func suspectedWorktreeReset(isPolecat bool, explicitCleanupStatus string, isNoMergeTask bool, headSHA, baseTipSHA string) bool {
+	if !isPolecat || explicitCleanupStatus == "clean" || isNoMergeTask {
 		return false
 	}
 	return headSHA != "" && baseTipSHA != "" && headSHA == baseTipSHA
@@ -737,8 +742,18 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					// advanced base), never equal to the base tip. Report-only
 					// (--cleanup-status=clean) and no_merge tasks are exempt — they
 					// legitimately sit at the base with no commit.
+					// Use the EXPLICIT --cleanup-status, not doneCleanupStatus:
+					// the latter is auto-detected as "clean" for any clean+pushed
+					// tree (see ~line 315), and a reset worktree is exactly that —
+					// so passing the auto-detected value would exempt the very case
+					// this guard exists to catch. Only an explicit --cleanup-status=
+					// clean (report-only audits/reviews) should exempt.
+					explicitCleanup := ""
+					if cmd.Flags().Changed("cleanup-status") {
+						explicitCleanup = doneCleanupStatus
+					}
 					baseTip, _ := g.Rev(originDefault)
-					if suspectedWorktreeReset(os.Getenv("GT_POLECAT") != "", doneCleanupStatus, isNoMergeTask, noMRCommitSHA, baseTip) {
+					if suspectedWorktreeReset(os.Getenv("GT_POLECAT") != "", explicitCleanup, isNoMergeTask, noMRCommitSHA, baseTip) {
 						return fmt.Errorf(
 							"cannot complete: HEAD is exactly %s — no distinct polecat commit.\n"+
 								"The worktree was almost certainly reset onto the base branch out from under this session.\n"+
