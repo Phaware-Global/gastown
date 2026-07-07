@@ -116,29 +116,36 @@ func init() {
 
 // suspectedWorktreeReset reports whether a real code polecat's zero-commit
 // "completion" is actually a worktree reset onto the base branch rather than a
-// genuine no-op. HEAD equal to the base tip (origin/<default>) means there is no
-// distinct polecat commit — the worktree was reset onto the base out from under
-// the session (the idle-reap/reuse thrash checks polecats out to origin/develop).
-// Closing in that state false-completes real, in-flight work (the v1.0.4 release
-// bead was closed "no code changes" this way), and the pushed-commit verification
-// downstream passes tautologically because the base tip is by definition on the
-// base branch.
+// genuine no-op. The signal is a DETACHED HEAD: the idle-reap/reuse thrash resets
+// polecats with `git checkout origin/<default>`, which detaches HEAD (reflog:
+// "checkout: moving from polecat/<name>/... to origin/develop"). Closing in that
+// state false-completes real, in-flight work — the v1.0.4 release bead was closed
+// "no code changes" this way, and the pushed-commit verification downstream passes
+// tautologically because HEAD sits on the base branch.
 //
-// It is scoped to real code polecats: report-only tasks (--cleanup-status=clean)
-// and no_merge tasks legitimately sit at the base with no commit, and a genuine
-// MR-already-merged completion (GH#wd7) has HEAD on the polecat's own feature
-// commit — an ancestor of the advanced base, never equal to the base tip.
-// A missing baseTip ("" on rev-parse failure) fails open (returns false).
+// A detached HEAD (branch=="HEAD", git's abbrev-ref for detached; or "" when the
+// branch can't be resolved — a degraded/half-reset worktree, which we treat as
+// suspect and fail CLOSED) is the discriminator because it is robust where a
+// SHA comparison was not:
+//   - it needs no origin/<default> lookup, so it can't be defeated by the base
+//     ref advancing after the reset, nor fail-open when that ref won't resolve;
+//   - both legitimate zero-commit completions sit ON a branch — a direct
+//     push-to-default is on the default branch, and an MR-already-merged
+//     completion (GH#wd7) is on the polecat's own feature branch — so neither is
+//     flagged.
+//
+// Scoped to real code polecats: report-only (explicit --cleanup-status=clean) and
+// no_merge tasks legitimately complete with no commit and are exempt.
 //
 // explicitCleanupStatus must be the value EXPLICITLY passed via --cleanup-status,
 // NOT the auto-detected doneCleanupStatus: the latter resolves to "clean" for any
 // clean+pushed tree, which a reset worktree always is, so passing it would exempt
 // the exact case this guard catches.
-func suspectedWorktreeReset(isPolecat bool, explicitCleanupStatus string, isNoMergeTask bool, headSHA, baseTipSHA string) bool {
+func suspectedWorktreeReset(isPolecat bool, explicitCleanupStatus string, isNoMergeTask bool, branch string) bool {
 	if !isPolecat || explicitCleanupStatus == "clean" || isNoMergeTask {
 		return false
 	}
-	return headSHA != "" && baseTipSHA != "" && headSHA == baseTipSHA
+	return branch == "HEAD" || branch == ""
 }
 
 func runDone(cmd *cobra.Command, args []string) (retErr error) {
@@ -727,35 +734,35 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					closeReason := "Completed with no code changes (already fixed or pushed directly to main)"
 					noMRCommitSHA, _ := g.Rev("HEAD")
 
-					// Worktree-reset guard (hga-y3jm false-completion): for a real
-					// code polecat, refuse to self-close when HEAD is exactly
-					// origin/<default>'s own tip. That state is not "the polecat
-					// produced no work" — it means the worktree was reset onto the
-					// base branch out from under the agent (the idle-reap/reuse
-					// thrash checks polecats out to origin/develop). VerifyPushedCommit
-					// below would pass tautologically (develop's tip is by definition
-					// on develop), recording develop's own commit as the polecat's
-					// "completion" and false-closing real, in-flight work — exactly
-					// how the v1.0.4 release bead was closed "no code changes". The
-					// legitimate MR-already-merged case (GH#wd7) is unaffected: there
-					// HEAD is the polecat's own feature commit (an ancestor of the
-					// advanced base), never equal to the base tip. Report-only
-					// (--cleanup-status=clean) and no_merge tasks are exempt — they
-					// legitimately sit at the base with no commit.
-					// Use the EXPLICIT --cleanup-status, not doneCleanupStatus:
-					// the latter is auto-detected as "clean" for any clean+pushed
-					// tree (see ~line 315), and a reset worktree is exactly that —
-					// so passing the auto-detected value would exempt the very case
-					// this guard exists to catch. Only an explicit --cleanup-status=
-					// clean (report-only audits/reviews) should exempt.
+					// Worktree-reset guard (hga-y3jm false-completion): a real code
+					// polecat completing with a DETACHED HEAD is the signature of the
+					// idle-reap/reuse thrash checking the worktree out to
+					// origin/develop out from under the session — not a genuine no-op.
+					// VerifyPushedCommit below would pass tautologically (HEAD sits on
+					// the base branch), recording the base's own commit as the
+					// polecat's "completion" and false-closing real, in-flight work
+					// (how the v1.0.4 release bead was closed "no code changes").
+					// Detached HEAD is used instead of a HEAD==base-tip SHA check
+					// because the latter is defeated when the base advances after the
+					// reset and false-positives a legitimate direct push-to-default;
+					// both legitimate zero-commit completions sit ON a branch.
+					//
+					// Use the EXPLICIT --cleanup-status, not doneCleanupStatus: the
+					// latter auto-detects "clean" for any clean+pushed tree (see ~line
+					// 315), which a reset worktree always is, so it would exempt the
+					// very case this guard catches. Only an explicit
+					// --cleanup-status=clean (report-only audits/reviews) exempts.
 					explicitCleanup := ""
 					if cmd.Flags().Changed("cleanup-status") {
 						explicitCleanup = doneCleanupStatus
 					}
-					baseTip, _ := g.Rev(originDefault)
-					if suspectedWorktreeReset(os.Getenv("GT_POLECAT") != "", explicitCleanup, isNoMergeTask, noMRCommitSHA, baseTip) {
+					// Re-read the branch here (not the value captured early in
+					// runDone): rebase/checkout steps above may have changed it, and a
+					// resolve failure ("" ) is itself suspect, so fail closed.
+					curBranch, _ := g.CurrentBranch()
+					if suspectedWorktreeReset(os.Getenv("GT_POLECAT") != "", explicitCleanup, isNoMergeTask, curBranch) {
 						return fmt.Errorf(
-							"cannot complete: HEAD is exactly %s — no distinct polecat commit.\n"+
+							"cannot complete: HEAD is detached (no branch) with no commits ahead of %s.\n"+
 								"The worktree was almost certainly reset onto the base branch out from under this session.\n"+
 								"Refusing to self-close (this would false-complete real work). Recover your branch and resubmit, or:\n"+
 								"  gt done --status ESCALATED   (worktree reset — work needs recovery/review)\n"+
