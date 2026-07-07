@@ -914,7 +914,102 @@ func stripEnvPrefixes(environ []string, prefixes ...string) []string {
 // When Ephemeral is true, uses "bd query" with ephemeral=true to search the
 // wisps table (where ephemeral issues live in beads v0.59+). Without this,
 // "bd list" only searches the issues table and misses wisps entirely.
+// List returns beads matching opts.
+//
+// For hooked-status queries it also unions in hooked wisps from the wisps table.
+// Since beads v1.1.0 (schema v53) wisps live in a dedicated `wisps` table that
+// the issues path (bd list / storeList) cannot see, hooked patrol/agent wisps
+// would otherwise be invisible to every discovery caller (gt hook, gt patrol
+// report, deacon stale-hook scan, GetAssignedIssue), which stalls propulsion
+// town-wide. See listHookedWisps.
 func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
+	issues, err := b.listStored(opts)
+	if err != nil {
+		return nil, err
+	}
+	// Ephemeral queries already target the wisps table; only augment issue-path
+	// queries that ask for hooked work (handles "hooked" and "open,hooked" etc.).
+	if !opts.Ephemeral && strings.Contains(strings.ToLower(opts.Status), "hooked") {
+		if wisps, werr := b.listHookedWisps(opts); werr == nil && len(wisps) > 0 {
+			seen := make(map[string]bool, len(issues))
+			for _, is := range issues {
+				if is != nil {
+					seen[is.ID] = true
+				}
+			}
+			for _, w := range wisps {
+				if w != nil && !seen[w.ID] {
+					issues = append(issues, w)
+				}
+			}
+		}
+	}
+	return issues, nil
+}
+
+// listHookedWisps queries the wisps table (beads v1.1.0+ stores wisps separately
+// from issues) for hooked wisps matching opts' assignee/priority filters. It uses
+// `bd sql` because bd list is issues-only and bd query's assignee filter does not
+// match wisp rows. A missing wisps table (pre-v53 db) yields no results, not an error.
+func (b *Beads) listHookedWisps(opts ListOptions) ([]*Issue, error) {
+	where := "w.status = 'hooked'"
+	if opts.Assignee != "" {
+		where += fmt.Sprintf(" AND w.assignee = '%s'", strings.ReplaceAll(opts.Assignee, "'", "''"))
+	}
+	if opts.Priority >= 0 {
+		where += fmt.Sprintf(" AND w.priority = %d", opts.Priority)
+	}
+	query := "SELECT w.id, w.title, w.description, w.status, w.priority, w.assignee, " +
+		"w.created_at, w.updated_at, w.created_by, GROUP_CONCAT(al.label) AS labels_csv " +
+		"FROM wisps w LEFT JOIN wisp_labels al ON w.id = al.issue_id " +
+		"WHERE " + where + " " +
+		"GROUP BY w.id, w.title, w.description, w.status, w.priority, w.assignee, " +
+		"w.created_at, w.updated_at, w.created_by"
+
+	out, err := b.run("sql", "--json", query)
+	if err != nil || len(out) == 0 || !isJSONBytes(out) {
+		return nil, nil // wisps table absent on pre-v53 dbs, or no rows — treat as none
+	}
+	var rows []struct {
+		ID          string `json:"id"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		Status      string `json:"status"`
+		Priority    int    `json:"priority"`
+		Assignee    string `json:"assignee"`
+		CreatedAt   string `json:"created_at"`
+		UpdatedAt   string `json:"updated_at"`
+		CreatedBy   string `json:"created_by"`
+		LabelsCSV   string `json:"labels_csv"`
+	}
+	if err := json.Unmarshal(out, &rows); err != nil {
+		return nil, nil
+	}
+	wisps := make([]*Issue, 0, len(rows))
+	for _, row := range rows {
+		issue := &Issue{
+			ID:          row.ID,
+			Title:       row.Title,
+			Description: row.Description,
+			Status:      row.Status,
+			Priority:    row.Priority,
+			Assignee:    row.Assignee,
+			CreatedAt:   row.CreatedAt,
+			UpdatedAt:   row.UpdatedAt,
+			CreatedBy:   row.CreatedBy,
+			Ephemeral:   true,
+		}
+		if row.LabelsCSV != "" {
+			issue.Labels = strings.Split(row.LabelsCSV, ",")
+		}
+		wisps = append(wisps, issue)
+	}
+	return wisps, nil
+}
+
+// listStored returns issues from the issues path only (in-process store, ephemeral
+// wisp query, or `bd list`). List wraps it to add hooked-wisp augmentation.
+func (b *Beads) listStored(opts ListOptions) ([]*Issue, error) {
 	if b.store != nil && !opts.Ephemeral {
 		return b.storeList(opts)
 	}
