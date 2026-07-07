@@ -930,7 +930,7 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 	// Ephemeral queries already target the wisps table; only augment issue-path
 	// queries that ask for hooked work (handles "hooked" and "open,hooked" etc.).
 	if !opts.Ephemeral && strings.Contains(strings.ToLower(opts.Status), "hooked") {
-		if wisps, werr := b.listHookedWisps(opts); werr == nil && len(wisps) > 0 {
+		if wisps := b.listHookedWisps(opts); len(wisps) > 0 {
 			seen := make(map[string]bool, len(issues))
 			for _, is := range issues {
 				if is != nil {
@@ -950,8 +950,10 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 // listHookedWisps queries the wisps table (beads v1.1.0+ stores wisps separately
 // from issues) for hooked wisps matching opts' assignee/priority filters. It uses
 // `bd sql` because bd list is issues-only and bd query's assignee filter does not
-// match wisp rows. A missing wisps table (pre-v53 db) yields no results, not an error.
-func (b *Beads) listHookedWisps(opts ListOptions) ([]*Issue, error) {
+// match wisp rows. A missing wisps table (pre-v53 db), a query error, or no rows
+// all yield no results — hooked-wisp augmentation is best-effort and never fails
+// the caller's List.
+func (b *Beads) listHookedWisps(opts ListOptions) []*Issue {
 	where := "w.status = 'hooked'"
 	if opts.Assignee != "" {
 		where += fmt.Sprintf(" AND w.assignee = '%s'", strings.ReplaceAll(opts.Assignee, "'", "''"))
@@ -968,7 +970,7 @@ func (b *Beads) listHookedWisps(opts ListOptions) ([]*Issue, error) {
 
 	out, err := b.run("sql", "--json", query)
 	if err != nil || len(out) == 0 || !isJSONBytes(out) {
-		return nil, nil // wisps table absent on pre-v53 dbs, or no rows — treat as none
+		return nil // wisps table absent on pre-v53 dbs, or no rows — treat as none
 	}
 	var rows []struct {
 		ID          string `json:"id"`
@@ -983,7 +985,7 @@ func (b *Beads) listHookedWisps(opts ListOptions) ([]*Issue, error) {
 		LabelsCSV   string `json:"labels_csv"`
 	}
 	if err := json.Unmarshal(out, &rows); err != nil {
-		return nil, nil
+		return nil
 	}
 	wisps := make([]*Issue, 0, len(rows))
 	for _, row := range rows {
@@ -1004,7 +1006,7 @@ func (b *Beads) listHookedWisps(opts ListOptions) ([]*Issue, error) {
 		}
 		wisps = append(wisps, issue)
 	}
-	return wisps, nil
+	return wisps
 }
 
 // listStored returns issues from the issues path only (in-process store, ephemeral
