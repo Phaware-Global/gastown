@@ -744,3 +744,5 @@ gt mayor attach
 ## License
 
 MIT License - see LICENSE file for details
+
+<!-- CI control probe: verifying the internal/config Test failure is independent of code changes. Remove after. -->
