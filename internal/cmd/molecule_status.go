@@ -1222,11 +1222,15 @@ func scanAllRigsForHookedBeads(townRoot, target string) []*beads.Issue {
 		}
 
 		b := beads.New(rigBeadsDir)
-		// First check for hooked beads
+		// First check for hooked beads.
+		// NoWisps: this scans OTHER rigs' DBs for a town-level role (mayor/deacon);
+		// that role's wisps live in hq (already checked by the caller), never in a
+		// rig db, so the per-rig wisp union would be ~10 wasted bd sql subprocesses.
 		hookedBeads, err := b.List(beads.ListOptions{
 			Status:   beads.StatusHooked,
 			Assignee: target,
 			Priority: -1,
+			NoWisps:  true,
 		})
 		if err != nil {
 			continue
@@ -1241,6 +1245,7 @@ func scanAllRigsForHookedBeads(townRoot, target string) []*beads.Issue {
 			Status:   "in_progress",
 			Assignee: target,
 			Priority: -1,
+			NoWisps:  true,
 		})
 		if err != nil {
 			continue

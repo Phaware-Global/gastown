@@ -36,7 +36,9 @@ jobs:
 
       - name: Install beads (bd)
         if: steps.cache-beads.outputs.cache-hit != 'true'
-        run: go install github.com/steveyegge/beads/cmd/bd@v0.57.0
+        # Keep in sync with the beads library version in go.mod (v1.1.0). A stale
+        # CLI opens the library-created DB at the wrong schema and fails at runtime.
+        run: go install github.com/steveyegge/beads/cmd/bd@v1.1.0
 
       - name: Install Dolt
         run: |

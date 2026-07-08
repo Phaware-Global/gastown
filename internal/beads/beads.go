@@ -305,6 +305,9 @@ type ListOptions struct {
 	NoAssignee bool   // filter for issues with no assignee
 	Limit      int    // Max results (0 = use safe default cap; set explicitly for truly unlimited queries)
 	Ephemeral  bool   // Search wisps table (ephemeral issues) instead of issues table
+	NoWisps    bool   // Skip the hooked/child wisp union — issues path only. For hot callers that
+	// scan DBs where the target's wisps can't live (e.g. a town-level role's cross-rig
+	// scan: its wisps are in hq, not in any rig db), so the extra bd sql per db is pure waste.
 }
 
 // CreateOptions specifies options for creating an issue.
@@ -914,7 +917,189 @@ func stripEnvPrefixes(environ []string, prefixes ...string) []string {
 // When Ephemeral is true, uses "bd query" with ephemeral=true to search the
 // wisps table (where ephemeral issues live in beads v0.59+). Without this,
 // "bd list" only searches the issues table and misses wisps entirely.
+// List returns beads matching opts, augmented with matching wisps.
+//
+// Since beads v1.1.0 (schema v53) wisps live in a dedicated `wisps` table that the
+// issues path (bd list / storeList) cannot see, this restores the query shapes that
+// legitimately involve wisps and would otherwise go blind:
+//   - hooked-work discovery (Status contains "hooked"): gt hook, gt patrol report,
+//     GetAssignedIssue — the regression that stalled propulsion town-wide;
+//   - parent lookups (Parent set): patrol stale-detection walking a molecule's step
+//     children (checkHasOpenChildren).
+//
+// Matching wisps are unioned into the issue results (dedup by id). Ephemeral queries
+// already target the wisps table and are left untouched. Wisp augmentation is
+// best-effort — a missing wisps table (pre-v53), query error, or no rows yields no
+// wisps and never fails the caller's List.
 func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
+	issues, err := b.listStored(opts)
+	if err != nil {
+		return nil, err
+	}
+	if !opts.Ephemeral && !opts.NoWisps {
+		var wisps []*Issue
+		switch {
+		case strings.Contains(strings.ToLower(opts.Status), "hooked"):
+			wisps = b.listHookedWisps(opts)
+		case opts.Parent != "" && isWispID(opts.Parent):
+			// Only wisps have wisp children; gating on a wisp parent avoids adding a
+			// bd sql subprocess to the (far more common) issue-parent queries, which
+			// otherwise doubles subprocess/lock load across the suite.
+			wisps = b.listChildWisps(opts)
+		}
+		if len(wisps) > 0 {
+			seen := make(map[string]bool, len(issues))
+			for _, is := range issues {
+				if is != nil {
+					seen[is.ID] = true
+				}
+			}
+			for _, w := range wisps {
+				if w != nil && !seen[w.ID] {
+					issues = append(issues, w)
+				}
+			}
+		}
+	}
+	return issues, nil
+}
+
+// listHookedWisps returns hooked wisps matching opts' assignee/priority filters.
+// The SQL predicate is the constant w.status='hooked' — no caller-supplied value is
+// interpolated; assignee/priority are filtered in Go, so there is no injection surface.
+func (b *Beads) listHookedWisps(opts ListOptions) []*Issue {
+	wisps := b.wispRows("FROM wisps w LEFT JOIN wisp_labels al ON w.id = al.issue_id " +
+		"WHERE w.status = 'hooked'")
+	return filterWisps(wisps, opts.Assignee, opts.NoAssignee, opts.Priority, "")
+}
+
+// listChildWisps returns wisps that are children of opts.Parent (linked by a
+// parent-child wisp dependency), applying opts' status/priority/assignee filters in
+// Go. opts.Parent must be a bead-id-shaped token; anything else yields no wisps, so
+// no unvalidated value is ever interpolated into SQL.
+func (b *Beads) listChildWisps(opts ListOptions) []*Issue {
+	if !isSQLSafeID(opts.Parent) {
+		return nil
+	}
+	wisps := b.wispRows("FROM wisps w " +
+		"JOIN wisp_dependencies d ON w.id = d.issue_id AND d.type = 'parent-child' " +
+		"LEFT JOIN wisp_labels al ON w.id = al.issue_id " +
+		"WHERE d.depends_on_wisp_id = '" + opts.Parent + "' OR d.depends_on_issue_id = '" + opts.Parent + "'")
+	return filterWisps(wisps, opts.Assignee, opts.NoAssignee, opts.Priority, opts.Status)
+}
+
+// isWispID reports whether id is shaped like a wisp id (e.g. gt-wisp-c9j,
+// hq-wisp-001le). Wisps are the only beads with wisp children, so this gates the
+// child-wisp augmentation to wisp parents and avoids an extra query on ordinary
+// issue-parent lookups.
+func isWispID(id string) bool {
+	return strings.Contains(id, "-wisp-")
+}
+
+// isSQLSafeID reports whether s is safe to inline as a bead/wisp id in SQL: non-empty
+// and limited to [A-Za-z0-9_-] (contains no quote or backslash).
+func isSQLSafeID(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// filterWisps applies assignee/no-assignee/priority/status filters in Go, avoiding
+// raw-SQL interpolation of caller-supplied values. noAssignee (which mirrors the
+// issues path's NoAssignee) keeps only unassigned wisps and takes precedence over
+// assignee. An empty or "all" status matches any status; otherwise the
+// comma-separated status set is matched case-insensitively.
+func filterWisps(wisps []*Issue, assignee string, noAssignee bool, priority int, status string) []*Issue {
+	var statuses map[string]bool
+	if status != "" && !strings.EqualFold(status, "all") {
+		statuses = make(map[string]bool)
+		for _, s := range strings.Split(status, ",") {
+			statuses[strings.ToLower(strings.TrimSpace(s))] = true
+		}
+	}
+	out := make([]*Issue, 0, len(wisps))
+	for _, w := range wisps {
+		if w == nil {
+			continue
+		}
+		if noAssignee {
+			if w.Assignee != "" {
+				continue
+			}
+		} else if assignee != "" && w.Assignee != assignee {
+			continue
+		}
+		if priority >= 0 && w.Priority != priority {
+			continue
+		}
+		if statuses != nil && !statuses[strings.ToLower(w.Status)] {
+			continue
+		}
+		out = append(out, w)
+	}
+	return out
+}
+
+// wispRows runs a wisps-table query (the given "FROM ... WHERE ..." fragment, which
+// must contain no unvalidated caller input) via bd sql and parses the rows. Returns
+// nil on any error, empty output, or non-JSON — wisp augmentation is best-effort.
+func (b *Beads) wispRows(fromWhere string) []*Issue {
+	query := "SELECT w.id, w.title, w.description, w.status, w.priority, w.assignee, " +
+		"w.created_at, w.updated_at, w.created_by, GROUP_CONCAT(al.label) AS labels_csv " +
+		fromWhere + " " +
+		"GROUP BY w.id, w.title, w.description, w.status, w.priority, w.assignee, " +
+		"w.created_at, w.updated_at, w.created_by"
+
+	out, err := b.run("sql", "--json", query)
+	if err != nil || len(out) == 0 || !isJSONBytes(out) {
+		return nil // wisps table absent on pre-v53 dbs, or no rows — treat as none
+	}
+	var rows []struct {
+		ID          string `json:"id"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		Status      string `json:"status"`
+		Priority    int    `json:"priority"`
+		Assignee    string `json:"assignee"`
+		CreatedAt   string `json:"created_at"`
+		UpdatedAt   string `json:"updated_at"`
+		CreatedBy   string `json:"created_by"`
+		LabelsCSV   string `json:"labels_csv"`
+	}
+	if err := json.Unmarshal(out, &rows); err != nil {
+		return nil
+	}
+	wisps := make([]*Issue, 0, len(rows))
+	for _, row := range rows {
+		issue := &Issue{
+			ID:          row.ID,
+			Title:       row.Title,
+			Description: row.Description,
+			Status:      row.Status,
+			Priority:    row.Priority,
+			Assignee:    row.Assignee,
+			CreatedAt:   row.CreatedAt,
+			UpdatedAt:   row.UpdatedAt,
+			CreatedBy:   row.CreatedBy,
+			Ephemeral:   true,
+		}
+		if row.LabelsCSV != "" {
+			issue.Labels = strings.Split(row.LabelsCSV, ",")
+		}
+		wisps = append(wisps, issue)
+	}
+	return wisps
+}
+
+// listStored returns issues from the issues path only (in-process store, ephemeral
+// wisp query, or `bd list`). List wraps it to add hooked-wisp augmentation.
+func (b *Beads) listStored(opts ListOptions) ([]*Issue, error) {
 	if b.store != nil && !opts.Ephemeral {
 		return b.storeList(opts)
 	}
