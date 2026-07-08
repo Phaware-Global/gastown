@@ -988,20 +988,23 @@ func (b *Beads) listChildWisps(opts ListOptions) []*Issue {
 	return filterWisps(wisps, opts.Assignee, opts.NoAssignee, opts.Priority, opts.Status)
 }
 
-// isMissingTableErr reports whether err is a "table doesn't exist" error (Dolt/MySQL
-// error 1146, or a SQLite-style "no such table") rather than a transient failure
-// (Dolt timeout, connection refused). Lets wisp queries treat an absent wisps table
-// (pre-v53 or a fresh embedded db) as "no wisps" while still propagating real errors.
-func isMissingTableErr(err error) bool {
-	if err == nil {
-		return false
+// wispsTableExists reports whether the wisps table is present. It runs SHOW TABLES
+// (which exits 0 whether or not the table exists, so its output survives b.run's
+// discard-on-error path) and returns any error from the check itself, so callers can
+// distinguish "confirmed absent" from "couldn't verify" (a transient failure).
+func (b *Beads) wispsTableExists() (bool, error) {
+	out, err := b.run("sql", "--json", "SHOW TABLES LIKE 'wisps'")
+	if err != nil {
+		return false, err
 	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "doesn't exist") ||
-		strings.Contains(s, "does not exist") ||
-		strings.Contains(s, "no such table") ||
-		strings.Contains(s, "table not found") ||
-		strings.Contains(s, "1146")
+	if len(out) == 0 || !isJSONBytes(out) {
+		return false, nil
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(out, &rows); err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
 }
 
 // isWispID reports whether id is shaped like a wisp id (e.g. gt-wisp-c9j,
@@ -1086,10 +1089,13 @@ func (b *Beads) wispRowsErr(fromWhere string) ([]*Issue, error) {
 
 	out, err := b.run("sql", "--json", query)
 	if err != nil {
-		if isMissingTableErr(err) {
-			// wisps/wisp_labels table absent (pre-v53 or a fresh embedded db) —
-			// legitimately no wisps, not a failure. Real errors (Dolt timeout,
-			// connection refused) still propagate.
+		// A missing wisps table (pre-v53 or a fresh embedded db) is "no wisps", not
+		// a failure. bd puts the "table not found" detail on stdout, which b.run
+		// discards on error, so we can't read it from err — instead verify existence
+		// with SHOW TABLES (which exits 0 either way, so its output survives). Only
+		// swallow when the table is confirmed absent; real failures (Dolt timeout,
+		// connection refused) still propagate.
+		if exists, checkErr := b.wispsTableExists(); checkErr == nil && !exists {
 			return nil, nil
 		}
 		return nil, err
