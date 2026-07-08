@@ -938,7 +938,10 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 		switch {
 		case strings.Contains(strings.ToLower(opts.Status), "hooked"):
 			wisps = b.listHookedWisps(opts)
-		case opts.Parent != "":
+		case opts.Parent != "" && isWispID(opts.Parent):
+			// Only wisps have wisp children; gating on a wisp parent avoids adding a
+			// bd sql subprocess to the (far more common) issue-parent queries, which
+			// otherwise doubles subprocess/lock load across the suite.
 			wisps = b.listChildWisps(opts)
 		}
 		if len(wisps) > 0 {
@@ -980,6 +983,14 @@ func (b *Beads) listChildWisps(opts ListOptions) []*Issue {
 		"LEFT JOIN wisp_labels al ON w.id = al.issue_id " +
 		"WHERE d.depends_on_wisp_id = '" + opts.Parent + "' OR d.depends_on_issue_id = '" + opts.Parent + "'")
 	return filterWisps(wisps, opts.Assignee, opts.Priority, opts.Status)
+}
+
+// isWispID reports whether id is shaped like a wisp id (e.g. gt-wisp-c9j,
+// hq-wisp-001le). Wisps are the only beads with wisp children, so this gates the
+// child-wisp augmentation to wisp parents and avoids an extra query on ordinary
+// issue-parent lookups.
+func isWispID(id string) bool {
+	return strings.Contains(id, "-wisp-")
 }
 
 // isSQLSafeID reports whether s is safe to inline as a bead/wisp id in SQL: non-empty

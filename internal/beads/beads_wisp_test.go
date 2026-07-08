@@ -19,6 +19,20 @@ func TestIsSQLSafeID(t *testing.T) {
 	}
 }
 
+func TestIsWispID(t *testing.T) {
+	for _, id := range []string{"gt-wisp-c9j", "hq-wisp-001le", "heartworks_android-wisp-x"} {
+		if !isWispID(id) {
+			t.Errorf("isWispID(%q) = false, want true", id)
+		}
+	}
+	// Ordinary issue ids must NOT trigger the child-wisp augmentation.
+	for _, id := range []string{"gt-abc", "hq-123", "hga-y3jm", "", "wisp", "gtwisp"} {
+		if isWispID(id) {
+			t.Errorf("isWispID(%q) = true, want false", id)
+		}
+	}
+}
+
 func TestFilterWisps(t *testing.T) {
 	ws := []*Issue{
 		{ID: "w1", Status: "hooked", Assignee: "gastown/witness", Priority: 0},
