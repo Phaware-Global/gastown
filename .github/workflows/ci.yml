@@ -145,6 +145,12 @@ jobs:
   integration:
     name: Integration Tests
     runs-on: ubuntu-latest
+    env:
+      # beads v1.1.0's bd prints a first-run "anonymous usage metrics" notice into
+      # command output, which pollutes the text these integration tests parse, and
+      # spools a metric per bd invocation (latency the huge suite can't afford).
+      # Disable both — the tests only care about bd's functional output.
+      BD_DISABLE_METRICS: "1"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -202,7 +208,7 @@ jobs:
         # v1.1.0's heavier Dolt engine (dolt/vitess/go-mysql-server bump) plus the
         # wisp-table discovery queries push it ~3m higher, tipping it over 25m on
         # every run. Raise the ceiling to restore headroom for runner variance.
-        run: gotestsum --format testname --junitfile junit-integration.xml -- -tags=integration -timeout=35m -v ./internal/cmd/...
+        run: gotestsum --format testname --junitfile junit-integration.xml -- -tags=integration -timeout=45m -v ./internal/cmd/...
 
       - name: Test Report
         if: always()
