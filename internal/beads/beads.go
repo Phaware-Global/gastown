@@ -970,7 +970,7 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 func (b *Beads) listHookedWisps(opts ListOptions) []*Issue {
 	wisps := b.wispRows("FROM wisps w LEFT JOIN wisp_labels al ON w.id = al.issue_id " +
 		"WHERE w.status = 'hooked'")
-	return filterWisps(wisps, opts.Assignee, opts.Priority, "")
+	return filterWisps(wisps, opts.Assignee, opts.NoAssignee, opts.Priority, "")
 }
 
 // listChildWisps returns wisps that are children of opts.Parent (linked by a
@@ -985,7 +985,7 @@ func (b *Beads) listChildWisps(opts ListOptions) []*Issue {
 		"JOIN wisp_dependencies d ON w.id = d.issue_id AND d.type = 'parent-child' " +
 		"LEFT JOIN wisp_labels al ON w.id = al.issue_id " +
 		"WHERE d.depends_on_wisp_id = '" + opts.Parent + "' OR d.depends_on_issue_id = '" + opts.Parent + "'")
-	return filterWisps(wisps, opts.Assignee, opts.Priority, opts.Status)
+	return filterWisps(wisps, opts.Assignee, opts.NoAssignee, opts.Priority, opts.Status)
 }
 
 // isWispID reports whether id is shaped like a wisp id (e.g. gt-wisp-c9j,
@@ -1010,10 +1010,12 @@ func isSQLSafeID(s string) bool {
 	return true
 }
 
-// filterWisps applies assignee/priority/status filters in Go, avoiding raw-SQL
-// interpolation of caller-supplied values. An empty or "all" status matches any
-// status; otherwise the comma-separated status set is matched case-insensitively.
-func filterWisps(wisps []*Issue, assignee string, priority int, status string) []*Issue {
+// filterWisps applies assignee/no-assignee/priority/status filters in Go, avoiding
+// raw-SQL interpolation of caller-supplied values. noAssignee (which mirrors the
+// issues path's NoAssignee) keeps only unassigned wisps and takes precedence over
+// assignee. An empty or "all" status matches any status; otherwise the
+// comma-separated status set is matched case-insensitively.
+func filterWisps(wisps []*Issue, assignee string, noAssignee bool, priority int, status string) []*Issue {
 	var statuses map[string]bool
 	if status != "" && !strings.EqualFold(status, "all") {
 		statuses = make(map[string]bool)
@@ -1026,7 +1028,11 @@ func filterWisps(wisps []*Issue, assignee string, priority int, status string) [
 		if w == nil {
 			continue
 		}
-		if assignee != "" && w.Assignee != assignee {
+		if noAssignee {
+			if w.Assignee != "" {
+				continue
+			}
+		} else if assignee != "" && w.Assignee != assignee {
 			continue
 		}
 		if priority >= 0 && w.Priority != priority {

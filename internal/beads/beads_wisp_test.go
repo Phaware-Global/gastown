@@ -38,6 +38,7 @@ func TestFilterWisps(t *testing.T) {
 		{ID: "w1", Status: "hooked", Assignee: "gastown/witness", Priority: 0},
 		{ID: "w2", Status: "open", Assignee: "gastown/refinery", Priority: 1},
 		{ID: "w3", Status: "closed", Assignee: "gastown/witness", Priority: 2},
+		{ID: "w4", Status: "open", Assignee: "", Priority: 1},
 		nil,
 	}
 	ids := func(in []*Issue) []string {
@@ -49,23 +50,27 @@ func TestFilterWisps(t *testing.T) {
 	}
 
 	// assignee filter
-	got := filterWisps(ws, "gastown/witness", -1, "")
+	got := filterWisps(ws, "gastown/witness", false, -1, "")
 	if len(got) != 2 || ids(got)[0] != "w1" || ids(got)[1] != "w3" {
 		t.Errorf("assignee filter = %v, want [w1 w3]", ids(got))
 	}
+	// no-assignee filter: only the unassigned wisp, and it takes precedence over assignee
+	if got := filterWisps(ws, "gastown/witness", true, -1, ""); len(got) != 1 || got[0].ID != "w4" {
+		t.Errorf("no-assignee filter = %v, want [w4]", ids(got))
+	}
 	// priority filter
-	if got := filterWisps(ws, "", 1, ""); len(got) != 1 || got[0].ID != "w2" {
-		t.Errorf("priority filter = %v, want [w2]", ids(got))
+	if got := filterWisps(ws, "", false, 1, ""); len(got) != 2 {
+		t.Errorf("priority filter = %v, want [w2 w4]", ids(got))
 	}
 	// status filter (comma-separated, case-insensitive)
-	if got := filterWisps(ws, "", -1, "OPEN,closed"); len(got) != 2 {
-		t.Errorf("status filter = %v, want [w2 w3]", ids(got))
+	if got := filterWisps(ws, "", false, -1, "closed"); len(got) != 1 || got[0].ID != "w3" {
+		t.Errorf("status filter = %v, want [w3]", ids(got))
 	}
 	// "all" and "" match every (non-nil) wisp
-	if got := filterWisps(ws, "", -1, "all"); len(got) != 3 {
-		t.Errorf(`status "all" = %v, want 3`, ids(got))
+	if got := filterWisps(ws, "", false, -1, "all"); len(got) != 4 {
+		t.Errorf(`status "all" = %v, want 4`, ids(got))
 	}
-	if got := filterWisps(ws, "", -1, ""); len(got) != 3 {
-		t.Errorf(`status "" = %v, want 3`, ids(got))
+	if got := filterWisps(ws, "", false, -1, ""); len(got) != 4 {
+		t.Errorf(`status "" = %v, want 4`, ids(got))
 	}
 }
