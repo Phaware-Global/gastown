@@ -305,6 +305,9 @@ type ListOptions struct {
 	NoAssignee bool   // filter for issues with no assignee
 	Limit      int    // Max results (0 = use safe default cap; set explicitly for truly unlimited queries)
 	Ephemeral  bool   // Search wisps table (ephemeral issues) instead of issues table
+	NoWisps    bool   // Skip the hooked/child wisp union — issues path only. For hot callers that
+	// scan DBs where the target's wisps can't live (e.g. a town-level role's cross-rig
+	// scan: its wisps are in hq, not in any rig db), so the extra bd sql per db is pure waste.
 }
 
 // CreateOptions specifies options for creating an issue.
@@ -933,7 +936,7 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !opts.Ephemeral {
+	if !opts.Ephemeral && !opts.NoWisps {
 		var wisps []*Issue
 		switch {
 		case strings.Contains(strings.ToLower(opts.Status), "hooked"):
