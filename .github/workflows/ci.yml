@@ -203,12 +203,12 @@ jobs:
         run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Integration Tests
-        # 35m (was 25m, was 15m): each beads upgrade adds cost per `bd init` and
-        # per query. The suite already ran ~24m on main at 25m (borderline);
-        # v1.1.0's heavier Dolt engine (dolt/vitess/go-mysql-server bump) plus the
-        # wisp-table discovery queries push it ~3m higher, tipping it over 25m on
-        # every run. Raise the ceiling to restore headroom for runner variance.
-        run: gotestsum --format testname --junitfile junit-integration.xml -- -tags=integration -timeout=45m -v ./internal/cmd/...
+        # 35m (was 25m, was 15m): each beads upgrade adds cost per bd call, and
+        # v1.1.0's heavier Dolt engine (dolt/vitess/go-mysql-server bump) pushed the
+        # already-~24m suite over the old 25m budget. With BD_DISABLE_METRICS (above)
+        # trimming per-call overhead this lands comfortably under 35m; the headroom
+        # absorbs runner variance.
+        run: gotestsum --format testname --junitfile junit-integration.xml -- -tags=integration -timeout=35m -v ./internal/cmd/...
 
       - name: Test Report
         if: always()
