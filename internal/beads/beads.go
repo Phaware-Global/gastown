@@ -988,6 +988,25 @@ func (b *Beads) listChildWisps(opts ListOptions) []*Issue {
 	return filterWisps(wisps, opts.Assignee, opts.NoAssignee, opts.Priority, opts.Status)
 }
 
+// wispsTableExists reports whether the wisps table is present. It runs SHOW TABLES
+// (which exits 0 whether or not the table exists, so its output survives b.run's
+// discard-on-error path) and returns any error from the check itself, so callers can
+// distinguish "confirmed absent" from "couldn't verify" (a transient failure).
+func (b *Beads) wispsTableExists() (bool, error) {
+	out, err := b.run("sql", "--json", "SHOW TABLES LIKE 'wisps'")
+	if err != nil {
+		return false, err
+	}
+	if len(out) == 0 || !isJSONBytes(out) {
+		return false, nil
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(out, &rows); err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
+}
+
 // isWispID reports whether id is shaped like a wisp id (e.g. gt-wisp-c9j,
 // hq-wisp-001le). Wisps are the only beads with wisp children, so this gates the
 // child-wisp augmentation to wisp parents and avoids an extra query on ordinary
@@ -1050,6 +1069,18 @@ func filterWisps(wisps []*Issue, assignee string, noAssignee bool, priority int,
 // must contain no unvalidated caller input) via bd sql and parses the rows. Returns
 // nil on any error, empty output, or non-JSON — wisp augmentation is best-effort.
 func (b *Beads) wispRows(fromWhere string) []*Issue {
+	rows, _ := b.wispRowsErr(fromWhere)
+	return rows
+}
+
+// wispRowsErr is the error-propagating form of wispRows. Empty or non-JSON output
+// — no rows, or the wisps table absent on a pre-v53 db — yields (nil, nil); a bd sql
+// failure (Dolt timeout, connection refused) or malformed JSON yields (nil, err).
+// Correctness-critical callers (e.g. sling-context listing, where a swallowed error
+// would silently look like "no contexts" and trigger re-dispatch) use this so they
+// can tell "no wisps" from "couldn't tell". wispRows swallows the error for
+// best-effort discovery augmentation where a failed query just means no augmentation.
+func (b *Beads) wispRowsErr(fromWhere string) ([]*Issue, error) {
 	query := "SELECT w.id, w.title, w.description, w.status, w.priority, w.assignee, " +
 		"w.created_at, w.updated_at, w.created_by, GROUP_CONCAT(al.label) AS labels_csv " +
 		fromWhere + " " +
@@ -1057,8 +1088,20 @@ func (b *Beads) wispRows(fromWhere string) []*Issue {
 		"w.created_at, w.updated_at, w.created_by"
 
 	out, err := b.run("sql", "--json", query)
-	if err != nil || len(out) == 0 || !isJSONBytes(out) {
-		return nil // wisps table absent on pre-v53 dbs, or no rows — treat as none
+	if err != nil {
+		// A missing wisps table (pre-v53 or a fresh embedded db) is "no wisps", not
+		// a failure. bd puts the "table not found" detail on stdout, which b.run
+		// discards on error, so we can't read it from err — instead verify existence
+		// with SHOW TABLES (which exits 0 either way, so its output survives). Only
+		// swallow when the table is confirmed absent; real failures (Dolt timeout,
+		// connection refused) still propagate.
+		if exists, checkErr := b.wispsTableExists(); checkErr == nil && !exists {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if len(out) == 0 || !isJSONBytes(out) {
+		return nil, nil // no rows (bd may print plain text like "No issues found.")
 	}
 	var rows []struct {
 		ID          string `json:"id"`
@@ -1073,7 +1116,7 @@ func (b *Beads) wispRows(fromWhere string) []*Issue {
 		LabelsCSV   string `json:"labels_csv"`
 	}
 	if err := json.Unmarshal(out, &rows); err != nil {
-		return nil
+		return nil, fmt.Errorf("parsing wisp rows: %w", err)
 	}
 	wisps := make([]*Issue, 0, len(rows))
 	for _, row := range rows {
@@ -1094,7 +1137,7 @@ func (b *Beads) wispRows(fromWhere string) []*Issue {
 		}
 		wisps = append(wisps, issue)
 	}
-	return wisps
+	return wisps, nil
 }
 
 // listStored returns issues from the issues path only (in-process store, ephemeral
