@@ -988,6 +988,22 @@ func (b *Beads) listChildWisps(opts ListOptions) []*Issue {
 	return filterWisps(wisps, opts.Assignee, opts.NoAssignee, opts.Priority, opts.Status)
 }
 
+// isMissingTableErr reports whether err is a "table doesn't exist" error (Dolt/MySQL
+// error 1146, or a SQLite-style "no such table") rather than a transient failure
+// (Dolt timeout, connection refused). Lets wisp queries treat an absent wisps table
+// (pre-v53 or a fresh embedded db) as "no wisps" while still propagating real errors.
+func isMissingTableErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "doesn't exist") ||
+		strings.Contains(s, "does not exist") ||
+		strings.Contains(s, "no such table") ||
+		strings.Contains(s, "table not found") ||
+		strings.Contains(s, "1146")
+}
+
 // isWispID reports whether id is shaped like a wisp id (e.g. gt-wisp-c9j,
 // hq-wisp-001le). Wisps are the only beads with wisp children, so this gates the
 // child-wisp augmentation to wisp parents and avoids an extra query on ordinary
@@ -1070,6 +1086,12 @@ func (b *Beads) wispRowsErr(fromWhere string) ([]*Issue, error) {
 
 	out, err := b.run("sql", "--json", query)
 	if err != nil {
+		if isMissingTableErr(err) {
+			// wisps/wisp_labels table absent (pre-v53 or a fresh embedded db) —
+			// legitimately no wisps, not a failure. Real errors (Dolt timeout,
+			// connection refused) still propagate.
+			return nil, nil
+		}
 		return nil, err
 	}
 	if len(out) == 0 || !isJSONBytes(out) {
