@@ -118,8 +118,15 @@ func (b *Beads) ListOpenSlingContexts() ([]*Issue, error) {
 		}
 	}
 
-	// Union ephemeral (wisp) sling contexts — the common case since v1.1.0.
-	if wisps := b.listOpenSlingContextWisps(); len(wisps) > 0 {
+	// Union ephemeral (wisp) sling contexts — the common case since v1.1.0. Propagate
+	// a query failure instead of silently returning fewer contexts: this is symmetric
+	// with the bd list path above, and a swallowed error here would look like "no
+	// context" and re-introduce the re-dispatch/miscount blindness this fix removes.
+	wisps, err := b.listOpenSlingContextWisps()
+	if err != nil {
+		return nil, fmt.Errorf("listing sling context wisps: %w", err)
+	}
+	if len(wisps) > 0 {
 		seen := make(map[string]bool, len(issues))
 		for _, is := range issues {
 			if is != nil {
@@ -137,11 +144,12 @@ func (b *Beads) ListOpenSlingContexts() ([]*Issue, error) {
 }
 
 // listOpenSlingContextWisps returns open sling-context wisps from the wisps table
-// (beads v1.1.0+ stores ephemeral beads there, separate from issues). Best-effort:
-// a missing wisps table, query error, or no rows yields nil. The label predicate is
-// a package constant (no caller input), so there is no injection surface.
-func (b *Beads) listOpenSlingContextWisps() []*Issue {
-	return b.wispRows("FROM wisps w LEFT JOIN wisp_labels al ON w.id = al.issue_id " +
+// (beads v1.1.0+ stores ephemeral beads there, separate from issues). Errors are
+// propagated (via wispRowsErr) so a transient Dolt failure is not mistaken for "no
+// contexts"; a missing wisps table or no rows yields (nil, nil). The label predicate
+// is a package constant (no caller input), so there is no injection surface.
+func (b *Beads) listOpenSlingContextWisps() ([]*Issue, error) {
+	return b.wispRowsErr("FROM wisps w LEFT JOIN wisp_labels al ON w.id = al.issue_id " +
 		"WHERE w.status = 'open' AND EXISTS (" +
 		"SELECT 1 FROM wisp_labels f WHERE f.issue_id = w.id AND f.label = '" + capacity.LabelSlingContext + "')")
 }

@@ -1050,6 +1050,18 @@ func filterWisps(wisps []*Issue, assignee string, noAssignee bool, priority int,
 // must contain no unvalidated caller input) via bd sql and parses the rows. Returns
 // nil on any error, empty output, or non-JSON — wisp augmentation is best-effort.
 func (b *Beads) wispRows(fromWhere string) []*Issue {
+	rows, _ := b.wispRowsErr(fromWhere)
+	return rows
+}
+
+// wispRowsErr is the error-propagating form of wispRows. Empty or non-JSON output
+// — no rows, or the wisps table absent on a pre-v53 db — yields (nil, nil); a bd sql
+// failure (Dolt timeout, connection refused) or malformed JSON yields (nil, err).
+// Correctness-critical callers (e.g. sling-context listing, where a swallowed error
+// would silently look like "no contexts" and trigger re-dispatch) use this so they
+// can tell "no wisps" from "couldn't tell". wispRows swallows the error for
+// best-effort discovery augmentation where a failed query just means no augmentation.
+func (b *Beads) wispRowsErr(fromWhere string) ([]*Issue, error) {
 	query := "SELECT w.id, w.title, w.description, w.status, w.priority, w.assignee, " +
 		"w.created_at, w.updated_at, w.created_by, GROUP_CONCAT(al.label) AS labels_csv " +
 		fromWhere + " " +
@@ -1057,8 +1069,11 @@ func (b *Beads) wispRows(fromWhere string) []*Issue {
 		"w.created_at, w.updated_at, w.created_by"
 
 	out, err := b.run("sql", "--json", query)
-	if err != nil || len(out) == 0 || !isJSONBytes(out) {
-		return nil // wisps table absent on pre-v53 dbs, or no rows — treat as none
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 || !isJSONBytes(out) {
+		return nil, nil // no rows (bd may print plain text like "No issues found.")
 	}
 	var rows []struct {
 		ID          string `json:"id"`
@@ -1073,7 +1088,7 @@ func (b *Beads) wispRows(fromWhere string) []*Issue {
 		LabelsCSV   string `json:"labels_csv"`
 	}
 	if err := json.Unmarshal(out, &rows); err != nil {
-		return nil
+		return nil, fmt.Errorf("parsing wisp rows: %w", err)
 	}
 	wisps := make([]*Issue, 0, len(rows))
 	for _, row := range rows {
@@ -1094,7 +1109,7 @@ func (b *Beads) wispRows(fromWhere string) []*Issue {
 		}
 		wisps = append(wisps, issue)
 	}
-	return wisps
+	return wisps, nil
 }
 
 // listStored returns issues from the issues path only (in-process store, ephemeral
