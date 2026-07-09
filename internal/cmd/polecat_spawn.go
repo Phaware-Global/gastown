@@ -461,17 +461,60 @@ func (s *SpawnedPolecatInfo) StartSession() (string, error) {
 		style.PrintWarning("could not update issue status to in_progress: %v", err)
 	}
 
-	// Get pane — if this fails, the session may have died during startup.
-	// Kill the dead session to prevent "session already running" on next attempt (gt-jn40ft).
-	pane, err := getSessionPane(s.SessionName)
+	// Get pane, tolerating transient failures. A freshly-started session can be
+	// momentarily unqueryable under tmux/CPU contention, and getSessionPane runs a
+	// single `tmux list-panes` with no retry. Without this, one flaky query on a busy
+	// host would kill a healthy session and make the caller roll the whole spawn back
+	// (worktree removed, bead unhooked) — the fresh-polecat "spawn didn't persist"
+	// failure product work escalated on (hq-wisp-6dawbp).
+	pane, err := getSessionPaneWithRetry(t, s.SessionName)
 	if err != nil {
-		// Session likely died — clean up the tmux session so it doesn't block re-sling
+		// The pane query failed after retries. Only tear the session down (returning
+		// an error makes the caller roll the spawn back) if tmux confirms the session
+		// is actually gone. If it is still alive, the query flaked under load — keep
+		// the running session; the agent discovers its hooked work via gt prime on its
+		// next turn (both callers handle an empty pane as "no nudge").
+		if alive, checkErr := t.HasSession(s.SessionName); checkErr == nil && alive {
+			style.PrintWarning("session %s started but pane query failed after retries: %v — leaving it running (agent will find work via gt prime)", s.SessionName, err)
+			return "", nil
+		}
+		// Session likely died — clean up the tmux session so it doesn't block re-sling.
 		_ = t.KillSession(s.SessionName)
 		return "", fmt.Errorf("getting pane for %s (session likely died during startup): %w", s.SessionName, err)
 	}
 
 	s.Pane = pane
 	return pane, nil
+}
+
+// getSessionPaneWithRetry calls getSessionPane, retrying a few times with a short
+// backoff. A just-started tmux session can be momentarily unqueryable under tmux/CPU
+// contention, so a single failure is not proof the session died. It stops early once
+// tmux confirms the session is genuinely gone, so a real death still fails fast.
+func getSessionPaneWithRetry(t *tmux.Tmux, sessionName string) (string, error) {
+	return retrySessionPane(sessionName, 5, getSessionPane, t.HasSession, func(attempt int) {
+		time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+	})
+}
+
+// retrySessionPane is the injectable core of getSessionPaneWithRetry (getPane,
+// hasSession, and backoff are seams for testing). It retries getPane up to attempts
+// times, but bails out early the moment hasSession reports the session is gone.
+func retrySessionPane(sessionName string, attempts int, getPane func(string) (string, error), hasSession func(string) (bool, error), backoff func(int)) (string, error) {
+	var pane string
+	var err error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			backoff(attempt)
+		}
+		if pane, err = getPane(sessionName); err == nil {
+			return pane, nil
+		}
+		if alive, checkErr := hasSession(sessionName); checkErr == nil && !alive {
+			break // confirmed gone — retrying won't help
+		}
+	}
+	return "", err
 }
 
 // IsRigName checks if a target string is a rig name (not a role or path).
