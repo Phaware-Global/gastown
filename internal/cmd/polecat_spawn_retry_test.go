@@ -64,4 +64,30 @@ func TestRetrySessionPane(t *testing.T) {
 			t.Errorf("getPane called %d times, want 1 (early bail when confirmed gone)", calls)
 		}
 	})
+
+	t.Run("liveness-check error does not bail early (keeps retrying)", func(t *testing.T) {
+		calls := 0
+		getPane := func(string) (string, error) { calls++; return "", errors.New("tmux busy") }
+		hasSessionErr := func(string) (bool, error) { return false, errors.New("tmux server unreachable") }
+		if _, err := retrySessionPane("s", 5, getPane, hasSessionErr, noBackoff); err == nil {
+			t.Fatal("want error when the pane query never succeeds")
+		}
+		// A HasSession error is inconclusive — not proof the session is gone — so we
+		// must keep retrying rather than tear down a possibly-healthy session.
+		if calls != 5 {
+			t.Errorf("getPane called %d times, want 5 (no early bail on inconclusive liveness check)", calls)
+		}
+	})
+
+	t.Run("non-positive attempts returns error, never a spurious empty success", func(t *testing.T) {
+		calls := 0
+		getPane := func(string) (string, error) { calls++; return "%9", nil }
+		pane, err := retrySessionPane("s", 0, getPane, alive, noBackoff)
+		if err == nil {
+			t.Fatalf("want error for attempts=0, got (%q, nil)", pane)
+		}
+		if calls != 0 {
+			t.Errorf("getPane called %d times, want 0", calls)
+		}
+	})
 }

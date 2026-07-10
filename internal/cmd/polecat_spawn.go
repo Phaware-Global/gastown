@@ -473,7 +473,9 @@ func (s *SpawnedPolecatInfo) StartSession() (string, error) {
 		// an error makes the caller roll the spawn back) if tmux confirms the session
 		// is actually gone. If it is still alive, the query flaked under load — keep
 		// the running session; the agent discovers its hooked work via gt prime on its
-		// next turn (both callers handle an empty pane as "no nudge").
+		// next turn (all three
+			// StartSession callers — sling.go, sling_dispatch.go, sling_formula.go —
+			// handle an empty pane as "no nudge").
 		if alive, checkErr := t.HasSession(s.SessionName); checkErr == nil && alive {
 			style.PrintWarning("session %s started but pane query failed after retries: %v — leaving it running (agent will find work via gt prime)", s.SessionName, err)
 			return "", nil
@@ -502,7 +504,9 @@ func getSessionPaneWithRetry(t *tmux.Tmux, sessionName string) (string, error) {
 // times, but bails out early the moment hasSession reports the session is gone.
 func retrySessionPane(sessionName string, attempts int, getPane func(string) (string, error), hasSession func(string) (bool, error), backoff func(int)) (string, error) {
 	var pane string
-	var err error
+	// Seed err so attempts <= 0 returns a real error rather than a spurious
+	// ("", nil) success (which StartSession would treat as "session alive, empty pane").
+	err := fmt.Errorf("retrySessionPane: no attempts made (attempts=%d)", attempts)
 	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
 			backoff(attempt)
