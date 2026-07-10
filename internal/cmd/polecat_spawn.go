@@ -474,8 +474,8 @@ func (s *SpawnedPolecatInfo) StartSession() (string, error) {
 		// is actually gone. If it is still alive, the query flaked under load — keep
 		// the running session; the agent discovers its hooked work via gt prime on its
 		// next turn (all three
-			// StartSession callers — sling.go, sling_dispatch.go, sling_formula.go —
-			// handle an empty pane as "no nudge").
+		// StartSession callers — sling.go, sling_dispatch.go, sling_formula.go —
+		// handle an empty pane as "no nudge").
 		if alive, checkErr := t.HasSession(s.SessionName); checkErr == nil && alive {
 			style.PrintWarning("session %s started but pane query failed after retries: %v — leaving it running (agent will find work via gt prime)", s.SessionName, err)
 			return "", nil
