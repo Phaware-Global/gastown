@@ -1011,6 +1011,14 @@ func (d *Daemon) heartbeat(state *State) {
 	// Kill sessions that have been idle longer than the configured threshold.
 	d.reapIdlePolecats()
 
+	// 12c. Relieve the per-rig polecat directory cap. reapIdlePolecats only kills
+	// LIVE idle sessions; it never removes the resulting dead-session worktree
+	// directories, which accumulate until a rig hits its dir cap and fresh spawns
+	// are refused before a worktree is even created (the "spawn never persists"
+	// deadlock, e.g. heartworks_ios filling all 30 slots). Trim stale dirs when a
+	// rig approaches its cap.
+	d.reapStalePolecatDirsNearCap()
+
 	// 13. Clean up orphaned claude subagent processes (memory leak prevention)
 	// These are Task tool subagents that didn't clean up after completion.
 	// This is a safety net - Deacon patrol also does this more frequently.
@@ -3254,6 +3262,66 @@ func (d *Daemon) killIdlePolecat(rigName, polecatName, sessionName string, idleD
 		events.SessionDeathPayload(sessionName, fmt.Sprintf("%s/polecats/%s", rigName, polecatName),
 			fmt.Sprintf("idle-reap: %s, idle %v (threshold %v)", reason, idleDuration.Truncate(time.Second), timeout),
 			"daemon"))
+}
+
+// polecatDirCapReliefHeadroom is how many free slots below the cap trigger a
+// stale-polecat reap, so fresh spawns keep a little headroom.
+const polecatDirCapReliefHeadroom = 5
+
+// shouldReapForCapRelief reports whether a rig with the given polecat-directory
+// count is close enough to the floor cap to warrant reaping stale polecats.
+func shouldReapForCapRelief(dirCount int) bool {
+	return dirCount >= polecat.MinPolecatDirsPerRig-polecatDirCapReliefHeadroom
+}
+
+// reapStalePolecatDirsNearCap reclaims stale dead-session polecat directories for
+// rigs approaching their per-rig directory cap. reapIdlePolecats only kills LIVE
+// idle sessions; it never removes the resulting dead-session worktree directories
+// (kept by the persistent-pool model for reuse), so they accumulate until a rig
+// hits its cap and fresh spawns are refused before a worktree is even created. This
+// trims the pool only when near the cap — idle dirs are otherwise left for reuse.
+func (d *Daemon) reapStalePolecatDirsNearCap() {
+	d.rigPool.runPerRig(d.ctx, d.getKnownRigs(), func(ctx context.Context, rigName string) error {
+		d.reapRigStalePolecatDirsNearCap(rigName)
+		return nil
+	})
+}
+
+func (d *Daemon) reapRigStalePolecatDirsNearCap(rigName string) {
+	polecatsDir := filepath.Join(d.config.TownRoot, rigName, "polecats")
+	entries, err := os.ReadDir(polecatsDir)
+	if err != nil {
+		return // no polecats directory
+	}
+	dirCount := 0
+	for _, e := range entries {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			dirCount++
+		}
+	}
+	// Leave dirs alone until the rig is filling its slot cap — the pool wants them
+	// for fast reuse. Gate on the floor cap (MinPolecatDirsPerRig); a rig with a
+	// higher max_polecats override is trimmed slightly early, which is safe.
+	if !shouldReapForCapRelief(dirCount) {
+		return
+	}
+	d.logger.Printf("Rig %s at %d polecat dirs (cap floor %d) — reaping stale polecats to relieve the directory cap",
+		rigName, dirCount, polecat.MinPolecatDirsPerRig)
+	// Reap via the canonical, SAFE_TO_NUKE-gated cleanup: it won't touch unpushed
+	// work, in-flight merge requests, recovery-needed, or paused polecats. Uses the
+	// established daemon gt-shellout pattern (d.gtPath), inheriting the daemon env.
+	ctx, cancel := context.WithTimeout(d.ctx, 5*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, d.gtPath, "polecat", "stale", rigName, "--cleanup") //nolint:gosec // G204: args are constructed internally
+	cmd.Dir = d.config.TownRoot
+	util.SetDetachedProcessGroup(cmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		msg := string(out)
+		if len(msg) > 500 {
+			msg = msg[:500]
+		}
+		d.logger.Printf("Warning: cap-relief cleanup for rig %s failed: %v\n%s", rigName, err, msg)
+	}
 }
 
 // cleanupOrphanedProcesses kills orphaned claude subagent processes.

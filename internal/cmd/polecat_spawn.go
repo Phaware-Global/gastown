@@ -23,8 +23,6 @@ import (
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
-const minPolecatDirsPerRig = 30
-
 // SpawnedPolecatInfo contains info about a spawned polecat session.
 type SpawnedPolecatInfo struct {
 	RigName     string // Rig name (e.g., "gastown")
@@ -63,12 +61,6 @@ type SlingSpawnOptions struct {
 	SkipAdmission bool   // Caller already holds a polecat admission reservation
 }
 
-func effectivePolecatDirCap(configured int) int {
-	if configured < minPolecatDirsPerRig {
-		return minPolecatDirsPerRig
-	}
-	return configured
-}
 
 // SpawnPolecatForSling creates a fresh polecat and optionally starts its session.
 // This is used by gt sling when the target is a rig name.
@@ -265,7 +257,7 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	// Per-rig directory cap: prevent unbounded worktree accumulation, but only
 	// after trying safe reuse. A reusable preserved polecat should not be blocked
 	// just because the rig is already at the directory cap.
-	maxPolecatDirsPerRig := effectivePolecatDirCap(r.GetIntConfig("max_polecats"))
+	maxPolecatDirsPerRig := polecat.EffectivePolecatDirCap(r.GetIntConfig("max_polecats"))
 	rigPolecatDir := filepath.Join(townRoot, rigName, "polecats")
 	if entries, err := os.ReadDir(rigPolecatDir); err == nil {
 		dirCount := 0
