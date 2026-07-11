@@ -24,6 +24,40 @@ import (
 // deliveries are simply retried on a later turn.
 const injectAckBudget = 8 * time.Second
 
+// maxInjectPerRun bounds how many unread messages a single inject hook emits and
+// acks. All urgent/high-priority mail is always included; the normal/low tier is
+// capped so a large unread backlog (e.g. a telegraph flood of GitHub CI/PR events)
+// can't make the per-turn inject + delivery-ack blow the UserPromptSubmit hook
+// timeout. Omitted messages stay unread and drain over subsequent turns.
+const maxInjectPerRun = 40
+
+// boundInjectBatch returns at most limit messages to inject and ack, always keeping
+// every urgent and high-priority message and filling the remainder (in order) up to
+// the limit. It also reports how many were omitted. Bounding the per-turn batch keeps
+// the delivery-ack (one Dolt write per message) from blowing the hook timeout when a
+// large backlog has accumulated.
+func boundInjectBatch(messages []*mail.Message, limit int) (batch []*mail.Message, omitted int) {
+	if limit <= 0 || len(messages) <= limit {
+		return messages, 0
+	}
+	var priority, rest []*mail.Message
+	for _, msg := range messages {
+		if msg != nil && (msg.Priority == mail.PriorityUrgent || msg.Priority == mail.PriorityHigh) {
+			priority = append(priority, msg)
+		} else {
+			rest = append(rest, msg)
+		}
+	}
+	batch = priority
+	for _, msg := range rest {
+		if len(batch) >= limit {
+			break
+		}
+		batch = append(batch, msg)
+	}
+	return batch, len(messages) - len(batch)
+}
+
 func runMailCheck(cmd *cobra.Command, args []string) error {
 	start := time.Now()
 
@@ -134,14 +168,18 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 	// checked before going idle (prevents mail from sitting unread).
 	if mailCheckInject {
 		if unread > 0 {
-			messages = filterUnreadMessages(messages)
-			fmt.Print(formatInjectOutput(messages))
-			// Ack after output so message is delivered before being marked acked.
-			// Skip it when the inbox read already blew the budget, so a slow read
-			// under load doesn't compound into a slow write and blow the hook
-			// timeout — unacked deliveries retry on a later turn.
+			batch, omitted := boundInjectBatch(filterUnreadMessages(messages), maxInjectPerRun)
+			fmt.Print(formatInjectOutput(batch))
+			if omitted > 0 {
+				fmt.Printf("\n<system-reminder>\n%d more unread message(s) not shown this turn — the inbox is draining a backlog. Run 'gt mail inbox' to see all.\n</system-reminder>\n", omitted)
+			}
+			// Ack after output so message is delivered before being marked acked. Only
+			// the emitted batch is acked, which (with maxInjectPerRun) bounds the number
+			// of delivery-bead writes so a large backlog can't blow the hook timeout.
+			// Skip it when the inbox read already blew the budget, so a slow read under
+			// load doesn't compound into a slow write — unacked deliveries retry later.
 			if time.Since(start) < injectAckBudget {
-				if ackErr := mailbox.AcknowledgeDeliveries(address, messages); ackErr != nil {
+				if ackErr := mailbox.AcknowledgeDeliveries(address, batch); ackErr != nil {
 					fmt.Fprintf(os.Stderr, "gt mail check: delivery ack update failed for %s: %v\n", address, ackErr)
 				}
 			} else {
