@@ -58,7 +58,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} mail check --inject"
+            "command": "{{GT_BIN}} mail check --inject",
+            "timeout": 60
           }
         ]
       }

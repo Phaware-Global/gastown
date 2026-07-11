@@ -23,6 +23,11 @@ type HookEntry struct {
 type Hook struct {
 	Type    string `json:"type"` // "command"
 	Command string `json:"command"`
+	// Timeout is the hook command's timeout in seconds (Claude Code hook schema).
+	// Omitted (0) uses the client default (30s for UserPromptSubmit). Set higher for
+	// hooks whose work can legitimately run long under load (e.g. gt mail check
+	// --inject reading a Dolt inbox), so the client doesn't discard their output.
+	Timeout int `json:"timeout,omitempty"`
 }
 
 // HooksConfig represents the hooks section of a Claude Code settings.json.

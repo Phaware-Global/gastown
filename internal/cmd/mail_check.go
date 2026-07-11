@@ -24,6 +24,66 @@ import (
 // deliveries are simply retried on a later turn.
 const injectAckBudget = 8 * time.Second
 
+// maxInjectPerRun is a HARD ceiling on how many unread messages a single inject
+// hook emits and acks, regardless of priority. Urgent mail is filled first, then
+// high, then normal/low — so the most important mail is preferentially included —
+// but the total is always bounded. An earlier design left urgent (and then high)
+// unbounded on the theory that important mail "must never be delayed"; that reopened
+// the very wedge this cap exists to close. Message priority is fully sender-controlled
+// (gt mail send --urgent / --priority), so an escalation storm of high/urgent mail —
+// e.g. many HIGH escalations to the mayor during a Dolt incident — would make the
+// per-run delivery-ack (one Dolt write per message) unbounded and blow the
+// UserPromptSubmit hook timeout: output discarded, deliveries never acked, the same
+// flood re-injected next turn — a self-sustaining stall. A hard cap makes a single
+// hook run bounded no matter the priority mix. Omitted messages stay unread and drain
+// over subsequent turns.
+const maxInjectPerRun = 40
+
+// boundInjectBatch returns at most `limit` messages to inject and ack, filling by
+// priority — urgent first, then high, then normal — so the most important mail is
+// kept when the backlog exceeds the cap. It also reports how many were omitted. The
+// ceiling is hard and applies to EVERY tier (including urgent): bounding the per-run
+// batch keeps the delivery-ack (one Dolt write per message) from blowing the hook
+// timeout even under a high/urgent backlog, which priority alone must not be able to
+// bypass. limit<=0 disables the cap (returns all non-nil messages).
+func boundInjectBatch(messages []*mail.Message, limit int) (batch []*mail.Message, omitted int) {
+	// Drop nils up front so they never reach the batch (and can't panic the formatter
+	// or ack) in any path, including the under-limit fast path below.
+	nonNil := make([]*mail.Message, 0, len(messages))
+	for _, msg := range messages {
+		if msg != nil {
+			nonNil = append(nonNil, msg)
+		}
+	}
+	if limit <= 0 || len(nonNil) <= limit {
+		return nonNil, 0
+	}
+	var urgent, high, normal []*mail.Message
+	for _, msg := range nonNil {
+		switch msg.Priority {
+		case mail.PriorityUrgent:
+			urgent = append(urgent, msg)
+		case mail.PriorityHigh:
+			high = append(high, msg)
+		default:
+			normal = append(normal, msg)
+		}
+	}
+	// Fill urgent → high → normal up to the hard limit. Urgent is filled first so it
+	// is preferentially kept, but it is NOT exempt from the cap: an urgent flood spills
+	// its overflow to the omitted count rather than making the batch unbounded.
+	batch = make([]*mail.Message, 0, limit)
+	for _, tier := range [][]*mail.Message{urgent, high, normal} {
+		for _, msg := range tier {
+			if len(batch) >= limit {
+				break
+			}
+			batch = append(batch, msg)
+		}
+	}
+	return batch, len(nonNil) - len(batch)
+}
+
 func runMailCheck(cmd *cobra.Command, args []string) error {
 	start := time.Now()
 
@@ -134,14 +194,18 @@ func runMailCheck(cmd *cobra.Command, args []string) error {
 	// checked before going idle (prevents mail from sitting unread).
 	if mailCheckInject {
 		if unread > 0 {
-			messages = filterUnreadMessages(messages)
-			fmt.Print(formatInjectOutput(messages))
-			// Ack after output so message is delivered before being marked acked.
-			// Skip it when the inbox read already blew the budget, so a slow read
-			// under load doesn't compound into a slow write and blow the hook
-			// timeout — unacked deliveries retry on a later turn.
+			batch, omitted := boundInjectBatch(filterUnreadMessages(messages), maxInjectPerRun)
+			fmt.Print(formatInjectOutput(batch))
+			if omitted > 0 {
+				fmt.Printf("\n<system-reminder>\n%d more unread message(s) not shown this turn — the inbox is draining a backlog. Run 'gt mail inbox' to see all.\n</system-reminder>\n", omitted)
+			}
+			// Ack after output so message is delivered before being marked acked. Only
+			// the emitted batch is acked, which (with maxInjectPerRun) bounds the number
+			// of delivery-bead writes so a large backlog can't blow the hook timeout.
+			// Skip it when the inbox read already blew the budget, so a slow read under
+			// load doesn't compound into a slow write — unacked deliveries retry later.
 			if time.Since(start) < injectAckBudget {
-				if ackErr := mailbox.AcknowledgeDeliveries(address, messages); ackErr != nil {
+				if ackErr := mailbox.AcknowledgeDeliveries(address, batch); ackErr != nil {
 					fmt.Fprintf(os.Stderr, "gt mail check: delivery ack update failed for %s: %v\n", address, ackErr)
 				}
 			} else {
