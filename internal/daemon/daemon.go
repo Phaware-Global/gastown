@@ -3322,9 +3322,10 @@ func (d *Daemon) reapRigStalePolecatDirsNearCap(ctx context.Context, rigName str
 	// refinery. So no unpushed work is lost; a fully-pushed idle polecat is reclaimed
 	// even if it has an open MR (the MR branch survives on the remote). Uses the
 	// established gt-shellout pattern and the per-rig worker ctx so the pool bounds it.
-	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(cctx, d.gtPath, "polecat", "stale", rigName, "--cleanup") //nolint:gosec // G204: args are constructed internally
+	// The RigWorkerPool already gives each rig a bounded context (defaultRigTimeout,
+	// 30s), so use it directly — a longer inner timeout could never fire. A cleanup cut
+	// short by the deadline simply resumes on the next heartbeat.
+	cmd := exec.CommandContext(ctx, d.gtPath, "polecat", "stale", rigName, "--cleanup") //nolint:gosec // G204: args are constructed internally
 	cmd.Dir = d.config.TownRoot
 	util.SetDetachedProcessGroup(cmd)
 	// The detached process group means the ctx-kill only signals the top gt pid, and
