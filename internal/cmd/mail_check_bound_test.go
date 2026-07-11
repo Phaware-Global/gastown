@@ -65,6 +65,31 @@ func TestBoundInjectBatch(t *testing.T) {
 		}
 	})
 
+	t.Run("nil messages are dropped in every path", func(t *testing.T) {
+		// Under the limit, with nils interspersed.
+		msgs := []*mail.Message{nil, mk(mail.PriorityNormal), nil, mk(mail.PriorityHigh), nil}
+		b, om := boundInjectBatch(msgs, 40)
+		if len(b) != 2 || om != 0 {
+			t.Fatalf("under-limit with nils: got %d batch / %d omitted, want 2/0", len(b), om)
+		}
+		for _, m := range b {
+			if m == nil {
+				t.Fatal("nil leaked into batch (under-limit path)")
+			}
+		}
+		// Over the limit, with nils (100 non-nil normal → 40 shown, 60 omitted).
+		over := append([]*mail.Message{nil, nil}, repeat(mail.PriorityNormal, 100)...)
+		b, om = boundInjectBatch(over, 40)
+		if len(b) != 40 || om != 60 {
+			t.Errorf("over-limit with nils: got %d batch / %d omitted, want 40/60", len(b), om)
+		}
+		for _, m := range b {
+			if m == nil {
+				t.Fatal("nil leaked into batch (over-limit path)")
+			}
+		}
+	})
+
 	t.Run("never drops urgent even beyond the limit", func(t *testing.T) {
 		b, om := boundInjectBatch(repeat(mail.PriorityUrgent, 50), 40)
 		if len(b) != 50 || om != 0 {

@@ -38,14 +38,19 @@ const maxInjectPerRun = 40
 // the delivery-ack (one Dolt write per message) from blowing the hook timeout when a
 // large backlog has accumulated, even when the backlog is high-priority.
 func boundInjectBatch(messages []*mail.Message, limit int) (batch []*mail.Message, omitted int) {
-	if limit <= 0 || len(messages) <= limit {
-		return messages, 0
+	// Drop nils up front so they never reach the batch (and can't panic the formatter
+	// or ack) in any path, including the under-limit fast path below.
+	nonNil := make([]*mail.Message, 0, len(messages))
+	for _, msg := range messages {
+		if msg != nil {
+			nonNil = append(nonNil, msg)
+		}
+	}
+	if limit <= 0 || len(nonNil) <= limit {
+		return nonNil, 0
 	}
 	var urgent, high, normal []*mail.Message
-	for _, msg := range messages {
-		if msg == nil {
-			continue
-		}
+	for _, msg := range nonNil {
 		switch msg.Priority {
 		case mail.PriorityUrgent:
 			urgent = append(urgent, msg)
@@ -64,7 +69,7 @@ func boundInjectBatch(messages []*mail.Message, limit int) (batch []*mail.Messag
 			batch = append(batch, msg)
 		}
 	}
-	return batch, len(messages) - len(batch)
+	return batch, len(nonNil) - len(batch)
 }
 
 func runMailCheck(cmd *cobra.Command, args []string) error {
