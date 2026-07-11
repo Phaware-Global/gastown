@@ -25,35 +25,44 @@ import (
 const injectAckBudget = 8 * time.Second
 
 // maxInjectPerRun bounds how many unread messages a single inject hook emits and
-// acks. All urgent/high-priority mail is always included; the normal/low tier is
-// capped so a large unread backlog (e.g. a telegraph flood of GitHub CI/PR events)
-// can't make the per-turn inject + delivery-ack blow the UserPromptSubmit hook
-// timeout. Omitted messages stay unread and drain over subsequent turns.
+// acks. Only urgent mail is unbounded (rare, must never be delayed); high and
+// normal/low fill the remaining budget, high first. This caps the per-turn
+// delivery-ack so a large backlog — including a high-priority telegraph flood of
+// GitHub CI/PR events — can't blow the UserPromptSubmit hook timeout. Omitted
+// messages stay unread and drain over subsequent turns.
 const maxInjectPerRun = 40
 
-// boundInjectBatch returns at most limit messages to inject and ack, always keeping
-// every urgent and high-priority message and filling the remainder (in order) up to
+// boundInjectBatch returns at most max(urgent count, limit) messages to inject and
+// ack: every urgent message (never dropped), then high, then normal, filling up to
 // the limit. It also reports how many were omitted. Bounding the per-turn batch keeps
 // the delivery-ack (one Dolt write per message) from blowing the hook timeout when a
-// large backlog has accumulated.
+// large backlog has accumulated, even when the backlog is high-priority.
 func boundInjectBatch(messages []*mail.Message, limit int) (batch []*mail.Message, omitted int) {
 	if limit <= 0 || len(messages) <= limit {
 		return messages, 0
 	}
-	var priority, rest []*mail.Message
+	var urgent, high, normal []*mail.Message
 	for _, msg := range messages {
-		if msg != nil && (msg.Priority == mail.PriorityUrgent || msg.Priority == mail.PriorityHigh) {
-			priority = append(priority, msg)
-		} else {
-			rest = append(rest, msg)
+		if msg == nil {
+			continue
+		}
+		switch msg.Priority {
+		case mail.PriorityUrgent:
+			urgent = append(urgent, msg)
+		case mail.PriorityHigh:
+			high = append(high, msg)
+		default:
+			normal = append(normal, msg)
 		}
 	}
-	batch = priority
-	for _, msg := range rest {
-		if len(batch) >= limit {
-			break
+	batch = urgent // urgent is never dropped
+	for _, tier := range [][]*mail.Message{high, normal} {
+		for _, msg := range tier {
+			if len(batch) >= limit {
+				break
+			}
+			batch = append(batch, msg)
 		}
-		batch = append(batch, msg)
 	}
 	return batch, len(messages) - len(batch)
 }

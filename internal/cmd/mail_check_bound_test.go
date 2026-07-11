@@ -39,14 +39,29 @@ func TestBoundInjectBatch(t *testing.T) {
 		}
 	})
 
-	t.Run("urgent and high always kept, normal fills the rest", func(t *testing.T) {
+	t.Run("urgent kept; high then normal fill to the limit", func(t *testing.T) {
 		mixed := append(append(repeat(mail.PriorityUrgent, 5), repeat(mail.PriorityHigh, 3)...), repeat(mail.PriorityNormal, 100)...)
 		b, om := boundInjectBatch(mixed, 40)
-		if len(b) != 40 || om != 68 { // 5+3+32 shown, 108-40 omitted
+		if len(b) != 40 || om != 68 { // 5 urgent + 3 high + 32 normal shown, 108-40 omitted
 			t.Errorf("got %d batch / %d omitted, want 40/68", len(b), om)
 		}
-		if countPri(b, mail.PriorityUrgent) != 5 || countPri(b, mail.PriorityHigh) != 3 {
-			t.Errorf("dropped priority mail: %d urgent, %d high (want 5,3)", countPri(b, mail.PriorityUrgent), countPri(b, mail.PriorityHigh))
+		if countPri(b, mail.PriorityUrgent) != 5 || countPri(b, mail.PriorityHigh) != 3 || countPri(b, mail.PriorityNormal) != 32 {
+			t.Errorf("wrong fill: %d urgent, %d high, %d normal (want 5,3,32)",
+				countPri(b, mail.PriorityUrgent), countPri(b, mail.PriorityHigh), countPri(b, mail.PriorityNormal))
+		}
+	})
+
+	t.Run("high-priority flood is capped, urgent still all kept", func(t *testing.T) {
+		// A telegraph flood marked high must not defeat the bound: 5 urgent + 100 high
+		// + 50 normal at limit 40 → 5 urgent + 35 high (fill to 40), no normal.
+		mixed := append(append(repeat(mail.PriorityUrgent, 5), repeat(mail.PriorityHigh, 100)...), repeat(mail.PriorityNormal, 50)...)
+		b, om := boundInjectBatch(mixed, 40)
+		if len(b) != 40 || om != 115 { // 155 total - 40 shown
+			t.Errorf("got %d batch / %d omitted, want 40/115", len(b), om)
+		}
+		if countPri(b, mail.PriorityUrgent) != 5 || countPri(b, mail.PriorityHigh) != 35 || countPri(b, mail.PriorityNormal) != 0 {
+			t.Errorf("flood not capped: %d urgent, %d high, %d normal (want 5,35,0)",
+				countPri(b, mail.PriorityUrgent), countPri(b, mail.PriorityHigh), countPri(b, mail.PriorityNormal))
 		}
 	})
 
