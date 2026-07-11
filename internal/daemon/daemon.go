@@ -3269,9 +3269,10 @@ func (d *Daemon) killIdlePolecat(rigName, polecatName, sessionName string, idleD
 const polecatDirCapReliefHeadroom = 5
 
 // shouldReapForCapRelief reports whether a rig with the given polecat-directory
-// count is close enough to the floor cap to warrant reaping stale polecats.
-func shouldReapForCapRelief(dirCount int) bool {
-	return dirCount >= polecat.MinPolecatDirsPerRig-polecatDirCapReliefHeadroom
+// count is within the relief headroom of its effective cap, and so should have
+// stale polecats reaped.
+func shouldReapForCapRelief(dirCount, cap int) bool {
+	return dirCount >= cap-polecatDirCapReliefHeadroom
 }
 
 // reapStalePolecatDirsNearCap reclaims stale dead-session polecat directories for
@@ -3281,13 +3282,19 @@ func shouldReapForCapRelief(dirCount int) bool {
 // hits its cap and fresh spawns are refused before a worktree is even created. This
 // trims the pool only when near the cap — idle dirs are otherwise left for reuse.
 func (d *Daemon) reapStalePolecatDirsNearCap() {
+	// Build the rig manager once, up front, for effective-cap resolution across rigs.
+	rigsConfig, err := agentconfig.LoadRigsConfig(filepath.Join(d.config.TownRoot, "mayor", "rigs.json"))
+	if err != nil {
+		rigsConfig = &agentconfig.RigsConfig{Rigs: make(map[string]agentconfig.RigEntry)}
+	}
+	rigMgr := rig.NewManager(d.config.TownRoot, rigsConfig, gitpkg.NewGit(d.config.TownRoot))
 	d.rigPool.runPerRig(d.ctx, d.getKnownRigs(), func(ctx context.Context, rigName string) error {
-		d.reapRigStalePolecatDirsNearCap(rigName)
+		d.reapRigStalePolecatDirsNearCap(ctx, rigMgr, rigName)
 		return nil
 	})
 }
 
-func (d *Daemon) reapRigStalePolecatDirsNearCap(rigName string) {
+func (d *Daemon) reapRigStalePolecatDirsNearCap(ctx context.Context, rigMgr *rig.Manager, rigName string) {
 	polecatsDir := filepath.Join(d.config.TownRoot, rigName, "polecats")
 	entries, err := os.ReadDir(polecatsDir)
 	if err != nil {
@@ -3299,20 +3306,33 @@ func (d *Daemon) reapRigStalePolecatDirsNearCap(rigName string) {
 			dirCount++
 		}
 	}
-	// Leave dirs alone until the rig is filling its slot cap — the pool wants them
-	// for fast reuse. Gate on the floor cap (MinPolecatDirsPerRig); a rig with a
-	// higher max_polecats override is trimmed slightly early, which is safe.
-	if !shouldReapForCapRelief(dirCount) {
+	// Cheap pre-filter: the floor (MinPolecatDirsPerRig) is the smallest possible cap,
+	// so below its relief threshold no rig can be near its cap — skip resolving the
+	// per-rig config on every heartbeat.
+	if dirCount < polecat.MinPolecatDirsPerRig-polecatDirCapReliefHeadroom {
 		return
 	}
-	d.logger.Printf("Rig %s at %d polecat dirs (cap floor %d) — reaping stale polecats to relieve the directory cap",
-		rigName, dirCount, polecat.MinPolecatDirsPerRig)
-	// Reap via the canonical, SAFE_TO_NUKE-gated cleanup: it won't touch unpushed
-	// work, in-flight merge requests, recovery-needed, or paused polecats. Uses the
-	// established daemon gt-shellout pattern (d.gtPath), inheriting the daemon env.
-	ctx, cancel := context.WithTimeout(d.ctx, 5*time.Minute)
+	// Resolve this rig's ACTUAL effective cap (max_polecats floored at the minimum),
+	// so a rig configured for a larger pool isn't reaped down to the floor and looped.
+	effectiveCap := polecat.MinPolecatDirsPerRig
+	if r, rerr := rigMgr.GetRig(rigName); rerr == nil {
+		effectiveCap = polecat.EffectivePolecatDirCap(r.GetIntConfig("max_polecats"))
+	}
+	if !shouldReapForCapRelief(dirCount, effectiveCap) {
+		return // near the floor, but still comfortably below this rig's real cap
+	}
+	d.logger.Printf("Rig %s at %d/%d polecat dirs — reaping stale polecats to relieve the directory cap",
+		rigName, dirCount, effectiveCap)
+	// Reap via `gt polecat stale --cleanup`. It reaps only polecats assessStaleness
+	// deems stale: session-less AND not paused (protected agent states) AND with no
+	// uncommitted or unpushed work (CleanExcludingBeads counts unpushed commits), and
+	// nukePolecatFull does a best-effort push and preserves the remote branch for the
+	// refinery. So no unpushed work is lost; a fully-pushed idle polecat is reclaimed
+	// even if it has an open MR (the MR branch survives on the remote). Uses the
+	// established gt-shellout pattern and the per-rig worker ctx so the pool bounds it.
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, d.gtPath, "polecat", "stale", rigName, "--cleanup") //nolint:gosec // G204: args are constructed internally
+	cmd := exec.CommandContext(cctx, d.gtPath, "polecat", "stale", rigName, "--cleanup") //nolint:gosec // G204: args are constructed internally
 	cmd.Dir = d.config.TownRoot
 	util.SetDetachedProcessGroup(cmd)
 	if out, err := cmd.CombinedOutput(); err != nil {
