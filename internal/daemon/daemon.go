@@ -1011,6 +1011,14 @@ func (d *Daemon) heartbeat(state *State) {
 	// Kill sessions that have been idle longer than the configured threshold.
 	d.reapIdlePolecats()
 
+	// 12c. Relieve the per-rig polecat directory cap. reapIdlePolecats only kills
+	// LIVE idle sessions; it never removes the resulting dead-session worktree
+	// directories, which accumulate until a rig hits its dir cap and fresh spawns
+	// are refused before a worktree is even created (the "spawn never persists"
+	// deadlock, e.g. heartworks_ios filling all 30 slots). Trim stale dirs when a
+	// rig approaches its cap.
+	d.reapStalePolecatDirsNearCap()
+
 	// 13. Clean up orphaned claude subagent processes (memory leak prevention)
 	// These are Task tool subagents that didn't clean up after completion.
 	// This is a safety net - Deacon patrol also does this more frequently.
@@ -3254,6 +3262,107 @@ func (d *Daemon) killIdlePolecat(rigName, polecatName, sessionName string, idleD
 		events.SessionDeathPayload(sessionName, fmt.Sprintf("%s/polecats/%s", rigName, polecatName),
 			fmt.Sprintf("idle-reap: %s, idle %v (threshold %v)", reason, idleDuration.Truncate(time.Second), timeout),
 			"daemon"))
+}
+
+// polecatDirCapReliefHeadroom is how many free slots below the cap trigger a
+// stale-polecat reap, so fresh spawns keep a little headroom.
+const polecatDirCapReliefHeadroom = 5
+
+// shouldReapForCapRelief reports whether a rig with the given polecat-directory
+// count is within the relief headroom of its effective cap, and so should have
+// stale polecats reaped.
+func shouldReapForCapRelief(dirCount, cap int) bool {
+	return dirCount >= cap-polecatDirCapReliefHeadroom
+}
+
+// reapStalePolecatDirsNearCap reclaims stale dead-session polecat directories for
+// rigs approaching their per-rig directory cap. reapIdlePolecats only kills LIVE
+// idle sessions; it never removes the resulting dead-session worktree directories
+// (kept by the persistent-pool model for reuse), so they accumulate until a rig
+// hits its cap and fresh spawns are refused before a worktree is even created. This
+// trims the pool only when near the cap — idle dirs are otherwise left for reuse.
+func (d *Daemon) reapStalePolecatDirsNearCap() {
+	d.rigPool.runPerRig(d.ctx, d.getKnownRigs(), func(ctx context.Context, rigName string) error {
+		d.reapRigStalePolecatDirsNearCap(ctx, rigName)
+		return nil
+	})
+}
+
+func (d *Daemon) reapRigStalePolecatDirsNearCap(ctx context.Context, rigName string) {
+	polecatsDir := filepath.Join(d.config.TownRoot, rigName, "polecats")
+	entries, err := os.ReadDir(polecatsDir)
+	if err != nil {
+		return // no polecats directory
+	}
+	dirCount := 0
+	for _, e := range entries {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			dirCount++
+		}
+	}
+	// Cheap pre-filter: the floor (MinPolecatDirsPerRig) is the smallest possible cap,
+	// so below its relief threshold no rig can be near its cap. This runs every
+	// heartbeat, so it stays a bare dir count — no config parse or rig-manager build
+	// happens unless a rig is actually near the floor.
+	if dirCount < polecat.MinPolecatDirsPerRig-polecatDirCapReliefHeadroom {
+		return
+	}
+	// Near the floor — resolve this rig's ACTUAL effective cap (max_polecats floored
+	// at the minimum), so a rig configured for a larger pool isn't reaped to the floor.
+	effectiveCap := d.resolveRigPolecatCap(rigName)
+	if !shouldReapForCapRelief(dirCount, effectiveCap) {
+		return // near the floor, but still comfortably below this rig's real cap
+	}
+	d.logger.Printf("Rig %s at %d/%d polecat dirs — reaping stale polecats to relieve the directory cap",
+		rigName, dirCount, effectiveCap)
+	// Reap via `gt polecat stale --cleanup`. It reaps only polecats assessStaleness
+	// deems stale: session-less AND not paused (protected agent states) AND with no
+	// uncommitted or unpushed work (CleanExcludingBeads counts unpushed commits), and
+	// nukePolecatFull does a best-effort push and preserves the remote branch for the
+	// refinery. So no unpushed work is lost; a fully-pushed idle polecat is reclaimed
+	// even if it has an open MR (the MR branch survives on the remote). Uses the
+	// established gt-shellout pattern and the per-rig worker ctx so the pool bounds it.
+	// The RigWorkerPool already gives each rig a bounded context (defaultRigTimeout,
+	// 30s), so use it directly — a longer inner timeout could never fire. A cleanup cut
+	// short by the deadline simply resumes on the next heartbeat.
+	cmd := exec.CommandContext(ctx, d.gtPath, "polecat", "stale", rigName, "--cleanup") //nolint:gosec // G204: args are constructed internally
+	cmd.Dir = d.config.TownRoot
+	util.SetDetachedProcessGroup(cmd)
+	// The detached process group means the ctx-kill only signals the top gt pid, and
+	// CombinedOutput can then block on the pipe a git grandchild still holds. WaitDelay
+	// bounds that: after the deadline fires, Wait abandons the process and its pipes
+	// within WaitDelay so a hung child can't stall the heartbeat worker indefinitely.
+	cmd.WaitDelay = 10 * time.Second
+	if out, err := cmd.CombinedOutput(); err != nil {
+		msg := string(out)
+		if len(msg) > 500 {
+			msg = msg[:500]
+		}
+		d.logger.Printf("Warning: cap-relief cleanup for rig %s failed: %v\n%s", rigName, err, msg)
+	}
+}
+
+// resolveRigPolecatCap returns the effective polecat-directory cap for a rig
+// (max_polecats floored at MinPolecatDirsPerRig). It is called only for rigs already
+// near the floor, so building a rig manager here keeps it off the common heartbeat
+// path. On any config/rig load error it logs and falls back to the floor rather than
+// silently gating the rig — a transient rigs.json read must not quietly reap a
+// high-cap rig early.
+func (d *Daemon) resolveRigPolecatCap(rigName string) int {
+	rigsConfig, err := agentconfig.LoadRigsConfig(filepath.Join(d.config.TownRoot, "mayor", "rigs.json"))
+	if err != nil {
+		d.logger.Printf("Warning: cap-relief could not load rigs.json for %s (using floor cap %d): %v",
+			rigName, polecat.MinPolecatDirsPerRig, err)
+		return polecat.MinPolecatDirsPerRig
+	}
+	rigMgr := rig.NewManager(d.config.TownRoot, rigsConfig, gitpkg.NewGit(d.config.TownRoot))
+	r, err := rigMgr.GetRig(rigName)
+	if err != nil {
+		d.logger.Printf("Warning: cap-relief could not load rig %s config (using floor cap %d): %v",
+			rigName, polecat.MinPolecatDirsPerRig, err)
+		return polecat.MinPolecatDirsPerRig
+	}
+	return polecat.EffectivePolecatDirCap(r.GetIntConfig("max_polecats"))
 }
 
 // cleanupOrphanedProcesses kills orphaned claude subagent processes.
