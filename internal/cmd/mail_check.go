@@ -24,19 +24,28 @@ import (
 // deliveries are simply retried on a later turn.
 const injectAckBudget = 8 * time.Second
 
-// maxInjectPerRun bounds how many unread messages a single inject hook emits and
-// acks. Only urgent mail is unbounded (rare, must never be delayed); high and
-// normal/low fill the remaining budget, high first. This caps the per-turn
-// delivery-ack so a large backlog — including a high-priority telegraph flood of
-// GitHub CI/PR events — can't blow the UserPromptSubmit hook timeout. Omitted
-// messages stay unread and drain over subsequent turns.
+// maxInjectPerRun is a HARD ceiling on how many unread messages a single inject
+// hook emits and acks, regardless of priority. Urgent mail is filled first, then
+// high, then normal/low — so the most important mail is preferentially included —
+// but the total is always bounded. An earlier design left urgent (and then high)
+// unbounded on the theory that important mail "must never be delayed"; that reopened
+// the very wedge this cap exists to close. Message priority is fully sender-controlled
+// (gt mail send --urgent / --priority), so an escalation storm of high/urgent mail —
+// e.g. many HIGH escalations to the mayor during a Dolt incident — would make the
+// per-run delivery-ack (one Dolt write per message) unbounded and blow the
+// UserPromptSubmit hook timeout: output discarded, deliveries never acked, the same
+// flood re-injected next turn — a self-sustaining stall. A hard cap makes a single
+// hook run bounded no matter the priority mix. Omitted messages stay unread and drain
+// over subsequent turns.
 const maxInjectPerRun = 40
 
-// boundInjectBatch returns at most max(urgent count, limit) messages to inject and
-// ack: every urgent message (never dropped), then high, then normal, filling up to
-// the limit. It also reports how many were omitted. Bounding the per-turn batch keeps
-// the delivery-ack (one Dolt write per message) from blowing the hook timeout when a
-// large backlog has accumulated, even when the backlog is high-priority.
+// boundInjectBatch returns at most `limit` messages to inject and ack, filling by
+// priority — urgent first, then high, then normal — so the most important mail is
+// kept when the backlog exceeds the cap. It also reports how many were omitted. The
+// ceiling is hard and applies to EVERY tier (including urgent): bounding the per-run
+// batch keeps the delivery-ack (one Dolt write per message) from blowing the hook
+// timeout even under a high/urgent backlog, which priority alone must not be able to
+// bypass. limit<=0 disables the cap (returns all non-nil messages).
 func boundInjectBatch(messages []*mail.Message, limit int) (batch []*mail.Message, omitted int) {
 	// Drop nils up front so they never reach the batch (and can't panic the formatter
 	// or ack) in any path, including the under-limit fast path below.
@@ -60,8 +69,11 @@ func boundInjectBatch(messages []*mail.Message, limit int) (batch []*mail.Messag
 			normal = append(normal, msg)
 		}
 	}
-	batch = urgent // urgent is never dropped
-	for _, tier := range [][]*mail.Message{high, normal} {
+	// Fill urgent → high → normal up to the hard limit. Urgent is filled first so it
+	// is preferentially kept, but it is NOT exempt from the cap: an urgent flood spills
+	// its overflow to the omitted count rather than making the batch unbounded.
+	batch = make([]*mail.Message, 0, limit)
+	for _, tier := range [][]*mail.Message{urgent, high, normal} {
 		for _, msg := range tier {
 			if len(batch) >= limit {
 				break

@@ -90,10 +90,47 @@ func TestBoundInjectBatch(t *testing.T) {
 		}
 	})
 
-	t.Run("never drops urgent even beyond the limit", func(t *testing.T) {
+	t.Run("urgent is filled first but still bounded by the hard cap", func(t *testing.T) {
+		// A flood of urgent mail must NOT make the batch unbounded — priority is
+		// sender-controlled, so an unbounded urgent tier would reopen the hook-timeout
+		// wedge. 50 urgent at limit 40 → 40 shown (all urgent), 10 omitted.
 		b, om := boundInjectBatch(repeat(mail.PriorityUrgent, 50), 40)
-		if len(b) != 50 || om != 0 {
-			t.Errorf("got %d batch / %d omitted, want 50/0 (urgent must never be dropped)", len(b), om)
+		if len(b) != 40 || om != 10 {
+			t.Errorf("got %d batch / %d omitted, want 40/10 (urgent must be capped too)", len(b), om)
+		}
+		if countPri(b, mail.PriorityUrgent) != 40 {
+			t.Errorf("expected all 40 slots filled with urgent, got %d", countPri(b, mail.PriorityUrgent))
+		}
+	})
+
+	t.Run("urgent is preferred over high/normal when the cap binds", func(t *testing.T) {
+		// 40 urgent + 40 high + 40 normal at limit 40 → all 40 slots go to urgent.
+		mixed := append(append(repeat(mail.PriorityUrgent, 40), repeat(mail.PriorityHigh, 40)...), repeat(mail.PriorityNormal, 40)...)
+		b, om := boundInjectBatch(mixed, 40)
+		if len(b) != 40 || om != 80 {
+			t.Errorf("got %d batch / %d omitted, want 40/80", len(b), om)
+		}
+		if countPri(b, mail.PriorityUrgent) != 40 {
+			t.Errorf("urgent must be filled first: got %d urgent in batch, want 40", countPri(b, mail.PriorityUrgent))
+		}
+	})
+
+	t.Run("limit<=0 disables the cap", func(t *testing.T) {
+		msgs := repeat(mail.PriorityNormal, 100)
+		b, om := boundInjectBatch(msgs, 0)
+		if len(b) != 100 || om != 0 {
+			t.Errorf("limit 0: got %d batch / %d omitted, want 100/0 (cap disabled)", len(b), om)
+		}
+		b, om = boundInjectBatch(msgs, -1)
+		if len(b) != 100 || om != 0 {
+			t.Errorf("limit -1: got %d batch / %d omitted, want 100/0 (cap disabled)", len(b), om)
+		}
+	})
+
+	t.Run("exactly at the limit returns all, none omitted", func(t *testing.T) {
+		b, om := boundInjectBatch(repeat(mail.PriorityNormal, 40), 40)
+		if len(b) != 40 || om != 0 {
+			t.Errorf("len==limit: got %d batch / %d omitted, want 40/0", len(b), om)
 		}
 	})
 }
