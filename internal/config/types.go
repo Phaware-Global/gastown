@@ -686,7 +686,8 @@ const CurrentRigsVersion = 1
 const CurrentRigConfigVersion = 1
 
 // CurrentRigSettingsVersion is the current schema version for RigSettings.
-const CurrentRigSettingsVersion = 1
+// v2: added the Execution block (remote polecat execution).
+const CurrentRigSettingsVersion = 2
 
 // RigConfig represents per-rig identity (rig/config.json).
 // This contains only identity - behavioral config is in settings/config.json.
@@ -755,6 +756,11 @@ type RigSettings struct {
 	// CodeGraph configures automatic codegraph indexing for this rig's new worktrees.
 	// Overrides the town-level CodeGraph setting when non-nil.
 	CodeGraph *CodeGraphConfig `json:"codegraph,omitempty"`
+
+	// Execution selects where this rig's polecats run and their remote
+	// lifecycle (docs/design/remote-polecat-execution.md §4). Nil or
+	// backend "local" means today's on-host behavior.
+	Execution *ExecutionConfig `json:"execution,omitempty"`
 }
 
 // CrewConfig represents crew workspace settings for a rig.

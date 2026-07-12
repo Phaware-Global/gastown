@@ -3145,9 +3145,23 @@ func (d *Daemon) reapRigIdlePolecats(rigName string, timeout time.Duration) {
 		return // No polecats directory
 	}
 
+	maxRuntime := rigMaxRuntime(filepath.Join(d.config.TownRoot, rigName))
 	for _, polecatName := range polecats {
-		d.reapIdlePolecat(rigName, polecatName, timeout)
+		d.reapIdlePolecat(rigName, polecatName, timeout, maxRuntime)
 	}
+}
+
+// rigMaxRuntime returns the absolute polecat runtime cap for a rig, or 0 when
+// the rig has no execution block configured. Rigs opt into the cap by setting
+// execution in settings/config.json (docs/design/remote-polecat-execution.md
+// §9.5) — applying a default cap to unconfigured rigs would change existing
+// local behavior.
+func rigMaxRuntime(rigPath string) time.Duration {
+	settings, err := agentconfig.LoadRigSettings(agentconfig.RigSettingsPath(rigPath))
+	if err != nil || settings == nil || settings.Execution == nil {
+		return 0
+	}
+	return settings.Execution.MaxRuntime()
 }
 
 // reapIdlePolecat checks a single polecat and kills it if idle too long.
@@ -3157,13 +3171,25 @@ func (d *Daemon) reapRigIdlePolecats(rigName string, timeout time.Duration) {
 //     hooked work (agent_state=idle in beads). This catches polecats that completed
 //     gt done — persistentPreRun resets heartbeat to "working" on every gt sub-command,
 //     so after gt done finishes the heartbeat shows "working" with a stale timestamp.
-func (d *Daemon) reapIdlePolecat(rigName, polecatName string, timeout time.Duration) {
+func (d *Daemon) reapIdlePolecat(rigName, polecatName string, timeout, maxRuntime time.Duration) {
 	sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
 
 	// Only check sessions that are actually alive
 	alive, err := d.tmux.HasSession(sessionName)
 	if err != nil || !alive {
 		return
+	}
+
+	// Absolute zombie cap (remote-polecat-execution §9.5): wall-clock since
+	// session creation, independent of heartbeat freshness and state — the
+	// idle-based checks below never catch a busy-but-looping polecat. 0 = no cap.
+	if maxRuntime > 0 {
+		if created, err := d.tmux.GetSessionCreatedTime(sessionName); err == nil {
+			if age := time.Since(created); age > maxRuntime {
+				d.killIdlePolecat(rigName, polecatName, sessionName, age, maxRuntime, "max-runtime-exceeded")
+				return
+			}
+		}
 	}
 
 	// Read heartbeat to check state and idle duration
