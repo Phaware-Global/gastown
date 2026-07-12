@@ -317,9 +317,9 @@ Worker-side configuration (`/etc/gt-worker/config.json`, operator-managed, never
 transmitted): listen address, state/worktree/spool directories, TLS material
 from enrollment, allowed exec modes, and an optional **agent env file**
 (`agent_env_file`) supplying worker-local secrets like `ANTHROPIC_API_KEY` —
-this provider's `agent_auth` mechanism (core §7.1): the operator provisions LLM
-credentials on the machine once; they are injected into the work process
-worker-side and never cross the socket.
+this provider's form of the externalized agent-auth contract (core §7.1): the
+operator provisions credentials on the machine once; they are injected into the
+work process worker-side and never cross the socket.
 
 ## 9. Network egress posture (socket implementation)
 
@@ -378,22 +378,24 @@ internals in a service + protocol shell.
    watchdog + orphaned-session reaping, `push_binaries` freshness.
 5. Egress modes (§9) and macOS (launchd) worker support.
 
-## 12. Open questions (socket)
+## 12. Decisions (socket)
 
-1. **Concurrent sessions per worker.** v1 assumes a small fixed capacity
-   (worker config `max_sessions`, default 1). Should the worker advertise
-   capacity/load in `hello_ack` so the daemon can pick among several enrolled
-   workers for one rig — and is that already too close to the scheduler
-   non-goal (core §1)?
-2. **Binary delivery trust.** `push_binaries` lets the orchestrator run
-   arbitrary code on the worker (inherent to the model, and equivalent to EC2's
-   SSM injection) — is mTLS + enrollment sufficient, or should binaries also be
-   signature-verified against a release key so a compromised *daemon host*
-   can't push tampered binaries?
-3. **macOS workers.** Container mode on macOS means Docker Desktop/colima with
-   different bind-mount and UID semantics; native mode is the realistic first
-   target for iOS rigs. Which ships first?
-4. **NAT / non-LAN workers.** The orchestrator dials the worker, so a worker
-   behind NAT needs a tunnel (Tailscale already assumed for the proxy plane,
-   core §9.6). Standardize on "the address must be reachable; use your mesh,"
-   or add a worker-initiated (reverse) connection mode later?
+All resolved 2026-07-11:
+
+1. **Concurrent sessions per worker.** Worker-side **`max_sessions`** in the
+   worker config (default **1**), advertised in `hello_ack`; the worker
+   refuses `session_open` beyond it. One enrolled worker per rig in v1 —
+   choosing among several workers is placement, which stays out of scope
+   (core §1 non-goal). No load advertisement beyond the session count.
+2. **Binary delivery trust.** v1 relies on **mTLS + enrollment** plus the
+   per-binary `sha256` already carried in `push_binaries` — threat-parity
+   with the EC2 provider's boot-time injection, and a compromised
+   orchestrator host already owns the town it orchestrates.
+   Release-key signature verification is future hardening, not v1.
+3. **macOS workers.** **Linux, container mode ships first** — it shares the
+   container/relay/bind-mount code paths with EC2. macOS native mode follows
+   for iOS-adjacent rigs (launchd packaging, no-Docker native path).
+4. **NAT / non-LAN workers.** v1 requires the worker `address` to be
+   **directly reachable** from the orchestrator — the same mesh/VPN
+   assumption the proxy plane already makes (core §9.6). A worker-initiated
+   reverse-connection mode is deferred until a real deployment needs it.

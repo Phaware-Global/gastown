@@ -44,9 +44,10 @@ The **provider channel** (core §3) is SSM — IAM-authenticated `SendCommand` /
   checkpointing still apply (they also guard against host crashes). A rig can
   switch between the two with a one-line config change and no other behavioral
   difference.
-- **Sizing.** Either an explicit `instance_type`, or `cpu`/`memory` hints from
-  which the backend picks the cheapest matching type/class (open question 3).
-  Worktree/root storage is gp3 EBS sized by `ebs_gb`.
+- **Sizing.** v1 requires an explicit `instance_type` (x86_64 first — the AMI
+  arch must match; an arm64 AMI comes later). `cpu`/`memory` hints →
+  cheapest-matching-type selection is deferred; the keys are reserved (§13,
+  decision 3). Worktree/root storage is gp3 EBS sized by `ebs_gb`.
 - **Identity tags (core §5 "Endpoint discovery").** Every instance is tagged
   `gt:rig`, `gt:polecat`, `gt:session` at `RunInstances`. Daemon restarts and
   the orphan reaper re-find live instances via `DescribeInstances` on these
@@ -73,7 +74,7 @@ The AMI is defined by a Packer HCL2 template in this repo:
 **Baked into the AMI (slow-moving):**
 
 - Base distro: **Amazon Linux 2023** (first-party SSM agent + Docker packaging;
-  Ubuntu LTS is an acceptable alternative — open question 2).
+  Ubuntu LTS was considered and rejected — §13, decision 2).
 - `dockerd` (enabled at boot) — the real Docker daemon (core §10).
 - `amazon-ssm-agent` (enabled at boot) — the provider channel.
 - `git` — host-side checkpointing (core §9.2) runs `git` in `gt-worker-agent`,
@@ -116,21 +117,22 @@ EC2-specific keys live under the `ec2` key of the core `execution` block (core
     "instance_lifecycle": "spot",      // "spot" | "on_demand"
     "spot_max_price": null,            // optional cap; null = current on-demand price
 
-    // Resource sizing (§2). Either name an instance_type directly, or give
-    // cpu/memory and let the backend pick the cheapest matching type/class.
-    "instance_type": "c7i.2xlarge",    // optional explicit type
-    "cpu": "8",                        // else: vCPU…
-    "memory": "16Gi",                  // …and memory → instance-type selection
+    // Resource sizing (§2). v1: explicit instance_type, required. cpu/memory →
+    // cheapest-matching-type selection is deferred; keys reserved (§13).
+    "instance_type": "c7i.2xlarge",
     "ebs_gb": 80,                      // root/worktree EBS (gp3)
 
     // Registry auth for `image` (§6.3)
     "image_auth": { "type": "ecr" },
 
-    // agent (LLM) auth (§6.2)
-    "agent_auth": { "mode": "bedrock_role" },
+    // Secret env resolved worker-side from Secrets Manager (§6.2, core §7.1).
+    // Only needed for direct-API auth; Bedrock rigs need no secret at all.
+    "env_secrets": {
+      "ANTHROPIC_API_KEY": "arn:aws:secretsmanager:us-east-1:123456789:secret:gt-anthropic-key"
+    },
 
     // gateway-mode egress config (§7); only read when network.mode = "gateway".
-    // v1 accepts only "cloudflare_zero_trust" (core §12, open question 3).
+    // v1 accepts only "cloudflare_zero_trust" (core §12, decision 3).
     "gateway": {
       "provider": "cloudflare_zero_trust",
       "token_secret_arn": "arn:aws:secretsmanager:us-east-1:123456789:secret:gt-cf-egress"
@@ -159,7 +161,9 @@ The same rig as strict, comment-free JSON:
       "instance_type": "c7i.2xlarge",
       "ebs_gb": 80,
       "image_auth": { "type": "ecr" },
-      "agent_auth": { "mode": "bedrock_role" },
+      "env_secrets": {
+        "ANTHROPIC_API_KEY": "arn:aws:secretsmanager:us-east-1:123456789:secret:gt-anthropic-key"
+      },
       "gateway": {
         "provider": "cloudflare_zero_trust",
         "token_secret_arn": "arn:aws:secretsmanager:us-east-1:123456789:secret:gt-cf-egress"
@@ -212,7 +216,7 @@ CloudTrail/SSM logs; Secrets Manager / SSM **ARNs** (references) are fine.
 |---|---|
 | Control-plane identity (proxy cert) | CSR-over-SSM (§6.1); Secrets Manager fallback (§6.1). |
 | Image pull auth | ECR (same/cross-account): the **instance profile** role (`ecr:*`) + repo policy for cross-account. Other registries: `docker login` from a Secrets Manager secret the instance role can read. |
-| LLM auth | Default `bedrock_role` (§6.2) — no key to inject. Alternative `secret`: Secrets Manager → container env. |
+| LLM auth | **Externalized** (core §7.1, §6.2 here): Bedrock via the instance role + non-secret env (no secret at all), or a direct API key via `env_secrets` → Secrets Manager → container env. |
 | Worker platform identity | The instance IAM role (§11), scoped per rig — also covers any AWS work the agent itself does. |
 
 ### 6.1 Proxy-cert delivery: CSR over SSM
@@ -254,29 +258,35 @@ for:
 > address changes, the daemon can update the instance's proxy endpoint
 > out-of-band (SSM Parameter Store or a `send-command`).
 
-### 6.2 LLM auth (`agent_auth`)
+### 6.2 Agent (LLM) auth — externalized
 
-Implements core §7.1. Default **`bedrock_role`**: set
-`CLAUDE_CODE_USE_BEDROCK=1`, grant the instance role `bedrock:InvokeModel` —
-**no key to inject**; the instance role then does triple duty (ECR pull +
-Secrets Manager + Bedrock invoke). Alternative **`secret`**: source
-`ANTHROPIC_API_KEY` (or the named provider var) from Secrets Manager into the
-container env — worker-side, never the command line.
+Per core §7.1, gastown does not model LLM auth as config; authenticating the
+agent is part of the rig's environment contract (core §6.2). Two patterns on
+EC2:
+
+- **Bedrock via the instance role (no secret).** The rig's env (`rc.Env`) sets
+  `CLAUDE_CODE_USE_BEDROCK=1` (+ region vars) — non-secret, injected per core
+  §7.4 — and the rig's instance role carries `bedrock:InvokeModel` (§11).
+  Nothing to deliver; the operator confirms the target models are available in
+  the rig's region (§13, decision 1).
+- **Direct API key via `env_secrets`.** The `ec2.env_secrets` map names
+  Secrets Manager ARNs; `gt-worker-agent` resolves them worker-side into the
+  container env — never the command line:
 
 ```jsonc
-"agent_auth": { "mode": "bedrock_role" }                 // default; no secret
-// or
-"agent_auth": {
-  "mode": "secret",
-  "env_var": "ANTHROPIC_API_KEY",
-  "secret_arn": "arn:aws:secretsmanager:us-east-1:123456789:secret:gt-anthropic-key"
+"env_secrets": {
+  "ANTHROPIC_API_KEY": "arn:aws:secretsmanager:us-east-1:123456789:secret:gt-anthropic-key"
 }
 ```
+
+Either way the instance role does triple duty (ECR pull + Secrets Manager reads
++ optional Bedrock invoke), and `env_secrets` is agent-agnostic — it delivers
+any secret env the rig needs, not just LLM keys.
 
 ### 6.3 Registry auth (`image_auth`)
 
 `{ "type": "ecr" }` uses the instance profile for same- or cross-account ECR
-(cross-account additionally needs a repo policy — open question 4). Other
+(cross-account additionally needs a repo policy — §13, decision 4). Other
 registries: `{ "type": "secret", "secret_arn": "…" }` → `docker login`
 worker-side from Secrets Manager.
 
@@ -293,8 +303,8 @@ PrivateLink** (NAT fallback), with the security group denying everything else
 |---|---|---|
 | ECR (api + dkr) + S3 gateway | image pull | VPC endpoints |
 | SSM / SSMMessages / EC2Messages | SSM session/exec (provider channel) | VPC endpoints |
-| Secrets Manager | `secret`-mode auth, registry creds | VPC endpoint |
-| Bedrock runtime | `agent_auth.mode = bedrock_role` | VPC endpoint |
+| Secrets Manager | `env_secrets`, registry creds, gateway token | VPC endpoint |
+| Bedrock runtime | Bedrock-authenticated rigs (§6.2) | VPC endpoint |
 | S3 checkpoint-spool bucket | offline checkpoint fallback (§9.1) | S3 gateway endpoint |
 | Host proxy (`:9876`) | all control-plane + git | direct (VPC / VPN / Tailscale) |
 
@@ -311,8 +321,8 @@ PrivateLink** (NAT fallback), with the security group denying everything else
    policies enforcing destination policy, blocking known-bad endpoints, and
    logging every flow for audit/DLP. The gateway token is injected as a Secrets
    Manager reference (`ec2.gateway.token_secret_arn`), and `gt-worker-agent`
-   brings the tunnel up before the work container starts. Per the core §12
-   decision (open question 3), **`cloudflare_zero_trust` is the only accepted
+   brings the tunnel up before the work container starts. Per core §12,
+   decision 3, **`cloudflare_zero_trust` is the only accepted
    `gateway.provider` value in v1** — orchestrator-side preflight rejects
    anything else — and gt does not create or manage Gateway policies: the
    rig's policy (allowlists, DLP, logging rules) is administered in the
@@ -416,7 +426,7 @@ EC2 instantiation of core §10's list):
    the ECR repos / secrets / Bedrock models / S3 prefixes it needs, not one
    broad shared role, so a stolen credential is narrowly bounded (§11).
 
-Depth-of-hardening beyond (1)–(3) is core open question 5.
+Depth-of-hardening beyond (1)–(3) is settled by core §12, decision 5: raw socket for trusted rigs; `requires_docker` + `sandboxed` rejected at preflight until rootless dockerd ships.
 
 ## 11. IAM requirements (instance profile)
 
@@ -426,8 +436,8 @@ Per-rig instance role, least-privilege (§10.3). Required actions by feature:
 |---|---|
 | SSM channel (exec, cert flow, binary injection) | `ssm:UpdateInstanceInformation`, `ssmmessages:*`, `ec2messages:*` (the standard `AmazonSSMManagedInstanceCore` set) |
 | Image pull | `ecr:GetAuthorizationToken`, `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` on the rig's repos |
-| `agent_auth: secret` / registry secrets / gateway token | `secretsmanager:GetSecretValue` on the specific ARNs |
-| `agent_auth: bedrock_role` | `bedrock:InvokeModel` (+ streaming variant) on the rig's model IDs |
+| `env_secrets` / registry secrets / gateway token | `secretsmanager:GetSecretValue` on the specific ARNs |
+| Bedrock rigs (§6.2) | `bedrock:InvokeModel` (+ streaming variant) on the rig's model IDs |
 | S3 checkpoint spool (§9.1) | `s3:PutObject`, `s3:GetObject`, `s3:ListBucket` on the spool bucket/prefix for this rig |
 | Self-termination watchdog (§9) | none — `shutdown -h` + `InstanceInitiatedShutdownBehavior: terminate` needs no API call (deliberately: the instance role gets **no** `ec2:TerminateInstances`) |
 
@@ -446,7 +456,7 @@ Assumes core Tiers 1–2 (config, CA primitive, interface, provider-neutral
    proxy-client/`gt-worker-agent`.
 2. `EC2Backend.Provision/Teardown` honoring `instance_lifecycle` (spot **and**
    on-demand), the provision hook, instance-profile credential wiring (ECR /
-   `agent_auth`), tag-based discovery.
+   `env_secrets`), tag-based discovery.
 3. CSR-over-SSM cert acquisition (§6.1); container launch with bind-mounts
    (`/opt/gt`, worktree, docker.sock), `exec_mode` container/native.
 4. SSM-based `WrapCommand` (blocking-pane wrapper) + remote session-env
@@ -456,21 +466,31 @@ Assumes core Tiers 1–2 (config, CA primitive, interface, provider-neutral
 6. Egress postures (§7): `sandboxed` (SG-only) → `gateway` (Zero Trust tunnel as
    a host service) → `open`.
 
-## 13. Open questions (EC2)
+## 13. Decisions (EC2)
 
-1. **Bedrock model parity.** Confirm target models (e.g. Opus 4.8) are available
-   on Bedrock in the chosen region before defaulting a rig to `bedrock_role`;
-   otherwise use `secret` + direct Anthropic API.
-2. **AMI scope / base distro.** Amazon Linux 2023 vs Ubuntu LTS; which
-   toolchains (if any) belong in the base AMI vs the default work image (core
-   open question 2)?
-3. **Instance sizing UX.** Prefer explicit `instance_type`, or `cpu`/`memory` →
-   cheapest-matching-type selection (and across which families)? How to express
-   GPU / arch (arm64 vs x86) needs?
-4. **Cross-account ECR.** Standardize on instance-role + repo policy, or an
-   assumed pull-role ARN in `image_auth`?
-5. **On-demand fallback.** Should `instance_lifecycle: "spot"` optionally fall
-   back to on-demand on `InsufficientInstanceCapacity`, or fail and retry spot?
+All resolved 2026-07-11:
+
+1. **Bedrock model parity.** Resolved by externalizing agent auth (core §7.1,
+   §6.2 here): gastown no longer defaults an LLM auth mode, so there is
+   nothing to gate on Bedrock availability. Rigs that choose Bedrock set the
+   non-secret env + role grant and confirm regional model availability
+   themselves; rigs on the direct API declare an `env_secrets` reference.
+   Model-availability checking is out of gastown's scope.
+2. **AMI scope / base distro.** **Amazon Linux 2023** (first-party SSM agent +
+   Docker packaging). The AMI bakes **no toolchains** — toolchains belong to
+   work images (core §12, decision 2).
+3. **Instance sizing UX.** v1 requires an explicit **`instance_type`**,
+   x86_64 first (the AMI arch must match; an arm64 AMI is a follow-up).
+   `cpu`/`memory` → cheapest-matching-type selection is deferred; the keys are
+   reserved in the schema but rejected by v1 preflight. GPU and arch needs are
+   expressed through `instance_type` directly.
+4. **Cross-account ECR.** Instance-role + ECR repository policy (the standard
+   pattern). No assumed pull-role ARN in `image_auth` for v1.
+5. **On-demand fallback.** **No silent fallback** on
+   `InsufficientInstanceCapacity`: the spot failure surfaces on the bead and
+   the operator flips `instance_lifecycle` (a one-line change, §2) — a cost
+   posture should never change implicitly. An explicit opt-in fallback flag
+   can be revisited if capacity errors prove frequent in practice.
 
 ---
 

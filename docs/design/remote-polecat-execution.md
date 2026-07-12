@@ -508,7 +508,7 @@ build/test tools — the reason for a custom image); (3) a **POSIX shell
 binary directly), but because most providers' exec channels are **string**
 interfaces: `WrapCommand` delivers the agent as a single shell-quoted command
 line that we run as `sh -c "<argv>"`; that, plus interactive sessions, needs
-`/bin/sh` (v1 requires it; distroless is a known limitation — open question 6);
+`/bin/sh` (v1 requires it; distroless is unsupported — §12, decision 6);
 (4) a **Docker client** *only if* the rig's workflows call `docker`/`docker
 compose` (§10).
 
@@ -524,9 +524,15 @@ egress (control plane is proxied; the agent's own internet is governed by
 gastown's checkpoint/push runs host-side in `gt-worker-agent`, independent of
 the image.
 
+A corollary of §7.1: the image (with the rig's env and the worker's ambient
+identity) **must yield an agent runtime that can authenticate** — LLM
+credentials are never baked into the image itself; they arrive via the §7.1
+mechanisms.
+
 **Default image:** when `image` is empty, the backend uses a gastown-published
-default dev image satisfying the above for the `claude` agent plus a common
-toolchain — same injection path, no special case.
+default dev image satisfying the above for the `claude` agent plus **Node.js
+LTS, Python 3, and Go** (§12, decision 2) — same injection path, no special
+case. Anything beyond those toolchains is a custom image.
 
 ### 6.3 Preflight
 
@@ -535,8 +541,10 @@ laptop, so it must **not** pull the (potentially large) work image just to
 inspect it:
 
 - **Orchestrator-side (config only, no image pull):** reject `requires_docker`
-  on a provider that cannot supply a Docker daemon (§10); reject an
-  untrusted/`sandboxed` rig configured for host networking (§6.1.1);
+  on a provider that cannot supply a Docker daemon (§10); reject
+  `requires_docker` on a `sandboxed` rig while rootless dockerd is unshipped
+  (§12, decision 5); reject an untrusted/`sandboxed` rig configured for host
+  networking (§6.1.1);
   sanity-check the resolved agent config and the provider extension block
   (sizing, addresses, auth references — per provider spec). These need no image
   and fail instantly.
@@ -565,10 +573,10 @@ exposing the value.
 |---|---|---|
 | **Control-plane identity** (proxy cert) | Daemon mints a short-lived leaf cert (CN `gt-<rig>-<name>`) at provision; **the private key is generated on the worker and never transmitted** (§7.2). Identity is the cert, enforced by `gt-proxy-server`. | Provider-defined signing channel (§7.2). |
 | **Image pull auth** | Never in the command string or image. | Provider-defined: ambient worker credentials or a worker-side secret store / operator-installed login. |
-| **LLM auth** | Never in the command string, image, or provisioning metadata (§7.1). | Provider-defined worker-side injection; ambient cloud identity where available. |
+| **LLM auth** | Never in the command string, image, or provisioning metadata (§7.1). | **Externalized** (§7.1): ambient worker identity + non-secret env, generic `env_secrets` references resolved worker-side, or operator-provisioned worker config. |
 | **Worker's own platform identity** | Whatever identity the worker holds (cloud role, machine cert) is scoped to that worker's needs, least-privilege. | Provider-defined. |
 
-### 7.1 LLM auth detail
+### 7.1 LLM auth — externalized to the environment
 
 `internal/config/env.go` already defines the per-provider auth allowlist
 (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, the cloud-LLM platform var groups,
@@ -576,18 +584,32 @@ exposing the value.
 orchestrator's shell env and baking them into the host `exec env` prefix — which
 (a) does not propagate through a remote exec channel into the worker process,
 and (b) would leak the secret via provider-side channel/session logs and process
-args if inlined into the remote command. So for remote backends, the **names**
-are accounted for but the **delivery** must change:
+args if inlined into the remote command.
 
-- Route auth vars through **worker-side env injection** (a secret store the
-  worker can read, ambient cloud identity, or operator-provisioned worker
-  config), never the command line.
-- Prefer mechanisms with **no transmitted secret at all** (e.g. an ambient cloud
-  identity that grants model access) where the provider offers one.
+Rather than model LLM auth as gastown config, **authenticating the agent
+runtime is externalized to the execution environment** — it is part of the
+image/worker contract (§6.2), not a gastown-managed concern. gastown supplies
+generic plumbing only; the rig operator decides how the agent authenticates:
 
-A useful security property falls out: the key lives worker-side (secret store or
-machine config), not the orchestrator's shell — the remote path is *more*
-isolated than local. Each provider spec defines its `agent_auth` mechanism.
+- **Ambient worker identity (preferred where available).** The worker's
+  platform identity grants model access directly (e.g. a cloud role authorized
+  for a managed model service); the rig's env carries only the non-secret
+  switches that point the agent at it (via `rc.Env`, §8, injected per §7.4). No
+  secret exists at all.
+- **Generic secret-env references (`env_secrets`).** For direct API keys, the
+  provider extension declares `env_secrets: { "VAR": "<secret reference>" }`;
+  `gt-worker-agent` resolves each reference **worker-side** via the provider's
+  secret mechanism into the agent's env. gastown treats these as opaque env
+  vars — nothing in the core knows or cares that one is an LLM key, and the
+  same mechanism serves any other secret env the rig needs.
+- **Operator-provisioned worker config.** On persistent machines the operator
+  provisions credentials on the worker itself (see the socket spec §8); they
+  are injected locally and never transmitted.
+
+In every case the §7 invariant holds: secrets never ride the command line, the
+image, or provisioning metadata. A useful property falls out: the key lives
+worker-side, not in the orchestrator's shell — the remote path is *more*
+isolated than local.
 
 ### 7.2 Secure proxy-cert delivery
 
@@ -1005,15 +1027,19 @@ exists, and Tier 2 is fully exercisable against `LocalBackend`.
 
 ---
 
-## 12. Open questions (core)
+## 12. Decisions & open questions (core)
 
-Provider-specific questions live in the provider specs. Universal:
+Provider-specific decisions live in the provider specs. Universal items below
+are resolved (2026-07-11) unless explicitly marked open.
 
-1. **Provision latency vs. dispatch.** Acquiring a worker takes
-   seconds-to-minutes in the dispatch path (varies by provider). Accept
-   synchronously for v1; pre-warming (Tier 4) is the optimization.
-2. **Default dev image scope.** Which toolchains ship in the gastown default
-   work image vs. left to custom images?
+1. **Provision latency vs. dispatch.** **Resolved:** v1 provisions
+   synchronously in the dispatch path (seconds-to-minutes, varies by
+   provider); pre-warmed idle pools (Tier 4) are the optimization if and when
+   the latency hurts in practice.
+2. **Default dev image scope.** **Resolved:** the gastown default work image
+   ships the `claude` agent, `git`, `/bin/sh` + coreutils, plus **Node.js LTS,
+   Python 3, and Go**. Anything beyond that (JVM, Rust, mobile toolchains, …)
+   is a custom image.
 3. **Egress gateway abstraction (§7.3).** **Resolved (2026-07-11): no
    gateway-product interface in v1.** Each provider spec names a single
    supported gateway product; preflight rejects any other
@@ -1027,22 +1053,21 @@ Provider-specific questions live in the provider specs. Universal:
    in the gateway product's own control plane, never through gt.
    **Still open:** the recommended default `gateway` policy posture — a
    curated registry allowlist vs. allow-all-but-log.
-4. **Sandboxed-mode dependency story.** For `sandboxed` rigs that still need
-   packages, standardize on a pull-through cache/internal mirror vs. deps
-   pre-baked in the image/worker base? (Mechanisms are provider-specific; the
-   policy choice is shared.)
-5. **Docker socket hardening (§10).** Default to a bind-mounted host socket
-   (single-tenant) or invest in rootless dockerd / nested userns as the default
-   for defense-in-depth against a malicious agent escaping to worker-host root?
-6. **Distroless work images (§6.2).** Confirm whether an exec channel can drive
-   a shell injected by absolute path into a `/bin/sh`-less image, or whether v1
-   simply requires `/bin/sh`. Note a second pitfall beyond the exec path:
-   distroless images lack `glibc` and the dynamic linker
-   (`/lib64/ld-linux-x86-64.so.2`), so any injected shell/binary **must be fully
-   statically linked** (e.g. static `busybox`/`toybox`) to run at all — a
-   dynamically linked one fails with a missing-loader error. This pushes the v1
-   stance further toward simply requiring `/bin/sh`.
-7. **Worker sizing UX.** Providers with elastic sizing want `cpu`/`memory`
-   hints; fixed machines have none. Should sizing hints live in the core schema
-   (advisory, ignorable) or stay purely provider-specific (current position:
-   provider-specific)?
+4. **Sandboxed-mode dependency story.** **Resolved:** v1 = dependencies
+   **pre-baked into the work image** (no new infrastructure). An internal
+   mirror / pull-through cache is a later, provider-level enhancement for rigs
+   whose dependency sets churn too fast to bake.
+5. **Docker socket hardening (§10).** **Resolved:** the bind-mounted host
+   socket stays the default for **trusted** rigs; rootless dockerd / nested
+   userns remains mandatory for untrusted code (§10) and is **not in v1** — so
+   preflight rejects `requires_docker` on `sandboxed`/untrusted rigs until
+   rootless ships (§6.3). No silent weakening of either posture.
+6. **Distroless work images (§6.2).** **Resolved:** v1 requires `/bin/sh` (and
+   a standard dynamic linker) in the work image, enforced by worker-side
+   preflight (§6.3); distroless images are unsupported. (Beyond the exec-string
+   path, distroless lacks `glibc`/the dynamic linker, so an injected shell
+   would have to be fully statically linked — not worth solving unless a real
+   rig needs it.)
+7. **Worker sizing UX.** **Resolved:** sizing stays provider-specific; the
+   core schema carries no sizing fields. (EC2's v1 stance: explicit instance
+   type — see that spec's decisions.)
