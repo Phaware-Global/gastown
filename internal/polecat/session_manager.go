@@ -340,7 +340,7 @@ func (m *SessionManager) polecatSlot(polecat string) int {
 }
 
 // Start creates and starts a new session for a polecat.
-func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
+func (m *SessionManager) Start(polecat string, opts SessionStartOptions) (retErr error) {
 	if !m.hasPolecat(polecat) {
 		return fmt.Errorf("%w: %s", ErrPolecatNotFound, polecat)
 	}
@@ -508,17 +508,25 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		if opts.Command != "" {
 			return fmt.Errorf("explicit command override is not supported with remote execution backend %q", execCfg.BackendName())
 		}
-		wrapped, err := buildRemoteArgv(context.Background(), execCfg,
+		prov, err := buildRemoteArgv(context.Background(), execCfg,
 			execution.PolecatSpec{Rig: m.rig.Name, Polecat: polecat, Session: sessionID, Config: execCfg},
 			runtimeConfig.BuildArgsWithPrompt(beacon), envVars)
 		if err != nil {
 			return fmt.Errorf("remote execution: %w", err)
 		}
-		command = shellJoinArgv(wrapped)
+		// From here the worker is provisioned; if any later step of Start fails
+		// (and thus returns a non-nil error), release it so we never orphan an
+		// off-host worker (remote-polecat-execution §9.5).
+		defer func() {
+			if retErr != nil {
+				prov.teardown()
+			}
+		}()
+		command = shellJoinArgv(prov.argv)
 		// The host pane runs the backend's launcher, not the agent, so
 		// process-name liveness must track the launcher; agent liveness is
 		// heartbeat-only for remote backends (§8.1).
-		envVars["GT_PROCESS_NAMES"] = filepath.Base(wrapped[0])
+		envVars["GT_PROCESS_NAMES"] = filepath.Base(prov.argv[0])
 	}
 
 	// Create session with command and env vars via -e flags so the initial
