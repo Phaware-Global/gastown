@@ -131,7 +131,7 @@ func TestSignPolecatCSR_RejectsWeakKeys(t *testing.T) {
 	}
 	weakPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
 	if _, err := ca.SignPolecatCSR(weakPEM, "gt-gastown-furiosa", 0); err == nil {
-		t.Error("signed a 512-bit RSA key")
+		t.Error("signed a 1024-bit RSA key (below the 2048 floor)")
 	}
 
 	// 2048-bit RSA is the floor and must pass.
@@ -165,8 +165,12 @@ func TestSignPolecatCSR_ClampsTTLCeiling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Assert both bounds: clamped DOWN to ~MaxRemoteCertTTL, not over-clamped
+	// to a tiny/zero value (which would still pass an upper-bound-only check).
 	if ttl := time.Until(cert.NotAfter); ttl > MaxRemoteCertTTL+time.Minute {
 		t.Errorf("TTL not clamped: %v > %v", ttl, MaxRemoteCertTTL)
+	} else if ttl < MaxRemoteCertTTL-2*time.Minute {
+		t.Errorf("TTL over-clamped: %v < %v", ttl, MaxRemoteCertTTL)
 	}
 }
 
