@@ -1,7 +1,11 @@
 package proxy
 
 import (
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -17,6 +21,12 @@ import (
 // compromised. The authoritative default lives here, not inherited from
 // /v1/admin/issue-cert.
 const DefaultRemoteCertTTL = 24 * time.Hour
+
+// MaxRemoteCertTTL is the hard ceiling on CSR-signed leaf TTLs. The short
+// lifetime is the primary bound on exposure from a compromised worker (the
+// proxy deny list is in-memory and lost on restart), so a buggy caller must
+// not be able to mint a long-lived leaf; out-of-range requests are clamped.
+const MaxRemoteCertTTL = 7 * 24 * time.Hour
 
 // SignPolecatCSR signs a PEM-encoded PKCS#10 CSR as a polecat client cert.
 //
@@ -54,9 +64,15 @@ func (ca *CA) SignPolecatCSR(csrPEM []byte, expectedCN string, ttl time.Duration
 	if csr.Subject.CommonName != expectedCN {
 		return nil, fmt.Errorf("csr: CN %q does not match expected identity %q", csr.Subject.CommonName, expectedCN)
 	}
+	if err := checkCSRKeyStrength(csr.PublicKey); err != nil {
+		return nil, fmt.Errorf("csr: %w", err)
+	}
 
 	if ttl <= 0 {
 		ttl = DefaultRemoteCertTTL
+	}
+	if ttl > MaxRemoteCertTTL {
+		ttl = MaxRemoteCertTTL
 	}
 
 	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
@@ -79,4 +95,29 @@ func (ca *CA) SignPolecatCSR(csrPEM []byte, expectedCN string, ttl time.Duration
 	}
 
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}), nil
+}
+
+// checkCSRKeyStrength rejects weak or unknown public keys before the CA
+// endorses them. CheckSignature proves possession, not strength — the CSR is
+// attacker-influenced, and a signed cert for a factorable key is an
+// impersonation primitive.
+func checkCSRKeyStrength(pub any) error {
+	switch k := pub.(type) {
+	case *ecdsa.PublicKey:
+		switch k.Curve {
+		case elliptic.P256(), elliptic.P384(), elliptic.P521():
+			return nil
+		default:
+			return fmt.Errorf("ecdsa curve %s not allowed (want P-256/P-384/P-521)", k.Curve.Params().Name)
+		}
+	case ed25519.PublicKey:
+		return nil
+	case *rsa.PublicKey:
+		if k.N.BitLen() < 2048 {
+			return fmt.Errorf("rsa key too small: %d bits (min 2048)", k.N.BitLen())
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported public key type %T", pub)
+	}
 }

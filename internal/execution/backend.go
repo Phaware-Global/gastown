@@ -65,6 +65,12 @@ type Backend interface {
 	// it does not merely prepend a prefix — and is responsible for landing
 	// argv and env in the remote process by whatever mechanism its launcher
 	// requires (design §7.4).
+	//
+	// The returned argv is rendered into a host tmux command line and is
+	// visible in host process listings. Secret env (LLM keys, registry creds,
+	// the proxy key) MUST therefore be delivered out-of-band worker-side
+	// (design §7.1–7.2, §7.4), never folded into the returned argv. Only
+	// non-secret session env may travel in the launcher payload.
 	WrapCommand(ep Endpoint, agentArgv []string, env map[string]string) ([]string, error)
 
 	// Teardown releases the environment: destroy the sandbox, or end the

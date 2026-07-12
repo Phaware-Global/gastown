@@ -99,6 +99,9 @@ func (e *ExecutionConfig) UnmarshalJSON(data []byte) error {
 
 // MarshalJSON re-emits the shared fields with provider extensions as sibling keys.
 func (e *ExecutionConfig) MarshalJSON() ([]byte, error) {
+	if e == nil {
+		return []byte("null"), nil
+	}
 	type plain ExecutionConfig
 	data, err := json.Marshal((*plain)(e))
 	if err != nil {
@@ -164,6 +167,14 @@ func (e *ExecutionConfig) MaxRuntime() time.Duration {
 	return ParseDurationOrDefault(e.MaxRuntimeStr, DefaultMaxRuntime)
 }
 
+// MaxRuntimeSet reports whether max_runtime was explicitly configured (as
+// opposed to defaulted). The reaper's hard-kill cap keys on this so merely
+// declaring an execution block — e.g. to select a backend or network posture
+// — never silently imposes a wall-clock kill on a busy polecat. Nil-safe.
+func (e *ExecutionConfig) MaxRuntimeSet() bool {
+	return e != nil && e.MaxRuntimeStr != ""
+}
+
 // ProviderExtension returns the raw provider-specific sub-object for the
 // selected backend (e.g. the "ec2" object when backend is "ec2"), or nil if
 // none was configured. Nil-safe.
@@ -179,7 +190,13 @@ var ErrInvalidExecutionConfig = errors.New("invalid execution config")
 
 // validateExecutionConfig validates the shared fields of an execution block.
 // Provider extensions are opaque here; the selected backend validates its own.
+// The backend NAME is deliberately not validated here: the provider registry
+// lives above this package (internal/execution imports config), so an unknown
+// name fails closed at backend resolution and at orchestrator-side preflight.
 func validateExecutionConfig(e *ExecutionConfig) error {
+	if e == nil {
+		return nil
+	}
 	switch e.ExecMode {
 	case "", ExecModeContainer, ExecModeNative:
 	default:

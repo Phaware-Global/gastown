@@ -3,6 +3,7 @@ package polecat
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -49,7 +50,7 @@ func TestBuildRemoteArgv(t *testing.T) {
 	agentArgv := []string{"claude", "--model", "opus", "do work"}
 	env := map[string]string{"GT_ROLE": "myr/polecats/mycat", "GT_PROXY_URL": "http://127.0.0.1:9899"}
 
-	wrapped, err := buildRemoteArgv(context.Background(), execCfg, spec, agentArgv, env)
+	prov, err := buildRemoteArgv(context.Background(), execCfg, spec, agentArgv, env)
 	if err != nil {
 		t.Fatalf("buildRemoteArgv: %v", err)
 	}
@@ -69,8 +70,8 @@ func TestBuildRemoteArgv(t *testing.T) {
 	if fake.gotEnv["GT_PROXY_URL"] != "http://127.0.0.1:9899" {
 		t.Errorf("backend received env %v", fake.gotEnv)
 	}
-	if !reflect.DeepEqual(wrapped, fake.launcher) {
-		t.Errorf("wrapped = %v, want backend launcher %v", wrapped, fake.launcher)
+	if !reflect.DeepEqual(prov.argv, fake.launcher) {
+		t.Errorf("wrapped = %v, want backend launcher %v", prov.argv, fake.launcher)
 	}
 }
 
@@ -80,6 +81,75 @@ func TestBuildRemoteArgv_UnknownBackend(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for unregistered backend")
 	}
+}
+
+// tearDownBackend counts Teardown calls and can fail WrapCommand on demand.
+type tearDownBackend struct {
+	failWrap     bool
+	teardownCnt  int
+	provisionCnt int
+}
+
+func (b *tearDownBackend) Provision(_ context.Context, spec execution.PolecatSpec) (execution.Endpoint, error) {
+	b.provisionCnt++
+	return execution.Endpoint{Backend: "teardowntest", ID: "w1", Identity: spec.Identity()}, nil
+}
+
+func (b *tearDownBackend) WrapCommand(_ execution.Endpoint, argv []string, _ map[string]string) ([]string, error) {
+	if b.failWrap {
+		return nil, fmt.Errorf("wrap boom")
+	}
+	return append([]string{"launch"}, argv...), nil
+}
+
+func (b *tearDownBackend) Teardown(context.Context, execution.Endpoint) error {
+	b.teardownCnt++
+	return nil
+}
+
+func (b *tearDownBackend) Discover(context.Context, execution.IdentityTags) ([]execution.Endpoint, error) {
+	return nil, nil
+}
+
+// TestBuildRemoteArgv_TeardownOnWrapFailure verifies that a WrapCommand failure
+// after a successful Provision releases the worker rather than leaking it.
+func TestBuildRemoteArgv_TeardownOnWrapFailure(t *testing.T) {
+	backend := &tearDownBackend{failWrap: true}
+	execution.Register("teardowntest", func(*config.ExecutionConfig) (execution.Backend, error) {
+		return backend, nil
+	})
+	execCfg := &config.ExecutionConfig{Backend: "teardowntest"}
+
+	_, err := buildRemoteArgv(context.Background(), execCfg,
+		execution.PolecatSpec{Rig: "r", Polecat: "p"}, []string{"claude"}, nil)
+	if err == nil {
+		t.Fatal("expected wrap failure")
+	}
+	if backend.provisionCnt != 1 {
+		t.Errorf("provisionCnt = %d, want 1", backend.provisionCnt)
+	}
+	if backend.teardownCnt != 1 {
+		t.Errorf("teardownCnt = %d, want 1 (worker leaked on wrap failure)", backend.teardownCnt)
+	}
+}
+
+// TestRemoteProvision_TeardownOnStartFailure verifies the deferred cleanup
+// contract: teardown() releases the provisioned worker (the path Start's
+// defer runs when a later start step errors).
+func TestRemoteProvision_TeardownOnStartFailure(t *testing.T) {
+	backend := &tearDownBackend{}
+	prov := &remoteProvision{
+		argv:    []string{"launch", "claude"},
+		backend: backend,
+		ep:      execution.Endpoint{ID: "w1"},
+	}
+	prov.teardown()
+	if backend.teardownCnt != 1 {
+		t.Errorf("teardownCnt = %d, want 1", backend.teardownCnt)
+	}
+	// Nil-safe.
+	var nilProv *remoteProvision
+	nilProv.teardown()
 }
 
 func TestShellJoinArgv(t *testing.T) {

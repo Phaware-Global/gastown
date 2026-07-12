@@ -3,6 +3,7 @@ package daemon
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -106,20 +107,23 @@ func TestReapIdlePolecat_NoCapNoReap(t *testing.T) {
 	}
 }
 
-// TestRigMaxRuntime verifies cap resolution from rig settings: 0 without an
-// execution block, configured value with one, default 4h when unset.
+// TestRigMaxRuntime verifies cap resolution from rig settings. The hard-kill
+// cap engages ONLY when max_runtime is explicitly set: no settings, no
+// execution block, and an execution block without max_runtime all yield 0
+// (no cap), so merely selecting a backend never silently hard-kills a busy
+// polecat.
 func TestRigMaxRuntime(t *testing.T) {
 	rigPath := t.TempDir()
 	settingsDir := filepath.Join(rigPath, "settings")
 	_ = os.MkdirAll(settingsDir, 0755)
 	settingsPath := filepath.Join(settingsDir, "config.json")
+	d := &Daemon{logger: log.New(io.Discard, "", 0)}
 
 	// No settings file at all → no cap.
-	if got := rigMaxRuntime(rigPath); got != 0 {
+	if got := d.rigMaxRuntime(rigPath); got != 0 {
 		t.Errorf("no settings: rigMaxRuntime = %v, want 0", got)
 	}
 
-	// Settings without execution block → no cap.
 	writeSettings := func(s *agentconfig.RigSettings) {
 		data, err := json.Marshal(s)
 		if err != nil {
@@ -129,26 +133,29 @@ func TestRigMaxRuntime(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+
+	// Settings without execution block → no cap.
 	writeSettings(&agentconfig.RigSettings{Type: "rig-settings", Version: agentconfig.CurrentRigSettingsVersion})
-	if got := rigMaxRuntime(rigPath); got != 0 {
+	if got := d.rigMaxRuntime(rigPath); got != 0 {
 		t.Errorf("no execution block: rigMaxRuntime = %v, want 0", got)
 	}
 
-	// Execution block with explicit max_runtime.
-	writeSettings(&agentconfig.RigSettings{
-		Type: "rig-settings", Version: agentconfig.CurrentRigSettingsVersion,
-		Execution: &agentconfig.ExecutionConfig{MaxRuntimeStr: "2h"},
-	})
-	if got := rigMaxRuntime(rigPath); got != 2*time.Hour {
-		t.Errorf("explicit: rigMaxRuntime = %v, want 2h", got)
-	}
-
-	// Execution block without max_runtime → design default.
+	// Execution block WITHOUT max_runtime → still no cap (the key safety fix:
+	// no silent 4h hard-kill just because a backend/network was selected).
 	writeSettings(&agentconfig.RigSettings{
 		Type: "rig-settings", Version: agentconfig.CurrentRigSettingsVersion,
 		Execution: &agentconfig.ExecutionConfig{Backend: "local"},
 	})
-	if got := rigMaxRuntime(rigPath); got != agentconfig.DefaultMaxRuntime {
-		t.Errorf("default: rigMaxRuntime = %v, want %v", got, agentconfig.DefaultMaxRuntime)
+	if got := d.rigMaxRuntime(rigPath); got != 0 {
+		t.Errorf("execution block without max_runtime: rigMaxRuntime = %v, want 0 (no silent cap)", got)
+	}
+
+	// Execution block WITH explicit max_runtime → that value.
+	writeSettings(&agentconfig.RigSettings{
+		Type: "rig-settings", Version: agentconfig.CurrentRigSettingsVersion,
+		Execution: &agentconfig.ExecutionConfig{MaxRuntimeStr: "2h"},
+	})
+	if got := d.rigMaxRuntime(rigPath); got != 2*time.Hour {
+		t.Errorf("explicit: rigMaxRuntime = %v, want 2h", got)
 	}
 }

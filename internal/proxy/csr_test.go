@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -108,6 +109,64 @@ func TestSignPolecatCSR_MalformedPEM(t *testing.T) {
 		if _, err := ca.SignPolecatCSR(bad, "gt-gastown-furiosa", 0); err == nil {
 			t.Error("accepted malformed CSR input")
 		}
+	}
+}
+
+func TestSignPolecatCSR_RejectsWeakKeys(t *testing.T) {
+	ca, err := GenerateCA(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1024-bit RSA: proof-of-possession passes, strength floor (2048) must reject.
+	// (Go's rsa.GenerateKey refuses to emit 512-bit keys at all.)
+	weakRSA, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.CreateCertificateRequest(rand.Reader,
+		&x509.CertificateRequest{Subject: pkix.Name{CommonName: "gt-gastown-furiosa"}}, weakRSA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	weakPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
+	if _, err := ca.SignPolecatCSR(weakPEM, "gt-gastown-furiosa", 0); err == nil {
+		t.Error("signed a 512-bit RSA key")
+	}
+
+	// 2048-bit RSA is the floor and must pass.
+	okRSA, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err = x509.CreateCertificateRequest(rand.Reader,
+		&x509.CertificateRequest{Subject: pkix.Name{CommonName: "gt-gastown-furiosa"}}, okRSA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	okPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
+	if _, err := ca.SignPolecatCSR(okPEM, "gt-gastown-furiosa", 0); err != nil {
+		t.Errorf("rejected a 2048-bit RSA key: %v", err)
+	}
+}
+
+func TestSignPolecatCSR_ClampsTTLCeiling(t *testing.T) {
+	ca, err := GenerateCA(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrPEM := testCSR(t, "gt-gastown-furiosa", nil)
+	certPEM, err := ca.SignPolecatCSR(csrPEM, "gt-gastown-furiosa", 10*365*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(certPEM)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ttl := time.Until(cert.NotAfter); ttl > MaxRemoteCertTTL+time.Minute {
+		t.Errorf("TTL not clamped: %v > %v", ttl, MaxRemoteCertTTL)
 	}
 }
 
