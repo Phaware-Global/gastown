@@ -670,7 +670,11 @@ Two **orthogonal** network planes, governed separately:
    audit/DLP. The happy medium: a real security posture — exfiltration is
    policed and observable — without crippling the agent. Gateway product,
    credential handling, and bring-up are provider-defined; `gt-worker-agent`
-   brings the tunnel up before the work process starts.
+   brings the tunnel up before the work process starts. v1 ships a **single
+   gateway integration per provider** (no gateway-product interface — open
+   question 3 records the decision): the config carries a `provider`
+   discriminator so later products are additive, and gt does **not** manage
+   gateway policy — policy lives in the gateway product's own control plane.
 
 3. **`open`** — unrestricted egress (whatever the worker's network allows).
    Simplest, least safe; for fully trusted rigs where the gateway hop is
@@ -1010,10 +1014,19 @@ Provider-specific questions live in the provider specs. Universal:
    synchronously for v1; pre-warming (Tier 4) is the optimization.
 2. **Default dev image scope.** Which toolchains ship in the gastown default
    work image vs. left to custom images?
-3. **Egress gateway abstraction (§7.3).** Should the `gateway` mode's provider
-   integration be an interface (one Zero Trust product first, others later —
-   Tailscale, a squid/HTTP filtering proxy), and what is the default `gateway`
-   policy (a curated registry allowlist vs. allow-all-but-log)?
+3. **Egress gateway abstraction (§7.3).** **Resolved (2026-07-11): no
+   gateway-product interface in v1.** Each provider spec names a single
+   supported gateway product; preflight rejects any other
+   `gateway.provider` value. The config block keeps the `provider`
+   discriminator so later products (Tailscale, a squid/HTTP filtering
+   proxy) are an additive config value, not a schema break, and bring-up
+   is encapsulated behind a narrow internal seam in `gt-worker-agent`
+   (ensure-up / verify / teardown) that is promoted to an interface only
+   when a second product actually lands. gt stays **out of gateway policy
+   management**: policy (allowlists, DLP, logging rules) is administered
+   in the gateway product's own control plane, never through gt.
+   **Still open:** the recommended default `gateway` policy posture — a
+   curated registry allowlist vs. allow-all-but-log.
 4. **Sandboxed-mode dependency story.** For `sandboxed` rigs that still need
    packages, standardize on a pull-through cache/internal mirror vs. deps
    pre-baked in the image/worker base? (Mechanisms are provider-specific; the
