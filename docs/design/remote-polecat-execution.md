@@ -1,9 +1,23 @@
-# Remote Polecat Execution (AWS, EC2-first)
+# Remote Polecat Execution — Provider-Agnostic Core
 
-> **Date:** 2026-06-21
+> **Date:** 2026-06-21 (revised 2026-07-11: provider-agnostic refactor)
 > **Author:** crew
 > **Status:** Proposal
 > **Related:** sandboxed-polecat-execution.md, persistent-polecat-pool.md, proxy-server.md, federation.md
+> **Providers:** [AWS EC2](remote-polecat-execution-ec2.md) · [Local Network (Socket)](remote-polecat-execution-socket.md)
+
+This document specifies the **provider-agnostic core** of remote polecat
+execution: the architecture, configuration schema, `ExecutionBackend` interface,
+execution model, credential invariants, and lifecycle protocol that every
+execution provider implements. Provider-specific mechanics (provisioning APIs,
+credential delivery channels, interruption signals, network plumbing) live in
+the companion provider specifications:
+
+- **[Provider: AWS EC2](remote-polecat-execution-ec2.md)** — ephemeral cloud
+  instances (spot or on-demand) provisioned per task from a Packer-built image.
+- **[Provider: Local Network (Socket)](remote-polecat-execution-socket.md)** —
+  pre-provisioned machines on the local network (or any TCP-reachable host)
+  running a persistent `gt-worker-client` service.
 
 ---
 
@@ -14,39 +28,37 @@ execs the agent inside a tmux session under the user's UID, with direct loopback
 access to Dolt, `.runtime/`, and mail. A single developer machine cannot sustain
 10–20 simultaneous agent sessions without resource contention.
 
-We want to **offload polecat execution to remote cloud instances** to increase
-compute capacity, while keeping **certain rigs pinned to the orchestrator host**
-(e.g. iOS development, which needs local provisioning profiles and signing keys).
+We want to **offload polecat execution to remote workers** — cloud instances
+provisioned on demand, or existing machines elsewhere on the network — to
+increase compute capacity, while keeping **certain rigs pinned to the
+orchestrator host** (e.g. iOS development, which needs local provisioning
+profiles and signing keys).
 
-This document specifies a per-rig, pluggable **execution backend**. The primary
-target is **EC2** — it gives us full host control (most importantly a real Docker
-daemon, so agents can run `docker build` / `docker compose` / testcontainers; see
-§10), prebaked AMIs for fast warm starts, and arbitrary instance sizing. The
-backend provisions an ephemeral instance, launches a polecat inside it, routes all
-control-plane and git traffic back to the host over the existing mTLS proxy,
-preserves work across interruptions, and tears the instance down after a cooldown
-to conserve cost.
-
-**Spot is the desired default** (cost), but the backend **also supports on-demand**
-instances per rig (`instance_lifecycle`), for interruption-intolerant work or
-predictable capacity. Fargate is retained as a **later, secondary** backend for
-lightweight rigs that need neither Docker nor a custom host (§6.4).
+This document specifies a per-rig, pluggable **execution backend**. A backend
+acquires a worker (by provisioning one, or by attaching to one that already
+exists), launches a polecat on it, routes all control-plane and git traffic back
+to the orchestrator over the existing mTLS proxy, preserves work across
+interruptions, and releases the worker per a configured lifecycle.
 
 ### Goals
 
 1. **Per-rig execution host config** — each rig declares where its polecats run.
-2. **Provisioned ephemeral EC2 execution** — spot *or* on-demand, from a Packer
-   AMI, created on demand, auto-launching the polecat.
+2. **Pluggable execution providers** — ephemeral cloud sandboxes and
+   pre-provisioned machines behind one interface; adding a provider never
+   changes the core.
 3. **mTLS control plane** — the remote polecat reaches `gt`/`bd` and git only
-   through the host proxy; no direct Dolt auth, no GitHub access from the box.
-4. **Recovery + cleanup after cooldown** — work is recoverable if an instance
-   dies; instances are torn down after a cooldown to save money.
-5. **Configurable CPU/memory per rig** — beefier infra for projects that need it.
-6. **Spot interruption handling** — react to AWS reclamation signals from inside
-   the instance and flush work before shutdown (no-op for on-demand).
-7. **Zombie timeouts** — nuke instances that run too long.
+   through the host proxy; no direct Dolt auth, no GitHub access from the worker.
+4. **Secure identity delivery** — each polecat gets a short-lived client cert;
+   the private key is generated on the worker and never leaves it.
+5. **Checkpoint + recovery** — work is continuously checkpointed and recoverable
+   if a worker dies; a replacement resumes from the last checkpoint.
+6. **Lifecycle management** — teardown after a cooldown, an absolute zombie cap,
+   and a graceful flush on interruption or expiry.
+7. **Configurable execution environment** — per-rig `native` vs. `container`
+   execution and a per-rig work image; resource sizing where the provider
+   supports it.
 8. **Docker / nested-container support** — agents can use a real Docker daemon
-   (the main reason EC2 is the primary backend; §10).
+   on providers that offer one (§10).
 
 ### Non-goals
 
@@ -90,58 +102,87 @@ per-polecat certs or injects `GT_PROXY_*` env automatically today.
 address parser for `[machine:]rig[/polecat]`. The SSH implementation is a stub
 (`"ssh connections not yet implemented"`) and **nothing in dispatch reads it**.
 
-We do **not** build on Path B: it models *named long-lived hosts*, the wrong
-abstraction for per-task ephemeral instances that don't exist until provisioned,
-and it has no transport story for beads.
+We do **not** build on Path B. It models named long-lived hosts with raw SSH and
+has no transport story for beads. The *use case* it gestured at — a specific,
+pre-existing machine as an execution target — **is** in scope, but it is served
+by the [socket provider](remote-polecat-execution-socket.md), which pairs the
+named-host model with a worker-side daemon and the proxy control plane instead
+of raw shell access. Path B's scaffolding remains unused.
 
 ### 2.3 Persistent-pool tension
 
 `persistent-polecat-pool.md` deliberately *reuses* polecats (identity + worktree
-survive across assignments; "no nuke in the happy path"). The ephemeral-instance
+survive across assignments; "no nuke in the happy path"). The ephemeral-sandbox
 cost model wants the opposite: sandboxes torn down per task. We resolve this in
-§9: persistent **identity** (host-side), ephemeral **sandbox** (the instance),
-with the polecat branch in `.repo.git` as the durable artifact.
+§9: persistent **identity** (host-side), ephemeral **sandbox** (the worker
+environment), with the polecat branch in `.repo.git` as the durable artifact.
 
 ---
 
-## 3. Architecture (EC2)
+## 3. Architecture
+
+Four actors, in every deployment:
+
+- **Orchestrator** — the GasTown daemon on the host. Owns dispatch, identity,
+  beads, `.repo.git`, and the proxy server. Decides *when* a polecat runs and
+  *which* backend runs it.
+- **ExecutionBackend** — the provider driver inside the daemon (§5). Translates
+  the generic lifecycle (`Provision` / `WrapCommand` / `Teardown` / `Discover`)
+  into provider API calls.
+- **`gt-worker-agent`** — the worker-side daemon (generic name; a provider may
+  ship it under a provider-specific binary name). It runs on the worker machine
+  and is responsible for: acquiring the polecat's proxy cert via the provider's
+  delivery mechanism (§7.2), running the local mTLS relay, preparing and
+  supervising the work process (`docker run` / native), running the checkpoint
+  loop (§9.2), and handling interruption/shutdown signals and the local watchdog
+  (§9.3, §9.5). On ephemeral providers it is injected at provision time; on
+  pre-provisioned machines it runs as a persistent service.
+- **`gt-proxy-server`** — the existing mTLS relay on the orchestrator (§2.1).
+  Terminates all control-plane (`gt`/`bd`) and git traffic from workers.
 
 ```
-Orchestrator host                         AWS — EC2 instance (spot or on-demand)
-┌────────────────────────────┐            ┌───────────────────────────────────────┐
-│ GasTown daemon             │            │ EC2 instance (Packer AMI, gt-pinned)   │
-│  SpawnPolecatForSling      │            │  dockerd · amazon-ssm-agent            │
-│   └─ ExecutionBackend      │ RunInstances│                                       │
-│        .Provision() ───────┼──RunInst.──►│  gt-node-agent  (host systemd service) │
-│   └─ cert via SSM (CSR) ───┼────SSM─────►│   • keygen local; cert signed via SSM  │
-│   └─ argv from             │            │     (§7.2) → host tmpfs                 │
-│        .WrapCommand()       │            │   • LOCAL relay 127.0.0.1:9899         │
-│  gt-proxy-server ◄──mTLS──── relay ◄────┤   • checkpoint+push loop               │
-│   /v1/exec  (gt/bd)        │            │   • IMDS spot-interrupt poller (§9.3)  │
-│   /v1/git/<rig> (.repo.git)│            │                                        │
-│        │ async push        │            │  work (custom/default image) in Docker │
-│        ▼                   │            │   • gt/bd + /opt/gt bind-mounted in     │
-│  GitHub (host-only)        │            │   • worktree on EBS bind-mounted in     │
-│                            │            │   • /var/run/docker.sock bind-mounted   │
-└────────────────────────────┘            │     → agent can docker compose (§10)    │
-                                          │  origin/GT_PROXY_URL → relay (host-net: │
-                                          │  127.0.0.1:9899; bridge: host-gw, §6.1.1)│
-                                          │  no direct Dolt / GitHub / ctrl-plane   │
-                                          │  (work-egress per network.mode, §7.3)   │
-                                          └───────────────────────────────────────┘
+Orchestrator host                            Worker (provider-supplied machine)
+┌─────────────────────────────┐              ┌──────────────────────────────────────┐
+│ GasTown daemon              │              │ gt-worker-agent                       │
+│  SpawnPolecatForSling       │  Provision   │  • keygen local; CSR signed via the   │
+│   └─ ExecutionBackend ──────┼──(provider──►│    provider's delivery channel (§7.2) │
+│   └─ WrapCommand →          │    API)      │  • LOCAL plaintext relay :9899        │
+│       launcher argv ────────┼──(provider──►│  • checkpoint + push loop (§9.2)      │
+│                             │  exec chan.) │  • interruption handler + watchdog    │
+│  gt-proxy-server ◄──mTLS────┼──────────────│    (§9.3, §9.5)                       │
+│   /v1/exec  (gt/bd)         │              │                                       │
+│   /v1/git/<rig> (.repo.git) │              │  work process (container | native)    │
+│        │ async push         │              │   • gt/bd + /opt/gt injected          │
+│        ▼                    │              │   • worktree mounted in               │
+│  GitHub (host-only)         │              │   • GT_PROXY_URL + git origin →       │
+│                             │              │     the local relay (§6.1.1)          │
+└─────────────────────────────┘              │   • no direct Dolt / GitHub /         │
+                                             │     control plane (egress per §7.3)   │
+                                             └──────────────────────────────────────┘
 ```
 
 The remote polecat never contacts Dolt, GitHub, or the gastown control plane
-directly — all of that flows host ↔ proxy, and the host pushes to GitHub. Its
-*own* outbound internet (package installs, APIs) is governed by a per-rig egress
-posture (`sandboxed` / Zero Trust `gateway` / `open`); it also reaches a narrow
-allowlist of AWS managed-service endpoints via VPC endpoints. See §7.3.
+directly — all of that flows worker ↔ proxy, and the host pushes to GitHub. The
+polecat's *own* outbound internet (package installs, APIs) is governed by a
+per-rig egress posture (`sandboxed` / `gateway` / `open`, §7.3), implemented by
+each provider with its own network primitives.
 
-Because we own the EC2 host, the gastown binaries, relay, checkpointing, and
-interrupt handling all live in a single host service (`gt-node-agent`) — no
-sidecar container, no shared-volume copy, no cross-container signalling. The agent
-runs in a Docker container so per-rig custom images and Docker-in-workflow both
-work (§6.1, §10).
+Because gastown controls the worker host, the gastown binaries, relay,
+checkpointing, and interrupt handling all live in the single `gt-worker-agent`
+service — no sidecar container, no shared-volume copy, no cross-container
+signalling. The agent runs either natively or in a Docker container so per-rig
+custom images and Docker-in-workflow both work (§6, §10).
+
+Two channels connect orchestrator and worker, and they are deliberately
+distinct:
+
+1. **The provider channel** — how the backend provisions the worker, delivers
+   the cert-signing exchange, launches the agent process, and sends lifecycle
+   signals. This is provider-specific (a cloud command channel, a persistent
+   socket, …) and is authenticated by provider means, not by gastown certs.
+2. **The proxy channel** — the ongoing mTLS control plane (`gt`/`bd`, git,
+   heartbeats) from `gt-worker-agent`'s relay to `gt-proxy-server`. This is
+   identical across providers and authenticated by the per-polecat client cert.
 
 ---
 
@@ -160,89 +201,86 @@ notes here as documentation, not literal syntax.
 ```jsonc
 // settings/config.json  (illustrative — strip comments in the real file)
 "execution": {
-  "backend": "ec2",                    // "local" | "ec2" | "fargate" (later)
-  "region": "us-east-1",
+  // Which provider runs this rig's polecats. "local" is the default.
+  // Additional values are defined by provider specs (e.g. "ec2", "socket").
+  "backend": "local",
 
-  // Purchasing model. Spot is the cost-optimized default; on_demand for
-  // interruption-intolerant work or predictable capacity (req. — see §9.3).
-  "instance_lifecycle": "spot",        // "spot" | "on_demand"
-  "spot_max_price": null,              // optional cap; null = current on-demand price
+  // Execution environment (§6). Container mode (default for remote backends)
+  // runs the agent in a container from `image`; gastown injects gt/bd + the
+  // worktree. Native runs the agent directly on the worker.
+  "exec_mode": "container",            // "container" | "native"
+  "image": "registry.example.com/my-dev-env:latest",
 
-  // Resource sizing (req. #5). Either name an instance_type directly, or give
-  // cpu/memory and let the backend pick the cheapest matching type/class.
-  "instance_type": "c7i.2xlarge",      // optional explicit type
-  "cpu": "8",                          // else: vCPU…
-  "memory": "16Gi",                    // …and memory → instance-type selection
-  "ebs_gb": 80,                        // root/worktree EBS (gp3)
+  // Capability gate (§10): the rig's workflows need a real Docker daemon.
+  // Preflight rejects providers that cannot supply one. Optional.
+  "requires_docker": true,
 
-  // Execution environment (§6). Container mode (default) runs the agent in a
-  // Docker container from this image; gt injects gt/bd + worktree + docker.sock.
-  "exec_mode": "container",            // "container" (default) | "native"
-  "image": "123456789.dkr.ecr.us-east-1.amazonaws.com/my-dev-env:latest",
-  "image_auth": { "type": "ecr" },     // see §7
-  "requires_docker": true,             // gate: forces EC2; rejects Fargate (§10)
-
-  // agent (LLM) auth (see §7)
-  "agent_auth": { "mode": "bedrock_role" },
-
-  // network egress posture (see §7.3). "gateway" is the default for real dev
-  // work (package installs etc.) routed through a Zero Trust egress gateway.
+  // Work-egress posture (§7.3). How each mode is realized is provider-defined.
   "network": {
-    "mode": "gateway",                 // "sandboxed" | "gateway" | "open"
-    "gateway": {
-      "provider": "cloudflare_zero_trust",
-      "token_secret_arn": "arn:aws:secretsmanager:...:gt-cf-egress"
-    }
+    "mode": "gateway"                  // "sandboxed" | "gateway" | "open"
   },
 
-  // lifecycle (req. #4, #6, #7)
+  // Lifecycle (§9)
   "checkpoint_interval": "5m",         // continuous work checkpointing
   "cooldown": "10m",                   // delay before teardown after DONE
-  "max_runtime": "4h"                  // absolute zombie cap
+  "max_runtime": "4h",                 // absolute zombie cap
+
+  // Provider-specific extension: exactly one object keyed by the backend name,
+  // with keys defined by that provider's spec. Ignored by the core.
+  // "ec2":    { ... }   — see remote-polecat-execution-ec2.md §4
+  // "socket": { ... }   — see remote-polecat-execution-socket.md §8
 }
 ```
+
+**Core schema (shared fields only):** `backend`, `exec_mode`, `image`,
+`requires_docker`, `network.mode`, `checkpoint_interval`, `cooldown`,
+`max_runtime`. Everything else — regions, instance sizing, purchasing models,
+addresses, TLS material, auth modes, gateway credentials — is a
+**provider-specific extension**, namespaced under a key matching the `backend`
+value and documented in that provider's spec. The core loader validates the
+shared fields and hands the extension object to the backend opaquely.
 
 `RigSettings` is a versioned, pointer-block struct; adding `Execution
 *ExecutionConfig` follows the established pattern (`MergeQueue`, `Review`,
 `CodeGraph`, …) and bumps `CurrentRigSettingsVersion`.
-
-**Spot vs. on-demand.** `instance_lifecycle: "spot"` (default) launches via the
-EC2 spot market (`InstanceMarketOptions`), with the §9.3 interruption handling
-armed. `"on_demand"` launches a normal instance: no reclamation, so the spot
-poller is simply inert — but `cooldown`, `max_runtime`, and continuous
-checkpointing still apply (they also guard against host crashes). A rig can switch
-between the two with a one-line config change and no other behavioral difference.
 
 ---
 
 ## 5. The `ExecutionBackend` interface
 
 ```go
-// Resolved per rig. local = no-op; ec2/fargate provision real infra.
+// Resolved per rig. local = no-op; remote providers acquire real workers.
 type ExecutionBackend interface {
-    // Provision creates the execution environment and blocks until the agent
-    // can be launched into it. Idempotent for resume (see §9.4). Returns the
+    // Provision acquires the execution environment and blocks until the agent
+    // can be launched into it. "Acquire" is provider-defined: create an
+    // ephemeral sandbox, or open/verify a session on a pre-provisioned worker.
+    // Idempotent for resume (see §9.4): if a live worker already exists for
+    // this identity, reattach instead of acquiring a new one. Returns the
     // handle the daemon uses for WrapCommand/Teardown.
     Provision(ctx context.Context, spec PolecatSpec) (Endpoint, error)
 
     // WrapCommand takes the fully-resolved agent command (argv) and session env
     // and returns the complete argv the daemon should exec on the orchestrator
     // host to launch the agent remotely. The backend controls the ENTIRE
-    // structure — it does not merely prepend a prefix (see note below).
-    //   EC2:     aws ssm start-session … (a doc that runs `docker exec -e … <argv>`)
-    //   Fargate: aws ecs execute-command … --command "<argv>"
-    //   Local:   the argv unchanged (today's behavior).
+    // structure — it does not merely prepend a prefix (see note below). The
+    // returned argv is the blocking-pane process (the tmux pane runs it); the
+    // backend is responsible for landing argv and env in the remote process by
+    // whatever mechanism its launcher requires (§7.4).
+    //   Local:  the argv unchanged (today's behavior).
+    //   Remote: a launcher that drives the provider's exec channel.
     WrapCommand(ep Endpoint, agentArgv []string, env map[string]string) ([]string, error)
 
-    // Teardown destroys the environment. Called by the reaper after cooldown,
-    // on max_runtime expiry, or on explicit nuke.
+    // Teardown releases the environment. Called by the reaper after cooldown,
+    // on max_runtime expiry, or on explicit nuke. "Release" is provider-defined:
+    // destroy the sandbox, or end the session and clean up on a persistent
+    // worker — either way the polecat's remote footprint is gone afterward.
     Teardown(ctx context.Context, ep Endpoint) error
 
-    // Discover re-finds live endpoints from AWS by the gt:* identity tags, so the
-    // daemon can reattach after a restart and the reaper can sweep orphans
-    // (§"Endpoint discovery"). This is necessarily backend-specific — EC2
-    // DescribeInstances vs ECS ListTasks — which is why it lives on the interface
-    // rather than in generic daemon code.
+    // Discover re-finds live endpoints from PROVIDER-SIDE state by polecat
+    // identity, so the daemon can reattach after a restart and the reaper can
+    // sweep orphans (§"Endpoint discovery"). How identity is recorded and
+    // queried is necessarily provider-specific — which is why this lives on
+    // the interface rather than in generic daemon code.
     Discover(ctx context.Context, filter IdentityTags) ([]Endpoint, error)
 }
 ```
@@ -252,63 +290,65 @@ type ExecutionBackend interface {
 > string by appending the agent command as **trailing positional args** to the
 > `ExecWrapper` prefix (`exec env VAR=val … <prefix> <agent> <args>`). That works
 > for local wrappers (`exitbox`, `sudo`) that take a trailing command, but **breaks
-> for remote backends**: `aws ssm start-session` needs a document + parameters and
-> `aws ecs execute-command` needs the command in `--command "…"`, not as trailing
-> argv. So the existing static `ExecWrapper []string` (a pure prefix) is replaced,
-> for remote backends, by `ExecutionBackend.WrapCommand`, which receives the
-> resolved agent argv + env and returns the full argv — letting each backend place
-> the command (and env, §7.4) in the slot its launcher actually requires. Local
-> rigs keep the prefix path unchanged.
+> for remote backends**: remote launchers typically need the command embedded in
+> a launcher-specific slot (a session document, a `--command` flag, a protocol
+> message), not as trailing argv. So the existing static `ExecWrapper []string`
+> (a pure prefix) is replaced, for remote backends, by
+> `ExecutionBackend.WrapCommand`, which receives the resolved agent argv + env
+> and returns the full argv — letting each backend place the command (and env,
+> §7.4) in the slot its launcher actually requires. Local rigs keep the prefix
+> path unchanged.
 
-> **Exit codes don't propagate through `start-session`.** `aws ssm start-session`
-> returns `0` when the session closes regardless of the remote process's exit
-> status, so the launch command's exit code is **not** a reliable success signal.
-> This is fine because, as with the local tmux model, gastown does **not** derive
-> success from the launcher's exit code: completion is the agent calling `gt done`
-> (heartbeat → `exiting`), and crash/abnormal-exit is caught by stale-heartbeat +
-> liveness detection (§8.1, §9.3) — not the session's return value. If a backend
-> ever needs the true remote exit status (e.g. for diagnostics), it captures it
-> out-of-band — the remote wrapper writes `$?` to a file `gt-node-agent` reads, or
-> uses `ssm send-command` (whose invocation status *does* carry the exit code)
-> rather than `start-session`.
+> **Launcher exit codes are not a success signal.** Providers' exec channels are
+> not required to propagate the remote process's exit status to the launcher argv
+> (some cannot). This is fine because, as with the local tmux model, gastown does
+> **not** derive success from the launcher's exit code: completion is the agent
+> calling `gt done` (heartbeat → `exiting`), and crash/abnormal-exit is caught by
+> stale-heartbeat + liveness detection (§8.1, §9.3) — not the launch command's
+> return value. If a backend needs the true remote exit status (e.g. for
+> diagnostics), it captures it out-of-band via a provider-specific mechanism;
+> provider specs document whether and how their channel carries it.
 
 - `LocalBackend` — `Provision`/`Teardown` no-ops; `WrapCommand` returns the agent
-  argv unchanged (today's path, refactored behind the interface, no behavior change).
-- `EC2SpotBackend` — **the primary, first-to-ship cloud backend.** Provisions a
-  spot or on-demand instance from a Packer AMI. Despite the name it honors
-  `instance_lifecycle` for both purchasing models.
-- `FargateBackend` — **later, secondary** (§6.4). For lightweight rigs needing
-  neither Docker nor a custom host. Supports `FARGATE_SPOT` and `FARGATE`
-  (on-demand) capacity providers.
+  argv unchanged (today's path, refactored behind the interface, no behavior
+  change).
+- **[EC2 provider](remote-polecat-execution-ec2.md)** — ephemeral cloud
+  instances, spot or on-demand, provisioned per task. The first cloud provider.
+- **[Socket provider](remote-polecat-execution-socket.md)** — pre-provisioned
+  machines running a persistent `gt-worker-client`; `Provision` opens a session,
+  it does not create a machine.
 
-`PolecatSpec` carries the resolved per-rig config (lifecycle / sizing / image /
-auth / exec_mode) plus the polecat identity (`<rig>/<name>`), so backends are
-config-driven, not hard-coded.
+`PolecatSpec` carries the resolved per-rig config (the §4 shared fields plus the
+opaque provider extension) and the polecat identity (`<rig>/<name>`), so
+backends are config-driven, not hard-coded.
 
 ### Endpoint discovery — surviving a daemon restart
 
-`Endpoint` MUST be reconstructable from AWS, not just from daemon memory, because
-the daemon can crash or restart while remote instances are still running. Every
-backend therefore **tags its AWS resources** (EC2 instance / ECS task) with the
-polecat identity (`gt:rig`, `gt:polecat`, `gt:session`) at `Provision`. On startup
-the daemon (and `Teardown`) re-discovers live endpoints by listing resources
-filtered on those tags, rather than persisting endpoint handles locally. This is
-what makes `Provision` idempotent for resume (§9.4) and prevents orphaned, billable
-instances after a crash. The reaper additionally sweeps for tagged instances with
-no corresponding live agent bead and tears them down.
+`Endpoint` MUST be reconstructable from provider-side state, not just from
+daemon memory, because the daemon can crash or restart while remote workers are
+still running (and, for billed providers, still costing money). Every backend
+therefore **records the polecat identity on the provider side** (`gt:rig`,
+`gt:polecat`, `gt:session` — as resource tags, session metadata, or whatever the
+provider offers) at `Provision`. On startup the daemon (and `Teardown`)
+re-discovers live endpoints by querying that identity, rather than persisting
+endpoint handles locally. This is what makes `Provision` idempotent for resume
+(§9.4) and prevents orphaned workers after a crash. The reaper additionally
+sweeps for identity-labeled workers with no corresponding live agent bead and
+tears them down.
 
 ### Wiring points
 
 - **Provision hook:** inserted between `SpawnPolecatForSling` returning and the
   deferred `StartSession` call (`internal/cmd/polecat_spawn.go`) — a natural gap,
-  since session start is already deferred. This is also where the daemon mints the
-  per-polecat cert (CN `gt-<rig>-<name>`) and arranges its **secure delivery** to
-  the instance (§7.2 — never as plaintext that lingers in cleartext metadata).
+  since session start is already deferred. This is also where the daemon mints
+  the per-polecat cert (CN `gt-<rig>-<name>`) and arranges its **secure
+  delivery** to the worker via the provider's mechanism (§7.2 — never as
+  plaintext that lingers where it can be read back).
 - **WrapCommand:** replaces the static `ExecWrapper` prefix-append in
   `BuildStartupCommand` (`internal/config/loader.go`) for remote backends — the
   command builder is refactored to delegate final-argv construction (command +
-  env placement) to the backend (see the note in §5 and §7.4). Local rigs keep the
-  prefix path.
+  env placement) to the backend (see the note in §5 and §7.4). Local rigs keep
+  the prefix path.
 - **Teardown + cooldown:** `killIdlePolecat` (`internal/daemon/daemon.go`) gains a
   `backend.Teardown()` call; a cooldown timestamp in the heartbeat makes the
   reaper wait before tearing down.
@@ -318,152 +358,171 @@ no corresponding live agent bead and tears them down.
 
 ---
 
-## 6. EC2 execution model
+## 6. Execution model
 
-The EC2 backend runs the polecat in one of two modes:
+Every remote provider runs the polecat in one of two modes:
 
-- **`native` (simplest):** the agent runs directly on the instance; the AMI *is*
-  the dev environment. Lowest overhead, full Docker, but the toolchain is the AMI.
+- **`native` (simplest):** the agent runs directly on the worker; the worker's
+  base image / installed toolchain *is* the dev environment. Lowest overhead,
+  full Docker access where present, but the toolchain is fixed per worker.
 - **`container` (default; per-rig toolchains):** the agent runs in a Docker
-  container from the rig's `image`, with gastown bits and the worktree bind-mounted
-  in from the host. This preserves custom images per rig *and* gives Docker (§10).
+  container from the rig's `image`, with gastown bits and the worktree
+  bind-mounted in from the worker host. This preserves custom images per rig
+  *and* gives Docker (§10).
 
-Because we own the instance, gastown is delivered by **host bind-mounts**, not
-container gymnastics: a single host service (`gt-node-agent`) holds the cert, runs
-the relay, and owns checkpointing/interrupts. Nothing about the proxy, cert, or
-control plane depends on what the work image contains.
+Because gastown controls the worker host, gastown is delivered by **host
+bind-mounts**, not container gymnastics: the single `gt-worker-agent` service
+holds the cert, runs the relay, and owns checkpointing/interrupts. Nothing about
+the proxy, cert, or control plane depends on what the work image contains.
 
 ### 6.1 Host injection (the primary mechanism)
 
-**The AMI is a stable base, decoupled from the `gt` release cadence.** Baking a new
-AMI for every `gt` update would make active development painfully slow. Instead the
-Packer AMI carries only slow-moving infrastructure — `dockerd`, `amazon-ssm-agent`,
-`git`, a `gt-agent` system user, and a thin bootstrapper — and the **version-
-sensitive binaries** (`gt`/`bd`/proxy-client and the `gt-node-agent` program) are
-**injected at boot over SSM** from the orchestrator, which *is* the matching `gt`
-release. This guarantees the proxy client matches the server protocol without ever
-rebuilding the AMI on a `gt` bump; AMI rebuilds are reserved for base-OS/security
-updates. (Same SSM channel as the cert flow, §7.2.)
+**The worker's base image is a stable base, decoupled from the `gt` release
+cadence.** Rebuilding worker base images for every `gt` update would make active
+development painfully slow. Instead the base carries only slow-moving
+infrastructure — `dockerd`, `git`, a `gt-agent` system user, the provider's
+management agent, and a thin bootstrapper — and the **version-sensitive
+binaries** (`gt`/`bd`/proxy-client and the `gt-worker-agent` program) are
+**delivered from the orchestrator** — which *is* the matching `gt` release — via
+the provider channel: injected at boot on ephemeral providers, or updated over
+the session connection on persistent workers. This guarantees the proxy client
+matches the server protocol without rebuilding base images on a `gt` bump; base
+rebuilds are reserved for OS/security updates. Each provider spec defines its
+delivery mechanism.
 
-The AMI carries **`git`** as well — host-side checkpointing (§9.2) runs `git` in
-`gt-node-agent`, so it is an AMI requirement independent of whether the *work
-image* ships git (the Fargate sidecar likewise bundles git for the same reason).
+The worker base carries **`git`** as well — host-side checkpointing (§9.2) runs
+`git` in `gt-worker-agent`, so it is a worker requirement independent of whether
+the *work image* ships git.
 
 ```
-EC2 instance (AMI: dockerd · amazon-ssm-agent · gt-node-agent · gt/bd · git · idle bin)
+Worker host (base: dockerd · git · provider mgmt agent · gt-worker-agent · gt/bd · idle bin)
 │
-├── gt-node-agent.service   (systemd; the host-side gastown supervisor)
-│     • generates key locally; gets a CSR signed via SSM → cert in HOST tmpfs (§7.2)
+├── gt-worker-agent   (the worker-side gastown supervisor; service manager per provider)
+│     • generates key locally; gets a CSR signed via the provider channel (§7.2)
+│       → cert in worker tmpfs
 │     • runs the LOCAL relay; terminates mTLS to the host proxy (:9876) upstream
-│     • runs the checkpoint+push loop over the worktree on EBS
-│     • runs the IMDS spot-interrupt poller (§9.3)
+│     • runs the checkpoint+push loop over the worktree (§9.2)
+│     • runs the provider's interruption watcher + the local watchdog (§9.3, §9.5)
 │     • prepares the env once relay + cert are up — container mode: `docker run`
 │       the IDLE work container (idle entrypoint, no agent yet); native: nothing
 │
-└── agent PROCESS — launched on demand by the ORCHESTRATOR, not gt-node-agent:
-      WrapCommand → aws ssm start-session → (container: `docker exec`) -- <argv>
-      • bind mounts (container): /opt/gt (gt/bd + idle) · EBS worktree · docker.sock
-      • env: GT_PROXY_URL + git origin → the host relay (address per §6.1.1)
-      • holds NO cert/key — mTLS is gt-node-agent's job
+└── agent PROCESS — launched on demand by the ORCHESTRATOR, not gt-worker-agent:
+      WrapCommand → provider exec channel → (container: `docker exec`) -- <argv>
+      • injected mounts (container): /opt/gt (gt/bd + idle) · the worktree
+        · docker.sock where the rig uses Docker (§10)
+      • env: GT_PROXY_URL + git origin → the local relay (address per §6.1.1)
+      • holds NO cert/key — mTLS is gt-worker-agent's job
 ```
 
-**mTLS termination lives entirely in `gt-node-agent` on the host.** The agent's
-`gt`/`bd`/git talk to a plaintext local relay; the host service adds the client
-cert and forwards over mTLS to the host proxy. **The private key never enters the
-work container or its env.** The hop is instance-internal and never leaves the box.
-Two distinct ports avoid confusion: the local relay is `…:9899`; the host proxy
-(mTLS upstream) is `:9876`.
+**mTLS termination lives entirely in `gt-worker-agent` on the worker host.** The
+agent's `gt`/`bd`/git talk to a plaintext local relay; the worker service adds
+the client cert and forwards over mTLS to the host proxy. **The private key
+never enters the work container or its env.** The hop is worker-internal and
+never leaves the machine. Two distinct ports avoid confusion: the local relay is
+`…:9899`; the host proxy (mTLS upstream) is `:9876`.
 
-**Worktree ownership & agent UID.** `gt-node-agent` **runs as root** (it manages
-`dockerd` and must read/commit the worktree for host-side checkpointing). The
-agent's UID then depends on the mode:
+**Worktree ownership & agent UID.** `gt-worker-agent` runs with the privileges
+it needs to manage `dockerd` and read/commit the worktree for host-side
+checkpointing (root on providers where it also manages the host). The agent's
+UID then depends on the mode:
 
-- **Container mode + bridge networking:** the container may run as `root` — it is
-  namespaced and IMDS is blocked at the bridge (§10), so root inside the container
-  is contained **for the no-raw-docker-socket case**. (A container *with* the host
-  `docker.sock` is not contained by this — that escape is governed by §10's
-  rootless/userns requirement for untrusted rigs, not by namespacing.)
-- **`native` mode / host networking:** there is no namespace isolation and IMDS is
-  firewalled **by UID** (§10), so the agent **must run as a dedicated non-root
-  `gt-agent` UID** — distinct from `gt-node-agent`'s root — or the firewall can't
-  tell them apart.
+- **Container mode + bridge networking:** the container may run as `root` — it
+  is namespaced, and container-reachable worker credentials (where the provider
+  exposes any) are blocked at the bridge (§10; provider specs give the
+  mechanics). Root inside the container is contained **for the
+  no-raw-docker-socket case** only — a container *with* the host `docker.sock`
+  is not contained by namespacing (§10).
+- **`native` mode / host networking:** there is no namespace isolation, so
+  providers that expose ambient credentials on the worker require the agent to
+  run as a **dedicated non-root `gt-agent` UID** — distinct from
+  `gt-worker-agent`'s UID — so host-level controls can tell the two apart. See
+  the provider specs for the concrete requirement.
 
-In every case the worktree is created **group-owned by a shared `gt` group** (and
-group-writable), so `gt-node-agent` (root) and the agent (whatever UID) both
+In every case the worktree is created **group-owned by a shared `gt` group**
+(and group-writable), so `gt-worker-agent` and the agent (whatever UID) both
 retain access and checkpointing is never blocked by an ownership mismatch.
 
 #### 6.1.1 Container networking — how the agent reaches the relay
 
-`127.0.0.1` inside a bridge-network container is the *container's* loopback, **not**
-the host — so a relay bound to host `127.0.0.1:9899` is unreachable from a default
-bridge container. Two supported wirings (the backend picks one and sets
-`GT_PROXY_URL` / git `origin` to match):
+`127.0.0.1` inside a bridge-network container is the *container's* loopback,
+**not** the host — so a relay bound to worker-host `127.0.0.1:9899` is
+unreachable from a default bridge container. Two supported wirings (the backend
+picks one and sets `GT_PROXY_URL` / git `origin` to match):
 
 1. **Host networking** (`--network host`, default **for trusted rigs only**). The
-   container shares the host network namespace, so `127.0.0.1:9899` *is* the relay.
-   Simplest, but it **defeats the IMDS isolation mitigations** (§10): with no bridge
-   and no routing hop, the container's traffic is indistinguishable from the host's,
-   so neither the bridge `iptables` drop nor the IMDSv2 hop-limit can keep it away
-   from `169.254.169.254`. **Acceptable only for trusted rigs.**
-2. **Bridge + host-gateway** (**required for `sandboxed` / untrusted-code rigs**).
-   Keep bridge isolation: bind the relay to the docker bridge gateway (or
-   `0.0.0.0:9899`, firewalled to the bridge subnet) and start the container with
-   `--add-host=host.docker.internal:host-gateway`; the agent reaches the relay at
-   `http://host.docker.internal:9899`. This is the mode in which the §10 IMDS
-   defenses actually work, so untrusted rigs **must** use it (preflight enforces
-   this pairing).
+   container shares the host network namespace, so `127.0.0.1:9899` *is* the
+   relay. Simplest, but it **defeats network-level isolation of the container**:
+   with no bridge and no routing hop, the container's traffic is
+   indistinguishable from the host's, so bridge-level controls (including any
+   provider credential-endpoint blocking, §10) cannot apply. **Acceptable only
+   for trusted rigs.**
+2. **Bridge + host-gateway** (**required for `sandboxed` / untrusted-code
+   rigs**). Keep bridge isolation: bind the relay to the docker bridge gateway
+   (or `0.0.0.0:9899`, firewalled to the bridge subnet) and start the container
+   with `--add-host=host.docker.internal:host-gateway`; the agent reaches the
+   relay at `http://host.docker.internal:9899`. This is the mode in which
+   network-level hardening actually works, so untrusted rigs **must** use it
+   (preflight enforces this pairing).
 
 So the networking default is **trust-dependent**, not unconditional: host
-networking for trusted rigs (simplicity), bridge for untrusted ones (so IMDS
-hardening is effective). `native` mode has no container; the agent uses
-`127.0.0.1:9899`, and IMDS must be locked down at the instance level instead (§10).
+networking for trusted rigs (simplicity), bridge for untrusted ones (so
+network hardening is effective). `native` mode has no container; the agent uses
+`127.0.0.1:9899`, and any credential-endpoint lockdown happens at the worker
+level instead (§10, provider specs).
 
 #### 6.1.2 Startup ordering & command construction
 
 Two distinct lifecycle steps, by two different actors:
-1. **`gt-node-agent` prepares the environment** (systemd/Docker ordering, no
-   health-check gymnastics): obtain its cert (CSR over SSM, §7.2), confirm the relay
-   is listening (it probes the relay itself), and — in container mode — `docker run`
-   the **idle**
-   work container (running only the injected idle entrypoint; no agent yet).
+
+1. **`gt-worker-agent` prepares the environment** (service/Docker ordering, no
+   health-check gymnastics): obtain its cert (CSR over the provider channel,
+   §7.2), confirm the relay is listening (it probes the relay itself), and — in
+   container mode — `docker run` the **idle** work container (running only the
+   injected idle entrypoint; no agent yet).
 2. **The orchestrator launches the agent process** on demand via `WrapCommand` →
-   `aws ssm start-session` → (container) `docker exec` into the prepared container.
-   This is the same blocking-pane model as local; `gt-node-agent` never starts the
-   agent itself — it only readies the box and supervises checkpoint/interrupt.
+   the provider exec channel → (container) `docker exec` into the prepared
+   container. This is the same blocking-pane model as local; `gt-worker-agent`
+   never starts the agent itself — it only readies the worker and supervises
+   checkpoint/interrupt.
 
 > **Command construction (avoid an injection footgun).** The remote command
-> (`WrapCommand` → SSM → `docker exec -- …`) is built from the tokenized agent argv
-> (§5, §8) with the same `ShellQuote` discipline `BuildStartupCommand` already
-> applies (`internal/config/loader.go`): every token individually shell-quoted,
-> config-derived parts (model flags, custom-agent args, the free-form
-> `InitialPrompt`) treated as **untrusted data to be quoted, never interpolated
-> raw** (pass the prompt as a single quoted arg or via stdin/file). Session env is
-> injected per §7.4, not via the orchestrator's local `exec env`.
+> (`WrapCommand` → provider exec channel → `docker exec -- …`) is built from the
+> tokenized agent argv (§5, §8) with the same `ShellQuote` discipline
+> `BuildStartupCommand` already applies (`internal/config/loader.go`): every
+> token individually shell-quoted, config-derived parts (model flags,
+> custom-agent args, the free-form `InitialPrompt`) treated as **untrusted data
+> to be quoted, never interpolated raw** (pass the prompt as a single quoted arg
+> or via stdin/file). Session env is injected per §7.4, not via the
+> orchestrator's local `exec env`.
 
 ### 6.2 Image contract (container mode only)
 
 In `container` mode the image is the dev environment and **carries only the
-toolchain and agent runtime; gastown injects the rest from the host.** Concisely:
+toolchain and agent runtime; gastown injects the rest from the worker host.**
+Concisely:
 
 **MUST provide:** (1) the **agent runtime binary** the rig resolves to (`claude`,
-`codex`, …) on `PATH`; (2) the **project toolchain** (language runtimes, build/test
-tools — the reason for a custom image); (3) a **POSIX shell (`/bin/sh`)** — not
-because `docker exec` itself uses one (it `execve`s the binary directly), but
-because the SSM/exec **string** interface means `WrapCommand` delivers the agent
-as a single shell-quoted command line that we run as `sh -c "<argv>"`; that, plus
-interactive sessions, needs `/bin/sh` (v1 requires it; distroless is a known
-limitation — open question 8); (4) a **Docker client** *only if* the rig's
-workflows call `docker`/`docker compose` (§10).
+`codex`, …) on `PATH`; (2) the **project toolchain** (language runtimes,
+build/test tools — the reason for a custom image); (3) a **POSIX shell
+(`/bin/sh`)** — not because `docker exec` itself uses one (it `execve`s the
+binary directly), but because most providers' exec channels are **string**
+interfaces: `WrapCommand` delivers the agent as a single shell-quoted command
+line that we run as `sh -c "<argv>"`; that, plus interactive sessions, needs
+`/bin/sh` (v1 requires it; distroless is a known limitation — open question 6);
+(4) a **Docker client** *only if* the rig's workflows call `docker`/`docker
+compose` (§10).
 
 **MUST NOT be expected to carry:** gastown binaries (`gt`/`bd`/proxy client —
 bind-mounted at `/opt/gt`); a specific entrypoint/`CMD`/init (gastown supplies an
-injected idle entrypoint); an SSM agent (SSM terminates on the host); any
-credentials/certs/Dolt config (injected per §7; the proxy key never enters the
-container); or any assumption about direct egress (control plane is proxied; the
-agent's own internet is governed by `network.mode`, §7.3).
+injected idle entrypoint); any provider management agent (the provider channel
+terminates on the worker host); any credentials/certs/Dolt config (injected per
+§7; the proxy key never enters the container); or any assumption about direct
+egress (control plane is proxied; the agent's own internet is governed by
+`network.mode`, §7.3).
 
-`git` is needed in the image only if the agent's *own* workflows call it; gastown's
-checkpoint/push runs host-side in `gt-node-agent`, independent of the image.
+`git` is needed in the image only if the agent's *own* workflows call it;
+gastown's checkpoint/push runs host-side in `gt-worker-agent`, independent of
+the image.
 
 **Default image:** when `image` is empty, the backend uses a gastown-published
 default dev image satisfying the above for the `claude` agent plus a common
@@ -472,209 +531,158 @@ toolchain — same injection path, no special case.
 ### 6.3 Preflight
 
 Preflight splits by *where it can run cheaply* — the orchestrator is often a
-laptop, so it must **not** pull the (potentially large) work image just to inspect
-it:
+laptop, so it must **not** pull the (potentially large) work image just to
+inspect it:
 
-- **Orchestrator-side (config only, no image pull):** reject `requires_docker` on
-  a Fargate rig (§10); sanity-check the resolved agent config, sizing, and auth
-  references. These need no image and fail instantly.
-- **Instance-side (image-content checks), in `gt-node-agent` after the instance
-  pulls the image:** verify the resolved agent runtime resolves on `PATH` and that
-  `/bin/sh` exists. The instance has already pulled the image to run it, so this is
-  free there and ruinous on the laptop. A failure is reported back over the control
-  plane (and surfaced on the bead) **before** the agent is launched, so a bad image
-  still fails fast with a clear error — just without dragging the image across the
-  developer's link.
-
-### 6.4 Fargate backend (later, secondary)
-
-> Deferred — for lightweight rigs that need **neither Docker (§10) nor a custom
-> host** (e.g. pure code-edit/review polecats). Ships after EC2 (Tier 4). Captured
-> here only so the interface stays backend-agnostic; skip on a first read.
-
-Fargate gives no host and no shared host filesystem, so the host-bind-mount model
-above does not apply. Injection instead uses a **version-pinned `gt-sidecar`
-container + a shared task volume**: the sidecar copies `gt`/`bd` + the idle
-entrypoint (+ static `busybox sh` for distroless) onto the volume, obtains a signed
-cert via the same key-local/CSR flow (§7.2, over ECS Exec instead of SSM), and runs
-the relay + checkpoint/interrupt logic — the in-task analogue of `gt-node-agent`. The work container `dependsOn` the
-sidecar's **container health check** (binaries copied + relay listening; ECS only
-honors `HEALTHY` when a health check is defined), shares the task network namespace
-(so the relay is reachable without the §6.1.1 host-gateway dance), and is driven by
-`aws ecs execute-command --command "<argv>"`. Interruption needs
-`initProcessEnabled: true` (so `tini` is PID 1 and forwards SIGTERM). Note
-**`pidMode: task` is *not* supported on Fargate** (EC2 launch type only), so the
-sidecar **cannot** signal the agent across the PID namespace there — Fargate must
-rely entirely on the **shared-volume STOP-marker** coordination (the work
-container's idle entrypoint watches for `/opt/gt/STOP` and stops its own agent
-child; §9.3). The extra moving parts — and the lack of Docker — are exactly why
-Fargate is secondary.
+- **Orchestrator-side (config only, no image pull):** reject `requires_docker`
+  on a provider that cannot supply a Docker daemon (§10); reject an
+  untrusted/`sandboxed` rig configured for host networking (§6.1.1);
+  sanity-check the resolved agent config and the provider extension block
+  (sizing, addresses, auth references — per provider spec). These need no image
+  and fail instantly.
+- **Worker-side (image-content checks), in `gt-worker-agent` after the worker
+  pulls the image:** verify the resolved agent runtime resolves on `PATH` and
+  that `/bin/sh` exists. The worker has already pulled the image to run it, so
+  this is free there and ruinous on the laptop. A failure is reported back over
+  the control plane (and surfaced on the bead) **before** the agent is launched,
+  so a bad image still fails fast with a clear error — just without dragging the
+  image across the developer's link.
 
 ---
 
 ## 7. Credentials & identity
 
-A single per-instance IAM-role + secret-store layer covers **four** distinct
-credential concerns. The invariant is that **no secret material — a private key,
-an API key, a password, the proxy client **private key** (the signed cert is
-public, not secret) — ever appears in the image, in
-launch metadata, in the remote command string, in process args, or in CloudTrail/
-SSM logs.** The SSM-driven cert flow (§7.2) honors this with no exception: the
-private key is generated on the instance and never transmitted, and no bootstrap
-secret rides launch metadata or `ssm send-command` parameters. Secret
-**references** — Secrets Manager / SSM ARNs — are expected and not sensitive; AWS
-resolves them at launch without exposing the value.
+Four distinct credential concerns cross the orchestrator↔worker boundary. The
+invariant is that **no secret material — a private key, an API key, a password,
+the proxy client **private key** (the signed cert is public, not secret) — ever
+appears in the work image, in provisioning metadata, in the remote command
+string, in process args, or in any provider-side log of the exec channel.**
+Secret **references** (identifiers naming a secret in a provider's secret store)
+are expected and not sensitive; the provider resolves them worker-side without
+exposing the value.
 
-| Concern | Mechanism |
-|---|---|
-| **Control-plane identity** (proxy cert) | Daemon mints a short-lived leaf cert (CN `gt-<rig>-<name>`) at provision and delivers it **securely** per §7.2 — never as lingering plaintext. Identity is the cert, enforced by `gt-proxy-server`. |
-| **Image pull auth** | ECR (same/cross-account): the **instance profile** IAM role (`ecr:*`) + repo policy for cross-account. Other registries: `docker login` from a Secrets Manager secret the instance role can read. |
-| **LLM auth** | Default `bedrock_role`: set `CLAUDE_CODE_USE_BEDROCK=1`, grant the instance role `bedrock:InvokeModel` — **no key to inject**. Alternative `secret`: source `ANTHROPIC_API_KEY` (or provider var) from Secrets Manager into the container env. |
-| **Agent AWS identity** | The instance IAM role (for any AWS work the agent itself does). |
+| Concern | Core invariant | Delivery |
+|---|---|---|
+| **Control-plane identity** (proxy cert) | Daemon mints a short-lived leaf cert (CN `gt-<rig>-<name>`) at provision; **the private key is generated on the worker and never transmitted** (§7.2). Identity is the cert, enforced by `gt-proxy-server`. | Provider-defined signing channel (§7.2). |
+| **Image pull auth** | Never in the command string or image. | Provider-defined: ambient worker credentials or a worker-side secret store / operator-installed login. |
+| **LLM auth** | Never in the command string, image, or provisioning metadata (§7.1). | Provider-defined worker-side injection; ambient cloud identity where available. |
+| **Worker's own platform identity** | Whatever identity the worker holds (cloud role, machine cert) is scoped to that worker's needs, least-privilege. | Provider-defined. |
 
 ### 7.1 LLM auth detail
 
 `internal/config/env.go` already defines the per-provider auth allowlist
-(`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, Bedrock AWS vars, Foundry, Vertex,
+(`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, the cloud-LLM platform var groups,
 …) and emits them into the agent env. **But** it delivers them by reading the
 orchestrator's shell env and baking them into the host `exec env` prefix — which
-(a) does not propagate through SSM / `docker exec` into the container, and (b)
-would leak the secret via CloudTrail / SSM session logs / process args if inlined
-into the remote command. So for remote backends, the **names** are accounted for
-but the **delivery** must change:
+(a) does not propagate through a remote exec channel into the worker process,
+and (b) would leak the secret via provider-side channel/session logs and process
+args if inlined into the remote command. So for remote backends, the **names**
+are accounted for but the **delivery** must change:
 
-- Route auth vars through **instance/container-env injection** (instance profile,
-  Secrets Manager → container env), never the command line.
-- Default remote rigs to **Bedrock-via-role** to sidestep secrets entirely; the
-  instance role then does triple duty (ECR pull + Secrets Manager + Bedrock invoke).
+- Route auth vars through **worker-side env injection** (a secret store the
+  worker can read, ambient cloud identity, or operator-provisioned worker
+  config), never the command line.
+- Prefer mechanisms with **no transmitted secret at all** (e.g. an ambient cloud
+  identity that grants model access) where the provider offers one.
 
-A useful security property falls out: the key lives in the secret store, not the
-orchestrator's shell — the remote path is *more* isolated than local.
-
-`agent_auth`:
-
-```jsonc
-"agent_auth": { "mode": "bedrock_role" }                 // default; no secret
-// or
-"agent_auth": {
-  "mode": "secret",
-  "env_var": "ANTHROPIC_API_KEY",
-  "secret_arn": "arn:aws:secretsmanager:...:gt-anthropic-key"
-}
-```
+A useful security property falls out: the key lives worker-side (secret store or
+machine config), not the orchestrator's shell — the remote path is *more*
+isolated than local. Each provider spec defines its `agent_auth` mechanism.
 
 ### 7.2 Secure proxy-cert delivery
 
 The per-polecat client cert and its **private key** are the most sensitive
-material in the system: they grant `gt`/`bd` and git access as that identity. The
-key MUST NOT be injected as lingering plaintext (EC2 userdata and ECS task env are
-both readable via the AWS API) **and should never travel over the network at all.**
+material in the system: they grant `gt`/`bd` and git access as that identity.
+The key MUST NOT be injected as lingering plaintext readable through provider
+APIs **and should never travel over the network at all.** The core protocol,
+which every provider implements over its own channel:
 
-**The orchestrator drives delivery over SSM — no inbound port on the laptop.**
-Rather than expose a bootstrap listener on the orchestrator (problematic behind
-NAT / on a dynamic laptop IP — and `:9876` rejects certless connections via
-`ClientAuth: tls.RequireAndVerifyClientCert`, while `:9877` is the admin port,
-`internal/proxy/server.go`), delivery is **orchestrator-initiated via SSM**, which
-the daemon already has credentials for:
+1. **Key generation is worker-local.** `gt-worker-agent` generates the private
+   key in worker tmpfs. It never leaves the machine — not to the orchestrator,
+   not to a secret store.
+2. **CSR-signing exchange.** The worker emits a CSR (CN `gt-<rig>-<name>`) over
+   the provider channel; the daemon validates the CSR's CN against the expected
+   identity for the worker it is talking to, signs it with the CA, and returns
+   the **cert** over the same channel. A signed certificate is public material,
+   not a secret — it may transit channels that are logged.
+3. **Channel binding replaces bootstrap tokens.** The provider channel is
+   already mutually authenticated (by the provider's platform identity, mTLS,
+   or equivalent) and
+   addressed to the exact worker the daemon acquired — so no separate bootstrap
+   secret is needed to bind the CSR to the worker. Providers whose channels lack
+   this property must add an explicit binding step (see the socket spec's
+   enrollment flow).
 
-1. **CSR over SSM (preferred).** Concretely, the daemon issues a single SSM
-   `SendCommand` (`AWS-RunShellScript`) that, on the instance, **generates the
-   private key in host tmpfs and emits the CSR (CN `gt-<rig>-<name>`) on stdout**;
-   the daemon **captures the CSR directly from the command output** (no
-   poll-a-file dance), signs it with the CA, and returns the **cert** via a second
-   `SendCommand` (or a known path `gt-node-agent` reads). Returning the cert this
-   way is safe even though `send-command` output lands in CloudTrail/SSM logs: **a
-   signed certificate is public material, not a secret** — only the private key is
-   sensitive, and it never leaves the instance. **No bootstrap token is needed:** the
-   SSM channel is IAM-authenticated and the daemon targets the exact instance ID it
-   launched and tagged, so the binding the old token provided is inherent — and the
-   daemon validates the CSR's CN against the expected `gt-<rig>-<name>` before
-   signing.
-   **New CA primitive required:** the proxy CA today (`/v1/admin/issue-cert`)
-   *generates a keypair and returns the key* — which would defeat the no-key-
-   transport goal. This design needs a **CSR-signing path** (`sign(csr) → cert`,
-   key never seen by the CA) added to the CA/proxy; do not reuse the keypair-issuing
-   endpoint for the remote flow.
-2. **Per-instance Secrets Manager secret (fallback).** The daemon writes the cert
-   **+ key** to a short-TTL Secrets Manager secret scoped to the instance role;
-   `gt-node-agent` fetches it at boot. This *does* transmit the key (and leaves it
-   at rest in Secrets Manager for the instance lifetime), so it is strictly weaker
-   than the CSR flow — prefer (1).
+**New CA primitive required:** the proxy CA today (`/v1/admin/issue-cert`)
+*generates a keypair and returns the key* — which would defeat the
+no-key-transport goal. This design needs a **CSR-signing path** (`sign(csr) →
+cert`, key never seen by the CA) added to the CA/proxy; do not reuse the
+keypair-issuing endpoint for the remote flow.
 
-> **Ongoing relay traffic** (the `:9876` mTLS control plane) likewise avoids an
-> inbound laptop port. The primary mechanism is a **stable host name** (Tailscale /
-> VPN, §9.6): the instance dials the laptop's stable name, which is what the
-> persistent instance→host relay needs. Note SSM Session Manager port-forwarding is
-> **client→instance** (the orchestrator forwarding to a port *on* the instance), so
-> it is **not** a clean reverse tunnel for the instance→host relay — it fits the
-> orchestrator-initiated CSR exchange and commands, but the ongoing relay relies on
-> the stable-hostname path, not SSM forwarding. The `:9876`/`RequireAndVerifyClientCert`
-> config is unchanged either way.
-
-The private key lives only in host tmpfs (never in the work container, and under
-the CSR flow never on the wire), and the cert is short-lived so exposure is bounded
-even if an instance is compromised. Note this design wants a **shorter
-`proxy_cert_ttl` (≈24h)** for ephemeral instances than the proxy's current
+The private key lives only in worker tmpfs (never in the work container, and
+under the CSR flow never on the wire), and the cert is short-lived so exposure
+is bounded even if a worker is compromised. This design wants a **shorter
+`proxy_cert_ttl` (≈24h)** for remote workers than the proxy's current
 keypair-issuance default (720h / 30d) — an intentional change; the authoritative
-default should be set on the new CSR-signing path, not inherited. The CA can revoke
-a leaked serial via the proxy denylist.
+default should be set on the new CSR-signing path, not inherited. The CA can
+revoke a leaked serial via the proxy denylist.
+
+> **Ongoing relay traffic** (the `:9876` mTLS control plane) must not require an
+> inbound port on the orchestrator opened per-worker, and must not pin a raw
+> orchestrator IP (the orchestrator is often a laptop, §9.6). The worker dials a
+> **stable host name** (Tailscale / VPN / dynamic DNS) for the proxy; the
+> `:9876`/`RequireAndVerifyClientCert` config is unchanged. Cert delivery and
+> lifecycle signalling ride the provider channel, not a listener on the laptop.
 
 ### 7.3 Network model & egress posture
 
 Two **orthogonal** network planes, governed separately:
 
-- **Control plane** (`gt`/`bd`, git, beads) → **always** the host proxy, in every
-  mode. This is about identity, not isolation: it is how the polecat reaches Dolt
-  without DB auth. It never changes with the egress posture.
-- **AWS control-plane allowlist** — the instance always needs scoped access to the
-  managed services this design uses, ideally via **VPC endpoints / PrivateLink**
-  (NAT fallback), with the security group denying everything else *not* otherwise
-  permitted by the egress mode:
-
-  | Destination | Why | Path |
-  |---|---|---|
-  | ECR (api + dkr) + S3 gateway | image pull | VPC endpoints |
-  | SSM / SSMMessages / EC2Messages | SSM session/exec | VPC endpoints |
-  | Secrets Manager | `secret`-mode auth, registry creds | VPC endpoint |
-  | Bedrock runtime | `agent_auth.mode = bedrock_role` | VPC endpoint |
-  | Host proxy (`:9876`) | all control-plane + git | direct (VPC / VPN / Tailscale) |
-
+- **Control plane** (`gt`/`bd`, git, beads) → **always** the host proxy, in
+  every mode. This is about identity, not isolation: it is how the polecat
+  reaches Dolt without DB auth. It never changes with the egress posture.
+  (Providers may additionally need a narrow allowlist of their own platform
+  endpoints for the provider channel to function — see each provider spec.)
 - **Work-egress plane** — the agent's *own* outbound internet (npm, PyPI,
-  crates.io, the Go module proxy, apt mirrors, GitHub for dependencies, arbitrary
-  HTTP APIs the task legitimately calls). This is what `network.mode` controls.
+  crates.io, the Go module proxy, apt mirrors, GitHub for dependencies,
+  arbitrary HTTP APIs the task legitimately calls). This is what `network.mode`
+  controls.
 
-> **Why this matters:** a fully locked-down box would break `npm install`,
+> **Why this matters:** a fully locked-down worker would break `npm install`,
 > `pip install`, `go mod download`, `apt-get`, and most real build steps. Total
-> isolation is correct for *untrusted* work but is the wrong default for ordinary
-> development. So egress is a **per-rig spectrum**, not a binary.
+> isolation is correct for *untrusted* work but is the wrong default for
+> ordinary development. So egress is a **per-rig spectrum**, not a binary.
 
 #### `network.mode`
 
-1. **`sandboxed`** — no general egress; only the proxy + AWS allowlist above.
-   Maximum isolation — the original goal of `sandboxed-polecat-execution.md`
-   (prevent credential exfiltration / malicious-MCP reach-out). Dependencies must
-   be **pre-baked into the image/AMI** or served from an **internal mirror /
-   pull-through cache** reachable via a VPC endpoint (e.g. CodeArtifact, an
-   S3-backed registry proxy). Use for high-sensitivity rigs or untrusted code.
+1. **`sandboxed`** — no general egress; only the proxy (plus any provider
+   platform allowlist). Maximum isolation — the original goal of
+   `sandboxed-polecat-execution.md` (prevent credential exfiltration /
+   malicious-MCP reach-out). Dependencies must be **pre-baked into the
+   image/worker base** or served from an **internal mirror / pull-through
+   cache** the provider can reach without general egress. Use for
+   high-sensitivity rigs or untrusted code.
 
 2. **`gateway`** *(recommended default for dev work)* — full outbound internet,
-   but **mediated by a Zero Trust egress gateway** rather than raw NAT. A
-   Cloudflare Zero Trust setup (WARP / `cloudflared` running as a host service on
-   the instance, with Gateway DNS/network/HTTP policies) lets legitimate package
-   and API traffic through while it **enforces destination policy, blocks known-bad
-   endpoints, and logs every flow** for audit/DLP. The happy medium: a real
-   security posture — exfiltration is policed and observable — without crippling
-   the agent. The gateway token is injected as a secret reference (§7), and
-   `gt-node-agent` brings the tunnel up before the work container starts.
+   but **mediated by a policy-enforcing egress gateway** rather than raw NAT:
+   legitimate package and API traffic gets through while the gateway **enforces
+   destination policy, blocks known-bad endpoints, and logs every flow** for
+   audit/DLP. The happy medium: a real security posture — exfiltration is
+   policed and observable — without crippling the agent. Gateway product,
+   credential handling, and bring-up are provider-defined; `gt-worker-agent`
+   brings the tunnel up before the work process starts.
 
-3. **`open`** — unrestricted NAT egress. Simplest, least safe; for fully trusted
-   rigs where the gateway hop is unwanted. Allowed but never the default.
+3. **`open`** — unrestricted egress (whatever the worker's network allows).
+   Simplest, least safe; for fully trusted rigs where the gateway hop is
+   unwanted. Allowed but never the default.
 
-In **all** modes the control plane and git still flow through the gastown proxy —
-only the *work-egress* plane differs. The shift from `sandboxed` to `gateway` is a
-shift from **isolation-by-prevention** to **mediation-by-policy + observability**:
-appropriate when the agent must reach real registries, but you still want every
-byte of egress attributable and governed.
+In **all** modes the control plane and git still flow through the gastown proxy
+— only the *work-egress* plane differs. The shift from `sandboxed` to `gateway`
+is a shift from **isolation-by-prevention** to **mediation-by-policy +
+observability**: appropriate when the agent must reach real registries, but you
+still want every byte of egress attributable and governed. A provider that
+cannot implement a mode rejects it at preflight rather than silently degrading
+(see the socket spec, where egress is largely operator-owned).
 
 ### 7.4 Session-env propagation
 
@@ -686,33 +694,34 @@ The agent needs gastown's session env to function. These fall into two groups:
   `BuildStartupCommand`.
 - **New relay vars this design adds** — `GT_PROXY_URL` and the `GIT_SSL_*` group
   (and friends) that point gt/bd/git at the local relay (§6.1). These are **not**
-  emitted by `AgentEnv` today; they are introduced by this work (set per the chosen
-  container-networking mode, §6.1.1) and injected alongside the existing vars.
+  emitted by `AgentEnv` today; they are introduced by this work (set per the
+  chosen container-networking mode, §6.1.1) and injected alongside the existing
+  vars.
 
-The problem is the same for both groups: the local `exec env` prefix **runs on the
-orchestrator host and does not cross the boundary** — neither SSM nor `docker exec`
-forwards the client's environment to the remote process. So a naive remote launch
-would start the agent with **none** of these set, and `gt`/`bd` would fail to
-resolve their role, rig, or workspace.
+The problem is the same for both groups: the local `exec env` prefix **runs on
+the orchestrator host and does not cross the boundary** — neither remote exec
+channels nor `docker exec` forward the client's environment to the remote
+process. So a naive remote launch would start the agent with **none** of these
+set, and `gt`/`bd` would fail to resolve their role, rig, or workspace.
 
 The backend therefore injects session env **remotely**, as part of `WrapCommand`
 (§5) — never via the orchestrator's local `exec env`:
 
 - **Container mode:** pass each var through `docker exec -e VAR=val …` (or an
-  `--env-file` that `gt-node-agent` writes to the bind-mounted `/opt/gt` and
-  references), so they are set in the agent's process, not the host's.
-- **Native mode:** `gt-node-agent` writes them to an env file it `source`s (or
-  prepends `env VAR=val …` to the launched argv) on the instance.
+  `--env-file` that `gt-worker-agent` writes to the bind-mounted `/opt/gt` and
+  references), so they are set in the agent's process, not the worker host's.
+- **Native mode:** `gt-worker-agent` writes them to an env file it `source`s (or
+  prepends `env VAR=val …` to the launched argv) on the worker.
 
 Split by sensitivity, consistent with §7.1:
 
 - **Non-secret session env** (`GT_ROLE`, `GT_SESSION`, `GT_ROOT`, `BD_ACTOR`,
-  `GT_PROXY_URL`, …) travels in the `WrapCommand` payload / env-file. These are not
-  secrets; appearing in the SSM/`docker exec` invocation is acceptable.
-- **Secret env** (`ANTHROPIC_API_KEY`, registry creds, the proxy cert/key) is
-  **never** in the command payload — it is injected via the secret store / instance
-  profile (§7.1–7.2) or, for the proxy cert, terminated entirely in `gt-node-agent`
-  so it never reaches the agent at all.
+  `GT_PROXY_URL`, …) travels in the `WrapCommand` payload / env-file. These are
+  not secrets; appearing in the exec-channel invocation is acceptable.
+- **Secret env** (LLM API keys, registry creds, the proxy cert/key) is **never**
+  in the command payload — it is injected via the provider's worker-side secret
+  mechanism (§7.1–7.2) or, for the proxy cert, terminated entirely in
+  `gt-worker-agent` so it never reaches the agent at all.
 
 This is why `WrapCommand` takes the env map (§5): the backend, not
 `BuildStartupCommand`, is responsible for landing the session env in the remote
@@ -723,26 +732,26 @@ process by whatever mechanism its launcher requires.
 ## 8. Model configuration carry-over
 
 Rig model/agent config (`Agent` preset → `RoleAgents["polecat"]` → custom agent →
-`Command`/`Args`/`Env`) resolves **host-side in `BuildStartupCommand`** before the
-wrapper is applied. The remote needs none of gastown's agent config files; only
-the resolved command + env cross. The config splits three ways:
+`Command`/`Args`/`Env`) resolves **host-side in `BuildStartupCommand`** before
+the wrapper is applied. The remote needs none of gastown's agent config files;
+only the resolved command + env cross. The config splits three ways:
 
 | Surface | Examples | Crosses to the remote? |
 |---|---|---|
 | **Command + Args + prompt** | `claude --model claude-opus-4-8`, custom `Command: codex`, `--dangerously-skip-permissions`, `InitialPrompt` | **Free** — it *is* the wrapped command string (§6.1.2). |
-| **Env-based model config** (`rc.Env`) | `ANTHROPIC_BASE_URL` (Groq/MiniMax), `ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL` | **Inject** — same boundary as auth: non-secret → plain container env; secret → secret store. |
-| **Agent runtime binary** | the binary `Command` names | **Must be in the image/AMI** (§6.2). |
+| **Env-based model config** (`rc.Env`) | `ANTHROPIC_BASE_URL` (Groq/MiniMax), `ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL` | **Inject** — same boundary as auth: non-secret → plain remote env; secret → the provider's secret mechanism (§7.4). |
+| **Agent runtime binary** | the binary `Command` names | **Must be in the image / worker base** (§6.2). |
 
-So custom models carry over: CLI config for free, env config via the §7 injection
-path, and the runtime via the §6.2 image contract.
+So custom models carry over: CLI config for free, env config via the §7
+injection path, and the runtime via the §6.2 image contract.
 
 ### 8.1 Liveness consequence
 
 `GT_PROCESS_NAMES` (used by Witness/reaper to match `pane_current_command`) is
-meaningless for remote: the host pane runs `aws ssm`/`session-worker`, not the
-agent. **Remote backends use heartbeat-based liveness only** (the
-`.runtime/heartbeats/` mechanism via the proxy), not process-name matching. This is
-required regardless of model config; custom-agent rigs just make it concrete.
+meaningless for remote: the host pane runs the backend's *launcher* process, not
+the agent. **Remote backends use heartbeat-based liveness only** (the
+`.runtime/heartbeats/` mechanism via the proxy), not process-name matching. This
+is required regardless of model config; custom-agent rigs just make it concrete.
 
 ---
 
@@ -751,294 +760,276 @@ required regardless of model config; custom-agent rigs just make it concrete.
 ### 9.1 Identity vs. sandbox (persistent-pool reconciliation)
 
 For remote backends there is **no host-side worktree**. Persistent **identity**
-(name, agent bead, CV) stays host-side; the **sandbox** is the ephemeral instance;
-the durable artifact is the polecat branch in `~/gt/<rig>/.repo.git`. This diverges
+(name, agent bead, CV) stays host-side; the **sandbox** is the ephemeral remote
+execution environment (an instance, or a session on a persistent machine); the
+durable artifact is the polecat branch in `~/gt/<rig>/.repo.git`. This diverges
 from the reuse-the-worktree pool model and is carved out explicitly for
 `backend != local`.
 
 ### 9.2 Recovery — git push via proxy (no storage snapshots)
 
-There is no EBS/AMI snapshot lifecycle; durability is host-side git. **Two refs
-with two roles** (this is the source-of-truth split):
+There is no provider storage-snapshot lifecycle; durability is host-side git.
+**Two refs with two roles** (this is the source-of-truth split):
 
 - The **polecat branch** (`polecat/<name>/<issue>`) is the artifact for
-  *completed/intentional* work — it advances only on the agent's own real commits
-  and `gt done`, and is what becomes a PR. It stays clean.
+  *completed/intentional* work — it advances only on the agent's own real
+  commits and `gt done`, and is what becomes a PR. It stays clean.
 - The **checkpoint ref** (`refs/checkpoints/polecat/<name>`) is the resume
-  source-of-truth for *in-progress/interrupted* work — force-updated every interval
-  with the latest worktree state.
+  source-of-truth for *in-progress/interrupted* work — force-updated every
+  interval with the latest worktree state.
 
-To de-risk the tight interrupt window, the polecat **checkpoints continuously**:
-every `checkpoint_interval` (and on quiescence) `gt-node-agent` commits + pushes
-the **checkpoint ref** through the proxy, so the host is never more than one
-interval stale. **Recovery resets the worktree from the checkpoint ref** (not the
-branch), then the agent continues; on `gt done` the real work is already on the
-clean branch. This applies to **on-demand** instances too (it guards host crashes,
-not just spot reclamation).
+To de-risk tight interruption windows, the polecat **checkpoints continuously**:
+every `checkpoint_interval` (and on quiescence) `gt-worker-agent` commits +
+pushes the **checkpoint ref** through the proxy, so the host is never more than
+one interval stale. **Recovery resets the worktree from the checkpoint ref**
+(not the branch), then the agent continues; on `gt done` the real work is
+already on the clean branch. This applies to **non-preemptible** workers too (it
+guards worker and host crashes, not just preemption).
 
 Checkpointing must stay cheap and must not pollute the branch or bloat the repo:
 
-- **Disposable, non-accumulating commits.** Each checkpoint is an **orphan commit**
-  (no parent) — or a single commit always re-parented on the branch tip — and the
-  ref is **force-moved**, never appended. Old checkpoint commits become
-  unreferenced and are reclaimed by periodic `git gc --prune` on `.repo.git`, so a
-  long session does not accumulate a 5-minute-granularity commit chain. (Unchanged
-  blobs/trees are shared by content-addressing; only changed trees cost objects.)
-- **Tracked-only, gitignore-respecting staging.** Stage with the repo's `.gitignore`
-  honored and **do not** blindly `git add -A` over untracked trees — avoid
-  committing `node_modules`, build/compiler caches, and logs (bandwidth + bloat
-  through the proxy). Untracked-but-wanted files are the rare exception, handled
-  explicitly.
-- **Quiescence guard.** Trigger a checkpoint only when the worktree is momentarily
-  settled (no in-flight writes for a short debounce), so a half-written file is not
-  captured mid-flush. The interval is a ceiling, not a hard metronome.
-- **S3 fallback when the host is unreachable.** Normally checkpoints push to the
-  host `.repo.git` via the proxy. But if the orchestrator is offline at exactly the
-  wrong moment — a spot interrupt while the laptop is asleep — the final, unpushed
-  delta would die with the instance. So when the proxy is unreachable,
-  `gt-node-agent` falls back to uploading a **git bundle of the checkpoint ref to
-  S3** (the instance role already has scoped S3 access). On resume, the new instance
-  pulls the S3 bundle when the host `.repo.git` is behind it, **and immediately
-  re-pushes that state to `.repo.git` via the proxy** (or the daemon ingests the
-  bundle directly) so the host reconverges and S3 is not left as a second
-  source-of-truth. This closes the laptop-asleep-during-interrupt durability gap; it
-  is optional and only engages on a proxy outage.
+- **Disposable, non-accumulating commits.** Each checkpoint is an **orphan
+  commit** (no parent) — or a single commit always re-parented on the branch tip
+  — and the ref is **force-moved**, never appended. Old checkpoint commits
+  become unreferenced and are reclaimed by periodic `git gc --prune` on
+  `.repo.git`, so a long session does not accumulate a 5-minute-granularity
+  commit chain. (Unchanged blobs/trees are shared by content-addressing; only
+  changed trees cost objects.)
+- **Tracked-only, gitignore-respecting staging.** Stage with the repo's
+  `.gitignore` honored and **do not** blindly `git add -A` over untracked trees
+  — avoid committing `node_modules`, build/compiler caches, and logs (bandwidth
+  + bloat through the proxy). Untracked-but-wanted files are the rare exception,
+  handled explicitly.
+- **Quiescence guard.** Trigger a checkpoint only when the worktree is
+  momentarily settled (no in-flight writes for a short debounce), so a
+  half-written file is not captured mid-flush. The interval is a ceiling, not a
+  hard metronome.
+- **Offline checkpoint spool (provider-defined fallback).** Normally checkpoints
+  push to the host `.repo.git` via the proxy. But if the orchestrator is offline
+  at exactly the wrong moment — an interruption while the laptop is asleep — the
+  final, unpushed delta would die with an ephemeral worker. So when the proxy is
+  unreachable, `gt-worker-agent` spools the checkpoint (a git bundle of the
+  checkpoint ref) to a **provider-defined durable location** that outlives the
+  worker. On resume, the replacement worker pulls the spooled bundle when the
+  host `.repo.git` is behind it, **and immediately re-pushes that state to
+  `.repo.git` via the proxy** (or the daemon ingests the bundle directly) so the
+  host reconverges and the spool is not left as a second source-of-truth. This
+  is optional per provider and only engages on a proxy outage. (EC2: an object
+  store; socket: the worker's own persistent disk — see the provider specs.)
 
-### 9.3 Spot interruption — in-instance (no-op for on-demand)
+### 9.3 Interruption (provider-signalled preemption or shutdown)
 
-Interruption is handled **inside the instance** by `gt-node-agent`. It applies only
-to `instance_lifecycle: "spot"`; for on-demand the poller runs but never fires.
+Some providers can take the worker away (capacity reclamation, host shutdown); some
+can only be asked to stop (an explicit shutdown message). Either way,
+interruption is handled **on the worker** by `gt-worker-agent`, which watches
+the **provider's interruption signal** — a metadata endpoint to poll, a process
+signal, or a message on the session connection; each provider spec defines its
+signal and its warning window. For workers with no preemption (on-demand cloud,
+persistent machines), the watcher is simply inert.
 
-- **EC2 Spot:** there is no reliable advance SIGTERM. `gt-node-agent` **polls IMDS**
-  `/spot/instance-action` (and optionally the rebalance recommendation, which fires
-  earlier). The ~2-min window is best-effort.
-
-**Shutdown sequence** (much simpler than Fargate, because everything is one host
-under one root): (1) stop the agent — `gt-node-agent` signals the agent process
-directly (native mode) or `docker stop`s the work container (container mode); no
-cross-container PID-namespace / `CAP_KILL` dance is needed. (2) Flush the final
-small delta to the checkpoint ref (same tracked-only, gitignore-respecting staging
-as §9.2 — small because of continuous checkpointing). (3) Exit. If the final flush
-fails, at most one `checkpoint_interval` is lost.
-
-> **Fargate (secondary) interruption** is more involved: ECS SIGTERMs every
-> container at once, so the work container's idle entrypoint must trap/ignore
-> SIGTERM (under `initProcessEnabled` `tini`). Since `pidMode: task` is unavailable
-> on Fargate (§6.4), the sidecar can't signal across the PID namespace, so it must
-> use the **shared-volume STOP marker** to stop the agent before flushing. This
-> asymmetry is another reason EC2 is primary.
+**Shutdown sequence** (identical across providers, because everything is one
+worker host under one supervisor): (1) stop the agent — `gt-worker-agent`
+signals the agent process directly (native mode) or `docker stop`s the work
+container (container mode); no cross-container PID-namespace dance is needed.
+(2) Flush the final small delta to the checkpoint ref (same tracked-only,
+gitignore-respecting staging as §9.2 — small because of continuous
+checkpointing). (3) Exit / report shutdown complete, per provider. If the final
+flush fails, at most one `checkpoint_interval` is lost.
 
 ### 9.4 Resume
 
-Two distinct re-entry cases, distinguished by whether the instance is still alive
-(reconciled with the tag-based discovery in §5):
+Two distinct re-entry cases, distinguished by whether the worker session is
+still alive (reconciled with the identity-based discovery in §5):
 
-- **Instance still alive** (e.g. the *daemon* restarted, the *instance* did not):
-  tag-discovery finds the live instance for the identity, and `Provision`
-  **reattaches** to it — no new instance, no reprovision. This is the §5
+- **Worker still alive** (e.g. the *daemon* restarted, the *worker* did not):
+  `Discover` finds the live worker for the identity, and `Provision`
+  **reattaches** to it — no new worker, no reprovision. This is the §5
   discovery path.
-- **Instance gone** (spot reclamation, host crash): no live tagged instance is
-  found, so `Provision` launches a **fresh** one that resumes from the checkpoint.
+- **Worker gone** (preemption, worker crash, session lost): no live worker is
+  found, so `Provision` acquires a **fresh** environment that resumes from the
+  checkpoint.
 
-In the gone case the polecat never reached `gt done`; its bead stays `working` with
-a stale heartbeat, and Witness's existing **restart-first** policy drives the
-re-provision. The fresh instance MUST `git fetch` and **reset its worktree to the
-checkpoint ref** (`refs/checkpoints/polecat/<name>`, the in-progress source of truth
-per §9.2 — not the polecat branch, which only holds completed/`gt done` work), then
-re-attach to the **same** bead — so interrupted work resumes from the last
-checkpoint rather than restarting or losing it. `Provision` is idempotent across
-both cases: reattach if live, resume-from-checkpoint if not.
+In the gone case the polecat never reached `gt done`; its bead stays `working`
+with a stale heartbeat, and Witness's existing **restart-first** policy drives
+the re-provision. The fresh environment MUST `git fetch` and **reset its
+worktree to the checkpoint ref** (`refs/checkpoints/polecat/<name>`, the
+in-progress source of truth per §9.2 — not the polecat branch, which only holds
+completed/`gt done` work), then re-attach to the **same** bead — so interrupted
+work resumes from the last checkpoint rather than restarting or losing it.
+`Provision` is idempotent across both cases: reattach if live,
+resume-from-checkpoint if not.
 
 ### 9.5 Teardown & zombie cap
 
-- After `gt done` (or idle), the reaper waits `cooldown`, then calls `Teardown()`
-  (`TerminateInstances`).
+- After `gt done` (or idle), the reaper waits `cooldown`, then calls
+  `Teardown()` (provider-defined release: destroy the sandbox, or end the
+  session and clean up on a persistent machine).
 - `max_runtime` is an absolute wall-clock cap checked in `reapIdlePolecat`,
-  independent of heartbeat freshness, to kill busy zombies. **On expiry the reaper
-  does a graceful flush first, not an immediate kill:** it sends a flush/stop signal
-  (via SSM, the same path as a spot interrupt) so `gt-node-agent` stops the agent
-  and pushes a final checkpoint (and surfaces tail logs), waits a short grace
-  window (e.g. 60–120s), and only then calls `TerminateInstances`. If the grace
-  window expires it terminates anyway. This preserves partial progress on a
-  timed-out long task instead of discarding everything since the last checkpoint.
-- **Instance-side self-termination watchdog (cost backstop).** The host reaper is
-  not trustworthy for teardown when the orchestrator is a laptop that may sleep or
-  lose connectivity — a missed teardown means an EC2 instance billing
-  indefinitely. So `gt-node-agent` also enforces its own limits **locally**: it
-  self-terminates (after a final checkpoint) when it reaches `max_runtime`, **or**
-  when it loses contact with the orchestrator/control plane for a dead-man's-switch
-  interval (a few × `checkpoint_interval`). The host reaper is the primary,
-  graceful path; the in-instance watchdog guarantees the instance dies even if the
-  laptop never comes back. (A `shutdown -h` self-stop plus an EC2
-  `InstanceInitiatedShutdownBehavior=terminate` is the belt-and-suspenders form.)
+  independent of heartbeat freshness, to kill busy zombies. **On expiry the
+  reaper does a graceful flush first, not an immediate kill:** it sends a
+  flush/stop signal over the provider channel (the same path as an interruption)
+  so `gt-worker-agent` stops the agent and pushes a final checkpoint (and
+  surfaces tail logs), waits a short grace window (e.g. 60–120s), and only then
+  forces `Teardown`. If the grace window expires it tears down anyway. This
+  preserves partial progress on a timed-out long task instead of discarding
+  everything since the last checkpoint.
+- **Worker-side self-release watchdog (cost/safety backstop).** The host reaper
+  is not trustworthy for teardown when the orchestrator is a laptop that may
+  sleep or lose connectivity — a missed teardown means a worker running (and, on
+  billed providers, billing) indefinitely. So `gt-worker-agent` also enforces
+  its own limits **locally**: it self-releases (after a final checkpoint) when
+  it reaches `max_runtime`, **or** when it loses contact with the
+  orchestrator/control plane for a dead-man's-switch interval (a few ×
+  `checkpoint_interval`). The host reaper is the primary, graceful path; the
+  worker-side watchdog guarantees the session ends even if the laptop never
+  comes back. What "self-release" means is provider-defined: an ephemeral cloud
+  worker terminates itself; a persistent machine stops the session and preserves
+  itself (see the provider specs).
 
 ### 9.6 Orchestrator connectivity & dynamic host
 
 The orchestrator is often a developer laptop — dynamic IP, sleep, Wi-Fi changes,
-transient drops. The remote instance's link to the host proxy is therefore *not*
+transient drops. The worker's link to the host proxy is therefore *not*
 reliable, and the design must tolerate it:
 
-- **Stable host address.** The instance must not pin a raw laptop IP. It reaches the
-  proxy via a **stable hostname** (Tailscale / VPN / dynamic-DNS), or the daemon
-  updates the instance's proxy endpoint out-of-band (SSM Parameter Store / an SSM
-  send-command) when its address changes. `GT_PROXY_URL`'s host half is resolved
+- **Stable host address.** The worker must not pin a raw laptop IP. It reaches
+  the proxy via a **stable hostname** (Tailscale / VPN / dynamic-DNS), or the
+  daemon updates the worker's proxy endpoint out-of-band over the provider
+  channel when its address changes. `GT_PROXY_URL`'s host half is resolved
   through that stable name.
-- **Local checkpoint queueing.** `gt-node-agent` commits checkpoints to the local
-  checkpoint ref regardless of connectivity and **retries the push with exponential
-  backoff**; a push outage delays durability but never blocks the agent or loses
-  the local commit. `gt`/`bd` calls that need the host degrade gracefully (retry /
-  surface a clear "control plane unreachable" rather than hang indefinitely).
-- **Debounced host-side reaping.** When the *host's own* network was recently down
-  (the daemon can detect its own offline window), the reaper applies a generous
-  grace/debounce before treating a stale remote heartbeat as death — otherwise a
-  laptop sleeping for five minutes would mass-reap healthy instances and re-provision
-  needlessly.
+- **Local checkpoint queueing.** `gt-worker-agent` commits checkpoints to the
+  local checkpoint ref regardless of connectivity and **retries the push with
+  exponential backoff**; a push outage delays durability but never blocks the
+  agent or loses the local commit. `gt`/`bd` calls that need the host degrade
+  gracefully (retry / surface a clear "control plane unreachable" rather than
+  hang indefinitely).
+- **Debounced host-side reaping.** When the *host's own* network was recently
+  down (the daemon can detect its own offline window), the reaper applies a
+  generous grace/debounce before treating a stale remote heartbeat as death —
+  otherwise a laptop sleeping for five minutes would mass-reap healthy workers
+  and re-provision needlessly.
 
 ---
 
 ## 10. Docker / nested-container workloads
 
-A major reason EC2 is the primary backend: agents frequently need a **real Docker
-daemon** — `docker build`, `docker compose up` to bring up dependent services for
-integration tests, testcontainers, etc.
+Agents frequently need a **real Docker daemon** — `docker build`, `docker
+compose up` to bring up dependent services for integration tests,
+testcontainers, etc. This is a **capability** a provider does or does not offer,
+and a major criterion in provider selection.
 
-- **EC2 (supported).** The AMI runs `dockerd`. In `container` mode the work
-  container is started with `/var/run/docker.sock` bind-mounted, so the agent's
-  `docker`/`docker compose` talks to the **host daemon** and spins up *sibling*
-  containers on the instance (the standard "Docker-outside-of-Docker" pattern). In
-  `native` mode the agent simply uses the host daemon directly. Either way,
-  compose stacks, image builds, and testcontainers work.
-  - *Security note:* a bind-mounted Docker socket is effectively host root, and the
-    **host carries the instance IAM role** (ECR, Secrets Manager, Bedrock). A
-    container escape via the socket (launch a privileged sibling, mount host `/`)
-    reaches the host and can then hit **IMDS (`169.254.169.254`) to steal the role's
-    temporary credentials.** Single-tenant ephemerality limits *blast radius* but
-    does not stop credential theft within the rig's own run. Required mitigations:
-    1. **Block IMDS from the container network** — host `iptables` dropping
-       `169.254.169.254` from the docker bridge, and IMDSv2 with a hop limit of 1 so
-       a container cannot reach it even via the gateway. **This requires bridge
-       networking** (§6.1.1 option 2): under `--network host` there is no bridge and
-       no extra hop, so both controls are bypassed — which is exactly why untrusted
-       rigs MUST use bridge mode. For `native` mode (and host-net) the primary
-       control is a **host firewall scoped by UID** — but this only works if the two
-       sides have *different* UIDs. So the agent must **not** run as root in these
-       modes: `gt-node-agent` stays root (UID 0, for dockerd/worktree), and it drops
-       privileges to launch the agent as a **dedicated non-root `gt-agent` UID**. The
-       firewall then allows only UID 0 (and `gt-node-agent`) to reach
-       `169.254.169.254` and denies `gt-agent`. If the agent also ran as root the
-       filter could not tell them apart — hence the dedicated UID is mandatory in
-       native/host-net mode (it dovetails with the §6.1 shared-`gt`-group worktree so
-       checkpointing still works across the UID boundary). **Do not simply disable
-       IMDS post-boot:** `gt-node-agent` needs it for the `/spot/instance-action`
-       poller (§9.3), so a blanket disable would break spot
-       interruption handling. The UID-scoped firewall preserves the poller while
-       denying the agent.
-       **Caveat — the Docker socket bypasses the UID firewall.** If the `gt-agent`
-       UID can write `/var/run/docker.sock`, it can `docker run` a container
-       (host-net, or mounting host `/`) whose traffic originates as **root/dockerd**,
-       not `gt-agent` — so it reaches IMDS regardless of the UID filter. The UID
-       firewall (and the bridge `iptables` control) therefore only contain the
-       *direct* escape paths; **they do not contain a Docker-socket-holding agent.**
-       For an untrusted rig that also needs Docker, the socket *is* the hole, and
-       the only real defense is mitigation (2): rootless dockerd / nested userns,
-       where the nested daemon runs unprivileged and its containers cannot reach the
-       host's IMDS credentials. Untrusted + raw host socket is not a safe
-       combination at any UID.
-    2. **Mandatory (not deferred) hardening for untrusted code** — rigs in
-       `sandboxed` mode or running untrusted PRs MUST use rootless dockerd / nested
-       userns (or skip the socket entirely); the "single-tenant, acceptable"
-       rationale only holds for *trusted* rigs.
-    3. **Per-rig least-privilege IAM** — scope each rig's instance role to exactly
-       the ECR repos / secrets / Bedrock models it needs, not one broad shared role,
-       so a stolen credential is narrowly bounded.
-    Depth-of-hardening beyond (1)–(3) is open question 9.
-- **Fargate (NOT supported).** Fargate exposes no Docker daemon, forbids
-  `privileged`, and cannot run Docker-in-Docker. So `docker build` / `docker
-  compose` / testcontainers **do not work** on Fargate. The only partial path is to
-  model required services (postgres, redis) as **additional containers in the same
-  task** (shared localhost) — static, declared at provision time, no image builds,
-  cannot run the repo's own compose file dynamically.
+Where the worker runs `dockerd`: in `container` mode the work container is
+started with `/var/run/docker.sock` bind-mounted, so the agent's
+`docker`/`docker compose` talks to the **worker-host daemon** and spins up
+*sibling* containers (the standard "Docker-outside-of-Docker" pattern). In
+`native` mode the agent simply uses the host daemon directly. Either way,
+compose stacks, image builds, and testcontainers work.
 
-**Backend gating.** `requires_docker: true` (§4) forces the rig onto EC2 and makes
-preflight (§6.3) reject a Fargate selection — so a Docker-needing rig can never be
-silently scheduled where the daemon is absent. This makes "needs Docker" an
-explicit, validated backend-selection criterion alongside the iOS "needs local"
-case.
+**Security note (all providers):** a bind-mounted Docker socket is effectively
+worker-host root. Whatever ambient credentials or identity the worker host
+holds, a container escape via the socket can reach. Single-tenant ephemerality
+limits *blast radius* but does not stop credential theft within the rig's own
+run — and on persistent machines the compromise can outlive the session.
+Required mitigations, in provider-appropriate form:
+
+1. **Block worker credential endpoints from the container network** where the
+   provider exposes any (cloud metadata services and the like) — and understand
+   the limits: network-level blocks require bridge networking (§6.1.1) and **do
+   not contain a Docker-socket-holding agent**, whose spawned containers
+   originate traffic as the host daemon. Each provider spec details its
+   endpoints and mitigations.
+2. **Mandatory (not deferred) hardening for untrusted code** — rigs in
+   `sandboxed` mode or running untrusted PRs MUST use rootless dockerd / nested
+   userns (or skip the socket entirely); "single-tenant, acceptable" reasoning
+   only holds for *trusted* rigs. Untrusted + raw host socket is not a safe
+   combination on any provider.
+3. **Least-privilege worker identity** — scope whatever platform identity the
+   worker holds to exactly what that rig needs, so a stolen credential is
+   narrowly bounded.
+
+**Provider support:**
+
+| Provider | Docker capability |
+|---|---|
+| `local` | Host daemon (today's behavior). |
+| [EC2](remote-polecat-execution-ec2.md) | **Supported** — the worker image runs `dockerd`; see that spec's §10 for metadata-endpoint and UID mitigations. |
+| [Socket](remote-polecat-execution-socket.md) | **Supported if the worker machine runs `dockerd`** — declared in the worker's capability handshake; see that spec's security model. |
+| AWS Fargate (secondary, deferred) | **Not supported** — no Docker daemon; see the EC2 spec's Fargate appendix. |
+
+**Backend gating.** `requires_docker: true` (§4) makes preflight (§6.3) reject
+any provider/worker that cannot supply a daemon — so a Docker-needing rig can
+never be silently scheduled where the daemon is absent. This makes "needs
+Docker" an explicit, validated backend-selection criterion alongside the iOS
+"needs local" case.
 
 ---
 
 ## 11. Implementation phases
 
-**Tier 1 — config + safety rails (no AWS dependency; ships value alone):**
-1. `RigSettings.Execution` block (§4) + version bump — per-rig backend / lifecycle
-   / sizing / image / `requires_docker`.
+**Tier 1 — config + safety rails (no provider dependency; ships value alone):**
+1. `RigSettings.Execution` block (§4) + version bump — shared fields + opaque
+   provider extension.
 2. Absolute `max_runtime` cap in `reapIdlePolecat` (the genuine §9.5 gap).
-3. Auto cert-issuance (CN `gt-<rig>-<name>`) + secure delivery (§7.2) and the
-   `GT_PROXY_*`/`GIT_SSL_*` env contract — wires the *existing* proxy into the
-   spawn path.
+3. Auto cert-issuance (CN `gt-<rig>-<name>`), the **CSR-signing CA primitive**
+   (§7.2), and the `GT_PROXY_*`/`GIT_SSL_*` env contract — wires the *existing*
+   proxy into the spawn path.
 
-**Tier 2 — interface + EC2 backend (the primary):**
-4. `ExecutionBackend` interface + `LocalBackend` (refactor today's path behind it;
-   no behavior change).
-5. The Packer AMI as a **stable base** (dockerd + amazon-ssm-agent + git +
-   `gt-agent` user + bootstrapper); the version-sensitive binaries (gt/bd/
-   proxy-client/`gt-node-agent`) are injected at boot over SSM, not baked (§6.1).
-6. `EC2SpotBackend.Provision/Teardown` honoring `instance_lifecycle` (spot **and**
-   on-demand), the provision hook, instance-profile credential wiring (ECR /
-   agent_auth), tag-based discovery.
-7. `gt-node-agent`: CSR-over-SSM cert acquisition (§7.2), local relay, container launch with
-   bind-mounts (`/opt/gt`, worktree, docker.sock), `exec_mode` container/native.
-8. SSM-based `WrapCommand` (blocking-pane wrapper) + remote session-env injection
-   (§7.4) + heartbeat-only liveness (§8.1).
+**Tier 2 — agnostic core:**
+4. `ExecutionBackend` interface + `LocalBackend` (refactor today's path behind
+   it; no behavior change), including the `BuildStartupCommand` →
+   `WrapCommand` delegation (§5).
+5. `gt-worker-agent` as a provider-neutral program: CSR flow, local relay, work
+   env preparation (container/native), checkpoint loop (§9.2), shutdown
+   sequence + watchdog (§9.3, §9.5) — with the provider channel and interruption
+   signal behind small internal interfaces.
+6. Heartbeat-only liveness for remote backends (§8.1) and remote session-env
+   injection (§7.4).
 
-**Tier 3 — full lifecycle:**
-9. Cooldown + `Teardown` from `killIdlePolecat`; continuous checkpoint loop (§9.2).
-10. IMDS spot-interrupt poller + resume logic (§9.3–9.4).
-11. Network egress posture (§7.3): `sandboxed` (SG-only) → `gateway` (Zero Trust
-    tunnel as a host service) → `open`.
+**Tier 3 — first providers (independent of each other; either can ship first):**
+7. **[EC2 provider](remote-polecat-execution-ec2.md)** — provisioning, worker
+   image, cert-over-provider-channel, exec channel, interruption, egress
+   postures; phased per that spec.
+8. **[Socket provider](remote-polecat-execution-socket.md)** — `gt-worker-client`
+   service, enrollment + session protocol, exec streaming; phased per that spec.
 
-**Tier 4 — secondary backend + optimizations:**
-12. `FargateBackend` (§6.4) for lightweight no-Docker rigs (`FARGATE_SPOT` /
-    `FARGATE`).
-13. Pre-warmed idle instance pool per remote rig to hide cold-start latency.
+**Tier 4 — optimizations + secondary providers:**
+9. Pre-warmed idle worker pools per remote rig to hide cold-start latency.
+10. Secondary providers (e.g. AWS Fargate — see the EC2 spec's appendix).
 
-Each tier is independently testable; Tier 1 is useful before any cloud backend
-exists.
+Each tier is independently testable; Tier 1 is useful before any remote provider
+exists, and Tier 2 is fully exercisable against `LocalBackend`.
 
 ---
 
-## 12. Open questions
+## 12. Open questions (core)
 
-1. **Provision latency vs. dispatch.** EC2 + AMI warm start is faster than a cold
-   image pull, but still seconds-to-minutes in the dispatch path. Accept
+Provider-specific questions live in the provider specs. Universal:
+
+1. **Provision latency vs. dispatch.** Acquiring a worker takes
+   seconds-to-minutes in the dispatch path (varies by provider). Accept
    synchronously for v1; pre-warming (Tier 4) is the optimization.
-2. **Default dev image / AMI scope.** Which toolchains ship in the gastown default
-   image and the base AMI vs. left to custom images?
-3. **Bedrock model parity.** Confirm target models (e.g. Opus 4.8) are available on
-   Bedrock in the chosen region before defaulting a rig to `bedrock_role`;
-   otherwise use `secret` + direct Anthropic API.
-4. **Cross-account ECR.** Standardize on instance-role + repo policy, or an assumed
-   pull-role ARN in `image_auth`?
-5. **Instance sizing UX.** Prefer explicit `instance_type`, or `cpu`/`memory` →
-   cheapest-matching-type selection (and across which families)? How to express
-   GPU / arch (arm64 vs x86) needs?
-6. **Egress gateway abstraction (§7.3).** Should `network.gateway.provider` be an
-   interface (Cloudflare Zero Trust first, others later — Tailscale, a squid/HTTP
-   filtering proxy), and what is the default `gateway` policy (a curated registry
-   allowlist vs. allow-all-but-log)?
-7. **Sandboxed-mode dependency story.** For `sandboxed` rigs that still need
-   packages, standardize on a pull-through cache reachable by VPC endpoint
-   (CodeArtifact, an S3-backed mirror) vs. deps pre-baked in the image/AMI.
-8. **Distroless work images (§6.2).** Confirm whether `docker exec` (over SSM)
-   can drive a shell injected by absolute path into a `/bin/sh`-less image, or
-   whether v1 simply requires `/bin/sh`. Note a second pitfall beyond the exec
-   path: distroless images lack `glibc` and the dynamic linker
+2. **Default dev image scope.** Which toolchains ship in the gastown default
+   work image vs. left to custom images?
+3. **Egress gateway abstraction (§7.3).** Should the `gateway` mode's provider
+   integration be an interface (one Zero Trust product first, others later —
+   Tailscale, a squid/HTTP filtering proxy), and what is the default `gateway`
+   policy (a curated registry allowlist vs. allow-all-but-log)?
+4. **Sandboxed-mode dependency story.** For `sandboxed` rigs that still need
+   packages, standardize on a pull-through cache/internal mirror vs. deps
+   pre-baked in the image/worker base? (Mechanisms are provider-specific; the
+   policy choice is shared.)
+5. **Docker socket hardening (§10).** Default to a bind-mounted host socket
+   (single-tenant) or invest in rootless dockerd / nested userns as the default
+   for defense-in-depth against a malicious agent escaping to worker-host root?
+6. **Distroless work images (§6.2).** Confirm whether an exec channel can drive
+   a shell injected by absolute path into a `/bin/sh`-less image, or whether v1
+   simply requires `/bin/sh`. Note a second pitfall beyond the exec path:
+   distroless images lack `glibc` and the dynamic linker
    (`/lib64/ld-linux-x86-64.so.2`), so any injected shell/binary **must be fully
    statically linked** (e.g. static `busybox`/`toybox`) to run at all — a
    dynamically linked one fails with a missing-loader error. This pushes the v1
    stance further toward simply requiring `/bin/sh`.
-9. **Docker socket hardening (§10).** Default to a bind-mounted host socket
-   (single-tenant, ephemeral) or invest in rootless dockerd / nested userns for
-   defense-in-depth against a malicious agent escaping to host root?
-10. **On-demand fallback.** Should `instance_lifecycle: "spot"` optionally fall
-    back to on-demand on `InsufficientInstanceCapacity`, or fail and retry spot?
+7. **Worker sizing UX.** Providers with elastic sizing want `cpu`/`memory`
+   hints; fixed machines have none. Should sizing hints live in the core schema
+   (advisory, ignorable) or stay purely provider-specific (current position:
+   provider-specific)?
