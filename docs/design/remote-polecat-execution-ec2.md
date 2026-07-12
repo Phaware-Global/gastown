@@ -129,7 +129,8 @@ EC2-specific keys live under the `ec2` key of the core `execution` block (core
     // agent (LLM) auth (§6.2)
     "agent_auth": { "mode": "bedrock_role" },
 
-    // gateway-mode egress config (§7); only read when network.mode = "gateway"
+    // gateway-mode egress config (§7); only read when network.mode = "gateway".
+    // v1 accepts only "cloudflare_zero_trust" (core §12, open question 3).
     "gateway": {
       "provider": "cloudflare_zero_trust",
       "token_secret_arn": "arn:aws:secretsmanager:us-east-1:123456789:secret:gt-cf-egress"
@@ -310,8 +311,12 @@ PrivateLink** (NAT fallback), with the security group denying everything else
    policies enforcing destination policy, blocking known-bad endpoints, and
    logging every flow for audit/DLP. The gateway token is injected as a Secrets
    Manager reference (`ec2.gateway.token_secret_arn`), and `gt-worker-agent`
-   brings the tunnel up before the work container starts. (Gateway-provider
-   abstraction is core open question 3.)
+   brings the tunnel up before the work container starts. Per the core §12
+   decision (open question 3), **`cloudflare_zero_trust` is the only accepted
+   `gateway.provider` value in v1** — orchestrator-side preflight rejects
+   anything else — and gt does not create or manage Gateway policies: the
+   rig's policy (allowlists, DLP, logging rules) is administered in the
+   Cloudflare dashboard/API, outside gt.
 3. **`open`** — unrestricted NAT egress. Allowed but never the default.
 
 ## 8. Spot interruption (the provider interruption signal)
