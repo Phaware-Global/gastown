@@ -753,8 +753,13 @@ func wrapOperationalErr(err error) error {
 // patrol re-escalated by hand instead of hitting the fingerprint dedupe.
 // fingerprintSuffix collapses repeat escalations for the same MR and
 // failure kind into a single bead rather than filing one per patrol cycle.
+// reason (the unresolved-thread JSON blob) is unbounded, so it travels over
+// stdin via --stdin rather than as an argv element — embedding it in argv
+// risks ARG_MAX and is exactly the shell-quoting hazard --stdin exists to
+// avoid (gemini review on #159).
 func escalateReviewLoopCap(description, reason, fingerprintSuffix string) error {
-	cmd := exec.Command(gtBinary(), escalateReviewLoopCapArgs(description, reason, fingerprintSuffix)...)
+	cmd := exec.Command(gtBinary(), escalateReviewLoopCapArgs(description, fingerprintSuffix)...)
+	cmd.Stdin = strings.NewReader(reason)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -763,13 +768,15 @@ func escalateReviewLoopCap(description, reason, fingerprintSuffix string) error 
 // escalateReviewLoopCapArgs builds the `gt escalate` argv, split out from
 // escalateReviewLoopCap so tests can pin the flag shape without shelling
 // out. Only flags gt escalate's flag set actually defines (see escalate.go:
-// --severity/-s, --reason/-r, --source, --fingerprint) may appear here.
-func escalateReviewLoopCapArgs(description, reason, fingerprintSuffix string) []string {
+// --severity/-s, --stdin, --source, --fingerprint) may appear here. reason
+// never appears here — it travels over stdin (see escalateReviewLoopCap) —
+// so this function takes no reason parameter.
+func escalateReviewLoopCapArgs(description, fingerprintSuffix string) []string {
 	args := []string{
 		"escalate",
 		"-s", "HIGH",
 		"--source", "refinery:dispatch-review-fix",
-		"--reason", reason,
+		"--stdin",
 	}
 	if fingerprintSuffix != "" {
 		args = append(args, "--fingerprint", fingerprintSuffix)
