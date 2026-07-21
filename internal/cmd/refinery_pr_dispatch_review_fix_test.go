@@ -400,3 +400,79 @@ func TestReviewFixCapacityExitCode(t *testing.T) {
 		})
 	}
 }
+
+// TestEscalateReviewLoopCapArgs is the regression test for gt-5yxm:
+// escalateReviewLoopCap used to hard-code --mail and --context, neither of
+// which `gt escalate` defines (see escalate.go's flag registration), so the
+// shell-out failed with "unknown flag" and cobra's exit 1 got wrapped into
+// exit 4 (operational error) instead of the cap-hit's exit 3. The
+// iteration-cap escalation was never recorded, so every subsequent patrol
+// re-detected the uncapped condition and re-filed by hand (~20 near-
+// identical HIGH mails for one underlying problem). This walks the built
+// argv against escalateCmd's real flag set so a rename on either side fails
+// here instead of silently breaking the shell-out again.
+func TestEscalateReviewLoopCapArgs(t *testing.T) {
+	args := escalateReviewLoopCapArgs("cap hit description", "thread json", "dispatch-review-fix:cap:hga-wisp-i34")
+
+	if args[0] != "escalate" {
+		t.Fatalf("args[0] = %q; want %q", args[0], "escalate")
+	}
+
+	for _, banned := range []string{"--mail", "--context"} {
+		if reviewFixArgsContain(args, banned) {
+			t.Errorf("args contains unsupported flag %q: %v", banned, args)
+		}
+	}
+
+	for _, want := range []string{"--source", "--reason", "--fingerprint"} {
+		if !reviewFixArgsContain(args, want) {
+			t.Errorf("args missing expected flag %q: %v", want, args)
+		}
+	}
+
+	// Every long flag used must exist on the real escalate command.
+	for _, a := range args {
+		if name, ok := strings.CutPrefix(a, "--"); ok {
+			if escalateCmd.Flags().Lookup(name) == nil {
+				t.Errorf("args uses flag %q which escalate.go does not define", a)
+			}
+		}
+	}
+
+	if got := args[len(args)-1]; got != "cap hit description" {
+		t.Errorf("last arg = %q; want trailing positional description", got)
+	}
+}
+
+// TestEscalateReviewLoopCapArgs_FingerprintDedupes pins the secondary fix:
+// a non-empty fingerprint suffix must reach `gt escalate` so repeat cap-hits
+// on the same MR dedupe into one escalation bead instead of filing N per
+// patrol cycle.
+func TestEscalateReviewLoopCapArgs_FingerprintDedupes(t *testing.T) {
+	args := escalateReviewLoopCapArgs("desc", "reason", "dispatch-review-fix:cap:hga-wisp-i34")
+	for i, a := range args {
+		if a == "--fingerprint" {
+			if i+1 >= len(args) || args[i+1] != "dispatch-review-fix:cap:hga-wisp-i34" {
+				t.Errorf("args = %v; want --fingerprint followed by the given suffix", args)
+			}
+			return
+		}
+	}
+	t.Errorf("args missing --fingerprint: %v", args)
+}
+
+func TestEscalateReviewLoopCapArgs_EmptyFingerprintOmitted(t *testing.T) {
+	args := escalateReviewLoopCapArgs("desc", "reason", "")
+	if reviewFixArgsContain(args, "--fingerprint") {
+		t.Errorf("args should omit --fingerprint when suffix is empty: %v", args)
+	}
+}
+
+func reviewFixArgsContain(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
