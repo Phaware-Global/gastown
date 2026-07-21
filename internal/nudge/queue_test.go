@@ -609,6 +609,96 @@ func TestEnqueueRejectsWhenFullOfLiveEntries(t *testing.T) {
 	}
 }
 
+// TestGCExpiredSkipsClaimed verifies that gcExpired never removes a .claimed
+// file, even one that would be expired. A .claimed file is mid-delivery —
+// DrainClaim already renamed it out of the .json namespace and owns its
+// lifecycle (its own orphan-claim sweep, gated on staleClaimThreshold, not on
+// ExpiresAt). gcExpired only ever matches the literal ".json" suffix, so an
+// in-flight claim must survive an Enqueue call that triggers a GC pass.
+func TestGCExpiredSkipsClaimed(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-gc-skips-claimed"
+	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", session)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a nudge currently claimed by some other in-flight Drain: an
+	// expired QueuedNudge whose file already carries the ".claimed.<suffix>"
+	// marker DrainClaim uses, so it is no longer named "*.json".
+	expired := QueuedNudge{
+		Sender:    "claimant",
+		Message:   "mid-delivery",
+		Timestamp: time.Now().Add(-time.Hour),
+		ExpiresAt: time.Now().Add(-time.Minute), // expired
+	}
+	data, err := json.Marshal(expired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimPath := filepath.Join(dir, "100.json.claimed.deadbeef")
+	if err := os.WriteFile(claimPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Any Enqueue call runs gcExpired first.
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "live-sender", Message: "live"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if _, statErr := os.Stat(claimPath); statErr != nil {
+		t.Errorf("claimed file should survive gcExpired even though expired, stat err = %v", statErr)
+	}
+}
+
+// TestGCExpiredSkipsZeroExpiry verifies that gcExpired never removes a queued
+// entry with a zero (unset) ExpiresAt. A zero time.Time is always "before
+// now", so without the explicit IsZero guard a never-expiring entry would be
+// purged on the very next Enqueue instead of being left to persist
+// indefinitely as intended.
+func TestGCExpiredSkipsZeroExpiry(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-gc-skips-zero-expiry"
+	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", session)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a queued nudge directly to disk with ExpiresAt left zero,
+	// bypassing Enqueue (which always fills in a default TTL) so the
+	// zero-value carve-out is exercised directly.
+	noExpiry := QueuedNudge{
+		Sender:    "system",
+		Message:   "never expires",
+		Timestamp: time.Now().Add(-time.Hour),
+		// ExpiresAt intentionally left zero.
+	}
+	data, err := json.Marshal(noExpiry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "100.json")
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "live-sender", Message: "live"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Errorf("zero-ExpiresAt entry should survive gcExpired, stat err = %v", statErr)
+	}
+
+	nudges, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(nudges) != 2 {
+		t.Fatalf("Drain returned %d nudges, want 2 (zero-expiry entry plus the live one)", len(nudges))
+	}
+}
+
 func TestDrainSweepsOrphanedClaims(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-test-orphans"
