@@ -193,3 +193,38 @@ func TestWorkEnvStopAndTeardown(t *testing.T) {
 	assert.Equal(t, "stop -t 30 gt-work-MyRig-furiosa", calls[0])
 	assert.Equal(t, "rm -f gt-work-MyRig-furiosa", calls[1])
 }
+
+func TestNewWorkEnv_SandboxedRefusesDockerSocket(t *testing.T) {
+	cfg := testWorkEnvConfig(t, "docker")
+	cfg.Sandboxed = true
+	cfg.MountDockerSocket = true
+	_, err := NewWorkEnv(cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "docker socket")
+}
+
+func TestWorkEnvPrepare_EndOfOptionsBeforeImage(t *testing.T) {
+	docker, logFile, _ := fakeDocker(t)
+	cfg := testWorkEnvConfig(t, docker)
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+	require.NoError(t, w.Prepare(context.Background()))
+	run := dockerCalls(t, logFile)[1]
+	assert.Contains(t, run, "-- "+cfg.Image+" "+idleEntrypoint,
+		"image must sit behind an end-of-options separator")
+}
+
+func TestWorkEnvPrepare_IdleEntrypointForwardsTERM(t *testing.T) {
+	docker, _, _ := fakeDocker(t)
+	cfg := testWorkEnvConfig(t, docker)
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+	require.NoError(t, w.Prepare(context.Background()))
+	script, err := os.ReadFile(filepath.Join(cfg.GTDir, "gt-idle.sh"))
+	require.NoError(t, err)
+	// PID 1 must forward TERM to the namespace and drain, not exit
+	// instantly (an instant exit SIGKILLs the exec'd agent with no grace).
+	assert.Contains(t, string(script), "kill -TERM -1")
+	assert.Contains(t, string(script), "trap term TERM INT")
+	assert.NotContains(t, string(script), "trap 'exit 0'")
+}

@@ -163,18 +163,21 @@ func (s *Supervisor) shutdown(reason StopReason) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
+	stopped := false
 	if s.cfg.StopWork != nil {
 		if err := s.cfg.StopWork(ctx); err != nil {
 			s.log.Warn("stopping work process", "err", err)
+		} else {
+			stopped = true
 		}
 	}
 
 	// The final flush may skip the quiescence guard ONLY when the writer was
-	// actually stopped (StopWork wired and ran): with no writer, there is
-	// nothing to capture mid-flush. When nothing supervises the writer yet,
-	// keep the debounce — a torn snapshot in the recovery ref is worse than
-	// spending one debounce window on the way out.
-	if s.cfg.StopWork != nil {
+	// provably stopped — StopWork wired AND returned success. A failed stop
+	// (docker daemon unreachable, stop timeout) means the writer may still
+	// be live, so the debounce stays on: a torn snapshot in the recovery ref
+	// is worse than spending one debounce window on the way out.
+	if stopped {
 		saved := s.cfg.Checkpointer.Debounce
 		s.cfg.Checkpointer.Debounce = 0
 		defer func() { s.cfg.Checkpointer.Debounce = saved }()
