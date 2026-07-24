@@ -97,6 +97,41 @@ func randomSuffix() string {
 	return hex.EncodeToString(b[:])
 }
 
+// gcExpired removes queued (unclaimed) nudges past their ExpiresAt from dir.
+// It runs on every Enqueue call so that dead entries never occupy cap space —
+// nothing else drains a queue belonging to a long-lived agent that never
+// calls Drain, so without this the cap wedges permanently full of expired
+// messages and every subsequent Enqueue is silently refused (gt-770z).
+//
+// Only .json (unclaimed) entries are considered: a .claimed file is already
+// mid-delivery to some caller and is handled by the orphan-claim sweep in
+// DrainClaim, not here. Malformed entries are left alone — that cleanup is
+// DrainClaim's job, not the cap check's.
+func gcExpired(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var n QueuedNudge
+		if err := json.Unmarshal(data, &n); err != nil {
+			continue
+		}
+		if !n.ExpiresAt.IsZero() && now.After(n.ExpiresAt) {
+			_ = os.Remove(path)
+		}
+	}
+}
+
 // Enqueue writes a nudge to the queue for the given session.
 // The nudge will be picked up by the agent's hook at the next turn boundary.
 // Returns an error if the queue is full (MaxQueueDepth reached).
@@ -105,6 +140,10 @@ func Enqueue(townRoot, session string, nudge QueuedNudge) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("creating nudge queue dir: %w", err)
 	}
+
+	// GC expired entries before enforcing the cap: an entry past its expiry
+	// must never occupy cap space and block a live message.
+	gcExpired(dir)
 
 	// Check queue depth before writing to prevent runaway senders.
 	maxDepth := nudgeConfig(townRoot).MaxQueueDepthV()
