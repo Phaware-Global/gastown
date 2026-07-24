@@ -3,12 +3,14 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -121,4 +123,46 @@ func TestRunCommand_StripsHostileSessionEnv(t *testing.T) {
 		require.Equal(t, 0, code)
 		assert.Equal(t, "session= role=", stdout)
 	})
+}
+
+func TestRigPrefix_WarnsOnceWhenRigsJSONMissing(t *testing.T) {
+	lc := &logCapture{}
+	townRoot := t.TempDir()
+	srv, err := New(Config{
+		AllowedCommands: []string{"echo"},
+		TownRoot:        townRoot,
+		Logger:          slog.New(lc),
+	}, nil)
+	require.NoError(t, err)
+
+	// Missing everywhere: default prefix, and exactly one warning even
+	// across repeated refreshes.
+	assert.Equal(t, "gt", srv.rigPrefix("MyRig"))
+	srv.prefixMu.Lock()
+	srv.prefixAt = time.Time{} // force the next call to refresh again
+	srv.prefixMu.Unlock()
+	assert.Equal(t, "gt", srv.rigPrefix("MyRig"))
+
+	entry, found := lc.findEntry(slog.LevelWarn, "rigs.json not found (checked mayor/rigs.json and town root) — all derived GT_SESSION values fall back to the default rig prefix; polecats on custom-prefix rigs will not heartbeat")
+	require.True(t, found, "missing rigs.json must be warned about")
+	assert.Equal(t, townRoot, entry.attrs["townRoot"])
+	lc.mu.Lock()
+	warns := 0
+	for _, e := range lc.entries {
+		if e.level == slog.LevelWarn {
+			warns++
+		}
+	}
+	lc.mu.Unlock()
+	assert.Equal(t, 1, warns, "warning must be edge-triggered, not per-refresh")
+
+	// rigs.json appears: prefixes restore and the recovery is noted.
+	require.NoError(t, os.WriteFile(filepath.Join(townRoot, "rigs.json"),
+		[]byte(`{"rigs":{"MyRig":{"beads":{"prefix":"mr"}}}}`), 0644))
+	srv.prefixMu.Lock()
+	srv.prefixAt = time.Time{}
+	srv.prefixMu.Unlock()
+	assert.Equal(t, "mr", srv.rigPrefix("MyRig"))
+	_, found = lc.findEntry(slog.LevelInfo, "rigs.json found again — rig prefixes restored")
+	assert.True(t, found)
 }
