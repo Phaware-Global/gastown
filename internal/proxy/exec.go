@@ -107,7 +107,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		execCtx, cancel = context.WithTimeout(execCtx, s.execTimeout)
 		defer cancel()
 	}
-	out, errOut, exitCode := runCommand(execCtx, argv, identity, envOverride)
+	out, errOut, exitCode := runCommand(execCtx, argv, identity, s.sessionIdentityEnv(identity), envOverride)
 
 	// Audit log (do not log full argv — it may contain tokens or secrets).
 	if exitCode == 0 {
@@ -210,7 +210,7 @@ func (s *Server) limiterFor(identity string) *rate.Limiter {
 	return v.(*rate.Limiter)
 }
 
-func runCommand(ctx context.Context, argv []string, identity string, envOverride ...[]string) (stdout, stderr string, exitCode int) {
+func runCommand(ctx context.Context, argv []string, identity string, sessionEnv []string, envOverride ...[]string) (stdout, stderr string, exitCode int) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	var outBuf, errBuf strings.Builder
 	cmd.Stdout = &outBuf
@@ -226,6 +226,13 @@ func runCommand(ctx context.Context, argv []string, identity string, envOverride
 		env = stripEnvKey(env, "GT_PROXY_IDENTITY")
 		env = append(env, "GT_PROXY_IDENTITY="+identity)
 	}
+	// Trusted session-identity env, derived server-side from the client cert
+	// (session_env.go). Strip the keys from the base env unconditionally so
+	// they can only ever carry the authenticated identity — this is what lets
+	// a REMOTE polecat's proxied gt calls heartbeat its host-side session
+	// (remote-polecat-execution.md §8.1).
+	env = stripEnvKeys(env, sessionIdentityEnvKeys)
+	env = append(env, sessionEnv...)
 	cmd.Env = env
 	err := cmd.Run()
 	if err != nil {
