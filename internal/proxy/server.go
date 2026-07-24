@@ -550,11 +550,21 @@ func (s *Server) handleSignCSR(w http.ResponseWriter, r *http.Request) {
 		ttl = parsed
 	}
 
+	// Identity components must use a safe charset: '/' is the separator
+	// cnToIdentity emits (so a '/' inside rig or name lets two distinct pairs
+	// collide on one authz identity), and control/whitespace chars have no
+	// business in a cert CN.
+	if !validIdentityComponent(req.Rig) || !validIdentityComponent(req.Name) {
+		http.Error(w, "bad request: rig and name must match [A-Za-z0-9_.-]+", http.StatusBadRequest)
+		return
+	}
 	cn := "gt-" + req.Rig + "-" + req.Name
-	// The CN must round-trip through the gt-<rig>-<name> parser every authz
-	// consumer uses (cnToIdentity splits on the LAST hyphen). A hyphen in rig
-	// or name would mint a cert whose parsed identity differs from the pair
-	// validated here — identity confusion, not just a formatting nit.
+	// The CN must also round-trip through the gt-<rig>-<name> parser every
+	// authz consumer uses (cnToIdentity splits on the LAST hyphen). A hyphen
+	// in the NAME would mint a cert whose parsed identity differs from the
+	// pair validated here — identity confusion, not just a formatting nit.
+	// With the charset check above, this makes the CN space injective for
+	// issuable pairs.
 	if cnToIdentity(cn) != req.Rig+"/"+req.Name {
 		http.Error(w, "bad request: rig/name do not round-trip through the gt-<rig>-<name> identity format (hyphenated names are ambiguous)", http.StatusBadRequest)
 		return
@@ -585,6 +595,23 @@ func (s *Server) handleSignCSR(w http.ResponseWriter, r *http.Request) {
 		Serial:    leaf.SerialNumber.Text(16),
 		ExpiresAt: leaf.NotAfter.UTC().Format(time.RFC3339),
 	})
+}
+
+// validIdentityComponent reports whether s is non-empty and contains only
+// [A-Za-z0-9_.-] — safe for embedding in a gt-<rig>-<name> CN.
+func validIdentityComponent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '_', r == '.', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // denyCertRequest is the JSON body for POST /v1/admin/deny-cert.

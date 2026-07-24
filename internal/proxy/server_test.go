@@ -961,6 +961,27 @@ func TestAdminSignCSREndpoint(t *testing.T) {
 		assert.Equal(t, "gt-a-b-c", result.CN)
 	})
 
+	t.Run("slash or unsafe chars in rig/name return 400", func(t *testing.T) {
+		// '/' is the identity separator cnToIdentity emits: (a/b, c) and
+		// (a, b/c) would both parse to authz identity "a/b/c" while passing
+		// the round-trip check, so the charset guard must reject them.
+		for _, tc := range []struct{ rig, name string }{
+			{"a/b", "c"},
+			{"a", "b/c"},
+			{"a b", "c"},
+			{"a", "c\n"},
+		} {
+			csrPEM, _ := testCSRWithKey(t, "gt-"+tc.rig+"-"+tc.name)
+			req, err := json.Marshal(map[string]string{
+				"rig": tc.rig, "name": tc.name, "csr": string(csrPEM),
+			})
+			require.NoError(t, err)
+			resp := postJSON(t, string(req))
+			resp.Body.Close()
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "rig=%q name=%q", tc.rig, tc.name)
+		}
+	})
+
 	t.Run("CN mismatch returns 400", func(t *testing.T) {
 		csrPEM, _ := testCSRWithKey(t, "gt-OtherRig-impostor")
 		req, err := json.Marshal(map[string]string{
