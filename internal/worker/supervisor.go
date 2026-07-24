@@ -79,6 +79,11 @@ func NewSupervisor(cfg SupervisorConfig) *Supervisor {
 	if cfg.DeadmanAfter > 0 && cfg.OpTimeout > cfg.DeadmanAfter/2 {
 		cfg.OpTimeout = cfg.DeadmanAfter / 2
 	}
+	// Floor after the clamp: integer division of a pathological DeadmanAfter
+	// (1ns) would zero the per-op deadline and cancel every op instantly.
+	if cfg.OpTimeout <= 0 {
+		cfg.OpTimeout = cfg.Interval
+	}
 	return &Supervisor{cfg: cfg, log: cfg.Log}
 }
 
