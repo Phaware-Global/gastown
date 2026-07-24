@@ -551,6 +551,14 @@ func (s *Server) handleSignCSR(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cn := "gt-" + req.Rig + "-" + req.Name
+	// The CN must round-trip through the gt-<rig>-<name> parser every authz
+	// consumer uses (cnToIdentity splits on the LAST hyphen). A hyphen in rig
+	// or name would mint a cert whose parsed identity differs from the pair
+	// validated here — identity confusion, not just a formatting nit.
+	if cnToIdentity(cn) != req.Rig+"/"+req.Name {
+		http.Error(w, "bad request: rig/name do not round-trip through the gt-<rig>-<name> identity format (hyphenated names are ambiguous)", http.StatusBadRequest)
+		return
+	}
 	certPEM, err := s.ca.SignPolecatCSR([]byte(req.CSR), cn, ttl)
 	if err != nil {
 		http.Error(w, "failed to sign csr: "+err.Error(), http.StatusBadRequest)

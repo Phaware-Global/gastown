@@ -33,6 +33,7 @@ func main() {
 		proxyURL = flag.String("proxy-url", "", "host proxy base URL, e.g. https://gt-host.example:9876 (required)")
 		signURL  = flag.String("sign-url", "http://127.0.0.1:9877", "proxy admin base URL for CSR signing")
 		listen   = flag.String("relay-listen", "127.0.0.1:9899", "local relay listen address (see design §6.1.1 for container networking)")
+		allowLAN = flag.Bool("allow-non-loopback-relay", false, "permit a non-loopback relay listen address (bridge-gateway wiring; MUST be firewalled to the container subnet — anything that reaches the relay acts as this polecat)")
 		stateDir = flag.String("state-dir", "", "identity/state directory (default: /dev/shm/gt-worker or $TMPDIR/gt-worker)")
 		ttl      = flag.String("cert-ttl", "", "requested cert TTL (empty = server default)")
 	)
@@ -72,16 +73,15 @@ func main() {
 		log.Error("relay setup failed", "err", err)
 		os.Exit(1)
 	}
-
-	go func() {
-		<-ctx.Done()
-		log.Info("shutting down relay")
-		_ = relay.Close()
-	}()
+	relay.AllowNonLoopback = *allowLAN
+	if *allowLAN {
+		log.Warn("relay may bind a non-loopback address — anything that reaches it authenticates as this polecat; the address MUST be firewalled to the container bridge subnet", "listen", *listen)
+	}
 
 	log.Info("relay starting", "listen", *listen, "upstream", *proxyURL)
-	if err := relay.Serve(*listen); err != nil {
+	if err := relay.Serve(ctx, *listen); err != nil {
 		log.Error("relay error", "err", err)
 		os.Exit(1)
 	}
+	log.Info("relay stopped")
 }

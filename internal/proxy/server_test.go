@@ -933,6 +933,34 @@ func TestAdminSignCSREndpoint(t *testing.T) {
 		}
 	})
 
+	t.Run("identity must round-trip through the CN format", func(t *testing.T) {
+		// (rig="a", name="b-c") and (rig="a-b", name="c") both build CN
+		// "gt-a-b-c", which authz parses (last-hyphen split) as a-b/c. The
+		// round-trip guard rejects the pair whose parse would differ — a
+		// hyphenated NAME — making the CN space injective again. A
+		// hyphenated RIG parses back to itself and stays allowed.
+		csrPEM, _ := testCSRWithKey(t, "gt-a-b-c")
+
+		req, err := json.Marshal(map[string]string{
+			"rig": "a", "name": "b-c", "csr": string(csrPEM),
+		})
+		require.NoError(t, err)
+		resp := postJSON(t, string(req))
+		resp.Body.Close()
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "hyphenated name must be rejected")
+
+		req, err = json.Marshal(map[string]string{
+			"rig": "a-b", "name": "c", "csr": string(csrPEM),
+		})
+		require.NoError(t, err)
+		resp = postJSON(t, string(req))
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode, "hyphenated rig round-trips and stays allowed")
+		var result signCSRResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+		assert.Equal(t, "gt-a-b-c", result.CN)
+	})
+
 	t.Run("CN mismatch returns 400", func(t *testing.T) {
 		csrPEM, _ := testCSRWithKey(t, "gt-OtherRig-impostor")
 		req, err := json.Marshal(map[string]string{

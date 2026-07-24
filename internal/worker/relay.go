@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -19,9 +20,17 @@ import (
 //
 // The listen address is the §6.1.1 decision point: 127.0.0.1:9899 for
 // native/host-networking, the docker bridge gateway (or 0.0.0.0 firewalled
-// to the bridge subnet) for bridge-networked containers.
+// to the bridge subnet) for bridge-networked containers. Anything that can
+// reach the listener authenticates to the host proxy AS this polecat, so
+// non-loopback binds are refused unless AllowNonLoopback is set — and then
+// the address MUST be firewalled to the container bridge subnet.
 type Relay struct {
 	proxy *httputil.ReverseProxy
+
+	// AllowNonLoopback permits binding a non-loopback listen address (the
+	// §6.1.1 bridge-gateway wiring). Off by default: an open relay equals
+	// full control-plane impersonation of the polecat.
+	AllowNonLoopback bool
 
 	lnMu sync.Mutex
 	ln   net.Listener
@@ -54,10 +63,19 @@ func NewRelay(upstream string, id *Identity) (*Relay, error) {
 	return &Relay{proxy: rp}, nil
 }
 
-// Serve listens on listenAddr and blocks serving relay traffic until the
-// listener is closed via Close. It reports the bound address through Addr
-// once listening (listenAddr may use port 0 in tests).
-func (r *Relay) Serve(listenAddr string) error {
+// Serve listens on listenAddr and blocks serving relay traffic until ctx is
+// canceled or the listener is closed via Close. It reports the bound address
+// through Addr once listening (listenAddr may use port 0 in tests).
+//
+// Non-loopback listen addresses are refused unless AllowNonLoopback is set
+// (see the type comment).
+func (r *Relay) Serve(ctx context.Context, listenAddr string) error {
+	if !r.AllowNonLoopback {
+		if host, _, err := net.SplitHostPort(listenAddr); err != nil || host == "" || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
+			return fmt.Errorf("relay listen address %q is not a loopback IP: anything that reaches the relay acts as this polecat on the control plane — bind 127.0.0.1/::1, or set AllowNonLoopback for a bridge-gateway bind firewalled to the container subnet", listenAddr)
+		}
+	}
+
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return fmt.Errorf("relay listen: %w", err)
@@ -67,13 +85,30 @@ func (r *Relay) Serve(listenAddr string) error {
 	r.lnMu.Unlock()
 
 	srv := &http.Server{
-		Handler:     r.proxy,
-		ReadTimeout: 30 * time.Second,
-		// Generous write timeout for git fetch/push streams, matching the
-		// host proxy's own posture.
-		WriteTimeout: 5 * time.Minute,
-		IdleTimeout:  2 * time.Minute,
+		Handler: r.proxy,
+		// Bound only the header read: request and response BODIES are live
+		// git pack streams (push uploads, clone downloads) with no safe upper
+		// duration — an absolute Read/WriteTimeout would sever a large clone
+		// mid-stream. Slow-loris exposure is bounded by ReadHeaderTimeout +
+		// IdleTimeout plus the transport's own dial/TLS/response-header
+		// timeouts, on a loopback-by-default listener.
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
 	}
+
+	// Stop serving when ctx is canceled — including a ctx that was already
+	// canceled before the listener bound (a shutdown signal racing startup
+	// must not leave the relay serving forever).
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = r.Close()
+		case <-stop:
+		}
+	}()
+
 	err = srv.Serve(ln)
 	if err == http.ErrServerClosed || errors.Is(err, net.ErrClosed) {
 		return nil

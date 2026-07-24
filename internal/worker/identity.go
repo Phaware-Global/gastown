@@ -20,6 +20,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/lock"
 )
 
 // Signer obtains a signed polecat client cert for a worker-generated CSR.
@@ -57,6 +59,14 @@ func EnsureIdentity(ctx context.Context, dir, cn string, signer Signer) (*Identi
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("create identity dir: %w", err)
 	}
+	// Serialize concurrent enrollments on the same dir so interleaved writes
+	// can never pair one run's key with another run's cert.
+	unlock, err := lock.FlockAcquire(filepath.Join(dir, ".enroll.lock"))
+	if err != nil {
+		return nil, fmt.Errorf("lock identity dir: %w", err)
+	}
+	defer unlock()
+
 	id := &Identity{
 		CN:       cn,
 		CertFile: filepath.Join(dir, "client.crt"),
@@ -90,21 +100,33 @@ func EnsureIdentity(ctx context.Context, dir, cn string, signer Signer) (*Identi
 	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 
+	// Temp+rename per file so a crash never leaves a truncated file; the
+	// flock above keeps whole enrollments from interleaving across runs.
 	// Key first (0600), then cert + CA; a crash mid-way just re-enrolls.
-	if err := os.WriteFile(id.KeyFile, keyPEM, 0600); err != nil {
+	if err := writeFileAtomic(id.KeyFile, keyPEM, 0600); err != nil {
 		return nil, fmt.Errorf("write key: %w", err)
 	}
-	if err := os.WriteFile(id.CertFile, certPEM, 0644); err != nil {
+	if err := writeFileAtomic(id.CertFile, certPEM, 0644); err != nil {
 		return nil, fmt.Errorf("write cert: %w", err)
 	}
-	if err := os.WriteFile(id.CAFile, caPEM, 0644); err != nil {
+	if err := writeFileAtomic(id.CAFile, caPEM, 0644); err != nil {
 		return nil, fmt.Errorf("write ca: %w", err)
 	}
 	return id, nil
 }
 
+// writeFileAtomic writes data to a temp sibling and renames it into place.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
 // reusable reports whether id's on-disk cert matches cn, still has
-// renewBefore validity left, and pairs with its on-disk key.
+// renewBefore validity left, chains to the on-disk CA, and pairs with its
+// on-disk key.
 func reusable(id *Identity, cn string) bool {
 	certPEM, err := os.ReadFile(id.CertFile)
 	if err != nil {
@@ -121,7 +143,23 @@ func reusable(id *Identity, cn string) bool {
 	if leaf.Subject.CommonName != cn || time.Until(leaf.NotAfter) < renewBefore {
 		return false
 	}
-	if _, err := os.Stat(id.CAFile); err != nil {
+	// The leaf must chain to the CURRENT on-disk CA. If the proxy's CA rotated
+	// (e.g. its ca dir was regenerated after a host rebuild), a cached leaf
+	// passes every other local check yet fails every mTLS handshake — a CA
+	// mismatch must force re-enrollment, not silent reuse.
+	caPEM, err := os.ReadFile(id.CAFile)
+	if err != nil {
+		return false
+	}
+	caBlock, _ := pem.Decode(caPEM)
+	if caBlock == nil || caBlock.Type != "CERTIFICATE" {
+		return false
+	}
+	caCert, err := x509.ParseCertificate(caBlock.Bytes)
+	if err != nil {
+		return false
+	}
+	if err := leaf.CheckSignatureFrom(caCert); err != nil {
 		return false
 	}
 	// Confirm cert and key agree (also validates the key parses).

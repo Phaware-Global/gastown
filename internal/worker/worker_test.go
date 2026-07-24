@@ -2,7 +2,11 @@ package worker
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
 	"net"
@@ -119,7 +123,7 @@ func TestRelay_EndToEndExecThroughProxy(t *testing.T) {
 	relay, err := NewRelay("https://"+mainAddr, id)
 	require.NoError(t, err)
 	done := make(chan error, 1)
-	go func() { done <- relay.Serve("127.0.0.1:0") }()
+	go func() { done <- relay.Serve(context.Background(), "127.0.0.1:0") }()
 	t.Cleanup(func() {
 		_ = relay.Close()
 		select {
@@ -173,4 +177,80 @@ func TestAdminSigner_ErrorSurfacesServerMessage(t *testing.T) {
 	_, err := EnsureIdentity(context.Background(), t.TempDir(), "gt-MyRig-furiosa", signer)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "does not match")
+}
+
+func TestEnsureIdentity_ReEnrollsOnCARotation(t *testing.T) {
+	dir := t.TempDir()
+
+	// Enroll against proxy A.
+	_, adminA := startProxy(t)
+	signerA := &AdminSigner{AdminURL: "http://" + adminA, Rig: "MyRig", Name: "furiosa"}
+	_, err := EnsureIdentity(context.Background(), dir, "gt-MyRig-furiosa", signerA)
+	require.NoError(t, err)
+
+	// Simulate CA rotation: a different proxy (fresh CA) signs from now on,
+	// and its CA lands in the identity dir the way a provider channel would
+	// deliver it — by overwriting ca.crt.
+	_, adminB := startProxy(t)
+	signerB := &AdminSigner{AdminURL: "http://" + adminB, Rig: "MyRig", Name: "furiosa"}
+	certPEM, caPEM, err := signerB.SignCSR(context.Background(), testWorkerCSR(t, "gt-MyRig-furiosa"))
+	require.NoError(t, err)
+	_ = certPEM
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "ca.crt"), caPEM, 0644))
+
+	// The cached leaf (signed by CA A) no longer chains to the on-disk CA (B):
+	// EnsureIdentity must re-enroll, not reuse.
+	oldCert, err := os.ReadFile(filepath.Join(dir, "client.crt"))
+	require.NoError(t, err)
+	id, err := EnsureIdentity(context.Background(), dir, "gt-MyRig-furiosa", signerB)
+	require.NoError(t, err)
+	newCert, err := os.ReadFile(id.CertFile)
+	require.NoError(t, err)
+	assert.NotEqual(t, oldCert, newCert, "stale-CA identity must re-enroll")
+}
+
+// testWorkerCSR builds a throwaway CSR for cn (key discarded — only used to
+// drive a signer).
+func testWorkerCSR(t *testing.T, cn string) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	der, err := x509.CreateCertificateRequest(rand.Reader,
+		&x509.CertificateRequest{Subject: pkix.Name{CommonName: cn}}, key)
+	require.NoError(t, err)
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
+}
+
+func TestRelay_RefusesNonLoopbackListenByDefault(t *testing.T) {
+	mainAddr, adminAddr := startProxy(t)
+	signer := &AdminSigner{AdminURL: "http://" + adminAddr, Rig: "MyRig", Name: "furiosa"}
+	id, err := EnsureIdentity(context.Background(), t.TempDir(), "gt-MyRig-furiosa", signer)
+	require.NoError(t, err)
+
+	relay, err := NewRelay("https://"+mainAddr, id)
+	require.NoError(t, err)
+	err = relay.Serve(context.Background(), "0.0.0.0:0")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "loopback")
+}
+
+func TestRelay_ServeStopsOnPreCanceledContext(t *testing.T) {
+	mainAddr, adminAddr := startProxy(t)
+	signer := &AdminSigner{AdminURL: "http://" + adminAddr, Rig: "MyRig", Name: "furiosa"}
+	id, err := EnsureIdentity(context.Background(), t.TempDir(), "gt-MyRig-furiosa", signer)
+	require.NoError(t, err)
+
+	relay, err := NewRelay("https://"+mainAddr, id)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // shutdown signal wins the race before the listener binds
+	done := make(chan error, 1)
+	go func() { done <- relay.Serve(ctx, "127.0.0.1:0") }()
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not stop for a pre-canceled context")
+	}
 }
