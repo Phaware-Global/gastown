@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -22,26 +24,48 @@ const prefixCacheTTL = 30 * time.Second
 
 // rigPrefix returns the session-name prefix for a rig, reading rigs.json
 // through a TTL cache so the long-running proxy tracks newly added rigs.
+//
+// This sits on the exec hot path, so the file I/O of a refresh happens
+// OUTSIDE the lock (two goroutines racing a refresh just build twice — the
+// build is a read-only file parse), and reads take only an RLock. The proxy
+// never calls BuildPrefixRegistryFromTown, whose copyFileIfNewer side effect
+// would make a daemon request path write into town state.
 func (s *Server) rigPrefix(rig string) string {
-	s.prefixMu.Lock()
-	if s.prefixReg == nil || time.Since(s.prefixAt) > prefixCacheTTL {
-		reg, err := session.BuildPrefixRegistryFromTown(s.cfg.TownRoot)
+	s.prefixMu.RLock()
+	reg, at := s.prefixReg, s.prefixAt
+	s.prefixMu.RUnlock()
+
+	if reg == nil || time.Since(at) > prefixCacheTTL {
+		fresh, err := s.buildPrefixRegistry()
 		if err != nil {
-			// Keep a previously good registry on transient read errors;
-			// otherwise fall through with nil and use the default prefix.
+			// Keep a previously good registry on transient read errors.
 			s.log.Warn("could not build rig prefix registry", "err", err)
-			reg = s.prefixReg
+			fresh = reg
 		}
-		s.prefixReg = reg
+		s.prefixMu.Lock()
+		// Another goroutine may have refreshed while we built; last write
+		// wins — both saw current file contents.
+		s.prefixReg = fresh
 		s.prefixAt = time.Now()
+		reg = fresh
+		s.prefixMu.Unlock()
 	}
-	reg := s.prefixReg
-	s.prefixMu.Unlock()
 
 	if reg == nil {
 		return session.DefaultPrefix
 	}
 	return reg.PrefixForRig(rig)
+}
+
+// buildPrefixRegistry reads rigs.json read-only: canonical mayor/rigs.json
+// first, town-root fallback second — the same preference as
+// session.BuildPrefixRegistryFromTown, minus its fallback-copy write.
+func (s *Server) buildPrefixRegistry() (*session.PrefixRegistry, error) {
+	canonical := filepath.Join(s.cfg.TownRoot, "mayor", "rigs.json")
+	if _, err := os.Stat(canonical); err == nil {
+		return session.BuildPrefixRegistryFromFile(canonical)
+	}
+	return session.BuildPrefixRegistryFromFile(filepath.Join(s.cfg.TownRoot, "rigs.json"))
 }
 
 // sessionIdentityEnv derives the trusted session env for an authenticated
@@ -88,7 +112,7 @@ func stripEnvKeys(env []string, keys []string) []string {
 // prefixCache is embedded in Server: the TTL-cached rigs.json prefix
 // registry used to derive session names from authenticated identities.
 type prefixCache struct {
-	prefixMu  sync.Mutex
+	prefixMu  sync.RWMutex
 	prefixReg *session.PrefixRegistry
 	prefixAt  time.Time
 }
