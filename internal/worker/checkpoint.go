@@ -149,12 +149,15 @@ func (c *Checkpointer) Checkpoint(ctx context.Context) (pushed bool, err error) 
 	if _, err := c.git(ctx, nil, "update-ref", "--", c.Ref, commit); err != nil {
 		return false, err
 	}
-	c.lastTree = tree
 
 	if _, err := c.git(ctx, nil, "push", "--force", "--", c.remote(),
 		c.Ref+":"+c.Ref); err != nil {
+		// lastTree is deliberately NOT recorded on a failed push: the same
+		// tree must be retried next tick until it actually lands remotely
+		// (§9.6 — a push outage delays durability, it must not drop it).
 		return false, fmt.Errorf("checkpoint push (local ref %s updated): %w", c.Ref, err)
 	}
+	c.lastTree = tree
 	return true, nil
 }
 
