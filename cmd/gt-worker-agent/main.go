@@ -22,6 +22,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log/slog"
 	"net"
@@ -202,8 +203,10 @@ func main() {
 				// An operator shutdown signal during the prep window cancels
 				// the in-flight docker calls — that is a normal interrupt,
 				// not a preparation fault; the supervisor's StopInterrupted
-				// path drives the clean exit.
-				if ctx.Err() != nil {
+				// path drives the clean exit. Only an error that actually
+				// wraps the cancellation counts: a genuine fault racing the
+				// signal keeps its exit-1 diagnostics.
+				if errors.Is(err, context.Canceled) {
 					log.Info("work environment preparation interrupted by shutdown")
 					return
 				}

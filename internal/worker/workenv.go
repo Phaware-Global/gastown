@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -137,12 +138,25 @@ func (w *WorkEnv) ProxyURL() string {
 }
 
 // docker runs the docker CLI, returning trimmed stdout.
+//
+// Cancellation attribution: exec's kill produces "signal: killed", which does
+// NOT wrap context.Canceled — so when the context is canceled AND the process
+// died by signal (never exited on its own), the returned error wraps the
+// context cause instead, letting callers errors.Is-classify an interrupt. A
+// genuine docker failure (nonzero exit) keeps its own error even if the
+// context is canceled concurrently.
 func (w *WorkEnv) docker(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, w.cfg.Docker, args...)
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			var ee *exec.ExitError
+			if !errors.As(err, &ee) || !ee.Exited() {
+				return "", fmt.Errorf("%s %s: %w", w.cfg.Docker, strings.Join(args, " "), context.Cause(ctx))
+			}
+		}
 		return "", fmt.Errorf("%s %s: %w: %s", w.cfg.Docker, strings.Join(args, " "), err, strings.TrimSpace(errb.String()))
 	}
 	return strings.TrimSpace(out.String()), nil
@@ -168,6 +182,11 @@ func (w *WorkEnv) Prepare(ctx context.Context) error {
 # and forward TERM to the exec'd processes with a drain window on stop.
 term() {
 	kill -TERM -1 2>/dev/null
+	# Reap our own children (the backgrounded sleep) immediately so the
+	# only-PID-1-left check below doesn't wait on zombies; orphaned agent
+	# descendants reparent to us and are reaped by the shell as they exit.
+	wait 2>/dev/null
+	# Drain window: ~25s inside docker stop's 30s grace, then exit anyway.
 	i=0
 	while [ "$i" -lt 25 ]; do
 		set -- /proc/[0-9]*
