@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -96,5 +97,28 @@ func TestSessionIdentityEnvUnit(t *testing.T) {
 		env := []string{"HOME=/h", "GT_SESSION=evil", "GT_RIG=evil", "PATH=/p", "GT_ROLE=evil", "GT_POLECAT=evil", "GT_SESSIONX=keep"}
 		got := stripEnvKeys(env, sessionIdentityEnvKeys)
 		assert.Equal(t, []string{"HOME=/h", "PATH=/p", "GT_SESSIONX=keep"}, got)
+	})
+}
+
+// TestRunCommand_StripsHostileSessionEnv exercises the strip+inject in
+// runCommand itself: a hostile GT_SESSION already present in the base/override
+// env (the path minimalEnv would never produce, but the bd-create env
+// builders construct overrides) must not survive — the child sees the
+// server-derived identity value, or nothing at all.
+func TestRunCommand_StripsHostileSessionEnv(t *testing.T) {
+	printSession := []string{"sh", "-c", "printf '%s' \"session=$GT_SESSION role=$GT_ROLE\""}
+	hostile := []string{"PATH=" + os.Getenv("PATH"), "GT_SESSION=evil", "GT_ROLE=mayor"}
+
+	t.Run("hostile override is replaced by the derived identity", func(t *testing.T) {
+		derived := []string{"GT_SESSION=gt-furiosa", "GT_ROLE=polecat"}
+		stdout, _, code := runCommand(context.Background(), printSession, "MyRig/furiosa", derived, hostile)
+		require.Equal(t, 0, code)
+		assert.Equal(t, "session=gt-furiosa role=polecat", stdout)
+	})
+
+	t.Run("hostile override with no authenticated identity is stripped to nothing", func(t *testing.T) {
+		stdout, _, code := runCommand(context.Background(), printSession, "", nil, hostile)
+		require.Equal(t, 0, code)
+		assert.Equal(t, "session= role=", stdout)
 	})
 }
