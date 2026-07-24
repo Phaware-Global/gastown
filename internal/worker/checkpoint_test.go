@@ -133,7 +133,7 @@ func TestCheckpoint_SkipsWhenNotQuiescent(t *testing.T) {
 }
 
 func TestCheckpoint_PushFailureKeepsLocalRef(t *testing.T) {
-	wt, _, c := newCheckpointRepo(t)
+	wt, bare, c := newCheckpointRepo(t)
 	// Break the remote.
 	gitOut(t, wt, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "missing.git"))
 
@@ -146,6 +146,14 @@ func TestCheckpoint_PushFailureKeepsLocalRef(t *testing.T) {
 	// lost).
 	sha := gitOut(t, wt, "rev-parse", c.Ref)
 	assert.Equal(t, "v2", gitOut(t, wt, "show", sha+":main.go"))
+
+	// Restore the remote: the SAME tree must be retried and land — a failed
+	// push must not mark the tree as already checkpointed (§9.6).
+	gitOut(t, wt, "remote", "set-url", "origin", bare)
+	pushed, err = c.Checkpoint(context.Background())
+	require.NoError(t, err)
+	assert.True(t, pushed, "unchanged tree must be re-pushed after a push outage")
+	assert.Equal(t, "v2", gitOut(t, bare, "show", c.Ref+":main.go"))
 }
 
 func TestSupervisor_MaxRuntimeSelfReleaseWithFinalFlush(t *testing.T) {
