@@ -2,9 +2,15 @@ package proxy
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"io"
 	"log/slog"
 	"net"
@@ -832,5 +838,203 @@ func TestAdminIssueCertEndpoint(t *testing.T) {
 		// Default TTL is 720h (30 days). Allow some clock skew.
 		expectedExpiry := time.Now().Add(720 * time.Hour)
 		assert.WithinDuration(t, expectedExpiry, expiry, 5*time.Minute)
+	})
+}
+
+// testCSRWithKey generates an ECDSA P-256 key and a CSR for cn, returning the
+// PEM CSR and the PEM private key (unlike testCSR, which discards the key) so
+// callers can exercise the signed cert in a real mTLS handshake.
+func testCSRWithKey(t *testing.T, cn string) (csrPEM, keyPEM []byte) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	der, err := x509.CreateCertificateRequest(rand.Reader,
+		&x509.CertificateRequest{Subject: pkix.Name{CommonName: cn}}, key)
+	require.NoError(t, err)
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	require.NoError(t, err)
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+}
+
+// TestAdminSignCSREndpoint verifies the local admin HTTP endpoint for signing
+// worker-generated CSRs (the remote-worker cert path — no key transport).
+func TestAdminSignCSREndpoint(t *testing.T) {
+	dir := t.TempDir()
+	ca, err := GenerateCA(dir)
+	require.NoError(t, err)
+
+	srv, err := New(Config{
+		ListenAddr:      "127.0.0.1:0",
+		AdminListenAddr: "127.0.0.1:0",
+		AllowedCommands: []string{"echo"},
+		TownRoot:        t.TempDir(),
+		Logger:          discardLogger(),
+	}, ca)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	go func() { srv.Start(ctx) }() //nolint:errcheck
+
+	var mainAddr, adminAddr string
+	require.Eventually(t, func() bool {
+		if a := srv.Addr(); a != nil {
+			mainAddr = a.String()
+		}
+		if a := srv.AdminAddr(); a != nil {
+			adminAddr = a.String()
+		}
+		return mainAddr != "" && adminAddr != ""
+	}, 5*time.Second, 10*time.Millisecond)
+	waitForServer(t, mainAddr, 5*time.Second)
+	waitForServer(t, adminAddr, 5*time.Second)
+
+	adminClient := &http.Client{}
+	signURL := "http://" + adminAddr + "/v1/admin/sign-csr"
+
+	postJSON := func(t *testing.T, body string) *http.Response {
+		t.Helper()
+		resp, err := adminClient.Post(signURL, "application/json", strings.NewReader(body))
+		require.NoError(t, err)
+		return resp
+	}
+
+	t.Run("GET returns 405", func(t *testing.T) {
+		resp, err := adminClient.Get(signURL)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode)
+	})
+
+	t.Run("missing fields return 400", func(t *testing.T) {
+		for _, body := range []string{
+			`{"name":"rust","csr":"x"}`, // no rig
+			`{"rig":"MyRig","csr":"x"}`, // no name
+			`{"rig":"MyRig","name":"rust"}`, // no csr
+		} {
+			resp := postJSON(t, body)
+			resp.Body.Close()
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "body: %s", body)
+		}
+	})
+
+	t.Run("bad ttl returns 400", func(t *testing.T) {
+		csrPEM, _ := testCSRWithKey(t, "gt-MyRig-rust")
+		for _, ttl := range []string{"bogus", "-1h"} {
+			req, err := json.Marshal(map[string]string{
+				"rig": "MyRig", "name": "rust", "csr": string(csrPEM), "ttl": ttl,
+			})
+			require.NoError(t, err)
+			resp := postJSON(t, string(req))
+			resp.Body.Close()
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "ttl: %s", ttl)
+		}
+	})
+
+	t.Run("CN mismatch returns 400", func(t *testing.T) {
+		csrPEM, _ := testCSRWithKey(t, "gt-OtherRig-impostor")
+		req, err := json.Marshal(map[string]string{
+			"rig": "MyRig", "name": "rust", "csr": string(csrPEM),
+		})
+		require.NoError(t, err)
+		resp := postJSON(t, string(req))
+		resp.Body.Close()
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	})
+
+	t.Run("weak key returns 400", func(t *testing.T) {
+		rsaKey, err := rsa.GenerateKey(rand.Reader, 1024)
+		require.NoError(t, err)
+		der, err := x509.CreateCertificateRequest(rand.Reader,
+			&x509.CertificateRequest{Subject: pkix.Name{CommonName: "gt-MyRig-rust"}}, rsaKey)
+		require.NoError(t, err)
+		csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
+		req, err := json.Marshal(map[string]string{
+			"rig": "MyRig", "name": "rust", "csr": string(csrPEM),
+		})
+		require.NoError(t, err)
+		resp := postJSON(t, string(req))
+		resp.Body.Close()
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	})
+
+	t.Run("valid CSR signs a cert that works with the mTLS server, no key in response", func(t *testing.T) {
+		csrPEM, keyPEM := testCSRWithKey(t, "gt-MyRig-rust")
+		reqBody, err := json.Marshal(map[string]string{
+			"rig": "MyRig", "name": "rust", "csr": string(csrPEM), "ttl": "1h",
+		})
+		require.NoError(t, err)
+		resp := postJSON(t, string(reqBody))
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		raw, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		var result signCSRResponse
+		require.NoError(t, json.Unmarshal(raw, &result))
+		assert.Equal(t, "gt-MyRig-rust", result.CN)
+		assert.NotEmpty(t, result.Cert)
+		assert.NotEmpty(t, result.CA)
+		assert.NotEmpty(t, result.Serial)
+		// The CSR flow must never transport a private key.
+		assert.NotContains(t, string(raw), "PRIVATE KEY")
+
+		// The signed cert + the worker-held key complete an mTLS exec call.
+		clientCert, err := tls.X509KeyPair([]byte(result.Cert), keyPEM)
+		require.NoError(t, err)
+		pool := x509.NewCertPool()
+		require.True(t, pool.AppendCertsFromPEM([]byte(result.CA)))
+		mTLSClient := &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					Certificates: []tls.Certificate{clientCert},
+					RootCAs:      pool,
+				},
+			},
+		}
+		execResp, err := mTLSClient.Post(
+			"https://"+mainAddr+"/v1/exec",
+			"application/json",
+			strings.NewReader(`{"argv":["echo","hello"]}`),
+		)
+		require.NoError(t, err)
+		defer execResp.Body.Close()
+		assert.Equal(t, http.StatusOK, execResp.StatusCode)
+	})
+
+	t.Run("default ttl is DefaultRemoteCertTTL", func(t *testing.T) {
+		csrPEM, _ := testCSRWithKey(t, "gt-MyRig-furiosa")
+		reqBody, err := json.Marshal(map[string]string{
+			"rig": "MyRig", "name": "furiosa", "csr": string(csrPEM),
+		})
+		require.NoError(t, err)
+		resp := postJSON(t, string(reqBody))
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var result signCSRResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+		expiry, err := time.Parse(time.RFC3339, result.ExpiresAt)
+		require.NoError(t, err)
+		assert.WithinDuration(t, time.Now().Add(DefaultRemoteCertTTL), expiry, 5*time.Minute)
+	})
+
+	t.Run("huge ttl is clamped to MaxRemoteCertTTL", func(t *testing.T) {
+		csrPEM, _ := testCSRWithKey(t, "gt-MyRig-nux")
+		reqBody, err := json.Marshal(map[string]string{
+			"rig": "MyRig", "name": "nux", "csr": string(csrPEM), "ttl": "17520h",
+		})
+		require.NoError(t, err)
+		resp := postJSON(t, string(reqBody))
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var result signCSRResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+		expiry, err := time.Parse(time.RFC3339, result.ExpiresAt)
+		require.NoError(t, err)
+		assert.WithinDuration(t, time.Now().Add(MaxRemoteCertTTL), expiry, 5*time.Minute)
 	})
 }
