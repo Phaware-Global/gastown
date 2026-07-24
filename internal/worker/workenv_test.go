@@ -2,10 +2,12 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -227,4 +229,39 @@ func TestWorkEnvPrepare_IdleEntrypointForwardsTERM(t *testing.T) {
 	assert.Contains(t, string(script), "kill -TERM -1")
 	assert.Contains(t, string(script), "trap term TERM INT")
 	assert.NotContains(t, string(script), "trap 'exit 0'")
+}
+
+func TestWorkEnvDocker_CancellationAttribution(t *testing.T) {
+	dir := t.TempDir()
+	slow := filepath.Join(dir, "docker")
+	// A docker stand-in that hangs until killed.
+	require.NoError(t, os.WriteFile(slow, []byte("#!/bin/sh\nsleep 60\n"), 0755))
+	cfg := testWorkEnvConfig(t, slow)
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+
+	t.Run("kill under canceled ctx wraps context.Canceled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() { time.Sleep(100 * time.Millisecond); cancel() }()
+		_, err := w.docker(ctx, "run", "x")
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, context.Canceled), "signal-kill under canceled ctx must classify as cancellation, got: %v", err)
+	})
+
+	t.Run("genuine nonzero exit keeps its own error even with ctx canceled", func(t *testing.T) {
+		fail := filepath.Join(dir, "docker-fail")
+		require.NoError(t, os.WriteFile(fail, []byte("#!/bin/sh\necho boom >&2\nexit 3\n"), 0755))
+		cfgF := testWorkEnvConfig(t, fail)
+		wf, err := NewWorkEnv(cfgF)
+		require.NoError(t, err)
+		// A genuine nonzero exit keeps its own error and stderr. (The exact
+		// exited-nonzero-while-ctx-cancels race can't be sequenced
+		// deterministically — CommandContext's kill is untrappable — but the
+		// Exited() guard in docker() covers it; this pins the normal-fault
+		// path staying un-swallowed.)
+		_, err = wf.docker(context.Background(), "run", "x")
+		require.Error(t, err)
+		assert.False(t, errors.Is(err, context.Canceled))
+		assert.Contains(t, err.Error(), "boom")
+	})
 }
