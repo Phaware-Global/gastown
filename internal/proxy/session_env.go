@@ -51,7 +51,10 @@ func (s *Server) rigPrefix(rig string) string {
 		if err == nil && !found && !s.prefixMissingWarned {
 			s.log.Warn("rigs.json not found (checked mayor/rigs.json and town root) — all derived GT_SESSION values fall back to the default rig prefix; polecats on custom-prefix rigs will not heartbeat", "townRoot", s.cfg.TownRoot)
 			s.prefixMissingWarned = true
-		} else if found && s.prefixMissingWarned {
+		} else if err == nil && found && s.prefixMissingWarned {
+			// Recovery means SUCCESSFULLY rebuilt, not merely "a file exists":
+			// found=true with a non-nil err (malformed file, or deleted between
+			// Stat and read) is still degraded and must not clear the flag.
 			s.log.Info("rigs.json found again — rig prefixes restored")
 			s.prefixMissingWarned = false
 		}

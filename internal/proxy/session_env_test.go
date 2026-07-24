@@ -156,6 +156,17 @@ func TestRigPrefix_WarnsOnceWhenRigsJSONMissing(t *testing.T) {
 	lc.mu.Unlock()
 	assert.Equal(t, 1, warns, "warning must be edge-triggered, not per-refresh")
 
+	// Malformed rigs.json: found but not rebuilt — must NOT log "restored"
+	// or clear the degraded flag.
+	require.NoError(t, os.WriteFile(filepath.Join(townRoot, "rigs.json"), []byte("{not json"), 0644))
+	srv.prefixMu.Lock()
+	srv.prefixAt = time.Time{}
+	srv.prefixMu.Unlock()
+	assert.Equal(t, "gt", srv.rigPrefix("MyRig"))
+	if _, falseRestore := lc.findEntry(slog.LevelInfo, "rigs.json found again — rig prefixes restored"); falseRestore {
+		t.Fatal("malformed rigs.json must not log a false restore")
+	}
+
 	// rigs.json appears: prefixes restore and the recovery is noted.
 	require.NoError(t, os.WriteFile(filepath.Join(townRoot, "rigs.json"),
 		[]byte(`{"rigs":{"MyRig":{"beads":{"prefix":"mr"}}}}`), 0644))
