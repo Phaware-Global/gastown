@@ -97,6 +97,25 @@ func TestValidateReceivePackRefs(t *testing.T) {
 		require.Error(t, err)
 	})
 
+	t.Run("own checkpoint ref is allowed", func(t *testing.T) {
+		// remote-polecat-execution.md §9.2: the worker force-pushes
+		// refs/checkpoints/polecat/<name> through the proxy.
+		body := receivePackBody("refs/checkpoints/polecat/furiosa")
+		assert.NoError(t, validateReceivePackRefs(body, polecat))
+	})
+
+	t.Run("another polecat's checkpoint ref is denied", func(t *testing.T) {
+		body := receivePackBody("refs/checkpoints/polecat/nux")
+		err := validateReceivePackRefs(body, polecat)
+		require.Error(t, err)
+	})
+
+	t.Run("checkpoint ref with suffix is denied (exact name only)", func(t *testing.T) {
+		body := receivePackBody("refs/checkpoints/polecat/furiosa-extra")
+		err := validateReceivePackRefs(body, polecat)
+		require.Error(t, err)
+	})
+
 	t.Run("mixed valid and invalid returns error on first invalid", func(t *testing.T) {
 		body := receivePackBody(
 			"refs/heads/polecat/furiosa-ok",
