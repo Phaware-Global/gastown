@@ -910,8 +910,8 @@ func TestAdminSignCSREndpoint(t *testing.T) {
 
 	t.Run("missing fields return 400", func(t *testing.T) {
 		for _, body := range []string{
-			`{"name":"rust","csr":"x"}`, // no rig
-			`{"rig":"MyRig","csr":"x"}`, // no name
+			`{"name":"rust","csr":"x"}`,     // no rig
+			`{"rig":"MyRig","csr":"x"}`,     // no name
 			`{"rig":"MyRig","name":"rust"}`, // no csr
 		} {
 			resp := postJSON(t, body)
