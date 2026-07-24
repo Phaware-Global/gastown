@@ -45,6 +45,15 @@ type SupervisorConfig struct {
 	// no-op (nothing supervised yet).
 	StopWork func(ctx context.Context) error
 
+	// OpTimeout bounds each checkpoint/probe operation. This is what keeps a
+	// HUNG git (half-open connection on a silent network partition — packets
+	// dropped, no RST) from blocking the loop and starving the watchdog: the
+	// operation is killed at the deadline and control returns to the
+	// watchdog checks. 0 defaults to Interval, clamped to DeadmanAfter/2
+	// when a dead-man window is set so a hung op can never eat the whole
+	// window.
+	OpTimeout time.Duration
+
 	Log *slog.Logger
 }
 
@@ -63,6 +72,12 @@ func NewSupervisor(cfg SupervisorConfig) *Supervisor {
 	}
 	if cfg.DeadmanAfter == 0 {
 		cfg.DeadmanAfter = 4 * cfg.Interval
+	}
+	if cfg.OpTimeout <= 0 {
+		cfg.OpTimeout = cfg.Interval
+	}
+	if cfg.DeadmanAfter > 0 && cfg.OpTimeout > cfg.DeadmanAfter/2 {
+		cfg.OpTimeout = cfg.DeadmanAfter / 2
 	}
 	return &Supervisor{cfg: cfg, log: cfg.Log}
 }
@@ -92,8 +107,11 @@ loop:
 		case <-ticker.C:
 		}
 
-		// Watchdog checks first, so a wedged checkpoint path cannot starve
-		// them (§9.5: these are the cost/safety backstop).
+		// Watchdog checks run before the tick's checkpoint work, and every
+		// checkpoint/probe below is bounded by OpTimeout — together that is
+		// what makes starvation impossible: a hung git is killed at the
+		// deadline and control returns here within OpTimeout (§9.5: these
+		// are the cost/safety backstop).
 		if s.cfg.MaxRuntime > 0 && time.Since(start) >= s.cfg.MaxRuntime {
 			s.log.Warn("worker max_runtime reached — self-releasing", "cap", s.cfg.MaxRuntime)
 			reason = StopMaxRuntime
@@ -106,12 +124,13 @@ loop:
 			break loop
 		}
 
-		pushed, err := s.cfg.Checkpointer.Checkpoint(ctx)
+		opCtx, opCancel := context.WithTimeout(ctx, s.cfg.OpTimeout)
+		pushed, err := s.cfg.Checkpointer.Checkpoint(opCtx)
 		switch {
 		case err != nil:
-			// Push/remote failures feed the dead-man clock; everything keeps
-			// running — a push outage delays durability, never blocks work
-			// (§9.6).
+			// Push/remote failures (including OpTimeout kills of a hung git)
+			// feed the dead-man clock; everything keeps running — a push
+			// outage delays durability, never blocks work (§9.6).
 			s.log.Warn("checkpoint failed", "err", err)
 		case pushed:
 			s.log.Debug("checkpoint pushed")
@@ -119,12 +138,13 @@ loop:
 		default:
 			// Nothing to push: probe so an idle-but-healthy session still
 			// proves control-plane contact.
-			if err := s.cfg.Checkpointer.Probe(ctx); err != nil {
+			if err := s.cfg.Checkpointer.Probe(opCtx); err != nil {
 				s.log.Warn("control-plane probe failed", "err", err)
 			} else {
 				lastContact = time.Now()
 			}
 		}
+		opCancel()
 	}
 
 	s.shutdown(reason)
@@ -144,10 +164,16 @@ func (s *Supervisor) shutdown(reason StopReason) {
 		}
 	}
 
-	// Final flush ignores quiescence: capture whatever is there, now.
-	saved := s.cfg.Checkpointer.Debounce
-	s.cfg.Checkpointer.Debounce = 0
-	defer func() { s.cfg.Checkpointer.Debounce = saved }()
+	// The final flush may skip the quiescence guard ONLY when the writer was
+	// actually stopped (StopWork wired and ran): with no writer, there is
+	// nothing to capture mid-flush. When nothing supervises the writer yet,
+	// keep the debounce — a torn snapshot in the recovery ref is worse than
+	// spending one debounce window on the way out.
+	if s.cfg.StopWork != nil {
+		saved := s.cfg.Checkpointer.Debounce
+		s.cfg.Checkpointer.Debounce = 0
+		defer func() { s.cfg.Checkpointer.Debounce = saved }()
+	}
 	if pushed, err := s.cfg.Checkpointer.Checkpoint(ctx); err != nil {
 		s.log.Warn("final checkpoint flush failed (local ref may still hold it)", "reason", reason, "err", err)
 	} else if pushed {

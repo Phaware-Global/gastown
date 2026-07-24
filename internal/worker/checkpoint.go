@@ -70,16 +70,23 @@ func (c *Checkpointer) remote() string {
 // buildTree snapshots the tracked worktree state (current HEAD's tree plus
 // all tracked modifications/deletions) into a throwaway index and returns the
 // resulting tree hash. The agent's real index and HEAD are untouched.
+//
+// "Tracked" means tracked in HEAD: `add -u` only updates paths HEAD already
+// knows, so a NEW file the agent `git add`ed but has not yet committed
+// (staged-only) is NOT captured — that is the design's documented
+// untracked-but-wanted exception (§9.2), accepted so the checkpoint can never
+// sweep in untracked trees. TestCheckpoint_StagedNewFileNotCaptured pins the
+// boundary.
 func (c *Checkpointer) buildTree(ctx context.Context) (string, error) {
-	tmpIdx, err := os.CreateTemp("", "gt-checkpoint-index-*")
+	// The index lives in a private 0700 temp dir: git recreates index files
+	// with umask perms at whatever path GIT_INDEX_FILE names, so the
+	// directory provides the isolation a shared /tmp path would lose.
+	tmpDir, err := os.MkdirTemp("", "gt-checkpoint-*")
 	if err != nil {
-		return "", fmt.Errorf("temp index: %w", err)
+		return "", fmt.Errorf("temp index dir: %w", err)
 	}
-	tmpIdxPath := tmpIdx.Name()
-	_ = tmpIdx.Close()
-	_ = os.Remove(tmpIdxPath) // git will recreate it; we only claimed the name
-	defer os.Remove(tmpIdxPath)
-	idxEnv := []string{"GIT_INDEX_FILE=" + tmpIdxPath}
+	defer os.RemoveAll(tmpDir)
+	idxEnv := []string{"GIT_INDEX_FILE=" + filepath.Join(tmpDir, "index")}
 
 	if _, err := c.git(ctx, idxEnv, "read-tree", "HEAD"); err != nil {
 		return "", err
@@ -98,6 +105,13 @@ func (c *Checkpointer) buildTree(ctx context.Context) (string, error) {
 // is delayed, never lost locally — and the error is returned for the
 // caller's backoff/dead-man accounting (§9.6).
 func (c *Checkpointer) Checkpoint(ctx context.Context) (pushed bool, err error) {
+	// Guard against a misconfigured ref being parsed as a git option; the
+	// argv builders also use `--` end-of-options (defense-in-depth — Ref and
+	// Remote come from our own flags, never from relayed input).
+	if !strings.HasPrefix(c.Ref, "refs/") {
+		return false, fmt.Errorf("checkpoint ref %q must start with refs/", c.Ref)
+	}
+
 	tree, err := c.buildTree(ctx)
 	if err != nil {
 		return false, err
@@ -132,12 +146,12 @@ func (c *Checkpointer) Checkpoint(ctx context.Context) (pushed bool, err error) 
 	if err != nil {
 		return false, err
 	}
-	if _, err := c.git(ctx, nil, "update-ref", c.Ref, commit); err != nil {
+	if _, err := c.git(ctx, nil, "update-ref", "--", c.Ref, commit); err != nil {
 		return false, err
 	}
 	c.lastTree = tree
 
-	if _, err := c.git(ctx, nil, "push", "--force", c.remote(),
+	if _, err := c.git(ctx, nil, "push", "--force", "--", c.remote(),
 		c.Ref+":"+c.Ref); err != nil {
 		return false, fmt.Errorf("checkpoint push (local ref %s updated): %w", c.Ref, err)
 	}
@@ -148,7 +162,7 @@ func (c *Checkpointer) Checkpoint(ctx context.Context) (pushed bool, err error) 
 // reachable — used to feed the dead-man's switch on ticks with nothing to
 // push.
 func (c *Checkpointer) Probe(ctx context.Context) error {
-	_, err := c.git(ctx, nil, "ls-remote", "--heads", c.remote())
+	_, err := c.git(ctx, nil, "ls-remote", "--heads", "--", c.remote())
 	return err
 }
 
