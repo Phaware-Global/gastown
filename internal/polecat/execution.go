@@ -19,7 +19,8 @@ import (
 func rigExecutionConfig(rigPath string) *config.ExecutionConfig {
 	settings, err := config.LoadRigSettings(config.RigSettingsPath(rigPath))
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
+		// LoadRigSettings wraps a missing file as ErrNotFound, not os.ErrNotExist.
+		if !errors.Is(err, config.ErrNotFound) {
 			fmt.Fprintf(os.Stderr, "Warning: could not load rig settings for execution config: %v\n", err)
 		}
 		return nil

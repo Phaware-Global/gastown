@@ -3166,7 +3166,8 @@ func (d *Daemon) rigMaxRuntime(rigPath string) time.Duration {
 	if err != nil {
 		// A missing settings file is normal (no cap). Any other error means a
 		// present-but-broken config silently disabling this safety rail — surface it.
-		if !errors.Is(err, os.ErrNotExist) {
+		// LoadRigSettings wraps a missing file as ErrNotFound, not os.ErrNotExist.
+		if !errors.Is(err, agentconfig.ErrNotFound) {
 			d.logger.Printf("Warning: could not load rig settings at %s for max_runtime cap: %v", rigPath, err)
 		}
 		return 0
