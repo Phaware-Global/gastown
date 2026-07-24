@@ -148,11 +148,12 @@ func TestRelay_EndToEndExecThroughProxy(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	var result struct {
-		ExitCode int    `json:"exit_code"`
+		ExitCode *int   `json:"exitCode"`
 		Stdout   string `json:"stdout"`
 	}
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
-	assert.Equal(t, 0, result.ExitCode)
+	require.NotNil(t, result.ExitCode, "exitCode missing from exec response")
+	assert.Equal(t, 0, *result.ExitCode)
 	assert.Contains(t, result.Stdout, "hello-through-relay")
 }
 
