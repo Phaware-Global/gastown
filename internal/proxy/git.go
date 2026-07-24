@@ -314,6 +314,7 @@ func validateReceivePackRefs(body []byte, cnName string) error {
 	// flush packet that terminates the ref list.  Any binary pack data that follows
 	// the flush packet is never read by this loop.
 	allowed := "refs/heads/polecat/" + cnName + "-"
+	checkpointRef := "refs/checkpoints/polecat/" + cnName
 	offset := 0
 	for offset < len(body) {
 		// Guard: need at least 4 bytes for the length field.
@@ -353,10 +354,14 @@ func validateReceivePackRefs(body []byte, cnName string) error {
 		}
 		ref := string(parts[2])
 
-		// Only allow refs/heads/polecat/<cnName>-* (prefix form).
-		// Exact-name pushes (without timestamp suffix) are not permitted.
-		if !strings.HasPrefix(ref, allowed) {
-			return fmt.Errorf("push to %q denied: only refs/heads/polecat/%s-* allowed", ref, cnName)
+		// Allowed refs for a polecat identity:
+		//   - refs/heads/polecat/<cnName>-* (prefix form; exact-name pushes
+		//     without the timestamp suffix are not permitted), and
+		//   - refs/checkpoints/polecat/<cnName>, the polecat's own checkpoint
+		//     ref (remote-polecat-execution.md §9.2) — exact name only, so
+		//     one polecat can never move another's checkpoint.
+		if !strings.HasPrefix(ref, allowed) && ref != checkpointRef {
+			return fmt.Errorf("push to %q denied: only refs/heads/polecat/%s-* or %s allowed", ref, cnName, checkpointRef)
 		}
 	}
 	return nil
