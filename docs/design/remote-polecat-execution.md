@@ -68,6 +68,20 @@ interruptions, and releases the worker per a configured lifecycle.
 - Multi-town federation (see `federation.md`). This is single-town, single
   orchestrator, with remote *execution* only.
 - Replacing the local execution path. `local` remains the default backend.
+- **Remote execution of any role other than polecats.** Witness, refinery,
+  reviewer, deacon, mayor, and crew sessions continue to run on the
+  orchestrator host, launched by their existing session managers, regardless
+  of a rig's `execution` block — `execution.backend` governs **polecat
+  placement only**. This is deliberate, not an accident of scope: Witness is
+  the host-side recovery driver for remote polecats (§9.4) and must stay with
+  the daemon; refinery and reviewer hold host-local credentials and push refs
+  (e.g. the integration branch) that sit entirely outside the polecat
+  proxy-authorization model, so offloading them is a different problem with
+  its own identity, ref-authorization, and repo-access design. Polecats are
+  the 10–20× concurrency term this design exists to offload; the per-rig
+  fixed cost (one witness + refinery + reviewer) stays on the host. If that
+  fixed cost ever becomes the bottleneck, offloading those roles gets its own
+  separate design.
 
 ---
 
