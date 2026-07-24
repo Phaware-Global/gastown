@@ -24,9 +24,11 @@ import (
 	"context"
 	"flag"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -50,6 +52,14 @@ func main() {
 		gitRemote  = flag.String("git-remote", "origin", "git remote the checkpoint ref is pushed to (points at the relay in production)")
 		maxRuntime = flag.Duration("max-runtime", 0, "worker-side absolute session cap; 0 disables (§9.5)")
 		deadman    = flag.Duration("deadman-after", 0, "self-release after this long without control-plane contact; 0 = 4x checkpoint-interval, negative disables")
+
+		execMode     = flag.String("exec-mode", "native", "execution model (§6): \"native\" (agent runs on the worker directly; no container) or \"container\" (idle work container prepared here, agent docker exec'd in by the orchestrator)")
+		image        = flag.String("image", "", "work image (required in container mode; §6.2 contract)")
+		gtDir        = flag.String("gt-dir", "", "host dir with injected gastown bits, mounted ro at /opt/gt (required in container mode)")
+		containerNet = flag.String("container-network", "bridge", "container networking (§6.1.1): \"bridge\" (relay via host.docker.internal; hardening works) or \"host\" (trusted rigs only)")
+		sandboxed    = flag.Bool("sandboxed", false, "rig egress posture is sandboxed; refuses host networking (§6.1.1)")
+		dockerSock   = flag.Bool("mount-docker-sock", false, "bind-mount /var/run/docker.sock into the work container (§10; trusted rigs only)")
+		agentBinary  = flag.String("agent-binary", "", "agent runtime binary to preflight on the image PATH (§6.3)")
 	)
 	flag.Parse()
 
@@ -92,6 +102,43 @@ func main() {
 		log.Warn("relay may bind a non-loopback address — anything that reaches it authenticates as this polecat; the address MUST be firewalled to the container bridge subnet", "listen", *listen)
 	}
 
+	// Container mode (§6.1.2): build the work environment now so its
+	// StopWork can be wired into the supervisor; Prepare runs once the relay
+	// is listening (the design's ordering: cert → relay up → docker run).
+	var workEnv *worker.WorkEnv
+	if *execMode == "container" {
+		if *worktree == "" {
+			log.Error("container mode requires -worktree (bind-mounted into the work container)")
+			os.Exit(2)
+		}
+		_, portStr, err := net.SplitHostPort(*listen)
+		port, convErr := strconv.Atoi(portStr)
+		if err != nil || convErr != nil || port <= 0 {
+			log.Error("container mode requires an explicit -relay-listen port (the container must be pointed at it)", "listen", *listen)
+			os.Exit(2)
+		}
+		workEnv, err = worker.NewWorkEnv(worker.WorkEnvConfig{
+			Rig:               *rig,
+			Polecat:           *name,
+			Session:           cn,
+			Image:             *image,
+			Worktree:          *worktree,
+			GTDir:             *gtDir,
+			ContainerNetwork:  *containerNet,
+			Sandboxed:         *sandboxed,
+			MountDockerSocket: *dockerSock,
+			RelayPort:         port,
+			AgentBinary:       *agentBinary,
+		})
+		if err != nil {
+			log.Error("work environment config invalid", "err", err)
+			os.Exit(2)
+		}
+	} else if *execMode != "native" {
+		log.Error("invalid -exec-mode", "mode", *execMode)
+		os.Exit(2)
+	}
+
 	// Shutdown ORDER matters (§9.3): the supervisor's final checkpoint flush
 	// pushes THROUGH the relay, so the relay must outlive the supervisor. A
 	// shutdown signal cancels the supervisor's context only; the relay's own
@@ -105,7 +152,7 @@ func main() {
 		if ref == "" {
 			ref = worker.CheckpointRefForPolecat(*name)
 		}
-		sup := worker.NewSupervisor(worker.SupervisorConfig{
+		supCfg := worker.SupervisorConfig{
 			Checkpointer: &worker.Checkpointer{
 				Worktree: *worktree,
 				Ref:      ref,
@@ -116,7 +163,14 @@ func main() {
 			MaxRuntime:   *maxRuntime,
 			DeadmanAfter: *deadman,
 			Log:          log,
-		})
+		}
+		if workEnv != nil {
+			// §9.3 step 1: stop the work container before the final flush
+			// (this is also what lets the flush skip the quiescence guard —
+			// the writer is provably stopped).
+			supCfg.StopWork = workEnv.StopWork
+		}
+		sup := worker.NewSupervisor(supCfg)
 		log.Info("supervisor starting", "worktree", *worktree, "ref", ref,
 			"interval", *ckptEvery, "maxRuntime", *maxRuntime)
 		go func() {
@@ -130,6 +184,30 @@ func main() {
 		}()
 	}
 
+	// Prepare the idle work container once the relay is actually listening
+	// (§6.1.2 ordering); a Prepare failure ends the session — cancel the
+	// signal context so the supervisor runs its shutdown and everything
+	// unwinds.
+	prepFailed := make(chan struct{})
+	if workEnv != nil {
+		go func() {
+			for relay.Addr() == nil {
+				select {
+				case <-relayCtx.Done():
+					return
+				case <-time.After(50 * time.Millisecond):
+				}
+			}
+			if err := workEnv.Prepare(ctx); err != nil {
+				log.Error("work environment preparation failed", "err", err)
+				close(prepFailed)
+				cancel()
+				return
+			}
+			log.Info("idle work container ready", "container", workEnv.ContainerName(), "proxyURL", workEnv.ProxyURL())
+		}()
+	}
+
 	log.Info("relay starting", "listen", *listen, "upstream", *proxyURL)
 	if err := relay.Serve(relayCtx, *listen); err != nil {
 		log.Error("relay error", "err", err)
@@ -137,14 +215,32 @@ func main() {
 	}
 	log.Info("relay stopped")
 
+	exitCode := 0
 	if *worktree != "" {
 		reason := <-reasonCh // supervisor already finished (it canceled relayCtx)
 		log.Info("supervisor stopped", "reason", reason)
 		switch reason {
 		case worker.StopMaxRuntime:
-			os.Exit(3)
+			exitCode = 3
 		case worker.StopDeadman:
-			os.Exit(4)
+			exitCode = 4
 		}
 	}
+
+	// The session is over for every path that reaches here: remove the work
+	// container (the §9.5 container-half of release; StopWork already ran in
+	// the supervisor's shutdown sequence).
+	if workEnv != nil {
+		tdCtx, tdCancel := context.WithTimeout(context.Background(), time.Minute)
+		if err := workEnv.Teardown(tdCtx); err != nil {
+			log.Warn("work container teardown", "err", err)
+		}
+		tdCancel()
+	}
+	select {
+	case <-prepFailed:
+		exitCode = 1
+	default:
+	}
+	os.Exit(exitCode)
 }
