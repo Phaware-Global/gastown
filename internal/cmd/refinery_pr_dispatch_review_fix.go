@@ -247,7 +247,8 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 		if err := escalateReviewLoopCap(
 			fmt.Sprintf("PR #%d review loop exceeded %d iterations; %d thread(s) still unresolved",
 				state.PRNumber, maxIter, len(threads)),
-			string(threadsJSON)); err != nil {
+			string(threadsJSON),
+			fmt.Sprintf("dispatch-review-fix:cap:%s", refPrDispatchReviewFixMR)); err != nil {
 			return wrapOperationalErr(fmt.Errorf("escalating iteration cap: %w", err))
 		}
 		fmt.Fprintf(os.Stdout, "PR #%d: review loop iteration cap (%d) reached — escalated to mayor\n",
@@ -325,7 +326,8 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 		_ = escalateReviewLoopCap(
 			fmt.Sprintf("PR #%d: review-fix polecat %s spawned but MR-bead update FAILED (%v) — manual intervention required to prevent double-dispatch",
 				state.PRNumber, polecatName, err),
-			string(threadsJSON))
+			string(threadsJSON),
+			fmt.Sprintf("dispatch-review-fix:bead-update-failed:%s", refPrDispatchReviewFixMR))
 		return wrapOperationalErr(fmt.Errorf("recording dispatch on MR %s after polecat %s spawned: %w (escalation filed)",
 			refPrDispatchReviewFixMR, polecatName, err))
 	}
@@ -744,19 +746,42 @@ func wrapOperationalErr(err error) error {
 }
 
 // escalateReviewLoopCap shells out to `gt escalate` to file an escalation
-// bead and route mail when the review-fix loop exceeds its per-PR cap.
-// Mirrors the formula's existing `gt escalate -s HIGH ... --mail mayor/`
-// call so the output path is identical.
-func escalateReviewLoopCap(description, contextStr string) error {
-	cmd := exec.Command(gtBinary(), "escalate",
-		"-s", "HIGH",
-		"--mail", "mayor/",
-		"--context", contextStr,
-		description,
-	)
+// bead when the review-fix loop exceeds its per-PR cap (or a post-dispatch
+// bead update fails). gt-5yxm: this used to pass --mail and --context,
+// neither of which `gt escalate` accepts — cobra rejected the unknown flag
+// and the call exited non-zero, so the cap-hit was never recorded and every
+// patrol re-escalated by hand instead of hitting the fingerprint dedupe.
+// fingerprintSuffix collapses repeat escalations for the same MR and
+// failure kind into a single bead rather than filing one per patrol cycle.
+// reason (the unresolved-thread JSON blob) is unbounded, so it travels over
+// stdin via --stdin rather than as an argv element — embedding it in argv
+// risks ARG_MAX and is exactly the shell-quoting hazard --stdin exists to
+// avoid (gemini review on #159).
+func escalateReviewLoopCap(description, reason, fingerprintSuffix string) error {
+	cmd := exec.Command(gtBinary(), escalateReviewLoopCapArgs(description, fingerprintSuffix)...)
+	cmd.Stdin = strings.NewReader(reason)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// escalateReviewLoopCapArgs builds the `gt escalate` argv, split out from
+// escalateReviewLoopCap so tests can pin the flag shape without shelling
+// out. Only flags gt escalate's flag set actually defines (see escalate.go:
+// --severity/-s, --stdin, --source, --fingerprint) may appear here. reason
+// never appears here — it travels over stdin (see escalateReviewLoopCap) —
+// so this function takes no reason parameter.
+func escalateReviewLoopCapArgs(description, fingerprintSuffix string) []string {
+	args := []string{
+		"escalate",
+		"-s", "HIGH",
+		"--source", "refinery:dispatch-review-fix",
+		"--stdin",
+	}
+	if fingerprintSuffix != "" {
+		args = append(args, "--fingerprint", fingerprintSuffix)
+	}
+	return append(args, description)
 }
 
 // Compile-time silencer for time.Time so test harnesses that import this
