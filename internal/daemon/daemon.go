@@ -31,6 +31,7 @@ import (
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/estop"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/execution"
 	"github.com/steveyegge/gastown/internal/feed"
 	gitpkg "github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mayor"
@@ -3145,8 +3146,66 @@ func (d *Daemon) reapRigIdlePolecats(rigName string, timeout time.Duration) {
 		return // No polecats directory
 	}
 
+	maxRuntime := d.rigMaxRuntime(filepath.Join(d.config.TownRoot, rigName))
 	for _, polecatName := range polecats {
-		d.reapIdlePolecat(rigName, polecatName, timeout)
+		d.reapIdlePolecat(rigName, polecatName, timeout, maxRuntime)
+	}
+}
+
+// rigMaxRuntime returns the absolute polecat runtime cap for a rig, or 0 when
+// the rig has not EXPLICITLY set execution.max_runtime in settings/config.json
+// (docs/design/remote-polecat-execution.md §9.5).
+//
+// The cap is a hard kill (KillSessionWithProcesses — no graceful gt done;
+// remote graceful-flush arrives with gt-worker-agent). So it is gated on an
+// explicit max_runtime value, not the 4h default MaxRuntime() would return for
+// any execution block: merely selecting a backend or network posture must
+// never silently hard-kill a busy local polecat mid-work.
+func (d *Daemon) rigMaxRuntime(rigPath string) time.Duration {
+	settings, err := agentconfig.LoadRigSettings(agentconfig.RigSettingsPath(rigPath))
+	if err != nil {
+		// A missing settings file is normal (no cap). Any other error means a
+		// present-but-broken config silently disabling this safety rail — surface it.
+		// LoadRigSettings wraps a missing file as ErrNotFound, not os.ErrNotExist.
+		if !errors.Is(err, agentconfig.ErrNotFound) {
+			d.logger.Printf("Warning: could not load rig settings at %s for max_runtime cap: %v", rigPath, err)
+		}
+		return 0
+	}
+	if settings == nil || !settings.Execution.MaxRuntimeSet() {
+		return 0
+	}
+	return settings.Execution.MaxRuntime()
+}
+
+// teardownRemoteExecution releases the remote execution worker for a polecat,
+// if the rig uses a remote backend. It resolves the backend from rig config,
+// discovers the polecat's live endpoints by identity, and tears each down —
+// honoring the Backend.Teardown contract on the reap/max_runtime path
+// (remote-polecat-execution §9.5). No-op for local rigs. Best-effort: failures
+// are logged, never blocking the local session kill that follows.
+func (d *Daemon) teardownRemoteExecution(rigName, polecatName string) {
+	rigPath := filepath.Join(d.config.TownRoot, rigName)
+	settings, err := agentconfig.LoadRigSettings(agentconfig.RigSettingsPath(rigPath))
+	if err != nil || settings == nil || !settings.Execution.IsRemote() {
+		return
+	}
+	backend, err := execution.ForConfig(settings.Execution)
+	if err != nil {
+		d.logger.Printf("Warning: resolving execution backend to tear down %s/%s: %v", rigName, polecatName, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(d.ctx, 30*time.Second)
+	defer cancel()
+	eps, err := backend.Discover(ctx, execution.IdentityTags{Rig: rigName, Polecat: polecatName})
+	if err != nil {
+		d.logger.Printf("Warning: discovering remote endpoints for %s/%s: %v", rigName, polecatName, err)
+		return
+	}
+	for _, ep := range eps {
+		if err := backend.Teardown(ctx, ep); err != nil {
+			d.logger.Printf("Warning: tearing down remote worker %s for %s/%s: %v", ep.ID, rigName, polecatName, err)
+		}
 	}
 }
 
@@ -3157,13 +3216,34 @@ func (d *Daemon) reapRigIdlePolecats(rigName string, timeout time.Duration) {
 //     hooked work (agent_state=idle in beads). This catches polecats that completed
 //     gt done — persistentPreRun resets heartbeat to "working" on every gt sub-command,
 //     so after gt done finishes the heartbeat shows "working" with a stale timestamp.
-func (d *Daemon) reapIdlePolecat(rigName, polecatName string, timeout time.Duration) {
+func (d *Daemon) reapIdlePolecat(rigName, polecatName string, timeout, maxRuntime time.Duration) {
 	sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
 
 	// Only check sessions that are actually alive
 	alive, err := d.tmux.HasSession(sessionName)
 	if err != nil || !alive {
 		return
+	}
+
+	// Absolute zombie cap (remote-polecat-execution §9.5): wall-clock since
+	// session creation, independent of heartbeat freshness and state — the
+	// idle-based checks below never catch a busy-but-looping polecat. 0 = no cap.
+	//
+	// Anchored to tmux session_created, which resets when Start recreates a
+	// stale session, so crash-recovery restarts the clock. That is acceptable
+	// for the local hard cap (a genuinely stuck loop is caught on its current
+	// run; the cap is opt-in and coarse). A durable per-work runtime anchor
+	// arrives with the remote resume/checkpoint accounting (§9.4).
+	if maxRuntime > 0 {
+		if created, err := d.tmux.GetSessionCreatedTime(sessionName); err == nil {
+			if age := time.Since(created); age > maxRuntime {
+				d.killIdlePolecat(rigName, polecatName, sessionName, age, maxRuntime, "max-runtime-exceeded")
+				return
+			}
+		} else {
+			// Fail-open would silently disable the cap — surface it.
+			d.logger.Printf("Warning: could not read session creation time for %s (max_runtime cap skipped this pass): %v", sessionName, err)
+		}
 	}
 
 	// Read heartbeat to check state and idle duration
@@ -3245,6 +3325,12 @@ func (d *Daemon) reapIdlePolecat(rigName, polecatName string, timeout time.Durat
 func (d *Daemon) killIdlePolecat(rigName, polecatName, sessionName string, idleDuration, timeout time.Duration, reason string) {
 	d.logger.Printf("Reaping idle polecat %s/%s (state=%s, idle %v, threshold %v)",
 		rigName, polecatName, reason, idleDuration.Truncate(time.Second), timeout)
+
+	// Release any remote execution worker BEFORE killing the local pane. For a
+	// remote backend the tmux pane is only the launcher; killing it leaves the
+	// off-host worker running (remote-polecat-execution §9.5 Teardown contract).
+	// No-op for local rigs (LocalBackend.Teardown is a no-op, Discover empty).
+	d.teardownRemoteExecution(rigName, polecatName)
 
 	// Kill the tmux session (and all descendant processes)
 	if err := d.tmux.KillSessionWithProcesses(sessionName); err != nil {

@@ -466,7 +466,7 @@ func TestReapIdlePolecat_SkipsWhenBeadLookupFailsButHasWork(t *testing.T) {
 	data, _ := json.Marshal(staleHB)
 	_ = os.WriteFile(hbPath, data, 0644)
 
-	d.reapIdlePolecat("myr", "mycat", 15*time.Minute)
+	d.reapIdlePolecat("myr", "mycat", 15*time.Minute, 0)
 
 	if strings.Contains(logBuf.String(), "Reaping idle polecat") {
 		t.Errorf("must NOT reap polecat with open assigned work when agent bead lookup fails, got: %q", logBuf.String())
@@ -510,7 +510,7 @@ func TestReapIdlePolecat_ReapsWhenBeadLookupFailsAndNoWork(t *testing.T) {
 	data, _ := json.Marshal(staleHB)
 	_ = os.WriteFile(hbPath, data, 0644)
 
-	d.reapIdlePolecat("myr", "mycat", 15*time.Minute)
+	d.reapIdlePolecat("myr", "mycat", 15*time.Minute, 0)
 
 	if !strings.Contains(logBuf.String(), "Reaping idle polecat") {
 		t.Errorf("expected idle polecat with no work and failed bead lookup to be reaped, got: %q", logBuf.String())
@@ -565,7 +565,7 @@ func TestReapIdlePolecat_SkipsActiveAgent(t *testing.T) {
 	data, _ := json.Marshal(staleHB)
 	_ = os.WriteFile(hbPath, data, 0644)
 
-	d.reapIdlePolecat("myr", "mycat", 15*time.Minute)
+	d.reapIdlePolecat("myr", "mycat", 15*time.Minute, 0)
 
 	got := logBuf.String()
 	if strings.Contains(got, "Reaping idle polecat") {
@@ -616,7 +616,7 @@ func TestReapIdlePolecat_ReapsIdleNoHook(t *testing.T) {
 	data, _ := json.Marshal(staleHB)
 	_ = os.WriteFile(hbPath, data, 0644)
 
-	d.reapIdlePolecat("myr", "mycat", 15*time.Minute)
+	d.reapIdlePolecat("myr", "mycat", 15*time.Minute, 0)
 
 	got := logBuf.String()
 	if !strings.Contains(got, "Reaping idle polecat") {
