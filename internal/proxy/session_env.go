@@ -36,13 +36,25 @@ func (s *Server) rigPrefix(rig string) string {
 	s.prefixMu.RUnlock()
 
 	if reg == nil || time.Since(at) > prefixCacheTTL {
-		fresh, err := s.buildPrefixRegistry()
+		fresh, found, err := s.buildPrefixRegistry()
 		if err != nil {
 			// Keep a previously good registry on transient read errors.
 			s.log.Warn("could not build rig prefix registry", "err", err)
 			fresh = reg
 		}
 		s.prefixMu.Lock()
+		// Missing rigs.json is not an error from the file reader, but it
+		// silently degrades every derived GT_SESSION to the default prefix —
+		// a rig with a custom prefix would stop heartbeating with nothing in
+		// the logs. Warn on the transition into (and note recovery from)
+		// the missing state, not every 30s refresh.
+		if err == nil && !found && !s.prefixMissingWarned {
+			s.log.Warn("rigs.json not found (checked mayor/rigs.json and town root) — all derived GT_SESSION values fall back to the default rig prefix; polecats on custom-prefix rigs will not heartbeat", "townRoot", s.cfg.TownRoot)
+			s.prefixMissingWarned = true
+		} else if found && s.prefixMissingWarned {
+			s.log.Info("rigs.json found again — rig prefixes restored")
+			s.prefixMissingWarned = false
+		}
 		// Another goroutine may have refreshed while we built; last write
 		// wins — both saw current file contents.
 		s.prefixReg = fresh
@@ -60,12 +72,21 @@ func (s *Server) rigPrefix(rig string) string {
 // buildPrefixRegistry reads rigs.json read-only: canonical mayor/rigs.json
 // first, town-root fallback second — the same preference as
 // session.BuildPrefixRegistryFromTown, minus its fallback-copy write.
-func (s *Server) buildPrefixRegistry() (*session.PrefixRegistry, error) {
+// found reports whether either file existed (BuildPrefixRegistryFromFile
+// returns an empty registry with a nil error for a missing file, which
+// callers must not mistake for a healthy empty town).
+func (s *Server) buildPrefixRegistry() (reg *session.PrefixRegistry, found bool, err error) {
 	canonical := filepath.Join(s.cfg.TownRoot, "mayor", "rigs.json")
-	if _, err := os.Stat(canonical); err == nil {
-		return session.BuildPrefixRegistryFromFile(canonical)
+	if _, statErr := os.Stat(canonical); statErr == nil {
+		reg, err = session.BuildPrefixRegistryFromFile(canonical)
+		return reg, true, err
 	}
-	return session.BuildPrefixRegistryFromFile(filepath.Join(s.cfg.TownRoot, "rigs.json"))
+	fallback := filepath.Join(s.cfg.TownRoot, "rigs.json")
+	if _, statErr := os.Stat(fallback); statErr == nil {
+		reg, err = session.BuildPrefixRegistryFromFile(fallback)
+		return reg, true, err
+	}
+	return session.NewPrefixRegistry(), false, nil
 }
 
 // sessionIdentityEnv derives the trusted session env for an authenticated
@@ -115,4 +136,7 @@ type prefixCache struct {
 	prefixMu  sync.RWMutex
 	prefixReg *session.PrefixRegistry
 	prefixAt  time.Time
+	// prefixMissingWarned makes the missing-rigs.json warning edge-triggered
+	// (once on entering the state, not every refresh). Guarded by prefixMu.
+	prefixMissingWarned bool
 }
