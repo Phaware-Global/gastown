@@ -199,6 +199,14 @@ func main() {
 				}
 			}
 			if err := workEnv.Prepare(ctx); err != nil {
+				// An operator shutdown signal during the prep window cancels
+				// the in-flight docker calls — that is a normal interrupt,
+				// not a preparation fault; the supervisor's StopInterrupted
+				// path drives the clean exit.
+				if ctx.Err() != nil {
+					log.Info("work environment preparation interrupted by shutdown")
+					return
+				}
 				log.Error("work environment preparation failed", "err", err)
 				close(prepFailed)
 				cancel()

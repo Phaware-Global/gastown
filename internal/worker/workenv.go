@@ -103,6 +103,13 @@ func NewWorkEnv(cfg WorkEnvConfig) (*WorkEnv, error) {
 	if cfg.Sandboxed && cfg.ContainerNetwork == containerNetworkHost {
 		return nil, fmt.Errorf("workenv: sandboxed egress posture requires bridge networking (§6.1.1); host networking defeats network-level isolation")
 	}
+	// The docker socket is a strictly LARGER isolation breach than host
+	// networking (host docker daemon ≈ host root, §10) — refuse it for a
+	// sandboxed rig locally, symmetric with the networking guard above,
+	// rather than trusting orchestrator preflight alone.
+	if cfg.Sandboxed && cfg.MountDockerSocket {
+		return nil, fmt.Errorf("workenv: sandboxed egress posture cannot mount the docker socket (§10: host daemon access defeats sandbox containment; requires rootless dockerd, not shipped)")
+	}
 	if cfg.RelayPort <= 0 {
 		return nil, fmt.Errorf("workenv: relay port is required")
 	}
@@ -148,8 +155,31 @@ func (w *WorkEnv) docker(ctx context.Context, args ...string) (string, error) {
 func (w *WorkEnv) Prepare(ctx context.Context) error {
 	// Injected idle entrypoint (§6.2: the image is never expected to carry
 	// an entrypoint). /bin/sh is the only image dependency (v1 contract).
+	//
+	// PID-1 duty: the docker-exec'd agent is NOT our child, and if PID 1
+	// exits the instant TERM arrives, the namespace teardown SIGKILLs the
+	// agent mid-write with zero grace. So on TERM the entrypoint forwards
+	// TERM to every process in the PID namespace (kill -1) and waits for
+	// them to drain — up to 25s, inside docker stop's 30s window — before
+	// exiting, so `docker stop -t 30` is genuinely graceful for the agent.
 	idle := filepath.Join(w.cfg.GTDir, "gt-idle.sh")
-	script := "#!/bin/sh\n# gastown injected idle entrypoint: hold the container until docker exec.\ntrap 'exit 0' TERM INT\nwhile :; do sleep 60 & wait $!; done\n"
+	script := `#!/bin/sh
+# gastown injected idle entrypoint: hold the container until docker exec,
+# and forward TERM to the exec'd processes with a drain window on stop.
+term() {
+	kill -TERM -1 2>/dev/null
+	i=0
+	while [ "$i" -lt 25 ]; do
+		set -- /proc/[0-9]*
+		[ "$#" -le 1 ] && break
+		i=$((i+1))
+		sleep 1
+	done
+	exit 0
+}
+trap term TERM INT
+while :; do sleep 60 & wait $!; done
+`
 	if err := writeFileAtomic(idle, []byte(script), 0755); err != nil {
 		return fmt.Errorf("write idle entrypoint: %w", err)
 	}
@@ -176,7 +206,9 @@ func (w *WorkEnv) Prepare(ctx context.Context) error {
 	if w.cfg.MountDockerSocket {
 		args = append(args, "-v", "/var/run/docker.sock:/var/run/docker.sock")
 	}
-	args = append(args, w.cfg.Image, idleEntrypoint)
+	// End-of-options: a flag-shaped Image value must be a bad image name,
+	// never a docker run flag.
+	args = append(args, "--", w.cfg.Image, idleEntrypoint)
 
 	if _, err := w.docker(ctx, args...); err != nil {
 		return fmt.Errorf("start idle work container: %w", err)
