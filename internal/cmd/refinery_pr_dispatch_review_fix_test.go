@@ -400,3 +400,96 @@ func TestReviewFixCapacityExitCode(t *testing.T) {
 		})
 	}
 }
+
+// TestEscalateReviewLoopCapArgs is the regression test for gt-5yxm:
+// escalateReviewLoopCap used to hard-code --mail and --context, neither of
+// which `gt escalate` defines (see escalate.go's flag registration), so the
+// shell-out failed with "unknown flag" and cobra's exit 1 got wrapped into
+// exit 4 (operational error) instead of the cap-hit's exit 3. The
+// iteration-cap escalation was never recorded, so every subsequent patrol
+// re-detected the uncapped condition and re-filed by hand (~20 near-
+// identical HIGH mails for one underlying problem). This walks the built
+// argv against escalateCmd's real flag set so a rename on either side fails
+// here instead of silently breaking the shell-out again.
+//
+// It also pins the follow-up fix (gemini review on #159): the reason text
+// (an unbounded unresolved-thread JSON blob) must travel over stdin via
+// --stdin, never as an argv element — argv is exactly the kind of payload
+// that risks ARG_MAX and the shell-quoting hazard --stdin exists to avoid.
+func TestEscalateReviewLoopCapArgs(t *testing.T) {
+	args := escalateReviewLoopCapArgs("cap hit description", "dispatch-review-fix:cap:hga-wisp-i34")
+
+	if args[0] != "escalate" {
+		t.Fatalf("args[0] = %q; want %q", args[0], "escalate")
+	}
+
+	for _, banned := range []string{"--mail", "--context", "--reason"} {
+		if reviewFixArgsContain(args, banned) {
+			t.Errorf("args contains unsupported/unwanted flag %q: %v", banned, args)
+		}
+	}
+
+	for _, want := range []string{"--source", "--stdin", "--fingerprint"} {
+		if !reviewFixArgsContain(args, want) {
+			t.Errorf("args missing expected flag %q: %v", want, args)
+		}
+	}
+
+	// Every long flag used must exist on the real escalate command
+	// (--stdin included) so a rename on either side fails here.
+	for _, a := range args {
+		if name, ok := strings.CutPrefix(a, "--"); ok {
+			if escalateCmd.Flags().Lookup(name) == nil {
+				t.Errorf("args uses flag %q which escalate.go does not define", a)
+			}
+		}
+	}
+
+	// The reason text itself must never leak into argv — it belongs on
+	// stdin (see escalateReviewLoopCap). escalateReviewLoopCapArgs takes no
+	// reason parameter, so this guards against a future refactor
+	// reintroducing it as an argv element.
+	reasonBlob := `[{"id":"PRRT_xyz","body":"unresolved thread payload"}]`
+	for _, a := range args {
+		if strings.Contains(a, reasonBlob) {
+			t.Errorf("reason text leaked into argv (ARG_MAX / shell-quoting risk): %v", args)
+		}
+	}
+
+	if got := args[len(args)-1]; got != "cap hit description" {
+		t.Errorf("last arg = %q; want trailing positional description", got)
+	}
+}
+
+// TestEscalateReviewLoopCapArgs_FingerprintDedupes pins the secondary fix:
+// a non-empty fingerprint suffix must reach `gt escalate` so repeat cap-hits
+// on the same MR dedupe into one escalation bead instead of filing N per
+// patrol cycle.
+func TestEscalateReviewLoopCapArgs_FingerprintDedupes(t *testing.T) {
+	args := escalateReviewLoopCapArgs("desc", "dispatch-review-fix:cap:hga-wisp-i34")
+	for i, a := range args {
+		if a == "--fingerprint" {
+			if i+1 >= len(args) || args[i+1] != "dispatch-review-fix:cap:hga-wisp-i34" {
+				t.Errorf("args = %v; want --fingerprint followed by the given suffix", args)
+			}
+			return
+		}
+	}
+	t.Errorf("args missing --fingerprint: %v", args)
+}
+
+func TestEscalateReviewLoopCapArgs_EmptyFingerprintOmitted(t *testing.T) {
+	args := escalateReviewLoopCapArgs("desc", "")
+	if reviewFixArgsContain(args, "--fingerprint") {
+		t.Errorf("args should omit --fingerprint when suffix is empty: %v", args)
+	}
+}
+
+func reviewFixArgsContain(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
