@@ -224,3 +224,67 @@ func TestSupervisor_InterruptRunsShutdownSequence(t *testing.T) {
 	sha := gitOut(t, bare, "rev-parse", c.Ref)
 	assert.Equal(t, "interrupted", gitOut(t, bare, "show", sha+":main.go"))
 }
+
+func TestCheckpoint_StagedNewFileNotCaptured(t *testing.T) {
+	wt, bare, c := newCheckpointRepo(t)
+
+	// A NEW file the agent staged but has not committed: not in HEAD, so
+	// tracked-only (`add -u`) staging deliberately excludes it — the design's
+	// untracked-but-wanted exception (§9.2). This test locks the boundary in
+	// so a change to it is a conscious decision, not an accident.
+	require.NoError(t, os.WriteFile(filepath.Join(wt, "brand-new.go"), []byte("staged\n"), 0644))
+	gitOut(t, wt, "add", "brand-new.go")
+	// Plus a tracked change so a checkpoint actually happens.
+	require.NoError(t, os.WriteFile(filepath.Join(wt, "main.go"), []byte("v2\n"), 0644))
+
+	pushed, err := c.Checkpoint(context.Background())
+	require.NoError(t, err)
+	require.True(t, pushed)
+
+	files := gitOut(t, bare, "ls-tree", "-r", "--name-only", c.Ref)
+	assert.Contains(t, files, "main.go")
+	assert.NotContains(t, files, "brand-new.go",
+		"staged-but-uncommitted new files are excluded by design (tracked-in-HEAD only)")
+
+	// The agent's own staging area still holds the file untouched.
+	staged := gitOut(t, wt, "diff", "--cached", "--name-only")
+	assert.Contains(t, staged, "brand-new.go")
+}
+
+func TestCheckpoint_RejectsNonRefsRef(t *testing.T) {
+	_, _, c := newCheckpointRepo(t)
+	c.Ref = "--upload-pack=evil"
+	_, err := c.Checkpoint(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must start with refs/")
+}
+
+// TestSupervisor_HungGitCannotStarveWatchdog pins the OpTimeout guarantee: a
+// checkpoint/probe that HANGS (silent partition — no RST, no fast failure)
+// is killed at the per-op deadline, so the max-runtime/dead-man checks keep
+// running and self-release still fires.
+func TestSupervisor_HungGitCannotStarveWatchdog(t *testing.T) {
+	wt, _, c := newCheckpointRepo(t)
+
+	// A remote whose transport hangs: an ext:: command that sleeps far past
+	// the test horizon without ever speaking the git protocol.
+	gitOut(t, wt, "config", "protocol.ext.allow", "always")
+	gitOut(t, wt, "remote", "set-url", "origin", "ext::sh -c \"sleep 600\"")
+	// Ensure there is something to push so Checkpoint reaches the transport.
+	require.NoError(t, os.WriteFile(filepath.Join(wt, "main.go"), []byte("v2\n"), 0644))
+
+	sup := NewSupervisor(SupervisorConfig{
+		Checkpointer: c,
+		Interval:     50 * time.Millisecond,
+		OpTimeout:    150 * time.Millisecond,
+		DeadmanAfter: 400 * time.Millisecond,
+	})
+	done := make(chan StopReason, 1)
+	go func() { done <- sup.Run(context.Background()) }()
+	select {
+	case reason := <-done:
+		assert.Equal(t, StopDeadman, reason)
+	case <-time.After(15 * time.Second):
+		t.Fatal("hung git starved the watchdog — dead-man self-release never fired")
+	}
+}
