@@ -1,6 +1,8 @@
 package nudge
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -438,13 +440,15 @@ func TestDrainSkipsExpired(t *testing.T) {
 		t.Fatalf("Enqueue fresh: %v", err)
 	}
 
-	// Pending counts both (doesn't check expiry)
+	// Pending itself still counts all files without checking expiry, but the
+	// second Enqueue's own GC pass already removed the expired sibling before
+	// writing the fresh one (gt-770z) — so only the fresh entry remains.
 	pending, err := Pending(townRoot, session)
 	if err != nil {
 		t.Fatalf("Pending: %v", err)
 	}
-	if pending != 2 {
-		t.Errorf("Pending = %d, want 2 (counts all files)", pending)
+	if pending != 1 {
+		t.Errorf("Pending = %d, want 1 (Enqueue's GC pass drops the expired sibling)", pending)
 	}
 
 	// Drain should skip the expired nudge
@@ -459,7 +463,7 @@ func TestDrainSkipsExpired(t *testing.T) {
 		t.Errorf("got sender %q, want %q", nudges[0].Sender, "new-sender")
 	}
 
-	// After drain, queue dir should be empty (both files removed)
+	// After drain, queue dir should be empty (fresh file drained, expired sibling already GC'd)
 	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", session)
 	entries, _ := os.ReadDir(dir)
 	if len(entries) != 0 {
@@ -513,6 +517,185 @@ func TestEnqueueQueueDepthLimit(t *testing.T) {
 	err = Enqueue(townRoot, session, overflow)
 	if err != nil {
 		t.Errorf("Enqueue after drain should succeed: %v", err)
+	}
+}
+
+// TestEnqueueGCsExpiredEntriesBeforeCapCheck reproduces gt-770z: a queue
+// wedged at MaxQueueDepth with nothing but expired entries (the real-world
+// case of a long-lived agent — deacon, overseer — that never calls Drain, so
+// nothing ever purges dead nudges). A fresh Enqueue must succeed because the
+// expired entries are GC'd before the cap is checked, not refused because the
+// directory happens to contain MaxQueueDepth files.
+func TestEnqueueGCsExpiredEntriesBeforeCapCheck(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-gc-expired"
+	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", session)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wedge the queue directly on disk (bypassing Enqueue, whose own GC pass
+	// would otherwise clean these up as they're written) with MaxQueueDepth
+	// entries, all already expired.
+	for i := 0; i < MaxQueueDepth; i++ {
+		n := QueuedNudge{
+			Sender:    "stale-sender",
+			Message:   "stale",
+			Timestamp: time.Now().Add(-time.Hour),
+			ExpiresAt: time.Now().Add(-time.Minute), // expired
+		}
+		data, err := json.Marshal(n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, fmt.Sprintf("%d-%s.json", n.Timestamp.UnixNano()+int64(i), randomSuffix()))
+		if err := os.WriteFile(path, data, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Sanity check: queue is wedged at cap before Enqueue's GC pass runs.
+	pending, _ := Pending(townRoot, session)
+	if pending != MaxQueueDepth {
+		t.Fatalf("setup: pending = %d, want %d (queue not wedged)", pending, MaxQueueDepth)
+	}
+
+	// (a) + (b): enqueue into a queue full of expired entries succeeds — an
+	// entry past its expiry never blocks a new enqueue.
+	fresh := QueuedNudge{Sender: "live-sender", Message: "live message"}
+	if err := Enqueue(townRoot, session, fresh); err != nil {
+		t.Fatalf("Enqueue into expired-full queue should succeed, got: %v", err)
+	}
+
+	nudges, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(nudges) != 1 {
+		t.Fatalf("Drain returned %d nudges, want 1 (expired entries must be dropped by GC)", len(nudges))
+	}
+	if nudges[0].Sender != "live-sender" {
+		t.Errorf("got sender %q, want %q", nudges[0].Sender, "live-sender")
+	}
+}
+
+// TestEnqueueRejectsWhenFullOfLiveEntries verifies the cap enforcement is
+// unchanged for the case GC does NOT help: a queue full of entries that have
+// NOT expired must still reject a new enqueue, and that rejection must be
+// reported to the caller as an error (not merely logged).
+func TestEnqueueRejectsWhenFullOfLiveEntries(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-full-of-live"
+
+	for i := 0; i < MaxQueueDepth; i++ {
+		n := QueuedNudge{Sender: "sender", Message: "live"}
+		if err := Enqueue(townRoot, session, n); err != nil {
+			t.Fatalf("Enqueue %d: %v", i, err)
+		}
+	}
+
+	err := Enqueue(townRoot, session, QueuedNudge{Sender: "sender", Message: "overflow"})
+	if err == nil {
+		t.Fatal("expected an error when the queue is full of live entries, got nil")
+	}
+	if !strings.Contains(err.Error(), "is full") {
+		t.Errorf("got error %q, want it to report the queue as full", err.Error())
+	}
+
+	// GC must not have touched the live entries.
+	pending, _ := Pending(townRoot, session)
+	if pending != MaxQueueDepth {
+		t.Errorf("Pending = %d, want %d (live entries must survive GC)", pending, MaxQueueDepth)
+	}
+}
+
+// TestGCExpiredSkipsClaimed verifies that gcExpired never removes a .claimed
+// file, even one that would be expired. A .claimed file is mid-delivery —
+// DrainClaim already renamed it out of the .json namespace and owns its
+// lifecycle (its own orphan-claim sweep, gated on staleClaimThreshold, not on
+// ExpiresAt). gcExpired only ever matches the literal ".json" suffix, so an
+// in-flight claim must survive an Enqueue call that triggers a GC pass.
+func TestGCExpiredSkipsClaimed(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-gc-skips-claimed"
+	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", session)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a nudge currently claimed by some other in-flight Drain: an
+	// expired QueuedNudge whose file already carries the ".claimed.<suffix>"
+	// marker DrainClaim uses, so it is no longer named "*.json".
+	expired := QueuedNudge{
+		Sender:    "claimant",
+		Message:   "mid-delivery",
+		Timestamp: time.Now().Add(-time.Hour),
+		ExpiresAt: time.Now().Add(-time.Minute), // expired
+	}
+	data, err := json.Marshal(expired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimPath := filepath.Join(dir, "100.json.claimed.deadbeef")
+	if err := os.WriteFile(claimPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Any Enqueue call runs gcExpired first.
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "live-sender", Message: "live"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if _, statErr := os.Stat(claimPath); statErr != nil {
+		t.Errorf("claimed file should survive gcExpired even though expired, stat err = %v", statErr)
+	}
+}
+
+// TestGCExpiredSkipsZeroExpiry verifies that gcExpired never removes a queued
+// entry with a zero (unset) ExpiresAt. A zero time.Time is always "before
+// now", so without the explicit IsZero guard a never-expiring entry would be
+// purged on the very next Enqueue instead of being left to persist
+// indefinitely as intended.
+func TestGCExpiredSkipsZeroExpiry(t *testing.T) {
+	townRoot := t.TempDir()
+	session := "gt-test-gc-skips-zero-expiry"
+	dir := filepath.Join(townRoot, ".runtime", "nudge_queue", session)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a queued nudge directly to disk with ExpiresAt left zero,
+	// bypassing Enqueue (which always fills in a default TTL) so the
+	// zero-value carve-out is exercised directly.
+	noExpiry := QueuedNudge{
+		Sender:    "system",
+		Message:   "never expires",
+		Timestamp: time.Now().Add(-time.Hour),
+		// ExpiresAt intentionally left zero.
+	}
+	data, err := json.Marshal(noExpiry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "100.json")
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Enqueue(townRoot, session, QueuedNudge{Sender: "live-sender", Message: "live"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Errorf("zero-ExpiresAt entry should survive gcExpired, stat err = %v", statErr)
+	}
+
+	nudges, err := Drain(townRoot, session)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(nudges) != 2 {
+		t.Fatalf("Drain returned %d nudges, want 2 (zero-expiry entry plus the live one)", len(nudges))
 	}
 }
 
