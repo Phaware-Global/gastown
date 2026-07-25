@@ -96,6 +96,11 @@ type Service struct {
 	// persistMu serializes sessions.json writes so concurrent persists can't
 	// rename out of order and strand a stale snapshot.
 	persistMu sync.Mutex
+
+	// orphanHook, when set, is called at the very top of orphanSession before
+	// it takes any lock — a test seam for driving the watchdog-vs-teardown
+	// race deterministically. nil in production.
+	orphanHook func()
 }
 
 // New builds a Service and loads persisted session state: sessions recorded
@@ -609,10 +614,24 @@ func (s *Service) handleTeardown(c *connState, m *sockproto.Message) {
 	if sess == nil {
 		if wasOrphan {
 			// Tearing down an already-orphaned session: its relay is stopped
-			// and identity shredded, but an orphan KEEPS its worktree — remove
-			// it now (unless asked not to) so the machine is left clean.
+			// and identity shredded, but an orphan KEEPS its worktree and (in
+			// container mode) its stopped work container — the watchdog dropped
+			// the WorkEnv handle. Remove both by their deterministic
+			// name/path so the machine is left clean.
+			if s.cfg.Docker {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+				if err := worker.RemoveWorkContainer(ctx, "", orphan.Rig, orphan.Polecat); err != nil {
+					s.log.Warn("remove orphaned work container", "session", m.Session, "err", err)
+				}
+				cancel()
+			}
 			if clean {
-				_ = os.RemoveAll(filepath.Join(s.cfg.StateDir, "worktrees", orphan.Rig, orphan.Polecat))
+				wt := filepath.Join(s.cfg.StateDir, "worktrees", orphan.Rig, orphan.Polecat)
+				if err := underRoot(s.cfg.StateDir, wt); err == nil {
+					_ = os.RemoveAll(wt)
+				} else {
+					s.log.Warn("refusing to remove worktree outside state dir", "session", m.Session, "err", err)
+				}
 			}
 			_ = os.RemoveAll(filepath.Join(s.cfg.StateDir, "identity", m.Session))
 			s.persist()
@@ -711,6 +730,9 @@ func (s *Service) teardownSession(sess *session, cleanWorktree bool) {
 // shredded: an orphan is dead (re-adoption is a later phase), so a
 // re-provision of the same identity re-enrolls with a fresh cert.
 func (s *Service) orphanSession(sess *session) {
+	if s.orphanHook != nil {
+		s.orphanHook()
+	}
 	// The tearingDown check and the session→orphan move happen in ONE critical
 	// section so a concurrent teardown cannot observe live==true and then have
 	// this insert land behind its back. If a teardown is in progress it OWNS

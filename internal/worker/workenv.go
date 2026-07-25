@@ -119,7 +119,7 @@ func NewWorkEnv(cfg WorkEnvConfig) (*WorkEnv, error) {
 	}
 	return &WorkEnv{
 		cfg:  cfg,
-		name: "gt-work-" + cfg.Rig + "-" + cfg.Polecat,
+		name: WorkContainerName(cfg.Rig, cfg.Polecat),
 	}, nil
 }
 
@@ -272,6 +272,28 @@ func (w *WorkEnv) StopWork(ctx context.Context) error {
 func (w *WorkEnv) Teardown(ctx context.Context) error {
 	if _, err := w.docker(ctx, "rm", "-f", w.name); err != nil {
 		return fmt.Errorf("remove work container: %w", err)
+	}
+	return nil
+}
+
+// WorkContainerName is the deterministic work-container name for a polecat,
+// so an orphaned container can be removed without a live WorkEnv handle.
+func WorkContainerName(rig, polecat string) string {
+	return "gt-work-" + rig + "-" + polecat
+}
+
+// RemoveWorkContainer force-removes a polecat's work container by name.
+// Idempotent by intent: a missing container just yields a docker error the
+// caller can ignore. dockerBin defaults to "docker".
+func RemoveWorkContainer(ctx context.Context, dockerBin, rig, polecat string) error {
+	if dockerBin == "" {
+		dockerBin = "docker"
+	}
+	cmd := exec.CommandContext(ctx, dockerBin, "rm", "-f", WorkContainerName(rig, polecat))
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("remove work container %s: %w: %s", WorkContainerName(rig, polecat), err, strings.TrimSpace(errb.String()))
 	}
 	return nil
 }
