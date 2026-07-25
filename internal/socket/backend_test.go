@@ -26,6 +26,8 @@ type fakeWorker struct {
 	ln   net.Listener
 	addr string
 
+	stop chan struct{} // closed at cleanup; hang blocks on it (conn stays open)
+
 	mu       sync.Mutex
 	sessions []sockproto.SessionSummary
 	received []string // message types, in order
@@ -49,9 +51,9 @@ func newFakeWorker(t *testing.T) *fakeWorker {
 	sock := filepath.Join(dir, "w.sock")
 	ln, err := net.Listen("unix", sock)
 	require.NoError(t, err)
-	w := &fakeWorker{t: t, ln: ln, addr: "unix://" + sock, maxSessions: 1}
+	w := &fakeWorker{t: t, ln: ln, addr: "unix://" + sock, maxSessions: 1, stop: make(chan struct{})}
 	go w.serve()
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { close(w.stop); ln.Close() })
 	return w
 }
 
@@ -120,7 +122,8 @@ func (w *fakeWorker) handle(nc net.Conn) {
 			})
 		case sockproto.TypeSessionOpen:
 			if w.hang {
-				return // handshake done, but never answer the request
+				<-w.stop // handshake done, but never answer — keep the conn open
+				return
 			}
 			if w.failOpenWith != "" {
 				reply(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Code: w.failOpenWith, Msg: "bad"})
@@ -139,6 +142,7 @@ func (w *fakeWorker) handle(nc net.Conn) {
 			reply(&sockproto.Message{Type: sockproto.TypeSessionReady, ID: m.ID, Session: m.Session, RelayAddr: "127.0.0.1:9899"})
 		case sockproto.TypeDiscover:
 			if w.hang {
+				<-w.stop
 				return
 			}
 			w.mu.Lock()
@@ -155,8 +159,16 @@ func (w *fakeWorker) handle(nc net.Conn) {
 			w.mu.Unlock()
 			reply(&sockproto.Message{Type: sockproto.TypeSessions, ID: m.ID, Sessions: out})
 		case sockproto.TypeShutdown:
+			if w.hang {
+				<-w.stop
+				return
+			}
 			reply(&sockproto.Message{Type: sockproto.TypeShutdownComplete, ID: m.ID, Session: m.Session, CheckpointRef: "refs/checkpoints/polecat/" + m.Session})
 		case sockproto.TypeTeardown:
+			if w.hang {
+				<-w.stop
+				return
+			}
 			w.removeSession(m.Session)
 			reply(&sockproto.Message{Type: sockproto.TypeTeardownComplete, ID: m.ID, Session: m.Session})
 		default:
@@ -416,19 +428,39 @@ func TestProvision_NativeAllowsCertless(t *testing.T) {
 }
 
 func TestDiscover_BoundsHungWorker(t *testing.T) {
-	// A worker that accepts the connection, handshakes, but never replies to
-	// discover must not hang the caller (deadline-less ctx). The controlTimeout
-	// self-defense bounds it; we shrink the socket deadline via a short ctx to
-	// keep the test fast while still proving the un-hung path.
+	// A worker that handshakes then never replies must not hang a
+	// DEADLINE-LESS caller — this is what the controlTimeout self-defense
+	// exists for. Shrink the cap so the test is fast, and pass a bare
+	// context.Background() so the bound can ONLY come from the self-imposed
+	// timeout (a caller deadline would mask it). Assert the error wraps the
+	// self-timeout, not something else.
+	orig := controlTimeout
+	controlTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { controlTimeout = orig })
+
 	w := newHangingWorker(t)
 	b, _ := testBackend(t, w)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
 	start := time.Now()
-	_, err := b.Discover(ctx, execution.IdentityTags{})
+	_, err := b.Discover(context.Background(), execution.IdentityTags{})
 	require.Error(t, err)
-	assert.Less(t, time.Since(start), 5*time.Second, "discover must return promptly against a hung worker")
+	assert.ErrorIs(t, err, os.ErrDeadlineExceeded, "the bound must come from the self-imposed controlTimeout's socket deadline")
+	elapsed := time.Since(start)
+	assert.GreaterOrEqual(t, elapsed, 300*time.Millisecond, "must wait for the self-timeout, not fail earlier")
+	assert.Less(t, elapsed, 5*time.Second, "and not hang")
+}
+
+func TestTeardown_BoundsHungWorker(t *testing.T) {
+	orig := controlTimeout
+	controlTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { controlTimeout = orig })
+
+	w := newHangingWorker(t)
+	b, _ := testBackend(t, w)
+
+	err := b.Teardown(context.Background(), execution.Endpoint{Backend: BackendName, ID: "s", Address: w.addr})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, os.ErrDeadlineExceeded)
 }
 
 func TestProvision_SkipsAsyncTrafficMatchesExactID(t *testing.T) {
