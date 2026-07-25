@@ -16,7 +16,9 @@ const provisionTimeout = 10 * time.Minute
 
 // controlTimeout bounds a single control request (discover, teardown) so a
 // hung worker can never block a caller that passed a deadline-less context.
-const controlTimeout = 60 * time.Second
+// A var, not a const, so tests can exercise the self-imposed cap without
+// waiting the full minute.
+var controlTimeout = 60 * time.Second
 
 // Signer signs a session CSR into a polecat cert — the daemon's proxy-CA
 // hook, injected so this package does not import the proxy CA directly (and
