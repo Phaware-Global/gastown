@@ -92,6 +92,10 @@ type Service struct {
 	mu       sync.Mutex
 	sessions map[string]*session // by session id
 	orphans  map[string]sockproto.SessionSummary
+
+	// persistMu serializes sessions.json writes so concurrent persists can't
+	// rename out of order and strand a stale snapshot.
+	persistMu sync.Mutex
 }
 
 // New builds a Service and loads persisted session state: sessions recorded
@@ -594,14 +598,23 @@ func (s *Service) handleShutdown(c *connState, m *sockproto.Message) {
 // (§6): stop everything, remove the worktree (by default), shred identity,
 // drop state.
 func (s *Service) handleTeardown(c *connState, m *sockproto.Message) {
+	clean := m.CleanWorktree == nil || *m.CleanWorktree
+
 	s.mu.Lock()
 	sess := s.sessions[m.Session]
-	_, wasOrphan := s.orphans[m.Session]
+	orphan, wasOrphan := s.orphans[m.Session]
 	delete(s.orphans, m.Session)
 	s.mu.Unlock()
 
 	if sess == nil {
 		if wasOrphan {
+			// Tearing down an already-orphaned session: its relay is stopped
+			// and identity shredded, but an orphan KEEPS its worktree — remove
+			// it now (unless asked not to) so the machine is left clean.
+			if clean {
+				_ = os.RemoveAll(filepath.Join(s.cfg.StateDir, "worktrees", orphan.Rig, orphan.Polecat))
+			}
+			_ = os.RemoveAll(filepath.Join(s.cfg.StateDir, "identity", m.Session))
 			s.persist()
 			_ = c.send(&sockproto.Message{Type: sockproto.TypeTeardownComplete, ID: m.ID, Session: m.Session})
 			return
@@ -609,7 +622,6 @@ func (s *Service) handleTeardown(c *connState, m *sockproto.Message) {
 		_ = c.send(&sockproto.Message{Type: sockproto.TypeError, ID: m.ID, Session: m.Session, Code: "no_session", Msg: "no such session"})
 		return
 	}
-	clean := m.CleanWorktree == nil || *m.CleanWorktree
 	s.teardownSession(sess, clean)
 	_ = c.send(&sockproto.Message{Type: sockproto.TypeTeardownComplete, ID: m.ID, Session: m.Session})
 }
@@ -640,11 +652,20 @@ func (s *Service) teardownSession(sess *session, cleanWorktree bool) {
 	worktree := sess.worktree
 	s.mu.Unlock()
 	if !live {
+		// bringUp failed (it cleaned up its own partial state) OR the watchdog
+		// orphaned the session while we waited on buildDone. Either way finish
+		// the cleanup: remove any orphan record and its resources so nothing
+		// leaks and no phantom survives on disk.
 		s.mu.Lock()
 		_, orphaned := s.orphans[sess.summary.Session]
 		delete(s.orphans, sess.summary.Session)
 		s.mu.Unlock()
 		if orphaned {
+			if workEnv != nil {
+				ctx, c := context.WithTimeout(context.Background(), time.Minute)
+				_ = workEnv.Teardown(ctx)
+				c()
+			}
 			if cleanWorktree && worktree != "" {
 				_ = os.RemoveAll(worktree)
 			}
@@ -692,19 +713,17 @@ func (s *Service) teardownSession(sess *session, cleanWorktree bool) {
 func (s *Service) orphanSession(sess *session) {
 	// The tearingDown check and the session→orphan move happen in ONE critical
 	// section so a concurrent teardown cannot observe live==true and then have
-	// this insert land behind its back. If a teardown is in progress it owns
-	// the cleanup — drop from sessions but insert no orphan.
+	// this insert land behind its back. If a teardown is in progress it OWNS
+	// the full cleanup — leave the session in place (do NOT delete it) so
+	// teardown's live-read still sees it and removes worktree/container/state;
+	// deleting here would route teardown into its no-op !live path and leak
+	// those resources.
 	s.mu.Lock()
-	relay := sess.relay
 	if sess.tearingDown {
-		delete(s.sessions, sess.summary.Session)
 		s.mu.Unlock()
-		if relay != nil {
-			_ = relay.Close()
-		}
-		_ = os.RemoveAll(filepath.Join(s.cfg.StateDir, "identity", sess.summary.Session))
 		return
 	}
+	relay := sess.relay
 	delete(s.sessions, sess.summary.Session)
 	sum := sess.summary
 	sum.State = "orphaned"
@@ -778,9 +797,18 @@ func (s *Service) stateFile() string {
 
 // persist writes the current session set. Sessions are persisted so a
 // service restart can report them (as orphans, until re-adoption lands).
+//
+// The whole snapshot-and-write is serialized under persistMu: two concurrent
+// persists must not rename out of order (which could leave a stale snapshot
+// on disk even after the in-memory maps are empty). Because the snapshot is
+// taken WHEN persist runs (not when it was called), the last persist to run
+// always reflects the latest map state.
 func (s *Service) persist() {
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+
 	s.mu.Lock()
-	var all []sockproto.SessionSummary
+	all := []sockproto.SessionSummary{} // non-nil → empty marshals as [] not null
 	for _, sess := range s.sessions {
 		all = append(all, sess.summary)
 	}

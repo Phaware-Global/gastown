@@ -585,3 +585,41 @@ func TestWatchdogOrphanThenTeardown_NoZombie(t *testing.T) {
 	assert.Empty(t, svc.sessions)
 	assert.Empty(t, svc.orphans, "teardown of an orphaned session must remove the orphan record")
 }
+
+func TestTeardownRacingWatchdog_CleanState(t *testing.T) {
+	// Fire an operator teardown right as the watchdog's max_runtime expires so
+	// teardownSession and the watchdog-driven orphanSession run concurrently.
+	// Whatever the interleaving, the machine must end clean: no live/orphan
+	// session record, worktree + identity gone. Repeat to probe the window;
+	// run under -race.
+	for i := 0; i < 4; i++ {
+		proxyURL, ca, _ := startProxy(t)
+		addr, svc := startService(t, proxyURL)
+		b := newBackendWithMaxRuntime(t, addr, ca, "700ms")
+
+		ep, err := b.Provision(context.Background(), polecatSpec())
+		require.NoError(t, err)
+		worktree := filepath.Join(svc.cfg.StateDir, "worktrees", "demo", "furiosa")
+
+		go func() {
+			time.Sleep(650 * time.Millisecond) // overlap the 700ms watchdog
+			_ = b.Teardown(context.Background(), ep)
+		}()
+
+		require.Eventually(t, func() bool {
+			svc.mu.Lock()
+			ns, no := len(svc.sessions), len(svc.orphans)
+			svc.mu.Unlock()
+			_, wErr := os.Stat(worktree)
+			_, iErr := os.Stat(filepath.Join(svc.cfg.StateDir, "identity", "gt-demo-furiosa"))
+			return ns == 0 && no == 0 && os.IsNotExist(wErr) && os.IsNotExist(iErr)
+		}, 15*time.Second, 100*time.Millisecond,
+			"iteration %d: teardown racing the watchdog must leave a clean machine (no session/orphan, no worktree/identity)", i)
+
+		// sessions.json must not persist a phantom.
+		data, err := os.ReadFile(filepath.Join(svc.cfg.StateDir, "sessions.json"))
+		if err == nil {
+			assert.Equal(t, "[]", strings.TrimSpace(string(data)), "iteration %d: sessions.json must be empty", i)
+		}
+	}
+}
