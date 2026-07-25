@@ -675,6 +675,11 @@ func (s *Service) teardownSession(sess *session, cleanWorktree bool) {
 
 	s.mu.Lock()
 	delete(s.sessions, sess.summary.Session)
+	// Also drop any orphan the watchdog's orphanSession inserted while we were
+	// blocked on <-sess.done above: the supervisor goroutine calls
+	// orphanSession BEFORE closing done, so by now its insert (if any) has
+	// happened and this delete deterministically removes the phantom.
+	delete(s.orphans, sess.summary.Session)
 	s.mu.Unlock()
 	s.persist()
 }
@@ -685,26 +690,33 @@ func (s *Service) teardownSession(sess *session, cleanWorktree bool) {
 // shredded: an orphan is dead (re-adoption is a later phase), so a
 // re-provision of the same identity re-enrolls with a fresh cert.
 func (s *Service) orphanSession(sess *session) {
-	// A teardown for this session is in progress and will do the cleanup —
-	// don't insert a phantom orphan it would then have to chase.
+	// The tearingDown check and the session→orphan move happen in ONE critical
+	// section so a concurrent teardown cannot observe live==true and then have
+	// this insert land behind its back. If a teardown is in progress it owns
+	// the cleanup — drop from sessions but insert no orphan.
 	s.mu.Lock()
-	tearingDown := sess.tearingDown
 	relay := sess.relay
-	s.mu.Unlock()
-	if tearingDown {
+	if sess.tearingDown {
+		delete(s.sessions, sess.summary.Session)
+		s.mu.Unlock()
+		if relay != nil {
+			_ = relay.Close()
+		}
+		_ = os.RemoveAll(filepath.Join(s.cfg.StateDir, "identity", sess.summary.Session))
 		return
 	}
-	if relay != nil {
-		_ = relay.Close()
-	}
-	_ = os.RemoveAll(filepath.Join(s.cfg.StateDir, "identity", sess.summary.Session))
-
-	s.mu.Lock()
 	delete(s.sessions, sess.summary.Session)
 	sum := sess.summary
 	sum.State = "orphaned"
 	s.orphans[sum.Session] = sum
 	s.mu.Unlock()
+
+	// An orphan is dead (re-adoption is a later phase): stop its relay and
+	// shred its session cert so a re-provision re-enrolls with a fresh one.
+	if relay != nil {
+		_ = relay.Close()
+	}
+	_ = os.RemoveAll(filepath.Join(s.cfg.StateDir, "identity", sess.summary.Session))
 	s.persist()
 }
 
