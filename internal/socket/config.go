@@ -68,6 +68,14 @@ func (s *Settings) validate() error {
 	if s.Address == "" {
 		return fmt.Errorf("socket: address is required")
 	}
+	// A unix socket's trust is filesystem permissions + the pre-shared token
+	// (§3.3): dialTransport never runs TLS on a unix connection, so an
+	// auto/manual TLS block would be silently ignored — a security-posture
+	// surprise. Require mode=none on unix so the fs-permission trust model is
+	// explicit, and reject a bare unix address with a TLS mode set.
+	if s.isUnix() && s.tlsMode() != tlsModeNone {
+		return fmt.Errorf("socket: a unix:// address must use tls.mode=none with a pre-shared token (§3.3); TLS is not applied to unix sockets, so auto/manual would silently connect unauthenticated")
+	}
 	switch s.tlsMode() {
 	case tlsModeAuto:
 		if s.TLS.WorkerName == "" {
