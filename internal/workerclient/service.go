@@ -72,7 +72,9 @@ type session struct {
 	relay       *worker.Relay
 	workEnv     *worker.WorkEnv // nil in native mode
 	worktree    string
-	certTaken   bool // the signed cert has been consumed by SignCSR
+	certWanted  bool // SignCSR is awaiting a cert
+	certTaken   bool // a cert has been claimed for this session
+	tearingDown bool // a teardown is in progress; suppress a racing orphan insert
 
 	done      chan struct{} // closed when the supervisor has finished
 	buildDone chan struct{} // closed when bringUp returns (success or fail)
@@ -281,23 +283,25 @@ func (s *Service) handleSessionOpen(ctx context.Context, c *connState, m *sockpr
 	go s.bringUp(ctx, c, m, sess)
 }
 
-// handleCert routes the signed cert to the in-flight bringup. A cert that
-// arrives after SignCSR already consumed one (certTaken) is answered with
-// unexpected_cert rather than silently accepted into the drained buffer.
+// handleCert routes the signed cert to the in-flight bringup. The claim
+// (certTaken) is made UNDER the lock before delivery, so exactly one cert is
+// ever accepted for a session — a duplicate always gets unexpected_cert, with
+// no receive→set-flag window for a second cert to slip through.
 func (s *Service) handleCert(c *connState, m *sockproto.Message) {
 	s.mu.Lock()
 	sess := s.sessions[m.Session]
-	taken := sess != nil && sess.certTaken
+	ok := sess != nil && sess.certWanted && !sess.certTaken
+	if ok {
+		sess.certTaken = true // claim it now, under the lock
+	}
 	s.mu.Unlock()
-	if sess == nil || taken {
+	if !ok {
 		_ = c.send(&sockproto.Message{Type: sockproto.TypeError, ID: m.ID, Session: m.Session, Code: "unexpected_cert", Msg: "session is not awaiting a cert"})
 		return
 	}
-	select {
-	case sess.certCh <- m:
-	default:
-		_ = c.send(&sockproto.Message{Type: sockproto.TypeError, ID: m.ID, Session: m.Session, Code: "unexpected_cert", Msg: "session is not awaiting a cert"})
-	}
+	// certWanted means SignCSR is at (or about to reach) the receive; certCh
+	// has cap 1, so this send never blocks the read loop.
+	sess.certCh <- m
 }
 
 // connSigner adapts the §4.2 CSR-over-the-connection exchange to the
@@ -314,6 +318,12 @@ type connSigner struct {
 }
 
 func (cs *connSigner) SignCSR(ctx context.Context, csrPEM []byte) (certPEM, caPEM []byte, err error) {
+	// Mark the session as awaiting a cert BEFORE emitting the CSR, so any cert
+	// that arrives is delivered here (handleCert gates delivery on certWanted).
+	cs.svc.mu.Lock()
+	cs.sess.certWanted = true
+	cs.svc.mu.Unlock()
+
 	if err := cs.c.send(&sockproto.Message{
 		Type:    sockproto.TypeCSR,
 		ID:      cs.openID,
@@ -324,9 +334,6 @@ func (cs *connSigner) SignCSR(ctx context.Context, csrPEM []byte) (certPEM, caPE
 	}
 	select {
 	case m := <-cs.sess.certCh:
-		cs.svc.mu.Lock()
-		cs.sess.certTaken = true // a later duplicate cert now gets unexpected_cert
-		cs.svc.mu.Unlock()
 		cs.certID = m.ID
 		if m.CertPEM == "" || m.CAPEM == "" {
 			return nil, nil, fmt.Errorf("workerclient: cert message missing cert or ca")
@@ -553,7 +560,17 @@ func (s *Service) handleShutdown(c *connState, m *sockproto.Message) {
 		_ = c.send(&sockproto.Message{Type: sockproto.TypeError, ID: m.ID, Session: m.Session, Code: "no_session", Msg: "no live session"})
 		return
 	}
-	// Graceful: let an in-flight bringup finish before stopping it.
+	// Abort an in-flight bringup rather than wait for it: handleShutdown runs
+	// synchronously on the connection read loop, and a still-enrolling bringup
+	// is parked in SignCSR waiting for a cert that only THIS read loop can
+	// deliver — waiting here would deadlock the whole connection until the
+	// bringup timeout. A session that never reached ready has no worktree to
+	// flush anyway. (Matches teardownSession's cancel-then-wait.)
+	s.mu.Lock()
+	if sess.buildCancel != nil {
+		sess.buildCancel()
+	}
+	s.mu.Unlock()
 	<-sess.buildDone
 	s.mu.Lock()
 	cancel := sess.cancel
@@ -602,7 +619,10 @@ func (s *Service) handleTeardown(c *connState, m *sockproto.Message) {
 // dropped. It first ABORTS any in-flight bringup and waits for it to finish,
 // so it never races bringUp's field writes or cleans up mid-build.
 func (s *Service) teardownSession(sess *session, cleanWorktree bool) {
+	// tearingDown suppresses a racing watchdog orphanSession insert; buildCancel
+	// aborts an in-flight bringup so we never race its field writes.
 	s.mu.Lock()
+	sess.tearingDown = true
 	if sess.buildCancel != nil {
 		sess.buildCancel()
 	}
@@ -610,7 +630,8 @@ func (s *Service) teardownSession(sess *session, cleanWorktree bool) {
 	<-sess.buildDone
 
 	// bringUp has returned; read its now-stable fields under the lock. If it
-	// failed, it already cleaned up and dropped the session — nothing to do.
+	// failed OR the watchdog orphaned it concurrently, the session is gone from
+	// s.sessions — remove any orphan record it left so no phantom remains.
 	s.mu.Lock()
 	_, live := s.sessions[sess.summary.Session]
 	cancel := sess.cancel
@@ -619,6 +640,17 @@ func (s *Service) teardownSession(sess *session, cleanWorktree bool) {
 	worktree := sess.worktree
 	s.mu.Unlock()
 	if !live {
+		s.mu.Lock()
+		_, orphaned := s.orphans[sess.summary.Session]
+		delete(s.orphans, sess.summary.Session)
+		s.mu.Unlock()
+		if orphaned {
+			if cleanWorktree && worktree != "" {
+				_ = os.RemoveAll(worktree)
+			}
+			_ = os.RemoveAll(filepath.Join(s.cfg.StateDir, "identity", sess.summary.Session))
+			s.persist()
+		}
 		return
 	}
 
@@ -653,9 +685,15 @@ func (s *Service) teardownSession(sess *session, cleanWorktree bool) {
 // shredded: an orphan is dead (re-adoption is a later phase), so a
 // re-provision of the same identity re-enrolls with a fresh cert.
 func (s *Service) orphanSession(sess *session) {
+	// A teardown for this session is in progress and will do the cleanup —
+	// don't insert a phantom orphan it would then have to chase.
 	s.mu.Lock()
+	tearingDown := sess.tearingDown
 	relay := sess.relay
 	s.mu.Unlock()
+	if tearingDown {
+		return
+	}
 	if relay != nil {
 		_ = relay.Close()
 	}

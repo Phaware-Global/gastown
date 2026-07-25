@@ -478,3 +478,60 @@ func TestBareShutdownFlushesFinalCheckpoint(t *testing.T) {
 	out := git(t, rigRepo, "show", "refs/checkpoints/polecat/furiosa:main.go")
 	assert.Equal(t, "bare-shutdown", out)
 }
+
+func TestShutdownBeforeCert_DoesNotWedge(t *testing.T) {
+	proxyURL, _, _ := startProxy(t)
+	addr, svc := startService(t, proxyURL)
+
+	// On ONE connection: session_open, receive the CSR, then send shutdown
+	// WITHOUT answering the cert. handleShutdown must abort the in-flight
+	// bringup (not wait ~5 min for the bringup timeout) and reply promptly,
+	// keeping the connection's read loop responsive.
+	nc := rawDial(t, addr)
+	codec := sockproto.NewCodec(nc)
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeAuth, Token: "t0k"}))
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeHello, ID: "h", ProtoVersion: sockproto.ProtoVersion}))
+	_, err := codec.Recv()
+	require.NoError(t, err)
+	require.NoError(t, codec.Send(&sockproto.Message{
+		Type: sockproto.TypeSessionOpen, ID: "s1",
+		Session: "gt-demo-furiosa", Rig: "demo", Polecat: "furiosa", ExecMode: "native",
+	}))
+	_, err = codec.Recv() // CSR (bringUp now parked awaiting the cert)
+	require.NoError(t, err)
+
+	// Send shutdown, then a ping, and read until we see the pong. If the read
+	// loop had wedged (~5 min), no reply would arrive within the deadline.
+	// Aborting the bringup legitimately emits a stray session_error and a
+	// no_session shutdown reply (the session was dropped) before the pong —
+	// the orchestrator ignores id-mismatched replies, so the test just drains
+	// to the pong.
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeShutdown, ID: "sd", Session: "gt-demo-furiosa"}))
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypePing, ID: "p"}))
+
+	gotPong := make(chan struct{})
+	go func() {
+		for {
+			m, err := codec.Recv()
+			if err != nil {
+				return
+			}
+			if m.Type == sockproto.TypePong && m.ID == "p" {
+				close(gotPong)
+				return
+			}
+		}
+	}()
+	select {
+	case <-gotPong:
+		// Read loop stayed responsive through the shutdown-before-cert.
+	case <-time.After(20 * time.Second):
+		t.Fatal("shutdown-before-cert wedged the connection read loop")
+	}
+
+	require.Eventually(t, func() bool {
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		return len(svc.sessions) == 0
+	}, 15*time.Second, 100*time.Millisecond)
+}
