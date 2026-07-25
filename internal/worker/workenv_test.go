@@ -265,3 +265,13 @@ func TestWorkEnvDocker_CancellationAttribution(t *testing.T) {
 		assert.Contains(t, err.Error(), "boom")
 	})
 }
+
+func TestRemoveWorkContainer(t *testing.T) {
+	docker, logFile, _ := fakeDocker(t)
+	err := RemoveWorkContainer(context.Background(), docker, "MyRig", "furiosa")
+	require.NoError(t, err)
+	calls := dockerCalls(t, logFile)
+	require.Len(t, calls, 1)
+	assert.Equal(t, "rm -f gt-work-MyRig-furiosa", calls[0])
+	assert.Equal(t, "gt-work-MyRig-furiosa", WorkContainerName("MyRig", "furiosa"))
+}
