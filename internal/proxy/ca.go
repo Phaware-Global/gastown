@@ -142,6 +142,18 @@ func (ca *CA) IssueServer(cn string, extraIPs []net.IP, extraDNSNames []string, 
 	return ca.issue(cn, dnsNames, extraIPs, ttl, x509.ExtKeyUsageServerAuth)
 }
 
+// IssueClient issues a generic client-auth leaf certificate signed by the CA.
+// Used for non-polecat client identities — e.g. the orchestrator's client
+// cert on the worker-CA plane (remote-polecat-execution-socket.md §3), where
+// the CN is a daemon identity, not a gt-<rig>-<name> polecat. Polecat certs
+// must use IssuePolecat / SignPolecatCSR, which enforce the identity format.
+func (ca *CA) IssueClient(cn string, ttl time.Duration) (certPEM, keyPEM []byte, err error) {
+	if cn == "" {
+		return nil, nil, fmt.Errorf("client CN must be non-empty")
+	}
+	return ca.issue(cn, nil, nil, ttl, x509.ExtKeyUsageClientAuth)
+}
+
 // IssuePolecat issues a leaf certificate signed by the CA for a polecat (client auth).
 // cn must be in the format "gt-<rig>-<name>" with non-empty rig and name segments
 // (e.g. "gt-gastown-furiosa"). Returns an error for malformed CNs to prevent issuing
