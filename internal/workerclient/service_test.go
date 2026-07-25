@@ -18,6 +18,7 @@ import (
 	"github.com/steveyegge/gastown/internal/execution"
 	"github.com/steveyegge/gastown/internal/proxy"
 	"github.com/steveyegge/gastown/internal/socket"
+	"github.com/steveyegge/gastown/internal/sockproto"
 	"github.com/steveyegge/gastown/internal/worker"
 )
 
@@ -284,7 +285,7 @@ func TestRestart_PersistedSessionsReportOrphaned(t *testing.T) {
 	assert.Equal(t, "gt-demo-furiosa", ep.ID)
 }
 
-func TestShutdownFlushesFinalCheckpoint(t *testing.T) {
+func TestTeardownFlushesFinalCheckpoint(t *testing.T) {
 	proxyURL, ca, townRoot := startProxy(t)
 	addr, svc := startService(t, proxyURL)
 	b := newBackend(t, addr, ca)
@@ -292,8 +293,9 @@ func TestShutdownFlushesFinalCheckpoint(t *testing.T) {
 	ep, err := b.Provision(context.Background(), polecatSpec())
 	require.NoError(t, err)
 
-	// A change made right before teardown: the graceful shutdown's final
-	// flush must capture it (§9.3 via Teardown's shutdown-then-teardown).
+	// A change made right before teardown: Teardown's shutdown-then-teardown
+	// runs the graceful §9.3 final flush, which must capture it. (The bare
+	// shutdown path is covered by TestBareShutdownFlushesFinalCheckpoint.)
 	worktree := filepath.Join(svc.cfg.StateDir, "worktrees", "demo", "furiosa")
 	require.NoError(t, os.WriteFile(filepath.Join(worktree, "main.go"), []byte("final-words\n"), 0644))
 
@@ -306,3 +308,173 @@ func TestShutdownFlushesFinalCheckpoint(t *testing.T) {
 
 // silence unused import when worker types are only referenced indirectly.
 var _ = worker.CheckpointRefForPolecat
+
+func TestValidate_RejectsPathTraversal(t *testing.T) {
+	assert.NoError(t, validateSessionFields("gt-demo-furiosa", "demo", "furiosa"))
+	assert.NoError(t, validateSessionFields("a.b_c-1", "r1", "p1"))
+	for _, tc := range []struct{ session, rig, polecat string }{
+		{"../../etc", "demo", "furiosa"},
+		{"gt-demo-furiosa", "../../../etc", "cron.d"},
+		{"gt-demo-furiosa", "demo", "../../root/.ssh"},
+		{"gt-demo-furiosa", "foo/bar", "furiosa"},
+		{"..", "demo", "furiosa"},
+		{".", "demo", "furiosa"},
+		{"gt demo", "demo", "furiosa"},
+		{"", "demo", "furiosa"},
+	} {
+		assert.Error(t, validateSessionFields(tc.session, tc.rig, tc.polecat),
+			"must reject session=%q rig=%q polecat=%q", tc.session, tc.rig, tc.polecat)
+	}
+}
+
+func TestUnderRoot(t *testing.T) {
+	root := t.TempDir()
+	assert.NoError(t, underRoot(root, filepath.Join(root, "worktrees", "demo", "furiosa")))
+	assert.Error(t, underRoot(root, "/etc/cron.d"))
+	assert.Error(t, underRoot(root, filepath.Join(root, "..", "escape")))
+}
+
+// rawConn dials the service directly (bypassing the backend) so a test can
+// drop the connection at an arbitrary protocol point.
+func rawDial(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	path := strings.TrimPrefix(addr, "unix://")
+	nc, err := net.Dial("unix", path)
+	require.NoError(t, err)
+	t.Cleanup(func() { nc.Close() })
+	return nc
+}
+
+func TestSessionOpen_RejectsUnsafeIdentity(t *testing.T) {
+	proxyURL, _, _ := startProxy(t)
+	addr, _ := startService(t, proxyURL)
+	nc := rawDial(t, addr)
+	codec := sockproto.NewCodec(nc)
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeAuth, Token: "t0k"}))
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeHello, ID: "h", ProtoVersion: sockproto.ProtoVersion}))
+	ack, err := codec.Recv()
+	require.NoError(t, err)
+	require.Equal(t, sockproto.TypeHelloAck, ack.Type)
+
+	require.NoError(t, codec.Send(&sockproto.Message{
+		Type: sockproto.TypeSessionOpen, ID: "s1",
+		Session: "gt-demo-furiosa", Rig: "../../../etc", Polecat: "cron.d", ExecMode: "native",
+	}))
+	resp, err := codec.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, sockproto.TypeSessionError, resp.Type)
+	assert.Equal(t, "bad_request", resp.Code)
+}
+
+func TestDroppedConnFreesSessionSlot(t *testing.T) {
+	proxyURL, _, _ := startProxy(t)
+	addr, svc := startService(t, proxyURL, func(c *Config) { c.MaxSessions = 1 })
+
+	// Open a session and drop the connection right after session_open, before
+	// answering the CSR. The per-connection context must abort the in-flight
+	// bringup and free the single slot.
+	nc := rawDial(t, addr)
+	codec := sockproto.NewCodec(nc)
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeAuth, Token: "t0k"}))
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeHello, ID: "h", ProtoVersion: sockproto.ProtoVersion}))
+	_, err := codec.Recv() // hello_ack
+	require.NoError(t, err)
+	require.NoError(t, codec.Send(&sockproto.Message{
+		Type: sockproto.TypeSessionOpen, ID: "s1",
+		Session: "gt-demo-furiosa", Rig: "demo", Polecat: "furiosa", ExecMode: "native",
+	}))
+	_, err = codec.Recv() // the CSR; we don't answer it
+	require.NoError(t, err)
+	nc.Close() // drop the connection mid-bringup
+
+	// The slot must free promptly (per-conn ctx aborts bringup), well under
+	// the 5-minute bringup timeout.
+	require.Eventually(t, func() bool {
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		return len(svc.sessions) == 0
+	}, 15*time.Second, 100*time.Millisecond, "dropped connection must free the session slot")
+}
+
+func TestMaxSessionsExceeded(t *testing.T) {
+	proxyURL, ca, _ := startProxy(t)
+	addr, _ := startService(t, proxyURL, func(c *Config) { c.MaxSessions = 1 })
+	b := newBackend(t, addr, ca)
+
+	_, err := b.Provision(context.Background(), polecatSpec())
+	require.NoError(t, err)
+
+	// A second, different polecat exceeds the limit of 1.
+	other := execution.PolecatSpec{Rig: "demo", Polecat: "nux", Session: "gt-demo-nux"}
+	_, err = b.Provision(context.Background(), other)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "session limit")
+}
+
+func TestTeardownDuringBringup_Race(t *testing.T) {
+	proxyURL, _, _ := startProxy(t)
+	addr, svc := startService(t, proxyURL)
+
+	// Drive a session to the CSR point, then issue teardown on a SECOND
+	// connection while bringUp is blocked awaiting the cert. Under -race this
+	// exercises the teardown-vs-bringUp field synchronization.
+	nc := rawDial(t, addr)
+	codec := sockproto.NewCodec(nc)
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeAuth, Token: "t0k"}))
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeHello, ID: "h", ProtoVersion: sockproto.ProtoVersion}))
+	_, err := codec.Recv()
+	require.NoError(t, err)
+	require.NoError(t, codec.Send(&sockproto.Message{
+		Type: sockproto.TypeSessionOpen, ID: "s1",
+		Session: "gt-demo-furiosa", Rig: "demo", Polecat: "furiosa", ExecMode: "native",
+	}))
+	_, err = codec.Recv() // CSR (bringUp is now blocked awaiting the cert)
+	require.NoError(t, err)
+
+	nc2 := rawDial(t, addr)
+	codec2 := sockproto.NewCodec(nc2)
+	require.NoError(t, codec2.Send(&sockproto.Message{Type: sockproto.TypeAuth, Token: "t0k"}))
+	require.NoError(t, codec2.Send(&sockproto.Message{Type: sockproto.TypeHello, ID: "h2", ProtoVersion: sockproto.ProtoVersion}))
+	_, err = codec2.Recv()
+	require.NoError(t, err)
+	require.NoError(t, codec2.Send(&sockproto.Message{Type: sockproto.TypeTeardown, ID: "t1", Session: "gt-demo-furiosa"}))
+	resp, err := codec2.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, sockproto.TypeTeardownComplete, resp.Type)
+
+	// Session gone, slot freed, no zombie orphan.
+	require.Eventually(t, func() bool {
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		return len(svc.sessions) == 0 && len(svc.orphans) == 0
+	}, 15*time.Second, 100*time.Millisecond)
+}
+
+func TestBareShutdownFlushesFinalCheckpoint(t *testing.T) {
+	proxyURL, ca, townRoot := startProxy(t)
+	addr, svc := startService(t, proxyURL)
+	b := newBackend(t, addr, ca)
+
+	ep, err := b.Provision(context.Background(), polecatSpec())
+	require.NoError(t, err)
+
+	worktree := filepath.Join(svc.cfg.StateDir, "worktrees", "demo", "furiosa")
+	require.NoError(t, os.WriteFile(filepath.Join(worktree, "main.go"), []byte("bare-shutdown\n"), 0644))
+
+	// A bare shutdown (not teardown) via the raw protocol: the session stays
+	// but the supervisor's final flush must land.
+	nc := rawDial(t, addr)
+	codec := sockproto.NewCodec(nc)
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeAuth, Token: "t0k"}))
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeHello, ID: "h", ProtoVersion: sockproto.ProtoVersion}))
+	_, err = codec.Recv()
+	require.NoError(t, err)
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeShutdown, ID: "sd", Session: ep.ID}))
+	resp, err := codec.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, sockproto.TypeShutdownComplete, resp.Type)
+
+	rigRepo := filepath.Join(townRoot, "demo", ".repo.git")
+	out := git(t, rigRepo, "show", "refs/checkpoints/polecat/furiosa:main.go")
+	assert.Equal(t, "bare-shutdown", out)
+}
