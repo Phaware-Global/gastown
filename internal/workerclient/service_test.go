@@ -535,3 +535,53 @@ func TestShutdownBeforeCert_DoesNotWedge(t *testing.T) {
 		return len(svc.sessions) == 0
 	}, 15*time.Second, 100*time.Millisecond)
 }
+
+// newBackendWithMaxRuntime is newBackend but with an explicit short
+// max_runtime so the session's watchdog self-releases (orphans) quickly.
+func newBackendWithMaxRuntime(t *testing.T, addr string, ca *proxy.CA, maxRuntime string) *socket.SocketBackend {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"address": addr, "tls": map[string]string{"mode": "none"}, "token": "t0k",
+	})
+	require.NoError(t, err)
+	cfg := &config.ExecutionConfig{
+		Backend:       socket.BackendName,
+		ExecMode:      config.ExecModeNative,
+		CheckpointStr: "300ms",
+		MaxRuntimeStr: maxRuntime,
+		Extensions:    map[string]json.RawMessage{socket.BackendName: raw},
+	}
+	b, err := socket.New(cfg)
+	require.NoError(t, err)
+	b.Signer = &caSigner{ca: ca}
+	b.OrchestratorID = "town-test"
+	b.GTVersion = "test"
+	return b
+}
+
+func TestWatchdogOrphanThenTeardown_NoZombie(t *testing.T) {
+	proxyURL, ca, _ := startProxy(t)
+	addr, svc := startService(t, proxyURL)
+	// Short max_runtime: the session's watchdog self-releases and orphans it.
+	b := newBackendWithMaxRuntime(t, addr, ca, "800ms")
+
+	_, err := b.Provision(context.Background(), polecatSpec())
+	require.NoError(t, err)
+
+	// Wait for the watchdog to orphan the session (moved to s.orphans).
+	require.Eventually(t, func() bool {
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		_, orphaned := svc.orphans["gt-demo-furiosa"]
+		return len(svc.sessions) == 0 && orphaned
+	}, 15*time.Second, 100*time.Millisecond, "watchdog must orphan the session")
+
+	// Teardown of the orphaned session must leave NO phantom orphan behind.
+	require.NoError(t, b.Teardown(context.Background(), execution.Endpoint{
+		Backend: socket.BackendName, ID: "gt-demo-furiosa", Address: addr,
+	}))
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+	assert.Empty(t, svc.sessions)
+	assert.Empty(t, svc.orphans, "teardown of an orphaned session must remove the orphan record")
+}
