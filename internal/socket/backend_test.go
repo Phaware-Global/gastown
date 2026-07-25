@@ -35,6 +35,8 @@ type fakeWorker struct {
 	skipCSR      bool   // reply session_ready directly (reattach-style / native no-cert path)
 	failOpenWith string // non-empty → session_error code
 	refuseHello  bool
+	chatty       bool // interleave ping + empty-id stray messages before each reply
+	hang         bool // accept + handshake, then never answer a request
 }
 
 func newFakeWorker(t *testing.T) *fakeWorker {
@@ -82,6 +84,16 @@ func (w *fakeWorker) record(t string) {
 func (w *fakeWorker) handle(nc net.Conn) {
 	defer nc.Close()
 	codec := sockproto.NewCodec(nc)
+	// reply injects chatty noise (a ping + an empty-id stray) before the real
+	// reply when the chatty knob is set, so the backend's exact-ID matcher is
+	// exercised.
+	reply := func(m *sockproto.Message) {
+		if w.chatty {
+			_ = codec.Send(&sockproto.Message{Type: sockproto.TypePing})
+			_ = codec.Send(&sockproto.Message{Type: sockproto.TypeError, Code: "stray", Msg: "no id here"})
+		}
+		_ = codec.Send(m)
+	}
 	for {
 		m, err := codec.Recv()
 		if err != nil {
@@ -107,22 +119,28 @@ func (w *fakeWorker) handle(nc net.Conn) {
 				Sessions:     sess,
 			})
 		case sockproto.TypeSessionOpen:
+			if w.hang {
+				return // handshake done, but never answer the request
+			}
 			if w.failOpenWith != "" {
-				_ = codec.Send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Code: w.failOpenWith, Msg: "bad"})
+				reply(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Code: w.failOpenWith, Msg: "bad"})
 				continue
 			}
 			if w.skipCSR {
 				w.addSession(m)
-				_ = codec.Send(&sockproto.Message{Type: sockproto.TypeSessionReady, ID: m.ID, Session: m.Session, RelayAddr: "127.0.0.1:9899"})
+				reply(&sockproto.Message{Type: sockproto.TypeSessionReady, ID: m.ID, Session: m.Session, RelayAddr: "127.0.0.1:9899"})
 				continue
 			}
 			// Ask for a cert: emit a CSR (a fake PEM string is fine — the
 			// backend just forwards it to the Signer).
-			_ = codec.Send(&sockproto.Message{Type: sockproto.TypeCSR, ID: m.ID, Session: m.Session, CSRPEM: "-----FAKE CSR-----"})
+			reply(&sockproto.Message{Type: sockproto.TypeCSR, ID: m.ID, Session: m.Session, CSRPEM: "-----FAKE CSR-----"})
 		case sockproto.TypeCert:
 			w.addSession(m)
-			_ = codec.Send(&sockproto.Message{Type: sockproto.TypeSessionReady, ID: m.ID, Session: m.Session, RelayAddr: "127.0.0.1:9899"})
+			reply(&sockproto.Message{Type: sockproto.TypeSessionReady, ID: m.ID, Session: m.Session, RelayAddr: "127.0.0.1:9899"})
 		case sockproto.TypeDiscover:
+			if w.hang {
+				return
+			}
 			w.mu.Lock()
 			var out []sockproto.SessionSummary
 			for _, s := range w.sessions {
@@ -135,16 +153,24 @@ func (w *fakeWorker) handle(nc net.Conn) {
 				out = append(out, s)
 			}
 			w.mu.Unlock()
-			_ = codec.Send(&sockproto.Message{Type: sockproto.TypeSessions, ID: m.ID, Sessions: out})
+			reply(&sockproto.Message{Type: sockproto.TypeSessions, ID: m.ID, Sessions: out})
 		case sockproto.TypeShutdown:
-			_ = codec.Send(&sockproto.Message{Type: sockproto.TypeShutdownComplete, ID: m.ID, Session: m.Session, CheckpointRef: "refs/checkpoints/polecat/" + m.Session})
+			reply(&sockproto.Message{Type: sockproto.TypeShutdownComplete, ID: m.ID, Session: m.Session, CheckpointRef: "refs/checkpoints/polecat/" + m.Session})
 		case sockproto.TypeTeardown:
 			w.removeSession(m.Session)
-			_ = codec.Send(&sockproto.Message{Type: sockproto.TypeTeardownComplete, ID: m.ID, Session: m.Session})
+			reply(&sockproto.Message{Type: sockproto.TypeTeardownComplete, ID: m.ID, Session: m.Session})
 		default:
 			_ = codec.SendErr(m.ID, "unknown", m.Type)
 		}
 	}
+}
+
+// newHangingWorker returns a worker that completes the handshake but never
+// answers a control request (§ hung-worker timeout coverage).
+func newHangingWorker(t *testing.T) *fakeWorker {
+	w := newFakeWorker(t)
+	w.hang = true
+	return w
 }
 
 func (w *fakeWorker) addSession(m *sockproto.Message) {
@@ -359,4 +385,59 @@ func TestForConfig_ResolvesSocketBackend(t *testing.T) {
 	require.NoError(t, err)
 	_, ok := be.(*SocketBackend)
 	assert.True(t, ok, "ForConfig must resolve the registered socket backend, got %T", be)
+}
+
+func TestProvision_ContainerRequiresCSR(t *testing.T) {
+	w := newFakeWorker(t)
+	w.skipCSR = true          // worker jumps straight to session_ready, no CSR
+	b, _ := testBackend(t, w) // testBackend uses exec_mode container
+
+	_, err := b.Provision(context.Background(), spec())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "without a CSR exchange")
+}
+
+func TestProvision_NativeAllowsCertless(t *testing.T) {
+	w := newFakeWorker(t)
+	w.skipCSR = true
+	raw, err := json.Marshal(w.settings())
+	require.NoError(t, err)
+	cfg := &config.ExecutionConfig{
+		Backend:    BackendName,
+		ExecMode:   config.ExecModeNative,
+		Extensions: map[string]json.RawMessage{BackendName: raw},
+	}
+	b, err := New(cfg)
+	require.NoError(t, err)
+
+	ep, err := b.Provision(context.Background(), spec())
+	require.NoError(t, err)
+	assert.Equal(t, "gt-MyRig-furiosa", ep.ID)
+}
+
+func TestDiscover_BoundsHungWorker(t *testing.T) {
+	// A worker that accepts the connection, handshakes, but never replies to
+	// discover must not hang the caller (deadline-less ctx). The controlTimeout
+	// self-defense bounds it; we shrink the socket deadline via a short ctx to
+	// keep the test fast while still proving the un-hung path.
+	w := newHangingWorker(t)
+	b, _ := testBackend(t, w)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := b.Discover(ctx, execution.IdentityTags{})
+	require.Error(t, err)
+	assert.Less(t, time.Since(start), 5*time.Second, "discover must return promptly against a hung worker")
+}
+
+func TestProvision_SkipsAsyncTrafficMatchesExactID(t *testing.T) {
+	w := newFakeWorker(t)
+	w.chatty = true // interleave a ping and an empty-id stray before each reply
+	b, signer := testBackend(t, w)
+
+	ep, err := b.Provision(context.Background(), spec())
+	require.NoError(t, err)
+	assert.Equal(t, "gt-MyRig-furiosa", ep.ID)
+	assert.Equal(t, "gt-MyRig-furiosa", signer.gotCN, "must still complete the CSR exchange through the noise")
 }

@@ -143,19 +143,19 @@ func (c *conn) request(ctx context.Context, req *sockproto.Message) (*sockproto.
 	if err := c.codec.Send(req); err != nil {
 		return nil, err
 	}
+	// The reply must echo our exact nonce. Ping/pong keepalive and any other
+	// async worker traffic (including a message that omits the id) is skipped
+	// — never mistaken for the reply. The socket deadline set above bounds
+	// this loop, so a flood of non-matching messages cannot spin forever.
 	for {
 		resp, err := c.codec.Recv()
 		if err != nil {
 			return nil, err
 		}
-		// Ignore connection-scoped async traffic that isn't our reply.
-		if resp.ID != req.ID && (resp.Type == sockproto.TypePing || resp.Type == sockproto.TypePong) {
-			continue
+		if resp.ID == req.ID {
+			return resp, nil
 		}
-		if resp.ID != "" && resp.ID != req.ID {
-			continue
-		}
-		return resp, nil
+		// else: keepalive or stray async message — keep reading for our reply.
 	}
 }
 

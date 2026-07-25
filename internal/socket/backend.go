@@ -14,6 +14,10 @@ import (
 // (image pull can be slow, but not unbounded).
 const provisionTimeout = 10 * time.Minute
 
+// controlTimeout bounds a single control request (discover, teardown) so a
+// hung worker can never block a caller that passed a deadline-less context.
+const controlTimeout = 60 * time.Second
+
 // Signer signs a session CSR into a polecat cert — the daemon's proxy-CA
 // hook, injected so this package does not import the proxy CA directly (and
 // so tests can stub it). It is the socket form of core §7.2 step 2: the CSR
@@ -68,6 +72,9 @@ func (b *SocketBackend) endpointFor(spec execution.PolecatSpec) execution.Endpoi
 
 // Provision opens (or reattaches) a session on the worker (§5, core §9.4).
 func (b *SocketBackend) Provision(ctx context.Context, spec execution.PolecatSpec) (execution.Endpoint, error) {
+	// WithTimeout yields min(caller deadline, provisionTimeout): a
+	// deadline-less caller is bounded by the cap; a shorter caller deadline
+	// still wins.
 	ctx, cancel := context.WithTimeout(ctx, provisionTimeout)
 	defer cancel()
 
@@ -106,6 +113,16 @@ func (b *SocketBackend) Provision(ctx context.Context, spec execution.PolecatSpe
 	resp, err := c.request(ctx, open)
 	if err != nil {
 		return execution.Endpoint{}, fmt.Errorf("socket: session_open: %w", err)
+	}
+
+	// A container session's agent reaches the proxy only over mTLS with the
+	// session cert, so it MUST go through the CSR exchange; a worker that
+	// skips straight to session_ready would leave a container session with no
+	// polecat identity. Enforce it rather than trust the worker's choice.
+	// (Native no-cert modes may legitimately skip it — allowed for exec_mode
+	// native; revisit when native lands.)
+	if resp.Type == sockproto.TypeSessionReady && b.cfg.ExecMode != config.ExecModeNative {
+		return execution.Endpoint{}, fmt.Errorf("socket: worker returned session_ready without a CSR exchange for a %s session — no polecat cert would be issued (§4.2)", b.cfg.ExecMode)
 	}
 
 	// The worker generates its key locally and returns a CSR (§4.2, core
@@ -167,6 +184,9 @@ func (b *SocketBackend) WrapCommand(ep execution.Endpoint, agentArgv []string, e
 // Teardown ends the session on the persistent machine (§6): graceful
 // shutdown (flush) then teardown; the machine survives.
 func (b *SocketBackend) Teardown(ctx context.Context, ep execution.Endpoint) error {
+	ctx, cancel := context.WithTimeout(ctx, controlTimeout)
+	defer cancel()
+
 	c, err := b.dial(ctx)
 	if err != nil {
 		return err
@@ -193,6 +213,9 @@ func (b *SocketBackend) Teardown(ctx context.Context, ep execution.Endpoint) err
 
 // Discover lists live sessions on the worker by identity (§5, core §9.4).
 func (b *SocketBackend) Discover(ctx context.Context, filter execution.IdentityTags) ([]execution.Endpoint, error) {
+	ctx, cancel := context.WithTimeout(ctx, controlTimeout)
+	defer cancel()
+
 	c, err := b.dial(ctx)
 	if err != nil {
 		return nil, err

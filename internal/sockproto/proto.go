@@ -143,16 +143,33 @@ func (c *Codec) Send(m *Message) error {
 }
 
 // Recv reads the next message line.
+//
+// A message may exceed the bufio buffer (hello_ack / sessions grow with the
+// worker's session count), so fragments returned with bufio.ErrBufferFull are
+// accumulated until the newline, bounded by maxLine. Any Recv error
+// invalidates the connection — a partially-read oversized line leaves the
+// stream unaligned, so callers must not reuse the codec after an error.
 func (c *Codec) Recv() (*Message, error) {
 	line, err := c.r.ReadSlice('\n')
 	if err == bufio.ErrBufferFull {
-		// Drain oversized line up to maxLine, then fail decisively.
-		total := len(line)
-		for err == bufio.ErrBufferFull && total < maxLine {
+		// ReadSlice returns a slice into the reader's buffer, invalidated by
+		// the next read — copy each fragment as we accumulate.
+		buf := make([]byte, len(line), len(line)*2)
+		copy(buf, line)
+		for err == bufio.ErrBufferFull {
+			if len(buf) > maxLine {
+				return nil, fmt.Errorf("sockproto: message exceeds %d bytes", maxLine)
+			}
 			line, err = c.r.ReadSlice('\n')
-			total += len(line)
+			buf = append(buf, line...)
 		}
-		return nil, fmt.Errorf("sockproto: message exceeds %d bytes", maxLine)
+		if err != nil {
+			return nil, fmt.Errorf("sockproto: read: %w", err)
+		}
+		if len(buf) > maxLine {
+			return nil, fmt.Errorf("sockproto: message exceeds %d bytes", maxLine)
+		}
+		return decodeMessage(buf)
 	}
 	if err != nil {
 		if err == io.EOF && len(line) == 0 {
@@ -160,6 +177,12 @@ func (c *Codec) Recv() (*Message, error) {
 		}
 		return nil, fmt.Errorf("sockproto: read: %w", err)
 	}
+	return decodeMessage(line)
+}
+
+// decodeMessage unmarshals one JSON line into a Message and checks the
+// required type field.
+func decodeMessage(line []byte) (*Message, error) {
 	var m Message
 	if err := json.Unmarshal(line, &m); err != nil {
 		return nil, fmt.Errorf("sockproto: decode: %w", err)
