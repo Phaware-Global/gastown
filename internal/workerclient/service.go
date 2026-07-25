@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -59,15 +60,22 @@ type Config struct {
 	Log *slog.Logger
 }
 
-// session is one live polecat session.
+// session is one live polecat session. All mutable fields below are guarded
+// by Service.mu; bringUp runs on its own goroutine while the connection's
+// read loop keeps serving, so writes here and reads in teardown/shutdown must
+// hold the lock.
 type session struct {
-	summary sockproto.SessionSummary
+	summary sockproto.SessionSummary // State mutated under s.mu
 
-	cancel   context.CancelFunc // stops the supervisor (graceful §9.3)
-	done     chan struct{}      // closed when the supervisor has finished
-	relay    *worker.Relay
-	workEnv  *worker.WorkEnv // nil in native mode
-	worktree string
+	cancel      context.CancelFunc // stops the supervisor (graceful §9.3)
+	buildCancel context.CancelFunc // aborts an in-flight bringUp (dropped conn / early teardown)
+	relay       *worker.Relay
+	workEnv     *worker.WorkEnv // nil in native mode
+	worktree    string
+	certTaken   bool // the signed cert has been consumed by SignCSR
+
+	done      chan struct{} // closed when the supervisor has finished
+	buildDone chan struct{} // closed when bringUp returns (success or fail)
 
 	// certCh feeds the signed cert back into the in-flight bringup when the
 	// orchestrator answers our csr message.
@@ -153,6 +161,12 @@ func (c *connState) send(m *sockproto.Message) error {
 
 func (s *Service) handle(ctx context.Context, nc net.Conn) {
 	defer nc.Close()
+	// A per-connection context: a dropped connection cancels its in-flight
+	// bringups immediately (freeing the session slot) instead of leaving them
+	// blocked for the full bringup timeout waiting for a cert that can never
+	// arrive on the dead connection.
+	connCtx, connCancel := context.WithCancel(ctx)
+	defer connCancel()
 	c := &connState{codec: sockproto.NewCodec(nc)}
 
 	authed := s.cfg.Token == ""
@@ -203,7 +217,7 @@ func (s *Service) handle(ctx context.Context, nc net.Conn) {
 		case sockproto.TypeDiscover:
 			_ = c.send(&sockproto.Message{Type: sockproto.TypeSessions, ID: m.ID, Sessions: s.filtered(m.Rig, m.Polecat)})
 		case sockproto.TypeSessionOpen:
-			s.handleSessionOpen(ctx, c, m)
+			s.handleSessionOpen(connCtx, c, m)
 		case sockproto.TypeCert:
 			s.handleCert(c, m)
 		case sockproto.TypeShutdown:
@@ -221,8 +235,10 @@ func (s *Service) handle(ctx context.Context, nc net.Conn) {
 // feeds certCh, and bringup completes async, answering the CERT's id with
 // session_ready or session_error.
 func (s *Service) handleSessionOpen(ctx context.Context, c *connState, m *sockproto.Message) {
-	if m.Session == "" || m.Rig == "" || m.Polecat == "" {
-		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: "session, rig, and polecat are required"})
+	// Validate the orchestrator-supplied identity fields BEFORE they reach any
+	// filesystem or URL sink (the worker is a separate trust domain — HIGH).
+	if err := validateSessionFields(m.Session, m.Rig, m.Polecat); err != nil {
+		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "bad_request", Msg: err.Error()})
 		return
 	}
 	modeOK := false
@@ -254,8 +270,9 @@ func (s *Service) handleSessionOpen(ctx context.Context, c *connState, m *sockpr
 			Session: m.Session, Rig: m.Rig, Polecat: m.Polecat,
 			State: "starting", StartedAt: time.Now().UTC(),
 		},
-		certCh: make(chan *sockproto.Message, 1),
-		done:   make(chan struct{}),
+		certCh:    make(chan *sockproto.Message, 1),
+		done:      make(chan struct{}),
+		buildDone: make(chan struct{}),
 	}
 	s.sessions[m.Session] = sess
 	delete(s.orphans, m.Session) // a re-opened identity replaces its orphan record
@@ -264,13 +281,16 @@ func (s *Service) handleSessionOpen(ctx context.Context, c *connState, m *sockpr
 	go s.bringUp(ctx, c, m, sess)
 }
 
-// handleCert routes the signed cert to the in-flight bringup.
+// handleCert routes the signed cert to the in-flight bringup. A cert that
+// arrives after SignCSR already consumed one (certTaken) is answered with
+// unexpected_cert rather than silently accepted into the drained buffer.
 func (s *Service) handleCert(c *connState, m *sockproto.Message) {
 	s.mu.Lock()
 	sess := s.sessions[m.Session]
+	taken := sess != nil && sess.certTaken
 	s.mu.Unlock()
-	if sess == nil {
-		_ = c.send(&sockproto.Message{Type: sockproto.TypeError, ID: m.ID, Session: m.Session, Code: "no_session", Msg: "no session awaiting a cert"})
+	if sess == nil || taken {
+		_ = c.send(&sockproto.Message{Type: sockproto.TypeError, ID: m.ID, Session: m.Session, Code: "unexpected_cert", Msg: "session is not awaiting a cert"})
 		return
 	}
 	select {
@@ -284,6 +304,7 @@ func (s *Service) handleCert(c *connState, m *sockproto.Message) {
 // worker.Signer interface: SignCSR sends our csr (echoing the session_open
 // id) and blocks until handleCert feeds the orchestrator's answer.
 type connSigner struct {
+	svc    *Service
 	c      *connState
 	sess   *session
 	openID string
@@ -303,6 +324,9 @@ func (cs *connSigner) SignCSR(ctx context.Context, csrPEM []byte) (certPEM, caPE
 	}
 	select {
 	case m := <-cs.sess.certCh:
+		cs.svc.mu.Lock()
+		cs.sess.certTaken = true // a later duplicate cert now gets unexpected_cert
+		cs.svc.mu.Unlock()
 		cs.certID = m.ID
 		if m.CertPEM == "" || m.CAPEM == "" {
 			return nil, nil, fmt.Errorf("workerclient: cert message missing cert or ca")
@@ -317,20 +341,50 @@ func (cs *connSigner) SignCSR(ctx context.Context, csrPEM []byte) (certPEM, caPE
 // over the conn) → relay → worktree clone through the relay → work container
 // (container mode) → checkpoint supervisor → session_ready.
 func (s *Service) bringUp(ctx context.Context, c *connState, open *sockproto.Message, sess *session) {
+	defer close(sess.buildDone)
+
+	// Bringup is bounded (a stalled orchestrator or slow clone must not pin a
+	// half-built session) AND cancelable by teardown/dropped-conn: ctx is the
+	// per-connection context, and buildCancel lets an external teardown abort
+	// this bringup immediately.
+	buCtx, buCancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer buCancel()
+	s.mu.Lock()
+	sess.buildCancel = buCancel
+	s.mu.Unlock()
+
+	idDir := filepath.Join(s.cfg.StateDir, "identity", sess.summary.Session)
+	var relayCancel context.CancelFunc
+
+	// fail cleans up whatever this bringup started (it holds the only refs)
+	// and drops the session — WITHOUT going through teardownSession, which
+	// waits on buildDone and would deadlock here. Idempotent with a racing
+	// external teardown, which returns early once it sees the session gone.
 	fail := func(id, code string, err error) {
 		s.log.Warn("session bringup failed", "session", sess.summary.Session, "code", code, "err", err)
-		s.teardownSession(sess, true)
+		if relayCancel != nil {
+			relayCancel()
+		}
+		s.mu.Lock()
+		worktree := sess.worktree
+		we := sess.workEnv
+		delete(s.sessions, sess.summary.Session)
+		s.mu.Unlock()
+		if we != nil {
+			tctx, tcancel := context.WithTimeout(context.Background(), time.Minute)
+			_ = we.Teardown(tctx)
+			tcancel()
+		}
+		if worktree != "" {
+			_ = os.RemoveAll(worktree)
+		}
+		_ = os.RemoveAll(idDir)
+		s.persist()
 		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: id, Session: sess.summary.Session, Code: code, Msg: err.Error()})
 	}
 
-	// Bringup is bounded: a stalled orchestrator (never sends cert) or a
-	// slow clone must not pin a half-built session forever.
-	buCtx, buCancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer buCancel()
-
 	cn := "gt-" + sess.summary.Rig + "-" + sess.summary.Polecat
-	idDir := filepath.Join(s.cfg.StateDir, "identity", sess.summary.Session)
-	signer := &connSigner{c: c, sess: sess, openID: open.ID}
+	signer := &connSigner{svc: s, c: c, sess: sess, openID: open.ID}
 	id, err := worker.EnsureIdentity(buCtx, idDir, cn, signer)
 	if err != nil {
 		fail(open.ID, "identity", err)
@@ -352,8 +406,11 @@ func (s *Service) bringUp(ctx context.Context, c *connState, open *sockproto.Mes
 		fail(replyID, "relay", err)
 		return
 	}
+	s.mu.Lock()
 	sess.relay = relay
-	relayCtx, relayCancel := context.WithCancel(context.Background())
+	s.mu.Unlock()
+	relayCtx, rc := context.WithCancel(context.Background())
+	relayCancel = rc
 	relayDone := make(chan struct{})
 	go func() {
 		defer close(relayDone)
@@ -369,24 +426,30 @@ func (s *Service) bringUp(ctx context.Context, c *connState, open *sockproto.Mes
 		}
 	}
 	if relayAddr == nil {
-		relayCancel()
 		fail(replyID, "relay", fmt.Errorf("relay did not bind"))
 		return
 	}
 	relayURL := "http://" + relayAddr.String()
 
 	// Worktree: cloned THROUGH the relay from the host .repo.git, so origin
-	// already points at the control plane for checkpoint pushes (§5, §7).
-	sess.worktree = filepath.Join(s.cfg.StateDir, "worktrees", sess.summary.Rig, sess.summary.Polecat)
-	if err := os.MkdirAll(filepath.Dir(sess.worktree), 0755); err != nil {
-		relayCancel()
+	// already points at the control plane for checkpoint pushes (§5, §7). The
+	// identity fields were validated at session_open; underRoot is defense in
+	// depth so the join can never escape the state dir.
+	worktree := filepath.Join(s.cfg.StateDir, "worktrees", sess.summary.Rig, sess.summary.Polecat)
+	if err := underRoot(s.cfg.StateDir, worktree); err != nil {
 		fail(replyID, "worktree", err)
 		return
 	}
-	_ = os.RemoveAll(sess.worktree) // replace any stale tree (re-adoption is a later phase)
-	cloneURL := relayURL + "/v1/git/" + sess.summary.Rig
-	if out, err := exec.CommandContext(buCtx, "git", "clone", "--", cloneURL, sess.worktree).CombinedOutput(); err != nil {
-		relayCancel()
+	s.mu.Lock()
+	sess.worktree = worktree
+	s.mu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(worktree), 0755); err != nil {
+		fail(replyID, "worktree", err)
+		return
+	}
+	_ = os.RemoveAll(worktree) // replace any stale tree (re-adoption is a later phase)
+	cloneURL := relayURL + "/v1/git/" + url.PathEscape(sess.summary.Rig)
+	if out, err := exec.CommandContext(buCtx, "git", "clone", "--", cloneURL, worktree).CombinedOutput(); err != nil {
 		fail(replyID, "clone", fmt.Errorf("git clone via relay: %v: %s", err, strings.TrimSpace(string(out))))
 		return
 	}
@@ -402,20 +465,21 @@ func (s *Service) bringUp(ctx context.Context, c *connState, open *sockproto.Mes
 			Polecat:   sess.summary.Polecat,
 			Session:   sess.summary.Session,
 			Image:     open.Image,
-			Worktree:  sess.worktree,
+			Worktree:  worktree,
 			GTDir:     s.cfg.GTDir,
 			Sandboxed: open.NetworkMode == "sandboxed",
 			RelayPort: port,
 		})
 		if err == nil {
+			s.mu.Lock()
+			sess.workEnv = we
+			s.mu.Unlock()
 			err = we.Prepare(buCtx)
 		}
 		if err != nil {
-			relayCancel()
 			fail(replyID, "workenv", err)
 			return
 		}
-		sess.workEnv = we
 	}
 
 	// Checkpoint supervisor (§9.2, §9.5). The relay must outlive the
@@ -435,7 +499,7 @@ func (s *Service) bringUp(ctx context.Context, c *connState, open *sockproto.Mes
 	}
 	supCfg := worker.SupervisorConfig{
 		Checkpointer: &worker.Checkpointer{
-			Worktree: sess.worktree,
+			Worktree: worktree,
 			Ref:      worker.CheckpointRefForPolecat(sess.summary.Polecat),
 			Debounce: 2 * time.Second,
 		},
@@ -448,7 +512,9 @@ func (s *Service) bringUp(ctx context.Context, c *connState, open *sockproto.Mes
 	}
 	sup := worker.NewSupervisor(supCfg)
 	supCtx, supCancel := context.WithCancel(context.Background())
+	s.mu.Lock()
 	sess.cancel = supCancel
+	s.mu.Unlock()
 	go func() {
 		defer close(sess.done)
 		reason := sup.Run(supCtx)
@@ -456,7 +522,9 @@ func (s *Service) bringUp(ctx context.Context, c *connState, open *sockproto.Mes
 		<-relayDone
 		s.log.Info("session supervisor stopped", "session", sess.summary.Session, "reason", reason)
 		// A watchdog stop (max-runtime / dead-man) orphans the session (§7):
-		// the machine keeps running, the daemon reaps on next contact.
+		// the machine keeps running, the daemon reaps on next contact. A
+		// StopInterrupted came from teardown/shutdown, which do their own
+		// cleanup — don't re-insert an orphan for a session being torn down.
 		if reason != worker.StopInterrupted {
 			s.orphanSession(sess)
 		}
@@ -481,11 +549,21 @@ func (s *Service) handleShutdown(c *connState, m *sockproto.Message) {
 	s.mu.Lock()
 	sess := s.sessions[m.Session]
 	s.mu.Unlock()
-	if sess == nil || sess.cancel == nil {
+	if sess == nil {
 		_ = c.send(&sockproto.Message{Type: sockproto.TypeError, ID: m.ID, Session: m.Session, Code: "no_session", Msg: "no live session"})
 		return
 	}
-	sess.cancel()
+	// Graceful: let an in-flight bringup finish before stopping it.
+	<-sess.buildDone
+	s.mu.Lock()
+	cancel := sess.cancel
+	_, live := s.sessions[m.Session]
+	s.mu.Unlock()
+	if !live || cancel == nil {
+		_ = c.send(&sockproto.Message{Type: sockproto.TypeError, ID: m.ID, Session: m.Session, Code: "no_session", Msg: "no live session"})
+		return
+	}
+	cancel()
 	<-sess.done
 	_ = c.send(&sockproto.Message{
 		Type:          sockproto.TypeShutdownComplete,
@@ -521,24 +599,45 @@ func (s *Service) handleTeardown(c *connState, m *sockproto.Message) {
 
 // teardownSession is the §6 cleanup: supervisor down, container removed,
 // relay stopped, worktree (optionally) removed, identity shredded, state
-// dropped.
+// dropped. It first ABORTS any in-flight bringup and waits for it to finish,
+// so it never races bringUp's field writes or cleans up mid-build.
 func (s *Service) teardownSession(sess *session, cleanWorktree bool) {
-	if sess.cancel != nil {
-		sess.cancel()
+	s.mu.Lock()
+	if sess.buildCancel != nil {
+		sess.buildCancel()
+	}
+	s.mu.Unlock()
+	<-sess.buildDone
+
+	// bringUp has returned; read its now-stable fields under the lock. If it
+	// failed, it already cleaned up and dropped the session — nothing to do.
+	s.mu.Lock()
+	_, live := s.sessions[sess.summary.Session]
+	cancel := sess.cancel
+	workEnv := sess.workEnv
+	relay := sess.relay
+	worktree := sess.worktree
+	s.mu.Unlock()
+	if !live {
+		return
+	}
+
+	if cancel != nil {
+		cancel()
 		<-sess.done
 	}
-	if sess.workEnv != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-		if err := sess.workEnv.Teardown(ctx); err != nil {
+	if workEnv != nil {
+		ctx, c := context.WithTimeout(context.Background(), time.Minute)
+		if err := workEnv.Teardown(ctx); err != nil {
 			s.log.Warn("work container teardown", "session", sess.summary.Session, "err", err)
 		}
-		cancel()
+		c()
 	}
-	if sess.relay != nil {
-		_ = sess.relay.Close()
+	if relay != nil {
+		_ = relay.Close()
 	}
-	if cleanWorktree && sess.worktree != "" {
-		_ = os.RemoveAll(sess.worktree)
+	if cleanWorktree && worktree != "" {
+		_ = os.RemoveAll(worktree)
 	}
 	_ = os.RemoveAll(filepath.Join(s.cfg.StateDir, "identity", sess.summary.Session))
 
@@ -549,12 +648,16 @@ func (s *Service) teardownSession(sess *session, cleanWorktree bool) {
 }
 
 // orphanSession moves a self-stopped session (watchdog) into the orphan set.
-// The relay is stopped and the session cert is shredded: an orphan is dead
-// (re-adoption is a later phase), so a re-provision of the same identity must
-// re-enroll with a fresh cert rather than reuse the stale one.
+// Called from the supervisor goroutine after bringUp has published its fields,
+// so a plain locked read is safe. The relay is stopped and the session cert
+// shredded: an orphan is dead (re-adoption is a later phase), so a
+// re-provision of the same identity re-enrolls with a fresh cert.
 func (s *Service) orphanSession(sess *session) {
-	if sess.relay != nil {
-		_ = sess.relay.Close()
+	s.mu.Lock()
+	relay := sess.relay
+	s.mu.Unlock()
+	if relay != nil {
+		_ = relay.Close()
 	}
 	_ = os.RemoveAll(filepath.Join(s.cfg.StateDir, "identity", sess.summary.Session))
 
@@ -577,8 +680,12 @@ func (s *Service) shutdownAll() {
 	}
 	s.mu.Unlock()
 	for _, sess := range live {
-		if sess.cancel != nil {
-			sess.cancel()
+		<-sess.buildDone // let an in-flight bringup finish before stopping it
+		s.mu.Lock()
+		cancel := sess.cancel
+		s.mu.Unlock()
+		if cancel != nil {
+			cancel()
 			<-sess.done
 		}
 	}

@@ -73,7 +73,12 @@ func main() {
 			os.Exit(2)
 		}
 		_ = os.Remove(path) // stale socket from a previous run
+		// Tighten umask around the bind so the socket is never briefly
+		// exposed at default perms between Listen and Chmod (§3.3 fs gate
+		// TOCTOU). Restore it immediately after.
+		oldMask := syscall.Umask(0o077)
 		ln, err = net.Listen("unix", path)
+		syscall.Umask(oldMask)
 		if err != nil {
 			log.Error("listen", "err", err)
 			os.Exit(1)
