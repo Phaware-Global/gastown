@@ -9,6 +9,10 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -174,4 +178,99 @@ func TestEnrollWorker_RejectsBadArgs(t *testing.T) {
 func rsaKey(t *testing.T, bits int) (*rsa.PrivateKey, error) {
 	t.Helper()
 	return rsa.GenerateKey(rand.Reader, bits)
+}
+
+// TestMachineCertCannotActAsClient pins the round-1 HIGH: a machine cert must
+// NOT satisfy a client-auth requirement, or one stolen worker key would
+// authenticate as the orchestrator to every other worker.
+func TestMachineCertCannotActAsClient(t *testing.T) {
+	ca, err := LoadOrCreate(t.TempDir())
+	require.NoError(t, err)
+	certPEM, _, err := ca.SignMachineCSR(testCSR(t, "x"), "gpu-box-1")
+	require.NoError(t, err)
+	block, _ := pem.Decode(certPEM)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	require.NoError(t, err)
+
+	assert.NotContains(t, cert.ExtKeyUsage, x509.ExtKeyUsageClientAuth,
+		"machine certs must be ServerAuth-only")
+
+	pool := x509.NewCertPool()
+	require.True(t, pool.AppendCertsFromPEM(ca.CertPEM))
+	_, err = cert.Verify(x509.VerifyOptions{Roots: pool,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}})
+	assert.Error(t, err, "a machine cert must fail client-auth verification")
+}
+
+func TestCertHygiene_BasicConstraints(t *testing.T) {
+	ca, err := LoadOrCreate(t.TempDir())
+	require.NoError(t, err)
+	assert.True(t, ca.Cert.MaxPathLenZero, "CA must forbid intermediates")
+
+	certPEM, _, err := ca.SignMachineCSR(testCSR(t, "x"), "gpu-box-1")
+	require.NoError(t, err)
+	block, _ := pem.Decode(certPEM)
+	machine, err := x509.ParseCertificate(block.Bytes)
+	require.NoError(t, err)
+	assert.True(t, machine.BasicConstraintsValid, "leaf must assert CA:FALSE explicitly")
+	assert.False(t, machine.IsCA)
+
+	orchPEM, _, _, err := ca.OrchestratorMaterial()
+	require.NoError(t, err)
+	oblock, _ := pem.Decode(orchPEM)
+	orch, err := x509.ParseCertificate(oblock.Bytes)
+	require.NoError(t, err)
+	assert.True(t, orch.BasicConstraintsValid)
+	assert.False(t, orch.IsCA)
+	assert.Equal(t, OrchestratorCN, orch.Subject.CommonName)
+}
+
+func TestConcurrentRecord_NoLostUpdates(t *testing.T) {
+	// Concurrent enroll-style registry writes must not lose entries (a lost
+	// worker can never be revoked even though its cert stays valid).
+	ca, err := LoadOrCreate(t.TempDir())
+	require.NoError(t, err)
+	const n = 8
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_ = ca.Record(Worker{
+				Name: fmt.Sprintf("box-%d", i), Address: "10.0.0.1:9878",
+				Serial: fmt.Sprintf("s%d", i), EnrolledAt: time.Now(),
+			})
+		}(i)
+	}
+	wg.Wait()
+	reg, err := ca.LoadRegistry()
+	require.NoError(t, err)
+	assert.Len(t, reg.Workers, n, "concurrent Record must not lose entries")
+}
+
+func TestEnsureOrchestratorCert_RemintsWhenCARotates(t *testing.T) {
+	dir := t.TempDir()
+	ca1, err := LoadOrCreate(dir)
+	require.NoError(t, err)
+	orig, _, _, err := ca1.OrchestratorMaterial()
+	require.NoError(t, err)
+
+	// Replace the CA (as a clobbering concurrent create would) and reload:
+	// the stale orchestrator cert no longer chains, so it must be re-minted
+	// rather than left unusable.
+	require.NoError(t, os.Remove(filepath.Join(dir, WorkerCACertFile)))
+	require.NoError(t, os.Remove(filepath.Join(dir, caKeyFile)))
+	ca2, err := LoadOrCreate(dir)
+	require.NoError(t, err)
+	fresh, _, caPEM, err := ca2.OrchestratorMaterial()
+	require.NoError(t, err)
+	assert.NotEqual(t, string(orig), string(fresh), "stale orchestrator cert must be re-minted")
+
+	block, _ := pem.Decode(fresh)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	require.NoError(t, err)
+	pool := x509.NewCertPool()
+	require.True(t, pool.AppendCertsFromPEM(caPEM))
+	_, err = cert.Verify(x509.VerifyOptions{Roots: pool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}})
+	assert.NoError(t, err, "re-minted cert must chain to the current CA")
 }

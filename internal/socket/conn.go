@@ -87,7 +87,7 @@ func dialTransport(ctx context.Context, s *Settings) (net.Conn, error) {
 	// Refuse a revoked machine before presenting any credential: revocation
 	// (`gt worker revoke`) must cut a worker off immediately, not merely when
 	// its cert eventually expires (§3.1).
-	if err := checkNotRevoked(s.TLS.WorkerName); err != nil {
+	if err := checkNotRevoked(s.tlsMode(), s.TLS.WorkerName); err != nil {
 		return nil, err
 	}
 	tlsCfg, err := clientTLS(s)
@@ -98,22 +98,30 @@ func dialTransport(ctx context.Context, s *Settings) (net.Conn, error) {
 	return td.DialContext(ctx, "tcp", s.Address)
 }
 
-// checkNotRevoked consults the enrolled-worker registry. An unknown worker or
-// an unreadable registry is NOT fatal — a manual-TLS deployment need not use
-// the registry at all — but an explicit revoked entry always is.
-func checkNotRevoked(name string) error {
-	if name == "" {
+// checkNotRevoked consults the enrolled-worker registry before an auto-TLS
+// dial. It FAILS CLOSED on a present-but-unreadable registry: a corrupted,
+// truncated, or permission-broken workers.json must not silently disable
+// revocation for the whole fleet. The only tolerated absence is a registry
+// that genuinely does not exist (manual-TLS deployments never create one).
+//
+// mode is the effective TLS mode; only auto mode is registry-managed.
+func checkNotRevoked(mode, name string) error {
+	if name == "" || mode != tlsModeAuto {
 		return nil
 	}
 	dir, err := autoTLSDir()
 	if err != nil {
-		return nil //nolint:nilerr // no registry resolvable: not a revocation signal
+		return fmt.Errorf("socket: cannot resolve the worker CA dir to check revocation: %w", err)
 	}
-	ca, err := workerca.LoadRegistryFrom(dir)
+	reg, err := workerca.LoadRegistryFrom(dir)
 	if err != nil {
-		return nil //nolint:nilerr // no/unreadable registry: not a revocation signal
+		if os.IsNotExist(err) {
+			// No registry at all: nothing has ever been enrolled here.
+			return nil
+		}
+		return fmt.Errorf("socket: cannot read the enrolled-worker registry to check revocation (refusing to dial): %w", err)
 	}
-	for _, w := range ca.Workers {
+	for _, w := range reg.Workers {
 		if w.Name == name && w.Revoked {
 			return fmt.Errorf("socket: worker %q is revoked (re-enroll with `gt worker enroll %s` to restore it)", name, name)
 		}

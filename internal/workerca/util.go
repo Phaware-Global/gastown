@@ -11,7 +11,11 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"path/filepath"
 	"regexp"
+	"time"
+
+	"github.com/steveyegge/gastown/internal/lock"
 )
 
 // workerNameRe bounds enrolled worker names: they become a cert CN, a DNS SAN,
@@ -91,4 +95,40 @@ func certSerialHex(certPEM []byte) (string, error) {
 		return "", fmt.Errorf("workerca: parse cert: %w", err)
 	}
 	return cert.SerialNumber.Text(16), nil
+}
+
+// lockDir takes an exclusive advisory lock on the material dir, serializing
+// read-modify-write sequences (registry updates, first CA creation) across
+// concurrent gt invocations.
+func lockDir(dir string) (func(), error) {
+	unlock, err := lock.FlockAcquire(filepath.Join(dir, ".workerca.lock"))
+	if err != nil {
+		return nil, fmt.Errorf("workerca: lock material dir: %w", err)
+	}
+	return unlock, nil
+}
+
+// orchestratorCertValid reports whether an existing orchestrator cert both
+// parses and still chains to the CURRENT CA — if the CA was replaced, the old
+// client cert is useless and must be re-minted.
+func (ca *CA) orchestratorCertValid(certPath string) bool {
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return false
+	}
+	block, _ := pem.Decode(certPEM)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return false
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return false
+	}
+	if err := cert.CheckSignatureFrom(ca.Cert); err != nil {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(ca.Dir, OrchestratorKeyFile)); err != nil {
+		return false
+	}
+	return time.Now().Before(cert.NotAfter)
 }

@@ -47,10 +47,13 @@ const (
 	OrchestratorKeyFile  = "orchestrator.key"
 	// RegistryFile is the enrolled-worker registry.
 	RegistryFile = "workers.json"
+	// OrchestratorCN is the CN of the daemon's client cert. Workers PIN this
+	// on their accept side: only a cert with this exact CN may act as the
+	// orchestrator, so no other worker-CA-signed identity can stand in.
+	OrchestratorCN = "gt-orchestrator"
 
-	caKeyFile     = "worker-ca.key"
-	registryTmp   = "workers.json.tmp"
-	orchestatorCN = "gt-orchestrator"
+	caKeyFile   = "worker-ca.key"
+	registryTmp = "workers.json.tmp"
 )
 
 // Lifetimes. Machine certs are long-lived (an enrolled machine is a durable
@@ -89,6 +92,16 @@ func LoadOrCreate(dir string) (*CA, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("workerca: create dir: %w", err)
 	}
+	// Serialize first-create: two concurrent callers would otherwise each mint
+	// a DIFFERENT CA, the last clobbering worker-ca.crt/.key while
+	// orchestrator.crt still chains to the loser — leaving every worker
+	// enrolled thereafter permanently undialable.
+	unlock, err := lockDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
 	ca, err := load(dir)
 	if err == nil {
 		return ca, nil
@@ -143,6 +156,7 @@ func create(dir string) (*CA, error) {
 		IsCA:                  true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		BasicConstraintsValid: true,
+		MaxPathLenZero:        true, // no intermediate CAs beneath this one
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
@@ -176,7 +190,7 @@ func create(dir string) (*CA, error) {
 // ensureOrchestratorCert mints the daemon's client cert if absent.
 func (ca *CA) ensureOrchestratorCert() error {
 	certPath := filepath.Join(ca.Dir, OrchestratorCertFile)
-	if _, err := os.Stat(certPath); err == nil {
+	if ca.orchestratorCertValid(certPath) {
 		return nil
 	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -188,12 +202,14 @@ func (ca *CA) ensureOrchestratorCert() error {
 		return err
 	}
 	tmpl := &x509.Certificate{
-		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: orchestatorCN},
-		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(orchTTL),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: OrchestratorCN},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(orchTTL),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true, // assert CA:FALSE explicitly
+		IsCA:                  false,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.Cert, &key.PublicKey, ca.Key)
 	if err != nil {
@@ -244,16 +260,21 @@ func (ca *CA) SignMachineCSR(csrPEM []byte, name string) (certPEM []byte, notAft
 	}
 	expiry := time.Now().Add(machineTTL)
 	tmpl := &x509.Certificate{
-		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: name},
-		DNSNames:     []string{name},
-		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     expiry,
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		// A worker is a TLS server on the control connection AND presents this
-		// identity; client auth is included so the same cert works if a future
-		// reverse-connection mode lands.
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: name},
+		DNSNames:              []string{name},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              expiry,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true, // assert CA:FALSE explicitly
+		IsCA:                  false,
+		// ServerAuth ONLY. A machine cert must never be usable as a CLIENT
+		// cert: workers verify inbound client certs against this same CA, so a
+		// ClientAuth machine cert would let anyone holding one worker's key
+		// authenticate to every OTHER worker as the orchestrator — fleet-wide
+		// lateral movement. If a reverse-connection mode ever lands it gets its
+		// own cert, not this one.
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.Cert, csr.PublicKey, ca.Key)
 	if err != nil {
@@ -329,6 +350,12 @@ func (ca *CA) SaveRegistry(r *Registry) error {
 
 // Record adds or replaces a worker entry (re-enrollment rotates in place).
 func (ca *CA) Record(w Worker) error {
+	unlock, err := lockDir(ca.Dir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	r, err := ca.LoadRegistry()
 	if err != nil {
 		return err
@@ -350,6 +377,12 @@ func (ca *CA) Record(w Worker) error {
 // Revoke marks an enrolled worker revoked. The daemon refuses to dial a
 // revoked worker; the serial is recorded so a future CRL/denylist can use it.
 func (ca *CA) Revoke(name string) error {
+	unlock, err := lockDir(ca.Dir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	r, err := ca.LoadRegistry()
 	if err != nil {
 		return err
