@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -273,4 +274,56 @@ func TestEnsureOrchestratorCert_RemintsWhenCARotates(t *testing.T) {
 	require.True(t, pool.AppendCertsFromPEM(caPEM))
 	_, err = cert.Verify(x509.VerifyOptions{Roots: pool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}})
 	assert.NoError(t, err, "re-minted cert must chain to the current CA")
+}
+
+func TestValidWorkerName_ReservesOrchestratorCN(t *testing.T) {
+	// A machine cert with CN gt-orchestrator would satisfy the worker's CN
+	// pin, coupling the two impersonation barriers.
+	assert.False(t, ValidWorkerName(OrchestratorCN))
+	ca, err := LoadOrCreate(t.TempDir())
+	require.NoError(t, err)
+	_, _, err = ca.SignMachineCSR(testCSR(t, "x"), OrchestratorCN)
+	require.Error(t, err, "the CA must refuse to mint a machine cert with the orchestrator CN")
+}
+
+func TestConcurrentLoadOrCreate_OrchestratorPairStaysMatched(t *testing.T) {
+	// Concurrent LoadOrCreate (scripted fleet bring-up) — including the
+	// re-mint path after the orchestrator cert is invalidated — must never
+	// leave orchestrator.crt/.key as a mismatched pair, which would make the
+	// daemon unable to dial ANY worker.
+	dir := t.TempDir()
+	ca, err := LoadOrCreate(dir)
+	require.NoError(t, err)
+	// Invalidate the orchestrator cert so every concurrent caller re-mints.
+	require.NoError(t, os.Remove(filepath.Join(dir, OrchestratorKeyFile)))
+	_ = ca
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if c, err := LoadOrCreate(dir); err == nil {
+				_, _, _, _ = c.OrchestratorMaterial()
+			}
+		}()
+	}
+	wg.Wait()
+
+	// The surviving pair must load as a valid keypair and chain to the CA.
+	pair, err := tls.LoadX509KeyPair(
+		filepath.Join(dir, OrchestratorCertFile), filepath.Join(dir, OrchestratorKeyFile))
+	require.NoError(t, err, "orchestrator cert/key must remain a matched pair")
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	require.NoError(t, err)
+	final, err := LoadOrCreate(dir)
+	require.NoError(t, err)
+	assert.NoError(t, leaf.CheckSignatureFrom(final.Cert), "pair must chain to the current CA")
+
+	// No temp files left behind.
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	for _, e := range entries {
+		assert.NotContains(t, e.Name(), ".tmp", "no temp files may survive")
+	}
 }

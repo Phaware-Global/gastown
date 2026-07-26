@@ -103,13 +103,25 @@ func LoadOrCreate(dir string) (*CA, error) {
 	defer unlock()
 
 	ca, err := load(dir)
-	if err == nil {
-		return ca, nil
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+		if ca, err = create(dir); err != nil {
+			return nil, err
+		}
 	}
-	if !os.IsNotExist(err) {
+	// Ensure/re-mint the orchestrator cert HERE, while the dir lock is still
+	// held: it writes two files (cert + key) that must stay a matched pair, and
+	// doing it later (from OrchestratorMaterial) would let two concurrent
+	// enrolls interleave those writes into a mismatched pair — leaving the
+	// daemon unable to dial ANY worker. It cannot take the lock itself:
+	// create() already runs under this same flock, and re-acquiring would
+	// self-deadlock.
+	if err := ca.ensureOrchestratorCert(); err != nil {
 		return nil, err
 	}
-	return create(dir)
+	return ca, nil
 }
 
 func load(dir string) (*CA, error) {
@@ -177,14 +189,9 @@ func create(dir string) (*CA, error) {
 	if err != nil {
 		return nil, fmt.Errorf("workerca: parse new CA cert: %w", err)
 	}
-	ca := &CA{Dir: dir, Cert: cert, CertPEM: certPEM, Key: key}
-
-	// The orchestrator's own client cert, which workers verify against this
-	// same CA (§3.1 step 2 returns it as the client-cert CA).
-	if err := ca.ensureOrchestratorCert(); err != nil {
-		return nil, err
-	}
-	return ca, nil
+	// The orchestrator's own client cert (which workers verify against this
+	// same CA, §3.1 step 2) is minted by LoadOrCreate under the dir lock.
+	return &CA{Dir: dir, Cert: cert, CertPEM: certPEM, Key: key}, nil
 }
 
 // ensureOrchestratorCert mints the daemon's client cert if absent.
@@ -285,10 +292,10 @@ func (ca *CA) SignMachineCSR(csrPEM []byte, name string) (certPEM []byte, notAft
 
 // OrchestratorMaterial returns the daemon's client cert/key PEM and the worker
 // CA cert PEM — what a worker needs to verify the daemon (§3.1 step 2).
+// The material is minted/re-minted by LoadOrCreate under the dir lock, so
+// this only reads — minting here would escape that lock and could interleave
+// the cert/key writes of two concurrent callers into a mismatched pair.
 func (ca *CA) OrchestratorMaterial() (certPEM, keyPEM, caPEM []byte, err error) {
-	if err := ca.ensureOrchestratorCert(); err != nil {
-		return nil, nil, nil, err
-	}
 	certPEM, err = os.ReadFile(filepath.Join(ca.Dir, OrchestratorCertFile))
 	if err != nil {
 		return nil, nil, nil, err
