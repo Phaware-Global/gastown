@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/url"
@@ -56,6 +57,11 @@ type Config struct {
 	ExecModes []string
 	// Docker reports a usable docker daemon (capabilities.docker).
 	Docker bool
+	// AgentEnvFile is an operator-managed KEY=VALUE file supplying worker-local
+	// agent credentials (§8) — this provider's form of the externalized
+	// agent-auth contract (core §7.1). Injected into the agent process
+	// worker-side; never transmitted over the socket.
+	AgentEnvFile string
 
 	Log *slog.Logger
 }
@@ -161,6 +167,7 @@ func (s *Service) Serve(ctx context.Context, ln net.Listener) error {
 // bringup completes on a goroutine while the read loop keeps serving.
 type connState struct {
 	codec  *sockproto.Codec
+	nc     net.Conn
 	sendMu sync.Mutex
 }
 
@@ -170,6 +177,32 @@ func (c *connState) send(m *sockproto.Message) error {
 	return c.codec.Send(m)
 }
 
+// writeFrame writes one §4.3 frame under the same lock as message sends, so a
+// frame's header and payload can never interleave with another writer's.
+func (c *connState) writeFrame(t sockproto.FrameType, payload []byte) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	return sockproto.WriteFrame(c.nc, t, payload)
+}
+
+// writeExit writes the terminal exit frame.
+func (c *connState) writeExit(code int) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	return sockproto.WriteExitFrame(c.nc, code)
+}
+
+// expireReads pushes the connection's read deadline into the past, unblocking
+// a goroutine parked in a socket read. Writes are unaffected.
+func (c *connState) expireReads() error {
+	return c.nc.SetReadDeadline(time.Now().Add(-time.Second))
+}
+
+// frameReader returns the reader an exec stream must read frames from: the
+// codec's BUFFERED reader, since bytes past the attach preamble line may
+// already be buffered and would be lost by reading the raw conn.
+func (c *connState) frameReader() io.Reader { return c.codec.Reader() }
+
 func (s *Service) handle(ctx context.Context, nc net.Conn) {
 	defer nc.Close()
 	// A per-connection context: a dropped connection cancels its in-flight
@@ -178,7 +211,7 @@ func (s *Service) handle(ctx context.Context, nc net.Conn) {
 	// arrive on the dead connection.
 	connCtx, connCancel := context.WithCancel(ctx)
 	defer connCancel()
-	c := &connState{codec: sockproto.NewCodec(nc)}
+	c := &connState{codec: sockproto.NewCodec(nc), nc: nc}
 
 	authed := s.cfg.Token == ""
 	helloed := false
@@ -233,6 +266,12 @@ func (s *Service) handle(ctx context.Context, nc net.Conn) {
 			s.handleCert(c, m)
 		case sockproto.TypeShutdown:
 			s.handleShutdown(c, m)
+		case sockproto.TypeAttach:
+			// An exec stream takes over this connection (§4.3): after the ack
+			// it carries only binary frames, so the control loop must not read
+			// from it again.
+			s.handleAttach(connCtx, c, m)
+			return
 		case sockproto.TypeTeardown:
 			s.handleTeardown(c, m)
 		default:

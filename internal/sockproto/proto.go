@@ -4,8 +4,9 @@
 // messages on the control connection, one object per line, UTF-8. Requests
 // carry an ID nonce; responses echo it.
 //
-// The §4.3 exec-stream framing (binary frames after an attach preamble)
-// arrives with the exec-streaming increment and is not defined here yet.
+// The §4.3 exec-stream framing (binary frames after an attach preamble) lives
+// in frame.go: a connection speaks JSON messages until attach/attach_ack, then
+// switches to frames on the SAME connection.
 package sockproto
 
 import (
@@ -36,6 +37,11 @@ const (
 	TypeEnrollCSR      = "enroll_csr"      // worker → orch: machine CSR
 	TypeEnrollComplete = "enroll_complete" // orch → worker: machine cert + CAs
 	TypeEnrollAck      = "enroll_ack"      // worker → orch: material persisted
+
+	// Exec stream (§4.3): attach opens one, then the connection switches to
+	// binary frames.
+	TypeAttach    = "attach"
+	TypeAttachAck = "attach_ack"
 
 	TypeSessionOpen      = "session_open"
 	TypeCSR              = "csr"
@@ -113,6 +119,13 @@ type Message struct {
 
 	// session_ready (§4.2)
 	RelayAddr string `json:"relay_addr,omitempty"`
+
+	// attach (§4.3, §5): the agent command to exec worker-side, plus the
+	// NON-SECRET session env it needs (core §7.4). Secret env is delivered
+	// worker-side via the operator's agent env file (§8) and never rides
+	// this payload.
+	Argv []string `json:"argv,omitempty"`
+	TTY  bool     `json:"tty,omitempty"`
 
 	// shutdown / teardown (§4.2)
 	Reason        string `json:"reason,omitempty"`
@@ -206,6 +219,12 @@ func decodeMessage(line []byte) (*Message, error) {
 	}
 	return &m, nil
 }
+
+// Reader returns the codec's buffered reader. After the attach preamble a
+// connection switches to §4.3 frames on the SAME stream, so the frame reader
+// MUST continue from this buffer — reading the raw conn instead would drop any
+// bytes the codec already buffered past the preamble line.
+func (c *Codec) Reader() io.Reader { return c.r }
 
 // SendErr writes a typed error response echoing id.
 func (c *Codec) SendErr(id, code, msg string) error {
