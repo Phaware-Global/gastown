@@ -801,8 +801,6 @@ func executeKeychainRotation(
 	return result
 }
 
-
-
 // Watch command flags
 var (
 	watchInterval time.Duration

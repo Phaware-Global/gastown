@@ -11,7 +11,7 @@ import (
 func TestRigAddURLValidation(t *testing.T) {
 	_ = mockBdCommand(t)
 	townRoot := setupTestTown(t)
-	
+
 	// We need to be in the workspace for FindFromCwdOrError
 	oldCwd, _ := os.Getwd()
 	if err := os.Chdir(townRoot); err != nil {
@@ -20,7 +20,7 @@ func TestRigAddURLValidation(t *testing.T) {
 	defer os.Chdir(oldCwd)
 
 	gitURL := "https://github.com/org/repo.git"
-	
+
 	tests := []struct {
 		name        string
 		pushURL     string
@@ -47,7 +47,7 @@ func TestRigAddURLValidation(t *testing.T) {
 			rigAddPushURL = tt.pushURL
 			rigAddUpstreamURL = tt.upstreamURL
 			rigAddAdopt = false
-			
+
 			// Call runRigAdd
 			err := runRigAdd(nil, []string{"myrig", gitURL})
 			if err == nil {

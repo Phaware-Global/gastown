@@ -331,15 +331,15 @@ func escalationFingerprintLabel(raw string) string {
 }
 
 type deliveryStatus struct {
-	Target            string `json:"target,omitempty"`
-	Channel           string `json:"channel"`
-	Created           bool   `json:"created,omitempty"`
-	Persisted         bool   `json:"persisted,omitempty"`
-	RuntimeNotified   bool   `json:"runtime_notified,omitempty"`
-	Annotated         bool   `json:"annotated,omitempty"`
-	Severity          string `json:"severity,omitempty"`
-	Error             string `json:"error,omitempty"`
-	Warning           string `json:"warning,omitempty"`
+	Target          string `json:"target,omitempty"`
+	Channel         string `json:"channel"`
+	Created         bool   `json:"created,omitempty"`
+	Persisted       bool   `json:"persisted,omitempty"`
+	RuntimeNotified bool   `json:"runtime_notified,omitempty"`
+	Annotated       bool   `json:"annotated,omitempty"`
+	Severity        string `json:"severity,omitempty"`
+	Error           string `json:"error,omitempty"`
+	Warning         string `json:"warning,omitempty"`
 	// Skipped is set true on external-notification actions (email/sms/slack)
 	// that couldn't run because their contact field is unset in
 	// settings/escalation.json. The G39 hard-fail collector keys off this

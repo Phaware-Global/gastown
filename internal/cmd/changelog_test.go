@@ -96,12 +96,12 @@ func TestChangelogSinceTime(t *testing.T) {
 	expectedWeekStart := time.Date(monY, monM, monD, 0, 0, 0, 0, time.Local)
 
 	tests := []struct {
-		name        string
-		today       bool
-		week        bool
-		since       string
-		wantTime    time.Time
-		wantErrSub  string
+		name       string
+		today      bool
+		week       bool
+		since      string
+		wantTime   time.Time
+		wantErrSub string
 	}{
 		{
 			name:     "--today returns start of today",
@@ -317,4 +317,3 @@ func writeFakeBD(t *testing.T, binDir, output string) {
 		t.Fatalf("write fake bd: %v", err)
 	}
 }
-

@@ -37,8 +37,8 @@ If nothing is queued, outputs {"decision":"approve"} and the agent goes idle.
 
 This command must complete in <500ms as it runs on every turn boundary.
 All output goes to stdout as JSON for Claude Code to consume.`,
-	Args:    cobra.NoArgs,
-	RunE:    runSignalStop,
+	Args: cobra.NoArgs,
+	RunE: runSignalStop,
 	// Silence usage on error — this is a machine-consumed command
 	SilenceUsage:  true,
 	SilenceErrors: true,

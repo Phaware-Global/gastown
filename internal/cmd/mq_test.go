@@ -378,7 +378,7 @@ func TestMRFilteringByLabel(t *testing.T) {
 			issue: &beads.Issue{
 				ID:     "mr-1",
 				Title:  "Merge: test-branch",
-				Type:   "task", // Wrong type (default from bd create)
+				Type:   "task",                       // Wrong type (default from bd create)
 				Labels: []string{"gt:merge-request"}, // Correct label
 			},
 			wantIsMR: true,

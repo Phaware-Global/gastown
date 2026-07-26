@@ -177,9 +177,9 @@ type polecatBranchResult struct {
 //     caller's uncommitted work would be lost or contaminated)
 //   - anything else (main, master,     → fetch the repo's default branch, then
 //     detached, residual)                check out the target: plain checkout if
-//                                        it already exists locally
-//                                        (polecatBranchResumed), else create it
-//                                        from origin/<default> (polecatBranchCreated)
+//     it already exists locally
+//     (polecatBranchResumed), else create it
+//     from origin/<default> (polecatBranchCreated)
 //
 // git operations run via exec.Command (a subprocess of `gt`), NOT a Bash tool
 // call from the LLM, so the tap-guard PreToolUse hook — which blocks raw

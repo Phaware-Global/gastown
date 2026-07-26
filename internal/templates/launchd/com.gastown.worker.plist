@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gastown.worker</string>
+
+    <!-- Sources <state-dir>/worker.env (0600) before exec so secrets — the
+         unix-mode pre-shared token — reach the worker through the environment
+         instead of argv, which is world-readable via ps. launchd inherits a
+         stripped environment, so shell rc files do not propagate; `set -a`
+         matches systemd's EnvironmentFile semantics. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>set -a; [ -r "{{.StateDir}}/worker.env" ] &amp;&amp; . "{{.StateDir}}/worker.env"; set +a; exec "{{.BinaryPath}}"{{range .Args}} {{.}}{{end}}</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{{.StateDir}}</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- A worker that exits has abandoned its sessions; the orchestrator sees
+         them as orphaned and re-provisions. Always come back. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>{{.StateDir}}/worker.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{.StateDir}}/worker.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{.Path}}</string>
+    </dict>
+
+    <!-- The agent is interactive work, not a batch job: Background would have
+         it throttled and its I/O deprioritized. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

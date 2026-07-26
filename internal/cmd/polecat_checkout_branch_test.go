@@ -29,18 +29,18 @@ func TestBeadIDPattern(t *testing.T) {
 
 		// Negatives — guard against shell-injection / branch-name pollution.
 		{"", false},
-		{"gt", false},                 // no suffix
-		{"gt-", false},                // empty suffix
-		{"GT-MWY", false},             // uppercase prefix
-		{"gt-MWY", false},             // uppercase body
-		{"gt mwy", false},             // space
-		{"gt-mwy/something", false},   // slash
-		{"gt-mwy;rm -rf /", false},    // shell metacharacter
-		{"gt-mwy`whoami`", false},     // backticks
-		{"gt-mwy$(whoami)", false},    // command substitution
-		{"a-mwy", false},              // 1-char prefix
-		{"abcd-mwy", false},           // 4-char prefix (we cap at 3)
-		{"--gt-mwy", false},           // leading dashes
+		{"gt", false},               // no suffix
+		{"gt-", false},              // empty suffix
+		{"GT-MWY", false},           // uppercase prefix
+		{"gt-MWY", false},           // uppercase body
+		{"gt mwy", false},           // space
+		{"gt-mwy/something", false}, // slash
+		{"gt-mwy;rm -rf /", false},  // shell metacharacter
+		{"gt-mwy`whoami`", false},   // backticks
+		{"gt-mwy$(whoami)", false},  // command substitution
+		{"a-mwy", false},            // 1-char prefix
+		{"abcd-mwy", false},         // 4-char prefix (we cap at 3)
+		{"--gt-mwy", false},         // leading dashes
 	}
 	for _, c := range cases {
 		t.Run(c.in, func(t *testing.T) {
