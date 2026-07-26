@@ -26,7 +26,11 @@ var controlTimeout = 60 * time.Second
 // arrives over the mTLS control connection, and the daemon signs it only for
 // the identity of the session it opened (§4.2 channel binding).
 type Signer interface {
-	SignSessionCSR(ctx context.Context, csrPEM []byte, expectedCN string) (certPEM, caPEM []byte, notAfter time.Time, err error)
+	// SignSessionCSR signs csrPEM for the given polecat identity. rig/polecat
+	// travel STRUCTURALLY rather than as a pre-built CN so no implementation
+	// has to split one back apart: cnToIdentity splits on the last hyphen, so a
+	// hyphenated polecat name makes that lossy.
+	SignSessionCSR(ctx context.Context, csrPEM []byte, rig, polecat string) (certPEM, caPEM []byte, notAfter time.Time, err error)
 }
 
 // SocketBackend is the ExecutionBackend for pre-provisioned socket workers.
@@ -39,20 +43,40 @@ type SocketBackend struct {
 	GTVersion      string
 	// Signer performs the proxy-CA CSR signing (§4.2). Required for Provision
 	// to complete a fresh session; a nil Signer still allows Discover/Teardown
-	// and reattach of an already-certified live session.
+	// and reattach of an already-certified live session. New() installs the
+	// admin-API signer, so a backend built through the registry always has one
+	// — a nil Signer here means a caller constructed the struct directly.
 	Signer Signer
 
 	// dialFn is overridable in tests; nil uses the real dialer.
 	dialFn func(ctx context.Context, s *Settings, orchestratorID, gtVersion string) (*conn, error)
 }
 
-// New builds a SocketBackend from a rig execution config.
+// New builds a SocketBackend from a rig execution config, wired for real use:
+// the CSR signer is installed here, so a backend resolved through
+// execution.ForConfig can complete a session bringup. (Provision needs it for
+// EVERY session — the worker generates its key locally and CSRs over the
+// control connection regardless of exec mode — so a backend without one is
+// useful for nothing but Discover/Teardown.)
 func New(cfg *config.ExecutionConfig) (*SocketBackend, error) {
 	s, err := parseSettings(cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &SocketBackend{cfg: cfg, settings: s}, nil
+	signer, err := newAdminSigner(s.AdminURL)
+	if err != nil {
+		return nil, err
+	}
+	return &SocketBackend{
+		cfg:            cfg,
+		settings:       s,
+		Signer:         signer,
+		OrchestratorID: orchestratorID(),
+		// GTVersion is left empty until push_binaries (§11 phase 4) actually
+		// consumes it; nothing reads it today, and plumbing the version
+		// constant down from internal/cmd would be an import cycle for a field
+		// with no reader.
+	}, nil
 }
 
 func (b *SocketBackend) dial(ctx context.Context) (*conn, error) {
@@ -100,7 +124,6 @@ func (b *SocketBackend) Provision(ctx context.Context, spec execution.PolecatSpe
 		return execution.Endpoint{}, fmt.Errorf("socket: worker at %s is at its session limit (%d)", b.settings.Address, cap.MaxSessions)
 	}
 
-	cn := "gt-" + spec.Rig + "-" + spec.Polecat
 	open := &sockproto.Message{
 		Type:               sockproto.TypeSessionOpen,
 		Session:            spec.Session,
@@ -133,7 +156,7 @@ func (b *SocketBackend) Provision(ctx context.Context, spec execution.PolecatSpe
 		if b.Signer == nil {
 			return execution.Endpoint{}, fmt.Errorf("socket: worker sent a CSR but no Signer is configured")
 		}
-		certPEM, caPEM, notAfter, err := b.Signer.SignSessionCSR(ctx, []byte(resp.CSRPEM), cn)
+		certPEM, caPEM, notAfter, err := b.Signer.SignSessionCSR(ctx, []byte(resp.CSRPEM), spec.Rig, spec.Polecat)
 		if err != nil {
 			return execution.Endpoint{}, fmt.Errorf("socket: signing session CSR: %w", err)
 		}
