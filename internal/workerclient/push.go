@@ -366,7 +366,31 @@ func (s *Service) containerInject() (gtDir, proxyClient string, err error) {
 			return gtDir, candidate, nil
 		}
 	}
-	s.log.Warn("no gt-proxy-client to inject; the agent will have no gt/bd until one is pushed",
-		"platform", platform, "looked_in", candidates)
-	return gtDir, "", nil
+	// Fail LOUDLY rather than start a mute agent. An earlier version warned and
+	// carried on, claiming the next provision would fix it — which is false on
+	// the cross-platform path, where an up-to-date worker was never sent
+	// container binaries at all. A container session whose agent cannot run
+	// `gt` cannot call `gt done`: it looks alive and accomplishes nothing,
+	// which is worse than a session that refuses to start with a clear reason.
+	return "", "", fmt.Errorf("no gt-proxy-client to inject for container platform %s (looked in %v) — the orchestrator has not pushed it; `gt worker push-binaries <rig>` from the orchestrator, or `make dist` there if it has no %s artifacts",
+		platform, candidates, platform)
+}
+
+// hasContainerBinaries reports whether an injectable client exists for the
+// container platform, so the orchestrator can push one even when versions
+// already match.
+func (s *Service) hasContainerBinaries() bool {
+	platform := s.containerPlatform()
+	if platform == "" {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(s.containerBinDir(platform), BinProxyClient)); err == nil {
+		return true
+	}
+	// A same-platform container runs the worker's own binary.
+	if platform == sockproto.PlatformTag(runtime.GOOS, runtime.GOARCH) {
+		_, err := os.Stat(filepath.Join(s.binDir(), BinProxyClient))
+		return err == nil
+	}
+	return false
 }

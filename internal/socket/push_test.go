@@ -319,3 +319,53 @@ func TestPushBinaries_RefusesAMaliciousWorkerPlatform(t *testing.T) {
 		assert.Contains(t, err.Error(), "container platform")
 	})
 }
+
+// TestPushBinaries_PushesContainerBinariesEvenWhenVersionsMatch pins the
+// fail-open path this closes: a worker can be exactly up to date and still have
+// never received container binaries (fresh enrollment, wiped state dir). Gating
+// that push on version equality left every container session running an agent
+// with no gt/bd at all — indefinitely, behind a warning.
+func TestPushBinaries_PushesContainerBinariesEvenWhenVersionsMatch(t *testing.T) {
+	root := t.TempDir()
+	native := filepath.Join(root, PlatformDir(runtime.GOOS, runtime.GOARCH))
+	require.NoError(t, os.MkdirAll(native, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(native, "gt-proxy-client"), []byte("native"), 0755))
+	linux := filepath.Join(root, PlatformDir("linux", "amd64"))
+	require.NoError(t, os.MkdirAll(linux, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(linux, "gt-proxy-client"), []byte("linux"), 0755))
+	defer SetBinarySourceForTest(root)()
+
+	w := newFakeWorker(t)
+	w.gtVersion = "1.2.3"
+	w.containerPlatform = "linux-amd64"
+	w.containerBinaries = false // up to date, but never sent container binaries
+	b, _ := testBackend(t, w)
+	b.GTVersion = "1.2.3"
+
+	c, err := b.dial(context.Background())
+	require.NoError(t, err)
+	defer c.close()
+	require.NoError(t, b.pushBinaries(context.Background(), c))
+
+	got := w.pushed()
+	assert.Contains(t, got, "linux-amd64/gt-proxy-client", "the container binaries must be sent")
+	assert.NotContains(t, got, "gt-proxy-client", "the worker's own are current, so they must not be resent")
+}
+
+// TestPushBinaries_SkipsEverythingWhenNothingIsMissing pins the other side: a
+// current worker that already holds its container binaries costs nothing on the
+// provision path.
+func TestPushBinaries_SkipsEverythingWhenNothingIsMissing(t *testing.T) {
+	w := newFakeWorker(t)
+	w.gtVersion = "1.2.3"
+	w.containerPlatform = "linux-amd64"
+	w.containerBinaries = true
+	b, _ := testBackend(t, w)
+	b.GTVersion = "1.2.3"
+
+	c, err := b.dial(context.Background())
+	require.NoError(t, err)
+	defer c.close()
+	require.NoError(t, b.pushBinaries(context.Background(), c))
+	assert.Empty(t, w.pushed())
+}

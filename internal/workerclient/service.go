@@ -339,8 +339,11 @@ func (s *Service) handle(ctx context.Context, nc net.Conn) {
 					ExecModes:   s.cfg.ExecModes,
 					MaxSessions: s.cfg.MaxSessions,
 					// The work container is a Linux container even here, so the
-					// orchestrator must know which binaries to send for it.
+					// orchestrator must know which binaries to send for it —
+					// and whether we already hold them, since an up-to-date
+					// worker would otherwise never be sent any.
 					ContainerPlatform: s.containerPlatform(),
+					ContainerBinaries: s.hasContainerBinaries(),
 				},
 				Sessions: s.summaries(),
 			})

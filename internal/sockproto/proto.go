@@ -65,6 +65,13 @@ type Capabilities struct {
 	Docker      bool     `json:"docker"`
 	ExecModes   []string `json:"exec_modes"`
 	MaxSessions int      `json:"max_sessions"`
+	// ContainerBinaries reports whether the worker already holds a
+	// gt-proxy-client it can inject into a work container. Version equality is
+	// NOT enough to skip a container push: a worker can be perfectly
+	// up-to-date and still have never received the container platform's
+	// binaries (fresh enrollment, wiped state dir), and a container without
+	// them runs an agent with no gt/bd at all.
+	ContainerBinaries bool `json:"container_binaries,omitempty"`
 	// ContainerPlatform is "<goos>-<goarch>" of the worker's docker daemon,
 	// when it has one. The work container is a Linux container even on a macOS
 	// worker, so the binaries injected into it are a DIFFERENT platform from
@@ -80,6 +87,12 @@ func (c *Capabilities) GetContainerPlatform() string {
 		return ""
 	}
 	return c.ContainerPlatform
+}
+
+// HasContainerBinaries reports whether the worker already holds an injectable
+// client, from a possibly-nil capability block.
+func (c *Capabilities) HasContainerBinaries() bool {
+	return c != nil && c.ContainerBinaries
 }
 
 // SessionSummary describes one live session (§4.1 sessions / hello_ack).

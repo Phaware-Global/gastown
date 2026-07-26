@@ -98,15 +98,25 @@ func (b *SocketBackend) pushTo(ctx context.Context, c *conn, force bool) ([]Push
 	if ack == nil {
 		return nil, fmt.Errorf("socket: no handshake to compare versions against")
 	}
+	// Does the worker need its OWN binaries refreshed?
+	refreshOwn := true
 	if !force {
 		// "dev" on either side means an unversioned build: comparing it would
 		// push on every single provision, so skip rather than guess.
-		if b.GTVersion == "" || b.GTVersion == "dev" || ack.GTVersion == "dev" {
-			return nil, nil
-		}
-		if ack.GTVersion == b.GTVersion {
-			return nil, nil
-		}
+		unversioned := b.GTVersion == "" || b.GTVersion == "dev" || ack.GTVersion == "dev"
+		refreshOwn = !unversioned && ack.GTVersion != b.GTVersion
+	}
+
+	// The container's binaries are a SEPARATE question. A worker can be exactly
+	// up to date and still have never received them — fresh enrollment, wiped
+	// state dir — and version equality would then skip the push forever, leaving
+	// every container session with an agent that has no gt/bd at all. So this is
+	// gated on what the worker actually holds, not on versions.
+	needContainer := ack.Capabilities.GetContainerPlatform() != "" &&
+		(force || refreshOwn || !ack.Capabilities.HasContainerBinaries())
+
+	if !refreshOwn && !needContainer {
+		return nil, nil
 	}
 
 	workerOS, workerArch := ack.OS, ack.Arch
@@ -127,11 +137,12 @@ func (b *SocketBackend) pushTo(ctx context.Context, c *conn, force bool) ([]Push
 
 	var results []PushResult
 
-	// The worker's own binaries.
-	sent, err := b.pushPlatform(ctx, c, workerOS, workerArch, "")
-	results = append(results, sent...)
-	if err != nil {
-		return results, err
+	if refreshOwn {
+		sent, err := b.pushPlatform(ctx, c, workerOS, workerArch, "")
+		results = append(results, sent...)
+		if err != nil {
+			return results, err
+		}
 	}
 
 	// Container mode needs a SECOND platform: the work container is a Linux
@@ -139,7 +150,7 @@ func (b *SocketBackend) pushTo(ctx context.Context, c *conn, force bool) ([]Push
 	// worker reports the platform its docker daemon runs (§4.1), and those
 	// binaries are stored separately for injection — never installed as the
 	// worker's own.
-	if cp := ack.Capabilities.GetContainerPlatform(); cp != "" && cp != PlatformDir(workerOS, workerArch) {
+	if cp := ack.Capabilities.GetContainerPlatform(); needContainer && cp != PlatformDir(workerOS, workerArch) {
 		cpOS, cpArch, ok := splitPlatform(cp)
 		if !ok {
 			return results, fmt.Errorf("socket: worker reported an unparseable container platform %q", cp)

@@ -125,10 +125,29 @@ func EnsureIdentity(ctx context.Context, dir, cn string, signer Signer) (*Identi
 	return id, nil
 }
 
-// writeFileAtomic writes data to a temp sibling and renames it into place.
+// writeFileAtomic writes data to a UNIQUE temp sibling and renames it into
+// place.
+//
+// The temp name must be unique, not path+".tmp": two writers racing on one
+// destination otherwise share the staging file, and the second rename fails
+// with ENOENT after the first renames it away. That is not hypothetical — the
+// work container's injected entrypoint lives in a directory shared by every
+// session on the worker, so concurrent Prepares collided there.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, perm); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp) // no-op once the rename succeeds
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, perm); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)

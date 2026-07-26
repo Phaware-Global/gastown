@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -225,11 +226,7 @@ while :; do sleep 60 & wait $!; done
 			return fmt.Errorf("inject %s: %w", proxyClientName, err)
 		}
 		for _, name := range []string{"gt", "bd"} {
-			link := filepath.Join(w.cfg.GTDir, name)
-			if err := os.Remove(link); err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("replacing injected %s: %w", name, err)
-			}
-			if err := os.Symlink(proxyClientName, link); err != nil {
+			if err := atomicSymlink(proxyClientName, filepath.Join(w.cfg.GTDir, name)); err != nil {
 				return fmt.Errorf("linking injected %s: %w", name, err)
 			}
 		}
@@ -298,12 +295,32 @@ func (w *WorkEnv) preflight(ctx context.Context) error {
 		// This is a hard failure rather than a warning: an agent that cannot
 		// run `gt` cannot call `gt done`, take mail, or update a bead — the
 		// session would look alive and accomplish nothing.
-		link := "ln -sf /opt/gt/gt /usr/local/bin/gt && ln -sf /opt/gt/bd /usr/local/bin/bd"
-		if _, err := w.docker(ctx, "exec", "-u", "0", w.name, "/bin/sh", "-c", link); err != nil {
-			return fmt.Errorf("image preflight: could not link gt/bd into /usr/local/bin in image %s (the agent could not reach the control plane): %w", w.cfg.Image, err)
-		}
+		// mkdir -p first: a minimal image (busybox is the canonical one) has no
+		// /usr/local/bin at all, and `ln -sf` into a missing directory fails.
+		// Before injection existed, such an image came up degraded; it must not
+		// now come up not at all for want of one mkdir.
+		link := "mkdir -p /usr/local/bin && ln -sf /opt/gt/gt /usr/local/bin/gt && ln -sf /opt/gt/bd /usr/local/bin/bd"
+		linkErr := func() error {
+			_, err := w.docker(ctx, "exec", "-u", "0", w.name, "/bin/sh", "-c", link)
+			return err
+		}()
+
+		// The VERIFICATION is what matters, not the linking: an image that
+		// already ships gt/bd on PATH is fine even if the link failed (read-only
+		// /usr, no uid-0 account). Only an agent that genuinely cannot run `gt`
+		// is fatal — it would take work, look alive, and accomplish nothing.
 		if _, err := w.docker(ctx, "exec", w.name, "/bin/sh", "-c", "command -v gt >/dev/null && command -v bd >/dev/null"); err != nil {
+			if linkErr != nil {
+				return fmt.Errorf("image preflight: could not put gt/bd on PATH in image %s (linking failed: %v; the agent could not reach the control plane): %w", w.cfg.Image, linkErr, err)
+			}
 			return fmt.Errorf("image preflight: gt/bd not on PATH in image %s after linking: %w", w.cfg.Image, err)
+		}
+		// A failed link with a working PATH is survivable (the image ships its
+		// own), so it is not fatal — but it is worth the operator's attention,
+		// since it usually means a read-only /usr or no uid-0 account.
+		if linkErr != nil {
+			slog.Default().Warn("gt/bd link step failed but they resolve on PATH anyway",
+				"image", w.cfg.Image, "container", w.name, "err", linkErr)
 		}
 	}
 	return nil
@@ -353,6 +370,27 @@ func RemoveWorkContainer(ctx context.Context, dockerBin, rig, polecat string) er
 // shellQuoteToken single-quotes a token for the sh -c preflight probe.
 func shellQuoteToken(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// atomicSymlink replaces a symlink in one step: create it under a unique name,
+// then rename over the target.
+//
+// GTDir is shared by every session on the worker and mounted live into running
+// containers, so a remove-then-symlink is wrong twice over: two concurrent
+// Prepares interleave into an EEXIST that fails a session, and the gap between
+// the two calls is a window where an already-running agent's `gt` is simply
+// missing. Rename over an existing symlink does neither.
+func atomicSymlink(target, link string) error {
+	tmp, err := os.MkdirTemp(filepath.Dir(link), ".link-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	staged := filepath.Join(tmp, filepath.Base(link))
+	if err := os.Symlink(target, staged); err != nil {
+		return err
+	}
+	return os.Rename(staged, link)
 }
 
 // copyExecutable copies through a temp file + rename, so a container never

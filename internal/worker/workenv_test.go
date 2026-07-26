@@ -3,9 +3,11 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -318,7 +320,7 @@ func TestWorkEnvPrepare_InjectsGtAndBd(t *testing.T) {
 	assert.Contains(t, joined, "-e GT_PROXY_RELAY=1")
 	// Linked as root: the image's user may not own /usr/local/bin, and
 	// /opt/gt is read-only so it cannot be done from inside the mount.
-	assert.Contains(t, joined, "exec -u 0 gt-work-MyRig-furiosa /bin/sh -c ln -sf /opt/gt/gt /usr/local/bin/gt")
+	assert.Contains(t, joined, "exec -u 0 gt-work-MyRig-furiosa /bin/sh -c mkdir -p /usr/local/bin && ln -sf /opt/gt/gt /usr/local/bin/gt")
 	assert.Contains(t, joined, "command -v gt")
 }
 
@@ -335,4 +337,110 @@ func TestWorkEnvPrepare_NoInjectionWithoutAClient(t *testing.T) {
 	_, err = os.Stat(filepath.Join(cfg.GTDir, "gt"))
 	assert.True(t, os.IsNotExist(err))
 	assert.NotContains(t, strings.Join(dockerCalls(t, logFile), "\n"), "/usr/local/bin/gt")
+}
+
+// fakeDockerMatching is a docker stand-in that fails only the invocations whose
+// joined argv matches pattern — finer than fakeDocker's per-subcommand switch,
+// which cannot express "the link exec fails but the verify exec succeeds".
+func fakeDockerMatching(t *testing.T, pattern string) (docker, logFile string) {
+	t.Helper()
+	dir := t.TempDir()
+	docker = filepath.Join(dir, "docker")
+	logFile = filepath.Join(dir, "docker.log")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logFile + `"
+case "$*" in
+  *"` + pattern + `"*) echo "forced failure" >&2; exit 1 ;;
+esac
+if [ "$1" = "run" ]; then echo "deadbeefcafe"; fi
+exit 0
+`
+	require.NoError(t, os.WriteFile(docker, []byte(script), 0755))
+	return docker, logFile
+}
+
+// withProxyClient adds an injectable client to a config.
+func withProxyClient(t *testing.T, cfg WorkEnvConfig) WorkEnvConfig {
+	t.Helper()
+	client := filepath.Join(t.TempDir(), "gt-proxy-client")
+	require.NoError(t, os.WriteFile(client, []byte("client"), 0755))
+	cfg.ProxyClient = client
+	return cfg
+}
+
+// TestWorkEnvPrepare_CreatesUsrLocalBin pins the minimal-image case: busybox has
+// no /usr/local/bin, and `ln -sf` into a missing directory fails. Before
+// injection existed such an image came up degraded; it must not now fail to come
+// up at all for want of one mkdir.
+func TestWorkEnvPrepare_CreatesUsrLocalBin(t *testing.T) {
+	docker, logFile := fakeDockerMatching(t, "NOTHING-FAILS")
+	cfg := withProxyClient(t, testWorkEnvConfig(t, docker))
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+	require.NoError(t, w.Prepare(context.Background()))
+
+	assert.Contains(t, strings.Join(dockerCalls(t, logFile), "\n"), "mkdir -p /usr/local/bin && ln -sf")
+}
+
+// TestWorkEnvPrepare_LinkFailureSurvivesWhenGtResolves pins that VERIFICATION is
+// the gate, not the linking: an image that already ships gt/bd (or has a
+// read-only /usr) must still come up, because the agent can reach the control
+// plane regardless.
+func TestWorkEnvPrepare_LinkFailureSurvivesWhenGtResolves(t *testing.T) {
+	docker, logFile := fakeDockerMatching(t, "ln -sf")
+	cfg := withProxyClient(t, testWorkEnvConfig(t, docker))
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+
+	require.NoError(t, w.Prepare(context.Background()),
+		"a failed link must not fail the session when gt is on PATH anyway")
+	assert.Contains(t, strings.Join(dockerCalls(t, logFile), "\n"), "command -v gt")
+}
+
+// TestWorkEnvPrepare_FailsWhenGtIsNotOnPath pins the case that must stay fatal:
+// an agent that cannot run `gt` cannot call `gt done`, so the session would look
+// alive and accomplish nothing.
+func TestWorkEnvPrepare_FailsWhenGtIsNotOnPath(t *testing.T) {
+	docker, _ := fakeDockerMatching(t, "command -v gt")
+	cfg := withProxyClient(t, testWorkEnvConfig(t, docker))
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+
+	err = w.Prepare(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not on PATH")
+}
+
+// TestWorkEnvPrepare_ConcurrentSessionsShareGTDirSafely pins the swap the
+// injection does in a WORKER-SHARED directory: two sessions preparing at once
+// must not collide on the gt/bd links (remove-then-symlink raced into EEXIST and
+// failed a session), and the swap must never leave a live container's `gt`
+// missing.
+func TestWorkEnvPrepare_ConcurrentSessionsShareGTDirSafely(t *testing.T) {
+	docker, _ := fakeDockerMatching(t, "NOTHING-FAILS")
+	shared := t.TempDir()
+
+	var wg sync.WaitGroup
+	errs := make([]error, 6)
+	for i := range errs {
+		cfg := withProxyClient(t, testWorkEnvConfig(t, docker))
+		cfg.GTDir = shared
+		cfg.Polecat = fmt.Sprintf("polecat%d", i)
+		cfg.Session = fmt.Sprintf("gt-MyRig-polecat%d", i)
+		w, err := NewWorkEnv(cfg)
+		require.NoError(t, err)
+		wg.Add(1)
+		go func(i int, w *WorkEnv) {
+			defer wg.Done()
+			errs[i] = w.Prepare(context.Background())
+		}(i, w)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		assert.NoError(t, err, "session %d must not lose a race on the shared gt/bd links", i)
+	}
+	target, err := os.Readlink(filepath.Join(shared, "gt"))
+	require.NoError(t, err)
+	assert.Equal(t, "gt-proxy-client", target)
 }

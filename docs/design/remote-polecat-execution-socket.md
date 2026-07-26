@@ -196,6 +196,12 @@ installed, writes through a staging file, and installs by rename — a half-writ
   execute is strictly worse than leaving it stale. A same-platform worker falls
   back to the orchestrator's own install dir, so the single-platform case works
   with no extra step.
+- The container's binaries are pushed when the worker says it **lacks** them,
+  not only when versions differ: a worker can be exactly up to date and have
+  never received them (fresh enrollment, a wiped state dir), and gating on
+  version alone left every container session running an agent with no `gt`/`bd`
+  at all. `hello_ack` reports `container_binaries` for this. A container session
+  that still cannot resolve one **fails** rather than starting a mute agent.
 - A push may carry a `platform` tag, and then it is **for the work container,
   not the worker**: on a macOS worker the container is still a Linux container,
   so its `gt`/`bd` are a different build from the ones the worker runs. Tagged
