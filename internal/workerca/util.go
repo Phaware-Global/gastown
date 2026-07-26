@@ -27,6 +27,13 @@ func ValidWorkerName(name string) bool {
 	if name == "." || name == ".." {
 		return false
 	}
+	// Reserve the orchestrator identity: a machine cert with CN
+	// gt-orchestrator would satisfy the worker's CN pin, coupling the two
+	// impersonation barriers that are meant to be independent (the pin would
+	// stop protecting anything if machine certs ever regained ClientAuth).
+	if name == OrchestratorCN {
+		return false
+	}
 	return workerNameRe.MatchString(name)
 }
 
@@ -50,11 +57,14 @@ func marshalKey(key *ecdsa.PrivateKey) ([]byte, error) {
 
 // writeFileAtomic writes via a temp sibling + rename.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	tmp := path + ".tmp"
+	// A PID-unique temp sibling: a fixed ".tmp" would be shared by two
+	// concurrent writers, risking a corrupt intermediate.
+	tmp := fmt.Sprintf("%s.tmp%d", path, os.Getpid())
 	if err := os.WriteFile(tmp, data, perm); err != nil {
 		return fmt.Errorf("workerca: write %s: %w", path, err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
 		return fmt.Errorf("workerca: rename %s: %w", path, err)
 	}
 	return nil
