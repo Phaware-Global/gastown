@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -503,6 +504,30 @@ func TestAgentEnv_ContainerDoesNotInheritHostPaths(t *testing.T) {
 	for _, key := range []string{"PATH", "HOME", "TMPDIR"} {
 		assert.False(t, hasEnvKey(inContainer, key), "%s must come from the image, not the worker host", key)
 	}
+}
+
+// TestAgentEnv_ContainerIgnoresHostPathsFromTheEnvFile pins the second door into
+// the same defect: the operator's env file is appended verbatim, so a PATH line
+// there would ride `docker exec -e` and override the image's PATH just as the
+// host's would have.
+func TestAgentEnv_ContainerIgnoresHostPathsFromTheEnvFile(t *testing.T) {
+	dir := t.TempDir()
+	envFile := filepath.Join(dir, "agent.env")
+	require.NoError(t, os.WriteFile(envFile, []byte(
+		"ANTHROPIC_API_KEY=sk-x\nPATH=/opt/operator/bin\nHOME=/home/operator\n"), 0600))
+	s := &Service{cfg: Config{AgentEnvFile: envFile}, log: slog.Default()}
+
+	inContainer, err := s.agentEnv(nil, "", true)
+	require.NoError(t, err)
+	assert.Contains(t, inContainer, "ANTHROPIC_API_KEY=sk-x", "credentials are what the file is for")
+	for _, key := range []string{"PATH", "HOME"} {
+		assert.False(t, hasEnvKey(inContainer, key), "%s from the env file must not reach a container", key)
+	}
+
+	// On a native worker the file's values are the operator's business.
+	native, err := s.agentEnv(nil, "", false)
+	require.NoError(t, err)
+	assert.Contains(t, native, "PATH=/opt/operator/bin")
 }
 
 func hasEnvKey(env []string, key string) bool {

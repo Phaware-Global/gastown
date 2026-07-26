@@ -357,16 +357,16 @@ func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktre
 // agent credentials), then the non-secret session env from the wire.
 func (s *Service) agentEnv(wireEnv map[string]string, proxyURL string, container bool) ([]string, error) {
 	env := []string{}
-	base := []string{"HOME", "PATH", "LANG", "TERM", "TMPDIR"}
-	if container {
-		// NOT the worker host's PATH: inside a container it names directories
-		// that do not exist, and `docker exec -e PATH=…` would override the
-		// image's own — so the agent runtime the image preflight just verified
-		// against the IMAGE's PATH could then be unfindable. HOME and TMPDIR are
-		// likewise host paths. The image supplies all of these.
-		base = []string{"LANG", "TERM"}
-	}
-	for _, key := range base {
+	// NOT the worker host's PATH for a container: inside one it names
+	// directories that do not exist, and `docker exec -e PATH=…` would override
+	// the image's own — so the agent runtime the image preflight just verified
+	// against the IMAGE's PATH could become unfindable. HOME and TMPDIR are
+	// likewise host paths. The image supplies all of them
+	// (containerExcludedEnv).
+	for _, key := range []string{"HOME", "PATH", "LANG", "TERM", "TMPDIR"} {
+		if container && containerExcludedEnv[key] {
+			continue
+		}
 		if v := os.Getenv(key); v != "" {
 			env = append(env, key+"="+v)
 		}
@@ -391,9 +391,32 @@ func (s *Service) agentEnv(wireEnv map[string]string, proxyURL string, container
 		if err != nil {
 			return nil, fmt.Errorf("agent env file: %w", err)
 		}
-		env = append(env, fileEnv...)
+		for _, kv := range fileEnv {
+			// The same exclusion as the host env above, and for the same reason:
+			// a PATH line in the operator's file would ride `docker exec -e` and
+			// override the IMAGE's PATH, so the agent runtime that the image
+			// preflight verified could become unfindable. The file exists for
+			// credentials and model config (§8), not for relocating the
+			// container's view of its own filesystem.
+			if container && isHostPathKey(kv) {
+				s.log.Warn("ignoring a host-path variable from the agent env file for a container session",
+					"entry", strings.SplitN(kv, "=", 2)[0], "file", s.cfg.AgentEnvFile)
+				continue
+			}
+			env = append(env, kv)
+		}
 	}
 	return env, nil
+}
+
+// containerExcludedEnv are variables a container must take from its image, not
+// from the worker.
+var containerExcludedEnv = map[string]bool{"PATH": true, "HOME": true, "TMPDIR": true}
+
+// isHostPathKey reports whether a KEY=VALUE entry names one of them.
+func isHostPathKey(kv string) bool {
+	key, _, _ := strings.Cut(kv, "=")
+	return containerExcludedEnv[key]
 }
 
 // signalAgent forwards a named signal to the agent (native) or the container's
