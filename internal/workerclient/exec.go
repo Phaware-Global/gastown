@@ -332,10 +332,11 @@ func (s *Service) agentEnv(wireEnv map[string]string) ([]string, error) {
 		}
 	}
 	// Wire env BEFORE the operator's file: os/exec dedups keeping the LAST
-	// value, so the file always wins for any key it sets. That is what makes
-	// "the agent env file is the only sanctioned source of agent credentials"
-	// true in practice — a wire ANTHROPIC_BASE_URL cannot redirect a
-	// file-provisioned credential to another endpoint.
+	// value, so the file wins for every key it sets. Note the limit of that
+	// guarantee — it holds only for keys the file actually sets, which is why
+	// anything that could redirect a credential (ANTHROPIC_BASE_URL) is barred
+	// from the wire outright in sockproto.EnvAllowed rather than relying on the
+	// file to shadow it.
 	for k, v := range wireEnv {
 		env = append(env, k+"="+v)
 	}
