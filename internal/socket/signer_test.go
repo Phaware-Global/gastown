@@ -112,9 +112,18 @@ func TestNewAdminSigner_RefusesNonLoopback(t *testing.T) {
 		require.Error(t, err, u)
 		assert.Contains(t, err.Error(), "not loopback")
 	}
-	for _, u := range []string{"", "http://127.0.0.1:9877", "http://localhost:9877", "http://[::1]:9877"} {
+	// Hostnames are case-insensitive: refusing "Localhost" would be a false
+	// negative that just confuses an operator.
+	for _, u := range []string{"", "http://127.0.0.1:9877", "http://localhost:9877",
+		"http://Localhost:9877", "http://LOCALHOST:9877", "http://[::1]:9877", "http://127.0.0.5:9877"} {
 		_, err := newAdminSigner(u)
 		assert.NoError(t, err, u)
+	}
+	// Near-misses that must still be refused.
+	for _, u := range []string{"http://127.0.0.1.evil.example:9877", "http://0.0.0.0:9877",
+		"http://localhost.evil.example:9877", "http://user@10.1.2.3:9877"} {
+		_, err := newAdminSigner(u)
+		assert.Error(t, err, u)
 	}
 }
 
@@ -140,6 +149,78 @@ func TestAdminSigner_RefusesWrongCN(t *testing.T) {
 		csrFor(t, worker.PolecatCN("demo", "furiosa")), "demo", "furiosa")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "refusing to install it as this session's identity")
+}
+
+// TestAdminSigner_RefusesCAThatDidNotSignTheLeaf pins that the pair is checked:
+// the returned CA becomes the worker's trust root for the relay, so a
+// substituted or mixed-up root must be refused here rather than surface as an
+// opaque mTLS failure once the session is running.
+func TestAdminSigner_RefusesCAThatDidNotSignTheLeaf(t *testing.T) {
+	adminAddr := startProxyAdmin(t)
+	real, err := newAdminSigner("http://" + adminAddr)
+	require.NoError(t, err)
+	certPEM, _, _, err := real.SignSessionCSR(context.Background(),
+		csrFor(t, worker.PolecatCN("demo", "furiosa")), "demo", "furiosa")
+	require.NoError(t, err)
+
+	// A legitimate leaf, paired with an unrelated CA.
+	otherCA := selfSignedCA(t, "some-other-root")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"cert": string(certPEM), "ca": string(otherCA),
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	s, err := newAdminSigner(srv.URL)
+	require.NoError(t, err)
+	_, _, _, err = s.SignSessionCSR(context.Background(),
+		csrFor(t, worker.PolecatCN("demo", "furiosa")), "demo", "furiosa")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not issued by the returned CA")
+}
+
+// selfSignedCA builds a throwaway CA certificate.
+func selfSignedCA(t *testing.T, cn string) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(2),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	require.NoError(t, err)
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// TestAdminSigner_RefusesRedirectOffLoopback pins the gap a URL check alone
+// leaves: validating admin_url proves where the FIRST request goes, but a
+// redirect would carry the CSR exchange off-box and let the far end choose the
+// CA that becomes the session's trust root.
+func TestAdminSigner_RefusesRedirectOffLoopback(t *testing.T) {
+	var elsewhere *httptest.Server
+	elsewhere = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"cert": "x", "ca": "x"})
+	}))
+	t.Cleanup(elsewhere.Close)
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, elsewhere.URL+"/v1/admin/sign-csr", http.StatusFound)
+	}))
+	t.Cleanup(redirector.Close)
+
+	s, err := newAdminSigner(redirector.URL)
+	require.NoError(t, err)
+	_, _, _, err = s.SignSessionCSR(context.Background(),
+		csrFor(t, worker.PolecatCN("demo", "furiosa")), "demo", "furiosa")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "redirect")
 }
 
 func TestParseLeaf_RejectsGarbage(t *testing.T) {
