@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -139,7 +140,8 @@ func TestExecStream_RefusesSecretEnvFromWire(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, sockproto.TypeError, resp.Type)
 	assert.Equal(t, "bad_request", resp.Code)
-	assert.Contains(t, resp.Msg, "secret")
+	assert.Contains(t, resp.Msg, "not permitted from the wire")
+	assert.Contains(t, resp.Msg, "agent env file")
 }
 
 func TestExecStream_AgentEnvFileSuppliesCredentials(t *testing.T) {
@@ -227,6 +229,33 @@ func TestExecStream_SignalForwardedToAgent(t *testing.T) {
 	}
 }
 
+// TestExecStream_LegacySignalNameForwarded pins compatibility with a launcher
+// built against an older gt, which sent Go's descriptive os.Signal.String()
+// form: dropping it would mean the pane's Ctrl-C never reaches the agent.
+func TestExecStream_LegacySignalNameForwarded(t *testing.T) {
+	addr, _ := provisionedService(t)
+
+	conn, codec := attachStream(t, addr, "gt-demo-furiosa",
+		[]string{"sh", "-c", "trap 'echo got-int; exit 0' INT; while :; do sleep 0.05; done"}, nil)
+	time.Sleep(400 * time.Millisecond)
+	require.NoError(t, sockproto.WriteFrame(conn, sockproto.FrameSignal, []byte(syscall.SIGINT.String())))
+
+	done := make(chan struct{})
+	var out string
+	var code int
+	go func() {
+		out, _, code = drainStream(t, codec)
+		close(done)
+	}()
+	select {
+	case <-done:
+		assert.Contains(t, out, "got-int", "a descriptive signal name must still be delivered")
+		assert.Equal(t, 0, code)
+	case <-time.After(15 * time.Second):
+		t.Fatal("legacy signal name was not delivered to the agent")
+	}
+}
+
 func TestExecStream_LargeOutputIsChunkedIntact(t *testing.T) {
 	addr, _ := provisionedService(t)
 
@@ -277,3 +306,162 @@ func TestWrapCommandEnv_KeepsCredentialOffArgv(t *testing.T) {
 }
 
 var _ = io.Discard
+
+// TestExecStream_HalfCloseIsStdinEOFNotDisconnect pins the ambiguity in a clean
+// EOF: half-closing the write side is how a launcher hands the agent stdin EOF,
+// so it must NOT be treated as a lost pane and kill the agent mid-work.
+func TestExecStream_HalfCloseIsStdinEOFNotDisconnect(t *testing.T) {
+	addr, _ := provisionedService(t)
+
+	// Reads stdin to EOF, then keeps working before exiting cleanly.
+	conn, codec := attachStream(t, addr, "gt-demo-furiosa",
+		[]string{"sh", "-c", "cat; sleep 0.4; echo still-alive; exit 0"}, nil)
+	require.NoError(t, sockproto.WriteFrame(conn, sockproto.FrameStdin, []byte("in\n")))
+	require.NoError(t, conn.(*net.UnixConn).CloseWrite())
+
+	out, _, code := drainStream(t, codec)
+	assert.Equal(t, 0, code, "a half-close must not kill the agent")
+	assert.Equal(t, "in\nstill-alive\n", out)
+}
+
+// TestExecStream_DeadLauncherCancelsSilentAgent pins the liveness prober: an
+// agent that produces NO output would never hit a failing pump write, so
+// without probing, a killed pane would leave it running forever — pinning the
+// session (MaxSessions=1 means pinning the whole worker).
+func TestExecStream_DeadLauncherCancelsSilentAgent(t *testing.T) {
+	restore := execProbeInterval
+	execProbeInterval = 50 * time.Millisecond
+	t.Cleanup(func() { execProbeInterval = restore })
+
+	addr, svc := provisionedService(t)
+
+	// Silent and long-lived: it writes a marker file when SIGTERM'd so we can
+	// prove the cancel was a graceful signal, not just a lost connection.
+	marker := filepath.Join(t.TempDir(), "termed")
+	conn, _ := attachStream(t, addr, "gt-demo-furiosa",
+		[]string{"sh", "-c", fmt.Sprintf("trap 'touch %s; exit 0' TERM; while :; do sleep 0.05; done", marker)}, nil)
+	time.Sleep(400 * time.Millisecond) // let the trap install
+
+	require.NoError(t, conn.Close()) // the pane died
+
+	// The exec must unregister, freeing the session for a reattach.
+	require.Eventually(t, func() bool {
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		return svc.sessions["gt-demo-furiosa"].execCancel == nil
+	}, 15*time.Second, 50*time.Millisecond, "a dead launcher must release the session's exec slot")
+
+	_, err := os.Stat(marker)
+	assert.NoError(t, err, "cancellation must reach the agent as a graceful SIGTERM")
+}
+
+// TestExecStream_SecondAttachRefused pins that one session cannot run two
+// agents: a second launcher on the same worktree would double-write the
+// checkpointed tree.
+func TestExecStream_SecondAttachRefused(t *testing.T) {
+	addr, _ := provisionedService(t)
+
+	_, first := attachStream(t, addr, "gt-demo-furiosa",
+		[]string{"sh", "-c", "while :; do sleep 0.05; done"}, nil)
+	// Wait until the first exec is registered, so the second attach races
+	// nothing: the refusal must be deterministic.
+	time.Sleep(400 * time.Millisecond)
+
+	_, second := attachStream(t, addr, "gt-demo-furiosa", []string{"true"}, nil)
+	_, errOut, code := drainStream(t, second)
+	assert.Equal(t, 125, code, "the second attach must be refused, not silently run")
+	assert.Contains(t, errOut, "already has an attached agent")
+
+	_ = first
+}
+
+// TestExecStream_TeardownKillsAttachedAgent pins that ending a session kills
+// its agent BEFORE the worktree is removed — otherwise a native agent keeps
+// writing into a directory that is being deleted underneath it.
+func TestExecStream_TeardownKillsAttachedAgent(t *testing.T) {
+	proxyURL, ca, _ := startProxy(t)
+	addr, svc := startService(t, proxyURL)
+	b := newBackend(t, addr, ca)
+	ep, err := b.Provision(context.Background(), polecatSpec())
+	require.NoError(t, err)
+
+	_, codec := attachStream(t, addr, "gt-demo-furiosa",
+		[]string{"sh", "-c", "while :; do sleep 0.05; done"}, nil)
+	time.Sleep(400 * time.Millisecond)
+
+	done := make(chan int, 1)
+	go func() {
+		_, _, code := drainStream(t, codec)
+		done <- code
+	}()
+
+	require.NoError(t, b.Teardown(context.Background(), ep))
+
+	select {
+	case code := <-done:
+		assert.NotEqual(t, 0, code, "a torn-down agent must not report success")
+	case <-time.After(30 * time.Second):
+		t.Fatal("teardown left the attached agent running")
+	}
+	svc.mu.Lock()
+	_, live := svc.sessions["gt-demo-furiosa"]
+	svc.mu.Unlock()
+	assert.False(t, live, "teardown must drop the session")
+}
+
+func TestCanonicalSignalNamesAreAccepted(t *testing.T) {
+	// Both the canonical wire form and Go's descriptive os.Signal.String() form
+	// (what an older launcher sends) must map to the same signal.
+	for _, tc := range []struct {
+		in   string
+		want syscall.Signal
+	}{
+		{"SIGINT", syscall.SIGINT}, {"INT", syscall.SIGINT}, {"interrupt", syscall.SIGINT},
+		{"SIGTERM", syscall.SIGTERM}, {"terminated", syscall.SIGTERM},
+		{"SIGHUP", syscall.SIGHUP}, {"hangup", syscall.SIGHUP},
+		{"SIGQUIT", syscall.SIGQUIT}, {"quit", syscall.SIGQUIT},
+		{"SIGKILL", 0}, {"", 0}, {"bogus", 0},
+	} {
+		assert.Equal(t, tc.want, parseSignal(tc.in), "signal %q", tc.in)
+	}
+	// docker kill needs a canonical name for every signal we accept.
+	assert.Equal(t, "SIGINT", signalName(syscall.SIGINT))
+	assert.Equal(t, "SIGQUIT", signalName(syscall.SIGQUIT))
+}
+
+func TestEnvAllowed_AllowlistRefusesLoaderAndSecrets(t *testing.T) {
+	for _, k := range []string{"GT_ROLE", "GT_RIG", "BD_DB", "ANTHROPIC_MODEL", "ANTHROPIC_BASE_URL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDECODE"} {
+		assert.True(t, sockproto.EnvAllowed(k), "%s must be allowed", k)
+	}
+	// Loader vars would load attacker code into a NATIVE agent running on the
+	// worker host; PATH would hijack every subprocess it spawns.
+	for _, k := range []string{"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PATH", "HOME", "ANTHROPIC_API_KEY", "GT_AUTH_TOKEN", "GITHUB_TOKEN", "SSH_PRIVATE_KEY",
+		"GT_WORKER_TOKEN", "GT_WORKER_NAME", ""} {
+		assert.False(t, sockproto.EnvAllowed(k), "%s must be refused", k)
+	}
+}
+
+// TestAgentEnv_FileWinsOverWire pins the §8 invariant: the operator's agent env
+// file is the ONLY sanctioned source of agent credentials, so a wire value can
+// never override one it sets (os/exec keeps the LAST duplicate).
+func TestAgentEnv_FileWinsOverWire(t *testing.T) {
+	dir := t.TempDir()
+	envFile := filepath.Join(dir, "agent.env")
+	require.NoError(t, os.WriteFile(envFile, []byte("ANTHROPIC_BASE_URL=https://real.example\n"), 0600))
+
+	s := &Service{cfg: Config{AgentEnvFile: envFile}}
+	env, err := s.agentEnv(map[string]string{"ANTHROPIC_BASE_URL": "https://attacker.example"})
+	require.NoError(t, err)
+
+	// Last wins, so the file's value must come after the wire's.
+	var lastIdx = -1
+	var lastVal string
+	for i, kv := range env {
+		if strings.HasPrefix(kv, "ANTHROPIC_BASE_URL=") {
+			lastIdx, lastVal = i, kv
+		}
+	}
+	require.NotEqual(t, -1, lastIdx)
+	assert.Equal(t, "ANTHROPIC_BASE_URL=https://real.example", lastVal,
+		"the agent env file must win over a wire value")
+}
