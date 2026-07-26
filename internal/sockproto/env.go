@@ -16,12 +16,27 @@ import "strings"
 // would hijack every subprocess it spawns.
 var (
 	// envAllowedPrefixes are families forwarded wholesale: gastown's own session
-	// vars, beads, and the model-config carry-over.
+	// vars, beads, and the model-config carry-over. The wholesale families are
+	// narrowed by envEndpointSuffixes below.
 	envAllowedPrefixes = []string{"GT_", "BD_", "ANTHROPIC_DEFAULT_"}
+
+	// envEndpointSuffixes refuse anything that NAMES A DESTINATION, whatever
+	// family it matched. An endpoint is a worker-LOCAL fact — the agent's
+	// control-plane URL is the worker's own session relay, chosen by the worker
+	// — so an orchestrator-supplied one is at best wrong and at worst a
+	// redirect: GT_PROXY_URL would point the agent's gt/bd RPC at an attacker
+	// (argument exfiltration, and injected responses become fake mail/beads,
+	// i.e. prompt injection), GT_OTEL_LOGS_URL would ship agent output to a
+	// chosen collector, GT_DOLT_HOST pairs with a file-provisioned
+	// GT_DOLT_PASSWORD the same way ANTHROPIC_BASE_URL paired with the API key.
+	// Refusing by SHAPE rather than by name means a var added later cannot
+	// quietly reopen the class.
+	envEndpointSuffixes = []string{"_URL", "_URI", "_HOST", "_ADDR", "_ADDRESS", "_ENDPOINT", "_PORT", "_SERVER", "_PROXY"}
 	// envAllowedExact are individually permitted keys. They are model/mode
-	// SELECTION only — nothing here can change where a credential is sent.
+	// SELECTION only — nothing here names a destination.
 	//
-	// ANTHROPIC_BASE_URL is deliberately absent. It is not itself a secret, but
+	// ANTHROPIC_BASE_URL is deliberately absent (and now also caught by the
+	// _URL shape rule). It is not itself a secret, but
 	// it names the endpoint the agent sends its API key TO: a compromised or
 	// confused orchestrator could set it and exfiltrate a credential the worker
 	// provisioned from its own env file (§8), which is exactly the threat the
@@ -53,7 +68,7 @@ var (
 
 // EnvAllowed reports whether a session-env key may cross the exec stream.
 func EnvAllowed(key string) bool {
-	if key == "" || envLauncherOnly[key] || EnvSecretKey(key) {
+	if key == "" || envLauncherOnly[key] || EnvSecretKey(key) || EnvEndpointKey(key) {
 		return false
 	}
 	if envAllowedExact[key] {
@@ -79,7 +94,20 @@ func EnvSecretKey(key string) bool {
 	return false
 }
 
+// EnvEndpointKey reports whether a key names a destination. Endpoints are
+// worker-local facts and are never accepted from the orchestrator; the worker
+// supplies the agent's control-plane URL from its own session relay.
+func EnvEndpointKey(key string) bool {
+	upper := strings.ToUpper(key)
+	for _, suffix := range envEndpointSuffixes {
+		if strings.HasSuffix(upper, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 // EnvAllowedDescription renders the policy for an error message.
 func EnvAllowedDescription() string {
-	return "GT_*, BD_*, ANTHROPIC_DEFAULT_*, and specific model-config keys, none credential-shaped"
+	return "GT_*, BD_*, ANTHROPIC_DEFAULT_*, and specific model-selection keys — none credential-shaped, none naming an endpoint (the worker supplies those itself)"
 }

@@ -55,13 +55,24 @@ func (s *Service) handleAttach(ctx context.Context, c *connState, m *sockproto.M
 
 	s.mu.Lock()
 	sess := s.sessions[m.Session]
-	var worktree, container string
+	var worktree, container, proxyURL string
 	var ready bool
 	if sess != nil {
 		worktree = sess.worktree
 		ready = sess.summary.State == "ready"
 		if sess.workEnv != nil {
 			container = sess.workEnv.ContainerName()
+		}
+		// The agent's control-plane URL is the worker's OWN session relay — the
+		// only endpoint that carries this polecat's identity to the proxy. The
+		// worker sets it; the orchestrator cannot (its own value would name a
+		// host the worker may not even be able to reach). In container mode the
+		// container already has it from creation (WorkEnv), and docker exec
+		// inherits it.
+		if sess.relay != nil && container == "" {
+			if addr := sess.relay.Addr(); addr != nil {
+				proxyURL = "http://" + addr.String()
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -79,13 +90,13 @@ func (s *Service) handleAttach(ctx context.Context, c *connState, m *sockproto.M
 	// From here the connection is a frame stream. Read frames from the codec's
 	// BUFFERED reader: bytes past the preamble line may already be buffered,
 	// and reading the raw conn would drop them.
-	if err := s.streamExec(ctx, c, sess, m, worktree, container); err != nil {
+	if err := s.streamExec(ctx, c, sess, m, worktree, container, proxyURL); err != nil {
 		s.log.Warn("exec stream", "session", m.Session, "err", err)
 	}
 }
 
 // streamExec builds and runs the agent process, piping stdio over frames.
-func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m *sockproto.Message, worktree, container string) error {
+func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m *sockproto.Message, worktree, container, proxyURL string) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -118,7 +129,7 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 	}
 	defer unregister()
 
-	cmd, err := s.execCommand(ctx, m, worktree, container)
+	cmd, err := s.execCommand(ctx, m, worktree, container, proxyURL)
 	if err != nil {
 		// Report the failure as a non-zero exit so the launcher (and the pane)
 		// terminate rather than hanging on a stream that never produces frames.
@@ -276,8 +287,8 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 // execCommand builds the agent command for the session's exec mode (§5):
 // `docker exec` into the prepared work container, or a direct exec on the
 // worker for native mode.
-func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktree, container string) (*exec.Cmd, error) {
-	env, err := s.agentEnv(m.Env)
+func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktree, container, proxyURL string) (*exec.Cmd, error) {
+	env, err := s.agentEnv(m.Env, proxyURL)
 	if err != nil {
 		return nil, err
 	}
@@ -324,12 +335,18 @@ func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktre
 // agentEnv assembles the agent's environment: a minimal base, the worker's
 // operator-provisioned agent env file (§8 — the ONLY sanctioned source of
 // agent credentials), then the non-secret session env from the wire.
-func (s *Service) agentEnv(wireEnv map[string]string) ([]string, error) {
+func (s *Service) agentEnv(wireEnv map[string]string, proxyURL string) ([]string, error) {
 	env := []string{}
 	for _, key := range []string{"HOME", "PATH", "LANG", "TERM", "TMPDIR"} {
 		if v := os.Getenv(key); v != "" {
 			env = append(env, key+"="+v)
 		}
+	}
+	// Endpoints are worker-local: the wire cannot carry them
+	// (sockproto.EnvEndpointKey), so the worker supplies the agent's
+	// control-plane URL from its own session relay.
+	if proxyURL != "" {
+		env = append(env, "GT_PROXY_URL="+proxyURL)
 	}
 	// Wire env BEFORE the operator's file: os/exec dedups keeping the LAST
 	// value, so the file wins for every key it sets. Note the limit of that

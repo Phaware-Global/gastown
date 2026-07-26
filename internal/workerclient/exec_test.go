@@ -429,6 +429,48 @@ func TestCanonicalSignalNamesAreAccepted(t *testing.T) {
 	assert.Equal(t, "SIGQUIT", signalName(syscall.SIGQUIT))
 }
 
+// TestExecStream_ProxyURLComesFromTheWorkerRelay pins that the agent's
+// control-plane URL is the worker's OWN session relay, not an orchestrator
+// value: the relay is what carries this polecat's identity to the proxy, and a
+// wire endpoint is refused outright.
+func TestExecStream_ProxyURLComesFromTheWorkerRelay(t *testing.T) {
+	addr, svc := provisionedService(t)
+
+	_, codec := attachStream(t, addr, "gt-demo-furiosa",
+		[]string{"sh", "-c", "echo $GT_PROXY_URL"}, nil)
+	out, _, code := drainStream(t, codec)
+	require.Equal(t, 0, code)
+
+	svc.mu.Lock()
+	relayAddr := svc.sessions["gt-demo-furiosa"].relay.Addr().String()
+	svc.mu.Unlock()
+	assert.Equal(t, "http://"+relayAddr+"\n", out,
+		"the agent must talk to the worker's session relay")
+}
+
+// TestExecStream_RefusesWireEndpoint pins the endpoint class shut: a wire
+// GT_PROXY_URL would redirect the agent's gt/bd RPC, so injected responses
+// would become fake mail and beads.
+func TestExecStream_RefusesWireEndpoint(t *testing.T) {
+	addr, _ := provisionedService(t)
+
+	nc := rawDial(t, addr)
+	codec := sockproto.NewCodec(nc)
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeAuth, Token: "t0k"}))
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeHello, ID: "h", ProtoVersion: sockproto.ProtoVersion}))
+	_, err := codec.Recv()
+	require.NoError(t, err)
+	require.NoError(t, codec.Send(&sockproto.Message{
+		Type: sockproto.TypeAttach, ID: "a", Session: "gt-demo-furiosa",
+		Argv: []string{"true"},
+		Env:  map[string]string{"GT_PROXY_URL": "http://attacker.example"},
+	}))
+	resp, err := codec.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, sockproto.TypeError, resp.Type)
+	assert.Equal(t, "bad_request", resp.Code)
+}
+
 func TestEnvAllowed_AllowlistRefusesLoaderAndSecrets(t *testing.T) {
 	for _, k := range []string{"GT_ROLE", "GT_RIG", "BD_DB", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDECODE"} {
 		assert.True(t, sockproto.EnvAllowed(k), "%s must be allowed", k)
@@ -436,7 +478,7 @@ func TestEnvAllowed_AllowlistRefusesLoaderAndSecrets(t *testing.T) {
 	// Loader vars would load attacker code into a NATIVE agent running on the
 	// worker host; PATH would hijack every subprocess it spawns.
 	for _, k := range []string{"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PATH", "HOME", "ANTHROPIC_API_KEY", "GT_AUTH_TOKEN", "GITHUB_TOKEN", "SSH_PRIVATE_KEY",
-		"ANTHROPIC_BASE_URL", "GT_WORKER_TOKEN", "GT_WORKER_NAME", ""} {
+		"ANTHROPIC_BASE_URL", "GT_PROXY_URL", "GT_OTEL_LOGS_URL", "GT_DOLT_HOST", "GT_WORKER_TOKEN", "GT_WORKER_NAME", ""} {
 		assert.False(t, sockproto.EnvAllowed(k), "%s must be refused", k)
 	}
 }
@@ -450,7 +492,7 @@ func TestAgentEnv_FileWinsOverWire(t *testing.T) {
 	require.NoError(t, os.WriteFile(envFile, []byte("ANTHROPIC_MODEL=file-model\n"), 0600))
 
 	s := &Service{cfg: Config{AgentEnvFile: envFile}}
-	env, err := s.agentEnv(map[string]string{"ANTHROPIC_MODEL": "wire-model"})
+	env, err := s.agentEnv(map[string]string{"ANTHROPIC_MODEL": "wire-model"}, "")
 	require.NoError(t, err)
 
 	var lastVal string
@@ -494,7 +536,7 @@ func TestAttach_RefusesCredentialEndpointRedirect(t *testing.T) {
 
 	// And the agent env never carries a wire base URL even if one slipped past.
 	s := &Service{cfg: Config{AgentEnvFile: envFile}}
-	env, err := s.agentEnv(map[string]string{"GT_ROLE": "polecat"})
+	env, err := s.agentEnv(map[string]string{"GT_ROLE": "polecat"}, "")
 	require.NoError(t, err)
 	for _, kv := range env {
 		assert.NotContains(t, kv, "attacker.example")
