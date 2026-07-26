@@ -9,6 +9,7 @@ package socket
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/config"
@@ -31,6 +32,9 @@ type Settings struct {
 	// Address is a TCP "host:port" or "unix:///path/to.sock" (§3.3).
 	Address string    `json:"address"`
 	TLS     TLSConfig `json:"tls"`
+	// AdminURL is the proxy admin base URL used to sign session CSRs (§4.2).
+	// Empty means DefaultAdminURL. Loopback only — see newAdminSigner.
+	AdminURL string `json:"admin_url,omitempty"`
 	// Token is the pre-shared token for unix-socket mode (§3.3). Never used
 	// on TCP. Typically supplied worker-side / operator env, not committed.
 	Token string `json:"token,omitempty"`
@@ -130,4 +134,15 @@ func init() {
 	execution.Register(BackendName, func(cfg *config.ExecutionConfig) (execution.Backend, error) {
 		return New(cfg)
 	})
+}
+
+// orchestratorID identifies this orchestrator in the §3.2 handshake. The
+// hostname is enough to tell two orchestrators apart in a worker's logs, which
+// is all the field is used for today.
+func orchestratorID() string {
+	h, err := os.Hostname()
+	if err != nil || h == "" {
+		return "gt-orchestrator"
+	}
+	return h
 }

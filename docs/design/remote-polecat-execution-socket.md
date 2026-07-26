@@ -287,10 +287,23 @@ JSON):
       "ca_file": null,                 // manual mode: worker CA cert
       "cert_file": null,               // manual mode: orchestrator client cert
       "key_file": null                 // manual mode: orchestrator client key
-    }
+    },
+
+    // Proxy admin base URL used to sign session CSRs (§4.2). Default
+    // http://127.0.0.1:9877. LOOPBACK ONLY: the admin API is unauthenticated —
+    // its protection is that it binds the orchestrator's loopback — so a remote
+    // value is refused at backend construction rather than dialed.
+    "admin_url": null
   }
 }
 ```
+
+> **Who signs.** The worker never touches the CA: it generates its key locally
+> and sends a CSR over the control connection, and the orchestrator signs it
+> through the proxy's admin API on the worker's behalf. The admin endpoint
+> **refuses** a CSR whose CN is not `gt-<rig>-<name>` — that refusal is the §4.2
+> channel binding — and the backend re-checks the issued cert's CN before
+> installing it as the session's identity.
 
 The same rig as strict, comment-free JSON:
 

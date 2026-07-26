@@ -16,6 +16,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/execution"
 	"github.com/steveyegge/gastown/internal/sockproto"
+	"github.com/steveyegge/gastown/internal/worker"
 )
 
 // fakeWorker is a minimal gt-worker-client stand-in for driving the backend:
@@ -211,15 +212,16 @@ func (w *fakeWorker) preload(sess sockproto.SessionSummary) {
 	w.mu.Unlock()
 }
 
-// stubSigner records the CN it was asked to sign and returns fake material.
+// stubSigner records the identity it was asked to sign for and returns fake
+// material.
 type stubSigner struct {
 	gotCN  string
 	gotCSR []byte
 	err    error
 }
 
-func (s *stubSigner) SignSessionCSR(_ context.Context, csrPEM []byte, cn string) ([]byte, []byte, time.Time, error) {
-	s.gotCN = cn
+func (s *stubSigner) SignSessionCSR(_ context.Context, csrPEM []byte, rig, polecat string) ([]byte, []byte, time.Time, error) {
+	s.gotCN = worker.PolecatCN(rig, polecat)
 	s.gotCSR = csrPEM
 	if s.err != nil {
 		return nil, nil, time.Time{}, s.err
