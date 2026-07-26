@@ -484,9 +484,6 @@ func TestEnvAllowed_AllowlistRefusesLoaderAndSecrets(t *testing.T) {
 	}
 }
 
-// TestAgentEnv_FileWinsOverWire pins the §8 invariant: the operator's agent env
-// file is the sanctioned source of agent configuration, so a wire value can
-// never override one it sets (os/exec keeps the LAST duplicate).
 // TestAgentEnv_ContainerDoesNotInheritHostPaths pins that a container exec is
 // NOT handed the worker host's PATH/HOME/TMPDIR. `docker exec -e PATH=…`
 // overrides the image's own, so the agent runtime that the image preflight
@@ -539,6 +536,9 @@ func hasEnvKey(env []string, key string) bool {
 	return false
 }
 
+// TestAgentEnv_FileWinsOverWire pins the §8 invariant: the operator's agent env
+// file is the sanctioned source of agent configuration, so a wire value can
+// never override one it sets (os/exec keeps the LAST duplicate).
 func TestAgentEnv_FileWinsOverWire(t *testing.T) {
 	dir := t.TempDir()
 	envFile := filepath.Join(dir, "agent.env")
