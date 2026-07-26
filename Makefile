@@ -158,9 +158,12 @@ safe-install: check-up-to-date check-forward-only build
 # dies with command-not-found the first time a remote polecat starts.
 # gt-worker-client is the worker service itself, installed here so a machine
 # that acts as both orchestrator and worker (the single-box setup) is complete
-# after one `make install`. Both are replaced atomically, like gt itself.
+# after one `make install`. gt-proxy-client comes too: on a worker it IS `gt` and
+# `bd` (the shims `gt worker service install` creates point at it), so a worker
+# without it has an agent that cannot reach the control plane at all. All are
+# replaced atomically, like gt itself.
 install-remote-execution-binaries:
-	@for b in $(BINARY)-worker-attach $(BINARY)-worker-client; do \
+	@for b in $(BINARY)-worker-attach $(BINARY)-worker-client $(BINARY)-proxy-client; do \
 		cp $(BUILD_DIR)/$$b $(INSTALL_DIR)/$$b.new && \
 		mv $(INSTALL_DIR)/$$b.new $(INSTALL_DIR)/$$b && \
 		echo "Installed $$b to $(INSTALL_DIR)/$$b"; \

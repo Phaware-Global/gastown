@@ -21,6 +21,9 @@ func fakeWorkerClient(t *testing.T) string {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "gt-worker-client")
 	require.NoError(t, os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0755))
+	// The agent's gt/bd are this binary under those names, so the planner
+	// requires it too.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "gt-proxy-client"), []byte("#!/bin/sh\nexit 0\n"), 0755))
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
 	return bin
 }
@@ -159,6 +162,78 @@ func TestPlanWorkerService_StateDirIsAbsolute(t *testing.T) {
 		Listen: "unix:///tmp/gtw.sock", ProxyURL: "http://127.0.0.1:9876", StateDir: "relative/state"})
 	require.NoError(t, err)
 	assert.True(t, filepath.IsAbs(plan.StateDir), plan.StateDir)
+}
+
+// TestInstallShims_PointsGtAndBdAtTheProxyClient pins how a remote agent
+// reaches the control plane: `gt` and `bd` are gt-proxy-client under those
+// names. They go in the WORKER's bin dir, not the gt install dir — on a machine
+// that is both orchestrator and worker, the real gt lives there and must stay.
+func TestInstallShims_PointsGtAndBdAtTheProxyClient(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd job planning is macOS-only")
+	}
+	fakeWorkerClient(t)
+	stateDir := t.TempDir()
+
+	plan, err := planWorkerService(workerServiceOpts{
+		Listen: "unix:///tmp/gtw.sock", ProxyURL: "http://127.0.0.1:9876", StateDir: stateDir})
+	require.NoError(t, err)
+	require.NoError(t, installShims(plan))
+
+	for _, name := range []string{"gt", "bd"} {
+		link := filepath.Join(stateDir, "bin", name)
+		target, err := os.Readlink(link)
+		require.NoError(t, err, "%s must be a symlink", name)
+		assert.Equal(t, plan.ProxyClient, target)
+		// A symlink, not a copy: an upgraded gt-proxy-client must carry over,
+		// since a stale client against a newer proxy fails at agent runtime.
+		assert.Contains(t, target, "gt-proxy-client")
+	}
+
+	// The shim dir must come FIRST, or a single-box worker's agent would get the
+	// real gt instead of the proxy shim.
+	assert.True(t, strings.HasPrefix(plan.Path, filepath.Join(stateDir, "bin")+":"), plan.Path)
+	assert.Contains(t, string(plan.Plist), filepath.Join(stateDir, "bin")+":")
+}
+
+// TestInstallShims_ReplacesStaleLinks pins that re-installing repoints existing
+// shims: a shim left pointing at an old path fails at agent runtime, which is
+// worse than no shim at all.
+func TestInstallShims_ReplacesStaleLinks(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd job planning is macOS-only")
+	}
+	fakeWorkerClient(t)
+	stateDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(stateDir, "bin"), 0755))
+	require.NoError(t, os.Symlink("/nonexistent/old-proxy-client", filepath.Join(stateDir, "bin", "gt")))
+
+	plan, err := planWorkerService(workerServiceOpts{
+		Listen: "unix:///tmp/gtw.sock", ProxyURL: "http://127.0.0.1:9876", StateDir: stateDir})
+	require.NoError(t, err)
+	require.NoError(t, installShims(plan))
+
+	target, err := os.Readlink(filepath.Join(stateDir, "bin", "gt"))
+	require.NoError(t, err)
+	assert.Equal(t, plan.ProxyClient, target)
+}
+
+// TestPlanWorkerService_RequiresProxyClient pins that a worker missing
+// gt-proxy-client fails at install: the agent would start and then be unable to
+// call gt done at all.
+func TestPlanWorkerService_RequiresProxyClient(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd job planning is macOS-only")
+	}
+	// A PATH with gt-worker-client but NO gt-proxy-client.
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "gt-worker-client"), []byte("#!/bin/sh\n"), 0755))
+	t.Setenv("PATH", dir)
+
+	_, err := planWorkerService(workerServiceOpts{
+		Listen: "unix:///tmp/gtw.sock", ProxyURL: "http://127.0.0.1:9876", StateDir: t.TempDir()})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "gt-proxy-client not found")
 }
 
 func TestWorkerServicePath(t *testing.T) {
