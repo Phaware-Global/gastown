@@ -10,29 +10,21 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/sockproto"
 	"github.com/steveyegge/gastown/internal/worker"
 )
 
-// secretEnvSubstrings identify env keys that must never be accepted from the
-// wire. The launcher already filters to a non-secret allowlist (core §7.4), but
-// the worker re-checks: an env var arriving over the control plane is
-// orchestrator-supplied input, and a worker's own operator-provisioned agent
-// env file (§8) is the ONLY sanctioned source of agent credentials. A wire
-// value must never shadow or inject one.
-var secretEnvSubstrings = []string{"TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "API_KEY", "APIKEY", "_KEY", "PRIVATE"}
+// execWaitDelay bounds the interval between cancelling an exec and forcibly
+// killing it: long enough for an agent to handle SIGTERM and flush, short
+// enough that a wedged agent cannot pin the session (MaxSessions=1 means one
+// wedged session is the whole worker).
+const execWaitDelay = 10 * time.Second
 
-// looksSecret reports whether an env key must be refused from the wire.
-func looksSecret(key string) bool {
-	upper := strings.ToUpper(key)
-	for _, frag := range secretEnvSubstrings {
-		if strings.Contains(upper, frag) {
-			return true
-		}
-	}
-	return false
-}
+// execProbeInterval is how often an attached stream probes the launcher's
+// liveness. A var so tests can drive the dead-peer path without waiting.
+var execProbeInterval = 30 * time.Second
 
 // handleAttach services an exec-stream connection (§4.3, §5): validate the
 // attach preamble against a ready session, ack it, then switch this connection
@@ -46,12 +38,17 @@ func (s *Service) handleAttach(ctx context.Context, c *connState, m *sockproto.M
 			Code: "bad_request", Msg: "attach requires argv"})
 		return
 	}
-	// Reject wire-supplied secret env before it can reach the agent.
+	// Re-validate wire env against the shared allowlist before it can reach the
+	// agent. The launcher already filtered, but this side must not TRUST that:
+	// the env is orchestrator-supplied input, and in native mode the agent runs
+	// on the worker host where a wire LD_PRELOAD or PATH would be code
+	// execution (sockproto.EnvAllowed documents the reasoning).
 	for k := range m.Env {
-		if looksSecret(k) {
+		if !sockproto.EnvAllowed(k) {
 			_ = c.send(&sockproto.Message{Type: sockproto.TypeError, ID: m.ID, Session: m.Session,
 				Code: "bad_request",
-				Msg:  fmt.Sprintf("env %q looks like a secret; agent credentials must come from the worker's agent env file (§7.1/§8), not the wire", k)})
+				Msg: fmt.Sprintf("env %q is not permitted from the wire (allowed: %s); agent credentials come from the worker's agent env file (§7.1/§8)",
+					k, sockproto.EnvAllowedDescription())})
 			return
 		}
 	}
@@ -92,6 +89,35 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Register this exec with the session so a concurrent teardown/shutdown on
+	// ANOTHER connection kills the agent instead of deleting its worktree from
+	// under a still-running process (§6). Registration also serializes attaches:
+	// a second launcher must not start a SECOND agent on the same worktree, and
+	// an attach racing a teardown must not start one at all.
+	s.mu.Lock()
+	switch {
+	case sess.tearingDown:
+		s.mu.Unlock()
+		_ = c.writeExit(125)
+		return fmt.Errorf("session %s is being torn down", m.Session)
+	case sess.execCancel != nil:
+		s.mu.Unlock()
+		_ = c.writeFrame(sockproto.FrameStderr, []byte("gt-worker-client: session already has an attached agent\n"))
+		_ = c.writeExit(125)
+		return fmt.Errorf("session %s already has an attached exec", m.Session)
+	}
+	sess.execCancel = cancel
+	s.mu.Unlock()
+	var unregisterOnce sync.Once
+	unregister := func() {
+		unregisterOnce.Do(func() {
+			s.mu.Lock()
+			sess.execCancel = nil
+			s.mu.Unlock()
+		})
+	}
+	defer unregister()
+
 	cmd, err := s.execCommand(ctx, m, worktree, container)
 	if err != nil {
 		// Report the failure as a non-zero exit so the launcher (and the pane)
@@ -130,6 +156,12 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 			n, err := r.Read(buf)
 			if n > 0 {
 				if werr := c.writeFrame(t, buf[:n]); werr != nil {
+					// The launcher stopped draining (or died): cancel so the
+					// agent is killed and cmd.Wait can return, instead of the
+					// agent blocking forever on a full stdout pipe.
+					s.log.Warn("output frame write failed; cancelling the attached agent",
+						"session", m.Session, "err", werr)
+					cancel()
 					return
 				}
 			}
@@ -145,13 +177,33 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 	// Read inbound frames: stdin, signals, resize. Ends when the launcher
 	// closes the stream (agent stdin then sees EOF).
 	inboundDone := make(chan struct{})
+	// agentDone marks the agent as already exited, so the teardown-time read
+	// error below is expected rather than a lost launcher.
+	agentDone := make(chan struct{})
 	go func() {
 		defer close(inboundDone)
 		defer stdin.Close()
 		for {
 			t, payload, err := sockproto.ReadFrame(c.frameReader())
 			if err != nil {
-				return // EOF or protocol error: stop feeding stdin
+				// A clean io.EOF is AMBIGUOUS: a launcher legitimately
+				// half-closes its write side to hand the agent stdin EOF (that
+				// is how `cat` terminates), so EOF alone must not kill the
+				// agent — closing stdin (deferred above) is the whole response,
+				// and a truly dead launcher is caught by the liveness prober.
+				// A hard error is unambiguous: the connection broke, the pane is
+				// gone, so cancel rather than leave an orphaned agent pinning
+				// the session with no reattach path.
+				if !errors.Is(err, io.EOF) {
+					select {
+					case <-agentDone:
+					default:
+						s.log.Warn("exec stream read failed; cancelling the attached agent",
+							"session", m.Session, "err", err)
+						cancel()
+					}
+				}
+				return
 			}
 			switch t {
 			case sockproto.FrameStdin:
@@ -169,8 +221,35 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 		}
 	}()
 
+	// Liveness prober: an EMPTY stdout frame is a no-op for the launcher (it
+	// writes zero bytes) but a real write on the socket, so it detects a dead
+	// peer even for an agent that produces no output — the case no pump write
+	// would ever catch. Without it, a killed pane would leave the agent running
+	// forever, pinning the session.
+	proberDone := make(chan struct{})
+	go func() {
+		defer close(proberDone)
+		tick := time.NewTicker(execProbeInterval)
+		defer tick.Stop()
+		for {
+			select {
+			case <-agentDone:
+				return
+			case <-tick.C:
+				if err := c.writeFrame(sockproto.FrameStdout, nil); err != nil {
+					s.log.Warn("exec stream liveness probe failed; cancelling the attached agent",
+						"session", m.Session, "err", err)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
 	waitErr := cmd.Wait()
-	pumps.Wait() // flush all output BEFORE the terminal exit frame
+	close(agentDone) // stop the prober; later read errors are expected
+	<-proberDone     // no prober write may race the terminal exit frame
+	pumps.Wait()     // flush all output BEFORE the terminal exit frame
 
 	// The inbound goroutine is parked in a blocking socket read, which ctx
 	// cancellation cannot interrupt — expire the READ deadline to unblock it
@@ -179,6 +258,12 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 	_ = c.expireReads()
 	<-inboundDone
 	cancel()
+
+	// Unregister BEFORE the terminal exit frame: a launcher that sees the exit
+	// frame may immediately reattach (the pane restarts the agent), and it must
+	// not be refused as "already attached" by this finished exec's registration.
+	// The agent is already dead, so there is nothing left for a teardown to kill.
+	unregister()
 
 	code := exitCode(waitErr)
 	if err := c.writeExit(code); err != nil {
@@ -206,7 +291,13 @@ func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktre
 		// as a single shell-quoted command line and run via /bin/sh, which the
 		// image contract requires.
 		args = append(args, "--", container, "/bin/sh", "-c", shellJoin(m.Argv))
-		return exec.CommandContext(ctx, "docker", args...), nil
+		cmd := exec.CommandContext(ctx, "docker", args...)
+		// Cancelling kills the `docker exec` CLIENT; the in-container process is
+		// reaped indirectly (its stdio pipes close, so its next write takes
+		// SIGPIPE). The authoritative kill for container mode is teardown, which
+		// removes the work container outright (§6).
+		cmd.WaitDelay = execWaitDelay
+		return cmd, nil
 	}
 
 	// Native: exec directly, argv passed as argv (no shell involved at all).
@@ -215,6 +306,18 @@ func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktre
 	cmd.Env = env
 	// Own process group so a signal reaches the agent's whole tree.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Cancellation is a graceful SIGTERM to the whole group — an agent killed
+	// with SIGKILL cannot flush its own state — with WaitDelay as the hard
+	// bound: after it, Go SIGKILLs the process and closes the pipes, so
+	// cmd.Wait and the output pumps always unwind even if the agent ignores
+	// SIGTERM.
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+	}
+	cmd.WaitDelay = execWaitDelay
 	return cmd, nil
 }
 
@@ -228,15 +331,20 @@ func (s *Service) agentEnv(wireEnv map[string]string) ([]string, error) {
 			env = append(env, key+"="+v)
 		}
 	}
+	// Wire env BEFORE the operator's file: os/exec dedups keeping the LAST
+	// value, so the file always wins for any key it sets. That is what makes
+	// "the agent env file is the only sanctioned source of agent credentials"
+	// true in practice — a wire ANTHROPIC_BASE_URL cannot redirect a
+	// file-provisioned credential to another endpoint.
+	for k, v := range wireEnv {
+		env = append(env, k+"="+v)
+	}
 	if s.cfg.AgentEnvFile != "" {
 		fileEnv, err := readEnvFile(s.cfg.AgentEnvFile)
 		if err != nil {
 			return nil, fmt.Errorf("agent env file: %w", err)
 		}
 		env = append(env, fileEnv...)
-	}
-	for k, v := range wireEnv {
-		env = append(env, k+"="+v)
 	}
 	return env, nil
 }
@@ -249,7 +357,8 @@ func (s *Service) signalAgent(cmd *exec.Cmd, name, container string) {
 		return
 	}
 	if container != "" {
-		_ = exec.Command("docker", "kill", "--signal", strings.ToUpper(name), "--", container).Run()
+		// docker kill needs a canonical name; the wire form may be descriptive.
+		_ = exec.Command("docker", "kill", "--signal", signalName(sig), "--", container).Run()
 		return
 	}
 	if cmd.Process == nil {
@@ -259,19 +368,39 @@ func (s *Service) signalAgent(cmd *exec.Cmd, name, container string) {
 	_ = syscall.Kill(-cmd.Process.Pid, sig)
 }
 
-// parseSignal maps the small set of signals a launcher may forward.
+// parseSignal maps the signals a launcher may forward. It accepts BOTH the
+// canonical names ("SIGINT"/"INT") and Go's descriptive os.Signal.String()
+// forms ("interrupt", "terminated", "hangup", "quit") — a launcher built
+// against an older gt may still send the latter, and silently dropping them
+// would mean the pane's Ctrl-C never reaches the agent.
 func parseSignal(name string) syscall.Signal {
-	switch strings.ToUpper(strings.TrimPrefix(strings.ToUpper(name), "SIG")) {
-	case "INT":
+	switch strings.TrimPrefix(strings.ToUpper(strings.TrimSpace(name)), "SIG") {
+	case "INT", "INTERRUPT":
 		return syscall.SIGINT
-	case "TERM":
+	case "TERM", "TERMINATED":
 		return syscall.SIGTERM
-	case "HUP":
+	case "HUP", "HANGUP":
 		return syscall.SIGHUP
 	case "QUIT":
 		return syscall.SIGQUIT
 	default:
 		return 0
+	}
+}
+
+// signalName renders a signal for docker kill, which needs a canonical name.
+func signalName(sig syscall.Signal) string {
+	switch sig {
+	case syscall.SIGINT:
+		return "SIGINT"
+	case syscall.SIGTERM:
+		return "SIGTERM"
+	case syscall.SIGHUP:
+		return "SIGHUP"
+	case syscall.SIGQUIT:
+		return "SIGQUIT"
+	default:
+		return ""
 	}
 }
 

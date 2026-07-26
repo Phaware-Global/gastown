@@ -199,7 +199,34 @@ N bytes payload
 
 `resize` carries `{cols, rows}` JSON; `exit` carries the process's real exit
 code (1-byte payload); `signal` (orch → worker) forwards e.g. SIGINT to the
-agent. The stream closes after `exit`.
+agent, by **canonical name** (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`). The
+stream closes after `exit`.
+
+Stream rules that follow from the framing:
+
+- **One agent per session.** A second `attach` to a session that already has a
+  running exec is refused (exit `125`): two agents on one worktree would
+  double-write the tree the checkpoint loop is committing.
+- **Half-close ≠ disconnect.** A launcher may half-close its write side to hand
+  the agent stdin EOF; the worker closes the agent's stdin and keeps the agent
+  running. Only a hard read error is treated as a lost pane.
+- **Liveness.** The worker periodically writes a zero-length `stdout` frame — a
+  no-op for the launcher, a real write on the socket — so a killed pane is
+  detected even for an agent that produces no output. On a failed write (probe
+  or output pump) the worker cancels the exec: `SIGTERM` to the agent's process
+  group, then a hard kill after a short grace, so a dead launcher can never
+  leave an agent pinning the session.
+- **Session lifecycle wins.** `shutdown` stops an attached agent *before* the
+  final flush (so the checkpoint captures a quiesced tree), and `teardown`
+  stops it before the worktree is removed.
+
+Session env in the `attach` payload is an **allowlist** (`GT_*`, `BD_*`,
+`ANTHROPIC_DEFAULT_*`, plus specific model-config keys, none credential-shaped),
+enforced identically on both sides. The worker re-validates rather than trusting
+the launcher's filter: in native mode the agent runs on the worker host, where a
+wire `LD_PRELOAD` or `PATH` would be code execution. Agent credentials come from
+the worker's own agent env file (§8) — which wins over any wire value of the
+same key — never from the orchestrator.
 
 ## 5. Interface mapping
 

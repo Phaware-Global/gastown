@@ -108,7 +108,11 @@ func run(address, session, token, workerName string, argv []string) (int, error)
 
 	go func() {
 		for sig := range sigCh {
-			_ = writeFrame(sockproto.FrameSignal, []byte(sig.String()))
+			// CANONICAL names on the wire. os.Signal.String() yields
+			// descriptive forms ("interrupt", "terminated"), which an older
+			// worker would not recognize — and a silently dropped SIGINT means
+			// the pane's Ctrl-C never reaches the agent.
+			_ = writeFrame(sockproto.FrameSignal, []byte(canonicalSignalName(sig)))
 		}
 	}()
 
@@ -157,49 +161,34 @@ func run(address, session, token, workerName string, argv []string) (int, error)
 	}
 }
 
-// forwardedEnvPrefixes are the session-env families the agent needs (core
-// §7.4): gastown's own session vars plus the relay pointers.
-var forwardedEnvPrefixes = []string{"GT_", "BD_", "CLAUDE", "ANTHROPIC_MODEL", "ANTHROPIC_BASE_URL", "ANTHROPIC_DEFAULT_"}
-
-// launcherOnlyEnv are vars that configure THIS process and must not be
-// forwarded to the agent.
-var launcherOnlyEnv = map[string]bool{
-	"GT_WORKER_TOKEN": true,
-	"GT_WORKER_NAME":  true,
+// canonicalSignalName maps a caught signal to the canonical wire name the
+// worker parses.
+func canonicalSignalName(sig os.Signal) string {
+	switch sig {
+	case syscall.SIGINT:
+		return "SIGINT"
+	case syscall.SIGTERM:
+		return "SIGTERM"
+	case syscall.SIGHUP:
+		return "SIGHUP"
+	case syscall.SIGQUIT:
+		return "SIGQUIT"
+	default:
+		return strings.ToUpper(sig.String())
+	}
 }
 
-// secretEnvSubstrings mark keys that must never ride the wire. The worker
-// re-checks this independently; agent credentials come from the worker's own
-// agent env file (§8), never from here.
-var secretEnvSubstrings = []string{"TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "API_KEY", "APIKEY", "_KEY", "PRIVATE"}
-
-// sessionEnv selects the non-secret session env to forward, from this
-// process's own environment (the tmux pane supplied it), so nothing sensitive
-// is placed in argv.
+// sessionEnv selects the session env to forward, from this process's own
+// environment (the tmux pane supplied it), so nothing sensitive is placed in
+// argv. The filter is the SHARED wire policy the worker re-validates against
+// (sockproto.EnvAllowed), so the two sides cannot drift.
 func sessionEnv() map[string]string {
 	out := map[string]string{}
 	for _, kv := range os.Environ() {
 		k, v, ok := strings.Cut(kv, "=")
-		if !ok || launcherOnlyEnv[k] || isSecretKey(k) {
-			continue
-		}
-		for _, p := range forwardedEnvPrefixes {
-			if strings.HasPrefix(k, p) {
-				out[k] = v
-				break
-			}
+		if ok && sockproto.EnvAllowed(k) {
+			out[k] = v
 		}
 	}
 	return out
-}
-
-// isSecretKey reports whether a key must be withheld from the wire.
-func isSecretKey(k string) bool {
-	upper := strings.ToUpper(k)
-	for _, frag := range secretEnvSubstrings {
-		if strings.Contains(upper, frag) {
-			return true
-		}
-	}
-	return false
 }
