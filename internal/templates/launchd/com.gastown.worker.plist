@@ -5,20 +5,26 @@
     <key>Label</key>
     <string>com.gastown.worker</string>
 
-    <!-- Sources <state-dir>/worker.env (0600) before exec so secrets — the
-         unix-mode pre-shared token — reach the worker through the environment
-         instead of argv, which is world-readable via ps. launchd inherits a
-         stripped environment, so shell rc files do not propagate; `set -a`
-         matches systemd's EnvironmentFile semantics. -->
+    <!-- ShellCommand sources <state-dir>/worker.env (0600) before exec so
+         secrets — the unix-mode pre-shared token — reach the worker through the
+         environment instead of argv, which is world-readable via ps. launchd
+         inherits a stripped environment, so shell rc files do not propagate;
+         `set -a` matches systemd's EnvironmentFile semantics.
+
+         Every interpolation is XML-escaped here, and the shell line is
+         assembled with shell quoting in Go: this file is BOTH an XML document
+         and a /bin/sh -c argument, so a path containing & or a quote would
+         otherwise either make launchd reject the job or break out of the
+         command line. -->
     <key>ProgramArguments</key>
     <array>
         <string>/bin/sh</string>
         <string>-c</string>
-        <string>set -a; [ -r "{{.StateDir}}/worker.env" ] &amp;&amp; . "{{.StateDir}}/worker.env"; set +a; exec "{{.BinaryPath}}"{{range .Args}} {{.}}{{end}}</string>
+        <string>{{xml .ShellCommand}}</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>{{.StateDir}}</string>
+    <string>{{xml .StateDir}}</string>
 
     <key>RunAtLoad</key>
     <true/>
@@ -29,15 +35,15 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>{{.StateDir}}/worker.log</string>
+    <string>{{xml .LogPath}}</string>
 
     <key>StandardErrorPath</key>
-    <string>{{.StateDir}}/worker.log</string>
+    <string>{{xml .LogPath}}</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>{{.Path}}</string>
+        <string>{{xml .Path}}</string>
     </dict>
 
     <!-- The agent is interactive work, not a batch job: Background would have

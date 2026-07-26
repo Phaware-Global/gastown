@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -117,10 +118,21 @@ func TestPlanWorkerService_TCPJob(t *testing.T) {
 	assert.NotContains(t, strings.Join(nativeOnly.Args, " "), "-docker")
 }
 
+// shellLineFromPlist returns the /bin/sh -c line launchd will actually run,
+// decoded by plutil — so these tests assert on the real thing rather than on
+// escaped bytes.
+func shellLineFromPlist(t *testing.T, plist []byte) string {
+	t.Helper()
+	f := filepath.Join(t.TempDir(), "com.gastown.worker.plist")
+	require.NoError(t, os.WriteFile(f, plist, 0644))
+	out, err := exec.Command("plutil", "-extract", "ProgramArguments.2", "raw", "-o", "-", f).CombinedOutput()
+	require.NoError(t, err, "plutil could not read the job: %s", strings.TrimSpace(string(out)))
+	return strings.TrimSpace(string(out))
+}
+
 // TestPlanWorkerService_QuotesPathsWithSpaces pins quoting on the path that
-// matters: the plist embeds the argv inside a `/bin/sh -c` string, and the
-// DEFAULT state dir is "~/Library/Application Support/gt-worker" — unquoted,
-// the worker would be handed "-state-dir …/Application" and fail at startup.
+// matters most: the DEFAULT state dir is "~/Library/Application Support/
+// gt-worker", and unquoted the worker would be handed "-state-dir …/Application".
 func TestPlanWorkerService_QuotesPathsWithSpaces(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("launchd job planning is macOS-only")
@@ -133,8 +145,38 @@ func TestPlanWorkerService_QuotesPathsWithSpaces(t *testing.T) {
 		Listen: "unix:///tmp/gtw.sock", ProxyURL: "http://127.0.0.1:9876", StateDir: spaced})
 	require.NoError(t, err)
 
-	// The rendered job must carry the path as ONE shell word.
-	assert.Contains(t, string(plan.Plist), "-state-dir '"+spaced+"'")
+	line := shellLineFromPlist(t, plan.Plist)
+	assert.Contains(t, line, "-state-dir '"+spaced+"'", "the path must survive as ONE shell word")
+}
+
+// TestPlanWorkerService_ShellLineIsInjectionSafe pins that operator-supplied
+// paths cannot execute at job start. Every part of the line is single-quoted, so
+// a $(…) in a path is inert text — and the line still parses as valid shell.
+func TestPlanWorkerService_ShellLineIsInjectionSafe(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd job planning is macOS-only")
+	}
+	fakeWorkerClient(t)
+	marker := filepath.Join(t.TempDir(), "pwned")
+	stateDir := filepath.Join(t.TempDir(), `we"ird $(touch `+marker+`)`)
+	require.NoError(t, os.MkdirAll(stateDir, 0700))
+
+	plan, err := planWorkerService(workerServiceOpts{
+		Listen: "unix:///tmp/gtw.sock", ProxyURL: "http://127.0.0.1:9876", StateDir: stateDir})
+	require.NoError(t, err)
+
+	line := shellLineFromPlist(t, plan.Plist)
+	// Quoted, therefore inert — not absent: a path is allowed to contain these
+	// characters, it just must not be interpreted.
+	assert.Contains(t, line, "'"+stateDir+"'")
+
+	// Valid shell, and running it does NOT fire the embedded command. The exec
+	// target is a stub that exits 0, so the line runs to completion.
+	syntax, err := exec.Command("/bin/sh", "-n", "-c", line).CombinedOutput()
+	require.NoError(t, err, "the rendered line is not valid shell: %s", strings.TrimSpace(string(syntax)))
+	_ = exec.Command("/bin/sh", "-c", line).Run()
+	_, statErr := os.Stat(marker)
+	assert.True(t, os.IsNotExist(statErr), "the path's $(…) must never execute")
 }
 
 // TestPlanWorkerService_UnixJobNeedsNoTLS pins that the unix path is usable
