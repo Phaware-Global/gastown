@@ -9,10 +9,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/steveyegge/gastown/internal/execution"
 	"github.com/steveyegge/gastown/internal/sockproto"
 )
 
@@ -160,4 +162,59 @@ func TestPushBinariesTo_ReportsErrors(t *testing.T) {
 	_, err := b.PushBinariesTo(context.Background())
 	require.Error(t, err, "the operator path must not swallow what the automatic path logs")
 	assert.Contains(t, err.Error(), "plan9/mips")
+}
+
+// TestProvision_RetriesARestartingWorker pins the contract the worker's
+// "restarting" refusal claims: its supervisor brings it straight back, so a
+// polecat start that races a binary upgrade must succeed on the retry rather
+// than fail once. Nothing upstream retries — buildRemoteArgv calls Provision
+// exactly once — so this is the only place it can happen.
+func TestProvision_RetriesARestartingWorker(t *testing.T) {
+	prev := provisionRetryDelay
+	provisionRetryDelay = 10 * time.Millisecond
+	t.Cleanup(func() { provisionRetryDelay = prev })
+
+	w := newFakeWorker(t)
+	w.restartingUntilAttempt = 2 // refuse the first two session_opens
+	b, _ := testBackend(t, w)
+
+	ep, err := b.Provision(context.Background(), execution.PolecatSpec{
+		Rig: "demo", Polecat: "furiosa", Session: "gt-demo-furiosa", Config: b.cfg,
+	})
+	require.NoError(t, err, "a restarting worker must not fail the provision")
+	assert.Equal(t, "gt-demo-furiosa", ep.ID)
+	assert.GreaterOrEqual(t, w.sessionOpenAttempts(), 3, "it must actually have retried")
+}
+
+// TestProvision_GivesUpOnAWorkerThatStaysDown pins the bound: retries are for a
+// supervisor restart, not for masking a dead worker into a long stall.
+func TestProvision_GivesUpOnAWorkerThatStaysDown(t *testing.T) {
+	prev := provisionRetryDelay
+	provisionRetryDelay = 10 * time.Millisecond
+	t.Cleanup(func() { provisionRetryDelay = prev })
+
+	w := newFakeWorker(t)
+	w.restartingUntilAttempt = 99
+	b, _ := testBackend(t, w)
+
+	_, err := b.Provision(context.Background(), execution.PolecatSpec{
+		Rig: "demo", Polecat: "furiosa", Session: "gt-demo-furiosa", Config: b.cfg,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "restarting")
+	assert.Equal(t, provisionRetries+1, w.sessionOpenAttempts(), "attempts must be bounded")
+}
+
+// TestProvision_DoesNotRetryARealRejection pins that only the transient shape
+// retries: a worker at its session limit must fail immediately, not three times.
+func TestProvision_DoesNotRetryARealRejection(t *testing.T) {
+	w := newFakeWorker(t)
+	w.failOpenWith = "max_sessions"
+	b, _ := testBackend(t, w)
+
+	_, err := b.Provision(context.Background(), execution.PolecatSpec{
+		Rig: "demo", Polecat: "furiosa", Session: "gt-demo-furiosa", Config: b.cfg,
+	})
+	require.Error(t, err)
+	assert.Equal(t, 1, w.sessionOpenAttempts(), "a real rejection must not be retried")
 }

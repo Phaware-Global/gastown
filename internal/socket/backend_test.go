@@ -39,6 +39,11 @@ type fakeWorker struct {
 	pushes  map[string]*pushedBinary
 	pushBuf map[string][]byte
 
+	// restartingUntilAttempt makes the worker answer session_open with the
+	// transient "restarting" refusal for the first N attempts.
+	restartingUntilAttempt int
+	openAttempts           int
+
 	// knobs
 	refusePush   string // non-empty → answer a terminal push chunk with this error code
 	gtVersion    string
@@ -81,6 +86,13 @@ func (w *fakeWorker) handlePush(codec *sockproto.Codec, m *sockproto.Message) {
 	w.pushes[m.Name] = &pushedBinary{data: w.pushBuf[m.Name], sha: m.SHA256}
 	delete(w.pushBuf, m.Name)
 	_ = codec.Send(&sockproto.Message{Type: sockproto.TypePushBinaryAck, ID: m.ID, Name: m.Name, Applied: "installed"})
+}
+
+// sessionOpenAttempts reports how many session_opens arrived.
+func (w *fakeWorker) sessionOpenAttempts() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.openAttempts
 }
 
 // pushed returns the completed transfers.
@@ -183,6 +195,15 @@ func (w *fakeWorker) handle(nc net.Conn) {
 		case sockproto.TypePushBinary:
 			w.handlePush(codec, m)
 		case sockproto.TypeSessionOpen:
+			w.mu.Lock()
+			w.openAttempts++
+			restarting := w.openAttempts <= w.restartingUntilAttempt
+			w.mu.Unlock()
+			if restarting {
+				_ = codec.Send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session,
+					Code: "restarting", Msg: "worker is restarting onto a new binary; retry"})
+				continue
+			}
 			if w.hang {
 				<-w.stop // handshake done, but never answer — keep the conn open
 				return

@@ -2,6 +2,7 @@ package socket
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -95,7 +96,30 @@ func (b *SocketBackend) endpointFor(spec execution.PolecatSpec) execution.Endpoi
 	}
 }
 
+// errWorkerRestarting marks a refusal from a worker that is exiting onto a
+// pushed binary. Its supervisor brings it straight back, so this is transient
+// by construction — see Provision's retry.
+var errWorkerRestarting = errors.New("socket: worker is restarting")
+
+// provisionRetries is how many extra attempts a transient worker restart gets.
+// A supervisor restart is sub-second; three attempts over ~2s covers it without
+// turning a genuinely dead worker into a long stall.
+const provisionRetries = 2
+
+// provisionRetryDelay is the wait before each retry.
+var provisionRetryDelay = 500 * time.Millisecond
+
 // Provision opens (or reattaches) a session on the worker (§5, core §9.4).
+//
+// A worker that is restarting onto a pushed binary (§4.1) is retried rather
+// than reported: it refuses with a `restarting` code, or its connection simply
+// drops, and either way its supervisor has it back within a second. Without
+// this the binary refresh would not be the invisible thing the design claims —
+// a polecat start that happened to race an upgrade would fail once, and nothing
+// upstream retries (buildRemoteArgv calls Provision exactly once).
+//
+// Both attempts and delays live inside the caller's deadline, so a genuinely
+// dead worker still fails promptly rather than stalling for the full timeout.
 func (b *SocketBackend) Provision(ctx context.Context, spec execution.PolecatSpec) (execution.Endpoint, error) {
 	// WithTimeout yields min(caller deadline, provisionTimeout): a
 	// deadline-less caller is bounded by the cap; a shorter caller deadline
@@ -103,6 +127,25 @@ func (b *SocketBackend) Provision(ctx context.Context, spec execution.PolecatSpe
 	ctx, cancel := context.WithTimeout(ctx, provisionTimeout)
 	defer cancel()
 
+	var ep execution.Endpoint
+	var err error
+	for attempt := 0; ; attempt++ {
+		ep, err = b.provisionOnce(ctx, spec)
+		if err == nil || !errors.Is(err, errWorkerRestarting) || attempt >= provisionRetries {
+			return ep, err
+		}
+		slog.Default().Info("socket: worker is restarting onto a pushed binary; retrying provision",
+			"session", spec.Session, "attempt", attempt+1)
+		select {
+		case <-ctx.Done():
+			return execution.Endpoint{}, fmt.Errorf("%w (deadline reached while it restarted)", err)
+		case <-time.After(provisionRetryDelay):
+		}
+	}
+}
+
+// provisionOnce is one full attempt: dial, refresh binaries, open the session.
+func (b *SocketBackend) provisionOnce(ctx context.Context, spec execution.PolecatSpec) (execution.Endpoint, error) {
 	c, err := b.dial(ctx)
 	if err != nil {
 		return execution.Endpoint{}, err
@@ -145,7 +188,10 @@ func (b *SocketBackend) Provision(ctx context.Context, spec execution.PolecatSpe
 	}
 	resp, err := c.request(ctx, open)
 	if err != nil {
-		return execution.Endpoint{}, fmt.Errorf("socket: session_open: %w", err)
+		// A connection that dies mid-bringup is the other face of a restart:
+		// the worker exited between our handshake and this request. Treat it as
+		// transient — a worker that is really gone fails again on the retry.
+		return execution.Endpoint{}, fmt.Errorf("socket: session_open: %w: %w", errWorkerRestarting, err)
 	}
 
 	// A container session's agent reaches the proxy only over mTLS with the
@@ -184,6 +230,9 @@ func (b *SocketBackend) Provision(ctx context.Context, spec execution.PolecatSpe
 	case sockproto.TypeSessionReady:
 		return b.endpointFor(spec), nil
 	case sockproto.TypeSessionError, sockproto.TypeError:
+		if resp.Code == "restarting" {
+			return execution.Endpoint{}, fmt.Errorf("%w: %s", errWorkerRestarting, resp.Msg)
+		}
 		return execution.Endpoint{}, fmt.Errorf("socket: worker rejected session %s: %s: %s", spec.Session, resp.Code, resp.Msg)
 	default:
 		return execution.Endpoint{}, fmt.Errorf("socket: unexpected response %q to session bringup", resp.Type)

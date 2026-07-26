@@ -183,8 +183,11 @@ installed, writes through a staging file, and installs by rename — a half-writ
   provision the refresh is meant to be invisible to. It is applied at a
   genuinely idle moment instead: a teardown that empties the worker, or a
   control connection closing with nothing live. While an apply is in flight the
-  worker refuses `session_open` with a retryable `restarting`, so no session is
-  accepted and then abandoned by the exit.
+  worker refuses `session_open` with `restarting`, and **`Provision` retries it**
+  (bounded, inside the caller's deadline) — along with a connection that dies
+  mid-bringup, which is the same event seen from the other side. Nothing upstream
+  retries a provision, so without this the refresh would not be invisible: a
+  polecat start that happened to race an upgrade would fail once.
 - An **os/arch mismatch is refused**, not attempted: the orchestrator only has
   binaries for its own platform, and installing one the worker cannot execute is
   strictly worse than leaving it stale.
