@@ -6,7 +6,9 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/worker"
@@ -47,13 +49,27 @@ func newAdminSigner(adminURL string) (*adminSigner, error) {
 	if host == "" {
 		return nil, fmt.Errorf("socket: admin_url %q has no host", adminURL)
 	}
-	if host != "localhost" {
+	// Hostnames are case-insensitive, so "Localhost" is the same host.
+	if !strings.EqualFold(host, "localhost") {
 		ip := net.ParseIP(host)
 		if ip == nil || !ip.IsLoopback() {
 			return nil, fmt.Errorf("socket: admin_url %q is not loopback — the proxy admin API is unauthenticated and must never be reached over a network", adminURL)
 		}
 	}
 	return &adminSigner{adminURL: adminURL}, nil
+}
+
+// noRedirectClient is the HTTP client the signer uses. Validating the admin URL
+// only proves where the FIRST request goes: a 302 would carry the exchange off
+// the loopback, and the CA that comes back becomes the session's trust root. So
+// redirects are refused outright — a local admin API has no reason to issue one.
+func noRedirectClient() *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return fmt.Errorf("socket: proxy admin API attempted a redirect to %s; refusing to carry a session CSR off the loopback", req.URL.Redacted())
+		},
+	}
 }
 
 // SignSessionCSR signs a session CSR for the given polecat identity and
@@ -63,7 +79,7 @@ func (a *adminSigner) SignSessionCSR(ctx context.Context, csrPEM []byte, rig, po
 	// gt-<rig>-<name>, so the identity comes from these arguments (which the
 	// backend takes from the session it opened) and never from worker-supplied
 	// bytes. That refusal is the §4.2 channel binding.
-	signer := &worker.AdminSigner{AdminURL: a.adminURL, Rig: rig, Name: polecat}
+	signer := &worker.AdminSigner{AdminURL: a.adminURL, Rig: rig, Name: polecat, Client: noRedirectClient()}
 	certPEM, caPEM, err = signer.SignCSR(ctx, csrPEM)
 	if err != nil {
 		return nil, nil, time.Time{}, err
@@ -80,6 +96,22 @@ func (a *adminSigner) SignSessionCSR(ctx context.Context, csrPEM []byte, rig, po
 	if want := worker.PolecatCN(rig, polecat); leaf.Subject.CommonName != want {
 		return nil, nil, time.Time{}, fmt.Errorf("socket: signed cert CN is %q, want %q — refusing to install it as this session's identity",
 			leaf.Subject.CommonName, want)
+	}
+
+	// The CA travels with the leaf and becomes the worker's trust root for the
+	// relay, so check the pair is actually a pair: a CA that did not sign this
+	// leaf is either a mixed-up response or a substituted root, and either way
+	// the session's mTLS would fail later with something far less obvious.
+	ca, err := parseLeaf(caPEM)
+	if err != nil {
+		return nil, nil, time.Time{}, fmt.Errorf("socket: parsing returned CA: %w", err)
+	}
+	if !ca.IsCA {
+		return nil, nil, time.Time{}, fmt.Errorf("socket: returned CA %q is not a CA certificate", ca.Subject.CommonName)
+	}
+	if err := leaf.CheckSignatureFrom(ca); err != nil {
+		return nil, nil, time.Time{}, fmt.Errorf("socket: signed cert was not issued by the returned CA (%q): %w — refusing to install mismatched session material",
+			ca.Subject.CommonName, err)
 	}
 	return certPEM, caPEM, leaf.NotAfter, nil
 }

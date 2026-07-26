@@ -2,6 +2,9 @@
 /gt
 /gt-proxy-server
 /gt-proxy-client
+# The remote-execution companions build to the repo root as easily as to bin/;
+# ignore them by pattern so a stray `go build ./cmd/...` can never be committed.
+/gt-worker-*
 *.exe
 
 # Build
