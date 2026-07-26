@@ -13,6 +13,17 @@ import (
 
 // These variables are set at build time via ldflags in cmd package.
 // We provide fallback methods to read from build info.
+// GTVersion is the gastown release this binary was built from, injected by
+// `make build` via ldflags. It lives HERE, in a leaf package, because both the
+// orchestrator (internal/socket) and the worker service (cmd/gt-worker-client)
+// must report it in the §3.2 handshake to decide binary freshness — and
+// internal/cmd, which holds the user-facing Version, cannot be imported by
+// either without a cycle.
+//
+// "dev" means a raw `go build`: unversioned, so freshness comparison is skipped
+// rather than guessed at.
+var GTVersion = "dev"
+
 var (
 	// Commit can be set from cmd package or read from build info
 	Commit = ""

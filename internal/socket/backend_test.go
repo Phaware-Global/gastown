@@ -2,10 +2,12 @@ package socket
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -33,13 +35,63 @@ type fakeWorker struct {
 	sessions []sockproto.SessionSummary
 	received []string // message types, in order
 
+	// push_binaries state: what arrived, per name.
+	pushes  map[string]*pushedBinary
+	pushBuf map[string][]byte
+
 	// knobs
+	refusePush   string // non-empty → answer a terminal push chunk with this error code
+	gtVersion    string
+	os, arch     string
 	maxSessions  int
 	skipCSR      bool   // reply session_ready directly (reattach-style / native no-cert path)
 	failOpenWith string // non-empty → session_error code
 	refuseHello  bool
 	chatty       bool // interleave ping + empty-id stray messages before each reply
 	hang         bool // accept + handshake, then never answer a request
+}
+
+// pushedBinary is a completed push_binaries transfer as the fake worker saw it.
+type pushedBinary struct {
+	data []byte
+	sha  string
+}
+
+// handlePush accumulates chunks and answers the terminal one, mirroring the
+// real worker's contract closely enough to test the sender.
+func (w *fakeWorker) handlePush(codec *sockproto.Codec, m *sockproto.Message) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.pushBuf == nil {
+		w.pushBuf = map[string][]byte{}
+		w.pushes = map[string]*pushedBinary{}
+	}
+	if m.Data != "" {
+		chunk, err := base64.StdEncoding.DecodeString(m.Data)
+		require.NoError(w.t, err)
+		w.pushBuf[m.Name] = append(w.pushBuf[m.Name], chunk...)
+	}
+	if !m.EOF {
+		return
+	}
+	if w.refusePush != "" {
+		_ = codec.Send(&sockproto.Message{Type: sockproto.TypeError, ID: m.ID, Code: w.refusePush, Msg: "refused"})
+		return
+	}
+	w.pushes[m.Name] = &pushedBinary{data: w.pushBuf[m.Name], sha: m.SHA256}
+	delete(w.pushBuf, m.Name)
+	_ = codec.Send(&sockproto.Message{Type: sockproto.TypePushBinaryAck, ID: m.ID, Name: m.Name, Applied: "installed"})
+}
+
+// pushed returns the completed transfers.
+func (w *fakeWorker) pushed() map[string]*pushedBinary {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := map[string]*pushedBinary{}
+	for k, v := range w.pushes {
+		out[k] = v
+	}
+	return out
 }
 
 func newFakeWorker(t *testing.T) *fakeWorker {
@@ -114,13 +166,22 @@ func (w *fakeWorker) handle(nc net.Conn) {
 			w.mu.Lock()
 			sess := append([]sockproto.SessionSummary(nil), w.sessions...)
 			w.mu.Unlock()
+			workerOS, workerArch := w.os, w.arch
+			if workerOS == "" {
+				workerOS, workerArch = runtime.GOOS, runtime.GOARCH
+			}
 			_ = codec.Send(&sockproto.Message{
 				Type:         sockproto.TypeHelloAck,
 				ProtoVersion: sockproto.ProtoVersion,
 				WorkerID:     "fake",
+				GTVersion:    w.gtVersion,
+				OS:           workerOS,
+				Arch:         workerArch,
 				Capabilities: &sockproto.Capabilities{Docker: true, ExecModes: []string{"container", "native"}, MaxSessions: w.maxSessions},
 				Sessions:     sess,
 			})
+		case sockproto.TypePushBinary:
+			w.handlePush(codec, m)
 		case sockproto.TypeSessionOpen:
 			if w.hang {
 				<-w.stop // handshake done, but never answer — keep the conn open

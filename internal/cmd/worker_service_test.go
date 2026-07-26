@@ -206,11 +206,11 @@ func TestPlanWorkerService_StateDirIsAbsolute(t *testing.T) {
 	assert.True(t, filepath.IsAbs(plan.StateDir), plan.StateDir)
 }
 
-// TestInstallShims_PointsGtAndBdAtTheProxyClient pins how a remote agent
+// TestInstallBinDir_PointsGtAndBdAtTheProxyClient pins how a remote agent
 // reaches the control plane: `gt` and `bd` are gt-proxy-client under those
-// names. They go in the WORKER's bin dir, not the gt install dir — on a machine
-// that is both orchestrator and worker, the real gt lives there and must stay.
-func TestInstallShims_PointsGtAndBdAtTheProxyClient(t *testing.T) {
+// names, in the WORKER's own bin dir — not the gt install dir, where on a
+// single-box setup the real gt lives and must stay.
+func TestInstallBinDir_PointsGtAndBdAtTheProxyClient(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("launchd job planning is macOS-only")
 	}
@@ -220,17 +220,36 @@ func TestInstallShims_PointsGtAndBdAtTheProxyClient(t *testing.T) {
 	plan, err := planWorkerService(workerServiceOpts{
 		Listen: "unix:///tmp/gtw.sock", ProxyURL: "http://127.0.0.1:9876", StateDir: stateDir})
 	require.NoError(t, err)
-	require.NoError(t, installShims(plan))
+	require.NoError(t, installBinDir(plan))
 
 	for _, name := range []string{"gt", "bd"} {
 		link := filepath.Join(stateDir, "bin", name)
 		target, err := os.Readlink(link)
 		require.NoError(t, err, "%s must be a symlink", name)
-		assert.Equal(t, plan.ProxyClient, target)
-		// A symlink, not a copy: an upgraded gt-proxy-client must carry over,
-		// since a stale client against a newer proxy fails at agent runtime.
-		assert.Contains(t, target, "gt-proxy-client")
+		// RELATIVE, into the same dir: the shims follow a pushed
+		// gt-proxy-client with nothing else to update, and the directory can
+		// move.
+		assert.Equal(t, "gt-proxy-client", target)
+		resolved, err := filepath.EvalSymlinks(link)
+		require.NoError(t, err, "%s must resolve to a real file", name)
+		// macOS /var is itself a symlink to /private/var; compare resolved.
+		wantTarget, err := filepath.EvalSymlinks(plan.ProxyClient)
+		require.NoError(t, err)
+		assert.Equal(t, wantTarget, resolved)
 	}
+
+	// The binaries are COPIES in the worker's dir: push_binaries replaces these
+	// files, and a symlink into the install dir would make a pushed binary
+	// inert (and would need write access the worker should not have).
+	for _, name := range []string{"gt-worker-client", "gt-proxy-client"} {
+		fi, err := os.Lstat(filepath.Join(stateDir, "bin", name))
+		require.NoError(t, err)
+		assert.Zero(t, fi.Mode()&os.ModeSymlink, "%s must be a copy, not a link", name)
+		assert.Equal(t, os.FileMode(0755), fi.Mode().Perm())
+	}
+
+	// And the job must RUN the copy, or a pushed upgrade would never take.
+	assert.Equal(t, filepath.Join(stateDir, "bin", "gt-worker-client"), plan.Binary)
 
 	// The shim dir must come FIRST, or a single-box worker's agent would get the
 	// real gt instead of the proxy shim.
@@ -238,10 +257,10 @@ func TestInstallShims_PointsGtAndBdAtTheProxyClient(t *testing.T) {
 	assert.Contains(t, string(plan.Plist), filepath.Join(stateDir, "bin")+":")
 }
 
-// TestInstallShims_ReplacesStaleLinks pins that re-installing repoints existing
+// TestInstallBinDir_ReplacesStaleLinks pins that re-installing repoints existing
 // shims: a shim left pointing at an old path fails at agent runtime, which is
 // worse than no shim at all.
-func TestInstallShims_ReplacesStaleLinks(t *testing.T) {
+func TestInstallBinDir_ReplacesStaleLinks(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("launchd job planning is macOS-only")
 	}
@@ -253,11 +272,11 @@ func TestInstallShims_ReplacesStaleLinks(t *testing.T) {
 	plan, err := planWorkerService(workerServiceOpts{
 		Listen: "unix:///tmp/gtw.sock", ProxyURL: "http://127.0.0.1:9876", StateDir: stateDir})
 	require.NoError(t, err)
-	require.NoError(t, installShims(plan))
+	require.NoError(t, installBinDir(plan))
 
 	target, err := os.Readlink(filepath.Join(stateDir, "bin", "gt"))
 	require.NoError(t, err)
-	assert.Equal(t, plan.ProxyClient, target)
+	assert.Equal(t, "gt-proxy-client", target)
 }
 
 // TestPlanWorkerService_RequiresProxyClient pins that a worker missing

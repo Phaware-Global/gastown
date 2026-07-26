@@ -115,17 +115,15 @@ pane runs `gt-worker-attach` against it.
 (`docs/proxy-server.md`). That is what lets a remote agent run `gt done` or
 `bd update` with no town on disk and no credentials of its own.
 
-`gt worker service install` creates them, as symlinks in `<state-dir>/bin`
-pointing at the installed `gt-proxy-client`, and puts that directory **first**
-on the supervised worker's PATH. Two consequences worth knowing:
+`gt worker service install` sets this up: it copies `gt-worker-client` and
+`gt-proxy-client` into `<state-dir>/bin`, points `gt` and `bd` there as relative
+symlinks, and puts that directory **first** on the supervised worker's PATH. The
+worker runs out of that directory too. Two consequences worth knowing:
 
-- The shims are deliberately **not** in the `gt` install dir. On a machine that
-  is both orchestrator and worker, the real `gt` lives there and must keep
-  living there — the agent gets the shim, your shell keeps the real binary.
-- They are symlinks, not copies, so a `make install` upgrade of
-  `gt-proxy-client` carries over automatically. A stale client against an
-  upgraded proxy presents as an agent that mysteriously stops being able to call
-  `gt`, which is a miserable thing to diagnose.
+- The bin dir is deliberately **not** the `gt` install dir. On a machine that is
+  both orchestrator and worker, the real `gt` lives there and must keep living
+  there — the agent gets the shim, your shell keeps the real binary.
+- They are copies, because that directory is what the orchestrator refreshes.
 
 The agent reaches the control plane in **relay mode**: it holds no certificate
 of its own — the worker's local relay holds the session identity and terminates
@@ -133,17 +131,30 @@ mTLS upstream — so `gt` needs only `GT_PROXY_URL`, which the worker sets from
 the relay it bound. (`gt-proxy-client` also still supports direct mTLS when
 `GT_PROXY_CERT`/`KEY`/`CA` are supplied.)
 
-Two pieces are still not automated:
+### Keeping them fresh
 
-- **Fleet freshness.** Keeping every worker's client in step with the
-  orchestrator is `push_binaries`' job (design §11 phase 4): the handshake
-  already reports the worker's `gt_version`, and the orchestrator pushes
-  matching binaries when they differ. Today, re-run `make install` on the worker
-  after upgrading the orchestrator, then `gt worker service restart`.
-- **Container mode.** The work container's `gt`/`bd` come from the worker's
-  `--gt-dir`, which nothing populates yet, and a container relay binds the
-  bridge gateway rather than loopback — so it needs `GT_PROXY_RELAY=1` alongside
-  the URL. `gt-proxy-client` accepts that; the injection is not wired.
+You do not re-copy binaries after upgrading the orchestrator. The handshake
+carries each side's version, and a worker whose version differs is refreshed
+before the next session opens (§4.1 `push_binaries`): `gt-proxy-client` is
+installed immediately, and `gt-worker-client` — the running service — is staged
+and applied the first time that worker has no live session, because a restart
+would abandon a polecat mid-work.
+
+`gt worker push-binaries <rig>` does it on demand. Use it when you want the
+transfer to happen before someone starts a polecat, or when you need to see the
+reason it is being skipped: the automatic path logs failures and carries on
+(a version bump must never fail a polecat start), while the command reports them.
+
+A worker on a different OS/architecture than the orchestrator is **refused**
+rather than pushed to — this orchestrator only has its own platform's binaries,
+and installing one the worker cannot execute is worse than leaving it stale.
+Upgrade such a worker in place with `make install` there.
+
+Still not automated: **container mode**. The work container's `gt`/`bd` come from
+the worker's `--gt-dir`, which nothing populates yet, and a container relay binds
+the bridge gateway rather than loopback — so it needs `GT_PROXY_RELAY=1`
+alongside the URL. `gt-proxy-client` accepts that shape; the injection is not
+wired.
 
 The agent CLI is different in kind and stays operator-installed: its version,
 licensing and auth are the operator's decision.

@@ -3,11 +3,13 @@ package socket
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/execution"
 	"github.com/steveyegge/gastown/internal/sockproto"
+	"github.com/steveyegge/gastown/internal/version"
 )
 
 // provisionTimeout bounds the full session_open → session_ready exchange
@@ -72,10 +74,7 @@ func New(cfg *config.ExecutionConfig) (*SocketBackend, error) {
 		settings:       s,
 		Signer:         signer,
 		OrchestratorID: orchestratorID(),
-		// GTVersion is left empty until push_binaries (§11 phase 4) actually
-		// consumes it; nothing reads it today, and plumbing the version
-		// constant down from internal/cmd would be an import cycle for a field
-		// with no reader.
+		GTVersion:      version.GTVersion,
 	}, nil
 }
 
@@ -109,6 +108,15 @@ func (b *SocketBackend) Provision(ctx context.Context, spec execution.PolecatSpe
 		return execution.Endpoint{}, err
 	}
 	defer c.close()
+
+	// Binary freshness (§5): refresh a worker whose gt_version differs before
+	// opening a session on it. Best-effort — a worker that cannot be refreshed
+	// still runs sessions, since protocol version (not gt version) is the
+	// compatibility gate, and failing a session a user is waiting on because of
+	// a version bump would be the wrong trade.
+	if err := b.pushBinaries(ctx, c); err != nil {
+		slog.Default().Warn("socket: binary refresh skipped", "worker", c.ack.WorkerID, "err", err)
+	}
 
 	// Reattach if the handshake already reports this session live (daemon
 	// restarted, worker did not) — no new session, idempotent per core §9.4.

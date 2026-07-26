@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -70,7 +71,7 @@ Example (TCP, mTLS, enrolled as this machine's name):
 		}
 		fmt.Printf("Installed and started com.gastown.worker\n  plist:  %s\n  binary: %s\n  state:  %s\n  log:    %s\n  gt/bd:  %s -> %s\n",
 			plan.PlistPath, plan.Binary, plan.StateDir, filepath.Join(plan.StateDir, "worker.log"),
-			plan.ShimDir, plan.ProxyClient)
+			plan.BinDir, plan.ProxyClient)
 		if strings.HasPrefix(o.Listen, "unix://") {
 			fmt.Printf("\nUnix listener: put the pre-shared token in %s as\n  GT_WORKER_TOKEN=…\n(mode 0600), then: gt worker service restart\n",
 				filepath.Join(plan.StateDir, "worker.env"))
@@ -102,8 +103,12 @@ type workerServicePlan struct {
 	Args        []string
 	Path        string
 	Plist       []byte
-	ShimDir     string // <state-dir>/bin, first on the agent's PATH
-	ProxyClient string // what the gt/bd shims point at
+	BinDir      string // <state-dir>/bin: worker-owned, first on the agent's PATH
+	ProxyClient string // the gt/bd shim target, inside BinDir
+
+	// sources are the installed binaries copied into BinDir at install time;
+	// after that, push_binaries owns what lives there.
+	sources map[string]string
 }
 
 // planWorkerService validates opts and renders the job.
@@ -190,7 +195,7 @@ func planWorkerService(o workerServiceOpts) (*workerServicePlan, error) {
 	// the ONLY way a remote agent reaches the control plane (docs/proxy-server.md).
 	// Resolve it now so a missing client is an install-time error, not an agent
 	// that starts fine and then cannot call `gt done`.
-	proxyClient, err := proxyClientPath()
+	proxyClientSrc, err := proxyClientPath()
 	if err != nil {
 		return nil, err
 	}
@@ -199,12 +204,19 @@ func planWorkerService(o workerServiceOpts) (*workerServicePlan, error) {
 	for i, a := range args {
 		quoted[i] = config.ShellQuote(a)
 	}
-	shimDir := filepath.Join(stateDir, "bin")
+	// The worker runs OUT OF ITS OWN bin dir, and the binaries there are copies.
+	// That is what makes push_binaries (§4.1) possible: the orchestrator keeps a
+	// worker's companions in step by replacing files in a directory the worker
+	// owns, with no write access to a system path and no operator step. Running
+	// straight from the install dir would leave the pushed copy inert.
+	binDir := filepath.Join(stateDir, "bin")
+	runBinary := filepath.Join(binDir, "gt-worker-client")
+	runProxyClient := filepath.Join(binDir, "gt-proxy-client")
 	// The shim dir goes FIRST: the agent inherits this PATH, and on a machine
 	// that is both orchestrator and worker the real `gt` is also installed — the
 	// agent must get the proxy shim, while the operator's own shell keeps the
 	// real binary.
-	jobPath := shimDir + ":" + workerServicePath(binary)
+	jobPath := binDir + ":" + workerServicePath(runBinary)
 	envFile := filepath.Join(stateDir, "worker.env")
 	logPath := filepath.Join(stateDir, "worker.log")
 
@@ -214,7 +226,7 @@ func planWorkerService(o workerServiceOpts) (*workerServicePlan, error) {
 	// would otherwise run as code at job start.
 	shellCommand := fmt.Sprintf("set -a; [ -r %s ] && . %s; set +a; exec %s %s",
 		config.ShellQuote(envFile), config.ShellQuote(envFile),
-		config.ShellQuote(binary), strings.Join(quoted, " "))
+		config.ShellQuote(runBinary), strings.Join(quoted, " "))
 
 	plist, err := templates.RenderWorkerLaunchd(templates.WorkerSupervisorData{
 		ShellCommand: shellCommand,
@@ -230,37 +242,78 @@ func planWorkerService(o workerServiceOpts) (*workerServicePlan, error) {
 		return nil, err
 	}
 	return &workerServicePlan{
-		Binary: binary, StateDir: stateDir, PlistPath: plistPath,
+		Binary: runBinary, StateDir: stateDir, PlistPath: plistPath,
 		Args: quoted, Path: jobPath, Plist: plist,
-		ShimDir: shimDir, ProxyClient: proxyClient,
+		BinDir: binDir, ProxyClient: runProxyClient,
+		sources: map[string]string{
+			"gt-worker-client": binary,
+			"gt-proxy-client":  proxyClientSrc,
+		},
 	}, nil
 }
 
-// installShims points `gt` and `bd` at gt-proxy-client in the worker's own bin
-// dir — NOT in the gt install dir, which on a single-box setup holds the real
-// gt and must keep holding it.
+// installBinDir populates the worker's own bin dir: copies of the binaries it
+// runs, plus `gt` and `bd` pointing at the proxy client.
 //
-// Symlinks rather than copies, so a `make install` upgrade of gt-proxy-client
-// carries to the shims automatically; keeping the client in step with the
-// orchestrator's proxy is a version-coupling problem, and a stale copy here
-// would present as an agent that mysteriously stops being able to call gt.
-// (Fleet-wide freshness is push_binaries' job — design §11 phase 4.)
-func installShims(plan *workerServicePlan) error {
-	if err := os.MkdirAll(plan.ShimDir, 0755); err != nil {
-		return fmt.Errorf("creating shim dir: %w", err)
+// Copies, not links into the install dir, because push_binaries replaces these
+// files in place — a symlink to a system path would make a pushed binary inert,
+// and would need write access the worker should not have. The shims are
+// RELATIVE symlinks so the whole directory can be moved, and they follow a
+// pushed gt-proxy-client with nothing else to update.
+//
+// Not in the gt install dir, either way: on a single-box setup the real gt lives
+// there and must keep living there.
+func installBinDir(plan *workerServicePlan) error {
+	if err := os.MkdirAll(plan.BinDir, 0755); err != nil {
+		return fmt.Errorf("creating bin dir: %w", err)
+	}
+	for name, src := range plan.sources {
+		if err := copyExecutable(src, filepath.Join(plan.BinDir, name)); err != nil {
+			return fmt.Errorf("copying %s into the worker bin dir: %w", name, err)
+		}
 	}
 	for _, name := range []string{"gt", "bd"} {
-		link := filepath.Join(plan.ShimDir, name)
-		// Replace whatever is there: a stale shim pointing at an old path is
-		// worse than no shim, because it fails at agent runtime.
+		link := filepath.Join(plan.BinDir, name)
+		// Replace whatever is there: a stale shim is worse than no shim,
+		// because it fails at agent runtime rather than at install.
 		if err := os.Remove(link); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("replacing %s: %w", link, err)
 		}
-		if err := os.Symlink(plan.ProxyClient, link); err != nil {
-			return fmt.Errorf("linking %s -> %s: %w", link, plan.ProxyClient, err)
+		if err := os.Symlink("gt-proxy-client", link); err != nil {
+			return fmt.Errorf("linking %s: %w", link, err)
 		}
 	}
 	return nil
+}
+
+// copyExecutable copies through a temp file + rename, so nothing ever observes
+// a half-written binary.
+func copyExecutable(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := io.Copy(tmp, in); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0755); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), dst)
 }
 
 // proxyClientPath finds gt-proxy-client, preferring the copy installed next to
@@ -284,7 +337,7 @@ func installWorkerService(plan *workerServicePlan) error {
 	if err := os.MkdirAll(plan.StateDir, 0700); err != nil {
 		return fmt.Errorf("creating state dir: %w", err)
 	}
-	if err := installShims(plan); err != nil {
+	if err := installBinDir(plan); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(plan.PlistPath), 0755); err != nil {
