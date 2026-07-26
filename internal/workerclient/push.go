@@ -41,6 +41,11 @@ var pushableBinaries = map[string]bool{
 	BinWorkerClient: true,
 }
 
+// containerProbeRetry is how long a FAILED docker probe is remembered. Long
+// enough that a dead daemon is not re-probed on every connection, short enough
+// that a restarted one is picked up without restarting the worker.
+var containerProbeRetry = time.Minute
+
 // maxPushBytes bounds a single pushed binary. gt is ~130MB; this leaves room
 // while refusing a stream that would fill the worker's disk.
 const maxPushBytes = 512 << 20
@@ -302,13 +307,20 @@ func (s *Service) containerPlatform() string {
 		return ""
 	}
 	s.mu.Lock()
-	cached, probed := s.containerPlatformCache, s.containerPlatformProbed
+	cached, probedAt := s.containerPlatformCache, s.containerPlatformProbedAt
 	s.mu.Unlock()
-	if cached != "" || probed {
-		// A FAILED probe is cached too: this runs inline on the handshake read
-		// loop, and a hung docker daemon would otherwise cost its full timeout
-		// on every connection — twice, when the capability block asks again.
-		return cached
+	if cached != "" {
+		return cached // a daemon cannot change platform without restarting
+	}
+	// A failed probe is cached, but only BRIEFLY. This runs inline on the
+	// handshake read loop, so a hung daemon must not cost its full timeout on
+	// every connection — but caching the failure forever meant one transient
+	// outage (a daemon restart, or a `docker version` that merely exceeded the
+	// timeout under load) disabled container mode for the worker's entire
+	// process lifetime, and since a container session now hard-fails without an
+	// injectable client, that is an outage needing a manual restart.
+	if !probedAt.IsZero() && time.Since(probedAt) < containerProbeRetry {
+		return ""
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -318,7 +330,7 @@ func (s *Service) containerPlatform() string {
 	if err != nil {
 		s.log.Warn("could not determine the container platform; container-mode binaries will not be pushed", "err", err)
 		s.mu.Lock()
-		s.containerPlatformProbed = true
+		s.containerPlatformProbedAt = time.Now()
 		s.mu.Unlock()
 		return ""
 	}
@@ -326,13 +338,13 @@ func (s *Service) containerPlatform() string {
 	if !sockproto.ValidPlatformTag(got) {
 		s.log.Warn("docker reported an unexpected platform", "platform", got)
 		s.mu.Lock()
-		s.containerPlatformProbed = true
+		s.containerPlatformProbedAt = time.Now()
 		s.mu.Unlock()
-		return got[:0]
+		return ""
 	}
 	s.mu.Lock()
 	s.containerPlatformCache = got
-	s.containerPlatformProbed = true
+	s.containerPlatformProbedAt = time.Now()
 	s.mu.Unlock()
 	return got
 }

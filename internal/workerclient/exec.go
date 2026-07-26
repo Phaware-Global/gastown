@@ -318,7 +318,10 @@ func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktre
 		// The exec channel is a string interface (§6.2): the argv is rendered
 		// as a single shell-quoted command line and run via /bin/sh, which the
 		// image contract requires.
-		args = append(args, "--", container, "/bin/sh", "-c", shellJoin(m.Argv))
+		// Same PATH prefix the container preflight verified with: the injected
+		// gt/bd must be what the AGENT resolves, not merely what a bare shell
+		// would have found.
+		args = append(args, "--", container, "/bin/sh", "-c", worker.AgentPathPrefix+shellJoin(m.Argv))
 		cmd := exec.CommandContext(ctx, "docker", args...)
 		// Canceling kills the `docker exec` CLIENT; the in-container process is
 		// reaped indirectly (its stdio pipes close, so its next write takes

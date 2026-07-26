@@ -119,8 +119,8 @@ type Service struct {
 	// that the probe RAN, so a failure is not retried on every handshake —
 	// the probe is inline on the read loop and a hung daemon costs its full
 	// timeout. Guarded by mu.
-	containerPlatformCache  string
-	containerPlatformProbed bool
+	containerPlatformCache    string
+	containerPlatformProbedAt time.Time
 
 	// restarting is set while a staged worker binary is being applied: the
 	// process is about to exit for the supervisor, so no new session may start

@@ -80,10 +80,21 @@ type WorkEnvConfig struct {
 // proxyClientName is the injected binary's name inside /opt/gt.
 const proxyClientName = "gt-proxy-client"
 
-// Where an injected gt legitimately resolves inside the container.
+// Where the injected CLI lives inside the container, and the PATH prefix that
+// makes it win.
+//
+// Prefixing PATH is what makes the resolution deterministic: linking into
+// /usr/local/bin is a convenience, but an image whose PATH puts another
+// directory first would still shadow it. The mount is read-only, so nothing in
+// the container can replace what it resolves to.
 const (
-	injectedGtPath = "/usr/local/bin/gt"
-	mountedGtPath  = "/opt/gt/gt"
+	mountedGtPath = "/opt/gt/gt"
+	mountedBdPath = "/opt/gt/bd"
+
+	// AgentPathPrefix is prepended to the agent's command line in container
+	// mode. It expands the image's own PATH, so the agent runtime stays
+	// findable (§6.2's contract) with the injected CLI ahead of it.
+	AgentPathPrefix = "PATH=/opt/gt:$PATH "
 )
 
 const (
@@ -314,30 +325,53 @@ func (w *WorkEnv) preflight(ctx context.Context) error {
 			_, linkErr = w.docker(ctx, "exec", "-u", "0", w.name, "/bin/sh", "-c", link)
 		}
 
-		// Resolve gt rather than merely testing for it: `command -v` proves only
-		// that SOMETHING named gt is on PATH, which an image can supply — and
-		// silently shadowing the injected client with an image-supplied binary
-		// is exactly what must not happen, since that binary would run with the
-		// session's env, worktree and (when mounted) docker socket.
-		resolved, err := w.docker(ctx, "exec", w.name, "/bin/sh", "-c", "command -v gt && command -v bd")
+		// Probe with the SAME PATH the agent will run with (AgentPathPrefix puts
+		// the read-only mount first), so the answer is what the agent actually
+		// gets rather than what a bare shell would find.
+		//
+		// BOTH names are resolved and BOTH are checked: `bd` is the same injected
+		// binary under another name — the beads CLI — and checking only `gt` left
+		// an image that ships its own `bd` completely unexamined.
+		resolved, err := w.docker(ctx, "exec", w.name, "/bin/sh", "-c",
+			AgentPathPrefix+"command -v gt && command -v bd")
 		if err != nil {
 			if linkErr != nil {
 				return fmt.Errorf("image preflight: could not put gt/bd on PATH in image %s (linking failed: %v; the agent could not reach the control plane): %w", w.cfg.Image, linkErr, err)
 			}
-			return fmt.Errorf("image preflight: gt/bd not on PATH in image %s and none were injected — the agent could not reach the control plane: %w", w.cfg.Image, err)
+			return fmt.Errorf("image preflight: gt/bd not on PATH in image %s and none were injected — the agent could not reach the control plane (if this worker should have received a client, check that the orchestrator has artifacts for this container's platform): %w", w.cfg.Image, err)
 		}
-		gtPath := strings.TrimSpace(strings.SplitN(strings.TrimSpace(resolved), "\n", 2)[0])
+		lines := strings.Split(strings.TrimSpace(resolved), "\n")
+		gtPath, bdPath := "", ""
+		if len(lines) > 0 {
+			gtPath = strings.TrimSpace(lines[0])
+		}
+		if len(lines) > 1 {
+			bdPath = strings.TrimSpace(lines[1])
+		}
 
-		if w.cfg.ProxyClient != "" && gtPath != injectedGtPath && gtPath != mountedGtPath {
-			// We injected a trusted client and the container resolves a
-			// different one. Refusing beats warning: the agent's control-plane
-			// CLI would be an image-supplied binary, and the image is a registry
-			// tag — someone else's supply chain.
-			return fmt.Errorf("image preflight: %s resolves gt to %q, not the injected client (%s) — refusing to run the agent against an image-supplied control-plane CLI",
-				w.cfg.Image, gtPath, injectedGtPath)
+		if w.cfg.ProxyClient != "" {
+			// We injected a client, so the mount comes first on PATH and both
+			// names MUST resolve inside it. Anything else means the image
+			// shadowed us — usually accidentally (an image that bakes in an old
+			// gt), which is precisely the confusing failure to catch early.
+			//
+			// This is not a defense against a HOSTILE image: the agent runs
+			// inside that image, so an image that wants to interpose can. It
+			// stops an accident from silently swapping the control-plane CLI.
+			for _, got := range []struct{ name, path, want string }{
+				{"gt", gtPath, mountedGtPath},
+				{"bd", bdPath, mountedBdPath},
+			} {
+				if got.path != got.want {
+					return fmt.Errorf("image preflight: %s resolves %s to %q, not the injected client (%s) — refusing to run the agent against an image-supplied control-plane CLI",
+						w.cfg.Image, got.name, got.path, got.want)
+				}
+			}
 		}
 		if linkErr != nil {
-			slog.Default().Warn("gt/bd link step failed; the container is using its own",
+			// Survivable: the mount is what the agent uses. The link is a
+			// convenience for anything that resets PATH.
+			slog.Default().Warn("gt/bd link into /usr/local/bin failed; the agent uses the mounted client",
 				"image", w.cfg.Image, "container", w.name, "resolved_gt", gtPath, "err", linkErr)
 		}
 	}

@@ -137,10 +137,19 @@ func (b *SocketBackend) pushTo(ctx context.Context, c *conn, force bool) ([]Push
 			// every provision, and "the worker has none" is just the empty case.
 			want, err := b.clientDigestFor(cp)
 			if err != nil {
-				// No artifacts for that platform. Nothing to send; the worker's
-				// own error at session time names what to build.
-				slog.Default().Warn("socket: cannot check the worker's container client", "platform", cp, "err", err)
+				// No artifacts for that platform. Say so at ERROR with the
+				// remedy: downstream, a container session whose image does not
+				// ship its own gt will hard-fail at preflight, and the actual
+				// cause lives only here.
+				slog.Default().Error("socket: no binaries for the worker's container platform — container sessions there will fail preflight",
+					"worker", ack.WorkerID, "container_platform", cp, "err", err,
+					"remedy", "run `make dist` on this orchestrator so it has "+cp+" artifacts")
 			} else {
+				// The worker's digest is ADVISORY, not evidence: it controls its
+				// own filesystem, so this only decides whether sending is
+				// worthwhile. What the container actually runs is settled
+				// container-side, by the preflight that resolves gt/bd against
+				// the read-only mount.
 				needContainer = ack.Capabilities.GetContainerClient() != want
 			}
 		}
@@ -152,8 +161,13 @@ func (b *SocketBackend) pushTo(ctx context.Context, c *conn, force bool) ([]Push
 	// needContainer=true, sends nothing (the tagged push is skipped as
 	// redundant), and every container session fails for want of a client that
 	// was never pushed.
-	if needContainer && sameAsWorker {
-		refreshOwn = true
+	// ...but ONLY the client. pushPlatform's untagged form otherwise sends
+	// gt-worker-client too, which stages a worker-service restart — far too much
+	// consequence for "the container needs a CLI", and it would let a stale
+	// artifact tree replace a running worker whose version is identical.
+	pushOwnClientOnly := false
+	if needContainer && sameAsWorker && !refreshOwn {
+		pushOwnClientOnly = true
 	}
 
 	if !refreshOwn && !needContainer {
@@ -165,8 +179,12 @@ func (b *SocketBackend) pushTo(ctx context.Context, c *conn, force bool) ([]Push
 
 	var results []PushResult
 
-	if refreshOwn {
-		sent, err := b.pushPlatform(ctx, c, workerOS, workerArch, "")
+	if refreshOwn || pushOwnClientOnly {
+		only := ""
+		if pushOwnClientOnly {
+			only = "gt-proxy-client"
+		}
+		sent, err := b.pushPlatform(ctx, c, workerOS, workerArch, "", only)
 		results = append(results, sent...)
 		if err != nil {
 			return results, err
@@ -183,7 +201,7 @@ func (b *SocketBackend) pushTo(ctx context.Context, c *conn, force bool) ([]Push
 		if !ok {
 			return results, fmt.Errorf("socket: worker reported an unparseable container platform %q", cp)
 		}
-		sent, err := b.pushPlatform(ctx, c, cpOS, cpArch, cp)
+		sent, err := b.pushPlatform(ctx, c, cpOS, cpArch, cp, "")
 		results = append(results, sent...)
 		if err != nil {
 			return results, err
@@ -195,13 +213,17 @@ func (b *SocketBackend) pushTo(ctx context.Context, c *conn, force bool) ([]Push
 // pushPlatform streams every pushable binary for one platform. platform is the
 // wire tag: empty means "the worker's own", anything else is stored for
 // container injection.
-func (b *SocketBackend) pushPlatform(ctx context.Context, c *conn, goos, goarch, platform string) ([]PushResult, error) {
+// only, when non-empty, restricts the push to that single binary.
+func (b *SocketBackend) pushPlatform(ctx context.Context, c *conn, goos, goarch, platform, only string) ([]PushResult, error) {
 	dir, err := binariesFor(goos, goarch)
 	if err != nil {
 		return nil, err
 	}
 	var results []PushResult
 	for _, name := range PushableBinaries {
+		if only != "" && name != only {
+			continue
+		}
 		if platform != "" && name == "gt-worker-client" {
 			continue // the container never runs the worker service
 		}

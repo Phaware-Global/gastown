@@ -208,11 +208,16 @@ installed, writes through a staging file, and installs by rename — a half-writ
 - A container that cannot resolve `gt`/`bd` **fails preflight** — but a missing
   injectable client is not itself fatal: an image may ship its own, and an
   operator's explicit `--gt-dir` may already hold them. Verification inside the
-  container is the authority. What IS refused is a **shadowed** injection: if a
-  client was injected and the container resolves `gt` somewhere else, the
-  session stops, because the agent's control-plane CLI would be a binary from
-  the image (a registry tag — someone else's supply chain) running with the
-  session's env, worktree, and docker socket.
+  container is the authority.
+- The injected client wins **by construction**, not by hope: the agent's command
+  line is prefixed with `PATH=/opt/gt:$PATH` (expanding the image's own PATH, so
+  the agent runtime stays findable), and preflight probes with that same prefix.
+  Both `gt` and `bd` must resolve inside the read-only mount when a client was
+  injected; anything else stops the session. That catches an image that bakes in
+  its own CLI and would otherwise silently shadow the pushed one. It is **not** a
+  defense against a hostile image — the agent runs inside that image, so an image
+  determined to interpose can — it stops an accident from swapping the
+  control-plane CLI unnoticed.
 - A push may carry a `platform` tag, and then it is **for the work container,
   not the worker**: on a macOS worker the container is still a Linux container,
   so its `gt`/`bd` are a different build from the ones the worker runs. Tagged

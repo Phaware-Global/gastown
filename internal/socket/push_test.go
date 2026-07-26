@@ -422,13 +422,24 @@ func TestPushBinaries_SkipsAnIdenticalContainerClient(t *testing.T) {
 // current worker that already holds its container binaries costs nothing on the
 // provision path.
 func TestPushBinaries_SkipsEverythingWhenNothingIsMissing(t *testing.T) {
-	// No artifacts configured, so the digest check cannot run — the worker is
-	// current and nothing is sent regardless.
-	defer SetBinarySourceForTest(t.TempDir())()
+	// The artifact must EXIST and its digest must match what the worker reports,
+	// or this passes for the wrong reason (an unresolvable artifact also skips).
+	foreign := "linux-amd64"
+	if foreign == PlatformDir(runtime.GOOS, runtime.GOARCH) {
+		foreign = "linux-arm64"
+	}
+	payload := []byte("current-client")
+	sum := sha256.Sum256(payload)
+	root := t.TempDir()
+	fdir := filepath.Join(root, foreign)
+	require.NoError(t, os.MkdirAll(fdir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(fdir, "gt-proxy-client"), payload, 0755))
+	defer SetBinarySourceForTest(root)()
+
 	w := newFakeWorker(t)
 	w.gtVersion = "1.2.3"
-	w.containerPlatform = "linux-amd64"
-	w.containerClient = "deadbeef"
+	w.containerPlatform = foreign
+	w.containerClient = hex.EncodeToString(sum[:])
 	b, _ := testBackend(t, w)
 	b.GTVersion = "1.2.3"
 
@@ -437,4 +448,34 @@ func TestPushBinaries_SkipsEverythingWhenNothingIsMissing(t *testing.T) {
 	defer c.close()
 	require.NoError(t, b.pushBinaries(context.Background(), c))
 	assert.Empty(t, w.pushed())
+}
+
+// TestPushBinaries_SamePlatformForcedPushSkipsTheWorkerService pins the scope of
+// the same-platform fix: the container needs a CLI, which must not drag the
+// worker SERVICE along — that stages a restart, and a stale artifact tree would
+// otherwise replace a running worker whose version is identical.
+func TestPushBinaries_SamePlatformForcedPushSkipsTheWorkerService(t *testing.T) {
+	root := t.TempDir()
+	native := filepath.Join(root, PlatformDir(runtime.GOOS, runtime.GOARCH))
+	require.NoError(t, os.MkdirAll(native, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(native, "gt-proxy-client"), []byte("client"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(native, "gt-worker-client"), []byte("service"), 0755))
+	defer SetBinarySourceForTest(root)()
+
+	w := newFakeWorker(t)
+	w.gtVersion = "1.2.3"
+	w.containerPlatform = PlatformDir(runtime.GOOS, runtime.GOARCH)
+	w.containerClient = "" // needs a container client
+	b, _ := testBackend(t, w)
+	b.GTVersion = "1.2.3" // but is otherwise current
+
+	c, err := b.dial(context.Background())
+	require.NoError(t, err)
+	defer c.close()
+	require.NoError(t, b.pushBinaries(context.Background(), c))
+
+	got := w.pushed()
+	assert.Contains(t, got, "gt-proxy-client")
+	assert.NotContains(t, got, "gt-worker-client",
+		"a container's need for a CLI must not restart the worker service")
 }

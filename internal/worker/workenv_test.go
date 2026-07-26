@@ -31,7 +31,7 @@ if [ -f "` + failFile + `" ] && grep -q "^$1$" "` + failFile + `"; then
   exit 1
 fi
 case "$*" in
-  *"command -v gt"*) echo "/usr/local/bin/gt"; echo "/usr/local/bin/bd"; exit 0 ;;
+  *"command -v gt"*) echo "/opt/gt/gt"; echo "/opt/gt/bd"; exit 0 ;;
 esac
 if [ "$1" = "run" ]; then echo "deadbeefcafe"; fi
 exit 0
@@ -324,7 +324,8 @@ func TestWorkEnvPrepare_InjectsGtAndBd(t *testing.T) {
 	// Linked as root: the image's user may not own /usr/local/bin, and
 	// /opt/gt is read-only so it cannot be done from inside the mount.
 	assert.Contains(t, joined, "exec -u 0 gt-work-MyRig-furiosa /bin/sh -c mkdir -p /usr/local/bin && ln -sf /opt/gt/gt /usr/local/bin/gt")
-	assert.Contains(t, joined, "command -v gt && command -v bd")
+	assert.Contains(t, joined, AgentPathPrefix+"command -v gt && command -v bd",
+		"the probe must use the PATH the agent will run with, or it proves nothing")
 }
 
 // TestWorkEnvPrepare_NoInjectionWithoutAClient pins that a worker which has not
@@ -358,7 +359,7 @@ func fakeDockerMatching(t *testing.T, pattern string) (docker, logFile string) {
 printf '%s\n' "$*" >> "` + logFile + `"
 case "$*" in
   *"` + pattern + `"*) echo "forced failure" >&2; exit 1 ;;
-  *"command -v gt"*) echo "/usr/local/bin/gt"; echo "/usr/local/bin/bd"; exit 0 ;;
+  *"command -v gt"*) echo "/opt/gt/gt"; echo "/opt/gt/bd"; exit 0 ;;
 esac
 if [ "$1" = "run" ]; then echo "deadbeefcafe"; fi
 exit 0
@@ -418,7 +419,7 @@ func TestWorkEnvPrepare_RefusesAShadowedInjection(t *testing.T) {
 	script := `#!/bin/sh
 printf '%s\n' "$*" >> "` + logFile + `"
 case "$*" in
-  *"command -v gt"*) echo "/usr/bin/gt"; echo "/usr/bin/bd"; exit 0 ;;
+  *"command -v gt"*) echo "/usr/bin/gt"; echo "/opt/gt/bd"; exit 0 ;;
 esac
 if [ "$1" = "run" ]; then echo "deadbeefcafe"; fi
 exit 0
@@ -433,6 +434,63 @@ exit 0
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "/usr/bin/gt")
 	assert.Contains(t, err.Error(), "image-supplied")
+}
+
+// TestWorkEnvPrepare_RefusesAShadowedBd pins the half the first version of this
+// check threw away: `bd` is the same injected binary under another name — the
+// beads CLI — and only `gt` was ever compared, so an image shipping its own `bd`
+// went completely unexamined.
+func TestWorkEnvPrepare_RefusesAShadowedBd(t *testing.T) {
+	dir := t.TempDir()
+	docker := filepath.Join(dir, "docker")
+	logFile := filepath.Join(dir, "docker.log")
+	// gt resolves to ours; bd does not.
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logFile + `"
+case "$*" in
+  *"command -v gt"*) echo "/opt/gt/gt"; echo "/usr/bin/bd"; exit 0 ;;
+esac
+if [ "$1" = "run" ]; then echo "deadbeefcafe"; fi
+exit 0
+`
+	require.NoError(t, os.WriteFile(docker, []byte(script), 0755))
+
+	cfg := withProxyClient(t, testWorkEnvConfig(t, docker))
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+
+	err = w.Prepare(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "bd")
+	assert.Contains(t, err.Error(), "/usr/bin/bd")
+}
+
+// TestWorkEnvPrepare_LinkFailureStillRequiresTheMountedClient pins the hole the
+// earlier guard had: it accepted /usr/local/bin/gt precisely when the link had
+// failed, i.e. when that path could NOT be ours. With the PATH prefix the
+// expectation is the mount either way.
+func TestWorkEnvPrepare_LinkFailureStillRequiresTheMountedClient(t *testing.T) {
+	dir := t.TempDir()
+	docker := filepath.Join(dir, "docker")
+	logFile := filepath.Join(dir, "docker.log")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logFile + `"
+case "$*" in
+  *"ln -sf"*) echo "forced failure" >&2; exit 1 ;;
+  *"command -v gt"*) echo "/usr/local/bin/gt"; echo "/usr/local/bin/bd"; exit 0 ;;
+esac
+if [ "$1" = "run" ]; then echo "deadbeefcafe"; fi
+exit 0
+`
+	require.NoError(t, os.WriteFile(docker, []byte(script), 0755))
+
+	cfg := withProxyClient(t, testWorkEnvConfig(t, docker))
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+
+	err = w.Prepare(context.Background())
+	require.Error(t, err, "a link that failed cannot have produced /usr/local/bin/gt")
+	assert.Contains(t, err.Error(), "/usr/local/bin/gt")
 }
 
 // TestWorkEnvPrepare_AcceptsAnImageThatShipsItsOwn pins the supported config the

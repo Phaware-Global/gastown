@@ -509,3 +509,31 @@ func TestContainerInject_PrefersTheTaggedContainerBinary(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, tagged, proxyClient)
 }
+
+// TestContainerPlatform_NegativeProbeExpires pins that a transient docker outage
+// is transient. Caching the failure forever meant one hiccup at the wrong moment
+// disabled container mode for the worker's whole process lifetime — and since a
+// container session hard-fails without an injectable client, that is an outage
+// requiring a manual restart.
+func TestContainerPlatform_NegativeProbeExpires(t *testing.T) {
+	prev := containerProbeRetry
+	containerProbeRetry = 50 * time.Millisecond
+	t.Cleanup(func() { containerProbeRetry = prev })
+
+	// A docker stand-in that fails until a marker file appears.
+	dir := t.TempDir()
+	docker := filepath.Join(dir, "docker")
+	marker := filepath.Join(dir, "up")
+	require.NoError(t, os.WriteFile(docker, []byte("#!/bin/sh\nif [ -f "+marker+" ]; then echo linux-amd64; exit 0; fi\nexit 1\n"), 0755))
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	proxyURL, _, _ := startProxy(t)
+	_, svc := startService(t, proxyURL, func(c *Config) { c.Docker = true })
+
+	assert.Empty(t, svc.containerPlatform(), "daemon down")
+	assert.Empty(t, svc.containerPlatform(), "and not re-probed immediately")
+
+	require.NoError(t, os.WriteFile(marker, []byte("x"), 0644))
+	require.Eventually(t, func() bool { return svc.containerPlatform() == "linux-amd64" },
+		5*time.Second, 25*time.Millisecond, "a recovered daemon must be picked up without a restart")
+}
