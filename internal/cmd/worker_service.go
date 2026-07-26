@@ -200,15 +200,27 @@ func planWorkerService(o workerServiceOpts) (*workerServicePlan, error) {
 		quoted[i] = config.ShellQuote(a)
 	}
 	shimDir := filepath.Join(stateDir, "bin")
+	// The shim dir goes FIRST: the agent inherits this PATH, and on a machine
+	// that is both orchestrator and worker the real `gt` is also installed — the
+	// agent must get the proxy shim, while the operator's own shell keeps the
+	// real binary.
+	jobPath := shimDir + ":" + workerServicePath(binary)
+	envFile := filepath.Join(stateDir, "worker.env")
+	logPath := filepath.Join(stateDir, "worker.log")
+
+	// Assemble the sh -c line here, where the parts are known and can be quoted
+	// individually. The binary path and state dir are operator-supplied, so they
+	// get the same treatment as the arguments: a path with a quote or $(…) in it
+	// would otherwise run as code at job start.
+	shellCommand := fmt.Sprintf("set -a; [ -r %s ] && . %s; set +a; exec %s %s",
+		config.ShellQuote(envFile), config.ShellQuote(envFile),
+		config.ShellQuote(binary), strings.Join(quoted, " "))
+
 	plist, err := templates.RenderWorkerLaunchd(templates.WorkerSupervisorData{
-		BinaryPath: binary,
-		StateDir:   stateDir,
-		Args:       quoted,
-		// The shim dir goes FIRST: the agent inherits this PATH, and on a machine
-		// that is both orchestrator and worker the real `gt` is also installed —
-		// the agent must get the proxy shim, while the operator's own shell keeps
-		// the real binary.
-		Path: shimDir + ":" + workerServicePath(binary),
+		ShellCommand: shellCommand,
+		StateDir:     stateDir,
+		LogPath:      logPath,
+		Path:         jobPath,
 	})
 	if err != nil {
 		return nil, err
@@ -219,7 +231,7 @@ func planWorkerService(o workerServiceOpts) (*workerServicePlan, error) {
 	}
 	return &workerServicePlan{
 		Binary: binary, StateDir: stateDir, PlistPath: plistPath,
-		Args: quoted, Path: shimDir + ":" + workerServicePath(binary), Plist: plist,
+		Args: quoted, Path: jobPath, Plist: plist,
 		ShimDir: shimDir, ProxyClient: proxyClient,
 	}, nil
 }

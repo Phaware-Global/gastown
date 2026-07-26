@@ -60,15 +60,30 @@ var (
 	// come from the worker's own agent env file (§8), never the wire.
 	envSecretSubstrings = []string{"TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "API_KEY", "APIKEY", "_KEY", "PRIVATE"}
 
-	// envLauncherOnly configure the launcher process itself and must never be
-	// forwarded to the agent. (They are credential-shaped too, so EnvSecretKey
-	// already refuses them; listed for intent.)
-	envLauncherOnly = map[string]bool{"GT_WORKER_TOKEN": true, "GT_WORKER_NAME": true}
+	// envNeverFromWire are keys the orchestrator must never supply, whatever
+	// their shape.
+	//
+	// GT_WORKER_TOKEN / GT_WORKER_NAME configure the LAUNCHER process itself
+	// (they are credential-shaped too, so EnvSecretKey already refuses them;
+	// listed for intent).
+	//
+	// GT_PROXY_RELAY is different and the reason this list is not just about the
+	// launcher: it tells gt-proxy-client that a non-loopback proxy URL is a
+	// worker-local relay, which SUPPRESSES that binary's loopback guard. Only
+	// the worker is in a position to assert that. It is inert from the wire
+	// today — the paired GT_PROXY_URL is refused as an endpoint and the worker
+	// sets it from its own relay — but a security toggle whose safety depends on
+	// a second refusal elsewhere is one refactor away from being a redirect.
+	envNeverFromWire = map[string]bool{
+		"GT_WORKER_TOKEN": true,
+		"GT_WORKER_NAME":  true,
+		"GT_PROXY_RELAY":  true,
+	}
 )
 
 // EnvAllowed reports whether a session-env key may cross the exec stream.
 func EnvAllowed(key string) bool {
-	if key == "" || envLauncherOnly[key] || EnvSecretKey(key) || EnvEndpointKey(key) {
+	if key == "" || envNeverFromWire[key] || EnvSecretKey(key) || EnvEndpointKey(key) {
 		return false
 	}
 	if envAllowedExact[key] {
