@@ -44,7 +44,7 @@ type fakeWorker struct {
 	restartingUntilAttempt int
 	openAttempts           int
 	containerPlatform      string
-	containerBinaries      bool
+	containerClient        string
 
 	// knobs
 	refusePush   string // non-empty → answer a terminal push chunk with this error code
@@ -198,7 +198,7 @@ func (w *fakeWorker) handle(nc net.Conn) {
 				Arch:         workerArch,
 				Capabilities: &sockproto.Capabilities{Docker: true, ExecModes: []string{"container", "native"},
 					MaxSessions: w.maxSessions, ContainerPlatform: w.containerPlatform,
-					ContainerBinaries: w.containerBinaries},
+					ContainerClient: w.containerClient},
 				Sessions: sess,
 			})
 		case sockproto.TypePushBinary:

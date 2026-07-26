@@ -80,6 +80,12 @@ type WorkEnvConfig struct {
 // proxyClientName is the injected binary's name inside /opt/gt.
 const proxyClientName = "gt-proxy-client"
 
+// Where an injected gt legitimately resolves inside the container.
+const (
+	injectedGtPath = "/usr/local/bin/gt"
+	mountedGtPath  = "/opt/gt/gt"
+)
+
 const (
 	containerNetworkHost   = "host"
 	containerNetworkBridge = "bridge"
@@ -287,7 +293,10 @@ func (w *WorkEnv) preflight(ctx context.Context) error {
 			return fmt.Errorf("image preflight: agent runtime %q not on PATH in image %s (§6.2): %w", w.cfg.AgentBinary, w.cfg.Image, err)
 		}
 	}
-	if w.cfg.ProxyClient != "" {
+	// Verification runs whether or not we injected: the question is "can this
+	// agent reach the control plane", and an image that ships its own gt/bd
+	// answers it just as well. Injection only changes what we EXPECT to resolve.
+	{
 		// /opt/gt is read-only, so the CLI is linked into a directory that is
 		// on every reasonable PATH. Done as root because the image's user may
 		// not own /usr/local/bin.
@@ -295,32 +304,41 @@ func (w *WorkEnv) preflight(ctx context.Context) error {
 		// This is a hard failure rather than a warning: an agent that cannot
 		// run `gt` cannot call `gt done`, take mail, or update a bead — the
 		// session would look alive and accomplish nothing.
-		// mkdir -p first: a minimal image (busybox is the canonical one) has no
-		// /usr/local/bin at all, and `ln -sf` into a missing directory fails.
-		// Before injection existed, such an image came up degraded; it must not
-		// now come up not at all for want of one mkdir.
-		link := "mkdir -p /usr/local/bin && ln -sf /opt/gt/gt /usr/local/bin/gt && ln -sf /opt/gt/bd /usr/local/bin/bd"
-		linkErr := func() error {
-			_, err := w.docker(ctx, "exec", "-u", "0", w.name, "/bin/sh", "-c", link)
-			return err
-		}()
+		var linkErr error
+		if w.cfg.ProxyClient != "" {
+			// mkdir -p first: a minimal image (busybox is the canonical one) has
+			// no /usr/local/bin at all, and `ln -sf` into a missing directory
+			// fails. Before injection existed, such an image came up degraded;
+			// it must not now fail to come up for want of one mkdir.
+			link := "mkdir -p /usr/local/bin && ln -sf /opt/gt/gt /usr/local/bin/gt && ln -sf /opt/gt/bd /usr/local/bin/bd"
+			_, linkErr = w.docker(ctx, "exec", "-u", "0", w.name, "/bin/sh", "-c", link)
+		}
 
-		// The VERIFICATION is what matters, not the linking: an image that
-		// already ships gt/bd on PATH is fine even if the link failed (read-only
-		// /usr, no uid-0 account). Only an agent that genuinely cannot run `gt`
-		// is fatal — it would take work, look alive, and accomplish nothing.
-		if _, err := w.docker(ctx, "exec", w.name, "/bin/sh", "-c", "command -v gt >/dev/null && command -v bd >/dev/null"); err != nil {
+		// Resolve gt rather than merely testing for it: `command -v` proves only
+		// that SOMETHING named gt is on PATH, which an image can supply — and
+		// silently shadowing the injected client with an image-supplied binary
+		// is exactly what must not happen, since that binary would run with the
+		// session's env, worktree and (when mounted) docker socket.
+		resolved, err := w.docker(ctx, "exec", w.name, "/bin/sh", "-c", "command -v gt && command -v bd")
+		if err != nil {
 			if linkErr != nil {
 				return fmt.Errorf("image preflight: could not put gt/bd on PATH in image %s (linking failed: %v; the agent could not reach the control plane): %w", w.cfg.Image, linkErr, err)
 			}
-			return fmt.Errorf("image preflight: gt/bd not on PATH in image %s after linking: %w", w.cfg.Image, err)
+			return fmt.Errorf("image preflight: gt/bd not on PATH in image %s and none were injected — the agent could not reach the control plane: %w", w.cfg.Image, err)
 		}
-		// A failed link with a working PATH is survivable (the image ships its
-		// own), so it is not fatal — but it is worth the operator's attention,
-		// since it usually means a read-only /usr or no uid-0 account.
+		gtPath := strings.TrimSpace(strings.SplitN(strings.TrimSpace(resolved), "\n", 2)[0])
+
+		if w.cfg.ProxyClient != "" && gtPath != injectedGtPath && gtPath != mountedGtPath {
+			// We injected a trusted client and the container resolves a
+			// different one. Refusing beats warning: the agent's control-plane
+			// CLI would be an image-supplied binary, and the image is a registry
+			// tag — someone else's supply chain.
+			return fmt.Errorf("image preflight: %s resolves gt to %q, not the injected client (%s) — refusing to run the agent against an image-supplied control-plane CLI",
+				w.cfg.Image, gtPath, injectedGtPath)
+		}
 		if linkErr != nil {
-			slog.Default().Warn("gt/bd link step failed but they resolve on PATH anyway",
-				"image", w.cfg.Image, "container", w.name, "err", linkErr)
+			slog.Default().Warn("gt/bd link step failed; the container is using its own",
+				"image", w.cfg.Image, "container", w.name, "resolved_gt", gtPath, "err", linkErr)
 		}
 	}
 	return nil

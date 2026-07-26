@@ -115,8 +115,12 @@ type Service struct {
 	persistMu sync.Mutex
 
 	// containerPlatformCache memoizes the docker daemon's platform; it cannot
-	// change without the daemon restarting. Guarded by mu.
-	containerPlatformCache string
+	// change without the daemon restarting. containerPlatformProbed records
+	// that the probe RAN, so a failure is not retried on every handshake —
+	// the probe is inline on the read loop and a hung daemon costs its full
+	// timeout. Guarded by mu.
+	containerPlatformCache  string
+	containerPlatformProbed bool
 
 	// restarting is set while a staged worker binary is being applied: the
 	// process is about to exit for the supervisor, so no new session may start
@@ -324,6 +328,9 @@ func (s *Service) handle(ctx context.Context, nc net.Conn) {
 				return
 			}
 			helloed = true
+			// Resolve the container platform ONCE: it probes docker, and the
+			// digest below needs the same answer.
+			containerPlatform := s.containerPlatform()
 			_ = c.send(&sockproto.Message{
 				Type:         sockproto.TypeHelloAck,
 				ProtoVersion: sockproto.ProtoVersion,
@@ -342,8 +349,8 @@ func (s *Service) handle(ctx context.Context, nc net.Conn) {
 					// orchestrator must know which binaries to send for it —
 					// and whether we already hold them, since an up-to-date
 					// worker would otherwise never be sent any.
-					ContainerPlatform: s.containerPlatform(),
-					ContainerBinaries: s.hasContainerBinaries(),
+					ContainerPlatform: containerPlatform,
+					ContainerClient:   s.containerClientDigest(containerPlatform),
 				},
 				Sessions: s.summaries(),
 			})

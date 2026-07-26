@@ -370,28 +370,27 @@ func TestPushBinaries_FailureDoesNotBlockProvision(t *testing.T) {
 // TestHasContainerBinaries pins what the handshake advertises, since the
 // orchestrator uses it to decide whether to push container binaries to a worker
 // whose version already matches.
-func TestHasContainerBinaries(t *testing.T) {
+func TestContainerClientDigest(t *testing.T) {
 	proxyURL, _, _ := startProxy(t)
 	_, svc := startService(t, proxyURL, func(c *Config) { c.Docker = true })
 
 	foreign := foreignPlatform()
-	svc.mu.Lock()
-	svc.containerPlatformCache = foreign
-	svc.mu.Unlock()
-	assert.False(t, svc.hasContainerBinaries(), "nothing pushed yet")
+	assert.Empty(t, svc.containerClientDigest(foreign), "nothing pushed yet")
 
+	payload := []byte("container-client")
 	require.NoError(t, os.MkdirAll(svc.containerBinDir(foreign), 0755))
-	require.NoError(t, os.WriteFile(filepath.Join(svc.containerBinDir(foreign), BinProxyClient), []byte("x"), 0755))
-	assert.True(t, svc.hasContainerBinaries())
+	require.NoError(t, os.WriteFile(filepath.Join(svc.containerBinDir(foreign), BinProxyClient), payload, 0755))
+	sum := sha256.Sum256(payload)
+	// The DIGEST, not a bool: it also lets the orchestrator skip re-streaming an
+	// identical binary on every provision.
+	assert.Equal(t, hex.EncodeToString(sum[:]), svc.containerClientDigest(foreign))
 
 	// Same-platform containers run the worker's own binary, so that counts too.
-	svc.mu.Lock()
-	svc.containerPlatformCache = sockproto.PlatformTag(runtime.GOOS, runtime.GOARCH)
-	svc.mu.Unlock()
-	assert.False(t, svc.hasContainerBinaries(), "the worker's own client is not installed yet")
+	native := sockproto.PlatformTag(runtime.GOOS, runtime.GOARCH)
+	assert.Empty(t, svc.containerClientDigest(native), "the worker's own client is not installed yet")
 	require.NoError(t, os.MkdirAll(svc.binDir(), 0755))
-	require.NoError(t, os.WriteFile(filepath.Join(svc.binDir(), BinProxyClient), []byte("x"), 0755))
-	assert.True(t, svc.hasContainerBinaries())
+	require.NoError(t, os.WriteFile(filepath.Join(svc.binDir(), BinProxyClient), payload, 0755))
+	assert.Equal(t, hex.EncodeToString(sum[:]), svc.containerClientDigest(native))
 }
 
 // TestPush_TaggedPlatformGoesToTheContainerTree pins the separation that makes
@@ -483,10 +482,9 @@ func TestContainerInject_RefusesTheWorkersOwnClientForAForeignContainer(t *testi
 	require.NoError(t, os.MkdirAll(svc.binDir(), 0755))
 	require.NoError(t, os.WriteFile(filepath.Join(svc.binDir(), BinProxyClient), []byte("own-native"), 0755))
 
-	_, _, err := svc.containerInject()
-	require.Error(t, err, "a foreign-platform container must not be given the worker's own binary")
-	assert.Contains(t, err.Error(), foreignPlatform())
-	assert.Contains(t, err.Error(), "push-binaries", "the error must say how to fix it")
+	_, proxyClient, err := svc.containerInject()
+	require.NoError(t, err, "an image may still ship its own gt/bd — the container's preflight decides")
+	assert.Empty(t, proxyClient, "a foreign-platform container must not be given the worker's own binary")
 }
 
 // TestContainerInject_PrefersTheTaggedContainerBinary pins the cross-platform

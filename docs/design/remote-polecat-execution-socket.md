@@ -196,12 +196,23 @@ installed, writes through a staging file, and installs by rename — a half-writ
   execute is strictly worse than leaving it stale. A same-platform worker falls
   back to the orchestrator's own install dir, so the single-platform case works
   with no extra step.
-- The container's binaries are pushed when the worker says it **lacks** them,
-  not only when versions differ: a worker can be exactly up to date and have
-  never received them (fresh enrollment, a wiped state dir), and gating on
-  version alone left every container session running an agent with no `gt`/`bd`
-  at all. `hello_ack` reports `container_binaries` for this. A container session
-  that still cannot resolve one **fails** rather than starting a mute agent.
+- The container's client is pushed by **digest**, not by version: `hello_ack`
+  reports `container_client` (the sha256 of the client the worker would inject,
+  or empty). A worker can be exactly up to date and have never received one
+  (fresh enrollment, a wiped state dir), so version equality is the wrong gate;
+  reporting the digest also stops an identical binary being re-streamed on every
+  provision. When the container platform equals the worker's own, the client IS
+  the worker's own binary, so the untagged push must fire even when versions
+  match — otherwise the canonical Linux-worker deployment is detected as needing
+  one and sent nothing.
+- A container that cannot resolve `gt`/`bd` **fails preflight** — but a missing
+  injectable client is not itself fatal: an image may ship its own, and an
+  operator's explicit `--gt-dir` may already hold them. Verification inside the
+  container is the authority. What IS refused is a **shadowed** injection: if a
+  client was injected and the container resolves `gt` somewhere else, the
+  session stops, because the agent's control-plane CLI would be a binary from
+  the image (a registry tag — someone else's supply chain) running with the
+  session's env, worktree, and docker socket.
 - A push may carry a `platform` tag, and then it is **for the work container,
   not the worker**: on a macOS worker the container is still a Linux container,
   so its `gt`/`bd` are a different build from the ones the worker runs. Tagged

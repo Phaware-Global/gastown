@@ -65,13 +65,16 @@ type Capabilities struct {
 	Docker      bool     `json:"docker"`
 	ExecModes   []string `json:"exec_modes"`
 	MaxSessions int      `json:"max_sessions"`
-	// ContainerBinaries reports whether the worker already holds a
-	// gt-proxy-client it can inject into a work container. Version equality is
-	// NOT enough to skip a container push: a worker can be perfectly
-	// up-to-date and still have never received the container platform's
-	// binaries (fresh enrollment, wiped state dir), and a container without
-	// them runs an agent with no gt/bd at all.
-	ContainerBinaries bool `json:"container_binaries,omitempty"`
+	// ContainerClient is the sha256 of the gt-proxy-client the worker can inject
+	// into a work container, or "" if it has none.
+	//
+	// Version equality is NOT enough to decide a container push: a worker can be
+	// perfectly up to date and still have never received the container
+	// platform's binaries (fresh enrollment, wiped state dir), and a container
+	// without them runs an agent with no gt/bd at all. Reporting the DIGEST
+	// rather than a bool also stops an identical binary being re-streamed on
+	// every provision.
+	ContainerClient string `json:"container_client,omitempty"`
 	// ContainerPlatform is "<goos>-<goarch>" of the worker's docker daemon,
 	// when it has one. The work container is a Linux container even on a macOS
 	// worker, so the binaries injected into it are a DIFFERENT platform from
@@ -89,10 +92,13 @@ func (c *Capabilities) GetContainerPlatform() string {
 	return c.ContainerPlatform
 }
 
-// HasContainerBinaries reports whether the worker already holds an injectable
-// client, from a possibly-nil capability block.
-func (c *Capabilities) HasContainerBinaries() bool {
-	return c != nil && c.ContainerBinaries
+// GetContainerClient reads the injectable client's digest from a possibly-nil
+// capability block. "" means the worker has none.
+func (c *Capabilities) GetContainerClient() string {
+	if c == nil {
+		return ""
+	}
+	return c.ContainerClient
 }
 
 // SessionSummary describes one live session (§4.1 sessions / hello_ack).

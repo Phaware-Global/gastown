@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -98,27 +99,6 @@ func (b *SocketBackend) pushTo(ctx context.Context, c *conn, force bool) ([]Push
 	if ack == nil {
 		return nil, fmt.Errorf("socket: no handshake to compare versions against")
 	}
-	// Does the worker need its OWN binaries refreshed?
-	refreshOwn := true
-	if !force {
-		// "dev" on either side means an unversioned build: comparing it would
-		// push on every single provision, so skip rather than guess.
-		unversioned := b.GTVersion == "" || b.GTVersion == "dev" || ack.GTVersion == "dev"
-		refreshOwn = !unversioned && ack.GTVersion != b.GTVersion
-	}
-
-	// The container's binaries are a SEPARATE question. A worker can be exactly
-	// up to date and still have never received them — fresh enrollment, wiped
-	// state dir — and version equality would then skip the push forever, leaving
-	// every container session with an agent that has no gt/bd at all. So this is
-	// gated on what the worker actually holds, not on versions.
-	needContainer := ack.Capabilities.GetContainerPlatform() != "" &&
-		(force || refreshOwn || !ack.Capabilities.HasContainerBinaries())
-
-	if !refreshOwn && !needContainer {
-		return nil, nil
-	}
-
 	workerOS, workerArch := ack.OS, ack.Arch
 	if workerOS == "" || workerArch == "" {
 		workerOS, workerArch = runtime.GOOS, runtime.GOARCH
@@ -130,6 +110,54 @@ func (b *SocketBackend) pushTo(ctx context.Context, c *conn, force bool) ([]Push
 	// looking for a file named gt-proxy-client and have it streamed back.
 	if !sockproto.ValidPlatformTag(PlatformDir(workerOS, workerArch)) {
 		return nil, fmt.Errorf("socket: worker reported an invalid platform %q/%q", workerOS, workerArch)
+	}
+
+	// Does the worker need its OWN binaries refreshed?
+	refreshOwn := true
+	if !force {
+		// "dev" on either side means an unversioned build: comparing it would
+		// push on every single provision, so skip rather than guess.
+		unversioned := b.GTVersion == "" || b.GTVersion == "dev" || ack.GTVersion == "dev"
+		refreshOwn = !unversioned && ack.GTVersion != b.GTVersion
+	}
+
+	// The container's binaries are a SEPARATE question, gated on what the worker
+	// actually holds rather than on versions: a worker can be exactly up to date
+	// and have never received them (fresh enrollment, wiped state dir), and
+	// version equality would then skip the push forever, leaving every container
+	// session with an agent that has no gt/bd at all.
+	cp := ack.Capabilities.GetContainerPlatform()
+	sameAsWorker := cp == PlatformDir(workerOS, workerArch)
+	needContainer := false
+	if cp != "" {
+		if force || refreshOwn {
+			needContainer = true
+		} else {
+			// Compare digests: an identical client must not be re-streamed on
+			// every provision, and "the worker has none" is just the empty case.
+			want, err := b.clientDigestFor(cp)
+			if err != nil {
+				// No artifacts for that platform. Nothing to send; the worker's
+				// own error at session time names what to build.
+				slog.Default().Warn("socket: cannot check the worker's container client", "platform", cp, "err", err)
+			} else {
+				needContainer = ack.Capabilities.GetContainerClient() != want
+			}
+		}
+	}
+
+	// A same-platform container runs the worker's OWN binary, so "the container
+	// needs one" must be able to trigger the untagged push. Without this the
+	// canonical deployment — a Linux worker with local Linux docker — computes
+	// needContainer=true, sends nothing (the tagged push is skipped as
+	// redundant), and every container session fails for want of a client that
+	// was never pushed.
+	if needContainer && sameAsWorker {
+		refreshOwn = true
+	}
+
+	if !refreshOwn && !needContainer {
+		return nil, nil
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, pushTimeout)
@@ -150,7 +178,7 @@ func (b *SocketBackend) pushTo(ctx context.Context, c *conn, force bool) ([]Push
 	// worker reports the platform its docker daemon runs (§4.1), and those
 	// binaries are stored separately for injection — never installed as the
 	// worker's own.
-	if cp := ack.Capabilities.GetContainerPlatform(); needContainer && cp != PlatformDir(workerOS, workerArch) {
+	if needContainer && !sameAsWorker {
 		cpOS, cpArch, ok := splitPlatform(cp)
 		if !ok {
 			return results, fmt.Errorf("socket: worker reported an unparseable container platform %q", cp)
@@ -190,6 +218,29 @@ func (b *SocketBackend) pushPlatform(ctx context.Context, c *conn, goos, goarch,
 		results = append(results, PushResult{Name: name, Platform: PlatformDir(goos, goarch), Applied: applied})
 	}
 	return results, nil
+}
+
+// clientDigestFor is the sha256 of the gt-proxy-client artifact for a platform,
+// so an identical copy on the worker can be left alone.
+func (b *SocketBackend) clientDigestFor(platform string) (string, error) {
+	goos, goarch, ok := splitPlatform(platform)
+	if !ok {
+		return "", fmt.Errorf("socket: invalid platform %q", platform)
+	}
+	dir, err := binariesFor(goos, goarch)
+	if err != nil {
+		return "", err
+	}
+	f, err := os.Open(filepath.Join(dir, "gt-proxy-client"))
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // splitPlatform parses a "<goos>-<goarch>" tag, rejecting anything that is not
