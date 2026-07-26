@@ -127,6 +127,14 @@ func (b *SocketBackend) pushTo(ctx context.Context, c *conn, force bool) ([]Push
 	// version equality would then skip the push forever, leaving every container
 	// session with an agent that has no gt/bd at all.
 	cp := ack.Capabilities.GetContainerPlatform()
+	if cp == "" && ack.Capabilities != nil && ack.Capabilities.Docker {
+		// A docker-capable worker that cannot name its container platform is
+		// probing a daemon that is down or slow. Container sessions there will
+		// fail preflight for want of an injected client, and without this the
+		// only trace is a warning on the worker.
+		slog.Default().Warn("socket: docker-capable worker reports no container platform; container sessions there will have no gt/bd until its daemon answers",
+			"worker", ack.WorkerID)
+	}
 	sameAsWorker := cp == PlatformDir(workerOS, workerArch)
 	needContainer := false
 	if cp != "" {
@@ -147,9 +155,10 @@ func (b *SocketBackend) pushTo(ctx context.Context, c *conn, force bool) ([]Push
 			} else {
 				// The worker's digest is ADVISORY, not evidence: it controls its
 				// own filesystem, so this only decides whether sending is
-				// worthwhile. What the container actually runs is settled
-				// container-side, by the preflight that resolves gt/bd against
-				// the read-only mount.
+				// worthwhile. What the container actually runs is decided
+				// container-side by WorkEnv.preflight (see worker.AgentPathPrefix
+				// and the checks around it) — named by symbol rather than
+				// described, so this comment cannot drift from the mechanism.
 				needContainer = ack.Capabilities.GetContainerClient() != want
 			}
 		}

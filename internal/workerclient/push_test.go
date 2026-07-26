@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -520,18 +521,31 @@ func TestContainerPlatform_NegativeProbeExpires(t *testing.T) {
 	containerProbeRetry = 50 * time.Millisecond
 	t.Cleanup(func() { containerProbeRetry = prev })
 
-	// A docker stand-in that fails until a marker file appears.
+	// A docker stand-in that COUNTS its invocations and fails until a marker
+	// file appears, so the test can pin the cache as well as its expiry.
 	dir := t.TempDir()
 	docker := filepath.Join(dir, "docker")
 	marker := filepath.Join(dir, "up")
-	require.NoError(t, os.WriteFile(docker, []byte("#!/bin/sh\nif [ -f "+marker+" ]; then echo linux-amd64; exit 0; fi\nexit 1\n"), 0755))
+	calls := filepath.Join(dir, "calls")
+	require.NoError(t, os.WriteFile(docker, []byte(
+		"#!/bin/sh\necho x >> "+calls+"\nif [ -f "+marker+" ]; then echo linux-amd64; exit 0; fi\nexit 1\n"), 0755))
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	probeCount := func() int {
+		data, err := os.ReadFile(calls)
+		if err != nil {
+			return 0
+		}
+		return len(strings.Fields(string(data)))
+	}
 
 	proxyURL, _, _ := startProxy(t)
 	_, svc := startService(t, proxyURL, func(c *Config) { c.Docker = true })
 
 	assert.Empty(t, svc.containerPlatform(), "daemon down")
 	assert.Empty(t, svc.containerPlatform(), "and not re-probed immediately")
+	// The cache is the point of the second call: probing per handshake is a 10s
+	// inline stall on the connection read loop.
+	assert.Equal(t, 1, probeCount(), "a failed probe must be cached, not repeated")
 
 	require.NoError(t, os.WriteFile(marker, []byte("x"), 0644))
 	require.Eventually(t, func() bool { return svc.containerPlatform() == "linux-amd64" },

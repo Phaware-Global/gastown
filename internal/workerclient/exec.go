@@ -305,7 +305,7 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 // `docker exec` into the prepared work container, or a direct exec on the
 // worker for native mode.
 func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktree, container, proxyURL string) (*exec.Cmd, error) {
-	env, err := s.agentEnv(m.Env, proxyURL)
+	env, err := s.agentEnv(m.Env, proxyURL, container != "")
 	if err != nil {
 		return nil, err
 	}
@@ -318,9 +318,9 @@ func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktre
 		// The exec channel is a string interface (§6.2): the argv is rendered
 		// as a single shell-quoted command line and run via /bin/sh, which the
 		// image contract requires.
-		// Same PATH prefix the container preflight verified with: the injected
-		// gt/bd must be what the AGENT resolves, not merely what a bare shell
-		// would have found.
+		// Same prefix the container preflight verified with, expanding the same
+		// base: the injected gt/bd must be what the AGENT resolves, not merely
+		// what a bare shell would have found.
 		args = append(args, "--", container, "/bin/sh", "-c", worker.AgentPathPrefix+shellJoin(m.Argv))
 		cmd := exec.CommandContext(ctx, "docker", args...)
 		// Canceling kills the `docker exec` CLIENT; the in-container process is
@@ -355,9 +355,18 @@ func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktre
 // agentEnv assembles the agent's environment: a minimal base, the worker's
 // operator-provisioned agent env file (§8 — the ONLY sanctioned source of
 // agent credentials), then the non-secret session env from the wire.
-func (s *Service) agentEnv(wireEnv map[string]string, proxyURL string) ([]string, error) {
+func (s *Service) agentEnv(wireEnv map[string]string, proxyURL string, container bool) ([]string, error) {
 	env := []string{}
-	for _, key := range []string{"HOME", "PATH", "LANG", "TERM", "TMPDIR"} {
+	base := []string{"HOME", "PATH", "LANG", "TERM", "TMPDIR"}
+	if container {
+		// NOT the worker host's PATH: inside a container it names directories
+		// that do not exist, and `docker exec -e PATH=…` would override the
+		// image's own — so the agent runtime the image preflight just verified
+		// against the IMAGE's PATH could then be unfindable. HOME and TMPDIR are
+		// likewise host paths. The image supplies all of these.
+		base = []string{"LANG", "TERM"}
+	}
+	for _, key := range base {
 		if v := os.Getenv(key); v != "" {
 			env = append(env, key+"="+v)
 		}

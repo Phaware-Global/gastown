@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -551,4 +552,41 @@ func TestWorkEnvPrepare_ConcurrentSessionsShareGTDirSafely(t *testing.T) {
 	target, err := os.Readlink(filepath.Join(shared, "gt"))
 	require.NoError(t, err)
 	assert.Equal(t, "gt-proxy-client", target)
+}
+
+// TestAgentPathPrefix_AppliesToEveryCommand runs the composed probe in a REAL
+// shell, which is the test whose absence let a shell bug ship: every fake docker
+// in this file echoes canned output, so `PATH=x cmd1 && cmd2` — where POSIX
+// scopes the assignment to cmd1 alone — looked correct by string containment
+// while resolving `bd` against the image's PATH and refusing every injected
+// container session.
+func TestAgentPathPrefix_AppliesToEveryCommand(t *testing.T) {
+	mount := t.TempDir() // stands in for the read-only /opt/gt
+	image := t.TempDir() // stands in for a directory the image ships
+	for _, name := range []string{"gt", "bd"} {
+		require.NoError(t, os.WriteFile(filepath.Join(mount, name), []byte("#!/bin/sh\n"), 0755))
+	}
+	// The image also ships its own bd, earlier on PATH than anything else.
+	require.NoError(t, os.WriteFile(filepath.Join(image, "bd"), []byte("#!/bin/sh\n"), 0755))
+
+	// The production prefix, with the mount path substituted for the fixture.
+	prefix := strings.Replace(AgentPathPrefix, "/opt/gt", mount, 1)
+
+	for _, sh := range []string{"/bin/sh", "/bin/bash", "/bin/zsh"} {
+		if _, err := os.Stat(sh); err != nil {
+			continue
+		}
+		t.Run(filepath.Base(sh), func(t *testing.T) {
+			cmd := exec.Command(sh, "-c", prefix+"command -v gt && command -v bd")
+			cmd.Env = []string{"PATH=" + image + ":/usr/bin:/bin"}
+			out, err := cmd.CombinedOutput()
+			require.NoError(t, err, string(out))
+
+			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+			require.Len(t, lines, 2, "both names must resolve: %q", string(out))
+			assert.Equal(t, filepath.Join(mount, "gt"), strings.TrimSpace(lines[0]))
+			assert.Equal(t, filepath.Join(mount, "bd"), strings.TrimSpace(lines[1]),
+				"the prefix must apply to the SECOND command too, not just the first")
+		})
+	}
 }

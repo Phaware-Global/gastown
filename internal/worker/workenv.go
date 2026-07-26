@@ -91,10 +91,16 @@ const (
 	mountedGtPath = "/opt/gt/gt"
 	mountedBdPath = "/opt/gt/bd"
 
-	// AgentPathPrefix is prepended to the agent's command line in container
-	// mode. It expands the image's own PATH, so the agent runtime stays
-	// findable (§6.2's contract) with the injected CLI ahead of it.
-	AgentPathPrefix = "PATH=/opt/gt:$PATH "
+	// AgentPathPrefix is prepended to a container command line so the injected
+	// CLI resolves first. It expands the image's own PATH, so the agent runtime
+	// stays findable (§6.2's contract).
+	//
+	// It EXPORTS rather than using an assignment prefix. `PATH=x cmd1 && cmd2`
+	// applies the assignment to cmd1 ONLY — a POSIX rule that made an earlier
+	// version resolve `gt` against the mount and `bd` against the image, so
+	// every injected container session was refused. Verified in dash, bash and
+	// zsh; TestAgentPathPrefix_AppliesToEveryCommand runs the real shell.
+	AgentPathPrefix = "export PATH=/opt/gt:$PATH; "
 )
 
 const (
@@ -325,9 +331,10 @@ func (w *WorkEnv) preflight(ctx context.Context) error {
 			_, linkErr = w.docker(ctx, "exec", "-u", "0", w.name, "/bin/sh", "-c", link)
 		}
 
-		// Probe with the SAME PATH the agent will run with (AgentPathPrefix puts
-		// the read-only mount first), so the answer is what the agent actually
-		// gets rather than what a bare shell would find.
+		// Probe with the same PATH the agent will run with: AgentPathPrefix puts
+		// the read-only mount first, and container execs deliberately do NOT
+		// carry the worker host's PATH (see workerclient.agentEnv), so both this
+		// probe and the agent expand the IMAGE's PATH.
 		//
 		// BOTH names are resolved and BOTH are checked: `bd` is the same injected
 		// binary under another name — the beads CLI — and checking only `gt` left

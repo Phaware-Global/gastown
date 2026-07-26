@@ -210,8 +210,12 @@ installed, writes through a staging file, and installs by rename — a half-writ
   operator's explicit `--gt-dir` may already hold them. Verification inside the
   container is the authority.
 - The injected client wins **by construction**, not by hope: the agent's command
-  line is prefixed with `PATH=/opt/gt:$PATH` (expanding the image's own PATH, so
-  the agent runtime stays findable), and preflight probes with that same prefix.
+  line is prefixed with `export PATH=/opt/gt:$PATH;` (expanding the image's own
+  PATH, so the agent runtime stays findable), and preflight probes with the same
+  prefix. It exports rather than using an assignment prefix — `PATH=x cmd1 &&
+  cmd2` applies to `cmd1` alone — and a container exec deliberately does **not**
+  carry the worker host's `PATH`/`HOME`/`TMPDIR`, so both the probe and the agent
+  expand the image's own.
   Both `gt` and `bd` must resolve inside the read-only mount when a client was
   injected; anything else stops the session. That catches an image that bakes in
   its own CLI and would otherwise silently shadow the pushed one. It is **not** a
