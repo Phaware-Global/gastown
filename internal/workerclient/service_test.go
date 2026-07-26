@@ -81,8 +81,8 @@ func startProxy(t *testing.T) (string, *proxy.CA, string) {
 // does in production, via SignPolecatCSR).
 type caSigner struct{ ca *proxy.CA }
 
-func (s *caSigner) SignSessionCSR(_ context.Context, csrPEM []byte, cn string) ([]byte, []byte, time.Time, error) {
-	certPEM, err := s.ca.SignPolecatCSR(csrPEM, cn, 0)
+func (s *caSigner) SignSessionCSR(_ context.Context, csrPEM []byte, rig, polecat string) ([]byte, []byte, time.Time, error) {
+	certPEM, err := s.ca.SignPolecatCSR(csrPEM, worker.PolecatCN(rig, polecat), 0)
 	if err != nil {
 		return nil, nil, time.Time{}, err
 	}
