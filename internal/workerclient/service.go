@@ -83,7 +83,7 @@ type session struct {
 	execCancel  context.CancelFunc // cancels an attached exec stream (nil when none)
 	certWanted  bool               // SignCSR is awaiting a cert
 	certTaken   bool               // a cert has been claimed for this session
-	tearingDown bool               // a teardown is in progress; suppress a racing orphan insert
+	tearingDown bool               // the session is ending (teardown or graceful shutdown): suppress a racing orphan insert and refuse new attaches
 
 	done      chan struct{} // closed when the supervisor has finished
 	buildDone chan struct{} // closed when bringUp returns (success or fail)
@@ -666,13 +666,19 @@ func (s *Service) handleShutdown(c *connState, m *sockproto.Message) {
 		return
 	}
 	// An attached agent must stop BEFORE the supervisor's final flush, or the
-	// checkpoint captures a tree the agent is still writing to.
+	// checkpoint captures a tree the agent is still writing to. Fence exactly
+	// as teardownSession does, in ONE critical section: tearingDown makes
+	// streamExec refuse a reattach for the whole flush (a graceful shutdown
+	// ends the session, so there is nothing left to attach to), and cancelling
+	// under the lock means the cancel cannot be a stale handle to an exec that
+	// unregistered in a gap. cancel() only closes a context, so holding s.mu
+	// across it is safe.
 	s.mu.Lock()
-	execCancel := sess.execCancel
-	s.mu.Unlock()
-	if execCancel != nil {
-		execCancel()
+	sess.tearingDown = true
+	if sess.execCancel != nil {
+		sess.execCancel()
 	}
+	s.mu.Unlock()
 	cancel()
 	<-sess.done
 	_ = c.send(&sockproto.Message{

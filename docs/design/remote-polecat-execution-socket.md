@@ -221,12 +221,21 @@ Stream rules that follow from the framing:
   stops it before the worktree is removed.
 
 Session env in the `attach` payload is an **allowlist** (`GT_*`, `BD_*`,
-`ANTHROPIC_DEFAULT_*`, plus specific model-config keys, none credential-shaped),
-enforced identically on both sides. The worker re-validates rather than trusting
-the launcher's filter: in native mode the agent runs on the worker host, where a
-wire `LD_PRELOAD` or `PATH` would be code execution. Agent credentials come from
-the worker's own agent env file (§8) — which wins over any wire value of the
-same key — never from the orchestrator.
+`ANTHROPIC_DEFAULT_*`, plus specific model-*selection* keys, none
+credential-shaped), enforced identically on both sides. The worker re-validates
+rather than trusting the launcher's filter: in native mode the agent runs on the
+worker host, where a wire `LD_PRELOAD` or `PATH` would be code execution.
+
+Agent credentials come from the worker's own agent env file (§8), never from the
+orchestrator — **and so does the endpoint a credential is sent to**.
+`ANTHROPIC_BASE_URL` is barred from the wire: it is not itself a secret, but a
+compromised or confused orchestrator that could set it would exfiltrate the
+worker's own API key to an endpoint of its choosing. Ordering alone is not
+enough — the env file wins only for keys it also sets, and a file holding the key
+but not the base URL is an ordinary config — so an alternate-provider polecat
+pairs base URL and credential together in the worker's env file. (Local gastown
+already applies the same pairing rule: `config/env.go` excludes
+`ANTHROPIC_BASE_URL` from parent-shell passthrough.)
 
 ## 5. Interface mapping
 

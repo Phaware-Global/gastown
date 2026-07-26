@@ -18,12 +18,27 @@ var (
 	// envAllowedPrefixes are families forwarded wholesale: gastown's own session
 	// vars, beads, and the model-config carry-over.
 	envAllowedPrefixes = []string{"GT_", "BD_", "ANTHROPIC_DEFAULT_"}
-	// envAllowedExact are individually permitted keys.
+	// envAllowedExact are individually permitted keys. They are model/mode
+	// SELECTION only — nothing here can change where a credential is sent.
+	//
+	// ANTHROPIC_BASE_URL is deliberately absent. It is not itself a secret, but
+	// it names the endpoint the agent sends its API key TO: a compromised or
+	// confused orchestrator could set it and exfiltrate a credential the worker
+	// provisioned from its own env file (§8), which is exactly the threat the
+	// worker-side re-check exists to stop. The reversed dedup order in agentEnv
+	// only protects keys the file ALSO sets, so a file with the key and no base
+	// URL — a perfectly ordinary config — would have leaked. The endpoint must
+	// therefore be paired with the credential in the worker's agent env file.
+	//
+	// This matches gastown's existing local policy: config/env.go excludes
+	// ANTHROPIC_BASE_URL from parent-shell passthrough for the same
+	// pairing reason (a MiniMax deacon's base URL leaking into Claude
+	// polecats), and alternate-provider presets set base URL and key together
+	// in one Env block.
 	envAllowedExact = map[string]bool{
 		"CLAUDECODE":             true,
 		"CLAUDE_CODE_ENTRYPOINT": true,
 		"ANTHROPIC_MODEL":        true,
-		"ANTHROPIC_BASE_URL":     true,
 	}
 	// envSecretSubstrings refuse anything credential-shaped even when it matches
 	// an allowed family (e.g. a hypothetical GT_..._TOKEN): agent credentials

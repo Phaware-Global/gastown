@@ -430,38 +430,102 @@ func TestCanonicalSignalNamesAreAccepted(t *testing.T) {
 }
 
 func TestEnvAllowed_AllowlistRefusesLoaderAndSecrets(t *testing.T) {
-	for _, k := range []string{"GT_ROLE", "GT_RIG", "BD_DB", "ANTHROPIC_MODEL", "ANTHROPIC_BASE_URL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDECODE"} {
+	for _, k := range []string{"GT_ROLE", "GT_RIG", "BD_DB", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDECODE"} {
 		assert.True(t, sockproto.EnvAllowed(k), "%s must be allowed", k)
 	}
 	// Loader vars would load attacker code into a NATIVE agent running on the
 	// worker host; PATH would hijack every subprocess it spawns.
 	for _, k := range []string{"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PATH", "HOME", "ANTHROPIC_API_KEY", "GT_AUTH_TOKEN", "GITHUB_TOKEN", "SSH_PRIVATE_KEY",
-		"GT_WORKER_TOKEN", "GT_WORKER_NAME", ""} {
+		"ANTHROPIC_BASE_URL", "GT_WORKER_TOKEN", "GT_WORKER_NAME", ""} {
 		assert.False(t, sockproto.EnvAllowed(k), "%s must be refused", k)
 	}
 }
 
 // TestAgentEnv_FileWinsOverWire pins the §8 invariant: the operator's agent env
-// file is the ONLY sanctioned source of agent credentials, so a wire value can
+// file is the sanctioned source of agent configuration, so a wire value can
 // never override one it sets (os/exec keeps the LAST duplicate).
 func TestAgentEnv_FileWinsOverWire(t *testing.T) {
 	dir := t.TempDir()
 	envFile := filepath.Join(dir, "agent.env")
-	require.NoError(t, os.WriteFile(envFile, []byte("ANTHROPIC_BASE_URL=https://real.example\n"), 0600))
+	require.NoError(t, os.WriteFile(envFile, []byte("ANTHROPIC_MODEL=file-model\n"), 0600))
 
 	s := &Service{cfg: Config{AgentEnvFile: envFile}}
-	env, err := s.agentEnv(map[string]string{"ANTHROPIC_BASE_URL": "https://attacker.example"})
+	env, err := s.agentEnv(map[string]string{"ANTHROPIC_MODEL": "wire-model"})
 	require.NoError(t, err)
 
-	// Last wins, so the file's value must come after the wire's.
-	var lastIdx = -1
 	var lastVal string
-	for i, kv := range env {
-		if strings.HasPrefix(kv, "ANTHROPIC_BASE_URL=") {
-			lastIdx, lastVal = i, kv
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "ANTHROPIC_MODEL=") {
+			lastVal = kv
 		}
 	}
-	require.NotEqual(t, -1, lastIdx)
-	assert.Equal(t, "ANTHROPIC_BASE_URL=https://real.example", lastVal,
+	assert.Equal(t, "ANTHROPIC_MODEL=file-model", lastVal,
 		"the agent env file must win over a wire value")
+}
+
+// TestAttach_RefusesCredentialEndpointRedirect pins the exfiltration path shut:
+// a wire ANTHROPIC_BASE_URL would send a file-provisioned ANTHROPIC_API_KEY to
+// whatever endpoint the orchestrator named. The dedup order alone does NOT
+// cover it — the file wins only for keys the file also sets, and a file with
+// the key but no base URL is an ordinary config — so the key must be refused at
+// the wire.
+func TestAttach_RefusesCredentialEndpointRedirect(t *testing.T) {
+	dir := t.TempDir()
+	envFile := filepath.Join(dir, "agent.env")
+	require.NoError(t, os.WriteFile(envFile, []byte("ANTHROPIC_API_KEY=sk-from-worker\n"), 0600))
+
+	addr, _ := provisionedService(t, func(c *Config) { c.AgentEnvFile = envFile })
+
+	nc := rawDial(t, addr)
+	codec := sockproto.NewCodec(nc)
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeAuth, Token: "t0k"}))
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeHello, ID: "h", ProtoVersion: sockproto.ProtoVersion}))
+	_, err := codec.Recv()
+	require.NoError(t, err)
+	require.NoError(t, codec.Send(&sockproto.Message{
+		Type: sockproto.TypeAttach, ID: "a", Session: "gt-demo-furiosa",
+		Argv: []string{"true"},
+		Env:  map[string]string{"ANTHROPIC_BASE_URL": "https://attacker.example"},
+	}))
+	resp, err := codec.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, sockproto.TypeError, resp.Type, "the attach must be refused outright")
+	assert.Equal(t, "bad_request", resp.Code)
+
+	// And the agent env never carries a wire base URL even if one slipped past.
+	s := &Service{cfg: Config{AgentEnvFile: envFile}}
+	env, err := s.agentEnv(map[string]string{"GT_ROLE": "polecat"})
+	require.NoError(t, err)
+	for _, kv := range env {
+		assert.NotContains(t, kv, "attacker.example")
+	}
+}
+
+// TestShutdown_FencesReattachDuringFinalFlush pins that a graceful shutdown
+// fences the session exactly as teardown does: no launcher may start a fresh
+// agent into the worktree the supervisor is checkpointing.
+func TestShutdown_FencesReattachDuringFinalFlush(t *testing.T) {
+	proxyURL, ca, _ := startProxy(t)
+	addr, svc := startService(t, proxyURL)
+	b := newBackend(t, addr, ca)
+	_, err := b.Provision(context.Background(), polecatSpec())
+	require.NoError(t, err)
+
+	// Shut the session down gracefully on its own connection.
+	nc := rawDial(t, addr)
+	codec := sockproto.NewCodec(nc)
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeAuth, Token: "t0k"}))
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeHello, ID: "h", ProtoVersion: sockproto.ProtoVersion}))
+	_, err = codec.Recv()
+	require.NoError(t, err)
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeShutdown, ID: "s",
+		Session: "gt-demo-furiosa", Reason: "teardown", GraceSeconds: 60}))
+	resp, err := codec.Recv()
+	require.NoError(t, err)
+	require.Equal(t, sockproto.TypeShutdownComplete, resp.Type, "%s: %s", resp.Code, resp.Msg)
+
+	svc.mu.Lock()
+	fenced := svc.sessions["gt-demo-furiosa"].tearingDown
+	svc.mu.Unlock()
+	assert.True(t, fenced, "a shut-down session must refuse further attaches")
 }
