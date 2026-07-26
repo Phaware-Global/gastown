@@ -399,7 +399,10 @@ func (s *Service) bringUp(ctx context.Context, c *connState, open *sockproto.Mes
 		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: id, Session: sess.summary.Session, Code: code, Msg: err.Error()})
 	}
 
-	cn := "gt-" + sess.summary.Rig + "-" + sess.summary.Polecat
+	// One definition of the CN, shared with the orchestrator that signs it: the
+	// two must agree byte for byte or enrollment breaks (or worse, issues a
+	// cert the authz layer reads as a different polecat).
+	cn := worker.PolecatCN(sess.summary.Rig, sess.summary.Polecat)
 	signer := &connSigner{svc: s, c: c, sess: sess, openID: open.ID}
 	id, err := worker.EnsureIdentity(buCtx, idDir, cn, signer)
 	if err != nil {
