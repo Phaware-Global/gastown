@@ -31,6 +31,12 @@ const (
 	TypePong     = "pong"
 	TypeError    = "error"
 
+	// Enrollment (§3.1), spoken only on a listener in enrollment mode.
+	TypeEnroll         = "enroll"          // orch → worker: join token
+	TypeEnrollCSR      = "enroll_csr"      // worker → orch: machine CSR
+	TypeEnrollComplete = "enroll_complete" // orch → worker: machine cert + CAs
+	TypeEnrollAck      = "enroll_ack"      // worker → orch: material persisted
+
 	TypeSessionOpen      = "session_open"
 	TypeCSR              = "csr"
 	TypeCert             = "cert"
@@ -96,6 +102,14 @@ type Message struct {
 	CertPEM  string    `json:"cert_pem,omitempty"`
 	CAPEM    string    `json:"ca_pem,omitempty"`
 	NotAfter time.Time `json:"not_after,omitzero"`
+
+	// enrollment (§3.1). WorkerName is the enrolled machine identity the
+	// orchestrator assigns; ClientCAPEM is the CA that signs the
+	// orchestrator's client cert, which the worker pins for future
+	// connections.
+	JoinToken   string `json:"join_token,omitempty"`
+	WorkerName  string `json:"worker_name,omitempty"`
+	ClientCAPEM string `json:"client_ca_pem,omitempty"`
 
 	// session_ready (§4.2)
 	RelayAddr string `json:"relay_addr,omitempty"`

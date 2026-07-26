@@ -40,10 +40,55 @@ func main() {
 		maxSessions = flag.Int("max-sessions", 1, "concurrent session cap")
 		execModes   = flag.String("exec-modes", "native", "comma-separated supported exec modes (native,container)")
 		docker      = flag.Bool("docker", false, "advertise a usable docker daemon")
+
+		// Enrollment mode (§3.1): `gt-worker-client enroll -listen ... -join-token ... -tls-dir ...`
+		joinToken = flag.String("join-token", "", "enrollment: single-use token the orchestrator must present")
+		tlsDir    = flag.String("tls-dir", "", "enrollment: directory to write machine cert/key + CAs into")
 	)
+	// Accept the `enroll` subcommand in EITHER position — `gt-worker-client
+	// enroll -listen ...` reads naturally, but Go's flag package stops parsing
+	// at the first non-flag argument, so strip a leading subcommand before
+	// parsing rather than silently ignoring every flag after it.
+	enrollMode := false
+	if len(os.Args) > 1 && os.Args[1] == "enroll" {
+		enrollMode = true
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+	}
 	flag.Parse()
+	if flag.Arg(0) == "enroll" {
+		enrollMode = true
+	}
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	// Enrollment mode (§3.1 step 1): a one-shot plaintext listener that
+	// exchanges a machine CSR for a signed cert, then exits. No proxy URL is
+	// needed — no sessions run in this mode.
+	if enrollMode {
+		if *listen == "" || *joinToken == "" || *tlsDir == "" {
+			log.Error("enroll requires -listen, -join-token, and -tls-dir")
+			os.Exit(2)
+		}
+		addr := strings.TrimPrefix(*listen, "tcp://")
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			log.Error("enrollment listen", "err", err)
+			os.Exit(1)
+		}
+		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer cancel()
+		log.Info("waiting for enrollment from the orchestrator", "addr", addr, "tlsDir", *tlsDir)
+		if err := workerclient.Enroll(ctx, ln, workerclient.EnrollConfig{
+			TLSDir:    *tlsDir,
+			JoinToken: *joinToken,
+			Log:       log,
+		}); err != nil {
+			log.Error("enrollment failed", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if *listen == "" || *proxyURL == "" {
 		log.Error("missing required flags: -listen and -proxy-url are required")
 		os.Exit(2)

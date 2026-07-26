@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/sockproto"
+	"github.com/steveyegge/gastown/internal/workerca"
 )
 
 // dialTimeout bounds establishing the control connection.
@@ -83,12 +84,41 @@ func dialTransport(ctx context.Context, s *Settings) (net.Conn, error) {
 	if s.isUnix() {
 		return d.DialContext(ctx, "unix", s.unixPath())
 	}
+	// Refuse a revoked machine before presenting any credential: revocation
+	// (`gt worker revoke`) must cut a worker off immediately, not merely when
+	// its cert eventually expires (§3.1).
+	if err := checkNotRevoked(s.TLS.WorkerName); err != nil {
+		return nil, err
+	}
 	tlsCfg, err := clientTLS(s)
 	if err != nil {
 		return nil, err
 	}
 	td := tls.Dialer{NetDialer: &d, Config: tlsCfg}
 	return td.DialContext(ctx, "tcp", s.Address)
+}
+
+// checkNotRevoked consults the enrolled-worker registry. An unknown worker or
+// an unreadable registry is NOT fatal — a manual-TLS deployment need not use
+// the registry at all — but an explicit revoked entry always is.
+func checkNotRevoked(name string) error {
+	if name == "" {
+		return nil
+	}
+	dir, err := autoTLSDir()
+	if err != nil {
+		return nil //nolint:nilerr // no registry resolvable: not a revocation signal
+	}
+	ca, err := workerca.LoadRegistryFrom(dir)
+	if err != nil {
+		return nil //nolint:nilerr // no/unreadable registry: not a revocation signal
+	}
+	for _, w := range ca.Workers {
+		if w.Name == name && w.Revoked {
+			return fmt.Errorf("socket: worker %q is revoked (re-enroll with `gt worker enroll %s` to restore it)", name, name)
+		}
+	}
+	return nil
 }
 
 // clientTLS builds the mutual-TLS config for a TCP worker (§3): present the
@@ -101,9 +131,11 @@ func clientTLS(s *Settings) (*tls.Config, error) {
 		if err != nil {
 			return nil, err
 		}
-		caFile = filepath.Join(dir, "worker-ca.crt")
-		certFile = filepath.Join(dir, "orchestrator.crt")
-		keyFile = filepath.Join(dir, "orchestrator.key")
+		// Names come from workerca so the enrollment writer and this reader
+		// can never drift apart.
+		caFile = filepath.Join(dir, workerca.WorkerCACertFile)
+		certFile = filepath.Join(dir, workerca.OrchestratorCertFile)
+		keyFile = filepath.Join(dir, workerca.OrchestratorKeyFile)
 	}
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
