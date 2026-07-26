@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -59,6 +61,11 @@ type WorkEnvConfig struct {
 	// §6.1.1 address for the chosen networking mode.
 	RelayPort int
 
+	// ProxyClient is the host path to the CONTAINER-platform gt-proxy-client to
+	// inject as the agent's gt/bd. Empty skips injection (the image is then
+	// expected to carry its own, which nothing currently does).
+	ProxyClient string
+
 	// AgentBinary, when set, is preflighted worker-side after the idle
 	// container starts (§6.3): the resolved agent runtime must be on PATH in
 	// the image, and /bin/sh must exist. Failing preflight stops the
@@ -68,6 +75,9 @@ type WorkEnvConfig struct {
 	// Docker overrides the docker binary (tests). Default "docker".
 	Docker string
 }
+
+// proxyClientName is the injected binary's name inside /opt/gt.
+const proxyClientName = "gt-proxy-client"
 
 const (
 	containerNetworkHost   = "host"
@@ -206,6 +216,25 @@ while :; do sleep 60 & wait $!; done
 		return fmt.Errorf("write idle entrypoint: %w", err)
 	}
 
+	// The agent's `gt` and `bd` inside the container: gt-proxy-client under
+	// those names, from the CONTAINER's platform (a macOS worker's own binary
+	// would not execute here). The links are made HOST-side because /opt/gt is
+	// mounted read-only.
+	if w.cfg.ProxyClient != "" {
+		if err := copyExecutable(w.cfg.ProxyClient, filepath.Join(w.cfg.GTDir, proxyClientName)); err != nil {
+			return fmt.Errorf("inject %s: %w", proxyClientName, err)
+		}
+		for _, name := range []string{"gt", "bd"} {
+			link := filepath.Join(w.cfg.GTDir, name)
+			if err := os.Remove(link); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("replacing injected %s: %w", name, err)
+			}
+			if err := os.Symlink(proxyClientName, link); err != nil {
+				return fmt.Errorf("linking injected %s: %w", name, err)
+			}
+		}
+	}
+
 	// Replace, never reuse: a fresh Prepare means a fresh environment; a
 	// same-name leftover (crashed worker-agent) is stale by definition.
 	_, _ = w.docker(ctx, "rm", "-f", w.name)
@@ -219,6 +248,10 @@ while :; do sleep 60 & wait $!; done
 		"-v", w.cfg.Worktree + ":/work",
 		"-w", "/work",
 		"-e", "GT_PROXY_URL=" + w.ProxyURL(),
+		// The relay a container reaches is the bridge gateway, not loopback, so
+		// gt-proxy-client needs this to use relay mode (it refuses plaintext to
+		// a non-loopback host otherwise, which is the guard working as intended).
+		"-e", "GT_PROXY_RELAY=1",
 	}
 	if w.cfg.ContainerNetwork == containerNetworkHost {
 		args = append(args, "--network", "host")
@@ -255,6 +288,22 @@ func (w *WorkEnv) preflight(ctx context.Context) error {
 	if w.cfg.AgentBinary != "" {
 		if _, err := w.docker(ctx, "exec", w.name, "/bin/sh", "-c", "command -v "+shellQuoteToken(w.cfg.AgentBinary)); err != nil {
 			return fmt.Errorf("image preflight: agent runtime %q not on PATH in image %s (§6.2): %w", w.cfg.AgentBinary, w.cfg.Image, err)
+		}
+	}
+	if w.cfg.ProxyClient != "" {
+		// /opt/gt is read-only, so the CLI is linked into a directory that is
+		// on every reasonable PATH. Done as root because the image's user may
+		// not own /usr/local/bin.
+		//
+		// This is a hard failure rather than a warning: an agent that cannot
+		// run `gt` cannot call `gt done`, take mail, or update a bead — the
+		// session would look alive and accomplish nothing.
+		link := "ln -sf /opt/gt/gt /usr/local/bin/gt && ln -sf /opt/gt/bd /usr/local/bin/bd"
+		if _, err := w.docker(ctx, "exec", "-u", "0", w.name, "/bin/sh", "-c", link); err != nil {
+			return fmt.Errorf("image preflight: could not link gt/bd into /usr/local/bin in image %s (the agent could not reach the control plane): %w", w.cfg.Image, err)
+		}
+		if _, err := w.docker(ctx, "exec", w.name, "/bin/sh", "-c", "command -v gt >/dev/null && command -v bd >/dev/null"); err != nil {
+			return fmt.Errorf("image preflight: gt/bd not on PATH in image %s after linking: %w", w.cfg.Image, err)
 		}
 	}
 	return nil
@@ -304,4 +353,34 @@ func RemoveWorkContainer(ctx context.Context, dockerBin, rig, polecat string) er
 // shellQuoteToken single-quotes a token for the sh -c preflight probe.
 func shellQuoteToken(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// copyExecutable copies through a temp file + rename, so a container never
+// mounts a half-written binary.
+func copyExecutable(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := io.Copy(tmp, in); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0755); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), dst)
 }

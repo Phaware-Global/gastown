@@ -15,7 +15,7 @@ launchd job only.
 |---|---|---|
 | `gt-worker-client` | `make install` on that machine | the worker service itself |
 | `gt`, `bd` | created by `gt worker service install` (symlinks to `gt-proxy-client`) | the agent's control-plane calls; see [Binaries](#binaries) |
-| `gt-proxy-client` | `make install` on that machine | it *is* `gt` and `bd` there |
+| `gt-proxy-client` | `make install` on that machine, then kept current by `push_binaries` | it *is* `gt` and `bd` there |
 | agent CLI (e.g. `claude`) | operator-provisioned | licensing and auth are the operator's, not gastown's |
 | `git` | operator-provisioned | the worktree is cloned through the session relay |
 | Docker | only for `exec_mode: container` | Docker Desktop on macOS |
@@ -151,11 +151,25 @@ rather than pushed to — this orchestrator only has its own platform's binaries
 and installing one the worker cannot execute is worse than leaving it stale.
 Upgrade such a worker in place with `make install` there.
 
-Still not automated: **container mode**. The work container's `gt`/`bd` come from
-the worker's `--gt-dir`, which nothing populates yet, and a container relay binds
-the bridge gateway rather than loopback — so it needs `GT_PROXY_RELAY=1`
-alongside the URL. `gt-proxy-client` accepts that shape; the injection is not
-wired.
+### Container mode
+
+A work container is a **Linux** container even when the worker is a Mac, so its
+`gt`/`bd` cannot be the worker's own binaries. The worker reports what its docker
+daemon runs, the orchestrator pushes that platform's `gt-proxy-client` alongside
+the worker's own, and container preparation injects it into the mounted `/opt/gt`
+as `gt` and `bd`, links them onto `PATH` inside the container, and sets
+`GT_PROXY_RELAY=1` (a container's relay is the bridge gateway, not loopback).
+
+That means the orchestrator needs Linux artifacts even in an all-Mac setup:
+
+```bash
+make dist    # darwin/arm64, darwin/amd64, linux/amd64, linux/arm64
+```
+
+`make install` keeps this machine's own platform current on its own; `make dist`
+is what you run when a worker — or a work container — is a different platform
+from the orchestrator. A platform with no artifacts is refused with a message
+naming it, rather than shipping a binary that cannot execute there.
 
 The agent CLI is different in kind and stays operator-installed: its version,
 licensing and auth are the operator's decision.

@@ -57,11 +57,14 @@ func TestPushBinaries_SkipsDevBuilds(t *testing.T) {
 	}
 }
 
-// TestPushBinaries_RefusesForeignPlatform pins the guard that matters most:
-// this orchestrator has binaries for its OWN platform only, and installing one
-// a worker cannot execute would replace a working `gt` with garbage — strictly
-// worse than being stale.
-func TestPushBinaries_RefusesForeignPlatform(t *testing.T) {
+// TestPushBinaries_ForeignPlatformNeedsItsOwnArtifacts pins what replaced the
+// blanket refusal: a worker on another platform is served from the artifact
+// tree, and when that platform is missing the error says which one to build
+// rather than shipping a binary the worker cannot execute.
+func TestPushBinaries_ForeignPlatformNeedsItsOwnArtifacts(t *testing.T) {
+	root := t.TempDir()
+	defer SetBinarySourceForTest(root)()
+
 	w := newFakeWorker(t)
 	w.gtVersion = "1.0.0"
 	w.os, w.arch = "windows", "386"
@@ -75,8 +78,54 @@ func TestPushBinaries_RefusesForeignPlatform(t *testing.T) {
 	err = b.pushBinaries(context.Background(), c)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "windows/386")
-	assert.Contains(t, err.Error(), runtime.GOOS+"/"+runtime.GOARCH)
-	assert.Empty(t, w.pushed(), "nothing may be sent to a platform we cannot build for")
+	assert.Contains(t, err.Error(), "make dist")
+	assert.Empty(t, w.pushed(), "nothing may be sent until that platform is built")
+
+	// Build that platform's artifacts and it goes through.
+	dir := filepath.Join(root, PlatformDir("windows", "386"))
+	require.NoError(t, os.MkdirAll(dir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "gt-proxy-client"), []byte("win-payload"), 0755))
+
+	c2, err := b.dial(context.Background())
+	require.NoError(t, err)
+	defer c2.close()
+	require.NoError(t, b.pushBinaries(context.Background(), c2))
+	got := w.pushed()
+	require.Contains(t, got, "gt-proxy-client")
+	assert.Equal(t, []byte("win-payload"), got["gt-proxy-client"].data)
+}
+
+// TestPushBinaries_AlsoSendsContainerPlatform pins the case that makes this
+// necessary on a single machine: the work container is a LINUX container, so a
+// macOS worker needs Linux gt/bd for it — tagged, so the worker stores them for
+// injection rather than installing binaries it cannot run.
+func TestPushBinaries_AlsoSendsContainerPlatform(t *testing.T) {
+	root := t.TempDir()
+	native := filepath.Join(root, PlatformDir(runtime.GOOS, runtime.GOARCH))
+	require.NoError(t, os.MkdirAll(native, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(native, "gt-proxy-client"), []byte("native"), 0755))
+	linux := filepath.Join(root, PlatformDir("linux", "arm64"))
+	require.NoError(t, os.MkdirAll(linux, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(linux, "gt-proxy-client"), []byte("linux"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(linux, "gt-worker-client"), []byte("linux-worker"), 0755))
+	defer SetBinarySourceForTest(root)()
+
+	w := newFakeWorker(t)
+	w.gtVersion = "1.0.0"
+	w.containerPlatform = "linux-arm64"
+	b, _ := testBackend(t, w)
+	b.GTVersion = "1.2.3"
+
+	c, err := b.dial(context.Background())
+	require.NoError(t, err)
+	defer c.close()
+	require.NoError(t, b.pushBinaries(context.Background(), c))
+
+	got := w.pushed()
+	assert.Equal(t, []byte("native"), got["gt-proxy-client"].data, "the worker's own binary is untagged")
+	assert.Equal(t, []byte("linux"), got["linux-arm64/gt-proxy-client"].data, "the container's binary is tagged")
+	assert.NotContains(t, got, "linux-arm64/gt-worker-client",
+		"a container never runs the worker service, so it must not be sent one")
 }
 
 // TestPushOne_StreamsAndVerifies pins the transfer itself: chunked, with a
@@ -98,7 +147,7 @@ func TestPushOne_StreamsAndVerifies(t *testing.T) {
 	require.NoError(t, err)
 	defer c.close()
 
-	applied, err := pushOne(context.Background(), c, "gt-proxy-client", path)
+	applied, err := pushOne(context.Background(), c, "gt-proxy-client", path, "")
 	require.NoError(t, err)
 	assert.Equal(t, "installed", applied)
 
@@ -124,7 +173,7 @@ func TestPushOne_ReportsWorkerRefusal(t *testing.T) {
 	require.NoError(t, err)
 	defer c.close()
 
-	_, err = pushOne(context.Background(), c, "gt-proxy-client", path)
+	_, err = pushOne(context.Background(), c, "gt-proxy-client", path, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "integrity")
 }
@@ -141,9 +190,11 @@ func TestPushBinariesTo_ForcesRegardlessOfVersion(t *testing.T) {
 	b, _ := testBackend(t, w)
 	b.GTVersion = "1.2.3"
 
-	src := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(src, "gt-proxy-client"), []byte("payload"), 0755))
-	defer SetBinarySourceForTest(src)()
+	root := t.TempDir()
+	native := filepath.Join(root, PlatformDir(runtime.GOOS, runtime.GOARCH))
+	require.NoError(t, os.MkdirAll(native, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(native, "gt-proxy-client"), []byte("payload"), 0755))
+	defer SetBinarySourceForTest(root)()
 
 	results, err := b.PushBinariesTo(context.Background())
 	require.NoError(t, err)

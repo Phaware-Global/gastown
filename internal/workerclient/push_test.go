@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -18,8 +19,14 @@ import (
 	"github.com/steveyegge/gastown/internal/version"
 )
 
-// pushBinary streams payload to the worker as name and returns the final reply.
+// pushBinary streams payload to the worker as name (own platform).
 func pushBinary(t *testing.T, addr, name string, payload []byte, corruptSum bool) *sockproto.Message {
+	t.Helper()
+	return pushBinaryFor(t, addr, name, "", payload, corruptSum)
+}
+
+// pushBinaryFor streams payload tagged for a platform and returns the reply.
+func pushBinaryFor(t *testing.T, addr, name, platform string, payload []byte, corruptSum bool) *sockproto.Message {
 	t.Helper()
 	nc := rawDial(t, addr)
 	codec := sockproto.NewCodec(nc)
@@ -41,12 +48,12 @@ func pushBinary(t *testing.T, addr, name string, payload []byte, corruptSum bool
 			end = len(payload)
 		}
 		require.NoError(t, codec.Send(&sockproto.Message{
-			Type: sockproto.TypePushBinary, Name: name,
+			Type: sockproto.TypePushBinary, Name: name, Platform: platform,
 			Data: base64.StdEncoding.EncodeToString(payload[off:end]),
 		}))
 	}
 	require.NoError(t, codec.Send(&sockproto.Message{
-		Type: sockproto.TypePushBinary, ID: "p1", Name: name, EOF: true, SHA256: digest,
+		Type: sockproto.TypePushBinary, ID: "p1", Name: name, Platform: platform, EOF: true, SHA256: digest,
 	}))
 	resp, err := codec.Recv()
 	require.NoError(t, err)
@@ -293,7 +300,9 @@ var _ = socket.BackendName
 // a real SocketBackend, a real worker service, a version difference — and the
 // binary lands in the worker's own bin dir, where the gt/bd shims point.
 func TestPushBinaries_EndToEnd(t *testing.T) {
-	src := t.TempDir()
+	root := t.TempDir()
+	src := filepath.Join(root, socket.PlatformDir(runtime.GOOS, runtime.GOARCH))
+	require.NoError(t, os.MkdirAll(src, 0755))
 	payload := make([]byte, sockproto.PushChunkBytes+77) // spans chunks
 	for i := range payload {
 		payload[i] = byte(i % 253)
@@ -303,7 +312,7 @@ func TestPushBinaries_EndToEnd(t *testing.T) {
 	// test shipped only the proxy client, so the gt-worker-client path — the one
 	// that used to kill the connection Provision reuses — was never exercised.
 	require.NoError(t, os.WriteFile(filepath.Join(src, "gt-worker-client"), []byte("newer-worker"), 0755))
-	defer socket.SetBinarySourceForTest(src)()
+	defer socket.SetBinarySourceForTest(root)()
 
 	// Both sides need a REAL version: an unversioned "dev" build opts out of
 	// freshness entirely, which is itself the behavior TestPushBinaries_SkipsDevBuilds
@@ -335,13 +344,15 @@ func TestPushBinaries_EndToEnd(t *testing.T) {
 // cannot be refreshed still runs sessions rather than failing a polecat start
 // someone is waiting on.
 func TestPushBinaries_FailureDoesNotBlockProvision(t *testing.T) {
-	// A source dir whose "binary" cannot be read.
-	src := t.TempDir()
+	// An artifact whose file cannot be read.
+	root := t.TempDir()
+	src := filepath.Join(root, socket.PlatformDir(runtime.GOOS, runtime.GOARCH))
+	require.NoError(t, os.MkdirAll(src, 0755))
 	bad := filepath.Join(src, "gt-proxy-client")
 	require.NoError(t, os.WriteFile(bad, []byte("x"), 0755))
 	require.NoError(t, os.Chmod(bad, 0000))
 	t.Cleanup(func() { _ = os.Chmod(bad, 0755) })
-	defer socket.SetBinarySourceForTest(src)()
+	defer socket.SetBinarySourceForTest(root)()
 
 	restore := version.GTVersion
 	version.GTVersion = "1.0.0-worker"
@@ -354,4 +365,42 @@ func TestPushBinaries_FailureDoesNotBlockProvision(t *testing.T) {
 
 	_, err := b.Provision(context.Background(), polecatSpec())
 	require.NoError(t, err, "a failed refresh must not fail the session")
+}
+
+// TestPush_TaggedPlatformGoesToTheContainerTree pins the separation that makes
+// container support possible: Linux binaries pushed to a macOS worker must NOT
+// land where the worker runs its own — it cannot execute them.
+func TestPush_TaggedPlatformGoesToTheContainerTree(t *testing.T) {
+	proxyURL, _, _ := startProxy(t)
+	addr, svc := startService(t, proxyURL)
+
+	payload := []byte("linux-proxy-client")
+	resp := pushBinaryFor(t, addr, BinProxyClient, "linux-arm64", payload, false)
+	require.Equal(t, sockproto.TypePushBinaryAck, resp.Type, "%s: %s", resp.Code, resp.Msg)
+	assert.Equal(t, "installed", resp.Applied)
+	assert.Equal(t, "linux-arm64", resp.Platform)
+
+	got, err := os.ReadFile(filepath.Join(svc.containerBinDir("linux-arm64"), BinProxyClient))
+	require.NoError(t, err)
+	assert.Equal(t, payload, got)
+
+	_, err = os.Stat(filepath.Join(svc.binDir(), BinProxyClient))
+	assert.True(t, os.IsNotExist(err), "a foreign-platform binary must never become the worker's own")
+}
+
+// TestPush_RefusesBogusPlatformTag pins the second path-joined wire value: the
+// platform tag is validated by shape, exactly like the binary name.
+func TestPush_RefusesBogusPlatformTag(t *testing.T) {
+	proxyURL, _, _ := startProxy(t)
+	addr, svc := startService(t, proxyURL)
+
+	for _, p := range []string{"../../etc", "linux-arm64/../../..", "LINUX-ARM64", "linux_arm64", "linux-"} {
+		resp := pushBinaryFor(t, addr, BinProxyClient, p, []byte("x"), false)
+		require.Equal(t, sockproto.TypeError, resp.Type, "platform %q must be refused", p)
+		assert.Equal(t, "bad_request", resp.Code)
+	}
+	entries, err := os.ReadDir(filepath.Join(svc.cfg.StateDir, "container-bin"))
+	if err == nil {
+		assert.Empty(t, entries, "no directory may be created from a refused tag")
+	}
 }

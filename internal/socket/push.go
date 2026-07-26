@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/sockproto"
@@ -30,18 +31,55 @@ var PushableBinaries = []string{"gt-proxy-client", "gt-worker-client"}
 // pushTimeout bounds a full binary transfer.
 const pushTimeout = 10 * time.Minute
 
-// binarySourceFn locates the binaries to push; a var so tests can point it at
-// a fixture dir instead of the test binary's own directory.
-var binarySourceFn = binarySource
+// EnvBinaryDir overrides where per-platform artifacts are read from.
+const EnvBinaryDir = "GT_BINARY_DIR"
 
-// binarySource locates the binaries to push: the ones installed alongside the
-// running gt, so a worker ends up on exactly the build this orchestrator is.
-func binarySource() (string, error) {
+// artifactRootFn locates the per-platform artifact tree; a var so tests can
+// point it at a fixture instead of the running binary's neighbourhood.
+var artifactRootFn = artifactRoot
+
+// artifactRoot is the tree `make dist` writes: <root>/<goos>-<goarch>/<binary>.
+// Derived from the running binary so an orchestrator installed anywhere finds
+// its own artifacts (~/.local/bin/gt → ~/.local/share/gt/binaries).
+func artifactRoot() (string, error) {
+	if dir := os.Getenv(EnvBinaryDir); dir != "" {
+		return dir, nil
+	}
 	self, err := os.Executable()
 	if err != nil {
 		return "", fmt.Errorf("locating this binary: %w", err)
 	}
-	return filepath.Dir(self), nil
+	return filepath.Join(filepath.Dir(self), "..", "share", "gt", "binaries"), nil
+}
+
+// PlatformDir is the artifact subdirectory for a platform.
+func PlatformDir(goos, goarch string) string { return goos + "-" + goarch }
+
+// binariesFor resolves the directory holding the binaries for a platform.
+//
+// A same-platform worker falls back to the orchestrator's own install dir when
+// no artifact tree exists, so a plain `make install` (which also populates the
+// tree) keeps working for the common single-platform case. A DIFFERENT platform
+// has no such fallback: pushing this machine's binaries there is precisely the
+// mistake the os/arch guard existed to prevent.
+func binariesFor(goos, goarch string) (string, error) {
+	root, err := artifactRootFn()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(root, PlatformDir(goos, goarch))
+	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+		return dir, nil
+	}
+	if goos == runtime.GOOS && goarch == runtime.GOARCH {
+		self, err := os.Executable()
+		if err != nil {
+			return "", fmt.Errorf("locating this binary: %w", err)
+		}
+		return filepath.Dir(self), nil
+	}
+	return "", fmt.Errorf("socket: no %s/%s binaries in %s — build them with `make dist` (this orchestrator is %s/%s, so its own binaries cannot run there)",
+		goos, goarch, root, runtime.GOOS, runtime.GOARCH)
 }
 
 // pushBinaries streams the companion binaries to a worker whose version
@@ -71,43 +109,81 @@ func (b *SocketBackend) pushTo(ctx context.Context, c *conn, force bool) ([]Push
 		}
 	}
 
-	// The orchestrator only has binaries for its OWN platform. Pushing a
-	// darwin-arm64 build to a linux worker would replace a working `gt` with an
-	// unexecutable file — worse than being stale — so refuse, and name both
-	// sides so the operator knows what to build.
-	if ack.OS != "" && ack.Arch != "" && (ack.OS != runtime.GOOS || ack.Arch != runtime.GOARCH) {
-		return nil, fmt.Errorf("socket: worker %s is %s/%s but this orchestrator has %s/%s binaries — refusing to push a binary it cannot run (upgrade that worker in place)",
-			ack.WorkerID, ack.OS, ack.Arch, runtime.GOOS, runtime.GOARCH)
+	workerOS, workerArch := ack.OS, ack.Arch
+	if workerOS == "" || workerArch == "" {
+		workerOS, workerArch = runtime.GOOS, runtime.GOARCH
 	}
 
-	dir, err := binarySourceFn()
-	if err != nil {
-		return nil, err
-	}
 	ctx, cancel := context.WithTimeout(ctx, pushTimeout)
 	defer cancel()
 
 	var results []PushResult
+
+	// The worker's own binaries.
+	sent, err := b.pushPlatform(ctx, c, workerOS, workerArch, "")
+	results = append(results, sent...)
+	if err != nil {
+		return results, err
+	}
+
+	// Container mode needs a SECOND platform: the work container is a Linux
+	// container, so a macOS worker cannot inject its own `gt` into one. The
+	// worker reports the platform its docker daemon runs (§4.1), and those
+	// binaries are stored separately for injection — never installed as the
+	// worker's own.
+	if cp := ack.Capabilities.GetContainerPlatform(); cp != "" && cp != PlatformDir(workerOS, workerArch) {
+		cpOS, cpArch, ok := splitPlatform(cp)
+		if !ok {
+			return results, fmt.Errorf("socket: worker reported an unparseable container platform %q", cp)
+		}
+		sent, err := b.pushPlatform(ctx, c, cpOS, cpArch, cp)
+		results = append(results, sent...)
+		if err != nil {
+			return results, err
+		}
+	}
+	return results, nil
+}
+
+// pushPlatform streams every pushable binary for one platform. platform is the
+// wire tag: empty means "the worker's own", anything else is stored for
+// container injection.
+func (b *SocketBackend) pushPlatform(ctx context.Context, c *conn, goos, goarch, platform string) ([]PushResult, error) {
+	dir, err := binariesFor(goos, goarch)
+	if err != nil {
+		return nil, err
+	}
+	var results []PushResult
 	for _, name := range PushableBinaries {
+		if platform != "" && name == "gt-worker-client" {
+			continue // the container never runs the worker service
+		}
 		path := filepath.Join(dir, name)
 		if _, err := os.Stat(path); err != nil {
 			// Not every install has every companion; skip what is not there
 			// rather than fail the whole refresh.
 			continue
 		}
-		applied, err := pushOne(ctx, c, name, path)
+		applied, err := pushOne(ctx, c, name, path, platform)
 		if err != nil {
-			return results, fmt.Errorf("socket: pushing %s: %w", name, err)
+			return results, fmt.Errorf("socket: pushing %s (%s/%s): %w", name, goos, goarch, err)
 		}
-		results = append(results, PushResult{Name: name, Applied: applied})
+		results = append(results, PushResult{Name: name, Platform: PlatformDir(goos, goarch), Applied: applied})
 	}
 	return results, nil
 }
 
+// splitPlatform parses a "<goos>-<goarch>" tag.
+func splitPlatform(p string) (goos, goarch string, ok bool) {
+	goos, goarch, ok = strings.Cut(p, "-")
+	return goos, goarch, ok && goos != "" && goarch != ""
+}
+
 // PushResult reports what happened to one binary on the worker.
 type PushResult struct {
-	Name    string `json:"name"`
-	Applied string `json:"applied"` // "installed" | "staged"
+	Name     string `json:"name"`
+	Platform string `json:"platform"`
+	Applied  string `json:"applied"` // "installed" | "staged"
 }
 
 // PushBinariesTo refreshes a worker on demand — the operator path. Unlike the
@@ -125,7 +201,7 @@ func (b *SocketBackend) PushBinariesTo(ctx context.Context) ([]PushResult, error
 
 // pushOne streams a single binary and returns how the worker applied it
 // ("installed" or "staged").
-func pushOne(ctx context.Context, c *conn, name, path string) (string, error) {
+func pushOne(ctx context.Context, c *conn, name, path, platform string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -153,9 +229,10 @@ func pushOne(ctx context.Context, c *conn, name, path string) (string, error) {
 		}
 
 		msg := &sockproto.Message{
-			Type: sockproto.TypePushBinary,
-			Name: name,
-			Data: base64.StdEncoding.EncodeToString(buf[:n]),
+			Type:     sockproto.TypePushBinary,
+			Name:     name,
+			Platform: platform,
+			Data:     base64.StdEncoding.EncodeToString(buf[:n]),
 		}
 		if atEOF {
 			msg.ID = "push-" + name
@@ -181,11 +258,11 @@ func pushOne(ctx context.Context, c *conn, name, path string) (string, error) {
 	}
 }
 
-// SetBinarySourceForTest overrides where pushable binaries are read from, so an
-// end-to-end test can drive a real transfer without writing into the directory
-// the test binary happens to live in. Returns a restore func.
-func SetBinarySourceForTest(dir string) func() {
-	prev := binarySourceFn
-	binarySourceFn = func() (string, error) { return dir, nil }
-	return func() { binarySourceFn = prev }
+// SetBinarySourceForTest overrides the artifact ROOT, so an end-to-end test can
+// drive a real transfer without writing into the directory the test binary
+// happens to live in. Returns a restore func.
+func SetBinarySourceForTest(root string) func() {
+	prev := artifactRootFn
+	artifactRootFn = func() (string, error) { return root, nil }
+	return func() { artifactRootFn = prev }
 }

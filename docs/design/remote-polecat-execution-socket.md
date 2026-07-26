@@ -160,7 +160,7 @@ nonce); responses echo it. Errors: `{"type":"error","id":…,"code":…,"msg":�
 | Message | Direction | Payload | Purpose |
 |---|---|---|---|
 | `hello` | orch → worker | `proto_version`, `gt_version`, `orchestrator_id` | open/resume a connection |
-| `hello_ack` | worker → orch | `proto_version`, `gt_version`, `worker_id`, `os`, `arch`, `capabilities` (`docker: bool`, `exec_modes: []`), `sessions: [<session summaries>]` | capability + state report; `gt_version` is what the freshness check compares |
+| `hello_ack` | worker → orch | `proto_version`, `gt_version`, `worker_id`, `os`, `arch`, `capabilities` (`docker: bool`, `exec_modes: []`, `container_platform`), `sessions: [<session summaries>]` | capability + state report; `gt_version` is what the freshness check compares, `container_platform` is what its docker daemon runs |
 | `discover` | orch → worker | optional `rig`, `polecat` filters | list sessions by identity (backs `Discover`) |
 | `sessions` | worker → orch | `[ {session, rig, polecat, state, started_at} ]` | reply to `discover` |
 | `push_binaries` | orch → worker | streamed chunks (`name`, `sha256`, base64 `data`, `eof`) | update `gt`/`bd`/proxy-client to match the orchestrator release (core §6.1) |
@@ -188,9 +188,20 @@ installed, writes through a staging file, and installs by rename — a half-writ
   mid-bringup, which is the same event seen from the other side. Nothing upstream
   retries a provision, so without this the refresh would not be invisible: a
   polecat start that happened to race an upgrade would fail once.
-- An **os/arch mismatch is refused**, not attempted: the orchestrator only has
-  binaries for its own platform, and installing one the worker cannot execute is
-  strictly worse than leaving it stale.
+- Binaries are served **per platform** from the tree `make dist` builds
+  (`<root>/<goos>-<goarch>/`), selected by the worker's reported `os`/`arch`.
+  The two pushables are pure Go and cross-compile with `CGO_ENABLED=0`, so a
+  macOS orchestrator can keep a Linux worker current. A platform with no
+  artifacts is **refused**, naming it — installing a binary the worker cannot
+  execute is strictly worse than leaving it stale. A same-platform worker falls
+  back to the orchestrator's own install dir, so the single-platform case works
+  with no extra step.
+- A push may carry a `platform` tag, and then it is **for the work container,
+  not the worker**: the container is a Linux container even on a macOS worker,
+  so its `gt`/`bd` are a different build from the ones the worker runs. Tagged
+  binaries are stored separately and never installed as the worker's own. The
+  tag is validated by shape (`<goos>-<goarch>`), like the binary name, because
+  it too is joined to a path.
 - Either side reporting version `dev` (an unversioned build) opts out, rather
   than pushing on every provision forever.
 - `Provision` pushes best-effort and logs failures — `proto_version`, not

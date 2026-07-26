@@ -275,3 +275,64 @@ func TestRemoveWorkContainer(t *testing.T) {
 	assert.Equal(t, "rm -f gt-work-MyRig-furiosa", calls[0])
 	assert.Equal(t, "gt-work-MyRig-furiosa", WorkContainerName("MyRig", "furiosa"))
 }
+
+// TestWorkEnvPrepare_InjectsGtAndBd pins how a containerized agent reaches the
+// control plane: gt-proxy-client from the CONTAINER's platform, mounted at
+// /opt/gt as `gt` and `bd`, then linked onto PATH inside the container. Without
+// it the agent runs but cannot call `gt done`, take mail, or update a bead —
+// a session that looks alive and accomplishes nothing.
+func TestWorkEnvPrepare_InjectsGtAndBd(t *testing.T) {
+	docker, logFile, _ := fakeDocker(t)
+	cfg := testWorkEnvConfig(t, docker)
+
+	// A stand-in for the Linux gt-proxy-client the orchestrator pushed.
+	client := filepath.Join(t.TempDir(), "gt-proxy-client")
+	require.NoError(t, os.WriteFile(client, []byte("linux-proxy-client"), 0755))
+	cfg.ProxyClient = client
+
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+	require.NoError(t, w.Prepare(context.Background()))
+
+	// The binary is copied (not linked) into the mounted dir, since the
+	// container cannot follow a host symlink out of the mount.
+	got, err := os.ReadFile(filepath.Join(cfg.GTDir, "gt-proxy-client"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("linux-proxy-client"), got)
+	fi, err := os.Stat(filepath.Join(cfg.GTDir, "gt-proxy-client"))
+	require.NoError(t, err)
+	assert.NotZero(t, fi.Mode()&0111, "the container must be able to execute it")
+
+	for _, name := range []string{"gt", "bd"} {
+		target, err := os.Readlink(filepath.Join(cfg.GTDir, name))
+		require.NoError(t, err, "%s must be a symlink", name)
+		// Relative: the link is resolved INSIDE the container, where the host
+		// path does not exist.
+		assert.Equal(t, "gt-proxy-client", target)
+	}
+
+	calls := dockerCalls(t, logFile)
+	joined := strings.Join(calls, "\n")
+	// The relay a container reaches is the bridge gateway, so relay mode has to
+	// be stated — gt-proxy-client refuses plaintext to a non-loopback host.
+	assert.Contains(t, joined, "-e GT_PROXY_RELAY=1")
+	// Linked as root: the image's user may not own /usr/local/bin, and
+	// /opt/gt is read-only so it cannot be done from inside the mount.
+	assert.Contains(t, joined, "exec -u 0 gt-work-MyRig-furiosa /bin/sh -c ln -sf /opt/gt/gt /usr/local/bin/gt")
+	assert.Contains(t, joined, "command -v gt")
+}
+
+// TestWorkEnvPrepare_NoInjectionWithoutAClient pins that a worker which has not
+// yet been pushed container binaries still brings the container up — the next
+// provision pushes them, and failing here would strand the session instead.
+func TestWorkEnvPrepare_NoInjectionWithoutAClient(t *testing.T) {
+	docker, logFile, _ := fakeDocker(t)
+	cfg := testWorkEnvConfig(t, docker) // ProxyClient empty
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+	require.NoError(t, w.Prepare(context.Background()))
+
+	_, err = os.Stat(filepath.Join(cfg.GTDir, "gt"))
+	assert.True(t, os.IsNotExist(err))
+	assert.NotContains(t, strings.Join(dockerCalls(t, logFile), "\n"), "/usr/local/bin/gt")
+}

@@ -114,6 +114,10 @@ type Service struct {
 	// rename out of order and strand a stale snapshot.
 	persistMu sync.Mutex
 
+	// containerPlatformCache memoizes the docker daemon's platform; it cannot
+	// change without the daemon restarting. Guarded by mu.
+	containerPlatformCache string
+
 	// restarting is set while a staged worker binary is being applied: the
 	// process is about to exit for the supervisor, so no new session may start
 	// and be abandoned mid-bringup. Guarded by mu.
@@ -334,6 +338,9 @@ func (s *Service) handle(ctx context.Context, nc net.Conn) {
 					Docker:      s.cfg.Docker,
 					ExecModes:   s.cfg.ExecModes,
 					MaxSessions: s.cfg.MaxSessions,
+					// The work container is a Linux container even here, so the
+					// orchestrator must know which binaries to send for it.
+					ContainerPlatform: s.containerPlatform(),
 				},
 				Sessions: s.summaries(),
 			})
@@ -619,15 +626,21 @@ func (s *Service) bringUp(ctx context.Context, c *connState, open *sockproto.Mes
 		_, portStr, _ := net.SplitHostPort(relayAddr.String())
 		port := 0
 		fmt.Sscanf(portStr, "%d", &port)
+		gtDir, proxyClient, err := s.containerInject()
+		if err != nil {
+			fail(replyID, "inject", err)
+			return
+		}
 		we, err := worker.NewWorkEnv(worker.WorkEnvConfig{
-			Rig:       sess.summary.Rig,
-			Polecat:   sess.summary.Polecat,
-			Session:   sess.summary.Session,
-			Image:     open.Image,
-			Worktree:  worktree,
-			GTDir:     s.cfg.GTDir,
-			Sandboxed: open.NetworkMode == "sandboxed",
-			RelayPort: port,
+			Rig:         sess.summary.Rig,
+			Polecat:     sess.summary.Polecat,
+			Session:     sess.summary.Session,
+			Image:       open.Image,
+			Worktree:    worktree,
+			GTDir:       gtDir,
+			ProxyClient: proxyClient,
+			Sandboxed:   open.NetworkMode == "sandboxed",
+			RelayPort:   port,
 		})
 		if err == nil {
 			s.mu.Lock()
