@@ -160,11 +160,43 @@ nonce); responses echo it. Errors: `{"type":"error","id":…,"code":…,"msg":�
 | Message | Direction | Payload | Purpose |
 |---|---|---|---|
 | `hello` | orch → worker | `proto_version`, `gt_version`, `orchestrator_id` | open/resume a connection |
-| `hello_ack` | worker → orch | `proto_version`, `worker_id`, `os`, `arch`, `capabilities` (`docker: bool`, `exec_modes: []`), `sessions: [<session summaries>]` | capability + state report |
+| `hello_ack` | worker → orch | `proto_version`, `gt_version`, `worker_id`, `os`, `arch`, `capabilities` (`docker: bool`, `exec_modes: []`), `sessions: [<session summaries>]` | capability + state report; `gt_version` is what the freshness check compares |
 | `discover` | orch → worker | optional `rig`, `polecat` filters | list sessions by identity (backs `Discover`) |
 | `sessions` | worker → orch | `[ {session, rig, polecat, state, started_at} ]` | reply to `discover` |
 | `push_binaries` | orch → worker | streamed chunks (`name`, `sha256`, base64 `data`, `eof`) | update `gt`/`bd`/proxy-client to match the orchestrator release (core §6.1) |
+| `push_binaries_ack` | worker → orch | `name`, `applied` (`installed` \| `staged`) | reply to the terminal chunk |
 | `ping` / `pong` | both | — | keepalive; feeds the worker watchdog (§7) |
+
+**Binary freshness rules.** `name` is an allowlist (`gt-proxy-client`,
+`gt-worker-client`), never a path: it arrives from the wire and is joined to a
+directory. The worker verifies the whole-file `sha256` **before** anything is
+installed, writes through a staging file, and installs by rename — a half-written
+`gt` on a worker is an agent that cannot reach the control plane.
+
+- The worker runs out of its **own bin dir** (`<state-dir>/bin`), and `gt`/`bd`
+  are relative symlinks to `gt-proxy-client` there. A push therefore updates the
+  agent's CLI by replacing one file, and needs no write access to a system path.
+- `gt-worker-client` is the running service: applying it means exiting for the
+  supervisor, so a push **always stages** it — never applies inline. The
+  orchestrator is still holding that connection (Provision reuses it for
+  `session_open`), so exiting there would kill the ack and fail the very
+  provision the refresh is meant to be invisible to. It is applied at a
+  genuinely idle moment instead: a teardown that empties the worker, or a
+  control connection closing with nothing live. While an apply is in flight the
+  worker refuses `session_open` with `restarting`, and **`Provision` retries it**
+  (bounded, inside the caller's deadline) — along with a connection that dies
+  mid-bringup, which is the same event seen from the other side. Nothing upstream
+  retries a provision, so without this the refresh would not be invisible: a
+  polecat start that happened to race an upgrade would fail once.
+- An **os/arch mismatch is refused**, not attempted: the orchestrator only has
+  binaries for its own platform, and installing one the worker cannot execute is
+  strictly worse than leaving it stale.
+- Either side reporting version `dev` (an unversioned build) opts out, rather
+  than pushing on every provision forever.
+- `Provision` pushes best-effort and logs failures — `proto_version`, not
+  `gt_version`, is the compatibility gate, so a version bump must never fail a
+  polecat start. `gt worker push-binaries <rig>` is the operator path and does
+  report errors.
 
 ### 4.2 Session lifecycle messages
 
@@ -435,7 +467,8 @@ internals in a service + protocol shell.
 3. Exec streaming: `gt-worker-attach`, the §4.3 framing, `WrapCommand`;
    worker-side preflight reporting.
 4. Lifecycle completion: `shutdown`/`teardown`, checkpoint loop + local spool,
-   watchdog + orphaned-session reaping, `push_binaries` freshness.
+   watchdog + orphaned-session reaping. (`push_binaries` freshness landed with
+   the worker-deployment work — §4.1.)
 5. Egress modes (§9) and macOS (launchd) worker support.
 
 ## 12. Decisions (socket)

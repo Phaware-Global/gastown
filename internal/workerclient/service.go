@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log/slog"
 	"net"
@@ -32,6 +33,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/sockproto"
+	"github.com/steveyegge/gastown/internal/version"
 	"github.com/steveyegge/gastown/internal/worker"
 )
 
@@ -64,6 +66,12 @@ type Config struct {
 	// agent-auth contract (core §7.1). Injected into the agent process
 	// worker-side; never transmitted over the socket.
 	AgentEnvFile string
+
+	// RestartHook replaces the process exit that applies a pushed worker
+	// binary. nil means os.Exit(0) — the supervisor (launchd KeepAlive,
+	// systemd Restart) brings the new binary up. Tests set it so a test binary
+	// does not exit.
+	RestartHook func()
 
 	Log *slog.Logger
 }
@@ -106,6 +114,15 @@ type Service struct {
 	// rename out of order and strand a stale snapshot.
 	persistMu sync.Mutex
 
+	// restarting is set while a staged worker binary is being applied: the
+	// process is about to exit for the supervisor, so no new session may start
+	// and be abandoned mid-bringup. Guarded by mu.
+	restarting bool
+
+	// restartHook, when set, replaces the process exit that applies a pushed
+	// worker binary — a test seam, since a test binary must not exit.
+	restartHook func()
+
 	// orphanHook, when set, is called at the very top of orphanSession before
 	// it takes any lock — a test seam for driving the watchdog-vs-teardown
 	// race deterministically. nil in production.
@@ -134,11 +151,16 @@ func New(cfg Config) (*Service, error) {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
+	if cfg.RestartHook == nil {
+		// Default: exit and let the supervisor restart us on the new binary.
+		cfg.RestartHook = func() { os.Exit(0) }
+	}
 	s := &Service{
-		cfg:      cfg,
-		log:      cfg.Log,
-		sessions: map[string]*session{},
-		orphans:  map[string]sockproto.SessionSummary{},
+		cfg:         cfg,
+		log:         cfg.Log,
+		restartHook: cfg.RestartHook,
+		sessions:    map[string]*session{},
+		orphans:     map[string]sockproto.SessionSummary{},
 	}
 	s.loadPersisted()
 	return s, nil
@@ -176,6 +198,12 @@ type connState struct {
 	// stopped draining, a dead peer), every later write short-circuits instead
 	// of burning another frameWriteTimeout. Guarded by sendMu.
 	writeFailed bool
+
+	// push is the in-flight push_binaries transfer on THIS connection, so two
+	// orchestrators (or a retry after a drop) cannot interleave chunks into one
+	// file. Touched only from the connection's own read loop.
+	push     *pushState
+	pushHash hash.Hash
 }
 
 func (c *connState) send(m *sockproto.Message) error {
@@ -246,6 +274,21 @@ func (s *Service) handle(ctx context.Context, nc net.Conn) {
 	connCtx, connCancel := context.WithCancel(ctx)
 	defer connCancel()
 	c := &connState{codec: sockproto.NewCodec(nc), nc: nc}
+	// A dropped connection mid-push leaves a .part file; drop it rather than
+	// leave staging to grow with every retry.
+	//
+	// Connection close is also the moment a staged worker binary can be
+	// applied: the orchestrator is no longer holding this connection, so
+	// exiting for the supervisor costs nothing. (A teardown that empties the
+	// worker is the other trigger.) Without this, a worker that is idle the
+	// whole time — the operator `gt worker push-binaries` case — would sit on a
+	// staged upgrade until its next session happened to end.
+	defer func() {
+		if c.push != nil {
+			c.push.abort()
+		}
+		s.applyPendingIfIdle()
+	}()
 
 	authed := s.cfg.Token == ""
 	helloed := false
@@ -280,9 +323,13 @@ func (s *Service) handle(ctx context.Context, nc net.Conn) {
 			_ = c.send(&sockproto.Message{
 				Type:         sockproto.TypeHelloAck,
 				ProtoVersion: sockproto.ProtoVersion,
-				WorkerID:     s.cfg.WorkerID,
-				OS:           runtime.GOOS,
-				Arch:         runtime.GOARCH,
+				// The orchestrator compares this against its own to decide
+				// whether to push binaries (§4.1). Without it there is nothing
+				// to compare, and a worker drifts silently.
+				GTVersion: version.GTVersion,
+				WorkerID:  s.cfg.WorkerID,
+				OS:        runtime.GOOS,
+				Arch:      runtime.GOARCH,
 				Capabilities: &sockproto.Capabilities{
 					Docker:      s.cfg.Docker,
 					ExecModes:   s.cfg.ExecModes,
@@ -294,6 +341,8 @@ func (s *Service) handle(ctx context.Context, nc net.Conn) {
 			_ = c.send(&sockproto.Message{Type: sockproto.TypePong, ID: m.ID})
 		case sockproto.TypeDiscover:
 			_ = c.send(&sockproto.Message{Type: sockproto.TypeSessions, ID: m.ID, Sessions: s.filtered(m.Rig, m.Polecat)})
+		case sockproto.TypePushBinary:
+			s.handlePushBinary(c, m)
 		case sockproto.TypeSessionOpen:
 			s.handleSessionOpen(connCtx, c, m)
 		case sockproto.TypeCert:
@@ -338,6 +387,16 @@ func (s *Service) handleSessionOpen(ctx context.Context, c *connState, m *sockpr
 	}
 
 	s.mu.Lock()
+	if s.restarting {
+		// A staged worker binary is being applied: this process is about to
+		// exit for its supervisor. Accepting a session now would abandon it
+		// mid-bringup, so refuse with a code the orchestrator can retry against
+		// the restarted worker.
+		s.mu.Unlock()
+		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session,
+			Code: "restarting", Msg: "worker is restarting onto a new binary; retry"})
+		return
+	}
 	if _, live := s.sessions[m.Session]; live {
 		s.mu.Unlock()
 		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "exists", Msg: "session already live"})
@@ -750,6 +809,11 @@ func (s *Service) handleTeardown(c *connState, m *sockproto.Message) {
 // relay stopped, worktree (optionally) removed, identity shredded, state
 // dropped. It first ABORTS any in-flight bringup and waits for it to finish,
 // so it never races bringUp's field writes or cleans up mid-build.
+// applyPendingIfIdle is called after a session ends: a worker binary staged
+// while work was in flight lands at the first safe moment, rather than waiting
+// for the orchestrator to push again.
+func (s *Service) applyPendingIfIdle() { s.ApplyPendingWorkerClient() }
+
 func (s *Service) teardownSession(sess *session, cleanWorktree bool) {
 	// tearingDown suppresses a racing watchdog orphanSession insert; buildCancel
 	// aborts an in-flight bringup so we never race its field writes.
@@ -828,6 +892,8 @@ func (s *Service) teardownSession(sess *session, cleanWorktree bool) {
 	delete(s.orphans, sess.summary.Session)
 	s.mu.Unlock()
 	s.persist()
+	// A worker binary staged while this session was running can land now.
+	s.applyPendingIfIdle()
 }
 
 // orphanSession moves a self-stopped session (watchdog) into the orphan set.

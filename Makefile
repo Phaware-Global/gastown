@@ -19,7 +19,8 @@ LDFLAGS := -s -w \
            -X github.com/steveyegge/gastown/internal/cmd.Version=$(VERSION) \
            -X github.com/steveyegge/gastown/internal/cmd.Commit=$(COMMIT) \
            -X github.com/steveyegge/gastown/internal/cmd.BuildTime=$(BUILD_TIME) \
-           -X github.com/steveyegge/gastown/internal/cmd.BuiltProperly=1
+           -X github.com/steveyegge/gastown/internal/cmd.BuiltProperly=1 \
+           -X github.com/steveyegge/gastown/internal/version.GTVersion=$(VERSION)
 
 # ICU4C detection for macOS (required by go-icu-regex transitive dependency).
 # Homebrew installs icu4c as a keg-only package, so headers/libs aren't on the

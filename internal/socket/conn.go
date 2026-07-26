@@ -199,6 +199,19 @@ func (c *conn) request(ctx context.Context, req *sockproto.Message) (*sockproto.
 	}
 }
 
+// sendOnly writes a message that expects no reply — push_binaries chunks,
+// which stream without a round trip per chunk. It takes the same lock as
+// request so a chunk can never interleave with another exchange.
+func (c *conn) sendOnly(ctx context.Context, m *sockproto.Message) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if dl, ok := ctx.Deadline(); ok {
+		_ = c.nc.SetWriteDeadline(dl)
+		defer c.nc.SetWriteDeadline(time.Time{})
+	}
+	return c.codec.Send(m)
+}
+
 // close shuts the control connection.
 func (c *conn) close() error {
 	c.mu.Lock()

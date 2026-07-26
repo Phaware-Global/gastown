@@ -43,6 +43,12 @@ const (
 	TypeAttach    = "attach"
 	TypeAttachAck = "attach_ack"
 
+	// binary freshness (§4.1): the orchestrator streams the companion binaries
+	// a worker runs — gt-proxy-client (which IS `gt` and `bd` there) and
+	// gt-worker-client itself — when the worker reports a different gt_version.
+	TypePushBinary    = "push_binaries"
+	TypePushBinaryAck = "push_binaries_ack"
+
 	TypeSessionOpen      = "session_open"
 	TypeCSR              = "csr"
 	TypeCert             = "cert"
@@ -103,6 +109,14 @@ type Message struct {
 	MaxRuntime         string            `json:"max_runtime,omitempty"`
 	Env                map[string]string `json:"env,omitempty"` // NON-secret only (core §7.4)
 
+	// push_binaries (§4.1). Chunks carry Data; the final chunk sets EOF and the
+	// whole-file SHA256, which the worker verifies before anything is installed.
+	Name    string `json:"name,omitempty"`
+	SHA256  string `json:"sha256,omitempty"`
+	Data    string `json:"data,omitempty"` // base64 chunk
+	EOF     bool   `json:"eof,omitempty"`
+	Applied string `json:"applied,omitempty"` // ack: "installed" | "staged"
+
 	// csr / cert (§4.2; core §7.2 over the socket)
 	CSRPEM   string    `json:"csr_pem,omitempty"`
 	CertPEM  string    `json:"cert_pem,omitempty"`
@@ -142,6 +156,12 @@ type Message struct {
 // session env maps stay small. 1 MiB is far above any legitimate message and
 // keeps a misbehaving peer from ballooning memory.
 const maxLine = 1 << 20
+
+// PushChunkBytes is the RAW payload per push_binaries chunk. Base64 inflates by
+// 4/3, so this leaves ample room under maxLine once the JSON envelope is added —
+// a chunk that overran the line limit would fail mid-transfer, after the worker
+// had already written most of a binary.
+const PushChunkBytes = 512 << 10
 
 // Codec reads and writes newline-delimited JSON messages on a connection.
 // Not safe for concurrent use on the same side (the control protocol is
