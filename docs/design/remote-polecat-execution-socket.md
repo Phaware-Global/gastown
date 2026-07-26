@@ -226,6 +226,17 @@ credential-shaped), enforced identically on both sides. The worker re-validates
 rather than trusting the launcher's filter: in native mode the agent runs on the
 worker host, where a wire `LD_PRELOAD` or `PATH` would be code execution.
 
+**Endpoints never cross the wire.** Any key naming a destination (`*_URL`,
+`*_HOST`, `*_ADDR`, `*_PORT`, `*_ENDPOINT`, …) is refused by shape, so a var
+added later cannot quietly reopen the class. An endpoint is a worker-local fact:
+the agent's control-plane URL is the worker's **own session relay** — the only
+endpoint carrying that polecat's identity to the proxy — so `gt-worker-client`
+sets `GT_PROXY_URL` itself from the relay it bound (in container mode the
+container already has it from creation). An orchestrator-supplied endpoint would
+be at best unreachable from the worker and at worst a redirect: a wire
+`GT_PROXY_URL` points the agent's `gt`/`bd` RPC at an attacker, whose injected
+responses arrive as mail and beads — prompt injection with extra steps.
+
 Agent credentials come from the worker's own agent env file (§8), never from the
 orchestrator — **and so does the endpoint a credential is sent to**.
 `ANTHROPIC_BASE_URL` is barred from the wire: it is not itself a secret, but a
