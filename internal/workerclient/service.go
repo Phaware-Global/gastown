@@ -114,6 +114,11 @@ type Service struct {
 	// rename out of order and strand a stale snapshot.
 	persistMu sync.Mutex
 
+	// restarting is set while a staged worker binary is being applied: the
+	// process is about to exit for the supervisor, so no new session may start
+	// and be abandoned mid-bringup. Guarded by mu.
+	restarting bool
+
 	// restartHook, when set, replaces the process exit that applies a pushed
 	// worker binary — a test seam, since a test binary must not exit.
 	restartHook func()
@@ -271,10 +276,18 @@ func (s *Service) handle(ctx context.Context, nc net.Conn) {
 	c := &connState{codec: sockproto.NewCodec(nc), nc: nc}
 	// A dropped connection mid-push leaves a .part file; drop it rather than
 	// leave staging to grow with every retry.
+	//
+	// Connection close is also the moment a staged worker binary can be
+	// applied: the orchestrator is no longer holding this connection, so
+	// exiting for the supervisor costs nothing. (A teardown that empties the
+	// worker is the other trigger.) Without this, a worker that is idle the
+	// whole time — the operator `gt worker push-binaries` case — would sit on a
+	// staged upgrade until its next session happened to end.
 	defer func() {
 		if c.push != nil {
 			c.push.abort()
 		}
+		s.applyPendingIfIdle()
 	}()
 
 	authed := s.cfg.Token == ""
@@ -374,6 +387,16 @@ func (s *Service) handleSessionOpen(ctx context.Context, c *connState, m *sockpr
 	}
 
 	s.mu.Lock()
+	if s.restarting {
+		// A staged worker binary is being applied: this process is about to
+		// exit for its supervisor. Accepting a session now would abandon it
+		// mid-bringup, so refuse with a code the orchestrator can retry against
+		// the restarted worker.
+		s.mu.Unlock()
+		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session,
+			Code: "restarting", Msg: "worker is restarting onto a new binary; retry"})
+		return
+	}
 	if _, live := s.sessions[m.Session]; live {
 		s.mu.Unlock()
 		_ = c.send(&sockproto.Message{Type: sockproto.TypeSessionError, ID: m.ID, Session: m.Session, Code: "exists", Msg: "session already live"})

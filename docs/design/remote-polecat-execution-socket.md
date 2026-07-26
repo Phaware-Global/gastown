@@ -176,9 +176,15 @@ installed, writes through a staging file, and installs by rename — a half-writ
 - The worker runs out of its **own bin dir** (`<state-dir>/bin`), and `gt`/`bd`
   are relative symlinks to `gt-proxy-client` there. A push therefore updates the
   agent's CLI by replacing one file, and needs no write access to a system path.
-- `gt-worker-client` is the running service: applying it needs a restart, and a
-  restart abandons live sessions. It is **staged** while any session is live and
-  applied at the first idle moment; the ack says which happened.
+- `gt-worker-client` is the running service: applying it means exiting for the
+  supervisor, so a push **always stages** it — never applies inline. The
+  orchestrator is still holding that connection (Provision reuses it for
+  `session_open`), so exiting there would kill the ack and fail the very
+  provision the refresh is meant to be invisible to. It is applied at a
+  genuinely idle moment instead: a teardown that empties the worker, or a
+  control connection closing with nothing live. While an apply is in flight the
+  worker refuses `session_open` with a retryable `restarting`, so no session is
+  accepted and then abandoned by the exit.
 - An **os/arch mismatch is refused**, not attempted: the orchestrator only has
   binaries for its own platform, and installing one the worker cannot execute is
   strictly worse than leaving it stale.

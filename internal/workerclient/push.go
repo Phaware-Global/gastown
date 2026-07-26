@@ -177,25 +177,21 @@ func (s *Service) installPushed(name, staged string) (string, error) {
 	}
 
 	if name == BinWorkerClient {
-		// This is the running service. Swapping it does nothing until a
-		// restart, and a restart abandons every live session — the orchestrator
-		// would see them orphaned and re-provision, which is a high price for a
-		// version bump. So: apply only when idle, otherwise keep it staged and
-		// say so, and the next idle moment picks it up.
-		s.mu.Lock()
-		live := len(s.sessions)
-		s.mu.Unlock()
-		if live > 0 {
-			pending := filepath.Join(s.stagingDir(), BinWorkerClient+".pending")
-			if err := os.Rename(staged, pending); err != nil {
-				return "", fmt.Errorf("staging %s: %w", name, err)
-			}
-			return "staged", nil
+		// This is the running service, and applying it means exiting for the
+		// supervisor to restart us. That must NEVER happen on the request path:
+		// the orchestrator is still holding this connection — Provision reuses
+		// it for session_open immediately after the push — so exiting here would
+		// kill the ack, drop the connection, and fail the very provision the
+		// refresh is supposed to be transparent to.
+		//
+		// So a push only ever STAGES this binary. Applying it is a separate,
+		// genuinely-idle event: a teardown that empties the worker, or a control
+		// connection closing with no session live (see applyPendingIfIdle).
+		pending := filepath.Join(s.stagingDir(), BinWorkerClient+".pending")
+		if err := os.Rename(staged, pending); err != nil {
+			return "", fmt.Errorf("staging %s: %w", name, err)
 		}
-		if err := s.applyWorkerClient(staged); err != nil {
-			return "", err
-		}
-		return "installed", nil
+		return "staged", nil
 	}
 
 	if err := os.Rename(staged, filepath.Join(s.binDir(), name)); err != nil {
@@ -208,6 +204,12 @@ func (s *Service) installPushed(name, staged string) (string, error) {
 // (launchd KeepAlive / systemd Restart) brings the new one up; exiting is how a
 // service updates itself without an exec dance that would strand the listener.
 func (s *Service) applyWorkerClient(staged string) error {
+	// The bin dir normally exists (the service installer creates it), but a
+	// staged binary can outlive a state-dir wipe, and failing the apply here
+	// would leave the worker refusing sessions until it restarted.
+	if err := os.MkdirAll(s.binDir(), 0755); err != nil {
+		return fmt.Errorf("creating bin dir: %w", err)
+	}
 	if err := os.Rename(staged, filepath.Join(s.binDir(), BinWorkerClient)); err != nil {
 		return fmt.Errorf("installing %s: %w", BinWorkerClient, err)
 	}
@@ -220,21 +222,34 @@ func (s *Service) applyWorkerClient(staged string) error {
 }
 
 // ApplyPendingWorkerClient installs a previously staged worker binary if the
-// worker is now idle. Called after a teardown drops the session count to zero,
-// so a deferred upgrade lands at the first safe moment rather than waiting for
-// the next push.
+// worker is idle. Called when a teardown empties the worker and when a control
+// connection closes, so a deferred upgrade lands at the first safe moment
+// rather than waiting for the next push.
+//
+// The idle decision and the restart are ONE critical section, via s.restarting:
+// otherwise a session_open on another connection could slip in between and be
+// abandoned mid-bringup by the exit. Once restarting is set, session_open is
+// refused with a retryable error rather than accepted and killed.
 func (s *Service) ApplyPendingWorkerClient() {
 	pending := filepath.Join(s.stagingDir(), BinWorkerClient+".pending")
 	if _, err := os.Stat(pending); err != nil {
 		return
 	}
+
 	s.mu.Lock()
-	live := len(s.sessions)
-	s.mu.Unlock()
-	if live > 0 {
+	if len(s.sessions) > 0 || s.restarting {
+		s.mu.Unlock()
 		return
 	}
+	s.restarting = true
+	s.mu.Unlock()
+
 	if err := s.applyWorkerClient(pending); err != nil {
 		s.log.Warn("applying staged worker binary", "err", err)
+		// The swap failed, so we are not restarting after all: let sessions
+		// through again rather than wedging the worker into refusing forever.
+		s.mu.Lock()
+		s.restarting = false
+		s.mu.Unlock()
 	}
 }

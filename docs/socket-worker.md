@@ -136,9 +136,10 @@ the relay it bound. (`gt-proxy-client` also still supports direct mTLS when
 You do not re-copy binaries after upgrading the orchestrator. The handshake
 carries each side's version, and a worker whose version differs is refreshed
 before the next session opens (§4.1 `push_binaries`): `gt-proxy-client` is
-installed immediately, and `gt-worker-client` — the running service — is staged
-and applied the first time that worker has no live session, because a restart
-would abandon a polecat mid-work.
+installed immediately, and `gt-worker-client` — the running service — is always
+staged, then applied the first time that worker is genuinely idle (a session
+ending, or the orchestrator's connection closing). A restart would abandon a
+polecat mid-work, so the worker never takes one while it is being talked to.
 
 `gt worker push-binaries <rig>` does it on demand. Use it when you want the
 transfer to happen before someone starts a polecat, or when you need to see the

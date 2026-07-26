@@ -114,10 +114,67 @@ func TestPush_RefusesUnknownName(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// TestPush_WorkerClientDeferredWhileBusy pins the upgrade policy: replacing the
-// worker service means a restart, and a restart abandons a live agent. So a busy
-// worker stages the binary and says so; the swap happens at the first idle
-// moment.
+// TestPush_WorkerClientNeverRestartsOnTheRequestPath is the regression test for
+// the bug this file previously hid: applying gt-worker-client means exiting for
+// the supervisor, and doing that inside the push handler killed the ack and the
+// connection — the same connection Provision reuses for session_open, so the
+// refresh failed the provision it was supposed to be invisible to.
+//
+// A push now only ever STAGES this binary, live session or not.
+func TestPush_WorkerClientNeverRestartsOnTheRequestPath(t *testing.T) {
+	restarted := make(chan struct{}, 4)
+	proxyURL, _, _ := startProxy(t)
+	addr, svc := startService(t, proxyURL, func(c *Config) {
+		c.RestartHook = func() { restarted <- struct{}{} }
+	})
+
+	// Idle worker — the case that used to exit mid-request.
+	nc := rawDial(t, addr)
+	codec := sockproto.NewCodec(nc)
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeAuth, Token: "t0k"}))
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeHello, ID: "h", ProtoVersion: sockproto.ProtoVersion}))
+	_, err := codec.Recv()
+	require.NoError(t, err)
+
+	payload := []byte("#!/bin/sh\necho newer-worker\n")
+	sum := sha256.Sum256(payload)
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypePushBinary, Name: BinWorkerClient,
+		Data: base64.StdEncoding.EncodeToString(payload)}))
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypePushBinary, ID: "p1",
+		Name: BinWorkerClient, EOF: true, SHA256: hex.EncodeToString(sum[:])}))
+
+	resp, err := codec.Recv()
+	require.NoError(t, err, "the ack must arrive — the worker must not die mid-request")
+	require.Equal(t, sockproto.TypePushBinaryAck, resp.Type, "%s: %s", resp.Code, resp.Msg)
+	assert.Equal(t, "staged", resp.Applied)
+
+	select {
+	case <-restarted:
+		t.Fatal("the worker restarted while the orchestrator still held the connection")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// The connection is still usable — which is the whole point, since
+	// Provision issues session_open on it next.
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypePing, ID: "ping"}))
+	pong, err := codec.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, sockproto.TypePong, pong.Type)
+
+	// Closing the connection is the safe moment: the upgrade lands there.
+	require.NoError(t, nc.Close())
+	select {
+	case <-restarted:
+	case <-time.After(15 * time.Second):
+		t.Fatal("a staged upgrade never applied after the connection closed")
+	}
+	got, err := os.ReadFile(filepath.Join(svc.binDir(), BinWorkerClient))
+	require.NoError(t, err)
+	assert.Equal(t, payload, got)
+}
+
+// TestPush_WorkerClientDeferredWhileBusy pins that a live session holds the
+// upgrade off entirely — and that ending the session is what releases it.
 func TestPush_WorkerClientDeferredWhileBusy(t *testing.T) {
 	restarted := make(chan struct{}, 4)
 	proxyURL, ca, _ := startProxy(t)
@@ -131,17 +188,18 @@ func TestPush_WorkerClientDeferredWhileBusy(t *testing.T) {
 	payload := []byte("#!/bin/sh\necho newer-worker\n")
 	resp := pushBinary(t, addr, BinWorkerClient, payload, false)
 	require.Equal(t, sockproto.TypePushBinaryAck, resp.Type, "%s: %s", resp.Code, resp.Msg)
-	assert.Equal(t, "staged", resp.Applied, "a live session must not be restarted out from under")
+	assert.Equal(t, "staged", resp.Applied)
 
+	// pushBinary's own connection closed, but a session is live, so nothing
+	// applies: a restart would abandon the agent.
 	select {
 	case <-restarted:
-		t.Fatal("the worker restarted while a session was live")
-	case <-time.After(200 * time.Millisecond):
+		t.Fatal("the worker restarted with a session live")
+	case <-time.After(300 * time.Millisecond):
 	}
 	_, err = os.Stat(filepath.Join(svc.binDir(), BinWorkerClient))
 	assert.True(t, os.IsNotExist(err), "the staged binary must not be live yet")
 
-	// Ending the session is the first safe moment; the upgrade lands there.
 	require.NoError(t, b.Teardown(context.Background(), ep))
 	select {
 	case <-restarted:
@@ -153,25 +211,38 @@ func TestPush_WorkerClientDeferredWhileBusy(t *testing.T) {
 	assert.Equal(t, payload, got)
 }
 
-// TestPush_WorkerClientAppliedWhenIdle pins the other half: with no session to
-// protect, the upgrade applies immediately.
-func TestPush_WorkerClientAppliedWhenIdle(t *testing.T) {
-	restarted := make(chan struct{}, 4)
+// TestPush_RestartingRefusesNewSessions pins the race the idle re-check used to
+// leave open: between deciding "idle" and exiting, a session_open on another
+// connection could be accepted and then abandoned mid-bringup.
+func TestPush_RestartingRefusesNewSessions(t *testing.T) {
 	proxyURL, _, _ := startProxy(t)
 	addr, svc := startService(t, proxyURL, func(c *Config) {
-		c.RestartHook = func() { restarted <- struct{}{} }
+		c.RestartHook = func() {} // hold the process in the restarting state
 	})
 
-	resp := pushBinary(t, addr, BinWorkerClient, []byte("newer"), false)
-	require.Equal(t, sockproto.TypePushBinaryAck, resp.Type)
-	assert.Equal(t, "installed", resp.Applied)
-	select {
-	case <-restarted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("an idle worker must apply the upgrade and hand off to its supervisor")
-	}
-	_, err := os.Stat(filepath.Join(svc.binDir(), BinWorkerClient))
-	assert.NoError(t, err)
+	// Enter the restarting state exactly as an apply does.
+	require.NoError(t, os.MkdirAll(svc.stagingDir(), 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(svc.stagingDir(), BinWorkerClient+".pending"),
+		[]byte("newer"), 0755))
+	svc.ApplyPendingWorkerClient()
+
+	svc.mu.Lock()
+	restarting := svc.restarting
+	svc.mu.Unlock()
+	require.True(t, restarting, "applying a staged binary must mark the worker restarting")
+
+	nc := rawDial(t, addr)
+	codec := sockproto.NewCodec(nc)
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeAuth, Token: "t0k"}))
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeHello, ID: "h", ProtoVersion: sockproto.ProtoVersion}))
+	_, err := codec.Recv()
+	require.NoError(t, err)
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeSessionOpen, ID: "o",
+		Session: "gt-demo-furiosa", Rig: "demo", Polecat: "furiosa", ExecMode: "native"}))
+	resp, err := codec.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, sockproto.TypeSessionError, resp.Type)
+	assert.Equal(t, "restarting", resp.Code, "a session accepted now would be abandoned by the exit")
 }
 
 // TestPush_InterleavedNamesRefused pins that a second file cannot start
@@ -228,6 +299,10 @@ func TestPushBinaries_EndToEnd(t *testing.T) {
 		payload[i] = byte(i % 253)
 	}
 	require.NoError(t, os.WriteFile(filepath.Join(src, "gt-proxy-client"), payload, 0755))
+	// BOTH binaries, as a real orchestrator has: the earlier version of this
+	// test shipped only the proxy client, so the gt-worker-client path — the one
+	// that used to kill the connection Provision reuses — was never exercised.
+	require.NoError(t, os.WriteFile(filepath.Join(src, "gt-worker-client"), []byte("newer-worker"), 0755))
 	defer socket.SetBinarySourceForTest(src)()
 
 	// Both sides need a REAL version: an unversioned "dev" build opts out of
@@ -248,6 +323,11 @@ func TestPushBinaries_EndToEnd(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(svc.binDir(), BinProxyClient))
 	require.NoError(t, err)
 	assert.Equal(t, payload, got, "the agent's gt/bd must be the orchestrator's build")
+
+	// The worker binary is staged, not applied: the session that just came up
+	// must not be restarted out from under.
+	_, err = os.Stat(filepath.Join(svc.stagingDir(), BinWorkerClient+".pending"))
+	assert.NoError(t, err, "gt-worker-client must be staged for the next idle moment")
 }
 
 // TestPushBinaries_FailureDoesNotBlockProvision pins the trade the design makes:
