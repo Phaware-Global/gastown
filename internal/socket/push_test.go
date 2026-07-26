@@ -269,3 +269,53 @@ func TestProvision_DoesNotRetryARealRejection(t *testing.T) {
 	require.Error(t, err)
 	assert.Equal(t, 1, w.sessionOpenAttempts(), "a real rejection must not be retried")
 }
+
+// TestPushBinaries_RefusesAMaliciousWorkerPlatform pins that the ORCHESTRATOR
+// validates what the worker claims before joining it to a local path. The
+// receiver already checks the tag we send it; checking on one side only is how
+// a traversal gets in — here an enrolled-but-compromised worker could walk this
+// machine's filesystem for a file named gt-proxy-client and have it streamed
+// back to it.
+func TestPushBinaries_RefusesAMaliciousWorkerPlatform(t *testing.T) {
+	root := t.TempDir()
+	defer SetBinarySourceForTest(root)()
+
+	t.Run("os/arch", func(t *testing.T) {
+		w := newFakeWorker(t)
+		w.gtVersion = "1.0.0"
+		w.os, w.arch = "../../../../tmp/evil", "x"
+		b, _ := testBackend(t, w)
+		b.GTVersion = "1.2.3"
+
+		c, err := b.dial(context.Background())
+		require.NoError(t, err)
+		defer c.close()
+
+		err = b.pushBinaries(context.Background(), c)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid platform")
+		assert.Empty(t, w.pushed())
+	})
+
+	t.Run("container platform", func(t *testing.T) {
+		w := newFakeWorker(t)
+		w.gtVersion = "1.0.0"
+		w.containerPlatform = "../../../etc-x"
+		b, _ := testBackend(t, w)
+		b.GTVersion = "1.2.3"
+
+		// The worker's own platform is fine, so it gets that far; the container
+		// tag is what must be refused.
+		native := filepath.Join(root, PlatformDir(runtime.GOOS, runtime.GOARCH))
+		require.NoError(t, os.MkdirAll(native, 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(native, "gt-proxy-client"), []byte("ok"), 0755))
+
+		c, err := b.dial(context.Background())
+		require.NoError(t, err)
+		defer c.close()
+
+		err = b.pushBinaries(context.Background(), c)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "container platform")
+	})
+}

@@ -404,3 +404,50 @@ func TestPush_RefusesBogusPlatformTag(t *testing.T) {
 		assert.Empty(t, entries, "no directory may be created from a refused tag")
 	}
 }
+
+// TestContainerInject_SamePlatformUsesTheWorkersOwnClient pins the mainstream
+// container host: a Linux worker running local Linux docker. Its container
+// platform equals its own, so the orchestrator sends no redundant tagged copy —
+// and injection must then use the worker's own gt-proxy-client, which runs
+// unmodified inside that container. Looking only in the container tree made
+// injection silently no-op there, leaving the agent with no gt/bd at all.
+func TestContainerInject_SamePlatformUsesTheWorkersOwnClient(t *testing.T) {
+	proxyURL, _, _ := startProxy(t)
+	_, svc := startService(t, proxyURL, func(c *Config) { c.Docker = true })
+
+	native := sockproto.PlatformTag(runtime.GOOS, runtime.GOARCH)
+	svc.mu.Lock()
+	svc.containerPlatformCache = native // stand in for `docker version`
+	svc.mu.Unlock()
+
+	// Only the worker's OWN binary exists — exactly the same-platform case.
+	require.NoError(t, os.MkdirAll(svc.binDir(), 0755))
+	own := filepath.Join(svc.binDir(), BinProxyClient)
+	require.NoError(t, os.WriteFile(own, []byte("worker-own-client"), 0755))
+
+	_, proxyClient, err := svc.containerInject()
+	require.NoError(t, err)
+	assert.Equal(t, own, proxyClient, "a same-platform container must get the worker's own client")
+}
+
+// TestContainerInject_PrefersTheTaggedContainerBinary pins the cross-platform
+// case: when the container runs a different platform, the tagged copy wins and
+// the worker's own (unexecutable there) is never chosen.
+func TestContainerInject_PrefersTheTaggedContainerBinary(t *testing.T) {
+	proxyURL, _, _ := startProxy(t)
+	_, svc := startService(t, proxyURL, func(c *Config) { c.Docker = true })
+
+	svc.mu.Lock()
+	svc.containerPlatformCache = "linux-arm64"
+	svc.mu.Unlock()
+
+	require.NoError(t, os.MkdirAll(svc.binDir(), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(svc.binDir(), BinProxyClient), []byte("own"), 0755))
+	require.NoError(t, os.MkdirAll(svc.containerBinDir("linux-arm64"), 0755))
+	tagged := filepath.Join(svc.containerBinDir("linux-arm64"), BinProxyClient)
+	require.NoError(t, os.WriteFile(tagged, []byte("linux"), 0755))
+
+	_, proxyClient, err := svc.containerInject()
+	require.NoError(t, err)
+	assert.Equal(t, tagged, proxyClient)
+}

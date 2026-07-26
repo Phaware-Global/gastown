@@ -53,7 +53,7 @@ func artifactRoot() (string, error) {
 }
 
 // PlatformDir is the artifact subdirectory for a platform.
-func PlatformDir(goos, goarch string) string { return goos + "-" + goarch }
+func PlatformDir(goos, goarch string) string { return sockproto.PlatformTag(goos, goarch) }
 
 // binariesFor resolves the directory holding the binaries for a platform.
 //
@@ -112,6 +112,14 @@ func (b *SocketBackend) pushTo(ctx context.Context, c *conn, force bool) ([]Push
 	workerOS, workerArch := ack.OS, ack.Arch
 	if workerOS == "" || workerArch == "" {
 		workerOS, workerArch = runtime.GOOS, runtime.GOARCH
+	}
+	// The worker's platform is ITS claim, and we are about to join it to a path
+	// on THIS machine. The receiver validates the tag we send it the same way;
+	// checking on one side only is how a traversal gets in — here it would let
+	// an enrolled-but-compromised worker walk the orchestrator's filesystem
+	// looking for a file named gt-proxy-client and have it streamed back.
+	if !sockproto.ValidPlatformTag(PlatformDir(workerOS, workerArch)) {
+		return nil, fmt.Errorf("socket: worker reported an invalid platform %q/%q", workerOS, workerArch)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, pushTimeout)
@@ -173,10 +181,14 @@ func (b *SocketBackend) pushPlatform(ctx context.Context, c *conn, goos, goarch,
 	return results, nil
 }
 
-// splitPlatform parses a "<goos>-<goarch>" tag.
+// splitPlatform parses a "<goos>-<goarch>" tag, rejecting anything that is not
+// one — the value comes from the worker and is joined to a path.
 func splitPlatform(p string) (goos, goarch string, ok bool) {
+	if !sockproto.ValidPlatformTag(p) {
+		return "", "", false
+	}
 	goos, goarch, ok = strings.Cut(p, "-")
-	return goos, goarch, ok && goos != "" && goarch != ""
+	return goos, goarch, ok
 }
 
 // PushResult reports what happened to one binary on the worker.

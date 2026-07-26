@@ -1,6 +1,9 @@
 package sockproto
 
-import "strings"
+import (
+	"regexp"
+	"strings"
+)
 
 // Session-env policy for the exec stream (§4.3 attach, core §7.4). It lives
 // here, on the wire package, so BOTH sides share one definition: the launcher
@@ -121,6 +124,20 @@ func EnvEndpointKey(key string) bool {
 	}
 	return false
 }
+
+// platformTag matches "<goos>-<goarch>". Platform strings cross the wire in
+// BOTH directions — the worker reports its own and its container's in
+// hello_ack, the orchestrator tags pushes with one — and each side joins the
+// other's value to a filesystem path. So the shape check lives here, enforced
+// identically by sender and receiver; validating on one side only is how a
+// traversal gets in.
+var platformTag = regexp.MustCompile(`^[a-z0-9]+-[a-z0-9]+$`)
+
+// ValidPlatformTag reports whether s is a well-formed "<goos>-<goarch>" tag.
+func ValidPlatformTag(s string) bool { return platformTag.MatchString(s) }
+
+// PlatformTag renders a platform the one way both sides read it.
+func PlatformTag(goos, goarch string) string { return goos + "-" + goarch }
 
 // EnvAllowedDescription renders the policy for an error message.
 func EnvAllowedDescription() string {

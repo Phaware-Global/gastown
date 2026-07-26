@@ -197,11 +197,16 @@ installed, writes through a staging file, and installs by rename — a half-writ
   back to the orchestrator's own install dir, so the single-platform case works
   with no extra step.
 - A push may carry a `platform` tag, and then it is **for the work container,
-  not the worker**: the container is a Linux container even on a macOS worker,
+  not the worker**: on a macOS worker the container is still a Linux container,
   so its `gt`/`bd` are a different build from the ones the worker runs. Tagged
-  binaries are stored separately and never installed as the worker's own. The
-  tag is validated by shape (`<goos>-<goarch>`), like the binary name, because
-  it too is joined to a path.
+  binaries are stored separately and never installed as the worker's own. When
+  the container platform EQUALS the worker's, no tagged copy is sent — the
+  worker's own binary runs unmodified in the container and injection uses it.
+- Platform tags are validated by shape (`<goos>-<goarch>`) on **both** sides —
+  `sockproto.ValidPlatformTag`. Each end joins the other's value to a local
+  path (the worker's reported `os`/`arch` and `container_platform` on the
+  orchestrator, the push tag on the worker), so validating on one side only
+  would leave the other open to a traversal.
 - Either side reporting version `dev` (an unversioned build) opts out, rather
   than pushing on every provision forever.
 - `Provision` pushes best-effort and logs failures — `proto_version`, not

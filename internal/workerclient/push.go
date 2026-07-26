@@ -9,7 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -56,10 +56,8 @@ func (s *Service) containerBinDir(platform string) string {
 	return filepath.Join(s.cfg.StateDir, "container-bin", platform)
 }
 
-// platformTag matches "<goos>-<goarch>". The value arrives from the wire and is
-// joined to a path, so it is validated as a whole rather than sanitized: an
-// allowlist of shape, like the binary names themselves.
-var platformTag = regexp.MustCompile(`^[a-z0-9]+-[a-z0-9]+$`)
+// The platform tag's shape check is sockproto.ValidPlatformTag — shared with
+// the orchestrator, which validates the values it receives the same way.
 
 // stagingDir holds a partially-received or deferred binary.
 func (s *Service) stagingDir() string { return filepath.Join(s.cfg.StateDir, "staging") }
@@ -96,7 +94,7 @@ func (s *Service) handlePushBinary(c *connState, m *sockproto.Message) {
 		_ = c.send(&sockproto.Message{Type: sockproto.TypeError, ID: m.ID, Code: code, Msg: msg})
 	}
 
-	if m.Platform != "" && !platformTag.MatchString(m.Platform) {
+	if m.Platform != "" && !sockproto.ValidPlatformTag(m.Platform) {
 		fail("bad_request", "platform %q is not a <goos>-<goarch> tag", m.Platform)
 		return
 	}
@@ -318,7 +316,7 @@ func (s *Service) containerPlatform() string {
 		return ""
 	}
 	got := strings.TrimSpace(string(out))
-	if !platformTag.MatchString(got) {
+	if !sockproto.ValidPlatformTag(got) {
 		s.log.Warn("docker reported an unexpected platform", "platform", got)
 		return ""
 	}
@@ -350,11 +348,25 @@ func (s *Service) containerInject() (gtDir, proxyClient string, err error) {
 	if platform == "" {
 		return gtDir, "", nil
 	}
-	candidate := filepath.Join(s.containerBinDir(platform), BinProxyClient)
-	if _, err := os.Stat(candidate); err != nil {
-		s.log.Warn("no container-platform gt-proxy-client to inject; the agent will have no gt/bd until one is pushed",
-			"platform", platform, "expected", candidate)
-		return gtDir, "", nil
+
+	// A LINUX worker running local Linux docker — the canonical
+	// container-execution host — has a container platform equal to its own, and
+	// the orchestrator does not send a redundant tagged copy for it. Its own
+	// gt-proxy-client runs unmodified inside that container, so use it.
+	//
+	// (The earlier version of this looked only in the container tree, which
+	// made injection silently no-op on exactly that mainstream deployment: the
+	// agent came up with no gt/bd at all.)
+	candidates := []string{filepath.Join(s.containerBinDir(platform), BinProxyClient)}
+	if platform == sockproto.PlatformTag(runtime.GOOS, runtime.GOARCH) {
+		candidates = append(candidates, filepath.Join(s.binDir(), BinProxyClient))
 	}
-	return gtDir, candidate, nil
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			return gtDir, candidate, nil
+		}
+	}
+	s.log.Warn("no gt-proxy-client to inject; the agent will have no gt/bd until one is pushed",
+		"platform", platform, "looked_in", candidates)
+	return gtDir, "", nil
 }
