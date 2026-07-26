@@ -14,7 +14,8 @@ launchd job only.
 | Piece | How it gets there | Why |
 |---|---|---|
 | `gt-worker-client` | `make install` on that machine | the worker service itself |
-| `gt`, `bd` | **operator-provisioned for now** (`gt-proxy-client` installed under both names) | the agent's control-plane calls; see [Binaries](#binaries) |
+| `gt`, `bd` | created by `gt worker service install` (symlinks to `gt-proxy-client`) | the agent's control-plane calls; see [Binaries](#binaries) |
+| `gt-proxy-client` | `make install` on that machine | it *is* `gt` and `bd` there |
 | agent CLI (e.g. `claude`) | operator-provisioned | licensing and auth are the operator's, not gastown's |
 | `git` | operator-provisioned | the worktree is cloned through the session relay |
 | Docker | only for `exec_mode: container` | Docker Desktop on macOS |
@@ -110,19 +111,39 @@ pane runs `gt-worker-attach` against it.
 ## Binaries
 
 `gt` and `bd` on a worker are **not** the real binaries: they are
-`gt-proxy-client` installed under those names, forwarding every call to the
-orchestrator's `gt-proxy-server` over mTLS with the session's own certificate
+`gt-proxy-client` under those names, forwarding every call to the control plane
 (`docs/proxy-server.md`). That is what lets a remote agent run `gt done` or
 `bd update` with no town on disk and no credentials of its own.
 
-They are gastown's own binaries and are coupled to the proxy protocol, so
-keeping them in step with the orchestrator is gastown's job, not the operator's
-— that is what `push_binaries` (design §11 phase 4) is for: the handshake
-already reports the worker's version, and the orchestrator pushes matching
-binaries when they differ. Until that lands, install `gt-proxy-client` under
-both names by hand and re-copy it whenever the orchestrator is upgraded. In
-container mode the same bits are injected into the work container from the
-worker's `--gt-dir`, which is likewise operator-populated for now.
+`gt worker service install` creates them, as symlinks in `<state-dir>/bin`
+pointing at the installed `gt-proxy-client`, and puts that directory **first**
+on the supervised worker's PATH. Two consequences worth knowing:
+
+- The shims are deliberately **not** in the `gt` install dir. On a machine that
+  is both orchestrator and worker, the real `gt` lives there and must keep
+  living there — the agent gets the shim, your shell keeps the real binary.
+- They are symlinks, not copies, so a `make install` upgrade of
+  `gt-proxy-client` carries over automatically. A stale client against an
+  upgraded proxy presents as an agent that mysteriously stops being able to call
+  `gt`, which is a miserable thing to diagnose.
+
+The agent reaches the control plane in **relay mode**: it holds no certificate
+of its own — the worker's local relay holds the session identity and terminates
+mTLS upstream — so `gt` needs only `GT_PROXY_URL`, which the worker sets from
+the relay it bound. (`gt-proxy-client` also still supports direct mTLS when
+`GT_PROXY_CERT`/`KEY`/`CA` are supplied.)
+
+Two pieces are still not automated:
+
+- **Fleet freshness.** Keeping every worker's client in step with the
+  orchestrator is `push_binaries`' job (design §11 phase 4): the handshake
+  already reports the worker's `gt_version`, and the orchestrator pushes
+  matching binaries when they differ. Today, re-run `make install` on the worker
+  after upgrading the orchestrator, then `gt worker service restart`.
+- **Container mode.** The work container's `gt`/`bd` come from the worker's
+  `--gt-dir`, which nothing populates yet, and a container relay binds the
+  bridge gateway rather than loopback — so it needs `GT_PROXY_RELAY=1` alongside
+  the URL. `gt-proxy-client` accepts that; the injection is not wired.
 
 The agent CLI is different in kind and stays operator-installed: its version,
 licensing and auth are the operator's decision.

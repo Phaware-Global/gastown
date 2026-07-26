@@ -1,7 +1,14 @@
-// gt-proxy-client is the pass-through binary installed in containers as both `gt` and `bd`.
-// When GT_PROXY_URL, GT_PROXY_CERT, GT_PROXY_KEY, and GT_PROXY_CA are all set, it forwards
-// os.Args[1:] to the proxy server over mTLS and proxies the response.
-// Otherwise it execs the real binary at /usr/local/bin/gt.real (or the path in GT_REAL_BIN).
+// gt-proxy-client is the pass-through binary installed as both `gt` and `bd`
+// wherever a polecat runs off the orchestrator host — inside a work container,
+// or on a remote worker.
+//
+// With GT_PROXY_URL set it forwards os.Args[1:] to the control plane and
+// proxies the response, in one of two shapes: DIRECT mTLS when
+// GT_PROXY_CERT/KEY/CA are supplied, or RELAY (plaintext to a loopback URL)
+// when they are not — the remote-worker case, where the worker's local relay
+// holds the session identity and terminates mTLS upstream, so the agent never
+// holds the session key. With GT_PROXY_URL unset it execs the real binary at
+// /usr/local/bin/gt.real (or GT_REAL_BIN).
 package main
 
 import (
@@ -11,9 +18,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -35,6 +45,7 @@ func main() {
 	//   GT_PROXY_KEY  — path to PEM client private key
 	//   GT_PROXY_CA   — path to PEM proxy CA cert (used to verify server cert)
 	// Optional:
+	//   GT_PROXY_RELAY — "1" permits relay mode to a non-loopback relay (containers)
 	//   GT_REAL_BIN   — fallback binary path (default /usr/local/bin/gt.real)
 	proxyURL := os.Getenv("GT_PROXY_URL")
 	certFile := os.Getenv("GT_PROXY_CERT")
@@ -44,39 +55,17 @@ func main() {
 	// but passed separately so the Go HTTP client can also trust the proxy server cert.
 	caFile := os.Getenv("GT_PROXY_CA")
 
-	if proxyURL == "" || certFile == "" || keyFile == "" || caFile == "" {
-		// One or more proxy env vars unset — not in sandboxed mode, exec the real binary silently.
+	if proxyURL == "" {
+		// No proxy configured at all — not a proxied environment, so this is an
+		// ordinary invocation: exec the real binary silently.
 		execReal()
 		return
 	}
 
-	// Build mTLS client.
-	clientCert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	httpClient, err := proxyHTTPClient(proxyURL, certFile, keyFile, caFile)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "gt-proxy-client: load client cert: %v\n", err)
+		fmt.Fprintf(os.Stderr, "gt-proxy-client: %v\n", err)
 		os.Exit(1)
-	}
-
-	caPEM, err := os.ReadFile(caFile) //nolint:gosec // caFile is from trusted env var GT_PROXY_CA
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "gt-proxy-client: read CA: %v\n", err)
-		os.Exit(1)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caPEM) {
-		fmt.Fprintf(os.Stderr, "gt-proxy-client: invalid CA PEM\n")
-		os.Exit(1)
-	}
-
-	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{clientCert},
-		MinVersion:   tls.VersionTLS12,
-		RootCAs:      pool,
-	}
-
-	httpClient := &http.Client{
-		Timeout:   5 * time.Minute,
-		Transport: &http.Transport{TLSClientConfig: tlsCfg},
 	}
 
 	// Determine argv: prepend the binary name so the server knows which tool we are.
@@ -120,6 +109,90 @@ func main() {
 }
 
 // toolNameFromArg0 extracts "gt" or "bd" from the argv[0] binary path.
+// proxyHTTPClient builds the client for the configured proxy endpoint. There
+// are two sanctioned shapes, and which one applies is decided by whether client
+// material was supplied — never by guessing:
+//
+//   - DIRECT mTLS (GT_PROXY_CERT/KEY/CA all set): the caller holds a polecat
+//     cert and talks to gt-proxy-server itself.
+//   - RELAY (no client material): the caller talks to a worker-LOCAL relay that
+//     holds the session identity and terminates mTLS upstream
+//     (docs/design/remote-polecat-execution.md §7.2). This is the remote-worker
+//     shape: the agent must never hold the session key, so it cannot present a
+//     client cert, and requiring one is what made `gt` unusable on a worker —
+//     the four-var gate silently fell through to gt.real instead.
+//
+// Relay mode requires a LOOPBACK url, or GT_PROXY_RELAY=1 for the container
+// case where the relay binds the bridge gateway. Plaintext to an arbitrary host
+// with neither would be an unauthenticated control-plane call to something this
+// process cannot verify.
+func proxyHTTPClient(proxyURL, certFile, keyFile, caFile string) (*http.Client, error) {
+	someMaterial := certFile != "" || keyFile != "" || caFile != ""
+	allMaterial := certFile != "" && keyFile != "" && caFile != ""
+
+	if someMaterial && !allMaterial {
+		// A partial set is a misconfiguration, not a mode. Falling back to
+		// plaintext here would silently drop mTLS the operator asked for.
+		return nil, fmt.Errorf("GT_PROXY_CERT/GT_PROXY_KEY/GT_PROXY_CA must be set together (or all omitted for relay mode); got cert=%t key=%t ca=%t",
+			certFile != "", keyFile != "", caFile != "")
+	}
+
+	if !allMaterial {
+		// A container's relay is legitimately NOT loopback — it binds the docker
+		// bridge gateway, firewalled to the container subnet (worker.Relay's
+		// AllowNonLoopback) — so relay mode there must be stated rather than
+		// inferred. GT_PROXY_RELAY=1 is that statement, and only the worker is
+		// in a position to make it: the orchestrator cannot supply the URL it
+		// would apply to (endpoints are refused from the wire).
+		if os.Getenv("GT_PROXY_RELAY") != "1" {
+			if err := requireLoopback(proxyURL); err != nil {
+				return nil, err
+			}
+		}
+		return &http.Client{Timeout: 5 * time.Minute}, nil
+	}
+
+	clientCert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load client cert: %w", err)
+	}
+	caPEM, err := os.ReadFile(caFile) //nolint:gosec // caFile is from trusted env var GT_PROXY_CA
+	if err != nil {
+		return nil, fmt.Errorf("read CA: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("invalid CA PEM in %s", caFile)
+	}
+	return &http.Client{
+		Timeout: 5 * time.Minute,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{
+			Certificates: []tls.Certificate{clientCert},
+			MinVersion:   tls.VersionTLS12,
+			RootCAs:      pool,
+		}},
+	}, nil
+}
+
+// requireLoopback rejects a non-loopback relay URL.
+func requireLoopback(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("GT_PROXY_URL %q: %w", rawURL, err)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("GT_PROXY_URL %q has no host", rawURL)
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("GT_PROXY_URL %q is not loopback and no client certificate was supplied: refusing to send control-plane commands to an unverified host (set GT_PROXY_CERT/KEY/CA for direct mTLS, or point at the worker's local relay)", rawURL)
+}
+
 func toolNameFromArg0(arg0 string) string {
 	return filepath.Base(arg0)
 }

@@ -68,8 +68,9 @@ Example (TCP, mTLS, enrolled as this machine's name):
 		if err := installWorkerService(plan); err != nil {
 			return err
 		}
-		fmt.Printf("Installed and started com.gastown.worker\n  plist:  %s\n  binary: %s\n  state:  %s\n  log:    %s\n",
-			plan.PlistPath, plan.Binary, plan.StateDir, filepath.Join(plan.StateDir, "worker.log"))
+		fmt.Printf("Installed and started com.gastown.worker\n  plist:  %s\n  binary: %s\n  state:  %s\n  log:    %s\n  gt/bd:  %s -> %s\n",
+			plan.PlistPath, plan.Binary, plan.StateDir, filepath.Join(plan.StateDir, "worker.log"),
+			plan.ShimDir, plan.ProxyClient)
 		if strings.HasPrefix(o.Listen, "unix://") {
 			fmt.Printf("\nUnix listener: put the pre-shared token in %s as\n  GT_WORKER_TOKEN=…\n(mode 0600), then: gt worker service restart\n",
 				filepath.Join(plan.StateDir, "worker.env"))
@@ -95,12 +96,14 @@ type workerServiceOpts struct {
 // absolute and checked, every argument decided. Separating it from the install
 // keeps the validation testable without touching launchd.
 type workerServicePlan struct {
-	Binary    string
-	StateDir  string
-	PlistPath string
-	Args      []string
-	Path      string
-	Plist     []byte
+	Binary      string
+	StateDir    string
+	PlistPath   string
+	Args        []string
+	Path        string
+	Plist       []byte
+	ShimDir     string // <state-dir>/bin, first on the agent's PATH
+	ProxyClient string // what the gt/bd shims point at
 }
 
 // planWorkerService validates opts and renders the job.
@@ -183,15 +186,29 @@ func planWorkerService(o workerServiceOpts) (*workerServicePlan, error) {
 		args = append(args, "-gt-dir", o.GTDir)
 	}
 
+	// The agent's `gt` and `bd` are gt-proxy-client under those names — that is
+	// the ONLY way a remote agent reaches the control plane (docs/proxy-server.md).
+	// Resolve it now so a missing client is an install-time error, not an agent
+	// that starts fine and then cannot call `gt done`.
+	proxyClient, err := proxyClientPath()
+	if err != nil {
+		return nil, err
+	}
+
 	quoted := make([]string, len(args))
 	for i, a := range args {
 		quoted[i] = config.ShellQuote(a)
 	}
+	shimDir := filepath.Join(stateDir, "bin")
 	plist, err := templates.RenderWorkerLaunchd(templates.WorkerSupervisorData{
 		BinaryPath: binary,
 		StateDir:   stateDir,
 		Args:       quoted,
-		Path:       workerServicePath(binary),
+		// The shim dir goes FIRST: the agent inherits this PATH, and on a machine
+		// that is both orchestrator and worker the real `gt` is also installed —
+		// the agent must get the proxy shim, while the operator's own shell keeps
+		// the real binary.
+		Path: shimDir + ":" + workerServicePath(binary),
 	})
 	if err != nil {
 		return nil, err
@@ -202,14 +219,61 @@ func planWorkerService(o workerServiceOpts) (*workerServicePlan, error) {
 	}
 	return &workerServicePlan{
 		Binary: binary, StateDir: stateDir, PlistPath: plistPath,
-		Args: quoted, Path: workerServicePath(binary), Plist: plist,
+		Args: quoted, Path: shimDir + ":" + workerServicePath(binary), Plist: plist,
+		ShimDir: shimDir, ProxyClient: proxyClient,
 	}, nil
+}
+
+// installShims points `gt` and `bd` at gt-proxy-client in the worker's own bin
+// dir — NOT in the gt install dir, which on a single-box setup holds the real
+// gt and must keep holding it.
+//
+// Symlinks rather than copies, so a `make install` upgrade of gt-proxy-client
+// carries to the shims automatically; keeping the client in step with the
+// orchestrator's proxy is a version-coupling problem, and a stale copy here
+// would present as an agent that mysteriously stops being able to call gt.
+// (Fleet-wide freshness is push_binaries' job — design §11 phase 4.)
+func installShims(plan *workerServicePlan) error {
+	if err := os.MkdirAll(plan.ShimDir, 0755); err != nil {
+		return fmt.Errorf("creating shim dir: %w", err)
+	}
+	for _, name := range []string{"gt", "bd"} {
+		link := filepath.Join(plan.ShimDir, name)
+		// Replace whatever is there: a stale shim pointing at an old path is
+		// worse than no shim, because it fails at agent runtime.
+		if err := os.Remove(link); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("replacing %s: %w", link, err)
+		}
+		if err := os.Symlink(plan.ProxyClient, link); err != nil {
+			return fmt.Errorf("linking %s -> %s: %w", link, plan.ProxyClient, err)
+		}
+	}
+	return nil
+}
+
+// proxyClientPath finds gt-proxy-client, preferring the copy installed next to
+// the running gt so the worker's shims match this build.
+func proxyClientPath() (string, error) {
+	if self, err := os.Executable(); err == nil {
+		cand := filepath.Join(filepath.Dir(self), "gt-proxy-client")
+		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
+			return cand, nil
+		}
+	}
+	path, err := exec.LookPath("gt-proxy-client")
+	if err != nil {
+		return "", fmt.Errorf("gt-proxy-client not found next to gt or on PATH — the agent's `gt`/`bd` are that binary under those names, so the worker cannot reach the control plane without it; run `make install` on this machine")
+	}
+	return path, nil
 }
 
 // installWorkerService writes the job and (re)starts it.
 func installWorkerService(plan *workerServicePlan) error {
 	if err := os.MkdirAll(plan.StateDir, 0700); err != nil {
 		return fmt.Errorf("creating state dir: %w", err)
+	}
+	if err := installShims(plan); err != nil {
+		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(plan.PlistPath), 0755); err != nil {
 		return fmt.Errorf("creating LaunchAgents dir: %w", err)
