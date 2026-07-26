@@ -41,11 +41,11 @@ func validateBeadIDShape(id string) error {
 // patrol.
 
 var (
-	mqSetReviewStatePolecat            string
-	mqSetReviewStateIter               int
-	mqSetReviewStateClearPolecat       bool
-	mqSetReviewStateClearIter          bool
-	mqSetReviewStateAwaitStartedAt     string
+	mqSetReviewStatePolecat             string
+	mqSetReviewStateIter                int
+	mqSetReviewStateClearPolecat        bool
+	mqSetReviewStateClearIter           bool
+	mqSetReviewStateAwaitStartedAt      string
 	mqSetReviewStateClearAwaitStartedAt bool
 )
 

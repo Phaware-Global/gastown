@@ -120,24 +120,24 @@ var (
 	slingHookRawBead bool     // --hook-raw-bead: hook raw bead without default formula (expert mode)
 
 	// Flags migrated for polecat spawning (used by sling for work assignment)
-	slingCreate        bool   // --create: create polecat if it doesn't exist
-	slingForce         bool   // --force: force spawn even if polecat has unread mail
-	slingAccount       string // --account: Claude Code account handle to use
-	slingAgent         string // --agent: override runtime agent for this sling/spawn
-	slingNoConvoy      bool   // --no-convoy: skip auto-convoy creation
-	slingOwned         bool   // --owned: mark auto-convoy as caller-managed lifecycle
-	slingNoMerge       bool   // --no-merge: skip merge queue on completion (for upstream PRs/human review)
-	slingMerge         string // --merge: merge strategy for convoy (direct/mr/local)
-	slingNoBoot        bool   // --no-boot: skip wakeRigAgents (avoid witness/refinery boot and lock contention)
-	slingMaxConcurrent int    // --max-concurrent: throttle spawn rate in batch mode (spawns N, pauses, spawns N more)
-	slingBaseBranch    string // --base-branch: override base branch for polecat worktree
-	slingResumeBranch  string // --branch: resume an existing branch instead of creating a fresh one
-	slingResumePR      int    // --pr: resume the head branch of an existing PR (resolves via gh)
-	slingRalph         bool   // --ralph: enable Ralph Wiggum loop mode for multi-step workflows
-	slingFormula       string // --formula: override formula for dispatch (default: mol-polecat-work)
-	slingCrew          string // --crew: target a crew member in the specified rig
-	slingReviewOnly    bool   // --review-only: mark work as review-only (no merge/commit/push)
-	slingPR            int    // --review-pr: check out and work on an existing PR branch (for review-fix dispatch)
+	slingCreate         bool   // --create: create polecat if it doesn't exist
+	slingForce          bool   // --force: force spawn even if polecat has unread mail
+	slingAccount        string // --account: Claude Code account handle to use
+	slingAgent          string // --agent: override runtime agent for this sling/spawn
+	slingNoConvoy       bool   // --no-convoy: skip auto-convoy creation
+	slingOwned          bool   // --owned: mark auto-convoy as caller-managed lifecycle
+	slingNoMerge        bool   // --no-merge: skip merge queue on completion (for upstream PRs/human review)
+	slingMerge          string // --merge: merge strategy for convoy (direct/mr/local)
+	slingNoBoot         bool   // --no-boot: skip wakeRigAgents (avoid witness/refinery boot and lock contention)
+	slingMaxConcurrent  int    // --max-concurrent: throttle spawn rate in batch mode (spawns N, pauses, spawns N more)
+	slingBaseBranch     string // --base-branch: override base branch for polecat worktree
+	slingResumeBranch   string // --branch: resume an existing branch instead of creating a fresh one
+	slingResumePR       int    // --pr: resume the head branch of an existing PR (resolves via gh)
+	slingRalph          bool   // --ralph: enable Ralph Wiggum loop mode for multi-step workflows
+	slingFormula        string // --formula: override formula for dispatch (default: mol-polecat-work)
+	slingCrew           string // --crew: target a crew member in the specified rig
+	slingReviewOnly     bool   // --review-only: mark work as review-only (no merge/commit/push)
+	slingPR             int    // --review-pr: check out and work on an existing PR branch (for review-fix dispatch)
 	slingBranchOverride string // --review-branch: explicit branch override (pairs with --review-pr or standalone)
 )
 

@@ -64,12 +64,12 @@ type ChangelogEntry struct {
 
 // closedBead is the raw shape from bd list --status=closed --json.
 type closedBead struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	IssueType   string `json:"issue_type"`
-	Ephemeral   bool   `json:"ephemeral"`
-	ClosedAt    string `json:"closed_at"`
-	CloseReason string `json:"close_reason"`
+	ID          string   `json:"id"`
+	Title       string   `json:"title"`
+	IssueType   string   `json:"issue_type"`
+	Ephemeral   bool     `json:"ephemeral"`
+	ClosedAt    string   `json:"closed_at"`
+	CloseReason string   `json:"close_reason"`
 	Labels      []string `json:"labels"`
 }
 

@@ -170,12 +170,12 @@ func isPushToMain(command string) bool {
 	// (`--push-option=main`) are already ignored because they start with
 	// `-`, so the token is dropped whole.
 	flagsTakingArg := map[string]bool{
-		"-o":              true,
-		"--push-option":   true,
-		"--receive-pack":  true,
-		"--exec":          true,
-		"--repo":          true,
-		"--signed":        true, // `--signed=<yes|no|if-asked>` uses =; only its space form takes a separate arg
+		"-o":             true,
+		"--push-option":  true,
+		"--receive-pack": true,
+		"--exec":         true,
+		"--repo":         true,
+		"--signed":       true, // `--signed=<yes|no|if-asked>` uses =; only its space form takes a separate arg
 	}
 
 	var positionals []string
@@ -281,11 +281,11 @@ func skipGitGlobalArgs(fields []string) int {
 	}
 	// Boolean flags that take no value.
 	booleanFlags := map[string]bool{
-		"-p":         true,
-		"--paginate": true,
-		"-P":         true,
-		"--no-pager": true,
-		"--bare":     true,
+		"-p":                   true,
+		"--paginate":           true,
+		"-P":                   true,
+		"--no-pager":           true,
+		"--bare":               true,
 		"--no-replace-objects": true,
 	}
 	i := 1

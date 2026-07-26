@@ -122,6 +122,41 @@ type SupervisorData struct {
 	Path     string // PATH env var to inject into the supervised daemon
 }
 
+// WorkerSupervisorData renders the socket-execution worker's launchd job
+// (docs/design/remote-polecat-execution-socket.md §11 phase 5).
+type WorkerSupervisorData struct {
+	BinaryPath string   // path to gt-worker-client
+	StateDir   string   // session state dir; also holds worker.env and worker.log
+	Args       []string // already-quoted gt-worker-client arguments
+	Path       string   // PATH for the supervised worker (it execs git, docker, the agent)
+}
+
+// WorkerLaunchdPlistPath is where the worker's launchd job is installed.
+func WorkerLaunchdPlistPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("finding home directory: %w", err)
+	}
+	return filepath.Join(home, "Library", "LaunchAgents", "com.gastown.worker.plist"), nil
+}
+
+// RenderWorkerLaunchd renders the worker plist for data.
+func RenderWorkerLaunchd(data WorkerSupervisorData) ([]byte, error) {
+	content, err := supervisorFS.ReadFile("launchd/com.gastown.worker.plist")
+	if err != nil {
+		return nil, fmt.Errorf("reading worker launchd template: %w", err)
+	}
+	tmpl, err := template.New("worker-launchd").Parse(string(content))
+	if err != nil {
+		return nil, fmt.Errorf("parsing worker launchd template: %w", err)
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return nil, fmt.Errorf("rendering worker launchd template: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
 // New creates a new Templates instance.
 func New() (*Templates, error) {
 	t := &Templates{}

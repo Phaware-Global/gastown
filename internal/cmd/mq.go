@@ -35,12 +35,12 @@ var (
 	mqRejectStdin  bool // Read reason from stdin
 
 	// List command flags
-	mqListReady   bool
-	mqListStatus  string
-	mqListWorker  string
-	mqListEpic    string
-	mqListJSON    bool
-	mqListVerify  bool
+	mqListReady  bool
+	mqListStatus string
+	mqListWorker string
+	mqListEpic   string
+	mqListJSON   bool
+	mqListVerify bool
 
 	// Status command flags
 	mqStatusJSON bool

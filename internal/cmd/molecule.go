@@ -6,10 +6,10 @@ import (
 
 // Molecule command flags
 var (
-	moleculeJSON      bool
-	moleculeJitter    string // jitter duration for squash (e.g. "10s")
-	moleculeSummary   string // optional summary for squash digest
-	moleculeNoDigest  bool   // skip digest bead creation on squash
+	moleculeJSON     bool
+	moleculeJitter   string // jitter duration for squash (e.g. "10s")
+	moleculeSummary  string // optional summary for squash digest
+	moleculeNoDigest bool   // skip digest bead creation on squash
 )
 
 var moleculeCmd = &cobra.Command{
@@ -42,7 +42,6 @@ TO DISPATCH WORK (with molecules):
   gt sling mol-xxx target   # Pour formula + sling to agent
   gt formulas               # List available formulas`,
 }
-
 
 var moleculeProgressCmd = &cobra.Command{
 	Use:   "progress <root-issue-id>",
@@ -175,7 +174,6 @@ Examples:
 	RunE: runMoleculeCurrent,
 }
 
-
 var moleculeBurnCmd = &cobra.Command{
 	Use:   "burn [target]",
 	Short: "Burn current molecule without creating a digest",
@@ -226,7 +224,6 @@ When a polecat is working on a molecule, it processes one step at a time:
 IMPORTANT: Always use 'gt mol step done' to complete steps. Do not manually
 close steps with 'bd close' - that skips the auto-continuation logic.`,
 }
-
 
 func init() {
 	// Progress flags

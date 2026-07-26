@@ -1,4 +1,4 @@
-.PHONY: build desktop-build desktop-run install safe-install check-forward-only check-version-tag check-install-path clean test test-makefile test-e2e-container check-up-to-date
+.PHONY: build desktop-build desktop-run install safe-install install-remote-execution-binaries check-forward-only check-version-tag check-install-path clean test test-makefile test-e2e-container check-up-to-date
 
 BINARY := gt
 BINARY_DESKTOP := gt-desktop
@@ -106,6 +106,7 @@ install: check-up-to-date build
 	@mkdir -p $(INSTALL_DIR)
 	@rm -f $(INSTALL_DIR)/$(BINARY)
 	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY)
+	@$(MAKE) --no-print-directory install-remote-execution-binaries
 	@# Nuke any stale go-install binaries that shadow the canonical location
 	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY); do \
 		if [ -f "$$bad" ]; then \
@@ -138,6 +139,7 @@ safe-install: check-up-to-date check-forward-only build
 	@# Atomic-ish replace: copy to temp then move (move is atomic on same filesystem)
 	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY).new
 	@mv $(INSTALL_DIR)/$(BINARY).new $(INSTALL_DIR)/$(BINARY)
+	@$(MAKE) --no-print-directory install-remote-execution-binaries
 	@# Nuke any stale go-install binaries that shadow the canonical location
 	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY); do \
 		if [ -f "$$bad" ]; then \
@@ -148,6 +150,21 @@ safe-install: check-up-to-date check-forward-only build
 	@echo "Installed $(BINARY) to $(INSTALL_DIR)/$(BINARY) (daemon NOT restarted)"
 	@$(MAKE) --no-print-directory check-install-path
 	@echo "Sessions will pick up new binary on next cycle."
+
+# install-remote-execution-binaries: the remote-execution companions.
+#
+# gt-worker-attach is NOT optional for a socket rig: WrapCommand emits a bare
+# `gt-worker-attach` as the pane command, so a missing binary means the pane
+# dies with command-not-found the first time a remote polecat starts.
+# gt-worker-client is the worker service itself, installed here so a machine
+# that acts as both orchestrator and worker (the single-box setup) is complete
+# after one `make install`. Both are replaced atomically, like gt itself.
+install-remote-execution-binaries:
+	@for b in $(BINARY)-worker-attach $(BINARY)-worker-client; do \
+		cp $(BUILD_DIR)/$$b $(INSTALL_DIR)/$$b.new && \
+		mv $(INSTALL_DIR)/$$b.new $(INSTALL_DIR)/$$b && \
+		echo "Installed $$b to $(INSTALL_DIR)/$$b"; \
+	done
 
 # check-version-tag: Verify that if HEAD is tagged vX.Y.Z, the Version constant
 # in internal/cmd/version.go equals X.Y.Z. No-op when HEAD is untagged, so it is

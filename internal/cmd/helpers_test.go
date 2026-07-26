@@ -47,7 +47,7 @@ func TestInferRigFromCrewName(t *testing.T) {
 	mkdirAll("rigA/crew/alice")
 	mkdirAll("rigA/crew/bob")
 	mkdirAll("rigB/crew/carol")
-	mkdirAll("rigB/crew/bob")   // bob exists in both rigs
+	mkdirAll("rigB/crew/bob")     // bob exists in both rigs
 	mkdirAll(".hidden/crew/dave") // hidden dir, should be skipped
 
 	// Create a non-dir entry at town root

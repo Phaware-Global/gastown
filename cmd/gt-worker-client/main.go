@@ -28,7 +28,7 @@ import (
 func main() {
 	var (
 		listen      = flag.String("listen", "", "unix:///path/to.sock or TCP host:port (required)")
-		token       = flag.String("token", "", "pre-shared token (required for unix listeners; refused on TCP)")
+		token       = flag.String("token", "", "pre-shared token for unix listeners (visible in ps; prefer GT_WORKER_TOKEN)")
 		tlsCert     = flag.String("tls-cert", "", "this machine's TLS cert (TCP)")
 		tlsKey      = flag.String("tls-key", "", "this machine's TLS key (TCP)")
 		tlsClientCA = flag.String("tls-client-ca", "", "CA that signs orchestrator client certs (TCP)")
@@ -107,6 +107,15 @@ func main() {
 	if *listen == "" || *proxyURL == "" {
 		log.Error("missing required flags: -listen and -proxy-url are required")
 		os.Exit(2)
+	}
+
+	// The unix-mode token is a secret, and argv is world-readable via ps — so
+	// prefer the environment, which a supervisor can feed from a 0600 file
+	// (`gt worker service install` wires worker.env for exactly this).
+	if *token == "" {
+		*token = os.Getenv("GT_WORKER_TOKEN")
+	} else {
+		log.Warn("-token is visible to other local users via ps; prefer GT_WORKER_TOKEN")
 	}
 
 	svc, err := workerclient.New(workerclient.Config{

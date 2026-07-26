@@ -61,7 +61,6 @@ type SlingSpawnOptions struct {
 	SkipAdmission bool   // Caller already holds a polecat admission reservation
 }
 
-
 // SpawnPolecatForSling creates a fresh polecat and optionally starts its session.
 // This is used by gt sling when the target is a rig name.
 // The caller (sling) handles hook attachment and nudging.
