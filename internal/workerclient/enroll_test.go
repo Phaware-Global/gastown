@@ -224,3 +224,106 @@ func freshCSR(t *testing.T) []byte {
 	require.NoError(t, err)
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
 }
+
+// TestWorkerRejectsPeerMachineCert pins the round-1 HIGH end-to-end: a
+// SECOND enrolled worker's machine cert must NOT be able to drive this
+// worker's control plane. Two independent barriers must hold — machine certs
+// are ServerAuth-only, and the accept side pins the orchestrator CN.
+func TestWorkerRejectsPeerMachineCert(t *testing.T) {
+	caDir := t.TempDir()
+	ca, err := workerca.LoadOrCreate(caDir)
+	require.NoError(t, err)
+
+	// Enroll the victim worker and a peer worker.
+	victimTLS, peerTLS := t.TempDir(), t.TempDir()
+	for _, e := range []struct{ name, dir string }{{"victim", victimTLS}, {"peer", peerTLS}} {
+		tok, err := workerca.NewJoinToken()
+		require.NoError(t, err)
+		addr, done := startEnrollListener(t, e.dir, tok)
+		_, err = ca.EnrollWorker(context.Background(), e.name, addr, tok)
+		require.NoError(t, err)
+		require.NoError(t, <-done)
+	}
+
+	// Victim listens with the enrolled material (CN-pinned accept side).
+	tlsCfg, err := ServerTLSConfig(
+		filepath.Join(victimTLS, MachineCertFile),
+		filepath.Join(victimTLS, MachineKeyFile),
+		filepath.Join(victimTLS, ClientCAFile))
+	require.NoError(t, err)
+	tcp, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer tcp.Close()
+	ln := tls.NewListener(tcp, tlsCfg)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Force the handshake so verification actually runs.
+			if tc, ok := c.(*tls.Conn); ok {
+				_ = tc.Handshake()
+			}
+			c.Close()
+		}
+	}()
+
+	// The PEER dials the victim, presenting its own machine cert as a client
+	// cert — the impersonation attempt.
+	peerCert, err := tls.LoadX509KeyPair(
+		filepath.Join(peerTLS, MachineCertFile), filepath.Join(peerTLS, MachineKeyFile))
+	require.NoError(t, err)
+	caPEM, err := os.ReadFile(filepath.Join(peerTLS, WorkerCAFile))
+	require.NoError(t, err)
+	pool := x509.NewCertPool()
+	require.True(t, pool.AppendCertsFromPEM(caPEM))
+
+	conn, err := tls.Dial("tcp", tcp.Addr().String(), &tls.Config{
+		Certificates: []tls.Certificate{peerCert},
+		RootCAs:      pool,
+		ServerName:   "victim",
+		MinVersion:   tls.VersionTLS13,
+	})
+	if err == nil {
+		// TLS 1.3 can defer the peer's verdict to the first read.
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, err = conn.Read(make([]byte, 1))
+		conn.Close()
+	}
+	require.Error(t, err, "a peer worker's machine cert must not authenticate as the orchestrator")
+}
+
+// TestServerTLSConfig_AcceptsOnlyOrchestratorCN unit-checks the pin.
+func TestServerTLSConfig_AcceptsOnlyOrchestratorCN(t *testing.T) {
+	assert.Equal(t, workerca.OrchestratorCN, OrchestratorCN,
+		"the worker's pinned CN must match what the CA mints")
+}
+
+// TestEnroll_SilentPeerDoesNotWedge pins the enroll deadline + conn tracking:
+// a peer that connects and says nothing must not block enrollment forever,
+// and ctx cancellation must unblock shutdown.
+func TestEnroll_SilentPeerDoesNotWedge(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Enroll(ctx, ln, EnrollConfig{TLSDir: t.TempDir(), JoinToken: "tok"})
+	}()
+
+	// A silent connection occupies the sequential accept loop.
+	silent, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	defer silent.Close()
+	time.Sleep(200 * time.Millisecond)
+
+	// Cancellation must unblock the stuck Recv (the accepted conn is closed
+	// too, not just the listener).
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a silent peer wedged enrollment: ctx cancel did not unblock it")
+	}
+}

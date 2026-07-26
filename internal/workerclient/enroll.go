@@ -14,6 +14,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/sockproto"
 )
@@ -63,9 +65,19 @@ func Enroll(ctx context.Context, ln net.Listener, cfg EnrollConfig) error {
 		return fmt.Errorf("workerclient: create tls dir: %w", err)
 	}
 
+	// Track the in-flight connection so ctx cancellation closes IT too — a
+	// peer that connects and says nothing would otherwise block the sequential
+	// accept loop (and hang shutdown) until its deadline.
+	var curMu sync.Mutex
+	var cur net.Conn
 	go func() {
 		<-ctx.Done()
 		ln.Close()
+		curMu.Lock()
+		if cur != nil {
+			cur.Close()
+		}
+		curMu.Unlock()
 	}()
 
 	for {
@@ -76,8 +88,14 @@ func Enroll(ctx context.Context, ln net.Listener, cfg EnrollConfig) error {
 			}
 			return fmt.Errorf("workerclient: enrollment accept: %w", err)
 		}
+		curMu.Lock()
+		cur = nc
+		curMu.Unlock()
 		err = enrollOnce(nc, cfg, log)
 		nc.Close()
+		curMu.Lock()
+		cur = nil
+		curMu.Unlock()
 		if err == nil {
 			log.Info("enrollment complete; exiting enrollment mode")
 			return nil
@@ -91,6 +109,8 @@ func Enroll(ctx context.Context, ln net.Listener, cfg EnrollConfig) error {
 
 // enrollOnce runs the exchange on one connection.
 func enrollOnce(nc net.Conn, cfg EnrollConfig, log *slog.Logger) error {
+	// Bound the whole attempt: a silent peer must not wedge enrollment.
+	_ = nc.SetDeadline(time.Now().Add(enrollAttemptTimeout))
 	codec := sockproto.NewCodec(nc)
 
 	m, err := codec.Recv()
@@ -148,6 +168,14 @@ func enrollOnce(nc net.Conn, cfg EnrollConfig, log *slog.Logger) error {
 	if err := verifyMachineCert(resp.CertPEM, resp.CAPEM, m.WorkerName, key); err != nil {
 		return err
 	}
+	// ClientCAPEM becomes the anchor this worker trusts to authenticate FUTURE
+	// orchestrator client certs — a far more durable grant than one session, so
+	// validate it rather than persisting whatever arrived. In the standard flow
+	// the same worker CA signs both, so require that; a split client CA would
+	// be a deliberate protocol change, not something to accept silently.
+	if err := verifyClientCA(resp.ClientCAPEM, resp.CAPEM); err != nil {
+		return err
+	}
 
 	keyPEM, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
@@ -170,8 +198,12 @@ func enrollOnce(nc net.Conn, cfg EnrollConfig, log *slog.Logger) error {
 		}
 	}
 
+	// Material is on disk: this machine IS enrolled. A failed ack must not
+	// leave the one-shot listener open for a second party holding the token to
+	// re-drive enrollment and overwrite it — log and treat as terminal.
 	if err := codec.Send(&sockproto.Message{Type: sockproto.TypeEnrollAck, ID: m.ID, WorkerName: m.WorkerName}); err != nil {
-		return err
+		log.Warn("enrollment material persisted but the ack could not be sent; treating enrollment as complete",
+			"name", m.WorkerName, "err", err)
 	}
 	log.Info("enrolled", "name", m.WorkerName, "tlsDir", cfg.TLSDir)
 	return nil
@@ -235,6 +267,30 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("rename %s: %w", path, err)
+	}
+	return nil
+}
+
+// enrollAttemptTimeout bounds one enrollment attempt end-to-end.
+const enrollAttemptTimeout = 60 * time.Second
+
+// verifyClientCA checks the CA the worker is about to trust for future
+// orchestrator client certs: it must parse, be a CA, and (in the standard
+// single-CA flow) be the same CA that signed this machine's cert.
+func verifyClientCA(clientCAPEM, workerCAPEM string) error {
+	block, _ := pem.Decode([]byte(clientCAPEM))
+	if block == nil || block.Type != "CERTIFICATE" {
+		return fmt.Errorf("client CA is not a CERTIFICATE PEM block")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("parse client CA: %w", err)
+	}
+	if !cert.IsCA {
+		return fmt.Errorf("client CA certificate is not a CA")
+	}
+	if clientCAPEM != workerCAPEM {
+		return fmt.Errorf("client CA does not match the worker CA; refusing to trust a separate client-auth anchor")
 	}
 	return nil
 }
