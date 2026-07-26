@@ -191,18 +191,29 @@ func (b *SocketBackend) WrapCommand(ep execution.Endpoint, agentArgv []string, e
 	if len(agentArgv) == 0 {
 		return nil, fmt.Errorf("socket: empty agent argv")
 	}
+	// The launcher needs the worker credential, but argv is world-readable via
+	// ps — so the token/worker-name travel in the SESSION ENV the daemon sets
+	// on the tmux pane (GT_WORKER_TOKEN / GT_WORKER_NAME), which the launcher
+	// reads from its own environment. Only the address, session id, and the
+	// agent argv (already non-secret, and quoted by the caller) go in argv.
+	//
+	// The launcher forwards the non-secret session env from that same
+	// environment into the exec payload (core §7.4); nothing sensitive is
+	// placed on a command line.
+	if env != nil {
+		if b.settings.Token != "" {
+			env["GT_WORKER_TOKEN"] = b.settings.Token
+		}
+		if b.settings.TLS.WorkerName != "" {
+			env["GT_WORKER_NAME"] = b.settings.TLS.WorkerName
+		}
+	}
 	argv := []string{
 		"gt-worker-attach",
 		"--address", ep.Address,
 		"--session", ep.ID,
+		"--",
 	}
-	// The non-secret session env travels in the exec payload the launcher
-	// sends, not in this host-visible argv — pass it by reference (an env
-	// file the launcher reads), keeping tokens out of `ps`. The launcher
-	// contract and framing land with the exec-streaming increment; the env
-	// map is threaded through here so the seam is in place.
-	_ = env
-	argv = append(argv, "--")
 	return append(argv, agentArgv...), nil
 }
 
