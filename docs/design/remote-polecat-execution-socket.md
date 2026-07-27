@@ -276,6 +276,28 @@ code (1-byte payload); `signal` (orch → worker) forwards e.g. SIGINT to the
 agent, by **canonical name** (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`). The
 stream closes after `exit`.
 
+**Terminals.** The `attach` preamble carries `tty` plus the launcher's initial
+`cols`/`rows`, and a launcher whose pane IS a terminal asks for one. This is not
+a comfort feature: an interactive agent requires a TTY to start at all — Claude
+Code's UI calls `setRawMode` on stdin and throws without one ("Raw mode is not
+supported on the current process.stdin") — so plain pipes do not degrade such an
+agent, they prevent it from running.
+
+Two consequences:
+
+- **stdout and stderr become one stream.** A terminal has a single output, so
+  everything arrives as `stdout` frames. Without `tty` the two stay separate,
+  which is why a scripted attach should not ask for one.
+- **`resize` is applied, not ignored.** The pty is created at the launcher's
+  geometry (an agent that reads its size once at startup would otherwise render
+  to 80x24 forever) and `SIGWINCH` on the pane sends a `resize` frame; tmux
+  resizes panes constantly.
+
+Container mode passes `-t` to `docker exec` so the terminal is allocated inside
+the container rather than wrapping it in a second pty on the worker. The
+launcher puts its local terminal in raw mode for the session and restores it on
+every exit path, so the pane's keystrokes belong to the remote agent.
+
 Stream rules that follow from the framing:
 
 - **One agent per session.** A second `attach` to a session that already has a

@@ -178,6 +178,11 @@ type Message struct {
 	// this payload.
 	Argv []string `json:"argv,omitempty"`
 	TTY  bool     `json:"tty,omitempty"`
+	// Cols/Rows are the launcher's initial window size, sent with the attach so
+	// the pty is created at the right geometry — an agent that reads its
+	// dimensions once at startup would otherwise render to 80x24 forever.
+	Cols int `json:"cols,omitempty"`
+	Rows int `json:"rows,omitempty"`
 
 	// shutdown / teardown (§4.2)
 	Reason        string `json:"reason,omitempty"`

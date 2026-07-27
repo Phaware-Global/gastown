@@ -624,3 +624,119 @@ func TestShutdown_FencesReattachDuringFinalFlush(t *testing.T) {
 	svc.mu.Unlock()
 	assert.True(t, fenced, "a shut-down session must refuse further attaches")
 }
+
+// attachStreamTTY attaches asking for a terminal at a given geometry.
+func attachStreamTTY(t *testing.T, addr, sessionID string, argv []string, cols, rows int) (net.Conn, *sockproto.Codec) {
+	t.Helper()
+	nc := rawDial(t, addr)
+	codec := sockproto.NewCodec(nc)
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeAuth, Token: "t0k"}))
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeHello, ID: "h", ProtoVersion: sockproto.ProtoVersion}))
+	_, err := codec.Recv()
+	require.NoError(t, err)
+	require.NoError(t, codec.Send(&sockproto.Message{
+		Type: sockproto.TypeAttach, ID: "a", Session: sessionID, Argv: argv,
+		TTY: true, Cols: cols, Rows: rows,
+	}))
+	ack, err := codec.Recv()
+	require.NoError(t, err)
+	require.Equal(t, sockproto.TypeAttachAck, ack.Type, "%s: %s", ack.Code, ack.Msg)
+	return nc, codec
+}
+
+// TestExecStream_TTYGivesTheAgentATerminal is the reason this increment exists:
+// an interactive agent calls setRawMode on startup and throws when stdin is not
+// a TTY, so plain pipes do not degrade it — they stop it from starting.
+func TestExecStream_TTYGivesTheAgentATerminal(t *testing.T) {
+	addr, _ := provisionedService(t)
+
+	_, codec := attachStreamTTY(t, addr, "gt-demo-furiosa",
+		[]string{"sh", "-c", "test -t 0 && test -t 1 && echo HAVE_TTY"}, 100, 30)
+	out, _, code := drainStream(t, codec)
+	require.Equal(t, 0, code)
+	assert.Contains(t, out, "HAVE_TTY", "stdin and stdout must both be a terminal")
+}
+
+// TestExecStream_NoTTYWhenNotRequested pins that the pipe path is unchanged for
+// a launcher that has no terminal of its own (a scripted attach), where separate
+// stdout/stderr is worth keeping.
+func TestExecStream_NoTTYWhenNotRequested(t *testing.T) {
+	addr, _ := provisionedService(t)
+
+	_, codec := attachStream(t, addr, "gt-demo-furiosa",
+		[]string{"sh", "-c", "test -t 0 || echo NO_TTY; echo to-err >&2"}, nil)
+	out, errOut, code := drainStream(t, codec)
+	require.Equal(t, 0, code)
+	assert.Contains(t, out, "NO_TTY")
+	assert.Contains(t, errOut, "to-err", "without a pty the two streams stay separate")
+}
+
+// TestExecStream_TTYStartsAtTheLauncherGeometry pins that the size travels with
+// the attach: an agent that reads its dimensions once at startup would otherwise
+// render to the 80x24 default for the life of the session.
+func TestExecStream_TTYStartsAtTheLauncherGeometry(t *testing.T) {
+	addr, _ := provisionedService(t)
+
+	_, codec := attachStreamTTY(t, addr, "gt-demo-furiosa",
+		[]string{"sh", "-c", "stty size"}, 133, 47)
+	out, _, code := drainStream(t, codec)
+	require.Equal(t, 0, code)
+	assert.Contains(t, strings.ReplaceAll(out, "\r", ""), "47 133",
+		"the pty must be created at the launcher's geometry, not the default")
+}
+
+// TestExecStream_ResizeIsApplied pins that a resize frame reaches the terminal —
+// tmux resizes panes constantly, and a TUI rendered to stale geometry is
+// unusable.
+func TestExecStream_ResizeIsApplied(t *testing.T) {
+	addr, _ := provisionedService(t)
+
+	conn, codec := attachStreamTTY(t, addr, "gt-demo-furiosa",
+		[]string{"sh", "-c", "trap 'stty size; exit 0' WINCH; while :; do sleep 0.05; done"}, 80, 24)
+	time.Sleep(500 * time.Millisecond) // let the trap install
+
+	payload, err := sockproto.MarshalResize(150, 55)
+	require.NoError(t, err)
+	require.NoError(t, sockproto.WriteFrame(conn, sockproto.FrameResize, payload))
+
+	done := make(chan struct{})
+	var out string
+	go func() {
+		out, _, _ = drainStream(t, codec)
+		close(done)
+	}()
+	select {
+	case <-done:
+		assert.Contains(t, strings.ReplaceAll(out, "\r", ""), "55 150",
+			"the agent must see the new geometry")
+	case <-time.After(20 * time.Second):
+		t.Fatal("the resize never reached the terminal")
+	}
+}
+
+// TestExecStream_TTYSignalStillReachesTheAgent pins that dropping Setpgid for the
+// pty path did not cost signal delivery: a pty child is a SESSION leader, hence
+// its own process-group leader, so the negative-pid kill still reaches the tree.
+func TestExecStream_TTYSignalStillReachesTheAgent(t *testing.T) {
+	addr, _ := provisionedService(t)
+
+	conn, codec := attachStreamTTY(t, addr, "gt-demo-furiosa",
+		[]string{"sh", "-c", "trap 'echo got-int; exit 0' INT; while :; do sleep 0.05; done"}, 80, 24)
+	time.Sleep(500 * time.Millisecond) // let the trap install
+	require.NoError(t, sockproto.WriteFrame(conn, sockproto.FrameSignal, []byte("SIGINT")))
+
+	done := make(chan struct{})
+	var out string
+	var code int
+	go func() {
+		out, _, code = drainStream(t, codec)
+		close(done)
+	}()
+	select {
+	case <-done:
+		assert.Contains(t, out, "got-int", "the pane's Ctrl-C must still reach a pty agent")
+		assert.Equal(t, 0, code)
+	case <-time.After(20 * time.Second):
+		t.Fatal("signal was not delivered to the pty agent")
+	}
+}

@@ -22,6 +22,8 @@ import (
 	"sync"
 	"syscall"
 
+	"golang.org/x/term"
+
 	"github.com/steveyegge/gastown/internal/socket"
 	"github.com/steveyegge/gastown/internal/sockproto"
 )
@@ -77,12 +79,26 @@ func run(address, session, token, workerName string, argv []string) (int, error)
 	}
 	defer conn.Close()
 
+	// A terminal is what an interactive agent needs to start: Claude Code's UI
+	// calls setRawMode on stdin and throws without a TTY. So when this pane HAS
+	// a terminal, ask the worker for one and hand over the geometry with the
+	// attach — an agent that reads its size once at startup must not see 80x24.
+	tty := term.IsTerminal(int(os.Stdin.Fd()))
+	cols, rows := 0, 0
+	if tty {
+		if w, h, err := term.GetSize(int(os.Stdin.Fd())); err == nil {
+			cols, rows = w, h
+		}
+	}
 	if err := codec.Send(&sockproto.Message{
 		Type:    sockproto.TypeAttach,
 		ID:      "attach",
 		Session: session,
 		Argv:    argv,
 		Env:     sessionEnv(),
+		TTY:     tty,
+		Cols:    cols,
+		Rows:    rows,
 	}); err != nil {
 		return 1, fmt.Errorf("sending attach: %w", err)
 	}
@@ -97,6 +113,18 @@ func run(address, session, token, workerName string, argv []string) (int, error)
 		return 1, fmt.Errorf("expected attach_ack, got %q", ack.Type)
 	}
 
+	// Raw mode: with a remote terminal, every keystroke belongs to the agent —
+	// the local line discipline must not buffer lines, echo them, or turn ^C
+	// into a local signal. Restored on every exit path, including a panic, or
+	// the operator is left with an unusable shell.
+	if tty {
+		restore, err := term.MakeRaw(int(os.Stdin.Fd()))
+		if err != nil {
+			return 1, fmt.Errorf("putting the terminal in raw mode: %w", err)
+		}
+		defer term.Restore(int(os.Stdin.Fd()), restore)
+	}
+
 	// One writer goroutine owns the outbound half so stdin and signal frames
 	// never interleave mid-frame.
 	var writeMu sync.Mutex
@@ -104,6 +132,27 @@ func run(address, session, token, workerName string, argv []string) (int, error)
 		writeMu.Lock()
 		defer writeMu.Unlock()
 		return sockproto.WriteFrame(conn, t, payload)
+	}
+
+	// Window changes follow the pane: a TUI rendered to stale geometry is
+	// unusable, and tmux resizes panes constantly.
+	if tty {
+		winch := make(chan os.Signal, 1)
+		signal.Notify(winch, syscall.SIGWINCH)
+		defer signal.Stop(winch)
+		go func() {
+			for range winch {
+				w, h, err := term.GetSize(int(os.Stdin.Fd()))
+				if err != nil {
+					continue
+				}
+				payload, err := sockproto.MarshalResize(w, h)
+				if err != nil {
+					continue
+				}
+				_ = writeFrame(sockproto.FrameResize, payload)
+			}
+		}()
 	}
 
 	go func() {

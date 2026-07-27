@@ -138,41 +138,68 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 		return err
 	}
 
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("stdin pipe: %w", err)
-	}
-	// NOT cmd.StdoutPipe/StderrPipe: those are closed by cmd.Wait the moment the
-	// process exits, and os/exec documents it as incorrect to call Wait before
-	// the reads finish. Doing so drops whatever is still sitting in the pipe —
-	// CI caught exactly that, truncating a 5000-line burst at ~2000. Owning the
-	// pipes ourselves decouples reaping from draining: Wait touches neither, and
-	// each read end reports EOF once the child's write end is closed.
-	stdoutR, stdoutW, err := os.Pipe()
-	if err != nil {
-		return fmt.Errorf("stdout pipe: %w", err)
-	}
-	defer func() { _ = stdoutR.Close() }()
-	stderrR, stderrW, err := os.Pipe()
-	if err != nil {
+	// A TTY is what an interactive agent needs to start at all (see pty.go), so
+	// the launcher asks for one and the worker allocates it. Without the
+	// request — a non-tty pane, a scripted attach — plain pipes keep the
+	// separate stdout/stderr the framing can carry.
+	var (
+		tty    *ptySession
+		stdin  io.WriteCloser
+		stdout io.Reader
+		stderr io.Reader
+	)
+	if m.TTY {
+		var initial *sockproto.Resize
+		if m.Cols > 0 && m.Rows > 0 {
+			initial = &sockproto.Resize{Cols: m.Cols, Rows: m.Rows}
+		}
+		tty, err = startPTY(cmd, initial)
+		if err != nil {
+			_ = c.writeFrame(sockproto.FrameStderr, []byte("gt-worker-client: "+err.Error()+"\n"))
+			_ = c.writeExit(126)
+			return err
+		}
+		defer tty.Close()
+		// One stream in both directions: a terminal has a single output, so
+		// stderr arrives interleaved as FrameStdout by construction.
+		stdin, stdout, stderr = tty, tty, nil
+	} else {
+		if stdin, err = cmd.StdinPipe(); err != nil {
+			return fmt.Errorf("stdin pipe: %w", err)
+		}
+		// NOT cmd.StdoutPipe/StderrPipe: those are closed by cmd.Wait the moment
+		// the process exits, and os/exec documents it as incorrect to call Wait
+		// before the reads finish. Doing so drops whatever is still sitting in
+		// the pipe — CI caught exactly that, truncating a 5000-line burst at
+		// ~2000. Owning the pipes decouples reaping from draining: Wait touches
+		// neither, and each read end sees EOF when the CHILD's write end closes.
+		stdoutR, stdoutW, perr := os.Pipe()
+		if perr != nil {
+			return fmt.Errorf("stdout pipe: %w", perr)
+		}
+		defer func() { _ = stdoutR.Close() }()
+		stderrR, stderrW, perr := os.Pipe()
+		if perr != nil {
+			_ = stdoutW.Close()
+			return fmt.Errorf("stderr pipe: %w", perr)
+		}
+		defer func() { _ = stderrR.Close() }()
+		cmd.Stdout, cmd.Stderr = stdoutW, stderrW
+		stdout, stderr = stdoutR, stderrR
+
+		startErr := cmd.Start()
+		// The child holds its own dup of each write end now, so drop ours: the
+		// read ends must see EOF when the CHILD exits, not when this returns.
 		_ = stdoutW.Close()
-		return fmt.Errorf("stderr pipe: %w", err)
+		_ = stderrW.Close()
+		if startErr != nil {
+			_ = c.writeFrame(sockproto.FrameStderr, []byte("gt-worker-client: start agent: "+startErr.Error()+"\n"))
+			_ = c.writeExit(126)
+			return fmt.Errorf("start agent: %w", startErr)
+		}
 	}
-	defer func() { _ = stderrR.Close() }()
-	cmd.Stdout, cmd.Stderr = stdoutW, stderrW
-	var stdout io.Reader = stdoutR
-	var stderr io.Reader = stderrR
-	startErr := cmd.Start()
-	// The child holds its own dup of each write end now, so drop ours: the read
-	// ends must see EOF when the CHILD exits, not when this function returns.
-	_ = stdoutW.Close()
-	_ = stderrW.Close()
-	if startErr != nil {
-		_ = c.writeFrame(sockproto.FrameStderr, []byte("gt-worker-client: start agent: "+startErr.Error()+"\n"))
-		_ = c.writeExit(126)
-		return fmt.Errorf("start agent: %w", startErr)
-	}
-	s.log.Info("agent started", "session", m.Session, "pid", cmd.Process.Pid, "container", container)
+	s.log.Info("agent started", "session", m.Session, "pid", cmd.Process.Pid,
+		"container", container, "tty", m.TTY)
 
 	// Pump the agent's output into frames. Each pump writes through
 	// connState's serialized writer, so frames never interleave.
@@ -198,9 +225,12 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 			}
 		}
 	}
-	pumps.Add(2)
+	pumps.Add(1)
 	go pump(stdout, sockproto.FrameStdout)
-	go pump(stderr, sockproto.FrameStderr)
+	if stderr != nil {
+		pumps.Add(1)
+		go pump(stderr, sockproto.FrameStderr)
+	}
 
 	// Read inbound frames: stdin, signals, resize. Ends when the launcher
 	// closes the stream (agent stdin then sees EOF).
@@ -241,8 +271,20 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 			case sockproto.FrameSignal:
 				s.signalAgent(cmd, string(payload), container)
 			case sockproto.FrameResize:
-				// No PTY in this increment; resize is accepted and ignored so a
-				// launcher can send it unconditionally.
+				// A TUI rendered to the wrong geometry is unusable, so this is
+				// applied rather than accepted-and-ignored. Without a pty there
+				// is nothing to resize, and the frame stays a no-op.
+				if tty == nil {
+					break
+				}
+				r, err := sockproto.UnmarshalResize(payload)
+				if err != nil {
+					s.log.Warn("bad resize frame", "session", m.Session, "err", err)
+					break
+				}
+				if err := tty.resize(r); err != nil {
+					s.log.Warn("resize", "session", m.Session, "err", err)
+				}
 			default:
 				// stdout/stderr/exit are worker→launcher only; ignore.
 			}
@@ -305,6 +347,7 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 // `docker exec` into the prepared work container, or a direct exec on the
 // worker for native mode.
 func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktree, container, proxyURL string) (*exec.Cmd, error) {
+	tty := m.TTY
 	env, err := s.agentEnv(m.Env, proxyURL, container != "")
 	if err != nil {
 		return nil, err
@@ -312,6 +355,12 @@ func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktre
 
 	if container != "" {
 		args := []string{"exec", "-i", "-w", "/work"}
+		if tty {
+			// docker allocates the terminal inside the container; the worker
+			// does not wrap this in a pty of its own, or the agent would be
+			// behind two of them.
+			args = append(args, "-t")
+		}
 		for _, kv := range env {
 			args = append(args, "-e", kv)
 		}
@@ -336,7 +385,15 @@ func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktre
 	cmd.Dir = worktree
 	cmd.Env = env
 	// Own process group so a signal reaches the agent's whole tree.
-	setProcessGroup(cmd)
+	//
+	// NOT under a pty: allocating one makes the child a SESSION leader
+	// (Setsid + Setctty), and Setsid with Setpgid is rejected outright — the
+	// exec fails with EINVAL before the agent ever runs. A session leader is
+	// already a process-group leader, so signalling -pid still reaches the whole
+	// tree either way.
+	if !tty {
+		setProcessGroup(cmd)
+	}
 	// Cancellation is a graceful SIGTERM to the whole group — an agent killed
 	// with SIGKILL cannot flush its own state — with WaitDelay as the hard
 	// bound: after it, Go SIGKILLs the process and closes the pipes, so
