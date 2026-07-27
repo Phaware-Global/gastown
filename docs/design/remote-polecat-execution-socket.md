@@ -305,8 +305,9 @@ it (the CLI reads it as "unset" and installs the default), so a sequence must be
 chosen: `ctrl-\` three times. NUL — what an earlier version used — is Ctrl+Space,
 an ordinary editing keystroke; `ctrl-\` is SIGQUIT on a normal terminal and is
 close to never typed. The worker also strips that byte sequence from container
-stdin, so it does not reach the client at all. Mitigation, not a proof: a
-sequence split across two frames would still pass.
+stdin — across frames, because the launcher reads its terminal in raw mode and a
+typed sequence arrives one byte per frame, so per-frame filtering would never see
+it.
 
 Other properties the implementation must hold, each learned the hard way:
 
@@ -328,6 +329,17 @@ Other properties the implementation must hold, each learned the hard way:
   client, which owns the real terminal via `-t`, so it is made fully raw:
   transparent, with no echo, no double newline translation, and no `^S`/`^C`
   intercepted in transit.
+
+  The one exception in native mode is **software flow control**: `IXON`/`IEXTEN`
+  are cleared. They exist so a 1980s terminal could ask a host to stop
+  transmitting; over this transport they have no job, while a single `0x13` byte
+  from the wire stops the pty's output queue — after which the agent blocks
+  writing and cannot be reaped even by `SIGKILL`, taking the session and, at
+  `max_sessions: 1`, the worker.
+- **A cancelled agent that will not die releases the terminal.** Closing the
+  master discards a stalled output queue, which is the only thing that frees such
+  a child. It fires on CANCELLATION, never on elapsed time — an agent is supposed
+  to run for hours.
 - **A half-close does not hang up the terminal.** Closing stdin is the right
   answer on a pipe; on a pty, stdin and stdout are the same master, so closing it
   SIGHUPs the agent and truncates its output. The terminal's own EOF is `^D`.

@@ -113,12 +113,19 @@ func startPTY(cmd *exec.Cmd, initial *sockproto.Resize, plumbing bool) (*ptySess
 	master, err = pollable(master)
 	if err != nil {
 		// The child is ALREADY RUNNING — StartWithSize forked and exec'd it — so
-		// returning here without killing it would leave a live agent holding the
+		// returning without killing it would leave a live agent holding the
 		// worktree while the session slot is released: the orphan the
 		// one-agent-per-session fence exists to prevent.
+		//
+		// The master is closed FIRST. An earlier version killed then waited,
+		// justifying the order as "signalled while its terminal still exists" —
+		// which is wrong twice: a signal goes to a process, not through its tty,
+		// and Wait cannot return while the pty's output queue holds bytes with
+		// nobody reading the master. Nothing is reading it here (the pumps start
+		// later), so a chatty child would have deadlocked this cleanup.
+		_ = master.Close()
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		_ = master.Close()
 		return nil, fmt.Errorf("make pty master pollable: %w", err)
 	}
 
@@ -142,8 +149,36 @@ func startPTY(cmd *exec.Cmd, initial *sockproto.Resize, plumbing bool) (*ptySess
 		if _, err := term.MakeRaw(int(master.Fd())); err != nil {
 			slog.Default().Warn("could not make the container pty transparent", "err", err)
 		}
+	} else if err := disableFlowControl(master); err != nil {
+		slog.Default().Warn("could not disable software flow control on the pty", "err", err)
 	}
 	return &ptySession{master: master}, nil
+}
+
+// disableFlowControl clears IXON and IEXTEN on a NATIVE pty, leaving every
+// user-facing terminal semantic (ISIG, ICANON, OPOST) as the kernel made it.
+//
+// This is not a return to hand-picking flags. ISIG/ICANON/OPOST are what a
+// terminal MEANS to the program using it — ^C interrupts, ^D ends input, output
+// is translated — and removing any of them broke something real in earlier
+// rounds. IXON is different: software flow control exists so a 1980s terminal
+// could ask a host to stop transmitting, and over this transport it has no job
+// (the stream has its own flow control) while its failure mode is severe.
+//
+// A single 0x13 byte from the wire stops the pty's output queue. The agent then
+// blocks writing, cmd.Wait never returns — SIGKILL does not help, because the
+// process cannot be reaped while its output queue is held — and at
+// max_sessions: 1 that is the whole worker, from one keystroke that nothing
+// remote can un-stick once the pane is gone. IEXTEN goes with it: ^O discards
+// output just as silently.
+func disableFlowControl(master *os.File) error {
+	t, err := unix.IoctlGetTermios(int(master.Fd()), ioctlGet)
+	if err != nil {
+		return err
+	}
+	t.Iflag &^= unix.IXON | unix.IXOFF | unix.IXANY
+	t.Lflag &^= unix.IEXTEN
+	return unix.IoctlSetTermios(int(master.Fd()), ioctlSet, t)
 }
 
 // pollable re-wraps a blocking fd as a non-blocking one owned by Go's runtime

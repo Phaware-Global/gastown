@@ -210,12 +210,15 @@ func TestPTY_CrossCompiles(t *testing.T) {
 	}
 }
 
-// TestPTY_NativeLeavesTheTerminalAlone pins the role split. A NATIVE pty IS the
-// agent's terminal, so every discipline flag must stay as the kernel made it:
-// clearing ISIG would remove the last interrupt path (the launcher's own raw
-// mode means no local SIGINT is ever raised to forward as a signal frame), and
-// clearing IXON/IEXTEN or OPOST changes what a terminal means.
-func TestPTY_NativeLeavesTheTerminalAlone(t *testing.T) {
+// TestPTY_NativeKeepsTerminalSemantics pins the role split. A NATIVE pty IS the
+// agent's terminal, so the flags that give it MEANING stay as the kernel made
+// them: clearing ISIG would remove the last interrupt path (the launcher's own
+// raw mode means no local SIGINT is ever raised to forward as a signal frame),
+// and clearing ICANON or OPOST breaks EOF and output translation.
+//
+// Flow control is the exception, covered by TestPTY_NativeDisablesFlowControl:
+// it is not a terminal semantic an agent relies on, and it can wedge the worker.
+func TestPTY_NativeKeepsTerminalSemantics(t *testing.T) {
 	cmd := exec.Command("sleep", "5")
 	p, err := startPTY(cmd, &sockproto.Resize{Cols: 80, Rows: 24}, false)
 	require.NoError(t, err)
@@ -226,7 +229,6 @@ func TestPTY_NativeLeavesTheTerminalAlone(t *testing.T) {
 	assert.NotZero(t, tio.Lflag&unix.ISIG, "^C must still interrupt: it is the only interrupt path left")
 	assert.NotZero(t, tio.Lflag&unix.ICANON, "^D must still mean EOF")
 	assert.NotZero(t, tio.Oflag&unix.OPOST, "output translation must survive or every line staircases")
-	assert.NotZero(t, tio.Iflag&unix.IXON, "a terminal is where ^S pauses output")
 }
 
 // TestPTY_ContainerIsTransparentPlumbing pins the other half: with -t the docker
@@ -273,4 +275,77 @@ func TestPollable_IsCloseOnExec(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotZero(t, flags&unix.FD_CLOEXEC,
 		"the master must be close-on-exec, atomically — Dup then CloseOnExec leaves a fork window")
+}
+
+// TestPTY_NativeDisablesFlowControl pins the one flag a native pty must NOT
+// keep. IXON is how a 1980s terminal asked a host to stop transmitting; over
+// this transport it has no job (the stream has its own flow control) and one
+// 0x13 byte from the wire stops the pty's output queue — the agent then blocks
+// writing and cannot be reaped even by SIGKILL, so the session and, at
+// max_sessions: 1, the worker wedge from a single keystroke nothing remote can
+// undo once the pane is gone.
+func TestPTY_NativeDisablesFlowControl(t *testing.T) {
+	cmd := exec.Command("sleep", "5")
+	p, err := startPTY(cmd, &sockproto.Resize{Cols: 80, Rows: 24}, false)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.Close(); _ = cmd.Process.Kill(); _ = cmd.Wait() })
+
+	tio, err := unix.IoctlGetTermios(int(p.master.Fd()), ioctlGet)
+	require.NoError(t, err)
+	assert.Zero(t, tio.Iflag&unix.IXON, "^S must not be able to stall the agent's output")
+	assert.Zero(t, tio.Lflag&unix.IEXTEN, "^O discards output just as silently")
+
+	// The semantics that make it a TERMINAL are still untouched.
+	assert.NotZero(t, tio.Lflag&unix.ISIG, "^C must still interrupt")
+	assert.NotZero(t, tio.Lflag&unix.ICANON, "^D must still mean EOF")
+	assert.NotZero(t, tio.Oflag&unix.OPOST, "output translation must survive")
+}
+
+// TestDetachFilter_SurvivesOneBytePerFrame pins the shape typed input actually
+// takes: the launcher reads its terminal in raw mode (VMIN=1), so a typed
+// sequence arrives as separate one-byte frames. A per-frame scan — what an
+// earlier version did — never sees it.
+func TestDetachFilter_SurvivesOneBytePerFrame(t *testing.T) {
+	d := &detachFilter{seq: containerDetachBytes}
+
+	var out []byte
+	for _, b := range containerDetachBytes { // three separate frames, as typed
+		out = append(out, d.filter([]byte{b})...)
+	}
+	assert.Empty(t, out, "a sequence split across frames must still be removed")
+
+	// Ordinary input flows, including a partial sequence followed by something
+	// else — two of three is a keystroke, not a detach.
+	d2 := &detachFilter{seq: containerDetachBytes}
+	var got []byte
+	for _, chunk := range [][]byte{{'a'}, {0x1c}, {0x1c}, {'b'}, {'c'}} {
+		got = append(got, d2.filter(chunk)...)
+	}
+	assert.Equal(t, []byte{'a', 0x1c, 0x1c, 'b', 'c'}, got)
+
+	// And within one frame, which is what a paste looks like.
+	d3 := &detachFilter{seq: containerDetachBytes}
+	in := append([]byte("hello"), containerDetachBytes...)
+	assert.Equal(t, "helloworld", string(d3.filter(append(in, []byte("world")...))))
+}
+
+// TestDetachFilter_HoldsBackOnlyAPrefix pins the cost of cross-frame filtering:
+// a trailing partial prefix waits for the next input, and nothing else does.
+func TestDetachFilter_HoldsBackOnlyAPrefix(t *testing.T) {
+	d := &detachFilter{seq: containerDetachBytes}
+	assert.Equal(t, "abc", string(d.filter([]byte("abc"))), "ordinary bytes are never delayed")
+	assert.Empty(t, d.filter([]byte{0x1c}), "a possible prefix is held")
+	assert.Equal(t, []byte{0x1c, 'z'}, d.filter([]byte{'z'}), "and released once it cannot complete")
+}
+
+// TestNewDetachFilter_OnlyForContainerTTY pins the WIRING, which the filter's own
+// unit tests cannot see: applying it to native stdin would silently corrupt an
+// agent's input while leaving container detach live, and dropping it entirely
+// would leave the fence open — both mutations the byte-level tests survive.
+func TestNewDetachFilter_OnlyForContainerTTY(t *testing.T) {
+	tty := &ptySession{}
+	assert.NotNil(t, newDetachFilter(tty, "gt-work-demo-furiosa"), "a container client can be detached from")
+	assert.Nil(t, newDetachFilter(tty, ""), "a native pty has no client in the middle")
+	assert.Nil(t, newDetachFilter(nil, "gt-work-demo-furiosa"), "no tty means no escape proxy")
+	assert.Nil(t, newDetachFilter(nil, ""))
 }

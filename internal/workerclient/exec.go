@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"regexp"
@@ -34,12 +35,71 @@ const execWaitDelay = 10 * time.Second
 // normal terminal, so it is close to never typed, let alone three times running.
 const containerDetachKeys = `ctrl-\,ctrl-\,ctrl-\`
 
-// containerDetachBytes is what that sequence is on the wire, stripped from
-// container stdin as defense in depth: the CLI always installs SOME escape
-// proxy, so the only way to make detach unreachable is to ensure those bytes
-// never arrive. A sequence split across two frames would still pass, which is
-// why the choice above matters too — this is mitigation, not a proof.
+// containerDetachBytes is that sequence on the wire, stripped from container
+// stdin as defense in depth: the CLI always installs SOME escape proxy, so the
+// only way to make detach unreachable is for those bytes never to arrive.
 var containerDetachBytes = []byte{0x1c, 0x1c, 0x1c}
+
+// newDetachFilter returns a filter for container stdin, or nil when there is no
+// docker client in the middle to detach from. Separated from streamExec so the
+// WIRING — not just the byte logic — is testable: an earlier test asserted
+// bytes.ReplaceAll's behavior and would have stayed green if the filter had been
+// applied to native stdin instead, or dropped entirely.
+func newDetachFilter(tty *ptySession, container string) *detachFilter {
+	if tty == nil || container == "" {
+		return nil
+	}
+	return &detachFilter{seq: containerDetachBytes}
+}
+
+// detachFilter removes the detach sequence from a byte stream ACROSS frames.
+//
+// Per-frame filtering was useless: the launcher reads its terminal in raw mode
+// (VMIN=1), so a typed sequence arrives as three separate one-byte frames and a
+// per-frame scan never sees it. Split delivery is the normal case, not an edge
+// one.
+//
+// A trailing partial prefix is held back until the next input decides it. That
+// costs a keystroke's latency only for ^\ — SIGQUIT on a normal terminal, and
+// close to never typed — and never for anything else.
+type detachFilter struct {
+	seq     []byte
+	pending []byte
+}
+
+// filter returns the bytes safe to forward, holding back any trailing prefix of
+// the sequence.
+func (d *detachFilter) filter(in []byte) []byte {
+	buf := append(d.pending, in...)
+	d.pending = nil
+
+	var out []byte
+	for len(buf) > 0 {
+		i := bytes.Index(buf, d.seq)
+		if i >= 0 {
+			out = append(out, buf[:i]...)
+			buf = buf[i+len(d.seq):]
+			continue
+		}
+		// No complete sequence: forward everything except a trailing run that
+		// could still become one.
+		keep := len(buf)
+		for n := len(d.seq) - 1; n > 0; n-- {
+			if n <= len(buf) && bytes.Equal(buf[len(buf)-n:], d.seq[:n]) {
+				keep = len(buf) - n
+				break
+			}
+		}
+		out = append(out, buf[:keep]...)
+		d.pending = append([]byte(nil), buf[keep:]...)
+		break
+	}
+	return out
+}
+
+// ptyWaitGrace is how long a CANCELLED agent has to be reaped before the pty
+// master is closed to release it. It never applies to a running agent.
+var ptyWaitGrace = 5 * time.Second
 
 // ptyDrainGrace is how long the output pump may keep reading a pty master after
 // the agent exits, before the master is closed to unblock it. Long enough to
@@ -178,6 +238,20 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 		// container != "" means the pty is plumbing to the docker client rather
 		// than the agent's own terminal.
 		tty, err = startPTY(cmd, initial, container != "")
+		if err != nil && container != "" {
+			// startPTY killed what it started — but in container mode that is the
+			// docker CLIENT, not the agent, and the in-container process survives
+			// its client. Terminate everything in the container except PID 1 (the
+			// same move its idle entrypoint makes on TERM), or the session slot is
+			// released while an agent still runs on the worktree.
+			kctx, kcancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if _, kerr := exec.CommandContext(kctx, "docker", "exec", "-u", "0", container,
+				"/bin/sh", "-c", "kill -TERM -1").CombinedOutput(); kerr != nil {
+				s.log.Warn("could not terminate in-container processes after a failed pty start",
+					"session", m.Session, "container", container, "err", kerr)
+			}
+			kcancel()
+		}
 		if err != nil {
 			_ = c.writeFrame(sockproto.FrameStderr, []byte("gt-worker-client: "+err.Error()+"\n"))
 			_ = c.writeExit(126)
@@ -260,7 +334,7 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 	// closes the stream (agent stdin then sees EOF).
 	// Container stdin is filtered for the docker detach sequence; a native pty
 	// has no client in the middle to detach from.
-	stripDetach := tty != nil && container != ""
+	detach := newDetachFilter(tty, container)
 
 	inboundDone := make(chan struct{})
 	// agentDone marks the agent as already exited, so the teardown-time read
@@ -301,8 +375,11 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 			}
 			switch t {
 			case sockproto.FrameStdin:
-				if stripDetach {
-					payload = bytes.ReplaceAll(payload, containerDetachBytes, nil)
+				if detach != nil {
+					payload = detach.filter(payload)
+					if len(payload) == 0 {
+						break
+					}
 				}
 				if _, werr := stdin.Write(payload); werr != nil {
 					return
@@ -355,7 +432,14 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 		}
 	}()
 
-	waitErr := cmd.Wait()
+	// Wait, but never unconditionally: if the pty's output queue is stalled — a
+	// stray ^S, a stopped reader, an agent wedged mid-write — the child cannot be
+	// reaped even by SIGKILL while nobody drains the master, so cmd.Wait would
+	// block forever and take the session (and at max_sessions: 1 the worker) with
+	// it. Closing the master discards that queue and releases the child. Ordering
+	// this AFTER the Wait, as an earlier version did, made it unreachable exactly
+	// when it was needed.
+	waitErr := waitReleasing(ctx, cmd, tty, ptyWaitGrace, s.log, m.Session)
 	close(agentDone) // stop the prober; later read errors are expected
 	<-proberDone     // no prober write may race the terminal exit frame
 
@@ -446,12 +530,10 @@ func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktre
 			// supplied", falls through to the config file, and installs the escape
 			// proxy with the ctrl-p,ctrl-q default. Verified against the binary —
 			// an invalid value is rejected client-side ("Unknown character"),
-			// while an empty one sails through. So the sequence is set to three
-			// NULs, which the CLI accepts and no keyboard produces.
-			//
-			// Mitigation, not elimination: the CLI always installs SOME escape
-			// proxy, so a peer that deliberately sends those bytes can still
-			// detach. This removes the accident, not the capability.
+			// while an empty one sails through. So a sequence is CHOSEN
+			// (containerDetachKeys) rather than cleared, and the worker also
+			// strips those bytes from container stdin (detachFilter) so they do
+			// not reach the client at all.
 			args = append(args, "-t", "--detach-keys="+containerDetachKeys)
 		}
 		for _, kv := range env {
@@ -621,6 +703,41 @@ func signalName(sig syscall.Signal) string {
 		return "SIGQUIT"
 	default:
 		return ""
+	}
+}
+
+// waitReleasing reaps cmd, closing the pty master if a CANCELLED agent will not
+// die.
+//
+// A pty child blocked writing into a stalled output queue is unreapable while
+// nobody drains the master — SIGKILL included — so the close is the release
+// valve. It fires only after cancellation, never on elapsed time: an agent is
+// supposed to run for hours, and an earlier version keyed the grace off the
+// start of the wait, which killed healthy long-running sessions (caught by the
+// resize test, whose agent lives six seconds).
+//
+// Without a tty this is a plain Wait: cmd.Wait closes the pipes it created.
+func waitReleasing(ctx context.Context, cmd *exec.Cmd, tty *ptySession, grace time.Duration, log *slog.Logger, session string) error {
+	if tty == nil {
+		return cmd.Wait()
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+	}
+	// Cancelled: the agent has been signalled and should be gone shortly.
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(grace):
+		log.Warn("cancelled agent not reaped; closing the pty master to release it",
+			"session", session, "grace", grace)
+		_ = tty.Close()
+		return <-done
 	}
 }
 
