@@ -40,12 +40,6 @@ type ptySession struct {
 	closeErr  error
 }
 
-// Termios ioctls differ by platform.
-const (
-	ioctlReadTermios  = unix.TIOCGETA
-	ioctlWriteTermios = unix.TIOCSETA
-)
-
 // Default geometry when the launcher supplies none (a non-tty pane, or an older
 // launcher). A dimension that is present but out of range is CLAMPED on the
 // attach path — see winsize — rather than failing the session.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -178,3 +179,32 @@ func TestPTYResize_RefusesRatherThanSubstituting(t *testing.T) {
 }
 
 var _ = os.Getenv
+
+// TestPTY_CrossCompiles is a guard against the defect that shipped in this PR's
+// first pty commit: the termios ioctl constants are platform-specific (BSD uses
+// TIOCGETA/TIOCSETA, Linux TCGETS/TCSETS), and naming the darwin ones inline
+// made gt-worker-client fail to build for linux — the platform `make dist`
+// exists to ship it to.
+//
+// A unit test cannot catch a build break for another GOOS, so this runs the
+// compiler. It is skipped in -short mode because it costs a build.
+func TestPTY_CrossCompiles(t *testing.T) {
+	if testing.Short() {
+		t.Skip("costs a cross-compile")
+	}
+	root, err := filepath.Abs("../..")
+	require.NoError(t, err)
+
+	for _, target := range []struct{ goos, goarch string }{
+		{"linux", "amd64"}, {"linux", "arm64"}, {"darwin", "arm64"},
+	} {
+		t.Run(target.goos+"-"+target.goarch, func(t *testing.T) {
+			cmd := exec.Command("go", "build", "-o", os.DevNull, "./cmd/gt-worker-client")
+			cmd.Dir = root
+			cmd.Env = append(os.Environ(),
+				"CGO_ENABLED=0", "GOOS="+target.goos, "GOARCH="+target.goarch)
+			out, err := cmd.CombinedOutput()
+			require.NoError(t, err, "the worker must build for %s/%s:\n%s", target.goos, target.goarch, out)
+		})
+	}
+}
