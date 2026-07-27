@@ -2,6 +2,8 @@ package workerclient
 
 import (
 	"bytes"
+	"context"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -348,4 +350,107 @@ func TestNewDetachFilter_OnlyForContainerTTY(t *testing.T) {
 	assert.Nil(t, newDetachFilter(tty, ""), "a native pty has no client in the middle")
 	assert.Nil(t, newDetachFilter(nil, "gt-work-demo-furiosa"), "no tty means no escape proxy")
 	assert.Nil(t, newDetachFilter(nil, ""))
+}
+
+// TestWaitReleasing_LeavesAFlushingAgentAlone pins the premise the valve must
+// check. handleShutdown cancels on the GRACEFUL path, so a well-behaved agent
+// that traps SIGTERM and flushes is the COMMON case at cancellation — firing on
+// the timer alone hung it up mid-flush, discarding its last output and turning a
+// clean exit into a signal death.
+func TestWaitReleasing_LeavesAFlushingAgentAlone(t *testing.T) {
+	prevGrace, prevStall := ptyWaitGrace, ptyStallGrace
+	ptyWaitGrace, ptyStallGrace = 200*time.Millisecond, 300*time.Millisecond
+	t.Cleanup(func() { ptyWaitGrace, ptyStallGrace = prevGrace, prevStall })
+
+	// Flushes steadily for well past the grace, then exits cleanly.
+	cmd := exec.Command("/bin/sh", "-c",
+		"i=0; while [ $i -lt 12 ]; do echo flushing-$i; sleep 0.1; i=$((i+1)); done; echo FLUSH-DONE; exit 0")
+	p, err := startPTY(cmd, &sockproto.Resize{Cols: 80, Rows: 24}, false)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.Close() })
+
+	// A pump, as streamExec runs one.
+	var mu sync.Mutex
+	var out []byte
+	go func() {
+		buf := make([]byte, 256)
+		for {
+			n, err := p.Read(buf)
+			mu.Lock()
+			out = append(out, buf[:n]...)
+			mu.Unlock()
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancelled from the start: the graceful-shutdown shape
+
+	err = waitReleasing(ctx, cmd, p, ptyWaitGrace, slog.Default(), "gt-demo-furiosa")
+	require.NoError(t, err, "a flushing agent must exit cleanly, not by hangup")
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Contains(t, string(out), "FLUSH-DONE",
+		"the agent's final output must survive: the valve is for a STALLED terminal")
+}
+
+// TestWaitReleasing_ReleasesAStalledTerminal pins the case the valve is for: a
+// cancelled agent nobody can drain, which is unreapable even by SIGKILL.
+func TestWaitReleasing_ReleasesAStalledTerminal(t *testing.T) {
+	prevGrace, prevStall := ptyWaitGrace, ptyStallGrace
+	ptyWaitGrace, ptyStallGrace = 200*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { ptyWaitGrace, ptyStallGrace = prevGrace, prevStall })
+
+	// Never exits, never writes: nothing to drain, so the pump makes no progress.
+	cmd := exec.Command("sleep", "60")
+	p, err := startPTY(cmd, &sockproto.Resize{Cols: 80, Rows: 24}, false)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.Close() })
+	require.NoError(t, cmd.Process.Kill()) // cancelled and signalled
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- waitReleasing(ctx, cmd, p, ptyWaitGrace, slog.Default(), "gt-demo-furiosa") }()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the valve never fired: a stalled terminal would wedge the session")
+	}
+}
+
+// TestWriteAgentStdin_AppliesTheFilter pins the APPLICATION of the detach
+// filter, which its own unit tests cannot see: with the call inlined in
+// streamExec, deleting it left every test green because no test drives a
+// container+tty session's stdin.
+func TestWriteAgentStdin_AppliesTheFilter(t *testing.T) {
+	var got bytes.Buffer
+	d := &detachFilter{seq: containerDetachBytes}
+	for _, b := range containerDetachBytes { // as typed: one byte per frame
+		require.NoError(t, writeAgentStdin(&got, d, []byte{b}))
+	}
+	assert.Empty(t, got.String(), "the sequence must never reach the docker client")
+
+	require.NoError(t, writeAgentStdin(&got, d, []byte("ok")))
+	assert.Equal(t, "ok", got.String())
+
+	// Without a filter — the native path — every byte passes through untouched.
+	var native bytes.Buffer
+	require.NoError(t, writeAgentStdin(&native, nil, containerDetachBytes))
+	assert.Equal(t, containerDetachBytes, native.Bytes(), "native stdin must not be filtered")
+}
+
+// TestDetachFilter_FlushReturnsHeldInput pins that a held-back prefix is not
+// lost when input ends: a trailing partial sequence is ordinary keystrokes, and
+// dropping them loses input exactly when a launcher half-closes or dies.
+func TestDetachFilter_FlushReturnsHeldInput(t *testing.T) {
+	d := &detachFilter{seq: containerDetachBytes}
+	assert.Equal(t, "hi", string(d.filter([]byte("hi"))))
+	assert.Empty(t, d.filter([]byte{0x1c}), "a possible prefix is held")
+	assert.Equal(t, []byte{0x1c}, d.flush(), "and returned when the stream ends")
+	assert.Empty(t, d.flush(), "flush is idempotent")
 }
