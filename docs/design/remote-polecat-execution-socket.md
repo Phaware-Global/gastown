@@ -301,9 +301,12 @@ tty. It also moves the CLI's detach sequence out of reach: `-t` enables ctrl-p/c
 and since the launcher forwards raw bytes, that keystroke would exit the client
 while leaving the agent running — an orphan the one-agent-per-session fence would
 then let a second launcher double. An EMPTY `--detach-keys=` does **not** disable
-it (the CLI reads it as "unset" and installs the default), so the sequence is set
-to three NULs instead. That removes the accident, not the capability: the CLI
-always installs some escape proxy.
+it (the CLI reads it as "unset" and installs the default), so a sequence must be
+chosen: `ctrl-\` three times. NUL — what an earlier version used — is Ctrl+Space,
+an ordinary editing keystroke; `ctrl-\` is SIGQUIT on a normal terminal and is
+close to never typed. The worker also strips that byte sequence from container
+stdin, so it does not reach the client at all. Mitigation, not a proof: a
+sequence split across two frames would still pass.
 
 Other properties the implementation must hold, each learned the hard way:
 
@@ -314,11 +317,17 @@ Other properties the implementation must hold, each learned the hard way:
   non-blocking gives it to the runtime poller, where `Close` genuinely unblocks
   the pump. The drain wait is bounded anyway, so the exit frame never depends on
   an assumption about terminal teardown.
-- **The line discipline is quieted, not made raw.** Clearing ECHO and ISIG closes
-  the window where bytes are echoed back before the agent configures its own
-  terminal. Using raw mode for that would also clear OPOST — the pty then stops
-  translating `\n` to `\r\n`, so every line of agent output staircases, and
-  Ink cannot restore it — and ICANON, which is what interprets `^D` as EOF.
+- **The line discipline depends on what the pty IS.** In NATIVE mode it is the
+  agent's terminal and is left exactly as the kernel made it: `^C` interrupts,
+  `^D` ends input, `^S` pauses, `\n` becomes `\r\n`, and an interactive agent
+  turns off whatever it wants to handle itself. Reaching in here is how earlier
+  attempts broke output (clearing OPOST staircases every line — Ink cannot
+  restore it), EOF (clearing ICANON), and interrupts (clearing ISIG removes the
+  last interrupt path, since the launcher's own raw mode means no local SIGINT
+  is ever raised to forward). In CONTAINER mode it is plumbing to the docker
+  client, which owns the real terminal via `-t`, so it is made fully raw:
+  transparent, with no echo, no double newline translation, and no `^S`/`^C`
+  intercepted in transit.
 - **A half-close does not hang up the terminal.** Closing stdin is the right
   answer on a pipe; on a pty, stdin and stdout are the same master, so closing it
   SIGHUPs the agent and truncates its output. The terminal's own EOF is `^D`.

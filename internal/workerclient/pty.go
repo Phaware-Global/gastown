@@ -11,6 +11,7 @@ import (
 
 	"github.com/creack/pty"
 	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 
 	"github.com/steveyegge/gastown/internal/sockproto"
 )
@@ -85,7 +86,7 @@ func winsize(cols, rows int) (*pty.Winsize, []string) {
 }
 
 // startPTY starts cmd attached to a new pty and returns its master side.
-func startPTY(cmd *exec.Cmd, initial *sockproto.Resize) (*ptySession, error) {
+func startPTY(cmd *exec.Cmd, initial *sockproto.Resize, plumbing bool) (*ptySession, error) {
 	cols, rows := 0, 0
 	if initial != nil {
 		cols, rows = initial.Cols, initial.Rows
@@ -105,30 +106,42 @@ func startPTY(cmd *exec.Cmd, initial *sockproto.Resize) (*ptySession, error) {
 	// Make the master POLLABLE before anything reads it. creack/pty opens it
 	// blocking, so Go serves reads with a plain syscall on a thread — and a read
 	// parked there is uninterruptible: neither Close nor SetReadDeadline returns
-	// it (both verified by probe on this platform). A pump parked that way leaks
-	// a goroutine, an OS thread and the fd for the life of the process, once per
-	// wedged session. Re-wrapping the fd non-blocking hands it to the runtime
-	// poller, where Close does unblock the reader.
+	// it (both verified by probe). A pump parked that way leaks a goroutine, an
+	// OS thread and the fd for the life of the process, once per wedged session.
+	// Re-wrapping the fd non-blocking hands it to the runtime poller, where Close
+	// does unblock the reader.
 	master, err = pollable(master)
 	if err != nil {
+		// The child is ALREADY RUNNING — StartWithSize forked and exec'd it — so
+		// returning here without killing it would leave a live agent holding the
+		// worktree while the session slot is released: the orphan the
+		// one-agent-per-session fence exists to prevent.
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		_ = master.Close()
 		return nil, fmt.Errorf("make pty master pollable: %w", err)
 	}
 
-	// Close the ECHO/ISIG window WITHOUT touching output processing. A fresh
-	// slave has ECHO and ISIG on, so bytes arriving before the child configures
-	// its own terminal are echoed back, and a 0x03 in that window raises SIGINT
-	// against this pty's foreground group instead of reaching the agent.
+	// The line discipline depends on what this pty IS.
 	//
-	// This deliberately does NOT use raw mode: MakeRaw also clears OPOST — the
-	// pty then stops translating \n to \r\n, so every line of agent output
-	// staircases down the pane — and clears ICANON, which is the line discipline
-	// that interprets ^D as EOF. Both matter here: the agent's output is the
-	// whole point, and ^D is the only in-band way to give a pty session EOF now
-	// that closing stdin would hang up the line.
-	if err := quietTerminal(master); err != nil {
-		// Not fatal: the agent still has a terminal, it may just echo briefly.
-		slog.Default().Warn("could not quiet the pty line discipline", "err", err)
+	// NATIVE: it is the agent's terminal, so leave it exactly as the kernel made
+	// it. A terminal is where ^C interrupts, ^D ends input, ^S pauses output and
+	// \n becomes \r\n; an interactive agent turns off what it wants to handle
+	// itself. Reaching in here is how an earlier version broke output (clearing
+	// OPOST staircased every line) and EOF (clearing ICANON), and clearing ISIG
+	// would remove the last interrupt path a non-interactive program has — the
+	// launcher's own raw mode means no local SIGINT is ever raised to forward.
+	//
+	// CONTAINER: it is PLUMBING to the docker client, which allocates the real
+	// terminal inside the container with -t. Here the outer discipline must do
+	// nothing at all: it would echo bytes back, double-translate newlines the
+	// inner tty already produced, let ^C tear down the client instead of
+	// reaching the agent, and let ^S/^O freeze or discard the agent's output on
+	// the way through. Raw is exactly "transparent".
+	if plumbing {
+		if _, err := term.MakeRaw(int(master.Fd())); err != nil {
+			slog.Default().Warn("could not make the container pty transparent", "err", err)
+		}
 	}
 	return &ptySession{master: master}, nil
 }
@@ -136,11 +149,15 @@ func startPTY(cmd *exec.Cmd, initial *sockproto.Resize) (*ptySession, error) {
 // pollable re-wraps a blocking fd as a non-blocking one owned by Go's runtime
 // poller, so a blocked Read can be unblocked by Close.
 func pollable(f *os.File) (*os.File, error) {
-	dup, err := unix.Dup(int(f.Fd()))
+	// F_DUPFD_CLOEXEC, not Dup+CloseOnExec: the two-step form leaves a window in
+	// which a concurrently forking child (this worker execs docker, git and the
+	// agent itself from other goroutines) inherits the pty master — and an
+	// unrelated long-lived child holding a copy keeps the pty alive, undoing the
+	// very leak fix this function exists for.
+	dup, err := unix.FcntlInt(f.Fd(), unix.F_DUPFD_CLOEXEC, 0)
 	if err != nil {
 		return f, err
 	}
-	unix.CloseOnExec(dup)
 	if err := unix.SetNonblock(dup, true); err != nil {
 		_ = unix.Close(dup)
 		return f, err
@@ -151,17 +168,6 @@ func pollable(f *os.File) (*os.File, error) {
 		return f, err
 	}
 	return g, nil
-}
-
-// quietTerminal clears ECHO and ISIG on a pty, leaving OPOST (newline
-// translation) and ICANON (^D as EOF) alone.
-func quietTerminal(master *os.File) error {
-	t, err := unix.IoctlGetTermios(int(master.Fd()), ioctlReadTermios)
-	if err != nil {
-		return err
-	}
-	t.Lflag &^= unix.ECHO | unix.ECHOE | unix.ECHOK | unix.ECHONL | unix.ISIG
-	return unix.IoctlSetTermios(int(master.Fd()), ioctlWriteTermios, t)
 }
 
 // resize applies a new window size, which is what makes a running TUI redraw.

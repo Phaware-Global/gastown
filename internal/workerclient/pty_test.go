@@ -12,6 +12,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"github.com/steveyegge/gastown/internal/sockproto"
 )
@@ -91,7 +92,7 @@ func TestPTYClose_UnblocksAParkedPump(t *testing.T) {
 // EOF mechanism at all — which is exactly what the half-close fix promises.
 func TestPTY_PreservesOutputProcessingAndCanonicalInput(t *testing.T) {
 	cmd := exec.Command("/bin/sh", "-c", "printf 'one\\ntwo\\n'")
-	p, err := startPTY(cmd, &sockproto.Resize{Cols: 80, Rows: 24})
+	p, err := startPTY(cmd, &sockproto.Resize{Cols: 80, Rows: 24}, false)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = p.Close() })
 
@@ -111,7 +112,7 @@ func TestPTY_PreservesOutputProcessingAndCanonicalInput(t *testing.T) {
 
 	// ICANON: ^D must end a reader, not arrive as a byte.
 	catCmd := exec.Command("cat")
-	cp, err := startPTY(catCmd, &sockproto.Resize{Cols: 80, Rows: 24})
+	cp, err := startPTY(catCmd, &sockproto.Resize{Cols: 80, Rows: 24}, false)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cp.Close() })
 	_, err = cp.Write([]byte("hello\n"))
@@ -207,4 +208,69 @@ func TestPTY_CrossCompiles(t *testing.T) {
 			require.NoError(t, err, "the worker must build for %s/%s:\n%s", target.goos, target.goarch, out)
 		})
 	}
+}
+
+// TestPTY_NativeLeavesTheTerminalAlone pins the role split. A NATIVE pty IS the
+// agent's terminal, so every discipline flag must stay as the kernel made it:
+// clearing ISIG would remove the last interrupt path (the launcher's own raw
+// mode means no local SIGINT is ever raised to forward as a signal frame), and
+// clearing IXON/IEXTEN or OPOST changes what a terminal means.
+func TestPTY_NativeLeavesTheTerminalAlone(t *testing.T) {
+	cmd := exec.Command("sleep", "5")
+	p, err := startPTY(cmd, &sockproto.Resize{Cols: 80, Rows: 24}, false)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.Close(); _ = cmd.Process.Kill(); _ = cmd.Wait() })
+
+	tio, err := unix.IoctlGetTermios(int(p.master.Fd()), ioctlGet)
+	require.NoError(t, err)
+	assert.NotZero(t, tio.Lflag&unix.ISIG, "^C must still interrupt: it is the only interrupt path left")
+	assert.NotZero(t, tio.Lflag&unix.ICANON, "^D must still mean EOF")
+	assert.NotZero(t, tio.Oflag&unix.OPOST, "output translation must survive or every line staircases")
+	assert.NotZero(t, tio.Iflag&unix.IXON, "a terminal is where ^S pauses output")
+}
+
+// TestPTY_ContainerIsTransparentPlumbing pins the other half: with -t the docker
+// client owns the real terminal inside the container, so the outer pty must do
+// NOTHING — otherwise it echoes bytes back, double-translates newlines the inner
+// tty already produced, lets ^C tear down the client instead of reaching the
+// agent, and lets ^S/^O freeze or discard the agent's output in transit.
+func TestPTY_ContainerIsTransparentPlumbing(t *testing.T) {
+	cmd := exec.Command("sleep", "5")
+	p, err := startPTY(cmd, &sockproto.Resize{Cols: 80, Rows: 24}, true)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.Close(); _ = cmd.Process.Kill(); _ = cmd.Wait() })
+
+	tio, err := unix.IoctlGetTermios(int(p.master.Fd()), ioctlGet)
+	require.NoError(t, err)
+	for _, f := range []struct {
+		name string
+		set  bool
+	}{
+		{"ECHO", tio.Lflag&unix.ECHO != 0},
+		{"ISIG", tio.Lflag&unix.ISIG != 0},
+		{"IEXTEN", tio.Lflag&unix.IEXTEN != 0},
+		{"OPOST", tio.Oflag&unix.OPOST != 0},
+		{"IXON", tio.Iflag&unix.IXON != 0},
+	} {
+		assert.False(t, f.set, "%s must be off: this pty is plumbing, not a terminal", f.name)
+	}
+}
+
+// TestPollable_IsCloseOnExec pins that the duplicated master cannot leak into a
+// concurrently forked child. The worker forks constantly (docker, git, the agent
+// itself), and a child holding a copy keeps the pty alive — undoing the leak fix
+// the dup exists for.
+func TestPollable_IsCloseOnExec(t *testing.T) {
+	master, slave, err := pty.Open()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = slave.Close() })
+
+	dup, err := pollable(master)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = dup.Close() })
+
+	flags, err := unix.FcntlInt(dup.Fd(), unix.F_GETFD, 0)
+	require.NoError(t, err)
+	assert.NotZero(t, flags&unix.FD_CLOEXEC,
+		"the master must be close-on-exec, atomically — Dup then CloseOnExec leaves a fork window")
 }

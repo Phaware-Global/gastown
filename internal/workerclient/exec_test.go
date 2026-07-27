@@ -1,6 +1,7 @@
 package workerclient
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -930,4 +931,20 @@ func TestExecCommand_ContainerTTYDisablesDetachKeys(t *testing.T) {
 		&sockproto.Message{Argv: []string{"claude"}}, "/work", "gt-work-demo-furiosa", "")
 	require.NoError(t, err)
 	assert.NotContains(t, strings.Join(noTTY.Args, " "), "--detach-keys")
+}
+
+// TestExecStream_ContainerStdinStripsTheDetachSequence pins the defense in depth
+// behind the detach fence: the docker CLI always installs SOME escape proxy, so
+// the only way to make detach unreachable is for those bytes never to arrive.
+func TestExecStream_ContainerStdinStripsTheDetachSequence(t *testing.T) {
+	// The filter is applied to the bytes the worker writes to the client's pty.
+	in := append([]byte("hello"), containerDetachBytes...)
+	in = append(in, []byte("world")...)
+	assert.Equal(t, "helloworld", string(bytes.ReplaceAll(in, containerDetachBytes, nil)),
+		"the sequence must be removed, and nothing else")
+
+	// A partial sequence is ordinary input and must survive.
+	partial := []byte{'a', 0x1c, 0x1c, 'b'}
+	assert.Equal(t, partial, bytes.ReplaceAll(partial, containerDetachBytes, nil),
+		"two of three is a keystroke, not a detach")
 }

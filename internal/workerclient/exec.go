@@ -1,6 +1,7 @@
 package workerclient
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -23,10 +24,22 @@ import (
 // wedged session is the whole worker).
 const execWaitDelay = 10 * time.Second
 
-// containerDetachKeys is an untypable escape sequence for `docker exec -t`.
-// Empty does NOT disable detach (the CLI reads it as "unset"), so this replaces
-// the ctrl-p,ctrl-q default with three NULs.
-const containerDetachKeys = "ctrl-@,ctrl-@,ctrl-@"
+// containerDetachKeys replaces docker's ctrl-p,ctrl-q detach sequence for
+// `docker exec -t`. Empty does NOT disable detach (the CLI reads it as
+// "unset"), so a sequence must be chosen rather than cleared.
+//
+// ctrl-\ three times, not the NULs an earlier version used: NUL is what
+// Ctrl+Space sends, which is set-mark in readline and Emacs — an ordinary
+// editing keystroke inside the very agent this protects. Ctrl+\ is SIGQUIT on a
+// normal terminal, so it is close to never typed, let alone three times running.
+const containerDetachKeys = `ctrl-\,ctrl-\,ctrl-\`
+
+// containerDetachBytes is what that sequence is on the wire, stripped from
+// container stdin as defense in depth: the CLI always installs SOME escape
+// proxy, so the only way to make detach unreachable is to ensure those bytes
+// never arrive. A sequence split across two frames would still pass, which is
+// why the choice above matters too — this is mitigation, not a proof.
+var containerDetachBytes = []byte{0x1c, 0x1c, 0x1c}
 
 // ptyDrainGrace is how long the output pump may keep reading a pty master after
 // the agent exits, before the master is closed to unblock it. Long enough to
@@ -162,7 +175,9 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 	)
 	if m.TTY {
 		initial := &sockproto.Resize{Cols: m.Cols, Rows: m.Rows}
-		tty, err = startPTY(cmd, initial)
+		// container != "" means the pty is plumbing to the docker client rather
+		// than the agent's own terminal.
+		tty, err = startPTY(cmd, initial, container != "")
 		if err != nil {
 			_ = c.writeFrame(sockproto.FrameStderr, []byte("gt-worker-client: "+err.Error()+"\n"))
 			_ = c.writeExit(126)
@@ -243,6 +258,10 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 
 	// Read inbound frames: stdin, signals, resize. Ends when the launcher
 	// closes the stream (agent stdin then sees EOF).
+	// Container stdin is filtered for the docker detach sequence; a native pty
+	// has no client in the middle to detach from.
+	stripDetach := tty != nil && container != ""
+
 	inboundDone := make(chan struct{})
 	// agentDone marks the agent as already exited, so the teardown-time read
 	// error below is expected rather than a lost launcher.
@@ -282,6 +301,9 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 			}
 			switch t {
 			case sockproto.FrameStdin:
+				if stripDetach {
+					payload = bytes.ReplaceAll(payload, containerDetachBytes, nil)
+				}
 				if _, werr := stdin.Write(payload); werr != nil {
 					return
 				}
