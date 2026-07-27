@@ -41,6 +41,43 @@ func attachStream(t *testing.T, addr string, sessionID string, argv []string, en
 	return nc, codec
 }
 
+// drainStreamAsync reads frames on ANOTHER goroutine and delivers the result
+// over a channel. Tests that need a timeout must use this rather than calling
+// drainStream in a `go func`: drainStream uses require, i.e. t.FailNow, which
+// the testing package documents must only be called from the test goroutine —
+// from elsewhere it Goexits that goroutine, so the test's channel never closes
+// and it reports a timeout with the wrong cause.
+type drainResult struct {
+	stdout, stderr string
+	code           int
+	err            error
+}
+
+func drainStreamAsync(codec *sockproto.Codec) <-chan drainResult {
+	ch := make(chan drainResult, 1)
+	go func() {
+		var out, errOut strings.Builder
+		for {
+			ft, payload, err := sockproto.ReadFrame(codec.Reader())
+			if err != nil {
+				ch <- drainResult{out.String(), errOut.String(), 0, err}
+				return
+			}
+			switch ft {
+			case sockproto.FrameStdout:
+				out.Write(payload)
+			case sockproto.FrameStderr:
+				errOut.Write(payload)
+			case sockproto.FrameExit:
+				code, err := sockproto.ExitCodeFromFrame(payload)
+				ch <- drainResult{out.String(), errOut.String(), code, err}
+				return
+			}
+		}
+	}()
+	return ch
+}
+
 // drainStream reads frames until the exit frame, returning stdout, stderr, and
 // the exit code.
 func drainStream(t *testing.T, codec *sockproto.Codec) (string, string, int) {
@@ -699,15 +736,10 @@ func TestExecStream_ResizeIsApplied(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, sockproto.WriteFrame(conn, sockproto.FrameResize, payload))
 
-	done := make(chan struct{})
-	var out string
-	go func() {
-		out, _, _ = drainStream(t, codec)
-		close(done)
-	}()
 	select {
-	case <-done:
-		assert.Contains(t, strings.ReplaceAll(out, "\r", ""), "55 150",
+	case res := <-drainStreamAsync(codec):
+		require.NoError(t, res.err)
+		assert.Contains(t, strings.ReplaceAll(res.stdout, "\r", ""), "55 150",
 			"the agent must see the new geometry")
 	case <-time.After(20 * time.Second):
 		t.Fatal("the resize never reached the terminal")
@@ -725,18 +757,173 @@ func TestExecStream_TTYSignalStillReachesTheAgent(t *testing.T) {
 	time.Sleep(500 * time.Millisecond) // let the trap install
 	require.NoError(t, sockproto.WriteFrame(conn, sockproto.FrameSignal, []byte("SIGINT")))
 
-	done := make(chan struct{})
-	var out string
-	var code int
-	go func() {
-		out, _, code = drainStream(t, codec)
-		close(done)
-	}()
 	select {
-	case <-done:
-		assert.Contains(t, out, "got-int", "the pane's Ctrl-C must still reach a pty agent")
-		assert.Equal(t, 0, code)
+	case res := <-drainStreamAsync(codec):
+		require.NoError(t, res.err)
+		assert.Contains(t, res.stdout, "got-int", "the pane's Ctrl-C must still reach a pty agent")
+		assert.Equal(t, 0, res.code)
 	case <-time.After(20 * time.Second):
 		t.Fatal("signal was not delivered to the pty agent")
 	}
+}
+
+// TestExecStream_TTYRejectsOutOfRangeGeometry pins the narrowing that three `> 0`
+// guards did not catch: cols/rows arrive as ints and reach the ioctl as uint16,
+// so 65536 passed every check and produced a ZERO-column terminal.
+func TestExecStream_TTYRejectsOutOfRangeGeometry(t *testing.T) {
+	addr, _ := provisionedService(t)
+
+	t.Run("attach geometry", func(t *testing.T) {
+		nc := rawDial(t, addr)
+		codec := sockproto.NewCodec(nc)
+		require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeAuth, Token: "t0k"}))
+		require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeHello, ID: "h", ProtoVersion: sockproto.ProtoVersion}))
+		_, err := codec.Recv()
+		require.NoError(t, err)
+		require.NoError(t, codec.Send(&sockproto.Message{
+			Type: sockproto.TypeAttach, ID: "a", Session: "gt-demo-furiosa",
+			Argv: []string{"sh", "-c", "stty size"}, TTY: true, Cols: 65536, Rows: 55,
+		}))
+		ack, err := codec.Recv()
+		require.NoError(t, err)
+		require.Equal(t, sockproto.TypeAttachAck, ack.Type)
+		_, errOut, code := drainStream(t, codec)
+		assert.Equal(t, 126, code, "a 0-column terminal must be refused, not created")
+		assert.Contains(t, errOut, "outside 1..65535")
+	})
+
+	t.Run("resize frame", func(t *testing.T) {
+		conn, codec := attachStreamTTY(t, addr, "gt-demo-furiosa",
+			[]string{"sh", "-c", "trap 'stty size; exit 0' WINCH; i=0; while [ $i -lt 60 ]; do sleep 0.1; i=$((i+1)); done; stty size"}, 90, 30)
+		time.Sleep(400 * time.Millisecond)
+
+		bogus, err := sockproto.MarshalResize(65536, 55)
+		require.NoError(t, err)
+		require.NoError(t, sockproto.WriteFrame(conn, sockproto.FrameResize, bogus))
+
+		select {
+		case res := <-drainStreamAsync(codec):
+			require.NoError(t, res.err)
+			// The refused resize must leave the ORIGINAL geometry intact.
+			assert.Contains(t, strings.ReplaceAll(res.stdout, "\r", ""), "30 90",
+				"a rejected resize must not change the terminal")
+		case <-time.After(30 * time.Second):
+			t.Fatal("the agent never reported its geometry")
+		}
+	})
+}
+
+// TestExecStream_TTYSetsTERM pins that the agent gets a terminal TYPE as well as
+// a terminal: a supervised worker has a stripped environment and TERM is not on
+// the wire env allowlist, so without this every termcap consumer inside the
+// session treats it as dumb.
+func TestExecStream_TTYSetsTERM(t *testing.T) {
+	addr, _ := provisionedService(t)
+
+	nc := rawDial(t, addr)
+	codec := sockproto.NewCodec(nc)
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeAuth, Token: "t0k"}))
+	require.NoError(t, codec.Send(&sockproto.Message{Type: sockproto.TypeHello, ID: "h", ProtoVersion: sockproto.ProtoVersion}))
+	_, err := codec.Recv()
+	require.NoError(t, err)
+	require.NoError(t, codec.Send(&sockproto.Message{
+		Type: sockproto.TypeAttach, ID: "a", Session: "gt-demo-furiosa",
+		Argv: []string{"sh", "-c", "echo TERM=$TERM"}, TTY: true, Cols: 80, Rows: 24,
+		Term: "screen-256color",
+	}))
+	ack, err := codec.Recv()
+	require.NoError(t, err)
+	require.Equal(t, sockproto.TypeAttachAck, ack.Type)
+
+	out, _, code := drainStream(t, codec)
+	require.Equal(t, 0, code)
+	assert.Contains(t, out, "TERM=screen-256color", "the launcher's TERM must reach the agent")
+}
+
+// TestTTYTerm pins the fallback and the charset: TERM becomes an env var in the
+// agent's environment, so a wire value is validated rather than trusted.
+func TestTTYTerm(t *testing.T) {
+	assert.Equal(t, "screen-256color", ttyTerm("screen-256color"))
+	assert.Equal(t, "xterm-256color", ttyTerm(""), "a launcher that sends none still gets a usable terminal")
+	for _, bogus := range []string{"x;rm -rf /", "a b", "x\nY", strings.Repeat("x", 65)} {
+		assert.Equal(t, "xterm-256color", ttyTerm(bogus), "%q must not reach the agent's env", bogus)
+	}
+}
+
+// TestExecStream_TTYHalfCloseDoesNotHangUpTheTerminal pins the invariant a pty
+// broke: closing stdin is the right answer to a half-close on a PIPE, but on a
+// pty stdin and stdout are the same master, so closing it SIGHUPs the agent and
+// truncates its output.
+func TestExecStream_TTYHalfCloseDoesNotHangUpTheTerminal(t *testing.T) {
+	addr, _ := provisionedService(t)
+
+	conn, codec := attachStreamTTY(t, addr, "gt-demo-furiosa",
+		[]string{"sh", "-c", "sleep 1; echo STILL_ALIVE; exit 7"}, 80, 24)
+	// Half-close immediately: with the old behavior the agent took SIGHUP here.
+	require.NoError(t, conn.(*net.UnixConn).CloseWrite())
+
+	select {
+	case res := <-drainStreamAsync(codec):
+		require.NoError(t, res.err)
+		assert.Contains(t, res.stdout, "STILL_ALIVE", "a half-close must not hang up the terminal")
+		assert.Equal(t, 7, res.code, "the agent's own exit code must survive")
+	case <-time.After(30 * time.Second):
+		t.Fatal("the session never completed after a half-close")
+	}
+}
+
+// TestExecStream_TTYExitsWhenADescendantHoldsTheSlave is the regression test for
+// the wedge: a pty master is nobody's pipe, so cmd.Wait closes nothing, and a
+// descendant outliving the agent kept the output pump readable forever — no exit
+// frame, and at MaxSessions=1 the whole worker stuck until restart.
+func TestExecStream_TTYExitsWhenADescendantHoldsTheSlave(t *testing.T) {
+	prev := ptyDrainGrace
+	ptyDrainGrace = 500 * time.Millisecond
+	t.Cleanup(func() { ptyDrainGrace = prev })
+
+	addr, svc := provisionedService(t)
+
+	// The agent exits immediately; a grandchild keeps the slave open for a minute.
+	_, codec := attachStreamTTY(t, addr, "gt-demo-furiosa",
+		[]string{"sh", "-c", "sleep 60 & echo AGENT_DONE; exit 3"}, 80, 24)
+
+	select {
+	case res := <-drainStreamAsync(codec):
+		require.NoError(t, res.err)
+		assert.Equal(t, 3, res.code, "the exit frame must arrive despite the lingering descendant")
+		assert.Contains(t, res.stdout, "AGENT_DONE", "output before the exit must still be flushed")
+	case <-time.After(30 * time.Second):
+		t.Fatal("the session wedged: no exit frame while a descendant held the pty slave")
+	}
+
+	// And the session must be attachable again rather than pinned.
+	require.Eventually(t, func() bool {
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		return svc.sessions["gt-demo-furiosa"].execCancel == nil
+	}, 10*time.Second, 50*time.Millisecond, "the exec slot must be released")
+}
+
+// TestExecCommand_ContainerTTYDisablesDetachKeys pins that a container exec turns
+// OFF docker's ctrl-p/ctrl-q sequence, which -t silently enables. The launcher
+// forwards raw bytes, so an operator pressing it would make the docker client
+// exit 0 while the in-container agent kept running — an orphan that the
+// one-agent-per-session fence would then happily let a second launcher double.
+func TestExecCommand_ContainerTTYDisablesDetachKeys(t *testing.T) {
+	s := &Service{cfg: Config{}, log: slog.Default()}
+
+	cmd, err := s.execCommand(context.Background(),
+		&sockproto.Message{Argv: []string{"claude"}, TTY: true, Cols: 80, Rows: 24},
+		"/work", "gt-work-demo-furiosa", "")
+	require.NoError(t, err)
+
+	joined := strings.Join(cmd.Args, " ")
+	assert.Contains(t, joined, "-t", "the agent needs a terminal inside the container")
+	assert.Contains(t, joined, "--detach-keys=", "detach must be disabled, or a keystroke orphans the agent")
+
+	// Without a tty there is no detach sequence to disable, and no -t.
+	noTTY, err := s.execCommand(context.Background(),
+		&sockproto.Message{Argv: []string{"claude"}}, "/work", "gt-work-demo-furiosa", "")
+	require.NoError(t, err)
+	assert.NotContains(t, strings.Join(noTTY.Args, " "), "--detach-keys")
 }

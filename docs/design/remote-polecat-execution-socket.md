@@ -293,10 +293,37 @@ Two consequences:
   to 80x24 forever) and `SIGWINCH` on the pane sends a `resize` frame; tmux
   resizes panes constantly.
 
-Container mode passes `-t` to `docker exec` so the terminal is allocated inside
-the container rather than wrapping it in a second pty on the worker. The
-launcher puts its local terminal in raw mode for the session and restores it on
-every exit path, so the pane's keystrokes belong to the remote agent.
+Container mode passes `-t` so the AGENT gets a terminal inside the container.
+The worker's own pty is still allocated around the `docker exec` client, because
+`docker exec -it` requires its own stdin to be a terminal — two line disciplines
+in series, with the client propagating the worker's `SIGWINCH` to the container's
+tty. It also passes `--detach-keys=` : `-t` enables the CLI's ctrl-p/ctrl-q
+detach, and since the launcher forwards raw bytes, that keystroke would exit the
+client while leaving the agent running — an orphan the one-agent-per-session
+fence would then let a second launcher double.
+
+Other properties the implementation must hold, each learned the hard way:
+
+- **The exit frame is written even if the output pump is stuck.** A pty master is
+  nobody's pipe, so `cmd.Wait` closes nothing and a descendant outliving the
+  agent can keep the pump blocked; closing the master does not reliably interrupt
+  a read already in the syscall. So the drain wait is BOUNDED — a parked pump is
+  a leak the connection's close reaps, whereas an unbounded wait wedges the
+  worker at `max_sessions: 1`.
+- **A half-close does not hang up the terminal.** Closing stdin is the right
+  answer on a pipe; on a pty, stdin and stdout are the same master, so closing it
+  SIGHUPs the agent and truncates its output. The terminal's own EOF is `^D`.
+- **Geometry is validated against `uint16`, not against `> 0`.** These values
+  reach an ioctl field, so 65536 would truncate to a zero-column terminal.
+- **`TERM` travels in the preamble.** A supervised worker has a stripped
+  environment and `TERM` is not on the wire env allowlist, so without this the
+  agent would have a terminal that every termcap consumer treats as dumb.
+
+The launcher puts its local terminal in raw mode for the session and restores it
+on every exit path — including a panic in any goroutine, and a terminating signal
+that the remote agent does not answer within a grace period, after which it
+detaches on its own. Without that, a wedged stream could only be killed with
+`SIGKILL`, which runs no defers and strands the operator in a shell with no echo.
 
 Stream rules that follow from the framing:
 

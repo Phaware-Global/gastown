@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -21,6 +22,12 @@ import (
 // enough that a wedged agent cannot pin the session (MaxSessions=1 means one
 // wedged session is the whole worker).
 const execWaitDelay = 10 * time.Second
+
+// ptyDrainGrace is how long the output pump may keep reading a pty master after
+// the agent exits, before the master is closed to unblock it. Long enough to
+// flush a final screen, short enough that a lingering descendant cannot wedge
+// the session.
+var ptyDrainGrace = 2 * time.Second
 
 // execProbeInterval is how often an attached stream probes the launcher's
 // liveness. A var so tests can drive the dead-peer path without waiting.
@@ -149,10 +156,7 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 		stderr io.Reader
 	)
 	if m.TTY {
-		var initial *sockproto.Resize
-		if m.Cols > 0 && m.Rows > 0 {
-			initial = &sockproto.Resize{Cols: m.Cols, Rows: m.Rows}
-		}
+		initial := &sockproto.Resize{Cols: m.Cols, Rows: m.Rows}
 		tty, err = startPTY(cmd, initial)
 		if err != nil {
 			_ = c.writeFrame(sockproto.FrameStderr, []byte("gt-worker-client: "+err.Error()+"\n"))
@@ -240,7 +244,15 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 	agentDone := make(chan struct{})
 	go func() {
 		defer close(inboundDone)
-		defer func() { _ = stdin.Close() }()
+		// Closing stdin is the right response to a half-close on a PIPE. On a pty
+		// it is not: stdin and stdout are the same master, so closing it hangs up
+		// the line — SIGHUP to the agent's foreground group, killing a process the
+		// protocol promises to keep alive, and truncating its output as the pump's
+		// read fails. The terminal's own EOF is ^D, which a launcher can send as
+		// ordinary input if it means it.
+		if tty == nil {
+			defer func() { _ = stdin.Close() }()
+		}
 		for {
 			t, payload, err := sockproto.ReadFrame(c.frameReader())
 			if err != nil {
@@ -319,7 +331,29 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 	waitErr := cmd.Wait()
 	close(agentDone) // stop the prober; later read errors are expected
 	<-proberDone     // no prober write may race the terminal exit frame
-	pumps.Wait()     // flush all output BEFORE the terminal exit frame
+
+	// Flush all output BEFORE the terminal exit frame.
+	//
+	// On a PIPE this is safe to wait on unconditionally: cmd.Wait closes the
+	// parent ends of the pipes it created, so the pumps always unwind.
+	//
+	// A pty master is nobody's pipe. cmd.Wait closes nothing, and any descendant
+	// that outlived the agent still holds the slave open, so on Linux the pump's
+	// read never returns. Closing the master is not a reliable remedy either — a
+	// read already blocked in the syscall is not necessarily interrupted by
+	// Close, which a test in this package demonstrates — so the wait itself is
+	// bounded. The invariant that matters is that the exit frame is ALWAYS
+	// written and the session slot released; a pump goroutine parked on a dead
+	// terminal is a leak the connection's own close reaps, not a wedged worker.
+	if tty == nil {
+		pumps.Wait()
+	} else {
+		_ = tty.Close() // release the fd; may or may not interrupt the reader
+		if !waitOrTimeout(&pumps, ptyDrainGrace) {
+			s.log.Warn("pty output pump did not drain; writing the exit frame anyway",
+				"session", m.Session, "grace", ptyDrainGrace)
+		}
+	}
 
 	// The inbound goroutine is parked in a blocking socket read, which ctx
 	// cancellation cannot interrupt — expire the READ deadline to unblock it
@@ -352,14 +386,32 @@ func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktre
 	if err != nil {
 		return nil, err
 	}
+	if m.TTY {
+		// A terminal with no TERM is a terminal every termcap consumer treats as
+		// dumb — no colour, no cursor movement — which is worse than the pipe it
+		// replaced. The worker's own environment cannot supply it (a supervised
+		// service has a stripped env: the launchd job sets PATH and nothing
+		// else), and TERM is not on the wire env allowlist, so the launcher sends
+		// it in the attach preamble instead of the allowlist being widened for it.
+		env = append(env, "TERM="+ttyTerm(m.Term))
+	}
 
 	if container != "" {
 		args := []string{"exec", "-i", "-w", "/work"}
 		if tty {
-			// docker allocates the terminal inside the container; the worker
-			// does not wrap this in a pty of its own, or the agent would be
-			// behind two of them.
-			args = append(args, "-t")
+			// -t gives the AGENT a terminal inside the container. The worker's own
+			// pty is still allocated around the docker client, because `docker
+			// exec -it` requires its stdin to be a terminal — so there are two
+			// line disciplines in series, and the client propagates our SIGWINCH
+			// to the container's tty. (An earlier comment here claimed the worker
+			// does not wrap this; it does, and it must.)
+			//
+			// --detach-keys="" disables the CLI's ctrl-p/ctrl-q sequence, which is
+			// only active with -t: the launcher forwards raw bytes, so an operator
+			// pressing it would make the client exit 0 while the in-container
+			// agent kept running — an orphan the one-agent-per-session fence would
+			// then let a second launcher double.
+			args = append(args, "-t", "--detach-keys=")
 		}
 		for _, kv := range env {
 			args = append(args, "-e", kv)
@@ -530,6 +582,37 @@ func signalName(sig syscall.Signal) string {
 		return ""
 	}
 }
+
+// waitOrTimeout waits for wg, reporting whether it finished within d.
+//
+// It exists because a blocked pty read cannot be assumed interruptible: waiting
+// on it forever is what turns one lingering descendant into a wedged worker.
+func waitOrTimeout(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
+// ttyTerm picks the terminal type for a pty session: the launcher's, when it
+// sent one that looks like a terminfo name, else a widely-supported default.
+// Validated because it becomes an env var in the agent's environment.
+func ttyTerm(requested string) string {
+	if requested != "" && len(requested) <= 64 && validTerm.MatchString(requested) {
+		return requested
+	}
+	return "xterm-256color"
+}
+
+// validTerm is the terminfo name charset: letters, digits, and -+._
+var validTerm = regexp.MustCompile(`^[A-Za-z0-9._+-]+$`)
 
 // exitCode extracts a process exit status; a signal death has no exit status,
 // so it is reported as -1 and encoded as 255 on the wire.

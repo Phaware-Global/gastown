@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/term"
 
@@ -99,6 +100,7 @@ func run(address, session, token, workerName string, argv []string) (int, error)
 		TTY:     tty,
 		Cols:    cols,
 		Rows:    rows,
+		Term:    os.Getenv("TERM"),
 	}); err != nil {
 		return 1, fmt.Errorf("sending attach: %w", err)
 	}
@@ -117,12 +119,25 @@ func run(address, session, token, workerName string, argv []string) (int, error)
 	// the local line discipline must not buffer lines, echo them, or turn ^C
 	// into a local signal. Restored on every exit path, including a panic, or
 	// the operator is left with an unusable shell.
+	restoreTerm := func() {}
 	if tty {
-		restore, err := term.MakeRaw(int(os.Stdin.Fd()))
+		state, err := term.MakeRaw(int(os.Stdin.Fd()))
 		if err != nil {
 			return 1, fmt.Errorf("putting the terminal in raw mode: %w", err)
 		}
-		defer term.Restore(int(os.Stdin.Fd()), restore)
+		var once sync.Once
+		restoreTerm = func() { once.Do(func() { _ = term.Restore(int(os.Stdin.Fd()), state) }) }
+		defer restoreTerm()
+		// A panic in ANY goroutine kills the process without unwinding run, so
+		// the deferred restore above would never run and the operator would be
+		// left in a shell with no echo and a dead Ctrl-C. Restore first, then let
+		// the panic proceed.
+		defer func() {
+			if r := recover(); r != nil {
+				restoreTerm()
+				panic(r)
+			}
+		}()
 	}
 
 	// One writer goroutine owns the outbound half so stdin and signal frames
@@ -162,12 +177,33 @@ func run(address, session, token, workerName string, argv []string) (int, error)
 			// worker would not recognize — and a silently dropped SIGINT means
 			// the pane's Ctrl-C never reaches the agent.
 			_ = writeFrame(sockproto.FrameSignal, []byte(canonicalSignalName(sig)))
+
+			// SIGINT belongs to the agent (it is the pane's Ctrl-C). The
+			// TERMINATING signals must also be able to stop THIS process:
+			// forwarding and nothing else meant no catchable signal could end the
+			// launcher, so a wedged stream left only SIGKILL — which runs no
+			// defers and strands the operator's terminal in raw mode.
+			switch sig {
+			case syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP:
+				time.AfterFunc(shutdownGrace, func() {
+					restoreTerm()
+					fmt.Fprintf(os.Stderr, "\r\ngt-worker-attach: agent did not exit within %s of %s; detaching\r\n",
+						shutdownGrace, canonicalSignalName(sig))
+					os.Exit(143)
+				})
+			}
 		}
 	}()
 
 	// Local stdin → stdin frames. Not waited on: a blocked read on a tty must
 	// never delay exit once the agent is gone.
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				restoreTerm()
+				panic(r)
+			}
+		}()
 		buf := make([]byte, 32<<10)
 		for {
 			n, err := os.Stdin.Read(buf)
@@ -209,6 +245,12 @@ func run(address, session, token, workerName string, argv []string) (int, error)
 		}
 	}
 }
+
+// shutdownGrace is how long the agent has to exit after a terminating signal
+// before the launcher detaches on its own, restoring the terminal on the way
+// out. Without it a wedged stream can only be killed with SIGKILL, which skips
+// every defer.
+var shutdownGrace = 10 * time.Second
 
 // canonicalSignalName maps a caught signal to the canonical wire name the
 // worker parses.

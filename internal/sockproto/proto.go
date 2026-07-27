@@ -183,6 +183,10 @@ type Message struct {
 	// dimensions once at startup would otherwise render to 80x24 forever.
 	Cols int `json:"cols,omitempty"`
 	Rows int `json:"rows,omitempty"`
+	// Term is the launcher's TERM. A worker cannot supply it — a supervised
+	// service has a stripped environment — and it is not on the env allowlist,
+	// so it travels here rather than widening that policy.
+	Term string `json:"term,omitempty"`
 
 	// shutdown / teardown (§4.2)
 	Reason        string `json:"reason,omitempty"`
