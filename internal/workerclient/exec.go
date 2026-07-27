@@ -23,6 +23,11 @@ import (
 // wedged session is the whole worker).
 const execWaitDelay = 10 * time.Second
 
+// containerDetachKeys is an untypable escape sequence for `docker exec -t`.
+// Empty does NOT disable detach (the CLI reads it as "unset"), so this replaces
+// the ctrl-p,ctrl-q default with three NULs.
+const containerDetachKeys = "ctrl-@,ctrl-@,ctrl-@"
+
 // ptyDrainGrace is how long the output pump may keep reading a pty master after
 // the agent exits, before the master is closed to unblock it. Long enough to
 // flush a final screen, short enough that a lingering descendant cannot wedge
@@ -337,18 +342,21 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 	// On a PIPE this is safe to wait on unconditionally: cmd.Wait closes the
 	// parent ends of the pipes it created, so the pumps always unwind.
 	//
-	// A pty master is nobody's pipe. cmd.Wait closes nothing, and any descendant
-	// that outlived the agent still holds the slave open, so on Linux the pump's
-	// read never returns. Closing the master is not a reliable remedy either — a
-	// read already blocked in the syscall is not necessarily interrupted by
-	// Close, which a test in this package demonstrates — so the wait itself is
-	// bounded. The invariant that matters is that the exit frame is ALWAYS
-	// written and the session slot released; a pump goroutine parked on a dead
-	// terminal is a leak the connection's own close reaps, not a wedged worker.
+	// A pty master is nobody's pipe: cmd.Wait closes nothing, and any descendant
+	// that outlived the agent still holds the slave open, so the pump's read does
+	// not return on its own. Closing the master IS the remedy — but only because
+	// startPTY made it pollable; on the blocking fd creack/pty returns, neither
+	// Close nor SetReadDeadline interrupts a parked read, and the pump would leak
+	// a goroutine, an OS thread and the fd for the life of the process, once per
+	// wedged session.
+	//
+	// The wait stays bounded anyway: the invariant that matters is that the exit
+	// frame is ALWAYS written and the slot released, and that must not rest on an
+	// assumption about how a terminal behaves at teardown.
 	if tty == nil {
 		pumps.Wait()
 	} else {
-		_ = tty.Close() // release the fd; may or may not interrupt the reader
+		_ = tty.Close() // pollable, so this unblocks the pump's read
 		if !waitOrTimeout(&pumps, ptyDrainGrace) {
 			s.log.Warn("pty output pump did not drain; writing the exit frame anyway",
 				"session", m.Session, "grace", ptyDrainGrace)
@@ -406,12 +414,23 @@ func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktre
 			// to the container's tty. (An earlier comment here claimed the worker
 			// does not wrap this; it does, and it must.)
 			//
-			// --detach-keys="" disables the CLI's ctrl-p/ctrl-q sequence, which is
-			// only active with -t: the launcher forwards raw bytes, so an operator
-			// pressing it would make the client exit 0 while the in-container
-			// agent kept running — an orphan the one-agent-per-session fence would
-			// then let a second launcher double.
-			args = append(args, "-t", "--detach-keys=")
+			// Move the CLI's detach sequence out of reach. -t enables it, the
+			// launcher forwards raw bytes, and an operator pressing the default
+			// ctrl-p ctrl-q makes the client exit 0 while the in-container agent
+			// keeps running — an orphan the one-agent-per-session fence then lets
+			// a second launcher double.
+			//
+			// An EMPTY value does not disable it: docker/cli reads "" as "flag not
+			// supplied", falls through to the config file, and installs the escape
+			// proxy with the ctrl-p,ctrl-q default. Verified against the binary —
+			// an invalid value is rejected client-side ("Unknown character"),
+			// while an empty one sails through. So the sequence is set to three
+			// NULs, which the CLI accepts and no keyboard produces.
+			//
+			// Mitigation, not elimination: the CLI always installs SOME escape
+			// proxy, so a peer that deliberately sends those bytes can still
+			// detach. This removes the accident, not the capability.
+			args = append(args, "-t", "--detach-keys="+containerDetachKeys)
 		}
 		for _, kv := range env {
 			args = append(args, "-e", kv)

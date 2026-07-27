@@ -1,7 +1,9 @@
 package workerclient
 
 import (
+	"bytes"
 	"os"
+	"os/exec"
 	"sync"
 	"testing"
 	"time"
@@ -41,15 +43,21 @@ func TestWaitOrTimeout_DoesNotWaitForeverOnAStuckPump(t *testing.T) {
 		"a pump that drains must be waited for, so output is not truncated")
 }
 
-// TestPTYClose_DoesNotReliablyInterruptABlockedRead records WHY the wait is
-// bounded rather than relying on Close. This is an observation about the
-// platform, not a requirement on it: if a future Go or OS does interrupt the
-// read, the bounded wait simply returns sooner.
-func TestPTYClose_DoesNotReliablyInterruptABlockedRead(t *testing.T) {
+// TestPTYClose_UnblocksAParkedPump pins the property the leak fix rests on: a
+// pump blocked reading the master must be released by Close.
+//
+// It is NOT true of the fd creack/pty returns — that one is blocking, so Go
+// serves the read with a syscall on a thread and neither Close nor
+// SetReadDeadline interrupts it, leaking a goroutine, an OS thread and the fd
+// per wedged session. startPTY therefore re-wraps it non-blocking, which hands
+// it to the runtime poller; this test pins that re-wrap.
+func TestPTYClose_UnblocksAParkedPump(t *testing.T) {
 	master, slave, err := pty.Open()
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = slave.Close() }) // the "lingering descendant"
 
+	master, err = pollable(master)
+	require.NoError(t, err)
 	p := &ptySession{master: master}
 	readReturned := make(chan error, 1)
 	go func() {
@@ -66,34 +74,82 @@ func TestPTYClose_DoesNotReliablyInterruptABlockedRead(t *testing.T) {
 	require.NoError(t, p.Close())
 	select {
 	case <-readReturned:
-		t.Log("Close DID interrupt the blocked read on this platform; the bounded wait then returns immediately")
-	case <-time.After(2 * time.Second):
-		t.Log("Close did NOT interrupt the blocked read — this is the case the bounded wait exists for")
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not unblock the pump: the fd, its goroutine and an OS thread would leak per wedged session")
 	}
 	assert.NoError(t, p.Close(), "Close must be idempotent")
 }
 
-// TestPTYWinsize_RejectsWhatTruncates pins the narrowing the `> 0` guards missed:
-// these values reach a uint16 ioctl field, so 65536 became a ZERO-column
-// terminal that no TUI can lay out.
-func TestPTYWinsize_RejectsWhatTruncates(t *testing.T) {
+// TestPTY_PreservesOutputProcessingAndCanonicalInput pins the two line-discipline
+// flags an earlier "just use raw mode" fix silently destroyed.
+//
+// OPOST: without it the pty stops translating \n to \r\n, so every line of
+// agent output staircases down the pane — including Ink's, since libuv's raw
+// mode ORs ONLCR into the CURRENT termios and cannot restore OPOST.
+// ICANON: without it ^D is delivered as a literal byte, so a pty session has no
+// EOF mechanism at all — which is exactly what the half-close fix promises.
+func TestPTY_PreservesOutputProcessingAndCanonicalInput(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "printf 'one\\ntwo\\n'")
+	p, err := startPTY(cmd, &sockproto.Resize{Cols: 80, Rows: 24})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.Close() })
+
+	var out []byte
+	buf := make([]byte, 256)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !bytes.Contains(out, []byte("two")) {
+		n, err := p.Read(buf)
+		out = append(out, buf[:n]...)
+		if err != nil {
+			break
+		}
+	}
+	_ = cmd.Wait()
+	assert.Contains(t, string(out), "one\r\ntwo\r\n",
+		"OPOST must survive: without it the agent's output staircases")
+
+	// ICANON: ^D must end a reader, not arrive as a byte.
+	catCmd := exec.Command("cat")
+	cp, err := startPTY(catCmd, &sockproto.Resize{Cols: 80, Rows: 24})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cp.Close() })
+	_, err = cp.Write([]byte("hello\n"))
+	require.NoError(t, err)
+	time.Sleep(300 * time.Millisecond)
+	_, err = cp.Write([]byte{4}) // ^D
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	go func() { done <- catCmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("^D did not end the reader: a pty session would have no way to signal EOF")
+	}
+}
+
+// TestPTYWinsize_ClampsRatherThanFailingTheAttach pins the narrowing the `> 0`
+// guards missed — these reach a uint16 ioctl field, so 65536 became a
+// ZERO-column terminal — and that the ATTACH path degrades rather than killing
+// the session over one miscomputed dimension.
+func TestPTYWinsize_ClampsRatherThanFailingTheAttach(t *testing.T) {
 	for _, tc := range []struct{ cols, rows int }{
 		{65536, 55}, {55, 65536}, {100000, 100000}, {-1, 24}, {80, -1},
 	} {
-		_, err := winsize(tc.cols, tc.rows)
-		require.Error(t, err, "%dx%d must be refused", tc.cols, tc.rows)
-		assert.Contains(t, err.Error(), "outside 1..65535")
+		got, clamped := winsize(tc.cols, tc.rows)
+		assert.NotEmpty(t, clamped, "%dx%d must be reported as clamped", tc.cols, tc.rows)
+		assert.NotZero(t, got.Cols, "a zero-column terminal must never be produced")
+		assert.NotZero(t, got.Rows)
 	}
 
 	// A dimension the launcher could not determine falls back per dimension,
 	// rather than discarding the one it DID know.
-	got, err := winsize(200, 0)
-	require.NoError(t, err)
+	got, clamped := winsize(200, 0)
+	assert.Empty(t, clamped, "an absent dimension is not a bad one")
 	assert.Equal(t, uint16(200), got.Cols, "a known width must survive an unknown height")
 	assert.Equal(t, uint16(defaultRows), got.Rows)
 
-	got, err = winsize(0, 0)
-	require.NoError(t, err)
+	got, _ = winsize(0, 0)
 	assert.Equal(t, uint16(defaultCols), got.Cols)
 	assert.Equal(t, uint16(defaultRows), got.Rows)
 }

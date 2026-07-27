@@ -297,24 +297,36 @@ Container mode passes `-t` so the AGENT gets a terminal inside the container.
 The worker's own pty is still allocated around the `docker exec` client, because
 `docker exec -it` requires its own stdin to be a terminal — two line disciplines
 in series, with the client propagating the worker's `SIGWINCH` to the container's
-tty. It also passes `--detach-keys=` : `-t` enables the CLI's ctrl-p/ctrl-q
-detach, and since the launcher forwards raw bytes, that keystroke would exit the
-client while leaving the agent running — an orphan the one-agent-per-session
-fence would then let a second launcher double.
+tty. It also moves the CLI's detach sequence out of reach: `-t` enables ctrl-p/ctrl-q,
+and since the launcher forwards raw bytes, that keystroke would exit the client
+while leaving the agent running — an orphan the one-agent-per-session fence would
+then let a second launcher double. An EMPTY `--detach-keys=` does **not** disable
+it (the CLI reads it as "unset" and installs the default), so the sequence is set
+to three NULs instead. That removes the accident, not the capability: the CLI
+always installs some escape proxy.
 
 Other properties the implementation must hold, each learned the hard way:
 
-- **The exit frame is written even if the output pump is stuck.** A pty master is
-  nobody's pipe, so `cmd.Wait` closes nothing and a descendant outliving the
-  agent can keep the pump blocked; closing the master does not reliably interrupt
-  a read already in the syscall. So the drain wait is BOUNDED — a parked pump is
-  a leak the connection's close reaps, whereas an unbounded wait wedges the
-  worker at `max_sessions: 1`.
+- **The master is made pollable before anything reads it.** The fd a pty library
+  hands back is blocking, so Go serves reads with a syscall on a thread — and a
+  read parked there is uninterruptible by either `Close` or a read deadline,
+  leaking a goroutine, an OS thread and the fd per wedged session. Re-wrapping it
+  non-blocking gives it to the runtime poller, where `Close` genuinely unblocks
+  the pump. The drain wait is bounded anyway, so the exit frame never depends on
+  an assumption about terminal teardown.
+- **The line discipline is quieted, not made raw.** Clearing ECHO and ISIG closes
+  the window where bytes are echoed back before the agent configures its own
+  terminal. Using raw mode for that would also clear OPOST — the pty then stops
+  translating `\n` to `\r\n`, so every line of agent output staircases, and
+  Ink cannot restore it — and ICANON, which is what interprets `^D` as EOF.
 - **A half-close does not hang up the terminal.** Closing stdin is the right
   answer on a pipe; on a pty, stdin and stdout are the same master, so closing it
   SIGHUPs the agent and truncates its output. The terminal's own EOF is `^D`.
 - **Geometry is validated against `uint16`, not against `> 0`.** These values
-  reach an ioctl field, so 65536 would truncate to a zero-column terminal.
+  reach an ioctl field, so 65536 would truncate to a zero-column terminal. The
+  attach path CLAMPS per dimension (one miscomputed value must not cost the
+  session); a resize REFUSES, because there the peer is asserting something
+  specific.
 - **`TERM` travels in the preamble.** A supervised worker has a stripped
   environment and `TERM` is not on the wire env allowlist, so without this the
   agent would have a terminal that every termcap consumer treats as dumb.

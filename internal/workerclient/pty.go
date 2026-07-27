@@ -2,7 +2,6 @@ package workerclient
 
 import (
 	"fmt"
-	"golang.org/x/term"
 	"io"
 	"log/slog"
 	"math"
@@ -11,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
 
 	"github.com/steveyegge/gastown/internal/sockproto"
 )
@@ -40,8 +40,15 @@ type ptySession struct {
 	closeErr  error
 }
 
-// Default geometry when the launcher supplies none (a non-tty pane, an older
-// launcher, or a dimension that failed validation).
+// Termios ioctls differ by platform.
+const (
+	ioctlReadTermios  = unix.TIOCGETA
+	ioctlWriteTermios = unix.TIOCSETA
+)
+
+// Default geometry when the launcher supplies none (a non-tty pane, or an older
+// launcher). A dimension that is present but out of range is CLAMPED on the
+// attach path — see winsize — rather than failing the session.
 const (
 	defaultCols = 120
 	defaultRows = 40
@@ -55,27 +62,32 @@ const (
 // truncates to a ZERO-column terminal — a TUI that divides by the column count
 // then crashes or spins. Validating per dimension also means a launcher that
 // reports 200x0 keeps its known 200 instead of having both replaced.
-func dimension(v, fallback int) (uint16, error) {
-	if v == 0 {
-		return uint16(fallback), nil
+func dimension(v, fallback int) (uint16, bool) {
+	if v <= 0 || v > math.MaxUint16 {
+		return uint16(fallback), v != 0
 	}
-	if v < 0 || v > math.MaxUint16 {
-		return 0, fmt.Errorf("terminal dimension %d is outside 1..%d", v, math.MaxUint16)
-	}
-	return uint16(v), nil
+	return uint16(v), false
 }
 
-// winsize validates a geometry pair.
-func winsize(cols, rows int) (*pty.Winsize, error) {
-	c, err := dimension(cols, defaultCols)
-	if err != nil {
-		return nil, err
+// winsize resolves a geometry pair for the ATTACH path, clamping rather than
+// refusing: a launcher that miscomputes one dimension should get a usable
+// terminal, not lose the session. (A RESIZE is different — there the peer is
+// asserting something specific, so a bad value is an error it should see.)
+//
+// The guard is against uint16, not against `> 0`: these reach the ioctl as
+// uint16, so 65536 would otherwise pass a positivity check and truncate to a
+// ZERO-column terminal that no TUI can lay out.
+func winsize(cols, rows int) (*pty.Winsize, []string) {
+	var clamped []string
+	c, badC := dimension(cols, defaultCols)
+	if badC {
+		clamped = append(clamped, fmt.Sprintf("cols=%d", cols))
 	}
-	r, err := dimension(rows, defaultRows)
-	if err != nil {
-		return nil, err
+	r, badR := dimension(rows, defaultRows)
+	if badR {
+		clamped = append(clamped, fmt.Sprintf("rows=%d", rows))
 	}
-	return &pty.Winsize{Cols: c, Rows: r}, nil
+	return &pty.Winsize{Cols: c, Rows: r}, clamped
 }
 
 // startPTY starts cmd attached to a new pty and returns its master side.
@@ -84,9 +96,10 @@ func startPTY(cmd *exec.Cmd, initial *sockproto.Resize) (*ptySession, error) {
 	if initial != nil {
 		cols, rows = initial.Cols, initial.Rows
 	}
-	size, err := winsize(cols, rows)
-	if err != nil {
-		return nil, err
+	size, clamped := winsize(cols, rows)
+	if len(clamped) > 0 {
+		slog.Default().Warn("clamping an out-of-range terminal dimension to the default",
+			"clamped", clamped, "using", fmt.Sprintf("%dx%d", size.Cols, size.Rows))
 	}
 	// StartWithSize sets the size BEFORE the child runs, so an agent that reads
 	// its dimensions once at startup sees the pane's real geometry rather than
@@ -95,19 +108,66 @@ func startPTY(cmd *exec.Cmd, initial *sockproto.Resize) (*ptySession, error) {
 	if err != nil {
 		return nil, fmt.Errorf("allocate pty: %w", err)
 	}
-	p := &ptySession{master: master}
-
-	// Put the line discipline in raw mode immediately. A fresh pty slave has
-	// ECHO and ISIG on, so anything the launcher sends before the child
-	// configures its own terminal would be echoed back into the output stream —
-	// and a 0x03 in that window would raise SIGINT against this pty's
-	// foreground group rather than reaching the agent. An interactive agent sets
-	// raw mode itself; doing it here first only closes the startup window.
-	if _, err := term.MakeRaw(int(master.Fd())); err != nil {
-		// Not fatal: the agent still gets a terminal, it just may echo briefly.
-		slog.Default().Warn("could not put the pty in raw mode", "err", err)
+	// Make the master POLLABLE before anything reads it. creack/pty opens it
+	// blocking, so Go serves reads with a plain syscall on a thread — and a read
+	// parked there is uninterruptible: neither Close nor SetReadDeadline returns
+	// it (both verified by probe on this platform). A pump parked that way leaks
+	// a goroutine, an OS thread and the fd for the life of the process, once per
+	// wedged session. Re-wrapping the fd non-blocking hands it to the runtime
+	// poller, where Close does unblock the reader.
+	master, err = pollable(master)
+	if err != nil {
+		_ = master.Close()
+		return nil, fmt.Errorf("make pty master pollable: %w", err)
 	}
-	return p, nil
+
+	// Close the ECHO/ISIG window WITHOUT touching output processing. A fresh
+	// slave has ECHO and ISIG on, so bytes arriving before the child configures
+	// its own terminal are echoed back, and a 0x03 in that window raises SIGINT
+	// against this pty's foreground group instead of reaching the agent.
+	//
+	// This deliberately does NOT use raw mode: MakeRaw also clears OPOST — the
+	// pty then stops translating \n to \r\n, so every line of agent output
+	// staircases down the pane — and clears ICANON, which is the line discipline
+	// that interprets ^D as EOF. Both matter here: the agent's output is the
+	// whole point, and ^D is the only in-band way to give a pty session EOF now
+	// that closing stdin would hang up the line.
+	if err := quietTerminal(master); err != nil {
+		// Not fatal: the agent still has a terminal, it may just echo briefly.
+		slog.Default().Warn("could not quiet the pty line discipline", "err", err)
+	}
+	return &ptySession{master: master}, nil
+}
+
+// pollable re-wraps a blocking fd as a non-blocking one owned by Go's runtime
+// poller, so a blocked Read can be unblocked by Close.
+func pollable(f *os.File) (*os.File, error) {
+	dup, err := unix.Dup(int(f.Fd()))
+	if err != nil {
+		return f, err
+	}
+	unix.CloseOnExec(dup)
+	if err := unix.SetNonblock(dup, true); err != nil {
+		_ = unix.Close(dup)
+		return f, err
+	}
+	g := os.NewFile(uintptr(dup), f.Name())
+	if err := f.Close(); err != nil {
+		_ = g.Close()
+		return f, err
+	}
+	return g, nil
+}
+
+// quietTerminal clears ECHO and ISIG on a pty, leaving OPOST (newline
+// translation) and ICANON (^D as EOF) alone.
+func quietTerminal(master *os.File) error {
+	t, err := unix.IoctlGetTermios(int(master.Fd()), ioctlReadTermios)
+	if err != nil {
+		return err
+	}
+	t.Lflag &^= unix.ECHO | unix.ECHOE | unix.ECHOK | unix.ECHONL | unix.ISIG
+	return unix.IoctlSetTermios(int(master.Fd()), ioctlWriteTermios, t)
 }
 
 // resize applies a new window size, which is what makes a running TUI redraw.

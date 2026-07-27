@@ -787,9 +787,11 @@ func TestExecStream_TTYRejectsOutOfRangeGeometry(t *testing.T) {
 		ack, err := codec.Recv()
 		require.NoError(t, err)
 		require.Equal(t, sockproto.TypeAttachAck, ack.Type)
-		_, errOut, code := drainStream(t, codec)
-		assert.Equal(t, 126, code, "a 0-column terminal must be refused, not created")
-		assert.Contains(t, errOut, "outside 1..65535")
+		out, _, code := drainStream(t, codec)
+		require.Equal(t, 0, code, "one bad dimension must not cost the session")
+		// Clamped to the default width, with the launcher's valid height kept.
+		assert.Contains(t, strings.ReplaceAll(out, "\r", ""), "55 120",
+			"an out-of-range width must clamp to the default, not create a 0-column terminal")
 	})
 
 	t.Run("resize frame", func(t *testing.T) {
@@ -919,7 +921,9 @@ func TestExecCommand_ContainerTTYDisablesDetachKeys(t *testing.T) {
 
 	joined := strings.Join(cmd.Args, " ")
 	assert.Contains(t, joined, "-t", "the agent needs a terminal inside the container")
-	assert.Contains(t, joined, "--detach-keys=", "detach must be disabled, or a keystroke orphans the agent")
+	assert.Contains(t, joined, "--detach-keys="+containerDetachKeys,
+		"an EMPTY value is read by the CLI as unset, leaving ctrl-p/ctrl-q live")
+	assert.NotContains(t, joined, "--detach-keys= ", "the empty form is a no-op")
 
 	// Without a tty there is no detach sequence to disable, and no -t.
 	noTTY, err := s.execCommand(context.Background(),
