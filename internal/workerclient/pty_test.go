@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -358,9 +359,9 @@ func TestNewDetachFilter_OnlyForContainerTTY(t *testing.T) {
 // the timer alone hung it up mid-flush, discarding its last output and turning a
 // clean exit into a signal death.
 func TestWaitReleasing_LeavesAFlushingAgentAlone(t *testing.T) {
-	prevGrace, prevStall := ptyWaitGrace, ptyStallGrace
-	ptyWaitGrace, ptyStallGrace = 200*time.Millisecond, 300*time.Millisecond
-	t.Cleanup(func() { ptyWaitGrace, ptyStallGrace = prevGrace, prevStall })
+	prev := ptyWaitGrace
+	ptyWaitGrace = 200 * time.Millisecond
+	t.Cleanup(func() { ptyWaitGrace = prev })
 
 	// Flushes steadily for well past the grace, then exits cleanly.
 	cmd := exec.Command("/bin/sh", "-c",
@@ -388,7 +389,10 @@ func TestWaitReleasing_LeavesAFlushingAgentAlone(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancelled from the start: the graceful-shutdown shape
 
-	err = waitReleasing(ctx, cmd, p, ptyWaitGrace, slog.Default(), "gt-demo-furiosa")
+	// The pump is alive for the whole flush, which is the signal the valve must
+	// respect: while something is reading the master, the terminal is draining.
+	pumpExited := make(chan struct{})
+	err = waitReleasing(ctx, cmd, p, pumpExited, ptyWaitGrace, slog.Default(), "gt-demo-furiosa")
 	require.NoError(t, err, "a flushing agent must exit cleanly, not by hangup")
 
 	mu.Lock()
@@ -397,29 +401,44 @@ func TestWaitReleasing_LeavesAFlushingAgentAlone(t *testing.T) {
 		"the agent's final output must survive: the valve is for a STALLED terminal")
 }
 
-// TestWaitReleasing_ReleasesAStalledTerminal pins the case the valve is for: a
-// cancelled agent nobody can drain, which is unreapable even by SIGKILL.
-func TestWaitReleasing_ReleasesAStalledTerminal(t *testing.T) {
-	prevGrace, prevStall := ptyWaitGrace, ptyStallGrace
-	ptyWaitGrace, ptyStallGrace = 200*time.Millisecond, 200*time.Millisecond
-	t.Cleanup(func() { ptyWaitGrace, ptyStallGrace = prevGrace, prevStall })
+// TestWaitReleasing_ReleasesAnUndrainedTerminal pins the case the valve exists
+// for, and does it WITHOUT killing the child first — the earlier version of this
+// test did, so cmd.Wait returned immediately and the valve was never consulted:
+// it passed with the valve deleted.
+//
+// Here a chatty child fills the pty's output queue with nobody reading it, then
+// is signalled. It cannot be reaped — not even by SIGKILL — until something
+// drains or closes the terminal, which is exactly what the valve does.
+func TestWaitReleasing_ReleasesAnUndrainedTerminal(t *testing.T) {
+	prev := ptyWaitGrace
+	ptyWaitGrace = 300 * time.Millisecond
+	t.Cleanup(func() { ptyWaitGrace = prev })
 
-	// Never exits, never writes: nothing to drain, so the pump makes no progress.
-	cmd := exec.Command("sleep", "60")
+	cmd := exec.Command("/bin/sh", "-c", "while :; do echo filling-the-output-queue; done")
 	p, err := startPTY(cmd, &sockproto.Resize{Cols: 80, Rows: 24}, false)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = p.Close() })
-	require.NoError(t, cmd.Process.Kill()) // cancelled and signalled
+
+	// NOTHING reads the master: the queue fills and the child blocks writing.
+	time.Sleep(500 * time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
+	require.NoError(t, cmd.Process.Signal(syscall.SIGKILL))
+
+	// The pump is already gone (there never was one), which is the valve's
+	// premise: no reader remains.
+	pumpExited := make(chan struct{})
+	close(pumpExited)
 
 	done := make(chan error, 1)
-	go func() { done <- waitReleasing(ctx, cmd, p, ptyWaitGrace, slog.Default(), "gt-demo-furiosa") }()
+	go func() {
+		done <- waitReleasing(ctx, cmd, p, pumpExited, ptyWaitGrace, slog.Default(), "gt-demo-furiosa")
+	}()
 	select {
 	case <-done:
-	case <-time.After(15 * time.Second):
-		t.Fatal("the valve never fired: a stalled terminal would wedge the session")
+	case <-time.After(20 * time.Second):
+		t.Fatal("the valve never released the terminal: the session would wedge with no exit frame")
 	}
 }
 
@@ -444,13 +463,18 @@ func TestWriteAgentStdin_AppliesTheFilter(t *testing.T) {
 	assert.Equal(t, containerDetachBytes, native.Bytes(), "native stdin must not be filtered")
 }
 
-// TestDetachFilter_FlushReturnsHeldInput pins that a held-back prefix is not
-// lost when input ends: a trailing partial sequence is ordinary keystrokes, and
-// dropping them loses input exactly when a launcher half-closes or dies.
-func TestDetachFilter_FlushReturnsHeldInput(t *testing.T) {
+// TestDetachFilter_HeldPrefixIsNotDeliveredAtEOF pins a deliberate loss. The
+// held bytes can only ever be a strict prefix of the detach sequence, and 0x1c
+// is VQUIT on the default line discipline the container gives the agent — so
+// delivering them when input ends would SIGQUIT the agent that the half-close
+// path exists to keep alive. A lost trailing ^\ is the better error.
+func TestDetachFilter_HeldPrefixIsNotDeliveredAtEOF(t *testing.T) {
 	d := &detachFilter{seq: containerDetachBytes}
 	assert.Equal(t, "hi", string(d.filter([]byte("hi"))))
 	assert.Empty(t, d.filter([]byte{0x1c}), "a possible prefix is held")
-	assert.Equal(t, []byte{0x1c}, d.flush(), "and returned when the stream ends")
-	assert.Empty(t, d.flush(), "flush is idempotent")
+
+	// Nothing in the inbound path delivers it: the only reader of pending is
+	// filter itself, resolving it against the NEXT input.
+	assert.Equal(t, []byte{0x1c, 'z'}, d.filter([]byte{'z'}),
+		"held bytes reach the agent only when later input proves them harmless")
 }

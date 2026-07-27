@@ -338,13 +338,19 @@ Other properties the implementation must hold, each learned the hard way:
   `max_sessions: 1`, the worker.
 - **A cancelled agent that will not die releases the terminal.** Closing the
   master discards a stalled output queue, which is the only thing that frees such
-  a child. Two conditions gate it, and both matter: it fires only after
-  CANCELLATION (never on elapsed time — an agent is supposed to run for hours),
-  and only once the output pump has genuinely stopped making progress. An agent
-  still writing is being drained by definition, and hanging it up mid-flush
-  discards its final output and turns a clean exit into a signal death — on the
-  GRACEFUL shutdown path, which cancels precisely so the agent can flush. The
+  a child. Two conditions gate it: the session has been
+  CANCELLED, and the output pump has EXITED — meaning nothing is reading the
+  master, which is the only state that makes a child unreapable. Neither elapsed
+  time nor read-progress is an acceptable proxy: a timer hangs up healthy agents
+  on the graceful-shutdown path (which cancels precisely so the agent can flush),
+  and a pump blocked delivering to a stalled launcher looks idle for as long as
+  `frameWriteTimeout`. While the pump lives, the terminal is being drained. The
   grace is longer than the SIGTERM window the agent is promised.
+- **A held detach prefix is never delivered.** The filter can only be holding a
+  strict prefix of the detach sequence — one or two `0x1c` — and `0x1c` is VQUIT
+  on the default line discipline the container gives the agent, so writing it at
+  end of stream would SIGQUIT the agent the half-close path exists to keep alive.
+  A lost trailing `^\` is the better error.
 - **A half-close does not hang up the terminal.** Closing stdin is the right
   answer on a pipe; on a pty, stdin and stdout are the same master, so closing it
   SIGHUPs the agent and truncates its output. The terminal's own EOF is `^D`.

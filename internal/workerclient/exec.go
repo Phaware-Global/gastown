@@ -82,13 +82,6 @@ type detachFilter struct {
 	pending []byte
 }
 
-// flush returns any held-back prefix, so input is not lost when the stream ends.
-func (d *detachFilter) flush() []byte {
-	held := d.pending
-	d.pending = nil
-	return held
-}
-
 // filter returns the bytes safe to forward, holding back any trailing prefix of
 // the sequence.
 func (d *detachFilter) filter(in []byte) []byte {
@@ -126,13 +119,6 @@ func (d *detachFilter) filter(in []byte) []byte {
 // mid-flush does not merely time it out — it hangs up the line, SIGHUPs the
 // agent, discards its last output and turns a clean exit into a signal death.
 var ptyWaitGrace = execWaitDelay + 5*time.Second
-
-// ptyStallGrace is how long the output pump must make NO progress before the
-// master is considered stalled. The valve exists for a pty nobody can drain; an
-// agent that is still producing output is being drained by definition, and must
-// be left alone however long it takes — Go's WaitDelay SIGKILL bounds it, and a
-// killed agent stops producing, which is what finally trips this.
-var ptyStallGrace = 2 * time.Second
 
 // ptyDrainGrace is how long the output pump may keep reading a pty master after
 // the agent exits, before the master is closed to unblock it. Long enough to
@@ -356,8 +342,14 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 			}
 		}
 	}
+	// ptyPumpExited closes when the OUTPUT pump returns — the moment nothing is
+	// reading the master any more, which is the release valve's real premise.
+	ptyPumpExited := make(chan struct{})
 	pumps.Add(1)
-	go pump(stdout, sockproto.FrameStdout)
+	go func() {
+		defer close(ptyPumpExited)
+		pump(stdout, sockproto.FrameStdout)
+	}()
 	if stderr != nil {
 		pumps.Add(1)
 		go pump(stderr, sockproto.FrameStderr)
@@ -375,17 +367,14 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 	agentDone := make(chan struct{})
 	go func() {
 		defer close(inboundDone)
-		// Whatever the filter is holding when input ends belongs to the agent:
-		// a trailing prefix that never completed is ordinary keystrokes, and
-		// dropping them silently loses input at exactly the moment a launcher
-		// half-closes or dies.
-		defer func() {
-			if detach != nil {
-				if held := detach.flush(); len(held) > 0 {
-					_, _ = stdin.Write(held)
-				}
-			}
-		}()
+		// The filter's held bytes are deliberately NOT delivered when input ends.
+		//
+		// By construction they can only be a strict prefix of the detach
+		// sequence — one or two 0x1c — and 0x1c is VQUIT on the DEFAULT line
+		// discipline that `docker exec -t` gives the agent inside the container.
+		// Writing them at end of stream would therefore SIGQUIT the agent that
+		// the half-close path exists to keep alive, turning a lost keystroke into
+		// a remote kill. Losing a trailing ^\ is strictly the better error.
 		// Closing stdin is the right response to a half-close on a PIPE. On a pty
 		// it is not: stdin and stdout are the same master, so closing it hangs up
 		// the line — SIGHUP to the agent's foreground group, killing a process the
@@ -477,7 +466,7 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 	// it. Closing the master discards that queue and releases the child. Ordering
 	// this AFTER the Wait, as an earlier version did, made it unreachable exactly
 	// when it was needed.
-	waitErr := waitReleasing(ctx, cmd, tty, ptyWaitGrace, s.log, m.Session)
+	waitErr := waitReleasing(ctx, cmd, tty, ptyPumpExited, ptyWaitGrace, s.log, m.Session)
 	close(agentDone) // stop the prober; later read errors are expected
 	<-proberDone     // no prober write may race the terminal exit frame
 
@@ -755,7 +744,7 @@ func signalName(sig syscall.Signal) string {
 // resize test, whose agent lives six seconds).
 //
 // Without a tty this is a plain Wait: cmd.Wait closes the pipes it created.
-func waitReleasing(ctx context.Context, cmd *exec.Cmd, tty *ptySession, grace time.Duration, log *slog.Logger, session string) error {
+func waitReleasing(ctx context.Context, cmd *exec.Cmd, tty *ptySession, pumpExited <-chan struct{}, grace time.Duration, log *slog.Logger, session string) error {
 	if tty == nil {
 		return cmd.Wait()
 	}
@@ -768,33 +757,34 @@ func waitReleasing(ctx context.Context, cmd *exec.Cmd, tty *ptySession, grace ti
 	case <-ctx.Done():
 	}
 
-	// Cancelled. The valve may only fire once BOTH are true: the promised flush
-	// window has passed, and the pump has genuinely stopped making progress.
+	// Cancelled. The valve exists for ONE state: a child blocked writing into a
+	// terminal that nobody is reading, which is unreapable even by SIGKILL. So
+	// the condition is exactly that — the output pump has EXITED — rather than a
+	// proxy for it.
 	//
-	// Firing on the timer alone was a live regression: handleShutdown cancels on
-	// the GRACEFUL path, so a well-behaved agent trapping SIGTERM and flushing
-	// was hung up on mid-flush — its remaining output discarded and its clean
-	// exit reported as a signal death.
-	deadline := time.After(grace)
-	tick := time.NewTicker(500 * time.Millisecond)
-	defer tick.Stop()
-	graceExpired := false
-	for {
-		select {
-		case err := <-done:
-			return err
-		case <-deadline:
-			graceExpired = true
-		case <-tick.C:
-		}
-		if !graceExpired {
-			continue
-		}
-		if idle := tty.idleFor(); idle < ptyStallGrace {
-			continue // still draining: the agent is alive and productive
-		}
-		log.Warn("cancelled agent not reaped and its terminal is stalled; closing the master to release it",
-			"session", session, "grace", grace, "idle", tty.idleFor())
+	// Two proxies were tried and both were wrong. A plain timer hung up healthy
+	// agents mid-flush on the graceful-shutdown path. Read progress was no
+	// better: the pump does not call Read while blocked in writeFrame, which this
+	// repo bounds at frameWriteTimeout (60s), so a stalled LAUNCHER — the
+	// peer-reachable trigger — made a draining terminal look idle.
+	//
+	// While the pump lives the terminal is being drained (or the pump is
+	// delivering what it drained and will exit on its own write timeout), so the
+	// right answer is to keep waiting: cmd.WaitDelay SIGKILLs the agent, and a
+	// killed agent stops producing.
+	select {
+	case err := <-done:
+		return err
+	case <-pumpExited:
+	}
+	// No reader remains. Give the agent the window it was promised, then release
+	// the terminal so it can be reaped.
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(grace):
+		log.Warn("cancelled agent not reaped and nothing is draining its terminal; closing the master",
+			"session", session, "grace", grace)
 		_ = tty.Close()
 		return <-done
 	}

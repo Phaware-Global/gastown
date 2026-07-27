@@ -8,8 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/creack/pty"
 	"golang.org/x/sys/unix"
@@ -41,12 +39,6 @@ type ptySession struct {
 
 	closeOnce sync.Once
 	closeErr  error
-
-	// lastRead is when the output pump last got bytes, in UnixNano. It is what
-	// lets the release valve tell a STALLED terminal (its reason to exist) from
-	// an agent that is simply still flushing.
-	lastRead atomic.Int64
-	started  time.Time
 }
 
 // Default geometry when the launcher supplies none (a non-tty pane, or an older
@@ -160,7 +152,7 @@ func startPTY(cmd *exec.Cmd, initial *sockproto.Resize, plumbing bool) (*ptySess
 	} else if err := disableFlowControl(master); err != nil {
 		slog.Default().Warn("could not disable software flow control on the pty", "err", err)
 	}
-	return &ptySession{master: master, started: time.Now()}, nil
+	return &ptySession{master: master}, nil
 }
 
 // disableFlowControl clears IXON and IEXTEN on a NATIVE pty, leaving every
@@ -223,23 +215,7 @@ func (p *ptySession) resize(r sockproto.Resize) error {
 	return pty.Setsize(p.master, &pty.Winsize{Cols: uint16(r.Cols), Rows: uint16(r.Rows)})
 }
 
-func (p *ptySession) Read(b []byte) (int, error) {
-	n, err := p.master.Read(b)
-	if n > 0 {
-		p.lastRead.Store(time.Now().UnixNano())
-	}
-	return n, err
-}
-
-// idleFor reports how long since the pump last read anything. A session that has
-// never produced output reports the time since it started.
-func (p *ptySession) idleFor() time.Duration {
-	last := p.lastRead.Load()
-	if last == 0 {
-		return time.Since(p.started)
-	}
-	return time.Since(time.Unix(0, last))
-}
+func (p *ptySession) Read(b []byte) (int, error)  { return p.master.Read(b) }
 func (p *ptySession) Write(b []byte) (int, error) { return p.master.Write(b) }
 
 // Close hangs up the line. Idempotent, because it is called both from the
