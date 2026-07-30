@@ -436,7 +436,7 @@ func TestRenderCompactPlanShowsEveryDeletion(t *testing.T) {
 		}
 	})
 
-	t.Run("a source shown under a write row is not double-counted", func(t *testing.T) {
+	t.Run("a clear attributed under a write row still prints its own DROP", func(t *testing.T) {
 		originals := []storedMemory{
 			{fullKey: "memory.feedback.a", memType: "feedback", shortKey: "a", value: "old a"},
 			{fullKey: "memory.feedback.b", memType: "feedback", shortKey: "b", value: "old b"},
@@ -450,11 +450,13 @@ func TestRenderCompactPlanShowsEveryDeletion(t *testing.T) {
 			clears: []storedMemory{originals[1]},
 		}
 		got := renderPlan(t, originals, plan)
-		if strings.Contains(got, "DROP") {
-			t.Errorf("source already shown as ← was re-listed as DROP:\n%s", got)
+		// Suppression is gone: the model chose `sources`, so letting it suppress
+		// a DROP let it choose which deletions disclosed their key and body.
+		if !strings.Contains(got, "DROP") {
+			t.Errorf("deletion is not listed:\n%s", got)
 		}
-		if !strings.Contains(got, "feedback/b") {
-			t.Errorf("consumed source is not attributed:\n%s", got)
+		if !strings.Contains(got, "memory.feedback.b") {
+			t.Errorf("DROP row does not name the exact kv key:\n%s", got)
 		}
 	})
 }
@@ -515,54 +517,6 @@ func TestRenderCompactPlanSanitizesLabels(t *testing.T) {
 	}
 }
 
-func TestMergedAwayRequiresTypeQualifiedSource(t *testing.T) {
-	// A bare shortKey is not injective — keys repeat across types — so one
-	// rendered "← src" line would suppress the DROP row of every memory sharing
-	// that key.
-	plan := &compactPlan{sets: []memSetOp{{
-		fullKey: "memory.user.dup", memType: "user", shortKey: "dup",
-		value: "v", isNew: true, sources: []string{"dup"},
-	}}}
-	victim := storedMemory{fullKey: "memory.feedback.dup", memType: "feedback", shortKey: "dup"}
-	if mergedAway(victim, plan, []storedMemory{victim}) {
-		t.Error("a bare shortKey suppressed the DROP of a different type's memory")
-	}
-
-	qualified := &compactPlan{sets: []memSetOp{{
-		fullKey: "memory.user.dup", memType: "user", shortKey: "dup",
-		value: "v", isNew: true, sources: []string{"feedback/dup"},
-	}}}
-	if !mergedAway(victim, qualified, []storedMemory{victim}) {
-		t.Error("a type-qualified source did not match the memory it consumes")
-	}
-}
-
-func TestMergedAwayRequiresUnambiguousSource(t *testing.T) {
-	// parseMemoryKey maps a legacy untyped memory.notes and a canonical
-	// memory.general.notes to the SAME general/notes pair — a coexistence
-	// buildCompactPlan explicitly handles — so one "← general/notes" line named
-	// two distinct kv keys and suppressed both deletions.
-	legacy := storedMemory{fullKey: "memory.notes", memType: "general", shortKey: "notes"}
-	canonical := storedMemory{fullKey: "memory.general.notes", memType: "general", shortKey: "notes"}
-	originals := []storedMemory{legacy, canonical}
-
-	plan := &compactPlan{sets: []memSetOp{{
-		fullKey: "memory.general.merged", memType: "general", shortKey: "merged",
-		value: "v", isNew: true, sources: []string{"general/notes"},
-	}}}
-
-	for _, m := range []storedMemory{legacy, canonical} {
-		if mergedAway(m, plan, originals) {
-			t.Errorf("ambiguous source suppressed the DROP of %s", m.fullKey)
-		}
-	}
-
-	// With only one candidate in the store the token is unambiguous again.
-	if !mergedAway(canonical, plan, []storedMemory{canonical}) {
-		t.Error("unambiguous source failed to match the memory it consumes")
-	}
-}
-
 func TestRenderCompactPlanIdentifiesDeletions(t *testing.T) {
 	// type/key is not unique, so a DROP row must name the exact kv key and show
 	// what is being lost — it is the only view of a deletion the operator gets.
@@ -598,15 +552,32 @@ func TestSanitizeForEchoEscapesUnicodeControls(t *testing.T) {
 	}
 }
 
-func TestPlanLabelIsNotTruncated(t *testing.T) {
-	// A label is the row's identity, not a preview: capping it made any two keys
-	// sharing a long prefix render as the same line.
-	shared := strings.Repeat("k", 200)
-	a := planLabel("general", shared+"-alpha")
-	b := planLabel("general", shared+"-beta")
-	if a == b {
-		t.Errorf("two distinct keys render as the same label: %q", a)
-	}
+func TestBoundedIdentity(t *testing.T) {
+	// An identity must be bounded (an unbounded model-controlled key could
+	// scroll the plan off screen before [y/N]) AND unambiguous (a plain prefix
+	// cap made two keys sharing a long prefix render identically).
+	shared := strings.Repeat("k", 400)
+
+	t.Run("distinct keys stay distinct past the cap", func(t *testing.T) {
+		a := planLabel("general", shared+"-alpha")
+		b := planLabel("general", shared+"-beta")
+		if a == b {
+			t.Errorf("two distinct keys render as the same label: %q", a)
+		}
+	})
+
+	t.Run("bounded", func(t *testing.T) {
+		got := planLabel("general", shared)
+		if n := utf8.RuneCountInString(got); n > identityWidth+32 {
+			t.Errorf("label is %d runes, want bounded near %d", n, identityWidth)
+		}
+	})
+
+	t.Run("short identities are untouched", func(t *testing.T) {
+		if got := boundedIdentity("memory.general.notes"); got != "memory.general.notes" {
+			t.Errorf("got %q, want the identity verbatim", got)
+		}
+	})
 }
 
 func TestRenderCompactPlanSanitizesModelText(t *testing.T) {
@@ -1027,4 +998,16 @@ func TestBuildCompactPlan(t *testing.T) {
 			t.Fatal("expected a set op for memory.user.senior-go")
 		}
 	})
+}
+
+func TestSanitizeForEchoEscapesC1(t *testing.T) {
+	// The C1 block is category Cc, not Cf: U+009B is the 8-bit CSI (the
+	// single-character equivalent of ESC [) and U+009D is OSC, so escaping only
+	// Cf/Cs/Co left them reaching the terminal raw.
+	for _, r := range []rune{0x80, 0x85, 0x9b, 0x9d, 0x9f} {
+		got := sanitizeForEcho("DROP" + string(r) + "tail")
+		if strings.ContainsRune(got, r) {
+			t.Errorf("U+%04X survived sanitizing: %q", r, got)
+		}
+	}
 }

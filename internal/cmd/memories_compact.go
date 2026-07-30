@@ -3,6 +3,8 @@ package cmd
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/steveyegge/gastown/internal/style"
 )
@@ -321,7 +324,7 @@ func sanitizeForEcho(s string) string {
 			b.WriteString(`\t`)
 		case r < 0x20 || r == 0x7f:
 			fmt.Fprintf(&b, `\x%02x`, r)
-		case unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Cs, r) || unicode.Is(unicode.Co, r):
+		case unicode.Is(unicode.Cc, r) || unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Cs, r) || unicode.Is(unicode.Co, r):
 			// Non-ASCII display controls: the bidi overrides U+202A-U+202E and
 			// isolates U+2066-U+2069 reorder the rest of the line, and the
 			// zero-width marks hide text outright. C0 escaping alone left the
@@ -889,7 +892,7 @@ func renderCompactPlanTo(w io.Writer, originals []storedMemory, plan *compactPla
 		// redraw the very plan the operator is approving.
 		for _, src := range s.sources {
 			fmt.Fprintf(w, "         %s %s\n", style.Dim.Render("←"),
-				style.Dim.Render(compactTruncate(sanitizeForEcho(src), valuePreviewWidth)))
+				style.Dim.Render(boundedIdentity(src)))
 		}
 		if s.changed {
 			oldPreview, newPreview := valuePreviewPair(s.prevValue, s.value)
@@ -906,13 +909,13 @@ func renderCompactPlanTo(w io.Writer, originals []storedMemory, plan *compactPla
 		}
 	}
 
+	// EVERY clear gets a row. Suppressing the ones already attributed under a
+	// "← src" line saved a duplicate line and cost far more than it saved: the
+	// model chooses `sources`, so it chose which deletions disclosed their key
+	// and body, and matching a token back to a memory was never reliably
+	// injective (bare keys, then type/key for legacy-vs-canonical pairs). A
+	// deletion listed twice is noise; a deletion listed nowhere is the bug.
 	for _, m := range plan.clears {
-		// Skip clears folded into a row that ACTUALLY SHOWED the attribution —
-		// re-listing those as DROP would double-count them. Anything else must
-		// print, so that no deletion can happen with nothing on screen.
-		if mergedAway(m, plan, originals) {
-			continue
-		}
 		reason := plan.dropReasons[m.fullKey]
 		label := planLabel(m.memType, m.shortKey)
 		if reason != "" {
@@ -926,7 +929,7 @@ func renderCompactPlanTo(w io.Writer, originals []storedMemory, plan *compactPla
 		// render the same label — so on its own the row could not say which
 		// memory was going away, and never showed the content at all. This is
 		// the only view of a deletion the operator gets.
-		fmt.Fprintf(w, "         %s %s\n", style.Dim.Render("key:"), style.Dim.Render(sanitizeForEcho(m.fullKey)))
+		fmt.Fprintf(w, "         %s %s\n", style.Dim.Render("key:"), style.Dim.Render(boundedIdentity(m.fullKey)))
 		was := []rune(m.value)
 		fmt.Fprintf(w, "         %s %s\n", style.Dim.Render("was:"), style.Dim.Render(previewSpan(was, 0, len(was))))
 	}
@@ -940,53 +943,31 @@ func writesRow(s memSetOp) bool { return s.isNew || s.changed }
 // values: loadStoredMemories accepts any memory.* kv key and sanitizeKey runs
 // only on the write path, so a key planted through `bd kv set` reaches the
 // renderer raw and could emit CR/ANSI to erase its own row.
-// It is deliberately NOT truncated: a label is the row's identity, not a
-// preview of content, and a rune-prefix cap made any two keys sharing a long
-// prefix render as the same line. Escaping already neutralises the display
-// risk, so an over-long key is merely ugly rather than ambiguous.
+// It is bounded by boundedIdentity rather than left unbounded: keys are
+// model-controlled and length-unlimited (sanitizeKey normalises characters but
+// caps nothing), so an unbounded label let one row emit tens of thousands of
+// runes and scroll the rest of the plan — including a real DROP — off screen
+// before the [y/N] prompt.
 func planLabel(memType, shortKey string) string {
-	return sanitizeForEcho(memType + "/" + shortKey)
+	return boundedIdentity(memType + "/" + shortKey)
 }
 
-// sourceMatches reports whether a model-supplied source token names m.
-func sourceMatches(src string, m storedMemory) bool {
-	return src == m.fullKey || src == m.memType+"/"+m.shortKey
-}
+// identityWidth bounds a rendered identity before its disambiguating digest.
+const identityWidth = 120
 
-// mergedAway reports whether a cleared memory is listed as a source of a row
-// that RENDERS its sources, so the deletion is already visible on screen as a
-// "← src" line.
+// boundedIdentity renders an untrusted identifier bounded AND unambiguous.
 //
-// It must consider only writing rows — KEEP rows print no attribution, so
-// counting them suppressed the DROP for a memory nothing on screen mentioned.
-//
-// It must also require the token to be UNAMBIGUOUS. parseMemoryKey maps a
-// legacy untyped memory.<key> and a canonical memory.general.<key> to the same
-// general/<key> pair — a coexistence buildCompactPlan explicitly handles — so a
-// type-qualified token can still name two distinct kv keys, and one rendered
-// line would suppress both deletions. When a token matches more than one
-// original, nothing is suppressed and each memory prints its own DROP row.
-func mergedAway(m storedMemory, plan *compactPlan, originals []storedMemory) bool {
-	for _, s := range plan.sets {
-		if !writesRow(s) {
-			continue
-		}
-		for _, src := range s.sources {
-			if !sourceMatches(src, m) {
-				continue
-			}
-			matches := 0
-			for _, o := range originals {
-				if sourceMatches(src, o) {
-					matches++
-				}
-			}
-			if matches == 1 {
-				return true
-			}
-		}
+// A plain prefix cap cannot do both: two keys sharing a long prefix collapse to
+// the same line, which is what made truncating labels wrong in the first place.
+// Appending a digest of the full value keeps distinct identifiers distinct
+// while still bounding what reaches the terminal.
+func boundedIdentity(s string) string {
+	escaped := sanitizeForEcho(s)
+	if utf8.RuneCountInString(escaped) <= identityWidth {
+		return escaped
 	}
-	return false
+	sum := sha256.Sum256([]byte(s))
+	return string([]rune(escaped)[:identityWidth]) + "…#" + hex.EncodeToString(sum[:4])
 }
 
 // applyCompactPlan writes the new/changed memories then clears the removed ones.
