@@ -494,6 +494,49 @@ func TestRenderCompactPlanShowsWrittenBodies(t *testing.T) {
 	})
 }
 
+func TestRenderCompactPlanSanitizesLabels(t *testing.T) {
+	// Keys are as untrusted as values: loadStoredMemories accepts any memory.*
+	// kv key and sanitizeKey never runs on read, so a planted key reaches the
+	// renderer raw and could erase its own DROP row.
+	evil := "victim\r\x1b[2K\x1b[1A\x1b[2K"
+	originals := []storedMemory{{fullKey: "memory.feedback." + evil, memType: "feedback", shortKey: evil}}
+	plan := &compactPlan{
+		sets:   []memSetOp{},
+		clears: []storedMemory{originals[0]},
+	}
+	got := renderPlan(t, originals, plan)
+	if !strings.Contains(got, "DROP") {
+		t.Fatalf("deletion row missing:\n%q", got)
+	}
+	for _, bad := range []string{"\r", "\x1b"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("DROP label leaked raw control sequence %q:\n%q", bad, got)
+		}
+	}
+}
+
+func TestMergedAwayRequiresTypeQualifiedSource(t *testing.T) {
+	// A bare shortKey is not injective — keys repeat across types — so one
+	// rendered "← src" line would suppress the DROP row of every memory sharing
+	// that key.
+	plan := &compactPlan{sets: []memSetOp{{
+		fullKey: "memory.user.dup", memType: "user", shortKey: "dup",
+		value: "v", isNew: true, sources: []string{"dup"},
+	}}}
+	victim := storedMemory{fullKey: "memory.feedback.dup", memType: "feedback", shortKey: "dup"}
+	if mergedAway(victim, plan) {
+		t.Error("a bare shortKey suppressed the DROP of a different type's memory")
+	}
+
+	qualified := &compactPlan{sets: []memSetOp{{
+		fullKey: "memory.user.dup", memType: "user", shortKey: "dup",
+		value: "v", isNew: true, sources: []string{"feedback/dup"},
+	}}}
+	if !mergedAway(victim, qualified) {
+		t.Error("a type-qualified source did not match the memory it consumes")
+	}
+}
+
 func TestRenderCompactPlanSanitizesModelText(t *testing.T) {
 	// sources and drop reasons are raw model output, steered by untrusted memory
 	// values. Unsanitized they can redraw the very plan being approved.
@@ -601,6 +644,35 @@ func TestValuePreviewPair(t *testing.T) {
 		)
 		if oldPreview == newPreview {
 			t.Errorf("previews identical for a whitespace-only rewrite: %q", oldPreview)
+		}
+	})
+
+	t.Run("two decoy edits cannot silently hide the middle", func(t *testing.T) {
+		// Bounding the span by prefix AND suffix is not enough on its own: one
+		// cosmetic edit near each end stretches the span so the real rewrite
+		// lands in the elided middle. The elision must announce its own size.
+		filler := strings.Repeat("y", 500)
+		oldPreview, newPreview := valuePreviewPair(
+			"A"+filler+" never force-push "+filler+"Z",
+			"B"+filler+" always force-push "+filler+"Y",
+		)
+		for _, p := range []string{oldPreview, newPreview} {
+			if !strings.Contains(p, "hidden") {
+				t.Errorf("elision does not disclose how much it hides: %q", p)
+			}
+		}
+		if oldPreview == newPreview {
+			t.Error("previews identical despite a large hidden rewrite")
+		}
+	})
+
+	t.Run("escaping is injective", func(t *testing.T) {
+		// A real newline and the literal two characters `\n` must not collapse to
+		// the same rendering, or a pair differing only across that collision is a
+		// genuine UPDATE that displays as two identical lines.
+		oldPreview, newPreview := valuePreviewPair(`a \n b`, "a \n b")
+		if oldPreview == newPreview {
+			t.Errorf("literal backslash-n and a real newline render identically: %q", oldPreview)
 		}
 	})
 

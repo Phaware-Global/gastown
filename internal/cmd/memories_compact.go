@@ -306,6 +306,12 @@ func sanitizeForEcho(s string) string {
 	b.Grow(len(s))
 	for _, r := range s {
 		switch {
+		case r == '\\':
+			// Escape the escape, or the mapping is not injective: a real newline
+			// and the literal two characters `\n` would both render as `\n`, and a
+			// value pair differing only across that collision is a genuine UPDATE
+			// that renders as two identical lines.
+			b.WriteString(`\\`)
 		case r == '\n':
 			b.WriteString(`\n`)
 		case r == '\r':
@@ -819,18 +825,22 @@ func previewSpan(r []rune, start, end int) string {
 		b.WriteString("…")
 	}
 	if hi-lo <= 2*(previewContext+previewSpanHalf) {
-		b.WriteString(string(r[lo:hi]))
+		b.WriteString(sanitizeForEcho(string(r[lo:hi])))
 	} else {
 		headEnd := min(lo+previewContext+previewSpanHalf, hi)
 		tailStart := max(hi-previewContext-previewSpanHalf, headEnd)
-		b.WriteString(string(r[lo:headEnd]))
-		b.WriteString(" … ")
-		b.WriteString(string(r[tailStart:hi]))
+		b.WriteString(sanitizeForEcho(string(r[lo:headEnd])))
+		// Say how much is hidden. A bare ellipsis let two cosmetic edits — one
+		// near each end — stretch the span and drop an arbitrarily large rewrite
+		// into a middle that looked like ordinary truncation. The model controls
+		// both edges, so the elision has to announce its own size.
+		fmt.Fprintf(&b, " …%d hidden… ", tailStart-headEnd)
+		b.WriteString(sanitizeForEcho(string(r[tailStart:hi])))
 	}
 	if hi < len(r) {
 		b.WriteString("…")
 	}
-	return sanitizeForEcho(b.String())
+	return b.String()
 }
 
 // renderCompactPlan prints a human-readable summary of the proposed changes.
@@ -852,7 +862,7 @@ func renderCompactPlanTo(w io.Writer, originals []storedMemory, plan *compactPla
 	// nor the "← src" line that would reveal the original was being replaced.
 	// These values are re-injected into every future session by gt prime.
 	for _, s := range plan.sets {
-		label := s.memType + "/" + s.shortKey
+		label := planLabel(s.memType, s.shortKey)
 		if !writesRow(s) {
 			fmt.Fprintf(w, "  %s %s\n", style.Dim.Render("KEEP  "), style.Dim.Render(label))
 			continue
@@ -878,8 +888,13 @@ func renderCompactPlanTo(w io.Writer, originals []storedMemory, plan *compactPla
 			fmt.Fprintf(w, "         %s %s\n", style.Dim.Render("old:"), style.Dim.Render(oldPreview))
 			fmt.Fprintf(w, "         %s %s\n", style.Dim.Render("new:"), style.Dim.Render(newPreview))
 		} else {
+			// Give NEW/MERGE the same head+tail+hidden-count treatment as UPDATE
+			// rather than a plain prefix. There is no "old" to diff against, but
+			// this is the row where ALL the content is model-chosen and
+			// unreviewed, so it should not get the weakest display.
+			body := []rune(s.value)
 			fmt.Fprintf(w, "         %s %s\n", style.Dim.Render("new:"),
-				style.Dim.Render(compactTruncate(sanitizeForEcho(s.value), valuePreviewWidth)))
+				style.Dim.Render(previewSpan(body, 0, len(body))))
 		}
 	}
 
@@ -891,7 +906,7 @@ func renderCompactPlanTo(w io.Writer, originals []storedMemory, plan *compactPla
 			continue
 		}
 		reason := plan.dropReasons[m.fullKey]
-		label := m.memType + "/" + m.shortKey
+		label := planLabel(m.memType, m.shortKey)
 		if reason != "" {
 			fmt.Fprintf(w, "  %s %s  %s\n", style.Warning.Render("DROP  "), style.Bold.Render(label),
 				style.Dim.Render("("+compactTruncate(sanitizeForEcho(reason), valuePreviewWidth)+")"))
@@ -904,6 +919,14 @@ func renderCompactPlanTo(w io.Writer, originals []storedMemory, plan *compactPla
 // writesRow reports whether a set op results in a write, and therefore whether
 // renderCompactPlanTo prints its sources and body.
 func writesRow(s memSetOp) bool { return s.isNew || s.changed }
+
+// planLabel renders a type/key label for the plan. Keys are as untrusted as
+// values: loadStoredMemories accepts any memory.* kv key and sanitizeKey runs
+// only on the write path, so a key planted through `bd kv set` reaches the
+// renderer raw and could emit CR/ANSI to erase its own row.
+func planLabel(memType, shortKey string) string {
+	return compactTruncate(sanitizeForEcho(memType+"/"+shortKey), valuePreviewWidth)
+}
 
 // mergedAway reports whether a cleared memory is listed as a source of a row
 // that RENDERS its sources, so the deletion is already visible on screen as a
@@ -920,7 +943,12 @@ func mergedAway(m storedMemory, plan *compactPlan) bool {
 			continue
 		}
 		for _, src := range s.sources {
-			if src == m.fullKey || src == m.shortKey || src == m.memType+"/"+m.shortKey {
+			// Type-qualified forms only. A bare shortKey is not injective — keys
+			// repeat across types, so one model-supplied token matched every
+			// original sharing that key and a single rendered "← src" line
+			// suppressed all of their DROP rows. Anything unmatched simply prints
+			// its own DROP row, which is the safe direction.
+			if src == m.fullKey || src == m.memType+"/"+m.shortKey {
 				return true
 			}
 		}
