@@ -88,6 +88,7 @@ func runMemories(cmd *cobra.Command, args []string) error {
 			memoriesInstructions,
 			cmd.Flags().Changed("instructions"),
 			memoriesInstructionsFile,
+			cmd.Flags().Changed("instructions-file"),
 		)
 		if err != nil {
 			return err
