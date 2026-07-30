@@ -1,7 +1,14 @@
 package cmd
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestExtractJSONSpan(t *testing.T) {
@@ -58,6 +65,19 @@ func TestParseCompactResponse(t *testing.T) {
 		}
 	})
 
+	t.Run("truncated at the output limit", func(t *testing.T) {
+		// A store too big for one pass stops at max_tokens mid-JSON; the error
+		// must name that cause, not the resulting parse failure.
+		raw := []byte(`{"is_error":false,"stop_reason":"max_tokens","result":"{\"memories\":[{\"type\":\"user\","}`)
+		_, err := parseCompactResponse(raw)
+		if err == nil {
+			t.Fatal("expected error for a max_tokens-truncated response")
+		}
+		if !strings.Contains(err.Error(), "output limit") {
+			t.Errorf("error = %q, want it to name the output limit", err)
+		}
+	})
+
 	t.Run("no JSON object", func(t *testing.T) {
 		raw := []byte(`{"result":"I cannot help with that"}`)
 		if _, err := parseCompactResponse(raw); err == nil {
@@ -68,29 +88,251 @@ func TestParseCompactResponse(t *testing.T) {
 
 func TestValidateMemoriesFlags(t *testing.T) {
 	tests := []struct {
-		name                                           string
-		compact, hasArgs, dryRun, yes, model, typeFlag bool
-		wantErr                                        bool
+		name    string
+		use     memoriesFlagUse
+		wantErr bool
 	}{
-		{name: "plain list, no flags", wantErr: false},
-		{name: "plain list with search term", hasArgs: true, wantErr: false},
-		{name: "plain list with --type", typeFlag: true, wantErr: false},
-		{name: "--dry-run without --compact", dryRun: true, wantErr: true},
-		{name: "--yes without --compact", yes: true, wantErr: true},
-		{name: "--model without --compact", model: true, wantErr: true},
-		{name: "compact alone", compact: true, wantErr: false},
-		{name: "compact with all its flags", compact: true, dryRun: true, yes: true, model: true, wantErr: false},
-		{name: "compact with search term", compact: true, hasArgs: true, wantErr: true},
-		{name: "compact with --type", compact: true, typeFlag: true, wantErr: true},
+		{name: "plain list, no flags", use: memoriesFlagUse{}},
+		{name: "plain list with search term", use: memoriesFlagUse{hasArgs: true}},
+		{name: "plain list with --type", use: memoriesFlagUse{typeFilter: true}},
+		{name: "--dry-run without --compact", use: memoriesFlagUse{dryRun: true}, wantErr: true},
+		{name: "--yes without --compact", use: memoriesFlagUse{yes: true}, wantErr: true},
+		{name: "--model without --compact", use: memoriesFlagUse{model: true}, wantErr: true},
+		{name: "--instructions without --compact", use: memoriesFlagUse{instructions: true}, wantErr: true},
+		{name: "--instructions-file without --compact", use: memoriesFlagUse{instructionsFile: true}, wantErr: true},
+		{name: "--timeout without --compact", use: memoriesFlagUse{timeout: true, timeoutValue: time.Minute}, wantErr: true},
+		{name: "compact alone", use: memoriesFlagUse{compact: true}},
+		{
+			name: "compact with all its flags",
+			use: memoriesFlagUse{compact: true, dryRun: true, yes: true, model: true,
+				instructions: true, timeout: true, timeoutValue: 10 * time.Minute},
+		},
+		{name: "compact with search term", use: memoriesFlagUse{compact: true, hasArgs: true}, wantErr: true},
+		{name: "compact with --type", use: memoriesFlagUse{compact: true, typeFilter: true}, wantErr: true},
+		{
+			name:    "both instruction flags",
+			use:     memoriesFlagUse{compact: true, instructions: true, instructionsFile: true},
+			wantErr: true,
+		},
+		{
+			name:    "zero --timeout",
+			use:     memoriesFlagUse{compact: true, timeout: true, timeoutValue: 0},
+			wantErr: true,
+		},
+		{
+			name:    "negative --timeout",
+			use:     memoriesFlagUse{compact: true, timeout: true, timeoutValue: -5 * time.Second},
+			wantErr: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateMemoriesFlags(tt.compact, tt.hasArgs, tt.dryRun, tt.yes, tt.model, tt.typeFlag)
+			err := validateMemoriesFlags(tt.use)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateMemoriesFlags() err = %v, wantErr = %v", err, tt.wantErr)
 			}
 		})
 	}
+}
+
+func TestCompactTimeoutFor(t *testing.T) {
+	t.Run("scales past the old flat 2m cap for a real store", func(t *testing.T) {
+		// The reported failure: 81 memories timed out at a flat 2 minutes.
+		got := compactTimeoutFor(81)
+		if got <= 2*time.Minute {
+			t.Errorf("compactTimeoutFor(81) = %s, want more than the old 2m cap", got)
+		}
+		if got > compactTimeoutMax {
+			t.Errorf("compactTimeoutFor(81) = %s, want <= %s", got, compactTimeoutMax)
+		}
+	})
+
+	t.Run("monotonic in memory count", func(t *testing.T) {
+		if compactTimeoutFor(10) >= compactTimeoutFor(200) {
+			t.Error("timeout must grow with the number of memories")
+		}
+	})
+
+	t.Run("clamped at the max", func(t *testing.T) {
+		if got := compactTimeoutFor(100000); got != compactTimeoutMax {
+			t.Errorf("compactTimeoutFor(100000) = %s, want %s", got, compactTimeoutMax)
+		}
+	})
+
+	t.Run("never below the base", func(t *testing.T) {
+		for _, n := range []int{-1, 0, 2} {
+			if got := compactTimeoutFor(n); got < compactTimeoutBase {
+				t.Errorf("compactTimeoutFor(%d) = %s, want >= %s", n, got, compactTimeoutBase)
+			}
+		}
+	})
+}
+
+func TestResolveCompactInstructions(t *testing.T) {
+	t.Run("no flags means no instructions", func(t *testing.T) {
+		got, err := resolveCompactInstructions("", false, "")
+		if err != nil || got != "" {
+			t.Fatalf("got (%q, %v), want (\"\", nil)", got, err)
+		}
+	})
+
+	t.Run("inline is trimmed", func(t *testing.T) {
+		got, err := resolveCompactInstructions("  drop augment notes\n", true, "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "drop augment notes" {
+			t.Errorf("got %q, want trimmed instructions", got)
+		}
+	})
+
+	t.Run("blank inline is an error", func(t *testing.T) {
+		if _, err := resolveCompactInstructions("   ", true, ""); err == nil {
+			t.Error("expected error for whitespace-only --instructions")
+		}
+	})
+
+	t.Run("file contents are read and trimmed", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "instructions.md")
+		if err := os.WriteFile(path, []byte("retire the augment workflow\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		got, err := resolveCompactInstructions("", false, path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "retire the augment workflow" {
+			t.Errorf("got %q, want the file contents", got)
+		}
+	})
+
+	t.Run("missing file is an error", func(t *testing.T) {
+		if _, err := resolveCompactInstructions("", false, filepath.Join(t.TempDir(), "nope.md")); err == nil {
+			t.Error("expected error for unreadable --instructions-file")
+		}
+	})
+
+	t.Run("empty file is an error", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "empty.md")
+		if err := os.WriteFile(path, []byte("\n  \n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolveCompactInstructions("", false, path); err == nil {
+			t.Error("expected error for an --instructions-file with no instructions")
+		}
+	})
+}
+
+func TestBuildCompactPrompt(t *testing.T) {
+	mems := []storedMemory{
+		{fullKey: "memory.feedback.augment-loop", memType: "feedback", shortKey: "augment-loop", value: "run augment review"},
+	}
+
+	t.Run("without instructions", func(t *testing.T) {
+		got := buildCompactPrompt(mems, "")
+		if strings.Contains(got, compactInstructionsOpen) {
+			t.Error("prompt has an instructions block when none were given")
+		}
+		if !strings.Contains(got, "feedback/augment-loop") {
+			t.Error("prompt is missing the memory list")
+		}
+	})
+
+	t.Run("with instructions", func(t *testing.T) {
+		instructions := "Remove references to augment.\nUse the internal reviewer instead."
+		got := buildCompactPrompt(mems, instructions)
+		if !strings.Contains(got, compactInstructionsOpen) || !strings.Contains(got, compactInstructionsClose) {
+			t.Fatal("instructions are not delimited")
+		}
+		if !strings.Contains(got, instructions) {
+			t.Error("instructions text is missing from the prompt")
+		}
+		// Multi-line instructions must sit inside the delimiters, not leak into
+		// the memory list that follows.
+		openIdx := strings.Index(got, compactInstructionsOpen)
+		closeIdx := strings.Index(got, compactInstructionsClose)
+		if openIdx >= closeIdx || strings.Index(got, "Current memories") < closeIdx {
+			t.Error("instructions block is not fully ahead of the memory list")
+		}
+		// The model must be told the instructions outrank the default goals,
+		// otherwise "preserve every distinct fact" blocks a requested removal.
+		if !strings.Contains(got, "outrank") {
+			t.Error("prompt does not establish instruction precedence over the goals")
+		}
+	})
+}
+
+func TestCompactClaudeArgs(t *testing.T) {
+	args := compactClaudeArgs("sonnet")
+
+	// A turn budget of 1 aborts the whole run (error_max_turns) the moment the
+	// model attempts a tool call, which it may do even when tools are denied.
+	var turns string
+	for i, a := range args {
+		if a == "--max-turns" && i+1 < len(args) {
+			turns = args[i+1]
+		}
+	}
+	if turns == "" {
+		t.Fatal("--max-turns is not set")
+	}
+	if n, err := strconv.Atoi(turns); err != nil || n < 2 {
+		t.Errorf("--max-turns = %q, want an integer >= 2", turns)
+	}
+
+	if args[len(args)-1] != "-p" {
+		t.Errorf("last arg = %q, want -p to terminate the variadic tool list", args[len(args)-1])
+	}
+
+	// Compaction needs no tools, and it runs with permissions skipped inside the
+	// user's town directory — the mutating tools must be denied.
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--disallowed-tools") {
+		t.Fatal("--disallowed-tools is not set")
+	}
+	for _, tool := range []string{"Bash", "Write", "Edit"} {
+		if !slices.Contains(compactDeniedTools, tool) {
+			t.Errorf("%s is not denied for the compaction call", tool)
+		}
+	}
+}
+
+func TestBuildCompactPromptForbidsTools(t *testing.T) {
+	// The prompt must tell the model not to reach for tools: a tool call costs a
+	// turn and buys nothing, since every memory is already in the prompt.
+	got := buildCompactPrompt([]storedMemory{
+		{fullKey: "memory.user.k", memType: "user", shortKey: "k", value: "v"},
+	}, "")
+	if !strings.Contains(got, "Do not use any tools") {
+		t.Error("prompt does not tell the model to avoid tools")
+	}
+}
+
+func TestClaudeCompactError(t *testing.T) {
+	baseErr := errors.New("exit status 1")
+
+	t.Run("surfaces the stdout error envelope", func(t *testing.T) {
+		// The real failure mode: claude reports error_max_turns on STDOUT and
+		// leaves stderr empty, so a bare ExitError says only "exit status 1".
+		stdout := []byte(`{"is_error":true,"subtype":"error_max_turns","result":""}`)
+		err := claudeCompactError(baseErr, stdout)
+		if !strings.Contains(err.Error(), "error_max_turns") {
+			t.Errorf("error = %q, want it to name the subtype from stdout", err)
+		}
+	})
+
+	t.Run("falls back to raw stdout", func(t *testing.T) {
+		err := claudeCompactError(baseErr, []byte("something went wrong"))
+		if !strings.Contains(err.Error(), "something went wrong") {
+			t.Errorf("error = %q, want it to include raw stdout", err)
+		}
+	})
+
+	t.Run("passes the error through when there is nothing to add", func(t *testing.T) {
+		if err := claudeCompactError(baseErr, nil); !errors.Is(err, baseErr) {
+			t.Errorf("error = %v, want the original error", err)
+		}
+	})
 }
 
 func TestBuildCompactPlan(t *testing.T) {

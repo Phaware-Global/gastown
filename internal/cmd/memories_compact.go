@@ -8,15 +8,42 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/style"
 )
 
-// compactTimeout bounds the headless compaction model call so a hung or
-// slow `claude` invocation can't stall the command indefinitely.
-var compactTimeout = 2 * time.Minute
+// Compaction runtime scales with the size of the memory store: the contract
+// asks the model to re-emit the COMPLETE desired final set, so every stored
+// byte is an output byte. A single flat cap could not cover that — a real store
+// of 81 memories (~67 KB of values, i.e. 20k+ output tokens) needs several
+// minutes of generation and always tripped the old 2-minute cap. So the default
+// budget scales with the memory count, and --timeout overrides it outright.
+//
+// The cap still exists to bound a genuinely hung `claude` invocation.
+const (
+	compactTimeoutBase   = 3 * time.Minute
+	compactTimeoutPerMem = 6 * time.Second
+	compactTimeoutMax    = 30 * time.Minute
+)
+
+// compactTimeoutFor returns the default model budget for n memories.
+func compactTimeoutFor(n int) time.Duration {
+	if n < 0 {
+		n = 0
+	}
+	d := compactTimeoutBase + time.Duration(n)*compactTimeoutPerMem
+	if d > compactTimeoutMax {
+		return compactTimeoutMax
+	}
+	return d
+}
+
+// compactHeartbeatInterval is how often the wait prints an elapsed-time line so
+// a multi-minute model call doesn't look like a hang.
+var compactHeartbeatInterval = 30 * time.Second
 
 // memCompactResult is the JSON contract the LLM must return: the complete
 // desired final memory set plus, for display only, the list of memories it
@@ -81,8 +108,9 @@ func (p *compactPlan) writes() int {
 
 // runMemoriesCompact implements `gt memories --compact`: load the current
 // memories, ask an LLM to consolidate them, show the plan, and (unless
-// --dry-run) apply after confirmation.
-func runMemoriesCompact() error {
+// --dry-run) apply after confirmation. instructions is the operator's already
+// resolved extra guidance for this run ("" for none).
+func runMemoriesCompact(instructions string) error {
 	originals, err := loadStoredMemories()
 	if err != nil {
 		return fmt.Errorf("loading memories: %w", err)
@@ -103,15 +131,27 @@ func runMemoriesCompact() error {
 		return fmt.Errorf("--model must not be empty")
 	}
 
-	fmt.Printf("%s Compacting %d memories with %s...\n\n",
-		style.Bold.Render("🧹"), len(originals), style.Bold.Render(model))
+	timeout := memoriesCompactTimeout
+	if timeout <= 0 {
+		timeout = compactTimeoutFor(len(originals))
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), compactTimeout)
+	fmt.Printf("%s Compacting %d memories with %s (timeout %s)...\n",
+		style.Bold.Render("🧹"), len(originals), style.Bold.Render(model), timeout.Round(time.Second))
+	if instructions != "" {
+		fmt.Printf("%s\n", style.Dim.Render("   instructions: "+strings.ReplaceAll(instructions, "\n", " ")))
+	}
+	fmt.Println()
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	raw, err := invokeClaudeCompact(ctx, buildCompactPrompt(originals), model)
+	stopHeartbeat := startCompactHeartbeat(timeout)
+	raw, err := invokeClaudeCompact(ctx, buildCompactPrompt(originals, instructions), model)
+	stopHeartbeat()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("compaction model timed out after %s", compactTimeout)
+			return fmt.Errorf("compaction model timed out after %s — retry with a longer --timeout, "+
+				"or narrow the work with --instructions", timeout.Round(time.Second))
 		}
 		return fmt.Errorf("invoking compaction model: %w", err)
 	}
@@ -155,6 +195,60 @@ func runMemoriesCompact() error {
 	return applyCompactPlan(plan)
 }
 
+// resolveCompactInstructions returns the operator's extra guidance for this
+// compaction run, from --instructions (inline, inlineSet reports whether the
+// flag was given) or --instructions-file. A flag that was supplied but resolves
+// to blank text is an error rather than a silent no-op: the caller asked for
+// guidance to be applied, so quietly running a generic compaction instead would
+// misapply the whole plan.
+func resolveCompactInstructions(inline string, inlineSet bool, file string) (string, error) {
+	if path := strings.TrimSpace(file); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("reading --instructions-file: %w", err)
+		}
+		trimmed := strings.TrimSpace(string(data))
+		if trimmed == "" {
+			return "", fmt.Errorf("--instructions-file %s contains no instructions", path)
+		}
+		return trimmed, nil
+	}
+	trimmed := strings.TrimSpace(inline)
+	if inlineSet && trimmed == "" {
+		return "", fmt.Errorf("--instructions must not be blank")
+	}
+	return trimmed, nil
+}
+
+// startCompactHeartbeat prints an elapsed-time line every
+// compactHeartbeatInterval until the returned stop func is called, so a
+// legitimately long model call is visibly alive instead of looking wedged. The
+// stop func blocks until the goroutine has exited, so no heartbeat line can
+// interleave with the plan output that follows.
+func startCompactHeartbeat(limit time.Duration) func() {
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	start := time.Now()
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(compactHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				fmt.Printf("%s\n", style.Dim.Render(fmt.Sprintf("   still compacting… %s elapsed (timeout %s)",
+					time.Since(start).Round(time.Second), limit.Round(time.Second))))
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-stopped
+	}
+}
+
 // loadStoredMemories reads all memory.* entries from the kv store.
 func loadStoredMemories() ([]storedMemory, error) {
 	kvs, err := bdKvListJSON()
@@ -178,8 +272,19 @@ func loadStoredMemories() ([]storedMemory, error) {
 	return mems, nil
 }
 
+// compactInstructionsOpen and compactInstructionsClose delimit operator
+// instructions in the prompt so multi-line guidance can't be confused with the
+// surrounding contract or the memory list.
+const (
+	compactInstructionsOpen  = "--- BEGIN OPERATOR INSTRUCTIONS ---"
+	compactInstructionsClose = "--- END OPERATOR INSTRUCTIONS ---"
+)
+
 // buildCompactPrompt renders the current memories and the output contract.
-func buildCompactPrompt(mems []storedMemory) string {
+// instructions, when non-empty, is the operator's extra guidance for this run
+// (e.g. "drop everything about the retired reviewer") and takes precedence over
+// the generic goals — but never over the output contract.
+func buildCompactPrompt(mems []storedMemory, instructions string) string {
 	var b strings.Builder
 	b.WriteString("You are compacting an AI agent's persistent memory store. ")
 	b.WriteString("Each memory has a type, a short key, and a value.\n\n")
@@ -189,6 +294,17 @@ func buildCompactPrompt(mems []storedMemory) string {
 	b.WriteString("3. Preserve every distinct fact — never lose information, never invent new facts.\n")
 	b.WriteString("4. Keep each memory's type the same category it had (feedback, user, project, reference, general).\n")
 	b.WriteString("5. Keep values concise but complete.\n\n")
+	if instructions != "" {
+		b.WriteString("The operator gave instructions for THIS run. They outrank goals 1-5: where they\n")
+		b.WriteString("conflict, follow the instructions — including deleting, rewriting, or replacing\n")
+		b.WriteString("the wording of memories they tell you to change, even though goal 3 would\n")
+		b.WriteString("otherwise preserve that content. Apply them to every memory they touch, and\n")
+		b.WriteString("compact normally for the rest. They do NOT change the output format below:\n")
+		b.WriteString("still return the COMPLETE final set as one JSON object with valid types.\n\n")
+		b.WriteString(compactInstructionsOpen + "\n")
+		b.WriteString(instructions + "\n")
+		b.WriteString(compactInstructionsClose + "\n\n")
+	}
 	b.WriteString("Current memories (each value is quoted; \\n denotes a newline inside a value):\n\n")
 	for _, m := range mems {
 		// Identify each memory as type/key (keys can repeat across types) and
@@ -196,6 +312,10 @@ func buildCompactPrompt(mems []storedMemory) string {
 		// memory-per-line structure the model reads.
 		fmt.Fprintf(&b, "- %s/%s: %q\n", m.memType, m.shortKey, m.value)
 	}
+	// Every memory is already in this prompt, so a tool call buys nothing and
+	// costs a turn — which is how a run ends in error_max_turns.
+	b.WriteString("\nDo not use any tools. Every memory you need is already above; ")
+	b.WriteString("answer directly from it.\n")
 	b.WriteString("\nReturn ONLY a JSON object (no prose, no markdown fences) of this exact shape:\n")
 	b.WriteString(`{
   "memories": [
@@ -214,6 +334,39 @@ func buildCompactPrompt(mems []storedMemory) string {
 	return b.String()
 }
 
+// compactMaxTurns is the turn budget for the compaction call. It must be more
+// than 1: the model can attempt a tool call even when the prompt tells it not
+// to and every tool is denied, and under --max-turns 1 that attempt consumed
+// the only turn and aborted the whole run with error_max_turns — after minutes
+// of work. A small budget lets the run absorb a stray attempt and still answer.
+const compactMaxTurns = 6
+
+// compactDeniedTools are refused for the compaction call. Compaction is a pure
+// text transformation over data already embedded in the prompt, so it needs no
+// tools at all — and the call runs with --dangerously-skip-permissions in the
+// user's town directory, where an errant Bash or Write would be destructive.
+// Denying them cannot stop the model from *attempting* a call (hence the turn
+// budget above), but it does stop one from taking effect.
+var compactDeniedTools = []string{
+	"Bash", "Edit", "Glob", "Grep", "MultiEdit", "NotebookEdit",
+	"Read", "Task", "TodoWrite", "WebFetch", "WebSearch", "Write",
+}
+
+// compactClaudeArgs builds the headless `claude` argv for a compaction run.
+func compactClaudeArgs(model string) []string {
+	args := []string{
+		"--dangerously-skip-permissions",
+		"--output-format", "json",
+		"--max-turns", strconv.Itoa(compactMaxTurns),
+		"--model", model,
+		"--disallowed-tools",
+	}
+	args = append(args, compactDeniedTools...)
+	// `claude -p` with no inline prompt reads the prompt from stdin; keep -p
+	// last so it terminates the variadic --disallowed-tools list.
+	return append(args, "-p")
+}
+
 // invokeClaudeCompact runs the claude CLI headless and returns its raw stdout.
 // CLAUDECODE env vars are cleared so an agent running this from inside a Claude
 // Code session does not trip the nested-session guard (same approach as seance).
@@ -221,38 +374,68 @@ func invokeClaudeCompact(ctx context.Context, prompt, model string) ([]byte, err
 	// Deliver the prompt on stdin rather than as a `-p <prompt>` argv element:
 	// the prompt embeds the entire memory store, which for a large store could
 	// exceed the OS argument-length limit (ARG_MAX) and fail with "argument
-	// list too long". `claude -p` with no inline prompt reads it from stdin.
-	cmd := exec.CommandContext(ctx, "claude",
-		"--dangerously-skip-permissions",
-		"--output-format", "json",
-		"--max-turns", "1",
-		"--model", model,
-		"-p",
-	)
+	// list too long".
+	cmd := exec.CommandContext(ctx, "claude", compactClaudeArgs(model)...)
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Env = clearClaudeCodeEnv(os.Environ())
 	out, err := cmd.Output()
 	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
-			return nil, fmt.Errorf("%w: %s", err, strings.TrimSpace(string(ee.Stderr)))
-		}
-		return nil, err
+		return nil, claudeCompactError(err, out)
 	}
 	return out, nil
+}
+
+// claudeCompactError annotates a failed `claude` run with whatever it actually
+// told us. Under --output-format json the CLI reports failures as a result
+// envelope on STDOUT and can leave stderr empty, so returning the bare
+// *exec.ExitError would surface only "exit status 1" and discard the sole
+// diagnostic the user needs.
+func claudeCompactError(err error, stdout []byte) error {
+	var parts []string
+	if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+		parts = append(parts, "stderr: "+truncateStr(strings.TrimSpace(string(ee.Stderr)), 500))
+	}
+	if s := strings.TrimSpace(string(stdout)); s != "" {
+		var env claudeResultEnvelope
+		if jsonErr := json.Unmarshal([]byte(s), &env); jsonErr == nil && (env.IsError || env.Subtype != "") {
+			parts = append(parts, fmt.Sprintf("model reported subtype %q: %s",
+				env.Subtype, truncateStr(strings.TrimSpace(env.Result), 500)))
+		} else {
+			parts = append(parts, "stdout: "+truncateStr(s, 500))
+		}
+	}
+	if len(parts) == 0 {
+		return err
+	}
+	return fmt.Errorf("%w: %s", err, strings.Join(parts, "; "))
+}
+
+// claudeResultEnvelope is the `claude --output-format json` wrapper around the
+// model's text. It carries the failure detail on both the success and error
+// paths, so both parseCompactResponse and claudeCompactError decode it.
+type claudeResultEnvelope struct {
+	Result     string `json:"result"`
+	IsError    bool   `json:"is_error"`
+	Subtype    string `json:"subtype"`
+	StopReason string `json:"stop_reason"`
 }
 
 // parseCompactResponse unwraps the claude JSON envelope and extracts the
 // embedded compaction JSON object from the result text.
 func parseCompactResponse(raw []byte) (*memCompactResult, error) {
-	var env struct {
-		Result  string `json:"result"`
-		IsError bool   `json:"is_error"`
-		Subtype string `json:"subtype"`
-	}
+	var env claudeResultEnvelope
 	resultText := string(raw)
 	if err := json.Unmarshal(raw, &env); err == nil {
 		if env.IsError {
 			return nil, fmt.Errorf("model reported an error (subtype %q): %s", env.Subtype, strings.TrimSpace(env.Result))
+		}
+		// A store large enough to exhaust the model's output budget truncates
+		// mid-JSON. Say so plainly — otherwise this surfaces as an opaque
+		// "decoding compaction JSON: unexpected end of JSON input".
+		if env.StopReason == "max_tokens" {
+			return nil, fmt.Errorf("model hit its output limit before finishing the memory set — "+
+				"the response is truncated (%d chars). The store is too large to compact in one pass; "+
+				"narrow it with --instructions", len(env.Result))
 		}
 		if env.Result != "" {
 			resultText = env.Result

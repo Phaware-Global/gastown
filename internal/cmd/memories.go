@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/style"
@@ -14,6 +15,9 @@ var memoriesCompact bool
 var memoriesDryRun bool
 var memoriesYes bool
 var memoriesModel string
+var memoriesInstructions string
+var memoriesInstructionsFile string
+var memoriesCompactTimeout time.Duration
 
 func init() {
 	memoriesCmd.Flags().StringVar(&memoriesTypeFilter, "type", "", "Filter by memory type: feedback, project, user, reference, general")
@@ -21,6 +25,9 @@ func init() {
 	memoriesCmd.Flags().BoolVar(&memoriesDryRun, "dry-run", false, "With --compact: show the plan without writing changes")
 	memoriesCmd.Flags().BoolVar(&memoriesYes, "yes", false, "With --compact: apply the plan without the confirmation prompt")
 	memoriesCmd.Flags().StringVar(&memoriesModel, "model", "sonnet", "With --compact: model used for compaction reasoning")
+	memoriesCmd.Flags().StringVar(&memoriesInstructions, "instructions", "", "With --compact: extra guidance for the compaction model (e.g. \"drop everything about the retired reviewer\")")
+	memoriesCmd.Flags().StringVar(&memoriesInstructionsFile, "instructions-file", "", "With --compact: read --instructions from a file")
+	memoriesCmd.Flags().DurationVar(&memoriesCompactTimeout, "timeout", 0, "With --compact: model timeout (default scales with the number of memories)")
 	memoriesCmd.GroupID = GroupWork
 	rootCmd.AddCommand(memoriesCmd)
 }
@@ -40,30 +47,52 @@ Use --type to filter by memory category:
   reference  Pointers to external resources
   general    Uncategorized memories
 
+With --compact, use --instructions (or --instructions-file) to steer the
+compaction: guidance there outranks the default merge/dedup goals, so it can
+retire a topic outright or rewrite how a fact is phrased.
+
+Compaction asks the model to re-emit the whole memory set, so it takes minutes
+on a large store. The default --timeout scales with the number of memories;
+raise it with --timeout if a very large store still runs out of time.
+
 Examples:
   gt memories                    # List all memories
   gt memories --type feedback    # Show only behavioral corrections
   gt memories refinery           # Search for memories about refinery
   gt memories --compact          # LLM-assisted merge/dedup (preview + confirm)
-  gt memories --compact --dry-run  # Preview the compaction plan only`,
+  gt memories --compact --dry-run  # Preview the compaction plan only
+  gt memories --compact --instructions "Remove references to augment — we no longer use it. Replace code reviewer notes about augment with internal reviewer instructions."
+  gt memories --compact --instructions-file cleanup.md --timeout 20m`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runMemories,
 }
 
 func runMemories(cmd *cobra.Command, args []string) error {
-	if err := validateMemoriesFlags(
-		memoriesCompact,
-		len(args) > 0,
-		cmd.Flags().Changed("dry-run"),
-		cmd.Flags().Changed("yes"),
-		cmd.Flags().Changed("model"),
-		cmd.Flags().Changed("type"),
-	); err != nil {
+	if err := validateMemoriesFlags(memoriesFlagUse{
+		compact:          memoriesCompact,
+		hasArgs:          len(args) > 0,
+		dryRun:           cmd.Flags().Changed("dry-run"),
+		yes:              cmd.Flags().Changed("yes"),
+		model:            cmd.Flags().Changed("model"),
+		typeFilter:       cmd.Flags().Changed("type"),
+		instructions:     cmd.Flags().Changed("instructions"),
+		instructionsFile: cmd.Flags().Changed("instructions-file"),
+		timeout:          cmd.Flags().Changed("timeout"),
+		timeoutValue:     memoriesCompactTimeout,
+	}); err != nil {
 		return err
 	}
 
 	if memoriesCompact {
-		return runMemoriesCompact()
+		instructions, err := resolveCompactInstructions(
+			memoriesInstructions,
+			cmd.Flags().Changed("instructions"),
+			memoriesInstructionsFile,
+		)
+		if err != nil {
+			return err
+		}
+		return runMemoriesCompact(instructions)
 	}
 
 	kvs, err := bdKvListJSON()
@@ -156,21 +185,44 @@ func runMemories(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// memoriesFlagUse records which `gt memories` flags the user actually set (as
+// opposed to their default values), so validation can reject combinations that
+// would silently ignore input.
+type memoriesFlagUse struct {
+	compact          bool
+	hasArgs          bool
+	dryRun           bool
+	yes              bool
+	model            bool
+	typeFilter       bool
+	instructions     bool
+	instructionsFile bool
+	timeout          bool
+	timeoutValue     time.Duration
+}
+
 // validateMemoriesFlags rejects flag combinations that would silently ignore
-// user input. The --compact-only flags (--dry-run/--yes/--model) are
-// meaningless for plain listing, and a search term is ignored under --compact;
-// surfacing an error beats quietly dropping the input.
-func validateMemoriesFlags(compact, hasArgs, dryRunSet, yesSet, modelSet, typeSet bool) error {
-	if !compact {
+// user input. The --compact-only flags are meaningless for plain listing, and a
+// search term is ignored under --compact; surfacing an error beats quietly
+// dropping the input.
+func validateMemoriesFlags(u memoriesFlagUse) error {
+	if !u.compact {
+		compactOnly := []struct {
+			set  bool
+			name string
+		}{
+			{u.dryRun, "--dry-run"},
+			{u.yes, "--yes"},
+			{u.model, "--model"},
+			{u.instructions, "--instructions"},
+			{u.instructionsFile, "--instructions-file"},
+			{u.timeout, "--timeout"},
+		}
 		var offenders []string
-		if dryRunSet {
-			offenders = append(offenders, "--dry-run")
-		}
-		if yesSet {
-			offenders = append(offenders, "--yes")
-		}
-		if modelSet {
-			offenders = append(offenders, "--model")
+		for _, f := range compactOnly {
+			if f.set {
+				offenders = append(offenders, f.name)
+			}
 		}
 		if len(offenders) > 0 {
 			return fmt.Errorf("%s only applies with --compact", strings.Join(offenders, ", "))
@@ -178,11 +230,19 @@ func validateMemoriesFlags(compact, hasArgs, dryRunSet, yesSet, modelSet, typeSe
 		return nil
 	}
 	// compact mode
-	if hasArgs {
+	if u.hasArgs {
 		return fmt.Errorf("--compact does not take a search term")
 	}
-	if typeSet {
+	if u.typeFilter {
 		return fmt.Errorf("--type cannot be combined with --compact (compaction always considers all memories)")
+	}
+	if u.instructions && u.instructionsFile {
+		return fmt.Errorf("--instructions and --instructions-file are mutually exclusive")
+	}
+	// An explicit non-positive --timeout would otherwise fall back to the scaled
+	// default, silently ignoring what the user asked for.
+	if u.timeout && u.timeoutValue <= 0 {
+		return fmt.Errorf("--timeout must be positive (got %s)", u.timeoutValue)
 	}
 	return nil
 }
