@@ -851,7 +851,28 @@ func previewSpan(r []rune, start, end int) string {
 	if hi < len(r) {
 		b.WriteString("…")
 	}
-	return b.String()
+	// Bound what is actually RENDERED. The budget above is applied to raw runes,
+	// but sanitizeForEcho expands one rune to as many as eight (\u{202E}), so a
+	// span of control characters overran the intended width ~8x — and since
+	// every deletion now prints a was: line, that is reachable from a stored
+	// value as well as from model output.
+	return boundRendered(b.String(), 2*(previewContext+previewSpanHalf))
+}
+
+// maxSourceLines caps how many "← src" lines one row may emit.
+const maxSourceLines = 10
+
+// boundRendered caps an already-escaped string to n runes, keeping both ends so
+// a bound cannot hide one side of a change, and saying how much it removed.
+func boundRendered(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	r := []rune(s)
+	half := n / 2
+	return string(r[:half]) +
+		fmt.Sprintf(" …%d rendered runes hidden… ", len(r)-2*half) +
+		string(r[len(r)-half:])
 }
 
 // renderCompactPlan prints a human-readable summary of the proposed changes.
@@ -890,7 +911,17 @@ func renderCompactPlanTo(w io.Writer, originals []storedMemory, plan *compactPla
 		// re-key still shows which memory it consumes. sources is raw model
 		// output, so sanitize and cap it — unsanitized it could emit CR/ANSI and
 		// redraw the very plan the operator is approving.
-		for _, src := range s.sources {
+		for i, src := range s.sources {
+			// Cap the line COUNT, not just each line's width: sources is raw
+			// model output with no cap, so an array of thousands scrolled the
+			// rest of the plan — including real DROP rows — off screen before
+			// the [y/N] prompt. Nothing depends on rendering all of it; since
+			// DROP suppression was removed, sources is purely attribution.
+			if i == maxSourceLines {
+				fmt.Fprintf(w, "         %s %s\n", style.Dim.Render("←"),
+					style.Dim.Render(fmt.Sprintf("…%d more source(s) not shown", len(s.sources)-maxSourceLines)))
+				break
+			}
 			fmt.Fprintf(w, "         %s %s\n", style.Dim.Render("←"),
 				style.Dim.Render(boundedIdentity(src)))
 		}

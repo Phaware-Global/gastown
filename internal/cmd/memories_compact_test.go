@@ -1011,3 +1011,46 @@ func TestSanitizeForEchoEscapesC1(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderCompactPlanBoundsRowSize(t *testing.T) {
+	// boundedIdentity caps each field's width; these cap what one ROW can emit,
+	// so the model cannot scroll real deletions off screen before [y/N].
+	t.Run("source line count is capped", func(t *testing.T) {
+		many := make([]string, 500)
+		for i := range many {
+			many[i] = "general/src" + strconv.Itoa(i)
+		}
+		plan := &compactPlan{sets: []memSetOp{{
+			fullKey: "memory.general.k", memType: "general", shortKey: "k",
+			value: "v", isNew: true, sources: many,
+		}}}
+		got := renderPlan(t, nil, plan)
+		if n := strings.Count(got, "←"); n > maxSourceLines+1 {
+			t.Errorf("row emitted %d source lines, want <= %d", n, maxSourceLines+1)
+		}
+		if !strings.Contains(got, "more source(s) not shown") {
+			t.Errorf("truncation of the source list is not disclosed:\n%s", got)
+		}
+	})
+
+	t.Run("preview width is bounded after escaping", func(t *testing.T) {
+		// sanitizeForEcho expands one rune to as many as eight, so budgeting raw
+		// runes let a span of control characters render ~8x its bound.
+		hostile := strings.Repeat("‮", 400)
+		got := previewSpan([]rune(hostile), 0, len([]rune(hostile)))
+		if n := utf8.RuneCountInString(got); n > 2*(previewContext+previewSpanHalf)+64 {
+			t.Errorf("rendered preview is %d runes, want bounded near %d",
+				n, 2*(previewContext+previewSpanHalf))
+		}
+		if strings.ContainsRune(got, '‮') {
+			t.Error("bidi override survived into the rendered preview")
+		}
+	})
+
+	t.Run("ordinary previews are untouched", func(t *testing.T) {
+		v := "a short memory value"
+		if got := previewSpan([]rune(v), 0, len([]rune(v))); got != v {
+			t.Errorf("got %q, want the value verbatim", got)
+		}
+	})
+}
