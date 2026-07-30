@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sort"
@@ -60,11 +61,6 @@ var compactHeartbeatInterval = 30 * time.Second
 type memCompactResult struct {
 	Memories []compactMemory `json:"memories"`
 	Dropped  []compactDrop   `json:"dropped"`
-
-	// usedTools is set from the run envelope, not the model's JSON (unexported,
-	// so decoding cannot forge it): the run reached for a tool while processing
-	// untrusted memory text. See compactUsedTools.
-	usedTools bool
 }
 
 type compactMemory struct {
@@ -164,6 +160,21 @@ func runMemoriesCompact(instructions string) error {
 	stopHeartbeat := startCompactHeartbeat(timeout)
 	raw, err := invokeClaudeCompact(ctx, buildCompactPrompt(originals, instructions), model)
 	stopHeartbeat()
+
+	// Read the anomaly signal off the RAW envelope, before anything that can
+	// return early. Deriving it from the parsed result discarded it on every
+	// failure path — and those are the runs that matter most: error_max_turns is
+	// reported as a non-zero exit, so the run with the MOST tool activity was
+	// exactly the one that never reported any. A model-chosen validation failure
+	// (an invalid type, a duplicate key) was a cheaper stealth path than the
+	// no-op plan for the same reason.
+	usedTools := compactRunUsedTools(raw)
+	if usedTools {
+		fmt.Printf("%s The compaction run used tools, which this prompt never needs. "+
+			"A stored memory may be steering the model — review the plan carefully.\n",
+			style.Warning.Render("⚠"))
+	}
+
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("compaction model timed out after %s — retry with a longer --timeout, "+
@@ -182,19 +193,8 @@ func runMemoriesCompact(instructions string) error {
 		return err
 	}
 
-	// Report an anomalous run BEFORE any early return. A no-op plan used to exit
-	// green right here, which handed the stealthiest run the only path with no
-	// telemetry at all: "call <tool>, then return every memory unchanged"
-	// produces no writes and no clears, and the prompt itself invites returning
-	// the set unchanged. Fail non-zero so a scheduled run surfaces it too.
-	if result.usedTools {
-		fmt.Printf("%s The compaction run used tools, which this prompt never needs. "+
-			"A stored memory may be steering the model — review the plan carefully.\n",
-			style.Warning.Render("⚠"))
-	}
-
 	if plan.writes() == 0 && len(plan.clears) == 0 {
-		if result.usedTools {
+		if usedTools {
 			return fmt.Errorf("compaction proposed no changes but the run used tools — " +
 				"nothing was written, but inspect the memory store before re-running")
 		}
@@ -212,13 +212,21 @@ func runMemoriesCompact(instructions string) error {
 	// A run that reached for a tool acted on something in the memory text, which
 	// is untrusted. Never apply that unattended: --yes exists to automate the
 	// ordinary case, not to rubber-stamp an anomalous one.
-	if result.usedTools && memoriesYes {
+	if usedTools && memoriesYes {
 		return fmt.Errorf("refusing to auto-apply: the compaction run used tools, which a pure " +
 			"text transformation never needs — a stored memory may be steering the model. " +
 			"Re-run without --yes to inspect the plan and confirm interactively")
 	}
 
 	if !memoriesYes {
+		// Repeat the warning here, not only before the plan. The interactive
+		// answer is the one decision it can still influence, and the plan dump
+		// between them runs to hundreds of lines on a real store — far enough to
+		// scroll the earlier copy off screen.
+		if usedTools {
+			fmt.Printf("\n%s This run used tools — a stored memory may be steering it.\n",
+				style.Warning.Render("⚠"))
+		}
 		fmt.Printf("\nApply this plan? [y/N] ")
 		// Read the whole line (not fmt.Scanln, which stops at the first space
 		// and leaves the rest in the stdin buffer) so trailing input can't
@@ -284,18 +292,33 @@ func validateCompactInstructions(s string) error {
 	return nil
 }
 
-// sanitizeForEcho strips control characters so untrusted text cannot redraw or
-// clear the terminal line it is printed on.
+// sanitizeForEcho renders control characters as printable escapes so untrusted
+// text cannot redraw or clear the terminal line it is printed on.
+//
+// It escapes rather than strips deliberately. Dropping the characters made a
+// whitespace-only rewrite invisible: a value changed from "internal reviewer"
+// to "internal\nreviewer" is a real change that gets written, but both sides
+// rendered identically once the newline became a space, so the confirmation
+// prompt asserted nothing had changed. Escaping keeps the difference on screen
+// while still denying the terminal any control sequence.
 func sanitizeForEcho(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r == '\n' || r == '\t' {
-			return ' '
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r < 0x20 || r == 0x7f:
+			fmt.Fprintf(&b, `\x%02x`, r)
+		default:
+			b.WriteRune(r)
 		}
-		if r < 0x20 || r == 0x7f {
-			return -1
-		}
-		return r
-	}, s)
+	}
+	return b.String()
 }
 
 // startCompactHeartbeat prints an elapsed-time line every
@@ -506,7 +529,10 @@ func invokeClaudeCompact(ctx context.Context, prompt, model string) ([]byte, err
 	cmd.Dir = os.TempDir()
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, claudeCompactError(err, out)
+		// Return out as well: under --output-format json the envelope lands on
+		// stdout even when the CLI exits non-zero, and the caller reads the
+		// tool-use signal off it.
+		return out, claudeCompactError(err, out)
 	}
 	return out, nil
 }
@@ -553,18 +579,30 @@ type claudeResultEnvelope struct {
 // prompt, so extra turns or any denial record mean the model acted on something
 // in the memory text it was given. Since that text is untrusted, the caller
 // treats this as a reason to refuse to apply the plan unattended.
+//
+// This is telemetry, not the boundary — compactClaudeArgs denies the whole tool
+// surface, so an anomaly here means that containment needs re-examining.
 func compactUsedTools(env *claudeResultEnvelope) bool {
 	return env.NumTurns > 1 || len(env.PermissionDenial) > 0
+}
+
+// compactRunUsedTools reads the signal straight off the raw envelope, so it is
+// available on the failure paths too — a run that errors is not a run that
+// behaved.
+func compactRunUsedTools(raw []byte) bool {
+	var env claudeResultEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return false
+	}
+	return compactUsedTools(&env)
 }
 
 // parseCompactResponse unwraps the claude JSON envelope and extracts the
 // embedded compaction JSON object from the result text.
 func parseCompactResponse(raw []byte) (*memCompactResult, error) {
 	var env claudeResultEnvelope
-	var usedTools bool
 	resultText := string(raw)
 	if err := json.Unmarshal(raw, &env); err == nil {
-		usedTools = compactUsedTools(&env)
 		if env.IsError {
 			return nil, fmt.Errorf("model reported an error (subtype %q): %s", env.Subtype, strings.TrimSpace(env.Result))
 		}
@@ -590,7 +628,6 @@ func parseCompactResponse(raw []byte) (*memCompactResult, error) {
 	if err := json.Unmarshal([]byte(obj), &result); err != nil {
 		return nil, fmt.Errorf("decoding compaction JSON: %w", err)
 	}
-	result.usedTools = usedTools
 	return &result, nil
 }
 
@@ -726,47 +763,86 @@ func buildCompactPlan(originals []storedMemory, result *memCompactResult) (*comp
 // valuePreviewWidth is how many runes of a memory value each preview line shows.
 const valuePreviewWidth = 160
 
-// valuePreviewPair renders old and new around their FIRST DIFFERENCE rather
-// than from the start of each.
+// Preview geometry: context kept either side of the changed span, and how much
+// of the span itself is shown at each end when it is too long to print whole.
+const (
+	previewContext  = 40
+	previewSpanHalf = 60
+)
+
+// valuePreviewPair renders old and new so that the ENTIRE changed region is
+// represented — its start and its end — not just where the values first differ.
 //
-// A plain prefix hid exactly the rewrite worth catching: memory values are
-// unbounded, so two values sharing their first 160 bytes — a long reference
-// memory with only its final clause flipped — rendered as byte-identical
-// "..."-terminated lines, and the confirmation prompt actively suggested
-// nothing had changed. Windowing on the difference also keeps the slice on rune
-// boundaries, which a byte prefix did not.
+// Two earlier versions of this were fooled:
+//   - A plain prefix rendered a long value whose last clause changed as two
+//     identical "..."-terminated lines, actively asserting nothing had changed.
+//   - Anchoring on the first difference alone let a decoy edit near the front
+//     push the real rewrite past the window. The model controls the value, so
+//     it controls where the first difference falls.
+//
+// So the span is bounded by the common prefix AND the common suffix, and when
+// it is too long to show whole, the MIDDLE is elided rather than the tail.
+//
+// The diff runs on the raw runes and sanitizing happens at render time:
+// sanitizing first erased control-character-only edits (sanitizeForEcho maps
+// \n to a space), which are real changes that get written.
 func valuePreviewPair(oldVal, newVal string) (string, string) {
-	o := []rune(sanitizeForEcho(oldVal))
-	n := []rune(sanitizeForEcho(newVal))
+	o := []rune(oldVal)
+	n := []rune(newVal)
 
-	diff := 0
-	for diff < len(o) && diff < len(n) && o[diff] == n[diff] {
-		diff++
+	prefix := 0
+	for prefix < len(o) && prefix < len(n) && o[prefix] == n[prefix] {
+		prefix++
 	}
-	// Keep a little of the shared text before the change for context.
-	const lead = 40
-	start := max(diff-lead, 0)
+	suffix := 0
+	for suffix < len(o)-prefix && suffix < len(n)-prefix &&
+		o[len(o)-1-suffix] == n[len(n)-1-suffix] {
+		suffix++
+	}
 
-	return runeWindow(o, start, valuePreviewWidth), runeWindow(n, start, valuePreviewWidth)
+	return previewSpan(o, prefix, len(o)-suffix), previewSpan(n, prefix, len(n)-suffix)
 }
 
-// runeWindow returns width runes of r from start, marking each elided side.
-func runeWindow(r []rune, start, width int) string {
-	start = min(start, len(r))
-	end := min(start+width, len(r))
-	s := string(r[start:end])
-	if start > 0 {
-		s = "…" + s
+// previewSpan renders r with the changed region [start,end) guaranteed visible:
+// leading context, the head and tail of the change with any excess middle
+// elided, then trailing context. Operates on runes, so it never splits a
+// multi-byte sequence, and sanitizes for display at the end.
+func previewSpan(r []rune, start, end int) string {
+	start = min(max(start, 0), len(r))
+	end = min(max(end, start), len(r))
+
+	lo := max(start-previewContext, 0)
+	hi := min(end+previewContext, len(r))
+
+	var b strings.Builder
+	if lo > 0 {
+		b.WriteString("…")
 	}
-	if end < len(r) {
-		s += "…"
+	if hi-lo <= 2*(previewContext+previewSpanHalf) {
+		b.WriteString(string(r[lo:hi]))
+	} else {
+		headEnd := min(lo+previewContext+previewSpanHalf, hi)
+		tailStart := max(hi-previewContext-previewSpanHalf, headEnd)
+		b.WriteString(string(r[lo:headEnd]))
+		b.WriteString(" … ")
+		b.WriteString(string(r[tailStart:hi]))
 	}
-	return s
+	if hi < len(r) {
+		b.WriteString("…")
+	}
+	return sanitizeForEcho(b.String())
 }
 
 // renderCompactPlan prints a human-readable summary of the proposed changes.
 func renderCompactPlan(originals []storedMemory, plan *compactPlan) {
-	fmt.Printf("%s (%d → %d memories)\n\n",
+	renderCompactPlanTo(os.Stdout, originals, plan)
+}
+
+// renderCompactPlanTo writes the plan summary to w. This is the operator's only
+// view of what will be written and deleted, so it is the gate the whole
+// confirmation rests on — split out from renderCompactPlan so it can be tested.
+func renderCompactPlanTo(w io.Writer, originals []storedMemory, plan *compactPlan) {
+	fmt.Fprintf(w, "%s (%d → %d memories)\n\n",
 		style.Bold.Render("Compaction plan"), len(originals), len(plan.sets))
 
 	// Every row that WRITES shows its body. Confining the preview to UPDATE left
@@ -777,52 +853,72 @@ func renderCompactPlan(originals []storedMemory, plan *compactPlan) {
 	// These values are re-injected into every future session by gt prime.
 	for _, s := range plan.sets {
 		label := s.memType + "/" + s.shortKey
-		switch {
-		case s.isNew && len(s.sources) > 1:
-			fmt.Printf("  %s %s\n", style.Success.Render("MERGE "), style.Bold.Render(label))
-		case s.isNew:
-			fmt.Printf("  %s %s\n", style.Success.Render("NEW   "), style.Bold.Render(label))
-		case s.changed:
-			fmt.Printf("  %s %s\n", style.Info.Render("UPDATE"), style.Bold.Render(label))
-		default:
-			fmt.Printf("  %s %s\n", style.Dim.Render("KEEP  "), style.Dim.Render(label))
+		if !writesRow(s) {
+			fmt.Fprintf(w, "  %s %s\n", style.Dim.Render("KEEP  "), style.Dim.Render(label))
 			continue
 		}
+		switch {
+		case s.isNew && len(s.sources) > 1:
+			fmt.Fprintf(w, "  %s %s\n", style.Success.Render("MERGE "), style.Bold.Render(label))
+		case s.isNew:
+			fmt.Fprintf(w, "  %s %s\n", style.Success.Render("NEW   "), style.Bold.Render(label))
+		default:
+			fmt.Fprintf(w, "  %s %s\n", style.Info.Render("UPDATE"), style.Bold.Render(label))
+		}
 		// Attribute every source, not just multi-source ones, so a one-to-one
-		// re-key still shows which memory it consumes.
+		// re-key still shows which memory it consumes. sources is raw model
+		// output, so sanitize and cap it — unsanitized it could emit CR/ANSI and
+		// redraw the very plan the operator is approving.
 		for _, src := range s.sources {
-			fmt.Printf("         %s %s\n", style.Dim.Render("←"), src)
+			fmt.Fprintf(w, "         %s %s\n", style.Dim.Render("←"),
+				style.Dim.Render(compactTruncate(sanitizeForEcho(src), valuePreviewWidth)))
 		}
 		if s.changed {
 			oldPreview, newPreview := valuePreviewPair(s.prevValue, s.value)
-			fmt.Printf("         %s %s\n", style.Dim.Render("old:"), style.Dim.Render(oldPreview))
-			fmt.Printf("         %s %s\n", style.Dim.Render("new:"), style.Dim.Render(newPreview))
+			fmt.Fprintf(w, "         %s %s\n", style.Dim.Render("old:"), style.Dim.Render(oldPreview))
+			fmt.Fprintf(w, "         %s %s\n", style.Dim.Render("new:"), style.Dim.Render(newPreview))
 		} else {
-			fmt.Printf("         %s %s\n", style.Dim.Render("new:"),
+			fmt.Fprintf(w, "         %s %s\n", style.Dim.Render("new:"),
 				style.Dim.Render(compactTruncate(sanitizeForEcho(s.value), valuePreviewWidth)))
 		}
 	}
 
 	for _, m := range plan.clears {
-		// Skip clears folded into a MERGE/UPDATE — they're already shown as a
-		// "← src" line, so re-listing them as DROP would double-count them.
+		// Skip clears folded into a row that ACTUALLY SHOWED the attribution —
+		// re-listing those as DROP would double-count them. Anything else must
+		// print, so that no deletion can happen with nothing on screen.
 		if mergedAway(m, plan) {
 			continue
 		}
 		reason := plan.dropReasons[m.fullKey]
 		label := m.memType + "/" + m.shortKey
 		if reason != "" {
-			fmt.Printf("  %s %s  %s\n", style.Warning.Render("DROP  "), style.Bold.Render(label), style.Dim.Render("("+reason+")"))
+			fmt.Fprintf(w, "  %s %s  %s\n", style.Warning.Render("DROP  "), style.Bold.Render(label),
+				style.Dim.Render("("+compactTruncate(sanitizeForEcho(reason), valuePreviewWidth)+")"))
 		} else {
-			fmt.Printf("  %s %s\n", style.Warning.Render("DROP  "), style.Bold.Render(label))
+			fmt.Fprintf(w, "  %s %s\n", style.Warning.Render("DROP  "), style.Bold.Render(label))
 		}
 	}
 }
 
-// mergedAway reports whether a cleared memory's key is listed as a source of
-// some surviving merged/updated memory (so it's already shown as a "← src").
+// writesRow reports whether a set op results in a write, and therefore whether
+// renderCompactPlanTo prints its sources and body.
+func writesRow(s memSetOp) bool { return s.isNew || s.changed }
+
+// mergedAway reports whether a cleared memory is listed as a source of a row
+// that RENDERS its sources, so the deletion is already visible on screen as a
+// "← src" line.
+//
+// It must consider only writing rows. KEEP rows print no attribution, so
+// counting them here suppressed the DROP for a memory nothing on screen
+// mentioned: an ordinary "superseded" compaction — the model re-emits A
+// verbatim and lists B as a source — printed the single line "KEEP a" and then
+// silently deleted B.
 func mergedAway(m storedMemory, plan *compactPlan) bool {
 	for _, s := range plan.sets {
+		if !writesRow(s) {
+			continue
+		}
 		for _, src := range s.sources {
 			if src == m.fullKey || src == m.shortKey || src == m.memType+"/"+m.shortKey {
 				return true
