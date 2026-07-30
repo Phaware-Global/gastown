@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/steveyegge/gastown/internal/style"
 )
@@ -151,7 +152,7 @@ func runMemoriesCompact(instructions string) error {
 		// this banner is the operator's only view of guidance that is authorized
 		// to rewrite memories. Raw CR/ANSI could redraw the line to show
 		// something other than what was sent.
-		fmt.Printf("%s\n", style.Dim.Render("   instructions: "+truncateStr(sanitizeForEcho(instructions), 300)))
+		fmt.Printf("%s\n", style.Dim.Render("   instructions: "+compactTruncate(sanitizeForEcho(instructions), 300)))
 	}
 	fmt.Println()
 
@@ -320,6 +321,13 @@ func sanitizeForEcho(s string) string {
 			b.WriteString(`\t`)
 		case r < 0x20 || r == 0x7f:
 			fmt.Fprintf(&b, `\x%02x`, r)
+		case unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Cs, r) || unicode.Is(unicode.Co, r):
+			// Non-ASCII display controls: the bidi overrides U+202A-U+202E and
+			// isolates U+2066-U+2069 reorder the rest of the line, and the
+			// zero-width marks hide text outright. C0 escaping alone left the
+			// confirmation surface reorderable by a memory value, a model-supplied
+			// source, or a planted key.
+			fmt.Fprintf(&b, `\u{%04X}`, r)
 		default:
 			b.WriteRune(r)
 		}
@@ -902,7 +910,7 @@ func renderCompactPlanTo(w io.Writer, originals []storedMemory, plan *compactPla
 		// Skip clears folded into a row that ACTUALLY SHOWED the attribution —
 		// re-listing those as DROP would double-count them. Anything else must
 		// print, so that no deletion can happen with nothing on screen.
-		if mergedAway(m, plan) {
+		if mergedAway(m, plan, originals) {
 			continue
 		}
 		reason := plan.dropReasons[m.fullKey]
@@ -913,6 +921,14 @@ func renderCompactPlanTo(w io.Writer, originals []storedMemory, plan *compactPla
 		} else {
 			fmt.Fprintf(w, "  %s %s\n", style.Warning.Render("DROP  "), style.Bold.Render(label))
 		}
+		// Name the exact kv key and show what is being lost. type/key is not
+		// unique — a legacy memory.<key> and a canonical memory.general.<key>
+		// render the same label — so on its own the row could not say which
+		// memory was going away, and never showed the content at all. This is
+		// the only view of a deletion the operator gets.
+		fmt.Fprintf(w, "         %s %s\n", style.Dim.Render("key:"), style.Dim.Render(sanitizeForEcho(m.fullKey)))
+		was := []rune(m.value)
+		fmt.Fprintf(w, "         %s %s\n", style.Dim.Render("was:"), style.Dim.Render(previewSpan(was, 0, len(was))))
 	}
 }
 
@@ -924,31 +940,48 @@ func writesRow(s memSetOp) bool { return s.isNew || s.changed }
 // values: loadStoredMemories accepts any memory.* kv key and sanitizeKey runs
 // only on the write path, so a key planted through `bd kv set` reaches the
 // renderer raw and could emit CR/ANSI to erase its own row.
+// It is deliberately NOT truncated: a label is the row's identity, not a
+// preview of content, and a rune-prefix cap made any two keys sharing a long
+// prefix render as the same line. Escaping already neutralises the display
+// risk, so an over-long key is merely ugly rather than ambiguous.
 func planLabel(memType, shortKey string) string {
-	return compactTruncate(sanitizeForEcho(memType+"/"+shortKey), valuePreviewWidth)
+	return sanitizeForEcho(memType + "/" + shortKey)
+}
+
+// sourceMatches reports whether a model-supplied source token names m.
+func sourceMatches(src string, m storedMemory) bool {
+	return src == m.fullKey || src == m.memType+"/"+m.shortKey
 }
 
 // mergedAway reports whether a cleared memory is listed as a source of a row
 // that RENDERS its sources, so the deletion is already visible on screen as a
 // "← src" line.
 //
-// It must consider only writing rows. KEEP rows print no attribution, so
-// counting them here suppressed the DROP for a memory nothing on screen
-// mentioned: an ordinary "superseded" compaction — the model re-emits A
-// verbatim and lists B as a source — printed the single line "KEEP a" and then
-// silently deleted B.
-func mergedAway(m storedMemory, plan *compactPlan) bool {
+// It must consider only writing rows — KEEP rows print no attribution, so
+// counting them suppressed the DROP for a memory nothing on screen mentioned.
+//
+// It must also require the token to be UNAMBIGUOUS. parseMemoryKey maps a
+// legacy untyped memory.<key> and a canonical memory.general.<key> to the same
+// general/<key> pair — a coexistence buildCompactPlan explicitly handles — so a
+// type-qualified token can still name two distinct kv keys, and one rendered
+// line would suppress both deletions. When a token matches more than one
+// original, nothing is suppressed and each memory prints its own DROP row.
+func mergedAway(m storedMemory, plan *compactPlan, originals []storedMemory) bool {
 	for _, s := range plan.sets {
 		if !writesRow(s) {
 			continue
 		}
 		for _, src := range s.sources {
-			// Type-qualified forms only. A bare shortKey is not injective — keys
-			// repeat across types, so one model-supplied token matched every
-			// original sharing that key and a single rendered "← src" line
-			// suppressed all of their DROP rows. Anything unmatched simply prints
-			// its own DROP row, which is the safe direction.
-			if src == m.fullKey || src == m.memType+"/"+m.shortKey {
+			if !sourceMatches(src, m) {
+				continue
+			}
+			matches := 0
+			for _, o := range originals {
+				if sourceMatches(src, o) {
+					matches++
+				}
+			}
+			if matches == 1 {
 				return true
 			}
 		}

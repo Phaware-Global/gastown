@@ -524,7 +524,7 @@ func TestMergedAwayRequiresTypeQualifiedSource(t *testing.T) {
 		value: "v", isNew: true, sources: []string{"dup"},
 	}}}
 	victim := storedMemory{fullKey: "memory.feedback.dup", memType: "feedback", shortKey: "dup"}
-	if mergedAway(victim, plan) {
+	if mergedAway(victim, plan, []storedMemory{victim}) {
 		t.Error("a bare shortKey suppressed the DROP of a different type's memory")
 	}
 
@@ -532,8 +532,80 @@ func TestMergedAwayRequiresTypeQualifiedSource(t *testing.T) {
 		fullKey: "memory.user.dup", memType: "user", shortKey: "dup",
 		value: "v", isNew: true, sources: []string{"feedback/dup"},
 	}}}
-	if !mergedAway(victim, qualified) {
+	if !mergedAway(victim, qualified, []storedMemory{victim}) {
 		t.Error("a type-qualified source did not match the memory it consumes")
+	}
+}
+
+func TestMergedAwayRequiresUnambiguousSource(t *testing.T) {
+	// parseMemoryKey maps a legacy untyped memory.notes and a canonical
+	// memory.general.notes to the SAME general/notes pair — a coexistence
+	// buildCompactPlan explicitly handles — so one "← general/notes" line named
+	// two distinct kv keys and suppressed both deletions.
+	legacy := storedMemory{fullKey: "memory.notes", memType: "general", shortKey: "notes"}
+	canonical := storedMemory{fullKey: "memory.general.notes", memType: "general", shortKey: "notes"}
+	originals := []storedMemory{legacy, canonical}
+
+	plan := &compactPlan{sets: []memSetOp{{
+		fullKey: "memory.general.merged", memType: "general", shortKey: "merged",
+		value: "v", isNew: true, sources: []string{"general/notes"},
+	}}}
+
+	for _, m := range []storedMemory{legacy, canonical} {
+		if mergedAway(m, plan, originals) {
+			t.Errorf("ambiguous source suppressed the DROP of %s", m.fullKey)
+		}
+	}
+
+	// With only one candidate in the store the token is unambiguous again.
+	if !mergedAway(canonical, plan, []storedMemory{canonical}) {
+		t.Error("unambiguous source failed to match the memory it consumes")
+	}
+}
+
+func TestRenderCompactPlanIdentifiesDeletions(t *testing.T) {
+	// type/key is not unique, so a DROP row must name the exact kv key and show
+	// what is being lost — it is the only view of a deletion the operator gets.
+	legacy := storedMemory{fullKey: "memory.notes", memType: "general", shortKey: "notes",
+		value: "the legacy body that is about to be deleted"}
+	canonical := storedMemory{fullKey: "memory.general.notes", memType: "general", shortKey: "notes",
+		value: "the canonical body"}
+	originals := []storedMemory{legacy, canonical}
+	plan := &compactPlan{clears: []storedMemory{legacy}}
+
+	got := renderPlan(t, originals, plan)
+	if !strings.Contains(got, "memory.notes") {
+		t.Errorf("DROP row does not name the exact kv key:\n%s", got)
+	}
+	if !strings.Contains(got, "the legacy body") {
+		t.Errorf("DROP row does not show what is being deleted:\n%s", got)
+	}
+}
+
+func TestSanitizeForEchoEscapesUnicodeControls(t *testing.T) {
+	// C0 escaping alone left the confirmation line reorderable: the bidi
+	// overrides and isolates reverse or hide the text around them.
+	for _, r := range []rune{'‮', '‪', '⁦', '⁩', '​', '‎', '‏'} {
+		in := "keep tests" + string(r) + "trailing"
+		got := sanitizeForEcho(in)
+		if strings.ContainsRune(got, r) {
+			t.Errorf("U+%04X survived sanitizing: %q", r, got)
+		}
+	}
+	// Ordinary non-ASCII text must survive untouched.
+	if got := sanitizeForEcho("café — naïve 日本語"); got != "café — naïve 日本語" {
+		t.Errorf("sanitizing mangled legitimate text: %q", got)
+	}
+}
+
+func TestPlanLabelIsNotTruncated(t *testing.T) {
+	// A label is the row's identity, not a preview: capping it made any two keys
+	// sharing a long prefix render as the same line.
+	shared := strings.Repeat("k", 200)
+	a := planLabel("general", shared+"-alpha")
+	b := planLabel("general", shared+"-beta")
+	if a == b {
+		t.Errorf("two distinct keys render as the same label: %q", a)
 	}
 }
 
