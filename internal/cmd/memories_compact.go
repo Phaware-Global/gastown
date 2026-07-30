@@ -692,6 +692,16 @@ func buildCompactPlan(originals []storedMemory, result *memCompactResult) (*comp
 	if len(result.Memories) == 0 {
 		return nil, fmt.Errorf("refusing to apply: model returned an empty memory set (this would erase all %d memories)", len(originals))
 	}
+	// Compaction merges and drops; it never grows the store. Rejecting growth
+	// here closes the row-count flood at its source rather than in the renderer:
+	// an uncapped set let the model emit thousands of rows, burying the real
+	// writes and deletions above the [y/N] prompt — and, unlike a display cap,
+	// this also stops those rows from being written at all.
+	if len(result.Memories) > len(originals) {
+		return nil, fmt.Errorf("refusing to apply: model returned %d memories from a store of %d — "+
+			"compaction merges and drops, it never grows the store",
+			len(result.Memories), len(originals))
+	}
 
 	// Index originals by exact key and by (type, shortKey) so unchanged
 	// memories — including legacy untyped ones — reuse their existing key
@@ -783,8 +793,12 @@ const valuePreviewWidth = 160
 // Preview geometry: context kept either side of the changed span, and how much
 // of the span itself is shown at each end when it is too long to print whole.
 const (
-	previewContext  = 40
-	previewSpanHalf = 60
+	previewContext = 40
+	// Rendered-rune budgets. sanitizeForEcho expands one rune to as many as
+	// eight, so raw-rune budgets did not bound the line that actually reaches
+	// the terminal.
+	previewContextRendered = 60
+	previewChangeRendered  = 160
 )
 
 // valuePreviewPair renders old and new so that the ENTIRE changed region is
@@ -822,8 +836,15 @@ func valuePreviewPair(oldVal, newVal string) (string, string) {
 
 // previewSpan renders r with the changed region [start,end) guaranteed visible:
 // leading context, the head and tail of the change with any excess middle
-// elided, then trailing context. Operates on runes, so it never splits a
-// multi-byte sequence, and sanitizes for display at the end.
+// elided, then trailing context.
+//
+// Every budget here is measured in RENDERED runes and applied per piece, and
+// the CONTEXT is what gets cut first. Bounding the assembled line instead was
+// wrong in exactly the way this function exists to prevent: previewSpan centres
+// the change, so a trailing head/tail bound elided the middle — the change —
+// and escape expansion (up to 8 rendered runes each) let 40 raw runes of
+// context consume the whole budget, putting the entire rewrite inside the
+// elision on both sides and rendering old: and new: identically again.
 func previewSpan(r []rune, start, end int) string {
 	start = min(max(start, 0), len(r))
 	end = min(max(end, start), len(r))
@@ -831,49 +852,58 @@ func previewSpan(r []rune, start, end int) string {
 	lo := max(start-previewContext, 0)
 	hi := min(end+previewContext, len(r))
 
+	// Context is trimmed from its outer edge, keeping what abuts the change.
+	lead := capRenderedTail(sanitizeForEcho(string(r[lo:start])), previewContextRendered)
+	trail := capRenderedHead(sanitizeForEcho(string(r[end:hi])), previewContextRendered)
+
 	var b strings.Builder
 	if lo > 0 {
 		b.WriteString("…")
 	}
-	if hi-lo <= 2*(previewContext+previewSpanHalf) {
-		b.WriteString(sanitizeForEcho(string(r[lo:hi])))
-	} else {
-		headEnd := min(lo+previewContext+previewSpanHalf, hi)
-		tailStart := max(hi-previewContext-previewSpanHalf, headEnd)
-		b.WriteString(sanitizeForEcho(string(r[lo:headEnd])))
-		// Say how much is hidden. A bare ellipsis let two cosmetic edits — one
-		// near each end — stretch the span and drop an arbitrarily large rewrite
-		// into a middle that looked like ordinary truncation. The model controls
-		// both edges, so the elision has to announce its own size.
-		fmt.Fprintf(&b, " …%d hidden… ", tailStart-headEnd)
-		b.WriteString(sanitizeForEcho(string(r[tailStart:hi])))
-	}
+	b.WriteString(lead)
+	b.WriteString(renderChange(r[start:end]))
+	b.WriteString(trail)
 	if hi < len(r) {
 		b.WriteString("…")
 	}
-	// Bound what is actually RENDERED. The budget above is applied to raw runes,
-	// but sanitizeForEcho expands one rune to as many as eight (\u{202E}), so a
-	// span of control characters overran the intended width ~8x — and since
-	// every deletion now prints a was: line, that is reachable from a stored
-	// value as well as from model output.
-	return boundRendered(b.String(), 2*(previewContext+previewSpanHalf))
+	return b.String()
+}
+
+// renderChange renders the changed region itself, bounded but never dropped:
+// if it does not fit, the MIDDLE is elided and the elision reports its size, so
+// both edges of the rewrite stay on screen.
+func renderChange(change []rune) string {
+	s := sanitizeForEcho(string(change))
+	n := utf8.RuneCountInString(s)
+	if n <= previewChangeRendered {
+		return s
+	}
+	rs := []rune(s)
+	half := previewChangeRendered / 2
+	return string(rs[:half]) +
+		fmt.Sprintf(" …%d rendered runes hidden… ", n-2*half) +
+		string(rs[len(rs)-half:])
+}
+
+// capRenderedHead keeps the first n rendered runes, marking any cut.
+func capRenderedHead(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	return string([]rune(s)[:n]) + "…"
+}
+
+// capRenderedTail keeps the last n rendered runes, marking any cut.
+func capRenderedTail(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return "…" + string(r[len(r)-n:])
 }
 
 // maxSourceLines caps how many "← src" lines one row may emit.
 const maxSourceLines = 10
-
-// boundRendered caps an already-escaped string to n runes, keeping both ends so
-// a bound cannot hide one side of a change, and saying how much it removed.
-func boundRendered(s string, n int) string {
-	if utf8.RuneCountInString(s) <= n {
-		return s
-	}
-	r := []rune(s)
-	half := n / 2
-	return string(r[:half]) +
-		fmt.Sprintf(" …%d rendered runes hidden… ", len(r)-2*half) +
-		string(r[len(r)-half:])
-}
 
 // renderCompactPlan prints a human-readable summary of the proposed changes.
 func renderCompactPlan(originals []storedMemory, plan *compactPlan) {

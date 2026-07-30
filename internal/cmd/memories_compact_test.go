@@ -1038,9 +1038,9 @@ func TestRenderCompactPlanBoundsRowSize(t *testing.T) {
 		// runes let a span of control characters render ~8x its bound.
 		hostile := strings.Repeat("‮", 400)
 		got := previewSpan([]rune(hostile), 0, len([]rune(hostile)))
-		if n := utf8.RuneCountInString(got); n > 2*(previewContext+previewSpanHalf)+64 {
-			t.Errorf("rendered preview is %d runes, want bounded near %d",
-				n, 2*(previewContext+previewSpanHalf))
+		budget := 2*previewContextRendered + previewChangeRendered
+		if n := utf8.RuneCountInString(got); n > budget+64 {
+			t.Errorf("rendered preview is %d runes, want bounded near %d", n, budget)
 		}
 		if strings.ContainsRune(got, '‮') {
 			t.Error("bidi override survived into the rendered preview")
@@ -1053,4 +1053,49 @@ func TestRenderCompactPlanBoundsRowSize(t *testing.T) {
 			t.Errorf("got %q, want the value verbatim", got)
 		}
 	})
+}
+
+func TestPreviewSpanKeepsTheChangeVisible(t *testing.T) {
+	// The regression this replaced: bounding the ASSEMBLED line kept its head
+	// and tail, but previewSpan centres the change — so with escape-expanding
+	// context the whole rewrite fell into the elided middle and old:/new: came
+	// out identical for a value that really was being written.
+	ctx := strings.Repeat("‮", 60) // 60 runes of context, 8 rendered runes each
+	oldPreview, newPreview := valuePreviewPair(ctx+"ALPHA"+ctx, ctx+"OMEGA"+ctx)
+
+	if oldPreview == newPreview {
+		t.Fatalf("previews identical despite a real rewrite:\n%q", oldPreview)
+	}
+	if !strings.Contains(oldPreview, "ALPHA") {
+		t.Errorf("old preview lost the changed text: %q", oldPreview)
+	}
+	if !strings.Contains(newPreview, "OMEGA") {
+		t.Errorf("new preview lost the changed text: %q", newPreview)
+	}
+}
+
+func TestBuildCompactPlanRejectsStoreGrowth(t *testing.T) {
+	// Compaction merges and drops. An uncapped set let the model emit thousands
+	// of rows, burying the real writes above the [y/N] prompt — and they would
+	// have been written, not just displayed.
+	originals := []storedMemory{
+		{fullKey: "memory.user.a", memType: "user", shortKey: "a", value: "a"},
+		{fullKey: "memory.user.b", memType: "user", shortKey: "b", value: "b"},
+	}
+	flood := make([]compactMemory, 500)
+	for i := range flood {
+		flood[i] = compactMemory{Type: "user", Key: "k" + strconv.Itoa(i), Value: "v"}
+	}
+	if _, err := buildCompactPlan(originals, &memCompactResult{Memories: flood}); err == nil {
+		t.Fatal("expected refusal when the model returns more memories than the store holds")
+	}
+
+	// A same-size set (every memory kept) must still be accepted.
+	same := []compactMemory{
+		{Type: "user", Key: "a", Value: "a"},
+		{Type: "user", Key: "b", Value: "b"},
+	}
+	if _, err := buildCompactPlan(originals, &memCompactResult{Memories: same}); err != nil {
+		t.Fatalf("same-size result rejected: %v", err)
+	}
 }
