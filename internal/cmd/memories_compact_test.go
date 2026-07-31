@@ -1057,7 +1057,7 @@ func TestRenderCompactPlanBoundsRowSize(t *testing.T) {
 
 func TestPreviewSpanKeepsTheChangeVisible(t *testing.T) {
 	// The regression this replaced: bounding the ASSEMBLED line kept its head
-	// and tail, but previewSpan centres the change — so with escape-expanding
+	// and tail, but previewSpan centers the change — so with escape-expanding
 	// context the whole rewrite fell into the elided middle and old:/new: came
 	// out identical for a value that really was being written.
 	ctx := strings.Repeat("‮", 60) // 60 runes of context, 8 rendered runes each

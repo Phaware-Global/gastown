@@ -840,7 +840,7 @@ func valuePreviewPair(oldVal, newVal string) (string, string) {
 //
 // Every budget here is measured in RENDERED runes and applied per piece, and
 // the CONTEXT is what gets cut first. Bounding the assembled line instead was
-// wrong in exactly the way this function exists to prevent: previewSpan centres
+// wrong in exactly the way this function exists to prevent: previewSpan centers
 // the change, so a trailing head/tail bound elided the middle — the change —
 // and escape expansion (up to 8 rendered runes each) let 40 raw runes of
 // context consume the whole budget, putting the entire rewrite inside the
@@ -1005,7 +1005,7 @@ func writesRow(s memSetOp) bool { return s.isNew || s.changed }
 // only on the write path, so a key planted through `bd kv set` reaches the
 // renderer raw and could emit CR/ANSI to erase its own row.
 // It is bounded by boundedIdentity rather than left unbounded: keys are
-// model-controlled and length-unlimited (sanitizeKey normalises characters but
+// model-controlled and length-unlimited (sanitizeKey normalizes characters but
 // caps nothing), so an unbounded label let one row emit tens of thousands of
 // runes and scroll the rest of the plan — including a real DROP — off screen
 // before the [y/N] prompt.
