@@ -207,7 +207,7 @@ func (c *conn) sendOnly(ctx context.Context, m *sockproto.Message) error {
 	defer c.mu.Unlock()
 	if dl, ok := ctx.Deadline(); ok {
 		_ = c.nc.SetWriteDeadline(dl)
-		defer c.nc.SetWriteDeadline(time.Time{})
+		defer func() { _ = c.nc.SetWriteDeadline(time.Time{}) }()
 	}
 	return c.codec.Send(m)
 }

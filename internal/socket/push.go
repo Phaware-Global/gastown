@@ -119,7 +119,7 @@ func (b *SocketBackend) PushBinariesTo(ctx context.Context) ([]PushResult, error
 	if err != nil {
 		return nil, err
 	}
-	defer c.close()
+	defer func() { _ = c.close() }()
 	return b.pushTo(ctx, c, true)
 }
 
