@@ -142,7 +142,7 @@ func New(cfg Config) (*Service, error) {
 func (s *Service) Serve(ctx context.Context, ln net.Listener) error {
 	go func() {
 		<-ctx.Done()
-		ln.Close()
+		_ = ln.Close()
 	}()
 	for {
 		nc, err := ln.Accept()
@@ -289,7 +289,11 @@ func (s *Service) handleSessionOpen(ctx context.Context, c *connState, m *sockpr
 	delete(s.orphans, m.Session) // a re-opened identity replaces its orphan record
 	s.mu.Unlock()
 
-	go s.bringUp(ctx, c, m, sess)
+	// nolint is reported here, on the goroutine: bringUp's teardown path uses a
+	// context.Background deadline on purpose (see the comment at that call) —
+	// deriving it from ctx would make container teardown a no-op exactly when it
+	// is needed, because the session ending is what cancels ctx.
+	go s.bringUp(ctx, c, m, sess) //nolint:gosec // G118: deliberate detached teardown context
 }
 
 // handleCert routes the signed cert to the in-flight bringup. The claim
@@ -387,6 +391,10 @@ func (s *Service) bringUp(ctx context.Context, c *connState, open *sockproto.Mes
 		delete(s.sessions, sess.summary.Session)
 		s.mu.Unlock()
 		if we != nil {
+			// Deliberately detached from ctx: this teardown runs BECAUSE the
+			// session ended, which usually means ctx is already canceled. A
+			// ctx-derived deadline here would make Teardown a no-op and leak
+			// the work container.
 			tctx, tcancel := context.WithTimeout(context.Background(), time.Minute)
 			_ = we.Teardown(tctx)
 			tcancel()

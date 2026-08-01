@@ -83,7 +83,9 @@ func main() {
 			log.Error("listen", "err", err)
 			os.Exit(1)
 		}
-		if err := os.Chmod(path, 0700); err != nil {
+		// 0600, not 0700: the execute bit is meaningless on a socket, and
+		// connecting needs only write permission.
+		if err := os.Chmod(path, 0600); err != nil {
 			log.Error("restrict socket permissions", "err", err)
 			os.Exit(1)
 		}
