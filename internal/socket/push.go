@@ -36,7 +36,7 @@ const pushTimeout = 10 * time.Minute
 const EnvBinaryDir = "GT_BINARY_DIR"
 
 // artifactRootFn locates the per-platform artifact tree; a var so tests can
-// point it at a fixture instead of the running binary's neighbourhood.
+// point it at a fixture instead of the running binary's neighborhood.
 var artifactRootFn = artifactRoot
 
 // artifactRoot is the tree `make dist` writes: <root>/<goos>-<goarch>/<binary>.
