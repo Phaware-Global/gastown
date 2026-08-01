@@ -84,10 +84,13 @@ func run(address, session, token, workerName string, argv []string) (int, error)
 	// calls setRawMode on stdin and throws without a TTY. So when this pane HAS
 	// a terminal, ask the worker for one and hand over the geometry with the
 	// attach — an agent that reads its size once at startup must not see 80x24.
-	tty := term.IsTerminal(int(os.Stdin.Fd()))
+	// stdinFD is a file descriptor, so it always fits in an int; the x/term API
+	// takes one as int while os.File reports it as uintptr.
+	stdinFD := int(os.Stdin.Fd()) //nolint:gosec // G115: an fd never overflows an int
+	tty := term.IsTerminal(stdinFD)
 	cols, rows := 0, 0
 	if tty {
-		if w, h, err := term.GetSize(int(os.Stdin.Fd())); err == nil {
+		if w, h, err := term.GetSize(stdinFD); err == nil {
 			cols, rows = w, h
 		}
 	}
@@ -121,12 +124,12 @@ func run(address, session, token, workerName string, argv []string) (int, error)
 	// the operator is left with an unusable shell.
 	restoreTerm := func() {}
 	if tty {
-		state, err := term.MakeRaw(int(os.Stdin.Fd()))
+		state, err := term.MakeRaw(stdinFD)
 		if err != nil {
 			return 1, fmt.Errorf("putting the terminal in raw mode: %w", err)
 		}
 		var once sync.Once
-		restoreTerm = func() { once.Do(func() { _ = term.Restore(int(os.Stdin.Fd()), state) }) }
+		restoreTerm = func() { once.Do(func() { _ = term.Restore(stdinFD, state) }) }
 		defer restoreTerm()
 		// A panic in ANY goroutine kills the process without unwinding run, so
 		// the deferred restore above would never run and the operator would be
@@ -157,7 +160,7 @@ func run(address, session, token, workerName string, argv []string) (int, error)
 		defer signal.Stop(winch)
 		go func() {
 			for range winch {
-				w, h, err := term.GetSize(int(os.Stdin.Fd()))
+				w, h, err := term.GetSize(stdinFD)
 				if err != nil {
 					continue
 				}
