@@ -72,21 +72,9 @@ func main() {
 			log.Error("a unix listener requires -token (§3.3)")
 			os.Exit(2)
 		}
-		_ = os.Remove(path) // stale socket from a previous run
-		// Tighten umask around the bind so the socket is never briefly
-		// exposed at default perms between Listen and Chmod (§3.3 fs gate
-		// TOCTOU). Restore it immediately after.
-		oldMask := syscall.Umask(0o077)
-		ln, err = net.Listen("unix", path)
-		syscall.Umask(oldMask)
+		ln, err = listenRestrictedUnix(path)
 		if err != nil {
 			log.Error("listen", "err", err)
-			os.Exit(1)
-		}
-		// 0600, not 0700: the execute bit is meaningless on a socket, and
-		// connecting needs only write permission.
-		if err := os.Chmod(path, 0600); err != nil {
-			log.Error("restrict socket permissions", "err", err)
 			os.Exit(1)
 		}
 	} else {
