@@ -145,6 +145,9 @@ func (w *WorkEnv) ProxyURL() string {
 // context cause instead, letting callers errors.Is-classify an interrupt. A
 // genuine docker failure (nonzero exit) keeps its own error even if the
 // context is canceled concurrently.
+//
+//nolint:unparam // deliberate: this wraps the docker CLI and returns its stdout;
+// the call sites here happen to need only the error.
 func (w *WorkEnv) docker(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, w.cfg.Docker, args...)
 	var out, errb bytes.Buffer
