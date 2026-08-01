@@ -101,8 +101,22 @@ func TestEnrollmentEndToEnd(t *testing.T) {
 		MinVersion:   tls.VersionTLS13,
 	})
 	svcCtx, svcCancel := context.WithCancel(context.Background())
-	t.Cleanup(svcCancel)
-	go func() { _ = svc.Serve(svcCtx, tlsLn) }()
+	served := make(chan struct{})
+	go func() { defer close(served); _ = svc.Serve(svcCtx, tlsLn) }()
+	// Cancelling is not enough: Serve's shutdown cancels the live sessions and
+	// waits for each to finish tearing down, and that teardown writes state and
+	// removes the worktree — under t.TempDir. Returning without waiting races
+	// TempDir's RemoveAll against those writes, which is exactly how this test
+	// failed in CI ("directory not empty"). Registered AFTER the TempDir calls
+	// so LIFO cleanup runs it first.
+	t.Cleanup(func() {
+		svcCancel()
+		select {
+		case <-served:
+		case <-time.After(30 * time.Second):
+			t.Error("worker service did not shut down")
+		}
+	})
 
 	// The backend dials in auto-TLS mode, reading the enrollment-managed
 	// material from the CA dir and pinning ServerName to the enrolled name.
