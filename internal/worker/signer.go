@@ -65,7 +65,7 @@ func (s *AdminSigner) SignCSR(ctx context.Context, csrPEM []byte) (certPEM, caPE
 	if err != nil {
 		return nil, nil, fmt.Errorf("sign-csr request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
