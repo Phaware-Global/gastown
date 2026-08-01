@@ -16,7 +16,7 @@ import (
 	"github.com/steveyegge/gastown/internal/worker"
 )
 
-// execWaitDelay bounds the interval between cancelling an exec and forcibly
+// execWaitDelay bounds the interval between canceling an exec and forcibly
 // killing it: long enough for an agent to handle SIGTERM and flush, short
 // enough that a wedged agent cannot pin the session (MaxSessions=1 means one
 // wedged session is the whole worker).
@@ -170,7 +170,7 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 					// The launcher stopped draining (or died): cancel so the
 					// agent is killed and cmd.Wait can return, instead of the
 					// agent blocking forever on a full stdout pipe.
-					s.log.Warn("output frame write failed; cancelling the attached agent",
+					s.log.Warn("output frame write failed; canceling the attached agent",
 						"session", m.Session, "err", werr)
 					cancel()
 					return
@@ -193,7 +193,7 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 	agentDone := make(chan struct{})
 	go func() {
 		defer close(inboundDone)
-		defer stdin.Close()
+		defer func() { _ = stdin.Close() }()
 		for {
 			t, payload, err := sockproto.ReadFrame(c.frameReader())
 			if err != nil {
@@ -209,7 +209,7 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 					select {
 					case <-agentDone:
 					default:
-						s.log.Warn("exec stream read failed; cancelling the attached agent",
+						s.log.Warn("exec stream read failed; canceling the attached agent",
 							"session", m.Session, "err", err)
 						cancel()
 					}
@@ -248,7 +248,7 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 				return
 			case <-tick.C:
 				if err := c.writeFrame(sockproto.FrameStdout, nil); err != nil {
-					s.log.Warn("exec stream liveness probe failed; cancelling the attached agent",
+					s.log.Warn("exec stream liveness probe failed; canceling the attached agent",
 						"session", m.Session, "err", err)
 					cancel()
 					return
@@ -303,7 +303,7 @@ func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktre
 		// image contract requires.
 		args = append(args, "--", container, "/bin/sh", "-c", shellJoin(m.Argv))
 		cmd := exec.CommandContext(ctx, "docker", args...)
-		// Cancelling kills the `docker exec` CLIENT; the in-container process is
+		// Canceling kills the `docker exec` CLIENT; the in-container process is
 		// reaped indirectly (its stdio pipes close, so its next write takes
 		// SIGPIPE). The authoritative kill for container mode is teardown, which
 		// removes the work container outright (§6).

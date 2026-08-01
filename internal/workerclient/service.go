@@ -214,7 +214,7 @@ func (c *connState) writeLocked(write func() error) error {
 		return errWriteFailed
 	}
 	_ = c.nc.SetWriteDeadline(time.Now().Add(frameWriteTimeout))
-	defer c.nc.SetWriteDeadline(time.Time{})
+	defer func() { _ = c.nc.SetWriteDeadline(time.Time{}) }()
 	err := write()
 	if err != nil {
 		c.writeFailed = true
@@ -680,7 +680,7 @@ func (s *Service) handleShutdown(c *connState, m *sockproto.Message) {
 	// checkpoint captures a tree the agent is still writing to. Fence exactly
 	// as teardownSession does, in ONE critical section: tearingDown makes
 	// streamExec refuse a reattach for the whole flush (a graceful shutdown
-	// ends the session, so there is nothing left to attach to), and cancelling
+	// ends the session, so there is nothing left to attach to), and canceling
 	// under the lock means the cancel cannot be a stale handle to an exec that
 	// unregistered in a gap. cancel() only closes a context, so holding s.mu
 	// across it is safe.
