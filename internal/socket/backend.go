@@ -108,7 +108,7 @@ func (b *SocketBackend) Provision(ctx context.Context, spec execution.PolecatSpe
 	if err != nil {
 		return execution.Endpoint{}, err
 	}
-	defer c.close()
+	defer func() { _ = c.close() }()
 
 	// Reattach if the handshake already reports this session live (daemon
 	// restarted, worker did not) — no new session, idempotent per core §9.4.
@@ -216,7 +216,7 @@ func (b *SocketBackend) Teardown(ctx context.Context, ep execution.Endpoint) err
 	if err != nil {
 		return err
 	}
-	defer c.close()
+	defer func() { _ = c.close() }()
 
 	// Graceful stop first (§6 step 1-2): best-effort — a worker that already
 	// tore the session down answers with an error we tolerate.
@@ -245,7 +245,7 @@ func (b *SocketBackend) Discover(ctx context.Context, filter execution.IdentityT
 	if err != nil {
 		return nil, err
 	}
-	defer c.close()
+	defer func() { _ = c.close() }()
 
 	resp, err := c.request(ctx, &sockproto.Message{
 		Type:    sockproto.TypeDiscover,

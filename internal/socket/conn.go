@@ -138,7 +138,7 @@ func (c *conn) request(ctx context.Context, req *sockproto.Message) (*sockproto.
 	req.ID = fmt.Sprintf("r%d", c.nonce)
 	if dl, ok := ctx.Deadline(); ok {
 		_ = c.nc.SetDeadline(dl)
-		defer c.nc.SetDeadline(time.Time{})
+		defer func() { _ = c.nc.SetDeadline(time.Time{}) }()
 	}
 	if err := c.codec.Send(req); err != nil {
 		return nil, err
