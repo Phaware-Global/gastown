@@ -538,7 +538,10 @@ func (s *Service) bringUp(ctx context.Context, c *connState, open *sockproto.Mes
 		supCfg.StopWork = sess.workEnv.StopWork
 	}
 	sup := worker.NewSupervisor(supCfg)
-	supCtx, supCancel := context.WithCancel(context.Background())
+	// supCancel is not deferred on purpose: the supervisor outlives this call.
+	// It is stored in sess.cancel under the lock below and invoked by teardown /
+	// shutdown, which is the only thing that may stop a running session.
+	supCtx, supCancel := context.WithCancel(context.Background()) //nolint:gosec // G118: cancel is stored in sess.cancel and called by teardown
 	s.mu.Lock()
 	sess.cancel = supCancel
 	s.mu.Unlock()
