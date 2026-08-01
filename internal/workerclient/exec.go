@@ -112,7 +112,7 @@ func (d *detachFilter) filter(in []byte) []byte {
 	return out
 }
 
-// ptyWaitGrace is the floor on how long a CANCELLED agent has before the pty
+// ptyWaitGrace is the floor on how long a CANCELED agent has before the pty
 // master may be closed to release it. It never applies to a running agent, and
 // it is deliberately LONGER than execWaitDelay: that is the window the code
 // promises an agent for handling SIGTERM and flushing, and closing the master
@@ -276,7 +276,7 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 			_ = c.writeExit(126)
 			return err
 		}
-		defer tty.Close()
+		defer func() { _ = tty.Close() }()
 		// One stream in both directions: a terminal has a single output, so
 		// stderr arrives interleaved as FrameStdout by construction.
 		stdin, stdout, stderr = tty, tty, nil
@@ -529,7 +529,7 @@ func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktre
 	}
 	if m.TTY {
 		// A terminal with no TERM is a terminal every termcap consumer treats as
-		// dumb — no colour, no cursor movement — which is worse than the pipe it
+		// dumb — no color, no cursor movement — which is worse than the pipe it
 		// replaced. The worker's own environment cannot supply it (a supervised
 		// service has a stripped env: the launchd job sets PATH and nothing
 		// else), and TERM is not on the wire env allowlist, so the launcher sends
@@ -591,7 +591,7 @@ func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktre
 	// NOT under a pty: allocating one makes the child a SESSION leader
 	// (Setsid + Setctty), and Setsid with Setpgid is rejected outright — the
 	// exec fails with EINVAL before the agent ever runs. A session leader is
-	// already a process-group leader, so signalling -pid still reaches the whole
+	// already a process-group leader, so signaling -pid still reaches the whole
 	// tree either way.
 	if !tty {
 		setProcessGroup(cmd)
@@ -733,7 +733,7 @@ func signalName(sig syscall.Signal) string {
 	}
 }
 
-// waitReleasing reaps cmd, closing the pty master if a CANCELLED agent will not
+// waitReleasing reaps cmd, closing the pty master if a CANCELED agent will not
 // die.
 //
 // A pty child blocked writing into a stalled output queue is unreapable while
@@ -757,7 +757,7 @@ func waitReleasing(ctx context.Context, cmd *exec.Cmd, tty *ptySession, pumpExit
 	case <-ctx.Done():
 	}
 
-	// Cancelled. The valve exists for ONE state: a child blocked writing into a
+	// Canceled. The valve exists for ONE state: a child blocked writing into a
 	// terminal that nobody is reading, which is unreapable even by SIGKILL. So
 	// the condition is exactly that — the output pump has EXITED — rather than a
 	// proxy for it.
@@ -783,7 +783,7 @@ func waitReleasing(ctx context.Context, cmd *exec.Cmd, tty *ptySession, pumpExit
 	case err := <-done:
 		return err
 	case <-time.After(grace):
-		log.Warn("cancelled agent not reaped and nothing is draining its terminal; closing the master",
+		log.Warn("canceled agent not reaped and nothing is draining its terminal; closing the master",
 			"session", session, "grace", grace)
 		_ = tty.Close()
 		return <-done

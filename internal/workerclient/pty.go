@@ -118,7 +118,7 @@ func startPTY(cmd *exec.Cmd, initial *sockproto.Resize, plumbing bool) (*ptySess
 		// one-agent-per-session fence exists to prevent.
 		//
 		// The master is closed FIRST. An earlier version killed then waited,
-		// justifying the order as "signalled while its terminal still exists" —
+		// justifying the order as "signaled while its terminal still exists" —
 		// which is wrong twice: a signal goes to a process, not through its tty,
 		// and Wait cannot return while the pty's output queue holds bytes with
 		// nobody reading the master. Nothing is reading it here (the pumps start
