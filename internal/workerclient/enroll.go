@@ -72,7 +72,7 @@ func Enroll(ctx context.Context, ln net.Listener, cfg EnrollConfig) error {
 	var cur net.Conn
 	go func() {
 		<-ctx.Done()
-		ln.Close()
+		_ = ln.Close()
 		curMu.Lock()
 		if cur != nil {
 			cur.Close()
