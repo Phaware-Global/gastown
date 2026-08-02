@@ -63,6 +63,7 @@ Return **exactly one** JSON object and no prose before or after it:
 {
   "perspective": "{{ .Perspective }}",
   "verdict": "one-line verdict for this perspective — REQUIRED even with zero findings (e.g. \"no findings: error paths all guarded\")",
+  "disposition": "request_changes",
   "findings": [
     {
       "path": "internal/foo/bar.go",
@@ -80,3 +81,20 @@ Return **exactly one** JSON object and no prose before or after it:
 `priority` is one of `high`, `medium`, `low`. `findings` may be empty, but
 `verdict` must never be empty — a perspective is never silent. Every finding's
 `perspective` field must be `{{ .Perspective }}`.
+
+**`disposition` is optional and escalation-only** — `request_changes` or
+`comment`. Omit it and the posted review's event is derived from your findings'
+severity (any high → REQUEST_CHANGES, any medium → COMMENT, clean or nits-only →
+APPROVE).
+
+Set it when you must block on something you **cannot anchor to a diff line** —
+an architectural objection, a missing-by-design invariant, a concern about the
+change as a whole. Section 4 requires every finding to carry a concrete
+`file:line`, so such an objection cannot be expressed as a finding at all. Left
+in your `verdict` alone it changes nothing: a pass returning zero findings and
+"BLOCK: do not merge" posts as an **APPROVE** with that sentence as the body.
+`disposition` is the only way to make an unanchorable objection actually block.
+
+It can only raise the verdict, never lower it: the posted event is the more
+blocking of your disposition and the severity tally, and `approve` is rejected.
+So `comment` never suppresses another pass's high finding.

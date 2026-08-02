@@ -74,8 +74,15 @@ var validPriorities = map[string]bool{"high": true, "medium": true, "low": true}
 // GitHub review event it selects. The closed set is enforced at the contract
 // boundary: ParseFindings rejects any non-empty, unrecognized disposition, so a
 // typo fails loudly rather than silently degrading a blocking verdict.
+//
+// "approve" is deliberately absent. Disposition exists to ESCALATE past the
+// severity tally — to express a blocking objection that cannot be anchored to a
+// diff line — and an approving disposition can only ever be a no-op (it already
+// agrees with the tally) or a de-escalation. Excluding it makes the closed set
+// identical to the one ParsePerspectiveResult enforces, so the two entry points
+// describe one contract instead of disagreeing, and matches what the help text,
+// the payload schema, and the role template all state.
 var validDispositions = map[string]string{
-	"approve":         "APPROVE",
 	"request_changes": "REQUEST_CHANGES",
 	"comment":         "COMMENT",
 }
@@ -98,20 +105,42 @@ var validDispositions = map[string]string{
 // boundary, so the lookup-miss fallthrough below only fires for the empty
 // (severity-derived) case on payloads from the sanctioned path.
 func (fs *Findings) ReviewEvent() string {
+	derived := fs.severityEvent()
+	// Disposition is a FLOOR, never an override: the submitted event is the more
+	// blocking of the explicit disposition and the severity tally.
+	//
+	// Letting the explicit value win outright is subtly wrong in both directions.
+	// "approve" over a high finding is the obvious prompt-injection shape — the
+	// Reviewer's primary input is the PR diff, attacker-influenced by
+	// construction. But "comment" is worse in practice, because it needs no bad
+	// actor at all: a perf lens legitimately escalating its own clean tally to
+	// COMMENT would, under an override, silently downgrade a *different* lens's
+	// high finding from REQUEST_CHANGES to COMMENT — averaging away exactly the
+	// dissenting block that Consolidate's fold exists to preserve.
+	//
+	// Taking the maximum makes escalation the only possible effect, structurally,
+	// for every disposition value rather than by special case.
 	if ev, ok := validDispositions[strings.ToLower(strings.TrimSpace(fs.Disposition))]; ok {
-		// Escalation via disposition is always safe; DE-escalation past a high
-		// finding is not. The Reviewer's primary input is the PR diff and commit
-		// messages — attacker-influenced by construction — so an explicit
-		// "approve" that contradicts the pass's own high-severity findings is
-		// exactly the shape a prompt injection would take. Ignore it and fall
-		// through to severity derivation, which returns REQUEST_CHANGES.
-		// ParseFindings rejects this combination outright at the contract
-		// boundary; this is the backstop for Findings built in code.
-		if ev == "APPROVE" && fs.hasHighFinding() {
-			return "REQUEST_CHANGES"
+		if eventRank(ev) > eventRank(derived) {
+			return ev
 		}
-		return ev
 	}
+	return derived
+}
+
+// eventRank orders review events by how blocking they are.
+func eventRank(event string) int {
+	switch event {
+	case "COMMENT":
+		return 1
+	case "REQUEST_CHANGES":
+		return 2
+	}
+	return 0 // APPROVE, or anything unrecognized
+}
+
+// severityEvent derives the review event from finding severity alone.
+func (fs *Findings) severityEvent() string {
 	hasMedium := false
 	for _, f := range fs.Findings {
 		// Normalize defensively for Findings built outside ParseFindings (which
@@ -150,7 +179,15 @@ func ParseFindings(data []byte) (*Findings, error) {
 	fs.Disposition = strings.ToLower(strings.TrimSpace(fs.Disposition))
 	if fs.Disposition != "" {
 		if _, ok := validDispositions[fs.Disposition]; !ok {
-			return nil, fmt.Errorf("findings.disposition %q is invalid (want approve, request_changes, or comment)", fs.Disposition)
+			// Name "approve" specifically: it is the value an agent is most
+			// likely to reach for, and a bare "invalid" would not explain why
+			// escalation is the only direction the override travels.
+			if fs.Disposition == "approve" {
+				return nil, fmt.Errorf("findings.disposition=approve is not accepted: the override may " +
+					"only escalate a verdict, never de-escalate. A clean or nits-only payload already " +
+					"derives APPROVE from severity — drop the disposition")
+			}
+			return nil, fmt.Errorf("findings.disposition %q is invalid (want request_changes or comment)", fs.Disposition)
 		}
 	}
 	for i := range fs.Findings {
@@ -158,35 +195,14 @@ func ParseFindings(data []byte) (*Findings, error) {
 			return nil, err
 		}
 	}
-	// Reject an explicit approve that contradicts the payload's own high-severity
-	// findings. The override exists so a pass can ESCALATE past the severity
-	// tally (a blocking objection it cannot anchor to a line); de-escalating past
-	// a high finding has no legitimate use and is the exact shape a prompt
-	// injection in the reviewed diff would take. Fail loudly here rather than
-	// silently downgrading, so a genuine mistake is visible to the agent.
-	if fs.Disposition == "approve" && fs.hasHighFinding() {
-		return nil, fmt.Errorf("findings.disposition=approve contradicts %d high-priority finding(s): "+
-			"the override may escalate a verdict, never de-escalate past a high finding "+
-			"(drop the disposition to get the severity-derived REQUEST_CHANGES)", fs.countHigh())
-	}
+	// No de-escalation check is needed here: ReviewEvent takes the maximum of the
+	// disposition and the severity tally, so a disposition ranking below the
+	// tally is inert by construction rather than by validation. That matters
+	// because comment-with-a-high-finding is a LEGITIMATE payload — one lens
+	// escalating its own clean tally while another lens found something high —
+	// and rejecting it would break correct usage. The floor resolves it to
+	// REQUEST_CHANGES, which is the right answer.
 	return &fs, nil
-}
-
-// hasHighFinding reports whether any finding is high priority. Compares
-// case-insensitively on trimmed input so it is correct for Findings built in
-// code, which have not been through normalizeFinding.
-func (fs *Findings) hasHighFinding() bool {
-	return fs.countHigh() > 0
-}
-
-func (fs *Findings) countHigh() int {
-	n := 0
-	for _, f := range fs.Findings {
-		if strings.EqualFold(strings.TrimSpace(f.Priority), "high") {
-			n++
-		}
-	}
-	return n
 }
 
 // normalizeFinding validates and canonicalizes a single finding in place: path,

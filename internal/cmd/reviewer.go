@@ -88,10 +88,13 @@ REQUEST_CHANGES, any medium is COMMENT, and a clean or nits-only pass is APPROVE
 A perspective that must block on something it cannot anchor to a diff line
 (an architectural objection) sets "disposition" in its PerspectiveResult;
 'gt reviewer consolidate' folds the most blocking one into the payload below.
-The override is ESCALATION-ONLY: "request_changes" and "comment" are accepted,
-"approve" is rejected, and an "approve" that contradicts a high-priority finding
-is refused outright — a de-escalation past a high finding has no legitimate use
-and is the shape a prompt injection in the reviewed diff would take.
+
+"disposition" is a FLOOR, not an override: the submitted event is the more
+blocking of the disposition and the severity tally, so it can only ever raise
+the verdict. The accepted set is "request_changes" and "comment"; "approve" is
+rejected, since an approving disposition can only be a no-op or a
+de-escalation. This is why a "comment" from one perspective can never suppress
+another perspective's high finding.
 
 The findings file (--findings, or "-" for stdin) is a JSON object:
 
