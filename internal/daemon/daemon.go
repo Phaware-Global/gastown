@@ -90,6 +90,14 @@ type Daemon struct {
 	// costs at most one extra nudge.
 	reviewerNudgeMu   sync.Mutex
 	reviewerLastNudge map[string]time.Time
+	// reviewerLastKill enforces a per-rig kill cooldown so a forged heartbeat
+	// cannot drive a kill on every tick.
+	reviewerLastKill map[string]time.Time
+	// reviewerMissingSince records when a rig was FIRST observed with no
+	// heartbeat, so the missing-heartbeat grace is measured from the daemon's own
+	// observation rather than from session creation — otherwise deleting the file
+	// is an instant kill switch for any session older than the window.
+	reviewerMissingSince map[string]time.Time
 
 	// Deacon startup tracking: prevents race condition where newly started
 	// sessions are immediately killed by the heartbeat check.
