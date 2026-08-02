@@ -142,18 +142,35 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 	if err != nil {
 		return fmt.Errorf("stdin pipe: %w", err)
 	}
-	stdout, err := cmd.StdoutPipe()
+	// NOT cmd.StdoutPipe/StderrPipe: those are closed by cmd.Wait the moment the
+	// process exits, and os/exec documents it as incorrect to call Wait before
+	// the reads finish. Doing so drops whatever is still sitting in the pipe —
+	// CI caught exactly that, truncating a 5000-line burst at ~2000. Owning the
+	// pipes ourselves decouples reaping from draining: Wait touches neither, and
+	// each read end reports EOF once the child's write end is closed.
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("stdout pipe: %w", err)
 	}
-	stderr, err := cmd.StderrPipe()
+	defer func() { _ = stdoutR.Close() }()
+	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
+		_ = stdoutW.Close()
 		return fmt.Errorf("stderr pipe: %w", err)
 	}
-	if err := cmd.Start(); err != nil {
-		_ = c.writeFrame(sockproto.FrameStderr, []byte("gt-worker-client: start agent: "+err.Error()+"\n"))
+	defer func() { _ = stderrR.Close() }()
+	cmd.Stdout, cmd.Stderr = stdoutW, stderrW
+	var stdout io.Reader = stdoutR
+	var stderr io.Reader = stderrR
+	startErr := cmd.Start()
+	// The child holds its own dup of each write end now, so drop ours: the read
+	// ends must see EOF when the CHILD exits, not when this function returns.
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
+	if startErr != nil {
+		_ = c.writeFrame(sockproto.FrameStderr, []byte("gt-worker-client: start agent: "+startErr.Error()+"\n"))
 		_ = c.writeExit(126)
-		return fmt.Errorf("start agent: %w", err)
+		return fmt.Errorf("start agent: %w", startErr)
 	}
 	s.log.Info("agent started", "session", m.Session, "pid", cmd.Process.Pid, "container", container)
 
@@ -316,7 +333,7 @@ func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktre
 	cmd.Dir = worktree
 	cmd.Env = env
 	// Own process group so a signal reaches the agent's whole tree.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setProcessGroup(cmd)
 	// Cancellation is a graceful SIGTERM to the whole group — an agent killed
 	// with SIGKILL cannot flush its own state — with WaitDelay as the hard
 	// bound: after it, Go SIGKILLs the process and closes the pipes, so
@@ -326,7 +343,7 @@ func (s *Service) execCommand(ctx context.Context, m *sockproto.Message, worktre
 		if cmd.Process == nil {
 			return os.ErrProcessDone
 		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		return signalProcessGroup(cmd.Process.Pid, syscall.SIGTERM)
 	}
 	cmd.WaitDelay = execWaitDelay
 	return cmd, nil
@@ -382,8 +399,8 @@ func (s *Service) signalAgent(cmd *exec.Cmd, name, container string) {
 	if cmd.Process == nil {
 		return
 	}
-	// Negative PID: signal the whole process group (Setpgid above).
-	_ = syscall.Kill(-cmd.Process.Pid, sig)
+	// Reaches the agent's whole process group (see setProcessGroup).
+	_ = signalProcessGroup(cmd.Process.Pid, sig)
 }
 
 // parseSignal maps the signals a launcher may forward. It accepts BOTH the
