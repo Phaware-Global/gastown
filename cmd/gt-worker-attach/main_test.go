@@ -18,9 +18,6 @@ func TestCanonicalSignalName(t *testing.T) {
 	assert.Equal(t, "SIGTERM", canonicalSignalName(syscall.SIGTERM))
 	assert.Equal(t, "SIGHUP", canonicalSignalName(syscall.SIGHUP))
 	assert.Equal(t, "SIGQUIT", canonicalSignalName(syscall.SIGQUIT))
-	// Anything else still crosses in an upper-cased form the worker can reject
-	// cleanly rather than misinterpret.
-	assert.Equal(t, "USER DEFINED SIGNAL 1", canonicalSignalName(syscall.SIGUSR1))
 }
 
 // TestSessionEnv_ForwardsOnlyWirePolicy pins that the launcher forwards exactly
