@@ -1,17 +1,23 @@
 // gt-worker-agent is the worker-side gastown supervisor for remote polecat
-// execution (docs/design/remote-polecat-execution.md §3). This increment
-// covers identity bootstrap + the local mTLS-terminating relay (§6.1, §7.2):
+// execution (docs/design/remote-polecat-execution.md §3):
 //
 //  1. Generate the polecat's private key locally (it never leaves the worker)
-//     and obtain a CA-signed client cert for gt-<rig>-<name> via the signer.
+//     and obtain a CA-signed client cert for gt-<rig>-<name> via the signer
+//     (§7.2).
 //  2. Run the local plaintext relay: the agent's gt/bd/git talk to it in the
-//     clear on the worker; the relay forwards over mTLS to the host proxy.
+//     clear on the worker; the relay forwards over mTLS to the host proxy
+//     (§6.1).
+//  3. With -worktree, run the lifecycle supervisor: the continuous checkpoint
+//     loop (§9.2), the shutdown flush on interruption (§9.3), and the local
+//     max-runtime + dead-man self-release watchdog (§9.5). Self-release in
+//     this provider-neutral binary means EXITING with a distinguishing code
+//     (3 = max-runtime, 4 = deadman) — the provider's service wrapper maps
+//     that to its own release action (terminate the instance, end the
+//     session).
 //
-// The checkpoint loop, interruption watcher, and self-release watchdog
-// (§9.2–9.5) arrive in later increments. Provider backends may ship this
-// program under a provider-specific name; the provider channel supplies the
-// CSR-signing hop, defaulting here to the proxy admin API for host-local and
-// test use.
+// Provider backends may ship this program under a provider-specific name; the
+// provider channel supplies the CSR-signing hop, defaulting here to the proxy
+// admin API for host-local and test use.
 package main
 
 import (
@@ -22,6 +28,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/worker"
 )
@@ -36,6 +43,13 @@ func main() {
 		allowLAN = flag.Bool("allow-non-loopback-relay", false, "permit a non-loopback relay listen address (bridge-gateway wiring; MUST be firewalled to the container subnet — anything that reaches the relay acts as this polecat)")
 		stateDir = flag.String("state-dir", "", "identity/state directory (default: /dev/shm/gt-worker or $TMPDIR/gt-worker)")
 		ttl      = flag.String("cert-ttl", "", "requested cert TTL (empty = server default)")
+
+		worktree   = flag.String("worktree", "", "polecat worktree path; enables the checkpoint loop + watchdog (design §9.2–9.5)")
+		ckptEvery  = flag.Duration("checkpoint-interval", 5*time.Minute, "checkpoint interval ceiling")
+		ckptRef    = flag.String("checkpoint-ref", "", "checkpoint ref (default refs/checkpoints/polecat/<name>)")
+		gitRemote  = flag.String("git-remote", "origin", "git remote the checkpoint ref is pushed to (points at the relay in production)")
+		maxRuntime = flag.Duration("max-runtime", 0, "worker-side absolute session cap; 0 disables (§9.5)")
+		deadman    = flag.Duration("deadman-after", 0, "self-release after this long without control-plane contact; 0 = 4x checkpoint-interval, negative disables")
 	)
 	flag.Parse()
 
@@ -78,10 +92,59 @@ func main() {
 		log.Warn("relay may bind a non-loopback address — anything that reaches it authenticates as this polecat; the address MUST be firewalled to the container bridge subnet", "listen", *listen)
 	}
 
+	// Shutdown ORDER matters (§9.3): the supervisor's final checkpoint flush
+	// pushes THROUGH the relay, so the relay must outlive the supervisor. A
+	// shutdown signal cancels the supervisor's context only; the relay's own
+	// context is canceled after the supervisor (final flush included) has
+	// finished — or directly by the signal when no supervisor is running.
+	relayCtx, relayCancel := context.WithCancel(context.Background())
+	defer relayCancel()
+	reasonCh := make(chan worker.StopReason, 1)
+	if *worktree != "" {
+		ref := *ckptRef
+		if ref == "" {
+			ref = worker.CheckpointRefForPolecat(*name)
+		}
+		sup := worker.NewSupervisor(worker.SupervisorConfig{
+			Checkpointer: &worker.Checkpointer{
+				Worktree: *worktree,
+				Ref:      ref,
+				Remote:   *gitRemote,
+				Debounce: 2 * time.Second,
+			},
+			Interval:     *ckptEvery,
+			MaxRuntime:   *maxRuntime,
+			DeadmanAfter: *deadman,
+			Log:          log,
+		})
+		log.Info("supervisor starting", "worktree", *worktree, "ref", ref,
+			"interval", *ckptEvery, "maxRuntime", *maxRuntime)
+		go func() {
+			reasonCh <- sup.Run(ctx) // signal ctx: interruption stops the supervisor first
+			relayCancel()            // ...and only then the relay it flushed through
+		}()
+	} else {
+		go func() {
+			<-ctx.Done()
+			relayCancel()
+		}()
+	}
+
 	log.Info("relay starting", "listen", *listen, "upstream", *proxyURL)
-	if err := relay.Serve(ctx, *listen); err != nil {
+	if err := relay.Serve(relayCtx, *listen); err != nil {
 		log.Error("relay error", "err", err)
 		os.Exit(1)
 	}
 	log.Info("relay stopped")
+
+	if *worktree != "" {
+		reason := <-reasonCh // supervisor already finished (it canceled relayCtx)
+		log.Info("supervisor stopped", "reason", reason)
+		switch reason {
+		case worker.StopMaxRuntime:
+			os.Exit(3)
+		case worker.StopDeadman:
+			os.Exit(4)
+		}
+	}
 }
