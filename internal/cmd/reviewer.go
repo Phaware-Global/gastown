@@ -826,33 +826,37 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("sending review request to %s: %w", to, err)
 	}
 
-	// Seed the heartbeat only AFTER the mail is on its way. Seeding first left a
-	// permanent `dispatched` record when the send failed — the dispatcher already
-	// returned a hard error the caller can retry, so the reaper's later
-	// "dispatched but never started" escalation would be duplicate noise about a
-	// failure that was never silent, and the retry would inherit the failed
-	// attempt's clock.
-	//
-	// The seed still precedes EnsureRunning below, which is the case it exists
-	// for: a request that is mailed but whose session never starts.
-	switch err := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA); {
-	case err == nil:
-	case errors.Is(err, reviewer.ErrReviewInFlight):
-		// Queued behind an unfinished review. Mail is the work queue and the
-		// request is safely in it; the in-flight review's telemetry is what
-		// supervisors need, so it is deliberately left intact.
-		fmt.Fprintf(os.Stderr,
-			"note: reviewer is mid-review; PR #%d is queued and will be recorded when it starts\n", spec.PR)
-	default:
-		fmt.Fprintf(os.Stderr, "warning: seeding reviewer heartbeat: %v\n", err)
-	}
-
 	// Start the reviewer session if not already running, injecting the token as
 	// GH_TOKEN/GITHUB_TOKEN. Idempotent: a running session drains the new mail.
 	mgr := reviewer.NewManager(r)
 	if serr := mgr.EnsureRunning("", map[string]string{"GH_TOKEN": tokenVal, "GITHUB_TOKEN": tokenVal}); serr != nil {
 		// The request mail persists; await-review's timeout is the safety net.
 		fmt.Fprintf(os.Stderr, "warning: review request mailed but reviewer session did not start: %v\n", serr)
+	}
+
+	// Seed the heartbeat AFTER the mail is sent and after EnsureRunning.
+	//
+	// After the mail, because seeding first left a permanent `dispatched` record
+	// when the send failed — the dispatcher already returned a hard error the
+	// caller can retry on, so a later "dispatched but never started" escalation
+	// would be duplicate noise about a failure that was never silent.
+	//
+	// After EnsureRunning, because that call may RECYCLE a wedged session, and
+	// recycling clears the heartbeat. Seeding before it meant the clear wiped the
+	// record we had just written, leaving the new review with no heartbeat at all
+	// — precisely the "dispatched into the void" blind spot the seed exists to
+	// close. EnsureRunning's failure is non-fatal, so a request whose session
+	// never starts is still recorded here.
+	switch err := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA); {
+	case err == nil:
+	case errors.Is(err, reviewer.ErrReviewInFlight):
+		// Queued behind an unfinished review on a DIFFERENT PR. Mail is the work
+		// queue and the request is safely in it; the in-flight review's telemetry
+		// is what supervisors need, so it is deliberately left intact.
+		fmt.Fprintf(os.Stderr,
+			"note: reviewer is mid-review; PR #%d is queued and will be recorded when it starts\n", spec.PR)
+	default:
+		fmt.Fprintf(os.Stderr, "warning: seeding reviewer heartbeat: %v\n", err)
 	}
 
 	fmt.Printf("Dispatched review of PR #%d (round %d, origin %s) → %s\n", prNumber, spec.Round, origin, to)
