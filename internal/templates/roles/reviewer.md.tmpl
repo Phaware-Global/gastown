@@ -182,8 +182,10 @@ When the review is posted:
    ```
 3. Self-terminate:
    ```bash
-   {{ cmd }} reviewer done
+   {{ cmd }} reviewer done --pr <pr>
    ```
+   Pass `--pr` so the heartbeat is cleared only if it records *your* review — a
+   second request dispatched while you were working must not lose its record.
    This clears your state and auto-terminates your tmux session. Do **NOT** idle
    at the prompt after running it.
 
