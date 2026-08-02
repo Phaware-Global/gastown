@@ -119,6 +119,11 @@ type PatrolsConfig struct {
 	Witness        *PatrolConfig          `json:"witness,omitempty"`
 	Deacon         *PatrolConfig          `json:"deacon,omitempty"`
 	Handler        *PatrolConfig          `json:"handler,omitempty"`
+	// Reviewer gates the stuck-reviewer reaper. Like witness/refinery (and
+	// unlike the opt-in dogs) it defaults to ENABLED when unset: it is a safety
+	// rail, and a town that never configured it is exactly the town that needs
+	// it. Set {"enabled": false} to opt out.
+	Reviewer       *PatrolConfig          `json:"reviewer,omitempty"`
 	DoltServer     *DoltServerConfig      `json:"dolt_server,omitempty"`
 	DoltRemotes    *DoltRemotesConfig     `json:"dolt_remotes,omitempty"`
 	DoltBackup     *DoltBackupConfig      `json:"dolt_backup,omitempty"`
@@ -418,6 +423,10 @@ func IsPatrolEnabled(config *DaemonPatrolConfig, patrol string) bool {
 	case "handler":
 		if config.Patrols.Handler != nil {
 			return config.Patrols.Handler.Enabled
+		}
+	case constants.RoleReviewer:
+		if config.Patrols.Reviewer != nil {
+			return config.Patrols.Reviewer.Enabled
 		}
 	}
 	return true // Default: enabled
