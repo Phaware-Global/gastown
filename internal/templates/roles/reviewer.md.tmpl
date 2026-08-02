@@ -144,7 +144,11 @@ is required even with zero findings:
 `comment`. Use it when a perspective must block on something it cannot anchor to
 a diff line — an architectural objection. Without it, such a pass returns zero
 findings and the review posts as APPROVE with "do not merge" as its body.
-`approve` is rejected: a pass may raise its own verdict, never lower it.
+
+It is a **floor, not an override**: the posted event is the more blocking of the
+disposition and the severity tally. So a `comment` from one lens can never pull
+another lens's high finding down from REQUEST_CHANGES, and `approve` is rejected
+outright — a pass may raise its own verdict, never lower anyone's.
 
 `{{ cmd }} reviewer consolidate` merges those into the findings payload `{{ cmd }}
 reviewer post` consumes (summary + deduped findings + the most blocking
