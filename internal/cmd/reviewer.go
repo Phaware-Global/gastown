@@ -911,7 +911,7 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	switch err := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA); {
+	switch err := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA, origin, from); {
 	case err == nil:
 	case errors.Is(err, reviewer.ErrReviewInFlight):
 		// Queued behind an unfinished review on a DIFFERENT PR — UNLESS we had to
@@ -931,7 +931,7 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 			if cerr := reviewer.ClearHeartbeat(r.Path); cerr != nil {
 				fmt.Fprintf(os.Stderr, "warning: clearing stale reviewer heartbeat: %v\n", cerr)
 			}
-			if terr := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA); terr != nil {
+			if terr := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA, origin, from); terr != nil {
 				fmt.Fprintf(os.Stderr, "warning: seeding reviewer heartbeat: %v\n", terr)
 			}
 			break

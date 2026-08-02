@@ -9,6 +9,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/reviewer"
 	"github.com/steveyegge/gastown/internal/rig"
@@ -213,6 +214,7 @@ func (d *Daemon) reapRigReviewer(rigName string, peers []string) {
 				"elapsed": reviewer.SafeText(hb.Elapsed().Round(time.Second).String()),
 				"detail":  reviewer.SafeText(detail),
 			})
+		d.escalateReviewerFailure(rigName, hb, "reviewer session died mid-review")
 		if cerr := reviewer.ClearHeartbeat(rigPath); cerr != nil {
 			d.logger.Printf("Reviewer reaper: clearing %s heartbeat: %v", rigName, cerr)
 		}
@@ -499,6 +501,7 @@ func (d *Daemon) killStuckReviewer(rigName, sessionName, rigPath string, hb *rev
 		// Fall through: still clear the heartbeat. Leaving it would make the rig
 		// look stalled forever while re-attempting a kill that is failing anyway.
 	}
+	d.escalateReviewerFailure(rigName, hb, reason)
 	_ = events.LogFeed(events.TypeKill, rigName+"/"+constants.RoleReviewer,
 		map[string]interface{}{
 			"rig": rigName, "role": constants.RoleReviewer, "reason": reviewer.SafeText(reason),
@@ -684,6 +687,79 @@ func (d *Daemon) shouldKillReviewer(rigName string) bool {
 	}
 	d.reviewerLastKill[rigName] = time.Now()
 	return true
+}
+
+// escalateReviewerFailure tells whoever asked for the review that it will never
+// arrive.
+//
+// Without this the two origins fail very differently, and both badly. A
+// refinery-origin review is only rescued by await-review's 30m timeout — the
+// refinery sits waiting on a session the daemon already killed, learning
+// nothing about why. A crew-origin review is never rescued at all: that timeout
+// lives INSIDE the refinery's await-review step, so nothing covers the crew
+// path and the requesting crew member waits forever.
+//
+// Best-effort: a mail failure never prevents the kill from completing.
+func (d *Daemon) escalateReviewerFailure(rigName string, hb *reviewer.Heartbeat, reason string) {
+	if hb == nil {
+		return
+	}
+	// The requester is read from the rig-writable heartbeat, so it is untrusted
+	// input being used as a MAIL ADDRESS. Unvalidated, a forged value redirects
+	// the failure notice to an arbitrary mailbox — the escalation becomes a
+	// delivery primitive for whoever can write the file. Only the two addresses
+	// `gt reviewer request` actually writes are accepted.
+	to, ok := validReviewerRequester(rigName, hb.Requester)
+	if !ok {
+		// The feed event is still emitted by the caller, so the kill is never
+		// invisible — it just isn't routed.
+		d.logger.Printf("Reviewer reaper: %s has no valid requester (%q) — kill logged to the feed but not escalated",
+			rigName, reviewer.SafeText(hb.Requester))
+		return
+	}
+
+	body := fmt.Sprintf(
+		"REVIEW_FAILED\nrig: %s\npr: %d\nround: %d\nsha: %s\nphase: %s\nelapsed: %s\nreason: %s\n\n"+
+			"The reviewer session was terminated by the daemon and did not post a review.\n"+
+			"No review will arrive for this request — re-dispatch with `gt reviewer request %d "+
+			"--sha %s` if the review is still wanted.\n",
+		rigName, reviewer.SafePR(hb.PR), hb.Round, reviewer.SafeSHA(hb.SHA),
+		reviewer.SafePhase(hb.Phase), hb.Elapsed().Round(time.Second),
+		reviewer.SafeText(reason), reviewer.SafePR(hb.PR), reviewer.SafeSHA(hb.SHA))
+
+	router := mail.NewRouterWithTownRoot(d.config.TownRoot, d.config.TownRoot)
+	if stores := d.BeadsStores(); len(stores) > 0 {
+		router.SetStores(stores)
+	}
+	defer router.WaitPendingNotifications()
+
+	msg := mail.NewMessage("daemon", to,
+		fmt.Sprintf("Review failed: PR #%d (round %d)", reviewer.SafePR(hb.PR), hb.Round), body)
+	msg.Type = mail.TypeTask
+	msg.Timestamp = time.Now()
+	if err := router.Send(msg); err != nil {
+		d.logger.Printf("Reviewer reaper: escalating %s reviewer failure to %s: %v", rigName, to, err)
+		return
+	}
+	d.logger.Printf("Reviewer reaper: escalated %s reviewer failure (PR #%d) to %s",
+		rigName, reviewer.SafePR(hb.PR), to)
+}
+
+// validReviewerRequester returns the escalation address for a heartbeat's
+// recorded requester, accepting only the two values `gt reviewer request`
+// writes for THIS rig: "<rig>/refinery" and "<rig>/crew".
+//
+// Anything else — another rig's mailbox, an arbitrary agent, a crafted string —
+// is rejected rather than sanitized, because there is no partially-valid
+// address worth delivering to.
+func validReviewerRequester(rigName, requester string) (string, bool) {
+	switch strings.TrimSpace(requester) {
+	case rigName + "/" + constants.RoleRefinery:
+		return rigName + "/" + constants.RoleRefinery, true
+	case rigName + "/crew":
+		return rigName + "/crew", true
+	}
+	return "", false
 }
 
 // reviewerAnchor pins a review identity to the session age at which the daemon
