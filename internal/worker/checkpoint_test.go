@@ -296,3 +296,54 @@ func TestSupervisor_HungGitCannotStarveWatchdog(t *testing.T) {
 		t.Fatal("hung git starved the watchdog — dead-man self-release never fired")
 	}
 }
+
+// TestSupervisor_FailedStopWorkKeepsQuiescenceGuard pins the round-1 #164
+// finding: a FAILED StopWork means the writer may still be live, so the
+// final flush must keep the debounce — a churning worktree is skipped, not
+// captured torn.
+func TestSupervisor_FailedStopWorkKeepsQuiescenceGuard(t *testing.T) {
+	wt, bare, c := newCheckpointRepo(t)
+	c.Debounce = 300 * time.Millisecond
+
+	sup := NewSupervisor(SupervisorConfig{
+		Checkpointer: c,
+		Interval:     time.Hour, // no periodic tick
+		StopWork: func(context.Context) error {
+			return assert.AnError // docker stop failed: writer NOT provably stopped
+		},
+	})
+
+	// Writer still running: keep churning the worktree through shutdown.
+	require.NoError(t, os.WriteFile(filepath.Join(wt, "main.go"), []byte("v2\n"), 0644))
+	stop := make(chan struct{})
+	churnDone := make(chan struct{})
+	go func() {
+		defer close(churnDone)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			case <-time.After(50 * time.Millisecond):
+				_ = os.WriteFile(filepath.Join(wt, "main.go"), []byte(strings.Repeat("y", i+1)), 0644)
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan StopReason, 1)
+	go func() { done <- sup.Run(ctx) }()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("supervisor did not stop")
+	}
+	close(stop)
+	<-churnDone
+
+	// The debounce stayed on, the worktree never went quiescent, so no torn
+	// snapshot was captured: the checkpoint ref must not exist.
+	cmd := exec.Command("git", "rev-parse", "--verify", c.Ref)
+	cmd.Dir = bare
+	require.Error(t, cmd.Run(), "a churning worktree behind a FAILED StopWork must not be flushed")
+}
