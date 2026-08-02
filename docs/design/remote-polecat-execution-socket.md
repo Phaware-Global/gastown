@@ -276,6 +276,99 @@ code (1-byte payload); `signal` (orch → worker) forwards e.g. SIGINT to the
 agent, by **canonical name** (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`). The
 stream closes after `exit`.
 
+**Terminals.** The `attach` preamble carries `tty` plus the launcher's initial
+`cols`/`rows`, and a launcher whose pane IS a terminal asks for one. This is not
+a comfort feature: an interactive agent requires a TTY to start at all — Claude
+Code's UI calls `setRawMode` on stdin and throws without one ("Raw mode is not
+supported on the current process.stdin") — so plain pipes do not degrade such an
+agent, they prevent it from running.
+
+Two consequences:
+
+- **stdout and stderr become one stream.** A terminal has a single output, so
+  everything arrives as `stdout` frames. Without `tty` the two stay separate,
+  which is why a scripted attach should not ask for one.
+- **`resize` is applied, not ignored.** The pty is created at the launcher's
+  geometry (an agent that reads its size once at startup would otherwise render
+  to 80x24 forever) and `SIGWINCH` on the pane sends a `resize` frame; tmux
+  resizes panes constantly.
+
+Container mode passes `-t` so the AGENT gets a terminal inside the container.
+The worker's own pty is still allocated around the `docker exec` client, because
+`docker exec -it` requires its own stdin to be a terminal — two line disciplines
+in series, with the client propagating the worker's `SIGWINCH` to the container's
+tty. It also moves the CLI's detach sequence out of reach: `-t` enables ctrl-p/ctrl-q,
+and since the launcher forwards raw bytes, that keystroke would exit the client
+while leaving the agent running — an orphan the one-agent-per-session fence would
+then let a second launcher double. An EMPTY `--detach-keys=` does **not** disable
+it (the CLI reads it as "unset" and installs the default), so a sequence must be
+chosen: `ctrl-\` three times. NUL — what an earlier version used — is Ctrl+Space,
+an ordinary editing keystroke; `ctrl-\` is SIGQUIT on a normal terminal and is
+close to never typed. The worker also strips that byte sequence from container
+stdin — across frames, because the launcher reads its terminal in raw mode and a
+typed sequence arrives one byte per frame, so per-frame filtering would never see
+it.
+
+Other properties the implementation must hold, each learned the hard way:
+
+- **The master is made pollable before anything reads it.** The fd a pty library
+  hands back is blocking, so Go serves reads with a syscall on a thread — and a
+  read parked there is uninterruptible by either `Close` or a read deadline,
+  leaking a goroutine, an OS thread and the fd per wedged session. Re-wrapping it
+  non-blocking gives it to the runtime poller, where `Close` genuinely unblocks
+  the pump. The drain wait is bounded anyway, so the exit frame never depends on
+  an assumption about terminal teardown.
+- **The line discipline depends on what the pty IS.** In NATIVE mode it is the
+  agent's terminal and is left exactly as the kernel made it: `^C` interrupts,
+  `^D` ends input, `^S` pauses, `\n` becomes `\r\n`, and an interactive agent
+  turns off whatever it wants to handle itself. Reaching in here is how earlier
+  attempts broke output (clearing OPOST staircases every line — Ink cannot
+  restore it), EOF (clearing ICANON), and interrupts (clearing ISIG removes the
+  last interrupt path, since the launcher's own raw mode means no local SIGINT
+  is ever raised to forward). In CONTAINER mode it is plumbing to the docker
+  client, which owns the real terminal via `-t`, so it is made fully raw:
+  transparent, with no echo, no double newline translation, and no `^S`/`^C`
+  intercepted in transit.
+
+  The one exception in native mode is **software flow control**: `IXON`/`IEXTEN`
+  are cleared. They exist so a 1980s terminal could ask a host to stop
+  transmitting; over this transport they have no job, while a single `0x13` byte
+  from the wire stops the pty's output queue — after which the agent blocks
+  writing and cannot be reaped even by `SIGKILL`, taking the session and, at
+  `max_sessions: 1`, the worker.
+- **A cancelled agent that will not die releases the terminal.** Closing the
+  master discards a stalled output queue, which is the only thing that frees such
+  a child. Two conditions gate it: the session has been
+  CANCELLED, and the output pump has EXITED — meaning nothing is reading the
+  master, which is the only state that makes a child unreapable. Neither elapsed
+  time nor read-progress is an acceptable proxy: a timer hangs up healthy agents
+  on the graceful-shutdown path (which cancels precisely so the agent can flush),
+  and a pump blocked delivering to a stalled launcher looks idle for as long as
+  `frameWriteTimeout`. While the pump lives, the terminal is being drained. The
+  grace is longer than the SIGTERM window the agent is promised.
+- **A held detach prefix is never delivered.** The filter can only be holding a
+  strict prefix of the detach sequence — one or two `0x1c` — and `0x1c` is VQUIT
+  on the default line discipline the container gives the agent, so writing it at
+  end of stream would SIGQUIT the agent the half-close path exists to keep alive.
+  A lost trailing `^\` is the better error.
+- **A half-close does not hang up the terminal.** Closing stdin is the right
+  answer on a pipe; on a pty, stdin and stdout are the same master, so closing it
+  SIGHUPs the agent and truncates its output. The terminal's own EOF is `^D`.
+- **Geometry is validated against `uint16`, not against `> 0`.** These values
+  reach an ioctl field, so 65536 would truncate to a zero-column terminal. The
+  attach path CLAMPS per dimension (one miscomputed value must not cost the
+  session); a resize REFUSES, because there the peer is asserting something
+  specific.
+- **`TERM` travels in the preamble.** A supervised worker has a stripped
+  environment and `TERM` is not on the wire env allowlist, so without this the
+  agent would have a terminal that every termcap consumer treats as dumb.
+
+The launcher puts its local terminal in raw mode for the session and restores it
+on every exit path — including a panic in any goroutine, and a terminating signal
+that the remote agent does not answer within a grace period, after which it
+detaches on its own. Without that, a wedged stream could only be killed with
+`SIGKILL`, which runs no defers and strands the operator in a shell with no echo.
+
 Stream rules that follow from the framing:
 
 - **One agent per session.** A second `attach` to a session that already has a

@@ -21,6 +21,9 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
+
+	"golang.org/x/term"
 
 	"github.com/steveyegge/gastown/internal/socket"
 	"github.com/steveyegge/gastown/internal/sockproto"
@@ -77,12 +80,30 @@ func run(address, session, token, workerName string, argv []string) (int, error)
 	}
 	defer conn.Close()
 
+	// A terminal is what an interactive agent needs to start: Claude Code's UI
+	// calls setRawMode on stdin and throws without a TTY. So when this pane HAS
+	// a terminal, ask the worker for one and hand over the geometry with the
+	// attach — an agent that reads its size once at startup must not see 80x24.
+	// stdinFD is a file descriptor, so it always fits in an int; the x/term API
+	// takes one as int while os.File reports it as uintptr.
+	stdinFD := int(os.Stdin.Fd()) //nolint:gosec // G115: an fd never overflows an int
+	tty := term.IsTerminal(stdinFD)
+	cols, rows := 0, 0
+	if tty {
+		if w, h, err := term.GetSize(stdinFD); err == nil {
+			cols, rows = w, h
+		}
+	}
 	if err := codec.Send(&sockproto.Message{
 		Type:    sockproto.TypeAttach,
 		ID:      "attach",
 		Session: session,
 		Argv:    argv,
 		Env:     sessionEnv(),
+		TTY:     tty,
+		Cols:    cols,
+		Rows:    rows,
+		Term:    os.Getenv("TERM"),
 	}); err != nil {
 		return 1, fmt.Errorf("sending attach: %w", err)
 	}
@@ -97,6 +118,31 @@ func run(address, session, token, workerName string, argv []string) (int, error)
 		return 1, fmt.Errorf("expected attach_ack, got %q", ack.Type)
 	}
 
+	// Raw mode: with a remote terminal, every keystroke belongs to the agent —
+	// the local line discipline must not buffer lines, echo them, or turn ^C
+	// into a local signal. Restored on every exit path, including a panic, or
+	// the operator is left with an unusable shell.
+	restoreTerm := func() {}
+	if tty {
+		state, err := term.MakeRaw(stdinFD)
+		if err != nil {
+			return 1, fmt.Errorf("putting the terminal in raw mode: %w", err)
+		}
+		var once sync.Once
+		restoreTerm = func() { once.Do(func() { _ = term.Restore(stdinFD, state) }) }
+		defer restoreTerm()
+		// A panic in ANY goroutine kills the process without unwinding run, so
+		// the deferred restore above would never run and the operator would be
+		// left in a shell with no echo and a dead Ctrl-C. Restore first, then let
+		// the panic proceed.
+		defer func() {
+			if r := recover(); r != nil {
+				restoreTerm()
+				panic(r)
+			}
+		}()
+	}
+
 	// One writer goroutine owns the outbound half so stdin and signal frames
 	// never interleave mid-frame.
 	var writeMu sync.Mutex
@@ -106,6 +152,27 @@ func run(address, session, token, workerName string, argv []string) (int, error)
 		return sockproto.WriteFrame(conn, t, payload)
 	}
 
+	// Window changes follow the pane: a TUI rendered to stale geometry is
+	// unusable, and tmux resizes panes constantly.
+	if tty {
+		winch := make(chan os.Signal, 1)
+		notifyWindowChange(winch)
+		defer signal.Stop(winch)
+		go func() {
+			for range winch {
+				w, h, err := term.GetSize(stdinFD)
+				if err != nil {
+					continue
+				}
+				payload, err := sockproto.MarshalResize(w, h)
+				if err != nil {
+					continue
+				}
+				_ = writeFrame(sockproto.FrameResize, payload)
+			}
+		}()
+	}
+
 	go func() {
 		for sig := range sigCh {
 			// CANONICAL names on the wire. os.Signal.String() yields
@@ -113,12 +180,33 @@ func run(address, session, token, workerName string, argv []string) (int, error)
 			// worker would not recognize — and a silently dropped SIGINT means
 			// the pane's Ctrl-C never reaches the agent.
 			_ = writeFrame(sockproto.FrameSignal, []byte(canonicalSignalName(sig)))
+
+			// SIGINT belongs to the agent (it is the pane's Ctrl-C). The
+			// TERMINATING signals must also be able to stop THIS process:
+			// forwarding and nothing else meant no catchable signal could end the
+			// launcher, so a wedged stream left only SIGKILL — which runs no
+			// defers and strands the operator's terminal in raw mode.
+			switch sig {
+			case syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP:
+				time.AfterFunc(shutdownGrace, func() {
+					restoreTerm()
+					fmt.Fprintf(os.Stderr, "\r\ngt-worker-attach: agent did not exit within %s of %s; detaching\r\n",
+						shutdownGrace, canonicalSignalName(sig))
+					os.Exit(143)
+				})
+			}
 		}
 	}()
 
 	// Local stdin → stdin frames. Not waited on: a blocked read on a tty must
 	// never delay exit once the agent is gone.
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				restoreTerm()
+				panic(r)
+			}
+		}()
 		buf := make([]byte, 32<<10)
 		for {
 			n, err := os.Stdin.Read(buf)
@@ -160,6 +248,12 @@ func run(address, session, token, workerName string, argv []string) (int, error)
 		}
 	}
 }
+
+// shutdownGrace is how long the agent has to exit after a terminating signal
+// before the launcher detaches on its own, restoring the terminal on the way
+// out. Without it a wedged stream can only be killed with SIGKILL, which skips
+// every defer.
+var shutdownGrace = 10 * time.Second
 
 // canonicalSignalName maps a caught signal to the canonical wire name the
 // worker parses.
