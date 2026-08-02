@@ -10,6 +10,12 @@ import (
 
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/execution"
+
+	// Register the execution providers. LocalBackend self-registers inside
+	// internal/execution; remote providers live in their own packages and
+	// must be blank-imported so their init() runs before ForConfig resolves
+	// a rig's backend. Add each new provider here.
+	_ "github.com/steveyegge/gastown/internal/socket"
 )
 
 // rigExecutionConfig loads the rig's execution block from settings/config.json.

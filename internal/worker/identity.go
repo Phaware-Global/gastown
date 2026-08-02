@@ -33,6 +33,16 @@ type Signer interface {
 	SignCSR(ctx context.Context, csrPEM []byte) (certPEM, caPEM []byte, err error)
 }
 
+// PolecatCN is the control-plane CN for a polecat identity. ONE definition,
+// because both ends of the CSR exchange must agree byte for byte: the
+// orchestrator binds the signature to this name and the worker enrolls under
+// it, so two hand-built copies drifting would either break enrollment or —
+// worse — issue a cert the authz layer reads as a different polecat. The proxy
+// derives rig/name back out of it (cnToIdentity splits on the LAST hyphen).
+func PolecatCN(rig, polecat string) string {
+	return "gt-" + rig + "-" + polecat
+}
+
 // Identity is the polecat's control-plane identity on the worker: a private
 // key that never left the machine, plus the CA-signed leaf cert for it.
 type Identity struct {

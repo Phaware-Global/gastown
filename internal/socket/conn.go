@@ -1,0 +1,180 @@
+package socket
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/steveyegge/gastown/internal/sockproto"
+)
+
+// dialTimeout bounds establishing the control connection.
+const dialTimeout = 15 * time.Second
+
+// conn is a control connection to a gt-worker-client, guarding the sequential
+// request/response protocol with a mutex (§4: control messages are
+// sequential by design).
+type conn struct {
+	mu    sync.Mutex
+	nc    net.Conn
+	codec *sockproto.Codec
+	ack   *sockproto.Message // hello_ack captured at handshake (capabilities + sessions)
+	nonce int
+}
+
+// dial establishes and handshakes a control connection per §3.2 (mTLS/unix)
+// and §3.3 (unix token), leaving it ready for session messages.
+func dial(ctx context.Context, s *Settings, orchestratorID, gtVersion string) (*conn, error) {
+	nc, err := dialTransport(ctx, s)
+	if err != nil {
+		return nil, err
+	}
+	c := &conn{nc: nc, codec: sockproto.NewCodec(nc)}
+
+	// §3.3: on a unix socket in token mode, auth is the first message.
+	if s.tlsMode() == tlsModeNone {
+		if err := c.codec.Send(&sockproto.Message{Type: sockproto.TypeAuth, Token: s.Token}); err != nil {
+			nc.Close()
+			return nil, err
+		}
+	}
+
+	// §3.2 handshake: hello → hello_ack (with version negotiation).
+	if err := c.codec.Send(&sockproto.Message{
+		Type:           sockproto.TypeHello,
+		ProtoVersion:   sockproto.ProtoVersion,
+		GTVersion:      gtVersion,
+		OrchestratorID: orchestratorID,
+	}); err != nil {
+		nc.Close()
+		return nil, err
+	}
+	ack, err := c.codec.Recv()
+	if err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("socket: handshake: %w", err)
+	}
+	if ack.Type == sockproto.TypeError {
+		nc.Close()
+		return nil, fmt.Errorf("socket: worker refused connection: %s: %s", ack.Code, ack.Msg)
+	}
+	if ack.Type != sockproto.TypeHelloAck {
+		nc.Close()
+		return nil, fmt.Errorf("socket: expected hello_ack, got %q", ack.Type)
+	}
+	if ack.ProtoVersion != sockproto.ProtoVersion {
+		nc.Close()
+		return nil, fmt.Errorf("socket: worker speaks proto version %d, orchestrator speaks %d", ack.ProtoVersion, sockproto.ProtoVersion)
+	}
+	c.ack = ack
+	return c, nil
+}
+
+// dialTransport opens the raw connection: unix socket, or TCP with the §3
+// TLS material.
+func dialTransport(ctx context.Context, s *Settings) (net.Conn, error) {
+	d := net.Dialer{Timeout: dialTimeout}
+	if s.isUnix() {
+		return d.DialContext(ctx, "unix", s.unixPath())
+	}
+	tlsCfg, err := clientTLS(s)
+	if err != nil {
+		return nil, err
+	}
+	td := tls.Dialer{NetDialer: &d, Config: tlsCfg}
+	return td.DialContext(ctx, "tcp", s.Address)
+}
+
+// clientTLS builds the mutual-TLS config for a TCP worker (§3): present the
+// orchestrator client cert, verify the worker against the worker CA, pinned
+// to the enrolled worker name.
+func clientTLS(s *Settings) (*tls.Config, error) {
+	caFile, certFile, keyFile := s.TLS.CAFile, s.TLS.CertFile, s.TLS.KeyFile
+	if s.tlsMode() == tlsModeAuto {
+		dir, err := autoTLSDir()
+		if err != nil {
+			return nil, err
+		}
+		caFile = filepath.Join(dir, "worker-ca.crt")
+		certFile = filepath.Join(dir, "orchestrator.crt")
+		keyFile = filepath.Join(dir, "orchestrator.key")
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("socket: load orchestrator client cert (run `gt worker enroll`?): %w", err)
+	}
+	caPEM, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("socket: read worker CA: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("socket: worker CA file %s has no valid certificates", caFile)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      pool,
+		MinVersion:   tls.VersionTLS13,
+		// Pin the enrolled machine identity: the worker cert's CN must be the
+		// name the operator enrolled, so a different machine presenting a
+		// worker-CA-signed cert is still rejected.
+		ServerName: s.TLS.WorkerName,
+	}, nil
+}
+
+// request sends a request with a fresh nonce and returns the first response
+// echoing that ID (skipping unrelated async messages like pong).
+func (c *conn) request(ctx context.Context, req *sockproto.Message) (*sockproto.Message, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.nonce++
+	req.ID = fmt.Sprintf("r%d", c.nonce)
+	if dl, ok := ctx.Deadline(); ok {
+		_ = c.nc.SetDeadline(dl)
+		defer func() { _ = c.nc.SetDeadline(time.Time{}) }()
+	}
+	if err := c.codec.Send(req); err != nil {
+		return nil, err
+	}
+	// The reply must echo our exact nonce. Ping/pong keepalive and any other
+	// async worker traffic (including a message that omits the id) is skipped
+	// — never mistaken for the reply. The socket deadline set above bounds
+	// this loop, so a flood of non-matching messages cannot spin forever.
+	for {
+		resp, err := c.codec.Recv()
+		if err != nil {
+			return nil, err
+		}
+		if resp.ID == req.ID {
+			return resp, nil
+		}
+		// else: keepalive or stray async message — keep reading for our reply.
+	}
+}
+
+// close shuts the control connection.
+func (c *conn) close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.nc.Close()
+}
+
+// autoTLSDir returns the enrollment-managed material directory (§8 auto
+// mode): $GT_WORKER_CA_DIR or ~/.gt/worker-ca.
+func autoTLSDir() (string, error) {
+	if d := os.Getenv("GT_WORKER_CA_DIR"); d != "" {
+		return d, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("socket: resolve home for worker-ca dir: %w", err)
+	}
+	return filepath.Join(home, ".gt", "worker-ca"), nil
+}
