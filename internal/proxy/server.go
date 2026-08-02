@@ -288,6 +288,7 @@ func (s *Server) Start(ctx context.Context) error {
 		adminMux := http.NewServeMux()
 		adminMux.HandleFunc("/v1/admin/deny-cert", s.handleDenyCert)
 		adminMux.HandleFunc("/v1/admin/issue-cert", s.handleIssueCert)
+		adminMux.HandleFunc("/v1/admin/sign-csr", s.handleSignCSR)
 
 		adminSrv = &http.Server{
 			Addr:         s.cfg.AdminListenAddr,
@@ -475,6 +476,142 @@ func (s *Server) handleIssueCert(w http.ResponseWriter, r *http.Request) {
 		Serial:    leaf.SerialNumber.Text(16),
 		ExpiresAt: leaf.NotAfter.UTC().Format(time.RFC3339),
 	})
+}
+
+// signCSRRequest is the JSON body for POST /v1/admin/sign-csr.
+type signCSRRequest struct {
+	// Rig is the rig name (e.g. "MyRig").
+	Rig string `json:"rig"`
+	// Name is the polecat name (e.g. "rust").
+	Name string `json:"name"`
+	// CSR is the PEM-encoded PKCS#10 certificate request. Its CN must equal
+	// gt-<rig>-<name>; the private key stays wherever the CSR was generated.
+	CSR string `json:"csr"`
+	// TTL is the certificate validity duration (e.g. "24h"). Defaults to
+	// DefaultRemoteCertTTL; clamped to MaxRemoteCertTTL.
+	TTL string `json:"ttl"`
+}
+
+// signCSRResponse is the JSON response for POST /v1/admin/sign-csr.
+// Unlike issue-cert there is no key field: the CSR flow never sees one.
+type signCSRResponse struct {
+	CN        string `json:"cn"`
+	Cert      string `json:"cert"`
+	CA        string `json:"ca"`
+	Serial    string `json:"serial"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+// handleSignCSR handles POST /v1/admin/sign-csr on the local admin server.
+// It signs a worker-generated CSR as a polecat client cert — the remote-worker
+// cert path (docs/design/remote-polecat-execution.md §7.2): the daemon (or a
+// provider backend) calls this over the local admin socket after validating,
+// over its authenticated provider channel, that the CSR came from the worker
+// it provisioned for gt-<rig>-<name>. The private key never crosses.
+//
+// The admin server is local-only (bound to 127.0.0.1), same access model as
+// issue-cert/deny-cert.
+func (s *Server) handleSignCSR(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10) // a PEM CSR is a few KiB
+	var req signCSRRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Rig == "" {
+		http.Error(w, "bad request: rig is required", http.StatusBadRequest)
+		return
+	}
+	if req.Name == "" {
+		http.Error(w, "bad request: name is required", http.StatusBadRequest)
+		return
+	}
+	if req.CSR == "" {
+		http.Error(w, "bad request: csr is required", http.StatusBadRequest)
+		return
+	}
+
+	var ttl time.Duration // 0 → SignPolecatCSR applies DefaultRemoteCertTTL
+	if req.TTL != "" {
+		parsed, err := time.ParseDuration(req.TTL)
+		if err != nil {
+			http.Error(w, "bad request: invalid ttl: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if parsed <= 0 {
+			http.Error(w, "bad request: ttl must be positive", http.StatusBadRequest)
+			return
+		}
+		ttl = parsed
+	}
+
+	// Identity components must use a safe charset: '/' is the separator
+	// cnToIdentity emits (so a '/' inside rig or name lets two distinct pairs
+	// collide on one authz identity), and control/whitespace chars have no
+	// business in a cert CN.
+	if !validIdentityComponent(req.Rig) || !validIdentityComponent(req.Name) {
+		http.Error(w, "bad request: rig and name must match [A-Za-z0-9_.-]+", http.StatusBadRequest)
+		return
+	}
+	cn := "gt-" + req.Rig + "-" + req.Name
+	// The CN must also round-trip through the gt-<rig>-<name> parser every
+	// authz consumer uses (cnToIdentity splits on the LAST hyphen). A hyphen
+	// in the NAME would mint a cert whose parsed identity differs from the
+	// pair validated here — identity confusion, not just a formatting nit.
+	// With the charset check above, this makes the CN space injective for
+	// issuable pairs.
+	if cnToIdentity(cn) != req.Rig+"/"+req.Name {
+		http.Error(w, "bad request: rig/name do not round-trip through the gt-<rig>-<name> identity format (hyphenated names are ambiguous)", http.StatusBadRequest)
+		return
+	}
+	certPEM, err := s.ca.SignPolecatCSR([]byte(req.CSR), cn, ttl)
+	if err != nil {
+		http.Error(w, "failed to sign csr: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	block, _ := pem.Decode(certPEM)
+	if block == nil || block.Type != "CERTIFICATE" {
+		http.Error(w, "internal error: failed to decode signed certificate PEM", http.StatusInternalServerError)
+		return
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		http.Error(w, "internal error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.log.Info("csr signed via admin API", "cn", cn, "serial", leaf.SerialNumber.Text(16))
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(signCSRResponse{
+		CN:        cn,
+		Cert:      string(certPEM),
+		CA:        string(s.ca.CertPEM),
+		Serial:    leaf.SerialNumber.Text(16),
+		ExpiresAt: leaf.NotAfter.UTC().Format(time.RFC3339),
+	})
+}
+
+// validIdentityComponent reports whether s is non-empty and contains only
+// [A-Za-z0-9_.-] — safe for embedding in a gt-<rig>-<name> CN.
+func validIdentityComponent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '_', r == '.', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // denyCertRequest is the JSON body for POST /v1/admin/deny-cert.

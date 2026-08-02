@@ -241,6 +241,11 @@ func validateRigSettings(c *RigSettings) error {
 			return err
 		}
 	}
+	if c.Execution != nil {
+		if err := validateExecutionConfig(c.Execution); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
