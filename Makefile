@@ -37,6 +37,7 @@ build:
 	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY)-proxy-client ./cmd/gt-proxy-client
 	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY)-worker-agent ./cmd/gt-worker-agent
 	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY)-worker-client ./cmd/gt-worker-client
+	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY)-worker-attach ./cmd/gt-worker-attach
 	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/gt
 
 desktop-build:

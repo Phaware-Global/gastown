@@ -6,17 +6,20 @@
 // sessions on shutdown/teardown. It is the socket packaging of the same
 // internal/worker building blocks gt-worker-agent uses.
 //
-// This increment covers the session service (spec §11 phases 1-2 worker
-// side). Enrollment (§3.1), exec streaming (§4.3), the offline spool, and
-// container re-adoption after a service restart are later phases; sessions
-// found in persisted state at startup are reported as "orphaned" for the
-// daemon to reap and re-provision.
+// This increment covers the session service plus exec streaming (§4.3): a
+// launcher attaches to a ready session, and the agent's stdio is piped over
+// binary frames (see exec.go). The offline spool and container re-adoption
+// after a service restart are later phases; sessions found in persisted state
+// at startup are reported as "orphaned" for the daemon to reap and
+// re-provision.
 package workerclient
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/url"
@@ -56,6 +59,11 @@ type Config struct {
 	ExecModes []string
 	// Docker reports a usable docker daemon (capabilities.docker).
 	Docker bool
+	// AgentEnvFile is an operator-managed KEY=VALUE file supplying worker-local
+	// agent credentials (§8) — this provider's form of the externalized
+	// agent-auth contract (core §7.1). Injected into the agent process
+	// worker-side; never transmitted over the socket.
+	AgentEnvFile string
 
 	Log *slog.Logger
 }
@@ -72,9 +80,10 @@ type session struct {
 	relay       *worker.Relay
 	workEnv     *worker.WorkEnv // nil in native mode
 	worktree    string
-	certWanted  bool // SignCSR is awaiting a cert
-	certTaken   bool // a cert has been claimed for this session
-	tearingDown bool // a teardown is in progress; suppress a racing orphan insert
+	execCancel  context.CancelFunc // cancels an attached exec stream (nil when none)
+	certWanted  bool               // SignCSR is awaiting a cert
+	certTaken   bool               // a cert has been claimed for this session
+	tearingDown bool               // the session is ending (teardown or graceful shutdown): suppress a racing orphan insert and refuse new attaches
 
 	done      chan struct{} // closed when the supervisor has finished
 	buildDone chan struct{} // closed when bringUp returns (success or fail)
@@ -161,7 +170,12 @@ func (s *Service) Serve(ctx context.Context, ln net.Listener) error {
 // bringup completes on a goroutine while the read loop keeps serving.
 type connState struct {
 	codec  *sockproto.Codec
+	nc     net.Conn
 	sendMu sync.Mutex
+	// writeFailed is sticky: once a frame write has failed (a launcher that
+	// stopped draining, a dead peer), every later write short-circuits instead
+	// of burning another frameWriteTimeout. Guarded by sendMu.
+	writeFailed bool
 }
 
 func (c *connState) send(m *sockproto.Message) error {
@@ -169,6 +183,59 @@ func (c *connState) send(m *sockproto.Message) error {
 	defer c.sendMu.Unlock()
 	return c.codec.Send(m)
 }
+
+// frameWriteTimeout bounds a single frame write. A launcher that stops draining
+// (killed pane, partition with no FIN/RST, full recv buffer) fills the socket
+// send buffer; without a deadline the pump would block inside WriteFrame while
+// HOLDING sendMu, the agent would block on its own stdout pipe, cmd.Wait would
+// never return, and the session — the whole worker at MaxSessions=1 — would
+// wedge permanently. A unix socket has no keepalive backstop, so this deadline
+// is the only bound.
+const frameWriteTimeout = 60 * time.Second
+
+// writeFrame writes one §4.3 frame under the same lock as message sends, so a
+// frame's header and payload can never interleave with another writer's.
+func (c *connState) writeFrame(t sockproto.FrameType, payload []byte) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	return c.writeLocked(func() error { return sockproto.WriteFrame(c.nc, t, payload) })
+}
+
+// writeExit writes the terminal exit frame.
+func (c *connState) writeExit(code int) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	return c.writeLocked(func() error { return sockproto.WriteExitFrame(c.nc, code) })
+}
+
+// writeLocked runs one deadline-bounded write. sendMu must be held.
+func (c *connState) writeLocked(write func() error) error {
+	if c.writeFailed {
+		return errWriteFailed
+	}
+	_ = c.nc.SetWriteDeadline(time.Now().Add(frameWriteTimeout))
+	defer func() { _ = c.nc.SetWriteDeadline(time.Time{}) }()
+	err := write()
+	if err != nil {
+		c.writeFailed = true
+	}
+	return err
+}
+
+// errWriteFailed reports a write attempted after this connection's outbound
+// half was already known dead.
+var errWriteFailed = errors.New("exec stream: outbound half is dead")
+
+// expireReads pushes the connection's read deadline into the past, unblocking
+// a goroutine parked in a socket read. Writes are unaffected.
+func (c *connState) expireReads() error {
+	return c.nc.SetReadDeadline(time.Now().Add(-time.Second))
+}
+
+// frameReader returns the reader an exec stream must read frames from: the
+// codec's BUFFERED reader, since bytes past the attach preamble line may
+// already be buffered and would be lost by reading the raw conn.
+func (c *connState) frameReader() io.Reader { return c.codec.Reader() }
 
 func (s *Service) handle(ctx context.Context, nc net.Conn) {
 	defer nc.Close()
@@ -178,7 +245,7 @@ func (s *Service) handle(ctx context.Context, nc net.Conn) {
 	// arrive on the dead connection.
 	connCtx, connCancel := context.WithCancel(ctx)
 	defer connCancel()
-	c := &connState{codec: sockproto.NewCodec(nc)}
+	c := &connState{codec: sockproto.NewCodec(nc), nc: nc}
 
 	authed := s.cfg.Token == ""
 	helloed := false
@@ -233,6 +300,12 @@ func (s *Service) handle(ctx context.Context, nc net.Conn) {
 			s.handleCert(c, m)
 		case sockproto.TypeShutdown:
 			s.handleShutdown(c, m)
+		case sockproto.TypeAttach:
+			// An exec stream takes over this connection (§4.3): after the ack
+			// it carries only binary frames, so the control loop must not read
+			// from it again.
+			s.handleAttach(connCtx, c, m)
+			return
 		case sockproto.TypeTeardown:
 			s.handleTeardown(c, m)
 		default:
@@ -603,6 +676,20 @@ func (s *Service) handleShutdown(c *connState, m *sockproto.Message) {
 		_ = c.send(&sockproto.Message{Type: sockproto.TypeError, ID: m.ID, Session: m.Session, Code: "no_session", Msg: "no live session"})
 		return
 	}
+	// An attached agent must stop BEFORE the supervisor's final flush, or the
+	// checkpoint captures a tree the agent is still writing to. Fence exactly
+	// as teardownSession does, in ONE critical section: tearingDown makes
+	// streamExec refuse a reattach for the whole flush (a graceful shutdown
+	// ends the session, so there is nothing left to attach to), and canceling
+	// under the lock means the cancel cannot be a stale handle to an exec that
+	// unregistered in a gap. cancel() only closes a context, so holding s.mu
+	// across it is safe.
+	s.mu.Lock()
+	sess.tearingDown = true
+	if sess.execCancel != nil {
+		sess.execCancel()
+	}
+	s.mu.Unlock()
 	cancel()
 	<-sess.done
 	_ = c.send(&sockproto.Message{
@@ -670,6 +757,11 @@ func (s *Service) teardownSession(sess *session, cleanWorktree bool) {
 	sess.tearingDown = true
 	if sess.buildCancel != nil {
 		sess.buildCancel()
+	}
+	// Kill any attached exec first: otherwise a native agent keeps running
+	// while we RemoveAll its worktree out from under it.
+	if sess.execCancel != nil {
+		sess.execCancel()
 	}
 	s.mu.Unlock()
 	<-sess.buildDone

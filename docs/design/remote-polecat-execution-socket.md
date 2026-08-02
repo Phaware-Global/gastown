@@ -199,7 +199,54 @@ N bytes payload
 
 `resize` carries `{cols, rows}` JSON; `exit` carries the process's real exit
 code (1-byte payload); `signal` (orch → worker) forwards e.g. SIGINT to the
-agent. The stream closes after `exit`.
+agent, by **canonical name** (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`). The
+stream closes after `exit`.
+
+Stream rules that follow from the framing:
+
+- **One agent per session.** A second `attach` to a session that already has a
+  running exec is refused (exit `125`): two agents on one worktree would
+  double-write the tree the checkpoint loop is committing.
+- **Half-close ≠ disconnect.** A launcher may half-close its write side to hand
+  the agent stdin EOF; the worker closes the agent's stdin and keeps the agent
+  running. Only a hard read error is treated as a lost pane.
+- **Liveness.** The worker periodically writes a zero-length `stdout` frame — a
+  no-op for the launcher, a real write on the socket — so a killed pane is
+  detected even for an agent that produces no output. On a failed write (probe
+  or output pump) the worker cancels the exec: `SIGTERM` to the agent's process
+  group, then a hard kill after a short grace, so a dead launcher can never
+  leave an agent pinning the session.
+- **Session lifecycle wins.** `shutdown` stops an attached agent *before* the
+  final flush (so the checkpoint captures a quiesced tree), and `teardown`
+  stops it before the worktree is removed.
+
+Session env in the `attach` payload is an **allowlist** (`GT_*`, `BD_*`,
+`ANTHROPIC_DEFAULT_*`, plus specific model-*selection* keys, none
+credential-shaped), enforced identically on both sides. The worker re-validates
+rather than trusting the launcher's filter: in native mode the agent runs on the
+worker host, where a wire `LD_PRELOAD` or `PATH` would be code execution.
+
+**Endpoints never cross the wire.** Any key naming a destination (`*_URL`,
+`*_HOST`, `*_ADDR`, `*_PORT`, `*_ENDPOINT`, …) is refused by shape, so a var
+added later cannot quietly reopen the class. An endpoint is a worker-local fact:
+the agent's control-plane URL is the worker's **own session relay** — the only
+endpoint carrying that polecat's identity to the proxy — so `gt-worker-client`
+sets `GT_PROXY_URL` itself from the relay it bound (in container mode the
+container already has it from creation). An orchestrator-supplied endpoint would
+be at best unreachable from the worker and at worst a redirect: a wire
+`GT_PROXY_URL` points the agent's `gt`/`bd` RPC at an attacker, whose injected
+responses arrive as mail and beads — prompt injection with extra steps.
+
+Agent credentials come from the worker's own agent env file (§8), never from the
+orchestrator — **and so does the endpoint a credential is sent to**.
+`ANTHROPIC_BASE_URL` is barred from the wire: it is not itself a secret, but a
+compromised or confused orchestrator that could set it would exfiltrate the
+worker's own API key to an endpoint of its choosing. Ordering alone is not
+enough — the env file wins only for keys it also sets, and a file holding the key
+but not the base URL is an ordinary config — so an alternate-provider polecat
+pairs base URL and credential together in the worker's env file. (Local gastown
+already applies the same pairing rule: `config/env.go` excludes
+`ANTHROPIC_BASE_URL` from parent-shell passthrough.)
 
 ## 5. Interface mapping
 
