@@ -63,7 +63,7 @@ Return **exactly one** JSON object and no prose before or after it:
 {
   "perspective": "{{ .Perspective }}",
   "verdict": "one-line verdict for this perspective — REQUIRED even with zero findings (e.g. \"no findings: error paths all guarded\")",
-  "disposition": "request_changes",
+  "disposition": "<optional; omit unless escalating — request_changes|comment>",
   "findings": [
     {
       "path": "internal/foo/bar.go",
