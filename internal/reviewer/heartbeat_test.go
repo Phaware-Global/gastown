@@ -291,3 +291,35 @@ func TestWriteHeartbeat_UsesAFixedTempNameAndIsNotWorldReadable(t *testing.T) {
 		t.Errorf("heartbeat mode = %04o, want 0600 to match the rig's other metadata", perm)
 	}
 }
+
+func TestReadHeartbeatE_DistinguishesAbsentFromUnreadable(t *testing.T) {
+	rig := t.TempDir()
+
+	// Absent is not an error — the rig is simply idle.
+	hb, err := ReadHeartbeatE(rig)
+	if hb != nil || err != nil {
+		t.Errorf("absent: got (%v, %v), want (nil, nil)", hb, err)
+	}
+
+	// Malformed IS an error. A supervisor must not read a torn or corrupt file
+	// as "no reviewer is working here" and take the harshest available action.
+	path := HeartbeatPath(rig)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hb, err = ReadHeartbeatE(rig)
+	if err == nil {
+		t.Error("malformed heartbeat must surface an error, not read as absent")
+	}
+	if hb != nil {
+		t.Errorf("malformed: got %v, want nil heartbeat", hb)
+	}
+
+	// The lenient reader keeps its best-effort contract for progress-only callers.
+	if ReadHeartbeat(rig) != nil {
+		t.Error("ReadHeartbeat must stay lenient (nil on malformed)")
+	}
+}

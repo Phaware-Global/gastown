@@ -100,6 +100,29 @@ func (hb *Heartbeat) Elapsed() time.Duration {
 	return time.Since(hb.StartedAt)
 }
 
+// ReadHeartbeatE loads the reviewer heartbeat, distinguishing "absent" (nil,
+// nil) from "unreadable or malformed" (nil, err).
+//
+// Supervisors need that distinction: a transient I/O error or a torn read is
+// not evidence that a reviewer is idle, and conflating them hands the harshest
+// available action to a momentary filesystem hiccup. ReadHeartbeat keeps the
+// lenient nil-on-anything behavior for callers that only want a best-effort
+// progress signal.
+func ReadHeartbeatE(rigPath string) (*Heartbeat, error) {
+	data, err := os.ReadFile(HeartbeatPath(rigPath)) //nolint:gosec // path derived from trusted rig path
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var hb Heartbeat
+	if err := json.Unmarshal(data, &hb); err != nil {
+		return nil, fmt.Errorf("malformed heartbeat: %w", err)
+	}
+	return &hb, nil
+}
+
 // ReadHeartbeat loads the reviewer heartbeat for a rig. Returns nil when the
 // file is absent, unreadable, or malformed — every caller is a supervisor that
 // already treats nil as "no progress signal", and a corrupt file must not be a
