@@ -283,9 +283,9 @@ squashed_at: %s
 			Title:       digestTitle,
 			Description: digestDesc,
 			Labels:      []string{"gt:task"},
-			Priority:    4,       // P4 - backlog priority for digests
+			Priority:    4, // P4 - backlog priority for digests
 			Actor:       target,
-			Ephemeral:   true,    // Don't export to JSONL - daily aggregation handles permanent record
+			Ephemeral:   true, // Don't export to JSONL - daily aggregation handles permanent record
 		})
 		if err != nil {
 			return fmt.Errorf("creating digest: %w", err)

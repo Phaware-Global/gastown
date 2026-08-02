@@ -7,9 +7,9 @@ import (
 func TestParseSchemaVersion_Valid(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		input      string
-		wantMajor  int
-		wantMinor  int
+		input     string
+		wantMajor int
+		wantMinor int
 	}{
 		{"1.0", 1, 0},
 		{"2.3", 2, 3},

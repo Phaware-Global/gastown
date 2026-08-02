@@ -192,4 +192,3 @@ func TestBuildBrowseQuery_EscapesSQL(t *testing.T) {
 		t.Errorf("buildBrowseQuery should escape single quotes: %q", got)
 	}
 }
-

@@ -77,10 +77,10 @@ func runScorekeeperWithStore(store doltserver.WLCommonsStore) error {
 
 	if wlScorekeeperJSON {
 		summary := struct {
-			RigsScored   int            `json:"rigs_scored"`
-			TierDist     map[string]int `json:"tier_distribution"`
-			MaxTier      string         `json:"max_tier"`
-			ClusterNote  string         `json:"cluster_note"`
+			RigsScored  int            `json:"rigs_scored"`
+			TierDist    map[string]int `json:"tier_distribution"`
+			MaxTier     string         `json:"max_tier"`
+			ClusterNote string         `json:"cluster_note"`
 		}{
 			RigsScored:  len(entries),
 			TierDist:    tierDist,

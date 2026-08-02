@@ -208,4 +208,3 @@ func TestFormatCountStyled(t *testing.T) {
 		t.Errorf("formatCountStyled(42) = %q, does not contain '42'", got)
 	}
 }
-

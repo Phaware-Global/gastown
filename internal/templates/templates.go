@@ -4,6 +4,7 @@ package templates
 import (
 	"bytes"
 	"embed"
+	"encoding/xml"
 	"fmt"
 	"os"
 	"os/exec"
@@ -120,6 +121,59 @@ type SupervisorData struct {
 	GTPath   string // Path to the gt binary
 	TownRoot string // Path to the Gas Town workspace
 	Path     string // PATH env var to inject into the supervised daemon
+}
+
+// WorkerSupervisorData renders the socket-execution worker's launchd job
+// (docs/design/remote-polecat-execution-socket.md §11 phase 5).
+type WorkerSupervisorData struct {
+	// ShellCommand is the complete `/bin/sh -c` line, assembled and
+	// shell-quoted by the caller (quoting belongs where the parts are known,
+	// not in a template).
+	ShellCommand string
+	StateDir     string // session state dir; also holds worker.env and worker.log
+	LogPath      string // stdout/stderr destination
+	Path         string // PATH for the supervised worker (it execs git, docker, the agent)
+}
+
+// WorkerLaunchdPlistPath is where the worker's launchd job is installed.
+func WorkerLaunchdPlistPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("finding home directory: %w", err)
+	}
+	return filepath.Join(home, "Library", "LaunchAgents", "com.gastown.worker.plist"), nil
+}
+
+// RenderWorkerLaunchd renders the worker plist for data.
+func RenderWorkerLaunchd(data WorkerSupervisorData) ([]byte, error) {
+	content, err := supervisorFS.ReadFile("launchd/com.gastown.worker.plist")
+	if err != nil {
+		return nil, fmt.Errorf("reading worker launchd template: %w", err)
+	}
+	// Every value is XML-escaped: the plist is an XML document, and an
+	// operator's path containing & or < would otherwise produce a file launchd
+	// silently refuses to load.
+	tmpl, err := template.New("worker-launchd").Funcs(template.FuncMap{
+		"xml": xmlEscape,
+	}).Parse(string(content))
+	if err != nil {
+		return nil, fmt.Errorf("parsing worker launchd template: %w", err)
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return nil, fmt.Errorf("rendering worker launchd template: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+// xmlEscape escapes a value for an XML text node.
+func xmlEscape(s string) string {
+	var buf bytes.Buffer
+	if err := xml.EscapeText(&buf, []byte(s)); err != nil {
+		// EscapeText only fails if the writer fails; a bytes.Buffer cannot.
+		return ""
+	}
+	return buf.String()
 }
 
 // New creates a new Templates instance.

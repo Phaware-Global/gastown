@@ -76,7 +76,7 @@ func TestRigAdoptBeadsCandidateDetection(t *testing.T) {
 // and a prefix is available, the fallback init path is triggered.
 func TestRigAdoptFallbackInitNeeded(t *testing.T) {
 	tests := []struct {
-		name       string
+		name         string
 		hasDotBeads  bool
 		hasPrefix    bool
 		wantFallback bool

@@ -18,9 +18,9 @@ import (
 // prWorkflowCommandPatterns matches the forbidden commands this guard
 // covers. Each pattern allows the target command to appear at one of
 // three boundaries: (1) line start (possibly indented); (2) after a
-// shell command-separator operator in the set `` [|&;(`] ``
+// shell command-separator operator in the set “ [|&;(`] “
 // (backtick inclusion covers command-substitution shapes like
-// `` `gh pr create` ``, flagged in iter-1 review); (3) immediately
+// “ `gh pr create` “, flagged in iter-1 review); (3) immediately
 // after a shell `-c` wrapper — `sh -c '...'`, `bash -lc "..."`,
 // `dash -ic '...'`, etc. The wrapper-boundary fragment accepts any
 // `-<short-opts>c` form (with `c` as the LAST short opt) to cover
@@ -37,7 +37,7 @@ import (
 //     broadens the false-positive surface (any value with `gh pr
 //     create` in it) more than the real-world benefit justifies.
 //   - Quoted-string corner cases like `echo "|| gh pr create"` can
-//     match because the boundary set `` [|&;(`] `` doesn't know it's
+//     match because the boundary set “ [|&;(`] “ doesn't know it's
 //     inside a quote. Accepted: over-block on an unusual diagnostic
 //     command beats silently missing a real PR-creation.
 //
@@ -85,7 +85,7 @@ var prMergeCommandPattern = regexp.MustCompile("(?m)(^\\s*|[|&;(`]\\s*|-[a-z]*c\
 //     escape.
 //   - The PR-number segment is `[^/\s]+` rather than `[0-9]+` so shell
 //     variables (`$PR`), gh placeholders (`:number`), and command
-//     substitution (`` `cmd` ``) match too — the digit-only form was
+//     substitution (“ `cmd` “) match too — the digit-only form was
 //     bypassable by anything that wasn't a literal integer.
 var prMergeViaApiPattern = regexp.MustCompile(
 	"(?ms)(^\\s*|[|&;(`]\\s*|-[a-z]*c\\s+['\"]\\s*)gh\\s+api\\b.*?pulls/[^/\\s]+/merge\\b")
@@ -222,7 +222,7 @@ func runTapGuardPRWorkflow(cmd *cobra.Command, args []string) error {
 	// Only state 1 reaches the "manual invocation" allow path. State
 	// 2 + 3 collapse to fail-closed.
 	var (
-		command           string
+		command              string
 		stdinUninterpretable bool
 	)
 	if !isStdinTerminal() {

@@ -23,8 +23,9 @@ func TestEnvAllowed(t *testing.T) {
 		// best unreachable from the worker and at worst a redirect (a wire
 		// GT_PROXY_URL turns injected RPC responses into fake mail/beads).
 		"GT_PROXY_URL", "GT_OTEL_LOGS_URL", "GT_DOLT_HOST", "BD_SERVER_ADDR", "GT_RELAY_PORT",
-		// Launcher-only plumbing.
-		"GT_WORKER_TOKEN", "GT_WORKER_NAME",
+		// Launcher-only plumbing, and the relay toggle that suppresses
+		// gt-proxy-client's loopback guard — only the worker may assert that.
+		"GT_WORKER_TOKEN", "GT_WORKER_NAME", "GT_PROXY_RELAY",
 		// Unrecognized entirely.
 		"CLAUDE_UNKNOWN_FUTURE_VAR", "RANDOM_VAR", "",
 	} {

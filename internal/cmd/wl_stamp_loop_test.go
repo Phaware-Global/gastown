@@ -174,9 +174,9 @@ func TestStampLoop_SelfStampFails(t *testing.T) {
 // Not parallel: mutates package-level wlStamp* globals.
 func TestStampLoop_InvalidValence(t *testing.T) {
 	tests := []struct {
-		name     string
-		quality  float64
-		wantErr  string
+		name    string
+		quality float64
+		wantErr string
 	}{
 		{"quality too high", 6.0, "quality"},
 		{"quality negative", -0.5, "quality"},
