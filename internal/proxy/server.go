@@ -82,6 +82,9 @@ type Server struct {
 	lnMu    sync.Mutex
 	ln      net.Listener
 	adminLn net.Listener
+
+	// prefixCache backs sessionIdentityEnv (session_env.go).
+	prefixCache
 }
 
 // New creates a new Server with the given config and CA.
