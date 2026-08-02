@@ -885,7 +885,7 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	switch err := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA); {
+	switch err := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA, origin, from); {
 	case err == nil:
 	case errors.Is(err, reviewer.ErrReviewInFlight):
 		// Queued behind an unfinished review on a DIFFERENT PR. Mail is the work

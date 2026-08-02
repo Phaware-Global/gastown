@@ -411,3 +411,26 @@ func TestReapRigReviewer_ClearsAHeartbeatWithAnUnusableTimestamp(t *testing.T) {
 		}
 	}
 }
+
+func TestValidReviewerRequester_RejectsForgedAddresses(t *testing.T) {
+	// hb.Requester is read from the rig-writable heartbeat and used as a MAIL
+	// ADDRESS, so an unvalidated value turns the escalation into a delivery
+	// primitive for whoever can write the file.
+	for _, ok := range []string{"gastown/refinery", "gastown/crew"} {
+		if got, valid := validReviewerRequester("gastown", ok); !valid || got != ok {
+			t.Errorf("validReviewerRequester(%q) = (%q,%v), want it accepted", ok, got, valid)
+		}
+	}
+	for _, bad := range []string{
+		"",
+		"otherrig/refinery",       // another rig's mailbox
+		"gastown/mayor",           // not a dispatch origin
+		"gastown/polecats/evil",   // arbitrary agent
+		"../../etc/passwd",
+		"gastown/crew\nBcc: evil", // header-ish injection
+	} {
+		if got, valid := validReviewerRequester("gastown", bad); valid {
+			t.Errorf("validReviewerRequester(%q) = (%q,true), want rejected", bad, got)
+		}
+	}
+}
