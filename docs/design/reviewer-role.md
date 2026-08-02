@@ -173,12 +173,67 @@ dispatchPlugins`), but rig-scoped and refinery-initiated:
 3. On completion the Reviewer posts the GitHub review, writes a summary to
    the review bead, closes it, and runs `gt reviewer done` — the analog of
    `gt dog done`: clears state, auto-terminates the session.
-4. Staleness backstop: the existing daemon stale-session machinery pattern
-   (cf. `detectStaleWorkingDogs`) applies — a reviewer session in
-   state=working past `stuck_threshold` is killed and its bead reopened.
-   `await-review`'s own timeout (exit 3 → escalation) is the functional
-   safety net even if cleanup lags: a hung Reviewer never blocks a merge
-   silently.
+4. Staleness backstop: the reviewer heartbeat (below) makes review progress
+   observable, and the daemon's reviewer reaper nudges and then kills a
+   session that stops progressing or exceeds its absolute runtime cap.
+   `await-review`'s own timeout (exit 3 → escalation) remains the
+   merge-side safety net: a hung Reviewer never blocks a merge silently.
+
+   > **History.** This step originally asserted that "the existing daemon
+   > stale-session machinery pattern (cf. `detectStaleWorkingDogs`) applies."
+   > It never did. Every daemon patrol enumerates its targets from either a
+   > persistent registry (witness/refinery) or a worktree directory plus an
+   > agent bead (polecats/dogs); the Reviewer has neither, so it was invisible
+   > to all of them and nothing ever reaped a hung reviewer. The heartbeat and
+   > the reaper exist to make the claim true.
+
+### State vs telemetry
+
+The Reviewer is ZFC: it keeps **no lifecycle state file**. The tmux session is
+the source of truth for "is there a reviewer", and mail is the work queue. That
+rule is what makes the role crash-safe — there is no state to reconcile, so a
+killed session leaves nothing stale behind and a re-dispatch is always clean.
+
+The heartbeat at `<rig>/reviewer/heartbeat.json` does **not** violate that rule,
+because it is a different category of file. The distinction that matters is
+*who reads it and what changes if it's gone*:
+
+| | Lifecycle state (forbidden) | Telemetry (this heartbeat) |
+|---|---|---|
+| Read by | the role itself, to decide what to do next | supervisors only — the reaper, `gt reviewer status`, an operator |
+| If deleted mid-review | behavior changes; the role is confused or wedged | nothing changes; the review proceeds identically |
+| If it disagrees with reality | reality is corrupted — two sources of truth | reality wins; the file is re-derived on the next phase |
+| Authority | authoritative | strictly derived and disposable |
+
+No `gt reviewer` command ever reads the heartbeat to decide what to do. It is
+written forward-only, never branched on, and deleting it at any moment changes
+nothing about the review in flight — it only blinds the supervisor. That is the
+test: **state you must not lose, versus telemetry you may always throw away.**
+
+The precedent is `deacon/heartbeat.json`, which coexists with the Deacon's own
+ZFC design for exactly this reason.
+
+Two fields carry the load, and they answer different questions:
+
+- **`timestamp`** — when the current phase was entered. Its age is a *progress*
+  signal. Note that the perspective subagents run entirely between the last
+  `gt reviewer prompt` and `gt reviewer consolidate`, so a heartbeat parked at
+  `prompt` is the normal shape of a review in flight, not by itself evidence of
+  a wedge.
+- **`started_at`** — when the review was dispatched, preserved across every
+  phase transition. `elapsed` measures total review wall time and is the basis
+  for an absolute cap that a still-touching-but-looping reviewer cannot evade.
+
+The heartbeat is seeded by `gt reviewer request` on the **dispatcher's** side,
+before the session exists, so a reviewer that is requested but never starts is
+distinguishable from a rig where no review was ever requested. It is cleared by
+`gt reviewer done`, so an idle rig never looks stalled. It lives in
+`<rig>/reviewer/`, deliberately outside the `<rig>/reviewer/rig/` worktree, so
+it never appears in `git status` and cannot be swept by a detached checkout.
+
+Writes are atomic (temp + rename) so the daemon never reads a torn file, and
+every write is best-effort: telemetry must never be able to fail the review step
+that produced it.
 
 ## Role Definition
 
@@ -759,8 +814,10 @@ phase in the gastown rig (`bd create --rig gastown`), epic-linked.
 
 | Failure | Detection | Outcome |
 |---|---|---|
-| Reviewer session crashes mid-review | Session dead, bead in_progress | Daemon stale-cleanup reopens; next `await-review` poll still inside timeout → refinery re-dispatches (request is idempotent per PR+SHA: re-request with same SHA reuses the open bead) |
-| Reviewer hangs | `stuck_threshold` (45m) > `pr_review_timeout` (30m) | `await-review` exit 3 → escalation (existing path); stale cleanup reaps the session afterward |
+| Reviewer session crashes mid-review | Session dead, heartbeat present and ageing | Daemon reviewer reaper clears the heartbeat; next `await-review` poll still inside timeout → refinery re-dispatches (request is idempotent per PR+SHA: re-request with same SHA reuses the open bead) |
+| Reviewer hangs | Heartbeat `timestamp` age > `stuck_threshold` (45m), or `elapsed` past the absolute cap | Reaper nudges once, then kills on the next cycle and emits a kill feed event; `await-review` exit 3 → escalation (existing path) at 30m regardless |
+| Reviewer dispatched but never starts | Heartbeat stuck at `dispatched` with no live session | Reaper clears it and escalates — previously indistinguishable from "no review requested" |
+| Reviewer loops without progressing | Heartbeat keeps refreshing but `elapsed` exceeds the absolute cap | Hard kill on `elapsed`, which a refreshing `timestamp` cannot evade |
 | Review posted but malformed (no priority shields) | Threads parse with empty Priority | Loop still works — priority is advisory; review-fix dispatch carries the thread body regardless |
 | Token invalid/expired | `gh` fails in-session | Reviewer escalates via `gt escalate`; `await-review` times out → exit 3; never blocks merge silently |
 | Two requests race for one rig | Second `request` sees live session | Mail-queue semantics: one session, sequential drain |

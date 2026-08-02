@@ -25,11 +25,16 @@ import (
 
 // Manager handles the lifecycle of a rig's on-demand Reviewer session.
 //
-// It mirrors the Refinery manager's ZFC design: there is no state file — the
-// tmux session is the source of truth, and review-request work is carried on
-// beads/mail. The Reviewer is spawn-on-demand (one session per rig, drained by
-// mail), so the Manager only needs to start, stop, and report on the session,
-// and to provision the reviewer worktree if it is missing.
+// It mirrors the Refinery manager's ZFC design: there is no lifecycle state
+// file — the tmux session is the source of truth, and review-request work is
+// carried on beads/mail. The Reviewer is spawn-on-demand (one session per rig,
+// drained by mail), so the Manager only needs to start, stop, and report on the
+// session, and to provision the reviewer worktree if it is missing.
+//
+// heartbeat.json in this package is telemetry, not lifecycle state, and does
+// not breach that rule: no reviewer code path reads it to decide what to do,
+// and deleting it changes nothing about a review in flight. See
+// docs/design/reviewer-role.md § "State vs telemetry".
 type Manager struct {
 	rig    *rig.Rig
 	output io.Writer
