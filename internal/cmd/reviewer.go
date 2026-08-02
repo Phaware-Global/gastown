@@ -43,6 +43,7 @@ var (
 	reviewerPromptPriorThreads string
 	reviewerPromptInstructions string
 	reviewerPromptMaxFindings  int
+	reviewerPromptMaxDuration  time.Duration
 
 	reviewerConsolidateSHA string
 	reviewerConsolidateOut string
@@ -240,6 +241,8 @@ func init() {
 		`file of extra execution instructions to inject (or "-" for stdin)`)
 	reviewerPromptCmd.Flags().IntVar(&reviewerPromptMaxFindings, "max-findings", 0,
 		"per-pass finding cap (default: the rig's review.max_findings_per_perspective)")
+	reviewerPromptCmd.Flags().DurationVar(&reviewerPromptMaxDuration, "max-duration", 0,
+		"soft wall-clock budget for the pass; it returns a partial result rather than hanging (default: half the reviewer stuck_threshold)")
 	_ = reviewerPromptCmd.MarkFlagRequired("pr")
 	_ = reviewerPromptCmd.MarkFlagRequired("sha")
 
@@ -600,6 +603,7 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 		Round:             reviewerPromptRound,
 		PriorThreads:      priorThreads,
 		MaxFindings:       maxFindings,
+		MaxDuration:       reviewerPromptMaxDuration,
 		ExtraInstructions: extra,
 	})
 	if err != nil {

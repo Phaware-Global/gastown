@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/reviewer"
@@ -49,19 +48,17 @@ func (d *Daemon) reapStuckReviewers() {
 	})
 }
 
-// reviewerStuckThreshold resolves a rig's reviewer stuck threshold from its
-// role definition, falling back to the compiled-in default. This is the first
-// real consumer of RoleDefinition.Health — until now reviewer.toml's
-// stuck_threshold was read only by `gt role def`'s printer and enforced nothing.
+// reviewerStuckThreshold resolves a rig's reviewer stuck threshold, clamped.
+//
+// Delegates to reviewer.StuckThreshold so the reaper's kill decision and the
+// dispatcher's wedge-recycle decision read the same number from the same place;
+// two copies of this rule would eventually disagree, and the failure mode is a
+// session the dispatcher considers fine and the reaper kills. The clamp matters
+// because reviewer.toml lives INSIDE the rig and is agent-writable: unclamped,
+// a one-second threshold kills every reviewer on sight and a one-year threshold
+// disables the reaper.
 func (d *Daemon) reviewerStuckThreshold(rigName, rigPath string) time.Duration {
-	raw := reviewer.DefaultStuckThreshold
-	if def, err := config.LoadRoleDefinition(d.config.TownRoot, rigPath, constants.RoleReviewer); err == nil &&
-		def != nil && def.Health.StuckThreshold.Duration > 0 {
-		raw = def.Health.StuckThreshold.Duration
-	}
-	// reviewer.toml lives INSIDE the rig and is agent-writable, so an unclamped
-	// threshold is a kill switch in both directions: a one-second value kills
-	// every reviewer on sight, a one-year value disables the reaper.
+	raw := reviewer.StuckThreshold(d.config.TownRoot, rigPath)
 	clamped, adjusted := reviewer.ClampStuckThreshold(raw)
 	if adjusted {
 		d.logger.Printf("Reviewer reaper: %s stuck_threshold %v is outside [%v, %v] — using %v",
