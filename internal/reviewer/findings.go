@@ -99,6 +99,17 @@ var validDispositions = map[string]string{
 // (severity-derived) case on payloads from the sanctioned path.
 func (fs *Findings) ReviewEvent() string {
 	if ev, ok := validDispositions[strings.ToLower(strings.TrimSpace(fs.Disposition))]; ok {
+		// Escalation via disposition is always safe; DE-escalation past a high
+		// finding is not. The Reviewer's primary input is the PR diff and commit
+		// messages — attacker-influenced by construction — so an explicit
+		// "approve" that contradicts the pass's own high-severity findings is
+		// exactly the shape a prompt injection would take. Ignore it and fall
+		// through to severity derivation, which returns REQUEST_CHANGES.
+		// ParseFindings rejects this combination outright at the contract
+		// boundary; this is the backstop for Findings built in code.
+		if ev == "APPROVE" && fs.hasHighFinding() {
+			return "REQUEST_CHANGES"
+		}
 		return ev
 	}
 	hasMedium := false
@@ -147,7 +158,35 @@ func ParseFindings(data []byte) (*Findings, error) {
 			return nil, err
 		}
 	}
+	// Reject an explicit approve that contradicts the payload's own high-severity
+	// findings. The override exists so a pass can ESCALATE past the severity
+	// tally (a blocking objection it cannot anchor to a line); de-escalating past
+	// a high finding has no legitimate use and is the exact shape a prompt
+	// injection in the reviewed diff would take. Fail loudly here rather than
+	// silently downgrading, so a genuine mistake is visible to the agent.
+	if fs.Disposition == "approve" && fs.hasHighFinding() {
+		return nil, fmt.Errorf("findings.disposition=approve contradicts %d high-priority finding(s): "+
+			"the override may escalate a verdict, never de-escalate past a high finding "+
+			"(drop the disposition to get the severity-derived REQUEST_CHANGES)", fs.countHigh())
+	}
 	return &fs, nil
+}
+
+// hasHighFinding reports whether any finding is high priority. Compares
+// case-insensitively on trimmed input so it is correct for Findings built in
+// code, which have not been through normalizeFinding.
+func (fs *Findings) hasHighFinding() bool {
+	return fs.countHigh() > 0
+}
+
+func (fs *Findings) countHigh() int {
+	n := 0
+	for _, f := range fs.Findings {
+		if strings.EqualFold(strings.TrimSpace(f.Priority), "high") {
+			n++
+		}
+	}
+	return n
 }
 
 // normalizeFinding validates and canonicalizes a single finding in place: path,

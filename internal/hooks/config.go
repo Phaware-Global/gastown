@@ -507,6 +507,27 @@ func DefaultOverrides() map[string]*HooksConfig {
 					}},
 				},
 				{
+					// The GraphQL review-submission mutations. `gh api graphql`
+					// matches neither the `gh pr review` pattern nor the REST
+					// `*gh api*pulls*reviews*` one (which needs those path
+					// segments), so without this a session could submit an
+					// approving review under the machine-user token with no
+					// output-contract validation. The sibling resolveReviewThread
+					// matcher already establishes that this role reaches GraphQL.
+					Matcher: "Bash(*addPullRequestReview*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviewer posts reviews only via `gt reviewer post`. The GraphQL addPullRequestReview/submitPullRequestReview mutations bypass the tested output contract.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*submitPullRequestReview*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviewer posts reviews only via `gt reviewer post`. The GraphQL addPullRequestReview/submitPullRequestReview mutations bypass the tested output contract.' && exit 2",
+					}},
+				},
+				{
 					Matcher: "Bash(*gh pr merge*)",
 					Hooks: []Hook{{
 						Type:    "command",
