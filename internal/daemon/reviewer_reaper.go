@@ -145,15 +145,30 @@ const (
 //	          prompt` and `gt reviewer consolidate`, with no command in between
 //	          to refresh the timestamp. The threshold must accommodate a full
 //	          subagent pass, which is why it defaults to 45m.
-func decideReviewerAction(hb *reviewer.Heartbeat, stuck time.Duration) (reviewerAction, string) {
+func decideReviewerAction(hb *reviewer.Heartbeat, stuck, sessionAge time.Duration) (reviewerAction, string) {
 	if hb == nil || stuck <= 0 {
 		return reviewerActionNone, ""
 	}
-	age, elapsed := hb.Age(), hb.Elapsed()
+	age := hb.Age()
 
-	// Elapsed is zero when StartedAt is unknown. Zero must never trip the cap,
-	// so this guard is load-bearing rather than defensive: without it, every
-	// heartbeat missing a StartedAt would be killed on sight.
+	// The runtime the cap acts on is the LONGER of the session's own age and the
+	// heartbeat's self-reported elapsed.
+	//
+	// hb.Elapsed() alone is forgeable by the process the cap exists to constrain:
+	// the heartbeat is a file the reviewer writes, so deleting or corrupting it
+	// yields a fresh clock on the next touch, and a looping reviewer evades the
+	// cap forever. The tmux session's creation time is owned by tmux, not by the
+	// reviewer, so it cannot be reset from inside the session — taking the max
+	// makes the cap unforgeable while still honoring a heartbeat that (via a
+	// dispatcher seed predating the session) reports MORE elapsed time.
+	elapsed := hb.Elapsed()
+	if sessionAge > elapsed {
+		elapsed = sessionAge
+	}
+
+	// Elapsed is zero only when both signals are unknown. Zero must never trip
+	// the cap, so this guard is load-bearing rather than defensive: without it,
+	// every heartbeat missing a StartedAt would be killed on sight.
 	if capDur := stuck * reviewerAbsoluteCapMultiple; elapsed > 0 && elapsed >= capDur {
 		return reviewerActionKill, fmt.Sprintf("exceeded absolute runtime cap (%s of %s)",
 			elapsed.Round(time.Second), capDur)
@@ -172,7 +187,7 @@ func decideReviewerAction(hb *reviewer.Heartbeat, stuck time.Duration) (reviewer
 // enforceReviewerProgress applies decideReviewerAction to a live reviewer.
 func (d *Daemon) enforceReviewerProgress(rigName, sessionName, rigPath string, hb *reviewer.Heartbeat) {
 	stuck := d.reviewerStuckThreshold(rigPath)
-	action, reason := decideReviewerAction(hb, stuck)
+	action, reason := decideReviewerAction(hb, stuck, d.reviewerSessionAge(sessionName))
 	switch action {
 	case reviewerActionKill:
 		d.killStuckReviewer(rigName, sessionName, rigPath, hb, reason)
@@ -180,6 +195,18 @@ func (d *Daemon) enforceReviewerProgress(rigName, sessionName, rigPath string, h
 		d.nudgeStuckReviewer(rigName, sessionName, hb, hb.Age(), stuck)
 	case reviewerActionNone:
 	}
+}
+
+// reviewerSessionAge returns how long the reviewer's tmux session has been up,
+// or 0 when it cannot be determined. Unlike the heartbeat, this clock is owned
+// by tmux rather than by the reviewed process, so it cannot be reset from inside
+// the session. 0 means "unknown" and never contributes to a kill decision.
+func (d *Daemon) reviewerSessionAge(sessionName string) time.Duration {
+	created, err := d.tmux.GetSessionCreatedTime(sessionName)
+	if err != nil || created.IsZero() {
+		return 0
+	}
+	return time.Since(created)
 }
 
 // nudgeStuckReviewer pokes a reviewer that has stalled but is not yet past the
