@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/steveyegge/gastown/internal/config"
@@ -96,21 +97,62 @@ func (m *Manager) Stop() error {
 }
 
 // EnsureRunning starts the Reviewer session if it isn't already running,
-// reporting whether it actually started one.
+// recycles one that is running but wedged, and reports whether it ended up
+// starting a session either way.
 //
-// Returns nil (no error) when a healthy session already exists, so callers can
-// dispatch idempotently: a second review request for the same rig simply
-// queues in the running session's mailbox. extraEnv is applied only when a new
-// session is started (an already-running session keeps its original env).
+// The plain "already healthy → return nil" path is not sufficient on its own.
+// IsRunning is CheckSessionHealth with no inactivity check, so it reports
+// "healthy" for any session whose tmux and agent process are both alive —
+// including one that has stopped draining its mailbox entirely. Dispatching
+// into such a session mails a review request nobody will ever read: the
+// refinery times out at 30m, escalates, and the wedged session survives to
+// swallow the next round too. Recycling here converts that silent black hole
+// into a fresh session that actually picks the work up.
+//
+// The wedge threshold is the same one the daemon's reaper kills on, resolved
+// through the shared StuckThreshold, so the two decisions cannot drift.
 //
 // started is not cosmetic. Telemetry decisions hinge on it: a heartbeat left by
 // a previous, now-dead review describes nothing that is running once a NEW
 // session is spawned, and a caller that deferred its own dispatch record to
 // preserve an "in-flight" review needs to know that review no longer exists.
+//
+// extraEnv is applied only when a session is started (an already-running,
+// non-wedged session keeps its original env).
 func (m *Manager) EnsureRunning(agentOverride string, extraEnv map[string]string) (bool, error) {
-	if running, _ := m.IsRunning(); running {
+	running, _ := m.IsRunning()
+	if !running {
+		return true, m.Start(agentOverride, extraEnv)
+	}
+
+	townRoot := filepath.Dir(m.rig.Path)
+	hb := ReadHeartbeat(m.rig.Path)
+	if !IsWedged(hb, StuckThreshold(townRoot, m.rig.Path)) {
+		// Genuinely working (or idle between reviews): queue in its mailbox.
 		return false, nil
 	}
+
+	_, _ = fmt.Fprintf(m.output,
+		"⚠ Reviewer session is wedged (no progress for %s at phase %q, PR #%d) — recycling "+
+			"rather than queueing into a mailbox it is not draining.\n",
+		hb.Age().Round(time.Second), hb.Phase, hb.PR)
+
+	sessionID := m.SessionName()
+	if err := tmux.NewTmux().KillSessionWithProcesses(sessionID); err != nil {
+		return false, fmt.Errorf("recycling wedged reviewer session %s: %w", sessionID, err)
+	}
+	// Clear the abandoned review's heartbeat so the fresh session starts from a
+	// clean record; the dispatcher re-seeds it for the new request.
+	if err := ClearHeartbeat(m.rig.Path); err != nil {
+		_, _ = fmt.Fprintf(m.output, "⚠ could not clear wedged reviewer heartbeat: %v\n", err)
+	}
+	_ = events.LogFeed(events.TypeKill, m.rig.Name+"/"+constants.RoleReviewer,
+		map[string]interface{}{
+			"rig": m.rig.Name, "role": constants.RoleReviewer,
+			"reason": "recycled_wedged_on_dispatch",
+			"phase":  SafePhase(hb.Phase), "pr": SafePR(hb.PR),
+			"stalled": hb.Age().Round(time.Second).String(),
+		})
 	return true, m.Start(agentOverride, extraEnv)
 }
 
