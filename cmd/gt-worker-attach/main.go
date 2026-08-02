@@ -156,7 +156,7 @@ func run(address, session, token, workerName string, argv []string) (int, error)
 	// unusable, and tmux resizes panes constantly.
 	if tty {
 		winch := make(chan os.Signal, 1)
-		signal.Notify(winch, syscall.SIGWINCH)
+		notifyWindowChange(winch)
 		defer signal.Stop(winch)
 		go func() {
 			for range winch {
