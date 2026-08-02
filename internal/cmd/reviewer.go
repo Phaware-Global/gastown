@@ -58,21 +58,28 @@ the PR head, reviews from configurable perspectives, and posts its findings as a
 single GitHub review with inline comment threads under a dedicated machine-user
 identity.
 
-The Reviewer never approves and never merges — human approval is the merge gate.
-Posting goes exclusively through ` + "`gt reviewer post`" + `; raw ` + "`gh pr review`" + ` is
+The Reviewer submits a real verdict — APPROVE, REQUEST_CHANGES, or COMMENT —
+derived from finding severity or set explicitly in the findings payload. Its
+approval is informational: the Reviewer is deliberately not the rig's
+pr_approver, so human approval remains the merge gate, and the Reviewer never
+merges. Posting goes exclusively through ` + "`gt reviewer post`" + `; raw ` + "`gh pr review`" + ` is
 tap-guard-blocked.`,
 }
 
 var reviewerPostCmd = &cobra.Command{
 	Use:   "post",
-	Short: "Post a review (one COMMENT review with inline finding threads)",
+	Short: "Post a review (one review with inline finding threads)",
 	Long: `Post a code review to a PR from a findings JSON payload.
 
 This is the ONLY sanctioned review-posting path. It submits a single review
-(event=COMMENT) anchored to the reviewed head SHA, with one inline thread per
-finding. Each finding body carries a neutral shields.io priority badge and a
-[perspective] tag so the refinery's review-fix loop and human reviewers can act
-on it.
+anchored to the reviewed head SHA, with one inline thread per finding. Each
+finding body carries a neutral shields.io priority badge and a [perspective] tag
+so the refinery's review-fix loop and human reviewers can act on it.
+
+The review event is derived from finding severity — any high finding is
+REQUEST_CHANGES, any medium is COMMENT, and a clean or nits-only pass is
+APPROVE — unless the payload sets "disposition" ("approve", "request_changes",
+or "comment") explicitly.
 
 The findings file (--findings, or "-" for stdin) is a JSON object:
 

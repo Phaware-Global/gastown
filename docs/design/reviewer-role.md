@@ -63,8 +63,10 @@ observability. Rejected.
    conformance, not just the diff text.
 5. Findings flow into the existing review-fix loop: inline threads with
    priority markers that `parseThreadPriority` already understands.
-6. The Reviewer **never approves and never merges**. Human approval remains
-   the merge gate, exactly as in the current design.
+6. The Reviewer **submits a real verdict** (APPROVE, REQUEST_CHANGES, or
+   COMMENT) but **never merges**. Its approval is informational — the Reviewer
+   is deliberately not the rig's `pr_approver`, so human approval remains the
+   merge gate, exactly as in the current design.
 7. Crew-authored PRs keep automated review coverage after Augment is
    removed: crew requests the same Reviewer through a standalone (no-MR)
    request mode, and the Reviewer is the **only** agent in the town that
@@ -512,10 +514,11 @@ direct-merge assumption. Convergence:
 Add a `reviewer` entry to `DefaultOverrides()`
 (`internal/hooks/config.go:201`) blocking, at the Bash-tool layer:
 
-- `gh pr merge` and **all of `gh pr review`** (including `--comment`):
-  posting goes exclusively through `gt reviewer post`, which emits COMMENT
-  reviews only — approve/request-changes are states the merge gates don't
-  model, and a raw-`gh` path would bypass the tested output contract
+- `gh pr merge` and **all of `gh pr review`** (including `--approve` and
+  `--comment`): this is a channel restriction, not a limit on the verdict.
+  Posting goes exclusively through `gt reviewer post`, which submits the
+  review event (APPROVE / REQUEST_CHANGES / COMMENT) derived from finding
+  severity; a raw-`gh` path would bypass the tested output contract
 - the GraphQL `resolveReviewThread` mutation (thread resolution belongs to
   the authoring polecat — actor-boundary rule in
   [refinery-pr-workflow.md](refinery-pr-workflow.md))
@@ -616,7 +619,7 @@ end-to-end on a test PR.
      (model on `gt dog done`).
 2. `gt reviewer post --pr <n> --findings <json>` (**decided** — see Resolved
    Decisions #1): wraps the GitHub review API for atomic submission (one
-   COMMENT review, all inline threads). Owns the output contract — neutral
+   review, all inline threads). Owns the output contract — neutral
    priority badges, perspective tags — in tested Go; tap-guard blocks all
    raw `gh pr review` so this is the only posting path.
 3. Widen `parseThreadPriority` (`internal/refinery/threads.go:121`) to

@@ -278,7 +278,8 @@ func outputReviewerContext(ctx RoleContext) {
 	fmt.Println("## Responsibilities")
 	fmt.Println("- Review the PR named in your hooked/mailed review request")
 	fmt.Println("- Post findings as a single GitHub review — you are the only agent that posts PR reviews")
-	fmt.Println("- Never approve, never merge, never push (the worktree is checkout-only)")
+	fmt.Println("- Your posted review carries a real verdict (APPROVE / REQUEST_CHANGES / COMMENT); it is informational, not the merge gate")
+	fmt.Println("- Never merge, never push (the worktree is checkout-only)")
 	fmt.Println()
 	fmt.Println("## Review Protocol (run the commands; do not improvise)")
 	fmt.Println("1. `" + cli.Name() + " reviewer checkout <pr> --sha <sha>` - check out the requested SHA")
@@ -442,7 +443,8 @@ func outputCommandQuickReference(ctx RoleContext) {
 		fmt.Printf("| Post your review | `%s reviewer post --pr <n> --findings findings.json` | ~~gh pr review~~ (blocked), ~~gt mail send .../refinery~~ (verdict never reaches GitHub) |\n", c)
 		fmt.Printf("| Check out the PR | `%s reviewer checkout <n> --sha <sha>` | ~~git checkout~~ (skips the SHA-scoped contract) |\n", c)
 		fmt.Printf("| Finish the review | `%s reviewer done` | ~~idle at the prompt~~ (leaves the session hanging) |\n", c)
-		fmt.Println("| Approve / merge | (never) | the reviewer never approves, merges, or pushes |")
+		fmt.Printf("| Approve the PR | `%s reviewer post` (verdict follows finding severity) | ~~gh pr review --approve~~ (blocked; your approval is informational, not the merge gate) |\n", c)
+		fmt.Println("| Merge / push | (never) | the reviewer never merges or pushes |")
 
 	case RoleDeacon:
 		fmt.Println("| Want to... | Correct command | Common mistake |")
