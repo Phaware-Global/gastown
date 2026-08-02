@@ -14,7 +14,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"flag"
 	"log/slog"
 	"net"
@@ -40,10 +39,70 @@ func main() {
 		maxSessions = flag.Int("max-sessions", 1, "concurrent session cap")
 		execModes   = flag.String("exec-modes", "native", "comma-separated supported exec modes (native,container)")
 		docker      = flag.Bool("docker", false, "advertise a usable docker daemon")
+
+		// Enrollment mode (§3.1): `gt-worker-client enroll -listen ... -join-token ... -tls-dir ...`
+		joinToken     = flag.String("join-token", "", "enrollment: single-use token (visible in ps; prefer -join-token-file or GT_JOIN_TOKEN)")
+		joinTokenFile = flag.String("join-token-file", "", "enrollment: file containing the single-use join token")
+		tlsDir        = flag.String("tls-dir", "", "enrollment: directory to write machine cert/key + CAs into")
 	)
+	// Accept the `enroll` subcommand in EITHER position — `gt-worker-client
+	// enroll -listen ...` reads naturally, but Go's flag package stops parsing
+	// at the first non-flag argument, so strip a leading subcommand before
+	// parsing rather than silently ignoring every flag after it.
+	enrollMode := false
+	if len(os.Args) > 1 && os.Args[1] == "enroll" {
+		enrollMode = true
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+	}
 	flag.Parse()
+	if flag.Arg(0) == "enroll" {
+		enrollMode = true
+	}
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	// Enrollment mode (§3.1 step 1): a one-shot plaintext listener that
+	// exchanges a machine CSR for a signed cert, then exits. No proxy URL is
+	// needed — no sessions run in this mode.
+	if enrollMode {
+		// Prefer a file or env var: argv is world-readable via ps//proc.
+		tok := *joinToken
+		if *joinTokenFile != "" {
+			data, err := os.ReadFile(*joinTokenFile)
+			if err != nil {
+				log.Error("reading join token file", "err", err)
+				os.Exit(2)
+			}
+			tok = strings.TrimSpace(string(data))
+		} else if tok == "" {
+			tok = os.Getenv("GT_JOIN_TOKEN")
+		} else {
+			log.Warn("-join-token is visible to other local users via ps; prefer -join-token-file or GT_JOIN_TOKEN")
+		}
+		if *listen == "" || tok == "" || *tlsDir == "" {
+			log.Error("enroll requires -listen, -tls-dir, and a join token (-join-token-file, GT_JOIN_TOKEN, or -join-token)")
+			os.Exit(2)
+		}
+		addr := strings.TrimPrefix(*listen, "tcp://")
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			log.Error("enrollment listen", "err", err)
+			os.Exit(1)
+		}
+		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer cancel()
+		log.Info("waiting for enrollment from the orchestrator", "addr", addr, "tlsDir", *tlsDir)
+		if err := workerclient.Enroll(ctx, ln, workerclient.EnrollConfig{
+			TLSDir:    *tlsDir,
+			JoinToken: tok,
+			Log:       log,
+		}); err != nil {
+			log.Error("enrollment failed", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if *listen == "" || *proxyURL == "" {
 		log.Error("missing required flags: -listen and -proxy-url are required")
 		os.Exit(2)
@@ -87,19 +146,12 @@ func main() {
 			log.Error("a TCP listener requires -tls-cert, -tls-key, and -tls-client-ca")
 			os.Exit(2)
 		}
-		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+		// ServerTLSConfig pins the orchestrator CN on the client cert, so a
+		// worker-CA-signed cert belonging to some OTHER machine cannot drive
+		// this worker (§3).
+		tlsCfg, err := workerclient.ServerTLSConfig(*tlsCert, *tlsKey, *tlsClientCA)
 		if err != nil {
-			log.Error("load machine cert", "err", err)
-			os.Exit(1)
-		}
-		caPEM, err := os.ReadFile(*tlsClientCA)
-		if err != nil {
-			log.Error("read client CA", "err", err)
-			os.Exit(1)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(caPEM) {
-			log.Error("client CA file has no valid certificates", "file", *tlsClientCA)
+			log.Error("worker TLS config", "err", err)
 			os.Exit(1)
 		}
 		tcp, err := net.Listen("tcp", *listen)
@@ -107,12 +159,7 @@ func main() {
 			log.Error("listen", "err", err)
 			os.Exit(1)
 		}
-		ln = tls.NewListener(tcp, &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			ClientAuth:   tls.RequireAndVerifyClientCert,
-			ClientCAs:    pool,
-			MinVersion:   tls.VersionTLS13,
-		})
+		ln = tls.NewListener(tcp, tlsCfg)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
