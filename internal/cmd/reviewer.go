@@ -59,11 +59,17 @@ single GitHub review with inline comment threads under a dedicated machine-user
 identity.
 
 The Reviewer submits a real verdict — APPROVE, REQUEST_CHANGES, or COMMENT —
-derived from finding severity or set explicitly in the findings payload. Its
-approval is informational: the Reviewer is deliberately not the rig's
-pr_approver, so human approval remains the merge gate, and the Reviewer never
-merges. Posting goes exclusively through ` + "`gt reviewer post`" + `; raw ` + "`gh pr review`" + ` is
-tap-guard-blocked.`,
+derived from finding severity, or escalated by a perspective's disposition.
+
+Scope of that approval: it does NOT satisfy the named pr_approver gate, because
+config validation requires pr_approver and pr_reviewer to be different
+identities. It DOES count toward the pr_required_approvals count gate and toward
+any branch-protection approval rule, exactly like a human's — GitHub's approval
+count has no notion of a bot. Size those gates accordingly, or the Reviewer's
+APPROVE fills a slot a human was meant to fill.
+
+The Reviewer never merges. Posting goes exclusively through ` + "`gt reviewer post`" + `;
+raw ` + "`gh pr review`" + ` is tap-guard-blocked.`,
 }
 
 var reviewerPostCmd = &cobra.Command{
@@ -77,15 +83,22 @@ finding body carries a neutral shields.io priority badge and a [perspective] tag
 so the refinery's review-fix loop and human reviewers can act on it.
 
 The review event is derived from finding severity — any high finding is
-REQUEST_CHANGES, any medium is COMMENT, and a clean or nits-only pass is
-APPROVE — unless the payload sets "disposition" ("approve", "request_changes",
-or "comment") explicitly.
+REQUEST_CHANGES, any medium is COMMENT, and a clean or nits-only pass is APPROVE.
+
+A perspective that must block on something it cannot anchor to a diff line
+(an architectural objection) sets "disposition" in its PerspectiveResult;
+'gt reviewer consolidate' folds the most blocking one into the payload below.
+The override is ESCALATION-ONLY: "request_changes" and "comment" are accepted,
+"approve" is rejected, and an "approve" that contradicts a high-priority finding
+is refused outright — a de-escalation past a high finding has no legitimate use
+and is the shape a prompt injection in the reviewed diff would take.
 
 The findings file (--findings, or "-" for stdin) is a JSON object:
 
   {
     "summary": "per-perspective verdicts + counts",
     "reviewed_sha": "<optional; --sha overrides>",
+    "disposition": "<optional; request_changes|comment — escalation only>",
     "findings": [
       {"path": "internal/foo.go", "line": 42, "priority": "high",
        "perspective": "adversarial", "title": "nil deref",
@@ -315,7 +328,11 @@ func runReviewerPost(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("submitting review for PR #%d: %w", reviewerPostPR, err)
 	}
 
-	fmt.Printf("Posted review on PR #%d: %d inline finding(s)", reviewerPostPR, len(in.Comments))
+	// Report the submitted event. The verdict is derived, not stated by the
+	// caller, and submitting it is irreversible — so a reviewer that mis-tagged
+	// a finding's priority could otherwise post an APPROVE and read a success
+	// line byte-identical to the REQUEST_CHANGES one.
+	fmt.Printf("Posted %s review on PR #%d: %d inline finding(s)", in.Event, reviewerPostPR, len(in.Comments))
 	if sha != "" {
 		fmt.Printf(" at %s", shortSHA(sha))
 	}
