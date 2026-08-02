@@ -46,6 +46,8 @@ var (
 
 	reviewerConsolidateSHA string
 	reviewerConsolidateOut string
+
+	reviewerDonePR int
 )
 
 var reviewerCmd = &cobra.Command{
@@ -246,6 +248,10 @@ func init() {
 	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateOut, "out", "",
 		"write the consolidated findings JSON here (default: stdout)")
 
+	reviewerDoneCmd.Flags().IntVar(&reviewerDonePR, "pr", 0,
+		"the PR just reviewed; clears the heartbeat only if it records that review "+
+			"(omit to clear unconditionally)")
+
 	reviewerCmd.AddCommand(reviewerPostCmd)
 	reviewerCmd.AddCommand(reviewerCheckoutCmd)
 	reviewerCmd.AddCommand(reviewerPerspectivesCmd)
@@ -294,11 +300,22 @@ func reviewerRigPathForHeartbeat() string {
 	if err != nil {
 		return ""
 	}
-	rigName := detectRole(cwd, townRoot).Rig
-	if rigName == "" {
+	// Require the REVIEWER role, not merely a resolvable rig. detectRole assigns
+	// ctx.Rig for ANY path under <town>/<rig>/, before and independently of the
+	// role branches — so a polecat, crew member, refinery, or witness would all
+	// resolve a rig path here. Two of the four callers (`prompt`, `consolidate`)
+	// have no worktree guard of their own, and `consolidate` is a pure JSON
+	// transform advertised outside the reviewer session, so a non-reviewer
+	// running it is realistic rather than adversarial-only. Without this check
+	// any agent in the rig could plant a heartbeat for a reviewer that does not
+	// exist (an unclearable phantom stall, since the only reachable
+	// ClearHeartbeat is `gt reviewer done`), or keep a genuinely wedged reviewer
+	// looking alive indefinitely — the reaper keys on this file.
+	info := detectRole(cwd, townRoot)
+	if info.Role != RoleReviewer || info.Rig == "" {
 		return ""
 	}
-	_, r, err := getRig(rigName)
+	_, r, err := getRig(info.Rig)
 	if err != nil || r == nil {
 		return ""
 	}
@@ -791,16 +808,33 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 	// reviewer that is requested but never starts (or dies during startup) still
 	// leaves a record, so "dispatched into the void" is observable to the reaper
 	// rather than being indistinguishable from "no review was ever requested".
-	if err := reviewer.TouchHeartbeat(r.Path, reviewer.PhaseDispatched, spec.PR, spec.Round, spec.HeadSHA); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: seeding reviewer heartbeat: %v\n", err)
-	}
-
 	router := mail.NewRouterWithTownRoot(townRoot, townRoot)
 	defer router.WaitPendingNotifications()
 	msg := mail.NewMessage(from, to, spec.Subject(), spec.Body(priorThreads))
 	msg.Type = mail.TypeTask
 	if err := router.Send(msg); err != nil {
 		return fmt.Errorf("sending review request to %s: %w", to, err)
+	}
+
+	// Seed the heartbeat only AFTER the mail is on its way. Seeding first left a
+	// permanent `dispatched` record when the send failed — the dispatcher already
+	// returned a hard error the caller can retry, so the reaper's later
+	// "dispatched but never started" escalation would be duplicate noise about a
+	// failure that was never silent, and the retry would inherit the failed
+	// attempt's clock.
+	//
+	// The seed still precedes EnsureRunning below, which is the case it exists
+	// for: a request that is mailed but whose session never starts.
+	switch err := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA); {
+	case err == nil:
+	case errors.Is(err, reviewer.ErrReviewInFlight):
+		// Queued behind an unfinished review. Mail is the work queue and the
+		// request is safely in it; the in-flight review's telemetry is what
+		// supervisors need, so it is deliberately left intact.
+		fmt.Fprintf(os.Stderr,
+			"note: reviewer is mid-review; PR #%d is queued and will be recorded when it starts\n", spec.PR)
+	default:
+		fmt.Fprintf(os.Stderr, "warning: seeding reviewer heartbeat: %v\n", err)
 	}
 
 	// Start the reviewer session if not already running, injecting the token as
@@ -835,8 +869,18 @@ func runReviewerDone(cmd *cobra.Command, args []string) error {
 
 	// Clear the heartbeat BEFORE killing the session: a heartbeat that outlived
 	// its reviewer would make an idle rig look permanently stalled to the reaper.
-	if err := reviewer.ClearHeartbeat(r.Path); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: clearing reviewer heartbeat: %v\n", err)
+	//
+	// Conditional on the PR just finished. An unconditional clear destroys a
+	// QUEUED review's dispatch record: finish PR 100, remove the file, and PR 200
+	// — dispatched while 100 was running — becomes invisible, which is exactly
+	// the "dispatched into the void" blind spot the dispatcher seed exists to
+	// close. Without --pr we cannot tell, and fall back to clearing.
+	cleared, cerr := reviewer.ClearHeartbeatFor(r.Path, reviewerDonePR)
+	switch {
+	case cerr != nil:
+		fmt.Fprintf(os.Stderr, "warning: clearing reviewer heartbeat: %v\n", cerr)
+	case !cleared:
+		fmt.Printf("Left the heartbeat in place — it records a different review than PR #%d.\n", reviewerDonePR)
 	}
 	// Completion is a feed event so a review's end is as visible as its spawn —
 	// previously only the spawn was logged, which made a reviewer that started

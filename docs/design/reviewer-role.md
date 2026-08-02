@@ -221,8 +221,16 @@ Two fields carry the load, and they answer different questions:
   `prompt` is the normal shape of a review in flight, not by itself evidence of
   a wedge.
 - **`started_at`** — when the review was dispatched, preserved across every
-  phase transition. `elapsed` measures total review wall time and is the basis
-  for an absolute cap that a still-touching-but-looping reviewer cannot evade.
+  phase transition. `elapsed` measures total review wall time. Only the
+  dispatcher sets it, so an in-session phase touch cannot reseed the clock, and
+  it is reset whenever the `(pr, round, sha)` identity changes — round 2 of the
+  same PR is a new review with its own budget, not a continuation of round 1.
+
+  `elapsed` is a **self-reported lower bound, not a tamper-proof one.** A
+  process that deletes or corrupts the heartbeat gets a fresh clock on its next
+  touch, and nothing in this file can prevent that. A supervisor needing an
+  unforgeable runtime bound must anchor on something the reviewed process does
+  not own — the tmux session's start time — and treat `elapsed` as a floor.
 
 The heartbeat is seeded by `gt reviewer request` on the **dispatcher's** side,
 before the session exists, so a reviewer that is requested but never starts is
