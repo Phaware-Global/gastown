@@ -3,9 +3,12 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,6 +31,9 @@ if [ -f "` + failFile + `" ] && grep -q "^$1$" "` + failFile + `"; then
   echo "forced failure for $1" >&2
   exit 1
 fi
+case "$*" in
+  *"command -v gt"*) echo "/opt/gt/gt"; echo "/opt/gt/bd"; exit 0 ;;
+esac
 if [ "$1" = "run" ]; then echo "deadbeefcafe"; fi
 exit 0
 `
@@ -116,7 +122,7 @@ func TestWorkEnvPrepare_RunsIdleContainerWithContract(t *testing.T) {
 	assert.NotZero(t, fi.Mode()&0111, "idle entrypoint must be executable")
 
 	calls := dockerCalls(t, logFile)
-	require.Len(t, calls, 3, "rm -f (stale), run, preflight exec: %v", calls)
+	require.Len(t, calls, 4, "rm -f (stale), run, /bin/sh probe, gt/bd verification: %v", calls)
 	assert.Equal(t, "rm -f gt-work-MyRig-furiosa", calls[0])
 
 	run := calls[1]
@@ -166,9 +172,9 @@ func TestWorkEnvPrepare_AgentPreflight(t *testing.T) {
 
 	t.Run("agent on PATH passes and is probed quoted", func(t *testing.T) {
 		require.NoError(t, w.Prepare(context.Background()))
-		calls := dockerCalls(t, logFile)
-		last := calls[len(calls)-1]
-		assert.Contains(t, last, "command -v 'claude'")
+		// The gt/bd verification now runs after this probe, so look for it
+		// among the calls rather than assuming it is last.
+		assert.Contains(t, strings.Join(dockerCalls(t, logFile), "\n"), "command -v 'claude'")
 	})
 
 	t.Run("preflight failure stops before agent launch and removes the container", func(t *testing.T) {
@@ -274,4 +280,313 @@ func TestRemoveWorkContainer(t *testing.T) {
 	require.Len(t, calls, 1)
 	assert.Equal(t, "rm -f gt-work-MyRig-furiosa", calls[0])
 	assert.Equal(t, "gt-work-MyRig-furiosa", WorkContainerName("MyRig", "furiosa"))
+}
+
+// TestWorkEnvPrepare_InjectsGtAndBd pins how a containerized agent reaches the
+// control plane: gt-proxy-client from the CONTAINER's platform, mounted at
+// /opt/gt as `gt` and `bd`, then linked onto PATH inside the container. Without
+// it the agent runs but cannot call `gt done`, take mail, or update a bead —
+// a session that looks alive and accomplishes nothing.
+func TestWorkEnvPrepare_InjectsGtAndBd(t *testing.T) {
+	docker, logFile, _ := fakeDocker(t)
+	cfg := testWorkEnvConfig(t, docker)
+
+	// A stand-in for the Linux gt-proxy-client the orchestrator pushed.
+	client := filepath.Join(t.TempDir(), "gt-proxy-client")
+	require.NoError(t, os.WriteFile(client, []byte("linux-proxy-client"), 0755))
+	cfg.ProxyClient = client
+
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+	require.NoError(t, w.Prepare(context.Background()))
+
+	// The binary is copied (not linked) into the mounted dir, since the
+	// container cannot follow a host symlink out of the mount.
+	got, err := os.ReadFile(filepath.Join(cfg.GTDir, "gt-proxy-client"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("linux-proxy-client"), got)
+	fi, err := os.Stat(filepath.Join(cfg.GTDir, "gt-proxy-client"))
+	require.NoError(t, err)
+	assert.NotZero(t, fi.Mode()&0111, "the container must be able to execute it")
+
+	for _, name := range []string{"gt", "bd"} {
+		target, err := os.Readlink(filepath.Join(cfg.GTDir, name))
+		require.NoError(t, err, "%s must be a symlink", name)
+		// Relative: the link is resolved INSIDE the container, where the host
+		// path does not exist.
+		assert.Equal(t, "gt-proxy-client", target)
+	}
+
+	calls := dockerCalls(t, logFile)
+	joined := strings.Join(calls, "\n")
+	// The relay a container reaches is the bridge gateway, so relay mode has to
+	// be stated — gt-proxy-client refuses plaintext to a non-loopback host.
+	assert.Contains(t, joined, "-e GT_PROXY_RELAY=1")
+	// Linked as root: the image's user may not own /usr/local/bin, and
+	// /opt/gt is read-only so it cannot be done from inside the mount.
+	assert.Contains(t, joined, "exec -u 0 gt-work-MyRig-furiosa /bin/sh -c mkdir -p /usr/local/bin && ln -sf /opt/gt/gt /usr/local/bin/gt")
+	assert.Contains(t, joined, AgentPathPrefix+"command -v gt && command -v bd",
+		"the probe must use the PATH the agent will run with, or it proves nothing")
+}
+
+// TestWorkEnvPrepare_NoInjectionWithoutAClient pins that a worker which has not
+// yet been pushed container binaries still brings the container up — the next
+// provision pushes them, and failing here would strand the session instead.
+func TestWorkEnvPrepare_NoInjectionWithoutAClient(t *testing.T) {
+	docker, logFile, _ := fakeDocker(t)
+	cfg := testWorkEnvConfig(t, docker) // ProxyClient empty
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+	require.NoError(t, w.Prepare(context.Background()))
+
+	_, err = os.Stat(filepath.Join(cfg.GTDir, "gt"))
+	assert.True(t, os.IsNotExist(err))
+	joined := strings.Join(dockerCalls(t, logFile), "\n")
+	assert.NotContains(t, joined, "/usr/local/bin/gt", "nothing to link")
+	// But verification still runs: "can this agent reach the control plane" is
+	// the question, and an image that ships its own gt/bd answers it.
+	assert.Contains(t, joined, "command -v gt")
+}
+
+// fakeDockerMatching is a docker stand-in that fails only the invocations whose
+// joined argv matches pattern — finer than fakeDocker's per-subcommand switch,
+// which cannot express "the link exec fails but the verify exec succeeds".
+func fakeDockerMatching(t *testing.T, pattern string) (docker, logFile string) {
+	t.Helper()
+	dir := t.TempDir()
+	docker = filepath.Join(dir, "docker")
+	logFile = filepath.Join(dir, "docker.log")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logFile + `"
+case "$*" in
+  *"` + pattern + `"*) echo "forced failure" >&2; exit 1 ;;
+  *"command -v gt"*) echo "/opt/gt/gt"; echo "/opt/gt/bd"; exit 0 ;;
+esac
+if [ "$1" = "run" ]; then echo "deadbeefcafe"; fi
+exit 0
+`
+	require.NoError(t, os.WriteFile(docker, []byte(script), 0755))
+	return docker, logFile
+}
+
+// withProxyClient adds an injectable client to a config.
+func withProxyClient(t *testing.T, cfg WorkEnvConfig) WorkEnvConfig {
+	t.Helper()
+	client := filepath.Join(t.TempDir(), "gt-proxy-client")
+	require.NoError(t, os.WriteFile(client, []byte("client"), 0755))
+	cfg.ProxyClient = client
+	return cfg
+}
+
+// TestWorkEnvPrepare_CreatesUsrLocalBin pins the minimal-image case: busybox has
+// no /usr/local/bin, and `ln -sf` into a missing directory fails. Before
+// injection existed such an image came up degraded; it must not now fail to come
+// up at all for want of one mkdir.
+func TestWorkEnvPrepare_CreatesUsrLocalBin(t *testing.T) {
+	docker, logFile := fakeDockerMatching(t, "NOTHING-FAILS")
+	cfg := withProxyClient(t, testWorkEnvConfig(t, docker))
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+	require.NoError(t, w.Prepare(context.Background()))
+
+	assert.Contains(t, strings.Join(dockerCalls(t, logFile), "\n"), "mkdir -p /usr/local/bin && ln -sf")
+}
+
+// TestWorkEnvPrepare_LinkFailureSurvivesWhenGtResolves pins that VERIFICATION is
+// the gate, not the linking: an image that already ships gt/bd (or has a
+// read-only /usr) must still come up, because the agent can reach the control
+// plane regardless.
+func TestWorkEnvPrepare_LinkFailureSurvivesWhenGtResolves(t *testing.T) {
+	docker, logFile := fakeDockerMatching(t, "ln -sf")
+	cfg := withProxyClient(t, testWorkEnvConfig(t, docker))
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+
+	require.NoError(t, w.Prepare(context.Background()),
+		"a failed link must not fail the session when gt is on PATH anyway")
+	assert.Contains(t, strings.Join(dockerCalls(t, logFile), "\n"), "command -v gt")
+}
+
+// TestWorkEnvPrepare_RefusesAShadowedInjection pins that an image cannot
+// substitute its OWN control-plane CLI for the injected one. `command -v gt`
+// merely proves something named gt is on PATH; the image is a registry tag —
+// someone else's supply chain — and that binary would run with the session's
+// env, worktree and (when mounted) docker socket.
+func TestWorkEnvPrepare_RefusesAShadowedInjection(t *testing.T) {
+	dir := t.TempDir()
+	docker := filepath.Join(dir, "docker")
+	logFile := filepath.Join(dir, "docker.log")
+	// Resolves gt to an image-supplied path rather than the injected one.
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logFile + `"
+case "$*" in
+  *"command -v gt"*) echo "/usr/bin/gt"; echo "/opt/gt/bd"; exit 0 ;;
+esac
+if [ "$1" = "run" ]; then echo "deadbeefcafe"; fi
+exit 0
+`
+	require.NoError(t, os.WriteFile(docker, []byte(script), 0755))
+
+	cfg := withProxyClient(t, testWorkEnvConfig(t, docker))
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+
+	err = w.Prepare(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "/usr/bin/gt")
+	assert.Contains(t, err.Error(), "image-supplied")
+}
+
+// TestWorkEnvPrepare_RefusesAShadowedBd pins the half the first version of this
+// check threw away: `bd` is the same injected binary under another name — the
+// beads CLI — and only `gt` was ever compared, so an image shipping its own `bd`
+// went completely unexamined.
+func TestWorkEnvPrepare_RefusesAShadowedBd(t *testing.T) {
+	dir := t.TempDir()
+	docker := filepath.Join(dir, "docker")
+	logFile := filepath.Join(dir, "docker.log")
+	// gt resolves to ours; bd does not.
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logFile + `"
+case "$*" in
+  *"command -v gt"*) echo "/opt/gt/gt"; echo "/usr/bin/bd"; exit 0 ;;
+esac
+if [ "$1" = "run" ]; then echo "deadbeefcafe"; fi
+exit 0
+`
+	require.NoError(t, os.WriteFile(docker, []byte(script), 0755))
+
+	cfg := withProxyClient(t, testWorkEnvConfig(t, docker))
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+
+	err = w.Prepare(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "bd")
+	assert.Contains(t, err.Error(), "/usr/bin/bd")
+}
+
+// TestWorkEnvPrepare_LinkFailureStillRequiresTheMountedClient pins the hole the
+// earlier guard had: it accepted /usr/local/bin/gt precisely when the link had
+// failed, i.e. when that path could NOT be ours. With the PATH prefix the
+// expectation is the mount either way.
+func TestWorkEnvPrepare_LinkFailureStillRequiresTheMountedClient(t *testing.T) {
+	dir := t.TempDir()
+	docker := filepath.Join(dir, "docker")
+	logFile := filepath.Join(dir, "docker.log")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logFile + `"
+case "$*" in
+  *"ln -sf"*) echo "forced failure" >&2; exit 1 ;;
+  *"command -v gt"*) echo "/usr/local/bin/gt"; echo "/usr/local/bin/bd"; exit 0 ;;
+esac
+if [ "$1" = "run" ]; then echo "deadbeefcafe"; fi
+exit 0
+`
+	require.NoError(t, os.WriteFile(docker, []byte(script), 0755))
+
+	cfg := withProxyClient(t, testWorkEnvConfig(t, docker))
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+
+	err = w.Prepare(context.Background())
+	require.Error(t, err, "a link that failed cannot have produced /usr/local/bin/gt")
+	assert.Contains(t, err.Error(), "/usr/local/bin/gt")
+}
+
+// TestWorkEnvPrepare_AcceptsAnImageThatShipsItsOwn pins the supported config the
+// hard error would otherwise have killed: no injectable client, but the image
+// carries gt/bd. Verification passes, so the session comes up.
+func TestWorkEnvPrepare_AcceptsAnImageThatShipsItsOwn(t *testing.T) {
+	docker, _ := fakeDockerMatching(t, "NOTHING-FAILS")
+	cfg := testWorkEnvConfig(t, docker) // no ProxyClient
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+	require.NoError(t, w.Prepare(context.Background()),
+		"an image that supplies its own gt/bd is a supported configuration")
+}
+
+// TestWorkEnvPrepare_FailsWhenGtIsNotOnPath pins the case that must stay fatal:
+// an agent that cannot run `gt` cannot call `gt done`, so the session would look
+// alive and accomplish nothing.
+func TestWorkEnvPrepare_FailsWhenGtIsNotOnPath(t *testing.T) {
+	docker, _ := fakeDockerMatching(t, "command -v gt")
+	cfg := withProxyClient(t, testWorkEnvConfig(t, docker))
+	w, err := NewWorkEnv(cfg)
+	require.NoError(t, err)
+
+	err = w.Prepare(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "control plane")
+}
+
+// TestWorkEnvPrepare_ConcurrentSessionsShareGTDirSafely pins the swap the
+// injection does in a WORKER-SHARED directory: two sessions preparing at once
+// must not collide on the gt/bd links (remove-then-symlink raced into EEXIST and
+// failed a session), and the swap must never leave a live container's `gt`
+// missing.
+func TestWorkEnvPrepare_ConcurrentSessionsShareGTDirSafely(t *testing.T) {
+	docker, _ := fakeDockerMatching(t, "NOTHING-FAILS")
+	shared := t.TempDir()
+
+	var wg sync.WaitGroup
+	errs := make([]error, 6)
+	for i := range errs {
+		cfg := withProxyClient(t, testWorkEnvConfig(t, docker))
+		cfg.GTDir = shared
+		cfg.Polecat = fmt.Sprintf("polecat%d", i)
+		cfg.Session = fmt.Sprintf("gt-MyRig-polecat%d", i)
+		w, err := NewWorkEnv(cfg)
+		require.NoError(t, err)
+		wg.Add(1)
+		go func(i int, w *WorkEnv) {
+			defer wg.Done()
+			errs[i] = w.Prepare(context.Background())
+		}(i, w)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		assert.NoError(t, err, "session %d must not lose a race on the shared gt/bd links", i)
+	}
+	target, err := os.Readlink(filepath.Join(shared, "gt"))
+	require.NoError(t, err)
+	assert.Equal(t, "gt-proxy-client", target)
+}
+
+// TestAgentPathPrefix_AppliesToEveryCommand runs the composed probe in a REAL
+// shell, which is the test whose absence let a shell bug ship: every fake docker
+// in this file echoes canned output, so `PATH=x cmd1 && cmd2` — where POSIX
+// scopes the assignment to cmd1 alone — looked correct by string containment
+// while resolving `bd` against the image's PATH and refusing every injected
+// container session.
+func TestAgentPathPrefix_AppliesToEveryCommand(t *testing.T) {
+	mount := t.TempDir() // stands in for the read-only /opt/gt
+	image := t.TempDir() // stands in for a directory the image ships
+	for _, name := range []string{"gt", "bd"} {
+		require.NoError(t, os.WriteFile(filepath.Join(mount, name), []byte("#!/bin/sh\n"), 0755))
+	}
+	// The image also ships its own bd, earlier on PATH than anything else.
+	require.NoError(t, os.WriteFile(filepath.Join(image, "bd"), []byte("#!/bin/sh\n"), 0755))
+
+	// The production prefix, with the mount path substituted for the fixture.
+	prefix := strings.Replace(AgentPathPrefix, "/opt/gt", mount, 1)
+
+	for _, sh := range []string{"/bin/sh", "/bin/bash", "/bin/zsh"} {
+		if _, err := os.Stat(sh); err != nil {
+			continue
+		}
+		t.Run(filepath.Base(sh), func(t *testing.T) {
+			cmd := exec.Command(sh, "-c", prefix+"command -v gt && command -v bd")
+			cmd.Env = []string{"PATH=" + image + ":/usr/bin:/bin"}
+			out, err := cmd.CombinedOutput()
+			require.NoError(t, err, string(out))
+
+			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+			require.Len(t, lines, 2, "both names must resolve: %q", string(out))
+			assert.Equal(t, filepath.Join(mount, "gt"), strings.TrimSpace(lines[0]))
+			assert.Equal(t, filepath.Join(mount, "bd"), strings.TrimSpace(lines[1]),
+				"the prefix must apply to the SECOND command too, not just the first")
+		})
+	}
 }

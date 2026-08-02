@@ -1,13 +1,18 @@
 package workerclient
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/sockproto"
 )
@@ -36,6 +41,11 @@ var pushableBinaries = map[string]bool{
 	BinWorkerClient: true,
 }
 
+// containerProbeRetry is how long a FAILED docker probe is remembered. Long
+// enough that a dead daemon is not re-probed on every connection, short enough
+// that a restarted one is picked up without restarting the worker.
+var containerProbeRetry = time.Minute
+
 // maxPushBytes bounds a single pushed binary. gt is ~130MB; this leaves room
 // while refusing a stream that would fill the worker's disk.
 const maxPushBytes = 512 << 20
@@ -45,6 +55,16 @@ const maxPushBytes = 512 << 20
 // orchestrator must never need write access to a system path.
 func (s *Service) binDir() string { return filepath.Join(s.cfg.StateDir, "bin") }
 
+// containerBinDir holds binaries for a DIFFERENT platform than the worker's
+// own: the Linux ones injected into a work container. They are never installed
+// as the worker's binaries — a macOS worker cannot run them.
+func (s *Service) containerBinDir(platform string) string {
+	return filepath.Join(s.cfg.StateDir, "container-bin", platform)
+}
+
+// The platform tag's shape check is sockproto.ValidPlatformTag — shared with
+// the orchestrator, which validates the values it receives the same way.
+
 // stagingDir holds a partially-received or deferred binary.
 func (s *Service) stagingDir() string { return filepath.Join(s.cfg.StateDir, "staging") }
 
@@ -52,10 +72,11 @@ func (s *Service) stagingDir() string { return filepath.Join(s.cfg.StateDir, "st
 // per-connection so two orchestrators (or a retry after a drop) cannot
 // interleave chunks into one file.
 type pushState struct {
-	name string
-	f    *os.File
-	sum  []byte // running sha256 over what was written
-	n    int64
+	name     string
+	platform string // "" = the worker's own
+	f        *os.File
+	sum      []byte // running sha256 over what was written
+	n        int64
 }
 
 func (p *pushState) abort() {
@@ -79,6 +100,10 @@ func (s *Service) handlePushBinary(c *connState, m *sockproto.Message) {
 		_ = c.send(&sockproto.Message{Type: sockproto.TypeError, ID: m.ID, Code: code, Msg: msg})
 	}
 
+	if m.Platform != "" && !sockproto.ValidPlatformTag(m.Platform) {
+		fail("bad_request", "platform %q is not a <goos>-<goarch> tag", m.Platform)
+		return
+	}
 	if !pushableBinaries[m.Name] {
 		fail("bad_request", "%q is not a pushable binary (allowed: %s)", m.Name, strings.Join([]string{BinProxyClient, BinWorkerClient}, ", "))
 		return
@@ -87,8 +112,9 @@ func (s *Service) handlePushBinary(c *connState, m *sockproto.Message) {
 	// Starting a different file mid-stream is a protocol error, not a reset:
 	// silently discarding a half-written binary would hide a bug that could
 	// otherwise install a spliced file.
-	if c.push != nil && c.push.name != m.Name {
-		fail("proto", "push for %q interrupted by %q on the same connection", c.push.name, m.Name)
+	if c.push != nil && (c.push.name != m.Name || c.push.platform != m.Platform) {
+		fail("proto", "push for %q (%s) interrupted by %q (%s) on the same connection",
+			c.push.name, c.push.platform, m.Name, m.Platform)
 		return
 	}
 
@@ -102,7 +128,7 @@ func (s *Service) handlePushBinary(c *connState, m *sockproto.Message) {
 			fail("io", "creating staging file: %v", err)
 			return
 		}
-		c.push = &pushState{name: m.Name, f: f, sum: nil}
+		c.push = &pushState{name: m.Name, platform: m.Platform, f: f, sum: nil}
 		c.pushHash = sha256.New()
 	}
 
@@ -154,11 +180,11 @@ func (s *Service) handlePushBinary(c *connState, m *sockproto.Message) {
 		fail("io", "chmod staged binary: %v", err)
 		return
 	}
-	name := c.push.name
+	name, platform := c.push.name, c.push.platform
 	c.push = nil
 	c.pushHash = nil
 
-	applied, err := s.installPushed(name, staged)
+	applied, err := s.installPushed(name, platform, staged)
 	if err != nil {
 		_ = os.Remove(staged)
 		s.log.Warn("installing pushed binary", "name", name, "err", err)
@@ -166,12 +192,26 @@ func (s *Service) handlePushBinary(c *connState, m *sockproto.Message) {
 		return
 	}
 	s.log.Info("pushed binary accepted", "name", name, "bytes", "-", "applied", applied)
-	_ = c.send(&sockproto.Message{Type: sockproto.TypePushBinaryAck, ID: m.ID, Name: name, Applied: applied})
+	_ = c.send(&sockproto.Message{Type: sockproto.TypePushBinaryAck, ID: m.ID,
+		Name: name, Platform: platform, Applied: applied})
 }
 
 // installPushed moves a verified binary into place, or stages it when applying
 // now would kill work. Returns "installed" or "staged".
-func (s *Service) installPushed(name, staged string) (string, error) {
+func (s *Service) installPushed(name, platform, staged string) (string, error) {
+	// A tagged platform is for the work container, not for us: install it into
+	// the injection tree and never near the binaries this worker executes.
+	if platform != "" {
+		dir := s.containerBinDir(platform)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return "", fmt.Errorf("creating container bin dir: %w", err)
+		}
+		if err := os.Rename(staged, filepath.Join(dir, name)); err != nil {
+			return "", fmt.Errorf("installing %s for %s: %w", name, platform, err)
+		}
+		return "installed", nil
+	}
+
 	if err := os.MkdirAll(s.binDir(), 0755); err != nil {
 		return "", fmt.Errorf("creating bin dir: %w", err)
 	}
@@ -252,4 +292,161 @@ func (s *Service) ApplyPendingWorkerClient() {
 		s.restarting = false
 		s.mu.Unlock()
 	}
+}
+
+// containerPlatform reports "<goos>-<goarch>" of this worker's docker daemon,
+// or "" when there is none. It is what the work container runs — a macOS worker
+// drives Linux containers, so this is routinely NOT the worker's own platform,
+// and injecting the worker's own `gt` into a container would produce a binary
+// the container cannot execute.
+//
+// Cached: the answer cannot change without the daemon restarting, and the
+// handshake is on the hot path for every provision.
+func (s *Service) containerPlatform() string {
+	if !s.cfg.Docker {
+		return ""
+	}
+	s.mu.Lock()
+	cached, probedAt := s.containerPlatformCache, s.containerPlatformProbedAt
+	s.mu.Unlock()
+	if cached != "" {
+		return cached // a daemon cannot change platform without restarting
+	}
+	// A failed probe is cached, but only BRIEFLY. This runs inline on the
+	// handshake read loop, so a hung daemon must not cost its full timeout on
+	// every connection — but caching the failure forever meant one transient
+	// outage (a daemon restart, or a `docker version` that merely exceeded the
+	// timeout under load) disabled container mode for the worker's entire
+	// process lifetime, and since a container session now hard-fails without an
+	// injectable client, that is an outage needing a manual restart.
+	if !probedAt.IsZero() && time.Since(probedAt) < containerProbeRetry {
+		return ""
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "version",
+		"--format", "{{.Server.Os}}-{{.Server.Arch}}").Output()
+	if err != nil {
+		s.log.Warn("could not determine the container platform; container-mode binaries will not be pushed", "err", err)
+		s.mu.Lock()
+		s.containerPlatformProbedAt = time.Now()
+		s.mu.Unlock()
+		return ""
+	}
+	got := strings.TrimSpace(string(out))
+	if !sockproto.ValidPlatformTag(got) {
+		s.log.Warn("docker reported an unexpected platform", "platform", got)
+		s.mu.Lock()
+		s.containerPlatformProbedAt = time.Now()
+		s.mu.Unlock()
+		return ""
+	}
+	s.mu.Lock()
+	s.containerPlatformCache = got
+	s.containerPlatformProbedAt = time.Now()
+	s.mu.Unlock()
+	return got
+}
+
+// containerInject resolves what a work container needs mounted: the dir bound
+// at /opt/gt, and the CONTAINER-platform gt-proxy-client to inject as gt/bd.
+//
+// The operator's -gt-dir still wins when set — it predates this and may hold
+// bits we know nothing about. Otherwise the worker uses its own state dir, and
+// the proxy client comes from what the orchestrator pushed for the container's
+// platform (§4.1). A worker that has not been pushed those yet simply injects
+// nothing: the session still comes up, and the next provision (which pushes
+// before opening) fixes it.
+func (s *Service) containerInject() (gtDir, proxyClient string, err error) {
+	gtDir = s.cfg.GTDir
+	if gtDir == "" {
+		gtDir = filepath.Join(s.cfg.StateDir, "gtdir")
+	}
+	if err := os.MkdirAll(gtDir, 0755); err != nil {
+		return "", "", fmt.Errorf("creating gt-dir: %w", err)
+	}
+
+	platform := s.containerPlatform()
+	if platform == "" {
+		return gtDir, "", nil
+	}
+
+	// A LINUX worker running local Linux docker — the canonical
+	// container-execution host — has a container platform equal to its own, and
+	// the orchestrator does not send a redundant tagged copy for it. Its own
+	// gt-proxy-client runs unmodified inside that container, so use it.
+	//
+	// (The earlier version of this looked only in the container tree, which
+	// made injection silently no-op on exactly that mainstream deployment: the
+	// agent came up with no gt/bd at all.)
+	if client, err := s.injectableClient(platform); err == nil {
+		return gtDir, client, nil
+	}
+	candidates := []string{filepath.Join(s.containerBinDir(platform), BinProxyClient),
+		filepath.Join(s.binDir(), BinProxyClient)}
+	// Nothing to inject. That is NOT automatically fatal: an image can ship its
+	// own gt/bd, and an operator's explicit -gt-dir may already hold them —
+	// both supported configurations. The container's own preflight verifies
+	// `gt`/`bd` resolve there and fails the session if they do not, which is the
+	// authority on "can this agent reach the control plane". Failing here
+	// instead would kill sessions that work.
+	//
+	// (An earlier version warned and carried on claiming the next provision
+	// would fix it — false cross-platform, where an up-to-date worker was never
+	// sent container binaries at all. The fix for that is the push now being
+	// gated on what the worker HOLDS, not on versions.)
+	s.log.Warn("no gt-proxy-client to inject; the container must supply its own gt/bd or the session will fail preflight",
+		"platform", platform, "looked_in", candidates,
+		"hint", "run `gt worker push-binaries <rig>` on the orchestrator, or `make dist` there if it has no "+platform+" artifacts")
+	return gtDir, "", nil
+}
+
+// containerClientDigest is the sha256 of the client the worker would inject for
+// platform, or "" when it has none. Takes the platform rather than resolving it
+// again: the handshake has it one line earlier, and re-resolving means a second
+// blocking docker probe.
+func (s *Service) containerClientDigest(platform string) string {
+	if platform == "" {
+		return ""
+	}
+	path, err := s.injectableClient(platform)
+	if err != nil {
+		return ""
+	}
+	sum, err := fileDigest(path)
+	if err != nil {
+		s.log.Warn("could not digest the injectable client", "path", path, "err", err)
+		return ""
+	}
+	return sum
+}
+
+// injectableClient resolves the client to inject for a container platform.
+func (s *Service) injectableClient(platform string) (string, error) {
+	candidates := []string{filepath.Join(s.containerBinDir(platform), BinProxyClient)}
+	// A same-platform container runs the worker's own binary unmodified.
+	if platform == sockproto.PlatformTag(runtime.GOOS, runtime.GOARCH) {
+		candidates = append(candidates, filepath.Join(s.binDir(), BinProxyClient))
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c, nil
+		}
+	}
+	return "", fmt.Errorf("no gt-proxy-client for container platform %s (looked in %v)", platform, candidates)
+}
+
+// fileDigest is the sha256 of a file, hex-encoded.
+func fileDigest(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

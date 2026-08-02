@@ -57,11 +57,14 @@ func TestPushBinaries_SkipsDevBuilds(t *testing.T) {
 	}
 }
 
-// TestPushBinaries_RefusesForeignPlatform pins the guard that matters most:
-// this orchestrator has binaries for its OWN platform only, and installing one
-// a worker cannot execute would replace a working `gt` with garbage — strictly
-// worse than being stale.
-func TestPushBinaries_RefusesForeignPlatform(t *testing.T) {
+// TestPushBinaries_ForeignPlatformNeedsItsOwnArtifacts pins what replaced the
+// blanket refusal: a worker on another platform is served from the artifact
+// tree, and when that platform is missing the error says which one to build
+// rather than shipping a binary the worker cannot execute.
+func TestPushBinaries_ForeignPlatformNeedsItsOwnArtifacts(t *testing.T) {
+	root := t.TempDir()
+	defer SetBinarySourceForTest(root)()
+
 	w := newFakeWorker(t)
 	w.gtVersion = "1.0.0"
 	w.os, w.arch = "windows", "386"
@@ -75,8 +78,54 @@ func TestPushBinaries_RefusesForeignPlatform(t *testing.T) {
 	err = b.pushBinaries(context.Background(), c)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "windows/386")
-	assert.Contains(t, err.Error(), runtime.GOOS+"/"+runtime.GOARCH)
-	assert.Empty(t, w.pushed(), "nothing may be sent to a platform we cannot build for")
+	assert.Contains(t, err.Error(), "make dist")
+	assert.Empty(t, w.pushed(), "nothing may be sent until that platform is built")
+
+	// Build that platform's artifacts and it goes through.
+	dir := filepath.Join(root, PlatformDir("windows", "386"))
+	require.NoError(t, os.MkdirAll(dir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "gt-proxy-client"), []byte("win-payload"), 0755))
+
+	c2, err := b.dial(context.Background())
+	require.NoError(t, err)
+	defer c2.close()
+	require.NoError(t, b.pushBinaries(context.Background(), c2))
+	got := w.pushed()
+	require.Contains(t, got, "gt-proxy-client")
+	assert.Equal(t, []byte("win-payload"), got["gt-proxy-client"].data)
+}
+
+// TestPushBinaries_AlsoSendsContainerPlatform pins the case that makes this
+// necessary on a single machine: the work container is a LINUX container, so a
+// macOS worker needs Linux gt/bd for it — tagged, so the worker stores them for
+// injection rather than installing binaries it cannot run.
+func TestPushBinaries_AlsoSendsContainerPlatform(t *testing.T) {
+	root := t.TempDir()
+	native := filepath.Join(root, PlatformDir(runtime.GOOS, runtime.GOARCH))
+	require.NoError(t, os.MkdirAll(native, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(native, "gt-proxy-client"), []byte("native"), 0755))
+	linux := filepath.Join(root, PlatformDir("linux", "arm64"))
+	require.NoError(t, os.MkdirAll(linux, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(linux, "gt-proxy-client"), []byte("linux"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(linux, "gt-worker-client"), []byte("linux-worker"), 0755))
+	defer SetBinarySourceForTest(root)()
+
+	w := newFakeWorker(t)
+	w.gtVersion = "1.0.0"
+	w.containerPlatform = "linux-arm64"
+	b, _ := testBackend(t, w)
+	b.GTVersion = "1.2.3"
+
+	c, err := b.dial(context.Background())
+	require.NoError(t, err)
+	defer c.close()
+	require.NoError(t, b.pushBinaries(context.Background(), c))
+
+	got := w.pushed()
+	assert.Equal(t, []byte("native"), got["gt-proxy-client"].data, "the worker's own binary is untagged")
+	assert.Equal(t, []byte("linux"), got["linux-arm64/gt-proxy-client"].data, "the container's binary is tagged")
+	assert.NotContains(t, got, "linux-arm64/gt-worker-client",
+		"a container never runs the worker service, so it must not be sent one")
 }
 
 // TestPushOne_StreamsAndVerifies pins the transfer itself: chunked, with a
@@ -98,7 +147,7 @@ func TestPushOne_StreamsAndVerifies(t *testing.T) {
 	require.NoError(t, err)
 	defer c.close()
 
-	applied, err := pushOne(context.Background(), c, "gt-proxy-client", path)
+	applied, err := pushOne(context.Background(), c, "gt-proxy-client", path, "")
 	require.NoError(t, err)
 	assert.Equal(t, "installed", applied)
 
@@ -124,7 +173,7 @@ func TestPushOne_ReportsWorkerRefusal(t *testing.T) {
 	require.NoError(t, err)
 	defer c.close()
 
-	_, err = pushOne(context.Background(), c, "gt-proxy-client", path)
+	_, err = pushOne(context.Background(), c, "gt-proxy-client", path, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "integrity")
 }
@@ -141,9 +190,11 @@ func TestPushBinariesTo_ForcesRegardlessOfVersion(t *testing.T) {
 	b, _ := testBackend(t, w)
 	b.GTVersion = "1.2.3"
 
-	src := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(src, "gt-proxy-client"), []byte("payload"), 0755))
-	defer SetBinarySourceForTest(src)()
+	root := t.TempDir()
+	native := filepath.Join(root, PlatformDir(runtime.GOOS, runtime.GOARCH))
+	require.NoError(t, os.MkdirAll(native, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(native, "gt-proxy-client"), []byte("payload"), 0755))
+	defer SetBinarySourceForTest(root)()
 
 	results, err := b.PushBinariesTo(context.Background())
 	require.NoError(t, err)
@@ -217,4 +268,214 @@ func TestProvision_DoesNotRetryARealRejection(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Equal(t, 1, w.sessionOpenAttempts(), "a real rejection must not be retried")
+}
+
+// TestPushBinaries_RefusesAMaliciousWorkerPlatform pins that the ORCHESTRATOR
+// validates what the worker claims before joining it to a local path. The
+// receiver already checks the tag we send it; checking on one side only is how
+// a traversal gets in — here an enrolled-but-compromised worker could walk this
+// machine's filesystem for a file named gt-proxy-client and have it streamed
+// back to it.
+func TestPushBinaries_RefusesAMaliciousWorkerPlatform(t *testing.T) {
+	root := t.TempDir()
+	defer SetBinarySourceForTest(root)()
+
+	t.Run("os/arch", func(t *testing.T) {
+		w := newFakeWorker(t)
+		w.gtVersion = "1.0.0"
+		w.os, w.arch = "../../../../tmp/evil", "x"
+		b, _ := testBackend(t, w)
+		b.GTVersion = "1.2.3"
+
+		c, err := b.dial(context.Background())
+		require.NoError(t, err)
+		defer c.close()
+
+		err = b.pushBinaries(context.Background(), c)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid platform")
+		assert.Empty(t, w.pushed())
+	})
+
+	t.Run("container platform", func(t *testing.T) {
+		w := newFakeWorker(t)
+		w.gtVersion = "1.0.0"
+		w.containerPlatform = "../../../etc-x"
+		b, _ := testBackend(t, w)
+		b.GTVersion = "1.2.3"
+
+		// The worker's own platform is fine, so it gets that far; the container
+		// tag is what must be refused.
+		native := filepath.Join(root, PlatformDir(runtime.GOOS, runtime.GOARCH))
+		require.NoError(t, os.MkdirAll(native, 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(native, "gt-proxy-client"), []byte("ok"), 0755))
+
+		c, err := b.dial(context.Background())
+		require.NoError(t, err)
+		defer c.close()
+
+		err = b.pushBinaries(context.Background(), c)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "container platform")
+	})
+}
+
+// TestPushBinaries_PushesContainerBinariesEvenWhenVersionsMatch pins the
+// fail-open path this closes: a worker can be exactly up to date and still have
+// never received container binaries (fresh enrollment, wiped state dir). Gating
+// that push on version equality left every container session running an agent
+// with no gt/bd at all — indefinitely, behind a warning.
+func TestPushBinaries_PushesContainerBinariesEvenWhenVersionsMatch(t *testing.T) {
+	// The container platform must be one the WORKER is not, or this degenerates
+	// into the same-platform case (which the next test covers) — on a
+	// linux/amd64 CI runner a hardcoded "linux-amd64" did exactly that.
+	foreign := "linux-amd64"
+	if foreign == PlatformDir(runtime.GOOS, runtime.GOARCH) {
+		foreign = "linux-arm64"
+	}
+	root := t.TempDir()
+	native := filepath.Join(root, PlatformDir(runtime.GOOS, runtime.GOARCH))
+	require.NoError(t, os.MkdirAll(native, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(native, "gt-proxy-client"), []byte("native"), 0755))
+	fdir := filepath.Join(root, foreign)
+	require.NoError(t, os.MkdirAll(fdir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(fdir, "gt-proxy-client"), []byte("linux"), 0755))
+	defer SetBinarySourceForTest(root)()
+
+	w := newFakeWorker(t)
+	w.gtVersion = "1.2.3"
+	w.containerPlatform = foreign
+	w.containerClient = "" // up to date, but never sent container binaries
+	b, _ := testBackend(t, w)
+	b.GTVersion = "1.2.3"
+
+	c, err := b.dial(context.Background())
+	require.NoError(t, err)
+	defer c.close()
+	require.NoError(t, b.pushBinaries(context.Background(), c))
+
+	got := w.pushed()
+	assert.Contains(t, got, foreign+"/gt-proxy-client", "the container binaries must be sent")
+	assert.NotContains(t, got, "gt-proxy-client", "the worker's own are current, so they must not be resent")
+}
+
+// TestPushBinaries_SamePlatformContainerGetsTheOwnBinaryPush pins the canonical
+// deployment: a Linux worker with local Linux docker. Its container platform
+// equals its own, so no tagged copy is sent — which means the UNTAGGED push must
+// happen even though versions match, or the worker is detected as needing a
+// client and then sent nothing, forever, and every container session fails.
+func TestPushBinaries_SamePlatformContainerGetsTheOwnBinaryPush(t *testing.T) {
+	root := t.TempDir()
+	native := filepath.Join(root, PlatformDir(runtime.GOOS, runtime.GOARCH))
+	require.NoError(t, os.MkdirAll(native, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(native, "gt-proxy-client"), []byte("native"), 0755))
+	defer SetBinarySourceForTest(root)()
+
+	w := newFakeWorker(t)
+	w.gtVersion = "1.2.3"
+	w.containerPlatform = PlatformDir(runtime.GOOS, runtime.GOARCH)
+	w.containerClient = "" // has none
+	b, _ := testBackend(t, w)
+	b.GTVersion = "1.2.3" // versions MATCH
+
+	c, err := b.dial(context.Background())
+	require.NoError(t, err)
+	defer c.close()
+	require.NoError(t, b.pushBinaries(context.Background(), c))
+
+	assert.Contains(t, w.pushed(), "gt-proxy-client",
+		"a same-platform container needs the worker's own client, so it must be pushed")
+}
+
+// TestPushBinaries_SkipsAnIdenticalContainerClient pins the digest gate: an
+// identical binary must not be re-streamed on every provision, which is a
+// 9MB transfer inside the provision critical path.
+func TestPushBinaries_SkipsAnIdenticalContainerClient(t *testing.T) {
+	foreign := "linux-amd64"
+	if foreign == PlatformDir(runtime.GOOS, runtime.GOARCH) {
+		foreign = "linux-arm64"
+	}
+	payload := []byte("linux-client")
+	sum := sha256.Sum256(payload)
+
+	root := t.TempDir()
+	fdir := filepath.Join(root, foreign)
+	require.NoError(t, os.MkdirAll(fdir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(fdir, "gt-proxy-client"), payload, 0755))
+	defer SetBinarySourceForTest(root)()
+
+	w := newFakeWorker(t)
+	w.gtVersion = "1.2.3"
+	w.containerPlatform = foreign
+	w.containerClient = hex.EncodeToString(sum[:]) // already holds exactly this
+	b, _ := testBackend(t, w)
+	b.GTVersion = "1.2.3"
+
+	c, err := b.dial(context.Background())
+	require.NoError(t, err)
+	defer c.close()
+	require.NoError(t, b.pushBinaries(context.Background(), c))
+	assert.Empty(t, w.pushed(), "an identical client must not be re-sent")
+}
+
+// TestPushBinaries_SkipsEverythingWhenNothingIsMissing pins the other side: a
+// current worker that already holds its container binaries costs nothing on the
+// provision path.
+func TestPushBinaries_SkipsEverythingWhenNothingIsMissing(t *testing.T) {
+	// The artifact must EXIST and its digest must match what the worker reports,
+	// or this passes for the wrong reason (an unresolvable artifact also skips).
+	foreign := "linux-amd64"
+	if foreign == PlatformDir(runtime.GOOS, runtime.GOARCH) {
+		foreign = "linux-arm64"
+	}
+	payload := []byte("current-client")
+	sum := sha256.Sum256(payload)
+	root := t.TempDir()
+	fdir := filepath.Join(root, foreign)
+	require.NoError(t, os.MkdirAll(fdir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(fdir, "gt-proxy-client"), payload, 0755))
+	defer SetBinarySourceForTest(root)()
+
+	w := newFakeWorker(t)
+	w.gtVersion = "1.2.3"
+	w.containerPlatform = foreign
+	w.containerClient = hex.EncodeToString(sum[:])
+	b, _ := testBackend(t, w)
+	b.GTVersion = "1.2.3"
+
+	c, err := b.dial(context.Background())
+	require.NoError(t, err)
+	defer c.close()
+	require.NoError(t, b.pushBinaries(context.Background(), c))
+	assert.Empty(t, w.pushed())
+}
+
+// TestPushBinaries_SamePlatformForcedPushSkipsTheWorkerService pins the scope of
+// the same-platform fix: the container needs a CLI, which must not drag the
+// worker SERVICE along — that stages a restart, and a stale artifact tree would
+// otherwise replace a running worker whose version is identical.
+func TestPushBinaries_SamePlatformForcedPushSkipsTheWorkerService(t *testing.T) {
+	root := t.TempDir()
+	native := filepath.Join(root, PlatformDir(runtime.GOOS, runtime.GOARCH))
+	require.NoError(t, os.MkdirAll(native, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(native, "gt-proxy-client"), []byte("client"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(native, "gt-worker-client"), []byte("service"), 0755))
+	defer SetBinarySourceForTest(root)()
+
+	w := newFakeWorker(t)
+	w.gtVersion = "1.2.3"
+	w.containerPlatform = PlatformDir(runtime.GOOS, runtime.GOARCH)
+	w.containerClient = "" // needs a container client
+	b, _ := testBackend(t, w)
+	b.GTVersion = "1.2.3" // but is otherwise current
+
+	c, err := b.dial(context.Background())
+	require.NoError(t, err)
+	defer c.close()
+	require.NoError(t, b.pushBinaries(context.Background(), c))
+
+	got := w.pushed()
+	assert.Contains(t, got, "gt-proxy-client")
+	assert.NotContains(t, got, "gt-worker-client",
+		"a container's need for a CLI must not restart the worker service")
 }

@@ -160,7 +160,7 @@ nonce); responses echo it. Errors: `{"type":"error","id":…,"code":…,"msg":�
 | Message | Direction | Payload | Purpose |
 |---|---|---|---|
 | `hello` | orch → worker | `proto_version`, `gt_version`, `orchestrator_id` | open/resume a connection |
-| `hello_ack` | worker → orch | `proto_version`, `gt_version`, `worker_id`, `os`, `arch`, `capabilities` (`docker: bool`, `exec_modes: []`), `sessions: [<session summaries>]` | capability + state report; `gt_version` is what the freshness check compares |
+| `hello_ack` | worker → orch | `proto_version`, `gt_version`, `worker_id`, `os`, `arch`, `capabilities` (`docker: bool`, `exec_modes: []`, `container_platform`), `sessions: [<session summaries>]` | capability + state report; `gt_version` is what the freshness check compares, `container_platform` is what its docker daemon runs |
 | `discover` | orch → worker | optional `rig`, `polecat` filters | list sessions by identity (backs `Discover`) |
 | `sessions` | worker → orch | `[ {session, rig, polecat, state, started_at} ]` | reply to `discover` |
 | `push_binaries` | orch → worker | streamed chunks (`name`, `sha256`, base64 `data`, `eof`) | update `gt`/`bd`/proxy-client to match the orchestrator release (core §6.1) |
@@ -188,9 +188,51 @@ installed, writes through a staging file, and installs by rename — a half-writ
   mid-bringup, which is the same event seen from the other side. Nothing upstream
   retries a provision, so without this the refresh would not be invisible: a
   polecat start that happened to race an upgrade would fail once.
-- An **os/arch mismatch is refused**, not attempted: the orchestrator only has
-  binaries for its own platform, and installing one the worker cannot execute is
-  strictly worse than leaving it stale.
+- Binaries are served **per platform** from the tree `make dist` builds
+  (`<root>/<goos>-<goarch>/`), selected by the worker's reported `os`/`arch`.
+  The two pushables are pure Go and cross-compile with `CGO_ENABLED=0`, so a
+  macOS orchestrator can keep a Linux worker current. A platform with no
+  artifacts is **refused**, naming it — installing a binary the worker cannot
+  execute is strictly worse than leaving it stale. A same-platform worker falls
+  back to the orchestrator's own install dir, so the single-platform case works
+  with no extra step.
+- The container's client is pushed by **digest**, not by version: `hello_ack`
+  reports `container_client` (the sha256 of the client the worker would inject,
+  or empty). A worker can be exactly up to date and have never received one
+  (fresh enrollment, a wiped state dir), so version equality is the wrong gate;
+  reporting the digest also stops an identical binary being re-streamed on every
+  provision. When the container platform equals the worker's own, the client IS
+  the worker's own binary, so the untagged push must fire even when versions
+  match — otherwise the canonical Linux-worker deployment is detected as needing
+  one and sent nothing.
+- A container that cannot resolve `gt`/`bd` **fails preflight** — but a missing
+  injectable client is not itself fatal: an image may ship its own, and an
+  operator's explicit `--gt-dir` may already hold them. Verification inside the
+  container is the authority.
+- The injected client wins **by construction**, not by hope: the agent's command
+  line is prefixed with `export PATH=/opt/gt:$PATH;` (expanding the image's own
+  PATH, so the agent runtime stays findable), and preflight probes with the same
+  prefix. It exports rather than using an assignment prefix — `PATH=x cmd1 &&
+  cmd2` applies to `cmd1` alone — and a container exec deliberately does **not**
+  carry the worker host's `PATH`/`HOME`/`TMPDIR`, so both the probe and the agent
+  expand the image's own.
+  Both `gt` and `bd` must resolve inside the read-only mount when a client was
+  injected; anything else stops the session. That catches an image that bakes in
+  its own CLI and would otherwise silently shadow the pushed one. It is **not** a
+  defense against a hostile image — the agent runs inside that image, so an image
+  determined to interpose can — it stops an accident from swapping the
+  control-plane CLI unnoticed.
+- A push may carry a `platform` tag, and then it is **for the work container,
+  not the worker**: on a macOS worker the container is still a Linux container,
+  so its `gt`/`bd` are a different build from the ones the worker runs. Tagged
+  binaries are stored separately and never installed as the worker's own. When
+  the container platform EQUALS the worker's, no tagged copy is sent — the
+  worker's own binary runs unmodified in the container and injection uses it.
+- Platform tags are validated by shape (`<goos>-<goarch>`) on **both** sides —
+  `sockproto.ValidPlatformTag`. Each end joins the other's value to a local
+  path (the worker's reported `os`/`arch` and `container_platform` on the
+  orchestrator, the push tag on the worker), so validating on one side only
+  would leave the other open to a traversal.
 - Either side reporting version `dev` (an unversioned build) opts out, rather
   than pushing on every provision forever.
 - `Provision` pushes best-effort and logs failures — `proto_version`, not

@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,8 +20,14 @@ import (
 	"github.com/steveyegge/gastown/internal/version"
 )
 
-// pushBinary streams payload to the worker as name and returns the final reply.
+// pushBinary streams payload to the worker as name (own platform).
 func pushBinary(t *testing.T, addr, name string, payload []byte, corruptSum bool) *sockproto.Message {
+	t.Helper()
+	return pushBinaryFor(t, addr, name, "", payload, corruptSum)
+}
+
+// pushBinaryFor streams payload tagged for a platform and returns the reply.
+func pushBinaryFor(t *testing.T, addr, name, platform string, payload []byte, corruptSum bool) *sockproto.Message {
 	t.Helper()
 	nc := rawDial(t, addr)
 	codec := sockproto.NewCodec(nc)
@@ -41,12 +49,12 @@ func pushBinary(t *testing.T, addr, name string, payload []byte, corruptSum bool
 			end = len(payload)
 		}
 		require.NoError(t, codec.Send(&sockproto.Message{
-			Type: sockproto.TypePushBinary, Name: name,
+			Type: sockproto.TypePushBinary, Name: name, Platform: platform,
 			Data: base64.StdEncoding.EncodeToString(payload[off:end]),
 		}))
 	}
 	require.NoError(t, codec.Send(&sockproto.Message{
-		Type: sockproto.TypePushBinary, ID: "p1", Name: name, EOF: true, SHA256: digest,
+		Type: sockproto.TypePushBinary, ID: "p1", Name: name, Platform: platform, EOF: true, SHA256: digest,
 	}))
 	resp, err := codec.Recv()
 	require.NoError(t, err)
@@ -293,7 +301,9 @@ var _ = socket.BackendName
 // a real SocketBackend, a real worker service, a version difference — and the
 // binary lands in the worker's own bin dir, where the gt/bd shims point.
 func TestPushBinaries_EndToEnd(t *testing.T) {
-	src := t.TempDir()
+	root := t.TempDir()
+	src := filepath.Join(root, socket.PlatformDir(runtime.GOOS, runtime.GOARCH))
+	require.NoError(t, os.MkdirAll(src, 0755))
 	payload := make([]byte, sockproto.PushChunkBytes+77) // spans chunks
 	for i := range payload {
 		payload[i] = byte(i % 253)
@@ -303,7 +313,7 @@ func TestPushBinaries_EndToEnd(t *testing.T) {
 	// test shipped only the proxy client, so the gt-worker-client path — the one
 	// that used to kill the connection Provision reuses — was never exercised.
 	require.NoError(t, os.WriteFile(filepath.Join(src, "gt-worker-client"), []byte("newer-worker"), 0755))
-	defer socket.SetBinarySourceForTest(src)()
+	defer socket.SetBinarySourceForTest(root)()
 
 	// Both sides need a REAL version: an unversioned "dev" build opts out of
 	// freshness entirely, which is itself the behavior TestPushBinaries_SkipsDevBuilds
@@ -335,13 +345,15 @@ func TestPushBinaries_EndToEnd(t *testing.T) {
 // cannot be refreshed still runs sessions rather than failing a polecat start
 // someone is waiting on.
 func TestPushBinaries_FailureDoesNotBlockProvision(t *testing.T) {
-	// A source dir whose "binary" cannot be read.
-	src := t.TempDir()
+	// An artifact whose file cannot be read.
+	root := t.TempDir()
+	src := filepath.Join(root, socket.PlatformDir(runtime.GOOS, runtime.GOARCH))
+	require.NoError(t, os.MkdirAll(src, 0755))
 	bad := filepath.Join(src, "gt-proxy-client")
 	require.NoError(t, os.WriteFile(bad, []byte("x"), 0755))
 	require.NoError(t, os.Chmod(bad, 0000))
 	t.Cleanup(func() { _ = os.Chmod(bad, 0755) })
-	defer socket.SetBinarySourceForTest(src)()
+	defer socket.SetBinarySourceForTest(root)()
 
 	restore := version.GTVersion
 	version.GTVersion = "1.0.0-worker"
@@ -354,4 +366,188 @@ func TestPushBinaries_FailureDoesNotBlockProvision(t *testing.T) {
 
 	_, err := b.Provision(context.Background(), polecatSpec())
 	require.NoError(t, err, "a failed refresh must not fail the session")
+}
+
+// TestHasContainerBinaries pins what the handshake advertises, since the
+// orchestrator uses it to decide whether to push container binaries to a worker
+// whose version already matches.
+func TestContainerClientDigest(t *testing.T) {
+	proxyURL, _, _ := startProxy(t)
+	_, svc := startService(t, proxyURL, func(c *Config) { c.Docker = true })
+
+	foreign := foreignPlatform()
+	assert.Empty(t, svc.containerClientDigest(foreign), "nothing pushed yet")
+
+	payload := []byte("container-client")
+	require.NoError(t, os.MkdirAll(svc.containerBinDir(foreign), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(svc.containerBinDir(foreign), BinProxyClient), payload, 0755))
+	sum := sha256.Sum256(payload)
+	// The DIGEST, not a bool: it also lets the orchestrator skip re-streaming an
+	// identical binary on every provision.
+	assert.Equal(t, hex.EncodeToString(sum[:]), svc.containerClientDigest(foreign))
+
+	// Same-platform containers run the worker's own binary, so that counts too.
+	native := sockproto.PlatformTag(runtime.GOOS, runtime.GOARCH)
+	assert.Empty(t, svc.containerClientDigest(native), "the worker's own client is not installed yet")
+	require.NoError(t, os.MkdirAll(svc.binDir(), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(svc.binDir(), BinProxyClient), payload, 0755))
+	assert.Equal(t, hex.EncodeToString(sum[:]), svc.containerClientDigest(native))
+}
+
+// TestPush_TaggedPlatformGoesToTheContainerTree pins the separation that makes
+// container support possible: Linux binaries pushed to a macOS worker must NOT
+// land where the worker runs its own — it cannot execute them.
+func TestPush_TaggedPlatformGoesToTheContainerTree(t *testing.T) {
+	proxyURL, _, _ := startProxy(t)
+	addr, svc := startService(t, proxyURL)
+
+	payload := []byte("linux-proxy-client")
+	resp := pushBinaryFor(t, addr, BinProxyClient, "linux-arm64", payload, false)
+	require.Equal(t, sockproto.TypePushBinaryAck, resp.Type, "%s: %s", resp.Code, resp.Msg)
+	assert.Equal(t, "installed", resp.Applied)
+	assert.Equal(t, "linux-arm64", resp.Platform)
+
+	got, err := os.ReadFile(filepath.Join(svc.containerBinDir("linux-arm64"), BinProxyClient))
+	require.NoError(t, err)
+	assert.Equal(t, payload, got)
+
+	_, err = os.Stat(filepath.Join(svc.binDir(), BinProxyClient))
+	assert.True(t, os.IsNotExist(err), "a foreign-platform binary must never become the worker's own")
+}
+
+// TestPush_RefusesBogusPlatformTag pins the second path-joined wire value: the
+// platform tag is validated by shape, exactly like the binary name.
+func TestPush_RefusesBogusPlatformTag(t *testing.T) {
+	proxyURL, _, _ := startProxy(t)
+	addr, svc := startService(t, proxyURL)
+
+	for _, p := range []string{"../../etc", "linux-arm64/../../..", "LINUX-ARM64", "linux_arm64", "linux-"} {
+		resp := pushBinaryFor(t, addr, BinProxyClient, p, []byte("x"), false)
+		require.Equal(t, sockproto.TypeError, resp.Type, "platform %q must be refused", p)
+		assert.Equal(t, "bad_request", resp.Code)
+	}
+	entries, err := os.ReadDir(filepath.Join(svc.cfg.StateDir, "container-bin"))
+	if err == nil {
+		assert.Empty(t, entries, "no directory may be created from a refused tag")
+	}
+}
+
+// TestContainerInject_SamePlatformUsesTheWorkersOwnClient pins the mainstream
+// container host: a Linux worker running local Linux docker. Its container
+// platform equals its own, so the orchestrator sends no redundant tagged copy —
+// and injection must then use the worker's own gt-proxy-client, which runs
+// unmodified inside that container. Looking only in the container tree made
+// injection silently no-op there, leaving the agent with no gt/bd at all.
+func TestContainerInject_SamePlatformUsesTheWorkersOwnClient(t *testing.T) {
+	proxyURL, _, _ := startProxy(t)
+	_, svc := startService(t, proxyURL, func(c *Config) { c.Docker = true })
+
+	native := sockproto.PlatformTag(runtime.GOOS, runtime.GOARCH)
+	svc.mu.Lock()
+	svc.containerPlatformCache = native // stand in for `docker version`
+	svc.mu.Unlock()
+
+	// Only the worker's OWN binary exists — exactly the same-platform case.
+	require.NoError(t, os.MkdirAll(svc.binDir(), 0755))
+	own := filepath.Join(svc.binDir(), BinProxyClient)
+	require.NoError(t, os.WriteFile(own, []byte("worker-own-client"), 0755))
+
+	_, proxyClient, err := svc.containerInject()
+	require.NoError(t, err)
+	assert.Equal(t, own, proxyClient, "a same-platform container must get the worker's own client")
+}
+
+// foreignPlatform returns a platform tag that is definitely not this host's, so
+// a test means the same thing on every runner (hardcoding "linux-arm64" made
+// the cross-platform case degenerate into the same-platform one on an arm64
+// Linux runner).
+func foreignPlatform() string {
+	if p := "linux-arm64"; p != sockproto.PlatformTag(runtime.GOOS, runtime.GOARCH) {
+		return p
+	}
+	return "linux-amd64"
+}
+
+// TestContainerInject_RefusesTheWorkersOwnClientForAForeignContainer pins the
+// guard the other two tests could not: with only the worker's own (foreign)
+// binary present, injection must REFUSE rather than mount a Mach-O file as a
+// Linux container's `gt`. Deleting the platform check makes this fail.
+func TestContainerInject_RefusesTheWorkersOwnClientForAForeignContainer(t *testing.T) {
+	proxyURL, _, _ := startProxy(t)
+	_, svc := startService(t, proxyURL, func(c *Config) { c.Docker = true })
+
+	svc.mu.Lock()
+	svc.containerPlatformCache = foreignPlatform()
+	svc.mu.Unlock()
+
+	require.NoError(t, os.MkdirAll(svc.binDir(), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(svc.binDir(), BinProxyClient), []byte("own-native"), 0755))
+
+	_, proxyClient, err := svc.containerInject()
+	require.NoError(t, err, "an image may still ship its own gt/bd — the container's preflight decides")
+	assert.Empty(t, proxyClient, "a foreign-platform container must not be given the worker's own binary")
+}
+
+// TestContainerInject_PrefersTheTaggedContainerBinary pins the cross-platform
+// case: when the container runs a different platform, the tagged copy wins and
+// the worker's own (unexecutable there) is never chosen.
+func TestContainerInject_PrefersTheTaggedContainerBinary(t *testing.T) {
+	proxyURL, _, _ := startProxy(t)
+	_, svc := startService(t, proxyURL, func(c *Config) { c.Docker = true })
+
+	foreign := foreignPlatform()
+	svc.mu.Lock()
+	svc.containerPlatformCache = foreign
+	svc.mu.Unlock()
+
+	require.NoError(t, os.MkdirAll(svc.binDir(), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(svc.binDir(), BinProxyClient), []byte("own"), 0755))
+	require.NoError(t, os.MkdirAll(svc.containerBinDir(foreign), 0755))
+	tagged := filepath.Join(svc.containerBinDir(foreign), BinProxyClient)
+	require.NoError(t, os.WriteFile(tagged, []byte("linux"), 0755))
+
+	_, proxyClient, err := svc.containerInject()
+	require.NoError(t, err)
+	assert.Equal(t, tagged, proxyClient)
+}
+
+// TestContainerPlatform_NegativeProbeExpires pins that a transient docker outage
+// is transient. Caching the failure forever meant one hiccup at the wrong moment
+// disabled container mode for the worker's whole process lifetime — and since a
+// container session hard-fails without an injectable client, that is an outage
+// requiring a manual restart.
+func TestContainerPlatform_NegativeProbeExpires(t *testing.T) {
+	prev := containerProbeRetry
+	containerProbeRetry = 50 * time.Millisecond
+	t.Cleanup(func() { containerProbeRetry = prev })
+
+	// A docker stand-in that COUNTS its invocations and fails until a marker
+	// file appears, so the test can pin the cache as well as its expiry.
+	dir := t.TempDir()
+	docker := filepath.Join(dir, "docker")
+	marker := filepath.Join(dir, "up")
+	calls := filepath.Join(dir, "calls")
+	require.NoError(t, os.WriteFile(docker, []byte(
+		"#!/bin/sh\necho x >> "+calls+"\nif [ -f "+marker+" ]; then echo linux-amd64; exit 0; fi\nexit 1\n"), 0755))
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	probeCount := func() int {
+		data, err := os.ReadFile(calls)
+		if err != nil {
+			return 0
+		}
+		return len(strings.Fields(string(data)))
+	}
+
+	proxyURL, _, _ := startProxy(t)
+	_, svc := startService(t, proxyURL, func(c *Config) { c.Docker = true })
+
+	assert.Empty(t, svc.containerPlatform(), "daemon down")
+	assert.Empty(t, svc.containerPlatform(), "and not re-probed immediately")
+	// The cache is the point of the second call: probing per handshake is a 10s
+	// inline stall on the connection read loop.
+	assert.Equal(t, 1, probeCount(), "a failed probe must be cached, not repeated")
+
+	require.NoError(t, os.WriteFile(marker, []byte("x"), 0644))
+	require.Eventually(t, func() bool { return svc.containerPlatform() == "linux-amd64" },
+		5*time.Second, 25*time.Millisecond, "a recovered daemon must be picked up without a restart")
 }

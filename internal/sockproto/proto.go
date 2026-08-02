@@ -65,6 +65,40 @@ type Capabilities struct {
 	Docker      bool     `json:"docker"`
 	ExecModes   []string `json:"exec_modes"`
 	MaxSessions int      `json:"max_sessions"`
+	// ContainerClient is the sha256 of the gt-proxy-client the worker can inject
+	// into a work container, or "" if it has none.
+	//
+	// Version equality is NOT enough to decide a container push: a worker can be
+	// perfectly up to date and still have never received the container
+	// platform's binaries (fresh enrollment, wiped state dir), and a container
+	// without them runs an agent with no gt/bd at all. Reporting the DIGEST
+	// rather than a bool also stops an identical binary being re-streamed on
+	// every provision.
+	ContainerClient string `json:"container_client,omitempty"`
+	// ContainerPlatform is "<goos>-<goarch>" of the worker's docker daemon,
+	// when it has one. The work container is a Linux container even on a macOS
+	// worker, so the binaries injected into it are a DIFFERENT platform from
+	// the ones the worker runs — the orchestrator needs this to pick the right
+	// artifacts (§4.1).
+	ContainerPlatform string `json:"container_platform,omitempty"`
+}
+
+// GetContainerPlatform reads the container platform from a possibly-nil
+// capability block.
+func (c *Capabilities) GetContainerPlatform() string {
+	if c == nil {
+		return ""
+	}
+	return c.ContainerPlatform
+}
+
+// GetContainerClient reads the injectable client's digest from a possibly-nil
+// capability block. "" means the worker has none.
+func (c *Capabilities) GetContainerClient() string {
+	if c == nil {
+		return ""
+	}
+	return c.ContainerClient
 }
 
 // SessionSummary describes one live session (§4.1 sessions / hello_ack).
@@ -111,11 +145,15 @@ type Message struct {
 
 	// push_binaries (§4.1). Chunks carry Data; the final chunk sets EOF and the
 	// whole-file SHA256, which the worker verifies before anything is installed.
-	Name    string `json:"name,omitempty"`
-	SHA256  string `json:"sha256,omitempty"`
-	Data    string `json:"data,omitempty"` // base64 chunk
-	EOF     bool   `json:"eof,omitempty"`
-	Applied string `json:"applied,omitempty"` // ack: "installed" | "staged"
+	Name string `json:"name,omitempty"`
+	// Platform tags binaries destined for somewhere other than the worker
+	// itself — "<goos>-<goarch>" for the work container's Linux binaries.
+	// Empty means the worker's own platform.
+	Platform string `json:"platform,omitempty"`
+	SHA256   string `json:"sha256,omitempty"`
+	Data     string `json:"data,omitempty"` // base64 chunk
+	EOF      bool   `json:"eof,omitempty"`
+	Applied  string `json:"applied,omitempty"` // ack: "installed" | "staged"
 
 	// csr / cert (§4.2; core §7.2 over the socket)
 	CSRPEM   string    `json:"csr_pem,omitempty"`

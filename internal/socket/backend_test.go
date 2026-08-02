@@ -43,6 +43,8 @@ type fakeWorker struct {
 	// transient "restarting" refusal for the first N attempts.
 	restartingUntilAttempt int
 	openAttempts           int
+	containerPlatform      string
+	containerClient        string
 
 	// knobs
 	refusePush   string // non-empty → answer a terminal push chunk with this error code
@@ -71,10 +73,14 @@ func (w *fakeWorker) handlePush(codec *sockproto.Codec, m *sockproto.Message) {
 		w.pushBuf = map[string][]byte{}
 		w.pushes = map[string]*pushedBinary{}
 	}
+	key := m.Name
+	if m.Platform != "" {
+		key = m.Platform + "/" + m.Name
+	}
 	if m.Data != "" {
 		chunk, err := base64.StdEncoding.DecodeString(m.Data)
 		require.NoError(w.t, err)
-		w.pushBuf[m.Name] = append(w.pushBuf[m.Name], chunk...)
+		w.pushBuf[key] = append(w.pushBuf[key], chunk...)
 	}
 	if !m.EOF {
 		return
@@ -83,9 +89,10 @@ func (w *fakeWorker) handlePush(codec *sockproto.Codec, m *sockproto.Message) {
 		_ = codec.Send(&sockproto.Message{Type: sockproto.TypeError, ID: m.ID, Code: w.refusePush, Msg: "refused"})
 		return
 	}
-	w.pushes[m.Name] = &pushedBinary{data: w.pushBuf[m.Name], sha: m.SHA256}
-	delete(w.pushBuf, m.Name)
-	_ = codec.Send(&sockproto.Message{Type: sockproto.TypePushBinaryAck, ID: m.ID, Name: m.Name, Applied: "installed"})
+	w.pushes[key] = &pushedBinary{data: w.pushBuf[key], sha: m.SHA256}
+	delete(w.pushBuf, key)
+	_ = codec.Send(&sockproto.Message{Type: sockproto.TypePushBinaryAck, ID: m.ID,
+		Name: m.Name, Platform: m.Platform, Applied: "installed"})
 }
 
 // sessionOpenAttempts reports how many session_opens arrived.
@@ -189,8 +196,10 @@ func (w *fakeWorker) handle(nc net.Conn) {
 				GTVersion:    w.gtVersion,
 				OS:           workerOS,
 				Arch:         workerArch,
-				Capabilities: &sockproto.Capabilities{Docker: true, ExecModes: []string{"container", "native"}, MaxSessions: w.maxSessions},
-				Sessions:     sess,
+				Capabilities: &sockproto.Capabilities{Docker: true, ExecModes: []string{"container", "native"},
+					MaxSessions: w.maxSessions, ContainerPlatform: w.containerPlatform,
+					ContainerClient: w.containerClient},
+				Sessions: sess,
 			})
 		case sockproto.TypePushBinary:
 			w.handlePush(codec, m)

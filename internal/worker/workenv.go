@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -59,6 +62,11 @@ type WorkEnvConfig struct {
 	// §6.1.1 address for the chosen networking mode.
 	RelayPort int
 
+	// ProxyClient is the host path to the CONTAINER-platform gt-proxy-client to
+	// inject as the agent's gt/bd. Empty skips injection (the image is then
+	// expected to carry its own, which nothing currently does).
+	ProxyClient string
+
 	// AgentBinary, when set, is preflighted worker-side after the idle
 	// container starts (§6.3): the resolved agent runtime must be on PATH in
 	// the image, and /bin/sh must exist. Failing preflight stops the
@@ -68,6 +76,32 @@ type WorkEnvConfig struct {
 	// Docker overrides the docker binary (tests). Default "docker".
 	Docker string
 }
+
+// proxyClientName is the injected binary's name inside /opt/gt.
+const proxyClientName = "gt-proxy-client"
+
+// Where the injected CLI lives inside the container, and the PATH prefix that
+// makes it win.
+//
+// Prefixing PATH is what makes the resolution deterministic: linking into
+// /usr/local/bin is a convenience, but an image whose PATH puts another
+// directory first would still shadow it. The mount is read-only, so nothing in
+// the container can replace what it resolves to.
+const (
+	mountedGtPath = "/opt/gt/gt"
+	mountedBdPath = "/opt/gt/bd"
+
+	// AgentPathPrefix is prepended to a container command line so the injected
+	// CLI resolves first. It expands the image's own PATH, so the agent runtime
+	// stays findable (§6.2's contract).
+	//
+	// It EXPORTS rather than using an assignment prefix. `PATH=x cmd1 && cmd2`
+	// applies the assignment to cmd1 ONLY — a POSIX rule that made an earlier
+	// version resolve `gt` against the mount and `bd` against the image, so
+	// every injected container session was refused. Verified in dash, bash and
+	// zsh; TestAgentPathPrefix_AppliesToEveryCommand runs the real shell.
+	AgentPathPrefix = "export PATH=/opt/gt:$PATH; "
+)
 
 const (
 	containerNetworkHost   = "host"
@@ -206,6 +240,21 @@ while :; do sleep 60 & wait $!; done
 		return fmt.Errorf("write idle entrypoint: %w", err)
 	}
 
+	// The agent's `gt` and `bd` inside the container: gt-proxy-client under
+	// those names, from the CONTAINER's platform (a macOS worker's own binary
+	// would not execute here). The links are made HOST-side because /opt/gt is
+	// mounted read-only.
+	if w.cfg.ProxyClient != "" {
+		if err := copyExecutable(w.cfg.ProxyClient, filepath.Join(w.cfg.GTDir, proxyClientName)); err != nil {
+			return fmt.Errorf("inject %s: %w", proxyClientName, err)
+		}
+		for _, name := range []string{"gt", "bd"} {
+			if err := atomicSymlink(proxyClientName, filepath.Join(w.cfg.GTDir, name)); err != nil {
+				return fmt.Errorf("linking injected %s: %w", name, err)
+			}
+		}
+	}
+
 	// Replace, never reuse: a fresh Prepare means a fresh environment; a
 	// same-name leftover (crashed worker-agent) is stale by definition.
 	_, _ = w.docker(ctx, "rm", "-f", w.name)
@@ -219,6 +268,10 @@ while :; do sleep 60 & wait $!; done
 		"-v", w.cfg.Worktree + ":/work",
 		"-w", "/work",
 		"-e", "GT_PROXY_URL=" + w.ProxyURL(),
+		// The relay a container reaches is the bridge gateway, not loopback, so
+		// gt-proxy-client needs this to use relay mode (it refuses plaintext to
+		// a non-loopback host otherwise, which is the guard working as intended).
+		"-e", "GT_PROXY_RELAY=1",
 	}
 	if w.cfg.ContainerNetwork == containerNetworkHost {
 		args = append(args, "--network", "host")
@@ -255,6 +308,78 @@ func (w *WorkEnv) preflight(ctx context.Context) error {
 	if w.cfg.AgentBinary != "" {
 		if _, err := w.docker(ctx, "exec", w.name, "/bin/sh", "-c", "command -v "+shellQuoteToken(w.cfg.AgentBinary)); err != nil {
 			return fmt.Errorf("image preflight: agent runtime %q not on PATH in image %s (§6.2): %w", w.cfg.AgentBinary, w.cfg.Image, err)
+		}
+	}
+	// Verification runs whether or not we injected: the question is "can this
+	// agent reach the control plane", and an image that ships its own gt/bd
+	// answers it just as well. Injection only changes what we EXPECT to resolve.
+	{
+		// /opt/gt is read-only, so the CLI is linked into a directory that is
+		// on every reasonable PATH. Done as root because the image's user may
+		// not own /usr/local/bin.
+		//
+		// This is a hard failure rather than a warning: an agent that cannot
+		// run `gt` cannot call `gt done`, take mail, or update a bead — the
+		// session would look alive and accomplish nothing.
+		var linkErr error
+		if w.cfg.ProxyClient != "" {
+			// mkdir -p first: a minimal image (busybox is the canonical one) has
+			// no /usr/local/bin at all, and `ln -sf` into a missing directory
+			// fails. Before injection existed, such an image came up degraded;
+			// it must not now fail to come up for want of one mkdir.
+			link := "mkdir -p /usr/local/bin && ln -sf /opt/gt/gt /usr/local/bin/gt && ln -sf /opt/gt/bd /usr/local/bin/bd"
+			_, linkErr = w.docker(ctx, "exec", "-u", "0", w.name, "/bin/sh", "-c", link)
+		}
+
+		// Probe with the same PATH the agent will run with: AgentPathPrefix puts
+		// the read-only mount first, and container execs deliberately do NOT
+		// carry the worker host's PATH (see workerclient.agentEnv), so both this
+		// probe and the agent expand the IMAGE's PATH.
+		//
+		// BOTH names are resolved and BOTH are checked: `bd` is the same injected
+		// binary under another name — the beads CLI — and checking only `gt` left
+		// an image that ships its own `bd` completely unexamined.
+		resolved, err := w.docker(ctx, "exec", w.name, "/bin/sh", "-c",
+			AgentPathPrefix+"command -v gt && command -v bd")
+		if err != nil {
+			if linkErr != nil {
+				return fmt.Errorf("image preflight: could not put gt/bd on PATH in image %s (linking failed: %v; the agent could not reach the control plane): %w", w.cfg.Image, linkErr, err)
+			}
+			return fmt.Errorf("image preflight: gt/bd not on PATH in image %s and none were injected — the agent could not reach the control plane (if this worker should have received a client, check that the orchestrator has artifacts for this container's platform): %w", w.cfg.Image, err)
+		}
+		lines := strings.Split(strings.TrimSpace(resolved), "\n")
+		gtPath, bdPath := "", ""
+		if len(lines) > 0 {
+			gtPath = strings.TrimSpace(lines[0])
+		}
+		if len(lines) > 1 {
+			bdPath = strings.TrimSpace(lines[1])
+		}
+
+		if w.cfg.ProxyClient != "" {
+			// We injected a client, so the mount comes first on PATH and both
+			// names MUST resolve inside it. Anything else means the image
+			// shadowed us — usually accidentally (an image that bakes in an old
+			// gt), which is precisely the confusing failure to catch early.
+			//
+			// This is not a defense against a HOSTILE image: the agent runs
+			// inside that image, so an image that wants to interpose can. It
+			// stops an accident from silently swapping the control-plane CLI.
+			for _, got := range []struct{ name, path, want string }{
+				{"gt", gtPath, mountedGtPath},
+				{"bd", bdPath, mountedBdPath},
+			} {
+				if got.path != got.want {
+					return fmt.Errorf("image preflight: %s resolves %s to %q, not the injected client (%s) — refusing to run the agent against an image-supplied control-plane CLI",
+						w.cfg.Image, got.name, got.path, got.want)
+				}
+			}
+		}
+		if linkErr != nil {
+			// Survivable: the mount is what the agent uses. The link is a
+			// convenience for anything that resets PATH.
+			slog.Default().Warn("gt/bd link into /usr/local/bin failed; the agent uses the mounted client",
+				"image", w.cfg.Image, "container", w.name, "resolved_gt", gtPath, "err", linkErr)
 		}
 	}
 	return nil
@@ -304,4 +429,55 @@ func RemoveWorkContainer(ctx context.Context, dockerBin, rig, polecat string) er
 // shellQuoteToken single-quotes a token for the sh -c preflight probe.
 func shellQuoteToken(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// atomicSymlink replaces a symlink in one step: create it under a unique name,
+// then rename over the target.
+//
+// GTDir is shared by every session on the worker and mounted live into running
+// containers, so a remove-then-symlink is wrong twice over: two concurrent
+// Prepares interleave into an EEXIST that fails a session, and the gap between
+// the two calls is a window where an already-running agent's `gt` is simply
+// missing. Rename over an existing symlink does neither.
+func atomicSymlink(target, link string) error {
+	tmp, err := os.MkdirTemp(filepath.Dir(link), ".link-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	staged := filepath.Join(tmp, filepath.Base(link))
+	if err := os.Symlink(target, staged); err != nil {
+		return err
+	}
+	return os.Rename(staged, link)
+}
+
+// copyExecutable copies through a temp file + rename, so a container never
+// mounts a half-written binary.
+func copyExecutable(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := io.Copy(tmp, in); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0755); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), dst)
 }

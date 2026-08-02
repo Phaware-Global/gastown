@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -483,6 +484,58 @@ func TestEnvAllowed_AllowlistRefusesLoaderAndSecrets(t *testing.T) {
 	}
 }
 
+// TestAgentEnv_ContainerDoesNotInheritHostPaths pins that a container exec is
+// NOT handed the worker host's PATH/HOME/TMPDIR. `docker exec -e PATH=…`
+// overrides the image's own, so the agent runtime that the image preflight
+// verified against the IMAGE's PATH could then be unfindable — and the host's
+// directories do not exist in the container anyway.
+func TestAgentEnv_ContainerDoesNotInheritHostPaths(t *testing.T) {
+	s := &Service{cfg: Config{}}
+
+	native, err := s.agentEnv(nil, "", false)
+	require.NoError(t, err)
+	assert.True(t, hasEnvKey(native, "PATH"), "a native agent runs on the host, so it needs the host PATH")
+
+	inContainer, err := s.agentEnv(nil, "", true)
+	require.NoError(t, err)
+	for _, key := range []string{"PATH", "HOME", "TMPDIR"} {
+		assert.False(t, hasEnvKey(inContainer, key), "%s must come from the image, not the worker host", key)
+	}
+}
+
+// TestAgentEnv_ContainerIgnoresHostPathsFromTheEnvFile pins the second door into
+// the same defect: the operator's env file is appended verbatim, so a PATH line
+// there would ride `docker exec -e` and override the image's PATH just as the
+// host's would have.
+func TestAgentEnv_ContainerIgnoresHostPathsFromTheEnvFile(t *testing.T) {
+	dir := t.TempDir()
+	envFile := filepath.Join(dir, "agent.env")
+	require.NoError(t, os.WriteFile(envFile, []byte(
+		"ANTHROPIC_API_KEY=sk-x\nPATH=/opt/operator/bin\nHOME=/home/operator\n"), 0600))
+	s := &Service{cfg: Config{AgentEnvFile: envFile}, log: slog.Default()}
+
+	inContainer, err := s.agentEnv(nil, "", true)
+	require.NoError(t, err)
+	assert.Contains(t, inContainer, "ANTHROPIC_API_KEY=sk-x", "credentials are what the file is for")
+	for _, key := range []string{"PATH", "HOME"} {
+		assert.False(t, hasEnvKey(inContainer, key), "%s from the env file must not reach a container", key)
+	}
+
+	// On a native worker the file's values are the operator's business.
+	native, err := s.agentEnv(nil, "", false)
+	require.NoError(t, err)
+	assert.Contains(t, native, "PATH=/opt/operator/bin")
+}
+
+func hasEnvKey(env []string, key string) bool {
+	for _, kv := range env {
+		if strings.HasPrefix(kv, key+"=") {
+			return true
+		}
+	}
+	return false
+}
+
 // TestAgentEnv_FileWinsOverWire pins the §8 invariant: the operator's agent env
 // file is the sanctioned source of agent configuration, so a wire value can
 // never override one it sets (os/exec keeps the LAST duplicate).
@@ -492,7 +545,7 @@ func TestAgentEnv_FileWinsOverWire(t *testing.T) {
 	require.NoError(t, os.WriteFile(envFile, []byte("ANTHROPIC_MODEL=file-model\n"), 0600))
 
 	s := &Service{cfg: Config{AgentEnvFile: envFile}}
-	env, err := s.agentEnv(map[string]string{"ANTHROPIC_MODEL": "wire-model"}, "")
+	env, err := s.agentEnv(map[string]string{"ANTHROPIC_MODEL": "wire-model"}, "", false)
 	require.NoError(t, err)
 
 	var lastVal string
@@ -536,7 +589,7 @@ func TestAttach_RefusesCredentialEndpointRedirect(t *testing.T) {
 
 	// And the agent env never carries a wire base URL even if one slipped past.
 	s := &Service{cfg: Config{AgentEnvFile: envFile}}
-	env, err := s.agentEnv(map[string]string{"GT_ROLE": "polecat"}, "")
+	env, err := s.agentEnv(map[string]string{"GT_ROLE": "polecat"}, "", false)
 	require.NoError(t, err)
 	for _, kv := range env {
 		assert.NotContains(t, kv, "attacker.example")

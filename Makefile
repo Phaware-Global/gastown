@@ -1,9 +1,19 @@
-.PHONY: build desktop-build desktop-run install safe-install install-remote-execution-binaries check-forward-only check-version-tag check-install-path clean test test-makefile test-e2e-container check-up-to-date
+.PHONY: build desktop-build desktop-run install safe-install install-remote-execution-binaries dist install-artifacts check-forward-only check-version-tag check-install-path clean test test-makefile test-e2e-container check-up-to-date
 
 BINARY := gt
 BINARY_DESKTOP := gt-desktop
 BUILD_DIR := .
 INSTALL_DIR := $(HOME)/.local/bin
+# Per-platform artifacts for push_binaries (§4.1). A worker is refreshed from
+# the tree matching ITS os/arch, which is why this exists at all: the two
+# pushable binaries are pure Go and cross-compile in seconds, so a macOS
+# orchestrator can keep a Linux worker — and a Linux container on a macOS
+# worker — in step.
+ARTIFACT_DIR := $(HOME)/.local/share/gt/binaries
+# Platforms `make dist` builds. Container mode needs linux even when every
+# machine involved is a Mac: the work container is a Linux container.
+DIST_PLATFORMS ?= darwin/arm64 darwin/amd64 linux/amd64 linux/arm64
+PUSHABLE := $(BINARY)-proxy-client $(BINARY)-worker-client
 E2E_IMAGE ?= gastown-test
 E2E_BUILD_FLAGS ?=
 E2E_RUN_FLAGS ?= --rm
@@ -169,6 +179,41 @@ install-remote-execution-binaries:
 		mv $(INSTALL_DIR)/$$b.new $(INSTALL_DIR)/$$b && \
 		echo "Installed $$b to $(INSTALL_DIR)/$$b"; \
 	done
+	@$(MAKE) --no-print-directory install-artifacts
+
+# dist: build the pushable binaries for every platform a worker might be.
+#
+# CGO_ENABLED=0 is what makes this cheap — gt itself needs ICU/cgo, but
+# gt-proxy-client and gt-worker-client do not, so they cross-compile with no
+# toolchain. (It also switches to Go's pure-Go DNS resolver, which is why it is
+# applied HERE and not to the native build.)
+#
+# The same LDFLAGS as `build`, deliberately: an artifact stamped with a
+# different version than the orchestrator would make every worker report a
+# mismatch forever, and push on every single provision.
+dist:
+	@for platform in $(DIST_PLATFORMS); do \
+		goos=$${platform%/*}; goarch=$${platform#*/}; \
+		outdir="$(ARTIFACT_DIR)/$$goos-$$goarch"; \
+		mkdir -p "$$outdir"; \
+		for b in $(PUSHABLE); do \
+			cmd=$${b#$(BINARY)-}; \
+			CGO_ENABLED=0 GOOS=$$goos GOARCH=$$goarch \
+				go build -ldflags "$(LDFLAGS)" -o "$$outdir/$$b" ./cmd/$(BINARY)-$$cmd || exit 1; \
+		done; \
+		echo "dist: $$goos/$$goarch -> $$outdir"; \
+	done
+
+# install-artifacts: place THIS platform's pushable binaries in the artifact
+# tree, so a same-platform worker can be refreshed after a plain `make install`
+# without anyone remembering to run `make dist`.
+install-artifacts:
+	@outdir="$(ARTIFACT_DIR)/$$(go env GOOS)-$$(go env GOARCH)"; \
+	mkdir -p "$$outdir"; \
+	for b in $(PUSHABLE); do \
+		cp $(BUILD_DIR)/$$b "$$outdir/$$b.new" && mv "$$outdir/$$b.new" "$$outdir/$$b"; \
+	done; \
+	echo "Installed this platform's pushable binaries to $$outdir"
 
 # check-version-tag: Verify that if HEAD is tagged vX.Y.Z, the Version constant
 # in internal/cmd/version.go equals X.Y.Z. No-op when HEAD is untagged, so it is
