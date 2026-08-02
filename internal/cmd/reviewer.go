@@ -12,6 +12,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/reviewer"
@@ -279,6 +281,45 @@ func requireReviewerWorktree() (string, error) {
 	return cwd, nil
 }
 
+// reviewerRigPathForHeartbeat resolves the current rig's path for heartbeat
+// writes, best-effort. Every failure returns "" so the caller skips the touch:
+// the heartbeat is telemetry, and a monitoring write must never be able to fail
+// the review step that produced it.
+func reviewerRigPathForHeartbeat() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return ""
+	}
+	rigName := detectRole(cwd, townRoot).Rig
+	if rigName == "" {
+		return ""
+	}
+	_, r, err := getRig(rigName)
+	if err != nil || r == nil {
+		return ""
+	}
+	return r.Path
+}
+
+// touchReviewerPhase records that the Reviewer reached phase. Best-effort: a
+// failed write warns on stderr (never stdout — `gt reviewer prompt`'s stdout is
+// consumed as the prompt) but never fails the command. Warning rather than
+// swallowing matters because the Layer-2 reaper keys on this file: a silently
+// absent heartbeat would make a later kill look arbitrary.
+func touchReviewerPhase(phase string, pr, round int, sha string) {
+	rigPath := reviewerRigPathForHeartbeat()
+	if rigPath == "" {
+		return
+	}
+	if err := reviewer.TouchHeartbeat(rigPath, phase, pr, round, sha); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: reviewer heartbeat (%s): %v\n", phase, err)
+	}
+}
+
 func runReviewerPost(cmd *cobra.Command, args []string) error {
 	if reviewerPostPR <= 0 {
 		return fmt.Errorf("--pr must be a positive PR number")
@@ -286,6 +327,7 @@ func runReviewerPost(cmd *cobra.Command, args []string) error {
 	if _, err := requireReviewerWorktree(); err != nil {
 		return err
 	}
+	touchReviewerPhase(reviewer.PhasePost, reviewerPostPR, 0, reviewerPostSHA)
 
 	data, err := readFindingsInput(reviewerPostFindings)
 	if err != nil {
@@ -353,6 +395,7 @@ func runReviewerCheckout(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	touchReviewerPhase(reviewer.PhaseCheckout, prNumber, 0, reviewerCheckoutSHA)
 
 	g := git.NewGit(cwd)
 	if err := g.CheckoutPRHeadDetached(prNumber, reviewerCheckoutSHA); err != nil {
@@ -495,6 +538,9 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Recorded before the perspective resolves so an unresolvable perspective
+	// still leaves evidence that the review reached the prompt phase.
+	touchReviewerPhase(reviewer.PhasePrompt, reviewerPromptPR, reviewerPromptRound, reviewerPromptSHA)
 
 	rp, err := reviewer.ResolvePerspective(townRoot, rigPath, perspective)
 	if err != nil {
@@ -589,6 +635,10 @@ func computeReviewBaseSHA(g reviewBaseGit, prNumber int, sha string) string {
 }
 
 func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
+	// consolidate takes no --pr; passing 0 inherits the identity fields already
+	// on the heartbeat, so the record stays complete across the phase change.
+	touchReviewerPhase(reviewer.PhaseConsolidate, 0, 0, reviewerConsolidateSHA)
+
 	var results []reviewer.PerspectiveResult
 
 	if len(args) == 0 {
@@ -737,6 +787,14 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 	}
 	to := fmt.Sprintf("%s/reviewer", r.Name)
 
+	// Seed the heartbeat from the DISPATCHER, before the session exists. A
+	// reviewer that is requested but never starts (or dies during startup) still
+	// leaves a record, so "dispatched into the void" is observable to the reaper
+	// rather than being indistinguishable from "no review was ever requested".
+	if err := reviewer.TouchHeartbeat(r.Path, reviewer.PhaseDispatched, spec.PR, spec.Round, spec.HeadSHA); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: seeding reviewer heartbeat: %v\n", err)
+	}
+
 	router := mail.NewRouterWithTownRoot(townRoot, townRoot)
 	defer router.WaitPendingNotifications()
 	msg := mail.NewMessage(from, to, spec.Subject(), spec.Body(priorThreads))
@@ -773,6 +831,19 @@ func runReviewerDone(cmd *cobra.Command, args []string) error {
 	_, r, err := getRig(rigName)
 	if err != nil {
 		return err
+	}
+
+	// Clear the heartbeat BEFORE killing the session: a heartbeat that outlived
+	// its reviewer would make an idle rig look permanently stalled to the reaper.
+	if err := reviewer.ClearHeartbeat(r.Path); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: clearing reviewer heartbeat: %v\n", err)
+	}
+	// Completion is a feed event so a review's end is as visible as its spawn —
+	// previously only the spawn was logged, which made a reviewer that started
+	// and never finished indistinguishable from one still working.
+	if err := events.LogFeed(events.TypeDone, rigName+"/"+constants.RoleReviewer,
+		map[string]interface{}{"rig": rigName, "role": constants.RoleReviewer}); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: reviewer done feed event: %v\n", err)
 	}
 
 	// Self-terminate the session after a short delay so this command reports
