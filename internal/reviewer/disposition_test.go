@@ -2,6 +2,7 @@ package reviewer
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -201,5 +202,43 @@ func TestConsolidate_DispositionSurvivesTheRoundTripToPost(t *testing.T) {
 	}
 	if ev := reparsed.ReviewEvent(); ev != "REQUEST_CHANGES" {
 		t.Errorf("ReviewEvent after round-trip = %q, want REQUEST_CHANGES", ev)
+	}
+}
+
+func TestSchemaExamplesDoNotSeedAnActionableDisposition(t *testing.T) {
+	// The perspective subagent is told to follow the output schema exactly and
+	// not improvise. Every other value in that example is a self-describing
+	// placeholder, so a literal `"disposition": "request_changes"` would be
+	// copied verbatim by a clean pass — posting a blocking review with zero
+	// findings, which nothing downstream can correct (the floor only escalates)
+	// and which the Reviewer cannot clear itself (gh pr review and both GraphQL
+	// review mutations are tap-guard-blocked).
+	//
+	// Guard both agent-facing schemas against regressing to a literal value.
+	for _, path := range []string{
+		"prompt/execution.md.tmpl",
+		"../templates/roles/reviewer.md.tmpl",
+	} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("reading %s: %v", path, err)
+		}
+		body := string(data)
+		for _, bad := range []string{
+			`"disposition": "request_changes"`,
+			`"disposition": "comment"`,
+			`"disposition":"request_changes"`,
+			`"disposition":"comment"`,
+		} {
+			if strings.Contains(body, bad) {
+				t.Errorf("%s contains a literal actionable disposition (%s) in its schema; "+
+					"a pass copying the schema would post a false block — use a "+
+					"self-describing placeholder like the one in cmd/reviewer.go's payload schema", path, bad)
+			}
+		}
+		// The field must still be present, or the escalation path has no producer.
+		if !strings.Contains(body, `"disposition"`) {
+			t.Errorf("%s no longer documents `disposition` — the escalation path needs a producer", path)
+		}
 	}
 }

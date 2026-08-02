@@ -643,7 +643,17 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 		if err := os.WriteFile(reviewerConsolidateOut, encoded, 0o644); err != nil { //nolint:gosec // operator-facing output
 			return fmt.Errorf("writing %s: %w", reviewerConsolidateOut, err)
 		}
-		fmt.Printf("Wrote consolidated findings (%d) to %s\n", len(fs.Findings), reviewerConsolidateOut)
+		// Report the event this payload will submit. Posting is irreversible and
+		// the Reviewer cannot clear its own review (gh pr review and both GraphQL
+		// review mutations are tap-guard-blocked), so the resolved verdict has to
+		// be visible at the last reversible step — not for the first time in
+		// `post`'s output, after it has already been submitted.
+		fmt.Printf("Wrote consolidated findings (%d) to %s — will post as %s\n",
+			len(fs.Findings), reviewerConsolidateOut, fs.ReviewEvent())
+		if fs.Disposition != "" {
+			fmt.Printf("  (escalated to %s by a perspective's disposition=%q)\n",
+				fs.ReviewEvent(), fs.Disposition)
+		}
 		return nil
 	}
 	_, err = os.Stdout.Write(encoded)

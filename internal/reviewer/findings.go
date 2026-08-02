@@ -59,11 +59,16 @@ type Findings struct {
 	// Findings are the individual inline findings. May be empty (a clean review
 	// still posts a summary).
 	Findings []Finding `json:"findings"`
-	// Disposition optionally overrides the GitHub review event the Reviewer
-	// submits: "approve", "request_changes", or "comment" (case-insensitive).
-	// When empty, the event is derived from finding severity (see ReviewEvent).
-	// Lets a perspective pass assert a blocking verdict explicitly while keeping
-	// a deterministic default when the agent omits it.
+	// Disposition optionally ESCALATES the GitHub review event: "request_changes"
+	// or "comment" (case-insensitive). "approve" is rejected — see
+	// validDispositions. It is a floor, not an override: the submitted event is
+	// the more blocking of this value and the severity-derived one, so it can
+	// raise a verdict but never lower one (see ReviewEvent). When empty, the
+	// event comes from finding severity alone.
+	//
+	// It exists so a pass can assert a blocking verdict it cannot anchor to a
+	// diff line, which normalizeFinding's path+line requirement makes
+	// inexpressible as a finding.
 	Disposition string `json:"disposition,omitempty"`
 }
 
@@ -88,8 +93,10 @@ var validDispositions = map[string]string{
 }
 
 // ReviewEvent returns the GitHub review disposition for these findings:
-// "APPROVE", "REQUEST_CHANGES", or "COMMENT". An explicit Disposition wins;
-// otherwise it is derived from the highest severity present:
+// "APPROVE", "REQUEST_CHANGES", or "COMMENT". The result is the MORE BLOCKING
+// of an explicit Disposition and the severity-derived event — a disposition can
+// only escalate, never de-escalate. Severity derivation uses the highest
+// priority present:
 //
 //	high   → REQUEST_CHANGES (blocking; must be addressed)
 //	medium → COMMENT         (advisory; worth fixing, not a block)
