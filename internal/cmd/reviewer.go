@@ -848,29 +848,6 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("sending review request to %s: %w", to, err)
 	}
 
-	// Seed the heartbeat only AFTER the mail is on its way. Seeding first left a
-	// permanent `dispatched` record when the send failed — the dispatcher already
-	// returned a hard error the caller can retry, so the reaper's later
-	// "dispatched but never started" escalation would be duplicate noise about a
-	// failure that was never silent, and the retry would inherit the failed
-	// attempt's clock.
-	//
-	// The seed still precedes EnsureRunning below, which is the case it exists
-	// for: a request that is mailed but whose session never starts.
-	deferredSeed := false
-	switch err := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA); {
-	case err == nil:
-	case errors.Is(err, reviewer.ErrReviewInFlight):
-		// Queued behind an unfinished review. Mail is the work queue and the
-		// request is safely in it; the in-flight review's telemetry is what
-		// supervisors need, so it is deliberately left intact.
-		deferredSeed = true
-		fmt.Fprintf(os.Stderr,
-			"note: reviewer is mid-review; PR #%d is queued and will be recorded when it starts\n", spec.PR)
-	default:
-		fmt.Fprintf(os.Stderr, "warning: seeding reviewer heartbeat: %v\n", err)
-	}
-
 	// Start the reviewer session if not already running, injecting the token as
 	// GH_TOKEN/GITHUB_TOKEN. Idempotent: a running session drains the new mail.
 	mgr := reviewer.NewManager(r)
@@ -880,25 +857,51 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "warning: review request mailed but reviewer session did not start: %v\n", serr)
 	}
 
-	// A deferred seed plus a session we had to START means the review we deferred
-	// to is not running: its session is gone (reaped, crashed, or self-exited
-	// without clearing). Claim the record now.
+	// Seed the heartbeat AFTER the mail is sent and after EnsureRunning.
 	//
-	// Otherwise the brand-new session is judged against a dead predecessor's
-	// heartbeat — which is stale by construction, since it is stale precisely
-	// because TouchDispatch refused to reseed it — for the several minutes it
-	// takes the agent to prime, read its mail, and reach `gt reviewer checkout`.
-	// Both grace windows miss that gap: a heartbeat IS present and the session IS
-	// alive, so the rails apply immediately, and the successor is born past the
-	// kill threshold. Leaving the fix to the agent's own first command meant the
-	// window it was written to close was the window it did not cover.
-	if deferredSeed && started && serr == nil {
-		if cerr := reviewer.ClearHeartbeat(r.Path); cerr != nil {
-			fmt.Fprintf(os.Stderr, "warning: clearing stale reviewer heartbeat: %v\n", cerr)
+	// After the mail, because seeding first left a permanent `dispatched` record
+	// when the send failed — the dispatcher already returned a hard error the
+	// caller can retry on, so a later "dispatched but never started" escalation
+	// would be duplicate noise about a failure that was never silent.
+	//
+	// After EnsureRunning, because that call may RECYCLE a wedged session, and
+	// recycling clears the heartbeat. Seeding before it meant the clear wiped the
+	// record we had just written, leaving the new review with no heartbeat at all
+	// — precisely the "dispatched into the void" blind spot the seed exists to
+	// close. EnsureRunning's failure is non-fatal, so a request whose session
+	// never starts is still recorded here.
+	switch err := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA); {
+	case err == nil:
+	case errors.Is(err, reviewer.ErrReviewInFlight):
+		// Queued behind an unfinished review on a DIFFERENT PR — UNLESS we had to
+		// start the session ourselves, in which case that review is not running:
+		// its session is gone (reaped, crashed, or self-exited without clearing)
+		// and the record is a corpse. Claim it.
+		//
+		// Otherwise the brand-new session is judged against a dead predecessor's
+		// heartbeat — stale by construction, since it is stale precisely because
+		// TouchDispatch refused to reseed it — for the several minutes it takes the
+		// agent to prime, read its mail, and reach `gt reviewer checkout`. Both
+		// grace windows miss that gap: a heartbeat IS present and the session IS
+		// alive, so the rails apply immediately and the successor is born past the
+		// kill threshold. Leaving the fix to the agent's own first command meant
+		// the window it was written to close was the window it did not cover.
+		if started && serr == nil {
+			if cerr := reviewer.ClearHeartbeat(r.Path); cerr != nil {
+				fmt.Fprintf(os.Stderr, "warning: clearing stale reviewer heartbeat: %v\n", cerr)
+			}
+			if terr := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA); terr != nil {
+				fmt.Fprintf(os.Stderr, "warning: seeding reviewer heartbeat: %v\n", terr)
+			}
+			break
 		}
-		if terr := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA); terr != nil {
-			fmt.Fprintf(os.Stderr, "warning: seeding reviewer heartbeat: %v\n", terr)
-		}
+		// A live session really is mid-review. Mail is the work queue and the
+		// request is safely in it; the in-flight review's telemetry is what
+		// supervisors need, so it is deliberately left intact.
+		fmt.Fprintf(os.Stderr,
+			"note: reviewer is mid-review; PR #%d is queued and will be recorded when it starts\n", spec.PR)
+	default:
+		fmt.Fprintf(os.Stderr, "warning: seeding reviewer heartbeat: %v\n", err)
 	}
 
 	fmt.Printf("Dispatched review of PR #%d (round %d, origin %s) → %s\n", prNumber, spec.Round, origin, to)
