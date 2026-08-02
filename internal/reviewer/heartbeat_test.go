@@ -321,6 +321,9 @@ func TestReadHeartbeatE_DistinguishesAbsentFromUnreadable(t *testing.T) {
 	// The lenient reader keeps its best-effort contract for progress-only callers.
 	if ReadHeartbeat(rig) != nil {
 		t.Error("ReadHeartbeat must stay lenient (nil on malformed)")
+	}
+}
+
 func TestTouchDispatch_RecordsRequesterAndOrigin(t *testing.T) {
 	rig := t.TempDir()
 	if err := TouchDispatch(rig, 175, 1, "abc", "crew", "gastown/crew"); err != nil {
