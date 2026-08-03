@@ -817,10 +817,17 @@ func (d *Daemon) escalateReviewerFailure(rigName string, hb *reviewer.Heartbeat,
 			return
 		}
 	case <-time.After(reviewerEscalateTimeout):
-		d.logger.Printf("Reviewer reaper: escalation to %s timed out after %v — kill is still recorded in the feed",
-			to, reviewerEscalateTimeout)
+		// This BOUNDS the wait, it does not cancel the send: router.Send shells
+		// out to bd, whose own write context runs to 120s, and delivery (plus the
+		// recipient nudge) may still complete afterwards. Say so, rather than
+		// reporting that the escalation did not happen — an operator who
+		// re-dispatches by hand on the strength of a "timed out" line costs a
+		// redundant review round.
+		d.logger.Printf("Reviewer reaper: escalation to %s still pending after %v — it may yet be "+
+			"delivered; the kill is recorded in the feed either way", to, reviewerEscalateTimeout)
 		return
 	case <-d.ctx.Done():
+		d.logger.Printf("Reviewer reaper: shutdown while escalating to %s — delivery may still complete", to)
 		return
 	}
 	d.logger.Printf("Reviewer reaper: escalated %s reviewer failure (PR #%d) to %s", rigName, pr, to)
