@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -508,5 +509,29 @@ func TestEscalationCooldown_IsNotConsumedByAnUnroutableRequester(t *testing.T) {
 	if !d.shouldEscalateReviewer("gastown") {
 		t.Error("an unroutable requester consumed the cooldown — the escalation that " +
 			"was never sent must not spend the budget for the one that matters")
+	}
+}
+
+func TestIsRealCrewMember_AllowlistsTheNameCharacterSet(t *testing.T) {
+	// The ACCEPTED address is interpolated into daemon log lines, the mail To,
+	// and a `bd create --assignee` argument. A blacklist that misses LF/CR/ESC/
+	// NUL lets a forged requester forge entries shaped like the reaper's own —
+	// in the very log an operator reads to decide whether a kill was announced.
+	town := crewTown(t, "gastown", "max")
+	if !isRealCrewMember(town, "gastown", "max") {
+		t.Fatal("a real crew member must be accepted")
+	}
+	for _, bad := range []string{
+		"max\nRefinery:hijack",
+		"max\r\nReviewerReaper:escalated",
+		"max\x1b[2J\x1b[H",
+		"max\x00nul",
+		"max spaced",
+		strings.Repeat("A", 100),
+		"crew", "", "..", ".hidden", "a/b", `a\b`,
+	} {
+		if isRealCrewMember(town, "gastown", bad) {
+			t.Errorf("isRealCrewMember(%q) = true, want rejected", bad)
+		}
 	}
 }
