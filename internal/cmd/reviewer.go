@@ -860,19 +860,17 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "warning: review request mailed but reviewer session did not start: %v\n", serr)
 	}
 
-	// Seed the heartbeat AFTER the mail is sent and after EnsureRunning.
+	// Seed the heartbeat AFTER the mail is sent, and after EnsureRunning.
 	//
 	// After the mail, because seeding first left a permanent `dispatched` record
 	// when the send failed — the dispatcher already returned a hard error the
 	// caller can retry on, so a later "dispatched but never started" escalation
 	// would be duplicate noise about a failure that was never silent.
 	//
-	// After EnsureRunning, because that call may RECYCLE a wedged session, and
-	// recycling clears the heartbeat. Seeding before it meant the clear wiped the
-	// record we had just written, leaving the new review with no heartbeat at all
-	// — precisely the "dispatched into the void" blind spot the seed exists to
-	// close. EnsureRunning's failure is non-fatal, so a request whose session
-	// never starts is still recorded here.
+	// After EnsureRunning, so the seed reflects whether the session actually came
+	// up. EnsureRunning's failure is non-fatal, so a request whose session never
+	// starts is still recorded here.
+	//
 	// A wedged session's heartbeat is EVIDENCE, not stale data — it is the only
 	// thing that will make the reaper act. Seeding over it resets the phase clock
 	// to zero, flipping Classify from KillImminent back to Working, so the remedy

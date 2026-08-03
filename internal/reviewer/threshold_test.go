@@ -153,8 +153,19 @@ func TestClampPassDuration_BoundsBothDirections(t *testing.T) {
 	// Too large: the pass outruns the reaper's phase rail, so the session is
 	// killed mid-pass and every established finding is discarded — the exact
 	// outcome the budget exists to prevent. The mirror image of the floor.
-	if got := ClampPassDuration(10*time.Hour, stuck); got >= stuck {
-		t.Errorf("ClampPassDuration(10h) = %v, want < the stuck threshold %v", got, stuck)
+	//
+	// Assert BOTH bounds on the result, not just the ceiling: a ceiling that
+	// returned 1ns satisfied "< stuck" while violating the floor, so the old
+	// assertion passed under a mutation that broke the function.
+	if got := ClampPassDuration(10*time.Hour, stuck); got >= stuck || got < MinPassDuration {
+		t.Errorf("ClampPassDuration(10h) = %v, want within [%v, %v)", got, MinPassDuration, stuck)
+	}
+	// A small threshold makes the ceiling (stuck/2) fall BELOW the floor. The
+	// floor must still win — otherwise the ceiling silently undoes it.
+	small := 2 * MinPassDuration
+	if got := ClampPassDuration(10*time.Hour, small); got < MinPassDuration {
+		t.Errorf("ClampPassDuration(10h, %v) = %v, want >= the floor %v — the ceiling must not undo the floor",
+			small, got, MinPassDuration)
 	}
 	if got := ClampPassDuration(stuck, stuck); got >= stuck {
 		t.Errorf("a budget equal to the threshold must also be reduced, got %v", got)

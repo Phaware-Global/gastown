@@ -23,11 +23,13 @@ func ClampPassDuration(d, stuck time.Duration) time.Duration {
 	if stuck <= 0 {
 		stuck = DefaultStuckThreshold
 	}
+	if d >= stuck {
+		d = stuck / 2
+	}
+	// Floor LAST. Applying it first let the ceiling hand back a sub-floor value
+	// whenever stuck/2 < MinPassDuration — the ceiling could undo the floor.
 	if d < MinPassDuration {
 		return MinPassDuration
-	}
-	if d >= stuck {
-		return stuck / 2
 	}
 	return d
 }

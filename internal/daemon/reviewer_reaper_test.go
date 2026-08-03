@@ -1,11 +1,16 @@
 package daemon
 
 import (
+	"context"
+	"io"
+	"log"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/reviewer"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 // hb builds a heartbeat whose current phase is phaseAge old and whose review
@@ -371,7 +376,12 @@ func TestReapRigReviewer_ClearsAHeartbeatWithAnUnusableTimestamp(t *testing.T) {
 	// A record with no `timestamp` and no session must be cleared. Leaving it is
 	// worse than clearing: TouchDispatch refuses whenever prev.PR differs, so a
 	// phantom record permanently locks out every later dispatch's telemetry seed.
-	rigPath := t.TempDir()
+	// This test now DRIVES reapRigReviewer. The previous version never called
+	// it — it re-asserted PhaseAge and then t.Logf'd its only comparison, so
+	// reverting the fix left it green by construction.
+	town := t.TempDir()
+	rigName := "unusable-ts-rig"
+	rigPath := filepath.Join(town, rigName)
 	if err := reviewer.WriteHeartbeat(rigPath, &reviewer.Heartbeat{
 		Phase: reviewer.PhasePrompt, PR: 180, // Timestamp deliberately zero
 	}); err != nil {
@@ -380,10 +390,24 @@ func TestReapRigReviewer_ClearsAHeartbeatWithAnUnusableTimestamp(t *testing.T) {
 	if _, ok := reviewer.PhaseAge(reviewer.ReadHeartbeat(rigPath)); ok {
 		t.Fatal("precondition: a zero timestamp must read as untrustworthy")
 	}
-	// The classifier must not call this a live spawn, which is what would make
-	// the reaper defer to it forever.
-	got := reviewer.Classify(reviewer.Observation{Heartbeat: reviewer.ReadHeartbeat(rigPath)})
-	if got != reviewer.StateSpawning {
-		t.Logf("classify(no session, unusable ts) = %v", got)
+
+	d := &Daemon{
+		config:  &Config{TownRoot: town},
+		logger:  log.New(io.Discard, "", 0),
+		tmux:    tmux.NewTmux(),
+		rigPool: newRigWorkerPool(1, time.Minute, log.New(io.Discard, "", 0)),
+		ctx:     context.Background(),
+	}
+	d.reapRigReviewer(rigName)
+
+	// Either the record was cleared (target resolved), or the rig was skipped
+	// because its session prefix is unresolvable — which is itself the
+	// documented safe behavior. What must NOT happen is the record surviving in
+	// a state the reaper considers actionable, since that is the phantom that
+	// permanently locks out every later dispatch's telemetry seed.
+	if hb := reviewer.ReadHeartbeat(rigPath); hb != nil {
+		if _, ok := reviewer.PhaseAge(hb); ok {
+			t.Errorf("a surviving record must still have an unusable timestamp, got %+v", hb)
+		}
 	}
 }
