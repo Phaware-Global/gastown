@@ -263,3 +263,46 @@ func TestGetPatrolRigs_HonorsTheReviewerAllowlist(t *testing.T) {
 		t.Errorf("GetPatrolRigs(reviewer) = %v, want the configured allowlist", got)
 	}
 }
+
+func TestReviewerWasNudged_GrantsTheCapCourtesyOnce(t *testing.T) {
+	// This is what makes the cap's nudge tier terminate. If it ever returns false
+	// for a reviewer that was already nudged, a session looping fast enough to
+	// keep its phase fresh is nudged forever and the absolute cap — the one rail
+	// such a loop cannot evade — becomes unreachable.
+	d := &Daemon{}
+	if d.reviewerWasNudged("rig-a") {
+		t.Fatal("no nudge on record must read as courtesy-unspent")
+	}
+	if !d.shouldNudgeReviewer("rig-a") {
+		t.Fatal("precondition: the first nudge must be allowed")
+	}
+	if !d.reviewerWasNudged("rig-a") {
+		t.Error("after a nudge the courtesy must read as spent")
+	}
+	// Per-rig, like every other cooldown here.
+	if d.reviewerWasNudged("rig-b") {
+		t.Error("rig-a's nudge must not spend rig-b's courtesy")
+	}
+	// Merely outliving the nudge COOLDOWN must not re-grant it: that nudge was
+	// still delivered and still ignored.
+	d.reviewerLastNudge["rig-a"] = time.Now().Add(-reviewerNudgeCooldown - time.Minute)
+	if !d.reviewerWasNudged("rig-a") {
+		t.Error("an expired nudge cooldown must not restore the courtesy")
+	}
+	// Far enough back, it is a different episode entirely.
+	d.reviewerLastNudge["rig-a"] = time.Now().Add(-reviewerNudgeCooldown*3 - time.Minute)
+	if d.reviewerWasNudged("rig-a") {
+		t.Error("a long-stale nudge must not permanently deny the courtesy")
+	}
+}
+
+func TestReviewerWasNudged_DoesNotRecord(t *testing.T) {
+	// A read that recorded would spend the courtesy on observation alone, killing
+	// a progressing round-N review without ever nudging it — the exact failure
+	// the tier was added to prevent.
+	d := &Daemon{}
+	d.reviewerWasNudged("rig-a")
+	if !d.shouldNudgeReviewer("rig-a") {
+		t.Error("checking whether a nudge was sent must not count as sending one")
+	}
+}
