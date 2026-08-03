@@ -207,14 +207,22 @@ func TestConsolidate_DispositionSurvivesTheRoundTripToPost(t *testing.T) {
 
 func TestSchemaExamplesDoNotSeedAnActionableDisposition(t *testing.T) {
 	// The perspective subagent is told to follow the output schema exactly and
-	// not improvise. Every other value in that example is a self-describing
-	// placeholder, so a literal `"disposition": "request_changes"` would be
-	// copied verbatim by a clean pass — posting a blocking review with zero
-	// findings, which nothing downstream can correct (the floor only escalates)
-	// and which the Reviewer cannot clear itself (gh pr review and both GraphQL
-	// review mutations are tap-guard-blocked).
+	// not improvise. Every other value in those examples is a self-describing
+	// placeholder, so an actionable `disposition` would be copied verbatim by a
+	// clean pass — posting a blocking review with zero findings, which nothing
+	// downstream can correct (the floor only escalates) and which the Reviewer
+	// cannot clear itself (gh pr review and both GraphQL review mutations are
+	// tap-guard-blocked).
 	//
-	// Guard both agent-facing schemas against regressing to a literal value.
+	// Two things this guard gets right that a naive version does not:
+	//
+	//  1. It is scoped to the ```json fences. The hazard is a literal inside the
+	//     SCHEMA a pass copies; surrounding prose legitimately quotes concrete
+	//     values while instructing the pass when to use them.
+	//  2. It normalizes the value the way dispositionRank does. A byte-exact
+	//     blacklist is spelling-sensitive while the parser lowercases and trims,
+	//     so `"Comment"` or `" comment "` would re-seed an actionable value and
+	//     leave the suite green.
 	for _, path := range []string{
 		"prompt/execution.md.tmpl",
 		"../templates/roles/reviewer.md.tmpl",
@@ -224,21 +232,90 @@ func TestSchemaExamplesDoNotSeedAnActionableDisposition(t *testing.T) {
 			t.Fatalf("reading %s: %v", path, err)
 		}
 		body := string(data)
-		for _, bad := range []string{
-			`"disposition": "request_changes"`,
-			`"disposition": "comment"`,
-			`"disposition":"request_changes"`,
-			`"disposition":"comment"`,
-		} {
-			if strings.Contains(body, bad) {
-				t.Errorf("%s contains a literal actionable disposition (%s) in its schema; "+
-					"a pass copying the schema would post a false block — use a "+
-					"self-describing placeholder like the one in cmd/reviewer.go's payload schema", path, bad)
-			}
-		}
-		// The field must still be present, or the escalation path has no producer.
+		// The field must still be documented, or the escalation path has no
+		// producer — the fix for one finding must not undo the fix for another.
 		if !strings.Contains(body, `"disposition"`) {
 			t.Errorf("%s no longer documents `disposition` — the escalation path needs a producer", path)
+			continue
 		}
+		for _, block := range jsonBlocks(body) {
+			v, ok := jsonStringValue(block, "disposition")
+			if !ok {
+				continue
+			}
+			if dispositionRank(v) != 0 {
+				t.Errorf("%s schema block sets disposition to the actionable value %q; "+
+					"a pass copying the schema would post a false verdict — use a "+
+					"self-describing placeholder", path, v)
+			}
+		}
+	}
+}
+
+// jsonBlocks returns the contents of every ```json fenced block in s.
+func jsonBlocks(s string) []string {
+	var out []string
+	rest := s
+	for {
+		i := strings.Index(rest, "```json")
+		if i < 0 {
+			return out
+		}
+		rest = rest[i+len("```json"):]
+		j := strings.Index(rest, "```")
+		if j < 0 {
+			return out
+		}
+		out = append(out, rest[:j])
+		rest = rest[j+3:]
+	}
+}
+
+// jsonStringValue extracts a `"key": "value"` string from a JSON-ish block,
+// tolerating arbitrary spacing around the colon.
+func jsonStringValue(block, key string) (string, bool) {
+	i := strings.Index(block, `"`+key+`"`)
+	if i < 0 {
+		return "", false
+	}
+	rest := block[i+len(key)+2:]
+	c := strings.Index(rest, ":")
+	if c < 0 {
+		return "", false
+	}
+	rest = strings.TrimSpace(rest[c+1:])
+	if len(rest) == 0 || rest[0] != '"' {
+		return "", false
+	}
+	rest = rest[1:]
+	e := strings.Index(rest, `"`)
+	if e < 0 {
+		return "", false
+	}
+	return rest[:e], true
+}
+
+func TestSchemaGuard_CatchesCaseAndSpacingVariants(t *testing.T) {
+	// The guard itself needs a guard: the round-3 defect was a literal in the
+	// schema, and a spelling-sensitive check would have let the same defect back
+	// in under a different casing.
+	for _, block := range []string{
+		`{"disposition": "comment"}`,
+		`{"disposition": "Comment"}`,
+		`{"disposition":"REQUEST_CHANGES"}`,
+		`{"disposition":  " request_changes "}`,
+	} {
+		v, ok := jsonStringValue(block, "disposition")
+		if !ok {
+			t.Fatalf("jsonStringValue failed on %s", block)
+		}
+		if dispositionRank(v) == 0 {
+			t.Errorf("%s: value %q must be recognized as actionable", block, v)
+		}
+	}
+	// The shipped placeholder must NOT trip it.
+	v, ok := jsonStringValue(`{"disposition": "<omit if you completed the pass; REQUIRED if truncated>"}`, "disposition")
+	if !ok || dispositionRank(v) != 0 {
+		t.Errorf("the placeholder must not be actionable, got %q", v)
 	}
 }

@@ -633,6 +633,23 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 	}
 
 	fs := reviewer.Consolidate(results, reviewerConsolidateSHA)
+
+	// Report the event on STDERR, before the --out branch, so every invocation
+	// gets it. Posting is irreversible and the Reviewer cannot clear its own
+	// review, so the verdict has to be visible at the last reversible step — and
+	// the sanctioned `consolidate | post --findings -` pipe has no --out.
+	// Stderr specifically: stdout carries the JSON payload.
+	event := fs.ReviewEvent()
+	fmt.Fprintf(os.Stderr, "Consolidated findings (%d) — will post as %s\n", len(fs.Findings), event)
+	// Only call it an escalation when the disposition actually RAISED the event.
+	// A disposition that merely agrees with the severity tally, or one the floor
+	// absorbed, changes nothing — naming it as the cause of a block would send
+	// the reader to the wrong lens.
+	if fs.Disposition != "" && event != fs.SeverityEvent() {
+		fmt.Fprintf(os.Stderr, "  (raised from %s by a perspective's disposition=%q)\n",
+			fs.SeverityEvent(), fs.Disposition)
+	}
+
 	encoded, err := json.MarshalIndent(fs, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encoding consolidated findings: %w", err)
@@ -648,12 +665,7 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 		// review mutations are tap-guard-blocked), so the resolved verdict has to
 		// be visible at the last reversible step — not for the first time in
 		// `post`'s output, after it has already been submitted.
-		fmt.Printf("Wrote consolidated findings (%d) to %s — will post as %s\n",
-			len(fs.Findings), reviewerConsolidateOut, fs.ReviewEvent())
-		if fs.Disposition != "" {
-			fmt.Printf("  (escalated to %s by a perspective's disposition=%q)\n",
-				fs.ReviewEvent(), fs.Disposition)
-		}
+		fmt.Printf("Wrote consolidated findings (%d) to %s\n", len(fs.Findings), reviewerConsolidateOut)
 		return nil
 	}
 	_, err = os.Stdout.Write(encoded)
