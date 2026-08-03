@@ -198,6 +198,34 @@ func TouchHeartbeat(rigPath, phase string, pr, round int, sha string) error {
 	return WriteHeartbeat(rigPath, &next)
 }
 
+// TouchCheckout records that the Reviewer has begun working a review, starting
+// a FRESH clock when the PR differs from what is on record.
+//
+// This is the one in-session touch permitted to establish identity, and it
+// exists because skipping the dispatcher seed (which the wedged-session path
+// does, to preserve evidence the reaper needs) otherwise hands the next review
+// the previous one's frozen StartedAt — and the absolute-runtime rail then
+// kills a seconds-old review on sight.
+//
+// Allowing an agent-supplied PR to reset the clock was unsafe when Elapsed was
+// the only runtime signal. It is safe now: supervisors bound runtime by
+// max(Elapsed, tmux session age), and the session clock is owned by tmux, so a
+// reviewer resetting this file cannot outrun the cap. Checking out a different
+// PR is also unambiguous evidence that the reviewer moved on, unlike a bare
+// phase touch.
+func TouchCheckout(rigPath string, pr int, sha string) error {
+	prev := ReadHeartbeat(rigPath)
+	if prev != nil && (pr == 0 || prev.PR == pr) {
+		// Same review (or no PR to compare): ordinary phase advance.
+		return TouchHeartbeat(rigPath, PhaseCheckout, pr, 0, sha)
+	}
+	now := time.Now().UTC()
+	hb := &Heartbeat{
+		Timestamp: now, StartedAt: now, Phase: PhaseCheckout, PR: pr, SHA: sha,
+	}
+	return WriteHeartbeat(rigPath, hb)
+}
+
 // sameReview reports whether a heartbeat describes the given review. A review is
 // identified by (PR, round, SHA) together: round 2 of the same PR is a NEW
 // review with its own budget, not a continuation.

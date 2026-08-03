@@ -420,7 +420,13 @@ func runReviewerCheckout(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	touchReviewerPhase(reviewer.PhaseCheckout, prNumber, 0, reviewerCheckoutSHA)
+	// Checkout is the one in-session step allowed to START a review, so a queued
+	// review drained after a wedge does not inherit the previous one's clock.
+	if rigPath := reviewerRigPathForHeartbeat(); rigPath != "" {
+		if terr := reviewer.TouchCheckout(rigPath, prNumber, reviewerCheckoutSHA); terr != nil {
+			fmt.Fprintf(os.Stderr, "warning: reviewer heartbeat (checkout): %v\n", terr)
+		}
+	}
 
 	g := git.NewGit(cwd)
 	if err := g.CheckoutPRHeadDetached(prNumber, reviewerCheckoutSHA); err != nil {
