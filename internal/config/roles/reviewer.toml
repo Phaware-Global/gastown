@@ -21,4 +21,12 @@ GT_SCOPE = "rig"
 ping_timeout = "30s"
 consecutive_failures = 3
 kill_cooldown = "5m"
-stuck_threshold = "45m"   # reviews are bounded; well past pr_review_timeout (30m)
+# ENFORCED by the daemon's reviewer reaper (internal/daemon/reviewer_reaper.go).
+# Heartbeat age past this nudges the session; 2x kills it; 4x of TOTAL review
+# time (heartbeat elapsed) is a hard kill that a looping reviewer cannot evade.
+# Must stay above pr_review_timeout (30m) so the refinery's await-review
+# escalation — which carries diagnostics a silent kill would destroy — fires
+# first. Note the perspective subagents run between `gt reviewer prompt` and
+# `gt reviewer consolidate` with nothing refreshing the heartbeat, so this must
+# accommodate a full subagent pass.
+stuck_threshold = "45m"
