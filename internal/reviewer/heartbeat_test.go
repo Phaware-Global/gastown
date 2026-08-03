@@ -426,7 +426,7 @@ func TestTouchCheckout_NewPRStartsAFreshClock(t *testing.T) {
 
 func TestTouchCheckout_SamePRAdvancesWithoutResetting(t *testing.T) {
 	rig := t.TempDir()
-	if err := TouchDispatch(rig, 100, 1, "aaaa"); err != nil {
+	if err := TouchDispatch(rig, 100, 1, "aaaa", "crew", "gastown/crew/max"); err != nil {
 		t.Fatal(err)
 	}
 	origin := ReadHeartbeat(rig).StartedAt
