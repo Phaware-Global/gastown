@@ -87,9 +87,12 @@ func SafeText(s string) string {
 	for _, r := range s {
 		if r < 0x20 || r == 0x7f {
 			b.WriteByte(' ')
-			continue
+		} else {
+			b.WriteRune(r)
 		}
-		b.WriteRune(r)
+		// Bound BOTH branches. Checking only after a printable rune let a field
+		// made entirely of control characters grow without limit — the sanitizer
+		// would neutralize the content and then flood the log with the result.
 		if b.Len() >= maxFieldLen {
 			break
 		}

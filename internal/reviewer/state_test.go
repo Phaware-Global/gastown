@@ -43,6 +43,12 @@ func TestSafeText_StripsTerminalControlAndNewlines(t *testing.T) {
 	if len(got) > maxFieldLen {
 		t.Errorf("SafeText returned %d chars, want <= %d", len(got), maxFieldLen)
 	}
+	// The bound has to apply to the sanitized characters too. Checking it only
+	// after a printable rune let an all-control-character field grow without
+	// limit: neutralized, then flooding the log with the neutralized result.
+	if got := SafeText(strings.Repeat("\x1b", maxFieldLen*4)); len(got) > maxFieldLen {
+		t.Errorf("SafeText returned %d chars for an all-control input, want <= %d", len(got), maxFieldLen)
+	}
 }
 
 func TestSafeSHA_RejectsNonHex(t *testing.T) {
