@@ -127,14 +127,15 @@ func (d *Daemon) reapRigReviewer(rigName string) {
 		// exists to provide, and the session then came up with NO heartbeat,
 		// routing a healthy just-started reviewer onto the missing-heartbeat kill
 		// path. Every other branch here has a grace or a ramp; this one had none.
-		age, ok := reviewer.PhaseAge(hb)
-		if !ok {
-			d.logger.Printf("Reviewer reaper: %s heartbeat timestamp is in the future — taking no action", rigName)
+		// An unusable timestamp (zero or future) on a record with NO session is
+		// not a reason to hold back — it cannot be a live dispatch, and leaving it
+		// is worse than clearing it: TouchDispatch refuses whenever prev.PR
+		// differs, so a phantom record permanently locks out every later
+		// dispatch's telemetry seed. Only a trustworthy, in-grace age defers.
+		if age, ok := reviewer.PhaseAge(hb); ok && age < reviewer.SpawnGrace {
 			return
 		}
-		if age < reviewer.SpawnGrace {
-			return
-		}
+		age, _ := reviewer.PhaseAge(hb)
 		d.logger.Printf("Reviewer reaper: %s reviewer has no session (phase=%s pr=%d, no progress for %s) — clearing stale heartbeat",
 			rigName, reviewer.SafePhase(hb.Phase), reviewer.SafePR(hb.PR), age.Round(time.Second))
 		_ = events.LogFeed(events.TypeSessionDeath, rigName+"/"+constants.RoleReviewer,

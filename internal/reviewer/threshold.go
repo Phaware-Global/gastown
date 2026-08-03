@@ -12,6 +12,26 @@ import (
 // tuning choice but a way to rubber-stamp every PR. Callers clamp to it.
 const MinPassDuration = 5 * time.Minute
 
+// ClampPassDuration bounds a pass budget to [MinPassDuration, stuck].
+//
+// The ceiling matters as much as the floor and is the mirror-image injection: a
+// budget at or beyond the rig's stuck threshold guarantees the pass outruns the
+// reaper's phase rail, so the session is killed mid-pass and every finding it
+// had established is discarded — exactly the outcome §5's budget exists to
+// prevent. An out-of-range value is corrected rather than honored.
+func ClampPassDuration(d, stuck time.Duration) time.Duration {
+	if stuck <= 0 {
+		stuck = DefaultStuckThreshold
+	}
+	if d < MinPassDuration {
+		return MinPassDuration
+	}
+	if d >= stuck {
+		return stuck / 2
+	}
+	return d
+}
+
 // PassDuration returns the soft wall-clock budget for one perspective subagent
 // pass on a rig: half that rig's configured stuck threshold, floored at
 // MinPassDuration.

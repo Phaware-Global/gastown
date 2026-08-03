@@ -90,7 +90,7 @@ Return **exactly one** JSON object and no prose before or after it:
 {
   "perspective": "{{ .Perspective }}",
   "verdict": "one-line verdict for this perspective — REQUIRED even with zero findings (e.g. \"no findings: error paths all guarded\")",
-  "disposition": "<optional; omit unless escalating — request_changes|comment>",
+  "disposition": "<omit if you completed the pass; REQUIRED if truncated (§5) — request_changes|comment>",
   "findings": [
     {
       "path": "internal/foo/bar.go",
@@ -109,8 +109,10 @@ Return **exactly one** JSON object and no prose before or after it:
 `verdict` must never be empty — a perspective is never silent. Every finding's
 `perspective` field must be `{{ .Perspective }}`.
 
-**`disposition` is optional and escalation-only** — `request_changes` or
-`comment`. Omit it and the posted review's event is derived from your findings'
+**`disposition` is escalation-only** — `request_changes` or `comment`. It is
+optional in general but **REQUIRED if you cut the pass short** (§5): a truncated
+pass with no disposition posts as an APPROVE. Omit it only when you completed
+the pass, and then the posted review's event is derived from your findings'
 severity (any high → REQUEST_CHANGES, any medium → COMMENT, clean or nits-only →
 APPROVE).
 

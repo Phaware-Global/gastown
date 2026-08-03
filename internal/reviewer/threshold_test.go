@@ -142,3 +142,29 @@ func TestBuildPerspectivePrompt_BudgetExhaustionMustSetADisposition(t *testing.T
 		t.Error("the contract should state the consequence (a posted APPROVE), not just the rule")
 	}
 }
+
+func TestClampPassDuration_BoundsBothDirections(t *testing.T) {
+	stuck := DefaultStuckThreshold
+
+	// Too small: the pass stops before it establishes anything — a rubber stamp.
+	if got := ClampPassDuration(time.Second, stuck); got != MinPassDuration {
+		t.Errorf("ClampPassDuration(1s) = %v, want the floor %v", got, MinPassDuration)
+	}
+	// Too large: the pass outruns the reaper's phase rail, so the session is
+	// killed mid-pass and every established finding is discarded — the exact
+	// outcome the budget exists to prevent. The mirror image of the floor.
+	if got := ClampPassDuration(10*time.Hour, stuck); got >= stuck {
+		t.Errorf("ClampPassDuration(10h) = %v, want < the stuck threshold %v", got, stuck)
+	}
+	if got := ClampPassDuration(stuck, stuck); got >= stuck {
+		t.Errorf("a budget equal to the threshold must also be reduced, got %v", got)
+	}
+	// In range passes through.
+	if got := ClampPassDuration(20*time.Minute, stuck); got != 20*time.Minute {
+		t.Errorf("ClampPassDuration(20m) = %v, want it unchanged", got)
+	}
+	// A nonsense threshold falls back rather than producing a nonsense budget.
+	if got := ClampPassDuration(20*time.Minute, 0); got <= 0 {
+		t.Errorf("ClampPassDuration with a zero threshold = %v, want a sane budget", got)
+	}
+}
