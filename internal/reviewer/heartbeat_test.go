@@ -323,3 +323,54 @@ func TestReadHeartbeatE_DistinguishesAbsentFromUnreadable(t *testing.T) {
 		t.Error("ReadHeartbeat must stay lenient (nil on malformed)")
 	}
 }
+
+func TestTouchCheckout_NewPRStartsAFreshClock(t *testing.T) {
+	rig := t.TempDir()
+	// Round 1 wedged three hours ago and its record was deliberately preserved
+	// (the wedged-session path skips the dispatcher seed so the reaper can act).
+	stale := time.Now().UTC().Add(-3 * time.Hour)
+	if err := WriteHeartbeat(rig, &Heartbeat{
+		Timestamp: stale, StartedAt: stale, Phase: PhasePrompt, PR: 100, SHA: "aaaa",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The reviewer drains the queued request and checks out a DIFFERENT PR.
+	// Inheriting the frozen clock would put the new review instantly past the
+	// absolute-runtime cap and get it killed seconds after it started.
+	if err := TouchCheckout(rig, 200, "bbbb"); err != nil {
+		t.Fatal(err)
+	}
+	hb := ReadHeartbeat(rig)
+	if hb == nil {
+		t.Fatal("nil heartbeat")
+	}
+	if hb.PR != 200 || hb.SHA != "bbbb" {
+		t.Errorf("identity not established: %+v", hb)
+	}
+	if el := hb.Elapsed(); el > time.Minute {
+		t.Errorf("Elapsed = %v, want ~0 — a new review must not inherit the previous one's clock", el)
+	}
+}
+
+func TestTouchCheckout_SamePRAdvancesWithoutResetting(t *testing.T) {
+	rig := t.TempDir()
+	if err := TouchDispatch(rig, 100, 1, "aaaa"); err != nil {
+		t.Fatal(err)
+	}
+	origin := ReadHeartbeat(rig).StartedAt
+
+	// Re-checking out the SAME review is an ordinary phase advance; resetting
+	// here would let a reviewer refresh its own runtime clock by re-running
+	// checkout in a loop.
+	if err := TouchCheckout(rig, 100, "aaaa"); err != nil {
+		t.Fatal(err)
+	}
+	hb := ReadHeartbeat(rig)
+	if !hb.StartedAt.Equal(origin) {
+		t.Errorf("StartedAt = %v, want preserved %v for the same review", hb.StartedAt, origin)
+	}
+	if hb.Phase != PhaseCheckout {
+		t.Errorf("Phase = %q, want %q", hb.Phase, PhaseCheckout)
+	}
+}
