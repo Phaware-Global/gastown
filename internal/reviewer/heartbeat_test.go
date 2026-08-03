@@ -445,3 +445,30 @@ func TestTouchCheckout_SamePRAdvancesWithoutResetting(t *testing.T) {
 		t.Errorf("Phase = %q, want %q", hb.Phase, PhaseCheckout)
 	}
 }
+
+func TestTouchCheckout_CarriesTheRequesterForward(t *testing.T) {
+	rig := t.TempDir()
+	// A queued review is picked up at checkout — the dispatcher refused to seed
+	// it while another was in flight — so this is the ONLY place its escalation
+	// address can survive. Dropping it leaves a killed queued review with nobody
+	// to notify, which is the blind spot the escalation exists to close.
+	if err := TouchDispatch(rig, 100, 1, "aaaa", "crew", "gastown/crew/max"); err != nil {
+		t.Fatal(err)
+	}
+	if err := TouchCheckout(rig, 200, "bbbb"); err != nil {
+		t.Fatal(err)
+	}
+	hb := ReadHeartbeat(rig)
+	if hb == nil {
+		t.Fatal("nil heartbeat")
+	}
+	if hb.Requester != "gastown/crew/max" || hb.Origin != "crew" {
+		t.Errorf("requester lost at pickup: %+v", hb)
+	}
+	if hb.PR != 200 {
+		t.Errorf("PR = %d, want the newly checked-out review", hb.PR)
+	}
+	if el := hb.Elapsed(); el > time.Minute {
+		t.Errorf("Elapsed = %v, want a fresh clock for the new review", el)
+	}
+}

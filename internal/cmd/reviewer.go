@@ -784,7 +784,12 @@ func resolveCrewRequester(rigName string) string {
 			}
 		}
 	}
-	return fmt.Sprintf("@crew/%s", rigName)
+	// No concrete crew identity (dispatch from outside a crew worktree). Address
+	// the refinery rather than broadcasting: "@crew/<rig>" reaches everyone and
+	// hands each of them the same actionable re-dispatch instruction, so N crew
+	// members race to re-request one review. The refinery is a single, always-
+	// polled identity that already owns review dispatch for the rig.
+	return fmt.Sprintf("%s/%s", rigName, constants.RoleRefinery)
 }
 
 func runReviewerRequest(cmd *cobra.Command, args []string) error {
