@@ -330,6 +330,14 @@ func TouchCheckout(rigPath string, pr, round int, sha string) error {
 	hb := &Heartbeat{
 		Timestamp: now, StartedAt: now, Phase: PhaseCheckout, PR: pr, Round: round, SHA: sha,
 	}
+	if prev != nil {
+		// Carry the escalation address forward. A QUEUED review is picked up here
+		// — the dispatcher refused to seed it while another was in flight — so
+		// this is the only place its requester can survive. Dropping it leaves a
+		// killed queued review with nobody to notify, which is the blind spot the
+		// escalation exists to close.
+		hb.Origin, hb.Requester = prev.Origin, prev.Requester
+	}
 	return WriteHeartbeat(rigPath, hb)
 }
 

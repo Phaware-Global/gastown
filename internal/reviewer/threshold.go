@@ -2,7 +2,6 @@ package reviewer
 
 import (
 	"time"
-
 )
 
 // MinPassDuration is the floor for a perspective pass's wall-clock budget.

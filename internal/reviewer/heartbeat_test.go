@@ -606,7 +606,7 @@ func TestTouchCheckout_SamePRAdvancesWithoutResetting(t *testing.T) {
 
 func TestWriteHeartbeat_ATrashedTempPathCannotFreezeTheRecord(t *testing.T) {
 	rig := t.TempDir()
-	if err := TouchDispatch(rig, 176, 1, "aaaa"); err != nil {
+	if err := TouchDispatch(rig, 176, 1, "aaaa", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	// os.Remove cannot delete a non-empty directory, so one `mkdir -p
@@ -629,7 +629,7 @@ func TestWriteHeartbeat_ATrashedTempPathCannotFreezeTheRecord(t *testing.T) {
 	}
 	// And a re-dispatch of the same review still lands, so the record cannot be
 	// pinned at a stale identity either.
-	if err := TouchDispatch(rig, 176, 2, "bbbb"); err != nil {
+	if err := TouchDispatch(rig, 176, 2, "bbbb", "crew", "gastown/crew"); err != nil {
 		t.Errorf("TouchDispatch = %v, want nil — a trashed temp path must not wedge the dispatcher", err)
 	}
 	if hb := ReadHeartbeat(rig); hb == nil || hb.Round != 2 {
@@ -650,7 +650,7 @@ func TestTouchCheckout_CannotWedgeTheDispatcher(t *testing.T) {
 	if hb := ReadHeartbeat(rig); hb.PR != 1 {
 		t.Fatalf("precondition: checkout should record what it checked out: %+v", hb)
 	}
-	if err := TouchDispatch(rig, 176, 6, "bbbbbbb"); err != nil {
+	if err := TouchDispatch(rig, 176, 6, "bbbbbbb", "crew", "gastown/crew"); err != nil {
 		t.Errorf("TouchDispatch = %v, want nil — a record no dispatcher seeded must not "+
 			"block the seed", err)
 	}
@@ -680,7 +680,7 @@ func TestClearHeartbeatFor_RecoversARecordNoDispatcherSeeded(t *testing.T) {
 
 func TestClearHeartbeatFor_StillProtectsARealQueuedDispatch(t *testing.T) {
 	rig := t.TempDir()
-	if err := TouchDispatch(rig, 200, 1, "sha200"); err != nil {
+	if err := TouchDispatch(rig, 200, 1, "sha200", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	// The property that must survive the change above: finishing PR 100 must not
@@ -699,7 +699,7 @@ func TestClearHeartbeatFor_StillProtectsARealQueuedDispatch(t *testing.T) {
 
 func TestClearHeartbeatFor_RefusesToActOnAnUnreadableRecord(t *testing.T) {
 	rig := t.TempDir()
-	if err := TouchDispatch(rig, 200, 1, "sha200"); err != nil {
+	if err := TouchDispatch(rig, 200, 1, "sha200", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	// A torn read — no attacker required, just a concurrent rename — made
@@ -717,5 +717,32 @@ func TestClearHeartbeatFor_RefusesToActOnAnUnreadableRecord(t *testing.T) {
 	}
 	if _, serr := os.Stat(HeartbeatPath(rig)); serr != nil {
 		t.Error("the unreadable record must be preserved for the supervisor")
+	}
+}
+
+func TestTouchCheckout_CarriesTheRequesterForward(t *testing.T) {
+	rig := t.TempDir()
+	// A queued review is picked up at checkout — the dispatcher refused to seed
+	// it while another was in flight — so this is the ONLY place its escalation
+	// address can survive. Dropping it leaves a killed queued review with nobody
+	// to notify, which is the blind spot the escalation exists to close.
+	if err := TouchDispatch(rig, 100, 1, "aaaa", "crew", "gastown/crew/max"); err != nil {
+		t.Fatal(err)
+	}
+	if err := TouchCheckout(rig, 200, 0, "bbbb"); err != nil {
+		t.Fatal(err)
+	}
+	hb := ReadHeartbeat(rig)
+	if hb == nil {
+		t.Fatal("nil heartbeat")
+	}
+	if hb.Requester != "gastown/crew/max" || hb.Origin != "crew" {
+		t.Errorf("requester lost at pickup: %+v", hb)
+	}
+	if hb.PR != 200 {
+		t.Errorf("PR = %d, want the newly checked-out review", hb.PR)
+	}
+	if el := hb.Elapsed(); el > time.Minute {
+		t.Errorf("Elapsed = %v, want a fresh clock for the new review", el)
 	}
 }

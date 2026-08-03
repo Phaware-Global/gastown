@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -547,61 +548,6 @@ func TestReapRigReviewer_ClearsAHeartbeatWithAnUnusableTimestamp(t *testing.T) {
 	}
 }
 
-func TestValidReviewerRequester_RejectsForgedAddresses(t *testing.T) {
-	// hb.Requester is read from the rig-writable heartbeat and used as a MAIL
-	// ADDRESS, so an unvalidated value turns the escalation into a delivery
-	// primitive for whoever can write the file.
-	// NOTE: "gastown/crew" is deliberately absent — see
-	// TestValidReviewerRequester_RejectsTheDeadLetterContainer. It is the
-	// container directory, not an identity anyone polls.
-	for _, ok := range []string{"gastown/refinery", "gastown/crew/max", "@crew/gastown"} {
-		if got, valid := validReviewerRequester("gastown", ok); !valid || got != ok {
-			t.Errorf("validReviewerRequester(%q) = (%q,%v), want it accepted", ok, got, valid)
-		}
-	}
-	for _, bad := range []string{
-		"",
-		"otherrig/refinery",       // another rig's mailbox
-		"gastown/mayor",           // not a dispatch origin
-		"gastown/polecats/evil",   // arbitrary agent
-		"../../etc/passwd",
-		"gastown/crew\nBcc: evil", // header-ish injection
-		"gastown/crew",            // container directory: a silent dead letter
-	} {
-		if got, valid := validReviewerRequester("gastown", bad); valid {
-			t.Errorf("validReviewerRequester(%q) = (%q,true), want rejected", bad, got)
-		}
-	}
-}
-
-func TestValidReviewerRequester_RejectsTheDeadLetterContainer(t *testing.T) {
-	// "<rig>/crew" is the CONTAINER directory holding crew members, not an
-	// identity anyone polls. It passes validateRecipient only because the
-	// directory exists, so Send returns nil and the daemon logs a successful
-	// delivery while nobody is told — the crew-origin case this whole function
-	// exists to rescue.
-	if got, ok := validReviewerRequester("gastown", "gastown/crew"); ok {
-		t.Errorf("validReviewerRequester(\"gastown/crew\") = (%q,true); that address is a dead letter", got)
-	}
-	// A concrete crew member normalizes to the "<rig>/<name>" inbox they poll.
-	if _, ok := validReviewerRequester("gastown", "gastown/crew/max"); !ok {
-		t.Error("a concrete crew identity must be accepted")
-	}
-	// The group form, which Router.sendToGroup actually handles.
-	if _, ok := validReviewerRequester("gastown", "@crew/gastown"); !ok {
-		t.Error("the crew group address must be accepted")
-	}
-	// Still rejects everything forged.
-	for _, bad := range []string{
-		"otherrig/crew/max", "gastown/crew/", "gastown/crew/a/b",
-		"@crew/otherrig", "gastown/mayor", "gastown/crew/max evil", "",
-	} {
-		if got, ok := validReviewerRequester("gastown", bad); ok {
-			t.Errorf("validReviewerRequester(%q) = (%q,true), want rejected", bad, got)
-		}
-	}
-}
-
 func TestSafeRound_ClampsImplausibleValues(t *testing.T) {
 	// Round was the one heartbeat-sourced field reaching the mail body, the
 	// subject, and the recipient's nudge without a sanitizer.
@@ -626,5 +572,76 @@ func TestShouldEscalateReviewer_RateLimitsPerRig(t *testing.T) {
 	}
 	if !d.shouldEscalateReviewer("rig-b") {
 		t.Error("the cooldown must be per-rig")
+	}
+}
+
+// crewTown builds a town with real crew-member directories so requester
+// validation can be exercised by ROUTABILITY rather than spelling.
+func crewTown(t *testing.T, rig string, members ...string) string {
+	t.Helper()
+	town := t.TempDir()
+	for _, m := range members {
+		if err := os.MkdirAll(filepath.Join(town, rig, "crew", m), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return town
+}
+
+func TestValidReviewerRequester_ChecksRoutabilityNotSpelling(t *testing.T) {
+	d := &Daemon{config: &Config{TownRoot: crewTown(t, "gastown", "max")}}
+
+	// Real destinations.
+	for _, ok := range []string{"gastown/refinery", "gastown/crew/max"} {
+		if got, valid := d.validReviewerRequester("gastown", ok); !valid || got != ok {
+			t.Errorf("validReviewerRequester(%q) = (%q,%v), want accepted", ok, got, valid)
+		}
+	}
+
+	// Every one of these is a DESTINATION problem, not a spelling problem:
+	//   crew/crew        normalizes back onto the <rig>/crew container dead letter
+	//   crew/witness     normalizes onto an unrelated role of the rig
+	//   crew/ghost       is not a crew member at all
+	// hb.Requester is rig-writable, so each would let a forged heartbeat steer a
+	// daemon-authored notice at a mailbox of the attacker's choosing.
+	for _, bad := range []string{
+		"gastown/crew/crew",
+		"gastown/crew/witness",
+		"gastown/crew/reviewer",
+		"gastown/crew/ghost",
+		"gastown/crew/../../etc",
+		"gastown/crew/.hidden",
+		"gastown/crew",
+		"gastown/crew/",
+		"otherrig/crew/max",
+		"gastown/mayor",
+		"gastown/crew/max evil",
+		"gastown/crew/max\nBcc: evil",
+		"",
+	} {
+		if got, valid := d.validReviewerRequester("gastown", bad); valid {
+			t.Errorf("validReviewerRequester(%q) = (%q,true), want rejected", bad, got)
+		}
+	}
+}
+
+func TestEscalationCooldown_IsNotConsumedByAnUnroutableRequester(t *testing.T) {
+	// The worst failure of the previous round: the cooldown was taken BEFORE the
+	// address was validated, so one forged/unroutable heartbeat silently blacked
+	// out every genuine escalation in that rig for the whole window.
+	d := &Daemon{
+		config:  &Config{TownRoot: crewTown(t, "gastown", "max")},
+		logger:  log.New(io.Discard, "", 0),
+		tmux:    tmux.NewTmux(),
+		rigPool: newRigWorkerPool(1, time.Minute, log.New(io.Discard, "", 0)),
+		ctx:     context.Background(),
+	}
+	// An unroutable requester must not spend the budget.
+	d.escalateReviewerFailure("gastown", &reviewer.Heartbeat{
+		PR: 1, Phase: reviewer.PhasePrompt, Requester: "gastown/crew/ghost",
+	}, "test")
+	if !d.shouldEscalateReviewer("gastown") {
+		t.Error("an unroutable requester consumed the cooldown — the escalation that " +
+			"was never sent must not spend the budget for the one that matters")
 	}
 }

@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -739,24 +740,27 @@ func (d *Daemon) escalateReviewerFailure(rigName string, hb *reviewer.Heartbeat,
 	if hb == nil {
 		return
 	}
-	// Rate-limit. This is the one heartbeat-driven action here that used to have
-	// no cooldown, which made a rig-writable file a per-tick daemon-authored mail
-	// AND nudge amplifier aimed at the refinery — the died-mid-review path fires
-	// on every tick for as long as the record persists.
-	if !d.shouldEscalateReviewer(rigName) {
-		return
-	}
+
 	// The requester is read from the rig-writable heartbeat, so it is untrusted
 	// input being used as a MAIL ADDRESS. Unvalidated, a forged value redirects
 	// the failure notice to an arbitrary mailbox — the escalation becomes a
 	// delivery primitive for whoever can write the file. Only the two addresses
 	// `gt reviewer request` actually writes are accepted.
-	to, ok := validReviewerRequester(rigName, hb.Requester)
+	to, ok := d.validReviewerRequester(rigName, hb.Requester)
 	if !ok {
 		// The feed event is still emitted by the caller, so the kill is never
 		// invisible — it just isn't routed.
 		d.logger.Printf("Reviewer reaper: %s has no valid requester (%q) — kill logged to the feed but not escalated",
 			rigName, reviewer.SafeText(hb.Requester))
+		return
+	}
+
+	// Rate-limit AFTER the address resolves. Consuming the cooldown first meant
+	// a single unroutable (or forged) requester silently blacked out every
+	// genuine escalation in that rig for the whole window — the escalation that
+	// was never sent still spent the budget for the one that mattered.
+	if !d.shouldEscalateReviewer(rigName) {
+		d.logger.Printf("Reviewer reaper: %s escalation suppressed by cooldown", rigName)
 		return
 	}
 
@@ -786,7 +790,6 @@ func (d *Daemon) escalateReviewerFailure(rigName string, hb *reviewer.Heartbeat,
 	if stores := d.BeadsStores(); len(stores) > 0 {
 		router.SetStores(stores)
 	}
-	defer router.WaitPendingNotifications()
 
 	msg := mail.NewMessage("daemon", to,
 		fmt.Sprintf("Review failed: PR #%d (round %d)", pr, round), body)
@@ -797,8 +800,16 @@ func (d *Daemon) escalateReviewerFailure(rigName string, hb *reviewer.Heartbeat,
 	// this runs inline on the daemon's heartbeat path — an unbounded call there
 	// stalls every other recovery phase behind it. Escalation is best-effort;
 	// a slow mailer must never hold the heartbeat hostage.
+	// The goroutine owns the router's full lifecycle. A deferred
+	// WaitPendingNotifications here would run on the timeout path WHILE Send is
+	// still in flight, which panics on the router's WaitGroup and takes the
+	// daemon down — a crash introduced by making the send cancellable.
 	done := make(chan error, 1)
-	go func() { done <- router.Send(msg) }()
+	go func() {
+		err := router.Send(msg)
+		router.WaitPendingNotifications()
+		done <- err
+	}()
 	select {
 	case err := <-done:
 		if err != nil {
@@ -822,25 +833,41 @@ func (d *Daemon) escalateReviewerFailure(rigName string, hb *reviewer.Heartbeat,
 // Anything else — another rig's mailbox, an arbitrary agent, a crafted string —
 // is rejected rather than sanitized, because there is no partially-valid
 // address worth delivering to.
-func validReviewerRequester(rigName, requester string) (string, bool) {
+func (d *Daemon) validReviewerRequester(rigName, requester string) (string, bool) {
 	req := strings.TrimSpace(requester)
 	// The rig's refinery — a real, polled identity.
 	if req == rigName+"/"+constants.RoleRefinery {
 		return req, true
 	}
-	// The rig's crew group. Router.sendToGroup handles this form; "<rig>/crew"
-	// does NOT — that is the container directory, and delivering to it is a
-	// silent dead letter that Send reports as success.
-	if req == "@crew/"+rigName {
-		return req, true
-	}
 	// A concrete crew member: "<rig>/crew/<name>", which normalizes to the
 	// "<rig>/<name>" inbox identity a crew agent actually polls.
-	if name, ok := strings.CutPrefix(req, rigName+"/crew/"); ok &&
-		name != "" && !strings.ContainsAny(name, "/ \t") {
+	//
+	// Checked by ROUTABILITY, not spelling. A name-shaped guard rejects one
+	// spelling rather than one destination: "<rig>/crew/crew" normalizes right
+	// back onto the "<rig>/crew" container dead letter, and
+	// "<rig>/crew/<witness|reviewer|some-polecat>" normalizes onto an unrelated
+	// agent of the rig — so hb.Requester, which is rig-writable, could steer a
+	// daemon-authored notice at an arbitrary mailbox. Requiring the crew member's
+	// own directory to exist is the honest test of "is this a real crew member".
+	if name, ok := strings.CutPrefix(req, rigName+"/crew/"); ok && isRealCrewMember(d.config.TownRoot, rigName, name) {
 		return req, true
 	}
 	return "", false
+}
+
+// isRealCrewMember reports whether <town>/<rig>/crew/<name> is a crew member's
+// own directory. Rejects path escapes and any name that would normalize onto a
+// container or another role.
+func isRealCrewMember(townRoot, rigName, name string) bool {
+	if name == "" || name == "crew" || strings.ContainsAny(name, `/\`) ||
+		name == "." || name == ".." || strings.HasPrefix(name, ".") {
+		return false
+	}
+	if strings.ContainsAny(name, " \t") {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(townRoot, rigName, "crew", name))
+	return err == nil && info.IsDir()
 }
 
 // reviewerAnchor pins a review identity to the session age at which the daemon
