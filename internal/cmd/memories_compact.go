@@ -1032,23 +1032,49 @@ func boundedIdentity(s string) string {
 }
 
 // applyCompactPlan writes the new/changed memories then clears the removed ones.
+//
+// A plan is applied one bd process per memory, so it is not atomic and cannot
+// be rolled back. Returning on the first failure was therefore the worst option
+// available: the writes before it had already landed, the operator was told
+// only which single key failed, and — because clears run last — a memory they
+// approved for removal could stay live and keep being re-injected by gt prime,
+// with no report that it had survived.
+//
+// So every step is attempted, and the summary states exactly what happened. Any
+// remaining work is safe to retry: writes are idempotent updates, and a clear
+// whose memory is already gone is reported by bd as a miss.
 func applyCompactPlan(plan *compactPlan) error {
 	wrote, cleared := 0, 0
+	var failures []string
+
 	for _, s := range plan.sets {
 		if !s.isNew && !s.changed {
 			continue
 		}
 		if err := bdKvSet(s.fullKey, s.value); err != nil {
-			return fmt.Errorf("writing %s: %w", s.fullKey, err)
+			failures = append(failures, fmt.Sprintf("writing %s: %v", s.fullKey, err))
+			continue
 		}
 		wrote++
 	}
 	for _, m := range plan.clears {
 		if err := bdKvClear(m.fullKey); err != nil {
-			return fmt.Errorf("clearing %s: %w", m.fullKey, err)
+			failures = append(failures, fmt.Sprintf("clearing %s: %v", m.fullKey, err))
+			continue
 		}
 		cleared++
 	}
+
+	if len(failures) > 0 {
+		fmt.Printf("%s Partially applied: %d written, %d removed, %d failed.\n",
+			style.Warning.Render("⚠"), wrote, cleared, len(failures))
+		for _, f := range failures {
+			fmt.Printf("   %s %s\n", style.Warning.Render("✗"), f)
+		}
+		return fmt.Errorf("%d of %d memory operations failed — the store is partially compacted; "+
+			"re-run to retry the rest", len(failures), wrote+cleared+len(failures))
+	}
+
 	fmt.Printf("%s Compacted memories: %d written, %d removed.\n",
 		style.Success.Render("✓"), wrote, cleared)
 	return nil
