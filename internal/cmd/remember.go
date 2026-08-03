@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -193,14 +192,95 @@ func sanitizeKey(key string) string {
 	return key
 }
 
-// bdKvSet calls bd kv set <key> <value>.
-func bdKvSet(key, value string) error {
-	cmd := exec.Command("bd", "kv", "set", key, value)
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+// Memory writes go through `bd remember` / `bd forget`, not `bd kv set|clear`.
+//
+// bd reserves the kv namespace this package stores memories in and rejects
+// writes to it outright:
+//
+//	invalid key: key cannot start with "memory." (reserved for persistent
+//	memories; use 'bd remember' / 'bd forget')
+//
+// which broke every memory write — `gt remember`, `gt forget`, and the apply
+// step of `gt memories --compact`, the last of which failed only AFTER the
+// operator confirmed a plan.
+//
+// The two sides use different key forms: `bd remember --key`/`bd forget` take
+// the key WITHOUT the memory. prefix and add it themselves, while `bd kv list`
+// (still the read path, and still permitted) returns it WITH the prefix. So the
+// prefix is stripped on the way in and kept on the way out.
+//
+// bdMemoryKey converts a stored kv key (memory.<type>.<slug>) to the bare key
+// bd's memory commands expect.
+func bdMemoryKey(kvKey string) string {
+	return strings.TrimPrefix(kvKey, memoryKeyPrefix)
 }
 
-// bdKvGet calls bd kv get <key> and returns the value.
+// bdMemoryResult is the --json envelope shared by `bd remember` and
+// `bd forget`. Note the booleans are JSON *strings* ("true"/"false").
+type bdMemoryResult struct {
+	Action  string `json:"action"`  // remember: "remembered" | "updated"
+	Deleted string `json:"deleted"` // forget, on a hit
+	Found   string `json:"found"`   // forget, on a miss: "false"
+	Key     string `json:"key"`
+}
+
+// bdRememberArgs builds the argv for storing one memory.
+//
+// "--" terminates flag parsing: a value beginning with a dash is otherwise
+// consumed as an unknown flag and the write fails ("unknown flag: -x ...").
+func bdRememberArgs(key, value string) []string {
+	return []string{"remember", "--key", bdMemoryKey(key), "--json", "--", value}
+}
+
+// bdForgetArgs builds the argv for removing one memory.
+func bdForgetArgs(key string) []string {
+	return []string{"forget", "--json", "--", bdMemoryKey(key)}
+}
+
+// interpretRememberResult reports whether `bd remember` actually stored.
+func interpretRememberResult(key string, out []byte) error {
+	var res bdMemoryResult
+	if err := json.Unmarshal(out, &res); err != nil {
+		// A bd without --json on this command still signals success by exit
+		// status; don't fail a write it reported as fine.
+		return nil
+	}
+	if res.Action == "" {
+		return fmt.Errorf("bd remember did not store %s: %s", key, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// interpretForgetResult reports whether `bd forget` actually removed anything.
+//
+// bd exits 0 when it deletes nothing, reporting {"found":"false"}. That must be
+// an error here: callers delete keys they just read from the store, so a
+// no-op means the key form is wrong or the store moved underneath — and
+// reporting a removal that did not happen would let applyCompactPlan claim
+// memories were dropped while they remain.
+func interpretForgetResult(key string, out []byte) error {
+	var res bdMemoryResult
+	if err := json.Unmarshal(out, &res); err != nil {
+		return nil
+	}
+	if res.Found == "false" {
+		return fmt.Errorf("bd forget found no memory %s (bd key %q)", key, bdMemoryKey(key))
+	}
+	return nil
+}
+
+// bdKvSet stores a memory value under a memory.* kv key.
+func bdKvSet(key, value string) error {
+	cmd := exec.Command("bd", bdRememberArgs(key, value)...)
+	out, err := cmd.Output()
+	if err != nil {
+		return bdMemoryError(err, out)
+	}
+	return interpretRememberResult(key, out)
+}
+
+// bdKvGet calls bd kv get <key> and returns the value. Reads are unaffected by
+// the reservation above — only writes are refused.
 func bdKvGet(key string) (string, error) {
 	cmd := exec.Command("bd", "kv", "get", key)
 	out, err := cmd.Output()
@@ -210,11 +290,29 @@ func bdKvGet(key string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// bdKvClear calls bd kv clear <key>.
+// bdKvClear removes a memory by its memory.* kv key.
 func bdKvClear(key string) error {
-	cmd := exec.Command("bd", "kv", "clear", key)
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	cmd := exec.Command("bd", bdForgetArgs(key)...)
+	out, err := cmd.Output()
+	if err != nil {
+		return bdMemoryError(err, out)
+	}
+	return interpretForgetResult(key, out)
+}
+
+// bdMemoryError annotates a failed bd memory command with whatever it printed.
+func bdMemoryError(err error, stdout []byte) error {
+	var parts []string
+	if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+		parts = append(parts, strings.TrimSpace(string(ee.Stderr)))
+	}
+	if s := strings.TrimSpace(string(stdout)); s != "" {
+		parts = append(parts, s)
+	}
+	if len(parts) == 0 {
+		return err
+	}
+	return fmt.Errorf("%w: %s", err, strings.Join(parts, "; "))
 }
 
 // parseBdKvListJSON parses bd kv list --json output, keeping only string values.
