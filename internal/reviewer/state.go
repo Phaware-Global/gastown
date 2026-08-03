@@ -105,26 +105,35 @@ func SafePR(pr int) int {
 	return pr
 }
 
-// Runtime is the wall time an absolute cap should act on: the LONGER of the
-// heartbeat's self-reported elapsed and the tmux session's own age.
+// Runtime is the wall time an absolute cap should act on.
 //
-// Neither signal is sufficient alone. Elapsed is forgeable by the reviewer —
-// deleting the file, omitting started_at, or future-dating it all yield 0 or
-// negative, which under an elapsed-only rule reads as "brand new" and evades
-// the cap forever. Session age cannot be reset from inside the session (tmux
-// owns it) but under-reports when a dispatcher seeded the heartbeat before the
-// session existed. Negative inputs are 0 = unknown, never "healthy".
+// It prefers the tmux session's age, which the reviewed process does not own,
+// and falls back to the heartbeat's self-report only when the session clock is
+// unavailable.
+//
+// It used to take the MAX of the two, which corroborated the cap in one
+// direction only. Deleting the heartbeat reports elapsed 0, so max() correctly
+// caught that evasion — but a forged LARGE started_at also wins a max(), which
+// made a rig-writable file sufficient to SIGKILL a healthy thirty-second-old
+// reviewer's whole process tree on the next tick. A clock that can be pushed
+// either way is not corroboration; it is two attack surfaces.
+//
+// Preferring the session clock costs a little accuracy — a dispatcher-seeded
+// heartbeat legitimately predates its session by up to the spawn grace, and a
+// later round shares its predecessor's session — and that inaccuracy is why a
+// cap breach must nudge before it kills rather than acting on this number
+// alone. Accuracy is the right thing to trade away here: the failure mode of an
+// over-estimate is a nudge, and the failure mode of a forgeable clock is a kill.
+//
+// Zero means "unknown" and must never trip a cap.
 func Runtime(elapsed, sessionAge time.Duration) time.Duration {
-	if elapsed < 0 {
-		elapsed = 0
-	}
-	if sessionAge < 0 {
-		sessionAge = 0
-	}
-	if sessionAge > elapsed {
+	if sessionAge > 0 {
 		return sessionAge
 	}
-	return elapsed
+	if elapsed > 0 {
+		return elapsed
+	}
+	return 0
 }
 
 // PhaseAge validates a heartbeat's progress signal, reporting ok=false when it
