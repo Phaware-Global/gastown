@@ -106,6 +106,8 @@ type Daemon struct {
 	// map rather than reviewerLastNudge's: recording a nudge to throttle a log
 	// line would spend the absolute cap's single courtesy nudge.
 	reviewerLastQuietLog map[string]time.Time
+	// reviewerLastEscalate rate-limits failure escalations per rig.
+	reviewerLastEscalate map[string]time.Time
 
 	// Deacon startup tracking: prevents race condition where newly started
 	// sessions are immediately killed by the heartbeat check.
