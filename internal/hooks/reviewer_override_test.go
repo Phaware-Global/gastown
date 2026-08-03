@@ -24,6 +24,13 @@ func TestReviewerOverrideBlocksWriteSurfaces(t *testing.T) {
 	wantBlocked := []string{
 		"gh pr review",
 		"gh api*pulls*reviews", // raw review-API POST path (defense-in-depth)
+		// GraphQL review submission. `gh api graphql` matches neither the
+		// `gh pr review` pattern nor the REST one (which needs the pulls/reviews
+		// path segments), so these need their own matchers — and their own
+		// entries here, or a later cleanup could delete them as apparent
+		// duplicates of the REST guard with the suite still green.
+		"addPullRequestReview",
+		"submitPullRequestReview",
 		"gh pr merge",
 		"git push",
 		"gt refinery pr",

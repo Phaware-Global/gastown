@@ -356,6 +356,20 @@ func validateMergeQueueConfig(c *MergeQueueConfig) error {
 			return fmt.Errorf("reviewer_local=true requires a non-empty pr_reviewer " +
 				"(the reviewer bot login still drives the engagement gate)")
 		}
+		// The Reviewer posts a real verdict, including APPROVE on a clean pass.
+		// That approval is only informational because the Reviewer is a
+		// different identity from the approval gate — a property that was
+		// documented in prose but never enforced, so a copy/paste of the same
+		// machine-user login into both fields would let the bot satisfy the
+		// named-approver gate and merge with zero human review. Enforce it here
+		// so the guarantee holds by construction rather than by convention.
+		if c.PRApprover != "" && c.PRReviewer != "" &&
+			strings.EqualFold(strings.TrimSpace(c.PRApprover), strings.TrimSpace(c.PRReviewer)) {
+			return fmt.Errorf("pr_approver and pr_reviewer must be different identities "+
+				"(both are %q): the reviewer's approval is informational and cannot also be "+
+				"the approval gate, or the bot approves its own reviews and merges without a human",
+				c.PRApprover)
+		}
 		switch c.PRMergeMethod {
 		case "", PRMergeMethodSquash, PRMergeMethodMerge, PRMergeMethodRebase:
 			// valid

@@ -19,6 +19,51 @@ type PerspectiveResult struct {
 	Verdict string `json:"verdict"`
 	// Findings are this pass's individual findings. May be empty.
 	Findings []Finding `json:"findings"`
+	// Disposition optionally escalates this pass's verdict beyond what its
+	// findings' severity implies: "request_changes" or "comment".
+	//
+	// This exists because normalizeFinding requires every finding to anchor to a
+	// path and a positive line, so an objection that is architectural — real, but
+	// with no single diff line to attach it to — cannot be expressed as a
+	// finding at all. Without this field such a pass could only put "BLOCK: do
+	// not merge" in its free-text Verdict, which no code reads, and the review
+	// would post as APPROVE (zero findings) with "do not merge" as its body.
+	//
+	// Escalation only: "approve" is rejected here, because a pass de-escalating
+	// its own verdict has no legitimate use and is the shape a prompt injection
+	// in the reviewed diff would take.
+	Disposition string `json:"disposition,omitempty"`
+}
+
+// dispositionError explains a rejected disposition, naming OMISSION first.
+//
+// The order matters. The message is the only error-recovery guidance a
+// perspective pass has — its role template has no step for a rejected result —
+// so a message that enumerates only the two accepted values steers the repair
+// toward picking one of them, which reproduces a false block (REQUEST_CHANGES
+// with zero threads, unclearable). Omission is the correct repair in almost
+// every case that reaches here.
+func dispositionError(d string) string {
+	trimmed := strings.TrimSpace(d)
+	if strings.HasPrefix(trimmed, "<") && strings.HasSuffix(trimmed, ">") {
+		return fmt.Sprintf("disposition %q is the schema PLACEHOLDER copied literally — "+
+			"drop the field entirely unless you are escalating", d)
+	}
+	return fmt.Sprintf("disposition %q is invalid: omit the field entirely unless you are "+
+		"escalating. The only accepted values are request_changes and comment — a perspective "+
+		"may escalate its verdict, never de-escalate", d)
+}
+
+// dispositionRank orders dispositions by how blocking they are, so consolidating
+// several perspectives can take the most blocking one. Unknown/empty is 0.
+func dispositionRank(d string) int {
+	switch strings.ToLower(strings.TrimSpace(d)) {
+	case "comment":
+		return 1
+	case "request_changes":
+		return 2
+	}
+	return 0
 }
 
 // ParsePerspectiveResult unmarshals and validates one perspective pass's output.
@@ -45,6 +90,13 @@ func ParsePerspectiveResult(data []byte) (*PerspectiveResult, error) {
 		return nil, fmt.Errorf("perspective result (%s): verdict must be a single line (no newlines)", r.Perspective)
 	}
 	r.Verdict = strings.TrimSpace(r.Verdict)
+	// Escalation-only: a pass may raise its verdict above what its findings
+	// imply, never lower it. "approve" is rejected rather than ignored so the
+	// contract violation is visible instead of silently dropped.
+	r.Disposition = strings.ToLower(strings.TrimSpace(r.Disposition))
+	if r.Disposition != "" && dispositionRank(r.Disposition) == 0 {
+		return nil, fmt.Errorf("perspective result (%s): %s", r.Perspective, dispositionError(r.Disposition))
+	}
 	for i := range r.Findings {
 		// The execution contract requires every finding's perspective to match
 		// the pass. Canonicalize to the pass perspective when empty OR a
@@ -172,9 +224,21 @@ func Consolidate(results []PerspectiveResult, reviewedSHA string) *Findings {
 		}
 	}
 
+	// Fold the per-perspective dispositions by taking the most blocking one: if
+	// any single lens says "request changes", the consolidated review must say
+	// so, regardless of what the other lenses concluded. A dissenting block is
+	// never averaged away.
+	disposition := ""
+	for _, r := range results {
+		if dispositionRank(r.Disposition) > dispositionRank(disposition) {
+			disposition = strings.ToLower(strings.TrimSpace(r.Disposition))
+		}
+	}
+
 	return &Findings{
 		Summary:     strings.TrimRight(sb.String(), "\n"),
 		ReviewedSHA: reviewedSHA,
 		Findings:    out,
+		Disposition: disposition,
 	}
 }

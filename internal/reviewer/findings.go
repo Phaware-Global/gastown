@@ -59,11 +59,16 @@ type Findings struct {
 	// Findings are the individual inline findings. May be empty (a clean review
 	// still posts a summary).
 	Findings []Finding `json:"findings"`
-	// Disposition optionally overrides the GitHub review event the Reviewer
-	// submits: "approve", "request_changes", or "comment" (case-insensitive).
-	// When empty, the event is derived from finding severity (see ReviewEvent).
-	// Lets a perspective pass assert a blocking verdict explicitly while keeping
-	// a deterministic default when the agent omits it.
+	// Disposition optionally ESCALATES the GitHub review event: "request_changes"
+	// or "comment" (case-insensitive). "approve" is rejected — see
+	// validDispositions. It is a floor, not an override: the submitted event is
+	// the more blocking of this value and the severity-derived one, so it can
+	// raise a verdict but never lower one (see ReviewEvent). When empty, the
+	// event comes from finding severity alone.
+	//
+	// It exists so a pass can assert a blocking verdict it cannot anchor to a
+	// diff line, which normalizeFinding's path+line requirement makes
+	// inexpressible as a finding.
 	Disposition string `json:"disposition,omitempty"`
 }
 
@@ -74,15 +79,24 @@ var validPriorities = map[string]bool{"high": true, "medium": true, "low": true}
 // GitHub review event it selects. The closed set is enforced at the contract
 // boundary: ParseFindings rejects any non-empty, unrecognized disposition, so a
 // typo fails loudly rather than silently degrading a blocking verdict.
+//
+// "approve" is deliberately absent. Disposition exists to ESCALATE past the
+// severity tally — to express a blocking objection that cannot be anchored to a
+// diff line — and an approving disposition can only ever be a no-op (it already
+// agrees with the tally) or a de-escalation. Excluding it makes the closed set
+// identical to the one ParsePerspectiveResult enforces, so the two entry points
+// describe one contract instead of disagreeing, and matches what the help text,
+// the payload schema, and the role template all state.
 var validDispositions = map[string]string{
-	"approve":         "APPROVE",
 	"request_changes": "REQUEST_CHANGES",
 	"comment":         "COMMENT",
 }
 
 // ReviewEvent returns the GitHub review disposition for these findings:
-// "APPROVE", "REQUEST_CHANGES", or "COMMENT". An explicit Disposition wins;
-// otherwise it is derived from the highest severity present:
+// "APPROVE", "REQUEST_CHANGES", or "COMMENT". The result is the MORE BLOCKING
+// of an explicit Disposition and the severity-derived event — a disposition can
+// only escalate, never de-escalate. Severity derivation uses the highest
+// priority present:
 //
 //	high   → REQUEST_CHANGES (blocking; must be addressed)
 //	medium → COMMENT         (advisory; worth fixing, not a block)
@@ -98,9 +112,49 @@ var validDispositions = map[string]string{
 // boundary, so the lookup-miss fallthrough below only fires for the empty
 // (severity-derived) case on payloads from the sanctioned path.
 func (fs *Findings) ReviewEvent() string {
+	derived := fs.severityEvent()
+	// Disposition is a FLOOR, never an override: the submitted event is the more
+	// blocking of the explicit disposition and the severity tally.
+	//
+	// Letting the explicit value win outright is subtly wrong in both directions.
+	// "approve" over a high finding is the obvious prompt-injection shape — the
+	// Reviewer's primary input is the PR diff, attacker-influenced by
+	// construction. But "comment" is worse in practice, because it needs no bad
+	// actor at all: a perf lens legitimately escalating its own clean tally to
+	// COMMENT would, under an override, silently downgrade a *different* lens's
+	// high finding from REQUEST_CHANGES to COMMENT — averaging away exactly the
+	// dissenting block that Consolidate's fold exists to preserve.
+	//
+	// Taking the maximum makes escalation the only possible effect, structurally,
+	// for every disposition value rather than by special case.
 	if ev, ok := validDispositions[strings.ToLower(strings.TrimSpace(fs.Disposition))]; ok {
-		return ev
+		if eventRank(ev) > eventRank(derived) {
+			return ev
+		}
 	}
+	return derived
+}
+
+// eventRank orders review events by how blocking they are.
+func eventRank(event string) int {
+	switch event {
+	case "COMMENT":
+		return 1
+	case "REQUEST_CHANGES":
+		return 2
+	}
+	return 0 // APPROVE, or anything unrecognized
+}
+
+// SeverityEvent is the event finding severity alone implies, ignoring any
+// disposition. Exported so callers can tell whether a disposition actually
+// raised the verdict or merely agreed with the tally.
+func (fs *Findings) SeverityEvent() string {
+	return fs.severityEvent()
+}
+
+// severityEvent derives the review event from finding severity alone.
+func (fs *Findings) severityEvent() string {
 	hasMedium := false
 	for _, f := range fs.Findings {
 		// Normalize defensively for Findings built outside ParseFindings (which
@@ -139,7 +193,15 @@ func ParseFindings(data []byte) (*Findings, error) {
 	fs.Disposition = strings.ToLower(strings.TrimSpace(fs.Disposition))
 	if fs.Disposition != "" {
 		if _, ok := validDispositions[fs.Disposition]; !ok {
-			return nil, fmt.Errorf("findings.disposition %q is invalid (want approve, request_changes, or comment)", fs.Disposition)
+			// Name "approve" specifically: it is the value an agent is most
+			// likely to reach for, and a bare "invalid" would not explain why
+			// escalation is the only direction the override travels.
+			if fs.Disposition == "approve" {
+				return nil, fmt.Errorf("findings.disposition=approve is not accepted: the override may " +
+					"only escalate a verdict, never de-escalate. A clean or nits-only payload already " +
+					"derives APPROVE from severity — drop the disposition")
+			}
+			return nil, fmt.Errorf("findings.%s", dispositionError(fs.Disposition))
 		}
 	}
 	for i := range fs.Findings {
@@ -147,6 +209,13 @@ func ParseFindings(data []byte) (*Findings, error) {
 			return nil, err
 		}
 	}
+	// No de-escalation check is needed here: ReviewEvent takes the maximum of the
+	// disposition and the severity tally, so a disposition ranking below the
+	// tally is inert by construction rather than by validation. That matters
+	// because comment-with-a-high-finding is a LEGITIMATE payload — one lens
+	// escalating its own clean tally while another lens found something high —
+	// and rejecting it would break correct usage. The floor resolves it to
+	// REQUEST_CHANGES, which is the right answer.
 	return &fs, nil
 }
 

@@ -479,16 +479,18 @@ func DefaultOverrides() map[string]*HooksConfig {
 		// Reviewer roles: write-surface guard (P23-2376).
 		// The Reviewer's only sanctioned write surfaces are its review bead, its
 		// own worktree (checkout only), and PR review comments posted through
-		// `gt reviewer post`. Everything below is blocked so a prompt-injected
-		// or confused reviewer session can't approve, merge, push, resolve
-		// threads, drive the refinery, or close MR beads.
+		// `gt reviewer post` (which submits the review's verdict — APPROVE,
+		// REQUEST_CHANGES, or COMMENT — through the tested output contract).
+		// Everything below is blocked so a prompt-injected or confused reviewer
+		// session can't merge, push, resolve threads, drive the refinery, close
+		// MR beads, or route a verdict around `gt reviewer post`.
 		"reviewer": {
 			PreToolUse: []HookEntry{
 				{
 					Matcher: "Bash(*gh pr review*)",
 					Hooks: []Hook{{
 						Type:    "command",
-						Command: "echo '❌ BLOCKED: Reviewer posts reviews only via `gt reviewer post` (COMMENT reviews). Raw `gh pr review` bypasses the tested output contract and can approve/request-changes, which the merge gates do not model.' && exit 2",
+						Command: "echo '❌ BLOCKED: Reviewer posts reviews only via `gt reviewer post`, which submits the verdict (APPROVE/REQUEST_CHANGES/COMMENT) through the tested output contract. Raw `gh pr review` bypasses that contract.' && exit 2",
 					}},
 				},
 				{
@@ -502,6 +504,27 @@ func DefaultOverrides() map[string]*HooksConfig {
 					Hooks: []Hook{{
 						Type:    "command",
 						Command: "echo '❌ BLOCKED: Reviewer posts reviews only via `gt reviewer post`. Raw `gh api .../pulls/N/reviews` bypasses the tested output contract.' && exit 2",
+					}},
+				},
+				{
+					// The GraphQL review-submission mutations. `gh api graphql`
+					// matches neither the `gh pr review` pattern nor the REST
+					// `*gh api*pulls*reviews*` one (which needs those path
+					// segments), so without this a session could submit an
+					// approving review under the machine-user token with no
+					// output-contract validation. The sibling resolveReviewThread
+					// matcher already establishes that this role reaches GraphQL.
+					Matcher: "Bash(*addPullRequestReview*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviewer posts reviews only via `gt reviewer post`. The GraphQL addPullRequestReview/submitPullRequestReview mutations bypass the tested output contract.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*submitPullRequestReview*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviewer posts reviews only via `gt reviewer post`. The GraphQL addPullRequestReview/submitPullRequestReview mutations bypass the tested output contract.' && exit 2",
 					}},
 				},
 				{

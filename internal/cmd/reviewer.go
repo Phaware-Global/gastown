@@ -58,27 +58,50 @@ the PR head, reviews from configurable perspectives, and posts its findings as a
 single GitHub review with inline comment threads under a dedicated machine-user
 identity.
 
-The Reviewer never approves and never merges — human approval is the merge gate.
-Posting goes exclusively through ` + "`gt reviewer post`" + `; raw ` + "`gh pr review`" + ` is
-tap-guard-blocked.`,
+The Reviewer submits a real verdict — APPROVE, REQUEST_CHANGES, or COMMENT —
+derived from finding severity, or escalated by a perspective's disposition.
+
+Scope of that approval: it does NOT satisfy the named pr_approver gate, because
+config validation requires pr_approver and pr_reviewer to be different
+identities. It DOES count toward the pr_required_approvals count gate and toward
+any branch-protection approval rule, exactly like a human's — GitHub's approval
+count has no notion of a bot. Size those gates accordingly, or the Reviewer's
+APPROVE fills a slot a human was meant to fill.
+
+The Reviewer never merges. Posting goes exclusively through ` + "`gt reviewer post`" + `;
+raw ` + "`gh pr review`" + ` is tap-guard-blocked.`,
 }
 
 var reviewerPostCmd = &cobra.Command{
 	Use:   "post",
-	Short: "Post a review (one COMMENT review with inline finding threads)",
+	Short: "Post a review (one review with inline finding threads)",
 	Long: `Post a code review to a PR from a findings JSON payload.
 
 This is the ONLY sanctioned review-posting path. It submits a single review
-(event=COMMENT) anchored to the reviewed head SHA, with one inline thread per
-finding. Each finding body carries a neutral shields.io priority badge and a
-[perspective] tag so the refinery's review-fix loop and human reviewers can act
-on it.
+anchored to the reviewed head SHA, with one inline thread per finding. Each
+finding body carries a neutral shields.io priority badge and a [perspective] tag
+so the refinery's review-fix loop and human reviewers can act on it.
+
+The review event is derived from finding severity — any high finding is
+REQUEST_CHANGES, any medium is COMMENT, and a clean or nits-only pass is APPROVE.
+
+A perspective that must block on something it cannot anchor to a diff line
+(an architectural objection) sets "disposition" in its PerspectiveResult;
+'gt reviewer consolidate' folds the most blocking one into the payload below.
+
+"disposition" is a FLOOR, not an override: the submitted event is the more
+blocking of the disposition and the severity tally, so it can only ever raise
+the verdict. The accepted set is "request_changes" and "comment"; "approve" is
+rejected, since an approving disposition can only be a no-op or a
+de-escalation. This is why a "comment" from one perspective can never suppress
+another perspective's high finding.
 
 The findings file (--findings, or "-" for stdin) is a JSON object:
 
   {
     "summary": "per-perspective verdicts + counts",
     "reviewed_sha": "<optional; --sha overrides>",
+    "disposition": "<optional; request_changes|comment — escalation only>",
     "findings": [
       {"path": "internal/foo.go", "line": 42, "priority": "high",
        "perspective": "adversarial", "title": "nil deref",
@@ -308,7 +331,11 @@ func runReviewerPost(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("submitting review for PR #%d: %w", reviewerPostPR, err)
 	}
 
-	fmt.Printf("Posted review on PR #%d: %d inline finding(s)", reviewerPostPR, len(in.Comments))
+	// Report the submitted event. The verdict is derived, not stated by the
+	// caller, and submitting it is irreversible — so a reviewer that mis-tagged
+	// a finding's priority could otherwise post an APPROVE and read a success
+	// line byte-identical to the REQUEST_CHANGES one.
+	fmt.Printf("Posted %s review on PR #%d: %d inline finding(s)", in.Event, reviewerPostPR, len(in.Comments))
 	if sha != "" {
 		fmt.Printf(" at %s", shortSHA(sha))
 	}
@@ -606,6 +633,23 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 	}
 
 	fs := reviewer.Consolidate(results, reviewerConsolidateSHA)
+
+	// Report the event on STDERR, before the --out branch, so every invocation
+	// gets it. Posting is irreversible and the Reviewer cannot clear its own
+	// review, so the verdict has to be visible at the last reversible step — and
+	// the sanctioned `consolidate | post --findings -` pipe has no --out.
+	// Stderr specifically: stdout carries the JSON payload.
+	event := fs.ReviewEvent()
+	fmt.Fprintf(os.Stderr, "Consolidated findings (%d) — will post as %s\n", len(fs.Findings), event)
+	// Only call it an escalation when the disposition actually RAISED the event.
+	// A disposition that merely agrees with the severity tally, or one the floor
+	// absorbed, changes nothing — naming it as the cause of a block would send
+	// the reader to the wrong lens.
+	if fs.Disposition != "" && event != fs.SeverityEvent() {
+		fmt.Fprintf(os.Stderr, "  (raised from %s by a perspective's disposition=%q)\n",
+			fs.SeverityEvent(), fs.Disposition)
+	}
+
 	encoded, err := json.MarshalIndent(fs, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encoding consolidated findings: %w", err)
@@ -616,6 +660,11 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 		if err := os.WriteFile(reviewerConsolidateOut, encoded, 0o644); err != nil { //nolint:gosec // operator-facing output
 			return fmt.Errorf("writing %s: %w", reviewerConsolidateOut, err)
 		}
+		// Report the event this payload will submit. Posting is irreversible and
+		// the Reviewer cannot clear its own review (gh pr review and both GraphQL
+		// review mutations are tap-guard-blocked), so the resolved verdict has to
+		// be visible at the last reversible step — not for the first time in
+		// `post`'s output, after it has already been submitted.
 		fmt.Printf("Wrote consolidated findings (%d) to %s\n", len(fs.Findings), reviewerConsolidateOut)
 		return nil
 	}
