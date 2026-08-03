@@ -65,25 +65,35 @@ func TestSafePR_ClampsImplausibleValues(t *testing.T) {
 	}
 }
 
-func TestRuntime_UnforgeableAndNeverNegative(t *testing.T) {
-	// A reviewer that deletes its heartbeat reports elapsed 0; tmux owns the
-	// session clock and it cannot be reset from inside the session.
+func TestRuntime_PrefersTheUnforgeableClock(t *testing.T) {
+	// The session clock is owned by tmux and cannot be reset from inside the
+	// session, so it wins whenever it is known.
 	if got := Runtime(0, 3*time.Hour); got != 3*time.Hour {
 		t.Errorf("Runtime = %v, want the session age when elapsed is forged to 0", got)
 	}
-	// A dispatcher-seeded heartbeat legitimately predates the session.
-	if got := Runtime(3*time.Hour, 5*time.Minute); got != 3*time.Hour {
-		t.Errorf("Runtime = %v, want the larger heartbeat elapsed", got)
+	// The direction the old max() got wrong: a forged LARGE started_at must not
+	// be able to charge a young session for hours it never ran. Under max() this
+	// was a kill primitive — a rig-writable file could SIGKILL a healthy
+	// thirty-second-old reviewer's whole process tree on the next tick.
+	if got := Runtime(10*time.Hour, 5*time.Minute); got != 5*time.Minute {
+		t.Errorf("Runtime = %v, want the session age (%v) — a forged elapsed must not "+
+			"induce a kill", got, 5*time.Minute)
 	}
-	// Negative (future-dated) inputs must read as unknown, never healthy.
+	// Only when the session clock is unavailable does the self-report apply.
+	if got := Runtime(90*time.Minute, 0); got != 90*time.Minute {
+		t.Errorf("Runtime = %v, want the heartbeat elapsed when the session age is unknown", got)
+	}
+	// Negative (future-dated) inputs must read as unknown, never as healthy.
 	if got := Runtime(-time.Hour, -time.Hour); got != 0 {
 		t.Errorf("Runtime = %v, want 0 for negative inputs", got)
 	}
 	if got := Runtime(-time.Hour, 2*time.Hour); got != 2*time.Hour {
-		t.Errorf("Runtime = %v, want session age to survive a forged negative elapsed", got)
+		t.Errorf("Runtime = %v, want the session age to survive a forged negative elapsed", got)
+	}
+	if got := Runtime(0, 0); got != 0 {
+		t.Errorf("Runtime = %v, want 0 when both signals are unknown", got)
 	}
 }
-
 func TestPhaseAge_RejectsBothDirectionsOfNonsense(t *testing.T) {
 	// Zero timestamp: time.Since yields ~2562047h, which renders as garbage on an
 	// operator's screen and would trip every threshold at once.
