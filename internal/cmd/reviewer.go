@@ -242,7 +242,8 @@ func init() {
 	reviewerPromptCmd.Flags().IntVar(&reviewerPromptMaxFindings, "max-findings", 0,
 		"per-pass finding cap (default: the rig's review.max_findings_per_perspective)")
 	reviewerPromptCmd.Flags().DurationVar(&reviewerPromptMaxDuration, "max-duration", 0,
-		"soft wall-clock budget for the pass; it returns a partial result rather than hanging (default: half the reviewer stuck_threshold)")
+		"soft wall-clock budget for the pass; it returns a partial result rather than hanging "+
+			"(default: half the rig's stuck_threshold, floored at 5m)")
 	_ = reviewerPromptCmd.MarkFlagRequired("pr")
 	_ = reviewerPromptCmd.MarkFlagRequired("sha")
 
@@ -551,6 +552,15 @@ func loadRigReviewConfig() (townRoot, rigName, rigPath string, reviewCfg *config
 	return townRoot, rigName, r.Path, reviewCfg, nil
 }
 
+// resolvePassDuration picks the pass budget: an explicit --max-duration when
+// given, else the rig-derived default (half its clamped stuck threshold).
+func resolvePassDuration(townRoot, rigPath string) time.Duration {
+	if reviewerPromptMaxDuration > 0 {
+		return reviewerPromptMaxDuration
+	}
+	return reviewer.PassDuration(townRoot, rigPath)
+}
+
 func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 	perspective := args[0]
 	if reviewerPromptPR <= 0 {
@@ -603,7 +613,7 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 		Round:             reviewerPromptRound,
 		PriorThreads:      priorThreads,
 		MaxFindings:       maxFindings,
-		MaxDuration:       reviewerPromptMaxDuration,
+		MaxDuration:       resolvePassDuration(townRoot, rigPath),
 		ExtraInstructions: extra,
 	})
 	if err != nil {
@@ -829,7 +839,17 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 	// Start the reviewer session if not already running, injecting the token as
 	// GH_TOKEN/GITHUB_TOKEN. Idempotent: a running session drains the new mail.
 	mgr := reviewer.NewManager(r)
-	if serr := mgr.EnsureRunning("", map[string]string{"GH_TOKEN": tokenVal, "GITHUB_TOKEN": tokenVal}); serr != nil {
+	switch serr := mgr.EnsureRunning("", map[string]string{"GH_TOKEN": tokenVal, "GITHUB_TOKEN": tokenVal}); {
+	case serr == nil:
+	case errors.Is(serr, reviewer.ErrSessionWedged):
+		// The mail is queued but the session is not draining it. Say so loudly and
+		// name the remedy: the daemon's reaper will recycle the session on a later
+		// tick with all of its gates applied, and an operator who does not want to
+		// wait has an explicit command. Dispatch deliberately does not kill.
+		style.PrintWarning("reviewer session for %s appears wedged — PR #%d is queued but may not be "+
+			"picked up until the session is recycled. The daemon reaper will handle it; to act now, run "+
+			"`gt reviewer stop --rig %s --force`.", r.Name, spec.PR, r.Name)
+	default:
 		// The request mail persists; await-review's timeout is the safety net.
 		fmt.Fprintf(os.Stderr, "warning: review request mailed but reviewer session did not start: %v\n", serr)
 	}

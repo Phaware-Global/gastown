@@ -56,7 +56,7 @@ demonstrable weakness. Cap: at most **{{ .MaxFindings }}** findings; if you find
 more, keep the highest-severity {{ .MaxFindings }} and note the overflow in your
 verdict.
 
-### 5. Time budget — return something rather than nothing
+### 5. Time budget — return something, and say so in a way the code can read
 You have a soft budget of **{{ .MaxDuration }}** for this pass. Nothing enforces
 it from outside your session: if you never return, the whole review stalls with
 no partial result, and the only recovery is the daemon killing the reviewer —
@@ -64,11 +64,21 @@ which discards everything you found.
 
 So treat the budget as a hard commitment. As you approach it, stop
 investigating, keep the findings you have already established to the evidence
-standard above, and return them. Set your `verdict` to say the pass was cut
-short and what you did not get to (e.g. `"partial: budget reached mid-review;
-covered auth paths, did not review the migration"`). A partial pass with an
-honest verdict is far more useful than silence: findings you return are acted
-on, and the gap you name tells a human where to look.
+standard above, and return them.
+
+**If you cut the pass short, you MUST set `"disposition": "comment"`** (see the
+schema below) *and* say in your `verdict` what you did not get to.
+
+That is not a formality. `verdict` is free text that no code reads: it lands in
+the review body and nothing else. A pass that stops early with zero established
+findings and no disposition is indistinguishable from a clean pass, so the
+review posts as an **APPROVE** — an endorsement of a diff you did not finish
+reading. The disposition is the only channel that makes "I ran out of time"
+visible to the machinery.
+
+If you did establish findings before running out, return them normally; their
+severity speaks for itself and the disposition simply prevents the result from
+reading as a complete pass.
 
 Never pad findings to fill the budget, and never drop below the evidence
 standard to produce more of them.

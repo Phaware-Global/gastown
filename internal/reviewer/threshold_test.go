@@ -48,12 +48,27 @@ func TestIsWedged_OnlyPastTheKillMultiple(t *testing.T) {
 	}
 }
 
-func TestDefaultPassDuration_LeavesRoomBeforeTheReaperActs(t *testing.T) {
-	// A pass must be able to blow its budget and still return a partial result
-	// before the reaper starts nudging; otherwise the budget buys nothing.
-	if DefaultPassDuration >= DefaultStuckThreshold {
+func TestPassDuration_DerivesFromTheRigAndHasAFloor(t *testing.T) {
+	// An unconfigured rig falls back to the default threshold; the budget must
+	// leave room to blow it and still return before the reaper nudges.
+	d := PassDuration(t.TempDir(), t.TempDir())
+	if d >= DefaultStuckThreshold {
 		t.Errorf("pass budget %v must be under the stuck threshold %v, or a pass that "+
-			"honors its budget still trips the reaper", DefaultPassDuration, DefaultStuckThreshold)
+			"honors its budget still trips the reaper", d, DefaultStuckThreshold)
+	}
+	if d < MinPassDuration {
+		t.Errorf("pass budget %v is below the floor %v — a budget that small stops a "+
+			"pass before it establishes anything, which rubber-stamps the PR", d, MinPassDuration)
+	}
+}
+
+func TestIsWedged_ClampsBeforeMultiplyingToAvoidOverflow(t *testing.T) {
+	// An unclamped rig-configured threshold overflows stuck*StuckMultiple into a
+	// negative duration, inverting the comparison into "always wedged" — an
+	// agent-writable config value becoming an unconditional recycle.
+	hb := &Heartbeat{Timestamp: time.Now(), Phase: PhasePrompt}
+	if IsWedged(hb, time.Duration(1<<62)) {
+		t.Error("a fresh heartbeat must not be wedged under an absurd threshold (overflow)")
 	}
 }
 
@@ -88,19 +103,42 @@ func TestBuildPerspectivePrompt_RendersTimeBudget(t *testing.T) {
 	}
 }
 
-func TestBuildPerspectivePrompt_DefaultsTimeBudget(t *testing.T) {
+func TestBuildPerspectivePrompt_FloorsTheTimeBudget(t *testing.T) {
+	// An unset or absurdly small budget must be corrected UP to the floor. A
+	// sub-minute budget tells the pass to stop before it has established
+	// anything, which posts an APPROVE on an unreviewed diff.
+	for _, given := range []time.Duration{0, -time.Hour, time.Second} {
+		out, err := BuildPerspectivePrompt(PromptParams{
+			Perspective: "security", Lens: "look for holes", RigName: "r", PR: 1, SHA: "abc",
+			MaxDuration: given,
+		})
+		if err != nil {
+			t.Fatalf("BuildPerspectivePrompt(%v): %v", given, err)
+		}
+		if !strings.Contains(out, MinPassDuration.String()) {
+			t.Errorf("MaxDuration=%v must render the floor %v", given, MinPassDuration)
+		}
+		if strings.Contains(out, "budget of **0s**") {
+			t.Error("must never render a zero budget")
+		}
+	}
+}
+
+func TestBuildPerspectivePrompt_BudgetExhaustionMustSetADisposition(t *testing.T) {
+	// The gap this closes: a pass that stops early with zero findings and no
+	// disposition is indistinguishable from a clean pass, so the review posts as
+	// APPROVE — an endorsement of a diff the pass did not finish reading.
 	out, err := BuildPerspectivePrompt(PromptParams{
-		Perspective: "security", Lens: "look for holes", RigName: "r", PR: 1, SHA: "abc",
+		Perspective: "adversarial", Lens: "look", RigName: "r", PR: 1, SHA: "abc",
 	})
 	if err != nil {
-		t.Fatalf("BuildPerspectivePrompt: %v", err)
+		t.Fatal(err)
 	}
-	if !strings.Contains(out, DefaultPassDuration.String()) {
-		t.Errorf("an unset MaxDuration must render DefaultPassDuration (%v), not a zero budget",
-			DefaultPassDuration)
+	if !strings.Contains(out, `"disposition": "comment"`) {
+		t.Error("the budget section must tell a truncated pass to set disposition=comment; " +
+			"verdict alone is free text no code reads")
 	}
-	// A zero budget would read as "you have no time", which is worse than absent.
-	if strings.Contains(out, "budget of **0s**") {
-		t.Error("must never render a zero budget")
+	if !strings.Contains(out, "APPROVE") {
+		t.Error("the contract should state the consequence (a posted APPROVE), not just the rule")
 	}
 }
