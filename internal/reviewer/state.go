@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/session"
 )
 
@@ -348,6 +350,23 @@ const (
 	MinStuckThreshold = 31 * time.Minute
 	MaxStuckThreshold = 6 * time.Hour
 )
+
+// StuckThreshold resolves a rig's configured stall threshold from its role
+// definition, falling back to DefaultStuckThreshold.
+//
+// The single source for the configured value. The daemon reaper, the
+// dispatch-time wedge check, and `gt reviewer status` all call it, so "the
+// reaper would kill this session", "dispatch should recycle this session", and
+// "the CLI says it is stalled" can never drift into three different numbers.
+// Callers that ACT on it must pass the result through ClampStuckThreshold —
+// reviewer.toml is agent-writable.
+func StuckThreshold(townRoot, rigPath string) time.Duration {
+	def, err := config.LoadRoleDefinition(townRoot, rigPath, constants.RoleReviewer)
+	if err != nil || def == nil || def.Health.StuckThreshold.Duration <= 0 {
+		return DefaultStuckThreshold
+	}
+	return def.Health.StuckThreshold.Duration
+}
 
 // ClampStuckThreshold bounds a configured threshold into the supported range,
 // reporting whether it had to be adjusted. An out-of-range value is replaced by
