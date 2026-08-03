@@ -66,7 +66,10 @@ type PromptParams struct {
 	// subagent's session — the point is that a pass which runs long returns a
 	// partial result with an honest verdict instead of hanging the whole review
 	// until the daemon kills the reviewer and discards everything it found.
-	// Zero falls back to DefaultPassDuration.
+	// Below MinPassDuration (including zero) is corrected UP to that floor; a
+	// budget that small stops the pass before it establishes anything. Callers
+	// that know the rig should pass PassDuration(townRoot, rigPath), which
+	// derives half the rig's clamped stuck threshold.
 	MaxDuration time.Duration
 	// ExtraInstructions is the injection slot for additional execution
 	// instructions, appended after the shared contract. Usually empty.

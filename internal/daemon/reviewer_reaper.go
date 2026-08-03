@@ -196,13 +196,22 @@ func (d *Daemon) reapRigReviewer(rigName string, peers []string) {
 		if !shouldClearDeadDispatch(age, ageOK) {
 			return
 		}
-		d.logger.Printf("Reviewer reaper: %s reviewer has no session (phase=%s pr=%d, no progress for %s) — clearing stale heartbeat",
-			rigName, reviewer.SafePhase(hb.Phase), reviewer.SafePR(hb.PR), age.Round(time.Second))
+		reason, detail := "died_mid_review", fmt.Sprintf("no progress for %s", age.Round(time.Second))
+		if !ageOK {
+			// Distinguish the case this branch was widened to handle. Reporting
+			// "no progress for 0s" for a record that has no usable timestamp at
+			// all describes the opposite of what happened, and elapsed=0s in the
+			// feed reads as "just started".
+			reason, detail = "unusable_heartbeat", "heartbeat has no usable timestamp"
+		}
+		d.logger.Printf("Reviewer reaper: %s reviewer has no session (phase=%s pr=%d, %s) — clearing stale heartbeat",
+			rigName, reviewer.SafePhase(hb.Phase), reviewer.SafePR(hb.PR), detail)
 		_ = events.LogFeed(events.TypeSessionDeath, rigName+"/"+constants.RoleReviewer,
 			map[string]interface{}{
-				"rig": rigName, "role": constants.RoleReviewer, "reason": "died_mid_review",
+				"rig": rigName, "role": constants.RoleReviewer, "reason": reason,
 				"phase": reviewer.SafePhase(hb.Phase), "pr": reviewer.SafePR(hb.PR),
 				"elapsed": reviewer.SafeText(hb.Elapsed().Round(time.Second).String()),
+				"detail":  reviewer.SafeText(detail),
 			})
 		if cerr := reviewer.ClearHeartbeat(rigPath); cerr != nil {
 			d.logger.Printf("Reviewer reaper: clearing %s heartbeat: %v", rigName, cerr)

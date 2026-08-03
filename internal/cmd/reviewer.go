@@ -883,7 +883,7 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "warning: review request mailed but reviewer session did not start: %v\n", serr)
 	}
 
-	// Seed the heartbeat AFTER the mail is sent and after EnsureRunning.
+	// Seed the heartbeat AFTER the mail is sent, and after EnsureRunning.
 	//
 	// After the mail, because seeding first left a permanent `dispatched` record
 	// when the send failed — the dispatcher already returned a hard error the
