@@ -146,6 +146,13 @@ func eventRank(event string) int {
 	return 0 // APPROVE, or anything unrecognized
 }
 
+// SeverityEvent is the event finding severity alone implies, ignoring any
+// disposition. Exported so callers can tell whether a disposition actually
+// raised the verdict or merely agreed with the tally.
+func (fs *Findings) SeverityEvent() string {
+	return fs.severityEvent()
+}
+
 // severityEvent derives the review event from finding severity alone.
 func (fs *Findings) severityEvent() string {
 	hasMedium := false
@@ -194,7 +201,7 @@ func ParseFindings(data []byte) (*Findings, error) {
 					"only escalate a verdict, never de-escalate. A clean or nits-only payload already " +
 					"derives APPROVE from severity — drop the disposition")
 			}
-			return nil, fmt.Errorf("findings.disposition %q is invalid (want request_changes or comment)", fs.Disposition)
+			return nil, fmt.Errorf("findings.%s", dispositionError(fs.Disposition))
 		}
 	}
 	for i := range fs.Findings {

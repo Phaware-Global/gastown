@@ -35,6 +35,25 @@ type PerspectiveResult struct {
 	Disposition string `json:"disposition,omitempty"`
 }
 
+// dispositionError explains a rejected disposition, naming OMISSION first.
+//
+// The order matters. The message is the only error-recovery guidance a
+// perspective pass has — its role template has no step for a rejected result —
+// so a message that enumerates only the two accepted values steers the repair
+// toward picking one of them, which reproduces a false block (REQUEST_CHANGES
+// with zero threads, unclearable). Omission is the correct repair in almost
+// every case that reaches here.
+func dispositionError(d string) string {
+	trimmed := strings.TrimSpace(d)
+	if strings.HasPrefix(trimmed, "<") && strings.HasSuffix(trimmed, ">") {
+		return fmt.Sprintf("disposition %q is the schema PLACEHOLDER copied literally — "+
+			"drop the field entirely unless you are escalating", d)
+	}
+	return fmt.Sprintf("disposition %q is invalid: omit the field entirely unless you are "+
+		"escalating. The only accepted values are request_changes and comment — a perspective "+
+		"may escalate its verdict, never de-escalate", d)
+}
+
 // dispositionRank orders dispositions by how blocking they are, so consolidating
 // several perspectives can take the most blocking one. Unknown/empty is 0.
 func dispositionRank(d string) int {
@@ -76,9 +95,7 @@ func ParsePerspectiveResult(data []byte) (*PerspectiveResult, error) {
 	// contract violation is visible instead of silently dropped.
 	r.Disposition = strings.ToLower(strings.TrimSpace(r.Disposition))
 	if r.Disposition != "" && dispositionRank(r.Disposition) == 0 {
-		return nil, fmt.Errorf("perspective result (%s): disposition %q is invalid "+
-			"(want request_changes or comment — a perspective may escalate its verdict, never de-escalate)",
-			r.Perspective, r.Disposition)
+		return nil, fmt.Errorf("perspective result (%s): %s", r.Perspective, dispositionError(r.Disposition))
 	}
 	for i := range r.Findings {
 		// The execution contract requires every finding's perspective to match
