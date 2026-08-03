@@ -242,3 +242,19 @@ func TestState_DescribeIsPopulatedForEveryState(t *testing.T) {
 		}
 	}
 }
+
+func TestClassify_UnusableTimestampWithNoSessionIsNotHeldOpenForever(t *testing.T) {
+	// A record with a zero timestamp and no session cannot be a live dispatch.
+	// Classifying it as spawning forever would be harmless on its own, but
+	// TouchDispatch refuses whenever prev.PR differs — so a phantom record that
+	// is never cleared permanently locks out every later dispatch's telemetry.
+	// The reaper's no-session branch must therefore act on it; this pins that the
+	// classifier does not report it as a healthy in-flight review.
+	hb := &Heartbeat{Phase: PhasePrompt, PR: 180} // Timestamp zero
+	if got := Classify(Observation{Heartbeat: hb}); got == StateWorking {
+		t.Error("an unusable timestamp with no session must not classify as working")
+	}
+	if _, ok := PhaseAge(hb); ok {
+		t.Error("a zero timestamp must report unknown")
+	}
+}

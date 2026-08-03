@@ -95,16 +95,45 @@ func (m *Manager) Stop() error {
 	return t.KillSession(sessionID)
 }
 
-// EnsureRunning starts the Reviewer session if it isn't already running.
-// Returns nil (no error) when a healthy session already exists, so callers can
-// dispatch idempotently: a second review request for the same rig simply
-// queues in the running session's mailbox. extraEnv is applied only when a new
-// session is started (an already-running session keeps its original env).
+// ErrSessionWedged means a live reviewer session has stopped making progress,
+// so a new request would queue into a mailbox nobody is draining.
+var ErrSessionWedged = errors.New("reviewer session is wedged")
+
+// EnsureRunning starts the Reviewer session if it isn't already running, and
+// reports ErrSessionWedged when a running one has stopped draining work.
+//
+// The plain "already healthy → return nil" check is not sufficient on its own.
+// IsRunning is CheckSessionHealth with no inactivity check, so it reports
+// "healthy" for any session whose tmux and agent process are both alive —
+// including one that has stopped reading its mailbox entirely. Dispatching into
+// such a session mails a request nobody will ever read: the refinery times out
+// at 30m, escalates, and the wedged session survives to swallow the next round.
+//
+// This DETECTS and REPORTS; it deliberately does not kill.
+//
+// Killing here was a session-kill primitive that bypassed every gate the
+// daemon's kill has — the patrol enable switch, the parked/docked rig filter,
+// the per-rig kill cooldown, the TOCTOU re-read, the feed event, and the
+// escalation to whoever asked for the review. It also raced the reaper on the
+// identical predicate with no lock, so a dispatch and a patrol tick could both
+// decide to recycle and the reaper could kill the session EnsureRunning had
+// just started. Two independent killers acting on one shared file is not a race
+// worth winning; there should only be one.
+//
+// The reaper owns termination, with all of those gates. The caller surfaces
+// this error so an operator can act immediately (`gt reviewer stop --force`)
+// rather than waiting a tick.
 func (m *Manager) EnsureRunning(agentOverride string, extraEnv map[string]string) error {
-	if running, _ := m.IsRunning(); running {
-		return nil
+	running, _ := m.IsRunning()
+	if !running {
+		return m.Start(agentOverride, extraEnv)
 	}
-	return m.Start(agentOverride, extraEnv)
+	townRoot := filepath.Dir(m.rig.Path)
+	if IsWedged(ReadHeartbeat(m.rig.Path), StuckThreshold(townRoot, m.rig.Path)) {
+		return ErrSessionWedged
+	}
+	// Genuinely working, or idle between reviews: queue in its mailbox.
+	return nil
 }
 
 // Start spawns the Reviewer agent in a tmux session. ZFC-compliant: no state

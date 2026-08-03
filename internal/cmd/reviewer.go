@@ -43,6 +43,7 @@ var (
 	reviewerPromptPriorThreads string
 	reviewerPromptInstructions string
 	reviewerPromptMaxFindings  int
+	reviewerPromptMaxDuration  time.Duration
 
 	reviewerConsolidateSHA string
 	reviewerConsolidateOut string
@@ -240,6 +241,9 @@ func init() {
 		`file of extra execution instructions to inject (or "-" for stdin)`)
 	reviewerPromptCmd.Flags().IntVar(&reviewerPromptMaxFindings, "max-findings", 0,
 		"per-pass finding cap (default: the rig's review.max_findings_per_perspective)")
+	reviewerPromptCmd.Flags().DurationVar(&reviewerPromptMaxDuration, "max-duration", 0,
+		"soft wall-clock budget for the pass; it returns a partial result rather than hanging "+
+			"(default: half the rig's stuck_threshold; clamped to [5m, stuck_threshold))")
 	_ = reviewerPromptCmd.MarkFlagRequired("pr")
 	_ = reviewerPromptCmd.MarkFlagRequired("sha")
 
@@ -548,6 +552,19 @@ func loadRigReviewConfig() (townRoot, rigName, rigPath string, reviewCfg *config
 	return townRoot, rigName, r.Path, reviewCfg, nil
 }
 
+// resolvePassDuration picks the pass budget: an explicit --max-duration when
+// given, else the rig-derived default (half its clamped stuck threshold).
+func resolvePassDuration(townRoot, rigPath string) time.Duration {
+	stuck, _ := reviewer.ClampStuckThreshold(reviewer.StuckThreshold(townRoot, rigPath))
+	if reviewerPromptMaxDuration > 0 {
+		// Bounded on BOTH sides. Too small stops the pass before it establishes
+		// anything (a rubber stamp); too large outruns the reaper's phase rail, so
+		// the session is killed mid-pass and every finding is discarded.
+		return reviewer.ClampPassDuration(reviewerPromptMaxDuration, stuck)
+	}
+	return reviewer.PassDuration(townRoot, rigPath)
+}
+
 func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 	perspective := args[0]
 	if reviewerPromptPR <= 0 {
@@ -600,6 +617,7 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 		Round:             reviewerPromptRound,
 		PriorThreads:      priorThreads,
 		MaxFindings:       maxFindings,
+		MaxDuration:       resolvePassDuration(townRoot, rigPath),
 		ExtraInstructions: extra,
 	})
 	if err != nil {
@@ -822,33 +840,61 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("sending review request to %s: %w", to, err)
 	}
 
-	// Seed the heartbeat only AFTER the mail is on its way. Seeding first left a
-	// permanent `dispatched` record when the send failed — the dispatcher already
-	// returned a hard error the caller can retry, so the reaper's later
-	// "dispatched but never started" escalation would be duplicate noise about a
-	// failure that was never silent, and the retry would inherit the failed
-	// attempt's clock.
+	// Start the reviewer session if not already running, injecting the token as
+	// GH_TOKEN/GITHUB_TOKEN. Idempotent: a running session drains the new mail.
+	mgr := reviewer.NewManager(r)
+	wedged := false
+	switch serr := mgr.EnsureRunning("", map[string]string{"GH_TOKEN": tokenVal, "GITHUB_TOKEN": tokenVal}); {
+	case serr == nil:
+	case errors.Is(serr, reviewer.ErrSessionWedged):
+		wedged = true
+		// The mail is queued but the session is not draining it. Say so loudly and
+		// name the remedy: the daemon's reaper will recycle the session on a later
+		// tick with all of its gates applied, and an operator who does not want to
+		// wait has an explicit command. Dispatch deliberately does not kill.
+		style.PrintWarning("reviewer session for %s appears wedged — PR #%d is queued but may not be "+
+			"picked up until the session is recycled. The daemon reaper will handle it; to act now, run "+
+			"`gt reviewer stop --rig %s --force`.", r.Name, spec.PR, r.Name)
+	default:
+		// The request mail persists; await-review's timeout is the safety net.
+		fmt.Fprintf(os.Stderr, "warning: review request mailed but reviewer session did not start: %v\n", serr)
+	}
+
+	// Seed the heartbeat AFTER the mail is sent, and after EnsureRunning.
 	//
-	// The seed still precedes EnsureRunning below, which is the case it exists
-	// for: a request that is mailed but whose session never starts.
+	// After the mail, because seeding first left a permanent `dispatched` record
+	// when the send failed — the dispatcher already returned a hard error the
+	// caller can retry on, so a later "dispatched but never started" escalation
+	// would be duplicate noise about a failure that was never silent.
+	//
+	// After EnsureRunning, so the seed reflects whether the session actually came
+	// up. EnsureRunning's failure is non-fatal, so a request whose session never
+	// starts is still recorded here.
+	//
+	// A wedged session's heartbeat is EVIDENCE, not stale data — it is the only
+	// thing that will make the reaper act. Seeding over it resets the phase clock
+	// to zero, flipping Classify from KillImminent back to Working, so the remedy
+	// the warning above just promised never arrives. Worse, re-dispatch cadence
+	// (30m) is shorter than the phase kill rail (90m), so the rail could never
+	// fire: each dispatch would rescue the very session it was queueing behind.
+	//
+	// The queued request is safe in the mailbox and gets its own record once the
+	// session is recycled and actually starts working.
+	if wedged {
+		fmt.Printf("Dispatched review of PR #%d (round %d, origin %s) → %s\n", prNumber, spec.Round, origin, to)
+		return nil
+	}
+
 	switch err := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA); {
 	case err == nil:
 	case errors.Is(err, reviewer.ErrReviewInFlight):
-		// Queued behind an unfinished review. Mail is the work queue and the
-		// request is safely in it; the in-flight review's telemetry is what
-		// supervisors need, so it is deliberately left intact.
+		// Queued behind an unfinished review on a DIFFERENT PR. Mail is the work
+		// queue and the request is safely in it; the in-flight review's telemetry
+		// is what supervisors need, so it is deliberately left intact.
 		fmt.Fprintf(os.Stderr,
 			"note: reviewer is mid-review; PR #%d is queued and will be recorded when it starts\n", spec.PR)
 	default:
 		fmt.Fprintf(os.Stderr, "warning: seeding reviewer heartbeat: %v\n", err)
-	}
-
-	// Start the reviewer session if not already running, injecting the token as
-	// GH_TOKEN/GITHUB_TOKEN. Idempotent: a running session drains the new mail.
-	mgr := reviewer.NewManager(r)
-	if serr := mgr.EnsureRunning("", map[string]string{"GH_TOKEN": tokenVal, "GITHUB_TOKEN": tokenVal}); serr != nil {
-		// The request mail persists; await-review's timeout is the safety net.
-		fmt.Fprintf(os.Stderr, "warning: review request mailed but reviewer session did not start: %v\n", serr)
 	}
 
 	fmt.Printf("Dispatched review of PR #%d (round %d, origin %s) → %s\n", prNumber, spec.Round, origin, to)
