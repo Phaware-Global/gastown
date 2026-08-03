@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/reviewer"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -20,6 +21,7 @@ import (
 var (
 	reviewerStopRig    string
 	reviewerStopForce  bool
+	reviewerStopPR     int
 	reviewerStatusRig  string
 	reviewerStatusJSON bool
 	reviewerListJSON   bool
@@ -75,6 +77,8 @@ omitted unless --json is given.`,
 
 func init() {
 	reviewerStopCmd.Flags().StringVar(&reviewerStopRig, "rig", "", "rig name (default: inferred from cwd)")
+	reviewerStopCmd.Flags().IntVar(&reviewerStopPR, "pr", 0,
+		"only clear the heartbeat if it records this PR (omit to clear unconditionally)")
 	reviewerStopCmd.Flags().BoolVar(&reviewerStopForce, "force", false,
 		"kill the process group immediately instead of interrupting first")
 
@@ -111,6 +115,11 @@ func resolveReviewerRig(explicit string) (string, string, error) {
 
 // ReviewerState is the reported state of one rig's Reviewer, combining session
 // liveness with heartbeat progress.
+//
+// Every heartbeat-sourced string is sanitized before it lands here, because
+// these values are printed to a terminal: a forged heartbeat with an embedded
+// ESC sequence could otherwise rewrite the operator's screen — erasing the row
+// that would have revealed a stalled review, or drawing a fake one.
 type ReviewerState struct {
 	Rig       string `json:"rig"`
 	Session   string `json:"session"`
@@ -122,41 +131,100 @@ type ReviewerState struct {
 	PhaseAge  string `json:"phase_age,omitempty"`
 	Elapsed   string `json:"elapsed,omitempty"`
 	Diagnosis string `json:"diagnosis"`
+	// Err is set when the rig could not be inspected (unresolvable session
+	// target, tmux failure). Reported rather than swallowed: "cannot tell" and
+	// "healthy" must not look the same to an operator.
+	Err string `json:"error,omitempty"`
 }
 
-// collectReviewerState reads one rig's reviewer session + heartbeat.
+// collectReviewerState reads one rig's reviewer session + heartbeat and
+// classifies it with reviewer.Classify — the SAME function the daemon reaper
+// uses, so `gt reviewer status` can never report "working" for a session the
+// reaper is about to kill.
 func collectReviewerState(rigName, rigPath string) ReviewerState {
-	sessionName := session.ReviewerSessionName(session.PrefixFor(rigName))
-	t := tmux.NewTmux()
-	running, _ := t.HasSession(sessionName)
+	st := ReviewerState{Rig: rigName}
 
-	st := ReviewerState{Rig: rigName, Session: sessionName, Running: running}
-	hb := reviewer.ReadHeartbeat(rigPath)
+	// Read the heartbeat FIRST and unconditionally. An unresolvable session
+	// target must block acting on the rig, not reporting on it — the heartbeat is
+	// still readable and is exactly what an operator needs in order to understand
+	// a misconfigured rig.
+	hb, rerr := reviewer.ReadHeartbeatE(rigPath)
 	if hb != nil {
-		st.Phase, st.PR, st.Round, st.SHA = hb.Phase, hb.PR, hb.Round, hb.SHA
-		st.PhaseAge = hb.Age().Round(time.Second).String()
-		if el := hb.Elapsed(); el > 0 {
-			st.Elapsed = el.Round(time.Second).String()
+		st.Phase = reviewer.SafePhase(hb.Phase)
+		st.PR = reviewer.SafePR(hb.PR)
+		st.Round = hb.Round
+		st.SHA = reviewer.SafeSHA(hb.SHA)
+		if age, ok := reviewer.PhaseAge(hb); ok {
+			st.PhaseAge = age.Round(time.Second).String()
 		}
 	}
-	st.Diagnosis = diagnoseReviewer(running, hb)
+
+	obs := reviewer.Observation{
+		Heartbeat:      hb,
+		ReadErr:        rerr,
+		StuckThreshold: clampedStuckThreshold(rigPath),
+	}
+
+	sessionName, serr := reviewer.ResolveSessionName(rigName)
+	if serr != nil {
+		// Refusing an ambiguous target matters more here than in the reaper:
+		// `gt reviewer stop` acts on this name, and a rig without beads.prefix
+		// collapses onto the shared "gt-reviewer", so guessing would let an
+		// operator kill a rig they did not name.
+		st.Err = serr.Error()
+	} else {
+		st.Session = sessionName
+		t := tmux.NewTmux()
+		running, herr := t.HasSession(sessionName)
+		if herr != nil {
+			// Surface rather than swallow: "cannot tell" and "healthy" must not
+			// look the same to an operator.
+			st.Err = herr.Error()
+		} else {
+			st.Running = running
+			obs.SessionAlive = running
+			obs.SessionAge = sessionAgeOrZero(t, sessionName, running)
+		}
+	}
+
+	if hb != nil {
+		// Report the CORROBORATED runtime, not the heartbeat's self-report. The
+		// reaper deliberately refuses to trust elapsed alone (it is forgeable by
+		// the reviewer), so showing the raw value would tell an operator a
+		// different story than the one the reaper is acting on.
+		if rt := reviewer.Runtime(hb.Elapsed(), obs.SessionAge); rt > 0 {
+			st.Elapsed = rt.Round(time.Second).String()
+		}
+	}
+
+	st.Diagnosis = reviewer.Classify(obs).Describe()
+	if st.Err != "" {
+		st.Diagnosis += " (session state unknown: " + st.Err + ")"
+	}
 	return st
 }
 
-// diagnoseReviewer names the four session/heartbeat combinations in the same
-// terms the daemon's reaper uses, so an operator reading `gt reviewer status`
-// and an operator reading the daemon log see the same vocabulary.
-func diagnoseReviewer(running bool, hb *reviewer.Heartbeat) string {
-	switch {
-	case !running && hb == nil:
-		return "idle — no reviewer session, no review in flight"
-	case !running && hb != nil:
-		return "died mid-review — heartbeat present but no session (the reaper will clear it)"
-	case running && hb == nil:
-		return "orphan — session running with no review on record (self-termination may have failed)"
-	default:
-		return "working"
+// sessionAgeOrZero returns the tmux session's age, or 0 when unknown.
+func sessionAgeOrZero(t *tmux.Tmux, sessionName string, running bool) time.Duration {
+	if !running {
+		return 0
 	}
+	created, err := t.GetSessionCreatedTime(sessionName)
+	if err != nil || created.IsZero() {
+		return 0
+	}
+	return time.Since(created)
+}
+
+// clampedStuckThreshold resolves the rig's threshold through the same clamp the
+// reaper applies, so the CLI's notion of "stalled" matches the reaper's.
+func clampedStuckThreshold(rigPath string) time.Duration {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return reviewer.DefaultStuckThreshold
+	}
+	clamped, _ := reviewer.ClampStuckThreshold(reviewer.StuckThreshold(townRoot, rigPath))
+	return clamped
 }
 
 func runReviewerStop(cmd *cobra.Command, args []string) error {
@@ -164,25 +232,53 @@ func runReviewerStop(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	sessionName := session.ReviewerSessionName(session.PrefixFor(rigName))
+	// Refuse an ambiguous target. A rig without beads.prefix collapses onto the
+	// shared "gt-reviewer" session name, so guessing here would let an operator
+	// kill a rig they did not name.
+	sessionName, serr := reviewer.ResolveSessionName(rigName)
+	if serr != nil {
+		return fmt.Errorf("cannot determine which session belongs to rig %s: %w", rigName, serr)
+	}
+
 	t := tmux.NewTmux()
 	running, err := t.HasSession(sessionName)
 	if err != nil {
 		return fmt.Errorf("checking session: %w", err)
 	}
-	if !running {
-		// Still clear a stale heartbeat: a dead session with a live heartbeat is
-		// the "died mid-review" state, and leaving the record behind makes the
-		// rig read as permanently stalled.
-		if hb := reviewer.ReadHeartbeat(rigPath); hb != nil {
-			if cerr := reviewer.ClearHeartbeat(rigPath); cerr != nil {
-				return fmt.Errorf("clearing stale heartbeat: %w", cerr)
-			}
-			fmt.Printf("No reviewer session for rig %s; cleared a stale heartbeat (PR #%d, phase %s).\n",
-				rigName, hb.PR, hb.Phase)
-			return nil
+
+	hb, rerr := reviewer.ReadHeartbeatE(rigPath)
+	if rerr != nil {
+		// An unreadable heartbeat is the one case where an unconditional clear is
+		// right: it cannot be matched against --pr, and leaving it makes the rig
+		// permanently unusable to both the reaper and status.
+		style.PrintWarning("reviewer heartbeat is unreadable (%v) — clearing it", rerr)
+		if cerr := reviewer.ClearHeartbeat(rigPath); cerr != nil {
+			return fmt.Errorf("clearing unreadable heartbeat: %w", cerr)
 		}
-		return fmt.Errorf("no reviewer session running for rig %s", rigName)
+	}
+
+	if !running {
+		if hb == nil {
+			return fmt.Errorf("no reviewer session running for rig %s", rigName)
+		}
+		// A heartbeat with no session is AMBIGUOUS: it is both how a dead reviewer
+		// looks and how a still-spawning dispatch looks, because `gt reviewer
+		// request` seeds the record before the session exists. Deleting it inside
+		// the spawn window destroys the only evidence that a request was made —
+		// while that request's mail is still sitting in the mailbox, so the review
+		// would later start with no record at all.
+		if reviewer.Classify(reviewer.Observation{Heartbeat: hb}) == reviewer.StateSpawning {
+			return fmt.Errorf("rig %s has a review dispatched for PR #%d but no session yet "+
+				"(still inside the %s spawn window) — its request mail is queued and the session "+
+				"may still come up; wait, or re-run once it has",
+				rigName, reviewer.SafePR(hb.PR), reviewer.SpawnGrace)
+		}
+		if _, cerr := reviewer.ClearHeartbeatFor(rigPath, reviewerStopPR); cerr != nil {
+			return fmt.Errorf("clearing stale heartbeat: %w", cerr)
+		}
+		fmt.Printf("No reviewer session for rig %s; cleared a stale heartbeat (PR #%d, phase %s).\n",
+			rigName, reviewer.SafePR(hb.PR), reviewer.SafePhase(hb.Phase))
+		return nil
 	}
 
 	if !reviewerStopForce {
@@ -190,15 +286,41 @@ func runReviewerStop(cmd *cobra.Command, args []string) error {
 		_ = t.SendKeysRaw(sessionName, "C-c")
 		session.WaitForSessionExit(t, sessionName, constants.GracefulShutdownTimeout)
 	}
-	if stillUp, _ := t.HasSession(sessionName); stillUp {
+	stillUp, err := t.HasSession(sessionName)
+	if err != nil {
+		// Previously this error was swallowed and the command printed "Stopped
+		// reviewer" without having killed anything.
+		return fmt.Errorf("re-checking session before kill: %w", err)
+	}
+	if stillUp {
 		if err := t.KillSessionWithProcesses(sessionName); err != nil {
 			return fmt.Errorf("killing session %s: %w", sessionName, err)
 		}
 	}
-	// Clear after the kill, mirroring the reaper: a heartbeat outliving its
-	// session makes an idle rig look stalled.
-	if err := reviewer.ClearHeartbeat(rigPath); err != nil {
-		style.PrintWarning("could not clear reviewer heartbeat: %v", err)
+
+	// An operator-initiated kill is an audit event. Without it the only record
+	// that a review was terminated is the heartbeat this command then deletes,
+	// so a stopped review would leave no trace at all.
+	pr, phase := 0, ""
+	if hb != nil {
+		pr, phase = reviewer.SafePR(hb.PR), reviewer.SafePhase(hb.Phase)
+	}
+	if ferr := events.LogFeed(events.TypeKill, rigName+"/"+constants.RoleReviewer,
+		map[string]interface{}{
+			"rig": rigName, "role": constants.RoleReviewer,
+			"reason": "operator_stop", "pr": pr, "phase": phase,
+			"forced": reviewerStopForce,
+		}); ferr != nil {
+		style.PrintWarning("could not record the stop in the feed: %v", ferr)
+	}
+
+	cleared, cerr := reviewer.ClearHeartbeatFor(rigPath, reviewerStopPR)
+	switch {
+	case cerr != nil:
+		style.PrintWarning("could not clear reviewer heartbeat: %v", cerr)
+	case !cleared && hb != nil:
+		fmt.Printf("Left the heartbeat in place — it records PR #%d, not #%d.\n",
+			reviewer.SafePR(hb.PR), reviewerStopPR)
 	}
 	fmt.Printf("Stopped reviewer for rig %s (session %s).\n", rigName, sessionName)
 	return nil
@@ -232,6 +354,10 @@ func runReviewerStatus(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  Elapsed:   %s (total review time)\n", st.Elapsed)
 	}
 	fmt.Printf("  State:     %s\n", st.Diagnosis)
+	if st.Err != "" {
+		// "could not tell" must never render as "healthy".
+		style.PrintWarning("inspection incomplete: %s", st.Err)
+	}
 	return nil
 }
 

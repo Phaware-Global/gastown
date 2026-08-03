@@ -1,75 +1,60 @@
 package cmd
 
 import (
+	"os"
 	"strings"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/reviewer"
 )
 
-func TestDiagnoseReviewer_CoversAllFourStates(t *testing.T) {
-	live := &reviewer.Heartbeat{Timestamp: time.Now(), StartedAt: time.Now(), Phase: reviewer.PhasePrompt, PR: 1}
-
-	tests := []struct {
-		name    string
-		running bool
-		hb      *reviewer.Heartbeat
-		want    string // substring
-	}{
-		{"idle rig", false, nil, "idle"},
-		{"died mid-review", false, live, "died mid-review"},
-		{"orphan session", true, nil, "orphan"},
-		{"working", true, live, "working"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := diagnoseReviewer(tc.running, tc.hb)
-			if !strings.Contains(got, tc.want) {
-				t.Errorf("diagnoseReviewer(%v, hb=%v) = %q, want it to mention %q",
-					tc.running, tc.hb != nil, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestDiagnoseReviewer_DistinguishesDeadFromIdle(t *testing.T) {
-	// The distinction that matters operationally: a rig with no reviewer at all
-	// is healthy; a rig whose reviewer died mid-review left work unfinished and
-	// needs the refinery to re-dispatch. Both have no session.
-	idle := diagnoseReviewer(false, nil)
-	dead := diagnoseReviewer(false, &reviewer.Heartbeat{Phase: reviewer.PhaseConsolidate, PR: 9})
-	if idle == dead {
-		t.Error("an idle rig and a rig whose reviewer died mid-review must not report the same state")
-	}
-}
-
-func TestCollectReviewerState_ReportsHeartbeatFields(t *testing.T) {
+func TestCollectReviewerState_SurfacesHeartbeatFieldsSanitized(t *testing.T) {
 	rigPath := t.TempDir()
-	started := time.Now().Add(-30 * time.Minute)
 	if err := reviewer.WriteHeartbeat(rigPath, &reviewer.Heartbeat{
 		Timestamp: time.Now().Add(-5 * time.Minute),
-		StartedAt: started,
-		Phase:     reviewer.PhasePrompt,
-		PR:        175,
-		Round:     2,
-		SHA:       "abcdef1234567890",
+		StartedAt: time.Now().Add(-30 * time.Minute),
+		// A forged phase carrying a terminal escape: unescaped, this would let a
+		// rig-writable file rewrite the operator's screen.
+		Phase: "prompt\x1b[2J\rFAKE",
+		PR:    175,
+		Round: 2,
+		SHA:   "not-a-sha",
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	st := collectReviewerState("testrig", rigPath)
-	if st.PR != 175 || st.Round != 2 || st.Phase != reviewer.PhasePrompt {
-		t.Errorf("heartbeat fields not surfaced: %+v", st)
+	if st.Phase != "unknown" {
+		t.Errorf("Phase = %q, want \"unknown\" — an unrecognized phase must not reach the terminal", st.Phase)
 	}
-	if st.Elapsed == "" {
-		t.Error("Elapsed must be reported — it is the number the reaper's absolute cap acts on")
+	if st.SHA != "unknown" {
+		t.Errorf("SHA = %q, want \"unknown\" for a non-hex value", st.SHA)
 	}
-	if st.PhaseAge == "" {
-		t.Error("PhaseAge must be reported")
+	if st.PR != 175 || st.Round != 2 {
+		t.Errorf("identity fields not surfaced: %+v", st)
 	}
-	if st.Rig != "testrig" {
-		t.Errorf("Rig = %q, want testrig", st.Rig)
+	if st.Diagnosis == "" {
+		t.Error("Diagnosis must always be populated")
+	}
+}
+
+func TestCollectReviewerState_UsesTheSharedClassifier(t *testing.T) {
+	// The CLI must never report a state the reaper would not act on. Both go
+	// through reviewer.Classify, so a heartbeat with no session inside the spawn
+	// window reads as "spawning" here exactly as it does in the daemon.
+	rigPath := t.TempDir()
+	if err := reviewer.WriteHeartbeat(rigPath, &reviewer.Heartbeat{
+		Timestamp: time.Now(), StartedAt: time.Now(),
+		Phase: reviewer.PhaseDispatched, PR: 9,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	st := collectReviewerState("testrig", rigPath)
+	want := reviewer.StateSpawning.Describe()
+	if !strings.HasPrefix(st.Diagnosis, want) {
+		t.Errorf("Diagnosis = %q, want %q", st.Diagnosis, want)
 	}
 }
 
@@ -83,17 +68,28 @@ func TestCollectReviewerState_NoHeartbeatLeavesProgressEmpty(t *testing.T) {
 	}
 }
 
-func TestCollectReviewerState_UnknownStartedAtOmitsElapsed(t *testing.T) {
-	// Elapsed() is 0 when StartedAt is unset. Reporting "0s" would read as "just
-	// started" rather than "unknown", which is the opposite of the truth.
+func TestCollectReviewerState_UnreadableIsNotIdle(t *testing.T) {
+	// A corrupt heartbeat previously read as "idle", which is the state that
+	// invites the harshest cleanup — and stop could not clear it.
 	rigPath := t.TempDir()
-	if err := reviewer.WriteHeartbeat(rigPath, &reviewer.Heartbeat{
-		Timestamp: time.Now(), Phase: reviewer.PhaseCheckout, PR: 5,
-	}); err != nil {
+	path := reviewer.HeartbeatPath(rigPath)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if st := collectReviewerState("testrig", rigPath); st.Elapsed != "" {
-		t.Errorf("Elapsed = %q, want empty when StartedAt is unknown", st.Elapsed)
+	if err := os.WriteFile(path, []byte("{corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st := collectReviewerState("testrig", rigPath)
+	if st.Diagnosis == reviewer.StateIdle.Describe() {
+		t.Error("a corrupt heartbeat must not report as idle")
+	}
+}
+
+func TestCollectReviewerState_ReportsUnknownRatherThanHealthy(t *testing.T) {
+	// An unresolvable session target must surface, not silently look fine.
+	st := collectReviewerState("rig-with-no-registry-entry", t.TempDir())
+	if st.Err == "" {
+		t.Error("an uninspectable rig must not report as working")
 	}
 }
 
