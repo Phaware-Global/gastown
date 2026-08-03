@@ -3,12 +3,14 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/reviewer"
 )
 
@@ -25,6 +27,16 @@ const (
 	// forged heartbeat drives a kill every tick — an unbounded denial of service
 	// against a role that respawns on demand.
 	reviewerKillCooldown = 5 * time.Minute
+	// reviewerEscalateCooldown rate-limits failure escalations per rig. The
+	// died-mid-review path fires on every tick for as long as the record
+	// persists, so without this a rig-writable heartbeat is a daemon-authored
+	// mail + nudge amplifier aimed at the refinery.
+	reviewerEscalateCooldown = 30 * time.Minute
+
+	// reviewerEscalateTimeout bounds the mail send, which shells out to bd and
+	// can block on Dolt. This runs inline on the heartbeat path, so an unbounded
+	// call stalls every later recovery phase behind it.
+	reviewerEscalateTimeout = 20 * time.Second
 )
 
 // reapStuckReviewers checks every known rig's Reviewer session and nudges or
@@ -153,6 +165,7 @@ func (d *Daemon) reapRigReviewer(rigName string) {
 				"elapsed": reviewer.SafeText(hb.Elapsed().Round(time.Second).String()),
 				"detail":  reviewer.SafeText(detail),
 			})
+		d.escalateReviewerFailure(rigName, hb, "reviewer session died mid-review")
 		if cerr := reviewer.ClearHeartbeat(rigPath); cerr != nil {
 			d.logger.Printf("Reviewer reaper: clearing %s heartbeat: %v", rigName, cerr)
 		}
@@ -322,6 +335,31 @@ func (d *Daemon) reviewerWasNudged(rigName string) bool {
 	return ok && time.Since(last) < reviewerNudgeCooldown*3
 }
 
+// shouldEscalateReviewer rate-limits failure escalations to one per rig per
+// cooldown, mirroring the nudge and kill cooldowns.
+func (d *Daemon) shouldEscalateReviewer(rigName string) bool {
+	d.reviewerNudgeMu.Lock()
+	defer d.reviewerNudgeMu.Unlock()
+	if d.reviewerLastEscalate == nil {
+		d.reviewerLastEscalate = make(map[string]time.Time)
+	}
+	if last, ok := d.reviewerLastEscalate[rigName]; ok && time.Since(last) < reviewerEscalateCooldown {
+		return false
+	}
+	d.reviewerLastEscalate[rigName] = time.Now()
+	return true
+}
+
+// safeRound clamps a heartbeat round number. It was the one heartbeat-sourced
+// field reaching the mail body, the subject, and the recipient's nudge without
+// a sanitizer.
+func safeRound(round int) int {
+	if round < 0 || round > 1000 {
+		return 0
+	}
+	return round
+}
+
 // killStuckReviewer terminates a reviewer session and clears its heartbeat.
 //
 // The kill is loud by design: it is logged, emitted to the feed, and the reason
@@ -357,6 +395,7 @@ func (d *Daemon) killStuckReviewer(rigName, sessionName, rigPath string, hb *rev
 		// Fall through: still clear the heartbeat. Leaving it would make the rig
 		// look stalled forever while re-attempting a kill that is failing anyway.
 	}
+	d.escalateReviewerFailure(rigName, hb, reason)
 	_ = events.LogFeed(events.TypeKill, rigName+"/"+constants.RoleReviewer,
 		map[string]interface{}{
 			"rig": rigName, "role": constants.RoleReviewer, "reason": reviewer.SafeText(reason),
@@ -458,4 +497,156 @@ func (d *Daemon) shouldKillReviewer(rigName string) bool {
 	}
 	d.reviewerLastKill[rigName] = time.Now()
 	return true
+}
+
+// escalateReviewerFailure tells whoever asked for the review that it will never
+// arrive.
+//
+// Without this the two origins fail very differently, and both badly. A
+// refinery-origin review is only rescued by await-review's 30m timeout — the
+// refinery sits waiting on a session the daemon already killed, learning
+// nothing about why. A crew-origin review is never rescued at all: that timeout
+// lives INSIDE the refinery's await-review step, so nothing covers the crew
+// path and the requesting crew member waits forever.
+//
+// Best-effort: a mail failure never prevents the kill from completing.
+func (d *Daemon) escalateReviewerFailure(rigName string, hb *reviewer.Heartbeat, reason string) {
+	if hb == nil {
+		return
+	}
+
+	// The requester is read from the rig-writable heartbeat, so it is untrusted
+	// input being used as a MAIL ADDRESS. Unvalidated, a forged value redirects
+	// the failure notice to an arbitrary mailbox — the escalation becomes a
+	// delivery primitive for whoever can write the file. Only the two addresses
+	// `gt reviewer request` actually writes are accepted.
+	to, ok := d.validReviewerRequester(rigName, hb.Requester)
+	if !ok {
+		// The feed event is still emitted by the caller, so the kill is never
+		// invisible — it just isn't routed.
+		d.logger.Printf("Reviewer reaper: %s has no valid requester (%q) — kill logged to the feed but not escalated",
+			rigName, reviewer.SafeText(hb.Requester))
+		return
+	}
+
+	// Rate-limit AFTER the address resolves. Consuming the cooldown first meant
+	// a single unroutable (or forged) requester silently blacked out every
+	// genuine escalation in that rig for the whole window — the escalation that
+	// was never sent still spent the budget for the one that mattered.
+	if !d.shouldEscalateReviewer(rigName) {
+		d.logger.Printf("Reviewer reaper: %s escalation suppressed by cooldown", rigName)
+		return
+	}
+
+	// Round is heartbeat-sourced like every other field and was the one reaching
+	// the body, the subject, and the recipient's nudge without a sanitizer.
+	round := safeRound(hb.Round)
+	pr, sha := reviewer.SafePR(hb.PR), reviewer.SafeSHA(hb.SHA)
+
+	// The remedy line is only actionable when we have a usable PR and SHA; a
+	// bogus `gt reviewer request 0 --sha unknown` is worse than no suggestion.
+	remedy := "Re-dispatch the review if it is still wanted."
+	if pr > 0 && sha != "unknown" {
+		remedy = fmt.Sprintf("Re-dispatch with `gt reviewer request %d --sha %s` if the review is still wanted.", pr, sha)
+	}
+	body := fmt.Sprintf(
+		"REVIEW_FAILED\nrig: %s\npr: %d\nround: %d\nsha: %s\nphase: %s\nelapsed: %s\nreason: %s\n\n"+
+			"The reviewer session was terminated by the daemon.\n"+
+			// Deliberately not "no review will arrive": the reviewer may have posted
+			// before it died, and asserting otherwise sends the reader to re-request
+			// a review that already exists.
+			"Any review for this request that has not already been posted will not arrive.\n%s\n",
+		rigName, pr, round, sha,
+		reviewer.SafePhase(hb.Phase), hb.Elapsed().Round(time.Second),
+		reviewer.SafeText(reason), remedy)
+
+	router := mail.NewRouterWithTownRoot(d.config.TownRoot, d.config.TownRoot)
+	if stores := d.BeadsStores(); len(stores) > 0 {
+		router.SetStores(stores)
+	}
+
+	msg := mail.NewMessage("daemon", to,
+		fmt.Sprintf("Review failed: PR #%d (round %d)", pr, round), body)
+	msg.Type = mail.TypeTask
+	msg.Timestamp = time.Now()
+
+	// Bound the send. router.Send shells out to bd and can block on Dolt, and
+	// this runs inline on the daemon's heartbeat path — an unbounded call there
+	// stalls every other recovery phase behind it. Escalation is best-effort;
+	// a slow mailer must never hold the heartbeat hostage.
+	// The goroutine owns the router's full lifecycle. A deferred
+	// WaitPendingNotifications here would run on the timeout path WHILE Send is
+	// still in flight, which panics on the router's WaitGroup and takes the
+	// daemon down — a crash introduced by making the send cancellable.
+	done := make(chan error, 1)
+	go func() {
+		err := router.Send(msg)
+		router.WaitPendingNotifications()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			d.logger.Printf("Reviewer reaper: escalating %s reviewer failure to %s: %v", rigName, to, err)
+			return
+		}
+	case <-time.After(reviewerEscalateTimeout):
+		// This BOUNDS the wait, it does not cancel the send: router.Send shells
+		// out to bd, whose own write context runs to 120s, and delivery (plus the
+		// recipient nudge) may still complete afterwards. Say so, rather than
+		// reporting that the escalation did not happen — an operator who
+		// re-dispatches by hand on the strength of a "timed out" line costs a
+		// redundant review round.
+		d.logger.Printf("Reviewer reaper: escalation to %s still pending after %v — it may yet be "+
+			"delivered; the kill is recorded in the feed either way", to, reviewerEscalateTimeout)
+		return
+	case <-d.ctx.Done():
+		d.logger.Printf("Reviewer reaper: shutdown while escalating to %s — delivery may still complete", to)
+		return
+	}
+	d.logger.Printf("Reviewer reaper: escalated %s reviewer failure (PR #%d) to %s", rigName, pr, to)
+}
+
+// validReviewerRequester returns the escalation address for a heartbeat's
+// recorded requester, accepting only the two values `gt reviewer request`
+// writes for THIS rig: "<rig>/refinery" and "<rig>/crew".
+//
+// Anything else — another rig's mailbox, an arbitrary agent, a crafted string —
+// is rejected rather than sanitized, because there is no partially-valid
+// address worth delivering to.
+func (d *Daemon) validReviewerRequester(rigName, requester string) (string, bool) {
+	req := strings.TrimSpace(requester)
+	// The rig's refinery — a real, polled identity.
+	if req == rigName+"/"+constants.RoleRefinery {
+		return req, true
+	}
+	// A concrete crew member: "<rig>/crew/<name>", which normalizes to the
+	// "<rig>/<name>" inbox identity a crew agent actually polls.
+	//
+	// Checked by ROUTABILITY, not spelling. A name-shaped guard rejects one
+	// spelling rather than one destination: "<rig>/crew/crew" normalizes right
+	// back onto the "<rig>/crew" container dead letter, and
+	// "<rig>/crew/<witness|reviewer|some-polecat>" normalizes onto an unrelated
+	// agent of the rig — so hb.Requester, which is rig-writable, could steer a
+	// daemon-authored notice at an arbitrary mailbox. Requiring the crew member's
+	// own directory to exist is the honest test of "is this a real crew member".
+	if name, ok := strings.CutPrefix(req, rigName+"/crew/"); ok && isRealCrewMember(d.config.TownRoot, rigName, name) {
+		return req, true
+	}
+	return "", false
+}
+
+// isRealCrewMember reports whether <town>/<rig>/crew/<name> is a crew member's
+// own directory. Rejects path escapes and any name that would normalize onto a
+// container or another role.
+func isRealCrewMember(townRoot, rigName, name string) bool {
+	if name == "" || name == "crew" || strings.ContainsAny(name, `/\`) ||
+		name == "." || name == ".." || strings.HasPrefix(name, ".") {
+		return false
+	}
+	if strings.ContainsAny(name, " \t") {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(townRoot, rigName, "crew", name))
+	return err == nil && info.IsDir()
 }

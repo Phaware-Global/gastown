@@ -4,7 +4,9 @@ import (
 	"context"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -408,6 +410,128 @@ func TestReapRigReviewer_ClearsAHeartbeatWithAnUnusableTimestamp(t *testing.T) {
 	if hb := reviewer.ReadHeartbeat(rigPath); hb != nil {
 		if _, ok := reviewer.PhaseAge(hb); ok {
 			t.Errorf("a surviving record must still have an unusable timestamp, got %+v", hb)
+		}
+	}
+}
+
+func TestSafeRound_ClampsImplausibleValues(t *testing.T) {
+	// Round was the one heartbeat-sourced field reaching the mail body, the
+	// subject, and the recipient's nudge without a sanitizer.
+	if safeRound(-1) != 0 || safeRound(1<<30) != 0 {
+		t.Error("implausible round numbers must clamp to 0")
+	}
+	if safeRound(2) != 2 {
+		t.Error("a plausible round must pass through")
+	}
+}
+
+func TestShouldEscalateReviewer_RateLimitsPerRig(t *testing.T) {
+	// The died-mid-review path fires every tick for as long as the record
+	// persists, so without a cooldown a rig-writable heartbeat is a
+	// daemon-authored mail + nudge amplifier aimed at the refinery.
+	d := &Daemon{}
+	if !d.shouldEscalateReviewer("rig-a") {
+		t.Fatal("first escalation must be allowed")
+	}
+	if d.shouldEscalateReviewer("rig-a") {
+		t.Error("a second escalation inside the cooldown must be suppressed")
+	}
+	if !d.shouldEscalateReviewer("rig-b") {
+		t.Error("the cooldown must be per-rig")
+	}
+}
+
+// crewTown builds a town with real crew-member directories so requester
+// validation can be exercised by ROUTABILITY rather than spelling.
+func crewTown(t *testing.T, rig string, members ...string) string {
+	t.Helper()
+	town := t.TempDir()
+	for _, m := range members {
+		if err := os.MkdirAll(filepath.Join(town, rig, "crew", m), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return town
+}
+
+func TestValidReviewerRequester_ChecksRoutabilityNotSpelling(t *testing.T) {
+	d := &Daemon{config: &Config{TownRoot: crewTown(t, "gastown", "max")}}
+
+	// Real destinations.
+	for _, ok := range []string{"gastown/refinery", "gastown/crew/max"} {
+		if got, valid := d.validReviewerRequester("gastown", ok); !valid || got != ok {
+			t.Errorf("validReviewerRequester(%q) = (%q,%v), want accepted", ok, got, valid)
+		}
+	}
+
+	// Every one of these is a DESTINATION problem, not a spelling problem:
+	//   crew/crew        normalizes back onto the <rig>/crew container dead letter
+	//   crew/witness     normalizes onto an unrelated role of the rig
+	//   crew/ghost       is not a crew member at all
+	// hb.Requester is rig-writable, so each would let a forged heartbeat steer a
+	// daemon-authored notice at a mailbox of the attacker's choosing.
+	for _, bad := range []string{
+		"gastown/crew/crew",
+		"gastown/crew/witness",
+		"gastown/crew/reviewer",
+		"gastown/crew/ghost",
+		"gastown/crew/../../etc",
+		"gastown/crew/.hidden",
+		"gastown/crew",
+		"gastown/crew/",
+		"otherrig/crew/max",
+		"gastown/mayor",
+		"gastown/crew/max evil",
+		"gastown/crew/max\nBcc: evil",
+		"",
+	} {
+		if got, valid := d.validReviewerRequester("gastown", bad); valid {
+			t.Errorf("validReviewerRequester(%q) = (%q,true), want rejected", bad, got)
+		}
+	}
+}
+
+func TestEscalationCooldown_IsNotConsumedByAnUnroutableRequester(t *testing.T) {
+	// The worst failure of the previous round: the cooldown was taken BEFORE the
+	// address was validated, so one forged/unroutable heartbeat silently blacked
+	// out every genuine escalation in that rig for the whole window.
+	d := &Daemon{
+		config:  &Config{TownRoot: crewTown(t, "gastown", "max")},
+		logger:  log.New(io.Discard, "", 0),
+		tmux:    tmux.NewTmux(),
+		rigPool: newRigWorkerPool(1, time.Minute, log.New(io.Discard, "", 0)),
+		ctx:     context.Background(),
+	}
+	// An unroutable requester must not spend the budget.
+	d.escalateReviewerFailure("gastown", &reviewer.Heartbeat{
+		PR: 1, Phase: reviewer.PhasePrompt, Requester: "gastown/crew/ghost",
+	}, "test")
+	if !d.shouldEscalateReviewer("gastown") {
+		t.Error("an unroutable requester consumed the cooldown — the escalation that " +
+			"was never sent must not spend the budget for the one that matters")
+	}
+}
+
+func TestIsRealCrewMember_AllowlistsTheNameCharacterSet(t *testing.T) {
+	// The ACCEPTED address is interpolated into daemon log lines, the mail To,
+	// and a `bd create --assignee` argument. A blacklist that misses LF/CR/ESC/
+	// NUL lets a forged requester forge entries shaped like the reaper's own —
+	// in the very log an operator reads to decide whether a kill was announced.
+	town := crewTown(t, "gastown", "max")
+	if !isRealCrewMember(town, "gastown", "max") {
+		t.Fatal("a real crew member must be accepted")
+	}
+	for _, bad := range []string{
+		"max\nRefinery:hijack",
+		"max\r\nReviewerReaper:escalated",
+		"max\x1b[2J\x1b[H",
+		"max\x00nul",
+		"max spaced",
+		strings.Repeat("A", 100),
+		"crew", "", "..", ".hidden", "a/b", `a\b`,
+	} {
+		if isRealCrewMember(town, "gastown", bad) {
+			t.Errorf("isRealCrewMember(%q) = true, want rejected", bad)
 		}
 	}
 }
