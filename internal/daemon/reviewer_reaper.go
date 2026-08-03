@@ -187,12 +187,13 @@ func (d *Daemon) reapRigReviewer(rigName string, peers []string) {
 		// exists to provide, and the session then came up with NO heartbeat,
 		// routing a healthy just-started reviewer onto the missing-heartbeat kill
 		// path. Every other branch here has a grace or a ramp; this one had none.
-		age, ok := reviewer.PhaseAge(hb)
-		if !ok {
-			d.logger.Printf("Reviewer reaper: %s heartbeat timestamp is unusable — taking no action", rigName)
-			return
-		}
-		if !shouldClearDeadDispatch(age, ok) {
+		// An unusable timestamp (zero or future) on a record with NO session is
+		// not a reason to hold back — it cannot be a live dispatch, and leaving it
+		// is worse than clearing it: TouchDispatch refuses whenever prev.PR
+		// differs, so a phantom record permanently locks out every later
+		// dispatch's telemetry seed. Only a trustworthy, in-grace age defers.
+		age, ageOK := reviewer.PhaseAge(hb)
+		if !shouldClearDeadDispatch(age, ageOK) {
 			return
 		}
 		d.logger.Printf("Reviewer reaper: %s reviewer has no session (phase=%s pr=%d, no progress for %s) — clearing stale heartbeat",
@@ -639,12 +640,18 @@ func shouldReapMissingHeartbeat(missingFor time.Duration, seen, idle bool) bool 
 // finding, and a bare `age > constant` assertion cannot tell whether the guard
 // is still wired up.
 //
-// An unusable phase age (zero or future-dated) resolves to "do not act". This
-// branch is ambiguous by construction — it is how a dead reviewer looks AND how
-// a dispatch still spawning looks — so an untrustworthy timestamp must not
-// resolve it in the destructive direction.
+// Only a TRUSTWORTHY, in-grace age defers. An unusable phase age clears, which
+// looks like the destructive choice and is not: with no session the record
+// cannot describe a live dispatch, and leaving it costs more than clearing it —
+// TouchDispatch refuses whenever prev.PR differs, so a phantom record with a
+// zero timestamp permanently locks out every later dispatch's telemetry seed,
+// and no command removes it.
+//
+// The grace itself is what must not be shortened. `gt reviewer request` seeds
+// the heartbeat BEFORE the session exists, and the mail write plus a
+// first-dispatch worktree provision can outlast a daemon tick.
 func shouldClearDeadDispatch(age time.Duration, ageOK bool) bool {
-	return ageOK && age >= reviewer.SpawnGrace
+	return !ageOK || age >= reviewer.SpawnGrace
 }
 
 // clearReviewerHeartbeat removes a rig's reviewer heartbeat, logging failures.

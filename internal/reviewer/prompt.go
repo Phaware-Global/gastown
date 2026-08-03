@@ -97,8 +97,11 @@ func BuildPerspectivePrompt(p PromptParams) (string, error) {
 	if p.MaxFindings <= 0 {
 		p.MaxFindings = config.DefaultMaxFindingsPerPerspective
 	}
-	if p.MaxDuration <= 0 {
-		p.MaxDuration = DefaultPassDuration
+	// Floor, not just a zero-check. A sub-minute budget tells the pass to stop
+	// before it has established anything, which rubber-stamps the PR — so an
+	// out-of-range value is corrected rather than honored.
+	if p.MaxDuration < MinPassDuration {
+		p.MaxDuration = MinPassDuration
 	}
 	p.PriorThreads = strings.TrimRight(p.PriorThreads, "\n")
 	p.ExtraInstructions = strings.TrimSpace(p.ExtraInstructions)

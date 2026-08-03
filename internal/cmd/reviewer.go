@@ -257,7 +257,8 @@ func init() {
 	reviewerPromptCmd.Flags().IntVar(&reviewerPromptMaxFindings, "max-findings", 0,
 		"per-pass finding cap (default: the rig's review.max_findings_per_perspective)")
 	reviewerPromptCmd.Flags().DurationVar(&reviewerPromptMaxDuration, "max-duration", 0,
-		"soft wall-clock budget for the pass; it returns a partial result rather than hanging (default: half the reviewer stuck_threshold)")
+		"soft wall-clock budget for the pass; it returns a partial result rather than hanging "+
+			"(default: half the rig's stuck_threshold; clamped to [5m, stuck_threshold))")
 	_ = reviewerPromptCmd.MarkFlagRequired("pr")
 	_ = reviewerPromptCmd.MarkFlagRequired("sha")
 
@@ -573,6 +574,19 @@ func loadRigReviewConfig() (townRoot, rigName, rigPath string, reviewCfg *config
 	return townRoot, rigName, r.Path, reviewCfg, nil
 }
 
+// resolvePassDuration picks the pass budget: an explicit --max-duration when
+// given, else the rig-derived default (half its clamped stuck threshold).
+func resolvePassDuration(townRoot, rigPath string) time.Duration {
+	stuck, _ := reviewer.ClampStuckThreshold(reviewer.StuckThreshold(townRoot, rigPath))
+	if reviewerPromptMaxDuration > 0 {
+		// Bounded on BOTH sides. Too small stops the pass before it establishes
+		// anything (a rubber stamp); too large outruns the reaper's phase rail, so
+		// the session is killed mid-pass and every finding is discarded.
+		return reviewer.ClampPassDuration(reviewerPromptMaxDuration, stuck)
+	}
+	return reviewer.PassDuration(townRoot, rigPath)
+}
+
 func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 	perspective := args[0]
 	if reviewerPromptPR <= 0 {
@@ -625,7 +639,7 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 		Round:             reviewerPromptRound,
 		PriorThreads:      priorThreads,
 		MaxFindings:       maxFindings,
-		MaxDuration:       reviewerPromptMaxDuration,
+		MaxDuration:       resolvePassDuration(townRoot, rigPath),
 		ExtraInstructions: extra,
 	})
 	if err != nil {
@@ -851,8 +865,20 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 	// Start the reviewer session if not already running, injecting the token as
 	// GH_TOKEN/GITHUB_TOKEN. Idempotent: a running session drains the new mail.
 	mgr := reviewer.NewManager(r)
+	wedged := false
 	started, serr := mgr.EnsureRunning("", map[string]string{"GH_TOKEN": tokenVal, "GITHUB_TOKEN": tokenVal})
-	if serr != nil {
+	switch {
+	case serr == nil:
+	case errors.Is(serr, reviewer.ErrSessionWedged):
+		wedged = true
+		// The mail is queued but the session is not draining it. Say so loudly and
+		// name the remedy: the daemon's reaper will recycle the session on a later
+		// tick with all of its gates applied, and an operator who does not want to
+		// wait has an explicit command. Dispatch deliberately does not kill.
+		style.PrintWarning("reviewer session for %s appears wedged — PR #%d is queued but may not be "+
+			"picked up until the session is recycled. The daemon reaper will handle it; to act now, run "+
+			"`gt reviewer stop --rig %s --force`.", r.Name, spec.PR, r.Name)
+	default:
 		// The request mail persists; await-review's timeout is the safety net.
 		fmt.Fprintf(os.Stderr, "warning: review request mailed but reviewer session did not start: %v\n", serr)
 	}
@@ -864,12 +890,27 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 	// caller can retry on, so a later "dispatched but never started" escalation
 	// would be duplicate noise about a failure that was never silent.
 	//
-	// After EnsureRunning, because that call may RECYCLE a wedged session, and
-	// recycling clears the heartbeat. Seeding before it meant the clear wiped the
-	// record we had just written, leaving the new review with no heartbeat at all
-	// — precisely the "dispatched into the void" blind spot the seed exists to
-	// close. EnsureRunning's failure is non-fatal, so a request whose session
+	// After EnsureRunning, because whether it STARTED a session decides what the
+	// record on file means: a heartbeat that outlived the session it described is
+	// a corpse to be claimed, while one belonging to a live session is a review in
+	// flight. EnsureRunning's failure is non-fatal, so a request whose session
 	// never starts is still recorded here.
+	//
+	// Except when the session is wedged. Then the heartbeat is EVIDENCE, not
+	// stale data — it is the only thing that will make the reaper act, since the
+	// reaper reads nothing else. Seeding over it resets the phase clock
+	// to zero, flipping Classify from KillImminent back to Working, so the remedy
+	// the warning above just promised never arrives. Worse, re-dispatch cadence
+	// (30m) is shorter than the phase kill rail (90m), so the rail could never
+	// fire: each dispatch would rescue the very session it was queueing behind.
+	//
+	// The queued request is safe in the mailbox and gets its own record once the
+	// session is recycled and actually starts working.
+	if wedged {
+		fmt.Printf("Dispatched review of PR #%d (round %d, origin %s) → %s\n", prNumber, spec.Round, origin, to)
+		return nil
+	}
+
 	switch err := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA); {
 	case err == nil:
 	case errors.Is(err, reviewer.ErrReviewInFlight):

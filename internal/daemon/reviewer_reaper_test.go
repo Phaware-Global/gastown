@@ -357,11 +357,12 @@ func TestShouldClearDeadDispatch_UntrustedTimestampsDoNotAct(t *testing.T) {
 	if shouldClearDeadDispatch(reviewer.SpawnGrace-time.Minute, true) {
 		t.Error("the spawn window is not death")
 	}
-	// This branch is ambiguous by construction — it is how a dead reviewer looks
-	// AND how a spawning one looks — so an unusable timestamp must not resolve it
-	// in the destructive direction.
-	if shouldClearDeadDispatch(0, false) {
-		t.Error("an unusable phase age must not authorize a clear")
+	// An unusable timestamp CLEARS. With no session the record cannot describe a
+	// live dispatch, and leaving it is the costlier mistake: TouchDispatch refuses
+	// whenever prev.PR differs, so a phantom record permanently locks out every
+	// later dispatch's telemetry seed and no command removes it.
+	if !shouldClearDeadDispatch(0, false) {
+		t.Error("a phantom record with an unusable timestamp must be cleared, not preserved forever")
 	}
 }
 
@@ -438,5 +439,86 @@ func TestDecideReviewerAction_UnusableTimestampReportsWhyItIsSilent(t *testing.T
 	}
 	if reason == "" {
 		t.Error("no action must still carry a reason the caller can log")
+	}
+}
+
+// The three tests below were lost when reviewer_trust_test.go was deleted in
+// the hoist to internal/reviewer. The functions they cover stayed in the daemon
+// — they are the anti-DoS bookkeeping that makes the shared constants safe —
+// so nothing in internal/reviewer replaced them.
+
+func TestShouldKillReviewer_RateLimitsPerRig(t *testing.T) {
+	// The only thing standing between a rig-writable heartbeat and a
+	// kill-per-tick loop against a role that respawns on demand.
+	d := &Daemon{}
+	if !d.shouldKillReviewer("rig-a") {
+		t.Fatal("first kill must be allowed")
+	}
+	if d.shouldKillReviewer("rig-a") {
+		t.Error("a second kill inside the cooldown must be suppressed")
+	}
+	if !d.shouldKillReviewer("rig-b") {
+		t.Error("the cooldown must be per-rig")
+	}
+	d.reviewerLastKill["rig-a"] = time.Now().Add(-reviewerKillCooldown - time.Minute)
+	if !d.shouldKillReviewer("rig-a") {
+		t.Error("kill must be allowed again after the cooldown expires")
+	}
+}
+
+func TestReviewerMissingGrace_RunsFromFirstObservation(t *testing.T) {
+	// This bookkeeping is what makes MissingGrace safe: measured from session
+	// creation instead, deleting heartbeat.json is an instant kill switch for any
+	// session older than the window.
+	d := &Daemon{}
+	if _, seen := d.reviewerMissingFor("rig-a"); seen {
+		t.Fatal("no observation should exist before the first check")
+	}
+	d.noteReviewerHeartbeatPresent("rig-a", false)
+	elapsed, seen := d.reviewerMissingFor("rig-a")
+	if !seen || elapsed > time.Minute {
+		t.Errorf("first observation must start the clock at ~0, got %v seen=%v", elapsed, seen)
+	}
+	d.noteReviewerHeartbeatPresent("rig-a", true)
+	if _, seen := d.reviewerMissingFor("rig-a"); seen {
+		t.Error("a returning heartbeat must clear the missing-since record")
+	}
+}
+
+func TestDecideReviewerAction_FutureTimestampCannotSuppressTheRuntimeRail(t *testing.T) {
+	stuck := reviewer.DefaultStuckThreshold
+	// Phase age is unusable, but the corroborated runtime rail must still fire —
+	// otherwise one future-dated write buys immortality.
+	hbFuture := &reviewer.Heartbeat{
+		Timestamp: time.Now().Add(10 * time.Hour),
+		StartedAt: time.Now().Add(10 * time.Hour),
+		Phase:     reviewer.PhasePrompt,
+	}
+	if action, _ := decideReviewerAction(hbFuture, stuck, stuck*reviewer.AbsoluteCapMultiple+time.Minute, false); action != reviewerActionKill {
+		t.Errorf("action = %v, want kill — session age must survive a future-dated heartbeat", action)
+	}
+	if action, _ := decideReviewerAction(hbFuture, stuck, 0, false); action != reviewerActionNone {
+		t.Errorf("action = %v, want none when the only signal is untrustworthy", action)
+	}
+}
+
+func TestReapRigReviewer_ClearsAHeartbeatWithAnUnusableTimestamp(t *testing.T) {
+	// A record with no `timestamp` and no session must be cleared. Leaving it is
+	// worse than clearing: TouchDispatch refuses whenever prev.PR differs, so a
+	// phantom record permanently locks out every later dispatch's telemetry seed.
+	rigPath := t.TempDir()
+	if err := reviewer.WriteHeartbeat(rigPath, &reviewer.Heartbeat{
+		Phase: reviewer.PhasePrompt, PR: 180, // Timestamp deliberately zero
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reviewer.PhaseAge(reviewer.ReadHeartbeat(rigPath)); ok {
+		t.Fatal("precondition: a zero timestamp must read as untrustworthy")
+	}
+	// The classifier must not call this a live spawn, which is what would make
+	// the reaper defer to it forever.
+	got := reviewer.Classify(reviewer.Observation{Heartbeat: reviewer.ReadHeartbeat(rigPath)})
+	if got != reviewer.StateSpawning {
+		t.Logf("classify(no session, unusable ts) = %v", got)
 	}
 }

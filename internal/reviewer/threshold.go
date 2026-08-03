@@ -5,16 +5,51 @@ import (
 
 )
 
-// DefaultPassDuration is the soft wall-clock budget given to one perspective
-// subagent pass.
+// MinPassDuration is the floor for a perspective pass's wall-clock budget.
 //
-// Sized against DefaultStuckThreshold, not independently: the passes run in
-// parallel between `gt reviewer prompt` and `gt reviewer consolidate` with
-// nothing refreshing the heartbeat, so the slowest pass is what the reaper's
-// phase-age rail actually measures. A budget at half the stuck threshold leaves
-// a pass room to run long and still return a partial result before the reaper
-// starts nudging.
-const DefaultPassDuration = DefaultStuckThreshold / 2
+// A budget below this cannot produce a review worth posting — the pass would
+// stop before it had established anything — so a sub-minute value is not a
+// tuning choice but a way to rubber-stamp every PR. Callers clamp to it.
+const MinPassDuration = 5 * time.Minute
+
+// ClampPassDuration bounds a pass budget to [MinPassDuration, stuck].
+//
+// The ceiling matters as much as the floor and is the mirror-image injection: a
+// budget at or beyond the rig's stuck threshold guarantees the pass outruns the
+// reaper's phase rail, so the session is killed mid-pass and every finding it
+// had established is discarded — exactly the outcome §5's budget exists to
+// prevent. An out-of-range value is corrected rather than honored.
+func ClampPassDuration(d, stuck time.Duration) time.Duration {
+	if stuck <= 0 {
+		stuck = DefaultStuckThreshold
+	}
+	if d < MinPassDuration {
+		return MinPassDuration
+	}
+	if d >= stuck {
+		return stuck / 2
+	}
+	return d
+}
+
+// PassDuration returns the soft wall-clock budget for one perspective subagent
+// pass on a rig: half that rig's configured stuck threshold, floored at
+// MinPassDuration.
+//
+// Derived from the rig's threshold rather than a compile-time constant, because
+// the passes run in parallel between `gt reviewer prompt` and `gt reviewer
+// consolidate` with nothing refreshing the heartbeat — so the slowest pass is
+// exactly what the reaper's phase-age rail measures. A rig that raises its
+// threshold must get proportionally more budget, or its passes trip a rail it
+// was configured to avoid. A fixed constant silently broke that relationship,
+// and the --max-duration help text already promised this behavior.
+func PassDuration(townRoot, rigPath string) time.Duration {
+	stuck, _ := ClampStuckThreshold(StuckThreshold(townRoot, rigPath))
+	if d := stuck / 2; d > MinPassDuration {
+		return d
+	}
+	return MinPassDuration
+}
 
 // IsWedged reports whether a live session's heartbeat shows it has stopped
 // draining work — no phase progress for StuckMultiple thresholds.
@@ -33,6 +68,11 @@ func IsWedged(hb *Heartbeat, stuck time.Duration) bool {
 	if hb == nil || stuck <= 0 {
 		return false
 	}
+	// Clamp before multiplying. An unclamped rig-configured threshold overflows
+	// `stuck * StuckMultiple` into a negative duration, which inverts the
+	// comparison below into "always wedged" — turning an agent-writable config
+	// value into an unconditional recycle of every reviewer.
+	stuck, _ = ClampStuckThreshold(stuck)
 	age, ok := PhaseAge(hb)
 	if !ok {
 		return false
