@@ -416,7 +416,10 @@ func TestValidReviewerRequester_RejectsForgedAddresses(t *testing.T) {
 	// hb.Requester is read from the rig-writable heartbeat and used as a MAIL
 	// ADDRESS, so an unvalidated value turns the escalation into a delivery
 	// primitive for whoever can write the file.
-	for _, ok := range []string{"gastown/refinery", "gastown/crew"} {
+	// NOTE: "gastown/crew" is deliberately absent — see
+	// TestValidReviewerRequester_RejectsTheDeadLetterContainer. It is the
+	// container directory, not an identity anyone polls.
+	for _, ok := range []string{"gastown/refinery", "gastown/crew/max", "@crew/gastown"} {
 		if got, valid := validReviewerRequester("gastown", ok); !valid || got != ok {
 			t.Errorf("validReviewerRequester(%q) = (%q,%v), want it accepted", ok, got, valid)
 		}
@@ -428,9 +431,65 @@ func TestValidReviewerRequester_RejectsForgedAddresses(t *testing.T) {
 		"gastown/polecats/evil",   // arbitrary agent
 		"../../etc/passwd",
 		"gastown/crew\nBcc: evil", // header-ish injection
+		"gastown/crew",            // container directory: a silent dead letter
 	} {
 		if got, valid := validReviewerRequester("gastown", bad); valid {
 			t.Errorf("validReviewerRequester(%q) = (%q,true), want rejected", bad, got)
 		}
+	}
+}
+
+func TestValidReviewerRequester_RejectsTheDeadLetterContainer(t *testing.T) {
+	// "<rig>/crew" is the CONTAINER directory holding crew members, not an
+	// identity anyone polls. It passes validateRecipient only because the
+	// directory exists, so Send returns nil and the daemon logs a successful
+	// delivery while nobody is told — the crew-origin case this whole function
+	// exists to rescue.
+	if got, ok := validReviewerRequester("gastown", "gastown/crew"); ok {
+		t.Errorf("validReviewerRequester(\"gastown/crew\") = (%q,true); that address is a dead letter", got)
+	}
+	// A concrete crew member normalizes to the "<rig>/<name>" inbox they poll.
+	if _, ok := validReviewerRequester("gastown", "gastown/crew/max"); !ok {
+		t.Error("a concrete crew identity must be accepted")
+	}
+	// The group form, which Router.sendToGroup actually handles.
+	if _, ok := validReviewerRequester("gastown", "@crew/gastown"); !ok {
+		t.Error("the crew group address must be accepted")
+	}
+	// Still rejects everything forged.
+	for _, bad := range []string{
+		"otherrig/crew/max", "gastown/crew/", "gastown/crew/a/b",
+		"@crew/otherrig", "gastown/mayor", "gastown/crew/max evil", "",
+	} {
+		if got, ok := validReviewerRequester("gastown", bad); ok {
+			t.Errorf("validReviewerRequester(%q) = (%q,true), want rejected", bad, got)
+		}
+	}
+}
+
+func TestSafeRound_ClampsImplausibleValues(t *testing.T) {
+	// Round was the one heartbeat-sourced field reaching the mail body, the
+	// subject, and the recipient's nudge without a sanitizer.
+	if safeRound(-1) != 0 || safeRound(1<<30) != 0 {
+		t.Error("implausible round numbers must clamp to 0")
+	}
+	if safeRound(2) != 2 {
+		t.Error("a plausible round must pass through")
+	}
+}
+
+func TestShouldEscalateReviewer_RateLimitsPerRig(t *testing.T) {
+	// The died-mid-review path fires every tick for as long as the record
+	// persists, so without a cooldown a rig-writable heartbeat is a
+	// daemon-authored mail + nudge amplifier aimed at the refinery.
+	d := &Daemon{}
+	if !d.shouldEscalateReviewer("rig-a") {
+		t.Fatal("first escalation must be allowed")
+	}
+	if d.shouldEscalateReviewer("rig-a") {
+		t.Error("a second escalation inside the cooldown must be suppressed")
+	}
+	if !d.shouldEscalateReviewer("rig-b") {
+		t.Error("the cooldown must be per-rig")
 	}
 }

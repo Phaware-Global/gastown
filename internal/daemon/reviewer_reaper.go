@@ -26,6 +26,16 @@ const (
 	// forged heartbeat drives a kill every tick — an unbounded denial of service
 	// against a role that respawns on demand.
 	reviewerKillCooldown = 5 * time.Minute
+	// reviewerEscalateCooldown rate-limits failure escalations per rig. The
+	// died-mid-review path fires on every tick for as long as the record
+	// persists, so without this a rig-writable heartbeat is a daemon-authored
+	// mail + nudge amplifier aimed at the refinery.
+	reviewerEscalateCooldown = 30 * time.Minute
+
+	// reviewerEscalateTimeout bounds the mail send, which shells out to bd and
+	// can block on Dolt. This runs inline on the heartbeat path, so an unbounded
+	// call stalls every later recovery phase behind it.
+	reviewerEscalateTimeout = 20 * time.Second
 )
 
 // reapStuckReviewers checks every known rig's Reviewer session and nudges or
@@ -324,6 +334,31 @@ func (d *Daemon) reviewerWasNudged(rigName string) bool {
 	return ok && time.Since(last) < reviewerNudgeCooldown*3
 }
 
+// shouldEscalateReviewer rate-limits failure escalations to one per rig per
+// cooldown, mirroring the nudge and kill cooldowns.
+func (d *Daemon) shouldEscalateReviewer(rigName string) bool {
+	d.reviewerNudgeMu.Lock()
+	defer d.reviewerNudgeMu.Unlock()
+	if d.reviewerLastEscalate == nil {
+		d.reviewerLastEscalate = make(map[string]time.Time)
+	}
+	if last, ok := d.reviewerLastEscalate[rigName]; ok && time.Since(last) < reviewerEscalateCooldown {
+		return false
+	}
+	d.reviewerLastEscalate[rigName] = time.Now()
+	return true
+}
+
+// safeRound clamps a heartbeat round number. It was the one heartbeat-sourced
+// field reaching the mail body, the subject, and the recipient's nudge without
+// a sanitizer.
+func safeRound(round int) int {
+	if round < 0 || round > 1000 {
+		return 0
+	}
+	return round
+}
+
 // killStuckReviewer terminates a reviewer session and clears its heartbeat.
 //
 // The kill is loud by design: it is logged, emitted to the feed, and the reason
@@ -478,6 +513,13 @@ func (d *Daemon) escalateReviewerFailure(rigName string, hb *reviewer.Heartbeat,
 	if hb == nil {
 		return
 	}
+	// Rate-limit. This is the one heartbeat-driven action here that used to have
+	// no cooldown, which made a rig-writable file a per-tick daemon-authored mail
+	// AND nudge amplifier aimed at the refinery — the died-mid-review path fires
+	// on every tick for as long as the record persists.
+	if !d.shouldEscalateReviewer(rigName) {
+		return
+	}
 	// The requester is read from the rig-writable heartbeat, so it is untrusted
 	// input being used as a MAIL ADDRESS. Unvalidated, a forged value redirects
 	// the failure notice to an arbitrary mailbox — the escalation becomes a
@@ -492,14 +534,27 @@ func (d *Daemon) escalateReviewerFailure(rigName string, hb *reviewer.Heartbeat,
 		return
 	}
 
+	// Round is heartbeat-sourced like every other field and was the one reaching
+	// the body, the subject, and the recipient's nudge without a sanitizer.
+	round := safeRound(hb.Round)
+	pr, sha := reviewer.SafePR(hb.PR), reviewer.SafeSHA(hb.SHA)
+
+	// The remedy line is only actionable when we have a usable PR and SHA; a
+	// bogus `gt reviewer request 0 --sha unknown` is worse than no suggestion.
+	remedy := "Re-dispatch the review if it is still wanted."
+	if pr > 0 && sha != "unknown" {
+		remedy = fmt.Sprintf("Re-dispatch with `gt reviewer request %d --sha %s` if the review is still wanted.", pr, sha)
+	}
 	body := fmt.Sprintf(
 		"REVIEW_FAILED\nrig: %s\npr: %d\nround: %d\nsha: %s\nphase: %s\nelapsed: %s\nreason: %s\n\n"+
-			"The reviewer session was terminated by the daemon and did not post a review.\n"+
-			"No review will arrive for this request — re-dispatch with `gt reviewer request %d "+
-			"--sha %s` if the review is still wanted.\n",
-		rigName, reviewer.SafePR(hb.PR), hb.Round, reviewer.SafeSHA(hb.SHA),
+			"The reviewer session was terminated by the daemon.\n"+
+			// Deliberately not "no review will arrive": the reviewer may have posted
+			// before it died, and asserting otherwise sends the reader to re-request
+			// a review that already exists.
+			"Any review for this request that has not already been posted will not arrive.\n%s\n",
+		rigName, pr, round, sha,
 		reviewer.SafePhase(hb.Phase), hb.Elapsed().Round(time.Second),
-		reviewer.SafeText(reason), reviewer.SafePR(hb.PR), reviewer.SafeSHA(hb.SHA))
+		reviewer.SafeText(reason), remedy)
 
 	router := mail.NewRouterWithTownRoot(d.config.TownRoot, d.config.TownRoot)
 	if stores := d.BeadsStores(); len(stores) > 0 {
@@ -508,15 +563,30 @@ func (d *Daemon) escalateReviewerFailure(rigName string, hb *reviewer.Heartbeat,
 	defer router.WaitPendingNotifications()
 
 	msg := mail.NewMessage("daemon", to,
-		fmt.Sprintf("Review failed: PR #%d (round %d)", reviewer.SafePR(hb.PR), hb.Round), body)
+		fmt.Sprintf("Review failed: PR #%d (round %d)", pr, round), body)
 	msg.Type = mail.TypeTask
 	msg.Timestamp = time.Now()
-	if err := router.Send(msg); err != nil {
-		d.logger.Printf("Reviewer reaper: escalating %s reviewer failure to %s: %v", rigName, to, err)
+
+	// Bound the send. router.Send shells out to bd and can block on Dolt, and
+	// this runs inline on the daemon's heartbeat path — an unbounded call there
+	// stalls every other recovery phase behind it. Escalation is best-effort;
+	// a slow mailer must never hold the heartbeat hostage.
+	done := make(chan error, 1)
+	go func() { done <- router.Send(msg) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			d.logger.Printf("Reviewer reaper: escalating %s reviewer failure to %s: %v", rigName, to, err)
+			return
+		}
+	case <-time.After(reviewerEscalateTimeout):
+		d.logger.Printf("Reviewer reaper: escalation to %s timed out after %v — kill is still recorded in the feed",
+			to, reviewerEscalateTimeout)
+		return
+	case <-d.ctx.Done():
 		return
 	}
-	d.logger.Printf("Reviewer reaper: escalated %s reviewer failure (PR #%d) to %s",
-		rigName, reviewer.SafePR(hb.PR), to)
+	d.logger.Printf("Reviewer reaper: escalated %s reviewer failure (PR #%d) to %s", rigName, pr, to)
 }
 
 // validReviewerRequester returns the escalation address for a heartbeat's
@@ -527,11 +597,22 @@ func (d *Daemon) escalateReviewerFailure(rigName string, hb *reviewer.Heartbeat,
 // is rejected rather than sanitized, because there is no partially-valid
 // address worth delivering to.
 func validReviewerRequester(rigName, requester string) (string, bool) {
-	switch strings.TrimSpace(requester) {
-	case rigName + "/" + constants.RoleRefinery:
-		return rigName + "/" + constants.RoleRefinery, true
-	case rigName + "/crew":
-		return rigName + "/crew", true
+	req := strings.TrimSpace(requester)
+	// The rig's refinery — a real, polled identity.
+	if req == rigName+"/"+constants.RoleRefinery {
+		return req, true
+	}
+	// The rig's crew group. Router.sendToGroup handles this form; "<rig>/crew"
+	// does NOT — that is the container directory, and delivering to it is a
+	// silent dead letter that Send reports as success.
+	if req == "@crew/"+rigName {
+		return req, true
+	}
+	// A concrete crew member: "<rig>/crew/<name>", which normalizes to the
+	// "<rig>/<name>" inbox identity a crew agent actually polls.
+	if name, ok := strings.CutPrefix(req, rigName+"/crew/"); ok &&
+		name != "" && !strings.ContainsAny(name, "/ \t") {
+		return req, true
 	}
 	return "", false
 }

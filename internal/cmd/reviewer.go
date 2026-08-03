@@ -763,6 +763,30 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 	return err
 }
 
+// resolveCrewRequester returns a mail address that an agent actually polls.
+//
+// "<rig>/crew" is NOT one: it is the container directory holding the crew
+// members, and it passes validateRecipient only because that directory exists —
+// so Send returns nil and the daemon logs a successful delivery while nobody is
+// told. Every real crew member's inbox identity is "<rig>/<name>", reached via
+// the three-part "<rig>/crew/<name>" form.
+//
+// Prefer the concrete identity of whoever is invoking the dispatch. When that
+// cannot be determined (dispatch from outside a crew worktree), fall back to the
+// group address "@crew/<rig>", which Router.sendToGroup does handle — a
+// broadcast to the rig's crew is imperfect but reaches someone, which the
+// container path never does.
+func resolveCrewRequester(rigName string) string {
+	if cwd, err := os.Getwd(); err == nil {
+		if townRoot, terr := workspace.FindFromCwdOrError(); terr == nil {
+			if info := detectRole(cwd, townRoot); info.Role == RoleCrew && info.Polecat != "" {
+				return fmt.Sprintf("%s/crew/%s", rigName, info.Polecat)
+			}
+		}
+	}
+	return fmt.Sprintf("@crew/%s", rigName)
+}
+
 func runReviewerRequest(cmd *cobra.Command, args []string) error {
 	prNumber, err := parsePRNumber(args[0])
 	if err != nil {
@@ -824,7 +848,7 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 	townRoot := filepath.Dir(r.Path)
 	from := fmt.Sprintf("%s/refinery", r.Name)
 	if origin == reviewer.OriginCrew {
-		from = fmt.Sprintf("%s/crew", r.Name)
+		from = resolveCrewRequester(r.Name)
 	}
 	to := fmt.Sprintf("%s/reviewer", r.Name)
 

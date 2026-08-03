@@ -98,6 +98,8 @@ type Daemon struct {
 	// observation rather than from session creation — otherwise deleting the file
 	// is an instant kill switch for any session older than the window.
 	reviewerMissingSince map[string]time.Time
+	// reviewerLastEscalate rate-limits failure escalations per rig.
+	reviewerLastEscalate map[string]time.Time
 
 	// Deacon startup tracking: prevents race condition where newly started
 	// sessions are immediately killed by the heartbeat check.
