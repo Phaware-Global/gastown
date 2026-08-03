@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
@@ -12,53 +13,19 @@ import (
 	"github.com/steveyegge/gastown/internal/reviewer"
 )
 
-// Reviewer reaper thresholds. These are the compiled-in floor; a rig's
-// reviewer.toml [health] block overrides StuckThreshold per rig.
+// Daemon-side reaper knobs. Everything about what the heartbeat MEANS —
+// thresholds, grace windows, sanitizers, the state machine — lives in
+// internal/reviewer so the daemon and `gt reviewer status` cannot drift.
 const (
-	// defaultReviewerStuckThreshold matches reviewer.toml's shipped value. It is
-	// deliberately longer than merge_queue.pr_review_timeout (30m) so the
-	// refinery escalates a non-engaging reviewer BEFORE the reaper kills it —
-	// the escalation carries diagnostic value that a silent kill would destroy.
-	defaultReviewerStuckThreshold = 45 * time.Minute
-
-	// reviewerKillMultiple: a heartbeat this many times past the stuck threshold
-	// is killed. One threshold nudges (a wedged agent often unsticks), the next
-	// kills. Two tiers instead of a nudge-tracking state machine.
-	reviewerKillMultiple = 2
-
-	// reviewerAbsoluteCapMultiple bounds TOTAL review wall time (heartbeat
-	// elapsed), independent of phase age. This is the rail a reviewer that keeps
-	// refreshing its heartbeat while making no real progress cannot evade —
-	// phase age alone would let it run forever.
-	reviewerAbsoluteCapMultiple = 4
-
 	// reviewerNudgeCooldown rate-limits stuck nudges so a wedged reviewer is not
 	// nudged on every heartbeat tick.
 	reviewerNudgeCooldown = 10 * time.Minute
-
-	// reviewerSpawnGrace covers the window between `gt reviewer request` seeding
-	// the heartbeat and the session actually existing: a Dolt-backed mail write
-	// plus, on a first dispatch, a full git worktree provision. Throughout it the
-	// rig is legitimately in the "heartbeat, no session" state that otherwise
-	// means the reviewer died.
-	reviewerSpawnGrace = 10 * time.Minute
 
 	// reviewerKillCooldown is the minimum gap between kills of the same rig's
 	// reviewer, honoring reviewer.toml's kill_cooldown intent. Without it a
 	// forged heartbeat drives a kill every tick — an unbounded denial of service
 	// against a role that respawns on demand.
 	reviewerKillCooldown = 5 * time.Minute
-
-	// reviewerMissingGrace is how long a live session may have NO heartbeat
-	// before it is reaped, measured from first observation of the absence.
-	reviewerMissingGrace = 15 * time.Minute
-
-	// reviewerOrphanGrace is how long a live reviewer session may have no
-	// heartbeat before it is reaped. `gt reviewer done` clears the heartbeat and
-	// then kills its own session ~3s later, so a brief no-heartbeat window is
-	// normal; anything past this grace is a session whose self-termination
-	// failed, or one started outside the dispatch path.
-	reviewerOrphanGrace = 15 * time.Minute
 )
 
 // reapStuckReviewers checks every known rig's Reviewer session and nudges or
@@ -87,7 +54,7 @@ func (d *Daemon) reapStuckReviewers() {
 // real consumer of RoleDefinition.Health — until now reviewer.toml's
 // stuck_threshold was read only by `gt role def`'s printer and enforced nothing.
 func (d *Daemon) reviewerStuckThreshold(rigName, rigPath string) time.Duration {
-	raw := defaultReviewerStuckThreshold
+	raw := reviewer.DefaultStuckThreshold
 	if def, err := config.LoadRoleDefinition(d.config.TownRoot, rigPath, constants.RoleReviewer); err == nil &&
 		def != nil && def.Health.StuckThreshold.Duration > 0 {
 		raw = def.Health.StuckThreshold.Duration
@@ -95,10 +62,10 @@ func (d *Daemon) reviewerStuckThreshold(rigName, rigPath string) time.Duration {
 	// reviewer.toml lives INSIDE the rig and is agent-writable, so an unclamped
 	// threshold is a kill switch in both directions: a one-second value kills
 	// every reviewer on sight, a one-year value disables the reaper.
-	clamped, adjusted := clampStuckThreshold(raw)
+	clamped, adjusted := reviewer.ClampStuckThreshold(raw)
 	if adjusted {
 		d.logger.Printf("Reviewer reaper: %s stuck_threshold %v is outside [%v, %v] — using %v",
-			rigName, raw, minReviewerStuckThreshold, maxReviewerStuckThreshold, clamped)
+			rigName, raw, reviewer.MinStuckThreshold, reviewer.MaxStuckThreshold, clamped)
 	}
 	return clamped
 }
@@ -120,7 +87,7 @@ func (d *Daemon) reapRigReviewer(rigName string) {
 	// so the reaper could read rig A's heartbeat and kill rig B's healthy
 	// reviewer. Skipping a misconfigured rig costs coverage; guessing costs an
 	// unrelated rig's running review.
-	sessionName, serr := resolveReviewerSession(rigName)
+	sessionName, serr := reviewer.ResolveSessionName(rigName)
 	if serr != nil {
 		d.logger.Printf("Reviewer reaper: skipping %s — %v", rigName, serr)
 		return
@@ -141,7 +108,12 @@ func (d *Daemon) reapRigReviewer(rigName string) {
 	}
 
 	if hb == nil {
-		d.noteReviewerHeartbeatPresent(rigName, false)
+		// Only accrue the missing-heartbeat grace while a session actually
+		// exists. Letting the clock run across idle periods lets an attacker
+		// pre-age it, so `rm heartbeat.json` becomes a zero-grace kill on the
+		// NEXT freshly spawned reviewer — the grace is supposed to mean "missing
+		// for 15m with a session up", not "15m have passed at some point".
+		d.noteReviewerHeartbeatPresent(rigName, !alive)
 		if alive {
 			d.reapReviewerWithoutHeartbeat(rigName, sessionName)
 		}
@@ -158,21 +130,21 @@ func (d *Daemon) reapRigReviewer(rigName string) {
 		// exists to provide, and the session then came up with NO heartbeat,
 		// routing a healthy just-started reviewer onto the missing-heartbeat kill
 		// path. Every other branch here has a grace or a ramp; this one had none.
-		age, ok := reviewerPhaseAge(hb.Age())
+		age, ok := reviewer.PhaseAge(hb)
 		if !ok {
 			d.logger.Printf("Reviewer reaper: %s heartbeat timestamp is in the future — taking no action", rigName)
 			return
 		}
-		if age < reviewerSpawnGrace {
+		if age < reviewer.SpawnGrace {
 			return
 		}
 		d.logger.Printf("Reviewer reaper: %s reviewer has no session (phase=%s pr=%d, no progress for %s) — clearing stale heartbeat",
-			rigName, safePhase(hb.Phase), safePR(hb.PR), age.Round(time.Second))
+			rigName, reviewer.SafePhase(hb.Phase), reviewer.SafePR(hb.PR), age.Round(time.Second))
 		_ = events.LogFeed(events.TypeSessionDeath, rigName+"/"+constants.RoleReviewer,
 			map[string]interface{}{
 				"rig": rigName, "role": constants.RoleReviewer, "reason": "died_mid_review",
-				"phase": safePhase(hb.Phase), "pr": safePR(hb.PR),
-				"elapsed": hb.Elapsed().Round(time.Second).String(),
+				"phase": reviewer.SafePhase(hb.Phase), "pr": reviewer.SafePR(hb.PR),
+				"elapsed": reviewer.SafeText(hb.Elapsed().Round(time.Second).String()),
 			})
 		if cerr := reviewer.ClearHeartbeat(rigPath); cerr != nil {
 			d.logger.Printf("Reviewer reaper: clearing %s heartbeat: %v", rigName, cerr)
@@ -206,17 +178,36 @@ const (
 //	          prompt` and `gt reviewer consolidate`, with no command in between
 //	          to refresh the timestamp. The threshold must accommodate a full
 //	          subagent pass, which is why it defaults to 45m.
-func decideReviewerAction(hb *reviewer.Heartbeat, stuck, sessionAge time.Duration) (reviewerAction, string) {
+//
+// nudged reports whether this reviewer has already been nudged for a cap breach.
+// It is what makes the courtesy nudge below terminate: without it, a reviewer
+// looping fast enough to keep its phase fresh would be nudged forever and the
+// absolute cap — the one rail such a loop cannot evade — would be unreachable.
+func decideReviewerAction(hb *reviewer.Heartbeat, stuck, sessionAge time.Duration, nudged bool) (reviewerAction, string) {
 	if hb == nil || stuck <= 0 {
 		return reviewerActionNone, ""
 	}
 	// The runtime the cap acts on is corroborated against tmux, which the
 	// reviewed process does not own — see reviewerRuntime. Negative inputs (a
 	// future-dated file) collapse to 0 = unknown rather than reading as healthy.
-	runtime := reviewerRuntime(hb.Elapsed(), sessionAge)
+	runtime := reviewer.Runtime(hb.Elapsed(), sessionAge)
 
 	// Zero runtime means BOTH signals are unknown. Unknown must never kill.
-	if capDur := stuck * reviewerAbsoluteCapMultiple; runtime > 0 && runtime >= capDur {
+	if capDur := stuck * reviewer.AbsoluteCapMultiple; runtime > 0 && runtime >= capDur {
+		// One courtesy nudge before killing. Runtime prefers the SESSION clock,
+		// which is unforgeable but deliberately over-estimates a later round's own
+		// wall time, because rounds share a session. Acting on it alone would kill
+		// a minutes-old round-N review for its predecessor's lifetime, so a review
+		// still visibly advancing its phase gets one chance to wrap up.
+		//
+		// Exactly one: `nudged` makes the tier terminate. A reviewer looping fast
+		// enough to keep its phase fresh is the case the cap exists for, and an
+		// unconditional nudge tier would make it immortal.
+		if age, ok := reviewer.PhaseAge(hb); ok && age < stuck && !nudged {
+			return reviewerActionNudge, fmt.Sprintf(
+				"past the absolute runtime cap (%s of %s) but still progressing — nudging once before killing",
+				runtime.Round(time.Second), capDur)
+		}
 		return reviewerActionKill, fmt.Sprintf("exceeded absolute runtime cap (%s of %s)",
 			runtime.Round(time.Second), capDur)
 	}
@@ -224,17 +215,19 @@ func decideReviewerAction(hb *reviewer.Heartbeat, stuck, sessionAge time.Duratio
 	// A future-dated timestamp yields a negative age, which under a naive
 	// comparison reads as infinitely fresh and makes a wedged reviewer immortal.
 	// Treat it as no progress signal; the runtime rail above still applies.
-	age, ok := reviewerPhaseAge(hb.Age())
+	age, ok := reviewer.PhaseAge(hb)
 	if !ok {
-		return reviewerActionNone, ""
+		// The safe direction, but not a silent one: this is also what a forged
+		// future timestamp buys, and the runtime rail is then all that remains.
+		return reviewerActionNone, "phase timestamp is unusable — progress rails disabled"
 	}
 	switch {
-	case age >= stuck*reviewerKillMultiple:
+	case age >= stuck*reviewer.StuckMultiple:
 		return reviewerActionKill, fmt.Sprintf("no progress for %s (phase=%s, %dx the %s threshold)",
-			age.Round(time.Second), safePhase(hb.Phase), reviewerKillMultiple, stuck)
+			age.Round(time.Second), reviewer.SafePhase(hb.Phase), reviewer.StuckMultiple, stuck)
 	case age >= stuck:
 		return reviewerActionNudge, fmt.Sprintf("no progress for %s (phase=%s)",
-			age.Round(time.Second), safePhase(hb.Phase))
+			age.Round(time.Second), reviewer.SafePhase(hb.Phase))
 	}
 	return reviewerActionNone, ""
 }
@@ -242,7 +235,7 @@ func decideReviewerAction(hb *reviewer.Heartbeat, stuck, sessionAge time.Duratio
 // enforceReviewerProgress applies decideReviewerAction to a live reviewer.
 func (d *Daemon) enforceReviewerProgress(rigName, sessionName, rigPath string, hb *reviewer.Heartbeat) {
 	stuck := d.reviewerStuckThreshold(rigName, rigPath)
-	action, reason := decideReviewerAction(hb, stuck, d.reviewerSessionAge(sessionName))
+	action, reason := decideReviewerAction(hb, stuck, d.reviewerSessionAge(sessionName), d.reviewerWasNudged(rigName))
 	switch action {
 	case reviewerActionKill:
 		d.killStuckReviewer(rigName, sessionName, rigPath, hb, reason)
@@ -279,13 +272,13 @@ func (d *Daemon) nudgeStuckReviewer(rigName, sessionName string, hb *reviewer.He
 	msg := fmt.Sprintf(
 		"REVIEWER_STALLED: no progress for %s (phase=%s, PR #%d). Continue the review, "+
 			"or if you cannot, post what you have via `gt reviewer post` and run `gt reviewer done`.",
-		age.Round(time.Second), safePhase(hb.Phase), safePR(hb.PR))
+		age.Round(time.Second), reviewer.SafePhase(hb.Phase), reviewer.SafePR(hb.PR))
 	if err := d.tmux.NudgeSession(sessionName, msg); err != nil {
 		d.logger.Printf("Reviewer reaper: nudging %s: %v", sessionName, err)
 		return
 	}
 	d.logger.Printf("Reviewer reaper: nudged %s reviewer (stalled %s at phase=%s, threshold %s)",
-		rigName, age.Round(time.Second), safePhase(hb.Phase), stuck)
+		rigName, age.Round(time.Second), reviewer.SafePhase(hb.Phase), stuck)
 }
 
 // shouldNudgeReviewer rate-limits stuck nudges to one per cooldown per rig, so
@@ -306,6 +299,22 @@ func (d *Daemon) shouldNudgeReviewer(rigName string) bool {
 	return true
 }
 
+// reviewerWasNudged reports whether this rig's reviewer has been nudged recently
+// enough that the nudge should count as already spent. Unlike shouldNudgeReviewer
+// it records nothing — a read of the same bookkeeping, so the cap's courtesy
+// nudge is granted once and then withdrawn.
+//
+// The window is deliberately wider than the nudge cooldown: a nudge whose
+// cooldown has merely expired was still delivered and still ignored, and
+// re-granting the courtesy on that basis would restore the immortality the
+// single-nudge rule exists to prevent.
+func (d *Daemon) reviewerWasNudged(rigName string) bool {
+	d.reviewerNudgeMu.Lock()
+	defer d.reviewerNudgeMu.Unlock()
+	last, ok := d.reviewerLastNudge[rigName]
+	return ok && time.Since(last) < reviewerNudgeCooldown*3
+}
+
 // killStuckReviewer terminates a reviewer session and clears its heartbeat.
 //
 // The kill is loud by design: it is logged, emitted to the feed, and the reason
@@ -316,8 +325,12 @@ func (d *Daemon) killStuckReviewer(rigName, sessionName, rigPath string, hb *rev
 	// Re-read under the decision. Between deciding and acting the reviewer may
 	// have finished and a new review been dispatched into the same session, in
 	// which case this kill would land on an innocent successor.
+	// Compare IDENTITY, not Timestamp. The decision is about which review is
+	// running, and the timestamp changes on every phase touch — so comparing it
+	// handed any process writing heartbeat.json in a loop a permanent veto over
+	// its own kill, which is exactly the runaway this rail exists to stop.
 	if current, cerr := reviewer.ReadHeartbeatE(rigPath); cerr != nil || current == nil ||
-		!current.Timestamp.Equal(hb.Timestamp) || current.PR != hb.PR {
+		current.PR != hb.PR || !strings.EqualFold(current.SHA, hb.SHA) {
 		d.logger.Printf("Reviewer reaper: %s heartbeat changed under the kill decision — aborting", rigName)
 		return
 	}
@@ -330,7 +343,7 @@ func (d *Daemon) killStuckReviewer(rigName, sessionName, rigPath string, hb *rev
 	// line-oriented, so a raw value with an embedded newline can forge entries
 	// that appear to come from the daemon itself.
 	d.logger.Printf("Reviewer reaper: killing %s reviewer — %s (pr=%d phase=%s sha=%s)",
-		rigName, safeLogField(reason), safePR(hb.PR), safePhase(hb.Phase), safeSHA(hb.SHA))
+		rigName, reviewer.SafeText(reason), reviewer.SafePR(hb.PR), reviewer.SafePhase(hb.Phase), reviewer.SafeSHA(hb.SHA))
 
 	if err := d.tmux.KillSessionWithProcesses(sessionName); err != nil {
 		d.logger.Printf("Reviewer reaper: killing session %s: %v", sessionName, err)
@@ -339,9 +352,9 @@ func (d *Daemon) killStuckReviewer(rigName, sessionName, rigPath string, hb *rev
 	}
 	_ = events.LogFeed(events.TypeKill, rigName+"/"+constants.RoleReviewer,
 		map[string]interface{}{
-			"rig": rigName, "role": constants.RoleReviewer, "reason": safeLogField(reason),
-			"pr": safePR(hb.PR), "phase": safePhase(hb.Phase), "sha": safeSHA(hb.SHA),
-			"elapsed": hb.Elapsed().Round(time.Second).String(),
+			"rig": rigName, "role": constants.RoleReviewer, "reason": reviewer.SafeText(reason),
+			"pr": reviewer.SafePR(hb.PR), "phase": reviewer.SafePhase(hb.Phase), "sha": reviewer.SafeSHA(hb.SHA),
+			"elapsed": reviewer.SafeText(hb.Elapsed().Round(time.Second).String()),
 		})
 	d.clearReviewerHeartbeat(rigName, rigPath)
 }
@@ -388,7 +401,7 @@ func (d *Daemon) reviewerMissingFor(rigName string) (time.Duration, bool) {
 // observation means the window must also be waited out with the daemon watching.
 func (d *Daemon) reapReviewerWithoutHeartbeat(rigName, sessionName string) {
 	missingFor, seen := d.reviewerMissingFor(rigName)
-	if !seen || missingFor < reviewerMissingGrace {
+	if !seen || missingFor < reviewer.MissingGrace {
 		return
 	}
 	// Corroborate with something the file's author does not control. A session
