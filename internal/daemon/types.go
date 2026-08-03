@@ -447,6 +447,15 @@ func GetPatrolRigs(config *DaemonPatrolConfig, patrol string) []string {
 		if config.Patrols.Witness != nil {
 			return config.Patrols.Witness.Rigs
 		}
+	case constants.RoleReviewer:
+		// Without this the `rigs` allowlist was silently inert — it fell through
+		// to "all rigs", so a destructive, default-on patrol had only a
+		// whole-patrol off switch and no working per-rig narrowing. Only half of
+		// the rig-scoping fix had landed: IsPatrolEnabled gained a reviewer case
+		// and this did not.
+		if config.Patrols.Reviewer != nil {
+			return config.Patrols.Reviewer.Rigs
+		}
 	}
 	return nil // All rigs
 }
