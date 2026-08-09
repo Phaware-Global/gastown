@@ -1,0 +1,14 @@
+# Toolchain pins for this repository.
+#
+# go matches the go directive in go.mod.
+# golangci-lint is pinned so lint results are reproducible across machines.
+#
+# Build note: the go-icu-regex transitive dependency needs ICU headers. On
+# macOS, Homebrew installs icu4c keg-only, so the Makefile locates it with
+# `brew --prefix icu4c` and exports CGO_CPPFLAGS/CGO_LDFLAGS. Without icu4c
+# installed the build fails with:
+#     fatal error: 'unicode/regex.h' file not found
+# icu4c is a system package, so it cannot be pinned here.
+[tools]
+go = "1.26.2"
+golangci-lint = "2.12.2"
