@@ -263,7 +263,7 @@ func ensureRoleWorktreeIntegrity(cwd, townRoot string, role Role) error {
 
 func roleRequiresWorktreeIntegrity(role Role) bool {
 	switch role {
-	case RolePolecat, RoleCrew, RoleWitness, RoleRefinery, RoleDog, RoleBoot:
+	case RolePolecat, RoleCrew, RoleRefinery, RoleDog, RoleBoot:
 		return true
 	default:
 		return false

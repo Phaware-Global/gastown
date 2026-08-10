@@ -26,6 +26,21 @@ func TestEnsureRoleWorktreeIntegrityRequiresPolecatMetadata(t *testing.T) {
 	}
 }
 
+func TestEnsureRoleWorktreeIntegrityAllowsWitnessWithoutMetadata(t *testing.T) {
+	// Witness has no rig/ git clone by design (see `gt rig --help`), so
+	// missing .git metadata under witness/ must not be treated as a
+	// violation. Regression test for gt-8815.
+	townRoot := t.TempDir()
+	cwd := filepath.Join(townRoot, "gastown", "witness")
+	if err := os.MkdirAll(cwd, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ensureRoleWorktreeIntegrity(cwd, townRoot, RoleWitness); err != nil {
+		t.Fatalf("ensureRoleWorktreeIntegrity() error = %v, want nil", err)
+	}
+}
+
 func TestEnsureRoleWorktreeIntegrityAllowsNeutralDirectoryWithoutMetadata(t *testing.T) {
 	townRoot := t.TempDir()
 
