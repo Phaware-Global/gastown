@@ -27,9 +27,9 @@ func TestEnsureRoleWorktreeIntegrityRequiresPolecatMetadata(t *testing.T) {
 }
 
 func TestEnsureRoleWorktreeIntegrityAllowsWitnessWithoutMetadata(t *testing.T) {
-	// Witness has no rig/ git clone by design (see `gt rig --help`), so
-	// missing .git metadata under witness/ must not be treated as a
-	// violation. Regression test for gt-8815.
+	// Witness's home dir has no rig/ git clone by design (see `gt rig
+	// --help`), so missing .git metadata directly under witness/ must not be
+	// treated as a violation. Regression test for gt-8815.
 	townRoot := t.TempDir()
 	cwd := filepath.Join(townRoot, "gastown", "witness")
 	if err := os.MkdirAll(cwd, 0755); err != nil {
@@ -38,6 +38,23 @@ func TestEnsureRoleWorktreeIntegrityAllowsWitnessWithoutMetadata(t *testing.T) {
 
 	if err := ensureRoleWorktreeIntegrity(cwd, townRoot, RoleWitness); err != nil {
 		t.Fatalf("ensureRoleWorktreeIntegrity() error = %v, want nil", err)
+	}
+}
+
+func TestEnsureRoleWorktreeIntegrityRejectsWitnessRigCloneWithoutMetadata(t *testing.T) {
+	// witness/rig/ is a real linked worktree when present (see
+	// internal/witness/manager.go:witnessDir) and is not covered by the
+	// witness-home exemption above — missing .git metadata there must still
+	// fail closed. Regression test for PR #185 review feedback on gt-8815.
+	townRoot := t.TempDir()
+	cwd := filepath.Join(townRoot, "gastown", "witness", "rig")
+	if err := os.MkdirAll(cwd, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	err := ensureRoleWorktreeIntegrity(cwd, townRoot, RoleWitness)
+	if !errors.Is(err, worktreeintegrity.ErrIntegrityViolation) {
+		t.Fatalf("ensureRoleWorktreeIntegrity() error = %v, want ErrIntegrityViolation", err)
 	}
 }
 

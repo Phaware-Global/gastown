@@ -252,9 +252,13 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 }
 
 func ensureRoleWorktreeIntegrity(cwd, townRoot string, role Role) error {
+	require := roleRequiresWorktreeIntegrity(role)
+	if role == RoleWitness && isWitnessHomeWithoutClone(cwd, townRoot) {
+		require = false
+	}
 	if err := worktreeintegrity.Validate(cwd, worktreeintegrity.IntegrityOptions{
 		TownRoot: townRoot,
-		Require:  roleRequiresWorktreeIntegrity(role),
+		Require:  require,
 	}); err != nil {
 		return fmt.Errorf("%w\nRemediation: stop using this worktree and run `gt doctor --fix`", err)
 	}
@@ -263,11 +267,30 @@ func ensureRoleWorktreeIntegrity(cwd, townRoot string, role Role) error {
 
 func roleRequiresWorktreeIntegrity(role Role) bool {
 	switch role {
-	case RolePolecat, RoleCrew, RoleRefinery, RoleDog, RoleBoot:
+	case RolePolecat, RoleCrew, RoleRefinery, RoleDog, RoleBoot, RoleWitness:
 		return true
 	default:
 		return false
 	}
+}
+
+// isWitnessHomeWithoutClone reports whether cwd is the witness role's home
+// directory (<rig>/witness) rather than its optional witness/rig/ clone.
+// Witness has no git clone by design when it runs from its home dir, but
+// witness/rig/ (see internal/witness/manager.go:witnessDir, which prefers it
+// over witness/ whenever it exists) is a real linked worktree when present
+// and must still pass integrity validation like any other agent worktree.
+func isWitnessHomeWithoutClone(cwd, townRoot string) bool {
+	relPath, err := filepath.Rel(townRoot, cwd)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(filepath.ToSlash(relPath), "/")
+	if len(parts) < 2 || parts[1] != "witness" {
+		return false
+	}
+	// <rig>/witness/rig/... is the real clone — not exempt.
+	return len(parts) < 3 || parts[2] != "rig"
 }
 
 // runPrimeCompactResume runs a lighter prime after compaction or resume.

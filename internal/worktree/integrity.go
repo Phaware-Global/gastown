@@ -18,9 +18,12 @@ type IntegrityOptions struct {
 	// the filesystem root.
 	TownRoot string
 
-	// Require reports a missing .git marker as an integrity violation. This is
-	// appropriate for agent worktree roles such as polecats, crew, and refinery.
-	// Witness is intentionally excluded: it has no rig/ git clone by design.
+	// Require reports a missing .git marker as an integrity violation. The
+	// caller decides which roles and paths need this — see
+	// roleRequiresWorktreeIntegrity in internal/cmd/prime.go for the current
+	// set. Witness is a partial exception: its home dir has no git clone by
+	// design, but its optional witness/rig/ clone (when present) is a real
+	// worktree and is not exempt.
 	Require bool
 }
 
