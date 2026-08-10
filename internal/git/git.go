@@ -1074,6 +1074,21 @@ func (g *Git) HasStagedChanges() (bool, error) {
 	return strings.TrimSpace(out) != "", nil
 }
 
+// StagedFiles returns all file paths currently staged (index differs from
+// HEAD). Used to re-verify the index after an unstage operation that may
+// have failed, rather than trusting a discarded error.
+func (g *Git) StagedFiles() ([]string, error) {
+	out, err := g.run("diff", "--cached", "--name-only")
+	if err != nil {
+		return nil, err
+	}
+	trimmed := strings.TrimSpace(out)
+	if trimmed == "" {
+		return nil, nil
+	}
+	return strings.Split(trimmed, "\n"), nil
+}
+
 // ShowFile returns the contents of a file at a given ref (e.g., "origin/main:CLAUDE.md").
 // Returns empty string and no error if the file does not exist at that ref.
 func (g *Git) ShowFile(ref, path string) (string, error) {

@@ -152,17 +152,40 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 		// (e.g. a checked-in CLAUDE.local.md) — these are runtime artifacts
 		// and must never land in a preservation commit. Mirrors gt done's
 		// gt-pvx exclusion policy.
-		_ = g.ResetFiles("CLAUDE.local.md")
-		for _, path := range status.RuntimeArtifactPaths() {
-			_ = g.ResetFiles(path)
-		}
-		for _, path := range opts.ExtraExcludePaths {
-			_ = g.ResetFiles(path)
+		var excludePaths []string
+		excludePaths = append(excludePaths, "CLAUDE.local.md")
+		excludePaths = append(excludePaths, status.RuntimeArtifactPaths()...)
+		excludePaths = append(excludePaths, opts.ExtraExcludePaths...)
+
+		var resetErrs []error
+		for _, path := range excludePaths {
+			if err := g.ResetFiles(path); err != nil {
+				resetErrs = append(resetErrs, fmt.Errorf("%s: %w", path, err))
+			}
 		}
 		// Unstage deletions of tracked files: a safety net must preserve
 		// work (additions + modifications), never destroy it (deletions).
 		if deletions, delErr := g.StagedDeletions(); delErr == nil && len(deletions) > 0 {
-			_ = g.ResetFiles(deletions...)
+			if err := g.ResetFiles(deletions...); err != nil {
+				resetErrs = append(resetErrs, fmt.Errorf("staged deletions: %w", err))
+			}
+			excludePaths = append(excludePaths, deletions...)
+		}
+
+		if len(resetErrs) > 0 {
+			// A reset failure means the exclusion may not have taken effect.
+			// Don't trust it silently — re-verify against the actual index
+			// and refuse to commit (let alone push) if anything that must be
+			// excluded is still staged (PR #184 review).
+			staged, sErr := g.StagedFiles()
+			if sErr != nil {
+				return nil, fmt.Errorf("exclusion reset failed (%v) and could not re-verify the index: %w", resetErrs, sErr)
+			}
+			for _, f := range staged {
+				if pathExcluded(f, excludePaths) {
+					return nil, fmt.Errorf("refusing to auto-preserve: exclusion reset failed and %q is still staged: %v", f, resetErrs)
+				}
+			}
 		}
 
 		// `git add -u` legitimately stages nothing when the only
@@ -271,4 +294,22 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 	result.Ref = refName
 	result.Commit = head
 	return result, nil
+}
+
+// pathExcluded reports whether staged path f falls under one of the
+// exclude paths. exclude entries ending in "/" (directory roots from
+// RuntimeArtifactPaths) match by prefix; everything else matches exactly.
+func pathExcluded(f string, exclude []string) bool {
+	for _, ex := range exclude {
+		if strings.HasSuffix(ex, "/") {
+			if strings.HasPrefix(f, ex) {
+				return true
+			}
+			continue
+		}
+		if f == ex {
+			return true
+		}
+	}
+	return false
 }

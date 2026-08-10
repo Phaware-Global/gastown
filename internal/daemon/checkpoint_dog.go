@@ -8,11 +8,22 @@ import (
 	"github.com/steveyegge/gastown/internal/checkpoint"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/session"
 )
 
 const (
 	defaultCheckpointDogInterval = 10 * time.Minute
+
+	// checkpointDogAbandonedThreshold bounds how long a dead session's
+	// worktree keeps getting auto-checkpointed after its last known
+	// activity. Distinct from (and much larger than) the session-liveness
+	// heartbeat threshold: checkpointing a session that just died is the
+	// highest-risk case this dog exists for, but a worktree whose session
+	// has been dead well beyond this window is more likely a deliberately
+	// abandoned or gone-wrong worktree than one about to be reassigned,
+	// and should stop being auto-published (PR #184 review).
+	checkpointDogAbandonedThreshold = 24 * time.Hour
 )
 
 // CheckpointDogConfig holds configuration for the checkpoint_dog patrol.
@@ -95,10 +106,27 @@ func (d *Daemon) checkpointRigPolecats(rigName string) (int, int) {
 		// why the checkpoint fired for one incident polecat but not for two
 		// others in the same afternoon — both had already died by the time
 		// this patrol ran.
+		//
+		// That said, this must not turn into "every worktree on the box,
+		// indefinitely" (PR #184 review). A tmux failure means we can't
+		// tell whether the worktree is even in scope, so skip it for
+		// safety rather than checkpointing blind — the next cycle will
+		// retry. And a session dead well beyond checkpointDogAbandonedThreshold
+		// is more likely a deliberately-left-dirty or gone-wrong worktree
+		// than one about to be reassigned, so stop auto-publishing it.
 		sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
-		if alive, err := d.tmux.HasSession(sessionName); err != nil {
-			d.logger.Printf("checkpoint_dog: error checking session %s: %v", sessionName, err)
-		} else if !alive {
+		alive, err := d.tmux.HasSession(sessionName)
+		if err != nil {
+			d.logger.Printf("checkpoint_dog: error checking session %s, skipping for safety: %v", sessionName, err)
+			continue
+		}
+		if !alive {
+			if hb := polecat.ReadSessionHeartbeat(d.config.TownRoot, sessionName); hb != nil {
+				if age := time.Since(hb.Timestamp); age > checkpointDogAbandonedThreshold {
+					d.logger.Printf("checkpoint_dog: session %s dead, last activity %s ago (> %s) — skipping as abandoned", sessionName, age.Round(time.Minute), checkpointDogAbandonedThreshold)
+					continue
+				}
+			}
 			d.logger.Printf("checkpoint_dog: session %s is dead — checkpointing anyway (highest-risk case)", sessionName)
 		}
 
