@@ -1,10 +1,15 @@
 package daemon
 
 import (
+	"io"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/checkpoint"
 )
 
 func TestCheckpointDogInterval_Default(t *testing.T) {
@@ -202,5 +207,120 @@ func TestIsGitWorktree(t *testing.T) {
 	}
 	if !isGitWorktree(fileGit) {
 		t.Error(".git file (linked worktree) should count as worktree")
+	}
+}
+
+// initCheckpointTestRepo creates a local git worktree with a bare "origin"
+// remote and returns the local worktree dir, on branch "polecat/foo/bead@1".
+func initCheckpointTestRepo(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	remoteDir := filepath.Join(tmp, "remote.git")
+	localDir := filepath.Join(tmp, "local")
+
+	run := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+
+	run(tmp, "init", "--bare", remoteDir)
+	if err := os.MkdirAll(localDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	run(localDir, "init")
+	run(localDir, "config", "user.email", "test@test.com")
+	run(localDir, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(localDir, "README.md"), []byte("# Test\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	run(localDir, "add", ".")
+	run(localDir, "commit", "-m", "initial")
+	run(localDir, "remote", "add", "origin", remoteDir)
+	run(localDir, "checkout", "-b", "polecat/foo/bead@1")
+
+	return localDir
+}
+
+func newTestDaemon() *Daemon {
+	return &Daemon{logger: log.New(io.Discard, "", 0)}
+}
+
+func TestCheckpointWorktree_CommitsAndPushesPreserveRef(t *testing.T) {
+	workDir := initCheckpointTestRepo(t)
+	if err := os.WriteFile(filepath.Join(workDir, "handler.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	d := newTestDaemon()
+	if !d.checkpointWorktree(workDir, "myrig", "foo") {
+		t.Fatal("expected checkpointWorktree to report a preservation")
+	}
+
+	cmd := exec.Command("git", "log", "-1", "--format=%s")
+	cmd.Dir = workDir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git log: %v", err)
+	}
+	if got := string(out); got != checkpoint.WIPCommitPrefix+"\n" {
+		t.Fatalf("commit subject = %q, want %q", got, checkpoint.WIPCommitPrefix)
+	}
+}
+
+func TestCheckpointWorktree_CleanWorktreeReportsNothing(t *testing.T) {
+	workDir := initCheckpointTestRepo(t)
+
+	d := newTestDaemon()
+	if d.checkpointWorktree(workDir, "myrig", "foo") {
+		t.Fatal("expected checkpointWorktree to report nothing for a clean worktree")
+	}
+}
+
+func TestCheckpointWorktree_RefusesProtectedBranch(t *testing.T) {
+	workDir := initCheckpointTestRepo(t)
+
+	// initCheckpointTestRepo already switched to a feature branch; switch
+	// back to whatever the repo's default init branch was (main/master per
+	// local git config) rather than assuming its exact name.
+	cmd := exec.Command("git", "checkout", "-")
+	cmd.Dir = workDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("checkout -: %v\n%s", err, out)
+	}
+	branchCmd := exec.Command("git", "branch", "--show-current")
+	branchCmd.Dir = workDir
+	branchOut, err := branchCmd.Output()
+	if err != nil {
+		t.Fatalf("branch --show-current: %v", err)
+	}
+	defaultBranch := string(branchOut)
+	if len(defaultBranch) > 0 && defaultBranch[len(defaultBranch)-1] == '\n' {
+		defaultBranch = defaultBranch[:len(defaultBranch)-1]
+	}
+	if defaultBranch != "main" && defaultBranch != "master" && defaultBranch != "develop" {
+		t.Skipf("repo default branch %q is not in protectedBranchSet", defaultBranch)
+	}
+
+	if err := os.WriteFile(filepath.Join(workDir, "handler.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	d := newTestDaemon()
+	if d.checkpointWorktree(workDir, "myrig", "foo") {
+		t.Fatal("must not checkpoint a protected branch (G41 guard)")
+	}
+
+	statusCmd := exec.Command("git", "status", "--porcelain")
+	statusCmd.Dir = workDir
+	out, err := statusCmd.Output()
+	if err != nil {
+		t.Fatalf("git status: %v", err)
+	}
+	if len(out) == 0 {
+		t.Fatal("work must remain uncommitted in the worktree after refusal")
 	}
 }

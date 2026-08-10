@@ -464,7 +464,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			ExtraExcludePaths: extraExclude,
 		})
 		if preserveErr != nil {
-			return fmt.Errorf("gt-pvx safety net: %w\nResolve conflicts first, or use --status DEFERRED to exit without completing", preserveErr)
+			return fmt.Errorf("gt-pvx safety net auto-save failed: %w\nResolve the issue first, or use --status DEFERRED to exit without completing", preserveErr)
 		}
 		if preserveResult.Committed {
 			fmt.Printf("%s Auto-committed uncommitted work (safety net)\n", style.Bold.Render("✓"))

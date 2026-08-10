@@ -34,6 +34,13 @@ type PreserveOptions struct {
 	// in a preservation commit (e.g. an overlay CLAUDE.md carrying a
 	// lifecycle marker). Paths that aren't staged are a no-op.
 	ExtraExcludePaths []string
+
+	// CommitMessage overrides the default "fix: auto-save uncommitted
+	// implementation work (gt-pvx safety net)" message. Callers with their
+	// own recognizable marker (e.g. checkpoint_dog's "WIP: checkpoint
+	// (auto)" prefix, matched elsewhere for squashing) should set this
+	// rather than let their commits go unrecognized by that tooling.
+	CommitMessage string
 }
 
 // PreserveResult reports what AutoPreserveUncommittedWork actually did.
@@ -107,9 +114,12 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 			_ = g.ResetFiles(deletions...)
 		}
 
-		msg := "fix: auto-save uncommitted implementation work (gt-pvx safety net)"
-		if opts.IssueID != "" {
-			msg = fmt.Sprintf("fix: auto-save uncommitted implementation work (%s, gt-pvx safety net)", opts.IssueID)
+		msg := opts.CommitMessage
+		if msg == "" {
+			msg = "fix: auto-save uncommitted implementation work (gt-pvx safety net)"
+			if opts.IssueID != "" {
+				msg = fmt.Sprintf("fix: auto-save uncommitted implementation work (%s, gt-pvx safety net)", opts.IssueID)
+			}
 		}
 		if err := g.CommitNoVerify(msg); err != nil {
 			return nil, fmt.Errorf("auto-committing: %w", err)

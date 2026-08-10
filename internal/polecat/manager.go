@@ -1152,6 +1152,30 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	// Polecat dir is the parent directory (polecats/<name>/)
 	polecatDir := m.polecatDir(name)
 
+	// Preserve any uncommitted or unpushed work before anything below can
+	// discard it. This runs unconditionally — including under force/nuclear,
+	// which bypass the uncommitted-work gate a few lines down — because that
+	// gate is exactly what force/nuclear exist to skip, and skipping it must
+	// not mean skipping preservation too (gt-y8ts: force-nuking a polecat
+	// used to destroy real uncommitted work with zero recovery path). Commits
+	// with --no-verify (broken husky hooks in polecat worktrees can fail a
+	// plain commit while a later push still reports success) and pushes to a
+	// dedicated preserve/<branch> ref, verified against the remote tip, since
+	// the worktree itself is about to be removed. Best-effort: a preservation
+	// failure is logged and does not block an operator-requested removal.
+	preserveGit := git.NewGit(clonePath)
+	if branch, brErr := preserveGit.CurrentBranch(); brErr == nil && branch != "" {
+		if result, presErr := git.AutoPreserveUncommittedWork(preserveGit, branch, git.PreserveOptions{
+			IssueID: name,
+			Push:    true,
+		}); presErr != nil {
+			style.PrintWarning("could not auto-preserve work in %s before removal: %v", name, presErr)
+		} else if result.Pushed {
+			fmt.Printf("%s Preserved uncommitted work for %s: pushed %s to %s\n",
+				style.Bold.Render("✓"), name, result.Commit, result.Ref)
+		}
+	}
+
 	// Check for uncommitted work unless bypassed
 	if !nuclear {
 		// ZFC #10: First try to read cleanup_status from agent bead
