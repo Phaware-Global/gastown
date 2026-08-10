@@ -251,7 +251,11 @@ func newTestDaemon() *Daemon {
 
 func TestCheckpointWorktree_CommitsAndPushesPreserveRef(t *testing.T) {
 	workDir := initCheckpointTestRepo(t)
-	if err := os.WriteFile(filepath.Join(workDir, "handler.go"), []byte("package x\n"), 0o644); err != nil {
+	// Modify a file already tracked by initCheckpointTestRepo's initial
+	// commit: staging is `git add -u` (allowlist, gt-i4ej FIX 1), which only
+	// picks up changes to files git already tracks, never new untracked
+	// files (see the matching comment in preserve_test.go).
+	if err := os.WriteFile(filepath.Join(workDir, "README.md"), []byte("# Test\nmodified\n"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
