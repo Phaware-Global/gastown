@@ -1160,7 +1160,7 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	// used to destroy real uncommitted work with zero recovery path). Commits
 	// with --no-verify (broken husky hooks in polecat worktrees can fail a
 	// plain commit while a later push still reports success) and pushes to a
-	// dedicated preserve/<branch> ref, verified against the remote tip, since
+	// dedicated polecat/preserve-<branch> ref, verified against the remote tip, since
 	// the worktree itself is about to be removed. Best-effort: a preservation
 	// failure is logged and does not block an operator-requested removal.
 	preserveGit := git.NewGit(clonePath)

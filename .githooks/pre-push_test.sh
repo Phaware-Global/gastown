@@ -248,6 +248,38 @@ unset GT_ALLOW_OFFBRANCH_PUSH 2>/dev/null || true
 assert_pass "Off-branch deletion not blocked by HEAD guard" run_hook "refs/heads/$DEFAULT_BRANCH" "0000000000000000000000000000000000000000" "refs/heads/$DEFAULT_BRANCH" "$default_sha"
 cleanup
 
+# Test 14: gt-y8ts preservation ref, pushed via the "HEAD:refs/heads/<ref>"
+# refspec form the git.AutoPreserveUncommittedWork helper uses — allowed
+# because it's namespaced under "polecat/". Uses local_ref="HEAD" (not
+# "refs/heads/...") to match the actual refspec shape, which also confirms
+# the HEAD-mismatch guard doesn't fire for it.
+echo "Test 14: Preservation ref push (polecat/preserve-*, HEAD refspec form) allowed"
+setup_repos
+cd "$TMPDIR/local"
+git checkout -b "polecat/furiosa/gt-y8ts@abc123" >/dev/null 2>&1
+echo "wip" >> file.txt
+git add file.txt && git commit -m "wip" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+assert_pass "Preservation ref push allowed" run_hook "HEAD" "$local_sha" "refs/heads/polecat/preserve-furiosa-gt-y8ts@abc123" "0000000000000000000000000000000000000000"
+cleanup
+
+# Test 15: Regression guard for gt-y8ts — a bare "preserve/*" ref (the
+# original, buggy ref naming) must stay BLOCKED. AutoPreserveUncommittedWork
+# was first shipped pushing to "preserve/<branch>" and that push was rejected
+# by this exact hook on this exact repo (see gt-y8ts bead notes) — the fix
+# renamed the ref to "polecat/preserve-<branch>" (Test 14). This test exists
+# so nobody re-introduces the bare "preserve/*" naming without noticing it
+# fails here.
+echo "Test 15: Bare preserve/* ref (old buggy naming) stays blocked"
+setup_repos
+cd "$TMPDIR/local"
+git checkout -b "polecat/furiosa/gt-y8ts@abc123" >/dev/null 2>&1
+echo "wip" >> file.txt
+git add file.txt && git commit -m "wip" >/dev/null 2>&1
+local_sha=$(get_sha HEAD)
+assert_block "Bare preserve/* ref blocked" run_hook "HEAD" "$local_sha" "refs/heads/preserve/furiosa-gt-y8ts-abc123" "0000000000000000000000000000000000000000"
+cleanup
+
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 if [[ $FAIL -gt 0 ]]; then

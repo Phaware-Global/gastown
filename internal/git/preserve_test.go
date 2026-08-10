@@ -200,7 +200,7 @@ func TestAutoPreserveUncommittedWork_PushesAndVerifies(t *testing.T) {
 	if !result.Committed || !result.Pushed {
 		t.Fatalf("expected Committed and Pushed both true, got %+v", result)
 	}
-	wantRef := "preserve/" + strings.ReplaceAll(branch, "/", "-")
+	wantRef := "polecat/preserve-" + strings.ReplaceAll(branch, "/", "-")
 	if result.Ref != wantRef {
 		t.Fatalf("Ref = %q, want %q", result.Ref, wantRef)
 	}

@@ -138,7 +138,7 @@ func (d *Daemon) checkpointRigPolecats(rigName string) (int, int) {
 // .vite, language caches, CLAUDE.local.md, .DS_Store, .db/.pyc/.pyo), so a
 // checkpoint could commit files gt done would have excluded.
 //
-// Unlike gt done, this pushes to a dedicated preserve/<branch> ref rather
+// Unlike gt done, this pushes to a dedicated polecat/preserve-<branch> ref rather
 // than the branch itself: a checkpoint can fire while a PR is already open
 // on the branch, and force-pushing WIP commits onto it would disrupt review
 // and CI. Verified against the remote tip, since nothing else pushes on
