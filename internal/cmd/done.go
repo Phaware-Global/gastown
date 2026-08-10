@@ -440,56 +440,39 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			return fmt.Errorf("gt done aborted: refusing to auto-save uncommitted work on protected branch %q (G41 guard)", branch)
 		}
 
-		// Re-check to get file details (cleanup detection already confirmed uncommitted changes)
-		workStatus, err := g.CheckUncommittedWork()
-		if err == nil && workStatus.HasUncommittedChanges && !workStatus.CleanExcludingRuntime() {
-			if len(workStatus.UnmergedFiles) > 0 {
-				return fmt.Errorf("cannot auto-save unmerged conflicts: %s\nResolve conflicts first, or use --status DEFERRED to exit without completing", strings.Join(workStatus.UnmergedFiles, ", "))
+		// Only exclude CLAUDE.md if it carries the polecat overlay marker —
+		// AutoPreserveUncommittedWork always excludes CLAUDE.local.md but
+		// doesn't know about this repo-specific overlay marker.
+		var extraExclude []string
+		if claudeData, readErr := os.ReadFile(filepath.Join(cwd, "CLAUDE.md")); readErr == nil {
+			if strings.Contains(string(claudeData), templates.PolecatLifecycleMarker) {
+				extraExclude = append(extraExclude, "CLAUDE.md")
 			}
+		}
 
-			fmt.Printf("\n%s Uncommitted changes detected — auto-saving to prevent work loss\n", style.Bold.Render("⚠"))
+		fmt.Printf("\n%s Uncommitted changes detected — auto-saving to prevent work loss\n", style.Bold.Render("⚠"))
+		if workStatus, wsErr := g.CheckUncommittedWork(); wsErr == nil {
 			fmt.Printf("  Files: %s\n\n", workStatus.String())
+		}
 
-			// Stage all changes (git add -A), then unstage overlay/runtime files (gt-p35)
-			// and any deletions of tracked files (gt-pvx safety: never commit deletions).
-			if addErr := g.Add("-A"); addErr != nil {
-				style.PrintWarning("auto-commit: git add failed: %v — uncommitted work may be at risk", addErr)
-			} else {
-				// Unstage Gas Town overlay files that git add -A picked up.
-				// These are runtime artifacts that must not be committed to repos.
-				_ = g.ResetFiles("CLAUDE.local.md")
-				// Only unstage CLAUDE.md if it contains the overlay marker
-				if claudeData, readErr := os.ReadFile(filepath.Join(cwd, "CLAUDE.md")); readErr == nil {
-					if strings.Contains(string(claudeData), templates.PolecatLifecycleMarker) {
-						_ = g.ResetFiles("CLAUDE.md")
-					}
-				}
-				// Unstage runtime/ephemeral artifacts using the centralized git policy.
-				for _, path := range workStatus.RuntimeArtifactPaths() {
-					_ = g.ResetFiles(path)
-				}
-				// Unstage deletions of tracked files. A safety-net auto-commit should
-				// preserve work (additions + modifications), never destroy it (deletions).
-				// This prevents the bug where a polecat's working tree has a missing
-				// tracked file (e.g. .beads/metadata.json) and the auto-save commits
-				// the deletion, breaking infrastructure for subsequent sessions.
-				if stagedDeletions, delErr := g.StagedDeletions(); delErr == nil && len(stagedDeletions) > 0 {
-					_ = g.ResetFiles(stagedDeletions...)
-				}
-				// Build a descriptive commit message
-				autoMsg := "fix: auto-save uncommitted implementation work (gt-pvx safety net)"
-				if issueFromBranch := parseBranchName(branch).Issue; issueFromBranch != "" {
-					autoMsg = fmt.Sprintf("fix: auto-save uncommitted implementation work (%s, gt-pvx safety net)", issueFromBranch)
-				}
-				if commitErr := g.Commit(autoMsg); commitErr != nil {
-					style.PrintWarning("auto-commit: git commit failed: %v — uncommitted work may be at risk", commitErr)
-				} else {
-					fmt.Printf("%s Auto-committed uncommitted work (safety net)\n", style.Bold.Render("✓"))
-					fmt.Printf("  The agent should have committed before running gt done.\n")
-					fmt.Printf("  This auto-save prevents work loss.\n\n")
-					doneCleanupStatus = "unpushed" // Update status — changes are now committed but not pushed
-				}
-			}
+		// gt done pushes the branch itself later in this same flow, so the
+		// shared preserve helper only needs to commit here — no separate
+		// preservation-ref push (unlike the nuke/checkpoint call sites, which
+		// have no later push step of their own).
+		preserveResult, preserveErr := git.AutoPreserveUncommittedWork(g, branch, git.PreserveOptions{
+			IssueID:           parseBranchName(branch).Issue,
+			ExtraExcludePaths: extraExclude,
+		})
+		if preserveErr != nil {
+			return fmt.Errorf("gt-pvx safety net: %w\nResolve conflicts first, or use --status DEFERRED to exit without completing", preserveErr)
+		}
+		if preserveResult.Committed {
+			fmt.Printf("%s Auto-committed uncommitted work (safety net)\n", style.Bold.Render("✓"))
+			fmt.Printf("  The agent should have committed before running gt done.\n")
+			fmt.Printf("  This auto-save prevents work loss.\n\n")
+			doneCleanupStatus = "unpushed" // Update status — changes are now committed but not pushed
+		} else {
+			style.PrintWarning("auto-commit: nothing left to commit after excluding runtime artifacts — uncommitted work may be at risk")
 		}
 	}
 

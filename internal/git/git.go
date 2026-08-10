@@ -1012,6 +1012,19 @@ func (g *Git) Commit(message string) error {
 	return err
 }
 
+// CommitNoVerify creates a commit with the given message, bypassing commit
+// hooks. Polecat worktrees can carry a broken husky pre-commit hook
+// (.husky/_/husky.sh missing) that fails a plain `git commit` while a
+// following `git push` still reports success against the unchanged HEAD —
+// silently preserving nothing while claiming success (gt-y8ts). Automated
+// preservation paths (auto-save, checkpointing) must use this instead of
+// Commit so a broken hook can never turn a "successful" safety net into a
+// no-op.
+func (g *Git) CommitNoVerify(message string) error {
+	_, err := g.run("commit", "--no-verify", "-m", message)
+	return err
+}
+
 // CommitAll stages all changes and commits.
 func (g *Git) CommitAll(message string) error {
 	_, err := g.run("commit", "-am", message)
