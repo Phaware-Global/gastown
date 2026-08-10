@@ -2,6 +2,7 @@ package git
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -61,6 +62,17 @@ type PreserveResult struct {
 	Commit string
 	// Ref is the preservation ref HEAD was pushed to, set when Pushed.
 	Ref string
+
+	// HooksFailed is true when the auto-save commit could only be made by
+	// bypassing commit hooks (e.g. a secret scanner) because they failed.
+	// The work is still Committed — never lost — but callers MUST NOT push
+	// it: an unverified commit reaching origin is exactly the risk the
+	// hooks exist to catch (gt-i4ej FIX 2). Never pushed, regardless of
+	// opts.Push. Callers should escalate loudly, surfacing HookOutput.
+	HooksFailed bool
+	// HookOutput carries the failing hook's error output when HooksFailed,
+	// for callers to include in their escalation.
+	HookOutput string
 }
 
 // PreservationRefName returns the dedicated ref a branch's work-in-progress
@@ -69,8 +81,26 @@ type PreserveResult struct {
 // Namespaced under "polecat/" (not a bare "preserve/*") so the push passes
 // Gas Town's pre-push hook allowlist — see the Push field doc above.
 func PreservationRefName(branch string) string {
-	sanitized := strings.NewReplacer("/", "-").Replace(branch)
+	sanitized := strings.NewReplacer("/", "-", " ", "-").Replace(branch)
 	return "polecat/preserve-" + sanitized
+}
+
+// detachedPreservationIdentity returns a value unique to the calling
+// polecat's worktree, used to disambiguate a detached-HEAD preservation ref
+// (gt-i4ej FIX 3). Prefers issueID (the polecat/bead identity callers
+// already pass via PreserveOptions.IssueID); falls back to the worktree's
+// directory name, which is unique per polecat by construction. Errors
+// rather than guessing when neither is available — silently collapsing two
+// polecats onto the same ref is worse than refusing to preserve.
+func detachedPreservationIdentity(g *Git, issueID string) (string, error) {
+	identity := issueID
+	if identity == "" {
+		identity = filepath.Base(g.WorkDir())
+	}
+	if identity == "" || identity == "." || identity == string(filepath.Separator) {
+		return "", fmt.Errorf("no polecat/bead identity available to disambiguate a detached-HEAD preservation ref")
+	}
+	return identity, nil
 }
 
 // AutoPreserveUncommittedWork commits any uncommitted (staged or unstaged)
@@ -104,12 +134,24 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 			return result, fmt.Errorf("cannot auto-preserve unmerged conflicts: %s", strings.Join(status.UnmergedFiles, ", "))
 		}
 
-		if err := g.Add("-A"); err != nil {
+		// ALLOWLIST, not denylist: stage only modifications/deletions to
+		// files git already tracks (`git add -u`). `git add -A` stages
+		// every untracked file too, and a denylist of known Gas Town
+		// runtime paths can never enumerate what it has never seen — a
+		// .env, a dumped token, a debug log with a session key. This runs
+		// unattended and can force-push the result to origin, which makes
+		// it an automated secret-publication path (gt-i4ej FIX 1). The
+		// accepted tradeoff: a genuinely new untracked source file is not
+		// captured by this safety net. A safety net that occasionally
+		// misses a new file is fine; one that occasionally publishes a
+		// credential is not.
+		if err := g.Add("-u"); err != nil {
 			return nil, fmt.Errorf("staging changes: %w", err)
 		}
-		// Unstage Gas Town overlay/runtime files that `git add -A` picked up —
-		// these are runtime artifacts and must never land in a preservation
-		// commit. Mirrors gt done's gt-pvx exclusion policy.
+		// Unstage Gas Town overlay/runtime files that were already tracked
+		// (e.g. a checked-in CLAUDE.local.md) — these are runtime artifacts
+		// and must never land in a preservation commit. Mirrors gt done's
+		// gt-pvx exclusion policy.
 		_ = g.ResetFiles("CLAUDE.local.md")
 		for _, path := range status.RuntimeArtifactPaths() {
 			_ = g.ResetFiles(path)
@@ -123,20 +165,54 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 			_ = g.ResetFiles(deletions...)
 		}
 
-		msg := opts.CommitMessage
-		if msg == "" {
-			msg = "fix: auto-save uncommitted implementation work (gt-pvx safety net)"
-			if opts.IssueID != "" {
-				msg = fmt.Sprintf("fix: auto-save uncommitted implementation work (%s, gt-pvx safety net)", opts.IssueID)
+		// `git add -u` legitimately stages nothing when the only
+		// uncommitted work is a new untracked file (the accepted
+		// tradeoff above) or when everything staged was then unstaged as
+		// a runtime artifact. `git commit` errors on an empty index, so
+		// check first rather than treating that as a failure.
+		hasStaged, hsErr := g.HasStagedChanges()
+		if hsErr != nil {
+			return nil, fmt.Errorf("checking staged changes: %w", hsErr)
+		}
+		if hasStaged {
+			msg := opts.CommitMessage
+			if msg == "" {
+				msg = "fix: auto-save uncommitted implementation work (gt-pvx safety net)"
+				if opts.IssueID != "" {
+					msg = fmt.Sprintf("fix: auto-save uncommitted implementation work (%s, gt-pvx safety net)", opts.IssueID)
+				}
+			}
+
+			// Hooks gate the PUSH, not the commit (gt-i4ej FIX 2). Try a
+			// verified commit first — pre-commit hooks are frequently the
+			// secret scanner that FIX 1 leans on as a second line of
+			// defense. If hooks fail, the work must still not be lost, so
+			// fall back to an unverified local commit — but mark it so the
+			// push step below refuses to publish it, and the caller can
+			// escalate loudly instead.
+			if err := g.Commit(msg); err != nil {
+				if nvErr := g.CommitNoVerify(msg); nvErr != nil {
+					return nil, fmt.Errorf("auto-committing: %w", nvErr)
+				}
+				result.Committed = true
+				result.HooksFailed = true
+				result.HookOutput = err.Error()
+			} else {
+				result.Committed = true
 			}
 		}
-		if err := g.CommitNoVerify(msg); err != nil {
-			return nil, fmt.Errorf("auto-committing: %w", err)
-		}
-		result.Committed = true
 	}
 
 	if !opts.Push {
+		return result, nil
+	}
+
+	if result.HooksFailed {
+		// The commit was made without hook verification, so it must not
+		// reach origin unattended: nothing unverified may be published.
+		// The work is safe (committed locally); the caller is responsible
+		// for escalating HookOutput loudly so a human resolves the hook
+		// failure (gt-i4ej FIX 2).
 		return result, nil
 	}
 
@@ -150,6 +226,21 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 		return result, fmt.Errorf("resolving HEAD: %w", revErr)
 	}
 
+	// A detached HEAD reports as literal "HEAD" from `git rev-parse
+	// --abbrev-ref HEAD`, not "". It is the normal idle state for a
+	// polecat worktree, not an exotic one, so collapsing every detached
+	// worktree onto the same "polecat/preserve-HEAD" ref is a real
+	// collision risk, not a theoretical one. Derive a ref unique to this
+	// polecat instead (gt-i4ej FIX 3).
+	refBranch := branch
+	if branch == "HEAD" {
+		identity, idErr := detachedPreservationIdentity(g, opts.IssueID)
+		if idErr != nil {
+			return result, fmt.Errorf("cannot derive a unique preservation ref for detached HEAD: %w", idErr)
+		}
+		refBranch = "detached-" + identity + "-" + shortSHA(head)
+	}
+
 	// Skip the push only when we're certain there's nothing new to preserve.
 	// Two independent proofs, either is sufficient: the preservation ref
 	// already points at this exact HEAD (this exact state was already
@@ -161,7 +252,7 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 	// the "committed but never pushed, worktree about to vanish" case this
 	// function exists to catch.
 	if !result.Committed {
-		if tip, err := g.PushRemoteBranchTip(remote, PreservationRefName(branch)); err == nil && tip == head {
+		if tip, err := g.PushRemoteBranchTip(remote, PreservationRefName(refBranch)); err == nil && tip == head {
 			return result, nil
 		}
 		if status.UnpushedCommits == 0 {
@@ -169,7 +260,7 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 		}
 	}
 
-	refName := PreservationRefName(branch)
+	refName := PreservationRefName(refBranch)
 	if err := g.Push(remote, "HEAD:refs/heads/"+refName, true); err != nil {
 		return result, fmt.Errorf("pushing preservation ref %s: %w", refName, err)
 	}

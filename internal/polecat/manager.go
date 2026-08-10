@@ -1157,10 +1157,12 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	// which bypass the uncommitted-work gate a few lines down — because that
 	// gate is exactly what force/nuclear exist to skip, and skipping it must
 	// not mean skipping preservation too (gt-y8ts: force-nuking a polecat
-	// used to destroy real uncommitted work with zero recovery path). Commits
-	// with --no-verify (broken husky hooks in polecat worktrees can fail a
-	// plain commit while a later push still reports success) and pushes to a
-	// dedicated polecat/preserve-<branch> ref, verified against the remote tip, since
+	// used to destroy real uncommitted work with zero recovery path). Tries a
+	// verified commit first, falling back to --no-verify only if hooks fail
+	// (broken husky hooks in polecat worktrees can fail a plain commit while
+	// a later push still reports success) — in which case the commit is kept
+	// locally but never pushed (gt-i4ej FIX 2). Pushes to a dedicated
+	// polecat/preserve-<branch> ref, verified against the remote tip, since
 	// the worktree itself is about to be removed. Best-effort: a preservation
 	// failure is logged and does not block an operator-requested removal.
 	preserveGit := git.NewGit(clonePath)
@@ -1173,6 +1175,8 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 		} else if result.Pushed {
 			fmt.Printf("%s Preserved uncommitted work for %s: pushed %s to %s\n",
 				style.Bold.Render("✓"), name, result.Commit, result.Ref)
+		} else if result.HooksFailed {
+			style.PrintWarning("preserved uncommitted work for %s LOCALLY ONLY — its pre-commit hook FAILED, so it was not pushed (worktree is about to be removed): %s", name, result.HookOutput)
 		}
 	}
 

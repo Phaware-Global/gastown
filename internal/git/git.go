@@ -2514,7 +2514,7 @@ type RemoteRef struct {
 // The prefix filters refs (e.g., "refs/heads/polecat/" for all polecat branches).
 // Returns full ref names like "refs/heads/polecat/furiosa-abc123".
 func (g *Git) ListRemoteRefsWithHashes(remote, prefix string) ([]RemoteRef, error) {
-	out, err := g.run("ls-remote", "--refs", remote, prefix+"*")
+	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--refs", remote, prefix+"*")
 	if err != nil {
 		return nil, err
 	}
@@ -2553,7 +2553,7 @@ func (g *Git) ListRemoteRefs(remote, prefix string) ([]string, error) {
 // includes tags so callers can distinguish a truly empty repo from a non-empty
 // repo with no branch refs or a broken remote HEAD.
 func (g *Git) RemoteHasRefs(remote string) (bool, error) {
-	out, err := g.run("ls-remote", "--refs", remote)
+	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--refs", remote)
 	if err != nil {
 		return false, err
 	}
@@ -2766,7 +2766,7 @@ func (g *Git) IsEmpty() (bool, error) {
 // NOTE: For named remotes with a separate pushurl, this checks the fetch URL.
 // Use PushRemoteBranchExists to verify branches that were pushed.
 func (g *Git) RemoteBranchExists(remote, branch string) (bool, error) {
-	out, err := g.run("ls-remote", "--heads", remote, branch)
+	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--heads", remote, branch)
 	if err != nil {
 		return false, err
 	}
@@ -2776,7 +2776,7 @@ func (g *Git) RemoteBranchExists(remote, branch string) (bool, error) {
 // RemoteBranchTip returns the SHA at refs/heads/<branch> on the remote.
 // An empty SHA with nil error means the branch is missing.
 func (g *Git) RemoteBranchTip(remote, branch string) (string, error) {
-	out, err := g.run("ls-remote", "--heads", remote, branch)
+	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--heads", remote, branch)
 	if err != nil {
 		return "", err
 	}
@@ -2794,7 +2794,7 @@ func (g *Git) PushRemoteBranchExists(remote, branch string) (bool, error) {
 	if fetchErr != nil || pushErr != nil || pushURL == fetchURL {
 		return g.RemoteBranchExists(remote, branch)
 	}
-	out, err := g.run("ls-remote", "--heads", pushURL, branch)
+	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--heads", pushURL, branch)
 	if err != nil {
 		return false, err
 	}

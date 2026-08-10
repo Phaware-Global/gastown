@@ -466,6 +466,14 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		if preserveErr != nil {
 			return fmt.Errorf("gt-pvx safety net auto-save failed: %w\nResolve the issue first, or use --status DEFERRED to exit without completing", preserveErr)
 		}
+		if preserveResult.HooksFailed {
+			// gt done pushes the branch itself later in this same flow
+			// (see the comment above), so an unverified commit here would
+			// otherwise reach origin regardless of AutoPreserveUncommittedWork's
+			// own push gating. Refuse to proceed instead (gt-i4ej FIX 2) —
+			// the work is safe in a local commit, just not pushed.
+			return fmt.Errorf("gt-pvx safety net committed your work locally, but its pre-commit hook FAILED — refusing to push an unverified commit to origin.\nHook output:\n%s\n\nResolve the hook failure and re-run gt done. Your work is safe in a local commit; it has not been pushed", preserveResult.HookOutput)
+		}
 		if preserveResult.Committed {
 			fmt.Printf("%s Auto-committed uncommitted work (safety net)\n", style.Bold.Render("✓"))
 			fmt.Printf("  The agent should have committed before running gt done.\n")

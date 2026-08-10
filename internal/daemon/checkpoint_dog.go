@@ -171,6 +171,12 @@ func (d *Daemon) checkpointWorktree(workDir, rigName, polecatName string) bool {
 	if result.Committed {
 		d.logger.Printf("checkpoint_dog: created WIP checkpoint in %s/%s", rigName, polecatName)
 	}
+	if result.HooksFailed {
+		// The commit exists locally but was never verified — pushing it
+		// would defeat the hooks (gt-i4ej FIX 2). Escalate loudly so a
+		// human resolves the hook failure; the work itself is not at risk.
+		d.logger.Printf("checkpoint_dog: ERROR — %s/%s checkpoint committed locally but its pre-commit hook FAILED, so it was NOT pushed: %s", rigName, polecatName, result.HookOutput)
+	}
 	if result.Pushed {
 		d.logger.Printf("checkpoint_dog: pushed %s/%s checkpoint to %s (%s)", rigName, polecatName, result.Ref, result.Commit)
 	}
