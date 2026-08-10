@@ -252,9 +252,13 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 }
 
 func ensureRoleWorktreeIntegrity(cwd, townRoot string, role Role) error {
+	require := roleRequiresWorktreeIntegrity(role)
+	if (role == RoleDog || role == RoleBoot) && isDogKennelContainer(cwd, townRoot) {
+		require = false
+	}
 	if err := worktreeintegrity.Validate(cwd, worktreeintegrity.IntegrityOptions{
 		TownRoot: townRoot,
-		Require:  roleRequiresWorktreeIntegrity(role),
+		Require:  require,
 	}); err != nil {
 		return fmt.Errorf("%w\nRemediation: stop using this worktree and run `gt doctor --fix`", err)
 	}
@@ -268,6 +272,39 @@ func roleRequiresWorktreeIntegrity(role Role) bool {
 	default:
 		return false
 	}
+}
+
+// isDogKennelContainer reports whether cwd is a dog/boot kennel container
+// (<townRoot>/deacon/dogs/<name>) rather than a per-rig worktree nested
+// inside it. A kennel is a plain directory by design — dog and boot session
+// cwds are always the container itself (internal/dog/session_manager.go:
+// kennelPath, internal/boot/boot.go: bootDir), which never has its own .git.
+// deacon/dogs/<name>/<rig>, by contrast, is a real git worktree created
+// inside the kennel (internal/dog/manager.go: createRigWorktree) and must
+// still fail closed when its .git is missing.
+//
+// Both cwd and townRoot are canonicalized with filepath.EvalSymlinks before
+// counting path segments, and the "deacon"/"dogs" segments are matched
+// case-insensitively (APFS is case-insensitive by default). Without this, a
+// symlink or case-variant alias could make a real, deeper worktree look like
+// the (exempt) kennel container from the raw path alone. Resolution failure
+// fails closed — not exempt, integrity is still required.
+func isDogKennelContainer(cwd, townRoot string) bool {
+	resolvedCwd, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		return false
+	}
+	resolvedTownRoot, err := filepath.EvalSymlinks(townRoot)
+	if err != nil {
+		return false
+	}
+
+	relPath, err := filepath.Rel(resolvedTownRoot, resolvedCwd)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(filepath.ToSlash(relPath), "/")
+	return len(parts) == 3 && strings.EqualFold(parts[0], "deacon") && strings.EqualFold(parts[1], "dogs")
 }
 
 // runPrimeCompactResume runs a lighter prime after compaction or resume.
