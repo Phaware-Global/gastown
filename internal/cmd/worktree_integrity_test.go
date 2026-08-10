@@ -58,6 +58,70 @@ func TestEnsureRoleWorktreeIntegrityRejectsWitnessRigCloneWithoutMetadata(t *tes
 	}
 }
 
+func TestEnsureRoleWorktreeIntegrityRejectsWitnessRigCloneAlias(t *testing.T) {
+	// Regression test for PR #185 review feedback (phaware-val): the home-dir
+	// exemption must not be reachable through a differently-cased or
+	// symlinked alias of the real witness/rig clone. isWitnessHomeWithoutClone
+	// canonicalizes with filepath.EvalSymlinks and compares the "rig" segment
+	// case-insensitively so both aliases below still resolve to "not exempt".
+	t.Run("case-variant spelling (witness/RIG)", func(t *testing.T) {
+		townRoot := t.TempDir()
+		cwd := filepath.Join(townRoot, "gastown", "witness", "RIG")
+		if err := os.MkdirAll(cwd, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		err := ensureRoleWorktreeIntegrity(cwd, townRoot, RoleWitness)
+		if !errors.Is(err, worktreeintegrity.ErrIntegrityViolation) {
+			t.Fatalf("ensureRoleWorktreeIntegrity() error = %v, want ErrIntegrityViolation", err)
+		}
+	})
+
+	t.Run("symlink alias (witness/clone -> rig)", func(t *testing.T) {
+		townRoot := t.TempDir()
+		realClone := filepath.Join(townRoot, "gastown", "witness", "rig")
+		if err := os.MkdirAll(realClone, 0755); err != nil {
+			t.Fatal(err)
+		}
+		aliasClone := filepath.Join(townRoot, "gastown", "witness", "clone")
+		if err := os.Symlink(realClone, aliasClone); err != nil {
+			t.Fatal(err)
+		}
+
+		err := ensureRoleWorktreeIntegrity(aliasClone, townRoot, RoleWitness)
+		if !errors.Is(err, worktreeintegrity.ErrIntegrityViolation) {
+			t.Fatalf("ensureRoleWorktreeIntegrity() error = %v, want ErrIntegrityViolation", err)
+		}
+	})
+}
+
+func TestEnsureRoleWorktreeIntegrityRejectsWitnessRigCloneInheritingTownRootGit(t *testing.T) {
+	// Regression test for PR #185 review feedback (phaware-val): townRoot
+	// itself has real, well-formed .git metadata (the documented `gt install
+	// --git` deployment). findGitMarker must not walk past the witness/rig
+	// worktree boundary and hand back TownRoot's own marker — that would let
+	// a witness/rig clone with its .git deleted (interrupted clone, partial
+	// rsync) pass validation by inheriting the town's unrelated repo.
+	townRoot := t.TempDir()
+	townGitDir := filepath.Join(townRoot, ".git")
+	if err := os.MkdirAll(townGitDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townGitDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cwd := filepath.Join(townRoot, "gastown", "witness", "rig")
+	if err := os.MkdirAll(cwd, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	err := ensureRoleWorktreeIntegrity(cwd, townRoot, RoleWitness)
+	if !errors.Is(err, worktreeintegrity.ErrIntegrityViolation) {
+		t.Fatalf("ensureRoleWorktreeIntegrity() error = %v, want ErrIntegrityViolation", err)
+	}
+}
+
 func TestEnsureRoleWorktreeIntegrityAllowsNeutralDirectoryWithoutMetadata(t *testing.T) {
 	townRoot := t.TempDir()
 

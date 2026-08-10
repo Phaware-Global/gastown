@@ -280,17 +280,34 @@ func roleRequiresWorktreeIntegrity(role Role) bool {
 // witness/rig/ (see internal/witness/manager.go:witnessDir, which prefers it
 // over witness/ whenever it exists) is a real linked worktree when present
 // and must still pass integrity validation like any other agent worktree.
+//
+// Both cwd and townRoot are canonicalized with filepath.EvalSymlinks before
+// comparison, and the "rig" segment is matched case-insensitively: on a
+// case-insensitive filesystem (default macOS APFS) or via a symlink alias,
+// the real witness/rig clone can be reached under a spelling that a raw
+// string comparison would miss, incorrectly granting the home-dir exemption
+// to the clone this check exists to guard. Resolution failure fails closed
+// (not exempt) rather than risk exempting a path we couldn't verify.
 func isWitnessHomeWithoutClone(cwd, townRoot string) bool {
-	relPath, err := filepath.Rel(townRoot, cwd)
+	resolvedCwd, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		return false
+	}
+	resolvedTownRoot, err := filepath.EvalSymlinks(townRoot)
+	if err != nil {
+		return false
+	}
+
+	relPath, err := filepath.Rel(resolvedTownRoot, resolvedCwd)
 	if err != nil {
 		return false
 	}
 	parts := strings.Split(filepath.ToSlash(relPath), "/")
-	if len(parts) < 2 || parts[1] != "witness" {
+	if len(parts) < 2 || !strings.EqualFold(parts[1], "witness") {
 		return false
 	}
 	// <rig>/witness/rig/... is the real clone — not exempt.
-	return len(parts) < 3 || parts[2] != "rig"
+	return len(parts) < 3 || !strings.EqualFold(parts[2], "rig")
 }
 
 // runPrimeCompactResume runs a lighter prime after compaction or resume.

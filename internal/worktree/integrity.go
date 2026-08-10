@@ -111,6 +111,15 @@ func findGitMarker(path, townRoot string) (string, bool, error) {
 	}
 
 	for {
+		// Stop before inspecting TownRoot's own .git. TownRoot is the town-level
+		// repository boundary (e.g. `gt install --git`'s ~/gt/.git), not metadata
+		// belonging to the worktree rooted somewhere under it. Without this check,
+		// a worktree whose own .git was deleted would silently inherit TownRoot's
+		// marker and pass validation instead of failing closed.
+		if stop != "" && path == stop {
+			break
+		}
+
 		marker := filepath.Join(path, ".git")
 		if _, err := os.Lstat(marker); err == nil {
 			return marker, true, nil
@@ -118,9 +127,6 @@ func findGitMarker(path, townRoot string) (string, bool, error) {
 			return "", false, fmt.Errorf("%w: cannot inspect %s: %v", ErrIntegrityViolation, marker, err)
 		}
 
-		if stop != "" && path == stop {
-			break
-		}
 		parent := filepath.Dir(path)
 		if parent == path {
 			break
