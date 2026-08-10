@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -207,6 +208,86 @@ func TestValidateMoleculePrereqs(t *testing.T) {
 						t.Errorf("error message missing %q, got: %s", want, errMsg)
 					}
 				}
+			}
+		})
+	}
+}
+
+// TestMQSubmitMRCreationFailureModesHardFail mirrors done_test.go's
+// TestMRCreationFailureModesHardFail for the `gt mq submit` path. Before this
+// fix, mq_submit.go nudged the refinery as soon as bd.Create() returned a
+// nil error, with no readback verification — the exact gap done.go's GH#1945
+// guard closes on its own path. This simulation maps each failure condition
+// to the SAME production error constructors mq_submit.go now calls (shared
+// with done.go), so the asserted values come from production code.
+func TestMQSubmitMRCreationFailureModesHardFail(t *testing.T) {
+	const branch = "polecat/furiosa/gt-abc"
+	const mrID = "gts-mr-test"
+
+	// mrCreationOutcome mirrors the control flow of the MR-creation block in
+	// mq_submit.go: create, then guard against an empty ID, then read back
+	// to confirm the write persisted.
+	mrCreationOutcome := func(createErr error, gotID string, showErr error, showReturns bool) error {
+		if createErr != nil {
+			return createErr
+		}
+		if gotID == "" {
+			return errMREmptyID(branch)
+		}
+		if showErr != nil || !showReturns {
+			return errMRReadbackFailed(branch, gotID, showErr)
+		}
+		return nil
+	}
+
+	tests := []struct {
+		name        string
+		gotID       string
+		showErr     error
+		showReturns bool
+		wantHardErr bool
+	}{
+		{
+			name:        "valid ID + show succeeds → no error",
+			gotID:       mrID,
+			showErr:     nil,
+			showReturns: true,
+			wantHardErr: false,
+		},
+		{
+			name:        "empty MR ID (observed in ephemeral/wisp mode) → hard error",
+			gotID:       "",
+			showErr:     nil,
+			showReturns: false,
+			wantHardErr: true,
+		},
+		{
+			name:        "show fails → hard error (GH#1945, was: nudge on unconfirmed write)",
+			gotID:       mrID,
+			showErr:     fmt.Errorf("dolt read failed"),
+			showReturns: false,
+			wantHardErr: true,
+		},
+		{
+			name:        "show returns nil → hard error (GH#1945, was: nudge on unconfirmed write)",
+			gotID:       mrID,
+			showErr:     nil,
+			showReturns: false,
+			wantHardErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := mrCreationOutcome(nil, tt.gotID, tt.showErr, tt.showReturns)
+			if (err != nil) != tt.wantHardErr {
+				t.Fatalf("hardErr = %v, want hard error: %v", err, tt.wantHardErr)
+			}
+			if err == nil {
+				return
+			}
+			if !strings.Contains(err.Error(), branch) {
+				t.Errorf("error should reference branch %q for recovery guidance, got: %v", branch, err)
 			}
 		})
 	}

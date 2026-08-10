@@ -287,6 +287,20 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("creating merge request bead: %w", err)
 		}
 
+		// Guard against empty ID from bd create (observed in ephemeral/wisp mode).
+		// Mirrors the done.go gt-5u4 guard — an empty ID means no usable merge slot.
+		if mrIssue.ID == "" {
+			return errMREmptyID(branch)
+		}
+
+		// GH#1945: Verify MR bead is readable before considering it confirmed.
+		// bd.Create() succeeds when the bead is written locally, but if the write
+		// didn't persist (Dolt failure, corrupt state), the refinery would never
+		// see this MR — silently losing the submission. Mirrors done.go:1575.
+		if verifiedMR, verifyErr := bd.Show(mrIssue.ID); verifyErr != nil || verifiedMR == nil {
+			return errMRReadbackFailed(branch, mrIssue.ID, verifyErr)
+		}
+
 		// gt-gpy: Validate MR bead landed in the rig's database (warning only).
 		if prefixErr := beads.ValidateRigPrefix(townRoot, rigName, mrIssue.ID); prefixErr != nil {
 			style.PrintWarning("MR bead prefix mismatch: %v\nThe refinery may not find this MR — check 'gt mq list %s'", prefixErr, rigName)
