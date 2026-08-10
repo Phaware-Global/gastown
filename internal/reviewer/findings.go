@@ -84,43 +84,27 @@ var validDispositions = map[string]string{
 // "APPROVE", "REQUEST_CHANGES", or "COMMENT". An explicit Disposition wins;
 // otherwise it is derived from the highest severity present:
 //
-//	high   → REQUEST_CHANGES (blocking; must be addressed)
-//	medium → COMMENT         (advisory; worth fixing, not a block)
-//	low / none → APPROVE      (nits-only or clean — the Reviewer endorses it)
+//	high        → REQUEST_CHANGES (blocking; must be addressed)
+//	medium/low/none → COMMENT     (advisory, nits-only, or clean)
 //
-// The in-town Reviewer is a real reviewer: a clean or nits-only pass APPROVEs so
-// its GitHub verdict reads as an approval rather than a non-committal comment.
-// The Reviewer is deliberately NOT the rig's pr_approver, so this APPROVE is
-// informational — human approval stays the merge gate (see the Reviewer
-// runbook); it must not be wired into branch protection as a required approval.
-//
-// An explicit Disposition is validated by ParseFindings at the contract
-// boundary, so the lookup-miss fallthrough below only fires for the empty
-// (severity-derived) case on payloads from the sanctioned path.
+// The Reviewer never approves and never merges — human approval is the merge
+// gate (see the Reviewer runbook). APPROVE must never be an emergent
+// consequence of a findings count: it is reachable only via an explicit,
+// opt-in Disposition of "approve" in the findings payload (validated by
+// ParseFindings at the contract boundary), never from the severity-derived
+// default below. This also protects against a pass that could not produce a
+// meaningful verdict (e.g. it reviewed the wrong SHA): "found nothing" must
+// never be indistinguishable from "reviewed everything and it's clean".
 func (fs *Findings) ReviewEvent() string {
 	if ev, ok := validDispositions[strings.ToLower(strings.TrimSpace(fs.Disposition))]; ok {
 		return ev
 	}
-	hasMedium := false
 	for _, f := range fs.Findings {
-		// Normalize defensively for Findings built outside ParseFindings (which
-		// rejects bad priorities). Only an explicit "low" permits APPROVE; an
-		// empty priority is "medium" (advisory) per normalizeFinding, and any
-		// unrecognized value is treated as medium too, so a malformed/typo
-		// priority can never yield an accidental APPROVE.
-		switch strings.ToLower(strings.TrimSpace(f.Priority)) {
-		case "high":
+		if strings.ToLower(strings.TrimSpace(f.Priority)) == "high" {
 			return "REQUEST_CHANGES"
-		case "low":
-			// nits-only — non-blocking, permits APPROVE
-		default: // "medium", empty, or any unrecognized priority
-			hasMedium = true
 		}
 	}
-	if hasMedium {
-		return "COMMENT"
-	}
-	return "APPROVE"
+	return "COMMENT"
 }
 
 // ParseFindings unmarshals and validates the findings payload. Priorities are

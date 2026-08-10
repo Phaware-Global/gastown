@@ -178,8 +178,8 @@ func TestReviewEvent_SeverityDerived(t *testing.T) {
 		priorities []string
 		want       string
 	}{
-		{"clean", nil, "APPROVE"},
-		{"low only", []string{"low", "low"}, "APPROVE"},
+		{"clean", nil, "COMMENT"},
+		{"low only", []string{"low", "low"}, "COMMENT"},
 		{"medium caps at comment", []string{"low", "medium"}, "COMMENT"},
 		{"empty priority treated as medium", []string{""}, "COMMENT"},
 		{"unknown priority treated as medium", []string{"low", "bogus"}, "COMMENT"},
@@ -212,6 +212,12 @@ func TestReviewEvent_ExplicitDispositionOverrides(t *testing.T) {
 	}
 	if got := fs.ReviewEvent(); got != "COMMENT" {
 		t.Errorf("high+comment: ReviewEvent() = %q, want COMMENT", got)
+	}
+	// APPROVE is reachable only via this explicit opt-in — never as a
+	// severity-derived default (see TestReviewEvent_SeverityDerived).
+	fs = &Findings{Summary: "s", Disposition: "approve"}
+	if got := fs.ReviewEvent(); got != "APPROVE" {
+		t.Errorf("explicit approve: ReviewEvent() = %q, want APPROVE", got)
 	}
 }
 
