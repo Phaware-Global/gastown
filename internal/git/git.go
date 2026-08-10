@@ -129,6 +129,15 @@ func (g *Git) run(args ...string) (string, error) {
 // (e.g. GitLab) is unreachable or slow.
 const pushTimeout = 60 * time.Second
 
+// remoteQueryTimeout bounds read-only network git calls (ls-remote) so an
+// unreachable or slow remote can never hang a caller indefinitely. Unlike
+// pushTimeout's mutating push, these are cheap reads used to check/verify
+// remote branch state, so a shorter deadline is safe. Unbounded ls-remote
+// calls on this path used to be able to hang the checkpoint_dog daemon
+// patrol forever, silently disabling preservation for every polecat
+// (gt-y8ts FIX 4).
+const remoteQueryTimeout = 30 * time.Second
+
 // runWithTimeout executes a git command with a deadline. If the command does
 // not finish within the timeout, the process is killed and an error is returned.
 func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _ error) { //nolint:unparam // string return kept for consistency with Run()
@@ -1051,6 +1060,18 @@ func (g *Git) StagedDeletions() ([]string, error) {
 		return nil, nil
 	}
 	return strings.Split(trimmed, "\n"), nil
+}
+
+// HasStagedChanges reports whether the index differs from HEAD. Used after a
+// staging pass that may legitimately stage nothing (e.g. `git add -u` when
+// the only uncommitted work is a new untracked file) so callers can skip
+// `git commit` instead of hitting its "nothing to commit" error.
+func (g *Git) HasStagedChanges() (bool, error) {
+	out, err := g.run("diff", "--cached", "--name-only")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "", nil
 }
 
 // ShowFile returns the contents of a file at a given ref (e.g., "origin/main:CLAUDE.md").
