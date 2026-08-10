@@ -488,7 +488,24 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		} else if runtimeOnly {
 			fmt.Printf("%s Nothing to auto-commit — all uncommitted paths were runtime artifacts\n\n", style.Bold.Render("✓"))
 		} else {
-			style.PrintWarning("auto-commit: nothing left to commit after excluding runtime artifacts — uncommitted work may be at risk")
+			// `git add -u` (gt-i4ej FIX 1) never stages a brand-new
+			// untracked file — the accepted tradeoff of a safety net that
+			// must never auto-publish a credential. That means this branch
+			// is not "nothing was excluded, something is still wrong"; it
+			// is almost always exactly those new files, unstaged and
+			// uncommitted. Name them so the operator doesn't have to guess
+			// why the safety net that just ran left the tree dirty
+			// (PR #184 review).
+			var atRisk []string
+			if workStatus != nil {
+				atRisk = workStatus.NonRuntimePaths()
+			}
+			if len(atRisk) > 0 {
+				style.PrintWarning("auto-commit: %d new untracked file(s) were not auto-staged — they are never auto-captured by the add -u safety net; commit them yourself or re-run gt done after staging:\n  %s",
+					len(atRisk), strings.Join(atRisk, "\n  "))
+			} else {
+				style.PrintWarning("auto-commit: nothing left to commit after excluding runtime artifacts — uncommitted work may be at risk")
+			}
 		}
 	}
 

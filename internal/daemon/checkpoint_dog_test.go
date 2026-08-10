@@ -6,10 +6,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/checkpoint"
+	"github.com/steveyegge/gastown/internal/git"
 )
 
 func TestCheckpointDogInterval_Default(t *testing.T) {
@@ -251,6 +253,9 @@ func newTestDaemon() *Daemon {
 
 func TestCheckpointWorktree_CommitsAndPushesPreserveRef(t *testing.T) {
 	workDir := initCheckpointTestRepo(t)
+	// initCheckpointTestRepo lays out <tmp>/remote.git next to <tmp>/local
+	// (the returned workDir) — see its definition below.
+	remoteDir := filepath.Join(filepath.Dir(workDir), "remote.git")
 	// Modify a file already tracked by initCheckpointTestRepo's initial
 	// commit: staging is `git add -u` (allowlist, gt-i4ej FIX 1), which only
 	// picks up changes to files git already tracks, never new untracked
@@ -272,6 +277,31 @@ func TestCheckpointWorktree_CommitsAndPushesPreserveRef(t *testing.T) {
 	}
 	if got := string(out); got != checkpoint.WIPCommitPrefix+"\n" {
 		t.Fatalf("commit subject = %q, want %q", got, checkpoint.WIPCommitPrefix)
+	}
+
+	// A test named "...AndPushesPreserveRef" must actually verify the push:
+	// mutation testing showed the previous version here stayed green with
+	// Push:true deleted entirely, because it only ever inspected `git log`
+	// on the local worktree (PR #184 review). Derive the expected ref name
+	// from the function under test rather than hand-writing it, and check
+	// the bare remote directly.
+	headOut, err := exec.Command("git", "-C", workDir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	head := strings.TrimSpace(string(headOut))
+
+	wantRef := git.PreservationRefName("polecat/foo/bead@1")
+	lsOut, err := exec.Command("git", "ls-remote", "--heads", remoteDir, wantRef).Output()
+	if err != nil {
+		t.Fatalf("ls-remote: %v", err)
+	}
+	fields := strings.Fields(string(lsOut))
+	if len(fields) < 2 {
+		t.Fatalf("preservation ref %q was not pushed to the bare remote (ls-remote returned %q)", wantRef, lsOut)
+	}
+	if fields[0] != head {
+		t.Fatalf("ls-remote %s = %s, want sha %s", wantRef, fields[0], head)
 	}
 }
 

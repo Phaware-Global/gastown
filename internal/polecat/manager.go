@@ -1170,13 +1170,22 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	// for the strongest destructive operation, often precisely BECAUSE a
 	// polecat's worktree contents must not survive (compromised, wrote
 	// credentials, staged hostile data). Publishing that worktree to a
-	// shared remote ref first would invert the operator's intent. Nuclear
-	// removal still commits locally (so the content is not silently
-	// destroyed — recoverable via the worktree's branch ref) but never
-	// pushes it off the box.
+	// shared remote ref first would invert the operator's intent. For an
+	// attached branch, nuclear removal still commits locally — the content
+	// is not silently destroyed, recoverable via refs/heads/<branch>, which
+	// lives in the common git dir and survives worktree removal. A detached
+	// worktree has no such ref: CurrentBranch() reports the literal "HEAD"
+	// string, AutoPreserveUncommittedWork commits onto that detached HEAD,
+	// and WorktreeRemove's teardown deletes .git/worktrees/<id> — including
+	// the per-worktree HEAD and reflog that were the only things pointing
+	// at that commit — leaving an unreachable object awaiting gc. So the
+	// detached/nuclear case skips the commit entirely rather than promising
+	// a recoverability it can't deliver (PR #184 review).
 	preserveGit := git.NewGit(clonePath)
 	if branch, brErr := preserveGit.CurrentBranch(); brErr == nil && branch != "" {
-		if result, presErr := git.AutoPreserveUncommittedWork(preserveGit, branch, git.PreserveOptions{
+		if branch == "HEAD" && nuclear {
+			style.PrintWarning("worktree %s is on a detached HEAD — nuclear removal skips local auto-preserve here (no branch ref would survive worktree teardown to hold the commit); any uncommitted work is discarded", name)
+		} else if result, presErr := git.AutoPreserveUncommittedWork(preserveGit, branch, git.PreserveOptions{
 			IssueID: name,
 			Push:    !nuclear,
 		}); presErr != nil {

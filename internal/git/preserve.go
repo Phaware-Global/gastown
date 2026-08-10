@@ -6,6 +6,17 @@ import (
 	"strings"
 )
 
+// unverifiedCommitTrailer marks an auto-save commit that could only be made
+// by bypassing commit hooks (CommitNoVerify) — most often a secret scanner
+// rejecting it. Recorded IN the commit message rather than relying on
+// PreserveResult.HooksFailed alone: that field is fresh on every call
+// (result is a new &PreserveResult{} each time), so a later call — with a
+// clean worktree, nothing to commit, HooksFailed defaulting back to false —
+// has no memory that HEAD's ancestry still contains an unverified commit,
+// and would push it (gt-i4ej FIX 2 round-2 finding). The push gate below
+// re-derives the fact from the commit range itself instead.
+const unverifiedCommitTrailer = "Gastown-Unverified: pre-commit hook failed"
+
 // PreserveOptions configures AutoPreserveUncommittedWork.
 type PreserveOptions struct {
 	// IssueID, if set, is embedded in the auto-save commit message so the
@@ -164,27 +175,62 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 			}
 		}
 		// Unstage deletions of tracked files: a safety net must preserve
-		// work (additions + modifications), never destroy it (deletions).
-		if deletions, delErr := g.StagedDeletions(); delErr == nil && len(deletions) > 0 {
+		// work (additions + modifications), never destroy it (deletions). A
+		// failed query is treated exactly like a failed reset below rather
+		// than silently skipped — the old `delErr == nil &&` short-circuit
+		// let a query error (e.g. a concurrent index.lock) through as if
+		// there were simply no deletions, so any staged deletion went
+		// uninspected into the commit and, on Push:true paths, force-pushed
+		// (PR #184 review).
+		if deletions, delErr := g.StagedDeletions(); delErr != nil {
+			resetErrs = append(resetErrs, fmt.Errorf("querying staged deletions: %w", delErr))
+		} else if len(deletions) > 0 {
 			if err := g.ResetFiles(deletions...); err != nil {
 				resetErrs = append(resetErrs, fmt.Errorf("staged deletions: %w", err))
 			}
 			excludePaths = append(excludePaths, deletions...)
 		}
 
+		// Re-verify the FULL staged set, not just the paths this call chose
+		// to exclude: `git add -u` only re-stages modifications to files
+		// already tracked at HEAD — it never touches a pre-existing "A"
+		// (added) index entry for a path that was untracked before this
+		// call, e.g. one the caller separately ran `git add <newfile>` on.
+		// Left alone, that survives add -u's allowlist untouched and enters
+		// an unattended, potentially force-pushed commit — exactly what the
+		// allowlist exists to prevent (gt-i4ej FIX 1 round-2 finding).
+		// Unconditional (not just when resetErrs is non-empty), since this
+		// failure mode has nothing to do with a reset failing.
+		if staged, sErr := g.StagedFiles(); sErr != nil {
+			resetErrs = append(resetErrs, fmt.Errorf("listing staged files: %w", sErr))
+		} else {
+			for _, f := range staged {
+				if pathExcluded(f, excludePaths) || g.FileTrackedAtHEAD(f) {
+					continue
+				}
+				if err := g.ResetFiles(f); err != nil {
+					resetErrs = append(resetErrs, fmt.Errorf("unstaging untracked %s: %w", f, err))
+					continue
+				}
+				excludePaths = append(excludePaths, f)
+			}
+		}
+
 		if len(resetErrs) > 0 {
-			// A reset failure means the exclusion may not have taken effect.
-			// Don't trust it silently — re-verify against the actual index
-			// and refuse to commit (let alone push) if anything that must be
-			// excluded is still staged (PR #184 review).
+			// A reset (or a query it depended on) failed, so an exclusion
+			// may not have taken effect. Don't trust it silently —
+			// re-verify against the actual index and refuse to commit (let
+			// alone push) if anything that must be excluded, or that isn't
+			// tracked at HEAD, is still staged (PR #184 review).
 			staged, sErr := g.StagedFiles()
 			if sErr != nil {
 				return nil, fmt.Errorf("exclusion reset failed (%v) and could not re-verify the index: %w", resetErrs, sErr)
 			}
 			for _, f := range staged {
-				if pathExcluded(f, excludePaths) {
-					return nil, fmt.Errorf("refusing to auto-preserve: exclusion reset failed and %q is still staged: %v", f, resetErrs)
+				if pathExcluded(f, excludePaths) || g.FileTrackedAtHEAD(f) {
+					continue
 				}
+				return nil, fmt.Errorf("refusing to auto-preserve: exclusion reset failed and %q is still staged: %v", f, resetErrs)
 			}
 		}
 
@@ -214,7 +260,12 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 			// push step below refuses to publish it, and the caller can
 			// escalate loudly instead.
 			if err := g.Commit(msg); err != nil {
-				if nvErr := g.CommitNoVerify(msg); nvErr != nil {
+				// Trailer makes the unverified state a durable property of
+				// the commit itself, not just this call's in-memory result
+				// (see unverifiedCommitTrailer doc) — the push gate below
+				// checks for it on every call, including ones that made no
+				// commit at all.
+				if nvErr := g.CommitNoVerify(msg + "\n\n" + unverifiedCommitTrailer); nvErr != nil {
 					return nil, fmt.Errorf("auto-committing: %w", nvErr)
 				}
 				result.Committed = true
@@ -249,6 +300,21 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 		return result, fmt.Errorf("resolving HEAD: %w", revErr)
 	}
 
+	// Re-derive HooksFailed as a property of the commit range about to be
+	// pushed, not of this call's in-memory result (see unverifiedCommitTrailer
+	// doc): a prior cycle may have made an unverified commit and returned
+	// before pushing it, and THIS cycle's worktree can be perfectly clean
+	// with nothing to commit, so the `if result.HooksFailed` check above
+	// would miss it entirely and push HEAD anyway (gt-i4ej FIX 2 round-2
+	// finding).
+	if badSHA, chkErr := hasUnverifiedCommit(g, remote, head); chkErr != nil {
+		return result, fmt.Errorf("checking for a prior unverified commit before push: %w", chkErr)
+	} else if badSHA != "" {
+		result.HooksFailed = true
+		result.HookOutput = fmt.Sprintf("commit %s bypassed pre-commit hooks (%s) and was never verified — refusing to push until resolved", shortSHA(badSHA), unverifiedCommitTrailer)
+		return result, nil
+	}
+
 	// A detached HEAD reports as literal "HEAD" from `git rev-parse
 	// --abbrev-ref HEAD`, not "". It is the normal idle state for a
 	// polecat worktree, not an exotic one, so collapsing every detached
@@ -261,7 +327,13 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 		if idErr != nil {
 			return result, fmt.Errorf("cannot derive a unique preservation ref for detached HEAD: %w", idErr)
 		}
-		refBranch = "detached-" + identity + "-" + shortSHA(head)
+		// Identity alone (no commit SHA) so repeated checkpoints of the
+		// same polecat force-push over their own prior state instead of
+		// minting a brand-new permanent remote branch every cycle — the
+		// ref is already force-pushed, so a stable name is correct and
+		// nothing here relies on the old name being distinct per commit
+		// (PR #184 review).
+		refBranch = "detached-" + identity
 	}
 
 	// Skip the push only when we're certain there's nothing new to preserve.
@@ -294,6 +366,31 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 	result.Ref = refName
 	result.Commit = head
 	return result, nil
+}
+
+// hasUnverifiedCommit reports the SHA of the nearest commit, reachable from
+// head back to its merge-base with remote's default branch, that carries
+// unverifiedCommitTrailer — i.e. was committed with hooks bypassed and has
+// never been confirmed safe to publish. Scoped to the merge-base range (this
+// branch's own commits since it diverged) rather than all of history, so an
+// unrelated marked commit merged in from elsewhere can't false-positive
+// every future push. Falls back to head's full ancestry if the merge-base
+// can't be resolved (e.g. the remote branch isn't fetched locally) — a
+// wider search is the safe direction here, not a skipped one.
+func hasUnverifiedCommit(g *Git, remote, head string) (string, error) {
+	revRange := head
+	if base, err := g.MergeBase(head, remote+"/"+g.RemoteDefaultBranch()); err == nil && base != "" {
+		revRange = base + ".." + head
+	}
+	out, err := g.run("log", revRange, "--fixed-strings", "--grep="+unverifiedCommitTrailer, "--format=%H")
+	if err != nil {
+		return "", err
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return "", nil
+	}
+	return strings.Fields(out)[0], nil
 }
 
 // pathExcluded reports whether staged path f falls under one of the

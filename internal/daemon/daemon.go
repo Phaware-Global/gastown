@@ -119,6 +119,15 @@ type Daemon struct {
 	// so a long catch-up sync is never dispatched twice concurrently.
 	offsiteBackupRunning atomic.Bool
 
+	// checkpointDogRunning guards runCheckpointDog so it never runs inline
+	// in the daemon's main select loop: it walks every polecat worktree
+	// across every rig, and each one can block for up to pushTimeout on an
+	// unreachable remote — serially, per polecat, per rig — which stalls
+	// every other dog (and shutdown itself) behind it for as long as the
+	// walk takes (PR #184 review). Dispatched to a goroutine; the guard
+	// skips a cycle rather than piling overlapping runs up.
+	checkpointDogRunning atomic.Bool
+
 	// lastDoctorMolTime tracks when the last mol-dog-doctor molecule was poured.
 	// Option B throttling: only pour when anomaly detected AND cooldown elapsed.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
@@ -829,9 +838,23 @@ func (d *Daemon) Run() (err error) {
 
 		case <-checkpointDogChan:
 			// Checkpoint dog — auto-commits WIP changes in active polecat
-			// worktrees to prevent data loss from session crashes.
+			// worktrees to prevent data loss from session crashes. Run in
+			// a guarded goroutine, not inline: it can stall on an
+			// unreachable remote for up to pushTimeout per polecat, and
+			// running it in this select loop would block every other dog
+			// (and shutdown handling) behind it for the whole walk
+			// (PR #184 review). checkpointRigPolecats also re-checks
+			// isShutdownInProgress per polecat so a shutdown mid-walk
+			// aborts it instead of running to completion.
 			if !d.isShutdownInProgress() {
-				d.runCheckpointDog()
+				if !d.checkpointDogRunning.CompareAndSwap(false, true) {
+					d.logger.Printf("checkpoint_dog: previous cycle still running, skipping this tick")
+				} else {
+					go func() {
+						defer d.checkpointDogRunning.Store(false)
+						d.runCheckpointDog()
+					}()
+				}
 			}
 
 		case <-scheduledMaintenanceChan:

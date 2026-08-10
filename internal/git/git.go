@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1087,6 +1088,19 @@ func (g *Git) StagedFiles() ([]string, error) {
 		return nil, nil
 	}
 	return strings.Split(trimmed, "\n"), nil
+}
+
+// FileTrackedAtHEAD reports whether path already exists as a tracked file
+// at HEAD. Used to tell a legitimate `git add -u` re-stage of a tracked
+// file apart from a stray "A" (added) index entry for a path that was
+// untracked before the caller started (e.g. a separate `git add <newfile>`
+// run earlier in the same worktree) — `add -u` never touches the latter,
+// so it survives into a commit unless explicitly checked for. Any error
+// (including "does not exist") is treated as not-tracked: the safe
+// direction for a caller deciding whether to exclude a path.
+func (g *Git) FileTrackedAtHEAD(path string) bool {
+	_, err := g.run("cat-file", "-e", "HEAD:"+path)
+	return err == nil
 }
 
 // ShowFile returns the contents of a file at a given ref (e.g., "origin/main:CLAUDE.md").
@@ -3217,6 +3231,23 @@ func (g *Git) BranchCreatedDate(branch string) (string, error) {
 		return "", err
 	}
 	return out, nil
+}
+
+// LastActivityTime returns the commit date of HEAD, as a filesystem-signal
+// fallback for callers that need "how long has this worktree been
+// inactive" but can't rely on a session heartbeat (e.g. one that a clean
+// session teardown already deleted). Survives worktree/session reaping
+// because it reads the commit graph, not runtime state (PR #184 review).
+func (g *Git) LastActivityTime() (time.Time, error) {
+	out, err := g.run("log", "-1", "--format=%ct", "HEAD")
+	if err != nil {
+		return time.Time{}, err
+	}
+	sec, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parsing commit timestamp %q: %w", out, err)
+	}
+	return time.Unix(sec, 0), nil
 }
 
 // CommitsAhead returns the number of commits that branch has ahead of base.

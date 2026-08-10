@@ -95,6 +95,10 @@ func (d *Daemon) checkpointRigPolecats(rigName string) (int, int) {
 	checkpointed := 0
 
 	for _, polecatName := range polecats {
+		if d.isShutdownInProgress() {
+			d.logger.Printf("checkpoint_dog: shutdown in progress, aborting %s walk (%d/%d polecats scanned)", rigName, scanned, len(polecats))
+			break
+		}
 		scanned++
 
 		// Deliberately checkpoint regardless of whether the tmux session is
@@ -120,16 +124,6 @@ func (d *Daemon) checkpointRigPolecats(rigName string) (int, int) {
 			d.logger.Printf("checkpoint_dog: error checking session %s, skipping for safety: %v", sessionName, err)
 			continue
 		}
-		if !alive {
-			if hb := polecat.ReadSessionHeartbeat(d.config.TownRoot, sessionName); hb != nil {
-				if age := time.Since(hb.Timestamp); age > checkpointDogAbandonedThreshold {
-					d.logger.Printf("checkpoint_dog: session %s dead, last activity %s ago (> %s) — skipping as abandoned", sessionName, age.Round(time.Minute), checkpointDogAbandonedThreshold)
-					continue
-				}
-			}
-			d.logger.Printf("checkpoint_dog: session %s is dead — checkpointing anyway (highest-risk case)", sessionName)
-		}
-
 		// Polecat layout: prefer <polecatsDir>/<name>/<rigName>/ (the new
 		// nested layout where the outer <name>/ dir is a container with
 		// per-polecat scaffolding and the inner dir is the actual git
@@ -140,11 +134,34 @@ func (d *Daemon) checkpointRigPolecats(rigName string) (int, int) {
 		// container caused git to walk up to the top-level workspace's
 		// .git and commit "WIP: checkpoint (auto)" on the workspace's
 		// branch (usually main) instead of the polecat's branch.
-		// (gt-checkpoint-workdir fix.)
+		// (gt-checkpoint-workdir fix.) Resolved before the alive check
+		// below so it can double as the abandoned-worktree age fallback.
 		workDir := resolveCheckpointWorkDir(polecatsDir, polecatName, rigName)
 		if workDir == "" {
 			continue // Neither layout has a usable .git — skip silently.
 		}
+
+		if !alive {
+			// Bound how long a dead session's worktree keeps getting
+			// auto-checkpointed. Prefer the session heartbeat, but a clean
+			// session teardown deletes exactly that file — killIdlePolecat
+			// and ReconcilePool both call RemoveSessionHeartbeat right
+			// after reaping a session — so a missing heartbeat means
+			// "reaped (or never had one)," not "just started." Treating a
+			// missing heartbeat as fresh inverted this bound: it fired for
+			// a session that crashed seconds ago and never fired for one
+			// cleanly reaped weeks ago — the actual "deliberately
+			// abandoned" case the threshold exists to catch (PR #184
+			// review). Fall back to the worktree's own last-activity
+			// signal (HEAD's commit date), which survives session reaping.
+			age, ageErr := checkpointDogWorktreeAge(workDir, d.config.TownRoot, sessionName)
+			if ageErr == nil && age > checkpointDogAbandonedThreshold {
+				d.logger.Printf("checkpoint_dog: session %s dead, last activity %s ago (> %s) — skipping as abandoned", sessionName, age.Round(time.Minute), checkpointDogAbandonedThreshold)
+				continue
+			}
+			d.logger.Printf("checkpoint_dog: session %s is dead — checkpointing anyway (highest-risk case)", sessionName)
+		}
+
 		if d.checkpointWorktree(workDir, rigName, polecatName) {
 			checkpointed++
 		}
@@ -202,8 +219,15 @@ func (d *Daemon) checkpointWorktree(workDir, rigName, polecatName string) bool {
 	if result.HooksFailed {
 		// The commit exists locally but was never verified — pushing it
 		// would defeat the hooks (gt-i4ej FIX 2). Escalate loudly so a
-		// human resolves the hook failure; the work itself is not at risk.
-		d.logger.Printf("checkpoint_dog: ERROR — %s/%s checkpoint committed locally but its pre-commit hook FAILED, so it was NOT pushed: %s", rigName, polecatName, result.HookOutput)
+		// human resolves the hook failure — but do not copy
+		// result.HookOutput (git's relayed pre-commit hook stderr) into
+		// this log: the hook this gate exists for is typically a secret
+		// scanner, so its verbatim output can contain the very credential
+		// it caught. Writing that into the daemon's shared, rotated,
+		// gzip-archived log would relocate the secret to a longer-lived,
+		// more widely-read artifact than the uncommitted file it came from
+		// (PR #184 review). Point at the worktree instead.
+		d.logger.Printf("checkpoint_dog: ERROR — %s/%s checkpoint committed locally but its pre-commit hook FAILED, so it was NOT pushed. Run `git commit` in %s to see the hook output.", rigName, polecatName, workDir)
 	}
 	if result.Pushed {
 		d.logger.Printf("checkpoint_dog: pushed %s/%s checkpoint to %s (%s)", rigName, polecatName, result.Ref, result.Commit)
@@ -239,4 +263,20 @@ func resolveCheckpointWorkDir(polecatsDir, polecatName, rigName string) string {
 		return flat
 	}
 	return ""
+}
+
+// checkpointDogWorktreeAge returns how long ago a dead-session worktree was
+// last active, for the checkpointDogAbandonedThreshold bound. Prefers the
+// session heartbeat; falls back to the worktree's own HEAD commit date,
+// which — unlike the heartbeat file — survives the session being cleanly
+// reaped (PR #184 review, see caller).
+func checkpointDogWorktreeAge(workDir, townRoot, sessionName string) (time.Duration, error) {
+	if hb := polecat.ReadSessionHeartbeat(townRoot, sessionName); hb != nil {
+		return time.Since(hb.Timestamp), nil
+	}
+	last, err := git.NewGit(workDir).LastActivityTime()
+	if err != nil {
+		return 0, err
+	}
+	return time.Since(last), nil
 }
