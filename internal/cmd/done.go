@@ -450,8 +450,14 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			}
 		}
 
-		fmt.Printf("\n%s Uncommitted changes detected — auto-saving to prevent work loss\n", style.Bold.Render("⚠"))
-		if workStatus, wsErr := g.CheckUncommittedWork(); wsErr == nil {
+		workStatus, wsErr := g.CheckUncommittedWork()
+		runtimeOnly := wsErr == nil && workStatus.CleanExcludingRuntime()
+		if runtimeOnly {
+			fmt.Printf("\n%s Only runtime artifacts uncommitted (.beads/, .claude/, etc.) — nothing to auto-save\n", style.Bold.Render("ℹ"))
+		} else {
+			fmt.Printf("\n%s Uncommitted changes detected — auto-saving to prevent work loss\n", style.Bold.Render("⚠"))
+		}
+		if wsErr == nil {
 			fmt.Printf("  Files: %s\n\n", workStatus.String())
 		}
 
@@ -479,6 +485,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			fmt.Printf("  The agent should have committed before running gt done.\n")
 			fmt.Printf("  This auto-save prevents work loss.\n\n")
 			doneCleanupStatus = "unpushed" // Update status — changes are now committed but not pushed
+		} else if runtimeOnly {
+			fmt.Printf("%s Nothing to auto-commit — all uncommitted paths were runtime artifacts\n\n", style.Bold.Render("✓"))
 		} else {
 			style.PrintWarning("auto-commit: nothing left to commit after excluding runtime artifacts — uncommitted work may be at risk")
 		}

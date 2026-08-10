@@ -1165,11 +1165,20 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	// polecat/preserve-<branch> ref, verified against the remote tip, since
 	// the worktree itself is about to be removed. Best-effort: a preservation
 	// failure is logged and does not block an operator-requested removal.
+	//
+	// Push is gated on !nuclear: nuclear/selfNuke is the operator reaching
+	// for the strongest destructive operation, often precisely BECAUSE a
+	// polecat's worktree contents must not survive (compromised, wrote
+	// credentials, staged hostile data). Publishing that worktree to a
+	// shared remote ref first would invert the operator's intent. Nuclear
+	// removal still commits locally (so the content is not silently
+	// destroyed — recoverable via the worktree's branch ref) but never
+	// pushes it off the box.
 	preserveGit := git.NewGit(clonePath)
 	if branch, brErr := preserveGit.CurrentBranch(); brErr == nil && branch != "" {
 		if result, presErr := git.AutoPreserveUncommittedWork(preserveGit, branch, git.PreserveOptions{
 			IssueID: name,
-			Push:    true,
+			Push:    !nuclear,
 		}); presErr != nil {
 			style.PrintWarning("could not auto-preserve work in %s before removal: %v", name, presErr)
 		} else if result.Pushed {
