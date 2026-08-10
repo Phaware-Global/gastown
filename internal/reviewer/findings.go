@@ -60,8 +60,9 @@ type Findings struct {
 	// still posts a summary).
 	Findings []Finding `json:"findings"`
 	// Disposition optionally overrides the GitHub review event the Reviewer
-	// submits: "approve", "request_changes", or "comment" (case-insensitive).
-	// When empty, the event is derived from finding severity (see ReviewEvent).
+	// submits: "request_changes" or "comment" (case-insensitive). "approve" is
+	// deliberately not a member of this set — see validDispositions. When
+	// empty, the event is derived from finding severity (see ReviewEvent).
 	// Lets a perspective pass assert a blocking verdict explicitly while keeping
 	// a deterministic default when the agent omits it.
 	Disposition string `json:"disposition,omitempty"`
@@ -71,30 +72,37 @@ type Findings struct {
 var validPriorities = map[string]bool{"high": true, "medium": true, "low": true}
 
 // validDispositions maps the findings-payload disposition (lowercased) to the
-// GitHub review event it selects. The closed set is enforced at the contract
-// boundary: ParseFindings rejects any non-empty, unrecognized disposition, so a
-// typo fails loudly rather than silently degrading a blocking verdict.
+// GitHub review event it selects. "approve" is deliberately excluded from this
+// closed set: the Reviewer is not the rig's pr_approver and must never be able
+// to contribute a GitHub approval, by construction rather than by convention
+// (see the security note on ReviewEvent below). The remaining closed set is
+// enforced at the contract boundary: ParseFindings rejects any non-empty,
+// unrecognized disposition (including "approve"), so a typo — or an injected
+// "approve" — fails loudly rather than silently degrading a blocking verdict
+// or granting an approval.
 var validDispositions = map[string]string{
-	"approve":         "APPROVE",
 	"request_changes": "REQUEST_CHANGES",
 	"comment":         "COMMENT",
 }
 
 // ReviewEvent returns the GitHub review disposition for these findings:
-// "APPROVE", "REQUEST_CHANGES", or "COMMENT". An explicit Disposition wins;
-// otherwise it is derived from the highest severity present:
+// "REQUEST_CHANGES" or "COMMENT" — never "APPROVE". It is derived from the
+// highest severity present, unless an explicit Disposition (request_changes
+// or comment) overrides it:
 //
 //	high        → REQUEST_CHANGES (blocking; must be addressed)
 //	medium/low/none → COMMENT     (advisory, nits-only, or clean)
 //
 // The Reviewer never approves and never merges — human approval is the merge
-// gate (see the Reviewer runbook). APPROVE must never be an emergent
-// consequence of a findings count: it is reachable only via an explicit,
-// opt-in Disposition of "approve" in the findings payload (validated by
-// ParseFindings at the contract boundary), never from the severity-derived
-// default below. This also protects against a pass that could not produce a
-// meaningful verdict (e.g. it reviewed the wrong SHA): "found nothing" must
-// never be indistinguishable from "reviewed everything and it's clean".
+// gate (see the Reviewer runbook). This is structural, not just a documented
+// convention: "approve" is not in validDispositions (see above), so neither
+// the severity-derived default nor an explicit Disposition can ever produce
+// "APPROVE" — including from a payload built by a session that was prompt-
+// injected into requesting one. A clean/COMMENT round that follows a prior
+// REQUEST_CHANGES does not re-approve the PR; instead, the caller of
+// SubmitReview is expected to explicitly dismiss the Reviewer's own stale
+// CHANGES_REQUESTED review (see runReviewerPost) so the block it created can
+// be lifted without ever emitting an approval.
 func (fs *Findings) ReviewEvent() string {
 	if ev, ok := validDispositions[strings.ToLower(strings.TrimSpace(fs.Disposition))]; ok {
 		return ev
@@ -123,7 +131,7 @@ func ParseFindings(data []byte) (*Findings, error) {
 	fs.Disposition = strings.ToLower(strings.TrimSpace(fs.Disposition))
 	if fs.Disposition != "" {
 		if _, ok := validDispositions[fs.Disposition]; !ok {
-			return nil, fmt.Errorf("findings.disposition %q is invalid (want approve, request_changes, or comment)", fs.Disposition)
+			return nil, fmt.Errorf("findings.disposition %q is invalid (want request_changes or comment; the Reviewer can never approve)", fs.Disposition)
 		}
 	}
 	for i := range fs.Findings {

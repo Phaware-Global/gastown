@@ -213,17 +213,32 @@ func TestReviewEvent_ExplicitDispositionOverrides(t *testing.T) {
 	if got := fs.ReviewEvent(); got != "COMMENT" {
 		t.Errorf("high+comment: ReviewEvent() = %q, want COMMENT", got)
 	}
-	// APPROVE is reachable only via this explicit opt-in — never as a
-	// severity-derived default (see TestReviewEvent_SeverityDerived).
-	fs = &Findings{Summary: "s", Disposition: "approve"}
-	if got := fs.ReviewEvent(); got != "APPROVE" {
-		t.Errorf("explicit approve: ReviewEvent() = %q, want APPROVE", got)
-	}
 }
 
 func TestParseFindings_InvalidDisposition(t *testing.T) {
 	data := []byte(`{"summary": "s", "disposition": "block", "findings": []}`)
 	if _, err := ParseFindings(data); err == nil {
 		t.Error("expected error for invalid disposition")
+	}
+}
+
+func TestParseFindings_ApproveDispositionRejected(t *testing.T) {
+	// "approve" is not in validDispositions: the Reviewer must never be able
+	// to produce a GitHub approval, even from a hand-authored or injected
+	// payload that opts in explicitly.
+	data := []byte(`{"summary": "s", "disposition": "approve", "findings": []}`)
+	if _, err := ParseFindings(data); err == nil {
+		t.Error("expected error for disposition:approve — the Reviewer can never approve")
+	}
+}
+
+func TestReviewEvent_NeverReturnsApprove(t *testing.T) {
+	// Structural guarantee: no combination of Disposition/findings can
+	// produce "APPROVE" from a *validated* Findings. A hand-constructed
+	// Findings (bypassing ParseFindings) with a bogus Disposition still
+	// falls through to the severity-derived default rather than approving.
+	fs := &Findings{Summary: "s", Disposition: "approve"}
+	if got := fs.ReviewEvent(); got == "APPROVE" {
+		t.Errorf("ReviewEvent() = %q, want anything but APPROVE", got)
 	}
 }
