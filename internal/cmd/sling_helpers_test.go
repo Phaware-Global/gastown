@@ -115,6 +115,55 @@ func TestNudgeRefineryNoOpWithoutLog(t *testing.T) {
 	nudgeRefinery("nonexistent-rig", "test message")
 }
 
+// TestRefineryNudgePayloadIsPurelyAdditive verifies that extra fields (e.g.
+// mrID, branch) appended to the MQ_SUBMIT event payload never displace the
+// original "source=sling" / "message=" fields — nudgeRefinery is a shared
+// emitter with two call sites and unknown consumers on the channel, so
+// existing consumers keyed on those fields must keep working unchanged.
+func TestRefineryNudgePayloadIsPurelyAdditive(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		extra   []string
+		want    []string
+	}{
+		{
+			name:    "no extra fields matches pre-existing shape",
+			message: "MERGE_READY received - check inbox for pending work",
+			extra:   nil,
+			want:    []string{"source=sling", "message=MERGE_READY received - check inbox for pending work"},
+		},
+		{
+			name:    "mrID and branch appended after source and message",
+			message: "MERGE_READY received - check inbox for pending work",
+			extra:   []string{"mrID=gt-mr-123", "branch=polecat/toast/gt-abc"},
+			want: []string{
+				"source=sling",
+				"message=MERGE_READY received - check inbox for pending work",
+				"mrID=gt-mr-123",
+				"branch=polecat/toast/gt-abc",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := refineryNudgePayload(tt.message, tt.extra...)
+			if len(got) != len(tt.want) {
+				t.Fatalf("refineryNudgePayload() = %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("payload[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+			if got[0] != "source=sling" {
+				t.Errorf("payload[0] must remain source=sling for existing consumers, got %q", got[0])
+			}
+		})
+	}
+}
+
 func TestIsDeferredBead(t *testing.T) {
 	tests := []struct {
 		name string

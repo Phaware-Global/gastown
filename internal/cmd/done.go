@@ -1679,7 +1679,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 notifyWitness:
 	// Nudge refinery — MR bead is already on main (transaction-based shared main).
 	if shouldNudgeRefinery(exitType, mrID) {
-		nudgeRefinery(rigName, "MERGE_READY received - check inbox for pending work")
+		nudgeRefinery(rigName, "MERGE_READY received - check inbox for pending work",
+			"mrID="+mrID, "branch="+branch)
 	}
 
 	// Write completion metadata to agent bead for audit trail.

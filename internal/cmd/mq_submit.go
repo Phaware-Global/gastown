@@ -307,7 +307,8 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 		}
 
 		// Nudge refinery to pick up the new MR
-		nudgeRefinery(rigName, "MERGE_READY received - check inbox for pending work")
+		nudgeRefinery(rigName, "MERGE_READY received - check inbox for pending work",
+			"mrID="+mrIssue.ID, "branch="+branch)
 
 		// GH#2599: Back-link source issue to MR bead for discoverability.
 		if issueID != "" {
