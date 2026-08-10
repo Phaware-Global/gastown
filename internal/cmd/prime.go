@@ -252,9 +252,16 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 }
 
 func ensureRoleWorktreeIntegrity(cwd, townRoot string, role Role) error {
+	require := roleRequiresWorktreeIntegrity(role)
+	if role == RoleWitness && isWitnessHomeWithoutClone(cwd, townRoot) {
+		require = false
+	}
+	if (role == RoleDog || role == RoleBoot) && isDogKennelContainer(cwd, townRoot) {
+		require = false
+	}
 	if err := worktreeintegrity.Validate(cwd, worktreeintegrity.IntegrityOptions{
 		TownRoot: townRoot,
-		Require:  roleRequiresWorktreeIntegrity(role),
+		Require:  require,
 	}); err != nil {
 		return fmt.Errorf("%w\nRemediation: stop using this worktree and run `gt doctor --fix`", err)
 	}
@@ -263,11 +270,87 @@ func ensureRoleWorktreeIntegrity(cwd, townRoot string, role Role) error {
 
 func roleRequiresWorktreeIntegrity(role Role) bool {
 	switch role {
-	case RolePolecat, RoleCrew, RoleWitness, RoleRefinery, RoleDog, RoleBoot:
+	case RolePolecat, RoleCrew, RoleRefinery, RoleDog, RoleBoot, RoleWitness:
 		return true
 	default:
 		return false
 	}
+}
+
+// isWitnessHomeWithoutClone reports whether cwd is the witness role's home
+// directory (<rig>/witness) rather than its optional witness/rig/ clone.
+// Witness has no git clone by design when it runs from its home dir, but
+// witness/rig/ (see internal/witness/manager.go:witnessDir, which prefers it
+// over witness/ whenever it exists) is a real linked worktree when present
+// and must still pass integrity validation like any other agent worktree.
+//
+// cwd and townRoot are resolved with filepath.Abs, not filepath.EvalSymlinks,
+// so this shares findGitMarker's path space (internal/worktree/integrity.go)
+// — but that alignment is not what makes this safe. Safety comes from the
+// polarity of the test: it is a POSITIVE match on exactly <rig>/witness (two
+// path segments), not a negative carve-out of everything that isn't the real
+// clone. Under a positive test, any recognition failure — case variance, a
+// symlinked alias, anything unforeseen — falls through to "not exempt" and
+// fails closed. A negative test (exempt unless it looks like the clone) fails
+// OPEN on the same recognition failure: an unrecognized spelling of the real
+// clone would stop matching "rig" and get exempted by the very check meant to
+// guard it. The real witness/rig clone is three segments, so it simply never
+// satisfies len(parts) == 2 and needs no explicit carve-out. EqualFold on the
+// "witness" segment is safe here — under positive polarity it only widens
+// what counts as the (harmless, no-clone) home dir, it can't widen an
+// exemption of the clone itself.
+func isWitnessHomeWithoutClone(cwd, townRoot string) bool {
+	resolvedCwd, err := filepath.Abs(cwd)
+	if err != nil {
+		return false
+	}
+	resolvedTownRoot, err := filepath.Abs(townRoot)
+	if err != nil {
+		return false
+	}
+
+	relPath, err := filepath.Rel(resolvedTownRoot, resolvedCwd)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(filepath.ToSlash(relPath), "/")
+	return len(parts) == 2 && strings.EqualFold(parts[1], "witness")
+}
+
+// isDogKennelContainer reports whether cwd is a dog/boot kennel container
+// (<townRoot>/deacon/dogs/<name>) rather than a per-rig worktree nested
+// inside it. A kennel is a plain directory by design — dog and boot session
+// cwds are always the container itself (internal/dog/session_manager.go:
+// kennelPath, internal/boot/boot.go: bootDir), which never has its own .git.
+// deacon/dogs/<name>/<rig>, by contrast, is a real git worktree created
+// inside the kennel (internal/dog/manager.go: createRigWorktree) and must
+// still fail closed when its .git is missing.
+//
+// cwd and townRoot are resolved with filepath.Abs, not filepath.EvalSymlinks
+// — the same path space findGitMarker walks in (internal/worktree/integrity.go).
+// The segment comparison is exact-case, not case-folded. Both choices keep
+// this function agreeing with findGitMarker about which literal path is being
+// described: findGitMarker never resolves symlinks or folds case as it walks
+// upward from cwd, so a canonicalized or case-insensitive notion of "kennel"
+// here could exempt a path that findGitMarker would have walked straight
+// through into a real, deeper worktree — the exemption and the walk must
+// share one path space or the exemption doesn't guard what it claims to.
+func isDogKennelContainer(cwd, townRoot string) bool {
+	resolvedCwd, err := filepath.Abs(cwd)
+	if err != nil {
+		return false
+	}
+	resolvedTownRoot, err := filepath.Abs(townRoot)
+	if err != nil {
+		return false
+	}
+
+	relPath, err := filepath.Rel(resolvedTownRoot, resolvedCwd)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(filepath.ToSlash(relPath), "/")
+	return len(parts) == 3 && parts[0] == "deacon" && parts[1] == "dogs"
 }
 
 // runPrimeCompactResume runs a lighter prime after compaction or resume.
