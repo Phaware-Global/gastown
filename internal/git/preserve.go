@@ -141,12 +141,21 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 		return result, fmt.Errorf("resolving HEAD: %w", revErr)
 	}
 
-	// Skip the push only when we're certain there's nothing new to preserve:
-	// no auto-commit just happened, and the preservation ref already points
-	// at this exact HEAD. Any error while checking counts as "not certain" —
-	// fall through and push anyway rather than risk silently skipping.
+	// Skip the push only when we're certain there's nothing new to preserve.
+	// Two independent proofs, either is sufficient: the preservation ref
+	// already points at this exact HEAD (this exact state was already
+	// pushed by a prior call — the common repeated-checkpoint case), or the
+	// worktree's status shows zero commits not already reachable from a
+	// known base (nothing polecat-specific has ever happened here — the
+	// freshly-spawned/idle case). Absent either proof, push: a caller found
+	// with local-only commits and no matching preserve-ref tip is exactly
+	// the "committed but never pushed, worktree about to vanish" case this
+	// function exists to catch.
 	if !result.Committed {
 		if tip, err := g.PushRemoteBranchTip(remote, PreservationRefName(branch)); err == nil && tip == head {
+			return result, nil
+		}
+		if status.UnpushedCommits == 0 {
 			return result, nil
 		}
 	}
