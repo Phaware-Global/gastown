@@ -98,11 +98,20 @@ var validDispositions = map[string]string{
 // convention: "approve" is not in validDispositions (see above), so neither
 // the severity-derived default nor an explicit Disposition can ever produce
 // "APPROVE" — including from a payload built by a session that was prompt-
-// injected into requesting one. A clean/COMMENT round that follows a prior
-// REQUEST_CHANGES does not re-approve the PR; instead, the caller of
-// SubmitReview is expected to explicitly dismiss the Reviewer's own stale
-// CHANGES_REQUESTED review (see runReviewerPost) so the block it created can
-// be lifted without ever emitting an approval.
+// injected into requesting one.
+//
+// One-time migration concern: a clean/COMMENT round that follows a prior
+// REQUEST_CHANGES from this identity does NOT retract it — GitHub only folds
+// APPROVED/CHANGES_REQUESTED/DISMISSED into a reviewer's latest state, so a
+// COMMENTED review leaves the stale CHANGES_REQUESTED in place and the PR
+// stays blocked. GitHub's dismiss-review endpoint does not help either: on a
+// repo without branch protection it returns HTTP 200 and silently no-ops.
+// Clearing a PR stuck in this state requires a human operator to manually
+// post a superseding review under the Reviewer identity from outside any
+// automated Reviewer session (see "One-time remediation" in the Reviewer
+// runbook) — this package intentionally has no code path that does it
+// automatically, because that path would be exactly the reachable-APPROVE
+// hatch this file exists to close.
 func (fs *Findings) ReviewEvent() string {
 	if ev, ok := validDispositions[strings.ToLower(strings.TrimSpace(fs.Disposition))]; ok {
 		return ev

@@ -4,11 +4,13 @@ The **Reviewer** is a rig-level, on-demand agent role that performs AI code
 review on pull requests and posts its findings as a GitHub PR review under a
 dedicated machine-user identity. It replaces the externally-hosted Augment app
 in the refinery's PR review loop. The Reviewer's GitHub review **disposition
-matches its findings** — a high-severity finding posts `REQUEST_CHANGES`, a
-medium-only review posts `COMMENT`, and a clean or nits-only review posts
-`APPROVE`. It **never merges**, and because it must not be the `pr_approver`
-(see Security), its `APPROVE` is informational — human approval stays the merge
-gate.
+matches its findings** — a high-severity finding posts `REQUEST_CHANGES`,
+anything else (medium, low, or clean) posts `COMMENT`. **The Reviewer never
+posts `APPROVE` and never merges** — this is enforced at the contract boundary
+(`disposition: "approve"` is rejected, not just undocumented), not merely a
+convention. Human approval stays the merge gate. See "One-time remediation"
+below for the one case this creates: a PR that already carries a stale
+`REQUEST_CHANGES` from before this behavior shipped.
 
 This runbook covers configuring, operating, and troubleshooting a local
 Reviewer for a rig. Design reference: [`docs/design/reviewer-role.md`](../design/reviewer-role.md).
@@ -270,10 +272,10 @@ On GitHub, a successful review appears under the `pr_reviewer` login with one
 inline thread per finding and a top-level summary listing per-perspective
 verdicts, a finding count, and the reviewed SHA. Its disposition reflects the
 findings: **CHANGES REQUESTED** when any finding is high-severity, **COMMENTED**
-when the worst is medium, and **APPROVED** when the review is clean or nits-only.
-A perspective pass may also set an explicit `disposition`
-(`approve` / `request_changes` / `comment`) in the findings payload to override
-the severity-derived default.
+otherwise (medium, low, or clean) — it is never **APPROVED**. A perspective
+pass may also set an explicit `disposition` (`request_changes` / `comment`) in
+the findings payload to override the severity-derived default; `approve` is
+not a valid value and is rejected.
 
 ---
 
@@ -310,6 +312,40 @@ timeout escalates (exit 3) and the daemon reaps the stale session.
   gate absorbs.
 - The token value never touches disk (outside the 0600 `daemon.env`) or logs;
   config stores only the env var name, and an unset var fails fast at dispatch.
+
+---
+
+## One-time remediation: clearing a stale REQUEST_CHANGES
+
+Because the Reviewer only ever posts `COMMENT` or `REQUEST_CHANGES`, a PR that
+already carries a `REQUEST_CHANGES` from the `pr_reviewer` identity — cast
+before this behavior shipped, or from any round predating a clean pass — stays
+blocked even after every finding is fixed. GitHub only folds
+`APPROVED`/`CHANGES_REQUESTED`/`DISMISSED` into a reviewer's latest review
+state; a later `COMMENTED` review does not supersede the earlier
+`CHANGES_REQUESTED`, so the block does not clear on its own. GitHub's
+dismiss-review endpoint does not help either — on a repo without branch
+protection it returns HTTP 200 and silently does nothing.
+
+**This is a one-time migration concern, not an ongoing design flaw.** Do not
+"fix" it by giving the automated Reviewer a way to post `APPROVE` (via a
+config flag, an env var, or otherwise) — that reopens exactly the hole this
+role's tap-guard and closed `validDispositions` set exist to close. Findings
+severity is a machine's assessment, not a merge decision; the Reviewer must
+never be positioned to make the merge decision it names.
+
+Instead, once a human operator has confirmed the PR is genuinely clean at its
+current head, clear the stale verdict by hand, from your own shell (never from
+inside a Reviewer session — the tap-guard blocks `gh pr review` there):
+
+```bash
+gh pr review <PR> --approve \
+  -b "Manual one-time remediation for a stale Reviewer REQUEST_CHANGES — see docs/runbooks/reviewer.md#one-time-remediation-clearing-a-stale-request_changes. Verified clean at <SHA>."
+```
+
+Run this under the `pr_reviewer` machine-user token (the same identity that
+cast the stale verdict), not a human's own GitHub login — the goal is that
+identity superseding its own prior review, not adding a second approver.
 
 ---
 

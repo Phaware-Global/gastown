@@ -513,9 +513,14 @@ Add a `reviewer` entry to `DefaultOverrides()`
 (`internal/hooks/config.go:201`) blocking, at the Bash-tool layer:
 
 - `gh pr merge` and **all of `gh pr review`** (including `--comment`):
-  posting goes exclusively through `gt reviewer post`, which emits COMMENT
-  reviews only — approve/request-changes are states the merge gates don't
-  model, and a raw-`gh` path would bypass the tested output contract
+  posting goes exclusively through `gt reviewer post`, which emits `COMMENT`
+  or `REQUEST_CHANGES` reviews — never `APPROVE`; `approve` is not a member of
+  the disposition set `ParseFindings` accepts, so this is enforced by
+  construction, not just by the tap-guard blocking a raw `gh pr review
+  --approve`. A stale `REQUEST_CHANGES` from a prior round can only be cleared
+  by a human operator manually superseding it from outside any Reviewer
+  session (see "One-time remediation" in the Reviewer runbook) — never by
+  giving the automated path a way to approve.
 - the GraphQL `resolveReviewThread` mutation (thread resolution belongs to
   the authoring polecat — actor-boundary rule in
   [refinery-pr-workflow.md](refinery-pr-workflow.md))
