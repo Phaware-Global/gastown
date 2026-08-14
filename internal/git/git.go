@@ -2259,23 +2259,33 @@ func (g *Git) GhPrApprovedBy(prNumber int, user string) (bool, error) {
 	return false, nil
 }
 
-// GhPrApprovalCount returns the number of distinct reviewers whose most recent
-// terminal review on the PR is APPROVED. A reviewer who later submits
-// CHANGES_REQUESTED or whose approval was DISMISSED does not count. Used to
-// enforce pr_required_approvals > 1.
+// GhPrApprovalCount returns the number of distinct reviewers, other than
+// excludeLogin, whose most recent terminal review on the PR is APPROVED. A
+// reviewer who later submits CHANGES_REQUESTED or whose approval was
+// DISMISSED does not count. Used to enforce pr_required_approvals > 1.
+//
+// excludeLogin (case-insensitive; pass "" for no exclusion) is the
+// configured merge_queue.pr_reviewer login: that identity must never be
+// able to contribute to the per-user approval-count gate, whether the
+// review was cast automatically (impossible today — ReviewEvent never
+// emits APPROVE) or by a human operator running a superseding review under
+// that identity (the runbook's stuck-PR remediation, which does cast an
+// APPROVED review). Excluding it here makes that a structural guarantee
+// rather than a documented promise.
 //
 // Resilient to gh returning reviews in any order — ghFetchReviews sorts by
 // submittedAt before we fold into the per-user latest-state map.
-func (g *Git) GhPrApprovalCount(prNumber int) (int, error) {
+func (g *Git) GhPrApprovalCount(prNumber int, excludeLogin string) (int, error) {
 	reviews, err := g.ghFetchReviews(prNumber)
 	if err != nil {
 		return 0, err
 	}
+	excludeLogin = strings.ToLower(excludeLogin)
 	// latest[user] = terminal state of that user's newest review
 	latest := make(map[string]string, len(reviews))
 	for _, r := range reviews {
 		login := strings.ToLower(r.Author.Login)
-		if login == "" {
+		if login == "" || login == excludeLogin {
 			continue
 		}
 		switch r.State {

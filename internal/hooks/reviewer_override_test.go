@@ -28,6 +28,8 @@ func TestReviewerOverrideBlocksWriteSurfaces(t *testing.T) {
 		"git push",
 		"gt refinery pr",
 		"resolveReviewThread",
+		"addPullRequestReview",    // GraphQL review-submission mutation (defense-in-depth)
+		"submitPullRequestReview", // GraphQL review-submission mutation (defense-in-depth)
 	}
 	for _, needle := range wantBlocked {
 		if !matcherCovers(rev.PreToolUse, needle) {

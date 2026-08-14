@@ -75,11 +75,14 @@ type PRProvider interface {
 	// than the filtered unresolved list.
 	AllThreads(prNumber int) ([]ReviewThread, error)
 
-	// CountApprovals returns the number of distinct users whose most recent
-	// terminal review on the PR is APPROVED. Reviews that have been dismissed
-	// or superseded by a CHANGES_REQUESTED review from the same user do not
-	// count. Used to enforce pr_required_approvals > 1.
-	CountApprovals(prNumber int) (int, error)
+	// CountApprovals returns the number of distinct users, other than
+	// excludeLogin, whose most recent terminal review on the PR is
+	// APPROVED. Reviews that have been dismissed or superseded by a
+	// CHANGES_REQUESTED review from the same user do not count. Used to
+	// enforce pr_required_approvals > 1. excludeLogin is normally the
+	// configured pr_reviewer login, so a review-loop identity can never
+	// contribute to this gate — pass "" for no exclusion.
+	CountApprovals(prNumber int, excludeLogin string) (int, error)
 
 	// ChecksRollup returns the CI status rollup for the PR:
 	//   state: "SUCCESS", "FAILURE", "ERROR", "PENDING", "NO_CHECKS", or "" if unknown

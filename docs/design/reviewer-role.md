@@ -515,15 +515,27 @@ Add a `reviewer` entry to `DefaultOverrides()`
 - `gh pr merge` and **all of `gh pr review`** (including `--comment`):
   posting goes exclusively through `gt reviewer post`, which emits `COMMENT`
   or `REQUEST_CHANGES` reviews — never `APPROVE`; `approve` is not a member of
-  the disposition set `ParseFindings` accepts, so this is enforced by
-  construction, not just by the tap-guard blocking a raw `gh pr review
-  --approve`. A stale `REQUEST_CHANGES` from a prior round can only be cleared
-  by a human operator manually superseding it from outside any Reviewer
-  session (see "One-time remediation" in the Reviewer runbook) — never by
-  giving the automated path a way to approve.
+  the disposition set `ParseFindings` accepts, so the **`gt reviewer post`
+  path** cannot emit `APPROVE` by construction, not just by the tap-guard
+  blocking a raw `gh pr review --approve`. That is a code-path guarantee, not
+  an identity-level one: a session that holds the `pr_reviewer` token could
+  still submit an approval via a Bash command the tap-guard doesn't match
+  (e.g. a raw `curl`, or a GraphQL mutation not covered below) — the tap-guard
+  is a Bash-string glob, not a capability boundary. `GhPrApprovalCount`
+  (`internal/git/git.go`) is the backstop for that gap: it excludes the
+  configured `pr_reviewer` login from `pr_required_approvals`, so no review
+  cast under that identity — through any route — can satisfy the count gate.
+  A stale `REQUEST_CHANGES` from a prior round can only be cleared by a human
+  operator manually superseding it from outside any Reviewer session (see
+  "Manual remediation" in the Reviewer runbook) — never by giving the
+  automated path a way to approve.
 - the GraphQL `resolveReviewThread` mutation (thread resolution belongs to
   the authoring polecat — actor-boundary rule in
-  [refinery-pr-workflow.md](refinery-pr-workflow.md))
+  [refinery-pr-workflow.md](refinery-pr-workflow.md)), and the GraphQL
+  `addPullRequestReview`/`submitPullRequestReview` mutations (the
+  review-submission counterpart to the `gh pr review`/`gh api .../reviews`
+  matchers above — neither of those Bash-string matchers contains
+  `pulls`/`reviews`, so these needed their own entries)
 - `git push` (any), `gt refinery pr *`, `bd close` on MR beads
 
 This mirrors how the polecat/refinery write surfaces are kept disjoint: the

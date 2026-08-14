@@ -661,7 +661,7 @@ func (f *threadGateFakeProvider) MergePR(int, string) (string, error) {
 
 func (f *threadGateFakeProvider) IsPRApproved(int) (bool, error)                  { panic("unused") }
 func (f *threadGateFakeProvider) IsPRApprovedBy(int, string) (bool, error)        { panic("unused") }
-func (f *threadGateFakeProvider) CountApprovals(int) (int, error)                 { panic("unused") }
+func (f *threadGateFakeProvider) CountApprovals(int, string) (int, error)         { panic("unused") }
 func (f *threadGateFakeProvider) CreatePR(CreatePROptions) (int, string, error)   { panic("unused") }
 func (f *threadGateFakeProvider) RequestReview(int, []string) error               { panic("unused") }
 func (f *threadGateFakeProvider) ChangesRequestedReviewers(int) ([]string, error) { panic("unused") }

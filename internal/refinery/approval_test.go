@@ -20,6 +20,7 @@ type fakePRProvider struct {
 
 	isApprovedCalls []string // users queried, in order
 	countCalls      int
+	excludeLogins   []string // excludeLogin arg passed to CountApprovals, in order
 }
 
 func (f *fakePRProvider) IsPRApprovedBy(prNumber int, user string) (bool, error) {
@@ -30,8 +31,9 @@ func (f *fakePRProvider) IsPRApprovedBy(prNumber int, user string) (bool, error)
 	return f.approvedBy[user], nil
 }
 
-func (f *fakePRProvider) CountApprovals(prNumber int) (int, error) {
+func (f *fakePRProvider) CountApprovals(prNumber int, excludeLogin string) (int, error) {
 	f.countCalls++
+	f.excludeLogins = append(f.excludeLogins, excludeLogin)
 	if f.approvalCountErr != nil {
 		return 0, f.approvalCountErr
 	}
@@ -269,6 +271,27 @@ func TestVerifyPRApproval_OutputWriter_EmitsProgressLines(t *testing.T) {
 	}
 	if !strings.Contains(got, "gatekeeper") || !strings.Contains(got, "approvals") {
 		t.Errorf("expected both gate progress lines, got %q", got)
+	}
+}
+
+func TestVerifyPRApproval_CountGate_ExcludesConfiguredPRReviewer(t *testing.T) {
+	// The count gate must never let the review-loop identity (pr_reviewer)
+	// contribute to pr_required_approvals — not even via the runbook's
+	// manual stuck-PR remediation, which casts a real APPROVED review
+	// under that identity. VerifyPRApproval enforces this by always
+	// passing cfg.PRReviewer as CountApprovals' excludeLogin.
+	cfg := &MergeQueueConfig{
+		MergeStrategy:       "pr",
+		PRReviewer:          "gt-rig-reviewer",
+		PRRequiredApprovals: intPtr(1),
+	}
+	provider := &fakePRProvider{approvalCount: 1}
+	if err := VerifyPRApproval(provider, cfg, 42, nil); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+	if len(provider.excludeLogins) != 1 || provider.excludeLogins[0] != "gt-rig-reviewer" {
+		t.Errorf("expected CountApprovals to be called with excludeLogin=%q, got %v",
+			"gt-rig-reviewer", provider.excludeLogins)
 	}
 }
 

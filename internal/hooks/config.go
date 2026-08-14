@@ -532,6 +532,29 @@ func DefaultOverrides() map[string]*HooksConfig {
 						Command: "echo '❌ BLOCKED: Thread resolution belongs to the authoring polecat, not the Reviewer.' && exit 2",
 					}},
 				},
+				{
+					// Defense-in-depth alongside the `gh pr review*` and
+					// `gh api*pulls*reviews*` matchers above: `gh api graphql`
+					// can submit or add to a PR review via the
+					// addPullRequestReview/submitPullRequestReview mutations
+					// without the literal "pulls"/"reviews" substring the
+					// REST matcher looks for, so a prompt-injected session
+					// could otherwise route an APPROVE around it the same
+					// way the resolveReviewThread matcher above closes that
+					// gap for thread resolution.
+					Matcher: "Bash(*addPullRequestReview*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviewer posts reviews only via `gt reviewer post`. Raw GraphQL addPullRequestReview bypasses the tested output contract.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*submitPullRequestReview*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviewer posts reviews only via `gt reviewer post`. Raw GraphQL submitPullRequestReview bypasses the tested output contract.' && exit 2",
+					}},
+				},
 			},
 		},
 	}

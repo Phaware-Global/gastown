@@ -83,7 +83,7 @@ func (p *bitbucketPRProvider) AllThreads(prNumber int) ([]ReviewThread, error) {
 	return nil, ErrUnsupported
 }
 
-func (p *bitbucketPRProvider) CountApprovals(prNumber int) (int, error) {
+func (p *bitbucketPRProvider) CountApprovals(prNumber int, excludeLogin string) (int, error) {
 	return 0, ErrUnsupported
 }
 

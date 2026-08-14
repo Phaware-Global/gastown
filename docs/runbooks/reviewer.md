@@ -8,9 +8,10 @@ matches its findings** — a high-severity finding posts `REQUEST_CHANGES`,
 anything else (medium, low, or clean) posts `COMMENT`. **The Reviewer never
 posts `APPROVE` and never merges** — this is enforced at the contract boundary
 (`disposition: "approve"` is rejected, not just undocumented), not merely a
-convention. Human approval stays the merge gate. See "One-time remediation"
-below for the one case this creates: a PR that already carries a stale
-`REQUEST_CHANGES` from before this behavior shipped.
+convention. Human approval stays the merge gate. See "Manual remediation"
+below for the recurring case this creates: any PR that ever received a high
+finding stays `REQUEST_CHANGES` even after a later clean round, because a
+`COMMENT` review does not retract a prior `REQUEST_CHANGES`.
 
 This runbook covers configuring, operating, and troubleshooting a local
 Reviewer for a rig. Design reference: [`docs/design/reviewer-role.md`](../design/reviewer-role.md).
@@ -291,6 +292,7 @@ not a valid value and is rejected.
 | `gt reviewer checkout` fails fetching `pull/<n>/head` | non-GitHub provider | v1 is GitHub-only by design (Bitbucket `SubmitReview` returns `ErrUnsupported`) |
 | Reviewer session hung / never finished | hung review | `await-review`'s 30m timeout escalates (exit 3) so a hung Reviewer never blocks a merge — the functional safety net; the session self-terminates on `gt reviewer done`, and a zombie (tmux alive, agent dead) is recreated on the next dispatch |
 | Perspective named in config not applied | missing file at every tier | `gt reviewer perspectives` shows what resolves; add the file or fix the name (or set `fail_silent_perspectives`) |
+| PR stays blocked after a clean Reviewer round | stale `CHANGES_REQUESTED` from `pr_reviewer` — expected on any PR that ever got a high finding | see "Manual remediation" below |
 
 A hung or crashed Reviewer **never blocks a merge silently**: `await-review`'s
 timeout escalates (exit 3) and the daemon reaps the stale session.
@@ -301,10 +303,14 @@ timeout escalates (exit 3) and the daemon reaps the stale session.
 
 - The Reviewer's only write surfaces are its review bead, its own worktree
   (checkout only), and PR review comments via `gt reviewer post`. A tap-guard
-  blocks `gh pr review`, `gh pr merge`, raw `gh api .../pulls/*/reviews`,
+  blocks `gh pr review`, `gh pr merge`, raw `gh api .../pulls/*/reviews`, the
+  GraphQL `addPullRequestReview`/`submitPullRequestReview` mutations,
   `git push`, `gt refinery pr *`, and review-thread resolution.
 - The machine user must not be `pr_approver` and must not have protected-branch
-  merge rights — branch protection backstops the tap-guard.
+  merge rights — branch protection backstops the tap-guard. `GhPrApprovalCount`
+  additionally excludes the configured `pr_reviewer` login by construction, so
+  no review cast under that identity — automated or the manual remediation
+  below — can ever satisfy `pr_required_approvals`.
 - PR diffs and commit messages are **attacker-influenced data**, not
   instructions. The review-request bead carries only town-generated metadata
   (PR number, SHA, branch); raw PR body text never enters it. The worst
@@ -315,37 +321,71 @@ timeout escalates (exit 3) and the daemon reaps the stale session.
 
 ---
 
-## One-time remediation: clearing a stale REQUEST_CHANGES
+## Manual remediation: clearing a stale REQUEST_CHANGES
 
 Because the Reviewer only ever posts `COMMENT` or `REQUEST_CHANGES`, a PR that
-already carries a `REQUEST_CHANGES` from the `pr_reviewer` identity — cast
-before this behavior shipped, or from any round predating a clean pass — stays
-blocked even after every finding is fixed. GitHub only folds
+carries a `REQUEST_CHANGES` from the `pr_reviewer` identity stays blocked even
+after every finding is fixed. GitHub only folds
 `APPROVED`/`CHANGES_REQUESTED`/`DISMISSED` into a reviewer's latest review
 state; a later `COMMENTED` review does not supersede the earlier
-`CHANGES_REQUESTED`, so the block does not clear on its own. GitHub's
-dismiss-review endpoint does not help either — on a repo without branch
-protection it returns HTTP 200 and silently does nothing.
+`CHANGES_REQUESTED`, so the block does not clear on its own. Whether GitHub's
+dismiss-review endpoint could clear it in-band, without an `APPROVE`, is
+unverified in this codebase — no code path here calls it.
 
-**This is a one-time migration concern, not an ongoing design flaw.** Do not
-"fix" it by giving the automated Reviewer a way to post `APPROVE` (via a
-config flag, an env var, or otherwise) — that reopens exactly the hole this
+**This is not a one-time migration concern — it recurs on every PR that ever
+receives a high finding.** The refinery loop's normal happy path produces it
+directly: round 1 posts a high finding → `REQUEST_CHANGES`; a review-fix
+polecat fixes it; round 2 is clean → `COMMENT`, which per above does not
+retract round 1's verdict. Expect to run this procedure routinely, not as a
+one-off migration step.
+
+Do not "fix" it by giving the automated Reviewer a way to post `APPROVE` (via
+a config flag, an env var, or otherwise) — that reopens exactly the hole this
 role's tap-guard and closed `validDispositions` set exist to close. Findings
 severity is a machine's assessment, not a merge decision; the Reviewer must
 never be positioned to make the merge decision it names.
 
 Instead, once a human operator has confirmed the PR is genuinely clean at its
 current head, clear the stale verdict by hand, from your own shell (never from
-inside a Reviewer session — the tap-guard blocks `gh pr review` there):
+inside a Reviewer session — the tap-guard blocks `gh pr review` there) and
+under the `pr_reviewer` machine-user token, not your own GitHub login — a
+bare `gh pr review <PR> --approve` authenticates as *you*, which clears
+nothing (the `pr_reviewer` entry stays `CHANGES_REQUESTED`) while adding your
+own login as an unintended approver:
 
 ```bash
-gh pr review <PR> --approve \
-  -b "Manual one-time remediation for a stale Reviewer REQUEST_CHANGES — see docs/runbooks/reviewer.md#one-time-remediation-clearing-a-stale-request_changes. Verified clean at <SHA>."
+# Run from your own shell (not a Reviewer session). This sources the bot
+# token from the daemon env file rather than your own gh auth.
+set -a; . ~/gt/settings/daemon.env; set +a
+GH_TOKEN="$GT_REVIEWER_GITHUB_TOKEN" gh pr review <PR> --approve \
+  --repo <owner>/<repo> \
+  -b "Manual remediation for a stale Reviewer REQUEST_CHANGES — see docs/runbooks/reviewer.md#manual-remediation-clearing-a-stale-request_changes. Verified clean at <SHA>."
+
+# Verify the pr_reviewer login's latest review state is no longer
+# CHANGES_REQUESTED:
+gh pr view <PR> --repo <owner>/<repo> --json reviews
 ```
 
-Run this under the `pr_reviewer` machine-user token (the same identity that
-cast the stale verdict), not a human's own GitHub login — the goal is that
-identity superseding its own prior review, not adding a second approver.
+`$GT_REVIEWER_GITHUB_TOKEN` is the env var named by
+`merge_queue.reviewer_token_env` (default shown above); substitute your rig's
+configured name if it differs. Consequences of this approval, so they are not
+a surprise:
+
+- It does **not** count toward `pr_required_approvals`: `GhPrApprovalCount`
+  (`internal/git/git.go`) excludes the configured `merge_queue.pr_reviewer`
+  login by construction, so an approval cast under that identity can never
+  satisfy the count gate. This is deliberate, not assumed — verify your rig's
+  `pr_required_approvals` gate is still satisfied by a real human approver
+  after running this procedure.
+- It is **not SHA-scoped**: `GhPrApprovalCount` never inspects the review's
+  commit, and these repos have no branch protection to dismiss it on a new
+  push. It persists across every subsequent push to the PR until superseded
+  by another terminal review from the same identity.
+- The `CHANGES_REQUESTED` state it clears is not itself a `gt`-enforced merge
+  gate — `ChangesRequestedReviewers`'s only caller,
+  `reRequestBlockingReviewers`, is best-effort and non-gating. This procedure
+  exists to unblock the human operator's own workflow expectations (a
+  visibly "blocked" PR), not to satisfy an automated check.
 
 ---
 

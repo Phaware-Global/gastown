@@ -462,7 +462,7 @@ func runRefineryPrWaitApproval(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("wait-approval requires at least one gate: " +
 			"set --approver=<user> and/or --min-approvals=<n≥1>")
 	}
-	provider, _, _, err := getRefineryPRContext()
+	provider, cfg, _, err := getRefineryPRContext()
 	if err != nil {
 		return err
 	}
@@ -488,7 +488,7 @@ func runRefineryPrWaitApproval(cmd *cobra.Command, args []string) error {
 		countOK := true
 		var count int
 		if minApprovals > 0 {
-			count, err = provider.CountApprovals(prNumber)
+			count, err = provider.CountApprovals(prNumber, cfg.PRReviewer)
 			if err != nil {
 				return fmt.Errorf("counting approvals: %w", err)
 			}

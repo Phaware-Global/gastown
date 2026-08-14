@@ -55,8 +55,8 @@ func (p *githubPRProvider) AllThreads(prNumber int) ([]ReviewThread, error) {
 	return gitReviewThreadsToProvider(threads), nil
 }
 
-func (p *githubPRProvider) CountApprovals(prNumber int) (int, error) {
-	return p.git.GhPrApprovalCount(prNumber)
+func (p *githubPRProvider) CountApprovals(prNumber int, excludeLogin string) (int, error) {
+	return p.git.GhPrApprovalCount(prNumber, excludeLogin)
 }
 
 func (p *githubPRProvider) ChecksRollup(prNumber int) (string, bool, error) {

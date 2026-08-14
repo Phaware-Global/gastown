@@ -32,7 +32,10 @@ func (e *NeedsApprovalError) Error() string { return e.Detail }
 //	a) If cfg.PRApprover is non-empty, that specific user must have an
 //	   active APPROVED review.
 //	b) If cfg.GetPRRequiredApprovals() > 0, the count of distinct
-//	   approving reviewers must meet the threshold.
+//	   approving reviewers must meet the threshold. cfg.PRReviewer is
+//	   excluded from this count (see GhPrApprovalCount), so a review cast
+//	   under the review-loop identity — including the runbook's manual
+//	   stuck-PR remediation — can never satisfy this gate on its own.
 //
 // Under MergeStrategy="pr", config validation accepts an empty
 // PRApprover ONLY when the resolved count gate is zero — i.e.,
@@ -91,7 +94,7 @@ func VerifyPRApproval(provider PRProvider, cfg *MergeQueueConfig, prNumber int, 
 	}
 
 	if requiredApprovals > 0 {
-		count, err := provider.CountApprovals(prNumber)
+		count, err := provider.CountApprovals(prNumber, cfg.PRReviewer)
 		if err != nil {
 			return fmt.Errorf("failed to count approvals on PR #%d: %w", prNumber, err)
 		}

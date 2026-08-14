@@ -100,18 +100,28 @@ var validDispositions = map[string]string{
 // "APPROVE" — including from a payload built by a session that was prompt-
 // injected into requesting one.
 //
-// One-time migration concern: a clean/COMMENT round that follows a prior
-// REQUEST_CHANGES from this identity does NOT retract it — GitHub only folds
+// Recurring operational cost, not a one-time migration concern: a
+// clean/COMMENT round that follows a prior REQUEST_CHANGES from this
+// identity does NOT retract it — GitHub only folds
 // APPROVED/CHANGES_REQUESTED/DISMISSED into a reviewer's latest state, so a
 // COMMENTED review leaves the stale CHANGES_REQUESTED in place and the PR
-// stays blocked. GitHub's dismiss-review endpoint does not help either: on a
-// repo without branch protection it returns HTTP 200 and silently no-ops.
-// Clearing a PR stuck in this state requires a human operator to manually
-// post a superseding review under the Reviewer identity from outside any
-// automated Reviewer session (see "One-time remediation" in the Reviewer
-// runbook) — this package intentionally has no code path that does it
+// stays blocked. This is not limited to PRs predating this behavior: it is
+// the modal outcome of a working review loop — round 1 posts a high finding
+// -> REQUEST_CHANGES, the polecat fixes it, round 2 is clean -> COMMENT,
+// which does not retract round 1's verdict. Every PR that ever receives a
+// high finding lands here.
+//
+// Whether GitHub's dismiss-review endpoint could clear the stale verdict
+// in-band, without an APPROVE, is unverified in this codebase — no code
+// path here calls it. Clearing a PR stuck in this state today requires a
+// human operator to manually post a superseding review under the Reviewer
+// identity from outside any automated Reviewer session (see "One-time
+// remediation" in the Reviewer runbook for the current procedure and its
+// consequences) — this package intentionally has no code path that does it
 // automatically, because that path would be exactly the reachable-APPROVE
-// hatch this file exists to close.
+// hatch this file exists to close. GhPrApprovalCount (internal/git/git.go)
+// excludes the configured pr_reviewer login, so that superseding review can
+// never itself satisfy pr_required_approvals.
 func (fs *Findings) ReviewEvent() string {
 	if ev, ok := validDispositions[strings.ToLower(strings.TrimSpace(fs.Disposition))]; ok {
 		return ev
