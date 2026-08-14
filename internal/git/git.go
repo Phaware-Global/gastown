@@ -2280,19 +2280,7 @@ func (g *Git) GhPrApprovalCount(prNumber int, excludeLogin string) (int, error) 
 	if err != nil {
 		return 0, err
 	}
-	excludeLogin = strings.ToLower(excludeLogin)
-	// latest[user] = terminal state of that user's newest review
-	latest := make(map[string]string, len(reviews))
-	for _, r := range reviews {
-		login := strings.ToLower(r.Author.Login)
-		if login == "" || login == excludeLogin {
-			continue
-		}
-		switch r.State {
-		case "APPROVED", "CHANGES_REQUESTED", "DISMISSED":
-			latest[login] = r.State
-		}
-	}
+	latest := foldLatestReviewStates(reviews, excludeLogin)
 	count := 0
 	for _, state := range latest {
 		if state == "APPROVED" {
@@ -2300,6 +2288,29 @@ func (g *Git) GhPrApprovalCount(prNumber int, excludeLogin string) (int, error) 
 		}
 	}
 	return count, nil
+}
+
+// foldLatestReviewStates folds reviews (oldest→newest) into a per-user map
+// of that user's latest terminal review state, dropping the review author
+// whose login case-insensitively matches excludeLogin (pass "" for no
+// exclusion). Trims excludeLogin before comparing so a trailing/leading
+// space in configuration — which strings.EqualFold does not strip — can't
+// silently disable the exclusion the way a bare ToLower comparison would.
+func foldLatestReviewStates(reviews []ghReview, excludeLogin string) map[string]string {
+	excludeLogin = strings.TrimSpace(excludeLogin)
+	// latest[lowered login] = terminal state of that user's newest review
+	latest := make(map[string]string, len(reviews))
+	for _, r := range reviews {
+		login := r.Author.Login
+		if login == "" || strings.EqualFold(login, excludeLogin) {
+			continue
+		}
+		switch r.State {
+		case "APPROVED", "CHANGES_REQUESTED", "DISMISSED":
+			latest[strings.ToLower(login)] = r.State
+		}
+	}
+	return latest
 }
 
 // GhPrChangesRequestedReviewers returns the GitHub logins of every reviewer

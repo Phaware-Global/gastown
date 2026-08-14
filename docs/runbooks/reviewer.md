@@ -355,11 +355,16 @@ own login as an unintended approver:
 
 ```bash
 # Run from your own shell (not a Reviewer session). This sources the bot
-# token from the daemon env file rather than your own gh auth.
-set -a; . ~/gt/settings/daemon.env; set +a
-GH_TOKEN="$GT_REVIEWER_GITHUB_TOKEN" gh pr review <PR> --approve \
-  --repo <owner>/<repo> \
-  -b "Manual remediation for a stale Reviewer REQUEST_CHANGES — see docs/runbooks/reviewer.md#manual-remediation-clearing-a-stale-request_changes. Verified clean at <SHA>."
+# token from the daemon env file rather than your own gh auth. The subshell
+# scopes `set -a` so daemon.env's other exports (including Telegraph
+# secrets) don't leak into your interactive shell or any session launched
+# from it afterward.
+(
+  set -a; . ~/gt/settings/daemon.env; set +a
+  GH_TOKEN="$GT_REVIEWER_GITHUB_TOKEN" gh pr review <PR> --approve \
+    --repo <owner>/<repo> \
+    -b "Manual remediation for a stale Reviewer REQUEST_CHANGES — see docs/runbooks/reviewer.md#manual-remediation-clearing-a-stale-request_changes. Verified clean at <SHA>."
+)
 
 # Verify the pr_reviewer login's latest review state is no longer
 # CHANGES_REQUESTED:
@@ -378,9 +383,14 @@ a surprise:
   `pr_required_approvals` gate is still satisfied by a real human approver
   after running this procedure.
 - It is **not SHA-scoped**: `GhPrApprovalCount` never inspects the review's
-  commit, and these repos have no branch protection to dismiss it on a new
-  push. It persists across every subsequent push to the PR until superseded
-  by another terminal review from the same identity.
+  commit, so it persists across every subsequent push to the PR until
+  superseded by another terminal review from the same identity. Branch
+  protection does not dismiss it either — GitHub's native required-approvals
+  check has no knowledge of `GhPrApprovalCount`'s `pr_reviewer` exclusion. On
+  a rig configured per §1 (branch protection + required approvals), this
+  approval satisfies GitHub's own gate directly. The exclusion only closes
+  the counted-approval problem on gt's side; it relocates, rather than
+  removes, the risk on GitHub's.
 - The `CHANGES_REQUESTED` state it clears is not itself a `gt`-enforced merge
   gate — `ChangesRequestedReviewers`'s only caller,
   `reRequestBlockingReviewers`, is best-effort and non-gating. This procedure
