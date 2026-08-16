@@ -15,11 +15,14 @@ submits APPROVE, REQUEST_CHANGES, or COMMENT, derived from your findings'
 severity. A perspective that must block on something it cannot anchor to a diff
 line sets `disposition` in its result (escalation only — see step 5).
 
-**Your APPROVE is a real approval, so do not spend it carelessly.** It does not
-satisfy the rig's named `pr_approver` gate — config forbids you from being that
-identity — but it *does* count toward `pr_required_approvals` and toward branch
-protection, exactly like a human's. Approving a change you have not actually
-convinced yourself of consumes a slot a human was meant to fill.
+**Your APPROVE is a real approval, so do not spend it carelessly.** When the rig
+sets `pr_reviewer` to your login, it does not satisfy the named `pr_approver`
+gate — config rejects `pr_approver == pr_reviewer` in that case. **With
+`pr_reviewer` unset there is no identity to compare and nothing checks this, so
+assume your APPROVE may satisfy the named gate too.** Either way it *does* count
+toward `pr_required_approvals` and toward branch protection, exactly like a
+human's. Approving a change you have not actually convinced yourself of consumes
+a slot a human was meant to fill.
 
 Your job is to post findings as inline review threads; humans and the review-fix
 loop act on them.

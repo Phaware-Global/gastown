@@ -527,7 +527,7 @@ evaluates **two independent gates** and the Reviewer sits outside only one:
 
 | Gate | Mechanism | Reviewer's APPROVE |
 |---|---|---|
-| Named approver | `IsPRApprovedBy(pr, cfg.PRApprover)` | **Cannot satisfy it when `pr_reviewer` is configured.** Config validation forces `pr_approver != pr_reviewer` in that case, so the login never matches. An unset `pr_reviewer` isn't checked against `pr_approver` at all — there's no reviewer login to compare. `VerifyPRApproval` separately rejects the PR outright while any reviewer has an active CHANGES_REQUESTED verdict, independent of this gate. |
+| Named approver | `IsPRApprovedBy(pr, cfg.PRApprover)` | **Cannot satisfy it when `pr_reviewer` is configured.** Config validation forces `pr_approver != pr_reviewer` in that case, so the login never matches. An unset `pr_reviewer` isn't checked against `pr_approver` at all — there's no reviewer login to compare. `VerifyPRApproval` separately defers the merge while the rig's designated `pr_reviewer` or `pr_approver` has an active CHANGES_REQUESTED verdict, independent of this gate — and only on providers that can enumerate review states (GitHub can; Bitbucket returns `ErrUnsupported` and the check is skipped). A review from any other account is advisory: gating on it would let any GitHub user block the merge queue on a public repo. GitHub supersedes such a verdict only with an APPROVED or DISMISSED review from the same login — a follow-up COMMENT does not. |
 | Count | `CountApprovals(pr) >= pr_required_approvals` | **Counts.** `GhPrApprovalCount` folds every distinct login whose latest terminal state is APPROVED. There is no bot exclusion and no permission filter. |
 
 The same applies to GitHub branch-protection rules requiring N approving

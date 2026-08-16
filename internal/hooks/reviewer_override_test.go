@@ -36,7 +36,7 @@ func TestReviewerOverrideBlocksWriteSurfaces(t *testing.T) {
 		// name on the command line, so a name-only guard misses it. This role
 		// has no legitimate `gh api graphql` use at all (resolveReviewThread
 		// below is its only other GraphQL surface, and that's blocked too).
-		"gh api graphql",
+		"gh api*graphql",
 		"gh pr merge",
 		"git push",
 		"gt refinery pr",
@@ -71,6 +71,67 @@ func TestReviewerOverrideApplicableViaRigRole(t *testing.T) {
 	if !found {
 		t.Errorf("GetApplicableOverrides(gastown/reviewer) = %v, missing \"reviewer\"", got)
 	}
+}
+
+// TestReviewerOverride_BlocksRealGraphQLCommandStrings exercises the guards
+// against COMMAND STRINGS rather than against the matcher list.
+//
+// matcherCovers only asserts that some matcher contains a substring, which
+// cannot detect a matcher that is well-formed but positioned wrongly — and that
+// is exactly what happened: `Bash(*gh api graphql*)` required the endpoint to
+// follow `gh api` contiguously, so every flag-first invocation escaped all three
+// GraphQL guards while the suite stayed green.
+func TestReviewerOverride_BlocksRealGraphQLCommandStrings(t *testing.T) {
+	rev, ok := DefaultOverrides()["reviewer"]
+	if !ok {
+		t.Fatal("DefaultOverrides() has no \"reviewer\" entry")
+	}
+	for _, cmd := range []string{
+		`gh api graphql -f query='mutation { addPullRequestReview(input:{}) { id } }'`,
+		`gh api graphql --input mut.json`,
+		`gh api --input mut.json graphql`,
+		`gh api -H accept:application/json graphql`,
+		`gh api --method POST graphql -F query=@mut.graphql`,
+	} {
+		if !anyMatcherMatches(rev.PreToolUse, "Bash("+cmd+")") {
+			t.Errorf("reviewer override does not block %q", cmd)
+		}
+	}
+}
+
+// anyMatcherMatches reports whether any entry's glob matches the given tool
+// invocation string.
+func anyMatcherMatches(entries []HookEntry, invocation string) bool {
+	for _, e := range entries {
+		if globMatches(e.Matcher, invocation) {
+			return true
+		}
+	}
+	return false
+}
+
+// globMatches implements the `*`-only glob semantics the matcher strings use:
+// every literal segment must appear in order.
+func globMatches(pattern, s string) bool {
+	parts := strings.Split(pattern, "*")
+	pos := 0
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		idx := strings.Index(s[pos:], part)
+		if idx < 0 {
+			return false
+		}
+		if i == 0 && idx != 0 {
+			return false
+		}
+		pos += idx + len(part)
+	}
+	if last := parts[len(parts)-1]; last != "" && !strings.HasSuffix(s, last) {
+		return false
+	}
+	return true
 }
 
 func matcherCovers(entries []HookEntry, needle string) bool {

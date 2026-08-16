@@ -546,7 +546,14 @@ func DefaultOverrides() map[string]*HooksConfig {
 					// Keeps the two name matchers above as defense-in-depth
 					// against a non-`gh` transport (e.g. raw curl) that still
 					// carries the mutation name literally.
-					Matcher: "Bash(*gh api graphql*)",
+					//
+					// `*gh api*graphql*`, not `*gh api graphql*`: `gh api` is a
+					// cobra command with interspersed flags, so the endpoint
+					// need not follow it contiguously. `gh api --input mut.json
+					// graphql` and `gh api -H x:y graphql` are both valid and
+					// both escaped the contiguous form — along with all three
+					// GraphQL guards, since the mutation name is in the file.
+					Matcher: "Bash(*gh api*graphql*)",
 					Hooks: []Hook{{
 						Type:    "command",
 						Command: "echo '❌ BLOCKED: Reviewer has no legitimate use of `gh api graphql`. Reviews go through `gt reviewer post`; thread resolution belongs to the authoring polecat.' && exit 2",

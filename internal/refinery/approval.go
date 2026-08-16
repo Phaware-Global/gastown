@@ -89,23 +89,8 @@ func VerifyPRApproval(provider PRProvider, cfg *MergeQueueConfig, prNumber int, 
 		return fmt.Errorf("no MergeQueueConfig provided")
 	}
 
-	blocking, err := provider.ChangesRequestedReviewers(prNumber)
-	if err != nil && !errors.Is(err, ErrUnsupported) {
-		return fmt.Errorf("failed to check blocking reviews on PR #%d: %w", prNumber, err)
-	}
-	if len(blocking) > 0 {
-		if out != nil {
-			_, _ = fmt.Fprintf(out, "[Engineer] PR #%d has an active CHANGES_REQUESTED review from %s — deferring merge\n",
-				prNumber, strings.Join(blocking, ", "))
-		}
-		return &NeedsApprovalError{
-			PRNumber: prNumber,
-			Detail: fmt.Sprintf(
-				"PR #%d has an active CHANGES_REQUESTED review from %s; a subsequent review with "+
-					"a non-blocking disposition is required (there may be no unresolved threads to "+
-					"resolve — an unanchored objection doesn't create one)",
-				prNumber, strings.Join(blocking, ", ")),
-		}
+	if err := verifyNoBlockingReview(provider, cfg, prNumber, out); err != nil {
+		return err
 	}
 
 	approver := cfg.PRApprover
@@ -151,4 +136,90 @@ func VerifyPRApproval(provider PRProvider, cfg *MergeQueueConfig, prNumber int, 
 	}
 
 	return nil
+}
+
+// trustedBlockingReviewers filters CHANGES_REQUESTED logins down to the
+// identities this rig has actually designated for review.
+//
+// The unfiltered version was a denial-of-service on the town's only merge path.
+// GhPrChangesRequestedReviewers returns EVERY login whose newest terminal review
+// is CHANGES_REQUESTED, with no permission or identity filter, and on a public
+// repository any GitHub account can submit one. That account then blocks the
+// merge queue indefinitely, because only an APPROVED or DISMISSED review from
+// the same login supersedes it and no in-town actor can produce either on
+// someone else's behalf.
+//
+// Scoping to pr_reviewer and pr_approver keeps what the gate was added for — the
+// Reviewer's REQUEST_CHANGES, including the findings-free escalation that
+// creates no resolvable thread, must actually block — while making a stranger's
+// review advisory. It also restores the opt-out the unconditional form removed:
+// a rig that configures neither identity has no per-user gate, and this must not
+// invent one.
+func trustedBlockingReviewers(cfg *MergeQueueConfig, blocking []string) []string {
+	trusted := make(map[string]bool, 2)
+	for _, login := range []string{cfg.PRReviewer, cfg.PRApprover} {
+		if l := strings.ToLower(strings.TrimSpace(login)); l != "" {
+			trusted[l] = true
+		}
+	}
+	if len(trusted) == 0 {
+		return nil
+	}
+	var out []string
+	for _, login := range blocking {
+		if trusted[strings.ToLower(strings.TrimSpace(login))] {
+			out = append(out, login)
+		}
+	}
+	return out
+}
+
+// verifyNoBlockingReview defers the merge while a designated reviewer's newest
+// terminal review is CHANGES_REQUESTED.
+//
+// This gate exists because the Reviewer can now submit REQUEST_CHANGES, and
+// nothing else in the merge path looks at review STATE. Thread-based gating
+// misses it entirely: an unanchorable objection is delivered via `disposition`
+// with zero findings, so there are no unresolved threads, and both
+// VerifyReviewThreadsResolved and the review-fix loop read that as "ready to
+// advance" — the refinery would merge the PR the Reviewer had just blocked.
+//
+// The detail message states what actually clears the block, which is narrower
+// than it first appears: GitHub supersedes a CHANGES_REQUESTED review only with
+// an APPROVED or a DISMISSED one from the SAME login. A follow-up COMMENT does
+// not, so the Reviewer clears its own block by passing a later round cleanly
+// (ReviewEvent yields APPROVE with no findings and no disposition) and not by
+// posting anything else. Saying "a subsequent review with a non-blocking
+// disposition is required" was wrong on exactly that point and sent operators
+// after a remedy that cannot work.
+func verifyNoBlockingReview(provider PRProvider, cfg *MergeQueueConfig, prNumber int, out io.Writer) error {
+	blocking, err := provider.ChangesRequestedReviewers(prNumber)
+	if err != nil {
+		// ErrUnsupported means the provider cannot answer, not that nothing is
+		// blocking. Tolerating it keeps Bitbucket working, and the help text says
+		// so rather than presenting the block as universal.
+		if errors.Is(err, ErrUnsupported) {
+			return nil
+		}
+		return fmt.Errorf("failed to check blocking reviews on PR #%d: %w", prNumber, err)
+	}
+	blocking = trustedBlockingReviewers(cfg, blocking)
+	if len(blocking) == 0 {
+		return nil
+	}
+	who := strings.Join(blocking, ", ")
+	if out != nil {
+		_, _ = fmt.Fprintf(out, "[Engineer] PR #%d has an active CHANGES_REQUESTED review from %s — deferring merge\n",
+			prNumber, who)
+	}
+	return &NeedsApprovalError{
+		PRNumber: prNumber,
+		Detail: fmt.Sprintf(
+			"PR #%d has an active CHANGES_REQUESTED review from %s. GitHub supersedes it only with "+
+				"an APPROVED or DISMISSED review from that same login — a follow-up COMMENT does not. "+
+				"If the objection was unanchored there may be no threads to resolve, so the fix loop "+
+				"will not re-trigger a review on its own: push the fix and re-dispatch with "+
+				"`gt reviewer request %d --sha <new-head>`, or dismiss the review on GitHub.",
+			prNumber, who, prNumber),
+	}
 }

@@ -305,22 +305,24 @@ func TestVerifyPRApproval_OutputWriter_Nil_NoPanic(t *testing.T) {
 	}
 }
 
-// TestVerifyPRApproval_ChangesRequestedBlocksEvenWithNoGatesAndNoThreads
-// pins the HIGH: a `disposition: request_changes` escalation with no
-// anchorable findings produces zero inline review threads, so the
-// threads-count proxy used elsewhere in the patrol (AwaitReviewStep,
-// dispatch-review-fix) sees nothing to resolve and would report ready.
+// TestVerifyPRApproval_ChangesRequestedFromTheDesignatedReviewerBlocks pins the
+// HIGH this gate exists for: a `disposition: request_changes` escalation with no
+// anchorable findings produces zero inline review threads, so the threads-count
+// proxy used elsewhere in the patrol (AwaitReviewStep, dispatch-review-fix) sees
+// nothing to resolve and would report ready — and the refinery would merge the
+// PR the Reviewer had just blocked.
+//
 // The fake's ChangesRequestedReviewers is set directly — bypassing
-// Consolidate/ParseFindings/ReviewEvent entirely, the same discipline as
-// TestEngineer_LoadConfig_RejectsSameApproverAndReviewer — so this test
-// reaches the state a findings-routed test structurally cannot: zero
-// findings, zero threads, one blocking reviewer. Also uses a no-gates
-// config (mirrors TestVerifyPRApproval_NoGatesConfigured_ReturnsNil) to
-// prove this check is unconditional, not a third leg of the configured
-// approver/count gates.
-func TestVerifyPRApproval_ChangesRequestedBlocksEvenWithNoGatesAndNoThreads(t *testing.T) {
+// Consolidate/ParseFindings/ReviewEvent entirely — so this reaches the state a
+// findings-routed test structurally cannot: zero findings, zero threads, one
+// blocking reviewer.
+//
+// Note the config: the gate is scoped to pr_reviewer/pr_approver, NOT
+// unconditional. See the sibling test below for why.
+func TestVerifyPRApproval_ChangesRequestedFromTheDesignatedReviewerBlocks(t *testing.T) {
 	cfg := &MergeQueueConfig{
 		MergeStrategy:       "pr",
+		PRReviewer:          "reviewer-bot",
 		PRApprover:          "",
 		PRRequiredApprovals: intPtr(0),
 	}
@@ -341,6 +343,16 @@ func TestVerifyPRApproval_ChangesRequestedBlocksEvenWithNoGatesAndNoThreads(t *t
 	if !strings.Contains(err.Error(), "CHANGES_REQUESTED") {
 		t.Errorf("error should say CHANGES_REQUESTED, got %q", err.Error())
 	}
+	// The remediation has to be one that works. GitHub supersedes a
+	// CHANGES_REQUESTED review only with an APPROVED or DISMISSED one from the
+	// same login, so telling an operator that a "non-blocking disposition" clears
+	// it sent them after something impossible.
+	if !strings.Contains(err.Error(), "APPROVED or DISMISSED") {
+		t.Errorf("error must state what actually supersedes the block, got %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "non-blocking disposition is required") {
+		t.Error("error still advertises a remediation that cannot clear the block")
+	}
 	// The approver/count gates never even get a chance to run — a blocking
 	// reviewer short-circuits before them, same shape as the approver gate
 	// short-circuiting the count gate.
@@ -349,24 +361,85 @@ func TestVerifyPRApproval_ChangesRequestedBlocksEvenWithNoGatesAndNoThreads(t *t
 	}
 }
 
-// TestVerifyPRApproval_ChangesRequestedClearedBySupersedingReview is the
-// non-regression companion: once the blocking reviewer's most recent
-// review is no longer CHANGES_REQUESTED (ChangesRequestedReviewers, per
-// its documented contract, excludes a superseded verdict), the gate must
-// pass — this is how a findings-free block clears in practice: a
-// subsequent review with a non-blocking disposition, not thread
-// resolution.
-func TestVerifyPRApproval_ChangesRequestedClearedBySupersedingReview(t *testing.T) {
+// TestVerifyPRApproval_ChangesRequestedFromAStrangerDoesNotBlock is the reason
+// the gate above is scoped rather than unconditional.
+//
+// GhPrChangesRequestedReviewers returns every login whose newest terminal review
+// is CHANGES_REQUESTED, with no permission or identity filter. On a PUBLIC
+// repository any GitHub account can submit one — and since only an APPROVED or
+// DISMISSED review from that same login supersedes it, and no in-town actor can
+// produce either on someone else's behalf, an unconditional gate handed any
+// stranger an indefinite block on the town's only merge path.
+func TestVerifyPRApproval_ChangesRequestedFromAStrangerDoesNotBlock(t *testing.T) {
 	cfg := &MergeQueueConfig{
 		MergeStrategy:       "pr",
-		PRApprover:          "",
+		PRReviewer:          "reviewer-bot",
+		PRApprover:          "human-approver",
+		PRRequiredApprovals: intPtr(0),
+	}
+	// The approver gate itself is satisfied, so the only thing that can defer the
+	// merge here is the CHANGES_REQUESTED check under test.
+	provider := &fakePRProvider{
+		approvedBy:                map[string]bool{"human-approver": true},
+		changesRequestedReviewers: []string{"drive-by-stranger"},
+	}
+	if err := VerifyPRApproval(provider, cfg, 42, nil); err != nil {
+		t.Fatalf("a stranger's CHANGES_REQUESTED must not gate the merge queue, got %v", err)
+	}
+	// The designated approver still blocks — the scoping is about WHO, not about
+	// weakening the gate.
+	provider.changesRequestedReviewers = []string{"human-approver"}
+	if err := VerifyPRApproval(provider, cfg, 42, nil); err == nil {
+		t.Error("the designated approver's CHANGES_REQUESTED must still block")
+	}
+}
+
+// TestVerifyPRApproval_NoDesignatedIdentitiesMeansNoBlockingGate pins the
+// opt-out the unconditional form removed. A rig that configures neither
+// pr_reviewer nor pr_approver has deliberately opted out of per-user approval
+// gating ("gate on review-loop + threads alone"); this check must not invent one
+// on its behalf, least of all from an arbitrary account's review.
+func TestVerifyPRApproval_NoDesignatedIdentitiesMeansNoBlockingGate(t *testing.T) {
+	cfg := &MergeQueueConfig{
+		MergeStrategy:       "pr",
 		PRRequiredApprovals: intPtr(0),
 	}
 	provider := &fakePRProvider{
-		changesRequestedReviewers: nil, // superseded: no longer blocking
+		changesRequestedReviewers: []string{"anybody"},
 	}
 	if err := VerifyPRApproval(provider, cfg, 42, nil); err != nil {
-		t.Fatalf("expected nil once no reviewer is actively blocking, got %v", err)
+		t.Fatalf("a rig with no designated review identities must have no blocking gate, got %v", err)
+	}
+}
+
+// TestVerifyPRApproval_ChangesRequestedClearsWhenTheReviewerNoLongerBlocks
+// covers the clearing path.
+//
+// The previous version of this test configured no pr_reviewer and handed the
+// fake an empty blocking list, so it asserted "no blocking reviewer means no
+// block" — true before this gate existed and true after, and therefore unable to
+// detect any change to it. It also described the clearing mechanism wrongly: a
+// subsequent COMMENT review does NOT supersede a CHANGES_REQUESTED one. Only an
+// APPROVED or DISMISSED review from the same login does, which in practice means
+// the Reviewer passing a later round cleanly.
+//
+// This version drives the transition against a configured identity, so it fails
+// if the gate stops blocking or stops clearing.
+func TestVerifyPRApproval_ChangesRequestedClearsWhenTheReviewerNoLongerBlocks(t *testing.T) {
+	cfg := &MergeQueueConfig{
+		MergeStrategy:       "pr",
+		PRReviewer:          "reviewer-bot",
+		PRRequiredApprovals: intPtr(0),
+	}
+	provider := &fakePRProvider{changesRequestedReviewers: []string{"reviewer-bot"}}
+	if err := VerifyPRApproval(provider, cfg, 42, nil); err == nil {
+		t.Fatal("precondition: a designated reviewer's CHANGES_REQUESTED must block")
+	}
+	// A later APPROVED review from the same login supersedes it, so the provider
+	// no longer reports the login as blocking.
+	provider.changesRequestedReviewers = nil
+	if err := VerifyPRApproval(provider, cfg, 42, nil); err != nil {
+		t.Fatalf("expected nil once the reviewer no longer blocks, got %v", err)
 	}
 }
 

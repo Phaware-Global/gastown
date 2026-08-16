@@ -69,9 +69,12 @@ separation is actually checked rather than silently skipped). It DOES count
 toward the pr_required_approvals count gate and toward any branch-protection
 approval rule, exactly like a human's — GitHub's approval count has no notion of
 a bot. Size those gates accordingly, or the Reviewer's APPROVE fills a slot a
-human was meant to fill. Separately, an active CHANGES_REQUESTED verdict from
-any reviewer blocks merge outright via VerifyPRApproval, regardless of these
-gates or of unresolved-thread count.
+human was meant to fill. Separately, an active CHANGES_REQUESTED verdict from the
+rig's designated pr_reviewer or pr_approver blocks merge outright via
+VerifyPRApproval, regardless of these gates or of unresolved-thread count — on
+providers that can enumerate review states. GitHub can; Bitbucket cannot, and the
+check is skipped there. A review from any other account is advisory: gating on it
+would let any GitHub user block the merge queue on a public repo.
 
 The Reviewer never merges. Posting goes exclusively through ` + "`gt reviewer post`" + `;
 raw ` + "`gh pr review`" + ` is tap-guard-blocked.`,
