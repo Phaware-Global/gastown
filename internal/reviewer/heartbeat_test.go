@@ -144,7 +144,7 @@ func TestTouchDispatch_DoesNotClobberAnUnfinishedDifferentReview(t *testing.T) {
 	if err := TouchDispatch(rig, 100, 1, "sha100"); err != nil {
 		t.Fatal(err)
 	}
-	if err := TouchHeartbeat(rig, PhasePrompt, 100, 1, "sha100"); err != nil {
+	if err := TouchHeartbeat(rig, PhasePrompt); err != nil {
 		t.Fatal(err)
 	}
 
@@ -171,8 +171,10 @@ func TestTouchHeartbeat_CannotChangeIdentityOrReseedTheClock(t *testing.T) {
 
 	// The exploit this closes: the PR reaching in-session touches comes from the
 	// reviewer's own flags, and the reviewer is what the absolute cap exists to
-	// constrain. A mismatched --pr must not reseed the clock or rewrite identity.
-	if err := TouchHeartbeat(rig, PhasePrompt, 999, 7, "evil"); err != nil {
+	// constrain. TouchHeartbeat now takes no identity arguments at all — the
+	// hole is closed by the signature — so what remains to verify is that the
+	// existing identity and clock survive a phase advance intact.
+	if err := TouchHeartbeat(rig, PhasePrompt); err != nil {
 		t.Fatal(err)
 	}
 	hb := ReadHeartbeat(rig)
@@ -191,7 +193,7 @@ func TestTouchHeartbeat_WithoutADispatchLeavesElapsedUnknown(t *testing.T) {
 	rig := t.TempDir()
 	// No dispatch on record. A phase touch must not start a clock, or an
 	// in-session touch could establish one.
-	if err := TouchHeartbeat(rig, PhaseConsolidate, 5, 1, "s"); err != nil {
+	if err := TouchHeartbeat(rig, PhaseConsolidate); err != nil {
 		t.Fatal(err)
 	}
 	hb := ReadHeartbeat(rig)
@@ -203,6 +205,33 @@ func TestTouchHeartbeat_WithoutADispatchLeavesElapsedUnknown(t *testing.T) {
 	}
 	if hb.Elapsed() != 0 {
 		t.Errorf("Elapsed = %v, want 0 (unknown never trips the cap)", hb.Elapsed())
+	}
+	// Identity is withheld for the same reason the clock is. A marker that
+	// carried a PR would be treated as a review in flight by TouchDispatch and
+	// would then block every future seed for the rig — reachable from a single
+	// `gt reviewer prompt --pr 999999` run before any dispatch.
+	if hb.PR != 0 || hb.Round != 0 || hb.SHA != "" {
+		t.Errorf("a phase-only marker must carry no review identity: %+v", hb)
+	}
+}
+
+func TestTouchDispatch_OverwritesAPhaseOnlyMarker(t *testing.T) {
+	rig := t.TempDir()
+	// A marker written with no dispatch on record carries no clock. Deferring to
+	// it as "in flight" would wedge the dispatcher permanently: nothing clears a
+	// record whose PR matches no real review.
+	if err := TouchHeartbeat(rig, PhasePrompt); err != nil {
+		t.Fatal(err)
+	}
+	if err := TouchDispatch(rig, 176, 2, "sha176"); err != nil {
+		t.Fatalf("TouchDispatch over a phase-only marker = %v, want nil", err)
+	}
+	hb := ReadHeartbeat(rig)
+	if hb.PR != 176 || hb.Round != 2 {
+		t.Errorf("the real dispatch did not land: %+v", hb)
+	}
+	if hb.StartedAt.IsZero() {
+		t.Error("the real dispatch must start a clock")
 	}
 }
 
@@ -292,6 +321,67 @@ func TestWriteHeartbeat_UsesAFixedTempNameAndIsNotWorldReadable(t *testing.T) {
 	}
 }
 
+func TestWriteHeartbeat_DoesNotInheritAPlantedTempFilesMode(t *testing.T) {
+	rig := t.TempDir()
+	if err := TouchDispatch(rig, 1, 1, "s"); err != nil {
+		t.Fatal(err)
+	}
+	tmpName := HeartbeatPath(rig) + ".tmp"
+	// Any process in the rig can create this dotfile. os.WriteFile is
+	// O_CREATE|O_TRUNC, whose mode argument is IGNORED on an existing file — so a
+	// pre-created 0666 temp permanently downgraded the 0600 rule, with no code
+	// path that ever restored it.
+	if err := os.WriteFile(tmpName, []byte("x"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(tmpName, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := TouchDispatch(rig, 1, 2, "s"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(HeartbeatPath(rig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("heartbeat mode = %04o after a planted 0666 temp, want 0600", perm)
+	}
+}
+
+func TestWriteHeartbeat_RefusesToWriteThroughAPlantedSymlink(t *testing.T) {
+	rig := t.TempDir()
+	if err := TouchDispatch(rig, 1, 1, "s"); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(t.TempDir(), "victim")
+	const sentinel = "do not overwrite me"
+	if err := os.WriteFile(victim, []byte(sentinel), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A FIXED temp name is predictable, which is the price of the
+	// anti-accumulation property. Opened with O_CREATE|O_TRUNC it followed a
+	// symlink planted here, turning every subsequent heartbeat write into an
+	// arbitrary-path overwrite — and the rename then installed the symlink as the
+	// heartbeat, so later reads came from the attacker's file too.
+	if err := os.Symlink(victim, HeartbeatPath(rig)+".tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := TouchDispatch(rig, 1, 2, "s"); err != nil {
+		t.Fatalf("TouchDispatch = %v, want nil — a planted symlink must be swept, not fatal", err)
+	}
+	got, err := os.ReadFile(victim) //nolint:gosec // test-local path
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != sentinel {
+		t.Errorf("wrote through a planted symlink: victim now %q", got)
+	}
+	if hb := ReadHeartbeat(rig); hb == nil || hb.Round != 2 {
+		t.Errorf("the legitimate write did not land: %+v", hb)
+	}
+}
+
 func TestReadHeartbeatE_DistinguishesAbsentFromUnreadable(t *testing.T) {
 	rig := t.TempDir()
 
@@ -338,7 +428,7 @@ func TestTouchCheckout_NewPRStartsAFreshClock(t *testing.T) {
 	// The reviewer drains the queued request and checks out a DIFFERENT PR.
 	// Inheriting the frozen clock would put the new review instantly past the
 	// absolute-runtime cap and get it killed seconds after it started.
-	if err := TouchCheckout(rig, 200, "bbbb"); err != nil {
+	if err := TouchCheckout(rig, 200, 3, "bbbb"); err != nil {
 		t.Fatal(err)
 	}
 	hb := ReadHeartbeat(rig)
@@ -348,8 +438,74 @@ func TestTouchCheckout_NewPRStartsAFreshClock(t *testing.T) {
 	if hb.PR != 200 || hb.SHA != "bbbb" {
 		t.Errorf("identity not established: %+v", hb)
 	}
+	// Assert the clock was STARTED, not merely that it is not stale. Elapsed()
+	// returns 0 for a zero StartedAt, so a freshness bound alone passes just as
+	// happily when no clock exists — and "started_at omitted entirely" is one of
+	// the evasions this module was written to prevent, so the mutant that drops
+	// the field must fail here.
+	if hb.StartedAt.IsZero() {
+		t.Fatal("a new review must START a clock, not leave it unknown")
+	}
 	if el := hb.Elapsed(); el > time.Minute {
 		t.Errorf("Elapsed = %v, want ~0 — a new review must not inherit the previous one's clock", el)
+	}
+	// Round comes from the request. Dropping it loses the first-review/fix-round
+	// distinction in exactly the queued-behind-a-wedge case an operator is most
+	// likely to be investigating — and falsifies TouchDispatch's identical-
+	// re-request check, which compares Round exactly.
+	if hb.Round != 3 {
+		t.Errorf("Round = %d, want 3 — checkout is the only writer of a queued review's identity", hb.Round)
+	}
+}
+
+func TestTouchCheckout_InheritsRoundRatherThanWritingZero(t *testing.T) {
+	rig := t.TempDir()
+	if err := TouchDispatch(rig, 100, 4, "aaaa"); err != nil {
+		t.Fatal(err)
+	}
+	// No --round supplied. Writing a zero would make a later identical
+	// re-dispatch compare unequal and hand the in-flight review a fresh budget,
+	// which is the retry-loop-defeats-the-cap hole sameReview exists to close.
+	if err := TouchCheckout(rig, 200, 0, "bbbb"); err != nil {
+		t.Fatal(err)
+	}
+	if r := ReadHeartbeat(rig).Round; r != 4 {
+		t.Errorf("Round = %d, want the inherited 4 rather than a silent zero", r)
+	}
+}
+
+func TestTouchDispatch_IdenticalRerequestKeepsTheClock(t *testing.T) {
+	rig := t.TempDir()
+	if err := TouchDispatch(rig, 100, 1, "aaaa"); err != nil {
+		t.Fatal(err)
+	}
+	origin := ReadHeartbeat(rig).StartedAt
+	if origin.IsZero() {
+		t.Fatal("precondition: a dispatch must start a clock")
+	}
+	if err := TouchDispatch(rig, 100, 1, "aaaa"); err != nil {
+		t.Fatal(err)
+	}
+	if got := ReadHeartbeat(rig).StartedAt; !got.Equal(origin) {
+		t.Errorf("StartedAt = %v, want preserved %v — an identical retry must not hand out a fresh budget", got, origin)
+	}
+}
+
+func TestTouchDispatch_DoesNotInheritAZeroClock(t *testing.T) {
+	rig := t.TempDir()
+	// A phase-only marker has a zero StartedAt. An identical re-dispatch that
+	// inherited it would report "unknown" runtime for the whole review, so the
+	// absolute cap would never see a number at all.
+	if err := WriteHeartbeat(rig, &Heartbeat{
+		Timestamp: time.Now().UTC(), Phase: PhasePrompt, PR: 100, Round: 1, SHA: "aaaa",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := TouchDispatch(rig, 100, 1, "aaaa"); err != nil {
+		t.Fatal(err)
+	}
+	if ReadHeartbeat(rig).StartedAt.IsZero() {
+		t.Error("a dispatch must seed a real clock rather than inherit a marker's zero")
 	}
 }
 
@@ -363,7 +519,7 @@ func TestTouchCheckout_SamePRAdvancesWithoutResetting(t *testing.T) {
 	// Re-checking out the SAME review is an ordinary phase advance; resetting
 	// here would let a reviewer refresh its own runtime clock by re-running
 	// checkout in a loop.
-	if err := TouchCheckout(rig, 100, "aaaa"); err != nil {
+	if err := TouchCheckout(rig, 100, 1, "aaaa"); err != nil {
 		t.Fatal(err)
 	}
 	hb := ReadHeartbeat(rig)

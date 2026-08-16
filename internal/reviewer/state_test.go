@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/session"
 )
 
 func TestSafePhase_AllowlistsKnownPhasesOnly(t *testing.T) {
@@ -71,23 +73,31 @@ func TestSafePR_ClampsImplausibleValues(t *testing.T) {
 	}
 }
 
-func TestRuntime_PrefersTheUnforgeableClock(t *testing.T) {
-	// The session clock is owned by tmux and cannot be reset from inside the
-	// session, so it wins whenever it is known.
+func TestRuntime_IsAnchoredOnTheUnforgeableClock(t *testing.T) {
+	// FLOOR — closes the evasion. Deleting or zeroing the heartbeat reports
+	// elapsed 0, and the session clock keeps accruing underneath regardless.
 	if got := Runtime(0, 3*time.Hour); got != 3*time.Hour {
 		t.Errorf("Runtime = %v, want the session age when elapsed is forged to 0", got)
 	}
-	// The direction the old max() got wrong: a forged LARGE started_at must not
-	// be able to charge a young session for hours it never ran. Under max() this
-	// was a kill primitive — a rig-writable file could SIGKILL a healthy
-	// thirty-second-old reviewer's whole process tree on the next tick.
-	if got := Runtime(10*time.Hour, 5*time.Minute); got != 5*time.Minute {
-		t.Errorf("Runtime = %v, want the session age (%v) — a forged elapsed must not "+
-			"induce a kill", got, 5*time.Minute)
+	// CEILING — closes the forgery. Under the old max() a `started_at` of
+	// now-10h in a rig-writable file was on its own sufficient to SIGKILL a
+	// healthy five-minute-old reviewer's whole process tree on the next tick.
+	// The self-report may raise the number by at most SpawnGrace, the legitimate
+	// head start a dispatcher-seeded heartbeat has over its session.
+	if got, want := Runtime(10*time.Hour, 5*time.Minute), 5*time.Minute+SpawnGrace; got != want {
+		t.Errorf("Runtime = %v, want %v — a forged elapsed must not induce a kill", got, want)
 	}
-	// Only when the session clock is unavailable does the self-report apply.
-	if got := Runtime(90*time.Minute, 0); got != 90*time.Minute {
-		t.Errorf("Runtime = %v, want the heartbeat elapsed when the session age is unknown", got)
+	// Inside that window the self-report is honored, because it is the accurate
+	// one: the dispatcher seeds the heartbeat before the session exists.
+	if got := Runtime(12*time.Minute, 5*time.Minute); got != 12*time.Minute {
+		t.Errorf("Runtime = %v, want the dispatcher's legitimate head start preserved", got)
+	}
+	// NO session clock means no runtime rail at all. Falling back to the
+	// self-report was the last path by which a rig-writable file alone could
+	// authorize a kill, and without a working tmux query the kill cannot be
+	// carried out anyway.
+	if got := Runtime(90*time.Minute, 0); got != 0 {
+		t.Errorf("Runtime = %v, want 0 — a self-report must never authorize a cap on its own", got)
 	}
 	// Negative (future-dated) inputs must read as unknown, never as healthy.
 	if got := Runtime(-time.Hour, -time.Hour); got != 0 {
@@ -121,8 +131,14 @@ func TestPhaseAge_RejectsBothDirectionsOfNonsense(t *testing.T) {
 }
 
 // obs builds an Observation with a sensible default threshold.
+// A non-zero SessionAge by default: a live tmux session always has one, and
+// omitting it now means "no session clock", which is its own state.
 func obs(hb *Heartbeat, alive bool) Observation {
-	return Observation{Heartbeat: hb, SessionAlive: alive, StuckThreshold: DefaultStuckThreshold}
+	o := Observation{Heartbeat: hb, SessionAlive: alive, StuckThreshold: DefaultStuckThreshold}
+	if alive {
+		o.SessionAge = time.Minute
+	}
+	return o
 }
 
 func liveHB(phaseAge, elapsed time.Duration) *Heartbeat {
@@ -240,5 +256,186 @@ func TestState_DescribeIsPopulatedForEveryState(t *testing.T) {
 		if d := s.Describe(); d == "" || d == "unknown" {
 			t.Errorf("State(%d).Describe() = %q, want a real description", s, d)
 		}
+	}
+}
+
+func TestClassify_APersistentlyUnreadableHeartbeatIsNotAnExemption(t *testing.T) {
+	// Corrupting the heartbeat used to be a strictly BETTER evasion than deleting
+	// it: deletion hit the abandoned path, while ReadErr returned before the
+	// session, the phase, and the runtime were even consulted — an exemption from
+	// every rail, with no bound on how long it lasted. One garbage byte, rewritten
+	// in a loop, made a reviewer immortal and invisible to `gt reviewer status`.
+	boom := errors.New("malformed heartbeat")
+
+	// A transient error still costs nothing. It has to persist, with the observer
+	// watching, past the same window the missing case already uses.
+	transient := Observation{
+		ReadErr: boom, SessionAlive: true, StuckThreshold: DefaultStuckThreshold,
+		SessionAge:   DefaultStuckThreshold * AbsoluteCapMultiple * 2,
+		MissingKnown: true, MissingFor: time.Minute,
+	}
+	if got := Classify(transient); got != StateUnreadable {
+		t.Errorf("Classify = %v, want StateUnreadable inside the grace window", got)
+	}
+
+	// Past the window, with a live session older than the absolute cap, the
+	// session-anchored rail applies — it needs no heartbeat at all, which is
+	// exactly why it is the one a process owning the file cannot switch off.
+	persistent := transient
+	persistent.MissingFor = MissingGrace + time.Minute
+	if got := Classify(persistent); got != StateKillImminent {
+		t.Errorf("Classify = %v, want StateKillImminent — an unreadable heartbeat must not "+
+			"outrank the clock the reviewer does not own", got)
+	}
+
+	// But only the runtime rail. A young session past the window is still just
+	// unreadable: there is no evidence of a wedge, only of a bad file.
+	young := persistent
+	young.SessionAge = time.Minute
+	if got := Classify(young); got != StateUnreadable {
+		t.Errorf("Classify = %v, want StateUnreadable — a young session must not be killed "+
+			"for a corrupt file", got)
+	}
+
+	// And an unreadable heartbeat with no session is never actionable.
+	dead := persistent
+	dead.SessionAlive = false
+	if got := Classify(dead); got != StateUnreadable {
+		t.Errorf("Classify = %v, want StateUnreadable when there is no session to act on", got)
+	}
+}
+
+func TestClassify_NoSessionClockIsReportedRatherThanAbsorbed(t *testing.T) {
+	// Runtime returns 0 only when there is no session clock, and without one the
+	// absolute cap is not merely inaccurate — it is off. Reporting that as plain
+	// "working" hid both a failing tmux query and the likelier bug: a consumer
+	// that simply forgot to populate SessionAge, silently losing the only rail a
+	// looping reviewer cannot evade.
+	o := Observation{
+		Heartbeat: liveHB(time.Minute, time.Minute), SessionAlive: true,
+		StuckThreshold: DefaultStuckThreshold,
+	}
+	if got := Classify(o); got != StateUnanchored {
+		t.Errorf("Classify = %v, want StateUnanchored when no session clock is available", got)
+	}
+	// With a clock, the same reviewer is plainly working.
+	o.SessionAge = time.Minute
+	if got := Classify(o); got != StateWorking {
+		t.Errorf("Classify = %v, want StateWorking once the session clock is present", got)
+	}
+	// Unanchored is about the CAP only — the phase rails are unaffected.
+	stalled := Observation{
+		Heartbeat: liveHB(DefaultStuckThreshold+time.Minute, time.Minute), SessionAlive: true,
+		StuckThreshold: DefaultStuckThreshold,
+	}
+	if got := Classify(stalled); got != StateStalled {
+		t.Errorf("Classify = %v, want StateStalled — a missing session clock must not "+
+			"disable the phase rails too", got)
+	}
+}
+
+func TestClampStuckThreshold_IsAKillSwitchInBothDirections(t *testing.T) {
+	// reviewer.toml lives inside the rig and is agent-writable. A one-second
+	// threshold kills every reviewer on sight; a one-year threshold disables the
+	// reaper. Both are replaced by the default rather than clamped to the nearest
+	// bound: a value that far off is a mistake or an attack, not an intent worth
+	// approximating.
+	for _, bad := range []time.Duration{time.Second, 0, -time.Hour, 365 * 24 * time.Hour} {
+		got, adjusted := ClampStuckThreshold(bad)
+		if !adjusted {
+			t.Errorf("ClampStuckThreshold(%v) reported no adjustment", bad)
+		}
+		if got != DefaultStuckThreshold {
+			t.Errorf("ClampStuckThreshold(%v) = %v, want the default %v", bad, got, DefaultStuckThreshold)
+		}
+	}
+	// The bounds themselves are inclusive and pass through unchanged.
+	for _, ok := range []time.Duration{MinStuckThreshold, DefaultStuckThreshold, MaxStuckThreshold} {
+		got, adjusted := ClampStuckThreshold(ok)
+		if adjusted || got != ok {
+			t.Errorf("ClampStuckThreshold(%v) = %v adjusted=%v, want it preserved", ok, got, adjusted)
+		}
+	}
+	// The floor exists so the refinery's await-review escalation — which carries
+	// diagnostics a kill destroys — always fires before anything kills the session.
+	if MinStuckThreshold <= 30*time.Minute {
+		t.Errorf("MinStuckThreshold = %v, want it to exceed the default pr_review_timeout (30m)",
+			MinStuckThreshold)
+	}
+}
+
+func TestStuckThreshold_IsClampedAtTheSource(t *testing.T) {
+	// A defense every caller must remember to apply is one a caller will
+	// eventually forget — and the callers here turn this number into authority to
+	// SIGKILL a process tree. There is deliberately no way to obtain the raw
+	// value except by naming it.
+	rig := t.TempDir()
+	town := t.TempDir()
+	got := StuckThreshold(town, rig)
+	if clamped, _ := ClampStuckThreshold(got); clamped != got {
+		t.Errorf("StuckThreshold returned %v, which the clamp would still adjust", got)
+	}
+	if got < MinStuckThreshold || got > MaxStuckThreshold {
+		t.Errorf("StuckThreshold = %v, want it inside [%v, %v]", got, MinStuckThreshold, MaxStuckThreshold)
+	}
+}
+
+// withRegistry installs a prefix registry for the duration of a test.
+func withRegistry(t *testing.T, rigToPrefix map[string]string) {
+	t.Helper()
+	prev := session.DefaultRegistry()
+	r := session.NewPrefixRegistry()
+	for rig, prefix := range rigToPrefix {
+		r.Register(prefix, rig)
+	}
+	session.SetDefaultRegistry(r)
+	t.Cleanup(func() { session.SetDefaultRegistry(prev) })
+}
+
+func TestResolveSessionName_ResolvesAConfiguredRig(t *testing.T) {
+	withRegistry(t, map[string]string{"alpha": "al", "beta": "bt"})
+	got, err := ResolveSessionName("alpha", []string{"alpha", "beta"})
+	if err != nil {
+		t.Fatalf("ResolveSessionName = %v, want nil", err)
+	}
+	if want := session.ReviewerSessionName("al"); got != want {
+		t.Errorf("ResolveSessionName = %q, want %q", got, want)
+	}
+}
+
+func TestResolveSessionName_RefusesARigWithNoPrefixOfItsOwn(t *testing.T) {
+	withRegistry(t, map[string]string{"alpha": "al"})
+	// PrefixForRig falls back to DefaultPrefix for an unknown rig, so "beta"
+	// would silently run under the shared "gt-reviewer" namespace. For the reaper
+	// that is a cross-rig SIGKILL; for `gt reviewer stop` it is an operator
+	// killing a rig they did not name.
+	if _, err := ResolveSessionName("beta", []string{"alpha", "beta"}); err == nil {
+		t.Error("a rig with no beads.prefix must be refused, not guessed")
+	}
+}
+
+func TestResolveSessionName_RefusesAPeerAbsentFromTheRegistry(t *testing.T) {
+	// The gap the previous implementation had. Collisions were resolved from
+	// AllRigs(), which is populated only from rigs.json — so a rig ABSENT from
+	// rigs.json could never be detected as a collision partner, even though it
+	// gets the fallback prefix and therefore runs under literally "gt-reviewer".
+	// The refusal fired on the misconfigured rig and NOT on the correctly
+	// configured `beads.prefix = "gt"` rig sharing its session name.
+	withRegistry(t, map[string]string{"gastown": session.DefaultPrefix})
+	if _, err := ResolveSessionName("gastown", nil); err != nil {
+		t.Fatalf("precondition: a rig explicitly configured with the default prefix and no "+
+			"peers must resolve, got %v", err)
+	}
+	_, err := ResolveSessionName("gastown", []string{"gastown", "unregistered"})
+	if err == nil {
+		t.Error("a peer that is absent from rigs.json still produces gt-reviewer — the " +
+			"collision must be refused")
+	}
+}
+
+func TestResolveSessionName_RefusesASharedPrefix(t *testing.T) {
+	withRegistry(t, map[string]string{"alpha": "shared", "beta": "shared"})
+	if _, err := ResolveSessionName("alpha", []string{"alpha", "beta"}); err == nil {
+		t.Error("two rigs on one prefix produce one session name — the target is ambiguous")
 	}
 }

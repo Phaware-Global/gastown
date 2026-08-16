@@ -221,16 +221,28 @@ Two fields carry the load, and they answer different questions:
   `prompt` is the normal shape of a review in flight, not by itself evidence of
   a wedge.
 - **`started_at`** — when the review was dispatched, preserved across every
-  phase transition. `elapsed` measures total review wall time. Only the
-  dispatcher sets it, so an in-session phase touch cannot reseed the clock, and
-  it is reset whenever the `(pr, round, sha)` identity changes — round 2 of the
-  same PR is a new review with its own budget, not a continuation of round 1.
+  phase transition. `elapsed` measures total review wall time. It is reset
+  whenever the `(pr, round, sha)` identity changes — round 2 of the same PR is a
+  new review with its own budget, not a continuation of round 1.
+
+  An in-session **phase** touch cannot reseed it, and cannot set the review
+  identity either: `gt reviewer prompt`/`post`/`consolidate` update only
+  `timestamp` and `phase`. The one exception is `gt reviewer checkout`, which
+  starts a fresh clock when it checks out a PR other than the one on record —
+  the queued-behind-a-wedge case, where the dispatcher's seed was deliberately
+  withheld to preserve the incumbent's evidence.
 
   `elapsed` is a **self-reported lower bound, not a tamper-proof one.** A
   process that deletes or corrupts the heartbeat gets a fresh clock on its next
-  touch, and nothing in this file can prevent that. A supervisor needing an
-  unforgeable runtime bound must anchor on something the reviewed process does
-  not own — the tmux session's start time — and treat `elapsed` as a floor.
+  touch, and nothing in this file can prevent that — which is why the checkout
+  exception costs nothing. A supervisor needing an unforgeable runtime bound
+  anchors on something the reviewed process does not own — the tmux session's
+  start time — and admits `elapsed` only as a refinement inside the window that
+  clock already permits (`internal/reviewer.Runtime`). It is bounded above by
+  the session's age plus the spawn grace, so a forged `started_at` cannot
+  authorize a kill, and floored by the session's age, so deleting the file
+  cannot evade one. Where there is no session clock at all, there is no runtime
+  cap: a self-report never kills on its own.
 
 The heartbeat is seeded by `gt reviewer request` on the **dispatcher's** side,
 before the session exists, so a reviewer that is requested but never starts is

@@ -63,8 +63,12 @@ Read the request bead/mail to extract `<pr>`, the recorded head `<sha>`, and the
 1. **Checkout** the exact SHA you were asked to review — always pass `--sha`
    with the head SHA recorded in the request, never bare `checkout <pr>`:
    ```bash
-   {{ cmd }} reviewer checkout <pr> --sha <sha>
+   {{ cmd }} reviewer checkout <pr> --sha <sha> --round <round>
    ```
+   `--round` is telemetry only — it records which round this is in the heartbeat
+   so an operator investigating a stalled reviewer can tell a first review from a
+   fix round. It changes nothing about what you review.
+
    With `--sha` the worktree detaches at exactly that commit. Without it,
    checkout would detach at the PR's *current* head, which can drift if upstream
    moved — breaking the "review exactly the requested SHA" contract and the

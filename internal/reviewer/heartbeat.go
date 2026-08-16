@@ -55,8 +55,9 @@ type Heartbeat struct {
 	Timestamp time.Time `json:"timestamp"`
 
 	// StartedAt is when the review was dispatched. Preserved across every phase
-	// touch, so Elapsed() measures total review wall time. Only TouchDispatch
-	// sets it, so an in-session touch cannot reseed the clock.
+	// touch, so Elapsed() measures total review wall time. TouchDispatch sets it;
+	// TouchCheckout also does, but only when starting a review the dispatcher
+	// could not seed, and see Runtime for why that reset cannot move a cap.
 	//
 	// This is a self-reported lower bound, NOT a tamper-proof one: a process that
 	// deletes or corrupts this file gets a fresh clock on the next touch, and
@@ -158,11 +159,33 @@ func WriteHeartbeat(rigPath string, hb *Heartbeat) error {
 	// sweeps, in a directory operators are now told to inspect. A fixed name means
 	// the next write simply overwrites the debris.
 	tmpName := path + ".tmp"
+	// A fixed name is predictable, so it must NOT be opened with os.WriteFile:
+	// that is O_CREATE|O_TRUNC, which follows a symlink planted at the temp path
+	// (turning the next heartbeat write into an arbitrary-path overwrite) and
+	// ignores its mode argument on an existing file (so a pre-created 0666 file
+	// permanently defeats the 0600 rule below). Any process in the rig can
+	// create that dotfile — the same trust class the state.go header describes.
+	//
+	// O_EXCL refuses both: it fails on anything already at the path, symlink or
+	// not. Sweeping a stale tmp first with os.Remove keeps the anti-accumulation
+	// property the fixed name was chosen for — a SIGKILL mid-write leaves one
+	// file, and the next write clears it.
+	if err := os.Remove(tmpName); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing stale temp heartbeat: %w", err)
+	}
 	// 0600 matches internal/deacon/heartbeat.go and the rest of the rig's
 	// metadata. The contents (PR, round, head SHA, timings) are low-value but
 	// there is no reader that needs more: the reaper, `gt reviewer status`, and
 	// the operator all run as this user.
-	if err := os.WriteFile(tmpName, data, 0o600); err != nil {
+	f, err := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // path derived from trusted rig path
+	if err != nil {
+		return fmt.Errorf("creating temp heartbeat: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("writing temp heartbeat: %w", err)
+	}
+	if err := f.Close(); err != nil {
 		return fmt.Errorf("writing temp heartbeat: %w", err)
 	}
 	if err := os.Rename(tmpName, path); err != nil {
@@ -173,23 +196,30 @@ func WriteHeartbeat(rigPath string, hb *Heartbeat) error {
 
 // TouchHeartbeat records that the Reviewer has entered phase for the review
 // already on record. It updates only Timestamp and Phase — every identity field
-// (PR, round, SHA, origin, requester) and StartedAt are inherited unchanged.
+// (PR, round, SHA) and StartedAt are inherited unchanged.
 //
-// In-session touches deliberately CANNOT change the review identity or reseed
-// the clock. The PR number reaching these call sites comes from the reviewer
-// agent's own flags (`--pr` on prompt/post, the positional arg on checkout), and
-// the reviewer is the entity the absolute runtime cap exists to constrain. If a
-// mismatched PR reseeded StartedAt, a wedged or prompt-injected session could
-// zero its own kill clock with one `gt reviewer prompt --pr 999`. Only the
-// dispatcher, via TouchDispatch, establishes identity and starts the clock.
-func TouchHeartbeat(rigPath, phase string, pr, round int, sha string) error {
+// It takes no identity arguments, deliberately. In-session touches must not be
+// able to change the review identity or reseed the clock: the values reaching
+// these call sites come from the reviewer agent's own flags (`--pr` on
+// prompt/post), and the reviewer is the entity the absolute runtime cap exists
+// to constrain. Making the parameters absent rather than ignored means a future
+// caller cannot reintroduce the hole by passing them through. Only TouchDispatch
+// and TouchCheckout establish identity.
+func TouchHeartbeat(rigPath, phase string) error {
 	prev := ReadHeartbeat(rigPath)
 	if prev == nil {
-		// No dispatch on record. Write a phase-only marker with a ZERO StartedAt:
-		// Elapsed() then reports "unknown", which never trips the absolute cap.
-		// Seeding a clock here would let an in-session touch start one.
+		// No dispatch on record. Write a PHASE-ONLY marker: zero StartedAt, and
+		// zero identity. Elapsed() then reports "unknown", which never trips the
+		// absolute cap, and the marker cannot masquerade as a review.
+		//
+		// Identity is withheld for the same reason the clock is. `gt reviewer
+		// prompt --pr 999999` run with no heartbeat present used to plant PR
+		// 999999 here; TouchDispatch then saw a different PR "in flight" and
+		// refused to seed every subsequent real dispatch, while `done --pr <real>`
+		// refused to clear it because the PR did not match. One in-session command
+		// permanently reopened the dispatched-into-the-void blind spot.
 		return WriteHeartbeat(rigPath, &Heartbeat{
-			Timestamp: time.Now().UTC(), Phase: phase, PR: pr, Round: round, SHA: sha,
+			Timestamp: time.Now().UTC(), Phase: phase,
 		})
 	}
 	next := *prev
@@ -204,24 +234,37 @@ func TouchHeartbeat(rigPath, phase string, pr, round int, sha string) error {
 // This is the one in-session touch permitted to establish identity, and it
 // exists because skipping the dispatcher seed (which the wedged-session path
 // does, to preserve evidence the reaper needs) otherwise hands the next review
-// the previous one's frozen StartedAt — and the absolute-runtime rail then
-// kills a seconds-old review on sight.
+// the previous one's frozen StartedAt — and the phase rail then reports a
+// seconds-old review as stalled for its predecessor's lifetime.
 //
-// Allowing an agent-supplied PR to reset the clock was unsafe when Elapsed was
-// the only runtime signal. It is safe now: supervisors bound runtime by
-// max(Elapsed, tmux session age), and the session clock is owned by tmux, so a
-// reviewer resetting this file cannot outrun the cap. Checking out a different
-// PR is also unambiguous evidence that the reviewer moved on, unlike a bare
-// phase touch.
-func TouchCheckout(rigPath string, pr int, sha string) error {
+// What this reset can and cannot buy is worth stating precisely, because an
+// earlier version of this comment overstated it. StartedAt is a SELF-REPORT.
+// Supervisors anchor the absolute runtime cap on the tmux session's age, which
+// is owned by tmux and cannot be reset from inside the session (see Runtime), so
+// resetting this field does not move the cap in either direction — it moves the
+// phase clock and the operator-facing identity, which is all it is for. A
+// reviewer that alternates PR numbers therefore gains nothing on the rail that
+// constrains it.
+//
+// Round comes from the request payload rather than being dropped: this is the
+// only writer of a queued review's identity, and round is the field that
+// distinguishes a first review from a fix round — precisely what an operator
+// investigating a stalled reviewer needs. Round 0 (not supplied) inherits the
+// previous record's round rather than writing a zero, so TouchDispatch's
+// identical-re-request check is not silently falsified into handing out a fresh
+// budget.
+func TouchCheckout(rigPath string, pr, round int, sha string) error {
 	prev := ReadHeartbeat(rigPath)
 	if prev != nil && (pr == 0 || prev.PR == pr) {
 		// Same review (or no PR to compare): ordinary phase advance.
-		return TouchHeartbeat(rigPath, PhaseCheckout, pr, 0, sha)
+		return TouchHeartbeat(rigPath, PhaseCheckout)
+	}
+	if round == 0 && prev != nil {
+		round = prev.Round
 	}
 	now := time.Now().UTC()
 	hb := &Heartbeat{
-		Timestamp: now, StartedAt: now, Phase: PhaseCheckout, PR: pr, SHA: sha,
+		Timestamp: now, StartedAt: now, Phase: PhaseCheckout, PR: pr, Round: round, SHA: sha,
 	}
 	return WriteHeartbeat(rigPath, hb)
 }
@@ -257,7 +300,13 @@ func TouchDispatch(rigPath string, pr, round int, sha string) error {
 	// round or SHA of the SAME PR is a re-review that supersedes the round on
 	// record — the reviewer works one PR at a time, so there is nothing to
 	// preserve, and this is the path that must reset the clock.
-	if prev != nil && prev.PR != 0 && pr != 0 && prev.PR != pr {
+	//
+	// Deferring requires a record this function can corroborate. A zero StartedAt
+	// means no dispatcher ever seeded it, so it is a phase-only marker rather
+	// than a review in flight — deferring to one would let a record that carries
+	// no clock block every future seed for the rig, with no command able to clear
+	// it. Overwrite instead.
+	if prev != nil && !prev.StartedAt.IsZero() && prev.PR != 0 && pr != 0 && prev.PR != pr {
 		return ErrReviewInFlight
 	}
 	hb := &Heartbeat{

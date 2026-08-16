@@ -110,33 +110,50 @@ func SafePR(pr int) int {
 
 // Runtime is the wall time an absolute cap should act on.
 //
-// It prefers the tmux session's age, which the reviewed process does not own,
-// and falls back to the heartbeat's self-report only when the session clock is
-// unavailable.
+// The tmux session's age is the ONLY clock here that the reviewed process does
+// not own, so it is the only one allowed to authorize a kill. The heartbeat's
+// self-reported elapsed is admitted solely as a refinement WITHIN the window the
+// session clock already permits — it can raise the number by at most SpawnGrace,
+// the legitimate head start a dispatcher-seeded heartbeat has over its session,
+// and it can never lower it below the session's own age:
 //
-// It used to take the MAX of the two, which corroborated the cap in one
-// direction only. Deleting the heartbeat reports elapsed 0, so max() correctly
-// caught that evasion — but a forged LARGE started_at also wins a max(), which
-// made a rig-writable file sufficient to SIGKILL a healthy thirty-second-old
-// reviewer's whole process tree on the next tick. A clock that can be pushed
-// either way is not corroboration; it is two attack surfaces.
+//	runtime = max(sessionAge, min(elapsed, sessionAge+SpawnGrace))
 //
-// Preferring the session clock costs a little accuracy — a dispatcher-seeded
-// heartbeat legitimately predates its session by up to the spawn grace, and a
-// later round shares its predecessor's session — and that inaccuracy is why a
-// cap breach must nudge before it kills rather than acting on this number
-// alone. Accuracy is the right thing to trade away here: the failure mode of an
-// over-estimate is a nudge, and the failure mode of a forgeable clock is a kill.
+// Both bounds earn their place, and each closes a bug the other reopens:
 //
-// Zero means "unknown" and must never trip a cap.
+//   - The min bounds FORGERY. This function used to take a plain max, so a
+//     `started_at` of now-1000h in a rig-writable file was on its own sufficient
+//     to SIGKILL a healthy thirty-second-old reviewer's whole process tree on
+//     the next tick.
+//   - The max floor bounds EVASION. Deleting or zeroing the file reports elapsed
+//     0, so a min alone would let `rm heartbeat.json` in a loop clear the cap
+//     forever. The session clock keeps accruing underneath.
+//
+// A zero sessionAge means the session clock is UNAVAILABLE, not that the session
+// is new, and this returns 0 — "unknown" — rather than falling back to the
+// self-report. Falling back was the last path by which a rig-writable file alone
+// could authorize a kill, and the fallback bought little: without a working tmux
+// query the reaper cannot carry out the kill anyway, while the phase rails,
+// which are bounded separately by PhaseAge, still apply.
+//
+// The session clock deliberately OVER-estimates a later round's own wall time,
+// because rounds share a session (Manager.EnsureRunning is a no-op when one is
+// up). That inaccuracy is why a cap breach must nudge a still-progressing
+// reviewer before it kills, rather than acting on this number alone. It is the
+// right trade: the failure mode of an over-estimate is a nudge, and the failure
+// mode of a forgeable clock is a kill.
 func Runtime(elapsed, sessionAge time.Duration) time.Duration {
-	if sessionAge > 0 {
-		return sessionAge
+	if sessionAge <= 0 {
+		return 0
 	}
-	if elapsed > 0 {
-		return elapsed
+	claimed := elapsed
+	if claimed > sessionAge+SpawnGrace {
+		claimed = sessionAge + SpawnGrace
 	}
-	return 0
+	if claimed > sessionAge {
+		return claimed
+	}
+	return sessionAge
 }
 
 // PhaseAge validates a heartbeat's progress signal, reporting ok=false when it
@@ -165,25 +182,48 @@ func PhaseAge(hb *Heartbeat) (time.Duration, bool) {
 // session name "gt-reviewer". A consumer would then read rig A's heartbeat and
 // act on rig B's session — for the reaper that is a cross-rig SIGKILL, and for
 // `gt reviewer stop` it is an operator killing a rig they did not name.
-// Refusing an unresolved or shared prefix costs only coverage on a
-// misconfigured rig; guessing costs an unrelated rig's running review.
-func ResolveSessionName(rigName string) (string, error) {
+// Refusing an ambiguous name costs only coverage on a misconfigured rig;
+// guessing costs an unrelated rig's running review.
+//
+// peers is the caller's own list of rig names to check for collisions, and it
+// matters that it is a parameter. An earlier version resolved collisions from
+// session.DefaultRegistry().AllRigs(), which is populated only from rigs.json —
+// so a rig ABSENT from rigs.json could never be detected as a collision partner
+// even though PrefixForRig hands it the fallback prefix and it therefore runs
+// under literally "gt-reviewer". The refusal fired on the misconfigured rig and
+// not on the correctly-configured `beads.prefix = "gt"` rig sharing its session
+// name — exactly backwards. Passing the caller's rig list (the daemon already
+// enumerates one) covers rigs the registry never learned about. An empty peers
+// list means "no other rigs to disambiguate against", not "checks disabled":
+// the DefaultPrefix rule below still applies.
+func ResolveSessionName(rigName string, peers []string) (string, error) {
 	prefix := session.PrefixFor(rigName)
 	if prefix == "" {
 		return "", fmt.Errorf("rig %q has no session prefix", rigName)
 	}
-	all := session.DefaultRegistry().AllRigs()
-	if prefix == session.DefaultPrefix && all[rigName] != session.DefaultPrefix {
+	name := session.ReviewerSessionName(prefix)
+	registered := session.DefaultRegistry().AllRigs()
+	if prefix == session.DefaultPrefix && registered[rigName] != session.DefaultPrefix {
 		return "", fmt.Errorf("rig %q has no beads.prefix and would collapse onto the shared %q session namespace",
 			rigName, session.DefaultPrefix)
 	}
-	for other, p := range all {
-		if other != rigName && p == prefix {
-			return "", fmt.Errorf("rig %q shares session prefix %q with rig %q — target is ambiguous",
-				rigName, prefix, other)
+	// Compare resolved NAMES, not prefixes. Two rigs collide precisely when they
+	// produce the same tmux session, and a rig missing from the registry produces
+	// one via the same fallback that makes it invisible in the prefix map.
+	seen := make(map[string]bool, len(peers)+len(registered))
+	for _, p := range peers {
+		seen[p] = true
+	}
+	for r := range registered {
+		seen[r] = true
+	}
+	for other := range seen {
+		if other != rigName && session.ReviewerSessionName(session.PrefixFor(other)) == name {
+			return "", fmt.Errorf("rig %q shares reviewer session %q with rig %q — target is ambiguous",
+				rigName, name, other)
 		}
 	}
-	return session.ReviewerSessionName(prefix), nil
+	return name, nil
 }
 
 // Grace windows. These are shared so the CLI never reports a state the reaper
@@ -223,6 +263,12 @@ const (
 	StateAbandoned
 	// StateWorking: session up, heartbeat progressing.
 	StateWorking
+	// StateUnanchored: session up and the phase clock looks healthy, but there is
+	// no session clock, so the absolute runtime cap cannot be enforced at all.
+	// Distinguished from StateWorking because it is the shape of a consumer that
+	// forgot to populate SessionAge as much as it is a failing tmux query, and in
+	// either case the rail a looping reviewer cannot evade is switched off.
+	StateUnanchored
 	// StateStalled: past the stuck threshold — the reaper nudges here.
 	StateStalled
 	// StateKillImminent: past the kill threshold or the runtime cap.
@@ -247,6 +293,8 @@ func (s State) Describe() string {
 		return "abandoned — session up with no review on record; self-termination may have failed"
 	case StateWorking:
 		return "working"
+	case StateUnanchored:
+		return "working — but no session clock is available, so the absolute runtime cap is not being enforced"
 	case StateStalled:
 		return "stalled — past the stuck threshold; the reaper will nudge"
 	case StateKillImminent:
@@ -263,14 +311,23 @@ type Observation struct {
 	ReadErr error
 	// SessionAlive reports whether the rig's reviewer tmux session exists.
 	SessionAlive bool
-	// SessionAge is how long that session has existed; 0 means unknown.
+	// SessionAge is how long that session has existed; 0 means unknown. A live
+	// session is never genuinely zero seconds old at observation time, so this
+	// needs no companion known-flag — but see StateUnanchored, which is how
+	// "unknown" is surfaced rather than silently absorbed.
 	SessionAge time.Duration
-	// MissingFor is how long the observer has seen NO heartbeat; 0 with
-	// MissingKnown false means the observer has not been watching.
+	// MissingFor is how long the observer has seen NO USABLE heartbeat — absent
+	// OR unreadable; 0 with MissingKnown false means the observer has not been
+	// watching.
 	//
 	// Measured from first observation rather than from session creation on
 	// purpose: the latter makes deleting heartbeat.json an instant kill switch
 	// for any session older than MissingGrace.
+	//
+	// Unreadable shares this clock rather than getting its own because "cannot be
+	// parsed" and "is not there" are the same thing to every rail: neither yields
+	// a phase, a clock, or an identity. Keeping them on one timer is also what
+	// makes corrupting the file no better an evasion than deleting it.
 	MissingFor   time.Duration
 	MissingKnown bool
 	// StuckThreshold is the rig's configured (and clamped) stall threshold.
@@ -284,6 +341,27 @@ type Observation struct {
 // intervening — should be testable without a live town.
 func Classify(o Observation) State {
 	if o.ReadErr != nil {
+		// An unreadable heartbeat used to be an UNBOUNDED exemption from every
+		// rail: it returned here before the session, the phase, and the runtime
+		// were even consulted, so corrupting the file with one byte was a strictly
+		// better evasion than deleting it — deletion was caught by the abandoned
+		// path, corruption by nothing, forever.
+		//
+		// Time-bound it exactly as the missing case is bounded. A transient I/O
+		// error or a torn read still costs nothing: it has to persist, with the
+		// observer watching, past the same grace window before anything escalates.
+		if !o.SessionAlive || !o.MissingKnown || o.MissingFor < MissingGrace {
+			return StateUnreadable
+		}
+		// Past the window there is no usable heartbeat and there IS a live
+		// session, so fall through to the one rail that needs no heartbeat at all.
+		// Runtime(0, SessionAge) is the session-anchored bound, which is precisely
+		// the clock a process that owns the file cannot touch.
+		if o.StuckThreshold > 0 {
+			if rt := Runtime(0, o.SessionAge); rt > 0 && rt >= o.StuckThreshold*AbsoluteCapMultiple {
+				return StateKillImminent
+			}
+		}
 		return StateUnreadable
 	}
 	hb := o.Heartbeat
@@ -327,6 +405,12 @@ func Classify(o Observation) State {
 				return StateStalled
 			}
 		}
+		// Healthy on the phase rail — but say so honestly. Runtime returns 0 only
+		// when there is no session clock, and without one the cap is not merely
+		// inaccurate, it is off.
+		if runtime == 0 {
+			return StateUnanchored
+		}
 	}
 	return StateWorking
 }
@@ -364,15 +448,28 @@ const (
 )
 
 // StuckThreshold resolves a rig's configured stall threshold from its role
-// definition, falling back to DefaultStuckThreshold.
+// definition, ALREADY CLAMPED, falling back to DefaultStuckThreshold.
 //
 // The single source for the configured value. The daemon reaper, the
 // dispatch-time wedge check, and `gt reviewer status` all call it, so "the
 // reaper would kill this session", "dispatch should recycle this session", and
 // "the CLI says it is stalled" can never drift into three different numbers.
-// Callers that ACT on it must pass the result through ClampStuckThreshold —
-// reviewer.toml is agent-writable.
+//
+// The clamp is applied HERE rather than left to each caller. reviewer.toml lives
+// inside the rig and is agent-writable, so the value is a kill switch in both
+// directions — and a defense every caller must remember to apply is one a caller
+// will eventually forget. There is now no way to obtain the raw value except by
+// asking for it explicitly via StuckThresholdRaw, which exists only so the
+// operator warning can name what was rejected.
 func StuckThreshold(townRoot, rigPath string) time.Duration {
+	clamped, _ := ClampStuckThreshold(StuckThresholdRaw(townRoot, rigPath))
+	return clamped
+}
+
+// StuckThresholdRaw returns a rig's configured stall threshold UNCLAMPED. Only
+// for reporting: pair it with ClampStuckThreshold to tell an operator which
+// value was rejected and what replaced it. Never act on this directly.
+func StuckThresholdRaw(townRoot, rigPath string) time.Duration {
 	def, err := config.LoadRoleDefinition(townRoot, rigPath, constants.RoleReviewer)
 	if err != nil || def == nil || def.Health.StuckThreshold.Duration <= 0 {
 		return DefaultStuckThreshold
