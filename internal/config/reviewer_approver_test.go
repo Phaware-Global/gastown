@@ -63,3 +63,35 @@ func TestValidateMergeQueue_EmptyReviewerDoesNotTripTheCheck(t *testing.T) {
 		t.Errorf("both empty (approval opt-out) must not trip the equality check: %v", err)
 	}
 }
+
+// TestValidateMergeQueue_EmptyReviewerIsAKnownGapNotAGuarantee documents,
+// deliberately, a known limitation rather than letting it pass as
+// unremarked-on intended behavior: the pr_approver != pr_reviewer check is a
+// proxy comparison between two config strings, not a check against the
+// Reviewer's actual identity. On a rig that provisions the Reviewer through
+// the standalone (no-MR) request path — where pr_reviewer is legitimately
+// left unset because the merge-queue engagement gate it drives doesn't apply
+// — nothing stops an operator from setting pr_approver to the Reviewer's own
+// machine-user login. This config loads cleanly and, per
+// docs/design/reviewer-role.md's "Approval semantics" table, the Reviewer's
+// own clean-pass APPROVE would then satisfy VerifyPRApproval's named-approver
+// gate: the exact self-approval this whole invariant exists to prevent,
+// just reached through the one state (pr_reviewer empty) the string
+// comparison can't examine.
+//
+// Closing this for real means recording the Reviewer's login independently
+// of the engagement-gate field (pr_reviewer is a hint for AwaitReviewStep,
+// not an identity registry) — out of scope for this fix. Until then, an
+// operator running the standalone Reviewer must not also name it as
+// pr_approver; this test exists so that limit is asserted and visible in
+// the suite rather than silently relied upon.
+func TestValidateMergeQueue_EmptyReviewerIsAKnownGapNotAGuarantee(t *testing.T) {
+	reviewerLogin := "phaware-val"
+	if err := validateMergeQueueConfig(prConfig(reviewerLogin, "")); err != nil {
+		t.Fatalf("known gap: pr_approver naming the Reviewer's own login with "+
+			"pr_reviewer unset currently loads without error (nothing can check "+
+			"it — see this test's comment); validateMergeQueueConfig now returns "+
+			"%v, so either the gap was closed (update this test to assert the new "+
+			"rejection) or something else regressed", err)
+	}
+}
