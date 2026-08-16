@@ -3,6 +3,7 @@ package reviewer
 import (
 	"encoding/json"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -216,9 +217,16 @@ func TestSchemaExamplesDoNotSeedAnActionableDisposition(t *testing.T) {
 	//
 	// Two things this guard gets right that a naive version does not:
 	//
-	//  1. It is scoped to the ```json fences. The hazard is a literal inside the
-	//     SCHEMA a pass copies; surrounding prose legitimately quotes concrete
-	//     values while instructing the pass when to use them.
+	//  1. It is bound to the JSON key/value shape, not to a fence label. An
+	//     earlier version scoped the scan to ```json fenced blocks; that missed
+	//     the same literal under a relabelled (```), differently-labelled
+	//     (```JSON) or unfenced/indented example, and — because nothing
+	//     asserted a block had actually been found — passed green while
+	//     inspecting nothing. Scanning the whole body for the key/value pattern
+	//     and requiring at least one match removes both blind spots: the value
+	//     is caught regardless of its surrounding fence, and a structural
+	//     regression that stops matching entirely is itself a test failure
+	//     rather than a silent skip.
 	//  2. It normalizes the value the way dispositionRank does. A byte-exact
 	//     blacklist is spelling-sensitive while the parser lowercases and trims,
 	//     so `"Comment"` or `" comment "` would re-seed an actionable value and
@@ -231,20 +239,14 @@ func TestSchemaExamplesDoNotSeedAnActionableDisposition(t *testing.T) {
 		if err != nil {
 			t.Fatalf("reading %s: %v", path, err)
 		}
-		body := string(data)
-		// The field must still be documented, or the escalation path has no
-		// producer — the fix for one finding must not undo the fix for another.
-		if !strings.Contains(body, `"disposition"`) {
-			t.Errorf("%s no longer documents `disposition` — the escalation path needs a producer", path)
+		values := dispositionValues(string(data))
+		if len(values) == 0 {
+			t.Errorf("%s does not contain a `disposition` example — the escalation path needs a producer", path)
 			continue
 		}
-		for _, block := range jsonBlocks(body) {
-			v, ok := jsonStringValue(block, "disposition")
-			if !ok {
-				continue
-			}
+		for _, v := range values {
 			if dispositionRank(v) != 0 {
-				t.Errorf("%s schema block sets disposition to the actionable value %q; "+
+				t.Errorf("%s schema sets disposition to the actionable value %q; "+
 					"a pass copying the schema would post a false verdict — use a "+
 					"self-describing placeholder", path, v)
 			}
@@ -252,23 +254,21 @@ func TestSchemaExamplesDoNotSeedAnActionableDisposition(t *testing.T) {
 	}
 }
 
-// jsonBlocks returns the contents of every ```json fenced block in s.
-func jsonBlocks(s string) []string {
-	var out []string
-	rest := s
-	for {
-		i := strings.Index(rest, "```json")
-		if i < 0 {
-			return out
-		}
-		rest = rest[i+len("```json"):]
-		j := strings.Index(rest, "```")
-		if j < 0 {
-			return out
-		}
-		out = append(out, rest[:j])
-		rest = rest[j+3:]
+// dispositionValuePattern matches every `"disposition": "<value>"` occurrence
+// regardless of surrounding fence label, indentation, or whether it is fenced
+// at all — the earlier ```json-scoped scan went silently vacuous under a
+// fence rename because nothing asserted it had matched anything.
+var dispositionValuePattern = regexp.MustCompile(`"disposition"\s*:\s*"([^"]*)"`)
+
+// dispositionValues extracts every `disposition` value from s via
+// dispositionValuePattern.
+func dispositionValues(s string) []string {
+	matches := dispositionValuePattern.FindAllStringSubmatch(s, -1)
+	out := make([]string, 0, len(matches))
+	for _, m := range matches {
+		out = append(out, m[1])
 	}
+	return out
 }
 
 // jsonStringValue extracts a `"key": "value"` string from a JSON-ish block,
@@ -313,9 +313,21 @@ func TestSchemaGuard_CatchesCaseAndSpacingVariants(t *testing.T) {
 			t.Errorf("%s: value %q must be recognized as actionable", block, v)
 		}
 	}
-	// The shipped placeholder must NOT trip it.
-	v, ok := jsonStringValue(`{"disposition": "<omit if you completed the pass; REQUIRED if truncated>"}`, "disposition")
-	if !ok || dispositionRank(v) != 0 {
-		t.Errorf("the placeholder must not be actionable, got %q", v)
+	// The shipped placeholder must NOT trip it. Read it out of the real
+	// template via the same extraction TestSchemaExamplesDoNotSeedAnActionableDisposition
+	// uses, rather than retyping it here — a prior version hardcoded a string
+	// ("<omit if you completed the pass; REQUIRED if truncated>") that appears
+	// nowhere in the repo, so this half of the guard exercised a placeholder
+	// that isn't shipped instead of the one that is.
+	data, err := os.ReadFile("prompt/execution.md.tmpl")
+	if err != nil {
+		t.Fatalf("reading prompt/execution.md.tmpl: %v", err)
+	}
+	values := dispositionValues(string(data))
+	if len(values) == 0 {
+		t.Fatal("prompt/execution.md.tmpl has no `disposition` example to check")
+	}
+	if dispositionRank(values[0]) != 0 {
+		t.Errorf("the shipped placeholder %q must not be actionable", values[0])
 	}
 }
