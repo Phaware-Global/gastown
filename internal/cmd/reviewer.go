@@ -61,12 +61,17 @@ identity.
 The Reviewer submits a real verdict — APPROVE, REQUEST_CHANGES, or COMMENT —
 derived from finding severity, or escalated by a perspective's disposition.
 
-Scope of that approval: it does NOT satisfy the named pr_approver gate, because
-config validation requires pr_approver and pr_reviewer to be different
-identities. It DOES count toward the pr_required_approvals count gate and toward
-any branch-protection approval rule, exactly like a human's — GitHub's approval
-count has no notion of a bot. Size those gates accordingly, or the Reviewer's
-APPROVE fills a slot a human was meant to fill.
+Scope of that approval: when pr_reviewer is configured, it does NOT satisfy the
+named pr_approver gate, because config validation requires pr_approver and
+pr_reviewer to be different identities in that case (an unset pr_reviewer isn't
+compared against pr_approver at all — set it if the Reviewer is in use, so the
+separation is actually checked rather than silently skipped). It DOES count
+toward the pr_required_approvals count gate and toward any branch-protection
+approval rule, exactly like a human's — GitHub's approval count has no notion of
+a bot. Size those gates accordingly, or the Reviewer's APPROVE fills a slot a
+human was meant to fill. Separately, an active CHANGES_REQUESTED verdict from
+any reviewer blocks merge outright via VerifyPRApproval, regardless of these
+gates or of unresolved-thread count.
 
 The Reviewer never merges. Posting goes exclusively through ` + "`gt reviewer post`" + `;
 raw ` + "`gh pr review`" + ` is tap-guard-blocked.`,

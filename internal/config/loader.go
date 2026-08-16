@@ -363,6 +363,12 @@ func validateMergeQueueConfig(c *MergeQueueConfig) error {
 		// machine-user login into both fields would let the bot satisfy the
 		// named-approver gate and merge with zero human review. Enforce it here
 		// so the guarantee holds by construction rather than by convention.
+		//
+		// Requires PRReviewer non-empty: an unset pr_reviewer means "no
+		// reviewer identity configured," not "confirmed distinct from
+		// pr_approver" — this comparison simply doesn't apply to that state.
+		// It is not evidence of separation, just the absence of a second
+		// identity to compare against.
 		if c.PRApprover != "" && c.PRReviewer != "" &&
 			strings.EqualFold(strings.TrimSpace(c.PRApprover), strings.TrimSpace(c.PRReviewer)) {
 			return fmt.Errorf("pr_approver and pr_reviewer must be different identities "+
