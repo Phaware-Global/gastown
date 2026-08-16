@@ -510,9 +510,14 @@ direct-merge assumption. Convergence:
   (polecat pushes / refinery PR creation) differs from the reviewer identity,
   GitHub accepts the review normally.
 - The machine user must NOT be the `pr_approver` and must not have merge
-  rights on protected branches. This is **enforced**, not conventional:
-  `validateMergeQueueConfig` rejects `pr_approver == pr_reviewer` (case-
-  insensitive). Branch protection is the backstop to tap-guard.
+  rights on protected branches. This is **enforced when both fields are
+  configured**, not conventional: `validateMergeQueueConfig` (write time)
+  and `Engineer.LoadConfig` (runtime read path) both reject
+  `pr_approver == pr_reviewer` (case-insensitive). An **unset** `pr_reviewer`
+  skips this comparison entirely — that's a different state ("no reviewer
+  identity configured") from "checked and confirmed distinct," not
+  equivalent to it, even though both currently pass validation. Branch
+  protection is the backstop to tap-guard.
 
 ### Approval semantics
 
@@ -522,7 +527,7 @@ evaluates **two independent gates** and the Reviewer sits outside only one:
 
 | Gate | Mechanism | Reviewer's APPROVE |
 |---|---|---|
-| Named approver | `IsPRApprovedBy(pr, cfg.PRApprover)` | **Cannot satisfy it.** Config validation forces `pr_approver != pr_reviewer`, so the login never matches. |
+| Named approver | `IsPRApprovedBy(pr, cfg.PRApprover)` | **Cannot satisfy it when `pr_reviewer` is configured.** Config validation forces `pr_approver != pr_reviewer` in that case, so the login never matches. An unset `pr_reviewer` isn't checked against `pr_approver` at all — there's no reviewer login to compare. `VerifyPRApproval` separately rejects the PR outright while any reviewer has an active CHANGES_REQUESTED verdict, independent of this gate. |
 | Count | `CountApprovals(pr) >= pr_required_approvals` | **Counts.** `GhPrApprovalCount` folds every distinct login whose latest terminal state is APPROVED. There is no bot exclusion and no permission filter. |
 
 The same applies to GitHub branch-protection rules requiring N approving

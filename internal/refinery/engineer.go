@@ -771,6 +771,10 @@ func (e *Engineer) LoadConfig() error {
 		// time (loader.go's validateMergeQueueConfig), or an externally
 		// edited config.json bypasses it entirely and the bot can satisfy
 		// its own approval gate.
+		//
+		// Requires PRReviewer non-empty: an unset pr_reviewer means "no
+		// reviewer identity configured," not "confirmed distinct from
+		// pr_approver" — mirrors loader.go's identical caveat.
 		if e.config.PRApprover != "" && e.config.PRReviewer != "" &&
 			strings.EqualFold(strings.TrimSpace(e.config.PRApprover), strings.TrimSpace(e.config.PRReviewer)) {
 			return fmt.Errorf("pr_approver and pr_reviewer must be different identities "+
