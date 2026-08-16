@@ -458,19 +458,21 @@ func TestTouchCheckout_NewPRStartsAFreshClock(t *testing.T) {
 	}
 }
 
-func TestTouchCheckout_InheritsRoundRatherThanWritingZero(t *testing.T) {
+func TestTouchCheckout_DoesNotStampAnotherReviewsRound(t *testing.T) {
 	rig := t.TempDir()
 	if err := TouchDispatch(rig, 100, 4, "aaaa"); err != nil {
 		t.Fatal(err)
 	}
-	// No --round supplied. Writing a zero would make a later identical
-	// re-dispatch compare unequal and hand the in-flight review a fresh budget,
-	// which is the retry-loop-defeats-the-cap hole sameReview exists to close.
+	// Reaching the reset path guarantees the record on file belongs to a
+	// DIFFERENT review, so there is no round here worth inheriting. An earlier
+	// version copied prev.Round, which stamped PR 100's round onto PR 200 — worse
+	// than absent, because a wrong round reads as authoritative to the operator
+	// it exists to inform.
 	if err := TouchCheckout(rig, 200, 0, "bbbb"); err != nil {
 		t.Fatal(err)
 	}
-	if r := ReadHeartbeat(rig).Round; r != 4 {
-		t.Errorf("Round = %d, want the inherited 4 rather than a silent zero", r)
+	if r := ReadHeartbeat(rig).Round; r != 0 {
+		t.Errorf("Round = %d, want 0 (unknown) rather than PR 100's round", r)
 	}
 }
 
@@ -528,5 +530,121 @@ func TestTouchCheckout_SamePRAdvancesWithoutResetting(t *testing.T) {
 	}
 	if hb.Phase != PhaseCheckout {
 		t.Errorf("Phase = %q, want %q", hb.Phase, PhaseCheckout)
+	}
+}
+
+func TestWriteHeartbeat_ATrashedTempPathCannotFreezeTheRecord(t *testing.T) {
+	rig := t.TempDir()
+	if err := TouchDispatch(rig, 176, 1, "aaaa"); err != nil {
+		t.Fatal(err)
+	}
+	// os.Remove cannot delete a non-empty directory, so one `mkdir -p
+	// heartbeat.json.tmp/x` by any process in the rig used to fail every
+	// subsequent write. A frozen record is worse than a missing one: its
+	// Timestamp ages until the phase rails kill a healthy session, and its
+	// identity makes TouchDispatch return ErrReviewInFlight for every other PR
+	// forever. Every write here is best-effort at the call site, so nothing
+	// surfaced it.
+	tmpName := HeartbeatPath(rig) + ".tmp"
+	if err := os.MkdirAll(filepath.Join(tmpName, "x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := TouchHeartbeat(rig, PhasePrompt); err != nil {
+		t.Fatalf("TouchHeartbeat = %v, want nil — a trashed temp path must not fail the write", err)
+	}
+	hb := ReadHeartbeat(rig)
+	if hb == nil || hb.Phase != PhasePrompt {
+		t.Fatalf("the record did not advance: %+v", hb)
+	}
+	// And a re-dispatch of the same review still lands, so the record cannot be
+	// pinned at a stale identity either.
+	if err := TouchDispatch(rig, 176, 2, "bbbb"); err != nil {
+		t.Errorf("TouchDispatch = %v, want nil — a trashed temp path must not wedge the dispatcher", err)
+	}
+	if hb := ReadHeartbeat(rig); hb == nil || hb.Round != 2 {
+		t.Errorf("the re-dispatch did not land: %+v", hb)
+	}
+}
+
+func TestTouchCheckout_CannotWedgeTheDispatcher(t *testing.T) {
+	rig := t.TempDir()
+	// One in-session `gt reviewer checkout <any real pr>` with no dispatch on
+	// record. This used to plant an identity with a non-zero StartedAt — exactly
+	// the corroboration TouchDispatch demanded — so every later request for the
+	// rig returned ErrReviewInFlight and `done --pr` refused to clear it. One
+	// command, permanent, unrecoverable by any documented step.
+	if err := TouchCheckout(rig, 1, 0, "aaaaaaa"); err != nil {
+		t.Fatal(err)
+	}
+	if hb := ReadHeartbeat(rig); hb.PR != 1 {
+		t.Fatalf("precondition: checkout should record what it checked out: %+v", hb)
+	}
+	if err := TouchDispatch(rig, 176, 6, "bbbbbbb"); err != nil {
+		t.Errorf("TouchDispatch = %v, want nil — a record no dispatcher seeded must not "+
+			"block the seed", err)
+	}
+	if hb := ReadHeartbeat(rig); hb.PR != 176 {
+		t.Errorf("the real dispatch did not land: %+v", hb)
+	}
+}
+
+func TestClearHeartbeatFor_RecoversARecordNoDispatcherSeeded(t *testing.T) {
+	rig := t.TempDir()
+	if err := TouchCheckout(rig, 999999, 0, "aaaaaaa"); err != nil {
+		t.Fatal(err)
+	}
+	// `done --pr <real>` is the form the role template mandates, and it refused
+	// on the PR mismatch — so nothing documented could remove a planted record.
+	cleared, err := ClearHeartbeatFor(rig, 176)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cleared {
+		t.Error("a record no dispatcher seeded must always be clearable")
+	}
+	if hb := ReadHeartbeat(rig); hb != nil {
+		t.Errorf("record survived: %+v", hb)
+	}
+}
+
+func TestClearHeartbeatFor_StillProtectsARealQueuedDispatch(t *testing.T) {
+	rig := t.TempDir()
+	if err := TouchDispatch(rig, 200, 1, "sha200"); err != nil {
+		t.Fatal(err)
+	}
+	// The property that must survive the change above: finishing PR 100 must not
+	// erase PR 200's dispatcher-seeded record.
+	cleared, err := ClearHeartbeatFor(rig, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared {
+		t.Error("a dispatcher-seeded record for another PR must not be cleared")
+	}
+	if hb := ReadHeartbeat(rig); hb == nil || hb.PR != 200 {
+		t.Errorf("queued dispatch record lost: %+v", hb)
+	}
+}
+
+func TestClearHeartbeatFor_RefusesToActOnAnUnreadableRecord(t *testing.T) {
+	rig := t.TempDir()
+	if err := TouchDispatch(rig, 200, 1, "sha200"); err != nil {
+		t.Fatal(err)
+	}
+	// A torn read — no attacker required, just a concurrent rename — made
+	// ReadHeartbeat return nil, which skipped the mismatch check and deleted the
+	// file. `done --pr 176` then destroyed PR 200's record and reported success.
+	if err := os.WriteFile(HeartbeatPath(rig), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cleared, err := ClearHeartbeatFor(rig, 176)
+	if err == nil {
+		t.Error("an unreadable record must surface the error, not be silently discarded")
+	}
+	if cleared {
+		t.Error("an unreadable record must not report a clean clear")
+	}
+	if _, serr := os.Stat(HeartbeatPath(rig)); serr != nil {
+		t.Error("the unreadable record must be preserved for the supervisor")
 	}
 }

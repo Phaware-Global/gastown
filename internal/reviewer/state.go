@@ -110,50 +110,60 @@ func SafePR(pr int) int {
 
 // Runtime is the wall time an absolute cap should act on.
 //
-// The tmux session's age is the ONLY clock here that the reviewed process does
-// not own, so it is the only one allowed to authorize a kill. The heartbeat's
-// self-reported elapsed is admitted solely as a refinement WITHIN the window the
-// session clock already permits — it can raise the number by at most SpawnGrace,
-// the legitimate head start a dispatcher-seeded heartbeat has over its session,
-// and it can never lower it below the session's own age:
+// observedAge is how long THIS REVIEW has been running, measured by an observer
+// on a clock the reviewed process does not own. It is not the tmux session's
+// age, and the difference is the whole point of this function's second
+// iteration: the session is shared by design — Manager.EnsureRunning is a no-op
+// when one is up, and the design doc sanctions "one session, sequential drain" —
+// so a session that has drained queued work accrues age every LATER review would
+// inherit. Flooring on it made a ten-second-old review in a three-hour-old
+// session instantly kill-imminent, which is the round-1 "born pre-aged" failure
+// relocated from the round boundary to the session boundary. A consumer derives
+// observedAge by differencing the session clock across the review it is watching
+// (see internal/daemon's reviewer reaper); it resets per review, and it is still
+// unforgeable because both terms come from tmux.
 //
-//	runtime = max(sessionAge, min(elapsed, sessionAge+SpawnGrace))
+// The heartbeat's self-reported elapsed is admitted solely as a refinement
+// WITHIN the window observedAge already permits — it can raise the number by at
+// most SpawnGrace, the legitimate head start a dispatcher-seeded heartbeat has
+// over its session, and it can never lower it below what was observed:
+//
+//	runtime = max(observedAge, min(elapsed, observedAge+SpawnGrace))
 //
 // Both bounds earn their place, and each closes a bug the other reopens:
 //
-//   - The min bounds FORGERY. This function used to take a plain max, so a
+//   - The min bounds FORGERY. This function once took a plain max, so a
 //     `started_at` of now-1000h in a rig-writable file was on its own sufficient
 //     to SIGKILL a healthy thirty-second-old reviewer's whole process tree on
 //     the next tick.
 //   - The max floor bounds EVASION. Deleting or zeroing the file reports elapsed
-//     0, so a min alone would let `rm heartbeat.json` in a loop clear the cap
-//     forever. The session clock keeps accruing underneath.
+//     0, so a min alone would let a reviewer clear the cap by rewriting one
+//     field. The observed clock keeps accruing underneath.
 //
-// A zero sessionAge means the session clock is UNAVAILABLE, not that the session
-// is new, and this returns 0 — "unknown" — rather than falling back to the
-// self-report. Falling back was the last path by which a rig-writable file alone
-// could authorize a kill, and the fallback bought little: without a working tmux
-// query the reaper cannot carry out the kill anyway, while the phase rails,
-// which are bounded separately by PhaseAge, still apply.
+// A zero observedAge means the observer has no clock for this review, NOT that
+// the review is new, and this returns 0 — "unknown" — rather than falling back
+// to the self-report. Falling back was the last path by which a rig-writable
+// file alone could authorize a kill, and it bought little: an observer with no
+// clock generally cannot carry out the kill either, while the phase rails,
+// bounded separately by PhaseAge, still apply.
 //
-// The session clock deliberately OVER-estimates a later round's own wall time,
-// because rounds share a session (Manager.EnsureRunning is a no-op when one is
-// up). That inaccuracy is why a cap breach must nudge a still-progressing
-// reviewer before it kills, rather than acting on this number alone. It is the
-// right trade: the failure mode of an over-estimate is a nudge, and the failure
-// mode of a forgeable clock is a kill.
-func Runtime(elapsed, sessionAge time.Duration) time.Duration {
-	if sessionAge <= 0 {
+// What this deliberately does NOT defend against is a reviewer that rewrites its
+// own (pr, round, sha) to make the observer start a fresh review clock. That
+// costs the attacker the identity an operator sees and the dispatcher's ability
+// to match it, and it is bounded by the phase rails, which no identity rewrite
+// refreshes. Trying to cover it here is what produced the shared-session floor.
+func Runtime(elapsed, observedAge time.Duration) time.Duration {
+	if observedAge <= 0 {
 		return 0
 	}
 	claimed := elapsed
-	if claimed > sessionAge+SpawnGrace {
-		claimed = sessionAge + SpawnGrace
+	if claimed > observedAge+SpawnGrace {
+		claimed = observedAge + SpawnGrace
 	}
-	if claimed > sessionAge {
+	if claimed > observedAge {
 		return claimed
 	}
-	return sessionAge
+	return observedAge
 }
 
 // PhaseAge validates a heartbeat's progress signal, reporting ok=false when it
@@ -182,34 +192,38 @@ func PhaseAge(hb *Heartbeat) (time.Duration, bool) {
 // session name "gt-reviewer". A consumer would then read rig A's heartbeat and
 // act on rig B's session — for the reaper that is a cross-rig SIGKILL, and for
 // `gt reviewer stop` it is an operator killing a rig they did not name.
-// Refusing an ambiguous name costs only coverage on a misconfigured rig;
-// guessing costs an unrelated rig's running review.
 //
-// peers is the caller's own list of rig names to check for collisions, and it
-// matters that it is a parameter. An earlier version resolved collisions from
-// session.DefaultRegistry().AllRigs(), which is populated only from rigs.json —
-// so a rig ABSENT from rigs.json could never be detected as a collision partner
-// even though PrefixForRig hands it the fallback prefix and it therefore runs
-// under literally "gt-reviewer". The refusal fired on the misconfigured rig and
-// not on the correctly-configured `beads.prefix = "gt"` rig sharing its session
-// name — exactly backwards. Passing the caller's rig list (the daemon already
-// enumerates one) covers rigs the registry never learned about. An empty peers
-// list means "no other rigs to disambiguate against", not "checks disabled":
-// the DefaultPrefix rule below still applies.
+// The refusal is deliberately asymmetric, and getting that wrong has now failed
+// in both directions:
+//
+//   - Resolving collisions from the registry alone missed rigs ABSENT from
+//     rigs.json. They are invisible in the prefix map yet still resolve to
+//     "gt-reviewer", so the refusal fired on the misconfigured rig and not on
+//     the correctly-configured `beads.prefix = "gt"` rig sharing its name.
+//   - Treating every peer as a collision partner then over-corrected: because an
+//     unregistered peer resolves to the fallback, ONE rig added but not yet in
+//     rigs.json — the ordinary state right after `gt rig add` — permanently
+//     switched off reviewer supervision for gastown, the rig this feature exists
+//     for.
+//
+// So a peer only vetoes when it has an EXPLICIT registry entry naming the same
+// prefix. An unconfigured peer is a configuration defect on the peer: it cannot
+// be safely targeted itself (the check below refuses it when it is the subject),
+// but it must not disqualify a rig that did configure itself correctly.
 func ResolveSessionName(rigName string, peers []string) (string, error) {
 	prefix := session.PrefixFor(rigName)
 	if prefix == "" {
 		return "", fmt.Errorf("rig %q has no session prefix", rigName)
 	}
-	name := session.ReviewerSessionName(prefix)
 	registered := session.DefaultRegistry().AllRigs()
+	// The subject itself must be explicitly configured. A rig relying on the
+	// fallback shares a namespace with every other such rig, so there is no
+	// name that unambiguously belongs to it.
 	if prefix == session.DefaultPrefix && registered[rigName] != session.DefaultPrefix {
 		return "", fmt.Errorf("rig %q has no beads.prefix and would collapse onto the shared %q session namespace",
 			rigName, session.DefaultPrefix)
 	}
-	// Compare resolved NAMES, not prefixes. Two rigs collide precisely when they
-	// produce the same tmux session, and a rig missing from the registry produces
-	// one via the same fallback that makes it invisible in the prefix map.
+	name := session.ReviewerSessionName(prefix)
 	seen := make(map[string]bool, len(peers)+len(registered))
 	for _, p := range peers {
 		seen[p] = true
@@ -218,7 +232,17 @@ func ResolveSessionName(rigName string, peers []string) (string, error) {
 		seen[r] = true
 	}
 	for other := range seen {
-		if other != rigName && session.ReviewerSessionName(session.PrefixFor(other)) == name {
+		if other == rigName {
+			continue
+		}
+		// Explicitly configured peers only. An unregistered peer resolves to the
+		// fallback prefix, which would collide with every DefaultPrefix rig and
+		// veto them all.
+		op, ok := registered[other]
+		if !ok || op == "" {
+			continue
+		}
+		if session.ReviewerSessionName(op) == name {
 			return "", fmt.Errorf("rig %q shares reviewer session %q with rig %q — target is ambiguous",
 				rigName, name, other)
 		}
@@ -311,11 +335,20 @@ type Observation struct {
 	ReadErr error
 	// SessionAlive reports whether the rig's reviewer tmux session exists.
 	SessionAlive bool
-	// SessionAge is how long that session has existed; 0 means unknown. A live
-	// session is never genuinely zero seconds old at observation time, so this
-	// needs no companion known-flag — but see StateUnanchored, which is how
-	// "unknown" is surfaced rather than silently absorbed.
+	// SessionAge is how long that session has existed; 0 means unknown. Used
+	// only where the question really is about the SESSION — an unreadable or
+	// absent heartbeat leaves no review to measure, so session age is then the
+	// only clock there is.
 	SessionAge time.Duration
+	// ReviewObservedFor is how long the observer has been watching THIS review —
+	// this (pr, round, sha) — on a clock the reviewed process does not own; 0
+	// means unknown. See Runtime.
+	//
+	// Distinct from SessionAge because the session is shared: it survives `gt
+	// reviewer done` and drains queued requests sequentially, so its age belongs
+	// to no particular review. Feeding it to the absolute cap made every review
+	// in a long-lived session kill-imminent on arrival.
+	ReviewObservedFor time.Duration
 	// MissingFor is how long the observer has seen NO USABLE heartbeat — absent
 	// OR unreadable; 0 with MissingKnown false means the observer has not been
 	// watching.
@@ -326,11 +359,17 @@ type Observation struct {
 	//
 	// Unreadable shares this clock rather than getting its own because "cannot be
 	// parsed" and "is not there" are the same thing to every rail: neither yields
-	// a phase, a clock, or an identity. Keeping them on one timer is also what
-	// makes corrupting the file no better an evasion than deleting it.
+	// a phase, a clock, or an identity. Sharing the timer is necessary for
+	// corrupting the file to be no better an evasion than deleting it, but it is
+	// not sufficient — the two must also reach the same STATES, which is why the
+	// ReadErr branch runs the same session-anchored ladder as the absent case.
 	MissingFor   time.Duration
 	MissingKnown bool
-	// StuckThreshold is the rig's configured (and clamped) stall threshold.
+	// StuckThreshold is the rig's configured (and clamped) stall threshold. Zero
+	// is treated as DefaultStuckThreshold rather than as "no rails" — see
+	// Classify. StuckThreshold() cannot return zero (it clamps to a 31m floor),
+	// so a zero here can only mean a consumer forgot the field, and that must
+	// fail toward enforcement rather than toward silence.
 	StuckThreshold time.Duration
 }
 
@@ -340,29 +379,46 @@ type Observation struct {
 // decides whether to kill an agent — and the one an operator reads before
 // intervening — should be testable without a live town.
 func Classify(o Observation) State {
+	// A zero threshold means the CONSUMER forgot the field, not that the rig
+	// wants no rails: StuckThreshold() clamps to a 31m floor and cannot return
+	// zero. Branching on it — as this used to — skipped the runtime cap, the
+	// stall rail and the kill rail together, so a reviewer wedged for thirty days
+	// reported plain "working". Defaulting fails toward enforcement instead, and
+	// it is the same asymmetry StateUnanchored was introduced to fix for
+	// SessionAge, applied to the field whose omission costs strictly more.
+	stuck := o.StuckThreshold
+	if stuck <= 0 {
+		stuck = DefaultStuckThreshold
+	}
+
 	if o.ReadErr != nil {
 		// An unreadable heartbeat used to be an UNBOUNDED exemption from every
 		// rail: it returned here before the session, the phase, and the runtime
 		// were even consulted, so corrupting the file with one byte was a strictly
-		// better evasion than deleting it — deletion was caught by the abandoned
-		// path, corruption by nothing, forever.
+		// better evasion than deleting it.
 		//
-		// Time-bound it exactly as the missing case is bounded. A transient I/O
-		// error or a torn read still costs nothing: it has to persist, with the
-		// observer watching, past the same grace window before anything escalates.
+		// Sharing the missing case's timer was necessary but not sufficient — the
+		// two must also reach the same STATES. Escalating only at the 4x absolute
+		// cap left one garbage byte buying 180 minutes of "no action will be taken
+		// on it" where `rm heartbeat.json` bought 15, and skipping the nudge rung
+		// entirely. So this runs the same session-anchored ladder the absent case
+		// runs, on the only clock an unusable heartbeat leaves: the session's.
 		if !o.SessionAlive || !o.MissingKnown || o.MissingFor < MissingGrace {
 			return StateUnreadable
 		}
-		// Past the window there is no usable heartbeat and there IS a live
-		// session, so fall through to the one rail that needs no heartbeat at all.
-		// Runtime(0, SessionAge) is the session-anchored bound, which is precisely
-		// the clock a process that owns the file cannot touch.
-		if o.StuckThreshold > 0 {
-			if rt := Runtime(0, o.SessionAge); rt > 0 && rt >= o.StuckThreshold*AbsoluteCapMultiple {
-				return StateKillImminent
-			}
+		// No session clock means no rail at all — say so, rather than returning
+		// "no action will be taken on it", which is how the unbounded exemption
+		// silently came back whenever a tmux query failed.
+		if o.SessionAge <= 0 {
+			return StateUnanchored
 		}
-		return StateUnreadable
+		switch rt := Runtime(0, o.SessionAge); {
+		case rt >= stuck*AbsoluteCapMultiple:
+			return StateKillImminent
+		case rt >= stuck*StuckMultiple:
+			return StateStalled
+		}
+		return StateAbandoned
 	}
 	hb := o.Heartbeat
 
@@ -370,7 +426,15 @@ func Classify(o Observation) State {
 		if !o.SessionAlive {
 			return StateIdle
 		}
-		if !o.MissingKnown || o.MissingFor < MissingGrace {
+		// The abandoned window must clear the documented no-touch gap, or a third
+		// party gets a supervisory signal for free. The perspective subagents run
+		// entirely between `gt reviewer prompt` and `gt reviewer consolidate` with
+		// nothing refreshing the file — which is why the stuck threshold is 45m —
+		// so with a bare 15m grace, one `rm heartbeat.json` during that window had
+		// a perfectly healthy reviewer reported as abandoned. Waiting out the same
+		// span the phase rail waits out costs only a slower cleanup of a genuinely
+		// dead session.
+		if !o.MissingKnown || o.MissingFor < abandonGrace(stuck) {
 			return StateStarting
 		}
 		return StateAbandoned
@@ -392,27 +456,36 @@ func Classify(o Observation) State {
 	// Live session with a heartbeat. The runtime rail is checked first and is
 	// independent of phase age, so a reviewer looping through phases — which
 	// refreshes its timestamp forever — is still caught.
-	if o.StuckThreshold > 0 {
-		runtime := Runtime(hb.Elapsed(), o.SessionAge)
-		if capDur := o.StuckThreshold * AbsoluteCapMultiple; runtime > 0 && runtime >= capDur {
+	runtime := Runtime(hb.Elapsed(), o.ReviewObservedFor)
+	if capDur := stuck * AbsoluteCapMultiple; runtime > 0 && runtime >= capDur {
+		return StateKillImminent
+	}
+	if ageOK {
+		switch {
+		case age >= stuck*StuckMultiple:
 			return StateKillImminent
-		}
-		if ageOK {
-			switch {
-			case age >= o.StuckThreshold*StuckMultiple:
-				return StateKillImminent
-			case age >= o.StuckThreshold:
-				return StateStalled
-			}
-		}
-		// Healthy on the phase rail — but say so honestly. Runtime returns 0 only
-		// when there is no session clock, and without one the cap is not merely
-		// inaccurate, it is off.
-		if runtime == 0 {
-			return StateUnanchored
+		case age >= stuck:
+			return StateStalled
 		}
 	}
+	// Healthy on the phase rail — but say so honestly. Runtime returns 0 only
+	// when the observer has no clock for this review, and without one the cap is
+	// not merely inaccurate, it is off.
+	if runtime == 0 {
+		return StateUnanchored
+	}
 	return StateWorking
+}
+
+// abandonGrace is how long a live session may show no usable heartbeat before it
+// counts as abandoned. It is the larger of MissingGrace and the rig's stuck
+// threshold, because the stuck threshold is by construction the longest window
+// in which a healthy review legitimately writes nothing.
+func abandonGrace(stuck time.Duration) time.Duration {
+	if stuck > MissingGrace {
+		return stuck
+	}
+	return MissingGrace
 }
 
 // Thresholds. These live beside Classify because they are part of "what the

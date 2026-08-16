@@ -130,13 +130,14 @@ func TestPhaseAge_RejectsBothDirectionsOfNonsense(t *testing.T) {
 	}
 }
 
-// obs builds an Observation with a sensible default threshold.
-// A non-zero SessionAge by default: a live tmux session always has one, and
-// omitting it now means "no session clock", which is its own state.
+// obs builds an Observation with a sensible default threshold and, for a live
+// session, both observer clocks populated. Omitting ReviewObservedFor now means
+// "the observer has no clock for this review", which is its own state.
 func obs(hb *Heartbeat, alive bool) Observation {
 	o := Observation{Heartbeat: hb, SessionAlive: alive, StuckThreshold: DefaultStuckThreshold}
 	if alive {
 		o.SessionAge = time.Minute
+		o.ReviewObservedFor = time.Minute
 	}
 	return o
 }
@@ -164,8 +165,24 @@ func TestClassify_CoversEveryCombination(t *testing.T) {
 			StateStarting,
 		},
 		{
-			"session up, no heartbeat, past grace",
-			Observation{SessionAlive: true, MissingKnown: true, MissingFor: MissingGrace + time.Minute},
+			// The abandoned window must clear the documented no-touch gap: the
+			// subagent passes run between `prompt` and `consolidate` with nothing
+			// refreshing the file, which is why the stuck threshold is 45m. With a
+			// bare 15m grace one `rm heartbeat.json` during that window reported a
+			// healthy reviewer as abandoned.
+			"session up, no heartbeat, inside the no-touch window",
+			Observation{
+				SessionAlive: true, MissingKnown: true,
+				MissingFor: MissingGrace + time.Minute, StuckThreshold: DefaultStuckThreshold,
+			},
+			StateStarting,
+		},
+		{
+			"session up, no heartbeat, past the no-touch window",
+			Observation{
+				SessionAlive: true, MissingKnown: true,
+				MissingFor: DefaultStuckThreshold + time.Minute, StuckThreshold: DefaultStuckThreshold,
+			},
 			StateAbandoned,
 		},
 		{
@@ -230,7 +247,8 @@ func TestClassify_RuntimeCapCatchesARefreshingLoop(t *testing.T) {
 	// timestamp forever, so phase age never trips. Only total runtime can stop it
 	// — and the session age makes that unforgeable.
 	o := obs(liveHB(time.Minute, time.Minute), true)
-	o.SessionAge = DefaultStuckThreshold*AbsoluteCapMultiple + time.Minute
+	o.ReviewObservedFor = DefaultStuckThreshold*AbsoluteCapMultiple + time.Minute
+	o.SessionAge = o.ReviewObservedFor
 	if got := Classify(o); got != StateKillImminent {
 		t.Errorf("Classify = %v, want StateKillImminent — a fresh phase must not exempt "+
 			"a session past the runtime cap", got)
@@ -244,10 +262,17 @@ func TestClassify_UnknownSignalsNeverEscalate(t *testing.T) {
 	if got := Classify(obs(future, true)); got != StateWorking {
 		t.Errorf("Classify = %v, want StateWorking (no action) when the only signal is untrustworthy", got)
 	}
-	// A zero threshold (misconfigured) must not classify anything as killable.
-	o := Observation{Heartbeat: liveHB(10*time.Hour, 10*time.Hour), SessionAlive: true, StuckThreshold: 0}
-	if got := Classify(o); got != StateWorking {
-		t.Errorf("Classify = %v, want StateWorking — a zero threshold must fail safe", got)
+	// A zero threshold means the CONSUMER forgot the field — StuckThreshold()
+	// clamps to a 31m floor and cannot return zero — so it must fail toward
+	// ENFORCEMENT, not toward silence. Branching on it skipped all three rails at
+	// once, so a reviewer wedged for ten hours reported plain "working".
+	o := Observation{
+		Heartbeat: liveHB(10*time.Hour, 10*time.Hour), SessionAlive: true,
+		SessionAge: 10 * time.Hour, ReviewObservedFor: 10 * time.Hour, StuckThreshold: 0,
+	}
+	if got := Classify(o); got != StateKillImminent {
+		t.Errorf("Classify = %v, want StateKillImminent — a forgotten threshold must fall back "+
+			"to the default rather than disabling every rail", got)
 	}
 }
 
@@ -288,13 +313,32 @@ func TestClassify_APersistentlyUnreadableHeartbeatIsNotAnExemption(t *testing.T)
 			"outrank the clock the reviewer does not own", got)
 	}
 
-	// But only the runtime rail. A young session past the window is still just
-	// unreadable: there is no evidence of a wedge, only of a bad file.
+	// Past the window a young session reaches the SAME rung the absent case
+	// reaches — abandoned — not a softer one. Sharing the missing timer was never
+	// sufficient on its own: escalating only at the 4x cap left one garbage byte
+	// buying 180 minutes of "no action will be taken on it" where `rm
+	// heartbeat.json` bought 15, and skipped the nudge rung entirely.
 	young := persistent
 	young.SessionAge = time.Minute
-	if got := Classify(young); got != StateUnreadable {
-		t.Errorf("Classify = %v, want StateUnreadable — a young session must not be killed "+
-			"for a corrupt file", got)
+	if got := Classify(young); got != StateAbandoned {
+		t.Errorf("Classify = %v, want StateAbandoned — corrupting the file must not be a "+
+			"softer outcome than deleting it", got)
+	}
+	// The intermediate rung exists too, so the reaper's nudge-before-kill ladder
+	// is reachable for a corrupt file.
+	stalled := persistent
+	stalled.SessionAge = DefaultStuckThreshold*StuckMultiple + time.Minute
+	if got := Classify(stalled); got != StateStalled {
+		t.Errorf("Classify = %v, want StateStalled at the 2x rung", got)
+	}
+	// And with no session clock at all, say so rather than returning "no action
+	// will be taken on it" — that silent fallback is how the unbounded exemption
+	// kept coming back whenever a tmux query failed.
+	noClock := persistent
+	noClock.SessionAge = 0
+	if got := Classify(noClock); got != StateUnanchored {
+		t.Errorf("Classify = %v, want StateUnanchored — a failing session clock must not "+
+			"reinstate permanent immunity for a corrupt file", got)
 	}
 
 	// And an unreadable heartbeat with no session is never actionable.
@@ -316,10 +360,10 @@ func TestClassify_NoSessionClockIsReportedRatherThanAbsorbed(t *testing.T) {
 		StuckThreshold: DefaultStuckThreshold,
 	}
 	if got := Classify(o); got != StateUnanchored {
-		t.Errorf("Classify = %v, want StateUnanchored when no session clock is available", got)
+		t.Errorf("Classify = %v, want StateUnanchored when no review clock is available", got)
 	}
 	// With a clock, the same reviewer is plainly working.
-	o.SessionAge = time.Minute
+	o.ReviewObservedFor = time.Minute
 	if got := Classify(o); got != StateWorking {
 		t.Errorf("Classify = %v, want StateWorking once the session clock is present", got)
 	}
@@ -414,22 +458,30 @@ func TestResolveSessionName_RefusesARigWithNoPrefixOfItsOwn(t *testing.T) {
 	}
 }
 
-func TestResolveSessionName_RefusesAPeerAbsentFromTheRegistry(t *testing.T) {
-	// The gap the previous implementation had. Collisions were resolved from
-	// AllRigs(), which is populated only from rigs.json — so a rig ABSENT from
-	// rigs.json could never be detected as a collision partner, even though it
-	// gets the fallback prefix and therefore runs under literally "gt-reviewer".
-	// The refusal fired on the misconfigured rig and NOT on the correctly
-	// configured `beads.prefix = "gt"` rig sharing its session name.
+func TestResolveSessionName_AnUnconfiguredPeerCannotVetoAConfiguredRig(t *testing.T) {
+	// Both directions of this have now failed, so both are pinned here.
+	//
+	// Resolving collisions from the registry alone missed rigs absent from
+	// rigs.json. Treating every peer as a collision partner then over-corrected:
+	// an unregistered peer resolves to the fallback prefix, so ONE rig added but
+	// not yet in rigs.json — the ordinary state right after `gt rig add` —
+	// switched off reviewer supervision for gastown, the rig this feature is for.
 	withRegistry(t, map[string]string{"gastown": session.DefaultPrefix})
 	if _, err := ResolveSessionName("gastown", nil); err != nil {
-		t.Fatalf("precondition: a rig explicitly configured with the default prefix and no "+
-			"peers must resolve, got %v", err)
+		t.Fatalf("precondition: an explicitly configured default-prefix rig must resolve, got %v", err)
 	}
-	_, err := ResolveSessionName("gastown", []string{"gastown", "unregistered"})
-	if err == nil {
-		t.Error("a peer that is absent from rigs.json still produces gt-reviewer — the " +
-			"collision must be refused")
+	got, err := ResolveSessionName("gastown", []string{"gastown", "unregistered"})
+	if err != nil {
+		t.Errorf("ResolveSessionName = %v; an unconfigured peer must not disqualify a rig "+
+			"that configured itself correctly", err)
+	}
+	if want := session.ReviewerSessionName(session.DefaultPrefix); got != want {
+		t.Errorf("ResolveSessionName = %q, want %q", got, want)
+	}
+	// The unconfigured peer is still refused when it is the SUBJECT: there is no
+	// name that unambiguously belongs to it.
+	if _, err := ResolveSessionName("unregistered", []string{"gastown", "unregistered"}); err == nil {
+		t.Error("a rig with no beads.prefix must be refused as a target")
 	}
 }
 
@@ -437,5 +489,62 @@ func TestResolveSessionName_RefusesASharedPrefix(t *testing.T) {
 	withRegistry(t, map[string]string{"alpha": "shared", "beta": "shared"})
 	if _, err := ResolveSessionName("alpha", []string{"alpha", "beta"}); err == nil {
 		t.Error("two rigs on one prefix produce one session name — the target is ambiguous")
+	}
+}
+
+func TestClassify_ALongLivedSessionDoesNotCondemnAFreshReview(t *testing.T) {
+	// The regression this replaced: Runtime floored on the SESSION's age, and the
+	// session is shared by design — EnsureRunning is a no-op when one is up and
+	// the design sanctions "one session, sequential drain". So a ten-second-old
+	// review inherited every minute its session had ever accrued, and any session
+	// past 4x the threshold made every later review kill-imminent on arrival.
+	// That is the round-1 "born pre-aged" failure moved from the round boundary
+	// to the session boundary, and nothing inside the process could correct it.
+	fresh := liveHB(10*time.Second, 10*time.Second)
+	for _, sessionAge := range []time.Duration{
+		time.Hour,
+		DefaultStuckThreshold * AbsoluteCapMultiple,
+		10 * time.Hour,
+		30 * 24 * time.Hour,
+	} {
+		o := obs(fresh, true)
+		o.SessionAge = sessionAge
+		o.ReviewObservedFor = 10 * time.Second
+		if got := Classify(o); got != StateWorking {
+			t.Errorf("sessionAge=%v: Classify = %v (%s), want working — a fresh review must not "+
+				"inherit its session's history", sessionAge, got, got.Describe())
+		}
+	}
+	// The cap still fires on the review's OWN observed clock.
+	o := obs(fresh, true)
+	o.SessionAge = 30 * 24 * time.Hour
+	o.ReviewObservedFor = DefaultStuckThreshold*AbsoluteCapMultiple + time.Minute
+	if got := Classify(o); got != StateKillImminent {
+		t.Errorf("Classify = %v, want StateKillImminent once THIS review passes the cap", got)
+	}
+}
+
+func TestClassify_CorruptIsNeverWeakerThanDeleted(t *testing.T) {
+	// The claim the shared timer was supposed to make true. Sharing MissingFor
+	// was necessary but not sufficient — the two paths must reach the same
+	// states, or one garbage byte still buys a softer outcome than `rm`.
+	for _, sessionAge := range []time.Duration{
+		20 * time.Minute,
+		100 * time.Minute,
+		DefaultStuckThreshold*AbsoluteCapMultiple - time.Minute,
+		DefaultStuckThreshold*AbsoluteCapMultiple + time.Minute,
+	} {
+		base := Observation{
+			SessionAlive: true, SessionAge: sessionAge,
+			MissingKnown: true, MissingFor: DefaultStuckThreshold + time.Minute,
+			StuckThreshold: DefaultStuckThreshold,
+		}
+		deleted := base
+		corrupt := base
+		corrupt.ReadErr = errors.New("malformed heartbeat")
+		if got, want := Classify(corrupt), Classify(deleted); got < want {
+			t.Errorf("sessionAge=%v: corrupt = %v (%s), deleted = %v (%s) — corrupting the file "+
+				"must never be the softer evasion", sessionAge, got, got.Describe(), want, want.Describe())
+		}
 	}
 }

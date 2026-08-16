@@ -74,6 +74,30 @@ type Heartbeat struct {
 	PR    int    `json:"pr,omitempty"`
 	Round int    `json:"round,omitempty"`
 	SHA   string `json:"sha,omitempty"`
+
+	// DispatchedAt is set ONLY by TouchDispatch, which runs on the dispatcher's
+	// side, outside the reviewer session. Its presence is what separates a record
+	// somebody actually asked for from one the reviewer wrote about itself.
+	//
+	// That distinction is load-bearing, not descriptive. Two rules key on it:
+	// TouchDispatch defers to an existing record only if that record was
+	// dispatcher-seeded, and ClearHeartbeatFor will always clear one that was
+	// not. Without them, a single in-session `gt reviewer checkout <any-real-pr>`
+	// planted an identity that made every later dispatch for the rig return
+	// ErrReviewInFlight — reopening the "dispatched into the void" blind spot for
+	// the whole rig — while `done --pr` refused to clear it because the PR did
+	// not match. One command, permanent, unrecoverable by any documented step.
+	//
+	// It is not a security boundary: the file is rig-writable, so a determined
+	// process can set this field too. It removes the ACCIDENT and the one-command
+	// version of the attack, which is what a plain-file telemetry record can
+	// honestly offer.
+	DispatchedAt time.Time `json:"dispatched_at,omitempty"`
+}
+
+// dispatcherSeeded reports whether a record was written by TouchDispatch.
+func (hb *Heartbeat) dispatcherSeeded() bool {
+	return hb != nil && !hb.DispatchedAt.IsZero()
 }
 
 // HeartbeatPath returns the reviewer heartbeat path for a rig.
@@ -153,25 +177,36 @@ func WriteHeartbeat(rigPath string, hb *Heartbeat) error {
 	}
 	data = append(data, '\n')
 
-	// A FIXED temp name, not os.CreateTemp's random one. The reaper kills reviewer
-	// sessions by design, so a SIGKILL inside the write window is expected — and
-	// with unique names each one would leave an orphan dotfile that nothing ever
-	// sweeps, in a directory operators are now told to inspect. A fixed name means
-	// the next write simply overwrites the debris.
-	tmpName := path + ".tmp"
-	// A fixed name is predictable, so it must NOT be opened with os.WriteFile:
-	// that is O_CREATE|O_TRUNC, which follows a symlink planted at the temp path
-	// (turning the next heartbeat write into an arbitrary-path overwrite) and
-	// ignores its mode argument on an existing file (so a pre-created 0666 file
-	// permanently defeats the 0600 rule below). Any process in the rig can
-	// create that dotfile — the same trust class the state.go header describes.
+	// A FIXED temp name, not os.CreateTemp's random one, for the common path. The
+	// reaper kills reviewer sessions by design, so a SIGKILL inside the write
+	// window is expected — and with unique names each one would leave an orphan
+	// dotfile that nothing ever sweeps, in a directory operators are told to
+	// inspect. A fixed name means the next write clears the debris.
 	//
-	// O_EXCL refuses both: it fails on anything already at the path, symlink or
-	// not. Sweeping a stale tmp first with os.Remove keeps the anti-accumulation
-	// property the fixed name was chosen for — a SIGKILL mid-write leaves one
-	// file, and the next write clears it.
+	// Being predictable, it must NOT be opened with os.WriteFile: that is
+	// O_CREATE|O_TRUNC, which follows a symlink planted at the temp path (turning
+	// the next heartbeat write into an arbitrary-path overwrite) and ignores its
+	// mode argument on an existing file (so a pre-created 0666 file permanently
+	// defeats the 0600 rule). Any process in the rig can create that dotfile — the
+	// trust class the state.go header describes. O_EXCL refuses both: it fails on
+	// anything already at the path, symlink or not.
+	//
+	// But the sweep must never be able to FAIL the write, and O_EXCL made that a
+	// real hazard. os.Remove cannot delete a non-empty directory, so one
+	// `mkdir -p heartbeat.json.tmp/x` by any rig process froze the record at
+	// whatever it last held. That is worse than lost telemetry in two directions:
+	// the frozen Timestamp ages until the phase rails kill a healthy session, and
+	// the frozen identity makes TouchDispatch return ErrReviewInFlight for every
+	// other PR forever. Writes here are best-effort at the call site — a stderr
+	// warning, never a failed command — so nothing would surface it.
+	//
+	// So: sweep, then fall back to a unique name if the fixed one is still
+	// unusable. The fallback gives up the anti-accumulation property for exactly
+	// the writes that would otherwise not happen at all, which is the right trade —
+	// a stray dotfile is a cosmetic problem, a frozen heartbeat is a kill.
+	tmpName := path + ".tmp"
 	if err := os.Remove(tmpName); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("removing stale temp heartbeat: %w", err)
+		_ = os.RemoveAll(tmpName)
 	}
 	// 0600 matches internal/deacon/heartbeat.go and the rest of the rig's
 	// metadata. The contents (PR, round, head SHA, timings) are low-value but
@@ -179,13 +214,24 @@ func WriteHeartbeat(rigPath string, hb *Heartbeat) error {
 	// the operator all run as this user.
 	f, err := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // path derived from trusted rig path
 	if err != nil {
-		return fmt.Errorf("creating temp heartbeat: %w", err)
+		var terr error
+		if f, terr = os.CreateTemp(filepath.Dir(path), heartbeatFile+".tmp-"); terr != nil {
+			return fmt.Errorf("creating temp heartbeat: %w", err)
+		}
+		tmpName = f.Name()
+		if cerr := f.Chmod(0o600); cerr != nil {
+			_ = f.Close()
+			_ = os.Remove(tmpName)
+			return fmt.Errorf("securing temp heartbeat: %w", cerr)
+		}
 	}
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("writing temp heartbeat: %w", err)
 	}
 	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("writing temp heartbeat: %w", err)
 	}
 	if err := os.Rename(tmpName, path); err != nil {
@@ -259,9 +305,16 @@ func TouchCheckout(rigPath string, pr, round int, sha string) error {
 		// Same review (or no PR to compare): ordinary phase advance.
 		return TouchHeartbeat(rigPath, PhaseCheckout)
 	}
-	if round == 0 && prev != nil {
-		round = prev.Round
-	}
+	// Round is NOT inherited from prev. Reaching this line guarantees
+	// prev.PR != pr (the early return above covers every other case), so prev
+	// describes a DIFFERENT review and its round belongs to that one. Copying it
+	// stamped a stranger's round onto this record — worse than leaving it absent,
+	// because a wrong round reads as authoritative to the operator it exists to
+	// inform, and it falsified sameReview into handing an in-flight review a
+	// fresh budget on an identical re-request.
+	//
+	// So an omitted --round records 0, meaning "unknown". The role template
+	// passes it; a manual invocation that omits it loses only the round.
 	now := time.Now().UTC()
 	hb := &Heartbeat{
 		Timestamp: now, StartedAt: now, Phase: PhaseCheckout, PR: pr, Round: round, SHA: sha,
@@ -301,19 +354,25 @@ func TouchDispatch(rigPath string, pr, round int, sha string) error {
 	// record — the reviewer works one PR at a time, so there is nothing to
 	// preserve, and this is the path that must reset the clock.
 	//
-	// Deferring requires a record this function can corroborate. A zero StartedAt
-	// means no dispatcher ever seeded it, so it is a phase-only marker rather
-	// than a review in flight — deferring to one would let a record that carries
-	// no clock block every future seed for the rig, with no command able to clear
-	// it. Overwrite instead.
-	if prev != nil && !prev.StartedAt.IsZero() && prev.PR != 0 && pr != 0 && prev.PR != pr {
+	// Deferring requires a record this function can corroborate, and only
+	// DispatchedAt corroborates it. A record without it was written from inside
+	// the reviewer session — a phase-only marker, or an in-session `gt reviewer
+	// checkout <pr>` — and deferring to one let a single command block every
+	// future seed for the rig with nothing able to clear it. Overwrite instead.
+	//
+	// Keying on StartedAt was the earlier attempt and was not enough:
+	// TouchCheckout sets a non-zero StartedAt too, so a planted checkout record
+	// was indistinguishable from a real dispatch.
+	if prev.dispatcherSeeded() && prev.PR != 0 && pr != 0 && prev.PR != pr {
 		return ErrReviewInFlight
 	}
+	now := time.Now().UTC()
 	hb := &Heartbeat{
-		Timestamp: time.Now().UTC(),
-		StartedAt: time.Now().UTC(),
-		Phase:     PhaseDispatched,
-		PR:        pr, Round: round, SHA: sha,
+		Timestamp:    now,
+		StartedAt:    now,
+		DispatchedAt: now,
+		Phase:        PhaseDispatched,
+		PR:           pr, Round: round, SHA: sha,
 	}
 	// Only an IDENTICAL re-dispatch — same PR, round, and SHA — keeps the existing
 	// clock. That is the idempotent-retry case, where handing out a fresh budget
@@ -348,8 +407,22 @@ func ClearHeartbeatFor(rigPath string, pr int) (bool, error) {
 	if pr <= 0 {
 		return true, ClearHeartbeat(rigPath)
 	}
-	hb := ReadHeartbeat(rigPath)
-	if hb != nil && hb.PR != 0 && hb.PR != pr {
+	// ReadHeartbeatE, not the lenient reader. ReadHeartbeat returns nil for a
+	// file that is present but malformed — the very distinction this package added
+	// ReadHeartbeatE to preserve — and a nil here skipped the mismatch check and
+	// deleted the file. So a torn read (no attacker required, just a concurrent
+	// rename) let `done --pr 176` destroy PR 200's dispatch record and report a
+	// clean finish, which is exactly the outcome this function exists to prevent.
+	hb, err := ReadHeartbeatE(rigPath)
+	if err != nil {
+		return false, err
+	}
+	// A record no dispatcher seeded is always clearable, whatever PR it names.
+	// Otherwise an in-session touch could name a PR nobody asked for and no
+	// documented command could remove it — `done --pr <real>` refuses on the
+	// mismatch, and `done` with no --pr is no longer the form the role template
+	// prescribes.
+	if hb != nil && hb.dispatcherSeeded() && hb.PR != 0 && hb.PR != pr {
 		return false, nil
 	}
 	return true, ClearHeartbeat(rigPath)

@@ -201,14 +201,31 @@ because it is a different category of file. The distinction that matters is
 | | Lifecycle state (forbidden) | Telemetry (this heartbeat) |
 |---|---|---|
 | Read by | the role itself, to decide what to do next | supervisors only — the reaper, `gt reviewer status`, an operator |
-| If deleted mid-review | behavior changes; the role is confused or wedged | nothing changes; the review proceeds identically |
+| If deleted mid-review | behavior changes; the role is confused or wedged | the review proceeds identically — but the supervisor is blinded, and past the abandon window that is itself actionable (see below) |
 | If it disagrees with reality | reality is corrupted — two sources of truth | reality wins; the file is re-derived on the next phase |
 | Authority | authoritative | strictly derived and disposable |
 
 No `gt reviewer` command ever reads the heartbeat to decide what to do. It is
 written forward-only, never branched on, and deleting it at any moment changes
-nothing about the review in flight — it only blinds the supervisor. That is the
-test: **state you must not lose, versus telemetry you may always throw away.**
+nothing about the review *in flight* — it only blinds the supervisor. That is
+the test: **state you must not lose, versus telemetry you may always throw
+away.**
+
+**One caveat, because an earlier version of this section overstated it.**
+"Harmless" is true of the review and false of the supervisor. Absence is itself
+a signal: a live session showing no usable heartbeat past the abandon window
+classifies as `abandoned`, which the reaper acts on. So deleting the file cannot
+confuse the reviewer, but it *can* get a healthy session reaped by a third
+party — and the file is rig-writable, which is a trust class this design
+explicitly accepts.
+
+Two things bound that. The abandon window is the rig's stuck threshold rather
+than a flat 15 minutes, so it clears the documented no-touch gap in which a
+healthy review legitimately writes nothing (the perspective subagents run
+entirely between `gt reviewer prompt` and `gt reviewer consolidate`). And the
+reaper corroborates with `IsIdle` before acting, so a session still producing
+output is not killed on the strength of a deleted file. Neither makes deletion
+free; both make it insufficient on its own.
 
 The precedent is `deacon/heartbeat.json`, which coexists with the Deacon's own
 ZFC design for exactly this reason.
