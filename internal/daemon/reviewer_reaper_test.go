@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -69,15 +70,26 @@ func TestDecideReviewerAction_AbsoluteCapCatchesRefreshingLoop(t *testing.T) {
 	// stop it — and the courtesy nudge must not make it immortal.
 	freshPhase := 1 * time.Minute
 	pastCap := stuck*reviewer.AbsoluteCapMultiple + time.Minute
+	// The session clock is what makes this rail work. It is the only input the
+	// looping reviewer does not own, and since a live session always has an age,
+	// supplying one is the honest shape of this scenario — a zero here would mean
+	// tmux could not be queried, which switches the cap off by design.
+	sessionAge := pastCap
 
-	action, _ := decideReviewerAction(hb(freshPhase, pastCap), stuck, 0, false)
+	action, _ := decideReviewerAction(hb(freshPhase, pastCap), stuck, sessionAge, false)
 	if action != reviewerActionNudge {
 		t.Errorf("action = %v, want nudge on the first cap breach", action)
 	}
 	// Nudge spent: the loop cannot buy another one by refreshing its phase.
-	if action, _ := decideReviewerAction(hb(freshPhase, pastCap), stuck, 0, true); action != reviewerActionKill {
+	if action, _ := decideReviewerAction(hb(freshPhase, pastCap), stuck, sessionAge, true); action != reviewerActionKill {
 		t.Errorf("action = %v, want kill: a fresh phase must not exempt a review past the absolute cap "+
 			"once its one nudge is spent", action)
+	}
+	// And with no session clock the cap is OFF, not merely inaccurate: a
+	// self-report is never sufficient on its own to authorize a SIGKILL.
+	if action, _ := decideReviewerAction(hb(freshPhase, pastCap), stuck, 0, true); action != reviewerActionNone {
+		t.Errorf("action = %v, want none — a forged started_at with no corroborating "+
+			"session clock must not kill", action)
 	}
 }
 
@@ -304,5 +316,89 @@ func TestReviewerWasNudged_DoesNotRecord(t *testing.T) {
 	d.reviewerWasNudged("rig-a")
 	if !d.shouldNudgeReviewer("rig-a") {
 		t.Error("checking whether a nudge was sent must not count as sending one")
+	}
+}
+
+func TestShouldReapMissingHeartbeat_EveryGuardIsLoadBearing(t *testing.T) {
+	// Extracted from reapReviewerWithoutHeartbeat precisely so deleting a guard
+	// fails here. Both were previously untested, and both stand between a
+	// deleted file and a SIGKILL over a process tree.
+	past := reviewer.MissingGrace + time.Minute
+
+	if !shouldReapMissingHeartbeat(past, true, true) {
+		t.Error("observed, past the grace, and idle is the case this exists to catch")
+	}
+	// The daemon has never observed this rig. A zero duration must read as "no
+	// information", not as "missing forever" — otherwise the first tick after a
+	// restart kills whatever it happens to find.
+	if shouldReapMissingHeartbeat(past, false, true) {
+		t.Error("an unobserved rig must not be reapable")
+	}
+	if shouldReapMissingHeartbeat(reviewer.MissingGrace-time.Minute, true, true) {
+		t.Error("inside the grace window nothing may be killed")
+	}
+	// A session still producing output is doing work. Killing it on the strength
+	// of a deleted file alone would let any process in the rig terminate a
+	// working reviewer.
+	if shouldReapMissingHeartbeat(past, true, false) {
+		t.Error("a busy session must not be killed for a missing file")
+	}
+}
+
+func TestShouldClearDeadDispatch_UntrustedTimestampsDoNotAct(t *testing.T) {
+	if !shouldClearDeadDispatch(reviewer.SpawnGrace+time.Minute, true) {
+		t.Error("a heartbeat that outlived its session past the grace is a dead dispatch")
+	}
+	// The fix for this patrol's highest-value finding: `gt reviewer request`
+	// seeds the heartbeat BEFORE the session exists, and the mail write plus a
+	// first-dispatch worktree provision can outlast a daemon tick. Acting inside
+	// that window deleted the dispatch record and then routed the healthy session
+	// that came up without one onto the missing-heartbeat kill path.
+	if shouldClearDeadDispatch(reviewer.SpawnGrace-time.Minute, true) {
+		t.Error("the spawn window is not death")
+	}
+	// This branch is ambiguous by construction — it is how a dead reviewer looks
+	// AND how a spawning one looks — so an unusable timestamp must not resolve it
+	// in the destructive direction.
+	if shouldClearDeadDispatch(0, false) {
+		t.Error("an unusable phase age must not authorize a clear")
+	}
+}
+
+func TestDecideReviewerAction_CapReasonNamesBothClocks(t *testing.T) {
+	stuck := 45 * time.Minute
+	// The session is reused across rounds, so a session-anchored cap breach can
+	// belong to a review that is minutes old. Reporting the session's age bare
+	// attributes a predecessor's lifetime to the current review — the false-reason
+	// failure this file exists to prevent — so both numbers must appear.
+	hb := hb(1*time.Minute, 5*time.Minute)
+	sessionAge := stuck*reviewer.AbsoluteCapMultiple + time.Minute
+	action, reason := decideReviewerAction(hb, stuck, sessionAge, true)
+	if action != reviewerActionKill {
+		t.Fatalf("action = %v, want kill past the cap once the courtesy nudge is spent", action)
+	}
+	if !strings.Contains(reason, "5m0s") {
+		t.Errorf("reason %q must state the review's own elapsed, not only the session's age", reason)
+	}
+	if !strings.Contains(reason, "session has been up") {
+		t.Errorf("reason %q must name the session clock as the number it acted on", reason)
+	}
+}
+
+func TestDecideReviewerAction_UnusableTimestampReportsWhyItIsSilent(t *testing.T) {
+	// A future-dated write disables both phase rails. Taking no action is right;
+	// taking it SILENTLY, on every tick, reproduced the diagnosis gap the patrol
+	// exists to close — and is exactly what a forged timestamp buys.
+	future := &reviewer.Heartbeat{
+		Timestamp: time.Now().Add(10 * time.Hour),
+		StartedAt: time.Now().Add(-time.Minute),
+		Phase:     reviewer.PhasePrompt,
+	}
+	action, reason := decideReviewerAction(future, 45*time.Minute, time.Minute, false)
+	if action != reviewerActionNone {
+		t.Fatalf("action = %v, want none — there is no trustworthy signal to act on", action)
+	}
+	if reason == "" {
+		t.Error("no action must still carry a reason the caller can log")
 	}
 }

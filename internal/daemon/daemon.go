@@ -98,6 +98,10 @@ type Daemon struct {
 	// observation rather than from session creation — otherwise deleting the file
 	// is an instant kill switch for any session older than the window.
 	reviewerMissingSince map[string]time.Time
+	// reviewerLastQuietLog rate-limits the "taking no action" diagnostic. Its own
+	// map rather than reviewerLastNudge's: recording a nudge to throttle a log
+	// line would spend the absolute cap's single courtesy nudge.
+	reviewerLastQuietLog map[string]time.Time
 
 	// Deacon startup tracking: prevents race condition where newly started
 	// sessions are immediately killed by the heartbeat check.

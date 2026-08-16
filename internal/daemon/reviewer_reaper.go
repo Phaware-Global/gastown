@@ -10,7 +10,9 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/reviewer"
+	"github.com/steveyegge/gastown/internal/rig"
 )
 
 // Daemon-side reaper knobs. Everything about what the heartbeat MEANS —
@@ -43,8 +45,14 @@ func (d *Daemon) reapStuckReviewers() {
 	// witness and refinery patrols. With getKnownRigs a destructive, default-on
 	// patrol had no working per-rig opt-out and would keep killing inside a rig
 	// an operator had deliberately parked.
+	// The collision check inside reapRigReviewer needs every rig the daemon knows
+	// about, not just the ones this patrol is scoped to: a rig excluded by the
+	// `rigs` allowlist still runs a reviewer session that a patrolled rig could
+	// collide with. Narrowing the peer list to the patrol's own rigs would make
+	// the ambiguity invisible in exactly the configuration that creates it.
+	peers := d.getKnownRigs()
 	d.rigPool.runPerRig(d.ctx, d.getPatrolRigs(constants.RoleReviewer), func(ctx context.Context, rigName string) error {
-		d.reapRigReviewer(rigName)
+		d.reapRigReviewer(rigName, peers)
 		return nil
 	})
 }
@@ -67,7 +75,49 @@ func (d *Daemon) reviewerStuckThreshold(rigName, rigPath string) time.Duration {
 		d.logger.Printf("Reviewer reaper: %s stuck_threshold %v is outside [%v, %v] — using %v",
 			rigName, raw, reviewer.MinStuckThreshold, reviewer.MaxStuckThreshold, clamped)
 	}
-	return clamped
+	return d.honorReviewEscalationOrdering(rigName, rigPath, clamped)
+}
+
+// honorReviewEscalationOrdering raises a stuck threshold that would let the kill
+// land before the refinery's await-review escalation.
+//
+// The ordering matters because the escalation carries diagnostics the kill
+// destroys: SIGKILL over the process tree leaves an operator with "reviewer
+// never engaged" and nothing to inspect. MinStuckThreshold encodes that ordering
+// as a constant derived from pr_review_timeout's DEFAULT of 30m — but that
+// figure is a per-rig `merge_queue` field, and the natural knob for a large repo
+// whose reviews legitimately run long. Raise it past the kill rail
+// (stuck * StuckMultiple) and the constant silently guarantees the opposite of
+// what it promises.
+//
+// Reading the rig's actual value closes that. A rig that tunes either knob keeps
+// the ordering; a rig that tunes neither is unaffected, since the shipped
+// defaults already satisfy it.
+func (d *Daemon) honorReviewEscalationOrdering(rigName, rigPath string, stuck time.Duration) time.Duration {
+	// LoadConfig reads <rig>/settings/config.json (falling back to the rig root),
+	// so Path is the only field it needs. Constructing the value beats loading the
+	// rig identity file for a number that does not come from it.
+	eng := refinery.NewEngineer(&rig.Rig{Name: rigName, Path: rigPath})
+	if err := eng.LoadConfig(); err != nil {
+		return stuck
+	}
+	timeout := eng.Config().PRReviewTimeout
+	if timeout <= 0 || stuck*reviewer.StuckMultiple > timeout {
+		return stuck
+	}
+	raised := timeout/reviewer.StuckMultiple + time.Minute
+	if capped, _ := reviewer.ClampStuckThreshold(raised); capped != raised {
+		// Past MaxStuckThreshold the ordering cannot be honored without disabling
+		// the reaper for this rig, which is the worse failure. Say so rather than
+		// silently picking one.
+		d.logger.Printf("Reviewer reaper: %s pr_review_timeout %v exceeds what the stuck threshold can "+
+			"accommodate (max %v) — the kill may precede the refinery's escalation",
+			rigName, timeout, reviewer.MaxStuckThreshold)
+		return stuck
+	}
+	d.logger.Printf("Reviewer reaper: %s raising stuck_threshold %v → %v so the kill rail (%dx) stays "+
+		"behind pr_review_timeout %v", rigName, stuck, raised, reviewer.StuckMultiple, timeout)
+	return raised
 }
 
 // reapRigReviewer evaluates one rig's reviewer and takes at most one action.
@@ -79,7 +129,7 @@ func (d *Daemon) reviewerStuckThreshold(rigName, rigPath string) time.Duration {
 //	none / alive  → self-termination failed (or a hand-started session): reap past grace
 //	present / none → the reviewer died mid-review: clear the stale heartbeat
 //	present/alive → a review in flight: apply the progress and runtime rails
-func (d *Daemon) reapRigReviewer(rigName string) {
+func (d *Daemon) reapRigReviewer(rigName string, peers []string) {
 	rigPath := filepath.Join(d.config.TownRoot, rigName)
 
 	// Refuse to guess the target. session.PrefixFor falls back to "gt" for any
@@ -87,7 +137,7 @@ func (d *Daemon) reapRigReviewer(rigName string) {
 	// so the reaper could read rig A's heartbeat and kill rig B's healthy
 	// reviewer. Skipping a misconfigured rig costs coverage; guessing costs an
 	// unrelated rig's running review.
-	sessionName, serr := reviewer.ResolveSessionName(rigName)
+	sessionName, serr := reviewer.ResolveSessionName(rigName, peers)
 	if serr != nil {
 		d.logger.Printf("Reviewer reaper: skipping %s — %v", rigName, serr)
 		return
@@ -101,9 +151,19 @@ func (d *Daemon) reapRigReviewer(rigName string) {
 
 	// A transient or corrupt read is NOT "no heartbeat". Conflating them gave
 	// the harshest available action to a momentary I/O error.
+	//
+	// But it is not an unbounded exemption either. An unreadable file yields no
+	// phase, no clock, and no identity — exactly what an ABSENT file yields — so
+	// it accrues the same missing-heartbeat clock. Returning here unconditionally
+	// made corrupting the heartbeat a strictly better evasion than deleting it:
+	// deletion was caught by the missing path, corruption by nothing, for as long
+	// as one garbage byte stayed in the file.
 	hb, rerr := reviewer.ReadHeartbeatE(rigPath)
 	if rerr != nil {
-		d.logger.Printf("Reviewer reaper: %s heartbeat unreadable (%v) — taking no action", rigName, rerr)
+		d.noteReviewerHeartbeatPresent(rigName, !alive)
+		if alive {
+			d.reapUnreadableReviewerHeartbeat(rigName, sessionName, rigPath, rerr)
+		}
 		return
 	}
 
@@ -132,10 +192,10 @@ func (d *Daemon) reapRigReviewer(rigName string) {
 		// path. Every other branch here has a grace or a ramp; this one had none.
 		age, ok := reviewer.PhaseAge(hb)
 		if !ok {
-			d.logger.Printf("Reviewer reaper: %s heartbeat timestamp is in the future — taking no action", rigName)
+			d.logger.Printf("Reviewer reaper: %s heartbeat timestamp is unusable — taking no action", rigName)
 			return
 		}
-		if age < reviewer.SpawnGrace {
+		if !shouldClearDeadDispatch(age, ok) {
 			return
 		}
 		d.logger.Printf("Reviewer reaper: %s reviewer has no session (phase=%s pr=%d, no progress for %s) — clearing stale heartbeat",
@@ -208,8 +268,15 @@ func decideReviewerAction(hb *reviewer.Heartbeat, stuck, sessionAge time.Duratio
 				"past the absolute runtime cap (%s of %s) but still progressing — nudging once before killing",
 				runtime.Round(time.Second), capDur)
 		}
-		return reviewerActionKill, fmt.Sprintf("exceeded absolute runtime cap (%s of %s)",
-			runtime.Round(time.Second), capDur)
+		// Name what the number IS. Runtime is session-anchored, and a session is
+		// reused across rounds, so this figure can exceed the current review's own
+		// wall time — reporting it bare as "the review ran 3h" attributes a
+		// predecessor's lifetime to a review that may be minutes old, which is the
+		// false-reason failure this file exists to prevent. Both clocks are stated
+		// so an operator can see the difference rather than infer it.
+		return reviewerActionKill, fmt.Sprintf(
+			"session has been up %s, past the %s absolute runtime cap (this review's own elapsed: %s)",
+			runtime.Round(time.Second), capDur, hb.Elapsed().Round(time.Second))
 	}
 
 	// A future-dated timestamp yields a negative age, which under a naive
@@ -235,13 +302,26 @@ func decideReviewerAction(hb *reviewer.Heartbeat, stuck, sessionAge time.Duratio
 // enforceReviewerProgress applies decideReviewerAction to a live reviewer.
 func (d *Daemon) enforceReviewerProgress(rigName, sessionName, rigPath string, hb *reviewer.Heartbeat) {
 	stuck := d.reviewerStuckThreshold(rigName, rigPath)
-	action, reason := decideReviewerAction(hb, stuck, d.reviewerSessionAge(sessionName), d.reviewerWasNudged(rigName))
+	sessionAge := d.reviewerSessionAge(sessionName)
+	action, reason := decideReviewerAction(hb, stuck, sessionAge, d.reviewerWasNudged(rigName))
 	switch action {
 	case reviewerActionKill:
-		d.killStuckReviewer(rigName, sessionName, rigPath, hb, reason)
+		d.killStuckReviewer(rigName, sessionName, rigPath, hb, reason, sessionAge)
 	case reviewerActionNudge:
 		d.nudgeStuckReviewer(rigName, sessionName, hb, hb.Age(), stuck)
 	case reviewerActionNone:
+		// Taking no action is not the same as having nothing to say. A heartbeat
+		// dated in the future disables both phase rails, and the decision rule
+		// reports that as a reason — but with no log line the operator saw only
+		// silence, on every tick, for as long as it lasted. That reproduces the
+		// diagnosis gap this whole patrol exists to close, and it is precisely
+		// what a forged timestamp buys. Rate-limited on its OWN clock, not via
+		// shouldNudgeReviewer: that call records a nudge, and recording one here
+		// would silently spend the cap tier's single courtesy nudge on a log line.
+		if reason != "" && d.shouldLogReviewerInaction(rigName) {
+			d.logger.Printf("Reviewer reaper: %s taking no action — %s (pr=%d phase=%s)",
+				rigName, reviewer.SafeText(reason), reviewer.SafePR(hb.PR), reviewer.SafePhase(hb.Phase))
+		}
 	}
 }
 
@@ -299,6 +379,26 @@ func (d *Daemon) shouldNudgeReviewer(rigName string) bool {
 	return true
 }
 
+// shouldLogReviewerInaction rate-limits the "taking no action" line to one per
+// cooldown per rig. The condition it reports (an unusable phase timestamp)
+// persists across every tick, so an unthrottled line would bury the log.
+//
+// Its own map, deliberately. Reusing shouldNudgeReviewer would RECORD a nudge,
+// spending the absolute cap's single courtesy nudge on a log line and turning a
+// diagnostic into a behavior change.
+func (d *Daemon) shouldLogReviewerInaction(rigName string) bool {
+	d.reviewerNudgeMu.Lock()
+	defer d.reviewerNudgeMu.Unlock()
+	if d.reviewerLastQuietLog == nil {
+		d.reviewerLastQuietLog = make(map[string]time.Time)
+	}
+	if last, ok := d.reviewerLastQuietLog[rigName]; ok && time.Since(last) < reviewerNudgeCooldown {
+		return false
+	}
+	d.reviewerLastQuietLog[rigName] = time.Now()
+	return true
+}
+
 // reviewerWasNudged reports whether this rig's reviewer has been nudged recently
 // enough that the nudge should count as already spent. Unlike shouldNudgeReviewer
 // it records nothing — a read of the same bookkeeping, so the cap's courtesy
@@ -321,7 +421,7 @@ func (d *Daemon) reviewerWasNudged(rigName string) bool {
 // is recorded. A reviewer session dying without explanation was the original
 // diagnosis problem, and a reaper that reproduced it silently would be no
 // better than the gap it closes.
-func (d *Daemon) killStuckReviewer(rigName, sessionName, rigPath string, hb *reviewer.Heartbeat, reason string) {
+func (d *Daemon) killStuckReviewer(rigName, sessionName, rigPath string, hb *reviewer.Heartbeat, reason string, sessionAge time.Duration) {
 	// Re-read under the decision. Between deciding and acting the reviewer may
 	// have finished and a new review been dispatched into the same session, in
 	// which case this kill would land on an innocent successor.
@@ -330,7 +430,7 @@ func (d *Daemon) killStuckReviewer(rigName, sessionName, rigPath string, hb *rev
 	// handed any process writing heartbeat.json in a loop a permanent veto over
 	// its own kill, which is exactly the runaway this rail exists to stop.
 	if current, cerr := reviewer.ReadHeartbeatE(rigPath); cerr != nil || current == nil ||
-		current.PR != hb.PR || !strings.EqualFold(current.SHA, hb.SHA) {
+		current.PR != hb.PR || current.Round != hb.Round || !strings.EqualFold(current.SHA, hb.SHA) {
 		d.logger.Printf("Reviewer reaper: %s heartbeat changed under the kill decision — aborting", rigName)
 		return
 	}
@@ -354,7 +454,15 @@ func (d *Daemon) killStuckReviewer(rigName, sessionName, rigPath string, hb *rev
 		map[string]interface{}{
 			"rig": rigName, "role": constants.RoleReviewer, "reason": reviewer.SafeText(reason),
 			"pr": reviewer.SafePR(hb.PR), "phase": reviewer.SafePhase(hb.Phase), "sha": reviewer.SafeSHA(hb.SHA),
-			"elapsed": reviewer.SafeText(hb.Elapsed().Round(time.Second).String()),
+			// Two fields, named for what they are. "runtime" is the corroborated
+			// number the decision actually acted on; "claimed_elapsed" is the
+			// heartbeat's self-report, which is the one field in this record an
+			// attacker chooses freely. Emitting only the latter under a neutral name
+			// let the same forged started_at both cause a kill and write the number
+			// that would be used to explain it — the surviving evidence corroborated
+			// the attacker's story.
+			"runtime":         reviewer.SafeText(reviewer.Runtime(hb.Elapsed(), sessionAge).Round(time.Second).String()),
+			"claimed_elapsed": reviewer.SafeText(hb.Elapsed().Round(time.Second).String()),
 		})
 	d.clearReviewerHeartbeat(rigName, rigPath)
 }
@@ -401,13 +509,10 @@ func (d *Daemon) reviewerMissingFor(rigName string) (time.Duration, bool) {
 // observation means the window must also be waited out with the daemon watching.
 func (d *Daemon) reapReviewerWithoutHeartbeat(rigName, sessionName string) {
 	missingFor, seen := d.reviewerMissingFor(rigName)
-	if !seen || missingFor < reviewer.MissingGrace {
-		return
-	}
 	// Corroborate with something the file's author does not control. A session
 	// still producing output is doing work, and killing it on the strength of a
 	// deleted file alone would let any rig process terminate a working reviewer.
-	if !d.tmux.IsIdle(sessionName) {
+	if !shouldReapMissingHeartbeat(missingFor, seen, d.tmux.IsIdle(sessionName)) {
 		return
 	}
 	if !d.shouldKillReviewer(rigName) {
@@ -428,6 +533,79 @@ func (d *Daemon) reapReviewerWithoutHeartbeat(rigName, sessionName string) {
 			"reason":      "heartbeat_missing",
 			"missing_for": missingFor.Round(time.Second).String(),
 		})
+}
+
+// reapUnreadableReviewerHeartbeat handles a live session whose heartbeat cannot
+// be parsed.
+//
+// Inside the grace window this only logs: a torn read or a momentary I/O error
+// must never earn the harshest available action. Past it, the only rail that
+// still has an input is the session clock — which needs no heartbeat at all, and
+// is precisely the clock a process that owns the file cannot switch off. So the
+// escalation is the absolute cap and nothing else: no phase rail (there is no
+// phase), no nudge (there is no identity to name in one).
+func (d *Daemon) reapUnreadableReviewerHeartbeat(rigName, sessionName, rigPath string, rerr error) {
+	missingFor, seen := d.reviewerMissingFor(rigName)
+	if !seen || missingFor < reviewer.MissingGrace {
+		if d.shouldLogReviewerInaction(rigName) {
+			d.logger.Printf("Reviewer reaper: %s heartbeat unreadable (%v) — taking no action yet",
+				rigName, reviewer.SafeText(rerr.Error()))
+		}
+		return
+	}
+	stuck := d.reviewerStuckThreshold(rigName, rigPath)
+	capDur := stuck * reviewer.AbsoluteCapMultiple
+	runtime := reviewer.Runtime(0, d.reviewerSessionAge(sessionName))
+	if runtime <= 0 || runtime < capDur {
+		if d.shouldLogReviewerInaction(rigName) {
+			d.logger.Printf("Reviewer reaper: %s heartbeat unreadable for %s (%v) — session up %s, "+
+				"under the %s cap", rigName, missingFor.Round(time.Second),
+				reviewer.SafeText(rerr.Error()), runtime.Round(time.Second), capDur)
+		}
+		return
+	}
+	if !d.shouldKillReviewer(rigName) {
+		return
+	}
+	reason := fmt.Sprintf("heartbeat unreadable for %s and session up %s, past the %s absolute cap",
+		missingFor.Round(time.Second), runtime.Round(time.Second), capDur)
+	d.logger.Printf("Reviewer reaper: killing %s reviewer — %s", rigName, reason)
+	if err := d.tmux.KillSessionWithProcesses(sessionName); err != nil {
+		d.logger.Printf("Reviewer reaper: killing session %s: %v", sessionName, err)
+	}
+	_ = events.LogFeed(events.TypeKill, rigName+"/"+constants.RoleReviewer,
+		map[string]interface{}{
+			"rig": rigName, "role": constants.RoleReviewer,
+			"reason":  "heartbeat_unreadable",
+			"detail":  reviewer.SafeText(reason),
+			"runtime": reviewer.SafeText(runtime.Round(time.Second).String()),
+		})
+	d.clearReviewerHeartbeat(rigName, rigPath)
+}
+
+// shouldReapMissingHeartbeat is the missing-heartbeat kill predicate, extracted
+// so deleting a guard fails a test rather than merely contradicting a comment.
+//
+// Both conditions are load-bearing and neither was covered before. Without
+// `seen` a daemon that has never observed the rig treats "0" as "forever" and
+// kills on its first tick. Without `idle` a deleted file alone is sufficient to
+// terminate a reviewer that is visibly working, which is the whole reason the
+// corroboration exists.
+func shouldReapMissingHeartbeat(missingFor time.Duration, seen, idle bool) bool {
+	return seen && missingFor >= reviewer.MissingGrace && idle
+}
+
+// shouldClearDeadDispatch is the no-session heartbeat predicate, extracted for
+// the same reason: the spawn grace is the fix for this patrol's highest-value
+// finding, and a bare `age > constant` assertion cannot tell whether the guard
+// is still wired up.
+//
+// An unusable phase age (zero or future-dated) resolves to "do not act". This
+// branch is ambiguous by construction — it is how a dead reviewer looks AND how
+// a dispatch still spawning looks — so an untrustworthy timestamp must not
+// resolve it in the destructive direction.
+func shouldClearDeadDispatch(age time.Duration, ageOK bool) bool {
+	return ageOK && age >= reviewer.SpawnGrace
 }
 
 // clearReviewerHeartbeat removes a rig's reviewer heartbeat, logging failures.
