@@ -1,8 +1,10 @@
 package refinery
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // NeedsApprovalError indicates a PR does not yet satisfy its configured
@@ -22,9 +24,28 @@ type NeedsApprovalError struct {
 func (e *NeedsApprovalError) Error() string { return e.Detail }
 
 // VerifyPRApproval checks the PR's approval state against cfg's gates
-// (PRApprover and GetPRRequiredApprovals). Returns nil when all
-// configured gates are satisfied, a *NeedsApprovalError when a gate is
-// unmet, or a plain error on provider-lookup failure.
+// (PRApprover and GetPRRequiredApprovals), plus one unconditional
+// invariant that isn't a "gate" in the configured sense. Returns nil when
+// everything is satisfied, a *NeedsApprovalError when something is unmet,
+// or a plain error on provider-lookup failure.
+//
+// Checked first, unconditionally (not gated by cfg — it applies even to a
+// rig with no PRApprover/PRRequiredApprovals configured):
+//
+//  0. No reviewer may have an active CHANGES_REQUESTED verdict. This
+//     exists because a `disposition` escalation with no anchorable
+//     findings (an architectural objection that doesn't map to a diff
+//     line) produces zero inline review threads — so the threads-count
+//     proxy used elsewhere in the patrol (AwaitReviewStep,
+//     dispatch-review-fix) sees "nothing to resolve" and reports ready,
+//     while the reviewer's own verdict is still blocking. This is the
+//     actual merge decision point (VerifyPRApproval backs both the
+//     patrol path and `gt refinery pr merge`), so it's where that verdict
+//     has to be checked — not left to a thread count that may be zero by
+//     construction. It clears the same way GitHub clears it: a
+//     subsequent review from the same user that isn't itself
+//     CHANGES_REQUESTED (ChangesRequestedReviewers excludes a superseded
+//     verdict) — never by resolving threads that were never created.
 //
 // Gate semantics — evaluated independently, both must pass when both are
 // configured:
@@ -66,6 +87,25 @@ func VerifyPRApproval(provider PRProvider, cfg *MergeQueueConfig, prNumber int, 
 	}
 	if cfg == nil {
 		return fmt.Errorf("no MergeQueueConfig provided")
+	}
+
+	blocking, err := provider.ChangesRequestedReviewers(prNumber)
+	if err != nil && !errors.Is(err, ErrUnsupported) {
+		return fmt.Errorf("failed to check blocking reviews on PR #%d: %w", prNumber, err)
+	}
+	if len(blocking) > 0 {
+		if out != nil {
+			_, _ = fmt.Fprintf(out, "[Engineer] PR #%d has an active CHANGES_REQUESTED review from %s — deferring merge\n",
+				prNumber, strings.Join(blocking, ", "))
+		}
+		return &NeedsApprovalError{
+			PRNumber: prNumber,
+			Detail: fmt.Sprintf(
+				"PR #%d has an active CHANGES_REQUESTED review from %s; a subsequent review with "+
+					"a non-blocking disposition is required (there may be no unresolved threads to "+
+					"resolve — an unanchored objection doesn't create one)",
+				prNumber, strings.Join(blocking, ", ")),
+		}
 	}
 
 	approver := cfg.PRApprover
