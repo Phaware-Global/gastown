@@ -31,6 +31,12 @@ func TestReviewerOverrideBlocksWriteSurfaces(t *testing.T) {
 		// duplicates of the REST guard with the suite still green.
 		"addPullRequestReview",
 		"submitPullRequestReview",
+		// Transport-level backstop for the two matchers above: `gh api graphql
+		// --input mut.json` / `-F query=@mut.graphql` never puts the mutation
+		// name on the command line, so a name-only guard misses it. This role
+		// has no legitimate `gh api graphql` use at all (resolveReviewThread
+		// below is its only other GraphQL surface, and that's blocked too).
+		"gh api graphql",
 		"gh pr merge",
 		"git push",
 		"gt refinery pr",

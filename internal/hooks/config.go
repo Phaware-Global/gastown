@@ -528,6 +528,31 @@ func DefaultOverrides() map[string]*HooksConfig {
 					}},
 				},
 				{
+					// The two matchers above key on the mutation NAME appearing
+					// in the command string, so `gh api graphql -f query='...'`
+					// with the mutation inline is caught. But `gh api graphql
+					// --input mut.json` / `-F query=@mut.graphql` never puts the
+					// mutation name on the command line — GhPrSubmitReview
+					// itself submits via `gh api --method POST ... --input -`
+					// elsewhere in this codebase, so the `--input` form is a
+					// real, live pattern, not hypothetical. The Reviewer's
+					// worktree is its sanctioned write surface, so writing
+					// mut.json and feeding it to `gh api graphql --input` isn't
+					// blocked by anything else. Match the transport instead of
+					// the payload: this role has no legitimate `gh api graphql`
+					// use at all (the sibling resolveReviewThread matcher below
+					// already covers its only other GraphQL surface), so a
+					// blanket block is the correct scope, not a narrower one.
+					// Keeps the two name matchers above as defense-in-depth
+					// against a non-`gh` transport (e.g. raw curl) that still
+					// carries the mutation name literally.
+					Matcher: "Bash(*gh api graphql*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviewer has no legitimate use of `gh api graphql`. Reviews go through `gt reviewer post`; thread resolution belongs to the authoring polecat.' && exit 2",
+					}},
+				},
+				{
 					Matcher: "Bash(*gh pr merge*)",
 					Hooks: []Hook{{
 						Type:    "command",
