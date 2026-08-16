@@ -243,14 +243,14 @@ const (
 // It is what makes the courtesy nudge below terminate: without it, a reviewer
 // looping fast enough to keep its phase fresh would be nudged forever and the
 // absolute cap — the one rail such a loop cannot evade — would be unreachable.
-func decideReviewerAction(hb *reviewer.Heartbeat, stuck, sessionAge time.Duration, nudged bool) (reviewerAction, string) {
+func decideReviewerAction(hb *reviewer.Heartbeat, stuck, observedFor time.Duration, nudged bool) (reviewerAction, string) {
 	if hb == nil || stuck <= 0 {
 		return reviewerActionNone, ""
 	}
 	// The runtime the cap acts on is corroborated against tmux, which the
 	// reviewed process does not own — see reviewerRuntime. Negative inputs (a
 	// future-dated file) collapse to 0 = unknown rather than reading as healthy.
-	runtime := reviewer.Runtime(hb.Elapsed(), sessionAge)
+	runtime := reviewer.Runtime(hb.Elapsed(), observedFor)
 
 	// Zero runtime means BOTH signals are unknown. Unknown must never kill.
 	if capDur := stuck * reviewer.AbsoluteCapMultiple; runtime > 0 && runtime >= capDur {
@@ -275,7 +275,7 @@ func decideReviewerAction(hb *reviewer.Heartbeat, stuck, sessionAge time.Duratio
 		// false-reason failure this file exists to prevent. Both clocks are stated
 		// so an operator can see the difference rather than infer it.
 		return reviewerActionKill, fmt.Sprintf(
-			"session has been up %s, past the %s absolute runtime cap (this review's own elapsed: %s)",
+			"this review has been running %s, past the %s absolute runtime cap (its own self-report: %s)",
 			runtime.Round(time.Second), capDur, hb.Elapsed().Round(time.Second))
 	}
 
@@ -303,10 +303,11 @@ func decideReviewerAction(hb *reviewer.Heartbeat, stuck, sessionAge time.Duratio
 func (d *Daemon) enforceReviewerProgress(rigName, sessionName, rigPath string, hb *reviewer.Heartbeat) {
 	stuck := d.reviewerStuckThreshold(rigName, rigPath)
 	sessionAge := d.reviewerSessionAge(sessionName)
-	action, reason := decideReviewerAction(hb, stuck, sessionAge, d.reviewerWasNudged(rigName))
+	observedFor := d.reviewerReviewObservedFor(rigName, hb, sessionAge)
+	action, reason := decideReviewerAction(hb, stuck, observedFor, d.reviewerWasNudged(rigName))
 	switch action {
 	case reviewerActionKill:
-		d.killStuckReviewer(rigName, sessionName, rigPath, hb, reason, sessionAge)
+		d.killStuckReviewer(rigName, sessionName, rigPath, hb, reason, observedFor)
 	case reviewerActionNudge:
 		d.nudgeStuckReviewer(rigName, sessionName, hb, hb.Age(), stuck)
 	case reviewerActionNone:
@@ -323,6 +324,47 @@ func (d *Daemon) enforceReviewerProgress(rigName, sessionName, rigPath string, h
 				rigName, reviewer.SafeText(reason), reviewer.SafePR(hb.PR), reviewer.SafePhase(hb.Phase))
 		}
 	}
+}
+
+// reviewerReviewObservedFor returns how long THIS review — this
+// (pr, round, sha) — has been observed running, on a clock the reviewed process
+// does not own.
+//
+// The session clock alone cannot answer that. The reviewer session is reused by
+// design: EnsureRunning is a no-op when one is up, and a session drains queued
+// requests sequentially, so its age belongs to no particular review. Feeding it
+// to the absolute cap made a ten-second-old review inherit every minute its
+// session had ever accrued, and any session past the cap condemned every later
+// review on arrival — the "born pre-aged" failure, moved from the round boundary
+// to the session boundary.
+//
+// So the daemon differences the session clock across the review it is watching:
+// it records the session age observed when this identity first appeared, and
+// reports the growth since. Both terms come from tmux, so the result is still
+// unforgeable; it resets per review, so a shared session condemns nothing.
+//
+// Two deliberate limits. A reviewer that rewrites its own (pr, round, sha) gets
+// a fresh clock — that costs it the identity operators and the dispatcher key
+// on, and the phase rails, which no rewrite refreshes, still apply. And a daemon
+// restart forgets the anchor, which under-reports; that fails toward not killing.
+func (d *Daemon) reviewerReviewObservedFor(rigName string, hb *reviewer.Heartbeat, sessionAge time.Duration) time.Duration {
+	if hb == nil || sessionAge <= 0 {
+		return 0
+	}
+	key := fmt.Sprintf("%d/%d/%s", hb.PR, hb.Round, strings.ToLower(strings.TrimSpace(hb.SHA)))
+	d.reviewerNudgeMu.Lock()
+	defer d.reviewerNudgeMu.Unlock()
+	if d.reviewerReviewAnchor == nil {
+		d.reviewerReviewAnchor = make(map[string]reviewerAnchor)
+	}
+	anchor, ok := d.reviewerReviewAnchor[rigName]
+	if !ok || anchor.key != key || anchor.sessionAge > sessionAge {
+		// New identity, or the session was replaced under us (its age went
+		// backwards). Anchor here; this review has been observed for nothing yet.
+		d.reviewerReviewAnchor[rigName] = reviewerAnchor{key: key, sessionAge: sessionAge}
+		return 0
+	}
+	return sessionAge - anchor.sessionAge
 }
 
 // reviewerSessionAge returns how long the reviewer's tmux session has been up,
@@ -421,7 +463,7 @@ func (d *Daemon) reviewerWasNudged(rigName string) bool {
 // is recorded. A reviewer session dying without explanation was the original
 // diagnosis problem, and a reaper that reproduced it silently would be no
 // better than the gap it closes.
-func (d *Daemon) killStuckReviewer(rigName, sessionName, rigPath string, hb *reviewer.Heartbeat, reason string, sessionAge time.Duration) {
+func (d *Daemon) killStuckReviewer(rigName, sessionName, rigPath string, hb *reviewer.Heartbeat, reason string, observedFor time.Duration) {
 	// Re-read under the decision. Between deciding and acting the reviewer may
 	// have finished and a new review been dispatched into the same session, in
 	// which case this kill would land on an innocent successor.
@@ -461,7 +503,7 @@ func (d *Daemon) killStuckReviewer(rigName, sessionName, rigPath string, hb *rev
 			// let the same forged started_at both cause a kill and write the number
 			// that would be used to explain it — the surviving evidence corroborated
 			// the attacker's story.
-			"runtime":         reviewer.SafeText(reviewer.Runtime(hb.Elapsed(), sessionAge).Round(time.Second).String()),
+			"runtime":         reviewer.SafeText(reviewer.Runtime(hb.Elapsed(), observedFor).Round(time.Second).String()),
 			"claimed_elapsed": reviewer.SafeText(hb.Elapsed().Round(time.Second).String()),
 		})
 	d.clearReviewerHeartbeat(rigName, rigPath)
@@ -629,4 +671,11 @@ func (d *Daemon) shouldKillReviewer(rigName string) bool {
 	}
 	d.reviewerLastKill[rigName] = time.Now()
 	return true
+}
+
+// reviewerAnchor pins a review identity to the session age at which the daemon
+// first saw it, so later ticks can difference the two.
+type reviewerAnchor struct {
+	key        string
+	sessionAge time.Duration
 }

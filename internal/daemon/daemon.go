@@ -98,6 +98,10 @@ type Daemon struct {
 	// observation rather than from session creation — otherwise deleting the file
 	// is an instant kill switch for any session older than the window.
 	reviewerMissingSince map[string]time.Time
+	// reviewerReviewAnchor records the session age observed when each rig's
+	// CURRENT review identity first appeared, so the absolute cap can be measured
+	// per review on a clock tmux owns rather than on the shared session's age.
+	reviewerReviewAnchor map[string]reviewerAnchor
 	// reviewerLastQuietLog rate-limits the "taking no action" diagnostic. Its own
 	// map rather than reviewerLastNudge's: recording a nudge to throttle a log
 	// line would spend the absolute cap's single courtesy nudge.

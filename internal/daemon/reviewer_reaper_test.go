@@ -367,21 +367,59 @@ func TestShouldClearDeadDispatch_UntrustedTimestampsDoNotAct(t *testing.T) {
 
 func TestDecideReviewerAction_CapReasonNamesBothClocks(t *testing.T) {
 	stuck := 45 * time.Minute
-	// The session is reused across rounds, so a session-anchored cap breach can
-	// belong to a review that is minutes old. Reporting the session's age bare
-	// attributes a predecessor's lifetime to the current review — the false-reason
-	// failure this file exists to prevent — so both numbers must appear.
+	// The observed clock and the heartbeat's self-report can disagree, and the
+	// decision acts on the observed one. Reporting only that number leaves an
+	// operator unable to see the discrepancy; reporting only the self-report would
+	// state a figure nothing acted on. Both appear.
 	hb := hb(1*time.Minute, 5*time.Minute)
-	sessionAge := stuck*reviewer.AbsoluteCapMultiple + time.Minute
-	action, reason := decideReviewerAction(hb, stuck, sessionAge, true)
+	observedFor := stuck*reviewer.AbsoluteCapMultiple + time.Minute
+	action, reason := decideReviewerAction(hb, stuck, observedFor, true)
 	if action != reviewerActionKill {
 		t.Fatalf("action = %v, want kill past the cap once the courtesy nudge is spent", action)
 	}
 	if !strings.Contains(reason, "5m0s") {
-		t.Errorf("reason %q must state the review's own elapsed, not only the session's age", reason)
+		t.Errorf("reason %q must state the heartbeat's own self-report", reason)
 	}
-	if !strings.Contains(reason, "session has been up") {
-		t.Errorf("reason %q must name the session clock as the number it acted on", reason)
+	if !strings.Contains(reason, "this review has been running") {
+		t.Errorf("reason %q must name the observed clock as the number it acted on", reason)
+	}
+}
+
+func TestReviewerReviewObservedFor_ResetsPerReviewAndNeverInheritsTheSession(t *testing.T) {
+	d := &Daemon{}
+	first := hb(time.Minute, time.Minute)
+	first.PR, first.Round, first.SHA = 176, 1, "aaaa"
+
+	// A session that has already drained work for three hours. The FIRST tick on
+	// a new identity anchors and reports nothing observed yet, so a review picked
+	// up by a long-lived session cannot be born past the cap — which is exactly
+	// what flooring on the session's own age used to do.
+	if got := d.reviewerReviewObservedFor("rig-a", first, 3*time.Hour); got != 0 {
+		t.Errorf("observedFor = %v, want 0 on first sighting — a fresh review must not "+
+			"inherit its session's history", got)
+	}
+	// Later ticks report the growth since the anchor, not the session's age.
+	if got := d.reviewerReviewObservedFor("rig-a", first, 3*time.Hour+20*time.Minute); got != 20*time.Minute {
+		t.Errorf("observedFor = %v, want 20m — the difference, not the session age", got)
+	}
+	// A new review in the SAME session re-anchors.
+	second := hb(time.Minute, time.Minute)
+	second.PR, second.Round, second.SHA = 176, 2, "bbbb"
+	if got := d.reviewerReviewObservedFor("rig-a", second, 4*time.Hour); got != 0 {
+		t.Errorf("observedFor = %v, want 0 — a new round is a new review", got)
+	}
+	// Per rig, not global.
+	if got := d.reviewerReviewObservedFor("rig-b", first, time.Hour); got != 0 {
+		t.Errorf("observedFor = %v, want 0 for an unseen rig", got)
+	}
+	// A session replaced under us (age goes backwards) re-anchors rather than
+	// reporting a negative or absurd duration.
+	if got := d.reviewerReviewObservedFor("rig-a", second, time.Minute); got != 0 {
+		t.Errorf("observedFor = %v, want 0 when the session was replaced", got)
+	}
+	// No session clock means no observed clock.
+	if got := d.reviewerReviewObservedFor("rig-a", second, 0); got != 0 {
+		t.Errorf("observedFor = %v, want 0 with no session clock", got)
 	}
 }
 
