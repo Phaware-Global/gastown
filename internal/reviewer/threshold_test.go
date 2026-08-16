@@ -134,7 +134,16 @@ func TestBuildPerspectivePrompt_BudgetExhaustionMustSetADisposition(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, `"disposition": "comment"`) {
+	// Asserted WITHOUT the `"disposition": "comment"` JSON literal, deliberately.
+	// TestSchemaExamplesDoNotSeedAnActionableDisposition scans the whole template
+	// for that key/value shape regardless of fencing — correctly, since a pass
+	// copying an actionable literal posts a verdict nobody asked for — so this
+	// instruction has to name the field and the value in prose rather than model
+	// them. Asserting on the rendered prose keeps the requirement enforced while
+	// leaving nothing copyable behind.
+	// Whitespace-normalized so the assertion survives a re-wrap of the paragraph.
+	flat := strings.Join(strings.Fields(out), " ")
+	if !strings.Contains(flat, "`disposition` field to `comment`") {
 		t.Error("the budget section must tell a truncated pass to set disposition=comment; " +
 			"verdict alone is free text no code reads")
 	}
