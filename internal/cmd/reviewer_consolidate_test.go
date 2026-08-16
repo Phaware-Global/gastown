@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/reviewer"
@@ -35,9 +36,24 @@ func captureReviewerStderr(t *testing.T, fn func()) string {
 		}
 		done <- b.String()
 	}()
+	// restore is both deferred and called explicitly on the happy path,
+	// guarded by sync.Once. fn() may call t.Fatalf, which runs
+	// runtime.Goexit and unwinds only through deferred calls — without the
+	// defer, a Fatalf inside fn() skips the restore and leaves os.Stderr
+	// pointed at this pipe for the rest of the test binary. But the restore
+	// must also run BEFORE the blocking `<-done` receive below (which only
+	// unblocks once w is closed), so the happy path can't rely on defer
+	// alone or it would deadlock waiting on a pipe it never closed.
+	var once sync.Once
+	restore := func() {
+		once.Do(func() {
+			os.Stderr = orig
+			_ = w.Close()
+		})
+	}
+	defer restore()
 	fn()
-	_ = w.Close()
-	os.Stderr = orig
+	restore()
 	return <-done
 }
 
