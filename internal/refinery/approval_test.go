@@ -18,8 +18,17 @@ type fakePRProvider struct {
 	approvedByErr    error
 	approvalCountErr error
 
-	isApprovedCalls []string // users queried, in order
-	countCalls      int
+	// changesRequestedReviewers/Err back ChangesRequestedReviewers directly —
+	// constructed straight from the fake, not routed through Consolidate/
+	// ParseFindings/ReviewEvent, so a test can reach the
+	// findings-free-REQUEST_CHANGES state VerifyPRApproval must guard even
+	// though nothing in this package can normally produce it that way.
+	changesRequestedReviewers []string
+	changesRequestedErr       error
+
+	isApprovedCalls       []string // users queried, in order
+	countCalls            int
+	changesRequestedCalls int
 }
 
 func (f *fakePRProvider) IsPRApprovedBy(prNumber int, user string) (bool, error) {
@@ -38,19 +47,26 @@ func (f *fakePRProvider) CountApprovals(prNumber int) (int, error) {
 	return f.approvalCount, nil
 }
 
+func (f *fakePRProvider) ChangesRequestedReviewers(int) ([]string, error) {
+	f.changesRequestedCalls++
+	if f.changesRequestedErr != nil {
+		return nil, f.changesRequestedErr
+	}
+	return f.changesRequestedReviewers, nil
+}
+
 // Unused PRProvider methods — panic if exercised so mis-wired tests fail loudly.
-func (f *fakePRProvider) FindPRNumber(string) (int, error)                { panic("unused") }
-func (f *fakePRProvider) IsPRApproved(int) (bool, error)                  { panic("unused") }
-func (f *fakePRProvider) MergePR(int, string) (string, error)             { panic("unused") }
-func (f *fakePRProvider) CreatePR(CreatePROptions) (int, string, error)   { panic("unused") }
-func (f *fakePRProvider) RequestReview(int, []string) error               { panic("unused") }
-func (f *fakePRProvider) ChangesRequestedReviewers(int) ([]string, error) { panic("unused") }
-func (f *fakePRProvider) UnresolvedThreads(int) ([]ReviewThread, error)   { panic("unused") }
-func (f *fakePRProvider) AllThreads(int) ([]ReviewThread, error)          { panic("unused") }
-func (f *fakePRProvider) ChecksRollup(int) (string, bool, error)          { panic("unused") }
-func (f *fakePRProvider) PostComment(int, string) error                   { panic("unused") }
-func (f *fakePRProvider) HasReviewFrom(int, string) (bool, error)         { panic("unused") }
-func (f *fakePRProvider) ListReviewAuthors(int) ([]string, error)         { panic("unused") }
+func (f *fakePRProvider) FindPRNumber(string) (int, error)              { panic("unused") }
+func (f *fakePRProvider) IsPRApproved(int) (bool, error)                { panic("unused") }
+func (f *fakePRProvider) MergePR(int, string) (string, error)           { panic("unused") }
+func (f *fakePRProvider) CreatePR(CreatePROptions) (int, string, error) { panic("unused") }
+func (f *fakePRProvider) RequestReview(int, []string) error             { panic("unused") }
+func (f *fakePRProvider) UnresolvedThreads(int) ([]ReviewThread, error) { panic("unused") }
+func (f *fakePRProvider) AllThreads(int) ([]ReviewThread, error)        { panic("unused") }
+func (f *fakePRProvider) ChecksRollup(int) (string, bool, error)        { panic("unused") }
+func (f *fakePRProvider) PostComment(int, string) error                 { panic("unused") }
+func (f *fakePRProvider) HasReviewFrom(int, string) (bool, error)       { panic("unused") }
+func (f *fakePRProvider) ListReviewAuthors(int) ([]string, error)       { panic("unused") }
 func (f *fakePRProvider) HasReviewFromOnSHA(int, string, string) (bool, error) {
 	panic("unused")
 }
@@ -286,5 +302,106 @@ func TestVerifyPRApproval_OutputWriter_Nil_NoPanic(t *testing.T) {
 	}
 	if err := VerifyPRApproval(provider, cfg, 42, nil); err != nil {
 		t.Fatalf("unexpected err with nil writer: %v", err)
+	}
+}
+
+// TestVerifyPRApproval_ChangesRequestedBlocksEvenWithNoGatesAndNoThreads
+// pins the HIGH: a `disposition: request_changes` escalation with no
+// anchorable findings produces zero inline review threads, so the
+// threads-count proxy used elsewhere in the patrol (AwaitReviewStep,
+// dispatch-review-fix) sees nothing to resolve and would report ready.
+// The fake's ChangesRequestedReviewers is set directly — bypassing
+// Consolidate/ParseFindings/ReviewEvent entirely, the same discipline as
+// TestEngineer_LoadConfig_RejectsSameApproverAndReviewer — so this test
+// reaches the state a findings-routed test structurally cannot: zero
+// findings, zero threads, one blocking reviewer. Also uses a no-gates
+// config (mirrors TestVerifyPRApproval_NoGatesConfigured_ReturnsNil) to
+// prove this check is unconditional, not a third leg of the configured
+// approver/count gates.
+func TestVerifyPRApproval_ChangesRequestedBlocksEvenWithNoGatesAndNoThreads(t *testing.T) {
+	cfg := &MergeQueueConfig{
+		MergeStrategy:       "pr",
+		PRApprover:          "",
+		PRRequiredApprovals: intPtr(0),
+	}
+	provider := &fakePRProvider{
+		changesRequestedReviewers: []string{"reviewer-bot"},
+	}
+	err := VerifyPRApproval(provider, cfg, 42, nil)
+	var needsErr *NeedsApprovalError
+	if !errors.As(err, &needsErr) {
+		t.Fatalf("expected *NeedsApprovalError, got %T: %v", err, err)
+	}
+	if needsErr.PRNumber != 42 {
+		t.Errorf("PRNumber = %d, want 42", needsErr.PRNumber)
+	}
+	if !strings.Contains(err.Error(), "reviewer-bot") {
+		t.Errorf("error should name the blocking reviewer, got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "CHANGES_REQUESTED") {
+		t.Errorf("error should say CHANGES_REQUESTED, got %q", err.Error())
+	}
+	// The approver/count gates never even get a chance to run — a blocking
+	// reviewer short-circuits before them, same shape as the approver gate
+	// short-circuiting the count gate.
+	if provider.changesRequestedCalls != 1 {
+		t.Errorf("expected ChangesRequestedReviewers called once, got %d", provider.changesRequestedCalls)
+	}
+}
+
+// TestVerifyPRApproval_ChangesRequestedClearedBySupersedingReview is the
+// non-regression companion: once the blocking reviewer's most recent
+// review is no longer CHANGES_REQUESTED (ChangesRequestedReviewers, per
+// its documented contract, excludes a superseded verdict), the gate must
+// pass — this is how a findings-free block clears in practice: a
+// subsequent review with a non-blocking disposition, not thread
+// resolution.
+func TestVerifyPRApproval_ChangesRequestedClearedBySupersedingReview(t *testing.T) {
+	cfg := &MergeQueueConfig{
+		MergeStrategy:       "pr",
+		PRApprover:          "",
+		PRRequiredApprovals: intPtr(0),
+	}
+	provider := &fakePRProvider{
+		changesRequestedReviewers: nil, // superseded: no longer blocking
+	}
+	if err := VerifyPRApproval(provider, cfg, 42, nil); err != nil {
+		t.Fatalf("expected nil once no reviewer is actively blocking, got %v", err)
+	}
+}
+
+// TestVerifyPRApproval_ChangesRequestedLookupErrorPropagates ensures a
+// real provider failure (as opposed to ErrUnsupported) is not silently
+// swallowed — this is a merge-blocking safety check, not a best-effort
+// nudge like reRequestBlockingReviewers.
+func TestVerifyPRApproval_ChangesRequestedLookupErrorPropagates(t *testing.T) {
+	cfg := &MergeQueueConfig{MergeStrategy: "pr", PRApprover: "", PRRequiredApprovals: intPtr(0)}
+	provider := &fakePRProvider{changesRequestedErr: fmt.Errorf("boom")}
+	err := VerifyPRApproval(provider, cfg, 42, nil)
+	if err == nil {
+		t.Fatal("expected error to propagate")
+	}
+	var needsErr *NeedsApprovalError
+	if errors.As(err, &needsErr) {
+		t.Errorf("a lookup failure is not a NeedsApprovalError, got %v", err)
+	}
+}
+
+// TestVerifyPRApproval_ChangesRequestedUnsupportedIsTolerated ensures
+// providers that can't enumerate review states (Bitbucket) don't get
+// hard-blocked by this check — mirrors reRequestBlockingReviewers'
+// tolerance of ErrUnsupported.
+func TestVerifyPRApproval_ChangesRequestedUnsupportedIsTolerated(t *testing.T) {
+	cfg := &MergeQueueConfig{
+		MergeStrategy:       "pr",
+		PRApprover:          "gatekeeper",
+		PRRequiredApprovals: intPtr(0),
+	}
+	provider := &fakePRProvider{
+		changesRequestedErr: ErrUnsupported,
+		approvedBy:          map[string]bool{"gatekeeper": true},
+	}
+	if err := VerifyPRApproval(provider, cfg, 42, nil); err != nil {
+		t.Fatalf("expected ErrUnsupported to be tolerated, got %v", err)
 	}
 }
