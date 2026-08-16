@@ -113,6 +113,30 @@ func resolveReviewerRig(explicit string) (string, string, error) {
 	return r.Name, r.Path, nil
 }
 
+// knownRigNames returns every rig registered in the town, for use as the peer
+// set when resolving a reviewer session name.
+//
+// Collisions have to be resolved against ALL rigs, not just the one being asked
+// about: a rig missing from rigs.json still gets the fallback prefix and still
+// runs under literally "gt-reviewer", so it is exactly the peer that would go
+// undetected. Failing to load the list yields nil, which narrows the check
+// rather than blocking the command — the DefaultPrefix refusal still applies.
+func knownRigNames() []string {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return nil
+	}
+	rigsConfig, err := config.LoadRigsConfig(constants.MayorRigsPath(townRoot))
+	if err != nil {
+		return nil
+	}
+	names := make([]string, 0, len(rigsConfig.Rigs))
+	for name := range rigsConfig.Rigs {
+		names = append(names, name)
+	}
+	return names
+}
+
 // ReviewerState is the reported state of one rig's Reviewer, combining session
 // liveness with heartbeat progress.
 //
@@ -165,7 +189,7 @@ func collectReviewerState(rigName, rigPath string) ReviewerState {
 		StuckThreshold: clampedStuckThreshold(rigPath),
 	}
 
-	sessionName, serr := reviewer.ResolveSessionName(rigName)
+	sessionName, serr := reviewer.ResolveSessionName(rigName, knownRigNames())
 	if serr != nil {
 		// Refusing an ambiguous target matters more here than in the reaper:
 		// `gt reviewer stop` acts on this name, and a rig without beads.prefix
@@ -235,7 +259,7 @@ func runReviewerStop(cmd *cobra.Command, args []string) error {
 	// Refuse an ambiguous target. A rig without beads.prefix collapses onto the
 	// shared "gt-reviewer" session name, so guessing here would let an operator
 	// kill a rig they did not name.
-	sessionName, serr := reviewer.ResolveSessionName(rigName)
+	sessionName, serr := reviewer.ResolveSessionName(rigName, knownRigNames())
 	if serr != nil {
 		return fmt.Errorf("cannot determine which session belongs to rig %s: %w", rigName, serr)
 	}
