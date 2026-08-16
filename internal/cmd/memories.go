@@ -27,7 +27,7 @@ func init() {
 	memoriesCmd.Flags().StringVar(&memoriesModel, "model", "sonnet", "With --compact: model used for compaction reasoning")
 	memoriesCmd.Flags().StringVar(&memoriesInstructions, "instructions", "", "With --compact: extra guidance for the compaction model (e.g. \"drop everything about the retired reviewer\")")
 	memoriesCmd.Flags().StringVar(&memoriesInstructionsFile, "instructions-file", "", "With --compact: read --instructions from a file")
-	memoriesCmd.Flags().DurationVar(&memoriesCompactTimeout, "timeout", 0, "With --compact: model timeout (default scales with the number of memories)")
+	memoriesCmd.Flags().DurationVar(&memoriesCompactTimeout, "timeout", 0, "With --compact: model timeout (default scales with the total size of the stored memories)")
 	memoriesCmd.GroupID = GroupWork
 	rootCmd.AddCommand(memoriesCmd)
 }
@@ -52,8 +52,9 @@ compaction: guidance there outranks the default merge/dedup goals, so it can
 retire a topic outright or rewrite how a fact is phrased.
 
 Compaction asks the model to re-emit the whole memory set, so it takes minutes
-on a large store. The default --timeout scales with the number of memories;
-raise it with --timeout if a very large store still runs out of time.
+on a large store. The default --timeout scales with the total size of the
+stored values; raise it with --timeout if a very large store still runs out
+of time.
 
 Examples:
   gt memories                    # List all memories
