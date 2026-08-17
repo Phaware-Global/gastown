@@ -540,3 +540,21 @@ func TestReReviewDecision_ClosesTheUnanchoredBlockLoop(t *testing.T) {
 		t.Errorf("outcome = %v, want a case- and space-insensitive match", out)
 	}
 }
+
+func TestReReviewOutcome_ExitCodesMatchThePatrolContract(t *testing.T) {
+	// The formula reads exit 0 as "advance to PR.6", 1 as "still in flight —
+	// patrol again", 3 as "cap hit; escalation already filed". The first version
+	// of this path returned 0 on BOTH the dispatch and the capped branch, which
+	// told the patrol to advance immediately after starting a reviewer session
+	// and, at the cap, claimed an escalation that was only ever a println.
+	//
+	// This pins the outcome->exit mapping the caller switches on, so a change to
+	// either side has to change both.
+	if reReviewDispatch == reReviewNotBlocked || reReviewCapped == reReviewNotBlocked {
+		t.Fatal("outcomes must be distinguishable — the caller picks an exit code from them")
+	}
+	if reReviewDispatch == reReviewCapped {
+		t.Error("dispatch (wait) and capped (escalate) must not collapse: they map to " +
+			"different exit codes and different operator consequences")
+	}
+}

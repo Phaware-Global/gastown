@@ -250,8 +250,23 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 		// was not, the reviewer says so again and the iteration cap escalates as
 		// usual. Bounded by the same maxIter as the thread-driven path, so an
 		// objection nobody can satisfy escalates rather than looping.
-		if err := reReviewIfBlockedWithoutThreads(provider, cfg, state, maxIter); err != nil {
+		switch outcome, err := reReviewIfBlockedWithoutThreads(provider, cfg, state, maxIter); {
+		case err != nil:
 			return err
+		case outcome == reReviewDispatch:
+			// Exit 1, not 0. Every other dispatch in this command records an
+			// in-flight marker and tells the patrol to wait; this one used to
+			// print "advancing" immediately after starting a reviewer session,
+			// which both contradicted the log line above it and let the next
+			// cycle re-dispatch on top of a round still running. A review takes
+			// minutes and the patrol interval is 5m, so that produced concurrent
+			// duplicate reviews of the same SHA — and the Reviewer's whole output
+			// is one irreversible GitHub review.
+			return NewSilentExit(1)
+		case outcome == reReviewCapped:
+			// Exit 3: the escalation has been filed by reReviewIfBlockedWithout-
+			// Threads, which is the contract the formula's exit-3 arm states.
+			return NewSilentExit(3)
 		}
 		fmt.Fprintf(os.Stdout, "PR #%d: no unresolved review threads, advancing to wait-approval\n",
 			state.PRNumber)
@@ -817,44 +832,106 @@ var _ = time.Time{}
 // supersedes it — which, for the Reviewer's own login, only another review round
 // can produce.
 //
-// Returns a non-nil error only for operational failures. A rig with no
-// designated reviewer, a provider that cannot enumerate review states, or a
-// verdict from anyone other than cfg.PRReviewer are all "nothing to do here":
-// the first two cannot be acted on, and the third is not the town's to clear.
+// Returns a non-nil error only for operational failures. Three cases are
+// "nothing to do here": a rig with no designated reviewer, a provider that
+// cannot enumerate review states, and a verdict from anyone other than
+// cfg.PRReviewer — the first two cannot be acted on, and the third is not the
+// town's to clear.
+//
+// Deliberately NOT gated on cfg.ReviewerLocal. An earlier version was, while the
+// merge gate it exists to clear never has been, which left the external-bot
+// configuration (pr_reviewer set, reviewer_local false) with the same
+// unclearable wedge this function was written to close. The scopes are matched
+// on the gate's side instead — see trustedBlockingReviewers.
 func reReviewIfBlockedWithoutThreads(provider refinery.PRProvider, cfg *refinery.MergeQueueConfig,
-	state dispatchReviewFixState, maxIter int) error {
-	if cfg == nil || strings.TrimSpace(cfg.PRReviewer) == "" || !cfg.ReviewerLocal {
-		return nil
+	state dispatchReviewFixState, maxIter int) (reReviewOutcome, error) {
+	if cfg == nil || strings.TrimSpace(cfg.PRReviewer) == "" {
+		return reReviewNotBlocked, nil
 	}
 	blocking, err := provider.ChangesRequestedReviewers(state.PRNumber)
 	if err != nil {
 		// ErrUnsupported means the provider cannot answer. Advancing is the
 		// pre-existing behavior for those providers and this must not change it.
 		if errors.Is(err, refinery.ErrUnsupported) {
-			return nil
+			return reReviewNotBlocked, nil
 		}
-		return wrapOperationalErr(fmt.Errorf("checking blocking reviews on PR #%d: %w", state.PRNumber, err))
+		return reReviewNotBlocked, wrapOperationalErr(
+			fmt.Errorf("checking blocking reviews on PR #%d: %w", state.PRNumber, err))
 	}
-	round, decision := reReviewDecision(cfg.PRReviewer, blocking, state.ReviewLoopIter, maxIter)
-	switch decision {
+	round, outcome := reReviewDecision(cfg.PRReviewer, blocking, state.ReviewLoopIter, maxIter)
+	switch outcome {
 	case reReviewNotBlocked:
-		return nil
+		return outcome, nil
+
 	case reReviewCapped:
+		// Escalate, do not merely print. The thread-driven cap files an
+		// escalation and exits 3; this branch used to write one stdout line and
+		// return 0, so the terminal state of the loop — an objection nobody can
+		// satisfy, on the town's only automated merge path — reached no human at
+		// all and repeated forever in a log nobody re-reads.
 		fmt.Fprintf(os.Stdout,
 			"PR #%d: %s still requests changes with no unresolved threads after %d round(s) — "+
-				"not re-reviewing; a human must resolve the objection or dismiss the review\n",
+				"escalating; a human must resolve the objection or dismiss the review\n",
 			state.PRNumber, cfg.PRReviewer, maxIter)
-		return nil
+		desc := fmt.Sprintf("PR #%d blocked by %s with no unresolved threads after %d review round(s)",
+			state.PRNumber, cfg.PRReviewer, maxIter)
+		reason := fmt.Sprintf(
+			"%s holds an active CHANGES_REQUESTED verdict on PR #%d that produced no inline threads, "+
+				"so there is nothing for the review-fix loop to resolve. The review-round budget "+
+				"(pr_review_loop_max=%d) is spent.\n\n"+
+				"GitHub supersedes that verdict only with an APPROVED or DISMISSED review from the same "+
+				"login — a COMMENT does not. A human must either resolve the objection and have the "+
+				"reviewer pass a round cleanly, or dismiss the review on GitHub.\n",
+			cfg.PRReviewer, state.PRNumber, maxIter)
+		if eerr := escalateReviewLoopCap(desc, reason,
+			fmt.Sprintf("dispatch-review-fix:unanchored-cap:%s", refPrDispatchReviewFixMR)); eerr != nil {
+			return outcome, wrapOperationalErr(fmt.Errorf("escalating unanchored review block: %w", eerr))
+		}
+		return outcome, nil
 	}
+
 	fmt.Fprintf(os.Stdout,
 		"PR #%d: %s requests changes but opened no threads (unanchored objection) — "+
 			"re-dispatching review round %d, the only thing that can supersede it\n",
 		state.PRNumber, cfg.PRReviewer, round)
+	// Persist the round BEFORE dispatching. The counter is what bounds this
+	// loop, and nothing else writes it on this path: mqRecordDispatch's only
+	// other caller is the thread-driven stage, and `gt reviewer request` writes
+	// no bead state. Without it ReviewLoopIter stayed frozen at its loaded
+	// value, reReviewCapped was unreachable from production, and every patrol
+	// cycle re-dispatched a fresh review — one permanent bead and one Dolt
+	// commit each, forever, from a single findings-free objection.
+	//
+	// Before rather than after, so a failed write cannot leave a dispatched
+	// round uncounted; and operational rather than ignored, so the counter can
+	// never silently fail to advance.
+	if werr := mqRecordReviewRound(refPrDispatchReviewFixMR, round); werr != nil {
+		return reReviewNotBlocked, wrapOperationalErr(
+			fmt.Errorf("recording review round %d on MR %s: %w", round, refPrDispatchReviewFixMR, werr))
+	}
 	// Empty headSHA on purpose: `gt reviewer request` resolves the PR's CURRENT
 	// head, which is what a re-review should target — the point is to judge the
 	// tree as it now stands, not the SHA the stale verdict was anchored to.
-	if err := dispatchLocalReviewer(state.PRNumber, refPrDispatchReviewFixMR, "", round); err != nil {
-		return wrapOperationalErr(fmt.Errorf("re-dispatching review of PR #%d: %w", state.PRNumber, err))
+	if derr := dispatchLocalReviewer(state.PRNumber, refPrDispatchReviewFixMR, "", round); derr != nil {
+		return reReviewNotBlocked, wrapOperationalErr(
+			fmt.Errorf("re-dispatching review of PR #%d: %w", state.PRNumber, derr))
+	}
+	return reReviewDispatch, nil
+}
+
+// mqRecordReviewRound advances review_loop_iter without claiming a polecat.
+//
+// mqRecordDispatch always passes --polecat, which is right for the thread-driven
+// path (a polecat really is in flight) and wrong here: this path dispatches a
+// REVIEW, not a fix polecat, and writing a polecat name Stage 1 would then wait
+// on would wedge the loop on an actor that does not exist.
+func mqRecordReviewRound(mrID string, iter int) error {
+	cmd := exec.Command(gtBinary(), "mq", "set-review-state", mrID,
+		"--iter", fmt.Sprintf("%d", iter),
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("gt mq set-review-state failed: %s: %w",
+			strings.TrimSpace(string(out)), err)
 	}
 	return nil
 }

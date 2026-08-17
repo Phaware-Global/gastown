@@ -157,10 +157,24 @@ func VerifyPRApproval(provider PRProvider, cfg *MergeQueueConfig, prNumber int, 
 // invent one.
 func trustedBlockingReviewers(cfg *MergeQueueConfig, blocking []string) []string {
 	trusted := make(map[string]bool, 2)
-	for _, login := range []string{cfg.PRReviewer, cfg.PRApprover} {
-		if l := strings.ToLower(strings.TrimSpace(login)); l != "" {
-			trusted[l] = true
-		}
+	// pr_approver is always trusted: it names a human, and a human can always
+	// clear their own verdict.
+	//
+	// pr_reviewer only when reviewer_local. The gate must be no wider than the
+	// clearing path, and the clearing path is a re-dispatch of the IN-TOWN
+	// Reviewer. On an external-bot rig there is nothing in town that can produce
+	// the APPROVED or DISMISSED review GitHub requires — reRequestBlockingReviewers
+	// skips pr_reviewer by design, a follow-up COMMENT does not supersede, and the
+	// bot answers to nobody here — so trusting it would wedge the queue until a
+	// human dismissed the review by hand. That is the exact unclearable state
+	// this gate was added to prevent, and it is worse than the gate's absence:
+	// before any of this, an external bot's verdict did not block the merge path
+	// at all, and the thread-based gate still covers everything it can anchor.
+	if l := strings.ToLower(strings.TrimSpace(cfg.PRApprover)); l != "" {
+		trusted[l] = true
+	}
+	if l := strings.ToLower(strings.TrimSpace(cfg.PRReviewer)); l != "" && cfg.ReviewerLocal {
+		trusted[l] = true
 	}
 	if len(trusted) == 0 {
 		return nil
@@ -217,9 +231,10 @@ func verifyNoBlockingReview(provider PRProvider, cfg *MergeQueueConfig, prNumber
 		Detail: fmt.Sprintf(
 			"PR #%d has an active CHANGES_REQUESTED review from %s. GitHub supersedes it only with "+
 				"an APPROVED or DISMISSED review from that same login — a follow-up COMMENT does not. "+
-				"If the objection was unanchored there may be no threads to resolve, so the fix loop "+
-				"will not re-trigger a review on its own: push the fix and re-dispatch with "+
-				"`gt reviewer request %d --sha <new-head>`, or dismiss the review on GitHub.",
-			prNumber, who, prNumber),
+				"When the blocking login is the rig's pr_reviewer, the review-fix loop now re-dispatches "+
+				"a fresh review round automatically for this state (bounded by pr_review_loop_max, then "+
+				"escalated), so no manual step is needed — running one by hand would race it. When it is "+
+				"the pr_approver, that human must approve, dismiss, or have the objection resolved.",
+			prNumber, who),
 	}
 }

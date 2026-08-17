@@ -323,6 +323,7 @@ func TestVerifyPRApproval_ChangesRequestedFromTheDesignatedReviewerBlocks(t *tes
 	cfg := &MergeQueueConfig{
 		MergeStrategy:       "pr",
 		PRReviewer:          "reviewer-bot",
+		ReviewerLocal:       true, // the in-town Reviewer — the only one with a clearing path
 		PRApprover:          "",
 		PRRequiredApprovals: intPtr(0),
 	}
@@ -374,6 +375,7 @@ func TestVerifyPRApproval_ChangesRequestedFromAStrangerDoesNotBlock(t *testing.T
 	cfg := &MergeQueueConfig{
 		MergeStrategy:       "pr",
 		PRReviewer:          "reviewer-bot",
+		ReviewerLocal:       true,
 		PRApprover:          "human-approver",
 		PRRequiredApprovals: intPtr(0),
 	}
@@ -429,6 +431,7 @@ func TestVerifyPRApproval_ChangesRequestedClearsWhenTheReviewerNoLongerBlocks(t 
 	cfg := &MergeQueueConfig{
 		MergeStrategy:       "pr",
 		PRReviewer:          "reviewer-bot",
+		ReviewerLocal:       true,
 		PRRequiredApprovals: intPtr(0),
 	}
 	provider := &fakePRProvider{changesRequestedReviewers: []string{"reviewer-bot"}}
@@ -510,9 +513,41 @@ func TestVerifyPRApproval_UnsetReviewerIsAKnownGapNotAGuarantee(t *testing.T) {
 		t.Fatalf("KNOWN GAP changed: with pr_reviewer unset the Reviewer's verdict is not "+
 			"recognized and the merge proceeds; got %v", err)
 	}
-	// Naming the login is what closes it today.
+	// Naming the login AND running the in-town Reviewer is what closes it today.
 	cfg.PRReviewer = "phaware-val"
+	cfg.ReviewerLocal = true
 	if err := VerifyPRApproval(provider, cfg, 42, nil); err == nil {
 		t.Error("once the rig designates the Reviewer's login, its verdict must block")
+	}
+}
+
+// TestVerifyPRApproval_ExternalReviewerIsNotTrusted pins the scope match between
+// this gate and its clearing path.
+//
+// The clearing path is a re-dispatch of the IN-TOWN Reviewer. On an
+// external-bot rig (pr_reviewer set, reviewer_local false) nothing in town can
+// produce the APPROVED or DISMISSED review GitHub requires: reRequestBlocking-
+// Reviewers skips pr_reviewer by design, a follow-up COMMENT does not
+// supersede, and the bot answers to nobody here. Trusting it would wedge the
+// merge queue until a human dismissed the review by hand — worse than the gate's
+// absence, since before this feature an external bot's verdict did not block the
+// merge path at all and the thread-based gate still covers everything anchorable.
+func TestVerifyPRApproval_ExternalReviewerIsNotTrusted(t *testing.T) {
+	cfg := &MergeQueueConfig{
+		MergeStrategy:       "pr",
+		PRReviewer:          "external-bot",
+		ReviewerLocal:       false,
+		PRRequiredApprovals: intPtr(0),
+	}
+	provider := &fakePRProvider{changesRequestedReviewers: []string{"external-bot"}}
+	if err := VerifyPRApproval(provider, cfg, 42, nil); err != nil {
+		t.Fatalf("an external reviewer has no in-town clearing path, so trusting it would wedge "+
+			"the queue; got %v", err)
+	}
+	// Flipping reviewer_local — which is what gives it a clearing path — is what
+	// makes the same verdict blocking.
+	cfg.ReviewerLocal = true
+	if err := VerifyPRApproval(provider, cfg, 42, nil); err == nil {
+		t.Error("the in-town Reviewer's verdict must block, since the loop can clear it")
 	}
 }
