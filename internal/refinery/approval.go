@@ -198,6 +198,12 @@ func trustedBlockingReviewers(cfg *MergeQueueConfig, blocking []string) []string
 // VerifyReviewThreadsResolved and the review-fix loop read that as "ready to
 // advance" — the refinery would merge the PR the Reviewer had just blocked.
 //
+// The gate fires at PR.7 (`gt refinery pr merge` / doMergePR), NOT at PR.6.
+// PR.6 (`wait-approval`) polls only IsPRApprovedBy and CountApprovals and never
+// consults review state, so it reports success and waves an unanchored block
+// through — worth knowing when debugging a wedge, because the formula points a
+// stuck MR back at PR.4 and PR.6, both of which will report ready.
+//
 // Clearing it is a MANUAL step today, and the message says so rather than
 // implying otherwise. An automatic clearing round — re-dispatching the Reviewer
 // when it holds an unanchored block — was implemented here and then withdrawn:
@@ -235,16 +241,40 @@ func verifyNoBlockingReview(provider PRProvider, cfg *MergeQueueConfig, prNumber
 		_, _ = fmt.Fprintf(out, "[Engineer] PR #%d has an active CHANGES_REQUESTED review from %s — deferring merge\n",
 			prNumber, who)
 	}
+	// Lead with the remedy that applies to the login actually holding the
+	// verdict. Naming the inapplicable one first steers the reader wrong, and
+	// this string is now the only clearing instruction there is.
+	remedy := fmt.Sprintf(
+		"Address the objection, then re-dispatch with `gt reviewer request %d` — the Reviewer "+
+			"clears its own block by passing a round cleanly. Nothing re-triggers that "+
+			"automatically: the review-fix loop is thread-driven and an unanchored objection "+
+			"creates no thread. Dismissing the review on GitHub also clears it.", prNumber)
+	if !holdsReviewerVerdict(cfg, blocking) {
+		remedy = "That login is the rig's pr_approver, a human: they must approve the PR or " +
+			"dismiss their own review. No in-town command can supersede it."
+	}
 	return &NeedsApprovalError{
 		PRNumber: prNumber,
 		Detail: fmt.Sprintf(
 			"PR #%d has an active CHANGES_REQUESTED review from %s. GitHub supersedes it only with "+
-				"an APPROVED or DISMISSED review from that same login — a follow-up COMMENT does not. "+
-				"If the objection was unanchored there are no threads to resolve, and the review-fix "+
-				"loop is thread-driven, so it will NOT re-trigger a round on its own. Address the "+
-				"objection, then either re-dispatch with `gt reviewer request %d` (the reviewer clears "+
-				"its own block by passing a round cleanly) or dismiss the review on GitHub. When the "+
-				"blocking login is the pr_approver, that human must approve or dismiss.",
-			prNumber, who, prNumber),
+				"an APPROVED or DISMISSED review from that same login — a follow-up COMMENT does not. %s",
+			prNumber, who, remedy),
 	}
+}
+
+// holdsReviewerVerdict reports whether the blocking set includes the rig's
+// pr_reviewer, as opposed to only its pr_approver. The two have different
+// remedies — one is an in-town re-dispatch, the other is a human — and the
+// operator message leads with whichever applies.
+func holdsReviewerVerdict(cfg *MergeQueueConfig, blocking []string) bool {
+	want := strings.ToLower(strings.TrimSpace(cfg.PRReviewer))
+	if want == "" || !cfg.ReviewerLocal {
+		return false
+	}
+	for _, login := range blocking {
+		if strings.ToLower(strings.TrimSpace(login)) == want {
+			return true
+		}
+	}
+	return false
 }

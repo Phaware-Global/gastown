@@ -233,12 +233,21 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 		return wrapOperationalErr(fmt.Errorf("polling unresolved threads: %w", err))
 	}
 	if len(threads) == 0 {
-		// NOTE: zero threads is not the same as nothing blocking — the Reviewer
-		// can deliver an unanchorable objection via `disposition`, which posts
+		// Zero threads is not the same as nothing blocking. The Reviewer can
+		// deliver an unanchorable objection via `disposition`, which posts
 		// REQUEST_CHANGES with no findings and therefore no threads for this loop
-		// to drive. VerifyPRApproval catches that at PR.6 and defers the merge
-		// with an operator remedy; automating the clearing round is deliberately
-		// NOT done here. See the note on verifyNoBlockingReview.
+		// to drive. VerifyPRApproval catches it at PR.7 and defers the merge.
+		//
+		// Automating the clearing round is deliberately NOT done here (see the
+		// note on verifyNoBlockingReview). But the state must not be SILENT:
+		// without a thread there is no fix loop, without a fix loop there is no
+		// iteration cap, and without the cap nothing ever escalated — the patrol
+		// would print "awaiting human approval, will retry next poll" forever.
+		// A terminal state that reaches no human is worse than a loud failure, so
+		// this announces it once and lets the operator act.
+		if err := escalateUnanchoredBlock(provider, cfg, state); err != nil {
+			return err
+		}
 		fmt.Fprintf(os.Stdout, "PR #%d: no unresolved review threads, advancing to wait-approval\n",
 			state.PRNumber)
 		return nil
@@ -793,3 +802,70 @@ func escalateReviewLoopCapArgs(description, fingerprintSuffix string) []string {
 // Compile-time silencer for time.Time so test harnesses that import this
 // file don't fail under -unused. The helper is a no-op.
 var _ = time.Time{}
+
+// escalateUnanchoredBlock files one escalation when a designated reviewer holds
+// a CHANGES_REQUESTED verdict that produced no threads.
+//
+// Deliberately minimal: it notifies and returns. It does not dispatch, persist a
+// counter, or claim an in-flight marker — that was the automatic clearing path,
+// which was withdrawn because getting those four concerns right is its own
+// change. Notification needs none of them, and the absence of one was the real
+// harm: the thread-driven cap escalates, and removing the loop left this branch
+// with no announcement on any path.
+//
+// Idempotent by fingerprint: `gt escalate --fingerprint` dedupes per MR, so a
+// patrol cycling every few minutes files one escalation rather than one per
+// cycle. That is the whole reason this is safe to do without a persisted marker.
+func escalateUnanchoredBlock(provider refinery.PRProvider, cfg *refinery.MergeQueueConfig,
+	state dispatchReviewFixState) error {
+	if cfg == nil {
+		return nil
+	}
+	blocking, err := provider.ChangesRequestedReviewers(state.PRNumber)
+	if err != nil {
+		// ErrUnsupported means the provider cannot answer; advancing quietly is
+		// the pre-existing behavior for those providers.
+		if errors.Is(err, refinery.ErrUnsupported) {
+			return nil
+		}
+		return wrapOperationalErr(
+			fmt.Errorf("checking blocking reviews on PR #%d: %w", state.PRNumber, err))
+	}
+	who := blockingDesignatedReviewer(cfg, blocking)
+	if who == "" {
+		return nil
+	}
+	fmt.Fprintf(os.Stdout,
+		"PR #%d: %s requests changes but opened no threads — nothing for the review-fix loop to "+
+			"resolve; escalating\n", state.PRNumber, who)
+	desc := fmt.Sprintf("PR #%d blocked by %s with no unresolved threads", state.PRNumber, who)
+	reason := fmt.Sprintf(
+		"%s holds an active CHANGES_REQUESTED verdict on PR #%d that produced no inline threads, "+
+			"so the review-fix loop has nothing to act on and the merge is deferred at PR.7.\n\n"+
+			"GitHub supersedes that verdict only with an APPROVED or DISMISSED review from the same "+
+			"login — a COMMENT does not. Address the objection and re-dispatch with "+
+			"`gt reviewer request %d`, or dismiss the review on GitHub.\n",
+		who, state.PRNumber, state.PRNumber)
+	if eerr := escalateReviewLoopCap(desc, reason,
+		fmt.Sprintf("dispatch-review-fix:unanchored-block:%s", refPrDispatchReviewFixMR)); eerr != nil {
+		return wrapOperationalErr(fmt.Errorf("escalating unanchored review block: %w", eerr))
+	}
+	return nil
+}
+
+// blockingDesignatedReviewer returns the rig's designated reviewer login when it
+// is among the blocking set, else "". Mirrors the merge gate's scope: pr_reviewer
+// only under reviewer_local, since that is the only configuration where the
+// verdict both blocks and has an in-town remedy to name.
+func blockingDesignatedReviewer(cfg *refinery.MergeQueueConfig, blocking []string) string {
+	want := strings.ToLower(strings.TrimSpace(cfg.PRReviewer))
+	if want == "" || !cfg.ReviewerLocal {
+		return ""
+	}
+	for _, login := range blocking {
+		if strings.ToLower(strings.TrimSpace(login)) == want {
+			return login
+		}
+	}
+	return ""
+}

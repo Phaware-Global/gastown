@@ -609,54 +609,192 @@ func DefaultOverrides() map[string]*HooksConfig {
 				//
 				// Listed per tool rather than as one wildcard because the block
 				// must name what it refuses: a future MCP write surface is NOT
-				// covered here and should be added deliberately.
+				// covered here and should be added deliberately. That convention
+				// only pays if the enumeration is actually walked — a tool that is
+				// PRESENT but unlisted is a hole, not a carve-out — so this covers
+				// the whole remote-write and review-write family the server
+				// exposes, not just the obvious members.
 				//
-				// The server segment is wildcarded, though. `mcp__github__x` is
-				// only the tool's name when the user happens to key that server
-				// "github" in ~/.claude.json; the key is user-chosen, so pinning
-				// it made all of these fail open under any other alias — a guard
-				// that silently depends on someone else's naming is not a guard.
-				// The suffix is the part the tool actually defines.
+				// TWO matchers per tool, deliberately, because the matcher is a
+				// REGEX over the tool name — per the vendored hook reference
+				// (plugin-dev/skills/hook-development/SKILL.md § Matchers, which
+				// documents `mcp__.*__delete.*` as the MCP form). An earlier
+				// attempt to solve the alias problem with `mcp__*__<tool>` used
+				// `*` as a glob; read as a regex that is `mcp_` + `_*` +
+				// `__<tool>`, which cannot span a server segment and therefore
+				// matched NO real tool name — turning a widened guard into no
+				// guard at all, with the substring-scanning test still green.
+				//
+				// So: `mcp__.*__<tool>` covers any server alias under a regex
+				// engine, and the literal `mcp__github__<tool>` covers the
+				// default alias under an exact-match engine. They are cheap and
+				// non-conflicting, and the pair is correct under either.
 				{
-					Matcher: "mcp__*__pull_request_review_write",
+					Matcher: "mcp__.*__pull_request_review_write",
 					Hooks: []Hook{{
 						Type:    "command",
 						Command: "echo '❌ BLOCKED: Reviews go out only through `gt reviewer post`, which derives the verdict from findings and anchors it to the reviewed SHA. Submitting one directly skips all of that.' && exit 2",
 					}},
 				},
 				{
-					Matcher: "mcp__*__add_comment_to_pending_review",
+					Matcher: "mcp__github__pull_request_review_write",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviews go out only through `gt reviewer post`, which derives the verdict from findings and anchors it to the reviewed SHA. Submitting one directly skips all of that.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__add_comment_to_pending_review",
 					Hooks: []Hook{{
 						Type:    "command",
 						Command: "echo '❌ BLOCKED: Reviews go out only through `gt reviewer post`.' && exit 2",
 					}},
 				},
 				{
-					Matcher: "mcp__*__merge_pull_request",
+					Matcher: "mcp__github__add_comment_to_pending_review",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviews go out only through `gt reviewer post`.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__merge_pull_request",
 					Hooks: []Hook{{
 						Type:    "command",
 						Command: "echo '❌ BLOCKED: The Reviewer never merges.' && exit 2",
 					}},
 				},
 				{
-					Matcher: "mcp__*__push_files",
+					Matcher: "mcp__github__merge_pull_request",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer never merges.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__push_files",
 					Hooks: []Hook{{
 						Type:    "command",
 						Command: "echo '❌ BLOCKED: The reviewer worktree is checkout-only; the Reviewer never pushes.' && exit 2",
 					}},
 				},
 				{
-					Matcher: "mcp__*__delete_file",
+					Matcher: "mcp__github__push_files",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The reviewer worktree is checkout-only; the Reviewer never pushes.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__create_or_update_file",
 					Hooks: []Hook{{
 						Type:    "command",
 						Command: "echo '❌ BLOCKED: The reviewer worktree is checkout-only; the Reviewer never writes to the remote.' && exit 2",
 					}},
 				},
 				{
-					Matcher: "mcp__*__create_or_update_file",
+					Matcher: "mcp__github__create_or_update_file",
 					Hooks: []Hook{{
 						Type:    "command",
 						Command: "echo '❌ BLOCKED: The reviewer worktree is checkout-only; the Reviewer never writes to the remote.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__delete_file",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The reviewer worktree is checkout-only; the Reviewer never writes to the remote.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__delete_file",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The reviewer worktree is checkout-only; the Reviewer never writes to the remote.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__update_pull_request",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer judges the PR; it does not edit it. Changing the title, body or BASE branch rewrites the artifact under review.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__update_pull_request",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer judges the PR; it does not edit it. Changing the title, body or BASE branch rewrites the artifact under review.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__create_pull_request",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer never opens PRs.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__create_pull_request",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer never opens PRs.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__update_pull_request_branch",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer never updates the PR branch — that changes the diff it was asked to judge.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__update_pull_request_branch",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer never updates the PR branch — that changes the diff it was asked to judge.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__create_branch",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The reviewer worktree is checkout-only; the Reviewer never creates refs.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__create_branch",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The reviewer worktree is checkout-only; the Reviewer never creates refs.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__fork_repository",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer never forks.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__fork_repository",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer never forks.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__add_reply_to_pull_request_comment",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Review output goes only through `gt reviewer post`, which applies the output contract. Replying directly bypasses it.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__add_reply_to_pull_request_comment",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Review output goes only through `gt reviewer post`, which applies the output contract. Replying directly bypasses it.' && exit 2",
 					}},
 				},
 			},

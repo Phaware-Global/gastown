@@ -95,12 +95,12 @@ in your `verdict` alone it changes nothing: a pass returning zero findings and
 "BLOCK: do not merge" posts as an **APPROVE** with that sentence as the body.
 `disposition` is the only way to express an unanchorable objection at all — but
 be aware of what it does and does not stop. It sets the GitHub verdict to
-REQUEST_CHANGES, which blocks the in-town merge gate **only when the rig
-runs the in-town Reviewer (`reviewer_local`) AND designates your login as
-`pr_reviewer`**, or designates it as `pr_approver`; where it does not,
-the escalation changes the badge and the review body and nothing else — and
-clearing it then needs an operator, since the fix loop is thread-driven and an
-unanchored objection creates no thread. An
+REQUEST_CHANGES. Where the rig runs the in-town Reviewer (`reviewer_local`) and
+designates your login as `pr_reviewer` — the primary configuration — that DOES
+block the merge, **and clearing it then needs an operator**: the fix loop is
+thread-driven, and an unanchored objection creates no thread for it to act on, so
+nothing in town re-triggers a review on its own. Where the rig does neither, the
+escalation changes the badge and the review body and nothing else. An
 **anchored** finding is stronger: unresolved threads block the merge for every
 rig, identity-agnostic and config-free. So when a concern CAN be tied to a
 `file:line`, prefer the finding — reach for `disposition` when it genuinely
