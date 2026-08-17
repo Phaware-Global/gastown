@@ -198,6 +198,15 @@ func trustedBlockingReviewers(cfg *MergeQueueConfig, blocking []string) []string
 // VerifyReviewThreadsResolved and the review-fix loop read that as "ready to
 // advance" — the refinery would merge the PR the Reviewer had just blocked.
 //
+// Clearing it is a MANUAL step today, and the message says so rather than
+// implying otherwise. An automatic clearing round — re-dispatching the Reviewer
+// when it holds an unanchored block — was implemented here and then withdrawn:
+// it needs a persisted round counter, an in-flight marker the next patrol cycle
+// can see, an escalation at the cap, and a scope that matches this gate's, and
+// getting any of them wrong turns one objection into an unbounded dispatch loop
+// against the town's only merge path. That belongs in its own change with its
+// own review, not bolted onto this one.
+//
 // The detail message states what actually clears the block, which is narrower
 // than it first appears: GitHub supersedes a CHANGES_REQUESTED review only with
 // an APPROVED or a DISMISSED one from the SAME login. A follow-up COMMENT does
@@ -231,10 +240,11 @@ func verifyNoBlockingReview(provider PRProvider, cfg *MergeQueueConfig, prNumber
 		Detail: fmt.Sprintf(
 			"PR #%d has an active CHANGES_REQUESTED review from %s. GitHub supersedes it only with "+
 				"an APPROVED or DISMISSED review from that same login — a follow-up COMMENT does not. "+
-				"When the blocking login is the rig's pr_reviewer, the review-fix loop now re-dispatches "+
-				"a fresh review round automatically for this state (bounded by pr_review_loop_max, then "+
-				"escalated), so no manual step is needed — running one by hand would race it. When it is "+
-				"the pr_approver, that human must approve, dismiss, or have the objection resolved.",
-			prNumber, who),
+				"If the objection was unanchored there are no threads to resolve, and the review-fix "+
+				"loop is thread-driven, so it will NOT re-trigger a round on its own. Address the "+
+				"objection, then either re-dispatch with `gt reviewer request %d` (the reviewer clears "+
+				"its own block by passing a round cleanly) or dismiss the review on GitHub. When the "+
+				"blocking login is the pr_approver, that human must approve or dismiss.",
+			prNumber, who, prNumber),
 	}
 }

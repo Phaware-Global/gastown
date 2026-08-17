@@ -152,7 +152,7 @@ func (e *AwaitReviewTimeoutError) Error() string {
 // State machine (in.StartedAt = "is trigger posted yet?"):
 //
 //   - StartedAt zero       → post trigger, return AwaitStatusTriggerPosted
-//                            with NewStartedAt = Now(). Caller persists.
+//     with NewStartedAt = Now(). Caller persists.
 //   - elapsed < MinWait    → AwaitStatusWaiting (RemainingWait set).
 //   - threads unresolved   → AwaitStatusNeedsResolution.
 //   - reviewer engaged AND threads clean → AwaitStatusReady.

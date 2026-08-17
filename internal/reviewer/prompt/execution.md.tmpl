@@ -96,8 +96,11 @@ in your `verdict` alone it changes nothing: a pass returning zero findings and
 `disposition` is the only way to express an unanchorable objection at all — but
 be aware of what it does and does not stop. It sets the GitHub verdict to
 REQUEST_CHANGES, which blocks the in-town merge gate **only when the rig
-designates your login as `pr_reviewer` or `pr_approver`**; where it does not,
-the escalation changes the badge and the review body and nothing else. An
+runs the in-town Reviewer (`reviewer_local`) AND designates your login as
+`pr_reviewer`**, or designates it as `pr_approver`; where it does not,
+the escalation changes the badge and the review body and nothing else — and
+clearing it then needs an operator, since the fix loop is thread-driven and an
+unanchored objection creates no thread. An
 **anchored** finding is stronger: unresolved threads block the merge for every
 rig, identity-agnostic and config-free. So when a concern CAN be tied to a
 `file:line`, prefer the finding — reach for `disposition` when it genuinely

@@ -150,10 +150,13 @@ a diff line — an architectural objection. Without it, such a pass returns zero
 findings and the review posts as APPROVE with "do not merge" as its body.
 
 Note what it does not do: a findings-free REQUEST_CHANGES blocks the in-town
-merge gate only when the rig designates the Reviewer's login as `pr_reviewer` or
-`pr_approver`. An anchored finding is stronger — unresolved threads block for
-every rig regardless of config — so prefer a `file:line` finding whenever the
-concern can carry one.
+merge gate only when the rig runs the in-town Reviewer (`reviewer_local`) and
+designates its login as `pr_reviewer`, or designates it as `pr_approver`. It also
+needs an operator to clear, because the fix loop is thread-driven and an
+unanchored objection creates no thread. An anchored finding is stronger —
+unresolved threads block for every rig regardless of config, and the fix loop
+acts on them — so prefer a `file:line` finding whenever the concern can carry
+one.
 
 It is a **floor, not an override**: the posted event is the more blocking of the
 disposition and the severity tally. So a `comment` from one lens can never pull

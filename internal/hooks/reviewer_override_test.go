@@ -45,11 +45,14 @@ func TestReviewerOverrideBlocksWriteSurfaces(t *testing.T) {
 		// shell as the only way out; a review submitted through the GitHub MCP
 		// tools touches no shell command and skips every output-contract check
 		// `gt reviewer post` performs.
-		"mcp__github__pull_request_review_write",
-		"mcp__github__add_comment_to_pending_review",
-		"mcp__github__merge_pull_request",
-		"mcp__github__push_files",
-		"mcp__github__create_or_update_file",
+		"mcp__*__pull_request_review_write",
+		"mcp__*__add_comment_to_pending_review",
+		"mcp__*__merge_pull_request",
+		"mcp__*__push_files",
+		"mcp__*__create_or_update_file",
+		// delete_file is the third tool in the same remote-write family; naming
+		// two of three is the kind of gap an enumerated list exists to prevent.
+		"mcp__*__delete_file",
 	}
 	for _, needle := range wantBlocked {
 		if !matcherCovers(rev.PreToolUse, needle) {
