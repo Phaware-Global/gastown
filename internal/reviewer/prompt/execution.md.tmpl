@@ -93,7 +93,15 @@ change as a whole. Section 4 requires every finding to carry a concrete
 `file:line`, so such an objection cannot be expressed as a finding at all. Left
 in your `verdict` alone it changes nothing: a pass returning zero findings and
 "BLOCK: do not merge" posts as an **APPROVE** with that sentence as the body.
-`disposition` is the only way to make an unanchorable objection actually block.
+`disposition` is the only way to express an unanchorable objection at all — but
+be aware of what it does and does not stop. It sets the GitHub verdict to
+REQUEST_CHANGES, which blocks the in-town merge gate **only when the rig
+designates your login as `pr_reviewer` or `pr_approver`**; where it does not,
+the escalation changes the badge and the review body and nothing else. An
+**anchored** finding is stronger: unresolved threads block the merge for every
+rig, identity-agnostic and config-free. So when a concern CAN be tied to a
+`file:line`, prefer the finding — reach for `disposition` when it genuinely
+cannot.
 
 It can only raise the verdict, never lower it: the posted event is the more
 blocking of your disposition and the severity tally, and `approve` is rejected.

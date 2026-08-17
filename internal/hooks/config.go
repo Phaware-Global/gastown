@@ -484,6 +484,14 @@ func DefaultOverrides() map[string]*HooksConfig {
 		// Everything below is blocked so a prompt-injected or confused reviewer
 		// session can't merge, push, resolve threads, drive the refinery, close
 		// MR beads, or route a verdict around `gt reviewer post`.
+		//
+		// Two transports are covered: the Bash tool (shell commands) and the
+		// GitHub MCP write tools. That pairing is the point — an earlier version
+		// modelled only the shell, and every accepted finding against it was a
+		// variant of one transport until one arrived that needed no shell at all.
+		// A NEW write surface is not covered by construction; adding it here is a
+		// deliberate step, and the matchers are listed per tool rather than
+		// wildcarded so that stays visible.
 		"reviewer": {
 			PreToolUse: []HookEntry{
 				{
@@ -585,6 +593,57 @@ func DefaultOverrides() map[string]*HooksConfig {
 					Hooks: []Hook{{
 						Type:    "command",
 						Command: "echo '❌ BLOCKED: Thread resolution belongs to the authoring polecat, not the Reviewer.' && exit 2",
+					}},
+				},
+				// Every matcher above is scoped to Bash(...), which models the
+				// shell as the only way out. It is not. MCP servers load in
+				// gt-spawned Claude sessions unless suppressed — memories_compact
+				// passes --strict-mcp-config precisely because the default is the
+				// opposite, and no reviewer dispatch path passes it — so a reviewer
+				// session reaches mcp__github__* write tools directly. A review
+				// submitted through one touches no shell command, matches none of
+				// the patterns above, and skips every output-contract check
+				// `gt reviewer post` performs: severity derivation, the disposition
+				// floor, the findings anchor. The resulting APPROVE is a real
+				// approval that GhPrApprovalCount folds with no bot exclusion.
+				//
+				// Bare tool-name matchers, the form the mayor override already
+				// uses. Listed per tool rather than as one wildcard because the
+				// block must name what it refuses: a future MCP write surface is
+				// NOT covered here and should be added deliberately.
+				{
+					Matcher: "mcp__github__pull_request_review_write",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviews go out only through `gt reviewer post`, which derives the verdict from findings and anchors it to the reviewed SHA. Submitting one directly skips all of that.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__add_comment_to_pending_review",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviews go out only through `gt reviewer post`.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__merge_pull_request",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer never merges.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__push_files",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The reviewer worktree is checkout-only; the Reviewer never pushes.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__create_or_update_file",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The reviewer worktree is checkout-only; the Reviewer never writes to the remote.' && exit 2",
 					}},
 				},
 			},

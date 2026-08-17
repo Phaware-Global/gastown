@@ -271,30 +271,6 @@ func dispositionValues(s string) []string {
 	return out
 }
 
-// jsonStringValue extracts a `"key": "value"` string from a JSON-ish block,
-// tolerating arbitrary spacing around the colon.
-func jsonStringValue(block, key string) (string, bool) {
-	i := strings.Index(block, `"`+key+`"`)
-	if i < 0 {
-		return "", false
-	}
-	rest := block[i+len(key)+2:]
-	c := strings.Index(rest, ":")
-	if c < 0 {
-		return "", false
-	}
-	rest = strings.TrimSpace(rest[c+1:])
-	if len(rest) == 0 || rest[0] != '"' {
-		return "", false
-	}
-	rest = rest[1:]
-	e := strings.Index(rest, `"`)
-	if e < 0 {
-		return "", false
-	}
-	return rest[:e], true
-}
-
 func TestSchemaGuard_CatchesCaseAndSpacingVariants(t *testing.T) {
 	// The guard itself needs a guard: the round-3 defect was a literal in the
 	// schema, and a spelling-sensitive check would have let the same defect back
@@ -305,12 +281,21 @@ func TestSchemaGuard_CatchesCaseAndSpacingVariants(t *testing.T) {
 		`{"disposition":"REQUEST_CHANGES"}`,
 		`{"disposition":  " request_changes "}`,
 	} {
-		v, ok := jsonStringValue(block, "disposition")
-		if !ok {
-			t.Fatalf("jsonStringValue failed on %s", block)
+		// Extract with the GUARD'S OWN function, not a parallel one. An earlier
+		// version used a hand-rolled scanner here, so the two tolerances were
+		// independent: the scanner found the colon by hand while the guard's
+		// tolerance lives entirely in its regexp's \s* groups. Tightening the
+		// pattern to `"disposition":\s*"..."` would then make `"disposition" :
+		// "request_changes"` invisible to the real guard while this test stayed
+		// green — the guard's variant-tolerance reported as covered when it was
+		// not.
+		values := dispositionValues(block)
+		if len(values) != 1 {
+			t.Fatalf("dispositionValues(%s) = %v, want exactly one value — the guard's own "+
+				"extractor must see this variant", block, values)
 		}
-		if dispositionRank(v) == 0 {
-			t.Errorf("%s: value %q must be recognized as actionable", block, v)
+		if dispositionRank(values[0]) == 0 {
+			t.Errorf("%s: value %q must be recognized as actionable", block, values[0])
 		}
 	}
 	// The shipped placeholder must NOT trip it. Read it out of the real
@@ -329,5 +314,47 @@ func TestSchemaGuard_CatchesCaseAndSpacingVariants(t *testing.T) {
 	}
 	if dispositionRank(values[0]) != 0 {
 		t.Errorf("the shipped placeholder %q must not be actionable", values[0])
+	}
+}
+
+func TestDispositionError_SteersTheRepairAwayFromAFalseBlock(t *testing.T) {
+	// This string is the only error-recovery guidance a perspective pass gets:
+	// it is printed, the pass reads it, and it repairs its output from that text
+	// alone. So the ORDERING is behavior, not prose. A conventional
+	// "invalid disposition %q (want request_changes or comment)" enumerates only
+	// the two accepted values and steers the repair toward picking one —
+	// reproducing the false block this function was written to prevent. Omission
+	// has to come first.
+	msg := dispositionError("bogus")
+	omit := strings.Index(msg, "omit")
+	if omit < 0 {
+		t.Fatalf("message must offer omission as the repair: %q", msg)
+	}
+	for _, v := range []string{"request_changes", "comment"} {
+		if at := strings.Index(msg, v); at >= 0 && at < omit {
+			t.Errorf("message names %q before offering omission, which steers the repair "+
+				"toward a false block: %q", v, msg)
+		}
+	}
+
+	// A literally-copied schema placeholder gets named as such, so the pass
+	// repairs by dropping the field rather than by guessing at a value. The
+	// generic message would send it looking for a real disposition it never
+	// meant to set.
+	ph := dispositionError("<optional; omit unless escalating — request_changes|comment>")
+	if !strings.Contains(ph, "PLACEHOLDER") {
+		t.Errorf("a <...> value must be named as the copied placeholder: %q", ph)
+	}
+
+	// Both surface through the two callers that hand the string to an agent.
+	if _, err := ParsePerspectiveResult([]byte(`{"perspective":"p","verdict":"v","disposition":"bogus"}`)); err == nil {
+		t.Error("ParsePerspectiveResult must reject an invalid disposition")
+	} else if !strings.Contains(err.Error(), "omit") {
+		t.Errorf("ParsePerspectiveResult must surface the recovery guidance: %v", err)
+	}
+	if _, err := ParseFindings([]byte(`{"summary":"s","disposition":"bogus","findings":[]}`)); err == nil {
+		t.Error("ParseFindings must reject an invalid disposition")
+	} else if !strings.Contains(err.Error(), "omit") {
+		t.Errorf("ParseFindings must surface the recovery guidance: %v", err)
 	}
 }

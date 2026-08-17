@@ -41,6 +41,15 @@ func TestReviewerOverrideBlocksWriteSurfaces(t *testing.T) {
 		"git push",
 		"gt refinery pr",
 		"resolveReviewThread",
+		// The MCP transport. Every matcher above is Bash-scoped, which models the
+		// shell as the only way out; a review submitted through the GitHub MCP
+		// tools touches no shell command and skips every output-contract check
+		// `gt reviewer post` performs.
+		"mcp__github__pull_request_review_write",
+		"mcp__github__add_comment_to_pending_review",
+		"mcp__github__merge_pull_request",
+		"mcp__github__push_files",
+		"mcp__github__create_or_update_file",
 	}
 	for _, needle := range wantBlocked {
 		if !matcherCovers(rev.PreToolUse, needle) {
@@ -81,6 +90,17 @@ func TestReviewerOverrideApplicableViaRigRole(t *testing.T) {
 // is exactly what happened: `Bash(*gh api graphql*)` required the endpoint to
 // follow `gh api` contiguously, so every flag-first invocation escaped all three
 // GraphQL guards while the suite stayed green.
+//
+// BOUNDARY, stated because this test is easy to over-read: it validates matcher
+// SHAPE against an assumed `*`-glob semantics, not against the engine that
+// enforces the block. Nothing in this repository consumes HookEntry.Matcher as a
+// pattern — the strings are serialized into settings.json and interpreted by
+// Claude Code, out of tree — so globMatches below is this file's model of that
+// engine (split on `*`, literals in order, first segment anchored, last as
+// suffix), not the engine itself. If the harness's semantics diverge, these
+// assertions can pass while the guards do not fire. Closing that would need an
+// end-to-end check against a real session, or moving enforcement into a
+// `gt tap guard` handler that inspects the hook JSON in Go.
 func TestReviewerOverride_BlocksRealGraphQLCommandStrings(t *testing.T) {
 	rev, ok := DefaultOverrides()["reviewer"]
 	if !ok {

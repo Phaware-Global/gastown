@@ -478,3 +478,41 @@ func TestVerifyPRApproval_ChangesRequestedUnsupportedIsTolerated(t *testing.T) {
 		t.Fatalf("expected ErrUnsupported to be tolerated, got %v", err)
 	}
 }
+
+// TestVerifyPRApproval_UnsetReviewerIsAKnownGapNotAGuarantee pins the coverage
+// limit of the CHANGES_REQUESTED gate, so it is documented rather than implicit.
+//
+// The gate is scoped to the identities the rig designates, and pr_reviewer is an
+// ENGAGEMENT gate rather than an identity registry — "empty means no automated
+// review is requested and the review loop is skipped entirely". But the in-town
+// Reviewer is still reachable in that shape: crew request it directly through
+// the standalone (no-MR) mode, and runReviewerPost never consults PRReviewer.
+//
+// So on a reviewer_local=false rig with pr_reviewer unset, a findings-free
+// REQUEST_CHANGES from the Reviewer does NOT block the merge — there is no
+// configured login to recognize it by. That is a real gap, not a design
+// decision, and the agent-facing contract now says so rather than promising the
+// escalation always blocks. Closing it properly needs the Reviewer's login
+// recorded independently of the engagement field; until then this test exists so
+// the gap cannot be mistaken for intended behavior or silently widened.
+func TestVerifyPRApproval_UnsetReviewerIsAKnownGapNotAGuarantee(t *testing.T) {
+	cfg := &MergeQueueConfig{
+		MergeStrategy:       "pr",
+		PRReviewer:          "", // engagement gate unset — the documented shape
+		PRApprover:          "human-approver",
+		PRRequiredApprovals: intPtr(0),
+	}
+	provider := &fakePRProvider{
+		approvedBy:                map[string]bool{"human-approver": true},
+		changesRequestedReviewers: []string{"phaware-val"}, // the Reviewer, unrecognized here
+	}
+	if err := VerifyPRApproval(provider, cfg, 42, nil); err != nil {
+		t.Fatalf("KNOWN GAP changed: with pr_reviewer unset the Reviewer's verdict is not "+
+			"recognized and the merge proceeds; got %v", err)
+	}
+	// Naming the login is what closes it today.
+	cfg.PRReviewer = "phaware-val"
+	if err := VerifyPRApproval(provider, cfg, 42, nil); err == nil {
+		t.Error("once the rig designates the Reviewer's login, its verdict must block")
+	}
+}
