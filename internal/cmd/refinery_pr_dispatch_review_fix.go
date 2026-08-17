@@ -233,6 +233,26 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 		return wrapOperationalErr(fmt.Errorf("polling unresolved threads: %w", err))
 	}
 	if len(threads) == 0 {
+		// Zero threads is NOT the same as nothing blocking. The Reviewer can
+		// deliver an objection it cannot anchor to a diff line via `disposition`,
+		// which posts REQUEST_CHANGES with no findings and therefore no inline
+		// threads at all. Advancing on the thread count alone walked straight past
+		// that verdict — and VerifyPRApproval then held the merge forever, because
+		// GitHub supersedes a CHANGES_REQUESTED review only with an APPROVED or
+		// DISMISSED one from the same login and nothing in town produced either:
+		// this path exits, await-review reports Ready, reRequestBlockingReviewers
+		// skips cfg.PRReviewer by design, and every raw review-submission path is
+		// tap-guard-blocked for the reviewer role.
+		//
+		// So the loop closes here instead. A fresh review round is the ONE thing
+		// that can clear it: if the objection was addressed, the next round posts
+		// APPROVE, which is a review from the same login and does supersede. If it
+		// was not, the reviewer says so again and the iteration cap escalates as
+		// usual. Bounded by the same maxIter as the thread-driven path, so an
+		// objection nobody can satisfy escalates rather than looping.
+		if err := reReviewIfBlockedWithoutThreads(provider, cfg, state, maxIter); err != nil {
+			return err
+		}
 		fmt.Fprintf(os.Stdout, "PR #%d: no unresolved review threads, advancing to wait-approval\n",
 			state.PRNumber)
 		return nil
@@ -787,3 +807,95 @@ func escalateReviewLoopCapArgs(description, fingerprintSuffix string) []string {
 // Compile-time silencer for time.Time so test harnesses that import this
 // file don't fail under -unused. The helper is a no-op.
 var _ = time.Time{}
+
+// reReviewIfBlockedWithoutThreads re-dispatches the Reviewer when it holds an
+// active CHANGES_REQUESTED verdict that produced no resolvable threads.
+//
+// This is the in-town clearing path for a findings-free escalation. Without it
+// the verdict is unclearable by any agent: the review-fix loop has nothing to
+// act on, and only an APPROVED or DISMISSED review from the blocking login
+// supersedes it — which, for the Reviewer's own login, only another review round
+// can produce.
+//
+// Returns a non-nil error only for operational failures. A rig with no
+// designated reviewer, a provider that cannot enumerate review states, or a
+// verdict from anyone other than cfg.PRReviewer are all "nothing to do here":
+// the first two cannot be acted on, and the third is not the town's to clear.
+func reReviewIfBlockedWithoutThreads(provider refinery.PRProvider, cfg *refinery.MergeQueueConfig,
+	state dispatchReviewFixState, maxIter int) error {
+	if cfg == nil || strings.TrimSpace(cfg.PRReviewer) == "" || !cfg.ReviewerLocal {
+		return nil
+	}
+	blocking, err := provider.ChangesRequestedReviewers(state.PRNumber)
+	if err != nil {
+		// ErrUnsupported means the provider cannot answer. Advancing is the
+		// pre-existing behavior for those providers and this must not change it.
+		if errors.Is(err, refinery.ErrUnsupported) {
+			return nil
+		}
+		return wrapOperationalErr(fmt.Errorf("checking blocking reviews on PR #%d: %w", state.PRNumber, err))
+	}
+	round, decision := reReviewDecision(cfg.PRReviewer, blocking, state.ReviewLoopIter, maxIter)
+	switch decision {
+	case reReviewNotBlocked:
+		return nil
+	case reReviewCapped:
+		fmt.Fprintf(os.Stdout,
+			"PR #%d: %s still requests changes with no unresolved threads after %d round(s) — "+
+				"not re-reviewing; a human must resolve the objection or dismiss the review\n",
+			state.PRNumber, cfg.PRReviewer, maxIter)
+		return nil
+	}
+	fmt.Fprintf(os.Stdout,
+		"PR #%d: %s requests changes but opened no threads (unanchored objection) — "+
+			"re-dispatching review round %d, the only thing that can supersede it\n",
+		state.PRNumber, cfg.PRReviewer, round)
+	// Empty headSHA on purpose: `gt reviewer request` resolves the PR's CURRENT
+	// head, which is what a re-review should target — the point is to judge the
+	// tree as it now stands, not the SHA the stale verdict was anchored to.
+	if err := dispatchLocalReviewer(state.PRNumber, refPrDispatchReviewFixMR, "", round); err != nil {
+		return wrapOperationalErr(fmt.Errorf("re-dispatching review of PR #%d: %w", state.PRNumber, err))
+	}
+	return nil
+}
+
+// reReviewDecision is the pure half of reReviewIfBlockedWithoutThreads, split
+// out so every branch is testable without exec'ing a dispatch.
+type reReviewOutcome int
+
+const (
+	// reReviewNotBlocked: the designated reviewer holds no active verdict here.
+	reReviewNotBlocked reReviewOutcome = iota
+	// reReviewCapped: it does, but the loop has spent its rounds — escalate to a
+	// human rather than re-reviewing forever.
+	reReviewCapped
+	// reReviewDispatch: re-dispatch, at the returned round.
+	reReviewDispatch
+)
+
+// reReviewDecision reports whether an unanchored block should earn a fresh
+// review round.
+//
+// Matching is case-insensitive and trimmed because the login round-trips
+// through GitHub's API and a rig's config file, and neither normalizes it —
+// GhPrChangesRequestedReviewers preserves the original casing it was given.
+func reReviewDecision(reviewer string, blocking []string, iter, maxIter int) (int, reReviewOutcome) {
+	want := strings.ToLower(strings.TrimSpace(reviewer))
+	if want == "" {
+		return 0, reReviewNotBlocked
+	}
+	held := false
+	for _, login := range blocking {
+		if strings.ToLower(strings.TrimSpace(login)) == want {
+			held = true
+			break
+		}
+	}
+	if !held {
+		return 0, reReviewNotBlocked
+	}
+	if iter >= maxIter {
+		return 0, reReviewCapped
+	}
+	return iter + 1, reReviewDispatch
+}

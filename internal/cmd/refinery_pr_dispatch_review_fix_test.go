@@ -493,3 +493,50 @@ func reviewFixArgsContain(args []string, want string) bool {
 	}
 	return false
 }
+
+func TestReReviewDecision_ClosesTheUnanchoredBlockLoop(t *testing.T) {
+	const reviewer = "phaware-val"
+	const maxIter = 3
+
+	// The case this exists for: the Reviewer holds a CHANGES_REQUESTED verdict
+	// that produced no threads, so the thread-driven loop has nothing to act on
+	// and would advance straight past it — leaving VerifyPRApproval to hold the
+	// merge forever, because only an APPROVED or DISMISSED review from that same
+	// login supersedes and nothing in town could produce one.
+	round, out := reReviewDecision(reviewer, []string{reviewer}, 0, maxIter)
+	if out != reReviewDispatch {
+		t.Fatalf("outcome = %v, want a re-review — a fresh round is the only thing that can supersede", out)
+	}
+	if round != 1 {
+		t.Errorf("round = %d, want 1", round)
+	}
+	// Rounds advance so the reviewer can see it is a fix round.
+	if round, out := reReviewDecision(reviewer, []string{reviewer}, 2, maxIter); out != reReviewDispatch || round != 3 {
+		t.Errorf("round = %d outcome = %v, want round 3 dispatch", round, out)
+	}
+
+	// Bounded by the same cap as the thread-driven path: an objection the author
+	// cannot satisfy must reach a human rather than spend rounds forever.
+	if _, out := reReviewDecision(reviewer, []string{reviewer}, maxIter, maxIter); out != reReviewCapped {
+		t.Errorf("outcome = %v, want capped at the iteration limit", out)
+	}
+
+	// Someone else's blocking review is not the town's to clear — re-reviewing
+	// could not supersede it, since only the blocking login's own review does.
+	if _, out := reReviewDecision(reviewer, []string{"a-human"}, 0, maxIter); out != reReviewNotBlocked {
+		t.Errorf("outcome = %v, want no action for another login's verdict", out)
+	}
+	// Nothing blocking at all.
+	if _, out := reReviewDecision(reviewer, nil, 0, maxIter); out != reReviewNotBlocked {
+		t.Errorf("outcome = %v, want no action when nothing blocks", out)
+	}
+	// A rig with no designated reviewer has no in-town identity to re-dispatch.
+	if _, out := reReviewDecision("", []string{"someone"}, 0, maxIter); out != reReviewNotBlocked {
+		t.Errorf("outcome = %v, want no action with no configured reviewer", out)
+	}
+	// The login round-trips through GitHub's API and a config file, neither of
+	// which normalizes case or padding.
+	if _, out := reReviewDecision("  PHAWARE-Val ", []string{"phaware-val"}, 0, maxIter); out != reReviewDispatch {
+		t.Errorf("outcome = %v, want a case- and space-insensitive match", out)
+	}
+}
