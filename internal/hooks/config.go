@@ -487,7 +487,7 @@ func DefaultOverrides() map[string]*HooksConfig {
 		//
 		// Two transports are covered: the Bash tool (shell commands) and the
 		// GitHub MCP write tools. That pairing is the point — an earlier version
-		// modelled only the shell, and every accepted finding against it was a
+		// modeled only the shell, and every accepted finding against it was a
 		// variant of one transport until one arrived that needed no shell at all.
 		// A NEW write surface is not covered by construction; adding it here is a
 		// deliberate step, and the matchers are listed per tool rather than
