@@ -25,11 +25,16 @@ import (
 
 // Manager handles the lifecycle of a rig's on-demand Reviewer session.
 //
-// It mirrors the Refinery manager's ZFC design: there is no state file — the
-// tmux session is the source of truth, and review-request work is carried on
-// beads/mail. The Reviewer is spawn-on-demand (one session per rig, drained by
-// mail), so the Manager only needs to start, stop, and report on the session,
-// and to provision the reviewer worktree if it is missing.
+// It mirrors the Refinery manager's ZFC design: there is no lifecycle state
+// file — the tmux session is the source of truth, and review-request work is
+// carried on beads/mail. The Reviewer is spawn-on-demand (one session per rig,
+// drained by mail), so the Manager only needs to start, stop, and report on the
+// session, and to provision the reviewer worktree if it is missing.
+//
+// heartbeat.json in this package is telemetry, not lifecycle state, and does
+// not breach that rule: no reviewer code path reads it to decide what to do,
+// and deleting it changes nothing about a review in flight. See
+// docs/design/reviewer-role.md § "State vs telemetry".
 type Manager struct {
 	rig    *rig.Rig
 	output io.Writer
@@ -90,16 +95,23 @@ func (m *Manager) Stop() error {
 	return t.KillSession(sessionID)
 }
 
-// EnsureRunning starts the Reviewer session if it isn't already running.
+// EnsureRunning starts the Reviewer session if it isn't already running,
+// reporting whether it actually started one.
+//
 // Returns nil (no error) when a healthy session already exists, so callers can
 // dispatch idempotently: a second review request for the same rig simply
 // queues in the running session's mailbox. extraEnv is applied only when a new
 // session is started (an already-running session keeps its original env).
-func (m *Manager) EnsureRunning(agentOverride string, extraEnv map[string]string) error {
+//
+// started is not cosmetic. Telemetry decisions hinge on it: a heartbeat left by
+// a previous, now-dead review describes nothing that is running once a NEW
+// session is spawned, and a caller that deferred its own dispatch record to
+// preserve an "in-flight" review needs to know that review no longer exists.
+func (m *Manager) EnsureRunning(agentOverride string, extraEnv map[string]string) (bool, error) {
 	if running, _ := m.IsRunning(); running {
-		return nil
+		return false, nil
 	}
-	return m.Start(agentOverride, extraEnv)
+	return true, m.Start(agentOverride, extraEnv)
 }
 
 // Start spawns the Reviewer agent in a tmux session. ZFC-compliant: no state
