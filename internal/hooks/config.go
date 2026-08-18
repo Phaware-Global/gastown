@@ -479,16 +479,26 @@ func DefaultOverrides() map[string]*HooksConfig {
 		// Reviewer roles: write-surface guard (P23-2376).
 		// The Reviewer's only sanctioned write surfaces are its review bead, its
 		// own worktree (checkout only), and PR review comments posted through
-		// `gt reviewer post`. Everything below is blocked so a prompt-injected
-		// or confused reviewer session can't approve, merge, push, resolve
-		// threads, drive the refinery, or close MR beads.
+		// `gt reviewer post` (which submits the review's verdict — APPROVE,
+		// REQUEST_CHANGES, or COMMENT — through the tested output contract).
+		// Everything below is blocked so a prompt-injected or confused reviewer
+		// session can't merge, push, resolve threads, drive the refinery, close
+		// MR beads, or route a verdict around `gt reviewer post`.
+		//
+		// Two transports are covered: the Bash tool (shell commands) and the
+		// GitHub MCP write tools. That pairing is the point — an earlier version
+		// modeled only the shell, and every accepted finding against it was a
+		// variant of one transport until one arrived that needed no shell at all.
+		// A NEW write surface is not covered by construction; adding it here is a
+		// deliberate step, and the matchers are listed per tool rather than
+		// wildcarded so that stays visible.
 		"reviewer": {
 			PreToolUse: []HookEntry{
 				{
 					Matcher: "Bash(*gh pr review*)",
 					Hooks: []Hook{{
 						Type:    "command",
-						Command: "echo '❌ BLOCKED: Reviewer posts reviews only via `gt reviewer post` (COMMENT reviews). Raw `gh pr review` bypasses the tested output contract and can approve/request-changes, which the merge gates do not model.' && exit 2",
+						Command: "echo '❌ BLOCKED: Reviewer posts reviews only via `gt reviewer post`, which submits the verdict (APPROVE/REQUEST_CHANGES/COMMENT) through the tested output contract. Raw `gh pr review` bypasses that contract.' && exit 2",
 					}},
 				},
 				{
@@ -502,6 +512,59 @@ func DefaultOverrides() map[string]*HooksConfig {
 					Hooks: []Hook{{
 						Type:    "command",
 						Command: "echo '❌ BLOCKED: Reviewer posts reviews only via `gt reviewer post`. Raw `gh api .../pulls/N/reviews` bypasses the tested output contract.' && exit 2",
+					}},
+				},
+				{
+					// The GraphQL review-submission mutations. `gh api graphql`
+					// matches neither the `gh pr review` pattern nor the REST
+					// `*gh api*pulls*reviews*` one (which needs those path
+					// segments), so without this a session could submit an
+					// approving review under the machine-user token with no
+					// output-contract validation. The sibling resolveReviewThread
+					// matcher already establishes that this role reaches GraphQL.
+					Matcher: "Bash(*addPullRequestReview*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviewer posts reviews only via `gt reviewer post`. The GraphQL addPullRequestReview/submitPullRequestReview mutations bypass the tested output contract.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "Bash(*submitPullRequestReview*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviewer posts reviews only via `gt reviewer post`. The GraphQL addPullRequestReview/submitPullRequestReview mutations bypass the tested output contract.' && exit 2",
+					}},
+				},
+				{
+					// The two matchers above key on the mutation NAME appearing
+					// in the command string, so `gh api graphql -f query='...'`
+					// with the mutation inline is caught. But `gh api graphql
+					// --input mut.json` / `-F query=@mut.graphql` never puts the
+					// mutation name on the command line — GhPrSubmitReview
+					// itself submits via `gh api --method POST ... --input -`
+					// elsewhere in this codebase, so the `--input` form is a
+					// real, live pattern, not hypothetical. The Reviewer's
+					// worktree is its sanctioned write surface, so writing
+					// mut.json and feeding it to `gh api graphql --input` isn't
+					// blocked by anything else. Match the transport instead of
+					// the payload: this role has no legitimate `gh api graphql`
+					// use at all (the sibling resolveReviewThread matcher below
+					// already covers its only other GraphQL surface), so a
+					// blanket block is the correct scope, not a narrower one.
+					// Keeps the two name matchers above as defense-in-depth
+					// against a non-`gh` transport (e.g. raw curl) that still
+					// carries the mutation name literally.
+					//
+					// `*gh api*graphql*`, not `*gh api graphql*`: `gh api` is a
+					// cobra command with interspersed flags, so the endpoint
+					// need not follow it contiguously. `gh api --input mut.json
+					// graphql` and `gh api -H x:y graphql` are both valid and
+					// both escaped the contiguous form — along with all three
+					// GraphQL guards, since the mutation name is in the file.
+					Matcher: "Bash(*gh api*graphql*)",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviewer has no legitimate use of `gh api graphql`. Reviews go through `gt reviewer post`; thread resolution belongs to the authoring polecat.' && exit 2",
 					}},
 				},
 				{
@@ -530,6 +593,208 @@ func DefaultOverrides() map[string]*HooksConfig {
 					Hooks: []Hook{{
 						Type:    "command",
 						Command: "echo '❌ BLOCKED: Thread resolution belongs to the authoring polecat, not the Reviewer.' && exit 2",
+					}},
+				},
+				// Every matcher above is scoped to Bash(...), which models the
+				// shell as the only way out. It is not. MCP servers load in
+				// gt-spawned Claude sessions unless suppressed — memories_compact
+				// passes --strict-mcp-config precisely because the default is the
+				// opposite, and no reviewer dispatch path passes it — so a reviewer
+				// session reaches mcp__github__* write tools directly. A review
+				// submitted through one touches no shell command, matches none of
+				// the patterns above, and skips every output-contract check
+				// `gt reviewer post` performs: severity derivation, the disposition
+				// floor, the findings anchor. The resulting APPROVE is a real
+				// approval that GhPrApprovalCount folds with no bot exclusion.
+				//
+				// Listed per tool rather than as one wildcard because the block
+				// must name what it refuses: a future MCP write surface is NOT
+				// covered here and should be added deliberately. That convention
+				// only pays if the enumeration is actually walked — a tool that is
+				// PRESENT but unlisted is a hole, not a carve-out — so this covers
+				// the whole remote-write and review-write family the server
+				// exposes, not just the obvious members.
+				//
+				// TWO matchers per tool, deliberately, because the matcher is a
+				// REGEX over the tool name — per the vendored hook reference
+				// (plugin-dev/skills/hook-development/SKILL.md § Matchers, which
+				// documents `mcp__.*__delete.*` as the MCP form). An earlier
+				// attempt to solve the alias problem with `mcp__*__<tool>` used
+				// `*` as a glob; read as a regex that is `mcp_` + `_*` +
+				// `__<tool>`, which cannot span a server segment and therefore
+				// matched NO real tool name — turning a widened guard into no
+				// guard at all, with the substring-scanning test still green.
+				//
+				// So: `mcp__.*__<tool>` covers any server alias under a regex
+				// engine, and the literal `mcp__github__<tool>` covers the
+				// default alias under an exact-match engine. They are cheap and
+				// non-conflicting, and the pair is correct under either.
+				{
+					Matcher: "mcp__.*__pull_request_review_write",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviews go out only through `gt reviewer post`, which derives the verdict from findings and anchors it to the reviewed SHA. Submitting one directly skips all of that.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__pull_request_review_write",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviews go out only through `gt reviewer post`, which derives the verdict from findings and anchors it to the reviewed SHA. Submitting one directly skips all of that.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__add_comment_to_pending_review",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviews go out only through `gt reviewer post`.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__add_comment_to_pending_review",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Reviews go out only through `gt reviewer post`.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__merge_pull_request",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer never merges.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__merge_pull_request",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer never merges.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__push_files",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The reviewer worktree is checkout-only; the Reviewer never pushes.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__push_files",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The reviewer worktree is checkout-only; the Reviewer never pushes.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__create_or_update_file",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The reviewer worktree is checkout-only; the Reviewer never writes to the remote.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__create_or_update_file",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The reviewer worktree is checkout-only; the Reviewer never writes to the remote.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__delete_file",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The reviewer worktree is checkout-only; the Reviewer never writes to the remote.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__delete_file",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The reviewer worktree is checkout-only; the Reviewer never writes to the remote.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__update_pull_request",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer judges the PR; it does not edit it. Changing the title, body or BASE branch rewrites the artifact under review.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__update_pull_request",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer judges the PR; it does not edit it. Changing the title, body or BASE branch rewrites the artifact under review.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__create_pull_request",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer never opens PRs.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__create_pull_request",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer never opens PRs.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__update_pull_request_branch",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer never updates the PR branch — that changes the diff it was asked to judge.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__update_pull_request_branch",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer never updates the PR branch — that changes the diff it was asked to judge.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__create_branch",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The reviewer worktree is checkout-only; the Reviewer never creates refs.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__create_branch",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The reviewer worktree is checkout-only; the Reviewer never creates refs.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__fork_repository",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer never forks.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__fork_repository",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: The Reviewer never forks.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__.*__add_reply_to_pull_request_comment",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Review output goes only through `gt reviewer post`, which applies the output contract. Replying directly bypasses it.' && exit 2",
+					}},
+				},
+				{
+					Matcher: "mcp__github__add_reply_to_pull_request_comment",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: "echo '❌ BLOCKED: Review output goes only through `gt reviewer post`, which applies the output contract. Replying directly bypasses it.' && exit 2",
 					}},
 				},
 			},

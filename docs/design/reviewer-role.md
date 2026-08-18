@@ -63,8 +63,14 @@ observability. Rejected.
    conformance, not just the diff text.
 5. Findings flow into the existing review-fix loop: inline threads with
    priority markers that `parseThreadPriority` already understands.
-6. The Reviewer **never approves and never merges**. Human approval remains
-   the merge gate, exactly as in the current design.
+6. The Reviewer **submits a real verdict** (APPROVE, REQUEST_CHANGES, or
+   COMMENT) but **never merges**. Its APPROVE does not satisfy the named
+   `pr_approver` gate — config validation rejects `pr_approver == pr_reviewer`,
+   so the two are always different identities. It **does** count toward the
+   `pr_required_approvals` count gate (`GhPrApprovalCount` folds every distinct
+   approving login with no bot exclusion) and toward any branch-protection
+   approval rule. Rigs must size those gates knowing one approval may come from
+   the Reviewer. See "Approval semantics" below.
 7. Crew-authored PRs keep automated review coverage after Augment is
    removed: crew requests the same Reviewer through a standalone (no-MR)
    request mode, and the Reviewer is the **only** agent in the town that
@@ -504,18 +510,63 @@ direct-merge assumption. Convergence:
   (polecat pushes / refinery PR creation) differs from the reviewer identity,
   GitHub accepts the review normally.
 - The machine user must NOT be the `pr_approver` and must not have merge
-  rights on protected branches. Branch protection is the backstop to
-  tap-guard.
+  rights on protected branches. This is **enforced when both fields are
+  configured**, not conventional: `validateMergeQueueConfig` (write time)
+  and `Engineer.LoadConfig` (runtime read path) both reject
+  `pr_approver == pr_reviewer` (case-insensitive). An **unset** `pr_reviewer`
+  skips this comparison entirely — that's a different state ("no reviewer
+  identity configured") from "checked and confirmed distinct," not
+  equivalent to it, even though both currently pass validation. Branch
+  protection is the backstop to tap-guard.
+
+### Approval semantics
+
+The Reviewer's APPROVE is a real GitHub approval. Exactly what it does and does
+not buy matters, because `VerifyPRApproval` (`internal/refinery/approval.go`)
+evaluates **two independent gates** and the Reviewer sits outside only one:
+
+| Gate | Mechanism | Reviewer's APPROVE |
+|---|---|---|
+| Named approver | `IsPRApprovedBy(pr, cfg.PRApprover)` | **Cannot satisfy it when `pr_reviewer` is configured.** Config validation forces `pr_approver != pr_reviewer` in that case, so the login never matches. An unset `pr_reviewer` isn't checked against `pr_approver` at all — there's no reviewer login to compare. `VerifyPRApproval` separately defers the merge while the rig's designated `pr_reviewer` or `pr_approver` has an active CHANGES_REQUESTED verdict, independent of this gate — and only on providers that can enumerate review states (GitHub can; Bitbucket returns `ErrUnsupported` and the check is skipped). A review from any other account is advisory: gating on it would let any GitHub user block the merge queue on a public repo. GitHub supersedes such a verdict only with an APPROVED or DISMISSED review from the same login — a follow-up COMMENT does not. |
+| Count | `CountApprovals(pr) >= pr_required_approvals` | **Counts.** `GhPrApprovalCount` folds every distinct login whose latest terminal state is APPROVED. There is no bot exclusion and no permission filter. |
+
+The same applies to GitHub branch-protection rules requiring N approving
+reviews, which `gh pr merge` defers to.
+
+**Consequence for operators.** A rig setting `pr_approver: alice` and
+`pr_required_approvals: 2` — intending "alice plus one more human" — will merge
+after *one* human approval, because the Reviewer's automatic APPROVE on a clean
+pass supplies the second. Size the count gate knowing one approval may be the
+bot's, or raise it by one.
+
+Earlier revisions of this document and the role's help text claimed the
+Reviewer's approval was "informational, not the merge gate" without
+qualification. That was true of the named-approver gate and false of the count
+gate. The wording is now split per-gate everywhere it appears.
+
+**Deliberately not fixed in code here.** Excluding `cfg.PRReviewer` from
+`GhPrApprovalCount` would make the simpler claim true by construction, and is
+the better end state. It is out of scope for a documentation-correctness change
+because it silently changes merge behavior for every rig already running the
+in-town Reviewer — a rig at `pr_required_approvals: 1` that merges today would
+stop merging. That belongs in its own change with its own migration note.
 
 ### Tap-guard boundary (new role override)
 
 Add a `reviewer` entry to `DefaultOverrides()`
 (`internal/hooks/config.go:201`) blocking, at the Bash-tool layer:
 
-- `gh pr merge` and **all of `gh pr review`** (including `--comment`):
-  posting goes exclusively through `gt reviewer post`, which emits COMMENT
-  reviews only — approve/request-changes are states the merge gates don't
-  model, and a raw-`gh` path would bypass the tested output contract
+- `gh pr merge` and **all of `gh pr review`** (including `--approve` and
+  `--comment`): this is a channel restriction, not a limit on the verdict.
+  Posting goes exclusively through `gt reviewer post`, which submits the
+  review event (APPROVE / REQUEST_CHANGES / COMMENT) derived from finding
+  severity; a raw-`gh` path would bypass the tested output contract
+- the GraphQL review-submission mutations `addPullRequestReview` and
+  `submitPullRequestReview`. `gh api graphql` matches neither the `gh pr
+  review` pattern nor the REST `*gh api*pulls*reviews*` one, so without these
+  matchers the channel restriction above has a hole wide enough to submit an
+  approving review under the machine-user token with no output-contract
+  validation
 - the GraphQL `resolveReviewThread` mutation (thread resolution belongs to
   the authoring polecat — actor-boundary rule in
   [refinery-pr-workflow.md](refinery-pr-workflow.md))
@@ -616,7 +667,7 @@ end-to-end on a test PR.
      (model on `gt dog done`).
 2. `gt reviewer post --pr <n> --findings <json>` (**decided** — see Resolved
    Decisions #1): wraps the GitHub review API for atomic submission (one
-   COMMENT review, all inline threads). Owns the output contract — neutral
+   review, all inline threads). Owns the output contract — neutral
    priority badges, perspective tags — in tested Go; tap-guard blocks all
    raw `gh pr review` so this is the only posting path.
 3. Widen `parseThreadPriority` (`internal/refinery/threads.go:121`) to

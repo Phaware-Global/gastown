@@ -251,6 +251,94 @@ func TestEngineer_LoadConfig_WithMergeQueue(t *testing.T) {
 	}
 }
 
+// TestEngineer_LoadConfig_RejectsSameApproverAndReviewer pins the runtime
+// read-path enforcement of pr_approver != pr_reviewer. It writes config.json
+// directly with os.WriteFile, bypassing config.SaveRigSettings /
+// validateMergeQueueConfig entirely — the same way an externally edited
+// config.json would reach the refinery — so it proves the invariant is
+// enforced where the merge decision is actually made (Engineer.LoadConfig),
+// not merely re-asserting the write-time check. Deleting the runtime check
+// added in engineer.go while keeping the write-time one in loader.go makes
+// this test fail.
+func TestEngineer_LoadConfig_RejectsSameApproverAndReviewer(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "engineer-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	config := map[string]interface{}{
+		"type":    "rig",
+		"version": 1,
+		"name":    "test-rig",
+		"merge_queue": map[string]interface{}{
+			"merge_strategy": "pr",
+			"vcs_provider":   "github",
+			"pr_approver":    "same-bot",
+			"pr_reviewer":    "same-bot",
+		},
+	}
+
+	data, _ := json.MarshalIndent(config, "", "  ")
+	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &rig.Rig{
+		Name: "test-rig",
+		Path: tmpDir,
+	}
+
+	e := NewEngineer(r)
+
+	err = e.LoadConfig()
+	if err == nil {
+		t.Fatal("expected LoadConfig to reject pr_approver == pr_reviewer on the runtime read path, got nil error")
+	}
+	if !strings.Contains(err.Error(), "pr_approver and pr_reviewer must be different identities") {
+		t.Errorf("expected error about pr_approver/pr_reviewer identity, got: %v", err)
+	}
+}
+
+// TestEngineer_LoadConfig_AllowsDistinctApproverAndReviewer is the
+// non-regression companion: a legitimately distinct approver/reviewer pair
+// must still load cleanly through the same runtime path.
+func TestEngineer_LoadConfig_AllowsDistinctApproverAndReviewer(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "engineer-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	config := map[string]interface{}{
+		"type":    "rig",
+		"version": 1,
+		"name":    "test-rig",
+		"merge_queue": map[string]interface{}{
+			"merge_strategy": "pr",
+			"vcs_provider":   "github",
+			"pr_approver":    "human-approver",
+			"pr_reviewer":    "reviewer-bot",
+		},
+	}
+
+	data, _ := json.MarshalIndent(config, "", "  ")
+	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &rig.Rig{
+		Name: "test-rig",
+		Path: tmpDir,
+	}
+
+	e := NewEngineer(r)
+
+	if err := e.LoadConfig(); err != nil {
+		t.Errorf("unexpected error with distinct approver/reviewer: %v", err)
+	}
+}
+
 func TestEngineer_LoadConfig_AutoPushDisabled(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "engineer-test-*")
 	if err != nil {

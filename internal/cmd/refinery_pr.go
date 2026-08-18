@@ -559,7 +559,11 @@ func runRefineryPrMerge(cmd *cobra.Command, args []string) error {
 	//
 	// Rigs that leave both PRApprover and PRRequiredApprovals unconfigured
 	// get no gate (opt-in) — existing behavior for rigs that haven't
-	// adopted the approval policy is preserved.
+	// adopted the approval policy is preserved. The CHANGES_REQUESTED check
+	// inside VerifyPRApproval honors the same opt-in: it is scoped to
+	// pr_reviewer/pr_approver, so a rig naming neither gets no blocking gate
+	// from it either. An earlier unconditional form broke that promise, and
+	// on a public repo let any account block the queue indefinitely.
 	if err := refinery.VerifyPRApproval(provider, cfg, prNumber, nil); err != nil {
 		var needsApproval *refinery.NeedsApprovalError
 		if errors.As(err, &needsApproval) {

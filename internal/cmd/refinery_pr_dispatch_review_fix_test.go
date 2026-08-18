@@ -493,3 +493,30 @@ func reviewFixArgsContain(args []string, want string) bool {
 	}
 	return false
 }
+
+func TestBlockingDesignatedReviewer_MatchesTheMergeGatesScope(t *testing.T) {
+	// This must not be wider than the gate it announces. Escalating for a login
+	// whose verdict does not actually block would file a HIGH about a merge that
+	// is not deferred; escalating for one that does block but has no in-town
+	// remedy would name `gt reviewer request` at a rig that runs no Reviewer.
+	cfg := &refinery.MergeQueueConfig{PRReviewer: "phaware-val", ReviewerLocal: true}
+	if got := blockingDesignatedReviewer(cfg, []string{"phaware-val"}); got != "phaware-val" {
+		t.Errorf("got %q, want the designated reviewer when it holds the verdict", got)
+	}
+	// Case and padding survive a round trip through GitHub's API and a config file.
+	if got := blockingDesignatedReviewer(cfg, []string{"PHAWARE-Val"}); got == "" {
+		t.Error("matching must be case-insensitive")
+	}
+	// Not the town's to announce: another login, or a rig with no in-town Reviewer.
+	if got := blockingDesignatedReviewer(cfg, []string{"a-human"}); got != "" {
+		t.Errorf("got %q, want none for another login's verdict", got)
+	}
+	external := &refinery.MergeQueueConfig{PRReviewer: "external-bot", ReviewerLocal: false}
+	if got := blockingDesignatedReviewer(external, []string{"external-bot"}); got != "" {
+		t.Errorf("got %q, want none — an external reviewer's verdict does not block "+
+			"and has no in-town remedy to name", got)
+	}
+	if got := blockingDesignatedReviewer(&refinery.MergeQueueConfig{}, []string{"anyone"}); got != "" {
+		t.Errorf("got %q, want none with no designated reviewer", got)
+	}
+}
