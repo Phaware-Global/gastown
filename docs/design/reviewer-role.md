@@ -757,6 +757,13 @@ end-to-end on a test PR.
      SHA in the reviewer worktree.
    - `gt reviewer done`: clear state, close out, self-terminate session
      (model on `gt dog done`).
+   - `gt reviewer stop [--rig] [--force]`, `gt reviewer status [--json]`,
+     `gt reviewer list [--json]`: the operator's side of the lifecycle.
+     `Manager.Stop()`/`Status()` existed from the start but had no commands
+     attached, so ending a stuck reviewer meant `tmux kill-session` by hand.
+     `status` combines session liveness with the heartbeat and reports the same
+     four states the reaper acts on, in the same vocabulary; `list` sweeps every
+     rig, which is otherwise impossible for a role with no registry entry.
 2. `gt reviewer post --pr <n> --findings <json>` (**decided** — see Resolved
    Decisions #1): wraps the GitHub review API for atomic submission (one
    review, all inline threads). Owns the output contract — neutral
