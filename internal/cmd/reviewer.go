@@ -44,6 +44,7 @@ var (
 	reviewerPromptPriorThreads string
 	reviewerPromptInstructions string
 	reviewerPromptMaxFindings  int
+	reviewerPromptMaxDuration  time.Duration
 
 	reviewerConsolidateSHA string
 	reviewerConsolidateOut string
@@ -255,6 +256,9 @@ func init() {
 		`file of extra execution instructions to inject (or "-" for stdin)`)
 	reviewerPromptCmd.Flags().IntVar(&reviewerPromptMaxFindings, "max-findings", 0,
 		"per-pass finding cap (default: the rig's review.max_findings_per_perspective)")
+	reviewerPromptCmd.Flags().DurationVar(&reviewerPromptMaxDuration, "max-duration", 0,
+		"soft wall-clock budget for the pass; it returns a partial result rather than hanging "+
+			"(default: half the rig's stuck_threshold; clamped to [5m, stuck_threshold))")
 	_ = reviewerPromptCmd.MarkFlagRequired("pr")
 	_ = reviewerPromptCmd.MarkFlagRequired("sha")
 
@@ -570,6 +574,19 @@ func loadRigReviewConfig() (townRoot, rigName, rigPath string, reviewCfg *config
 	return townRoot, rigName, r.Path, reviewCfg, nil
 }
 
+// resolvePassDuration picks the pass budget: an explicit --max-duration when
+// given, else the rig-derived default (half its clamped stuck threshold).
+func resolvePassDuration(townRoot, rigPath string) time.Duration {
+	stuck, _ := reviewer.ClampStuckThreshold(reviewer.StuckThreshold(townRoot, rigPath))
+	if reviewerPromptMaxDuration > 0 {
+		// Bounded on BOTH sides. Too small stops the pass before it establishes
+		// anything (a rubber stamp); too large outruns the reaper's phase rail, so
+		// the session is killed mid-pass and every finding is discarded.
+		return reviewer.ClampPassDuration(reviewerPromptMaxDuration, stuck)
+	}
+	return reviewer.PassDuration(townRoot, rigPath)
+}
+
 func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 	perspective := args[0]
 	if reviewerPromptPR <= 0 {
@@ -622,6 +639,7 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 		Round:             reviewerPromptRound,
 		PriorThreads:      priorThreads,
 		MaxFindings:       maxFindings,
+		MaxDuration:       resolvePassDuration(townRoot, rigPath),
 		ExtraInstructions: extra,
 	})
 	if err != nil {
@@ -844,57 +862,87 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("sending review request to %s: %w", to, err)
 	}
 
-	// Seed the heartbeat only AFTER the mail is on its way. Seeding first left a
-	// permanent `dispatched` record when the send failed — the dispatcher already
-	// returned a hard error the caller can retry, so the reaper's later
-	// "dispatched but never started" escalation would be duplicate noise about a
-	// failure that was never silent, and the retry would inherit the failed
-	// attempt's clock.
-	//
-	// The seed still precedes EnsureRunning below, which is the case it exists
-	// for: a request that is mailed but whose session never starts.
-	deferredSeed := false
-	switch err := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA); {
-	case err == nil:
-	case errors.Is(err, reviewer.ErrReviewInFlight):
-		// Queued behind an unfinished review. Mail is the work queue and the
-		// request is safely in it; the in-flight review's telemetry is what
-		// supervisors need, so it is deliberately left intact.
-		deferredSeed = true
-		fmt.Fprintf(os.Stderr,
-			"note: reviewer is mid-review; PR #%d is queued and will be recorded when it starts\n", spec.PR)
-	default:
-		fmt.Fprintf(os.Stderr, "warning: seeding reviewer heartbeat: %v\n", err)
-	}
-
 	// Start the reviewer session if not already running, injecting the token as
 	// GH_TOKEN/GITHUB_TOKEN. Idempotent: a running session drains the new mail.
 	mgr := reviewer.NewManager(r)
+	wedged := false
 	started, serr := mgr.EnsureRunning("", map[string]string{"GH_TOKEN": tokenVal, "GITHUB_TOKEN": tokenVal})
-	if serr != nil {
+	switch {
+	case serr == nil:
+	case errors.Is(serr, reviewer.ErrSessionWedged):
+		wedged = true
+		// The mail is queued but the session is not draining it. Say so loudly and
+		// name the remedy: the daemon's reaper will recycle the session on a later
+		// tick with all of its gates applied, and an operator who does not want to
+		// wait has an explicit command. Dispatch deliberately does not kill.
+		style.PrintWarning("reviewer session for %s appears wedged — PR #%d is queued but may not be "+
+			"picked up until the session is recycled. The daemon reaper will handle it; to act now, run "+
+			"`gt reviewer stop --rig %s --force`.", r.Name, spec.PR, r.Name)
+	default:
 		// The request mail persists; await-review's timeout is the safety net.
 		fmt.Fprintf(os.Stderr, "warning: review request mailed but reviewer session did not start: %v\n", serr)
 	}
 
-	// A deferred seed plus a session we had to START means the review we deferred
-	// to is not running: its session is gone (reaped, crashed, or self-exited
-	// without clearing). Claim the record now.
+	// Seed the heartbeat AFTER the mail is sent, and after EnsureRunning.
 	//
-	// Otherwise the brand-new session is judged against a dead predecessor's
-	// heartbeat — which is stale by construction, since it is stale precisely
-	// because TouchDispatch refused to reseed it — for the several minutes it
-	// takes the agent to prime, read its mail, and reach `gt reviewer checkout`.
-	// Both grace windows miss that gap: a heartbeat IS present and the session IS
-	// alive, so the rails apply immediately, and the successor is born past the
-	// kill threshold. Leaving the fix to the agent's own first command meant the
-	// window it was written to close was the window it did not cover.
-	if deferredSeed && started && serr == nil {
-		if cerr := reviewer.ClearHeartbeat(r.Path); cerr != nil {
-			fmt.Fprintf(os.Stderr, "warning: clearing stale reviewer heartbeat: %v\n", cerr)
+	// After the mail, because seeding first left a permanent `dispatched` record
+	// when the send failed — the dispatcher already returned a hard error the
+	// caller can retry on, so a later "dispatched but never started" escalation
+	// would be duplicate noise about a failure that was never silent.
+	//
+	// After EnsureRunning, because whether it STARTED a session decides what the
+	// record on file means: a heartbeat that outlived the session it described is
+	// a corpse to be claimed, while one belonging to a live session is a review in
+	// flight. EnsureRunning's failure is non-fatal, so a request whose session
+	// never starts is still recorded here.
+	//
+	// Except when the session is wedged. Then the heartbeat is EVIDENCE, not
+	// stale data — it is the only thing that will make the reaper act, since the
+	// reaper reads nothing else. Seeding over it resets the phase clock
+	// to zero, flipping Classify from KillImminent back to Working, so the remedy
+	// the warning above just promised never arrives. Worse, re-dispatch cadence
+	// (30m) is shorter than the phase kill rail (90m), so the rail could never
+	// fire: each dispatch would rescue the very session it was queueing behind.
+	//
+	// The queued request is safe in the mailbox and gets its own record once the
+	// session is recycled and actually starts working.
+	if wedged {
+		fmt.Printf("Dispatched review of PR #%d (round %d, origin %s) → %s\n", prNumber, spec.Round, origin, to)
+		return nil
+	}
+
+	switch err := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA); {
+	case err == nil:
+	case errors.Is(err, reviewer.ErrReviewInFlight):
+		// Queued behind an unfinished review on a DIFFERENT PR — UNLESS we had to
+		// start the session ourselves, in which case that review is not running:
+		// its session is gone (reaped, crashed, or self-exited without clearing)
+		// and the record is a corpse. Claim it.
+		//
+		// Otherwise the brand-new session is judged against a dead predecessor's
+		// heartbeat — stale by construction, since it is stale precisely because
+		// TouchDispatch refused to reseed it — for the several minutes it takes the
+		// agent to prime, read its mail, and reach `gt reviewer checkout`. Both
+		// grace windows miss that gap: a heartbeat IS present and the session IS
+		// alive, so the rails apply immediately and the successor is born past the
+		// kill threshold. Leaving the fix to the agent's own first command meant
+		// the window it was written to close was the window it did not cover.
+		if started && serr == nil {
+			if cerr := reviewer.ClearHeartbeat(r.Path); cerr != nil {
+				fmt.Fprintf(os.Stderr, "warning: clearing stale reviewer heartbeat: %v\n", cerr)
+			}
+			if terr := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA); terr != nil {
+				fmt.Fprintf(os.Stderr, "warning: seeding reviewer heartbeat: %v\n", terr)
+			}
+			break
 		}
-		if terr := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA); terr != nil {
-			fmt.Fprintf(os.Stderr, "warning: seeding reviewer heartbeat: %v\n", terr)
-		}
+		// A live session really is mid-review. Mail is the work queue and the
+		// request is safely in it; the in-flight review's telemetry is what
+		// supervisors need, so it is deliberately left intact.
+		fmt.Fprintf(os.Stderr,
+			"note: reviewer is mid-review; PR #%d is queued and will be recorded when it starts\n", spec.PR)
+	default:
+		fmt.Fprintf(os.Stderr, "warning: seeding reviewer heartbeat: %v\n", err)
 	}
 
 	fmt.Printf("Dispatched review of PR #%d (round %d, origin %s) → %s\n", prNumber, spec.Round, origin, to)

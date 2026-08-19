@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/refinery"
@@ -57,19 +56,17 @@ func (d *Daemon) reapStuckReviewers() {
 	})
 }
 
-// reviewerStuckThreshold resolves a rig's reviewer stuck threshold from its
-// role definition, falling back to the compiled-in default. This is the first
-// real consumer of RoleDefinition.Health — until now reviewer.toml's
-// stuck_threshold was read only by `gt role def`'s printer and enforced nothing.
+// reviewerStuckThreshold resolves a rig's reviewer stuck threshold, clamped.
+//
+// Delegates to reviewer.StuckThreshold so the reaper's kill decision and the
+// dispatcher's wedge-recycle decision read the same number from the same place;
+// two copies of this rule would eventually disagree, and the failure mode is a
+// session the dispatcher considers fine and the reaper kills. The clamp matters
+// because reviewer.toml lives INSIDE the rig and is agent-writable: unclamped,
+// a one-second threshold kills every reviewer on sight and a one-year threshold
+// disables the reaper.
 func (d *Daemon) reviewerStuckThreshold(rigName, rigPath string) time.Duration {
-	raw := reviewer.DefaultStuckThreshold
-	if def, err := config.LoadRoleDefinition(d.config.TownRoot, rigPath, constants.RoleReviewer); err == nil &&
-		def != nil && def.Health.StuckThreshold.Duration > 0 {
-		raw = def.Health.StuckThreshold.Duration
-	}
-	// reviewer.toml lives INSIDE the rig and is agent-writable, so an unclamped
-	// threshold is a kill switch in both directions: a one-second value kills
-	// every reviewer on sight, a one-year value disables the reaper.
+	raw := reviewer.StuckThreshold(d.config.TownRoot, rigPath)
 	clamped, adjusted := reviewer.ClampStuckThreshold(raw)
 	if adjusted {
 		d.logger.Printf("Reviewer reaper: %s stuck_threshold %v is outside [%v, %v] — using %v",
@@ -190,21 +187,31 @@ func (d *Daemon) reapRigReviewer(rigName string, peers []string) {
 		// exists to provide, and the session then came up with NO heartbeat,
 		// routing a healthy just-started reviewer onto the missing-heartbeat kill
 		// path. Every other branch here has a grace or a ramp; this one had none.
-		age, ok := reviewer.PhaseAge(hb)
-		if !ok {
-			d.logger.Printf("Reviewer reaper: %s heartbeat timestamp is unusable — taking no action", rigName)
+		// An unusable timestamp (zero or future) on a record with NO session is
+		// not a reason to hold back — it cannot be a live dispatch, and leaving it
+		// is worse than clearing it: TouchDispatch refuses whenever prev.PR
+		// differs, so a phantom record permanently locks out every later
+		// dispatch's telemetry seed. Only a trustworthy, in-grace age defers.
+		age, ageOK := reviewer.PhaseAge(hb)
+		if !shouldClearDeadDispatch(age, ageOK) {
 			return
 		}
-		if !shouldClearDeadDispatch(age, ok) {
-			return
+		reason, detail := "died_mid_review", fmt.Sprintf("no progress for %s", age.Round(time.Second))
+		if !ageOK {
+			// Distinguish the case this branch was widened to handle. Reporting
+			// "no progress for 0s" for a record that has no usable timestamp at
+			// all describes the opposite of what happened, and elapsed=0s in the
+			// feed reads as "just started".
+			reason, detail = "unusable_heartbeat", "heartbeat has no usable timestamp"
 		}
-		d.logger.Printf("Reviewer reaper: %s reviewer has no session (phase=%s pr=%d, no progress for %s) — clearing stale heartbeat",
-			rigName, reviewer.SafePhase(hb.Phase), reviewer.SafePR(hb.PR), age.Round(time.Second))
+		d.logger.Printf("Reviewer reaper: %s reviewer has no session (phase=%s pr=%d, %s) — clearing stale heartbeat",
+			rigName, reviewer.SafePhase(hb.Phase), reviewer.SafePR(hb.PR), detail)
 		_ = events.LogFeed(events.TypeSessionDeath, rigName+"/"+constants.RoleReviewer,
 			map[string]interface{}{
-				"rig": rigName, "role": constants.RoleReviewer, "reason": "died_mid_review",
+				"rig": rigName, "role": constants.RoleReviewer, "reason": reason,
 				"phase": reviewer.SafePhase(hb.Phase), "pr": reviewer.SafePR(hb.PR),
 				"elapsed": reviewer.SafeText(hb.Elapsed().Round(time.Second).String()),
+				"detail":  reviewer.SafeText(detail),
 			})
 		if cerr := reviewer.ClearHeartbeat(rigPath); cerr != nil {
 			d.logger.Printf("Reviewer reaper: clearing %s heartbeat: %v", rigName, cerr)
@@ -642,12 +649,18 @@ func shouldReapMissingHeartbeat(missingFor time.Duration, seen, idle bool) bool 
 // finding, and a bare `age > constant` assertion cannot tell whether the guard
 // is still wired up.
 //
-// An unusable phase age (zero or future-dated) resolves to "do not act". This
-// branch is ambiguous by construction — it is how a dead reviewer looks AND how
-// a dispatch still spawning looks — so an untrustworthy timestamp must not
-// resolve it in the destructive direction.
+// Only a TRUSTWORTHY, in-grace age defers. An unusable phase age clears, which
+// looks like the destructive choice and is not: with no session the record
+// cannot describe a live dispatch, and leaving it costs more than clearing it —
+// TouchDispatch refuses whenever prev.PR differs, so a phantom record with a
+// zero timestamp permanently locks out every later dispatch's telemetry seed,
+// and no command removes it.
+//
+// The grace itself is what must not be shortened. `gt reviewer request` seeds
+// the heartbeat BEFORE the session exists, and the mail write plus a
+// first-dispatch worktree provision can outlast a daemon tick.
 func shouldClearDeadDispatch(age time.Duration, ageOK bool) bool {
-	return ageOK && age >= reviewer.SpawnGrace
+	return !ageOK || age >= reviewer.SpawnGrace
 }
 
 // clearReviewerHeartbeat removes a rig's reviewer heartbeat, logging failures.
