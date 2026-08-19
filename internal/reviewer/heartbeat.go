@@ -93,6 +93,14 @@ type Heartbeat struct {
 	// version of the attack, which is what a plain-file telemetry record can
 	// honestly offer.
 	DispatchedAt time.Time `json:"dispatched_at,omitempty"`
+
+	// Origin is who asked for this review ("refinery" or "crew"), and Requester
+	// is their mail address. Recorded so a supervisor that kills the reviewer can
+	// tell the waiting party — otherwise a refinery-origin review is only
+	// rescued by await-review's 30m timeout, and a crew-origin one is never
+	// rescued at all, because no timeout covers that path.
+	Origin    string `json:"origin,omitempty"`
+	Requester string `json:"requester,omitempty"`
 }
 
 // dispatcherSeeded reports whether a record was written by TouchDispatch.
@@ -268,6 +276,9 @@ func TouchHeartbeat(rigPath, phase string) error {
 			Timestamp: time.Now().UTC(), Phase: phase,
 		})
 	}
+	// Copying prev wholesale inherits every identity field — including Origin and
+	// Requester, which only the dispatcher supplies. Losing those would leave a
+	// killed review with no one to escalate to.
 	next := *prev
 	next.Timestamp = time.Now().UTC()
 	next.Phase = phase
@@ -319,6 +330,14 @@ func TouchCheckout(rigPath string, pr, round int, sha string) error {
 	hb := &Heartbeat{
 		Timestamp: now, StartedAt: now, Phase: PhaseCheckout, PR: pr, Round: round, SHA: sha,
 	}
+	if prev != nil {
+		// Carry the escalation address forward. A QUEUED review is picked up here
+		// — the dispatcher refused to seed it while another was in flight — so
+		// this is the only place its requester can survive. Dropping it leaves a
+		// killed queued review with nobody to notify, which is the blind spot the
+		// escalation exists to close.
+		hb.Origin, hb.Requester = prev.Origin, prev.Requester
+	}
 	return WriteHeartbeat(rigPath, hb)
 }
 
@@ -343,11 +362,11 @@ func (hb *Heartbeat) sameReview(pr, round int, sha string) bool {
 // and a fresh round-2 reviewer would be born already 40 minutes into its budget
 // and killed on the reaper's first cycle.
 //
-// A dispatch for a DIFFERENT review while one is still on record does not
-// overwrite it: one file cannot represent the mail queue the design sanctions,
-// and the in-flight review's telemetry is what supervisors need. The queued
-// request establishes its own record when the reviewer reaches it.
-func TouchDispatch(rigPath string, pr, round int, sha string) error {
+// A dispatch for a DIFFERENT PR while one is still on record does not overwrite
+// it: one file cannot represent the mail queue the design sanctions, and the
+// in-flight review's telemetry is what supervisors need. The queued request
+// establishes its own record when the reviewer reaches it.
+func TouchDispatch(rigPath string, pr, round int, sha, origin, requester string) error {
 	prev := ReadHeartbeat(rigPath)
 	// A DIFFERENT PR is a queued request; leave the in-flight record alone. A new
 	// round or SHA of the SAME PR is a re-review that supersedes the round on
@@ -373,6 +392,7 @@ func TouchDispatch(rigPath string, pr, round int, sha string) error {
 		DispatchedAt: now,
 		Phase:        PhaseDispatched,
 		PR:           pr, Round: round, SHA: sha,
+		Origin: origin, Requester: requester,
 	}
 	// Only an IDENTICAL re-dispatch — same PR, round, and SHA — keeps the existing
 	// clock. That is the idempotent-retry case, where handing out a fresh budget

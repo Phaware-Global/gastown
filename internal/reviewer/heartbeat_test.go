@@ -61,7 +61,7 @@ func TestElapsed_ZeroWhenStartedAtUnset(t *testing.T) {
 
 func TestTouchDispatch_SeedsAndRoundTrips(t *testing.T) {
 	rig := t.TempDir()
-	if err := TouchDispatch(rig, 175, 1, "abc123"); err != nil {
+	if err := TouchDispatch(rig, 175, 1, "abc123", "crew", "gastown/crew"); err != nil {
 		t.Fatalf("TouchDispatch: %v", err)
 	}
 	hb := ReadHeartbeat(rig)
@@ -89,7 +89,7 @@ func TestTouchDispatch_NewRoundOfSamePRResetsTheClock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := TouchDispatch(rig, 176, 2, "bbbb"); err != nil {
+	if err := TouchDispatch(rig, 176, 2, "bbbb", "crew", "gastown/crew"); err != nil {
 		t.Fatalf("round-2 dispatch: %v", err)
 	}
 	hb := ReadHeartbeat(rig)
@@ -113,7 +113,7 @@ func TestTouchDispatch_NewSHAOfSameRoundResetsTheClock(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := TouchDispatch(rig, 1, 1, "cccc"); err != nil {
+	if err := TouchDispatch(rig, 1, 1, "cccc", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	if el := ReadHeartbeat(rig).Elapsed(); el > time.Minute {
@@ -131,7 +131,7 @@ func TestTouchDispatch_IdenticalRedispatchKeepsTheClock(t *testing.T) {
 	}
 	// An idempotent retry of the SAME review must not hand the reviewer a fresh
 	// budget, or a retry loop would make the cap unreachable.
-	if err := TouchDispatch(rig, 1, 1, "aaaa"); err != nil {
+	if err := TouchDispatch(rig, 1, 1, "aaaa", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	if el := ReadHeartbeat(rig).Elapsed(); el < 9*time.Minute {
@@ -141,7 +141,7 @@ func TestTouchDispatch_IdenticalRedispatchKeepsTheClock(t *testing.T) {
 
 func TestTouchDispatch_DoesNotClobberAnUnfinishedDifferentReview(t *testing.T) {
 	rig := t.TempDir()
-	if err := TouchDispatch(rig, 100, 1, "sha100"); err != nil {
+	if err := TouchDispatch(rig, 100, 1, "sha100", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	if err := TouchHeartbeat(rig, PhasePrompt); err != nil {
@@ -152,7 +152,7 @@ func TestTouchDispatch_DoesNotClobberAnUnfinishedDifferentReview(t *testing.T) {
 	// represent the queue, and the IN-FLIGHT review's telemetry is what
 	// supervisors need — overwriting it would reset a possibly-wedged reviewer's
 	// clock from a third party.
-	err := TouchDispatch(rig, 200, 1, "sha200")
+	err := TouchDispatch(rig, 200, 1, "sha200", "crew", "gastown/crew")
 	if !errors.Is(err, ErrReviewInFlight) {
 		t.Fatalf("TouchDispatch during an in-flight review = %v, want ErrReviewInFlight", err)
 	}
@@ -164,7 +164,7 @@ func TestTouchDispatch_DoesNotClobberAnUnfinishedDifferentReview(t *testing.T) {
 
 func TestTouchHeartbeat_CannotChangeIdentityOrReseedTheClock(t *testing.T) {
 	rig := t.TempDir()
-	if err := TouchDispatch(rig, 100, 1, "sha100"); err != nil {
+	if err := TouchDispatch(rig, 100, 1, "sha100", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	origin := ReadHeartbeat(rig).StartedAt
@@ -223,7 +223,7 @@ func TestTouchDispatch_OverwritesAPhaseOnlyMarker(t *testing.T) {
 	if err := TouchHeartbeat(rig, PhasePrompt); err != nil {
 		t.Fatal(err)
 	}
-	if err := TouchDispatch(rig, 176, 2, "sha176"); err != nil {
+	if err := TouchDispatch(rig, 176, 2, "sha176", "crew", "gastown/crew"); err != nil {
 		t.Fatalf("TouchDispatch over a phase-only marker = %v, want nil", err)
 	}
 	hb := ReadHeartbeat(rig)
@@ -237,7 +237,7 @@ func TestTouchDispatch_OverwritesAPhaseOnlyMarker(t *testing.T) {
 
 func TestClearHeartbeatFor_LeavesAQueuedReviewsRecord(t *testing.T) {
 	rig := t.TempDir()
-	if err := TouchDispatch(rig, 200, 1, "sha200"); err != nil {
+	if err := TouchDispatch(rig, 200, 1, "sha200", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	// Finishing PR 100 must not erase PR 200's dispatch record — that would make
@@ -264,7 +264,7 @@ func TestClearHeartbeatFor_LeavesAQueuedReviewsRecord(t *testing.T) {
 
 func TestClearHeartbeatFor_UnknownPRClearsUnconditionally(t *testing.T) {
 	rig := t.TempDir()
-	if err := TouchDispatch(rig, 7, 1, "s"); err != nil {
+	if err := TouchDispatch(rig, 7, 1, "s", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	// pr <= 0 means the caller could not determine which review it finished.
@@ -279,7 +279,7 @@ func TestClearHeartbeatFor_UnknownPRClearsUnconditionally(t *testing.T) {
 
 func TestClearHeartbeat_IdempotentAndRemoves(t *testing.T) {
 	rig := t.TempDir()
-	if err := TouchDispatch(rig, 7, 1, "sha"); err != nil {
+	if err := TouchDispatch(rig, 7, 1, "sha", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	if err := ClearHeartbeat(rig); err != nil {
@@ -296,7 +296,7 @@ func TestClearHeartbeat_IdempotentAndRemoves(t *testing.T) {
 func TestWriteHeartbeat_UsesAFixedTempNameAndIsNotWorldReadable(t *testing.T) {
 	rig := t.TempDir()
 	for i := 0; i < 3; i++ {
-		if err := TouchDispatch(rig, 1, 1, "s"); err != nil {
+		if err := TouchDispatch(rig, 1, 1, "s", "crew", "gastown/crew"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -323,7 +323,7 @@ func TestWriteHeartbeat_UsesAFixedTempNameAndIsNotWorldReadable(t *testing.T) {
 
 func TestWriteHeartbeat_DoesNotInheritAPlantedTempFilesMode(t *testing.T) {
 	rig := t.TempDir()
-	if err := TouchDispatch(rig, 1, 1, "s"); err != nil {
+	if err := TouchDispatch(rig, 1, 1, "s", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	tmpName := HeartbeatPath(rig) + ".tmp"
@@ -337,7 +337,7 @@ func TestWriteHeartbeat_DoesNotInheritAPlantedTempFilesMode(t *testing.T) {
 	if err := os.Chmod(tmpName, 0o666); err != nil {
 		t.Fatal(err)
 	}
-	if err := TouchDispatch(rig, 1, 2, "s"); err != nil {
+	if err := TouchDispatch(rig, 1, 2, "s", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(HeartbeatPath(rig))
@@ -351,7 +351,7 @@ func TestWriteHeartbeat_DoesNotInheritAPlantedTempFilesMode(t *testing.T) {
 
 func TestWriteHeartbeat_RefusesToWriteThroughAPlantedSymlink(t *testing.T) {
 	rig := t.TempDir()
-	if err := TouchDispatch(rig, 1, 1, "s"); err != nil {
+	if err := TouchDispatch(rig, 1, 1, "s", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	victim := filepath.Join(t.TempDir(), "victim")
@@ -367,7 +367,7 @@ func TestWriteHeartbeat_RefusesToWriteThroughAPlantedSymlink(t *testing.T) {
 	if err := os.Symlink(victim, HeartbeatPath(rig)+".tmp"); err != nil {
 		t.Fatal(err)
 	}
-	if err := TouchDispatch(rig, 1, 2, "s"); err != nil {
+	if err := TouchDispatch(rig, 1, 2, "s", "crew", "gastown/crew"); err != nil {
 		t.Fatalf("TouchDispatch = %v, want nil — a planted symlink must be swept, not fatal", err)
 	}
 	got, err := os.ReadFile(victim) //nolint:gosec // test-local path
@@ -411,6 +411,77 @@ func TestReadHeartbeatE_DistinguishesAbsentFromUnreadable(t *testing.T) {
 	// The lenient reader keeps its best-effort contract for progress-only callers.
 	if ReadHeartbeat(rig) != nil {
 		t.Error("ReadHeartbeat must stay lenient (nil on malformed)")
+	}
+}
+
+func TestTouchDispatch_RecordsRequesterAndOrigin(t *testing.T) {
+	rig := t.TempDir()
+	if err := TouchDispatch(rig, 175, 1, "abc", "crew", "gastown/crew"); err != nil {
+		t.Fatal(err)
+	}
+	hb := ReadHeartbeat(rig)
+	if hb == nil {
+		t.Fatal("nil heartbeat")
+	}
+	if hb.Origin != "crew" || hb.Requester != "gastown/crew" {
+		t.Errorf("origin/requester not recorded: %+v", hb)
+	}
+	if hb.Phase != PhaseDispatched {
+		t.Errorf("Phase = %q, want %q", hb.Phase, PhaseDispatched)
+	}
+}
+
+func TestTouchHeartbeat_PreservesRequesterAcrossPhases(t *testing.T) {
+	rig := t.TempDir()
+	if err := TouchDispatch(rig, 42, 2, "sha", "refinery", "gastown/refinery"); err != nil {
+		t.Fatal(err)
+	}
+	// Every in-session phase touch omits origin/requester — only the dispatcher
+	// supplies them. Without inheritance the escalation address is erased on the
+	// very first phase change, and a killed review notifies nobody.
+	for _, ph := range []string{PhaseCheckout, PhasePrompt, PhaseConsolidate, PhasePost} {
+		if err := TouchHeartbeat(rig, ph); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hb := ReadHeartbeat(rig)
+	if hb == nil {
+		t.Fatal("nil heartbeat")
+	}
+	if hb.Requester != "gastown/refinery" {
+		t.Errorf("Requester = %q after phase touches, want it preserved — "+
+			"losing it means a killed review escalates to nobody", hb.Requester)
+	}
+	if hb.Origin != "refinery" {
+		t.Errorf("Origin = %q, want preserved", hb.Origin)
+	}
+}
+
+func TestTouchDispatch_NewReviewAdoptsItsOwnRequester(t *testing.T) {
+	rig := t.TempDir()
+	if err := TouchDispatch(rig, 1, 1, "s1", "refinery", "gastown/refinery"); err != nil {
+		t.Fatal(err)
+	}
+	// A different PR while one is in flight is REFUSED — the in-flight record is
+	// what supervisors need, and overwriting it would reset a possibly-wedged
+	// reviewer's clock from a third party.
+	if err := TouchDispatch(rig, 2, 1, "s2", "crew", "gastown/crew"); !errors.Is(err, ErrReviewInFlight) {
+		t.Fatalf("dispatch for a different PR = %v, want ErrReviewInFlight", err)
+	}
+	if hb := ReadHeartbeat(rig); hb.Requester != "gastown/refinery" {
+		t.Errorf("in-flight requester was overwritten: %+v", hb)
+	}
+
+	// Once the first review is done, the next dispatch adopts its own requester.
+	if _, err := ClearHeartbeatFor(rig, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := TouchDispatch(rig, 2, 1, "s2", "crew", "gastown/crew"); err != nil {
+		t.Fatal(err)
+	}
+	hb := ReadHeartbeat(rig)
+	if hb.Requester != "gastown/crew" || hb.Origin != "crew" {
+		t.Errorf("a new review must adopt its own requester, got %+v", hb)
 	}
 }
 
@@ -460,7 +531,7 @@ func TestTouchCheckout_NewPRStartsAFreshClock(t *testing.T) {
 
 func TestTouchCheckout_DoesNotStampAnotherReviewsRound(t *testing.T) {
 	rig := t.TempDir()
-	if err := TouchDispatch(rig, 100, 4, "aaaa"); err != nil {
+	if err := TouchDispatch(rig, 100, 4, "aaaa", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	// Reaching the reset path guarantees the record on file belongs to a
@@ -478,14 +549,14 @@ func TestTouchCheckout_DoesNotStampAnotherReviewsRound(t *testing.T) {
 
 func TestTouchDispatch_IdenticalRerequestKeepsTheClock(t *testing.T) {
 	rig := t.TempDir()
-	if err := TouchDispatch(rig, 100, 1, "aaaa"); err != nil {
+	if err := TouchDispatch(rig, 100, 1, "aaaa", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	origin := ReadHeartbeat(rig).StartedAt
 	if origin.IsZero() {
 		t.Fatal("precondition: a dispatch must start a clock")
 	}
-	if err := TouchDispatch(rig, 100, 1, "aaaa"); err != nil {
+	if err := TouchDispatch(rig, 100, 1, "aaaa", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	if got := ReadHeartbeat(rig).StartedAt; !got.Equal(origin) {
@@ -503,7 +574,7 @@ func TestTouchDispatch_DoesNotInheritAZeroClock(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := TouchDispatch(rig, 100, 1, "aaaa"); err != nil {
+	if err := TouchDispatch(rig, 100, 1, "aaaa", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	if ReadHeartbeat(rig).StartedAt.IsZero() {
@@ -513,7 +584,7 @@ func TestTouchDispatch_DoesNotInheritAZeroClock(t *testing.T) {
 
 func TestTouchCheckout_SamePRAdvancesWithoutResetting(t *testing.T) {
 	rig := t.TempDir()
-	if err := TouchDispatch(rig, 100, 1, "aaaa"); err != nil {
+	if err := TouchDispatch(rig, 100, 1, "aaaa", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	origin := ReadHeartbeat(rig).StartedAt
@@ -535,7 +606,7 @@ func TestTouchCheckout_SamePRAdvancesWithoutResetting(t *testing.T) {
 
 func TestWriteHeartbeat_ATrashedTempPathCannotFreezeTheRecord(t *testing.T) {
 	rig := t.TempDir()
-	if err := TouchDispatch(rig, 176, 1, "aaaa"); err != nil {
+	if err := TouchDispatch(rig, 176, 1, "aaaa", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	// os.Remove cannot delete a non-empty directory, so one `mkdir -p
@@ -558,7 +629,7 @@ func TestWriteHeartbeat_ATrashedTempPathCannotFreezeTheRecord(t *testing.T) {
 	}
 	// And a re-dispatch of the same review still lands, so the record cannot be
 	// pinned at a stale identity either.
-	if err := TouchDispatch(rig, 176, 2, "bbbb"); err != nil {
+	if err := TouchDispatch(rig, 176, 2, "bbbb", "crew", "gastown/crew"); err != nil {
 		t.Errorf("TouchDispatch = %v, want nil — a trashed temp path must not wedge the dispatcher", err)
 	}
 	if hb := ReadHeartbeat(rig); hb == nil || hb.Round != 2 {
@@ -579,7 +650,7 @@ func TestTouchCheckout_CannotWedgeTheDispatcher(t *testing.T) {
 	if hb := ReadHeartbeat(rig); hb.PR != 1 {
 		t.Fatalf("precondition: checkout should record what it checked out: %+v", hb)
 	}
-	if err := TouchDispatch(rig, 176, 6, "bbbbbbb"); err != nil {
+	if err := TouchDispatch(rig, 176, 6, "bbbbbbb", "crew", "gastown/crew"); err != nil {
 		t.Errorf("TouchDispatch = %v, want nil — a record no dispatcher seeded must not "+
 			"block the seed", err)
 	}
@@ -609,7 +680,7 @@ func TestClearHeartbeatFor_RecoversARecordNoDispatcherSeeded(t *testing.T) {
 
 func TestClearHeartbeatFor_StillProtectsARealQueuedDispatch(t *testing.T) {
 	rig := t.TempDir()
-	if err := TouchDispatch(rig, 200, 1, "sha200"); err != nil {
+	if err := TouchDispatch(rig, 200, 1, "sha200", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	// The property that must survive the change above: finishing PR 100 must not
@@ -628,7 +699,7 @@ func TestClearHeartbeatFor_StillProtectsARealQueuedDispatch(t *testing.T) {
 
 func TestClearHeartbeatFor_RefusesToActOnAnUnreadableRecord(t *testing.T) {
 	rig := t.TempDir()
-	if err := TouchDispatch(rig, 200, 1, "sha200"); err != nil {
+	if err := TouchDispatch(rig, 200, 1, "sha200", "crew", "gastown/crew"); err != nil {
 		t.Fatal(err)
 	}
 	// A torn read — no attacker required, just a concurrent rename — made
@@ -646,5 +717,32 @@ func TestClearHeartbeatFor_RefusesToActOnAnUnreadableRecord(t *testing.T) {
 	}
 	if _, serr := os.Stat(HeartbeatPath(rig)); serr != nil {
 		t.Error("the unreadable record must be preserved for the supervisor")
+	}
+}
+
+func TestTouchCheckout_CarriesTheRequesterForward(t *testing.T) {
+	rig := t.TempDir()
+	// A queued review is picked up at checkout — the dispatcher refused to seed
+	// it while another was in flight — so this is the ONLY place its escalation
+	// address can survive. Dropping it leaves a killed queued review with nobody
+	// to notify, which is the blind spot the escalation exists to close.
+	if err := TouchDispatch(rig, 100, 1, "aaaa", "crew", "gastown/crew/max"); err != nil {
+		t.Fatal(err)
+	}
+	if err := TouchCheckout(rig, 200, 0, "bbbb"); err != nil {
+		t.Fatal(err)
+	}
+	hb := ReadHeartbeat(rig)
+	if hb == nil {
+		t.Fatal("nil heartbeat")
+	}
+	if hb.Requester != "gastown/crew/max" || hb.Origin != "crew" {
+		t.Errorf("requester lost at pickup: %+v", hb)
+	}
+	if hb.PR != 200 {
+		t.Errorf("PR = %d, want the newly checked-out review", hb.PR)
+	}
+	if el := hb.Elapsed(); el > time.Minute {
+		t.Errorf("Elapsed = %v, want a fresh clock for the new review", el)
 	}
 }
