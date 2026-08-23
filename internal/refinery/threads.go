@@ -205,6 +205,16 @@ func isSeverityHeaderLine(trimmedLine string) bool {
 // of whitespace, truncated to max chars with an ellipsis when longer.
 // Used to give the refinery LLM enough context to recognize a thread
 // without flooding the error message with body text.
+// FirstLinePreview is the exported form of firstLinePreview, for callers
+// outside this package that summarize a review thread body (the Reviewer's
+// prior-thread payload). Exported rather than duplicated so the badge- and
+// severity-skipping rules cannot drift between the two call sites: a private
+// copy in internal/cmd previously returned the priority badge itself as the
+// "preview", making every prior-thread line an identical shields.io URL.
+func FirstLinePreview(body string, max int) string {
+	return firstLinePreview(body, max)
+}
+
 func firstLinePreview(body string, max int) string {
 	for _, line := range strings.Split(body, "\n") {
 		trimmed := strings.TrimSpace(line)

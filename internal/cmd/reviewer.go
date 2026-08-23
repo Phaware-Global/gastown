@@ -242,7 +242,9 @@ func init() {
 	reviewerRequestCmd.Flags().StringVar(&reviewerRequestBranch, "branch", "", "PR head branch (optional)")
 	reviewerRequestCmd.Flags().StringVar(&reviewerRequestSHA, "sha", "",
 		"PR head SHA to review (default: the PR's current head)")
-	reviewerRequestCmd.Flags().IntVar(&reviewerRequestRound, "round", 1, "review round number (>=2 embeds prior threads)")
+	reviewerRequestCmd.Flags().IntVar(&reviewerRequestRound, "round", 1,
+		"review round number; >=2 embeds the PR's prior review threads in the request "+
+			"(the refinery derives this from the MR bead's review_loop_iter)")
 	reviewerRequestCmd.Flags().StringVar(&reviewerRequestOrigin, "origin", "",
 		"request origin: refinery|crew (default: refinery when --mr is set, else crew)")
 
@@ -859,16 +861,18 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 		MRID:    reviewerRequestMR,
 	}
 
-	// On a re-review, embed the prior round's unresolved threads so the
-	// Reviewer gets fix-loop context deterministically (best-effort).
+	// On a re-review, embed the prior rounds' threads so the Reviewer gets
+	// fix-loop context deterministically (best-effort).
+	//
+	// AllThreads, not UnresolvedThreads: the execution contract instructs a fix
+	// round not to relitigate already-resolved threads, which it cannot do if
+	// the payload omits them. A finding fixed in an earlier round was invisible
+	// here and free to be raised again — the round-over-round churn this whole
+	// path exists to prevent.
 	priorThreads := ""
 	if spec.Round >= 2 {
-		if threads, terr := provider.UnresolvedThreads(prNumber); terr == nil {
-			var pb strings.Builder
-			for _, th := range threads {
-				fmt.Fprintf(&pb, "- %s:%d [%s] %s\n", th.Path, th.Line, th.Author, firstLineOf(th.Body))
-			}
-			priorThreads = pb.String()
+		if threads, terr := provider.AllThreads(prNumber); terr == nil {
+			priorThreads = reviewer.FormatPriorThreads(threads)
 		}
 	}
 
@@ -1031,22 +1035,6 @@ func runReviewerDone(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Reviewer done — session %s will terminate shortly.\n", sessionID)
 	time.Sleep(4 * time.Second)
 	return nil
-}
-
-// firstLineOf returns the first non-empty line of s, trimmed, for compact
-// prior-thread summaries.
-func firstLineOf(s string) string {
-	for _, line := range strings.Split(s, "\n") {
-		if t := strings.TrimSpace(line); t != "" {
-			// Truncate on runes, not bytes, so a multi-byte character is never
-			// split into invalid UTF-8.
-			if r := []rune(t); len(r) > 120 {
-				return string(r[:120])
-			}
-			return t
-		}
-	}
-	return ""
 }
 
 // readOptionalInput returns the content of an optional file argument: "" for an
