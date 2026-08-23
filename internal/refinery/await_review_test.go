@@ -73,6 +73,8 @@ func (p *awaitFakeProvider) HasReviewFromOnSHA(prNumber int, user, sha string) (
 	return p.reviewBySHA[sha], nil
 }
 
+func (p *awaitFakeProvider) CreatedAt(int) (time.Time, error) { return time.Time{}, ErrUnsupported }
+
 func (p *awaitFakeProvider) CurrentHeadSHA(prNumber int) (string, error) {
 	return p.headSHA, p.headSHAErr
 }

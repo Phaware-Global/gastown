@@ -277,6 +277,7 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 			History:   reviewLoopHistory(state, len(threads)),
 			Resets:    state.ReviewLoopResets,
 			MaxRounds: maxIter,
+			Age:       prAge(provider, state.PRNumber),
 		})
 		reason := string(threadsJSON)
 		if desc := decision.Describe(state.PRNumber); desc != "" {
@@ -926,4 +927,34 @@ func ejectSuffix(d reviewer.EjectDecision) string {
 		return ""
 	}
 	return fmt.Sprintf(" — recommend %s", d.Outcome)
+}
+
+// prAge returns how long a PR has been open, or 0 when that cannot be
+// determined.
+//
+// Zero means "unknown" to Assess, which disables the age rail rather than
+// applying it to a made-up number. Every failure path lands there deliberately:
+// a provider that does not implement CreatedAt (Bitbucket returns
+// ErrUnsupported), a gh call that fails on an expired token, or a clock skew
+// that puts the creation time in the future. Guessing in the other direction —
+// treating a zero time.Time as the epoch — would report every PR as decades old
+// and eject all of them.
+//
+// Best-effort by design: this runs on the escalation path, where the useful
+// outcome is an escalation with slightly less context, never a failure that
+// suppresses the escalation entirely.
+func prAge(provider refinery.PRProvider, prNumber int) time.Duration {
+	if provider == nil || prNumber <= 0 {
+		return 0
+	}
+	created, err := provider.CreatedAt(prNumber)
+	if err != nil || created.IsZero() {
+		return 0
+	}
+	age := time.Since(created)
+	if age <= 0 {
+		// A creation time in the future is clock skew, not a new PR.
+		return 0
+	}
+	return age
 }

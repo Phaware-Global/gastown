@@ -3,6 +3,7 @@ package reviewer
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func hist(counts ...int) []RoundRecord {
@@ -137,5 +138,68 @@ func TestDescribe_PresentsAChoice(t *testing.T) {
 func TestDescribe_EmptyWhenNotTriggered(t *testing.T) {
 	if got := (EjectDecision{}).Describe(1); got != "" {
 		t.Errorf("untriggered decision described itself: %q", got)
+	}
+}
+
+// The rail this file previously shipped without a caller able to feed it. These
+// pin both halves: that a known age past the threshold ejects, and that an
+// unknown age (zero) does NOT — the failure mode that would eject every PR.
+func TestAssess_AgeRail(t *testing.T) {
+	tests := []struct {
+		name string
+		age  time.Duration
+		want bool
+	}{
+		{"unknown age does not eject", 0, false},
+		{"fresh PR does not eject", 2 * 24 * time.Hour, false},
+		{"exactly at the threshold does not eject", MaxPRAge, false},
+		{"past the threshold ejects", MaxPRAge + time.Hour, true},
+		{"two weeks ejects", 14 * 24 * time.Hour, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// One round, still blocking: no other rail can fire here, so the
+			// result isolates the age rail.
+			d := Assess(ConvergenceInput{History: hist(3), Age: tt.age})
+			if d.Triggered() != tt.want {
+				t.Errorf("age %v: Triggered() = %v, want %v (%+v)", tt.age, d.Triggered(), tt.want, d)
+			}
+			if tt.want && !strings.Contains(d.Reason, "blocking thread(s) still unresolved") {
+				t.Errorf("reason = %q, want the age criterion", d.Reason)
+			}
+		})
+	}
+}
+
+// A zero age must never read as "opened at the epoch". That inversion would
+// make every PR infinitely old and eject all of them.
+func TestAssess_UnknownAgeNeverEjectsAlone(t *testing.T) {
+	d := Assess(ConvergenceInput{History: hist(4, 3, 2), Age: 0})
+	if d.Triggered() {
+		t.Errorf("unknown age ejected a still-reducing loop: %+v", d)
+	}
+}
+
+// A drained PR is converged however old it is.
+func TestAssess_OldButDrainedDoesNotEject(t *testing.T) {
+	d := Assess(ConvergenceInput{History: hist(9, 4, 0), Age: 30 * 24 * time.Hour})
+	if d.Triggered() {
+		t.Errorf("an old PR with zero blocking threads must not eject: %+v", d)
+	}
+}
+
+func TestFormatAge(t *testing.T) {
+	cases := []struct {
+		d    time.Duration
+		want string
+	}{
+		{5 * time.Hour, "5 hours"},
+		{30 * time.Hour, "1 day"},
+		{14 * 24 * time.Hour, "14 days"},
+	}
+	for _, c := range cases {
+		if got := formatAge(c.d); got != c.want {
+			t.Errorf("formatAge(%v) = %q, want %q", c.d, got, c.want)
+		}
 	}
 }

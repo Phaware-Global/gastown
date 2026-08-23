@@ -46,22 +46,25 @@ type ConvergenceInput struct {
 	Resets int
 	// MaxRounds is the rig's configured review iteration cap.
 	MaxRounds int
+	// Age is how long the PR has been open. Zero means "unknown" — the
+	// provider could not answer — and disables the age rail rather than
+	// making every PR look infinitely old.
+	Age time.Duration
 }
 
-// NOTE — a PR-age rail is deliberately absent.
+// MaxPRAge is the age past which a still-blocked PR is treated as
+// non-converging regardless of its round history.
 //
 // A PR can sit blocked without accumulating rounds at all: a wedged reviewer, a
 // capacity-starved fix loop, an escalation nobody cleared. graphql-api #112,
-// #113, #118 and #120 each passed two weeks in that state, and #118 got only a
-// single review the whole time, so no round-count rail would ever fire on it.
+// #113, #118 and #120 each passed two weeks in that state, and #118 drew only a
+// single review the whole time — so no round-count rail would ever have fired
+// on it. That is the coverage this rail exists for.
 //
-// An age rail was drafted and removed. Nothing on the calling path can supply
-// the age: PRProvider exposes no PR creation time, and beads.Issue exposes no
-// bead creation time, so the field would have been permanently zero and the
-// rail permanently unreachable — the same dead-branch defect this stack exists
-// to remove (hga-y1b). Adding it needs a real source for the timestamp, either
-// a PRProvider method or a created_at field on the MR bead, and that is a
-// change of its own rather than a line here.
+// Seven days is chosen to sit well clear of a normal review cycle. The observed
+// stuck PRs ran to fourteen; a PR that has been blocked for a week has stopped
+// being reviewed and started waiting.
+const MaxPRAge = 7 * 24 * time.Hour
 
 // EjectDecision is the structured result of a convergence assessment.
 type EjectDecision struct {
@@ -86,14 +89,16 @@ func (d EjectDecision) Triggered() bool { return d.Outcome != EjectNone }
 // cap is evadable: clearing review_loop_iter restarts it, so "3 rounds" became
 // 23 and 31 in practice.
 //
-// Non-convergence fires on any of three rails, deliberately independent so a PR
+// Non-convergence fires on any of four rails, deliberately independent so a PR
 // stuck in an unusual way still trips one:
 //
 //   - three consecutive rounds with no net reduction in blocking threads — the
 //     loop is running but not draining;
 //   - rounds past the configured cap;
 //   - the cap has been reset at least once, since a reset means the cap already
-//     fired and the loop was restarted rather than resolved.
+//     fired and the loop was restarted rather than resolved;
+//   - the PR has been open longer than MaxPRAge with blocking threads still
+//     unresolved, which catches a PR that is stuck without churning.
 //
 // The outcome is a RECOMMENDATION carried to a human, not an automatic merge:
 // approving a PR is not a decision this should take unilaterally, and the
@@ -134,6 +139,15 @@ func Assess(in ConvergenceInput) EjectDecision {
 	if in.MaxRounds > 0 && latest.Round >= in.MaxRounds {
 		return decide(fmt.Sprintf("round %d has reached the configured cap of %d",
 			latest.Round, in.MaxRounds))
+	}
+	// Age > 0 is the "known" guard. A provider that cannot report a creation
+	// time (Bitbucket returns ErrUnsupported) yields zero, and zero must read as
+	// "unknown" rather than as an age of nothing — the inverse mistake, treating
+	// a zero time.Time as the epoch, would make every PR look infinitely old and
+	// trip this rail on all of them.
+	if in.Age > 0 && in.Age > MaxPRAge {
+		return decide(fmt.Sprintf("open %s with %d blocking thread(s) still unresolved",
+			formatAge(in.Age), latest.BlockingThreads))
 	}
 	if stalled, n := stalledRounds(in.History); stalled {
 		return decide(fmt.Sprintf(
@@ -220,4 +234,20 @@ func (d EjectDecision) Describe(prNumber int) string {
 	b.WriteString("\nThe alternative outcome remains available; this is a recommendation " +
 		"from the round history, not a merge decision.\n")
 	return b.String()
+}
+
+// formatAge renders a PR age for an operator-facing escalation line.
+//
+// Duration.String() renders multi-day spans as raw hours ("336h0m0s"), which
+// buries the one number that matters. Days are what the rail is about.
+func formatAge(d time.Duration) string {
+	days := int(d.Hours() / 24)
+	switch {
+	case days >= 2:
+		return fmt.Sprintf("%d days", days)
+	case days == 1:
+		return "1 day"
+	default:
+		return fmt.Sprintf("%d hours", int(d.Hours()))
+	}
 }
