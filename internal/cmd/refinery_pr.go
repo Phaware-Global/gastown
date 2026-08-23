@@ -741,10 +741,7 @@ func awaitReviewInner(args []string) error {
 		driftReset := beadState.CommitSHA != "" && headSHA != "" &&
 			!strings.EqualFold(beadState.CommitSHA, headSHA)
 		if beadState.StartedAt.IsZero() || driftReset {
-			round := 1
-			if !beadState.StartedAt.IsZero() {
-				round = 2 // a re-review after a fix round
-			}
+			round := dispatchRound(beadState)
 			if derr := dispatchLocalReviewer(prNumber, refPrAwaitMR, headSHA, round); derr != nil {
 				return fmt.Errorf("await-review: dispatching local reviewer: %w", derr)
 			}
@@ -837,6 +834,12 @@ func dispatchLocalReviewer(prNumber int, mrID, headSHA string, round int) error 
 type awaitReviewBeadState struct {
 	StartedAt time.Time
 	CommitSHA string
+	// ReviewLoopIter is the MR bead's review_loop_iter: the number of
+	// review-fix dispatches already completed for this PR. It is the only
+	// durable, monotonic record of how many fix rounds have happened, which
+	// makes it the sole trustworthy basis for the dispatched round number
+	// (see dispatchRound).
+	ReviewLoopIter int
 }
 
 // readAwaitReviewState reads the persisted await-review state from the
@@ -865,7 +868,10 @@ func readAwaitReviewState(mrID string) (awaitReviewBeadState, *beads.Beads, erro
 	if fields == nil {
 		return awaitReviewBeadState{}, bd, nil
 	}
-	state := awaitReviewBeadState{CommitSHA: fields.CommitSHA}
+	state := awaitReviewBeadState{
+		CommitSHA:      fields.CommitSHA,
+		ReviewLoopIter: fields.ReviewLoopIter,
+	}
 	if fields.AwaitReviewStartedAt != "" {
 		t, perr := time.Parse(time.RFC3339, fields.AwaitReviewStartedAt)
 		if perr != nil {
@@ -955,4 +961,48 @@ func fallback(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// dispatchRound returns the review round number to send with a reviewer
+// dispatch, derived from the MR bead's durable review_loop_iter counter.
+//
+// review_loop_iter counts review-fix dispatches ALREADY completed for this PR,
+// so the round now being dispatched is exactly one past it: iter 0 (no fix has
+// landed) is round 1, iter 3 is round 4.
+//
+// It replaces a derivation that read await_review_started_at:
+//
+//	round := 1
+//	if !beadState.StartedAt.IsZero() {
+//	    round = 2 // a re-review after a fix round
+//	}
+//
+// That branch was unreachable. Step PR.5 (dispatch-review-fix) clears
+// await_review_started_at via `gt mq set-review-state --clear-await-started-at`
+// as soon as a review-fix polecat's push completes — which is precisely the
+// event that precedes a re-review. So by the time PR.4 re-entered to dispatch,
+// StartedAt was always zero and the round was always 1, on every round forever.
+//
+// The consequences were not cosmetic. The execution contract keys its
+// anti-relitigation rules off the round: at round 1 it renders "There are no
+// prior threads to consider" and omits the instruction not to re-raise findings
+// on code unchanged since the last reviewed SHA. Every fix round was therefore
+// reviewed as a fresh first review of the whole diff, re-raising findings that
+// already existed as open threads and corrupting the fix loop's convergence
+// signal (hga-y1b; observed on PRs #110, #112, #113, #114 in a single patrol
+// cycle, and on PR #132 at an actual round 26 still dispatched as round 1).
+//
+// Deriving from the counter rather than a timestamp also makes the round
+// monotonic and restart-safe: it survives the clearing of await state, and two
+// dispatches for the same fix round report the same number instead of drifting.
+//
+// A negative iter (a hand-edited or corrupt bead field) would otherwise produce
+// round 0 or lower, which BuildPerspectivePrompt silently floors to 1 —
+// reintroducing the very bug this fixes, but quietly. Clamp here so the floor
+// is explicit and the dispatched round is never below 1.
+func dispatchRound(state awaitReviewBeadState) int {
+	if state.ReviewLoopIter < 0 {
+		return 1
+	}
+	return state.ReviewLoopIter + 1
 }
