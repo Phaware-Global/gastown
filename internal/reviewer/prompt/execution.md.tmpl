@@ -56,6 +56,20 @@ demonstrable weakness. Cap: at most **{{ .MaxFindings }}** findings; if you find
 more, keep the highest-severity {{ .MaxFindings }} and note the overflow in your
 verdict.
 
+**Length budgets, enforced.** Each finding is capped at **120** characters of
+`title`, **1200** of `body`, and **800** of `suggestion`. These are hard limits:
+a payload that exceeds one is rejected and you will have to re-emit it, so write
+within them the first time. State the failure scenario, the evidence that
+establishes it, and the change to make — then stop. Supporting analysis that
+does not change what the fixer does belongs in your `verdict`, not in a finding.
+If a body genuinely needs more than 1200 characters, you are almost always
+describing two findings that should be anchored separately.
+
+**One line, one finding.** Findings are consolidated by `path` + `line`, so two
+findings you raise on the same line will be merged into a single thread. Raise
+one finding per defect, at the line where a fixer would edit — not the same
+defect restated from several angles.
+
 ### 5. Time budget — return something, and say so in a way the code can read
 You have a soft budget of **{{ .MaxDuration }}** for this pass. Nothing enforces
 it from outside your session: if you never return, the whole review stalls with

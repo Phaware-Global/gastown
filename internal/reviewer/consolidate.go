@@ -184,10 +184,19 @@ func mergePerspectives(existing, add string) string {
 //
 //   - The summary lists every perspective's verdict in input order, so a
 //     perspective that found nothing is still explicitly accounted for.
-//   - Findings are deduplicated by (path, line, case-folded title). When two
-//     perspectives raise the same finding, the higher priority wins and the
+//   - Findings are deduplicated by (path, line) — NOT by title. Four lenses
+//     describing one defect in four different sentences are one defect and need
+//     one fix, but a title-keyed dedup saw four distinct findings and emitted
+//     four blocking threads (observed on graphql-api PR #114: 1 high + 3 medium
+//     all on line 88, all the same organizationMemberships[0] bug). Every
+//     distinct title is preserved in the merged body, so no lens's framing is
+//     lost — only the duplicate threads are. The higher priority wins and the
 //     perspective tags are unioned. First occurrence sets the position, so the
 //     output order is stable.
+//   - Low-priority findings on the same file are then collapsed into a single
+//     "nits" thread per file. Every unresolved thread blocks the refinery's fix
+//     loop regardless of severity, so a scatter of individually-trivial nits
+//     costs exactly as much to clear as a scatter of real defects.
 //
 // Doing dedup here, in tested Go, keeps it deterministic rather than leaving it
 // to per-run reviewer judgment.
@@ -199,18 +208,30 @@ func Consolidate(results []PerspectiveResult, reviewedSHA string) *Findings {
 	}
 
 	type dedupKey struct {
-		path  string
-		line  int
-		title string
+		path string
+		line int
 	}
 	index := map[dedupKey]int{}
 	var out []Finding
 	for _, r := range results {
 		for _, f := range r.Findings {
-			k := dedupKey{f.Path, f.Line, strings.ToLower(strings.TrimSpace(f.Title))}
+			k := dedupKey{f.Path, f.Line}
 			if idx, ok := index[k]; ok {
+				// The surviving thread takes the most severe priority, so a high
+				// from any lens is never softened by a medium from another.
 				if priorityRank(f.Priority) > priorityRank(out[idx].Priority) {
 					out[idx].Priority = f.Priority
+					// Title follows severity: the most severe framing of the
+					// defect is the one a fixer should read first.
+					if !strings.EqualFold(strings.TrimSpace(f.Title), strings.TrimSpace(out[idx].Title)) {
+						out[idx].Body = mergeText(out[idx].Body, "Also flagged as: "+out[idx].Title)
+						out[idx].Title = f.Title
+					}
+				} else if !strings.EqualFold(strings.TrimSpace(f.Title), strings.TrimSpace(out[idx].Title)) {
+					// A distinct framing from an equal-or-lower lens is kept in
+					// the body. Dropping it would lose the reason that lens
+					// flagged the line at all.
+					out[idx].Body = mergeText(out[idx].Body, "Also flagged as: "+f.Title)
 				}
 				out[idx].Perspective = mergePerspectives(out[idx].Perspective, f.Perspective)
 				// Preserve perspective-specific detail rather than discarding the
@@ -223,6 +244,8 @@ func Consolidate(results []PerspectiveResult, reviewedSHA string) *Findings {
 			out = append(out, f)
 		}
 	}
+
+	out = collapseLowFindings(out)
 
 	// Fold the per-perspective dispositions by taking the most blocking one: if
 	// any single lens says "request changes", the consolidated review must say
@@ -241,4 +264,79 @@ func Consolidate(results []PerspectiveResult, reviewedSHA string) *Findings {
 		Findings:    out,
 		Disposition: disposition,
 	}
+}
+
+// collapseLowFindings merges a file's low-priority findings into one thread.
+//
+// Severity governs the GitHub review event but NOT what blocks: the refinery's
+// fix loop polls unresolved threads and is author- and severity-agnostic ("every
+// unresolved thread counts"), so a low nit costs a full resolve cycle exactly
+// like a high. A round that scatters seven lows across a file therefore imposes
+// seven round-trips for issues the review itself calls non-blocking.
+//
+// Collapsing is per-file rather than global so each thread still lands on the
+// file it concerns, and the surviving anchor is the earliest line so the thread
+// sorts naturally against the others. Nothing is discarded — every title, body
+// and suggestion is folded into the merged body.
+//
+// Findings at or above medium are untouched: they are individually actionable
+// and a fixer needs them anchored where they occur.
+func collapseLowFindings(in []Finding) []Finding {
+	// Count lows per path first. A single low on a file is left exactly as it
+	// is: wrapping one finding in "nits" machinery would only obscure it.
+	lowCount := map[string]int{}
+	for _, f := range in {
+		if strings.EqualFold(f.Priority, "low") {
+			lowCount[f.Path]++
+		}
+	}
+
+	merged := map[string]int{} // path -> index in out of that path's nits thread
+	var out []Finding
+	for _, f := range in {
+		if !strings.EqualFold(f.Priority, "low") || lowCount[f.Path] < 2 {
+			out = append(out, f)
+			continue
+		}
+		idx, ok := merged[f.Path]
+		if !ok {
+			// Seed the collapsed thread from the first low on this path,
+			// preserving its anchor.
+			seed := f
+			seed.Body = mergeText("", nitEntry(f))
+			seed.Suggestion = ""
+			out = append(out, seed)
+			merged[f.Path] = len(out) - 1
+			continue
+		}
+		if f.Line < out[idx].Line {
+			out[idx].Line = f.Line
+		}
+		out[idx].Perspective = mergePerspectives(out[idx].Perspective, f.Perspective)
+		out[idx].Body = mergeText(out[idx].Body, nitEntry(f))
+	}
+
+	// Title the collapsed threads once their membership is final.
+	for path, idx := range merged {
+		out[idx].Title = fmt.Sprintf("Nits: %d non-blocking findings in this file", lowCount[path])
+	}
+	return out
+}
+
+// nitEntry renders one low finding as a bullet inside a collapsed nits thread,
+// keeping its own line number so the reader can still locate it.
+func nitEntry(f Finding) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "- line %d", f.Line)
+	if f.Perspective != "" {
+		fmt.Fprintf(&b, " [%s]", f.Perspective)
+	}
+	fmt.Fprintf(&b, ": %s", strings.TrimSpace(f.Title))
+	if body := strings.TrimSpace(f.Body); body != "" {
+		fmt.Fprintf(&b, "\n  %s", strings.ReplaceAll(body, "\n", "\n  "))
+	}
+	if sug := strings.TrimSpace(f.Suggestion); sug != "" {
+		fmt.Fprintf(&b, "\n  Suggested fix: %s", strings.ReplaceAll(sug, "\n", "\n  "))
+	}
+	return b.String()
 }
