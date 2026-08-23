@@ -234,6 +234,15 @@ func Consolidate(results []PerspectiveResult, reviewedSHA string, manifest DiffM
 					out[idx].Body = mergeText(out[idx].Body, "Also flagged as: "+f.Title)
 				}
 				out[idx].Perspective = mergePerspectives(out[idx].Perspective, f.Perspective)
+				// Union the remediation paths. This one is load-bearing, not
+				// bookkeeping: Classify caps a finding at out-of-scope when ANY
+				// remediation path falls outside the diff, so dropping the
+				// duplicate's paths would let a lens that omitted them mask a
+				// lens that named them honestly — and the merged finding would
+				// post as a blocking demand for work in untouched files. Whether
+				// that happened would depend on subagent arrival order.
+				out[idx].RemediationPaths = mergeRemediationPaths(
+					out[idx].RemediationPaths, f.RemediationPaths)
 				// Preserve perspective-specific detail rather than discarding the
 				// duplicate's body/suggestion.
 				out[idx].Body = mergeText(out[idx].Body, f.Body)
@@ -255,7 +264,7 @@ func Consolidate(results []PerspectiveResult, reviewedSHA string, manifest DiffM
 			// simply not this PR's to fix, so it is posted as advisory and the
 			// body says why.
 			out[i].Priority = "low"
-			out[i].Body = mergeText(OutOfScopeNotice(out[i]), out[i].Body)
+			out[i].Body = mergeText(OutOfScopeNotice(manifest, out[i]), out[i].Body)
 		}
 	}
 
@@ -385,4 +394,27 @@ func hasBlockingInScope(findings []Finding) bool {
 		}
 	}
 	return false
+}
+
+// mergeRemediationPaths unions two remediation-path lists, preserving first-seen
+// order and dropping blanks and duplicates.
+//
+// Comparison is case-sensitive and exact, matching DiffManifest lookups: paths
+// come from the same repo-relative namespace on both sides, and case-folding
+// here would let two genuinely different paths on a case-sensitive filesystem
+// collapse into one.
+func mergeRemediationPaths(existing, add []string) []string {
+	seen := make(map[string]bool, len(existing)+len(add))
+	var out []string
+	for _, src := range [][]string{existing, add} {
+		for _, p := range src {
+			p = strings.TrimSpace(p)
+			if p == "" || seen[p] {
+				continue
+			}
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out
 }

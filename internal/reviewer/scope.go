@@ -206,18 +206,42 @@ func (m DiffManifest) Classify(f Finding) Scope {
 
 // OutOfScopeNotice prefixes a demoted finding's body so a reader can see why it
 // is not blocking without cross-referencing the diff.
-func OutOfScopeNotice(f Finding) string {
+//
+// It takes the manifest because Classify returns ScopeOut on a DISJUNCTION —
+// the anchor is outside, OR any single remediation path is. So a demoted
+// finding can carry a mix of in-diff and out-of-diff paths, and naming all of
+// them as "outside this PR's diff" would steer a fixer away from a change they
+// could land here. Two shapes made that wrong: a mixed path list, and an
+// out-of-diff anchor whose remediation is entirely in-diff (where every named
+// path is in fact touched and the anchor — the real reason — went unmentioned).
+func OutOfScopeNotice(m DiffManifest, f Finding) string {
 	var outside []string
 	for _, rp := range f.RemediationPaths {
-		if rp = strings.TrimSpace(rp); rp != "" {
+		if rp = strings.TrimSpace(rp); rp == "" {
+			continue
+		}
+		if !m.Touches(rp) {
 			outside = append(outside, rp)
 		}
 	}
-	if len(outside) > 0 {
+
+	anchorOutside := !m.Touches(f.Path)
+
+	switch {
+	case len(outside) > 0 && anchorOutside:
+		return fmt.Sprintf("Non-blocking: this anchors outside the lines this PR changed, "+
+			"and acting on it requires changes outside the diff (%s). "+
+			"Track it as follow-up work rather than blocking this merge.",
+			strings.Join(outside, ", "))
+	case len(outside) > 0:
 		return fmt.Sprintf("Non-blocking: acting on this requires changes outside this PR's diff (%s). "+
 			"Track it as follow-up work rather than blocking this merge.",
 			strings.Join(outside, ", "))
+	default:
+		// Either the anchor is outside the diff, or it sits on an untouched
+		// line of a touched file. Naming no paths is correct here: every
+		// remediation path this finding declared is inside the diff.
+		return "Non-blocking: this anchors outside the lines this PR changed. " +
+			"Track it as follow-up work rather than blocking this merge."
 	}
-	return "Non-blocking: this anchors outside the lines this PR changed. " +
-		"Track it as follow-up work rather than blocking this merge."
 }

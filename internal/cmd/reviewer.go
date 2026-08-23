@@ -762,7 +762,7 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 	// ScopeUnknown and changes nothing. Scope filtering must never be able to
 	// silently downgrade a review just because git was unavailable — a missing
 	// manifest is missing evidence, not evidence of good scope.
-	manifest := buildDiffManifest(reviewerConsolidateBaseSHA, reviewerConsolidateSHA)
+	manifest := buildDiffManifest(resolveConsolidateBaseSHA(), reviewerConsolidateSHA)
 
 	fs := reviewer.Consolidate(results, reviewerConsolidateSHA, manifest)
 
@@ -1154,4 +1154,35 @@ func isHexObjectName(s string) bool {
 		}
 	}
 	return true
+}
+
+// resolveConsolidateBaseSHA returns the merge-base to classify findings
+// against: the explicit --base-sha when given, otherwise derived the same way
+// `gt reviewer prompt` derives it.
+//
+// The derivation is not a convenience. The sanctioned consolidate invocation —
+// the one the role template, `gt prime` and the runbook all print, and which the
+// template tells the Reviewer to run literally ("do not improvise the
+// procedure; run the commands") — passes only --sha. Requiring --base-sha would
+// have left scope classification switched off on the exact path every review
+// actually takes: buildDiffManifest returns nil without it, so every finding
+// classifies ScopeUnknown and nothing is demoted. A feature that only engages
+// when someone remembers an undocumented flag is a feature that never engages.
+//
+// The PR number comes from the heartbeat rather than a new --pr flag, because
+// consolidate deliberately takes no --pr (it inherits the heartbeat's identity
+// fields so the record stays complete across the phase change).
+func resolveConsolidateBaseSHA() string {
+	if b := strings.TrimSpace(reviewerConsolidateBaseSHA); b != "" {
+		return b
+	}
+	rigPath := reviewerRigPathForHeartbeat()
+	if rigPath == "" {
+		return ""
+	}
+	hb := reviewer.ReadHeartbeat(rigPath)
+	if hb == nil || hb.PR <= 0 {
+		return ""
+	}
+	return resolveReviewBaseSHA(hb.PR, reviewerConsolidateSHA)
 }

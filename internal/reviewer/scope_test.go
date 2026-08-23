@@ -222,3 +222,117 @@ func TestConsolidate_UnanchoredBlockKeptWhenScopeUnknown(t *testing.T) {
 		t.Errorf("event = %q, want REQUEST_CHANGES with no manifest", fs.ReviewEvent())
 	}
 }
+
+// Regression: the (path, line) dedup merged Priority, Title, Body, Suggestion
+// and Perspective but dropped the duplicate's RemediationPaths, so a lens that
+// omitted them could mask a lens that named them honestly — and whether the
+// anchor-laundering rail fired depended on subagent arrival order.
+func TestConsolidate_MergeUnionsRemediationPaths(t *testing.T) {
+	m := ParseDiffManifest(sampleDiff)
+	inDiff := "libs/domain/survey-code.value.ts"
+
+	// Lens A arrives first with no remediation paths; lens B arrives second and
+	// correctly names an out-of-diff path.
+	results := []PerspectiveResult{
+		{Perspective: "security", Verdict: "v", Findings: []Finding{{
+			Path: inDiff, Line: 38, Priority: "medium", Perspective: "security",
+			Title: "Vague concern",
+		}}},
+		{Perspective: "domain-driven-design", Verdict: "v", Findings: []Finding{{
+			Path: inDiff, Line: 38, Priority: "high", Perspective: "domain-driven-design",
+			Title:            "Fix lives in an untouched file",
+			RemediationPaths: []string{"libs/application/untouched.ts"},
+		}}},
+	}
+
+	fs := Consolidate(results, "sha", m)
+
+	if len(fs.Findings) != 1 {
+		t.Fatalf("got %d findings, want 1 merged", len(fs.Findings))
+	}
+	f := fs.Findings[0]
+	if f.Scope != ScopeOut {
+		t.Errorf("scope = %q, want out_of_scope: the second lens named an out-of-diff "+
+			"remediation path and the merge must not discard it", f.Scope)
+	}
+	if ev := fs.ReviewEvent(); ev != "APPROVE" {
+		t.Errorf("event = %q, want APPROVE — this must not block", ev)
+	}
+}
+
+// The same asymmetry in the other arrival order must reach the same verdict.
+func TestConsolidate_MergeUnionsRemediationPathsEitherOrder(t *testing.T) {
+	m := ParseDiffManifest(sampleDiff)
+	inDiff := "libs/domain/survey-code.value.ts"
+
+	results := []PerspectiveResult{
+		{Perspective: "domain-driven-design", Verdict: "v", Findings: []Finding{{
+			Path: inDiff, Line: 38, Priority: "high", Perspective: "domain-driven-design",
+			Title:            "Fix lives in an untouched file",
+			RemediationPaths: []string{"libs/application/untouched.ts"},
+		}}},
+		{Perspective: "security", Verdict: "v", Findings: []Finding{{
+			Path: inDiff, Line: 38, Priority: "medium", Perspective: "security",
+			Title: "Vague concern",
+		}}},
+	}
+
+	if got := Consolidate(results, "sha", m).Findings[0].Scope; got != ScopeOut {
+		t.Errorf("scope = %q, want out_of_scope regardless of arrival order", got)
+	}
+}
+
+func TestMergeRemediationPaths(t *testing.T) {
+	got := mergeRemediationPaths([]string{"a.ts", "b.ts"}, []string{" b.ts ", "", "c.ts"})
+	want := []string{"a.ts", "b.ts", "c.ts"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("got %v, want %v (first-seen order, deduped, blanks dropped)", got, want)
+		}
+	}
+}
+
+// OutOfScopeNotice must not label an in-diff path as outside the diff.
+func TestOutOfScopeNotice_OnlyNamesPathsActuallyOutside(t *testing.T) {
+	m := ParseDiffManifest(sampleDiff)
+	inDiff := "libs/domain/survey-code.value.ts"
+
+	t.Run("mixed paths name only the outside one", func(t *testing.T) {
+		got := OutOfScopeNotice(m, Finding{
+			Path: inDiff, Line: 38,
+			RemediationPaths: []string{inDiff, "libs/application/untouched.ts"},
+		})
+		if strings.Contains(got, inDiff) {
+			t.Errorf("in-diff path labelled as outside the diff:\n%s", got)
+		}
+		if !strings.Contains(got, "libs/application/untouched.ts") {
+			t.Errorf("out-of-diff path not named:\n%s", got)
+		}
+	})
+
+	t.Run("outside anchor with entirely in-diff remediation", func(t *testing.T) {
+		got := OutOfScopeNotice(m, Finding{
+			Path: "libs/application/untouched.ts", Line: 10,
+			RemediationPaths: []string{inDiff},
+		})
+		if strings.Contains(got, inDiff) {
+			t.Errorf("the only named path is in-diff; it must not be called outside:\n%s", got)
+		}
+		if !strings.Contains(got, "anchors outside the lines this PR changed") {
+			t.Errorf("the anchor is the real reason and must be stated:\n%s", got)
+		}
+	})
+
+	t.Run("both outside states both", func(t *testing.T) {
+		got := OutOfScopeNotice(m, Finding{
+			Path: "libs/application/untouched.ts", Line: 10,
+			RemediationPaths: []string{"libs/application/other.ts"},
+		})
+		if !strings.Contains(got, "anchors outside") || !strings.Contains(got, "libs/application/other.ts") {
+			t.Errorf("both reasons should appear:\n%s", got)
+		}
+	})
+}
