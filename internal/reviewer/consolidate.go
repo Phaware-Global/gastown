@@ -200,7 +200,7 @@ func mergePerspectives(existing, add string) string {
 //
 // Doing dedup here, in tested Go, keeps it deterministic rather than leaving it
 // to per-run reviewer judgment.
-func Consolidate(results []PerspectiveResult, reviewedSHA string) *Findings {
+func Consolidate(results []PerspectiveResult, reviewedSHA string, manifest DiffManifest) *Findings {
 	var sb strings.Builder
 	sb.WriteString("Per-perspective verdicts:\n")
 	for _, r := range results {
@@ -245,6 +245,20 @@ func Consolidate(results []PerspectiveResult, reviewedSHA string) *Findings {
 		}
 	}
 
+	// Classify against the diff before anything reads severity. A nil manifest
+	// leaves every finding ScopeUnknown and changes nothing, so a reviewer
+	// running without diff data behaves exactly as it did before.
+	for i := range out {
+		out[i].Scope = manifest.Classify(out[i])
+		if out[i].Scope == ScopeOut {
+			// Demote rather than drop. The finding may well be correct — it is
+			// simply not this PR's to fix, so it is posted as advisory and the
+			// body says why.
+			out[i].Priority = "low"
+			out[i].Body = mergeText(OutOfScopeNotice(out[i]), out[i].Body)
+		}
+	}
+
 	out = collapseLowFindings(out)
 
 	// Fold the per-perspective dispositions by taking the most blocking one: if
@@ -256,6 +270,22 @@ func Consolidate(results []PerspectiveResult, reviewedSHA string) *Findings {
 		if dispositionRank(r.Disposition) > dispositionRank(disposition) {
 			disposition = strings.ToLower(strings.TrimSpace(r.Disposition))
 		}
+	}
+
+	// A request_changes disposition is the one channel that blocks a merge
+	// without creating a thread, which means nothing in town can clear it: the
+	// fix loop is thread-driven, so an unanchored block needs an operator. The
+	// contract invites passes to reach for it precisely when they cannot anchor
+	// an objection — "an architectural objection, a concern about the change as
+	// a whole" — which is also the exact shape of an out-of-scope demand.
+	//
+	// So it is honoured only when the round also found something blocking
+	// INSIDE the diff. With a manifest present and no in-scope blocking finding,
+	// it is softened to comment: the objection still posts, in full, and still
+	// raises the verdict above a bare approve — it just no longer creates an
+	// unclearable block over work this PR does not contain.
+	if disposition == "request_changes" && manifest != nil && !hasBlockingInScope(out) {
+		disposition = "comment"
 	}
 
 	return &Findings{
@@ -339,4 +369,20 @@ func nitEntry(f Finding) string {
 		fmt.Fprintf(&b, "\n  Suggested fix: %s", strings.ReplaceAll(sug, "\n", "\n  "))
 	}
 	return b.String()
+}
+
+// hasBlockingInScope reports whether any finding both blocks (high) and lands
+// inside the diff. ScopeUnknown counts as in-scope: without a manifest there is
+// no evidence of a violation, and absent evidence must not silently disarm a
+// blocking verdict.
+func hasBlockingInScope(findings []Finding) bool {
+	for _, f := range findings {
+		if f.Scope == ScopeOut {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(f.Priority), "high") {
+			return true
+		}
+	}
+	return false
 }

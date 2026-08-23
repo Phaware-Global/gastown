@@ -46,6 +46,20 @@ type Finding struct {
 	Title       string `json:"title"`                // one-line summary
 	Body        string `json:"body"`                 // explanation, with codegraph evidence
 	Suggestion  string `json:"suggestion,omitempty"` // concrete change or diff suggestion
+
+	// RemediationPaths lists every repo-relative file that must be edited to
+	// act on this finding. Optional, but it is what distinguishes a finding
+	// this PR can fix from one that only points at it: a finding may anchor to
+	// a changed line while every edit it asks for lives in files the diff never
+	// touched. Consolidate classifies a finding by the weakest of its anchor
+	// and these paths, so naming them honestly is how a pass keeps a real
+	// concern from becoming a false merge blocker.
+	RemediationPaths []string `json:"remediation_paths,omitempty"`
+
+	// Scope is assigned by Consolidate against the diff manifest; it is not
+	// read from the payload. Findings outside the diff are demoted to
+	// non-blocking rather than dropped.
+	Scope Scope `json:"scope,omitempty"`
 }
 
 // Findings is the full payload `gt reviewer post --findings <json>` consumes.
@@ -182,6 +196,12 @@ func (fs *Findings) SeverityEvent() string {
 func (fs *Findings) severityEvent() string {
 	hasMedium := false
 	for _, f := range fs.Findings {
+		// Out-of-scope findings never gate the verdict. They are real and are
+		// still posted, but a PR must not be blocked on work its own diff does
+		// not contain — that demand belongs to a follow-up, not this merge.
+		if f.Scope == ScopeOut {
+			continue
+		}
 		// Normalize defensively for Findings built outside ParseFindings (which
 		// rejects bad priorities). Only an explicit "low" permits APPROVE; an
 		// empty priority is "medium" (advisory) per normalizeFinding, and any

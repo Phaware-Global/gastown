@@ -54,7 +54,7 @@ func TestConsolidate_SummaryAccountsForEveryPerspective(t *testing.T) {
 		}},
 		{Perspective: "security", Verdict: "no findings: nothing tainted"},
 	}
-	fs := Consolidate(results, "sha123")
+	fs := Consolidate(results, "sha123", nil)
 	if fs.ReviewedSHA != "sha123" {
 		t.Errorf("reviewed SHA = %q", fs.ReviewedSHA)
 	}
@@ -82,7 +82,7 @@ func TestConsolidate_DedupsAndEscalatesPriority(t *testing.T) {
 			{Path: "b.go", Line: 2, Priority: "medium", Perspective: "security", Title: "ssrf"},
 		}},
 	}
-	fs := Consolidate(results, "")
+	fs := Consolidate(results, "", nil)
 	if len(fs.Findings) != 2 {
 		t.Fatalf("findings = %d, want 2 (one deduped)", len(fs.Findings))
 	}
@@ -107,7 +107,7 @@ func TestConsolidate_MergesDifferingBodiesAndSuggestions(t *testing.T) {
 				Title: "unchecked error", Body: "tainted path reaches sink", Suggestion: "validate input"},
 		}},
 	}
-	fs := Consolidate(results, "")
+	fs := Consolidate(results, "", nil)
 	if len(fs.Findings) != 1 {
 		t.Fatalf("findings = %d, want 1 (deduped)", len(fs.Findings))
 	}
@@ -159,7 +159,7 @@ func TestConsolidate_RoundTripsThroughParseFindings(t *testing.T) {
 			{Path: "a.go", Line: 1, Priority: "high", Perspective: "adversarial", Title: "t"},
 		}},
 	}
-	fs := Consolidate(results, "sha")
+	fs := Consolidate(results, "sha", nil)
 	// The consolidated payload must be valid input for `gt reviewer post`.
 	body := fs.BuildReviewInput("sha")
 	if len(body.Comments) != 1 {
