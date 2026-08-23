@@ -46,19 +46,22 @@ type ConvergenceInput struct {
 	Resets int
 	// MaxRounds is the rig's configured review iteration cap.
 	MaxRounds int
-	// Age is how long the PR has been open with review outstanding.
-	Age time.Duration
 }
 
-// MaxPRAge is the age past which a still-blocked PR is treated as
-// non-converging regardless of its round history.
+// NOTE — a PR-age rail is deliberately absent.
 //
-// A PR can sit blocked without accumulating rounds at all — waiting on a
-// wedged reviewer, a capacity-starved fix loop, or an operator who never
-// cleared an escalation. graphql-api #112, #113, #118 and #120 all passed two
-// weeks in that state. Round-count criteria alone never fire on those, so age
-// is a separate rail.
-const MaxPRAge = 7 * 24 * time.Hour
+// A PR can sit blocked without accumulating rounds at all: a wedged reviewer, a
+// capacity-starved fix loop, an escalation nobody cleared. graphql-api #112,
+// #113, #118 and #120 each passed two weeks in that state, and #118 got only a
+// single review the whole time, so no round-count rail would ever fire on it.
+//
+// An age rail was drafted and removed. Nothing on the calling path can supply
+// the age: PRProvider exposes no PR creation time, and beads.Issue exposes no
+// bead creation time, so the field would have been permanently zero and the
+// rail permanently unreachable — the same dead-branch defect this stack exists
+// to remove (hga-y1b). Adding it needs a real source for the timestamp, either
+// a PRProvider method or a created_at field on the MR bead, and that is a
+// change of its own rather than a line here.
 
 // EjectDecision is the structured result of a convergence assessment.
 type EjectDecision struct {
@@ -83,15 +86,14 @@ func (d EjectDecision) Triggered() bool { return d.Outcome != EjectNone }
 // cap is evadable: clearing review_loop_iter restarts it, so "3 rounds" became
 // 23 and 31 in practice.
 //
-// Non-convergence fires on any of four rails, deliberately independent so a PR
+// Non-convergence fires on any of three rails, deliberately independent so a PR
 // stuck in an unusual way still trips one:
 //
 //   - three consecutive rounds with no net reduction in blocking threads — the
 //     loop is running but not draining;
 //   - rounds past the configured cap;
 //   - the cap has been reset at least once, since a reset means the cap already
-//     fired and the loop was restarted rather than resolved;
-//   - the PR is older than MaxPRAge with blocking threads still open.
+//     fired and the loop was restarted rather than resolved.
 //
 // The outcome is a RECOMMENDATION carried to a human, not an automatic merge:
 // approving a PR is not a decision this should take unilaterally, and the
@@ -122,13 +124,16 @@ func Assess(in ConvergenceInput) EjectDecision {
 			"the review-loop cap has been cleared %d time(s), so the cap has already "+
 				"fired and the loop was restarted rather than resolved", in.Resets))
 	}
-	if in.MaxRounds > 0 && latest.Round > in.MaxRounds {
-		return decide(fmt.Sprintf("round %d is past the configured cap of %d",
+	// >=, not >. RoundRecord.Round counts COMPLETED rounds, and the caller
+	// escalates the moment review_loop_iter reaches maxIter — so at the only
+	// point Assess is called, latest.Round == MaxRounds exactly. A strict >
+	// made this rail unreachable in the primary case (a cleanly configured PR
+	// hitting its cap for the first time), and with the other rails also quiet
+	// there — no resets yet, too few rounds to stall — the escalation fell back
+	// to the bare "exceeded N iterations" message this whole path replaces.
+	if in.MaxRounds > 0 && latest.Round >= in.MaxRounds {
+		return decide(fmt.Sprintf("round %d has reached the configured cap of %d",
 			latest.Round, in.MaxRounds))
-	}
-	if in.Age > MaxPRAge && latest.BlockingThreads > 0 {
-		return decide(fmt.Sprintf("open %s with %d blocking thread(s) still unresolved",
-			in.Age.Round(24*time.Hour), latest.BlockingThreads))
 	}
 	if stalled, n := stalledRounds(in.History); stalled {
 		return decide(fmt.Sprintf(

@@ -3,7 +3,6 @@ package reviewer
 import (
 	"strings"
 	"testing"
-	"time"
 )
 
 func hist(counts ...int) []RoundRecord {
@@ -55,12 +54,37 @@ func TestAssess_TwoNonReducingRoundsIsNotYetAStall(t *testing.T) {
 	}
 }
 
+// The shape the dispatch caller actually builds: it escalates the moment
+// review_loop_iter reaches maxIter, and reviewLoopHistory then emits exactly
+// maxIter records, so latest.Round == MaxRounds. A strict > comparison made
+// the cap rail silently miss this — the primary case — and no test constructed
+// it, because every other case used a history one round longer than the cap.
+func TestAssess_CapFiresAtTheCallerShape(t *testing.T) {
+	const maxRounds = 3
+	in := ConvergenceInput{
+		History:   hist(5, 5, 5), // len == maxRounds, latest.Round == 3
+		MaxRounds: maxRounds,
+		Resets:    0,
+	}
+	if got := in.History[len(in.History)-1].Round; got != maxRounds {
+		t.Fatalf("test setup wrong: latest.Round = %d, want %d", got, maxRounds)
+	}
+	d := Assess(in)
+	if !d.Triggered() {
+		t.Fatalf("cap rail did not fire at latest.Round == MaxRounds; the escalation "+
+			"would fall back to the bare \"exceeded N iterations\" message: %+v", d)
+	}
+	if !strings.Contains(d.Reason, "reached the configured cap") {
+		t.Errorf("reason = %q, want the cap criterion", d.Reason)
+	}
+}
+
 func TestAssess_PastConfiguredCap(t *testing.T) {
 	d := Assess(ConvergenceInput{History: hist(6, 5, 4, 3), MaxRounds: 3})
 	if !d.Triggered() {
 		t.Fatalf("round 4 past a cap of 3 should eject: %+v", d)
 	}
-	if !strings.Contains(d.Reason, "past the configured cap") {
+	if !strings.Contains(d.Reason, "reached the configured cap") {
 		t.Errorf("reason = %q, want the cap criterion", d.Reason)
 	}
 }
@@ -74,19 +98,6 @@ func TestAssess_ResetsAreEvidenceOfAPriorCap(t *testing.T) {
 	}
 	if !strings.Contains(d.Reason, "cleared 1 time(s)") {
 		t.Errorf("reason = %q, want the reset criterion", d.Reason)
-	}
-}
-
-// A PR can sit blocked without accumulating rounds — a wedged reviewer, a
-// starved fix loop, an escalation nobody cleared. Round criteria never fire on
-// those, so age is its own rail.
-func TestAssess_AgeRail(t *testing.T) {
-	d := Assess(ConvergenceInput{History: hist(3), Age: MaxPRAge + 24*time.Hour})
-	if !d.Triggered() {
-		t.Fatalf("a PR blocked past MaxPRAge should eject: %+v", d)
-	}
-	if !strings.Contains(d.Reason, "blocking thread(s) still unresolved") {
-		t.Errorf("reason = %q, want the age criterion", d.Reason)
 	}
 }
 
