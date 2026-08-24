@@ -216,6 +216,38 @@ func parentExcludeJoin(dbName string) (joinClause, whereCondition string) {
 
 const openWispStatusWhere = "w.status IN ('open', 'hooked', 'in_progress')"
 
+// notAgentWispPredicate excludes wisp-backed agent identity beads from a
+// reaper eligibility query. Agent identity beads may carry the legacy
+// issue_type='agent' marker or only the gt:agent label — the current
+// standard post-migration (see beads.IsAgentBead) — and CreateAgentBead
+// creates every agent bead with type=task+gt:agent, never type=agent. A
+// guard that checks only issue_type lets a wisp-backed agent bead survive
+// Scan but get closed by Reap once it passes maxAge (gt-7a7j). alias is the
+// table alias the wisps row is queried under ("w" when joined/aliased, ""
+// when the UPDATE targets the bare table). Every site that used to write
+// "issue_type != 'agent'" ad hoc now calls this so Scan and Reap can never
+// diverge on eligibility again.
+func notAgentWispPredicate(alias string) string {
+	idCol, typeCol := "id", "issue_type"
+	if alias != "" {
+		idCol, typeCol = alias+".id", alias+".issue_type"
+	}
+	return fmt.Sprintf(
+		"%s != 'agent' AND NOT EXISTS (SELECT 1 FROM wisp_labels wl WHERE wl.issue_id = %s AND wl.label = 'gt:agent')",
+		typeCol, idCol)
+}
+
+// staleIssueExemptLabelsSQL returns the SQL IN-list of labels that exempt an
+// issue from staleness sweeps: the pre-existing standing-order/protection
+// labels plus gt:agent, the label-based marker for agent identity beads.
+// Shared between AutoClose (which acts on it) and Scan's staleQuery mirror
+// so the two eligibility sets can't diverge — Scan's mirror previously
+// carried none of these labels, so it permanently reported issues AutoClose
+// would never close (gt-7a7j).
+func staleIssueExemptLabelsSQL() string {
+	return "'gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:agent'"
+}
+
 // closedMoleculeStepSubquery selects step-wisps whose parent molecule has already closed.
 // wisp_dependencies.issue_id is the child; depends_on_wisp_id is the parent molecule.
 const closedMoleculeStepSubquery = `
@@ -374,8 +406,8 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	moleculeStepExcludeJoin := closedMoleculeStepExcludeJoin("closed_molecule_step")
 
 	moleculeStepQuery := fmt.Sprintf(
-		"SELECT COUNT(*) FROM wisps w %s WHERE %s AND w.issue_type != 'agent'",
-		moleculeStepJoin, openWispStatusWhere)
+		"SELECT COUNT(*) FROM wisps w %s WHERE %s AND %s",
+		moleculeStepJoin, openWispStatusWhere, notAgentWispPredicate("w"))
 	if err := db.QueryRowContext(ctx, moleculeStepQuery).Scan(&result.MoleculeStepCandidates); err != nil {
 		return nil, fmt.Errorf("count molecule step candidates: %w", err)
 	}
@@ -386,8 +418,8 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	// Uses LEFT JOIN anti-pattern instead of correlated EXISTS to avoid O(n*m) cost (gt-jd1z).
 	// Closed-molecule steps are counted separately above and excluded here so counts stay disjoint.
 	reapQuery := fmt.Sprintf(
-		"SELECT COUNT(*) FROM wisps w %s %s WHERE %s AND w.created_at < ? AND w.issue_type != 'agent' AND %s AND closed_molecule_step.issue_id IS NULL",
-		parentJoin, moleculeStepExcludeJoin, openWispStatusWhere, parentWhere)
+		"SELECT COUNT(*) FROM wisps w %s %s WHERE %s AND w.created_at < ? AND %s AND %s AND closed_molecule_step.issue_id IS NULL",
+		parentJoin, moleculeStepExcludeJoin, openWispStatusWhere, notAgentWispPredicate("w"), parentWhere)
 	if err := db.QueryRowContext(ctx, reapQuery, now.Add(-maxAge)).Scan(&result.ReapCandidates); err != nil {
 		return nil, fmt.Errorf("count reap candidates: %w", err)
 	}
@@ -416,12 +448,16 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	// Same caveat: issues/dependencies tables may live on a separate Dolt instance.
 	// Convoys excluded to mirror AutoClose (hq-jnap): convoy lifecycle is
 	// tracked-bead-status driven, never staleness driven.
-	staleQuery := `
+	staleQuery := fmt.Sprintf(`
 		SELECT COUNT(*) FROM issues i
 		WHERE i.status IN ('open', 'in_progress')
 		AND i.updated_at < ?
 		AND i.priority > 1
 		AND i.issue_type NOT IN ('epic', 'convoy')
+		AND i.id NOT IN (
+			SELECT DISTINCT l.issue_id FROM labels l
+			WHERE l.label IN (%s)
+		)
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM dependencies d
 			INNER JOIN issues dep ON d.depends_on_issue_id = dep.id
@@ -432,7 +468,7 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 			INNER JOIN issues blocker ON d.issue_id = blocker.id
 			WHERE d.depends_on_issue_id IS NOT NULL
 			AND blocker.status IN ('open', 'in_progress')
-		)`
+		)`, staleIssueExemptLabelsSQL())
 	if err := db.QueryRowContext(ctx, staleQuery, now.Add(-staleIssueAge)).Scan(&result.StaleCandidates); err != nil {
 		if !isTableNotFound(err) {
 			return nil, fmt.Errorf("count stale candidates: %w", err)
@@ -479,14 +515,14 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	// Closed-molecule steps are closed immediately through a separate path, so stale
 	// max-age counts exclude them to keep dry-run and scan counts disjoint.
 	whereClause := fmt.Sprintf(
-		"%s AND w.created_at < ? AND w.issue_type != 'agent' AND %s AND closed_molecule_step.issue_id IS NULL", openWispStatusWhere, parentWhere)
+		"%s AND w.created_at < ? AND %s AND %s AND closed_molecule_step.issue_id IS NULL", openWispStatusWhere, notAgentWispPredicate("w"), parentWhere)
 
 	result := &ReapResult{Database: dbName, DryRun: dryRun}
 
 	if dryRun {
 		moleculeStepCountQuery := fmt.Sprintf(
-			"SELECT COUNT(*) FROM wisps w %s WHERE %s AND w.issue_type != 'agent'",
-			moleculeStepJoin, openWispStatusWhere)
+			"SELECT COUNT(*) FROM wisps w %s WHERE %s AND %s",
+			moleculeStepJoin, openWispStatusWhere, notAgentWispPredicate("w"))
 		if err := db.QueryRowContext(ctx, moleculeStepCountQuery).Scan(&result.MoleculeStepsClosed); err != nil {
 			return nil, fmt.Errorf("dry-run molecule step count: %w", err)
 		}
@@ -519,8 +555,8 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	}()
 
 	moleculeStepIDQuery := fmt.Sprintf(
-		"SELECT w.id FROM wisps w %s WHERE %s AND w.issue_type != 'agent' LIMIT %d",
-		moleculeStepJoin, openWispStatusWhere, DefaultBatchSize)
+		"SELECT w.id FROM wisps w %s WHERE %s AND %s LIMIT %d",
+		moleculeStepJoin, openWispStatusWhere, notAgentWispPredicate("w"), DefaultBatchSize)
 	moleculeStepsClosed, err := closeWispsInBatches(ctx, conn, moleculeStepIDQuery, nil, "closed molecule steps")
 	if err != nil {
 		return nil, err
@@ -607,8 +643,8 @@ func closeWispsInBatches(ctx context.Context, runner sqlRunner, idQuery string, 
 		inClause := strings.Join(placeholders, ",")
 
 		updateQuery := fmt.Sprintf(
-			"UPDATE wisps SET status='closed', closed_at=NOW() WHERE id IN (%s) AND status IN ('open', 'hooked', 'in_progress') AND issue_type != 'agent'",
-			inClause)
+			"UPDATE wisps SET status='closed', closed_at=NOW() WHERE id IN (%s) AND status IN ('open', 'hooked', 'in_progress') AND %s",
+			inClause, notAgentWispPredicate(""))
 		sqlResult, err := runner.ExecContext(ctx, updateQuery, args...)
 		if err != nil {
 			return total, fmt.Errorf("close %s batch: %w", description, err)
@@ -796,7 +832,7 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 		AND i.issue_type NOT IN ('epic', 'convoy')
 		AND i.id NOT IN (
 			SELECT DISTINCT l.issue_id FROM `+"`%s`"+`.labels l
-			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig', 'gt:agent')
+			WHERE l.label IN (%s)
 		)
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM `+"`%s`"+`.dependencies d
@@ -808,7 +844,7 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 			INNER JOIN `+"`%s`"+`.issues blocker ON d.issue_id = blocker.id
 			WHERE d.depends_on_issue_id IS NOT NULL
 			AND blocker.status IN ('open', 'in_progress')
-		)`, dbName, dbName, dbName, dbName, dbName)
+		)`, dbName, staleIssueExemptLabelsSQL(), dbName, dbName, dbName, dbName)
 
 	// Two-step SELECT-then-UPDATE to avoid self-referencing subquery in UPDATE,
 	// which is not valid MySQL (Error 1093) and fragile in Dolt (dolthub/dolt#10600).

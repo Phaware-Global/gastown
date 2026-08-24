@@ -270,14 +270,18 @@ func IsRefineryWorkflowBead(issue *Issue) bool {
 
 // IsProtectedBead checks if a bead has any protection labels that should
 // prevent automated status changes (AutoClose, unassign on polecat removal, etc.).
-// Protected labels: gt:standing-orders, gt:keep, gt:role, gt:rig.
+// Protected labels: gt:standing-orders, gt:keep, gt:role, gt:rig, gt:agent.
+// gt:agent is included so this stays a complete mirror of the reaper's own
+// exclusion set even though its only caller today pre-filters with
+// IsAgentBead — the doc comment here claims completeness, and the next
+// caller that trusts it without pre-filtering should get the right answer.
 func IsProtectedBead(issue *Issue) bool {
 	if issue == nil {
 		return false
 	}
 	for _, l := range issue.Labels {
 		switch l {
-		case "gt:standing-orders", "gt:keep", "gt:role", "gt:rig":
+		case "gt:standing-orders", "gt:keep", "gt:role", "gt:rig", "gt:agent":
 			return true
 		}
 	}

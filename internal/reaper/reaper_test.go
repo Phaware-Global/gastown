@@ -345,6 +345,9 @@ func TestReapExcludesAgentBeads(t *testing.T) {
 // 'gt:agent' label (not issue_type='agent', which only wisps use). AutoClose's
 // label exclusion must include 'gt:agent' or the staleness sweep will close
 // live Refinery/Witness/Mayor identity beads, breaking agent bead resolution.
+// The check goes through staleIssueExemptLabelsSQL() — the predicate AutoClose
+// shares with Scan's staleQuery mirror (gt-7a7j) — rather than a literal, so a
+// future edit to the shared list can't silently drop 'gt:agent' from one side.
 func TestAutoCloseExcludesAgentBeads(t *testing.T) {
 	sourcePath := "reaper.go"
 	data, err := os.ReadFile(sourcePath)
@@ -353,14 +356,21 @@ func TestAutoCloseExcludesAgentBeads(t *testing.T) {
 	}
 	source := string(data)
 	autoCloseBody := sourceBetween(t, source, "func AutoClose(", "// batchDeleteRows")
-	if !strings.Contains(autoCloseBody, "'gt:agent'") {
-		t.Fatalf("expected AutoClose() label exclusion to include 'gt:agent', autoClose body was:\n%s", autoCloseBody)
+	if !strings.Contains(autoCloseBody, "staleIssueExemptLabelsSQL()") {
+		t.Fatalf("expected AutoClose() to use the shared staleIssueExemptLabelsSQL() label exclusion, autoClose body was:\n%s", autoCloseBody)
+	}
+	if !strings.Contains(staleIssueExemptLabelsSQL(), "'gt:agent'") {
+		t.Fatalf("expected staleIssueExemptLabelsSQL() to include 'gt:agent', got: %s", staleIssueExemptLabelsSQL())
 	}
 }
 
 // TestScanExcludesAgentBeads documents that Scan() must use the same eligibility
 // predicate as Reap() for stale open wisps. If Scan counts agent beads but Reap
-// excludes them, the operator sees scan>0 and reap=0 for the same cutoff.
+// excludes them, the operator sees scan>0 and reap=0 for the same cutoff. Agent
+// beads can be wisp-backed with only the gt:agent label (issue_type='task'), not
+// just issue_type='agent' (gt-7a7j), so the check goes through the shared
+// notAgentWispPredicate() rather than the old inline literal, which never
+// checked wisp_labels.
 func TestScanExcludesAgentBeads(t *testing.T) {
 	sourcePath := "reaper.go"
 	data, err := os.ReadFile(sourcePath)
@@ -374,8 +384,50 @@ func TestScanExcludesAgentBeads(t *testing.T) {
 		t.Fatalf("could not isolate Scan() body in %s", sourcePath)
 	}
 	scanBody := source[scanStart:reapStart]
-	if !strings.Contains(scanBody, "w.issue_type != 'agent'") {
-		t.Fatalf("expected Scan() eligibility to exclude agent beads, scan body was:\n%s", scanBody)
+	if !strings.Contains(scanBody, `notAgentWispPredicate("w")`) {
+		t.Fatalf("expected Scan() eligibility to use the shared notAgentWispPredicate(\"w\"), scan body was:\n%s", scanBody)
+	}
+	if !strings.Contains(notAgentWispPredicate("w"), "w.issue_type != 'agent'") || !strings.Contains(notAgentWispPredicate("w"), "wisp_labels") {
+		t.Fatalf("expected notAgentWispPredicate(\"w\") to check both issue_type and wisp_labels, got: %s", notAgentWispPredicate("w"))
+	}
+}
+
+// TestScanAutoCloseStaleExemptionsAgree asserts Scan's stale-issue query and
+// AutoClose's eligible set use the identical label exclusion for the same
+// cutoff (gt-7a7j acceptance criterion). Before this fix, Scan's staleQuery
+// had no label exclusion at all, so it permanently reported gt:agent /
+// gt:standing-orders / gt:keep / gt:role / gt:rig issues as stale candidates
+// that AutoClose would never close — scan>0, auto-close=0, forever.
+func TestScanAutoCloseStaleExemptionsAgree(t *testing.T) {
+	sourcePath := "reaper.go"
+	data, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", sourcePath, err)
+	}
+	source := string(data)
+	scanStart := strings.Index(source, "func Scan(")
+	reapStart := strings.Index(source, "func Reap(")
+	autoCloseStart := strings.Index(source, "func AutoClose(")
+	batchDeleteMarker := strings.Index(source, "// batchDeleteRows")
+	if scanStart == -1 || reapStart == -1 || reapStart <= scanStart {
+		t.Fatalf("could not isolate Scan() body in %s", sourcePath)
+	}
+	if autoCloseStart == -1 || batchDeleteMarker == -1 || batchDeleteMarker <= autoCloseStart {
+		t.Fatalf("could not isolate AutoClose() body in %s", sourcePath)
+	}
+	scanBody := source[scanStart:reapStart]
+	autoCloseBody := source[autoCloseStart:batchDeleteMarker]
+
+	if !strings.Contains(scanBody, "staleIssueExemptLabelsSQL()") {
+		t.Fatalf("expected Scan()'s staleQuery to use staleIssueExemptLabelsSQL(), scan body was:\n%s", scanBody)
+	}
+	if !strings.Contains(autoCloseBody, "staleIssueExemptLabelsSQL()") {
+		t.Fatalf("expected AutoClose() to use staleIssueExemptLabelsSQL(), autoClose body was:\n%s", autoCloseBody)
+	}
+	for _, label := range []string{"gt:standing-orders", "gt:keep", "gt:role", "gt:rig", "gt:agent"} {
+		if !strings.Contains(staleIssueExemptLabelsSQL(), "'"+label+"'") {
+			t.Fatalf("staleIssueExemptLabelsSQL() missing %q, got: %s", label, staleIssueExemptLabelsSQL())
+		}
 	}
 }
 
@@ -395,6 +447,12 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 			"agent-step":               {id: "agent-step", status: "open", issueType: "agent", createdAt: now.Add(-48 * time.Hour)},
 			"stale-orphan":             {id: "stale-orphan", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour)},
 			"fresh-orphan":             {id: "fresh-orphan", status: "open", issueType: "task", createdAt: now.Add(-1 * time.Hour)},
+			// Wisp-backed agent identity bead carrying only the gt:agent label
+			// (issue_type='task') — the shape CreateAgentBead actually produces
+			// (internal/beads/beads_agent.go). Stale, orphaned, and otherwise
+			// identical to stale-orphan: without the wisp_labels check this gets
+			// reaped like any other stale wisp, destroying agent identity (gt-7a7j).
+			"label-agent-orphan": {id: "label-agent-orphan", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour), labels: []string{"gt:agent"}},
 		},
 		deps: []fakeDep{
 			{issueID: "step-closed-mol-recent", dependsOnID: "mol-closed", depType: "parent-child"},
@@ -435,8 +493,8 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	if dryRun.Reaped != 2 {
 		t.Fatalf("dry-run Reaped = %d, want 2", dryRun.Reaped)
 	}
-	if dryRun.OpenRemain != 10 {
-		t.Fatalf("dry-run OpenRemain = %d, want 10", dryRun.OpenRemain)
+	if dryRun.OpenRemain != 11 {
+		t.Fatalf("dry-run OpenRemain = %d, want 11", dryRun.OpenRemain)
 	}
 	if afterDryRun := state.statuses(); !reflect.DeepEqual(afterDryRun, beforeDryRun) {
 		t.Fatalf("dry-run mutated statuses: before=%v after=%v", beforeDryRun, afterDryRun)
@@ -453,8 +511,8 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	if realRun.Reaped != 2 {
 		t.Fatalf("real Reaped = %d, want 2", realRun.Reaped)
 	}
-	if realRun.OpenRemain != 6 {
-		t.Fatalf("real OpenRemain = %d, want 6", realRun.OpenRemain)
+	if realRun.OpenRemain != 7 {
+		t.Fatalf("real OpenRemain = %d, want 7", realRun.OpenRemain)
 	}
 
 	for _, id := range []string{"step-closed-mol-recent", "step-closed-mol-old", "step-non-molecule-parent", "stale-orphan"} {
@@ -462,7 +520,7 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 			t.Fatalf("%s status = %q, want closed", id, got)
 		}
 	}
-	for _, id := range []string{"step-mixed-parent-old", "step-external-parent-old", "step-open-parent-old", "agent-step", "fresh-orphan", "mol-open"} {
+	for _, id := range []string{"step-mixed-parent-old", "step-external-parent-old", "step-open-parent-old", "agent-step", "fresh-orphan", "mol-open", "label-agent-orphan"} {
 		if got := state.status(id); got != "open" {
 			t.Fatalf("%s status = %q, want open", id, got)
 		}
@@ -505,6 +563,23 @@ type fakeWisp struct {
 	status    string
 	issueType string
 	createdAt time.Time
+	labels    []string
+}
+
+// isAgentWisp reports whether w is excluded by notAgentWispPredicate: either
+// the legacy issue_type='agent' marker or the current gt:agent label
+// (wisp_labels). Mirrors the real predicate so the fake driver's simulated
+// eligibility matches what the actual SQL would return (gt-7a7j).
+func (w *fakeWisp) isAgentWisp() bool {
+	if w.issueType == "agent" {
+		return true
+	}
+	for _, l := range w.labels {
+		if l == "gt:agent" {
+			return true
+		}
+	}
+	return false
 }
 
 type fakeDep struct {
@@ -578,7 +653,7 @@ func (s *fakeReaperState) moleculeStepCandidatesLocked() []string {
 
 func (s *fakeReaperState) isMoleculeStepCandidateLocked(id string) bool {
 	w := s.wisps[id]
-	if w == nil || !isOpenWispStatus(w.status) || w.issueType == "agent" {
+	if w == nil || !isOpenWispStatus(w.status) || w.isAgentWisp() {
 		return false
 	}
 	for _, dep := range s.deps {
@@ -602,7 +677,7 @@ func (s *fakeReaperState) isMoleculeStepCandidateLocked(id string) bool {
 func (s *fakeReaperState) staleCandidatesLocked(cutoff time.Time, excludeMoleculeSteps bool) []string {
 	var ids []string
 	for id, w := range s.wisps {
-		if !isOpenWispStatus(w.status) || w.issueType == "agent" || !w.createdAt.Before(cutoff) {
+		if !isOpenWispStatus(w.status) || w.isAgentWisp() || !w.createdAt.Before(cutoff) {
 			continue
 		}
 		if s.hasOpenParentLocked(id) {
@@ -803,6 +878,7 @@ func validateMoleculeStepQuery(query string) error {
 		"NOT EXISTS",
 		"open_dep.depends_on_external IS NOT NULL",
 		"w.issue_type != 'agent'",
+		"wl.issue_id = w.id AND wl.label = 'gt:agent'",
 		"w.status IN ('open', 'hooked', 'in_progress')",
 	)
 }
@@ -816,6 +892,7 @@ func validateStaleWispQuery(query string) error {
 		"depends_on_external IS NOT NULL",
 		"wd.type = 'parent-child'",
 		"w.issue_type != 'agent'",
+		"wl.issue_id = w.id AND wl.label = 'gt:agent'",
 		"w.created_at < ?",
 		"open_parent.issue_id IS NULL",
 		"closed_molecule_step.issue_id IS NULL",
