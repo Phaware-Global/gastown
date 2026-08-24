@@ -218,10 +218,14 @@ const openWispStatusWhere = "w.status IN ('open', 'hooked', 'in_progress')"
 
 // notAgentWispPredicate excludes wisp-backed agent identity beads from a
 // reaper eligibility query. Agent identity beads may carry the legacy
-// issue_type='agent' marker or only the gt:agent label — the current
-// standard post-migration (see beads.IsAgentBead) — and CreateAgentBead
-// creates every agent bead with type=task+gt:agent, never type=agent. A
-// guard that checks only issue_type lets a wisp-backed agent bead survive
+// issue_type='agent' marker, or the gt:agent label — the current standard
+// post-migration (see beads.IsAgentBead). CreateAgentBead creates every
+// agent bead with "--type=task --labels=gt:agent", and bd create --labels
+// writes ONLY to the labels table, not wisp_labels
+// (internal/doctor/agent_beads_check.go:308-311) — so a wisp-backed agent
+// bead's gt:agent marker can live in either labels table depending on
+// whether anything has repaired it into wisp_labels out of band. A guard
+// that checks only one of the two lets a wisp-backed agent bead survive
 // Scan but get closed by Reap once it passes maxAge (gt-7a7j). alias is the
 // table alias the wisps row is queried under ("w" when joined/aliased, ""
 // when the UPDATE targets the bare table). Every site that used to write
@@ -233,8 +237,8 @@ func notAgentWispPredicate(alias string) string {
 		idCol, typeCol = alias+".id", alias+".issue_type"
 	}
 	return fmt.Sprintf(
-		"%s != 'agent' AND NOT EXISTS (SELECT 1 FROM wisp_labels wl WHERE wl.issue_id = %s AND wl.label = 'gt:agent')",
-		typeCol, idCol)
+		"%s != 'agent' AND NOT EXISTS (SELECT 1 FROM wisp_labels wl WHERE wl.issue_id = %s AND wl.label = 'gt:agent') AND NOT EXISTS (SELECT 1 FROM labels l WHERE l.issue_id = %s AND l.label = 'gt:agent')",
+		typeCol, idCol, idCol)
 }
 
 // staleIssueExemptLabelsSQL returns the SQL IN-list of labels that exempt an
@@ -294,7 +298,7 @@ func HasReaperSchema(db *sql.DB) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultQueryTimeout)
 	defer cancel()
 
-	for _, table := range []string{"wisps", "issues", "wisp_dependencies"} {
+	for _, table := range []string{"wisps", "issues", "wisp_dependencies", "wisp_labels"} {
 		exists, err := tableExists(ctx, db, table)
 		if err != nil {
 			return false, fmt.Errorf("check reaper schema: %w", err)
@@ -416,6 +420,10 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	// Must match Reap() eligibility semantics exactly, including the exclusion of
 	// agent beads, otherwise scan can report candidates that reap will never close.
 	// Uses LEFT JOIN anti-pattern instead of correlated EXISTS to avoid O(n*m) cost (gt-jd1z).
+	// notAgentWispPredicate's NOT EXISTS clauses are exempt from that ban: they key
+	// on wisp_labels/labels' PRIMARY KEY (issue_id, label), so Dolt's planner seeks a
+	// single row per candidate instead of the per-row table scan gt-jd1z/gt-wvd2 were
+	// about — a PK lookup, not the O(n*m) correlation this comment forbids.
 	// Closed-molecule steps are counted separately above and excluded here so counts stay disjoint.
 	reapQuery := fmt.Sprintf(
 		"SELECT COUNT(*) FROM wisps w %s %s WHERE %s AND w.created_at < ? AND %s AND %s AND closed_molecule_step.issue_id IS NULL",
@@ -688,7 +696,14 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	// No parent check — closed wisps past the delete age are unconditionally purgeable.
 	// The parent check (correlated subqueries on wisp_dependencies) was causing O(n*m)
 	// query cost with 1800+ closed wisps, leading to CPU spikes and timeouts (gt-wvd2).
-	digestQuery := "SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? GROUP BY wtype"
+	// Agent identity beads ARE excluded, unlike the parent check above: closed wisps
+	// past purgeAge are hard-deleted (wisp_labels/wisp_events included), and Reap's
+	// guard only stops a wisp-backed agent bead from being closed in the first place —
+	// it does nothing once one is already closed, so without this the purge clock
+	// still runs out on it (gt-7a7j, gt-h8oq).
+	digestQuery := fmt.Sprintf(
+		"SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND %s GROUP BY wtype",
+		notAgentWispPredicate("w"))
 	rows, err := db.QueryContext(ctx, digestQuery, deleteCutoff)
 	if err != nil {
 		return 0, nil, fmt.Errorf("digest query: %w", err)
@@ -721,9 +736,10 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	}()
 
 	// Batch delete — simple status+age filter, no parent check needed for purge.
+	// Agent guard mirrors the digest query above (gt-7a7j, gt-h8oq).
 	idQuery := fmt.Sprintf(
-		"SELECT w.id FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? LIMIT %d",
-		DefaultBatchSize)
+		"SELECT w.id FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND %s LIMIT %d",
+		notAgentWispPredicate("w"), DefaultBatchSize)
 	auxTables := []string{"wisp_labels", "wisp_comments", "wisp_events", "wisp_dependencies"}
 
 	totalDeleted, err := batchDeleteRows(ctx, db, idQuery, deleteCutoff, "wisps", auxTables)
