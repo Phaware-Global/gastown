@@ -158,7 +158,7 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		// ends so it does not linger and starve later tests. pkill -f on the
 		// unique temp hqPath matches the dolt --config path; safe (unique dir).
 		t.Cleanup(func() {
-			_ = exec.Command("pkill", "-f", townRoot).Run()
+			stopTownProcesses(t, townRoot)
 		})
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "prefix-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
@@ -233,7 +233,7 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		// ends so it does not linger and starve later tests. pkill -f on the
 		// unique temp hqPath matches the dolt --config path; safe (unique dir).
 		t.Cleanup(func() {
-			_ = exec.Command("pkill", "-f", townRoot).Run()
+			stopTownProcesses(t, townRoot)
 		})
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "no-issues-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
@@ -307,7 +307,7 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		// ends so it does not linger and starve later tests. pkill -f on the
 		// unique temp hqPath matches the dolt --config path; safe (unique dir).
 		t.Cleanup(func() {
-			_ = exec.Command("pkill", "-f", townRoot).Run()
+			stopTownProcesses(t, townRoot)
 		})
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "mismatch-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
@@ -364,7 +364,7 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		// ends so it does not linger and starve later tests. pkill -f on the
 		// unique temp hqPath matches the dolt --config path; safe (unique dir).
 		t.Cleanup(func() {
-			_ = exec.Command("pkill", "-f", townRoot).Run()
+			stopTownProcesses(t, townRoot)
 		})
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "derived-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
@@ -432,7 +432,7 @@ func TestBeadsDbInitAfterClone(t *testing.T) {
 		// ends so it does not linger and starve later tests. pkill -f on the
 		// unique temp hqPath matches the dolt --config path; safe (unique dir).
 		t.Cleanup(func() {
-			_ = exec.Command("pkill", "-f", townRoot).Run()
+			stopTownProcesses(t, townRoot)
 		})
 		cmd := exec.Command(gtBinary, "install", townRoot, "--name", "reinit-test")
 		cmd.Env = append(os.Environ(), "HOME="+tmpDir)
