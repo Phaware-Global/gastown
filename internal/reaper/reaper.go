@@ -237,11 +237,16 @@ const openWispStatusWhere = "w.status IN ('open', 'hooked', 'in_progress')"
 //
 // alias is the table alias the wisps row is queried under ("w" when
 // joined/aliased, "" when the target is the bare wisps table — a
-// multi-table UPDATE for the batch-close path). Every site that used to
-// write "issue_type != 'agent'" ad hoc now calls this so Scan and Reap can
-// never diverge on eligibility again.
+// multi-table UPDATE for the batch-close path). The bare form still
+// qualifies with the literal table name ("wisps.id"/"wisps.issue_type")
+// rather than leaving the columns unqualified: closeWispsInBatches splices
+// this into the reaper's only mutating statement, and an unqualified
+// column would become ambiguous (MySQL error 1052, aborting every reap
+// batch) if labels — schema owned outside this repo — ever gains its own
+// id column. Every site that used to write "issue_type != 'agent'" ad hoc
+// now calls this so Scan and Reap can never diverge on eligibility again.
 func notAgentWispJoin(alias string) (joinClause, whereCondition string) {
-	idCol, typeCol := "id", "issue_type"
+	idCol, typeCol := "wisps.id", "wisps.issue_type"
 	if alias != "" {
 		idCol, typeCol = alias+".id", alias+".issue_type"
 	}
@@ -312,7 +317,24 @@ func HasReaperSchema(db *sql.DB) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultQueryTimeout)
 	defer cancel()
 
-	for _, table := range []string{"wisps", "issues", "wisp_dependencies", "wisp_labels"} {
+	// labels is required alongside wisp_labels: notAgentWispJoin LEFT JOINs both
+	// into every Scan/Reap/purge eligibility query, and unlike the mail/stale
+	// counts (which wrap missing issues/labels in isTableNotFound and degrade
+	// gracefully), none of those queries tolerate a missing table — a database
+	// with wisps/issues/wisp_dependencies/wisp_labels but no labels would pass
+	// this gate and then fail every Scan/Reap/Purge call outright (gt-7a7j).
+	//
+	// Tradeoff, accepted deliberately: AutoClose and mail purge DO already
+	// tolerate a missing labels table on their own (isTableNotFound checks at
+	// their call sites) and don't need it gated here — so this makes a database
+	// lacking labels also skip those two paths, which previously degraded
+	// gracefully instead of skipping outright. All 9 production databases have
+	// labels today (checked against the live Dolt server), so this is a latent
+	// gate widening, not a live behavior change. If a labels-less database ever
+	// shows up in practice, prefer making the wisp queries isTableNotFound-
+	// tolerant (or gate notAgentWispJoin's labels arm per-operation) over
+	// keeping this blanket gate.
+	for _, table := range []string{"wisps", "issues", "wisp_dependencies", "wisp_labels", "labels"} {
 		exists, err := tableExists(ctx, db, table)
 		if err != nil {
 			return false, fmt.Errorf("check reaper schema: %w", err)
@@ -449,7 +471,12 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	// No parent check needed — closed wisps past the delete age are unconditionally purgeable.
 	// The parent check (correlated subqueries on wisp_dependencies) was causing O(n*m) query
 	// cost with 1800+ closed wisps, leading to CPU spikes and connection timeouts (gt-wvd2).
-	purgeQuery := "SELECT COUNT(*) FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ?"
+	// Agent guard must match purgeClosedWisps' own guard exactly, or this count and Purge
+	// diverge the same way reap/scan used to: PurgeCandidates > 0 forever with purged = 0
+	// once an agent wisp is closed (gt-7a7j, gt-h8oq).
+	purgeQuery := fmt.Sprintf(
+		"SELECT COUNT(*) FROM wisps w %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s",
+		agentJoin, agentWhere)
 	if err := db.QueryRowContext(ctx, purgeQuery, now.Add(-purgeAge)).Scan(&result.PurgeCandidates); err != nil {
 		return nil, fmt.Errorf("count purge candidates: %w", err)
 	}
@@ -665,14 +692,7 @@ func closeWispsInBatches(ctx context.Context, runner sqlRunner, idQuery string, 
 		}
 		inClause := strings.Join(placeholders, ",")
 
-		// Multi-table UPDATE with the same anti-join shape as the SELECT above —
-		// defense-in-depth on the one mutating statement, not just the ids feeding
-		// it (gt-7a7j review, thread on reaper_test.go:895).
-		agentJoin, agentWhere := notAgentWispJoin("")
-		updateQuery := fmt.Sprintf(
-			"UPDATE wisps %s SET wisps.status='closed', wisps.closed_at=NOW() WHERE wisps.id IN (%s) AND wisps.status IN ('open', 'hooked', 'in_progress') AND %s",
-			agentJoin, inClause, agentWhere)
-		sqlResult, err := runner.ExecContext(ctx, updateQuery, args...)
+		sqlResult, err := runner.ExecContext(ctx, closeWispsUpdateQuery(inClause), args...)
 		if err != nil {
 			return total, fmt.Errorf("close %s batch: %w", description, err)
 		}
@@ -680,6 +700,20 @@ func closeWispsInBatches(ctx context.Context, runner sqlRunner, idQuery string, 
 		affected, _ := sqlResult.RowsAffected()
 		total += int(affected)
 	}
+}
+
+// closeWispsUpdateQuery returns the UPDATE closeWispsInBatches issues to close
+// a batch of wisp ids. Factored out so tests can assert on the query
+// production code actually builds, rather than a hand-copied literal that
+// drifts silently when the query shape changes (gt-7a7j review: the previous
+// inline literal's anti-injection test stayed green through two unrelated
+// rewrites of this statement — a multi-table JOIN and a status/type column
+// rename — because it never called this code).
+func closeWispsUpdateQuery(inClause string) string {
+	agentJoin, agentWhere := notAgentWispJoin("")
+	return fmt.Sprintf(
+		"UPDATE wisps %s SET wisps.status='closed', wisps.closed_at=NOW() WHERE wisps.id IN (%s) AND wisps.status IN ('open', 'hooked', 'in_progress') AND %s",
+		agentJoin, inClause, agentWhere)
 }
 
 // Purge deletes old closed wisps and mail from a database.
@@ -720,11 +754,7 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	// guard only stops a wisp-backed agent bead from being closed in the first place —
 	// it does nothing once one is already closed, so without this the purge clock
 	// still runs out on it (gt-7a7j, gt-h8oq).
-	agentJoin, agentWhere := notAgentWispJoin("w")
-	digestQuery := fmt.Sprintf(
-		"SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s GROUP BY wtype",
-		agentJoin, agentWhere)
-	rows, err := db.QueryContext(ctx, digestQuery, deleteCutoff)
+	rows, err := db.QueryContext(ctx, purgeDigestQuery(), deleteCutoff)
 	if err != nil {
 		return 0, nil, fmt.Errorf("digest query: %w", err)
 	}
@@ -757,12 +787,9 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 
 	// Batch delete — simple status+age filter, no parent check needed for purge.
 	// Agent guard mirrors the digest query above (gt-7a7j, gt-h8oq).
-	idQuery := fmt.Sprintf(
-		"SELECT w.id FROM wisps w %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s LIMIT %d",
-		agentJoin, agentWhere, DefaultBatchSize)
 	auxTables := []string{"wisp_labels", "wisp_comments", "wisp_events", "wisp_dependencies"}
 
-	totalDeleted, err := batchDeleteRows(ctx, db, idQuery, deleteCutoff, "wisps", auxTables)
+	totalDeleted, err := batchDeleteRows(ctx, db, purgeBatchIDQuery(), deleteCutoff, "wisps", auxTables)
 	if err != nil {
 		return totalDeleted, anomalies, err
 	}
@@ -787,6 +814,26 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	}
 
 	return totalDeleted, anomalies, nil
+}
+
+// purgeDigestQuery and purgeBatchIDQuery return purgeClosedWisps' digest and
+// batch-delete queries. Factored out so tests can assert on the query
+// production code actually builds, rather than a hand-copied literal that
+// stays green after the real query's shape changes (gt-7a7j review: both
+// literals in reaper_test.go predated the agent-guard join and never caught
+// its addition).
+func purgeDigestQuery() string {
+	agentJoin, agentWhere := notAgentWispJoin("w")
+	return fmt.Sprintf(
+		"SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s GROUP BY wtype",
+		agentJoin, agentWhere)
+}
+
+func purgeBatchIDQuery() string {
+	agentJoin, agentWhere := notAgentWispJoin("w")
+	return fmt.Sprintf(
+		"SELECT w.id FROM wisps w %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s LIMIT %d",
+		agentJoin, agentWhere, DefaultBatchSize)
 }
 
 func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun bool) (int, error) {

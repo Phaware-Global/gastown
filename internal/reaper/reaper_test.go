@@ -211,53 +211,73 @@ func TestReapQueryNoDatabaseNameInjection(t *testing.T) {
 	}
 }
 
-// TestReapUpdateQueryNoDatabaseNameInjection verifies that the UPDATE query in
-// Reap() does not inject dbName where the IN clause should go.
+// TestReapUpdateQueryNoDatabaseNameInjection verifies that the UPDATE query
+// closeWispsUpdateQuery builds — the reaper's only mutating statement — has
+// no injected dbName and no interpolated value outside the parameterized
+// IN-clause and the fixed agent-guard literals. Calls the production
+// function directly: a hand-copied literal here previously stayed green
+// through two unrelated rewrites of this statement (the multi-table JOIN
+// and the wisps./status column qualification) because it never exercised
+// closeWispsUpdateQuery at all (gt-7a7j review round 2, #201).
 func TestReapUpdateQueryNoDatabaseNameInjection(t *testing.T) {
 	dbName := "gt"
-	inClause := "?,?,?"
+	updateQuery := closeWispsUpdateQuery("?,?,?")
 
-	// This is the fixed query — only inClause in the Sprintf args.
-	updateQuery := fmt.Sprintf(
-		"UPDATE wisps SET status='closed', closed_at=NOW() WHERE id IN (%s)",
-		inClause)
-
-	if strings.Contains(updateQuery, dbName) {
-		t.Errorf("Reap updateQuery contains injected database name %q: %s", dbName, updateQuery)
+	// The query legitimately contains the literal "gt:agent" label everywhere
+	// notAgentWispJoin appears, which itself contains "gt" as a substring — so
+	// strip those known-good occurrences before checking for an injected
+	// dbName, or this assertion false-positives on every agent-guarded query.
+	if strings.Contains(strings.ReplaceAll(updateQuery, "gt:agent", ""), dbName) {
+		t.Errorf("closeWispsUpdateQuery contains injected database name %q: %s", dbName, updateQuery)
 	}
 	if !strings.Contains(updateQuery, "IN (?,?,?)") {
-		t.Errorf("Reap updateQuery should contain parameterized IN clause, got: %s", updateQuery)
+		t.Errorf("closeWispsUpdateQuery should contain parameterized IN clause, got: %s", updateQuery)
+	}
+	if err := validateAgentGuardedUpdateQuery(updateQuery); err != nil {
+		t.Errorf("closeWispsUpdateQuery missing agent guard: %v", err)
 	}
 }
 
-// TestPurgeDigestQueryNoDatabaseNameInjection verifies that the purge digest
-// query is a plain string with no Sprintf interpolation at all.
+// TestPurgeDigestQueryNoDatabaseNameInjection verifies purgeDigestQuery —
+// called directly, not reconstructed — has no injected dbName and only the
+// parameterized cutoff plus fixed literals. See
+// TestReapUpdateQueryNoDatabaseNameInjection for why calling production code
+// matters here.
 func TestPurgeDigestQueryNoDatabaseNameInjection(t *testing.T) {
-	// The fixed digestQuery is a string literal — no Sprintf.
-	digestQuery := "SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? GROUP BY wtype"
+	dbName := "gt"
+	digestQuery := purgeDigestQuery()
 
-	if strings.Contains(digestQuery, "gt") {
-		t.Errorf("purge digestQuery should not contain database name, got: %s", digestQuery)
+	// See TestReapUpdateQueryNoDatabaseNameInjection: "gt:agent" itself
+	// contains "gt", so strip it before checking for an injected dbName.
+	if strings.Contains(strings.ReplaceAll(digestQuery, "gt:agent", ""), dbName) {
+		t.Errorf("purgeDigestQuery contains injected database name %q: %s", dbName, digestQuery)
 	}
 	if !strings.Contains(digestQuery, "GROUP BY wtype") {
-		t.Errorf("purge digestQuery should end with GROUP BY, got: %s", digestQuery)
+		t.Errorf("purgeDigestQuery should end with GROUP BY, got: %s", digestQuery)
+	}
+	if err := validateWAliasedAgentGuard(digestQuery); err != nil {
+		t.Errorf("purgeDigestQuery missing agent guard: %v", err)
 	}
 }
 
-// TestPurgeBatchQueryNoDatabaseNameInjection verifies that the purge batch
-// SELECT query uses DefaultBatchSize as the LIMIT, not dbName.
+// TestPurgeBatchQueryNoDatabaseNameInjection verifies purgeBatchIDQuery —
+// called directly — uses DefaultBatchSize as the LIMIT, not an injected
+// dbName, and carries the same agent guard as the digest query above.
 func TestPurgeBatchQueryNoDatabaseNameInjection(t *testing.T) {
-	// This is the fixed query — only DefaultBatchSize in the Sprintf args.
-	idQuery := fmt.Sprintf(
-		"SELECT w.id FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? LIMIT %d",
-		DefaultBatchSize)
+	dbName := "gt"
+	idQuery := purgeBatchIDQuery()
 
-	if strings.Contains(idQuery, "gt") {
-		t.Errorf("purge idQuery contains injected database name: %s", idQuery)
+	// See TestReapUpdateQueryNoDatabaseNameInjection: "gt:agent" itself
+	// contains "gt", so strip it before checking for an injected dbName.
+	if strings.Contains(strings.ReplaceAll(idQuery, "gt:agent", ""), dbName) {
+		t.Errorf("purgeBatchIDQuery contains injected database name %q: %s", dbName, idQuery)
 	}
 	expected := fmt.Sprintf("LIMIT %d", DefaultBatchSize)
 	if !strings.Contains(idQuery, expected) {
-		t.Errorf("purge idQuery should contain %s, got: %s", expected, idQuery)
+		t.Errorf("purgeBatchIDQuery should contain %s, got: %s", expected, idQuery)
+	}
+	if err := validateWAliasedAgentGuard(idQuery); err != nil {
+		t.Errorf("purgeBatchIDQuery missing agent guard: %v", err)
 	}
 }
 
@@ -855,7 +875,10 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 		return fakeCountRows(len(c.state.moleculeStepCandidatesLocked())), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps WHERE status IN"):
 		return fakeCountRows(c.state.openCountLocked()), nil
-	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps w WHERE w.status = 'closed'"):
+	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps w") && strings.Contains(normalized, "w.status = 'closed'"):
+		if err := validateWAliasedAgentGuard(normalized); err != nil {
+			return nil, err
+		}
 		return fakeCountRows(0), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM issues"):
 		return fakeCountRows(0), nil
@@ -1008,11 +1031,31 @@ func validateStaleWispQuery(query string) error {
 // the "w."-aliased form, and this fake's UPDATE branch used to close every id in
 // args unconditionally, so a missing or malformed guard here would not have
 // turned any test red (gt-7a7j review, thread on reaper_test.go:895).
+//
+// The join/where columns are qualified as "wisps.id"/"wisps.issue_type", not
+// left bare, because closeWispsUpdateQuery splices this into a literal
+// "UPDATE wisps" target: an unqualified "id"/"issue_type" would become
+// ambiguous (MySQL error 1052, aborting every reap batch) if the externally
+// owned `labels` table ever gains its own id column (gt-7a7j review round 2,
+// #201, low finding on reaper.go:244).
 func validateAgentGuardedUpdateQuery(query string) error {
 	return requireSQL(query,
-		"issue_type != 'agent'",
-		"LEFT JOIN wisp_labels agent_wl ON agent_wl.issue_id = id AND agent_wl.label = 'gt:agent'",
-		"LEFT JOIN labels agent_l ON agent_l.issue_id = id AND agent_l.label = 'gt:agent'",
+		"wisps.issue_type != 'agent'",
+		"LEFT JOIN wisp_labels agent_wl ON agent_wl.issue_id = wisps.id AND agent_wl.label = 'gt:agent'",
+		"LEFT JOIN labels agent_l ON agent_l.issue_id = wisps.id AND agent_l.label = 'gt:agent'",
+		"agent_wl.issue_id IS NULL",
+		"agent_l.issue_id IS NULL",
+	)
+}
+
+// validateWAliasedAgentGuard asserts the "w."-aliased notAgentWispJoin("w")
+// guard is present on a Scan/Purge eligibility query (as opposed to the
+// bare-table form checked by validateAgentGuardedUpdateQuery above).
+func validateWAliasedAgentGuard(query string) error {
+	return requireSQL(query,
+		"w.issue_type != 'agent'",
+		"LEFT JOIN wisp_labels agent_wl ON agent_wl.issue_id = w.id AND agent_wl.label = 'gt:agent'",
+		"LEFT JOIN labels agent_l ON agent_l.issue_id = w.id AND agent_l.label = 'gt:agent'",
 		"agent_wl.issue_id IS NULL",
 		"agent_l.issue_id IS NULL",
 	)
