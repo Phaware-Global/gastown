@@ -72,6 +72,31 @@ type Findings struct {
 	Disposition string `json:"disposition,omitempty"`
 }
 
+// Length budgets for a single finding, in runes.
+//
+// The Reviewer had no budget at any layer — not in Finding, not in FormatBody,
+// not in the execution contract, whose only volume guidance was a finding
+// COUNT. Measured output on graphql-api averaged 3,102 characters per inline
+// thread across 199 threads on one PR (617kB of review prose), peaking at
+// 8,887. At that size a thread stops being a work item and becomes an essay
+// the fixer must mine for the actual request.
+//
+// These are hard limits, enforced where the payload is parsed, for the same
+// reason decodeStrictJSON rejects unknown fields: the findings payload is a
+// strict machine contract, and silently truncating a body would cut a sentence
+// — and possibly the actual instruction — mid-word. A rejected payload names
+// the offending field and its size so the pass can trim and re-emit.
+//
+// The budgets are deliberately generous against what good findings need: a
+// title is one line, a body is the failure scenario plus its evidence, and a
+// suggestion is the change to make. Anything longer is usually a second finding
+// wearing the first one's anchor.
+const (
+	MaxTitleLen      = 120
+	MaxBodyLen       = 1200
+	MaxSuggestionLen = 800
+)
+
 // validPriorities is the closed set of priorities the badge/parser pair models.
 var validPriorities = map[string]bool{"high": true, "medium": true, "low": true}
 
@@ -247,6 +272,28 @@ func normalizeFinding(f *Finding, ctx string) error {
 	}
 	f.Priority = p
 	f.Perspective = strings.TrimSpace(f.Perspective)
+	f.Body = strings.TrimSpace(f.Body)
+	f.Suggestion = strings.TrimSpace(f.Suggestion)
+	// Enforce the length budgets last, so the sizes reported are the ones the
+	// trimmed payload actually carries.
+	for _, lim := range []struct {
+		field string
+		val   string
+		max   int
+	}{
+		{"title", f.Title, MaxTitleLen},
+		{"body", f.Body, MaxBodyLen},
+		{"suggestion", f.Suggestion, MaxSuggestionLen},
+	} {
+		// Count runes, not bytes: a budget measured in bytes would silently
+		// halve for non-ASCII findings.
+		if n := len([]rune(lim.val)); n > lim.max {
+			return fmt.Errorf("%s (%s): %s is %d characters, over the %d limit — "+
+				"state the failure and the change to make; move supporting analysis "+
+				"out or split it into a second finding on its own line",
+				ctx, f.Path, lim.field, n, lim.max)
+		}
+	}
 	return nil
 }
 
