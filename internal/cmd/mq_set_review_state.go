@@ -183,6 +183,15 @@ func runMqSetReviewState(cmd *cobra.Command, args []string) error {
 	}
 	switch {
 	case mqSetReviewStateClearIter:
+		// Record the reset before zeroing the counter. Clearing the iteration
+		// count is how the review-loop cap gets evaded: the cap escalates, an
+		// operator clears the counter, and the loop restarts from zero with no
+		// memory that it ever capped. graphql-api PR #112 reached 23 posted
+		// reviews and #132 reached 31, both under a configured cap of 3. The
+		// reset itself is legitimate — it is how a human says "keep going" —
+		// but it must leave a trace, so convergence assessment can tell a first
+		// pass from a fourth restart.
+		fields.ReviewLoopResets++
 		fields.ReviewLoopIter = 0
 	case iterProvided:
 		// Negative values were rejected above; at this point mqSetReviewStateIter ≥ 0.

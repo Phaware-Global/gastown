@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/refinery"
+	"github.com/steveyegge/gastown/internal/reviewer"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -78,11 +79,12 @@ func init() {
 // All fields are required for the dispatch path; the caller validates and
 // escalates on missing entries rather than muddling through with empties.
 type dispatchReviewFixState struct {
-	PRNumber       int
-	Branch         string
-	SourceIssue    string
-	ReviewFixName  string // currently-dispatched polecat name, or empty
-	ReviewLoopIter int    // already incremented; 0 if never dispatched
+	PRNumber         int
+	Branch           string
+	SourceIssue      string
+	ReviewFixName    string // currently-dispatched polecat name, or empty
+	ReviewLoopIter   int    // already incremented; 0 if never dispatched
+	ReviewLoopResets int    // times an operator cleared ReviewLoopIter for this PR
 }
 
 func parseDispatchMRFields(mrID string) (dispatchReviewFixState, error) {
@@ -121,11 +123,12 @@ func parseDispatchMRFields(mrID string) (dispatchReviewFixState, error) {
 	}
 
 	return dispatchReviewFixState{
-		PRNumber:       prNumber,
-		Branch:         fields.Branch,
-		SourceIssue:    fields.SourceIssue,
-		ReviewFixName:  fields.ReviewFixPolecat,
-		ReviewLoopIter: fields.ReviewLoopIter,
+		PRNumber:         prNumber,
+		Branch:           fields.Branch,
+		SourceIssue:      fields.SourceIssue,
+		ReviewFixName:    fields.ReviewFixPolecat,
+		ReviewLoopIter:   fields.ReviewLoopIter,
+		ReviewLoopResets: fields.ReviewLoopResets,
 	}, nil
 }
 
@@ -259,10 +262,30 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 		// Escalate. The mayor closes the escalation when a human merges
 		// the PR or kills the loop; the next patrol picks the MR back up.
 		threadsJSON, _ := json.Marshal(threads)
+
+		// Hitting the cap used to produce a bare "exceeded N iterations", which
+		// tells an operator that the loop ran long without saying what should
+		// happen to the PR. Assess the round history and carry a recommendation
+		// — approve-with-notes or decompose — so the escalation presents a
+		// choice between two stated options with the evidence beside them.
+		//
+		// This is a recommendation, not an action: nothing here approves a PR
+		// or splits one. The decision stays with the human the escalation
+		// reaches.
+		decision := reviewer.Assess(reviewer.ConvergenceInput{
+			PRNumber:  state.PRNumber,
+			History:   reviewLoopHistory(state, len(threads)),
+			Resets:    state.ReviewLoopResets,
+			MaxRounds: maxIter,
+		})
+		reason := string(threadsJSON)
+		if desc := decision.Describe(state.PRNumber); desc != "" {
+			reason = desc + "\nUnresolved threads:\n" + string(threadsJSON)
+		}
 		if err := escalateReviewLoopCap(
-			fmt.Sprintf("PR #%d review loop exceeded %d iterations; %d thread(s) still unresolved",
-				state.PRNumber, maxIter, len(threads)),
-			string(threadsJSON),
+			fmt.Sprintf("PR #%d review loop exceeded %d iterations; %d thread(s) still unresolved%s",
+				state.PRNumber, maxIter, len(threads), ejectSuffix(decision)),
+			reason,
 			fmt.Sprintf("dispatch-review-fix:cap:%s", refPrDispatchReviewFixMR)); err != nil {
 			return wrapOperationalErr(fmt.Errorf("escalating iteration cap: %w", err))
 		}
@@ -868,4 +891,39 @@ func blockingDesignatedReviewer(cfg *refinery.MergeQueueConfig, blocking []strin
 		}
 	}
 	return ""
+}
+
+// reviewLoopHistory reconstructs the round history Assess needs from the state
+// the MR bead actually carries.
+//
+// The bead records a running iteration count, not a per-round thread tally, so
+// only the current round's blocking count is known exactly. Earlier rounds are
+// represented with the same count, which makes the reconstruction conservative
+// in the direction that matters: a flat history reads as "not reducing", so the
+// stall rail can only fire when the loop genuinely reached the cap without
+// clearing its threads. It cannot manufacture apparent progress.
+//
+// Recording a real per-round tally on the bead would let the stall rail fire
+// earlier and let outcomeFor distinguish "shrinking" from "flat" on evidence
+// rather than on the cap. That is a bead schema change and is left out of this
+// one.
+func reviewLoopHistory(state dispatchReviewFixState, blocking int) []reviewer.RoundRecord {
+	rounds := state.ReviewLoopIter
+	if rounds < 1 {
+		rounds = 1
+	}
+	history := make([]reviewer.RoundRecord, 0, rounds)
+	for i := 1; i <= rounds; i++ {
+		history = append(history, reviewer.RoundRecord{Round: i, BlockingThreads: blocking})
+	}
+	return history
+}
+
+// ejectSuffix appends the recommended outcome to the escalation's one-line
+// description, so it is visible without opening the body.
+func ejectSuffix(d reviewer.EjectDecision) string {
+	if !d.Triggered() {
+		return ""
+	}
+	return fmt.Sprintf(" — recommend %s", d.Outcome)
 }
