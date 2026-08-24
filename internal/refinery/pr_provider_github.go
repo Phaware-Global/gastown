@@ -1,6 +1,10 @@
 package refinery
 
-import "github.com/steveyegge/gastown/internal/git"
+import (
+	"time"
+
+	"github.com/steveyegge/gastown/internal/git"
+)
 
 // githubPRProvider implements PRProvider using the gh CLI via git.Git.
 type githubPRProvider struct {
@@ -53,6 +57,10 @@ func (p *githubPRProvider) AllThreads(prNumber int) ([]ReviewThread, error) {
 		return nil, err
 	}
 	return gitReviewThreadsToProvider(threads), nil
+}
+
+func (p *githubPRProvider) CreatedAt(prNumber int) (time.Time, error) {
+	return p.git.GhPrCreatedAt(prNumber)
 }
 
 func (p *githubPRProvider) CountApprovals(prNumber int) (int, error) {
