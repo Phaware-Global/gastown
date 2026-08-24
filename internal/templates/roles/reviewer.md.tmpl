@@ -65,9 +65,13 @@ Read the request bead/mail to extract `<pr>`, the recorded head `<sha>`, and the
    ```bash
    {{ cmd }} reviewer checkout <pr> --sha <sha> --round <round>
    ```
-   `--round` is telemetry only — it records which round this is in the heartbeat
-   so an operator investigating a stalled reviewer can tell a first review from a
-   fix round. It changes nothing about what you review.
+   `--round` records which round this is in the heartbeat, and on a fix round it
+   is what makes the prior-thread context below apply. It is derived by the
+   refinery from the MR bead's `review_loop_iter`, so trust it: a round ≥ 2 means
+   earlier rounds exist and their threads are in your request payload. (Before
+   hga-y1b it was pinned at 1 on every dispatch, so a fix round was reviewed as a
+   first review and prior findings were re-raised. If you still see round 1 on a
+   PR you have reviewed before, that is a defect worth reporting, not a fact.)
 
    With `--sha` the worktree detaches at exactly that commit. Without it,
    checkout would detach at the PR's *current* head, which can drift if upstream
@@ -80,9 +84,13 @@ Read the request bead/mail to extract `<pr>`, the recorded head `<sha>`, and the
    {{ cmd }} reviewer perspectives
    ```
 
-3. **For fix rounds (round ≥ 2)**, write the prior-round thread context — already
-   assembled in your request payload, do **not** gather it yourself — to a file
-   (e.g. `prior-threads.txt`) so it can be injected into each prompt below.
+3. **For fix rounds (round ≥ 2)**, write the prior-round thread context to a file
+   (e.g. `prior-threads.txt`) so it can be injected into each prompt below. It is
+   **already assembled in your request payload** — every thread on the PR, open
+   and resolved, each marked with its state. Copy it verbatim; do **not** gather,
+   re-summarize, or filter it yourself. The resolved entries are load-bearing:
+   they are what lets a pass tell "already fixed" from "new", which is the
+   difference between a converging fix round and a re-run of the last one.
 
 4. **Generate one prompt per perspective.** Each generated prompt already carries
    the full execution contract (which SHA/diff to target, the required codegraph
