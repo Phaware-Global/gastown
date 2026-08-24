@@ -1110,7 +1110,7 @@ func shortSHA(sha string) string {
 //
 // -U0 is load-bearing: with git's default three lines of context every hunk
 // header claims six more lines than the diff changed, so findings on untouched
-// neighbouring code would classify as in-scope and the filter would be a no-op
+// neighboring code would classify as in-scope and the filter would be a no-op
 // exactly where it matters.
 //
 // Every failure path returns nil rather than an error. A nil manifest means

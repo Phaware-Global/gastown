@@ -52,7 +52,7 @@ var hunkHeader = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
 //
 // Zero context (-U0) is what makes the result meaningful: with the default three
 // lines of context, every hunk header claims six more lines than the diff
-// actually changed, and findings on untouched neighbouring code would classify
+// actually changed, and findings on untouched neighboring code would classify
 // as in-scope.
 //
 // A pure parser rather than a git call so the classification is unit-testable

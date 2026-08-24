@@ -288,7 +288,7 @@ func Consolidate(results []PerspectiveResult, reviewedSHA string, manifest DiffM
 	// an objection — "an architectural objection, a concern about the change as
 	// a whole" — which is also the exact shape of an out-of-scope demand.
 	//
-	// So it is honoured only when the round also found something blocking
+	// So it is honored only when the round also found something blocking
 	// INSIDE the diff. With a manifest present and no in-scope blocking finding,
 	// it is softened to comment: the objection still posts, in full, and still
 	// raises the verdict above a bare approve — it just no longer creates an
