@@ -60,6 +60,28 @@ func TestFormatJSON(t *testing.T) {
 	}
 }
 
+// TestHasReaperSchemaRequiresWispLabels guards against the gap flagged in
+// review on PR #200: notAgentWispPredicate made wisp_labels a hard
+// dependency of every Scan/Reap query (none of them tolerate a missing
+// table the way the mail/stale counts do), but HasReaperSchema — the gate
+// callers use to decide whether to run Scan/Reap at all on a database —
+// didn't require it. A database with wisps/issues/wisp_dependencies but no
+// wisp_labels (partially migrated, or an orphan test DB) would pass the
+// gate and then error on every query, silently stopping all reaping on
+// that database (gt-7a7j).
+func TestHasReaperSchemaRequiresWispLabels(t *testing.T) {
+	sourcePath := "reaper.go"
+	data, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", sourcePath, err)
+	}
+	source := string(data)
+	schemaBody := sourceBetween(t, source, "func HasReaperSchema(", "func tableExists(")
+	if !strings.Contains(schemaBody, `"wisp_labels"`) {
+		t.Fatalf("expected HasReaperSchema() to require wisp_labels, body was:\n%s", schemaBody)
+	}
+}
+
 func TestParentExcludeJoin(t *testing.T) {
 	joinClause, whereCondition := parentExcludeJoin("testdb")
 
@@ -387,8 +409,16 @@ func TestScanExcludesAgentBeads(t *testing.T) {
 	if !strings.Contains(scanBody, `notAgentWispPredicate("w")`) {
 		t.Fatalf("expected Scan() eligibility to use the shared notAgentWispPredicate(\"w\"), scan body was:\n%s", scanBody)
 	}
-	if !strings.Contains(notAgentWispPredicate("w"), "w.issue_type != 'agent'") || !strings.Contains(notAgentWispPredicate("w"), "wisp_labels") {
-		t.Fatalf("expected notAgentWispPredicate(\"w\") to check both issue_type and wisp_labels, got: %s", notAgentWispPredicate("w"))
+	pred := notAgentWispPredicate("w")
+	if !strings.Contains(pred, "w.issue_type != 'agent'") || !strings.Contains(pred, "wisp_labels") {
+		t.Fatalf("expected notAgentWispPredicate(\"w\") to check both issue_type and wisp_labels, got: %s", pred)
+	}
+	// bd create --labels writes to the labels table, not wisp_labels
+	// (internal/doctor/agent_beads_check.go:308-311) — a predicate that only
+	// checks wisp_labels misses every wisp-backed agent bead CreateAgentBead
+	// actually produces (gt-7a7j, HIGH finding on PR #200).
+	if !strings.Contains(pred, "FROM labels l WHERE l.issue_id = w.id AND l.label = 'gt:agent'") {
+		t.Fatalf("expected notAgentWispPredicate(\"w\") to also check the labels table, got: %s", pred)
 	}
 }
 
@@ -431,6 +461,30 @@ func TestScanAutoCloseStaleExemptionsAgree(t *testing.T) {
 	}
 }
 
+// TestPurgeClosedWispsExcludesAgentBeads guards against the gap flagged in
+// review on PR #200: the agent guard covered every close path (Scan/Reap)
+// but not purgeClosedWisps, so an already-closed wisp-backed agent bead —
+// exactly the state Reap's guard prevents new ones from reaching, but which
+// pre-fix code produced before this bead's fix landed — gets hard-deleted
+// (wisp_labels included) at purgeAge with no guard at all (gt-7a7j, gt-h8oq).
+func TestPurgeClosedWispsExcludesAgentBeads(t *testing.T) {
+	sourcePath := "reaper.go"
+	data, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", sourcePath, err)
+	}
+	source := string(data)
+	start := strings.Index(source, "func purgeClosedWisps(")
+	end := strings.Index(source, "func purgeOldMail(")
+	if start == -1 || end == -1 || end <= start {
+		t.Fatalf("could not isolate purgeClosedWisps() body in %s", sourcePath)
+	}
+	body := source[start:end]
+	if strings.Count(body, `notAgentWispPredicate("w")`) < 2 {
+		t.Fatalf("expected purgeClosedWisps() to guard both digestQuery and idQuery with notAgentWispPredicate(\"w\"), body was:\n%s", body)
+	}
+}
+
 func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	now := time.Now().UTC()
 	state := &fakeReaperState{
@@ -453,6 +507,13 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 			// identical to stale-orphan: without the wisp_labels check this gets
 			// reaped like any other stale wisp, destroying agent identity (gt-7a7j).
 			"label-agent-orphan": {id: "label-agent-orphan", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour), labels: []string{"gt:agent"}},
+			// Wisp-backed agent identity bead the way CreateAgentBead ACTUALLY
+			// creates one: "bd create --type=task --labels=gt:agent" writes only
+			// to the labels table, never to wisp_labels
+			// (internal/doctor/agent_beads_check.go:308-311). A predicate that
+			// checks only wisp_labels (PR #200 as originally reviewed) misses
+			// this shape entirely — the HIGH finding on gt-7a7j.
+			"issue-label-agent-orphan": {id: "issue-label-agent-orphan", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour), issueLabels: []string{"gt:agent"}},
 		},
 		deps: []fakeDep{
 			{issueID: "step-closed-mol-recent", dependsOnID: "mol-closed", depType: "parent-child"},
@@ -493,8 +554,8 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	if dryRun.Reaped != 2 {
 		t.Fatalf("dry-run Reaped = %d, want 2", dryRun.Reaped)
 	}
-	if dryRun.OpenRemain != 11 {
-		t.Fatalf("dry-run OpenRemain = %d, want 11", dryRun.OpenRemain)
+	if dryRun.OpenRemain != 12 {
+		t.Fatalf("dry-run OpenRemain = %d, want 12", dryRun.OpenRemain)
 	}
 	if afterDryRun := state.statuses(); !reflect.DeepEqual(afterDryRun, beforeDryRun) {
 		t.Fatalf("dry-run mutated statuses: before=%v after=%v", beforeDryRun, afterDryRun)
@@ -511,8 +572,8 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	if realRun.Reaped != 2 {
 		t.Fatalf("real Reaped = %d, want 2", realRun.Reaped)
 	}
-	if realRun.OpenRemain != 7 {
-		t.Fatalf("real OpenRemain = %d, want 7", realRun.OpenRemain)
+	if realRun.OpenRemain != 8 {
+		t.Fatalf("real OpenRemain = %d, want 8", realRun.OpenRemain)
 	}
 
 	for _, id := range []string{"step-closed-mol-recent", "step-closed-mol-old", "step-non-molecule-parent", "stale-orphan"} {
@@ -520,7 +581,7 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 			t.Fatalf("%s status = %q, want closed", id, got)
 		}
 	}
-	for _, id := range []string{"step-mixed-parent-old", "step-external-parent-old", "step-open-parent-old", "agent-step", "fresh-orphan", "mol-open", "label-agent-orphan"} {
+	for _, id := range []string{"step-mixed-parent-old", "step-external-parent-old", "step-open-parent-old", "agent-step", "fresh-orphan", "mol-open", "label-agent-orphan", "issue-label-agent-orphan"} {
 		if got := state.status(id); got != "open" {
 			t.Fatalf("%s status = %q, want open", id, got)
 		}
@@ -563,18 +624,32 @@ type fakeWisp struct {
 	status    string
 	issueType string
 	createdAt time.Time
-	labels    []string
+	// labels simulates rows in wisp_labels for this wisp.
+	labels []string
+	// issueLabels simulates rows in the separate `labels` table for this
+	// issue_id — the table bd create --labels actually writes to
+	// (internal/doctor/agent_beads_check.go:308-311). A wisp-backed agent
+	// bead created the way CreateAgentBead really creates one has gt:agent
+	// here and NOT in labels (wisp_labels only gets it via an out-of-band
+	// repair), so this must be checked independently of labels above (gt-7a7j).
+	issueLabels []string
 }
 
-// isAgentWisp reports whether w is excluded by notAgentWispPredicate: either
-// the legacy issue_type='agent' marker or the current gt:agent label
-// (wisp_labels). Mirrors the real predicate so the fake driver's simulated
-// eligibility matches what the actual SQL would return (gt-7a7j).
+// isAgentWisp reports whether w is excluded by notAgentWispPredicate: the
+// legacy issue_type='agent' marker, the gt:agent label in wisp_labels, or
+// the gt:agent label in the separate labels table. Mirrors the real
+// predicate so the fake driver's simulated eligibility matches what the
+// actual SQL would return (gt-7a7j).
 func (w *fakeWisp) isAgentWisp() bool {
 	if w.issueType == "agent" {
 		return true
 	}
 	for _, l := range w.labels {
+		if l == "gt:agent" {
+			return true
+		}
+	}
+	for _, l := range w.issueLabels {
 		if l == "gt:agent" {
 			return true
 		}
@@ -794,10 +869,16 @@ func (c *fakeReaperConn) ExecContext(_ context.Context, query string, args []dri
 
 	switch {
 	case strings.HasPrefix(normalized, "UPDATE wisps SET status='closed'"):
+		if err := validateAgentGuardedUpdateQuery(normalized); err != nil {
+			return nil, err
+		}
 		affected := int64(0)
 		for _, arg := range args {
 			id, _ := arg.Value.(string)
-			if w := c.state.wisps[id]; w != nil && isOpenWispStatus(w.status) {
+			// Honour the bare-table notAgentWispPredicate("") guard: a real
+			// UPDATE with this WHERE clause would not touch an agent-labelled
+			// row, regardless of what IDs are passed in the IN-list (gt-7a7j).
+			if w := c.state.wisps[id]; w != nil && isOpenWispStatus(w.status) && !w.isAgentWisp() {
 				w.status = "closed"
 				affected++
 			}
@@ -879,6 +960,7 @@ func validateMoleculeStepQuery(query string) error {
 		"open_dep.depends_on_external IS NOT NULL",
 		"w.issue_type != 'agent'",
 		"wl.issue_id = w.id AND wl.label = 'gt:agent'",
+		"l.issue_id = w.id AND l.label = 'gt:agent'",
 		"w.status IN ('open', 'hooked', 'in_progress')",
 	)
 }
@@ -893,9 +975,24 @@ func validateStaleWispQuery(query string) error {
 		"wd.type = 'parent-child'",
 		"w.issue_type != 'agent'",
 		"wl.issue_id = w.id AND wl.label = 'gt:agent'",
+		"l.issue_id = w.id AND l.label = 'gt:agent'",
 		"w.created_at < ?",
 		"open_parent.issue_id IS NULL",
 		"closed_molecule_step.issue_id IS NULL",
+	)
+}
+
+// validateAgentGuardedUpdateQuery asserts the bare-table notAgentWispPredicate("")
+// guard is present on the UPDATE that actually closes wisps. Before this test,
+// nothing checked the bare-table form: both query validators above only assert
+// the "w."-aliased form, and this fake's UPDATE branch used to close every id in
+// args unconditionally, so a missing or malformed guard here would not have
+// turned any test red (gt-7a7j review, thread on reaper_test.go:895).
+func validateAgentGuardedUpdateQuery(query string) error {
+	return requireSQL(query,
+		"issue_type != 'agent'",
+		"wl.issue_id = id AND wl.label = 'gt:agent'",
+		"l.issue_id = id AND l.label = 'gt:agent'",
 	)
 }
 
