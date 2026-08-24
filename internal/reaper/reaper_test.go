@@ -340,6 +340,24 @@ func TestReapExcludesAgentBeads(t *testing.T) {
 	t.Log("This prevents hq-mayor, hq-deacon, witness, refinery, etc. from being closed")
 }
 
+// TestAutoCloseExcludesAgentBeads guards against reaper: gt:beads-refinery-style
+// agent identity beads live in the issues table with issue_type='task' and a
+// 'gt:agent' label (not issue_type='agent', which only wisps use). AutoClose's
+// label exclusion must include 'gt:agent' or the staleness sweep will close
+// live Refinery/Witness/Mayor identity beads, breaking agent bead resolution.
+func TestAutoCloseExcludesAgentBeads(t *testing.T) {
+	sourcePath := "reaper.go"
+	data, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", sourcePath, err)
+	}
+	source := string(data)
+	autoCloseBody := sourceBetween(t, source, "func AutoClose(", "// batchDeleteRows")
+	if !strings.Contains(autoCloseBody, "'gt:agent'") {
+		t.Fatalf("expected AutoClose() label exclusion to include 'gt:agent', autoClose body was:\n%s", autoCloseBody)
+	}
+}
+
 // TestScanExcludesAgentBeads documents that Scan() must use the same eligibility
 // predicate as Reap() for stale open wisps. If Scan counts agent beads but Reap
 // excludes them, the operator sees scan>0 and reap=0 for the same cutoff.
