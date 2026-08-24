@@ -155,7 +155,7 @@ func TestConsolidate_TakesMostBlockingDisposition(t *testing.T) {
 		{Perspective: "security", Verdict: "BLOCK: architectural", Disposition: "request_changes"},
 		{Perspective: "perf", Verdict: "minor", Disposition: "comment"},
 	}
-	fs := Consolidate(results, "sha")
+	fs := Consolidate(results, "sha", nil)
 	if fs.Disposition != "request_changes" {
 		t.Errorf("Disposition = %q, want request_changes (most blocking wins)", fs.Disposition)
 	}
@@ -171,7 +171,7 @@ func TestConsolidate_NoDispositionLeavesSeverityDerivationIntact(t *testing.T) {
 		{Perspective: "adversarial", Verdict: "no findings"},
 		{Perspective: "security", Verdict: "no findings"},
 	}
-	fs := Consolidate(results, "sha")
+	fs := Consolidate(results, "sha", nil)
 	if fs.Disposition != "" {
 		t.Errorf("Disposition = %q, want empty when no perspective escalated", fs.Disposition)
 	}
@@ -188,7 +188,7 @@ func TestConsolidate_DispositionSurvivesTheRoundTripToPost(t *testing.T) {
 	// `consolidate --out findings.json` → `post --findings findings.json` hop.
 	fs := Consolidate([]PerspectiveResult{
 		{Perspective: "security", Verdict: "BLOCK", Disposition: "request_changes"},
-	}, "deadbeef")
+	}, "deadbeef", nil)
 
 	encoded, err := json.Marshal(fs)
 	if err != nil {

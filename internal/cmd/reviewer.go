@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -46,8 +47,9 @@ var (
 	reviewerPromptMaxFindings  int
 	reviewerPromptMaxDuration  time.Duration
 
-	reviewerConsolidateSHA string
-	reviewerConsolidateOut string
+	reviewerConsolidateSHA     string
+	reviewerConsolidateBaseSHA string
+	reviewerConsolidateOut     string
 
 	reviewerDonePR int
 )
@@ -196,8 +198,12 @@ them on stdin. The output is the findings JSON that 'gt reviewer post' consumes:
 
   - the summary lists every perspective's verdict (perspectives with no findings
     are still accounted for — never silent),
-  - findings are deduplicated by (path, line, title) with the highest priority
-    winning and perspective tags unioned.
+  - findings are deduplicated by (path, line) with the highest priority winning
+    and perspective tags unioned (one line, one thread — four lenses describing
+    one defect are one fix),
+  - a file's low-priority findings collapse into a single non-blocking thread,
+  - with --base-sha, findings outside the PR's diff are classified out of scope
+    and posted as non-blocking rather than as merge blockers.
 
 Deterministic dedup lives here, in Go, rather than in per-run reviewer judgment.
 Writes to --out, or stdout when --out is omitted.`,
@@ -266,6 +272,9 @@ func init() {
 
 	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateSHA, "sha", "",
 		"reviewed head SHA to record in the consolidated payload")
+	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateBaseSHA, "base-sha", "",
+		"merge-base the PR is diffed against; enables scope classification "+
+			"(findings outside the diff post as non-blocking)")
 	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateOut, "out", "",
 		"write the consolidated findings JSON here (default: stdout)")
 
@@ -747,7 +756,15 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	fs := reviewer.Consolidate(results, reviewerConsolidateSHA)
+	// Build the diff manifest so findings can be classified against what this
+	// PR actually changed. Best-effort by design: --base-sha is optional, and a
+	// git failure yields a nil manifest, which classifies everything as
+	// ScopeUnknown and changes nothing. Scope filtering must never be able to
+	// silently downgrade a review just because git was unavailable — a missing
+	// manifest is missing evidence, not evidence of good scope.
+	manifest := buildDiffManifest(resolveConsolidateBaseSHA(), reviewerConsolidateSHA)
+
+	fs := reviewer.Consolidate(results, reviewerConsolidateSHA, manifest)
 
 	// Report the event on STDERR, before the --out branch, so every invocation
 	// gets it. Posting is irreversible and the Reviewer cannot clear its own
@@ -1086,4 +1103,86 @@ func shortSHA(sha string) string {
 		return sha[:12]
 	}
 	return sha
+}
+
+// buildDiffManifest returns the set of lines this PR changed, for scope
+// classification, or nil when it cannot be determined.
+//
+// -U0 is load-bearing: with git's default three lines of context every hunk
+// header claims six more lines than the diff changed, so findings on untouched
+// neighboring code would classify as in-scope and the filter would be a no-op
+// exactly where it matters.
+//
+// Every failure path returns nil rather than an error. A nil manifest means
+// "unknown", which demotes nothing — the conservative direction. The opposite
+// default would let a git hiccup silently strip the blocking status from a
+// round of real findings.
+func buildDiffManifest(baseSHA, headSHA string) reviewer.DiffManifest {
+	baseSHA = strings.TrimSpace(baseSHA)
+	headSHA = strings.TrimSpace(headSHA)
+	if baseSHA == "" || headSHA == "" {
+		return nil
+	}
+	// Reject anything that isn't a plain hex object name before it reaches the
+	// command line: these values arrive from a mail payload the reviewer parses,
+	// and a value like "--output=..." would otherwise be read as a git flag.
+	for _, sha := range []string{baseSHA, headSHA} {
+		if !isHexObjectName(sha) {
+			return nil
+		}
+	}
+	out, err := exec.Command("git", "diff", "-U0", baseSHA+".."+headSHA).Output()
+	if err != nil {
+		return nil
+	}
+	m := reviewer.ParseDiffManifest(string(out))
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+// isHexObjectName reports whether s is a plausible git object name: hex digits
+// only, long enough to be unambiguous, no longer than a full SHA-256 name.
+func isHexObjectName(s string) bool {
+	if len(s) < 7 || len(s) > 64 {
+		return false
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveConsolidateBaseSHA returns the merge-base to classify findings
+// against: the explicit --base-sha when given, otherwise derived the same way
+// `gt reviewer prompt` derives it.
+//
+// The derivation is not a convenience. The sanctioned consolidate invocation —
+// the one the role template, `gt prime` and the runbook all print, and which the
+// template tells the Reviewer to run literally ("do not improvise the
+// procedure; run the commands") — passes only --sha. Requiring --base-sha would
+// have left scope classification switched off on the exact path every review
+// actually takes: buildDiffManifest returns nil without it, so every finding
+// classifies ScopeUnknown and nothing is demoted. A feature that only engages
+// when someone remembers an undocumented flag is a feature that never engages.
+//
+// The PR number comes from the heartbeat rather than a new --pr flag, because
+// consolidate deliberately takes no --pr (it inherits the heartbeat's identity
+// fields so the record stays complete across the phase change).
+func resolveConsolidateBaseSHA() string {
+	if b := strings.TrimSpace(reviewerConsolidateBaseSHA); b != "" {
+		return b
+	}
+	rigPath := reviewerRigPathForHeartbeat()
+	if rigPath == "" {
+		return ""
+	}
+	hb := reviewer.ReadHeartbeat(rigPath)
+	if hb == nil || hb.PR <= 0 {
+		return ""
+	}
+	return resolveReviewBaseSHA(hb.PR, reviewerConsolidateSHA)
 }

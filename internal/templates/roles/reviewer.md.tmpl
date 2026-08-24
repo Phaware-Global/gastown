@@ -121,6 +121,12 @@ Read the request bead/mail to extract `<pr>`, the recorded head `<sha>`, and the
    ```bash
    {{ cmd }} reviewer consolidate perspective-*.json --sha <sha> --out findings.json
    ```
+   Findings are classified against the PR's diff: anything anchored outside it,
+   or whose fix lives in files this PR never touched, posts as non-blocking.
+   The diff base is derived automatically; pass `--base-sha <merge-base>` only
+   to override it.
+   ```bash
+   ```
 
 7. **Post exactly one review:**
    ```bash

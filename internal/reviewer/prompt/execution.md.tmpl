@@ -23,6 +23,14 @@ return*. Follow it exactly — do not improvise the procedure.
   moved. If you detect such drift, note it in your verdict.
 - Raise findings **only** on lines this PR introduced or changed. Pre-existing
   code is out of scope unless the diff changed its behavior.
+- This is now **enforced**, not merely asked. Consolidation classifies every
+  finding against the real diff, and anything outside it posts as non-blocking.
+  That check reads `remediation_paths` as well as the anchor (see §6), so a
+  finding anchored on a changed line whose fix lives in untouched files is
+  out of scope — the anchor does not launder the demand.
+- Out of scope is **not** the same as unwelcome. A real problem you cannot fix
+  within this diff is worth raising; it is simply follow-up work, not a merge
+  blocker. Name it, name its paths, and let it post as advisory.
 
 ### 2. Review round
 {{ if ge .Round 2 -}}
@@ -114,7 +122,8 @@ Return **exactly one** JSON object and no prose before or after it:
       "perspective": "{{ .Perspective }}",
       "title": "one-line summary",
       "body": "explanation citing the codegraph evidence",
-      "suggestion": "concrete change (optional)"
+      "suggestion": "concrete change (optional)",
+      "remediation_paths": ["every file that must be edited to act on this (optional)"]
     }
   ]
 }
@@ -130,6 +139,20 @@ pass with no disposition posts as an APPROVE. Omit it only when you completed
 the pass, and then the posted review's event is derived from your findings'
 severity (any high → REQUEST_CHANGES, any medium → COMMENT, clean or nits-only →
 APPROVE).
+
+`remediation_paths` lists every file a fixer must edit to act on the finding.
+It is optional, and omitting it means the finding is judged on its anchor alone
+— but naming the files honestly is how you keep a real concern from becoming a
+false merge blocker. If the fix touches only files in this diff, say so and the
+finding blocks normally. If it reaches outside, say that too: the finding still
+posts, in full, as advisory. Understating it does not make the objection
+stronger; it makes the review one the fix loop cannot converge on.
+
+A note on `disposition` and scope: an unanchored `request_changes` is honoured
+only when the round also found something blocking **inside** the diff.
+Otherwise it is recorded as `comment`. It blocks a merge without creating a
+thread, so nothing in town can clear it — and "an objection about the change as
+a whole" is also the exact shape an out-of-scope demand takes.
 
 Set it when you must block on something you **cannot anchor to a diff line** —
 an architectural objection, a missing-by-design invariant, a concern about the

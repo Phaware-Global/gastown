@@ -29,7 +29,7 @@ func TestConsolidate_MergesSameLineAcrossPerspectives(t *testing.T) {
 		}}},
 	}
 
-	fs := Consolidate(results, "sha")
+	fs := Consolidate(results, "sha", nil)
 
 	if len(fs.Findings) != 1 {
 		t.Fatalf("got %d findings, want 1 merged thread", len(fs.Findings))
@@ -65,7 +65,7 @@ func TestConsolidate_DifferentLinesStaySeparate(t *testing.T) {
 		{Path: "a.ts", Line: 10, Priority: "high", Perspective: "security", Title: "One"},
 		{Path: "a.ts", Line: 20, Priority: "high", Perspective: "security", Title: "Two"},
 	}}}
-	if fs := Consolidate(results, "sha"); len(fs.Findings) != 2 {
+	if fs := Consolidate(results, "sha", nil); len(fs.Findings) != 2 {
 		t.Fatalf("got %d findings, want 2", len(fs.Findings))
 	}
 }
@@ -79,7 +79,7 @@ func TestConsolidate_CollapsesLowsPerFile(t *testing.T) {
 		{Path: "a.ts", Line: 40, Priority: "medium", Perspective: "security", Title: "Real issue"},
 	}}}
 
-	fs := Consolidate(results, "sha")
+	fs := Consolidate(results, "sha", nil)
 
 	var nits, lonely, medium *Finding
 	for i := range fs.Findings {
