@@ -219,7 +219,7 @@ const openWispStatusWhere = "w.status IN ('open', 'hooked', 'in_progress')"
 // notAgentWispJoin returns a LEFT JOIN clause and WHERE condition that
 // exclude wisp-backed agent identity beads from a reaper eligibility query,
 // via an anti-join rather than a correlated EXISTS — the pattern this file
-// already standardises on for the same reason (see parentExcludeJoin):
+// already standardizes on for the same reason (see parentExcludeJoin):
 // reapQuery's own adjacent comment bans correlated EXISTS here as the exact
 // shape that caused O(n*m) cost and CPU/connection-timeout incidents
 // (gt-jd1z, gt-wvd2).
