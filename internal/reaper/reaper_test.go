@@ -387,12 +387,14 @@ func TestAutoCloseExcludesAgentBeads(t *testing.T) {
 }
 
 // TestScanExcludesAgentBeads documents that Scan() must use the same eligibility
-// predicate as Reap() for stale open wisps. If Scan counts agent beads but Reap
+// join as Reap() for stale open wisps. If Scan counts agent beads but Reap
 // excludes them, the operator sees scan>0 and reap=0 for the same cutoff. Agent
 // beads can be wisp-backed with only the gt:agent label (issue_type='task'), not
 // just issue_type='agent' (gt-7a7j), so the check goes through the shared
-// notAgentWispPredicate() rather than the old inline literal, which never
-// checked wisp_labels.
+// notAgentWispJoin() rather than the old inline literal, which never checked
+// wisp_labels — and never checked the labels table CreateAgentBead actually
+// writes gt:agent to (internal/doctor/agent_beads_check.go:308-311, HIGH
+// finding on PR #200).
 func TestScanExcludesAgentBeads(t *testing.T) {
 	sourcePath := "reaper.go"
 	data, err := os.ReadFile(sourcePath)
@@ -406,19 +408,29 @@ func TestScanExcludesAgentBeads(t *testing.T) {
 		t.Fatalf("could not isolate Scan() body in %s", sourcePath)
 	}
 	scanBody := source[scanStart:reapStart]
-	if !strings.Contains(scanBody, `notAgentWispPredicate("w")`) {
-		t.Fatalf("expected Scan() eligibility to use the shared notAgentWispPredicate(\"w\"), scan body was:\n%s", scanBody)
+	if !strings.Contains(scanBody, `notAgentWispJoin("w")`) {
+		t.Fatalf("expected Scan() eligibility to use the shared notAgentWispJoin(\"w\"), scan body was:\n%s", scanBody)
 	}
-	pred := notAgentWispPredicate("w")
-	if !strings.Contains(pred, "w.issue_type != 'agent'") || !strings.Contains(pred, "wisp_labels") {
-		t.Fatalf("expected notAgentWispPredicate(\"w\") to check both issue_type and wisp_labels, got: %s", pred)
+	joinClause, whereCondition := notAgentWispJoin("w")
+	if !strings.Contains(whereCondition, "w.issue_type != 'agent'") {
+		t.Fatalf("expected notAgentWispJoin(\"w\") whereCondition to check issue_type, got: %s", whereCondition)
 	}
-	// bd create --labels writes to the labels table, not wisp_labels
-	// (internal/doctor/agent_beads_check.go:308-311) — a predicate that only
-	// checks wisp_labels misses every wisp-backed agent bead CreateAgentBead
-	// actually produces (gt-7a7j, HIGH finding on PR #200).
-	if !strings.Contains(pred, "FROM labels l WHERE l.issue_id = w.id AND l.label = 'gt:agent'") {
-		t.Fatalf("expected notAgentWispPredicate(\"w\") to also check the labels table, got: %s", pred)
+	if !strings.Contains(joinClause, "wisp_labels") {
+		t.Fatalf("expected notAgentWispJoin(\"w\") joinClause to check wisp_labels, got: %s", joinClause)
+	}
+	// bd create --labels writes to the labels table, not wisp_labels — a join
+	// that only checks wisp_labels misses every wisp-backed agent bead
+	// CreateAgentBead actually produces (gt-7a7j).
+	if !strings.Contains(joinClause, "LEFT JOIN labels agent_l ON agent_l.issue_id = w.id AND agent_l.label = 'gt:agent'") {
+		t.Fatalf("expected notAgentWispJoin(\"w\") to also check the labels table, got: %s", joinClause)
+	}
+	if !strings.Contains(whereCondition, "agent_wl.issue_id IS NULL") || !strings.Contains(whereCondition, "agent_l.issue_id IS NULL") {
+		t.Fatalf("expected notAgentWispJoin(\"w\") whereCondition to anti-join both label homes, got: %s", whereCondition)
+	}
+	// Anti-join, not correlated EXISTS — reapQuery's adjacent comment bans
+	// correlated subqueries on the wisp tables (gt-jd1z, gt-wvd2).
+	if strings.Contains(joinClause, "EXISTS") || strings.Contains(whereCondition, "EXISTS") {
+		t.Fatalf("expected notAgentWispJoin(\"w\") to use a LEFT JOIN anti-join, not correlated EXISTS: join=%s where=%s", joinClause, whereCondition)
 	}
 }
 
@@ -480,8 +492,11 @@ func TestPurgeClosedWispsExcludesAgentBeads(t *testing.T) {
 		t.Fatalf("could not isolate purgeClosedWisps() body in %s", sourcePath)
 	}
 	body := source[start:end]
-	if strings.Count(body, `notAgentWispPredicate("w")`) < 2 {
-		t.Fatalf("expected purgeClosedWisps() to guard both digestQuery and idQuery with notAgentWispPredicate(\"w\"), body was:\n%s", body)
+	if !strings.Contains(body, `notAgentWispJoin("w")`) {
+		t.Fatalf("expected purgeClosedWisps() to use notAgentWispJoin(\"w\"), body was:\n%s", body)
+	}
+	if strings.Count(body, "agentJoin") < 2 || strings.Count(body, "agentWhere") < 2 {
+		t.Fatalf("expected purgeClosedWisps() to apply the agent join/where to both digestQuery and idQuery, body was:\n%s", body)
 	}
 }
 
@@ -594,9 +609,9 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 		assertOpsContainInOrder(t, ops,
 			"EXEC SET @@autocommit = 0",
 			"QUERY SELECT w.id FROM wisps w INNER JOIN",
-			"EXEC UPDATE wisps SET status='closed'",
+			"EXEC UPDATE wisps LEFT JOIN",
 			"QUERY SELECT w.id FROM wisps w LEFT JOIN",
-			"EXEC UPDATE wisps SET status='closed'",
+			"EXEC UPDATE wisps LEFT JOIN",
 			"EXEC COMMIT",
 			"EXEC CALL DOLT_COMMIT",
 			"QUERY SELECT COUNT(*) FROM wisps WHERE status IN",
@@ -868,16 +883,17 @@ func (c *fakeReaperConn) ExecContext(_ context.Context, query string, args []dri
 	c.state.record(c.id, "EXEC "+normalized)
 
 	switch {
-	case strings.HasPrefix(normalized, "UPDATE wisps SET status='closed'"):
+	case strings.HasPrefix(normalized, "UPDATE wisps LEFT JOIN") && strings.Contains(normalized, "SET wisps.status='closed'"):
 		if err := validateAgentGuardedUpdateQuery(normalized); err != nil {
 			return nil, err
 		}
 		affected := int64(0)
 		for _, arg := range args {
 			id, _ := arg.Value.(string)
-			// Honour the bare-table notAgentWispPredicate("") guard: a real
-			// UPDATE with this WHERE clause would not touch an agent-labelled
-			// row, regardless of what IDs are passed in the IN-list (gt-7a7j).
+			// Honour the bare-table notAgentWispJoin("") guard: a real
+			// multi-table UPDATE with this WHERE clause would not touch an
+			// agent-labelled row, regardless of what IDs are passed in the
+			// IN-list (gt-7a7j).
 			if w := c.state.wisps[id]; w != nil && isOpenWispStatus(w.status) && !w.isAgentWisp() {
 				w.status = "closed"
 				affected++
@@ -959,8 +975,10 @@ func validateMoleculeStepQuery(query string) error {
 		"NOT EXISTS",
 		"open_dep.depends_on_external IS NOT NULL",
 		"w.issue_type != 'agent'",
-		"wl.issue_id = w.id AND wl.label = 'gt:agent'",
-		"l.issue_id = w.id AND l.label = 'gt:agent'",
+		"LEFT JOIN wisp_labels agent_wl ON agent_wl.issue_id = w.id AND agent_wl.label = 'gt:agent'",
+		"LEFT JOIN labels agent_l ON agent_l.issue_id = w.id AND agent_l.label = 'gt:agent'",
+		"agent_wl.issue_id IS NULL",
+		"agent_l.issue_id IS NULL",
 		"w.status IN ('open', 'hooked', 'in_progress')",
 	)
 }
@@ -974,15 +992,17 @@ func validateStaleWispQuery(query string) error {
 		"depends_on_external IS NOT NULL",
 		"wd.type = 'parent-child'",
 		"w.issue_type != 'agent'",
-		"wl.issue_id = w.id AND wl.label = 'gt:agent'",
-		"l.issue_id = w.id AND l.label = 'gt:agent'",
+		"LEFT JOIN wisp_labels agent_wl ON agent_wl.issue_id = w.id AND agent_wl.label = 'gt:agent'",
+		"LEFT JOIN labels agent_l ON agent_l.issue_id = w.id AND agent_l.label = 'gt:agent'",
+		"agent_wl.issue_id IS NULL",
+		"agent_l.issue_id IS NULL",
 		"w.created_at < ?",
 		"open_parent.issue_id IS NULL",
 		"closed_molecule_step.issue_id IS NULL",
 	)
 }
 
-// validateAgentGuardedUpdateQuery asserts the bare-table notAgentWispPredicate("")
+// validateAgentGuardedUpdateQuery asserts the bare-table notAgentWispJoin("")
 // guard is present on the UPDATE that actually closes wisps. Before this test,
 // nothing checked the bare-table form: both query validators above only assert
 // the "w."-aliased form, and this fake's UPDATE branch used to close every id in
@@ -991,8 +1011,10 @@ func validateStaleWispQuery(query string) error {
 func validateAgentGuardedUpdateQuery(query string) error {
 	return requireSQL(query,
 		"issue_type != 'agent'",
-		"wl.issue_id = id AND wl.label = 'gt:agent'",
-		"l.issue_id = id AND l.label = 'gt:agent'",
+		"LEFT JOIN wisp_labels agent_wl ON agent_wl.issue_id = id AND agent_wl.label = 'gt:agent'",
+		"LEFT JOIN labels agent_l ON agent_l.issue_id = id AND agent_l.label = 'gt:agent'",
+		"agent_wl.issue_id IS NULL",
+		"agent_l.issue_id IS NULL",
 	)
 }
 

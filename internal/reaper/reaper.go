@@ -216,29 +216,43 @@ func parentExcludeJoin(dbName string) (joinClause, whereCondition string) {
 
 const openWispStatusWhere = "w.status IN ('open', 'hooked', 'in_progress')"
 
-// notAgentWispPredicate excludes wisp-backed agent identity beads from a
-// reaper eligibility query. Agent identity beads may carry the legacy
-// issue_type='agent' marker, or the gt:agent label — the current standard
-// post-migration (see beads.IsAgentBead). CreateAgentBead creates every
-// agent bead with "--type=task --labels=gt:agent", and bd create --labels
-// writes ONLY to the labels table, not wisp_labels
-// (internal/doctor/agent_beads_check.go:308-311) — so a wisp-backed agent
-// bead's gt:agent marker can live in either labels table depending on
-// whether anything has repaired it into wisp_labels out of band. A guard
-// that checks only one of the two lets a wisp-backed agent bead survive
-// Scan but get closed by Reap once it passes maxAge (gt-7a7j). alias is the
-// table alias the wisps row is queried under ("w" when joined/aliased, ""
-// when the UPDATE targets the bare table). Every site that used to write
-// "issue_type != 'agent'" ad hoc now calls this so Scan and Reap can never
-// diverge on eligibility again.
-func notAgentWispPredicate(alias string) string {
+// notAgentWispJoin returns a LEFT JOIN clause and WHERE condition that
+// exclude wisp-backed agent identity beads from a reaper eligibility query,
+// via an anti-join rather than a correlated EXISTS — the pattern this file
+// already standardises on for the same reason (see parentExcludeJoin):
+// reapQuery's own adjacent comment bans correlated EXISTS here as the exact
+// shape that caused O(n*m) cost and CPU/connection-timeout incidents
+// (gt-jd1z, gt-wvd2).
+//
+// Agent identity beads may carry the legacy issue_type='agent' marker, or
+// the gt:agent label — the current standard post-migration (see
+// beads.IsAgentBead). CreateAgentBead creates every agent bead with
+// "--type=task --labels=gt:agent", and bd create --labels writes ONLY to
+// the labels table, not wisp_labels (internal/doctor/agent_beads_check.go:
+// 308-311) — so a wisp-backed agent bead's gt:agent marker can live in
+// either labels table depending on whether anything has repaired it into
+// wisp_labels out of band. A guard that checks only one of the two lets a
+// wisp-backed agent bead survive Scan but get closed by Reap once it passes
+// maxAge (gt-7a7j).
+//
+// alias is the table alias the wisps row is queried under ("w" when
+// joined/aliased, "" when the target is the bare wisps table — a
+// multi-table UPDATE for the batch-close path). Every site that used to
+// write "issue_type != 'agent'" ad hoc now calls this so Scan and Reap can
+// never diverge on eligibility again.
+func notAgentWispJoin(alias string) (joinClause, whereCondition string) {
 	idCol, typeCol := "id", "issue_type"
 	if alias != "" {
 		idCol, typeCol = alias+".id", alias+".issue_type"
 	}
-	return fmt.Sprintf(
-		"%s != 'agent' AND NOT EXISTS (SELECT 1 FROM wisp_labels wl WHERE wl.issue_id = %s AND wl.label = 'gt:agent') AND NOT EXISTS (SELECT 1 FROM labels l WHERE l.issue_id = %s AND l.label = 'gt:agent')",
-		typeCol, idCol, idCol)
+	joinClause = fmt.Sprintf(
+		`LEFT JOIN wisp_labels agent_wl ON agent_wl.issue_id = %s AND agent_wl.label = 'gt:agent'
+		LEFT JOIN labels agent_l ON agent_l.issue_id = %s AND agent_l.label = 'gt:agent'`,
+		idCol, idCol)
+	whereCondition = fmt.Sprintf(
+		"%s != 'agent' AND agent_wl.issue_id IS NULL AND agent_l.issue_id IS NULL",
+		typeCol)
+	return
 }
 
 // staleIssueExemptLabelsSQL returns the SQL IN-list of labels that exempt an
@@ -409,9 +423,11 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	moleculeStepJoin := closedMoleculeStepJoin("closed_molecule_step")
 	moleculeStepExcludeJoin := closedMoleculeStepExcludeJoin("closed_molecule_step")
 
+	agentJoin, agentWhere := notAgentWispJoin("w")
+
 	moleculeStepQuery := fmt.Sprintf(
-		"SELECT COUNT(*) FROM wisps w %s WHERE %s AND %s",
-		moleculeStepJoin, openWispStatusWhere, notAgentWispPredicate("w"))
+		"SELECT COUNT(*) FROM wisps w %s %s WHERE %s AND %s",
+		moleculeStepJoin, agentJoin, openWispStatusWhere, agentWhere)
 	if err := db.QueryRowContext(ctx, moleculeStepQuery).Scan(&result.MoleculeStepCandidates); err != nil {
 		return nil, fmt.Errorf("count molecule step candidates: %w", err)
 	}
@@ -419,15 +435,12 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	// Count reap candidates: open wisps past max_age with eligible parent status.
 	// Must match Reap() eligibility semantics exactly, including the exclusion of
 	// agent beads, otherwise scan can report candidates that reap will never close.
-	// Uses LEFT JOIN anti-pattern instead of correlated EXISTS to avoid O(n*m) cost (gt-jd1z).
-	// notAgentWispPredicate's NOT EXISTS clauses are exempt from that ban: they key
-	// on wisp_labels/labels' PRIMARY KEY (issue_id, label), so Dolt's planner seeks a
-	// single row per candidate instead of the per-row table scan gt-jd1z/gt-wvd2 were
-	// about — a PK lookup, not the O(n*m) correlation this comment forbids.
+	// Uses LEFT JOIN anti-pattern instead of correlated EXISTS to avoid O(n*m) cost
+	// (gt-jd1z) — notAgentWispJoin follows the same pattern for the same reason.
 	// Closed-molecule steps are counted separately above and excluded here so counts stay disjoint.
 	reapQuery := fmt.Sprintf(
-		"SELECT COUNT(*) FROM wisps w %s %s WHERE %s AND w.created_at < ? AND %s AND %s AND closed_molecule_step.issue_id IS NULL",
-		parentJoin, moleculeStepExcludeJoin, openWispStatusWhere, notAgentWispPredicate("w"), parentWhere)
+		"SELECT COUNT(*) FROM wisps w %s %s %s WHERE %s AND w.created_at < ? AND %s AND %s AND closed_molecule_step.issue_id IS NULL",
+		parentJoin, moleculeStepExcludeJoin, agentJoin, openWispStatusWhere, agentWhere, parentWhere)
 	if err := db.QueryRowContext(ctx, reapQuery, now.Add(-maxAge)).Scan(&result.ReapCandidates); err != nil {
 		return nil, fmt.Errorf("count reap candidates: %w", err)
 	}
@@ -518,23 +531,25 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	parentJoin, parentWhere := parentExcludeJoin(dbName)
 	moleculeStepJoin := closedMoleculeStepJoin("closed_molecule_step")
 	moleculeStepExcludeJoin := closedMoleculeStepExcludeJoin("closed_molecule_step")
-	// Exclude agent beads (issue_type='agent') from reaping — they have persistent
-	// identity and should not be closed by the wisp reaper regardless of age.
-	// Closed-molecule steps are closed immediately through a separate path, so stale
-	// max-age counts exclude them to keep dry-run and scan counts disjoint.
+	agentJoin, agentWhere := notAgentWispJoin("w")
+	// Exclude agent beads (issue_type='agent' or gt:agent label) from reaping —
+	// they have persistent identity and should not be closed by the wisp reaper
+	// regardless of age. Closed-molecule steps are closed immediately through a
+	// separate path, so stale max-age counts exclude them to keep dry-run and
+	// scan counts disjoint.
 	whereClause := fmt.Sprintf(
-		"%s AND w.created_at < ? AND %s AND %s AND closed_molecule_step.issue_id IS NULL", openWispStatusWhere, notAgentWispPredicate("w"), parentWhere)
+		"%s AND w.created_at < ? AND %s AND %s AND closed_molecule_step.issue_id IS NULL", openWispStatusWhere, agentWhere, parentWhere)
 
 	result := &ReapResult{Database: dbName, DryRun: dryRun}
 
 	if dryRun {
 		moleculeStepCountQuery := fmt.Sprintf(
-			"SELECT COUNT(*) FROM wisps w %s WHERE %s AND %s",
-			moleculeStepJoin, openWispStatusWhere, notAgentWispPredicate("w"))
+			"SELECT COUNT(*) FROM wisps w %s %s WHERE %s AND %s",
+			moleculeStepJoin, agentJoin, openWispStatusWhere, agentWhere)
 		if err := db.QueryRowContext(ctx, moleculeStepCountQuery).Scan(&result.MoleculeStepsClosed); err != nil {
 			return nil, fmt.Errorf("dry-run molecule step count: %w", err)
 		}
-		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM wisps w %s %s WHERE %s", parentJoin, moleculeStepExcludeJoin, whereClause)
+		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM wisps w %s %s %s WHERE %s", parentJoin, moleculeStepExcludeJoin, agentJoin, whereClause)
 		if err := db.QueryRowContext(ctx, countQuery, cutoff).Scan(&result.Reaped); err != nil {
 			return nil, fmt.Errorf("dry-run count: %w", err)
 		}
@@ -563,8 +578,8 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	}()
 
 	moleculeStepIDQuery := fmt.Sprintf(
-		"SELECT w.id FROM wisps w %s WHERE %s AND %s LIMIT %d",
-		moleculeStepJoin, openWispStatusWhere, notAgentWispPredicate("w"), DefaultBatchSize)
+		"SELECT w.id FROM wisps w %s %s WHERE %s AND %s LIMIT %d",
+		moleculeStepJoin, agentJoin, openWispStatusWhere, agentWhere, DefaultBatchSize)
 	moleculeStepsClosed, err := closeWispsInBatches(ctx, conn, moleculeStepIDQuery, nil, "closed molecule steps")
 	if err != nil {
 		return nil, err
@@ -575,8 +590,8 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	// This avoids holding a write lock on the entire table for minutes.
 	// Uses LEFT JOIN anti-pattern instead of correlated EXISTS to avoid O(n*m) cost (gt-jd1z).
 	idQuery := fmt.Sprintf(
-		"SELECT w.id FROM wisps w %s %s WHERE %s LIMIT %d",
-		parentJoin, moleculeStepExcludeJoin, whereClause, DefaultBatchSize)
+		"SELECT w.id FROM wisps w %s %s %s WHERE %s LIMIT %d",
+		parentJoin, moleculeStepExcludeJoin, agentJoin, whereClause, DefaultBatchSize)
 
 	totalReaped, err := closeWispsInBatches(ctx, conn, idQuery, []interface{}{cutoff}, "stale wisps")
 	if err != nil {
@@ -650,9 +665,13 @@ func closeWispsInBatches(ctx context.Context, runner sqlRunner, idQuery string, 
 		}
 		inClause := strings.Join(placeholders, ",")
 
+		// Multi-table UPDATE with the same anti-join shape as the SELECT above —
+		// defense-in-depth on the one mutating statement, not just the ids feeding
+		// it (gt-7a7j review, thread on reaper_test.go:895).
+		agentJoin, agentWhere := notAgentWispJoin("")
 		updateQuery := fmt.Sprintf(
-			"UPDATE wisps SET status='closed', closed_at=NOW() WHERE id IN (%s) AND status IN ('open', 'hooked', 'in_progress') AND %s",
-			inClause, notAgentWispPredicate(""))
+			"UPDATE wisps %s SET wisps.status='closed', wisps.closed_at=NOW() WHERE wisps.id IN (%s) AND wisps.status IN ('open', 'hooked', 'in_progress') AND %s",
+			agentJoin, inClause, agentWhere)
 		sqlResult, err := runner.ExecContext(ctx, updateQuery, args...)
 		if err != nil {
 			return total, fmt.Errorf("close %s batch: %w", description, err)
@@ -701,9 +720,10 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	// guard only stops a wisp-backed agent bead from being closed in the first place —
 	// it does nothing once one is already closed, so without this the purge clock
 	// still runs out on it (gt-7a7j, gt-h8oq).
+	agentJoin, agentWhere := notAgentWispJoin("w")
 	digestQuery := fmt.Sprintf(
-		"SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND %s GROUP BY wtype",
-		notAgentWispPredicate("w"))
+		"SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s GROUP BY wtype",
+		agentJoin, agentWhere)
 	rows, err := db.QueryContext(ctx, digestQuery, deleteCutoff)
 	if err != nil {
 		return 0, nil, fmt.Errorf("digest query: %w", err)
@@ -738,8 +758,8 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	// Batch delete — simple status+age filter, no parent check needed for purge.
 	// Agent guard mirrors the digest query above (gt-7a7j, gt-h8oq).
 	idQuery := fmt.Sprintf(
-		"SELECT w.id FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? AND %s LIMIT %d",
-		notAgentWispPredicate("w"), DefaultBatchSize)
+		"SELECT w.id FROM wisps w %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s LIMIT %d",
+		agentJoin, agentWhere, DefaultBatchSize)
 	auxTables := []string{"wisp_labels", "wisp_comments", "wisp_events", "wisp_dependencies"}
 
 	totalDeleted, err := batchDeleteRows(ctx, db, idQuery, deleteCutoff, "wisps", auxTables)

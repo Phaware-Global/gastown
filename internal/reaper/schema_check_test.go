@@ -45,6 +45,7 @@ func TestHasReaperSchemaViaShowColumns(t *testing.T) {
 		"wisps":             {"ID", "Status", "closed_at"},
 		"issues":            {"id", "status"},
 		"wisp_dependencies": typedDepColumns,
+		"wisp_labels":       {"issue_id", "label"},
 		"dependencies":      typedDepColumns,
 	}
 	withoutTable := func(name string) map[string][]string {
@@ -70,6 +71,11 @@ func TestHasReaperSchemaViaShowColumns(t *testing.T) {
 		{name: "missing wisps table", tables: withoutTable("wisps"), want: false},
 		{name: "missing issues table", tables: withoutTable("issues"), want: false},
 		{name: "missing wisp_dependencies table", tables: withoutTable("wisp_dependencies"), want: false},
+		// wisp_labels is now a hard dependency of every Scan/Reap query via
+		// notAgentWispJoin — none of those queries tolerate a missing table the
+		// way the mail/stale counts do, so a database lacking it must be
+		// skipped as unmigrated rather than erroring on every query (gt-7a7j).
+		{name: "missing wisp_labels table", tables: withoutTable("wisp_labels"), want: false},
 		// The dependencies table is optional; absent means schema OK.
 		{name: "dependencies table optional", tables: withoutTable("dependencies"), want: true},
 		{
@@ -78,6 +84,7 @@ func TestHasReaperSchemaViaShowColumns(t *testing.T) {
 				"wisps":             {"id"},
 				"issues":            {"id"},
 				"wisp_dependencies": {"id", "depends_on_id"},
+				"wisp_labels":       {"issue_id", "label"},
 				"dependencies":      typedDepColumns,
 			},
 			want: false,
@@ -88,6 +95,7 @@ func TestHasReaperSchemaViaShowColumns(t *testing.T) {
 				"wisps":             {"id"},
 				"issues":            {"id"},
 				"wisp_dependencies": typedDepColumns,
+				"wisp_labels":       {"issue_id", "label"},
 				"dependencies":      {"id", "depends_on_id"},
 			},
 			want: false,
