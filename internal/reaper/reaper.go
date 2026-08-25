@@ -616,9 +616,7 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	// Batch UPDATE: select IDs in chunks, update each chunk.
 	// This avoids holding a write lock on the entire table for minutes.
 	// Uses LEFT JOIN anti-pattern instead of correlated EXISTS to avoid O(n*m) cost (gt-jd1z).
-	idQuery := fmt.Sprintf(
-		"SELECT w.id FROM wisps w %s %s %s WHERE %s LIMIT %d",
-		parentJoin, moleculeStepExcludeJoin, agentJoin, whereClause, DefaultBatchSize)
+	idQuery := reapBatchIDQuery(parentJoin, moleculeStepExcludeJoin, agentJoin, whereClause)
 
 	totalReaped, err := closeWispsInBatches(ctx, conn, idQuery, []interface{}{cutoff}, "stale wisps")
 	if err != nil {
@@ -714,6 +712,18 @@ func closeWispsUpdateQuery(inClause string) string {
 	return fmt.Sprintf(
 		"UPDATE wisps %s SET wisps.status='closed', wisps.closed_at=NOW() WHERE wisps.id IN (%s) AND wisps.status IN ('open', 'hooked', 'in_progress') AND %s",
 		agentJoin, inClause, agentWhere)
+}
+
+// reapBatchIDQuery returns Reap's batch SELECT of stale wisp ids. Factored
+// out so tests can assert on the query production code actually builds,
+// rather than a hand-copied literal that drifts silently when this
+// statement's shape changes (gt-7a7j review round 3, #201: the previous
+// inline literal never called Reap or this function, so it stayed green
+// through the addition of agentJoin/agentWhere).
+func reapBatchIDQuery(parentJoin, moleculeStepExcludeJoin, agentJoin, whereClause string) string {
+	return fmt.Sprintf(
+		"SELECT w.id FROM wisps w %s %s %s WHERE %s LIMIT %d",
+		parentJoin, moleculeStepExcludeJoin, agentJoin, whereClause, DefaultBatchSize)
 }
 
 // Purge deletes old closed wisps and mail from a database.

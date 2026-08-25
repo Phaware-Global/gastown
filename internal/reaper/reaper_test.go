@@ -182,32 +182,37 @@ func TestReaperQueriesUseTypedDependencyColumns(t *testing.T) {
 	}
 }
 
-// TestReapQueryNoDatabaseNameInjection verifies that the Reap function's batch
-// SELECT query does not inject the database name into the SQL string. Previously,
-// dbName was passed as a Sprintf arg but the format string didn't use it, causing
-// positional shift: "FROM wisps w gt WHERE..." instead of "FROM wisps w LEFT JOIN...".
+// TestReapQueryNoDatabaseNameInjection verifies that reapBatchIDQuery — the
+// production function Reap calls to build its batch SELECT — does not inject
+// the database name into the SQL string, has no interpolated value outside
+// the fixed join/where literals and the LIMIT, and carries the agent guard.
+// Calls the production function directly: a hand-copied literal here
+// previously stayed green through the addition of agentJoin/agentWhere to
+// Reap because it never called Reap or reapBatchIDQuery at all (gt-7a7j
+// review round 3, #201).
 func TestReapQueryNoDatabaseNameInjection(t *testing.T) {
-	// Reproduce the exact Sprintf call from Reap() to verify no dbName injection.
 	dbName := "gt"
 	parentJoin, parentWhere := parentExcludeJoin(dbName)
+	moleculeStepExcludeJoin := closedMoleculeStepExcludeJoin("closed_molecule_step")
+	agentJoin, agentWhere := notAgentWispJoin("w")
 	whereClause := fmt.Sprintf(
-		"w.status IN ('open', 'hooked', 'in_progress') AND w.created_at < ? AND %s", parentWhere)
+		"%s AND w.created_at < ? AND %s AND %s AND closed_molecule_step.issue_id IS NULL", openWispStatusWhere, agentWhere, parentWhere)
 
-	// This is the fixed query — dbName is NOT in the Sprintf args.
-	idQuery := fmt.Sprintf(
-		"SELECT w.id FROM wisps w %s WHERE %s LIMIT %d",
-		parentJoin, whereClause, DefaultBatchSize)
+	idQuery := reapBatchIDQuery(parentJoin, moleculeStepExcludeJoin, agentJoin, whereClause)
 
-	// The query must NOT contain the literal database name as a bare token.
-	// Before the fix, "gt" appeared between "wisps w" and "WHERE".
-	if strings.Contains(idQuery, "wisps w gt") {
-		t.Errorf("Reap idQuery contains injected database name: %s", idQuery)
+	// See TestReapUpdateQueryNoDatabaseNameInjection: "gt:agent" itself
+	// contains "gt", so strip it before checking for an injected dbName.
+	if strings.Contains(strings.ReplaceAll(idQuery, "gt:agent", ""), dbName) {
+		t.Errorf("Reap idQuery contains injected database name %q: %s", dbName, idQuery)
 	}
 	if !strings.Contains(idQuery, "LEFT JOIN") {
 		t.Errorf("Reap idQuery should contain LEFT JOIN from parentExcludeJoin, got: %s", idQuery)
 	}
 	if !strings.Contains(idQuery, fmt.Sprintf("LIMIT %d", DefaultBatchSize)) {
 		t.Errorf("Reap idQuery should end with LIMIT %d, got: %s", DefaultBatchSize, idQuery)
+	}
+	if err := validateWAliasedAgentGuard(idQuery); err != nil {
+		t.Errorf("Reap idQuery missing agent guard: %v", err)
 	}
 }
 
