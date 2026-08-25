@@ -499,24 +499,64 @@ func TestScanAutoCloseStaleExemptionsAgree(t *testing.T) {
 // exactly the state Reap's guard prevents new ones from reaching, but which
 // pre-fix code produced before this bead's fix landed — gets hard-deleted
 // (wisp_labels included) at purgeAge with no guard at all (gt-7a7j, gt-h8oq).
+// TestPurgeClosedWispsExcludesAgentBeads asserts purgeClosedWisps' actual
+// behaviour, not its source text. A prior version of this test sliced
+// reaper.go between "func purgeClosedWisps(" and "func purgeOldMail(" and
+// grepped for notAgentWispJoin — but purgeDigestQuery and purgeBatchIDQuery
+// (which purgeClosedWisps calls, and which are where the guard actually
+// lives) are defined in exactly that byte range. The slice matched the
+// helpers' own definitions regardless of whether purgeClosedWisps' call
+// site still used them, so it would stay green even if the guard were
+// dropped from the call site entirely — the same "reads correct, does not
+// run" failure mode this whole bead exists to fix, one level up (gt-7a7j
+// review round 3, #201). This drives the real function end-to-end through
+// the fake driver instead.
 func TestPurgeClosedWispsExcludesAgentBeads(t *testing.T) {
-	sourcePath := "reaper.go"
-	data, err := os.ReadFile(sourcePath)
+	now := time.Now().UTC()
+	oldEnough := now.Add(-10 * 24 * time.Hour)
+	tooRecent := now.Add(-1 * time.Hour)
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			// Ordinary closed wisp past the purge cutoff: must be purged.
+			"closed-normal": {id: "closed-normal", status: "closed", issueType: "task", wispType: "task", closedAt: oldEnough},
+			// Wisp-backed agent identity bead shaped the way CreateAgentBead
+			// actually creates one — gt:agent in the labels table only,
+			// nothing in wisp_labels. This is the HIGH-severity shape this
+			// PR exists to protect; it must survive purge even though it is
+			// closed and past the age cutoff (gt-7a7j, gt-h8oq).
+			"closed-agent-label": {id: "closed-agent-label", status: "closed", issueType: "task", wispType: "task", closedAt: oldEnough, issueLabels: []string{"gt:agent"}},
+			// Same protection via the legacy/repaired wisp_labels form.
+			"closed-agent-wisplabel": {id: "closed-agent-wisplabel", status: "closed", issueType: "task", wispType: "task", closedAt: oldEnough, labels: []string{"gt:agent"}},
+			// Closed but not yet past purgeAge: must survive too, but for
+			// an unrelated reason (age, not the agent guard).
+			"closed-recent": {id: "closed-recent", status: "closed", issueType: "task", wispType: "task", closedAt: tooRecent},
+			// Still open: purge never considers it regardless of status.
+			"open-normal": {id: "open-normal", status: "open", issueType: "task", wispType: "task"},
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	purged, anomalies, err := purgeClosedWisps(db, "testdb", 7*24*time.Hour, false)
 	if err != nil {
-		t.Fatalf("read %s: %v", sourcePath, err)
+		t.Fatalf("purgeClosedWisps: %v", err)
 	}
-	source := string(data)
-	start := strings.Index(source, "func purgeClosedWisps(")
-	end := strings.Index(source, "func purgeOldMail(")
-	if start == -1 || end == -1 || end <= start {
-		t.Fatalf("could not isolate purgeClosedWisps() body in %s", sourcePath)
+	if len(anomalies) != 0 {
+		t.Fatalf("purgeClosedWisps anomalies = %v, want none", anomalies)
 	}
-	body := source[start:end]
-	if !strings.Contains(body, `notAgentWispJoin("w")`) {
-		t.Fatalf("expected purgeClosedWisps() to use notAgentWispJoin(\"w\"), body was:\n%s", body)
+	if purged != 1 {
+		t.Fatalf("purgeClosedWisps purged = %d, want 1", purged)
 	}
-	if strings.Count(body, "agentJoin") < 2 || strings.Count(body, "agentWhere") < 2 {
-		t.Fatalf("expected purgeClosedWisps() to apply the agent join/where to both digestQuery and idQuery, body was:\n%s", body)
+
+	remaining := state.statuses()
+	if _, ok := remaining["closed-normal"]; ok {
+		t.Error("closed-normal should have been purged")
+	}
+	for _, id := range []string{"closed-agent-label", "closed-agent-wisplabel", "closed-recent", "open-normal"} {
+		if _, ok := remaining[id]; !ok {
+			t.Errorf("%s should have survived purge, but was deleted", id)
+		}
 	}
 }
 
@@ -953,6 +993,25 @@ func (c *fakeReaperConn) ExecContext(_ context.Context, query string, args []dri
 		return fakeReaperResult(affected), nil
 	case normalized == "SET @@autocommit = 0" || normalized == "SET @@autocommit = 1" || normalized == "ROLLBACK" || normalized == "COMMIT" || strings.HasPrefix(normalized, "CALL DOLT_COMMIT"):
 		return fakeReaperResult(0), nil
+	case strings.HasPrefix(normalized, "DELETE FROM"):
+		// batchDeleteRows issues a DELETE per aux table (wisp_labels,
+		// wisp_comments, wisp_events, wisp_dependencies), two reverse-
+		// dependency cleanups, and finally the primary `wisps` delete. Only
+		// the primary delete needs to actually mutate state for the purge
+		// behavioural test (gt-7a7j review round 3, #201); the rest are
+		// no-ops here the same way they'd be non-fatal-and-ignored in
+		// production for a fixture with no aux rows.
+		affected := int64(0)
+		if strings.Contains(normalized, "`wisps`") {
+			for _, arg := range args {
+				id, _ := arg.Value.(string)
+				if _, ok := c.state.wisps[id]; ok {
+					delete(c.state.wisps, id)
+					affected++
+				}
+			}
+		}
+		return fakeReaperResult(affected), nil
 	default:
 		return nil, fmt.Errorf("unexpected exec: %s", normalized)
 	}
@@ -984,6 +1043,37 @@ func fakeIDRows(ids []string) *fakeReaperRows {
 		rows[i] = []driver.Value{id}
 	}
 	return &fakeReaperRows{cols: []string{"id"}, rows: rows}
+}
+
+func purgeCandidateIDs(wisps []*fakeWisp) []string {
+	ids := make([]string, len(wisps))
+	for i, w := range wisps {
+		ids[i] = w.id
+	}
+	return ids
+}
+
+// fakeDigestRows mirrors purgeDigestQuery's "COALESCE(w.wisp_type, 'unknown')
+// ... GROUP BY wtype" shape.
+func fakeDigestRows(wisps []*fakeWisp) *fakeReaperRows {
+	counts := map[string]int{}
+	for _, w := range wisps {
+		wtype := w.wispType
+		if wtype == "" {
+			wtype = "unknown"
+		}
+		counts[wtype]++
+	}
+	var types []string
+	for wtype := range counts {
+		types = append(types, wtype)
+	}
+	sort.Strings(types)
+	rows := make([][]driver.Value, len(types))
+	for i, wtype := range types {
+		rows[i] = []driver.Value{wtype, int64(counts[wtype])}
+	}
+	return &fakeReaperRows{cols: []string{"wtype", "cnt"}, rows: rows}
 }
 
 func (r *fakeReaperRows) Columns() []string { return r.cols }
