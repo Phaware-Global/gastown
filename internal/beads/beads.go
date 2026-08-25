@@ -277,7 +277,7 @@ func IsRefineryWorkflowBead(issue *Issue) bool {
 // caller that trusts it without pre-filtering should get the right answer.
 // The legacy issue_type=="agent" marker is checked too, via IsAgentBead,
 // since that marker protects a bead from the reaper the same way the label
-// does (see notAgentWispPredicate) and this function's own doc claims to
+// does (see notAgentWispJoin) and this function's own doc claims to
 // mirror that exclusion set completely.
 func IsProtectedBead(issue *Issue) bool {
 	if issue == nil {

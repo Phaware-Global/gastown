@@ -61,7 +61,7 @@ func TestFormatJSON(t *testing.T) {
 }
 
 // TestHasReaperSchemaRequiresWispLabels guards against the gap flagged in
-// review on PR #200: notAgentWispPredicate made wisp_labels a hard
+// review on PR #200: notAgentWispJoin made wisp_labels a hard
 // dependency of every Scan/Reap query (none of them tolerate a missing
 // table the way the mail/stale counts do), but HasReaperSchema — the gate
 // callers use to decide whether to run Scan/Reap at all on a database —
@@ -670,7 +670,7 @@ type fakeWisp struct {
 	issueLabels []string
 }
 
-// isAgentWisp reports whether w is excluded by notAgentWispPredicate: the
+// isAgentWisp reports whether w is excluded by notAgentWispJoin: the
 // legacy issue_type='agent' marker, the gt:agent label in wisp_labels, or
 // the gt:agent label in the separate labels table. Mirrors the real
 // predicate so the fake driver's simulated eligibility matches what the
