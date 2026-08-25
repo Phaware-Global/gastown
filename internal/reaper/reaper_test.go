@@ -912,6 +912,16 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 			return nil, err
 		}
 		return fakeIDRows(c.state.moleculeStepCandidatesLocked()), nil
+	case strings.Contains(normalized, "SELECT COALESCE(w.wisp_type") && strings.Contains(normalized, "GROUP BY wtype"):
+		if err := validateWAliasedAgentGuard(normalized); err != nil {
+			return nil, err
+		}
+		return fakeDigestRows(c.state.purgeCandidatesLocked(namedTime(args))), nil
+	case strings.Contains(normalized, "SELECT w.id FROM wisps w") && strings.Contains(normalized, "w.status = 'closed'"):
+		if err := validateWAliasedAgentGuard(normalized); err != nil {
+			return nil, err
+		}
+		return fakeIDRows(purgeCandidateIDs(c.state.purgeCandidatesLocked(namedTime(args)))), nil
 	default:
 		return nil, fmt.Errorf("unexpected query: %s", normalized)
 	}
