@@ -281,7 +281,7 @@ exit 0
 	stores := map[string]beadsdk.Storage{"hq": store}
 	m := NewConvoyManager(townRoot, logger, gtPath, 1*time.Hour, stores, nil, nil)
 	// Skip seeding so pollStoresSnapshot processes events immediately.
-	m.seeded.Store(true)
+	seedAllStores(m)
 	// Drive one poll manually instead of waiting for the 5s ticker.
 	m.pollStoresSnapshot(stores)
 
@@ -396,7 +396,7 @@ exit 0
 	stores := map[string]beadsdk.Storage{"hq": store}
 	m := NewConvoyManager(townRoot, logger, gtPath, 1*time.Hour, stores, nil, nil)
 	// Skip seeding so pollStoresSnapshot processes events immediately.
-	m.seeded.Store(true)
+	seedAllStores(m)
 	m.pollStoresSnapshot(stores)
 
 	mu.Lock()
@@ -511,7 +511,7 @@ exit 0
 	stores := map[string]beadsdk.Storage{"hq": store}
 	m := NewConvoyManager(townRoot, logger, gtPath, 1*time.Hour, stores, nil, nil)
 	// Skip seeding so pollStoresSnapshot processes events immediately.
-	m.seeded.Store(true)
+	seedAllStores(m)
 	m.pollStoresSnapshot(stores)
 
 	mu.Lock()
@@ -637,7 +637,7 @@ exit 0
 	stores := map[string]beadsdk.Storage{"hq": store}
 	m := NewConvoyManager(townRoot, logger, gtPath, 1*time.Hour, stores, nil, parked)
 	// Skip seeding so pollStoresSnapshot processes events immediately.
-	m.seeded.Store(true)
+	seedAllStores(m)
 	m.pollStoresSnapshot(stores)
 
 	mu.Lock()
