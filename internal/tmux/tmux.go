@@ -1649,7 +1649,7 @@ func (t *Tmux) InputBoxCleared(session string) bool {
 // the strand/no-strand judgement is testable without a live tmux server.
 //
 // It is deliberately biased toward "cleared": a capture error or an
-// unrecognisable pane means we cannot see a strand, and inventing one would make
+// unrecognizable pane means we cannot see a strand, and inventing one would make
 // callers re-nudge an agent that is working fine.
 func inputBoxClearedFrom(lines []string, promptPrefix string, captureErr error) bool {
 	if captureErr != nil {
