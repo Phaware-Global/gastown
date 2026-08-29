@@ -100,28 +100,37 @@ func (m *TelegraphServerManager) resolvedLogFile() string {
 
 // isRunning checks if the supervised Telegraph process is alive.
 // Must be called with m.mu held.
+//
+// It always re-derives liveness from the nonce-protected PID file rather than
+// trusting a cached m.process handle: a handle only encodes a PID number, so
+// once the process it originally pointed at exits, that PID can be reused by
+// an unrelated process (or, on some platforms, briefly linger as a zombie)
+// and a raw liveness signal against the stale handle would then report a
+// dead Telegraph as alive forever, since nothing ever routes back through
+// PID-file re-validation. This matters most for an *adopted* process (one
+// discovered via the PID file rather than started by this manager instance),
+// since there both the initial and every subsequent check rely solely on the
+// cached handle.
 func (m *TelegraphServerManager) isRunning() (int, bool) {
 	if m.runningFn != nil {
 		return m.runningFn()
-	}
-	if m.process != nil {
-		if isProcessAlive(m.process) {
-			return m.process.Pid, true
-		}
-		m.process = nil
 	}
 	pid, alive, err := verifyPIDOwnership(m.pidFile())
 	if err != nil || pid == 0 || !alive {
 		if pid > 0 {
 			_ = os.Remove(m.pidFile())
 		}
+		m.process = nil
 		return 0, false
 	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return 0, false
+	if m.process == nil || m.process.Pid != pid {
+		process, err := os.FindProcess(pid)
+		if err != nil {
+			m.process = nil
+			return 0, false
+		}
+		m.process = process
 	}
-	m.process = process
 	return pid, true
 }
 
