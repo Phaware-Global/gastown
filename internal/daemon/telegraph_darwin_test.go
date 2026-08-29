@@ -5,6 +5,7 @@ package daemon
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -77,6 +78,9 @@ func TestEnsureRunning_RestartsAdoptedZombie(t *testing.T) {
 	m := newTestTelegraphManager(t, cfg)
 
 	pid := spawnZombie(t)
+	if err := os.MkdirAll(filepath.Dir(m.pidFile()), 0755); err != nil {
+		t.Fatalf("mkdir pid dir: %v", err)
+	}
 	if _, err := writePIDFile(m.pidFile(), pid); err != nil {
 		t.Fatalf("writePIDFile: %v", err)
 	}
