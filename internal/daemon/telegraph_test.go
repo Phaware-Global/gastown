@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -265,6 +266,56 @@ func TestTelegraph_StopIsIdempotent(t *testing.T) {
 	// stopFn is called for each Stop() invocation (stopLocked delegates to stopFn unconditionally).
 	if got := atomic.LoadInt32(&stopped); got != 2 {
 		t.Errorf("Stop() called twice: stopFn invocations = %d, want 2", got)
+	}
+}
+
+// TestTelegraph_StaleProcessHandleDoesNotMaskDeath is a regression test for a
+// silent-outage bug: isRunning() used to trust a cached m.process handle's raw
+// liveness signal without re-validating it against the nonce-protected PID
+// file. In production, a Telegraph process adopted via PID file (not started
+// by this manager instance) died mid-run, but the health check kept believing
+// it was alive indefinitely — an 8+ minute silent webhook-ingress outage until
+// a manual daemon restart. This exercises the real (non-mocked) isRunning()
+// path: a stale handle pointing at a live, unrelated process (simulating PID
+// reuse / a lingering zombie) must not mask a PID-file-recorded death.
+func TestTelegraph_StaleProcessHandleDoesNotMaskDeath(t *testing.T) {
+	cfg := &TelegraphServerConfig{
+		Enabled:             true,
+		AutoRestart:         true,
+		RestartDelay:        0,
+		MaxRestartsInWindow: 5,
+		RestartWindow:       time.Minute,
+	}
+	m := newTestTelegraphManager(t, cfg)
+
+	if err := os.MkdirAll(filepath.Dir(m.pidFile()), 0755); err != nil {
+		t.Fatalf("failed to create pid dir: %v", err)
+	}
+
+	// The PID file records a Telegraph process that has already exited.
+	deadCmd := exec.Command("true")
+	if err := deadCmd.Run(); err != nil {
+		t.Fatalf("failed to run helper process: %v", err)
+	}
+	if _, err := writePIDFile(m.pidFile(), deadCmd.Process.Pid); err != nil {
+		t.Fatalf("failed to write pid file: %v", err)
+	}
+
+	// A stale cached handle left over from adoption points at a *different*,
+	// still-alive process (the test process itself) — modeling PID reuse
+	// after the real Telegraph died.
+	m.process = &os.Process{Pid: os.Getpid()}
+
+	var starts int32
+	m.startFn = func() error {
+		atomic.AddInt32(&starts, 1)
+		return nil
+	}
+
+	m.EnsureRunning()
+
+	if got := atomic.LoadInt32(&starts); got != 1 {
+		t.Fatalf("expected EnsureRunning to restart Telegraph after the PID-file-recorded process died, got %d starts", got)
 	}
 }
 
