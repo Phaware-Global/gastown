@@ -1993,27 +1993,43 @@ func (m *Manager) ReconcilePoolWith(namesWithDirs, namesWithSessions []string) {
 
 // isSessionProcessDead checks if a polecat session's agent has exited.
 //
-// Uses heartbeat-based liveness detection (gt-qjtq): checks whether the session's
-// heartbeat file has been updated recently. Polecat sessions touch their heartbeat
-// via gt commands (gt prime, gt hook, bd show, etc.) which run frequently during
-// normal operation. A stale heartbeat indicates the agent is no longer active.
+// Uses heartbeat-based liveness detection (gt-qjtq) as a fast path, backed by
+// PID signal probing.
 //
-// Falls back to PID signal probing when no heartbeat file exists (backward
-// compatibility for sessions started before heartbeat support was added).
+// A FRESH heartbeat is positive proof of life and short-circuits the PID probe.
+// A STALE heartbeat is NOT proof of death. Heartbeats are only written when a gt
+// command runs inside the session (see internal/cmd/root.go), so an agent that
+// spends longer than SessionHeartbeatStaleThreshold reasoning or editing files —
+// routine on a loaded box, where a single turn can run many minutes — goes stale
+// while perfectly healthy.
+//
+// Treating a stale heartbeat as death made `gt polecat list` report actively
+// working polecats as "stalled" with verdict NEEDS_RECOVERY, which drove the
+// witness to reap them mid-task and reassign their bead. The observed effect was
+// a bead churning through assignees with a shutdown each time and no commits
+// landing, and it got worse under load — exactly when turns are slowest and the
+// heartbeat most likely to lapse (gt-azm0).
 //
 // Returns true only when we can confirm the process is dead, not on transient
-// failures (gt-kncti: permission denied false positives).
+// failures (gt-kncti: permission denied false positives) and not merely because
+// the agent has been busy without shelling out to gt.
 func isSessionProcessDead(t *tmux.Tmux, sessionName string, townRoot string) bool {
-	// Primary: heartbeat-based liveness check (gt-qjtq ZFC fix).
+	// Fast path: a fresh heartbeat proves liveness without probing the process.
+	// A stale or absent heartbeat falls through to PID probing, which is the
+	// only signal that can actually distinguish "busy" from "dead".
 	if townRoot != "" {
-		stale, exists := IsSessionHeartbeatStale(townRoot, sessionName)
-		if exists {
-			return stale
+		if stale, exists := IsSessionHeartbeatStale(townRoot, sessionName); exists && !stale {
+			return false
 		}
-		// No heartbeat file — fall through to PID-based check for backward compatibility.
 	}
 
-	// Fallback: PID signal probing (legacy, for sessions without heartbeat support).
+	// Without a tmux handle there is no way to probe the process, and an
+	// unprobeable session must not be reported dead (gt-kncti contract).
+	if t == nil {
+		return false
+	}
+
+	// PID signal probing: the authoritative liveness signal.
 	pidStr, err := t.GetPanePID(sessionName)
 	if err != nil {
 		// Tmux query failed — could be permission denied, server busy, etc.

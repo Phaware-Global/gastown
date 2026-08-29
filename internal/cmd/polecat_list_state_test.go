@@ -40,6 +40,39 @@ func TestEffectivePolecatState(t *testing.T) {
 		want polecat.State
 	}{
 		{
+			// gt-azm0 regression: a live session holding an active issue is
+			// working, even if an earlier derivation concluded "stalled" from a
+			// lapsed heartbeat. Without this the polecat stayed stalled forever,
+			// was reported NEEDS_RECOVERY, and got reaped mid-task.
+			name: "session-running-stalled-with-issue-becomes-working",
+			item: PolecatListItem{
+				State:          polecat.StateStalled,
+				Issue:          "gt-azm0",
+				SessionRunning: true,
+			},
+			want: polecat.StateWorking,
+		},
+		{
+			// A stalled polecat with no live session stays stalled — the fix
+			// must not paper over genuinely dead sessions.
+			name: "session-dead-stalled-with-issue-stays-stalled",
+			item: PolecatListItem{
+				State:          polecat.StateStalled,
+				Issue:          "gt-azm0",
+				SessionRunning: false,
+			},
+			want: polecat.StateStalled,
+		},
+		{
+			// Liveness alone is not work: no issue means no rewrite.
+			name: "session-running-stalled-without-issue-stays-stalled",
+			item: PolecatListItem{
+				State:          polecat.StateStalled,
+				SessionRunning: true,
+			},
+			want: polecat.StateStalled,
+		},
+		{
 			name: "session-running-done-with-issue-becomes-working",
 			item: PolecatListItem{
 				State:          polecat.StateDone,

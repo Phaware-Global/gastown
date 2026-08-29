@@ -412,7 +412,15 @@ func effectivePolecatState(item PolecatListItem) polecat.State {
 	state := item.State
 	// A running session only implies working when there is active work attached.
 	// Without an issue, rewriting idle/done to working recreates "Issue: (none)".
-	if item.SessionRunning && item.Issue != "" && (state == polecat.StateDone || state == polecat.StateIdle) {
+	//
+	// StateStalled is included deliberately: stalled is derived upstream partly
+	// from heartbeat freshness, which lapses whenever an agent spends a while
+	// reasoning or editing instead of shelling out to gt. A live session holding
+	// an active issue is working, whatever an earlier derivation concluded, and
+	// without this a polecat that once went stalled stayed stalled forever —
+	// reported NEEDS_RECOVERY and reaped mid-task (gt-azm0).
+	if item.SessionRunning && item.Issue != "" &&
+		(state == polecat.StateDone || state == polecat.StateIdle || state == polecat.StateStalled) {
 		return polecat.StateWorking
 	}
 	// When session is dead but beads still says "working", mark as stalled

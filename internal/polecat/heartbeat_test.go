@@ -199,9 +199,45 @@ func TestIsSessionProcessDead_HeartbeatStale(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A stale heartbeat is NOT proof of death (gt-azm0). Heartbeats are only
+	// written when a gt command runs inside the session, so an agent that spends
+	// longer than the threshold reasoning or editing goes stale while healthy.
+	// Staleness must fall through to process probing rather than short-circuit,
+	// and with no tmux handle to probe with we cannot confirm death.
 	dead := isSessionProcessDead(nil, sessionName, townRoot)
-	if !dead {
-		t.Error("expected dead=true for session with stale heartbeat")
+	if dead {
+		t.Error("stale heartbeat alone must not report dead: it falls through to PID probing")
+	}
+}
+
+// TestIsSessionProcessDead_StaleHeartbeatLiveProcess is the gt-azm0 regression.
+//
+// A polecat mid-turn — reasoning or editing files rather than shelling out to gt —
+// lets its heartbeat lapse past SessionHeartbeatStaleThreshold while its process is
+// very much alive. Before the fix, the stale heartbeat short-circuited and reported
+// the session dead, so `gt polecat list` showed the polecat as stalled/NEEDS_RECOVERY
+// and the witness reaped it mid-task and reassigned its bead.
+func TestIsSessionProcessDead_StaleHeartbeatLiveProcess(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-test-hb-stale-but-live"
+
+	dir := filepath.Join(townRoot, ".runtime", "heartbeats")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Comfortably past SessionHeartbeatStaleThreshold, as a long turn produces.
+	oldTime := time.Now().Add(-20 * time.Minute).UTC()
+	data := []byte(`{"timestamp":"` + oldTime.Format(time.RFC3339Nano) + `","state":"working"}`)
+	if err := os.WriteFile(filepath.Join(dir, sessionName+".json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if stale, exists := IsSessionHeartbeatStale(townRoot, sessionName); !exists || !stale {
+		t.Fatalf("test setup: want an existing stale heartbeat, got exists=%v stale=%v", exists, stale)
+	}
+
+	if isSessionProcessDead(nil, sessionName, townRoot) {
+		t.Error("session with a stale heartbeat but no confirmed-dead process must not be reported dead")
 	}
 }
 
