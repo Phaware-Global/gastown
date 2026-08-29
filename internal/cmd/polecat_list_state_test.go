@@ -44,13 +44,29 @@ func TestEffectivePolecatState(t *testing.T) {
 			// working, even if an earlier derivation concluded "stalled" from a
 			// lapsed heartbeat. Without this the polecat stayed stalled forever,
 			// was reported NEEDS_RECOVERY, and got reaped mid-task.
-			name: "session-running-stalled-with-issue-becomes-working",
+			name: "session-running-stalled-with-fresh-heartbeat-becomes-working",
 			item: PolecatListItem{
 				State:          polecat.StateStalled,
 				Issue:          "gt-azm0",
 				SessionRunning: true,
+				HeartbeatFresh: true,
 			},
 			want: polecat.StateWorking,
+		},
+		{
+			// A wedged agent must still surface for recovery. SessionRunning is
+			// true for any surviving process (IsRunning passes maxInactivity=0,
+			// so AgentHung never fires), so liveness alone must NOT clear the
+			// stall — otherwise a deadlocked polecat reports Verdict=WORKING and
+			// holds its bead and capacity slot forever.
+			name: "session-running-stalled-without-fresh-heartbeat-stays-stalled",
+			item: PolecatListItem{
+				State:          polecat.StateStalled,
+				Issue:          "gt-azm0",
+				SessionRunning: true,
+				HeartbeatFresh: false,
+			},
+			want: polecat.StateStalled,
 		},
 		{
 			// A stalled polecat with no live session stays stalled — the fix
@@ -69,6 +85,7 @@ func TestEffectivePolecatState(t *testing.T) {
 			item: PolecatListItem{
 				State:          polecat.StateStalled,
 				SessionRunning: true,
+				HeartbeatFresh: true,
 			},
 			want: polecat.StateStalled,
 		},

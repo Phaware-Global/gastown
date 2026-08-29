@@ -400,8 +400,12 @@ type PolecatListItem struct {
 	CountsTowardCapacity bool          `json:"counts_toward_capacity"`
 	ReuseStatus          string        `json:"reuse_status,omitempty"`
 	SessionRunning       bool          `json:"session_running"`
-	Zombie               bool          `json:"zombie,omitempty"`
-	SessionName          string        `json:"session_name,omitempty"`
+	// HeartbeatFresh reports that the session wrote a heartbeat within
+	// SessionHeartbeatStaleThreshold — evidence of actual progress, as opposed
+	// to SessionRunning which only says a process exists.
+	HeartbeatFresh bool   `json:"heartbeat_fresh"`
+	Zombie         bool   `json:"zombie,omitempty"`
+	SessionName    string `json:"session_name,omitempty"`
 }
 
 // effectivePolecatState returns the observable state used by polecat list output.
@@ -413,14 +417,22 @@ func effectivePolecatState(item PolecatListItem) polecat.State {
 	// A running session only implies working when there is active work attached.
 	// Without an issue, rewriting idle/done to working recreates "Issue: (none)".
 	//
-	// StateStalled is included deliberately: stalled is derived upstream partly
-	// from heartbeat freshness, which lapses whenever an agent spends a while
-	// reasoning or editing instead of shelling out to gt. A live session holding
-	// an active issue is working, whatever an earlier derivation concluded, and
-	// without this a polecat that once went stalled stayed stalled forever —
-	// reported NEEDS_RECOVERY and reaped mid-task (gt-azm0).
 	if item.SessionRunning && item.Issue != "" &&
-		(state == polecat.StateDone || state == polecat.StateIdle || state == polecat.StateStalled) {
+		(state == polecat.StateDone || state == polecat.StateIdle) {
+		return polecat.StateWorking
+	}
+	// StateStalled needs evidence of PROGRESS, not just a live process, before
+	// it is rewritten to working. SessionRunning comes from IsRunning ->
+	// CheckSessionHealth(session, 0); passing maxInactivity=0 skips the
+	// AgentHung branch, so it is true for any surviving agent process — wedged
+	// or not. Rewriting on liveness alone would let a deadlocked polecat report
+	// Verdict=WORKING and NeedsRecovery=false while holding its hooked bead and
+	// capacity slot indefinitely.
+	//
+	// A fresh heartbeat is that evidence: the agent ran a gt command recently.
+	// Its absence is what legitimately marks a wedged agent for recovery, while
+	// its presence clears the gt-azm0 false-stall.
+	if item.SessionRunning && item.HeartbeatFresh && item.Issue != "" && state == polecat.StateStalled {
 		return polecat.StateWorking
 	}
 	// When session is dead but beads still says "working", mark as stalled
@@ -508,6 +520,14 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 		knownNames := make(map[string]bool)
 		for _, p := range polecats {
 			running, _ := polecatMgr.IsRunning(p.Name)
+			// Heartbeat freshness distinguishes a working agent from a wedged
+			// one: SessionRunning only proves a process exists (gt-azm0 review).
+			hbFresh := false
+			if rigTownRoot := filepath.Dir(r.Path); rigTownRoot != "" {
+				if stale, exists := polecat.IsSessionHeartbeatStale(rigTownRoot, polecatMgr.SessionName(p.Name)); exists && !stale {
+					hbFresh = true
+				}
+			}
 			cleanupStatus := ""
 			activeMR := ""
 			agentBeadID := polecatBeadIDForRig(r, r.Name, p.Name)
@@ -519,6 +539,7 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 				State:          p.State,
 				Issue:          p.Issue,
 				SessionRunning: running,
+				HeartbeatFresh: hbFresh,
 			})
 			disposition := mgr.WorkstateDispositionForPolecat(p.Name, state, p.Issue)
 			allPolecats = append(allPolecats, PolecatListItem{
@@ -539,6 +560,7 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 				CountsTowardCapacity: disposition.CountsTowardCapacity,
 				ReuseStatus:          disposition.ReuseStatus,
 				SessionRunning:       running,
+				HeartbeatFresh:       hbFresh,
 			})
 			knownNames[p.Name] = true
 		}

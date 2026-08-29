@@ -2013,6 +2013,16 @@ func (m *Manager) ReconcilePoolWith(namesWithDirs, namesWithSessions []string) {
 // Returns true only when we can confirm the process is dead, not on transient
 // failures (gt-kncti: permission denied false positives) and not merely because
 // the agent has been busy without shelling out to gt.
+// sessionAgentAlive reports whether the agent process inside sessionName is
+// alive, probing the process tree rather than the pane's root process.
+//
+// It is a package-level var so tests can exercise the stale-heartbeat
+// fall-through — the branch the whole safety argument rests on — without a live
+// tmux server.
+var sessionAgentAlive = func(t *tmux.Tmux, sessionName string) bool {
+	return t.IsAgentAlive(sessionName)
+}
+
 func isSessionProcessDead(t *tmux.Tmux, sessionName string, townRoot string) bool {
 	// Fast path: a fresh heartbeat proves liveness without probing the process.
 	// A stale or absent heartbeat falls through to PID probing, which is the
@@ -2023,13 +2033,30 @@ func isSessionProcessDead(t *tmux.Tmux, sessionName string, townRoot string) boo
 		}
 	}
 
-	// Without a tmux handle there is no way to probe the process, and an
-	// unprobeable session must not be reported dead (gt-kncti contract).
+	// Without a tmux handle there is no way to probe, and an unprobeable
+	// session must not be reported dead (gt-kncti contract).
 	if t == nil {
 		return false
 	}
 
-	// PID signal probing: the authoritative liveness signal.
+	// Probe the AGENT, not the pane. GetPanePID returns the pane's ROOT process,
+	// which is often a shell or exec-wrapper that outlives the agent — see
+	// session_manager.go ("heartbeat-fresh + pane-PID alive can hide a dead
+	// agent", hq-k1ot / np-tt5s). Relying on pane-PID liveness alone would make
+	// this fail open: an agent that crashed under a surviving wrapper pane would
+	// report alive forever, and the stale-session reap in ReconcilePoolWith
+	// (gt-jn40ft) could never fire.
+	//
+	// IsAgentAlive walks the process tree for the runtime itself — the same
+	// signal CheckSessionHealth level 2 and the witness's zombie detection
+	// already use for exactly this case. A busy agent's process is alive, so the
+	// gt-azm0 fix holds; a dead agent behind a live wrapper is still caught.
+	if !sessionAgentAlive(t, sessionName) {
+		return true
+	}
+
+	// Pane-PID probing as a final confirmation for sessions where agent-tree
+	// detection is unavailable.
 	pidStr, err := t.GetPanePID(sessionName)
 	if err != nil {
 		// Tmux query failed — could be permission denied, server busy, etc.
