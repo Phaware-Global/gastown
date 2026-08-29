@@ -578,6 +578,10 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) (retErr
 		return fmt.Errorf("startup blocked: %w", err)
 	}
 
+	// Set when the startup nudge stranded and its text was cleared, so the verify
+	// pass below re-delivers instead of trusting the now-empty input box.
+	startupNudgeStranded := false
+
 	// Handle fallback nudges for non-hook agents.
 	// See StartupFallbackInfo in runtime package for the fallback matrix.
 	if fallbackInfo.SendBeaconNudge {
@@ -597,15 +601,26 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) (retErr
 		if fallbackInfo.SendStartupNudge {
 			// Send work instructions via nudge.
 			//
-			// ClearOnStrand + TownRoot matter here as much as they do for the
-			// wait-idle and mail-router paths (gt-zlfq): a bare NudgeSession gets
-			// neither, so if the agent slips busy between paste and Enter the work
-			// prompt is left unsubmitted in its input box AND the delivery skips
-			// the cross-process flock. A polecat that never receives its prompt
-			// sits idle, is reaped, and its bead is reassigned — the churn tracked
-			// in gt-azm0.
-			debugSession("SendStartupNudge", m.tmux.NudgeSessionWithOpts(sessionID, startupNudgeContent,
-				tmux.NudgeOpts{TownRoot: m.townRoot(), ClearOnStrand: true}))
+			// TownRoot matters here as much as on the wait-idle and mail-router
+			// paths (gt-zlfq): a bare NudgeSession gets neither it nor strand
+			// handling, so the delivery also skips the cross-process flock. A
+			// polecat that never receives its prompt sits idle, is reaped, and its
+			// bead is reassigned — the churn tracked in gt-azm0.
+			//
+			// ClearOnStrand is only safe because the verify pass below re-delivers.
+			// Clearing without a re-delivery would destroy the work prompt
+			// outright — worse than leaving it, since stranded text would at least
+			// have been auto-submitted eventually (gt-zlfq review).
+			nudgeErr := m.tmux.NudgeSessionWithOpts(sessionID, startupNudgeContent,
+				tmux.NudgeOpts{TownRoot: m.townRoot(), ClearOnStrand: true})
+			debugSession("SendStartupNudge", nudgeErr)
+			if errors.Is(nudgeErr, tmux.ErrNudgeStranded) {
+				// The prompt was typed, then wiped by ClearOnStrand. The agent is
+				// still busy and its box is now empty, so the verify gate below
+				// would read that as "delivered" and skip the retry. Force the
+				// first attempt to re-nudge unconditionally.
+				startupNudgeStranded = true
+			}
 		}
 	}
 
@@ -617,7 +632,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) (retErr
 		if fallbackInfo.SendBeaconNudge {
 			verifyContent = startupPromptFallback
 		}
-		m.verifyStartupNudgeDelivery(sessionID, runtimeConfig, verifyContent)
+		m.verifyStartupNudgeDelivery(sessionID, runtimeConfig, verifyContent, startupNudgeStranded)
 	}
 
 	// Verify beacon delivery for hook+prompt agents (Mode A, hi-y44).
@@ -628,7 +643,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) (retErr
 	// synchronous call would add ~25s to every successful polecat startup on the
 	// common gt sling path. Non-fatal: the witness zombie patrol handles unrecovered stalls.
 	if !fallbackInfo.SendBeaconNudge && !fallbackInfo.SendStartupNudge {
-		go m.verifyStartupNudgeDelivery(sessionID, runtimeConfig, startupNudgeContent)
+		go m.verifyStartupNudgeDelivery(sessionID, runtimeConfig, startupNudgeContent, startupNudgeStranded)
 	}
 
 	// Legacy fallback for other startup paths (non-fatal)
@@ -682,17 +697,17 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) (retErr
 	return nil
 }
 
-// isSessionStale checks if a tmux session's pane process has died.
-// A stale session exists in tmux but its main process (the agent) is no longer running.
-// This happens when the agent crashes during startup but tmux keeps the dead pane.
-// Delegates to isSessionProcessDead to avoid duplicating process-check logic (gt-qgzj1h).
 // townRoot returns the Gas Town workspace root that owns this manager's rig.
-// Needed for nudge delivery options (cross-process flock keyed under the town)
-// and heartbeat lookups.
+// Needed for nudge delivery options (the cross-process flock is keyed under the
+// town) and heartbeat lookups.
 func (m *SessionManager) townRoot() string {
 	return filepath.Dir(m.rig.Path)
 }
 
+// isSessionStale checks if a tmux session's pane process has died.
+// A stale session exists in tmux but its main process (the agent) is no longer running.
+// This happens when the agent crashes during startup but tmux keeps the dead pane.
+// Delegates to isSessionProcessDead to avoid duplicating process-check logic (gt-qgzj1h).
 func (m *SessionManager) isSessionStale(sessionID string) bool {
 	return isSessionProcessDead(m.tmux, sessionID, filepath.Dir(m.rig.Path))
 }
@@ -968,7 +983,7 @@ func (m *SessionManager) validateIssue(issueID, workDir string) error {
 //
 // Non-fatal: if verification fails or times out, the session is left running.
 // The witness zombie patrol will eventually detect and handle truly idle polecats.
-func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config.RuntimeConfig, retryContent string) {
+func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config.RuntimeConfig, retryContent string, stranded bool) {
 	// Only verify for agents with prompt detection. Without ReadyPromptPrefix,
 	// we can't distinguish "idle at prompt" from "busy processing".
 	if rc == nil || rc.Tmux == nil || rc.Tmux.ReadyPromptPrefix == "" {
@@ -1008,16 +1023,32 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
 		// strands text in the input box, so returning early on busy skips the
 		// retry exactly when it is needed (gt-zlfq). Check whether the input box
 		// actually cleared before trusting busy as proof of delivery.
-		if !m.tmux.IsIdle(sessionID) && m.tmux.InputBoxCleared(sessionID) {
-			return // Agent is busy and its input box is empty — nudge was received
+		// A known strand must re-deliver on the first attempt no matter what the
+		// pane looks like: ClearOnStrand already emptied the box, so the
+		// busy+cleared check below would misread the wipe as successful delivery
+		// and skip the retry in exactly the case it exists for.
+		if !stranded {
+			// A busy agent usually means the nudge landed — but "went busy
+			// mid-paste" is precisely what strands text, so confirm the box is
+			// actually empty before trusting busy as proof of delivery.
+			if !m.tmux.IsIdle(sessionID) && m.tmux.InputBoxCleared(sessionID) {
+				return // Agent is busy and its box is empty — nudge was received
+			}
 		}
+		stranded = false // only the first attempt is forced
 
-		// Either the agent is idle (nudge likely lost) or it is busy with text
-		// still sitting unsubmitted in its input box (nudge stranded). Retry.
-		fmt.Fprintf(os.Stderr, "[startup-nudge] attempt %d/%d: agent %s has an unsubmitted input box, retrying nudge\n",
+		// Either the agent is idle (nudge likely lost), it is busy with text
+		// still unsubmitted (nudge stranded), or we cleared a strand and owe a
+		// re-delivery. Retry.
+		fmt.Fprintf(os.Stderr, "[startup-nudge] attempt %d/%d: re-delivering startup nudge to %s\n",
 			attempt, maxRetries, sessionID)
+		// ClearBeforeSend is mandatory here: this branch runs against a box that
+		// may be non-empty by construction, and the delivery protocol has no
+		// pre-clear. Without it the retry is appended to the stranded text and
+		// submitted as one fused instruction — and the Enter verification would
+		// then see a bare prompt and report success, hiding the corruption.
 		if err := m.tmux.NudgeSessionWithOpts(sessionID, retryContent,
-			tmux.NudgeOpts{TownRoot: m.townRoot(), ClearOnStrand: true}); err != nil {
+			tmux.NudgeOpts{TownRoot: m.townRoot(), ClearOnStrand: true, ClearBeforeSend: true}); err != nil {
 			fmt.Fprintf(os.Stderr, "[startup-nudge] retry nudge failed for %s: %v\n", sessionID, err)
 			return
 		}

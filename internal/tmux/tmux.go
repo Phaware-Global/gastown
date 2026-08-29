@@ -1630,7 +1630,18 @@ func (t *Tmux) sendEnterVerified(target, promptPrefix string) error {
 // Returns true when the box is empty OR when the box cannot be located, so an
 // agent we cannot introspect is never treated as stranded.
 func (t *Tmux) InputBoxCleared(session string) bool {
-	lines, err := t.CapturePaneLines(session, 5)
+	// Capture the AGENT's pane, mirroring how delivery resolves its target.
+	// CapturePaneLines(session, ...) would read the session's ACTIVE pane, which
+	// diverges whenever another window is focused (e.g. a `gt feed -w` window).
+	// Reading the wrong pane finds no ready-prompt, which is inconclusive, and
+	// the bias toward "cleared" would then hide every strand in such sessions.
+	// The prefix stays keyed to the session name: show-environment is
+	// session-scoped, the same split idleSnapshot uses.
+	target := session
+	if agentPane, err := t.FindAgentPane(session); err == nil && agentPane != "" {
+		target = t.canonicalPaneTarget(session, agentPane)
+	}
+	lines, err := t.CapturePaneLines(target, 5)
 	return inputBoxClearedFrom(lines, t.submitVerifyPrefix(session), err)
 }
 
@@ -1840,12 +1851,26 @@ type NudgeOpts struct {
 	// text was typed but the agent went busy before Enter submitted it
 	// (ErrNudgeStranded). The clear runs while this call still holds the nudge
 	// serialization lock, so it cannot race a concurrent nudge's freshly typed
-	// text. Set this when the caller will re-deliver the message via the queue
-	// (the wait-idle path), so Claude Code's deferred auto-submit of the
-	// stranded text can't duplicate the queued copy. Leave false for immediate
-	// delivery, where a strand is a genuine failure and the typed text should
-	// remain for the operator to see.
+	// text. Set this whenever the caller re-delivers the message — via the queue
+	// (wait-idle, immediate) or via a verify retry (startup nudge) — so Claude
+	// Code's deferred auto-submit of the stranded text cannot duplicate the
+	// re-delivered copy.
+	//
+	// Only set it alongside an actual re-delivery. Clearing without one destroys
+	// the message: the stranded text would at least have been auto-submitted
+	// eventually, so a bare clear is strictly worse than leaving it (gt-zlfq).
 	ClearOnStrand bool
+
+	// ClearBeforeSend sends Ctrl-U to the resolved agent pane before typing, so
+	// the message replaces whatever is in the input box rather than being
+	// appended to it.
+	//
+	// Required for any retry that runs against a box known to be non-empty. The
+	// delivery protocol has no pre-clear of its own, so re-nudging a stranded
+	// box would otherwise submit "<stranded text><retry text>" as one fused
+	// line — and the Enter verification would see a bare prompt afterwards and
+	// report success, making the corruption invisible (gt-zlfq).
+	ClearBeforeSend bool
 }
 
 // canonicalPaneTarget converts a pane identifier like "%23" into a tmux target
@@ -1928,6 +1953,15 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 	if opts.RequireIdle {
 		if idle, captureErr := t.idleSnapshot(target, session); !idle && captureErr == nil {
 			return ErrAgentBusy
+		}
+	}
+
+	// 1.6. ClearBeforeSend: wipe the input box under the delivery lock so this
+	// message replaces any text already sitting there instead of concatenating
+	// with it. Callers retrying against a known-stranded box set this.
+	if opts.ClearBeforeSend {
+		if _, cerr := t.run("send-keys", "-t", target, "C-u"); cerr != nil {
+			return fmt.Errorf("clearing input box before send for session %q: %w", session, cerr)
 		}
 	}
 

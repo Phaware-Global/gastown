@@ -196,3 +196,34 @@ func TestInputBoxClearedFrom(t *testing.T) {
 		})
 	}
 }
+
+// TestNudgeOptsClearSemantics pins the distinction between the two clear flags,
+// which the gt-zlfq review showed is easy to conflate and dangerous to get wrong.
+//
+// ClearOnStrand wipes AFTER a failed submit and is only safe when the caller
+// re-delivers — a bare clear destroys the message outright, which is strictly
+// worse than leaving stranded text that would eventually auto-submit.
+//
+// ClearBeforeSend wipes BEFORE typing and is mandatory for any retry running
+// against a box that may be non-empty. The delivery protocol has no pre-clear of
+// its own, so without it a retry is appended to the stranded text and submitted
+// as one fused line — and Enter verification then sees a bare prompt and reports
+// success, hiding the corruption from every caller.
+func TestNudgeOptsClearSemantics(t *testing.T) {
+	t.Parallel()
+
+	var zero NudgeOpts
+	if zero.ClearOnStrand || zero.ClearBeforeSend {
+		t.Fatal("zero NudgeOpts must not clear anything: a bare NudgeSession() must stay non-destructive")
+	}
+
+	// The two flags are independent: a retry against a known-stranded box needs
+	// both (clear the old text, and clear again if this attempt also strands).
+	retry := NudgeOpts{ClearOnStrand: true, ClearBeforeSend: true}
+	if !retry.ClearBeforeSend {
+		t.Error("a retry against a non-empty box must set ClearBeforeSend or it concatenates")
+	}
+	if !retry.ClearOnStrand {
+		t.Error("a retry that re-delivers should also clear on a fresh strand")
+	}
+}

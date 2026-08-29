@@ -583,7 +583,7 @@ func TestVerifyStartupNudgeDelivery_IdleAgent(t *testing.T) {
 	// plus overhead = ~60s. Use 90s for safety.
 	done := make(chan struct{})
 	go func() {
-		m.verifyStartupNudgeDelivery(sessionName, rc, "check your hook")
+		m.verifyStartupNudgeDelivery(sessionName, rc, "check your hook", false)
 		close(done)
 	}()
 
@@ -604,7 +604,7 @@ func TestVerifyStartupNudgeDelivery_NilConfig(t *testing.T) {
 	m := NewSessionManager(tmux.NewTmux(), r)
 
 	// Should return immediately without error for nil config
-	m.verifyStartupNudgeDelivery("nonexistent-session", nil, "")
+	m.verifyStartupNudgeDelivery("nonexistent-session", nil, "", false)
 
 	// And for config without prompt prefix
 	rc := &config.RuntimeConfig{
@@ -613,7 +613,7 @@ func TestVerifyStartupNudgeDelivery_NilConfig(t *testing.T) {
 			ReadyDelayMs:      1000,
 		},
 	}
-	m.verifyStartupNudgeDelivery("nonexistent-session", rc, "")
+	m.verifyStartupNudgeDelivery("nonexistent-session", rc, "", false)
 }
 
 func TestPromptlessFallbackIncludesPrimeAndWorkInstructions(t *testing.T) {
@@ -642,9 +642,9 @@ func TestPromptlessFallbackIncludesPrimeAndWorkInstructions(t *testing.T) {
 // not auto-submitted; the condition triggers verifyStartupNudgeDelivery as a safety net.
 func TestModeABeaconVerificationCondition(t *testing.T) {
 	tests := []struct {
-		name            string
-		rc              *config.RuntimeConfig
-		wantModeA       bool // !SendBeaconNudge && !SendStartupNudge
+		name      string
+		rc        *config.RuntimeConfig
+		wantModeA bool // !SendBeaconNudge && !SendStartupNudge
 	}{
 		{
 			name: "Claude hook+prompt agent triggers Mode A verification",
@@ -732,7 +732,7 @@ func TestModeAStartupVerifyIsNonBlocking(t *testing.T) {
 
 	launchStart := time.Now()
 	go func() {
-		m.verifyStartupNudgeDelivery(sessionName, rc, "[GAS TOWN] test ← witness / Run `gt prime --hook`")
+		m.verifyStartupNudgeDelivery(sessionName, rc, "[GAS TOWN] test ← witness / Run `gt prime --hook`", false)
 		close(goroutineDone)
 	}()
 	callerReturned <- time.Since(launchStart)
@@ -895,11 +895,11 @@ func TestParseFreshBranchName_Rejects(t *testing.T) {
 		"master",
 		"develop",
 		"feature/x",
-		"polecat/",          // empty tail
-		"polecat/alpha",     // no ts or issue
-		"polecat/alpha-",    // trailing dash, no ts
-		"polecat//gt-abc@1", // empty polecat name
-		"polecat/alpha/@1",  // empty issue
+		"polecat/",              // empty tail
+		"polecat/alpha",         // no ts or issue
+		"polecat/alpha-",        // trailing dash, no ts
+		"polecat//gt-abc@1",     // empty polecat name
+		"polecat/alpha/@1",      // empty issue
 		"polecat/alpha/gt-abc@", // empty ts
 		"",
 	}

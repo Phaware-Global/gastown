@@ -315,9 +315,15 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		// The text was typed but the agent slipped busy before Enter submitted
 		// it. ClearOnStrand removed the orphaned copy under the delivery lock;
 		// degrade to the queue rather than dropping the message (gt-zlfq).
-		// Immediate mode previously had neither the clear nor this fallback, so
-		// a strand left text rotting in the input box and lost the nudge — the
-		// startup-nudge variant of which stalls a fresh polecat outright.
+		//
+		// Without a town root there is nowhere real to queue: nudge.Enqueue would
+		// join onto "" and write a ./.runtime tree relative to the caller's cwd
+		// that no hook or poller ever reads, then report success. The queue and
+		// wait-idle modes refuse explicitly in this case; match them and surface
+		// the original strand instead of silently degrading.
+		if townRoot == "" {
+			return derr
+		}
 		if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
 			Sender:   sender,
 			Message:  message,
@@ -325,7 +331,15 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		}); qErr != nil {
 			return fmt.Errorf("immediate delivery stranded and queue fallback failed: %w (original: %v)", qErr, derr)
 		}
-		fmt.Fprintf(os.Stderr, "Note: agent went busy mid-paste; nudge queued for cooperative drain instead\n")
+		// Enqueueing alone guarantees nothing: a polecat has no nudge poller, and
+		// the UserPromptSubmit hook needs user input the agent will never get. The
+		// other queue-degradation paths in this function each start a drain for
+		// exactly this reason, so do the same before reporting the nudge queued.
+		if _, err := nudge.StartPoller(townRoot, sessionName); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not start nudge poller for %s: %v\n", sessionName, err)
+		}
+		watchAndDeliver(t, townRoot, sessionName)
+		fmt.Fprintf(os.Stderr, "Note: agent went busy mid-paste; nudge queued and a drain was started\n")
 		return nil
 	}
 }
