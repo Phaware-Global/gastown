@@ -60,6 +60,28 @@ func TestFormatJSON(t *testing.T) {
 	}
 }
 
+// TestHasReaperSchemaRequiresWispLabels guards against the gap flagged in
+// review on PR #200: notAgentWispJoin made wisp_labels a hard
+// dependency of every Scan/Reap query (none of them tolerate a missing
+// table the way the mail/stale counts do), but HasReaperSchema — the gate
+// callers use to decide whether to run Scan/Reap at all on a database —
+// didn't require it. A database with wisps/issues/wisp_dependencies but no
+// wisp_labels (partially migrated, or an orphan test DB) would pass the
+// gate and then error on every query, silently stopping all reaping on
+// that database (gt-7a7j).
+func TestHasReaperSchemaRequiresWispLabels(t *testing.T) {
+	sourcePath := "reaper.go"
+	data, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", sourcePath, err)
+	}
+	source := string(data)
+	schemaBody := sourceBetween(t, source, "func HasReaperSchema(", "func tableExists(")
+	if !strings.Contains(schemaBody, `"wisp_labels"`) {
+		t.Fatalf("expected HasReaperSchema() to require wisp_labels, body was:\n%s", schemaBody)
+	}
+}
+
 func TestParentExcludeJoin(t *testing.T) {
 	joinClause, whereCondition := parentExcludeJoin("testdb")
 
@@ -189,53 +211,73 @@ func TestReapQueryNoDatabaseNameInjection(t *testing.T) {
 	}
 }
 
-// TestReapUpdateQueryNoDatabaseNameInjection verifies that the UPDATE query in
-// Reap() does not inject dbName where the IN clause should go.
+// TestReapUpdateQueryNoDatabaseNameInjection verifies that the UPDATE query
+// closeWispsUpdateQuery builds — the reaper's only mutating statement — has
+// no injected dbName and no interpolated value outside the parameterized
+// IN-clause and the fixed agent-guard literals. Calls the production
+// function directly: a hand-copied literal here previously stayed green
+// through two unrelated rewrites of this statement (the multi-table JOIN
+// and the wisps./status column qualification) because it never exercised
+// closeWispsUpdateQuery at all (gt-7a7j review round 2, #201).
 func TestReapUpdateQueryNoDatabaseNameInjection(t *testing.T) {
 	dbName := "gt"
-	inClause := "?,?,?"
+	updateQuery := closeWispsUpdateQuery("?,?,?")
 
-	// This is the fixed query — only inClause in the Sprintf args.
-	updateQuery := fmt.Sprintf(
-		"UPDATE wisps SET status='closed', closed_at=NOW() WHERE id IN (%s)",
-		inClause)
-
-	if strings.Contains(updateQuery, dbName) {
-		t.Errorf("Reap updateQuery contains injected database name %q: %s", dbName, updateQuery)
+	// The query legitimately contains the literal "gt:agent" label everywhere
+	// notAgentWispJoin appears, which itself contains "gt" as a substring — so
+	// strip those known-good occurrences before checking for an injected
+	// dbName, or this assertion false-positives on every agent-guarded query.
+	if strings.Contains(strings.ReplaceAll(updateQuery, "gt:agent", ""), dbName) {
+		t.Errorf("closeWispsUpdateQuery contains injected database name %q: %s", dbName, updateQuery)
 	}
 	if !strings.Contains(updateQuery, "IN (?,?,?)") {
-		t.Errorf("Reap updateQuery should contain parameterized IN clause, got: %s", updateQuery)
+		t.Errorf("closeWispsUpdateQuery should contain parameterized IN clause, got: %s", updateQuery)
+	}
+	if err := validateAgentGuardedUpdateQuery(updateQuery); err != nil {
+		t.Errorf("closeWispsUpdateQuery missing agent guard: %v", err)
 	}
 }
 
-// TestPurgeDigestQueryNoDatabaseNameInjection verifies that the purge digest
-// query is a plain string with no Sprintf interpolation at all.
+// TestPurgeDigestQueryNoDatabaseNameInjection verifies purgeDigestQuery —
+// called directly, not reconstructed — has no injected dbName and only the
+// parameterized cutoff plus fixed literals. See
+// TestReapUpdateQueryNoDatabaseNameInjection for why calling production code
+// matters here.
 func TestPurgeDigestQueryNoDatabaseNameInjection(t *testing.T) {
-	// The fixed digestQuery is a string literal — no Sprintf.
-	digestQuery := "SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? GROUP BY wtype"
+	dbName := "gt"
+	digestQuery := purgeDigestQuery()
 
-	if strings.Contains(digestQuery, "gt") {
-		t.Errorf("purge digestQuery should not contain database name, got: %s", digestQuery)
+	// See TestReapUpdateQueryNoDatabaseNameInjection: "gt:agent" itself
+	// contains "gt", so strip it before checking for an injected dbName.
+	if strings.Contains(strings.ReplaceAll(digestQuery, "gt:agent", ""), dbName) {
+		t.Errorf("purgeDigestQuery contains injected database name %q: %s", dbName, digestQuery)
 	}
 	if !strings.Contains(digestQuery, "GROUP BY wtype") {
-		t.Errorf("purge digestQuery should end with GROUP BY, got: %s", digestQuery)
+		t.Errorf("purgeDigestQuery should end with GROUP BY, got: %s", digestQuery)
+	}
+	if err := validateWAliasedAgentGuard(digestQuery); err != nil {
+		t.Errorf("purgeDigestQuery missing agent guard: %v", err)
 	}
 }
 
-// TestPurgeBatchQueryNoDatabaseNameInjection verifies that the purge batch
-// SELECT query uses DefaultBatchSize as the LIMIT, not dbName.
+// TestPurgeBatchQueryNoDatabaseNameInjection verifies purgeBatchIDQuery —
+// called directly — uses DefaultBatchSize as the LIMIT, not an injected
+// dbName, and carries the same agent guard as the digest query above.
 func TestPurgeBatchQueryNoDatabaseNameInjection(t *testing.T) {
-	// This is the fixed query — only DefaultBatchSize in the Sprintf args.
-	idQuery := fmt.Sprintf(
-		"SELECT w.id FROM wisps w WHERE w.status = 'closed' AND w.closed_at < ? LIMIT %d",
-		DefaultBatchSize)
+	dbName := "gt"
+	idQuery := purgeBatchIDQuery()
 
-	if strings.Contains(idQuery, "gt") {
-		t.Errorf("purge idQuery contains injected database name: %s", idQuery)
+	// See TestReapUpdateQueryNoDatabaseNameInjection: "gt:agent" itself
+	// contains "gt", so strip it before checking for an injected dbName.
+	if strings.Contains(strings.ReplaceAll(idQuery, "gt:agent", ""), dbName) {
+		t.Errorf("purgeBatchIDQuery contains injected database name %q: %s", dbName, idQuery)
 	}
 	expected := fmt.Sprintf("LIMIT %d", DefaultBatchSize)
 	if !strings.Contains(idQuery, expected) {
-		t.Errorf("purge idQuery should contain %s, got: %s", expected, idQuery)
+		t.Errorf("purgeBatchIDQuery should contain %s, got: %s", expected, idQuery)
+	}
+	if err := validateWAliasedAgentGuard(idQuery); err != nil {
+		t.Errorf("purgeBatchIDQuery missing agent guard: %v", err)
 	}
 }
 
@@ -345,6 +387,9 @@ func TestReapExcludesAgentBeads(t *testing.T) {
 // 'gt:agent' label (not issue_type='agent', which only wisps use). AutoClose's
 // label exclusion must include 'gt:agent' or the staleness sweep will close
 // live Refinery/Witness/Mayor identity beads, breaking agent bead resolution.
+// The check goes through staleIssueExemptLabelsSQL() — the predicate AutoClose
+// shares with Scan's staleQuery mirror (gt-7a7j) — rather than a literal, so a
+// future edit to the shared list can't silently drop 'gt:agent' from one side.
 func TestAutoCloseExcludesAgentBeads(t *testing.T) {
 	sourcePath := "reaper.go"
 	data, err := os.ReadFile(sourcePath)
@@ -353,14 +398,23 @@ func TestAutoCloseExcludesAgentBeads(t *testing.T) {
 	}
 	source := string(data)
 	autoCloseBody := sourceBetween(t, source, "func AutoClose(", "// batchDeleteRows")
-	if !strings.Contains(autoCloseBody, "'gt:agent'") {
-		t.Fatalf("expected AutoClose() label exclusion to include 'gt:agent', autoClose body was:\n%s", autoCloseBody)
+	if !strings.Contains(autoCloseBody, "staleIssueExemptLabelsSQL()") {
+		t.Fatalf("expected AutoClose() to use the shared staleIssueExemptLabelsSQL() label exclusion, autoClose body was:\n%s", autoCloseBody)
+	}
+	if !strings.Contains(staleIssueExemptLabelsSQL(), "'gt:agent'") {
+		t.Fatalf("expected staleIssueExemptLabelsSQL() to include 'gt:agent', got: %s", staleIssueExemptLabelsSQL())
 	}
 }
 
 // TestScanExcludesAgentBeads documents that Scan() must use the same eligibility
-// predicate as Reap() for stale open wisps. If Scan counts agent beads but Reap
-// excludes them, the operator sees scan>0 and reap=0 for the same cutoff.
+// join as Reap() for stale open wisps. If Scan counts agent beads but Reap
+// excludes them, the operator sees scan>0 and reap=0 for the same cutoff. Agent
+// beads can be wisp-backed with only the gt:agent label (issue_type='task'), not
+// just issue_type='agent' (gt-7a7j), so the check goes through the shared
+// notAgentWispJoin() rather than the old inline literal, which never checked
+// wisp_labels — and never checked the labels table CreateAgentBead actually
+// writes gt:agent to (internal/doctor/agent_beads_check.go:308-311, HIGH
+// finding on PR #200).
 func TestScanExcludesAgentBeads(t *testing.T) {
 	sourcePath := "reaper.go"
 	data, err := os.ReadFile(sourcePath)
@@ -374,8 +428,135 @@ func TestScanExcludesAgentBeads(t *testing.T) {
 		t.Fatalf("could not isolate Scan() body in %s", sourcePath)
 	}
 	scanBody := source[scanStart:reapStart]
-	if !strings.Contains(scanBody, "w.issue_type != 'agent'") {
-		t.Fatalf("expected Scan() eligibility to exclude agent beads, scan body was:\n%s", scanBody)
+	if !strings.Contains(scanBody, `notAgentWispJoin("w")`) {
+		t.Fatalf("expected Scan() eligibility to use the shared notAgentWispJoin(\"w\"), scan body was:\n%s", scanBody)
+	}
+	joinClause, whereCondition := notAgentWispJoin("w")
+	if !strings.Contains(whereCondition, "w.issue_type != 'agent'") {
+		t.Fatalf("expected notAgentWispJoin(\"w\") whereCondition to check issue_type, got: %s", whereCondition)
+	}
+	if !strings.Contains(joinClause, "wisp_labels") {
+		t.Fatalf("expected notAgentWispJoin(\"w\") joinClause to check wisp_labels, got: %s", joinClause)
+	}
+	// bd create --labels writes to the labels table, not wisp_labels — a join
+	// that only checks wisp_labels misses every wisp-backed agent bead
+	// CreateAgentBead actually produces (gt-7a7j).
+	if !strings.Contains(joinClause, "LEFT JOIN labels agent_l ON agent_l.issue_id = w.id AND agent_l.label = 'gt:agent'") {
+		t.Fatalf("expected notAgentWispJoin(\"w\") to also check the labels table, got: %s", joinClause)
+	}
+	if !strings.Contains(whereCondition, "agent_wl.issue_id IS NULL") || !strings.Contains(whereCondition, "agent_l.issue_id IS NULL") {
+		t.Fatalf("expected notAgentWispJoin(\"w\") whereCondition to anti-join both label homes, got: %s", whereCondition)
+	}
+	// Anti-join, not correlated EXISTS — reapQuery's adjacent comment bans
+	// correlated subqueries on the wisp tables (gt-jd1z, gt-wvd2).
+	if strings.Contains(joinClause, "EXISTS") || strings.Contains(whereCondition, "EXISTS") {
+		t.Fatalf("expected notAgentWispJoin(\"w\") to use a LEFT JOIN anti-join, not correlated EXISTS: join=%s where=%s", joinClause, whereCondition)
+	}
+}
+
+// TestScanAutoCloseStaleExemptionsAgree asserts Scan's stale-issue query and
+// AutoClose's eligible set use the identical label exclusion for the same
+// cutoff (gt-7a7j acceptance criterion). Before this fix, Scan's staleQuery
+// had no label exclusion at all, so it permanently reported gt:agent /
+// gt:standing-orders / gt:keep / gt:role / gt:rig issues as stale candidates
+// that AutoClose would never close — scan>0, auto-close=0, forever.
+func TestScanAutoCloseStaleExemptionsAgree(t *testing.T) {
+	sourcePath := "reaper.go"
+	data, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", sourcePath, err)
+	}
+	source := string(data)
+	scanStart := strings.Index(source, "func Scan(")
+	reapStart := strings.Index(source, "func Reap(")
+	autoCloseStart := strings.Index(source, "func AutoClose(")
+	batchDeleteMarker := strings.Index(source, "// batchDeleteRows")
+	if scanStart == -1 || reapStart == -1 || reapStart <= scanStart {
+		t.Fatalf("could not isolate Scan() body in %s", sourcePath)
+	}
+	if autoCloseStart == -1 || batchDeleteMarker == -1 || batchDeleteMarker <= autoCloseStart {
+		t.Fatalf("could not isolate AutoClose() body in %s", sourcePath)
+	}
+	scanBody := source[scanStart:reapStart]
+	autoCloseBody := source[autoCloseStart:batchDeleteMarker]
+
+	if !strings.Contains(scanBody, "staleIssueExemptLabelsSQL()") {
+		t.Fatalf("expected Scan()'s staleQuery to use staleIssueExemptLabelsSQL(), scan body was:\n%s", scanBody)
+	}
+	if !strings.Contains(autoCloseBody, "staleIssueExemptLabelsSQL()") {
+		t.Fatalf("expected AutoClose() to use staleIssueExemptLabelsSQL(), autoClose body was:\n%s", autoCloseBody)
+	}
+	for _, label := range []string{"gt:standing-orders", "gt:keep", "gt:role", "gt:rig", "gt:agent"} {
+		if !strings.Contains(staleIssueExemptLabelsSQL(), "'"+label+"'") {
+			t.Fatalf("staleIssueExemptLabelsSQL() missing %q, got: %s", label, staleIssueExemptLabelsSQL())
+		}
+	}
+}
+
+// TestPurgeClosedWispsExcludesAgentBeads guards against the gap flagged in
+// review on PR #200: the agent guard covered every close path (Scan/Reap)
+// but not purgeClosedWisps, so an already-closed wisp-backed agent bead —
+// exactly the state Reap's guard prevents new ones from reaching, but which
+// pre-fix code produced before this bead's fix landed — gets hard-deleted
+// (wisp_labels included) at purgeAge with no guard at all (gt-7a7j, gt-h8oq).
+// TestPurgeClosedWispsExcludesAgentBeads asserts purgeClosedWisps' actual
+// behaviour, not its source text. A prior version of this test sliced
+// reaper.go between "func purgeClosedWisps(" and "func purgeOldMail(" and
+// grepped for notAgentWispJoin — but purgeDigestQuery and purgeBatchIDQuery
+// (which purgeClosedWisps calls, and which are where the guard actually
+// lives) are defined in exactly that byte range. The slice matched the
+// helpers' own definitions regardless of whether purgeClosedWisps' call
+// site still used them, so it would stay green even if the guard were
+// dropped from the call site entirely — the same "reads correct, does not
+// run" failure mode this whole bead exists to fix, one level up (gt-7a7j
+// review round 3, #201). This drives the real function end-to-end through
+// the fake driver instead.
+func TestPurgeClosedWispsExcludesAgentBeads(t *testing.T) {
+	now := time.Now().UTC()
+	oldEnough := now.Add(-10 * 24 * time.Hour)
+	tooRecent := now.Add(-1 * time.Hour)
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			// Ordinary closed wisp past the purge cutoff: must be purged.
+			"closed-normal": {id: "closed-normal", status: "closed", issueType: "task", wispType: "task", closedAt: oldEnough},
+			// Wisp-backed agent identity bead shaped the way CreateAgentBead
+			// actually creates one — gt:agent in the labels table only,
+			// nothing in wisp_labels. This is the HIGH-severity shape this
+			// PR exists to protect; it must survive purge even though it is
+			// closed and past the age cutoff (gt-7a7j, gt-h8oq).
+			"closed-agent-label": {id: "closed-agent-label", status: "closed", issueType: "task", wispType: "task", closedAt: oldEnough, issueLabels: []string{"gt:agent"}},
+			// Same protection via the legacy/repaired wisp_labels form.
+			"closed-agent-wisplabel": {id: "closed-agent-wisplabel", status: "closed", issueType: "task", wispType: "task", closedAt: oldEnough, labels: []string{"gt:agent"}},
+			// Closed but not yet past purgeAge: must survive too, but for
+			// an unrelated reason (age, not the agent guard).
+			"closed-recent": {id: "closed-recent", status: "closed", issueType: "task", wispType: "task", closedAt: tooRecent},
+			// Still open: purge never considers it regardless of status.
+			"open-normal": {id: "open-normal", status: "open", issueType: "task", wispType: "task"},
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	purged, anomalies, err := purgeClosedWisps(db, "testdb", 7*24*time.Hour, false)
+	if err != nil {
+		t.Fatalf("purgeClosedWisps: %v", err)
+	}
+	if len(anomalies) != 0 {
+		t.Fatalf("purgeClosedWisps anomalies = %v, want none", anomalies)
+	}
+	if purged != 1 {
+		t.Fatalf("purgeClosedWisps purged = %d, want 1", purged)
+	}
+
+	remaining := state.statuses()
+	if _, ok := remaining["closed-normal"]; ok {
+		t.Error("closed-normal should have been purged")
+	}
+	for _, id := range []string{"closed-agent-label", "closed-agent-wisplabel", "closed-recent", "open-normal"} {
+		if _, ok := remaining[id]; !ok {
+			t.Errorf("%s should have survived purge, but was deleted", id)
+		}
 	}
 }
 
@@ -395,6 +576,19 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 			"agent-step":               {id: "agent-step", status: "open", issueType: "agent", createdAt: now.Add(-48 * time.Hour)},
 			"stale-orphan":             {id: "stale-orphan", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour)},
 			"fresh-orphan":             {id: "fresh-orphan", status: "open", issueType: "task", createdAt: now.Add(-1 * time.Hour)},
+			// Wisp-backed agent identity bead carrying only the gt:agent label
+			// (issue_type='task') — the shape CreateAgentBead actually produces
+			// (internal/beads/beads_agent.go). Stale, orphaned, and otherwise
+			// identical to stale-orphan: without the wisp_labels check this gets
+			// reaped like any other stale wisp, destroying agent identity (gt-7a7j).
+			"label-agent-orphan": {id: "label-agent-orphan", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour), labels: []string{"gt:agent"}},
+			// Wisp-backed agent identity bead the way CreateAgentBead ACTUALLY
+			// creates one: "bd create --type=task --labels=gt:agent" writes only
+			// to the labels table, never to wisp_labels
+			// (internal/doctor/agent_beads_check.go:308-311). A predicate that
+			// checks only wisp_labels (PR #200 as originally reviewed) misses
+			// this shape entirely — the HIGH finding on gt-7a7j.
+			"issue-label-agent-orphan": {id: "issue-label-agent-orphan", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour), issueLabels: []string{"gt:agent"}},
 		},
 		deps: []fakeDep{
 			{issueID: "step-closed-mol-recent", dependsOnID: "mol-closed", depType: "parent-child"},
@@ -435,8 +629,8 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	if dryRun.Reaped != 2 {
 		t.Fatalf("dry-run Reaped = %d, want 2", dryRun.Reaped)
 	}
-	if dryRun.OpenRemain != 10 {
-		t.Fatalf("dry-run OpenRemain = %d, want 10", dryRun.OpenRemain)
+	if dryRun.OpenRemain != 12 {
+		t.Fatalf("dry-run OpenRemain = %d, want 12", dryRun.OpenRemain)
 	}
 	if afterDryRun := state.statuses(); !reflect.DeepEqual(afterDryRun, beforeDryRun) {
 		t.Fatalf("dry-run mutated statuses: before=%v after=%v", beforeDryRun, afterDryRun)
@@ -453,8 +647,8 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	if realRun.Reaped != 2 {
 		t.Fatalf("real Reaped = %d, want 2", realRun.Reaped)
 	}
-	if realRun.OpenRemain != 6 {
-		t.Fatalf("real OpenRemain = %d, want 6", realRun.OpenRemain)
+	if realRun.OpenRemain != 8 {
+		t.Fatalf("real OpenRemain = %d, want 8", realRun.OpenRemain)
 	}
 
 	for _, id := range []string{"step-closed-mol-recent", "step-closed-mol-old", "step-non-molecule-parent", "stale-orphan"} {
@@ -462,7 +656,7 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 			t.Fatalf("%s status = %q, want closed", id, got)
 		}
 	}
-	for _, id := range []string{"step-mixed-parent-old", "step-external-parent-old", "step-open-parent-old", "agent-step", "fresh-orphan", "mol-open"} {
+	for _, id := range []string{"step-mixed-parent-old", "step-external-parent-old", "step-open-parent-old", "agent-step", "fresh-orphan", "mol-open", "label-agent-orphan", "issue-label-agent-orphan"} {
 		if got := state.status(id); got != "open" {
 			t.Fatalf("%s status = %q, want open", id, got)
 		}
@@ -475,9 +669,9 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 		assertOpsContainInOrder(t, ops,
 			"EXEC SET @@autocommit = 0",
 			"QUERY SELECT w.id FROM wisps w INNER JOIN",
-			"EXEC UPDATE wisps SET status='closed'",
+			"EXEC UPDATE wisps LEFT JOIN",
 			"QUERY SELECT w.id FROM wisps w LEFT JOIN",
-			"EXEC UPDATE wisps SET status='closed'",
+			"EXEC UPDATE wisps LEFT JOIN",
 			"EXEC COMMIT",
 			"EXEC CALL DOLT_COMMIT",
 			"QUERY SELECT COUNT(*) FROM wisps WHERE status IN",
@@ -504,7 +698,40 @@ type fakeWisp struct {
 	id        string
 	status    string
 	issueType string
+	wispType  string
 	createdAt time.Time
+	closedAt  time.Time
+	// labels simulates rows in wisp_labels for this wisp.
+	labels []string
+	// issueLabels simulates rows in the separate `labels` table for this
+	// issue_id — the table bd create --labels actually writes to
+	// (internal/doctor/agent_beads_check.go:308-311). A wisp-backed agent
+	// bead created the way CreateAgentBead really creates one has gt:agent
+	// here and NOT in labels (wisp_labels only gets it via an out-of-band
+	// repair), so this must be checked independently of labels above (gt-7a7j).
+	issueLabels []string
+}
+
+// isAgentWisp reports whether w is excluded by notAgentWispJoin: the
+// legacy issue_type='agent' marker, the gt:agent label in wisp_labels, or
+// the gt:agent label in the separate labels table. Mirrors the real
+// predicate so the fake driver's simulated eligibility matches what the
+// actual SQL would return (gt-7a7j).
+func (w *fakeWisp) isAgentWisp() bool {
+	if w.issueType == "agent" {
+		return true
+	}
+	for _, l := range w.labels {
+		if l == "gt:agent" {
+			return true
+		}
+	}
+	for _, l := range w.issueLabels {
+		if l == "gt:agent" {
+			return true
+		}
+	}
+	return false
 }
 
 type fakeDep struct {
@@ -578,7 +805,7 @@ func (s *fakeReaperState) moleculeStepCandidatesLocked() []string {
 
 func (s *fakeReaperState) isMoleculeStepCandidateLocked(id string) bool {
 	w := s.wisps[id]
-	if w == nil || !isOpenWispStatus(w.status) || w.issueType == "agent" {
+	if w == nil || !isOpenWispStatus(w.status) || w.isAgentWisp() {
 		return false
 	}
 	for _, dep := range s.deps {
@@ -602,7 +829,7 @@ func (s *fakeReaperState) isMoleculeStepCandidateLocked(id string) bool {
 func (s *fakeReaperState) staleCandidatesLocked(cutoff time.Time, excludeMoleculeSteps bool) []string {
 	var ids []string
 	for id, w := range s.wisps {
-		if !isOpenWispStatus(w.status) || w.issueType == "agent" || !w.createdAt.Before(cutoff) {
+		if !isOpenWispStatus(w.status) || w.isAgentWisp() || !w.createdAt.Before(cutoff) {
 			continue
 		}
 		if s.hasOpenParentLocked(id) {
@@ -615,6 +842,22 @@ func (s *fakeReaperState) staleCandidatesLocked(cutoff time.Time, excludeMolecul
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+// purgeCandidatesLocked returns closed wisps past cutoff, excluding agent
+// wisps by the same isAgentWisp() check every other eligibility helper here
+// uses — mirrors purgeClosedWisps' real query so the fake can assert on
+// behaviour instead of source text (gt-7a7j review round 3, #201).
+func (s *fakeReaperState) purgeCandidatesLocked(cutoff time.Time) []*fakeWisp {
+	var wisps []*fakeWisp
+	for _, w := range s.wisps {
+		if w.status != "closed" || w.isAgentWisp() || !w.closedAt.Before(cutoff) {
+			continue
+		}
+		wisps = append(wisps, w)
+	}
+	sort.Slice(wisps, func(i, j int) bool { return wisps[i].id < wisps[j].id })
+	return wisps
 }
 
 func (s *fakeReaperState) hasOpenParentLocked(id string) bool {
@@ -690,7 +933,10 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 		return fakeCountRows(len(c.state.moleculeStepCandidatesLocked())), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps WHERE status IN"):
 		return fakeCountRows(c.state.openCountLocked()), nil
-	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps w WHERE w.status = 'closed'"):
+	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps w") && strings.Contains(normalized, "w.status = 'closed'"):
+		if err := validateWAliasedAgentGuard(normalized); err != nil {
+			return nil, err
+		}
 		return fakeCountRows(0), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM issues"):
 		return fakeCountRows(0), nil
@@ -706,6 +952,16 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 			return nil, err
 		}
 		return fakeIDRows(c.state.moleculeStepCandidatesLocked()), nil
+	case strings.Contains(normalized, "SELECT COALESCE(w.wisp_type") && strings.Contains(normalized, "GROUP BY wtype"):
+		if err := validateWAliasedAgentGuard(normalized); err != nil {
+			return nil, err
+		}
+		return fakeDigestRows(c.state.purgeCandidatesLocked(namedTime(args))), nil
+	case strings.Contains(normalized, "SELECT w.id FROM wisps w") && strings.Contains(normalized, "w.status = 'closed'"):
+		if err := validateWAliasedAgentGuard(normalized); err != nil {
+			return nil, err
+		}
+		return fakeIDRows(purgeCandidateIDs(c.state.purgeCandidatesLocked(namedTime(args)))), nil
 	default:
 		return nil, fmt.Errorf("unexpected query: %s", normalized)
 	}
@@ -718,11 +974,18 @@ func (c *fakeReaperConn) ExecContext(_ context.Context, query string, args []dri
 	c.state.record(c.id, "EXEC "+normalized)
 
 	switch {
-	case strings.HasPrefix(normalized, "UPDATE wisps SET status='closed'"):
+	case strings.HasPrefix(normalized, "UPDATE wisps LEFT JOIN") && strings.Contains(normalized, "SET wisps.status='closed'"):
+		if err := validateAgentGuardedUpdateQuery(normalized); err != nil {
+			return nil, err
+		}
 		affected := int64(0)
 		for _, arg := range args {
 			id, _ := arg.Value.(string)
-			if w := c.state.wisps[id]; w != nil && isOpenWispStatus(w.status) {
+			// Honour the bare-table notAgentWispJoin("") guard: a real
+			// multi-table UPDATE with this WHERE clause would not touch an
+			// agent-labelled row, regardless of what IDs are passed in the
+			// IN-list (gt-7a7j).
+			if w := c.state.wisps[id]; w != nil && isOpenWispStatus(w.status) && !w.isAgentWisp() {
 				w.status = "closed"
 				affected++
 			}
@@ -730,6 +993,25 @@ func (c *fakeReaperConn) ExecContext(_ context.Context, query string, args []dri
 		return fakeReaperResult(affected), nil
 	case normalized == "SET @@autocommit = 0" || normalized == "SET @@autocommit = 1" || normalized == "ROLLBACK" || normalized == "COMMIT" || strings.HasPrefix(normalized, "CALL DOLT_COMMIT"):
 		return fakeReaperResult(0), nil
+	case strings.HasPrefix(normalized, "DELETE FROM"):
+		// batchDeleteRows issues a DELETE per aux table (wisp_labels,
+		// wisp_comments, wisp_events, wisp_dependencies), two reverse-
+		// dependency cleanups, and finally the primary `wisps` delete. Only
+		// the primary delete needs to actually mutate state for the purge
+		// behavioural test (gt-7a7j review round 3, #201); the rest are
+		// no-ops here the same way they'd be non-fatal-and-ignored in
+		// production for a fixture with no aux rows.
+		affected := int64(0)
+		if strings.Contains(normalized, "`wisps`") {
+			for _, arg := range args {
+				id, _ := arg.Value.(string)
+				if _, ok := c.state.wisps[id]; ok {
+					delete(c.state.wisps, id)
+					affected++
+				}
+			}
+		}
+		return fakeReaperResult(affected), nil
 	default:
 		return nil, fmt.Errorf("unexpected exec: %s", normalized)
 	}
@@ -761,6 +1043,37 @@ func fakeIDRows(ids []string) *fakeReaperRows {
 		rows[i] = []driver.Value{id}
 	}
 	return &fakeReaperRows{cols: []string{"id"}, rows: rows}
+}
+
+func purgeCandidateIDs(wisps []*fakeWisp) []string {
+	ids := make([]string, len(wisps))
+	for i, w := range wisps {
+		ids[i] = w.id
+	}
+	return ids
+}
+
+// fakeDigestRows mirrors purgeDigestQuery's "COALESCE(w.wisp_type, 'unknown')
+// ... GROUP BY wtype" shape.
+func fakeDigestRows(wisps []*fakeWisp) *fakeReaperRows {
+	counts := map[string]int{}
+	for _, w := range wisps {
+		wtype := w.wispType
+		if wtype == "" {
+			wtype = "unknown"
+		}
+		counts[wtype]++
+	}
+	var types []string
+	for wtype := range counts {
+		types = append(types, wtype)
+	}
+	sort.Strings(types)
+	rows := make([][]driver.Value, len(types))
+	for i, wtype := range types {
+		rows[i] = []driver.Value{wtype, int64(counts[wtype])}
+	}
+	return &fakeReaperRows{cols: []string{"wtype", "cnt"}, rows: rows}
 }
 
 func (r *fakeReaperRows) Columns() []string { return r.cols }
@@ -803,6 +1116,10 @@ func validateMoleculeStepQuery(query string) error {
 		"NOT EXISTS",
 		"open_dep.depends_on_external IS NOT NULL",
 		"w.issue_type != 'agent'",
+		"LEFT JOIN wisp_labels agent_wl ON agent_wl.issue_id = w.id AND agent_wl.label = 'gt:agent'",
+		"LEFT JOIN labels agent_l ON agent_l.issue_id = w.id AND agent_l.label = 'gt:agent'",
+		"agent_wl.issue_id IS NULL",
+		"agent_l.issue_id IS NULL",
 		"w.status IN ('open', 'hooked', 'in_progress')",
 	)
 }
@@ -816,9 +1133,49 @@ func validateStaleWispQuery(query string) error {
 		"depends_on_external IS NOT NULL",
 		"wd.type = 'parent-child'",
 		"w.issue_type != 'agent'",
+		"LEFT JOIN wisp_labels agent_wl ON agent_wl.issue_id = w.id AND agent_wl.label = 'gt:agent'",
+		"LEFT JOIN labels agent_l ON agent_l.issue_id = w.id AND agent_l.label = 'gt:agent'",
+		"agent_wl.issue_id IS NULL",
+		"agent_l.issue_id IS NULL",
 		"w.created_at < ?",
 		"open_parent.issue_id IS NULL",
 		"closed_molecule_step.issue_id IS NULL",
+	)
+}
+
+// validateAgentGuardedUpdateQuery asserts the bare-table notAgentWispJoin("")
+// guard is present on the UPDATE that actually closes wisps. Before this test,
+// nothing checked the bare-table form: both query validators above only assert
+// the "w."-aliased form, and this fake's UPDATE branch used to close every id in
+// args unconditionally, so a missing or malformed guard here would not have
+// turned any test red (gt-7a7j review, thread on reaper_test.go:895).
+//
+// The join/where columns are qualified as "wisps.id"/"wisps.issue_type", not
+// left bare, because closeWispsUpdateQuery splices this into a literal
+// "UPDATE wisps" target: an unqualified "id"/"issue_type" would become
+// ambiguous (MySQL error 1052, aborting every reap batch) if the externally
+// owned `labels` table ever gains its own id column (gt-7a7j review round 2,
+// #201, low finding on reaper.go:244).
+func validateAgentGuardedUpdateQuery(query string) error {
+	return requireSQL(query,
+		"wisps.issue_type != 'agent'",
+		"LEFT JOIN wisp_labels agent_wl ON agent_wl.issue_id = wisps.id AND agent_wl.label = 'gt:agent'",
+		"LEFT JOIN labels agent_l ON agent_l.issue_id = wisps.id AND agent_l.label = 'gt:agent'",
+		"agent_wl.issue_id IS NULL",
+		"agent_l.issue_id IS NULL",
+	)
+}
+
+// validateWAliasedAgentGuard asserts the "w."-aliased notAgentWispJoin("w")
+// guard is present on a Scan/Purge eligibility query (as opposed to the
+// bare-table form checked by validateAgentGuardedUpdateQuery above).
+func validateWAliasedAgentGuard(query string) error {
+	return requireSQL(query,
+		"w.issue_type != 'agent'",
+		"LEFT JOIN wisp_labels agent_wl ON agent_wl.issue_id = w.id AND agent_wl.label = 'gt:agent'",
+		"LEFT JOIN labels agent_l ON agent_l.issue_id = w.id AND agent_l.label = 'gt:agent'",
+		"agent_wl.issue_id IS NULL",
+		"agent_l.issue_id IS NULL",
 	)
 }
 

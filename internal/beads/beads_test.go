@@ -3976,6 +3976,48 @@ func TestIsAgentBead(t *testing.T) {
 	}
 }
 
+// TestIsProtectedBead_LegacyAgentType guards the gap flagged in review on
+// PR #200: IsProtectedBead's doc comment claims to be a complete mirror of
+// the reaper's own gt:agent exclusion set, but only ever scanned Labels —
+// never issue.Type. A legacy agent bead (type="agent", no gt:agent label)
+// passed IsAgentBead but not IsProtectedBead. Today's only caller
+// (internal/polecat/manager.go) pre-filters with IsAgentBead so nothing
+// breaks yet, but the comment invites a future caller to skip that
+// pre-filter and trust this function alone.
+func TestIsProtectedBead_LegacyAgentType(t *testing.T) {
+	issue := &Issue{ID: "gt-legacy-agent", Type: "agent", Labels: []string{}}
+	if !IsProtectedBead(issue) {
+		t.Error("IsProtectedBead() = false for legacy type=agent bead, want true")
+	}
+}
+
+func TestIsProtectedBead(t *testing.T) {
+	tests := []struct {
+		name  string
+		issue *Issue
+		want  bool
+	}{
+		{name: "nil issue", issue: nil, want: false},
+		{name: "no labels", issue: &Issue{Type: "task", Labels: []string{}}, want: false},
+		{name: "gt:standing-orders", issue: &Issue{Type: "task", Labels: []string{"gt:standing-orders"}}, want: true},
+		{name: "gt:keep", issue: &Issue{Type: "task", Labels: []string{"gt:keep"}}, want: true},
+		{name: "gt:role", issue: &Issue{Type: "task", Labels: []string{"gt:role"}}, want: true},
+		{name: "gt:rig", issue: &Issue{Type: "task", Labels: []string{"gt:rig"}}, want: true},
+		{name: "gt:agent label", issue: &Issue{Type: "task", Labels: []string{"gt:agent"}}, want: true},
+		{name: "legacy type=agent, no label", issue: &Issue{Type: "agent", Labels: []string{}}, want: true},
+		{name: "unrelated label", issue: &Issue{Type: "task", Labels: []string{"priority-high"}}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IsProtectedBead(tt.issue)
+			if got != tt.want {
+				t.Errorf("IsProtectedBead() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestFilterBeadsEnv_NilInput verifies filterBeadsEnv does not panic on nil.
 func TestFilterBeadsEnv_NilInput(t *testing.T) {
 	got := filterBeadsEnv(nil)
