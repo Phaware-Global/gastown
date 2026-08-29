@@ -1619,6 +1619,38 @@ func (t *Tmux) sendEnterVerified(target, promptPrefix string) error {
 	return fmt.Errorf("nudge Enter not processed after %d retries: pane content unchanged", maxRetries)
 }
 
+// InputBoxCleared reports whether the session's live input box is empty — i.e.
+// nothing typed is sitting unsubmitted.
+//
+// This is the signal that distinguishes "busy because it received the nudge"
+// from "busy with the nudge still stranded in its input box". Agent idleness
+// cannot tell those apart, which is why callers that gate retries on idleness
+// alone skip the retry in exactly the case that needs it (gt-zlfq).
+//
+// Returns true when the box is empty OR when the box cannot be located, so an
+// agent we cannot introspect is never treated as stranded.
+func (t *Tmux) InputBoxCleared(session string) bool {
+	lines, err := t.CapturePaneLines(session, 5)
+	return inputBoxClearedFrom(lines, t.submitVerifyPrefix(session), err)
+}
+
+// inputBoxClearedFrom is the pure decision behind InputBoxCleared, split out so
+// the strand/no-strand judgement is testable without a live tmux server.
+//
+// It is deliberately biased toward "cleared": a capture error or an
+// unrecognisable pane means we cannot see a strand, and inventing one would make
+// callers re-nudge an agent that is working fine.
+func inputBoxClearedFrom(lines []string, promptPrefix string, captureErr error) bool {
+	if captureErr != nil {
+		return true // can't inspect — don't claim a strand
+	}
+	submitted, conclusive := inputBoxSubmitted(lines, promptPrefix)
+	if !conclusive {
+		return true
+	}
+	return submitted
+}
+
 // inputBoxSubmitted reports whether the agent's live input box is empty, which
 // is how we confirm a nudge's Enter actually submitted: on submit the typed text
 // moves into the transcript and the input line returns to a bare prompt.

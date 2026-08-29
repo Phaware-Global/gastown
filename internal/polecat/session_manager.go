@@ -595,8 +595,17 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) (retErr
 		}
 
 		if fallbackInfo.SendStartupNudge {
-			// Send work instructions via nudge
-			debugSession("SendStartupNudge", m.tmux.NudgeSession(sessionID, startupNudgeContent))
+			// Send work instructions via nudge.
+			//
+			// ClearOnStrand + TownRoot matter here as much as they do for the
+			// wait-idle and mail-router paths (gt-zlfq): a bare NudgeSession gets
+			// neither, so if the agent slips busy between paste and Enter the work
+			// prompt is left unsubmitted in its input box AND the delivery skips
+			// the cross-process flock. A polecat that never receives its prompt
+			// sits idle, is reaped, and its bead is reassigned — the churn tracked
+			// in gt-azm0.
+			debugSession("SendStartupNudge", m.tmux.NudgeSessionWithOpts(sessionID, startupNudgeContent,
+				tmux.NudgeOpts{TownRoot: m.townRoot(), ClearOnStrand: true}))
 		}
 	}
 
@@ -677,6 +686,13 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) (retErr
 // A stale session exists in tmux but its main process (the agent) is no longer running.
 // This happens when the agent crashes during startup but tmux keeps the dead pane.
 // Delegates to isSessionProcessDead to avoid duplicating process-check logic (gt-qgzj1h).
+// townRoot returns the Gas Town workspace root that owns this manager's rig.
+// Needed for nudge delivery options (cross-process flock keyed under the town)
+// and heartbeat lookups.
+func (m *SessionManager) townRoot() string {
+	return filepath.Dir(m.rig.Path)
+}
+
 func (m *SessionManager) isSessionStale(sessionID string) bool {
 	return isSessionProcessDead(m.tmux, sessionID, filepath.Dir(m.rig.Path))
 }
@@ -987,14 +1003,21 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
 		// running tools, generating a response), the status bar shows the busy
 		// indicator and IsIdle returns false — even though ❯ may still be
 		// visible in the pane from before Claude started output.
-		if !m.tmux.IsIdle(sessionID) {
-			return // Agent is busy — nudge was received and is being processed
+		// A busy agent usually means the nudge landed and is being processed —
+		// but not always. "Went busy mid-paste" is precisely the condition that
+		// strands text in the input box, so returning early on busy skips the
+		// retry exactly when it is needed (gt-zlfq). Check whether the input box
+		// actually cleared before trusting busy as proof of delivery.
+		if !m.tmux.IsIdle(sessionID) && m.tmux.InputBoxCleared(sessionID) {
+			return // Agent is busy and its input box is empty — nudge was received
 		}
 
-		// Agent is truly idle (no busy indicator, prompt visible) — nudge was likely lost. Retry.
-		fmt.Fprintf(os.Stderr, "[startup-nudge] attempt %d/%d: agent %s idle at prompt, retrying nudge\n",
+		// Either the agent is idle (nudge likely lost) or it is busy with text
+		// still sitting unsubmitted in its input box (nudge stranded). Retry.
+		fmt.Fprintf(os.Stderr, "[startup-nudge] attempt %d/%d: agent %s has an unsubmitted input box, retrying nudge\n",
 			attempt, maxRetries, sessionID)
-		if err := m.tmux.NudgeSession(sessionID, retryContent); err != nil {
+		if err := m.tmux.NudgeSessionWithOpts(sessionID, retryContent,
+			tmux.NudgeOpts{TownRoot: m.townRoot(), ClearOnStrand: true}); err != nil {
 			fmt.Fprintf(os.Stderr, "[startup-nudge] retry nudge failed for %s: %v\n", sessionID, err)
 			return
 		}

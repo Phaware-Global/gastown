@@ -307,8 +307,26 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		// "claude-opus-remote-mayor") to their provider preset. Setting it from
 		// the caller's townRoot could override that with the sender's workspace
 		// context and wrongly skip the vim-safety Escape. (GH#gt-wasn, PR #75 review)
-		opts := tmux.NudgeOpts{TownRoot: townRoot}
-		return t.NudgeSessionWithOpts(sessionName, prefixedMessage, opts)
+		opts := tmux.NudgeOpts{TownRoot: townRoot, ClearOnStrand: true}
+		derr := t.NudgeSessionWithOpts(sessionName, prefixedMessage, opts)
+		if !errors.Is(derr, tmux.ErrNudgeStranded) {
+			return derr
+		}
+		// The text was typed but the agent slipped busy before Enter submitted
+		// it. ClearOnStrand removed the orphaned copy under the delivery lock;
+		// degrade to the queue rather than dropping the message (gt-zlfq).
+		// Immediate mode previously had neither the clear nor this fallback, so
+		// a strand left text rotting in the input box and lost the nudge — the
+		// startup-nudge variant of which stalls a fresh polecat outright.
+		if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+			Sender:   sender,
+			Message:  message,
+			Priority: nudgePriorityFlag,
+		}); qErr != nil {
+			return fmt.Errorf("immediate delivery stranded and queue fallback failed: %w (original: %v)", qErr, derr)
+		}
+		fmt.Fprintf(os.Stderr, "Note: agent went busy mid-paste; nudge queued for cooperative drain instead\n")
+		return nil
 	}
 }
 
