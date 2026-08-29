@@ -175,6 +175,108 @@ func TestEventPoll_DetectsCloseEvents(t *testing.T) {
 	}
 }
 
+// flakyStorage wraps a real beadsdk.Storage and makes GetAllEventsSince fail
+// for a configured number of calls before delegating to the underlying
+// store. Used to simulate a store that is still failing its seed poll (e.g.
+// a large store hitting the query timeout) while other stores seed
+// successfully in the same daemon startup window.
+type flakyStorage struct {
+	beadsdk.Storage
+	failsRemaining atomic.Int64
+}
+
+func (s *flakyStorage) GetAllEventsSince(ctx context.Context, since time.Time) ([]*beadsdk.Event, error) {
+	if s.failsRemaining.Add(-1) >= 0 {
+		return nil, fmt.Errorf("simulated transient poll failure")
+	}
+	return s.Storage.GetAllEventsSince(ctx, since)
+}
+
+// TestPollStore_SlowStoreSeedsIndependently_NoReplayAfterOtherStoresSeed is a
+// regression test for gt-lurb: the warm-up flag used to be a single global
+// atomic.Bool, so a fast store seeding successfully would flip it to "seeded"
+// while a slow store (e.g. hq, over the query timeout) was still failing its
+// own seed poll. When the slow store's poll finally succeeded, its entire
+// pre-existing history was replayed as if newly closed. The fix tracks the
+// warm-up flag per store, so a store that seeds late still gets its own
+// warm-up cycle regardless of what other stores have already done.
+func TestPollStore_SlowStoreSeedsIndependently_NoReplayAfterOtherStoresSeed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+	slowRealStore, slowCleanup := setupTestStore(t)
+	defer slowCleanup()
+	fastStore, fastCleanup := setupTestStore(t)
+	defer fastCleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	// Pre-existing history on the slow store, closed before the daemon ever
+	// manages a successful poll of it. This must never be replayed as new.
+	preexisting := &beadsdk.Issue{
+		ID: "hq-pre1", Title: "Pre-existing closed issue", Status: beadsdk.StatusOpen,
+		Priority: 2, IssueType: beadsdk.TypeTask, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := slowRealStore.CreateIssue(ctx, preexisting, "test"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if err := slowRealStore.CloseIssue(ctx, preexisting.ID, "done", "test", ""); err != nil {
+		t.Fatalf("CloseIssue: %v", err)
+	}
+
+	slowStore := &flakyStorage{Storage: slowRealStore}
+	slowStore.failsRemaining.Store(2)
+
+	var mu sync.Mutex
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		mu.Lock()
+		logged = append(logged, fmt.Sprintf(format, args...))
+		mu.Unlock()
+	}
+
+	stores := map[string]beadsdk.Storage{
+		"hq":      slowStore,
+		"gastown": fastStore,
+	}
+	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
+
+	// Cycle 1: gastown (no events) seeds and succeeds immediately. hq fails
+	// (simulated timeout) and must NOT be marked seeded.
+	if !m.pollStoresSnapshot(m.stores) {
+		t.Fatal("expected pollStoresSnapshot to report an error while hq is still failing")
+	}
+	if _, ok := m.seededStores.Load("gastown"); !ok {
+		t.Fatal("expected gastown to be seeded after its first successful poll")
+	}
+	if _, ok := m.seededStores.Load("hq"); ok {
+		t.Fatal("hq must not be marked seeded while its polls are still failing")
+	}
+
+	// Cycle 2: hq still failing.
+	m.pollStoresSnapshot(m.stores)
+
+	// Cycle 3: hq's flakiness is exhausted, so it finally returns its
+	// pre-existing history — this is hq's own first *successful* poll.
+	if hadError := m.pollStoresSnapshot(m.stores); hadError {
+		mu.Lock()
+		t.Fatalf("expected no error once hq's flakiness is exhausted; logs: %v", logged)
+		mu.Unlock()
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, s := range logged {
+		if strings.Contains(s, "close detected") && strings.Contains(s, preexisting.ID) {
+			t.Errorf("pre-existing history was replayed as a new close event: %s (full logs: %v)", s, logged)
+		}
+	}
+	if _, ok := m.seededStores.Load("hq"); !ok {
+		t.Error("expected hq to be marked seeded after its own first successful poll")
+	}
+}
+
 func TestEventPoll_SkipsNonCloseEvents(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on Windows")
