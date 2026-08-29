@@ -32,6 +32,16 @@ const (
 	// second as the previous high-water mark are still visible next cycle.
 	eventPollLookback = 1 * time.Second
 
+	// eventPollSeedWindow bounds how far back a store's very first poll looks
+	// when it has no high-water mark yet. Querying since the Unix epoch scans
+	// the ENTIRE events table regardless of indexes (a predicate matching 100%
+	// of rows can't use an index to skip anything), which blows the beads
+	// pooled DSN's 10s read timeout once a store's history grows large enough
+	// (measured: 16.4s warm against a 114K-row table). A bounded window keeps
+	// the seed query fast, and nothing is lost: the seed poll is warm-up-only
+	// (see seededStores) and never processes the events it fetches. See gt-lurb.
+	eventPollSeedWindow = 24 * time.Hour
+
 	// convoyGracePeriod is how long after creation a convoy is immune from
 	// auto-close. This prevents a race where the daemon's stranded scan
 	// fires before the sling's bd dep add is visible in Dolt. See GH#2303.
@@ -101,10 +111,16 @@ type ConvoyManager struct {
 	// Key matches stores map keys ("hq", "gastown", etc.).
 	lastEventIDs sync.Map // map[string]time.Time
 
-	// seeded is true once the first poll cycle has run (warm-up).
-	// The first cycle advances high-water marks without processing events,
-	// preventing a burst of historical event replay on daemon restart.
-	seeded atomic.Bool
+	// seededStores tracks, per store name, whether that store's first poll
+	// cycle (warm-up) has run. The warm-up cycle advances a store's high-water
+	// mark without processing its events, preventing a burst of historical
+	// event replay on daemon restart. This MUST be per-store rather than a
+	// single global flag: stores seed at different times (a store whose seed
+	// poll times out retries on a later cycle), and a global flag flips to
+	// "seeded" as soon as ANY store finishes warm-up — so a slow store's
+	// eventual first successful poll is no longer treated as warm-up and its
+	// entire history is replayed instead of skipped. See gt-lurb.
+	seededStores sync.Map // map[string]bool
 
 	// processedCloses tracks issue IDs whose current closed state has already
 	// been processed. This prevents duplicate convoy checks when the same close
@@ -253,10 +269,10 @@ func (m *ConvoyManager) runEventPoll() {
 }
 
 // pollStoresSnapshot polls events from all non-parked stores in the snapshot.
-// The first call is a warm-up: it advances high-water marks without
-// processing events, preventing a burst of historical replay on restart.
-// A per-cycle seen set deduplicates close events across stores so each
-// issueID is processed at most once per poll cycle.
+// Each store's first poll is a warm-up: it advances that store's high-water
+// mark without processing events, preventing a burst of historical replay on
+// restart. A per-cycle seen set deduplicates close events across stores so
+// each issueID is processed at most once per poll cycle.
 // Returns true if any store poll encountered an error.
 func (m *ConvoyManager) pollStoresSnapshot(stores map[string]beadsdk.Storage) bool {
 	seen := make(map[string]bool)
@@ -269,7 +285,6 @@ func (m *ConvoyManager) pollStoresSnapshot(stores map[string]beadsdk.Storage) bo
 			hadError = true
 		}
 	}
-	m.seeded.CompareAndSwap(false, true)
 	return hadError
 }
 
@@ -279,21 +294,23 @@ func (m *ConvoyManager) pollStoresSnapshot(stores map[string]beadsdk.Storage) bo
 // The seen set deduplicates issueIDs across stores within a poll cycle.
 // Returns an error if the poll failed (used by caller for backoff decisions).
 func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map[string]beadsdk.Storage, seen map[string]bool) error {
-	// Load per-store high-water mark.
-	// Default to Unix epoch (not zero time) because Go's zero time.Time
-	// (0001-01-01) causes Dolt's SQL driver to produce +Inf when converting
-	// to a float parameter, triggering "Error 1366: +Inf is not a valid
-	// value for double". Unix epoch is safe for all SQL backends.
-	highWater := time.Unix(0, 0).UTC()
+	// Load per-store high-water mark. If this store has never been polled,
+	// seed from a bounded window (now - eventPollSeedWindow) rather than the
+	// Unix epoch: an unbounded seed query scans the entire events table and
+	// can blow the pooled DSN's read timeout once that table is large (see
+	// eventPollSeedWindow doc). This is safe to lose history for: the seed
+	// poll is warm-up-only and discards the events it fetches anyway.
+	highWater := time.Now().UTC().Add(-eventPollSeedWindow)
 	if v, ok := m.lastEventIDs.Load(name); ok {
 		highWater = v.(time.Time)
 	}
-	querySince := highWater
-	if !highWater.Equal(time.Unix(0, 0).UTC()) {
-		querySince = highWater.Add(-eventPollLookback)
-		if querySince.Before(time.Unix(0, 0).UTC()) {
-			querySince = time.Unix(0, 0).UTC()
-		}
+	// Go's zero time.Time (0001-01-01) causes Dolt's SQL driver to produce
+	// +Inf when converting to a float parameter, triggering "Error 1366:
+	// +Inf is not a valid value for double". Clamp to Unix epoch, which is
+	// safe for all SQL backends.
+	querySince := highWater.Add(-eventPollLookback)
+	if querySince.Before(time.Unix(0, 0).UTC()) {
+		querySince = time.Unix(0, 0).UTC()
 	}
 
 	events, err := store.GetAllEventsSince(m.ctx, querySince)
@@ -324,9 +341,11 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 	}
 	m.lastEventIDs.Store(name, highWater)
 
-	// First poll cycle is warm-up only: advance marks, skip processing.
-	// This prevents replaying the entire event history on daemon restart.
-	if !m.seeded.Load() {
+	// This store's first successful poll is warm-up only: advance its mark,
+	// skip processing. This prevents replaying the store's entire event
+	// history on daemon restart (or on this store's first poll after earlier
+	// attempts failed, e.g. timed out — see eventPollSeedWindow/seededStores).
+	if _, alreadySeeded := m.seededStores.LoadOrStore(name, true); !alreadySeeded {
 		for _, e := range events {
 			if e.ID == "" {
 				continue

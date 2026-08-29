@@ -39,6 +39,17 @@ func setupTestStore(t *testing.T) (beadsdk.Storage, func()) {
 	return store, func() { _ = store.Close() }
 }
 
+// markAllSeeded marks every currently configured store as having completed
+// its warm-up poll cycle, so pollStoresSnapshot processes events on the next
+// call instead of discarding them as warm-up.
+func (m *ConvoyManager) markAllSeeded() {
+	m.storesMu.Lock()
+	defer m.storesMu.Unlock()
+	for name := range m.stores {
+		m.seededStores.Store(name, true)
+	}
+}
+
 // scanTestOpts configures the mockGtForScanTest helper.
 type scanTestOpts struct {
 	strandedJSON  string // JSON for `gt convoy stranded --json`; default "[]"
@@ -150,7 +161,7 @@ func TestEventPoll_DetectsCloseEvents(t *testing.T) {
 	}
 
 	m := NewConvoyManager(townRoot, logger, "gt", 10*time.Minute, map[string]beadsdk.Storage{"hq": store}, nil, nil)
-	m.seeded.Store(true)
+	m.markAllSeeded()
 	m.pollStoresSnapshot(m.stores)
 
 	// Should have logged the close detection
@@ -1554,7 +1565,7 @@ func TestPollAllStores_MultiRig_DetectsCloseFromNonHqStore(t *testing.T) {
 	}
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
-	m.seeded.Store(true)
+	m.markAllSeeded()
 	m.pollStoresSnapshot(m.stores)
 
 	// The close event from the rig store should be detected
@@ -1617,7 +1628,7 @@ func TestPollAllStores_MultiRig_BothStoresPolled(t *testing.T) {
 	}
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
-	m.seeded.Store(true)
+	m.markAllSeeded()
 	m.pollStoresSnapshot(m.stores)
 
 	// Both close events should be detected
@@ -1695,7 +1706,7 @@ func TestPollAllStores_SkipsParkedRigs(t *testing.T) {
 	}
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, isParked)
-	m.seeded.Store(true)
+	m.markAllSeeded()
 	m.pollStoresSnapshot(m.stores)
 
 	// Active rig's close event should be detected
@@ -1753,7 +1764,7 @@ func TestPollAllStores_HqNeverSkippedEvenIfParkedCallbackReturnsTrue(t *testing.
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute,
 		map[string]beadsdk.Storage{"hq": store}, nil, alwaysParked)
-	m.seeded.Store(true)
+	m.markAllSeeded()
 	m.pollStoresSnapshot(m.stores)
 
 	found := false
@@ -1801,7 +1812,7 @@ func TestPollAllStores_HighWaterMark_NoReprocessing(t *testing.T) {
 		map[string]beadsdk.Storage{"hq": store}, nil, nil)
 
 	// First poll: should detect our close event
-	m.seeded.Store(true)
+	m.markAllSeeded()
 	m.pollStoresSnapshot(m.stores)
 
 	closeCount := 0
@@ -1853,7 +1864,7 @@ func TestPollAllStores_ReopenClearsCloseDedupAcrossPolls(t *testing.T) {
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute,
 		map[string]beadsdk.Storage{"hq": store}, nil, nil)
-	m.seeded.Store(true)
+	m.markAllSeeded()
 	m.pollStoresSnapshot(m.stores)
 
 	firstCloseCount := 0
@@ -1943,7 +1954,7 @@ func TestPollAllStores_ReopenResetsPerCycleDedup(t *testing.T) {
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute,
 		map[string]beadsdk.Storage{"hq": store}, nil, nil)
-	m.seeded.Store(true)
+	m.markAllSeeded()
 	m.pollStoresSnapshot(m.stores)
 
 	closeCount := 0
@@ -1996,7 +2007,7 @@ func TestPollAllStores_CrossStoreDedup(t *testing.T) {
 		"gastown": rigStore,
 	}
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
-	m.seeded.Store(true)
+	m.markAllSeeded()
 	m.pollStoresSnapshot(m.stores)
 
 	// Should see exactly 1 close detection for our issue, not 2
@@ -2127,7 +2138,7 @@ exit 0
 	}
 
 	m := NewConvoyManager(townRoot, logger, filepath.Join(binDir, "gt"), 10*time.Minute, map[string]beadsdk.Storage{"hq": store}, nil, nil)
-	m.seeded.Store(true)
+	m.markAllSeeded()
 	m.pollStoresSnapshot(m.stores)
 
 	// Only check for close events involving OUR issue — other tests may have
@@ -2174,7 +2185,7 @@ func TestPollStore_NilHqStore_LogsWarningAndSkips(t *testing.T) {
 	}
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
-	m.seeded.Store(true)
+	m.markAllSeeded()
 	m.pollStoresSnapshot(m.stores)
 
 	// Should log the nil hq warning
