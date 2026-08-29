@@ -40,56 +40,6 @@ func TestEffectivePolecatState(t *testing.T) {
 		want polecat.State
 	}{
 		{
-			// gt-azm0 regression: a live session holding an active issue is
-			// working, even if an earlier derivation concluded "stalled" from a
-			// lapsed heartbeat. Without this the polecat stayed stalled forever,
-			// was reported NEEDS_RECOVERY, and got reaped mid-task.
-			name: "session-running-stalled-with-fresh-heartbeat-becomes-working",
-			item: PolecatListItem{
-				State:          polecat.StateStalled,
-				Issue:          "gt-azm0",
-				SessionRunning: true,
-				HeartbeatFresh: true,
-			},
-			want: polecat.StateWorking,
-		},
-		{
-			// A wedged agent must still surface for recovery. SessionRunning is
-			// true for any surviving process (IsRunning passes maxInactivity=0,
-			// so AgentHung never fires), so liveness alone must NOT clear the
-			// stall — otherwise a deadlocked polecat reports Verdict=WORKING and
-			// holds its bead and capacity slot forever.
-			name: "session-running-stalled-without-fresh-heartbeat-stays-stalled",
-			item: PolecatListItem{
-				State:          polecat.StateStalled,
-				Issue:          "gt-azm0",
-				SessionRunning: true,
-				HeartbeatFresh: false,
-			},
-			want: polecat.StateStalled,
-		},
-		{
-			// A stalled polecat with no live session stays stalled — the fix
-			// must not paper over genuinely dead sessions.
-			name: "session-dead-stalled-with-issue-stays-stalled",
-			item: PolecatListItem{
-				State:          polecat.StateStalled,
-				Issue:          "gt-azm0",
-				SessionRunning: false,
-			},
-			want: polecat.StateStalled,
-		},
-		{
-			// Liveness alone is not work: no issue means no rewrite.
-			name: "session-running-stalled-without-issue-stays-stalled",
-			item: PolecatListItem{
-				State:          polecat.StateStalled,
-				SessionRunning: true,
-				HeartbeatFresh: true,
-			},
-			want: polecat.StateStalled,
-		},
-		{
 			name: "session-running-done-with-issue-becomes-working",
 			item: PolecatListItem{
 				State:          polecat.StateDone,

@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -1993,94 +1992,74 @@ func (m *Manager) ReconcilePoolWith(namesWithDirs, namesWithSessions []string) {
 
 // isSessionProcessDead checks if a polecat session's agent has exited.
 //
-// Uses heartbeat-based liveness detection (gt-qjtq) as a fast path, backed by
-// PID signal probing.
-//
-// A FRESH heartbeat is positive proof of life and short-circuits the PID probe.
-// A STALE heartbeat is NOT proof of death. Heartbeats are only written when a gt
-// command runs inside the session (see internal/cmd/root.go), so an agent that
-// spends longer than SessionHeartbeatStaleThreshold reasoning or editing files —
-// routine on a loaded box, where a single turn can run many minutes — goes stale
-// while perfectly healthy.
-//
-// Treating a stale heartbeat as death made `gt polecat list` report actively
-// working polecats as "stalled" with verdict NEEDS_RECOVERY, which drove the
-// witness to reap them mid-task and reassign their bead. The observed effect was
-// a bead churning through assignees with a shutdown each time and no commits
-// landing, and it got worse under load — exactly when turns are slowest and the
-// heartbeat most likely to lapse (gt-azm0).
-//
-// Returns true only when we can confirm the process is dead, not on transient
-// failures (gt-kncti: permission denied false positives) and not merely because
-// the agent has been busy without shelling out to gt.
 // sessionAgentAlive reports whether the agent process inside sessionName is
-// alive, probing the process tree rather than the pane's root process.
+// alive, probing the agent's process tree rather than the pane's root process.
 //
-// It is a package-level var so tests can exercise the stale-heartbeat
-// fall-through — the branch the whole safety argument rests on — without a live
-// tmux server.
-var sessionAgentAlive = func(t *tmux.Tmux, sessionName string) bool {
-	return t.IsAgentAlive(sessionName)
+// The second return distinguishes "confirmed not alive" from "could not tell".
+// tmux.IsAgentAlive has no error channel and returns a bare false for transient
+// failures — display-message erroring with GT_PANE_ID set, or pgrep/ps failing
+// with fork EAGAIN under load — so its false alone must never be read as death.
+//
+// A package-level var so tests can drive both arms without a live tmux server.
+var sessionAgentAlive = func(t *tmux.Tmux, sessionName string) (alive, ok bool) {
+	// A responsive tmux that still reports the session is the corroboration
+	// that turns "probe said no" into "the agent is genuinely gone".
+	exists, err := t.HasSession(sessionName)
+	if err != nil {
+		return false, false // tmux itself is unhealthy — no verdict
+	}
+	if !exists {
+		return false, true // session gone: confirmed dead
+	}
+	if t.IsAgentAlive(sessionName) {
+		return true, true
+	}
+	// Re-sample once: a single failed probe under load is not proof.
+	if t.IsAgentAlive(sessionName) {
+		return true, true
+	}
+	return false, true
 }
 
+// isSessionProcessDead reports whether a session's AGENT is confirmed gone.
+//
+// Heartbeat freshness is a fast path, not an oracle. Heartbeat files are written
+// only when a gt command runs inside a session (internal/cmd/root.go), so an
+// agent that spends longer than SessionHeartbeatStaleThreshold reasoning or
+// editing files — routine, and the norm on a loaded box — lets its heartbeat
+// lapse while perfectly healthy. Treating that as death made `gt polecat list`
+// report working polecats as stalled/NEEDS_RECOVERY and drove the witness to
+// reap them mid-task (gt-azm0). So a FRESH heartbeat proves life and
+// short-circuits; a stale one proves nothing and falls through to probing.
+//
+// Probing targets the agent's process tree, not GetPanePID: the pane's root
+// process is frequently a shell or exec-wrapper that outlives the agent, so
+// pane-PID liveness would hide a dead agent behind a surviving wrapper and
+// disable ReconcilePoolWith's stale-session kill (hq-k1ot / np-tt5s,
+// gt-jn40ft).
+//
+// Returns true ONLY on a corroborated verdict. Every uncertain outcome — no
+// tmux handle, an unhealthy tmux, an inconclusive probe — reports NOT dead.
+// This function's callers kill sessions (ReconcilePoolWith ->
+// KillSessionWithProcesses), so guessing wrong here destroys a healthy agent's
+// work mid-task; the conservative contract (gt-kncti) is load-bearing.
 func isSessionProcessDead(t *tmux.Tmux, sessionName string, townRoot string) bool {
-	// Fast path: a fresh heartbeat proves liveness without probing the process.
-	// A stale or absent heartbeat falls through to PID probing, which is the
-	// only signal that can actually distinguish "busy" from "dead".
 	if townRoot != "" {
 		if stale, exists := IsSessionHeartbeatStale(townRoot, sessionName); exists && !stale {
 			return false
 		}
 	}
 
-	// Without a tmux handle there is no way to probe, and an unprobeable
-	// session must not be reported dead (gt-kncti contract).
+	// No handle means no probe, and an unprobeable session is never dead.
 	if t == nil {
 		return false
 	}
 
-	// Probe the AGENT, not the pane. GetPanePID returns the pane's ROOT process,
-	// which is often a shell or exec-wrapper that outlives the agent — see
-	// session_manager.go ("heartbeat-fresh + pane-PID alive can hide a dead
-	// agent", hq-k1ot / np-tt5s). Relying on pane-PID liveness alone would make
-	// this fail open: an agent that crashed under a surviving wrapper pane would
-	// report alive forever, and the stale-session reap in ReconcilePoolWith
-	// (gt-jn40ft) could never fire.
-	//
-	// IsAgentAlive walks the process tree for the runtime itself — the same
-	// signal CheckSessionHealth level 2 and the witness's zombie detection
-	// already use for exactly this case. A busy agent's process is alive, so the
-	// gt-azm0 fix holds; a dead agent behind a live wrapper is still caught.
-	if !sessionAgentAlive(t, sessionName) {
-		return true
+	alive, ok := sessionAgentAlive(t, sessionName)
+	if !ok {
+		return false // could not tell — never guess death
 	}
-
-	// Pane-PID probing as a final confirmation for sessions where agent-tree
-	// detection is unavailable.
-	pidStr, err := t.GetPanePID(sessionName)
-	if err != nil {
-		// Tmux query failed — could be permission denied, server busy, etc.
-		// Don't assume dead; let a future cycle retry.
-		return false
-	}
-	if pidStr == "" {
-		// No PID means no process — session is dead.
-		return true
-	}
-	pid, err := strconv.Atoi(pidStr)
-	if err != nil {
-		// Got a non-numeric PID — shouldn't happen, but don't kill.
-		return false
-	}
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return true
-	}
-	// On Unix, Signal(0) checks if process exists without sending a signal
-	if err := p.Signal(syscall.Signal(0)); err != nil {
-		return true
-	}
-	return false
+	return !alive
 }
 
 // pendingMaxAge is how long a .pending reservation marker may exist before

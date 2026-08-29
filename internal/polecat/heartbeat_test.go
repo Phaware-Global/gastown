@@ -244,12 +244,12 @@ func TestIsSessionProcessDead_StaleHeartbeatLiveProcess(t *testing.T) {
 }
 
 // withAgentAliveProbe swaps the agent-liveness probe for the duration of a test
-// so the stale-heartbeat fall-through can be exercised without a tmux server.
-// The nil *tmux.Tmux the tests pass never reaches the real probe.
-func withAgentAliveProbe(t *testing.T, alive bool) {
+// so both arms of the stale-heartbeat fall-through can be exercised without a
+// tmux server. The nil *tmux.Tmux the older tests pass never reaches it.
+func withAgentAliveProbe(t *testing.T, alive, ok bool) {
 	t.Helper()
 	prev := sessionAgentAlive
-	sessionAgentAlive = func(*tmux.Tmux, string) bool { return alive }
+	sessionAgentAlive = func(*tmux.Tmux, string) (bool, bool) { return alive, ok }
 	t.Cleanup(func() { sessionAgentAlive = prev })
 }
 
@@ -267,37 +267,58 @@ func writeStaleHeartbeat(t *testing.T, townRoot, sessionName string) {
 }
 
 // TestIsSessionProcessDead_StaleHeartbeatProbesAgent covers the branch the whole
-// safety argument rests on: with the heartbeat stale, the verdict must come from
-// probing the AGENT, not from the heartbeat and not from the pane's root process.
+// safety argument rests on: with the heartbeat stale, the verdict comes from
+// probing the AGENT, and only a corroborated probe may report death.
 //
-// The pane process is frequently a shell or exec-wrapper that outlives the agent
-// (hq-k1ot / np-tt5s), so a dead agent behind a surviving wrapper pane must still
-// be reaped — otherwise ReconcilePoolWith's stale-session kill (gt-jn40ft) can
-// never fire and the session keeps its worktree and name-pool slot forever.
+// Callers of this function kill sessions (ReconcilePoolWith ->
+// KillSessionWithProcesses), so both directions are destructive if wrong: too
+// lenient and a dead agent behind a surviving wrapper pane keeps its worktree
+// and name-pool slot forever (hq-k1ot / np-tt5s, gt-jn40ft); too eager and a
+// transient pgrep/ps failure reaps a healthy agent mid-task (gt-kncti).
 func TestIsSessionProcessDead_StaleHeartbeatProbesAgent(t *testing.T) {
-	t.Run("agent dead behind live wrapper pane is reaped", func(t *testing.T) {
-		townRoot := t.TempDir()
-		sessionName := "gt-test-hb-stale-agent-dead"
-		writeStaleHeartbeat(t, townRoot, sessionName)
-		withAgentAliveProbe(t, false)
+	tests := []struct {
+		name     string
+		alive    bool
+		probeOK  bool
+		wantDead bool
+	}{
+		{
+			name:     "agent dead behind live wrapper pane is reaped",
+			alive:    false,
+			probeOK:  true,
+			wantDead: true,
+		},
+		{
+			// gt-azm0: an agent reasoning or editing past the threshold writes
+			// no heartbeat but is very much alive.
+			name:     "busy agent with a lapsed heartbeat is not reaped",
+			alive:    true,
+			probeOK:  true,
+			wantDead: false,
+		},
+		{
+			// gt-kncti: IsAgentAlive has no error channel and returns a bare
+			// false under load (fork EAGAIN, display-message errors). An
+			// inconclusive probe must never be read as death.
+			name:     "inconclusive probe must not report dead",
+			alive:    false,
+			probeOK:  false,
+			wantDead: false,
+		},
+	}
 
-		if !isSessionProcessDead(&tmux.Tmux{}, sessionName, townRoot) {
-			t.Error("stale heartbeat + dead agent must report dead")
-		}
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			townRoot := t.TempDir()
+			sessionName := "gt-test-" + tt.name
+			writeStaleHeartbeat(t, townRoot, sessionName)
+			withAgentAliveProbe(t, tt.alive, tt.probeOK)
 
-	t.Run("busy agent with a lapsed heartbeat is not reaped", func(t *testing.T) {
-		townRoot := t.TempDir()
-		sessionName := "gt-test-hb-stale-agent-alive"
-		writeStaleHeartbeat(t, townRoot, sessionName)
-		withAgentAliveProbe(t, true)
-
-		// gt-azm0: an agent reasoning or editing for longer than the threshold
-		// writes no heartbeat but is very much alive.
-		if isSessionProcessDead(&tmux.Tmux{}, sessionName, townRoot) {
-			t.Error("stale heartbeat + live agent must NOT report dead")
-		}
-	})
+			if got := isSessionProcessDead(&tmux.Tmux{}, sessionName, townRoot); got != tt.wantDead {
+				t.Errorf("isSessionProcessDead() = %v, want %v", got, tt.wantDead)
+			}
+		})
+	}
 
 	t.Run("fresh heartbeat short-circuits without probing", func(t *testing.T) {
 		townRoot := t.TempDir()
@@ -306,7 +327,7 @@ func TestIsSessionProcessDead_StaleHeartbeatProbesAgent(t *testing.T) {
 
 		probed := false
 		prev := sessionAgentAlive
-		sessionAgentAlive = func(*tmux.Tmux, string) bool { probed = true; return false }
+		sessionAgentAlive = func(*tmux.Tmux, string) (bool, bool) { probed = true; return false, true }
 		t.Cleanup(func() { sessionAgentAlive = prev })
 
 		if isSessionProcessDead(&tmux.Tmux{}, sessionName, townRoot) {
