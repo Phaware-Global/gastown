@@ -615,11 +615,17 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) (retErr
 			nudgeErr := m.tmux.NudgeSessionWithOpts(sessionID, startupNudgeContent,
 				tmux.NudgeOpts{TownRoot: m.townRoot(), ClearOnStrand: true})
 			debugSession("SendStartupNudge", nudgeErr)
-			if errors.Is(nudgeErr, tmux.ErrNudgeStranded) {
+			if errors.Is(nudgeErr, tmux.ErrNudgeStranded) && !errors.Is(nudgeErr, tmux.ErrNudgeStrandNotCleared) {
 				// The prompt was typed, then wiped by ClearOnStrand. The agent is
 				// still busy and its box is now empty, so the verify gate below
 				// would read that as "delivered" and skip the retry. Force the
 				// first attempt to re-nudge unconditionally.
+				//
+				// Only when the clear actually SUCCEEDED. If the C-u failed the
+				// text is still in the box and the agent's deferred auto-submit
+				// will deliver it, so forcing a re-delivery would submit the work
+				// prompt twice and could start the bead twice. In that case leave
+				// the normal busy/cleared gate to decide.
 				startupNudgeStranded = true
 			}
 		}

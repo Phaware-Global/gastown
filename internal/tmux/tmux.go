@@ -56,6 +56,16 @@ var (
 	// rather than reporting failure. Distinguished from ErrAgentBusy, which is
 	// detected *before* any text is typed. (GH#gt-nudge-strand)
 	ErrNudgeStranded = errors.New("nudge text stranded in input box: agent went busy mid-paste")
+
+	// ErrNudgeStrandNotCleared accompanies ErrNudgeStranded when ClearOnStrand
+	// was requested but the clearing keystroke itself failed, so the stranded
+	// text is STILL in the input box.
+	//
+	// Callers must distinguish the two: after a successful clear the box is
+	// empty and a re-delivery is required, but here the original text survives
+	// and the agent's deferred auto-submit will still deliver it — so
+	// re-delivering as well submits the message twice.
+	ErrNudgeStrandNotCleared = errors.New("stranded nudge text could not be cleared from the input box")
 	// ErrEmptyMessage is returned when a nudge message is empty after
 	// sanitization (e.g. whitespace/control-chars only). Delivering it would
 	// just press Enter into the agent's input box — a silent no-op that looks
@@ -2041,6 +2051,9 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 		// Claude Code's deferred auto-submit from duplicating that copy.
 		if opts.ClearOnStrand && errors.Is(err, ErrNudgeStranded) {
 			if _, cerr := t.run("send-keys", "-t", target, "C-u"); cerr != nil {
+				// Signal that the text is still in the box, so a caller keying
+				// re-delivery off the strand does not duplicate the message.
+				err = fmt.Errorf("%w: %w", err, ErrNudgeStrandNotCleared)
 				// The clear is what prevents Claude Code's deferred auto-submit of
 				// the stranded text from duplicating the requeued copy. If it
 				// fails, surface it so operators can tell "cleared + requeued"
