@@ -1956,15 +1956,6 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 		}
 	}
 
-	// 1.6. ClearBeforeSend: wipe the input box under the delivery lock so this
-	// message replaces any text already sitting there instead of concatenating
-	// with it. Callers retrying against a known-stranded box set this.
-	if opts.ClearBeforeSend {
-		if _, cerr := t.run("send-keys", "-t", target, "C-u"); cerr != nil {
-			return fmt.Errorf("clearing input box before send for session %q: %w", session, cerr)
-		}
-	}
-
 	// 2. Sanitize control characters that corrupt delivery
 	sanitized := sanitizeNudgeMessage(message)
 
@@ -1975,9 +1966,28 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 		return ErrEmptyMessage
 	}
 
+	// 2.6. ClearBeforeSend: wipe the input box under the delivery lock so this
+	// message replaces any text already there instead of concatenating with it.
+	//
+	// Ordered AFTER the empty-message guard and immediately before the send, so
+	// no path can empty the box and then return without typing. Clearing without
+	// delivering destroys the message outright — worse than leaving stranded
+	// text, which Claude Code's deferred auto-submit would still deliver.
+	if opts.ClearBeforeSend {
+		if _, cerr := t.run("send-keys", "-t", target, "C-u"); cerr != nil {
+			return fmt.Errorf("clearing input box before send for session %q: %w", session, cerr)
+		}
+	}
+
 	// 3. Send text via send-keys -l. Messages > 512 bytes are chunked
 	//    with 10ms inter-chunk delays to avoid argument length limits.
 	if err := t.sendMessageToTarget(target, sanitized); err != nil {
+		if opts.ClearBeforeSend {
+			// The box was just emptied and the text never landed. Report this as
+			// a strand so the caller re-delivers rather than treating it as a
+			// terminal failure and dropping a message it has already erased.
+			return fmt.Errorf("send after clearing input box for session %q: %w: %w", session, err, ErrNudgeStranded)
+		}
 		return err
 	}
 

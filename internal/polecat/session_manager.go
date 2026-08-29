@@ -19,6 +19,7 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/execution"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
@@ -970,6 +971,36 @@ func (m *SessionManager) validateIssue(issueID, workDir string) error {
 	return nil
 }
 
+// queueStartupNudge hands the startup prompt to the nudge queue and guarantees a
+// drain, for the cases where re-typing it into the pane is unsafe or has been
+// exhausted.
+//
+// Without this the prompt is simply lost: the retry path clears the box before
+// each attempt, so abandoning the loop after a clear leaves the polecat with no
+// work instructions at all — it sits idle, is reaped, and its bead is reassigned
+// (gt-azm0). Best-effort by design; failures are logged, never fatal to startup.
+func (m *SessionManager) queueStartupNudge(sessionID, content, reason string) {
+	townRoot := m.townRoot()
+	if townRoot == "" {
+		fmt.Fprintf(os.Stderr, "[startup-nudge] WARNING: cannot queue startup nudge for %s (%s): no town root\n",
+			sessionID, reason)
+		return
+	}
+	if err := nudge.Enqueue(townRoot, sessionID, nudge.QueuedNudge{
+		Sender:  "witness",
+		Message: content,
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "[startup-nudge] WARNING: queueing startup nudge for %s failed (%s): %v\n",
+			sessionID, reason, err)
+		return
+	}
+	if _, err := nudge.StartPoller(townRoot, sessionID); err != nil {
+		fmt.Fprintf(os.Stderr, "[startup-nudge] WARNING: queued startup nudge for %s but no poller (%s): %v\n",
+			sessionID, reason, err)
+	}
+	fmt.Fprintf(os.Stderr, "[startup-nudge] queued startup nudge for %s (%s)\n", sessionID, reason)
+}
+
 // verifyStartupNudgeDelivery checks if the polecat started working after the
 // startup nudge and retries the nudge if the agent is truly idle.
 // This fixes the Mode B race condition (GH#1379) where the startup nudge arrives
@@ -1027,31 +1058,61 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
 		// pane looks like: ClearOnStrand already emptied the box, so the
 		// busy+cleared check below would misread the wipe as successful delivery
 		// and skip the retry in exactly the case it exists for.
+		busy := !m.tmux.IsIdle(sessionID)
 		if !stranded {
 			// A busy agent usually means the nudge landed — but "went busy
 			// mid-paste" is precisely what strands text, so confirm the box is
 			// actually empty before trusting busy as proof of delivery.
-			if !m.tmux.IsIdle(sessionID) && m.tmux.InputBoxCleared(sessionID) {
+			if busy && m.tmux.InputBoxCleared(sessionID) {
 				return // Agent is busy and its box is empty — nudge was received
 			}
+			if busy {
+				// Busy with a NON-empty box that we did not strand: the text
+				// belongs to someone else's in-flight nudge. Clearing would
+				// destroy their message, so hand ours to the queue instead of
+				// typing over theirs, and let the drain deliver it.
+				m.queueStartupNudge(sessionID, retryContent, "another sender's text is in the input box")
+				return
+			}
 		}
+		ownStrand := stranded
 		stranded = false // only the first attempt is forced
 
-		// Either the agent is idle (nudge likely lost), it is busy with text
-		// still unsubmitted (nudge stranded), or we cleared a strand and owe a
-		// re-delivery. Retry.
+		// Either the agent is idle (nudge likely lost) or we cleared our own
+		// strand and owe a re-delivery.
 		fmt.Fprintf(os.Stderr, "[startup-nudge] attempt %d/%d: re-delivering startup nudge to %s\n",
 			attempt, maxRetries, sessionID)
-		// ClearBeforeSend is mandatory here: this branch runs against a box that
-		// may be non-empty by construction, and the delivery protocol has no
-		// pre-clear. Without it the retry is appended to the stranded text and
-		// submitted as one fused instruction — and the Enter verification would
-		// then see a bare prompt and report success, hiding the corruption.
-		if err := m.tmux.NudgeSessionWithOpts(sessionID, retryContent,
-			tmux.NudgeOpts{TownRoot: m.townRoot(), ClearOnStrand: true, ClearBeforeSend: true}); err != nil {
-			fmt.Fprintf(os.Stderr, "[startup-nudge] retry nudge failed for %s: %v\n", sessionID, err)
-			return
+		// ClearBeforeSend guards against typing onto leftover text: an idle
+		// agent's box may still hold an unsubmitted beacon, and appending to it
+		// would submit one fused instruction that Enter verification reports as
+		// success. Safe here because the box is either empty (our own strand was
+		// just cleared) or holds only leftovers belonging to this startup.
+		nErr := m.tmux.NudgeSessionWithOpts(sessionID, retryContent,
+			tmux.NudgeOpts{TownRoot: m.townRoot(), ClearOnStrand: true, ClearBeforeSend: true})
+		if nErr == nil {
+			continue
 		}
+		if errors.Is(nErr, tmux.ErrNudgeStranded) {
+			// The retry stranded too, and its text has just been cleared. This is
+			// the EXPECTED outcome against a busy agent, not a corner case, so it
+			// must not be terminal: returning here would end the loop having
+			// erased the prompt for good — the exact failure this path exists to
+			// prevent. Carry the strand into the next attempt.
+			fmt.Fprintf(os.Stderr, "[startup-nudge] attempt %d/%d stranded for %s; retrying\n",
+				attempt, maxRetries, sessionID)
+			stranded = true
+			_ = ownStrand
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "[startup-nudge] retry nudge failed for %s: %v\n", sessionID, nErr)
+		return
+	}
+
+	// Retries exhausted. The prompt has been cleared at least once, so leaving
+	// now would drop it entirely; hand it to the queue so a drain can still
+	// deliver it.
+	if !m.tmux.InputBoxCleared(sessionID) || m.tmux.IsIdle(sessionID) {
+		m.queueStartupNudge(sessionID, retryContent, "retries exhausted")
 	}
 
 	// If we exhausted retries and the agent is still idle, log a warning.

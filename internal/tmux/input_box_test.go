@@ -2,6 +2,8 @@ package tmux
 
 import (
 	"errors"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -225,5 +227,44 @@ func TestNudgeOptsClearSemantics(t *testing.T) {
 	}
 	if !retry.ClearOnStrand {
 		t.Error("a retry that re-delivers should also clear on a fresh strand")
+	}
+}
+
+// TestClearBeforeSendOrdering guards the invariant that makes ClearBeforeSend
+// safe: the box must never be emptied on a path that then returns without
+// typing. Clearing without delivering destroys the message outright — strictly
+// worse than leaving stranded text, which the agent would eventually auto-submit.
+//
+// Enforced structurally by ordering the C-u after the empty-message guard and
+// immediately before the send, and by reporting a post-clear send failure as
+// ErrNudgeStranded so the caller re-delivers instead of dropping a prompt it has
+// already erased.
+func TestClearBeforeSendOrdering(t *testing.T) {
+	t.Parallel()
+
+	src, err := os.ReadFile("tmux.go")
+	if err != nil {
+		t.Fatalf("reading tmux.go: %v", err)
+	}
+	body := string(src)
+
+	clearIdx := strings.Index(body, "if opts.ClearBeforeSend {")
+	if clearIdx == -1 {
+		t.Fatal("ClearBeforeSend block not found")
+	}
+	guardIdx := strings.Index(body, "if sanitized == \"\" {")
+	if guardIdx == -1 {
+		t.Fatal("empty-message guard not found")
+	}
+	sendIdx := strings.Index(body, "t.sendMessageToTarget(target, sanitized)")
+	if sendIdx == -1 {
+		t.Fatal("sendMessageToTarget call not found")
+	}
+
+	if clearIdx < guardIdx {
+		t.Error("ClearBeforeSend must run AFTER the empty-message guard, or an empty payload empties the box and returns without typing")
+	}
+	if clearIdx > sendIdx {
+		t.Error("ClearBeforeSend must run BEFORE the send, or the retry concatenates onto existing text")
 	}
 }

@@ -335,10 +335,17 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		// the UserPromptSubmit hook needs user input the agent will never get. The
 		// other queue-degradation paths in this function each start a drain for
 		// exactly this reason, so do the same before reporting the nudge queued.
+		//
+		// StartPoller is the drain: it launches a detached `gt nudge-poller` that
+		// survives this CLI exiting, so it returns immediately. Only if it fails
+		// do we fall back to the synchronous watcher — that one blocks for up to
+		// idleWatcherTimeout, and runNudgeChannel calls deliverNudge sequentially,
+		// so blocking unconditionally would turn a fan-out across N busy agents
+		// into an N*60s stall on the very mode operators pick for urgency.
 		if _, err := nudge.StartPoller(townRoot, sessionName); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not start nudge poller for %s: %v\n", sessionName, err)
+			fmt.Fprintf(os.Stderr, "Warning: could not start nudge poller for %s: %v; watching inline\n", sessionName, err)
+			watchAndDeliver(t, townRoot, sessionName)
 		}
-		watchAndDeliver(t, townRoot, sessionName)
 		fmt.Fprintf(os.Stderr, "Note: agent went busy mid-paste; nudge queued and a drain was started\n")
 		return nil
 	}
