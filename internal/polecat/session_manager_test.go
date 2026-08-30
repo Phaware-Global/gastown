@@ -1182,11 +1182,7 @@ func (f *fakeStartupTmux) NudgeSessionWithOpts(_, message string, _ tmux.NudgeOp
 // it, so the loop must NOT re-type it — that second copy is what starts the bead
 // twice.
 func TestVerifyStartupNudgeDelivery_DoesNotResendWhenTheClearFailed(t *testing.T) {
-	townRoot := t.TempDir()
-	rigPath := filepath.Join(townRoot, "testrig")
-	if err := os.MkdirAll(rigPath, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	_, rigPath := newFastVerifyTown(t)
 
 	notCleared := fmt.Errorf("%w: %w", tmux.ErrNudgeStranded, tmux.ErrNudgeStrandNotCleared)
 	fake := &fakeStartupTmux{
@@ -1208,5 +1204,59 @@ func TestVerifyStartupNudgeDelivery_DoesNotResendWhenTheClearFailed(t *testing.T
 	// send may happen.
 	if fake.sendCalls > 1 {
 		t.Errorf("loop sent %d times after a failed clear; the surviving copy plus a resend delivers the prompt twice", fake.sendCalls)
+	}
+}
+
+// newFastVerifyTown builds a town whose startup-nudge verify delay is
+// negligible, so loop tests cost milliseconds instead of the 25s default per
+// attempt.
+func newFastVerifyTown(t *testing.T) (townRoot, rigPath string) {
+	t.Helper()
+	townRoot = t.TempDir()
+	rigPath = filepath.Join(townRoot, "testrig")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settingsDir := filepath.Join(townRoot, "settings")
+	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := `{"operational":{"session":{"startup_nudge_verify_delay":"1ms","startup_nudge_max_retries":2}}}`
+	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return townRoot, rigPath
+}
+
+// TestVerifyStartupNudgeDelivery_QueuesWhenDeliveryIsUnconfirmed holds the LOSS
+// direction of the loop's contract, which the duplicate test does not reach.
+//
+// The queue is the only thing standing between an unconfirmed delivery and a
+// polecat that never receives its work prompt — it sits idle, is reaped, and its
+// bead is reassigned (gt-azm0). Without this, deleting the queue call entirely
+// left the suite green.
+func TestVerifyStartupNudgeDelivery_QueuesWhenDeliveryIsUnconfirmed(t *testing.T) {
+	townRoot, rigPath := newFastVerifyTown(t)
+
+	// A terminal, non-strand error: NudgeSessionWithOpts gave up before typing
+	// (a nudge-lock timeout), while Start's ClearOnStrand had already emptied the
+	// box — so the prompt is gone and a delivery is still owed.
+	fake := &fakeStartupTmux{
+		idle:       false,
+		boxCleared: true,
+		sendErrs:   []error{errors.New("nudge lock timeout for session")},
+	}
+	m := &SessionManager{
+		rig:        &rig.Rig{Name: "testrig", Path: rigPath},
+		verifyTmux: fake,
+	}
+
+	rc := &config.RuntimeConfig{Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "❯ "}}
+	m.verifyStartupNudgeDelivery("gt-testrig-probe", rc, "startup work prompt", true /* stranded */)
+
+	queueDir := filepath.Join(townRoot, ".runtime", "nudge_queue", "gt-testrig-probe")
+	entries, err := os.ReadDir(queueDir)
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("the prompt was cleared and never delivered, so it must be queued; found no queue entry under %s (err=%v)", queueDir, err)
 	}
 }
