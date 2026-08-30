@@ -1122,8 +1122,25 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// PR's branch) silently reports success while the reviewed
 				// defect merges unfixed. n==0 (no open PR on this branch) is
 				// also a mismatch and fails here.
-				if n, findErr := g.FindPRNumber(branch); findErr == nil && n != completion.reusePR {
-					return fmt.Errorf("review-fix bead targets PR #%d but branch %s is on PR #%d", completion.reusePR, branch, n)
+				//
+				// FindPRNumber's error return covers real failures (gh
+				// unauthenticated, rate-limited, offline, not installed),
+				// not just "no open PR" — a real failure must not silently
+				// skip verification. Fall back to comparing branch against
+				// the dispatch bead's review_branch (no network needed) and
+				// only accept the reuse when one of the two checks passed.
+				verified := false
+				if n, findErr := g.FindPRNumber(branch); findErr == nil {
+					verified = true
+					if n != completion.reusePR {
+						return fmt.Errorf("review-fix bead targets PR #%d but branch %s is on PR #%d", completion.reusePR, branch, n)
+					}
+				} else {
+					style.PrintWarning("could not verify branch %s is PR #%d via gh: %v", branch, completion.reusePR, findErr)
+				}
+				if !verified && (attachmentFields.ReviewBranch == "" || attachmentFields.ReviewBranch != branch) {
+					return fmt.Errorf("could not verify branch %s is PR #%d's head (gh lookup failed and branch doesn't match the dispatch bead's review_branch %q) — refusing to report success against an unverified branch",
+						branch, completion.reusePR, attachmentFields.ReviewBranch)
 				}
 				prNumber = completion.reusePR
 				prURL = fmt.Sprintf("#%d", prNumber)
@@ -1286,7 +1303,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// otherwise the PR sits orphaned from the merge pipeline
 				// while gt done reports success.
 				if mrIssue, findErr := bd.FindMRForReviewPR(completion.reusePR); findErr != nil {
-					style.PrintWarning("could not verify MR bead for reused PR #%d: %v", completion.reusePR, findErr)
+					mrFailed = true
+					doneErrors = append(doneErrors, fmt.Sprintf(
+						"could not verify an MR bead tracks reused PR #%d (%v); refinery pickup of branch %s is unconfirmed - dispatcher intervention required",
+						completion.reusePR, findErr, branch))
 				} else if mrIssue == nil {
 					mrFailed = true
 					doneErrors = append(doneErrors, fmt.Sprintf(
@@ -1359,6 +1379,12 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// existing PR's branch, and that PR's MR bead already
 				// carries review_pr — there was no handoff to attempt.
 				closeReason += fmt.Sprintf("; review-fix dispatch completed against PR #%d", completion.reusePR)
+				if mrFailed {
+					// mrFailed was set above when no live MR bead could be
+					// confirmed for this PR (lookup error or none found) —
+					// the audit trail must not read as a clean completion.
+					closeReason += "; but no live MR bead tracks it - refinery will not pick up"
+				}
 			case prURL != "":
 				// prURL is non-empty but refineryOwnsMerge is false —
 				// MR bead creation failed. Flag that so the audit
