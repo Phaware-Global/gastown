@@ -158,6 +158,13 @@ type ConvoyManager struct {
 	// and must not be silently dropped just because this store's own first
 	// poll cycle came late (e.g. it was hitting the seed query timeout while
 	// other stores seeded quickly). See gt-lurb.
+	//
+	// Truncated to whole seconds because beads/Dolt event CreatedAt is
+	// second-precision (CURRENT_TIMESTAMP); comparing an untruncated
+	// wall-clock time.Now() against a second-truncated DB value could
+	// classify an event as pre-existing history even though it happened
+	// after the daemon started, just because it landed in the same wall
+	// second as startup.
 	startedAt time.Time
 }
 
@@ -187,7 +194,7 @@ func NewConvoyManager(townRoot string, logger func(format string, args ...interf
 		openStores:   openStores,
 		isRigParked:  isRigParked,
 		gtPath:       gtPath,
-		startedAt:    time.Now().UTC(),
+		startedAt:    time.Now().UTC().Truncate(time.Second),
 	}
 }
 
@@ -378,13 +385,21 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 				// the pool ReadTimeout. Retrying the same unservable query
 				// forever would leave this store's close detection dark
 				// indefinitely (the stranded scan is the only remaining
-				// backstop). Give up on backfilling and seed at "now" instead,
-				// the same escape the +Inf/NaN branch above already takes.
+				// backstop). Give up on backfilling, but seed at the manager's
+				// own startedAt rather than wall-clock now: seeding at "now"
+				// would silently discard every close between daemon startup
+				// and this point, which is exactly what the startedAt floor
+				// elsewhere in this function exists to prevent. Clamp to the
+				// seed window as a ceiling on the resulting query size.
 				now := time.Now().UTC()
-				m.lastEventIDs.Store(name, now)
+				seedFrom := m.startedAt
+				if floor := now.Add(-eventPollSeedWindow); seedFrom.Before(floor) {
+					seedFrom = floor
+				}
+				m.lastEventIDs.Store(name, seedFrom)
 				m.seededStores.Store(name, true)
 				m.seedFailures.Delete(name)
-				m.logger("Convoy: event poll (%s): seed poll failed %d consecutive times, giving up on backfill and seeding at %s", name, failCount, now.Format(time.RFC3339))
+				m.logger("Convoy: event poll (%s): seed poll failed %d consecutive times, giving up on backfill and seeding at %s", name, failCount, seedFrom.Format(time.RFC3339))
 				return nil
 			}
 		}
@@ -421,7 +436,7 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 	// happened after startup.
 	if _, alreadySeeded := m.seededStores.Load(name); !alreadySeeded {
 		var preExisting []*beadsdk.Event
-		events, preExisting = partitionByStartedAt(events, m.startedAt)
+		events, preExisting = partitionByStartedAt(events, m.startedAt, time.Now().UTC())
 		for _, e := range preExisting {
 			if e.ID == "" {
 				continue
@@ -432,7 +447,14 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 		}
 		m.seededStores.Store(name, true)
 		// Fall through: any events at/after startedAt are processed normally
-		// below, same as a store that was already seeded.
+		// below, same as a store that was already seeded. If this store's
+		// seed poll kept failing (e.g. a Dolt outage spanning startup), that
+		// fall-through set can be large and every close in it is processed
+		// inline on this goroutine — log its size so a resulting nudge/sling
+		// burst is attributable to a late warm-up instead of unexplained.
+		if len(events) > 0 {
+			m.logger("Convoy: event poll (%s): late warm-up processing %d event(s) from startup backlog", name, len(events))
+		}
 	}
 
 	// Use hq store for convoy lookups (convoys are hq-* prefixed)
@@ -513,11 +535,16 @@ func isInfNaNError(err error) bool {
 }
 
 // partitionByStartedAt splits events into those created at or after cutoff
-// (returned first, for normal processing) and those created before it
-// (returned second, pre-existing history to discard during warm-up).
-func partitionByStartedAt(events []*beadsdk.Event, cutoff time.Time) (atOrAfter, before []*beadsdk.Event) {
+// and at or before now (returned first, for normal processing) and
+// everything else (returned second, history to discard during warm-up).
+// Events timestamped after now are treated as history too, not as
+// legitimately post-startup: their CreatedAt comes from the store (DB clock
+// or a corrupted row), not this process, so a clock skewed ahead of the
+// daemon host — or a single future-dated row — must not be trusted to
+// bypass the warm-up discard and replay the entire seed window as new.
+func partitionByStartedAt(events []*beadsdk.Event, cutoff, now time.Time) (atOrAfter, before []*beadsdk.Event) {
 	for _, e := range events {
-		if e.CreatedAt.Before(cutoff) {
+		if e.CreatedAt.Before(cutoff) || e.CreatedAt.After(now) {
 			before = append(before, e)
 		} else {
 			atOrAfter = append(atOrAfter, e)

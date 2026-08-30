@@ -225,6 +225,12 @@ func TestPollStore_SlowStoreSeedsIndependently_NoReplayAfterOtherStoresSeed(t *t
 		t.Fatalf("CloseIssue: %v", err)
 	}
 
+	// Event CreatedAt is second-precision (Dolt CURRENT_TIMESTAMP) and so is
+	// ConvoyManager.startedAt (truncated to match). Without this gap, the
+	// close above and NewConvoyManager below could land in the same wall
+	// second and the test would flake on the boundary it's asserting about.
+	time.Sleep(1100 * time.Millisecond)
+
 	slowStore := &flakyStorage{Storage: slowRealStore}
 	slowStore.failsRemaining.Store(2)
 
