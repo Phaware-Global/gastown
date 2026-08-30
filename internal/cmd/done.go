@@ -1114,6 +1114,17 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			}
 
 			if completion.reusePR > 0 {
+				// The reuse path force-closes the bead as "completed against
+				// PR #N" without ever pushing anything to that PR — verify
+				// the branch we're actually on is PR #N's head before taking
+				// it, or a review-fix polecat landed on the wrong branch
+				// (e.g. its own polecat/<name>-<bead> branch instead of the
+				// PR's branch) silently reports success while the reviewed
+				// defect merges unfixed. n==0 (no open PR on this branch) is
+				// also a mismatch and fails here.
+				if n, findErr := g.FindPRNumber(branch); findErr == nil && n != completion.reusePR {
+					return fmt.Errorf("review-fix bead targets PR #%d but branch %s is on PR #%d", completion.reusePR, branch, n)
+				}
 				prNumber = completion.reusePR
 				prURL = fmt.Sprintf("#%d", prNumber)
 				fmt.Printf("%s Review-fix dispatch: completing against existing PR #%d (no new PR, no new MR bead)\n",
@@ -1264,6 +1275,24 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				doneErrors = append(doneErrors, fmt.Sprintf(
 					"PR appears to exist on branch %s but PR number could not be resolved (URL parse + FindPRNumber both failed); refinery will not pick up and manual dispatcher intervention is required",
 					branch))
+			} else if completion.reusePR > 0 {
+				// Reused-PR path skips the handoff above on the assumption
+				// that PR #N's MR bead already exists and already carries
+				// review_pr. That assumption isn't checked anywhere else —
+				// a review-fix dispatch bead only carries review_pr/branch/
+				// source_issue, so review_pr can point at a PR whose MR bead
+				// is gone (closed, superseded, hand-stamped). Verify one is
+				// actually live before declaring this a clean completion;
+				// otherwise the PR sits orphaned from the merge pipeline
+				// while gt done reports success.
+				if mrIssue, findErr := bd.FindMRForReviewPR(completion.reusePR); findErr != nil {
+					style.PrintWarning("could not verify MR bead for reused PR #%d: %v", completion.reusePR, findErr)
+				} else if mrIssue == nil {
+					mrFailed = true
+					doneErrors = append(doneErrors, fmt.Sprintf(
+						"review-fix dispatch reused PR #%d but no live MR bead tracks it (review_pr=%d); refinery will not pick up branch %s — dispatcher intervention required",
+						completion.reusePR, completion.reusePR, branch))
+				}
 			}
 
 			// Mail dispatcher with READY_FOR_REVIEW.

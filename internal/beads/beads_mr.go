@@ -128,6 +128,34 @@ func pickMRForBranch(issues []*Issue, branch string, skipClosed bool) *Issue {
 	return nil
 }
 
+// FindMRForReviewPR searches for a live (non-closed) merge-request bead
+// tracking the given review-fix PR via its review_pr field. Returns the MR
+// bead if found, nil if none tracks that PR. Used by the reused-PR
+// completion path in `gt done` to verify a review-fix dispatch's assumption
+// that an MR bead already exists before skipping the refinery handoff.
+func (b *Beads) FindMRForReviewPR(reviewPR int) (*Issue, error) {
+	if reviewPR <= 0 {
+		return nil, nil
+	}
+	issues, err := b.ListMergeRequests(ListOptions{
+		Status: "all",
+		Label:  "gt:merge-request",
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, issue := range issues {
+		if issue.Status == "closed" {
+			continue
+		}
+		fields := ParseMRFields(issue)
+		if fields != nil && fields.ReviewPR == reviewPR {
+			return issue, nil
+		}
+	}
+	return nil, nil
+}
+
 // FindOpenMRsForIssue returns all open merge-request beads whose source_issue
 // matches the given issue ID. Used to find prior attempts when re-dispatching
 // an issue and to supersede old MRs when a new one is created.
