@@ -151,7 +151,17 @@ var reviewerCheckoutCmd = &cobra.Command{
 This is the only sanctioned way the Reviewer touches git: it never creates a
 branch and never pushes. With --sha the worktree detaches at exactly that commit
 (the SHA the Reviewer was asked to review), so the review is anchored even if
-upstream HEAD has moved.`,
+upstream HEAD has moved.
+
+If the PR is behind its base branch, the branch is updated first (the "Update
+branch" merge, via gh) and the worktree detaches at the resulting commit — a
+head behind its base is not the code that would result from merging, so
+reviewing it misses interactions with work already on the base and raises
+findings the base has already fixed. An update supersedes --sha; the command
+prints the SHA it actually checked out, and that is the one the rest of the
+round must pass to 'reviewer prompt' and 'reviewer post'. Failures to update
+(most often a branch that conflicts with its base) are reported and the review
+proceeds against the current head.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runReviewerCheckout,
 }
@@ -247,7 +257,8 @@ func init() {
 	_ = reviewerPostCmd.MarkFlagRequired("findings")
 
 	reviewerCheckoutCmd.Flags().StringVar(&reviewerCheckoutSHA, "sha", "",
-		"specific commit SHA to detach at (default: fetched PR head)")
+		"specific commit SHA to detach at (default: fetched PR head); superseded when the "+
+			"PR is behind its base and the branch is updated first")
 	// Round is telemetry, not behavior: it is what tells an operator staring at a
 	// stalled reviewer whether this is a first review or a fix round. Checkout is
 	// the only writer of a queued review's identity, so without this the field is
@@ -522,8 +533,31 @@ func runReviewerCheckout(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	g := git.NewGit(cwd)
-	if err := g.CheckoutPRHeadDetached(prNumber, reviewerCheckoutSHA); err != nil {
+
+	// Bring the PR up to date with its base BEFORE detaching. A head behind its
+	// base is not the code that would result from merging: a review of it can
+	// miss an interaction with work already on the base, and can raise findings
+	// the base has already fixed — which then cost a fix round to argue away.
+	// Doing it here, at the one step that initializes the worktree for a PR,
+	// means every review round starts from a mergeable head without the agent
+	// having to remember.
+	sha := reviewerCheckoutSHA
+	if updateReviewerPRIfBehind(g, prNumber) {
+		// The requested SHA is behind the base by definition now, so the review
+		// must run against the head the update produced, not the one the request
+		// named. Passing "" takes the freshly fetched head.
+		sha = ""
+	}
+	if err := g.CheckoutPRHeadDetached(prNumber, sha); err != nil {
 		return err
+	}
+	// Report the SHA actually checked out, not the one requested: after an
+	// update they differ, and everything downstream (the prompt's pinned diff
+	// base, the posted review's anchor, the refinery's SHA-scoped engagement
+	// gate) has to key on the commit the review really ran against.
+	reviewedSHA, rerr := g.Rev("HEAD")
+	if rerr != nil {
+		return fmt.Errorf("resolving the checked-out head of PR #%d: %w", prNumber, rerr)
 	}
 
 	// Checkout is the one in-session step allowed to START a review, so a queued
@@ -536,18 +570,21 @@ func runReviewerCheckout(cmd *cobra.Command, args []string) error {
 	// A heartbeat is a report of what happened; nothing should be reported until
 	// it has.
 	if rigPath := reviewerRigPathForHeartbeat(); rigPath != "" {
-		if terr := reviewer.TouchCheckout(rigPath, prNumber, reviewerCheckoutRound, reviewerCheckoutSHA); terr != nil {
+		if terr := reviewer.TouchCheckout(rigPath, prNumber, reviewerCheckoutRound, reviewedSHA); terr != nil {
 			fmt.Fprintf(os.Stderr, "warning: reviewer heartbeat (checkout): %v\n", terr)
 		}
 	}
 
-	target := reviewerCheckoutSHA
-	if target == "" {
-		target = "head"
-	} else {
-		target = shortSHA(target)
+	fmt.Printf("Checked out PR #%d at %s in %s\n", prNumber, shortSHA(reviewedSHA), cwd)
+	// An updated branch moves the head out from under the requested SHA. Say so
+	// in the imperative: the rest of the round passes --sha explicitly, and
+	// silently reviewing one commit while reporting another is exactly the
+	// stale-review failure this update exists to prevent.
+	if reviewerCheckoutSHA != "" && !strings.EqualFold(reviewedSHA, reviewerCheckoutSHA) {
+		fmt.Printf("The requested SHA %s is superseded. Review %s, and pass THAT SHA to "+
+			"`gt reviewer prompt --sha` and `gt reviewer post --sha`.\n",
+			shortSHA(reviewerCheckoutSHA), shortSHA(reviewedSHA))
 	}
-	fmt.Printf("Checked out PR #%d (%s) in %s\n", prNumber, target, cwd)
 
 	// Deterministically (re)build the codegraph index for the checked-out head so
 	// the review runs against a real index instead of silently degrading to
@@ -555,6 +592,67 @@ func runReviewerCheckout(cmd *cobra.Command, args []string) error {
 	// degraded review, not a broken one.
 	ensureReviewerCodegraphIndex(cwd)
 	return nil
+}
+
+// prHeadMoveTimeout bounds the wait for GitHub to publish the merge commit that
+// `gh pr update-branch` asks for. The REST call behind it returns 202 Accepted
+// — the work is queued, not done — so fetching immediately would land on the
+// pre-update head and review exactly the stale commit this is meant to avoid.
+// Vars, not consts, so tests can shorten the wait without sleeping through it.
+var (
+	prHeadMoveTimeout  = 30 * time.Second
+	prHeadMovePollWait = 2 * time.Second
+)
+
+// updateReviewerPRIfBehind brings the PR branch up to date with its base when it
+// has fallen behind, and reports whether the head moved as a result.
+//
+// Every failure here is non-fatal and reported. A branch that cannot be updated
+// is usually one with conflicts against its base, which only the author can
+// resolve; refusing to review it would strand the round and tell nobody why,
+// while reviewing the head as-is still produces findings the author can act on.
+func updateReviewerPRIfBehind(g *git.Git, prNumber int) bool {
+	status, err := g.GhPrBaseStatus(prNumber)
+	if err != nil {
+		style.PrintWarning("could not tell whether PR #%d is behind its base: %v — "+
+			"reviewing the head as-is", prNumber, err)
+		return false
+	}
+	if !status.Behind {
+		return false
+	}
+	fmt.Printf("PR #%d is behind %s — updating the branch before the review starts\n",
+		prNumber, status.Base)
+	if err := g.GhPrUpdateBranch(prNumber); err != nil {
+		style.PrintWarning("could not update PR #%d against %s: %v — reviewing the head "+
+			"as-is; a branch that conflicts with its base needs the author to resolve it",
+			prNumber, status.Base, err)
+		return false
+	}
+	if !waitForPRHeadToMove(g, prNumber, status.HeadSHA) {
+		style.PrintWarning("PR #%d's branch update has not landed after %s — reviewing "+
+			"whatever head is published now; re-run the checkout if the update lands later",
+			prNumber, prHeadMoveTimeout)
+	}
+	return true
+}
+
+// waitForPRHeadToMove polls the PR head until it differs from before, because
+// the update-branch API is asynchronous. Returns false on timeout.
+func waitForPRHeadToMove(g *git.Git, prNumber int, before string) bool {
+	deadline := time.Now().Add(prHeadMoveTimeout)
+	for {
+		head, err := g.GhPrHeadSHA(prNumber)
+		// A transient read failure is not evidence the update failed; keep
+		// polling until the deadline and let the caller report the timeout.
+		if err == nil && !strings.EqualFold(head, before) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(prHeadMovePollWait)
+	}
 }
 
 // ensureReviewerCodegraphIndex synchronously (re)builds the codegraph index for

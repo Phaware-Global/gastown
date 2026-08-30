@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -3456,6 +3457,135 @@ func TestGhPrDismissReview_Validation(t *testing.T) {
 func TestGhPrReviews_Validation(t *testing.T) {
 	g := NewGit(t.TempDir())
 	if _, err := g.GhPrReviews(0); err == nil {
+		t.Error("expected error for a non-positive PR number")
+	}
+}
+
+// ghBaseBranchStub installs a fake `gh` on PATH that answers the base-branch
+// query GhPrBaseStatus makes. The rest of that function is real git against
+// real repos, which is the part worth testing.
+func ghBaseBranchStub(t *testing.T, baseBranch string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell stub is POSIX-only")
+	}
+	dir := t.TempDir()
+	script := "#!/bin/sh\necho " + baseBranch + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(script), 0o700); err != nil { //nolint:gosec // test stub must be executable
+		t.Fatalf("write gh stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// A PR head that already contains the base tip is a valid review target; one
+// the base has moved past is not, and must be reported as behind so the
+// checkout updates it before the review starts.
+func TestGhPrBaseStatus_DetectsABehindHead(t *testing.T) {
+	remote := initTestRepo(t)
+	defaultBranch := gitIn(t, remote, "rev-parse", "--abbrev-ref", "HEAD")
+	ghBaseBranchStub(t, defaultBranch)
+
+	// A PR branch off the current base tip, published under the pull ref.
+	gitIn(t, remote, "checkout", "-b", "pr-branch")
+	if err := os.WriteFile(filepath.Join(remote, "pr.txt"), []byte("pr\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, remote, "add", ".")
+	gitIn(t, remote, "commit", "-m", "pr work")
+	prHead := gitIn(t, remote, "rev-parse", "HEAD")
+	gitIn(t, remote, "update-ref", "refs/pull/1/head", prHead)
+	gitIn(t, remote, "checkout", defaultBranch)
+
+	clone := t.TempDir()
+	gitIn(t, clone, "clone", remote, ".")
+	g := NewGit(clone)
+
+	// Up to date: the head contains everything on the base.
+	status, err := g.GhPrBaseStatus(1)
+	if err != nil {
+		t.Fatalf("GhPrBaseStatus: %v", err)
+	}
+	if status.Behind {
+		t.Errorf("a head containing the base tip must not be reported as behind: %+v", status)
+	}
+	if status.Base != defaultBranch {
+		t.Errorf("Base = %q, want %q", status.Base, defaultBranch)
+	}
+	if status.HeadSHA != prHead {
+		t.Errorf("HeadSHA = %q, want the PR head %q", status.HeadSHA, prHead)
+	}
+
+	// The base moves on (another PR merged) — the head is now stale.
+	if err := os.WriteFile(filepath.Join(remote, "merged.txt"), []byte("merged\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, remote, "add", ".")
+	gitIn(t, remote, "commit", "-m", "another PR merged to base")
+
+	status, err = g.GhPrBaseStatus(1)
+	if err != nil {
+		t.Fatalf("GhPrBaseStatus after the base moved: %v", err)
+	}
+	if !status.Behind {
+		t.Errorf("a head the base has moved past must be reported as behind: %+v", status)
+	}
+
+	// Updating the branch (what `gh pr update-branch` does upstream: merge the
+	// base into the head) clears it.
+	gitIn(t, remote, "checkout", "pr-branch")
+	gitIn(t, remote, "merge", "--no-edit", defaultBranch)
+	gitIn(t, remote, "update-ref", "refs/pull/1/head", gitIn(t, remote, "rev-parse", "HEAD"))
+	gitIn(t, remote, "checkout", defaultBranch)
+
+	status, err = g.GhPrBaseStatus(1)
+	if err != nil {
+		t.Fatalf("GhPrBaseStatus after the update: %v", err)
+	}
+	if status.Behind {
+		t.Errorf("an updated head must no longer be behind: %+v", status)
+	}
+}
+
+// FetchPRHead resolves the head without touching the working tree — the
+// worktree must stay where it was until the caller decides what to check out.
+func TestFetchPRHead_LeavesTheWorkingTreeAlone(t *testing.T) {
+	remote := initTestRepo(t)
+	defaultBranch := gitIn(t, remote, "rev-parse", "--abbrev-ref", "HEAD")
+	gitIn(t, remote, "checkout", "-b", "pr-branch")
+	if err := os.WriteFile(filepath.Join(remote, "pr.txt"), []byte("pr\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, remote, "add", ".")
+	gitIn(t, remote, "commit", "-m", "pr work")
+	prHead := gitIn(t, remote, "rev-parse", "HEAD")
+	gitIn(t, remote, "update-ref", "refs/pull/1/head", prHead)
+	gitIn(t, remote, "checkout", defaultBranch)
+
+	clone := t.TempDir()
+	gitIn(t, clone, "clone", remote, ".")
+	before := gitIn(t, clone, "rev-parse", "HEAD")
+
+	g := NewGit(clone)
+	got, err := g.FetchPRHead(1)
+	if err != nil {
+		t.Fatalf("FetchPRHead: %v", err)
+	}
+	if got != prHead {
+		t.Errorf("FetchPRHead = %q, want the PR head %q", got, prHead)
+	}
+	if after := gitIn(t, clone, "rev-parse", "HEAD"); after != before {
+		t.Errorf("working tree moved from %s to %s — fetching must not check anything out", before, after)
+	}
+}
+
+// TestGhPrUpdateBranch_Validation covers the guard that runs before any `gh`
+// subprocess.
+func TestGhPrUpdateBranch_Validation(t *testing.T) {
+	g := NewGit(t.TempDir())
+	if err := g.GhPrUpdateBranch(0); err == nil {
+		t.Error("expected error for a non-positive PR number")
+	}
+	if _, err := g.FetchPRHead(-1); err == nil {
 		t.Error("expected error for a non-positive PR number")
 	}
 }

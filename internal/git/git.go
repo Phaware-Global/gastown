@@ -1947,6 +1947,99 @@ func (g *Git) GhPrBaseBranch(prNumber int) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// FetchPRHead fetches the PR's head commit and returns its SHA, without
+// touching the working tree.
+//
+// Freshening ALL remote-tracking branch refs in the same fetch is deliberate.
+// The review execution contract diffs against the merge-base with origin/<base>;
+// fetching only pull/<n>/head leaves refs/remotes/origin/<base> wherever the
+// last full fetch put it, and a stale base silently over-scopes the review diff
+// with commits already merged upstream (gt-mu9: PR #136 round 1 reviewed the
+// already-merged #135 as in-scope). The explicit branches refspec restores the
+// default `git fetch origin` behavior, which git suppresses when an explicit
+// ref (the pull head) is requested.
+func (g *Git) FetchPRHead(prNumber int) (string, error) {
+	if prNumber <= 0 {
+		return "", fmt.Errorf("fetch PR head: invalid PR number %d", prNumber)
+	}
+	ref := fmt.Sprintf("pull/%d/head", prNumber)
+	if _, err := g.run("fetch", "origin", ref, "+refs/heads/*:refs/remotes/origin/*"); err != nil {
+		return "", fmt.Errorf("fetching %s: %w", ref, err)
+	}
+	sha, err := g.Rev("FETCH_HEAD")
+	if err != nil {
+		return "", fmt.Errorf("resolving the fetched head of PR #%d: %w", prNumber, err)
+	}
+	return sha, nil
+}
+
+// PRBaseStatus describes where a PR head sits relative to its base branch.
+type PRBaseStatus struct {
+	// Base is the branch the PR targets (e.g. "main").
+	Base string
+	// HeadSHA is the PR head commit, as of the fetch this status came from.
+	HeadSHA string
+	// Behind reports that the base branch contains commits the head does not.
+	// Such a head is a stale review target: it is not the code that would
+	// result from merging, so a review of it can miss an interaction with
+	// work already on the base and can flag as broken something the base
+	// already fixed.
+	Behind bool
+}
+
+// GhPrBaseStatus fetches the PR head and its base branch, then reports whether
+// the head is behind the base.
+//
+// The comparison is a local ancestry check rather than GitHub's
+// mergeStateStatus, which reports BEHIND only when the repository requires
+// branches to be up to date before merging. Whether a review target is stale
+// does not depend on that setting, so the answer must not either.
+func (g *Git) GhPrBaseStatus(prNumber int) (PRBaseStatus, error) {
+	base, err := g.GhPrBaseBranch(prNumber)
+	if err != nil {
+		return PRBaseStatus{}, err
+	}
+	if base == "" {
+		return PRBaseStatus{}, fmt.Errorf("PR #%d: could not determine the base branch", prNumber)
+	}
+	head, err := g.FetchPRHead(prNumber)
+	if err != nil {
+		return PRBaseStatus{}, err
+	}
+	baseRev, err := g.Rev("origin/" + base)
+	if err != nil {
+		return PRBaseStatus{}, fmt.Errorf("resolving origin/%s: %w", base, err)
+	}
+	upToDate, err := g.IsAncestor(baseRev, head)
+	if err != nil {
+		return PRBaseStatus{}, fmt.Errorf("comparing PR #%d head against origin/%s: %w", prNumber, base, err)
+	}
+	return PRBaseStatus{Base: base, HeadSHA: head, Behind: !upToDate}, nil
+}
+
+// GhPrUpdateBranch merges the PR's base branch into its head branch — the
+// "Update branch" button, via `gh pr update-branch`.
+//
+// The underlying REST call is asynchronous (202 Accepted): it returns before
+// the head ref has moved, so a caller that needs the resulting commit must poll
+// for it rather than fetching immediately.
+//
+// A merge rather than a rebase: rebasing rewrites the PR's history, which would
+// invalidate every inline review thread anchored to the old commits and destroy
+// the fix loop's continuity across rounds.
+func (g *Git) GhPrUpdateBranch(prNumber int) error {
+	if prNumber <= 0 {
+		return fmt.Errorf("gh pr update-branch: invalid PR number %d", prNumber)
+	}
+	cmd := exec.Command("gh", "pr", "update-branch", fmt.Sprintf("%d", prNumber))
+	cmd.Dir = g.workDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("gh pr update-branch %d failed: %s: %w",
+			prNumber, strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
 // CheckoutPRHeadDetached fetches the PR's head commit and checks it out in a
 // detached HEAD state in the working tree. When sha is non-empty the working
 // tree is detached at exactly that commit (the SHA the Reviewer was asked to
@@ -1963,20 +2056,11 @@ func (g *Git) CheckoutPRHeadDetached(prNumber int, sha string) error {
 	if prNumber <= 0 {
 		return fmt.Errorf("checkout PR head: invalid PR number %d", prNumber)
 	}
-	ref := fmt.Sprintf("pull/%d/head", prNumber)
-	// Freshen ALL remote-tracking branch refs in the same fetch as the PR
-	// head. The review execution contract diffs against the merge-base with
-	// origin/<base>; fetching only pull/<n>/head leaves
-	// refs/remotes/origin/<base> wherever the last full fetch put it, and a
-	// stale base silently over-scopes the review diff with commits already
-	// merged upstream (gt-mu9: PR #136 round 1 reviewed the already-merged
-	// #135 as in-scope). The explicit branches refspec restores the default
-	// `git fetch origin` behavior, which git suppresses when an explicit ref
-	// (the pull head) is requested.
-	if _, err := g.run("fetch", "origin", ref, "+refs/heads/*:refs/remotes/origin/*"); err != nil {
-		return fmt.Errorf("fetching %s: %w", ref, err)
+	head, err := g.FetchPRHead(prNumber)
+	if err != nil {
+		return err
 	}
-	target := "FETCH_HEAD"
+	target := head
 	if sha != "" {
 		target = sha
 	}
