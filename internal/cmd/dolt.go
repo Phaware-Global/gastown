@@ -594,9 +594,10 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 		if running {
 			metrics := doltserver.GetHealthMetrics(townRoot)
 			fmt.Printf("\n  %s\n", style.Bold.Render("Resource Metrics:"))
-			fmt.Printf("    Query latency: %v\n", metrics.QueryLatency.Round(time.Millisecond))
-			fmt.Printf("    Connections:   %d / %d (%.0f%%)\n",
-				metrics.Connections, metrics.MaxConnections, metrics.ConnectionPct)
+			printQueryLatency(metrics)
+			fmt.Printf("    Connections:   %d / %d (%.0f%%)%s\n",
+				metrics.Connections, metrics.MaxConnections, metrics.ConnectionPct,
+				connectionSourceSuffix(metrics))
 			if metrics.ReadOnly {
 				fmt.Printf("\n  %s %s\n",
 					style.Bold.Render("!!!"),
@@ -636,9 +637,10 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 		// Resource metrics
 		metrics := doltserver.GetHealthMetrics(townRoot)
 		fmt.Printf("\n  %s\n", style.Bold.Render("Resource Metrics:"))
-		fmt.Printf("    Query latency: %v\n", metrics.QueryLatency.Round(time.Millisecond))
-		fmt.Printf("    Connections:   %d / %d (%.0f%%)\n",
-			metrics.Connections, metrics.MaxConnections, metrics.ConnectionPct)
+		printQueryLatency(metrics)
+		fmt.Printf("    Connections:   %d / %d (%.0f%%)%s\n",
+			metrics.Connections, metrics.MaxConnections, metrics.ConnectionPct,
+			connectionSourceSuffix(metrics))
 		fmt.Printf("    Disk usage:    %s\n", metrics.DiskUsageHuman)
 		if metrics.ReadOnly {
 			fmt.Printf("\n  %s %s\n",
@@ -1833,4 +1835,29 @@ func printMigrateWispsResult(result *doltserver.MigrateWispsResult) {
 	if result.AgentsCopied == 0 && len(result.AuxTablesCreated) == 0 && !result.WispsTableCreated {
 		fmt.Printf("  %s Already migrated (no changes needed)\n", style.Bold.Render("✓"))
 	}
+}
+
+// printQueryLatency renders the connectivity probe result. A failed probe must
+// never render as "0s": that is the zero value, not a fast reply, and printing it
+// as a latency is what let a wedged server report itself healthy for 36 minutes
+// while every client timed out (hq-09sb1).
+func printQueryLatency(metrics *doltserver.HealthMetrics) {
+	if metrics.ProbeFailed {
+		fmt.Printf("    Query latency: %s\n",
+			style.Bold.Render("PROBE FAILED — server is not answering queries"))
+		if metrics.ProbeError != "" {
+			fmt.Printf("                   %s\n", metrics.ProbeError)
+		}
+		return
+	}
+	fmt.Printf("    Query latency: %v\n", metrics.QueryLatency.Round(time.Millisecond))
+}
+
+// connectionSourceSuffix notes when the connection count came from PROCESSLIST,
+// which counts live sessions and therefore cannot see leaked connection slots.
+func connectionSourceSuffix(metrics *doltserver.HealthMetrics) string {
+	if metrics.ConnectionSource == "processlist" {
+		return "  [sessions only — leaked slots not visible]"
+	}
+	return ""
 }

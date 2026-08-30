@@ -5091,3 +5091,134 @@ func TestHealthMetrics_CommitFreshnessFields(t *testing.T) {
 		t.Errorf("LastCommitAge = %v, want >= 0", metrics.LastCommitAge)
 	}
 }
+
+// TestCountServerConnectionSlots_CountsAcceptedExcludesListen verifies the OS
+// socket count sees real client connections and excludes the listening socket.
+// This is the measurement PROCESSLIST cannot make (hq-09sb1).
+func TestCountServerConnectionSlots_CountsAcceptedExcludesListen(t *testing.T) {
+	if _, err := exec.LookPath("lsof"); err != nil {
+		t.Skip("lsof not available")
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	// With only the listener open, the count must be 0 — LISTEN is not a client
+	// connection and must never be billed against max_connections.
+	pid := os.Getpid()
+	got, err := CountServerConnectionSlots(pid, port)
+	if err != nil {
+		t.Fatalf("CountServerConnectionSlots() error = %v", err)
+	}
+	if got != 0 {
+		t.Errorf("with listener only: count = %d, want 0 (LISTEN must be excluded)", got)
+	}
+
+	// Accept and hold connections; both endpoints live in this process, so each
+	// client connection contributes two sockets on the port.
+	const clients = 3
+	accepted := make(chan net.Conn, clients)
+	go func() {
+		for i := 0; i < clients; i++ {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted <- c
+		}
+	}()
+
+	var conns []net.Conn
+	for i := 0; i < clients; i++ {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, c)
+	}
+	for i := 0; i < clients; i++ {
+		select {
+		case c := <-accepted:
+			conns = append(conns, c)
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for accept")
+		}
+	}
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+
+	got, err = CountServerConnectionSlots(pid, port)
+	if err != nil {
+		t.Fatalf("CountServerConnectionSlots() error = %v", err)
+	}
+	// 3 dialed + 3 accepted = 6 non-LISTEN sockets on this port.
+	if want := clients * 2; got != want {
+		t.Errorf("with %d clients: count = %d, want %d", clients, got, want)
+	}
+}
+
+// TestCountServerConnectionSlots_NoSocketsIsNotAnError verifies that a pid
+// holding nothing on the port reports zero rather than failing — lsof exits 1
+// when it matches nothing, which is a legitimate zero.
+func TestCountServerConnectionSlots_NoSocketsIsNotAnError(t *testing.T) {
+	if _, err := exec.LookPath("lsof"); err != nil {
+		t.Skip("lsof not available")
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unusedPort := ln.Addr().(*net.TCPAddr).Port
+	ln.Close() // free the port so nothing holds it
+
+	got, err := CountServerConnectionSlots(os.Getpid(), unusedPort)
+	if err != nil {
+		t.Fatalf("CountServerConnectionSlots() error = %v, want nil", err)
+	}
+	if got != 0 {
+		t.Errorf("count = %d, want 0", got)
+	}
+}
+
+// TestGetHealthMetrics_ProbeFailureIsUnhealthy is the regression test for the
+// outage of 2026-08-29: a failed connectivity probe was swallowed, leaving
+// QueryLatency at zero and Healthy at true, so `gt dolt status` reported
+// "healthy, Query latency: 0s" for 36 minutes while every client timed out.
+func TestGetHealthMetrics_ProbeFailureIsUnhealthy(t *testing.T) {
+	// Point at a port with no server on it so the probe cannot succeed.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadPort := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	t.Setenv("GT_DOLT_PORT", strconv.Itoa(deadPort))
+	metrics := GetHealthMetrics(t.TempDir())
+
+	if !metrics.ProbeFailed {
+		t.Error("ProbeFailed = false, want true when the server is unreachable")
+	}
+	if metrics.Healthy {
+		t.Error("Healthy = true, want false when the connectivity probe fails")
+	}
+	if metrics.ProbeError == "" {
+		t.Error("ProbeError is empty, want the underlying failure")
+	}
+	if metrics.QueryLatency != 0 {
+		t.Errorf("QueryLatency = %v, want 0 (no measurement was made)", metrics.QueryLatency)
+	}
+	// The point of ProbeFailed: a zero latency must be attributable to failure,
+	// not mistaken for a fast reply.
+	if !metrics.ProbeFailed && metrics.QueryLatency == 0 {
+		t.Error("a zero latency with no ProbeFailed flag is indistinguishable from a fast server")
+	}
+}
