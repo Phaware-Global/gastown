@@ -5941,6 +5941,9 @@ func TestBuildStartupCommandWithAgentOverrideSetsGTAgentForOpenCode(t *testing.T
 // role_agents["dog"] = "claude-sonnet" was accepted by config and then silently
 // discarded, and dogs ran Haiku regardless.
 func TestResolveRoleAgentConfig_DogHonorsExplicitClaudeModel(t *testing.T) {
+	// An ambient cost tier maps dog to haiku/groq and would win before the
+	// persisted-config path this test exercises is ever reached.
+	t.Setenv("GT_COST_TIER", "")
 	townRoot := t.TempDir()
 	writeTownSettingsForTest(t, townRoot, `{
   "type": "town-settings",
@@ -5967,6 +5970,9 @@ func TestResolveRoleAgentConfig_DogHonorsExplicitClaudeModel(t *testing.T) {
 // TestResolveRoleAgentConfig_DogDefaultsToHaiku verifies the cheap default still
 // applies when the operator has expressed no preference for the dog role.
 func TestResolveRoleAgentConfig_DogDefaultsToHaiku(t *testing.T) {
+	// An ambient cost tier maps dog to haiku/groq and would win before the
+	// persisted-config path this test exercises is ever reached.
+	t.Setenv("GT_COST_TIER", "")
 	townRoot := t.TempDir()
 	writeTownSettingsForTest(t, townRoot, `{
   "type": "town-settings",
@@ -5992,5 +5998,31 @@ func writeTownSettingsForTest(t *testing.T, townRoot, body string) {
 	}
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestResolveRoleAgentConfig_DogUnresolvableNameKeepsHaiku covers the shape
+// ApplyCostTier(TierStandard) persists: role_agents["dog"] names an agent whose
+// definition has been deleted. An unresolvable name is not a usable preference,
+// so the cheap role default must stand — treating it as one would fall through to
+// the town default agent and silently promote every dog to the most expensive
+// model. Any typo in role_agents["dog"] has the same shape.
+func TestResolveRoleAgentConfig_DogUnresolvableNameKeepsHaiku(t *testing.T) {
+	t.Setenv("GT_COST_TIER", "")
+	townRoot := t.TempDir()
+	writeTownSettingsForTest(t, townRoot, `{
+  "type": "town-settings",
+  "version": 1,
+  "default_agent": "claude",
+  "role_agents": {"dog": "claude-haiku"}
+}`)
+
+	rc := ResolveRoleAgentConfig("dog", townRoot, "")
+	if rc == nil {
+		t.Fatal("ResolveRoleAgentConfig returned nil")
+	}
+	got := strings.Join(rc.Args, " ")
+	if !strings.Contains(got, "haiku") {
+		t.Errorf("dog args = %q, want the haiku default when role_agents names an undefined agent", got)
 	}
 }

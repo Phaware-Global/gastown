@@ -1717,9 +1717,19 @@ func tryResolveFromEphemeralTier(role string) (*RuntimeConfig, bool) {
 }
 
 // hasExplicitRoleAgent reports whether the role has an explicit per-role agent
-// assignment in rig or town settings. Unlike hasExplicitNonClaudeOverride it does
-// not care which agent was named, only that the operator named one — a role the
-// operator has configured should not be silently overridden by a built-in default.
+// assignment that actually resolves to a usable agent. Unlike
+// hasExplicitNonClaudeOverride it does not care which agent was named, only that
+// the operator named one — a role the operator has configured should not be
+// silently overridden by a built-in default.
+//
+// The name must resolve. An unresolvable name is not a usable preference: treating
+// it as one would skip the role default and let resolution fall through to the
+// town default agent, which is the most expensive model rather than the cheapest.
+// ApplyCostTier(TierStandard) produces exactly that shape — it persists
+// role_agents["dog"] = "claude-haiku" while deleting the matching agents entry —
+// as does any typo in the config. Requiring resolution keeps both cases on the
+// role default, and the caller's existing "falling back to default" warning stays
+// advisory.
 //
 // Deliberately narrower than hasExplicitNonClaudeOverride: it does not consult the
 // rig's global Agent or the town's DefaultAgent, since those are not statements
@@ -1727,12 +1737,16 @@ func tryResolveFromEphemeralTier(role string) (*RuntimeConfig, bool) {
 func hasExplicitRoleAgent(role string, townSettings *TownSettings, rigSettings *RigSettings) bool {
 	if rigSettings != nil && rigSettings.RoleAgents != nil {
 		if agentName, ok := rigSettings.RoleAgents[role]; ok && agentName != "" {
-			return true
+			if lookupAgentConfigIfExists(agentName, townSettings, rigSettings) != nil {
+				return true
+			}
 		}
 	}
 	if townSettings != nil && townSettings.RoleAgents != nil {
 		if agentName, ok := townSettings.RoleAgents[role]; ok && agentName != "" {
-			return true
+			if lookupAgentConfigIfExists(agentName, townSettings, rigSettings) != nil {
+				return true
+			}
 		}
 	}
 	return false
