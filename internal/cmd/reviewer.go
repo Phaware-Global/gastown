@@ -17,6 +17,7 @@ import (
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/reviewer"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
@@ -397,7 +398,7 @@ func runReviewerPost(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	provider, _, _, err := getRefineryPRContext()
+	provider, cfg, _, err := getRefineryPRContext()
 	if err != nil {
 		return err
 	}
@@ -428,8 +429,8 @@ func runReviewerPost(cmd *cobra.Command, args []string) error {
 	}
 
 	in := findings.BuildReviewInput(sha)
-	if err := provider.SubmitReview(reviewerPostPR, in); err != nil {
-		return fmt.Errorf("submitting review for PR #%d: %w", reviewerPostPR, err)
+	if err := postReviewAndClearStaleBlock(provider, cfg, reviewerPostPR, in); err != nil {
+		return err
 	}
 
 	// Report the submitted event. The verdict is derived, not stated by the
@@ -442,6 +443,70 @@ func runReviewerPost(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println()
 	return nil
+}
+
+// postReviewAndClearStaleBlock submits the review, then clears the Reviewer's
+// own superseded CHANGES_REQUESTED verdicts. GitHub keeps a changes-request
+// active forever — an APPROVE from the same reviewer does not supersede it — so
+// after a fix round the PR stays blocked on a verdict the reviewer has already
+// withdrawn in substance, and dismissing it was left to the reviewer agent,
+// which did not reliably do it.
+//
+// The order is load-bearing in both directions.
+//
+// Dismiss-then-submit is unsafe. The two are separate round-trips, so a
+// transient failure of the submit (5xx, rate limit, dropped connection) leaves
+// the prior block DISMISSED with no replacement verdict.
+// GhPrChangesRequestedReviewers folds each user's reviews to their newest
+// TERMINAL state, and DISMISSED is terminal, so the reviewer silently stops
+// counting as blocking: the merge gate goes green on a round whose review never
+// landed. Submitting first means a failed submit changes nothing at all.
+//
+// Submit-then-dismiss needs the REQUEST_CHANGES guard below. The review just
+// posted is a CHANGES_REQUESTED by the same login, so an unguarded dismissal
+// would clear the very verdict it exists to publish. Skipping it costs nothing:
+// a fresh block IS the newest terminal state, so any stale one behind it is
+// already inert for every gate that reads it, and the next round that approves
+// dismisses them all.
+func postReviewAndClearStaleBlock(provider refinery.PRProvider, cfg *refinery.MergeQueueConfig,
+	prNumber int, in refinery.SubmitReviewInput) error {
+	if err := provider.SubmitReview(prNumber, in); err != nil {
+		return fmt.Errorf("submitting review for PR #%d: %w", prNumber, err)
+	}
+	if strings.EqualFold(strings.TrimSpace(in.Event), "REQUEST_CHANGES") {
+		return nil
+	}
+	dismissStaleReviewerChangesRequests(provider, cfg, prNumber)
+	return nil
+}
+
+// staleReviewDismissalMessage replaces the verdict of a dismissed review. It
+// says why the old verdict no longer applies, which is all a reader of the
+// dismissed review gets.
+const staleReviewDismissalMessage = "Superseded by a new review round."
+
+// dismissStaleReviewerChangesRequests dismisses the Reviewer's own prior
+// CHANGES_REQUESTED reviews on the PR, so a fix round that now approves is not
+// still blocked by the verdict it supersedes. Call it only AFTER the new review
+// has landed — see postReviewAndClearStaleBlock.
+//
+// Best-effort by design, and deliberately not fatal: the review is already
+// posted by this point, and a review that lands with a stale block left behind
+// is strictly better than a cleared block with no review. It is also scoped to the configured
+// pr_reviewer — with no configured identity it does nothing, because "dismiss
+// every changes-request on the PR" would clear a human reviewer's block.
+func dismissStaleReviewerChangesRequests(provider refinery.PRProvider, cfg *refinery.MergeQueueConfig, prNumber int) {
+	user := strings.TrimSpace(cfg.PRReviewer)
+	if user == "" {
+		return
+	}
+	err := provider.DismissChangesRequestedReviews(prNumber, user, staleReviewDismissalMessage)
+	// ErrUnsupported is the sanctioned "this provider cannot" answer (Bitbucket),
+	// not a failure — it must not print a warning on every post.
+	if err != nil && !errors.Is(err, refinery.ErrUnsupported) {
+		style.PrintWarning("could not dismiss %s's prior changes-requested review on PR #%d: %v "+
+			"(the new review still posts; the stale block may need clearing by hand)", user, prNumber, err)
+	}
 }
 
 func runReviewerCheckout(cmd *cobra.Command, args []string) error {

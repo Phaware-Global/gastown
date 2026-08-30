@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2060,6 +2061,83 @@ func (g *Git) GhPrSubmitReview(prNumber int, commitID, body, event string, comme
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("gh pr review (submit) failed: %s: %w",
 			strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
+// GhPrReview is one review on a PR as the REST API reports it. The numeric ID
+// is the point: the GraphQL/`gh pr view` view of a review carries a node ID,
+// which the dismissal endpoint does not accept, so the dismiss path has to read
+// reviews over REST.
+type GhPrReview struct {
+	ID    int64  `json:"id"`
+	State string `json:"state"` // APPROVED | CHANGES_REQUESTED | COMMENTED | DISMISSED | PENDING
+	User  struct {
+		Login string `json:"login"`
+	} `json:"user"`
+}
+
+// GhPrReviews lists every review on the PR via the REST API, oldest first (the
+// order GitHub returns). Unlike ghFetchReviews it carries each review's numeric
+// ID, which is what GhPrDismissReview needs.
+func (g *Git) GhPrReviews(prNumber int) ([]GhPrReview, error) {
+	if prNumber <= 0 {
+		return nil, fmt.Errorf("gh pr reviews: invalid PR number %d", prNumber)
+	}
+	// --paginate with `--jq .[]` streams one review object per line across every
+	// page, so a long-running PR's older reviews are not silently cut off at the
+	// default page size.
+	cmd := exec.Command("gh", "api", "--paginate", "--jq", ".[]",
+		fmt.Sprintf("repos/{owner}/{repo}/pulls/%d/reviews", prNumber))
+	cmd.Dir = g.workDir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("gh api (list reviews) failed: %w", err)
+	}
+	var reviews []GhPrReview
+	dec := json.NewDecoder(bytes.NewReader(out))
+	for {
+		var r GhPrReview
+		if derr := dec.Decode(&r); derr != nil {
+			if errors.Is(derr, io.EOF) {
+				break
+			}
+			return nil, fmt.Errorf("parsing reviews: %w", derr)
+		}
+		reviews = append(reviews, r)
+	}
+	return reviews, nil
+}
+
+// GhPrDismissReview dismisses a single review, clearing whatever verdict it
+// carries. GitHub does not dismiss a CHANGES_REQUESTED review when the same
+// reviewer later approves, so a stale one keeps blocking the merge until it is
+// dismissed explicitly.
+//
+// message is required by the API and is what a reader sees in place of the
+// dismissed verdict, so it must say why the review no longer applies.
+func (g *Git) GhPrDismissReview(prNumber int, reviewID int64, message string) error {
+	if prNumber <= 0 {
+		return fmt.Errorf("gh pr dismiss review: invalid PR number %d", prNumber)
+	}
+	if reviewID <= 0 {
+		return fmt.Errorf("gh pr dismiss review: invalid review ID %d", reviewID)
+	}
+	if strings.TrimSpace(message) == "" {
+		return fmt.Errorf("gh pr dismiss review: message is required (it replaces the dismissed verdict)")
+	}
+	data, err := json.Marshal(map[string]any{"message": message, "event": "DISMISS"})
+	if err != nil {
+		return fmt.Errorf("gh pr dismiss review: marshaling payload: %w", err)
+	}
+	cmd := exec.Command("gh", "api", "--method", "PUT",
+		fmt.Sprintf("repos/{owner}/{repo}/pulls/%d/reviews/%d/dismissals", prNumber, reviewID),
+		"--input", "-")
+	cmd.Dir = g.workDir
+	cmd.Stdin = bytes.NewReader(data)
+	if out, derr := cmd.CombinedOutput(); derr != nil {
+		return fmt.Errorf("gh pr dismiss review %d failed: %s: %w",
+			reviewID, strings.TrimSpace(string(out)), derr)
 	}
 	return nil
 }
