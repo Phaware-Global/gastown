@@ -183,11 +183,18 @@ func TestEventPoll_DetectsCloseEvents(t *testing.T) {
 type flakyStorage struct {
 	beadsdk.Storage
 	failsRemaining atomic.Int64
+	// err is returned on each simulated failure. Defaults to a
+	// timeout-shaped error (matching this type's usual "query too large"
+	// scenario) when unset.
+	err error
 }
 
 func (s *flakyStorage) GetAllEventsSince(ctx context.Context, since time.Time) ([]*beadsdk.Event, error) {
 	if s.failsRemaining.Add(-1) >= 0 {
-		return nil, fmt.Errorf("simulated transient poll failure")
+		if s.err != nil {
+			return nil, s.err
+		}
+		return nil, fmt.Errorf("simulated transient poll failure: context deadline exceeded")
 	}
 	return s.Storage.GetAllEventsSince(ctx, since)
 }
@@ -466,8 +473,13 @@ func TestPollStore_SeedAndWarmupRegressions(t *testing.T) {
 		for i := 0; i < maxSeedPollFailures; i++ {
 			lastErr = m.pollStore("hq", flaky, stores, map[string]bool{})
 		}
-		if lastErr != nil {
-			t.Fatalf("expected pollStore to give up and return nil on the %dth consecutive seed failure, got: %v", maxSeedPollFailures, lastErr)
+		// Give-up still returns the underlying error (not nil): the caller
+		// must count this cycle as a failure for backoff purposes even
+		// though the seed point was narrowed, so a give-up doesn't reset
+		// the poll interval back to the fast path while the store is still
+		// unreachable.
+		if lastErr == nil {
+			t.Fatalf("expected pollStore to give up and still return the underlying error on the %dth consecutive seed failure, got nil", maxSeedPollFailures)
 		}
 
 		mu.Lock()
@@ -504,8 +516,8 @@ func TestPollStore_SeedAndWarmupRegressions(t *testing.T) {
 		for i := 0; i < maxSeedPollFailures; i++ {
 			lastErr = m.pollStore("hq", flaky, stores, map[string]bool{})
 		}
-		if lastErr != nil {
-			t.Fatalf("expected pollStore to give up a second time and return nil, got: %v", lastErr)
+		if lastErr == nil {
+			t.Fatalf("expected pollStore to give up a second time and still return the underlying error, got nil")
 		}
 		mu.Lock()
 		giveUps = strings.Count(strings.Join(logged, "\n"), "giving up on backfill")
@@ -545,8 +557,8 @@ func TestPollStore_SeedAndWarmupRegressions(t *testing.T) {
 		for i := 0; i < maxSeedPollFailures; i++ {
 			lastErr = m.pollStore("hq", flaky, stores, map[string]bool{})
 		}
-		if lastErr != nil {
-			t.Fatalf("expected pollStore to give up and return nil, got: %v", lastErr)
+		if lastErr == nil {
+			t.Fatalf("expected pollStore to give up and still return the underlying error, got nil")
 		}
 
 		hwm, hasHWM := m.lastEventIDs.Load("hq")
