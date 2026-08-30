@@ -476,8 +476,9 @@ func TestPollStore_SeedAndWarmupRegressions(t *testing.T) {
 		if !hasHWM {
 			t.Fatal("expected hq's high-water mark to be set after giving up")
 		}
-		if got := hwm.(time.Time); !got.Equal(m.startedAt) {
-			t.Errorf("expected give-up to seed at startedAt %s, got %s", m.startedAt.Format(time.RFC3339), got.Format(time.RFC3339))
+		firstSeedFrom := hwm.(time.Time)
+		if !firstSeedFrom.Equal(m.startedAt) {
+			t.Errorf("expected give-up to seed at startedAt %s, got %s", m.startedAt.Format(time.RFC3339), firstSeedFrom.Format(time.RFC3339))
 		}
 		// Give-up must NOT mark the store seeded: doing so would make the
 		// next successful poll skip the warm-up fall-through (and its size
@@ -511,6 +512,19 @@ func TestPollStore_SeedAndWarmupRegressions(t *testing.T) {
 		mu.Unlock()
 		if giveUps != 2 {
 			t.Errorf("expected the give-up escape to re-arm and fire a second time, got %d occurrences in: %v", giveUps, logged)
+		}
+
+		// The second give-up must narrow toward "now" rather than re-seeding
+		// at the same fixed startedAt forever, which would re-issue an
+		// identically-sized (eventually unservable) query on every re-fire.
+		mu.Lock()
+		hwm, hasHWM = m.lastEventIDs.Load("hq")
+		mu.Unlock()
+		if !hasHWM {
+			t.Fatal("expected hq's high-water mark to still be set after the second give-up")
+		}
+		if secondSeedFrom := hwm.(time.Time); !secondSeedFrom.After(firstSeedFrom) {
+			t.Errorf("expected second give-up's seed point %s to be strictly later than the first's %s", secondSeedFrom.Format(time.RFC3339), firstSeedFrom.Format(time.RFC3339))
 		}
 	})
 
