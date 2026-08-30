@@ -2,10 +2,13 @@ package polecat
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func TestTouchAndReadSessionHeartbeat(t *testing.T) {
@@ -184,24 +187,42 @@ func TestIsSessionProcessDead_HeartbeatFresh(t *testing.T) {
 	}
 }
 
-func TestIsSessionProcessDead_HeartbeatStale(t *testing.T) {
-	townRoot := t.TempDir()
-	sessionName := "gt-test-hb-dead"
-
-	// Write a stale heartbeat
+func writeStaleHeartbeat(t *testing.T, townRoot, sessionName string) {
+	t.Helper()
 	dir := filepath.Join(townRoot, ".runtime", "heartbeats")
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	oldTime := time.Now().Add(-10 * time.Minute).UTC()
-	data := []byte(`{"timestamp":"` + oldTime.Format(time.RFC3339Nano) + `"}`)
+	oldTime := time.Now().Add(-20 * time.Minute).UTC()
+	data := []byte(`{"timestamp":"` + oldTime.Format(time.RFC3339Nano) + `","state":"working"}`)
 	if err := os.WriteFile(filepath.Join(dir, sessionName+".json"), data, 0644); err != nil {
 		t.Fatal(err)
 	}
+}
 
-	dead := isSessionProcessDead(nil, sessionName, townRoot)
-	if !dead {
-		t.Error("expected dead=true for session with stale heartbeat")
+// TestIsSessionProcessDead_StaleHeartbeatIsNotDeath is the gt-azm0 regression.
+//
+// A polecat mid-turn — reasoning or editing rather than shelling out to gt —
+// lets its heartbeat lapse past SessionHeartbeatStaleThreshold while its process
+// is very much alive. Before the fix the stale heartbeat short-circuited and
+// reported the session dead, so `gt polecat list` showed the polecat as
+// stalled/NEEDS_RECOVERY and the witness reaped it mid-task and reassigned its
+// bead.
+//
+// A nil tmux handle stands in for "nothing to probe": the contract is that an
+// unprobeable session is never reported dead, so staleness alone must not
+// produce a kill.
+func TestIsSessionProcessDead_StaleHeartbeatIsNotDeath(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-test-hb-stale-but-live"
+	writeStaleHeartbeat(t, townRoot, sessionName)
+
+	if stale, exists := IsSessionHeartbeatStale(townRoot, sessionName); !exists || !stale {
+		t.Fatalf("test setup: want an existing stale heartbeat, got exists=%v stale=%v", exists, stale)
+	}
+
+	if isSessionProcessDead(nil, sessionName, townRoot) {
+		t.Error("a stale heartbeat alone must not report dead: it falls through to process probing")
 	}
 }
 
@@ -305,5 +326,90 @@ func TestReadSessionHeartbeat_V2AllStates(t *testing.T) {
 				t.Errorf("bead = %q, want %q", read.Bead, "gt-test-bead")
 			}
 		})
+	}
+}
+
+// withProbe swaps both probe steps for the duration of a test so either
+// direction of isSessionProcessDead's contract can be driven without a tmux
+// server or a real process.
+func withProbe(t *testing.T, pid string, pidErr error, alive bool) {
+	t.Helper()
+	prevPID, prevAlive := panePID, pidAlive
+	panePID = func(*tmux.Tmux, string) (string, error) { return pid, pidErr }
+	pidAlive = func(int) bool { return alive }
+	t.Cleanup(func() { panePID, pidAlive = prevPID, prevAlive })
+}
+
+// TestIsSessionProcessDead_ReapsAConfirmedDeadPane pins the other half of the
+// contract: an existing-and-stale heartbeat over a pane whose process is gone
+// must STILL report dead.
+//
+// This is the direction that authorizes KillSessionWithProcesses, so leaving it
+// unpinned would let the function be hardwired to `return false` and ship green
+// — especially in a change that deliberately widens the under-report window.
+func TestIsSessionProcessDead_ReapsAConfirmedDeadPane(t *testing.T) {
+	tests := []struct {
+		name     string
+		pid      string
+		pidErr   error
+		alive    bool
+		wantDead bool
+	}{
+		{
+			name: "stale heartbeat over a dead pane process reaps",
+			pid:  "4242", alive: false, wantDead: true,
+		},
+		{
+			name: "no pane pid at all means no process",
+			pid:  "", alive: false, wantDead: true,
+		},
+		{
+			// gt-azm0: the agent is mid-turn, so its heartbeat lapsed while its
+			// process is very much alive.
+			name: "stale heartbeat over a live pane process does not reap",
+			pid:  "4242", alive: true, wantDead: false,
+		},
+		{
+			// gt-kncti: a tmux query that failed is not evidence of death.
+			name: "unreadable pane yields no verdict",
+			pid:  "", pidErr: errors.New("server busy"), alive: false, wantDead: false,
+		},
+		{
+			name: "non-numeric pid does not authorize a kill",
+			pid:  "not-a-pid", alive: false, wantDead: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			townRoot := t.TempDir()
+			sessionName := "gt-test-reap"
+			writeStaleHeartbeat(t, townRoot, sessionName)
+			withProbe(t, tt.pid, tt.pidErr, tt.alive)
+
+			if got := isSessionProcessDead(&tmux.Tmux{}, sessionName, townRoot); got != tt.wantDead {
+				t.Errorf("isSessionProcessDead() = %v, want %v", got, tt.wantDead)
+			}
+		})
+	}
+}
+
+// TestIsSessionProcessDead_FreshHeartbeatSkipsTheProbe pins the fast path: a
+// fresh heartbeat proves life on its own and must not spend a probe.
+func TestIsSessionProcessDead_FreshHeartbeatSkipsTheProbe(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-test-fresh"
+	TouchSessionHeartbeat(townRoot, sessionName)
+
+	probed := false
+	prev := panePID
+	panePID = func(*tmux.Tmux, string) (string, error) { probed = true; return "", nil }
+	t.Cleanup(func() { panePID = prev })
+
+	if isSessionProcessDead(&tmux.Tmux{}, sessionName, townRoot) {
+		t.Error("a fresh heartbeat must report alive")
+	}
+	if probed {
+		t.Error("a fresh heartbeat must short-circuit before probing the pane")
 	}
 }

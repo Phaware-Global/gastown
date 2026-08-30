@@ -1,6 +1,9 @@
 package tmux
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 // TestInputBoxSubmitted verifies that submission detection keys off the live
 // input box (the last prompt-prefix line) rather than arbitrary pane churn.
@@ -20,6 +23,19 @@ func TestInputBoxSubmitted(t *testing.T) {
 		wantSubmitted bool
 		wantConcl     bool
 	}{
+		{
+			// gt-zlfq: Claude Code collapses a long pasted nudge to a
+			// "[Pasted text #N]" chip. That is still unsubmitted text in the
+			// box, and detection must be CONCLUSIVE about it — a merely
+			// inconclusive verdict falls through to a content-diff that any
+			// ticking status line satisfies, reporting a stranded nudge as
+			// delivered.
+			name:          "collapsed paste chip is unsubmitted text",
+			lines:         []string{"  earlier transcript", pc + " [Pasted text #5][Pasted text #6]"},
+			prefix:        prefix,
+			wantSubmitted: false,
+			wantConcl:     true,
+		},
 		{
 			name:          "empty box after submit",
 			lines:         []string{pc + " some earlier message", "  status bar", pc + " "},
@@ -117,6 +133,65 @@ func TestInputBoxSubmitted(t *testing.T) {
 			if gotSubmitted != tt.wantSubmitted || gotConcl != tt.wantConcl {
 				t.Errorf("inputBoxSubmitted(%q, %q) = (%v, %v), want (%v, %v)",
 					tt.lines, tt.prefix, gotSubmitted, gotConcl, tt.wantSubmitted, tt.wantConcl)
+			}
+		})
+	}
+}
+
+// TestInputBoxClearedFrom covers the gt-zlfq decision: distinguishing an agent
+// that is busy because it received a nudge from one that is busy with the nudge
+// still stranded, unsubmitted, in its input box.
+//
+// Before the fix the startup-nudge retry gated purely on agent idleness, so a
+// busy-but-stranded agent was read as "nudge received" and never retried —
+// skipping the retry in exactly the case that needed it. The polecat then sat
+// idle without its work prompt until it was reaped and its bead reassigned.
+func TestInputBoxClearedFrom(t *testing.T) {
+	t.Parallel()
+	const prefix = "❯ "
+	const pc = "❯"
+
+	tests := []struct {
+		name       string
+		lines      []string
+		captureErr error
+		want       bool
+	}{
+		{
+			name:  "bare prompt is cleared",
+			lines: []string{"  transcript", pc + " "},
+			want:  true,
+		},
+		{
+			name:  "stranded plain text is not cleared",
+			lines: []string{"  transcript", pc + " STAND DOWN: gt-lurb is already slung"},
+			want:  false,
+		},
+		{
+			name:  "stranded collapsed paste chip is not cleared",
+			lines: []string{"  transcript", pc + " [Pasted text #5][Pasted text #6]"},
+			want:  false,
+		},
+		{
+			// Bias toward "cleared": never invent a strand we cannot see, or
+			// callers would re-nudge healthy agents.
+			name:       "capture error reports cleared",
+			lines:      nil,
+			captureErr: errors.New("no server"),
+			want:       true,
+		},
+		{
+			name:  "unlocatable input box reports cleared",
+			lines: []string{"some pane with no prompt at all"},
+			want:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := inputBoxClearedFrom(tt.lines, prefix, tt.captureErr); got != tt.want {
+				t.Errorf("inputBoxClearedFrom() = %v, want %v", got, tt.want)
 			}
 		})
 	}

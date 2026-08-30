@@ -1991,30 +1991,49 @@ func (m *Manager) ReconcilePoolWith(namesWithDirs, namesWithSessions []string) {
 	m.cleanupOrphanPolecatState()
 }
 
-// isSessionProcessDead checks if a polecat session's agent has exited.
+// isSessionProcessDead reports whether a polecat session's agent has exited.
 //
-// Uses heartbeat-based liveness detection (gt-qjtq): checks whether the session's
-// heartbeat file has been updated recently. Polecat sessions touch their heartbeat
-// via gt commands (gt prime, gt hook, bd show, etc.) which run frequently during
-// normal operation. A stale heartbeat indicates the agent is no longer active.
+// A FRESH heartbeat proves life and short-circuits. Everything else falls
+// through to the pane-PID probe this function has always used.
 //
-// Falls back to PID signal probing when no heartbeat file exists (backward
-// compatibility for sessions started before heartbeat support was added).
+// What changed for gt-azm0 is only this: a STALE heartbeat is no longer proof of
+// death. Heartbeats are written only when a gt command runs inside a session
+// (internal/cmd/root.go), so an agent that spends longer than
+// SessionHeartbeatStaleThreshold reasoning or editing files — routine, and the
+// norm on a loaded box — lapses while perfectly healthy. Treating that as death
+// made `gt polecat list` report working polecats as stalled/NEEDS_RECOVERY and
+// drove the witness to reap them mid-task, churning a bead through assignees
+// with no commits landing.
 //
-// Returns true only when we can confirm the process is dead, not on transient
-// failures (gt-kncti: permission denied false positives).
+// The pane-PID probe is deliberately conservative and deliberately unchanged. It
+// cannot see an agent that died behind a surviving shell or exec-wrapper pane,
+// so it under-reports death — but this function's callers KILL sessions
+// (ReconcilePoolWith -> KillSessionWithProcesses), and under-reporting costs a
+// lingering worktree while over-reporting destroys a healthy agent's work
+// mid-task. That asymmetry is why the gt-kncti contract ("confirm dead, never
+// guess") is load-bearing here.
+//
+// Agent-tree liveness detection deliberately lives elsewhere, where a wrong
+// answer is recoverable: SessionManager.Start kills a stale session via
+// IsAgentAlive immediately before recreating it, and the witness's
+// detectZombieLiveSession applies the same signal on its own schedule to exactly
+// the live-session/dead-agent shape. Duplicating that judgement here, on a path
+// that kills without recreating, is tracked separately rather than bundled into
+// this fix.
 func isSessionProcessDead(t *tmux.Tmux, sessionName string, townRoot string) bool {
-	// Primary: heartbeat-based liveness check (gt-qjtq ZFC fix).
 	if townRoot != "" {
-		stale, exists := IsSessionHeartbeatStale(townRoot, sessionName)
-		if exists {
-			return stale
+		if stale, exists := IsSessionHeartbeatStale(townRoot, sessionName); exists && !stale {
+			return false
 		}
-		// No heartbeat file — fall through to PID-based check for backward compatibility.
 	}
 
-	// Fallback: PID signal probing (legacy, for sessions without heartbeat support).
-	pidStr, err := t.GetPanePID(sessionName)
+	// Without a tmux handle there is nothing to probe, and an unprobeable
+	// session must never be reported dead.
+	if t == nil {
+		return false
+	}
+
+	pidStr, err := panePID(t, sessionName)
 	if err != nil {
 		// Tmux query failed — could be permission denied, server busy, etc.
 		// Don't assume dead; let a future cycle retry.
@@ -2029,15 +2048,25 @@ func isSessionProcessDead(t *tmux.Tmux, sessionName string, townRoot string) boo
 		// Got a non-numeric PID — shouldn't happen, but don't kill.
 		return false
 	}
+	return !pidAlive(pid)
+}
+
+// panePID and pidAlive are the two probe steps, as package-level vars so tests
+// can drive BOTH directions of this function's contract. The kill direction —
+// an existing-and-stale heartbeat over a dead pane must still reap — is the one
+// that calls KillSessionWithProcesses, so leaving it unpinned would let a
+// hardwired `return false` ship green.
+var panePID = func(t *tmux.Tmux, session string) (string, error) {
+	return t.GetPanePID(session)
+}
+
+var pidAlive = func(pid int) bool {
 	p, err := os.FindProcess(pid)
 	if err != nil {
-		return true
+		return false
 	}
-	// On Unix, Signal(0) checks if process exists without sending a signal
-	if err := p.Signal(syscall.Signal(0)); err != nil {
-		return true
-	}
-	return false
+	// On Unix, Signal(0) checks if a process exists without sending a signal.
+	return p.Signal(syscall.Signal(0)) == nil
 }
 
 // pendingMaxAge is how long a .pending reservation marker may exist before
