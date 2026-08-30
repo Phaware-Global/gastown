@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -1990,100 +1991,72 @@ func (m *Manager) ReconcilePoolWith(namesWithDirs, namesWithSessions []string) {
 	m.cleanupOrphanPolecatState()
 }
 
-// agentProbe is the narrow tmux surface the liveness probe needs. Declared as an
-// interface so the corroboration logic below is coverable by a fake — with a
-// concrete *tmux.Tmux the only way to test it was to replace the whole probe,
-// which left its own branches untested.
-type agentProbe interface {
-	HasSession(session string) (bool, error)
-	AgentAliveE(session string) (bool, error)
-	AgentLivenessIsHeartbeatOnly(session string) bool
-}
-
-// sessionAgentAlive reports whether the agent process inside sessionName is
-// alive, probing the agent's process tree rather than the pane's root process.
+// isSessionProcessDead reports whether a polecat session's agent has exited.
 //
-// The second return distinguishes "confirmed not alive" from "could not tell",
-// and that distinction is delegated to tmux.AgentAliveE rather than reconstructed
-// here. An earlier attempt corroborated a negative IsAgentAlive by checking that
-// GetPanePID succeeded; that proved nothing, because GetPanePID runs only
-// display-message — the same tmux control path HasSession already proved. It
-// exercises neither mechanism whose silent failure turns into a bare false:
-// show-environment erroring (which defaults a codex/cursor/opencode session to
-// Claude's process names, so a healthy agent matches nothing) and pgrep/ps
-// failing to exec under load. AgentAliveE runs all three and returns an error
-// wrapping ErrAgentLivenessUnknown instead of a misleading false.
+// A FRESH heartbeat proves life and short-circuits. Everything else falls
+// through to the pane-PID probe this function has always used.
 //
-// A missing session is NOT taken as proof either: tmux.HasSession collapses
-// several failures into (false, nil) — every error on Windows/psmux, and
-// ErrNoServer everywhere — so absence there is indistinguishable from a control
-// path that is simply down.
-var sessionAgentAlive = func(t agentProbe, sessionName string) (alive, ok bool) {
-	exists, err := t.HasSession(sessionName)
-	if err != nil || !exists {
-		return false, false
-	}
-	if t.AgentLivenessIsHeartbeatOnly(sessionName) {
-		// The pane runs a launcher, not the agent (remote-execution backends), so
-		// an alive process tree says nothing about the agent and a dead one would
-		// only mean the launcher exited. The stale heartbeat that got us here is
-		// the signal; treat it as conclusive rather than demanding a tree verdict
-		// this session cannot give — otherwise these polecats are never reapable.
-		return false, true
-	}
-	alive, err = t.AgentAliveE(sessionName)
-	if err != nil {
-		return false, false
-	}
-	return alive, true
-}
-
-// isSessionProcessDead reports whether a session's AGENT is confirmed gone.
+// What changed for gt-azm0 is only this: a STALE heartbeat is no longer proof of
+// death. Heartbeats are written only when a gt command runs inside a session
+// (internal/cmd/root.go), so an agent that spends longer than
+// SessionHeartbeatStaleThreshold reasoning or editing files — routine, and the
+// norm on a loaded box — lapses while perfectly healthy. Treating that as death
+// made `gt polecat list` report working polecats as stalled/NEEDS_RECOVERY and
+// drove the witness to reap them mid-task, churning a bead through assignees
+// with no commits landing.
 //
-// Heartbeat state gates everything. A FRESH heartbeat proves life. A MISSING
-// heartbeat is inconclusive: a session that has never checked in cannot have
-// proved death either, and SessionManager.Start does not write the first
-// heartbeat until after the runtime is ready (up to ClaudeStartTimeout), so
-// during startup the agent process has not joined the tree yet and probing would
-// see only the wrapper shell. Reaping there let a concurrent gt sling kill a
-// polecat that was still starting. Only a heartbeat that EXISTS and is STALE
-// justifies probing at all.
+// The pane-PID probe is deliberately conservative and deliberately unchanged. It
+// cannot see an agent that died behind a surviving shell or exec-wrapper pane,
+// so it under-reports death — but this function's callers KILL sessions
+// (ReconcilePoolWith -> KillSessionWithProcesses), and under-reporting costs a
+// lingering worktree while over-reporting destroys a healthy agent's work
+// mid-task. That asymmetry is why the gt-kncti contract ("confirm dead, never
+// guess") is load-bearing here.
 //
-// Staleness itself is never proof. Heartbeats are written only when a gt command
-// runs inside a session (internal/cmd/root.go), so an agent that spends longer
-// than SessionHeartbeatStaleThreshold reasoning or editing files — routine, and
-// the norm on a loaded box — lapses while perfectly healthy. Treating that as
-// death made `gt polecat list` report working polecats as stalled and drove the
-// witness to reap them mid-task (gt-azm0).
-//
-// Probing targets the agent's process tree rather than the pane's root process,
-// which is frequently a shell or exec-wrapper that outlives the agent and would
-// hide a dead agent behind a surviving pane (hq-k1ot / np-tt5s, gt-jn40ft), and
-// it treats an unrunnable probe as no answer rather than as death.
-//
-// Returns true ONLY on a corroborated verdict. Every uncertain outcome — no town
-// root, no heartbeat, no tmux handle, an unusable probe — reports NOT dead.
-// Callers kill sessions (ReconcilePoolWith -> KillSessionWithProcesses), so
-// guessing wrong destroys a healthy agent's work mid-task; the conservative
-// contract (gt-kncti) is load-bearing. Genuinely orphaned sessions are still
-// reaped by ReconcilePoolWith's no-worktree branch and by SessionManager.Start's
-// own IsAgentAlive check.
+// Agent-tree liveness detection deliberately lives elsewhere, where a wrong
+// answer is recoverable: SessionManager.Start kills a stale session via
+// IsAgentAlive immediately before recreating it, and the witness's
+// detectZombieLiveSession applies the same signal on its own schedule to exactly
+// the live-session/dead-agent shape. Duplicating that judgement here, on a path
+// that kills without recreating, is tracked separately rather than bundled into
+// this fix.
 func isSessionProcessDead(t *tmux.Tmux, sessionName string, townRoot string) bool {
-	if townRoot == "" {
-		return false
+	if townRoot != "" {
+		if stale, exists := IsSessionHeartbeatStale(townRoot, sessionName); exists && !stale {
+			return false
+		}
 	}
-	stale, exists := IsSessionHeartbeatStale(townRoot, sessionName)
-	if !exists || !stale {
-		return false
-	}
+
+	// Without a tmux handle there is nothing to probe, and an unprobeable
+	// session must never be reported dead.
 	if t == nil {
 		return false
 	}
-	alive, ok := sessionAgentAlive(t, sessionName)
-	if !ok {
+
+	pidStr, err := t.GetPanePID(sessionName)
+	if err != nil {
+		// Tmux query failed — could be permission denied, server busy, etc.
+		// Don't assume dead; let a future cycle retry.
 		return false
 	}
-	return !alive
+	if pidStr == "" {
+		// No PID means no process — session is dead.
+		return true
+	}
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil {
+		// Got a non-numeric PID — shouldn't happen, but don't kill.
+		return false
+	}
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return true
+	}
+	// On Unix, Signal(0) checks if process exists without sending a signal
+	if err := p.Signal(syscall.Signal(0)); err != nil {
+		return true
+	}
+	return false
 }
 
 // pendingMaxAge is how long a .pending reservation marker may exist before

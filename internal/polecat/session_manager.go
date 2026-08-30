@@ -527,12 +527,6 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) (retErr
 		// process-name liveness must track the launcher; agent liveness is
 		// heartbeat-only for remote backends (§8.1).
 		envVars["GT_PROCESS_NAMES"] = filepath.Base(prov.argv[0])
-		// Mark the session so liveness checks know the process tree tracks the
-		// launcher rather than the agent. Without this, an agent-tree probe finds
-		// the launcher alive and reports the polecat healthy forever, so a remote
-		// agent that dies while gt-worker-attach is still blocked in ReadFrame
-		// would never be reaped and would hold its worktree and name-pool slot.
-		envVars[tmux.EnvAgentLivenessHeartbeatOnly] = "1"
 	}
 
 	// Create session with command and env vars via -e flags so the initial

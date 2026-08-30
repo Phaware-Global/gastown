@@ -2,13 +2,10 @@ package polecat
 
 import (
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func TestTouchAndReadSessionHeartbeat(t *testing.T) {
@@ -187,35 +184,6 @@ func TestIsSessionProcessDead_HeartbeatFresh(t *testing.T) {
 	}
 }
 
-// fakeAgentProbe drives every branch of the corroboration logic without a live
-// tmux server.
-type fakeAgentProbe struct {
-	hasSession    bool
-	hasSessionErr error
-	agentAlive    bool
-	agentAliveErr error
-	heartbeatOnly bool
-	aliveCalls    int
-}
-
-func (f *fakeAgentProbe) HasSession(string) (bool, error)          { return f.hasSession, f.hasSessionErr }
-func (f *fakeAgentProbe) AgentLivenessIsHeartbeatOnly(string) bool { return f.heartbeatOnly }
-func (f *fakeAgentProbe) AgentAliveE(string) (bool, error) {
-	f.aliveCalls++
-	return f.agentAlive, f.agentAliveErr
-}
-
-// withProbe routes sessionAgentAlive at the fake while keeping the REAL
-// corroboration logic in play, so these tests cover the production branches
-// rather than a stub that replaces them.
-func withProbe(t *testing.T, f *fakeAgentProbe) {
-	t.Helper()
-	real := sessionAgentAlive
-	prev := sessionAgentAlive
-	sessionAgentAlive = func(_ agentProbe, s string) (bool, bool) { return real(f, s) }
-	t.Cleanup(func() { sessionAgentAlive = prev })
-}
-
 func writeStaleHeartbeat(t *testing.T, townRoot, sessionName string) {
 	t.Helper()
 	dir := filepath.Join(townRoot, ".runtime", "heartbeats")
@@ -229,105 +197,30 @@ func writeStaleHeartbeat(t *testing.T, townRoot, sessionName string) {
 	}
 }
 
-// TestSessionAgentAliveCorroboration covers the probe's own branches. Both
-// directions are destructive if wrong: too lenient and a dead agent behind a
-// surviving wrapper pane keeps its worktree and name-pool slot forever
-// (hq-k1ot / np-tt5s, gt-jn40ft); too eager and a transient pgrep/ps failure
-// reaps a healthy agent mid-task (gt-kncti).
-func TestSessionAgentAliveCorroboration(t *testing.T) {
-	tests := []struct {
-		name      string
-		probe     fakeAgentProbe
-		wantAlive bool
-		wantOK    bool
-	}{
-		{
-			name:   "agent alive is conclusive",
-			probe:  fakeAgentProbe{hasSession: true, agentAlive: true},
-			wantOK: true, wantAlive: true,
-		},
-		{
-			name:   "agent absent with a working probe is confirmed dead",
-			probe:  fakeAgentProbe{hasSession: true, agentAlive: false},
-			wantOK: true, wantAlive: false,
-		},
-		{
-			// The probe machinery itself failed — pgrep unable to fork under
-			// load, or show-environment erroring so a codex/cursor session
-			// would be matched against Claude's process names. AgentAliveE
-			// surfaces these as an error instead of a bare false.
-			name:   "unusable probe yields no verdict",
-			probe:  fakeAgentProbe{hasSession: true, agentAliveErr: errors.New("agent liveness could not be determined: pgrep: fork: resource temporarily unavailable")},
-			wantOK: false, wantAlive: false,
-		},
-		{
-			name:   "tmux control path erroring yields no verdict",
-			probe:  fakeAgentProbe{hasSessionErr: errors.New("server exited")},
-			wantOK: false, wantAlive: false,
-		},
-		{
-			// HasSession collapses several failures into (false, nil) — every
-			// error on Windows/psmux, and ErrNoServer everywhere — so a missing
-			// session is indistinguishable from a downed control path.
-			name:   "missing session is not proof of death",
-			probe:  fakeAgentProbe{hasSession: false},
-			wantOK: false, wantAlive: false,
-		},
+// TestIsSessionProcessDead_StaleHeartbeatIsNotDeath is the gt-azm0 regression.
+//
+// A polecat mid-turn — reasoning or editing rather than shelling out to gt —
+// lets its heartbeat lapse past SessionHeartbeatStaleThreshold while its process
+// is very much alive. Before the fix the stale heartbeat short-circuited and
+// reported the session dead, so `gt polecat list` showed the polecat as
+// stalled/NEEDS_RECOVERY and the witness reaped it mid-task and reassigned its
+// bead.
+//
+// A nil tmux handle stands in for "nothing to probe": the contract is that an
+// unprobeable session is never reported dead, so staleness alone must not
+// produce a kill.
+func TestIsSessionProcessDead_StaleHeartbeatIsNotDeath(t *testing.T) {
+	townRoot := t.TempDir()
+	sessionName := "gt-test-hb-stale-but-live"
+	writeStaleHeartbeat(t, townRoot, sessionName)
+
+	if stale, exists := IsSessionHeartbeatStale(townRoot, sessionName); !exists || !stale {
+		t.Fatalf("test setup: want an existing stale heartbeat, got exists=%v stale=%v", exists, stale)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			f := tt.probe
-			alive, ok := sessionAgentAlive(&f, "gt-x")
-			if alive != tt.wantAlive || ok != tt.wantOK {
-				t.Errorf("got (alive=%v, ok=%v), want (alive=%v, ok=%v)", alive, ok, tt.wantAlive, tt.wantOK)
-			}
-			if f.aliveCalls > 1 {
-				t.Errorf("IsAgentAlive called %d times; re-sampling repeats a deterministic probe and doubles pgrep fork pressure", f.aliveCalls)
-			}
-		})
+	if isSessionProcessDead(nil, sessionName, townRoot) {
+		t.Error("a stale heartbeat alone must not report dead: it falls through to process probing")
 	}
-}
-
-// TestIsSessionProcessDead_HeartbeatGate covers which heartbeat states may lead
-// to a kill at all.
-func TestIsSessionProcessDead_HeartbeatGate(t *testing.T) {
-	t.Run("stale heartbeat plus dead agent is reaped", func(t *testing.T) {
-		townRoot := t.TempDir()
-		writeStaleHeartbeat(t, townRoot, "gt-s1")
-		withProbe(t, &fakeAgentProbe{hasSession: true, agentAlive: false})
-		if !isSessionProcessDead(&tmux.Tmux{}, "gt-s1", townRoot) {
-			t.Error("a confirmed-dead agent behind a live pane must be reaped")
-		}
-	})
-
-	t.Run("stale heartbeat plus live agent is not reaped", func(t *testing.T) {
-		townRoot := t.TempDir()
-		writeStaleHeartbeat(t, townRoot, "gt-s2")
-		withProbe(t, &fakeAgentProbe{hasSession: true, agentAlive: true})
-		if isSessionProcessDead(&tmux.Tmux{}, "gt-s2", townRoot) {
-			t.Error("gt-azm0: an agent mid-turn lapses its heartbeat while healthy")
-		}
-	})
-
-	t.Run("missing heartbeat is never reaped", func(t *testing.T) {
-		// SessionManager.Start writes the first heartbeat only after the runtime
-		// is ready (up to ClaudeStartTimeout). Until then IsAgentAlive sees only
-		// the wrapper shell, so probing reports death and a concurrent gt sling
-		// would kill a polecat that is still starting up.
-		townRoot := t.TempDir()
-		withProbe(t, &fakeAgentProbe{hasSession: true, agentAlive: false})
-		if isSessionProcessDead(&tmux.Tmux{}, "gt-starting-up", townRoot) {
-			t.Error("a session that has never checked in cannot have proved death")
-		}
-	})
-
-	t.Run("empty town root yields no verdict", func(t *testing.T) {
-		withProbe(t, &fakeAgentProbe{hasSession: true, agentAlive: false})
-		if isSessionProcessDead(&tmux.Tmux{}, "gt-s3", "") {
-			t.Error("without a town root the heartbeat cannot be consulted")
-		}
-	})
 }
 
 func TestIsSessionProcessDead_EmptyTownRoot(t *testing.T) {
