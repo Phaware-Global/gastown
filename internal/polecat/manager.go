@@ -1997,6 +1997,7 @@ func (m *Manager) ReconcilePoolWith(namesWithDirs, namesWithSessions []string) {
 type agentProbe interface {
 	HasSession(session string) (bool, error)
 	AgentAliveE(session string) (bool, error)
+	AgentLivenessIsHeartbeatOnly(session string) bool
 }
 
 // sessionAgentAlive reports whether the agent process inside sessionName is
@@ -2021,6 +2022,14 @@ var sessionAgentAlive = func(t agentProbe, sessionName string) (alive, ok bool) 
 	exists, err := t.HasSession(sessionName)
 	if err != nil || !exists {
 		return false, false
+	}
+	if t.AgentLivenessIsHeartbeatOnly(sessionName) {
+		// The pane runs a launcher, not the agent (remote-execution backends), so
+		// an alive process tree says nothing about the agent and a dead one would
+		// only mean the launcher exited. The stale heartbeat that got us here is
+		// the signal; treat it as conclusive rather than demanding a tree verdict
+		// this session cannot give — otherwise these polecats are never reapable.
+		return false, true
 	}
 	alive, err = t.AgentAliveE(sessionName)
 	if err != nil {

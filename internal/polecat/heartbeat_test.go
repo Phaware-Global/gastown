@@ -194,10 +194,12 @@ type fakeAgentProbe struct {
 	hasSessionErr error
 	agentAlive    bool
 	agentAliveErr error
+	heartbeatOnly bool
 	aliveCalls    int
 }
 
-func (f *fakeAgentProbe) HasSession(string) (bool, error) { return f.hasSession, f.hasSessionErr }
+func (f *fakeAgentProbe) HasSession(string) (bool, error)          { return f.hasSession, f.hasSessionErr }
+func (f *fakeAgentProbe) AgentLivenessIsHeartbeatOnly(string) bool { return f.heartbeatOnly }
 func (f *fakeAgentProbe) AgentAliveE(string) (bool, error) {
 	f.aliveCalls++
 	return f.agentAlive, f.agentAliveErr

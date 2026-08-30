@@ -2895,7 +2895,7 @@ func (t *Tmux) GetEnvironment(session, key string) (string, error) {
 	if len(parts) == 2 && parts[0] == key {
 		return parts[1], nil
 	}
-	return "", fmt.Errorf("environment variable %s not found in session %s", key, session)
+	return "", fmt.Errorf("%w: %s in session %s", ErrEnvNotSet, key, session)
 }
 
 // SetGlobalEnvironment sets an environment variable in the tmux global environment.
@@ -3175,6 +3175,27 @@ func (t *Tmux) matchesPaneRuntime(session, cmd, pid string, processNames []strin
 // undetermined, so callers can refuse to act destructively on a non-answer.
 var ErrAgentLivenessUnknown = errors.New("agent liveness could not be determined")
 
+// ErrEnvNotSet reports that a session environment variable is absent, as opposed
+// to show-environment having failed. Callers that fall back to a default when a
+// variable is merely unset must not apply that fallback when the read itself
+// broke.
+var ErrEnvNotSet = errors.New("environment variable not set in session")
+
+// EnvAgentLivenessHeartbeatOnly marks a session whose pane process tree tracks a
+// launcher rather than the agent itself — the remote-execution backends, where
+// the host pane runs gt-worker-attach and the agent lives off-host. For these,
+// process-tree liveness says nothing about the agent and the heartbeat is the
+// only signal (remote-polecat-execution §8.1).
+const EnvAgentLivenessHeartbeatOnly = "GT_AGENT_LIVENESS_HEARTBEAT_ONLY"
+
+// AgentLivenessIsHeartbeatOnly reports whether session's process tree tracks a
+// launcher rather than the agent, so an alive tree is not evidence the agent is
+// alive.
+func (t *Tmux) AgentLivenessIsHeartbeatOnly(session string) bool {
+	v, err := t.GetEnvironment(session, EnvAgentLivenessHeartbeatOnly)
+	return err == nil && strings.TrimSpace(v) != ""
+}
+
 // AgentAliveE reports whether the agent runtime is running in session,
 // distinguishing a clean "not running" from "could not determine".
 //
@@ -3188,27 +3209,20 @@ var ErrAgentLivenessUnknown = errors.New("agent liveness could not be determined
 //     from a clean no-match, and a wrapper pane reaches its agent only through
 //     that walk.
 //
-// Corroborating with display-message alone does not cover either: it is the same
-// tmux control path HasSession already proved, and it neither reads the session
-// environment nor forks a process lister. So this exercises all three.
-//
-// A non-nil error always wraps ErrAgentLivenessUnknown.
+// A non-nil error always wraps ErrAgentLivenessUnknown. A nil error with false
+// means the agent is genuinely absent from every pane's process tree.
 func (t *Tmux) AgentAliveE(session string) (bool, error) {
-	names, err := t.GetEnvironment(session, "GT_PROCESS_NAMES")
+	procNames, err := t.processNamesForLiveness(session)
 	if err != nil {
-		return false, fmt.Errorf("%w: reading %s for %q: %v", ErrAgentLivenessUnknown, "GT_PROCESS_NAMES", session, err)
-	}
-	procNames := splitProcessNames(names)
-	if len(procNames) == 0 {
-		return false, fmt.Errorf("%w: session %q declares no %s", ErrAgentLivenessUnknown, session, "GT_PROCESS_NAMES")
+		return false, err
 	}
 
-	pid, err := t.GetPanePID(session)
+	pids, err := t.livenessPanePIDs(session)
 	if err != nil {
-		return false, fmt.Errorf("%w: reading pane pid for %q: %v", ErrAgentLivenessUnknown, session, err)
+		return false, err
 	}
-	if strings.TrimSpace(pid) == "" {
-		return false, fmt.Errorf("%w: empty pane pid for %q", ErrAgentLivenessUnknown, session)
+	if len(pids) == 0 {
+		return false, fmt.Errorf("%w: no readable panes in %q", ErrAgentLivenessUnknown, session)
 	}
 
 	if runtime.GOOS == "windows" {
@@ -3217,11 +3231,82 @@ func (t *Tmux) AgentAliveE(session string) (bool, error) {
 		return false, fmt.Errorf("%w: process-tree probing is boolean-only on windows", ErrAgentLivenessUnknown)
 	}
 
-	matched, err := processTreeMatches(pid, procNames, 0)
-	if err != nil {
-		return false, fmt.Errorf("%w: scanning process tree of %s: %v", ErrAgentLivenessUnknown, pid, err)
+	for _, pid := range pids {
+		matched, err := processTreeMatches(pid, procNames, 0)
+		if err != nil {
+			return false, fmt.Errorf("%w: scanning process tree of %s: %v", ErrAgentLivenessUnknown, pid, err)
+		}
+		if matched {
+			return true, nil
+		}
 	}
-	return matched, nil
+	return false, nil
+}
+
+// processNamesForLiveness resolves the process names that identify the agent,
+// erroring only when the resolution itself is unreliable.
+//
+// GetEnvironment reports the same error for "variable unset" and
+// "show-environment failed", so they are separated here: an unset
+// GT_PROCESS_NAMES is the legacy shape and keeps the GT_AGENT fallback that
+// resolveSessionProcessNames documents, while a failed read has no trustworthy
+// fallback — defaulting to Claude's names there would make a healthy
+// codex/cursor/opencode agent match nothing and read as confirmed dead.
+func (t *Tmux) processNamesForLiveness(session string) ([]string, error) {
+	names, err := t.GetEnvironment(session, "GT_PROCESS_NAMES")
+	switch {
+	case err == nil:
+		if parsed := splitProcessNames(names); len(parsed) > 0 {
+			return parsed, nil
+		}
+	case !errors.Is(err, ErrEnvNotSet):
+		return nil, fmt.Errorf("%w: reading GT_PROCESS_NAMES for %q: %v", ErrAgentLivenessUnknown, session, err)
+	}
+
+	// Legacy sessions (started before GT_PROCESS_NAMES was set) carry GT_AGENT.
+	agentName, err := t.GetEnvironment(session, "GT_AGENT")
+	if err != nil && !errors.Is(err, ErrEnvNotSet) {
+		return nil, fmt.Errorf("%w: reading GT_AGENT for %q: %v", ErrAgentLivenessUnknown, session, err)
+	}
+	parsed := config.GetProcessNames(agentName)
+	if len(parsed) == 0 {
+		return nil, fmt.Errorf("%w: no process names resolve for %q", ErrAgentLivenessUnknown, session)
+	}
+	return parsed, nil
+}
+
+// livenessPanePIDs returns the pane pids whose process trees may contain the
+// agent.
+//
+// GetPanePID targets "<session>:^", which is the first window's ACTIVE pane —
+// not pane 0. An operator who attaches and splits window 0 moves that selection
+// onto the new pane, so walking it alone finds nothing and yields a CONFIRMED
+// negative for a perfectly healthy agent. IsRuntimeRunning avoids this by
+// preferring the recorded GT_PANE_ID and otherwise scanning every pane; this
+// mirrors that.
+func (t *Tmux) livenessPanePIDs(session string) ([]string, error) {
+	if paneID, err := t.GetEnvironment(session, "GT_PANE_ID"); err == nil && paneID != "" {
+		pid, perr := t.run("display-message", "-t", paneID, "-p", "#{pane_pid}")
+		if perr == nil {
+			if pid = strings.TrimSpace(pid); pid != "" {
+				return []string{pid}, nil
+			}
+		}
+		// Fall through to the full scan: a declared pane that cannot be read is
+		// not evidence the agent is gone.
+	}
+
+	out, err := t.run("list-panes", "-s", "-t", session, "-F", "#{pane_pid}")
+	if err != nil {
+		return nil, fmt.Errorf("%w: listing panes of %q: %v", ErrAgentLivenessUnknown, session, err)
+	}
+	var pids []string
+	for _, line := range strings.Fields(out) {
+		if line != "" {
+			pids = append(pids, line)
+		}
+	}
+	return pids, nil
 }
 
 func splitProcessNames(raw string) []string {
@@ -3243,7 +3328,10 @@ func splitProcessNames(raw string) []string {
 func processTreeMatches(pid string, names []string, depth int) (bool, error) {
 	const maxDepth = 10
 	if depth > maxDepth {
-		return false, nil
+		// A truncated walk is not "found nothing" — an agent nested deeper than
+		// this (stacked exec wrappers, sudo/ssh/container exec) would be missed,
+		// and this function's negative authorizes a kill.
+		return false, fmt.Errorf("process tree deeper than %d levels below %s", maxDepth, pid)
 	}
 	if ok, err := processNameMatches(pid, names); err != nil {
 		return false, err

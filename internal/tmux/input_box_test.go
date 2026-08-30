@@ -1,6 +1,8 @@
 package tmux
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -176,11 +178,17 @@ func TestProcessTreeMatches(t *testing.T) {
 		}
 	})
 
-	t.Run("depth is bounded", func(t *testing.T) {
+	t.Run("depth truncation is ambiguity, not a clean no-match", func(t *testing.T) {
 		t.Parallel()
+		// An agent nested deeper than the limit (stacked exec wrappers, sudo /
+		// ssh / container exec) must not be reported as absent: this function's
+		// negative authorizes a kill, so a walk that stopped early has to say so.
 		found, err := processTreeMatches(strconv.Itoa(os.Getpid()), []string{"x"}, 999)
-		if err != nil || found {
-			t.Errorf("past max depth must return (false, nil), got (%v, %v)", found, err)
+		if found {
+			t.Error("a truncated walk must not report a match")
+		}
+		if err == nil {
+			t.Error("past max depth must return an error; (false, nil) would authorise reaping an agent that was merely nested too deep")
 		}
 	})
 }
@@ -205,5 +213,35 @@ func TestSplitProcessNames(t *testing.T) {
 		if got := len(splitProcessNames(tt.in)); got != tt.want {
 			t.Errorf("splitProcessNames(%q) returned %d names, want %d", tt.in, got, tt.want)
 		}
+	}
+}
+
+// TestProcessNamesForLiveness_UnsetVsUnreadable separates the two GetEnvironment
+// failures that must not be conflated.
+//
+// An UNSET GT_PROCESS_NAMES is the legacy session shape and keeps the GT_AGENT
+// fallback, so those sessions stay reapable. A FAILED show-environment has no
+// trustworthy fallback: defaulting to Claude's names there would make a healthy
+// codex/cursor/opencode agent match nothing and read as confirmed dead.
+func TestProcessNamesForLiveness_UnsetVsUnreadable(t *testing.T) {
+	t.Parallel()
+	notSet := fmt.Errorf("%w: GT_PROCESS_NAMES in session s", ErrEnvNotSet)
+	if !errors.Is(notSet, ErrEnvNotSet) {
+		t.Fatal("an unset variable must be recognizable via ErrEnvNotSet")
+	}
+	readFailed := errors.New("no server running on /tmp/tmux-501/default")
+	if errors.Is(readFailed, ErrEnvNotSet) {
+		t.Error("a failed show-environment must NOT look like an unset variable")
+	}
+}
+
+// TestErrAgentLivenessUnknownWrapping pins the contract callers rely on: every
+// non-answer from the liveness probe is recognizable, so a caller that kills
+// sessions can refuse to act on it.
+func TestErrAgentLivenessUnknownWrapping(t *testing.T) {
+	t.Parallel()
+	wrapped := fmt.Errorf("%w: scanning process tree of 123: pgrep: fork failed", ErrAgentLivenessUnknown)
+	if !errors.Is(wrapped, ErrAgentLivenessUnknown) {
+		t.Error("probe failures must wrap ErrAgentLivenessUnknown so callers can refuse to reap on them")
 	}
 }
