@@ -84,6 +84,31 @@ type Daemon struct {
 	deathsMu     sync.Mutex
 	recentDeaths []sessionDeath
 
+	// reviewerLastNudge rate-limits reviewer stuck-nudges to one per rig per
+	// cooldown. Guarded because reapStuckReviewers fans out over rigs
+	// concurrently via rigPool.runPerRig. In-memory only — losing it on restart
+	// costs at most one extra nudge.
+	reviewerNudgeMu   sync.Mutex
+	reviewerLastNudge map[string]time.Time
+	// reviewerLastKill enforces a per-rig kill cooldown so a forged heartbeat
+	// cannot drive a kill on every tick.
+	reviewerLastKill map[string]time.Time
+	// reviewerMissingSince records when a rig was FIRST observed with no
+	// heartbeat, so the missing-heartbeat grace is measured from the daemon's own
+	// observation rather than from session creation — otherwise deleting the file
+	// is an instant kill switch for any session older than the window.
+	reviewerMissingSince map[string]time.Time
+	// reviewerReviewAnchor records the session age observed when each rig's
+	// CURRENT review identity first appeared, so the absolute cap can be measured
+	// per review on a clock tmux owns rather than on the shared session's age.
+	reviewerReviewAnchor map[string]reviewerAnchor
+	// reviewerLastQuietLog rate-limits the "taking no action" diagnostic. Its own
+	// map rather than reviewerLastNudge's: recording a nudge to throttle a log
+	// line would spend the absolute cap's single courtesy nudge.
+	reviewerLastQuietLog map[string]time.Time
+	// reviewerLastEscalate rate-limits failure escalations per rig.
+	reviewerLastEscalate map[string]time.Time
+
 	// Deacon startup tracking: prevents race condition where newly started
 	// sessions are immediately killed by the heartbeat check.
 	// See: https://github.com/steveyegge/gastown/issues/567
@@ -1011,6 +1036,15 @@ func (d *Daemon) heartbeat(state *State) {
 	// Polecats transition to IDLE after gt done but sessions stay alive.
 	// Kill sessions that have been idle longer than the configured threshold.
 	d.reapIdlePolecats()
+
+	// 12b-bis. Reap stuck Reviewer sessions. The Reviewer has no persistent
+	// registry entry and no agent bead, so no other phase in this heartbeat can
+	// see it: before this patrol, `gt reviewer done` was the only thing that
+	// ever ended a reviewer session — and a stuck reviewer is precisely the one
+	// that cannot run it.
+	if d.isPatrolActive(constants.RoleReviewer) {
+		d.reapStuckReviewers()
+	}
 
 	// 12c. Relieve the per-rig polecat directory cap. reapIdlePolecats only kills
 	// LIVE idle sessions; it never removes the resulting dead-session worktree

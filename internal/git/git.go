@@ -4168,3 +4168,48 @@ func submoduleDefaultBranch(submodulePath, remote string) (string, error) {
 	}
 	return "", fmt.Errorf("could not determine default branch for remote %s", remote)
 }
+
+// GhPrCreatedAt returns the time a PR was opened.
+//
+// Used by the review loop's convergence assessment to tell a PR that is
+// churning through rounds from one that is simply sitting blocked: a PR can
+// stay unmergeable for weeks without accumulating rounds at all (a wedged
+// reviewer, a capacity-starved fix loop, an escalation nobody cleared), and no
+// round-count rail fires on that shape.
+//
+// GitHub returns createdAt as RFC 3339. An unparseable or zero value is an
+// error rather than a zero time.Time, so a caller cannot mistake "we could not
+// tell" for "opened at the epoch" — which would make every PR look infinitely
+// old and trip an age rail on all of them.
+func (g *Git) GhPrCreatedAt(prNumber int) (time.Time, error) {
+	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber),
+		"--json", "createdAt")
+	cmd.Dir = g.workDir
+	// Separate streams so an auth/permission failure surfaces in the wrapped
+	// error rather than behind a bare exit status, matching GhPrHeadSHA.
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return time.Time{}, fmt.Errorf("gh pr view (createdAt) failed: %s: %w",
+			strings.TrimSpace(stderr.String()), err)
+	}
+	var resp struct {
+		CreatedAt string `json:"createdAt"`
+	}
+	if jerr := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &resp); jerr != nil {
+		return time.Time{}, fmt.Errorf("parsing createdAt: %w", jerr)
+	}
+	if strings.TrimSpace(resp.CreatedAt) == "" {
+		return time.Time{}, fmt.Errorf("gh pr view returned empty createdAt for PR #%d", prNumber)
+	}
+	t, perr := time.Parse(time.RFC3339, resp.CreatedAt)
+	if perr != nil {
+		return time.Time{}, fmt.Errorf("parsing createdAt %q for PR #%d: %w",
+			resp.CreatedAt, prNumber, perr)
+	}
+	if t.IsZero() {
+		return time.Time{}, fmt.Errorf("gh pr view returned a zero createdAt for PR #%d", prNumber)
+	}
+	return t, nil
+}

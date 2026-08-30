@@ -765,6 +765,23 @@ func (e *Engineer) LoadConfig() error {
 			return fmt.Errorf("reviewer_local=true requires a non-empty pr_reviewer " +
 				"(the reviewer bot login still drives the engagement gate)")
 		}
+		// The Reviewer's approval is informational only because it is a
+		// different identity from the named approval gate — that guarantee
+		// must hold on this runtime read path too, not only at config-write
+		// time (loader.go's validateMergeQueueConfig), or an externally
+		// edited config.json bypasses it entirely and the bot can satisfy
+		// its own approval gate.
+		//
+		// Requires PRReviewer non-empty: an unset pr_reviewer means "no
+		// reviewer identity configured," not "confirmed distinct from
+		// pr_approver" — mirrors loader.go's identical caveat.
+		if e.config.PRApprover != "" && e.config.PRReviewer != "" &&
+			strings.EqualFold(strings.TrimSpace(e.config.PRApprover), strings.TrimSpace(e.config.PRReviewer)) {
+			return fmt.Errorf("pr_approver and pr_reviewer must be different identities "+
+				"(both are %q): the reviewer's approval is informational and cannot also be "+
+				"the approval gate, or the bot approves its own reviews and merges without a human",
+				e.config.PRApprover)
+		}
 		switch e.config.PRMergeMethod {
 		case "", "squash", "merge", "rebase":
 			// valid

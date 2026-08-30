@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	gitpkg "github.com/steveyegge/gastown/internal/git"
@@ -674,6 +675,7 @@ func (f *threadGateFakeProvider) HasReviewFromOnSHA(int, string, string) (bool, 
 	panic("unused")
 }
 func (f *threadGateFakeProvider) CurrentHeadSHA(int) (string, error)        { panic("unused") }
+func (f *threadGateFakeProvider) CreatedAt(int) (time.Time, error)          { panic("unused") }
 func (f *threadGateFakeProvider) SubmitReview(int, SubmitReviewInput) error { panic("unused") }
 
 // TestDoMergePR_UnresolvedThreads_ShortCircuits asserts the contract of

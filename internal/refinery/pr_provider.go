@@ -2,6 +2,7 @@ package refinery
 
 import (
 	"errors"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/git"
 )
@@ -128,6 +129,13 @@ type PRProvider interface {
 	// force-push). Used by callers that need an authoritative SHA to
 	// pair with HasReviewFromOnSHA.
 	CurrentHeadSHA(prNumber int) (string, error)
+
+	// CreatedAt returns the time the PR was opened.
+	//
+	// Providers that cannot answer return ErrUnsupported, which callers treat
+	// as "age unknown" rather than as a failure — same contract as the other
+	// optional capabilities on this interface.
+	CreatedAt(prNumber int) (time.Time, error)
 
 	// SubmitReview submits a single PR review with the disposition in in.Event
 	// (APPROVE / REQUEST_CHANGES / COMMENT; empty defaults to COMMENT), an

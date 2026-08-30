@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"text/template"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
 )
@@ -60,6 +61,16 @@ type PromptParams struct {
 	PriorThreads string
 	// MaxFindings caps findings emitted by this pass (overflow summarized).
 	MaxFindings int
+	// MaxDuration is the pass's soft wall-clock budget, rendered into the
+	// contract as a self-imposed deadline. Nothing enforces it from outside the
+	// subagent's session — the point is that a pass which runs long returns a
+	// partial result with an honest verdict instead of hanging the whole review
+	// until the daemon kills the reviewer and discards everything it found.
+	// Below MinPassDuration (including zero) is corrected UP to that floor; a
+	// budget that small stops the pass before it establishes anything. Callers
+	// that know the rig should pass PassDuration(townRoot, rigPath), which
+	// derives half the rig's clamped stuck threshold.
+	MaxDuration time.Duration
 	// ExtraInstructions is the injection slot for additional execution
 	// instructions, appended after the shared contract. Usually empty.
 	ExtraInstructions string
@@ -88,6 +99,12 @@ func BuildPerspectivePrompt(p PromptParams) (string, error) {
 	}
 	if p.MaxFindings <= 0 {
 		p.MaxFindings = config.DefaultMaxFindingsPerPerspective
+	}
+	// Floor, not just a zero-check. A sub-minute budget tells the pass to stop
+	// before it has established anything, which rubber-stamps the PR — so an
+	// out-of-range value is corrected rather than honored.
+	if p.MaxDuration < MinPassDuration {
+		p.MaxDuration = MinPassDuration
 	}
 	p.PriorThreads = strings.TrimRight(p.PriorThreads, "\n")
 	p.ExtraInstructions = strings.TrimSpace(p.ExtraInstructions)

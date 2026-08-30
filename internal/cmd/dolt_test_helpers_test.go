@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/gastown/internal/testutil"
@@ -168,4 +169,52 @@ func dropStaleBeadsDatabases() error {
 
 	fmt.Fprintf(os.Stderr, "[dropStaleBeadsDatabases] cleaned: %v\n", dropped)
 	return nil
+}
+
+// stopTownProcesses terminates every process whose command line mentions root
+// (the test town's unique temp path) and WAITS for them to actually exit.
+//
+// The waiting is the point. These tests register a t.Cleanup that killed the
+// town's managed Dolt with a bare `pkill -f <root>`, but pkill only delivers
+// the signal — it returns as soon as the signal is sent, not when the process
+// has exited and closed its files. Go then runs the parent test's t.TempDir()
+// teardown, which RemoveAll's that same directory while Dolt is still shutting
+// down and still holding files inside it. The removal fails with
+//
+//	TempDir RemoveAll cleanup: unlinkat /tmp/TestX/001: directory not empty
+//
+// and the whole test fails even though every subtest passed. That is a race,
+// so it surfaces intermittently under load — it has been failing
+// TestBeadsDbInitAfterClone on CI and in the nightly integration run.
+//
+// SIGTERM first so Dolt can close its files cleanly, then escalate to SIGKILL
+// if it outstays the grace period; a killed-but-unreaped Dolt would leave the
+// same directory unremovable. Failures are deliberately silent: pkill exits
+// non-zero when nothing matched, which is the normal case for a town that
+// never started a server, and a cleanup helper must not fail a passing test.
+func stopTownProcesses(t *testing.T, root string) {
+	t.Helper()
+	if strings.TrimSpace(root) == "" {
+		return
+	}
+	_ = exec.Command("pkill", "-f", root).Run()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if exec.Command("pgrep", "-f", root).Run() != nil {
+			return // pgrep exits non-zero when nothing matches: all gone.
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Still alive after the grace period. SIGKILL, then give the kernel a
+	// moment to reap it and release the file handles.
+	_ = exec.Command("pkill", "-9", "-f", root).Run()
+	hardDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(hardDeadline) {
+		if exec.Command("pgrep", "-f", root).Run() != nil {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }

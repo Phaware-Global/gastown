@@ -213,6 +213,8 @@ gt reviewer prompt security    --pr <N> --sha <head-sha> --round 1 > prompt-secu
 #   → launch one subagent per prompt IN PARALLEL; each returns a PerspectiveResult JSON
 #     saved to perspective-<name>.json
 gt reviewer consolidate perspective-*.json --sha <head-sha> --out findings.json
+# Findings outside the PR diff are demoted to non-blocking. The diff base is
+# derived automatically; --base-sha <merge-base> overrides it.
 gt reviewer post --pr <N> --findings findings.json # the ONLY sanctioned posting path
 gt reviewer done                                    # clear state + self-terminate the session
 ```

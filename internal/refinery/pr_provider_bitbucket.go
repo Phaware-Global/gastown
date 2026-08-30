@@ -2,6 +2,7 @@ package refinery
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/bitbucket"
 	"github.com/steveyegge/gastown/internal/git"
@@ -105,6 +106,12 @@ func (p *bitbucketPRProvider) ListReviewAuthors(prNumber int) ([]string, error) 
 
 func (p *bitbucketPRProvider) HasReviewFromOnSHA(prNumber int, user, sha string) (bool, error) {
 	return false, ErrUnsupported
+}
+
+// CreatedAt is not implemented for Bitbucket. Callers treat ErrUnsupported as
+// "age unknown" and simply do not apply age-based rails.
+func (p *bitbucketPRProvider) CreatedAt(int) (time.Time, error) {
+	return time.Time{}, ErrUnsupported
 }
 
 func (p *bitbucketPRProvider) CurrentHeadSHA(prNumber int) (string, error) {

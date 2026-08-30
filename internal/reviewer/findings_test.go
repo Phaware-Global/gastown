@@ -198,20 +198,24 @@ func TestReviewEvent_SeverityDerived(t *testing.T) {
 	}
 }
 
-func TestReviewEvent_ExplicitDispositionOverrides(t *testing.T) {
-	// An explicit disposition wins over the severity-derived default: a clean
-	// review can request changes, and a high finding can be downgraded to comment.
+func TestReviewEvent_ExplicitDispositionEscalatesOnly(t *testing.T) {
+	// An explicit disposition raises the severity-derived default — a clean
+	// review can request changes …
 	fs := &Findings{Summary: "s", Disposition: "request_changes"}
 	if got := fs.ReviewEvent(); got != "REQUEST_CHANGES" {
 		t.Errorf("clean+request_changes: ReviewEvent() = %q, want REQUEST_CHANGES", got)
 	}
+	// … but it can never lower it. This assertion previously read "want COMMENT",
+	// which locked in a downgrade: a "comment" disposition from one lens
+	// suppressed another lens's high finding, turning a blocking review into an
+	// advisory one with no injection and no bad actor involved.
 	fs = &Findings{
 		Summary:     "s",
 		Disposition: "comment",
 		Findings:    []Finding{{Path: "a.go", Line: 1, Priority: "high", Title: "t"}},
 	}
-	if got := fs.ReviewEvent(); got != "COMMENT" {
-		t.Errorf("high+comment: ReviewEvent() = %q, want COMMENT", got)
+	if got := fs.ReviewEvent(); got != "REQUEST_CHANGES" {
+		t.Errorf("high+comment: ReviewEvent() = %q, want REQUEST_CHANGES (disposition is a floor, not a ceiling)", got)
 	}
 }
 

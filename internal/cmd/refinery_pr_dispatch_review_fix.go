@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/refinery"
+	"github.com/steveyegge/gastown/internal/reviewer"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -78,11 +79,12 @@ func init() {
 // All fields are required for the dispatch path; the caller validates and
 // escalates on missing entries rather than muddling through with empties.
 type dispatchReviewFixState struct {
-	PRNumber       int
-	Branch         string
-	SourceIssue    string
-	ReviewFixName  string // currently-dispatched polecat name, or empty
-	ReviewLoopIter int    // already incremented; 0 if never dispatched
+	PRNumber         int
+	Branch           string
+	SourceIssue      string
+	ReviewFixName    string // currently-dispatched polecat name, or empty
+	ReviewLoopIter   int    // already incremented; 0 if never dispatched
+	ReviewLoopResets int    // times an operator cleared ReviewLoopIter for this PR
 }
 
 func parseDispatchMRFields(mrID string) (dispatchReviewFixState, error) {
@@ -121,11 +123,12 @@ func parseDispatchMRFields(mrID string) (dispatchReviewFixState, error) {
 	}
 
 	return dispatchReviewFixState{
-		PRNumber:       prNumber,
-		Branch:         fields.Branch,
-		SourceIssue:    fields.SourceIssue,
-		ReviewFixName:  fields.ReviewFixPolecat,
-		ReviewLoopIter: fields.ReviewLoopIter,
+		PRNumber:         prNumber,
+		Branch:           fields.Branch,
+		SourceIssue:      fields.SourceIssue,
+		ReviewFixName:    fields.ReviewFixPolecat,
+		ReviewLoopIter:   fields.ReviewLoopIter,
+		ReviewLoopResets: fields.ReviewLoopResets,
 	}, nil
 }
 
@@ -233,6 +236,21 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 		return wrapOperationalErr(fmt.Errorf("polling unresolved threads: %w", err))
 	}
 	if len(threads) == 0 {
+		// Zero threads is not the same as nothing blocking. The Reviewer can
+		// deliver an unanchorable objection via `disposition`, which posts
+		// REQUEST_CHANGES with no findings and therefore no threads for this loop
+		// to drive. VerifyPRApproval catches it at PR.7 and defers the merge.
+		//
+		// Automating the clearing round is deliberately NOT done here (see the
+		// note on verifyNoBlockingReview). But the state must not be SILENT:
+		// without a thread there is no fix loop, without a fix loop there is no
+		// iteration cap, and without the cap nothing ever escalated — the patrol
+		// would print "awaiting human approval, will retry next poll" forever.
+		// A terminal state that reaches no human is worse than a loud failure, so
+		// this announces it once and lets the operator act.
+		if err := escalateUnanchoredBlock(provider, cfg, state); err != nil {
+			return err
+		}
 		fmt.Fprintf(os.Stdout, "PR #%d: no unresolved review threads, advancing to wait-approval\n",
 			state.PRNumber)
 		return nil
@@ -244,10 +262,31 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 		// Escalate. The mayor closes the escalation when a human merges
 		// the PR or kills the loop; the next patrol picks the MR back up.
 		threadsJSON, _ := json.Marshal(threads)
+
+		// Hitting the cap used to produce a bare "exceeded N iterations", which
+		// tells an operator that the loop ran long without saying what should
+		// happen to the PR. Assess the round history and carry a recommendation
+		// — approve-with-notes or decompose — so the escalation presents a
+		// choice between two stated options with the evidence beside them.
+		//
+		// This is a recommendation, not an action: nothing here approves a PR
+		// or splits one. The decision stays with the human the escalation
+		// reaches.
+		decision := reviewer.Assess(reviewer.ConvergenceInput{
+			PRNumber:  state.PRNumber,
+			History:   reviewLoopHistory(state, len(threads)),
+			Resets:    state.ReviewLoopResets,
+			MaxRounds: maxIter,
+			Age:       prAge(provider, state.PRNumber),
+		})
+		reason := string(threadsJSON)
+		if desc := decision.Describe(state.PRNumber); desc != "" {
+			reason = desc + "\nUnresolved threads:\n" + string(threadsJSON)
+		}
 		if err := escalateReviewLoopCap(
-			fmt.Sprintf("PR #%d review loop exceeded %d iterations; %d thread(s) still unresolved",
-				state.PRNumber, maxIter, len(threads)),
-			string(threadsJSON),
+			fmt.Sprintf("PR #%d review loop exceeded %d iterations; %d thread(s) still unresolved%s",
+				state.PRNumber, maxIter, len(threads), ejectSuffix(decision)),
+			reason,
 			fmt.Sprintf("dispatch-review-fix:cap:%s", refPrDispatchReviewFixMR)); err != nil {
 			return wrapOperationalErr(fmt.Errorf("escalating iteration cap: %w", err))
 		}
@@ -787,3 +826,135 @@ func escalateReviewLoopCapArgs(description, fingerprintSuffix string) []string {
 // Compile-time silencer for time.Time so test harnesses that import this
 // file don't fail under -unused. The helper is a no-op.
 var _ = time.Time{}
+
+// escalateUnanchoredBlock files one escalation when a designated reviewer holds
+// a CHANGES_REQUESTED verdict that produced no threads.
+//
+// Deliberately minimal: it notifies and returns. It does not dispatch, persist a
+// counter, or claim an in-flight marker — that was the automatic clearing path,
+// which was withdrawn because getting those four concerns right is its own
+// change. Notification needs none of them, and the absence of one was the real
+// harm: the thread-driven cap escalates, and removing the loop left this branch
+// with no announcement on any path.
+//
+// Idempotent by fingerprint: `gt escalate --fingerprint` dedupes per MR, so a
+// patrol cycling every few minutes files one escalation rather than one per
+// cycle. That is the whole reason this is safe to do without a persisted marker.
+func escalateUnanchoredBlock(provider refinery.PRProvider, cfg *refinery.MergeQueueConfig,
+	state dispatchReviewFixState) error {
+	if cfg == nil {
+		return nil
+	}
+	blocking, err := provider.ChangesRequestedReviewers(state.PRNumber)
+	if err != nil {
+		// ErrUnsupported means the provider cannot answer; advancing quietly is
+		// the pre-existing behavior for those providers.
+		if errors.Is(err, refinery.ErrUnsupported) {
+			return nil
+		}
+		return wrapOperationalErr(
+			fmt.Errorf("checking blocking reviews on PR #%d: %w", state.PRNumber, err))
+	}
+	who := blockingDesignatedReviewer(cfg, blocking)
+	if who == "" {
+		return nil
+	}
+	fmt.Fprintf(os.Stdout,
+		"PR #%d: %s requests changes but opened no threads — nothing for the review-fix loop to "+
+			"resolve; escalating\n", state.PRNumber, who)
+	desc := fmt.Sprintf("PR #%d blocked by %s with no unresolved threads", state.PRNumber, who)
+	reason := fmt.Sprintf(
+		"%s holds an active CHANGES_REQUESTED verdict on PR #%d that produced no inline threads, "+
+			"so the review-fix loop has nothing to act on and the merge is deferred at PR.7.\n\n"+
+			"GitHub supersedes that verdict only with an APPROVED or DISMISSED review from the same "+
+			"login — a COMMENT does not. Address the objection and re-dispatch with "+
+			"`gt reviewer request %d`, or dismiss the review on GitHub.\n",
+		who, state.PRNumber, state.PRNumber)
+	if eerr := escalateReviewLoopCap(desc, reason,
+		fmt.Sprintf("dispatch-review-fix:unanchored-block:%s", refPrDispatchReviewFixMR)); eerr != nil {
+		return wrapOperationalErr(fmt.Errorf("escalating unanchored review block: %w", eerr))
+	}
+	return nil
+}
+
+// blockingDesignatedReviewer returns the rig's designated reviewer login when it
+// is among the blocking set, else "". Mirrors the merge gate's scope: pr_reviewer
+// only under reviewer_local, since that is the only configuration where the
+// verdict both blocks and has an in-town remedy to name.
+func blockingDesignatedReviewer(cfg *refinery.MergeQueueConfig, blocking []string) string {
+	want := strings.ToLower(strings.TrimSpace(cfg.PRReviewer))
+	if want == "" || !cfg.ReviewerLocal {
+		return ""
+	}
+	for _, login := range blocking {
+		if strings.ToLower(strings.TrimSpace(login)) == want {
+			return login
+		}
+	}
+	return ""
+}
+
+// reviewLoopHistory reconstructs the round history Assess needs from the state
+// the MR bead actually carries.
+//
+// The bead records a running iteration count, not a per-round thread tally, so
+// only the current round's blocking count is known exactly. Earlier rounds are
+// represented with the same count, which makes the reconstruction conservative
+// in the direction that matters: a flat history reads as "not reducing", so the
+// stall rail can only fire when the loop genuinely reached the cap without
+// clearing its threads. It cannot manufacture apparent progress.
+//
+// Recording a real per-round tally on the bead would let the stall rail fire
+// earlier and let outcomeFor distinguish "shrinking" from "flat" on evidence
+// rather than on the cap. That is a bead schema change and is left out of this
+// one.
+func reviewLoopHistory(state dispatchReviewFixState, blocking int) []reviewer.RoundRecord {
+	rounds := state.ReviewLoopIter
+	if rounds < 1 {
+		rounds = 1
+	}
+	history := make([]reviewer.RoundRecord, 0, rounds)
+	for i := 1; i <= rounds; i++ {
+		history = append(history, reviewer.RoundRecord{Round: i, BlockingThreads: blocking})
+	}
+	return history
+}
+
+// ejectSuffix appends the recommended outcome to the escalation's one-line
+// description, so it is visible without opening the body.
+func ejectSuffix(d reviewer.EjectDecision) string {
+	if !d.Triggered() {
+		return ""
+	}
+	return fmt.Sprintf(" — recommend %s", d.Outcome)
+}
+
+// prAge returns how long a PR has been open, or 0 when that cannot be
+// determined.
+//
+// Zero means "unknown" to Assess, which disables the age rail rather than
+// applying it to a made-up number. Every failure path lands there deliberately:
+// a provider that does not implement CreatedAt (Bitbucket returns
+// ErrUnsupported), a gh call that fails on an expired token, or a clock skew
+// that puts the creation time in the future. Guessing in the other direction —
+// treating a zero time.Time as the epoch — would report every PR as decades old
+// and eject all of them.
+//
+// Best-effort by design: this runs on the escalation path, where the useful
+// outcome is an escalation with slightly less context, never a failure that
+// suppresses the escalation entirely.
+func prAge(provider refinery.PRProvider, prNumber int) time.Duration {
+	if provider == nil || prNumber <= 0 {
+		return 0
+	}
+	created, err := provider.CreatedAt(prNumber)
+	if err != nil || created.IsZero() {
+		return 0
+	}
+	age := time.Since(created)
+	if age <= 0 {
+		// A creation time in the future is clock skew, not a new PR.
+		return 0
+	}
+	return age
+}

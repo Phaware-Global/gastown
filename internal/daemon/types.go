@@ -119,6 +119,11 @@ type PatrolsConfig struct {
 	Witness        *PatrolConfig          `json:"witness,omitempty"`
 	Deacon         *PatrolConfig          `json:"deacon,omitempty"`
 	Handler        *PatrolConfig          `json:"handler,omitempty"`
+	// Reviewer gates the stuck-reviewer reaper. Like witness/refinery (and
+	// unlike the opt-in dogs) it defaults to ENABLED when unset: it is a safety
+	// rail, and a town that never configured it is exactly the town that needs
+	// it. Set {"enabled": false} to opt out.
+	Reviewer       *PatrolConfig          `json:"reviewer,omitempty"`
 	DoltServer     *DoltServerConfig      `json:"dolt_server,omitempty"`
 	DoltRemotes    *DoltRemotesConfig     `json:"dolt_remotes,omitempty"`
 	DoltBackup     *DoltBackupConfig      `json:"dolt_backup,omitempty"`
@@ -419,6 +424,10 @@ func IsPatrolEnabled(config *DaemonPatrolConfig, patrol string) bool {
 		if config.Patrols.Handler != nil {
 			return config.Patrols.Handler.Enabled
 		}
+	case constants.RoleReviewer:
+		if config.Patrols.Reviewer != nil {
+			return config.Patrols.Reviewer.Enabled
+		}
 	}
 	return true // Default: enabled
 }
@@ -437,6 +446,15 @@ func GetPatrolRigs(config *DaemonPatrolConfig, patrol string) []string {
 	case constants.RoleWitness:
 		if config.Patrols.Witness != nil {
 			return config.Patrols.Witness.Rigs
+		}
+	case constants.RoleReviewer:
+		// Without this the `rigs` allowlist was silently inert — it fell through
+		// to "all rigs", so a destructive, default-on patrol had only a
+		// whole-patrol off switch and no working per-rig narrowing. Only half of
+		// the rig-scoping fix had landed: IsPatrolEnabled gained a reviewer case
+		// and this did not.
+		if config.Patrols.Reviewer != nil {
+			return config.Patrols.Reviewer.Rigs
 		}
 	}
 	return nil // All rigs

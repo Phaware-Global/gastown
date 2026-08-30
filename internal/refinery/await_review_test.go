@@ -24,10 +24,10 @@ type awaitFakeProvider struct {
 	// SHAs not in the map return false (matches "reviewer hasn't reviewed
 	// this commit yet"). hasReviewBySHAErr lets a single test exercise the
 	// provider-error path independently of the unscoped HasReviewFrom.
-	reviewBySHA       map[string]bool
-	reviewBySHAErr    error
-	headSHA           string
-	headSHAErr        error
+	reviewBySHA    map[string]bool
+	reviewBySHAErr error
+	headSHA        string
+	headSHAErr     error
 
 	threads    []ReviewThread
 	threadsErr error
@@ -73,6 +73,8 @@ func (p *awaitFakeProvider) HasReviewFromOnSHA(prNumber int, user, sha string) (
 	return p.reviewBySHA[sha], nil
 }
 
+func (p *awaitFakeProvider) CreatedAt(int) (time.Time, error) { return time.Time{}, ErrUnsupported }
+
 func (p *awaitFakeProvider) CurrentHeadSHA(prNumber int) (string, error) {
 	return p.headSHA, p.headSHAErr
 }
@@ -97,10 +99,10 @@ func (p *awaitFakeProvider) RequestReview(prNumber int, reviewers []string) erro
 func (p *awaitFakeProvider) ChangesRequestedReviewers(prNumber int) ([]string, error) {
 	return p.changesRequested, p.changesRequestedErr
 }
-func (p *awaitFakeProvider) AllThreads(int) ([]ReviewThread, error)        { panic("unused") }
-func (p *awaitFakeProvider) CountApprovals(int) (int, error)               { panic("unused") }
-func (p *awaitFakeProvider) ChecksRollup(int) (string, bool, error)        { panic("unused") }
-func (p *awaitFakeProvider) SubmitReview(int, SubmitReviewInput) error      { panic("unused") }
+func (p *awaitFakeProvider) AllThreads(int) ([]ReviewThread, error)    { panic("unused") }
+func (p *awaitFakeProvider) CountApprovals(int) (int, error)           { panic("unused") }
+func (p *awaitFakeProvider) ChecksRollup(int) (string, bool, error)    { panic("unused") }
+func (p *awaitFakeProvider) SubmitReview(int, SubmitReviewInput) error { panic("unused") }
 
 // fixedClock returns a deterministic time for AwaitReviewStep's
 // "Now()" injection. Tests compose past/future timestamps relative to
