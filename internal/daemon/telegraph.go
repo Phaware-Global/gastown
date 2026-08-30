@@ -101,25 +101,48 @@ func (m *TelegraphServerManager) resolvedLogFile() string {
 // isRunning checks if the supervised Telegraph process is alive.
 // Must be called with m.mu held.
 //
-// It always re-derives liveness from the nonce-protected PID file rather than
-// trusting a cached m.process handle: a handle only encodes a PID number, so
-// once the process it originally pointed at exits, that PID can be reused by
-// an unrelated process (or, on some platforms, briefly linger as a zombie)
-// and a raw liveness signal against the stale handle would then report a
-// dead Telegraph as alive forever, since nothing ever routes back through
+// It always re-derives liveness from the PID file rather than trusting a
+// cached m.process handle: a handle only encodes a PID number, so once the
+// process it originally pointed at exits, that PID can be reused by an
+// unrelated process (or, on some platforms, briefly linger as a zombie) and
+// a raw liveness signal against the stale handle would then report a dead
+// Telegraph as alive forever, since nothing ever routes back through
 // PID-file re-validation. This matters most for an *adopted* process (one
 // discovered via the PID file rather than started by this manager instance),
 // since there both the initial and every subsequent check rely solely on the
 // cached handle.
+//
+// Two handle-derived signals still take precedence over the file, because
+// they are more authoritative than a fresh PID-file probe:
+//   - If the file is missing or unreadable but this manager's own handle for
+//     the process it started is still alive, trust the handle (startLocked
+//     treats a failed PID-file write as non-fatal, so the file's absence
+//     does not by itself mean Telegraph died) and repair the file.
+//   - If this manager's own handle for the exact PID the file names reports
+//     dead, trust that over the file: once a self-started child has been
+//     reaped via cmd.Wait, the handle's death report can't be spoofed by the
+//     OS recycling that PID number to an unrelated process before the next
+//     check.
 func (m *TelegraphServerManager) isRunning() (int, bool) {
 	if m.runningFn != nil {
 		return m.runningFn()
 	}
 	pid, alive, err := verifyPIDOwnership(m.pidFile())
 	if err != nil || pid == 0 || !alive {
+		if pid == 0 && m.process != nil && isProcessAlive(m.process) {
+			if _, werr := writePIDFile(m.pidFile(), m.process.Pid); werr != nil {
+				m.logger("Telegraph: warning: failed to repair PID file: %v", werr)
+			}
+			return m.process.Pid, true
+		}
 		if pid > 0 {
 			_ = os.Remove(m.pidFile())
 		}
+		m.process = nil
+		return 0, false
+	}
+	if m.process != nil && m.process.Pid == pid && !isProcessAlive(m.process) {
+		_ = os.Remove(m.pidFile())
 		m.process = nil
 		return 0, false
 	}
