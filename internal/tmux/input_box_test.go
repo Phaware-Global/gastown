@@ -1,6 +1,11 @@
 package tmux
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strconv"
+	"testing"
+)
 
 // TestInputBoxSubmitted verifies that submission detection keys off the live
 // input box (the last prompt-prefix line) rather than arbitrary pane churn.
@@ -119,5 +124,86 @@ func TestInputBoxSubmitted(t *testing.T) {
 					tt.lines, tt.prefix, gotSubmitted, gotConcl, tt.wantSubmitted, tt.wantConcl)
 			}
 		})
+	}
+}
+
+// TestProcessTreeMatches distinguishes the two outcomes that a bare bool cannot:
+// a walk that ran and found nothing, versus a walk that could not run.
+//
+// Callers of the liveness probe KILL sessions, so collapsing these is what let a
+// transient pgrep/ps failure read as a dead agent and reap a healthy polecat
+// mid-turn (gt-azm0 / gt-kncti). pgrep and ps both exit 1 to mean "nothing
+// matched", which is a real answer; anything else is ambiguity.
+func TestProcessTreeMatches(t *testing.T) {
+	t.Parallel()
+
+	t.Run("own process is found by name", func(t *testing.T) {
+		t.Parallel()
+		self := strconv.Itoa(os.Getpid())
+		comm := filepath.Base(os.Args[0])
+		found, err := processTreeMatches(self, []string{comm}, 0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !found {
+			t.Errorf("expected to find own process %s named %q", self, comm)
+		}
+	})
+
+	t.Run("clean no-match is not an error", func(t *testing.T) {
+		t.Parallel()
+		self := strconv.Itoa(os.Getpid())
+		found, err := processTreeMatches(self, []string{"definitely-not-a-real-binary-xyzzy"}, 0)
+		if err != nil {
+			t.Fatalf("a name that simply does not match must not be an error, got: %v", err)
+		}
+		if found {
+			t.Error("expected no match")
+		}
+	})
+
+	t.Run("nonexistent pid is a clean answer, not an error", func(t *testing.T) {
+		t.Parallel()
+		// ps exits 1 for an unknown pid, which means "no such process" — a real
+		// answer. Treating it as ambiguity would make every reaped session
+		// unverifiable.
+		found, err := processTreeMatches("99999999", []string{"anything"}, 0)
+		if err != nil {
+			t.Fatalf("unknown pid must be a clean answer, got: %v", err)
+		}
+		if found {
+			t.Error("expected no match for a nonexistent pid")
+		}
+	})
+
+	t.Run("depth is bounded", func(t *testing.T) {
+		t.Parallel()
+		found, err := processTreeMatches(strconv.Itoa(os.Getpid()), []string{"x"}, 999)
+		if err != nil || found {
+			t.Errorf("past max depth must return (false, nil), got (%v, %v)", found, err)
+		}
+	})
+}
+
+// TestSplitProcessNames covers the parsing that decides which binaries count as
+// "the agent" — an empty result must be surfaced rather than silently matching
+// nothing, since that would make a healthy agent look dead.
+func TestSplitProcessNames(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		in   string
+		want int
+	}{
+		{"node,claude", 2},
+		{" node , claude ", 2},
+		{"claude", 1},
+		{"", 0},
+		{" ", 0},
+		{",,", 0},
+	}
+	for _, tt := range tests {
+		if got := len(splitProcessNames(tt.in)); got != tt.want {
+			t.Errorf("splitProcessNames(%q) returned %d names, want %d", tt.in, got, tt.want)
+		}
 	}
 }

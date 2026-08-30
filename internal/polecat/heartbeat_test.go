@@ -193,14 +193,15 @@ type fakeAgentProbe struct {
 	hasSession    bool
 	hasSessionErr error
 	agentAlive    bool
-	panePID       string
-	panePIDErr    error
+	agentAliveErr error
 	aliveCalls    int
 }
 
-func (f *fakeAgentProbe) HasSession(string) (bool, error)   { return f.hasSession, f.hasSessionErr }
-func (f *fakeAgentProbe) IsAgentAlive(string) bool          { f.aliveCalls++; return f.agentAlive }
-func (f *fakeAgentProbe) GetPanePID(string) (string, error) { return f.panePID, f.panePIDErr }
+func (f *fakeAgentProbe) HasSession(string) (bool, error) { return f.hasSession, f.hasSessionErr }
+func (f *fakeAgentProbe) AgentAliveE(string) (bool, error) {
+	f.aliveCalls++
+	return f.agentAlive, f.agentAliveErr
+}
 
 // withProbe routes sessionAgentAlive at the fake while keeping the REAL
 // corroboration logic in play, so these tests cover the production branches
@@ -245,16 +246,16 @@ func TestSessionAgentAliveCorroboration(t *testing.T) {
 		},
 		{
 			name:   "agent absent with a working probe is confirmed dead",
-			probe:  fakeAgentProbe{hasSession: true, agentAlive: false, panePID: "123"},
+			probe:  fakeAgentProbe{hasSession: true, agentAlive: false},
 			wantOK: true, wantAlive: false,
 		},
 		{
-			// The probe machinery itself failed (fork EAGAIN under load, or a
-			// show-environment error silently defaulting a codex/cursor session
-			// to Claude's process names). IsAgentAlive returns a bare false for
-			// all of these, so without corroboration it would read as death.
+			// The probe machinery itself failed — pgrep unable to fork under
+			// load, or show-environment erroring so a codex/cursor session
+			// would be matched against Claude's process names. AgentAliveE
+			// surfaces these as an error instead of a bare false.
 			name:   "unusable probe yields no verdict",
-			probe:  fakeAgentProbe{hasSession: true, agentAlive: false, panePIDErr: errors.New("no such target")},
+			probe:  fakeAgentProbe{hasSession: true, agentAliveErr: errors.New("agent liveness could not be determined: pgrep: fork: resource temporarily unavailable")},
 			wantOK: false, wantAlive: false,
 		},
 		{
@@ -292,7 +293,7 @@ func TestIsSessionProcessDead_HeartbeatGate(t *testing.T) {
 	t.Run("stale heartbeat plus dead agent is reaped", func(t *testing.T) {
 		townRoot := t.TempDir()
 		writeStaleHeartbeat(t, townRoot, "gt-s1")
-		withProbe(t, &fakeAgentProbe{hasSession: true, agentAlive: false, panePID: "1"})
+		withProbe(t, &fakeAgentProbe{hasSession: true, agentAlive: false})
 		if !isSessionProcessDead(&tmux.Tmux{}, "gt-s1", townRoot) {
 			t.Error("a confirmed-dead agent behind a live pane must be reaped")
 		}
@@ -313,14 +314,14 @@ func TestIsSessionProcessDead_HeartbeatGate(t *testing.T) {
 		// the wrapper shell, so probing reports death and a concurrent gt sling
 		// would kill a polecat that is still starting up.
 		townRoot := t.TempDir()
-		withProbe(t, &fakeAgentProbe{hasSession: true, agentAlive: false, panePID: "1"})
+		withProbe(t, &fakeAgentProbe{hasSession: true, agentAlive: false})
 		if isSessionProcessDead(&tmux.Tmux{}, "gt-starting-up", townRoot) {
 			t.Error("a session that has never checked in cannot have proved death")
 		}
 	})
 
 	t.Run("empty town root yields no verdict", func(t *testing.T) {
-		withProbe(t, &fakeAgentProbe{hasSession: true, agentAlive: false, panePID: "1"})
+		withProbe(t, &fakeAgentProbe{hasSession: true, agentAlive: false})
 		if isSessionProcessDead(&tmux.Tmux{}, "gt-s3", "") {
 			t.Error("without a town root the heartbeat cannot be consulted")
 		}

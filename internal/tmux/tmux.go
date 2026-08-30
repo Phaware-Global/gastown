@@ -3171,6 +3171,126 @@ func (t *Tmux) matchesPaneRuntime(session, cmd, pid string, processNames []strin
 	return hasDescendantWithNames(pid, names, 0)
 }
 
+// ErrAgentLivenessUnknown wraps every failure that leaves agent liveness
+// undetermined, so callers can refuse to act destructively on a non-answer.
+var ErrAgentLivenessUnknown = errors.New("agent liveness could not be determined")
+
+// AgentAliveE reports whether the agent runtime is running in session,
+// distinguishing a clean "not running" from "could not determine".
+//
+// IsAgentAlive returns a bare false for both, which is fine for callers that
+// merely wait or retry but not for callers that KILL the session on a negative.
+// Each mechanism below fails silently in the boolean path:
+//
+//   - show-environment failing makes resolveSessionProcessNames fall back to
+//     Claude's names, so a healthy codex/cursor/opencode agent matches nothing.
+//   - pgrep/ps failing to exec (fork EAGAIN under load) is indistinguishable
+//     from a clean no-match, and a wrapper pane reaches its agent only through
+//     that walk.
+//
+// Corroborating with display-message alone does not cover either: it is the same
+// tmux control path HasSession already proved, and it neither reads the session
+// environment nor forks a process lister. So this exercises all three.
+//
+// A non-nil error always wraps ErrAgentLivenessUnknown.
+func (t *Tmux) AgentAliveE(session string) (bool, error) {
+	names, err := t.GetEnvironment(session, "GT_PROCESS_NAMES")
+	if err != nil {
+		return false, fmt.Errorf("%w: reading %s for %q: %v", ErrAgentLivenessUnknown, "GT_PROCESS_NAMES", session, err)
+	}
+	procNames := splitProcessNames(names)
+	if len(procNames) == 0 {
+		return false, fmt.Errorf("%w: session %q declares no %s", ErrAgentLivenessUnknown, session, "GT_PROCESS_NAMES")
+	}
+
+	pid, err := t.GetPanePID(session)
+	if err != nil {
+		return false, fmt.Errorf("%w: reading pane pid for %q: %v", ErrAgentLivenessUnknown, session, err)
+	}
+	if strings.TrimSpace(pid) == "" {
+		return false, fmt.Errorf("%w: empty pane pid for %q", ErrAgentLivenessUnknown, session)
+	}
+
+	if runtime.GOOS == "windows" {
+		// The Windows walk has no error channel to propagate; refuse a verdict
+		// rather than risk condemning a healthy agent.
+		return false, fmt.Errorf("%w: process-tree probing is boolean-only on windows", ErrAgentLivenessUnknown)
+	}
+
+	matched, err := processTreeMatches(pid, procNames, 0)
+	if err != nil {
+		return false, fmt.Errorf("%w: scanning process tree of %s: %v", ErrAgentLivenessUnknown, pid, err)
+	}
+	return matched, nil
+}
+
+func splitProcessNames(raw string) []string {
+	out := make([]string, 0, 4)
+	for _, n := range strings.Split(raw, ",") {
+		if n = strings.TrimSpace(n); n != "" {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// processTreeMatches walks pid's descendants looking for any of names, and
+// reports an error when the walk itself could not run.
+//
+// pgrep exits 1 to mean "no matching processes", which is a clean empty result
+// rather than a failure; any other exit status, or a failure to exec at all, is
+// the ambiguity this function exists to surface.
+func processTreeMatches(pid string, names []string, depth int) (bool, error) {
+	const maxDepth = 10
+	if depth > maxDepth {
+		return false, nil
+	}
+	if ok, err := processNameMatches(pid, names); err != nil {
+		return false, err
+	} else if ok {
+		return true, nil
+	}
+
+	out, err := exec.Command("pgrep", "-P", pid).Output()
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && ee.ExitCode() == 1 {
+			return false, nil // no children — a real answer
+		}
+		return false, err
+	}
+	for _, child := range strings.Fields(string(out)) {
+		ok, err := processTreeMatches(child, names, depth+1)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// processNameMatches compares a pid's executable name against names, separating
+// a genuine mismatch from a ps that could not run.
+func processNameMatches(pid string, names []string) (bool, error) {
+	out, err := exec.Command("ps", "-p", pid, "-o", "comm=").Output()
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && ee.ExitCode() == 1 {
+			return false, nil // no such process — a real answer
+		}
+		return false, err
+	}
+	comm := filepath.Base(strings.TrimSpace(string(out)))
+	for _, n := range names {
+		if comm == n {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // IsAgentAlive checks if an agent is running in the session using agent-agnostic detection.
 // It reads GT_PROCESS_NAMES from the session environment for accurate process detection,
 // falling back to GT_AGENT-based lookup for legacy sessions.

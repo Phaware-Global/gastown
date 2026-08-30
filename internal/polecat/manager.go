@@ -1996,27 +1996,22 @@ func (m *Manager) ReconcilePoolWith(namesWithDirs, namesWithSessions []string) {
 // which left its own branches untested.
 type agentProbe interface {
 	HasSession(session string) (bool, error)
-	IsAgentAlive(session string) bool
-	GetPanePID(session string) (string, error)
+	AgentAliveE(session string) (bool, error)
 }
 
 // sessionAgentAlive reports whether the agent process inside sessionName is
 // alive, probing the agent's process tree rather than the pane's root process.
 //
-// The second return distinguishes "confirmed not alive" from "could not tell".
-// tmux.IsAgentAlive has no error channel and returns a bare false for every
-// failure mode — pgrep/ps failing with fork EAGAIN under load, display-message
-// erroring with GT_PANE_ID set, or show-environment failing and silently
-// defaulting a codex/cursor session to Claude's process names. None of those are
-// evidence of death, and this function's caller kills sessions.
-//
-// So a negative probe is only believed when the probe machinery is demonstrably
-// working: GetPanePID must succeed, which proves both the pane and the
-// session-env read are live, making a false a real no-match rather than an exec
-// failure. Re-sampling IsAgentAlive was tried and rejected — an immediate repeat
-// of a deterministic probe reproduces the same failure, and it doubled the pgrep
-// tree-walk inside the reconcile loop, adding fork pressure to the box whose
-// fork pressure is the failure being guarded against.
+// The second return distinguishes "confirmed not alive" from "could not tell",
+// and that distinction is delegated to tmux.AgentAliveE rather than reconstructed
+// here. An earlier attempt corroborated a negative IsAgentAlive by checking that
+// GetPanePID succeeded; that proved nothing, because GetPanePID runs only
+// display-message — the same tmux control path HasSession already proved. It
+// exercises neither mechanism whose silent failure turns into a bare false:
+// show-environment erroring (which defaults a codex/cursor/opencode session to
+// Claude's process names, so a healthy agent matches nothing) and pgrep/ps
+// failing to exec under load. AgentAliveE runs all three and returns an error
+// wrapping ErrAgentLivenessUnknown instead of a misleading false.
 //
 // A missing session is NOT taken as proof either: tmux.HasSession collapses
 // several failures into (false, nil) — every error on Windows/psmux, and
@@ -2027,13 +2022,11 @@ var sessionAgentAlive = func(t agentProbe, sessionName string) (alive, ok bool) 
 	if err != nil || !exists {
 		return false, false
 	}
-	if t.IsAgentAlive(sessionName) {
-		return true, true
-	}
-	if _, err := t.GetPanePID(sessionName); err != nil {
+	alive, err = t.AgentAliveE(sessionName)
+	if err != nil {
 		return false, false
 	}
-	return false, true
+	return alive, true
 }
 
 // isSessionProcessDead reports whether a session's AGENT is confirmed gone.
@@ -2056,7 +2049,8 @@ var sessionAgentAlive = func(t agentProbe, sessionName string) (alive, ok bool) 
 //
 // Probing targets the agent's process tree rather than the pane's root process,
 // which is frequently a shell or exec-wrapper that outlives the agent and would
-// hide a dead agent behind a surviving pane (hq-k1ot / np-tt5s, gt-jn40ft).
+// hide a dead agent behind a surviving pane (hq-k1ot / np-tt5s, gt-jn40ft), and
+// it treats an unrunnable probe as no answer rather than as death.
 //
 // Returns true ONLY on a corroborated verdict. Every uncertain outcome — no town
 // root, no heartbeat, no tmux handle, an unusable probe — reports NOT dead.
