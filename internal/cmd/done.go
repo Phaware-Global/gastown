@@ -2624,6 +2624,24 @@ func isReviewFixDispatch(fields *beads.AttachmentFields) bool {
 	return fields != nil && fields.ReviewPR > 0
 }
 
+// noMergeCompletionTarget describes how the no_merge/review_pr path should
+// complete: either create a fresh PR from the polecat's own branch, or reuse
+// an already-open PR that a review-fix dispatch is targeting.
+type noMergeCompletionTarget struct {
+	createPR bool // create a new GitHub PR from the polecat's own branch
+	reusePR  int  // > 0: an existing PR to complete against — no new PR, no new MR bead
+}
+
+// resolveNoMergeCompletion decides the no_merge/review_pr completion path.
+// TODO(gt-y4gw): ignores review_pr entirely — a review-fix dispatch gets the
+// same createPR treatment as a plain no_merge bead, which opens a fresh PR
+// from the polecat's own worktree branch instead of completing against the
+// PR the dispatch is already targeting (ha-z60: duplicate PRs #200/#201,
+// #208/#219).
+func resolveNoMergeCompletion(fields *beads.AttachmentFields, mergeStrategyIsPR bool) (noMergeCompletionTarget, error) {
+	return noMergeCompletionTarget{createPR: mergeStrategyIsPR}, nil
+}
+
 // handoffPRArgs bundles the parameters for handoffPRToRefinery so the
 // call site stays readable inside the already-dense no-merge path in
 // `gt done`.
