@@ -65,14 +65,21 @@ type SessionManager struct {
 	// verifyTmux is what the startup-nudge verify loop talks to. Defaults to
 	// tmux; tests substitute a fake to drive the loop itself.
 	verifyTmux startupNudgeTmux
+
+	// startPoller launches the queue drain. Seamed for the same reason as
+	// verifyTmux, and for a sharper one: nudge.StartPoller re-executes
+	// os.Executable() detached, which inside a test is the TEST binary — so a
+	// test reaching this spawns an unattended copy of its own suite.
+	startPoller func(townRoot, session string) (int, error)
 }
 
 // NewSessionManager creates a new polecat session manager for a rig.
 func NewSessionManager(t *tmux.Tmux, r *rig.Rig) *SessionManager {
 	return &SessionManager{
-		tmux:       t,
-		rig:        r,
-		verifyTmux: t,
+		tmux:        t,
+		rig:         r,
+		verifyTmux:  t,
+		startPoller: nudge.StartPoller,
 	}
 }
 
@@ -1105,7 +1112,7 @@ func (m *SessionManager) queueStartupNudge(sessionID, content, reason string) {
 			sessionID, reason, err)
 		return
 	}
-	if _, err := nudge.StartPoller(townRoot, sessionID); err != nil {
+	if _, err := m.startPoller(townRoot, sessionID); err != nil {
 		fmt.Fprintf(os.Stderr, "[startup-nudge] WARNING: queued startup nudge for %s but no poller (%s): %v\n",
 			sessionID, reason, err)
 	}
