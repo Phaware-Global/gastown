@@ -1716,6 +1716,28 @@ func tryResolveFromEphemeralTier(role string) (*RuntimeConfig, bool) {
 	return nil, false
 }
 
+// hasExplicitRoleAgent reports whether the role has an explicit per-role agent
+// assignment in rig or town settings. Unlike hasExplicitNonClaudeOverride it does
+// not care which agent was named, only that the operator named one — a role the
+// operator has configured should not be silently overridden by a built-in default.
+//
+// Deliberately narrower than hasExplicitNonClaudeOverride: it does not consult the
+// rig's global Agent or the town's DefaultAgent, since those are not statements
+// about this role and should not defeat a role-specific default.
+func hasExplicitRoleAgent(role string, townSettings *TownSettings, rigSettings *RigSettings) bool {
+	if rigSettings != nil && rigSettings.RoleAgents != nil {
+		if agentName, ok := rigSettings.RoleAgents[role]; ok && agentName != "" {
+			return true
+		}
+	}
+	if townSettings != nil && townSettings.RoleAgents != nil {
+		if agentName, ok := townSettings.RoleAgents[role]; ok && agentName != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // hasExplicitNonClaudeOverride checks if there is an explicit non-Claude agent
 // assignment either specifically for the role (in rig or town RoleAgents) or
 // globally (via rig Agent or town DefaultAgent). This prevents fallback logic
@@ -1775,14 +1797,19 @@ func resolveRoleAgentConfigCore(role, townRoot, rigPath string) *RuntimeConfig {
 		_ = LoadRigAgentRegistry(RigAgentRegistryPath(rigPath))
 	}
 
-	// Dogs default to Haiku (cheap infrastructure workers), but respect
-	// explicit non-Claude overrides (e.g., RoleAgents["dog"] = "opencode").
-	if role == "dog" {
-		if hasExplicitNonClaudeOverride(role, townSettings, rigSettings) {
-			// Fall through to normal resolution below
-		} else {
-			return claudeHaikuPreset()
-		}
+	// Dogs default to Haiku (cheap infrastructure workers), but only when the
+	// operator has expressed no preference. An explicit role_agents["dog"]
+	// assignment wins, whichever agent it names.
+	//
+	// This used to fall through only for a non-Claude agent, which made the
+	// default unopt-outable within the Claude family: role_agents["dog"] =
+	// "claude-sonnet" was accepted by config, reported by `gt config`, and then
+	// silently discarded here, so dogs ran Haiku regardless. Setting the role to
+	// "opencode" worked; setting it to another Claude model did nothing.
+	if role == "dog" &&
+		!hasExplicitRoleAgent(role, townSettings, rigSettings) &&
+		!hasExplicitNonClaudeOverride(role, townSettings, rigSettings) {
+		return claudeHaikuPreset()
 	}
 
 	// Check ephemeral cost tier (GT_COST_TIER env var)
