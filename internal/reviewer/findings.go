@@ -64,9 +64,12 @@ type Finding struct {
 
 // Findings is the full payload `gt reviewer post --findings <json>` consumes.
 type Findings struct {
-	// Summary is the per-perspective verdict + counts block that becomes the
-	// review's top-level body. Required: the role contract forbids silence.
-	Summary string `json:"summary"`
+	// Summary is the structured review body: one verdict line per perspective
+	// plus any out-of-scope opportunities. Required, and it follows a template —
+	// see ReviewSummary, which also owns the content budgets and the markdown
+	// rendering. The role contract forbids silence, so every perspective that
+	// ran has a line here.
+	Summary ReviewSummary `json:"summary"`
 	// ReviewedSHA, when set, is appended to the summary so humans can see which
 	// commit was reviewed even if upstream HEAD has since moved.
 	ReviewedSHA string `json:"reviewed_sha,omitempty"`
@@ -137,9 +140,21 @@ var validDispositions = map[string]string{
 // only escalate, never de-escalate. Severity derivation uses the highest
 // priority present:
 //
-//	high   → REQUEST_CHANGES (blocking; must be addressed)
-//	medium → COMMENT         (advisory; worth fixing, not a block)
-//	low / none → APPROVE      (nits-only or clean — the Reviewer endorses it)
+//	high       → REQUEST_CHANGES (blocking; must be addressed)
+//	medium/low/none → APPROVE    (worth fixing, but not a merge gate)
+//
+// COMMENT is no longer derivable from severity. It remains reachable only as an
+// explicit Disposition, and the contract narrows what it means: a pass that cut
+// itself short sets "comment" so a clean tally does not read as a finished
+// endorsement (see the execution contract's time budget). An unanchorable
+// concern that must be answered before the PR merges is not a comment — it is
+// "request_changes", because that is what "address this before merging" means.
+//
+// Medium findings used to derive COMMENT, which meant a PR carrying a few
+// medium nits was never approved and never blocked: it sat in a non-committal
+// state that neither the fix loop nor a human could act on, while the threads
+// themselves already imposed the work. Severity now answers one question — does
+// this block the merge? — and only a high finding says yes.
 //
 // The in-town Reviewer is a real reviewer: a clean or nits-only pass APPROVEs so
 // its GitHub verdict reads as an approval rather than a non-committal comment.
@@ -192,9 +207,18 @@ func (fs *Findings) SeverityEvent() string {
 	return fs.severityEvent()
 }
 
-// severityEvent derives the review event from finding severity alone.
+// severityEvent derives the review event from finding severity alone: a high
+// finding blocks, and nothing else does.
+//
+// Only "high" is matched, so an empty or malformed priority contributes to
+// APPROVE rather than blocking. That is safe at this layer because it is not
+// the layer that validates: ParseFindings rejects any non-empty unrecognized
+// priority outright, and normalizeFinding defaults an empty one to "medium" —
+// which no longer changes the verdict either way. Every finding still posts as
+// its own thread, and unresolved threads gate the merge for every rig,
+// identity-agnostic and config-free; severity decides only whether the review
+// itself withholds approval.
 func (fs *Findings) severityEvent() string {
-	hasMedium := false
 	for _, f := range fs.Findings {
 		// Out-of-scope findings never gate the verdict. They are real and are
 		// still posted, but a PR must not be blocked on work its own diff does
@@ -202,22 +226,9 @@ func (fs *Findings) severityEvent() string {
 		if f.Scope == ScopeOut {
 			continue
 		}
-		// Normalize defensively for Findings built outside ParseFindings (which
-		// rejects bad priorities). Only an explicit "low" permits APPROVE; an
-		// empty priority is "medium" (advisory) per normalizeFinding, and any
-		// unrecognized value is treated as medium too, so a malformed/typo
-		// priority can never yield an accidental APPROVE.
-		switch strings.ToLower(strings.TrimSpace(f.Priority)) {
-		case "high":
+		if strings.EqualFold(strings.TrimSpace(f.Priority), "high") {
 			return "REQUEST_CHANGES"
-		case "low":
-			// nits-only — non-blocking, permits APPROVE
-		default: // "medium", empty, or any unrecognized priority
-			hasMedium = true
 		}
-	}
-	if hasMedium {
-		return "COMMENT"
 	}
 	return "APPROVE"
 }
@@ -232,8 +243,8 @@ func ParseFindings(data []byte) (*Findings, error) {
 	if err := decodeStrictJSON(data, &fs); err != nil {
 		return nil, fmt.Errorf("parsing findings JSON: %w", err)
 	}
-	if strings.TrimSpace(fs.Summary) == "" {
-		return nil, fmt.Errorf("findings.summary is required (the review must never be silent)")
+	if err := fs.Summary.Normalize("findings.summary"); err != nil {
+		return nil, err
 	}
 	fs.Disposition = strings.ToLower(strings.TrimSpace(fs.Disposition))
 	if fs.Disposition != "" {
@@ -368,34 +379,73 @@ func (fs *Findings) BuildComments() []refinery.ReviewComment {
 	return out
 }
 
-// SummaryBody returns the review's top-level body: the agent-authored summary,
-// a priority count line, and the reviewed SHA (preferring reviewedSHA, then the
-// payload's ReviewedSHA). The count line gives humans and the refinery an
-// at-a-glance severity tally without re-parsing every thread.
+// SummaryBody renders the review's top-level body from the template, as
+// GitHub-flavored markdown, in a fixed section order:
+//
+//	### Blockers        — derived: the findings that hold the merge
+//	### Verdicts        — authored: one line per perspective
+//	### Opportunities   — authored: out-of-scope follow-up candidates
+//	footer              — derived: the priority tally and the reviewed SHA
+//
+// Blockers leads because it answers the question a reader opens the review
+// with. It is derived from the findings rather than written, so it cannot
+// disagree with the threads or cost the author budget, and it is omitted
+// entirely when nothing blocks — the absence IS the "nothing blocks" signal.
+//
+// The reviewed SHA prefers reviewedSHA, then the payload's ReviewedSHA, so a
+// human can see which commit was reviewed even if upstream HEAD has moved.
 func (fs *Findings) SummaryBody(reviewedSHA string) string {
 	var b strings.Builder
-	b.WriteString(strings.TrimRight(fs.Summary, "\n"))
-	b.WriteString("\n\n")
+	if blockers := fs.blockers(); len(blockers) > 0 {
+		b.WriteString("### Blockers\n\n")
+		for _, f := range blockers {
+			fmt.Fprintf(&b, "- `%s:%d` — %s", f.Path, f.Line, f.Title)
+			if f.Perspective != "" {
+				fmt.Fprintf(&b, " [%s]", f.Perspective)
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+	fs.Summary.render(&b)
+	b.WriteString("\n---\n\n")
 	b.WriteString(fs.countLine())
 	sha := reviewedSHA
 	if sha == "" {
 		sha = fs.ReviewedSHA
 	}
 	if sha != "" {
-		fmt.Fprintf(&b, "\nReviewed SHA: %s", sha)
+		fmt.Fprintf(&b, " · **Reviewed SHA:** `%s`", sha)
 	}
 	return b.String()
 }
 
+// blockers returns the findings that actually hold the merge: high priority and
+// inside the diff. Out-of-scope findings are excluded for the same reason
+// severityEvent skips them — a PR must not be reported as blocked on work its
+// own diff does not contain (Consolidate has already demoted them anyway).
+func (fs *Findings) blockers() []Finding {
+	var out []Finding
+	for _, f := range fs.Findings {
+		if f.Scope == ScopeOut {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(f.Priority), "high") {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
 // countLine summarizes finding counts by priority, e.g.
-// "Findings: 3 (high: 1, medium: 1, low: 1)".
+// "**Findings:** 3 (high: 1, medium: 1, low: 1)".
 func (fs *Findings) countLine() string {
 	counts := map[string]int{}
 	for _, f := range fs.Findings {
 		counts[f.Priority]++
 	}
 	if len(fs.Findings) == 0 {
-		return "Findings: 0 — no findings."
+		return "**Findings:** 0 — no findings."
 	}
 	parts := make([]string, 0, 3)
 	for _, p := range []string{"high", "medium", "low"} {
@@ -403,7 +453,7 @@ func (fs *Findings) countLine() string {
 			parts = append(parts, fmt.Sprintf("%s: %d", p, counts[p]))
 		}
 	}
-	return fmt.Sprintf("Findings: %d (%s)", len(fs.Findings), strings.Join(parts, ", "))
+	return fmt.Sprintf("**Findings:** %d (%s)", len(fs.Findings), strings.Join(parts, ", "))
 }
 
 // BuildReviewInput assembles the full SubmitReview payload from parsed findings.

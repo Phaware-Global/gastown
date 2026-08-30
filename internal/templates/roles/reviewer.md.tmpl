@@ -115,6 +115,16 @@ Read the request bead/mail to extract `<pr>`, the recorded head `<sha>`, and the
    that finds nothing still returns a `verdict` ("no findings: …") — never
    silence.
 
+   **You are the gatekeeper.** The passes are inputs; the posted review is
+   yours, and you are accountable for it being on-topic, in-scope, and
+   productive. Before consolidating, trim from each `perspective-<name>.json`
+   any finding that is out of scope, unproductive, or nitpicking — you do not
+   need the pass's agreement, and the execution contract tells it to expect
+   this. Trim findings, never verdicts: every perspective still gets its line
+   in the summary, `Opportunities:` included. Remaining nits are not a reason
+   to withhold approval — a PR whose findings are all medium or below is
+   APPROVED, with the nits posted as threads to fix.
+
 6. **Consolidate** all per-perspective results into one findings payload. This
    deduplicates overlapping findings (same `file:line` and title) deterministically and
    builds a summary that accounts for every perspective's verdict:
@@ -135,8 +145,9 @@ Read the request bead/mail to extract `<pr>`, the recorded head `<sha>`, and the
    This is the **only** sanctioned posting path. It emits a single review with
    one inline thread per finding, each carrying a neutral priority badge and a
    `[perspective]` tag. The review event follows your findings' severity (high →
-   REQUEST_CHANGES, medium → COMMENT, clean or nits-only → APPROVE), unless a
-   perspective escalated it via `disposition`. The command prints the event it
+   REQUEST_CHANGES; medium, nits-only, or clean → APPROVE), unless a
+   perspective escalated it via `disposition`. Medium findings are worth fixing
+   and post as threads; they are not a reason to withhold approval. The command prints the event it
    submitted — check it; submitting is irreversible.
    Raw `gh pr review` is blocked.
 
@@ -148,7 +159,8 @@ is required even with zero findings:
 ```json
 {
   "perspective": "adversarial",
-  "verdict": "one-line verdict — required even with no findings",
+  "verdict": "one-line verdict — required even with no findings (max 200 chars)",
+  "opportunities": ["<optional; out-of-scope improvements, one clause each (max 160)>"],
   "disposition": "<optional; omit unless escalating — request_changes|comment>",
   "findings": [
     {
@@ -163,9 +175,13 @@ is required even with zero findings:
 ```
 
 `disposition` is **optional and escalation-only**: `request_changes` or
-`comment`. Use it when a perspective must block on something it cannot anchor to
-a diff line — an architectural objection. Without it, such a pass returns zero
-findings and the review posts as APPROVE with "do not merge" as its body.
+`comment`. Use `request_changes` when a perspective must block on something it
+cannot anchor to a diff line — an architectural objection, or any unanswered
+concern that has to be addressed before this PR merges. Without it, such a pass
+returns zero findings and the review posts as APPROVE with "do not merge" as its
+body. `comment` means something narrower: the pass did not complete, so its
+clean tally must not read as an endorsement. A concern that must be answered is
+never a `comment`.
 
 Note what it does not do: a findings-free REQUEST_CHANGES blocks the in-town
 merge gate only when the rig runs the in-town Reviewer (`reviewer_local`) and
@@ -187,6 +203,20 @@ disposition across perspectives — one lens saying "block" is never averaged
 away). Priority is one of `high`, `medium`, `low`. You do not hand-author the
 consolidated payload — the command builds it, including a verdict line for
 **every** perspective.
+
+The summary follows a **fixed template**, rendered as GitHub markdown by the
+posting command: a derived **Blockers** section (the high findings, with
+`file:line`), the **Verdicts** section (one bullet per lens), an
+**Opportunities** section (the deduplicated `opportunities` entries), and a
+footer carrying the finding tally and the reviewed SHA. You do not write the
+markdown and are not charged for it — the budgets count authored text only:
+200 characters per verdict (900 across all perspectives), 160 per opportunity
+(500 across all entries), 1200 overall.
+
+`consolidate` enforces those budgets and **fails without writing** if the fold
+of verdicts overruns, naming what to trim. That is yours to fix: as gatekeeper
+you may shorten a pass's verdict or drop its weakest opportunities in
+`perspective-<name>.json`, then re-run consolidate.
 
 ## Completing Work
 
