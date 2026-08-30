@@ -1406,6 +1406,29 @@ func DefaultBase() *HooksConfig {
 					Command: gtCommand("gt tap guard push-main"),
 				}},
 			},
+			// bd/gt invocations whose text-bearing flags (--append-notes,
+			// -m, etc.) carry agent-authored free text: Claude Code's
+			// Bash tool wraps every command in `eval "..."`, which
+			// executes any backtick or $(...) inside that text before
+			// bd/gt ever sees it (gt-h38j: two `bd update --append-notes`
+			// calls with a backticked phrase each spawned a ~14h runaway
+			// scan and lost the note). The guard itself decides whether
+			// the specific command/flag combination is relevant; these
+			// two matchers just get bd/gt invocations to it.
+			{
+				Matcher: "Bash(bd *)",
+				Hooks: []Hook{{
+					Type:    "command",
+					Command: gtCommand("gt tap guard command-substitution"),
+				}},
+			},
+			{
+				Matcher: "Bash(gt *)",
+				Hooks: []Hook{{
+					Type:    "command",
+					Command: gtCommand("gt tap guard command-substitution"),
+				}},
+			},
 		},
 		SessionStart: []HookEntry{
 			{
