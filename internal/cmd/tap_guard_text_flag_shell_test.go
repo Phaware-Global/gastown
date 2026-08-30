@@ -162,8 +162,8 @@ func TestFindCommandSubstitutionInTextFlag(t *testing.T) {
 			wantBlock: false,
 		},
 		{
-			name: "CLAUDE.md dolt diagnostics line: $(date +%s) outside any text-bearing flag",
-			command: "gt dolt dump 2>&1 | tee /tmp/dolt-hang-$(date +%s).log",
+			name:      "CLAUDE.md dolt diagnostics line: $(date +%s) outside any text-bearing flag",
+			command:   "gt dolt dump 2>&1 | tee /tmp/dolt-hang-$(date +%s).log",
 			wantBlock: false,
 		},
 		{
@@ -179,6 +179,65 @@ func TestFindCommandSubstitutionInTextFlag(t *testing.T) {
 		{
 			name:      "no bd/gt invocation at all",
 			command:   `curl -d "$(cat foo)" https://example.com`,
+			wantBlock: false,
+		},
+		{
+			// Round-2 finding 2: whole-line scan blocked another
+			// program's flags whenever bd/gt appeared anywhere on
+			// the same command line, even in a different shell
+			// segment. --body here belongs to gh, not gt.
+			name:      "compound command: gh --body in a different segment than gt is not blocked",
+			command:   `gt done && gh pr create --title "x" --body "$(cat /tmp/pr.md)"`,
+			wantBlock: false,
+		},
+		{
+			name:      "compound command: git -m in a different segment than bd is not blocked",
+			command:   "bd close gt-x && git commit -m \"fix: $(date +%F)\"",
+			wantBlock: false,
+		},
+		{
+			// Round-2 finding 3: an escaped quote inside the
+			// argument used to desync the tokenizer and bypass
+			// the guard by closing the string early.
+			name:       "escaped quote inside argument still caught",
+			command:    "bd update gt-x --append-notes \"escaped \\\" quote and `id`\"",
+			wantBlock:  true,
+			wantFlag:   "--append-notes",
+			wantBinary: "bd",
+		},
+		{
+			// Round-2 finding 4: attached short-flag value
+			// (git-style -mtext) was never inspected.
+			name:       "attached short-flag value -m\"...\" caught",
+			command:    `bd update gt-x -m"note with $(id)"`,
+			wantBlock:  true,
+			wantFlag:   "-m",
+			wantBinary: "bd",
+		},
+		{
+			// Round-2 finding 6: positional free text (no flag at
+			// all) is the guard's core case, not an edge.
+			name:       "gt nudge positional message caught",
+			command:    "gt nudge mayor/ \"check `id` output\"",
+			wantBlock:  true,
+			wantFlag:   positionalArgLabel,
+			wantBinary: "gt",
+		},
+		{
+			name:       "bd create positional title caught",
+			command:    "bd create \"Fix `parseFoo` handling\"",
+			wantBlock:  true,
+			wantFlag:   positionalArgLabel,
+			wantBinary: "bd",
+		},
+		{
+			name:      "gt nudge with clean positional message is not blocked",
+			command:   `gt nudge mayor/ "all clear, no code spans here"`,
+			wantBlock: false,
+		},
+		{
+			name:      "bd show positional id is not a text-carrying subcommand, not blocked",
+			command:   "bd show gt-abc `echo hi`",
 			wantBlock: false,
 		},
 	}
@@ -245,6 +304,16 @@ func TestRunTapGuardTextFlagShell(t *testing.T) {
 			name:        "allowed: empty payload fails open",
 			stdinJSON:   `{}`,
 			wantBlocked: false,
+		},
+		{
+			name:        "allowed: gh --body in a different segment than gt",
+			stdinJSON:   `{"tool_input": {"command": "gt done && gh pr create --title x --body \"$(cat /tmp/pr.md)\""}}`,
+			wantBlocked: false,
+		},
+		{
+			name:        "blocked: gt nudge positional message with backtick",
+			stdinJSON:   `{"tool_input": {"command": "gt nudge mayor/ \"check ` + "`id`" + ` output\""}}`,
+			wantBlocked: true,
 		},
 	}
 
