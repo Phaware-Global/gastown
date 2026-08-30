@@ -2633,12 +2633,26 @@ type noMergeCompletionTarget struct {
 }
 
 // resolveNoMergeCompletion decides the no_merge/review_pr completion path.
-// TODO(gt-y4gw): ignores review_pr entirely — a review-fix dispatch gets the
-// same createPR treatment as a plain no_merge bead, which opens a fresh PR
-// from the polecat's own worktree branch instead of completing against the
-// PR the dispatch is already targeting (ha-z60: duplicate PRs #200/#201,
-// #208/#219).
+//
+// gt-y4gw / ha-z60: a review-fix dispatch (review_pr set) already has an open
+// PR AND an MR bead tracking it via review_pr — the polecat force-pushed its
+// fix straight to that PR's branch. `gt done` must complete against THAT PR
+// rather than opening a fresh PR from the polecat's own worktree branch;
+// doing so is exactly what produced the duplicate PRs in #200/#201 and
+// #208/#219, because the polecat's local branch is not the PR's branch.
+//
+// mergeStrategyIsPR only matters for a plain (non-review-fix) no_merge bead:
+// it decides whether the work stays on the pushed branch or gets a fresh PR.
 func resolveNoMergeCompletion(fields *beads.AttachmentFields, mergeStrategyIsPR bool) (noMergeCompletionTarget, error) {
+	if isReviewFixDispatch(fields) {
+		if fields.ReviewPR <= 0 {
+			// isReviewFixDispatch already requires ReviewPR > 0 — unreachable
+			// in practice, but a silent fallback to createPR here is exactly
+			// the bug this function exists to prevent, so fail loudly instead.
+			return noMergeCompletionTarget{}, fmt.Errorf("review-fix dispatch detected but review_pr is not set")
+		}
+		return noMergeCompletionTarget{reusePR: fields.ReviewPR}, nil
+	}
 	return noMergeCompletionTarget{createPR: mergeStrategyIsPR}, nil
 }
 
