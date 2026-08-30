@@ -263,10 +263,19 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			//     ClearOnStrand above already cleared the orphaned text under the
 			//     delivery lock (so Claude Code's deferred auto-submit can't
 			//     duplicate the queued copy); we just re-deliver via the queue.
+			if errors.Is(derr, tmux.ErrNudgeStrandNotCleared) {
+				// The clear FAILED, so the typed text is still in a live input
+				// box and the agent's deferred auto-submit will deliver it.
+				// Queueing as well would deliver the same nudge twice. Surface
+				// the strand instead. Newly reachable now that the Enter-phase
+				// failures classify as strands.
+				return derr
+			}
 			if !errors.Is(derr, tmux.ErrAgentBusy) && !errors.Is(derr, tmux.ErrNudgeStranded) {
 				return derr
 			}
-			// else: agent became busy (or text stranded) — proceed to the queue path below.
+			// else: agent became busy (or text stranded and was cleared) —
+			// proceed to the queue path below.
 		}
 		// Terminal errors (session gone, no server) — propagate, don't queue.
 		// Queueing a nudge for a dead session means it will never be delivered.

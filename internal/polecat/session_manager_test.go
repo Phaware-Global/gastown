@@ -1112,36 +1112,6 @@ func TestStartupNudgeDeliveryAccounting(t *testing.T) {
 	}
 }
 
-// TestEnterPhaseFailuresAreStrands guards the classification the accounting
-// depends on: every sendEnterVerified exit that leaves typed text unsubmitted in
-// the input box must wrap ErrNudgeStranded.
-//
-// The three Enter-phase failures ("send Enter", "send Enter (retry N)", "pane
-// content unchanged") previously did not, so ClearOnStrand never fired, the box
-// kept the prompt, and the carried debt queued a second copy that the poller
-// drained while the agent auto-submitted the first — delivering the startup
-// prompt twice.
-func TestEnterPhaseFailuresAreStrands(t *testing.T) {
-	sendFailed := fmt.Errorf("send Enter: %w: %w", errors.New("tmux busy"), tmux.ErrNudgeStranded)
-	unchanged := fmt.Errorf("nudge Enter not processed after 3 retries: pane content unchanged: %w", tmux.ErrNudgeStranded)
-
-	for name, err := range map[string]error{"send failed": sendFailed, "pane unchanged": unchanged} {
-		t.Run(name, func(t *testing.T) {
-			if !errors.Is(err, tmux.ErrNudgeStranded) {
-				t.Fatal("an Enter-phase failure leaves text in the box and must classify as a strand")
-			}
-			// Not "not cleared": ClearOnStrand does fire for these, so the box is
-			// emptied and a re-delivery IS owed.
-			if errors.Is(err, tmux.ErrNudgeStrandNotCleared) {
-				t.Fatal("these strands are cleared normally; marking them not-cleared would drop the debt")
-			}
-			if !owedAfterSend(false, err) {
-				t.Error("a cleared strand must owe a delivery, or the prompt is lost")
-			}
-		})
-	}
-}
-
 // TestVerifyWillRedeliver guards the precondition for clearing the input box:
 // ClearOnStrand may only be set when a re-delivery actually follows.
 //

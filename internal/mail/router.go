@@ -1831,6 +1831,13 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			} else if errors.Is(err, tmux.ErrNoServer) {
 				noTmuxServer = true
 				break
+			} else if errors.Is(err, tmux.ErrNudgeStrandNotCleared) {
+				// The clear failed, so the notification text is still in a live
+				// input box and deferred auto-submit will deliver it; queueing
+				// as well would notify twice. Newly reachable now that the
+				// Enter-phase failures classify as strands.
+				errs = append(errs, fmt.Sprintf("%s: %v", sessionID, err))
+				continue
 			} else if (errors.Is(err, tmux.ErrAgentBusy) || errors.Is(err, tmux.ErrNudgeStranded)) && r.townRoot != "" {
 				// Agent went busy around the paste — queue instead of force-
 				// injecting onto a streaming agent. ErrAgentBusy is caught before
