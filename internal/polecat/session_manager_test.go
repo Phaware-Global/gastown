@@ -1145,3 +1145,68 @@ func TestVerifyWillRedeliver(t *testing.T) {
 		t.Error("a prompt-capable runtime does re-deliver, so clearing is safe")
 	}
 }
+
+// fakeStartupTmux drives verifyStartupNudgeDelivery's retry loop.
+type fakeStartupTmux struct {
+	idle        bool
+	boxCleared  bool
+	sendErrs    []error // one per NudgeSessionWithOpts call, last repeats
+	sendCalls   int
+	sentContent []string
+}
+
+func (f *fakeStartupTmux) HasSession(string) (bool, error) { return true, nil }
+func (f *fakeStartupTmux) IsIdle(string) bool              { return f.idle }
+func (f *fakeStartupTmux) InputBoxCleared(string) bool     { return f.boxCleared }
+func (f *fakeStartupTmux) NudgeSessionWithOpts(_, message string, _ tmux.NudgeOpts) error {
+	f.sentContent = append(f.sentContent, message)
+	i := f.sendCalls
+	f.sendCalls++
+	if i >= len(f.sendErrs) {
+		i = len(f.sendErrs) - 1
+	}
+	if i < 0 {
+		return nil
+	}
+	return f.sendErrs[i]
+}
+
+// TestVerifyStartupNudgeDelivery_DoesNotResendWhenTheClearFailed drives the real
+// retry loop, not the pure helper it calls.
+//
+// Every duplicate-delivery and lost-prompt defect in this area has lived in the
+// loop's control flow while the rules it evaluates were correct, so a test on
+// the helper alone let the wiring be reverted and still ship green. This asserts
+// the behavior at the call site: when a strand's clear FAILED, the prompt is
+// still in a live input box and the agent's deferred auto-submit will deliver
+// it, so the loop must NOT re-type it — that second copy is what starts the bead
+// twice.
+func TestVerifyStartupNudgeDelivery_DoesNotResendWhenTheClearFailed(t *testing.T) {
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	notCleared := fmt.Errorf("%w: %w", tmux.ErrNudgeStranded, tmux.ErrNudgeStrandNotCleared)
+	fake := &fakeStartupTmux{
+		idle:       false, // busy: the condition that strands text
+		boxCleared: false, // and its box still holds the prompt
+		sendErrs:   []error{notCleared},
+	}
+
+	m := &SessionManager{
+		rig:        &rig.Rig{Name: "testrig", Path: rigPath},
+		verifyTmux: fake,
+	}
+
+	rc := &config.RuntimeConfig{Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "❯ "}}
+	m.verifyStartupNudgeDelivery("gt-testrig-probe", rc, "startup work prompt", true /* stranded */)
+
+	// The first attempt is forced because Start's ClearOnStrand emptied the box.
+	// Its send comes back NotCleared, so the text is live again and no further
+	// send may happen.
+	if fake.sendCalls > 1 {
+		t.Errorf("loop sent %d times after a failed clear; the surviving copy plus a resend delivers the prompt twice", fake.sendCalls)
+	}
+}

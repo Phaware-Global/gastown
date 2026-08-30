@@ -184,31 +184,22 @@ func TestSendEnterVerified_UnverifiableIsAlsoAStrand(t *testing.T) {
 // where the send-keys for Enter itself fails.
 //
 // An unreachable target reaches it directly: sendEnterVerified's first action
-// after the snapshot IS the send-keys, so no live pane and no skip guard are
-// needed. A previous revision of this PR claimed the harness had no seam for
-// this and left the wrap unguarded — it does, and this is it.
+// after the snapshot IS the send-keys. Deliberately uses NewTmux() rather than
+// newTestTmux and creates no session, so it needs neither a live pane nor a tmux
+// binary — the send simply fails either way. That matters because CI installs no
+// tmux, and a version of this test that created a session skipped there, taking
+// every strand-classification test with it.
 //
 // The text is typed and unsubmitted whatever failed the keystroke, so this must
 // classify as a strand: callers key their clear-and-requeue recovery on
 // ErrNudgeStranded, and a plain error here leaves the box full while they
 // believe it empty.
 func TestSendEnterVerified_SendFailureIsAlsoAStrand(t *testing.T) {
-	tm := newTestTmux(t)
+	tm := NewTmux()
 
-	// Target a nonexistent WINDOW inside a session we own, rather than a
-	// nonexistent session name. Both make send-keys fail, but a bare session
-	// name can implicitly start a tmux server, and this package's binding tests
-	// read global bind-key state off the shared server — so a test that leaves a
-	// server behind perturbs them.
-	session := fmt.Sprintf("gt-test-sendfail-%d-%d", time.Now().UnixNano(), busyPaneSeq.Add(1))
-	if err := tm.NewSession(session, os.TempDir()); err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	t.Cleanup(func() { _ = tm.KillSession(session) })
-
-	err := tm.sendEnterVerified(session+":99", DefaultReadyPromptPrefix)
+	err := tm.sendEnterVerified(fmt.Sprintf("gt-no-such-session-%d", busyPaneSeq.Add(1)), DefaultReadyPromptPrefix)
 	if err == nil {
-		t.Fatal("sending Enter to a nonexistent window must fail")
+		t.Fatal("sending Enter to a nonexistent target must fail")
 	}
 	if !errors.Is(err, ErrNudgeStranded) {
 		t.Errorf("sendEnterVerified with a failing send-keys = %v, want it to unwrap to ErrNudgeStranded", err)

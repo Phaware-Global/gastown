@@ -42,17 +42,37 @@ var (
 	ErrIssueInvalid    = errors.New("issue not found or tombstoned")
 )
 
+// startupNudgeTmux is the tmux surface verifyStartupNudgeDelivery's retry loop
+// uses. Declared as an interface so the LOOP is testable, not just the pure
+// helpers it calls.
+//
+// Every duplicate-delivery and lost-prompt defect in this area has lived in that
+// loop's control flow rather than in the rules it evaluates, and each fix was
+// guarded only by a test on the extracted helper — so reverting the wiring while
+// leaving the helper intact kept shipping green.
+type startupNudgeTmux interface {
+	HasSession(session string) (bool, error)
+	IsIdle(session string) bool
+	InputBoxCleared(session string) bool
+	NudgeSessionWithOpts(session, message string, opts tmux.NudgeOpts) error
+}
+
 // SessionManager handles polecat session lifecycle.
 type SessionManager struct {
 	tmux *tmux.Tmux
 	rig  *rig.Rig
+
+	// verifyTmux is what the startup-nudge verify loop talks to. Defaults to
+	// tmux; tests substitute a fake to drive the loop itself.
+	verifyTmux startupNudgeTmux
 }
 
 // NewSessionManager creates a new polecat session manager for a rig.
 func NewSessionManager(t *tmux.Tmux, r *rig.Rig) *SessionManager {
 	return &SessionManager{
-		tmux: t,
-		rig:  r,
+		tmux:       t,
+		rig:        r,
+		verifyTmux: t,
 	}
 }
 
@@ -1144,7 +1164,7 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
 		// Wait for the agent to process the nudge before checking.
 		time.Sleep(verifyDelay)
 
-		running, err := m.tmux.HasSession(sessionID)
+		running, err := m.verifyTmux.HasSession(sessionID)
 		if err == nil && !running {
 			return // Session is genuinely gone — there is nobody to deliver to
 		}
@@ -1157,7 +1177,7 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
 			break
 		}
 
-		switch decideStartupNudgeAction(stranded, !m.tmux.IsIdle(sessionID), m.tmux.InputBoxCleared(sessionID)) {
+		switch decideStartupNudgeAction(stranded, !m.verifyTmux.IsIdle(sessionID), m.verifyTmux.InputBoxCleared(sessionID)) {
 		case startupNudgeDone:
 			delivered = true
 			return
@@ -1172,7 +1192,7 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
 		// agent's box may still hold an unsubmitted beacon, and appending to it
 		// would submit one fused instruction that Enter verification reports as
 		// success.
-		nErr := m.tmux.NudgeSessionWithOpts(sessionID, retryContent,
+		nErr := m.verifyTmux.NudgeSessionWithOpts(sessionID, retryContent,
 			tmux.NudgeOpts{TownRoot: m.townRoot(), ClearOnStrand: true, ClearBeforeSend: true})
 		var forceRedeliver bool
 		owedDelivery, forceRedeliver = strandOutcome(owedDelivery, nErr)
@@ -1209,7 +1229,7 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
 
 	// If we exhausted retries and the agent is still idle, log a warning.
 	// The witness zombie patrol will handle this case.
-	if m.tmux.IsIdle(sessionID) {
+	if m.verifyTmux.IsIdle(sessionID) {
 		fmt.Fprintf(os.Stderr, "[startup-nudge] WARNING: agent %s still idle after %d nudge retries\n",
 			sessionID, maxRetries)
 	}
