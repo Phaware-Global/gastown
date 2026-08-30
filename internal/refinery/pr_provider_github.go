@@ -1,6 +1,12 @@
 package refinery
 
-import "github.com/steveyegge/gastown/internal/git"
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/steveyegge/gastown/internal/git"
+)
 
 // githubPRProvider implements PRProvider using the gh CLI via git.Git.
 type githubPRProvider struct {
@@ -55,6 +61,10 @@ func (p *githubPRProvider) AllThreads(prNumber int) ([]ReviewThread, error) {
 	return gitReviewThreadsToProvider(threads), nil
 }
 
+func (p *githubPRProvider) CreatedAt(prNumber int) (time.Time, error) {
+	return p.git.GhPrCreatedAt(prNumber)
+}
+
 func (p *githubPRProvider) CountApprovals(prNumber int) (int, error) {
 	return p.git.GhPrApprovalCount(prNumber)
 }
@@ -81,6 +91,31 @@ func (p *githubPRProvider) HasReviewFromOnSHA(prNumber int, user, sha string) (b
 
 func (p *githubPRProvider) CurrentHeadSHA(prNumber int) (string, error) {
 	return p.git.GhPrHeadSHA(prNumber)
+}
+
+func (p *githubPRProvider) DismissChangesRequestedReviews(prNumber int, user, message string) error {
+	// Refuse to run without an identity rather than treating "" as "everyone":
+	// dismissing every changes-request on the PR would clear a human reviewer's
+	// block, which is exactly the outcome this must never produce.
+	if strings.TrimSpace(user) == "" {
+		return fmt.Errorf("DismissChangesRequestedReviews: user must be non-empty")
+	}
+	reviews, err := p.git.GhPrReviews(prNumber)
+	if err != nil {
+		return err
+	}
+	for _, r := range reviews {
+		if !strings.EqualFold(r.State, "CHANGES_REQUESTED") {
+			continue
+		}
+		if !strings.EqualFold(r.User.Login, user) {
+			continue
+		}
+		if derr := p.git.GhPrDismissReview(prNumber, r.ID, message); derr != nil {
+			return derr
+		}
+	}
+	return nil
 }
 
 func (p *githubPRProvider) SubmitReview(prNumber int, in SubmitReviewInput) error {

@@ -6,14 +6,18 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/reviewer"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
@@ -27,6 +31,7 @@ var (
 	reviewerPostFindings    string
 	reviewerPostSHA         string
 	reviewerCheckoutSHA     string
+	reviewerCheckoutRound   int
 	reviewerPerspectiveShow string
 
 	reviewerRequestMR     string
@@ -41,9 +46,13 @@ var (
 	reviewerPromptPriorThreads string
 	reviewerPromptInstructions string
 	reviewerPromptMaxFindings  int
+	reviewerPromptMaxDuration  time.Duration
 
-	reviewerConsolidateSHA string
-	reviewerConsolidateOut string
+	reviewerConsolidateSHA     string
+	reviewerConsolidateBaseSHA string
+	reviewerConsolidateOut     string
+
+	reviewerDonePR int
 )
 
 var reviewerCmd = &cobra.Command{
@@ -58,27 +67,72 @@ the PR head, reviews from configurable perspectives, and posts its findings as a
 single GitHub review with inline comment threads under a dedicated machine-user
 identity.
 
-The Reviewer never approves and never merges — human approval is the merge gate.
-Posting goes exclusively through ` + "`gt reviewer post`" + `; raw ` + "`gh pr review`" + ` is
-tap-guard-blocked.`,
+The Reviewer submits a real verdict — APPROVE, REQUEST_CHANGES, or COMMENT —
+derived from finding severity, or escalated by a perspective's disposition.
+
+Scope of that approval: when pr_reviewer is configured, it does NOT satisfy the
+named pr_approver gate, because config validation requires pr_approver and
+pr_reviewer to be different identities in that case (an unset pr_reviewer isn't
+compared against pr_approver at all — set it if the Reviewer is in use, so the
+separation is actually checked rather than silently skipped). It DOES count
+toward the pr_required_approvals count gate and toward any branch-protection
+approval rule, exactly like a human's — GitHub's approval count has no notion of
+a bot. Size those gates accordingly, or the Reviewer's APPROVE fills a slot a
+human was meant to fill. Separately, an active CHANGES_REQUESTED verdict from the
+rig's designated pr_reviewer or pr_approver blocks merge outright via
+VerifyPRApproval, regardless of these gates or of unresolved-thread count — on
+providers that can enumerate review states. GitHub can; Bitbucket cannot, and the
+check is skipped there. A review from any other account is advisory: gating on it
+would let any GitHub user block the merge queue on a public repo.
+
+The Reviewer never merges. Posting goes exclusively through ` + "`gt reviewer post`" + `;
+raw ` + "`gh pr review`" + ` is tap-guard-blocked.`,
 }
 
 var reviewerPostCmd = &cobra.Command{
 	Use:   "post",
-	Short: "Post a review (one COMMENT review with inline finding threads)",
+	Short: "Post a review (one review with inline finding threads)",
 	Long: `Post a code review to a PR from a findings JSON payload.
 
 This is the ONLY sanctioned review-posting path. It submits a single review
-(event=COMMENT) anchored to the reviewed head SHA, with one inline thread per
-finding. Each finding body carries a neutral shields.io priority badge and a
-[perspective] tag so the refinery's review-fix loop and human reviewers can act
-on it.
+anchored to the reviewed head SHA, with one inline thread per finding. Each
+finding body carries a neutral shields.io priority badge and a [perspective] tag
+so the refinery's review-fix loop and human reviewers can act on it.
 
-The findings file (--findings, or "-" for stdin) is a JSON object:
+The review event is derived from finding severity — any high finding is
+REQUEST_CHANGES; anything less (medium, low, or clean) is APPROVE. Medium
+findings post as threads to fix, not as a reason to withhold approval. COMMENT
+is reachable only as an explicit "disposition".
+
+A perspective that must block on something it cannot anchor to a diff line
+(an architectural objection) sets "disposition" in its PerspectiveResult;
+'gt reviewer consolidate' folds the most blocking one into the payload below.
+
+"disposition" is a FLOOR, not an override: the submitted event is the more
+blocking of the disposition and the severity tally, so it can only ever raise
+the verdict. The accepted set is "request_changes" and "comment"; "approve" is
+rejected, since an approving disposition can only be a no-op or a
+de-escalation. This is why a "comment" from one perspective can never suppress
+another perspective's high finding.
+
+The findings file (--findings, or "-" for stdin) is a JSON object. "summary"
+follows a fixed template — one verdict line per perspective plus any
+out-of-scope opportunities — which is rendered into GitHub markdown here, with
+a derived Blockers section and a findings/SHA footer. Markdown, labels, and the
+derived sections cost the author nothing; the budgets below count only authored
+text, in characters:
+
+  verdict      200 each, 900 across all perspectives
+  opportunity  160 each, 500 across all entries
+  summary     1200 overall
 
   {
-    "summary": "per-perspective verdicts + counts",
+    "summary": {
+      "verdicts": [{"perspective": "adversarial", "verdict": "one line"}],
+      "opportunities": ["<optional; out-of-scope follow-up candidates>"]
+    },
     "reviewed_sha": "<optional; --sha overrides>",
+    "disposition": "<optional; request_changes|comment — escalation only>",
     "findings": [
       {"path": "internal/foo.go", "line": 42, "priority": "high",
        "perspective": "adversarial", "title": "nil deref",
@@ -159,8 +213,12 @@ them on stdin. The output is the findings JSON that 'gt reviewer post' consumes:
 
   - the summary lists every perspective's verdict (perspectives with no findings
     are still accounted for — never silent),
-  - findings are deduplicated by (path, line, title) with the highest priority
-    winning and perspective tags unioned.
+  - findings are deduplicated by (path, line) with the highest priority winning
+    and perspective tags unioned (one line, one thread — four lenses describing
+    one defect are one fix),
+  - a file's low-priority findings collapse into a single non-blocking thread,
+  - with --base-sha, findings outside the PR's diff are classified out of scope
+    and posted as non-blocking rather than as merge blockers.
 
 Deterministic dedup lives here, in Go, rather than in per-run reviewer judgment.
 Writes to --out, or stdout when --out is omitted.`,
@@ -190,6 +248,12 @@ func init() {
 
 	reviewerCheckoutCmd.Flags().StringVar(&reviewerCheckoutSHA, "sha", "",
 		"specific commit SHA to detach at (default: fetched PR head)")
+	// Round is telemetry, not behavior: it is what tells an operator staring at a
+	// stalled reviewer whether this is a first review or a fix round. Checkout is
+	// the only writer of a queued review's identity, so without this the field is
+	// lost in exactly the case most likely to be under investigation.
+	reviewerCheckoutCmd.Flags().IntVar(&reviewerCheckoutRound, "round", 0,
+		"review round number from the request (recorded in the heartbeat; inherited when omitted)")
 
 	reviewerPerspectivesCmd.Flags().StringVar(&reviewerPerspectiveShow, "show", "",
 		"print the resolved prompt content for a single perspective")
@@ -199,7 +263,9 @@ func init() {
 	reviewerRequestCmd.Flags().StringVar(&reviewerRequestBranch, "branch", "", "PR head branch (optional)")
 	reviewerRequestCmd.Flags().StringVar(&reviewerRequestSHA, "sha", "",
 		"PR head SHA to review (default: the PR's current head)")
-	reviewerRequestCmd.Flags().IntVar(&reviewerRequestRound, "round", 1, "review round number (>=2 embeds prior threads)")
+	reviewerRequestCmd.Flags().IntVar(&reviewerRequestRound, "round", 1,
+		"review round number; >=2 embeds the PR's prior review threads in the request "+
+			"(the refinery derives this from the MR bead's review_loop_iter)")
 	reviewerRequestCmd.Flags().StringVar(&reviewerRequestOrigin, "origin", "",
 		"request origin: refinery|crew (default: refinery when --mr is set, else crew)")
 
@@ -213,13 +279,23 @@ func init() {
 		`file of extra execution instructions to inject (or "-" for stdin)`)
 	reviewerPromptCmd.Flags().IntVar(&reviewerPromptMaxFindings, "max-findings", 0,
 		"per-pass finding cap (default: the rig's review.max_findings_per_perspective)")
+	reviewerPromptCmd.Flags().DurationVar(&reviewerPromptMaxDuration, "max-duration", 0,
+		"soft wall-clock budget for the pass; it returns a partial result rather than hanging "+
+			"(default: half the rig's stuck_threshold; clamped to [5m, stuck_threshold))")
 	_ = reviewerPromptCmd.MarkFlagRequired("pr")
 	_ = reviewerPromptCmd.MarkFlagRequired("sha")
 
 	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateSHA, "sha", "",
 		"reviewed head SHA to record in the consolidated payload")
+	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateBaseSHA, "base-sha", "",
+		"merge-base the PR is diffed against; enables scope classification "+
+			"(findings outside the diff post as non-blocking)")
 	reviewerConsolidateCmd.Flags().StringVar(&reviewerConsolidateOut, "out", "",
 		"write the consolidated findings JSON here (default: stdout)")
+
+	reviewerDoneCmd.Flags().IntVar(&reviewerDonePR, "pr", 0,
+		"the PR just reviewed; clears the heartbeat only if it records that review "+
+			"(omit to clear unconditionally)")
 
 	reviewerCmd.AddCommand(reviewerPostCmd)
 	reviewerCmd.AddCommand(reviewerCheckoutCmd)
@@ -256,6 +332,56 @@ func requireReviewerWorktree() (string, error) {
 	return cwd, nil
 }
 
+// reviewerRigPathForHeartbeat resolves the current rig's path for heartbeat
+// writes, best-effort. Every failure returns "" so the caller skips the touch:
+// the heartbeat is telemetry, and a monitoring write must never be able to fail
+// the review step that produced it.
+func reviewerRigPathForHeartbeat() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return ""
+	}
+	// Require the REVIEWER role, not merely a resolvable rig. detectRole assigns
+	// ctx.Rig for ANY path under <town>/<rig>/, before and independently of the
+	// role branches — so a polecat, crew member, refinery, or witness would all
+	// resolve a rig path here. Two of the four callers (`prompt`, `consolidate`)
+	// have no worktree guard of their own, and `consolidate` is a pure JSON
+	// transform advertised outside the reviewer session, so a non-reviewer
+	// running it is realistic rather than adversarial-only. Without this check
+	// any agent in the rig could plant a heartbeat for a reviewer that does not
+	// exist (an unclearable phantom stall, since the only reachable
+	// ClearHeartbeat is `gt reviewer done`), or keep a genuinely wedged reviewer
+	// looking alive indefinitely — the reaper keys on this file.
+	info := detectRole(cwd, townRoot)
+	if info.Role != RoleReviewer || info.Rig == "" {
+		return ""
+	}
+	_, r, err := getRig(info.Rig)
+	if err != nil || r == nil {
+		return ""
+	}
+	return r.Path
+}
+
+// touchReviewerPhase records that the Reviewer reached phase. Best-effort: a
+// failed write warns on stderr (never stdout — `gt reviewer prompt`'s stdout is
+// consumed as the prompt) but never fails the command. Warning rather than
+// swallowing matters because the Layer-2 reaper keys on this file: a silently
+// absent heartbeat would make a later kill look arbitrary.
+func touchReviewerPhase(phase string) {
+	rigPath := reviewerRigPathForHeartbeat()
+	if rigPath == "" {
+		return
+	}
+	if err := reviewer.TouchHeartbeat(rigPath, phase); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: reviewer heartbeat (%s): %v\n", phase, err)
+	}
+}
+
 func runReviewerPost(cmd *cobra.Command, args []string) error {
 	if reviewerPostPR <= 0 {
 		return fmt.Errorf("--pr must be a positive PR number")
@@ -263,6 +389,7 @@ func runReviewerPost(cmd *cobra.Command, args []string) error {
 	if _, err := requireReviewerWorktree(); err != nil {
 		return err
 	}
+	touchReviewerPhase(reviewer.PhasePost)
 
 	data, err := readFindingsInput(reviewerPostFindings)
 	if err != nil {
@@ -273,7 +400,7 @@ func runReviewerPost(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	provider, _, _, err := getRefineryPRContext()
+	provider, cfg, _, err := getRefineryPRContext()
 	if err != nil {
 		return err
 	}
@@ -304,16 +431,84 @@ func runReviewerPost(cmd *cobra.Command, args []string) error {
 	}
 
 	in := findings.BuildReviewInput(sha)
-	if err := provider.SubmitReview(reviewerPostPR, in); err != nil {
-		return fmt.Errorf("submitting review for PR #%d: %w", reviewerPostPR, err)
+	if err := postReviewAndClearStaleBlock(provider, cfg, reviewerPostPR, in); err != nil {
+		return err
 	}
 
-	fmt.Printf("Posted review on PR #%d: %d inline finding(s)", reviewerPostPR, len(in.Comments))
+	// Report the submitted event. The verdict is derived, not stated by the
+	// caller, and submitting it is irreversible — so a reviewer that mis-tagged
+	// a finding's priority could otherwise post an APPROVE and read a success
+	// line byte-identical to the REQUEST_CHANGES one.
+	fmt.Printf("Posted %s review on PR #%d: %d inline finding(s)", in.Event, reviewerPostPR, len(in.Comments))
 	if sha != "" {
 		fmt.Printf(" at %s", shortSHA(sha))
 	}
 	fmt.Println()
 	return nil
+}
+
+// postReviewAndClearStaleBlock submits the review, then clears the Reviewer's
+// own superseded CHANGES_REQUESTED verdicts. GitHub keeps a changes-request
+// active forever — an APPROVE from the same reviewer does not supersede it — so
+// after a fix round the PR stays blocked on a verdict the reviewer has already
+// withdrawn in substance, and dismissing it was left to the reviewer agent,
+// which did not reliably do it.
+//
+// The order is load-bearing in both directions.
+//
+// Dismiss-then-submit is unsafe. The two are separate round-trips, so a
+// transient failure of the submit (5xx, rate limit, dropped connection) leaves
+// the prior block DISMISSED with no replacement verdict.
+// GhPrChangesRequestedReviewers folds each user's reviews to their newest
+// TERMINAL state, and DISMISSED is terminal, so the reviewer silently stops
+// counting as blocking: the merge gate goes green on a round whose review never
+// landed. Submitting first means a failed submit changes nothing at all.
+//
+// Submit-then-dismiss needs the REQUEST_CHANGES guard below. The review just
+// posted is a CHANGES_REQUESTED by the same login, so an unguarded dismissal
+// would clear the very verdict it exists to publish. Skipping it costs nothing:
+// a fresh block IS the newest terminal state, so any stale one behind it is
+// already inert for every gate that reads it, and the next round that approves
+// dismisses them all.
+func postReviewAndClearStaleBlock(provider refinery.PRProvider, cfg *refinery.MergeQueueConfig,
+	prNumber int, in refinery.SubmitReviewInput) error {
+	if err := provider.SubmitReview(prNumber, in); err != nil {
+		return fmt.Errorf("submitting review for PR #%d: %w", prNumber, err)
+	}
+	if strings.EqualFold(strings.TrimSpace(in.Event), "REQUEST_CHANGES") {
+		return nil
+	}
+	dismissStaleReviewerChangesRequests(provider, cfg, prNumber)
+	return nil
+}
+
+// staleReviewDismissalMessage replaces the verdict of a dismissed review. It
+// says why the old verdict no longer applies, which is all a reader of the
+// dismissed review gets.
+const staleReviewDismissalMessage = "Superseded by a new review round."
+
+// dismissStaleReviewerChangesRequests dismisses the Reviewer's own prior
+// CHANGES_REQUESTED reviews on the PR, so a fix round that now approves is not
+// still blocked by the verdict it supersedes. Call it only AFTER the new review
+// has landed — see postReviewAndClearStaleBlock.
+//
+// Best-effort by design, and deliberately not fatal: the review is already
+// posted by this point, and a review that lands with a stale block left behind
+// is strictly better than a cleared block with no review. It is also scoped to the configured
+// pr_reviewer — with no configured identity it does nothing, because "dismiss
+// every changes-request on the PR" would clear a human reviewer's block.
+func dismissStaleReviewerChangesRequests(provider refinery.PRProvider, cfg *refinery.MergeQueueConfig, prNumber int) {
+	user := strings.TrimSpace(cfg.PRReviewer)
+	if user == "" {
+		return
+	}
+	err := provider.DismissChangesRequestedReviews(prNumber, user, staleReviewDismissalMessage)
+	// ErrUnsupported is the sanctioned "this provider cannot" answer (Bitbucket),
+	// not a failure — it must not print a warning on every post.
+	if err != nil && !errors.Is(err, refinery.ErrUnsupported) {
+		style.PrintWarning("could not dismiss %s's prior changes-requested review on PR #%d: %v "+
+			"(the new review still posts; the stale block may need clearing by hand)", user, prNumber, err)
+	}
 }
 
 func runReviewerCheckout(cmd *cobra.Command, args []string) error {
@@ -326,10 +521,24 @@ func runReviewerCheckout(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-
 	g := git.NewGit(cwd)
 	if err := g.CheckoutPRHeadDetached(prNumber, reviewerCheckoutSHA); err != nil {
 		return err
+	}
+
+	// Checkout is the one in-session step allowed to START a review, so a queued
+	// review drained after a wedge does not inherit the previous one's clock.
+	//
+	// AFTER the checkout, not before. Recording first meant `gt reviewer checkout
+	// 999999` stamped a review identity for a PR that does not exist — the git
+	// failure that followed changed nothing already written — so an operator's
+	// only record of what the reviewer was doing could name a PR it never saw.
+	// A heartbeat is a report of what happened; nothing should be reported until
+	// it has.
+	if rigPath := reviewerRigPathForHeartbeat(); rigPath != "" {
+		if terr := reviewer.TouchCheckout(rigPath, prNumber, reviewerCheckoutRound, reviewerCheckoutSHA); terr != nil {
+			fmt.Fprintf(os.Stderr, "warning: reviewer heartbeat (checkout): %v\n", terr)
+		}
 	}
 
 	target := reviewerCheckoutSHA
@@ -455,6 +664,19 @@ func loadRigReviewConfig() (townRoot, rigName, rigPath string, reviewCfg *config
 	return townRoot, rigName, r.Path, reviewCfg, nil
 }
 
+// resolvePassDuration picks the pass budget: an explicit --max-duration when
+// given, else the rig-derived default (half its clamped stuck threshold).
+func resolvePassDuration(townRoot, rigPath string) time.Duration {
+	stuck, _ := reviewer.ClampStuckThreshold(reviewer.StuckThreshold(townRoot, rigPath))
+	if reviewerPromptMaxDuration > 0 {
+		// Bounded on BOTH sides. Too small stops the pass before it establishes
+		// anything (a rubber stamp); too large outruns the reaper's phase rail, so
+		// the session is killed mid-pass and every finding is discarded.
+		return reviewer.ClampPassDuration(reviewerPromptMaxDuration, stuck)
+	}
+	return reviewer.PassDuration(townRoot, rigPath)
+}
+
 func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 	perspective := args[0]
 	if reviewerPromptPR <= 0 {
@@ -468,6 +690,9 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Recorded before the perspective resolves so an unresolvable perspective
+	// still leaves evidence that the review reached the prompt phase.
+	touchReviewerPhase(reviewer.PhasePrompt)
 
 	rp, err := reviewer.ResolvePerspective(townRoot, rigPath, perspective)
 	if err != nil {
@@ -504,6 +729,7 @@ func runReviewerPrompt(cmd *cobra.Command, args []string) error {
 		Round:             reviewerPromptRound,
 		PriorThreads:      priorThreads,
 		MaxFindings:       maxFindings,
+		MaxDuration:       resolvePassDuration(townRoot, rigPath),
 		ExtraInstructions: extra,
 	})
 	if err != nil {
@@ -562,6 +788,10 @@ func computeReviewBaseSHA(g reviewBaseGit, prNumber int, sha string) string {
 }
 
 func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
+	// consolidate takes no --pr; passing 0 inherits the identity fields already
+	// on the heartbeat, so the record stays complete across the phase change.
+	touchReviewerPhase(reviewer.PhaseConsolidate)
+
 	var results []reviewer.PerspectiveResult
 
 	if len(args) == 0 {
@@ -605,7 +835,43 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	fs := reviewer.Consolidate(results, reviewerConsolidateSHA)
+	// Build the diff manifest so findings can be classified against what this
+	// PR actually changed. Best-effort by design: --base-sha is optional, and a
+	// git failure yields a nil manifest, which classifies everything as
+	// ScopeUnknown and changes nothing. Scope filtering must never be able to
+	// silently downgrade a review just because git was unavailable — a missing
+	// manifest is missing evidence, not evidence of good scope.
+	manifest := buildDiffManifest(resolveConsolidateBaseSHA(), reviewerConsolidateSHA)
+
+	fs := reviewer.Consolidate(results, reviewerConsolidateSHA, manifest)
+
+	// Report the event on STDERR, before the --out branch, so every invocation
+	// gets it. Posting is irreversible and the Reviewer cannot clear its own
+	// review, so the verdict has to be visible at the last reversible step — and
+	// the sanctioned `consolidate | post --findings -` pipe has no --out.
+	// Stderr specifically: stdout carries the JSON payload.
+	event := fs.ReviewEvent()
+	fmt.Fprintf(os.Stderr, "Consolidated findings (%d) — will post as %s\n", len(fs.Findings), event)
+	// The summary template is budget-enforced at parse time, which is inside
+	// `post`. Enforce it HERE too, at the last reversible step: in the
+	// sanctioned `consolidate | post --findings -` pipe an over-budget fold of
+	// verdicts would otherwise surface only as a rejected post, after the
+	// round's results have left the pipe. Failing here writes nothing and the
+	// error names what to trim — which the coordinator has the authority to do
+	// to the per-perspective results before re-consolidating.
+	if err := fs.Summary.Normalize("consolidated summary"); err != nil {
+		return fmt.Errorf("%w\n\nTrim the offending perspective result(s) and re-run consolidate; "+
+			"nothing was written", err)
+	}
+	// Only call it an escalation when the disposition actually RAISED the event.
+	// A disposition that merely agrees with the severity tally, or one the floor
+	// absorbed, changes nothing — naming it as the cause of a block would send
+	// the reader to the wrong lens.
+	if fs.Disposition != "" && event != fs.SeverityEvent() {
+		fmt.Fprintf(os.Stderr, "  (raised from %s by a perspective's disposition=%q)\n",
+			fs.SeverityEvent(), fs.Disposition)
+	}
+
 	encoded, err := json.MarshalIndent(fs, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encoding consolidated findings: %w", err)
@@ -616,11 +882,45 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 		if err := os.WriteFile(reviewerConsolidateOut, encoded, 0o644); err != nil { //nolint:gosec // operator-facing output
 			return fmt.Errorf("writing %s: %w", reviewerConsolidateOut, err)
 		}
+		// Report the event this payload will submit. Posting is irreversible and
+		// the Reviewer cannot clear its own review (gh pr review and both GraphQL
+		// review mutations are tap-guard-blocked), so the resolved verdict has to
+		// be visible at the last reversible step — not for the first time in
+		// `post`'s output, after it has already been submitted.
 		fmt.Printf("Wrote consolidated findings (%d) to %s\n", len(fs.Findings), reviewerConsolidateOut)
 		return nil
 	}
 	_, err = os.Stdout.Write(encoded)
 	return err
+}
+
+// resolveCrewRequester returns a mail address that an agent actually polls.
+//
+// "<rig>/crew" is NOT one: it is the container directory holding the crew
+// members, and it passes validateRecipient only because that directory exists —
+// so Send returns nil and the daemon logs a successful delivery while nobody is
+// told. Every real crew member's inbox identity is "<rig>/<name>", reached via
+// the three-part "<rig>/crew/<name>" form.
+//
+// Prefer the concrete identity of whoever is invoking the dispatch. When that
+// cannot be determined (dispatch from outside a crew worktree), fall back to the
+// group address "@crew/<rig>", which Router.sendToGroup does handle — a
+// broadcast to the rig's crew is imperfect but reaches someone, which the
+// container path never does.
+func resolveCrewRequester(rigName string) string {
+	if cwd, err := os.Getwd(); err == nil {
+		if townRoot, terr := workspace.FindFromCwdOrError(); terr == nil {
+			if info := detectRole(cwd, townRoot); info.Role == RoleCrew && info.Polecat != "" {
+				return fmt.Sprintf("%s/crew/%s", rigName, info.Polecat)
+			}
+		}
+	}
+	// No concrete crew identity (dispatch from outside a crew worktree). Address
+	// the refinery rather than broadcasting: "@crew/<rig>" reaches everyone and
+	// hands each of them the same actionable re-dispatch instruction, so N crew
+	// members race to re-request one review. The refinery is a single, always-
+	// polled identity that already owns review dispatch for the rig.
+	return fmt.Sprintf("%s/%s", rigName, constants.RoleRefinery)
 }
 
 func runReviewerRequest(cmd *cobra.Command, args []string) error {
@@ -668,26 +968,32 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 		MRID:    reviewerRequestMR,
 	}
 
-	// On a re-review, embed the prior round's unresolved threads so the
-	// Reviewer gets fix-loop context deterministically (best-effort).
+	// On a re-review, embed the prior rounds' threads so the Reviewer gets
+	// fix-loop context deterministically (best-effort).
+	//
+	// AllThreads, not UnresolvedThreads: the execution contract instructs a fix
+	// round not to relitigate already-resolved threads, which it cannot do if
+	// the payload omits them. A finding fixed in an earlier round was invisible
+	// here and free to be raised again — the round-over-round churn this whole
+	// path exists to prevent.
 	priorThreads := ""
 	if spec.Round >= 2 {
-		if threads, terr := provider.UnresolvedThreads(prNumber); terr == nil {
-			var pb strings.Builder
-			for _, th := range threads {
-				fmt.Fprintf(&pb, "- %s:%d [%s] %s\n", th.Path, th.Line, th.Author, firstLineOf(th.Body))
-			}
-			priorThreads = pb.String()
+		if threads, terr := provider.AllThreads(prNumber); terr == nil {
+			priorThreads = reviewer.FormatPriorThreads(threads)
 		}
 	}
 
 	townRoot := filepath.Dir(r.Path)
 	from := fmt.Sprintf("%s/refinery", r.Name)
 	if origin == reviewer.OriginCrew {
-		from = fmt.Sprintf("%s/crew", r.Name)
+		from = resolveCrewRequester(r.Name)
 	}
 	to := fmt.Sprintf("%s/reviewer", r.Name)
 
+	// Seed the heartbeat from the DISPATCHER, before the session exists. A
+	// reviewer that is requested but never starts (or dies during startup) still
+	// leaves a record, so "dispatched into the void" is observable to the reaper
+	// rather than being indistinguishable from "no review was ever requested".
 	router := mail.NewRouterWithTownRoot(townRoot, townRoot)
 	defer router.WaitPendingNotifications()
 	msg := mail.NewMessage(from, to, spec.Subject(), spec.Body(priorThreads))
@@ -699,9 +1005,84 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 	// Start the reviewer session if not already running, injecting the token as
 	// GH_TOKEN/GITHUB_TOKEN. Idempotent: a running session drains the new mail.
 	mgr := reviewer.NewManager(r)
-	if serr := mgr.EnsureRunning("", map[string]string{"GH_TOKEN": tokenVal, "GITHUB_TOKEN": tokenVal}); serr != nil {
+	wedged := false
+	started, serr := mgr.EnsureRunning("", map[string]string{"GH_TOKEN": tokenVal, "GITHUB_TOKEN": tokenVal})
+	switch {
+	case serr == nil:
+	case errors.Is(serr, reviewer.ErrSessionWedged):
+		wedged = true
+		// The mail is queued but the session is not draining it. Say so loudly and
+		// name the remedy: the daemon's reaper will recycle the session on a later
+		// tick with all of its gates applied, and an operator who does not want to
+		// wait has an explicit command. Dispatch deliberately does not kill.
+		style.PrintWarning("reviewer session for %s appears wedged — PR #%d is queued but may not be "+
+			"picked up until the session is recycled. The daemon reaper will handle it; to act now, run "+
+			"`gt reviewer stop --rig %s --force`.", r.Name, spec.PR, r.Name)
+	default:
 		// The request mail persists; await-review's timeout is the safety net.
 		fmt.Fprintf(os.Stderr, "warning: review request mailed but reviewer session did not start: %v\n", serr)
+	}
+
+	// Seed the heartbeat AFTER the mail is sent, and after EnsureRunning.
+	//
+	// After the mail, because seeding first left a permanent `dispatched` record
+	// when the send failed — the dispatcher already returned a hard error the
+	// caller can retry on, so a later "dispatched but never started" escalation
+	// would be duplicate noise about a failure that was never silent.
+	//
+	// After EnsureRunning, because whether it STARTED a session decides what the
+	// record on file means: a heartbeat that outlived the session it described is
+	// a corpse to be claimed, while one belonging to a live session is a review in
+	// flight. EnsureRunning's failure is non-fatal, so a request whose session
+	// never starts is still recorded here.
+	//
+	// Except when the session is wedged. Then the heartbeat is EVIDENCE, not
+	// stale data — it is the only thing that will make the reaper act, since the
+	// reaper reads nothing else. Seeding over it resets the phase clock
+	// to zero, flipping Classify from KillImminent back to Working, so the remedy
+	// the warning above just promised never arrives. Worse, re-dispatch cadence
+	// (30m) is shorter than the phase kill rail (90m), so the rail could never
+	// fire: each dispatch would rescue the very session it was queueing behind.
+	//
+	// The queued request is safe in the mailbox and gets its own record once the
+	// session is recycled and actually starts working.
+	if wedged {
+		fmt.Printf("Dispatched review of PR #%d (round %d, origin %s) → %s\n", prNumber, spec.Round, origin, to)
+		return nil
+	}
+
+	switch err := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA, origin, from); {
+	case err == nil:
+	case errors.Is(err, reviewer.ErrReviewInFlight):
+		// Queued behind an unfinished review on a DIFFERENT PR — UNLESS we had to
+		// start the session ourselves, in which case that review is not running:
+		// its session is gone (reaped, crashed, or self-exited without clearing)
+		// and the record is a corpse. Claim it.
+		//
+		// Otherwise the brand-new session is judged against a dead predecessor's
+		// heartbeat — stale by construction, since it is stale precisely because
+		// TouchDispatch refused to reseed it — for the several minutes it takes the
+		// agent to prime, read its mail, and reach `gt reviewer checkout`. Both
+		// grace windows miss that gap: a heartbeat IS present and the session IS
+		// alive, so the rails apply immediately and the successor is born past the
+		// kill threshold. Leaving the fix to the agent's own first command meant
+		// the window it was written to close was the window it did not cover.
+		if started && serr == nil {
+			if cerr := reviewer.ClearHeartbeat(r.Path); cerr != nil {
+				fmt.Fprintf(os.Stderr, "warning: clearing stale reviewer heartbeat: %v\n", cerr)
+			}
+			if terr := reviewer.TouchDispatch(r.Path, spec.PR, spec.Round, spec.HeadSHA, origin, from); terr != nil {
+				fmt.Fprintf(os.Stderr, "warning: seeding reviewer heartbeat: %v\n", terr)
+			}
+			break
+		}
+		// A live session really is mid-review. Mail is the work queue and the
+		// request is safely in it; the in-flight review's telemetry is what
+		// supervisors need, so it is deliberately left intact.
+		fmt.Fprintf(os.Stderr,
+			"note: reviewer is mid-review; PR #%d is queued and will be recorded when it starts\n", spec.PR)
+	default:
+		fmt.Fprintf(os.Stderr, "warning: seeding reviewer heartbeat: %v\n", err)
 	}
 
 	fmt.Printf("Dispatched review of PR #%d (round %d, origin %s) → %s\n", prNumber, spec.Round, origin, to)
@@ -726,6 +1107,29 @@ func runReviewerDone(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Clear the heartbeat BEFORE killing the session: a heartbeat that outlived
+	// its reviewer would make an idle rig look permanently stalled to the reaper.
+	//
+	// Conditional on the PR just finished. An unconditional clear destroys a
+	// QUEUED review's dispatch record: finish PR 100, remove the file, and PR 200
+	// — dispatched while 100 was running — becomes invisible, which is exactly
+	// the "dispatched into the void" blind spot the dispatcher seed exists to
+	// close. Without --pr we cannot tell, and fall back to clearing.
+	cleared, cerr := reviewer.ClearHeartbeatFor(r.Path, reviewerDonePR)
+	switch {
+	case cerr != nil:
+		fmt.Fprintf(os.Stderr, "warning: clearing reviewer heartbeat: %v\n", cerr)
+	case !cleared:
+		fmt.Printf("Left the heartbeat in place — it records a different review than PR #%d.\n", reviewerDonePR)
+	}
+	// Completion is a feed event so a review's end is as visible as its spawn —
+	// previously only the spawn was logged, which made a reviewer that started
+	// and never finished indistinguishable from one still working.
+	if err := events.LogFeed(events.TypeDone, rigName+"/"+constants.RoleReviewer,
+		map[string]interface{}{"rig": rigName, "role": constants.RoleReviewer}); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: reviewer done feed event: %v\n", err)
+	}
+
 	// Self-terminate the session after a short delay so this command reports
 	// success before the agent is killed (mirrors `gt dog done`).
 	sessionID := reviewer.NewManager(r).SessionName()
@@ -738,22 +1142,6 @@ func runReviewerDone(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Reviewer done — session %s will terminate shortly.\n", sessionID)
 	time.Sleep(4 * time.Second)
 	return nil
-}
-
-// firstLineOf returns the first non-empty line of s, trimmed, for compact
-// prior-thread summaries.
-func firstLineOf(s string) string {
-	for _, line := range strings.Split(s, "\n") {
-		if t := strings.TrimSpace(line); t != "" {
-			// Truncate on runes, not bytes, so a multi-byte character is never
-			// split into invalid UTF-8.
-			if r := []rune(t); len(r) > 120 {
-				return string(r[:120])
-			}
-			return t
-		}
-	}
-	return ""
 }
 
 // readOptionalInput returns the content of an optional file argument: "" for an
@@ -805,4 +1193,86 @@ func shortSHA(sha string) string {
 		return sha[:12]
 	}
 	return sha
+}
+
+// buildDiffManifest returns the set of lines this PR changed, for scope
+// classification, or nil when it cannot be determined.
+//
+// -U0 is load-bearing: with git's default three lines of context every hunk
+// header claims six more lines than the diff changed, so findings on untouched
+// neighboring code would classify as in-scope and the filter would be a no-op
+// exactly where it matters.
+//
+// Every failure path returns nil rather than an error. A nil manifest means
+// "unknown", which demotes nothing — the conservative direction. The opposite
+// default would let a git hiccup silently strip the blocking status from a
+// round of real findings.
+func buildDiffManifest(baseSHA, headSHA string) reviewer.DiffManifest {
+	baseSHA = strings.TrimSpace(baseSHA)
+	headSHA = strings.TrimSpace(headSHA)
+	if baseSHA == "" || headSHA == "" {
+		return nil
+	}
+	// Reject anything that isn't a plain hex object name before it reaches the
+	// command line: these values arrive from a mail payload the reviewer parses,
+	// and a value like "--output=..." would otherwise be read as a git flag.
+	for _, sha := range []string{baseSHA, headSHA} {
+		if !isHexObjectName(sha) {
+			return nil
+		}
+	}
+	out, err := exec.Command("git", "diff", "-U0", baseSHA+".."+headSHA).Output()
+	if err != nil {
+		return nil
+	}
+	m := reviewer.ParseDiffManifest(string(out))
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+// isHexObjectName reports whether s is a plausible git object name: hex digits
+// only, long enough to be unambiguous, no longer than a full SHA-256 name.
+func isHexObjectName(s string) bool {
+	if len(s) < 7 || len(s) > 64 {
+		return false
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveConsolidateBaseSHA returns the merge-base to classify findings
+// against: the explicit --base-sha when given, otherwise derived the same way
+// `gt reviewer prompt` derives it.
+//
+// The derivation is not a convenience. The sanctioned consolidate invocation —
+// the one the role template, `gt prime` and the runbook all print, and which the
+// template tells the Reviewer to run literally ("do not improvise the
+// procedure; run the commands") — passes only --sha. Requiring --base-sha would
+// have left scope classification switched off on the exact path every review
+// actually takes: buildDiffManifest returns nil without it, so every finding
+// classifies ScopeUnknown and nothing is demoted. A feature that only engages
+// when someone remembers an undocumented flag is a feature that never engages.
+//
+// The PR number comes from the heartbeat rather than a new --pr flag, because
+// consolidate deliberately takes no --pr (it inherits the heartbeat's identity
+// fields so the record stays complete across the phase change).
+func resolveConsolidateBaseSHA() string {
+	if b := strings.TrimSpace(reviewerConsolidateBaseSHA); b != "" {
+		return b
+	}
+	rigPath := reviewerRigPathForHeartbeat()
+	if rigPath == "" {
+		return ""
+	}
+	hb := reviewer.ReadHeartbeat(rigPath)
+	if hb == nil || hb.PR <= 0 {
+		return ""
+	}
+	return resolveReviewBaseSHA(hb.PR, reviewerConsolidateSHA)
 }

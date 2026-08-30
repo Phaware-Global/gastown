@@ -23,6 +23,14 @@ return*. Follow it exactly — do not improvise the procedure.
   moved. If you detect such drift, note it in your verdict.
 - Raise findings **only** on lines this PR introduced or changed. Pre-existing
   code is out of scope unless the diff changed its behavior.
+- This is now **enforced**, not merely asked. Consolidation classifies every
+  finding against the real diff, and anything outside it posts as non-blocking.
+  That check reads `remediation_paths` as well as the anchor (see §6), so a
+  finding anchored on a changed line whose fix lives in untouched files is
+  out of scope — the anchor does not launder the demand.
+- Out of scope is **not** the same as unwelcome. A real problem you cannot fix
+  within this diff is worth raising; it is simply follow-up work, not a merge
+  blocker. Name it, name its paths, and let it post as advisory.
 
 ### 2. Review round
 {{ if ge .Round 2 -}}
@@ -56,13 +64,90 @@ demonstrable weakness. Cap: at most **{{ .MaxFindings }}** findings; if you find
 more, keep the highest-severity {{ .MaxFindings }} and note the overflow in your
 verdict.
 
-### 5. Output — machine-readable, nothing else
+**Length budgets, enforced.** Each finding is capped at **120** characters of
+`title`, **1200** of `body`, and **800** of `suggestion`. These are hard limits:
+a payload that exceeds one is rejected and you will have to re-emit it, so write
+within them the first time. State the failure scenario, the evidence that
+establishes it, and the change to make — then stop. Supporting analysis that
+does not change what the fixer does belongs in your `verdict`, not in a finding.
+If a body genuinely needs more than 1200 characters, you are almost always
+describing two findings that should be anchored separately.
+
+**One line, one finding.** Findings are consolidated by `path` + `line`, so two
+findings you raise on the same line will be merged into a single thread. Raise
+one finding per defect, at the line where a fixer would edit — not the same
+defect restated from several angles.
+
+### 4a. Scope discipline — an improvement opportunity is not a finding
+If you see a better implementation, an architectural alternative, or a
+non-critical refactor that lies outside the diff's changed lines, do **not**
+raise it as a finding. Put it in the `opportunities` array of your result — one
+clause per entry, no markdown, at most **160** characters each (§6).
+
+That array is a section of the review summary, rendered under an
+**Opportunities** heading that says out loud that these are follow-up
+candidates. They reach the mayor, they may become beads, and they do **not**
+affect the verdict event or block the PR. Raise them there and the concern is
+recorded; raise them as findings and the PR is held up for work its own diff
+does not contain.
+
+A finding that anchors to a changed line but whose fix requires editing
+untouched files is out of scope by definition (§1 already enforces this). Do
+**not** reach for `disposition: request_changes` to force-block on it: that
+blocks the merge over work this PR does not contain, and creates no thread the
+fix loop can clear.
+
+The test is not "is this true?" — it is "must this diff change before it can
+merge?" If the answer is no, it is an opportunity, not a finding.
+
+### 4b. The coordinator is the gatekeeper
+Your pass is one input, not the review. The review coordinator consolidates
+every lens and is accountable for the posted review being on-topic, in-scope,
+and productive. It has the authority to **trim** anything from your pass that is
+out of scope, unproductive, or nitpicking — without consulting you.
+
+Write for that. The findings that get cut are the ones you cannot justify as
+"this diff must change", and a pass that pads its list makes the whole review
+cheaper to ignore. Surviving nits are not a merge blocker: a PR with nothing
+worse than nits is APPROVED, with those nits posted as threads to fix.
+
+### 5. Time budget — return something, and say so in a way the code can read
+You have a soft budget of **{{ .MaxDuration }}** for this pass. Nothing enforces
+it from outside your session: if you never return, the whole review stalls with
+no partial result, and the only recovery is the daemon killing the reviewer —
+which discards everything you found.
+
+So treat the budget as a hard commitment. As you approach it, stop
+investigating, keep the findings you have already established to the evidence
+standard above, and return them.
+
+**If you cut the pass short, you MUST set the `disposition` field to
+`comment`** (see the schema below) *and* say in your `verdict` what you did not
+get to.
+
+That is not a formality. `verdict` is free text that no code reads: it lands in
+the review body and nothing else. A pass that stops early with zero established
+findings and no disposition is indistinguishable from a clean pass, so the
+review posts as an **APPROVE** — an endorsement of a diff you did not finish
+reading. The disposition is the only channel that makes "I ran out of time"
+visible to the machinery.
+
+If you did establish findings before running out, return them normally; their
+severity speaks for itself and the disposition simply prevents the result from
+reading as a complete pass.
+
+Never pad findings to fill the budget, and never drop below the evidence
+standard to produce more of them.
+
+### 6. Output — machine-readable, nothing else
 Return **exactly one** JSON object and no prose before or after it:
 
 ```json
 {
   "perspective": "{{ .Perspective }}",
   "verdict": "one-line verdict for this perspective — REQUIRED even with zero findings (e.g. \"no findings: error paths all guarded\")",
+  "opportunities": ["<optional; out-of-scope improvements, one clause each — see §4a>"],
+  "disposition": "<omit if you completed the pass; REQUIRED if truncated (§5) — request_changes|comment>",
   "findings": [
     {
       "path": "internal/foo/bar.go",
@@ -71,7 +156,8 @@ Return **exactly one** JSON object and no prose before or after it:
       "perspective": "{{ .Perspective }}",
       "title": "one-line summary",
       "body": "explanation citing the codegraph evidence",
-      "suggestion": "concrete change (optional)"
+      "suggestion": "concrete change (optional)",
+      "remediation_paths": ["every file that must be edited to act on this (optional)"]
     }
   ]
 }
@@ -80,3 +166,75 @@ Return **exactly one** JSON object and no prose before or after it:
 `priority` is one of `high`, `medium`, `low`. `findings` may be empty, but
 `verdict` must never be empty — a perspective is never silent. Every finding's
 `perspective` field must be `{{ .Perspective }}`.
+
+**Your verdict and opportunities are the review summary.** They are not prose
+that lands somewhere; consolidation renders them into a fixed template — a
+Verdicts section with one bullet per lens, an Opportunities section, a derived
+Blockers section, and a footer — so write them as the single lines they will be
+displayed as. Formatting is not your job and costs you nothing: headings,
+bullets, bold, and the lens label are added for you, and none of them count
+against your budget. What counts is what you wrote, in characters:
+
+- `verdict` — **200**, one line, no newlines
+- each `opportunities` entry — **160**, one clause, no newlines
+
+Over-budget results are rejected and you will re-emit them, so write within the
+budget the first time. Do not add your own markdown to these fields.
+
+**`disposition` is escalation-only** — `request_changes` or `comment`. It is
+optional in general but **REQUIRED if you cut the pass short** (§5): a truncated
+pass with no disposition posts as an APPROVE. Omit it only when you completed
+the pass, and then the posted review's event is derived from your findings'
+severity (any high → REQUEST_CHANGES; medium, nits-only, or clean → APPROVE).
+Medium findings post as threads to fix; they do not withhold approval on their
+own, so reach for `high` only when the defect must block the merge.
+
+**Which disposition.** They are not interchangeable:
+- `request_changes` — you have an **unanswered concern that must be addressed
+  before this PR merges** and cannot anchor it to a diff line. That is a block,
+  and it is what `request_changes` is for. Do not soften such a concern to
+  `comment` because it feels unanchorable: an objection worth raising at all is
+  either something this PR must answer (`request_changes`) or an opportunity
+  (§4a), never a hedge in between.
+- `comment` — your pass is **incomplete** (§5): you ran out of budget and the
+  result must not read as a finished, clean review. It says "do not take this
+  APPROVE as an endorsement", not "I have reservations".
+
+Both are floors, never ceilings: neither can lower another lens's verdict.
+
+`remediation_paths` lists every file a fixer must edit to act on the finding.
+It is optional, and omitting it means the finding is judged on its anchor alone
+— but naming the files honestly is how you keep a real concern from becoming a
+false merge blocker. If the fix touches only files in this diff, say so and the
+finding blocks normally. If it reaches outside, say that too: the finding still
+posts, in full, as advisory. Understating it does not make the objection
+stronger; it makes the review one the fix loop cannot converge on.
+
+A note on `disposition` and scope: an unanchored `request_changes` is honoured
+only when the round also found something blocking **inside** the diff.
+Otherwise it is recorded as `comment`. It blocks a merge without creating a
+thread, so nothing in town can clear it — and "an objection about the change as
+a whole" is also the exact shape an out-of-scope demand takes.
+
+Set it when you must block on something you **cannot anchor to a diff line** —
+an architectural objection, a missing-by-design invariant, a concern about the
+change as a whole. Section 4 requires every finding to carry a concrete
+`file:line`, so such an objection cannot be expressed as a finding at all. Left
+in your `verdict` alone it changes nothing: a pass returning zero findings and
+"BLOCK: do not merge" posts as an **APPROVE** with that sentence as the body.
+`disposition` is the only way to express an unanchorable objection at all — but
+be aware of what it does and does not stop. It sets the GitHub verdict to
+REQUEST_CHANGES. Where the rig runs the in-town Reviewer (`reviewer_local`) and
+designates your login as `pr_reviewer` — the primary configuration — that DOES
+block the merge, **and clearing it then needs an operator**: the fix loop is
+thread-driven, and an unanchored objection creates no thread for it to act on, so
+nothing in town re-triggers a review on its own. Where the rig does neither, the
+escalation changes the badge and the review body and nothing else. An
+**anchored** finding is stronger: unresolved threads block the merge for every
+rig, identity-agnostic and config-free. So when a concern CAN be tied to a
+`file:line`, prefer the finding — reach for `disposition` when it genuinely
+cannot.
+
+It can only raise the verdict, never lower it: the posted event is the more
+blocking of your disposition and the severity tally, and `approve` is rejected.
+So `comment` never suppresses another pass's high finding.

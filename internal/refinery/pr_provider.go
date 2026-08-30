@@ -2,6 +2,7 @@ package refinery
 
 import (
 	"errors"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/git"
 )
@@ -128,6 +129,28 @@ type PRProvider interface {
 	// force-push). Used by callers that need an authoritative SHA to
 	// pair with HasReviewFromOnSHA.
 	CurrentHeadSHA(prNumber int) (string, error)
+
+	// CreatedAt returns the time the PR was opened.
+	//
+	// Providers that cannot answer return ErrUnsupported, which callers treat
+	// as "age unknown" rather than as a failure — same contract as the other
+	// optional capabilities on this interface.
+	CreatedAt(prNumber int) (time.Time, error)
+
+	// DismissChangesRequestedReviews dismisses every CHANGES_REQUESTED review
+	// on the PR authored by user, replacing each verdict with message.
+	//
+	// GitHub never auto-dismisses a changes-requested review: after a fix round
+	// the reviewer's prior verdict keeps blocking the merge even once the same
+	// reviewer posts an APPROVE, and only an explicit dismissal clears it. The
+	// in-town Reviewer therefore dismisses its own stale verdict before posting
+	// the new one.
+	//
+	// user is required and is matched case-insensitively; reviews by anyone else
+	// are left alone, so a human's changes-request is never cleared by the bot.
+	// It is a no-op returning nil when the user has no CHANGES_REQUESTED review
+	// on the PR. Providers that cannot dismiss reviews return ErrUnsupported.
+	DismissChangesRequestedReviews(prNumber int, user, message string) error
 
 	// SubmitReview submits a single PR review with the disposition in in.Event
 	// (APPROVE / REQUEST_CHANGES / COMMENT; empty defaults to COMMENT), an

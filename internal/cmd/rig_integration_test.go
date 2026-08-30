@@ -1232,7 +1232,7 @@ func runAgentCleanTest(t *testing.T, hasTrackedBeads bool) {
 	// linger and starve later tests of CPU/connections (port-based kill is
 	// safe: doltserver.Stop would read the bridged dolt.pid = test PID).
 	t.Cleanup(func() {
-		_ = exec.Command("pkill", "-f", hqPath).Run()
+		stopTownProcesses(t, hqPath)
 	})
 
 	// Step 2: Run gt install

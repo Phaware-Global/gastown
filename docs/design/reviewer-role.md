@@ -63,8 +63,14 @@ observability. Rejected.
    conformance, not just the diff text.
 5. Findings flow into the existing review-fix loop: inline threads with
    priority markers that `parseThreadPriority` already understands.
-6. The Reviewer **never approves and never merges**. Human approval remains
-   the merge gate, exactly as in the current design.
+6. The Reviewer **submits a real verdict** (APPROVE, REQUEST_CHANGES, or
+   COMMENT) but **never merges**. Its APPROVE does not satisfy the named
+   `pr_approver` gate — config validation rejects `pr_approver == pr_reviewer`,
+   so the two are always different identities. It **does** count toward the
+   `pr_required_approvals` count gate (`GhPrApprovalCount` folds every distinct
+   approving login with no bot exclusion) and toward any branch-protection
+   approval rule. Rigs must size those gates knowing one approval may come from
+   the Reviewer. See "Approval semantics" below.
 7. Crew-authored PRs keep automated review coverage after Augment is
    removed: crew requests the same Reviewer through a standalone (no-MR)
    request mode, and the Reviewer is the **only** agent in the town that
@@ -167,12 +173,104 @@ dispatchPlugins`), but rig-scoped and refinery-initiated:
 3. On completion the Reviewer posts the GitHub review, writes a summary to
    the review bead, closes it, and runs `gt reviewer done` — the analog of
    `gt dog done`: clears state, auto-terminates the session.
-4. Staleness backstop: the existing daemon stale-session machinery pattern
-   (cf. `detectStaleWorkingDogs`) applies — a reviewer session in
-   state=working past `stuck_threshold` is killed and its bead reopened.
-   `await-review`'s own timeout (exit 3 → escalation) is the functional
-   safety net even if cleanup lags: a hung Reviewer never blocks a merge
-   silently.
+4. Staleness backstop: the reviewer heartbeat (below) makes review progress
+   observable, and the daemon's reviewer reaper nudges and then kills a
+   session that stops progressing or exceeds its absolute runtime cap.
+   `await-review`'s own timeout (exit 3 → escalation) remains the
+   merge-side safety net: a hung Reviewer never blocks a merge silently.
+
+   > **History.** This step originally asserted that "the existing daemon
+   > stale-session machinery pattern (cf. `detectStaleWorkingDogs`) applies."
+   > It never did. Every daemon patrol enumerates its targets from either a
+   > persistent registry (witness/refinery) or a worktree directory plus an
+   > agent bead (polecats/dogs); the Reviewer has neither, so it was invisible
+   > to all of them and nothing ever reaped a hung reviewer. The heartbeat and
+   > the reaper exist to make the claim true.
+
+### State vs telemetry
+
+The Reviewer is ZFC: it keeps **no lifecycle state file**. The tmux session is
+the source of truth for "is there a reviewer", and mail is the work queue. That
+rule is what makes the role crash-safe — there is no state to reconcile, so a
+killed session leaves nothing stale behind and a re-dispatch is always clean.
+
+The heartbeat at `<rig>/reviewer/heartbeat.json` does **not** violate that rule,
+because it is a different category of file. The distinction that matters is
+*who reads it and what changes if it's gone*:
+
+| | Lifecycle state (forbidden) | Telemetry (this heartbeat) |
+|---|---|---|
+| Read by | the role itself, to decide what to do next | supervisors only — the reaper, `gt reviewer status`, an operator |
+| If deleted mid-review | behavior changes; the role is confused or wedged | the review proceeds identically — but the supervisor is blinded, and past the abandon window that is itself actionable (see below) |
+| If it disagrees with reality | reality is corrupted — two sources of truth | reality wins; the file is re-derived on the next phase |
+| Authority | authoritative | strictly derived and disposable |
+
+No `gt reviewer` command ever reads the heartbeat to decide what to do. It is
+written forward-only, never branched on, and deleting it at any moment changes
+nothing about the review *in flight* — it only blinds the supervisor. That is
+the test: **state you must not lose, versus telemetry you may always throw
+away.**
+
+**One caveat, because an earlier version of this section overstated it.**
+"Harmless" is true of the review and false of the supervisor. Absence is itself
+a signal: a live session showing no usable heartbeat past the abandon window
+classifies as `abandoned`, which the reaper acts on. So deleting the file cannot
+confuse the reviewer, but it *can* get a healthy session reaped by a third
+party — and the file is rig-writable, which is a trust class this design
+explicitly accepts.
+
+Two things bound that. The abandon window is the rig's stuck threshold rather
+than a flat 15 minutes, so it clears the documented no-touch gap in which a
+healthy review legitimately writes nothing (the perspective subagents run
+entirely between `gt reviewer prompt` and `gt reviewer consolidate`). And the
+reaper corroborates with `IsIdle` before acting, so a session still producing
+output is not killed on the strength of a deleted file. Neither makes deletion
+free; both make it insufficient on its own.
+
+The precedent is `deacon/heartbeat.json`, which coexists with the Deacon's own
+ZFC design for exactly this reason.
+
+Two fields carry the load, and they answer different questions:
+
+- **`timestamp`** — when the current phase was entered. Its age is a *progress*
+  signal. Note that the perspective subagents run entirely between the last
+  `gt reviewer prompt` and `gt reviewer consolidate`, so a heartbeat parked at
+  `prompt` is the normal shape of a review in flight, not by itself evidence of
+  a wedge.
+- **`started_at`** — when the review was dispatched, preserved across every
+  phase transition. `elapsed` measures total review wall time. It is reset
+  whenever the `(pr, round, sha)` identity changes — round 2 of the same PR is a
+  new review with its own budget, not a continuation of round 1.
+
+  An in-session **phase** touch cannot reseed it, and cannot set the review
+  identity either: `gt reviewer prompt`/`post`/`consolidate` update only
+  `timestamp` and `phase`. The one exception is `gt reviewer checkout`, which
+  starts a fresh clock when it checks out a PR other than the one on record —
+  the queued-behind-a-wedge case, where the dispatcher's seed was deliberately
+  withheld to preserve the incumbent's evidence.
+
+  `elapsed` is a **self-reported lower bound, not a tamper-proof one.** A
+  process that deletes or corrupts the heartbeat gets a fresh clock on its next
+  touch, and nothing in this file can prevent that — which is why the checkout
+  exception costs nothing. A supervisor needing an unforgeable runtime bound
+  anchors on something the reviewed process does not own — the tmux session's
+  start time — and admits `elapsed` only as a refinement inside the window that
+  clock already permits (`internal/reviewer.Runtime`). It is bounded above by
+  the session's age plus the spawn grace, so a forged `started_at` cannot
+  authorize a kill, and floored by the session's age, so deleting the file
+  cannot evade one. Where there is no session clock at all, there is no runtime
+  cap: a self-report never kills on its own.
+
+The heartbeat is seeded by `gt reviewer request` on the **dispatcher's** side,
+before the session exists, so a reviewer that is requested but never starts is
+distinguishable from a rig where no review was ever requested. It is cleared by
+`gt reviewer done`, so an idle rig never looks stalled. It lives in
+`<rig>/reviewer/`, deliberately outside the `<rig>/reviewer/rig/` worktree, so
+it never appears in `git status` and cannot be swept by a detached checkout.
+
+Writes are atomic (temp + rename) so the daemon never reads a torn file, and
+every write is best-effort: telemetry must never be able to fail the review step
+that produced it.
 
 ## Role Definition
 
@@ -504,18 +602,63 @@ direct-merge assumption. Convergence:
   (polecat pushes / refinery PR creation) differs from the reviewer identity,
   GitHub accepts the review normally.
 - The machine user must NOT be the `pr_approver` and must not have merge
-  rights on protected branches. Branch protection is the backstop to
-  tap-guard.
+  rights on protected branches. This is **enforced when both fields are
+  configured**, not conventional: `validateMergeQueueConfig` (write time)
+  and `Engineer.LoadConfig` (runtime read path) both reject
+  `pr_approver == pr_reviewer` (case-insensitive). An **unset** `pr_reviewer`
+  skips this comparison entirely — that's a different state ("no reviewer
+  identity configured") from "checked and confirmed distinct," not
+  equivalent to it, even though both currently pass validation. Branch
+  protection is the backstop to tap-guard.
+
+### Approval semantics
+
+The Reviewer's APPROVE is a real GitHub approval. Exactly what it does and does
+not buy matters, because `VerifyPRApproval` (`internal/refinery/approval.go`)
+evaluates **two independent gates** and the Reviewer sits outside only one:
+
+| Gate | Mechanism | Reviewer's APPROVE |
+|---|---|---|
+| Named approver | `IsPRApprovedBy(pr, cfg.PRApprover)` | **Cannot satisfy it when `pr_reviewer` is configured.** Config validation forces `pr_approver != pr_reviewer` in that case, so the login never matches. An unset `pr_reviewer` isn't checked against `pr_approver` at all — there's no reviewer login to compare. `VerifyPRApproval` separately defers the merge while the rig's designated `pr_reviewer` or `pr_approver` has an active CHANGES_REQUESTED verdict, independent of this gate — and only on providers that can enumerate review states (GitHub can; Bitbucket returns `ErrUnsupported` and the check is skipped). A review from any other account is advisory: gating on it would let any GitHub user block the merge queue on a public repo. GitHub supersedes such a verdict only with an APPROVED or DISMISSED review from the same login — a follow-up COMMENT does not. |
+| Count | `CountApprovals(pr) >= pr_required_approvals` | **Counts.** `GhPrApprovalCount` folds every distinct login whose latest terminal state is APPROVED. There is no bot exclusion and no permission filter. |
+
+The same applies to GitHub branch-protection rules requiring N approving
+reviews, which `gh pr merge` defers to.
+
+**Consequence for operators.** A rig setting `pr_approver: alice` and
+`pr_required_approvals: 2` — intending "alice plus one more human" — will merge
+after *one* human approval, because the Reviewer's automatic APPROVE on a clean
+pass supplies the second. Size the count gate knowing one approval may be the
+bot's, or raise it by one.
+
+Earlier revisions of this document and the role's help text claimed the
+Reviewer's approval was "informational, not the merge gate" without
+qualification. That was true of the named-approver gate and false of the count
+gate. The wording is now split per-gate everywhere it appears.
+
+**Deliberately not fixed in code here.** Excluding `cfg.PRReviewer` from
+`GhPrApprovalCount` would make the simpler claim true by construction, and is
+the better end state. It is out of scope for a documentation-correctness change
+because it silently changes merge behavior for every rig already running the
+in-town Reviewer — a rig at `pr_required_approvals: 1` that merges today would
+stop merging. That belongs in its own change with its own migration note.
 
 ### Tap-guard boundary (new role override)
 
 Add a `reviewer` entry to `DefaultOverrides()`
 (`internal/hooks/config.go:201`) blocking, at the Bash-tool layer:
 
-- `gh pr merge` and **all of `gh pr review`** (including `--comment`):
-  posting goes exclusively through `gt reviewer post`, which emits COMMENT
-  reviews only — approve/request-changes are states the merge gates don't
-  model, and a raw-`gh` path would bypass the tested output contract
+- `gh pr merge` and **all of `gh pr review`** (including `--approve` and
+  `--comment`): this is a channel restriction, not a limit on the verdict.
+  Posting goes exclusively through `gt reviewer post`, which submits the
+  review event (APPROVE / REQUEST_CHANGES / COMMENT) derived from finding
+  severity; a raw-`gh` path would bypass the tested output contract
+- the GraphQL review-submission mutations `addPullRequestReview` and
+  `submitPullRequestReview`. `gh api graphql` matches neither the `gh pr
+  review` pattern nor the REST `*gh api*pulls*reviews*` one, so without these
+  matchers the channel restriction above has a hole wide enough to submit an
+  approving review under the machine-user token with no output-contract
+  validation
 - the GraphQL `resolveReviewThread` mutation (thread resolution belongs to
   the authoring polecat — actor-boundary rule in
   [refinery-pr-workflow.md](refinery-pr-workflow.md))
@@ -614,9 +757,16 @@ end-to-end on a test PR.
      SHA in the reviewer worktree.
    - `gt reviewer done`: clear state, close out, self-terminate session
      (model on `gt dog done`).
+   - `gt reviewer stop [--rig] [--force]`, `gt reviewer status [--json]`,
+     `gt reviewer list [--json]`: the operator's side of the lifecycle.
+     `Manager.Stop()`/`Status()` existed from the start but had no commands
+     attached, so ending a stuck reviewer meant `tmux kill-session` by hand.
+     `status` combines session liveness with the heartbeat and reports the same
+     four states the reaper acts on, in the same vocabulary; `list` sweeps every
+     rig, which is otherwise impossible for a role with no registry entry.
 2. `gt reviewer post --pr <n> --findings <json>` (**decided** — see Resolved
    Decisions #1): wraps the GitHub review API for atomic submission (one
-   COMMENT review, all inline threads). Owns the output contract — neutral
+   review, all inline threads). Owns the output contract — neutral
    priority badges, perspective tags — in tested Go; tap-guard blocks all
    raw `gh pr review` so this is the only posting path.
 3. Widen `parseThreadPriority` (`internal/refinery/threads.go:121`) to
@@ -708,8 +858,10 @@ phase in the gastown rig (`bd create --rig gastown`), epic-linked.
 
 | Failure | Detection | Outcome |
 |---|---|---|
-| Reviewer session crashes mid-review | Session dead, bead in_progress | Daemon stale-cleanup reopens; next `await-review` poll still inside timeout → refinery re-dispatches (request is idempotent per PR+SHA: re-request with same SHA reuses the open bead) |
-| Reviewer hangs | `stuck_threshold` (45m) > `pr_review_timeout` (30m) | `await-review` exit 3 → escalation (existing path); stale cleanup reaps the session afterward |
+| Reviewer session crashes mid-review | Session dead, heartbeat present and ageing | Daemon reviewer reaper clears the heartbeat; next `await-review` poll still inside timeout → refinery re-dispatches (request is idempotent per PR+SHA: re-request with same SHA reuses the open bead) |
+| Reviewer hangs | Heartbeat `timestamp` age > `stuck_threshold` (45m), or `elapsed` past the absolute cap | Reaper nudges once, then kills on the next cycle and emits a kill feed event; `await-review` exit 3 → escalation (existing path) at 30m regardless |
+| Reviewer dispatched but never starts | Heartbeat stuck at `dispatched` with no live session | Reaper clears it and escalates — previously indistinguishable from "no review requested" |
+| Reviewer loops without progressing | Heartbeat keeps refreshing but `elapsed` exceeds the absolute cap | Hard kill on `elapsed`, which a refreshing `timestamp` cannot evade |
 | Review posted but malformed (no priority shields) | Threads parse with empty Priority | Loop still works — priority is advisory; review-fix dispatch carries the thread body regardless |
 | Token invalid/expired | `gh` fails in-session | Reviewer escalates via `gt escalate`; `await-review` times out → exit 3; never blocks merge silently |
 | Two requests race for one rig | Second `request` sees live session | Mail-queue semantics: one session, sequential drain |

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 // threadsFakeProvider is a focused fake for the PRProvider surface
@@ -43,7 +44,11 @@ func (p *threadsFakeProvider) HasReviewFromOnSHA(int, string, string) (bool, err
 	panic("unused")
 }
 func (p *threadsFakeProvider) CurrentHeadSHA(int) (string, error)        { panic("unused") }
+func (p *threadsFakeProvider) CreatedAt(int) (time.Time, error)          { panic("unused") }
 func (p *threadsFakeProvider) SubmitReview(int, SubmitReviewInput) error { panic("unused") }
+func (p *threadsFakeProvider) DismissChangesRequestedReviews(int, string, string) error {
+	panic("unused")
+}
 
 func TestVerifyReviewThreadsResolved_Empty_ReturnsNil(t *testing.T) {
 	provider := &threadsFakeProvider{threads: nil}

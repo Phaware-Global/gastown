@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2123,6 +2124,83 @@ func (g *Git) GhPrSubmitReview(prNumber int, commitID, body, event string, comme
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("gh pr review (submit) failed: %s: %w",
 			strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
+// GhPrReview is one review on a PR as the REST API reports it. The numeric ID
+// is the point: the GraphQL/`gh pr view` view of a review carries a node ID,
+// which the dismissal endpoint does not accept, so the dismiss path has to read
+// reviews over REST.
+type GhPrReview struct {
+	ID    int64  `json:"id"`
+	State string `json:"state"` // APPROVED | CHANGES_REQUESTED | COMMENTED | DISMISSED | PENDING
+	User  struct {
+		Login string `json:"login"`
+	} `json:"user"`
+}
+
+// GhPrReviews lists every review on the PR via the REST API, oldest first (the
+// order GitHub returns). Unlike ghFetchReviews it carries each review's numeric
+// ID, which is what GhPrDismissReview needs.
+func (g *Git) GhPrReviews(prNumber int) ([]GhPrReview, error) {
+	if prNumber <= 0 {
+		return nil, fmt.Errorf("gh pr reviews: invalid PR number %d", prNumber)
+	}
+	// --paginate with `--jq .[]` streams one review object per line across every
+	// page, so a long-running PR's older reviews are not silently cut off at the
+	// default page size.
+	cmd := exec.Command("gh", "api", "--paginate", "--jq", ".[]",
+		fmt.Sprintf("repos/{owner}/{repo}/pulls/%d/reviews", prNumber))
+	cmd.Dir = g.workDir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("gh api (list reviews) failed: %w", err)
+	}
+	var reviews []GhPrReview
+	dec := json.NewDecoder(bytes.NewReader(out))
+	for {
+		var r GhPrReview
+		if derr := dec.Decode(&r); derr != nil {
+			if errors.Is(derr, io.EOF) {
+				break
+			}
+			return nil, fmt.Errorf("parsing reviews: %w", derr)
+		}
+		reviews = append(reviews, r)
+	}
+	return reviews, nil
+}
+
+// GhPrDismissReview dismisses a single review, clearing whatever verdict it
+// carries. GitHub does not dismiss a CHANGES_REQUESTED review when the same
+// reviewer later approves, so a stale one keeps blocking the merge until it is
+// dismissed explicitly.
+//
+// message is required by the API and is what a reader sees in place of the
+// dismissed verdict, so it must say why the review no longer applies.
+func (g *Git) GhPrDismissReview(prNumber int, reviewID int64, message string) error {
+	if prNumber <= 0 {
+		return fmt.Errorf("gh pr dismiss review: invalid PR number %d", prNumber)
+	}
+	if reviewID <= 0 {
+		return fmt.Errorf("gh pr dismiss review: invalid review ID %d", reviewID)
+	}
+	if strings.TrimSpace(message) == "" {
+		return fmt.Errorf("gh pr dismiss review: message is required (it replaces the dismissed verdict)")
+	}
+	data, err := json.Marshal(map[string]any{"message": message, "event": "DISMISS"})
+	if err != nil {
+		return fmt.Errorf("gh pr dismiss review: marshaling payload: %w", err)
+	}
+	cmd := exec.Command("gh", "api", "--method", "PUT",
+		fmt.Sprintf("repos/{owner}/{repo}/pulls/%d/reviews/%d/dismissals", prNumber, reviewID),
+		"--input", "-")
+	cmd.Dir = g.workDir
+	cmd.Stdin = bytes.NewReader(data)
+	if out, derr := cmd.CombinedOutput(); derr != nil {
+		return fmt.Errorf("gh pr dismiss review %d failed: %s: %w",
+			reviewID, strings.TrimSpace(string(out)), derr)
 	}
 	return nil
 }
@@ -4247,4 +4325,49 @@ func submoduleDefaultBranch(submodulePath, remote string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("could not determine default branch for remote %s", remote)
+}
+
+// GhPrCreatedAt returns the time a PR was opened.
+//
+// Used by the review loop's convergence assessment to tell a PR that is
+// churning through rounds from one that is simply sitting blocked: a PR can
+// stay unmergeable for weeks without accumulating rounds at all (a wedged
+// reviewer, a capacity-starved fix loop, an escalation nobody cleared), and no
+// round-count rail fires on that shape.
+//
+// GitHub returns createdAt as RFC 3339. An unparseable or zero value is an
+// error rather than a zero time.Time, so a caller cannot mistake "we could not
+// tell" for "opened at the epoch" — which would make every PR look infinitely
+// old and trip an age rail on all of them.
+func (g *Git) GhPrCreatedAt(prNumber int) (time.Time, error) {
+	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber),
+		"--json", "createdAt")
+	cmd.Dir = g.workDir
+	// Separate streams so an auth/permission failure surfaces in the wrapped
+	// error rather than behind a bare exit status, matching GhPrHeadSHA.
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return time.Time{}, fmt.Errorf("gh pr view (createdAt) failed: %s: %w",
+			strings.TrimSpace(stderr.String()), err)
+	}
+	var resp struct {
+		CreatedAt string `json:"createdAt"`
+	}
+	if jerr := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &resp); jerr != nil {
+		return time.Time{}, fmt.Errorf("parsing createdAt: %w", jerr)
+	}
+	if strings.TrimSpace(resp.CreatedAt) == "" {
+		return time.Time{}, fmt.Errorf("gh pr view returned empty createdAt for PR #%d", prNumber)
+	}
+	t, perr := time.Parse(time.RFC3339, resp.CreatedAt)
+	if perr != nil {
+		return time.Time{}, fmt.Errorf("parsing createdAt %q for PR #%d: %w",
+			resp.CreatedAt, prNumber, perr)
+	}
+	if t.IsZero() {
+		return time.Time{}, fmt.Errorf("gh pr view returned a zero createdAt for PR #%d", prNumber)
+	}
+	return t, nil
 }

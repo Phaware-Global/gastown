@@ -1814,7 +1814,14 @@ func (r *Router) notifyRecipient(msg *Message) error {
 		}
 		waitErr := r.tmux.WaitForIdle(sessionID, timeout)
 		if waitErr == nil {
-			err := r.tmux.NudgeSessionWithOpts(sessionID, notification, tmux.NudgeOpts{TownRoot: r.townRoot, RequireIdle: true, ClearOnStrand: true})
+			// ClearOnStrand only when the strand branch below can actually
+			// re-deliver, which it does solely when a town root is available.
+			// Clearing without that would wipe a notification with nothing to
+			// re-send it — and since Enter-phase failures now classify as
+			// strands, this path covers cases that previously left the text in
+			// the box for the agent's deferred auto-submit.
+			canRequeue := r.townRoot != ""
+			err := r.tmux.NudgeSessionWithOpts(sessionID, notification, tmux.NudgeOpts{TownRoot: r.townRoot, RequireIdle: true, ClearOnStrand: canRequeue})
 			if err == nil {
 				r.enqueueReplyReminder(msg, sessionID)
 				notified++
@@ -1824,6 +1831,13 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			} else if errors.Is(err, tmux.ErrNoServer) {
 				noTmuxServer = true
 				break
+			} else if errors.Is(err, tmux.ErrNudgeStrandNotCleared) {
+				// The clear failed, so the notification text is still in a live
+				// input box and deferred auto-submit will deliver it; queueing
+				// as well would notify twice. Newly reachable now that the
+				// Enter-phase failures classify as strands.
+				errs = append(errs, fmt.Sprintf("%s: %v", sessionID, err))
+				continue
 			} else if (errors.Is(err, tmux.ErrAgentBusy) || errors.Is(err, tmux.ErrNudgeStranded)) && r.townRoot != "" {
 				// Agent went busy around the paste — queue instead of force-
 				// injecting onto a streaming agent. ErrAgentBusy is caught before

@@ -14,21 +14,21 @@ import (
 // AttachmentFields holds the attachment info for pinned beads.
 // These fields track which molecule is attached to a handoff/pinned bead.
 type AttachmentFields struct {
-	AttachedMolecule string // Root issue ID of the attached molecule
-	AttachedFormula  string // Formula name (e.g., "mol-polecat-work") for inline step display
-	AttachedAt       string // ISO 8601 timestamp when attached
-	AttachedArgs     string // Natural language args passed via gt sling --args (no-tmux mode)
+	AttachedMolecule string   // Root issue ID of the attached molecule
+	AttachedFormula  string   // Formula name (e.g., "mol-polecat-work") for inline step display
+	AttachedAt       string   // ISO 8601 timestamp when attached
+	AttachedArgs     string   // Natural language args passed via gt sling --args (no-tmux mode)
 	AttachedVars     []string // Formula variables passed via gt sling --var
-	DispatchedBy     string // Agent ID that dispatched this work (for completion notification)
-	NoMerge          bool   // If true, gt done skips merge queue (for upstream PRs/human review)
-	ReviewOnly       bool   // If true, assignee must evaluate and report back — no merge/commit/push
-	Mode             string // Execution mode: "" (normal) or "ralph" (Ralph Wiggum loop)
-	ConvoyID         string // Convoy bead ID tracking this issue (e.g., "hq-cv-abc")
-	MergeStrategy    string // Convoy merge strategy: "direct", "mr", "local", or "" (default = mr)
-	ConvoyOwned      bool   // If true, convoy has gt:owned label (caller-managed lifecycle)
-	FormulaVars      string // Newline-separated key=value pairs for formula template substitution
-	ReviewPR         int    // If >0, polecat should check out this GitHub PR's branch (review-fix dispatch)
-	ReviewBranch     string // Explicit branch name for the polecat to check out (takes precedence over polecat/<worker>)
+	DispatchedBy     string   // Agent ID that dispatched this work (for completion notification)
+	NoMerge          bool     // If true, gt done skips merge queue (for upstream PRs/human review)
+	ReviewOnly       bool     // If true, assignee must evaluate and report back — no merge/commit/push
+	Mode             string   // Execution mode: "" (normal) or "ralph" (Ralph Wiggum loop)
+	ConvoyID         string   // Convoy bead ID tracking this issue (e.g., "hq-cv-abc")
+	MergeStrategy    string   // Convoy merge strategy: "direct", "mr", "local", or "" (default = mr)
+	ConvoyOwned      bool     // If true, convoy has gt:owned label (caller-managed lifecycle)
+	FormulaVars      string   // Newline-separated key=value pairs for formula template substitution
+	ReviewPR         int      // If >0, polecat should check out this GitHub PR's branch (review-fix dispatch)
+	ReviewBranch     string   // Explicit branch name for the polecat to check out (takes precedence over polecat/<worker>)
 }
 
 // ParseAttachmentFields extracts attachment fields from an issue's description.
@@ -204,7 +204,7 @@ func SetAttachmentFields(issue *Issue, fields *AttachmentFields) string {
 		"nomerge":           true,
 		"review_only":       true,
 		"review-only":       true,
-		"reviewonly":         true,
+		"reviewonly":        true,
 		"mode":              true,
 		"convoy_id":         true,
 		"convoy-id":         true,
@@ -641,6 +641,7 @@ type MRFields struct {
 	// one action (dispatch polecat / check polecat / advance) and returns
 	// control to `loop-check` instead of busy-waiting inside the step.
 	ReviewLoopIter   int    // Number of review-fix dispatches already made for this PR
+	ReviewLoopResets int    // Times an operator cleared ReviewLoopIter for this PR
 	ReviewFixPolecat string // Name of the currently-dispatched review-fix polecat, or empty
 
 	// AwaitReviewStartedAt records when the await-review trigger was
@@ -750,6 +751,11 @@ func ParseMRFields(issue *Issue) *MRFields {
 				fields.ReviewLoopIter = n
 				hasFields = true
 			}
+		case "review_loop_resets", "review-loop-resets", "reviewloopresets":
+			if n, err := parseIntField(value); err == nil {
+				fields.ReviewLoopResets = n
+				hasFields = true
+			}
 		case "review_fix_polecat", "review-fix-polecat", "reviewfixpolecat":
 			fields.ReviewFixPolecat = value
 			hasFields = true
@@ -838,6 +844,11 @@ func FormatMRFields(fields *MRFields) string {
 	if fields.ReviewLoopIter > 0 {
 		lines = append(lines, fmt.Sprintf("review_loop_iter: %d", fields.ReviewLoopIter))
 	}
+	// Survives --clear-iter by design: it is the record that the cap already
+	// fired once, which is precisely what clearing the iteration counter erases.
+	if fields.ReviewLoopResets > 0 {
+		lines = append(lines, fmt.Sprintf("review_loop_resets: %d", fields.ReviewLoopResets))
+	}
 	if fields.ReviewFixPolecat != "" {
 		lines = append(lines, "review_fix_polecat: "+fields.ReviewFixPolecat)
 	}
@@ -862,54 +873,62 @@ func SetMRFields(issue *Issue, fields *MRFields) string {
 	// FormatMRFields writes a new one, producing duplicated keys in the
 	// rewritten description.
 	mrKeys := map[string]bool{
-		"branch":             true,
-		"target":             true,
-		"source_issue":       true,
-		"source-issue":       true,
-		"sourceissue":        true,
-		"worker":             true,
-		"rig":                true,
-		"commit_sha":         true,
-		"commit-sha":         true,
-		"commitsha":          true,
-		"merge_commit":       true,
-		"merge-commit":       true,
-		"mergecommit":        true,
-		"close_reason":       true,
-		"close-reason":       true,
-		"closereason":        true,
-		"agent_bead":         true,
-		"agent-bead":         true,
-		"agentbead":          true,
-		"retry_count":        true,
-		"retry-count":        true,
-		"retrycount":         true,
-		"last_conflict_sha":  true,
-		"last-conflict-sha":  true,
-		"lastconflictsha":    true,
-		"conflict_task_id":   true,
-		"conflict-task-id":   true,
-		"conflicttaskid":     true,
-		"convoy_id":          true,
-		"convoy-id":          true,
-		"convoyid":           true,
-		"convoy":             true,
-		"convoy_created_at":  true,
-		"convoy-created-at":  true,
-		"convoycreatedat":    true,
-		"pre_verified":       true,
-		"pre-verified":       true,
-		"preverified":        true,
-		"pre_verified_at":    true,
-		"pre-verified-at":    true,
-		"preverifiedat":      true,
-		"pre_verified_base":  true,
-		"pre-verified-base":  true,
-		"preverifiedbase":    true,
-		"review_pr":          true,
-		"review-pr":          true,
-		"reviewpr":           true,
-		"review_loop_iter":   true,
+		"branch":            true,
+		"target":            true,
+		"source_issue":      true,
+		"source-issue":      true,
+		"sourceissue":       true,
+		"worker":            true,
+		"rig":               true,
+		"commit_sha":        true,
+		"commit-sha":        true,
+		"commitsha":         true,
+		"merge_commit":      true,
+		"merge-commit":      true,
+		"mergecommit":       true,
+		"close_reason":      true,
+		"close-reason":      true,
+		"closereason":       true,
+		"agent_bead":        true,
+		"agent-bead":        true,
+		"agentbead":         true,
+		"retry_count":       true,
+		"retry-count":       true,
+		"retrycount":        true,
+		"last_conflict_sha": true,
+		"last-conflict-sha": true,
+		"lastconflictsha":   true,
+		"conflict_task_id":  true,
+		"conflict-task-id":  true,
+		"conflicttaskid":    true,
+		"convoy_id":         true,
+		"convoy-id":         true,
+		"convoyid":          true,
+		"convoy":            true,
+		"convoy_created_at": true,
+		"convoy-created-at": true,
+		"convoycreatedat":   true,
+		"pre_verified":      true,
+		"pre-verified":      true,
+		"preverified":       true,
+		"pre_verified_at":   true,
+		"pre-verified-at":   true,
+		"preverifiedat":     true,
+		"pre_verified_base": true,
+		"pre-verified-base": true,
+		"preverifiedbase":   true,
+		"review_pr":         true,
+		"review-pr":         true,
+		"reviewpr":          true,
+		"review_loop_iter":  true,
+		// review_loop_resets is parsed by ParseMRFields and emitted by
+		// FormatMRFields, so it MUST appear here. Omitting it means the old
+		// value line survives as "other content" while FormatMRFields writes a
+		// fresh one, duplicating the key — and ParseMRFields is last-match-wins,
+		// so the counter reads the stale trailing copy and stops advancing.
+		"review_loop_resets": true,
+		"review-loop-resets": true,
+		"reviewloopresets":   true,
 		"review-loop-iter":   true,
 		"reviewloopiter":     true,
 		"review_fix_polecat": true,
