@@ -100,7 +100,9 @@ finding body carries a neutral shields.io priority badge and a [perspective] tag
 so the refinery's review-fix loop and human reviewers can act on it.
 
 The review event is derived from finding severity — any high finding is
-REQUEST_CHANGES, any medium is COMMENT, and a clean or nits-only pass is APPROVE.
+REQUEST_CHANGES; anything less (medium, low, or clean) is APPROVE. Medium
+findings post as threads to fix, not as a reason to withhold approval. COMMENT
+is reachable only as an explicit "disposition".
 
 A perspective that must block on something it cannot anchor to a diff line
 (an architectural objection) sets "disposition" in its PerspectiveResult;

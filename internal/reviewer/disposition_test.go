@@ -89,12 +89,12 @@ func TestReviewEvent_DispositionIsAFloorNeverACeiling(t *testing.T) {
 		want        string
 	}{
 		{"", high, "REQUEST_CHANGES"},
-		{"", med, "COMMENT"},
+		{"", med, "APPROVE"}, // severity alone never yields COMMENT
 		{"", low, "APPROVE"},
 		{"", nil, "APPROVE"},
 		{"comment", low, "COMMENT"},          // escalates
 		{"comment", nil, "COMMENT"},          // escalates
-		{"comment", med, "COMMENT"},          // agrees
+		{"comment", med, "COMMENT"},          // escalates: COMMENT is now reachable only this way
 		{"comment", high, "REQUEST_CHANGES"}, // must NOT de-escalate
 		{"request_changes", nil, "REQUEST_CHANGES"},
 		{"request_changes", low, "REQUEST_CHANGES"},
@@ -356,5 +356,59 @@ func TestDispositionError_SteersTheRepairAwayFromAFalseBlock(t *testing.T) {
 		t.Error("ParseFindings must reject an invalid disposition")
 	} else if !strings.Contains(err.Error(), "omit") {
 		t.Errorf("ParseFindings must surface the recovery guidance: %v", err)
+	}
+}
+
+// COMMENT must never arise from severity alone. A PR carrying only medium
+// findings previously derived COMMENT: it was neither approved nor blocked, so
+// the fix loop had nothing to clear and a human had nothing to act on, while
+// the medium threads already imposed the work. Severity now answers exactly one
+// question — does this block the merge? — and only a high finding says yes.
+func TestSeverityEvent_NeverYieldsComment(t *testing.T) {
+	for _, priorities := range [][]string{
+		nil,
+		{"medium"},
+		{"low", "medium", "medium"},
+		{""},       // empty defaults to medium in normalizeFinding
+		{"bogus"},  // ParseFindings rejects this; built in code it must not block
+		{"MEDIUM"}, // casing must not change the verdict
+	} {
+		fs := &Findings{Summary: summaryOf("s")}
+		for _, p := range priorities {
+			fs.Findings = append(fs.Findings, Finding{Path: "a.go", Line: 1, Priority: p, Title: "t"})
+		}
+		if got := fs.SeverityEvent(); got != "APPROVE" {
+			t.Errorf("priorities=%v: SeverityEvent = %q, want APPROVE", priorities, got)
+		}
+	}
+
+	// … and a high finding still blocks, whatever else is present.
+	fs := &Findings{Summary: summaryOf("s"), Findings: []Finding{
+		{Path: "a.go", Line: 1, Priority: "medium", Title: "t"},
+		{Path: "a.go", Line: 2, Priority: "high", Title: "t"},
+	}}
+	if got := fs.SeverityEvent(); got != "REQUEST_CHANGES" {
+		t.Errorf("SeverityEvent = %q, want REQUEST_CHANGES", got)
+	}
+}
+
+// COMMENT stays reachable, but only as an explicit escalation: a pass with an
+// unanchorable concern — or one that cut itself short — can still keep a clean
+// tally from reading as an endorsement.
+func TestReviewEvent_CommentRemainsAnExplicitEscalation(t *testing.T) {
+	med := []Finding{{Path: "a.go", Line: 1, Priority: "medium", Title: "t"}}
+
+	if got := (&Findings{Summary: summaryOf("s"), Findings: med}).ReviewEvent(); got != "APPROVE" {
+		t.Errorf("medium only: ReviewEvent = %q, want APPROVE", got)
+	}
+	if got := (&Findings{Summary: summaryOf("s"), Disposition: "comment", Findings: med}).ReviewEvent(); got != "COMMENT" {
+		t.Errorf("medium + disposition=comment: ReviewEvent = %q, want COMMENT", got)
+	}
+	high := []Finding{{Path: "a.go", Line: 1, Priority: "high", Title: "t"}}
+	for _, d := range []string{"", "comment", "request_changes"} {
+		fs := &Findings{Summary: summaryOf("s"), Disposition: d, Findings: high}
+		if got := fs.ReviewEvent(); got != "REQUEST_CHANGES" {
+			t.Errorf("high + disposition=%q: ReviewEvent = %q, want REQUEST_CHANGES", d, got)
+		}
 	}
 }

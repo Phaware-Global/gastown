@@ -135,8 +135,9 @@ Read the request bead/mail to extract `<pr>`, the recorded head `<sha>`, and the
    This is the **only** sanctioned posting path. It emits a single review with
    one inline thread per finding, each carrying a neutral priority badge and a
    `[perspective]` tag. The review event follows your findings' severity (high →
-   REQUEST_CHANGES, medium → COMMENT, clean or nits-only → APPROVE), unless a
-   perspective escalated it via `disposition`. The command prints the event it
+   REQUEST_CHANGES; medium, nits-only, or clean → APPROVE), unless a
+   perspective escalated it via `disposition`. Medium findings are worth fixing
+   and post as threads; they are not a reason to withhold approval. The command prints the event it
    submitted — check it; submitting is irreversible.
    Raw `gh pr review` is blocked.
 

@@ -193,9 +193,12 @@ func TestReviewEvent_SeverityDerived(t *testing.T) {
 	}{
 		{"clean", nil, "APPROVE"},
 		{"low only", []string{"low", "low"}, "APPROVE"},
-		{"medium caps at comment", []string{"low", "medium"}, "COMMENT"},
-		{"empty priority treated as medium", []string{""}, "COMMENT"},
-		{"unknown priority treated as medium", []string{"low", "bogus"}, "COMMENT"},
+		// Medium findings are worth fixing and post as threads, but they are
+		// not a reason to withhold approval: a PR carrying only mediums used to
+		// land in COMMENT, which neither approved it nor blocked it.
+		{"medium only approves", []string{"low", "medium"}, "APPROVE"},
+		{"empty priority approves", []string{""}, "APPROVE"},
+		{"unknown priority approves", []string{"low", "bogus"}, "APPROVE"},
 		{"has high", []string{"low", "high", "medium"}, "REQUEST_CHANGES"},
 	}
 	for _, tc := range cases {

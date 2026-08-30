@@ -116,9 +116,11 @@ func TestConsolidate_CollapsesLowsPerFile(t *testing.T) {
 	if medium == nil {
 		t.Errorf("medium finding was collapsed: %+v", fs.Findings)
 	}
-	// Lows are non-blocking, and collapsing must not change that.
-	if fs.ReviewEvent() != "COMMENT" {
-		t.Errorf("event = %q, want COMMENT (one medium, rest low)", fs.ReviewEvent())
+	// Lows are non-blocking, and collapsing must not change that. Neither the
+	// medium nor the collapsed nits withhold approval — the threads carry the
+	// work, the verdict carries only "does this block the merge".
+	if fs.ReviewEvent() != "APPROVE" {
+		t.Errorf("event = %q, want APPROVE (one medium, rest low)", fs.ReviewEvent())
 	}
 }
 

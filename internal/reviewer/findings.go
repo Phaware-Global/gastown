@@ -140,9 +140,19 @@ var validDispositions = map[string]string{
 // only escalate, never de-escalate. Severity derivation uses the highest
 // priority present:
 //
-//	high   → REQUEST_CHANGES (blocking; must be addressed)
-//	medium → COMMENT         (advisory; worth fixing, not a block)
-//	low / none → APPROVE      (nits-only or clean — the Reviewer endorses it)
+//	high       → REQUEST_CHANGES (blocking; must be addressed)
+//	medium/low/none → APPROVE    (worth fixing, but not a merge gate)
+//
+// COMMENT is no longer derivable from severity. It remains reachable only as an
+// explicit Disposition — the escalation channel for a pass that has an
+// unanchorable concern, or that cut itself short (see the execution contract's
+// time budget) and must not read as a complete, clean pass.
+//
+// Medium findings used to derive COMMENT, which meant a PR carrying a few
+// medium nits was never approved and never blocked: it sat in a non-committal
+// state that neither the fix loop nor a human could act on, while the threads
+// themselves already imposed the work. Severity now answers one question — does
+// this block the merge? — and only a high finding says yes.
 //
 // The in-town Reviewer is a real reviewer: a clean or nits-only pass APPROVEs so
 // its GitHub verdict reads as an approval rather than a non-committal comment.
@@ -195,9 +205,18 @@ func (fs *Findings) SeverityEvent() string {
 	return fs.severityEvent()
 }
 
-// severityEvent derives the review event from finding severity alone.
+// severityEvent derives the review event from finding severity alone: a high
+// finding blocks, and nothing else does.
+//
+// Only "high" is matched, so an empty or malformed priority contributes to
+// APPROVE rather than blocking. That is safe at this layer because it is not
+// the layer that validates: ParseFindings rejects any non-empty unrecognized
+// priority outright, and normalizeFinding defaults an empty one to "medium" —
+// which no longer changes the verdict either way. Every finding still posts as
+// its own thread, and unresolved threads gate the merge for every rig,
+// identity-agnostic and config-free; severity decides only whether the review
+// itself withholds approval.
 func (fs *Findings) severityEvent() string {
-	hasMedium := false
 	for _, f := range fs.Findings {
 		// Out-of-scope findings never gate the verdict. They are real and are
 		// still posted, but a PR must not be blocked on work its own diff does
@@ -205,22 +224,9 @@ func (fs *Findings) severityEvent() string {
 		if f.Scope == ScopeOut {
 			continue
 		}
-		// Normalize defensively for Findings built outside ParseFindings (which
-		// rejects bad priorities). Only an explicit "low" permits APPROVE; an
-		// empty priority is "medium" (advisory) per normalizeFinding, and any
-		// unrecognized value is treated as medium too, so a malformed/typo
-		// priority can never yield an accidental APPROVE.
-		switch strings.ToLower(strings.TrimSpace(f.Priority)) {
-		case "high":
+		if strings.EqualFold(strings.TrimSpace(f.Priority), "high") {
 			return "REQUEST_CHANGES"
-		case "low":
-			// nits-only — non-blocking, permits APPROVE
-		default: // "medium", empty, or any unrecognized priority
-			hasMedium = true
 		}
-	}
-	if hasMedium {
-		return "COMMENT"
 	}
 	return "APPROVE"
 }

@@ -152,8 +152,9 @@ budget the first time. Do not add your own markdown to these fields.
 optional in general but **REQUIRED if you cut the pass short** (§5): a truncated
 pass with no disposition posts as an APPROVE. Omit it only when you completed
 the pass, and then the posted review's event is derived from your findings'
-severity (any high → REQUEST_CHANGES, any medium → COMMENT, clean or nits-only →
-APPROVE).
+severity (any high → REQUEST_CHANGES; medium, nits-only, or clean → APPROVE).
+Medium findings post as threads to fix; they do not withhold approval on their
+own, so reach for `high` only when the defect must block the merge.
 
 `remediation_paths` lists every file a fixer must edit to act on the finding.
 It is optional, and omitting it means the finding is judged on its anchor alone

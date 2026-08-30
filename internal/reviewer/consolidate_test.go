@@ -205,8 +205,8 @@ func TestConsolidate_CollectsAndDedupsOpportunities(t *testing.T) {
 	if len(fs.Findings) != 1 {
 		t.Errorf("opportunities must not become findings: %+v", fs.Findings)
 	}
-	if ev := fs.ReviewEvent(); ev != "COMMENT" {
-		t.Errorf("event = %q — opportunities must not change the severity-derived event", ev)
+	if ev := fs.ReviewEvent(); ev != "APPROVE" {
+		t.Errorf("event = %q — neither the medium finding nor the opportunities withhold approval", ev)
 	}
 	// And they survive to the posted body.
 	body := fs.SummaryBody("sha1")
