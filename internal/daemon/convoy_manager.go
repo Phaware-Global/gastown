@@ -406,14 +406,27 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 				// never had a successful poll, so if its next (now
 				// normal-shaped) polls keep failing too, this branch must be
 				// able to re-fire instead of going dark forever after a single
-				// give-up. Each re-fire's clamp above pulls seedFrom closer to
-				// "now" as real time passes, bounding the eventual loss. The
-				// next successful poll takes the normal (not seed) query path
-				// since lastEventIDs is now set, and — because seededStores is
-				// still unset here — falls through the warm-up block below,
-				// which logs the size of whatever backlog that poll turns up.
+				// give-up. The next successful poll takes the normal (not
+				// seed) query path since lastEventIDs is now set, and —
+				// because seededStores is still unset here — falls through
+				// the warm-up block below, which logs the size of whatever
+				// backlog that poll turns up.
 				now := time.Now().UTC()
-				seedFrom := m.startedAt
+				var seedFrom time.Time
+				if isSeedPoll {
+					// First give-up for this store: preserve the post-startup
+					// window as documented above.
+					seedFrom = m.startedAt
+				} else {
+					// A later give-up: highWater holds the seedFrom picked by
+					// the previous give-up, and querying that same start
+					// point forever (or letting the gap to "now" grow toward
+					// eventPollSeedWindow) never produces a servable query —
+					// that's the size that just failed. Halve the remaining
+					// gap to now instead, so each re-fire narrows the window
+					// until it becomes small enough to succeed.
+					seedFrom = highWater.Add(now.Sub(highWater) / 2)
+				}
 				if floor := now.Add(-eventPollSeedWindow); seedFrom.Before(floor) {
 					seedFrom = floor
 				}
@@ -432,8 +445,23 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 	m.seedFailures.Delete(name)
 	m.everSucceeded.Store(name, true)
 
-	// Advance high-water mark from all events
+	// Advance high-water mark from all events, but never past this poll's own
+	// wall clock: a future-dated CreatedAt (clock skew, or a single bad row)
+	// must not be trusted to set the HWM, mirroring the distrust
+	// partitionByStartedAt below applies to the same field. Trusting it would
+	// park this store's polling — every later poll queries since HWM-1s,
+	// matches nothing, and close detection goes dark until restart — which is
+	// worse than the one-cycle replay this guard trades away.
+	now := time.Now().UTC()
+	loggedFutureDated := false
 	for _, e := range events {
+		if e.CreatedAt.After(now) {
+			if !loggedFutureDated {
+				m.logger("Convoy: event poll (%s): future-dated CreatedAt on event %s (%s), ignoring for high-water mark", name, e.ID, e.CreatedAt.Format(time.RFC3339))
+				loggedFutureDated = true
+			}
+			continue
+		}
 		if e.CreatedAt.After(highWater) {
 			highWater = e.CreatedAt
 		}
@@ -457,7 +485,7 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 	// happened after startup.
 	if _, alreadySeeded := m.seededStores.Load(name); !alreadySeeded {
 		var preExisting []*beadsdk.Event
-		events, preExisting = partitionByStartedAt(events, m.startedAt, time.Now().UTC())
+		events, preExisting = partitionByStartedAt(events, m.startedAt, now)
 		for _, e := range preExisting {
 			if e.ID == "" {
 				continue
