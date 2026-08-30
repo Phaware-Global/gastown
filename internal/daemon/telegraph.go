@@ -28,11 +28,14 @@ type TelegraphServerManager struct {
 	selfStarted bool // true iff m.process was assigned by startLocked, not adopted from the PID file
 	startedAt   time.Time
 
-	// reapedPID records the PID of the last self-started child observed to exit via
-	// cmd.Wait, independent of any platform liveness probe. isProcessAlive alone
-	// cannot detect this on Windows, where it re-derives liveness from the PID
-	// number and so reports a reaped-but-recycled PID as alive again.
-	reapedPID atomic.Int64
+	// reaped records whether the current self-started child (m.process, while
+	// m.selfStarted) has been observed to exit via cmd.Wait, independent of any
+	// platform liveness probe. isProcessAlive alone cannot detect this on
+	// Windows, where it re-derives liveness from the PID number and so reports
+	// a reaped-but-recycled PID as alive again. It is allocated fresh per child
+	// in startLocked and closed over by that child's wait goroutine, so a stale
+	// goroutine from a previous child can never mark the current child reaped.
+	reaped *atomic.Bool
 
 	// Backoff state
 	currentDelay time.Duration
@@ -157,42 +160,68 @@ func (m *TelegraphServerManager) isRunning() (int, bool) {
 	// only provenance is "a file said so" is never re-blessed with a fresh
 	// nonce; report not-running instead and let the fall-through below adopt
 	// whatever the file names.
-	if m.selfStarted && m.process != nil && m.process.Pid != pid && m.isAlive(m.process) {
+	if m.selfStarted && m.process != nil && m.process.Pid != pid &&
+		(m.reaped == nil || !m.reaped.Load()) && m.isAlive(m.process) {
 		if _, werr := writePIDFile(m.pidFile(), m.process.Pid); werr != nil {
 			m.logger("Telegraph: warning: failed to repair PID file: %v", werr)
 		}
 		return m.process.Pid, true
 	}
 
-	if err != nil || pid == 0 || !alive {
-		if pid > 0 {
-			_ = os.Remove(m.pidFile())
+	if err != nil || pid == 0 {
+		// The file is missing or unparseable — that is not the file naming a
+		// specific dead process, just the file being unreadable, so it is not
+		// evidence that a handle we already hold is dead, including an
+		// adopted one (the file is unauthenticated; see doc above). Keep
+		// reporting it running without rewriting the file, so an adopted PID
+		// is never re-blessed with a fresh nonce.
+		if m.process != nil && m.isAlive(m.process) {
+			return m.process.Pid, true
 		}
 		m.process = nil
 		m.selfStarted = false
+		m.reaped = nil
+		return 0, false
+	}
+	if !alive {
+		// Unlike the case above, the file names a specific PID and that PID
+		// is confirmed dead — trust that death report over any stale cached
+		// handle, which may point at an unrelated process after PID reuse.
+		_ = os.Remove(m.pidFile())
+		m.process = nil
+		m.selfStarted = false
+		m.reaped = nil
 		return 0, false
 	}
 	if m.process != nil && m.process.Pid == pid {
 		// Once a self-started child has been reaped (cmd.Wait returned), that
 		// report is authoritative even if isAlive's platform probe cannot tell
-		// the reaped PID apart from a recycled one (see reapedPID doc above).
-		reaped := m.reapedPID.Load() == int64(pid)
+		// the reaped PID apart from a recycled one (see reaped doc above).
+		reaped := m.selfStarted && m.reaped != nil && m.reaped.Load()
 		if reaped || !m.isAlive(m.process) {
 			_ = os.Remove(m.pidFile())
 			m.process = nil
 			m.selfStarted = false
+			m.reaped = nil
 			return 0, false
 		}
 	}
 	if m.process == nil || m.process.Pid != pid {
+		if m.process != nil && !m.selfStarted && m.isAlive(m.process) {
+			// Do not retarget an already-adopted live handle just because the
+			// unauthenticated file started naming a different PID.
+			return m.process.Pid, true
+		}
 		process, err := os.FindProcess(pid)
 		if err != nil {
 			m.process = nil
 			m.selfStarted = false
+			m.reaped = nil
 			return 0, false
 		}
 		m.process = process
 		m.selfStarted = false
+		m.reaped = nil
 	}
 	return pid, true
 }
@@ -360,11 +389,15 @@ func (m *TelegraphServerManager) startLocked() error {
 	}
 
 	pid := cmd.Process.Pid
-	m.reapedPID.Store(0)
+	reaped := &atomic.Bool{}
+	m.reaped = reaped
 
 	go func() {
 		_ = cmd.Wait()
-		m.reapedPID.Store(int64(pid))
+		// Closes over this child's own reaped flag, not a PID number, so a
+		// goroutine left over from a previous child can never mark the
+		// current child (or a later one that reused its PID) reaped.
+		reaped.Store(true)
 		_ = logFile.Close()
 	}()
 
@@ -432,4 +465,5 @@ func (m *TelegraphServerManager) stopLocked() {
 	_ = os.Remove(m.pidFile())
 	m.process = nil
 	m.selfStarted = false
+	m.reaped = nil
 }
