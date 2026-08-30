@@ -1716,8 +1716,15 @@ func tryResolveFromEphemeralTier(role string) (*RuntimeConfig, bool) {
 	return nil, false
 }
 
-// hasExplicitRoleAgent reports whether the role has an explicit per-role agent
-// assignment that actually resolves to a usable agent. Unlike
+// hasResolvableRoleAgent reports whether the role has an explicit per-role agent
+// assignment that actually resolves to a usable agent.
+//
+// This is the resolving counterpart to the exported HasExplicitRoleAgent, which
+// checks only that a name is present. The two disagree precisely on the
+// unresolvable case — HasExplicitRoleAgent returns true for a name with no
+// definition, this returns false — so they are not interchangeable here: using
+// the name-only check would skip the role default and promote dogs to the town
+// default agent. Unlike
 // hasExplicitNonClaudeOverride it does not care which agent was named, only that
 // the operator named one — a role the operator has configured should not be
 // silently overridden by a built-in default.
@@ -1734,7 +1741,7 @@ func tryResolveFromEphemeralTier(role string) (*RuntimeConfig, bool) {
 // Deliberately narrower than hasExplicitNonClaudeOverride: it does not consult the
 // rig's global Agent or the town's DefaultAgent, since those are not statements
 // about this role and should not defeat a role-specific default.
-func hasExplicitRoleAgent(role string, townSettings *TownSettings, rigSettings *RigSettings) bool {
+func hasResolvableRoleAgent(role string, townSettings *TownSettings, rigSettings *RigSettings) bool {
 	if rigSettings != nil && rigSettings.RoleAgents != nil {
 		if agentName, ok := rigSettings.RoleAgents[role]; ok && agentName != "" {
 			if lookupAgentConfigIfExists(agentName, townSettings, rigSettings) != nil {
@@ -1821,7 +1828,7 @@ func resolveRoleAgentConfigCore(role, townRoot, rigPath string) *RuntimeConfig {
 	// silently discarded here, so dogs ran Haiku regardless. Setting the role to
 	// "opencode" worked; setting it to another Claude model did nothing.
 	if role == "dog" &&
-		!hasExplicitRoleAgent(role, townSettings, rigSettings) &&
+		!hasResolvableRoleAgent(role, townSettings, rigSettings) &&
 		!hasExplicitNonClaudeOverride(role, townSettings, rigSettings) {
 		return claudeHaikuPreset()
 	}
