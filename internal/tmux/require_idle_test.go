@@ -179,3 +179,27 @@ func TestSendEnterVerified_UnverifiableIsAlsoAStrand(t *testing.T) {
 		t.Errorf("sendEnterVerified on an unverifiable pane = %v, want it to unwrap to ErrNudgeStranded", err)
 	}
 }
+
+// TestSendEnterVerified_SendFailureIsAlsoAStrand drives the "send Enter" exit,
+// where the send-keys for Enter itself fails.
+//
+// An unreachable target reaches it directly: sendEnterVerified's first action
+// after the snapshot IS the send-keys, so no live pane and no skip guard are
+// needed. A previous revision of this PR claimed the harness had no seam for
+// this and left the wrap unguarded — it does, and this is it.
+//
+// The text is typed and unsubmitted whatever failed the keystroke, so this must
+// classify as a strand: callers key their clear-and-requeue recovery on
+// ErrNudgeStranded, and a plain error here leaves the box full while they
+// believe it empty.
+func TestSendEnterVerified_SendFailureIsAlsoAStrand(t *testing.T) {
+	tm := newTestTmux(t)
+
+	err := tm.sendEnterVerified("gt-no-such-session-"+fmt.Sprint(busyPaneSeq.Add(1)), DefaultReadyPromptPrefix)
+	if err == nil {
+		t.Fatal("sending Enter to a nonexistent target must fail")
+	}
+	if !errors.Is(err, ErrNudgeStranded) {
+		t.Errorf("sendEnterVerified with a failing send-keys = %v, want it to unwrap to ErrNudgeStranded", err)
+	}
+}

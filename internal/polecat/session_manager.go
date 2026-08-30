@@ -983,29 +983,34 @@ func (m *SessionManager) validateIssue(issueID, workDir string) error {
 	return nil
 }
 
-// owedAfterSend updates the startup prompt's delivery debt from one send
-// outcome. It is the loop's actual bookkeeping, not a description of it, so a
-// change to this rule is a change to the behavior under test.
+// strandOutcome derives BOTH consequences of one send outcome from a single
+// rule: whether a delivery is still owed, and whether the next attempt must
+// re-deliver unconditionally.
 //
-// "Owed" means the prompt has been typed and something cleared it, so unless a
-// later send succeeds the agent has no work instructions. Both directions are
-// costly: dropping a debt strands the polecat until it is reaped (gt-azm0),
-// while inventing one queues a second copy of a prompt that is still going to
-// arrive, which can start the bead twice.
-func owedAfterSend(owedBefore bool, sendErr error) bool {
+// They are returned together deliberately. When these two were computed
+// separately, the accounting excluded ErrNudgeStrandNotCleared while the loop
+// control did not, so a failed clear recorded no debt yet still forced a resend:
+// the prompt survived in a live input box, the agent's deferred auto-submit
+// delivered it, and the forced retry submitted a second copy — starting the bead
+// twice. Deriving both here makes that disagreement unrepresentable.
+//
+// "Owed" means the prompt was typed and something cleared it, so unless a later
+// send succeeds the agent has no work instructions.
+func strandOutcome(owedBefore bool, sendErr error) (owed, forceRedeliver bool) {
 	if sendErr == nil {
-		return false // submitted and verified
+		return false, false // submitted and verified
 	}
 	if errors.Is(sendErr, tmux.ErrNudgeStranded) {
-		// A strand whose clear FAILED leaves the text in the box, where the
-		// agent's deferred auto-submit is still a live delivery path; queueing
-		// as well would deliver it twice.
-		return !errors.Is(sendErr, tmux.ErrNudgeStrandNotCleared)
+		// A strand whose clear FAILED leaves the text in the box, where deferred
+		// auto-submit is still a live delivery path: nothing is owed, and forcing
+		// a re-delivery would deliver it twice.
+		cleared := !errors.Is(sendErr, tmux.ErrNudgeStrandNotCleared)
+		return cleared, cleared
 	}
 	// A non-strand error gave up before typing anything (both nudge-lock
 	// timeouts, a ClearBeforeSend C-u failure), so it neither creates nor
-	// discharges a debt — whatever an earlier clear did still stands.
-	return owedBefore
+	// discharges a debt, and there is nothing extra to re-deliver.
+	return owedBefore, false
 }
 
 // startupNudgeAction is one iteration's verdict in verifyStartupNudgeDelivery.
@@ -1169,7 +1174,8 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
 		// success.
 		nErr := m.tmux.NudgeSessionWithOpts(sessionID, retryContent,
 			tmux.NudgeOpts{TownRoot: m.townRoot(), ClearOnStrand: true, ClearBeforeSend: true})
-		owedDelivery = owedAfterSend(owedDelivery, nErr)
+		var forceRedeliver bool
+		owedDelivery, forceRedeliver = strandOutcome(owedDelivery, nErr)
 		if nErr == nil {
 			continue
 		}
@@ -1178,7 +1184,10 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
 				fmt.Fprintf(os.Stderr, "[startup-nudge] attempt %d/%d stranded for %s; retrying\n",
 					attempt, maxRetries, sessionID)
 			}
-			stranded = true
+			// Only a strand we actually cleared forces the next attempt to
+			// re-deliver — from the same call that produced owedDelivery, so the
+			// two cannot disagree.
+			stranded = forceRedeliver
 			continue
 		}
 		// Break, never return: NudgeSessionWithOpts has non-strand exits that

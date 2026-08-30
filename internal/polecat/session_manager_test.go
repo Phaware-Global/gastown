@@ -1071,42 +1071,53 @@ func TestStartupNudgeDeliveryAccounting(t *testing.T) {
 	lockTimeout := errors.New("nudge lock timeout for session")
 
 	tests := []struct {
-		name       string
-		owedBefore bool
-		sendErr    error
-		want       bool
+		name          string
+		owedBefore    bool
+		sendErr       error
+		want          bool
+		wantRedeliver bool
 	}{
 		{
 			name:       "successful send clears the debt",
-			owedBefore: true, sendErr: nil, want: false,
+			owedBefore: true, sendErr: nil, want: false, wantRedeliver: false,
 		},
 		{
 			// The regression this PR exists for: typed, cleared, not sent.
-			name:       "strand with a successful clear owes a delivery",
-			owedBefore: false, sendErr: stranded, want: true,
+			name:       "strand with a successful clear owes a delivery and forces a resend",
+			owedBefore: false, sendErr: stranded, want: true, wantRedeliver: true,
 		},
 		{
 			// The mirror error: the text survives in the box, so the agent's
 			// deferred auto-submit still delivers it and queueing duplicates.
-			name:       "strand whose clear failed owes nothing",
-			owedBefore: true, sendErr: strandedNotCleared, want: false,
+			// The text survives in a live box, so deferred auto-submit still
+			// delivers it: nothing owed AND no forced resend. Computing these
+			// two separately is what submitted the prompt twice.
+			name:       "strand whose clear failed owes nothing and must not force a resend",
+			owedBefore: true, sendErr: strandedNotCleared, want: false, wantRedeliver: false,
 		},
 		{
 			// A lock timeout gives up BEFORE typing, so it neither creates nor
 			// discharges a debt — an earlier clear's debt must survive it.
-			name:       "terminal error preserves an earlier debt",
-			owedBefore: true, sendErr: lockTimeout, want: true,
+			name:       "terminal error preserves an earlier debt without forcing a resend",
+			owedBefore: true, sendErr: lockTimeout, want: true, wantRedeliver: false,
 		},
 		{
 			name:       "terminal error creates no debt on its own",
-			owedBefore: false, sendErr: lockTimeout, want: false,
+			owedBefore: false, sendErr: lockTimeout, want: false, wantRedeliver: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := owedAfterSend(tt.owedBefore, tt.sendErr); got != tt.want {
-				t.Errorf("owedAfterSend(owed=%v, err=%v) = %v, want %v", tt.owedBefore, tt.sendErr, got, tt.want)
+			owed, redeliver := strandOutcome(tt.owedBefore, tt.sendErr)
+			if owed != tt.want {
+				t.Errorf("strandOutcome(owed=%v, err=%v) owed = %v, want %v", tt.owedBefore, tt.sendErr, owed, tt.want)
+			}
+			if redeliver != tt.wantRedeliver {
+				t.Errorf("strandOutcome(owed=%v, err=%v) forceRedeliver = %v, want %v", tt.owedBefore, tt.sendErr, redeliver, tt.wantRedeliver)
+			}
+			if redeliver && !owed {
+				t.Error("forcing a re-delivery while owing nothing means the prompt is already arriving — that resend is a duplicate")
 			}
 		})
 	}
