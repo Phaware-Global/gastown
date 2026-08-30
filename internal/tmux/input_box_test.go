@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -142,7 +144,18 @@ func TestProcessTreeMatches(t *testing.T) {
 	t.Run("own process is found by name", func(t *testing.T) {
 		t.Parallel()
 		self := strconv.Itoa(os.Getpid())
-		comm := filepath.Base(os.Args[0])
+		// Ask ps for our own comm rather than deriving it from os.Args[0]:
+		// Linux truncates comm to 15 characters, so a longer test-binary name
+		// would never match and the failure would look like a logic bug.
+		out, err := exec.Command("ps", "-p", self, "-o", "comm=").Output()
+		if err != nil {
+			t.Skipf("ps unavailable: %v", err)
+		}
+		comm := filepath.Base(strings.TrimSpace(string(out)))
+		if comm == "" {
+			t.Skip("ps returned no comm for this process")
+		}
+
 		found, err := processTreeMatches(self, []string{comm}, 0)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -164,17 +177,28 @@ func TestProcessTreeMatches(t *testing.T) {
 		}
 	})
 
-	t.Run("nonexistent pid is a clean answer, not an error", func(t *testing.T) {
+	t.Run("exited pid is a clean answer, not an error", func(t *testing.T) {
 		t.Parallel()
-		// ps exits 1 for an unknown pid, which means "no such process" — a real
-		// answer. Treating it as ambiguity would make every reaped session
-		// unverifiable.
-		found, err := processTreeMatches("99999999", []string{"anything"}, 0)
+		// "No such process" must read as a real answer, not ambiguity —
+		// otherwise no reaped session is ever verifiable.
+		//
+		// Use a pid that genuinely existed and has been reaped rather than a
+		// large literal: Linux rejects pids above /proc/sys/kernel/pid_max with
+		// "process ID out of range" instead of a clean exit-1 no-match, so a
+		// hard-coded number tests the platform's range check rather than the
+		// no-such-process path.
+		cmd := exec.Command("true")
+		if err := cmd.Run(); err != nil {
+			t.Skipf("could not spawn a throwaway process: %v", err)
+		}
+		gone := strconv.Itoa(cmd.Process.Pid)
+
+		found, err := processTreeMatches(gone, []string{"anything"}, 0)
 		if err != nil {
-			t.Fatalf("unknown pid must be a clean answer, got: %v", err)
+			t.Fatalf("an exited pid must be a clean answer, got: %v", err)
 		}
 		if found {
-			t.Error("expected no match for a nonexistent pid")
+			t.Error("expected no match for an exited pid")
 		}
 	})
 
