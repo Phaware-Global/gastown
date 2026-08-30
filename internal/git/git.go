@@ -2096,11 +2096,7 @@ func (g *Git) GhPrUpdateBranch(prNumber int) error {
 // tree is detached at exactly that commit (the SHA the Reviewer was asked to
 // review); otherwise it detaches at the freshly fetched PR head. This is the
 // only sanctioned way the Reviewer touches git — it never creates a branch and
-// never force-pushes (P23-2376). It has exactly one write: when the head is
-// behind its base, GhPrUpdateBranch pushes the base-into-head merge GitHub's
-// "Update branch" produces, so the review runs against a mergeable tree. That
-// merge is the whole exception; the reviewer touches nothing else on the
-// remote.
+// never pushes (P23-2376).
 //
 // NOTE: the `pull/<n>/head` ref is GitHub-specific. v1 of the Reviewer role is
 // GitHub-only by design (see docs/design/reviewer-role.md Non-Goals; the

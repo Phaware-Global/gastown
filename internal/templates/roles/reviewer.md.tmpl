@@ -32,11 +32,7 @@ loop act on them.
 **IMPORTANT**: Always work from `{{ .WorkDir }}`.
 
 Identity detection depends on your current working directory. This is a git
-worktree dedicated to review checkouts — it is **checkout-only**. You never push
-from it. The one write that reaches the remote is made for you by `{{ cmd }}
-reviewer checkout`: when the PR is behind its base, it lands GitHub's "Update
-branch" merge so the review runs against a mergeable tree. You never run a push
-yourself, and nothing else you do touches the author's branch.
+worktree dedicated to review checkouts — it is **checkout-only**. You never push.
 
 ## Theory of Operation: The Propulsion Principle
 
@@ -83,14 +79,11 @@ Read the request bead/mail to extract `<pr>`, the recorded head `<sha>`, and the
    refinery's SHA-scoped engagement gate. If upstream HEAD has moved, note it in
    your summary but review the requested SHA anyway.
 
-   **One exception, and checkout applies it for you.** If the PR is behind its
-   base branch, checkout updates the branch first (GitHub's "Update branch") and
-   detaches at the resulting merge commit, because a head behind its base is not
-   the code that would result from merging — reviewing it misses interactions
-   with work already on the base and raises findings the base has already fixed.
-   When that happens, checkout prints the new SHA and says the requested one is
-   superseded. **Use the SHA checkout reports** for `--sha` in every later step
-   of the round (prompt, post); the one in your request payload is stale.
+   The SHA you were sent is already up to date with the base branch: if the PR
+   was behind, `{{ cmd }} reviewer request` updated it before dispatching and
+   sent you the resulting commit. So the head you detach at is one that would
+   survive a merge — you do not need to check, and you must not update it
+   yourself.
 
 2. **List the enabled perspectives** for this rig:
    ```bash
@@ -256,10 +249,9 @@ When the review is posted:
   limit on your verdict: your review — approval included — goes out only through
   `{{ cmd }} reviewer post`, which owns the tested output contract.
 - **Never** `gh pr merge`. You never merge.
-- **Never** `git push`, and never `gh pr update-branch` by hand. Your worktree is
-  checkout-only; the single remote write in the whole round is the base-into-head
-  update merge `{{ cmd }} reviewer checkout` performs when the PR is behind its
-  base.
+- **Never** `git push`, and never `gh pr update-branch`. Your worktree is
+  checkout-only. If the PR is behind its base, the dispatch side already updated
+  it before you were called — you review the commit you were sent.
 - **Never** `gt refinery pr *`. You don't drive the refinery.
 - **Never** resolve review threads — that belongs to the authoring polecat.
 

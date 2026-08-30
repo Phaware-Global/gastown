@@ -97,33 +97,38 @@ func shortenUpdateWait(t *testing.T) {
 }
 
 // The happy path: a behind PR is updated, the update is confirmed against the
-// ref the checkout will read, and the caller is told to drop its pinned SHA.
-func TestUpdateReviewerPRIfBehind_ReportsAVerifiedUpdate(t *testing.T) {
+// ref the reviewer will fetch, and the dispatch retargets at the merge commit.
+func TestUpdatePRBranchIfBehind_ReportsAVerifiedUpdate(t *testing.T) {
 	remote, clone, base := setupBehindPR(t)
 	ghUpdateBranchStub(t, remote, base, true)
 	shortenUpdateWait(t)
 
-	if !updateReviewerPRIfBehind(git.NewGit(clone), 1, "") {
-		t.Error("a behind PR whose update landed must report true")
+	updated, ok := updatePRBranchIfBehind(git.NewGit(clone), 1, "")
+	if !ok {
+		t.Fatal("a behind PR whose update landed must report a verified update")
+	}
+	want := gitIn(t, remote, "rev-parse", "refs/pull/1/head")
+	if updated != want {
+		t.Errorf("dispatch SHA = %s, want the merge commit %s", updated, want)
 	}
 }
 
 // An update that is accepted but never lands must NOT report success: the
-// return value discards the operator-pinned --sha, so a false positive
-// silently retargets the round at an unpinned, possibly still-behind head.
-func TestUpdateReviewerPRIfBehind_KeepsThePinWhenTheUpdateNeverLands(t *testing.T) {
+// returned SHA replaces the one being dispatched, so a false positive silently
+// retargets the round at a possibly still-behind head.
+func TestUpdatePRBranchIfBehind_KeepsTheSHAWhenTheUpdateNeverLands(t *testing.T) {
 	remote, clone, base := setupBehindPR(t)
 	ghUpdateBranchStub(t, remote, base, false)
 	shortenUpdateWait(t)
 
-	if updateReviewerPRIfBehind(git.NewGit(clone), 1, "") {
-		t.Error("an unconfirmed update must not report success — the pinned SHA would be dropped")
+	if _, ok := updatePRBranchIfBehind(git.NewGit(clone), 1, ""); ok {
+		t.Error("an unconfirmed update must not report success — the dispatched SHA would be replaced")
 	}
 }
 
-// A PR already containing its base is left alone: no update, and the pinned
-// SHA survives.
-func TestUpdateReviewerPRIfBehind_NoOpWhenAlreadyUpToDate(t *testing.T) {
+// A PR already containing its base is left alone: no update, and the SHA being
+// dispatched survives.
+func TestUpdatePRBranchIfBehind_NoOpWhenAlreadyUpToDate(t *testing.T) {
 	remote, clone, base := setupBehindPR(t)
 	// Bring the PR head up to date before asking.
 	gitIn(t, remote, "checkout", "-q", "pr-branch")
@@ -133,15 +138,15 @@ func TestUpdateReviewerPRIfBehind_NoOpWhenAlreadyUpToDate(t *testing.T) {
 	ghUpdateBranchStub(t, remote, base, true)
 	shortenUpdateWait(t)
 
-	if updateReviewerPRIfBehind(git.NewGit(clone), 1, "") {
+	if _, ok := updatePRBranchIfBehind(git.NewGit(clone), 1, ""); ok {
 		t.Error("an up-to-date PR must not be updated")
 	}
 }
 
-// The decision is made about the commit the round would review, not the head:
-// a pinned commit that is behind still triggers the update even when the head
-// has since moved past the base.
-func TestUpdateReviewerPRIfBehind_MeasuresThePinnedCommit(t *testing.T) {
+// The decision is made about the commit being dispatched, not the head: a
+// pinned commit that is behind still triggers the update even when the head has
+// since moved past the base.
+func TestUpdatePRBranchIfBehind_MeasuresThePinnedCommit(t *testing.T) {
 	remote, clone, base := setupBehindPR(t)
 	pinned := gitIn(t, remote, "rev-parse", "refs/pull/1/head")
 	// The author pushes a head that DOES contain the base…
@@ -154,11 +159,11 @@ func TestUpdateReviewerPRIfBehind_MeasuresThePinnedCommit(t *testing.T) {
 
 	g := git.NewGit(clone)
 	// …so measuring the head would skip the update…
-	if updateReviewerPRIfBehind(g, 1, "") {
+	if _, ok := updatePRBranchIfBehind(g, 1, ""); ok {
 		t.Error("the current head contains the base; no update should be needed")
 	}
-	// …but the pinned commit this round reviews is still behind it.
-	if !updateReviewerPRIfBehind(g, 1, pinned) {
+	// …but the pinned commit this round would review is still behind it.
+	if _, ok := updatePRBranchIfBehind(g, 1, pinned); !ok {
 		t.Error("a pinned commit behind its base must still trigger the update")
 	}
 }
