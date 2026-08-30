@@ -1055,29 +1055,17 @@ func TestDecideStartupNudgeAction_OnlyConfirmedDeliveryStopsTheQueue(t *testing.
 	}
 }
 
-// TestStartupNudgeDeliveryAccounting pins the rules that decide whether the
-// startup prompt still owes a delivery after verifyStartupNudgeDelivery's loop.
+// TestStartupNudgeDeliveryAccounting exercises owedAfterSend — the function the
+// loop actually calls — rather than a local model of it. An earlier version of
+// this test re-implemented the rule as a closure and asserted that, so it passed
+// for any production code at all and the duplicate-delivery bug it was supposed
+// to cover was invisible to it.
 //
-// Every loss in this area came from deriving that answer from a pane probe
-// instead of from what the code had actually done: a probe taken right after our
-// own ClearOnStrand reads as "busy with an empty box" — indistinguishable from a
-// successful delivery — so the queue was skipped and the prompt was gone. The
-// mirror error is queueing when a delivery is still live, which submits the work
-// prompt twice and can start the bead twice.
+// "Owed" means the prompt was typed and something cleared it, so unless a later
+// send succeeds the agent has no work instructions. Dropping a debt strands the
+// polecat until it is reaped (gt-azm0); inventing one queues a second copy of a
+// prompt that is still going to arrive, which can start the bead twice.
 func TestStartupNudgeDeliveryAccounting(t *testing.T) {
-	// owedAfter models the loop's bookkeeping for one send outcome.
-	owedAfter := func(owedBefore bool, sendErr error) bool {
-		if sendErr == nil {
-			return false // submitted and verified
-		}
-		if errors.Is(sendErr, tmux.ErrNudgeStranded) {
-			// A clear that failed leaves the text in the box, where the agent's
-			// deferred auto-submit is still a live delivery path.
-			return !errors.Is(sendErr, tmux.ErrNudgeStrandNotCleared)
-		}
-		return owedBefore // terminal error: whatever an earlier clear did stands
-	}
-
 	stranded := fmt.Errorf("wrapped: %w", tmux.ErrNudgeStranded)
 	strandedNotCleared := fmt.Errorf("%w: %w", tmux.ErrNudgeStranded, tmux.ErrNudgeStrandNotCleared)
 	lockTimeout := errors.New("nudge lock timeout for session")
@@ -1093,20 +1081,19 @@ func TestStartupNudgeDeliveryAccounting(t *testing.T) {
 			owedBefore: true, sendErr: nil, want: false,
 		},
 		{
-			// The regression this whole PR exists for: typed, cleared, not sent.
+			// The regression this PR exists for: typed, cleared, not sent.
 			name:       "strand with a successful clear owes a delivery",
 			owedBefore: false, sendErr: stranded, want: true,
 		},
 		{
-			// The mirror error: the text survives, so queueing duplicates it.
+			// The mirror error: the text survives in the box, so the agent's
+			// deferred auto-submit still delivers it and queueing duplicates.
 			name:       "strand whose clear failed owes nothing",
 			owedBefore: true, sendErr: strandedNotCleared, want: false,
 		},
 		{
 			// A lock timeout gives up BEFORE typing, so it neither creates nor
-			// discharges a debt — an earlier clear's debt must survive it. This
-			// is the path that broke through a `break` while the probe-based
-			// check reported delivered.
+			// discharges a debt — an earlier clear's debt must survive it.
 			name:       "terminal error preserves an earlier debt",
 			owedBefore: true, sendErr: lockTimeout, want: true,
 		},
@@ -1118,8 +1105,38 @@ func TestStartupNudgeDeliveryAccounting(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := owedAfter(tt.owedBefore, tt.sendErr); got != tt.want {
-				t.Errorf("owedAfter(owed=%v, err=%v) = %v, want %v", tt.owedBefore, tt.sendErr, got, tt.want)
+			if got := owedAfterSend(tt.owedBefore, tt.sendErr); got != tt.want {
+				t.Errorf("owedAfterSend(owed=%v, err=%v) = %v, want %v", tt.owedBefore, tt.sendErr, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestEnterPhaseFailuresAreStrands guards the classification the accounting
+// depends on: every sendEnterVerified exit that leaves typed text unsubmitted in
+// the input box must wrap ErrNudgeStranded.
+//
+// The three Enter-phase failures ("send Enter", "send Enter (retry N)", "pane
+// content unchanged") previously did not, so ClearOnStrand never fired, the box
+// kept the prompt, and the carried debt queued a second copy that the poller
+// drained while the agent auto-submitted the first — delivering the startup
+// prompt twice.
+func TestEnterPhaseFailuresAreStrands(t *testing.T) {
+	sendFailed := fmt.Errorf("send Enter: %w: %w", errors.New("tmux busy"), tmux.ErrNudgeStranded)
+	unchanged := fmt.Errorf("nudge Enter not processed after 3 retries: pane content unchanged: %w", tmux.ErrNudgeStranded)
+
+	for name, err := range map[string]error{"send failed": sendFailed, "pane unchanged": unchanged} {
+		t.Run(name, func(t *testing.T) {
+			if !errors.Is(err, tmux.ErrNudgeStranded) {
+				t.Fatal("an Enter-phase failure leaves text in the box and must classify as a strand")
+			}
+			// Not "not cleared": ClearOnStrand does fire for these, so the box is
+			// emptied and a re-delivery IS owed.
+			if errors.Is(err, tmux.ErrNudgeStrandNotCleared) {
+				t.Fatal("these strands are cleared normally; marking them not-cleared would drop the debt")
+			}
+			if !owedAfterSend(false, err) {
+				t.Error("a cleared strand must owe a delivery, or the prompt is lost")
 			}
 		})
 	}

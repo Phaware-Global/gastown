@@ -983,6 +983,31 @@ func (m *SessionManager) validateIssue(issueID, workDir string) error {
 	return nil
 }
 
+// owedAfterSend updates the startup prompt's delivery debt from one send
+// outcome. It is the loop's actual bookkeeping, not a description of it, so a
+// change to this rule is a change to the behavior under test.
+//
+// "Owed" means the prompt has been typed and something cleared it, so unless a
+// later send succeeds the agent has no work instructions. Both directions are
+// costly: dropping a debt strands the polecat until it is reaped (gt-azm0),
+// while inventing one queues a second copy of a prompt that is still going to
+// arrive, which can start the bead twice.
+func owedAfterSend(owedBefore bool, sendErr error) bool {
+	if sendErr == nil {
+		return false // submitted and verified
+	}
+	if errors.Is(sendErr, tmux.ErrNudgeStranded) {
+		// A strand whose clear FAILED leaves the text in the box, where the
+		// agent's deferred auto-submit is still a live delivery path; queueing
+		// as well would deliver it twice.
+		return !errors.Is(sendErr, tmux.ErrNudgeStrandNotCleared)
+	}
+	// A non-strand error gave up before typing anything (both nudge-lock
+	// timeouts, a ClearBeforeSend C-u failure), so it neither creates nor
+	// discharges a debt — whatever an earlier clear did still stands.
+	return owedBefore
+}
+
 // startupNudgeAction is one iteration's verdict in verifyStartupNudgeDelivery.
 type startupNudgeAction int
 
@@ -1144,21 +1169,11 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
 		// success.
 		nErr := m.tmux.NudgeSessionWithOpts(sessionID, retryContent,
 			tmux.NudgeOpts{TownRoot: m.townRoot(), ClearOnStrand: true, ClearBeforeSend: true})
+		owedDelivery = owedAfterSend(owedDelivery, nErr)
 		if nErr == nil {
-			// Submitted and verified. Nothing is owed unless a later attempt
-			// clears the box again.
-			owedDelivery = false
 			continue
 		}
 		if errors.Is(nErr, tmux.ErrNudgeStranded) {
-			if errors.Is(nErr, tmux.ErrNudgeStrandNotCleared) {
-				// The clear failed, so the text is still in the box and the
-				// agent's deferred auto-submit remains a live delivery path.
-				// Queueing as well would submit the prompt twice.
-				owedDelivery = false
-			} else {
-				owedDelivery = true
-			}
 			if attempt < maxRetries {
 				fmt.Fprintf(os.Stderr, "[startup-nudge] attempt %d/%d stranded for %s; retrying\n",
 					attempt, maxRetries, sessionID)

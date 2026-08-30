@@ -307,7 +307,13 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		// "claude-opus-remote-mayor") to their provider preset. Setting it from
 		// the caller's townRoot could override that with the sender's workspace
 		// context and wrongly skip the vim-safety Escape. (GH#gt-wasn, PR #75 review)
-		opts := tmux.NudgeOpts{TownRoot: townRoot, ClearOnStrand: true}
+		// ClearOnStrand only when a re-delivery is actually available. Immediate
+		// is the only mode that tolerates an empty townRoot (queue and wait-idle
+		// refuse outright), and with no town root there is no queue to fall back
+		// to — clearing there would wipe the message with nothing to re-send it,
+		// destroying what stranded text would at least have auto-submitted. Same
+		// precondition the startup path gates on via verifyWillRedeliver.
+		opts := tmux.NudgeOpts{TownRoot: townRoot, ClearOnStrand: townRoot != ""}
 		derr := t.NudgeSessionWithOpts(sessionName, prefixedMessage, opts)
 		if !errors.Is(derr, tmux.ErrNudgeStranded) {
 			return derr

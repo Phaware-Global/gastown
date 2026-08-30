@@ -1572,7 +1572,10 @@ func (t *Tmux) sendEnterVerified(target, promptPrefix string) error {
 
 	// Send Enter
 	if _, err := t.run("send-keys", "-t", target, "Enter"); err != nil {
-		return fmt.Errorf("send Enter: %w", err)
+		// The text is typed and unsubmitted — a strand, whatever failed the
+		// keystroke. Wrapping it lets callers apply one recovery rule instead of
+		// silently leaving the box full while believing it empty.
+		return fmt.Errorf("send Enter: %w: %w", err, ErrNudgeStranded)
 	}
 
 	// If we can't snapshot, fall back to unverified delivery (old behavior).
@@ -1604,7 +1607,7 @@ func (t *Tmux) sendEnterVerified(target, promptPrefix string) error {
 
 		// Not submitted (or inconclusive + unchanged) — retry Enter.
 		if _, err := t.run("send-keys", "-t", target, "Enter"); err != nil {
-			return fmt.Errorf("send Enter (retry %d): %w", retry+1, err)
+			return fmt.Errorf("send Enter (retry %d): %w: %w", retry+1, err, ErrNudgeStranded)
 		}
 
 		// Exponential backoff: 500ms → 1000ms → 2000ms
@@ -1626,7 +1629,7 @@ func (t *Tmux) sendEnterVerified(target, promptPrefix string) error {
 	if strings.Join(lines, "\n") != preSnapshot {
 		return nil // Inconclusive but content changed — consider success.
 	}
-	return fmt.Errorf("nudge Enter not processed after %d retries: pane content unchanged", maxRetries)
+	return fmt.Errorf("nudge Enter not processed after %d retries: pane content unchanged: %w", maxRetries, ErrNudgeStranded)
 }
 
 // InputBoxCleared reports whether the session's live input box is empty — i.e.
