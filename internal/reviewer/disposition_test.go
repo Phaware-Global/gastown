@@ -24,7 +24,7 @@ func TestParseFindings_ApproveDispositionIsRejectedOutright(t *testing.T) {
 		`[{"path":"a.go","line":1,"priority":"low","title":"t","body":"b"}]`,
 		`[]`,
 	} {
-		payload := `{"summary":"s","disposition":"approve","findings":` + findings + `}`
+		payload := `{"summary":` + okSummary + `,"disposition":"approve","findings":` + findings + `}`
 		_, err := ParseFindings([]byte(payload))
 		if err == nil {
 			t.Errorf("approve disposition must be rejected regardless of severity (findings=%s)", findings)
@@ -38,7 +38,7 @@ func TestParseFindings_ApproveDispositionIsRejectedOutright(t *testing.T) {
 
 func TestParseFindings_ApproveRejectedEvenWithOddCasing(t *testing.T) {
 	// The lookup lowercases and trims, so a casing variant must not slip past.
-	payload := `{"summary":"s","disposition":"  ApPrOvE  ","findings":[]}`
+	payload := `{"summary":` + okSummary + `,"disposition":"  ApPrOvE  ","findings":[]}`
 	if _, err := ParseFindings([]byte(payload)); err == nil {
 		t.Error("a case/space variant of approve must be rejected too")
 	}
@@ -51,7 +51,7 @@ func TestReviewEvent_CommentDispositionCannotSuppressAHighFinding(t *testing.T) 
 	// it did — no injection, no bad actor, just a perf lens following the
 	// documented contract.
 	fs := &Findings{
-		Summary:     "s",
+		Summary:     summaryOf("s"),
 		Disposition: "comment",
 		Findings:    []Finding{{Path: "a.go", Line: 1, Priority: "high", Title: "t"}},
 	}
@@ -65,7 +65,7 @@ func TestParseFindings_CommentWithHighIsAcceptedAndStillBlocks(t *testing.T) {
 	// comment+high is a LEGITIMATE payload (one lens escalating its own clean
 	// tally while another found something high), so it must parse — and the
 	// floor must resolve it to the blocking event.
-	payload := `{"summary":"s","disposition":"comment","findings":[
+	payload := `{"summary":` + okSummary + `,"disposition":"comment","findings":[
 	  {"path":"a.go","line":1,"priority":"high","title":"t","body":"b"}]}`
 	fs, err := ParseFindings([]byte(payload))
 	if err != nil {
@@ -89,12 +89,12 @@ func TestReviewEvent_DispositionIsAFloorNeverACeiling(t *testing.T) {
 		want        string
 	}{
 		{"", high, "REQUEST_CHANGES"},
-		{"", med, "COMMENT"},
+		{"", med, "APPROVE"}, // severity alone never yields COMMENT
 		{"", low, "APPROVE"},
 		{"", nil, "APPROVE"},
 		{"comment", low, "COMMENT"},          // escalates
 		{"comment", nil, "COMMENT"},          // escalates
-		{"comment", med, "COMMENT"},          // agrees
+		{"comment", med, "COMMENT"},          // escalates: COMMENT is now reachable only this way
 		{"comment", high, "REQUEST_CHANGES"}, // must NOT de-escalate
 		{"request_changes", nil, "REQUEST_CHANGES"},
 		{"request_changes", low, "REQUEST_CHANGES"},
@@ -102,7 +102,7 @@ func TestReviewEvent_DispositionIsAFloorNeverACeiling(t *testing.T) {
 		{"request_changes", high, "REQUEST_CHANGES"},
 	}
 	for _, tc := range cases {
-		fs := &Findings{Summary: "s", Disposition: tc.disposition, Findings: tc.findings}
+		fs := &Findings{Summary: summaryOf("s"), Disposition: tc.disposition, Findings: tc.findings}
 		if got := fs.ReviewEvent(); got != tc.want {
 			t.Errorf("disposition=%q findings=%v: ReviewEvent = %q, want %q",
 				tc.disposition, prioritiesOf(tc.findings), got, tc.want)
@@ -120,7 +120,7 @@ func prioritiesOf(fs []Finding) []string {
 
 func TestReviewEvent_EscalationOverridesCleanTally(t *testing.T) {
 	// The whole point: zero findings would derive APPROVE, but the pass blocked.
-	fs := &Findings{Summary: "BLOCK: architectural", Disposition: "request_changes"}
+	fs := &Findings{Summary: summaryOf("BLOCK: architectural"), Disposition: "request_changes"}
 	if ev := fs.ReviewEvent(); ev != "REQUEST_CHANGES" {
 		t.Errorf("ReviewEvent = %q, want REQUEST_CHANGES — an unanchorable block must be expressible", ev)
 	}
@@ -352,9 +352,63 @@ func TestDispositionError_SteersTheRepairAwayFromAFalseBlock(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "omit") {
 		t.Errorf("ParsePerspectiveResult must surface the recovery guidance: %v", err)
 	}
-	if _, err := ParseFindings([]byte(`{"summary":"s","disposition":"bogus","findings":[]}`)); err == nil {
+	if _, err := ParseFindings([]byte(`{"summary":` + okSummary + `,"disposition":"bogus","findings":[]}`)); err == nil {
 		t.Error("ParseFindings must reject an invalid disposition")
 	} else if !strings.Contains(err.Error(), "omit") {
 		t.Errorf("ParseFindings must surface the recovery guidance: %v", err)
+	}
+}
+
+// COMMENT must never arise from severity alone. A PR carrying only medium
+// findings previously derived COMMENT: it was neither approved nor blocked, so
+// the fix loop had nothing to clear and a human had nothing to act on, while
+// the medium threads already imposed the work. Severity now answers exactly one
+// question — does this block the merge? — and only a high finding says yes.
+func TestSeverityEvent_NeverYieldsComment(t *testing.T) {
+	for _, priorities := range [][]string{
+		nil,
+		{"medium"},
+		{"low", "medium", "medium"},
+		{""},       // empty defaults to medium in normalizeFinding
+		{"bogus"},  // ParseFindings rejects this; built in code it must not block
+		{"MEDIUM"}, // casing must not change the verdict
+	} {
+		fs := &Findings{Summary: summaryOf("s")}
+		for _, p := range priorities {
+			fs.Findings = append(fs.Findings, Finding{Path: "a.go", Line: 1, Priority: p, Title: "t"})
+		}
+		if got := fs.SeverityEvent(); got != "APPROVE" {
+			t.Errorf("priorities=%v: SeverityEvent = %q, want APPROVE", priorities, got)
+		}
+	}
+
+	// … and a high finding still blocks, whatever else is present.
+	fs := &Findings{Summary: summaryOf("s"), Findings: []Finding{
+		{Path: "a.go", Line: 1, Priority: "medium", Title: "t"},
+		{Path: "a.go", Line: 2, Priority: "high", Title: "t"},
+	}}
+	if got := fs.SeverityEvent(); got != "REQUEST_CHANGES" {
+		t.Errorf("SeverityEvent = %q, want REQUEST_CHANGES", got)
+	}
+}
+
+// COMMENT stays reachable, but only as an explicit escalation: a pass with an
+// unanchorable concern — or one that cut itself short — can still keep a clean
+// tally from reading as an endorsement.
+func TestReviewEvent_CommentRemainsAnExplicitEscalation(t *testing.T) {
+	med := []Finding{{Path: "a.go", Line: 1, Priority: "medium", Title: "t"}}
+
+	if got := (&Findings{Summary: summaryOf("s"), Findings: med}).ReviewEvent(); got != "APPROVE" {
+		t.Errorf("medium only: ReviewEvent = %q, want APPROVE", got)
+	}
+	if got := (&Findings{Summary: summaryOf("s"), Disposition: "comment", Findings: med}).ReviewEvent(); got != "COMMENT" {
+		t.Errorf("medium + disposition=comment: ReviewEvent = %q, want COMMENT", got)
+	}
+	high := []Finding{{Path: "a.go", Line: 1, Priority: "high", Title: "t"}}
+	for _, d := range []string{"", "comment", "request_changes"} {
+		fs := &Findings{Summary: summaryOf("s"), Disposition: d, Findings: high}
+		if got := fs.ReviewEvent(); got != "REQUEST_CHANGES" {
+			t.Errorf("high + disposition=%q: ReviewEvent = %q, want REQUEST_CHANGES", d, got)
+		}
 	}
 }

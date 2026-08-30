@@ -193,8 +193,8 @@ func TestConsolidate_UnanchoredBlockSoftenedWithoutInScopeHigh(t *testing.T) {
 		t.Errorf("event = %q, want COMMENT", ev)
 	}
 	// The objection still posts in full.
-	if !strings.Contains(fs.Summary, "BLOCK: architectural objection") {
-		t.Errorf("verdict text was lost:\n%s", fs.Summary)
+	if got := fs.Summary.Verdicts[0].Verdict; got != "BLOCK: architectural objection" {
+		t.Errorf("verdict text was lost: %q", got)
 	}
 }
 
