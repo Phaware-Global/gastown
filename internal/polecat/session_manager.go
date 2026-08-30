@@ -977,6 +977,52 @@ func (m *SessionManager) validateIssue(issueID, workDir string) error {
 	return nil
 }
 
+// startupNudgeAction is one iteration's verdict in verifyStartupNudgeDelivery.
+type startupNudgeAction int
+
+const (
+	// startupNudgeDeliver: (re)send the prompt now.
+	startupNudgeDeliver startupNudgeAction = iota
+	// startupNudgeDone: delivery is confirmed; stop.
+	startupNudgeDone
+	// startupNudgeWait: inconclusive; look again next attempt, and do not act on
+	// the input box in the meantime.
+	startupNudgeWait
+)
+
+// decideStartupNudgeAction decides what to do from three observations: whether
+// WE stranded and cleared our own text, whether the agent is busy, and whether
+// its input box is empty.
+//
+// Split out as a pure function so the policy is testable as behavior. It is
+// easy to get backwards, and both mistakes are costly: trusting "busy" as
+// delivery skips the retry in exactly the strand case it exists for, while
+// re-sending on a live delivery submits the startup prompt twice and can start
+// the bead twice.
+func decideStartupNudgeAction(stranded, busy, boxCleared bool) startupNudgeAction {
+	if stranded {
+		// We cleared our own text, so an empty box is our doing rather than
+		// evidence the agent received anything. We owe a re-delivery.
+		return startupNudgeDeliver
+	}
+	if !busy {
+		// Idle means nothing is being processed, so the prompt was never
+		// submitted — whether the box is empty (lost) or still holds it.
+		return startupNudgeDeliver
+	}
+	if boxCleared {
+		// Busy with an empty box: the prompt was submitted and is being worked.
+		return startupNudgeDone
+	}
+	// Busy with text still in the box. It may be our own unsubmitted prompt, or
+	// another sender's in-flight nudge — our own send can leave text behind
+	// without reporting a strand (sendEnterVerified returns a plain "pane
+	// content unchanged" error, and returns nil outright when it cannot capture
+	// the pane). Nothing here distinguishes them, so do not type over it and do
+	// not claim delivery; look again next attempt.
+	return startupNudgeWait
+}
+
 // queueStartupNudge hands the startup prompt to the nudge queue and guarantees a
 // drain, for the cases where re-typing it into the pane is unsafe or has been
 // exhausted.
@@ -986,10 +1032,13 @@ func (m *SessionManager) validateIssue(issueID, workDir string) error {
 // work instructions at all — it sits idle, is reaped, and its bead is reassigned
 // (gt-azm0). Best-effort by design; failures are logged, never fatal to startup.
 func (m *SessionManager) queueStartupNudge(sessionID, content, reason string) {
+	// filepath.Dir never returns "", so an empty-string check here would be dead
+	// code. A relative root is the real hazard: nudge.Enqueue would join it onto
+	// the caller's cwd and write a queue nothing drains.
 	townRoot := m.townRoot()
-	if townRoot == "" {
-		fmt.Fprintf(os.Stderr, "[startup-nudge] WARNING: cannot queue startup nudge for %s (%s): no town root\n",
-			sessionID, reason)
+	if !filepath.IsAbs(townRoot) {
+		fmt.Fprintf(os.Stderr, "[startup-nudge] WARNING: cannot queue startup nudge for %s (%s): town root %q is not absolute\n",
+			sessionID, reason, townRoot)
 		return
 	}
 	if err := nudge.Enqueue(townRoot, sessionID, nudge.QueuedNudge{
@@ -1040,6 +1089,7 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
 		retryContent = runtime.StartupNudgeContent()
 	}
 
+	delivered := false
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		// Wait for the agent to process the nudge before checking.
 		time.Sleep(verifyDelay)
@@ -1047,78 +1097,69 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
 		// Check if session is still alive
 		running, err := m.tmux.HasSession(sessionID)
 		if err != nil || !running {
-			return // Session died, nothing to verify
+			return // Session died — there is nobody left to deliver to
 		}
 
-		// Use IsIdle instead of IsAtPrompt: IsIdle checks for the "esc to
-		// interrupt" busy indicator. If Claude is processing (loading context,
-		// running tools, generating a response), the status bar shows the busy
-		// indicator and IsIdle returns false — even though ❯ may still be
-		// visible in the pane from before Claude started output.
-		// A busy agent usually means the nudge landed and is being processed —
-		// but not always. "Went busy mid-paste" is precisely the condition that
-		// strands text in the input box, so returning early on busy skips the
-		// retry exactly when it is needed (gt-zlfq). Check whether the input box
-		// actually cleared before trusting busy as proof of delivery.
-		// A known strand must re-deliver on the first attempt no matter what the
-		// pane looks like: ClearOnStrand already emptied the box, so the
-		// busy+cleared check below would misread the wipe as successful delivery
-		// and skip the retry in exactly the case it exists for.
-		busy := !m.tmux.IsIdle(sessionID)
-		if !stranded {
-			// A busy agent usually means the nudge landed — but "went busy
-			// mid-paste" is precisely what strands text, so confirm the box is
-			// actually empty before trusting busy as proof of delivery.
-			if busy && m.tmux.InputBoxCleared(sessionID) {
-				return // Agent is busy and its box is empty — nudge was received
-			}
-			if busy {
-				// Busy with a NON-empty box that we did not strand: the text
-				// belongs to someone else's in-flight nudge. Clearing would
-				// destroy their message, so hand ours to the queue instead of
-				// typing over theirs, and let the drain deliver it.
-				m.queueStartupNudge(sessionID, retryContent, "another sender's text is in the input box")
-				return
-			}
+		switch decideStartupNudgeAction(stranded, !m.tmux.IsIdle(sessionID), m.tmux.InputBoxCleared(sessionID)) {
+		case startupNudgeDone:
+			return
+		case startupNudgeWait:
+			continue
 		}
-		ownStrand := stranded
-		stranded = false // only the first attempt is forced
+		stranded = false // only a fresh strand forces the next attempt
 
-		// Either the agent is idle (nudge likely lost) or we cleared our own
-		// strand and owe a re-delivery.
 		fmt.Fprintf(os.Stderr, "[startup-nudge] attempt %d/%d: re-delivering startup nudge to %s\n",
 			attempt, maxRetries, sessionID)
 		// ClearBeforeSend guards against typing onto leftover text: an idle
 		// agent's box may still hold an unsubmitted beacon, and appending to it
 		// would submit one fused instruction that Enter verification reports as
-		// success. Safe here because the box is either empty (our own strand was
-		// just cleared) or holds only leftovers belonging to this startup.
+		// success.
 		nErr := m.tmux.NudgeSessionWithOpts(sessionID, retryContent,
 			tmux.NudgeOpts{TownRoot: m.townRoot(), ClearOnStrand: true, ClearBeforeSend: true})
 		if nErr == nil {
-			continue
+			continue // next iteration confirms the agent actually picked it up
 		}
 		if errors.Is(nErr, tmux.ErrNudgeStranded) {
-			// The retry stranded too, and its text has just been cleared. This is
-			// the EXPECTED outcome against a busy agent, not a corner case, so it
-			// must not be terminal: returning here would end the loop having
-			// erased the prompt for good — the exact failure this path exists to
-			// prevent. Carry the strand into the next attempt.
-			fmt.Fprintf(os.Stderr, "[startup-nudge] attempt %d/%d stranded for %s; retrying\n",
-				attempt, maxRetries, sessionID)
+			// Expected against a busy agent, not a corner case: sendEnterVerified
+			// only reports a strand after four Enters fail over ~4s. Its text has
+			// just been cleared, so carry the strand forward rather than treating
+			// it as terminal.
+			if attempt < maxRetries {
+				fmt.Fprintf(os.Stderr, "[startup-nudge] attempt %d/%d stranded for %s; retrying\n",
+					attempt, maxRetries, sessionID)
+			}
 			stranded = true
-			_ = ownStrand
 			continue
 		}
+		// Break, never return: NudgeSessionWithOpts has non-strand exits that
+		// give up before typing anything (both nudge-lock timeouts, and a
+		// ClearBeforeSend C-u failure). By then an earlier clear has already
+		// emptied the box, so returning here would drop a prompt we erased —
+		// fall through to the queue instead.
 		fmt.Fprintf(os.Stderr, "[startup-nudge] retry nudge failed for %s: %v\n", sessionID, nErr)
-		return
+		break
 	}
 
-	// Retries exhausted. The prompt has been cleared at least once, so leaving
-	// now would drop it entirely; hand it to the queue so a drain can still
-	// deliver it.
-	if !m.tmux.InputBoxCleared(sessionID) || m.tmux.IsIdle(sessionID) {
-		m.queueStartupNudge(sessionID, retryContent, "retries exhausted")
+	// Deliver-or-queue: the ONLY exit that may skip the queue is a confirmed
+	// delivery. Anything else — exhausted attempts, a final strand, a terminal
+	// send error — leaves a prompt this function has typed and cleared at least
+	// once, and dropping it strands the polecat with no work instructions until
+	// it is reaped (gt-azm0).
+	//
+	// The queue is deliberately NOT gated on pane state. Gating it on
+	// "!InputBoxCleared || IsIdle" skipped exactly the common case: after a final
+	// strand the box is cleared (so the first term is false) and the agent is
+	// busy (so the second is false), and the prompt was silently lost.
+	if decideStartupNudgeAction(stranded, !m.tmux.IsIdle(sessionID), m.tmux.InputBoxCleared(sessionID)) == startupNudgeDone {
+		delivered = true
+	}
+	if !delivered {
+		// Queued without clearing the box first. When the box holds text we
+		// cannot attribute, clearing risks destroying another sender's message,
+		// and a duplicate prompt is the lesser failure: it is visible and
+		// recoverable, whereas a polecat that never receives its prompt sits idle
+		// until something reaps it.
+		m.queueStartupNudge(sessionID, retryContent, "delivery unconfirmed")
 	}
 
 	// If we exhausted retries and the agent is still idle, log a warning.

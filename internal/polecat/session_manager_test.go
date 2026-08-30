@@ -966,3 +966,90 @@ func TestShouldCreateFreshSessionBranch_Structural(t *testing.T) {
 		})
 	}
 }
+
+// TestDecideStartupNudgeAction pins the startup-nudge delivery policy.
+//
+// Both directions of error are costly. Trusting a busy agent as proof of
+// delivery skips the retry in exactly the strand case the retry exists for, so
+// the polecat never receives its work prompt, sits idle, and is reaped with its
+// bead reassigned (gt-azm0). Re-sending on a live delivery submits the startup
+// prompt twice and can start the bead twice.
+func TestDecideStartupNudgeAction(t *testing.T) {
+	tests := []struct {
+		name       string
+		stranded   bool
+		busy       bool
+		boxCleared bool
+		want       startupNudgeAction
+	}{
+		{
+			// We cleared our own text, so the empty box is our doing — not
+			// evidence the agent got anything. This is the case the old
+			// busy+cleared gate misread as success.
+			name:     "our own strand always re-delivers, even though the box looks clean",
+			stranded: true, busy: true, boxCleared: true,
+			want: startupNudgeDeliver,
+		},
+		{
+			name:     "our own strand re-delivers when idle too",
+			stranded: true, busy: false, boxCleared: true,
+			want: startupNudgeDeliver,
+		},
+		{
+			name:     "idle with an empty box means the prompt was lost",
+			stranded: false, busy: false, boxCleared: true,
+			want: startupNudgeDeliver,
+		},
+		{
+			name:     "idle holding text means it was never submitted",
+			stranded: false, busy: false, boxCleared: false,
+			want: startupNudgeDeliver,
+		},
+		{
+			name:     "busy with an empty box is a confirmed delivery",
+			stranded: false, busy: true, boxCleared: true,
+			want: startupNudgeDone,
+		},
+		{
+			// Unattributable: our own send can leave text without reporting a
+			// strand, and it may equally be another sender's in-flight nudge.
+			// Typing over it would fuse two instructions; claiming delivery
+			// would abandon our prompt.
+			name:     "busy holding text is inconclusive",
+			stranded: false, busy: true, boxCleared: false,
+			want: startupNudgeWait,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := decideStartupNudgeAction(tt.stranded, tt.busy, tt.boxCleared); got != tt.want {
+				t.Errorf("decideStartupNudgeAction(stranded=%v, busy=%v, boxCleared=%v) = %v, want %v",
+					tt.stranded, tt.busy, tt.boxCleared, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDecideStartupNudgeAction_OnlyConfirmedDeliveryStopsTheQueue is the
+// gt-zlfq exhaustion guarantee: verifyStartupNudgeDelivery skips its queue
+// fallback on exactly one verdict, so every other state must keep the prompt
+// recoverable. The previous gate ("!InputBoxCleared || IsIdle") returned false
+// after a final strand — box cleared, agent busy — and silently lost it.
+func TestDecideStartupNudgeAction_OnlyConfirmedDeliveryStopsTheQueue(t *testing.T) {
+	for _, stranded := range []bool{true, false} {
+		for _, busy := range []bool{true, false} {
+			for _, cleared := range []bool{true, false} {
+				got := decideStartupNudgeAction(stranded, busy, cleared)
+				confirmed := !stranded && busy && cleared
+				if confirmed && got != startupNudgeDone {
+					t.Errorf("busy+cleared+unstranded must be Done, got %v", got)
+				}
+				if !confirmed && got == startupNudgeDone {
+					t.Errorf("stranded=%v busy=%v cleared=%v must not report Done — the prompt would be dropped unqueued",
+						stranded, busy, cleared)
+				}
+			}
+		}
+	}
+}

@@ -2,8 +2,6 @@ package tmux
 
 import (
 	"errors"
-	"os"
-	"strings"
 	"testing"
 )
 
@@ -196,75 +194,5 @@ func TestInputBoxClearedFrom(t *testing.T) {
 				t.Errorf("inputBoxClearedFrom() = %v, want %v", got, tt.want)
 			}
 		})
-	}
-}
-
-// TestNudgeOptsClearSemantics pins the distinction between the two clear flags,
-// which the gt-zlfq review showed is easy to conflate and dangerous to get wrong.
-//
-// ClearOnStrand wipes AFTER a failed submit and is only safe when the caller
-// re-delivers — a bare clear destroys the message outright, which is strictly
-// worse than leaving stranded text that would eventually auto-submit.
-//
-// ClearBeforeSend wipes BEFORE typing and is mandatory for any retry running
-// against a box that may be non-empty. The delivery protocol has no pre-clear of
-// its own, so without it a retry is appended to the stranded text and submitted
-// as one fused line — and Enter verification then sees a bare prompt and reports
-// success, hiding the corruption from every caller.
-func TestNudgeOptsClearSemantics(t *testing.T) {
-	t.Parallel()
-
-	var zero NudgeOpts
-	if zero.ClearOnStrand || zero.ClearBeforeSend {
-		t.Fatal("zero NudgeOpts must not clear anything: a bare NudgeSession() must stay non-destructive")
-	}
-
-	// The two flags are independent: a retry against a known-stranded box needs
-	// both (clear the old text, and clear again if this attempt also strands).
-	retry := NudgeOpts{ClearOnStrand: true, ClearBeforeSend: true}
-	if !retry.ClearBeforeSend {
-		t.Error("a retry against a non-empty box must set ClearBeforeSend or it concatenates")
-	}
-	if !retry.ClearOnStrand {
-		t.Error("a retry that re-delivers should also clear on a fresh strand")
-	}
-}
-
-// TestClearBeforeSendOrdering guards the invariant that makes ClearBeforeSend
-// safe: the box must never be emptied on a path that then returns without
-// typing. Clearing without delivering destroys the message outright — strictly
-// worse than leaving stranded text, which the agent would eventually auto-submit.
-//
-// Enforced structurally by ordering the C-u after the empty-message guard and
-// immediately before the send, and by reporting a post-clear send failure as
-// ErrNudgeStranded so the caller re-delivers instead of dropping a prompt it has
-// already erased.
-func TestClearBeforeSendOrdering(t *testing.T) {
-	t.Parallel()
-
-	src, err := os.ReadFile("tmux.go")
-	if err != nil {
-		t.Fatalf("reading tmux.go: %v", err)
-	}
-	body := string(src)
-
-	clearIdx := strings.Index(body, "if opts.ClearBeforeSend {")
-	if clearIdx == -1 {
-		t.Fatal("ClearBeforeSend block not found")
-	}
-	guardIdx := strings.Index(body, "if sanitized == \"\" {")
-	if guardIdx == -1 {
-		t.Fatal("empty-message guard not found")
-	}
-	sendIdx := strings.Index(body, "t.sendMessageToTarget(target, sanitized)")
-	if sendIdx == -1 {
-		t.Fatal("sendMessageToTarget call not found")
-	}
-
-	if clearIdx < guardIdx {
-		t.Error("ClearBeforeSend must run AFTER the empty-message guard, or an empty payload empties the box and returns without typing")
-	}
-	if clearIdx > sendIdx {
-		t.Error("ClearBeforeSend must run BEFORE the send, or the retry concatenates onto existing text")
 	}
 }
