@@ -122,3 +122,86 @@ func TestSendEnterVerified_StrandedReturnsErrNudgeStranded(t *testing.T) {
 		t.Errorf("sendEnterVerified on stranded box = %v, want ErrNudgeStranded", err)
 	}
 }
+
+// TestSendEnterVerified_UnverifiableIsAlsoAStrand drives the real
+// sendEnterVerified down its "pane content unchanged" exit and asserts that it
+// too unwraps to ErrNudgeStranded.
+//
+// That exit means the same thing as the one above — text was typed and never
+// submitted — but it was previously returned as a plain error, so ClearOnStrand
+// never fired and callers keying recovery on ErrNudgeStranded left the box full
+// while believing it empty. The startup path then queued a second copy while
+// the agent's deferred auto-submit delivered the first.
+//
+// This drives the production function rather than asserting an error value the
+// test built itself: removing the wrap in tmux.go fails this test.
+func TestSendEnterVerified_UnverifiableIsAlsoAStrand(t *testing.T) {
+	tm := newTestTmux(t)
+	session := fmt.Sprintf("gt-test-unverifiable-%d-%d", time.Now().UnixNano(), busyPaneSeq.Add(1))
+	if err := tm.NewSession(session, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSession(session) })
+	time.Sleep(200 * time.Millisecond)
+
+	// `cat` again, so Enter keystrokes are inert and the pane stops changing.
+	if err := tm.SendKeys(session, "cat"); err != nil {
+		t.Fatalf("SendKeys(cat): %v", err)
+	}
+	time.Sleep(400 * time.Millisecond)
+
+	// A prompt prefix that appears nowhere in the pane makes inputBoxSubmitted
+	// inconclusive, which is what routes sendEnterVerified to the content-diff
+	// fallback and then to the "pane content unchanged" exit.
+	const absentPrefix = "⌘⌘ "
+
+	before, err := tm.CapturePane(session, 5)
+	if err != nil {
+		t.Skipf("CapturePane: %v", err)
+	}
+	if lines, err := tm.CapturePaneLines(session, 5); err == nil {
+		if _, conclusive := inputBoxSubmitted(lines, absentPrefix); conclusive {
+			t.Skipf("environment renders the absent prefix; cannot reach the inconclusive path")
+		}
+	}
+
+	err = tm.sendEnterVerified(session, absentPrefix)
+	if err == nil {
+		// Enter changed the pane in this environment, so the unverifiable path
+		// was not reached — nothing to assert.
+		after, cerr := tm.CapturePane(session, 5)
+		if cerr == nil && after != before {
+			t.Skip("pane content changed; the unverifiable exit was not reached")
+		}
+		t.Fatal("sendEnterVerified returned nil without the pane changing; the unverifiable exit must report a strand")
+	}
+	if !errors.Is(err, ErrNudgeStranded) {
+		t.Errorf("sendEnterVerified on an unverifiable pane = %v, want it to unwrap to ErrNudgeStranded", err)
+	}
+}
+
+// TestSendEnterVerified_SendFailureIsAlsoAStrand drives the "send Enter" exit,
+// where the send-keys for Enter itself fails.
+//
+// An unreachable target reaches it directly: sendEnterVerified's first action
+// after the snapshot IS the send-keys. Deliberately uses NewTmux() rather than
+// newTestTmux and creates no session, so it needs neither a live pane nor a tmux
+// binary — the send simply fails either way. That matters because CI installs no
+// tmux, and a version of this test that created a session skipped there, taking
+// every strand-classification test with it.
+//
+// The text is typed and unsubmitted whatever failed the keystroke, so this must
+// classify as a strand: callers key their clear-and-requeue recovery on
+// ErrNudgeStranded, and a plain error here leaves the box full while they
+// believe it empty.
+func TestSendEnterVerified_SendFailureIsAlsoAStrand(t *testing.T) {
+	tm := NewTmux()
+
+	err := tm.sendEnterVerified(fmt.Sprintf("gt-no-such-session-%d", busyPaneSeq.Add(1)), DefaultReadyPromptPrefix)
+	if err == nil {
+		t.Fatal("sending Enter to a nonexistent target must fail")
+	}
+	if !errors.Is(err, ErrNudgeStranded) {
+		t.Errorf("sendEnterVerified with a failing send-keys = %v, want it to unwrap to ErrNudgeStranded", err)
+	}
+}

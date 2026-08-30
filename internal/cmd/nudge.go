@@ -263,10 +263,19 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 			//     ClearOnStrand above already cleared the orphaned text under the
 			//     delivery lock (so Claude Code's deferred auto-submit can't
 			//     duplicate the queued copy); we just re-deliver via the queue.
+			if errors.Is(derr, tmux.ErrNudgeStrandNotCleared) {
+				// The clear FAILED, so the typed text is still in a live input
+				// box and the agent's deferred auto-submit will deliver it.
+				// Queueing as well would deliver the same nudge twice. Surface
+				// the strand instead. Newly reachable now that the Enter-phase
+				// failures classify as strands.
+				return derr
+			}
 			if !errors.Is(derr, tmux.ErrAgentBusy) && !errors.Is(derr, tmux.ErrNudgeStranded) {
 				return derr
 			}
-			// else: agent became busy (or text stranded) — proceed to the queue path below.
+			// else: agent became busy (or text stranded and was cleared) —
+			// proceed to the queue path below.
 		}
 		// Terminal errors (session gone, no server) — propagate, don't queue.
 		// Queueing a nudge for a dead session means it will never be delivered.
@@ -307,8 +316,62 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		// "claude-opus-remote-mayor") to their provider preset. Setting it from
 		// the caller's townRoot could override that with the sender's workspace
 		// context and wrongly skip the vim-safety Escape. (GH#gt-wasn, PR #75 review)
-		opts := tmux.NudgeOpts{TownRoot: townRoot}
-		return t.NudgeSessionWithOpts(sessionName, prefixedMessage, opts)
+		// ClearOnStrand only when a re-delivery is actually available. Immediate
+		// is the only mode that tolerates an empty townRoot (queue and wait-idle
+		// refuse outright), and with no town root there is no queue to fall back
+		// to — clearing there would wipe the message with nothing to re-send it,
+		// destroying what stranded text would at least have auto-submitted. Same
+		// precondition the startup path gates on via verifyWillRedeliver.
+		opts := tmux.NudgeOpts{TownRoot: townRoot, ClearOnStrand: townRoot != ""}
+		derr := t.NudgeSessionWithOpts(sessionName, prefixedMessage, opts)
+		if !errors.Is(derr, tmux.ErrNudgeStranded) {
+			return derr
+		}
+		if errors.Is(derr, tmux.ErrNudgeStrandNotCleared) {
+			// The clear failed, so the typed text is still in the agent's input
+			// box and its deferred auto-submit will deliver it. Queueing a second
+			// copy would run the same instruction twice — for an operational
+			// directive sent with --mode=immediate (stop, merge, re-dispatch)
+			// that is a double execution the sender cannot see. Surface the
+			// strand instead of silently duplicating it.
+			return derr
+		}
+		// The text was typed but the agent slipped busy before Enter submitted
+		// it. ClearOnStrand removed the orphaned copy under the delivery lock;
+		// degrade to the queue rather than dropping the message (gt-zlfq).
+		//
+		// Without a town root there is nowhere real to queue: nudge.Enqueue would
+		// join onto "" and write a ./.runtime tree relative to the caller's cwd
+		// that no hook or poller ever reads, then report success. The queue and
+		// wait-idle modes refuse explicitly in this case; match them and surface
+		// the original strand instead of silently degrading.
+		if townRoot == "" {
+			return derr
+		}
+		if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+			Sender:   sender,
+			Message:  message,
+			Priority: nudgePriorityFlag,
+		}); qErr != nil {
+			return fmt.Errorf("immediate delivery stranded and queue fallback failed: %w (original: %v)", qErr, derr)
+		}
+		// Enqueueing alone guarantees nothing: a polecat has no nudge poller, and
+		// the UserPromptSubmit hook needs user input the agent will never get. The
+		// other queue-degradation paths in this function each start a drain for
+		// exactly this reason, so do the same before reporting the nudge queued.
+		//
+		// StartPoller is the drain: it launches a detached `gt nudge-poller` that
+		// survives this CLI exiting, so it returns immediately. Only if it fails
+		// do we fall back to the synchronous watcher — that one blocks for up to
+		// idleWatcherTimeout, and runNudgeChannel calls deliverNudge sequentially,
+		// so blocking unconditionally would turn a fan-out across N busy agents
+		// into an N*60s stall on the very mode operators pick for urgency.
+		if _, err := nudge.StartPoller(townRoot, sessionName); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not start nudge poller for %s: %v; watching inline\n", sessionName, err)
+			watchAndDeliver(t, townRoot, sessionName)
+		}
+		fmt.Fprintf(os.Stderr, "Note: agent went busy mid-paste; nudge queued and a drain was started\n")
+		return nil
 	}
 }
 
