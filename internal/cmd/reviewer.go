@@ -149,9 +149,10 @@ var reviewerCheckoutCmd = &cobra.Command{
 	Long: `Fetch the PR's head commit and check it out in a detached HEAD state.
 
 This is the only sanctioned way the Reviewer touches git: it never creates a
-branch and never pushes. With --sha the worktree detaches at exactly that commit
-(the SHA the Reviewer was asked to review), so the review is anchored even if
-upstream HEAD has moved.
+branch and never force-pushes. It makes exactly one write to the remote — the
+base-into-head update merge described below — and nothing else. With --sha the
+worktree detaches at exactly that commit (the SHA the Reviewer was asked to
+review), so the review is anchored even if upstream HEAD has moved.
 
 If the PR is behind its base branch, the branch is updated first (the "Update
 branch" merge, via gh) and the worktree detaches at the resulting commit — a
@@ -542,7 +543,7 @@ func runReviewerCheckout(cmd *cobra.Command, args []string) error {
 	// means every review round starts from a mergeable head without the agent
 	// having to remember.
 	sha := reviewerCheckoutSHA
-	if updateReviewerPRIfBehind(g, prNumber) {
+	if updateReviewerPRIfBehind(g, prNumber, sha) {
 		// The requested SHA is behind the base by definition now, so the review
 		// must run against the head the update produced, not the one the request
 		// named. Passing "" takes the freshly fetched head.
@@ -594,28 +595,39 @@ func runReviewerCheckout(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// prHeadMoveTimeout bounds the wait for GitHub to publish the merge commit that
+// prUpdateTimeout bounds the wait for GitHub to publish the merge commit that
 // `gh pr update-branch` asks for. The REST call behind it returns 202 Accepted
 // — the work is queued, not done — so fetching immediately would land on the
 // pre-update head and review exactly the stale commit this is meant to avoid.
 // Vars, not consts, so tests can shorten the wait without sleeping through it.
 var (
-	prHeadMoveTimeout  = 30 * time.Second
-	prHeadMovePollWait = 2 * time.Second
+	prUpdateTimeout  = 30 * time.Second
+	prUpdatePollWait = 2 * time.Second
 )
 
-// updateReviewerPRIfBehind brings the PR branch up to date with its base when it
-// has fallen behind, and reports whether the head moved as a result.
+// updateReviewerPRIfBehind brings the PR branch up to date with its base when
+// the commit this round would review has fallen behind, and reports whether the
+// update landed — which is also the caller's signal to abandon the pinned SHA.
+//
+// It returns true ONLY on a verified update. The verification is the point: the
+// return value discards an operator-pinned --sha, so reporting success on an
+// unconfirmed update would silently retarget the round at whatever the pull ref
+// happens to resolve to — possibly still behind its base, possibly a commit
+// nobody asked for. A timeout, a failed update, or an update that did not
+// actually clear the behind state all keep the pin.
 //
 // Every failure here is non-fatal and reported. A branch that cannot be updated
 // is usually one with conflicts against its base, which only the author can
 // resolve; refusing to review it would strand the round and tell nobody why,
-// while reviewing the head as-is still produces findings the author can act on.
-func updateReviewerPRIfBehind(g *git.Git, prNumber int) bool {
-	status, err := g.GhPrBaseStatus(prNumber)
+// while reviewing the pinned commit still produces findings the author can act
+// on.
+func updateReviewerPRIfBehind(g *git.Git, prNumber int, wantSHA string) bool {
+	// Measure the commit this round would actually review, not the current head
+	// — they differ whenever the author pushed after the request was dispatched.
+	status, err := g.GhPrBaseStatus(prNumber, wantSHA)
 	if err != nil {
 		style.PrintWarning("could not tell whether PR #%d is behind its base: %v — "+
-			"reviewing the head as-is", prNumber, err)
+			"reviewing the requested commit as-is", prNumber, err)
 		return false
 	}
 	if !status.Behind {
@@ -624,35 +636,18 @@ func updateReviewerPRIfBehind(g *git.Git, prNumber int) bool {
 	fmt.Printf("PR #%d is behind %s — updating the branch before the review starts\n",
 		prNumber, status.Base)
 	if err := g.GhPrUpdateBranch(prNumber); err != nil {
-		style.PrintWarning("could not update PR #%d against %s: %v — reviewing the head "+
-			"as-is; a branch that conflicts with its base needs the author to resolve it",
-			prNumber, status.Base, err)
+		style.PrintWarning("could not update PR #%d against %s: %v — reviewing the "+
+			"requested commit as-is; a branch that conflicts with its base needs the "+
+			"author to resolve it", prNumber, status.Base, err)
 		return false
 	}
-	if !waitForPRHeadToMove(g, prNumber, status.HeadSHA) {
-		style.PrintWarning("PR #%d's branch update has not landed after %s — reviewing "+
-			"whatever head is published now; re-run the checkout if the update lands later",
-			prNumber, prHeadMoveTimeout)
+	if _, landed := g.WaitForPRUpdate(prNumber, prUpdateTimeout, prUpdatePollWait); !landed {
+		style.PrintWarning("PR #%d's branch update has not landed after %s — reviewing the "+
+			"requested commit instead; re-run the checkout once the update appears",
+			prNumber, prUpdateTimeout)
+		return false
 	}
 	return true
-}
-
-// waitForPRHeadToMove polls the PR head until it differs from before, because
-// the update-branch API is asynchronous. Returns false on timeout.
-func waitForPRHeadToMove(g *git.Git, prNumber int, before string) bool {
-	deadline := time.Now().Add(prHeadMoveTimeout)
-	for {
-		head, err := g.GhPrHeadSHA(prNumber)
-		// A transient read failure is not evidence the update failed; keep
-		// polling until the deadline and let the caller report the timeout.
-		if err == nil && !strings.EqualFold(head, before) {
-			return true
-		}
-		if time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(prHeadMovePollWait)
-	}
 }
 
 // ensureReviewerCodegraphIndex synchronously (re)builds the codegraph index for

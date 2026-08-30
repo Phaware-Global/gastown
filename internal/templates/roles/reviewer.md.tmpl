@@ -32,7 +32,11 @@ loop act on them.
 **IMPORTANT**: Always work from `{{ .WorkDir }}`.
 
 Identity detection depends on your current working directory. This is a git
-worktree dedicated to review checkouts — it is **checkout-only**. You never push.
+worktree dedicated to review checkouts — it is **checkout-only**. You never push
+from it. The one write that reaches the remote is made for you by `{{ cmd }}
+reviewer checkout`: when the PR is behind its base, it lands GitHub's "Update
+branch" merge so the review runs against a mergeable tree. You never run a push
+yourself, and nothing else you do touches the author's branch.
 
 ## Theory of Operation: The Propulsion Principle
 
@@ -252,7 +256,10 @@ When the review is posted:
   limit on your verdict: your review — approval included — goes out only through
   `{{ cmd }} reviewer post`, which owns the tested output contract.
 - **Never** `gh pr merge`. You never merge.
-- **Never** `git push`. Your worktree is checkout-only.
+- **Never** `git push`, and never `gh pr update-branch` by hand. Your worktree is
+  checkout-only; the single remote write in the whole round is the base-into-head
+  update merge `{{ cmd }} reviewer checkout` performs when the PR is behind its
+  base.
 - **Never** `gt refinery pr *`. You don't drive the refinery.
 - **Never** resolve review threads — that belongs to the authoring polecat.
 

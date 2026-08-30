@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func initTestRepo(t *testing.T) string {
@@ -3501,7 +3502,7 @@ func TestGhPrBaseStatus_DetectsABehindHead(t *testing.T) {
 	g := NewGit(clone)
 
 	// Up to date: the head contains everything on the base.
-	status, err := g.GhPrBaseStatus(1)
+	status, err := g.GhPrBaseStatus(1, "")
 	if err != nil {
 		t.Fatalf("GhPrBaseStatus: %v", err)
 	}
@@ -3522,7 +3523,7 @@ func TestGhPrBaseStatus_DetectsABehindHead(t *testing.T) {
 	gitIn(t, remote, "add", ".")
 	gitIn(t, remote, "commit", "-m", "another PR merged to base")
 
-	status, err = g.GhPrBaseStatus(1)
+	status, err = g.GhPrBaseStatus(1, "")
 	if err != nil {
 		t.Fatalf("GhPrBaseStatus after the base moved: %v", err)
 	}
@@ -3537,7 +3538,7 @@ func TestGhPrBaseStatus_DetectsABehindHead(t *testing.T) {
 	gitIn(t, remote, "update-ref", "refs/pull/1/head", gitIn(t, remote, "rev-parse", "HEAD"))
 	gitIn(t, remote, "checkout", defaultBranch)
 
-	status, err = g.GhPrBaseStatus(1)
+	status, err = g.GhPrBaseStatus(1, "")
 	if err != nil {
 		t.Fatalf("GhPrBaseStatus after the update: %v", err)
 	}
@@ -3587,5 +3588,123 @@ func TestGhPrUpdateBranch_Validation(t *testing.T) {
 	}
 	if _, err := g.FetchPRHead(-1); err == nil {
 		t.Error("expected error for a non-positive PR number")
+	}
+}
+
+// A round reviews the commit it was dispatched for, not whatever the head has
+// become. Measuring the head would answer the wrong question in both
+// directions: skipping the update because a NEW head contains the base while
+// the pinned commit does not, or firing one because the new head is behind
+// while the pinned commit is not.
+func TestGhPrBaseStatus_MeasuresTheRequestedCommit(t *testing.T) {
+	remote := initTestRepo(t)
+	defaultBranch := gitIn(t, remote, "rev-parse", "--abbrev-ref", "HEAD")
+	ghBaseBranchStub(t, defaultBranch)
+
+	// The pinned commit, branched off the base tip.
+	gitIn(t, remote, "checkout", "-b", "pr-branch")
+	if err := os.WriteFile(filepath.Join(remote, "pr.txt"), []byte("pr\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, remote, "add", ".")
+	gitIn(t, remote, "commit", "-m", "pinned commit")
+	pinned := gitIn(t, remote, "rev-parse", "HEAD")
+
+	// The base moves on, so the pinned commit is now behind…
+	gitIn(t, remote, "checkout", defaultBranch)
+	if err := os.WriteFile(filepath.Join(remote, "merged.txt"), []byte("merged\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, remote, "add", ".")
+	gitIn(t, remote, "commit", "-m", "another PR merged to base")
+
+	// …and the author pushes a newer head that DOES contain the base tip.
+	gitIn(t, remote, "checkout", "pr-branch")
+	gitIn(t, remote, "merge", "--no-edit", defaultBranch)
+	newHead := gitIn(t, remote, "rev-parse", "HEAD")
+	gitIn(t, remote, "update-ref", "refs/pull/1/head", newHead)
+	gitIn(t, remote, "checkout", defaultBranch)
+
+	clone := t.TempDir()
+	gitIn(t, clone, "clone", remote, ".")
+	g := NewGit(clone)
+
+	// The head is up to date…
+	headStatus, err := g.GhPrBaseStatus(1, "")
+	if err != nil {
+		t.Fatalf("GhPrBaseStatus(head): %v", err)
+	}
+	if headStatus.Behind {
+		t.Errorf("the current head contains the base tip and must not be behind: %+v", headStatus)
+	}
+	// …but the commit this round would review is not, and that is the answer
+	// that decides whether the update runs.
+	pinnedStatus, err := g.GhPrBaseStatus(1, pinned)
+	if err != nil {
+		t.Fatalf("GhPrBaseStatus(pinned): %v", err)
+	}
+	if !pinnedStatus.Behind {
+		t.Errorf("the pinned commit is behind the base and must be reported as such: %+v", pinnedStatus)
+	}
+	if pinnedStatus.HeadSHA != pinned {
+		t.Errorf("HeadSHA = %s, want the measured commit %s", pinnedStatus.HeadSHA, pinned)
+	}
+}
+
+// A commit that no longer exists (a force-push orphaned it) must fail loudly
+// rather than silently falling back to measuring the head.
+func TestGhPrBaseStatus_UnresolvableCommitIsAnError(t *testing.T) {
+	remote := initTestRepo(t)
+	defaultBranch := gitIn(t, remote, "rev-parse", "--abbrev-ref", "HEAD")
+	ghBaseBranchStub(t, defaultBranch)
+	prHead := gitIn(t, remote, "rev-parse", "HEAD")
+	gitIn(t, remote, "update-ref", "refs/pull/1/head", prHead)
+
+	clone := t.TempDir()
+	gitIn(t, clone, "clone", remote, ".")
+
+	if _, err := NewGit(clone).GhPrBaseStatus(1, "0000000000000000000000000000000000000000"); err == nil {
+		t.Error("an unresolvable requested commit must be an error, not a silent fallback")
+	}
+}
+
+// The wait asks "is it still behind?" against the ref the checkout will use, so
+// an already-updated PR returns immediately and one that never updates times
+// out rather than reporting a phantom success.
+func TestWaitForPRUpdate_ConfirmsTheBaseIsContained(t *testing.T) {
+	remote := initTestRepo(t)
+	defaultBranch := gitIn(t, remote, "rev-parse", "--abbrev-ref", "HEAD")
+	ghBaseBranchStub(t, defaultBranch)
+
+	gitIn(t, remote, "checkout", "-b", "pr-branch")
+	if err := os.WriteFile(filepath.Join(remote, "pr.txt"), []byte("pr\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, remote, "add", ".")
+	gitIn(t, remote, "commit", "-m", "pr work")
+	gitIn(t, remote, "update-ref", "refs/pull/1/head", gitIn(t, remote, "rev-parse", "HEAD"))
+	gitIn(t, remote, "checkout", defaultBranch)
+
+	clone := t.TempDir()
+	gitIn(t, clone, "clone", remote, ".")
+	g := NewGit(clone)
+
+	if _, landed := g.WaitForPRUpdate(1, time.Second, 10*time.Millisecond); !landed {
+		t.Error("a head already containing the base must land immediately")
+	}
+
+	// The base moves on and nothing updates the PR: the wait must give up.
+	if err := os.WriteFile(filepath.Join(remote, "merged.txt"), []byte("merged\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, remote, "add", ".")
+	gitIn(t, remote, "commit", "-m", "base moves on")
+
+	start := time.Now()
+	if _, landed := g.WaitForPRUpdate(1, 150*time.Millisecond, 10*time.Millisecond); landed {
+		t.Error("a head that never gains the base must not report as landed")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("waited %s — the poll must be bounded by the timeout", elapsed)
 	}
 }

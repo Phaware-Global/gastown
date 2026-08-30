@@ -2,93 +2,163 @@ package cmd
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/git"
 )
 
-// ghHeadSHAStub installs a fake `gh` that answers the headRefOid query with
-// `before` for the first (calls-1) invocations and `after` from then on,
-// standing in for the delay between `gh pr update-branch` returning 202 and
-// GitHub publishing the merge commit.
-func ghHeadSHAStub(t *testing.T, before, after string, switchAfter int) {
+func gitIn(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// setupBehindPR builds a "GitHub": a remote whose refs/pull/1/head is a PR
+// branch, with the base branch one commit ahead of it — the behind state this
+// feature reacts to. Returns the remote and a clone standing in for the
+// reviewer worktree.
+func setupBehindPR(t *testing.T) (remote, clone, base string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("shell stub is POSIX-only")
 	}
+	remote = t.TempDir()
+	gitIn(t, remote, "init", "-q", ".")
+	gitIn(t, remote, "config", "user.email", "test@test.com")
+	gitIn(t, remote, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(remote, "README.md"), []byte("x\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, remote, "add", ".")
+	gitIn(t, remote, "commit", "-qm", "initial")
+	base = gitIn(t, remote, "rev-parse", "--abbrev-ref", "HEAD")
+
+	gitIn(t, remote, "checkout", "-qb", "pr-branch")
+	if err := os.WriteFile(filepath.Join(remote, "pr.txt"), []byte("pr\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, remote, "add", ".")
+	gitIn(t, remote, "commit", "-qm", "pr work")
+	gitIn(t, remote, "update-ref", "refs/pull/1/head", gitIn(t, remote, "rev-parse", "HEAD"))
+
+	// The base moves on: the PR head no longer contains it.
+	gitIn(t, remote, "checkout", "-q", base)
+	if err := os.WriteFile(filepath.Join(remote, "merged.txt"), []byte("merged\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, remote, "add", ".")
+	gitIn(t, remote, "commit", "-qm", "another PR merged to base")
+
+	clone = t.TempDir()
+	gitIn(t, clone, "clone", "-q", remote, ".")
+	return remote, clone, base
+}
+
+// ghUpdateBranchStub installs a fake `gh` that answers the base-branch query
+// and, when landUpdate is true, performs on the remote exactly what GitHub's
+// "Update branch" does: merge the base into the head branch and republish the
+// pull ref. With landUpdate false it exits 0 without changing anything — the
+// shape of an update that is accepted but never lands.
+func ghUpdateBranchStub(t *testing.T, remote, base string, landUpdate bool) {
+	t.Helper()
 	dir := t.TempDir()
-	counter := filepath.Join(dir, "calls")
-	script := "#!/bin/sh\n" +
-		"n=$(cat " + counter + " 2>/dev/null || echo 0)\n" +
-		"n=$((n+1)); echo $n > " + counter + "\n" +
-		"if [ \"$n\" -ge " + itoa(switchAfter) + " ]; then\n" +
-		"  echo '{\"headRefOid\":\"" + after + "\"}'\n" +
-		"else\n" +
-		"  echo '{\"headRefOid\":\"" + before + "\"}'\n" +
-		"fi\n"
+	land := ""
+	if landUpdate {
+		land = "git -C " + remote + " checkout -q pr-branch\n" +
+			"  git -C " + remote + " merge --no-edit -q " + base + "\n" +
+			"  git -C " + remote + " update-ref refs/pull/1/head \"$(git -C " + remote + " rev-parse HEAD)\"\n" +
+			"  git -C " + remote + " checkout -q " + base + "\n"
+	}
+	script := "#!/bin/sh\ncase \"$*\" in\n" +
+		"  *update-branch*)\n  " + land + "  exit 0 ;;\n" +
+		"  *baseRefName*) echo " + base + " ;;\n" +
+		"esac\n"
 	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(script), 0o700); err != nil { //nolint:gosec // test stub must be executable
 		t.Fatalf("write gh stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
-func itoa(n int) string {
-	if n <= 0 {
-		return "0"
-	}
-	var b []byte
-	for n > 0 {
-		b = append([]byte{byte('0' + n%10)}, b...)
-		n /= 10
-	}
-	return string(b)
-}
-
-func shortenHeadMoveWait(t *testing.T, timeout, poll time.Duration) {
+func shortenUpdateWait(t *testing.T) {
 	t.Helper()
-	origTimeout, origPoll := prHeadMoveTimeout, prHeadMovePollWait
-	prHeadMoveTimeout, prHeadMovePollWait = timeout, poll
-	t.Cleanup(func() { prHeadMoveTimeout, prHeadMovePollWait = origTimeout, origPoll })
+	origTimeout, origPoll := prUpdateTimeout, prUpdatePollWait
+	prUpdateTimeout, prUpdatePollWait = 300*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { prUpdateTimeout, prUpdatePollWait = origTimeout, origPoll })
 }
 
-// The update-branch REST call returns 202 Accepted — the merge commit is queued,
-// not published — so the head must be polled. Accepting the first answer would
-// check out the pre-update commit and review exactly the stale SHA the update
-// exists to avoid.
-func TestWaitForPRHeadToMove_PollsPastTheStaleAnswer(t *testing.T) {
-	shortenHeadMoveWait(t, 5*time.Second, time.Millisecond)
-	ghHeadSHAStub(t, "oldsha", "newsha", 3)
+// The happy path: a behind PR is updated, the update is confirmed against the
+// ref the checkout will read, and the caller is told to drop its pinned SHA.
+func TestUpdateReviewerPRIfBehind_ReportsAVerifiedUpdate(t *testing.T) {
+	remote, clone, base := setupBehindPR(t)
+	ghUpdateBranchStub(t, remote, base, true)
+	shortenUpdateWait(t)
 
-	if !waitForPRHeadToMove(git.NewGit(t.TempDir()), 1, "oldsha") {
-		t.Error("the head moved on the third poll; waitForPRHeadToMove should have seen it")
+	if !updateReviewerPRIfBehind(git.NewGit(clone), 1, "") {
+		t.Error("a behind PR whose update landed must report true")
 	}
 }
 
-// A head that never moves must time out rather than hang the review: the caller
-// warns and proceeds against whatever is published.
-func TestWaitForPRHeadToMove_TimesOutWhenTheHeadNeverMoves(t *testing.T) {
-	shortenHeadMoveWait(t, 150*time.Millisecond, time.Millisecond)
-	ghHeadSHAStub(t, "oldsha", "oldsha", 1)
+// An update that is accepted but never lands must NOT report success: the
+// return value discards the operator-pinned --sha, so a false positive
+// silently retargets the round at an unpinned, possibly still-behind head.
+func TestUpdateReviewerPRIfBehind_KeepsThePinWhenTheUpdateNeverLands(t *testing.T) {
+	remote, clone, base := setupBehindPR(t)
+	ghUpdateBranchStub(t, remote, base, false)
+	shortenUpdateWait(t)
 
-	start := time.Now()
-	if waitForPRHeadToMove(git.NewGit(t.TempDir()), 1, "oldsha") {
-		t.Error("an unmoved head must not report as updated")
-	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("waited %s — the poll must be bounded by the timeout", elapsed)
+	if updateReviewerPRIfBehind(git.NewGit(clone), 1, "") {
+		t.Error("an unconfirmed update must not report success — the pinned SHA would be dropped")
 	}
 }
 
-// The comparison is case-insensitive: gh and the API both return lowercase hex,
-// but a caller passing an upper-cased SHA must not read as "already moved".
-func TestWaitForPRHeadToMove_MatchesTheHeadCaseInsensitively(t *testing.T) {
-	shortenHeadMoveWait(t, 150*time.Millisecond, time.Millisecond)
-	ghHeadSHAStub(t, "abcdef", "abcdef", 1)
+// A PR already containing its base is left alone: no update, and the pinned
+// SHA survives.
+func TestUpdateReviewerPRIfBehind_NoOpWhenAlreadyUpToDate(t *testing.T) {
+	remote, clone, base := setupBehindPR(t)
+	// Bring the PR head up to date before asking.
+	gitIn(t, remote, "checkout", "-q", "pr-branch")
+	gitIn(t, remote, "merge", "--no-edit", "-q", base)
+	gitIn(t, remote, "update-ref", "refs/pull/1/head", gitIn(t, remote, "rev-parse", "HEAD"))
+	gitIn(t, remote, "checkout", "-q", base)
+	ghUpdateBranchStub(t, remote, base, true)
+	shortenUpdateWait(t)
 
-	if waitForPRHeadToMove(git.NewGit(t.TempDir()), 1, "ABCDEF") {
-		t.Error("the same SHA in a different case is not a moved head")
+	if updateReviewerPRIfBehind(git.NewGit(clone), 1, "") {
+		t.Error("an up-to-date PR must not be updated")
+	}
+}
+
+// The decision is made about the commit the round would review, not the head:
+// a pinned commit that is behind still triggers the update even when the head
+// has since moved past the base.
+func TestUpdateReviewerPRIfBehind_MeasuresThePinnedCommit(t *testing.T) {
+	remote, clone, base := setupBehindPR(t)
+	pinned := gitIn(t, remote, "rev-parse", "refs/pull/1/head")
+	// The author pushes a head that DOES contain the base…
+	gitIn(t, remote, "checkout", "-q", "pr-branch")
+	gitIn(t, remote, "merge", "--no-edit", "-q", base)
+	gitIn(t, remote, "update-ref", "refs/pull/1/head", gitIn(t, remote, "rev-parse", "HEAD"))
+	gitIn(t, remote, "checkout", "-q", base)
+	ghUpdateBranchStub(t, remote, base, true)
+	shortenUpdateWait(t)
+
+	g := git.NewGit(clone)
+	// …so measuring the head would skip the update…
+	if updateReviewerPRIfBehind(g, 1, "") {
+		t.Error("the current head contains the base; no update should be needed")
+	}
+	// …but the pinned commit this round reviews is still behind it.
+	if !updateReviewerPRIfBehind(g, 1, pinned) {
+		t.Error("a pinned commit behind its base must still trigger the update")
 	}
 }

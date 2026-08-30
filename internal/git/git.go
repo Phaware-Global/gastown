@@ -1988,13 +1988,21 @@ type PRBaseStatus struct {
 }
 
 // GhPrBaseStatus fetches the PR head and its base branch, then reports whether
-// the head is behind the base.
+// commit is behind the base. An empty commit measures the PR's current head.
+//
+// The commit parameter exists because the head and the reviewed commit are not
+// the same thing: a round pins the SHA it was dispatched for, and the author can
+// push past it between dispatch and checkout. Measuring the head would then
+// answer a question nobody asked — clearing the update because the NEW head
+// contains the base while the round still reviews a pinned commit that does
+// not, or firing one because the new head is behind while the pinned commit is
+// not.
 //
 // The comparison is a local ancestry check rather than GitHub's
 // mergeStateStatus, which reports BEHIND only when the repository requires
 // branches to be up to date before merging. Whether a review target is stale
 // does not depend on that setting, so the answer must not either.
-func (g *Git) GhPrBaseStatus(prNumber int) (PRBaseStatus, error) {
+func (g *Git) GhPrBaseStatus(prNumber int, commit string) (PRBaseStatus, error) {
 	base, err := g.GhPrBaseBranch(prNumber)
 	if err != nil {
 		return PRBaseStatus{}, err
@@ -2006,15 +2014,58 @@ func (g *Git) GhPrBaseStatus(prNumber int) (PRBaseStatus, error) {
 	if err != nil {
 		return PRBaseStatus{}, err
 	}
+	// The fetch above is what makes a pinned commit resolvable at all: it
+	// arrives with the pull ref's history. One that does not (a force-push that
+	// orphaned it) fails the rev-parse below rather than being silently
+	// measured as the head.
+	measured := head
+	if strings.TrimSpace(commit) != "" {
+		measured, err = g.Rev(commit)
+		if err != nil {
+			return PRBaseStatus{}, fmt.Errorf("resolving the requested commit %s of PR #%d: %w",
+				commit, prNumber, err)
+		}
+	}
 	baseRev, err := g.Rev("origin/" + base)
 	if err != nil {
 		return PRBaseStatus{}, fmt.Errorf("resolving origin/%s: %w", base, err)
 	}
-	upToDate, err := g.IsAncestor(baseRev, head)
+	upToDate, err := g.IsAncestor(baseRev, measured)
 	if err != nil {
-		return PRBaseStatus{}, fmt.Errorf("comparing PR #%d head against origin/%s: %w", prNumber, base, err)
+		return PRBaseStatus{}, fmt.Errorf("comparing PR #%d (%s) against origin/%s: %w",
+			prNumber, measured, base, err)
 	}
-	return PRBaseStatus{Base: base, HeadSHA: head, Behind: !upToDate}, nil
+	return PRBaseStatus{Base: base, HeadSHA: measured, Behind: !upToDate}, nil
+}
+
+// WaitForPRUpdate polls until the PR head contains its base branch, which is
+// what confirms an update-branch actually landed. Returns the final status and
+// whether it landed within the timeout.
+//
+// It re-reads the SAME ref the checkout will use — refs/pull/<n>/head, via
+// GhPrBaseStatus — rather than the head branch's OID from `gh pr view`. Those
+// are two different refs: either can move first, so a poll on one cannot
+// promise the other carries the merge. And it asks the question that actually
+// matters (is the head still behind?) rather than "did the SHA change", which
+// an unrelated author push in the same window answers yes to.
+func (g *Git) WaitForPRUpdate(prNumber int, timeout, poll time.Duration) (PRBaseStatus, bool) {
+	deadline := time.Now().Add(timeout)
+	var last PRBaseStatus
+	for {
+		status, err := g.GhPrBaseStatus(prNumber, "")
+		// A transient read failure is not evidence the update failed; keep
+		// polling until the deadline and let the caller report the timeout.
+		if err == nil {
+			last = status
+			if !status.Behind {
+				return status, true
+			}
+		}
+		if time.Now().After(deadline) {
+			return last, false
+		}
+		time.Sleep(poll)
+	}
 }
 
 // GhPrUpdateBranch merges the PR's base branch into its head branch — the
@@ -2045,7 +2096,11 @@ func (g *Git) GhPrUpdateBranch(prNumber int) error {
 // tree is detached at exactly that commit (the SHA the Reviewer was asked to
 // review); otherwise it detaches at the freshly fetched PR head. This is the
 // only sanctioned way the Reviewer touches git — it never creates a branch and
-// never pushes (P23-2376).
+// never force-pushes (P23-2376). It has exactly one write: when the head is
+// behind its base, GhPrUpdateBranch pushes the base-into-head merge GitHub's
+// "Update branch" produces, so the review runs against a mergeable tree. That
+// merge is the whole exception; the reviewer touches nothing else on the
+// remote.
 //
 // NOTE: the `pull/<n>/head` ref is GitHub-specific. v1 of the Reviewer role is
 // GitHub-only by design (see docs/design/reviewer-role.md Non-Goals; the
