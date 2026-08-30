@@ -78,6 +78,39 @@ findings you raise on the same line will be merged into a single thread. Raise
 one finding per defect, at the line where a fixer would edit — not the same
 defect restated from several angles.
 
+### 4a. Scope discipline — an improvement opportunity is not a finding
+If you see a better implementation, an architectural alternative, or a
+non-critical refactor that lies outside the diff's changed lines, do **not**
+raise it as a finding. Put it in the `opportunities` array of your result — one
+clause per entry, no markdown, at most **160** characters each (§6).
+
+That array is a section of the review summary, rendered under an
+**Opportunities** heading that says out loud that these are follow-up
+candidates. They reach the mayor, they may become beads, and they do **not**
+affect the verdict event or block the PR. Raise them there and the concern is
+recorded; raise them as findings and the PR is held up for work its own diff
+does not contain.
+
+A finding that anchors to a changed line but whose fix requires editing
+untouched files is out of scope by definition (§1 already enforces this). Do
+**not** reach for `disposition: request_changes` to force-block on it: that
+blocks the merge over work this PR does not contain, and creates no thread the
+fix loop can clear.
+
+The test is not "is this true?" — it is "must this diff change before it can
+merge?" If the answer is no, it is an opportunity, not a finding.
+
+### 4b. The coordinator is the gatekeeper
+Your pass is one input, not the review. The review coordinator consolidates
+every lens and is accountable for the posted review being on-topic, in-scope,
+and productive. It has the authority to **trim** anything from your pass that is
+out of scope, unproductive, or nitpicking — without consulting you.
+
+Write for that. The findings that get cut are the ones you cannot justify as
+"this diff must change", and a pass that pads its list makes the whole review
+cheaper to ignore. Surviving nits are not a merge blocker: a PR with nothing
+worse than nits is APPROVED, with those nits posted as threads to fix.
+
 ### 5. Time budget — return something, and say so in a way the code can read
 You have a soft budget of **{{ .MaxDuration }}** for this pass. Nothing enforces
 it from outside your session: if you never return, the whole review stalls with
@@ -155,6 +188,19 @@ the pass, and then the posted review's event is derived from your findings'
 severity (any high → REQUEST_CHANGES; medium, nits-only, or clean → APPROVE).
 Medium findings post as threads to fix; they do not withhold approval on their
 own, so reach for `high` only when the defect must block the merge.
+
+**Which disposition.** They are not interchangeable:
+- `request_changes` — you have an **unanswered concern that must be addressed
+  before this PR merges** and cannot anchor it to a diff line. That is a block,
+  and it is what `request_changes` is for. Do not soften such a concern to
+  `comment` because it feels unanchorable: an objection worth raising at all is
+  either something this PR must answer (`request_changes`) or an opportunity
+  (§4a), never a hedge in between.
+- `comment` — your pass is **incomplete** (§5): you ran out of budget and the
+  result must not read as a finished, clean review. It says "do not take this
+  APPROVE as an endorsement", not "I have reservations".
+
+Both are floors, never ceilings: neither can lower another lens's verdict.
 
 `remediation_paths` lists every file a fixer must edit to act on the finding.
 It is optional, and omitting it means the finding is judged on its anchor alone

@@ -144,9 +144,11 @@ var validDispositions = map[string]string{
 //	medium/low/none → APPROVE    (worth fixing, but not a merge gate)
 //
 // COMMENT is no longer derivable from severity. It remains reachable only as an
-// explicit Disposition — the escalation channel for a pass that has an
-// unanchorable concern, or that cut itself short (see the execution contract's
-// time budget) and must not read as a complete, clean pass.
+// explicit Disposition, and the contract narrows what it means: a pass that cut
+// itself short sets "comment" so a clean tally does not read as a finished
+// endorsement (see the execution contract's time budget). An unanchorable
+// concern that must be answered before the PR merges is not a comment — it is
+// "request_changes", because that is what "address this before merging" means.
 //
 // Medium findings used to derive COMMENT, which meant a PR carrying a few
 // medium nits was never approved and never blocked: it sat in a non-committal

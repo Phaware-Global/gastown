@@ -7,7 +7,9 @@ in the refinery's PR review loop. The Reviewer's GitHub review **disposition
 matches its findings** — a high-severity finding posts `REQUEST_CHANGES`, and a
 review whose findings are all medium or below posts `APPROVE` (the findings
 still post as threads to fix). `COMMENT` is reserved for an explicit
-`disposition` escalation. It **never merges**, and because it must not be the `pr_approver`
+`disposition` — a perspective reporting that its pass did not complete. A
+concern that must be addressed before the PR merges is `request_changes`, not
+`COMMENT`. It **never merges**, and because it must not be the `pr_approver`
 (see Security), its `APPROVE` is informational — human approval stays the merge
 gate.
 

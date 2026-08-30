@@ -115,6 +115,16 @@ Read the request bead/mail to extract `<pr>`, the recorded head `<sha>`, and the
    that finds nothing still returns a `verdict` ("no findings: …") — never
    silence.
 
+   **You are the gatekeeper.** The passes are inputs; the posted review is
+   yours, and you are accountable for it being on-topic, in-scope, and
+   productive. Before consolidating, trim from each `perspective-<name>.json`
+   any finding that is out of scope, unproductive, or nitpicking — you do not
+   need the pass's agreement, and the execution contract tells it to expect
+   this. Trim findings, never verdicts: every perspective still gets its line
+   in the summary, `Opportunities:` included. Remaining nits are not a reason
+   to withhold approval — a PR whose findings are all medium or below is
+   APPROVED, with the nits posted as threads to fix.
+
 6. **Consolidate** all per-perspective results into one findings payload. This
    deduplicates overlapping findings (same `file:line` and title) deterministically and
    builds a summary that accounts for every perspective's verdict:
@@ -165,9 +175,13 @@ is required even with zero findings:
 ```
 
 `disposition` is **optional and escalation-only**: `request_changes` or
-`comment`. Use it when a perspective must block on something it cannot anchor to
-a diff line — an architectural objection. Without it, such a pass returns zero
-findings and the review posts as APPROVE with "do not merge" as its body.
+`comment`. Use `request_changes` when a perspective must block on something it
+cannot anchor to a diff line — an architectural objection, or any unanswered
+concern that has to be addressed before this PR merges. Without it, such a pass
+returns zero findings and the review posts as APPROVE with "do not merge" as its
+body. `comment` means something narrower: the pass did not complete, so its
+clean tally must not read as an endorsement. A concern that must be answered is
+never a `comment`.
 
 Note what it does not do: a findings-free REQUEST_CHANGES blocks the in-town
 merge gate only when the rig runs the in-town Reviewer (`reviewer_local`) and
