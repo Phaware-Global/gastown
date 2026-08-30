@@ -148,7 +148,8 @@ is required even with zero findings:
 ```json
 {
   "perspective": "adversarial",
-  "verdict": "one-line verdict — required even with no findings",
+  "verdict": "one-line verdict — required even with no findings (max 200 chars)",
+  "opportunities": ["<optional; out-of-scope improvements, one clause each (max 160)>"],
   "disposition": "<optional; omit unless escalating — request_changes|comment>",
   "findings": [
     {
@@ -187,6 +188,20 @@ disposition across perspectives — one lens saying "block" is never averaged
 away). Priority is one of `high`, `medium`, `low`. You do not hand-author the
 consolidated payload — the command builds it, including a verdict line for
 **every** perspective.
+
+The summary follows a **fixed template**, rendered as GitHub markdown by the
+posting command: a derived **Blockers** section (the high findings, with
+`file:line`), the **Verdicts** section (one bullet per lens), an
+**Opportunities** section (the deduplicated `opportunities` entries), and a
+footer carrying the finding tally and the reviewed SHA. You do not write the
+markdown and are not charged for it — the budgets count authored text only:
+200 characters per verdict (900 across all perspectives), 160 per opportunity
+(500 across all entries), 1200 overall.
+
+`consolidate` enforces those budgets and **fails without writing** if the fold
+of verdicts overruns, naming what to trim. That is yours to fix: as gatekeeper
+you may shorten a pass's verdict or drop its weakest opportunities in
+`perspective-<name>.json`, then re-run consolidate.
 
 ## Completing Work
 

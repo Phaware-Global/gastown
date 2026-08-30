@@ -19,6 +19,15 @@ type PerspectiveResult struct {
 	Verdict string `json:"verdict"`
 	// Findings are this pass's individual findings. May be empty.
 	Findings []Finding `json:"findings"`
+	// Opportunities are improvements this pass noticed that the diff does not
+	// have to make — a better implementation, an architectural alternative, a
+	// refactor outside the changed lines. They exist so that a lens with
+	// something worth saying about code the PR does not touch has somewhere to
+	// say it OTHER than a finding: raised as findings, such observations block
+	// merges over work the PR does not contain (see the execution contract's
+	// scope discipline). They land in the review body as advisory bullets and
+	// never move the review event.
+	Opportunities []string `json:"opportunities,omitempty"`
 	// Disposition optionally escalates this pass's verdict beyond what its
 	// findings' severity implies: "request_changes" or "comment".
 	//
@@ -84,12 +93,22 @@ func ParsePerspectiveResult(data []byte) (*PerspectiveResult, error) {
 		return nil, fmt.Errorf("perspective result (%s): verdict is required "+
 			"(a perspective is never silent — say \"no findings\" explicitly)", r.Perspective)
 	}
-	// The verdict becomes one line in the consolidated summary; a newline would
-	// break the "one line per perspective" contract and the badge parser.
-	if strings.ContainsAny(r.Verdict, "\n\r") {
-		return nil, fmt.Errorf("perspective result (%s): verdict must be a single line (no newlines)", r.Perspective)
-	}
 	r.Verdict = strings.TrimSpace(r.Verdict)
+	// The verdict and the opportunities become this lens's contribution to the
+	// summary template, so they are validated against the template's budgets
+	// HERE, at the pass boundary, rather than only after consolidation. A pass
+	// that overruns learns it from its own result instead of from a rejected
+	// payload built out of every lens's output, where the offender is no longer
+	// obvious.
+	oneLens := ReviewSummary{
+		Verdicts:      []PerspectiveVerdict{{Perspective: r.Perspective, Verdict: r.Verdict}},
+		Opportunities: r.Opportunities,
+	}
+	if err := oneLens.Normalize(fmt.Sprintf("perspective result (%s)", r.Perspective)); err != nil {
+		return nil, err
+	}
+	r.Verdict = oneLens.Verdicts[0].Verdict
+	r.Opportunities = oneLens.Opportunities
 	// Escalation-only: a pass may raise its verdict above what its findings
 	// imply, never lower it. "approve" is rejected rather than ignored so the
 	// contract violation is visible instead of silently dropped.
@@ -201,10 +220,24 @@ func mergePerspectives(existing, add string) string {
 // Doing dedup here, in tested Go, keeps it deterministic rather than leaving it
 // to per-run reviewer judgment.
 func Consolidate(results []PerspectiveResult, reviewedSHA string, manifest DiffManifest) *Findings {
-	var sb strings.Builder
-	sb.WriteString("Per-perspective verdicts:\n")
+	summary := ReviewSummary{}
+	seenOpportunity := map[string]bool{}
 	for _, r := range results {
-		fmt.Fprintf(&sb, "- [%s] %s\n", r.Perspective, strings.TrimSpace(r.Verdict))
+		summary.Verdicts = append(summary.Verdicts, PerspectiveVerdict{
+			Perspective: r.Perspective,
+			Verdict:     strings.TrimSpace(r.Verdict),
+		})
+		// Dedup across lenses, case-insensitively: two perspectives noticing the
+		// same out-of-scope improvement is one follow-up, and printing it twice
+		// makes the section look like two.
+		for _, o := range r.Opportunities {
+			o = strings.TrimSpace(o)
+			if o == "" || seenOpportunity[strings.ToLower(o)] {
+				continue
+			}
+			seenOpportunity[strings.ToLower(o)] = true
+			summary.Opportunities = append(summary.Opportunities, o)
+		}
 	}
 
 	type dedupKey struct {
@@ -298,7 +331,7 @@ func Consolidate(results []PerspectiveResult, reviewedSHA string, manifest DiffM
 	}
 
 	return &Findings{
-		Summary:     strings.TrimRight(sb.String(), "\n"),
+		Summary:     summary,
 		ReviewedSHA: reviewedSHA,
 		Findings:    out,
 		Disposition: disposition,

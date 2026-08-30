@@ -113,6 +113,7 @@ Return **exactly one** JSON object and no prose before or after it:
 {
   "perspective": "{{ .Perspective }}",
   "verdict": "one-line verdict for this perspective — REQUIRED even with zero findings (e.g. \"no findings: error paths all guarded\")",
+  "opportunities": ["<optional; out-of-scope improvements, one clause each — see §4a>"],
   "disposition": "<omit if you completed the pass; REQUIRED if truncated (§5) — request_changes|comment>",
   "findings": [
     {
@@ -132,6 +133,20 @@ Return **exactly one** JSON object and no prose before or after it:
 `priority` is one of `high`, `medium`, `low`. `findings` may be empty, but
 `verdict` must never be empty — a perspective is never silent. Every finding's
 `perspective` field must be `{{ .Perspective }}`.
+
+**Your verdict and opportunities are the review summary.** They are not prose
+that lands somewhere; consolidation renders them into a fixed template — a
+Verdicts section with one bullet per lens, an Opportunities section, a derived
+Blockers section, and a footer — so write them as the single lines they will be
+displayed as. Formatting is not your job and costs you nothing: headings,
+bullets, bold, and the lens label are added for you, and none of them count
+against your budget. What counts is what you wrote, in characters:
+
+- `verdict` — **200**, one line, no newlines
+- each `opportunities` entry — **160**, one clause, no newlines
+
+Over-budget results are rejected and you will re-emit them, so write within the
+budget the first time. Do not add your own markdown to these fields.
 
 **`disposition` is escalation-only** — `request_changes` or `comment`. It is
 optional in general but **REQUIRED if you cut the pass short** (§5): a truncated

@@ -24,7 +24,7 @@ func TestParseFindings_ApproveDispositionIsRejectedOutright(t *testing.T) {
 		`[{"path":"a.go","line":1,"priority":"low","title":"t","body":"b"}]`,
 		`[]`,
 	} {
-		payload := `{"summary":"s","disposition":"approve","findings":` + findings + `}`
+		payload := `{"summary":` + okSummary + `,"disposition":"approve","findings":` + findings + `}`
 		_, err := ParseFindings([]byte(payload))
 		if err == nil {
 			t.Errorf("approve disposition must be rejected regardless of severity (findings=%s)", findings)
@@ -38,7 +38,7 @@ func TestParseFindings_ApproveDispositionIsRejectedOutright(t *testing.T) {
 
 func TestParseFindings_ApproveRejectedEvenWithOddCasing(t *testing.T) {
 	// The lookup lowercases and trims, so a casing variant must not slip past.
-	payload := `{"summary":"s","disposition":"  ApPrOvE  ","findings":[]}`
+	payload := `{"summary":` + okSummary + `,"disposition":"  ApPrOvE  ","findings":[]}`
 	if _, err := ParseFindings([]byte(payload)); err == nil {
 		t.Error("a case/space variant of approve must be rejected too")
 	}
@@ -51,7 +51,7 @@ func TestReviewEvent_CommentDispositionCannotSuppressAHighFinding(t *testing.T) 
 	// it did — no injection, no bad actor, just a perf lens following the
 	// documented contract.
 	fs := &Findings{
-		Summary:     "s",
+		Summary:     summaryOf("s"),
 		Disposition: "comment",
 		Findings:    []Finding{{Path: "a.go", Line: 1, Priority: "high", Title: "t"}},
 	}
@@ -65,7 +65,7 @@ func TestParseFindings_CommentWithHighIsAcceptedAndStillBlocks(t *testing.T) {
 	// comment+high is a LEGITIMATE payload (one lens escalating its own clean
 	// tally while another found something high), so it must parse — and the
 	// floor must resolve it to the blocking event.
-	payload := `{"summary":"s","disposition":"comment","findings":[
+	payload := `{"summary":` + okSummary + `,"disposition":"comment","findings":[
 	  {"path":"a.go","line":1,"priority":"high","title":"t","body":"b"}]}`
 	fs, err := ParseFindings([]byte(payload))
 	if err != nil {
@@ -102,7 +102,7 @@ func TestReviewEvent_DispositionIsAFloorNeverACeiling(t *testing.T) {
 		{"request_changes", high, "REQUEST_CHANGES"},
 	}
 	for _, tc := range cases {
-		fs := &Findings{Summary: "s", Disposition: tc.disposition, Findings: tc.findings}
+		fs := &Findings{Summary: summaryOf("s"), Disposition: tc.disposition, Findings: tc.findings}
 		if got := fs.ReviewEvent(); got != tc.want {
 			t.Errorf("disposition=%q findings=%v: ReviewEvent = %q, want %q",
 				tc.disposition, prioritiesOf(tc.findings), got, tc.want)
@@ -120,7 +120,7 @@ func prioritiesOf(fs []Finding) []string {
 
 func TestReviewEvent_EscalationOverridesCleanTally(t *testing.T) {
 	// The whole point: zero findings would derive APPROVE, but the pass blocked.
-	fs := &Findings{Summary: "BLOCK: architectural", Disposition: "request_changes"}
+	fs := &Findings{Summary: summaryOf("BLOCK: architectural"), Disposition: "request_changes"}
 	if ev := fs.ReviewEvent(); ev != "REQUEST_CHANGES" {
 		t.Errorf("ReviewEvent = %q, want REQUEST_CHANGES — an unanchorable block must be expressible", ev)
 	}
@@ -352,7 +352,7 @@ func TestDispositionError_SteersTheRepairAwayFromAFalseBlock(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "omit") {
 		t.Errorf("ParsePerspectiveResult must surface the recovery guidance: %v", err)
 	}
-	if _, err := ParseFindings([]byte(`{"summary":"s","disposition":"bogus","findings":[]}`)); err == nil {
+	if _, err := ParseFindings([]byte(`{"summary":` + okSummary + `,"disposition":"bogus","findings":[]}`)); err == nil {
 		t.Error("ParseFindings must reject an invalid disposition")
 	} else if !strings.Contains(err.Error(), "omit") {
 		t.Errorf("ParseFindings must surface the recovery guidance: %v", err)

@@ -112,10 +112,22 @@ rejected, since an approving disposition can only be a no-op or a
 de-escalation. This is why a "comment" from one perspective can never suppress
 another perspective's high finding.
 
-The findings file (--findings, or "-" for stdin) is a JSON object:
+The findings file (--findings, or "-" for stdin) is a JSON object. "summary"
+follows a fixed template — one verdict line per perspective plus any
+out-of-scope opportunities — which is rendered into GitHub markdown here, with
+a derived Blockers section and a findings/SHA footer. Markdown, labels, and the
+derived sections cost the author nothing; the budgets below count only authored
+text, in characters:
+
+  verdict      200 each, 900 across all perspectives
+  opportunity  160 each, 500 across all entries
+  summary     1200 overall
 
   {
-    "summary": "per-perspective verdicts + counts",
+    "summary": {
+      "verdicts": [{"perspective": "adversarial", "verdict": "one line"}],
+      "opportunities": ["<optional; out-of-scope follow-up candidates>"]
+    },
     "reviewed_sha": "<optional; --sha overrides>",
     "disposition": "<optional; request_changes|comment — escalation only>",
     "findings": [
@@ -773,6 +785,17 @@ func runReviewerConsolidate(cmd *cobra.Command, args []string) error {
 	// Stderr specifically: stdout carries the JSON payload.
 	event := fs.ReviewEvent()
 	fmt.Fprintf(os.Stderr, "Consolidated findings (%d) — will post as %s\n", len(fs.Findings), event)
+	// The summary template is budget-enforced at parse time, which is inside
+	// `post`. Enforce it HERE too, at the last reversible step: in the
+	// sanctioned `consolidate | post --findings -` pipe an over-budget fold of
+	// verdicts would otherwise surface only as a rejected post, after the
+	// round's results have left the pipe. Failing here writes nothing and the
+	// error names what to trim — which the coordinator has the authority to do
+	// to the per-perspective results before re-consolidating.
+	if err := fs.Summary.Normalize("consolidated summary"); err != nil {
+		return fmt.Errorf("%w\n\nTrim the offending perspective result(s) and re-run consolidate; "+
+			"nothing was written", err)
+	}
 	// Only call it an escalation when the disposition actually RAISED the event.
 	// A disposition that merely agrees with the severity tally, or one the floor
 	// absorbed, changes nothing — naming it as the cause of a block would send

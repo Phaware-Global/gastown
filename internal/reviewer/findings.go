@@ -64,9 +64,12 @@ type Finding struct {
 
 // Findings is the full payload `gt reviewer post --findings <json>` consumes.
 type Findings struct {
-	// Summary is the per-perspective verdict + counts block that becomes the
-	// review's top-level body. Required: the role contract forbids silence.
-	Summary string `json:"summary"`
+	// Summary is the structured review body: one verdict line per perspective
+	// plus any out-of-scope opportunities. Required, and it follows a template —
+	// see ReviewSummary, which also owns the content budgets and the markdown
+	// rendering. The role contract forbids silence, so every perspective that
+	// ran has a line here.
+	Summary ReviewSummary `json:"summary"`
 	// ReviewedSHA, when set, is appended to the summary so humans can see which
 	// commit was reviewed even if upstream HEAD has since moved.
 	ReviewedSHA string `json:"reviewed_sha,omitempty"`
@@ -232,8 +235,8 @@ func ParseFindings(data []byte) (*Findings, error) {
 	if err := decodeStrictJSON(data, &fs); err != nil {
 		return nil, fmt.Errorf("parsing findings JSON: %w", err)
 	}
-	if strings.TrimSpace(fs.Summary) == "" {
-		return nil, fmt.Errorf("findings.summary is required (the review must never be silent)")
+	if err := fs.Summary.Normalize("findings.summary"); err != nil {
+		return nil, err
 	}
 	fs.Disposition = strings.ToLower(strings.TrimSpace(fs.Disposition))
 	if fs.Disposition != "" {
@@ -368,34 +371,73 @@ func (fs *Findings) BuildComments() []refinery.ReviewComment {
 	return out
 }
 
-// SummaryBody returns the review's top-level body: the agent-authored summary,
-// a priority count line, and the reviewed SHA (preferring reviewedSHA, then the
-// payload's ReviewedSHA). The count line gives humans and the refinery an
-// at-a-glance severity tally without re-parsing every thread.
+// SummaryBody renders the review's top-level body from the template, as
+// GitHub-flavored markdown, in a fixed section order:
+//
+//	### Blockers        — derived: the findings that hold the merge
+//	### Verdicts        — authored: one line per perspective
+//	### Opportunities   — authored: out-of-scope follow-up candidates
+//	footer              — derived: the priority tally and the reviewed SHA
+//
+// Blockers leads because it answers the question a reader opens the review
+// with. It is derived from the findings rather than written, so it cannot
+// disagree with the threads or cost the author budget, and it is omitted
+// entirely when nothing blocks — the absence IS the "nothing blocks" signal.
+//
+// The reviewed SHA prefers reviewedSHA, then the payload's ReviewedSHA, so a
+// human can see which commit was reviewed even if upstream HEAD has moved.
 func (fs *Findings) SummaryBody(reviewedSHA string) string {
 	var b strings.Builder
-	b.WriteString(strings.TrimRight(fs.Summary, "\n"))
-	b.WriteString("\n\n")
+	if blockers := fs.blockers(); len(blockers) > 0 {
+		b.WriteString("### Blockers\n\n")
+		for _, f := range blockers {
+			fmt.Fprintf(&b, "- `%s:%d` — %s", f.Path, f.Line, f.Title)
+			if f.Perspective != "" {
+				fmt.Fprintf(&b, " [%s]", f.Perspective)
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+	fs.Summary.render(&b)
+	b.WriteString("\n---\n\n")
 	b.WriteString(fs.countLine())
 	sha := reviewedSHA
 	if sha == "" {
 		sha = fs.ReviewedSHA
 	}
 	if sha != "" {
-		fmt.Fprintf(&b, "\nReviewed SHA: %s", sha)
+		fmt.Fprintf(&b, " · **Reviewed SHA:** `%s`", sha)
 	}
 	return b.String()
 }
 
+// blockers returns the findings that actually hold the merge: high priority and
+// inside the diff. Out-of-scope findings are excluded for the same reason
+// severityEvent skips them — a PR must not be reported as blocked on work its
+// own diff does not contain (Consolidate has already demoted them anyway).
+func (fs *Findings) blockers() []Finding {
+	var out []Finding
+	for _, f := range fs.Findings {
+		if f.Scope == ScopeOut {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(f.Priority), "high") {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
 // countLine summarizes finding counts by priority, e.g.
-// "Findings: 3 (high: 1, medium: 1, low: 1)".
+// "**Findings:** 3 (high: 1, medium: 1, low: 1)".
 func (fs *Findings) countLine() string {
 	counts := map[string]int{}
 	for _, f := range fs.Findings {
 		counts[f.Priority]++
 	}
 	if len(fs.Findings) == 0 {
-		return "Findings: 0 — no findings."
+		return "**Findings:** 0 — no findings."
 	}
 	parts := make([]string, 0, 3)
 	for _, p := range []string{"high", "medium", "low"} {
@@ -403,7 +445,7 @@ func (fs *Findings) countLine() string {
 			parts = append(parts, fmt.Sprintf("%s: %d", p, counts[p]))
 		}
 	}
-	return fmt.Sprintf("Findings: %d (%s)", len(fs.Findings), strings.Join(parts, ", "))
+	return fmt.Sprintf("**Findings:** %d (%s)", len(fs.Findings), strings.Join(parts, ", "))
 }
 
 // BuildReviewInput assembles the full SubmitReview payload from parsed findings.

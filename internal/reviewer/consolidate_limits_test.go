@@ -162,7 +162,7 @@ func TestNormalizeFinding_BudgetCountsRunes(t *testing.T) {
 
 func TestParseFindings_RejectsOverBudgetPayload(t *testing.T) {
 	payload, err := json.Marshal(Findings{
-		Summary: "s",
+		Summary: summaryOf("s"),
 		Findings: []Finding{{
 			Path: "a.ts", Line: 1, Priority: "high", Title: "t",
 			Body: strings.Repeat("x", MaxBodyLen+50),
