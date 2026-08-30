@@ -2033,7 +2033,7 @@ func isSessionProcessDead(t *tmux.Tmux, sessionName string, townRoot string) boo
 		return false
 	}
 
-	pidStr, err := t.GetPanePID(sessionName)
+	pidStr, err := panePID(t, sessionName)
 	if err != nil {
 		// Tmux query failed — could be permission denied, server busy, etc.
 		// Don't assume dead; let a future cycle retry.
@@ -2048,15 +2048,25 @@ func isSessionProcessDead(t *tmux.Tmux, sessionName string, townRoot string) boo
 		// Got a non-numeric PID — shouldn't happen, but don't kill.
 		return false
 	}
+	return !pidAlive(pid)
+}
+
+// panePID and pidAlive are the two probe steps, as package-level vars so tests
+// can drive BOTH directions of this function's contract. The kill direction —
+// an existing-and-stale heartbeat over a dead pane must still reap — is the one
+// that calls KillSessionWithProcesses, so leaving it unpinned would let a
+// hardwired `return false` ship green.
+var panePID = func(t *tmux.Tmux, session string) (string, error) {
+	return t.GetPanePID(session)
+}
+
+var pidAlive = func(pid int) bool {
 	p, err := os.FindProcess(pid)
 	if err != nil {
-		return true
+		return false
 	}
-	// On Unix, Signal(0) checks if process exists without sending a signal
-	if err := p.Signal(syscall.Signal(0)); err != nil {
-		return true
-	}
-	return false
+	// On Unix, Signal(0) checks if a process exists without sending a signal.
+	return p.Signal(syscall.Signal(0)) == nil
 }
 
 // pendingMaxAge is how long a .pending reservation marker may exist before
