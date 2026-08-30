@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -279,6 +280,9 @@ func TestTelegraph_StopIsIdempotent(t *testing.T) {
 // path: a stale handle pointing at a live, unrelated process (simulating PID
 // reuse / a lingering zombie) must not mask a PID-file-recorded death.
 func TestTelegraph_StaleProcessHandleDoesNotMaskDeath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("`true` helper is unix-only")
+	}
 	cfg := &TelegraphServerConfig{
 		Enabled:             true,
 		AutoRestart:         true,
@@ -292,7 +296,9 @@ func TestTelegraph_StaleProcessHandleDoesNotMaskDeath(t *testing.T) {
 		t.Fatalf("failed to create pid dir: %v", err)
 	}
 
-	// The PID file records a Telegraph process that has already exited.
+	// The PID file records a Telegraph process that has already exited. Its
+	// PID is reaped but not reserved, so this test depends on the OS not
+	// recycling it within the test window.
 	deadCmd := exec.Command("true")
 	if err := deadCmd.Run(); err != nil {
 		t.Fatalf("failed to run helper process: %v", err)
@@ -316,6 +322,90 @@ func TestTelegraph_StaleProcessHandleDoesNotMaskDeath(t *testing.T) {
 
 	if got := atomic.LoadInt32(&starts); got != 1 {
 		t.Fatalf("expected EnsureRunning to restart Telegraph after the PID-file-recorded process died, got %d starts", got)
+	}
+}
+
+// TestTelegraph_MissingPIDFileFallsBackToLiveHandle is a regression test:
+// startLocked treats a failed writePIDFile as a non-fatal warning, so the
+// file can be missing even though the process this manager started is
+// alive. isRunning must not treat that as death — doing so would spawn a
+// duplicate Telegraph on every health-check tick.
+func TestTelegraph_MissingPIDFileFallsBackToLiveHandle(t *testing.T) {
+	cfg := &TelegraphServerConfig{
+		Enabled:             true,
+		AutoRestart:         true,
+		RestartDelay:        0,
+		MaxRestartsInWindow: 5,
+		RestartWindow:       time.Minute,
+	}
+	m := newTestTelegraphManager(t, cfg)
+	if err := os.MkdirAll(filepath.Dir(m.pidFile()), 0755); err != nil {
+		t.Fatalf("failed to create pid dir: %v", err)
+	}
+
+	// No PID file was ever written, but this manager holds a live handle for
+	// a process it started itself.
+	m.process = &os.Process{Pid: os.Getpid()}
+	m.startedAt = time.Now()
+
+	var starts int32
+	m.startFn = func() error {
+		atomic.AddInt32(&starts, 1)
+		return nil
+	}
+
+	m.EnsureRunning()
+
+	if got := atomic.LoadInt32(&starts); got != 0 {
+		t.Fatalf("expected EnsureRunning not to restart a live self-started Telegraph over a missing PID file, got %d starts", got)
+	}
+	if _, err := os.Stat(m.pidFile()); err != nil {
+		t.Fatalf("expected isRunning to repair the missing PID file, stat failed: %v", err)
+	}
+}
+
+// TestTelegraph_ReapedSelfStartedHandleOverridesRecycledPID is a regression
+// test: once a self-started child has been reaped, this manager's own
+// handle for it reports death authoritatively. A fresh PID-file probe alone
+// can't be trusted to override that, because the OS may have already
+// recycled the PID number to an unrelated process by the next health check.
+func TestTelegraph_ReapedSelfStartedHandleOverridesRecycledPID(t *testing.T) {
+	cfg := &TelegraphServerConfig{
+		Enabled:             true,
+		AutoRestart:         true,
+		RestartDelay:        0,
+		MaxRestartsInWindow: 5,
+		RestartWindow:       time.Minute,
+	}
+	m := newTestTelegraphManager(t, cfg)
+	if err := os.MkdirAll(filepath.Dir(m.pidFile()), 0755); err != nil {
+		t.Fatalf("failed to create pid dir: %v", err)
+	}
+
+	// The reaped handle for the process this manager started itself.
+	deadCmd := exec.Command("true")
+	if err := deadCmd.Run(); err != nil {
+		t.Fatalf("failed to run helper process: %v", err)
+	}
+	m.process = deadCmd.Process
+
+	// The PID file still names that same PID as if it were alive — modeling
+	// the OS having recycled it to this (unrelated, still-running) test
+	// process before the health check ran.
+	if _, err := writePIDFile(m.pidFile(), deadCmd.Process.Pid); err != nil {
+		t.Fatalf("failed to write pid file: %v", err)
+	}
+
+	var starts int32
+	m.startFn = func() error {
+		atomic.AddInt32(&starts, 1)
+		return nil
+	}
+
+	m.EnsureRunning()
+
+	if got := atomic.LoadInt32(&starts); got != 1 {
+		t.Fatalf("expected EnsureRunning to restart Telegraph when its own reaped handle reports death, got %d starts", got)
 	}
 }
 
