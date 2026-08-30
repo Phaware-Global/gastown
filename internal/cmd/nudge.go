@@ -312,6 +312,15 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		if !errors.Is(derr, tmux.ErrNudgeStranded) {
 			return derr
 		}
+		if errors.Is(derr, tmux.ErrNudgeStrandNotCleared) {
+			// The clear failed, so the typed text is still in the agent's input
+			// box and its deferred auto-submit will deliver it. Queueing a second
+			// copy would run the same instruction twice — for an operational
+			// directive sent with --mode=immediate (stop, merge, re-dispatch)
+			// that is a double execution the sender cannot see. Surface the
+			// strand instead of silently duplicating it.
+			return derr
+		}
 		// The text was typed but the agent slipped busy before Enter submitted
 		// it. ClearOnStrand removed the orphaned copy under the delivery lock;
 		// degrade to the queue rather than dropping the message (gt-zlfq).

@@ -1,6 +1,7 @@
 package polecat
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -1051,5 +1052,98 @@ func TestDecideStartupNudgeAction_OnlyConfirmedDeliveryStopsTheQueue(t *testing.
 				}
 			}
 		}
+	}
+}
+
+// TestStartupNudgeDeliveryAccounting pins the rules that decide whether the
+// startup prompt still owes a delivery after verifyStartupNudgeDelivery's loop.
+//
+// Every loss in this area came from deriving that answer from a pane probe
+// instead of from what the code had actually done: a probe taken right after our
+// own ClearOnStrand reads as "busy with an empty box" — indistinguishable from a
+// successful delivery — so the queue was skipped and the prompt was gone. The
+// mirror error is queueing when a delivery is still live, which submits the work
+// prompt twice and can start the bead twice.
+func TestStartupNudgeDeliveryAccounting(t *testing.T) {
+	// owedAfter models the loop's bookkeeping for one send outcome.
+	owedAfter := func(owedBefore bool, sendErr error) bool {
+		if sendErr == nil {
+			return false // submitted and verified
+		}
+		if errors.Is(sendErr, tmux.ErrNudgeStranded) {
+			// A clear that failed leaves the text in the box, where the agent's
+			// deferred auto-submit is still a live delivery path.
+			return !errors.Is(sendErr, tmux.ErrNudgeStrandNotCleared)
+		}
+		return owedBefore // terminal error: whatever an earlier clear did stands
+	}
+
+	stranded := fmt.Errorf("wrapped: %w", tmux.ErrNudgeStranded)
+	strandedNotCleared := fmt.Errorf("%w: %w", tmux.ErrNudgeStranded, tmux.ErrNudgeStrandNotCleared)
+	lockTimeout := errors.New("nudge lock timeout for session")
+
+	tests := []struct {
+		name       string
+		owedBefore bool
+		sendErr    error
+		want       bool
+	}{
+		{
+			name:       "successful send clears the debt",
+			owedBefore: true, sendErr: nil, want: false,
+		},
+		{
+			// The regression this whole PR exists for: typed, cleared, not sent.
+			name:       "strand with a successful clear owes a delivery",
+			owedBefore: false, sendErr: stranded, want: true,
+		},
+		{
+			// The mirror error: the text survives, so queueing duplicates it.
+			name:       "strand whose clear failed owes nothing",
+			owedBefore: true, sendErr: strandedNotCleared, want: false,
+		},
+		{
+			// A lock timeout gives up BEFORE typing, so it neither creates nor
+			// discharges a debt — an earlier clear's debt must survive it. This
+			// is the path that broke through a `break` while the probe-based
+			// check reported delivered.
+			name:       "terminal error preserves an earlier debt",
+			owedBefore: true, sendErr: lockTimeout, want: true,
+		},
+		{
+			name:       "terminal error creates no debt on its own",
+			owedBefore: false, sendErr: lockTimeout, want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := owedAfter(tt.owedBefore, tt.sendErr); got != tt.want {
+				t.Errorf("owedAfter(owed=%v, err=%v) = %v, want %v", tt.owedBefore, tt.sendErr, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestVerifyWillRedeliver guards the precondition for clearing the input box:
+// ClearOnStrand may only be set when a re-delivery actually follows.
+//
+// SendStartupNudge is set for ANY hookless agent, but verifyStartupNudgeDelivery
+// returns immediately for a runtime with no ReadyPromptPrefix (it cannot tell
+// "idle at prompt" from "busy"). Presets such as auggie and amp are exactly that
+// shape, so clearing for them would wipe the work prompt with nothing to re-send
+// it — strictly worse than leaving stranded text the agent would auto-submit.
+func TestVerifyWillRedeliver(t *testing.T) {
+	if verifyWillRedeliver(nil) {
+		t.Error("a nil runtime config cannot re-deliver")
+	}
+	if verifyWillRedeliver(&config.RuntimeConfig{}) {
+		t.Error("a runtime with no tmux config cannot re-deliver")
+	}
+	if verifyWillRedeliver(&config.RuntimeConfig{Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: ""}}) {
+		t.Error("a runtime with no ReadyPromptPrefix cannot re-deliver, so the box must not be cleared")
+	}
+	if !verifyWillRedeliver(&config.RuntimeConfig{Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "❯ "}}) {
+		t.Error("a prompt-capable runtime does re-deliver, so clearing is safe")
 	}
 }
