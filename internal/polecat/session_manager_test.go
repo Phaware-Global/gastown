@@ -1,6 +1,7 @@
 package polecat
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -583,7 +584,7 @@ func TestVerifyStartupNudgeDelivery_IdleAgent(t *testing.T) {
 	// plus overhead = ~60s. Use 90s for safety.
 	done := make(chan struct{})
 	go func() {
-		m.verifyStartupNudgeDelivery(sessionName, rc, "check your hook")
+		m.verifyStartupNudgeDelivery(sessionName, rc, "check your hook", false)
 		close(done)
 	}()
 
@@ -604,7 +605,7 @@ func TestVerifyStartupNudgeDelivery_NilConfig(t *testing.T) {
 	m := NewSessionManager(tmux.NewTmux(), r)
 
 	// Should return immediately without error for nil config
-	m.verifyStartupNudgeDelivery("nonexistent-session", nil, "")
+	m.verifyStartupNudgeDelivery("nonexistent-session", nil, "", false)
 
 	// And for config without prompt prefix
 	rc := &config.RuntimeConfig{
@@ -613,7 +614,7 @@ func TestVerifyStartupNudgeDelivery_NilConfig(t *testing.T) {
 			ReadyDelayMs:      1000,
 		},
 	}
-	m.verifyStartupNudgeDelivery("nonexistent-session", rc, "")
+	m.verifyStartupNudgeDelivery("nonexistent-session", rc, "", false)
 }
 
 func TestPromptlessFallbackIncludesPrimeAndWorkInstructions(t *testing.T) {
@@ -642,9 +643,9 @@ func TestPromptlessFallbackIncludesPrimeAndWorkInstructions(t *testing.T) {
 // not auto-submitted; the condition triggers verifyStartupNudgeDelivery as a safety net.
 func TestModeABeaconVerificationCondition(t *testing.T) {
 	tests := []struct {
-		name            string
-		rc              *config.RuntimeConfig
-		wantModeA       bool // !SendBeaconNudge && !SendStartupNudge
+		name      string
+		rc        *config.RuntimeConfig
+		wantModeA bool // !SendBeaconNudge && !SendStartupNudge
 	}{
 		{
 			name: "Claude hook+prompt agent triggers Mode A verification",
@@ -732,7 +733,7 @@ func TestModeAStartupVerifyIsNonBlocking(t *testing.T) {
 
 	launchStart := time.Now()
 	go func() {
-		m.verifyStartupNudgeDelivery(sessionName, rc, "[GAS TOWN] test ← witness / Run `gt prime --hook`")
+		m.verifyStartupNudgeDelivery(sessionName, rc, "[GAS TOWN] test ← witness / Run `gt prime --hook`", false)
 		close(goroutineDone)
 	}()
 	callerReturned <- time.Since(launchStart)
@@ -895,11 +896,11 @@ func TestParseFreshBranchName_Rejects(t *testing.T) {
 		"master",
 		"develop",
 		"feature/x",
-		"polecat/",          // empty tail
-		"polecat/alpha",     // no ts or issue
-		"polecat/alpha-",    // trailing dash, no ts
-		"polecat//gt-abc@1", // empty polecat name
-		"polecat/alpha/@1",  // empty issue
+		"polecat/",              // empty tail
+		"polecat/alpha",         // no ts or issue
+		"polecat/alpha-",        // trailing dash, no ts
+		"polecat//gt-abc@1",     // empty polecat name
+		"polecat/alpha/@1",      // empty issue
 		"polecat/alpha/gt-abc@", // empty ts
 		"",
 	}
@@ -964,5 +965,314 @@ func TestShouldCreateFreshSessionBranch_Structural(t *testing.T) {
 					c.currentBranch, c.issue, c.canonicalBranch, got, c.want)
 			}
 		})
+	}
+}
+
+// TestDecideStartupNudgeAction pins the startup-nudge delivery policy.
+//
+// Both directions of error are costly. Trusting a busy agent as proof of
+// delivery skips the retry in exactly the strand case the retry exists for, so
+// the polecat never receives its work prompt, sits idle, and is reaped with its
+// bead reassigned (gt-azm0). Re-sending on a live delivery submits the startup
+// prompt twice and can start the bead twice.
+func TestDecideStartupNudgeAction(t *testing.T) {
+	tests := []struct {
+		name       string
+		stranded   bool
+		busy       bool
+		boxCleared bool
+		want       startupNudgeAction
+	}{
+		{
+			// We cleared our own text, so the empty box is our doing — not
+			// evidence the agent got anything. This is the case the old
+			// busy+cleared gate misread as success.
+			name:     "our own strand always re-delivers, even though the box looks clean",
+			stranded: true, busy: true, boxCleared: true,
+			want: startupNudgeDeliver,
+		},
+		{
+			name:     "our own strand re-delivers when idle too",
+			stranded: true, busy: false, boxCleared: true,
+			want: startupNudgeDeliver,
+		},
+		{
+			name:     "idle with an empty box means the prompt was lost",
+			stranded: false, busy: false, boxCleared: true,
+			want: startupNudgeDeliver,
+		},
+		{
+			name:     "idle holding text means it was never submitted",
+			stranded: false, busy: false, boxCleared: false,
+			want: startupNudgeDeliver,
+		},
+		{
+			name:     "busy with an empty box is a confirmed delivery",
+			stranded: false, busy: true, boxCleared: true,
+			want: startupNudgeDone,
+		},
+		{
+			// Unattributable: our own send can leave text without reporting a
+			// strand, and it may equally be another sender's in-flight nudge.
+			// Typing over it would fuse two instructions; claiming delivery
+			// would abandon our prompt.
+			name:     "busy holding text is inconclusive",
+			stranded: false, busy: true, boxCleared: false,
+			want: startupNudgeWait,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := decideStartupNudgeAction(tt.stranded, tt.busy, tt.boxCleared); got != tt.want {
+				t.Errorf("decideStartupNudgeAction(stranded=%v, busy=%v, boxCleared=%v) = %v, want %v",
+					tt.stranded, tt.busy, tt.boxCleared, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDecideStartupNudgeAction_OnlyConfirmedDeliveryStopsTheQueue is the
+// gt-zlfq exhaustion guarantee: verifyStartupNudgeDelivery skips its queue
+// fallback on exactly one verdict, so every other state must keep the prompt
+// recoverable. The previous gate ("!InputBoxCleared || IsIdle") returned false
+// after a final strand — box cleared, agent busy — and silently lost it.
+func TestDecideStartupNudgeAction_OnlyConfirmedDeliveryStopsTheQueue(t *testing.T) {
+	for _, stranded := range []bool{true, false} {
+		for _, busy := range []bool{true, false} {
+			for _, cleared := range []bool{true, false} {
+				got := decideStartupNudgeAction(stranded, busy, cleared)
+				confirmed := !stranded && busy && cleared
+				if confirmed && got != startupNudgeDone {
+					t.Errorf("busy+cleared+unstranded must be Done, got %v", got)
+				}
+				if !confirmed && got == startupNudgeDone {
+					t.Errorf("stranded=%v busy=%v cleared=%v must not report Done — the prompt would be dropped unqueued",
+						stranded, busy, cleared)
+				}
+			}
+		}
+	}
+}
+
+// TestStartupNudgeDeliveryAccounting exercises owedAfterSend — the function the
+// loop actually calls — rather than a local model of it. An earlier version of
+// this test re-implemented the rule as a closure and asserted that, so it passed
+// for any production code at all and the duplicate-delivery bug it was supposed
+// to cover was invisible to it.
+//
+// "Owed" means the prompt was typed and something cleared it, so unless a later
+// send succeeds the agent has no work instructions. Dropping a debt strands the
+// polecat until it is reaped (gt-azm0); inventing one queues a second copy of a
+// prompt that is still going to arrive, which can start the bead twice.
+func TestStartupNudgeDeliveryAccounting(t *testing.T) {
+	stranded := fmt.Errorf("wrapped: %w", tmux.ErrNudgeStranded)
+	strandedNotCleared := fmt.Errorf("%w: %w", tmux.ErrNudgeStranded, tmux.ErrNudgeStrandNotCleared)
+	lockTimeout := errors.New("nudge lock timeout for session")
+
+	tests := []struct {
+		name          string
+		owedBefore    bool
+		sendErr       error
+		want          bool
+		wantRedeliver bool
+	}{
+		{
+			name:       "successful send clears the debt",
+			owedBefore: true, sendErr: nil, want: false, wantRedeliver: false,
+		},
+		{
+			// The regression this PR exists for: typed, cleared, not sent.
+			name:       "strand with a successful clear owes a delivery and forces a resend",
+			owedBefore: false, sendErr: stranded, want: true, wantRedeliver: true,
+		},
+		{
+			// The mirror error: the text survives in the box, so the agent's
+			// deferred auto-submit still delivers it and queueing duplicates.
+			// The text survives in a live box, so deferred auto-submit still
+			// delivers it: nothing owed AND no forced resend. Computing these
+			// two separately is what submitted the prompt twice.
+			name:       "strand whose clear failed owes nothing and must not force a resend",
+			owedBefore: true, sendErr: strandedNotCleared, want: false, wantRedeliver: false,
+		},
+		{
+			// A lock timeout gives up BEFORE typing, so it neither creates nor
+			// discharges a debt — an earlier clear's debt must survive it.
+			name:       "terminal error preserves an earlier debt without forcing a resend",
+			owedBefore: true, sendErr: lockTimeout, want: true, wantRedeliver: false,
+		},
+		{
+			name:       "terminal error creates no debt on its own",
+			owedBefore: false, sendErr: lockTimeout, want: false, wantRedeliver: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			owed, redeliver := strandOutcome(tt.owedBefore, tt.sendErr)
+			if owed != tt.want {
+				t.Errorf("strandOutcome(owed=%v, err=%v) owed = %v, want %v", tt.owedBefore, tt.sendErr, owed, tt.want)
+			}
+			if redeliver != tt.wantRedeliver {
+				t.Errorf("strandOutcome(owed=%v, err=%v) forceRedeliver = %v, want %v", tt.owedBefore, tt.sendErr, redeliver, tt.wantRedeliver)
+			}
+			if redeliver && !owed {
+				t.Error("forcing a re-delivery while owing nothing means the prompt is already arriving — that resend is a duplicate")
+			}
+		})
+	}
+}
+
+// TestVerifyWillRedeliver guards the precondition for clearing the input box:
+// ClearOnStrand may only be set when a re-delivery actually follows.
+//
+// SendStartupNudge is set for ANY hookless agent, but verifyStartupNudgeDelivery
+// returns immediately for a runtime with no ReadyPromptPrefix (it cannot tell
+// "idle at prompt" from "busy"). Presets such as auggie and amp are exactly that
+// shape, so clearing for them would wipe the work prompt with nothing to re-send
+// it — strictly worse than leaving stranded text the agent would auto-submit.
+func TestVerifyWillRedeliver(t *testing.T) {
+	if verifyWillRedeliver(nil) {
+		t.Error("a nil runtime config cannot re-deliver")
+	}
+	if verifyWillRedeliver(&config.RuntimeConfig{}) {
+		t.Error("a runtime with no tmux config cannot re-deliver")
+	}
+	if verifyWillRedeliver(&config.RuntimeConfig{Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: ""}}) {
+		t.Error("a runtime with no ReadyPromptPrefix cannot re-deliver, so the box must not be cleared")
+	}
+	if !verifyWillRedeliver(&config.RuntimeConfig{Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "❯ "}}) {
+		t.Error("a prompt-capable runtime does re-deliver, so clearing is safe")
+	}
+}
+
+// fakeStartupTmux drives verifyStartupNudgeDelivery's retry loop.
+type fakeStartupTmux struct {
+	idle        bool
+	boxCleared  bool
+	sendErrs    []error // one per NudgeSessionWithOpts call, last repeats
+	sendCalls   int
+	sentContent []string
+}
+
+func (f *fakeStartupTmux) HasSession(string) (bool, error) { return true, nil }
+func (f *fakeStartupTmux) IsIdle(string) bool              { return f.idle }
+func (f *fakeStartupTmux) InputBoxCleared(string) bool     { return f.boxCleared }
+func (f *fakeStartupTmux) NudgeSessionWithOpts(_, message string, _ tmux.NudgeOpts) error {
+	f.sentContent = append(f.sentContent, message)
+	i := f.sendCalls
+	f.sendCalls++
+	if i >= len(f.sendErrs) {
+		i = len(f.sendErrs) - 1
+	}
+	if i < 0 {
+		return nil
+	}
+	return f.sendErrs[i]
+}
+
+// TestVerifyStartupNudgeDelivery_DoesNotResendWhenTheClearFailed drives the real
+// retry loop, not the pure helper it calls.
+//
+// Every duplicate-delivery and lost-prompt defect in this area has lived in the
+// loop's control flow while the rules it evaluates were correct, so a test on
+// the helper alone let the wiring be reverted and still ship green. This asserts
+// the behavior at the call site: when a strand's clear FAILED, the prompt is
+// still in a live input box and the agent's deferred auto-submit will deliver
+// it, so the loop must NOT re-type it — that second copy is what starts the bead
+// twice.
+func TestVerifyStartupNudgeDelivery_DoesNotResendWhenTheClearFailed(t *testing.T) {
+	_, rigPath := newFastVerifyTown(t)
+
+	notCleared := fmt.Errorf("%w: %w", tmux.ErrNudgeStranded, tmux.ErrNudgeStrandNotCleared)
+	fake := &fakeStartupTmux{
+		idle:       false, // busy: the condition that strands text
+		boxCleared: false, // and its box still holds the prompt
+		sendErrs:   []error{notCleared},
+	}
+
+	m := &SessionManager{
+		rig:         &rig.Rig{Name: "testrig", Path: rigPath},
+		verifyTmux:  fake,
+		startPoller: func(_, _ string) (int, error) { return 0, nil },
+	}
+
+	rc := &config.RuntimeConfig{Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "❯ "}}
+	m.verifyStartupNudgeDelivery("gt-testrig-probe", rc, "startup work prompt", true /* stranded */)
+
+	// The first attempt is forced because Start's ClearOnStrand emptied the box.
+	// Its send comes back NotCleared, so the text is live again and no further
+	// send may happen.
+	if fake.sendCalls > 1 {
+		t.Errorf("loop sent %d times after a failed clear; the surviving copy plus a resend delivers the prompt twice", fake.sendCalls)
+	}
+}
+
+// newFastVerifyTown builds a town whose startup-nudge verify delay is
+// negligible, so loop tests cost milliseconds instead of the 25s default per
+// attempt.
+func newFastVerifyTown(t *testing.T) (townRoot, rigPath string) {
+	t.Helper()
+	townRoot = t.TempDir()
+	rigPath = filepath.Join(townRoot, "testrig")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settingsDir := filepath.Join(townRoot, "settings")
+	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := `{"operational":{"session":{"startup_nudge_verify_delay":"1ms","startup_nudge_max_retries":2}}}`
+	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return townRoot, rigPath
+}
+
+// TestVerifyStartupNudgeDelivery_QueuesWhenDeliveryIsUnconfirmed holds the LOSS
+// direction of the loop's contract, which the duplicate test does not reach.
+//
+// The queue is the only thing standing between an unconfirmed delivery and a
+// polecat that never receives its work prompt — it sits idle, is reaped, and its
+// bead is reassigned (gt-azm0). Without this, deleting the queue call entirely
+// left the suite green.
+func TestVerifyStartupNudgeDelivery_QueuesWhenDeliveryIsUnconfirmed(t *testing.T) {
+	townRoot, rigPath := newFastVerifyTown(t)
+
+	// A terminal, non-strand error: NudgeSessionWithOpts gave up before typing
+	// (a nudge-lock timeout), while Start's ClearOnStrand had already emptied the
+	// box — so the prompt is gone and a delivery is still owed.
+	fake := &fakeStartupTmux{
+		idle:       false,
+		boxCleared: true,
+		sendErrs:   []error{errors.New("nudge lock timeout for session")},
+	}
+	// Stub the drain. nudge.StartPoller re-executes os.Executable() detached,
+	// which inside a test is the TEST binary — the real call spawns an
+	// unattended copy of this whole suite (PPID 1, no -short, no -timeout,
+	// driving Docker/Dolt containers) that outlives the run.
+	var pollerStarted bool
+	m := &SessionManager{
+		rig:        &rig.Rig{Name: "testrig", Path: rigPath},
+		verifyTmux: fake,
+		startPoller: func(_, _ string) (int, error) {
+			pollerStarted = true
+			return 0, nil
+		},
+	}
+
+	rc := &config.RuntimeConfig{Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "❯ "}}
+	m.verifyStartupNudgeDelivery("gt-testrig-probe", rc, "startup work prompt", true /* stranded */)
+
+	// Queueing without a drain is not a delivery: a polecat has no poller of its
+	// own and the UserPromptSubmit hook needs input it will never receive.
+	if !pollerStarted {
+		t.Error("queued the prompt but started no drain; nothing would deliver it")
+	}
+
+	queueDir := filepath.Join(townRoot, ".runtime", "nudge_queue", "gt-testrig-probe")
+	entries, err := os.ReadDir(queueDir)
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("the prompt was cleared and never delivered, so it must be queued; found no queue entry under %s (err=%v)", queueDir, err)
 	}
 }
