@@ -1412,18 +1412,21 @@ func DefaultBase() *HooksConfig {
 			// executes any backtick or $(...) inside that text before
 			// bd/gt ever sees it (gt-h38j: two `bd update --append-notes`
 			// calls with a backticked phrase each spawned a ~14h runaway
-			// scan and lost the note). The guard itself decides whether
-			// the specific command/flag combination is relevant; these
-			// two matchers just get bd/gt invocations to it.
+			// scan and lost the note).
+			//
+			// A single catch-all "Bash" matcher, not "Bash(bd *)" /
+			// "Bash(gt *)": Claude Code's glob matching does not cross
+			// newlines, so a multi-line command (agent-authored notes
+			// routinely are) slips past a prefix-anchored matcher, and
+			// a prefix matcher never fires when bd/gt isn't the first
+			// word (e.g. "cd /x && bd update ..."). The guard's own
+			// invokesBdOrGt scans every token of the command for bd/gt
+			// regardless of position, so the matcher must deliver every
+			// Bash call and let the guard decide relevance — the same
+			// fix pr-workflow's guard applied for the identical reason
+			// (see tap_guard.go's runTapGuardPRWorkflow comment).
 			{
-				Matcher: "Bash(bd *)",
-				Hooks: []Hook{{
-					Type:    "command",
-					Command: gtCommand("gt tap guard command-substitution"),
-				}},
-			},
-			{
-				Matcher: "Bash(gt *)",
+				Matcher: "Bash",
 				Hooks: []Hook{{
 					Type:    "command",
 					Command: gtCommand("gt tap guard command-substitution"),
