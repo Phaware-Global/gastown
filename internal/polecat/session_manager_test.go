@@ -1192,8 +1192,9 @@ func TestVerifyStartupNudgeDelivery_DoesNotResendWhenTheClearFailed(t *testing.T
 	}
 
 	m := &SessionManager{
-		rig:        &rig.Rig{Name: "testrig", Path: rigPath},
-		verifyTmux: fake,
+		rig:         &rig.Rig{Name: "testrig", Path: rigPath},
+		verifyTmux:  fake,
+		startPoller: func(_, _ string) (int, error) { return 0, nil },
 	}
 
 	rc := &config.RuntimeConfig{Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "❯ "}}
@@ -1246,13 +1247,28 @@ func TestVerifyStartupNudgeDelivery_QueuesWhenDeliveryIsUnconfirmed(t *testing.T
 		boxCleared: true,
 		sendErrs:   []error{errors.New("nudge lock timeout for session")},
 	}
+	// Stub the drain. nudge.StartPoller re-executes os.Executable() detached,
+	// which inside a test is the TEST binary — the real call spawns an
+	// unattended copy of this whole suite (PPID 1, no -short, no -timeout,
+	// driving Docker/Dolt containers) that outlives the run.
+	var pollerStarted bool
 	m := &SessionManager{
 		rig:        &rig.Rig{Name: "testrig", Path: rigPath},
 		verifyTmux: fake,
+		startPoller: func(_, _ string) (int, error) {
+			pollerStarted = true
+			return 0, nil
+		},
 	}
 
 	rc := &config.RuntimeConfig{Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "❯ "}}
 	m.verifyStartupNudgeDelivery("gt-testrig-probe", rc, "startup work prompt", true /* stranded */)
+
+	// Queueing without a drain is not a delivery: a polecat has no poller of its
+	// own and the UserPromptSubmit hook needs input it will never receive.
+	if !pollerStarted {
+		t.Error("queued the prompt but started no drain; nothing would deliver it")
+	}
 
 	queueDir := filepath.Join(townRoot, ".runtime", "nudge_queue", "gt-testrig-probe")
 	entries, err := os.ReadDir(queueDir)
