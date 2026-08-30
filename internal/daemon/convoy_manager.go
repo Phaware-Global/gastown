@@ -41,6 +41,16 @@ const (
 	// a 10s pool ReadTimeout).
 	eventPollSeedWindow = 24 * time.Hour
 
+	// maxSeedPollFailures bounds how many consecutive seed-poll failures a
+	// store tolerates before giving up on backfilling its warm-up window and
+	// seeding at "now" instead. Without this, a store whose eventPollSeedWindow
+	// volume alone exceeds the pool ReadTimeout (the gt-lurb symptom) retries
+	// the same unservable query forever and its close detection never comes
+	// online. Losing that store's pre-daemon-start backlog is the same
+	// trade-off eventPollSeedWindow already makes; giving up only trades away
+	// permanent unavailability for it.
+	maxSeedPollFailures = 5
+
 	// convoyGracePeriod is how long after creation a convoy is immune from
 	// auto-close. This prevents a race where the daemon's stranded scan
 	// fires before the sling's bd dep add is visible in Dolt. See GH#2303.
@@ -134,6 +144,21 @@ type ConvoyManager struct {
 	// been handled. This allows the 1s overlap window above without replaying
 	// the same lifecycle events on every poll.
 	processedLifecycleEvents sync.Map // map[string]bool
+
+	// seedFailures tracks, per store, consecutive seed-poll failures (a seed
+	// poll is one with no high-water mark yet, i.e. the store has never had a
+	// successful poll). Reset to zero on any successful poll. See
+	// maxSeedPollFailures.
+	seedFailures sync.Map // map[string]int
+
+	// startedAt is when this ConvoyManager was constructed. It floors what a
+	// store's warm-up (seed) cycle may discard: events created before
+	// startedAt are pre-existing history and are safe to skip, but events
+	// created at or after startedAt happened while the daemon was already up
+	// and must not be silently dropped just because this store's own first
+	// poll cycle came late (e.g. it was hitting the seed query timeout while
+	// other stores seeded quickly). See gt-lurb.
+	startedAt time.Time
 }
 
 // NewConvoyManager creates a new convoy manager.
@@ -162,6 +187,7 @@ func NewConvoyManager(townRoot string, logger func(format string, args ...interf
 		openStores:   openStores,
 		isRigParked:  isRigParked,
 		gtPath:       gtPath,
+		startedAt:    time.Now().UTC(),
 	}
 }
 
@@ -328,10 +354,39 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 			// Advance the high-water mark to now so future polls skip past the
 			// bad row entirely. Events before now are missed, but the stranded
 			// convoy scanner will catch any completions that were lost.
+			// Mark the store seeded here too: advancing the HWM to now IS a seed
+			// (the store now has a high-water mark, same as a successful seed
+			// poll), so the *next* successful poll must take the normal
+			// processing path rather than re-entering warm-up and discarding a
+			// fresh interval of events.
 			now := time.Now().UTC()
 			m.lastEventIDs.Store(name, now)
+			m.seededStores.Store(name, true)
+			m.seedFailures.Delete(name)
 			m.logger("Convoy: event poll (%s): +Inf/NaN row detected, advancing HWM to %s to skip corrupt data", name, now.Format(time.RFC3339))
 			return nil
+		}
+		if isSeedPoll {
+			failCount := 1
+			if v, ok := m.seedFailures.Load(name); ok {
+				failCount = v.(int) + 1
+			}
+			m.seedFailures.Store(name, failCount)
+			if failCount >= maxSeedPollFailures {
+				// This store's seed poll has failed too many times in a row —
+				// most likely its eventPollSeedWindow volume alone still exceeds
+				// the pool ReadTimeout. Retrying the same unservable query
+				// forever would leave this store's close detection dark
+				// indefinitely (the stranded scan is the only remaining
+				// backstop). Give up on backfilling and seed at "now" instead,
+				// the same escape the +Inf/NaN branch above already takes.
+				now := time.Now().UTC()
+				m.lastEventIDs.Store(name, now)
+				m.seededStores.Store(name, true)
+				m.seedFailures.Delete(name)
+				m.logger("Convoy: event poll (%s): seed poll failed %d consecutive times, giving up on backfill and seeding at %s", name, failCount, now.Format(time.RFC3339))
+				return nil
+			}
 		}
 		m.logger("Convoy: event poll error (%s): %v", name, err)
 		// Signal recovery mode so the stranded scan shortens its interval and
@@ -339,6 +394,7 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 		m.recoveryMode.Store(true)
 		return err
 	}
+	m.seedFailures.Delete(name)
 
 	// Advance high-water mark from all events
 	for _, e := range events {
@@ -348,15 +404,25 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 	}
 	m.lastEventIDs.Store(name, highWater)
 
-	// This store's first successful poll cycle is warm-up only: advance
-	// marks, skip processing. This prevents replaying the entire event
-	// history on daemon restart. Tracked per store (not globally) so a store
-	// that is still failing its seed poll (e.g. a large store hitting the
-	// query timeout) gets its own warm-up cycle once it finally succeeds,
-	// instead of being treated as already-seeded because other stores
-	// succeeded first.
+	// This store's first successful poll cycle is warm-up: pre-existing
+	// history (events created before the daemon itself started) is discarded
+	// rather than processed, preventing a replay storm on restart. Tracked
+	// per store (not globally) so a store that is still failing its seed poll
+	// (e.g. a large store hitting the query timeout) gets its own warm-up
+	// cycle once it finally succeeds, instead of being treated as
+	// already-seeded because other stores succeeded first.
+	//
+	// Events created at or after startedAt are NOT discarded here — they
+	// happened while the daemon was already up, so a store that seeds late
+	// (this same warm-up cycle, just delayed) must still process them
+	// normally below rather than losing them permanently. Without this floor,
+	// a store whose seed poll keeps timing out drops its entire outage
+	// backlog, including FireCrossRigDepNotifications for closes that
+	// happened after startup.
 	if _, alreadySeeded := m.seededStores.Load(name); !alreadySeeded {
-		for _, e := range events {
+		var preExisting []*beadsdk.Event
+		events, preExisting = partitionByStartedAt(events, m.startedAt)
+		for _, e := range preExisting {
 			if e.ID == "" {
 				continue
 			}
@@ -365,7 +431,8 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 			}
 		}
 		m.seededStores.Store(name, true)
-		return nil
+		// Fall through: any events at/after startedAt are processed normally
+		// below, same as a store that was already seeded.
 	}
 
 	// Use hq store for convoy lookups (convoys are hq-* prefixed)
@@ -443,6 +510,20 @@ func isInfNaNError(err error) bool {
 		strings.Contains(msg, "'-Inf' is not a valid value") ||
 		strings.Contains(msg, "NaN is not a valid value") ||
 		strings.Contains(msg, "'NaN' is not a valid value")
+}
+
+// partitionByStartedAt splits events into those created at or after cutoff
+// (returned first, for normal processing) and those created before it
+// (returned second, pre-existing history to discard during warm-up).
+func partitionByStartedAt(events []*beadsdk.Event, cutoff time.Time) (atOrAfter, before []*beadsdk.Event) {
+	for _, e := range events {
+		if e.CreatedAt.Before(cutoff) {
+			before = append(before, e)
+		} else {
+			atOrAfter = append(atOrAfter, e)
+		}
+	}
+	return atOrAfter, before
 }
 
 func isCloseEvent(e *beadsdk.Event) bool {
