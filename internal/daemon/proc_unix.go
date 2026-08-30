@@ -16,11 +16,6 @@ func setSysProcAttr(cmd *exec.Cmd) {
 	}
 }
 
-// isProcessAlive checks if a process is still running.
-func isProcessAlive(p *os.Process) bool {
-	return p.Signal(syscall.Signal(0)) == nil
-}
-
 // sendTermSignal sends SIGTERM for graceful shutdown.
 func sendTermSignal(p *os.Process) error {
 	return p.Signal(syscall.SIGTERM)
