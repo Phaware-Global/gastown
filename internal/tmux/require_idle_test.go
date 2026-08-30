@@ -195,9 +195,20 @@ func TestSendEnterVerified_UnverifiableIsAlsoAStrand(t *testing.T) {
 func TestSendEnterVerified_SendFailureIsAlsoAStrand(t *testing.T) {
 	tm := newTestTmux(t)
 
-	err := tm.sendEnterVerified("gt-no-such-session-"+fmt.Sprint(busyPaneSeq.Add(1)), DefaultReadyPromptPrefix)
+	// Target a nonexistent WINDOW inside a session we own, rather than a
+	// nonexistent session name. Both make send-keys fail, but a bare session
+	// name can implicitly start a tmux server, and this package's binding tests
+	// read global bind-key state off the shared server — so a test that leaves a
+	// server behind perturbs them.
+	session := fmt.Sprintf("gt-test-sendfail-%d-%d", time.Now().UnixNano(), busyPaneSeq.Add(1))
+	if err := tm.NewSession(session, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSession(session) })
+
+	err := tm.sendEnterVerified(session+":99", DefaultReadyPromptPrefix)
 	if err == nil {
-		t.Fatal("sending Enter to a nonexistent target must fail")
+		t.Fatal("sending Enter to a nonexistent window must fail")
 	}
 	if !errors.Is(err, ErrNudgeStranded) {
 		t.Errorf("sendEnterVerified with a failing send-keys = %v, want it to unwrap to ErrNudgeStranded", err)
