@@ -272,8 +272,8 @@ func TestTelegraph_StopIsIdempotent(t *testing.T) {
 
 // TestTelegraph_StaleProcessHandleDoesNotMaskDeath is a regression test for a
 // silent-outage bug: isRunning() used to trust a cached m.process handle's raw
-// liveness signal without re-validating it against the nonce-protected PID
-// file. In production, a Telegraph process adopted via PID file (not started
+// liveness signal without re-validating it against the PID file. In
+// production, a Telegraph process adopted via PID file (not started
 // by this manager instance) died mid-run, but the health check kept believing
 // it was alive indefinitely — an 8+ minute silent webhook-ingress outage until
 // a manual daemon restart. This exercises the real (non-mocked) isRunning()
@@ -346,6 +346,7 @@ func TestTelegraph_MissingPIDFileFallsBackToLiveHandle(t *testing.T) {
 	// No PID file was ever written, but this manager holds a live handle for
 	// a process it started itself.
 	m.process = &os.Process{Pid: os.Getpid()}
+	m.selfStarted = true
 	m.startedAt = time.Now()
 
 	var starts int32
@@ -369,6 +370,11 @@ func TestTelegraph_MissingPIDFileFallsBackToLiveHandle(t *testing.T) {
 // handle for it reports death authoritatively. A fresh PID-file probe alone
 // can't be trusted to override that, because the OS may have already
 // recycled the PID number to an unrelated process by the next health check.
+//
+// aliveFn stands in for the platform liveness probe so the reaped-handle
+// branch is exercised deterministically: a real liveness probe on the PID
+// below (the test process itself) would report it alive, masking the branch
+// under test the same way it does in production on Windows (see reapedPID).
 func TestTelegraph_ReapedSelfStartedHandleOverridesRecycledPID(t *testing.T) {
 	cfg := &TelegraphServerConfig{
 		Enabled:             true,
@@ -382,17 +388,16 @@ func TestTelegraph_ReapedSelfStartedHandleOverridesRecycledPID(t *testing.T) {
 		t.Fatalf("failed to create pid dir: %v", err)
 	}
 
-	// The reaped handle for the process this manager started itself.
-	deadCmd := exec.Command("true")
-	if err := deadCmd.Run(); err != nil {
-		t.Fatalf("failed to run helper process: %v", err)
-	}
-	m.process = deadCmd.Process
+	// A self-started handle whose process has already been reaped.
+	pid := os.Getpid()
+	m.process = &os.Process{Pid: pid}
+	m.selfStarted = true
+	m.aliveFn = func(*os.Process) bool { return false }
 
 	// The PID file still names that same PID as if it were alive — modeling
-	// the OS having recycled it to this (unrelated, still-running) test
-	// process before the health check ran.
-	if _, err := writePIDFile(m.pidFile(), deadCmd.Process.Pid); err != nil {
+	// the OS having recycled it to an unrelated, still-running process
+	// before the health check ran.
+	if _, err := writePIDFile(m.pidFile(), pid); err != nil {
 		t.Fatalf("failed to write pid file: %v", err)
 	}
 
@@ -406,6 +411,9 @@ func TestTelegraph_ReapedSelfStartedHandleOverridesRecycledPID(t *testing.T) {
 
 	if got := atomic.LoadInt32(&starts); got != 1 {
 		t.Fatalf("expected EnsureRunning to restart Telegraph when its own reaped handle reports death, got %d starts", got)
+	}
+	if _, err := os.Stat(m.pidFile()); !os.IsNotExist(err) {
+		t.Fatalf("expected isRunning to remove the PID file for the reaped handle, stat err=%v", err)
 	}
 }
 
