@@ -151,6 +151,14 @@ type ConvoyManager struct {
 	// maxSeedPollFailures.
 	seedFailures sync.Map // map[string]int
 
+	// everSucceeded tracks, per store, whether that store has ever completed a
+	// successful poll. Unlike lastEventIDs' hasHW check, this is NOT set by the
+	// give-up path (maxSeedPollFailures) below, so a store that gives up and
+	// then keeps failing its now-normal-shaped polls still counts failures and
+	// can give up again — seeding progressively closer to "now" each time —
+	// instead of the give-up escape being usable only once per store.
+	everSucceeded sync.Map // map[string]bool
+
 	// startedAt is when this ConvoyManager was constructed. It floors what a
 	// store's warm-up (seed) cycle may discard: events created before
 	// startedAt are pre-existing history and are safe to skip, but events
@@ -370,10 +378,11 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 			m.lastEventIDs.Store(name, now)
 			m.seededStores.Store(name, true)
 			m.seedFailures.Delete(name)
+			m.everSucceeded.Store(name, true)
 			m.logger("Convoy: event poll (%s): +Inf/NaN row detected, advancing HWM to %s to skip corrupt data", name, now.Format(time.RFC3339))
 			return nil
 		}
-		if isSeedPoll {
+		if _, succeeded := m.everSucceeded.Load(name); !succeeded {
 			failCount := 1
 			if v, ok := m.seedFailures.Load(name); ok {
 				failCount = v.(int) + 1
@@ -391,13 +400,24 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 				// and this point, which is exactly what the startedAt floor
 				// elsewhere in this function exists to prevent. Clamp to the
 				// seed window as a ceiling on the resulting query size.
+				//
+				// Deliberately does NOT mark the store seeded and gates on
+				// everSucceeded rather than isSeedPoll: this store has still
+				// never had a successful poll, so if its next (now
+				// normal-shaped) polls keep failing too, this branch must be
+				// able to re-fire instead of going dark forever after a single
+				// give-up. Each re-fire's clamp above pulls seedFrom closer to
+				// "now" as real time passes, bounding the eventual loss. The
+				// next successful poll takes the normal (not seed) query path
+				// since lastEventIDs is now set, and — because seededStores is
+				// still unset here — falls through the warm-up block below,
+				// which logs the size of whatever backlog that poll turns up.
 				now := time.Now().UTC()
 				seedFrom := m.startedAt
 				if floor := now.Add(-eventPollSeedWindow); seedFrom.Before(floor) {
 					seedFrom = floor
 				}
 				m.lastEventIDs.Store(name, seedFrom)
-				m.seededStores.Store(name, true)
 				m.seedFailures.Delete(name)
 				m.logger("Convoy: event poll (%s): seed poll failed %d consecutive times, giving up on backfill and seeding at %s", name, failCount, seedFrom.Format(time.RFC3339))
 				return nil
@@ -410,6 +430,7 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 		return err
 	}
 	m.seedFailures.Delete(name)
+	m.everSucceeded.Store(name, true)
 
 	// Advance high-water mark from all events
 	for _, e := range events {
