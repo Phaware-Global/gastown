@@ -137,8 +137,24 @@ const pushTimeout = 60 * time.Second
 const fetchTimeout = 60 * time.Second
 
 // prUpdateBranchTimeout bounds the `gh pr update-branch` call for the same
-// reason.
-const prUpdateBranchTimeout = 60 * time.Second
+// reason, and ghViewTimeout the read-only `gh pr view` calls that run ahead of
+// both on the refinery patrol's critical path.
+const (
+	prUpdateBranchTimeout = 60 * time.Second
+	ghViewTimeout         = 30 * time.Second
+)
+
+// subprocessWaitDelay bounds how long Wait may outlive a killed subprocess.
+//
+// A deadline alone does not bound these commands. On expiry os/exec kills only
+// the command's own PID, and with buffer-backed stdio Wait then blocks on the
+// copy goroutines until every DESCENDANT closes the inherited pipe. `git fetch`
+// runs its transport in a child (git-remote-https, ssh), and that child is
+// precisely the process stuck on a half-open socket — it never sees the kill
+// and keeps the fd, so the "deadline" is ignored and the caller hangs anyway.
+// WaitDelay is the backstop os/exec provides for exactly this, and the same
+// value is used in internal/cmd/prime.go and internal/workerclient/exec.go.
+const subprocessWaitDelay = 10 * time.Second
 
 // runWithTimeout executes a git command with a deadline. If the command does
 // not finish within the timeout, the process is killed and an error is returned.
@@ -163,6 +179,10 @@ func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	// Without this the timeout above is advisory: killing git does not kill the
+	// transport helper holding the stdio pipe, and Wait blocks on it. See
+	// subprocessWaitDelay.
+	cmd.WaitDelay = subprocessWaitDelay
 
 	err := cmd.Run()
 	if err != nil {
@@ -1947,11 +1967,23 @@ func (g *Git) GhPrBaseBranch(prNumber int) (string, error) {
 	if prNumber <= 0 {
 		return "", fmt.Errorf("gh pr base branch: invalid PR number %d", prNumber)
 	}
-	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber),
+	// Deadlined: this is the FIRST call GhPrBaseStatus makes, so an unbounded
+	// one hangs the refinery patrol before either of the deadlines below can
+	// apply. Callers treat an error here as non-fatal — they warn and dispatch
+	// the commit as-is — so bounding it fails the round forward rather than
+	// wedging with no exit code.
+	ctx, cancel := context.WithTimeout(context.Background(), ghViewTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view", fmt.Sprintf("%d", prNumber),
 		"--json", "baseRefName", "--jq", ".baseRefName")
 	cmd.Dir = g.workDir
+	cmd.WaitDelay = subprocessWaitDelay
 	out, err := cmd.Output()
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("gh pr view --json baseRefName timed out after %v "+
+				"(remote may be unreachable)", ghViewTimeout)
+		}
 		return "", fmt.Errorf("gh pr view --json baseRefName failed: %w", err)
 	}
 	return strings.TrimSpace(string(out)), nil
@@ -2124,6 +2156,7 @@ func (g *Git) GhPrUpdateBranch(prNumber int) error {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "gh", "pr", "update-branch", fmt.Sprintf("%d", prNumber))
 	cmd.Dir = g.workDir
+	cmd.WaitDelay = subprocessWaitDelay
 	if out, err := cmd.CombinedOutput(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("gh pr update-branch %d timed out after %v (remote may be unreachable)",
