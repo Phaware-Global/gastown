@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
@@ -83,4 +84,75 @@ func TestResolveNoMergeCompletion(t *testing.T) {
 			}
 		})
 	}
+}
+
+// PR #221 round-2 adversarial findings: on the reused-PR completion path,
+// gt done must (1) surface the live MR bead's ID so shouldNudgeRefinery
+// fires and CompletionMetadata.MRID is accurate, and (2) recognize when
+// issueID IS that MR's source_issue so the work bead is left open instead
+// of force-closed out from under a still-live MR.
+func TestResolveReviewFixMRLookup(t *testing.T) {
+	const (
+		reusePR = 221
+		branch  = "polecat/slit/gt-y4gw@mtg1grxe"
+		issueID = "gt-y4gw"
+	)
+
+	t.Run("lookup error leaves mrID empty and flags mrFailed", func(t *testing.T) {
+		got := resolveReviewFixMRLookup(nil, errors.New("dolt: connection refused"), reusePR, issueID, branch)
+		if got.mrID != "" {
+			t.Errorf("mrID = %q, want empty on lookup error", got.mrID)
+		}
+		if !got.mrFailed || got.errMsg == "" {
+			t.Errorf("mrFailed = %v, errMsg = %q, want mrFailed=true with a non-empty message", got.mrFailed, got.errMsg)
+		}
+		if got.refineryOwnsMerge {
+			t.Errorf("refineryOwnsMerge = true, want false on lookup error")
+		}
+	})
+
+	t.Run("no MR bead found leaves mrID empty and flags mrFailed", func(t *testing.T) {
+		got := resolveReviewFixMRLookup(nil, nil, reusePR, issueID, branch)
+		if got.mrID != "" {
+			t.Errorf("mrID = %q, want empty when no MR bead tracks the PR", got.mrID)
+		}
+		if !got.mrFailed || got.errMsg == "" {
+			t.Errorf("mrFailed = %v, errMsg = %q, want mrFailed=true with a non-empty message", got.mrFailed, got.errMsg)
+		}
+	})
+
+	t.Run("live MR bead whose source_issue is this bead: mrID set, work bead left open", func(t *testing.T) {
+		mrIssue := &beads.Issue{
+			ID:          "gt-wisp-ne5u",
+			Description: "branch: " + branch + "\nsource_issue: " + issueID + "\nreview_pr: 221",
+		}
+		got := resolveReviewFixMRLookup(mrIssue, nil, reusePR, issueID, branch)
+		if got.mrID != "gt-wisp-ne5u" {
+			t.Errorf("mrID = %q, want %q — shouldNudgeRefinery(exitType, mrID) never fires if this stays empty", got.mrID, "gt-wisp-ne5u")
+		}
+		if !got.refineryOwnsMerge {
+			t.Errorf("refineryOwnsMerge = false, want true — force-closing %s here would strand the live MR without its source_issue", issueID)
+		}
+		if got.mrFailed {
+			t.Errorf("mrFailed = true, want false — a live MR bead was found")
+		}
+	})
+
+	t.Run("live MR bead tracking a DIFFERENT source_issue: mrID set, but work bead still closes", func(t *testing.T) {
+		// resolveReviewFixDispatchBead creates a fresh dispatch bead (source
+		// closed/tombstoned/absent) when the original source_issue is gone —
+		// that fresh bead is not the MR's source_issue and must still be
+		// force-closed so it doesn't sit open forever.
+		mrIssue := &beads.Issue{
+			ID:          "gt-wisp-ne5u",
+			Description: "branch: " + branch + "\nsource_issue: gt-y4gw\nreview_pr: 221",
+		}
+		got := resolveReviewFixMRLookup(mrIssue, nil, reusePR, "gt-c9z7", branch)
+		if got.mrID != "gt-wisp-ne5u" {
+			t.Errorf("mrID = %q, want %q", got.mrID, "gt-wisp-ne5u")
+		}
+		if got.refineryOwnsMerge {
+			t.Errorf("refineryOwnsMerge = true, want false — gt-c9z7 is not this MR's source_issue, so it must still be force-closed")
+		}
+	})
 }

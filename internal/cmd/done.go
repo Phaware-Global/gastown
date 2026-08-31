@@ -1302,16 +1302,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// actually live before declaring this a clean completion;
 				// otherwise the PR sits orphaned from the merge pipeline
 				// while gt done reports success.
-				if mrIssue, findErr := bd.FindMRForReviewPR(completion.reusePR); findErr != nil {
+				mrIssue, findErr := bd.FindMRForReviewPR(completion.reusePR)
+				lookup := resolveReviewFixMRLookup(mrIssue, findErr, completion.reusePR, issueID, branch)
+				mrID = lookup.mrID
+				refineryOwnsMerge = lookup.refineryOwnsMerge
+				if lookup.mrFailed {
 					mrFailed = true
-					doneErrors = append(doneErrors, fmt.Sprintf(
-						"could not verify an MR bead tracks reused PR #%d (%v); refinery pickup of branch %s is unconfirmed - dispatcher intervention required",
-						completion.reusePR, findErr, branch))
-				} else if mrIssue == nil {
-					mrFailed = true
-					doneErrors = append(doneErrors, fmt.Sprintf(
-						"review-fix dispatch reused PR #%d but no live MR bead tracks it (review_pr=%d); refinery will not pick up branch %s — dispatcher intervention required",
-						completion.reusePR, completion.reusePR, branch))
+					doneErrors = append(doneErrors, lookup.errMsg)
 				}
 			}
 
@@ -2739,6 +2736,51 @@ func resolveNoMergeCompletion(fields *beads.AttachmentFields, mergeStrategyIsPR 
 		return noMergeCompletionTarget{reusePR: fields.ReviewPR}, nil
 	}
 	return noMergeCompletionTarget{createPR: mergeStrategyIsPR}, nil
+}
+
+// reviewFixMRLookupResult is what gt done needs from FindMRForReviewPR's
+// answer to complete a reused-PR (review-fix) run correctly.
+type reviewFixMRLookupResult struct {
+	mrID              string // set when a live MR bead tracks the reused PR
+	refineryOwnsMerge bool   // true: leave the work bead open, don't force-close it
+	mrFailed          bool   // true: lookup didn't confirm a live MR bead
+	errMsg            string // doneErrors entry to record when mrFailed
+}
+
+// resolveReviewFixMRLookup turns FindMRForReviewPR's result into gt done's
+// completion state for the reused-PR path.
+//
+// PR #221 round 2 findings: mrID must be populated from the found MR bead
+// (not discarded) so shouldNudgeRefinery fires and CompletionMetadata.MRID
+// is accurate — otherwise the refinery only learns the fix landed on its
+// next patrol tick. And when issueID is itself that MR's source_issue
+// (resolveReviewFixDispatchBead in refinery_pr_dispatch_review_fix.go
+// returns state.SourceIssue whenever it's still open — the routine case,
+// not an edge case), refineryOwnsMerge must be true so the caller leaves
+// the work bead open instead of force-closing it out from under the live
+// MR, which would strand the MR without its source_issue.
+func resolveReviewFixMRLookup(mrIssue *beads.Issue, findErr error, reusePR int, issueID, branch string) reviewFixMRLookupResult {
+	if findErr != nil {
+		return reviewFixMRLookupResult{
+			mrFailed: true,
+			errMsg: fmt.Sprintf(
+				"could not verify an MR bead tracks reused PR #%d (%v); refinery pickup of branch %s is unconfirmed - dispatcher intervention required",
+				reusePR, findErr, branch),
+		}
+	}
+	if mrIssue == nil {
+		return reviewFixMRLookupResult{
+			mrFailed: true,
+			errMsg: fmt.Sprintf(
+				"review-fix dispatch reused PR #%d but no live MR bead tracks it (review_pr=%d); refinery will not pick up branch %s — dispatcher intervention required",
+				reusePR, reusePR, branch),
+		}
+	}
+	result := reviewFixMRLookupResult{mrID: mrIssue.ID}
+	if fields := beads.ParseMRFields(mrIssue); fields != nil && fields.SourceIssue == issueID {
+		result.refineryOwnsMerge = true
+	}
+	return result
 }
 
 // handoffPRArgs bundles the parameters for handoffPRToRefinery so the
