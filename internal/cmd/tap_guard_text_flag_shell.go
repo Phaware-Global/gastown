@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 
+	"github.com/google/shlex"
 	"github.com/spf13/cobra"
 )
 
@@ -31,21 +33,33 @@ This guard fires only when BOTH hold:
     text-bearing flags: --append-notes, --notes, --acceptance,
     --description, -d, --body, --message, -m, --design, --reason, -r,
     --args, --title, --subject, -s
+  - or, for subcommands with no flag name at all (gt nudge/escalate,
+    bd create/comment), inside the positional free-text argument.
 
 It deliberately does NOT fire on a backtick or $( anywhere else on the
 command line — legitimate command substitution outside a text-bearing
 flag argument is common and correct (e.g. the Dolt diagnostics in
 CLAUDE.md use "$(date +%s)" inside a "tee" target path, not inside any
-of the flags above).
+of the flags above). To tell those apart, the command line is first
+split into shell-operator-delimited segments (on ";", "&&", "||", "|"
+and newline, all quote/backtick/$(...)-aware) so a different program's
+flags elsewhere on the line — even on another line, even without
+surrounding whitespace around the operator — are never mistaken for
+bd/gt's own arguments. Each segment is then tokenized with
+github.com/google/shlex, which implements POSIX-correct backslash and
+quote handling (round 1 and round 2 of gt-h38j.1 review both found new
+bypasses in a hand-rolled per-segment tokenizer; the mayor's ruling on
+this bead was to stop re-deriving that state machine one bypass at a
+time and use a real parser instead).
 
 Non-goals: this guard does not sanitize, escape, or rewrite the
 argument text, and it does not touch Claude Code's eval wrapper (not
 ours to change). It blocks and names the safe alternative:
   - bd: write the text to a file and pass it via the flag's file/stdin
-    form (bd already has --body-file for --description and
-    --design-file for --design; matching -file flags for the other
-    text fields are landing separately in bd-nre and can be referenced
-    here regardless of merge order).
+    form where one exists today (--body-file for --description/-d,
+    --design-file for --design); for the other text flags, rewrite the
+    text without the backtick/$( construct until a file/stdin variant
+    lands (tracked in bd-nre).
   - gt: use --stdin, which every gt subcommand that accepts free text
     (sling, mail send, escalate, handoff, nudge, mq reject, warrant)
     already supports.
@@ -97,206 +111,217 @@ func isTextBearingFlag(tok string) bool {
 }
 
 // positionalTextSubcommands maps a bd/gt subcommand (the token
-// immediately following the "bd"/"gt" invocation token) to true when
-// one of its positional (non-flag) arguments carries agent-authored
-// free text with no flag name to key off — the same eval-executes-it
-// hazard as a text-bearing flag. gt nudge's message and bd's
-// create/comment text are the guard's core case (an agent describing
-// what it found), not an edge: "gt nudge mayor/ \"check `id` output\""
-// has no text-bearing flag at all, and the message is positional
-// (internal/cmd/nudge.go: "nudge <target> [message]").
+// immediately following the "bd"/"gt" invocation, after any global
+// flags) to true when one of its positional (non-flag) arguments
+// carries agent-authored free text with no flag name to key off — the
+// same eval-executes-it hazard as a text-bearing flag. gt nudge's and
+// gt escalate's message, and bd's create/comment text, are the guard's
+// core case (an agent describing what it found or why it's blocked),
+// not an edge: "gt nudge mayor/ \"check `id` output\"" has no
+// text-bearing flag at all, and the message is positional
+// (internal/cmd/nudge.go: "nudge <target> [message]";
+// internal/cmd/escalate.go: "escalate [description]").
 var positionalTextSubcommands = map[string]bool{
-	"nudge":   true,
-	"create":  true,
-	"comment": true,
+	"nudge":    true,
+	"create":   true,
+	"comment":  true,
+	"escalate": true,
 }
 
-// shellSeparators are the tokens that end one bd/gt-or-other-program
-// invocation and start another on the same command line. Scoping the
-// scan to the segment between separators is what keeps this guard
-// from blocking an unrelated program's flags just because "bd" or
-// "gt" appears somewhere else on the line (e.g. "gt done && gh pr
-// create --title x --body \"$(cat f)\"" must not block on gh's
-// --body — that is the documented PR workflow).
-var shellSeparators = map[string]bool{
-	";":  true,
-	"&&": true,
-	"||": true,
-	"|":  true,
-}
+// shellSeparatorPattern documents (for readers of splitTopLevelSegments)
+// the operators that end one shell command and start another on the
+// same line: ";", "&&", "||", "|", and a bare newline.
 
-// splitIntoSegments breaks tokens into the sub-slices between
-// shellSeparators tokens (the separators themselves are dropped).
-func splitIntoSegments(tokens []cmdToken) [][]cmdToken {
-	var segments [][]cmdToken
-	var cur []cmdToken
-	for _, t := range tokens {
-		if shellSeparators[t.text] {
-			if len(cur) > 0 {
-				segments = append(segments, cur)
+// rawBinaryRef matches a standalone "bd" or "gt" word — used only as a
+// fallback when a segment fails to tokenize at all (see
+// findCommandSubstitutionInTextFlag).
+var rawBinaryRef = regexp.MustCompile(`(^|[^A-Za-z0-9_./-])(bd|gt)([^A-Za-z0-9_./-]|$)`)
+
+// splitTopLevelSegments splits a command line into the shell segments
+// delimited by ";", "&&", "||", "|" and newline — the operators that
+// separate one program invocation from the next. The scan tracks
+// quoting state (single quotes, double quotes, backtick spans, and
+// $(...) nesting depth) so an operator character that merely appears
+// inside quoted or substituted text is never mistaken for a real
+// separator, and a real separator glued directly to an adjacent word
+// with no surrounding whitespace (e.g. "cd /x;bd update ...") is still
+// recognized — round-2 finding: the previous whitespace-token-based
+// splitter missed exactly this shape, letting "bd" hide inside the
+// single token "/x;bd" (a false negative), while also merging an
+// entire multi-line command into one segment and false-positiving on
+// an unrelated program's flags on a later line (round-2 finding 2's
+// mirror image).
+//
+// Known limitation, accepted as out of scope: a literal ')' inside a
+// quoted string nested inside a $(...) span (e.g. $(echo "a)b")) will
+// close the paren-depth count early, since this scanner does not track
+// quote state *inside* a $(...) span. This guard is a best-effort hook
+// check, not a full shell parser or a security boundary in itself —
+// the same tradeoff already documented for the tokenizer below.
+func splitTopLevelSegments(command string) []string {
+	var segments []string
+	var cur strings.Builder
+	n := len(command)
+	i := 0
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	parenDepth := 0
+
+	flush := func() {
+		if cur.Len() > 0 {
+			segments = append(segments, cur.String())
+			cur.Reset()
+		}
+	}
+
+	for i < n {
+		c := command[i]
+
+		if inSingle {
+			cur.WriteByte(c)
+			if c == '\'' {
+				inSingle = false
 			}
-			cur = nil
+			i++
 			continue
 		}
-		cur = append(cur, t)
+
+		// A backslash escapes the very next byte outright wherever it
+		// appears (outside single quotes): never let what it escapes
+		// be mistaken for a quote delimiter or a segment separator.
+		if c == '\\' && i+1 < n {
+			cur.WriteByte(c)
+			cur.WriteByte(command[i+1])
+			i += 2
+			continue
+		}
+
+		if inDouble {
+			cur.WriteByte(c)
+			if c == '"' {
+				inDouble = false
+			}
+			i++
+			continue
+		}
+
+		if inBacktick {
+			cur.WriteByte(c)
+			if c == '`' {
+				inBacktick = false
+			}
+			i++
+			continue
+		}
+
+		if parenDepth > 0 {
+			cur.WriteByte(c)
+			switch c {
+			case '(':
+				parenDepth++
+			case ')':
+				parenDepth--
+			}
+			i++
+			continue
+		}
+
+		switch c {
+		case '\'':
+			inSingle = true
+			cur.WriteByte(c)
+			i++
+		case '"':
+			inDouble = true
+			cur.WriteByte(c)
+			i++
+		case '`':
+			inBacktick = true
+			cur.WriteByte(c)
+			i++
+		case '$':
+			cur.WriteByte(c)
+			i++
+			if i < n && command[i] == '(' {
+				parenDepth = 1
+				cur.WriteByte('(')
+				i++
+			}
+		case '\n', ';':
+			flush()
+			i++
+		case '|':
+			flush()
+			if i+1 < n && command[i+1] == '|' {
+				i += 2
+			} else {
+				i++
+			}
+		case '&':
+			if i+1 < n && command[i+1] == '&' {
+				flush()
+				i += 2
+			} else {
+				cur.WriteByte(c)
+				i++
+			}
+		default:
+			cur.WriteByte(c)
+			i++
+		}
 	}
-	if len(cur) > 0 {
-		segments = append(segments, cur)
-	}
+	flush()
 	return segments
 }
 
-// cmdToken is one shell word extracted from a command line, along with
-// the byte offset in the original string where the word started.
-type cmdToken struct {
-	text  string
-	start int
-}
-
-// tokenizeShellWords splits a command string into shell-like words,
-// stripping single/double quote delimiters but preserving their
-// contents verbatim — including any backtick or $( inside — so callers
-// can inspect the raw argument text for command-substitution
-// constructs regardless of how the agent quoted it.
-//
-// This is NOT a full shell lexer: a quote is matched to the next
-// occurrence of the same quote character with no escape handling
-// (same tradeoff tap_guard_push_main.go's unquote() makes elsewhere in
-// this package). That is intentional — a hook-fired best-effort guard,
-// not a security boundary in itself. Quoted and unquoted fragments
-// within a single word are concatenated the way a real shell would
-// (e.g. --notes="text" and --notes=text' more' both work), which is
-// what lets the flag=value case below split correctly.
-func tokenizeShellWords(command string) []cmdToken {
-	var tokens []cmdToken
-	n := len(command)
-	i := 0
-	for i < n {
-		for i < n && isShellSpace(command[i]) {
-			i++
-		}
-		if i >= n {
-			break
-		}
-		start := i
-		var b strings.Builder
-		for i < n && !isShellSpace(command[i]) {
-			switch command[i] {
-			case '\'':
-				if j := strings.IndexByte(command[i+1:], '\''); j >= 0 {
-					b.WriteString(command[i+1 : i+1+j])
-					i += j + 2
-				} else {
-					b.WriteString(command[i+1:])
-					i = n
-				}
-			case '"':
-				// Honor a backslash-escaped quote (\") as a literal "
-				// inside the double-quoted run rather than treating it
-				// as the terminator — an unescaped desync here closes
-				// the string early, and the remainder (including any
-				// backtick/$( after the real closing quote) re-tokenizes
-				// outside the flag argument, silently bypassing the
-				// guard on an ordinary agent-authored note containing
-				// an escaped quote.
-				j := i + 1
-				closed := false
-				for j < n {
-					if command[j] == '\\' && j+1 < n && command[j+1] == '"' {
-						b.WriteByte('"')
-						j += 2
-						continue
-					}
-					if command[j] == '"' {
-						closed = true
-						j++
-						break
-					}
-					b.WriteByte(command[j])
-					j++
-				}
-				if closed {
-					i = j
-				} else {
-					i = n
-				}
-			default:
-				b.WriteByte(command[i])
-				i++
-			}
-		}
-		tokens = append(tokens, cmdToken{text: b.String(), start: start})
-	}
-	return tokens
-}
-
-func isShellSpace(c byte) bool {
-	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
-}
-
-// invokesBdOrGt reports whether any token is exactly "bd" or "gt". A
-// token match (not a substring/regex match) so words like "gtk" or
-// "abd" don't false-positive.
-func invokesBdOrGt(tokens []cmdToken) bool {
+func invokesBdOrGt(tokens []string) bool {
 	for _, t := range tokens {
-		if t.text == "bd" || t.text == "gt" {
+		if t == "bd" || t == "gt" {
 			return true
 		}
 	}
 	return false
 }
 
-// nearestInvocationBinary returns "bd" or "gt" — whichever invocation
-// token most closely precedes beforePos, falling back to the first
-// bd/gt token anywhere in the command if none precedes it. Callers
-// only reach this after invokesBdOrGt has confirmed at least one
-// exists, so the fallback always finds something.
-func nearestInvocationBinary(tokens []cmdToken, beforePos int) string {
-	binary := ""
+func firstInvocationBinary(tokens []string) string {
 	for _, t := range tokens {
-		if t.text != "bd" && t.text != "gt" {
-			continue
+		if t == "bd" || t == "gt" {
+			return t
 		}
-		if t.start <= beforePos {
-			binary = t.text
-			continue
-		}
-		if binary == "" {
-			binary = t.text
-		}
-		break
 	}
-	return binary
+	return ""
 }
 
-// commandSubstitutionMatch describes a text-bearing flag argument that
-// contains a shell command-substitution construct.
+// commandSubstitutionMatch describes a text-bearing flag argument (or
+// positional free-text argument) that contains a shell
+// command-substitution construct.
 type commandSubstitutionMatch struct {
 	flag    string // the flag token as written, e.g. "--append-notes" or "-m"
-	binary  string // "bd" or "gt" — the nearest preceding invocation
+	binary  string // "bd" or "gt" — the invocation this argument belongs to
 	snippet string // the offending argument text
 }
 
-// flagAndValue splits a token into (flag, value, hasValue, valueStart).
-// Handles the "--flag=value" form; for tokens with no "=" (or a short
-// flag), hasValue is false and the caller should look at the NEXT
-// token as the argument instead.
-func flagAndValue(tok cmdToken) (flag, value string, hasValue bool, valueStart int) {
-	if idx := strings.IndexByte(tok.text, '='); idx >= 0 && strings.HasPrefix(tok.text, "--") {
-		return tok.text[:idx], tok.text[idx+1:], true, tok.start + idx + 1
+// flagAndValue splits a token into (flag, value, hasValue). Handles the
+// "--flag=value" form; for tokens with no "=" (or a short flag), hasValue
+// is false and the caller should look at the NEXT token as the argument
+// instead.
+func flagAndValue(tok string) (flag, value string, hasValue bool) {
+	if idx := strings.IndexByte(tok, '='); idx >= 0 && strings.HasPrefix(tok, "--") {
+		return tok[:idx], tok[idx+1:], true
 	}
 	// Attached short-flag value, the git-style spelling an agent
 	// commonly writes: -m"note with $(id)" tokenizes as one word
-	// ("-m" concatenated with the quoted run) since tokenizeShellWords
-	// merges quoted and unquoted fragments of a single shell word.
-	// Without this, only the separate "-m value" form was inspected.
-	if len(tok.text) > 2 && tok.text[0] == '-' && tok.text[1] != '-' {
-		short := tok.text[:2]
+	// ("-m" concatenated with the quoted run) since shlex merges
+	// quoted and unquoted fragments of a single shell word. Without
+	// this, only the separate "-m value" form was inspected.
+	if len(tok) > 2 && tok[0] == '-' && tok[1] != '-' {
+		short := tok[:2]
 		if textBearingShortFlags[short] {
-			return short, tok.text[2:], true, tok.start + 2
+			return short, tok[2:], true
 		}
 	}
-	return tok.text, "", false, 0
+	return tok, "", false
 }
 
 func containsCommandSubstitution(s string) bool {
@@ -311,18 +336,34 @@ const positionalArgLabel = "(positional)"
 // findCommandSubstitutionInTextFlag scans command for a bd/gt
 // invocation whose text-bearing flag argument, or positional
 // free-text argument, contains a backtick or $(. The scan is scoped
-// to each shell-separator-delimited segment of the line so that a
-// different program appearing elsewhere on the same line (e.g. "gt
-// done && gh pr create --body \"$(cat f)\"") is never mistaken for
-// the bd/gt invocation's own arguments. It does not itself check
-// invokesBdOrGt on the whole line — callers combine both.
+// to each shell-operator-delimited segment of the line (see
+// splitTopLevelSegments) so that a different program appearing
+// elsewhere on the same line — or a different line — is never mistaken
+// for the bd/gt invocation's own arguments.
 func findCommandSubstitutionInTextFlag(command string) (commandSubstitutionMatch, bool) {
-	tokens := tokenizeShellWords(command)
-	for _, segment := range splitIntoSegments(tokens) {
-		if !invokesBdOrGt(segment) {
+	for _, segment := range splitTopLevelSegments(command) {
+		if strings.TrimSpace(segment) == "" {
 			continue
 		}
-		if match, ok := findCommandSubstitutionInSegment(segment); ok {
+		tokens, err := shlex.Split(segment)
+		if err != nil {
+			// Unbalanced quoting defeats precise tokenization of this
+			// segment. Per the mayor's ruling on this bead (round 2
+			// produced six new hand-rolled-tokenizer bypasses): when a
+			// real parser can't make sense of the input, fail closed
+			// rather than silently letting it through. The remedy is
+			// the same one the guard already gives: split the command
+			// or use a file.
+			if rawBinaryRef.MatchString(segment) && containsCommandSubstitution(segment) {
+				m := rawBinaryRef.FindStringSubmatch(segment)
+				return commandSubstitutionMatch{flag: "(unparsable)", binary: m[2], snippet: segment}, true
+			}
+			continue
+		}
+		if !invokesBdOrGt(tokens) {
+			continue
+		}
+		if match, ok := findCommandSubstitutionInSegment(tokens); ok {
 			return match, true
 		}
 	}
@@ -334,77 +375,204 @@ func findCommandSubstitutionInTextFlag(command string) (commandSubstitutionMatch
 // then, for subcommands that carry a positional free-text argument
 // (positionalTextSubcommands), every non-flag token after the
 // subcommand.
-func findCommandSubstitutionInSegment(tokens []cmdToken) (commandSubstitutionMatch, bool) {
+func findCommandSubstitutionInSegment(tokens []string) (commandSubstitutionMatch, bool) {
 	if match, ok := findCommandSubstitutionInFlags(tokens); ok {
 		return match, true
 	}
 	return findCommandSubstitutionInPositional(tokens)
 }
 
-func findCommandSubstitutionInFlags(tokens []cmdToken) (commandSubstitutionMatch, bool) {
+func findCommandSubstitutionInFlags(tokens []string) (commandSubstitutionMatch, bool) {
+	binary := firstInvocationBinary(tokens)
 	for i, tok := range tokens {
-		flag, value, hasValue, valueStart := flagAndValue(tok)
+		flag, value, hasValue := flagAndValue(tok)
 		if !isTextBearingFlag(flag) {
 			continue
 		}
 
 		var argText string
-		var argStart int
 		if hasValue {
-			argText, argStart = value, valueStart
+			argText = value
 		} else if i+1 < len(tokens) {
-			argText, argStart = tokens[i+1].text, tokens[i+1].start
+			argText = tokens[i+1]
 		} else {
 			continue
 		}
 
 		if containsCommandSubstitution(argText) {
+			return commandSubstitutionMatch{flag: flag, binary: binary, snippet: argText}, true
+		}
+	}
+	return commandSubstitutionMatch{}, false
+}
+
+// isFlagToken reports whether tok should be treated as a flag (and
+// therefore skipped) during positional free-text scanning, rather than
+// as candidate positional text. A real flag token can never contain
+// whitespace — only a quoted argument can — so a token like
+// "- ran find /" (an agent's message that happens to start with a
+// single dash, e.g. a markdown bullet) is correctly NOT a flag despite
+// its leading '-'. This replaces the previous "any leading '-'" check,
+// which both false-positived on flag values (see isRedirectOperator's
+// doc comment) and false-negatived on exactly this shape.
+func isFlagToken(tok string) bool {
+	if tok == "" || tok[0] != '-' {
+		return false
+	}
+	if strings.ContainsAny(tok, " \t\n") {
+		return false
+	}
+	if strings.HasPrefix(tok, "--") {
+		return true
+	}
+	return len(tok) == 2 // short flag: "-" plus one character, e.g. -m, -s, -C
+}
+
+// isRedirectOperator reports whether tok is a shell redirection
+// operator (optionally prefixed by a file descriptor number), e.g.
+// ">", ">>", "<", "2>", "&>". findCommandSubstitutionInPositional stops
+// scanning at the first one: a redirect target is shell-interpreted
+// output routing, not free text passed to bd/gt, and unlike a bd/gt
+// argument it commonly contains an unquoted $(...) with an internal
+// space (e.g. "> /tmp/o-$(date +%s).log", which a naive word-splitter
+// sees as two words, one of which looks like a positional match).
+func isRedirectOperator(tok string) bool {
+	s := tok
+	for len(s) > 0 && s[0] >= '0' && s[0] <= '9' {
+		s = s[1:]
+	}
+	if s == ">" || s == ">>" || s == "<" || s == "<<" {
+		return true
+	}
+	return strings.HasPrefix(s, ">&") || strings.HasPrefix(s, "&>")
+}
+
+// findCommandSubstitutionInPositional covers bd/gt subcommands whose
+// hazardous argument has no flag name at all — gt nudge/escalate's
+// message and bd create/comment's title/body are the guard's core case
+// (an agent describing what it found or why it's blocked), not an
+// edge: "gt nudge mayor/ \"check `id` output\"" has no text-bearing
+// flag, and the message is positional.
+func findCommandSubstitutionInPositional(tokens []string) (commandSubstitutionMatch, bool) {
+	binIdx := -1
+	for i, t := range tokens {
+		if t == "bd" || t == "gt" {
+			binIdx = i
+			break
+		}
+	}
+	if binIdx < 0 {
+		return commandSubstitutionMatch{}, false
+	}
+	binary := tokens[binIdx]
+
+	subIdx := skipBinaryGlobalArgs(binary, tokens, binIdx+1)
+	if subIdx < 0 || subIdx >= len(tokens) {
+		return commandSubstitutionMatch{}, false
+	}
+	subcommand := tokens[subIdx]
+	if !positionalTextSubcommands[subcommand] {
+		return commandSubstitutionMatch{}, false
+	}
+
+	for i := subIdx + 1; i < len(tokens); i++ {
+		tok := tokens[i]
+		if isRedirectOperator(tok) {
+			break // everything after a redirect is shell-interpreted, not a bd/gt argument
+		}
+		if isFlagToken(tok) {
+			continue
+		}
+		if containsCommandSubstitution(tok) {
 			return commandSubstitutionMatch{
-				flag:    flag,
-				binary:  nearestInvocationBinary(tokens, argStart),
-				snippet: argText,
+				flag:    positionalArgLabel,
+				binary:  binary,
+				snippet: tok,
 			}, true
 		}
 	}
 	return commandSubstitutionMatch{}, false
 }
 
-// findCommandSubstitutionInPositional covers bd/gt subcommands whose
-// hazardous argument has no flag name at all — gt nudge's message and
-// bd create/comment's title/body are the guard's core case (an agent
-// describing what it found), not an edge: "gt nudge mayor/ \"check
-// `id` output\"" has no text-bearing flag, and the message is
-// positional.
-func findCommandSubstitutionInPositional(tokens []cmdToken) (commandSubstitutionMatch, bool) {
-	binIdx := -1
-	for i, t := range tokens {
-		if t.text == "bd" || t.text == "gt" {
-			binIdx = i
-			break
+// skipBinaryGlobalArgs returns the index of the subcommand token
+// (e.g. "create", "nudge") for the given binary ("bd" or "gt"),
+// skipping any global flags between the invocation and the
+// subcommand. Returns -1 if the subcommand can't be determined.
+func skipBinaryGlobalArgs(binary string, tokens []string, start int) int {
+	switch binary {
+	case "bd":
+		return skipBdGlobalArgs(tokens, start)
+	case "gt":
+		return skipGtGlobalArgs(tokens, start)
+	default:
+		return -1
+	}
+}
+
+// skipBdGlobalArgs handles bd's global flags that can appear before the
+// subcommand — most importantly -C/--directory <dir>, the documented
+// way to target a repo (bd create --repo silently loses data, per
+// gt/bd known gotchas), which round-2's positional scan missed
+// entirely because it assumed the subcommand was always
+// tokens[binIdx+1]. Conservative like tap_guard_push_main.go's
+// skipGitGlobalArgs: an unrecognized flag aborts to -1 rather than
+// blindly skipping, so a novel global flag can't be used to smuggle
+// the subcommand past this scan undetected.
+func skipBdGlobalArgs(tokens []string, start int) int {
+	consumesNext := map[string]bool{
+		"-C": true, "--directory": true,
+		"--actor": true,
+		"--db":    true,
+		"--dolt-auto-commit": true,
+	}
+	booleanFlags := map[string]bool{
+		"--global": true, "--ignore-schema-skew": true, "--json": true,
+		"--profile": true, "-q": true, "--quiet": true, "--readonly": true,
+		"--sandbox": true, "-v": true, "--verbose": true, "-V": true,
+		"--version": true, "-h": true, "--help": true,
+	}
+	i := start
+	for i < len(tokens) {
+		f := tokens[i]
+		if !strings.HasPrefix(f, "-") {
+			return i
 		}
-	}
-	if binIdx < 0 || binIdx+1 >= len(tokens) {
-		return commandSubstitutionMatch{}, false
-	}
-	subcommand := tokens[binIdx+1].text
-	if !positionalTextSubcommands[subcommand] {
-		return commandSubstitutionMatch{}, false
-	}
-	binary := tokens[binIdx].text
-	for i := binIdx + 2; i < len(tokens); i++ {
-		tok := tokens[i]
-		if strings.HasPrefix(tok.text, "-") {
-			continue // flags and their values are not the free-text argument
+		if strings.Contains(f, "=") {
+			i++
+			continue
 		}
-		if containsCommandSubstitution(tok.text) {
-			return commandSubstitutionMatch{
-				flag:    positionalArgLabel,
-				binary:  binary,
-				snippet: tok.text,
-			}, true
+		if booleanFlags[f] {
+			i++
+			continue
 		}
+		if consumesNext[f] {
+			i += 2
+			continue
+		}
+		return -1
 	}
-	return commandSubstitutionMatch{}, false
+	return -1
+}
+
+// skipGtGlobalArgs is gt's equivalent of skipBdGlobalArgs. gt has no
+// global flags that take a separate value, so this only needs to skip
+// the boolean -h/--help and -v/--version if present before the
+// subcommand.
+func skipGtGlobalArgs(tokens []string, start int) int {
+	booleanFlags := map[string]bool{"-h": true, "--help": true, "-v": true, "--version": true}
+	i := start
+	for i < len(tokens) {
+		f := tokens[i]
+		if !strings.HasPrefix(f, "-") {
+			return i
+		}
+		if booleanFlags[f] {
+			i++
+			continue
+		}
+		return -1
+	}
+	return -1
 }
 
 func runTapGuardTextFlagShell(cmd *cobra.Command, args []string) error {
@@ -441,11 +609,6 @@ func runTapGuardTextFlagShell(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	tokens := tokenizeShellWords(command)
-	if !invokesBdOrGt(tokens) {
-		return nil
-	}
-
 	match, ok := findCommandSubstitutionInTextFlag(command)
 	if !ok {
 		return nil
@@ -475,11 +638,13 @@ func printCommandSubstitutionBlock(match commandSubstitutionMatch, command strin
 	// on that at all. See gt-h38j.1 review round 1 finding 1.
 	if match.binary == "bd" {
 		fmt.Fprintln(os.Stderr, "║  Safe form: use the Write tool to save the text to a real file, then   ║")
-		fmt.Fprintln(os.Stderr, "║  pass the PATH via the flag's file variant — preferred because it      ║")
-		fmt.Fprintln(os.Stderr, "║  does not depend on how this command line gets parsed:                 ║")
+		fmt.Fprintln(os.Stderr, "║  pass the PATH via the flag's file variant, where one exists today —   ║")
+		fmt.Fprintln(os.Stderr, "║  preferred because it does not depend on how this line gets parsed:    ║")
 		fmt.Fprintln(os.Stderr, "║    bd ... --body-file <path>     (for --description/-d)                ║")
 		fmt.Fprintln(os.Stderr, "║    bd ... --design-file <path>   (for --design)                        ║")
-		fmt.Fprintln(os.Stderr, "║    bd ... <flag>-file <path>     (other text flags — see bd-nre)       ║")
+		fmt.Fprintln(os.Stderr, "║  No file/stdin variant exists yet for the other text flags             ║")
+		fmt.Fprintln(os.Stderr, "║  (--append-notes, --notes, --acceptance, --title, ...) — rewrite the   ║")
+		fmt.Fprintln(os.Stderr, "║  text without the backtick/$(...) construct instead.                   ║")
 	} else {
 		fmt.Fprintln(os.Stderr, "║  Safe form: use the Write tool to save the text to a real file, then   ║")
 		fmt.Fprintln(os.Stderr, "║  redirect it into --stdin — preferred because it does not depend on    ║")
@@ -489,8 +654,7 @@ func printCommandSubstitutionBlock(match commandSubstitutionMatch, command strin
 	if match.flag == positionalArgLabel {
 		fmt.Fprintln(os.Stderr, "║                                                                          ║")
 		fmt.Fprintln(os.Stderr, "║  This text has no flag — it's a positional argument. Rewrite it        ║")
-		fmt.Fprintln(os.Stderr, "║  without the backtick/$(...), or pass it via the flag form above       ║")
-		fmt.Fprintln(os.Stderr, "║  if this subcommand has one (e.g. bd create --title-file <path>).      ║")
+		fmt.Fprintln(os.Stderr, "║  without the backtick/$(...) construct instead.                        ║")
 	}
 	fmt.Fprintln(os.Stderr, "╚════════════════════════════════════════════════════════════════════════╝")
 	fmt.Fprintln(os.Stderr, "")

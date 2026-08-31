@@ -240,17 +240,114 @@ func TestFindCommandSubstitutionInTextFlag(t *testing.T) {
 			command:   "bd show gt-abc `echo hi`",
 			wantBlock: false,
 		},
+
+		// --- Round-3 findings (gt-h38j.1 review of 5d0cdaa2) ---
+		{
+			// Finding: a backslash before the closing quote desyncs
+			// the tokenizer. The agent wants --title "path C:\" (a
+			// path ending in one backslash), written with two
+			// backslashes so the shell's own escaping produces one.
+			// The round-2 hand-rolled loop only recognized \" as an
+			// escape, not \\, so it mis-closed --title's quote early
+			// and swallowed --append-notes's flag name into the
+			// (bogus) --title value, leaving the real hazard — the
+			// backtick in --append-notes's value — in a token no flag
+			// or positional scan reached.
+			name:       "backslash before closing quote no longer desyncs the tokenizer",
+			command:    "bd update gt-x --title \"path C:\\\\\" --append-notes \"note `id`\"",
+			wantBlock:  true,
+			wantFlag:   "--append-notes",
+			wantBinary: "bd",
+		},
+		{
+			name:      "value ending in a literal backslash is not itself flagged",
+			command:   "bd update gt-x --title \"path C:\\\\\"",
+			wantBlock: false,
+		},
+		{
+			// Finding: bd -C <dir> create bypassed the positional scan
+			// because it assumed the subcommand was always the token
+			// right after "bd". bd -C <dir> is the documented way to
+			// target a repo, not an edge case.
+			name:       "bd -C <dir> create no longer bypasses the positional scan",
+			command:    "bd -C /repo create \"Fix `id` thing\"",
+			wantBlock:  true,
+			wantFlag:   positionalArgLabel,
+			wantBinary: "bd",
+		},
+		{
+			name:       "bd -C <dir> comment no longer bypasses the positional scan",
+			command:    "bd -C /repo comment gt-x \"see `id`\"",
+			wantBlock:  true,
+			wantFlag:   positionalArgLabel,
+			wantBinary: "bd",
+		},
+		{
+			// Finding: gt escalate's positional description was
+			// uncovered — the exact shape CLAUDE.md tells agents to
+			// run for Dolt trouble.
+			name:       "gt escalate positional description now caught",
+			command:    "gt escalate -s HIGH \"Dolt: `hostname` unreachable\"",
+			wantBlock:  true,
+			wantFlag:   positionalArgLabel,
+			wantBinary: "gt",
+		},
+		{
+			// Finding: separators were only recognized when
+			// whitespace-delimited, so "cd /x;bd ..." hid "bd" inside
+			// the single token "/x;bd" and was never inspected at all
+			// (fail open on the real hazard).
+			name:       "separator glued to adjacent word with no whitespace still splits segments",
+			command:    "cd /x;bd update gt-x --notes \"`id`\"",
+			wantBlock:  true,
+			wantFlag:   "--notes",
+			wantBinary: "bd",
+		},
+		{
+			// Mirror image of the above: a multi-line command used to
+			// be treated as one segment, so an unrelated program's
+			// flag on a later line falsely blocked.
+			name:      "multi-line command: git -m on a later line than gt is not blocked",
+			command:   "gt sync\ngit commit -m \"$(cat msg.txt)\"",
+			wantBlock: false,
+		},
+		{
+			name:      "multi-line command: gh --body on a later line than bd is not blocked",
+			command:   "bd list --status open\ngh pr comment 220 --body \"$(cat r.md)\"",
+			wantBlock: false,
+		},
+		{
+			name:      "semicolon-separated command: curl -s on the far side of a semicolon is not blocked",
+			command:   "gt prime; curl -s \"https://x/$(date +%s)\"",
+			wantBlock: false,
+		},
+		{
+			// Finding: the positional scan read a redirect target as
+			// free text, and a naive unquoted word-split sees
+			// "$(date +%s)" as two words ("...-$(date" and
+			// "+%s).log"), the first of which looks like a match.
+			name:      "redirect target after positional args is not scanned",
+			command:   "bd comment gt-x \"msg\" > /tmp/o-$(date +%s).log",
+			wantBlock: false,
+		},
+		{
+			// Finding: a message that merely starts with '-' was
+			// mistaken for a flag and skipped (fail open) because the
+			// old check treated any leading '-' as a flag.
+			name:       "positional message starting with a single dash is still inspected",
+			command:    "gt nudge mayor/ \"- ran `find /`\"",
+			wantBlock:  true,
+			wantFlag:   positionalArgLabel,
+			wantBinary: "gt",
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			tokens := tokenizeShellWords(tc.command)
-			invokes := invokesBdOrGt(tokens)
 			match, found := findCommandSubstitutionInTextFlag(tc.command)
-			blocked := invokes && found
 
-			if blocked != tc.wantBlock {
-				t.Fatalf("command %q: blocked = %v; want %v (match=%+v)", tc.command, blocked, tc.wantBlock, match)
+			if found != tc.wantBlock {
+				t.Fatalf("command %q: blocked = %v; want %v (match=%+v)", tc.command, found, tc.wantBlock, match)
 			}
 			if !tc.wantBlock {
 				return
