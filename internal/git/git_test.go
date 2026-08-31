@@ -7,7 +7,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -3801,30 +3803,87 @@ func TestWaitForPRUpdate_UnaffectedByABaseThatAdvancesMidWait(t *testing.T) {
 
 // runWithTimeout's deadline is only as good as its process handling, and both
 // halves are single lines whose absence is invisible from reading the code —
-// which is why the defect they fix had to be measured rather than spotted. This
-// pins the behaviour: a git invocation whose child outlives the deadline must
-// still return promptly, not when the child finally exits.
-func TestRunWithTimeout_ReturnsWhenAChildOutlivesTheDeadline(t *testing.T) {
+// which is why the defect they fix had to be measured rather than spotted.
+//
+// The two halves are pinned separately, because they fail differently. The
+// group kill is what makes the call return AT the deadline and what reaps the
+// child; WaitDelay is only the backstop that stops Wait blocking on the pipe.
+// A budget generous enough to cover deadline+WaitDelay would pass with the
+// group kill reverted, so the timing assertion below deliberately excludes it.
+func TestRunWithTimeout_ReapsAChildThatOutlivesTheDeadline(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("shell alias is POSIX-only")
+		t.Skip("shell alias and signal probing are POSIX-only")
 	}
 	g := NewGit(initTestRepo(t))
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
 
-	// A git alias that backgrounds a sleeper holding the inherited stdout, then
-	// blocks itself — the shape of `git fetch` with a stuck transport helper.
-	const sleeper = "!sh -c 'sleep 45 & sleep 45'"
+	// A git alias that backgrounds a sleeper holding the inherited stdout and
+	// records its PID, then blocks itself — the shape of `git fetch` with a
+	// stuck transport helper.
+	alias := "alias.hang=!sh -c 'sleep 45 & echo $! > " + pidFile + "; sleep 45'"
 
 	start := time.Now()
-	_, err := g.runWithTimeout(time.Second, "-c", "alias.hang="+sleeper, "hang")
+	_, err := g.runWithTimeout(time.Second, "-c", alias, "hang")
 	elapsed := time.Since(start)
 
 	if err == nil {
 		t.Error("a command killed by its deadline must report an error")
 	}
-	// The deadline plus the WaitDelay backstop, with slack for a loaded CI box.
-	if budget := time.Second + subprocessWaitDelay + 5*time.Second; elapsed > budget {
-		t.Errorf("runWithTimeout returned after %s, over the %s budget — the deadline is "+
-			"not enforceable: killing git does not reap the child holding the pipe, so Wait "+
-			"blocks on it (see subprocessWaitDelay and SetProcessGroup)", elapsed, budget)
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("error = %v, want it to name the timeout — os/exec substitutes the context "+
+			"error only when Wait returns nil, so the deadline must be read from ctx.Err()", err)
+	}
+	// No WaitDelay term: with the group kill the call returns AT the deadline.
+	// Reverting it returns at deadline+WaitDelay instead, which this catches.
+	if budget := time.Second + 5*time.Second; elapsed > budget {
+		t.Errorf("runWithTimeout returned after %s, over the %s budget — the deadline kill "+
+			"is not reaching the process group, so the call waits out WaitDelay (see "+
+			"util.SetProcessGroup)", elapsed, budget)
+	}
+
+	// The property the group kill exists for: the descendant is gone, not
+	// merely detached from our pipe. Poll briefly — the signal is asynchronous.
+	raw, rerr := os.ReadFile(pidFile) //nolint:gosec // test-local path
+	if rerr != nil {
+		t.Fatalf("child never recorded its PID (%v); the probe would prove nothing", rerr)
+	}
+	pid, cerr := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if cerr != nil {
+		t.Fatalf("unreadable child PID %q: %v", raw, cerr)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if err := syscall.Kill(pid, 0); err != nil {
+			return // reaped
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("child %d survived the deadline kill — WaitDelay unblocked this caller "+
+				"but left the process holding its socket, one leak per call", pid)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// The twin path's deadline message. This branch was dead for as long as the
+// path was unreachable — arming the deadline is what made it reachable, and
+// wrong: a SIGKILLed process yields a non-nil *ExitError, so os/exec never
+// substitutes the context error and errors.Is(err, context.DeadlineExceeded)
+// never fired. `gt mq integration land` reported a 60s push timeout as a bare
+// "signal: killed" with empty stderr.
+func TestRunWithEnvAndTimeout_NamesTheTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell alias is POSIX-only")
+	}
+	g := NewGit(initTestRepo(t))
+	alias := "alias.hang=!sh -c 'sleep 45 & sleep 45'"
+
+	_, err := g.runWithEnvAndTimeout([]string{"-c", alias, "hang"}, nil, time.Second)
+
+	if err == nil {
+		t.Fatal("a command killed by its deadline must report an error")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("error = %v, want it to name the timeout — an operator seeing only "+
+			"\"signal: killed\" cannot tell a deadline from a crash", err)
 	}
 }

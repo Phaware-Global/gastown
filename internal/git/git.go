@@ -221,8 +221,10 @@ func (g *Git) runWithEnvAndTimeout(args []string, extraEnv []string, timeout tim
 
 	var cmd *exec.Cmd
 	var cancel context.CancelFunc
+	// ctx is hoisted out of the branch below so the error path can test it
+	// directly. See the deadline check after Run.
+	var ctx context.Context
 	if timeout > 0 {
-		var ctx context.Context
 		ctx, cancel = context.WithTimeout(context.Background(), timeout)
 		cmd = exec.CommandContext(ctx, "git", args...)
 	} else {
@@ -255,11 +257,14 @@ func (g *Git) runWithEnvAndTimeout(args []string, extraEnv []string, timeout tim
 	}
 	err := cmd.Run()
 	if err != nil {
-		if timeout > 0 {
-			// Check if the context's deadline was exceeded
-			if errors.Is(err, context.DeadlineExceeded) {
-				return "", fmt.Errorf("git %s timed out after %v (remote may be unreachable)", args[0], timeout)
-			}
+		// Test the CONTEXT, not the returned error. os/exec substitutes the
+		// context's error only when Wait itself returns nil, and a process the
+		// deadline SIGKILLs yields a non-nil *ExitError — so errors.Is(err,
+		// context.DeadlineExceeded) never fires here and the timeout surfaced
+		// as a bare "signal: killed" with empty stderr. runWithTimeout tests
+		// ctx.Err() for the same reason.
+		if ctx != nil && ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("git %s timed out after %v (remote may be unreachable)", args[0], timeout)
 		}
 		return "", g.wrapError(err, stdout.String(), stderr.String(), args)
 	}
