@@ -130,6 +130,16 @@ func (g *Git) run(args ...string) (string, error) {
 // (e.g. GitLab) is unreachable or slow.
 const pushTimeout = 60 * time.Second
 
+// fetchTimeout bounds a PR-head fetch, for the same reason pushTimeout bounds a
+// push: a half-open connection to the remote never returns, and the callers sit
+// on the refinery patrol's critical path — WaitForPRUpdate polls in a loop, and
+// an unbounded fetch inside it makes its own deadline unenforceable.
+const fetchTimeout = 60 * time.Second
+
+// prUpdateBranchTimeout bounds the `gh pr update-branch` call for the same
+// reason.
+const prUpdateBranchTimeout = 60 * time.Second
+
 // runWithTimeout executes a git command with a deadline. If the command does
 // not finish within the timeout, the process is killed and an error is returned.
 func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _ error) { //nolint:unparam // string return kept for consistency with Run()
@@ -1978,7 +1988,11 @@ func (g *Git) FetchPRHead(prNumber int) (string, error) {
 	// happen.
 	local := fmt.Sprintf("refs/worktree/gt/pr/%d", prNumber)
 	refspec := fmt.Sprintf("+refs/pull/%d/head:%s", prNumber, local)
-	if _, err := g.run("fetch", "origin", refspec, "+refs/heads/*:refs/remotes/origin/*"); err != nil {
+	// Deadlined: an unbounded fetch here would make WaitForPRUpdate's timeout
+	// unenforceable — it can only check the clock BETWEEN fetches — and would
+	// hang the refinery patrol with no exit code rather than failing it.
+	if _, err := g.runWithTimeout(fetchTimeout, "fetch", "origin", refspec,
+		"+refs/heads/*:refs/remotes/origin/*"); err != nil {
 		return "", fmt.Errorf("fetching refs/pull/%d/head: %w", prNumber, err)
 	}
 	sha, err := g.Rev(local)
@@ -2106,9 +2120,15 @@ func (g *Git) GhPrUpdateBranch(prNumber int) error {
 	if prNumber <= 0 {
 		return fmt.Errorf("gh pr update-branch: invalid PR number %d", prNumber)
 	}
-	cmd := exec.Command("gh", "pr", "update-branch", fmt.Sprintf("%d", prNumber))
+	ctx, cancel := context.WithTimeout(context.Background(), prUpdateBranchTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gh", "pr", "update-branch", fmt.Sprintf("%d", prNumber))
 	cmd.Dir = g.workDir
 	if out, err := cmd.CombinedOutput(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("gh pr update-branch %d timed out after %v (remote may be unreachable)",
+				prNumber, prUpdateBranchTimeout)
+		}
 		return fmt.Errorf("gh pr update-branch %d failed: %s: %w",
 			prNumber, strings.TrimSpace(string(out)), err)
 	}

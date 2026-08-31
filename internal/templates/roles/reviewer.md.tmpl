@@ -80,8 +80,8 @@ Read the request bead/mail to extract `<pr>`, the recorded head `<sha>`, and the
    your summary but review the requested SHA anyway.
 
    The SHA you were sent is **normally** up to date with the base branch: on a
-   refinery dispatch, `{{ cmd }} reviewer request` updates a behind PR before
-   sending it and sends you the resulting commit. Normally, not always — an
+   refinery dispatch, `{{ cmd }} refinery pr await-review` updates a behind PR
+   before dispatching and sends you the resulting commit. Normally, not always — an
    update that failed (usually a branch conflicting with its base) or that never
    landed is dispatched as-is, and a crew dispatch does not update at all. If you
    notice the head is behind its base, say so in your verdict and review it

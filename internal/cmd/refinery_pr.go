@@ -742,6 +742,18 @@ func awaitReviewInner(args []string) error {
 			!strings.EqualFold(beadState.CommitSHA, headSHA)
 		if beadState.StartedAt.IsZero() || driftReset {
 			round := dispatchRound(beadState)
+			// Refuse to write anything the dispatch cannot follow. `gt reviewer
+			// request` fails fast when the reviewer token env is unset, and the
+			// update below is a push: without this check a misconfigured rig
+			// lands a merge commit on the polecat's branch — restarting CI, and
+			// clearing approvals where the repo dismisses stale reviews — and
+			// then fails to dispatch, so StartedAt is never persisted and the
+			// next cycle re-enters and pushes again.
+			if tokenEnv := cfg.GetReviewerTokenEnv(); os.Getenv(tokenEnv) == "" {
+				return fmt.Errorf("await-review: reviewer_local is set but the reviewer token "+
+					"env %q is not — add `export %s=…` to settings/daemon.env and restart the "+
+					"daemon (no branch update was pushed)", tokenEnv, tokenEnv)
+			}
 			// Update a PR that is behind its base BEFORE dispatching, and carry
 			// the resulting commit forward as headSHA. Here, not inside the
 			// dispatch, so the commit is known by construction: headSHA is what
