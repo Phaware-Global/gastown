@@ -352,6 +352,61 @@ func TestFindCommandSubstitutionInTextFlag(t *testing.T) {
 			wantFlag:   positionalArgLabel,
 			wantBinary: "bd",
 		},
+
+		// --- Round-4 findings (gt-h38j.1 review of 1194378b) ---
+		{
+			// Finding: round 3's global-flag fail-open fix only touched
+			// skipBdGlobalArgs; skipGtGlobalArgs still aborted to -1 on
+			// any unrecognized flag, so gt's positional scan never ran
+			// at all when a novel global flag preceded the subcommand.
+			name:       "gt unrecognized global flag no longer smuggles the subcommand past the scan (gt's twin of the bd fix)",
+			command:    "gt --newglobal nudge mayor/ \"check `id` output\"",
+			wantBlock:  true,
+			wantFlag:   positionalArgLabel,
+			wantBinary: "gt",
+		},
+		{
+			// Finding: a value-taking unknown global flag reached the
+			// same fail-open gap from the value side.
+			name:       "bd unrecognized global flag with a value no longer smuggles the subcommand past the scan",
+			command:    "bd --newglobal val create \"Fix `id` thing\"",
+			wantBlock:  true,
+			wantFlag:   positionalArgLabel,
+			wantBinary: "bd",
+		},
+		{
+			// Finding: the positional scan skipped a flag TOKEN via
+			// isFlagToken but never skipped the token that follows it,
+			// so a non-text flag's own value (not agent free text) was
+			// scanned as if it were the positional argument, false-
+			// blocking a legitimate command.
+			name:      "positional scan skips a preceding flag's separate value, not just the flag itself",
+			command:   `bd create "Fix X" -p 1 --labels "round-$(date +%s)"`,
+			wantBlock: false,
+		},
+		{
+			name:      "positional scan skips a preceding flag's quoted separate value",
+			command:   `bd create "t" --assignee "$(gt whoami)"`,
+			wantBlock: false,
+		},
+		{
+			// Finding: flagAndValue inspected the attached value form
+			// (git-style -mtext) only for short flags; a long flag glued
+			// to its quoted value by shlex (no "=", no separate next
+			// token) was never scanned.
+			name:       "attached long-flag value caught (git-style --append-notes\"text\")",
+			command:    "bd update gt-x --append-notes\"see `find /`\"",
+			wantBlock:  true,
+			wantFlag:   "--append-notes",
+			wantBinary: "bd",
+		},
+		{
+			name:       "attached long-flag value caught for --body",
+			command:    "gt mail send x/ --body\"hi `id`\"",
+			wantBlock:  true,
+			wantFlag:   "--body",
+			wantBinary: "gt",
+		},
 	}
 
 	for _, tc := range tests {

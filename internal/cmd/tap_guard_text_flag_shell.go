@@ -310,6 +310,17 @@ func flagAndValue(tok string) (flag, value string, hasValue bool) {
 	if idx := strings.IndexByte(tok, '='); idx >= 0 && strings.HasPrefix(tok, "--") {
 		return tok[:idx], tok[idx+1:], true
 	}
+	// Attached long-flag value: shlex merges a long flag with an
+	// adjacent quoted run into one word, same as the short-flag case
+	// below, e.g. --append-notes"see `find /`" tokenizes as one word
+	// with no "=" and no separate next token to inspect.
+	if strings.HasPrefix(tok, "--") {
+		for f := range textBearingLongFlags {
+			if len(tok) > len(f) && strings.HasPrefix(tok, f) {
+				return f, tok[len(f):], true
+			}
+		}
+	}
 	// Attached short-flag value, the git-style spelling an agent
 	// commonly writes: -m"note with $(id)" tokenizes as one word
 	// ("-m" concatenated with the quoted run) since shlex merges
@@ -466,13 +477,28 @@ func findCommandSubstitutionInPositional(tokens []string) (commandSubstitutionMa
 	}
 	binary := tokens[binIdx]
 
-	subIdx := skipBinaryGlobalArgs(binary, tokens, binIdx+1)
-	if subIdx < 0 || subIdx >= len(tokens) {
-		return commandSubstitutionMatch{}, false
+	// Resolve the subcommand by scanning for the first token that IS
+	// one of the known positional-text subcommands, rather than by
+	// walking skipBinaryGlobalArgs's per-binary global-flag table: a
+	// novel global flag that table doesn't recognize (either binary's
+	// table — skipGtGlobalArgs in particular still aborts to -1 on
+	// any unrecognized flag) would otherwise smuggle the subcommand
+	// past this scan undetected. Fall back to skipBinaryGlobalArgs
+	// only when no known subcommand token appears at all, to preserve
+	// the "not a positional-text subcommand" no-match result for
+	// commands like "bd show gt-abc".
+	subIdx := -1
+	for i := binIdx + 1; i < len(tokens); i++ {
+		if positionalTextSubcommands[tokens[i]] {
+			subIdx = i
+			break
+		}
 	}
-	subcommand := tokens[subIdx]
-	if !positionalTextSubcommands[subcommand] {
-		return commandSubstitutionMatch{}, false
+	if subIdx < 0 {
+		subIdx = skipBinaryGlobalArgs(binary, tokens, binIdx+1)
+		if subIdx < 0 || subIdx >= len(tokens) || !positionalTextSubcommands[tokens[subIdx]] {
+			return commandSubstitutionMatch{}, false
+		}
 	}
 
 	for i := subIdx + 1; i < len(tokens); i++ {
@@ -481,6 +507,15 @@ func findCommandSubstitutionInPositional(tokens []string) (commandSubstitutionMa
 			break // everything after a redirect is shell-interpreted, not a bd/gt argument
 		}
 		if isFlagToken(tok) {
+			// A flag's own value is the flag's semantic argument, not
+			// free text destined for the positional slot — only skip
+			// the value when it's a separate token (no attached
+			// "=value" already consumed by this same token), e.g. -p 1
+			// or --labels "round-$(date +%s)" on "bd create ... -p 1
+			// --labels ...".
+			if !strings.Contains(tok, "=") && i+1 < len(tokens) {
+				i++
+			}
 			continue
 		}
 		if containsCommandSubstitution(tok) {
@@ -626,8 +661,9 @@ func printCommandSubstitutionBlock(match commandSubstitutionMatch, command strin
 	fmt.Fprintln(os.Stderr, "╔════════════════════════════════════════════════════════════════════════╗")
 	fmt.Fprintln(os.Stderr, "║  ❌ COMMAND SUBSTITUTION IN TEXT ARGUMENT BLOCKED                      ║")
 	fmt.Fprintln(os.Stderr, "╠════════════════════════════════════════════════════════════════════════╣")
-	fmt.Fprintf(os.Stderr, "║  Flag:    %-63s ║\n", truncateStr(match.flag, 63))
-	fmt.Fprintf(os.Stderr, "║  Command: %-63s ║\n", truncateStr(command, 63))
+	flatCommand := strings.Join(strings.Fields(command), " ")
+	fmt.Fprintf(os.Stderr, "║  Flag:    %-60s ║\n", truncateStr(match.flag, 60))
+	fmt.Fprintf(os.Stderr, "║  Command: %-60s ║\n", truncateStr(flatCommand, 60))
 	fmt.Fprintln(os.Stderr, "║                                                                        ║")
 	fmt.Fprintln(os.Stderr, "║  A backtick or $(...) inside this argument runs as a shell command     ║")
 	fmt.Fprintln(os.Stderr, "║  when Claude Code's Bash tool wraps this line in eval \"...\". Quoting   ║")
