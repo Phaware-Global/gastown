@@ -745,6 +745,18 @@ func awaitReviewInner(args []string) error {
 			if derr := dispatchLocalReviewer(prNumber, refPrAwaitMR, headSHA, round); derr != nil {
 				return fmt.Errorf("await-review: dispatching local reviewer: %w", derr)
 			}
+			// The dispatch updates a PR that is behind its base, which moves the
+			// upstream head. Re-read it: headSHA is what the step below both
+			// SHA-scopes the engagement check against and persists as the bead's
+			// commit_sha, so leaving the pre-update value here would record a
+			// commit the Reviewer was not dispatched against — and the next
+			// patrol cycle would read the move as an author force-push, drift-
+			// reset, and dispatch a duplicate review of the commit just
+			// reviewed. Best-effort: a read failure leaves the pre-update SHA,
+			// which is the behavior this had before the update existed.
+			if newHead, herr := provider.CurrentHeadSHA(prNumber); herr == nil && newHead != "" {
+				headSHA = newHead
+			}
 		}
 	}
 

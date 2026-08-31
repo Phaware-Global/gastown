@@ -3708,3 +3708,47 @@ func TestWaitForPRUpdate_ConfirmsTheBaseIsContained(t *testing.T) {
 		t.Errorf("waited %s — the poll must be bounded by the timeout", elapsed)
 	}
 }
+
+// Two PRs fetched into the same repository must not cross wires. FETCH_HEAD is
+// one file per repository — shared by every worktree and process — so resolving
+// it after a fetch could return whichever PR landed last. The per-PR refs make
+// each answer belong to the PR that was asked about.
+func TestFetchPRHead_IsolatesConcurrentPRs(t *testing.T) {
+	remote := initTestRepo(t)
+	defaultBranch := gitIn(t, remote, "rev-parse", "--abbrev-ref", "HEAD")
+
+	heads := map[int]string{}
+	for _, pr := range []int{1, 2} {
+		gitIn(t, remote, "checkout", "-q", defaultBranch)
+		gitIn(t, remote, "checkout", "-qb", fmt.Sprintf("pr-%d", pr))
+		if err := os.WriteFile(filepath.Join(remote, fmt.Sprintf("pr%d.txt", pr)), []byte("x\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		gitIn(t, remote, "add", ".")
+		gitIn(t, remote, "commit", "-qm", fmt.Sprintf("pr %d", pr))
+		heads[pr] = gitIn(t, remote, "rev-parse", "HEAD")
+		gitIn(t, remote, "update-ref", fmt.Sprintf("refs/pull/%d/head", pr), heads[pr])
+	}
+	gitIn(t, remote, "checkout", "-q", defaultBranch)
+
+	clone := t.TempDir()
+	gitIn(t, clone, "clone", "-q", remote, ".")
+	g := NewGit(clone)
+
+	// Interleave the fetches the way two overlapping dispatches would.
+	first, err := g.FetchPRHead(1)
+	if err != nil {
+		t.Fatalf("FetchPRHead(1): %v", err)
+	}
+	if _, err := g.FetchPRHead(2); err != nil {
+		t.Fatalf("FetchPRHead(2): %v", err)
+	}
+	again, err := g.FetchPRHead(1)
+	if err != nil {
+		t.Fatalf("FetchPRHead(1) again: %v", err)
+	}
+	if first != heads[1] || again != heads[1] {
+		t.Errorf("PR 1 resolved to %s/%s, want %s — a concurrent fetch must not change the answer",
+			first, again, heads[1])
+	}
+}

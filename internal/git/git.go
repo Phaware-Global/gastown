@@ -1962,11 +1962,19 @@ func (g *Git) FetchPRHead(prNumber int) (string, error) {
 	if prNumber <= 0 {
 		return "", fmt.Errorf("fetch PR head: invalid PR number %d", prNumber)
 	}
-	ref := fmt.Sprintf("pull/%d/head", prNumber)
-	if _, err := g.run("fetch", "origin", ref, "+refs/heads/*:refs/remotes/origin/*"); err != nil {
-		return "", fmt.Errorf("fetching %s: %w", ref, err)
+	// Land the head on a private per-PR ref and resolve THAT, never FETCH_HEAD.
+	// FETCH_HEAD is one file per repository, so it is shared by every worktree
+	// and every concurrent process: a second fetch landing between this fetch
+	// and the rev-parse would hand back the other PR's head. That was harmless
+	// while this ran only in the reviewer's private worktree; it is not once a
+	// shared worktree calls it, and WaitForPRUpdate re-runs it every couple of
+	// seconds, so the window is wide rather than instantaneous.
+	local := fmt.Sprintf("refs/gt/pr/%d", prNumber)
+	refspec := fmt.Sprintf("+refs/pull/%d/head:%s", prNumber, local)
+	if _, err := g.run("fetch", "origin", refspec, "+refs/heads/*:refs/remotes/origin/*"); err != nil {
+		return "", fmt.Errorf("fetching refs/pull/%d/head: %w", prNumber, err)
 	}
-	sha, err := g.Rev("FETCH_HEAD")
+	sha, err := g.Rev(local)
 	if err != nil {
 		return "", fmt.Errorf("resolving the fetched head of PR #%d: %w", prNumber, err)
 	}

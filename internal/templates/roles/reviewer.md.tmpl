@@ -79,11 +79,13 @@ Read the request bead/mail to extract `<pr>`, the recorded head `<sha>`, and the
    refinery's SHA-scoped engagement gate. If upstream HEAD has moved, note it in
    your summary but review the requested SHA anyway.
 
-   The SHA you were sent is already up to date with the base branch: if the PR
-   was behind, `{{ cmd }} reviewer request` updated it before dispatching and
-   sent you the resulting commit. So the head you detach at is one that would
-   survive a merge — you do not need to check, and you must not update it
-   yourself.
+   The SHA you were sent is **normally** up to date with the base branch: on a
+   refinery dispatch, `{{ cmd }} reviewer request` updates a behind PR before
+   sending it and sends you the resulting commit. Normally, not always — an
+   update that failed (usually a branch conflicting with its base) or that never
+   landed is dispatched as-is, and a crew dispatch does not update at all. If you
+   notice the head is behind its base, say so in your verdict and review it
+   anyway. Never update the branch yourself.
 
 2. **List the enabled perspectives** for this rig:
    ```bash
