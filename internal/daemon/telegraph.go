@@ -174,8 +174,12 @@ func (m *TelegraphServerManager) isRunning() (int, bool) {
 		// evidence that a handle we already hold is dead, including an
 		// adopted one (the file is unauthenticated; see doc above). Keep
 		// reporting it running without rewriting the file, so an adopted PID
-		// is never re-blessed with a fresh nonce.
-		if m.process != nil && m.isAlive(m.process) {
+		// is never re-blessed with a fresh nonce. A self-started child that
+		// has already been reaped is the exception: that death report can't
+		// be spoofed by the file going missing, so it still outranks the
+		// platform's raw liveness probe here (see reaped doc above).
+		reaped := m.selfStarted && m.reaped != nil && m.reaped.Load()
+		if m.process != nil && !reaped && m.isAlive(m.process) {
 			return m.process.Pid, true
 		}
 		m.process = nil

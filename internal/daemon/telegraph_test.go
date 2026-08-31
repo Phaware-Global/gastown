@@ -491,6 +491,48 @@ func TestTelegraph_AdoptedHandleNotKilledByStaleReapedFlag(t *testing.T) {
 	}
 }
 
+// TestTelegraph_ReapedSelfStartedHandleOverridesMissingPIDFile guards the
+// missing/unparseable-PID-file branch: a self-started child that has already
+// been reaped must not be reported running just because the file that would
+// have named a dead PID is gone, mirroring the guard the recycled-PID and
+// live-Windows-probe cases above already get.
+func TestTelegraph_ReapedSelfStartedHandleOverridesMissingPIDFile(t *testing.T) {
+	cfg := &TelegraphServerConfig{
+		Enabled:             true,
+		AutoRestart:         true,
+		RestartDelay:        0,
+		MaxRestartsInWindow: 5,
+		RestartWindow:       time.Minute,
+	}
+	m := newTestTelegraphManager(t, cfg)
+	if err := os.MkdirAll(filepath.Dir(m.pidFile()), 0755); err != nil {
+		t.Fatalf("failed to create pid dir: %v", err)
+	}
+
+	pid := os.Getpid()
+	m.process = &os.Process{Pid: pid}
+	m.selfStarted = true
+	m.aliveFn = func(*os.Process) bool { return true }
+	reaped := &atomic.Bool{}
+	reaped.Store(true)
+	m.reaped = reaped
+
+	// No PID file at all — verifyPIDOwnership reports pid=0, taking the
+	// err != nil || pid == 0 branch.
+
+	var starts int32
+	m.startFn = func() error {
+		atomic.AddInt32(&starts, 1)
+		return nil
+	}
+
+	m.EnsureRunning()
+
+	if got := atomic.LoadInt32(&starts); got != 1 {
+		t.Fatalf("expected EnsureRunning to restart Telegraph when its own reaped handle reports death despite a missing PID file, got %d starts", got)
+	}
+}
+
 // TestTelegraph_HealthCheckIntervalDefault verifies fallback to 30s.
 func TestTelegraph_HealthCheckIntervalDefault(t *testing.T) {
 	m := newTestTelegraphManager(t, &TelegraphServerConfig{Enabled: true})
