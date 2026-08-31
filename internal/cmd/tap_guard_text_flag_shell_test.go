@@ -340,6 +340,18 @@ func TestFindCommandSubstitutionInTextFlag(t *testing.T) {
 			wantFlag:   positionalArgLabel,
 			wantBinary: "gt",
 		},
+		{
+			// Finding: an unrecognized bd global flag used to abort
+			// skipBdGlobalArgs to -1, which made the positional scan
+			// report no match — the opposite of the conservative
+			// intent. A future bd global flag this scan doesn't know
+			// about must not smuggle the subcommand past it.
+			name:       "bd unrecognized global flag no longer smuggles the subcommand past the scan",
+			command:    "bd --newglobal create \"Fix `id` thing\"",
+			wantBlock:  true,
+			wantFlag:   positionalArgLabel,
+			wantBinary: "bd",
+		},
 	}
 
 	for _, tc := range tests {

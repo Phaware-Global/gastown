@@ -514,10 +514,11 @@ func skipBinaryGlobalArgs(binary string, tokens []string, start int) int {
 // way to target a repo (bd create --repo silently loses data, per
 // gt/bd known gotchas), which round-2's positional scan missed
 // entirely because it assumed the subcommand was always
-// tokens[binIdx+1]. Conservative like tap_guard_push_main.go's
-// skipGitGlobalArgs: an unrecognized flag aborts to -1 rather than
-// blindly skipping, so a novel global flag can't be used to smuggle
-// the subcommand past this scan undetected.
+// tokens[binIdx+1]. Unlike tap_guard_push_main.go's skipGitGlobalArgs,
+// an unrecognized flag is skipped rather than aborting to -1: aborting
+// would make findCommandSubstitutionInPositional report no match (the
+// opposite of conservative), letting a novel global flag smuggle the
+// subcommand past this scan undetected.
 func skipBdGlobalArgs(tokens []string, start int) int {
 	consumesNext := map[string]bool{
 		"-C": true, "--directory": true,
@@ -549,7 +550,9 @@ func skipBdGlobalArgs(tokens []string, start int) int {
 			i += 2
 			continue
 		}
-		return -1
+		// Unknown flag: assume it's boolean and keep scanning rather
+		// than aborting — see the fail-open note above.
+		i++
 	}
 	return -1
 }
@@ -621,16 +624,16 @@ func runTapGuardTextFlagShell(cmd *cobra.Command, args []string) error {
 func printCommandSubstitutionBlock(match commandSubstitutionMatch, command string) {
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "╔════════════════════════════════════════════════════════════════════════╗")
-	fmt.Fprintln(os.Stderr, "║  ❌ COMMAND SUBSTITUTION IN TEXT ARGUMENT BLOCKED                       ║")
+	fmt.Fprintln(os.Stderr, "║  ❌ COMMAND SUBSTITUTION IN TEXT ARGUMENT BLOCKED                      ║")
 	fmt.Fprintln(os.Stderr, "╠════════════════════════════════════════════════════════════════════════╣")
 	fmt.Fprintf(os.Stderr, "║  Flag:    %-63s ║\n", truncateStr(match.flag, 63))
 	fmt.Fprintf(os.Stderr, "║  Command: %-63s ║\n", truncateStr(command, 63))
-	fmt.Fprintln(os.Stderr, "║                                                                          ║")
+	fmt.Fprintln(os.Stderr, "║                                                                        ║")
 	fmt.Fprintln(os.Stderr, "║  A backtick or $(...) inside this argument runs as a shell command     ║")
 	fmt.Fprintln(os.Stderr, "║  when Claude Code's Bash tool wraps this line in eval \"...\". Quoting   ║")
 	fmt.Fprintln(os.Stderr, "║  the argument does not protect it — the surrounding eval re-parses     ║")
-	fmt.Fprintln(os.Stderr, "║  regardless of your quote style.                                        ║")
-	fmt.Fprintln(os.Stderr, "║                                                                          ║")
+	fmt.Fprintln(os.Stderr, "║  regardless of your quote style.                                       ║")
+	fmt.Fprintln(os.Stderr, "║                                                                        ║")
 	// Point at a real file, not a heredoc typed into this same Bash
 	// command: a heredoc body is still text on this command line, so
 	// its safety depends on exactly how the Bash wrapper parses it —
@@ -652,9 +655,13 @@ func printCommandSubstitutionBlock(match commandSubstitutionMatch, command strin
 		fmt.Fprintln(os.Stderr, "║    gt <command> ... --stdin < <path>                                   ║")
 	}
 	if match.flag == positionalArgLabel {
-		fmt.Fprintln(os.Stderr, "║                                                                          ║")
-		fmt.Fprintln(os.Stderr, "║  This text has no flag — it's a positional argument. Rewrite it        ║")
-		fmt.Fprintln(os.Stderr, "║  without the backtick/$(...) construct instead.                        ║")
+		fmt.Fprintln(os.Stderr, "║                                                                        ║")
+		if match.binary == "bd" {
+			fmt.Fprintln(os.Stderr, "║  This text has no flag — it's a positional argument. Rewrite it        ║")
+			fmt.Fprintln(os.Stderr, "║  without the backtick/$(...) construct instead.                        ║")
+		} else {
+			fmt.Fprintln(os.Stderr, "║  This text has no flag — it's a positional argument.                   ║")
+		}
 	}
 	fmt.Fprintln(os.Stderr, "╚════════════════════════════════════════════════════════════════════════╝")
 	fmt.Fprintln(os.Stderr, "")
