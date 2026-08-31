@@ -3798,3 +3798,33 @@ func TestWaitForPRUpdate_UnaffectedByABaseThatAdvancesMidWait(t *testing.T) {
 		t.Errorf("head = %s, want the merge commit %s", head, merged)
 	}
 }
+
+// runWithTimeout's deadline is only as good as its process handling, and both
+// halves are single lines whose absence is invisible from reading the code —
+// which is why the defect they fix had to be measured rather than spotted. This
+// pins the behaviour: a git invocation whose child outlives the deadline must
+// still return promptly, not when the child finally exits.
+func TestRunWithTimeout_ReturnsWhenAChildOutlivesTheDeadline(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell alias is POSIX-only")
+	}
+	g := NewGit(initTestRepo(t))
+
+	// A git alias that backgrounds a sleeper holding the inherited stdout, then
+	// blocks itself — the shape of `git fetch` with a stuck transport helper.
+	const sleeper = "!sh -c 'sleep 45 & sleep 45'"
+
+	start := time.Now()
+	_, err := g.runWithTimeout(time.Second, "-c", "alias.hang="+sleeper, "hang")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Error("a command killed by its deadline must report an error")
+	}
+	// The deadline plus the WaitDelay backstop, with slack for a loaded CI box.
+	if budget := time.Second + subprocessWaitDelay + 5*time.Second; elapsed > budget {
+		t.Errorf("runWithTimeout returned after %s, over the %s budget — the deadline is "+
+			"not enforceable: killing git does not reap the child holding the pipe, so Wait "+
+			"blocks on it (see subprocessWaitDelay and SetProcessGroup)", elapsed, budget)
+	}
+}

@@ -137,8 +137,9 @@ const pushTimeout = 60 * time.Second
 const fetchTimeout = 60 * time.Second
 
 // prUpdateBranchTimeout bounds the `gh pr update-branch` call for the same
-// reason, and ghViewTimeout the read-only `gh pr view` calls that run ahead of
-// both on the refinery patrol's critical path.
+// reason, and ghViewTimeout the read-only `gh pr view` calls on the refinery
+// patrol's critical path — GhPrHeadSHA, which await-review calls first, and
+// GhPrBaseBranch, which the update path calls before deciding anything.
 const (
 	prUpdateBranchTimeout = 60 * time.Second
 	ghViewTimeout         = 30 * time.Second
@@ -171,7 +172,14 @@ func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "git", args...)
-	util.SetDetachedProcessGroup(cmd)
+	// SetProcessGroup, not SetDetachedProcessGroup: the detached variant sets
+	// Setpgid without a Cancel hook, so the deadline kill reaches only git's own
+	// PID and the transport helper stuck on the socket survives — orphaned, still
+	// holding its fd. WaitDelay alone would unblock this caller and leak that
+	// process on every poll. The group kill takes the helper with it, and the
+	// call returns at the deadline instead of deadline+WaitDelay. Must stay
+	// AFTER CommandContext, whose default single-PID Cancel it replaces.
+	util.SetProcessGroup(cmd)
 	if g.workDir != "" {
 		cmd.Dir = g.workDir
 	}
@@ -179,8 +187,8 @@ func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	// Without this the timeout above is advisory: killing git does not kill the
-	// transport helper holding the stdio pipe, and Wait blocks on it. See
+	// Backstop for anything the group kill misses: without it Wait blocks on the
+	// copy goroutines until every descendant closes the inherited pipe. See
 	// subprocessWaitDelay.
 	cmd.WaitDelay = subprocessWaitDelay
 
@@ -223,7 +231,15 @@ func (g *Git) runWithEnvAndTimeout(args []string, extraEnv []string, timeout tim
 	if cancel != nil {
 		defer cancel()
 	}
-	util.SetDetachedProcessGroup(cmd)
+	if timeout > 0 {
+		// Same pairing as runWithTimeout: group kill so the deadline reaches the
+		// transport helper, WaitDelay so Wait cannot block on its pipe. Without
+		// both, pushTimeout here is advisory and `gt mq integration land` hangs
+		// on a half-open connection with no exit code.
+		util.SetProcessGroup(cmd)
+	} else {
+		util.SetDetachedProcessGroup(cmd)
+	}
 
 	if g.workDir != "" {
 		cmd.Dir = g.workDir
@@ -234,6 +250,9 @@ func (g *Git) runWithEnvAndTimeout(args []string, extraEnv []string, timeout tim
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	if timeout > 0 {
+		cmd.WaitDelay = subprocessWaitDelay
+	}
 	err := cmd.Run()
 	if err != nil {
 		if timeout > 0 {
@@ -1967,9 +1986,8 @@ func (g *Git) GhPrBaseBranch(prNumber int) (string, error) {
 	if prNumber <= 0 {
 		return "", fmt.Errorf("gh pr base branch: invalid PR number %d", prNumber)
 	}
-	// Deadlined: this is the FIRST call GhPrBaseStatus makes, so an unbounded
-	// one hangs the refinery patrol before either of the deadlines below can
-	// apply. Callers treat an error here as non-fatal — they warn and dispatch
+	// Deadlined: this is the first call GhPrBaseStatus makes, so an unbounded
+	// one hangs the update path before either of the deadlines below can apply. Callers treat an error here as non-fatal — they warn and dispatch
 	// the commit as-is — so bounding it fails the round forward rather than
 	// wedging with no exit code.
 	ctx, cancel := context.WithTimeout(context.Background(), ghViewTimeout)
@@ -2495,9 +2513,15 @@ func (g *Git) GhPrHasReviewFromOnSHA(prNumber int, user, sha string) (bool, erro
 // HasReviewFromOnSHA without trusting potentially stale local refs or
 // MR-bead state (G36 — bead's commit_sha can drift after a force-push).
 func (g *Git) GhPrHeadSHA(prNumber int) (string, error) {
-	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber),
+	// Deadlined: await-review calls this FIRST on every patrol cycle, and treats
+	// its error as fatal, so an unbounded one wedges the patrol with no exit
+	// code before any later deadline can apply.
+	ctx, cancel := context.WithTimeout(context.Background(), ghViewTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view", fmt.Sprintf("%d", prNumber),
 		"--json", "headRefOid")
 	cmd.Dir = g.workDir
+	cmd.WaitDelay = subprocessWaitDelay
 	// Capture stdout and stderr separately so an auth/permission failure
 	// from gh surfaces in the wrapped error rather than being lost behind
 	// a bare exit-status. await-review escalations on PR #N going dark
@@ -2507,6 +2531,10 @@ func (g *Git) GhPrHeadSHA(prNumber int) (string, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("gh pr view (headRefOid) timed out after %v "+
+				"(remote may be unreachable)", ghViewTimeout)
+		}
 		return "", fmt.Errorf("gh pr view (headRefOid) failed: %s: %w",
 			strings.TrimSpace(stderr.String()), err)
 	}
@@ -4406,9 +4434,10 @@ func (g *Git) PushSubmoduleCommit(submodulePath, sha, remote string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), pushTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", "-C", absPath, "push", remote, sha+":refs/heads/"+defaultBranch)
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
+	cmd.WaitDelay = subprocessWaitDelay
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("pushing submodule %s timed out after %v (remote may be unreachable)", submodulePath, pushTimeout)
