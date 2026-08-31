@@ -174,17 +174,12 @@ branch, round, and origin (refinery when --mr is given, else crew), sends it to
 <rig>/reviewer, and starts the reviewer session if one isn't already running
 (idempotent — a second request queues in the running session's mailbox).
 
-If the PR is behind its base branch, the branch is updated first (the "Update
-branch" merge, via gh) and the review is dispatched against the commit that
-produces — a head behind its base is not the code that would result from
-merging, so reviewing it misses interactions with work already on the base and
-raises findings the base has already fixed. Updating here rather than in the
-Reviewer's checkout keeps the push on the refinery's side of the fence: the
-Reviewer must not write to the branch its own review gates. Because the update
-moves the upstream head, the caller must re-read it after dispatch — 'refinery
-pr await-review' does — or the MR bead records the pre-update commit and the
-next patrol cycle reads the move as drift. A branch that cannot be updated —
-most often one that conflicts with its base — is reported and dispatched as-is.
+This command dispatches; it does not write to the PR. When the head is behind
+its base, 'refinery pr await-review' updates the branch BEFORE calling this and
+passes the resulting commit as --sha, so the SHA dispatched, the SHA the
+engagement gate is scoped to, and the SHA persisted on the MR bead are the same
+commit. A crew dispatch does no update at all, so --sha may be behind its base;
+the Reviewer notes that in its verdict rather than acting on it.
 
 On round >= 2 the prior round's unresolved review threads are fetched and
 embedded so the Reviewer has the fix-loop context without gathering it itself.`,
@@ -586,8 +581,8 @@ var (
 	prUpdatePollWait = 2 * time.Second
 )
 
-// reviewerDispatchGit returns a git handle on the rig worktree the dispatch side
-// works from. The refinery's own worktree first, the mayor's as a fallback —
+// reviewerDispatchGit returns a git handle on the rig worktree the refinery's
+// dispatch step works from. The refinery's own worktree first, the mayor's as a fallback —
 // the same pair refinery.NewEngineer picks, and for the same reason: the rig
 // directory itself resolves to the town's .git, whose remotes are rig-named
 // rather than "origin".
@@ -602,6 +597,16 @@ func reviewerDispatchGit(r *rig.Rig) *git.Git {
 // updatePRBranchIfBehind brings the PR branch up to date with its base when the
 // commit about to be dispatched has fallen behind, and returns the commit the
 // review should target instead.
+//
+// Called by the refinery's await-review step BEFORE it dispatches, never by the
+// dispatch command itself. Both halves of that matter. The update is a push, and
+// `gt reviewer request` is crew-facing with its PR number straight from argv, so
+// updating there would let a mistyped number land a merge on a PR nobody asked
+// to touch. And the caller has to KNOW the commit it dispatched: reading the
+// head back afterwards cannot distinguish this update from an author push that
+// raced it, and adopting the wrong commit deadlocks the SHA-scoped engagement
+// gate with the drift reset — the thing that used to heal that race — now
+// disarmed, because the bead and the upstream head agree.
 //
 // The second return value is true ONLY on a verified update. The verification is
 // the point: this value replaces the SHA the round is dispatched with, so
@@ -636,7 +641,10 @@ func updatePRBranchIfBehind(g *git.Git, prNumber int, wantSHA string) (string, b
 			"resolve it", prNumber, status.Base, err)
 		return "", false
 	}
-	updated, landed := g.WaitForPRUpdate(prNumber, prUpdateTimeout, prUpdatePollWait)
+	// Poll against the base commit the update was asked to merge, captured
+	// before the push: re-resolving the base each poll would report a landed
+	// merge as failed the moment another PR merges to the base mid-wait.
+	updated, landed := g.WaitForPRUpdate(prNumber, status.BaseSHA, prUpdateTimeout, prUpdatePollWait)
 	if !landed {
 		style.PrintWarning("PR #%d's branch update has not landed after %s — dispatching "+
 			"against the commit as-is; re-dispatch once the update appears",
@@ -644,8 +652,8 @@ func updatePRBranchIfBehind(g *git.Git, prNumber int, wantSHA string) (string, b
 		return "", false
 	}
 	fmt.Printf("PR #%d updated against %s — reviewing %s\n",
-		prNumber, status.Base, shortSHA(updated.HeadSHA))
-	return updated.HeadSHA, true
+		prNumber, status.Base, shortSHA(updated))
+	return updated, true
 }
 
 // ensureReviewerCodegraphIndex synchronously (re)builds the codegraph index for
@@ -1050,28 +1058,6 @@ func runReviewerRequest(cmd *cobra.Command, args []string) error {
 	}
 
 	origin := reviewer.DefaultOrigin(reviewerRequestOrigin, reviewerRequestMR)
-
-	// Bring a PR that is behind its base up to date before dispatching, and
-	// dispatch the commit that produces. A head behind its base is not the code
-	// that would result from merging: reviewing it misses interactions with work
-	// already on the base and raises findings the base has already fixed, each
-	// costing a fix round to argue away.
-	//
-	// Refinery dispatches only. The update is a push, and this command is
-	// crew-facing: prNumber comes from argv, so an unconditional update would
-	// let a mistyped number land a merge commit on a PR nobody asked to touch —
-	// restarting its CI and, where the repo dismisses stale reviews, its
-	// approvals. On the refinery path the number is the MR bead's, and pushing
-	// this branch is already the refinery's job. A crew review of a behind PR
-	// still runs; it just reviews the head as it stands.
-	//
-	// After the SHA guard, so a failed CurrentHeadSHA cannot itself trigger a
-	// remote write.
-	if origin == reviewer.OriginRefinery {
-		if updated, ok := updatePRBranchIfBehind(reviewerDispatchGit(r), prNumber, sha); ok {
-			sha = updated
-		}
-	}
 	spec := reviewer.RequestSpec{
 		PR:      prNumber,
 		HeadSHA: sha,

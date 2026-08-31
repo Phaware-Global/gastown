@@ -3689,7 +3689,8 @@ func TestWaitForPRUpdate_ConfirmsTheBaseIsContained(t *testing.T) {
 	gitIn(t, clone, "clone", remote, ".")
 	g := NewGit(clone)
 
-	if _, landed := g.WaitForPRUpdate(1, time.Second, 10*time.Millisecond); !landed {
+	baseRev := gitIn(t, clone, "rev-parse", "origin/"+defaultBranch)
+	if _, landed := g.WaitForPRUpdate(1, baseRev, time.Second, 10*time.Millisecond); !landed {
 		t.Error("a head already containing the base must land immediately")
 	}
 
@@ -3699,9 +3700,10 @@ func TestWaitForPRUpdate_ConfirmsTheBaseIsContained(t *testing.T) {
 	}
 	gitIn(t, remote, "add", ".")
 	gitIn(t, remote, "commit", "-m", "base moves on")
+	movedBase := gitIn(t, remote, "rev-parse", "HEAD")
 
 	start := time.Now()
-	if _, landed := g.WaitForPRUpdate(1, 150*time.Millisecond, 10*time.Millisecond); landed {
+	if _, landed := g.WaitForPRUpdate(1, movedBase, 150*time.Millisecond, 10*time.Millisecond); landed {
 		t.Error("a head that never gains the base must not report as landed")
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
@@ -3750,5 +3752,49 @@ func TestFetchPRHead_IsolatesConcurrentPRs(t *testing.T) {
 	if first != heads[1] || again != heads[1] {
 		t.Errorf("PR 1 resolved to %s/%s, want %s — a concurrent fetch must not change the answer",
 			first, again, heads[1])
+	}
+}
+
+// The wait answers "did the merge I asked for land", not "is the head current
+// with a base that keeps moving". A base advancing mid-wait — routine on a busy
+// branch — must not make a landed merge read as failed, or the caller discards
+// a merge it just pushed and pushes another next cycle.
+func TestWaitForPRUpdate_UnaffectedByABaseThatAdvancesMidWait(t *testing.T) {
+	remote := initTestRepo(t)
+	defaultBranch := gitIn(t, remote, "rev-parse", "--abbrev-ref", "HEAD")
+
+	gitIn(t, remote, "checkout", "-b", "pr-branch")
+	if err := os.WriteFile(filepath.Join(remote, "pr.txt"), []byte("pr\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, remote, "add", ".")
+	gitIn(t, remote, "commit", "-m", "pr work")
+	gitIn(t, remote, "checkout", defaultBranch)
+
+	clone := t.TempDir()
+	gitIn(t, clone, "clone", remote, ".")
+	g := NewGit(clone)
+	baseAtUpdate := gitIn(t, remote, "rev-parse", "HEAD")
+
+	// The update lands: the base as of that moment is merged into the head.
+	gitIn(t, remote, "checkout", "pr-branch")
+	gitIn(t, remote, "merge", "--no-edit", defaultBranch)
+	merged := gitIn(t, remote, "rev-parse", "HEAD")
+	gitIn(t, remote, "update-ref", "refs/pull/1/head", merged)
+	gitIn(t, remote, "checkout", defaultBranch)
+
+	// …and the base immediately advances again, as another PR merging would.
+	if err := os.WriteFile(filepath.Join(remote, "other.txt"), []byte("other\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, remote, "add", ".")
+	gitIn(t, remote, "commit", "-m", "another PR merges to base")
+
+	head, landed := g.WaitForPRUpdate(1, baseAtUpdate, time.Second, 10*time.Millisecond)
+	if !landed {
+		t.Error("the merge landed; a base that advanced afterwards must not report it as failed")
+	}
+	if head != merged {
+		t.Errorf("head = %s, want the merge commit %s", head, merged)
 	}
 }

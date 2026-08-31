@@ -667,7 +667,7 @@ func awaitReviewInner(args []string) error {
 	if err != nil {
 		return err
 	}
-	provider, cfg, _, err := getRefineryPRContext()
+	provider, cfg, r, err := getRefineryPRContext()
 	if err != nil {
 		return err
 	}
@@ -742,20 +742,24 @@ func awaitReviewInner(args []string) error {
 			!strings.EqualFold(beadState.CommitSHA, headSHA)
 		if beadState.StartedAt.IsZero() || driftReset {
 			round := dispatchRound(beadState)
+			// Update a PR that is behind its base BEFORE dispatching, and carry
+			// the resulting commit forward as headSHA. Here, not inside the
+			// dispatch, so the commit is known by construction: headSHA is what
+			// the step below SHA-scopes the engagement check against AND what it
+			// persists as the bead's commit_sha, so all three — dispatched,
+			// gated, persisted — are the same commit.
+			//
+			// Reading the head back after dispatching cannot do this. It cannot
+			// tell this update from an author push that raced it, and adopting
+			// the wrong commit is unrecoverable: the gate never matches the SHA
+			// the Reviewer posts against, while the bead now equals the upstream
+			// head, so no drift reset fires to heal it and the round waits out
+			// its timeout.
+			if updated, ok := updatePRBranchIfBehind(reviewerDispatchGit(r), prNumber, headSHA); ok {
+				headSHA = updated
+			}
 			if derr := dispatchLocalReviewer(prNumber, refPrAwaitMR, headSHA, round); derr != nil {
 				return fmt.Errorf("await-review: dispatching local reviewer: %w", derr)
-			}
-			// The dispatch updates a PR that is behind its base, which moves the
-			// upstream head. Re-read it: headSHA is what the step below both
-			// SHA-scopes the engagement check against and persists as the bead's
-			// commit_sha, so leaving the pre-update value here would record a
-			// commit the Reviewer was not dispatched against — and the next
-			// patrol cycle would read the move as an author force-push, drift-
-			// reset, and dispatch a duplicate review of the commit just
-			// reviewed. Best-effort: a read failure leaves the pre-update SHA,
-			// which is the behavior this had before the update existed.
-			if newHead, herr := provider.CurrentHeadSHA(prNumber); herr == nil && newHead != "" {
-				headSHA = newHead
 			}
 		}
 	}

@@ -1962,14 +1962,21 @@ func (g *Git) FetchPRHead(prNumber int) (string, error) {
 	if prNumber <= 0 {
 		return "", fmt.Errorf("fetch PR head: invalid PR number %d", prNumber)
 	}
-	// Land the head on a private per-PR ref and resolve THAT, never FETCH_HEAD.
+	// Land the head on a per-worktree ref and resolve THAT, never FETCH_HEAD.
 	// FETCH_HEAD is one file per repository, so it is shared by every worktree
 	// and every concurrent process: a second fetch landing between this fetch
 	// and the rev-parse would hand back the other PR's head. That was harmless
 	// while this ran only in the reviewer's private worktree; it is not once a
 	// shared worktree calls it, and WaitForPRUpdate re-runs it every couple of
 	// seconds, so the window is wide rather than instantaneous.
-	local := fmt.Sprintf("refs/gt/pr/%d", prNumber)
+	//
+	// refs/worktree/, not a plain ref: rig worktrees are `git worktree add` off
+	// one repository and therefore share its ref store, so a repository-global
+	// ref would fix cross-PR contamination and leave same-PR contention — two
+	// processes fetching PR n at once, one of them losing on the ref lock. git
+	// scopes refs/worktree/* to the checkout that writes it, so neither can
+	// happen.
+	local := fmt.Sprintf("refs/worktree/gt/pr/%d", prNumber)
 	refspec := fmt.Sprintf("+refs/pull/%d/head:%s", prNumber, local)
 	if _, err := g.run("fetch", "origin", refspec, "+refs/heads/*:refs/remotes/origin/*"); err != nil {
 		return "", fmt.Errorf("fetching refs/pull/%d/head: %w", prNumber, err)
@@ -1987,6 +1994,10 @@ type PRBaseStatus struct {
 	Base string
 	// HeadSHA is the PR head commit, as of the fetch this status came from.
 	HeadSHA string
+	// BaseSHA is origin/<Base> as of the same fetch. Callers waiting on an
+	// update poll against THIS commit rather than re-resolving the base, so a
+	// base that advances mid-wait cannot make a landed merge read as failed.
+	BaseSHA string
 	// Behind reports that the base branch contains commits the head does not.
 	// Such a head is a stale review target: it is not the code that would
 	// result from merging, so a review of it can miss an interaction with
@@ -2043,34 +2054,39 @@ func (g *Git) GhPrBaseStatus(prNumber int, commit string) (PRBaseStatus, error) 
 		return PRBaseStatus{}, fmt.Errorf("comparing PR #%d (%s) against origin/%s: %w",
 			prNumber, measured, base, err)
 	}
-	return PRBaseStatus{Base: base, HeadSHA: measured, Behind: !upToDate}, nil
+	return PRBaseStatus{Base: base, HeadSHA: measured, BaseSHA: baseRev, Behind: !upToDate}, nil
 }
 
-// WaitForPRUpdate polls until the PR head contains its base branch, which is
-// what confirms an update-branch actually landed. Returns the final status and
+// WaitForPRUpdate polls until the PR head contains baseRev, which is what
+// confirms an update-branch actually landed. Returns the head it landed on and
 // whether it landed within the timeout.
 //
-// It re-reads the SAME ref the checkout will use — refs/pull/<n>/head, via
-// GhPrBaseStatus — rather than the head branch's OID from `gh pr view`. Those
-// are two different refs: either can move first, so a poll on one cannot
-// promise the other carries the merge. And it asks the question that actually
-// matters (is the head still behind?) rather than "did the SHA change", which
-// an unrelated author push in the same window answers yes to.
-func (g *Git) WaitForPRUpdate(prNumber int, timeout, poll time.Duration) (PRBaseStatus, bool) {
+// baseRev is the base commit the update was asked to merge — captured BEFORE
+// the update, not re-resolved each poll. Re-resolving asks "is the head current
+// with the base as it is right now", and on a busy base branch the answer goes
+// false the moment another PR merges during the wait: the merge that did land
+// gets reported as failed, the pre-update SHA is dispatched, and the next cycle
+// pushes another merge on top. Whether the base has since advanced is a
+// different question, and not this one's to answer.
+//
+// It reads the SAME ref the checkout will use — refs/pull/<n>/head, via
+// FetchPRHead — rather than the head branch's OID from `gh pr view`. Those are
+// two different refs: either can move first, so a poll on one cannot promise
+// the other carries the merge.
+func (g *Git) WaitForPRUpdate(prNumber int, baseRev string, timeout, poll time.Duration) (string, bool) {
 	deadline := time.Now().Add(timeout)
-	var last PRBaseStatus
+	head := ""
 	for {
-		status, err := g.GhPrBaseStatus(prNumber, "")
-		// A transient read failure is not evidence the update failed; keep
-		// polling until the deadline and let the caller report the timeout.
-		if err == nil {
-			last = status
-			if !status.Behind {
-				return status, true
+		// A transient failure is not evidence the update failed; keep polling
+		// until the deadline and let the caller report the timeout.
+		if fetched, err := g.FetchPRHead(prNumber); err == nil {
+			head = fetched
+			if landed, aerr := g.IsAncestor(baseRev, head); aerr == nil && landed {
+				return head, true
 			}
 		}
 		if time.Now().After(deadline) {
-			return last, false
+			return head, false
 		}
 		time.Sleep(poll)
 	}
