@@ -3851,9 +3851,14 @@ func TestRunWithTimeout_ReapsAChildThatOutlivesTheDeadline(t *testing.T) {
 	if cerr != nil {
 		t.Fatalf("unreadable child PID %q: %v", raw, cerr)
 	}
+	// os.FindProcess + a zero signal, not syscall.Kill: Kill is undefined on
+	// Windows, and a _test.go file must COMPILE on every platform even where it
+	// skips — go vet type-checks test binaries, so an unbuildable one reddens
+	// the Windows job before the runtime skip above is ever reached.
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		if err := syscall.Kill(pid, 0); err != nil {
+		p, perr := os.FindProcess(pid)
+		if perr != nil || p.Signal(syscall.Signal(0)) != nil {
 			return // reaped
 		}
 		if time.Now().After(deadline) {
