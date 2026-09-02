@@ -1291,15 +1291,31 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	// nuking a stalled polecat (e.g., after disk space recovery) permanently loses
 	// any commits on the branch. The push is non-blocking: failures are warnings,
 	// not errors, so nuke still proceeds. See: disk-space-resilience.
-	polecatGit := git.NewGit(clonePath)
-	if branch, brErr := polecatGit.CurrentBranch(); brErr == nil && branch != "" {
-		pushed, unpushedCount, checkErr := polecatGit.BranchPushedToRemote(branch, "origin")
-		if checkErr == nil && !pushed && unpushedCount > 0 {
-			if pushErr := polecatGit.Push("origin", branch, false); pushErr != nil {
-				style.PrintWarning("could not push branch %s before removal (%d unpushed commit(s)): %v",
-					branch, unpushedCount, pushErr)
-				style.PrintWarning("WORK AT RISK: branch %s has %d unpushed commit(s) in worktree %s",
-					branch, unpushedCount, clonePath)
+	//
+	// Two gates (PR #184 review): never under nuclear — the operator reached
+	// for nuclear precisely because this worktree's contents must not survive
+	// (see the auto-preserve gating above), and this push would publish them
+	// anyway; and never when the branch carries a commit made with hooks
+	// bypassed — the auto-preserve gate above refuses to push those, and
+	// pushing the same commits here on the polecat's REAL branch would be
+	// strictly worse than the preserve ref it just refused.
+	if !nuclear {
+		polecatGit := git.NewGit(clonePath)
+		if branch, brErr := polecatGit.CurrentBranch(); brErr == nil && branch != "" {
+			if badSHA, chkErr := git.HasUnverifiedCommit(polecatGit, "origin"); chkErr != nil {
+				style.PrintWarning("could not verify %s's commits before the pre-removal push, not pushing branch %s: %v", name, branch, chkErr)
+			} else if badSHA != "" {
+				style.PrintWarning("branch %s carries commit %s made with pre-commit hooks bypassed — refusing the pre-removal push; the work remains in the local commit", branch, badSHA[:8])
+			} else {
+				pushed, unpushedCount, checkErr := polecatGit.BranchPushedToRemote(branch, "origin")
+				if checkErr == nil && !pushed && unpushedCount > 0 {
+					if pushErr := polecatGit.Push("origin", branch, false); pushErr != nil {
+						style.PrintWarning("could not push branch %s before removal (%d unpushed commit(s)): %v",
+							branch, unpushedCount, pushErr)
+						style.PrintWarning("WORK AT RISK: branch %s has %d unpushed commit(s) in worktree %s",
+							branch, unpushedCount, clonePath)
+					}
+				}
 			}
 		}
 	}

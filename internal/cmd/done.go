@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -477,8 +478,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// (see the comment above), so an unverified commit here would
 			// otherwise reach origin regardless of AutoPreserveUncommittedWork's
 			// own push gating. Refuse to proceed instead (gt-i4ej FIX 2) —
-			// the work is safe in a local commit, just not pushed.
-			return fmt.Errorf("gt-pvx safety net committed your work locally, but its pre-commit hook FAILED — refusing to push an unverified commit to origin.\nHook output:\n%s\n\nResolve the hook failure and re-run gt done. Your work is safe in a local commit; it has not been pushed", preserveResult.HookOutput)
+			// the work is safe in a local commit, just not pushed. This
+			// fires both for a hook failure in this very call and for an
+			// unverified commit left by an earlier auto-save cycle (the
+			// durable trailer check — PR #184 review).
+			return fmt.Errorf("gt-pvx safety net: this branch carries work committed with its pre-commit hook FAILING — refusing to push an unverified commit to origin.\n%s\n\nResolve the hook failure and re-run gt done. Your work is safe in a local commit; it has not been pushed", preserveResult.HookOutput)
 		}
 		if preserveResult.Committed {
 			fmt.Printf("%s Auto-committed uncommitted work (safety net)\n", style.Bold.Render("✓"))
@@ -490,19 +494,20 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		} else {
 			// `git add -u` (gt-i4ej FIX 1) never stages a brand-new
 			// untracked file — the accepted tradeoff of a safety net that
-			// must never auto-publish a credential. That means this branch
-			// is not "nothing was excluded, something is still wrong"; it
-			// is almost always exactly those new files, unstaged and
-			// uncommitted. Name them so the operator doesn't have to guess
-			// why the safety net that just ran left the tree dirty
-			// (PR #184 review).
-			var atRisk []string
-			if workStatus != nil {
-				atRisk = workStatus.NonRuntimePaths()
-			}
-			if len(atRisk) > 0 {
+			// must never auto-publish a credential. Name exactly those new
+			// files so the operator doesn't have to guess why the safety
+			// net that just ran left the tree dirty — but only those:
+			// lumping the deliberately-excluded overlay CLAUDE.md (a
+			// tracked, modified file gt done itself unstaged) in as "new
+			// untracked" told agents to commit the very file the exclusion
+			// exists to keep out of the PR (PR #184 review).
+			newUntracked, excludedLeft := classifyUnsavedPaths(workStatus, extraExclude)
+			if len(newUntracked) > 0 {
 				style.PrintWarning("auto-commit: %d new untracked file(s) were not auto-staged — they are never auto-captured by the add -u safety net; commit them yourself or re-run gt done after staging:\n  %s",
-					len(atRisk), strings.Join(atRisk, "\n  "))
+					len(newUntracked), strings.Join(newUntracked, "\n  "))
+			} else if len(excludedLeft) > 0 {
+				fmt.Printf("%s Nothing to auto-commit — the remaining changes are deliberately excluded from auto-save and must NOT be committed: %s\n\n",
+					style.Bold.Render("✓"), strings.Join(excludedLeft, ", "))
 			} else {
 				style.PrintWarning("auto-commit: nothing left to commit after excluding runtime artifacts — uncommitted work may be at risk")
 			}
@@ -908,6 +913,12 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Handle "direct" strategy: push to target branch, skip MR
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
+			if reason := refuseUnverifiedPush(g); reason != "" {
+				pushFailed = true
+				doneErrors = append(doneErrors, reason)
+				style.PrintWarning("%s", reason)
+				goto notifyWitness
+			}
 			// Push submodule changes before direct push (gt-dzs)
 			pushSubmoduleChanges(g, defaultBranch)
 			directRefspec := branch + ":" + defaultBranch
@@ -975,6 +986,18 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// Stale checkpoint from a previous assignment — discard and push normally.
 			fmt.Printf("→ Discarding stale push checkpoint (was for branch %s, now on %s)\n",
 				checkpoints[CheckpointPushed], branch)
+		}
+
+		// Never publish a commit made with commit hooks bypassed (durable
+		// Gastown-Unverified marker): the auto-save gate above only runs
+		// when the tree was dirty, but an earlier auto-save/checkpoint
+		// cycle can have left an unverified commit on a now-clean branch
+		// (PR #184 review).
+		if reason := refuseUnverifiedPush(g); reason != "" {
+			pushFailed = true
+			doneErrors = append(doneErrors, reason)
+			style.PrintWarning("%s", reason)
+			goto notifyWitness
 		}
 
 		// CRITICAL: Push branch BEFORE creating MR bead (hq-6dk53, hq-a4ksk)
@@ -1362,6 +1385,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Late-detected direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
 			fmt.Printf("  Convoy: %s\n", convoyInfo.ID)
+
+			if reason := refuseUnverifiedPush(g); reason != "" {
+				pushFailed = true
+				doneErrors = append(doneErrors, reason)
+				style.PrintWarning("%s", reason)
+				goto notifyWitness
+			}
 
 			// Push branch directly to main (the earlier push went to origin/<branch>)
 			directRefspec := branch + ":" + defaultBranch
@@ -2517,6 +2547,49 @@ func findHookedBeadForAgent(bd *beads.Beads, agentID string) string {
 
 // parseCleanupStatus converts a string flag value to a CleanupStatus.
 // ZFC: Agent observes git state and passes the appropriate status.
+// refuseUnverifiedPush returns a non-empty, operator-facing reason when the
+// current branch must not be pushed to origin: it carries a commit made with
+// commit hooks bypassed (the durable Gastown-Unverified trailer — typically
+// a secret scanner rejected it), or that state could not be checked. Every
+// gt done push site consults this because the auto-save's own HooksFailed
+// gate only fires when auto-save ran in the same invocation — an unverified
+// commit left by an earlier cycle sits on a clean tree (PR #184 review).
+func refuseUnverifiedPush(g *git.Git) string {
+	badSHA, err := git.HasUnverifiedCommit(g, "origin")
+	if err != nil {
+		return fmt.Sprintf("could not check the branch for unverified commits — refusing to push until it can be verified: %v", err)
+	}
+	if badSHA != "" {
+		return fmt.Sprintf("commit %s was made with pre-commit hooks bypassed (Gastown-Unverified) and never verified — refusing to push it to origin. Resolve the hook failure, rewrite the marked commit so hooks re-run (e.g. `git commit --amend` / `git rebase -i`), then re-run gt done", badSHA[:8])
+	}
+	return ""
+}
+
+// classifyUnsavedPaths splits the non-runtime uncommitted paths left behind
+// by an auto-save that committed nothing into (a) genuinely new untracked
+// files — never captured by the `git add -u` allowlist, worth telling the
+// operator to commit themselves — and (b) paths the caller deliberately
+// excluded (e.g. the polecat overlay CLAUDE.md), which must NOT be committed
+// and must never be reported as "new untracked" (PR #184 review).
+func classifyUnsavedPaths(workStatus *git.UncommittedWorkStatus, extraExclude []string) (newUntracked, excluded []string) {
+	if workStatus == nil {
+		return nil, nil
+	}
+	untracked := make(map[string]bool, len(workStatus.UntrackedFiles))
+	for _, f := range workStatus.UntrackedFiles {
+		untracked[f] = true
+	}
+	for _, f := range workStatus.NonRuntimePaths() {
+		switch {
+		case slices.Contains(extraExclude, f):
+			excluded = append(excluded, f)
+		case untracked[f]:
+			newUntracked = append(newUntracked, f)
+		}
+	}
+	return newUntracked, excluded
+}
+
 func parseCleanupStatus(s string) polecat.CleanupStatus {
 	switch strings.ToLower(s) {
 	case "clean":
