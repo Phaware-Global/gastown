@@ -75,14 +75,22 @@ type PreserveResult struct {
 	Ref string
 
 	// HooksFailed is true when the auto-save commit could only be made by
-	// bypassing commit hooks (e.g. a secret scanner) because they failed.
-	// The work is still Committed — never lost — but callers MUST NOT push
-	// it: an unverified commit reaching origin is exactly the risk the
-	// hooks exist to catch (gt-i4ej FIX 2). Never pushed, regardless of
-	// opts.Push. Callers should escalate loudly, surfacing HookOutput.
+	// bypassing commit hooks (e.g. a secret scanner) because they failed —
+	// whether by THIS call or by a prior one whose unverified commit is
+	// still in HEAD's ancestry (the durable trailer check runs for every
+	// caller, including Push:false ones, since those callers push the
+	// branch themselves — PR #184 review). The work is still Committed —
+	// never lost — but callers MUST NOT push it: an unverified commit
+	// reaching origin is exactly the risk the hooks exist to catch
+	// (gt-i4ej FIX 2). Never pushed, regardless of opts.Push. Callers
+	// should escalate loudly, surfacing HookOutput.
 	HooksFailed bool
-	// HookOutput carries the failing hook's error output when HooksFailed,
-	// for callers to include in their escalation.
+	// HookOutput carries a redacted, caller-facing description of the hook
+	// failure when HooksFailed. Deliberately NOT the hook's raw stderr:
+	// the hook is typically a secret scanner whose output can contain the
+	// matched credential, and callers print this into terminals, agent
+	// transcripts, and logs (PR #184 review). It points at the worktree
+	// where the output can be reproduced instead.
 	HookOutput string
 }
 
@@ -181,7 +189,10 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 		// let a query error (e.g. a concurrent index.lock) through as if
 		// there were simply no deletions, so any staged deletion went
 		// uninspected into the commit and, on Push:true paths, force-pushed
-		// (PR #184 review).
+		// (PR #184 review). The re-verification below re-queries deletions
+		// EXPLICITLY: a deleted file is by definition tracked at HEAD, so
+		// no generic tracked-at-HEAD test can ever flag it (round-4
+		// finding).
 		if deletions, delErr := g.StagedDeletions(); delErr != nil {
 			resetErrs = append(resetErrs, fmt.Errorf("querying staged deletions: %w", delErr))
 		} else if len(deletions) > 0 {
@@ -218,19 +229,43 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 
 		if len(resetErrs) > 0 {
 			// A reset (or a query it depended on) failed, so an exclusion
-			// may not have taken effect. Don't trust it silently —
-			// re-verify against the actual index and refuse to commit (let
-			// alone push) if anything that must be excluded, or that isn't
-			// tracked at HEAD, is still staged (PR #184 review).
+			// may not have taken effect. Don't trust it silently — re-verify
+			// against the actual index, and REFUSE to commit (let alone
+			// push) unless every staged path is provably legitimate. The
+			// per-class semantics (PR #184 review — a round-4 rewrite
+			// inverted these into "excluded ⇒ allowed" and published the
+			// exclude list; this is the round-2 refusal contract, restored
+			// and made explicit):
+			//   - excluded path still staged        ⇒ REFUSE (must never publish)
+			//   - staged deletion of a tracked file ⇒ REFUSE (auto-preserve
+			//     never records deletions; checked explicitly, because a
+			//     deleted file is by definition tracked at HEAD and no
+			//     tracked-at-HEAD test can ever catch it)
+			//   - staged path not a blob at HEAD    ⇒ REFUSE (a new file the
+			//     scrub above failed to unstage)
+			//   - tracked modification, not excluded ⇒ allowed (that IS the
+			//     work being preserved)
+			// Any re-verification query that itself fails aborts: committing
+			// an index we could not inspect is exactly the fail-open this
+			// gate exists to prevent.
 			staged, sErr := g.StagedFiles()
 			if sErr != nil {
 				return nil, fmt.Errorf("exclusion reset failed (%v) and could not re-verify the index: %w", resetErrs, sErr)
 			}
+			stillDeleted, delErr := g.StagedDeletions()
+			if delErr != nil {
+				return nil, fmt.Errorf("exclusion reset failed (%v) and could not re-verify staged deletions: %w", resetErrs, delErr)
+			}
+			if len(stillDeleted) > 0 {
+				return nil, fmt.Errorf("refusing to auto-preserve: exclusion reset failed and the deletion of %q is still staged: %v", stillDeleted[0], resetErrs)
+			}
 			for _, f := range staged {
-				if pathExcluded(f, excludePaths) || g.FileTrackedAtHEAD(f) {
-					continue
+				if pathExcluded(f, excludePaths) {
+					return nil, fmt.Errorf("refusing to auto-preserve: exclusion reset failed and %q is still staged: %v", f, resetErrs)
 				}
-				return nil, fmt.Errorf("refusing to auto-preserve: exclusion reset failed and %q is still staged: %v", f, resetErrs)
+				if !g.FileTrackedAtHEAD(f) {
+					return nil, fmt.Errorf("refusing to auto-preserve: %q is staged but not tracked at HEAD after a failed exclusion reset: %v", f, resetErrs)
+				}
 			}
 		}
 
@@ -270,10 +305,47 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 				}
 				result.Committed = true
 				result.HooksFailed = true
-				result.HookOutput = err.Error()
+				// Deliberately NOT err.Error(): git relays the pre-commit
+				// hook's stderr into its own, and the hook is typically a
+				// secret scanner whose output can contain the very
+				// credential it matched. Callers print HookOutput into
+				// operator terminals, agent transcripts, and logs, so point
+				// at the worktree instead of relocating the secret
+				// (PR #184 review).
+				result.HookOutput = fmt.Sprintf("pre-commit hook failed — output withheld, it can contain the secret a scanner matched; run `git commit` in %s to see it", g.WorkDir())
 			} else {
 				result.Committed = true
 			}
+		}
+	}
+
+	remote := opts.Remote
+	if remote == "" {
+		remote = "origin"
+	}
+
+	head, revErr := g.Rev("HEAD")
+	if revErr != nil {
+		return result, fmt.Errorf("resolving HEAD: %w", revErr)
+	}
+
+	// Re-derive HooksFailed as a property of the commit range, not of this
+	// call's in-memory result (see unverifiedCommitTrailer doc): a prior
+	// cycle may have made an unverified commit and returned before pushing
+	// it, and THIS cycle's worktree can be perfectly clean with nothing to
+	// commit (gt-i4ej FIX 2 round-2 finding). Runs for EVERY caller —
+	// including Push:false ones — because gt done and polecat removal push
+	// the branch to origin themselves right after this returns, gating that
+	// push only on result.HooksFailed; a gate that only ran on the
+	// Push:true path let a prior cycle's unverified commit straight through
+	// to the shared remote (PR #184 review). Skipped when this very call
+	// already set HooksFailed: its own commit carries the trailer.
+	if !result.HooksFailed {
+		if badSHA, chkErr := hasUnverifiedCommit(g, remote, head); chkErr != nil {
+			return result, fmt.Errorf("checking for a prior unverified commit: %w", chkErr)
+		} else if badSHA != "" {
+			result.HooksFailed = true
+			result.HookOutput = fmt.Sprintf("commit %s bypassed pre-commit hooks (%s) and was never verified — refusing to publish until resolved. To clear it: verify the work, then rewrite the marked commit so hooks re-run and the trailer is dropped (e.g. `git commit --amend`, or `git rebase -i` for older commits)", shortSHA(badSHA), unverifiedCommitTrailer)
 		}
 	}
 
@@ -290,31 +362,6 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 		return result, nil
 	}
 
-	remote := opts.Remote
-	if remote == "" {
-		remote = "origin"
-	}
-
-	head, revErr := g.Rev("HEAD")
-	if revErr != nil {
-		return result, fmt.Errorf("resolving HEAD: %w", revErr)
-	}
-
-	// Re-derive HooksFailed as a property of the commit range about to be
-	// pushed, not of this call's in-memory result (see unverifiedCommitTrailer
-	// doc): a prior cycle may have made an unverified commit and returned
-	// before pushing it, and THIS cycle's worktree can be perfectly clean
-	// with nothing to commit, so the `if result.HooksFailed` check above
-	// would miss it entirely and push HEAD anyway (gt-i4ej FIX 2 round-2
-	// finding).
-	if badSHA, chkErr := hasUnverifiedCommit(g, remote, head); chkErr != nil {
-		return result, fmt.Errorf("checking for a prior unverified commit before push: %w", chkErr)
-	} else if badSHA != "" {
-		result.HooksFailed = true
-		result.HookOutput = fmt.Sprintf("commit %s bypassed pre-commit hooks (%s) and was never verified — refusing to push until resolved", shortSHA(badSHA), unverifiedCommitTrailer)
-		return result, nil
-	}
-
 	// A detached HEAD reports as literal "HEAD" from `git rev-parse
 	// --abbrev-ref HEAD`, not "". It is the normal idle state for a
 	// polecat worktree, not an exotic one, so collapsing every detached
@@ -327,13 +374,18 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 		if idErr != nil {
 			return result, fmt.Errorf("cannot derive a unique preservation ref for detached HEAD: %w", idErr)
 		}
-		// Identity alone (no commit SHA) so repeated checkpoints of the
-		// same polecat force-push over their own prior state instead of
-		// minting a brand-new permanent remote branch every cycle — the
-		// ref is already force-pushed, so a stable name is correct and
-		// nothing here relies on the old name being distinct per commit
-		// (PR #184 review).
-		refBranch = "detached-" + identity
+		// Identity + the first commit this worktree added past the remote
+		// default branch. Stable across repeated checkpoints of one
+		// assignment (later checkpoints stack on top of the same first
+		// commit), so the ref force-pushes over its own prior state instead
+		// of minting a brand-new permanent remote branch every cycle
+		// (PR #184 review, round 3). But polecat names are a recycled pool:
+		// identity alone made the ref a function of the NAME, so the next
+		// bead assigned to it force-pushed over the previous bead's only
+		// preserved copy — the divergence anchor changes across
+		// assignments, so each assignment gets its own ref (PR #184
+		// review, round 4).
+		refBranch = "detached-" + identity + "-" + shortSHA(divergenceAnchor(g, remote, head))
 	}
 
 	// Skip the push only when we're certain there's nothing new to preserve.
@@ -366,6 +418,46 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 	result.Ref = refName
 	result.Commit = head
 	return result, nil
+}
+
+// divergenceAnchor returns the first commit reachable from head that is not
+// on remote's default branch — the commit that started this worktree
+// assignment's local history. Stable for the life of one assignment,
+// different for the next one (a reassigned worktree starts diverging from a
+// fresh base), which is exactly the property the detached preservation ref
+// needs (PR #184 review). Falls back to head itself when the divergence
+// can't be resolved (e.g. the remote default branch isn't fetched) — a
+// per-commit ref in a degenerate setup beats a name collision that
+// force-pushes over another bead's preserved work.
+func divergenceAnchor(g *Git, remote, head string) string {
+	base, err := g.MergeBase(head, remote+"/"+g.RemoteDefaultBranch())
+	if err != nil || base == "" {
+		return head
+	}
+	out, err := g.run("rev-list", "--reverse", base+".."+head)
+	if err != nil {
+		return head
+	}
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		return head
+	}
+	return fields[0]
+}
+
+// HasUnverifiedCommit reports the SHA of a commit in HEAD's ancestry (back
+// to the merge-base with remote's default branch) that was committed with
+// hooks bypassed and never verified — see hasUnverifiedCommit. Exported for
+// callers that push a branch to origin themselves rather than through
+// AutoPreserveUncommittedWork's own push path (gt done, polecat removal's
+// best-effort branch push), so they can refuse to publish it even when no
+// preserve call happened in the same invocation (PR #184 review).
+func HasUnverifiedCommit(g *Git, remote string) (string, error) {
+	head, err := g.Rev("HEAD")
+	if err != nil {
+		return "", err
+	}
+	return hasUnverifiedCommit(g, remote, head)
 }
 
 // hasUnverifiedCommit reports the SHA of the nearest commit, reachable from

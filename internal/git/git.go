@@ -1052,16 +1052,13 @@ func (g *Git) ResetFiles(paths ...string) error {
 
 // StagedDeletions returns the list of tracked files staged for deletion.
 // Used by auto-save to unstage deletions — safety nets should preserve work, not destroy it.
+// NUL-delimited (-z) for the same reason as StagedFiles.
 func (g *Git) StagedDeletions() ([]string, error) {
-	out, err := g.run("diff", "--cached", "--name-only", "--diff-filter=D")
+	out, err := g.run("diff", "--cached", "--name-only", "-z", "--diff-filter=D")
 	if err != nil {
 		return nil, err
 	}
-	trimmed := strings.TrimSpace(out)
-	if trimmed == "" {
-		return nil, nil
-	}
-	return strings.Split(trimmed, "\n"), nil
+	return splitNulPaths(out), nil
 }
 
 // HasStagedChanges reports whether the index differs from HEAD. Used after a
@@ -1079,29 +1076,43 @@ func (g *Git) HasStagedChanges() (bool, error) {
 // StagedFiles returns all file paths currently staged (index differs from
 // HEAD). Used to re-verify the index after an unstage operation that may
 // have failed, rather than trusting a discarded error.
+//
+// NUL-delimited (-z): plain `--name-only` output C-quotes any non-ASCII
+// path (core.quotePath) and any path containing '"' or '\', so string
+// comparisons and pathspecs built from it silently miss those files — a
+// `café.env` credential sailed through the auto-preserve scrub while its
+// ASCII sibling was caught (PR #184 review).
 func (g *Git) StagedFiles() ([]string, error) {
-	out, err := g.run("diff", "--cached", "--name-only")
+	out, err := g.run("diff", "--cached", "--name-only", "-z")
 	if err != nil {
 		return nil, err
 	}
-	trimmed := strings.TrimSpace(out)
-	if trimmed == "" {
-		return nil, nil
+	return splitNulPaths(out), nil
+}
+
+// splitNulPaths splits `git ... -z` output into paths.
+func splitNulPaths(out string) []string {
+	out = strings.Trim(out, "\x00")
+	if out == "" {
+		return nil
 	}
-	return strings.Split(trimmed, "\n"), nil
+	return strings.Split(out, "\x00")
 }
 
 // FileTrackedAtHEAD reports whether path already exists as a tracked file
-// at HEAD. Used to tell a legitimate `git add -u` re-stage of a tracked
-// file apart from a stray "A" (added) index entry for a path that was
-// untracked before the caller started (e.g. a separate `git add <newfile>`
-// run earlier in the same worktree) — `add -u` never touches the latter,
-// so it survives into a commit unless explicitly checked for. Any error
+// (blob) at HEAD. Used to tell a legitimate `git add -u` re-stage of a
+// tracked file apart from a stray "A" (added) index entry for a path that
+// was untracked before the caller started (e.g. a separate `git add
+// <newfile>` run earlier in the same worktree) — `add -u` never touches the
+// latter, so it survives into a commit unless explicitly checked for.
+// Requires the object to be a blob: `cat-file -e` alone also succeeds when
+// the path is a TREE at HEAD, which let a brand-new file at a
+// former-directory path pass as "tracked" (PR #184 review). Any error
 // (including "does not exist") is treated as not-tracked: the safe
 // direction for a caller deciding whether to exclude a path.
 func (g *Git) FileTrackedAtHEAD(path string) bool {
-	_, err := g.run("cat-file", "-e", "HEAD:"+path)
-	return err == nil
+	typ, err := g.run("cat-file", "-t", "HEAD:"+path)
+	return err == nil && typ == "blob"
 }
 
 // ShowFile returns the contents of a file at a given ref (e.g., "origin/main:CLAUDE.md").
@@ -3326,6 +3337,23 @@ func (g *Git) LastActivityTime() (time.Time, error) {
 		return time.Time{}, fmt.Errorf("parsing commit timestamp %q: %w", out, err)
 	}
 	return time.Unix(sec, 0), nil
+}
+
+// IndexModTime returns the mtime of the repository's index file — a signal
+// of when git state in THIS worktree last changed, unlike HEAD's commit
+// date, which a fresh worktree inherits from whatever base commit it was
+// created at (PR #184 review). Resolves the real git dir so linked
+// worktrees (whose .git is a pointer file) work too.
+func (g *Git) IndexModTime() (time.Time, error) {
+	gitDir, err := g.run("rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return time.Time{}, err
+	}
+	fi, err := os.Stat(filepath.Join(gitDir, "index"))
+	if err != nil {
+		return time.Time{}, err
+	}
+	return fi.ModTime(), nil
 }
 
 // CommitsAhead returns the number of commits that branch has ahead of base.
