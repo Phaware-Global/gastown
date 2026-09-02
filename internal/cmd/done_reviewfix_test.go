@@ -98,21 +98,25 @@ func TestResolveReviewFixMRLookup(t *testing.T) {
 		issueID = "gt-y4gw"
 	)
 
-	t.Run("lookup error leaves mrID empty and flags mrFailed", func(t *testing.T) {
-		got := resolveReviewFixMRLookup(nil, errors.New("dolt: connection refused"), reusePR, issueID, branch)
-		if got.mrID != "" {
-			t.Errorf("mrID = %q, want empty on lookup error", got.mrID)
+	t.Run("lookup error aborts gt done — fail closed, never force-close on an unverified lookup", func(t *testing.T) {
+		// PR #221 round 3: a Dolt lock timeout must NOT proceed with
+		// refineryOwnsMerge=false, which would force-close the live MR's
+		// source_issue. The helper returns an error so gt done fails
+		// loudly and stays retryable; the bead is left untouched.
+		got, err := resolveReviewFixMRLookup(nil, errors.New("dolt: connection refused"), reusePR, issueID, branch)
+		if err == nil {
+			t.Fatal("err = nil, want non-nil — a lookup error must abort gt done, not fall through to the force-close path")
 		}
-		if !got.mrFailed || got.errMsg == "" {
-			t.Errorf("mrFailed = %v, errMsg = %q, want mrFailed=true with a non-empty message", got.mrFailed, got.errMsg)
-		}
-		if got.refineryOwnsMerge {
-			t.Errorf("refineryOwnsMerge = true, want false on lookup error")
+		if got.mrFailed || got.mrID != "" || got.refineryOwnsMerge {
+			t.Errorf("result = %+v, want zero value alongside the error", got)
 		}
 	})
 
 	t.Run("no MR bead found leaves mrID empty and flags mrFailed", func(t *testing.T) {
-		got := resolveReviewFixMRLookup(nil, nil, reusePR, issueID, branch)
+		got, err := resolveReviewFixMRLookup(nil, nil, reusePR, issueID, branch)
+		if err != nil {
+			t.Fatalf("err = %v, want nil — a definitive not-found is not an abort", err)
+		}
 		if got.mrID != "" {
 			t.Errorf("mrID = %q, want empty when no MR bead tracks the PR", got.mrID)
 		}
@@ -126,7 +130,10 @@ func TestResolveReviewFixMRLookup(t *testing.T) {
 			ID:          "gt-wisp-ne5u",
 			Description: "branch: " + branch + "\nsource_issue: " + issueID + "\nreview_pr: 221",
 		}
-		got := resolveReviewFixMRLookup(mrIssue, nil, reusePR, issueID, branch)
+		got, err := resolveReviewFixMRLookup(mrIssue, nil, reusePR, issueID, branch)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
 		if got.mrID != "gt-wisp-ne5u" {
 			t.Errorf("mrID = %q, want %q — shouldNudgeRefinery(exitType, mrID) never fires if this stays empty", got.mrID, "gt-wisp-ne5u")
 		}
@@ -147,7 +154,10 @@ func TestResolveReviewFixMRLookup(t *testing.T) {
 			ID:          "gt-wisp-ne5u",
 			Description: "branch: " + branch + "\nsource_issue: gt-y4gw\nreview_pr: 221",
 		}
-		got := resolveReviewFixMRLookup(mrIssue, nil, reusePR, "gt-c9z7", branch)
+		got, err := resolveReviewFixMRLookup(mrIssue, nil, reusePR, "gt-c9z7", branch)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
 		if got.mrID != "gt-wisp-ne5u" {
 			t.Errorf("mrID = %q, want %q", got.mrID, "gt-wisp-ne5u")
 		}

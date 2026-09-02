@@ -1303,7 +1303,14 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// otherwise the PR sits orphaned from the merge pipeline
 				// while gt done reports success.
 				mrIssue, findErr := bd.FindMRForReviewPR(completion.reusePR)
-				lookup := resolveReviewFixMRLookup(mrIssue, findErr, completion.reusePR, issueID, branch)
+				lookup, lookupErr := resolveReviewFixMRLookup(mrIssue, findErr, completion.reusePR, issueID, branch)
+				if lookupErr != nil {
+					// Fail closed: the lookup couldn't establish whether a
+					// live MR owns this work bead, so neither leave-open nor
+					// force-close is safe to pick. Abort — the bead stays as
+					// it is and gt done is retryable.
+					return lookupErr
+				}
 				mrID = lookup.mrID
 				refineryOwnsMerge = lookup.refineryOwnsMerge
 				if lookup.mrFailed {
@@ -1377,9 +1384,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// carries review_pr — there was no handoff to attempt.
 				closeReason += fmt.Sprintf("; review-fix dispatch completed against PR #%d", completion.reusePR)
 				if mrFailed {
-					// mrFailed was set above when no live MR bead could be
-					// confirmed for this PR (lookup error or none found) —
-					// the audit trail must not read as a clean completion.
+					// mrFailed was set above when the lookup definitively
+					// found no live MR bead for this PR (a lookup ERROR
+					// aborts gt done before reaching here) — the audit
+					// trail must not read as a clean completion.
 					closeReason += "; but no live MR bead tracks it - refinery will not pick up"
 				}
 			case prURL != "":
@@ -2759,14 +2767,19 @@ type reviewFixMRLookupResult struct {
 // not an edge case), refineryOwnsMerge must be true so the caller leaves
 // the work bead open instead of force-closing it out from under the live
 // MR, which would strand the MR without its source_issue.
-func resolveReviewFixMRLookup(mrIssue *beads.Issue, findErr error, reusePR int, issueID, branch string) reviewFixMRLookupResult {
+//
+// Round 3: a lookup ERROR returns a non-nil error so gt done aborts and
+// stays retryable. Ownership of the work bead is unknown on that branch —
+// a Dolt lock timeout (the routine failure mode) must not fall through to
+// the force-close path, which would strand a live MR's source_issue. Only
+// a definitive "no live MR bead" (nil issue, nil error) proceeds with
+// mrFailed so the orphaned PR is recorded.
+func resolveReviewFixMRLookup(mrIssue *beads.Issue, findErr error, reusePR int, issueID, branch string) (reviewFixMRLookupResult, error) {
 	if findErr != nil {
-		return reviewFixMRLookupResult{
-			mrFailed: true,
-			errMsg: fmt.Sprintf(
-				"could not verify an MR bead tracks reused PR #%d (%v); refinery pickup of branch %s is unconfirmed - dispatcher intervention required",
-				reusePR, findErr, branch),
-		}
+		return reviewFixMRLookupResult{}, fmt.Errorf(
+			"could not verify an MR bead tracks reused PR #%d: %w\n"+
+				"Retry 'gt done' — closing the work bead on an unverified lookup could strand the live MR for branch %s without its source_issue",
+			reusePR, findErr, branch)
 	}
 	if mrIssue == nil {
 		return reviewFixMRLookupResult{
@@ -2774,13 +2787,13 @@ func resolveReviewFixMRLookup(mrIssue *beads.Issue, findErr error, reusePR int, 
 			errMsg: fmt.Sprintf(
 				"review-fix dispatch reused PR #%d but no live MR bead tracks it (review_pr=%d); refinery will not pick up branch %s — dispatcher intervention required",
 				reusePR, reusePR, branch),
-		}
+		}, nil
 	}
 	result := reviewFixMRLookupResult{mrID: mrIssue.ID}
 	if fields := beads.ParseMRFields(mrIssue); fields != nil && fields.SourceIssue == issueID {
 		result.refineryOwnsMerge = true
 	}
-	return result
+	return result, nil
 }
 
 // handoffPRArgs bundles the parameters for handoffPRToRefinery so the

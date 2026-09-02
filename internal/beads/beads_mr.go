@@ -128,7 +128,7 @@ func pickMRForBranch(issues []*Issue, branch string, skipClosed bool) *Issue {
 	return nil
 }
 
-// FindMRForReviewPR searches for a live (non-closed) merge-request bead
+// FindMRForReviewPR searches for a live (non-terminal) merge-request bead
 // tracking the given review-fix PR via its review_pr field. Returns the MR
 // bead if found, nil if none tracks that PR. Used by the reused-PR
 // completion path in `gt done` to verify a review-fix dispatch's assumption
@@ -144,16 +144,26 @@ func (b *Beads) FindMRForReviewPR(reviewPR int) (*Issue, error) {
 	if err != nil {
 		return nil, err
 	}
+	return pickMRForReviewPR(issues, reviewPR), nil
+}
+
+// pickMRForReviewPR is the pure matching logic exercised by tests: return
+// the first live MR whose parsed review_pr field matches. Terminal beads
+// are skipped via IssueStatus.IsTerminal — a tombstoned MR wisp is just as
+// dead as a closed one, and treating it as live would let the reused-PR
+// path in gt done report a clean completion (work bead left open, refinery
+// nudged) for a PR no live MR tracks (PR #221).
+func pickMRForReviewPR(issues []*Issue, reviewPR int) *Issue {
 	for _, issue := range issues {
-		if issue.Status == "closed" {
+		if IssueStatus(issue.Status).IsTerminal() {
 			continue
 		}
 		fields := ParseMRFields(issue)
 		if fields != nil && fields.ReviewPR == reviewPR {
-			return issue, nil
+			return issue
 		}
 	}
-	return nil, nil
+	return nil
 }
 
 // FindOpenMRsForIssue returns all open merge-request beads whose source_issue
