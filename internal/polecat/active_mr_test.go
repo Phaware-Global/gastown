@@ -120,7 +120,7 @@ func TestAssessActiveMR_VanishedMRWithNoSourceIsGitDecided(t *testing.T) {
 			RequireGitSafe: false,
 		})
 		if !got.Pending {
-			t.Error("Pending = false, want true: callers supplying no git evidence keep the fail-closed behaviour")
+			t.Error("Pending = false, want true: callers supplying no git evidence keep the fail-closed behavior")
 		}
 	})
 }

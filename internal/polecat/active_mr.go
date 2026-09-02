@@ -91,7 +91,7 @@ func assessStaleActiveMR(reader IssueReader, in ActiveMRInput, result ActiveMRAs
 		// git evidence instead: if the worktree holds no work at risk there is
 		// nothing left to preserve, whatever the vanished MR once referred to.
 		// Callers that do not supply git evidence (RequireGitSafe false) keep the
-		// old blocking behaviour rather than clearing on no evidence at all.
+		// old blocking behavior rather than clearing on no evidence at all.
 		if mrStatus == mrStatusMissing && sourceIssue == "" {
 			if in.RequireGitSafe && in.GitSafe {
 				result.Pending = false
