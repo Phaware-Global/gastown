@@ -138,11 +138,12 @@ func (m *TelegraphServerManager) resolvedLogFile() string {
 //     the process it started is still alive, trust the handle (startLocked
 //     treats a failed PID-file write as non-fatal, so the file's absence
 //     does not by itself mean Telegraph died) and repair the file.
-//   - If this manager's own handle for the exact PID the file names reports
-//     dead, trust that over the file: once a self-started child has been
-//     reaped via cmd.Wait, the handle's death report can't be spoofed by the
-//     OS recycling that PID number to an unrelated process before the next
-//     check.
+//   - If the cached handle — self-started or adopted — for the exact PID the
+//     file names reports dead, trust that death report over the file. For a
+//     self-started child the reaped flag (set once cmd.Wait returns) is the
+//     stronger form of this override: it survives even a platform liveness
+//     probe that reports the PID as alive after the OS recycled it to an
+//     unrelated process.
 func (m *TelegraphServerManager) isRunning() (int, bool) {
 	if m.runningFn != nil {
 		return m.runningFn()
@@ -156,10 +157,13 @@ func (m *TelegraphServerManager) isRunning() (int, bool) {
 	// process can overwrite it. Trusting the file over a disagreeing
 	// self-started handle would let a foreign writer redirect Stop()'s kill
 	// signal, or spawn a duplicate Telegraph while ours is still alive. An
-	// adopted (non-self-started) handle gets no such privilege — a PID whose
-	// only provenance is "a file said so" is never re-blessed with a fresh
-	// nonce; report not-running instead and let the fall-through below adopt
-	// whatever the file names.
+	// adopted (non-self-started) handle keeps only a weaker form of this:
+	// while it stays alive it is likewise never dropped or retargeted on the
+	// file's say-so (the file already chose this PID once, at adoption;
+	// honoring every later rewrite would let an unauthenticated writer re-aim
+	// Stop()'s kill signal at will), but a PID whose only provenance is "a
+	// file said so" is never re-blessed with a fresh nonce — the disagreeing
+	// file is left as-is, not repaired.
 	if m.selfStarted && m.process != nil && m.process.Pid != pid &&
 		(m.reaped == nil || !m.reaped.Load()) && m.isAlive(m.process) {
 		if _, werr := writePIDFile(m.pidFile(), m.process.Pid); werr != nil {

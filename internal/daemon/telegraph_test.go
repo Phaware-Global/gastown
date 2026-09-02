@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -488,6 +489,51 @@ func TestTelegraph_AdoptedHandleNotKilledByStaleReapedFlag(t *testing.T) {
 	gotPid, running := m.isRunning()
 	if !running || gotPid != pid {
 		t.Fatalf("expected adopted handle to still report running despite a stale reaped flag, got pid=%d running=%v", gotPid, running)
+	}
+}
+
+// TestTelegraph_AdoptedHandleNotRetargetedByRewrittenPIDFile guards the
+// no-retarget branch for adopted handles: once a live handle has been
+// adopted, a later rewrite of the unauthenticated PID file naming a
+// different live PID must neither re-aim the manager (and thus a future
+// Stop()'s kill signal) at the file's new PID nor rewrite the file to
+// re-bless the adopted PID with a fresh nonce.
+func TestTelegraph_AdoptedHandleNotRetargetedByRewrittenPIDFile(t *testing.T) {
+	m := newTestTelegraphManager(t, &TelegraphServerConfig{Enabled: true})
+	if err := os.MkdirAll(filepath.Dir(m.pidFile()), 0755); err != nil {
+		t.Fatalf("failed to create pid dir: %v", err)
+	}
+
+	// A previously adopted, still-alive handle.
+	adoptedPid := os.Getpid()
+	m.process = &os.Process{Pid: adoptedPid}
+	m.selfStarted = false
+	m.aliveFn = func(*os.Process) bool { return true }
+
+	// The unauthenticated PID file now names a different live process (the
+	// parent of the test process stands in for it).
+	filePid := os.Getppid()
+	if filePid == adoptedPid {
+		t.Fatalf("test requires distinct PIDs, got %d for both", filePid)
+	}
+	if _, err := writePIDFile(m.pidFile(), filePid); err != nil {
+		t.Fatalf("failed to write pid file: %v", err)
+	}
+	before, err := os.ReadFile(m.pidFile())
+	if err != nil {
+		t.Fatalf("failed to read pid file: %v", err)
+	}
+
+	gotPid, running := m.isRunning()
+	if !running || gotPid != adoptedPid {
+		t.Fatalf("expected adopted handle to keep reporting pid=%d running, got pid=%d running=%v", adoptedPid, gotPid, running)
+	}
+	after, err := os.ReadFile(m.pidFile())
+	if err != nil {
+		t.Fatalf("failed to re-read pid file: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("expected the disagreeing PID file to be left as-is, got %q -> %q", before, after)
 	}
 }
 
