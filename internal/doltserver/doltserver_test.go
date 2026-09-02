@@ -5221,4 +5221,36 @@ func TestGetHealthMetrics_ProbeFailureIsUnhealthy(t *testing.T) {
 	if !metrics.ProbeFailed && metrics.QueryLatency == 0 {
 		t.Error("a zero latency with no ProbeFailed flag is indistinguishable from a fast server")
 	}
+
+	// The connection count has the same zero-value problem: with no server, no
+	// count can be measured, and the zero in Connections must be flagged as
+	// "not measured" rather than passing for a healthy idle server.
+	if !metrics.ConnectionsUnknown {
+		t.Error("ConnectionsUnknown = false, want true when no connection count could be measured")
+	}
+	if metrics.ConnectionError == "" {
+		t.Error("ConnectionError is empty, want the underlying failure")
+	}
+}
+
+// TestSanitizeControlChars verifies that server-supplied bytes cannot smuggle
+// terminal control sequences into health output. ProbeError quotes whatever
+// answered on the Dolt port; a CR could otherwise overwrite the PROBE FAILED
+// alert line when printed.
+func TestSanitizeControlChars(t *testing.T) {
+	tests := []struct {
+		name, in, want string
+	}{
+		{"plain text unchanged", "read tcp: i/o timeout", "read tcp: i/o timeout"},
+		{"carriage return replaced", "bad\rgone", "bad?gone"},
+		{"newline and tab replaced", "a\nb\tc", "a?b?c"},
+		{"escape sequence replaced", "\x1b[2Kwiped", "?[2Kwiped"},
+		{"DEL replaced", "a\x7fb", "a?b"},
+		{"non-ASCII printable kept", "latence dépassée — 1s", "latence dépassée — 1s"},
+	}
+	for _, tt := range tests {
+		if got := sanitizeControlChars(tt.in); got != tt.want {
+			t.Errorf("%s: sanitizeControlChars(%q) = %q, want %q", tt.name, tt.in, got, tt.want)
+		}
+	}
 }

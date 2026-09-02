@@ -595,9 +595,7 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 			metrics := doltserver.GetHealthMetrics(townRoot)
 			fmt.Printf("\n  %s\n", style.Bold.Render("Resource Metrics:"))
 			printQueryLatency(metrics)
-			fmt.Printf("    Connections:   %d / %d (%.0f%%)%s\n",
-				metrics.Connections, metrics.MaxConnections, metrics.ConnectionPct,
-				connectionSourceSuffix(metrics))
+			fmt.Printf("    Connections:   %s\n", connectionsLine(metrics))
 			if metrics.ReadOnly {
 				fmt.Printf("\n  %s %s\n",
 					style.Bold.Render("!!!"),
@@ -638,9 +636,7 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 		metrics := doltserver.GetHealthMetrics(townRoot)
 		fmt.Printf("\n  %s\n", style.Bold.Render("Resource Metrics:"))
 		printQueryLatency(metrics)
-		fmt.Printf("    Connections:   %d / %d (%.0f%%)%s\n",
-			metrics.Connections, metrics.MaxConnections, metrics.ConnectionPct,
-			connectionSourceSuffix(metrics))
+		fmt.Printf("    Connections:   %s\n", connectionsLine(metrics))
 		fmt.Printf("    Disk usage:    %s\n", metrics.DiskUsageHuman)
 		if metrics.ReadOnly {
 			fmt.Printf("\n  %s %s\n",
@@ -1860,4 +1856,17 @@ func connectionSourceSuffix(metrics *doltserver.HealthMetrics) string {
 		return "  [sessions only — leaked slots not visible]"
 	}
 	return ""
+}
+
+// connectionsLine renders the connection-count value for status output. A
+// failed measurement must never render as "0 / N (0%)": that is the zero
+// value, indistinguishable from a healthy idle server — the same lie
+// printQueryLatency exists to prevent for latency (hq-09sb1).
+func connectionsLine(metrics *doltserver.HealthMetrics) string {
+	if metrics.ConnectionsUnknown {
+		return style.Bold.Render("unavailable — " + metrics.ConnectionError)
+	}
+	return fmt.Sprintf("%d / %d (%.0f%%)%s",
+		metrics.Connections, metrics.MaxConnections, metrics.ConnectionPct,
+		connectionSourceSuffix(metrics))
 }
