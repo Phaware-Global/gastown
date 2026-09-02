@@ -103,6 +103,9 @@ func (p *awaitFakeProvider) AllThreads(int) ([]ReviewThread, error)    { panic("
 func (p *awaitFakeProvider) CountApprovals(int) (int, error)           { panic("unused") }
 func (p *awaitFakeProvider) ChecksRollup(int) (string, bool, error)    { panic("unused") }
 func (p *awaitFakeProvider) SubmitReview(int, SubmitReviewInput) error { panic("unused") }
+func (p *awaitFakeProvider) DismissChangesRequestedReviews(int, string, string) error {
+	panic("unused")
+}
 
 // fixedClock returns a deterministic time for AwaitReviewStep's
 // "Now()" injection. Tests compose past/future timestamps relative to
