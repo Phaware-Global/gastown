@@ -43,15 +43,21 @@ const (
 	// a 10s pool ReadTimeout).
 	eventPollSeedWindow = 24 * time.Hour
 
-	// maxSeedPollFailures bounds how many consecutive seed-poll failures a
-	// store tolerates before giving up on backfilling its warm-up window and
-	// seeding at "now" instead. Without this, a store whose eventPollSeedWindow
-	// volume alone exceeds the pool ReadTimeout (the gt-lurb symptom) retries
-	// the same unservable query forever and its close detection never comes
-	// online. Losing that store's pre-daemon-start backlog is the same
-	// trade-off eventPollSeedWindow already makes; giving up only trades away
-	// permanent unavailability for it.
+	// maxSeedPollFailures bounds how many consecutive poll failures a store
+	// tolerates before the give-up escape considers moving its seed point.
+	// Without this, a store whose query window volume alone exceeds the pool
+	// ReadTimeout (the gt-lurb symptom) retries the same unservable query
+	// forever and its close detection never comes online.
 	maxSeedPollFailures = 5
+
+	// minOversizedQueryWindow is the smallest query window the give-up escape
+	// treats as plausibly oversized. Halving the window only helps when the
+	// failure is caused by result volume; a timeout on a window smaller than
+	// this (half the seed window that gt-lurb established as unservable) is
+	// far more likely a wedged or unreachable server, and narrowing then
+	// would discard post-startup closes without making any future query more
+	// servable.
+	minOversizedQueryWindow = eventPollSeedWindow / 2
 
 	// eventPollClockSkewTolerance bounds how far ahead of the daemon host's
 	// clock an event's CreatedAt may be before it's treated as future-dated
@@ -155,19 +161,9 @@ type ConvoyManager struct {
 	// the same lifecycle events on every poll.
 	processedLifecycleEvents sync.Map // map[string]bool
 
-	// seedFailures tracks, per store, consecutive seed-poll failures (a seed
-	// poll is one with no high-water mark yet, i.e. the store has never had a
-	// successful poll). Reset to zero on any successful poll. See
-	// maxSeedPollFailures.
+	// seedFailures tracks, per store, consecutive poll failures. Reset to
+	// zero on any successful poll. See maxSeedPollFailures.
 	seedFailures sync.Map // map[string]int
-
-	// everSucceeded tracks, per store, whether that store has ever completed a
-	// successful poll. Unlike lastEventIDs' hasHW check, this is NOT set by the
-	// give-up path (maxSeedPollFailures) below, so a store that gives up and
-	// then keeps failing its now-normal-shaped polls still counts failures and
-	// can give up again — seeding progressively closer to "now" each time —
-	// instead of the give-up escape being usable only once per store.
-	everSucceeded sync.Map // map[string]bool
 
 	// startedAt is when this ConvoyManager was constructed. It floors what a
 	// store's warm-up (seed) cycle may discard: events created before
@@ -388,7 +384,6 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 			m.lastEventIDs.Store(name, now)
 			m.seededStores.Store(name, true)
 			m.seedFailures.Delete(name)
-			m.everSucceeded.Store(name, true)
 			m.logger("Convoy: event poll (%s): +Inf/NaN row detected, advancing HWM to %s to skip corrupt data", name, now.Format(time.RFC3339))
 			return nil
 		}
@@ -397,70 +392,62 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 			failCount = v.(int) + 1
 		}
 		m.seedFailures.Store(name, failCount)
-		now := time.Now().UTC()
-		_, succeeded := m.everSucceeded.Load(name)
-		// A store that has succeeded before only gives up once its query
-		// window has grown past eventPollSeedWindow (the gt-lurb symptom
-		// reached from a warm store): otherwise the ordinary exponential
-		// backoff in runEventPoll is enough, and reseeding a warm store
-		// pre-emptively would risk skipping closes its next successful poll
-		// would have caught.
-		windowExceeded := succeeded && now.Sub(highWater) > eventPollSeedWindow
-		if failCount >= maxSeedPollFailures && (!succeeded || windowExceeded) {
-			// This store's seed poll has failed too many times in a row —
-			// most likely its eventPollSeedWindow volume alone still exceeds
-			// the pool ReadTimeout. Retrying the same unservable query
+		if failCount >= maxSeedPollFailures {
+			// After maxSeedPollFailures consecutive failures, give up on the
+			// current query window ONLY when the evidence points at the query
+			// itself being unservable (the gt-lurb symptom: result volume
+			// alone exceeds the pool ReadTimeout). Retrying such a query
 			// forever would leave this store's close detection dark
-			// indefinitely (the stranded scan is the only remaining
-			// backstop). Give up on backfilling, but seed at the manager's
-			// own startedAt rather than wall-clock now: seeding at "now"
-			// would silently discard every close between daemon startup
-			// and this point, which is exactly what the startedAt floor
-			// elsewhere in this function exists to prevent. Clamp to the
-			// seed window as a ceiling on the resulting query size.
-			//
-			// Deliberately does NOT mark the store seeded: this store's
-			// history hasn't actually been backfilled, so if its next (now
-			// normal-shaped) polls keep failing too, this branch must be
-			// able to re-fire instead of going dark forever after a single
-			// give-up. The next successful poll takes the normal (not
-			// seed) query path since lastEventIDs is now set, and —
-			// because seededStores is still unset here — falls through
-			// the warm-up block below, which logs the size of whatever
-			// backlog that poll turns up.
+			// indefinitely. A plain outage — connection refused, or a timeout
+			// on a window too small to be oversized (a wedged server) — is
+			// deliberately NOT a give-up: moving the seed point then would
+			// discard post-startup closes without making any future query
+			// more servable, and runEventPoll's exponential backoff already
+			// sheds load until the same window can be retried.
+			now := time.Now().UTC()
 			var seedFrom time.Time
+			giveUp := false
 			switch {
 			case isSeedPoll:
-				// First give-up for this store: preserve the post-startup
-				// window as documented above.
+				// The bounded seed query keeps failing. Seed at the manager's
+				// own startedAt rather than wall-clock now: seeding at "now"
+				// would silently discard every close between daemon startup
+				// and this point, while everything before startedAt would
+				// have been discarded by warm-up anyway, so this escape is
+				// lossless. It also fires on any error kind: the resulting
+				// post-startup window is strictly smaller than the seed
+				// window, so it can only improve servability.
 				seedFrom = m.startedAt
-			case isTimeoutError(err):
-				// A later give-up caused by the query itself being too large:
-				// highWater holds the seedFrom picked by the previous
-				// give-up, and querying that same start point forever (or
-				// letting the gap to "now" grow toward eventPollSeedWindow)
-				// never produces a servable query — that's the size that
-				// just failed. Halve the remaining gap to now instead, so
-				// each re-fire narrows the window until it becomes small
-				// enough to succeed.
+				giveUp = true
+			case isTimeoutError(err) && now.Sub(highWater) >= minOversizedQueryWindow:
+				// A timeout on an already-large window: plausibly the query
+				// itself is too big (gt-lurb reached from a post-give-up or
+				// warm store whose window grew during an outage). Querying
+				// the same start point forever never produces a servable
+				// query, so halve the remaining gap to now — each re-fire
+				// narrows the window until it becomes small enough to
+				// succeed, trading a bounded, logged loss for the store's
+				// close detection actually coming online.
 				seedFrom = highWater.Add(now.Sub(highWater) / 2)
-			default:
-				// Not a timeout — e.g. connection refused during a Dolt
-				// outage. Narrowing the window here buys nothing (the query
-				// size isn't the problem) and would discard part of the
-				// post-startup backlog the startedAt floor exists to
-				// preserve, so keep pinning at startedAt until a timeout
-				// actually indicates an oversized query.
-				seedFrom = m.startedAt
+				giveUp = true
 			}
-			if floor := now.Add(-eventPollSeedWindow); seedFrom.Before(floor) {
-				seedFrom = floor
+			if giveUp {
+				if floor := now.Add(-eventPollSeedWindow); seedFrom.Before(floor) {
+					seedFrom = floor
+				}
+				m.lastEventIDs.Store(name, seedFrom)
+				// Re-enter warm-up on the next successful poll: give-up leaves
+				// a backlog behind the new seed point, and the warm-up block
+				// below is where the startedAt floor, the backlog size log,
+				// and the Dolt-unhealthy deferral live. For an already-warm
+				// store startedAt precedes the whole clamped window, so the
+				// floor discards nothing extra.
+				m.seededStores.Delete(name)
+				m.seedFailures.Delete(name)
+				m.logger("Convoy: event poll (%s): poll failed %d consecutive times, giving up on backfill and seeding at %s: %v", name, failCount, seedFrom.Format(time.RFC3339), err)
+				m.recoveryMode.Store(true)
+				return err
 			}
-			m.lastEventIDs.Store(name, seedFrom)
-			m.seedFailures.Delete(name)
-			m.logger("Convoy: event poll (%s): seed poll failed %d consecutive times, giving up on backfill and seeding at %s: %v", name, failCount, seedFrom.Format(time.RFC3339), err)
-			m.recoveryMode.Store(true)
-			return err
 		}
 		m.logger("Convoy: event poll error (%s): %v", name, err)
 		// Signal recovery mode so the stranded scan shortens its interval and
@@ -469,7 +456,6 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 		return err
 	}
 	m.seedFailures.Delete(name)
-	m.everSucceeded.Store(name, true)
 
 	// Advance high-water mark from all events, but never past this poll's own
 	// wall clock (plus a small skew tolerance): a future-dated CreatedAt
@@ -495,7 +481,6 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 			highWater = e.CreatedAt
 		}
 	}
-	m.lastEventIDs.Store(name, highWater)
 
 	// This store's first successful poll cycle is warm-up: pre-existing
 	// history (events created before the daemon itself started) is discarded
@@ -512,9 +497,28 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 	// a store whose seed poll keeps timing out drops its entire outage
 	// backlog, including FireCrossRigDepNotifications for closes that
 	// happened after startup.
+	//
+	// The whole warm-up decision runs BEFORE the high-water mark is advanced
+	// or the store marked seeded, so deferring below leaves both untouched
+	// and the next poll re-fetches the same window.
 	if _, alreadySeeded := m.seededStores.Load(name); !alreadySeeded {
 		var preExisting []*beadsdk.Event
 		events, preExisting = partitionByStartedAt(events, m.startedAt, skewedNow)
+		if len(events) > 0 && IsDoltUnhealthy(m.townRoot) {
+			// Dolt is currently flagged unhealthy: running this backlog
+			// inline (GetDependentsWithMetadata plus, per close, a convoy
+			// check subprocess and cross-rig notifications, serially on this
+			// goroutine) would pile more load onto a degraded server right
+			// when it needs headroom to recover — the same death spiral
+			// scan() already backs off from via this same signal. Defer the
+			// whole cycle: return without advancing the high-water mark or
+			// marking the store seeded, so the next healthy poll re-fetches
+			// and processes this same window instead of the backlog being
+			// dropped forever (FireCrossRigDepNotifications has no other
+			// caller, so nothing else would ever fire those notifications).
+			m.logger("Convoy: event poll (%s): Dolt unhealthy — deferring %d late warm-up event(s) until Dolt recovers", name, len(events))
+			return nil
+		}
 		for _, e := range preExisting {
 			if e.ID == "" {
 				continue
@@ -531,23 +535,10 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 		// inline on this goroutine — log its size so a resulting nudge/sling
 		// burst is attributable to a late warm-up instead of unexplained.
 		if len(events) > 0 {
-			if IsDoltUnhealthy(m.townRoot) {
-				// Dolt is currently flagged unhealthy: running this backlog
-				// inline (GetDependentsWithMetadata plus, per close, a
-				// convoy check subprocess and cross-rig notifications,
-				// serially on this goroutine) would pile more load onto a
-				// degraded server right when it needs headroom to recover —
-				// the same death spiral scan() already backs off from via
-				// this same signal. Defer this cycle's backlog; the
-				// periodic stranded scan is the backstop that picks up
-				// these completions once Dolt is healthy again.
-				m.logger("Convoy: event poll (%s): Dolt unhealthy — deferring %d late warm-up event(s) to the stranded scan", name, len(events))
-				events = nil
-			} else {
-				m.logger("Convoy: event poll (%s): late warm-up processing %d event(s) from startup backlog", name, len(events))
-			}
+			m.logger("Convoy: event poll (%s): late warm-up processing %d event(s) from startup backlog", name, len(events))
 		}
 	}
+	m.lastEventIDs.Store(name, highWater)
 
 	// Use hq store for convoy lookups (convoys are hq-* prefixed)
 	hqStore := stores["hq"]
