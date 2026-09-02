@@ -144,6 +144,20 @@ func TestRefineryNudgePayloadIsPurelyAdditive(t *testing.T) {
 				"branch=polecat/toast/gt-abc",
 			},
 		},
+		{
+			// The consumer (channelevents.emitToDir) folds pairs into a map
+			// where the LAST value for a key wins, so an extra pair reusing a
+			// fixed key would silently override it. The emitter must drop such
+			// pairs to keep the contract enforceable, not just documented.
+			name:    "extra pairs colliding with fixed keys are dropped",
+			message: "MERGE_READY received - check inbox for pending work",
+			extra:   []string{"source=evil", "message=evil", "mrID=gt-mr-123"},
+			want: []string{
+				"source=sling",
+				"message=MERGE_READY received - check inbox for pending work",
+				"mrID=gt-mr-123",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -159,6 +173,21 @@ func TestRefineryNudgePayloadIsPurelyAdditive(t *testing.T) {
 			}
 			if got[0] != "source=sling" {
 				t.Errorf("payload[0] must remain source=sling for existing consumers, got %q", got[0])
+			}
+
+			// Assert the invariant as the consumer sees it: fold the slice
+			// into a map (last pair wins, mirroring emitToDir) and check the
+			// fixed fields survive whatever extra was passed.
+			folded := map[string]string{}
+			for _, pair := range got {
+				key, val, _ := strings.Cut(pair, "=")
+				folded[key] = val
+			}
+			if folded["source"] != "sling" {
+				t.Errorf("folded source = %q, want %q", folded["source"], "sling")
+			}
+			if folded["message"] != tt.message {
+				t.Errorf("folded message = %q, want %q", folded["message"], tt.message)
 			}
 		})
 	}

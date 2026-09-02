@@ -939,13 +939,23 @@ func nudgeRefinery(rigName, message string, extraPayload ...string) {
 // refineryNudgePayload builds the MQ_SUBMIT event payload. "source=sling" and
 // "message=" are fixed — nudgeRefinery is a shared emitter with two call
 // sites and unknown consumers on the channel, so any existing consumer
-// keying off those fields must keep working. extra is appended as-is,
-// purely additive (e.g. "mrID=...", "branch=...").
+// keying off those fields must keep working. extra must be purely additive
+// (e.g. "mrID=...", "branch=..."): the consumer folds pairs into a map where
+// the LAST value for a key wins, so an extra pair reusing a fixed key would
+// silently override it — such pairs are dropped here to enforce the contract.
 func refineryNudgePayload(message string, extra ...string) []string {
-	return append([]string{
+	payload := []string{
 		"source=sling",
 		"message=" + message,
-	}, extra...)
+	}
+	for _, pair := range extra {
+		key, _, _ := strings.Cut(pair, "=")
+		if key == "source" || key == "message" {
+			continue
+		}
+		payload = append(payload, pair)
+	}
+	return payload
 }
 
 // isPolecatTarget checks if the target string refers to a polecat.

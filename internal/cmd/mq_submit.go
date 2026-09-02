@@ -258,7 +258,6 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check if MR bead already exists for this branch+SHA (idempotency)
-	var mrIssue *beads.Issue
 	var existingMR *beads.Issue
 	if commitSHA != "" {
 		existingMR, err = bd.FindMRForBranchAndSHA(branch, commitSHA)
@@ -270,46 +269,42 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 		// Dedup check failed — fall through to create a new MR
 	}
 
-	if existingMR != nil {
-		mrIssue = existingMR
-		fmt.Printf("%s MR already exists (idempotent)\n", style.Bold.Render("✓"))
-	} else {
-		// Create MR bead (ephemeral wisp - will be cleaned up after merge)
-		mrIssue, err = bd.Create(beads.CreateOptions{
-			Title:       title,
-			Labels:      []string{"gt:merge-request"},
-			Priority:    priority,
-			Description: description,
-			Ephemeral:   true,
-			Rig:         rigName, // Ensure MR bead is created in the rig's database (gt-7y7)
+	mrIssue, mrCreated, err := ensureMRBead(existingMR, branch, "gt mq submit",
+		func() (*beads.Issue, error) {
+			// Create MR bead (ephemeral wisp - will be cleaned up after merge)
+			return bd.Create(beads.CreateOptions{
+				Title:       title,
+				Labels:      []string{"gt:merge-request"},
+				Priority:    priority,
+				Description: description,
+				Ephemeral:   true,
+				Rig:         rigName, // Ensure MR bead is created in the rig's database (gt-7y7)
+			})
+		},
+		bd.Show,
+		func(mrID string) error {
+			// gt-gpy: Validate MR bead landed in the rig's database (warning only).
+			prefixErr := beads.ValidateRigPrefix(townRoot, rigName, mrID)
+			if prefixErr != nil {
+				style.PrintWarning("MR bead prefix mismatch: %v\nThe refinery may not find this MR — check 'gt mq list %s'", prefixErr, rigName)
+			}
+			return prefixErr
 		})
-		if err != nil {
-			return fmt.Errorf("creating merge request bead: %w", err)
-		}
+	if err != nil {
+		return err
+	}
+	if !mrCreated {
+		fmt.Printf("%s MR already exists (idempotent)\n", style.Bold.Render("✓"))
+	}
 
-		// Guard against empty ID from bd create (observed in ephemeral/wisp mode).
-		// Mirrors the done.go gt-5u4 guard — an empty ID means no usable merge slot.
-		if mrIssue.ID == "" {
-			return errMREmptyID(branch)
-		}
+	// Nudge refinery to pick up the MR — on the idempotent path too. A GH#1945
+	// read-back hard-fail happens AFTER bd.Create() persisted the bead, so the
+	// re-run finds it and takes the idempotent path; if only the create path
+	// nudged, that MR would sit in the queue un-woken on every retry.
+	nudgeRefinery(rigName, "MERGE_READY received - check inbox for pending work",
+		"mrID="+mrIssue.ID, "branch="+branch)
 
-		// GH#1945: Verify MR bead is readable before considering it confirmed.
-		// bd.Create() succeeds when the bead is written locally, but if the write
-		// didn't persist (Dolt failure, corrupt state), the refinery would never
-		// see this MR — silently losing the submission. Mirrors done.go:1575.
-		if verifiedMR, verifyErr := bd.Show(mrIssue.ID); verifyErr != nil || verifiedMR == nil {
-			return errMRReadbackFailed(branch, mrIssue.ID, verifyErr)
-		}
-
-		// gt-gpy: Validate MR bead landed in the rig's database (warning only).
-		if prefixErr := beads.ValidateRigPrefix(townRoot, rigName, mrIssue.ID); prefixErr != nil {
-			style.PrintWarning("MR bead prefix mismatch: %v\nThe refinery may not find this MR — check 'gt mq list %s'", prefixErr, rigName)
-		}
-
-		// Nudge refinery to pick up the new MR
-		nudgeRefinery(rigName, "MERGE_READY received - check inbox for pending work",
-			"mrID="+mrIssue.ID, "branch="+branch)
-
+	if mrCreated {
 		// GH#2599: Back-link source issue to MR bead for discoverability.
 		if issueID != "" {
 			comment := fmt.Sprintf("MR created: %s", mrIssue.ID)
@@ -377,6 +372,50 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// ensureMRBead returns the confirmed MR bead for branch: the existing bead on
+// an idempotent retry, or a freshly created one whose write is verified by
+// read-back (GH#1945). retryCmd names the invoking command in recovery text.
+//
+// validatePrefix (gt-gpy) runs BEFORE the read-back: Create routes by rig
+// alias while Show routes by the bead ID's prefix, so on a prefix mismatch the
+// read-back queries a database the bead is not in and fails not-found. Running
+// the prefix check first surfaces the one warning that explains that failure,
+// and the mismatch is echoed in the read-back error.
+func ensureMRBead(existing *beads.Issue, branch, retryCmd string,
+	create func() (*beads.Issue, error),
+	show func(id string) (*beads.Issue, error),
+	validatePrefix func(id string) error,
+) (mr *beads.Issue, created bool, err error) {
+	if existing != nil {
+		return existing, false, nil
+	}
+	mr, err = create()
+	if err != nil {
+		return nil, false, fmt.Errorf("creating merge request bead: %w", err)
+	}
+
+	// Guard against empty ID from bd create (observed in ephemeral/wisp mode).
+	// Mirrors the done.go gt-5u4 guard — an empty ID means no usable merge slot.
+	if mr.ID == "" {
+		return nil, false, errMREmptyID(branch, retryCmd)
+	}
+
+	prefixErr := validatePrefix(mr.ID)
+
+	// GH#1945: Verify MR bead is readable before considering it confirmed.
+	// bd.Create() succeeds when the bead is written locally, but if the write
+	// didn't persist (Dolt failure, corrupt state), the refinery would never
+	// see this MR — silently losing the submission. Mirrors done.go:1575.
+	if verifiedMR, verifyErr := show(mr.ID); verifyErr != nil || verifiedMR == nil {
+		err = errMRReadbackFailed(branch, mr.ID, verifyErr, retryCmd)
+		if prefixErr != nil {
+			err = fmt.Errorf("%w (likely cause: the prefix mismatch above routed the read-back to a different database)", err)
+		}
+		return nil, false, err
+	}
+	return mr, true, nil
 }
 
 func resolveMQSubmitCommitSHA(g *git.Git, branch string) (string, error) {

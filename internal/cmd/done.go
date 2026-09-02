@@ -1563,7 +1563,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// no usable merge slot, so hard-fail rather than goto notifyWitness.
 			if mrID == "" {
 				clearDoneIntentOnHardFail(cwd, townRoot, agentBeadID, issueID)
-				return errMREmptyID(branch)
+				return errMREmptyID(branch, "gt done")
 			}
 
 			// GH#1945: Verify MR bead is readable before considering it confirmed.
@@ -1574,7 +1574,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// (which also preserves the worktree, since the nuke lives past notifyWitness).
 			if verifiedMR, verifyErr := bd.Show(mrID); verifyErr != nil || verifiedMR == nil {
 				clearDoneIntentOnHardFail(cwd, townRoot, agentBeadID, issueID)
-				return errMRReadbackFailed(branch, mrID, verifyErr)
+				return errMRReadbackFailed(branch, mrID, verifyErr, "gt done")
 			}
 
 			// gt-gpy: Validate that the MR bead landed in the rig's database.
@@ -2027,8 +2027,10 @@ func clearDoneIntentOnHardFail(cwd, townRoot, agentBeadID, issueID string) {
 // production error path and its tests share one source of truth — tests assert
 // against the exact values returned by runDone instead of re-encoding the strings.
 // All three describe the same condition: the branch was pushed but no usable
-// merge slot exists, so the refinery will not pick the work up and gt done must
-// be re-run after fixing the underlying cause.
+// merge slot exists, so the refinery will not pick the work up and the invoking
+// command must be re-run after fixing the underlying cause. errMREmptyID and
+// errMRReadbackFailed are shared with gt mq submit, so they take the invoking
+// command as retryCmd rather than hardcoding "gt done".
 
 // errMRCreateFailed is returned when bd.Create() of the MR bead errors.
 func errMRCreateFailed(branch string, cause error) error {
@@ -2039,19 +2041,22 @@ func errMRCreateFailed(branch string, cause error) error {
 
 // errMREmptyID is returned when bd.Create() succeeds but yields an empty MR ID
 // (observed in ephemeral/wisp mode) — there is no slot the refinery can act on.
-func errMREmptyID(branch string) error {
+// retryCmd names the invoking command ("gt done", "gt mq submit") so the
+// recovery line tells the operator to re-run what they actually ran.
+func errMREmptyID(branch, retryCmd string) error {
 	return fmt.Errorf("MR bead creation returned an empty ID — branch %s was pushed but no merge slot exists; "+
-		"refinery will not pick this up. re-run gt done to retry MR creation", branch)
+		"refinery will not pick this up. re-run %s to retry MR creation", branch, retryCmd)
 }
 
 // errMRReadbackFailed is returned when the MR bead is created but the verifying
 // read-back fails (GH#1945) — the slot is unconfirmed and may not have persisted.
-func errMRReadbackFailed(branch, mrID string, cause error) error {
+// retryCmd names the invoking command, as in errMREmptyID.
+func errMRReadbackFailed(branch, mrID string, cause error, retryCmd string) error {
 	if cause == nil {
 		cause = fmt.Errorf("read-back returned no bead")
 	}
 	return fmt.Errorf("MR bead %s created but verification read-back failed — branch %s was pushed but the merge slot is unconfirmed; "+
-		"refinery may not pick this up. re-run gt done to retry. underlying error: %w", mrID, branch, cause)
+		"refinery may not pick this up. re-run %s to retry. underlying error: %w", mrID, branch, retryCmd, cause)
 }
 
 // DoneCheckpoint represents a checkpoint stage in the gt done flow (gt-aufru).
