@@ -196,3 +196,24 @@ func TestBuildPerspectivePrompt_BaseSHAFallback(t *testing.T) {
 		t.Error("fallback prompt must not claim the base is pinned")
 	}
 }
+
+// §4a/§4b are rendered into every perspective pass, so scope discipline and the
+// coordinator's trimming authority are part of the deterministic contract
+// rather than advice that may or may not reach a given lens.
+func TestBuildPerspectivePrompt_RendersScopeDiscipline(t *testing.T) {
+	out := buildBuiltin(t, PromptParams{
+		RigName: "gastown", PR: 7, SHA: "abc123", Round: 1,
+	}, "adversarial")
+
+	for _, want := range []string{
+		"an improvement opportunity is not a finding",
+		"`opportunities` array",
+		"block the PR",
+		"The coordinator is the gatekeeper",
+		"trim",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("prompt missing scope-discipline marker %q", want)
+		}
+	}
+}

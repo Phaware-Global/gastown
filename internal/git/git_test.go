@@ -3432,3 +3432,30 @@ func TestCheckoutPRHeadDetachedFreshensBaseRefs(t *testing.T) {
 			defaultBranch, gotBase, remoteBaseTip)
 	}
 }
+
+// TestGhPrDismissReview_Validation covers the guards that run before any `gh`
+// subprocess. The message is required by the API and is what a reader of the
+// dismissed review sees in place of the withdrawn verdict, so an empty one must
+// fail here rather than as an opaque 422.
+func TestGhPrDismissReview_Validation(t *testing.T) {
+	g := NewGit(t.TempDir())
+
+	if err := g.GhPrDismissReview(0, 5, "superseded"); err == nil {
+		t.Error("expected error for a non-positive PR number")
+	}
+	if err := g.GhPrDismissReview(1, 0, "superseded"); err == nil {
+		t.Error("expected error for a non-positive review ID")
+	}
+	if err := g.GhPrDismissReview(1, 5, "   "); err == nil {
+		t.Error("expected error for a blank dismissal message")
+	}
+}
+
+// TestGhPrReviews_Validation pins the PR-number guard; the listing itself is
+// exercised end-to-end through the GitHub provider's dismiss path.
+func TestGhPrReviews_Validation(t *testing.T) {
+	g := NewGit(t.TempDir())
+	if _, err := g.GhPrReviews(0); err == nil {
+		t.Error("expected error for a non-positive PR number")
+	}
+}

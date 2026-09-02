@@ -59,11 +59,15 @@ func TestConsolidate_SummaryAccountsForEveryPerspective(t *testing.T) {
 		t.Errorf("reviewed SHA = %q", fs.ReviewedSHA)
 	}
 	// Both verdicts — including the zero-finding one — appear in the summary.
-	if !strings.Contains(fs.Summary, "[adversarial] found a nil deref") {
-		t.Error("summary missing adversarial verdict")
+	if len(fs.Summary.Verdicts) != 2 {
+		t.Fatalf("summary carries %d verdicts, want one per perspective", len(fs.Summary.Verdicts))
 	}
-	if !strings.Contains(fs.Summary, "[security] no findings: nothing tainted") {
-		t.Error("summary missing the zero-finding security verdict")
+	if got := fs.Summary.Verdicts[0]; got.Perspective != "adversarial" || got.Verdict != "found a nil deref" {
+		t.Errorf("verdict[0] = %+v, want the adversarial verdict", got)
+	}
+	// The zero-finding lens still gets its line — a perspective is never silent.
+	if got := fs.Summary.Verdicts[1]; got.Perspective != "security" || got.Verdict != "no findings: nothing tainted" {
+		t.Errorf("verdict[1] = %+v, want the security verdict", got)
 	}
 	if len(fs.Findings) != 1 {
 		t.Fatalf("findings = %d, want 1", len(fs.Findings))
@@ -165,7 +169,72 @@ func TestConsolidate_RoundTripsThroughParseFindings(t *testing.T) {
 	if len(body.Comments) != 1 {
 		t.Fatalf("expected 1 inline comment, got %d", len(body.Comments))
 	}
-	if !strings.Contains(body.Body, "Reviewed SHA: sha") {
+	if !strings.Contains(body.Body, "**Reviewed SHA:** `sha`") {
 		t.Error("summary body missing reviewed SHA")
+	}
+}
+
+// Opportunities are the channel §4a points out-of-scope improvements at: they
+// reach the review body as advisory bullets, deduplicated across lenses, and
+// they never move the verdict event.
+func TestConsolidate_CollectsAndDedupsOpportunities(t *testing.T) {
+	results := []PerspectiveResult{
+		{Perspective: "security", Verdict: "no blocking issues",
+			Opportunities: []string{"token TTL is hardcoded", "audit log lacks the actor id"}},
+		{Perspective: "adversarial", Verdict: "one medium finding",
+			// Same observation as the security lens, differently cased: one
+			// follow-up, so one bullet.
+			Opportunities: []string{"Token TTL is hardcoded", "retry loop has no jitter"},
+			Findings: []Finding{
+				{Path: "a.go", Line: 5, Priority: "medium", Perspective: "adversarial", Title: "unbounded retry"},
+			}},
+	}
+
+	fs := Consolidate(results, "sha1", nil)
+
+	want := []string{"token TTL is hardcoded", "audit log lacks the actor id", "retry loop has no jitter"}
+	if len(fs.Summary.Opportunities) != len(want) {
+		t.Fatalf("opportunities = %q, want %q (deduped case-insensitively)", fs.Summary.Opportunities, want)
+	}
+	for i, w := range want {
+		if fs.Summary.Opportunities[i] != w {
+			t.Errorf("opportunity[%d] = %q, want %q", i, fs.Summary.Opportunities[i], w)
+		}
+	}
+	// Advisory: an opportunity is not a finding and does not withhold approval.
+	if len(fs.Findings) != 1 {
+		t.Errorf("opportunities must not become findings: %+v", fs.Findings)
+	}
+	if ev := fs.ReviewEvent(); ev != "APPROVE" {
+		t.Errorf("event = %q — neither the medium finding nor the opportunities withhold approval", ev)
+	}
+	// And they survive to the posted body.
+	body := fs.SummaryBody("sha1")
+	for _, w := range want {
+		if !strings.Contains(body, "- "+w) {
+			t.Errorf("review body dropped opportunity %q:\n%s", w, body)
+		}
+	}
+}
+
+// A pass learns it overran from its own result, where the offender is obvious,
+// rather than from a payload folded out of every lens's output.
+func TestParsePerspectiveResult_EnforcesSummaryBudgets(t *testing.T) {
+	long := strings.Repeat("x", MaxVerdictLen+1)
+	if _, err := ParsePerspectiveResult([]byte(`{"perspective":"security","verdict":"` + long + `","findings":[]}`)); err == nil {
+		t.Error("an over-budget verdict was accepted")
+	}
+	longOpp := strings.Repeat("x", MaxOpportunityLen+1)
+	payload := `{"perspective":"security","verdict":"ok","opportunities":["` + longOpp + `"],"findings":[]}`
+	if _, err := ParsePerspectiveResult([]byte(payload)); err == nil {
+		t.Error("an over-budget opportunity was accepted")
+	}
+	ok := `{"perspective":"security","verdict":"ok","opportunities":["  add jitter  "],"findings":[]}`
+	r, err := ParsePerspectiveResult([]byte(ok))
+	if err != nil {
+		t.Fatalf("valid result rejected: %v", err)
+	}
+	if len(r.Opportunities) != 1 || r.Opportunities[0] != "add jitter" {
+		t.Errorf("opportunities = %q, want them trimmed", r.Opportunities)
 	}
 }

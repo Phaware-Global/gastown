@@ -118,6 +118,10 @@ func (p *bitbucketPRProvider) CurrentHeadSHA(prNumber int) (string, error) {
 	return "", ErrUnsupported
 }
 
+func (p *bitbucketPRProvider) DismissChangesRequestedReviews(prNumber int, user, message string) error {
+	return ErrUnsupported
+}
+
 func (p *bitbucketPRProvider) SubmitReview(prNumber int, in SubmitReviewInput) error {
 	return ErrUnsupported
 }
