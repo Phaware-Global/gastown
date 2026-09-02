@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -152,8 +153,9 @@ func (d *Daemon) checkpointRigPolecats(rigName string) (int, int) {
 			// a session that crashed seconds ago and never fired for one
 			// cleanly reaped weeks ago — the actual "deliberately
 			// abandoned" case the threshold exists to catch (PR #184
-			// review). Fall back to the worktree's own last-activity
-			// signal (HEAD's commit date), which survives session reaping.
+			// review). Fall back to the worktree's own activity signals
+			// (git index mtime, HEAD commit date — see
+			// checkpointDogWorktreeAge), which survive session reaping.
 			age, ageErr := checkpointDogWorktreeAge(workDir, d.config.TownRoot, sessionName)
 			if ageErr == nil && age > checkpointDogAbandonedThreshold {
 				d.logger.Printf("checkpoint_dog: session %s dead, last activity %s ago (> %s) — skipping as abandoned", sessionName, age.Round(time.Minute), checkpointDogAbandonedThreshold)
@@ -219,13 +221,14 @@ func (d *Daemon) checkpointWorktree(workDir, rigName, polecatName string) bool {
 	if result.HooksFailed {
 		// The commit exists locally but was never verified — pushing it
 		// would defeat the hooks (gt-i4ej FIX 2). Escalate loudly so a
-		// human resolves the hook failure — but do not copy
-		// result.HookOutput (git's relayed pre-commit hook stderr) into
-		// this log: the hook this gate exists for is typically a secret
-		// scanner, so its verbatim output can contain the very credential
-		// it caught. Writing that into the daemon's shared, rotated,
-		// gzip-archived log would relocate the secret to a longer-lived,
-		// more widely-read artifact than the uncommitted file it came from
+		// human resolves the hook failure — but do not copy the hook's
+		// stderr into this log (HookOutput is now redacted at the source
+		// for the same reason, but this site keeps its own wording): the
+		// hook this gate exists for is typically a secret scanner, so its
+		// verbatim output can contain the very credential it caught.
+		// Writing that into the daemon's shared, rotated, gzip-archived
+		// log would relocate the secret to a longer-lived, more
+		// widely-read artifact than the uncommitted file it came from
 		// (PR #184 review). Point at the worktree instead.
 		d.logger.Printf("checkpoint_dog: ERROR — %s/%s checkpoint committed locally but its pre-commit hook FAILED, so it was NOT pushed. Run `git commit` in %s to see the hook output.", rigName, polecatName, workDir)
 	}
@@ -266,17 +269,37 @@ func resolveCheckpointWorkDir(polecatsDir, polecatName, rigName string) string {
 }
 
 // checkpointDogWorktreeAge returns how long ago a dead-session worktree was
-// last active, for the checkpointDogAbandonedThreshold bound. Prefers the
-// session heartbeat; falls back to the worktree's own HEAD commit date,
-// which — unlike the heartbeat file — survives the session being cleanly
-// reaped (PR #184 review, see caller).
+// last active, for the checkpointDogAbandonedThreshold bound. Takes the most
+// recent of every available signal rather than the first one that resolves:
+//
+//   - the session heartbeat (deleted by a clean reap, so its absence means
+//     "reaped or never had one", not "fresh");
+//   - the git index mtime — a signal of THIS worktree's activity that
+//     survives reaping. HEAD's commit date alone is NOT such a signal: a
+//     polecat created from the current base-branch tip whose session died
+//     before its first commit inherits the base branch's last-commit date,
+//     so on any repo whose default branch hadn't moved in 24h every
+//     cleanly-reaped, not-yet-committed polecat — the population this dog
+//     exists for — was classified abandoned (PR #184 review);
+//   - HEAD's commit date, as the floor for repos where the index can't be
+//     statted.
+//
+// Erring fresh (preserving too often) is the safe direction; the caller
+// also treats an error here as "not abandoned" for the same reason.
 func checkpointDogWorktreeAge(workDir, townRoot, sessionName string) (time.Duration, error) {
-	if hb := polecat.ReadSessionHeartbeat(townRoot, sessionName); hb != nil {
-		return time.Since(hb.Timestamp), nil
+	var newest time.Time
+	if hb := polecat.ReadSessionHeartbeat(townRoot, sessionName); hb != nil && hb.Timestamp.After(newest) {
+		newest = hb.Timestamp
 	}
-	last, err := git.NewGit(workDir).LastActivityTime()
-	if err != nil {
-		return 0, err
+	g := git.NewGit(workDir)
+	if mt, err := g.IndexModTime(); err == nil && mt.After(newest) {
+		newest = mt
 	}
-	return time.Since(last), nil
+	if ct, err := g.LastActivityTime(); err == nil && ct.After(newest) {
+		newest = ct
+	}
+	if newest.IsZero() {
+		return 0, fmt.Errorf("no activity signal available for %s", workDir)
+	}
+	return time.Since(newest), nil
 }
