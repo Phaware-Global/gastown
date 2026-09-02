@@ -128,6 +128,28 @@ var positionalTextSubcommands = map[string]bool{
 	"escalate": true,
 }
 
+// positionalValueTakingFlags lists the flags that take a SEPARATE value
+// token on the positional-text subcommands above. During positional
+// scanning only these flags consume the token after them; a boolean
+// flag (--force, --json, --stdin, ...) consumes nothing, so the
+// positional message after it is still scanned. A value-taking flag
+// missing from this table errs toward scanning its value as positional
+// text: a false block names the safe rewrite, while a false pass
+// re-runs the gt-h38j incident. Note several of these are also
+// text-bearing flags (-m, --message, -r, --reason, ...); their values
+// are inspected by findCommandSubstitutionInFlags before the positional
+// scan runs, so skipping them here loses no coverage.
+var positionalValueTakingFlags = map[string]bool{
+	// gt nudge (internal/cmd/nudge.go)
+	"-m": true, "--message": true, "--mode": true, "--priority": true,
+	// gt escalate (internal/cmd/escalate.go)
+	"-s": true, "--severity": true, "-r": true, "--reason": true,
+	"--source": true, "--related": true, "--fingerprint": true,
+	// bd create / bd comment
+	"-d": true, "--description": true, "-p": true, "-t": true,
+	"--type": true, "--labels": true, "--assignee": true,
+}
+
 // shellSeparatorPattern documents (for readers of splitTopLevelSegments)
 // the operators that end one shell command and start another on the
 // same line: ";", "&&", "||", "|", and a bare newline.
@@ -307,18 +329,35 @@ type commandSubstitutionMatch struct {
 // is false and the caller should look at the NEXT token as the argument
 // instead.
 func flagAndValue(tok string) (flag, value string, hasValue bool) {
-	if idx := strings.IndexByte(tok, '='); idx >= 0 && strings.HasPrefix(tok, "--") {
-		return tok[:idx], tok[idx+1:], true
-	}
-	// Attached long-flag value: shlex merges a long flag with an
-	// adjacent quoted run into one word, same as the short-flag case
-	// below, e.g. --append-notes"see `find /`" tokenizes as one word
-	// with no "=" and no separate next token to inspect.
 	if strings.HasPrefix(tok, "--") {
+		// Attached long-flag value: shlex merges a long flag with an
+		// adjacent quoted run into one word, same as the short-flag
+		// case below, e.g. --append-notes"see `find /`" tokenizes as
+		// one word with no separate next token to inspect. Checked
+		// BEFORE the generic "=" split: an attached value containing
+		// "=" (e.g. --append-notes"a=b `find /`", one shlex word)
+		// would otherwise split at its first "=" into the flag
+		// "--append-notesa", which no table matches, and the value
+		// would never be inspected — the exact gt-h38j incident shape
+		// with a KEY=value phrase in the note (round-5 finding). The
+		// prefix match also subsumes the plain --flag=value spelling
+		// for text-bearing flags (one leading "=" is stripped from the
+		// value), so the "=" split below only ever decides for flags
+		// outside the text-bearing set. The "-file" carve-out keeps the
+		// file variants (--body-file, --append-notes-file, ...) parsed
+		// as their own flags: they carry a path, not free text, and are
+		// the guard's own recommended safe form.
 		for f := range textBearingLongFlags {
 			if len(tok) > len(f) && strings.HasPrefix(tok, f) {
-				return f, tok[len(f):], true
+				rest := tok[len(f):]
+				if rest == "-file" || strings.HasPrefix(rest, "-file=") {
+					break
+				}
+				return f, strings.TrimPrefix(rest, "="), true
 			}
+		}
+		if idx := strings.IndexByte(tok, '='); idx >= 0 {
+			return tok[:idx], tok[idx+1:], true
 		}
 	}
 	// Attached short-flag value, the git-style spelling an agent
@@ -501,22 +540,39 @@ func findCommandSubstitutionInPositional(tokens []string) (commandSubstitutionMa
 		}
 	}
 
+	endOfOptions := false
 	for i := subIdx + 1; i < len(tokens); i++ {
 		tok := tokens[i]
 		if isRedirectOperator(tok) {
 			break // everything after a redirect is shell-interpreted, not a bd/gt argument
 		}
-		if isFlagToken(tok) {
-			// A flag's own value is the flag's semantic argument, not
-			// free text destined for the positional slot — only skip
-			// the value when it's a separate token (no attached
-			// "=value" already consumed by this same token), e.g. -p 1
-			// or --labels "round-$(date +%s)" on "bd create ... -p 1
-			// --labels ...".
-			if !strings.Contains(tok, "=") && i+1 < len(tokens) {
-				i++
+		if !endOfOptions {
+			if tok == "--" {
+				// End-of-options marker: bd/gt treat every remaining
+				// token as positional, so scan them all. Round-5
+				// finding: isFlagToken counted the bare "--" as a flag,
+				// so the skip below swallowed the message after it.
+				endOfOptions = true
+				continue
 			}
-			continue
+			if isFlagToken(tok) {
+				// A flag's own value is the flag's semantic argument,
+				// not free text destined for the positional slot — but
+				// only a flag KNOWN to take a separate value consumes
+				// the next token, and never a redirect operator.
+				// Round-5 finding: skipping the token after ANY flag
+				// let a boolean flag (--force, --json, ...) swallow the
+				// positional message unscanned (reopening the gt-h38j
+				// hole), and conversely consume a following
+				// value-taking FLAG so its value was scanned as prose
+				// (false-blocking --labels "round-$(date +%s)"). An
+				// attached "=value" is part of this same token, so
+				// nothing more is consumed for it either way.
+				if positionalValueTakingFlags[tok] && i+1 < len(tokens) && !isRedirectOperator(tokens[i+1]) {
+					i++
+				}
+				continue
+			}
 		}
 		if containsCommandSubstitution(tok) {
 			return commandSubstitutionMatch{

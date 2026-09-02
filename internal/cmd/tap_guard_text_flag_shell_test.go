@@ -407,6 +407,110 @@ func TestFindCommandSubstitutionInTextFlag(t *testing.T) {
 			wantFlag:   "--body",
 			wantBinary: "gt",
 		},
+		{
+			// Round-5 HIGH finding: the round-4 flag-value skip consumed
+			// the token after ANY flag token, so a boolean flag sitting
+			// before the positional message swallowed the message
+			// unscanned — reopening the founding gt-h38j hole.
+			name:       "boolean short flag before positional message no longer swallows it",
+			command:    "gt nudge mayor/ -f \"check `find /` output\"",
+			wantBlock:  true,
+			wantFlag:   positionalArgLabel,
+			wantBinary: "gt",
+		},
+		{
+			name:       "boolean long flag before positional message no longer swallows it",
+			command:    "gt escalate --json \"Dolt: `find /` hung\"",
+			wantBlock:  true,
+			wantFlag:   positionalArgLabel,
+			wantBinary: "gt",
+		},
+		{
+			name:       "bd boolean flag before positional title no longer swallows it",
+			command:    "bd create --json \"t `id`\"",
+			wantBlock:  true,
+			wantFlag:   positionalArgLabel,
+			wantBinary: "bd",
+		},
+		{
+			name:       "boolean flag directly before a dollar-paren message no longer swallows it",
+			command:    `gt nudge mayor/ --if-fresh "$(find /)"`,
+			wantBlock:  true,
+			wantFlag:   positionalArgLabel,
+			wantBinary: "gt",
+		},
+		{
+			// Round-5: isFlagToken counted the bare end-of-options marker
+			// "--" as a flag, so it too swallowed the token after it.
+			name:       "end-of-options marker no longer swallows the positional title",
+			command:    "bd create -- \"title with `find /`\"",
+			wantBlock:  true,
+			wantFlag:   positionalArgLabel,
+			wantBinary: "bd",
+		},
+		{
+			name:       "everything after end-of-options is scanned as positional text",
+			command:    `gt nudge mayor/ -- "msg $(id)"`,
+			wantBlock:  true,
+			wantFlag:   positionalArgLabel,
+			wantBinary: "gt",
+		},
+		{
+			// Round-5 MEDIUM finding, the over-block half of the same
+			// skip: after a boolean flag the skip consumed the
+			// value-taking FLAG token instead of its value, so the value
+			// was then scanned as positional prose.
+			name:      "boolean flag before a value-taking flag no longer false-blocks its value",
+			command:   `bd create "t" --json --labels "round-$(date +%s)"`,
+			wantBlock: false,
+		},
+		{
+			name:      "redirect target after a boolean flag is still not scanned",
+			command:   "gt nudge mayor --force > /tmp/o-$(date +%s).log",
+			wantBlock: false,
+		},
+		{
+			// Round-5 MEDIUM finding: the "=" split preempted the
+			// attached long-flag prefix match, so an attached value
+			// containing "=" split into the flag "--append-notesa" and
+			// was never inspected — the exact gt-h38j incident spelling
+			// with a KEY=value phrase in the note.
+			name:       "attached long-flag value containing '=' caught",
+			command:    "bd update gt-x --append-notes\"a=b `find /`\"",
+			wantBlock:  true,
+			wantFlag:   "--append-notes",
+			wantBinary: "bd",
+		},
+		{
+			name:       "attached long-flag value without '=' still caught",
+			command:    "bd update gt-x --append-notes\"plain `find /`\"",
+			wantBlock:  true,
+			wantFlag:   "--append-notes",
+			wantBinary: "bd",
+		},
+		{
+			name:       "flag=value spelling with a further '=' inside the value still caught",
+			command:    "bd update gt-x --append-notes=\"a=b `find /`\"",
+			wantBlock:  true,
+			wantFlag:   "--append-notes",
+			wantBinary: "bd",
+		},
+		{
+			name:       "attached --body value containing '=' caught",
+			command:    "gt mail send x/ --body\"k=v `id`\"",
+			wantBlock:  true,
+			wantFlag:   "--body",
+			wantBinary: "gt",
+		},
+		{
+			// The file variants carry a path, not free text, and are the
+			// guard's own recommended safe form — the attached-value
+			// prefix match must not misread them as --body/--append-notes
+			// with an attached substitution.
+			name:      "body-file with '=' and a substitution in the path is a different flag, not blocked",
+			command:   "bd update gt-x --body-file=/tmp/n-$(date +%s).txt",
+			wantBlock: false,
+		},
 	}
 
 	for _, tc := range tests {
