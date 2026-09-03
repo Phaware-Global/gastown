@@ -111,3 +111,39 @@ func TestBeadsScopeHint_NonHQEmpty(t *testing.T) {
 		t.Fatalf("beadsScopeHint() = %q, want empty", hint)
 	}
 }
+
+// TestConnectionsLine verifies a failed connection measurement never renders as
+// "0 / N (0%)" — the zero value would be indistinguishable from a healthy idle
+// server, the same lie the PROBE FAILED rendering exists to prevent (hq-09sb1).
+func TestConnectionsLine(t *testing.T) {
+	measured := &doltserver.HealthMetrics{
+		Connections:    5,
+		MaxConnections: 1000,
+		ConnectionPct:  0.5,
+	}
+	if got := connectionsLine(measured); !strings.Contains(got, "5 / 1000") {
+		t.Errorf("connectionsLine(measured) = %q, want the count triple", got)
+	}
+
+	processlist := &doltserver.HealthMetrics{
+		Connections:      5,
+		MaxConnections:   1000,
+		ConnectionSource: "processlist",
+	}
+	if got := connectionsLine(processlist); !strings.Contains(got, "sessions only") {
+		t.Errorf("connectionsLine(processlist) = %q, want the sessions-only caveat", got)
+	}
+
+	unknown := &doltserver.HealthMetrics{
+		MaxConnections:     1000,
+		ConnectionsUnknown: true,
+		ConnectionError:    "querying connection count: exit status 1",
+	}
+	got := connectionsLine(unknown)
+	if !strings.Contains(got, "unavailable") || !strings.Contains(got, "exit status 1") {
+		t.Errorf("connectionsLine(unknown) = %q, want unavailable + the failure", got)
+	}
+	if strings.Contains(got, "0 / 1000") || strings.Contains(got, "(0%)") {
+		t.Errorf("connectionsLine(unknown) = %q, must not render the zero-value triple", got)
+	}
+}
