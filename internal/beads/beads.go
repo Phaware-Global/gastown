@@ -1358,7 +1358,14 @@ func (b *Beads) ListMergeRequests(opts ListOptions) ([]*Issue, error) {
 		labelFilter, statusFilter)
 
 	sqlOut, sqlErr := b.run("sql", "--json", query)
-	if sqlErr == nil && len(sqlOut) > 0 && isJSONBytes(sqlOut) {
+	if sqlErr != nil {
+		// MR beads created by gt done/gt mq submit are Ephemeral and live
+		// ONLY in the wisps table, so a failed wisps read must not read as
+		// "no MR beads": callers like FindMRForReviewPR would treat a Dolt
+		// lock timeout as a definitive absence and fail open (PR #221).
+		return nil, fmt.Errorf("querying merge-request wisps: %w", sqlErr)
+	}
+	if len(sqlOut) > 0 && isJSONBytes(sqlOut) {
 		var rows []struct {
 			ID          string `json:"id"`
 			Title       string `json:"title"`
