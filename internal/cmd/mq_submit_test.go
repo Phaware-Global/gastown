@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -209,5 +210,175 @@ func TestValidateMoleculePrereqs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestMQSubmitEnsureMRBead drives ensureMRBead — the production decision
+// function runMqSubmit calls — with fake create/show/validatePrefix hooks, so
+// deleting or reordering the production guards fails these cases (unlike the
+// previous version of this test, which re-encoded the control flow in a local
+// closure the production code never executed).
+func TestMQSubmitEnsureMRBead(t *testing.T) {
+	const branch = "polecat/furiosa/gt-abc"
+	const retryCmd = "gt mq submit"
+	const mrID = "gts-mr-test"
+
+	okIssue := &beads.Issue{ID: mrID}
+	okCreate := func() (*beads.Issue, error) { return okIssue, nil }
+	okShow := func(id string) (*beads.Issue, error) { return &beads.Issue{ID: id}, nil }
+	okPrefix := func(string) error { return nil }
+
+	tests := []struct {
+		name        string
+		existing    *beads.Issue
+		create      func() (*beads.Issue, error)
+		show        func(id string) (*beads.Issue, error)
+		prefix      func(id string) error
+		wantErr     bool
+		wantCreated bool
+		wantInErr   []string
+	}{
+		{
+			name:        "create succeeds + show succeeds → confirmed, created",
+			create:      okCreate,
+			show:        okShow,
+			prefix:      okPrefix,
+			wantCreated: true,
+		},
+		{
+			name:      "create fails → hard error wrapping cause",
+			create:    func() (*beads.Issue, error) { return nil, fmt.Errorf("dolt write failed") },
+			show:      okShow,
+			prefix:    okPrefix,
+			wantErr:   true,
+			wantInErr: []string{"creating merge request bead", "dolt write failed"},
+		},
+		{
+			name:      "empty MR ID → hard error naming gt mq submit, not gt done",
+			create:    func() (*beads.Issue, error) { return &beads.Issue{ID: ""}, nil },
+			show:      okShow,
+			prefix:    okPrefix,
+			wantErr:   true,
+			wantInErr: []string{branch, "re-run gt mq submit"},
+		},
+		{
+			name:      "show fails → hard error (GH#1945) naming gt mq submit",
+			create:    okCreate,
+			show:      func(string) (*beads.Issue, error) { return nil, fmt.Errorf("dolt read failed") },
+			prefix:    okPrefix,
+			wantErr:   true,
+			wantInErr: []string{branch, mrID, "re-run gt mq submit", "dolt read failed"},
+		},
+		{
+			name:      "show returns nil bead → hard error (GH#1945)",
+			create:    okCreate,
+			show:      func(string) (*beads.Issue, error) { return nil, nil },
+			prefix:    okPrefix,
+			wantErr:   true,
+			wantInErr: []string{branch, mrID, "re-run gt mq submit"},
+		},
+		{
+			name:      "prefix mismatch + show fails → error carries the prefix-mismatch hint",
+			create:    okCreate,
+			show:      func(string) (*beads.Issue, error) { return nil, fmt.Errorf("not found") },
+			prefix:    func(string) error { return fmt.Errorf("bead gts-mr-test not in rig db") },
+			wantErr:   true,
+			wantInErr: []string{"prefix mismatch", "re-run gt mq submit"},
+		},
+		{
+			name:        "existing MR → idempotent success without create or show",
+			existing:    okIssue,
+			create:      func() (*beads.Issue, error) { t.Error("create must not run on idempotent path"); return nil, nil },
+			show:        func(string) (*beads.Issue, error) { t.Error("show must not run on idempotent path"); return nil, nil },
+			prefix:      func(string) error { t.Error("validatePrefix must not run on idempotent path"); return nil },
+			wantCreated: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mr, created, err := ensureMRBead(tt.existing, branch, retryCmd, tt.create, tt.show, tt.prefix)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, want error: %v", err, tt.wantErr)
+			}
+			if created != tt.wantCreated {
+				t.Errorf("created = %v, want %v", created, tt.wantCreated)
+			}
+			if err != nil {
+				for _, want := range tt.wantInErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error missing %q; got: %s", want, err.Error())
+					}
+				}
+				return
+			}
+			if mr == nil || mr.ID != mrID {
+				t.Errorf("mr = %+v, want ID %q", mr, mrID)
+			}
+		})
+	}
+}
+
+// TestMQSubmitEnsureMRBeadValidatesPrefixBeforeReadback pins the gt-gpy
+// ordering: Create routes by rig alias but Show routes by ID prefix, so on a
+// prefix mismatch the read-back queries the wrong database and fails with a
+// misleading "unconfirmed" error. The prefix warning must fire first so the
+// one message explaining the failure is emitted.
+func TestMQSubmitEnsureMRBeadValidatesPrefixBeforeReadback(t *testing.T) {
+	var calls []string
+	_, _, err := ensureMRBead(nil, "polecat/furiosa/gt-abc", "gt mq submit",
+		func() (*beads.Issue, error) { return &beads.Issue{ID: "hq-mr-1"}, nil },
+		func(string) (*beads.Issue, error) { calls = append(calls, "show"); return nil, fmt.Errorf("not found") },
+		func(string) error { calls = append(calls, "validatePrefix"); return fmt.Errorf("prefix mismatch") },
+	)
+	if err == nil {
+		t.Fatal("want read-back hard error")
+	}
+	want := []string{"validatePrefix", "show"}
+	if len(calls) != len(want) || calls[0] != want[0] || calls[1] != want[1] {
+		t.Errorf("call order = %v, want %v", calls, want)
+	}
+}
+
+// TestMQSubmitRetryAfterReadbackFailureStillNudges encodes the GH#1945
+// stranding scenario from PR #189 review: Create persists the bead, the
+// read-back fails transiently, the command hard-fails; the re-run finds the
+// bead and takes the idempotent path. That retry must succeed through
+// ensureMRBead — runMqSubmit nudges the refinery unconditionally after a nil
+// error, so idempotent success is the nudge precondition. Before the fix the
+// nudge lived inside the create-only branch and the retried MR was never
+// picked up.
+func TestMQSubmitRetryAfterReadbackFailureStillNudges(t *testing.T) {
+	const branch = "polecat/furiosa/gt-abc"
+	persisted := &beads.Issue{ID: "gts-mr-persisted"}
+
+	// First run: create persists, read-back fails → hard error, no nudge.
+	_, _, err := ensureMRBead(nil, branch, "gt mq submit",
+		func() (*beads.Issue, error) { return persisted, nil },
+		func(string) (*beads.Issue, error) { return nil, fmt.Errorf("transient dolt read failure") },
+		func(string) error { return nil },
+	)
+	if err == nil {
+		t.Fatal("first run: want read-back hard error")
+	}
+
+	// Retry: the dedup lookup finds the persisted bead → idempotent success,
+	// which must reach the (now unconditional) nudge in runMqSubmit.
+	mr, created, err := ensureMRBead(persisted, branch, "gt mq submit",
+		func() (*beads.Issue, error) { t.Error("retry must not create a second MR"); return nil, nil },
+		func(string) (*beads.Issue, error) {
+			t.Error("retry must not re-verify the existing MR")
+			return nil, nil
+		},
+		func(string) error { return nil },
+	)
+	if err != nil {
+		t.Fatalf("retry must succeed so the refinery is nudged; got %v", err)
+	}
+	if created {
+		t.Error("retry must report the idempotent path, not a fresh create")
+	}
+	if mr != persisted {
+		t.Errorf("retry must return the persisted MR; got %+v", mr)
 	}
 }

@@ -1,6 +1,9 @@
 package beads
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestMatchesMRSourceIssue(t *testing.T) {
 	tests := []struct {
@@ -214,6 +217,78 @@ func TestPickMRForBranch(t *testing.T) {
 				t.Errorf("pickMRForBranch returned nil; want %q", tc.wantID)
 			case got.ID != tc.wantID:
 				t.Errorf("pickMRForBranch returned %q; want %q", got.ID, tc.wantID)
+			}
+		})
+	}
+}
+
+// TestPickMRForReviewPR covers the review_pr match logic used by the
+// reused-PR completion path in gt done. PR #221 round 3: terminal statuses
+// beyond "closed" — tombstone in particular — must also read as dead, or a
+// tombstoned MR wisp makes the orphan check pass and the work bead is left
+// open against an MR the refinery will never pick up.
+func TestPickMRForReviewPR(t *testing.T) {
+	mk := func(id, status string, reviewPR int) *Issue {
+		return &Issue{
+			ID:          id,
+			Description: fmt.Sprintf("branch: polecat/foo\ntarget: main\nsource_issue: gt-xxx\nreview_pr: %d\n", reviewPR),
+			Status:      status,
+			Labels:      []string{"gt:merge-request"},
+		}
+	}
+
+	tests := []struct {
+		name     string
+		issues   []*Issue
+		reviewPR int
+		wantID   string
+	}{
+		{
+			"open MR tracking the PR — matches",
+			[]*Issue{mk("gt-1", "open", 221)},
+			221, "gt-1",
+		},
+		{
+			"different review_pr — no match",
+			[]*Issue{mk("gt-2", "open", 220)},
+			221, "",
+		},
+		{
+			"closed MR — dead, no match",
+			[]*Issue{mk("gt-3", "closed", 221)},
+			221, "",
+		},
+		{
+			"tombstoned MR — just as dead as closed, no match",
+			[]*Issue{mk("gt-4", string(StatusTombstone), 221)},
+			221, "",
+		},
+		{
+			"description lacks MR fields — no match",
+			[]*Issue{{ID: "gt-5", Description: "just prose", Status: "open"}},
+			221, "",
+		},
+		{
+			"tombstoned match plus live match — returns the live one",
+			[]*Issue{
+				mk("gt-6", string(StatusTombstone), 221),
+				mk("gt-7", "open", 221),
+			},
+			221, "gt-7",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := pickMRForReviewPR(tc.issues, tc.reviewPR)
+			switch {
+			case tc.wantID == "" && got == nil:
+				// ok
+			case tc.wantID == "" && got != nil:
+				t.Errorf("pickMRForReviewPR returned %q; want nil", got.ID)
+			case tc.wantID != "" && got == nil:
+				t.Errorf("pickMRForReviewPR returned nil; want %q", tc.wantID)
+			case got.ID != tc.wantID:
+				t.Errorf("pickMRForReviewPR returned %q; want %q", got.ID, tc.wantID)
 			}
 		})
 	}

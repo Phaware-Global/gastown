@@ -16,6 +16,15 @@ import (
 	beadsdk "github.com/steveyegge/beads"
 )
 
+// seedAllStores marks every store currently on m as already past its warm-up
+// poll, so pollStoresSnapshot processes events immediately instead of
+// discarding the next poll cycle as historical replay.
+func seedAllStores(m *ConvoyManager) {
+	for name := range m.stores {
+		m.seededStores.Store(name, true)
+	}
+}
+
 // setupTestStore opens a real beads database for integration tests.
 // Skips if unavailable. Caller must run cleanup when done.
 func setupTestStore(t *testing.T) (beadsdk.Storage, func()) {
@@ -150,7 +159,7 @@ func TestEventPoll_DetectsCloseEvents(t *testing.T) {
 	}
 
 	m := NewConvoyManager(townRoot, logger, "gt", 10*time.Minute, map[string]beadsdk.Storage{"hq": store}, nil, nil)
-	m.seeded.Store(true)
+	seedAllStores(m)
 	m.pollStoresSnapshot(m.stores)
 
 	// Should have logged the close detection
@@ -163,6 +172,693 @@ func TestEventPoll_DetectsCloseEvents(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected 'close detected: %s' in logs, got: %v", issue.ID, logged)
+	}
+}
+
+// TestPollStore_ClockSkewToleranceAllowsSlightlyFutureEvent is a regression
+// test: an event whose CreatedAt is a few seconds ahead of the daemon host's
+// clock (systematic store/daemon skew, not corruption) must still advance
+// the high-water mark and be processed normally, instead of being treated as
+// future-dated forever and parking that store's polling.
+func TestPollStore_ClockSkewToleranceAllowsSlightlyFutureEvent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+	skewed := time.Now().UTC().Add(10 * time.Second) // within eventPollClockSkewTolerance
+	store := &fakeEventStorage{}
+	store.addEvent(closeEvent("evt-skew1", "hq-skew1", skewed))
+
+	var mu sync.Mutex
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		mu.Lock()
+		logged = append(logged, fmt.Sprintf(format, args...))
+		mu.Unlock()
+	}
+
+	stores := map[string]beadsdk.Storage{"hq": store}
+	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
+	seedAllStores(m) // skip warm-up so the event is processed on this poll
+
+	if err := m.pollStore("hq", store, stores, map[string]bool{}); err != nil {
+		t.Fatalf("pollStore: %v", err)
+	}
+
+	hwm, hasHWM := m.lastEventIDs.Load("hq")
+	if !hasHWM {
+		t.Fatal("expected high-water mark to be set")
+	}
+	if got := hwm.(time.Time); !got.Equal(skewed) {
+		t.Errorf("expected high-water mark to advance to the skewed CreatedAt %s, got %s", skewed.Format(time.RFC3339), got.Format(time.RFC3339))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, s := range logged {
+		if strings.Contains(s, "future-dated") {
+			t.Errorf("expected no future-dated warning for an event within the skew tolerance, got: %v", logged)
+		}
+	}
+}
+
+// fakeEventStorage is a pure in-memory beadsdk.Storage for pollStore tests.
+// It serves GetAllEventsSince from a slice and reports no dependents, which
+// is all the poll machinery touches, so these tests don't pay for a real
+// Dolt store setup (four of those pushed this package over the CI
+// -timeout=10m wall). The embedded nil Storage panics if pollStore grows a
+// call to a method not implemented here.
+type fakeEventStorage struct {
+	beadsdk.Storage
+	mu     sync.Mutex
+	events []*beadsdk.Event
+}
+
+func (s *fakeEventStorage) addEvent(e *beadsdk.Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, e)
+}
+
+func (s *fakeEventStorage) GetAllEventsSince(ctx context.Context, since time.Time) ([]*beadsdk.Event, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*beadsdk.Event
+	for _, e := range s.events {
+		if !e.CreatedAt.Before(since) {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeEventStorage) GetDependentsWithMetadata(ctx context.Context, issueID string) ([]*beadsdk.IssueWithDependencyMetadata, error) {
+	return nil, nil
+}
+
+func (s *fakeEventStorage) Close() error { return nil }
+
+// closeEvent builds a synthetic close event with a controlled CreatedAt.
+func closeEvent(id, issueID string, createdAt time.Time) *beadsdk.Event {
+	return &beadsdk.Event{ID: id, IssueID: issueID, EventType: beadsdk.EventClosed, CreatedAt: createdAt}
+}
+
+// flakyStorage wraps a beadsdk.Storage and makes GetAllEventsSince fail
+// for a configured number of calls before delegating to the underlying
+// store. Used to simulate a store that is still failing its seed poll (e.g.
+// a large store hitting the query timeout) while other stores seed
+// successfully in the same daemon startup window.
+type flakyStorage struct {
+	beadsdk.Storage
+	failsRemaining atomic.Int64
+	// err is returned on each simulated failure. Defaults to a
+	// timeout-shaped error (matching this type's usual "query too large"
+	// scenario) when unset.
+	err error
+}
+
+func (s *flakyStorage) GetAllEventsSince(ctx context.Context, since time.Time) ([]*beadsdk.Event, error) {
+	if s.failsRemaining.Add(-1) >= 0 {
+		if s.err != nil {
+			return nil, s.err
+		}
+		return nil, fmt.Errorf("simulated transient poll failure: context deadline exceeded")
+	}
+	return s.Storage.GetAllEventsSince(ctx, since)
+}
+
+// TestPollStore_SlowStoreSeedsIndependently_NoReplayAfterOtherStoresSeed is a
+// regression test for gt-lurb: the warm-up flag used to be a single global
+// atomic.Bool, so a fast store seeding successfully would flip it to "seeded"
+// while a slow store (e.g. hq, over the query timeout) was still failing its
+// own seed poll. When the slow store's poll finally succeeded, its entire
+// pre-existing history was replayed as if newly closed. The fix tracks the
+// warm-up flag per store, so a store that seeds late still gets its own
+// warm-up cycle regardless of what other stores have already done.
+func TestPollStore_SlowStoreSeedsIndependently_NoReplayAfterOtherStoresSeed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+	// Pre-existing history on the slow store, closed before the daemon ever
+	// started. This must never be replayed as new.
+	const preexistingID = "hq-pre1"
+	slowFake := &fakeEventStorage{}
+	slowFake.addEvent(closeEvent("evt-pre1", preexistingID, time.Now().UTC().Add(-10*time.Minute)))
+	fastStore := &fakeEventStorage{}
+
+	slowStore := &flakyStorage{Storage: slowFake}
+	slowStore.failsRemaining.Store(2)
+
+	var mu sync.Mutex
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		mu.Lock()
+		logged = append(logged, fmt.Sprintf(format, args...))
+		mu.Unlock()
+	}
+
+	stores := map[string]beadsdk.Storage{
+		"hq":      slowStore,
+		"gastown": fastStore,
+	}
+	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
+
+	// Cycle 1: gastown (no events) seeds and succeeds immediately. hq fails
+	// (simulated timeout) and must NOT be marked seeded.
+	if !m.pollStoresSnapshot(m.stores) {
+		t.Fatal("expected pollStoresSnapshot to report an error while hq is still failing")
+	}
+	if _, ok := m.seededStores.Load("gastown"); !ok {
+		t.Fatal("expected gastown to be seeded after its first successful poll")
+	}
+	if _, ok := m.seededStores.Load("hq"); ok {
+		t.Fatal("hq must not be marked seeded while its polls are still failing")
+	}
+
+	// Cycle 2: hq still failing.
+	m.pollStoresSnapshot(m.stores)
+
+	// Cycle 3: hq's flakiness is exhausted, so it finally returns its
+	// pre-existing history — this is hq's own first *successful* poll.
+	if hadError := m.pollStoresSnapshot(m.stores); hadError {
+		mu.Lock()
+		t.Fatalf("expected no error once hq's flakiness is exhausted; logs: %v", logged)
+		mu.Unlock()
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, s := range logged {
+		if strings.Contains(s, "close detected") && strings.Contains(s, preexistingID) {
+			t.Errorf("pre-existing history was replayed as a new close event: %s (full logs: %v)", s, logged)
+		}
+	}
+	if _, ok := m.seededStores.Load("hq"); !ok {
+		t.Error("expected hq to be marked seeded after its own first successful poll")
+	}
+}
+
+// infNaNThenOKStorage returns a Dolt +Inf/NaN-style error on its first call,
+// then delegates to the underlying store on subsequent calls.
+type infNaNThenOKStorage struct {
+	beadsdk.Storage
+	triggered atomic.Bool
+}
+
+func (s *infNaNThenOKStorage) GetAllEventsSince(ctx context.Context, since time.Time) ([]*beadsdk.Event, error) {
+	if !s.triggered.Swap(true) {
+		return nil, fmt.Errorf("Error 1366: +Inf is not a valid value for 'double'")
+	}
+	return s.Storage.GetAllEventsSince(ctx, since)
+}
+
+// TestPollStore_SeedAndWarmupRegressions groups the seed/warm-up regression
+// cases below. All of them run against in-memory fakes (fakeEventStorage):
+// the poll machinery only touches GetAllEventsSince and, via convoy lookups,
+// GetDependentsWithMetadata, and real Dolt store setups were the cost that
+// pushed this package over the CI -timeout=10m wall (gt-lurb rounds 3-4).
+func TestPollStore_SeedAndWarmupRegressions(t *testing.T) {
+	// TestPollStore_LateSeedStillProcessesPostStartupCloses is a regression
+	// test: a store whose seed poll is still failing (e.g. timing out) must
+	// not discard closes that happen while the daemon is already up. Only
+	// pre-existing history (created before the manager's startedAt) may be
+	// silently dropped during warm-up; anything closed after startup must
+	// still be processed on the store's first successful (late) poll,
+	// including the FireCrossRigDepNotifications call that has no other
+	// backstop.
+	t.Run("LateSeedStillProcessesPostStartupCloses", func(t *testing.T) {
+		fake := &fakeEventStorage{}
+		flaky := &flakyStorage{Storage: fake}
+		flaky.failsRemaining.Store(2)
+
+		var mu sync.Mutex
+		var logged []string
+		logger := func(format string, args ...interface{}) {
+			mu.Lock()
+			logged = append(logged, fmt.Sprintf(format, args...))
+			mu.Unlock()
+		}
+
+		stores := map[string]beadsdk.Storage{"hq": flaky}
+		m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
+
+		// Closed AFTER the manager (and its startedAt) was constructed,
+		// simulating a close that happens during the store's seed-poll outage
+		// window rather than pre-existing history from before the daemon
+		// started.
+		const issueID = "hq-late1"
+		fake.addEvent(closeEvent("evt-late1", issueID, m.startedAt.Add(time.Second)))
+
+		// Cycles 1-2: simulated timeout.
+		m.pollStoresSnapshot(m.stores)
+		m.pollStoresSnapshot(m.stores)
+		// Cycle 3: flakiness exhausted — this is hq's first successful (seed)
+		// poll, landing well after startedAt.
+		if hadError := m.pollStoresSnapshot(m.stores); hadError {
+			mu.Lock()
+			t.Fatalf("expected no error once flakiness is exhausted; logs: %v", logged)
+			mu.Unlock()
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		found := false
+		for _, s := range logged {
+			if strings.Contains(s, "close detected") && strings.Contains(s, issueID) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("close that happened during the outage window was discarded as warm-up instead of processed: %v", logged)
+		}
+	})
+
+	// TestPollStore_InfNaNRecoveryMarksSeeded_NextPollProcessesNormally is a
+	// regression test: the +Inf/NaN corrupt-row recovery branch advances the
+	// high-water mark to now (skipping the seed window), so the store must
+	// also be marked seeded there. Otherwise the next successful poll
+	// re-enters warm-up and permanently discards one interval's worth of
+	// close events.
+	t.Run("InfNaNRecoveryMarksSeeded_NextPollProcessesNormally", func(t *testing.T) {
+		fake := &fakeEventStorage{}
+		store := &infNaNThenOKStorage{Storage: fake}
+
+		var mu sync.Mutex
+		var logged []string
+		logger := func(format string, args ...interface{}) {
+			mu.Lock()
+			logged = append(logged, fmt.Sprintf(format, args...))
+			mu.Unlock()
+		}
+
+		stores := map[string]beadsdk.Storage{"hq": store}
+		m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
+
+		// Cycle 1: +Inf/NaN error is swallowed; HWM advances to now.
+		if err := m.pollStore("hq", store, stores, map[string]bool{}); err != nil {
+			t.Fatalf("expected +Inf/NaN branch to swallow the error, got: %v", err)
+		}
+		if _, ok := m.seededStores.Load("hq"); !ok {
+			t.Fatal("expected hq marked seeded immediately after +Inf/NaN recovery")
+		}
+
+		// A close after the +Inf/NaN recovery poll (slightly ahead of the
+		// recovery HWM; well within the clock-skew tolerance).
+		const issueID = "hq-afterinf1"
+		fake.addEvent(closeEvent("evt-afterinf1", issueID, time.Now().UTC().Add(2*time.Second)))
+
+		// Cycle 2: must process this close normally, not discard it as warm-up.
+		if err := m.pollStore("hq", store, stores, map[string]bool{}); err != nil {
+			t.Fatalf("pollStore cycle 2: %v", err)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		found := false
+		for _, s := range logged {
+			if strings.Contains(s, "close detected") && strings.Contains(s, issueID) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("close after +Inf/NaN recovery was discarded instead of processed: %v", logged)
+		}
+	})
+
+	// TestPollStore_SeedPollGivesUpAfterMaxFailures is a regression test: a
+	// store whose seed-poll query keeps failing (e.g. its 24h event volume
+	// alone still exceeds the pool ReadTimeout) must not retry the same
+	// unservable query forever. After maxSeedPollFailures consecutive seed
+	// failures, pollStore should give up on backfilling and seed at the
+	// manager's startedAt (clamped to the seed window), so the store's close
+	// detection eventually comes online — and, because give-up does not mark
+	// the store seeded, must remain re-armable if the store's now-normal-
+	// shaped polls keep timing out on a still-large window too (gt-lurb
+	// round 3: the escape used to be usable only once per store).
+	t.Run("SeedPollGivesUpAfterMaxFailures", func(t *testing.T) {
+		flaky := &flakyStorage{Storage: &fakeEventStorage{}}
+		flaky.failsRemaining.Store(1000) // always fails within this test's window
+
+		var mu sync.Mutex
+		var logged []string
+		logger := func(format string, args ...interface{}) {
+			mu.Lock()
+			logged = append(logged, fmt.Sprintf(format, args...))
+			mu.Unlock()
+		}
+
+		stores := map[string]beadsdk.Storage{"hq": flaky}
+		m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
+		// Push startedAt back so the post-give-up window (now - startedAt) is
+		// already ≥ minOversizedQueryWindow: repeated timeouts on it then
+		// count as oversized-query evidence and the second give-up halves the
+		// window instead of being suppressed as a plain outage.
+		m.startedAt = time.Now().UTC().Truncate(time.Second).Add(-16 * time.Hour)
+
+		var lastErr error
+		for i := 0; i < maxSeedPollFailures; i++ {
+			lastErr = m.pollStore("hq", flaky, stores, map[string]bool{})
+		}
+		// Give-up still returns the underlying error (not nil): the caller
+		// must count this cycle as a failure for backoff purposes even
+		// though the seed point was narrowed, so a give-up doesn't reset
+		// the poll interval back to the fast path while the store is still
+		// unreachable.
+		if lastErr == nil {
+			t.Fatalf("expected pollStore to give up and still return the underlying error on the %dth consecutive seed failure, got nil", maxSeedPollFailures)
+		}
+
+		mu.Lock()
+		hwm, hasHWM := m.lastEventIDs.Load("hq")
+		mu.Unlock()
+		if !hasHWM {
+			t.Fatal("expected hq's high-water mark to be set after giving up")
+		}
+		firstSeedFrom := hwm.(time.Time)
+		if !firstSeedFrom.Equal(m.startedAt) {
+			t.Errorf("expected give-up to seed at startedAt %s, got %s", m.startedAt.Format(time.RFC3339), firstSeedFrom.Format(time.RFC3339))
+		}
+		// Give-up must NOT mark the store seeded: doing so would make the
+		// next successful poll skip the warm-up fall-through (and its size
+		// log) entirely instead of processing the backlog through it.
+		if _, ok := m.seededStores.Load("hq"); ok {
+			t.Error("give-up must not mark the store seeded (would bypass the warm-up size log on the next successful poll)")
+		}
+		if _, ok := m.seedFailures.Load("hq"); ok {
+			t.Error("expected seedFailures counter cleared after giving up")
+		}
+
+		mu.Lock()
+		giveUps := strings.Count(strings.Join(logged, "\n"), "giving up on backfill")
+		mu.Unlock()
+		if giveUps != 1 {
+			t.Fatalf("expected exactly one 'giving up on backfill' log after the first give-up, got %d in: %v", giveUps, logged)
+		}
+
+		// The store's polls are now "normal" (isSeedPoll is false once
+		// lastEventIDs is set), but they keep failing too. The give-up escape
+		// must re-arm and fire again rather than going dark for this store's
+		// close detection forever after a single give-up.
+		for i := 0; i < maxSeedPollFailures; i++ {
+			lastErr = m.pollStore("hq", flaky, stores, map[string]bool{})
+		}
+		if lastErr == nil {
+			t.Fatalf("expected pollStore to give up a second time and still return the underlying error, got nil")
+		}
+		mu.Lock()
+		giveUps = strings.Count(strings.Join(logged, "\n"), "giving up on backfill")
+		mu.Unlock()
+		if giveUps != 2 {
+			t.Errorf("expected the give-up escape to re-arm and fire a second time, got %d occurrences in: %v", giveUps, logged)
+		}
+
+		// The second give-up must narrow toward "now" rather than re-seeding
+		// at the same fixed startedAt forever, which would re-issue an
+		// identically-sized (eventually unservable) query on every re-fire.
+		mu.Lock()
+		hwm, hasHWM = m.lastEventIDs.Load("hq")
+		mu.Unlock()
+		if !hasHWM {
+			t.Fatal("expected hq's high-water mark to still be set after the second give-up")
+		}
+		if secondSeedFrom := hwm.(time.Time); !secondSeedFrom.After(firstSeedFrom) {
+			t.Errorf("expected second give-up's seed point %s to be strictly later than the first's %s", secondSeedFrom.Format(time.RFC3339), firstSeedFrom.Format(time.RFC3339))
+		}
+	})
+
+	// TestPollStore_SeedPollGivesUpClampsToSeedWindow pins the ceiling clamp
+	// on the give-up seed point: when startedAt is further back than
+	// eventPollSeedWindow, give-up must seed at the clamp (now -
+	// eventPollSeedWindow), not at the unbounded startedAt, so a long-running
+	// daemon's give-up query stays bounded in size.
+	t.Run("SeedPollGivesUpClampsToSeedWindow", func(t *testing.T) {
+		flaky := &flakyStorage{Storage: &fakeEventStorage{}}
+		flaky.failsRemaining.Store(1000)
+
+		stores := map[string]beadsdk.Storage{"hq": flaky}
+		m := NewConvoyManager(t.TempDir(), func(string, ...interface{}) {}, "gt", 10*time.Minute, stores, nil, nil)
+		m.startedAt = time.Now().UTC().Add(-2 * eventPollSeedWindow)
+
+		var lastErr error
+		for i := 0; i < maxSeedPollFailures; i++ {
+			lastErr = m.pollStore("hq", flaky, stores, map[string]bool{})
+		}
+		if lastErr == nil {
+			t.Fatalf("expected pollStore to give up and still return the underlying error, got nil")
+		}
+
+		hwm, hasHWM := m.lastEventIDs.Load("hq")
+		if !hasHWM {
+			t.Fatal("expected hq's high-water mark to be set after giving up")
+		}
+		floor := time.Now().UTC().Add(-eventPollSeedWindow)
+		got := hwm.(time.Time)
+		if diff := got.Sub(floor); diff < -5*time.Second || diff > 5*time.Second {
+			t.Errorf("expected give-up to clamp to the seed window ceiling ~%s, got %s (startedAt %s)", floor.Format(time.RFC3339), got.Format(time.RFC3339), m.startedAt.Format(time.RFC3339))
+		}
+	})
+
+	// TestPollStore_NonTimeoutGiveUpStaysPinnedAtStartedAt is a regression
+	// test: after the first give-up seeds at startedAt, a plain outage
+	// (connection refused — not a timeout) must never move the seed point
+	// again, no matter how many consecutive failures accumulate or how large
+	// the window has grown. Halving on a connectivity failure (rather than an
+	// oversized query) would silently discard part of the post-startup
+	// backlog the startedAt floor exists to preserve.
+	t.Run("NonTimeoutGiveUpStaysPinnedAtStartedAt", func(t *testing.T) {
+		flaky := &flakyStorage{Storage: &fakeEventStorage{}, err: fmt.Errorf("dial tcp: connection refused")}
+		flaky.failsRemaining.Store(1000)
+
+		var mu sync.Mutex
+		var logged []string
+		logger := func(format string, args ...interface{}) {
+			mu.Lock()
+			logged = append(logged, fmt.Sprintf(format, args...))
+			mu.Unlock()
+		}
+
+		stores := map[string]beadsdk.Storage{"hq": flaky}
+		m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
+		// Even with a window large enough that a timeout WOULD halve, a
+		// non-timeout error must not.
+		m.startedAt = time.Now().UTC().Truncate(time.Second).Add(-16 * time.Hour)
+
+		for i := 0; i < maxSeedPollFailures; i++ {
+			m.pollStore("hq", flaky, stores, map[string]bool{})
+		}
+		hwm, _ := m.lastEventIDs.Load("hq")
+		firstSeedFrom := hwm.(time.Time)
+		if !firstSeedFrom.Equal(m.startedAt) {
+			t.Fatalf("expected first give-up to seed at startedAt %s, got %s", m.startedAt.Format(time.RFC3339), firstSeedFrom.Format(time.RFC3339))
+		}
+
+		for i := 0; i < maxSeedPollFailures*2; i++ {
+			m.pollStore("hq", flaky, stores, map[string]bool{})
+		}
+		hwm, _ = m.lastEventIDs.Load("hq")
+		secondSeedFrom := hwm.(time.Time)
+		if !secondSeedFrom.Equal(m.startedAt) {
+			t.Errorf("expected the seed point to stay pinned at startedAt %s through non-timeout failures, got %s", m.startedAt.Format(time.RFC3339), secondSeedFrom.Format(time.RFC3339))
+		}
+		mu.Lock()
+		giveUps := strings.Count(strings.Join(logged, "\n"), "giving up on backfill")
+		mu.Unlock()
+		if giveUps != 1 {
+			t.Errorf("expected exactly one give-up (the seed-poll escape); non-timeout failures must not re-fire it, got %d in: %v", giveUps, logged)
+		}
+	})
+
+	// TestPollStore_WarmStoreGiveUpReentersWarmup is a regression test for the
+	// gt-lurb symptom reached from a warm store: a store that succeeded once
+	// must still be able to give up and re-seed once its query window
+	// (now - highWater) keeps timing out at an oversized width. Crucially,
+	// the give-up must also clear seededStores, so the poll after a give-up
+	// re-enters the warm-up block — getting the startedAt floor, the backlog
+	// size log, and the Dolt-unhealthy deferral — instead of replaying the
+	// reopened window inline as if the store were still warm.
+	t.Run("WarmStoreGiveUpReentersWarmup", func(t *testing.T) {
+		fake := &fakeEventStorage{}
+		flaky := &flakyStorage{Storage: fake}
+
+		var mu sync.Mutex
+		var logged []string
+		logger := func(format string, args ...interface{}) {
+			mu.Lock()
+			logged = append(logged, fmt.Sprintf(format, args...))
+			mu.Unlock()
+		}
+
+		stores := map[string]beadsdk.Storage{"hq": flaky}
+		m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
+
+		// A warm store whose high-water mark has gone stale by more than the
+		// seed window (e.g. a >24h Dolt outage).
+		staleHWM := time.Now().UTC().Add(-2 * eventPollSeedWindow)
+		m.lastEventIDs.Store("hq", staleHWM)
+		m.seededStores.Store("hq", true)
+
+		// A close sitting in the stale window, from before this manager's
+		// startedAt: after the give-up reopens that window, warm-up must
+		// discard it as history, not replay it as a fresh close.
+		const preexistingID = "hq-warmpre1"
+		fake.addEvent(closeEvent("evt-warmpre1", preexistingID, time.Now().UTC().Add(-time.Hour)))
+
+		flaky.failsRemaining.Store(int64(maxSeedPollFailures))
+		var lastErr error
+		for i := 0; i < maxSeedPollFailures; i++ {
+			lastErr = m.pollStore("hq", flaky, stores, map[string]bool{})
+		}
+		if lastErr == nil {
+			t.Fatal("expected a warm store whose oversized window keeps timing out to give up and return an error")
+		}
+		hwm, hasHWM := m.lastEventIDs.Load("hq")
+		if !hasHWM {
+			t.Fatal("expected hq's high-water mark to still be set after giving up")
+		}
+		if got := hwm.(time.Time); !got.After(staleHWM) {
+			t.Errorf("expected give-up to advance the stale high-water mark %s, got %s", staleHWM.Format(time.RFC3339), got.Format(time.RFC3339))
+		}
+		if _, ok := m.seededStores.Load("hq"); ok {
+			t.Fatal("give-up must clear seededStores so the next successful poll re-enters warm-up")
+		}
+
+		// Flakiness exhausted: the next poll succeeds and must take the
+		// warm-up path for the reopened window.
+		if err := m.pollStore("hq", flaky, stores, map[string]bool{}); err != nil {
+			t.Fatalf("pollStore after give-up: %v", err)
+		}
+		if _, ok := m.seededStores.Load("hq"); !ok {
+			t.Error("expected the store to be re-seeded by its first successful post-give-up poll")
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		for _, s := range logged {
+			if strings.Contains(s, "close detected") && strings.Contains(s, preexistingID) {
+				t.Errorf("pre-startedAt close in the reopened window was replayed as new instead of discarded by warm-up: %s", s)
+			}
+		}
+	})
+
+	// TestPollStore_WarmStoreDoesNotGiveUpOnSmallWindowTimeout is a companion
+	// to the above: a timeout on a window too small to be oversized indicates
+	// a wedged or unreachable server, not the gt-lurb symptom, so the store
+	// must keep relying on runEventPoll's ordinary backoff instead of being
+	// reseeded — reseeding it would skip closes its next successful poll
+	// would otherwise catch.
+	t.Run("WarmStoreDoesNotGiveUpOnSmallWindowTimeout", func(t *testing.T) {
+		flaky := &flakyStorage{Storage: &fakeEventStorage{}}
+		stores := map[string]beadsdk.Storage{"hq": flaky}
+		m := NewConvoyManager(t.TempDir(), func(string, ...interface{}) {}, "gt", 10*time.Minute, stores, nil, nil)
+
+		recentHWM := time.Now().UTC().Add(-time.Minute)
+		m.lastEventIDs.Store("hq", recentHWM)
+		m.seededStores.Store("hq", true)
+
+		flaky.failsRemaining.Store(1000)
+		for i := 0; i < maxSeedPollFailures*2; i++ {
+			m.pollStore("hq", flaky, stores, map[string]bool{})
+		}
+		hwm, _ := m.lastEventIDs.Load("hq")
+		if got := hwm.(time.Time); !got.Equal(recentHWM) {
+			t.Errorf("expected a warm store with a small window to never give up (HWM unchanged at %s), got %s", recentHWM.Format(time.RFC3339), got.Format(time.RFC3339))
+		}
+	})
+}
+
+// TestPollStore_LateWarmupDefersWhenDoltUnhealthy is a regression test for
+// the late-warm-up death spiral: when a store's seed poll kept failing
+// across a Dolt outage and finally succeeds while Dolt is still flagged
+// unhealthy, the resulting startup backlog must NOT be processed inline
+// (each close runs GetDependentsWithMetadata plus a convoy-check subprocess
+// serially on the poll goroutine, piling more load onto a server that needs
+// headroom to recover). The deferral must also be reversible: it must leave
+// the high-water mark and seeded state untouched, so the next healthy poll
+// re-fetches and processes the same window instead of the backlog — and its
+// cross-rig dep notifications, which have no other backstop — being dropped
+// forever.
+func TestPollStore_LateWarmupDefersWhenDoltUnhealthy(t *testing.T) {
+	townRoot := t.TempDir()
+	daemonDir := filepath.Join(townRoot, "daemon")
+	if err := os.MkdirAll(daemonDir, 0755); err != nil {
+		t.Fatalf("mkdir daemon: %v", err)
+	}
+	unhealthyPath := filepath.Join(daemonDir, "DOLT_UNHEALTHY")
+	if err := os.WriteFile(unhealthyPath, []byte("{}"), 0644); err != nil {
+		t.Fatalf("write DOLT_UNHEALTHY: %v", err)
+	}
+
+	var mu sync.Mutex
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		mu.Lock()
+		logged = append(logged, fmt.Sprintf(format, args...))
+		mu.Unlock()
+	}
+
+	fake := &fakeEventStorage{}
+	stores := map[string]beadsdk.Storage{"hq": fake}
+	m := NewConvoyManager(townRoot, logger, "gt", 10*time.Minute, stores, nil, nil)
+
+	// Closed after startedAt: normally processed on the store's late warm-up,
+	// but Dolt is flagged unhealthy so the cycle must be deferred instead.
+	const issueID = "hq-unhealthy1"
+	fake.addEvent(closeEvent("evt-unhealthy1", issueID, m.startedAt.Add(time.Second)))
+
+	if err := m.pollStore("hq", fake, stores, map[string]bool{}); err != nil {
+		t.Fatalf("pollStore: %v", err)
+	}
+
+	mu.Lock()
+	for _, s := range logged {
+		if strings.Contains(s, "close detected") && strings.Contains(s, issueID) {
+			t.Errorf("late warm-up backlog was processed inline while Dolt unhealthy: %s (full logs: %v)", s, logged)
+		}
+	}
+	found := false
+	for _, s := range logged {
+		if strings.Contains(s, "deferring") && strings.Contains(s, "late warm-up") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected a 'deferring ... late warm-up' log when Dolt is unhealthy, got: %v", logged)
+	}
+	mu.Unlock()
+
+	// The deferral must be reversible: no high-water mark stored and no
+	// seeded marker, so the deferred window is re-fetched by the next poll
+	// rather than permanently skipped.
+	if _, ok := m.lastEventIDs.Load("hq"); ok {
+		t.Fatal("deferral must not advance the high-water mark — the deferred window would never be re-fetched")
+	}
+	if _, ok := m.seededStores.Load("hq"); ok {
+		t.Fatal("deferral must not mark the store seeded — the next poll must re-enter warm-up")
+	}
+
+	// Dolt recovers: the next poll re-fetches the same window and processes
+	// the deferred close.
+	if err := os.Remove(unhealthyPath); err != nil {
+		t.Fatalf("remove DOLT_UNHEALTHY: %v", err)
+	}
+	if err := m.pollStore("hq", fake, stores, map[string]bool{}); err != nil {
+		t.Fatalf("pollStore after recovery: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	found = false
+	for _, s := range logged {
+		if strings.Contains(s, "close detected") && strings.Contains(s, issueID) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("deferred close was not processed once Dolt recovered: %v", logged)
+	}
+	if _, ok := m.seededStores.Load("hq"); !ok {
+		t.Error("expected the store to be seeded by the first healthy poll")
 	}
 }
 
@@ -1554,7 +2250,7 @@ func TestPollAllStores_MultiRig_DetectsCloseFromNonHqStore(t *testing.T) {
 	}
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
-	m.seeded.Store(true)
+	seedAllStores(m)
 	m.pollStoresSnapshot(m.stores)
 
 	// The close event from the rig store should be detected
@@ -1617,7 +2313,7 @@ func TestPollAllStores_MultiRig_BothStoresPolled(t *testing.T) {
 	}
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
-	m.seeded.Store(true)
+	seedAllStores(m)
 	m.pollStoresSnapshot(m.stores)
 
 	// Both close events should be detected
@@ -1695,7 +2391,7 @@ func TestPollAllStores_SkipsParkedRigs(t *testing.T) {
 	}
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, isParked)
-	m.seeded.Store(true)
+	seedAllStores(m)
 	m.pollStoresSnapshot(m.stores)
 
 	// Active rig's close event should be detected
@@ -1753,7 +2449,7 @@ func TestPollAllStores_HqNeverSkippedEvenIfParkedCallbackReturnsTrue(t *testing.
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute,
 		map[string]beadsdk.Storage{"hq": store}, nil, alwaysParked)
-	m.seeded.Store(true)
+	seedAllStores(m)
 	m.pollStoresSnapshot(m.stores)
 
 	found := false
@@ -1801,7 +2497,7 @@ func TestPollAllStores_HighWaterMark_NoReprocessing(t *testing.T) {
 		map[string]beadsdk.Storage{"hq": store}, nil, nil)
 
 	// First poll: should detect our close event
-	m.seeded.Store(true)
+	seedAllStores(m)
 	m.pollStoresSnapshot(m.stores)
 
 	closeCount := 0
@@ -1853,7 +2549,7 @@ func TestPollAllStores_ReopenClearsCloseDedupAcrossPolls(t *testing.T) {
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute,
 		map[string]beadsdk.Storage{"hq": store}, nil, nil)
-	m.seeded.Store(true)
+	seedAllStores(m)
 	m.pollStoresSnapshot(m.stores)
 
 	firstCloseCount := 0
@@ -1943,7 +2639,7 @@ func TestPollAllStores_ReopenResetsPerCycleDedup(t *testing.T) {
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute,
 		map[string]beadsdk.Storage{"hq": store}, nil, nil)
-	m.seeded.Store(true)
+	seedAllStores(m)
 	m.pollStoresSnapshot(m.stores)
 
 	closeCount := 0
@@ -1996,7 +2692,7 @@ func TestPollAllStores_CrossStoreDedup(t *testing.T) {
 		"gastown": rigStore,
 	}
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
-	m.seeded.Store(true)
+	seedAllStores(m)
 	m.pollStoresSnapshot(m.stores)
 
 	// Should see exactly 1 close detection for our issue, not 2
@@ -2127,7 +2823,7 @@ exit 0
 	}
 
 	m := NewConvoyManager(townRoot, logger, filepath.Join(binDir, "gt"), 10*time.Minute, map[string]beadsdk.Storage{"hq": store}, nil, nil)
-	m.seeded.Store(true)
+	seedAllStores(m)
 	m.pollStoresSnapshot(m.stores)
 
 	// Only check for close events involving OUR issue — other tests may have
@@ -2174,7 +2870,7 @@ func TestPollStore_NilHqStore_LogsWarningAndSkips(t *testing.T) {
 	}
 
 	m := NewConvoyManager(t.TempDir(), logger, "gt", 10*time.Minute, stores, nil, nil)
-	m.seeded.Store(true)
+	seedAllStores(m)
 	m.pollStoresSnapshot(m.stores)
 
 	// Should log the nil hq warning

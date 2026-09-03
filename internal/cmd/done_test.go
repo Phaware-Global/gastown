@@ -787,10 +787,10 @@ func TestMRCreationFailureModesHardFail(t *testing.T) {
 			return errMRCreateFailed(branch, createErr)
 		}
 		if gotID == "" {
-			return errMREmptyID(branch)
+			return errMREmptyID(branch, "gt done")
 		}
 		if showErr != nil || !showReturns {
-			return errMRReadbackFailed(branch, gotID, showErr)
+			return errMRReadbackFailed(branch, gotID, showErr, "gt done")
 		}
 		return nil
 	}
@@ -891,7 +891,7 @@ func TestMRHardFailErrorsWrapCause(t *testing.T) {
 	})
 
 	t.Run("empty ID error guides recovery (no cause to wrap)", func(t *testing.T) {
-		err := errMREmptyID(branch)
+		err := errMREmptyID(branch, "gt done")
 		if err == nil {
 			t.Fatal("errMREmptyID must return a non-nil error")
 		}
@@ -900,7 +900,7 @@ func TestMRHardFailErrorsWrapCause(t *testing.T) {
 
 	t.Run("read-back error wraps cause and names the MR", func(t *testing.T) {
 		cause := fmt.Errorf("bead not found")
-		err := errMRReadbackFailed(branch, "gts-mr-9", cause)
+		err := errMRReadbackFailed(branch, "gts-mr-9", cause, "gt done")
 		if !errors.Is(err, cause) {
 			t.Errorf("errMRReadbackFailed must wrap the cause via %%w; got %v", err)
 		}
@@ -914,7 +914,7 @@ func TestMRHardFailErrorsWrapCause(t *testing.T) {
 		// done.go reaches this path when bd.Show returns (nil, nil): the bead is
 		// missing without an error. The constructor must still produce a usable
 		// error rather than a fmt %!w(<nil>) artifact.
-		err := errMRReadbackFailed(branch, "gts-mr-9", nil)
+		err := errMRReadbackFailed(branch, "gts-mr-9", nil, "gt done")
 		if err == nil {
 			t.Fatal("errMRReadbackFailed must return a non-nil error even when cause is nil")
 		}
