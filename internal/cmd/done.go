@@ -1097,8 +1097,56 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			var prURL string
 			var prNumber int
 			noMergeSettingsPath := filepath.Join(townRoot, rigName, "settings", "config.json")
-			if noMergeSettings, noMergeSettingsErr := config.LoadRigSettings(noMergeSettingsPath); noMergeSettingsErr == nil &&
-				noMergeSettings.MergeQueue != nil && noMergeSettings.MergeQueue.MergeStrategy == "pr" {
+			noMergeSettings, noMergeSettingsErr := config.LoadRigSettings(noMergeSettingsPath)
+			mergeStrategyIsPR := noMergeSettingsErr == nil &&
+				noMergeSettings.MergeQueue != nil && noMergeSettings.MergeQueue.MergeStrategy == "pr"
+
+			// completion decides whether to create a fresh PR, reuse an
+			// existing review-fix PR, or leave the branch as-is (gt-y4gw).
+			// A completion error means review metadata is present but
+			// unusable — fail loudly rather than falling through to
+			// createPR, which is exactly how duplicate PRs #200/#201 and
+			// #208/#219 got created.
+			completion, completionErr := resolveNoMergeCompletion(attachmentFields, mergeStrategyIsPR)
+			if completionErr != nil {
+				return fmt.Errorf("resolving no-merge completion path for %s: %w\n"+
+					"Retry 'gt done' — falling back to the polecat's own branch here is exactly what produced duplicate PRs #200/#201 and #208/#219", issueID, completionErr)
+			}
+
+			if completion.reusePR > 0 {
+				// The reuse path force-closes the bead as "completed against
+				// PR #N" without ever pushing anything to that PR — verify
+				// the branch we're actually on is PR #N's head before taking
+				// it, or a review-fix polecat landed on the wrong branch
+				// (e.g. its own polecat/<name>-<bead> branch instead of the
+				// PR's branch) silently reports success while the reviewed
+				// defect merges unfixed. n==0 (no open PR on this branch) is
+				// also a mismatch and fails here.
+				//
+				// FindPRNumber's error return covers real failures (gh
+				// unauthenticated, rate-limited, offline, not installed),
+				// not just "no open PR" — a real failure must not silently
+				// skip verification. Fall back to comparing branch against
+				// the dispatch bead's review_branch (no network needed) and
+				// only accept the reuse when one of the two checks passed.
+				verified := false
+				if n, findErr := g.FindPRNumber(branch); findErr == nil {
+					verified = true
+					if n != completion.reusePR {
+						return fmt.Errorf("review-fix bead targets PR #%d but branch %s is on PR #%d", completion.reusePR, branch, n)
+					}
+				} else {
+					style.PrintWarning("could not verify branch %s is PR #%d via gh: %v", branch, completion.reusePR, findErr)
+				}
+				if !verified && (attachmentFields.ReviewBranch == "" || attachmentFields.ReviewBranch != branch) {
+					return fmt.Errorf("could not verify branch %s is PR #%d's head (gh lookup failed and branch doesn't match the dispatch bead's review_branch %q) — refusing to report success against an unverified branch",
+						branch, completion.reusePR, attachmentFields.ReviewBranch)
+				}
+				prNumber = completion.reusePR
+				prURL = fmt.Sprintf("#%d", prNumber)
+				fmt.Printf("%s Review-fix dispatch: completing against existing PR #%d (no new PR, no new MR bead)\n",
+					style.Bold.Render("→"), prNumber)
+			} else if completion.createPR {
 				issueTitle := sourceIssueForNoMerge.Title
 				prTitle := fmt.Sprintf("%s (%s)", issueTitle, issueID)
 				if issueTitle == "" {
@@ -1184,9 +1232,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				fmt.Printf("%s\n", style.Dim.Render("Work stays on feature branch for human review."))
 			}
 
-			// Above sets prNumber > 0 exactly when we have a PR to hand
-			// off. Declare the flag at outer scope so the work-bead
-			// close guard below can read it.
+			// Above sets prNumber > 0 when we created a fresh PR, or
+			// reused an existing review-fix PR (completion.reusePR > 0).
+			// Declare the flag at outer scope so the work-bead close
+			// guard below can read it.
 			refineryOwnsMerge := false
 
 			// When a PR exists for this work under merge_strategy=pr,
@@ -1197,8 +1246,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// the PR sits orphaned from the review/merge pipeline.
 			// See G11 in docs/design/refinery-pr-workflow.md. Skipped
 			// for non-pr no_merge (the work legitimately ends there
-			// with a READY_FOR_REVIEW mail + closed bead).
-			if prNumber > 0 {
+			// with a READY_FOR_REVIEW mail + closed bead) AND for a
+			// reused review-fix PR — its MR bead already exists and
+			// already carries review_pr (gt-y4gw); creating another
+			// one here is exactly the duplicate-MR bug this fixes.
+			if completion.reusePR == 0 && prNumber > 0 {
 				mrID, refineryOwnsMerge = handoffPRToRefinery(bd, handoffPRArgs{
 					branch:            branch,
 					target:            defaultBranch,
@@ -1225,7 +1277,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						"MR bead handoff for PR #%d failed: refinery will not pick up branch %s; dispatcher intervention required",
 						prNumber, branch))
 				}
-			} else if prURL != "" {
+			} else if completion.reusePR == 0 && prURL != "" {
 				// Edge case: `gh pr create` succeeded (or reported a
 				// URL) but BOTH parsePRNumberFromURL AND the
 				// FindPRNumber fallback failed — prNumber stays 0 so
@@ -1240,6 +1292,31 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				doneErrors = append(doneErrors, fmt.Sprintf(
 					"PR appears to exist on branch %s but PR number could not be resolved (URL parse + FindPRNumber both failed); refinery will not pick up and manual dispatcher intervention is required",
 					branch))
+			} else if completion.reusePR > 0 {
+				// Reused-PR path skips the handoff above on the assumption
+				// that PR #N's MR bead already exists and already carries
+				// review_pr. That assumption isn't checked anywhere else —
+				// a review-fix dispatch bead only carries review_pr/branch/
+				// source_issue, so review_pr can point at a PR whose MR bead
+				// is gone (closed, superseded, hand-stamped). Verify one is
+				// actually live before declaring this a clean completion;
+				// otherwise the PR sits orphaned from the merge pipeline
+				// while gt done reports success.
+				mrIssue, findErr := bd.FindMRForReviewPR(completion.reusePR)
+				lookup, lookupErr := resolveReviewFixMRLookup(mrIssue, findErr, completion.reusePR, issueID, branch)
+				if lookupErr != nil {
+					// Fail closed: the lookup couldn't establish whether a
+					// live MR owns this work bead, so neither leave-open nor
+					// force-close is safe to pick. Abort — the bead stays as
+					// it is and gt done is retryable.
+					return lookupErr
+				}
+				mrID = lookup.mrID
+				refineryOwnsMerge = lookup.refineryOwnsMerge
+				if lookup.mrFailed {
+					mrFailed = true
+					doneErrors = append(doneErrors, lookup.errMsg)
+				}
 			}
 
 			// Mail dispatcher with READY_FOR_REVIEW.
@@ -1300,7 +1377,20 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// from observed state so the audit trail is accurate
 			// (matters when DispatchedBy was empty or mail failed).
 			closeReason := "No-merge work completed"
-			if prURL != "" {
+			switch {
+			case completion.reusePR > 0:
+				// Review-fix dispatch: the fix already landed on the
+				// existing PR's branch, and that PR's MR bead already
+				// carries review_pr — there was no handoff to attempt.
+				closeReason += fmt.Sprintf("; review-fix dispatch completed against PR #%d", completion.reusePR)
+				if mrFailed {
+					// mrFailed was set above when the lookup definitively
+					// found no live MR bead for this PR (a lookup ERROR
+					// aborts gt done before reaching here) — the audit
+					// trail must not read as a clean completion.
+					closeReason += "; but no live MR bead tracks it - refinery will not pick up"
+				}
+			case prURL != "":
 				// prURL is non-empty but refineryOwnsMerge is false —
 				// MR bead creation failed. Flag that so the audit
 				// trail explains why the refinery never picked up.
@@ -2628,6 +2718,88 @@ func stripOverlayCLAUDEmd(g *git.Git, defaultBranch string) bool {
 // supersede semantics would mint a duplicate MR on every completion (ha-z60).
 func isReviewFixDispatch(fields *beads.AttachmentFields) bool {
 	return fields != nil && fields.ReviewPR > 0
+}
+
+// noMergeCompletionTarget describes how the no_merge/review_pr path should
+// complete: either create a fresh PR from the polecat's own branch, or reuse
+// an already-open PR that a review-fix dispatch is targeting.
+type noMergeCompletionTarget struct {
+	createPR bool // create a new GitHub PR from the polecat's own branch
+	reusePR  int  // > 0: an existing PR to complete against — no new PR, no new MR bead
+}
+
+// resolveNoMergeCompletion decides the no_merge/review_pr completion path.
+//
+// gt-y4gw / ha-z60: a review-fix dispatch (review_pr set) already has an open
+// PR AND an MR bead tracking it via review_pr — the polecat force-pushed its
+// fix straight to that PR's branch. `gt done` must complete against THAT PR
+// rather than opening a fresh PR from the polecat's own worktree branch;
+// doing so is exactly what produced the duplicate PRs in #200/#201 and
+// #208/#219, because the polecat's local branch is not the PR's branch.
+//
+// mergeStrategyIsPR only matters for a plain (non-review-fix) no_merge bead:
+// it decides whether the work stays on the pushed branch or gets a fresh PR.
+func resolveNoMergeCompletion(fields *beads.AttachmentFields, mergeStrategyIsPR bool) (noMergeCompletionTarget, error) {
+	if isReviewFixDispatch(fields) {
+		if fields.ReviewPR <= 0 {
+			// isReviewFixDispatch already requires ReviewPR > 0 — unreachable
+			// in practice, but a silent fallback to createPR here is exactly
+			// the bug this function exists to prevent, so fail loudly instead.
+			return noMergeCompletionTarget{}, fmt.Errorf("review-fix dispatch detected but review_pr is not set")
+		}
+		return noMergeCompletionTarget{reusePR: fields.ReviewPR}, nil
+	}
+	return noMergeCompletionTarget{createPR: mergeStrategyIsPR}, nil
+}
+
+// reviewFixMRLookupResult is what gt done needs from FindMRForReviewPR's
+// answer to complete a reused-PR (review-fix) run correctly.
+type reviewFixMRLookupResult struct {
+	mrID              string // set when a live MR bead tracks the reused PR
+	refineryOwnsMerge bool   // true: leave the work bead open, don't force-close it
+	mrFailed          bool   // true: lookup didn't confirm a live MR bead
+	errMsg            string // doneErrors entry to record when mrFailed
+}
+
+// resolveReviewFixMRLookup turns FindMRForReviewPR's result into gt done's
+// completion state for the reused-PR path.
+//
+// PR #221 round 2 findings: mrID must be populated from the found MR bead
+// (not discarded) so shouldNudgeRefinery fires and CompletionMetadata.MRID
+// is accurate — otherwise the refinery only learns the fix landed on its
+// next patrol tick. And when issueID is itself that MR's source_issue
+// (resolveReviewFixDispatchBead in refinery_pr_dispatch_review_fix.go
+// returns state.SourceIssue whenever it's still open — the routine case,
+// not an edge case), refineryOwnsMerge must be true so the caller leaves
+// the work bead open instead of force-closing it out from under the live
+// MR, which would strand the MR without its source_issue.
+//
+// Round 3: a lookup ERROR returns a non-nil error so gt done aborts and
+// stays retryable. Ownership of the work bead is unknown on that branch —
+// a Dolt lock timeout (the routine failure mode) must not fall through to
+// the force-close path, which would strand a live MR's source_issue. Only
+// a definitive "no live MR bead" (nil issue, nil error) proceeds with
+// mrFailed so the orphaned PR is recorded.
+func resolveReviewFixMRLookup(mrIssue *beads.Issue, findErr error, reusePR int, issueID, branch string) (reviewFixMRLookupResult, error) {
+	if findErr != nil {
+		return reviewFixMRLookupResult{}, fmt.Errorf(
+			"could not verify an MR bead tracks reused PR #%d: %w\n"+
+				"Retry 'gt done' — closing the work bead on an unverified lookup could strand the live MR for branch %s without its source_issue",
+			reusePR, findErr, branch)
+	}
+	if mrIssue == nil {
+		return reviewFixMRLookupResult{
+			mrFailed: true,
+			errMsg: fmt.Sprintf(
+				"review-fix dispatch reused PR #%d but no live MR bead tracks it (review_pr=%d); refinery will not pick up branch %s — dispatcher intervention required",
+				reusePR, reusePR, branch),
+		}, nil
+	}
+	result := reviewFixMRLookupResult{mrID: mrIssue.ID}
+	if fields := beads.ParseMRFields(mrIssue); fields != nil && fields.SourceIssue == issueID {
+		result.refineryOwnsMerge = true
+	}
+	return result, nil
 }
 
 // handoffPRArgs bundles the parameters for handoffPRToRefinery so the
