@@ -904,7 +904,12 @@ func nudgeWitness(rigName, message string) {
 // No cooperative queue — idle agents never call Drain(), so queued
 // nudges would be stuck forever. Direct delivery is safe: if the
 // agent is busy, text buffers in tmux and is processed at next prompt.
-func nudgeRefinery(rigName, message string) {
+//
+// extraPayload accepts additional "key=value" pairs (e.g. "mrID=...",
+// "branch=...") appended to the emitted MQ_SUBMIT event so a specific
+// occurrence is diagnosable after the fact. Purely additive — existing
+// consumers keyed on "source=" or "message=" are unaffected.
+func nudgeRefinery(rigName, message string, extraPayload ...string) {
 	refinerySession := session.RefinerySessionName(session.PrefixFor(rigName))
 
 	// Test hook: log nudge for test observability (same pattern as GT_TEST_ATTACHED_MOLECULE_LOG)
@@ -922,16 +927,35 @@ func nudgeRefinery(rigName, message string) {
 	// This is the programmatic bridge between mq submit and the event system.
 	townRoot, _ := workspace.FindFromCwd()
 	if townRoot != "" {
-		_, _ = channelevents.EmitToTown(townRoot, "refinery", "MQ_SUBMIT", []string{
-			"source=sling",
-			"message=" + message,
-		})
+		_, _ = channelevents.EmitToTown(townRoot, "refinery", "MQ_SUBMIT", refineryNudgePayload(message, extraPayload...))
 	}
 
 	t := tmux.NewTmux()
 	if err := t.NudgeSession(refinerySession, message); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to nudge refinery %s: %v\n", refinerySession, err)
 	}
+}
+
+// refineryNudgePayload builds the MQ_SUBMIT event payload. "source=sling" and
+// "message=" are fixed — nudgeRefinery is a shared emitter with two call
+// sites and unknown consumers on the channel, so any existing consumer
+// keying off those fields must keep working. extra must be purely additive
+// (e.g. "mrID=...", "branch=..."): the consumer folds pairs into a map where
+// the LAST value for a key wins, so an extra pair reusing a fixed key would
+// silently override it — such pairs are dropped here to enforce the contract.
+func refineryNudgePayload(message string, extra ...string) []string {
+	payload := []string{
+		"source=sling",
+		"message=" + message,
+	}
+	for _, pair := range extra {
+		key, _, _ := strings.Cut(pair, "=")
+		if key == "source" || key == "message" {
+			continue
+		}
+		payload = append(payload, pair)
+	}
+	return payload
 }
 
 // isPolecatTarget checks if the target string refers to a polecat.

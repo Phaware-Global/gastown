@@ -115,6 +115,84 @@ func TestNudgeRefineryNoOpWithoutLog(t *testing.T) {
 	nudgeRefinery("nonexistent-rig", "test message")
 }
 
+// TestRefineryNudgePayloadIsPurelyAdditive verifies that extra fields (e.g.
+// mrID, branch) appended to the MQ_SUBMIT event payload never displace the
+// original "source=sling" / "message=" fields — nudgeRefinery is a shared
+// emitter with two call sites and unknown consumers on the channel, so
+// existing consumers keyed on those fields must keep working unchanged.
+func TestRefineryNudgePayloadIsPurelyAdditive(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		extra   []string
+		want    []string
+	}{
+		{
+			name:    "no extra fields matches pre-existing shape",
+			message: "MERGE_READY received - check inbox for pending work",
+			extra:   nil,
+			want:    []string{"source=sling", "message=MERGE_READY received - check inbox for pending work"},
+		},
+		{
+			name:    "mrID and branch appended after source and message",
+			message: "MERGE_READY received - check inbox for pending work",
+			extra:   []string{"mrID=gt-mr-123", "branch=polecat/toast/gt-abc"},
+			want: []string{
+				"source=sling",
+				"message=MERGE_READY received - check inbox for pending work",
+				"mrID=gt-mr-123",
+				"branch=polecat/toast/gt-abc",
+			},
+		},
+		{
+			// The consumer (channelevents.emitToDir) folds pairs into a map
+			// where the LAST value for a key wins, so an extra pair reusing a
+			// fixed key would silently override it. The emitter must drop such
+			// pairs to keep the contract enforceable, not just documented.
+			name:    "extra pairs colliding with fixed keys are dropped",
+			message: "MERGE_READY received - check inbox for pending work",
+			extra:   []string{"source=evil", "message=evil", "mrID=gt-mr-123"},
+			want: []string{
+				"source=sling",
+				"message=MERGE_READY received - check inbox for pending work",
+				"mrID=gt-mr-123",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := refineryNudgePayload(tt.message, tt.extra...)
+			if len(got) != len(tt.want) {
+				t.Fatalf("refineryNudgePayload() = %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("payload[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+			if got[0] != "source=sling" {
+				t.Errorf("payload[0] must remain source=sling for existing consumers, got %q", got[0])
+			}
+
+			// Assert the invariant as the consumer sees it: fold the slice
+			// into a map (last pair wins, mirroring emitToDir) and check the
+			// fixed fields survive whatever extra was passed.
+			folded := map[string]string{}
+			for _, pair := range got {
+				key, val, _ := strings.Cut(pair, "=")
+				folded[key] = val
+			}
+			if folded["source"] != "sling" {
+				t.Errorf("folded source = %q, want %q", folded["source"], "sling")
+			}
+			if folded["message"] != tt.message {
+				t.Errorf("folded message = %q, want %q", folded["message"], tt.message)
+			}
+		})
+	}
+}
+
 func TestIsDeferredBead(t *testing.T) {
 	tests := []struct {
 		name string
