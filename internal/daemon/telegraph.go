@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/telegraph"
@@ -22,9 +23,19 @@ type TelegraphServerManager struct {
 	gtPath   string
 	logger   func(format string, v ...interface{})
 
-	mu        sync.Mutex
-	process   *os.Process
-	startedAt time.Time
+	mu          sync.Mutex
+	process     *os.Process
+	selfStarted bool // true iff m.process was assigned by startLocked, not adopted from the PID file
+	startedAt   time.Time
+
+	// reaped records whether the current self-started child (m.process, while
+	// m.selfStarted) has been observed to exit via cmd.Wait, independent of any
+	// platform liveness probe. isProcessAlive alone cannot detect this on
+	// Windows, where it re-derives liveness from the PID number and so reports
+	// a reaped-but-recycled PID as alive again. It is allocated fresh per child
+	// in startLocked and closed over by that child's wait goroutine, so a stale
+	// goroutine from a previous child can never mark the current child reaped.
+	reaped *atomic.Bool
 
 	// Backoff state
 	currentDelay time.Duration
@@ -37,6 +48,15 @@ type TelegraphServerManager struct {
 	stopFn    func()
 	sleepFn   func(time.Duration)
 	nowFn     func() time.Time
+	aliveFn   func(*os.Process) bool
+}
+
+// isAlive reports whether p is alive, using aliveFn if set for test injection.
+func (m *TelegraphServerManager) isAlive(p *os.Process) bool {
+	if m.aliveFn != nil {
+		return m.aliveFn(p)
+	}
+	return isProcessAlive(p)
 }
 
 // NewTelegraphServerManager creates a new Telegraph subprocess supervisor.
@@ -100,28 +120,117 @@ func (m *TelegraphServerManager) resolvedLogFile() string {
 
 // isRunning checks if the supervised Telegraph process is alive.
 // Must be called with m.mu held.
+//
+// It always re-derives liveness from the PID file rather than trusting a
+// cached m.process handle: a handle only encodes a PID number, so once the
+// process it originally pointed at exits, that PID can be reused by an
+// unrelated process (or, on some platforms, briefly linger as a zombie) and
+// a raw liveness signal against the stale handle would then report a dead
+// Telegraph as alive forever, since nothing ever routes back through
+// PID-file re-validation. This matters most for an *adopted* process (one
+// discovered via the PID file rather than started by this manager instance),
+// since there both the initial and every subsequent check rely solely on the
+// cached handle.
+//
+// Two handle-derived signals still take precedence over the file, because
+// they are more authoritative than a fresh PID-file probe:
+//   - If the file is missing or unreadable but this manager's own handle for
+//     the process it started is still alive, trust the handle (startLocked
+//     treats a failed PID-file write as non-fatal, so the file's absence
+//     does not by itself mean Telegraph died) and repair the file.
+//   - If the cached handle — self-started or adopted — for the exact PID the
+//     file names reports dead, trust that death report over the file. For a
+//     self-started child the reaped flag (set once cmd.Wait returns) is the
+//     stronger form of this override: it survives even a platform liveness
+//     probe that reports the PID as alive after the OS recycled it to an
+//     unrelated process.
 func (m *TelegraphServerManager) isRunning() (int, bool) {
 	if m.runningFn != nil {
 		return m.runningFn()
 	}
-	if m.process != nil {
-		if isProcessAlive(m.process) {
+	pid, alive, err := verifyPIDOwnership(m.pidFile())
+
+	// A live handle for a process this manager itself started outranks the PID
+	// file whenever the two disagree (file missing/unparseable, naming a dead
+	// PID, or naming a different live PID): the file is 0644 in a 0755 dir and
+	// verifyPIDOwnership does not authenticate its writer, so any same-uid
+	// process can overwrite it. Trusting the file over a disagreeing
+	// self-started handle would let a foreign writer redirect Stop()'s kill
+	// signal, or spawn a duplicate Telegraph while ours is still alive. An
+	// adopted (non-self-started) handle keeps only a weaker form of this:
+	// while it stays alive it is likewise never dropped or retargeted on the
+	// file's say-so (the file already chose this PID once, at adoption;
+	// honoring every later rewrite would let an unauthenticated writer re-aim
+	// Stop()'s kill signal at will), but a PID whose only provenance is "a
+	// file said so" is never re-blessed with a fresh nonce — the disagreeing
+	// file is left as-is, not repaired.
+	if m.selfStarted && m.process != nil && m.process.Pid != pid &&
+		(m.reaped == nil || !m.reaped.Load()) && m.isAlive(m.process) {
+		if _, werr := writePIDFile(m.pidFile(), m.process.Pid); werr != nil {
+			m.logger("Telegraph: warning: failed to repair PID file: %v", werr)
+		}
+		return m.process.Pid, true
+	}
+
+	if err != nil || pid == 0 {
+		// The file is missing or unparseable — that is not the file naming a
+		// specific dead process, just the file being unreadable, so it is not
+		// evidence that a handle we already hold is dead, including an
+		// adopted one (the file is unauthenticated; see doc above). Keep
+		// reporting it running without rewriting the file, so an adopted PID
+		// is never re-blessed with a fresh nonce. A self-started child that
+		// has already been reaped is the exception: that death report can't
+		// be spoofed by the file going missing, so it still outranks the
+		// platform's raw liveness probe here (see reaped doc above).
+		reaped := m.selfStarted && m.reaped != nil && m.reaped.Load()
+		if m.process != nil && !reaped && m.isAlive(m.process) {
 			return m.process.Pid, true
 		}
 		m.process = nil
+		m.selfStarted = false
+		m.reaped = nil
+		return 0, false
 	}
-	pid, alive, err := verifyPIDOwnership(m.pidFile())
-	if err != nil || pid == 0 || !alive {
-		if pid > 0 {
+	if !alive {
+		// Unlike the case above, the file names a specific PID and that PID
+		// is confirmed dead — trust that death report over any stale cached
+		// handle, which may point at an unrelated process after PID reuse.
+		_ = os.Remove(m.pidFile())
+		m.process = nil
+		m.selfStarted = false
+		m.reaped = nil
+		return 0, false
+	}
+	if m.process != nil && m.process.Pid == pid {
+		// Once a self-started child has been reaped (cmd.Wait returned), that
+		// report is authoritative even if isAlive's platform probe cannot tell
+		// the reaped PID apart from a recycled one (see reaped doc above).
+		reaped := m.selfStarted && m.reaped != nil && m.reaped.Load()
+		if reaped || !m.isAlive(m.process) {
 			_ = os.Remove(m.pidFile())
+			m.process = nil
+			m.selfStarted = false
+			m.reaped = nil
+			return 0, false
 		}
-		return 0, false
 	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return 0, false
+	if m.process == nil || m.process.Pid != pid {
+		if m.process != nil && !m.selfStarted && m.isAlive(m.process) {
+			// Do not retarget an already-adopted live handle just because the
+			// unauthenticated file started naming a different PID.
+			return m.process.Pid, true
+		}
+		process, err := os.FindProcess(pid)
+		if err != nil {
+			m.process = nil
+			m.selfStarted = false
+			m.reaped = nil
+			return 0, false
+		}
+		m.process = process
+		m.selfStarted = false
+		m.reaped = nil
 	}
-	m.process = process
 	return pid, true
 }
 
@@ -287,19 +396,28 @@ func (m *TelegraphServerManager) startLocked() error {
 		return fmt.Errorf("starting telegraph subprocess: %w", err)
 	}
 
+	pid := cmd.Process.Pid
+	reaped := &atomic.Bool{}
+	m.reaped = reaped
+
 	go func() {
 		_ = cmd.Wait()
+		// Closes over this child's own reaped flag, not a PID number, so a
+		// goroutine left over from a previous child can never mark the
+		// current child (or a later one that reused its PID) reaped.
+		reaped.Store(true)
 		_ = logFile.Close()
 	}()
 
 	m.process = cmd.Process
+	m.selfStarted = true
 	m.startedAt = m.now()
 
-	if _, err := writePIDFile(m.pidFile(), cmd.Process.Pid); err != nil {
+	if _, err := writePIDFile(m.pidFile(), pid); err != nil {
 		m.logger("Telegraph: warning: failed to write PID file: %v", err)
 	}
 
-	m.logger("Telegraph: started subprocess (PID %d), config=%s", cmd.Process.Pid, cfgPath)
+	m.logger("Telegraph: started subprocess (PID %d), config=%s", pid, cfgPath)
 	return nil
 }
 
@@ -354,4 +472,6 @@ func (m *TelegraphServerManager) stopLocked() {
 
 	_ = os.Remove(m.pidFile())
 	m.process = nil
+	m.selfStarted = false
+	m.reaped = nil
 }
