@@ -19,6 +19,10 @@
           {
             "type": "command",
             "command": "{{GT_BIN}} tap guard pr-workflow"
+          },
+          {
+            "type": "command",
+            "command": "{{GT_BIN}} tap guard command-substitution"
           }
         ]
       },
