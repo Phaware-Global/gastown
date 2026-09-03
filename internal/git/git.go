@@ -3499,6 +3499,30 @@ func (g *Git) unpushedFromExactRemoteBranch(localBranch, remote string) (int, bo
 	return count, true, err
 }
 
+// remoteBranchContainingHead returns the first branch on remote whose tip
+// contains HEAD, or "" if none does. Used as preservation evidence when HEAD is
+// detached and there is no local branch name to look up on the remote.
+func (g *Git) remoteBranchContainingHead(remote string) (string, error) {
+	out, err := g.run("branch", "-r", "--contains", "HEAD", "--format=%(refname:short)")
+	if err != nil {
+		return "", err
+	}
+	prefix := remote + "/"
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		ref := strings.TrimSpace(line)
+		if ref == "" || !strings.HasPrefix(ref, prefix) {
+			continue
+		}
+		// Skip the remote's symbolic HEAD pointer (e.g. "origin/HEAD -> origin/main"),
+		// which names no branch of its own.
+		if ref == prefix+"HEAD" || strings.Contains(ref, "->") {
+			continue
+		}
+		return ref, nil
+	}
+	return "", nil
+}
+
 // BranchPreservationStatus describes whether HEAD is already preserved on a
 // durable branch, and how many patch-unique commits remain if it is not.
 type BranchPreservationStatus struct {
@@ -3543,6 +3567,24 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 				return result, nil
 			}
 			candidates = append(candidates, remoteSHA)
+		}
+	}
+
+	// A detached HEAD has no local branch name to resolve on the remote, so the
+	// exact-branch evidence above is skipped by its own guard and the check falls
+	// through to the remote default branch. That reports deliberately preserved
+	// work as unpreserved — a polecat parked on a preservation branch reads as
+	// NEEDS_RECOVERY forever, because every later evaluation repeats the same
+	// comparison. Ask git directly instead: a remote branch that contains HEAD is
+	// proof the commits are durable, which is the same thing the exact-branch
+	// path proves, just discovered by content rather than by name.
+	if includeExactBranch && (localBranch == "" || localBranch == "HEAD") {
+		if ref, err := g.remoteBranchContainingHead(remote); err == nil && ref != "" {
+			result.ComparisonBase = ref
+			result.Preserved = true
+			result.UnpreservedPatchCount = 0
+			result.Evidence = "remote_branch_contains_head"
+			return result, nil
 		}
 	}
 

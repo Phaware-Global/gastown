@@ -51,13 +51,13 @@ func AssessActiveMR(reader IssueReader, in ActiveMRInput) ActiveMRAssessment {
 	mr, err := reader.Show(mrID)
 	if err != nil {
 		if errors.Is(err, beads.ErrNotFound) {
-			return assessStaleActiveMR(reader, in, result, "missing", nil)
+			return assessStaleActiveMR(reader, in, result, mrStatusMissing, nil)
 		}
 		result.Reason = fmt.Sprintf("active_mr=%s status=lookup_error: %v", mrID, err)
 		return result
 	}
 	if mr == nil {
-		return assessStaleActiveMR(reader, in, result, "missing", nil)
+		return assessStaleActiveMR(reader, in, result, mrStatusMissing, nil)
 	}
 
 	result.MRStatus = mr.Status
@@ -68,6 +68,10 @@ func AssessActiveMR(reader IssueReader, in ActiveMRInput) ActiveMRAssessment {
 	return assessStaleActiveMR(reader, in, result, mr.Status, mr)
 }
 
+// mrStatusMissing is the synthetic MRStatus used when the active_mr bead cannot
+// be found at all, as opposed to being found in a terminal state.
+const mrStatusMissing = "missing"
+
 func assessStaleActiveMR(reader IssueReader, in ActiveMRInput, result ActiveMRAssessment, mrStatus string, mr *beads.Issue) ActiveMRAssessment {
 	result.MRStatus = mrStatus
 	result.Stale = true
@@ -76,6 +80,27 @@ func assessStaleActiveMR(reader IssueReader, in ActiveMRInput, result ActiveMRAs
 	terminal, reason := terminalSourceIssue(reader, sourceIssue)
 	result.SourceTerminal = terminal
 	if !terminal {
+		// A vanished MR with no identifiable source issue is unfalsifiable: the
+		// bead that named the source is gone, so no future lookup can ever prove
+		// the source terminal and Pending would stay true forever. Only the
+		// refinery clears active_mr, and it never will for an MR that no longer
+		// exists — so the polecat is wedged permanently. This is reachable in
+		// normal operation: the wisp reaper purges closed MR wisps.
+		//
+		// Fail closed on everything except that dead end, and decide it on direct
+		// git evidence instead: if the worktree holds no work at risk there is
+		// nothing left to preserve, whatever the vanished MR once referred to.
+		// Callers that do not supply git evidence (RequireGitSafe false) keep the
+		// old blocking behavior rather than clearing on no evidence at all.
+		if mrStatus == mrStatusMissing && sourceIssue == "" {
+			if in.RequireGitSafe && in.GitSafe {
+				result.Pending = false
+				result.Reason = ""
+				return result
+			}
+			result.Reason = fmt.Sprintf("active_mr=%s status=%s source_issue=<missing> git_state=unverified", result.ActiveMR, mrStatus)
+			return result
+		}
 		result.Reason = fmt.Sprintf("active_mr=%s status=%s %s", result.ActiveMR, mrStatus, reason)
 		return result
 	}
