@@ -1,10 +1,17 @@
 package daemon
 
 import (
+	"io"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/checkpoint"
+	"github.com/steveyegge/gastown/internal/git"
 )
 
 func TestCheckpointDogInterval_Default(t *testing.T) {
@@ -202,5 +209,152 @@ func TestIsGitWorktree(t *testing.T) {
 	}
 	if !isGitWorktree(fileGit) {
 		t.Error(".git file (linked worktree) should count as worktree")
+	}
+}
+
+// initCheckpointTestRepo creates a local git worktree with a bare "origin"
+// remote and returns the local worktree dir, on branch "polecat/foo/bead@1".
+func initCheckpointTestRepo(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	remoteDir := filepath.Join(tmp, "remote.git")
+	localDir := filepath.Join(tmp, "local")
+
+	run := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+
+	run(tmp, "init", "--bare", remoteDir)
+	if err := os.MkdirAll(localDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	run(localDir, "init")
+	run(localDir, "config", "user.email", "test@test.com")
+	run(localDir, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(localDir, "README.md"), []byte("# Test\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	run(localDir, "add", ".")
+	run(localDir, "commit", "-m", "initial")
+	run(localDir, "remote", "add", "origin", remoteDir)
+	run(localDir, "checkout", "-b", "polecat/foo/bead@1")
+
+	return localDir
+}
+
+func newTestDaemon() *Daemon {
+	return &Daemon{logger: log.New(io.Discard, "", 0)}
+}
+
+func TestCheckpointWorktree_CommitsAndPushesPreserveRef(t *testing.T) {
+	workDir := initCheckpointTestRepo(t)
+	// initCheckpointTestRepo lays out <tmp>/remote.git next to <tmp>/local
+	// (the returned workDir) — see its definition below.
+	remoteDir := filepath.Join(filepath.Dir(workDir), "remote.git")
+	// Modify a file already tracked by initCheckpointTestRepo's initial
+	// commit: staging is `git add -u` (allowlist, gt-i4ej FIX 1), which only
+	// picks up changes to files git already tracks, never new untracked
+	// files (see the matching comment in preserve_test.go).
+	if err := os.WriteFile(filepath.Join(workDir, "README.md"), []byte("# Test\nmodified\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	d := newTestDaemon()
+	if !d.checkpointWorktree(workDir, "myrig", "foo") {
+		t.Fatal("expected checkpointWorktree to report a preservation")
+	}
+
+	cmd := exec.Command("git", "log", "-1", "--format=%s")
+	cmd.Dir = workDir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git log: %v", err)
+	}
+	if got := string(out); got != checkpoint.WIPCommitPrefix+"\n" {
+		t.Fatalf("commit subject = %q, want %q", got, checkpoint.WIPCommitPrefix)
+	}
+
+	// A test named "...AndPushesPreserveRef" must actually verify the push:
+	// mutation testing showed the previous version here stayed green with
+	// Push:true deleted entirely, because it only ever inspected `git log`
+	// on the local worktree (PR #184 review). Derive the expected ref name
+	// from the function under test rather than hand-writing it, and check
+	// the bare remote directly.
+	headOut, err := exec.Command("git", "-C", workDir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	head := strings.TrimSpace(string(headOut))
+
+	wantRef := git.PreservationRefName("polecat/foo/bead@1")
+	lsOut, err := exec.Command("git", "ls-remote", "--heads", remoteDir, wantRef).Output()
+	if err != nil {
+		t.Fatalf("ls-remote: %v", err)
+	}
+	fields := strings.Fields(string(lsOut))
+	if len(fields) < 2 {
+		t.Fatalf("preservation ref %q was not pushed to the bare remote (ls-remote returned %q)", wantRef, lsOut)
+	}
+	if fields[0] != head {
+		t.Fatalf("ls-remote %s = %s, want sha %s", wantRef, fields[0], head)
+	}
+}
+
+func TestCheckpointWorktree_CleanWorktreeReportsNothing(t *testing.T) {
+	workDir := initCheckpointTestRepo(t)
+
+	d := newTestDaemon()
+	if d.checkpointWorktree(workDir, "myrig", "foo") {
+		t.Fatal("expected checkpointWorktree to report nothing for a clean worktree")
+	}
+}
+
+func TestCheckpointWorktree_RefusesProtectedBranch(t *testing.T) {
+	workDir := initCheckpointTestRepo(t)
+
+	// initCheckpointTestRepo already switched to a feature branch; switch
+	// back to whatever the repo's default init branch was (main/master per
+	// local git config) rather than assuming its exact name.
+	cmd := exec.Command("git", "checkout", "-")
+	cmd.Dir = workDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("checkout -: %v\n%s", err, out)
+	}
+	branchCmd := exec.Command("git", "branch", "--show-current")
+	branchCmd.Dir = workDir
+	branchOut, err := branchCmd.Output()
+	if err != nil {
+		t.Fatalf("branch --show-current: %v", err)
+	}
+	defaultBranch := string(branchOut)
+	if len(defaultBranch) > 0 && defaultBranch[len(defaultBranch)-1] == '\n' {
+		defaultBranch = defaultBranch[:len(defaultBranch)-1]
+	}
+	if defaultBranch != "main" && defaultBranch != "master" && defaultBranch != "develop" {
+		t.Skipf("repo default branch %q is not in protectedBranchSet", defaultBranch)
+	}
+
+	if err := os.WriteFile(filepath.Join(workDir, "handler.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	d := newTestDaemon()
+	if d.checkpointWorktree(workDir, "myrig", "foo") {
+		t.Fatal("must not checkpoint a protected branch (G41 guard)")
+	}
+
+	statusCmd := exec.Command("git", "status", "--porcelain")
+	statusCmd.Dir = workDir
+	out, err := statusCmd.Output()
+	if err != nil {
+		t.Fatalf("git status: %v", err)
+	}
+	if len(out) == 0 {
+		t.Fatal("work must remain uncommitted in the worktree after refusal")
 	}
 }

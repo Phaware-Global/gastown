@@ -1152,6 +1152,52 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	// Polecat dir is the parent directory (polecats/<name>/)
 	polecatDir := m.polecatDir(name)
 
+	// Preserve any uncommitted or unpushed work before anything below can
+	// discard it. This runs unconditionally — including under force/nuclear,
+	// which bypass the uncommitted-work gate a few lines down — because that
+	// gate is exactly what force/nuclear exist to skip, and skipping it must
+	// not mean skipping preservation too (gt-y8ts: force-nuking a polecat
+	// used to destroy real uncommitted work with zero recovery path). Tries a
+	// verified commit first, falling back to --no-verify only if hooks fail
+	// (broken husky hooks in polecat worktrees can fail a plain commit while
+	// a later push still reports success) — in which case the commit is kept
+	// locally but never pushed (gt-i4ej FIX 2). Pushes to a dedicated
+	// polecat/preserve-<branch> ref, verified against the remote tip, since
+	// the worktree itself is about to be removed. Best-effort: a preservation
+	// failure is logged and does not block an operator-requested removal.
+	//
+	// Push is gated on !nuclear: nuclear/selfNuke is the operator reaching
+	// for the strongest destructive operation, often precisely BECAUSE a
+	// polecat's worktree contents must not survive (compromised, wrote
+	// credentials, staged hostile data). Publishing that worktree to a
+	// shared remote ref first would invert the operator's intent. For an
+	// attached branch, nuclear removal still commits locally — the content
+	// is not silently destroyed, recoverable via refs/heads/<branch>, which
+	// lives in the common git dir and survives worktree removal. A detached
+	// worktree has no such ref: CurrentBranch() reports the literal "HEAD"
+	// string, AutoPreserveUncommittedWork commits onto that detached HEAD,
+	// and WorktreeRemove's teardown deletes .git/worktrees/<id> — including
+	// the per-worktree HEAD and reflog that were the only things pointing
+	// at that commit — leaving an unreachable object awaiting gc. So the
+	// detached/nuclear case skips the commit entirely rather than promising
+	// a recoverability it can't deliver (PR #184 review).
+	preserveGit := git.NewGit(clonePath)
+	if branch, brErr := preserveGit.CurrentBranch(); brErr == nil && branch != "" {
+		if branch == "HEAD" && nuclear {
+			style.PrintWarning("worktree %s is on a detached HEAD — nuclear removal skips local auto-preserve here (no branch ref would survive worktree teardown to hold the commit); any uncommitted work is discarded", name)
+		} else if result, presErr := git.AutoPreserveUncommittedWork(preserveGit, branch, git.PreserveOptions{
+			IssueID: name,
+			Push:    !nuclear,
+		}); presErr != nil {
+			style.PrintWarning("could not auto-preserve work in %s before removal: %v", name, presErr)
+		} else if result.Pushed {
+			fmt.Printf("%s Preserved uncommitted work for %s: pushed %s to %s\n",
+				style.Bold.Render("✓"), name, result.Commit, result.Ref)
+		} else if result.HooksFailed {
+			style.PrintWarning("preserved uncommitted work for %s LOCALLY ONLY — its pre-commit hook FAILED, so it was not pushed (worktree is about to be removed): %s", name, result.HookOutput)
+		}
+	}
+
 	// Check for uncommitted work unless bypassed
 	if !nuclear {
 		// ZFC #10: First try to read cleanup_status from agent bead
@@ -1245,15 +1291,31 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	// nuking a stalled polecat (e.g., after disk space recovery) permanently loses
 	// any commits on the branch. The push is non-blocking: failures are warnings,
 	// not errors, so nuke still proceeds. See: disk-space-resilience.
-	polecatGit := git.NewGit(clonePath)
-	if branch, brErr := polecatGit.CurrentBranch(); brErr == nil && branch != "" {
-		pushed, unpushedCount, checkErr := polecatGit.BranchPushedToRemote(branch, "origin")
-		if checkErr == nil && !pushed && unpushedCount > 0 {
-			if pushErr := polecatGit.Push("origin", branch, false); pushErr != nil {
-				style.PrintWarning("could not push branch %s before removal (%d unpushed commit(s)): %v",
-					branch, unpushedCount, pushErr)
-				style.PrintWarning("WORK AT RISK: branch %s has %d unpushed commit(s) in worktree %s",
-					branch, unpushedCount, clonePath)
+	//
+	// Two gates (PR #184 review): never under nuclear — the operator reached
+	// for nuclear precisely because this worktree's contents must not survive
+	// (see the auto-preserve gating above), and this push would publish them
+	// anyway; and never when the branch carries a commit made with hooks
+	// bypassed — the auto-preserve gate above refuses to push those, and
+	// pushing the same commits here on the polecat's REAL branch would be
+	// strictly worse than the preserve ref it just refused.
+	if !nuclear {
+		polecatGit := git.NewGit(clonePath)
+		if branch, brErr := polecatGit.CurrentBranch(); brErr == nil && branch != "" {
+			if badSHA, chkErr := git.HasUnverifiedCommit(polecatGit, "origin"); chkErr != nil {
+				style.PrintWarning("could not verify %s's commits before the pre-removal push, not pushing branch %s: %v", name, branch, chkErr)
+			} else if badSHA != "" {
+				style.PrintWarning("branch %s carries commit %s made with pre-commit hooks bypassed — refusing the pre-removal push; the work remains in the local commit", branch, badSHA[:8])
+			} else {
+				pushed, unpushedCount, checkErr := polecatGit.BranchPushedToRemote(branch, "origin")
+				if checkErr == nil && !pushed && unpushedCount > 0 {
+					if pushErr := polecatGit.Push("origin", branch, false); pushErr != nil {
+						style.PrintWarning("could not push branch %s before removal (%d unpushed commit(s)): %v",
+							branch, unpushedCount, pushErr)
+						style.PrintWarning("WORK AT RISK: branch %s has %d unpushed commit(s) in worktree %s",
+							branch, unpushedCount, clonePath)
+					}
+				}
 			}
 		}
 	}

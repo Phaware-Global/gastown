@@ -144,6 +144,18 @@ type Daemon struct {
 	// so a long catch-up sync is never dispatched twice concurrently.
 	offsiteBackupRunning atomic.Bool
 
+	// checkpointDogRunning guards runCheckpointDog so it never runs inline
+	// in the daemon's main select loop: it walks every polecat worktree
+	// across every rig, and each one can block for up to pushTimeout on an
+	// unreachable remote — serially, per polecat, per rig — which stalls
+	// every other dog (and shutdown itself) behind it for as long as the
+	// walk takes (PR #184 review). Dispatched to a goroutine; the guard
+	// skips a cycle rather than piling overlapping runs up.
+	// checkpointDogWG tracks that goroutine so shutdown can wait (bounded)
+	// for an in-flight git commit/push instead of exiting under it.
+	checkpointDogRunning atomic.Bool
+	checkpointDogWG      sync.WaitGroup
+
 	// lastDoctorMolTime tracks when the last mol-dog-doctor molecule was poured.
 	// Option B throttling: only pour when anomaly detected AND cooldown elapsed.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
@@ -168,7 +180,11 @@ type Daemon struct {
 	// duration of a single heartbeat tick. ~10 call sites per tick otherwise
 	// re-read and re-parse the same file. Invalidated at the start of each
 	// heartbeat so rigs.json changes between ticks are picked up.
-	// Only accessed from heartbeat loop goroutine - no sync needed.
+	// Guarded by knownRigsMu: the checkpoint dog goroutine reads the cache
+	// concurrently with the heartbeat loop's writes/invalidations, so the
+	// old "heartbeat loop goroutine only" invariant no longer holds
+	// (PR #184 review).
+	knownRigsMu         sync.Mutex
 	knownRigsCache      []string
 	knownRigsCacheValid bool
 
@@ -854,9 +870,25 @@ func (d *Daemon) Run() (err error) {
 
 		case <-checkpointDogChan:
 			// Checkpoint dog — auto-commits WIP changes in active polecat
-			// worktrees to prevent data loss from session crashes.
+			// worktrees to prevent data loss from session crashes. Run in
+			// a guarded goroutine, not inline: it can stall on an
+			// unreachable remote for up to pushTimeout per polecat, and
+			// running it in this select loop would block every other dog
+			// (and shutdown handling) behind it for the whole walk
+			// (PR #184 review). checkpointRigPolecats also re-checks
+			// isShutdownInProgress per polecat so a shutdown mid-walk
+			// aborts it instead of running to completion.
 			if !d.isShutdownInProgress() {
-				d.runCheckpointDog()
+				if !d.checkpointDogRunning.CompareAndSwap(false, true) {
+					d.logger.Printf("checkpoint_dog: previous cycle still running, skipping this tick")
+				} else {
+					d.checkpointDogWG.Add(1)
+					go func() {
+						defer d.checkpointDogWG.Done()
+						defer d.checkpointDogRunning.Store(false)
+						d.runCheckpointDog()
+					}()
+				}
 			}
 
 		case <-scheduledMaintenanceChan:
@@ -2331,6 +2363,8 @@ func (d *Daemon) openBeadsStores() (map[string]beadsdk.Storage, error) {
 // into a single mayor/rigs.json read. The cache is invalidated at the start of
 // each heartbeat.
 func (d *Daemon) getKnownRigs() []string {
+	d.knownRigsMu.Lock()
+	defer d.knownRigsMu.Unlock()
 	if d.knownRigsCacheValid {
 		return d.knownRigsCache
 	}
@@ -2343,6 +2377,8 @@ func (d *Daemon) getKnownRigs() []string {
 // invalidateKnownRigsCache clears the per-tick cache so the next
 // getKnownRigs() call re-reads mayor/rigs.json from disk.
 func (d *Daemon) invalidateKnownRigsCache() {
+	d.knownRigsMu.Lock()
+	defer d.knownRigsMu.Unlock()
 	d.knownRigsCache = nil
 	d.knownRigsCacheValid = false
 }
@@ -2543,6 +2579,23 @@ func (d *Daemon) shutdown(state *State) error { //nolint:unparam // error return
 	// Stop()/ctx.Done(). Shutdown steps below that must still run use their
 	// own Background-parented contexts (e.g. pushDoltRemotes).
 	d.cancel()
+
+	// Wait (bounded) for an in-flight checkpoint dog cycle. It re-checks
+	// isShutdownInProgress between polecats, so after d.cancel() it winds
+	// down at the next polecat boundary — but a single git commit/push may
+	// be mid-flight, and exiting under it can leave a worktree's index or
+	// the remote preserve ref half-updated. The bound covers one push plus
+	// its remote verification (PR #184 review).
+	checkpointDone := make(chan struct{})
+	go func() {
+		d.checkpointDogWG.Wait()
+		close(checkpointDone)
+	}()
+	select {
+	case <-checkpointDone:
+	case <-time.After(90 * time.Second):
+		d.logger.Println("checkpoint_dog: still running after 90s shutdown wait — proceeding with shutdown")
+	}
 
 	// Stop feed curator
 	if d.curator != nil {

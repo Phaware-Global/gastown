@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -440,55 +441,75 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			return fmt.Errorf("gt done aborted: refusing to auto-save uncommitted work on protected branch %q (G41 guard)", branch)
 		}
 
-		// Re-check to get file details (cleanup detection already confirmed uncommitted changes)
-		workStatus, err := g.CheckUncommittedWork()
-		if err == nil && workStatus.HasUncommittedChanges && !workStatus.CleanExcludingRuntime() {
-			if len(workStatus.UnmergedFiles) > 0 {
-				return fmt.Errorf("cannot auto-save unmerged conflicts: %s\nResolve conflicts first, or use --status DEFERRED to exit without completing", strings.Join(workStatus.UnmergedFiles, ", "))
+		// Only exclude CLAUDE.md if it carries the polecat overlay marker —
+		// AutoPreserveUncommittedWork always excludes CLAUDE.local.md but
+		// doesn't know about this repo-specific overlay marker.
+		var extraExclude []string
+		if claudeData, readErr := os.ReadFile(filepath.Join(cwd, "CLAUDE.md")); readErr == nil {
+			if strings.Contains(string(claudeData), templates.PolecatLifecycleMarker) {
+				extraExclude = append(extraExclude, "CLAUDE.md")
 			}
+		}
 
+		workStatus, wsErr := g.CheckUncommittedWork()
+		runtimeOnly := wsErr == nil && workStatus.CleanExcludingRuntime()
+		if runtimeOnly {
+			fmt.Printf("\n%s Only runtime artifacts uncommitted (.beads/, .claude/, etc.) — nothing to auto-save\n", style.Bold.Render("ℹ"))
+		} else {
 			fmt.Printf("\n%s Uncommitted changes detected — auto-saving to prevent work loss\n", style.Bold.Render("⚠"))
+		}
+		if wsErr == nil {
 			fmt.Printf("  Files: %s\n\n", workStatus.String())
+		}
 
-			// Stage all changes (git add -A), then unstage overlay/runtime files (gt-p35)
-			// and any deletions of tracked files (gt-pvx safety: never commit deletions).
-			if addErr := g.Add("-A"); addErr != nil {
-				style.PrintWarning("auto-commit: git add failed: %v — uncommitted work may be at risk", addErr)
+		// gt done pushes the branch itself later in this same flow, so the
+		// shared preserve helper only needs to commit here — no separate
+		// preservation-ref push (unlike the nuke/checkpoint call sites, which
+		// have no later push step of their own).
+		preserveResult, preserveErr := git.AutoPreserveUncommittedWork(g, branch, git.PreserveOptions{
+			IssueID:           parseBranchName(branch).Issue,
+			ExtraExcludePaths: extraExclude,
+		})
+		if preserveErr != nil {
+			return fmt.Errorf("gt-pvx safety net auto-save failed: %w\nResolve the issue first, or use --status DEFERRED to exit without completing", preserveErr)
+		}
+		if preserveResult.HooksFailed {
+			// gt done pushes the branch itself later in this same flow
+			// (see the comment above), so an unverified commit here would
+			// otherwise reach origin regardless of AutoPreserveUncommittedWork's
+			// own push gating. Refuse to proceed instead (gt-i4ej FIX 2) —
+			// the work is safe in a local commit, just not pushed. This
+			// fires both for a hook failure in this very call and for an
+			// unverified commit left by an earlier auto-save cycle (the
+			// durable trailer check — PR #184 review).
+			return fmt.Errorf("gt-pvx safety net: this branch carries work committed with its pre-commit hook FAILING — refusing to push an unverified commit to origin.\n%s\n\nResolve the hook failure and re-run gt done. Your work is safe in a local commit; it has not been pushed", preserveResult.HookOutput)
+		}
+		if preserveResult.Committed {
+			fmt.Printf("%s Auto-committed uncommitted work (safety net)\n", style.Bold.Render("✓"))
+			fmt.Printf("  The agent should have committed before running gt done.\n")
+			fmt.Printf("  This auto-save prevents work loss.\n\n")
+			doneCleanupStatus = "unpushed" // Update status — changes are now committed but not pushed
+		} else if runtimeOnly {
+			fmt.Printf("%s Nothing to auto-commit — all uncommitted paths were runtime artifacts\n\n", style.Bold.Render("✓"))
+		} else {
+			// `git add -u` (gt-i4ej FIX 1) never stages a brand-new
+			// untracked file — the accepted tradeoff of a safety net that
+			// must never auto-publish a credential. Name exactly those new
+			// files so the operator doesn't have to guess why the safety
+			// net that just ran left the tree dirty — but only those:
+			// lumping the deliberately-excluded overlay CLAUDE.md (a
+			// tracked, modified file gt done itself unstaged) in as "new
+			// untracked" told agents to commit the very file the exclusion
+			// exists to keep out of the PR (PR #184 review).
+			newUntracked, excludedLeft := classifyUnsavedPaths(workStatus, extraExclude)
+			if len(newUntracked) > 0 {
+				style.PrintWarning("auto-commit: %d new untracked file(s) were not auto-staged — they are never auto-captured by the add -u safety net; commit them yourself or re-run gt done after staging:\n  %s",
+					len(newUntracked), strings.Join(newUntracked, "\n  "))
+			} else if len(excludedLeft) > 0 {
+				fmt.Printf("%s Nothing to auto-commit — the remaining changes are deliberately excluded from auto-save and must NOT be committed: %s\n\n",
+					style.Bold.Render("✓"), strings.Join(excludedLeft, ", "))
 			} else {
-				// Unstage Gas Town overlay files that git add -A picked up.
-				// These are runtime artifacts that must not be committed to repos.
-				_ = g.ResetFiles("CLAUDE.local.md")
-				// Only unstage CLAUDE.md if it contains the overlay marker
-				if claudeData, readErr := os.ReadFile(filepath.Join(cwd, "CLAUDE.md")); readErr == nil {
-					if strings.Contains(string(claudeData), templates.PolecatLifecycleMarker) {
-						_ = g.ResetFiles("CLAUDE.md")
-					}
-				}
-				// Unstage runtime/ephemeral artifacts using the centralized git policy.
-				for _, path := range workStatus.RuntimeArtifactPaths() {
-					_ = g.ResetFiles(path)
-				}
-				// Unstage deletions of tracked files. A safety-net auto-commit should
-				// preserve work (additions + modifications), never destroy it (deletions).
-				// This prevents the bug where a polecat's working tree has a missing
-				// tracked file (e.g. .beads/metadata.json) and the auto-save commits
-				// the deletion, breaking infrastructure for subsequent sessions.
-				if stagedDeletions, delErr := g.StagedDeletions(); delErr == nil && len(stagedDeletions) > 0 {
-					_ = g.ResetFiles(stagedDeletions...)
-				}
-				// Build a descriptive commit message
-				autoMsg := "fix: auto-save uncommitted implementation work (gt-pvx safety net)"
-				if issueFromBranch := parseBranchName(branch).Issue; issueFromBranch != "" {
-					autoMsg = fmt.Sprintf("fix: auto-save uncommitted implementation work (%s, gt-pvx safety net)", issueFromBranch)
-				}
-				if commitErr := g.Commit(autoMsg); commitErr != nil {
-					style.PrintWarning("auto-commit: git commit failed: %v — uncommitted work may be at risk", commitErr)
-				} else {
-					fmt.Printf("%s Auto-committed uncommitted work (safety net)\n", style.Bold.Render("✓"))
-					fmt.Printf("  The agent should have committed before running gt done.\n")
-					fmt.Printf("  This auto-save prevents work loss.\n\n")
-					doneCleanupStatus = "unpushed" // Update status — changes are now committed but not pushed
-				}
+				style.PrintWarning("auto-commit: nothing left to commit after excluding runtime artifacts — uncommitted work may be at risk")
 			}
 		}
 	}
@@ -892,6 +913,12 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Handle "direct" strategy: push to target branch, skip MR
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
+			if reason := refuseUnverifiedPush(g); reason != "" {
+				pushFailed = true
+				doneErrors = append(doneErrors, reason)
+				style.PrintWarning("%s", reason)
+				goto notifyWitness
+			}
 			// Push submodule changes before direct push (gt-dzs)
 			pushSubmoduleChanges(g, defaultBranch)
 			directRefspec := branch + ":" + defaultBranch
@@ -959,6 +986,18 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// Stale checkpoint from a previous assignment — discard and push normally.
 			fmt.Printf("→ Discarding stale push checkpoint (was for branch %s, now on %s)\n",
 				checkpoints[CheckpointPushed], branch)
+		}
+
+		// Never publish a commit made with commit hooks bypassed (durable
+		// Gastown-Unverified marker): the auto-save gate above only runs
+		// when the tree was dirty, but an earlier auto-save/checkpoint
+		// cycle can have left an unverified commit on a now-clean branch
+		// (PR #184 review).
+		if reason := refuseUnverifiedPush(g); reason != "" {
+			pushFailed = true
+			doneErrors = append(doneErrors, reason)
+			style.PrintWarning("%s", reason)
+			goto notifyWitness
 		}
 
 		// CRITICAL: Push branch BEFORE creating MR bead (hq-6dk53, hq-a4ksk)
@@ -1436,6 +1475,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Late-detected direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
 			fmt.Printf("  Convoy: %s\n", convoyInfo.ID)
+
+			if reason := refuseUnverifiedPush(g); reason != "" {
+				pushFailed = true
+				doneErrors = append(doneErrors, reason)
+				style.PrintWarning("%s", reason)
+				goto notifyWitness
+			}
 
 			// Push branch directly to main (the earlier push went to origin/<branch>)
 			directRefspec := branch + ":" + defaultBranch
@@ -2597,6 +2643,49 @@ func findHookedBeadForAgent(bd *beads.Beads, agentID string) string {
 
 // parseCleanupStatus converts a string flag value to a CleanupStatus.
 // ZFC: Agent observes git state and passes the appropriate status.
+// refuseUnverifiedPush returns a non-empty, operator-facing reason when the
+// current branch must not be pushed to origin: it carries a commit made with
+// commit hooks bypassed (the durable Gastown-Unverified trailer — typically
+// a secret scanner rejected it), or that state could not be checked. Every
+// gt done push site consults this because the auto-save's own HooksFailed
+// gate only fires when auto-save ran in the same invocation — an unverified
+// commit left by an earlier cycle sits on a clean tree (PR #184 review).
+func refuseUnverifiedPush(g *git.Git) string {
+	badSHA, err := git.HasUnverifiedCommit(g, "origin")
+	if err != nil {
+		return fmt.Sprintf("could not check the branch for unverified commits — refusing to push until it can be verified: %v", err)
+	}
+	if badSHA != "" {
+		return fmt.Sprintf("commit %s was made with pre-commit hooks bypassed (Gastown-Unverified) and never verified — refusing to push it to origin. Resolve the hook failure, rewrite the marked commit so hooks re-run (e.g. `git commit --amend` / `git rebase -i`), then re-run gt done", badSHA[:8])
+	}
+	return ""
+}
+
+// classifyUnsavedPaths splits the non-runtime uncommitted paths left behind
+// by an auto-save that committed nothing into (a) genuinely new untracked
+// files — never captured by the `git add -u` allowlist, worth telling the
+// operator to commit themselves — and (b) paths the caller deliberately
+// excluded (e.g. the polecat overlay CLAUDE.md), which must NOT be committed
+// and must never be reported as "new untracked" (PR #184 review).
+func classifyUnsavedPaths(workStatus *git.UncommittedWorkStatus, extraExclude []string) (newUntracked, excluded []string) {
+	if workStatus == nil {
+		return nil, nil
+	}
+	untracked := make(map[string]bool, len(workStatus.UntrackedFiles))
+	for _, f := range workStatus.UntrackedFiles {
+		untracked[f] = true
+	}
+	for _, f := range workStatus.NonRuntimePaths() {
+		switch {
+		case slices.Contains(extraExclude, f):
+			excluded = append(excluded, f)
+		case untracked[f]:
+			newUntracked = append(newUntracked, f)
+		}
+	}
+	return newUntracked, excluded
+}
+
 func parseCleanupStatus(s string) polecat.CleanupStatus {
 	switch strings.ToLower(s) {
 	case "clean":

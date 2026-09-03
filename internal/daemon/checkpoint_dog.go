@@ -1,22 +1,30 @@
 package daemon
 
 import (
-	"bytes"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/checkpoint"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/session"
-	"github.com/steveyegge/gastown/internal/util"
 )
 
 const (
 	defaultCheckpointDogInterval = 10 * time.Minute
+
+	// checkpointDogAbandonedThreshold bounds how long a dead session's
+	// worktree keeps getting auto-checkpointed after its last known
+	// activity. Distinct from (and much larger than) the session-liveness
+	// heartbeat threshold: checkpointing a session that just died is the
+	// highest-risk case this dog exists for, but a worktree whose session
+	// has been dead well beyond this window is more likely a deliberately
+	// abandoned or gone-wrong worktree than one about to be reassigned,
+	// and should stop being auto-published (PR #184 review).
+	checkpointDogAbandonedThreshold = 24 * time.Hour
 )
 
 // CheckpointDogConfig holds configuration for the checkpoint_dog patrol.
@@ -40,22 +48,13 @@ func checkpointDogInterval(config *DaemonPatrolConfig) time.Duration {
 	return defaultCheckpointDogInterval
 }
 
-// runtimeExcludeDirs are directories to unstage after git add -A.
-// These contain runtime/ephemeral data that should not be checkpointed.
-var runtimeExcludeDirs = []string{
-	".claude/",
-	".beads/",
-	".runtime/",
-	"__pycache__/",
-}
-
 // runCheckpointDog auto-commits WIP changes in active polecat worktrees.
 // This protects against data loss when sessions crash or hit context limits.
 //
 // ## ZFC Exemption
-// The checkpoint dog executes git operations directly (same pattern as
-// compactor_dog's SQL operations). The daemon pours a molecule for
-// observability, then runs git commands via exec.Command.
+// The checkpoint dog executes git operations directly via internal/git (same
+// pattern as compactor_dog's SQL operations). The daemon pours a molecule for
+// observability, then delegates staging/commit/push to git.AutoPreserveUncommittedWork.
 func (d *Daemon) runCheckpointDog() {
 	if !d.isPatrolActive("checkpoint_dog") {
 		return
@@ -97,20 +96,35 @@ func (d *Daemon) checkpointRigPolecats(rigName string) (int, int) {
 	checkpointed := 0
 
 	for _, polecatName := range polecats {
+		if d.isShutdownInProgress() {
+			d.logger.Printf("checkpoint_dog: shutdown in progress, aborting %s walk (%d/%d polecats scanned)", rigName, scanned, len(polecats))
+			break
+		}
 		scanned++
 
-		// Check if tmux session is alive — only checkpoint active sessions.
-		// Dead sessions can't benefit from checkpoints.
+		// Deliberately checkpoint regardless of whether the tmux session is
+		// alive. This dog exists to protect against data loss when a session
+		// crashes — a dead session is exactly the case that needs it most,
+		// not a reason to skip: it is the one polecat state nothing else is
+		// actively preserving, and the one most likely to be reassigned or
+		// nuked next (gt-y8ts). The previous "alive sessions only" gate is
+		// why the checkpoint fired for one incident polecat but not for two
+		// others in the same afternoon — both had already died by the time
+		// this patrol ran.
+		//
+		// That said, this must not turn into "every worktree on the box,
+		// indefinitely" (PR #184 review). A tmux failure means we can't
+		// tell whether the worktree is even in scope, so skip it for
+		// safety rather than checkpointing blind — the next cycle will
+		// retry. And a session dead well beyond checkpointDogAbandonedThreshold
+		// is more likely a deliberately-left-dirty or gone-wrong worktree
+		// than one about to be reassigned, so stop auto-publishing it.
 		sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
 		alive, err := d.tmux.HasSession(sessionName)
 		if err != nil {
-			d.logger.Printf("checkpoint_dog: error checking session %s: %v", sessionName, err)
+			d.logger.Printf("checkpoint_dog: error checking session %s, skipping for safety: %v", sessionName, err)
 			continue
 		}
-		if !alive {
-			continue
-		}
-
 		// Polecat layout: prefer <polecatsDir>/<name>/<rigName>/ (the new
 		// nested layout where the outer <name>/ dir is a container with
 		// per-polecat scaffolding and the inner dir is the actual git
@@ -121,11 +135,35 @@ func (d *Daemon) checkpointRigPolecats(rigName string) (int, int) {
 		// container caused git to walk up to the top-level workspace's
 		// .git and commit "WIP: checkpoint (auto)" on the workspace's
 		// branch (usually main) instead of the polecat's branch.
-		// (gt-checkpoint-workdir fix.)
+		// (gt-checkpoint-workdir fix.) Resolved before the alive check
+		// below so it can double as the abandoned-worktree age fallback.
 		workDir := resolveCheckpointWorkDir(polecatsDir, polecatName, rigName)
 		if workDir == "" {
 			continue // Neither layout has a usable .git — skip silently.
 		}
+
+		if !alive {
+			// Bound how long a dead session's worktree keeps getting
+			// auto-checkpointed. Prefer the session heartbeat, but a clean
+			// session teardown deletes exactly that file — killIdlePolecat
+			// and ReconcilePool both call RemoveSessionHeartbeat right
+			// after reaping a session — so a missing heartbeat means
+			// "reaped (or never had one)," not "just started." Treating a
+			// missing heartbeat as fresh inverted this bound: it fired for
+			// a session that crashed seconds ago and never fired for one
+			// cleanly reaped weeks ago — the actual "deliberately
+			// abandoned" case the threshold exists to catch (PR #184
+			// review). Fall back to the worktree's own activity signals
+			// (git index mtime, HEAD commit date — see
+			// checkpointDogWorktreeAge), which survive session reaping.
+			age, ageErr := checkpointDogWorktreeAge(workDir, d.config.TownRoot, sessionName)
+			if ageErr == nil && age > checkpointDogAbandonedThreshold {
+				d.logger.Printf("checkpoint_dog: session %s dead, last activity %s ago (> %s) — skipping as abandoned", sessionName, age.Round(time.Minute), checkpointDogAbandonedThreshold)
+				continue
+			}
+			d.logger.Printf("checkpoint_dog: session %s is dead — checkpointing anyway (highest-risk case)", sessionName)
+		}
+
 		if d.checkpointWorktree(workDir, rigName, polecatName) {
 			checkpointed++
 		}
@@ -134,80 +172,69 @@ func (d *Daemon) checkpointRigPolecats(rigName string) (int, int) {
 	return scanned, checkpointed
 }
 
-// checkpointWorktree creates a WIP checkpoint commit for a single worktree.
-// Returns true if a checkpoint was created.
+// checkpointWorktree creates a WIP checkpoint for a single worktree and
+// pushes it to a preservation ref. Returns true if anything was preserved
+// (a new commit, a push of prior unpushed commits, or both).
+//
+// Delegates to git.AutoPreserveUncommittedWork — the same implementation gt
+// done's gt-pvx safety net and polecat removal use — rather than reimplementing
+// staging/exclusion/commit logic a third time (gt-y8ts). This also fixes a
+// policy drift bug: the old hand-rolled exclusion list here
+// (.claude/.beads/.runtime/__pycache__) diverged from gt done's broader
+// runtime-artifact policy (also excludes .opencode, .logs, node_modules,
+// .vite, language caches, CLAUDE.local.md, .DS_Store, .db/.pyc/.pyo), so a
+// checkpoint could commit files gt done would have excluded.
+//
+// Unlike gt done, this pushes to a dedicated polecat/preserve-<branch> ref rather
+// than the branch itself: a checkpoint can fire while a PR is already open
+// on the branch, and force-pushing WIP commits onto it would disrupt review
+// and CI. Verified against the remote tip, since nothing else pushes on
+// this path before the worktree might be reassigned or removed.
 func (d *Daemon) checkpointWorktree(workDir, rigName, polecatName string) bool {
-	// Check git status (exclude runtime dirs from consideration)
-	statusOut, err := runGitCmd(workDir, "status", "--porcelain")
-	if err != nil {
-		d.logger.Printf("checkpoint_dog: git status failed in %s/%s: %v", rigName, polecatName, err)
-		return false
-	}
-	if strings.TrimSpace(statusOut) == "" {
-		return false // Clean worktree
-	}
-
-	// G41 protected-branch guard: refuse to checkpoint when the worktree is
-	// on main/master/develop. The original incident (rictus's gt-mwy.4
-	// auto-save) landed in-progress polecat work on origin/main because
-	// the safety net commits to whatever branch is checked out. With a
-	// polecat that's still on main (worktree-init residue, blocked
-	// `git checkout -b`, or any path that leaves main checked out), the
-	// checkpoint commit's destination is exactly the branch the rest of
-	// the workflow refuses to push to. Skipping leaves the work in the
-	// worktree for manual recovery — same shape as the gt done safety
-	// net's protected-branch guard.
-	branchOut, err := runGitCmd(workDir, "rev-parse", "--abbrev-ref", "HEAD")
-	if err != nil {
+	g := git.NewGit(workDir)
+	branch, err := g.CurrentBranch()
+	if err != nil || branch == "" {
 		d.logger.Printf("checkpoint_dog: cannot read HEAD in %s/%s: %v — skipping for safety", rigName, polecatName, err)
 		return false
 	}
-	if branch := strings.TrimSpace(branchOut); git.IsProtectedBranch(branch) {
-		d.logger.Printf("checkpoint_dog: REFUSING to checkpoint %s/%s on protected branch %q (G41 guard) — work remains uncommitted in worktree",
-			rigName, polecatName, branch)
+
+	result, err := git.AutoPreserveUncommittedWork(g, branch, git.PreserveOptions{
+		IssueID:       polecatName,
+		Push:          true,
+		CommitMessage: checkpoint.WIPCommitPrefix,
+	})
+	if err != nil {
+		// Covers the G41 protected-branch refusal, unmerged-conflict refusal,
+		// and any git-operation failure — all deliberately non-fatal here so
+		// one broken worktree never stops the patrol from checkpointing the
+		// rest. Work stays uncommitted in the worktree for manual recovery.
+		d.logger.Printf("checkpoint_dog: could not checkpoint %s/%s: %v", rigName, polecatName, err)
 		return false
 	}
 
-	// Stage everything
-	if _, err := runGitCmd(workDir, "add", "-A"); err != nil {
-		d.logger.Printf("checkpoint_dog: git add -A failed in %s/%s: %v", rigName, polecatName, err)
-		return false
+	if !result.Committed && !result.Pushed {
+		return false // clean worktree, nothing to preserve
 	}
-
-	// Unstage runtime/ephemeral directories
-	for _, dir := range runtimeExcludeDirs {
-		// git reset HEAD -- <dir> is safe even if dir doesn't exist (exits 0)
-		_, _ = runGitCmd(workDir, "reset", "HEAD", "--", dir)
+	if result.Committed {
+		d.logger.Printf("checkpoint_dog: created WIP checkpoint in %s/%s", rigName, polecatName)
 	}
-
-	// Unstage deletions of tracked files. A checkpoint should preserve work
-	// (additions + modifications), never commit deletions of tracked files.
-	// This prevents the bug where a polecat's working tree has a missing
-	// tracked file and the checkpoint commits the deletion (gt-pvx fix).
-	if delOut, err := runGitCmd(workDir, "diff", "--cached", "--name-only", "--diff-filter=D"); err == nil {
-		if dels := strings.TrimSpace(delOut); dels != "" {
-			for _, f := range strings.Split(dels, "\n") {
-				if f != "" {
-					_, _ = runGitCmd(workDir, "reset", "HEAD", "--", f)
-				}
-			}
-		}
+	if result.HooksFailed {
+		// The commit exists locally but was never verified — pushing it
+		// would defeat the hooks (gt-i4ej FIX 2). Escalate loudly so a
+		// human resolves the hook failure — but do not copy the hook's
+		// stderr into this log (HookOutput is now redacted at the source
+		// for the same reason, but this site keeps its own wording): the
+		// hook this gate exists for is typically a secret scanner, so its
+		// verbatim output can contain the very credential it caught.
+		// Writing that into the daemon's shared, rotated, gzip-archived
+		// log would relocate the secret to a longer-lived, more
+		// widely-read artifact than the uncommitted file it came from
+		// (PR #184 review). Point at the worktree instead.
+		d.logger.Printf("checkpoint_dog: ERROR — %s/%s checkpoint committed locally but its pre-commit hook FAILED, so it was NOT pushed. Run `git commit` in %s to see the hook output.", rigName, polecatName, workDir)
 	}
-
-	// Check if anything is staged after exclusions
-	diffOut, err := runGitCmd(workDir, "diff", "--cached", "--quiet")
-	if err == nil && strings.TrimSpace(diffOut) == "" {
-		// --quiet exits 0 if no diff → nothing staged
-		return false
+	if result.Pushed {
+		d.logger.Printf("checkpoint_dog: pushed %s/%s checkpoint to %s (%s)", rigName, polecatName, result.Ref, result.Commit)
 	}
-
-	// Commit the checkpoint
-	if _, err := runGitCmd(workDir, "commit", "-m", "WIP: checkpoint (auto)"); err != nil {
-		d.logger.Printf("checkpoint_dog: git commit failed in %s/%s: %v", rigName, polecatName, err)
-		return false
-	}
-
-	d.logger.Printf("checkpoint_dog: created WIP checkpoint in %s/%s", rigName, polecatName)
 	return true
 }
 
@@ -241,24 +268,38 @@ func resolveCheckpointWorkDir(polecatsDir, polecatName, rigName string) string {
 	return ""
 }
 
-// runGitCmd executes a git command in the given directory and returns stdout.
-func runGitCmd(workDir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = workDir
-	util.SetDetachedProcessGroup(cmd)
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	if err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
-		if errMsg != "" {
-			return "", fmt.Errorf("%s: %s", err, errMsg)
-		}
-		return "", err
+// checkpointDogWorktreeAge returns how long ago a dead-session worktree was
+// last active, for the checkpointDogAbandonedThreshold bound. Takes the most
+// recent of every available signal rather than the first one that resolves:
+//
+//   - the session heartbeat (deleted by a clean reap, so its absence means
+//     "reaped or never had one", not "fresh");
+//   - the git index mtime — a signal of THIS worktree's activity that
+//     survives reaping. HEAD's commit date alone is NOT such a signal: a
+//     polecat created from the current base-branch tip whose session died
+//     before its first commit inherits the base branch's last-commit date,
+//     so on any repo whose default branch hadn't moved in 24h every
+//     cleanly-reaped, not-yet-committed polecat — the population this dog
+//     exists for — was classified abandoned (PR #184 review);
+//   - HEAD's commit date, as the floor for repos where the index can't be
+//     statted.
+//
+// Erring fresh (preserving too often) is the safe direction; the caller
+// also treats an error here as "not abandoned" for the same reason.
+func checkpointDogWorktreeAge(workDir, townRoot, sessionName string) (time.Duration, error) {
+	var newest time.Time
+	if hb := polecat.ReadSessionHeartbeat(townRoot, sessionName); hb != nil && hb.Timestamp.After(newest) {
+		newest = hb.Timestamp
 	}
-
-	return strings.TrimSpace(stdout.String()), nil
+	g := git.NewGit(workDir)
+	if mt, err := g.IndexModTime(); err == nil && mt.After(newest) {
+		newest = mt
+	}
+	if ct, err := g.LastActivityTime(); err == nil && ct.After(newest) {
+		newest = ct
+	}
+	if newest.IsZero() {
+		return 0, fmt.Errorf("no activity signal available for %s", workDir)
+	}
+	return time.Since(newest), nil
 }

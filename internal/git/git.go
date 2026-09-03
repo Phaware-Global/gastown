@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -129,6 +130,15 @@ func (g *Git) run(args ...string) (string, error) {
 // killed. This prevents gt done from hanging indefinitely when the remote
 // (e.g. GitLab) is unreachable or slow.
 const pushTimeout = 60 * time.Second
+
+// remoteQueryTimeout bounds read-only network git calls (ls-remote) so an
+// unreachable or slow remote can never hang a caller indefinitely. Unlike
+// pushTimeout's mutating push, these are cheap reads used to check/verify
+// remote branch state, so a shorter deadline is safe. Unbounded ls-remote
+// calls on this path used to be able to hang the checkpoint_dog daemon
+// patrol forever, silently disabling preservation for every polecat
+// (gt-y8ts FIX 4).
+const remoteQueryTimeout = 30 * time.Second
 
 // runWithTimeout executes a git command with a deadline. If the command does
 // not finish within the timeout, the process is killed and an error is returned.
@@ -1013,6 +1023,19 @@ func (g *Git) Commit(message string) error {
 	return err
 }
 
+// CommitNoVerify creates a commit with the given message, bypassing commit
+// hooks. Polecat worktrees can carry a broken husky pre-commit hook
+// (.husky/_/husky.sh missing) that fails a plain `git commit` while a
+// following `git push` still reports success against the unchanged HEAD —
+// silently preserving nothing while claiming success (gt-y8ts). Automated
+// preservation paths (auto-save, checkpointing) must use this instead of
+// Commit so a broken hook can never turn a "successful" safety net into a
+// no-op.
+func (g *Git) CommitNoVerify(message string) error {
+	_, err := g.run("commit", "--no-verify", "-m", message)
+	return err
+}
+
 // CommitAll stages all changes and commits.
 func (g *Git) CommitAll(message string) error {
 	_, err := g.run("commit", "-am", message)
@@ -1029,16 +1052,67 @@ func (g *Git) ResetFiles(paths ...string) error {
 
 // StagedDeletions returns the list of tracked files staged for deletion.
 // Used by auto-save to unstage deletions — safety nets should preserve work, not destroy it.
+// NUL-delimited (-z) for the same reason as StagedFiles.
 func (g *Git) StagedDeletions() ([]string, error) {
-	out, err := g.run("diff", "--cached", "--name-only", "--diff-filter=D")
+	out, err := g.run("diff", "--cached", "--name-only", "-z", "--diff-filter=D")
 	if err != nil {
 		return nil, err
 	}
-	trimmed := strings.TrimSpace(out)
-	if trimmed == "" {
-		return nil, nil
+	return splitNulPaths(out), nil
+}
+
+// HasStagedChanges reports whether the index differs from HEAD. Used after a
+// staging pass that may legitimately stage nothing (e.g. `git add -u` when
+// the only uncommitted work is a new untracked file) so callers can skip
+// `git commit` instead of hitting its "nothing to commit" error.
+func (g *Git) HasStagedChanges() (bool, error) {
+	out, err := g.run("diff", "--cached", "--name-only")
+	if err != nil {
+		return false, err
 	}
-	return strings.Split(trimmed, "\n"), nil
+	return strings.TrimSpace(out) != "", nil
+}
+
+// StagedFiles returns all file paths currently staged (index differs from
+// HEAD). Used to re-verify the index after an unstage operation that may
+// have failed, rather than trusting a discarded error.
+//
+// NUL-delimited (-z): plain `--name-only` output C-quotes any non-ASCII
+// path (core.quotePath) and any path containing '"' or '\', so string
+// comparisons and pathspecs built from it silently miss those files — a
+// `café.env` credential sailed through the auto-preserve scrub while its
+// ASCII sibling was caught (PR #184 review).
+func (g *Git) StagedFiles() ([]string, error) {
+	out, err := g.run("diff", "--cached", "--name-only", "-z")
+	if err != nil {
+		return nil, err
+	}
+	return splitNulPaths(out), nil
+}
+
+// splitNulPaths splits `git ... -z` output into paths.
+func splitNulPaths(out string) []string {
+	out = strings.Trim(out, "\x00")
+	if out == "" {
+		return nil
+	}
+	return strings.Split(out, "\x00")
+}
+
+// FileTrackedAtHEAD reports whether path already exists as a tracked file
+// (blob) at HEAD. Used to tell a legitimate `git add -u` re-stage of a
+// tracked file apart from a stray "A" (added) index entry for a path that
+// was untracked before the caller started (e.g. a separate `git add
+// <newfile>` run earlier in the same worktree) — `add -u` never touches the
+// latter, so it survives into a commit unless explicitly checked for.
+// Requires the object to be a blob: `cat-file -e` alone also succeeds when
+// the path is a TREE at HEAD, which let a brand-new file at a
+// former-directory path pass as "tracked" (PR #184 review). Any error
+// (including "does not exist") is treated as not-tracked: the safe
+// direction for a caller deciding whether to exclude a path.
+func (g *Git) FileTrackedAtHEAD(path string) bool {
+	typ, err := g.run("cat-file", "-t", "HEAD:"+path)
+	return err == nil && typ == "blob"
 }
 
 // ShowFile returns the contents of a file at a given ref (e.g., "origin/main:CLAUDE.md").
@@ -2558,7 +2632,7 @@ type RemoteRef struct {
 // The prefix filters refs (e.g., "refs/heads/polecat/" for all polecat branches).
 // Returns full ref names like "refs/heads/polecat/furiosa-abc123".
 func (g *Git) ListRemoteRefsWithHashes(remote, prefix string) ([]RemoteRef, error) {
-	out, err := g.run("ls-remote", "--refs", remote, prefix+"*")
+	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--refs", remote, prefix+"*")
 	if err != nil {
 		return nil, err
 	}
@@ -2597,7 +2671,7 @@ func (g *Git) ListRemoteRefs(remote, prefix string) ([]string, error) {
 // includes tags so callers can distinguish a truly empty repo from a non-empty
 // repo with no branch refs or a broken remote HEAD.
 func (g *Git) RemoteHasRefs(remote string) (bool, error) {
-	out, err := g.run("ls-remote", "--refs", remote)
+	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--refs", remote)
 	if err != nil {
 		return false, err
 	}
@@ -2810,7 +2884,7 @@ func (g *Git) IsEmpty() (bool, error) {
 // NOTE: For named remotes with a separate pushurl, this checks the fetch URL.
 // Use PushRemoteBranchExists to verify branches that were pushed.
 func (g *Git) RemoteBranchExists(remote, branch string) (bool, error) {
-	out, err := g.run("ls-remote", "--heads", remote, branch)
+	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--heads", remote, branch)
 	if err != nil {
 		return false, err
 	}
@@ -2820,7 +2894,7 @@ func (g *Git) RemoteBranchExists(remote, branch string) (bool, error) {
 // RemoteBranchTip returns the SHA at refs/heads/<branch> on the remote.
 // An empty SHA with nil error means the branch is missing.
 func (g *Git) RemoteBranchTip(remote, branch string) (string, error) {
-	out, err := g.run("ls-remote", "--heads", remote, branch)
+	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--heads", remote, branch)
 	if err != nil {
 		return "", err
 	}
@@ -2838,7 +2912,7 @@ func (g *Git) PushRemoteBranchExists(remote, branch string) (bool, error) {
 	if fetchErr != nil || pushErr != nil || pushURL == fetchURL {
 		return g.RemoteBranchExists(remote, branch)
 	}
-	out, err := g.run("ls-remote", "--heads", pushURL, branch)
+	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--heads", pushURL, branch)
 	if err != nil {
 		return false, err
 	}
@@ -3246,6 +3320,40 @@ func (g *Git) BranchCreatedDate(branch string) (string, error) {
 		return "", err
 	}
 	return out, nil
+}
+
+// LastActivityTime returns the commit date of HEAD, as a filesystem-signal
+// fallback for callers that need "how long has this worktree been
+// inactive" but can't rely on a session heartbeat (e.g. one that a clean
+// session teardown already deleted). Survives worktree/session reaping
+// because it reads the commit graph, not runtime state (PR #184 review).
+func (g *Git) LastActivityTime() (time.Time, error) {
+	out, err := g.run("log", "-1", "--format=%ct", "HEAD")
+	if err != nil {
+		return time.Time{}, err
+	}
+	sec, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parsing commit timestamp %q: %w", out, err)
+	}
+	return time.Unix(sec, 0), nil
+}
+
+// IndexModTime returns the mtime of the repository's index file — a signal
+// of when git state in THIS worktree last changed, unlike HEAD's commit
+// date, which a fresh worktree inherits from whatever base commit it was
+// created at (PR #184 review). Resolves the real git dir so linked
+// worktrees (whose .git is a pointer file) work too.
+func (g *Git) IndexModTime() (time.Time, error) {
+	gitDir, err := g.run("rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return time.Time{}, err
+	}
+	fi, err := os.Stat(filepath.Join(gitDir, "index"))
+	if err != nil {
+		return time.Time{}, err
+	}
+	return fi.ModTime(), nil
 }
 
 // CommitsAhead returns the number of commits that branch has ahead of base.
