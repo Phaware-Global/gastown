@@ -356,20 +356,20 @@ type Config struct {
 func DefaultConfig(townRoot string) *Config {
 	daemonDir := filepath.Join(townRoot, "daemon")
 	config := &Config{
-		TownRoot:         townRoot,
-		Port:             DefaultPort,
-		User:             DefaultUser,
-		DataDir:          filepath.Join(townRoot, ".dolt-data"),
-		LogFile:          filepath.Join(daemonDir, "dolt.log"),
-		PidFile:          filepath.Join(daemonDir, "dolt.pid"),
-		MaxConnections:   DefaultMaxConnections,
-		ReadTimeoutMs:    DefaultReadTimeoutMs,
-		WriteTimeoutMs:   DefaultWriteTimeoutMs,
-		WaitTimeoutSec:   DefaultWaitTimeoutSec,
-		TimeZone:         DefaultTimeZone,
+		TownRoot:       townRoot,
+		Port:           DefaultPort,
+		User:           DefaultUser,
+		DataDir:        filepath.Join(townRoot, ".dolt-data"),
+		LogFile:        filepath.Join(daemonDir, "dolt.log"),
+		PidFile:        filepath.Join(daemonDir, "dolt.pid"),
+		MaxConnections: DefaultMaxConnections,
+		ReadTimeoutMs:  DefaultReadTimeoutMs,
+		WriteTimeoutMs: DefaultWriteTimeoutMs,
+		WaitTimeoutSec: DefaultWaitTimeoutSec,
+		TimeZone:       DefaultTimeZone,
 		// LogLevel kept at "error" (fork: quieter Dolt logs, part of the
 		// telemetry/CPU-drain reduction work) rather than upstream's "warning".
-		LogLevel:         "error",
+		LogLevel: "error",
 		// Upstream's stats/event-scheduler disable — complements the fork's
 		// telemetry/auto-gc disable (same CPU-drain reduction goal).
 		EventScheduler:   "OFF",
@@ -3934,6 +3934,78 @@ func FindOrCreateRigBeadsDir(townRoot, rigName string) (string, error) {
 	return rigBeads, nil
 }
 
+// CountServerConnectionSlots counts the connection slots the Dolt server process
+// holds open, measured from the operating system rather than from SQL.
+//
+// This is the quantity max_connections actually gates, and it is not the same as
+// information_schema.PROCESSLIST. PROCESSLIST reports live *sessions*; a
+// connection whose client died can leave the server holding the socket — and the
+// slot — in CLOSED or CLOSE_WAIT, where no session exists to be listed. On
+// 2026-08-29 a leak of exactly this kind wedged the town: the server held 1031
+// sockets (998 CLOSED, 28 CLOSE_WAIT, 5 ESTABLISHED) against max_connections=1000
+// while PROCESSLIST would have reported 5. At the cap the server still completes
+// the TCP handshake but never sends the MySQL greeting, so every client sees a
+// read i/o timeout (hq-09sb1).
+//
+// It is also the only connection measurement that survives that state: it asks
+// the kernel, not the server, so it answers when SQL no longer does.
+//
+// The LISTEN socket is excluded — it is not a client connection. Note that
+// lsof's -iTCP:<port> filter matches the local OR the foreign endpoint, so an
+// outbound connection the process makes to the same port number elsewhere
+// (e.g. a push to a remote sql-server on the standard port) is also counted.
+// That overcount is accepted deliberately: filtering to local-port-only would
+// risk dropping leaked slots whose address columns lsof no longer renders once
+// the socket is CLOSED — the very sockets this counter exists to see — and for
+// a capacity measurement, counting high is the safe direction.
+func CountServerConnectionSlots(pid, port int) (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// -a ANDs -p and -i; without it lsof ORs them and returns every process.
+	out, err := exec.CommandContext(ctx, "lsof", "-nP", "-a",
+		"-p", strconv.Itoa(pid),
+		"-iTCP:"+strconv.Itoa(port),
+	).Output()
+	if err != nil {
+		// lsof exits 1 when it matches nothing, which is a legitimate zero rather
+		// than a failure. Distinguish that from lsof being absent or erroring.
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 && len(out) == 0 {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("counting server sockets via lsof: %w", err)
+	}
+
+	count := 0
+	for i, line := range strings.Split(string(out), "\n") {
+		if i == 0 || strings.TrimSpace(line) == "" {
+			continue // header / trailing blank
+		}
+		if strings.Contains(line, "(LISTEN)") {
+			continue
+		}
+		count++
+	}
+	return count, nil
+}
+
+// countConnectionSlots returns the server's connection count and how it was
+// measured. It prefers the OS socket count (sees leaked slots, works on a wedged
+// server) and falls back to PROCESSLIST when that is unavailable — lsof missing,
+// or the server PID not resolvable.
+func countConnectionSlots(townRoot string, config *Config) (int, string, error) {
+	if running, pid, err := IsRunning(townRoot); err == nil && running && pid > 0 {
+		if n, err := CountServerConnectionSlots(pid, config.Port); err == nil {
+			return n, "sockets", nil
+		}
+	}
+	n, err := GetActiveConnectionCount(townRoot)
+	if err != nil {
+		return 0, "", err
+	}
+	return n, "processlist", nil
+}
+
 // GetActiveConnectionCount queries the Dolt server to get the number of active connections.
 // Uses `dolt sql` to query information_schema.PROCESSLIST, which avoids needing
 // a MySQL driver dependency. Returns 0 if the server is unreachable or the query fails.
@@ -3987,7 +4059,13 @@ func GetActiveConnectionCount(townRoot string) (int, error) {
 }
 
 // HasConnectionCapacity checks whether the Dolt server has capacity for new connections.
-// Returns true if the active connection count is below the threshold (80% of max_connections).
+// Returns true if the connection count is below the threshold (80% of max_connections).
+// The count comes from countConnectionSlots — the OS socket count when the server
+// pid is resolvable, falling back to PROCESSLIST — so this admission gate measures
+// the quantity max_connections actually enforces. PROCESSLIST alone is blind to
+// leaked slots: during the 2026-08-29 wedge it reported 5 sessions while the
+// server held 1031 sockets against max_connections=1000 (hq-09sb1), which would
+// have kept this gate open while the server admitted nothing.
 // Returns false with error if the connection count cannot be determined — fail closed
 // to prevent connection storms that cause read-only mode (gt-lfc0d).
 func HasConnectionCapacity(townRoot string) (bool, int, error) {
@@ -3997,7 +4075,7 @@ func HasConnectionCapacity(townRoot string) (bool, int, error) {
 		maxConn = 1000 // Dolt default
 	}
 
-	active, err := GetActiveConnectionCount(townRoot)
+	active, _, err := countConnectionSlots(townRoot, config)
 	if err != nil {
 		// Fail closed: if we can't check, the server may be overloaded
 		return false, 0, err
@@ -4050,8 +4128,46 @@ type HealthMetrics struct {
 	// Healthy indicates whether the server is within acceptable resource limits.
 	Healthy bool `json:"healthy"`
 
+	// ProbeFailed reports that the SELECT active_branch() connectivity probe did
+	// not return. When true, QueryLatency is meaningless — it stays at its zero
+	// value, which is indistinguishable from a fast reply — and the SQL-derived
+	// fields are absent. Check this before printing a latency figure, or a wedged
+	// server reads as a healthy one.
+	ProbeFailed bool `json:"probe_failed,omitempty"`
+
+	// ProbeError is the connectivity probe failure, set when ProbeFailed is true.
+	ProbeError string `json:"probe_error,omitempty"`
+
+	// ConnectionSource records how Connections was measured: "sockets" (counted
+	// from the OS, sees leaked slots) or "processlist" (SQL, live sessions only).
+	ConnectionSource string `json:"connection_source,omitempty"`
+
+	// ConnectionsUnknown reports that the connection count could not be measured
+	// at all: the socket count was unavailable and the PROCESSLIST fallback
+	// failed. When true, Connections and ConnectionPct hold zero values that
+	// mean "not measured", never "zero connections in use" — render them as
+	// unavailable, or a wedged server prints a healthy-looking 0.
+	ConnectionsUnknown bool `json:"connections_unknown,omitempty"`
+
+	// ConnectionError is the measurement failure, set when ConnectionsUnknown is true.
+	ConnectionError string `json:"connection_error,omitempty"`
+
 	// Warnings contains any degradation warnings (non-fatal).
 	Warnings []string `json:"warnings,omitempty"`
+}
+
+// sanitizeControlChars replaces control characters with '?'. Probe and
+// connection-count errors quote bytes sent by whatever process answered on the
+// Dolt port — a port imposters are known to squat (see KillImposters) — and a
+// raw CR or escape sequence in those bytes could rewrite earlier terminal
+// output, such as the PROBE FAILED alert line, when the error is printed.
+func sanitizeControlChars(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return '?'
+		}
+		return r
+	}, s)
 }
 
 // GetHealthMetrics collects resource monitoring metrics from the Dolt server.
@@ -4067,8 +4183,18 @@ func GetHealthMetrics(townRoot string) *HealthMetrics {
 	}
 
 	// 1. Query latency: time a SELECT active_branch()
+	// A probe failure is itself the most important health signal there is: the
+	// server is not answering queries. Swallowing the error left QueryLatency at
+	// zero and Healthy at true, so `gt dolt status` reported "healthy, 0s" through
+	// a total 36-minute outage while every client timed out (hq-09sb1, hq-7zx6z).
 	latency, err := MeasureQueryLatency(townRoot)
-	if err == nil {
+	if err != nil {
+		metrics.Healthy = false
+		metrics.ProbeFailed = true
+		metrics.ProbeError = sanitizeControlChars(err.Error())
+		metrics.Warnings = append(metrics.Warnings,
+			"connectivity probe failed — server is not answering queries: "+metrics.ProbeError)
+	} else {
 		metrics.QueryLatency = latency
 		if latency > 1*time.Second {
 			metrics.Warnings = append(metrics.Warnings,
@@ -4076,10 +4202,13 @@ func GetHealthMetrics(townRoot string) *HealthMetrics {
 		}
 	}
 
-	// 2. Connection count
-	connCount, err := GetActiveConnectionCount(townRoot)
+	// 2. Connection count. Prefer the OS socket count: it sees the leaked slots
+	// that PROCESSLIST cannot, and it still answers once the server is wedged.
+	// Fall back to PROCESSLIST when the socket count is unavailable.
+	connCount, connSource, err := countConnectionSlots(townRoot, config)
 	if err == nil {
 		metrics.Connections = connCount
+		metrics.ConnectionSource = connSource
 		metrics.ConnectionPct = float64(connCount) / float64(metrics.MaxConnections) * 100
 		if metrics.ConnectionPct >= 80 {
 			metrics.Healthy = false
@@ -4087,6 +4216,13 @@ func GetHealthMetrics(townRoot string) *HealthMetrics {
 				fmt.Sprintf("connection count %d is %.0f%% of max %d — approaching limit",
 					connCount, metrics.ConnectionPct, metrics.MaxConnections))
 		}
+	} else {
+		// A failed measurement must not masquerade as a healthy zero — the same
+		// zero-value lie ProbeFailed exists to prevent for latency (hq-09sb1).
+		metrics.ConnectionsUnknown = true
+		metrics.ConnectionError = sanitizeControlChars(err.Error())
+		metrics.Warnings = append(metrics.Warnings,
+			"connection count unavailable: "+metrics.ConnectionError)
 	}
 
 	// 3. Disk usage
@@ -4277,7 +4413,14 @@ func MeasureQueryLatency(townRoot string) (time.Duration, error) {
 	defer cancel()
 
 	start := time.Now()
-	var branch string
+	// active_branch() is NULL when the connection has no database selected, and
+	// this DSN deliberately selects none. Scan into a nullable: what this probe
+	// measures is the round-trip, not the value. Scanning into a plain string
+	// made the probe fail 100% of the time with "converting NULL to string is
+	// unsupported" — an error the caller then swallowed, which is why every
+	// health report showed "Query latency: 0s" whether the server was fast,
+	// slow, or wedged (hq-09sb1).
+	var branch sql.NullString
 	err = db.QueryRowContext(ctx, "SELECT active_branch()").Scan(&branch)
 	elapsed := time.Since(start)
 
