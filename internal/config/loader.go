@@ -1716,6 +1716,49 @@ func tryResolveFromEphemeralTier(role string) (*RuntimeConfig, bool) {
 	return nil, false
 }
 
+// hasResolvableRoleAgent reports whether the role has an explicit per-role agent
+// assignment that actually resolves to a usable agent.
+//
+// This is the resolving counterpart to the exported HasExplicitRoleAgent, which
+// checks only that a name is present. The two disagree precisely on the
+// unresolvable case — HasExplicitRoleAgent returns true for a name with no
+// definition, this returns false — so they are not interchangeable here: using
+// the name-only check would skip the role default and promote dogs to the town
+// default agent. Unlike
+// hasExplicitNonClaudeOverride it does not care which agent was named, only that
+// the operator named one — a role the operator has configured should not be
+// silently overridden by a built-in default.
+//
+// The name must resolve. An unresolvable name is not a usable preference: treating
+// it as one would skip the role default and let resolution fall through to the
+// town default agent, which is the most expensive model rather than the cheapest.
+// ApplyCostTier(TierStandard) produces exactly that shape — it persists
+// role_agents["dog"] = "claude-haiku" while deleting the matching agents entry —
+// as does any typo in the config. Requiring resolution keeps both cases on the
+// role default, and the caller's existing "falling back to default" warning stays
+// advisory.
+//
+// Deliberately narrower than hasExplicitNonClaudeOverride: it does not consult the
+// rig's global Agent or the town's DefaultAgent, since those are not statements
+// about this role and should not defeat a role-specific default.
+func hasResolvableRoleAgent(role string, townSettings *TownSettings, rigSettings *RigSettings) bool {
+	if rigSettings != nil && rigSettings.RoleAgents != nil {
+		if agentName, ok := rigSettings.RoleAgents[role]; ok && agentName != "" {
+			if lookupAgentConfigIfExists(agentName, townSettings, rigSettings) != nil {
+				return true
+			}
+		}
+	}
+	if townSettings != nil && townSettings.RoleAgents != nil {
+		if agentName, ok := townSettings.RoleAgents[role]; ok && agentName != "" {
+			if lookupAgentConfigIfExists(agentName, townSettings, rigSettings) != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // hasExplicitNonClaudeOverride checks if there is an explicit non-Claude agent
 // assignment either specifically for the role (in rig or town RoleAgents) or
 // globally (via rig Agent or town DefaultAgent). This prevents fallback logic
@@ -1775,14 +1818,19 @@ func resolveRoleAgentConfigCore(role, townRoot, rigPath string) *RuntimeConfig {
 		_ = LoadRigAgentRegistry(RigAgentRegistryPath(rigPath))
 	}
 
-	// Dogs default to Haiku (cheap infrastructure workers), but respect
-	// explicit non-Claude overrides (e.g., RoleAgents["dog"] = "opencode").
-	if role == "dog" {
-		if hasExplicitNonClaudeOverride(role, townSettings, rigSettings) {
-			// Fall through to normal resolution below
-		} else {
-			return claudeHaikuPreset()
-		}
+	// Dogs default to Haiku (cheap infrastructure workers), but only when the
+	// operator has expressed no preference. An explicit role_agents["dog"]
+	// assignment wins, whichever agent it names.
+	//
+	// This used to fall through only for a non-Claude agent, which made the
+	// default unopt-outable within the Claude family: role_agents["dog"] =
+	// "claude-sonnet" was accepted by config, reported by `gt config`, and then
+	// silently discarded here, so dogs ran Haiku regardless. Setting the role to
+	// "opencode" worked; setting it to another Claude model did nothing.
+	if role == "dog" &&
+		!hasResolvableRoleAgent(role, townSettings, rigSettings) &&
+		!hasExplicitNonClaudeOverride(role, townSettings, rigSettings) {
+		return claudeHaikuPreset()
 	}
 
 	// Check ephemeral cost tier (GT_COST_TIER env var)
