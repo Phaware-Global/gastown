@@ -289,12 +289,24 @@ func maintainBackupSync(dataDir, dbName, backupName string) error {
 
 // maintainOpenDB opens a connection to the Dolt server for a database.
 func maintainOpenDB(config *doltserver.Config, dbName string) (*sql.DB, error) {
+	return maintainOpenDBWithReadTimeout(config, dbName, "30s")
+}
+
+// maintainOpenDBWithReadTimeout opens a maintenance connection whose driver-level
+// read deadline is readTimeout.
+//
+// The driver's readTimeout is a deadline on a single socket read, not on the
+// statement, so it must exceed the longest a statement can legitimately go
+// without sending bytes back — otherwise the driver abandons the connection and
+// reports "invalid connection" while the server is still working, and the
+// caller's own context timeout never gets a chance to apply.
+func maintainOpenDBWithReadTimeout(config *doltserver.Config, dbName, readTimeout string) (*sql.DB, error) {
 	// wa-d6f: socket-first DSN (TCP fallback) to avoid TIME_WAIT churn from
 	// short-lived gt maintain invocations.
 	dsn := buildDoltDSNFromConfig(config, dbName, dsnOpts{
 		ParseTime:    true,
 		Timeout:      "5s",
-		ReadTimeout:  "30s",
+		ReadTimeout:  readTimeout,
 		WriteTimeout: "30s",
 	})
 	return sql.Open("mysql", dsn)
@@ -371,7 +383,13 @@ func maintainFlattenDB(config *doltserver.Config, dbName string) error {
 // maintainGCDatabase runs dolt gc via SQL on the running server.
 // Safe on a running server — no downtime needed (Tim Sehn, 2026-02-28).
 func maintainGCDatabase(config *doltserver.Config, dbName string) error {
-	db, err := maintainOpenDB(config, dbName)
+	// CALL dolt_gc() sends nothing until it finishes, so the driver read deadline
+	// must cover the whole collection, not the 30s the other maintenance queries
+	// use. At 30s the four largest databases failed identically on every run with
+	// "dolt_gc: invalid connection" after exactly 30s — never collected, so their
+	// garbage kept growing and each attempt was slower than the last. hq reached
+	// 3.2GB, 75% of all Dolt data on disk, having seemingly never been collected.
+	db, err := maintainOpenDBWithReadTimeout(config, dbName, maintainGCTimeout.String())
 	if err != nil {
 		return err
 	}

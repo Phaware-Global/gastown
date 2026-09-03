@@ -5934,3 +5934,95 @@ func TestBuildStartupCommandWithAgentOverrideSetsGTAgentForOpenCode(t *testing.T
 		t.Errorf("opencode should not get Claude --settings, got: %q", cmd)
 	}
 }
+
+// TestResolveRoleAgentConfig_DogHonorsExplicitClaudeModel is the regression test
+// for a default that could not be opted out of within the Claude family: dogs
+// hard-returned the Haiku preset unless the configured agent was non-Claude, so
+// role_agents["dog"] = "claude-sonnet" was accepted by config and then silently
+// discarded, and dogs ran Haiku regardless.
+func TestResolveRoleAgentConfig_DogHonorsExplicitClaudeModel(t *testing.T) {
+	// An ambient cost tier maps dog to haiku/groq and would win before the
+	// persisted-config path this test exercises is ever reached.
+	t.Setenv("GT_COST_TIER", "")
+	townRoot := t.TempDir()
+	writeTownSettingsForTest(t, townRoot, `{
+  "type": "town-settings",
+  "version": 1,
+  "default_agent": "claude",
+  "agents": {
+    "claude-sonnet": {"command": "claude", "args": ["--model", "sonnet"]}
+  },
+  "role_agents": {"dog": "claude-sonnet"}
+}`)
+
+	rc := ResolveRoleAgentConfig("dog", townRoot, "")
+	if rc == nil {
+		t.Fatal("ResolveRoleAgentConfig returned nil")
+	}
+	if got := strings.Join(rc.Args, " "); !strings.Contains(got, "sonnet") {
+		t.Errorf("dog args = %q, want the configured sonnet model", got)
+	}
+	if strings.Contains(strings.Join(rc.Args, " "), "haiku") {
+		t.Errorf("dog args = %q, want the explicit role_agents assignment to win over the Haiku default", rc.Args)
+	}
+}
+
+// TestResolveRoleAgentConfig_DogDefaultsToHaiku verifies the cheap default still
+// applies when the operator has expressed no preference for the dog role.
+func TestResolveRoleAgentConfig_DogDefaultsToHaiku(t *testing.T) {
+	// An ambient cost tier maps dog to haiku/groq and would win before the
+	// persisted-config path this test exercises is ever reached.
+	t.Setenv("GT_COST_TIER", "")
+	townRoot := t.TempDir()
+	writeTownSettingsForTest(t, townRoot, `{
+  "type": "town-settings",
+  "version": 1,
+  "default_agent": "claude",
+  "role_agents": {"witness": "claude-sonnet"}
+}`)
+
+	rc := ResolveRoleAgentConfig("dog", townRoot, "")
+	if rc == nil {
+		t.Fatal("ResolveRoleAgentConfig returned nil")
+	}
+	if got := strings.Join(rc.Args, " "); !strings.Contains(got, "haiku") {
+		t.Errorf("dog args = %q, want the Haiku default when no dog role agent is set", got)
+	}
+}
+
+func writeTownSettingsForTest(t *testing.T, townRoot, body string) {
+	t.Helper()
+	path := TownSettingsPath(townRoot)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestResolveRoleAgentConfig_DogUnresolvableNameKeepsHaiku covers the shape
+// ApplyCostTier(TierStandard) persists: role_agents["dog"] names an agent whose
+// definition has been deleted. An unresolvable name is not a usable preference,
+// so the cheap role default must stand — treating it as one would fall through to
+// the town default agent and silently promote every dog to the most expensive
+// model. Any typo in role_agents["dog"] has the same shape.
+func TestResolveRoleAgentConfig_DogUnresolvableNameKeepsHaiku(t *testing.T) {
+	t.Setenv("GT_COST_TIER", "")
+	townRoot := t.TempDir()
+	writeTownSettingsForTest(t, townRoot, `{
+  "type": "town-settings",
+  "version": 1,
+  "default_agent": "claude",
+  "role_agents": {"dog": "claude-haiku"}
+}`)
+
+	rc := ResolveRoleAgentConfig("dog", townRoot, "")
+	if rc == nil {
+		t.Fatal("ResolveRoleAgentConfig returned nil")
+	}
+	got := strings.Join(rc.Args, " ")
+	if !strings.Contains(got, "haiku") {
+		t.Errorf("dog args = %q, want the haiku default when role_agents names an undefined agent", got)
+	}
+}
