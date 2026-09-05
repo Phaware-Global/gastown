@@ -1081,7 +1081,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	// This ensures polecat sees the molecule when gt prime runs on session start.
 	freshlySpawned := newPolecatInfo != nil
 	if freshlySpawned {
-		pane, err := newPolecatInfo.StartSession()
+		pane, err := startPolecatSessionFn(newPolecatInfo)
 		if err != nil {
 			// Rollback: session failed, clean up zombie artifacts (worktree, hooked bead).
 			// Without rollback, next sling attempt fails with "bead already hooked" (gt-jn40ft).

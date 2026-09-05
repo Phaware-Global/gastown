@@ -308,7 +308,7 @@ func runSlingFormula(ctx context.Context, args []string) error {
 	// Start spawned polecat session now that hook is set.
 	// This ensures polecat sees the wisp when gt prime runs on session start.
 	if resolved.NewPolecatInfo != nil {
-		pane, err := resolved.NewPolecatInfo.StartSession()
+		pane, err := startPolecatSessionFn(resolved.NewPolecatInfo)
 		if err != nil {
 			// Rollback: unhook wisp, delete Dolt branch, clean up polecat worktree/agent bead
 			rollbackSlingArtifactsFn(resolved.NewPolecatInfo, wispRootID, "", "")

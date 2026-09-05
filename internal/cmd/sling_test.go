@@ -825,6 +825,139 @@ exit /b 0
 	}
 }
 
+// TestSlingCreateRollsBackWhenSessionFailsToStart reproduces the exact shape of
+// gt-azm0: "gt sling <bead> <rig> --create" must FAIL (and unhook/roll back the
+// spawned polecat) rather than print success when the tmux session never starts.
+// Before this test, StartSession() was called directly as a method with no seam,
+// so nothing could exercise this branch — the rollback code existed but was
+// unverified. Routes through startPolecatSessionFn to force the failure.
+func TestSlingCreateRollsBackWhenSessionFailsToStart(t *testing.T) {
+	townRoot := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor", "rig"), 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"version":1}`), 0644); err != nil {
+		t.Fatalf("write town marker: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "gastown", "mayor", "rig"), 0755); err != nil {
+		t.Fatalf("mkdir gastown mayor rig: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", "routes.jsonl"), []byte(`{"prefix":"gt-","path":"."}`+"\n"), 0644); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+	rigs := &config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{
+		"gastown": {GitURL: "git@github.com:test/gastown.git", AddedAt: time.Now().Truncate(time.Second), BeadsConfig: &config.BeadsConfig{Repo: "local", Prefix: "gt-"}},
+	}}
+	if err := config.SaveRigsConfig(filepath.Join(townRoot, "mayor", "rigs.json"), rigs); err != nil {
+		t.Fatalf("SaveRigsConfig: %v", err)
+	}
+
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir binDir: %v", err)
+	}
+	bdScript := `#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in
+    show) echo '[{"title":"Test issue","status":"open","assignee":"","description":""}]'; exit 0 ;;
+    update) exit 0 ;;
+  esac
+done
+exit 0
+`
+	bdScriptWindows := `@echo off
+for %%a in (%*) do (
+  if "%%a"=="show" (echo [{"title":"Test issue","status":"open","assignee":"","description":""}]& exit /b 0)
+  if "%%a"=="update" exit /b 0
+)
+exit /b 0
+`
+	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(EnvGTRole, "mayor")
+	t.Setenv("GT_POLECAT", "")
+	t.Setenv("GT_CREW", "")
+	t.Setenv("TMUX_PANE", "")
+	t.Setenv("GT_TEST_NO_NUDGE", "1")
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(filepath.Join(townRoot, "mayor", "rig")); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	prevNoConvoy := slingNoConvoy
+	prevNoBoot := slingNoBoot
+	prevHookRaw := slingHookRawBead
+	prevCreate := slingCreate
+	prevSpawn := spawnPolecatForSling
+	prevHook := hookBeadWithRetryFn
+	prevStartSession := startPolecatSessionFn
+	prevRollback := rollbackSlingArtifactsFn
+	t.Cleanup(func() {
+		slingNoConvoy = prevNoConvoy
+		slingNoBoot = prevNoBoot
+		slingHookRawBead = prevHookRaw
+		slingCreate = prevCreate
+		spawnPolecatForSling = prevSpawn
+		hookBeadWithRetryFn = prevHook
+		startPolecatSessionFn = prevStartSession
+		rollbackSlingArtifactsFn = prevRollback
+	})
+	slingNoConvoy = true
+	slingNoBoot = true
+	slingHookRawBead = true
+	slingCreate = true
+
+	spawnedInfo := &SpawnedPolecatInfo{RigName: "gastown", PolecatName: "Toast", ClonePath: filepath.Join(townRoot, "fake-polecat")}
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		if !opts.Create {
+			t.Fatalf("expected Create=true (from --create) to reach spawn")
+		}
+		return spawnedInfo, nil
+	}
+	hookBeadWithRetryFn = func(beadID, targetAgent, hookDir string) error {
+		return nil
+	}
+	startPolecatSessionFn = func(s *SpawnedPolecatInfo) (string, error) {
+		if s != spawnedInfo {
+			t.Fatalf("unexpected spawn info passed to StartSession: %+v", s)
+		}
+		// This is the exact failure mode gt-azm0 reports: the tmux session
+		// never actually starts (e.g. the session died during startup).
+		return "", errors.New("simulated: session died during startup")
+	}
+
+	rollbackCalled := false
+	rollbackSlingArtifactsFn = func(spawnInfo *SpawnedPolecatInfo, beadID, hookWorkDir, convoyID string) {
+		rollbackCalled = true
+		if spawnInfo != spawnedInfo {
+			t.Fatalf("unexpected spawnInfo in rollback: %+v", spawnInfo)
+		}
+		if beadID != "gt-abc123" {
+			t.Fatalf("unexpected beadID in rollback: %q", beadID)
+		}
+	}
+
+	err = runSling(nil, []string{"gt-abc123", "gastown"})
+	if err == nil {
+		t.Fatalf("expected runSling to fail when the session never starts, not report success")
+	}
+	if !strings.Contains(err.Error(), "starting polecat session") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !rollbackCalled {
+		t.Fatalf("expected rollbackSlingArtifacts to be called so the bead is not left falsely hooked to a phantom polecat")
+	}
+}
+
 func TestSlingRejectsBeadMissingFromTargetRigBeforeSpawn(t *testing.T) {
 	townRoot := t.TempDir()
 
