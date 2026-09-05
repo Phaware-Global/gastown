@@ -377,7 +377,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	}
 
 	// 11. Start polecat session
-	pane, err := spawnInfo.StartSession()
+	pane, err := startPolecatSessionFn(spawnInfo)
 	if err != nil {
 		fmt.Printf("  %s Could not start session: %v, cleaning up partial state...\n", style.Dim.Render("✗"), err)
 		rollbackSlingArtifactsFn(spawnInfo, beadToHook, hookWorkDir, convoyID)
