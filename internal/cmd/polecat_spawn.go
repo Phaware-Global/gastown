@@ -363,6 +363,14 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	}, nil
 }
 
+// startPolecatSessionFn is a seam for tests (gt-azm0): sling.go, sling_dispatch.go,
+// and sling_formula.go all call through this instead of newPolecatInfo.StartSession()
+// directly, so tests can force a session-start failure and verify the caller rolls
+// back rather than reporting spawn success while no session ever runs.
+var startPolecatSessionFn = func(s *SpawnedPolecatInfo) (string, error) {
+	return s.StartSession()
+}
+
 // StartSession starts the tmux session for a spawned polecat.
 // This is called after the molecule/bead is attached, so the polecat
 // sees its work when gt prime runs on session start.
