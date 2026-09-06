@@ -1473,7 +1473,23 @@ func parseGitHubOwnerRepo(remoteURL string) (owner, repoName string, err error) 
 			}
 		}
 	}
-	return "", "", fmt.Errorf("could not parse owner/repo from url %q", remoteURL)
+	return "", "", fmt.Errorf("could not parse owner/repo from url %q", redactGitURL(remoteURL))
+}
+
+// redactGitURL masks any embedded credential (e.g. https://TOKEN@github.com/...)
+// before a remote URL is put in an error message or log line. A rig's
+// git_url can legitimately carry a token; error text must not leak it.
+func redactGitURL(remoteURL string) string {
+	schemeIdx := strings.Index(remoteURL, "://")
+	if schemeIdx < 0 {
+		return remoteURL // not a scheme://... URL (e.g. git@host:path) — no userinfo component to redact
+	}
+	atIdx := strings.Index(remoteURL[schemeIdx+3:], "@")
+	if atIdx < 0 {
+		return remoteURL
+	}
+	atIdx += schemeIdx + 3
+	return remoteURL[:schemeIdx+3] + "***" + remoteURL[atIdx:]
 }
 
 // verifyBranchAlreadyMerged checks whether the polecat's current branch work has

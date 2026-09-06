@@ -1514,6 +1514,30 @@ func TestParseGitHubOwnerRepo(t *testing.T) {
 	}
 }
 
+func TestRedactGitURL(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		url  string
+		want string
+	}{
+		{"token in https url", "https://ghp_abc123token@github.com/owner/repo.git", "https://***@github.com/owner/repo.git"},
+		{"plain https url", "https://github.com/owner/repo.git", "https://github.com/owner/repo.git"},
+		{"ssh form, no userinfo to redact", "git@github.com:owner/repo.git", "git@github.com:owner/repo.git"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := redactGitURL(tt.url)
+			if got != tt.want {
+				t.Errorf("redactGitURL(%q) = %q, want %q", tt.url, got, tt.want)
+			}
+			if strings.Contains(got, "abc123token") {
+				t.Errorf("redactGitURL(%q) leaked the credential: %q", tt.url, got)
+			}
+		})
+	}
+}
+
 func TestBeadRecoveredField_DefaultFalse(t *testing.T) {
 	t.Parallel()
 	// BeadRecovered should default to false (zero value)
