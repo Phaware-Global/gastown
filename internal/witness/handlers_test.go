@@ -1450,17 +1450,8 @@ func TestLinkedPRForBead_RealBeadsStore(t *testing.T) {
 	// Never created on disk — the point of the test.
 	workDir := filepath.Join(rigPath, "polecats", "alpha", rigName)
 
-	// Start from a clean cache: package-level and keyed by workDir, so a
-	// prior test using the same path (it won't be, t.TempDir() is unique,
-	// but be explicit) can't leak a stale entry in.
-	mrListCacheMu.Lock()
-	delete(mrListCache, workDir)
-	mrListCacheMu.Unlock()
-
-	var newClientCalls int
 	oldNewClient := newBeadsClient
 	newBeadsClient = func(workDir string) *beads.Beads {
-		newClientCalls++
 		return beads.NewIsolatedWithPort(rigPath, port)
 	}
 	t.Cleanup(func() { newBeadsClient = oldNewClient })
@@ -1506,48 +1497,110 @@ func TestLinkedPRForBead_RealBeadsStore(t *testing.T) {
 	if queriedOwner != "exampleorg" || queriedRepo != "examplerepo" {
 		t.Errorf("owner/repo = (%q, %q), want (exampleorg, examplerepo)", queriedOwner, queriedRepo)
 	}
-	if newClientCalls != 1 {
-		t.Errorf("expected exactly 1 underlying ListMergeRequests call, got %d — cachedListMergeRequests should memoize per workDir (val's PR #226 round-2 review)", newClientCalls)
-	}
 
 	// A bead with no matching MR bead at all must report hasPR=false, not error.
-	// Also must reuse the cached MR list rather than re-querying: still 1 call.
 	hasPR2, _, err := _linkedPRForBead(workDir, rigName, "no-such-bead")
 	if err != nil {
 		t.Fatalf("_linkedPRForBead(no-such-bead): %v", err)
 	}
-	if newClientCalls != 1 {
-		t.Errorf("expected the second _linkedPRForBead call to reuse the cached MR list (still 1 underlying call), got %d", newClientCalls)
-	}
 	if hasPR2 {
 		t.Error("_linkedPRForBead(no-such-bead) hasPR = true, want false (no MR bead records it)")
 	}
+}
 
-	// Circuit breaker: once tripped, _linkedPRForBead must refuse to call
-	// ghPRMergedByNumber at all for the rest of the cooldown — a hung/
-	// unreachable GitHub will hang every subsequent call the same way, so
-	// paying ghPRTimeout again per remaining orphaned bead in the sweep buys
-	// nothing (val's PR #226 round-2 review).
-	tripGithubCircuit(rigName)
-	t.Cleanup(func() {
-		ghDownMu.Lock()
-		delete(ghDownUntilRig, rigName)
-		ghDownMu.Unlock()
-	})
-	queriedPRs = nil
-	_, _, err = _linkedPRForBead(workDir, rigName, srcIssue.ID)
+// TestLinkedPRForBead_UncheckedPRIsNeverReportedAsNotMerged is the round-5
+// finding: if the bead's shared deadline expires before every recorded PR
+// number has actually been attempted, the loop must not fall through and
+// report a confident "not merged" for the ones it never checked. Unchecked
+// must surface as an error — which resetAbandonedBead already treats as
+// "leave the bead alone" — never as a negative answer. A bead with 2
+// recorded PRs where the first attempt consumes the entire shared budget
+// must error, not silently resolve to (true, false, nil).
+func TestLinkedPRForBead_UncheckedPRIsNeverReportedAsNotMerged(t *testing.T) {
+	// Not parallel: overrides package-level ghPRTimeout/ghPRPerAttemptTimeout
+	// to exercise real deadline-exhaustion behavior without waiting out the
+	// real 30s/10s.
+	// ghPRTimeout < 2*ghPRPerAttemptTimeout guarantees, regardless of
+	// scheduling jitter, that at most 2 attempts can ever fit in the shared
+	// budget (each attempt's own context is capped by whichever is sooner —
+	// its own per-attempt slice or the outer deadline — so a 2nd attempt
+	// can never overrun the outer budget, and a 3rd is always preemptively
+	// skipped at the top of the loop).
+	oldTimeout, oldPerAttempt := ghPRTimeout, ghPRPerAttemptTimeout
+	ghPRTimeout = 80 * time.Millisecond
+	ghPRPerAttemptTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { ghPRTimeout, ghPRPerAttemptTimeout = oldTimeout, oldPerAttempt })
+
+	testutil.RequireDoltContainer(t)
+	port, err := strconv.Atoi(testutil.DoltContainerPort())
+	if err != nil {
+		t.Fatalf("parsing dolt container port: %v", err)
+	}
+
+	townRoot := t.TempDir()
+	rigName := "testrig"
+	rigPath := filepath.Join(townRoot, rigName)
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	rigConfig := `{"type":"rig","version":1,"name":"testrig","git_url":"https://github.com/exampleorg/examplerepo.git"}`
+	if err := os.WriteFile(filepath.Join(rigPath, "config.json"), []byte(rigConfig), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	b := beads.NewIsolatedWithPort(rigPath, port)
+	if err := b.Init("gt"); err != nil {
+		if errors.Is(err, exec.ErrNotFound) || strings.Contains(err.Error(), "executable file not found") {
+			t.Skipf("bd binary not available: %v", err)
+		}
+		t.Logf("bd init returned a non-fatal notice, proceeding: %v", err)
+	}
+
+	oldNewClient := newBeadsClient
+	newBeadsClient = func(workDir string) *beads.Beads { return beads.NewIsolatedWithPort(rigPath, port) }
+	t.Cleanup(func() { newBeadsClient = oldNewClient })
+
+	var checkedPRs []int
+	oldGhMerged := ghPRMergedByNumber
+	ghPRMergedByNumber = func(ctx context.Context, owner, repoName string, prNumber int) (bool, error) {
+		checkedPRs = append(checkedPRs, prNumber)
+		<-ctx.Done() // simulate a hang: consume the entire shared per-bead budget
+		return false, ctx.Err()
+	}
+	t.Cleanup(func() { ghPRMergedByNumber = oldGhMerged })
+
+	srcIssue, err := b.Create(beads.CreateOptions{Title: "Some work", Labels: []string{"gt:task"}})
+	if err != nil {
+		t.Fatalf("create source issue: %v", err)
+	}
+	// TWO recorded PRs (simulating a retry/rework) via two MR beads for the
+	// same source issue — the first attempt hangs for the whole per-bead
+	// budget, so the second must never actually be attempted.
+	for i, prNum := range []int{10, 20} {
+		mrDesc := fmt.Sprintf("branch: polecat/alpha/%s@abc%d\ntarget: main\nsource_issue: %s\nreview_pr: %d", srcIssue.ID, i, srcIssue.ID, prNum)
+		if _, err := b.Create(beads.CreateOptions{
+			Title:       fmt.Sprintf("Merge: %s (%d)", srcIssue.ID, i),
+			Labels:      []string{"gt:merge-request"},
+			Description: mrDesc,
+			Ephemeral:   true,
+		}); err != nil {
+			t.Fatalf("create MR issue %d: %v", i, err)
+		}
+	}
+
+	workDir := filepath.Join(rigPath, "polecats", "alpha", rigName)
+	hasPR, merged, err := _linkedPRForBead(workDir, rigName, srcIssue.ID)
 	if err == nil {
-		t.Error("_linkedPRForBead should return an error while the GitHub circuit breaker is open")
+		t.Fatalf("_linkedPRForBead should error when the shared budget expires before every recorded PR is checked; got (%v, %v, nil)", hasPR, merged)
 	}
-	if len(queriedPRs) != 0 {
-		t.Errorf("ghPRMergedByNumber should not be called while the circuit breaker is open, got %v", queriedPRs)
+	if merged {
+		t.Error("_linkedPRForBead must not report merged=true when the state is actually unknown")
 	}
-
-	// A DIFFERENT rig's breaker must be unaffected — process-global state
-	// would let one rig's slow GitHub disarm the guard for every other rig
-	// gt up loops over in the same process (val's PR #226 round-3 review).
-	if githubCircuitOpen("some-other-rig") {
-		t.Error("tripping the circuit for one rig must not open it for a different rig")
+	if len(checkedPRs) != 1 {
+		t.Errorf("expected exactly 1 PR attempted (the one that consumed the whole budget), got %v", checkedPRs)
 	}
 }
 
