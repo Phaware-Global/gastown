@@ -158,6 +158,101 @@ func TestEnsurePolecatWorkBranch_RejectsBadBeadID(t *testing.T) {
 	}
 }
 
+// TestEnsurePolecatWorkBranch_ResumesRecordedReviewBranch is the gt-i48h
+// regression: a review-fix dispatch (`gt sling --review-branch`) records the
+// PR branch on the dispatch bead, and a *fresh* worktree that has never seen
+// that branch must resume it at its actual head — not derive
+// polecat/<name>-<beadID> and build a new branch off mainline, which silently
+// abandons the PR under review. Acceptance bar from the bead: "dispatch a
+// review-fix against an MR whose branch already has commits, and assert the
+// resulting worktree is on THAT branch at ITS head."
+func TestEnsurePolecatWorkBranch_ResumesRecordedReviewBranch(t *testing.T) {
+	root := t.TempDir()
+	origin := filepath.Join(root, "origin.git")
+	seed := filepath.Join(root, "seed")
+	gitRun(t, root, "init", "--bare", "-b", "main", origin)
+	gitRun(t, root, "init", "-b", "main", seed)
+	gitRun(t, seed, "config", "user.email", "test@example.com")
+	gitRun(t, seed, "config", "user.name", "Test")
+	gitRun(t, seed, "commit", "--allow-empty", "-m", "init")
+	gitRun(t, seed, "remote", "add", "origin", origin)
+	gitRun(t, seed, "push", "origin", "main")
+
+	// Simulate the PR branch already carrying review-fix commits from a prior
+	// round, pushed by a different (now-gone) polecat worktree.
+	reviewBranch := "polecat/guzzle/hm-o8aq@mtp0wfsu"
+	gitRun(t, seed, "checkout", "-b", reviewBranch)
+	gitRun(t, seed, "commit", "--allow-empty", "-m", "round 1 fix")
+	wantHead := exec.Command("git", "rev-parse", "HEAD")
+	wantHead.Dir = seed
+	headOut, err := wantHead.Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	wantSHA := string(headOut)
+	gitRun(t, seed, "push", "origin", reviewBranch)
+
+	// A brand-new worktree cloned fresh — this branch has never existed here,
+	// which is exactly the "idle polecat worktree parked on stale mainline"
+	// shape gt-i48h reproduced from.
+	clone := filepath.Join(root, "clone")
+	gitRun(t, root, "clone", origin, clone)
+	gitRun(t, clone, "config", "user.email", "test@example.com")
+	gitRun(t, clone, "config", "user.name", "Test")
+	if got := currentBranch(t, clone); got != "main" {
+		t.Fatalf("precondition: expected fresh clone on main, got %q", got)
+	}
+
+	prev := recordedReviewBranchFn
+	recordedReviewBranchFn = func(beadID string) (string, error) { return reviewBranch, nil }
+	defer func() { recordedReviewBranchFn = prev }()
+
+	res, err := ensurePolecatWorkBranch(clone, "guzzle", "hm-o8aq")
+	if err != nil {
+		t.Fatalf("ensurePolecatWorkBranch: %v", err)
+	}
+	if res.Action != polecatBranchResumed {
+		t.Errorf("Action = %q; want %q", res.Action, polecatBranchResumed)
+	}
+	if res.Target != reviewBranch {
+		t.Errorf("Target = %q; want %q", res.Target, reviewBranch)
+	}
+	if got := currentBranch(t, clone); got != reviewBranch {
+		t.Fatalf("worktree left on %q; want %q (the recorded review branch, not polecat/guzzle-hm-o8aq)",
+			got, reviewBranch)
+	}
+	gotHead := exec.Command("git", "rev-parse", "HEAD")
+	gotHead.Dir = clone
+	gotOut, err := gotHead.Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD in clone: %v", err)
+	}
+	if string(gotOut) != wantSHA {
+		t.Errorf("worktree HEAD = %s; want %s (the review branch's actual head)", gotOut, wantSHA)
+	}
+}
+
+// TestEnsurePolecatWorkBranch_ReviewBranchFetchFailureFailsLoud: when the
+// recorded review branch cannot be reached, the resume must fail loudly
+// rather than silently falling back to a fresh branch off mainline — a
+// silent fallback here is exactly the hmetet-z6zz failure mode gt-i48h's FIX
+// section calls out.
+func TestEnsurePolecatWorkBranch_ReviewBranchFetchFailureFailsLoud(t *testing.T) {
+	clone := newOriginAndClone(t)
+
+	prev := recordedReviewBranchFn
+	recordedReviewBranchFn = func(beadID string) (string, error) { return "polecat/nonexistent/branch", nil }
+	defer func() { recordedReviewBranchFn = prev }()
+
+	if _, err := ensurePolecatWorkBranch(clone, "nux", "gt-tk5"); err == nil {
+		t.Fatal("expected a loud failure when the recorded review branch doesn't exist on origin, got nil")
+	}
+	// Must not have silently created a fresh branch off main instead.
+	if got := currentBranch(t, clone); got != "main" {
+		t.Errorf("worktree moved to %q despite the fetch failure; want to stay on main untouched", got)
+	}
+}
+
 // TestEnsurePolecatOffMain_NonPolecatNoop: the guard only applies to polecats.
 // A witness/refinery on main must pass through untouched.
 func TestEnsurePolecatOffMain_NonPolecatNoop(t *testing.T) {
