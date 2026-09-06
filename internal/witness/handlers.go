@@ -2,6 +2,7 @@ package witness
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1312,10 +1313,19 @@ func _verifyCommitOnMain(workDir, rigName, polecatName string) (bool, error) {
 // idle polecat worktree sits DETACHED at whatever mainline commit was
 // current when the polecat went idle, so IsAncestor(HEAD, main) is true for
 // every idle worktree regardless of whether the polecat's own work ever
-// merged (gt-gsva). Instead this finds the polecat's own dispatch branch by
-// its "polecat/<name>/<bead>@<suffix>" naming convention (see the
-// mol-polecat-work formula's branch-setup step) and asks GitHub for the PR
-// against it directly.
+// merged (gt-gsva).
+//
+// It also does not run git INSIDE the polecat's worktree at all: both real
+// callers of resetAbandonedBead (DetectOrphanedBeads, the orphaned-molecule
+// path) confirm via os.Stat that the polecat's directory no longer exists
+// before calling it — that is their whole trigger condition. A git command
+// run there would fail on a missing cmd.Dir before it could answer anything
+// (gt-gsva PR #225 review, val). Instead this resolves the rig's remote URL
+// from its config (a string, not a path) and queries GitHub directly: find
+// the polecat's own dispatch branch by its "polecat/<name>/<bead>@<suffix>"
+// naming convention (see the mol-polecat-work formula's branch-setup step)
+// via `git ls-remote <url>` — which needs no local repository at all — then
+// ask GitHub for that branch's PR state via `gh pr list --repo owner/repo`.
 //
 // Returns hasPR=false when no dispatch branch (and therefore no PR) can be
 // found at all — callers should fall back to the pre-existing on-main
@@ -1330,39 +1340,33 @@ func _linkedPRForBead(workDir, rigName, polecatName, hookBead string) (hasPR boo
 		return false, false, fmt.Errorf("finding town root: %v", tErr)
 	}
 
-	polecatPath := filepath.Join(townRoot, rigName, "polecats", polecatName, rigName)
-	if _, statErr := os.Stat(polecatPath); os.IsNotExist(statErr) {
-		polecatPath = filepath.Join(townRoot, rigName, "polecats", polecatName)
+	rigCfg, cfgErr := rig.LoadRigConfig(filepath.Join(townRoot, rigName))
+	if cfgErr != nil {
+		return false, false, fmt.Errorf("loading rig config for %s: %w", rigName, cfgErr)
 	}
 
-	g := git.NewGit(polecatPath)
-	remotes, rErr := g.Remotes()
-	if rErr != nil || len(remotes) == 0 {
-		remotes = []string{"origin"}
+	// Polecats push to PushURL when set (e.g. a personal fork used because
+	// GitURL is read-only) — that is where their dispatch branches actually
+	// live, so it must be checked in preference to GitURL or fork-pushed
+	// branches are invisible to ls-remote and the fix silently no-ops.
+	remoteURL := rigCfg.PushURL
+	if remoteURL == "" {
+		remoteURL = rigCfg.GitURL
+	}
+	if remoteURL == "" {
+		return false, false, fmt.Errorf("rig %s has no git_url configured", rigName)
 	}
 
-	prefix := fmt.Sprintf("refs/heads/polecat/%s/%s@", polecatName, hookBead)
-
-	var branches []string
-	var lastErr error
-	for _, remote := range remotes {
-		refs, refErr := g.ListRemoteRefs(remote, prefix)
-		if refErr != nil {
-			lastErr = refErr
-			continue
-		}
-		for _, ref := range refs {
-			branches = append(branches, strings.TrimPrefix(ref, "refs/heads/"))
-		}
-		if len(branches) > 0 {
-			break
-		}
+	owner, repoName, parseErr := parseGitHubOwnerRepo(remoteURL)
+	if parseErr != nil {
+		return false, false, fmt.Errorf("resolving owner/repo for %s: %w", rigName, parseErr)
 	}
 
+	branches, discErr := discoverDispatchBranches(remoteURL, polecatName, hookBead)
+	if discErr != nil {
+		return false, false, fmt.Errorf("listing dispatch branches for %s: %w", hookBead, discErr)
+	}
 	if len(branches) == 0 {
-		if lastErr != nil {
-			return false, false, fmt.Errorf("listing dispatch branches for %s: %w", hookBead, lastErr)
-		}
 		return false, false, nil // no dispatch branch found — no PR linkage
 	}
 
@@ -1371,16 +1375,16 @@ func _linkedPRForBead(workDir, rigName, polecatName, hookBead string) (hasPR boo
 	sawPR := false
 	var stateErr error
 	for _, branch := range branches {
-		state, err := ghPRState(polecatPath, branch)
+		exists, branchMerged, err := ghPRMergedForBranch(owner, repoName, branch)
 		if err != nil {
 			stateErr = err
 			continue
 		}
-		if state == "" {
+		if !exists {
 			continue // branch exists but no PR was ever opened for it
 		}
 		sawPR = true
-		if state == "MERGED" {
+		if branchMerged {
 			return true, true, nil
 		}
 	}
@@ -1394,32 +1398,115 @@ func _linkedPRForBead(workDir, rigName, polecatName, hookBead string) (hasPR boo
 	return false, false, nil
 }
 
-// ghPRState returns the GitHub PR state ("OPEN", "MERGED", "CLOSED") for the
-// given branch's most recent PR, or "" if no PR exists for that branch.
-// Package-level var so tests can override.
-var ghPRState = _ghPRState
+// discoverDispatchBranches finds branches on remoteURL matching the
+// "polecat/<name>/<bead>@<suffix>" naming convention via `git ls-remote`.
+// remoteURL is queried directly — no local git repository is required, which
+// is the whole point: by the time resetAbandonedBead runs, the polecat's own
+// worktree is already confirmed gone. Split out from _linkedPRForBead so it
+// can be exercised against a real git remote in tests, independent of the
+// GitHub-specific (and therefore stubbed-in-tests) owner/repo resolution and
+// `gh` call.
+func discoverDispatchBranches(remoteURL, polecatName, hookBead string) ([]string, error) {
+	g := git.NewGit("")
+	prefix := fmt.Sprintf("refs/heads/polecat/%s/%s@", polecatName, hookBead)
+	refs, err := g.ListRemoteRefs(remoteURL, prefix)
+	if err != nil {
+		return nil, err
+	}
+	branches := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		branches = append(branches, strings.TrimPrefix(ref, "refs/heads/"))
+	}
+	return branches, nil
+}
 
-func _ghPRState(workDir, branch string) (string, error) {
-	cmd := exec.Command("gh", "pr", "list", "--head", branch, "--state", "all", "--json", "state", "--limit", "1")
-	cmd.Dir = workDir
+// parseGitHubOwnerRepo extracts "owner", "repo" from a GitHub remote URL in
+// either https://github.com/owner/repo(.git) or git@github.com:owner/repo(.git)
+// form. Pure string parsing — no git/network call needed, unlike
+// (*git.Git).ghRepoOwnerName, which requires an existing local checkout.
+func parseGitHubOwnerRepo(remoteURL string) (owner, repoName string, err error) {
+	url := strings.TrimSuffix(strings.TrimSpace(remoteURL), ".git")
+	for _, sep := range []string{"github.com/", "github.com:"} {
+		if idx := strings.Index(url, sep); idx >= 0 {
+			tail := url[idx+len(sep):]
+			parts := strings.SplitN(tail, "/", 2)
+			if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+				return parts[0], parts[1], nil
+			}
+		}
+	}
+	return "", "", fmt.Errorf("could not parse owner/repo from url %q", remoteURL)
+}
+
+// ghPRTimeout bounds the gh CLI call in ghPRMergedForBranch so a stalled or
+// unreachable GitHub API can never hang the witness patrol sweep indefinitely
+// — that sweep is what calls this code, so an unbounded call here is how a
+// sweep silently stops running (gt-gsva PR #225 review, val).
+const ghPRTimeout = 30 * time.Second
+
+// ghPRMergedForBranch reports whether branch has any PR at all (exists) and,
+// if so, whether one of them has merged (merged). It scans every PR returned
+// for the branch rather than trusting only the newest: `gh pr list` with
+// --state all returns newest-first, so limiting to the first result can miss
+// an earlier PR that actually merged while a later, unmerged one (e.g. a
+// review-fix re-dispatch) sorts first — reporting "not merged" for branches
+// whose real, older PR landed.
+//
+// Package-level var so tests can override.
+var ghPRMergedForBranch = _ghPRMergedForBranch
+
+func _ghPRMergedForBranch(owner, repoName, branch string) (exists bool, merged bool, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), ghPRTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "gh", "pr", "list",
+		"--repo", owner+"/"+repoName,
+		"--head", branch,
+		"--state", "all",
+		"--json", "state")
+	// A context deadline alone does not bound a subprocess whose grandchild
+	// holds the stdout pipe open (the gh CLI can spawn a helper); WaitDelay
+	// forces the process group closed once the context is done instead of
+	// leaving cmd.Wait() blocked forever.
+	cmd.WaitDelay = 5 * time.Second
+
 	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("gh pr list --head %s: %w", branch, err)
+		if ctx.Err() == context.DeadlineExceeded {
+			return false, false, fmt.Errorf("gh pr list --head %s timed out after %v", branch, ghPRTimeout)
+		}
+		return false, false, fmt.Errorf("gh pr list --head %s: %w", branch, err)
 	}
+	return parseGhPRListStates(out)
+}
+
+// parseGhPRListStates decodes `gh pr list --json state` output and reports
+// whether any PR exists for the query (exists) and whether any of them has
+// merged (merged). Scanning every entry — not just prs[0] — matters because
+// `gh pr list --state all` returns newest-first: a branch can have an older
+// PR that merged and a newer, unmerged one (e.g. a review-fix re-dispatch)
+// sorting ahead of it. Pure function, split out from _ghPRMergedForBranch so
+// this decision logic is testable without a real `gh` subprocess.
+func parseGhPRListStates(out []byte) (exists bool, merged bool, err error) {
 	out = bytes.TrimSpace(out)
 	if len(out) <= 2 {
-		return "", nil // no PR for this branch
+		return false, false, nil // no PR for this branch
 	}
 	var prs []struct {
 		State string `json:"state"`
 	}
 	if err := json.Unmarshal(out, &prs); err != nil {
-		return "", fmt.Errorf("parsing gh pr list output: %w", err)
+		return false, false, fmt.Errorf("parsing gh pr list output: %w", err)
 	}
 	if len(prs) == 0 {
-		return "", nil
+		return false, false, nil
 	}
-	return prs[0].State, nil
+	for _, pr := range prs {
+		if pr.State == "MERGED" {
+			return true, true, nil
+		}
+	}
+	return true, false, nil
 }
 
 // verifyBranchAlreadyMerged checks whether the polecat's current branch work has

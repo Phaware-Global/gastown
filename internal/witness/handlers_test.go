@@ -1463,6 +1463,134 @@ func TestResetAbandonedBead_DoesNotCloseWhenPRStateUndeterminable(t *testing.T) 
 	}
 }
 
+// TestDiscoverDispatchBranches_RealRemote exercises the REAL git ls-remote
+// call — not a stubbed package var — against an actual local git remote, in
+// the exact shape production leaves it: no polecat worktree at all, just a
+// remote URL. This is the seam PR #225 review (val) found completely
+// unexercised: every resetAbandonedBead test stubs linkedPRForBead wholesale,
+// so the suite would stay green whether or not ls-remote-against-a-URL (as
+// opposed to git-inside-the-deleted-worktree) actually works. This test runs
+// the real subprocess.
+func TestDiscoverDispatchBranches_RealRemote(t *testing.T) {
+	t.Parallel()
+
+	remotePath := t.TempDir()
+	clonePath := t.TempDir()
+	runGit := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return string(out)
+	}
+
+	runGit(remotePath, "init", "--bare")
+	runGit(clonePath, "init")
+	runGit(clonePath, "config", "user.email", "test@example.com")
+	runGit(clonePath, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(clonePath, "README.md"), []byte("test\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(clonePath, "add", "README.md")
+	runGit(clonePath, "commit", "-m", "initial")
+	runGit(clonePath, "remote", "add", "origin", remotePath)
+	runGit(clonePath, "push", "origin", "HEAD:refs/heads/polecat/rust/hmetet-9bed@abc123")
+	runGit(clonePath, "push", "origin", "HEAD:refs/heads/main")
+
+	branches, err := discoverDispatchBranches(remotePath, "rust", "hmetet-9bed")
+	if err != nil {
+		t.Fatalf("discoverDispatchBranches: %v", err)
+	}
+	if len(branches) != 1 || branches[0] != "polecat/rust/hmetet-9bed@abc123" {
+		t.Errorf("discoverDispatchBranches = %v, want exactly [polecat/rust/hmetet-9bed@abc123]", branches)
+	}
+
+	// No matching branch for a different bead — must report empty, not error.
+	none, err := discoverDispatchBranches(remotePath, "rust", "hmetet-nope")
+	if err != nil {
+		t.Fatalf("discoverDispatchBranches (no match): %v", err)
+	}
+	if len(none) != 0 {
+		t.Errorf("discoverDispatchBranches (no match) = %v, want empty", none)
+	}
+
+	// An unreachable remote must error, not silently report "no branches".
+	if _, err := discoverDispatchBranches(filepath.Join(t.TempDir(), "does-not-exist"), "rust", "hmetet-9bed"); err == nil {
+		t.Error("discoverDispatchBranches against an unreachable remote should return an error")
+	}
+}
+
+func TestParseGitHubOwnerRepo(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		url       string
+		wantOwner string
+		wantRepo  string
+		wantErr   bool
+	}{
+		{"https with .git", "https://github.com/Phaware-Global/gastown.git", "Phaware-Global", "gastown", false},
+		{"https without .git", "https://github.com/Phaware-Global/gastown", "Phaware-Global", "gastown", false},
+		{"ssh form", "git@github.com:Phaware-Global/gastown.git", "Phaware-Global", "gastown", false},
+		{"non-github url", "https://gitlab.com/owner/repo.git", "", "", true},
+		{"malformed", "https://github.com/onlyowner", "", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			owner, repoName, err := parseGitHubOwnerRepo(tt.url)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseGitHubOwnerRepo(%q) error = %v, wantErr %v", tt.url, err, tt.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if owner != tt.wantOwner || repoName != tt.wantRepo {
+				t.Errorf("parseGitHubOwnerRepo(%q) = (%q, %q), want (%q, %q)", tt.url, owner, repoName, tt.wantOwner, tt.wantRepo)
+			}
+		})
+	}
+}
+
+func TestParseGhPRListStates(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		json       string
+		wantExists bool
+		wantMerged bool
+		wantErr    bool
+	}{
+		{"empty array", `[]`, false, false, false},
+		{"single open", `[{"state":"OPEN"}]`, true, false, false},
+		{"single merged", `[{"state":"MERGED"}]`, true, true, false},
+		{"single closed unmerged", `[{"state":"CLOSED"}]`, true, false, false},
+		{
+			// The exact bug val found: --state all sorts newest-first, so an
+			// older merged PR can appear AFTER a newer, unmerged one (e.g. a
+			// review-fix re-dispatch). Must not stop at index 0.
+			"newest-first with older merged", `[{"state":"OPEN"},{"state":"MERGED"}]`, true, true, false,
+		},
+		{"invalid json", `not json`, false, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			exists, merged, err := parseGhPRListStates([]byte(tt.json))
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseGhPRListStates(%q) error = %v, wantErr %v", tt.json, err, tt.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if exists != tt.wantExists || merged != tt.wantMerged {
+				t.Errorf("parseGhPRListStates(%q) = (%v, %v), want (%v, %v)", tt.json, exists, merged, tt.wantExists, tt.wantMerged)
+			}
+		})
+	}
+}
+
 func TestBeadRecoveredField_DefaultFalse(t *testing.T) {
 	t.Parallel()
 	// BeadRecovered should default to false (zero value)
