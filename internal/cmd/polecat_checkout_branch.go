@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -8,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/util"
@@ -203,7 +205,24 @@ func ensurePolecatWorkBranch(cwd, polecatName, beadID string) (polecatBranchResu
 	}
 	currentBranch = strings.TrimSpace(currentBranch)
 
+	// A review-fix dispatch (`gt sling --review-branch`) records the PR
+	// branch to resume directly on the dispatch bead (review_branch field,
+	// internal/beads/fields.go). When present, that recorded branch is
+	// authoritative: resuming it is the entire point of a review-fix
+	// polecat. Falling through to the default polecat/<name>-<beadID> name
+	// instead abandons the reviewed PR branch for a brand-new one built off
+	// mainline — reconstructing state from the environment instead of
+	// reading the fact that was recorded (gt-i48h; same root cause as
+	// gt-0t6b).
+	reviewBranch, rbErr := recordedReviewBranchFn(beadID)
+	if rbErr != nil {
+		return polecatBranchResult{}, fmt.Errorf("checking bead %s for a recorded review branch: %w", beadID, rbErr)
+	}
+
 	targetBranch := fmt.Sprintf("polecat/%s-%s", polecatName, beadID)
+	if reviewBranch != "" {
+		targetBranch = reviewBranch
+	}
 
 	switch {
 	case currentBranch == targetBranch:
@@ -217,6 +236,10 @@ func ensurePolecatWorkBranch(cwd, polecatName, beadID string) (polecatBranchResu
 		return polecatBranchResult{}, fmt.Errorf("refusing to switch from polecat branch %q to %q — "+
 			"commit/stash on the current branch first (this would not be safe to do silently)",
 			currentBranch, targetBranch)
+	}
+
+	if reviewBranch != "" {
+		return resumeReviewBranch(cwd, reviewBranch)
 	}
 
 	// Base the work branch on the repo's ACTUAL default branch, not a
@@ -277,4 +300,94 @@ func ensurePolecatWorkBranch(cwd, polecatName, beadID string) (polecatBranchResu
 		action = polecatBranchResumed
 	}
 	return polecatBranchResult{Target: targetBranch, Action: action}, nil
+}
+
+// recordedReviewBranchFn is the injection point for tests: recordedReviewBranch
+// shells out to the real beads store, which requires a live bd/Dolt setup this
+// package's git-fixture tests don't have. Tests override this var directly
+// rather than faking a bead store.
+var recordedReviewBranchFn = recordedReviewBranch
+
+// recordedReviewBranch reads the review_branch attachment field off beadID's
+// description — the branch a review-fix dispatch (`gt sling --review-branch`)
+// recorded for the polecat to resume (internal/beads/fields.go,
+// AttachmentFields.ReviewBranch). Returns "" (not an error) when the bead
+// carries no such field, which is the normal case for every non-review-fix
+// dispatch — those must keep computing the default polecat/<name>-<beadID>
+// name.
+func recordedReviewBranch(beadID string) (string, error) {
+	bd := beads.New(resolveBeadDir(beadID))
+	issue, err := bd.Show(beadID)
+	if err != nil {
+		if errors.Is(err, beads.ErrNotFound) {
+			return "", nil
+		}
+		return "", fmt.Errorf("reading bead %s: %w", beadID, err)
+	}
+	if issue == nil {
+		return "", nil
+	}
+	fields := beads.ParseAttachmentFields(issue)
+	if fields == nil {
+		return "", nil
+	}
+	return strings.TrimSpace(fields.ReviewBranch), nil
+}
+
+// resumeReviewBranch fetches and checks out an existing PR branch recorded on
+// the dispatch bead (review_branch). Unlike the default path, this never
+// falls back to creating a fresh branch from mainline on failure — a
+// review-fix polecat that cannot reach the recorded branch must fail loudly
+// (gt-i48h FIX guidance) rather than silently starting a new branch that
+// abandons the PR under review; that silent-fallback shape is exactly what
+// hmetet-z6zz already burned a rig on.
+//
+// When the branch already exists locally (a prior session in this same
+// worktree), it is hard-reset to origin's head rather than trusted as-is: a
+// stale local copy sitting behind (or diverged from) the branch's true head
+// is the exact state gt-i48h reproduced from. The acceptance bar is
+// resuming AT the branch's head, not wherever this worktree last left it.
+func resumeReviewBranch(cwd, branch string) (polecatBranchResult, error) {
+	fetchCmd := exec.Command("git", "fetch", "origin", branch)
+	fetchCmd.Dir = cwd
+	util.SetDetachedProcessGroup(fetchCmd)
+	if out, fErr := fetchCmd.CombinedOutput(); fErr != nil {
+		return polecatBranchResult{}, fmt.Errorf(
+			"git fetch origin %s failed: %s: %w — the recorded review branch could not be reached; "+
+				"refusing to fall back to a fresh branch from mainline (that would abandon the PR under review)",
+			branch, strings.TrimSpace(string(out)), fErr)
+	}
+
+	branchExists := false
+	probe := exec.Command("git", "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
+	probe.Dir = cwd
+	util.SetDetachedProcessGroup(probe)
+	if err := probe.Run(); err == nil {
+		branchExists = true
+	}
+
+	var checkoutCmd *exec.Cmd
+	if branchExists {
+		checkoutCmd = exec.Command("git", "checkout", branch)
+	} else {
+		checkoutCmd = exec.Command("git", "checkout", "-b", branch, "origin/"+branch)
+	}
+	checkoutCmd.Dir = cwd
+	util.SetDetachedProcessGroup(checkoutCmd)
+	if out, cErr := checkoutCmd.CombinedOutput(); cErr != nil {
+		return polecatBranchResult{}, fmt.Errorf("git checkout %s failed: %s: %w",
+			branch, strings.TrimSpace(string(out)), cErr)
+	}
+
+	if branchExists {
+		resetCmd := exec.Command("git", "reset", "--hard", "origin/"+branch)
+		resetCmd.Dir = cwd
+		util.SetDetachedProcessGroup(resetCmd)
+		if out, rErr := resetCmd.CombinedOutput(); rErr != nil {
+			return polecatBranchResult{}, fmt.Errorf("git reset --hard origin/%s failed: %s: %w",
+				branch, strings.TrimSpace(string(out)), rErr)
+		}
+	}
+
+	return polecatBranchResult{Target: branch, Action: polecatBranchResumed}, nil
 }
