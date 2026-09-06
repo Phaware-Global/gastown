@@ -2757,7 +2757,7 @@ func resetAbandonedBead(bd *BdCli, workDir, rigName, hookBead, polecatName strin
 	// Prefer the bead's linked GitHub PR state, which describes what the
 	// polecat actually produced rather than where its worktree happens to be
 	// parked. Fall back to the on-main check only when no PR is linked at all
-	// (e.g. direct-merge convoys that never open a PR) — unchanged behaviour
+	// (e.g. direct-merge convoys that never open a PR) — unchanged behavior
 	// there. This prevents the spawn-storm / duplicate-work loop described in
 	// #2036 without reintroducing the false-positive close.
 	hasPR, prMerged, prErr := linkedPRForBead(workDir, rigName, polecatName, hookBead)

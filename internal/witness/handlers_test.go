@@ -1204,7 +1204,7 @@ func TestResetAbandonedBead_NoRouter(t *testing.T) {
 
 func TestResetAbandonedBead_ClosesWhenWorkOnMain(t *testing.T) {
 	// Not parallel: overrides package-level verifyCommitOnMain / linkedPRForBead.
-	// Test (a) from gt-gsva: no linked PR at all — unchanged behaviour, falls
+	// Test (a) from gt-gsva: no linked PR at all — unchanged behavior, falls
 	// back to the pre-existing on-main check. When verifyCommitOnMain returns
 	// true, resetAbandonedBead should close the bead instead of resetting it
 	// for re-dispatch. This is the fix for #2036.
