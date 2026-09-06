@@ -1421,7 +1421,19 @@ func TestLinkedPRForBead_RealBeadsStore(t *testing.T) {
 
 	b := beads.NewIsolatedWithPort(rigPath, port)
 	if err := b.Init("gt"); err != nil {
-		t.Skipf("bd init unavailable: %v", err)
+		// bd init can exit 0 with empty stdout (--quiet) and an informational
+		// stderr line — e.g. its first-run anonymous-metrics notice — and
+		// internal/beads's error-detection heuristic ("empty stdout + non-empty
+		// stderr" is normally the signature of a real bd bug) misreads that as
+		// a failure. That misfires here on a fully healthy machine, so treat
+		// this as skip-worthy ONLY when bd itself is genuinely unavailable;
+		// otherwise proceed — a real, still-broken store will fail loudly on
+		// the very next real operation below instead of silently vanishing
+		// into a skip (see: gt-0t6b PR #226 round-1 review).
+		if errors.Is(err, exec.ErrNotFound) || strings.Contains(err.Error(), "executable file not found") {
+			t.Skipf("bd binary not available: %v", err)
+		}
+		t.Logf("bd init returned a non-fatal notice, proceeding: %v", err)
 	}
 
 	oldNewClient := newBeadsClient
@@ -1497,6 +1509,8 @@ func TestParseGitHubOwnerRepo(t *testing.T) {
 		{"ssh form", "git@github.com:Phaware-Global/gastown.git", "Phaware-Global", "gastown", false},
 		{"non-github url", "https://gitlab.com/owner/repo.git", "", "", true},
 		{"malformed", "https://github.com/onlyowner", "", "", true},
+		{"trailing slash", "https://github.com/Phaware-Global/gastown/", "Phaware-Global", "gastown", false},
+		{"deep url with extra path segments", "https://github.com/owner/repo/tree/main", "", "", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

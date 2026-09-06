@@ -1464,10 +1464,15 @@ func _ghPRMergedByNumber(owner, repoName string, prNumber int) (merged bool, err
 // (*git.Git).ghRepoOwnerName, which requires an existing local checkout.
 func parseGitHubOwnerRepo(remoteURL string) (owner, repoName string, err error) {
 	url := strings.TrimSuffix(strings.TrimSpace(remoteURL), ".git")
+	url = strings.TrimRight(url, "/") // trailing slash (e.g. .../owner/repo/) must not become part of repoName
 	for _, sep := range []string{"github.com/", "github.com:"} {
 		if idx := strings.Index(url, sep); idx >= 0 {
 			tail := url[idx+len(sep):]
-			parts := strings.SplitN(tail, "/", 2)
+			parts := strings.Split(tail, "/")
+			// Exactly owner/repo — reject anything with extra path segments
+			// (e.g. github.com/owner/repo/tree/main) rather than silently
+			// folding them into repoName, which would send gh a malformed
+			// "owner/repo/extra" spec instead of a clean, traceable error.
 			if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
 				return parts[0], parts[1], nil
 			}
