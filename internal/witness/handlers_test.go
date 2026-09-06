@@ -1441,7 +1441,15 @@ func TestLinkedPRForBead_RealBeadsStore(t *testing.T) {
 		// otherwise proceed — a real, still-broken store will fail loudly on
 		// the very next real operation below instead of silently vanishing
 		// into a skip (see: gt-0t6b PR #226 round-1 review).
-		if errors.Is(err, exec.ErrNotFound) || strings.Contains(err.Error(), "executable file not found") {
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, beads.ErrNotInstalled) || strings.Contains(err.Error(), "executable file not found") {
+			// beads.Beads.wrapError (internal/beads/beads.go) catches the raw
+			// exec.ErrNotFound and replaces it with the beads.ErrNotInstalled
+			// sentinel WITHOUT %w-wrapping it, so errors.Is(err,
+			// exec.ErrNotFound) alone can never match — this genuinely-absent
+			// case must be checked for its actual sentinel (found the hard
+			// way: this fired as a silent "Test" CI job failure on every
+			// commit from round 1 through round 8, since that job never
+			// installs bd).
 			t.Skipf("bd binary not available: %v", err)
 		}
 		t.Logf("bd init returned a non-fatal notice, proceeding: %v", err)
@@ -1553,7 +1561,15 @@ func TestLinkedPRForBead_UncheckedPRIsNeverReportedAsNotMerged(t *testing.T) {
 
 	b := beads.NewIsolatedWithPort(rigPath, port)
 	if err := b.Init("gt"); err != nil {
-		if errors.Is(err, exec.ErrNotFound) || strings.Contains(err.Error(), "executable file not found") {
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, beads.ErrNotInstalled) || strings.Contains(err.Error(), "executable file not found") {
+			// beads.Beads.wrapError (internal/beads/beads.go) catches the raw
+			// exec.ErrNotFound and replaces it with the beads.ErrNotInstalled
+			// sentinel WITHOUT %w-wrapping it, so errors.Is(err,
+			// exec.ErrNotFound) alone can never match — this genuinely-absent
+			// case must be checked for its actual sentinel (found the hard
+			// way: this fired as a silent "Test" CI job failure on every
+			// commit from round 1 through round 8, since that job never
+			// installs bd).
 			t.Skipf("bd binary not available: %v", err)
 		}
 		t.Logf("bd init returned a non-fatal notice, proceeding: %v", err)
@@ -1643,7 +1659,15 @@ func TestLinkedPRForBead_NonGitHubRigWithNoRecordedPR(t *testing.T) {
 
 	b := beads.NewIsolatedWithPort(rigPath, port)
 	if err := b.Init("gt"); err != nil {
-		if errors.Is(err, exec.ErrNotFound) || strings.Contains(err.Error(), "executable file not found") {
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, beads.ErrNotInstalled) || strings.Contains(err.Error(), "executable file not found") {
+			// beads.Beads.wrapError (internal/beads/beads.go) catches the raw
+			// exec.ErrNotFound and replaces it with the beads.ErrNotInstalled
+			// sentinel WITHOUT %w-wrapping it, so errors.Is(err,
+			// exec.ErrNotFound) alone can never match — this genuinely-absent
+			// case must be checked for its actual sentinel (found the hard
+			// way: this fired as a silent "Test" CI job failure on every
+			// commit from round 1 through round 8, since that job never
+			// installs bd).
 			t.Skipf("bd binary not available: %v", err)
 		}
 		t.Logf("bd init returned a non-fatal notice, proceeding: %v", err)
