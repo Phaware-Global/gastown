@@ -1203,15 +1203,23 @@ func TestResetAbandonedBead_NoRouter(t *testing.T) {
 }
 
 func TestResetAbandonedBead_ClosesWhenWorkOnMain(t *testing.T) {
-	// Not parallel: overrides package-level verifyCommitOnMain.
-	// When verifyCommitOnMain returns true, resetAbandonedBead should close the
-	// bead instead of resetting it for re-dispatch. This is the fix for #2036.
+	// Not parallel: overrides package-level verifyCommitOnMain / linkedPRForBead.
+	// Test (a) from gt-gsva: no linked PR at all — unchanged behaviour, falls
+	// back to the pre-existing on-main check. When verifyCommitOnMain returns
+	// true, resetAbandonedBead should close the bead instead of resetting it
+	// for re-dispatch. This is the fix for #2036.
 
 	oldVerify := verifyCommitOnMain
 	verifyCommitOnMain = func(workDir, rigName, polecatName string) (bool, error) {
 		return true, nil // work is on main
 	}
 	t.Cleanup(func() { verifyCommitOnMain = oldVerify })
+
+	oldLinkedPR := linkedPRForBead
+	linkedPRForBead = func(workDir, rigName, polecatName, hookBead string) (bool, bool, error) {
+		return false, false, nil // no PR linked at all
+	}
+	t.Cleanup(func() { linkedPRForBead = oldLinkedPR })
 
 	bd, mock := mockBd(
 		func(args []string) (string, error) {
@@ -1250,15 +1258,21 @@ func TestResetAbandonedBead_ClosesWhenWorkOnMain(t *testing.T) {
 }
 
 func TestResetAbandonedBead_ResetsWhenWorkNotOnMain(t *testing.T) {
-	// Not parallel: overrides package-level verifyCommitOnMain.
-	// When verifyCommitOnMain returns false, resetAbandonedBead should reset
-	// the bead for re-dispatch (existing behavior).
+	// Not parallel: overrides package-level verifyCommitOnMain / linkedPRForBead.
+	// No linked PR, and verifyCommitOnMain returns false: resetAbandonedBead
+	// should reset the bead for re-dispatch (existing behavior).
 
 	oldVerify := verifyCommitOnMain
 	verifyCommitOnMain = func(workDir, rigName, polecatName string) (bool, error) {
 		return false, nil // work NOT on main
 	}
 	t.Cleanup(func() { verifyCommitOnMain = oldVerify })
+
+	oldLinkedPR := linkedPRForBead
+	linkedPRForBead = func(workDir, rigName, polecatName, hookBead string) (bool, bool, error) {
+		return false, false, nil // no PR linked at all
+	}
+	t.Cleanup(func() { linkedPRForBead = oldLinkedPR })
 
 	bd, mock := mockBd(
 		func(args []string) (string, error) {
@@ -1287,6 +1301,165 @@ func TestResetAbandonedBead_ResetsWhenWorkNotOnMain(t *testing.T) {
 	}
 	if !foundUpdate {
 		t.Errorf("expected bd update --status=open to be called, got calls: %v", mock.calls)
+	}
+}
+
+func TestResetAbandonedBead_ClosesWhenLinkedPRMerged(t *testing.T) {
+	// Not parallel: overrides package-level linkedPRForBead.
+	// Test (b) from gt-gsva: convoy completes, linked PR MERGED -> bead CLOSES.
+	// verifyCommitOnMain is deliberately left returning false (simulating the
+	// worktree not being on main by coincidence) to prove the close decision
+	// comes from the PR state, not from the on-main heuristic.
+
+	oldVerify := verifyCommitOnMain
+	verifyCommitOnMain = func(workDir, rigName, polecatName string) (bool, error) {
+		return false, nil
+	}
+	t.Cleanup(func() { verifyCommitOnMain = oldVerify })
+
+	oldLinkedPR := linkedPRForBead
+	linkedPRForBead = func(workDir, rigName, polecatName, hookBead string) (bool, bool, error) {
+		return true, true, nil // PR linked and merged
+	}
+	t.Cleanup(func() { linkedPRForBead = oldLinkedPR })
+
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			if len(args) >= 1 && args[0] == "show" {
+				return `[{"status":"hooked"}]`, nil
+			}
+			return "", nil
+		},
+		func(args []string) error {
+			return nil
+		},
+	)
+
+	tmpDir := t.TempDir()
+	result := resetAbandonedBead(bd, tmpDir, "testrig", "gt-work123", "alpha", nil)
+	if result {
+		t.Error("resetAbandonedBead should return false when the linked PR is merged (bead closed, not re-dispatched)")
+	}
+
+	var foundClose, foundUpdate bool
+	for _, call := range mock.calls {
+		if strings.Contains(call, "close gt-work123") {
+			foundClose = true
+		}
+		if strings.Contains(call, "update") && strings.Contains(call, "--status=open") {
+			foundUpdate = true
+		}
+	}
+	if !foundClose {
+		t.Errorf("expected bd close to be called, got calls: %v", mock.calls)
+	}
+	if foundUpdate {
+		t.Error("bd update --status=open should NOT be called when the linked PR is merged")
+	}
+}
+
+func TestResetAbandonedBead_DoesNotCloseWhenLinkedPROpen(t *testing.T) {
+	// Not parallel: overrides package-level verifyCommitOnMain / linkedPRForBead.
+	// Test (c) from gt-gsva — the faithful reproduction of the reported bug:
+	// the idle worktree is detached at a mainline commit (verifyCommitOnMain
+	// would say "true", exactly as it does for every idle worktree), but the
+	// bead's actual work lives on an unmerged branch with an open PR. Before
+	// the fix, resetAbandonedBead trusted verifyCommitOnMain alone and closed
+	// the bead out from under the open review (gt-gsva). It must not close it,
+	// and the bead must come back dispatchable (status=open) so gt sling can
+	// send review-fix work to it.
+
+	oldVerify := verifyCommitOnMain
+	verifyCommitOnMain = func(workDir, rigName, polecatName string) (bool, error) {
+		return true, nil // idle worktree detached at a mainline commit
+	}
+	t.Cleanup(func() { verifyCommitOnMain = oldVerify })
+
+	oldLinkedPR := linkedPRForBead
+	linkedPRForBead = func(workDir, rigName, polecatName, hookBead string) (bool, bool, error) {
+		return true, false, nil // PR linked, still open
+	}
+	t.Cleanup(func() { linkedPRForBead = oldLinkedPR })
+
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			if len(args) >= 1 && args[0] == "show" {
+				return `[{"status":"hooked"}]`, nil
+			}
+			return "", nil
+		},
+		func(args []string) error {
+			return nil
+		},
+	)
+
+	tmpDir := t.TempDir()
+	result := resetAbandonedBead(bd, tmpDir, "testrig", "gt-work123", "alpha", nil)
+	if !result {
+		t.Error("resetAbandonedBead should return true when the linked PR is still open (bead reset for re-dispatch, not closed)")
+	}
+
+	var foundClose, foundUpdate bool
+	for _, call := range mock.calls {
+		if strings.Contains(call, "close gt-work123") {
+			foundClose = true
+		}
+		if strings.Contains(call, "update") && strings.Contains(call, "--status=open") {
+			foundUpdate = true
+		}
+	}
+	if foundClose {
+		t.Error("bd close should NOT be called while the linked PR is still open, even if the worktree looks like it's on main")
+	}
+	if !foundUpdate {
+		t.Errorf("expected bd update --status=open to be called (dispatchable by gt sling), got calls: %v", mock.calls)
+	}
+}
+
+func TestResetAbandonedBead_DoesNotCloseWhenPRStateUndeterminable(t *testing.T) {
+	// Not parallel: overrides package-level verifyCommitOnMain / linkedPRForBead.
+	// Test (d) from gt-gsva: PR state UNDETERMINABLE -> bead DOES NOT CLOSE.
+	// Fail safe: an un-closed bead is a visible nuisance; a wrongly-closed one
+	// silently blocks re-dispatch and vanishes from open-work sweeps.
+
+	oldVerify := verifyCommitOnMain
+	verifyCommitOnMain = func(workDir, rigName, polecatName string) (bool, error) {
+		return true, nil // even if the (misleading) on-main check says true
+	}
+	t.Cleanup(func() { verifyCommitOnMain = oldVerify })
+
+	oldLinkedPR := linkedPRForBead
+	linkedPRForBead = func(workDir, rigName, polecatName, hookBead string) (bool, bool, error) {
+		return false, false, errors.New("gh pr list: network unreachable")
+	}
+	t.Cleanup(func() { linkedPRForBead = oldLinkedPR })
+
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			if len(args) >= 1 && args[0] == "show" {
+				return `[{"status":"hooked"}]`, nil
+			}
+			return "", nil
+		},
+		func(args []string) error {
+			return nil
+		},
+	)
+
+	tmpDir := t.TempDir()
+	result := resetAbandonedBead(bd, tmpDir, "testrig", "gt-work123", "alpha", nil)
+	if !result {
+		t.Error("resetAbandonedBead should return true when PR state can't be determined (fail safe: reset, don't close)")
+	}
+
+	var foundClose bool
+	for _, call := range mock.calls {
+		if strings.Contains(call, "close gt-work123") {
+			foundClose = true
+		}
+	}
+	if foundClose {
+		t.Error("bd close should NOT be called when the linked PR's state could not be determined")
 	}
 }
 

@@ -1306,6 +1306,122 @@ func _verifyCommitOnMain(workDir, rigName, polecatName string) (bool, error) {
 	return false, nil
 }
 
+// linkedPRForBead resolves whether hookBead has a GitHub PR associated with
+// its dispatch, and whether that PR has actually merged. Unlike
+// verifyCommitOnMain, this does not look at the worktree's current HEAD — an
+// idle polecat worktree sits DETACHED at whatever mainline commit was
+// current when the polecat went idle, so IsAncestor(HEAD, main) is true for
+// every idle worktree regardless of whether the polecat's own work ever
+// merged (gt-gsva). Instead this finds the polecat's own dispatch branch by
+// its "polecat/<name>/<bead>@<suffix>" naming convention (see the
+// mol-polecat-work formula's branch-setup step) and asks GitHub for the PR
+// against it directly.
+//
+// Returns hasPR=false when no dispatch branch (and therefore no PR) can be
+// found at all — callers should fall back to the pre-existing on-main
+// heuristic in that case (e.g. direct-merge convoys that never open a PR).
+//
+// Package-level var so tests can override.
+var linkedPRForBead = _linkedPRForBead
+
+func _linkedPRForBead(workDir, rigName, polecatName, hookBead string) (hasPR bool, merged bool, err error) {
+	townRoot, tErr := workspace.Find(workDir)
+	if tErr != nil || townRoot == "" {
+		return false, false, fmt.Errorf("finding town root: %v", tErr)
+	}
+
+	polecatPath := filepath.Join(townRoot, rigName, "polecats", polecatName, rigName)
+	if _, statErr := os.Stat(polecatPath); os.IsNotExist(statErr) {
+		polecatPath = filepath.Join(townRoot, rigName, "polecats", polecatName)
+	}
+
+	g := git.NewGit(polecatPath)
+	remotes, rErr := g.Remotes()
+	if rErr != nil || len(remotes) == 0 {
+		remotes = []string{"origin"}
+	}
+
+	prefix := fmt.Sprintf("refs/heads/polecat/%s/%s@", polecatName, hookBead)
+
+	var branches []string
+	var lastErr error
+	for _, remote := range remotes {
+		refs, refErr := g.ListRemoteRefs(remote, prefix)
+		if refErr != nil {
+			lastErr = refErr
+			continue
+		}
+		for _, ref := range refs {
+			branches = append(branches, strings.TrimPrefix(ref, "refs/heads/"))
+		}
+		if len(branches) > 0 {
+			break
+		}
+	}
+
+	if len(branches) == 0 {
+		if lastErr != nil {
+			return false, false, fmt.Errorf("listing dispatch branches for %s: %w", hookBead, lastErr)
+		}
+		return false, false, nil // no dispatch branch found — no PR linkage
+	}
+
+	// A bead is normally dispatched once, but retries/rework can leave more
+	// than one branch behind. Any one of them landing means the work is done.
+	sawPR := false
+	var stateErr error
+	for _, branch := range branches {
+		state, err := ghPRState(polecatPath, branch)
+		if err != nil {
+			stateErr = err
+			continue
+		}
+		if state == "" {
+			continue // branch exists but no PR was ever opened for it
+		}
+		sawPR = true
+		if state == "MERGED" {
+			return true, true, nil
+		}
+	}
+
+	if sawPR {
+		return true, false, nil
+	}
+	if stateErr != nil {
+		return false, false, fmt.Errorf("checking PR state for %s: %w", hookBead, stateErr)
+	}
+	return false, false, nil
+}
+
+// ghPRState returns the GitHub PR state ("OPEN", "MERGED", "CLOSED") for the
+// given branch's most recent PR, or "" if no PR exists for that branch.
+// Package-level var so tests can override.
+var ghPRState = _ghPRState
+
+func _ghPRState(workDir, branch string) (string, error) {
+	cmd := exec.Command("gh", "pr", "list", "--head", branch, "--state", "all", "--json", "state", "--limit", "1")
+	cmd.Dir = workDir
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("gh pr list --head %s: %w", branch, err)
+	}
+	out = bytes.TrimSpace(out)
+	if len(out) <= 2 {
+		return "", nil // no PR for this branch
+	}
+	var prs []struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(out, &prs); err != nil {
+		return "", fmt.Errorf("parsing gh pr list output: %w", err)
+	}
+	if len(prs) == 0 {
+		return "", nil
+	}
+	return prs[0].State, nil
+}
+
 // verifyBranchAlreadyMerged checks whether the polecat's current branch work has
 // already landed on the default branch — including via SQUASH merge, which
 // rewrites commit SHAs and therefore escapes a plain ancestor check.
@@ -2631,15 +2747,45 @@ func resetAbandonedBead(bd *BdCli, workDir, rigName, hookBead, polecatName strin
 	}
 	maxRespawns := config.LoadOperationalConfig(trRoot).GetWitnessConfig().MaxBeadRespawnsV()
 
-	// Guard: if the polecat's commit is already on the default branch,
-	// the work is done — close the bead instead of resetting for re-dispatch.
-	// This prevents the spawn-storm / duplicate-work loop described in #2036.
-	if onMain, err := verifyCommitOnMain(workDir, rigName, polecatName); err == nil && onMain {
-		reason := fmt.Sprintf("Work already on main (verified by witness, polecat %s)", polecatName)
+	// Guard: verify the bead's work actually landed before closing it instead
+	// of resetting for re-dispatch. This used to check IsAncestor(HEAD, main),
+	// but an idle polecat worktree sits DETACHED at whatever mainline commit
+	// was current when the polecat went idle — that check was true for every
+	// idle worktree regardless of whether the polecat's own branch ever
+	// merged, closing beads whose PR was still open for review (gt-gsva).
+	//
+	// Prefer the bead's linked GitHub PR state, which describes what the
+	// polecat actually produced rather than where its worktree happens to be
+	// parked. Fall back to the on-main check only when no PR is linked at all
+	// (e.g. direct-merge convoys that never open a PR) — unchanged behaviour
+	// there. This prevents the spawn-storm / duplicate-work loop described in
+	// #2036 without reintroducing the false-positive close.
+	hasPR, prMerged, prErr := linkedPRForBead(workDir, rigName, polecatName, hookBead)
+	switch {
+	case prErr != nil:
+		// FAIL SAFE: PR state could not be determined. An un-closed bead is a
+		// visible nuisance; a wrongly-closed one silently blocks re-dispatch
+		// (gt sling refuses a closed bead) and vanishes from open-work
+		// sweeps. Prefer the nuisance — fall through to the normal reset path.
+	case hasPR && prMerged:
+		reason := fmt.Sprintf("Work merged via linked PR (verified by witness, polecat %s)", polecatName)
 		if err := bd.Run(workDir, "close", hookBead, "-r", reason); err != nil {
-			fmt.Fprintf(os.Stderr, "witness: failed to close bead %s (work already on main): %v\n", hookBead, err)
+			fmt.Fprintf(os.Stderr, "witness: failed to close bead %s (linked PR merged): %v\n", hookBead, err)
 		}
 		return false
+	case hasPR && !prMerged:
+		// The bead's PR is still open (or closed without merging) — the work
+		// has not landed. Do not close; fall through so the bead resets for
+		// re-dispatch and gt sling can dispatch review-fix work against it.
+	default:
+		// No PR linked at all — preserve the pre-existing git-based check.
+		if onMain, err := verifyCommitOnMain(workDir, rigName, polecatName); err == nil && onMain {
+			reason := fmt.Sprintf("Work already on main (verified by witness, polecat %s)", polecatName)
+			if err := bd.Run(workDir, "close", hookBead, "-r", reason); err != nil {
+				fmt.Fprintf(os.Stderr, "witness: failed to close bead %s (work already on main): %v\n", hookBead, err)
+			}
+			return false
+		}
 	}
 
 	// Circuit breaker (clown show #22): if this bead has already been
