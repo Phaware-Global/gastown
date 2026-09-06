@@ -68,6 +68,10 @@ func TestEnsurePolecatWorkBranch_CreatesFromMain(t *testing.T) {
 		t.Fatalf("precondition: expected to start on main, got %q", got)
 	}
 
+	prev := recordedReviewBranchFn
+	recordedReviewBranchFn = func(beadID string) (string, error) { return "", nil }
+	defer func() { recordedReviewBranchFn = prev }()
+
 	res, err := ensurePolecatWorkBranch(clone, "nux", "gt-tk5")
 	if err != nil {
 		t.Fatalf("ensurePolecatWorkBranch: %v", err)
@@ -92,6 +96,10 @@ func TestEnsurePolecatWorkBranch_CreatesFromMaster(t *testing.T) {
 		t.Fatalf("precondition: expected to start on master, got %q", got)
 	}
 
+	prev := recordedReviewBranchFn
+	recordedReviewBranchFn = func(beadID string) (string, error) { return "", nil }
+	defer func() { recordedReviewBranchFn = prev }()
+
 	res, err := ensurePolecatWorkBranch(clone, "nux", "gt-tk5")
 	if err != nil {
 		t.Fatalf("ensurePolecatWorkBranch on master-based repo: %v", err)
@@ -109,6 +117,10 @@ func TestEnsurePolecatWorkBranch_Noop(t *testing.T) {
 	clone := newOriginAndClone(t)
 	gitRun(t, clone, "checkout", "-b", "polecat/nux-gt-tk5")
 
+	prev := recordedReviewBranchFn
+	recordedReviewBranchFn = func(beadID string) (string, error) { return "", nil }
+	defer func() { recordedReviewBranchFn = prev }()
+
 	res, err := ensurePolecatWorkBranch(clone, "nux", "gt-tk5")
 	if err != nil {
 		t.Fatalf("ensurePolecatWorkBranch: %v", err)
@@ -124,6 +136,10 @@ func TestEnsurePolecatWorkBranch_Noop(t *testing.T) {
 func TestEnsurePolecatWorkBranch_ResumesExisting(t *testing.T) {
 	clone := newOriginAndClone(t)
 	gitRun(t, clone, "branch", "polecat/nux-gt-tk5", "main") // exists, but not checked out
+
+	prev := recordedReviewBranchFn
+	recordedReviewBranchFn = func(beadID string) (string, error) { return "", nil }
+	defer func() { recordedReviewBranchFn = prev }()
 
 	res, err := ensurePolecatWorkBranch(clone, "nux", "gt-tk5")
 	if err != nil {
@@ -253,6 +269,32 @@ func TestEnsurePolecatWorkBranch_ReviewBranchFetchFailureFailsLoud(t *testing.T)
 	}
 }
 
+// TestEnsurePolecatWorkBranch_UnknownReviewBranchStateFailsLoud pins the
+// production distinction between "confirmed no review branch recorded"
+// (beads.ErrNotFound → "", nil, safe to fall through to the default branch)
+// and "could not determine whether one is recorded" (e.g. beads.ErrNotInstalled
+// on a bd-less box → a real error). Collapsing the latter into the former
+// would let ensurePolecatWorkBranch silently build a fresh branch off
+// mainline whenever bd is unavailable — recreating gt-i48h's own bug
+// (silently abandoning a recorded review branch) through a different door.
+// A refinery correction on gt-i48h/PR #227 called this out explicitly after
+// an earlier (wrong) fix attempted exactly that collapse.
+func TestEnsurePolecatWorkBranch_UnknownReviewBranchStateFailsLoud(t *testing.T) {
+	clone := newOriginAndClone(t)
+
+	prev := recordedReviewBranchFn
+	recordedReviewBranchFn = func(beadID string) (string, error) { return "", beads.ErrNotInstalled }
+	defer func() { recordedReviewBranchFn = prev }()
+
+	if _, err := ensurePolecatWorkBranch(clone, "nux", "gt-tk5"); err == nil {
+		t.Fatal("expected a loud failure when the recorded-review-branch check itself failed, got nil")
+	}
+	// Must not have silently created a fresh branch off main instead.
+	if got := currentBranch(t, clone); got != "main" {
+		t.Errorf("worktree moved to %q despite the lookup failure; want to stay on main untouched", got)
+	}
+}
+
 // TestEnsurePolecatOffMain_NonPolecatNoop: the guard only applies to polecats.
 // A witness/refinery on main must pass through untouched.
 func TestEnsurePolecatOffMain_NonPolecatNoop(t *testing.T) {
@@ -285,6 +327,11 @@ func TestEnsurePolecatOffMain_AlreadyOffMain(t *testing.T) {
 func TestEnsurePolecatOffMain_RestoresFromMain(t *testing.T) {
 	clone := newOriginAndClone(t)
 	ctx := RoleContext{Role: RolePolecat, Polecat: "nux", WorkDir: clone}
+
+	prev := recordedReviewBranchFn
+	recordedReviewBranchFn = func(beadID string) (string, error) { return "", nil }
+	defer func() { recordedReviewBranchFn = prev }()
+
 	if err := ensurePolecatOffMain(ctx, &beads.Issue{ID: "gt-tk5"}); err != nil {
 		t.Fatalf("expected auto-restore, got error: %v", err)
 	}
