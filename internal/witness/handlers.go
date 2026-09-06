@@ -2,9 +2,11 @@ package witness
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1304,6 +1306,276 @@ func _verifyCommitOnMain(workDir, rigName, polecatName string) (bool, error) {
 
 	// Commit is not on any remote's default branch
 	return false, nil
+}
+
+// linkedPRForBead reports whether hookBead has a GitHub PR recorded for its
+// dispatch, and whether that PR has actually merged. This reads a fact
+// recorded at dispatch time rather than reconstructing one from git — the
+// approach PR #225 tried and that two review rounds each found broken one
+// layer further out (git in a worktree already confirmed deleted, then a
+// dispatch branch deleted by the merge it was trying to detect). A recorded
+// fact does not get deleted by a merge.
+//
+// PROVENANCE — exactly where the value comes from and how it is read, so a
+// reviewer can verify this without taking it on trust:
+//  1. At dispatch, gt done creates an MR bead (label gt:merge-request,
+//     ephemeral) whose description already contains
+//     "source_issue: <hookBead>" — done.go, the MR-creation block. This
+//     happens for every PR-mode dispatch, unconditionally, at push time.
+//  2. Once the refinery opens the actual PR, `gt refinery pr create` writes
+//     "review_pr: <N>" onto that SAME MR bead (refinery_pr.go,
+//     writeReviewPRToMR — review_pr is a first-class MRField, gt-5le).
+//  3. On a real merge, the refinery sets close_reason to "merged" on the MR
+//     bead (engineer.go HandleMRInfoSuccess: CloseWithReason("merged", ...)).
+//
+// So: find the MR bead(s) whose description matches source_issue==hookBead
+// (beads.MatchesMRSourceIssue, scanning ListMergeRequests(Status:"all") —
+// already-existing plumbing used elsewhere for the same MR-bead schema, see
+// FindOpenMRsForIssue/FindMRForReviewPR), read review_pr off it via
+// ParseMRFields, then ask GitHub to confirm that ONE PR's state by number —
+// which works whether or not the branch still exists, because a PR number is
+// never deleted by a merge.
+//
+// Returns hasPR=false when no MR bead records a review_pr for hookBead at
+// all — the safe default is to do nothing in that case (present in
+// resetAbandonedBead's caller), not to fall back to any worktree-based
+// heuristic: val's round-2 review confirmed the old on-main fallback can
+// never return true in production either, since both real callers of
+// resetAbandonedBead require the polecat directory to already be absent.
+//
+// Package-level var so tests can override.
+var linkedPRForBead = _linkedPRForBead
+
+// newBeadsClient constructs the beads client _linkedPRForBead queries for
+// MR beads. Package-level var so tests can point it at an isolated test
+// store (e.g. beads.NewIsolatedWithPort) and exercise the real
+// ListMergeRequests/MatchesMRSourceIssue/ParseMRFields pipeline instead of
+// stubbing it away — the whole point of this design is that the pipeline is
+// real bd data, not a mock.
+var newBeadsClient = func(workDir string) *beads.Beads { return beads.New(workDir) }
+
+func _linkedPRForBead(workDir, rigName, hookBead string) (hasPR bool, merged bool, err error) {
+	// Cheap, bd-only check FIRST: does this bead even have a recorded PR at
+	// all? Only if it does do we need to resolve WHERE to check it (town
+	// root, rig config, git_url, GitHub owner/repo). Those resolution steps
+	// fail permanently for any rig that isn't exactly a plain github.com
+	// remote — ssh://git@github.com/..., git://, gitlab.com, bitbucket.org,
+	// file://, a port suffix, even case differences are all real, first-
+	// class rig configurations in gastown (internal/bitbucket, rig add's
+	// documented forms). Resolving them BEFORE checking for a recorded PR
+	// meant every such rig hit prErr on EVERY orphaned bead regardless of
+	// whether it had a PR to check — and since prErr now means "leave the
+	// bead alone forever" (this PR's own round-3 fix), that permanently
+	// disabled orphan recovery for any non-plain-github.com rig, which is a
+	// regression against main (round-4 review). "No PR recorded" must stay
+	// reachable, and cheap, for every rig regardless of hosting provider.
+	b := newBeadsClient(workDir)
+	mrs, mrErr := b.ListMergeRequests(beads.ListOptions{Status: "all", Label: "gt:merge-request"})
+	if mrErr != nil {
+		return false, false, fmt.Errorf("listing merge requests for %s: %w", hookBead, mrErr)
+	}
+
+	var prNumbers []int
+	for _, mr := range mrs {
+		if !beads.MatchesMRSourceIssue(mr.Description, hookBead) {
+			continue
+		}
+		fields := beads.ParseMRFields(mr)
+		if fields != nil && fields.ReviewPR > 0 {
+			prNumbers = append(prNumbers, fields.ReviewPR)
+		}
+	}
+	if len(prNumbers) == 0 {
+		return false, false, nil // no PR recorded for this bead — safe to reset normally
+	}
+
+	// A PR IS recorded, so we now need to resolve where to check it.
+	townRoot, tErr := workspace.Find(workDir)
+	if tErr != nil || townRoot == "" {
+		return false, false, fmt.Errorf("finding town root: %v", tErr)
+	}
+
+	rigCfg, cfgErr := rig.LoadRigConfig(filepath.Join(townRoot, rigName))
+	if cfgErr != nil {
+		return false, false, fmt.Errorf("loading rig config for %s: %w", rigName, cfgErr)
+	}
+	if rigCfg.GitURL == "" {
+		return false, false, fmt.Errorf("rig %s has no git_url configured", rigName)
+	}
+
+	// The PR always lives in the rig's own (upstream) repo — refinery opens
+	// it there regardless of which remote a polecat pushed its branch to —
+	// so this uses GitURL specifically, never PushURL (a fork-rig's read/write
+	// split matters for where branches are pushed, not for where PRs live).
+	owner, repoName, parseErr := parseGitHubOwnerRepo(rigCfg.GitURL)
+	if parseErr != nil {
+		return false, false, fmt.Errorf("resolving owner/repo for %s: %w", rigName, parseErr)
+	}
+
+	// One shared deadline for ALL of this bead's recorded PRs, not one fresh
+	// ghPRTimeout per PR number — a bead with N recorded PRs (retries/rework)
+	// must still cost at most one timeout, not N. Within that overall
+	// budget, each individual PR number gets at most ghPRPerAttemptTimeout
+	// so a single hanging attempt can't consume the whole shared deadline
+	// and starve every other recorded PR of a chance to answer (val's PR
+	// #226 round-3 review: the first attempt hogging the budget could hide
+	// a later PR that actually merged).
+	ctx, cancel := context.WithTimeout(context.Background(), ghPRTimeout)
+	defer cancel()
+
+	// A bead is normally dispatched once, but retries/rework can leave more
+	// than one MR bead behind. Any one of their recorded PRs landing means
+	// the work is done.
+	var stateErr error
+	for _, prNumber := range prNumbers {
+		if ctx.Err() != nil {
+			// The bead's overall budget is already spent from an earlier
+			// attempt — no point trying another. Record it as the reason:
+			// this PR number was never actually checked, so it must not
+			// silently count as a confident "not merged" below. Unchecked
+			// must surface as an error (which the caller already treats as
+			// "leave the bead alone"), never as a negative answer — the
+			// same fail-open shape this whole design exists to eliminate,
+			// just occurring one function deeper (mayor's ruling, gt-0t6b).
+			stateErr = ctx.Err()
+			break
+		}
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, ghPRPerAttemptTimeout)
+		isMerged, err := ghPRMergedByNumber(attemptCtx, owner, repoName, prNumber)
+		attemptCancel()
+		if err != nil {
+			stateErr = err
+			continue
+		}
+		if isMerged {
+			return true, true, nil
+		}
+	}
+	if stateErr != nil {
+		return true, false, fmt.Errorf("checking recorded PR state for %s: %w", hookBead, stateErr)
+	}
+	return true, false, nil
+}
+
+// Mayor's ruling on gt-0t6b (after rounds 2-4): the circuit breaker and the
+// MR-list cache that used to live here were a performance/bounding layer on
+// top of the per-bead + per-attempt deadlines below, and that layer alone
+// produced every review finding from round 2 onward (fail-open across every
+// rig, cached errors replayed sweep-wide, one slow call hiding a later
+// merged PR). The deadlines already bound the work; the breaker and cache
+// were belt-and-braces that kept misbehaving. Deliberately not present here
+// — see gt-0t6b's history if "gt up" is later measured to need it back, with
+// a measurement attached rather than speculative machinery.
+
+// ghPRTimeout bounds the total gh CLI work for one bead's recorded PRs (all
+// of them combined) so a stalled or unreachable GitHub API can never hang
+// the witness patrol sweep indefinitely — that sweep is what calls this
+// code, so an unbounded call here is how a sweep silently stops running
+// (gt-gsva/#225 review, val).
+//
+// Package-level var (not const) so tests can shrink it to exercise real
+// timeout/deadline-exhaustion behavior without waiting out the real 30s.
+var ghPRTimeout = 30 * time.Second
+
+// ghPRPerAttemptTimeout caps a single PR-number lookup within ghPRTimeout's
+// overall per-bead budget. Without this, the first recorded PR to hang would
+// consume the entire shared deadline and prevent any later PR number (e.g.
+// from a retry/rework) from ever being checked, even if it would have
+// answered instantly and confirmed a real merge (val's PR #226 round-3
+// review).
+//
+// Package-level var (not const) so tests can shrink it alongside ghPRTimeout.
+var ghPRPerAttemptTimeout = 10 * time.Second
+
+// ghPRMergedByNumber reports whether the given PR number has merged. Looking
+// up by number rather than by branch/head-ref is what makes this survive the
+// branch being deleted after merge. ctx carries the caller's shared deadline
+// (one budget per bead, not one fresh ghPRTimeout per recorded PR number).
+//
+// Package-level var so tests can override.
+var ghPRMergedByNumber = _ghPRMergedByNumber
+
+func _ghPRMergedByNumber(ctx context.Context, owner, repoName string, prNumber int) (merged bool, err error) {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view", strconv.Itoa(prNumber),
+		"--repo", owner+"/"+repoName,
+		"--json", "state")
+	// A context deadline alone does not bound a subprocess whose grandchild
+	// holds the stdout pipe open (the gh CLI can spawn a helper); WaitDelay
+	// forces the process group closed once the context is done instead of
+	// leaving cmd.Wait() blocked forever.
+	cmd.WaitDelay = 5 * time.Second
+
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, fmt.Errorf("gh pr view #%d timed out or was canceled: %w", prNumber, ctx.Err())
+		}
+		return false, fmt.Errorf("gh pr view #%d: %w", prNumber, err)
+	}
+	var pr struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &pr); err != nil {
+		return false, fmt.Errorf("parsing gh pr view #%d output: %w", prNumber, err)
+	}
+	return pr.State == "MERGED", nil
+}
+
+// parseGitHubOwnerRepo extracts "owner", "repo" from a GitHub remote URL in
+// either https://github.com/owner/repo(.git) or git@github.com:owner/repo(.git)
+// form. Pure string parsing — no git/network call needed, unlike
+// (*git.Git).ghRepoOwnerName, which requires an existing local checkout.
+func parseGitHubOwnerRepo(remoteURL string) (owner, repoName string, err error) {
+	// Trailing slash must be trimmed BEFORE the .git suffix, not after: for
+	// ".../owner/repo.git/", trimming ".git" first finds no match (the
+	// string ends in ".git/", not ".git") and leaves "repo.git" as the repo
+	// name once the slash is stripped afterward. Order matters here.
+	trimmed := strings.TrimRight(strings.TrimSpace(remoteURL), "/")
+	trimmed = strings.TrimSuffix(trimmed, ".git")
+
+	// SSH/SCP-like form: git@github.com:owner/repo. Anchored at the very
+	// start of the string — "github.com:" must BE the host segment right
+	// after "git@", not merely appear somewhere in the URL.
+	const sshPrefix = "git@github.com:"
+	if strings.HasPrefix(trimmed, sshPrefix) {
+		return splitGitHubOwnerRepo(strings.TrimPrefix(trimmed, sshPrefix), remoteURL)
+	}
+
+	// scheme://... form — parse structurally and require the host to BE
+	// github.com, not merely contain "github.com/" as a substring. An
+	// unanchored strings.Index match let a crafted git_url like
+	// "https://evil.example.com/x/github.com/attacker/repo" resolve to
+	// owner=attacker, repo=repo — a self-hosted or misconfigured rig would
+	// then read/close live work on an unrelated public GitHub repo.
+	//
+	// http/https/ssh/git are all documented, validated rig git_url schemes
+	// (internal/cmd/rig.go, rig_test.go, telegraph/rigs.go already parse
+	// ssh://). Admitting only http/https left every ssh://git@github.com/...
+	// rig erroring here — and since prErr now means leave-alone, that
+	// permanently stranded every orphan with a recorded PR on such a rig,
+	// the same shape of regression round 4 fixed for the no-PR path.
+	if u, parseErr := url.Parse(trimmed); parseErr == nil && u.Host == "github.com" {
+		switch u.Scheme {
+		case "http", "https", "ssh", "git":
+			return splitGitHubOwnerRepo(strings.TrimPrefix(u.Path, "/"), remoteURL)
+		}
+	}
+
+	return "", "", fmt.Errorf("could not parse owner/repo from url %q", util.RedactURL(remoteURL))
+}
+
+// splitGitHubOwnerRepo splits an already-host-anchored "owner/repo" tail.
+// originalURL is only used for the (redacted) error message.
+func splitGitHubOwnerRepo(tail, originalURL string) (owner, repoName string, err error) {
+	parts := strings.Split(tail, "/")
+	// Exactly owner/repo — reject anything with extra path segments (e.g.
+	// github.com/owner/repo/tree/main) rather than silently folding them
+	// into repoName, which would send gh a malformed "owner/repo/extra"
+	// spec instead of a clean, traceable error.
+	if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+		return parts[0], parts[1], nil
+	}
+	return "", "", fmt.Errorf("could not parse owner/repo from url %q", util.RedactURL(originalURL))
 }
 
 // verifyBranchAlreadyMerged checks whether the polecat's current branch work has
@@ -2631,15 +2903,42 @@ func resetAbandonedBead(bd *BdCli, workDir, rigName, hookBead, polecatName strin
 	}
 	maxRespawns := config.LoadOperationalConfig(trRoot).GetWitnessConfig().MaxBeadRespawnsV()
 
-	// Guard: if the polecat's commit is already on the default branch,
-	// the work is done — close the bead instead of resetting for re-dispatch.
-	// This prevents the spawn-storm / duplicate-work loop described in #2036.
-	if onMain, err := verifyCommitOnMain(workDir, rigName, polecatName); err == nil && onMain {
-		reason := fmt.Sprintf("Work already on main (verified by witness, polecat %s)", polecatName)
+	// Guard: read the PR recorded for this bead's dispatch (if any) rather
+	// than reconstructing it from git. An idle polecat's worktree is gone by
+	// the time this runs (both callers require it absent first) and its
+	// dispatch branch is deleted once merged, so any check built on the
+	// worktree or the branch existing is unreachable in production (gt-0t6b,
+	// supersedes #225's two rounds of the same defect). If a PR was recorded
+	// and it merged, the work is done — close instead of resetting. If none
+	// was recorded, do nothing here: that is the safe default, not a gap —
+	// falls through to the normal reset-for-redispatch path below.
+	hasPR, prMerged, prErr := linkedPRForBead(workDir, rigName, hookBead)
+	switch {
+	case prErr != nil:
+		// The PR state could not be determined (gh unreachable, auth
+		// expired, rate limited, deadline exhausted, owner/repo unresolvable).
+		// This must be visible — a silently-broken guard is how this class of
+		// bug lives for months — and the bead must be left ALONE: not
+		// closed, and NOT reset for re-dispatch either. Falling through to
+		// reset would treat "unknown" the same as "no PR recorded", and
+		// that is a real, reachable path to re-dispatching work that has
+		// already landed — every bit as much a "close/act on incomplete
+		// information" defect as the bug this bead exists to fix (mayor's
+		// ruling on gt-0t6b round 2: unknown is not "no PR"; unknown means
+		// do nothing). A bead that stays hooked one more patrol cycle is
+		// invisible; work re-dispatched on top of already-merged work is not.
+		fmt.Fprintf(os.Stderr, "witness: could not confirm recorded PR state for bead %s: %v (leaving untouched)\n", hookBead, prErr)
+		return false
+	case hasPR && prMerged:
+		reason := fmt.Sprintf("Work merged via recorded PR (verified by witness, polecat %s)", polecatName)
 		if err := bd.Run(workDir, "close", hookBead, "-r", reason); err != nil {
-			fmt.Fprintf(os.Stderr, "witness: failed to close bead %s (work already on main): %v\n", hookBead, err)
+			fmt.Fprintf(os.Stderr, "witness: failed to close bead %s (recorded PR merged): %v\n", hookBead, err)
 		}
 		return false
+	case hasPR && !prMerged:
+		// Recorded PR is still open (or closed without merging) — work has
+		// not landed. Fall through so the bead resets for re-dispatch and
+		// gt sling can send review-fix work against the still-open PR.
 	}
 
 	// Circuit breaker (clown show #22): if this bead has already been

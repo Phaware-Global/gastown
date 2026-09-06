@@ -1,6 +1,7 @@
 package witness
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/polecat"
+	"github.com/steveyegge/gastown/internal/testutil"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -1202,16 +1205,16 @@ func TestResetAbandonedBead_NoRouter(t *testing.T) {
 	}
 }
 
-func TestResetAbandonedBead_ClosesWhenWorkOnMain(t *testing.T) {
-	// Not parallel: overrides package-level verifyCommitOnMain.
-	// When verifyCommitOnMain returns true, resetAbandonedBead should close the
-	// bead instead of resetting it for re-dispatch. This is the fix for #2036.
+func TestResetAbandonedBead_ClosesWhenRecordedPRMerged(t *testing.T) {
+	// Not parallel: overrides package-level linkedPRForBead.
+	// gt-0t6b: when the recorded PR has merged, resetAbandonedBead should
+	// close the bead instead of resetting it for re-dispatch.
 
-	oldVerify := verifyCommitOnMain
-	verifyCommitOnMain = func(workDir, rigName, polecatName string) (bool, error) {
-		return true, nil // work is on main
+	oldLinkedPR := linkedPRForBead
+	linkedPRForBead = func(workDir, rigName, hookBead string) (bool, bool, error) {
+		return true, true, nil // recorded PR, merged
 	}
-	t.Cleanup(func() { verifyCommitOnMain = oldVerify })
+	t.Cleanup(func() { linkedPRForBead = oldLinkedPR })
 
 	bd, mock := mockBd(
 		func(args []string) (string, error) {
@@ -1228,10 +1231,9 @@ func TestResetAbandonedBead_ClosesWhenWorkOnMain(t *testing.T) {
 	tmpDir := t.TempDir()
 	result := resetAbandonedBead(bd, tmpDir, "testrig", "gt-work123", "alpha", nil)
 	if result {
-		t.Error("resetAbandonedBead should return false when work is on main (bead closed, not re-dispatched)")
+		t.Error("resetAbandonedBead should return false when the recorded PR has merged (bead closed, not re-dispatched)")
 	}
 
-	// Verify "close" was called, NOT "update ... --status=open"
 	var foundClose, foundUpdate bool
 	for _, call := range mock.calls {
 		if strings.Contains(call, "close gt-work123") {
@@ -1245,20 +1247,21 @@ func TestResetAbandonedBead_ClosesWhenWorkOnMain(t *testing.T) {
 		t.Errorf("expected bd close to be called, got calls: %v", mock.calls)
 	}
 	if foundUpdate {
-		t.Error("bd update --status=open should NOT be called when work is on main")
+		t.Error("bd update --status=open should NOT be called when the recorded PR has merged")
 	}
 }
 
-func TestResetAbandonedBead_ResetsWhenWorkNotOnMain(t *testing.T) {
-	// Not parallel: overrides package-level verifyCommitOnMain.
-	// When verifyCommitOnMain returns false, resetAbandonedBead should reset
-	// the bead for re-dispatch (existing behavior).
+func TestResetAbandonedBead_ResetsWhenNoPRRecorded(t *testing.T) {
+	// Not parallel: overrides package-level linkedPRForBead.
+	// gt-0t6b: no PR recorded at all (e.g. direct-merge convoys that never
+	// open one) -> safe default is to do nothing here, falling through to
+	// the normal reset-for-redispatch path.
 
-	oldVerify := verifyCommitOnMain
-	verifyCommitOnMain = func(workDir, rigName, polecatName string) (bool, error) {
-		return false, nil // work NOT on main
+	oldLinkedPR := linkedPRForBead
+	linkedPRForBead = func(workDir, rigName, hookBead string) (bool, bool, error) {
+		return false, false, nil // no PR recorded
 	}
-	t.Cleanup(func() { verifyCommitOnMain = oldVerify })
+	t.Cleanup(func() { linkedPRForBead = oldLinkedPR })
 
 	bd, mock := mockBd(
 		func(args []string) (string, error) {
@@ -1275,10 +1278,9 @@ func TestResetAbandonedBead_ResetsWhenWorkNotOnMain(t *testing.T) {
 	tmpDir := t.TempDir()
 	result := resetAbandonedBead(bd, tmpDir, "testrig", "gt-work123", "alpha", nil)
 	if !result {
-		t.Error("resetAbandonedBead should return true when work is NOT on main (bead reset for re-dispatch)")
+		t.Error("resetAbandonedBead should return true when no PR is recorded (bead reset for re-dispatch)")
 	}
 
-	// Verify "update --status=open" was called (normal reset path)
 	var foundUpdate bool
 	for _, call := range mock.calls {
 		if strings.Contains(call, "update") && strings.Contains(call, "--status=open") {
@@ -1287,6 +1289,498 @@ func TestResetAbandonedBead_ResetsWhenWorkNotOnMain(t *testing.T) {
 	}
 	if !foundUpdate {
 		t.Errorf("expected bd update --status=open to be called, got calls: %v", mock.calls)
+	}
+}
+
+func TestResetAbandonedBead_DoesNotCloseWhenRecordedPROpen(t *testing.T) {
+	// Not parallel: overrides package-level linkedPRForBead.
+	// gt-0t6b ACCEPTANCE #1, RED FIRST against plain main: before gt-gsva/
+	// gt-0t6b, resetAbandonedBead only checked verifyCommitOnMain, which is
+	// true for every idle worktree regardless of whether the polecat's real
+	// work ever merged — so a hooked bead with a genuinely open PR would get
+	// closed anyway. This is the faithful repro: a PR is recorded and it is
+	// still open. The bead must NOT close, and must come back dispatchable
+	// (status=open) so gt sling can send review-fix work to it.
+
+	oldLinkedPR := linkedPRForBead
+	linkedPRForBead = func(workDir, rigName, hookBead string) (bool, bool, error) {
+		return true, false, nil // recorded PR, NOT merged
+	}
+	t.Cleanup(func() { linkedPRForBead = oldLinkedPR })
+
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			if len(args) >= 1 && args[0] == "show" {
+				return `[{"status":"hooked"}]`, nil
+			}
+			return "", nil
+		},
+		func(args []string) error {
+			return nil
+		},
+	)
+
+	tmpDir := t.TempDir()
+	result := resetAbandonedBead(bd, tmpDir, "testrig", "gt-work123", "alpha", nil)
+	if !result {
+		t.Error("resetAbandonedBead should return true when the recorded PR is still open (bead reset for re-dispatch, not closed)")
+	}
+
+	var foundClose, foundUpdate bool
+	for _, call := range mock.calls {
+		if strings.Contains(call, "close gt-work123") {
+			foundClose = true
+		}
+		if strings.Contains(call, "update") && strings.Contains(call, "--status=open") {
+			foundUpdate = true
+		}
+	}
+	if foundClose {
+		t.Error("bd close should NOT be called while the recorded PR is still open")
+	}
+	if !foundUpdate {
+		t.Errorf("expected bd update --status=open to be called (dispatchable by gt sling), got calls: %v", mock.calls)
+	}
+}
+
+func TestResetAbandonedBead_LeavesBeadUntouchedWhenPRStateUndeterminable(t *testing.T) {
+	// Not parallel: overrides package-level linkedPRForBead.
+	// gt-0t6b, mayor's round-2 ruling: PR state couldn't be confirmed (gh
+	// unreachable, auth expired, rate limited, deadline exhausted, owner/repo
+	// unresolvable) -> the bead must be left ALONE. Not closed, and NOT reset for
+	// re-dispatch either — falling through to reset would treat "unknown"
+	// the same as "no PR recorded", silently re-dispatching work that may
+	// already have landed. Un-closed-and-unreset is the only safe outcome:
+	// a bead that stays hooked one more patrol cycle is invisible; work
+	// re-dispatched on top of already-merged work is not.
+
+	oldLinkedPR := linkedPRForBead
+	linkedPRForBead = func(workDir, rigName, hookBead string) (bool, bool, error) {
+		return true, false, errors.New("gh pr view: network unreachable")
+	}
+	t.Cleanup(func() { linkedPRForBead = oldLinkedPR })
+
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			if len(args) >= 1 && args[0] == "show" {
+				return `[{"status":"hooked"}]`, nil
+			}
+			return "", nil
+		},
+		func(args []string) error {
+			return nil
+		},
+	)
+
+	tmpDir := t.TempDir()
+	result := resetAbandonedBead(bd, tmpDir, "testrig", "gt-work123", "alpha", nil)
+	if result {
+		t.Error("resetAbandonedBead should return false when PR state can't be determined (bead left untouched, not recovered)")
+	}
+
+	var foundClose, foundUpdate bool
+	for _, call := range mock.calls {
+		if strings.Contains(call, "close gt-work123") {
+			foundClose = true
+		}
+		if strings.Contains(call, "update") && strings.Contains(call, "--status=open") {
+			foundUpdate = true
+		}
+	}
+	if foundClose {
+		t.Error("bd close should NOT be called when the recorded PR's state could not be determined")
+	}
+	if foundUpdate {
+		t.Error("bd update --status=open should NOT be called either — unknown state means do nothing, not reset")
+	}
+}
+
+// TestLinkedPRForBead_RealBeadsStore exercises the REAL _linkedPRForBead —
+// not the stubbed linkedPRForBead package var — against a real Dolt-backed
+// beads store, proving the whole provenance chain actually works: creating
+// a source issue and an MR bead recording source_issue/review_pr on it (the
+// same shape gt done and gt refinery pr create write in production), then
+// confirming _linkedPRForBead finds it via the real
+// ListMergeRequests/MatchesMRSourceIssue/ParseMRFields pipeline. Only the
+// GitHub-specific, network-dependent call (ghPRMergedByNumber) is stubbed —
+// the reasonable external boundary — everything else is real bd data. This
+// is the seam PR #225's review found completely unexercised in the prior
+// (branch-reconstruction) design; carrying the same discipline forward here.
+//
+// workDir is deliberately never created on disk, proving the lookup does
+// not depend on the polecat's worktree existing (gt-0t6b acceptance #3).
+func TestLinkedPRForBead_RealBeadsStore(t *testing.T) {
+	testutil.RequireDoltContainer(t)
+	port, err := strconv.Atoi(testutil.DoltContainerPort())
+	if err != nil {
+		t.Fatalf("parsing dolt container port: %v", err)
+	}
+
+	townRoot := t.TempDir()
+	rigName := "testrig"
+	rigPath := filepath.Join(townRoot, rigName)
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	rigConfig := `{"type":"rig","version":1,"name":"testrig","git_url":"https://github.com/exampleorg/examplerepo.git"}`
+	if err := os.WriteFile(filepath.Join(rigPath, "config.json"), []byte(rigConfig), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	b := beads.NewIsolatedWithPort(rigPath, port)
+	if err := b.Init("gt"); err != nil {
+		// bd init can exit 0 with empty stdout (--quiet) and an informational
+		// stderr line — e.g. its first-run anonymous-metrics notice — and
+		// internal/beads's error-detection heuristic ("empty stdout + non-empty
+		// stderr" is normally the signature of a real bd bug) misreads that as
+		// a failure. That misfires here on a fully healthy machine, so treat
+		// this as skip-worthy ONLY when bd itself is genuinely unavailable;
+		// otherwise proceed — a real, still-broken store will fail loudly on
+		// the very next real operation below instead of silently vanishing
+		// into a skip (see: gt-0t6b PR #226 round-1 review).
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, beads.ErrNotInstalled) || strings.Contains(err.Error(), "executable file not found") {
+			// beads.Beads.wrapError (internal/beads/beads.go) catches the raw
+			// exec.ErrNotFound and replaces it with the beads.ErrNotInstalled
+			// sentinel WITHOUT %w-wrapping it, so errors.Is(err,
+			// exec.ErrNotFound) alone can never match — this genuinely-absent
+			// case must be checked for its actual sentinel (found the hard
+			// way: this fired as a silent "Test" CI job failure on every
+			// commit from round 1 through round 8, since that job never
+			// installs bd).
+			t.Skipf("bd binary not available: %v", err)
+		}
+		t.Logf("bd init returned a non-fatal notice, proceeding: %v", err)
+	}
+
+	// Never created on disk — the point of the test.
+	workDir := filepath.Join(rigPath, "polecats", "alpha", rigName)
+
+	oldNewClient := newBeadsClient
+	newBeadsClient = func(workDir string) *beads.Beads {
+		return beads.NewIsolatedWithPort(rigPath, port)
+	}
+	t.Cleanup(func() { newBeadsClient = oldNewClient })
+
+	var queriedOwner, queriedRepo string
+	var queriedPRs []int
+	oldGhMerged := ghPRMergedByNumber
+	ghPRMergedByNumber = func(ctx context.Context, owner, repoName string, prNumber int) (bool, error) {
+		queriedOwner, queriedRepo = owner, repoName
+		queriedPRs = append(queriedPRs, prNumber)
+		return prNumber == 42, nil
+	}
+	t.Cleanup(func() { ghPRMergedByNumber = oldGhMerged })
+
+	srcIssue, err := b.Create(beads.CreateOptions{Title: "Some work", Labels: []string{"gt:task"}})
+	if err != nil {
+		t.Fatalf("create source issue: %v", err)
+	}
+
+	mrDesc := "branch: polecat/alpha/" + srcIssue.ID + "@abc123\n" +
+		"target: main\n" +
+		"source_issue: " + srcIssue.ID + "\n" +
+		"review_pr: 42"
+	if _, err := b.Create(beads.CreateOptions{
+		Title:       "Merge: " + srcIssue.ID,
+		Labels:      []string{"gt:merge-request"},
+		Description: mrDesc,
+		Ephemeral:   true,
+	}); err != nil {
+		t.Fatalf("create MR issue: %v", err)
+	}
+
+	hasPR, merged, err := _linkedPRForBead(workDir, rigName, srcIssue.ID)
+	if err != nil {
+		t.Fatalf("_linkedPRForBead: %v", err)
+	}
+	if !hasPR || !merged {
+		t.Errorf("_linkedPRForBead(%s) = (%v, %v), want (true, true)", srcIssue.ID, hasPR, merged)
+	}
+	if len(queriedPRs) != 1 || queriedPRs[0] != 42 {
+		t.Errorf("expected exactly one gh lookup for PR #42, got %v", queriedPRs)
+	}
+	if queriedOwner != "exampleorg" || queriedRepo != "examplerepo" {
+		t.Errorf("owner/repo = (%q, %q), want (exampleorg, examplerepo)", queriedOwner, queriedRepo)
+	}
+
+	// A bead with no matching MR bead at all must report hasPR=false, not error.
+	hasPR2, _, err := _linkedPRForBead(workDir, rigName, "no-such-bead")
+	if err != nil {
+		t.Fatalf("_linkedPRForBead(no-such-bead): %v", err)
+	}
+	if hasPR2 {
+		t.Error("_linkedPRForBead(no-such-bead) hasPR = true, want false (no MR bead records it)")
+	}
+}
+
+// TestLinkedPRForBead_UncheckedPRIsNeverReportedAsNotMerged is the round-5
+// finding: if the bead's shared deadline expires before every recorded PR
+// number has actually been attempted, the loop must not fall through and
+// report a confident "not merged" for the ones it never checked. Unchecked
+// must surface as an error — which resetAbandonedBead already treats as
+// "leave the bead alone" — never as a negative answer. A bead with 2
+// recorded PRs where the first attempt consumes the entire shared budget
+// must error, not silently resolve to (true, false, nil).
+func TestLinkedPRForBead_UncheckedPRIsNeverReportedAsNotMerged(t *testing.T) {
+	// Not parallel: overrides package-level ghPRTimeout/ghPRPerAttemptTimeout
+	// to exercise real deadline-exhaustion behavior without waiting out the
+	// real 30s/10s. ghPRPerAttemptTimeout is set MUCH larger than ghPRTimeout
+	// (not merely >=) so attempt 1's own context is unambiguously governed
+	// by the outer deadline alone (Go's context package recognizes the
+	// parent's earlier deadline and propagates it directly rather than
+	// racing two independent timers close together) — removing the
+	// microsecond-scale timing race a near-equal pair of deadlines would
+	// otherwise risk.
+	oldTimeout, oldPerAttempt := ghPRTimeout, ghPRPerAttemptTimeout
+	ghPRTimeout = 30 * time.Millisecond
+	ghPRPerAttemptTimeout = time.Second
+	t.Cleanup(func() { ghPRTimeout, ghPRPerAttemptTimeout = oldTimeout, oldPerAttempt })
+
+	testutil.RequireDoltContainer(t)
+	port, err := strconv.Atoi(testutil.DoltContainerPort())
+	if err != nil {
+		t.Fatalf("parsing dolt container port: %v", err)
+	}
+
+	townRoot := t.TempDir()
+	rigName := "testrig"
+	rigPath := filepath.Join(townRoot, rigName)
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	rigConfig := `{"type":"rig","version":1,"name":"testrig","git_url":"https://github.com/exampleorg/examplerepo.git"}`
+	if err := os.WriteFile(filepath.Join(rigPath, "config.json"), []byte(rigConfig), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	b := beads.NewIsolatedWithPort(rigPath, port)
+	if err := b.Init("gt"); err != nil {
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, beads.ErrNotInstalled) || strings.Contains(err.Error(), "executable file not found") {
+			// beads.Beads.wrapError (internal/beads/beads.go) catches the raw
+			// exec.ErrNotFound and replaces it with the beads.ErrNotInstalled
+			// sentinel WITHOUT %w-wrapping it, so errors.Is(err,
+			// exec.ErrNotFound) alone can never match — this genuinely-absent
+			// case must be checked for its actual sentinel (found the hard
+			// way: this fired as a silent "Test" CI job failure on every
+			// commit from round 1 through round 8, since that job never
+			// installs bd).
+			t.Skipf("bd binary not available: %v", err)
+		}
+		t.Logf("bd init returned a non-fatal notice, proceeding: %v", err)
+	}
+
+	oldNewClient := newBeadsClient
+	newBeadsClient = func(workDir string) *beads.Beads { return beads.NewIsolatedWithPort(rigPath, port) }
+	t.Cleanup(func() { newBeadsClient = oldNewClient })
+
+	var checkedPRs []int
+	oldGhMerged := ghPRMergedByNumber
+	ghPRMergedByNumber = func(ctx context.Context, owner, repoName string, prNumber int) (bool, error) {
+		checkedPRs = append(checkedPRs, prNumber)
+		<-ctx.Done() // simulate a hang: consume the entire shared per-bead budget
+		return false, ctx.Err()
+	}
+	t.Cleanup(func() { ghPRMergedByNumber = oldGhMerged })
+
+	srcIssue, err := b.Create(beads.CreateOptions{Title: "Some work", Labels: []string{"gt:task"}})
+	if err != nil {
+		t.Fatalf("create source issue: %v", err)
+	}
+	// TWO recorded PRs (simulating a retry/rework) via two MR beads for the
+	// same source issue — the first attempt alone exhausts the shared
+	// budget, so the second must never actually be attempted.
+	for i, prNum := range []int{10, 20} {
+		mrDesc := fmt.Sprintf("branch: polecat/alpha/%s@abc%d\ntarget: main\nsource_issue: %s\nreview_pr: %d", srcIssue.ID, i, srcIssue.ID, prNum)
+		if _, err := b.Create(beads.CreateOptions{
+			Title:       fmt.Sprintf("Merge: %s (%d)", srcIssue.ID, i),
+			Labels:      []string{"gt:merge-request"},
+			Description: mrDesc,
+			Ephemeral:   true,
+		}); err != nil {
+			t.Fatalf("create MR issue %d: %v", i, err)
+		}
+	}
+
+	workDir := filepath.Join(rigPath, "polecats", "alpha", rigName)
+	hasPR, merged, err := _linkedPRForBead(workDir, rigName, srcIssue.ID)
+	if err == nil {
+		t.Fatalf("_linkedPRForBead should error when the shared budget expires before every recorded PR is checked; got (%v, %v, nil)", hasPR, merged)
+	}
+	if merged {
+		t.Error("_linkedPRForBead must not report merged=true when the state is actually unknown")
+	}
+	// Exactly one of the two recorded PRs gets attempted — ListMergeRequests
+	// does not guarantee the order it returns MR beads in, so this asserts
+	// "only one was ever tried" rather than assuming which one.
+	if len(checkedPRs) != 1 {
+		t.Errorf("expected exactly 1 PR attempted (the one that exhausted the shared budget), got %v", checkedPRs)
+	}
+}
+
+// TestLinkedPRForBead_NonGitHubRigWithNoRecordedPR is the round-4 regression
+// repro: a rig whose git_url is NOT a plain github.com remote (bitbucket,
+// gitlab, ssh://, git://, file://, a port suffix — all real, first-class rig
+// configurations in gastown) used to hit the workspace/rig-config/owner-repo
+// resolution chain, and thus prErr, on EVERY orphaned bead in that rig —
+// regardless of whether the bead had a recorded PR at all. Since prErr means
+// "leave the bead alone forever" (this PR's round-3 fix), that permanently
+// disabled orphan recovery for any such rig. A bead with NO recorded PR must
+// resolve via the cheap bd-only check alone and never even attempt to parse
+// git_url.
+func TestLinkedPRForBead_NonGitHubRigWithNoRecordedPR(t *testing.T) {
+	testutil.RequireDoltContainer(t)
+	port, err := strconv.Atoi(testutil.DoltContainerPort())
+	if err != nil {
+		t.Fatalf("parsing dolt container port: %v", err)
+	}
+
+	townRoot := t.TempDir()
+	rigName := "bitbucketrig"
+	rigPath := filepath.Join(townRoot, rigName)
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately NOT a plain github.com remote — this is what a bitbucket-
+	// hosted rig's config.json looks like (internal/bitbucket is a full PR
+	// client; this is a real, supported configuration, not an edge case).
+	rigConfig := `{"type":"rig","version":1,"name":"bitbucketrig","git_url":"https://bitbucket.org/exampleorg/examplerepo.git"}`
+	if err := os.WriteFile(filepath.Join(rigPath, "config.json"), []byte(rigConfig), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	b := beads.NewIsolatedWithPort(rigPath, port)
+	if err := b.Init("gt"); err != nil {
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, beads.ErrNotInstalled) || strings.Contains(err.Error(), "executable file not found") {
+			// beads.Beads.wrapError (internal/beads/beads.go) catches the raw
+			// exec.ErrNotFound and replaces it with the beads.ErrNotInstalled
+			// sentinel WITHOUT %w-wrapping it, so errors.Is(err,
+			// exec.ErrNotFound) alone can never match — this genuinely-absent
+			// case must be checked for its actual sentinel (found the hard
+			// way: this fired as a silent "Test" CI job failure on every
+			// commit from round 1 through round 8, since that job never
+			// installs bd).
+			t.Skipf("bd binary not available: %v", err)
+		}
+		t.Logf("bd init returned a non-fatal notice, proceeding: %v", err)
+	}
+
+	oldNewClient := newBeadsClient
+	newBeadsClient = func(workDir string) *beads.Beads { return beads.NewIsolatedWithPort(rigPath, port) }
+	t.Cleanup(func() { newBeadsClient = oldNewClient })
+
+	srcIssue, err := b.Create(beads.CreateOptions{Title: "Some bitbucket-rig work", Labels: []string{"gt:task"}})
+	if err != nil {
+		t.Fatalf("create source issue: %v", err)
+	}
+	// No MR bead created at all for srcIssue — this is the "abandoned before
+	// any PR was ever opened" case that must stay resettable.
+
+	workDir := filepath.Join(rigPath, "polecats", "alpha", rigName)
+
+	hasPR, merged, err := _linkedPRForBead(workDir, rigName, srcIssue.ID)
+	if err != nil {
+		t.Fatalf("_linkedPRForBead on a non-GitHub rig with no recorded PR should not error, got: %v", err)
+	}
+	if hasPR || merged {
+		t.Errorf("_linkedPRForBead = (%v, %v), want (false, false) — no PR recorded, safe to reset", hasPR, merged)
+	}
+}
+
+func TestParseGitHubOwnerRepo(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		url       string
+		wantOwner string
+		wantRepo  string
+		wantErr   bool
+	}{
+		{"https with .git", "https://github.com/Phaware-Global/gastown.git", "Phaware-Global", "gastown", false},
+		{"https without .git", "https://github.com/Phaware-Global/gastown", "Phaware-Global", "gastown", false},
+		{"ssh form", "git@github.com:Phaware-Global/gastown.git", "Phaware-Global", "gastown", false},
+		{
+			// Round 6: only http/https were accepted as URL schemes, so an
+			// ssh://git@github.com/... rig (a documented, valid git_url form —
+			// cmd/rig.go, rig_test.go, telegraph/rigs.go) errored here, and
+			// since a resolution error now means "leave every orphan bead on
+			// this rig untouched forever", this permanently stranded recovery
+			// on any such rig.
+			"ssh:// scheme url form", "ssh://git@github.com/Phaware-Global/gastown.git", "Phaware-Global", "gastown", false,
+		},
+		{
+			"git:// scheme url form", "git://github.com/Phaware-Global/gastown.git", "Phaware-Global", "gastown", false,
+		},
+		{"non-github url", "https://gitlab.com/owner/repo.git", "", "", true},
+		{"malformed", "https://github.com/onlyowner", "", "", true},
+		{"trailing slash", "https://github.com/Phaware-Global/gastown/", "Phaware-Global", "gastown", false},
+		{"deep url with extra path segments", "https://github.com/owner/repo/tree/main", "", "", true},
+		{
+			// SECURITY (val's PR #226 round-3 review): an unanchored
+			// strings.Index("github.com/") match let a crafted git_url whose
+			// HOST is something else entirely resolve to an unrelated
+			// GitHub owner/repo — a self-hosted or misconfigured rig could
+			// then read/close live work on a public repo it has nothing to
+			// do with. Must error, not resolve to attacker/repo.
+			"github.com appears in path but is not the host", "https://evil.example.com/x/github.com/attacker/repo", "", "", true,
+		},
+		{
+			// Symmetric twin of the trailing-slash fix, same function,
+			// same round: ".git" must be trimmed AFTER the trailing slash,
+			// not before, or "owner/repo.git/" keeps "repo.git" as the name.
+			"trailing slash after .git", "https://github.com/Phaware-Global/gastown.git/", "Phaware-Global", "gastown", false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			owner, repoName, err := parseGitHubOwnerRepo(tt.url)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseGitHubOwnerRepo(%q) error = %v, wantErr %v", tt.url, err, tt.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if owner != tt.wantOwner || repoName != tt.wantRepo {
+				t.Errorf("parseGitHubOwnerRepo(%q) = (%q, %q), want (%q, %q)", tt.url, owner, repoName, tt.wantOwner, tt.wantRepo)
+			}
+		})
+	}
+}
+
+// TestParseGitHubOwnerRepo_ErrorMessagesDoNotLeakCredentials verifies
+// parseGitHubOwnerRepo's error path redacts credentials via util.RedactURL
+// (round 6: the PR's own local redaction copy returned the RAW URL verbatim
+// when url.Parse failed — exactly the case that fires here, since every
+// URL that reaches this error path already failed to parse as a valid
+// github.com remote). util.RedactURL fails closed to "<invalid URL>" when
+// parsing fails and a credential ('@') is present, which is what these
+// malformed-and-credentialed inputs must trigger.
+func TestParseGitHubOwnerRepo_ErrorMessagesDoNotLeakCredentials(t *testing.T) {
+	t.Parallel()
+	tests := []string{
+		"https://x-access-token:tok%zz@github.com/owner/repo.git", // invalid percent-encoding: fails url.Parse
+	}
+	for _, url := range tests {
+		t.Run(url, func(t *testing.T) {
+			_, _, err := parseGitHubOwnerRepo(url)
+			if err == nil {
+				t.Fatalf("parseGitHubOwnerRepo(%q) unexpectedly succeeded", url)
+			}
+			if strings.Contains(err.Error(), "tok%zz") {
+				t.Errorf("parseGitHubOwnerRepo(%q) error leaked a credential: %v", url, err)
+			}
+			if !strings.Contains(err.Error(), "<invalid URL>") {
+				t.Errorf("parseGitHubOwnerRepo(%q) error = %v, want it to fail closed to \"<invalid URL>\"", url, err)
+			}
+		})
 	}
 }
 
@@ -1485,6 +1979,17 @@ func TestDetectOrphanedBeads_ResultTypes(t *testing.T) {
 
 func TestDetectOrphanedBeads_WithMockBd(t *testing.T) {
 	installFakeTmuxNoServer(t)
+
+	// This test doesn't set up a real town (no mayor/ marker), so
+	// linkedPRForBead's real implementation would fail to resolve a town
+	// root and (correctly, per gt-0t6b) leave every bead untouched rather
+	// than reset it. Stub it to "no PR recorded" — this test exercises the
+	// orphan-detection/reset mechanics, not PR-check logic.
+	oldLinkedPR := linkedPRForBead
+	linkedPRForBead = func(workDir, rigName, hookBead string) (bool, bool, error) {
+		return false, false, nil
+	}
+	t.Cleanup(func() { linkedPRForBead = oldLinkedPR })
 
 	// Set up town directory structure
 	townRoot := t.TempDir()
@@ -1770,6 +2275,17 @@ func TestFindMRBeadForBranch_NoBdAvailable(t *testing.T) {
 
 func TestDetectOrphanedMolecules_WithMockBd(t *testing.T) {
 	installFakeTmuxNoServer(t)
+
+	// This test doesn't set up a real town (no mayor/ marker), so
+	// linkedPRForBead's real implementation would fail to resolve a town
+	// root and (correctly, per gt-0t6b) leave every bead untouched rather
+	// than reset it. Stub it to "no PR recorded" — this test exercises the
+	// orphan-detection/reset mechanics, not PR-check logic.
+	oldLinkedPR := linkedPRForBead
+	linkedPRForBead = func(workDir, rigName, hookBead string) (bool, bool, error) {
+		return false, false, nil
+	}
+	t.Cleanup(func() { linkedPRForBead = oldLinkedPR })
 
 	// Full test with mock bd returning beads assigned to dead polecats.
 	//
