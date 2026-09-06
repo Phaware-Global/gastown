@@ -1346,8 +1346,8 @@ func TestResetAbandonedBead_DoesNotCloseWhenRecordedPROpen(t *testing.T) {
 func TestResetAbandonedBead_LeavesBeadUntouchedWhenPRStateUndeterminable(t *testing.T) {
 	// Not parallel: overrides package-level linkedPRForBead.
 	// gt-0t6b, mayor's round-2 ruling: PR state couldn't be confirmed (gh
-	// unreachable, auth expired, rate limited, circuit breaker open, cache
-	// error) -> the bead must be left ALONE. Not closed, and NOT reset for
+	// unreachable, auth expired, rate limited, deadline exhausted, owner/repo
+	// unresolvable) -> the bead must be left ALONE. Not closed, and NOT reset for
 	// re-dispatch either — falling through to reset would treat "unknown"
 	// the same as "no PR recorded", silently re-dispatching work that may
 	// already have landed. Un-closed-and-unreset is the only safe outcome:
