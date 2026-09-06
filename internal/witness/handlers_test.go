@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/polecat"
+	"github.com/steveyegge/gastown/internal/testutil"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -1202,16 +1204,16 @@ func TestResetAbandonedBead_NoRouter(t *testing.T) {
 	}
 }
 
-func TestResetAbandonedBead_ClosesWhenWorkOnMain(t *testing.T) {
-	// Not parallel: overrides package-level verifyCommitOnMain.
-	// When verifyCommitOnMain returns true, resetAbandonedBead should close the
-	// bead instead of resetting it for re-dispatch. This is the fix for #2036.
+func TestResetAbandonedBead_ClosesWhenRecordedPRMerged(t *testing.T) {
+	// Not parallel: overrides package-level linkedPRForBead.
+	// gt-0t6b: when the recorded PR has merged, resetAbandonedBead should
+	// close the bead instead of resetting it for re-dispatch.
 
-	oldVerify := verifyCommitOnMain
-	verifyCommitOnMain = func(workDir, rigName, polecatName string) (bool, error) {
-		return true, nil // work is on main
+	oldLinkedPR := linkedPRForBead
+	linkedPRForBead = func(workDir, rigName, hookBead string) (bool, bool, error) {
+		return true, true, nil // recorded PR, merged
 	}
-	t.Cleanup(func() { verifyCommitOnMain = oldVerify })
+	t.Cleanup(func() { linkedPRForBead = oldLinkedPR })
 
 	bd, mock := mockBd(
 		func(args []string) (string, error) {
@@ -1228,10 +1230,9 @@ func TestResetAbandonedBead_ClosesWhenWorkOnMain(t *testing.T) {
 	tmpDir := t.TempDir()
 	result := resetAbandonedBead(bd, tmpDir, "testrig", "gt-work123", "alpha", nil)
 	if result {
-		t.Error("resetAbandonedBead should return false when work is on main (bead closed, not re-dispatched)")
+		t.Error("resetAbandonedBead should return false when the recorded PR has merged (bead closed, not re-dispatched)")
 	}
 
-	// Verify "close" was called, NOT "update ... --status=open"
 	var foundClose, foundUpdate bool
 	for _, call := range mock.calls {
 		if strings.Contains(call, "close gt-work123") {
@@ -1245,20 +1246,21 @@ func TestResetAbandonedBead_ClosesWhenWorkOnMain(t *testing.T) {
 		t.Errorf("expected bd close to be called, got calls: %v", mock.calls)
 	}
 	if foundUpdate {
-		t.Error("bd update --status=open should NOT be called when work is on main")
+		t.Error("bd update --status=open should NOT be called when the recorded PR has merged")
 	}
 }
 
-func TestResetAbandonedBead_ResetsWhenWorkNotOnMain(t *testing.T) {
-	// Not parallel: overrides package-level verifyCommitOnMain.
-	// When verifyCommitOnMain returns false, resetAbandonedBead should reset
-	// the bead for re-dispatch (existing behavior).
+func TestResetAbandonedBead_ResetsWhenNoPRRecorded(t *testing.T) {
+	// Not parallel: overrides package-level linkedPRForBead.
+	// gt-0t6b: no PR recorded at all (e.g. direct-merge convoys that never
+	// open one) -> safe default is to do nothing here, falling through to
+	// the normal reset-for-redispatch path.
 
-	oldVerify := verifyCommitOnMain
-	verifyCommitOnMain = func(workDir, rigName, polecatName string) (bool, error) {
-		return false, nil // work NOT on main
+	oldLinkedPR := linkedPRForBead
+	linkedPRForBead = func(workDir, rigName, hookBead string) (bool, bool, error) {
+		return false, false, nil // no PR recorded
 	}
-	t.Cleanup(func() { verifyCommitOnMain = oldVerify })
+	t.Cleanup(func() { linkedPRForBead = oldLinkedPR })
 
 	bd, mock := mockBd(
 		func(args []string) (string, error) {
@@ -1275,10 +1277,9 @@ func TestResetAbandonedBead_ResetsWhenWorkNotOnMain(t *testing.T) {
 	tmpDir := t.TempDir()
 	result := resetAbandonedBead(bd, tmpDir, "testrig", "gt-work123", "alpha", nil)
 	if !result {
-		t.Error("resetAbandonedBead should return true when work is NOT on main (bead reset for re-dispatch)")
+		t.Error("resetAbandonedBead should return true when no PR is recorded (bead reset for re-dispatch)")
 	}
 
-	// Verify "update --status=open" was called (normal reset path)
 	var foundUpdate bool
 	for _, call := range mock.calls {
 		if strings.Contains(call, "update") && strings.Contains(call, "--status=open") {
@@ -1287,6 +1288,229 @@ func TestResetAbandonedBead_ResetsWhenWorkNotOnMain(t *testing.T) {
 	}
 	if !foundUpdate {
 		t.Errorf("expected bd update --status=open to be called, got calls: %v", mock.calls)
+	}
+}
+
+func TestResetAbandonedBead_DoesNotCloseWhenRecordedPROpen(t *testing.T) {
+	// Not parallel: overrides package-level linkedPRForBead.
+	// gt-0t6b ACCEPTANCE #1, RED FIRST against plain main: before gt-gsva/
+	// gt-0t6b, resetAbandonedBead only checked verifyCommitOnMain, which is
+	// true for every idle worktree regardless of whether the polecat's real
+	// work ever merged — so a hooked bead with a genuinely open PR would get
+	// closed anyway. This is the faithful repro: a PR is recorded and it is
+	// still open. The bead must NOT close, and must come back dispatchable
+	// (status=open) so gt sling can send review-fix work to it.
+
+	oldLinkedPR := linkedPRForBead
+	linkedPRForBead = func(workDir, rigName, hookBead string) (bool, bool, error) {
+		return true, false, nil // recorded PR, NOT merged
+	}
+	t.Cleanup(func() { linkedPRForBead = oldLinkedPR })
+
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			if len(args) >= 1 && args[0] == "show" {
+				return `[{"status":"hooked"}]`, nil
+			}
+			return "", nil
+		},
+		func(args []string) error {
+			return nil
+		},
+	)
+
+	tmpDir := t.TempDir()
+	result := resetAbandonedBead(bd, tmpDir, "testrig", "gt-work123", "alpha", nil)
+	if !result {
+		t.Error("resetAbandonedBead should return true when the recorded PR is still open (bead reset for re-dispatch, not closed)")
+	}
+
+	var foundClose, foundUpdate bool
+	for _, call := range mock.calls {
+		if strings.Contains(call, "close gt-work123") {
+			foundClose = true
+		}
+		if strings.Contains(call, "update") && strings.Contains(call, "--status=open") {
+			foundUpdate = true
+		}
+	}
+	if foundClose {
+		t.Error("bd close should NOT be called while the recorded PR is still open")
+	}
+	if !foundUpdate {
+		t.Errorf("expected bd update --status=open to be called (dispatchable by gt sling), got calls: %v", mock.calls)
+	}
+}
+
+func TestResetAbandonedBead_DoesNotCloseWhenPRStateUndeterminable(t *testing.T) {
+	// Not parallel: overrides package-level linkedPRForBead.
+	// gt-0t6b: PR state couldn't be confirmed (gh unreachable, auth expired,
+	// rate limited) -> fail safe, do not close. An un-closed bead is a
+	// visible nuisance; a wrongly-closed one silently blocks re-dispatch and
+	// vanishes from open-work sweeps.
+
+	oldLinkedPR := linkedPRForBead
+	linkedPRForBead = func(workDir, rigName, hookBead string) (bool, bool, error) {
+		return true, false, errors.New("gh pr view: network unreachable")
+	}
+	t.Cleanup(func() { linkedPRForBead = oldLinkedPR })
+
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			if len(args) >= 1 && args[0] == "show" {
+				return `[{"status":"hooked"}]`, nil
+			}
+			return "", nil
+		},
+		func(args []string) error {
+			return nil
+		},
+	)
+
+	tmpDir := t.TempDir()
+	result := resetAbandonedBead(bd, tmpDir, "testrig", "gt-work123", "alpha", nil)
+	if !result {
+		t.Error("resetAbandonedBead should return true when PR state can't be determined (fail safe: reset, don't close)")
+	}
+
+	var foundClose bool
+	for _, call := range mock.calls {
+		if strings.Contains(call, "close gt-work123") {
+			foundClose = true
+		}
+	}
+	if foundClose {
+		t.Error("bd close should NOT be called when the recorded PR's state could not be determined")
+	}
+}
+
+// TestLinkedPRForBead_RealBeadsStore exercises the REAL _linkedPRForBead —
+// not the stubbed linkedPRForBead package var — against a real Dolt-backed
+// beads store, proving the whole provenance chain actually works: creating
+// a source issue and an MR bead recording source_issue/review_pr on it (the
+// same shape gt done and gt refinery pr create write in production), then
+// confirming _linkedPRForBead finds it via the real
+// ListMergeRequests/MatchesMRSourceIssue/ParseMRFields pipeline. Only the
+// GitHub-specific, network-dependent call (ghPRMergedByNumber) is stubbed —
+// the reasonable external boundary — everything else is real bd data. This
+// is the seam PR #225's review found completely unexercised in the prior
+// (branch-reconstruction) design; carrying the same discipline forward here.
+//
+// workDir is deliberately never created on disk, proving the lookup does
+// not depend on the polecat's worktree existing (gt-0t6b acceptance #3).
+func TestLinkedPRForBead_RealBeadsStore(t *testing.T) {
+	testutil.RequireDoltContainer(t)
+	port, err := strconv.Atoi(testutil.DoltContainerPort())
+	if err != nil {
+		t.Fatalf("parsing dolt container port: %v", err)
+	}
+
+	townRoot := t.TempDir()
+	rigName := "testrig"
+	rigPath := filepath.Join(townRoot, rigName)
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	rigConfig := `{"type":"rig","version":1,"name":"testrig","git_url":"https://github.com/exampleorg/examplerepo.git"}`
+	if err := os.WriteFile(filepath.Join(rigPath, "config.json"), []byte(rigConfig), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	b := beads.NewIsolatedWithPort(rigPath, port)
+	if err := b.Init("gt"); err != nil {
+		t.Skipf("bd init unavailable: %v", err)
+	}
+
+	oldNewClient := newBeadsClient
+	newBeadsClient = func(workDir string) *beads.Beads { return beads.NewIsolatedWithPort(rigPath, port) }
+	t.Cleanup(func() { newBeadsClient = oldNewClient })
+
+	var queriedOwner, queriedRepo string
+	var queriedPRs []int
+	oldGhMerged := ghPRMergedByNumber
+	ghPRMergedByNumber = func(owner, repoName string, prNumber int) (bool, error) {
+		queriedOwner, queriedRepo = owner, repoName
+		queriedPRs = append(queriedPRs, prNumber)
+		return prNumber == 42, nil
+	}
+	t.Cleanup(func() { ghPRMergedByNumber = oldGhMerged })
+
+	srcIssue, err := b.Create(beads.CreateOptions{Title: "Some work", Labels: []string{"gt:task"}})
+	if err != nil {
+		t.Fatalf("create source issue: %v", err)
+	}
+
+	mrDesc := "branch: polecat/alpha/" + srcIssue.ID + "@abc123\n" +
+		"target: main\n" +
+		"source_issue: " + srcIssue.ID + "\n" +
+		"review_pr: 42"
+	if _, err := b.Create(beads.CreateOptions{
+		Title:       "Merge: " + srcIssue.ID,
+		Labels:      []string{"gt:merge-request"},
+		Description: mrDesc,
+		Ephemeral:   true,
+	}); err != nil {
+		t.Fatalf("create MR issue: %v", err)
+	}
+
+	// Never created on disk — the point of the test.
+	workDir := filepath.Join(rigPath, "polecats", "alpha", rigName)
+
+	hasPR, merged, err := _linkedPRForBead(workDir, rigName, srcIssue.ID)
+	if err != nil {
+		t.Fatalf("_linkedPRForBead: %v", err)
+	}
+	if !hasPR || !merged {
+		t.Errorf("_linkedPRForBead(%s) = (%v, %v), want (true, true)", srcIssue.ID, hasPR, merged)
+	}
+	if len(queriedPRs) != 1 || queriedPRs[0] != 42 {
+		t.Errorf("expected exactly one gh lookup for PR #42, got %v", queriedPRs)
+	}
+	if queriedOwner != "exampleorg" || queriedRepo != "examplerepo" {
+		t.Errorf("owner/repo = (%q, %q), want (exampleorg, examplerepo)", queriedOwner, queriedRepo)
+	}
+
+	// A bead with no matching MR bead at all must report hasPR=false, not error.
+	hasPR2, _, err := _linkedPRForBead(workDir, rigName, "no-such-bead")
+	if err != nil {
+		t.Fatalf("_linkedPRForBead(no-such-bead): %v", err)
+	}
+	if hasPR2 {
+		t.Error("_linkedPRForBead(no-such-bead) hasPR = true, want false (no MR bead records it)")
+	}
+}
+
+func TestParseGitHubOwnerRepo(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		url       string
+		wantOwner string
+		wantRepo  string
+		wantErr   bool
+	}{
+		{"https with .git", "https://github.com/Phaware-Global/gastown.git", "Phaware-Global", "gastown", false},
+		{"https without .git", "https://github.com/Phaware-Global/gastown", "Phaware-Global", "gastown", false},
+		{"ssh form", "git@github.com:Phaware-Global/gastown.git", "Phaware-Global", "gastown", false},
+		{"non-github url", "https://gitlab.com/owner/repo.git", "", "", true},
+		{"malformed", "https://github.com/onlyowner", "", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			owner, repoName, err := parseGitHubOwnerRepo(tt.url)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseGitHubOwnerRepo(%q) error = %v, wantErr %v", tt.url, err, tt.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if owner != tt.wantOwner || repoName != tt.wantRepo {
+				t.Errorf("parseGitHubOwnerRepo(%q) = (%q, %q), want (%q, %q)", tt.url, owner, repoName, tt.wantOwner, tt.wantRepo)
+			}
+		})
 	}
 }
 
