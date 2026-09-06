@@ -1369,7 +1369,8 @@ func _linkedPRForBead(workDir, rigName, hookBead string) (hasPR bool, merged boo
 	// disabled orphan recovery for any non-plain-github.com rig, which is a
 	// regression against main (round-4 review). "No PR recorded" must stay
 	// reachable, and cheap, for every rig regardless of hosting provider.
-	mrs, mrErr := cachedListMergeRequests(workDir)
+	b := newBeadsClient(workDir)
+	mrs, mrErr := b.ListMergeRequests(beads.ListOptions{Status: "all", Label: "gt:merge-request"})
 	if mrErr != nil {
 		return false, false, fmt.Errorf("listing merge requests for %s: %w", hookBead, mrErr)
 	}
@@ -1411,15 +1412,6 @@ func _linkedPRForBead(workDir, rigName, hookBead string) (hasPR bool, merged boo
 		return false, false, fmt.Errorf("resolving owner/repo for %s: %w", rigName, parseErr)
 	}
 
-	// A hung/unreachable GitHub will hang every subsequent call the same
-	// way, so a single observed timeout backs off the rest of this rig's
-	// sweep instead of paying ghPRTimeout again per orphaned bead (val's PR
-	// #226 round-2 review — this is what runs on gt up's blocking startup
-	// path). Scoped per rig (githubCircuitOpen(rigName)), not process-global.
-	if githubCircuitOpen(rigName) {
-		return false, false, fmt.Errorf("skipping GitHub lookup for %s: a recent gh call for rig %s timed out, backing off for %s", hookBead, rigName, ghCircuitBreakerCooldown)
-	}
-
 	// One shared deadline for ALL of this bead's recorded PRs, not one fresh
 	// ghPRTimeout per PR number — a bead with N recorded PRs (retries/rework)
 	// must still cost at most one timeout, not N. Within that overall
@@ -1438,7 +1430,14 @@ func _linkedPRForBead(workDir, rigName, hookBead string) (hasPR bool, merged boo
 	for _, prNumber := range prNumbers {
 		if ctx.Err() != nil {
 			// The bead's overall budget is already spent from an earlier
-			// attempt — no point trying (or tripping the breaker again).
+			// attempt — no point trying another. Record it as the reason:
+			// this PR number was never actually checked, so it must not
+			// silently count as a confident "not merged" below. Unchecked
+			// must surface as an error (which the caller already treats as
+			// "leave the bead alone"), never as a negative answer — the
+			// same fail-open shape this whole design exists to eliminate,
+			// just occurring one function deeper (mayor's ruling, gt-0t6b).
+			stateErr = ctx.Err()
 			break
 		}
 		attemptCtx, attemptCancel := context.WithTimeout(ctx, ghPRPerAttemptTimeout)
@@ -1446,12 +1445,6 @@ func _linkedPRForBead(workDir, rigName, hookBead string) (hasPR bool, merged boo
 		attemptCancel()
 		if err != nil {
 			stateErr = err
-			if ctx.Err() != nil {
-				// The BEAD's overall deadline is spent (not just this one
-				// attempt's shorter slice) — a hung/unreachable GitHub will
-				// fail the same way for every remaining bead in this rig too.
-				tripGithubCircuit(rigName)
-			}
 			continue
 		}
 		if isMerged {
@@ -1464,97 +1457,25 @@ func _linkedPRForBead(workDir, rigName, hookBead string) (hasPR bool, merged boo
 	return true, false, nil
 }
 
-// mrListCacheTTL bounds how long a cached MR-bead scan is reused. Long
-// enough that an orphan-recovery sweep over N beads in the same rig (gt up,
-// or one witness patrol cycle) costs a single ListMergeRequests call instead
-// of N (val's PR #226 round-2 review: "bd list --limit=0 plus a bd sql scan
-// of the whole wisps table" per orphan is what made the old design's single
-// local git check look cheap by comparison). Short enough that a later,
-// genuinely new sweep sees fresh MR state rather than a stale one.
-const mrListCacheTTL = 30 * time.Second
-
-type mrListCacheEntry struct {
-	mrs      []*beads.Issue
-	cachedAt time.Time
-}
-
-var (
-	mrListCacheMu sync.Mutex
-	mrListCache   = map[string]mrListCacheEntry{}
-)
-
-// cachedListMergeRequests returns ListMergeRequests's result for workDir,
-// reusing a cached value from within the last mrListCacheTTL instead of
-// re-querying bd. Not parallel-sweep-safe by design beyond simple mutual
-// exclusion — resetAbandonedBead's real callers iterate orphans in a plain
-// sequential loop, never concurrently.
-//
-// Only SUCCESSFUL results are cached. Caching an error would replay one
-// transient Dolt hiccup to every remaining bead in the sweep for the whole
-// TTL, turning a momentary blip into a sweep-wide "can't determine PR state"
-// — mayor's ruling on gt-0t6b round 2 makes that outcome "leave the bead
-// alone" rather than "wrongly reset it", which is the safe direction, but
-// there is still no reason to manufacture N failures from one.
-func cachedListMergeRequests(workDir string) ([]*beads.Issue, error) {
-	mrListCacheMu.Lock()
-	if entry, ok := mrListCache[workDir]; ok && time.Since(entry.cachedAt) < mrListCacheTTL {
-		mrListCacheMu.Unlock()
-		return entry.mrs, nil
-	}
-	mrListCacheMu.Unlock()
-
-	b := newBeadsClient(workDir)
-	mrs, err := b.ListMergeRequests(beads.ListOptions{Status: "all", Label: "gt:merge-request"})
-	if err != nil {
-		return nil, err
-	}
-
-	mrListCacheMu.Lock()
-	mrListCache[workDir] = mrListCacheEntry{mrs: mrs, cachedAt: time.Now()}
-	mrListCacheMu.Unlock()
-
-	return mrs, nil
-}
-
-// ghCircuitBreakerCooldown is how long githubCircuitOpen keeps reporting
-// true for a rig after tripGithubCircuit(rigName), suppressing further gh
-// calls for that rig in this process. A hung or unreachable GitHub API will
-// fail every subsequent call the same way, so there is no value in paying
-// ghPRTimeout again for every remaining orphaned bead in the same rig's
-// sweep. Scoped per rig — not process-global — because gt up's
-// recoverOrphanedBeads loops every rig in one process (internal/cmd/up.go);
-// a global breaker would let one rig's slow GitHub disarm the guard for
-// every other rig too.
-//
-// Tripping the breaker never permits a close or a reset on its own — see
-// resetAbandonedBead's prErr branch, which treats "circuit open" exactly
-// like any other undetermined state: leave the bead alone (mayor's ruling,
-// gt-0t6b round 2 — unknown is not "no PR"; unknown means do nothing).
-const ghCircuitBreakerCooldown = 60 * time.Second
-
-var (
-	ghDownMu       sync.Mutex
-	ghDownUntilRig = map[string]time.Time{}
-)
-
-func githubCircuitOpen(rigName string) bool {
-	ghDownMu.Lock()
-	defer ghDownMu.Unlock()
-	return time.Now().Before(ghDownUntilRig[rigName])
-}
-
-func tripGithubCircuit(rigName string) {
-	ghDownMu.Lock()
-	defer ghDownMu.Unlock()
-	ghDownUntilRig[rigName] = time.Now().Add(ghCircuitBreakerCooldown)
-}
+// Mayor's ruling on gt-0t6b (after rounds 2-4): the circuit breaker and the
+// MR-list cache that used to live here were a performance/bounding layer on
+// top of the per-bead + per-attempt deadlines below, and that layer alone
+// produced every review finding from round 2 onward (fail-open across every
+// rig, cached errors replayed sweep-wide, one slow call hiding a later
+// merged PR). The deadlines already bound the work; the breaker and cache
+// were belt-and-braces that kept misbehaving. Deliberately not present here
+// — see gt-0t6b's history if "gt up" is later measured to need it back, with
+// a measurement attached rather than speculative machinery.
 
 // ghPRTimeout bounds the total gh CLI work for one bead's recorded PRs (all
 // of them combined) so a stalled or unreachable GitHub API can never hang
 // the witness patrol sweep indefinitely — that sweep is what calls this
 // code, so an unbounded call here is how a sweep silently stops running
 // (gt-gsva/#225 review, val).
-const ghPRTimeout = 30 * time.Second
+//
+// Package-level var (not const) so tests can shrink it to exercise real
+// timeout/deadline-exhaustion behavior without waiting out the real 30s.
+var ghPRTimeout = 30 * time.Second
 
 // ghPRPerAttemptTimeout caps a single PR-number lookup within ghPRTimeout's
 // overall per-bead budget. Without this, the first recorded PR to hang would
@@ -1562,7 +1483,9 @@ const ghPRTimeout = 30 * time.Second
 // from a retry/rework) from ever being checked, even if it would have
 // answered instantly and confirmed a real merge (val's PR #226 round-3
 // review).
-const ghPRPerAttemptTimeout = 10 * time.Second
+//
+// Package-level var (not const) so tests can shrink it alongside ghPRTimeout.
+var ghPRPerAttemptTimeout = 10 * time.Second
 
 // ghPRMergedByNumber reports whether the given PR number has merged. Looking
 // up by number rather than by branch/head-ref is what makes this survive the
@@ -1650,16 +1573,18 @@ func splitGitHubOwnerRepo(tail, originalURL string) (owner, repoName string, err
 // before a remote URL is put in an error message or log line. A rig's
 // git_url can legitimately carry a token; error text must not leak it.
 func redactGitURL(remoteURL string) string {
-	schemeIdx := strings.Index(remoteURL, "://")
-	if schemeIdx < 0 {
-		return remoteURL // not a scheme://... URL (e.g. git@host:path) — no userinfo component to redact
+	// Parsed, not string-split: a manual "first '@' after the scheme" search
+	// finds the wrong '@' when the userinfo itself contains one (e.g.
+	// "user:p@ssw0rd@host"), which both leaks the credential's tail AND
+	// erases the host from the resulting message — a redaction that misses
+	// is worse than none, since it looks safe (mayor's ruling on gt-0t6b).
+	// url.Parse locates the real userinfo/host boundary correctly.
+	u, err := url.Parse(remoteURL)
+	if err != nil || u.User == nil {
+		return remoteURL // no scheme://user@... form, or no userinfo present — nothing to redact
 	}
-	atIdx := strings.Index(remoteURL[schemeIdx+3:], "@")
-	if atIdx < 0 {
-		return remoteURL
-	}
-	atIdx += schemeIdx + 3
-	return remoteURL[:schemeIdx+3] + "***" + remoteURL[atIdx:]
+	u.User = url.User("REDACTED")
+	return u.String()
 }
 
 // verifyBranchAlreadyMerged checks whether the polecat's current branch work has
