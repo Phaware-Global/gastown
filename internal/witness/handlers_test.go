@@ -1,6 +1,7 @@
 package witness
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1436,14 +1437,28 @@ func TestLinkedPRForBead_RealBeadsStore(t *testing.T) {
 		t.Logf("bd init returned a non-fatal notice, proceeding: %v", err)
 	}
 
+	// Never created on disk — the point of the test.
+	workDir := filepath.Join(rigPath, "polecats", "alpha", rigName)
+
+	// Start from a clean cache: package-level and keyed by workDir, so a
+	// prior test using the same path (it won't be, t.TempDir() is unique,
+	// but be explicit) can't leak a stale entry in.
+	mrListCacheMu.Lock()
+	delete(mrListCache, workDir)
+	mrListCacheMu.Unlock()
+
+	var newClientCalls int
 	oldNewClient := newBeadsClient
-	newBeadsClient = func(workDir string) *beads.Beads { return beads.NewIsolatedWithPort(rigPath, port) }
+	newBeadsClient = func(workDir string) *beads.Beads {
+		newClientCalls++
+		return beads.NewIsolatedWithPort(rigPath, port)
+	}
 	t.Cleanup(func() { newBeadsClient = oldNewClient })
 
 	var queriedOwner, queriedRepo string
 	var queriedPRs []int
 	oldGhMerged := ghPRMergedByNumber
-	ghPRMergedByNumber = func(owner, repoName string, prNumber int) (bool, error) {
+	ghPRMergedByNumber = func(ctx context.Context, owner, repoName string, prNumber int) (bool, error) {
 		queriedOwner, queriedRepo = owner, repoName
 		queriedPRs = append(queriedPRs, prNumber)
 		return prNumber == 42, nil
@@ -1468,9 +1483,6 @@ func TestLinkedPRForBead_RealBeadsStore(t *testing.T) {
 		t.Fatalf("create MR issue: %v", err)
 	}
 
-	// Never created on disk — the point of the test.
-	workDir := filepath.Join(rigPath, "polecats", "alpha", rigName)
-
 	hasPR, merged, err := _linkedPRForBead(workDir, rigName, srcIssue.ID)
 	if err != nil {
 		t.Fatalf("_linkedPRForBead: %v", err)
@@ -1484,14 +1496,70 @@ func TestLinkedPRForBead_RealBeadsStore(t *testing.T) {
 	if queriedOwner != "exampleorg" || queriedRepo != "examplerepo" {
 		t.Errorf("owner/repo = (%q, %q), want (exampleorg, examplerepo)", queriedOwner, queriedRepo)
 	}
+	if newClientCalls != 1 {
+		t.Errorf("expected exactly 1 underlying ListMergeRequests call, got %d — cachedListMergeRequests should memoize per workDir (val's PR #226 round-2 review)", newClientCalls)
+	}
 
 	// A bead with no matching MR bead at all must report hasPR=false, not error.
+	// Also must reuse the cached MR list rather than re-querying: still 1 call.
 	hasPR2, _, err := _linkedPRForBead(workDir, rigName, "no-such-bead")
 	if err != nil {
 		t.Fatalf("_linkedPRForBead(no-such-bead): %v", err)
 	}
+	if newClientCalls != 1 {
+		t.Errorf("expected the second _linkedPRForBead call to reuse the cached MR list (still 1 underlying call), got %d", newClientCalls)
+	}
 	if hasPR2 {
 		t.Error("_linkedPRForBead(no-such-bead) hasPR = true, want false (no MR bead records it)")
+	}
+
+	// Circuit breaker: once tripped, _linkedPRForBead must refuse to call
+	// ghPRMergedByNumber at all for the rest of the cooldown — a hung/
+	// unreachable GitHub will hang every subsequent call the same way, so
+	// paying ghPRTimeout again per remaining orphaned bead in the sweep buys
+	// nothing (val's PR #226 round-2 review).
+	tripGithubCircuit()
+	t.Cleanup(func() {
+		ghDownMu.Lock()
+		ghDownUntil = time.Time{}
+		ghDownMu.Unlock()
+	})
+	queriedPRs = nil
+	_, _, err = _linkedPRForBead(workDir, rigName, srcIssue.ID)
+	if err == nil {
+		t.Error("_linkedPRForBead should return an error while the GitHub circuit breaker is open")
+	}
+	if len(queriedPRs) != 0 {
+		t.Errorf("ghPRMergedByNumber should not be called while the circuit breaker is open, got %v", queriedPRs)
+	}
+}
+
+func TestGithubCircuitBreaker(t *testing.T) {
+	// Not parallel: mutates package-level ghDownUntil.
+	ghDownMu.Lock()
+	ghDownUntil = time.Time{}
+	ghDownMu.Unlock()
+	t.Cleanup(func() {
+		ghDownMu.Lock()
+		ghDownUntil = time.Time{}
+		ghDownMu.Unlock()
+	})
+
+	if githubCircuitOpen() {
+		t.Fatal("circuit should start closed")
+	}
+
+	tripGithubCircuit()
+	if !githubCircuitOpen() {
+		t.Error("circuit should be open immediately after tripGithubCircuit")
+	}
+
+	// Simulate the cooldown having already elapsed.
+	ghDownMu.Lock()
+	ghDownUntil = time.Now().Add(-time.Second)
+	ghDownMu.Unlock()
+	if githubCircuitOpen() {
+		t.Error("circuit should close again once the cooldown has elapsed")
 	}
 }
 

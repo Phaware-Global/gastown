@@ -1376,8 +1376,7 @@ func _linkedPRForBead(workDir, rigName, hookBead string) (hasPR bool, merged boo
 		return false, false, fmt.Errorf("resolving owner/repo for %s: %w", rigName, parseErr)
 	}
 
-	b := newBeadsClient(workDir)
-	mrs, mrErr := b.ListMergeRequests(beads.ListOptions{Status: "all", Label: "gt:merge-request"})
+	mrs, mrErr := cachedListMergeRequests(workDir)
 	if mrErr != nil {
 		return false, false, fmt.Errorf("listing merge requests for %s: %w", hookBead, mrErr)
 	}
@@ -1396,14 +1395,33 @@ func _linkedPRForBead(workDir, rigName, hookBead string) (hasPR bool, merged boo
 		return false, false, nil // no PR recorded for this bead
 	}
 
+	// A hung/unreachable GitHub will hang every subsequent call the same
+	// way, so a single observed timeout backs off the rest of this sweep
+	// (across beads, not just this one) instead of paying ghPRTimeout again
+	// per bead per orphan (val's PR #226 round-2 review — this is what runs
+	// on gt up's blocking startup path, once per orphaned bead).
+	if githubCircuitOpen() {
+		return false, false, fmt.Errorf("skipping GitHub lookup for %s: a recent gh call timed out, backing off for %s", hookBead, ghCircuitBreakerCooldown)
+	}
+
+	// One shared deadline for ALL of this bead's recorded PRs, not one fresh
+	// ghPRTimeout per PR number — a bead with N recorded PRs (retries/rework)
+	// must still cost at most one timeout, not N.
+	ctx, cancel := context.WithTimeout(context.Background(), ghPRTimeout)
+	defer cancel()
+
 	// A bead is normally dispatched once, but retries/rework can leave more
 	// than one MR bead behind. Any one of their recorded PRs landing means
 	// the work is done.
 	var stateErr error
 	for _, prNumber := range prNumbers {
-		isMerged, err := ghPRMergedByNumber(owner, repoName, prNumber)
+		isMerged, err := ghPRMergedByNumber(ctx, owner, repoName, prNumber)
 		if err != nil {
 			stateErr = err
+			if ctx.Err() != nil {
+				tripGithubCircuit()
+				break // this bead's shared deadline is spent; more PR numbers won't fare better
+			}
 			continue
 		}
 		if isMerged {
@@ -1416,7 +1434,74 @@ func _linkedPRForBead(workDir, rigName, hookBead string) (hasPR bool, merged boo
 	return true, false, nil
 }
 
-// ghPRTimeout bounds the gh CLI call in ghPRMergedByNumber so a stalled or
+// mrListCacheTTL bounds how long a cached MR-bead scan is reused. Long
+// enough that an orphan-recovery sweep over N beads in the same rig (gt up,
+// or one witness patrol cycle) costs a single ListMergeRequests call instead
+// of N (val's PR #226 round-2 review: "bd list --limit=0 plus a bd sql scan
+// of the whole wisps table" per orphan is what made the old design's single
+// local git check look cheap by comparison). Short enough that a later,
+// genuinely new sweep sees fresh MR state rather than a stale one.
+const mrListCacheTTL = 30 * time.Second
+
+type mrListCacheEntry struct {
+	mrs      []*beads.Issue
+	err      error
+	cachedAt time.Time
+}
+
+var (
+	mrListCacheMu sync.Mutex
+	mrListCache   = map[string]mrListCacheEntry{}
+)
+
+// cachedListMergeRequests returns ListMergeRequests's result for workDir,
+// reusing a cached value from within the last mrListCacheTTL instead of
+// re-querying bd. Not parallel-sweep-safe by design beyond simple mutual
+// exclusion — resetAbandonedBead's real callers iterate orphans in a plain
+// sequential loop, never concurrently.
+func cachedListMergeRequests(workDir string) ([]*beads.Issue, error) {
+	mrListCacheMu.Lock()
+	if entry, ok := mrListCache[workDir]; ok && time.Since(entry.cachedAt) < mrListCacheTTL {
+		mrListCacheMu.Unlock()
+		return entry.mrs, entry.err
+	}
+	mrListCacheMu.Unlock()
+
+	b := newBeadsClient(workDir)
+	mrs, err := b.ListMergeRequests(beads.ListOptions{Status: "all", Label: "gt:merge-request"})
+
+	mrListCacheMu.Lock()
+	mrListCache[workDir] = mrListCacheEntry{mrs: mrs, err: err, cachedAt: time.Now()}
+	mrListCacheMu.Unlock()
+
+	return mrs, err
+}
+
+// ghCircuitBreakerCooldown is how long githubCircuitOpen keeps reporting
+// true after tripGithubCircuit, suppressing further gh calls in this
+// process. A hung or unreachable GitHub API will fail every subsequent call
+// the same way, so there is no value in paying ghPRTimeout again for every
+// remaining orphaned bead in the same sweep.
+const ghCircuitBreakerCooldown = 60 * time.Second
+
+var (
+	ghDownMu    sync.Mutex
+	ghDownUntil time.Time
+)
+
+func githubCircuitOpen() bool {
+	ghDownMu.Lock()
+	defer ghDownMu.Unlock()
+	return time.Now().Before(ghDownUntil)
+}
+
+func tripGithubCircuit() {
+	ghDownMu.Lock()
+	defer ghDownMu.Unlock()
+	ghDownUntil = time.Now().Add(ghCircuitBreakerCooldown)
+}
+
+// ghPRTimeout bounds the gh CLI call(s) in ghPRMergedByNumber so a stalled or
 // unreachable GitHub API can never hang the witness patrol sweep indefinitely
 // — that sweep is what calls this code, so an unbounded call here is how a
 // sweep silently stops running (gt-gsva/#225 review, val).
@@ -1424,15 +1509,13 @@ const ghPRTimeout = 30 * time.Second
 
 // ghPRMergedByNumber reports whether the given PR number has merged. Looking
 // up by number rather than by branch/head-ref is what makes this survive the
-// branch being deleted after merge.
+// branch being deleted after merge. ctx carries the caller's shared deadline
+// (one budget per bead, not one fresh ghPRTimeout per recorded PR number).
 //
 // Package-level var so tests can override.
 var ghPRMergedByNumber = _ghPRMergedByNumber
 
-func _ghPRMergedByNumber(owner, repoName string, prNumber int) (merged bool, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), ghPRTimeout)
-	defer cancel()
-
+func _ghPRMergedByNumber(ctx context.Context, owner, repoName string, prNumber int) (merged bool, err error) {
 	cmd := exec.CommandContext(ctx, "gh", "pr", "view", strconv.Itoa(prNumber),
 		"--repo", owner+"/"+repoName,
 		"--json", "state")
@@ -1444,8 +1527,8 @@ func _ghPRMergedByNumber(owner, repoName string, prNumber int) (merged bool, err
 
 	out, err := cmd.Output()
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return false, fmt.Errorf("gh pr view #%d timed out after %v", prNumber, ghPRTimeout)
+		if ctx.Err() != nil {
+			return false, fmt.Errorf("gh pr view #%d timed out or was canceled: %w", prNumber, ctx.Err())
 		}
 		return false, fmt.Errorf("gh pr view #%d: %w", prNumber, err)
 	}
