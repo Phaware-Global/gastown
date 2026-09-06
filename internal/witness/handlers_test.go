@@ -1551,6 +1551,73 @@ func TestLinkedPRForBead_RealBeadsStore(t *testing.T) {
 	}
 }
 
+// TestLinkedPRForBead_NonGitHubRigWithNoRecordedPR is the round-4 regression
+// repro: a rig whose git_url is NOT a plain github.com remote (bitbucket,
+// gitlab, ssh://, git://, file://, a port suffix — all real, first-class rig
+// configurations in gastown) used to hit the workspace/rig-config/owner-repo
+// resolution chain, and thus prErr, on EVERY orphaned bead in that rig —
+// regardless of whether the bead had a recorded PR at all. Since prErr means
+// "leave the bead alone forever" (this PR's round-3 fix), that permanently
+// disabled orphan recovery for any such rig. A bead with NO recorded PR must
+// resolve via the cheap bd-only check alone and never even attempt to parse
+// git_url.
+func TestLinkedPRForBead_NonGitHubRigWithNoRecordedPR(t *testing.T) {
+	testutil.RequireDoltContainer(t)
+	port, err := strconv.Atoi(testutil.DoltContainerPort())
+	if err != nil {
+		t.Fatalf("parsing dolt container port: %v", err)
+	}
+
+	townRoot := t.TempDir()
+	rigName := "bitbucketrig"
+	rigPath := filepath.Join(townRoot, rigName)
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately NOT a plain github.com remote — this is what a bitbucket-
+	// hosted rig's config.json looks like (internal/bitbucket is a full PR
+	// client; this is a real, supported configuration, not an edge case).
+	rigConfig := `{"type":"rig","version":1,"name":"bitbucketrig","git_url":"https://bitbucket.org/exampleorg/examplerepo.git"}`
+	if err := os.WriteFile(filepath.Join(rigPath, "config.json"), []byte(rigConfig), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	b := beads.NewIsolatedWithPort(rigPath, port)
+	if err := b.Init("gt"); err != nil {
+		if errors.Is(err, exec.ErrNotFound) || strings.Contains(err.Error(), "executable file not found") {
+			t.Skipf("bd binary not available: %v", err)
+		}
+		t.Logf("bd init returned a non-fatal notice, proceeding: %v", err)
+	}
+
+	oldNewClient := newBeadsClient
+	newBeadsClient = func(workDir string) *beads.Beads { return beads.NewIsolatedWithPort(rigPath, port) }
+	t.Cleanup(func() { newBeadsClient = oldNewClient })
+
+	srcIssue, err := b.Create(beads.CreateOptions{Title: "Some bitbucket-rig work", Labels: []string{"gt:task"}})
+	if err != nil {
+		t.Fatalf("create source issue: %v", err)
+	}
+	// No MR bead created at all for srcIssue — this is the "abandoned before
+	// any PR was ever opened" case that must stay resettable.
+
+	workDir := filepath.Join(rigPath, "polecats", "alpha", rigName)
+	mrListCacheMu.Lock()
+	delete(mrListCache, workDir)
+	mrListCacheMu.Unlock()
+
+	hasPR, merged, err := _linkedPRForBead(workDir, rigName, srcIssue.ID)
+	if err != nil {
+		t.Fatalf("_linkedPRForBead on a non-GitHub rig with no recorded PR should not error, got: %v", err)
+	}
+	if hasPR || merged {
+		t.Errorf("_linkedPRForBead = (%v, %v), want (false, false) — no PR recorded, safe to reset", hasPR, merged)
+	}
+}
+
 func TestGithubCircuitBreaker(t *testing.T) {
 	// Not parallel: mutates package-level ghDownUntilRig.
 	const rig1, rig2 = "rig1", "rig2"

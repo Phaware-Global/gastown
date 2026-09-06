@@ -1355,6 +1355,40 @@ var linkedPRForBead = _linkedPRForBead
 var newBeadsClient = func(workDir string) *beads.Beads { return beads.New(workDir) }
 
 func _linkedPRForBead(workDir, rigName, hookBead string) (hasPR bool, merged bool, err error) {
+	// Cheap, bd-only check FIRST: does this bead even have a recorded PR at
+	// all? Only if it does do we need to resolve WHERE to check it (town
+	// root, rig config, git_url, GitHub owner/repo). Those resolution steps
+	// fail permanently for any rig that isn't exactly a plain github.com
+	// remote — ssh://git@github.com/..., git://, gitlab.com, bitbucket.org,
+	// file://, a port suffix, even case differences are all real, first-
+	// class rig configurations in gastown (internal/bitbucket, rig add's
+	// documented forms). Resolving them BEFORE checking for a recorded PR
+	// meant every such rig hit prErr on EVERY orphaned bead regardless of
+	// whether it had a PR to check — and since prErr now means "leave the
+	// bead alone forever" (this PR's own round-3 fix), that permanently
+	// disabled orphan recovery for any non-plain-github.com rig, which is a
+	// regression against main (round-4 review). "No PR recorded" must stay
+	// reachable, and cheap, for every rig regardless of hosting provider.
+	mrs, mrErr := cachedListMergeRequests(workDir)
+	if mrErr != nil {
+		return false, false, fmt.Errorf("listing merge requests for %s: %w", hookBead, mrErr)
+	}
+
+	var prNumbers []int
+	for _, mr := range mrs {
+		if !beads.MatchesMRSourceIssue(mr.Description, hookBead) {
+			continue
+		}
+		fields := beads.ParseMRFields(mr)
+		if fields != nil && fields.ReviewPR > 0 {
+			prNumbers = append(prNumbers, fields.ReviewPR)
+		}
+	}
+	if len(prNumbers) == 0 {
+		return false, false, nil // no PR recorded for this bead — safe to reset normally
+	}
+
+	// A PR IS recorded, so we now need to resolve where to check it.
 	townRoot, tErr := workspace.Find(workDir)
 	if tErr != nil || townRoot == "" {
 		return false, false, fmt.Errorf("finding town root: %v", tErr)
@@ -1375,25 +1409,6 @@ func _linkedPRForBead(workDir, rigName, hookBead string) (hasPR bool, merged boo
 	owner, repoName, parseErr := parseGitHubOwnerRepo(rigCfg.GitURL)
 	if parseErr != nil {
 		return false, false, fmt.Errorf("resolving owner/repo for %s: %w", rigName, parseErr)
-	}
-
-	mrs, mrErr := cachedListMergeRequests(workDir)
-	if mrErr != nil {
-		return false, false, fmt.Errorf("listing merge requests for %s: %w", hookBead, mrErr)
-	}
-
-	var prNumbers []int
-	for _, mr := range mrs {
-		if !beads.MatchesMRSourceIssue(mr.Description, hookBead) {
-			continue
-		}
-		fields := beads.ParseMRFields(mr)
-		if fields != nil && fields.ReviewPR > 0 {
-			prNumbers = append(prNumbers, fields.ReviewPR)
-		}
-	}
-	if len(prNumbers) == 0 {
-		return false, false, nil // no PR recorded for this bead
 	}
 
 	// A hung/unreachable GitHub will hang every subsequent call the same
