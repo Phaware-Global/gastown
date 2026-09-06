@@ -1683,6 +1683,18 @@ func TestParseGitHubOwnerRepo(t *testing.T) {
 		{"https with .git", "https://github.com/Phaware-Global/gastown.git", "Phaware-Global", "gastown", false},
 		{"https without .git", "https://github.com/Phaware-Global/gastown", "Phaware-Global", "gastown", false},
 		{"ssh form", "git@github.com:Phaware-Global/gastown.git", "Phaware-Global", "gastown", false},
+		{
+			// Round 6: only http/https were accepted as URL schemes, so an
+			// ssh://git@github.com/... rig (a documented, valid git_url form —
+			// cmd/rig.go, rig_test.go, telegraph/rigs.go) errored here, and
+			// since a resolution error now means "leave every orphan bead on
+			// this rig untouched forever", this permanently stranded recovery
+			// on any such rig.
+			"ssh:// scheme url form", "ssh://git@github.com/Phaware-Global/gastown.git", "Phaware-Global", "gastown", false,
+		},
+		{
+			"git:// scheme url form", "git://github.com/Phaware-Global/gastown.git", "Phaware-Global", "gastown", false,
+		},
 		{"non-github url", "https://gitlab.com/owner/repo.git", "", "", true},
 		{"malformed", "https://github.com/onlyowner", "", "", true},
 		{"trailing slash", "https://github.com/Phaware-Global/gastown/", "Phaware-Global", "gastown", false},
@@ -1719,35 +1731,30 @@ func TestParseGitHubOwnerRepo(t *testing.T) {
 	}
 }
 
-func TestRedactGitURL(t *testing.T) {
+// TestParseGitHubOwnerRepo_ErrorMessagesDoNotLeakCredentials verifies
+// parseGitHubOwnerRepo's error path redacts credentials via util.RedactURL
+// (round 6: the PR's own local redaction copy returned the RAW URL verbatim
+// when url.Parse failed — exactly the case that fires here, since every
+// URL that reaches this error path already failed to parse as a valid
+// github.com remote). util.RedactURL fails closed to "<invalid URL>" when
+// parsing fails and a credential ('@') is present, which is what these
+// malformed-and-credentialed inputs must trigger.
+func TestParseGitHubOwnerRepo_ErrorMessagesDoNotLeakCredentials(t *testing.T) {
 	t.Parallel()
-	tests := []struct {
-		name string
-		url  string
-		want string
-	}{
-		{"token in https url", "https://ghp_abc123token@github.com/owner/repo.git", "https://REDACTED@github.com/owner/repo.git"},
-		{"plain https url", "https://github.com/owner/repo.git", "https://github.com/owner/repo.git"},
-		{"ssh form, no userinfo to redact", "git@github.com:owner/repo.git", "git@github.com:owner/repo.git"},
-		{
-			// Round-5 finding: a manual "first '@' after the scheme" search
-			// finds the wrong '@' when userinfo itself contains one, leaking
-			// the tail AND erasing the host. url.Parse finds the real
-			// userinfo/host boundary regardless.
-			"credential containing its own @", "https://user:p@ssw0rd@github.com/owner/repo.git", "https://REDACTED@github.com/owner/repo.git",
-		},
+	tests := []string{
+		"https://x-access-token:tok%zz@github.com/owner/repo.git", // invalid percent-encoding: fails url.Parse
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := redactGitURL(tt.url)
-			if got != tt.want {
-				t.Errorf("redactGitURL(%q) = %q, want %q", tt.url, got, tt.want)
+	for _, url := range tests {
+		t.Run(url, func(t *testing.T) {
+			_, _, err := parseGitHubOwnerRepo(url)
+			if err == nil {
+				t.Fatalf("parseGitHubOwnerRepo(%q) unexpectedly succeeded", url)
 			}
-			if strings.Contains(got, "abc123token") || strings.Contains(got, "ssw0rd") {
-				t.Errorf("redactGitURL(%q) leaked the credential: %q", tt.url, got)
+			if strings.Contains(err.Error(), "tok%zz") {
+				t.Errorf("parseGitHubOwnerRepo(%q) error leaked a credential: %v", url, err)
 			}
-			if !strings.Contains(got, "github.com") {
-				t.Errorf("redactGitURL(%q) = %q lost the host", tt.url, got)
+			if !strings.Contains(err.Error(), "<invalid URL>") {
+				t.Errorf("parseGitHubOwnerRepo(%q) error = %v, want it to fail closed to \"<invalid URL>\"", url, err)
 			}
 		})
 	}

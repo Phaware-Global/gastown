@@ -1541,18 +1541,27 @@ func parseGitHubOwnerRepo(remoteURL string) (owner, repoName string, err error) 
 		return splitGitHubOwnerRepo(strings.TrimPrefix(trimmed, sshPrefix), remoteURL)
 	}
 
-	// https(s):// form — parse structurally and require the host to BE
+	// scheme://... form — parse structurally and require the host to BE
 	// github.com, not merely contain "github.com/" as a substring. An
 	// unanchored strings.Index match let a crafted git_url like
 	// "https://evil.example.com/x/github.com/attacker/repo" resolve to
 	// owner=attacker, repo=repo — a self-hosted or misconfigured rig would
 	// then read/close live work on an unrelated public GitHub repo.
-	if u, parseErr := url.Parse(trimmed); parseErr == nil &&
-		(u.Scheme == "http" || u.Scheme == "https") && u.Host == "github.com" {
-		return splitGitHubOwnerRepo(strings.TrimPrefix(u.Path, "/"), remoteURL)
+	//
+	// http/https/ssh/git are all documented, validated rig git_url schemes
+	// (internal/cmd/rig.go, rig_test.go, telegraph/rigs.go already parse
+	// ssh://). Admitting only http/https left every ssh://git@github.com/...
+	// rig erroring here — and since prErr now means leave-alone, that
+	// permanently stranded every orphan with a recorded PR on such a rig,
+	// the same shape of regression round 4 fixed for the no-PR path.
+	if u, parseErr := url.Parse(trimmed); parseErr == nil && u.Host == "github.com" {
+		switch u.Scheme {
+		case "http", "https", "ssh", "git":
+			return splitGitHubOwnerRepo(strings.TrimPrefix(u.Path, "/"), remoteURL)
+		}
 	}
 
-	return "", "", fmt.Errorf("could not parse owner/repo from url %q", redactGitURL(remoteURL))
+	return "", "", fmt.Errorf("could not parse owner/repo from url %q", util.RedactURL(remoteURL))
 }
 
 // splitGitHubOwnerRepo splits an already-host-anchored "owner/repo" tail.
@@ -1566,25 +1575,7 @@ func splitGitHubOwnerRepo(tail, originalURL string) (owner, repoName string, err
 	if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
 		return parts[0], parts[1], nil
 	}
-	return "", "", fmt.Errorf("could not parse owner/repo from url %q", redactGitURL(originalURL))
-}
-
-// redactGitURL masks any embedded credential (e.g. https://TOKEN@github.com/...)
-// before a remote URL is put in an error message or log line. A rig's
-// git_url can legitimately carry a token; error text must not leak it.
-func redactGitURL(remoteURL string) string {
-	// Parsed, not string-split: a manual "first '@' after the scheme" search
-	// finds the wrong '@' when the userinfo itself contains one (e.g.
-	// "user:p@ssw0rd@host"), which both leaks the credential's tail AND
-	// erases the host from the resulting message — a redaction that misses
-	// is worse than none, since it looks safe (mayor's ruling on gt-0t6b).
-	// url.Parse locates the real userinfo/host boundary correctly.
-	u, err := url.Parse(remoteURL)
-	if err != nil || u.User == nil {
-		return remoteURL // no scheme://user@... form, or no userinfo present — nothing to redact
-	}
-	u.User = url.User("REDACTED")
-	return u.String()
+	return "", "", fmt.Errorf("could not parse owner/repo from url %q", util.RedactURL(originalURL))
 }
 
 // verifyBranchAlreadyMerged checks whether the polecat's current branch work has
@@ -2925,8 +2916,8 @@ func resetAbandonedBead(bd *BdCli, workDir, rigName, hookBead, polecatName strin
 	switch {
 	case prErr != nil:
 		// The PR state could not be determined (gh unreachable, auth
-		// expired, rate limited, circuit breaker open, cache error). This
-		// must be visible — a silently-broken guard is how this class of
+		// expired, rate limited, deadline exhausted, owner/repo unresolvable).
+		// This must be visible — a silently-broken guard is how this class of
 		// bug lives for months — and the bead must be left ALONE: not
 		// closed, and NOT reset for re-dispatch either. Falling through to
 		// reset would treat "unknown" the same as "no PR recorded", and
