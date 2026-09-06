@@ -1343,12 +1343,16 @@ func TestResetAbandonedBead_DoesNotCloseWhenRecordedPROpen(t *testing.T) {
 	}
 }
 
-func TestResetAbandonedBead_DoesNotCloseWhenPRStateUndeterminable(t *testing.T) {
+func TestResetAbandonedBead_LeavesBeadUntouchedWhenPRStateUndeterminable(t *testing.T) {
 	// Not parallel: overrides package-level linkedPRForBead.
-	// gt-0t6b: PR state couldn't be confirmed (gh unreachable, auth expired,
-	// rate limited) -> fail safe, do not close. An un-closed bead is a
-	// visible nuisance; a wrongly-closed one silently blocks re-dispatch and
-	// vanishes from open-work sweeps.
+	// gt-0t6b, mayor's round-2 ruling: PR state couldn't be confirmed (gh
+	// unreachable, auth expired, rate limited, circuit breaker open, cache
+	// error) -> the bead must be left ALONE. Not closed, and NOT reset for
+	// re-dispatch either — falling through to reset would treat "unknown"
+	// the same as "no PR recorded", silently re-dispatching work that may
+	// already have landed. Un-closed-and-unreset is the only safe outcome:
+	// a bead that stays hooked one more patrol cycle is invisible; work
+	// re-dispatched on top of already-merged work is not.
 
 	oldLinkedPR := linkedPRForBead
 	linkedPRForBead = func(workDir, rigName, hookBead string) (bool, bool, error) {
@@ -1370,18 +1374,24 @@ func TestResetAbandonedBead_DoesNotCloseWhenPRStateUndeterminable(t *testing.T) 
 
 	tmpDir := t.TempDir()
 	result := resetAbandonedBead(bd, tmpDir, "testrig", "gt-work123", "alpha", nil)
-	if !result {
-		t.Error("resetAbandonedBead should return true when PR state can't be determined (fail safe: reset, don't close)")
+	if result {
+		t.Error("resetAbandonedBead should return false when PR state can't be determined (bead left untouched, not recovered)")
 	}
 
-	var foundClose bool
+	var foundClose, foundUpdate bool
 	for _, call := range mock.calls {
 		if strings.Contains(call, "close gt-work123") {
 			foundClose = true
 		}
+		if strings.Contains(call, "update") && strings.Contains(call, "--status=open") {
+			foundUpdate = true
+		}
 	}
 	if foundClose {
 		t.Error("bd close should NOT be called when the recorded PR's state could not be determined")
+	}
+	if foundUpdate {
+		t.Error("bd update --status=open should NOT be called either — unknown state means do nothing, not reset")
 	}
 }
 
@@ -1518,10 +1528,10 @@ func TestLinkedPRForBead_RealBeadsStore(t *testing.T) {
 	// unreachable GitHub will hang every subsequent call the same way, so
 	// paying ghPRTimeout again per remaining orphaned bead in the sweep buys
 	// nothing (val's PR #226 round-2 review).
-	tripGithubCircuit()
+	tripGithubCircuit(rigName)
 	t.Cleanup(func() {
 		ghDownMu.Lock()
-		ghDownUntil = time.Time{}
+		delete(ghDownUntilRig, rigName)
 		ghDownMu.Unlock()
 	})
 	queriedPRs = nil
@@ -1532,33 +1542,44 @@ func TestLinkedPRForBead_RealBeadsStore(t *testing.T) {
 	if len(queriedPRs) != 0 {
 		t.Errorf("ghPRMergedByNumber should not be called while the circuit breaker is open, got %v", queriedPRs)
 	}
+
+	// A DIFFERENT rig's breaker must be unaffected — process-global state
+	// would let one rig's slow GitHub disarm the guard for every other rig
+	// gt up loops over in the same process (val's PR #226 round-3 review).
+	if githubCircuitOpen("some-other-rig") {
+		t.Error("tripping the circuit for one rig must not open it for a different rig")
+	}
 }
 
 func TestGithubCircuitBreaker(t *testing.T) {
-	// Not parallel: mutates package-level ghDownUntil.
-	ghDownMu.Lock()
-	ghDownUntil = time.Time{}
-	ghDownMu.Unlock()
-	t.Cleanup(func() {
+	// Not parallel: mutates package-level ghDownUntilRig.
+	const rig1, rig2 = "rig1", "rig2"
+	reset := func() {
 		ghDownMu.Lock()
-		ghDownUntil = time.Time{}
+		delete(ghDownUntilRig, rig1)
+		delete(ghDownUntilRig, rig2)
 		ghDownMu.Unlock()
-	})
+	}
+	reset()
+	t.Cleanup(reset)
 
-	if githubCircuitOpen() {
+	if githubCircuitOpen(rig1) {
 		t.Fatal("circuit should start closed")
 	}
 
-	tripGithubCircuit()
-	if !githubCircuitOpen() {
+	tripGithubCircuit(rig1)
+	if !githubCircuitOpen(rig1) {
 		t.Error("circuit should be open immediately after tripGithubCircuit")
+	}
+	if githubCircuitOpen(rig2) {
+		t.Error("tripping rig1's circuit must not open rig2's")
 	}
 
 	// Simulate the cooldown having already elapsed.
 	ghDownMu.Lock()
-	ghDownUntil = time.Now().Add(-time.Second)
+	ghDownUntilRig[rig1] = time.Now().Add(-time.Second)
 	ghDownMu.Unlock()
-	if githubCircuitOpen() {
+	if githubCircuitOpen(rig1) {
 		t.Error("circuit should close again once the cooldown has elapsed")
 	}
 }
@@ -1579,6 +1600,21 @@ func TestParseGitHubOwnerRepo(t *testing.T) {
 		{"malformed", "https://github.com/onlyowner", "", "", true},
 		{"trailing slash", "https://github.com/Phaware-Global/gastown/", "Phaware-Global", "gastown", false},
 		{"deep url with extra path segments", "https://github.com/owner/repo/tree/main", "", "", true},
+		{
+			// SECURITY (val's PR #226 round-3 review): an unanchored
+			// strings.Index("github.com/") match let a crafted git_url whose
+			// HOST is something else entirely resolve to an unrelated
+			// GitHub owner/repo — a self-hosted or misconfigured rig could
+			// then read/close live work on a public repo it has nothing to
+			// do with. Must error, not resolve to attacker/repo.
+			"github.com appears in path but is not the host", "https://evil.example.com/x/github.com/attacker/repo", "", "", true,
+		},
+		{
+			// Symmetric twin of the trailing-slash fix, same function,
+			// same round: ".git" must be trimmed AFTER the trailing slash,
+			// not before, or "owner/repo.git/" keeps "repo.git" as the name.
+			"trailing slash after .git", "https://github.com/Phaware-Global/gastown.git/", "Phaware-Global", "gastown", false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1815,6 +1851,17 @@ func TestDetectOrphanedBeads_ResultTypes(t *testing.T) {
 
 func TestDetectOrphanedBeads_WithMockBd(t *testing.T) {
 	installFakeTmuxNoServer(t)
+
+	// This test doesn't set up a real town (no mayor/ marker), so
+	// linkedPRForBead's real implementation would fail to resolve a town
+	// root and (correctly, per gt-0t6b) leave every bead untouched rather
+	// than reset it. Stub it to "no PR recorded" — this test exercises the
+	// orphan-detection/reset mechanics, not PR-check logic.
+	oldLinkedPR := linkedPRForBead
+	linkedPRForBead = func(workDir, rigName, hookBead string) (bool, bool, error) {
+		return false, false, nil
+	}
+	t.Cleanup(func() { linkedPRForBead = oldLinkedPR })
 
 	// Set up town directory structure
 	townRoot := t.TempDir()
@@ -2100,6 +2147,17 @@ func TestFindMRBeadForBranch_NoBdAvailable(t *testing.T) {
 
 func TestDetectOrphanedMolecules_WithMockBd(t *testing.T) {
 	installFakeTmuxNoServer(t)
+
+	// This test doesn't set up a real town (no mayor/ marker), so
+	// linkedPRForBead's real implementation would fail to resolve a town
+	// root and (correctly, per gt-0t6b) leave every bead untouched rather
+	// than reset it. Stub it to "no PR recorded" — this test exercises the
+	// orphan-detection/reset mechanics, not PR-check logic.
+	oldLinkedPR := linkedPRForBead
+	linkedPRForBead = func(workDir, rigName, hookBead string) (bool, bool, error) {
+		return false, false, nil
+	}
+	t.Cleanup(func() { linkedPRForBead = oldLinkedPR })
 
 	// Full test with mock bd returning beads assigned to dead polecats.
 	//
