@@ -59,6 +59,18 @@ type PreserveOptions struct {
 	// (auto)" prefix, matched elsewhere for squashing) should set this
 	// rather than let their commits go unrecognized by that tooling.
 	CommitMessage string
+
+	// BaseBranch, if set, scopes the unverified-commit scan (gt-35un) to
+	// this branch instead of the remote's default branch. Callers whose
+	// work targets something other than the repo default (e.g. a rig
+	// whose PRs land on "develop") must pass it — otherwise a commit that
+	// bypassed hooks and was merged into the real default branch long ago
+	// poisons the merge-base range and every future push from any
+	// develop-based branch is refused, even though the flagged commit is
+	// already public on origin and this branch never touched it. Empty
+	// falls back to RemoteDefaultBranch(), preserving prior behavior for
+	// callers that don't know their base branch.
+	BaseBranch string
 }
 
 // PreserveResult reports what AutoPreserveUncommittedWork actually did.
@@ -341,7 +353,7 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 	// to the shared remote (PR #184 review). Skipped when this very call
 	// already set HooksFailed: its own commit carries the trailer.
 	if !result.HooksFailed {
-		if badSHA, chkErr := hasUnverifiedCommit(g, remote, head); chkErr != nil {
+		if badSHA, chkErr := hasUnverifiedCommit(g, remote, head, opts.BaseBranch); chkErr != nil {
 			return result, fmt.Errorf("checking for a prior unverified commit: %w", chkErr)
 		} else if badSHA != "" {
 			result.HooksFailed = true
@@ -446,33 +458,54 @@ func divergenceAnchor(g *Git, remote, head string) string {
 }
 
 // HasUnverifiedCommit reports the SHA of a commit in HEAD's ancestry (back
-// to the merge-base with remote's default branch) that was committed with
-// hooks bypassed and never verified — see hasUnverifiedCommit. Exported for
-// callers that push a branch to origin themselves rather than through
-// AutoPreserveUncommittedWork's own push path (gt done, polecat removal's
-// best-effort branch push), so they can refuse to publish it even when no
-// preserve call happened in the same invocation (PR #184 review).
-func HasUnverifiedCommit(g *Git, remote string) (string, error) {
+// to the merge-base with baseBranch, or remote's default branch if
+// baseBranch is empty) that was committed with hooks bypassed and never
+// verified — see hasUnverifiedCommit. Exported for callers that push a
+// branch to origin themselves rather than through AutoPreserveUncommittedWork's
+// own push path (gt done, polecat removal's best-effort branch push), so
+// they can refuse to publish it even when no preserve call happened in the
+// same invocation (PR #184 review).
+//
+// baseBranch (gt-35un) should be the branch this work actually forked
+// from — pass "" only when the caller genuinely doesn't know it (the scan
+// then falls back to RemoteDefaultBranch(), which is wrong for any branch
+// whose real base differs from the repo default).
+func HasUnverifiedCommit(g *Git, remote, baseBranch string) (string, error) {
 	head, err := g.Rev("HEAD")
 	if err != nil {
 		return "", err
 	}
-	return hasUnverifiedCommit(g, remote, head)
+	return hasUnverifiedCommit(g, remote, head, baseBranch)
 }
 
 // hasUnverifiedCommit reports the SHA of the nearest commit, reachable from
-// head back to its merge-base with remote's default branch, that carries
-// unverifiedCommitTrailer — i.e. was committed with hooks bypassed and has
-// never been confirmed safe to publish. Scoped to the merge-base range (this
-// branch's own commits since it diverged) rather than all of history, so an
-// unrelated marked commit merged in from elsewhere can't false-positive
-// every future push. Falls back to head's full ancestry if the merge-base
-// can't be resolved (e.g. the remote branch isn't fetched locally) — a
-// wider search is the safe direction here, not a skipped one.
-func hasUnverifiedCommit(g *Git, remote, head string) (string, error) {
+// head back to its merge-base with baseBranch (or remote's default branch
+// when baseBranch is empty), that carries unverifiedCommitTrailer — i.e. was
+// committed with hooks bypassed and has never been confirmed safe to
+// publish. Scoped to the merge-base range (this branch's own commits since
+// it diverged) rather than all of history, so an unrelated marked commit
+// merged in from elsewhere can't false-positive every future push.
+//
+// The range must be scoped against the branch's ACTUAL base, not
+// unconditionally the remote default (gt-35un): on a rig whose PRs target
+// something other than the default branch (e.g. "develop"), a commit merged
+// into the real default long ago — already public on origin — sits AFTER
+// merge-base(head, default) but is nonetheless unrelated to this branch's
+// own history, and every subsequent push from any branch based on that
+// other branch was being refused for a commit it never made and that was
+// never at risk of reaching origin unverified (it's already there).
+//
+// Falls back to head's full ancestry if the merge-base can't be resolved
+// (e.g. the remote branch isn't fetched locally) — a wider search is the
+// safe direction here, not a skipped one.
+func hasUnverifiedCommit(g *Git, remote, head, baseBranch string) (string, error) {
+	base := baseBranch
+	if base == "" {
+		base = g.RemoteDefaultBranch()
+	}
 	revRange := head
-	if base, err := g.MergeBase(head, remote+"/"+g.RemoteDefaultBranch()); err == nil && base != "" {
-		revRange = base + ".." + head
+	if mergeBase, err := g.MergeBase(head, remote+"/"+base); err == nil && mergeBase != "" {
+		revRange = mergeBase + ".." + head
 	}
 	out, err := g.run("log", revRange, "--fixed-strings", "--grep="+unverifiedCommitTrailer, "--format=%H")
 	if err != nil {

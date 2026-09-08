@@ -1302,7 +1302,7 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	if !nuclear {
 		polecatGit := git.NewGit(clonePath)
 		if branch, brErr := polecatGit.CurrentBranch(); brErr == nil && branch != "" {
-			if badSHA, chkErr := git.HasUnverifiedCommit(polecatGit, "origin"); chkErr != nil {
+			if badSHA, chkErr := git.HasUnverifiedCommit(polecatGit, "origin", ""); chkErr != nil {
 				style.PrintWarning("could not verify %s's commits before the pre-removal push, not pushing branch %s: %v", name, branch, chkErr)
 			} else if badSHA != "" {
 				style.PrintWarning("branch %s carries commit %s made with pre-commit hooks bypassed — refusing the pre-removal push; the work remains in the local commit", branch, badSHA[:8])

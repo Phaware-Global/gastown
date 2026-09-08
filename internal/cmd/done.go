@@ -88,6 +88,37 @@ func doneContaminationBaseRef(defaultBranch, explicitTarget string) string {
 	return "origin/" + targetBranch
 }
 
+// resolveDoneBaseBranch determines the branch this polecat's work actually
+// forked from, for checks that must be scoped to the branch's own commits
+// rather than the wider repo default (gt-35un) — e.g. the unverified-commit
+// scan, which false-positives forever on any develop-based rig if it's
+// compared against the repo default instead. Same priority as the MR
+// target-branch resolution below: explicit --target flag first (it's
+// already known to be the polecat's base — no Dolt round-trip needed), then
+// formula_vars base_branch stamped on the bead at sling time. Returns ""
+// (meaning: caller falls back to RemoteDefaultBranch()) when neither is
+// available — including when the bead lookup itself fails, since guessing
+// wrong here must never be preferred over the existing default-branch
+// behavior.
+func resolveDoneBaseBranch(cwd, issueID string) string {
+	if doneTarget != "" {
+		return strings.TrimPrefix(doneTarget, "origin/")
+	}
+	if issueID == "" {
+		return ""
+	}
+	bd := beads.New(cwd)
+	issue, err := bd.Show(issueID)
+	if err != nil || issue == nil {
+		return ""
+	}
+	af := beads.ParseAttachmentFields(issue)
+	if af == nil {
+		return ""
+	}
+	return extractFormulaVar(af.FormulaVars, "base_branch")
+}
+
 func shouldSyncIdlePolecatWorktree(exitType, mergeStrategy string, pushFailed, mrFailed, syncSafe bool) bool {
 	if exitType != ExitCompleted || pushFailed || mrFailed || !syncSafe {
 		return false
@@ -466,9 +497,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// shared preserve helper only needs to commit here — no separate
 		// preservation-ref push (unlike the nuke/checkpoint call sites, which
 		// have no later push step of their own).
+		preAutoSaveIssueID := parseBranchName(branch).Issue
 		preserveResult, preserveErr := git.AutoPreserveUncommittedWork(g, branch, git.PreserveOptions{
-			IssueID:           parseBranchName(branch).Issue,
+			IssueID:           preAutoSaveIssueID,
 			ExtraExcludePaths: extraExclude,
+			BaseBranch:        resolveDoneBaseBranch(cwd, preAutoSaveIssueID),
 		})
 		if preserveErr != nil {
 			return fmt.Errorf("gt-pvx safety net auto-save failed: %w\nResolve the issue first, or use --status DEFERRED to exit without completing", preserveErr)
@@ -913,7 +946,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Handle "direct" strategy: push to target branch, skip MR
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
-			if reason := refuseUnverifiedPush(g); reason != "" {
+			if reason := refuseUnverifiedPush(g, defaultBranch); reason != "" {
 				pushFailed = true
 				doneErrors = append(doneErrors, reason)
 				style.PrintWarning("%s", reason)
@@ -993,7 +1026,15 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// when the tree was dirty, but an earlier auto-save/checkpoint
 		// cycle can have left an unverified commit on a now-clean branch
 		// (PR #184 review).
-		if reason := refuseUnverifiedPush(g); reason != "" {
+		//
+		// Scoped to this branch's actual base (gt-35un), not unconditionally
+		// the repo default: this branch is about to be pushed under its own
+		// name for a PR/MR against whatever it was forked from, which on a
+		// develop-based rig is NOT defaultBranch — checking against
+		// defaultBranch there means an already-merged, already-public
+		// unverified commit sitting in develop's own history poisons every
+		// future push from any branch based on it.
+		if reason := refuseUnverifiedPush(g, resolveDoneBaseBranch(cwd, issueID)); reason != "" {
 			pushFailed = true
 			doneErrors = append(doneErrors, reason)
 			style.PrintWarning("%s", reason)
@@ -1476,7 +1517,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			fmt.Printf("%s Late-detected direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
 			fmt.Printf("  Convoy: %s\n", convoyInfo.ID)
 
-			if reason := refuseUnverifiedPush(g); reason != "" {
+			if reason := refuseUnverifiedPush(g, defaultBranch); reason != "" {
 				pushFailed = true
 				doneErrors = append(doneErrors, reason)
 				style.PrintWarning("%s", reason)
@@ -2650,8 +2691,8 @@ func findHookedBeadForAgent(bd *beads.Beads, agentID string) string {
 // gt done push site consults this because the auto-save's own HooksFailed
 // gate only fires when auto-save ran in the same invocation — an unverified
 // commit left by an earlier cycle sits on a clean tree (PR #184 review).
-func refuseUnverifiedPush(g *git.Git) string {
-	badSHA, err := git.HasUnverifiedCommit(g, "origin")
+func refuseUnverifiedPush(g *git.Git, baseBranch string) string {
+	badSHA, err := git.HasUnverifiedCommit(g, "origin", baseBranch)
 	if err != nil {
 		return fmt.Sprintf("could not check the branch for unverified commits — refusing to push until it can be verified: %v", err)
 	}
