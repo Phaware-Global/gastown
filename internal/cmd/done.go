@@ -95,28 +95,34 @@ func doneContaminationBaseRef(defaultBranch, explicitTarget string) string {
 // compared against the repo default instead. Same priority as the MR
 // target-branch resolution below: explicit --target flag first (it's
 // already known to be the polecat's base — no Dolt round-trip needed), then
-// formula_vars base_branch stamped on the bead at sling time. Returns ""
-// (meaning: caller falls back to RemoteDefaultBranch()) when neither is
-// available — including when the bead lookup itself fails, since guessing
-// wrong here must never be preferred over the existing default-branch
-// behavior.
-func resolveDoneBaseBranch(cwd, issueID string) string {
+// formula_vars base_branch stamped on the bead at sling time. Falls back to
+// the caller-supplied defaultBranch (the rig's configured default, not
+// necessarily RemoteDefaultBranch()) when neither is available — including
+// when the bead lookup itself fails, since a failed Dolt lookup should not
+// silently widen the scan to the wider repo default (PR #228 review: this
+// used to return "" here, same failure mode noted at the MR-target resolver
+// warning below, "caused 150+ procedure beads to target main").
+func resolveDoneBaseBranch(cwd, issueID, defaultBranch string) string {
 	if doneTarget != "" {
 		return strings.TrimPrefix(doneTarget, "origin/")
 	}
 	if issueID == "" {
-		return ""
+		return defaultBranch
 	}
 	bd := beads.New(cwd)
 	issue, err := bd.Show(issueID)
 	if err != nil || issue == nil {
-		return ""
+		style.PrintWarning("could not load issue %s for base-branch detection (Dolt/beads lookup failed) — using rig default branch %s", issueID, defaultBranch)
+		return defaultBranch
 	}
 	af := beads.ParseAttachmentFields(issue)
 	if af == nil {
-		return ""
+		return defaultBranch
 	}
-	return extractFormulaVar(af.FormulaVars, "base_branch")
+	if bb := strings.TrimPrefix(extractFormulaVar(af.FormulaVars, "base_branch"), "origin/"); bb != "" {
+		return bb
+	}
+	return defaultBranch
 }
 
 func shouldSyncIdlePolecatWorktree(exitType, mergeStrategy string, pushFailed, mrFailed, syncSafe bool) bool {
@@ -436,6 +442,16 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		}
 	}
 
+	// Get configured default branch for this rig. Computed here (rather than
+	// just before its other use below) so resolveDoneBaseBranch has a real
+	// floor to fall back on in the auto-commit safety net section right
+	// below, instead of "" (which silently widened the unverified-commit
+	// scan to RemoteDefaultBranch() on a failed bead lookup — PR #228 review).
+	defaultBranch := "main" // fallback
+	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
+		defaultBranch = rigCfg.DefaultBranch
+	}
+
 	// SAFETY NET: Auto-commit uncommitted work before ANY exit path (gt-pvx).
 	// Polecats have been observed running gt done without committing their
 	// implementation work (1000s of lines lost). This happened because:
@@ -497,11 +513,22 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// shared preserve helper only needs to commit here — no separate
 		// preservation-ref push (unlike the nuke/checkpoint call sites, which
 		// have no later push step of their own).
-		preAutoSaveIssueID := parseBranchName(branch).Issue
+		//
+		// Resolve the issue ID with the same precedence used at line 554
+		// below (explicit --issue flag first): parseBranchName(branch).Issue
+		// alone is deliberately empty for the modern polecat/<worker>-<ts>
+		// branch format, which would leave resolveDoneBaseBranch unable to
+		// look up formula_vars.base_branch and fall back to
+		// RemoteDefaultBranch() — the exact gt-35un false positive this scan
+		// exists to avoid (PR #228 review).
+		preAutoSaveIssueID := doneIssue
+		if preAutoSaveIssueID == "" {
+			preAutoSaveIssueID = parseBranchName(branch).Issue
+		}
 		preserveResult, preserveErr := git.AutoPreserveUncommittedWork(g, branch, git.PreserveOptions{
 			IssueID:           preAutoSaveIssueID,
 			ExtraExcludePaths: extraExclude,
-			BaseBranch:        resolveDoneBaseBranch(cwd, preAutoSaveIssueID),
+			BaseBranch:        resolveDoneBaseBranch(cwd, preAutoSaveIssueID, defaultBranch),
 		})
 		if preserveErr != nil {
 			return fmt.Errorf("gt-pvx safety net auto-save failed: %w\nResolve the issue first, or use --status DEFERRED to exit without completing", preserveErr)
@@ -652,12 +679,6 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	// Parallel to done-intent label for backwards compat during migration.
 	if sessionName := os.Getenv("GT_SESSION"); sessionName != "" && townRoot != "" {
 		polecat.TouchSessionHeartbeatWithState(townRoot, sessionName, polecat.HeartbeatExiting, "gt done", issueID)
-	}
-
-	// Get configured default branch for this rig
-	defaultBranch := "main" // fallback
-	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
-		defaultBranch = rigCfg.DefaultBranch
 	}
 
 	// For COMPLETED, we need an issue ID and branch must not be the default branch
@@ -1034,7 +1055,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// defaultBranch there means an already-merged, already-public
 		// unverified commit sitting in develop's own history poisons every
 		// future push from any branch based on it.
-		if reason := refuseUnverifiedPush(g, resolveDoneBaseBranch(cwd, issueID)); reason != "" {
+		if reason := refuseUnverifiedPush(g, resolveDoneBaseBranch(cwd, issueID, defaultBranch)); reason != "" {
 			pushFailed = true
 			doneErrors = append(doneErrors, reason)
 			style.PrintWarning("%s", reason)

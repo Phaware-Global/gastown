@@ -498,6 +498,14 @@ func HasUnverifiedCommit(g *Git, remote, baseBranch string) (string, error) {
 // Falls back to head's full ancestry if the merge-base can't be resolved
 // (e.g. the remote branch isn't fetched locally) — a wider search is the
 // safe direction here, not a skipped one.
+//
+// A clean scan of that range is not the final answer: baseBranch is
+// caller-supplied (a --target flag or a bead's formula_vars), and a caller
+// naming a ref that already contains an unverified commit can make the
+// merge-base land at or after it, hiding it from the range above (PR #228
+// review, [security]). A second, baseBranch-independent pass always runs:
+// anything reachable from head that isn't already reachable from any
+// remote-tracking ref is in scope regardless of what baseBranch claims.
 func hasUnverifiedCommit(g *Git, remote, head, baseBranch string) (string, error) {
 	base := baseBranch
 	if base == "" {
@@ -507,7 +515,31 @@ func hasUnverifiedCommit(g *Git, remote, head, baseBranch string) (string, error
 	if mergeBase, err := g.MergeBase(head, remote+"/"+base); err == nil && mergeBase != "" {
 		revRange = mergeBase + ".." + head
 	}
-	out, err := g.run("log", revRange, "--fixed-strings", "--grep="+unverifiedCommitTrailer, "--format=%H")
+	if sha, err := grepUnverifiedCommit(g, revRange); sha != "" || err != nil {
+		return sha, err
+	}
+
+	// Defense in depth (PR #228 review, [security]): the range above is
+	// scoped by a caller-supplied baseBranch (a --target flag or a bead's
+	// formula_vars) that this function has no way to validate as genuinely
+	// this branch's base. A caller naming a ref that already contains an
+	// unverified commit — another polecat's pushed branch, an integration
+	// branch — makes the merge-base above land at or after that commit,
+	// excluding it from the scan. Re-scan independent of baseBranch:
+	// anything reachable from head that is NOT already reachable from any
+	// remote-tracking ref is always in scope here, so no --target or bead
+	// value can shrink this window enough to hide a genuinely unpushed
+	// unverified commit.
+	return grepUnverifiedCommit(g, head, "--not", "--remotes="+remote)
+}
+
+// grepUnverifiedCommit runs `git log <revRange> <extraArgs...>`, filtered to
+// commits carrying unverifiedCommitTrailer, and returns the nearest match's
+// SHA (empty if none).
+func grepUnverifiedCommit(g *Git, revRange string, extraArgs ...string) (string, error) {
+	args := append([]string{"log", revRange}, extraArgs...)
+	args = append(args, "--fixed-strings", "--grep="+unverifiedCommitTrailer, "--format=%H")
+	out, err := g.run(args...)
 	if err != nil {
 		return "", err
 	}
