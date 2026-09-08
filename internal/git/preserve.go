@@ -504,6 +504,16 @@ func HasUnverifiedCommit(g *Git, remote, base string) (string, error) {
 // in for verification; failing toward refusal here means an unresolvable
 // base blocks the push until it's actually fetched, not a wider best-effort
 // scan.
+//
+// NOT closed by this: refs/remotes/<remote>/<base> is still local ref
+// storage, written by fetch/push and authenticated by nothing (PR #228
+// round 2 review, [security]) — narrowed from N forgeable refs to one, but
+// an offline `git update-ref refs/remotes/<remote>/<base> <sha>` still
+// forges it. Closing that fully needs a network round-trip (ls-remote
+// against the real remote, or a fresh fetch, then merge-base
+// --is-ancestor) that this call's sites don't currently budget for. This is
+// a known, accepted gap, not an implied tamper-resistance this doesn't
+// have.
 func hasUnverifiedCommit(g *Git, remote, head, base string) (string, error) {
 	if base == "" {
 		base = g.RemoteDefaultBranch()
