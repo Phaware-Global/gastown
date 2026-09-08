@@ -1186,8 +1186,9 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 		if branch == "HEAD" && nuclear {
 			style.PrintWarning("worktree %s is on a detached HEAD — nuclear removal skips local auto-preserve here (no branch ref would survive worktree teardown to hold the commit); any uncommitted work is discarded", name)
 		} else if result, presErr := git.AutoPreserveUncommittedWork(preserveGit, branch, git.PreserveOptions{
-			IssueID: name,
-			Push:    !nuclear,
+			IssueID:    name,
+			Push:       !nuclear,
+			BaseBranch: m.guardBaseBranch(name),
 		}); presErr != nil {
 			style.PrintWarning("could not auto-preserve work in %s before removal: %v", name, presErr)
 		} else if result.Pushed {
@@ -1302,7 +1303,7 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	if !nuclear {
 		polecatGit := git.NewGit(clonePath)
 		if branch, brErr := polecatGit.CurrentBranch(); brErr == nil && branch != "" {
-			if badSHA, chkErr := git.HasUnverifiedCommit(polecatGit, "origin"); chkErr != nil {
+			if badSHA, chkErr := git.HasUnverifiedCommit(polecatGit, "origin", m.guardBaseBranch(name)); chkErr != nil {
 				style.PrintWarning("could not verify %s's commits before the pre-removal push, not pushing branch %s: %v", name, branch, chkErr)
 			} else if badSHA != "" {
 				style.PrintWarning("branch %s carries commit %s made with pre-commit hooks bypassed — refusing the pre-removal push; the work remains in the local commit", branch, badSHA[:8])
@@ -2484,6 +2485,32 @@ func attachmentTargetRefs(bd *beads.Beads, issue *beads.Issue) []string {
 		}
 	}
 	return refs
+}
+
+// guardBaseBranch resolves the dispatch-time base_branch for name's current
+// assignment, for the unverified-commit push guard (git.HasUnverifiedCommit,
+// PR #228 round 3) — never a value computed at push time, per the mayor's
+// ruling that a caller-controlled base reopens round 1's bypass. Reuses
+// attachmentTargetRefs, which already checks formula_vars base_branch
+// first, ahead of attached_vars and the convoy's base branch; the first
+// candidate is what a real dispatch sets. Returns "" (falls back to the
+// remote's actual default branch) when nothing is assigned, the agent bead
+// can't be read, or no override was ever recorded.
+func (m *Manager) guardBaseBranch(name string) string {
+	agentID := m.agentBeadID(name)
+	_, fields, err := m.agentBeads().GetAgentBead(agentID)
+	if err != nil || fields == nil || fields.HookBead == "" {
+		return ""
+	}
+	issue, err := m.beads.Show(fields.HookBead)
+	if err != nil || issue == nil {
+		return ""
+	}
+	refs := attachmentTargetRefs(m.beads, issue)
+	if len(refs) == 0 {
+		return ""
+	}
+	return refs[0]
 }
 
 func appendBaseBranchRefs(refs *[]string, vars string) {
