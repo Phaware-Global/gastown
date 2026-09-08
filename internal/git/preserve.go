@@ -59,18 +59,6 @@ type PreserveOptions struct {
 	// (auto)" prefix, matched elsewhere for squashing) should set this
 	// rather than let their commits go unrecognized by that tooling.
 	CommitMessage string
-
-	// BaseBranch, if set, scopes the unverified-commit scan (gt-35un) to
-	// this branch instead of the remote's default branch. Callers whose
-	// work targets something other than the repo default (e.g. a rig
-	// whose PRs land on "develop") must pass it — otherwise a commit that
-	// bypassed hooks and was merged into the real default branch long ago
-	// poisons the merge-base range and every future push from any
-	// develop-based branch is refused, even though the flagged commit is
-	// already public on origin and this branch never touched it. Empty
-	// falls back to RemoteDefaultBranch(), preserving prior behavior for
-	// callers that don't know their base branch.
-	BaseBranch string
 }
 
 // PreserveResult reports what AutoPreserveUncommittedWork actually did.
@@ -353,7 +341,7 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 	// to the shared remote (PR #184 review). Skipped when this very call
 	// already set HooksFailed: its own commit carries the trailer.
 	if !result.HooksFailed {
-		if badSHA, chkErr := hasUnverifiedCommit(g, remote, head, opts.BaseBranch); chkErr != nil {
+		if badSHA, chkErr := hasUnverifiedCommit(g, remote, head); chkErr != nil {
 			return result, fmt.Errorf("checking for a prior unverified commit: %w", chkErr)
 		} else if badSHA != "" {
 			result.HooksFailed = true
@@ -457,89 +445,48 @@ func divergenceAnchor(g *Git, remote, head string) string {
 	return fields[0]
 }
 
-// HasUnverifiedCommit reports the SHA of a commit in HEAD's ancestry (back
-// to the merge-base with baseBranch, or remote's default branch if
-// baseBranch is empty) that was committed with hooks bypassed and never
-// verified — see hasUnverifiedCommit. Exported for callers that push a
-// branch to origin themselves rather than through AutoPreserveUncommittedWork's
-// own push path (gt done, polecat removal's best-effort branch push), so
-// they can refuse to publish it even when no preserve call happened in the
-// same invocation (PR #184 review).
-//
-// baseBranch (gt-35un) should be the branch this work actually forked
-// from — pass "" only when the caller genuinely doesn't know it (the scan
-// then falls back to RemoteDefaultBranch(), which is wrong for any branch
-// whose real base differs from the repo default).
-func HasUnverifiedCommit(g *Git, remote, baseBranch string) (string, error) {
+// HasUnverifiedCommit reports the SHA of a commit in HEAD's ancestry that
+// was committed with hooks bypassed and never verified, and that is not yet
+// publicly reachable from any of remote's fetched tracking refs — see
+// hasUnverifiedCommit. Exported for callers that push a branch to origin
+// themselves rather than through AutoPreserveUncommittedWork's own push path
+// (gt done, polecat removal's best-effort branch push), so they can refuse
+// to publish it even when no preserve call happened in the same invocation
+// (PR #184 review).
+func HasUnverifiedCommit(g *Git, remote string) (string, error) {
 	head, err := g.Rev("HEAD")
 	if err != nil {
 		return "", err
 	}
-	return hasUnverifiedCommit(g, remote, head, baseBranch)
+	return hasUnverifiedCommit(g, remote, head)
 }
 
 // hasUnverifiedCommit reports the SHA of the nearest commit, reachable from
-// head back to its merge-base with baseBranch (or remote's default branch
-// when baseBranch is empty), that carries unverifiedCommitTrailer — i.e. was
-// committed with hooks bypassed and has never been confirmed safe to
-// publish. Scoped to the merge-base range (this branch's own commits since
-// it diverged) rather than all of history, so an unrelated marked commit
-// merged in from elsewhere can't false-positive every future push.
+// head, that carries unverifiedCommitTrailer (was committed with hooks
+// bypassed and has never been confirmed safe to publish) AND is not already
+// reachable from any of remote's fetched tracking refs (refs/remotes/<remote>/*)
+// — i.e. not already public on origin under some other branch.
 //
-// The range must be scoped against the branch's ACTUAL base, not
-// unconditionally the remote default (gt-35un): on a rig whose PRs target
-// something other than the default branch (e.g. "develop"), a commit merged
-// into the real default long ago — already public on origin — sits AFTER
-// merge-base(head, default) but is nonetheless unrelated to this branch's
-// own history, and every subsequent push from any branch based on that
-// other branch was being refused for a commit it never made and that was
-// never at risk of reaching origin unverified (it's already there).
+// Excluding by remote reachability, rather than scoping the scan to a
+// caller-named base branch (the original gt-35un fix), is what makes this
+// immune to caller-controlled scope (PR #228 review, [security]): the prior
+// version used a caller-supplied base branch (a --target flag, or a bead's
+// formula_vars) to set the lower bound of a merge-base(head, base) range,
+// and a caller naming a ref that already contained the flagged commit could
+// make that range land at or after it, hiding the commit from the scan
+// entirely. Reachability has no such knob — a commit already merged into
+// ANY branch fetched from origin is safe by construction (it's already
+// there, under whatever name), and a commit that exists only in this
+// branch's local history is always in scope, regardless of what any caller
+// claims the base branch is.
 //
-// Falls back to head's full ancestry if the merge-base can't be resolved
-// (e.g. the remote branch isn't fetched locally) — a wider search is the
-// safe direction here, not a skipped one.
-//
-// A clean scan of that range is not the final answer: baseBranch is
-// caller-supplied (a --target flag or a bead's formula_vars), and a caller
-// naming a ref that already contains an unverified commit can make the
-// merge-base land at or after it, hiding it from the range above (PR #228
-// review, [security]). A second, baseBranch-independent pass always runs:
-// anything reachable from head that isn't already reachable from any
-// remote-tracking ref is in scope regardless of what baseBranch claims.
-func hasUnverifiedCommit(g *Git, remote, head, baseBranch string) (string, error) {
-	base := baseBranch
-	if base == "" {
-		base = g.RemoteDefaultBranch()
-	}
-	revRange := head
-	if mergeBase, err := g.MergeBase(head, remote+"/"+base); err == nil && mergeBase != "" {
-		revRange = mergeBase + ".." + head
-	}
-	if sha, err := grepUnverifiedCommit(g, revRange); sha != "" || err != nil {
-		return sha, err
-	}
-
-	// Defense in depth (PR #228 review, [security]): the range above is
-	// scoped by a caller-supplied baseBranch (a --target flag or a bead's
-	// formula_vars) that this function has no way to validate as genuinely
-	// this branch's base. A caller naming a ref that already contains an
-	// unverified commit — another polecat's pushed branch, an integration
-	// branch — makes the merge-base above land at or after that commit,
-	// excluding it from the scan. Re-scan independent of baseBranch:
-	// anything reachable from head that is NOT already reachable from any
-	// remote-tracking ref is always in scope here, so no --target or bead
-	// value can shrink this window enough to hide a genuinely unpushed
-	// unverified commit.
-	return grepUnverifiedCommit(g, head, "--not", "--remotes="+remote)
-}
-
-// grepUnverifiedCommit runs `git log <revRange> <extraArgs...>`, filtered to
-// commits carrying unverifiedCommitTrailer, and returns the nearest match's
-// SHA (empty if none).
-func grepUnverifiedCommit(g *Git, revRange string, extraArgs ...string) (string, error) {
-	args := append([]string{"log", revRange}, extraArgs...)
-	args = append(args, "--fixed-strings", "--grep="+unverifiedCommitTrailer, "--format=%H")
-	out, err := g.run(args...)
+// If remote has no fetched tracking refs at all (added but never
+// fetched/pushed, or --remotes=<remote> otherwise matches nothing), "--not
+// --remotes=<remote>" excludes nothing and the scan widens to head's full
+// ancestry instead — the safe direction: more history in scope means more
+// possible refusals, never a silently narrower, more permissive scan.
+func hasUnverifiedCommit(g *Git, remote, head string) (string, error) {
+	out, err := g.run("log", head, "--not", "--remotes="+remote, "--fixed-strings", "--grep="+unverifiedCommitTrailer, "--format=%H")
 	if err != nil {
 		return "", err
 	}

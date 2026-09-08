@@ -431,21 +431,47 @@ func TestAutoPreserveUncommittedWork_DetachedHEADGetsUniqueRef(t *testing.T) {
 // directly: IssueID takes precedence when set, the worktree directory name
 // is a usable fallback, and an unresolvable case (gt-i4ej FIX 3) is
 // rejected rather than guessed.
-// TestHasUnverifiedCommit_ScopedToBaseBranch covers gt-35un: on a rig whose
-// PRs target something other than the repo's remote default branch (e.g.
-// "develop" rather than "main"), an unverified commit that's already merged
-// into that other branch and already public on origin must not poison every
-// future push from a branch based on it. Scoping the merge-base range
-// against the branch's actual base fixes this; the unscoped ("" baseBranch)
-// fallback reproduces the original false positive, pinning why the fix is
-// necessary.
-func TestHasUnverifiedCommit_ScopedToBaseBranch(t *testing.T) {
+func TestDetachedPreservationIdentity(t *testing.T) {
+	g := NewGit("/some/worktree/rictus")
+
+	id, err := detachedPreservationIdentity(g, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id != "rictus" {
+		t.Fatalf("identity = %q, want %q (fallback to workdir basename)", id, "rictus")
+	}
+
+	id2, err := detachedPreservationIdentity(g, "gt-y8ts")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id2 != "gt-y8ts" {
+		t.Fatalf("identity = %q, want IssueID to take precedence over the workdir fallback", id2)
+	}
+
+	gEmpty := NewGit("")
+	if _, err := detachedPreservationIdentity(gEmpty, ""); err == nil {
+		t.Fatal("expected an error when neither IssueID nor a resolvable workdir is available")
+	}
+}
+
+// TestHasUnverifiedCommit_AlreadyPublicOnRemoteIsAllowed covers gt-35un: an
+// unverified commit that is already public on origin — merged into develop
+// long ago, in this example — must not poison every future push from a
+// branch based on it, even though it's reachable from HEAD via that other
+// branch's history. This is the reachability-based replacement for the
+// original merge-base(baseBranch) scoping (PR #228 review, [security]):
+// that approach used a caller-supplied base branch to narrow the scan
+// window, which a caller could manipulate to hide a commit that was NOT yet
+// public; reachability from any of origin's fetched refs has no such knob.
+func TestHasUnverifiedCommit_AlreadyPublicOnRemoteIsAllowed(t *testing.T) {
 	localDir, _, mainBranch := initTestRepoWithRemote(t)
 	g := NewGit(localDir)
 
 	// develop diverges from main with a commit that bypassed hooks — already
-	// merged and already public on origin, simulating history the polecat
-	// branch never touched.
+	// merged and already public on origin, simulating history a later
+	// polecat branch never touched itself.
 	if err := g.CreateBranch("develop"); err != nil {
 		t.Fatalf("CreateBranch develop: %v", err)
 	}
@@ -463,9 +489,7 @@ func TestHasUnverifiedCommit_ScopedToBaseBranch(t *testing.T) {
 	}
 	runGitTestCmd(t, localDir, "push", "origin", "develop")
 
-	// Advance main independently so develop and main diverge, keeping
-	// merge-base(head, main) strictly before the flagged commit — the exact
-	// "diverged" shape from the bug report.
+	// Advance main independently so develop and main diverge.
 	if err := g.Checkout(mainBranch); err != nil {
 		t.Fatalf("Checkout %s: %v", mainBranch, err)
 	}
@@ -500,28 +524,20 @@ func TestHasUnverifiedCommit_ScopedToBaseBranch(t *testing.T) {
 		t.Fatalf("Commit: %v", err)
 	}
 
-	badSHA, err := HasUnverifiedCommit(g, "origin", "develop")
+	badSHA, err := HasUnverifiedCommit(g, "origin")
 	if err != nil {
-		t.Fatalf("HasUnverifiedCommit(develop): %v", err)
+		t.Fatalf("HasUnverifiedCommit: %v", err)
 	}
 	if badSHA != "" {
-		t.Fatalf("scoped to the branch's real base (develop), expected no unverified commit, got %s", badSHA)
-	}
-
-	badSHA, err = HasUnverifiedCommit(g, "origin", "")
-	if err != nil {
-		t.Fatalf(`HasUnverifiedCommit(""): %v`, err)
-	}
-	if badSHA == "" {
-		t.Fatal("empty baseBranch falls back to the remote default (main); expected the develop-only unverified commit to still be found there, reproducing the original bug this test guards against")
+		t.Fatalf("the flagged commit is already public on origin/develop; expected the push to be allowed, got refusal for %s", badSHA)
 	}
 }
 
-// TestHasUnverifiedCommit_OwnCommitStillCaughtWhenScoped covers the other
-// acceptance criterion of gt-35un: scoping the scan to the branch's real
-// base must not weaken it — a branch that carries its OWN unverified commit
-// is still refused.
-func TestHasUnverifiedCommit_OwnCommitStillCaughtWhenScoped(t *testing.T) {
+// TestHasUnverifiedCommit_OwnUnpushedCommitStillCaught proves the
+// reachability rewrite did not weaken the guard (PR #228 review): a branch
+// carrying its OWN unverified commit — never pushed anywhere — must still
+// be refused.
+func TestHasUnverifiedCommit_OwnUnpushedCommitStillCaught(t *testing.T) {
 	localDir, _, _ := initTestRepoWithRemote(t)
 	g := NewGit(localDir)
 
@@ -546,110 +562,103 @@ func TestHasUnverifiedCommit_OwnCommitStillCaughtWhenScoped(t *testing.T) {
 		t.Fatalf("CommitNoVerify: %v", err)
 	}
 
-	badSHA, err := HasUnverifiedCommit(g, "origin", "develop")
+	badSHA, err := HasUnverifiedCommit(g, "origin")
 	if err != nil {
 		t.Fatalf("HasUnverifiedCommit: %v", err)
 	}
 	if badSHA == "" {
-		t.Fatal("expected the branch's own unverified commit to still be caught when scoped to its real base")
+		t.Fatal("expected the branch's own, never-pushed unverified commit to still be caught")
 	}
 }
 
-// TestAutoPreserveUncommittedWork_BaseBranchScopesHooksFailedGate covers
-// gt-35un for the AutoPreserveUncommittedWork entry point (gt done's
-// gt-pvx safety net auto-commit path), not just the exported
-// HasUnverifiedCommit helper: PreserveOptions.BaseBranch must reach the
-// internal durable-trailer check too, or a dirty-tree polecat on a
-// develop-based rig still gets wrongly blocked even after the push-time
-// check (refuseUnverifiedPush) is fixed.
-func TestAutoPreserveUncommittedWork_BaseBranchScopesHooksFailedGate(t *testing.T) {
+// TestHasUnverifiedCommit_NoFetchedRemoteRefsWidensNotNarrows covers the
+// safe-direction requirement for a remote with no fetched tracking refs at
+// all (added but never fetched/pushed): "--not --remotes=<remote>" then
+// excludes nothing, so the scan widens to HEAD's full ancestry rather than
+// silently allowing everything through.
+func TestHasUnverifiedCommit_NoFetchedRemoteRefsWidensNotNarrows(t *testing.T) {
+	dir := initTestRepo(t)
+	g := NewGit(dir)
+
+	bareDir := filepath.Join(t.TempDir(), "remote.git")
+	runGitTestCmd(t, dir, "init", "--bare", bareDir)
+	runGitTestCmd(t, dir, "remote", "add", "origin", bareDir)
+	// Deliberately never push/fetch — origin has no local tracking refs.
+
+	if err := os.WriteFile(filepath.Join(dir, "own.txt"), []byte("x"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := g.Add("own.txt"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.CommitNoVerify("bad\n\n" + unverifiedCommitTrailer); err != nil {
+		t.Fatalf("CommitNoVerify: %v", err)
+	}
+
+	badSHA, err := HasUnverifiedCommit(g, "origin")
+	if err != nil {
+		t.Fatalf("HasUnverifiedCommit: %v", err)
+	}
+	if badSHA == "" {
+		t.Fatal("with no fetched remote-tracking refs, the scan must widen to full history and still catch the commit — not silently pass")
+	}
+}
+
+// TestHasUnverifiedCommit_DefaultBranchUnchanged is a base-case sanity
+// check (PR #228 review requirement d): on the common repo shape where the
+// polecat branch forks straight off the remote default, behavior is
+// unchanged from before the rewrite — an unpushed commit is refused, and
+// once it's merged and pushed to the default branch, a fresh branch off
+// that default is no longer poisoned by it.
+func TestHasUnverifiedCommit_DefaultBranchUnchanged(t *testing.T) {
 	localDir, _, mainBranch := initTestRepoWithRemote(t)
 	g := NewGit(localDir)
 
-	if err := g.CreateBranch("develop"); err != nil {
-		t.Fatalf("CreateBranch develop: %v", err)
+	if err := g.CreateBranch("polecat/foo/gt-35un@jkl012"); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
 	}
-	if err := g.Checkout("develop"); err != nil {
-		t.Fatalf("Checkout develop: %v", err)
+	if err := g.Checkout("polecat/foo/gt-35un@jkl012"); err != nil {
+		t.Fatalf("Checkout: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(localDir, "develop-only.txt"), []byte("x"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(localDir, "own.txt"), []byte("x"), 0644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if err := g.Add("develop-only.txt"); err != nil {
+	if err := g.Add("own.txt"); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	if err := g.CommitNoVerify("already merged\n\n" + unverifiedCommitTrailer); err != nil {
+	if err := g.CommitNoVerify("bad\n\n" + unverifiedCommitTrailer); err != nil {
 		t.Fatalf("CommitNoVerify: %v", err)
 	}
-	runGitTestCmd(t, localDir, "push", "origin", "develop")
 
+	badSHA, err := HasUnverifiedCommit(g, "origin")
+	if err != nil {
+		t.Fatalf("HasUnverifiedCommit: %v", err)
+	}
+	if badSHA == "" {
+		t.Fatal("expected the branch's own unverified commit to be refused")
+	}
+
+	// Merge it into mainBranch and push — it becomes public, so a fresh
+	// clean branch off main must no longer be poisoned by it.
 	if err := g.Checkout(mainBranch); err != nil {
 		t.Fatalf("Checkout %s: %v", mainBranch, err)
 	}
-	if err := os.WriteFile(filepath.Join(localDir, "main-only.txt"), []byte("y"), 0644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	if err := g.Add("main-only.txt"); err != nil {
-		t.Fatalf("Add: %v", err)
-	}
-	if err := g.Commit("main-only work"); err != nil {
-		t.Fatalf("Commit: %v", err)
-	}
+	runGitTestCmd(t, localDir, "merge", "--no-ff", "-m", "merge bad work", "polecat/foo/gt-35un@jkl012")
 	runGitTestCmd(t, localDir, "push", "origin", mainBranch)
 
-	if err := g.Checkout("develop"); err != nil {
-		t.Fatalf("Checkout develop: %v", err)
-	}
-	branch := "polecat/foo/gt-35un@ghi789"
-	if err := g.CreateBranch(branch); err != nil {
+	if err := g.CreateBranch("polecat/foo/gt-35un@mno345"); err != nil {
 		t.Fatalf("CreateBranch: %v", err)
 	}
-	if err := g.Checkout(branch); err != nil {
+	if err := g.Checkout("polecat/foo/gt-35un@mno345"); err != nil {
 		t.Fatalf("Checkout: %v", err)
 	}
 
-	// Dirty (uncommitted) work — same shape gt done's safety net auto-saves.
-	if err := os.WriteFile(filepath.Join(localDir, "README.md"), []byte("# Test\nmodified\n"), 0644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-
-	result, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{
-		IssueID:    "gt-35un",
-		BaseBranch: "develop",
-	})
+	badSHA, err = HasUnverifiedCommit(g, "origin")
 	if err != nil {
-		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
+		t.Fatalf("HasUnverifiedCommit: %v", err)
 	}
-	if !result.Committed {
-		t.Fatal("expected the dirty README change to be auto-committed")
-	}
-	if result.HooksFailed {
-		t.Fatal("BaseBranch=develop should scope the durable-trailer check to develop, not the remote default (main) — the develop-only unverified commit must not poison this unrelated auto-commit")
-	}
-}
-
-func TestDetachedPreservationIdentity(t *testing.T) {
-	g := NewGit("/some/worktree/rictus")
-
-	id, err := detachedPreservationIdentity(g, "")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if id != "rictus" {
-		t.Fatalf("identity = %q, want %q (fallback to workdir basename)", id, "rictus")
-	}
-
-	id2, err := detachedPreservationIdentity(g, "gt-y8ts")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if id2 != "gt-y8ts" {
-		t.Fatalf("identity = %q, want IssueID to take precedence over the workdir fallback", id2)
-	}
-
-	gEmpty := NewGit("")
-	if _, err := detachedPreservationIdentity(gEmpty, ""); err == nil {
-		t.Fatal("expected an error when neither IssueID nor a resolvable workdir is available")
+	if badSHA != "" {
+		t.Fatalf("the flagged commit is now merged and public on origin/%s; expected the push to be allowed, got refusal for %s", mainBranch, badSHA)
 	}
 }
 
