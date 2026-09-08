@@ -469,6 +469,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		preserveResult, preserveErr := git.AutoPreserveUncommittedWork(g, branch, git.PreserveOptions{
 			IssueID:           parseBranchName(branch).Issue,
 			ExtraExcludePaths: extraExclude,
+			BaseBranch:        resolveGuardBaseBranch(cwd, parseBranchName(branch).Issue),
 		})
 		if preserveErr != nil {
 			return fmt.Errorf("gt-pvx safety net auto-save failed: %w\nResolve the issue first, or use --status DEFERRED to exit without completing", preserveErr)
@@ -913,7 +914,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Handle "direct" strategy: push to target branch, skip MR
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
-			if reason := refuseUnverifiedPush(g); reason != "" {
+			if reason := refuseUnverifiedPush(g, resolveGuardBaseBranch(cwd, issueID)); reason != "" {
 				pushFailed = true
 				doneErrors = append(doneErrors, reason)
 				style.PrintWarning("%s", reason)
@@ -999,7 +1000,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// commit sitting in develop's own history — or anywhere else fetched
 		// from origin — is excluded on its own merits, regardless of which
 		// branch this branch was forked from.
-		if reason := refuseUnverifiedPush(g); reason != "" {
+		if reason := refuseUnverifiedPush(g, resolveGuardBaseBranch(cwd, issueID)); reason != "" {
 			pushFailed = true
 			doneErrors = append(doneErrors, reason)
 			style.PrintWarning("%s", reason)
@@ -1482,7 +1483,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			fmt.Printf("%s Late-detected direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
 			fmt.Printf("  Convoy: %s\n", convoyInfo.ID)
 
-			if reason := refuseUnverifiedPush(g); reason != "" {
+			if reason := refuseUnverifiedPush(g, resolveGuardBaseBranch(cwd, issueID)); reason != "" {
 				pushFailed = true
 				doneErrors = append(doneErrors, reason)
 				style.PrintWarning("%s", reason)
@@ -2656,8 +2657,12 @@ func findHookedBeadForAgent(bd *beads.Beads, agentID string) string {
 // gt done push site consults this because the auto-save's own HooksFailed
 // gate only fires when auto-save ran in the same invocation — an unverified
 // commit left by an earlier cycle sits on a clean tree (PR #184 review).
-func refuseUnverifiedPush(g *git.Git) string {
-	badSHA, err := git.HasUnverifiedCommit(g, "origin")
+//
+// base is the branch's dispatch-time recorded base (resolveGuardBaseBranch)
+// — see hasUnverifiedCommit for why it must come from dispatch, not from
+// anything this call site could compute at push time (PR #228 round 3).
+func refuseUnverifiedPush(g *git.Git, base string) string {
+	badSHA, err := git.HasUnverifiedCommit(g, "origin", base)
 	if err != nil {
 		return fmt.Sprintf("could not check the branch for unverified commits — refusing to push until it can be verified: %v", err)
 	}
@@ -2665,6 +2670,29 @@ func refuseUnverifiedPush(g *git.Git) string {
 		return fmt.Sprintf("commit %s was made with pre-commit hooks bypassed (Gastown-Unverified) and never verified — refusing to push it to origin. Resolve the hook failure, rewrite the marked commit so hooks re-run (e.g. `git commit --amend` / `git rebase -i`), then re-run gt done", badSHA[:8])
 	}
 	return ""
+}
+
+// resolveGuardBaseBranch looks up issueID's dispatch-time base_branch
+// (formula_vars base_branch, set by whatever slung the work) for the
+// unverified-commit push guard. Deliberately independent of this file's
+// other bd/sourceIssue locals so it can run at any push-gate call site
+// regardless of ordering — a single, cheap best-effort Dolt lookup. Any
+// failure (no issueID, Dolt unreachable, no override recorded) returns "",
+// which hasUnverifiedCommit itself falls back on to the remote's actual
+// default branch — never to widening the scan.
+func resolveGuardBaseBranch(cwd, issueID string) string {
+	if issueID == "" {
+		return ""
+	}
+	issue, err := beads.New(cwd).Show(issueID)
+	if err != nil || issue == nil {
+		return ""
+	}
+	af := beads.ParseAttachmentFields(issue)
+	if af == nil {
+		return ""
+	}
+	return extractFormulaVar(af.FormulaVars, "base_branch")
 }
 
 // classifyUnsavedPaths splits the non-runtime uncommitted paths left behind

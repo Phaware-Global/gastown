@@ -168,6 +168,7 @@ func TestAutoPreserveUncommittedWork_FailsClosedWhenDeletionQueryFails(t *testin
 // plumbing.
 func TestAutoPreserveUncommittedWork_UnstagesQuotedPathPreStagedFile(t *testing.T) {
 	dir := initTestRepo(t)
+	addOriginRemoteForGuard(t, dir)
 	g := NewGit(dir)
 	branch := "polecat/foo/gt-y8ts@abc123"
 	runGitTestCmd(t, dir, "checkout", "-b", branch)
@@ -279,6 +280,7 @@ func TestAutoPreserveUncommittedWork_UnverifiedCommitGateSurvivesPushFalse(t *te
 		t.Skip("shell hook script not portable to windows")
 	}
 	dir := initTestRepo(t)
+	addOriginRemoteForGuard(t, dir)
 	g := NewGit(dir)
 	branch := "polecat/foo/gt-y8ts@abc123"
 	runGitTestCmd(t, dir, "checkout", "-b", branch)
