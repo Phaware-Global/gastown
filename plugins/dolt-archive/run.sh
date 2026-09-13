@@ -42,8 +42,11 @@ log() {
 }
 
 # Indent borrowed multi-line output so it cannot forge its own [dolt-archive] line.
+# Normalize lone CR bytes to newlines first — sed's ^ only anchors after \n, so
+# CR-delimited content (spinner output, or a remote injecting a bare CR) would
+# otherwise ride through as one unprefixed "line".
 logblock() {
-  printf '%s\n' "$1" | sed 's/^/[dolt-archive]     | /'
+  printf '%s\n' "$1" | tr '\r' '\n' | sed 's/^/[dolt-archive]     | /'
 }
 
 # Strip userinfo (user:token@) from URLs so credentialed remotes never hit the log.
@@ -177,15 +180,22 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
     if ! ADD_ERR=$(git add *.jsonl 2>&1); then
       log "WARN: git add failed:"
       logblock "$ADD_ERR"
+      GIT_FAILED=true
     fi
 
     COMMIT_OK=true
     if ! COMMIT_ERR=$(git commit -m "Archive snapshot $(date +%Y-%m-%d-%H%M)" \
       --author="Gas Town Archive <archive@gastown.local>" 2>&1); then
-      log "WARN: git commit failed:"
-      logblock "$COMMIT_ERR"
       COMMIT_OK=false
-      GIT_FAILED=true
+      if [[ "$COMMIT_ERR" == *"nothing to commit"* ]]; then
+        # Not a failure — the pre-check above only guarantees a repo-wide diff
+        # exists, not that *.jsonl itself changed (e.g. unchanged export content).
+        log "No changes staged to commit"
+      else
+        log "WARN: git commit failed:"
+        logblock "$COMMIT_ERR"
+        GIT_FAILED=true
+      fi
     fi
 
     if ! $COMMIT_OK; then
@@ -253,13 +263,13 @@ fi
 log ""
 log "=== Archive Cycle Complete ==="
 
-SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED))"
-log "$SUMMARY"
-
 RESULT="success"
 if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]] || $GIT_FAILED; then
   RESULT="warning"
 fi
+
+SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED)), result=$RESULT"
+log "$SUMMARY"
 
 _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
   -l type:plugin-run,plugin:dolt-archive,result:$RESULT \
@@ -267,9 +277,12 @@ _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
 [ -n "${_rid:-}" ] && bd close "$_rid" --reason "plugin run recorded" >/dev/null 2>&1 || true
 
 if [[ "$EXPORT_FAILED" -gt 0 ]]; then
-  gt escalate "dolt-archive: JSONL export failed for $EXPORT_FAILED databases ($EXPORT_ERRORS)" \
+  if ! ESCALATE_ERR=$(gt escalate "dolt-archive: JSONL export failed for $EXPORT_FAILED databases ($EXPORT_ERRORS)" \
     -s critical \
-    --reason "JSONL is our last-resort recovery layer. Failed databases: $EXPORT_ERRORS" 2>/dev/null || true
+    --reason "JSONL is our last-resort recovery layer. Failed databases: $EXPORT_ERRORS" 2>&1); then
+    log "WARN: gt escalate failed:"
+    logblock "$ESCALATE_ERR"
+  fi
 fi
 
 log "Done."
