@@ -110,6 +110,10 @@ for DB in "${PROD_DBS[@]}"; do
   else
     log "  WARN: $DB export failed"
     rm -f "$EXPORT_FILE"
+    if [[ -e "$LATEST_LINK" || -L "$LATEST_LINK" ]]; then
+      rm -f "$LATEST_LINK"
+      log "  WARN: $DB removed stale -latest.jsonl (would have republished old data as current)"
+    fi
     EXPORT_FAILED=$((EXPORT_FAILED + 1))
     EXPORT_ERRORS="${EXPORT_ERRORS}${DB} "
   fi
