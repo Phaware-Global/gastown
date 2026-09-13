@@ -198,30 +198,13 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
 
   fi
 
-  # Push whenever local HEAD is ahead of the remote's tracked branch — not
-  # just when this cycle committed something. A commit stranded by an
-  # earlier failed push (e.g. a network blip) must still be retried on a
-  # later cycle, even one that stages nothing new itself.
-  #
-  # Gate on remote presence first, and resolve the branch actually checked
-  # out rather than hardcoding main (mirrors hasGitRemote/currentGitBranch
-  # in internal/daemon/jsonl_git_backup.go). A repo that has never been
-  # pushed has no origin/<branch> tracking ref, so `git rev-list` errors —
-  # that error must not look identical to a real "nothing to push" empty
-  # result, or a never-pushed repo silently never pushes. Default to
-  # HAVE_WORK=true and only clear it on a rev-list that *succeeded* with an
-  # empty diff.
-  if git remote get-url origin > /dev/null 2>&1; then
-    BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
-    [[ -z "$BRANCH" || "$BRANCH" == "HEAD" ]] && BRANCH="main"
-
-    HAVE_WORK=true
-    if RANGE_OUT=$(git rev-list "origin/$BRANCH..HEAD" 2>/dev/null); then
-      [[ -z "$RANGE_OUT" ]] && HAVE_WORK=false
-    fi
-
-    if $HAVE_WORK; then
-      if PUSH_ERR=$(git push origin "$BRANCH" 2>&1); then
+  # Push whenever local HEAD is ahead of origin/main — not just when this
+  # cycle committed something. A commit stranded by an earlier failed push
+  # (e.g. a network blip) must still be retried on a later cycle, even one
+  # that stages nothing new itself.
+  if [[ -n "$(git rev-list origin/main..HEAD 2>/dev/null)" ]]; then
+    if git remote get-url origin > /dev/null 2>&1; then
+      if PUSH_ERR=$(git push origin main 2>&1); then
         GIT_PUSHED=true
         log "Pushed to GitHub"
       else
@@ -229,9 +212,9 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
         logblock "$(printf '%s' "$PUSH_ERR" | redact)"
         GIT_FAILED=true
       fi
+    else
+      log "WARN: No git remote configured for backup repo"
     fi
-  else
-    log "WARN: No git remote configured for backup repo"
   fi
 elif ! $SKIP_GIT; then
   log "No git backup repo at $BACKUP_REPO — skipping git push"
