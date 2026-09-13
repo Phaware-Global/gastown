@@ -183,10 +183,8 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
       GIT_FAILED=true
     fi
 
-    COMMIT_OK=true
     if ! COMMIT_ERR=$(git commit -m "Archive snapshot $(date +%Y-%m-%d-%H%M)" \
       --author="Gas Town Archive <archive@gastown.local>" 2>&1); then
-      COMMIT_OK=false
       if [[ "$COMMIT_ERR" == *"nothing to commit"* ]]; then
         # Not a failure — the pre-check above only guarantees a repo-wide diff
         # exists, not that *.jsonl itself changed (e.g. unchanged export content).
@@ -198,9 +196,14 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
       fi
     fi
 
-    if ! $COMMIT_OK; then
-      log "WARN: skipping push - nothing was committed"
-    elif git remote get-url origin > /dev/null 2>&1; then
+  fi
+
+  # Push whenever local HEAD is ahead of origin/main — not just when this
+  # cycle committed something. A commit stranded by an earlier failed push
+  # (e.g. a network blip) must still be retried on a later cycle, even one
+  # that stages nothing new itself.
+  if [[ -n "$(git rev-list origin/main..HEAD 2>/dev/null)" ]]; then
+    if git remote get-url origin > /dev/null 2>&1; then
       if PUSH_ERR=$(git push origin main 2>&1); then
         GIT_PUSHED=true
         log "Pushed to GitHub"
