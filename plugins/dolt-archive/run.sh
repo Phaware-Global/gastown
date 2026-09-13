@@ -41,8 +41,18 @@ log() {
   echo "[dolt-archive] $*"
 }
 
-LOGFILE=$(mktemp /tmp/dolt-archive-stderr.XXXXXX)
-trap 'rm -f "$LOGFILE"' EXIT
+# Indent borrowed multi-line output so it cannot forge its own [dolt-archive] line.
+# Normalize lone CR bytes to newlines first — sed's ^ only anchors after \n, so
+# CR-delimited content (spinner output, or a remote injecting a bare CR) would
+# otherwise ride through as one unprefixed "line".
+logblock() {
+  printf '%s\n' "$1" | tr '\r' '\n' | sed 's/^/[dolt-archive]     | /'
+}
+
+# Strip userinfo (user:token@) from URLs so credentialed remotes never hit the log.
+redact() {
+  sed -E 's#(://)[^/@[:space:]]*@#\1***@#g'
+}
 
 dolt_query() {
   local db="$1"
@@ -52,14 +62,14 @@ dolt_query() {
     args+=(--use-db "$db")
   fi
   args+=(sql -q "$query" --result-format csv)
-  "${args[@]}" 2>>"$LOGFILE" | tail -n +2 | tr -d '\r'
+  "${args[@]}" | tail -n +2 | tr -d '\r'
 }
 
 dolt_query_json() {
   local db="$1"
   local query="$2"
   dolt --host "$DOLT_HOST" --port "$DOLT_PORT" --no-tls -u "$DOLT_USER" -p "" \
-    --use-db "$db" sql -q "$query" --result-format json 2>>"$LOGFILE"
+    --use-db "$db" sql -q "$query" --result-format json
 }
 
 # --- Step 1: JSONL export ----------------------------------------------------
@@ -95,23 +105,37 @@ for DB in "${PROD_DBS[@]}"; do
 
   log "Exporting $DB..."
 
-  # Skip databases without an issues table (e.g. gastown config DB)
-  if ! dolt_query "$DB" "SHOW TABLES LIKE 'issues'" 2>/dev/null | grep -q 'issues'; then
+  # A query failure (can't connect, auth, etc.) is not the same as a
+  # genuinely empty result — the former is an export failure, the latter
+  # just means this DB has no issues table (e.g. gastown config DB).
+  QERR=$(mktemp)
+  if ! TABLE_CHECK=$(dolt_query "$DB" "SHOW TABLES LIKE 'issues'" 2>"$QERR"); then
+    CAUSE=$(tr '\n' ' ' < "$QERR"); rm -f "$QERR"
+    log "  WARN: $DB: table check query failed: $CAUSE"
+    EXPORT_FAILED=$((EXPORT_FAILED + 1))
+    EXPORT_ERRORS="${EXPORT_ERRORS}${DB}(table-check: $CAUSE) "
+    continue
+  fi
+  rm -f "$QERR"
+  if ! grep -q 'issues' <<< "$TABLE_CHECK"; then
     log "  $DB: skipped (no issues table)"
     continue
   fi
 
   # Export via Dolt SQL (reliable for all databases with an issues table)
-  if dolt_query_json "$DB" "SELECT * FROM issues ORDER BY id" > "$EXPORT_FILE" 2>/dev/null && [[ -s "$EXPORT_FILE" ]]; then
+  QERR=$(mktemp)
+  if dolt_query_json "$DB" "SELECT * FROM issues ORDER BY id" > "$EXPORT_FILE" 2>"$QERR" && [[ -s "$EXPORT_FILE" ]]; then
     LINE_COUNT=$(wc -l < "$EXPORT_FILE" | tr -d ' ')
     log "  $DB: exported via SQL ($LINE_COUNT lines)"
     ln -sf "$(basename "$EXPORT_FILE")" "$LATEST_LINK"
     EXPORTED=$((EXPORTED + 1))
+    rm -f "$QERR"
   else
-    log "  WARN: $DB export failed"
+    CAUSE=$(tr '\n' ' ' < "$QERR"); rm -f "$QERR"
+    log "  WARN: $DB export failed: $CAUSE"
     rm -f "$EXPORT_FILE"
     EXPORT_FAILED=$((EXPORT_FAILED + 1))
-    EXPORT_ERRORS="${EXPORT_ERRORS}${DB} "
+    EXPORT_ERRORS="${EXPORT_ERRORS}${DB}(export: $CAUSE) "
   fi
 done
 
@@ -129,6 +153,7 @@ log "JSONL export: $EXPORTED succeeded, $EXPORT_FAILED failed"
 # --- Step 2: Git commit and push ---------------------------------------------
 
 GIT_PUSHED=false
+GIT_FAILED=false
 
 if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   log ""
@@ -152,16 +177,40 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   if git diff --quiet && git diff --staged --quiet; then
     log "No changes to commit"
   else
-    git add *.jsonl 2>/dev/null || true
-    git commit -m "Archive snapshot $(date +%Y-%m-%d-%H%M)" \
-      --author="Gas Town Archive <archive@gastown.local>" 2>/dev/null || true
+    if ! ADD_ERR=$(git add *.jsonl 2>&1); then
+      log "WARN: git add failed:"
+      logblock "$ADD_ERR"
+      GIT_FAILED=true
+    fi
 
+    if ! COMMIT_ERR=$(git commit -m "Archive snapshot $(date +%Y-%m-%d-%H%M)" \
+      --author="Gas Town Archive <archive@gastown.local>" 2>&1); then
+      if [[ "$COMMIT_ERR" == *"nothing to commit"* ]]; then
+        # Not a failure — the pre-check above only guarantees a repo-wide diff
+        # exists, not that *.jsonl itself changed (e.g. unchanged export content).
+        log "No changes staged to commit"
+      else
+        log "WARN: git commit failed:"
+        logblock "$COMMIT_ERR"
+        GIT_FAILED=true
+      fi
+    fi
+
+  fi
+
+  # Push whenever local HEAD is ahead of origin/main — not just when this
+  # cycle committed something. A commit stranded by an earlier failed push
+  # (e.g. a network blip) must still be retried on a later cycle, even one
+  # that stages nothing new itself.
+  if [[ -n "$(git rev-list origin/main..HEAD 2>/dev/null)" ]]; then
     if git remote get-url origin > /dev/null 2>&1; then
-      if git push origin main 2>/dev/null; then
+      if PUSH_ERR=$(git push origin main 2>&1); then
         GIT_PUSHED=true
         log "Pushed to GitHub"
       else
-        log "WARN: Git push to remote failed"
+        log "WARN: Git push to remote failed:"
+        logblock "$(printf '%s' "$PUSH_ERR" | redact)"
+        GIT_FAILED=true
       fi
     else
       log "WARN: No git remote configured for backup repo"
@@ -198,11 +247,12 @@ if ! $SKIP_DOLT_PUSH; then
     cd "$DB_DIR"
 
     for REMOTE_NAME in $(dolt remote -v 2>/dev/null | awk '{print $1}' | sort -u || true); do
-      if timeout 120 dolt push "$REMOTE_NAME" main 2>/dev/null; then
+      if PUSH_ERR=$(timeout 120 dolt push "$REMOTE_NAME" main 2>&1); then
         log "    $REMOTE_NAME: pushed"
         DOLT_PUSHED=$((DOLT_PUSHED + 1))
       else
-        log "    $REMOTE_NAME: FAILED"
+        log "    $REMOTE_NAME: FAILED:"
+        logblock "$(printf '%s' "$PUSH_ERR" | redact)"
         DOLT_PUSH_FAILED=$((DOLT_PUSH_FAILED + 1))
       fi
     done
@@ -216,13 +266,13 @@ fi
 log ""
 log "=== Archive Cycle Complete ==="
 
-SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED))"
-log "$SUMMARY"
-
 RESULT="success"
-if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]]; then
+if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]] || $GIT_FAILED; then
   RESULT="warning"
 fi
+
+SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED)), result=$RESULT"
+log "$SUMMARY"
 
 _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
   -l type:plugin-run,plugin:dolt-archive,result:$RESULT \
@@ -230,9 +280,12 @@ _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
 [ -n "${_rid:-}" ] && bd close "$_rid" --reason "plugin run recorded" >/dev/null 2>&1 || true
 
 if [[ "$EXPORT_FAILED" -gt 0 ]]; then
-  gt escalate "dolt-archive: JSONL export failed for $EXPORT_FAILED databases ($EXPORT_ERRORS)" \
+  if ! ESCALATE_ERR=$(gt escalate "dolt-archive: JSONL export failed for $EXPORT_FAILED databases ($EXPORT_ERRORS)" \
     -s critical \
-    --reason "JSONL is our last-resort recovery layer. Failed databases: $EXPORT_ERRORS" 2>/dev/null || true
+    --reason "JSONL is our last-resort recovery layer. Failed databases: $EXPORT_ERRORS" 2>&1); then
+    log "WARN: gt escalate failed:"
+    logblock "$ESCALATE_ERR"
+  fi
 fi
 
 log "Done."
