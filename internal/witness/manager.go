@@ -42,6 +42,19 @@ func NewManager(r *rig.Rig) *Manager {
 	}
 }
 
+// ensureWitnessAgentBead creates or reopens the witness's gt:agent bead so it
+// exists whenever a witness session actually starts, not only when the rig
+// itself was created via `gt rig add`/`gt rig adopt`. See gt-63db.
+func ensureWitnessAgentBead(townRoot, witnessDir, rigName string) error {
+	prefix := beads.GetPrefixForRig(townRoot, rigName)
+	witnessID := beads.WitnessBeadIDWithPrefix(prefix, rigName)
+	_, err := beads.New(witnessDir).CreateOrReopenAgentBead(witnessID,
+		fmt.Sprintf("Witness for %s - monitors polecat health and progress.", rigName),
+		&beads.AgentFields{RoleType: "witness", Rig: rigName, AgentState: "idle"},
+	)
+	return err
+}
+
 // IsRunning checks if the witness session is active and healthy.
 // Checks both tmux session existence AND agent process liveness to avoid
 // reporting zombie sessions (tmux alive but Claude dead) as "running".
@@ -159,6 +172,15 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	townRoot := m.townRoot()
 	if err := beads.SetupRedirect(townRoot, witnessDir); err != nil {
 		return fmt.Errorf("ensuring witness beads redirect: %w", err)
+	}
+
+	// Ensure this witness has a durable gt:agent bead. CreateAgentBead is
+	// otherwise only called once, at `gt rig add`/`gt rig adopt` time — a rig
+	// that predates that code path, or whose bead was later lost (e.g. reaped),
+	// never gets one back, which breaks any tooling that resolves the witness
+	// via its agent bead (gt-63db). Best-effort: must not block witness startup.
+	if err := ensureWitnessAgentBead(townRoot, witnessDir, m.rig.Name); err != nil {
+		style.PrintWarning("could not ensure witness agent bead: %v", err)
 	}
 
 	// Resolve CLAUDE_CONFIG_DIR from accounts.json so witness sessions

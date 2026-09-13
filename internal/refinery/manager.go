@@ -55,6 +55,19 @@ func NewManager(r *rig.Rig) *Manager {
 	}
 }
 
+// ensureRefineryAgentBead creates or reopens the refinery's gt:agent bead so
+// it exists whenever a refinery session actually starts, not only when the
+// rig itself was created via `gt rig add`/`gt rig adopt`. See gt-63db.
+func ensureRefineryAgentBead(townRoot, refineryRigDir, rigName string) error {
+	prefix := beads.GetPrefixForRig(townRoot, rigName)
+	refineryID := beads.RefineryBeadIDWithPrefix(prefix, rigName)
+	_, err := beads.New(refineryRigDir).CreateOrReopenAgentBead(refineryID,
+		fmt.Sprintf("Refinery for %s - processes merge queue.", rigName),
+		&beads.AgentFields{RoleType: "refinery", Rig: rigName, AgentState: "idle"},
+	)
+	return err
+}
+
 // SetOutput sets the output writer for user-facing messages.
 // This is useful for testing or redirecting output.
 func (m *Manager) SetOutput(w io.Writer) {
@@ -185,6 +198,15 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 	// Ensure .gitignore has required Gas Town patterns
 	if err := rig.EnsureGitignorePatterns(refineryRigDir); err != nil {
 		style.PrintWarning("could not update refinery .gitignore: %v", err)
+	}
+
+	// Ensure this refinery has a durable gt:agent bead. CreateAgentBead is
+	// otherwise only called once, at `gt rig add`/`gt rig adopt` time — a rig
+	// that predates that code path, or whose bead was later lost (e.g. reaped),
+	// never gets one back, which breaks any tooling that resolves the refinery
+	// via its agent bead (gt-63db). Best-effort: must not block refinery startup.
+	if err := ensureRefineryAgentBead(townRoot, refineryRigDir, m.rig.Name); err != nil {
+		style.PrintWarning("could not ensure refinery agent bead: %v", err)
 	}
 
 	initialPrompt := session.BuildStartupPrompt(session.BeaconConfig{
