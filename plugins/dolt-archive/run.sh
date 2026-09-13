@@ -41,9 +41,6 @@ log() {
   echo "[dolt-archive] $*"
 }
 
-LOGFILE=$(mktemp /tmp/dolt-archive-stderr.XXXXXX)
-trap 'rm -f "$LOGFILE"' EXIT
-
 dolt_query() {
   local db="$1"
   local query="$2"
@@ -52,14 +49,14 @@ dolt_query() {
     args+=(--use-db "$db")
   fi
   args+=(sql -q "$query" --result-format csv)
-  "${args[@]}" 2>>"$LOGFILE" | tail -n +2 | tr -d '\r'
+  "${args[@]}" | tail -n +2 | tr -d '\r'
 }
 
 dolt_query_json() {
   local db="$1"
   local query="$2"
   dolt --host "$DOLT_HOST" --port "$DOLT_PORT" --no-tls -u "$DOLT_USER" -p "" \
-    --use-db "$db" sql -q "$query" --result-format json 2>>"$LOGFILE"
+    --use-db "$db" sql -q "$query" --result-format json
 }
 
 # --- Step 1: JSONL export ----------------------------------------------------
@@ -95,14 +92,22 @@ for DB in "${PROD_DBS[@]}"; do
 
   log "Exporting $DB..."
 
-  # Skip databases without an issues table (e.g. gastown config DB)
-  if ! dolt_query "$DB" "SHOW TABLES LIKE 'issues'" 2>/dev/null | grep -q 'issues'; then
+  # A query failure (can't connect, auth, etc.) is not the same as a
+  # genuinely empty result — the former is an export failure, the latter
+  # just means this DB has no issues table (e.g. gastown config DB).
+  if ! TABLE_CHECK=$(dolt_query "$DB" "SHOW TABLES LIKE 'issues'"); then
+    log "  WARN: $DB: table check query failed"
+    EXPORT_FAILED=$((EXPORT_FAILED + 1))
+    EXPORT_ERRORS="${EXPORT_ERRORS}${DB} "
+    continue
+  fi
+  if ! grep -q 'issues' <<< "$TABLE_CHECK"; then
     log "  $DB: skipped (no issues table)"
     continue
   fi
 
   # Export via Dolt SQL (reliable for all databases with an issues table)
-  if dolt_query_json "$DB" "SELECT * FROM issues ORDER BY id" > "$EXPORT_FILE" 2>/dev/null && [[ -s "$EXPORT_FILE" ]]; then
+  if dolt_query_json "$DB" "SELECT * FROM issues ORDER BY id" > "$EXPORT_FILE" && [[ -s "$EXPORT_FILE" ]]; then
     LINE_COUNT=$(wc -l < "$EXPORT_FILE" | tr -d ' ')
     log "  $DB: exported via SQL ($LINE_COUNT lines)"
     ln -sf "$(basename "$EXPORT_FILE")" "$LATEST_LINK"
@@ -152,16 +157,20 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   if git diff --quiet && git diff --staged --quiet; then
     log "No changes to commit"
   else
-    git add *.jsonl 2>/dev/null || true
-    git commit -m "Archive snapshot $(date +%Y-%m-%d-%H%M)" \
-      --author="Gas Town Archive <archive@gastown.local>" 2>/dev/null || true
+    if ! ADD_ERR=$(git add *.jsonl 2>&1); then
+      log "WARN: git add failed: $ADD_ERR"
+    fi
+    if ! COMMIT_ERR=$(git commit -m "Archive snapshot $(date +%Y-%m-%d-%H%M)" \
+      --author="Gas Town Archive <archive@gastown.local>" 2>&1); then
+      log "WARN: git commit failed: $COMMIT_ERR"
+    fi
 
     if git remote get-url origin > /dev/null 2>&1; then
-      if git push origin main 2>/dev/null; then
+      if PUSH_ERR=$(git push origin main 2>&1); then
         GIT_PUSHED=true
         log "Pushed to GitHub"
       else
-        log "WARN: Git push to remote failed"
+        log "WARN: Git push to remote failed: $PUSH_ERR"
       fi
     else
       log "WARN: No git remote configured for backup repo"
@@ -198,11 +207,11 @@ if ! $SKIP_DOLT_PUSH; then
     cd "$DB_DIR"
 
     for REMOTE_NAME in $(dolt remote -v 2>/dev/null | awk '{print $1}' | sort -u || true); do
-      if timeout 120 dolt push "$REMOTE_NAME" main 2>/dev/null; then
+      if PUSH_ERR=$(timeout 120 dolt push "$REMOTE_NAME" main 2>&1); then
         log "    $REMOTE_NAME: pushed"
         DOLT_PUSHED=$((DOLT_PUSHED + 1))
       else
-        log "    $REMOTE_NAME: FAILED"
+        log "    $REMOTE_NAME: FAILED: $PUSH_ERR"
         DOLT_PUSH_FAILED=$((DOLT_PUSH_FAILED + 1))
       fi
     done
