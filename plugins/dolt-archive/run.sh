@@ -41,6 +41,16 @@ log() {
   echo "[dolt-archive] $*"
 }
 
+# Indent borrowed multi-line output so it cannot forge its own [dolt-archive] line.
+logblock() {
+  printf '%s\n' "$1" | sed 's/^/[dolt-archive]     | /'
+}
+
+# Strip userinfo (user:token@) from URLs so credentialed remotes never hit the log.
+redact() {
+  sed -E 's#(://)[^/@[:space:]]*@#\1***@#g'
+}
+
 dolt_query() {
   local db="$1"
   local query="$2"
@@ -95,28 +105,34 @@ for DB in "${PROD_DBS[@]}"; do
   # A query failure (can't connect, auth, etc.) is not the same as a
   # genuinely empty result — the former is an export failure, the latter
   # just means this DB has no issues table (e.g. gastown config DB).
-  if ! TABLE_CHECK=$(dolt_query "$DB" "SHOW TABLES LIKE 'issues'"); then
-    log "  WARN: $DB: table check query failed"
+  QERR=$(mktemp)
+  if ! TABLE_CHECK=$(dolt_query "$DB" "SHOW TABLES LIKE 'issues'" 2>"$QERR"); then
+    CAUSE=$(tr '\n' ' ' < "$QERR"); rm -f "$QERR"
+    log "  WARN: $DB: table check query failed: $CAUSE"
     EXPORT_FAILED=$((EXPORT_FAILED + 1))
-    EXPORT_ERRORS="${EXPORT_ERRORS}${DB} "
+    EXPORT_ERRORS="${EXPORT_ERRORS}${DB}(table-check: $CAUSE) "
     continue
   fi
+  rm -f "$QERR"
   if ! grep -q 'issues' <<< "$TABLE_CHECK"; then
     log "  $DB: skipped (no issues table)"
     continue
   fi
 
   # Export via Dolt SQL (reliable for all databases with an issues table)
-  if dolt_query_json "$DB" "SELECT * FROM issues ORDER BY id" > "$EXPORT_FILE" && [[ -s "$EXPORT_FILE" ]]; then
+  QERR=$(mktemp)
+  if dolt_query_json "$DB" "SELECT * FROM issues ORDER BY id" > "$EXPORT_FILE" 2>"$QERR" && [[ -s "$EXPORT_FILE" ]]; then
     LINE_COUNT=$(wc -l < "$EXPORT_FILE" | tr -d ' ')
     log "  $DB: exported via SQL ($LINE_COUNT lines)"
     ln -sf "$(basename "$EXPORT_FILE")" "$LATEST_LINK"
     EXPORTED=$((EXPORTED + 1))
+    rm -f "$QERR"
   else
-    log "  WARN: $DB export failed"
+    CAUSE=$(tr '\n' ' ' < "$QERR"); rm -f "$QERR"
+    log "  WARN: $DB export failed: $CAUSE"
     rm -f "$EXPORT_FILE"
     EXPORT_FAILED=$((EXPORT_FAILED + 1))
-    EXPORT_ERRORS="${EXPORT_ERRORS}${DB} "
+    EXPORT_ERRORS="${EXPORT_ERRORS}${DB}(export: $CAUSE) "
   fi
 done
 
@@ -134,6 +150,7 @@ log "JSONL export: $EXPORTED succeeded, $EXPORT_FAILED failed"
 # --- Step 2: Git commit and push ---------------------------------------------
 
 GIT_PUSHED=false
+GIT_FAILED=false
 
 if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   log ""
@@ -158,19 +175,29 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
     log "No changes to commit"
   else
     if ! ADD_ERR=$(git add *.jsonl 2>&1); then
-      log "WARN: git add failed: $ADD_ERR"
-    fi
-    if ! COMMIT_ERR=$(git commit -m "Archive snapshot $(date +%Y-%m-%d-%H%M)" \
-      --author="Gas Town Archive <archive@gastown.local>" 2>&1); then
-      log "WARN: git commit failed: $COMMIT_ERR"
+      log "WARN: git add failed:"
+      logblock "$ADD_ERR"
     fi
 
-    if git remote get-url origin > /dev/null 2>&1; then
+    COMMIT_OK=true
+    if ! COMMIT_ERR=$(git commit -m "Archive snapshot $(date +%Y-%m-%d-%H%M)" \
+      --author="Gas Town Archive <archive@gastown.local>" 2>&1); then
+      log "WARN: git commit failed:"
+      logblock "$COMMIT_ERR"
+      COMMIT_OK=false
+      GIT_FAILED=true
+    fi
+
+    if ! $COMMIT_OK; then
+      log "WARN: skipping push - nothing was committed"
+    elif git remote get-url origin > /dev/null 2>&1; then
       if PUSH_ERR=$(git push origin main 2>&1); then
         GIT_PUSHED=true
         log "Pushed to GitHub"
       else
-        log "WARN: Git push to remote failed: $PUSH_ERR"
+        log "WARN: Git push to remote failed:"
+        logblock "$(printf '%s' "$PUSH_ERR" | redact)"
+        GIT_FAILED=true
       fi
     else
       log "WARN: No git remote configured for backup repo"
@@ -211,7 +238,8 @@ if ! $SKIP_DOLT_PUSH; then
         log "    $REMOTE_NAME: pushed"
         DOLT_PUSHED=$((DOLT_PUSHED + 1))
       else
-        log "    $REMOTE_NAME: FAILED: $PUSH_ERR"
+        log "    $REMOTE_NAME: FAILED:"
+        logblock "$(printf '%s' "$PUSH_ERR" | redact)"
         DOLT_PUSH_FAILED=$((DOLT_PUSH_FAILED + 1))
       fi
     done
@@ -229,7 +257,7 @@ SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHE
 log "$SUMMARY"
 
 RESULT="success"
-if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]]; then
+if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]] || $GIT_FAILED; then
   RESULT="warning"
 fi
 
