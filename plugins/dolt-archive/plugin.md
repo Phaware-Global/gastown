@@ -43,17 +43,22 @@ configured, and 2 (`beads`, `heartworks_graphql_api`) point at
 remotes, not inert URLs — `git ls-remote` on `beads` already returns
 `refs/dolt/data`, and `beads` is a PUBLIC repo — so a push succeeding there
 is not automatically good news; whether publishing that database is
-intended is an open question for Mayor, not yet decided. This plugin's own
-`PROD_DBS` (`hq`, `gt`, `mo`, see Config below) is a 3-database subset of
-that 13-database inventory — its output can't confirm or refute the other
-10.
+intended is an open question for Mayor, not yet decided. `run.sh`
+auto-discovers every non-test database on the Dolt server
+(`DEFAULT_DBS=auto`), so this plugin covers all 13 databases in
+hq-addxm's inventory — including `beads` and `heartworks_graphql_api` —
+and its receipts do speak to them.
 
-For the databases this plugin does cover, the expected receipt while
-hq-addxm is open is `dolt_push=0/0` (no remotes configured) and `git=false`
-(`$BACKUP_REPO` has no `.git` directory), landing as `result=success`. That
-green receipt means the export step ran cleanly — it is not evidence a
-backup exists anywhere but this host. A disk failure here loses the Dolt
-data and every JSONL export together, no matter how clean the logs look.
+The expected receipt while hq-addxm is open is `dolt_push=0/2` — 11
+databases have no remote configured, so no push is attempted, while
+`beads` and `heartworks_graphql_api` fail against their `git+https`
+remotes — and `git=false` (`$BACKUP_REPO` has no `.git` directory),
+landing as `result=warning`. That receipt means the export step ran
+cleanly and the two remote-bearing databases are not yet landing offsite
+— it is not evidence a backup exists anywhere but this host for the
+other 11. A disk failure here loses the Dolt data and every JSONL export
+together, no matter how clean the logs look. A changed ratio, not the
+warning itself, is what to escalate.
 
 hq-wisp-2egq1 is a breadcrumb only, reaper-purgeable; hq-addxm is the
 durable record this note is keyed to and holds regardless of the wisp's
@@ -61,8 +66,12 @@ lifecycle.
 
 **This note goes stale per-database, not all at once.** As each database in
 hq-addxm's inventory gets a working offsite copy — a successful push, or
-`$BACKUP_REPO` gaining a working git remote — narrow this section to drop
-that database rather than waiting for all 13 before touching it.
+`$BACKUP_REPO` gaining a working git remote whose visibility has been
+established (and confirmed with Mayor if public, per the public-repo
+caveat above) — narrow this section to drop that database rather than
+waiting for all 13 before touching it. A working git remote alone does not
+close the gap; an unvetted remote's visibility is exactly the open question
+the dolt-push caveat above raises for `beads`.
 
 **Escalate on a change, not a repeat**: a database that previously pushed
 successfully starts failing, JSONL export itself fails, or a database starts
