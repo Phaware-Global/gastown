@@ -294,93 +294,46 @@ fi
 log ""
 log "=== Archive Cycle Complete ==="
 
-RESULT="success"
-if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]] || $GIT_FAILED; then
-  RESULT="warning"
+# Report what happened; judge nothing. Earlier rounds tried to answer "is
+# this the KNOWN config gap or a NEW failure?" — a stateless script has no
+# memory of yesterday's run, so every attempt to classify absence vs.
+# failure has an edge that reads the wrong way (a broken probe reads as "no
+# remote configured"; one database pushing reads as "everything is fine").
+# offsite_copies=N of M is the one number a dog needs: how many of this
+# run's databases have a confirmed dolt-native offsite copy, out of how
+# many exist. Whether N<M is expected (a known config gap, tracked
+# elsewhere) or a brand-new outage is for whoever reads the bead to decide,
+# not this script.
+DBS_TOTAL=${#PROD_DBS[@]}
+OFFSITE_COPIES=$DOLT_PUSHED
+
+if [[ "$OFFSITE_COPIES" -ge "$DBS_TOTAL" ]]; then
+  RESULT="success"
+else
+  RESULT="failure"
 fi
 
-# Zero offsite copies is not "success" or even plain "warning" — it means
-# nothing left the machine this cycle, regardless of whether that's because
-# a layer failed or was never attempted (no remote, no .git). The receipt is
-# the only thing dogs read, so it must say so plainly and cite why.
-#
-# Each reason is also classified as a KNOWN-shape absence (nothing was
-# attempted — no remote, no .git, already up to date, explicitly skipped) or
-# a LIVE failure (something was attempted and broke, or a recovery layer
-# failed outright). hq-addxm is the known *config* gap; it says nothing
-# about a live failure, so LIVE_FAILURE gates whether the tracking id below
-# is allowed to be stamped at all.
-NO_OFFSITE_REASONS=()
-LIVE_FAILURE=false
-
-if ! $GIT_PUSHED; then
-  if $GIT_FAILED; then
-    NO_OFFSITE_REASONS+=("${GIT_FAIL_STAGE:-git push} failed")
-    LIVE_FAILURE=true
-  elif [[ -n "$GIT_SKIP_REASON" ]]; then
-    NO_OFFSITE_REASONS+=("$GIT_SKIP_REASON")
-  elif $GIT_UP_TO_DATE; then
-    NO_OFFSITE_REASONS+=("git backup already up to date, nothing new to push")
-  fi
-fi
-if [[ "$DOLT_PUSHED" -eq 0 ]]; then
-  if [[ "$DOLT_NO_REMOTE_COUNT" -gt 0 ]]; then
-    NO_OFFSITE_REASONS+=("no remote configured for $DOLT_NO_REMOTE_COUNT databases")
-  fi
-  if [[ "$DOLT_NO_DOLTDIR_COUNT" -gt 0 ]]; then
-    NO_OFFSITE_REASONS+=("no .dolt directory for $DOLT_NO_DOLTDIR_COUNT databases")
-  fi
-  if [[ -n "$DOLT_SKIP_REASON" ]]; then
-    NO_OFFSITE_REASONS+=("$DOLT_SKIP_REASON")
-  fi
-  if [[ "$DOLT_PUSH_FAILED" -gt 0 ]]; then
-    NO_OFFSITE_REASONS+=("dolt push failed for $DOLT_PUSH_FAILED databases")
-    LIVE_FAILURE=true
-  fi
+# git backup (JSONL export + push) is the last-resort recovery layer (see
+# header), not the primary offsite copy — reported as its own fact here,
+# not folded into offsite_copies.
+if $GIT_PUSHED; then
+  GIT_REASON="pushed"
+elif $GIT_UP_TO_DATE; then
+  GIT_REASON="already up to date"
+elif $GIT_FAILED; then
+  GIT_REASON="${GIT_FAIL_STAGE:-git push} failed"
+elif [[ -n "$GIT_SKIP_REASON" ]]; then
+  GIT_REASON="$GIT_SKIP_REASON"
+else
+  GIT_REASON="unknown"
 fi
 
-if ! $GIT_PUSHED && [[ "$DOLT_PUSHED" -eq 0 ]]; then
-  RESULT="no_offsite_backup"
-  # JSONL is the last-resort recovery layer (see header). A total export
-  # failure landing in the same cycle as a zero-offsite-copy result must
-  # not go missing from the receipt just because the git/dolt gate is what
-  # tripped it — and it is itself a live failure, not a config gap.
-  if [[ "$EXPORT_FAILED" -gt 0 ]]; then
-    NO_OFFSITE_REASONS+=("jsonl export failed for $EXPORT_FAILED databases")
-    LIVE_FAILURE=true
-  fi
-fi
-
-SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED)), result=$RESULT"
-RESULT_LABEL="$RESULT"
-if [[ "$RESULT" == "no_offsite_backup" ]]; then
-  REASON_JOINED="unknown"
-  if [[ ${#NO_OFFSITE_REASONS[@]} -gt 0 ]]; then
-    REASON_JOINED="${NO_OFFSITE_REASONS[0]}"
-    for ((i = 1; i < ${#NO_OFFSITE_REASONS[@]}; i++)); do
-      REASON_JOINED="$REASON_JOINED; ${NO_OFFSITE_REASONS[$i]}"
-    done
-  fi
-  SUMMARY="$SUMMARY reason=\"$REASON_JOINED\""
-  # Only stamp the known-config-gap tracking id when EVERY reason is a
-  # known-shape absence. A live failure (push failed, export failed) is a
-  # new event hq-addxm says nothing about — stamping it would tell a dog a
-  # brand-new outage is already known and tracked, silently absorbing it
-  # into the old one. A mixed run (known absence + live failure) is new:
-  # do not stamp it either.
-  if ! $LIVE_FAILURE; then
-    SUMMARY="$SUMMARY tracking=hq-addxm"
-  fi
-  # gt plugin history renders any result label other than failure|skipped
-  # with the same green check as a clean run (internal/plugin/recording.go,
-  # internal/cmd/plugin.go) — a backup outage must not read as normal there.
-  # detail:$RESULT preserves the specific state for anything that greps it.
-  RESULT_LABEL="failure"
-fi
+DETAIL="offsite_copies_${OFFSITE_COPIES}_of_${DBS_TOTAL}"
+SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), dbs=$DBS_TOTAL dolt_pushed=$DOLT_PUSHED dolt_no_remote=$DOLT_NO_REMOTE_COUNT dolt_no_doltdir=$DOLT_NO_DOLTDIR_COUNT dolt_push_failed=$DOLT_PUSH_FAILED, git_pushed=$GIT_PUSHED git_reason=\"$GIT_REASON\", offsite_copies=$OFFSITE_COPIES of $DBS_TOTAL, result=$RESULT"
 log "$SUMMARY"
 
 _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
-  -l type:plugin-run,plugin:dolt-archive,result:$RESULT_LABEL,detail:$RESULT \
+  -l type:plugin-run,plugin:dolt-archive,result:$RESULT,detail:$DETAIL \
   -d "$SUMMARY" --silent 2>/dev/null)" || true
 [ -n "${_rid:-}" ] && bd close "$_rid" --reason "plugin run recorded" >/dev/null 2>&1 || true
 
