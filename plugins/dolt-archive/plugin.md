@@ -43,13 +43,27 @@ configured, and 2 (`beads`, `heartworks_graphql_api`) point at
 remotes, not inert URLs — `git ls-remote` on `beads` already returns
 `refs/dolt/data`, and `beads` is a PUBLIC repo — so a push succeeding there
 is not automatically good news; whether publishing that database is
-intended is an open question for Mayor, not yet decided. `run.sh`
+intended is an open question for Mayor, not yet decided. Until Mayor
+decides, contain it rather than only watching for it after the fact: drop
+the remote on the `beads` Dolt database (`dolt remote remove origin` in
+`$DOLT_DATA_DIR/beads`) or run this plugin with `--skip-dolt-push`. The
+hourly cooldown (`[gate] duration = "1h"` above) means `run.sh` retries
+the push every cycle regardless — a receipt is a detection channel, read
+after the push already happened, not a gate. `run.sh`
 auto-discovers every non-test database on the Dolt server
 (`DEFAULT_DBS=auto`), so this plugin covers all 13 databases in
 hq-addxm's inventory — including `beads` and `heartworks_graphql_api` —
-and its receipts do speak to them.
+and its receipts do speak to them, with one qualification: the export is
+`SELECT * FROM issues` per database (`run.sh:127`), so `jsonl=13/13` means
+13 issues tables were dumped, not that 13 databases are recoverable.
+`SHOW TABLES` on `beads` returns 28 tables — `wisps`, `comments`,
+`dependencies`, `labels`, `events`, `issue_snapshots` among them — and none
+of those are exported. For the 11 remote-less databases the JSONL/git layer
+is the only offsite-capable path (`dolt push` is unconfigured for them), so
+even once the offsite gap this note tracks is closed, 27 of the 28 tables
+per database still have no copy off this host.
 
-The expected receipt while hq-addxm is open is `dolt_push=0/2` — 11
+The expected receipt while hq-addxm is open is `jsonl=13/13`, `dolt_push=0/2` — 11
 databases have no remote configured, so no push is attempted, while
 `beads` and `heartworks_graphql_api` fail against their `git+https`
 remotes — and `git=false` (`$BACKUP_REPO` has no `.git` directory),
@@ -76,7 +90,16 @@ the dolt-push caveat above raises for `beads`.
 **Escalate on a change, not a repeat**: a database that previously pushed
 successfully starts failing, JSONL export itself fails, or a database starts
 pushing successfully (confirm with Mayor before treating it as resolved,
-given the public-repo caveat above) — any of those is new information.
+given the public-repo caveat above), or a database drops out of the
+`jsonl` count entirely — any of those is new information. That last case
+is silent: `run.sh` auto-discovers whatever `SHOW DATABASES` returns
+(`run.sh:83`), and a discovered database without an `issues` table is
+skipped without touching `EXPORTED` or `EXPORT_FAILED` (`run.sh:120-122`),
+so if the Dolt server stops serving a database, or its `issues` table goes
+missing, the receipt still reads a clean `jsonl=12/12` — the database
+lands in neither the numerator nor the denominator, so the ratio shows
+all-success while coverage has shrunk. Compare the current `jsonl`
+denominator against the expected `13` above, not just the ratio.
 Anyone unsure whether an observation matches the known gap above should
 nudge deacon/mayor rather than assume either way.
 
