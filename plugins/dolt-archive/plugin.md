@@ -28,39 +28,48 @@ Gets production data off this machine. Three layers:
 JSONL is the last-resort recovery layer. Always maintain it regardless of
 whether the other layers work.
 
-## KNOWN ISSUE — do not escalate (tracked: hq-addxm)
+## KNOWN ISSUE — operator documentation, not a dog-facing rule (tracked: hq-addxm)
 
-No offsite backup exists for 11 of the 13 Dolt databases (no remote
-configured) and 2 point at ordinary GitHub code repos (`beads`,
-`heartworks_graphql_api`) rather than a Dolt remote, so `dolt_push` reports
-failures/skips every run. This is understood, root-caused, and assigned to
-Mayor — it needs a human decision on where the offsite copy should live, not
-another report that it's still missing. hq-wisp-2egq1 is a secondary
-breadcrumb only — it is reaper-purgeable, and this rule must still hold if
-that wisp is gone.
+Dogs dispatched to run this plugin never see this file: `plugin.md` ships
+alongside a `run.sh`, so dispatch sends `bash run.sh` directly and tells the
+dog not to interpret `plugin.md` (`FormatMailBody`,
+`internal/plugin/types.go`). Nothing in this section suppresses anything at
+run time — it's context for Mayor, a patrol dog, or a human reading the file
+directly while hq-addxm is open.
 
-**If this run's `dolt_push` result matches that known shape (0 or low push
-count, same set of no-remote/misconfigured databases), do NOT escalate.**
-JSONL export succeeding means the export *step* ran without error — nothing
-more. It is not evidence that a backup exists. `$BACKUP_REPO`
-(`$HOME/gt/.dolt-archive/git`) has no `.git` directory on this machine, so
-every exported `.jsonl` file stays local: nothing is committed, nothing is
-pushed, nothing leaves this host. A disk failure here loses the Dolt data
-and every JSONL export together, regardless of how clean the export logs
-look. This rule exists so dogs stop re-reporting a known, tracked,
-human-gated gap — it is not a claim that the data is safe, and nothing else
-in this section should be read that way either.
+hq-addxm's inventory covers 13 Dolt databases townwide: 11 have no remote
+configured, and 2 (`beads`, `heartworks_graphql_api`) point at
+`git+https://github.com/...` remotes. Those are working Dolt-capable git
+remotes, not inert URLs — `git ls-remote` on `beads` already returns
+`refs/dolt/data`, and `beads` is a PUBLIC repo — so a push succeeding there
+is not automatically good news; whether publishing that database is
+intended is an open question for Mayor, not yet decided. This plugin's own
+`PROD_DBS` (`hq`, `gt`, `mo`, see Config below) is a 3-database subset of
+that 13-database inventory — its output can't confirm or refute the other
+10.
 
-**This suppression applies only while no offsite copy exists.** The moment
-any offsite layer works — a database pushes successfully, or
-`$BACKUP_REPO` gets a working git remote — this section is stale. Delete it
-at that point; do not edit it to match the new state.
+For the databases this plugin does cover, the expected receipt while
+hq-addxm is open is `dolt_push=0/0` (no remotes configured) and `git=false`
+(`$BACKUP_REPO` has no `.git` directory), landing as `result=success`. That
+green receipt means the export step ran cleanly — it is not evidence a
+backup exists anywhere but this host. A disk failure here loses the Dolt
+data and every JSONL export together, no matter how clean the logs look.
 
-**DO escalate immediately if the shape actually changes**: a database that
-previously pushed successfully starts failing, JSONL export itself fails, or
-(good news) a database starts pushing successfully — any of those is new
-information Mayor wants. A dog that isn't sure whether this is the same
-known shape should nudge deacon/mayor rather than file a new CRITICAL.
+hq-wisp-2egq1 is a breadcrumb only, reaper-purgeable; hq-addxm is the
+durable record this note is keyed to and holds regardless of the wisp's
+lifecycle.
+
+**This note goes stale per-database, not all at once.** As each database in
+hq-addxm's inventory gets a working offsite copy — a successful push, or
+`$BACKUP_REPO` gaining a working git remote — narrow this section to drop
+that database rather than waiting for all 13 before touching it.
+
+**Escalate on a change, not a repeat**: a database that previously pushed
+successfully starts failing, JSONL export itself fails, or a database starts
+pushing successfully (confirm with Mayor before treating it as resolved,
+given the public-repo caveat above) — any of those is new information.
+Anyone unsure whether an observation matches the known gap above should
+nudge deacon/mayor rather than assume either way.
 
 ## Config
 
