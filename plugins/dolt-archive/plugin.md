@@ -28,6 +28,26 @@ Gets production data off this machine. Three layers:
 JSONL is the last-resort recovery layer. Always maintain it regardless of
 whether the other layers work.
 
+## KNOWN ISSUE — do not escalate (tracked: hq-wisp-2egq1)
+
+No offsite backup exists for 11 of the 13 Dolt databases (no remote
+configured) and 2 point at ordinary GitHub code repos (`beads`,
+`heartworks_graphql_api`) rather than a Dolt remote, so `dolt_push` reports
+failures/skips every run. This is understood, root-caused, and assigned to
+Mayor — it needs a human decision on where the offsite copy should live, not
+another report that it's still missing.
+
+**If this run's `dolt_push` result matches that known shape (0 or low push
+count, same set of no-remote/misconfigured databases), do NOT escalate.**
+JSONL export still succeeding means the last-resort layer is intact — that is
+expected and fine, not silence-worthy on its own either.
+
+**DO escalate immediately if the shape actually changes**: a database that
+previously pushed successfully starts failing, JSONL export itself fails, or
+(good news) a database starts pushing successfully — any of those is new
+information Mayor wants. A dog that isn't sure whether this is the same
+known shape should nudge deacon/mayor rather than file a new CRITICAL.
+
 ## Config
 
 ```bash
