@@ -154,7 +154,9 @@ log "JSONL export: $EXPORTED succeeded, $EXPORT_FAILED failed"
 
 GIT_PUSHED=false
 GIT_FAILED=false
+GIT_FAIL_STAGE=""
 GIT_SKIP_REASON=""
+GIT_UP_TO_DATE=false
 
 if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   log ""
@@ -182,6 +184,7 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
       log "WARN: git add failed:"
       logblock "$ADD_ERR"
       GIT_FAILED=true
+      GIT_FAIL_STAGE="git add"
     fi
 
     if ! COMMIT_ERR=$(git commit -m "Archive snapshot $(date +%Y-%m-%d-%H%M)" \
@@ -194,6 +197,7 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
         log "WARN: git commit failed:"
         logblock "$COMMIT_ERR"
         GIT_FAILED=true
+        GIT_FAIL_STAGE="git commit"
       fi
     fi
 
@@ -203,8 +207,13 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   # cycle committed something. A commit stranded by an earlier failed push
   # (e.g. a network blip) must still be retried on a later cycle, even one
   # that stages nothing new itself.
-  if [[ -n "$(git rev-list origin/main..HEAD 2>/dev/null)" ]]; then
-    if git remote get-url origin > /dev/null 2>&1; then
+  #
+  # Remote presence is checked first, independent of rev-list state: a repo
+  # with no remote and nothing ahead of origin/main must still report "no
+  # remote configured" rather than silently falling through with no reason
+  # at all.
+  if git remote get-url origin > /dev/null 2>&1; then
+    if [[ -n "$(git rev-list origin/main..HEAD 2>/dev/null)" ]]; then
       if PUSH_ERR=$(git push origin main 2>&1); then
         GIT_PUSHED=true
         log "Pushed to GitHub"
@@ -212,11 +221,18 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
         log "WARN: Git push to remote failed:"
         logblock "$(printf '%s' "$PUSH_ERR" | redact)"
         GIT_FAILED=true
+        GIT_FAIL_STAGE="git push"
       fi
     else
-      log "WARN: No git remote configured for backup repo"
-      GIT_SKIP_REASON="no git remote configured for \$BACKUP_REPO"
+      # Nothing ahead of origin/main — the offsite copy is already current,
+      # not missing. Distinct from GIT_SKIP_REASON/GIT_FAILED so the report
+      # step doesn't mistake "up to date" for "no offsite copy exists".
+      GIT_UP_TO_DATE=true
+      log "Backup repo already up to date with origin/main"
     fi
+  else
+    log "WARN: No git remote configured for backup repo"
+    GIT_SKIP_REASON="no git remote configured for \$BACKUP_REPO"
   fi
 elif ! $SKIP_GIT; then
   log "No git backup repo at $BACKUP_REPO — skipping git push"
@@ -230,6 +246,8 @@ fi
 DOLT_PUSHED=0
 DOLT_PUSH_FAILED=0
 DOLT_NO_REMOTE_COUNT=0
+DOLT_NO_DOLTDIR_COUNT=0
+DOLT_SKIP_REASON=""
 
 if ! $SKIP_DOLT_PUSH; then
   log ""
@@ -240,6 +258,7 @@ if ! $SKIP_DOLT_PUSH; then
 
     if [[ ! -d "$DB_DIR/.dolt" ]]; then
       log "  $DB: no .dolt directory, skipping"
+      DOLT_NO_DOLTDIR_COUNT=$((DOLT_NO_DOLTDIR_COUNT + 1))
       continue
     fi
 
@@ -266,6 +285,8 @@ if ! $SKIP_DOLT_PUSH; then
   done
 
   log "Dolt push: $DOLT_PUSHED succeeded, $DOLT_PUSH_FAILED failed"
+else
+  DOLT_SKIP_REASON="dolt push skipped (--skip-dolt-push)"
 fi
 
 # --- Step 4: Report results --------------------------------------------------
@@ -282,25 +303,56 @@ fi
 # nothing left the machine this cycle, regardless of whether that's because
 # a layer failed or was never attempted (no remote, no .git). The receipt is
 # the only thing dogs read, so it must say so plainly and cite why.
+#
+# Each reason is also classified as a KNOWN-shape absence (nothing was
+# attempted — no remote, no .git, already up to date, explicitly skipped) or
+# a LIVE failure (something was attempted and broke, or a recovery layer
+# failed outright). hq-addxm is the known *config* gap; it says nothing
+# about a live failure, so LIVE_FAILURE gates whether the tracking id below
+# is allowed to be stamped at all.
 NO_OFFSITE_REASONS=()
-if ! $GIT_PUSHED && [[ -n "$GIT_SKIP_REASON" ]]; then
-  NO_OFFSITE_REASONS+=("$GIT_SKIP_REASON")
+LIVE_FAILURE=false
+
+if ! $GIT_PUSHED; then
+  if $GIT_FAILED; then
+    NO_OFFSITE_REASONS+=("${GIT_FAIL_STAGE:-git push} failed")
+    LIVE_FAILURE=true
+  elif [[ -n "$GIT_SKIP_REASON" ]]; then
+    NO_OFFSITE_REASONS+=("$GIT_SKIP_REASON")
+  elif $GIT_UP_TO_DATE; then
+    NO_OFFSITE_REASONS+=("git backup already up to date, nothing new to push")
+  fi
 fi
-if ! $GIT_PUSHED && $GIT_FAILED; then
-  NO_OFFSITE_REASONS+=("git push failed")
-fi
-if [[ "$DOLT_PUSHED" -eq 0 ]] && [[ "$DOLT_NO_REMOTE_COUNT" -gt 0 ]]; then
-  NO_OFFSITE_REASONS+=("no remote configured for $DOLT_NO_REMOTE_COUNT databases")
-fi
-if [[ "$DOLT_PUSHED" -eq 0 ]] && [[ "$DOLT_PUSH_FAILED" -gt 0 ]]; then
-  NO_OFFSITE_REASONS+=("dolt push failed for $DOLT_PUSH_FAILED databases")
+if [[ "$DOLT_PUSHED" -eq 0 ]]; then
+  if [[ "$DOLT_NO_REMOTE_COUNT" -gt 0 ]]; then
+    NO_OFFSITE_REASONS+=("no remote configured for $DOLT_NO_REMOTE_COUNT databases")
+  fi
+  if [[ "$DOLT_NO_DOLTDIR_COUNT" -gt 0 ]]; then
+    NO_OFFSITE_REASONS+=("no .dolt directory for $DOLT_NO_DOLTDIR_COUNT databases")
+  fi
+  if [[ -n "$DOLT_SKIP_REASON" ]]; then
+    NO_OFFSITE_REASONS+=("$DOLT_SKIP_REASON")
+  fi
+  if [[ "$DOLT_PUSH_FAILED" -gt 0 ]]; then
+    NO_OFFSITE_REASONS+=("dolt push failed for $DOLT_PUSH_FAILED databases")
+    LIVE_FAILURE=true
+  fi
 fi
 
 if ! $GIT_PUSHED && [[ "$DOLT_PUSHED" -eq 0 ]]; then
   RESULT="no_offsite_backup"
+  # JSONL is the last-resort recovery layer (see header). A total export
+  # failure landing in the same cycle as a zero-offsite-copy result must
+  # not go missing from the receipt just because the git/dolt gate is what
+  # tripped it — and it is itself a live failure, not a config gap.
+  if [[ "$EXPORT_FAILED" -gt 0 ]]; then
+    NO_OFFSITE_REASONS+=("jsonl export failed for $EXPORT_FAILED databases")
+    LIVE_FAILURE=true
+  fi
 fi
 
 SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED)), result=$RESULT"
+RESULT_LABEL="$RESULT"
 if [[ "$RESULT" == "no_offsite_backup" ]]; then
   REASON_JOINED="unknown"
   if [[ ${#NO_OFFSITE_REASONS[@]} -gt 0 ]]; then
@@ -309,12 +361,26 @@ if [[ "$RESULT" == "no_offsite_backup" ]]; then
       REASON_JOINED="$REASON_JOINED; ${NO_OFFSITE_REASONS[$i]}"
     done
   fi
-  SUMMARY="$SUMMARY reason=\"$REASON_JOINED\" tracking=hq-addxm"
+  SUMMARY="$SUMMARY reason=\"$REASON_JOINED\""
+  # Only stamp the known-config-gap tracking id when EVERY reason is a
+  # known-shape absence. A live failure (push failed, export failed) is a
+  # new event hq-addxm says nothing about — stamping it would tell a dog a
+  # brand-new outage is already known and tracked, silently absorbing it
+  # into the old one. A mixed run (known absence + live failure) is new:
+  # do not stamp it either.
+  if ! $LIVE_FAILURE; then
+    SUMMARY="$SUMMARY tracking=hq-addxm"
+  fi
+  # gt plugin history renders any result label other than failure|skipped
+  # with the same green check as a clean run (internal/plugin/recording.go,
+  # internal/cmd/plugin.go) — a backup outage must not read as normal there.
+  # detail:$RESULT preserves the specific state for anything that greps it.
+  RESULT_LABEL="failure"
 fi
 log "$SUMMARY"
 
 _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
-  -l type:plugin-run,plugin:dolt-archive,result:$RESULT \
+  -l type:plugin-run,plugin:dolt-archive,result:$RESULT_LABEL,detail:$RESULT \
   -d "$SUMMARY" --silent 2>/dev/null)" || true
 [ -n "${_rid:-}" ] && bd close "$_rid" --reason "plugin run recorded" >/dev/null 2>&1 || true
 
