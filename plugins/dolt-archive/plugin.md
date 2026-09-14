@@ -28,19 +28,33 @@ Gets production data off this machine. Three layers:
 JSONL is the last-resort recovery layer. Always maintain it regardless of
 whether the other layers work.
 
-## KNOWN ISSUE — do not escalate (tracked: hq-wisp-2egq1)
+## KNOWN ISSUE — do not escalate (tracked: hq-addxm)
 
 No offsite backup exists for 11 of the 13 Dolt databases (no remote
 configured) and 2 point at ordinary GitHub code repos (`beads`,
 `heartworks_graphql_api`) rather than a Dolt remote, so `dolt_push` reports
 failures/skips every run. This is understood, root-caused, and assigned to
 Mayor — it needs a human decision on where the offsite copy should live, not
-another report that it's still missing.
+another report that it's still missing. hq-wisp-2egq1 is a secondary
+breadcrumb only — it is reaper-purgeable, and this rule must still hold if
+that wisp is gone.
 
 **If this run's `dolt_push` result matches that known shape (0 or low push
 count, same set of no-remote/misconfigured databases), do NOT escalate.**
-JSONL export still succeeding means the last-resort layer is intact — that is
-expected and fine, not silence-worthy on its own either.
+JSONL export succeeding means the export *step* ran without error — nothing
+more. It is not evidence that a backup exists. `$BACKUP_REPO`
+(`$HOME/gt/.dolt-archive/git`) has no `.git` directory on this machine, so
+every exported `.jsonl` file stays local: nothing is committed, nothing is
+pushed, nothing leaves this host. A disk failure here loses the Dolt data
+and every JSONL export together, regardless of how clean the export logs
+look. This rule exists so dogs stop re-reporting a known, tracked,
+human-gated gap — it is not a claim that the data is safe, and nothing else
+in this section should be read that way either.
+
+**This suppression applies only while no offsite copy exists.** The moment
+any offsite layer works — a database pushes successfully, or
+`$BACKUP_REPO` gets a working git remote — this section is stale. Delete it
+at that point; do not edit it to match the new state.
 
 **DO escalate immediately if the shape actually changes**: a database that
 previously pushed successfully starts failing, JSONL export itself fails, or
