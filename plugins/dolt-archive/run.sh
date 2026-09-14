@@ -154,6 +154,7 @@ log "JSONL export: $EXPORTED succeeded, $EXPORT_FAILED failed"
 
 GIT_PUSHED=false
 GIT_FAILED=false
+GIT_SKIP_REASON=""
 
 if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   log ""
@@ -214,16 +215,21 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
       fi
     else
       log "WARN: No git remote configured for backup repo"
+      GIT_SKIP_REASON="no git remote configured for \$BACKUP_REPO"
     fi
   fi
 elif ! $SKIP_GIT; then
   log "No git backup repo at $BACKUP_REPO — skipping git push"
+  GIT_SKIP_REASON="no .git at \$BACKUP_REPO"
+else
+  GIT_SKIP_REASON="git push skipped (--skip-git)"
 fi
 
 # --- Step 3: Dolt native push ------------------------------------------------
 
 DOLT_PUSHED=0
 DOLT_PUSH_FAILED=0
+DOLT_NO_REMOTE_COUNT=0
 
 if ! $SKIP_DOLT_PUSH; then
   log ""
@@ -240,6 +246,7 @@ if ! $SKIP_DOLT_PUSH; then
     REMOTES=$(cd "$DB_DIR" && { dolt remote -v 2>/dev/null | grep -v "^$" | head -5 || true; })
     if [[ -z "$REMOTES" ]]; then
       log "  $DB: no remotes configured, skipping"
+      DOLT_NO_REMOTE_COUNT=$((DOLT_NO_REMOTE_COUNT + 1))
       continue
     fi
 
@@ -271,7 +278,39 @@ if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]] || $GIT_FAILE
   RESULT="warning"
 fi
 
+# Zero offsite copies is not "success" or even plain "warning" — it means
+# nothing left the machine this cycle, regardless of whether that's because
+# a layer failed or was never attempted (no remote, no .git). The receipt is
+# the only thing dogs read, so it must say so plainly and cite why.
+NO_OFFSITE_REASONS=()
+if ! $GIT_PUSHED && [[ -n "$GIT_SKIP_REASON" ]]; then
+  NO_OFFSITE_REASONS+=("$GIT_SKIP_REASON")
+fi
+if ! $GIT_PUSHED && $GIT_FAILED; then
+  NO_OFFSITE_REASONS+=("git push failed")
+fi
+if [[ "$DOLT_PUSHED" -eq 0 ]] && [[ "$DOLT_NO_REMOTE_COUNT" -gt 0 ]]; then
+  NO_OFFSITE_REASONS+=("no remote configured for $DOLT_NO_REMOTE_COUNT databases")
+fi
+if [[ "$DOLT_PUSHED" -eq 0 ]] && [[ "$DOLT_PUSH_FAILED" -gt 0 ]]; then
+  NO_OFFSITE_REASONS+=("dolt push failed for $DOLT_PUSH_FAILED databases")
+fi
+
+if ! $GIT_PUSHED && [[ "$DOLT_PUSHED" -eq 0 ]]; then
+  RESULT="no_offsite_backup"
+fi
+
 SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED)), result=$RESULT"
+if [[ "$RESULT" == "no_offsite_backup" ]]; then
+  REASON_JOINED="unknown"
+  if [[ ${#NO_OFFSITE_REASONS[@]} -gt 0 ]]; then
+    REASON_JOINED="${NO_OFFSITE_REASONS[0]}"
+    for ((i = 1; i < ${#NO_OFFSITE_REASONS[@]}; i++)); do
+      REASON_JOINED="$REASON_JOINED; ${NO_OFFSITE_REASONS[$i]}"
+    done
+  fi
+  SUMMARY="$SUMMARY reason=\"$REASON_JOINED\" tracking=hq-addxm"
+fi
 log "$SUMMARY"
 
 _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
