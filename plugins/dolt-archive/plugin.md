@@ -46,7 +46,12 @@ is not automatically good news; whether publishing that database is
 intended is an open question for Mayor, not yet decided. Until Mayor
 decides, contain it rather than only watching for it after the fact: drop
 the remote on the `beads` Dolt database (`dolt remote remove origin` in
-`$DOLT_DATA_DIR/beads`) or run this plugin with `--skip-dolt-push`. The
+`$DOLT_DATA_DIR/beads`). A `--skip-dolt-push` flag on a manual invocation
+cannot contain this: dog dispatch sends `bash run.sh` with no argument
+channel (`FormatMailBody`, `internal/plugin/types.go`), so nothing reaches
+the hourly run to skip. Removing the remote only stops future pushes — the
+public remote already holds data (`refs/dolt/data`, 146MB, pushed
+2026-09-12), and dropping the remote does not undo that. The
 hourly cooldown (`[gate] duration = "1h"` above) means `run.sh` retries
 the push every cycle regardless — a receipt is a detection channel, read
 after the push already happened, not a gate. `run.sh`
