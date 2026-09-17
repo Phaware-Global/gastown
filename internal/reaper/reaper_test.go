@@ -958,6 +958,12 @@ func (s *fakeReaperState) staleCandidatesLocked(cutoff time.Time, excludeMolecul
 		if s.hasOpenParentLocked(id) {
 			continue
 		}
+		// A top-level molecule (no parent-child dependency row at all) is
+		// never eligible via the missing-parent rule — only a molecule with
+		// an actual (closed or dangling) parent-child row is (hq-s4azi).
+		if w.issueType == "molecule" && !s.hasParentLocked(id) {
+			continue
+		}
 		if excludeMoleculeSteps && s.isMoleculeStepCandidateLocked(id) {
 			continue
 		}
@@ -965,6 +971,18 @@ func (s *fakeReaperState) staleCandidatesLocked(cutoff time.Time, excludeMolecul
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+// hasParentLocked reports whether id has any parent-child dependency row at
+// all, regardless of whether the referenced parent is open, closed, or
+// missing. Mirrors the has_parent anti-join in parentExcludeJoin.
+func (s *fakeReaperState) hasParentLocked(id string) bool {
+	for _, dep := range s.deps {
+		if dep.issueID == id && dep.depType == "parent-child" {
+			return true
+		}
+	}
+	return false
 }
 
 // purgeCandidatesLocked returns closed wisps past cutoff, excluding agent
@@ -1263,6 +1281,8 @@ func validateStaleWispQuery(query string) error {
 		"w.created_at < ?",
 		"open_parent.issue_id IS NULL",
 		"closed_molecule_step.issue_id IS NULL",
+		"has_parent.issue_id = w.id",
+		"w.issue_type != 'molecule' OR has_parent.issue_id IS NOT NULL",
 	)
 }
 
