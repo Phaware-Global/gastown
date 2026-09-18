@@ -165,6 +165,22 @@ func requiresCommitsBeforeClose(isPolecat bool, explicitCleanupStatus string, is
 	return isPolecat && explicitCleanupStatus != "clean" && !isNoMergeTask
 }
 
+// remoteBranchAlreadySubmitted reports whether the GH#wd7 fallback should
+// treat a zero-ahead-of-base branch as already-submitted work rather than
+// falling through to the must-have-commits refusal. BranchPushedToRemote's
+// "exact_remote_branch" evidence alone proves only that HEAD has nothing left
+// to push to origin/<branch> — that's trivially true for a branch that never
+// diverged from the dispatch base (a reset or freshly-created worktree),
+// which is exactly the case requiresCommitsBeforeClose exists to refuse
+// (PR #234, discussion_r4050410848: the fallback re-derived the same
+// pushed+clean condition the explicit-flag fix was meant to stop exempting).
+// Also require the remote branch itself to carry commits ahead of the
+// dispatch base, proving real work was pushed under this branch name.
+func remoteBranchAlreadySubmitted(pushed bool, unpushed int, pushErr error, remoteAheadOfBase int, remoteAheadErr error) bool {
+	return pushErr == nil && pushed && unpushed == 0 &&
+		remoteAheadErr == nil && remoteAheadOfBase > 0
+}
+
 // explicitCleanupFlag returns doneCleanupStatus only when --cleanup-status was
 // EXPLICITLY passed on this invocation, never the auto-detected value: the
 // latter resolves to "clean" for any clean+pushed tree, which a reset
@@ -840,7 +856,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				branchPushedWithWork := false
 				if branch != defaultBranch {
 					pushed, unpushed, pushErr := g.BranchPushedToRemote(branch, "origin")
-					branchPushedWithWork = pushErr == nil && pushed && unpushed == 0
+					remoteAhead, remoteAheadErr := g.CommitsAhead(originDefault, "origin/"+branch)
+					branchPushedWithWork = remoteBranchAlreadySubmitted(pushed, unpushed, pushErr, remoteAhead, remoteAheadErr)
 				}
 				if !branchPushedWithWork {
 					// Refusing here must not leave the session looking like it's

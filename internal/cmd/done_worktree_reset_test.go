@@ -1,6 +1,9 @@
 package cmd
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestSuspectedWorktreeReset(t *testing.T) {
 	tests := []struct {
@@ -111,6 +114,59 @@ func TestRequiresCommitsBeforeClose(t *testing.T) {
 			got := requiresCommitsBeforeClose(tt.isPolecat, tt.cleanupStatus, tt.isNoMergeTask)
 			if got != tt.want {
 				t.Errorf("requiresCommitsBeforeClose() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRemoteBranchAlreadySubmitted covers PR #234, discussion_r4050410848:
+// the GH#wd7 fallback must not treat a branch that never diverged from the
+// dispatch base as already-submitted work just because it's pushed+clean —
+// a 0-ahead polecat branch with no remote branch (or a remote branch that
+// trivially matches the base) must still fall through to the refusal.
+func TestRemoteBranchAlreadySubmitted(t *testing.T) {
+	tests := []struct {
+		name              string
+		pushed            bool
+		unpushed          int
+		pushErr           error
+		remoteAheadOfBase int
+		remoteAheadErr    error
+		want              bool
+	}{
+		{
+			name:   "genuine wd7 case: pushed, clean, remote branch has commits ahead of base",
+			pushed: true, unpushed: 0, remoteAheadOfBase: 3,
+			want: true,
+		},
+		{
+			name:   "reset/never-diverged branch: pushed+clean but remote branch equals base",
+			pushed: true, unpushed: 0, remoteAheadOfBase: 0,
+			want: false, // the exact hazard this fix closes
+		},
+		{
+			name:    "no remote branch at all",
+			pushed:  false,
+			pushErr: errors.New("no such remote branch"),
+			want:    false,
+		},
+		{
+			name:   "pushed but with unpushed commits remaining",
+			pushed: true, unpushed: 2, remoteAheadOfBase: 3,
+			want: false,
+		},
+		{
+			name:   "remote-ahead lookup failed",
+			pushed: true, unpushed: 0, remoteAheadErr: errors.New("rev-list failed"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := remoteBranchAlreadySubmitted(tt.pushed, tt.unpushed, tt.pushErr, tt.remoteAheadOfBase, tt.remoteAheadErr)
+			if got != tt.want {
+				t.Errorf("remoteBranchAlreadySubmitted() = %v, want %v", got, tt.want)
 			}
 		})
 	}
