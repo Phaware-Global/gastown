@@ -3240,6 +3240,49 @@ func TestUnpushedCommitsPrefersExactRemoteBranchOverUpstream(t *testing.T) {
 	}
 }
 
+// TestBranchPreservationStatus_FreshBranchIsNotExactRemoteBranch covers PR
+// #234, discussion_r4050410848: a brand-new local branch created off main,
+// with zero commits and NEVER pushed under its own name, still reports
+// Preserved=true because HEAD equals origin/<default>'s tip and the
+// no-exact-evidence fallback compares against that. Callers that only check
+// the Preserved bool (as gt done's GH#wd7 fallback used to, via the
+// BranchPushedToRemote wrapper) cannot distinguish this from a branch that
+// was genuinely pushed with real work — only Evidence == "exact_remote_branch"
+// proves the latter.
+func TestBranchPreservationStatus_FreshBranchIsNotExactRemoteBranch(t *testing.T) {
+	localDir, _, _ := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	branch := "polecat/fresh-never-pushed"
+
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout: %v", err)
+	}
+	// No commits, no push — this is the fresh zero-commit polecat dispatch
+	// shape, not the legitimate GH#wd7 "already pushed, base advanced" shape.
+
+	status, err := g.BranchPreservationStatus(branch, "origin", nil)
+	if err != nil {
+		t.Fatalf("BranchPreservationStatus: %v", err)
+	}
+	if !status.Preserved {
+		t.Fatalf("expected Preserved=true (HEAD equals origin/main tip), got %+v", status)
+	}
+	if status.Evidence == "exact_remote_branch" {
+		t.Fatalf("Evidence = %q, want anything but exact_remote_branch: this branch was never pushed under its own name", status.Evidence)
+	}
+
+	pushed, unpushed, err := g.BranchPushedToRemote(branch, "origin")
+	if err != nil {
+		t.Fatalf("BranchPushedToRemote: %v", err)
+	}
+	if !pushed || unpushed != 0 {
+		t.Fatalf("BranchPushedToRemote = (%v, %d), want (true, 0) — the bool alone can't tell fresh apart from actually-pushed, which is why gt done must check Evidence instead", pushed, unpushed)
+	}
+}
+
 // TestBranchPushedToRemote_NoPushURL verifies baseline behavior: when fetch and
 // push URLs are the same, BranchPushedToRemote works normally.
 func TestBranchPushedToRemote_NoPushURL(t *testing.T) {

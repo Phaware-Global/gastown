@@ -837,10 +837,22 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// if master advances (e.g., other MRs land), the feature branch is no
 				// longer ahead of origin/master — but the work WAS committed and pushed.
 				// In that case, treat as "MR already submitted" and fall through. (GH#wd7)
+				//
+				// Require Evidence == "exact_remote_branch" specifically, not just
+				// BranchPushedToRemote's bool (PR #234, discussion_r4050410848): inside
+				// this block branch is never the default branch (line ~762 returns
+				// early), so BranchPreservationStatus's exact-branch check always runs.
+				// When origin/<branch> doesn't exist yet — the genuine zero-commit,
+				// nothing-pushed case — it falls back to comparing HEAD against
+				// origin/<default>, which HEAD always equals right after a fresh
+				// branch-from-main checkout. That comparison_ref evidence would report
+				// "Preserved" for a branch that was never pushed at all, making the
+				// requiresCommitsBeforeClose fix above a no-op. Only exact_remote_branch
+				// proves this specific branch name was actually pushed with content.
 				branchPushedWithWork := false
 				if branch != defaultBranch {
-					pushed, unpushed, pushErr := g.BranchPushedToRemote(branch, "origin")
-					branchPushedWithWork = pushErr == nil && pushed && unpushed == 0
+					status, statusErr := g.BranchPreservationStatus(branch, "origin", nil)
+					branchPushedWithWork = statusErr == nil && status.Preserved && status.Evidence == "exact_remote_branch"
 				}
 				if !branchPushedWithWork {
 					// Refusing here must not leave the session looking like it's
