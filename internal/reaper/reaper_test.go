@@ -681,6 +681,129 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	}
 }
 
+// TestTopLevelMoleculeNotReapedWhileHooked is the RED test for hq-s4azi: a
+// top-level molecule wisp (mol-dog-reaper itself, or any dispatched work
+// molecule) has no parent-child dependency row BY DESIGN. The old
+// parentExcludeJoin predicate treated "no parent" and "parent missing" as the
+// same branch, so a top-level molecule matched the moment it passed max_age —
+// even while HOOKED (actively being worked). This must never happen: a
+// top-level molecule is excluded from the missing-parent reap rule entirely.
+func TestTopLevelMoleculeNotReapedWhileHooked(t *testing.T) {
+	now := time.Now().UTC()
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"top-level-molecule": {id: "top-level-molecule", status: "hooked", issueType: "molecule", createdAt: now.Add(-48 * time.Hour)},
+		},
+		deps: []fakeDep{},
+		ops:  map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	maxAge := 24 * time.Hour
+	scan, err := Scan(db, "testdb", maxAge, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if scan.ReapCandidates != 0 {
+		t.Fatalf("Scan ReapCandidates = %d, want 0 (top-level molecule must never be a reap candidate)", scan.ReapCandidates)
+	}
+
+	reap, err := Reap(db, "testdb", maxAge, false)
+	if err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if reap.Reaped != 0 {
+		t.Fatalf("Reap Reaped = %d, want 0", reap.Reaped)
+	}
+	if got := state.status("top-level-molecule"); got != "hooked" {
+		t.Fatalf("top-level-molecule status = %q, want hooked (must remain open, not reaped)", got)
+	}
+}
+
+// TestChildOfGenuinelyClosedParentStillReaped is the regression guard from
+// hq-s4azi: a wisp whose parent-child dependency row points to a parent that
+// is genuinely closed must still be reaped. The fix for the top-level-
+// molecule case must not disable this, the reaper's actual job.
+func TestChildOfGenuinelyClosedParentStillReaped(t *testing.T) {
+	now := time.Now().UTC()
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"closed-parent":          {id: "closed-parent", status: "closed", issueType: "task", createdAt: now.Add(-72 * time.Hour)},
+			"child-of-closed-parent": {id: "child-of-closed-parent", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour)},
+		},
+		deps: []fakeDep{
+			{issueID: "child-of-closed-parent", dependsOnID: "closed-parent", depType: "parent-child"},
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	maxAge := 24 * time.Hour
+	scan, err := Scan(db, "testdb", maxAge, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if scan.ReapCandidates != 1 {
+		t.Fatalf("Scan ReapCandidates = %d, want 1 (child of genuinely closed parent)", scan.ReapCandidates)
+	}
+
+	reap, err := Reap(db, "testdb", maxAge, false)
+	if err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if reap.Reaped != 1 {
+		t.Fatalf("Reap Reaped = %d, want 1", reap.Reaped)
+	}
+	if got := state.status("child-of-closed-parent"); got != "closed" {
+		t.Fatalf("child-of-closed-parent status = %q, want closed", got)
+	}
+}
+
+// TestScanAndReapAgreeOnCandidateSet is the second hq-s4azi RED test: scan
+// and reap must share one predicate so a dry-run preview is truthful. Before
+// the fix, this held only by coincidence (both called the same buggy
+// parentExcludeJoin); this test locks the parity down explicitly so scan and
+// reap can never diverge on the reap-candidate set again.
+func TestScanAndReapAgreeOnCandidateSet(t *testing.T) {
+	now := time.Now().UTC()
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"top-level-molecule":     {id: "top-level-molecule", status: "hooked", issueType: "molecule", createdAt: now.Add(-48 * time.Hour)},
+			"top-level-task":         {id: "top-level-task", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour)},
+			"closed-parent":          {id: "closed-parent", status: "closed", issueType: "task", createdAt: now.Add(-72 * time.Hour)},
+			"child-of-closed-parent": {id: "child-of-closed-parent", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour)},
+			"fresh-top-level-task":   {id: "fresh-top-level-task", status: "open", issueType: "task", createdAt: now.Add(-1 * time.Hour)},
+		},
+		deps: []fakeDep{
+			{issueID: "child-of-closed-parent", dependsOnID: "closed-parent", depType: "parent-child"},
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	maxAge := 24 * time.Hour
+	scan, err := Scan(db, "testdb", maxAge, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	dryRun, err := Reap(db, "testdb", maxAge, true)
+	if err != nil {
+		t.Fatalf("dry-run Reap: %v", err)
+	}
+
+	scanTotal := scan.ReapCandidates + scan.MoleculeStepCandidates
+	reapTotal := dryRun.Reaped + dryRun.MoleculeStepsClosed
+	if scanTotal != reapTotal {
+		t.Fatalf("scan predicted %d candidates but reap (dry-run) would close %d — preview is not truthful", scanTotal, reapTotal)
+	}
+	if scan.ReapCandidates != 2 {
+		t.Fatalf("scan.ReapCandidates = %d, want 2 (top-level-task + child-of-closed-parent)", scan.ReapCandidates)
+	}
+}
+
 var fakeReaperDriverID uint64
 
 func openFakeReaperDB(t *testing.T, state *fakeReaperState) *sql.DB {
@@ -835,6 +958,12 @@ func (s *fakeReaperState) staleCandidatesLocked(cutoff time.Time, excludeMolecul
 		if s.hasOpenParentLocked(id) {
 			continue
 		}
+		// A top-level molecule (no parent-child dependency row at all) is
+		// never eligible via the missing-parent rule — only a molecule with
+		// an actual (closed or dangling) parent-child row is (hq-s4azi).
+		if w.issueType == "molecule" && !s.hasParentLocked(id) {
+			continue
+		}
 		if excludeMoleculeSteps && s.isMoleculeStepCandidateLocked(id) {
 			continue
 		}
@@ -842,6 +971,18 @@ func (s *fakeReaperState) staleCandidatesLocked(cutoff time.Time, excludeMolecul
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+// hasParentLocked reports whether id has any parent-child dependency row at
+// all, regardless of whether the referenced parent is open, closed, or
+// missing. Mirrors the has_parent anti-join in parentExcludeJoin.
+func (s *fakeReaperState) hasParentLocked(id string) bool {
+	for _, dep := range s.deps {
+		if dep.issueID == id && dep.depType == "parent-child" {
+			return true
+		}
+	}
+	return false
 }
 
 // purgeCandidatesLocked returns closed wisps past cutoff, excluding agent
@@ -1140,6 +1281,8 @@ func validateStaleWispQuery(query string) error {
 		"w.created_at < ?",
 		"open_parent.issue_id IS NULL",
 		"closed_molecule_step.issue_id IS NULL",
+		"has_parent.issue_id = w.id",
+		"w.issue_type != 'molecule' OR has_parent.issue_id IS NOT NULL",
 	)
 }
 

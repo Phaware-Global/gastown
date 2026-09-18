@@ -191,12 +191,28 @@ func OpenDB(host string, port int, dbName string, readTimeout, writeTimeout time
 // subqueries per row, causing O(n*m) query cost on large wisp tables (gt-jd1z).
 // The LEFT JOIN approach runs the subquery once and hash-joins: O(n+m).
 //
-// Semantics (unchanged from parentCheckWhere):
-//   - No parent-child dependency → eligible (orphan wisps)
-//   - Parent status is 'closed' → eligible (parent already reaped)
-//   - Parent row missing (dangling ref) → eligible (parent already purged)
+// Semantics:
+//   - No parent-child dependency at all → eligible for a non-molecule wisp
+//     (orphan wisps); NEVER eligible for a molecule wisp (see below, hq-s4azi).
+//   - Parent-child dependency exists and parent status is 'closed' → eligible
+//     (parent already reaped)
+//   - Parent-child dependency exists but the parent row is missing (dangling
+//     ref) → eligible (parent already purged)
 //
-// The inverse is simpler: exclude wisps that have an OPEN parent.
+// "No parent-child dependency at all" and "a parent-child dependency whose
+// parent is gone" are DIFFERENT CONDITIONS and must not share a branch for
+// molecules: a top-level molecule wisp (mol-dog-reaper itself, or any
+// dispatched work molecule) has no parent-child dependency row BY DESIGN, not
+// because its parent was purged. Collapsing the two let a top-level molecule
+// match the instant it passed max_age — including while HOOKED and actively
+// being worked (hq-s4azi). has_parent below distinguishes "never had a
+// parent" from "parent is gone" so the WHERE clause can require an actual
+// parent-child row before a molecule is eligible. Non-molecule wisps keep the
+// original orphan-eligible behavior — this reaper still needs to clean up
+// genuinely abandoned top-level tasks/notifications, just not molecules.
+//
+// The inverse of "has no open parent" is simpler: exclude wisps that have an
+// OPEN parent.
 //
 // Usage:
 //
@@ -206,11 +222,16 @@ func parentExcludeJoin(dbName string) (joinClause, whereCondition string) {
 	joinClause = `LEFT JOIN (
 		SELECT DISTINCT wd.issue_id
 		FROM wisp_dependencies wd
+		WHERE wd.type = 'parent-child'
+	) has_parent ON has_parent.issue_id = w.id
+	LEFT JOIN (
+		SELECT DISTINCT wd.issue_id
+		FROM wisp_dependencies wd
 		LEFT JOIN wisps pw ON pw.id = wd.depends_on_wisp_id LEFT JOIN issues pi ON pi.id = wd.depends_on_issue_id
 		WHERE wd.type = 'parent-child'
 		AND (pw.status IN ('open', 'hooked', 'in_progress') OR pi.status IN ('open', 'hooked', 'in_progress') OR wd.depends_on_external IS NOT NULL)
 	) open_parent ON open_parent.issue_id = w.id`
-	whereCondition = "open_parent.issue_id IS NULL"
+	whereCondition = "open_parent.issue_id IS NULL AND (w.issue_type != 'molecule' OR has_parent.issue_id IS NOT NULL)"
 	return
 }
 
