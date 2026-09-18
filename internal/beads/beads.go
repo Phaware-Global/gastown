@@ -1544,6 +1544,37 @@ func (b *Beads) Show(id string) (*Issue, error) {
 	return issues[0], nil
 }
 
+// HistoryEntry is one commit-level snapshot of an issue, as returned by
+// `bd history <id> --json`. Entries are ordered newest-first.
+type HistoryEntry struct {
+	CommitHash string    `json:"CommitHash"`
+	Committer  string     `json:"Committer"`
+	CommitDate time.Time  `json:"CommitDate"`
+	Issue      Issue      `json:"Issue"`
+}
+
+// History returns the version history of an issue, newest-first, as recorded
+// by `bd history`. limit caps the number of entries (0 = bd's default of
+// "all"). Unlike Show, this always shells out to the bd CLI — there is no
+// in-process store fast path for history yet — which is fine for its current
+// caller (an infrequent, one-shot check in `gt done`), not a hot loop.
+func (b *Beads) History(id string, limit int) ([]HistoryEntry, error) {
+	args := []string{"history", id, "--json"}
+	if limit > 0 {
+		args = append(args, "--limit", strconv.Itoa(limit))
+	}
+	out, err := b.run(args...)
+	if err != nil {
+		return nil, err
+	}
+
+	var entries []HistoryEntry
+	if err := json.Unmarshal(out, &entries); err != nil {
+		return nil, fmt.Errorf("parsing bd history output: %w", err)
+	}
+	return entries, nil
+}
+
 // FindLatestIssueByTitleAndAssignee finds the newest issue matching the given title and assignee.
 func (b *Beads) FindLatestIssueByTitleAndAssignee(title, assignee string) (*Issue, error) {
 	out, err := b.run("list", "--json", "--limit", "0", "--title", title, "--assignee", assignee)

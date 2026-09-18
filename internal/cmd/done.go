@@ -162,24 +162,33 @@ func explicitCleanupFlag(cmd *cobra.Command, doneCleanupStatus string) string {
 }
 
 // isPolecatSession reports whether the current process is running as a
-// polecat, using the same env-var-first-then-role-detection order as
-// GetRoleWithContext (the canonical resolver, already used later in this
-// file — see the isPolecat computation ahead of the persistent-polecat
-// IDLE transition). A bare `os.Getenv("GT_POLECAT") != ""` check — what the
-// zero-commit guards used before this — is documented elsewhere in this repo
-// as unreliable (prime_branch_guard.go, sling.go, hook.go, handoff.go all
-// special-case it: coordinators can carry a stale GT_POLECAT from having
-// spawned polecats, and GT_POLECAT is "not guaranteed to be set in every
-// session"). hq-8ynas: heartworks_graphql_api/corpus reached the zero-commit
-// "no code changes" close path on a live, mid-task polecat session — the
-// guards below that should have required commits/refused on a reset worktree
-// silently did not fire, consistent with GT_POLECAT reading empty for a real
-// polecat session while role detection would have caught it.
+// polecat, using the canonical role resolver (GetRoleWithContext — already
+// used later in this file, see the isPolecat computation ahead of the
+// persistent-polecat IDLE transition) instead of a bare
+// `os.Getenv("GT_POLECAT") != ""` check. That bare check is documented
+// elsewhere in this repo as unreliable (prime_branch_guard.go, sling.go,
+// hook.go, handoff.go all special-case it: coordinators can carry a stale
+// GT_POLECAT from having spawned polecats, and GT_POLECAT is "not guaranteed
+// to be set in every session"). hq-8ynas: heartworks_graphql_api/corpus
+// reached the zero-commit "no code changes" close path on a live, mid-task
+// polecat session — the guards below that should have required
+// commits/refused on a reset worktree silently did not fire, consistent with
+// GT_POLECAT reading empty for a real polecat session while role detection
+// would have caught it.
+//
+// GetRoleWithContext has exactly one return path (`return info, nil`), so it
+// never actually returns an error today — an env-var fallback for that
+// branch would be dead code (PR #234 finding B). If that ever changes, fail
+// CLOSED here (treat the session as a polecat) rather than silently
+// skipping the completion-evidence and worktree-reset guards below: an
+// unresolvable role is exactly the ambiguous case those guards exist for,
+// and guessing "not a polecat" would exempt it from them instead.
 func isPolecatSession(cwd, townRoot string) bool {
-	if roleInfo, err := GetRoleWithContext(cwd, townRoot); err == nil {
-		return roleInfo.Role == RolePolecat
+	roleInfo, err := GetRoleWithContext(cwd, townRoot)
+	if err != nil {
+		return true
 	}
-	return os.Getenv("GT_POLECAT") != ""
+	return roleInfo.Role == RolePolecat
 }
 
 // lacksCompletionEvidence reports whether a zero-commit "no code changes"
@@ -204,6 +213,67 @@ func lacksCompletionEvidence(isPolecat bool, hasEvidence bool, explicitCleanupSt
 	return !hasEvidence
 }
 
+// evidenceHistoryLookback bounds how many bd history entries
+// hasEvidenceFromThisDispatch will walk looking for the start of the
+// current agent's assignment run. Generous relative to the handful of
+// commits a normal hook->close cycle produces; a bead with more churn than
+// this before the current assignment just falls back to the oldest fetched
+// snapshot (see hasEvidenceFromThisDispatch), which only makes the check
+// more conservative, never less.
+const evidenceHistoryLookback = 100
+
+// hasEvidenceFromThisDispatch reports whether issueID's Notes or Design were
+// actually written during the CURRENT assignment to currentAgent, not
+// merely non-empty (PR #234 finding A: "hasCompletionEvidence is true for
+// ANY non-empty Notes or Design. Nothing ties that text to THIS worker or
+// THIS dispatch" — the originating hga-2put bead had stale notes from a
+// PRIOR filing that would have passed a bare non-empty check every time it
+// was re-dispatched).
+//
+// It walks bd history (newest-first) for the contiguous run of entries
+// where Issue.Assignee == currentAgent, and takes the OLDEST snapshot in
+// that run as "how the bead looked when this dispatch began" — a run breaks
+// the moment history shows a different (or empty) assignee, which is
+// exactly the hand-off boundary we want. Notes/Design are then compared
+// against that snapshot: unchanged means whatever text is there predates
+// this dispatch and proves nothing about it; changed means this worker
+// (or at least this assignment) produced it.
+//
+// currentIssue is passed in rather than re-fetched so the caller's own
+// bd.Show result (already used for the acceptance-criteria check) stays the
+// single source of truth for "now".
+func hasEvidenceFromThisDispatch(bd *beads.Beads, issueID, currentAgent string, currentIssue *beads.Issue) bool {
+	if currentAgent == "" || currentIssue == nil {
+		return false
+	}
+	history, err := bd.History(issueID, evidenceHistoryLookback)
+	if err != nil || len(history) == 0 {
+		// Can't establish provenance — fail closed like the rest of this
+		// gate (hq-8ynas required behavior #1): no proof, no evidence.
+		return false
+	}
+
+	var dispatchSnapshot *beads.Issue
+	inRun := false
+	for i := range history {
+		if history[i].Issue.Assignee == currentAgent {
+			inRun = true
+			snap := history[i].Issue
+			dispatchSnapshot = &snap // overwritten each iter; last write = oldest entry still in the run
+		} else if inRun {
+			break // walked past the start of the current assignment
+		}
+	}
+	if dispatchSnapshot == nil {
+		// currentAgent never appears as the assignee in recorded history —
+		// e.g. a routing/replication lag. Fail closed rather than assume.
+		return false
+	}
+
+	return strings.TrimSpace(currentIssue.Notes) != strings.TrimSpace(dispatchSnapshot.Notes) ||
+		strings.TrimSpace(currentIssue.Design) != strings.TrimSpace(dispatchSnapshot.Design)
+}
+
 // completionCommitShaLine formats the target_branch/commit_sha suffix for a
 // zero-commit "no code changes" close reason — or, when commitSHA is nothing
 // but the base branch's own current tip, omits the misleading commit_sha
@@ -214,11 +284,35 @@ func lacksCompletionEvidence(isPolecat bool, hasEvidence bool, explicitCleanupSt
 // did land upstream); when commitSHA == baseSHA it is simply the ambient
 // state the fresh branch started at, and presenting it as "commit_sha:
 // <value>" makes an unverified guess look corroborated.
-func completionCommitShaLine(commitSHA, baseSHA, targetBranch string) string {
+//
+// verified must be true only when the caller already confirmed commitSHA is
+// reachable on origin/targetBranch (g.VerifyPushedCommit succeeded). The
+// "not evidence of a fix" judgment below is scoped to that path on purpose
+// (PR #234 finding D, "wrong in both directions"):
+//
+//  1. On the --skip-verify path, nothing has actually been checked —
+//     skip_verify:true is already recorded on the close reason immediately
+//     before this call as the explicit, honest signal that this is an
+//     operator override, not a verified claim. Asserting "not evidence"
+//     there would be just as much of an unverified guess as asserting
+//     evidence, so unverified callers get the bare commit_sha with no
+//     judgment attached either way.
+//  2. Even on the verified path, commitSHA == baseSHA is not unambiguous:
+//     a worker's commit that was fast-forward-merged into the base (no
+//     divergent history left once that happens) looks IDENTICAL to a
+//     freshly-branched, untouched HEAD sitting at the same tip — this
+//     function cannot tell those apart from local branch state alone. It
+//     intentionally resolves that ambiguity toward "not evidence" because
+//     that is the far more common case in practice (hq-8ynas's repeated
+//     false completions were all the untouched-branch case, never the
+//     fast-forward one) and because understating evidence here just leaves
+//     the bead open for a human to look at, while overstating it is exactly
+//     the false-completion failure mode this whole gate exists to prevent.
+func completionCommitShaLine(commitSHA, baseSHA, targetBranch string, verified bool) string {
 	if commitSHA == "" {
 		return ""
 	}
-	if commitSHA == baseSHA {
+	if verified && commitSHA == baseSHA {
 		return fmt.Sprintf("\ntarget_branch: %s\nnote: HEAD matches origin/%s tip — not evidence of a fix", targetBranch, targetBranch)
 	}
 	return fmt.Sprintf("\ntarget_branch: %s\ncommit_sha: %s", targetBranch, commitSHA)
@@ -793,6 +887,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					branchPushedWithWork = pushErr == nil && pushed && unpushed == 0
 				}
 				if !branchPushedWithWork {
+					// Refusing here must not leave the session looking like it's
+					// mid-exit: setDoneIntentLabel + the "exiting" heartbeat were
+					// both written earlier in this function, before we knew the
+					// commit check would fail (PR #234 finding C).
+					clearDoneIntentOnHardFail(cwd, townRoot, agentBeadID, issueID)
 					return fmt.Errorf("cannot complete: no commits on branch ahead of %s\n"+
 						"Polecats must have at least 1 commit to submit.\n"+
 						"If the bug was already fixed upstream: gt done --status DEFERRED\n"+
@@ -830,7 +929,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
 						skipClose = true
 					}
-					hasCompletionEvidence = strings.TrimSpace(issue.Notes) != "" || strings.TrimSpace(issue.Design) != ""
+					// Non-empty Notes/Design alone proves nothing (PR #234 finding
+					// A) — a re-dispatched bead can carry another worker's old
+					// findings untouched. Require that text to have actually
+					// changed since this agent's current assignment began.
+					hasCompletionEvidence = hasEvidenceFromThisDispatch(bd, issueID, sender, issue)
 				}
 
 				// Completion-evidence gate (hq-8ynas required behavior #1): zero
@@ -839,6 +942,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// (fail closed) rather than assert "Completed" on nothing but
 				// silence — leave the bead open and let witness/mayor see it.
 				if !skipClose && lacksCompletionEvidence(isPolecat, hasCompletionEvidence, explicitCleanupFlag(cmd, doneCleanupStatus), doneSkipVerify, isNoMergeTask) {
+					// PR #234 finding C: a refused gt done must not leave the
+					// polecat looking like it's exiting — the witness could
+					// restart it mid-fix on top of a done-intent label and an
+					// "exiting" heartbeat that no longer describe reality.
+					clearDoneIntentOnHardFail(cwd, townRoot, agentBeadID, issueID)
 					return fmt.Errorf("cannot complete: no commits ahead of %s and no findings recorded on %s\n"+
 						"A zero-commit close needs evidence someone actually checked: record what you found first —\n"+
 						"  bd update %s --notes \"<what you checked and why nothing needed to change>\"\n"+
@@ -875,6 +983,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					// resolve failure ("" ) is itself suspect, so fail closed.
 					curBranch, _ := g.CurrentBranch()
 					if suspectedWorktreeReset(isPolecat, explicitCleanup, isNoMergeTask, curBranch) {
+						// PR #234 finding C — see the completion-evidence refusal above.
+						clearDoneIntentOnHardFail(cwd, townRoot, agentBeadID, issueID)
 						return fmt.Errorf(
 							"cannot complete: HEAD is detached (no branch) with no commits ahead of %s.\n"+
 								"The worktree was almost certainly reset onto the base branch out from under this session.\n"+
@@ -886,13 +996,15 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 					if doneSkipVerify {
 						noteVerifiedPushSkipped(cwd, issueID, defaultBranch, noMRCommitSHA, "--skip-verify on no-MR close")
-						closeReason = fmt.Sprintf("%s\nskip_verify: true%s", closeReason, completionCommitShaLine(noMRCommitSHA, baseSHA, defaultBranch))
+						closeReason = fmt.Sprintf("%s\nskip_verify: true%s", closeReason, completionCommitShaLine(noMRCommitSHA, baseSHA, defaultBranch, false))
 					} else if !isNoMergeTask {
 						if verifyErr := g.VerifyPushedCommit("origin", defaultBranch, noMRCommitSHA); verifyErr != nil {
 							noteVerifiedPushFailure(cwd, issueID, defaultBranch, noMRCommitSHA, verifyErr)
+							// PR #234 finding C — see the completion-evidence refusal above.
+							clearDoneIntentOnHardFail(cwd, townRoot, agentBeadID, issueID)
 							return fmt.Errorf("cannot close no-MR code bead: %w", verifyErr)
 						}
-						closeReason += completionCommitShaLine(noMRCommitSHA, baseSHA, defaultBranch)
+						closeReason += completionCommitShaLine(noMRCommitSHA, baseSHA, defaultBranch, true)
 					}
 					if hasCompletionEvidence {
 						closeReason += "\nworker_notes: recorded on the bead before close (hq-8ynas evidence gate)"
