@@ -172,9 +172,9 @@ func TestHasEvidenceFromThisDispatch(t *testing.T) {
 
 	t.Run("hga-2put shape: notes predate this assignment and are untouched — refuse", func(t *testing.T) {
 		writeHistoryStub(t, []historyFixtureEntry{
-			{assignee: agent, notes: "val's original findings"},   // now
-			{assignee: agent, notes: "val's original findings"},   // hook moment (oldest in run)
-			{assignee: "", notes: "val's original findings"},      // before dispatch — run boundary
+			{assignee: agent, notes: "val's original findings"}, // now
+			{assignee: agent, notes: "val's original findings"}, // hook moment (oldest in run)
+			{assignee: "", notes: "val's original findings"},    // before dispatch — run boundary
 		})
 		bd := beads.New(t.TempDir())
 		current := &beads.Issue{Notes: "val's original findings"}

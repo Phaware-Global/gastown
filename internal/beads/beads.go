@@ -1548,9 +1548,9 @@ func (b *Beads) Show(id string) (*Issue, error) {
 // `bd history <id> --json`. Entries are ordered newest-first.
 type HistoryEntry struct {
 	CommitHash string    `json:"CommitHash"`
-	Committer  string     `json:"Committer"`
-	CommitDate time.Time  `json:"CommitDate"`
-	Issue      Issue      `json:"Issue"`
+	Committer  string    `json:"Committer"`
+	CommitDate time.Time `json:"CommitDate"`
+	Issue      Issue     `json:"Issue"`
 }
 
 // History returns the version history of an issue, newest-first, as recorded
