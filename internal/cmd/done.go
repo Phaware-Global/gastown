@@ -149,6 +149,131 @@ func suspectedWorktreeReset(isPolecat bool, explicitCleanupStatus string, isNoMe
 	return branch == "HEAD" || branch == ""
 }
 
+// requiresCommitsBeforeClose reports whether a zero-commit "no code changes"
+// close must be refused (subject to the branchPushedWithWork fallback at the
+// call site) rather than accepted at face value. Mirrors
+// suspectedWorktreeReset's signature and escape hatches on purpose — same
+// guard family, same exemptions.
+//
+// explicitCleanupStatus must be the value EXPLICITLY passed via
+// --cleanup-status (see explicitCleanupFlag), NOT the auto-detected
+// doneCleanupStatus: a fresh, zero-commit polecat branch is always
+// clean+pushed relative to its upstream, so the auto-detector resolves it
+// to "clean" too and would exempt every zero-commit polecat from this
+// refusal regardless of isPolecat (PR #234, discussion_r4050325617).
+func requiresCommitsBeforeClose(isPolecat bool, explicitCleanupStatus string, isNoMergeTask bool) bool {
+	return isPolecat && explicitCleanupStatus != "clean" && !isNoMergeTask
+}
+
+// explicitCleanupFlag returns doneCleanupStatus only when --cleanup-status was
+// EXPLICITLY passed on this invocation, never the auto-detected value: the
+// latter resolves to "clean" for any clean+pushed tree, which a reset
+// worktree always is, so passing it through would exempt the exact case the
+// worktree-reset guard exists to catch.
+func explicitCleanupFlag(cmd *cobra.Command, doneCleanupStatus string) string {
+	if cmd.Flags().Changed("cleanup-status") {
+		return doneCleanupStatus
+	}
+	return ""
+}
+
+// isPolecatSession reports whether the current process is running as a
+// polecat, using the canonical role resolver (GetRoleWithContext — already
+// used later in this file, see the isPolecat computation ahead of the
+// persistent-polecat IDLE transition) instead of a bare
+// `os.Getenv("GT_POLECAT") != ""` check. That bare check is documented
+// elsewhere in this repo as unreliable (prime_branch_guard.go, sling.go,
+// hook.go, handoff.go all special-case it: coordinators can carry a stale
+// GT_POLECAT from having spawned polecats, and GT_POLECAT is "not guaranteed
+// to be set in every session"). hq-8ynas: heartworks_graphql_api/corpus
+// reached the zero-commit "no code changes" close path on a live, mid-task
+// polecat session — the guards below that should have required
+// commits/refused on a reset worktree silently did not fire, consistent with
+// GT_POLECAT reading empty for a real polecat session while role detection
+// would have caught it.
+//
+// GetRoleWithContext has exactly one return path (`return info, nil`), so it
+// never actually returns an error today. If that ever changes, fail CLOSED
+// on the error (treat the session as a polecat) rather than silently
+// skipping the must-have-commits and worktree-reset guards below.
+//
+// RoleUnknown (an unresolvable cwd/env combination) is treated the same way,
+// not as "not a polecat" (PR #234 finding B, round 1's fix only covered the
+// unreachable error path and left this one exempting the guards it was
+// meant to arm). A session with GT_POLECAT set but GT_ROLE unset and a cwd
+// that doesn't resolve to a known role is exactly the ambiguous case these
+// guards exist for.
+//
+// The same GT_POLECAT fallback also applies whenever GT_ROLE is unset
+// (roleInfo.Source == "cwd"), not only on RoleUnknown (PR #234 round 3,
+// discussion_r4050325633): runDone reconstructs cwd to the polecat's actual
+// worktree when GT_POLECAT/GT_RIG are set (see the cwd fixup ahead of the
+// isPolecat computation below), but if that stat-based reconstruction fails
+// — e.g. the polecat clone path doesn't exist where expected — cwd stays
+// wherever the caller (or Claude Code resetting the shell cwd) left it,
+// which can resolve to a KNOWN non-polecat role such as RoleMayor rather
+// than RoleUnknown. A coordinator session always carries GT_ROLE
+// (config/env.go), so GT_ROLE being unset while GT_POLECAT is set is itself
+// strong evidence this is a polecat whose cwd detection just failed, not a
+// genuine mayor/witness/refinery session.
+func isPolecatSession(cwd, townRoot string) bool {
+	roleInfo, err := GetRoleWithContext(cwd, townRoot)
+	if err != nil {
+		return true
+	}
+	if roleInfo.Role == RolePolecat {
+		return true
+	}
+	if roleInfo.Role == RoleUnknown || roleInfo.Source == "cwd" {
+		return os.Getenv("GT_POLECAT") != ""
+	}
+	return false
+}
+
+// completionCommitShaLine formats the target_branch/commit_sha suffix for a
+// zero-commit "no code changes" close reason — or, when commitSHA is nothing
+// but the base branch's own current tip, omits the misleading commit_sha
+// line entirely (hq-8ynas required behavior #3: "NEVER cite a commit_sha
+// the worker did not produce"). Inside the zero-commit branch, HEAD is by
+// definition not ahead of the base — commitSHA there is only meaningful
+// evidence when the base has since moved past it (the worker's commit really
+// did land upstream); when commitSHA == baseSHA it is simply the ambient
+// state the fresh branch started at, and presenting it as "commit_sha:
+// <value>" makes an unverified guess look corroborated.
+//
+// verified must be true only when the caller already confirmed commitSHA is
+// reachable on origin/targetBranch (g.VerifyPushedCommit succeeded). The
+// "not evidence of a fix" judgment below is scoped to that path on purpose
+// (PR #234 finding D, "wrong in both directions"):
+//
+//  1. On the --skip-verify path, nothing has actually been checked —
+//     skip_verify:true is already recorded on the close reason immediately
+//     before this call as the explicit, honest signal that this is an
+//     operator override, not a verified claim. Asserting "not evidence"
+//     there would be just as much of an unverified guess as asserting
+//     evidence, so unverified callers get the bare commit_sha with no
+//     judgment attached either way.
+//  2. Even on the verified path, commitSHA == baseSHA is not unambiguous:
+//     a worker's commit that was fast-forward-merged into the base (no
+//     divergent history left once that happens) looks IDENTICAL to a
+//     freshly-branched, untouched HEAD sitting at the same tip — this
+//     function cannot tell those apart from local branch state alone. It
+//     intentionally resolves that ambiguity toward "not evidence" because
+//     that is the far more common case in practice (hq-8ynas's repeated
+//     false completions were all the untouched-branch case, never the
+//     fast-forward one) and because understating evidence here just leaves
+//     the bead open for a human to look at, while overstating it is exactly
+//     the false-completion failure mode this whole gate exists to prevent.
+func completionCommitShaLine(commitSHA, baseSHA, targetBranch string, verified bool) string {
+	if commitSHA == "" {
+		return ""
+	}
+	if verified && commitSHA == baseSHA {
+		return fmt.Sprintf("\ntarget_branch: %s\nnote: HEAD matches origin/%s tip — not evidence of a fix", targetBranch, targetBranch)
+	}
+	return fmt.Sprintf("\ntarget_branch: %s\ncommit_sha: %s", targetBranch, commitSHA)
+}
+
 func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	defer func() { telemetry.RecordDone(context.Background(), strings.ToUpper(doneStatus), retErr) }()
 	// Guard: Only polecats should call gt done
@@ -701,18 +826,48 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// IMPORTANT: The error message must NOT mention --cleanup-status=clean.
 		// LLM agents read error messages and self-bypass (the original bug).
 		if aheadCount == 0 {
-			if os.Getenv("GT_POLECAT") != "" && doneCleanupStatus != "clean" && !isNoMergeTask {
+			// isPolecat drives every guard in this branch (the "must have commits"
+			// refusal and the worktree-reset detection). Resolved once via the
+			// canonical role detector rather than a bare GT_POLECAT env check —
+			// see isPolecatSession (hq-8ynas).
+			isPolecat := isPolecatSession(cwd, townRoot)
+			if requiresCommitsBeforeClose(isPolecat, explicitCleanupFlag(cmd, doneCleanupStatus), isNoMergeTask) {
 				// Before failing, check whether commits exist on the remote feature branch.
 				// After a polecat pushes to origin/<feature-branch> and submits an MR,
 				// if master advances (e.g., other MRs land), the feature branch is no
 				// longer ahead of origin/master — but the work WAS committed and pushed.
 				// In that case, treat as "MR already submitted" and fall through. (GH#wd7)
+				//
+				// Require Evidence == "exact_remote_branch" specifically, not just
+				// BranchPushedToRemote's bool (PR #234, discussion_r4050410848): inside
+				// this block branch is never the default branch (line ~762 returns
+				// early), so BranchPreservationStatus's exact-branch check always runs.
+				// When origin/<branch> doesn't exist yet — the genuine zero-commit,
+				// nothing-pushed case — it falls back to comparing HEAD against
+				// origin/<default>, which HEAD always equals right after a fresh
+				// branch-from-main checkout. That comparison_ref evidence would report
+				// "Preserved" for a branch that was never pushed at all, making the
+				// requiresCommitsBeforeClose fix above a no-op.
+				//
+				// exact_remote_branch only proves a ref of this name exists on the
+				// remote and HEAD is an ancestor of it — it does NOT prove the branch
+				// carries any commits, or that any work was preserved. A zero-commit
+				// push (create branch, checkout, push with nothing new on it) or a
+				// branch reset to origin/<default> both satisfy this evidence (PR #234
+				// round 5). It is used here only to rule out the "never pushed at all"
+				// case above; it is not proof of content, only proof the branch name
+				// reached the remote.
 				branchPushedWithWork := false
 				if branch != defaultBranch {
-					pushed, unpushed, pushErr := g.BranchPushedToRemote(branch, "origin")
-					branchPushedWithWork = pushErr == nil && pushed && unpushed == 0
+					status, statusErr := g.BranchPreservationStatus(branch, "origin", nil)
+					branchPushedWithWork = statusErr == nil && status.Preserved && status.Evidence == "exact_remote_branch"
 				}
 				if !branchPushedWithWork {
+					// Refusing here must not leave the session looking like it's
+					// mid-exit: setDoneIntentLabel + the "exiting" heartbeat were
+					// both written earlier in this function, before we knew the
+					// commit check would fail (PR #234 finding C).
+					clearDoneIntentOnHardFail(cwd, townRoot, agentBeadID, issueID)
 					return fmt.Errorf("cannot complete: no commits on branch ahead of %s\n"+
 						"Polecats must have at least 1 commit to submit.\n"+
 						"If the bug was already fixed upstream: gt done --status DEFERRED\n"+
@@ -754,6 +909,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				if !skipClose {
 					closeReason := "Completed with no code changes (already fixed or pushed directly to main)"
 					noMRCommitSHA, _ := g.Rev("HEAD")
+					baseSHA, _ := g.Rev(originDefault)
 
 					// Worktree-reset guard (hga-y3jm false-completion): a real code
 					// polecat completing with a DETACHED HEAD is the signature of the
@@ -773,15 +929,14 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					// 315), which a reset worktree always is, so it would exempt the
 					// very case this guard catches. Only an explicit
 					// --cleanup-status=clean (report-only audits/reviews) exempts.
-					explicitCleanup := ""
-					if cmd.Flags().Changed("cleanup-status") {
-						explicitCleanup = doneCleanupStatus
-					}
+					explicitCleanup := explicitCleanupFlag(cmd, doneCleanupStatus)
 					// Re-read the branch here (not the value captured early in
 					// runDone): rebase/checkout steps above may have changed it, and a
 					// resolve failure ("" ) is itself suspect, so fail closed.
 					curBranch, _ := g.CurrentBranch()
-					if suspectedWorktreeReset(os.Getenv("GT_POLECAT") != "", explicitCleanup, isNoMergeTask, curBranch) {
+					if suspectedWorktreeReset(isPolecat, explicitCleanup, isNoMergeTask, curBranch) {
+						// PR #234 finding C — see the no-commits-ahead refusal above.
+						clearDoneIntentOnHardFail(cwd, townRoot, agentBeadID, issueID)
 						return fmt.Errorf(
 							"cannot complete: HEAD is detached (no branch) with no commits ahead of %s.\n"+
 								"The worktree was almost certainly reset onto the base branch out from under this session.\n"+
@@ -793,17 +948,15 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 					if doneSkipVerify {
 						noteVerifiedPushSkipped(cwd, issueID, defaultBranch, noMRCommitSHA, "--skip-verify on no-MR close")
-						if noMRCommitSHA != "" {
-							closeReason = fmt.Sprintf("%s\nskip_verify: true\ntarget_branch: %s\ncommit_sha: %s", closeReason, defaultBranch, noMRCommitSHA)
-						}
+						closeReason = fmt.Sprintf("%s\nskip_verify: true%s", closeReason, completionCommitShaLine(noMRCommitSHA, baseSHA, defaultBranch, false))
 					} else if !isNoMergeTask {
 						if verifyErr := g.VerifyPushedCommit("origin", defaultBranch, noMRCommitSHA); verifyErr != nil {
 							noteVerifiedPushFailure(cwd, issueID, defaultBranch, noMRCommitSHA, verifyErr)
+							// PR #234 finding C — see the no-commits-ahead refusal above.
+							clearDoneIntentOnHardFail(cwd, townRoot, agentBeadID, issueID)
 							return fmt.Errorf("cannot close no-MR code bead: %w", verifyErr)
 						}
-						if noMRCommitSHA != "" {
-							closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, defaultBranch, noMRCommitSHA)
-						}
+						closeReason += completionCommitShaLine(noMRCommitSHA, baseSHA, defaultBranch, true)
 					}
 					// G15 fix: Force-close bypasses molecule dependency checks.
 					// The polecat is about to be nuked — open wisps should not block closure.
