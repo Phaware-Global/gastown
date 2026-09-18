@@ -847,8 +847,16 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// origin/<default>, which HEAD always equals right after a fresh
 				// branch-from-main checkout. That comparison_ref evidence would report
 				// "Preserved" for a branch that was never pushed at all, making the
-				// requiresCommitsBeforeClose fix above a no-op. Only exact_remote_branch
-				// proves this specific branch name was actually pushed with content.
+				// requiresCommitsBeforeClose fix above a no-op.
+				//
+				// exact_remote_branch only proves a ref of this name exists on the
+				// remote and HEAD is an ancestor of it — it does NOT prove the branch
+				// carries any commits, or that any work was preserved. A zero-commit
+				// push (create branch, checkout, push with nothing new on it) or a
+				// branch reset to origin/<default> both satisfy this evidence (PR #234
+				// round 5). It is used here only to rule out the "never pushed at all"
+				// case above; it is not proof of content, only proof the branch name
+				// reached the remote.
 				branchPushedWithWork := false
 				if branch != defaultBranch {
 					status, statusErr := g.BranchPreservationStatus(branch, "origin", nil)
