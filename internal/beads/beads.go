@@ -195,6 +195,8 @@ type Issue struct {
 
 	// Content fields (parsed from bd show --json)
 	AcceptanceCriteria string `json:"acceptance_criteria,omitempty"`
+	Design             string `json:"design,omitempty"`
+	Notes              string `json:"notes,omitempty"`
 
 	// Agent bead slots (type=agent only)
 	HookBead   string `json:"hook_bead,omitempty"`   // Current work attached to agent's hook

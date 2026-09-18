@@ -149,6 +149,81 @@ func suspectedWorktreeReset(isPolecat bool, explicitCleanupStatus string, isNoMe
 	return branch == "HEAD" || branch == ""
 }
 
+// explicitCleanupFlag returns doneCleanupStatus only when --cleanup-status was
+// EXPLICITLY passed on this invocation, never the auto-detected value: the
+// latter resolves to "clean" for any clean+pushed tree, which a reset
+// worktree always is, so passing it through would exempt the exact case the
+// worktree-reset and completion-evidence guards exist to catch.
+func explicitCleanupFlag(cmd *cobra.Command, doneCleanupStatus string) string {
+	if cmd.Flags().Changed("cleanup-status") {
+		return doneCleanupStatus
+	}
+	return ""
+}
+
+// isPolecatSession reports whether the current process is running as a
+// polecat, using the same env-var-first-then-role-detection order as
+// GetRoleWithContext (the canonical resolver, already used later in this
+// file — see the isPolecat computation ahead of the persistent-polecat
+// IDLE transition). A bare `os.Getenv("GT_POLECAT") != ""` check — what the
+// zero-commit guards used before this — is documented elsewhere in this repo
+// as unreliable (prime_branch_guard.go, sling.go, hook.go, handoff.go all
+// special-case it: coordinators can carry a stale GT_POLECAT from having
+// spawned polecats, and GT_POLECAT is "not guaranteed to be set in every
+// session"). hq-8ynas: heartworks_graphql_api/corpus reached the zero-commit
+// "no code changes" close path on a live, mid-task polecat session — the
+// guards below that should have required commits/refused on a reset worktree
+// silently did not fire, consistent with GT_POLECAT reading empty for a real
+// polecat session while role detection would have caught it.
+func isPolecatSession(cwd, townRoot string) bool {
+	if roleInfo, err := GetRoleWithContext(cwd, townRoot); err == nil {
+		return roleInfo.Role == RolePolecat
+	}
+	return os.Getenv("GT_POLECAT") != ""
+}
+
+// lacksCompletionEvidence reports whether a zero-commit "no code changes"
+// close (hq-8ynas) would be asserting something nobody actually checked.
+// Zero commits ahead of the base branch is not, by itself, proof of
+// anything — it is equally what a polecat's very first few seconds of a
+// fresh dispatch look like, before it has read a single file. Closing here
+// without positive evidence (findings the worker recorded on the bead) is a
+// guess dressed up as a completion; several such guesses landed inside one
+// day against heartworks_graphql_api's hga-2put alone.
+//
+// The explicit escape hatches mirror suspectedWorktreeReset's: an operator
+// (or the polecat, deliberately) can still assert "clean" via
+// --cleanup-status=clean, --skip-verify, or a no_merge/review_only task —
+// each is an explicit signal, not silence. Absent one of those AND absent
+// recorded notes/design, this fails CLOSED: refuse the close rather than
+// print a tidy but unverified reason (hq-8ynas REQUIRED BEHAVIOUR #1).
+func lacksCompletionEvidence(isPolecat bool, hasEvidence bool, explicitCleanupStatus string, doneSkipVerify bool, isNoMergeTask bool) bool {
+	if !isPolecat || explicitCleanupStatus == "clean" || doneSkipVerify || isNoMergeTask {
+		return false
+	}
+	return !hasEvidence
+}
+
+// completionCommitShaLine formats the target_branch/commit_sha suffix for a
+// zero-commit "no code changes" close reason — or, when commitSHA is nothing
+// but the base branch's own current tip, omits the misleading commit_sha
+// line entirely (hq-8ynas REQUIRED BEHAVIOUR #3: "NEVER cite a commit_sha
+// the worker did not produce"). Inside the zero-commit branch, HEAD is by
+// definition not ahead of the base — commitSHA there is only meaningful
+// evidence when the base has since moved past it (the worker's commit really
+// did land upstream); when commitSHA == baseSHA it is simply the ambient
+// state the fresh branch started at, and presenting it as "commit_sha:
+// <value>" makes an unverified guess look corroborated.
+func completionCommitShaLine(commitSHA, baseSHA, targetBranch string) string {
+	if commitSHA == "" {
+		return ""
+	}
+	if commitSHA == baseSHA {
+		return fmt.Sprintf("\ntarget_branch: %s\nnote: HEAD matches origin/%s tip — not evidence of a fix", targetBranch, targetBranch)
+	}
+	return fmt.Sprintf("\ntarget_branch: %s\ncommit_sha: %s", targetBranch, commitSHA)
+}
+
 func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	defer func() { telemetry.RecordDone(context.Background(), strings.ToUpper(doneStatus), retErr) }()
 	// Guard: Only polecats should call gt done
@@ -701,7 +776,12 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// IMPORTANT: The error message must NOT mention --cleanup-status=clean.
 		// LLM agents read error messages and self-bypass (the original bug).
 		if aheadCount == 0 {
-			if os.Getenv("GT_POLECAT") != "" && doneCleanupStatus != "clean" && !isNoMergeTask {
+			// isPolecat drives every guard in this branch (the "must have commits"
+			// refusal, the worktree-reset detection, and the completion-evidence
+			// gate below). Resolved once via the canonical role detector rather
+			// than a bare GT_POLECAT env check — see isPolecatSession (hq-8ynas).
+			isPolecat := isPolecatSession(cwd, townRoot)
+			if isPolecat && doneCleanupStatus != "clean" && !isNoMergeTask {
 				// Before failing, check whether commits exist on the remote feature branch.
 				// After a polecat pushes to origin/<feature-branch> and submits an MR,
 				// if master advances (e.g., other MRs land), the feature branch is no
@@ -741,6 +821,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// If criteria exist and are unchecked, warn and skip close — the bead stays
 				// open for witness/mayor to handle.
 				skipClose := false
+				hasCompletionEvidence := false
 				if issue, err := bd.Show(issueID); err == nil {
 					if unchecked := beads.HasUncheckedCriteria(issue); unchecked > 0 {
 						skipReason := fmt.Sprintf("issue %s has %d unchecked acceptance criteria — skipping close", issueID, unchecked)
@@ -749,11 +830,26 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
 						skipClose = true
 					}
+					hasCompletionEvidence = strings.TrimSpace(issue.Notes) != "" || strings.TrimSpace(issue.Design) != ""
+				}
+
+				// Completion-evidence gate (hq-8ynas REQUIRED BEHAVIOUR #1): zero
+				// commits ahead of the base is what a fresh dispatch looks like
+				// before any investigation happens, not proof one happened. Refuse
+				// (fail closed) rather than assert "Completed" on nothing but
+				// silence — leave the bead open and let witness/mayor see it.
+				if !skipClose && lacksCompletionEvidence(isPolecat, hasCompletionEvidence, explicitCleanupFlag(cmd, doneCleanupStatus), doneSkipVerify, isNoMergeTask) {
+					return fmt.Errorf("cannot complete: no commits ahead of %s and no findings recorded on %s\n"+
+						"A zero-commit close needs evidence someone actually checked: record what you found first —\n"+
+						"  bd update %s --notes \"<what you checked and why nothing needed to change>\"\n"+
+						"then retry gt done. If you're blocked: gt done --status ESCALATED",
+						originDefault, issueID, issueID)
 				}
 
 				if !skipClose {
 					closeReason := "Completed with no code changes (already fixed or pushed directly to main)"
 					noMRCommitSHA, _ := g.Rev("HEAD")
+					baseSHA, _ := g.Rev(originDefault)
 
 					// Worktree-reset guard (hga-y3jm false-completion): a real code
 					// polecat completing with a DETACHED HEAD is the signature of the
@@ -773,15 +869,12 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					// 315), which a reset worktree always is, so it would exempt the
 					// very case this guard catches. Only an explicit
 					// --cleanup-status=clean (report-only audits/reviews) exempts.
-					explicitCleanup := ""
-					if cmd.Flags().Changed("cleanup-status") {
-						explicitCleanup = doneCleanupStatus
-					}
+					explicitCleanup := explicitCleanupFlag(cmd, doneCleanupStatus)
 					// Re-read the branch here (not the value captured early in
 					// runDone): rebase/checkout steps above may have changed it, and a
 					// resolve failure ("" ) is itself suspect, so fail closed.
 					curBranch, _ := g.CurrentBranch()
-					if suspectedWorktreeReset(os.Getenv("GT_POLECAT") != "", explicitCleanup, isNoMergeTask, curBranch) {
+					if suspectedWorktreeReset(isPolecat, explicitCleanup, isNoMergeTask, curBranch) {
 						return fmt.Errorf(
 							"cannot complete: HEAD is detached (no branch) with no commits ahead of %s.\n"+
 								"The worktree was almost certainly reset onto the base branch out from under this session.\n"+
@@ -793,17 +886,16 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 					if doneSkipVerify {
 						noteVerifiedPushSkipped(cwd, issueID, defaultBranch, noMRCommitSHA, "--skip-verify on no-MR close")
-						if noMRCommitSHA != "" {
-							closeReason = fmt.Sprintf("%s\nskip_verify: true\ntarget_branch: %s\ncommit_sha: %s", closeReason, defaultBranch, noMRCommitSHA)
-						}
+						closeReason = fmt.Sprintf("%s\nskip_verify: true%s", closeReason, completionCommitShaLine(noMRCommitSHA, baseSHA, defaultBranch))
 					} else if !isNoMergeTask {
 						if verifyErr := g.VerifyPushedCommit("origin", defaultBranch, noMRCommitSHA); verifyErr != nil {
 							noteVerifiedPushFailure(cwd, issueID, defaultBranch, noMRCommitSHA, verifyErr)
 							return fmt.Errorf("cannot close no-MR code bead: %w", verifyErr)
 						}
-						if noMRCommitSHA != "" {
-							closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, defaultBranch, noMRCommitSHA)
-						}
+						closeReason += completionCommitShaLine(noMRCommitSHA, baseSHA, defaultBranch)
+					}
+					if hasCompletionEvidence {
+						closeReason += "\nworker_notes: recorded on the bead before close (hq-8ynas evidence gate)"
 					}
 					// G15 fix: Force-close bypasses molecule dependency checks.
 					// The polecat is about to be nuked — open wisps should not block closure.

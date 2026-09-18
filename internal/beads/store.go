@@ -105,6 +105,8 @@ func sdkIssueToIssue(si *beadsdk.Issue) *Issue {
 		Labels:             si.Labels,
 		Ephemeral:          si.Ephemeral,
 		AcceptanceCriteria: si.AcceptanceCriteria,
+		Design:             si.Design,
+		Notes:              si.Notes,
 		Metadata:           si.Metadata,
 	}
 
