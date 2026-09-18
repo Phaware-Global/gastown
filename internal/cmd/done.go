@@ -149,6 +149,22 @@ func suspectedWorktreeReset(isPolecat bool, explicitCleanupStatus string, isNoMe
 	return branch == "HEAD" || branch == ""
 }
 
+// requiresCommitsBeforeClose reports whether a zero-commit "no code changes"
+// close must be refused (subject to the branchPushedWithWork fallback at the
+// call site) rather than accepted at face value. Mirrors
+// suspectedWorktreeReset's signature and escape hatches on purpose — same
+// guard family, same exemptions.
+//
+// explicitCleanupStatus must be the value EXPLICITLY passed via
+// --cleanup-status (see explicitCleanupFlag), NOT the auto-detected
+// doneCleanupStatus: a fresh, zero-commit polecat branch is always
+// clean+pushed relative to its upstream, so the auto-detector resolves it
+// to "clean" too and would exempt every zero-commit polecat from this
+// refusal regardless of isPolecat (PR #234, discussion_r4050325617).
+func requiresCommitsBeforeClose(isPolecat bool, explicitCleanupStatus string, isNoMergeTask bool) bool {
+	return isPolecat && explicitCleanupStatus != "clean" && !isNoMergeTask
+}
+
 // explicitCleanupFlag returns doneCleanupStatus only when --cleanup-status was
 // EXPLICITLY passed on this invocation, never the auto-detected value: the
 // latter resolves to "clean" for any clean+pushed tree, which a reset
@@ -187,15 +203,31 @@ func explicitCleanupFlag(cmd *cobra.Command, doneCleanupStatus string) string {
 // meant to arm). A session with GT_POLECAT set but GT_ROLE unset and a cwd
 // that doesn't resolve to a known role is exactly the ambiguous case these
 // guards exist for.
+//
+// The same GT_POLECAT fallback also applies whenever GT_ROLE is unset
+// (roleInfo.Source == "cwd"), not only on RoleUnknown (PR #234 round 3,
+// discussion_r4050325633): runDone reconstructs cwd to the polecat's actual
+// worktree when GT_POLECAT/GT_RIG are set (see the cwd fixup ahead of the
+// isPolecat computation below), but if that stat-based reconstruction fails
+// — e.g. the polecat clone path doesn't exist where expected — cwd stays
+// wherever the caller (or Claude Code resetting the shell cwd) left it,
+// which can resolve to a KNOWN non-polecat role such as RoleMayor rather
+// than RoleUnknown. A coordinator session always carries GT_ROLE
+// (config/env.go), so GT_ROLE being unset while GT_POLECAT is set is itself
+// strong evidence this is a polecat whose cwd detection just failed, not a
+// genuine mayor/witness/refinery session.
 func isPolecatSession(cwd, townRoot string) bool {
 	roleInfo, err := GetRoleWithContext(cwd, townRoot)
 	if err != nil {
 		return true
 	}
-	if roleInfo.Role == RoleUnknown {
+	if roleInfo.Role == RolePolecat {
+		return true
+	}
+	if roleInfo.Role == RoleUnknown || roleInfo.Source == "cwd" {
 		return os.Getenv("GT_POLECAT") != ""
 	}
-	return roleInfo.Role == RolePolecat
+	return false
 }
 
 // completionCommitShaLine formats the target_branch/commit_sha suffix for a
@@ -799,7 +831,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// canonical role detector rather than a bare GT_POLECAT env check —
 			// see isPolecatSession (hq-8ynas).
 			isPolecat := isPolecatSession(cwd, townRoot)
-			if isPolecat && doneCleanupStatus != "clean" && !isNoMergeTask {
+			if requiresCommitsBeforeClose(isPolecat, explicitCleanupFlag(cmd, doneCleanupStatus), isNoMergeTask) {
 				// Before failing, check whether commits exist on the remote feature branch.
 				// After a polecat pushes to origin/<feature-branch> and submits an MR,
 				// if master advances (e.g., other MRs land), the feature branch is no
