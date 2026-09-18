@@ -196,7 +196,7 @@ func isPolecatSession(cwd, townRoot string) bool {
 // --cleanup-status=clean, --skip-verify, or a no_merge/review_only task —
 // each is an explicit signal, not silence. Absent one of those AND absent
 // recorded notes/design, this fails CLOSED: refuse the close rather than
-// print a tidy but unverified reason (hq-8ynas REQUIRED BEHAVIOUR #1).
+// print a tidy but unverified reason (hq-8ynas required behavior #1).
 func lacksCompletionEvidence(isPolecat bool, hasEvidence bool, explicitCleanupStatus string, doneSkipVerify bool, isNoMergeTask bool) bool {
 	if !isPolecat || explicitCleanupStatus == "clean" || doneSkipVerify || isNoMergeTask {
 		return false
@@ -207,7 +207,7 @@ func lacksCompletionEvidence(isPolecat bool, hasEvidence bool, explicitCleanupSt
 // completionCommitShaLine formats the target_branch/commit_sha suffix for a
 // zero-commit "no code changes" close reason — or, when commitSHA is nothing
 // but the base branch's own current tip, omits the misleading commit_sha
-// line entirely (hq-8ynas REQUIRED BEHAVIOUR #3: "NEVER cite a commit_sha
+// line entirely (hq-8ynas required behavior #3: "NEVER cite a commit_sha
 // the worker did not produce"). Inside the zero-commit branch, HEAD is by
 // definition not ahead of the base — commitSHA there is only meaningful
 // evidence when the base has since moved past it (the worker's commit really
@@ -833,7 +833,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					hasCompletionEvidence = strings.TrimSpace(issue.Notes) != "" || strings.TrimSpace(issue.Design) != ""
 				}
 
-				// Completion-evidence gate (hq-8ynas REQUIRED BEHAVIOUR #1): zero
+				// Completion-evidence gate (hq-8ynas required behavior #1): zero
 				// commits ahead of the base is what a fresh dispatch looks like
 				// before any investigation happens, not proof one happened. Refuse
 				// (fail closed) rather than assert "Completed" on nothing but

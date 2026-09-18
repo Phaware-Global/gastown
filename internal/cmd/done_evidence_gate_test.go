@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// TestLacksCompletionEvidence covers hq-8ynas REQUIRED BEHAVIOUR #1: a
+// TestLacksCompletionEvidence covers hq-8ynas required behavior #1: a
 // zero-commit "no code changes" close must not happen on silence alone.
 func TestLacksCompletionEvidence(t *testing.T) {
 	tests := []struct {
@@ -61,7 +61,7 @@ func TestLacksCompletionEvidence(t *testing.T) {
 	}
 }
 
-// TestCompletionCommitShaLine covers hq-8ynas REQUIRED BEHAVIOUR #3: never
+// TestCompletionCommitShaLine covers hq-8ynas required behavior #3: never
 // cite a commit_sha the worker did not produce — specifically, never present
 // the base branch's own tip as if it were evidence of a fix.
 func TestCompletionCommitShaLine(t *testing.T) {
