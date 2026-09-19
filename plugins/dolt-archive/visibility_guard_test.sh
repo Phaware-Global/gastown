@@ -110,6 +110,16 @@ assert_parse "git+https://github.com/only-owner" ""
 # "/./" segment before owner/repo.
 assert_parse "git+ssh://git@github.com/./priv-owner/repo" "priv-owner/repo"
 
+# --- Round 3 fixes (gt-o01f): userinfo/authority-termination differential -
+#
+# A userinfo segment containing '#', '?', or '/' terminates the authority
+# early per the URL spec, so git/browsers resolve the host as "evil" while
+# this regex must NOT be fooled into reading "github.com" as the host and
+# "priv/repo" as the owner/repo. All three must be refused (empty parse).
+assert_parse "https://evil#@github.com/priv/repo" ""
+assert_parse "https://evil?@github.com/priv/repo" ""
+assert_parse "https://evil/@github.com/priv/repo" ""
+
 # --- Required scenarios from gt-v3df ------------------------------------
 
 # 1. A remote pointing at a public repo -> refused.

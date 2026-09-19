@@ -19,11 +19,18 @@ GH_VISIBILITY_TIMEOUT="${GH_VISIBILITY_TIMEOUT:-15}"
 # DoltHub remotes (doltremoteapi.dolthub.com) and any other host fall through
 # to the final `return 1` — deliberately: this function only vouches for
 # GitHub remotes, and the caller must refuse anything it doesn't vouch for.
+#
+# The userinfo class excludes '/', '@', '#', '?', and whitespace: each of
+# those terminates the authority section per the URL spec, so a userinfo
+# containing one (e.g. "evil#@github.com/priv/repo") would let a real parser
+# resolve a different host than this regex does. Anything that could produce
+# that host differential must fail to parse here, not silently resolve to
+# github.com.
 github_owner_repo() {
   local url="$1"
   url="${url#git+}"
 
-  if [[ "$url" =~ ^(https?|ssh)://([^/@[:space:]]+@)?github\.com[:/](\./)?([^/[:space:]]+/[^/[:space:]]+)$ ]]; then
+  if [[ "$url" =~ ^(https?|ssh)://([^/@#?[:space:]]+@)?github\.com[:/](\./)?([^/[:space:]]+/[^/[:space:]]+)$ ]]; then
     url="${BASH_REMATCH[4]}"
   elif [[ "$url" =~ ^git@github\.com:([^/[:space:]]+/[^/[:space:]]+)$ ]]; then
     url="${BASH_REMATCH[1]}"
