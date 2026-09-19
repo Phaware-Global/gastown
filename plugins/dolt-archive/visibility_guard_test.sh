@@ -21,7 +21,18 @@ cat > "$FAKE_BIN/gh" <<'FAKE_GH'
 # Visibility is driven by the owner segment of the repo path so each test
 # case can pick a scenario just by choosing a remote URL.
 if [[ "$1" == "api" ]]; then
-  repo="${2#repos/}"
+  hostname=""
+  repo=""
+  prev=""
+  for a in "$@"; do
+    if [[ "$prev" == "--hostname" ]]; then
+      hostname="$a"
+    fi
+    if [[ "$a" == repos/* ]]; then
+      repo="${a#repos/}"
+    fi
+    prev="$a"
+  done
   owner="${repo%%/*}"
   case "$owner" in
     pub-owner)    echo "public" ;;
@@ -29,6 +40,16 @@ if [[ "$1" == "api" ]]; then
     internal-owner) echo "internal" ;;
     lookup-fails-owner) exit 1 ;;
     empty-owner) echo "" ;;
+    mismatch-owner)
+      # Simulates a GHES/other default host that answers "private" for this
+      # repo while the real github.com answer is "public". Only a lookup
+      # explicitly pinned to --hostname github.com should see the real answer.
+      if [[ "$hostname" == "github.com" ]]; then
+        echo "public"
+      else
+        echo "private"
+      fi
+      ;;
     *) echo "public" ;;
   esac
   exit 0
@@ -85,6 +106,10 @@ assert_parse "https://doltremoteapi.dolthub.com/priv-owner/repo" ""
 assert_parse "not-a-url" ""
 assert_parse "git+https://github.com/only-owner" ""
 
+# Dolt rewrites an scp-style remote into this exact git+ssh form, inserting a
+# "/./" segment before owner/repo.
+assert_parse "git+ssh://git@github.com/./priv-owner/repo" "priv-owner/repo"
+
 # --- Required scenarios from gt-v3df ------------------------------------
 
 # 1. A remote pointing at a public repo -> refused.
@@ -113,6 +138,19 @@ assert_guard "git+https://github.com/empty-owner/repo" 1 "visibility-lookup-fail
 
 # gh missing entirely -> refused, never silently allowed.
 assert_guard "git+https://github.com/priv-owner/repo" 1 "gh-unavailable" "$EMPTY_BIN"
+
+# --- Round 2 fixes (gt-lc57) ---------------------------------------------
+
+# Dolt's own rewritten SSH form (with the /./ segment) on a private repo ->
+# push allowed. Previously this URL failed to parse at all and was refused
+# as "non-github-remote", breaking every SSH GitHub remote.
+assert_guard "git+ssh://git@github.com/./priv-owner/repo" 0 "private"
+
+# The lookup must be pinned to github.com: a repo that a differently
+# configured default host (e.g. GHES) would call "private" but that is
+# actually "public" on github.com must be refused, not allowed on the
+# strength of the wrong host's answer.
+assert_guard "git+https://github.com/mismatch-owner/repo" 1 "public"
 
 echo ""
 echo "visibility_guard_test.sh: $PASS passed, $FAIL failed"

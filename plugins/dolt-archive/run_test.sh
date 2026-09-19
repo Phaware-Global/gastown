@@ -56,7 +56,12 @@ chmod +x "$FAKE_BIN/dolt"
 cat > "$FAKE_BIN/gh" <<'FAKE_GH'
 #!/usr/bin/env bash
 if [[ "$1" == "api" ]]; then
-  repo="${2#repos/}"
+  repo=""
+  for a in "$@"; do
+    if [[ "$a" == repos/* ]]; then
+      repo="${a#repos/}"
+    fi
+  done
   owner="${repo%%/*}"
   case "$owner" in
     pub-owner)  echo "public" ;;

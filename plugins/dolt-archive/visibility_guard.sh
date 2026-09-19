@@ -12,18 +12,19 @@ GH_VISIBILITY_TIMEOUT="${GH_VISIBILITY_TIMEOUT:-15}"
 
 # Extract "owner/repo" from a github.com remote URL on stdout; fails (exit 1,
 # nothing printed) for anything else. Handles the URL forms Dolt's git-backed
-# remotes use (git+https://, git+ssh://), plain https/ssh git URLs, the
-# git@github.com: scp-style form, and an embedded userinfo/token
-# (https://x-access-token:TOKEN@github.com/...). DoltHub remotes
-# (doltremoteapi.dolthub.com) and any other host fall through to the final
-# `return 1` — deliberately: this function only vouches for GitHub remotes,
-# and the caller must refuse anything it doesn't vouch for.
+# remotes use (git+https://, git+ssh://, including the /./ segment Dolt
+# inserts when it rewrites an scp-style remote to git+ssh://git@github.com/./owner/repo),
+# plain https/ssh git URLs, the git@github.com: scp-style form, and an
+# embedded userinfo/token (https://x-access-token:TOKEN@github.com/...).
+# DoltHub remotes (doltremoteapi.dolthub.com) and any other host fall through
+# to the final `return 1` — deliberately: this function only vouches for
+# GitHub remotes, and the caller must refuse anything it doesn't vouch for.
 github_owner_repo() {
   local url="$1"
   url="${url#git+}"
 
-  if [[ "$url" =~ ^(https?|ssh)://([^/@[:space:]]+@)?github\.com[:/]([^/[:space:]]+/[^/[:space:]]+)$ ]]; then
-    url="${BASH_REMATCH[3]}"
+  if [[ "$url" =~ ^(https?|ssh)://([^/@[:space:]]+@)?github\.com[:/](\./)?([^/[:space:]]+/[^/[:space:]]+)$ ]]; then
+    url="${BASH_REMATCH[4]}"
   elif [[ "$url" =~ ^git@github\.com:([^/[:space:]]+/[^/[:space:]]+)$ ]]; then
     url="${BASH_REMATCH[1]}"
   else
@@ -57,7 +58,7 @@ remote_push_allowed() {
     return 1
   fi
 
-  if ! visibility="$(timeout "$GH_VISIBILITY_TIMEOUT" gh api "repos/$owner_repo" --jq '.visibility' 2>/dev/null)"; then
+  if ! visibility="$(timeout "$GH_VISIBILITY_TIMEOUT" gh api --hostname github.com "repos/$owner_repo" --jq '.visibility' 2>/dev/null)"; then
     echo "visibility-lookup-failed"
     return 1
   fi
