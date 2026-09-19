@@ -13,16 +13,18 @@ set -euo pipefail
 log() { echo "[git-hygiene] $*"; }
 
 # --- SAFETY GUARD (Mayor, 2026-09-05) ----------------------------------------
-# This plugin force-deletes orphan branches (branch -D), clears ALL stashes, and
-# runs gc --prune=now. It has been a silent NO-OP town-wide because it reads
-# 'repo_path' from `gt rig list --json`, a field that no longer exists (current
-# keys: name, beads_prefix, status, witness, refinery, polecats, crew).
+# This plugin force-deletes orphan branches (branch -D), deletes merged remote
+# branches on GitHub, clears ALL stashes, and runs gc --prune=now. It has been
+# a silent NO-OP town-wide because it reads 'repo_path' from
+# `gt rig list --json`, a field that no longer exists (current keys: name,
+# beads_prefix, status, witness, refinery, polecats, crew).
 #
 # That means the destructive paths below have not run for an unknown period, so
 # the FIRST successful run would delete an accumulated backlog in one pass.
 # Measured at patch time: 262 polecat/dog/fix refs in gastown alone, across 7
 # rigs. Orphan polecat branches have repeatedly turned out to hold recoverable
-# work, and `stash clear` is unrecoverable.
+# work, `stash clear` is unrecoverable, and a remote branch DELETE destroys
+# something every other machine can see.
 #
 # So: destructive mode now requires --destroy explicitly. Without it the script
 # reports what it WOULD remove and changes nothing.
@@ -35,7 +37,7 @@ done
 if [ "$HYGIENE_AUTHORIZED" != "true" ]; then
   DRY_RUN=true
   log "--destroy not supplied; running in REPORT-ONLY mode (no deletions)."
-  log "  Destructive cleanup (branch -D, stash clear, gc --prune) requires --destroy."
+  log "  Destructive cleanup (branch -D, remote branch DELETE, stash clear, gc --prune) requires --destroy."
 else
   DRY_RUN=false
   log "--destroy supplied; destructive cleanup ENABLED."
@@ -171,7 +173,12 @@ while IFS= read -r REPO_PATH; do
       fi
       if git -C "$REPO_PATH" merge-base --is-ancestor "origin/$RBRANCH" "origin/$DEFAULT_BRANCH" 2>/dev/null; then
         log "    Deleting remote: origin/$RBRANCH"
-        gh api "repos/$GH_REPO/git/refs/heads/$RBRANCH" -X DELETE 2>/dev/null && REMOTE_DELETED=$((REMOTE_DELETED + 1))
+        if [ "$DRY_RUN" = "true" ]; then
+          log "  WOULD delete remote: origin/$RBRANCH"
+          REMOTE_DELETED=$((REMOTE_DELETED + 1))
+        else
+          gh api "repos/$GH_REPO/git/refs/heads/$RBRANCH" -X DELETE 2>/dev/null && REMOTE_DELETED=$((REMOTE_DELETED + 1))
+        fi
       fi
     done <<< "$REMOTE_BRANCHES"
   fi
