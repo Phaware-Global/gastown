@@ -154,6 +154,7 @@ log "JSONL export: $EXPORTED succeeded, $EXPORT_FAILED failed"
 
 GIT_PUSHED=false
 GIT_FAILED=false
+GIT_REPO_MISSING=false
 
 if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   log ""
@@ -218,12 +219,14 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   fi
 elif ! $SKIP_GIT; then
   log "No git backup repo at $BACKUP_REPO — skipping git push"
+  GIT_REPO_MISSING=true
 fi
 
 # --- Step 3: Dolt native push ------------------------------------------------
 
 DOLT_PUSHED=0
 DOLT_PUSH_FAILED=0
+DBS_WITH_REMOTE=0
 
 if ! $SKIP_DOLT_PUSH; then
   log ""
@@ -243,6 +246,7 @@ if ! $SKIP_DOLT_PUSH; then
       continue
     fi
 
+    DBS_WITH_REMOTE=$((DBS_WITH_REMOTE + 1))
     log "  $DB: pushing to remotes..."
     cd "$DB_DIR"
 
@@ -266,12 +270,23 @@ fi
 log ""
 log "=== Archive Cycle Complete ==="
 
+# A remote-configured count below the exported count means some databases
+# were never even attempted by dolt push — they can't show up in
+# DOLT_PUSH_FAILED because they were never tried. Only meaningful when dolt
+# push actually ran this cycle.
+REMOTE_SHORTFALL=false
+if ! $SKIP_DOLT_PUSH && [[ "$DBS_WITH_REMOTE" -lt "$EXPORTED" ]]; then
+  REMOTE_SHORTFALL=true
+fi
+
 RESULT="success"
-if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]] || $GIT_FAILED; then
+if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]] || $GIT_FAILED || $GIT_REPO_MISSING || $REMOTE_SHORTFALL; then
   RESULT="warning"
 fi
 
-SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED)), result=$RESULT"
+# Report against the total tried, not a ratio that conceals databases that
+# were never in the denominator (e.g. "0/2 succeeded" out of 13 exported).
+SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED)) of $DBS_WITH_REMOTE/$EXPORTED with a remote, result=$RESULT"
 log "$SUMMARY"
 
 _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
@@ -283,6 +298,33 @@ if [[ "$EXPORT_FAILED" -gt 0 ]]; then
   if ! ESCALATE_ERR=$(gt escalate "dolt-archive: JSONL export failed for $EXPORT_FAILED databases ($EXPORT_ERRORS)" \
     -s critical \
     --reason "JSONL is our last-resort recovery layer. Failed databases: $EXPORT_ERRORS" 2>&1); then
+    log "WARN: gt escalate failed:"
+    logblock "$ESCALATE_ERR"
+  fi
+fi
+
+if [[ "$DOLT_PUSH_FAILED" -gt 0 ]]; then
+  if ! ESCALATE_ERR=$(gt escalate "dolt-archive: dolt push failed for $DOLT_PUSH_FAILED remote(s)" \
+    -s critical \
+    --reason "Native Dolt replication did not reach $DOLT_PUSH_FAILED remote(s) this cycle. The data did not leave this machine via that path." 2>&1); then
+    log "WARN: gt escalate failed:"
+    logblock "$ESCALATE_ERR"
+  fi
+fi
+
+if $GIT_REPO_MISSING; then
+  if ! ESCALATE_ERR=$(gt escalate "dolt-archive: no git backup repo at $BACKUP_REPO" \
+    -s critical \
+    --reason "The git-backup path is entirely a no-op with no repo at $BACKUP_REPO — JSONL snapshots are not leaving this machine via git." 2>&1); then
+    log "WARN: gt escalate failed:"
+    logblock "$ESCALATE_ERR"
+  fi
+fi
+
+if $REMOTE_SHORTFALL; then
+  if ! ESCALATE_ERR=$(gt escalate "dolt-archive: only $DBS_WITH_REMOTE of $EXPORTED exported databases have a dolt remote configured" \
+    -s critical \
+    --reason "$((EXPORTED - DBS_WITH_REMOTE)) exported database(s) have no dolt remote at all, so dolt push never attempts them. The dolt_push ratio only reports on the $DBS_WITH_REMOTE that were tried." 2>&1); then
     log "WARN: gt escalate failed:"
     logblock "$ESCALATE_ERR"
   fi
