@@ -11,6 +11,8 @@
 #   5. persistent condition, 2 cycles -> must escalate exactly once (fingerprint dedup)
 #   6. exported db with no remote, unexported db with a remote -> shortfall still caught
 #   7. git push failure (repo present) -> must escalate critical
+#   8. successful git push (repo present, real diff)  -> summary reads git=pushed
+#   9. nothing to push (repo present, no diff, nothing ahead) -> summary reads git=nothing-to-push
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -153,8 +155,13 @@ MOCK
 # only `dolt`/`bd`/`gt` are mocked — so overwriting testdb.jsonl with
 # different mocked export content produces a genuine diff to commit, and
 # breaking the remote afterward produces a genuine push failure.
+# $2 (optional) is the content seeded into testdb.jsonl, default "{"id":"old"}"
+# (differs from the dolt mock's exported "{"id":"1"}", so a scenario gets a
+# real diff to commit unless it passes a matching seed to test the opposite —
+# a repo already at parity with what this cycle would export.
 write_git_backup_repo() {
   local sandbox="$1"
+  local seed_content="${2:-{\"id\":\"old\"}}"
   local repo="$sandbox/home/gt/.dolt-archive/git"
   local bare="$sandbox/bare-origin.git"
   git init --quiet --bare "$bare"
@@ -164,7 +171,7 @@ write_git_backup_repo() {
     git config user.email "test@example.invalid"
     git config user.name "Test"
     git remote add origin "$bare"
-    printf '{"id":"old"}\n' > testdb.jsonl
+    printf '%s\n' "$seed_content" > testdb.jsonl
     git add testdb.jsonl
     git commit --quiet -m "seed"
     git push --quiet -u origin main
@@ -193,6 +200,38 @@ assert_escalated() {
   fi
   if ! grep -- "$needle" "$sandbox/escalate.log" | grep -q -- "-s critical"; then
     echo "FAIL: $desc — escalation for '$needle' did not use '-s critical'"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+# Asserts run.sh's own stdout/stderr (the actual "Archive: ..." summary line,
+# among other log output) contains an exact substring — not just that some
+# internal counter came out right, but that the text a human or the mayor
+# actually reads says the right thing.
+assert_output_contains() {
+  local sandbox="$1" needle="$2" desc="$3"
+  if ! grep -qF -- "$needle" "$sandbox/output.log" 2>/dev/null; then
+    echo "FAIL: $desc — expected output.log to contain '$needle'"
+    echo "  output.log contents:"
+    sed 's/^/    /' "$sandbox/output.log" 2>/dev/null || echo "    (empty)"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+# Asserts the escalate.log line matching $needle also contains $reason_text
+# in its --reason argument — catching drift between the numbers an escalation
+# claims and the numbers it actually computed.
+assert_reason_contains() {
+  local sandbox="$1" needle="$2" reason_text="$3" desc="$4"
+  local line
+  line="$(grep -- "$needle" "$sandbox/escalate.log" 2>/dev/null || true)"
+  if [[ -z "$line" ]]; then
+    echo "FAIL: $desc — no escalation matching '$needle' to check reason text on"
+    FAILURES=$((FAILURES + 1))
+    return
+  fi
+  if [[ "$line" != *"$reason_text"* ]]; then
+    echo "FAIL: $desc — expected reason to contain '$reason_text', got: $line"
     FAILURES=$((FAILURES + 1))
   fi
 }
@@ -239,6 +278,10 @@ touch "$DB_DIR/.mock-push-fail-origin"
 run_scenario "$SANDBOX" --databases testdb --skip-git
 assert_escalated "$SANDBOX" "dolt push failed" "dolt push failure"
 assert_fingerprint "$SANDBOX" "dolt push failed" "dolt-archive:dolt-push-failed" "dolt push failure"
+assert_output_contains "$SANDBOX" \
+  "dolt_push=0/1 attempted across 1 db(s) with a remote, exported_dbs_with_remote=1/1" \
+  "dolt push failure — dolt_push summary clause (attempted case)"
+assert_output_contains "$SANDBOX" "git=skipped" "dolt push failure — git clause (--skip-git)"
 rm -rf "$SANDBOX"
 
 # --- Scenario 2: missing git backup repo must escalate critical --------------
@@ -253,6 +296,8 @@ write_gt_mock "$SANDBOX"
 run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
 assert_escalated "$SANDBOX" "no git backup repo" "missing git backup repo"
 assert_fingerprint "$SANDBOX" "no git backup repo" "dolt-archive:git-repo-missing" "missing git backup repo"
+assert_output_contains "$SANDBOX" "git=missing" "missing git backup repo — git clause"
+assert_output_contains "$SANDBOX" "dolt_push=skipped" "missing git backup repo — dolt_push summary clause (skipped case)"
 rm -rf "$SANDBOX"
 
 # --- Scenario 3: remote count below exported count must escalate critical ----
@@ -275,6 +320,9 @@ mkdir -p "$NO_REMOTE_DIR/.dolt"
 run_scenario "$SANDBOX" --databases db-with-remote,db-no-remote --skip-git
 assert_escalated "$SANDBOX" "only 1 of 2 exported databases have a dolt remote configured" "remote-count shortfall"
 assert_fingerprint "$SANDBOX" "only 1 of 2 exported databases" "dolt-archive:remote-shortfall" "remote-count shortfall"
+assert_reason_contains "$SANDBOX" "only 1 of 2 exported databases" \
+  "1 exported database(s) have no dolt remote at all, so dolt push never attempts them. The dolt_push ratio in the summary covers all 1 db(s) with a remote (exported or not), not just these 1 exported one(s)." \
+  "remote-count shortfall — escalation reason text"
 rm -rf "$SANDBOX"
 
 # --- Scenario 4: fully healthy run must NOT escalate --------------------------
@@ -291,6 +339,10 @@ printf 'origin\thttps://example.invalid/testdb (fetch)\n' > "$HEALTHY_DIR/.mock-
 
 run_scenario "$SANDBOX" --databases testdb --skip-git
 assert_no_escalation "$SANDBOX" "healthy run"
+assert_output_contains "$SANDBOX" \
+  "dolt_push=1/1 attempted across 1 db(s) with a remote, exported_dbs_with_remote=1/1" \
+  "healthy run — dolt_push summary clause (attempted case, all succeeded)"
+assert_output_contains "$SANDBOX" "git=skipped" "healthy run — git clause (--skip-git)"
 rm -rf "$SANDBOX"
 
 # --- Scenario 5: a persistent condition across two cycles must escalate ------
@@ -379,6 +431,39 @@ git -C "$SANDBOX/home/gt/.dolt-archive/git" remote set-url origin "/nonexistent/
 run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
 assert_escalated "$SANDBOX" "git backup add/commit/push failed" "git push failure"
 assert_fingerprint "$SANDBOX" "git backup add/commit/push failed" "dolt-archive:git-backup-failed" "git push failure"
+assert_output_contains "$SANDBOX" "git=failed" "git push failure — git clause"
+rm -rf "$SANDBOX"
+
+# --- Scenario 8: successful git push must report git=pushed, not the same ----
+# --- token as skipped/missing/failed -----------------------------------------
+
+log "=== Scenario: successful git push (git=pushed) ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"
+write_bd_mock "$SANDBOX"
+write_gt_mock "$SANDBOX"
+write_git_backup_repo "$SANDBOX"
+
+run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
+assert_no_escalation "$SANDBOX" "successful git push"
+assert_output_contains "$SANDBOX" "git=pushed" "successful git push — git clause"
+rm -rf "$SANDBOX"
+
+# --- Scenario 9: nothing to push (repo present, already at parity) must ------
+# --- report git=nothing-to-push, not the same token as a failure -------------
+
+log "=== Scenario: nothing to push (git=nothing-to-push) ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"
+write_bd_mock "$SANDBOX"
+write_gt_mock "$SANDBOX"
+# Seed the repo with content matching what this cycle will export, and
+# already pushed, so there is nothing to commit and nothing ahead of origin.
+write_git_backup_repo "$SANDBOX" '{"id":"1"}'
+
+run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
+assert_no_escalation "$SANDBOX" "nothing to push"
+assert_output_contains "$SANDBOX" "git=nothing-to-push" "nothing to push — git clause"
 rm -rf "$SANDBOX"
 
 # --- Summary -------------------------------------------------------------------

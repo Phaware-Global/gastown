@@ -315,7 +315,26 @@ if $SKIP_DOLT_PUSH; then
 else
   DOLT_PUSH_CLAUSE="dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED)) attempted across $DBS_WITH_REMOTE db(s) with a remote, exported_dbs_with_remote=$EXPORTED_DBS_WITH_REMOTE/$EXPORTED"
 fi
-SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, $DOLT_PUSH_CLAUSE, result=$RESULT"
+
+# git=true/false collapsed four different states into one token: skipped
+# (--skip-git), missing (no backup repo at $BACKUP_REPO), failed (add/commit/
+# push error), and nothing-to-push (repo present, nothing ahead of
+# origin/main) all read as "false". Same vocabulary as dolt_push's own
+# skipped/attempted distinction above. Checked in priority order: a push that
+# actually succeeded wins even if an earlier step in the same cycle failed.
+if $SKIP_GIT; then
+  GIT_CLAUSE="git=skipped"
+elif $GIT_REPO_MISSING; then
+  GIT_CLAUSE="git=missing"
+elif $GIT_PUSHED; then
+  GIT_CLAUSE="git=pushed"
+elif $GIT_FAILED; then
+  GIT_CLAUSE="git=failed"
+else
+  GIT_CLAUSE="git=nothing-to-push"
+fi
+
+SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), $GIT_CLAUSE, $DOLT_PUSH_CLAUSE, result=$RESULT"
 log "$SUMMARY"
 
 _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
