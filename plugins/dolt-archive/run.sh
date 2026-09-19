@@ -8,6 +8,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./visibility_guard.sh
+source "$SCRIPT_DIR/visibility_guard.sh"
+
 # --- Configuration -----------------------------------------------------------
 
 DOLT_HOST="${DOLT_HOST:-127.0.0.1}"
@@ -224,6 +228,8 @@ fi
 
 DOLT_PUSHED=0
 DOLT_PUSH_FAILED=0
+DOLT_PUSH_REFUSED=0
+DOLT_REFUSAL_DETAIL=""
 
 if ! $SKIP_DOLT_PUSH; then
   log ""
@@ -237,7 +243,7 @@ if ! $SKIP_DOLT_PUSH; then
       continue
     fi
 
-    REMOTES=$(cd "$DB_DIR" && { dolt remote -v 2>/dev/null | grep -v "^$" | head -5 || true; })
+    REMOTES=$(cd "$DB_DIR" && { dolt remote -v 2>/dev/null | grep -v "^$" || true; })
     if [[ -z "$REMOTES" ]]; then
       log "  $DB: no remotes configured, skipping"
       continue
@@ -246,19 +252,39 @@ if ! $SKIP_DOLT_PUSH; then
     log "  $DB: pushing to remotes..."
     cd "$DB_DIR"
 
-    for REMOTE_NAME in $(dolt remote -v 2>/dev/null | awk '{print $1}' | sort -u || true); do
-      if PUSH_ERR=$(timeout 120 dolt push "$REMOTE_NAME" main 2>&1); then
-        log "    $REMOTE_NAME: pushed"
-        DOLT_PUSHED=$((DOLT_PUSHED + 1))
+    while IFS=$' \t' read -r REMOTE_NAME REMOTE_URL _; do
+      [[ -z "$REMOTE_NAME" ]] && continue
+
+      # Refuse unless the remote is a GitHub repo confirmed private. Fails
+      # closed: public, non-GitHub, or an undeterminable visibility all
+      # refuse the same way. This is the only thing standing between this
+      # script and a push to a public repo — see gt-v3df.
+      if VIS_REASON=$(remote_push_allowed "$REMOTE_URL"); then
+        if PUSH_ERR=$(timeout 120 dolt push "$REMOTE_NAME" main 2>&1); then
+          log "    $REMOTE_NAME: pushed"
+          DOLT_PUSHED=$((DOLT_PUSHED + 1))
+        else
+          log "    $REMOTE_NAME: FAILED:"
+          logblock "$(printf '%s' "$PUSH_ERR" | redact)"
+          DOLT_PUSH_FAILED=$((DOLT_PUSH_FAILED + 1))
+        fi
       else
-        log "    $REMOTE_NAME: FAILED:"
-        logblock "$(printf '%s' "$PUSH_ERR" | redact)"
-        DOLT_PUSH_FAILED=$((DOLT_PUSH_FAILED + 1))
+        log "    $REMOTE_NAME: REFUSED — visibility=$VIS_REASON (not confirmed private): $(printf '%s' "$REMOTE_URL" | redact)"
+        DOLT_PUSH_REFUSED=$((DOLT_PUSH_REFUSED + 1))
+        DOLT_REFUSAL_DETAIL="${DOLT_REFUSAL_DETAIL}${DB}/${REMOTE_NAME}(${VIS_REASON}) "
+
+        if ! ESCALATE_ERR=$(gt escalate "dolt-archive: refused dolt push for $DB to unsafe remote $REMOTE_NAME" \
+          -s critical \
+          --fingerprint "dolt-archive:push-refused:${DB}:${REMOTE_NAME}" \
+          --reason "Remote visibility is '$VIS_REASON', not confirmed private. Refusing to push $DB to $(printf '%s' "$REMOTE_URL" | redact) until it is. See gt-v3df." 2>&1); then
+          log "    WARN: gt escalate failed:"
+          logblock "$ESCALATE_ERR"
+        fi
       fi
-    done
+    done <<< "$REMOTES"
   done
 
-  log "Dolt push: $DOLT_PUSHED succeeded, $DOLT_PUSH_FAILED failed"
+  log "Dolt push: $DOLT_PUSHED succeeded, $DOLT_PUSH_FAILED failed, $DOLT_PUSH_REFUSED refused (unsafe destination)"
 fi
 
 # --- Step 4: Report results --------------------------------------------------
@@ -267,12 +293,18 @@ log ""
 log "=== Archive Cycle Complete ==="
 
 RESULT="success"
-if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]] || $GIT_FAILED; then
+if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_REFUSED" -gt 0 ]] || $GIT_FAILED; then
   RESULT="warning"
 fi
 
-SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED)), result=$RESULT"
+# dolt_push's denominator includes refused attempts too — a refusal is not
+# the same as "nothing to push" and must show up as a shortfall here, not
+# vanish into the count of things that just weren't attempted.
+SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED + DOLT_PUSH_REFUSED)), dolt_push_refused=$DOLT_PUSH_REFUSED, result=$RESULT"
 log "$SUMMARY"
+if [[ "$DOLT_PUSH_REFUSED" -gt 0 ]]; then
+  log "  Refused (unsafe destination): $DOLT_REFUSAL_DETAIL"
+fi
 
 _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
   -l type:plugin-run,plugin:dolt-archive,result:$RESULT \
