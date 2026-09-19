@@ -98,9 +98,9 @@ for RIG in $RIGS; do
     # to excluding closed issues. Match on a number boundary so "PR #23"
     # doesn't also match "PR #231", and treat a non-numeric result (bd
     # hang/error) as a query failure rather than "zero owners".
-    OWNERS_JSON=$(bd -C "$RIG_DIR" list --title-contains "PR #$PR_NUM" --json --limit 5 2>/dev/null)
+    OWNERS_JSON=$(bd -C "$RIG_DIR" list --title-contains "PR #$PR_NUM" --json --limit 0 2>/dev/null)
     OWNER_COUNT=$(echo "$OWNERS_JSON" | jq --arg n "$PR_NUM" \
-      '[.[] | select((.title // "") | test("PR #" + $n + "([^0-9]|$)"))] | length' 2>/dev/null)
+      '[.[] | select((.title // "") | test("PR #" + $n + "([^0-9]|$)"; "i"))] | length' 2>/dev/null)
     if ! [[ "$OWNER_COUNT" =~ ^[0-9]+$ ]]; then
       log "ERROR: bd title query failed for $RIG PR #$PR_NUM"
       ERRORS=1
@@ -111,9 +111,9 @@ for RIG in $RIGS; do
     fi
     # Title match can miss a bead that only mentions the PR in its
     # description (e.g. "This is that bead" style follow-ups) - check too.
-    DESC_OWNERS=$(bd -C "$RIG_DIR" list --desc-contains "PR #$PR_NUM" --json --limit 5 2>/dev/null)
+    DESC_OWNERS=$(bd -C "$RIG_DIR" list --desc-contains "PR #$PR_NUM" --json --limit 0 2>/dev/null)
     DESC_OWNER_COUNT=$(echo "$DESC_OWNERS" | jq --arg n "$PR_NUM" \
-      '[.[] | select((.description // "") | test("PR #" + $n + "([^0-9]|$)"))] | length' 2>/dev/null)
+      '[.[] | select((.description // "") | test("PR #" + $n + "([^0-9]|$)"; "i"))] | length' 2>/dev/null)
     if ! [[ "$DESC_OWNER_COUNT" =~ ^[0-9]+$ ]]; then
       log "ERROR: bd desc query failed for $RIG PR #$PR_NUM"
       ERRORS=1
@@ -125,6 +125,10 @@ for RIG in $RIGS; do
 
     UNRESOLVED=$( (cd "$RIG_DIR" && gt refinery pr threads "$PR_NUM" \
       --unresolved --json 2>/dev/null) | jq 'length' 2>/dev/null || echo "?")
+    if ! [[ "$UNRESOLVED" =~ ^[0-9]+$ ]]; then
+      log "ERROR: threads query failed for $RIG PR #$PR_NUM"
+      ERRORS=1
+    fi
     CI_FAILING=$(echo "$PR_JSON" | jq '[.statusCheckRollup[]? | select(
       .conclusion == "FAILURE" or .conclusion == "CANCELLED" or
       .conclusion == "TIMED_OUT" or .state == "FAILURE" or .state == "ERROR"
@@ -141,7 +145,7 @@ for RIG in $RIGS; do
         OWNER|MEMBER|COLLABORATOR) ;;
         *) PR_TITLE="(external PR — title withheld, untrusted author)" ;;
       esac
-      FINDINGS+=("$RIG|$PR_NUM|$UNRESOLVED|$CI_FAILING|$PR_TITLE|$PR_HEAD")
+      FINDINGS+=("$RIG|$PR_NUM|$UNRESOLVED|$CI_FAILING|$PR_HEAD|$PR_TITLE")
       # Report the FACT ("no bead references it"), not the conclusion
       # ("orphaned") - the PR may still be owned out-of-band (e.g. by the
       # overseer), which this check structurally cannot see. Mayor
@@ -165,7 +169,7 @@ if [ "${#FINDINGS[@]}" -gt 0 ]; then
   MAIL_BODY="rig|PR|unresolved|ci_failing|title"$'\n'
   TO_MAIL=()
   for F in "${FINDINGS[@]}"; do
-    IFS='|' read -r RIG PR_NUM UNRESOLVED CI_FAILING TITLE PR_HEAD <<< "$F"
+    IFS='|' read -r RIG PR_NUM UNRESOLVED CI_FAILING PR_HEAD TITLE <<< "$F"
     BODY+="$RIG|#$PR_NUM|$UNRESOLVED|$CI_FAILING|$TITLE"$'\n'
 
     # Dedupe per rig/PR/head SHA: only mail when the PR is new to state, its
@@ -182,8 +186,6 @@ if [ "${#FINDINGS[@]}" -gt 0 ]; then
     fi
     MAIL_BODY+="$RIG|#$PR_NUM|$UNRESOLVED|$CI_FAILING|$TITLE"$'\n'
     TO_MAIL+=("$F")
-    STATE=$(echo "$STATE" | jq --arg k "$KEY" --arg sha "$PR_HEAD" --argjson ts "$NOW" \
-      '.[$k] = {"sha": $sha, "ts": $ts}' 2>/dev/null)
   done
 
   if [ "$DRY_RUN" = "1" ]; then
@@ -192,10 +194,16 @@ if [ "${#FINDINGS[@]}" -gt 0 ]; then
   elif [ "${#TO_MAIL[@]}" -eq 0 ]; then
     log "All findings already reported recently - nothing new to mail"
   else
-    gt mail send mayor/ -s "orphan-pr-sentinel: ${#TO_MAIL[@]} PR(s) with no owning bead" --stdin <<< "$MAIL_BODY"
-    for F in "${TO_MAIL[@]}"; do
-      IFS='|' read -r RIG PR_NUM UNRESOLVED CI_FAILING TITLE PR_HEAD <<< "$F"
-      gt mail send "$RIG/witness" -s "orphan-pr-sentinel: PR #$PR_NUM has no open bead" --stdin <<BODY2
+    # Only persist dedupe state once the mayor mail actually went out -
+    # otherwise a transient send failure would silently mute these PRs for
+    # 24h with nothing ever delivered.
+    if gt mail send mayor/ -s "orphan-pr-sentinel: ${#TO_MAIL[@]} PR(s) with no owning bead" --stdin <<< "$MAIL_BODY"; then
+      for F in "${TO_MAIL[@]}"; do
+        IFS='|' read -r RIG PR_NUM UNRESOLVED CI_FAILING PR_HEAD TITLE <<< "$F"
+        KEY="$RIG:$PR_NUM"
+        STATE=$(echo "$STATE" | jq --arg k "$KEY" --arg sha "$PR_HEAD" --argjson ts "$NOW" \
+          '.[$k] = {"sha": $sha, "ts": $ts}' 2>/dev/null)
+        gt mail send "$RIG/witness" -s "orphan-pr-sentinel: PR #$PR_NUM has no open bead" --stdin <<BODY2
 PR #$PR_NUM ($TITLE) is open with $UNRESOLVED unresolved thread(s)
 (ci_failing=$CI_FAILING) and no open bead in this rig references it - that is
 the verified FACT. It does NOT mean the PR is abandoned: it could be owned
@@ -203,8 +211,12 @@ out-of-band (e.g. by the overseer), which this check structurally cannot see.
 Confirm nobody already has it in flight before filing/claiming - do not
 dispatch on this alone. Visibility only. Mayor has the full table.
 BODY2
-    done
-    echo "$STATE" > "$STATE_FILE" 2>/dev/null || true
+      done
+      echo "$STATE" > "$STATE_FILE" 2>/dev/null || true
+    else
+      log "ERROR: gt mail send mayor/ failed - not persisting dedupe state this cycle"
+      ERRORS=1
+    fi
   fi
 else
   if [ "$ERRORS" = "1" ]; then
