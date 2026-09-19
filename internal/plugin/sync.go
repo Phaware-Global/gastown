@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // fetchTimeout and archiveTimeout bound the git subprocesses SyncFromOrigin
@@ -386,6 +388,7 @@ func runGit(ctx context.Context, dir string, args ...string) error {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...) //nolint:gosec // G204: fixed subcommand, dir is caller-controlled
 	cmd.Env = gitSubprocessEnv()
 	cmd.WaitDelay = gitWaitDelay
+	util.SetProcessGroup(cmd)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -397,6 +400,7 @@ func revParse(ctx context.Context, dir, ref string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--verify", ref) //nolint:gosec // G204: fixed subcommand, dir/ref are caller-controlled
 	cmd.Env = gitSubprocessEnv()
 	cmd.WaitDelay = gitWaitDelay
+	util.SetProcessGroup(cmd)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -419,6 +423,7 @@ func archivePluginsTree(ctx context.Context, gitDir, ref, destDir string, plugin
 	gitCmd.Env = gitSubprocessEnv()
 	gitCmd.WaitDelay = gitWaitDelay
 	tarCmd.WaitDelay = gitWaitDelay
+	util.SetProcessGroup(gitCmd)
 
 	pipe, err := gitCmd.StdoutPipe()
 	if err != nil {
