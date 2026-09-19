@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -16,7 +17,105 @@ import (
 const (
 	defaultDoltRemotesInterval = 15 * time.Minute
 	doltPushTimeout            = 60 * time.Second
+	remoteVisibilityTimeout    = 15 * time.Second
 )
+
+// githubURLRe and githubSCPRe extract "owner/repo" from a github.com remote
+// URL. Ported faithfully from plugins/dolt-archive/visibility_guard.sh's
+// github_owner_repo (PR #238, three review rounds) — do not hand-roll this
+// parsing again, it reproduces bugs that were already found and fixed there:
+//
+//  1. Dolt rewrites an scp-style remote into
+//     git+ssh://git@github.com/./owner/repo — the "/./" segment is optional
+//     here to match that form.
+//  2. The userinfo class excludes '/', '@', '#', and '?' (in addition to
+//     whitespace): each of those terminates a URL's authority section per
+//     the URL spec, so a userinfo containing one (e.g.
+//     "evil#@github.com/priv/repo") would let a real parser resolve a
+//     different host than a looser regex would — this must fail to parse,
+//     not silently resolve to github.com.
+//  3. DoltHub and any other non-github.com host deliberately fall through
+//     to "no match" — this only vouches for GitHub remotes.
+var (
+	githubURLRe = regexp.MustCompile(`^(?:https?|ssh)://(?:[^/@#?\s]+@)?github\.com[:/](?:\./)?([^/\s]+/[^/\s]+)$`)
+	githubSCPRe = regexp.MustCompile(`^git@github\.com:([^/\s]+/[^/\s]+)$`)
+	ownerRepoRe = regexp.MustCompile(`^[^/\s]+/[^/\s]+$`)
+)
+
+// githubOwnerRepo extracts "owner/repo" from a github.com remote URL. It
+// returns ("", false) for anything it doesn't confidently recognize as a
+// github.com remote — the caller must not push when this returns false.
+func githubOwnerRepo(rawURL string) (string, bool) {
+	url := strings.TrimPrefix(rawURL, "git+")
+
+	var ownerRepo string
+	if m := githubURLRe.FindStringSubmatch(url); m != nil {
+		ownerRepo = m[1]
+	} else if m := githubSCPRe.FindStringSubmatch(url); m != nil {
+		ownerRepo = m[1]
+	} else {
+		return "", false
+	}
+
+	ownerRepo = strings.TrimSuffix(ownerRepo, ".git")
+	ownerRepo = strings.TrimSuffix(ownerRepo, "/")
+	if !ownerRepoRe.MatchString(ownerRepo) {
+		return "", false
+	}
+	return ownerRepo, true
+}
+
+// ghLookPath resolves the `gh` binary; overridden in tests to simulate it
+// being unavailable without touching the real PATH.
+var ghLookPath = func() error {
+	_, err := exec.LookPath("gh")
+	return err
+}
+
+// ghVisibilityLookup queries GitHub for a repo's visibility, pinned to
+// github.com so a machine configured for a different default host (e.g.
+// GHES) can't answer for a github.com remote. Overridden in tests.
+var ghVisibilityLookup = func(ctx context.Context, ownerRepo string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, remoteVisibilityTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "gh", "api", "--hostname", "github.com", "repos/"+ownerRepo, "--jq", ".visibility")
+	util.SetDetachedProcessGroup(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// remotePushAllowed reports whether a push to the given Dolt remote URL is
+// allowed: only when it resolves to a GitHub repo whose visibility API
+// confirms "private". It fails closed on everything else — a public repo,
+// a non-GitHub remote, an unparseable URL, a missing `gh`, or a failed or
+// empty visibility lookup are all refused — mirroring
+// visibility_guard.sh's remote_push_allowed. The returned reason is one of
+// "private" (allowed), or "public"/other-visibility, "non-github-remote",
+// "gh-unavailable", "visibility-lookup-failed" (refused).
+func remotePushAllowed(ctx context.Context, url string) (bool, string) {
+	if err := ghLookPath(); err != nil {
+		return false, "gh-unavailable"
+	}
+
+	ownerRepo, ok := githubOwnerRepo(url)
+	if !ok {
+		return false, "non-github-remote"
+	}
+
+	visibility, err := ghVisibilityLookup(ctx, ownerRepo)
+	if err != nil || visibility == "" {
+		return false, "visibility-lookup-failed"
+	}
+
+	if visibility == "private" {
+		return true, "private"
+	}
+	return false, visibility
+}
 
 // doltRemotesInterval returns the configured push interval, or the default (15m).
 func doltRemotesInterval(config *DaemonPatrolConfig) time.Duration {
@@ -111,6 +210,18 @@ func (d *Daemon) pushDatabase(dataDir, db, remote, branch string) error {
 		if strings.HasPrefix(db, prefix) {
 			return fmt.Errorf("REFUSED: %q looks like a test database (prefix %q)", db, prefix)
 		}
+	}
+
+	// Safety: refuse to push anywhere except a confirmed-private GitHub
+	// remote. This is the destination check the test-name guard above
+	// cannot provide: a production database with a perfectly normal name
+	// pushed to a public remote passes that guard cleanly.
+	remoteURL := d.resolveRemoteURL(dataDir, db, remote)
+	if remoteURL == "" {
+		return fmt.Errorf("REFUSED: %q: could not resolve URL for remote %q", db, remote)
+	}
+	if allowed, reason := remotePushAllowed(context.Background(), remoteURL); !allowed {
+		return fmt.Errorf("REFUSED: %q: remote %q is not a confirmed-private GitHub repo (%s)", db, remote, reason)
 	}
 
 	// Step 1: Stage any unstaged changes (non-fatal)
@@ -227,6 +338,29 @@ func (d *Daemon) discoverDatabasesWithRemotes(dataDir, remote string) ([]string,
 func escapeSQL(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	return strings.ReplaceAll(s, "'", "''")
+}
+
+// resolveRemoteURL returns the URL configured for a named Dolt remote, or
+// "" if the remote or database can't be found or the lookup fails.
+func (d *Daemon) resolveRemoteURL(dataDir, db, remote string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), doltCmdTimeout)
+	defer cancel()
+
+	query := fmt.Sprintf("USE `%s`; SELECT url FROM dolt_remotes WHERE name = '%s'", db, escapeSQL(remote))
+	cmd := exec.CommandContext(ctx, "dolt", "sql", "-r", "csv", "-q", query)
+	cmd.Dir = dataDir
+	util.SetDetachedProcessGroup(cmd)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(lines[1])
 }
 
 // databaseHasRemote checks if a database has the specified remote configured.
