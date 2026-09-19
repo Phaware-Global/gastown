@@ -205,8 +205,15 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   # cycle committed something. A commit stranded by an earlier failed push
   # (e.g. a network blip) must still be retried on a later cycle, even one
   # that stages nothing new itself.
-  if [[ -n "$(git rev-list origin/main..HEAD 2>/dev/null)" ]]; then
-    if git remote get-url origin > /dev/null 2>&1; then
+  #
+  # `git rev-list origin/main..HEAD` exits non-zero with EMPTY stdout when
+  # origin isn't configured, or refs/remotes/origin/main doesn't exist —
+  # indistinguishable, once stderr is discarded, from a genuine "nothing
+  # ahead". Check its own exit status instead of just testing the (possibly
+  # error-empty) output, so a missing push destination reads as a failure
+  # rather than the misleading all-clear.
+  if AHEAD="$(git rev-list origin/main..HEAD 2>&1)"; then
+    if [[ -n "$AHEAD" ]]; then
       if PUSH_ERR=$(git push origin main 2>&1); then
         GIT_PUSHED=true
         log "Pushed to GitHub"
@@ -215,9 +222,11 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
         logblock "$(printf '%s' "$PUSH_ERR" | redact)"
         GIT_FAILED=true
       fi
-    else
-      log "WARN: No git remote configured for backup repo"
     fi
+  else
+    log "WARN: Cannot determine git push status (no origin remote, or missing refs/remotes/origin/main):"
+    logblock "$(printf '%s' "$AHEAD" | redact)"
+    GIT_FAILED=true
   fi
 elif ! $SKIP_GIT; then
   log "No git backup repo at $BACKUP_REPO — skipping git push"

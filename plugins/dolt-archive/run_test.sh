@@ -467,6 +467,60 @@ assert_no_escalation "$SANDBOX" "nothing to push"
 assert_output_contains "$SANDBOX" "git=nothing-to-push" "nothing to push — git clause"
 rm -rf "$SANDBOX"
 
+# --- Scenario 10: origin remote entirely absent, with an unpushed commit, ----
+# --- must escalate as a failure, NOT read as the all-clear (gt-a7um) --------
+#
+# `git rev-list origin/main..HEAD` exits non-zero with empty stdout when
+# `origin/main` doesn't resolve at all — before the fix, that empty stdout
+# was indistinguishable from a genuine "nothing ahead" and the whole push
+# block (including any warning) was skipped silently.
+
+log "=== Scenario: no origin remote configured, work stranded (gt-a7um) ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"
+write_bd_mock "$SANDBOX"
+write_gt_mock "$SANDBOX"
+write_git_backup_repo "$SANDBOX"
+# Seed content differs from the dolt mock's exported "{"id":"1"}" (default),
+# so run.sh's own commit step creates a genuine new local commit this cycle —
+# one that can never be verified against origin/main once it's gone.
+git -C "$SANDBOX/home/gt/.dolt-archive/git" remote remove origin
+
+run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
+assert_escalated "$SANDBOX" "git backup add/commit/push failed" "no origin remote — must not read as all-clear"
+assert_fingerprint "$SANDBOX" "git backup add/commit/push failed" "dolt-archive:git-backup-failed" "no origin remote"
+assert_output_contains "$SANDBOX" "git=failed" "no origin remote — git clause"
+if grep -qF "git=nothing-to-push" "$SANDBOX/output.log" 2>/dev/null; then
+  echo "FAIL: no origin remote — output.log still contains the misleading git=nothing-to-push"
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$SANDBOX"
+
+# --- Scenario 11: origin remote absent but a stale refs/remotes/origin/main --
+# --- ref survives, with an unpushed commit — same failure, different half ---
+# --- of the same defect (gt-a7um round-5 finding: "or origin/main is missing")
+
+log "=== Scenario: origin removed, stale tracking ref remains, work stranded (gt-a7um) ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"
+write_bd_mock "$SANDBOX"
+write_gt_mock "$SANDBOX"
+write_git_backup_repo "$SANDBOX"
+REPO="$SANDBOX/home/gt/.dolt-archive/git"
+STALE_SHA="$(git -C "$REPO" rev-parse HEAD)"
+git -C "$REPO" remote remove origin
+git -C "$REPO" update-ref refs/remotes/origin/main "$STALE_SHA"
+
+run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
+assert_escalated "$SANDBOX" "git backup add/commit/push failed" "stale tracking ref, no remote — must not read as all-clear"
+assert_fingerprint "$SANDBOX" "git backup add/commit/push failed" "dolt-archive:git-backup-failed" "stale tracking ref, no remote"
+assert_output_contains "$SANDBOX" "git=failed" "stale tracking ref, no remote — git clause"
+if grep -qF "git=nothing-to-push" "$SANDBOX/output.log" 2>/dev/null; then
+  echo "FAIL: stale tracking ref, no remote — output.log still contains the misleading git=nothing-to-push"
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$SANDBOX"
+
 # --- Summary -------------------------------------------------------------------
 
 echo ""
