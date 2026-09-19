@@ -223,8 +223,22 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
         GIT_FAILED=true
       fi
     fi
+  elif git remote get-url origin >/dev/null 2>&1; then
+    # origin is configured and reachable but rev-list still failed — most
+    # likely refs/remotes/origin/main doesn't exist yet (first run, never
+    # fetched or pushed before). Treating that like "no origin" would
+    # escalate forever with no way to recover, so push directly instead:
+    # success establishes the tracking ref, failure is a genuine git=failed.
+    if PUSH_ERR=$(git push origin main 2>&1); then
+      GIT_PUSHED=true
+      log "Pushed to GitHub (established missing origin/main tracking ref)"
+    else
+      log "WARN: Git push to remote failed:"
+      logblock "$(printf '%s' "$PUSH_ERR" | redact)"
+      GIT_FAILED=true
+    fi
   else
-    log "WARN: Cannot determine git push status (no origin remote, or missing refs/remotes/origin/main):"
+    log "WARN: Cannot determine git push status (no origin remote):"
     logblock "$(printf '%s' "$AHEAD" | redact)"
     GIT_FAILED=true
   fi

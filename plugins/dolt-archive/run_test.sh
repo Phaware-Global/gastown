@@ -521,6 +521,45 @@ if grep -qF "git=nothing-to-push" "$SANDBOX/output.log" 2>/dev/null; then
 fi
 rm -rf "$SANDBOX"
 
+# --- Scenario 12: origin reachable but refs/remotes/origin/main never -------
+# --- existed (first run, never fetched or pushed) must push directly and ----
+# --- recover, not escalate forever (gt-y3e9 / PR #235 finding r4052265957) --
+#
+# `git rev-list origin/main..HEAD` also fails this way when origin is
+# perfectly reachable but nothing has ever synced refs/remotes/origin/main
+# locally — a real bootstrap case, not a broken remote. Before the fix, this
+# read identically to "no origin at all" and escalated with no way to ever
+# recover without a human manually pushing once.
+
+log "=== Scenario: origin reachable, no origin/main tracking ref yet (gt-y3e9) ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"
+write_bd_mock "$SANDBOX"
+write_gt_mock "$SANDBOX"
+REPO="$SANDBOX/home/gt/.dolt-archive/git"
+BARE="$SANDBOX/bare-origin.git"
+git init --quiet --bare "$BARE"
+git init --quiet -b main "$REPO"
+(
+  cd "$REPO"
+  git config user.email "test@example.invalid"
+  git config user.name "Test"
+  git remote add origin "$BARE"
+  printf '{"id":"old"}\n' > testdb.jsonl
+  git add testdb.jsonl
+  git commit --quiet -m "seed"
+  # Deliberately no fetch/push — refs/remotes/origin/main never gets created.
+)
+
+run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
+assert_no_escalation "$SANDBOX" "origin reachable, no tracking ref — should recover, not escalate"
+assert_output_contains "$SANDBOX" "git=pushed" "origin reachable, no tracking ref — git clause"
+if ! git -C "$BARE" show-ref --verify --quiet refs/heads/main; then
+  echo "FAIL: origin reachable, no tracking ref — bare origin never received the push"
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$SANDBOX"
+
 # --- Summary -------------------------------------------------------------------
 
 echo ""
