@@ -36,6 +36,14 @@ func TestGithubOwnerRepo(t *testing.T) {
 		{"https://evil#@github.com/priv/repo", "", false},
 		{"https://evil?@github.com/priv/repo", "", false},
 		{"https://evil/@github.com/priv/repo", "", false},
+
+		// gt-175j round 2: "github.com:x" before the '@' is username:password
+		// userinfo syntax, not a host and port — the real host is evil.com.
+		// A regex that merely checks for "github.com[:/]" at the front reads
+		// this as vouching for github.com; net/url's Hostname() strips
+		// userinfo (and port) and correctly resolves evil.com.
+		{"https://github.com:x@evil.com/repo", "", false},
+		{"ssh://git@github.com:x@evil.com/repo", "", false},
 	}
 
 	for _, tt := range tests {
@@ -63,12 +71,20 @@ func TestRemotePushAllowed(t *testing.T) {
 		{"public repo refused", "git+https://github.com/pub-owner/repo", false, "public", nil, false, "public"},
 		{"private repo allowed", "git+https://github.com/priv-owner/repo", false, "private", nil, true, "private"},
 		{"lookup failure refused", "git+https://github.com/lookup-fails-owner/repo", false, "", errors.New("boom"), false, "visibility-lookup-failed"},
-		{"non-github remote refused", "https://doltremoteapi.dolthub.com/priv-owner/repo", false, "", nil, false, "non-github-remote"},
+		{"non-github remote refused", "https://bitbucket.org/priv-owner/repo", false, "", nil, false, "non-github-remote"},
 		{"unparseable url refused", "garbage", false, "", nil, false, "non-github-remote"},
 		{"internal visibility refused", "git+https://github.com/internal-owner/repo", false, "internal", nil, false, "internal"},
 		{"empty visibility refused", "git+https://github.com/empty-owner/repo", false, "", nil, false, "visibility-lookup-failed"},
 		{"gh missing refused", "git+https://github.com/priv-owner/repo", true, "private", nil, false, "gh-unavailable"},
 		{"dolt /./ ssh form on private repo allowed", "git+ssh://git@github.com/./priv-owner/repo", false, "private", nil, true, "private"},
+
+		// gt-175j: DoltHub is the product's own private-backup remote
+		// (SetupDoltHubRemote), not an unrecognized third party. It must be
+		// refused with a reason that names DoltHub, not the generic
+		// "non-github-remote" — and refused regardless of what `gh` would
+		// say, since it's never consulted for a DoltHub host.
+		{"dolthub remote refused explicitly, not as non-github-remote", "https://doltremoteapi.dolthub.com/priv-owner/repo", false, "", nil, false, "dolthub-unsupported"},
+		{"dolthub remote refused even with git+ prefix", "git+https://doltremoteapi.dolthub.com/priv-owner/repo", false, "", nil, false, "dolthub-unsupported"},
 	}
 
 	for _, tt := range tests {
@@ -115,5 +131,45 @@ func TestRemotePushAllowedHostPinning(t *testing.T) {
 	allowed, reason := remotePushAllowed(context.Background(), "git+https://github.com/mismatch-owner/repo")
 	if allowed || reason != "public" {
 		t.Errorf("remotePushAllowed = (%v, %q), want (false, \"public\")", allowed, reason)
+	}
+}
+
+// TestRemotePushAllowedDoltHubNeverConsultsGH verifies a DoltHub remote is
+// refused before `gh` is ever looked up or called — the guard must not, for
+// example, treat a machine with no `gh` installed as "gh-unavailable" for a
+// DoltHub remote when the real reason is "this isn't GitHub".
+func TestRemotePushAllowedDoltHubNeverConsultsGH(t *testing.T) {
+	origLookPath, origLookup := ghLookPath, ghVisibilityLookup
+	defer func() { ghLookPath, ghVisibilityLookup = origLookPath, origLookup }()
+
+	ghLookPath = func() error { t.Fatal("ghLookPath should not be called for a DoltHub remote"); return nil }
+	ghVisibilityLookup = func(ctx context.Context, ownerRepo string) (string, error) {
+		t.Fatal("ghVisibilityLookup should not be called for a DoltHub remote")
+		return "", nil
+	}
+
+	allowed, reason := remotePushAllowed(context.Background(), "git+https://doltremoteapi.dolthub.com/priv-owner/repo")
+	if allowed || reason != "dolthub-unsupported" {
+		t.Errorf("remotePushAllowed = (%v, %q), want (false, \"dolthub-unsupported\")", allowed, reason)
+	}
+}
+
+func TestIsDoltHubRemote(t *testing.T) {
+	tests := []struct {
+		url  string
+		want bool
+	}{
+		{"https://doltremoteapi.dolthub.com/priv-owner/repo", true},
+		{"git+https://doltremoteapi.dolthub.com/priv-owner/repo", true},
+		{"https://github.com/priv-owner/repo", false},
+		{"https://www.dolthub.com/repositories/priv-owner/repo", false},
+		{"garbage", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.url, func(t *testing.T) {
+			if got := isDoltHubRemote(tt.url); got != tt.want {
+				t.Errorf("isDoltHubRemote(%q) = %v, want %v", tt.url, got, tt.want)
+			}
+		})
 	}
 }
