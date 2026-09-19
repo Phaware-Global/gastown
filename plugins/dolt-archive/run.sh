@@ -307,7 +307,15 @@ fi
 # inside the other's denominator, when they're independently counted and can
 # disagree (e.g. a push succeeding on an unexported db while every exported
 # db lacks a remote). Report them side by side instead, each self-contained.
-SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED)) attempted across $DBS_WITH_REMOTE db(s) with a remote, exported_dbs_with_remote=$EXPORTED_DBS_WITH_REMOTE/$EXPORTED, result=$RESULT"
+# Both figures come from the Dolt Push loop, which never runs under
+# --skip-dolt-push — reporting them as 0 there would read as "checked, found
+# none" rather than "not checked", so state that the step was skipped instead.
+if $SKIP_DOLT_PUSH; then
+  DOLT_PUSH_CLAUSE="dolt_push=skipped"
+else
+  DOLT_PUSH_CLAUSE="dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED)) attempted across $DBS_WITH_REMOTE db(s) with a remote, exported_dbs_with_remote=$EXPORTED_DBS_WITH_REMOTE/$EXPORTED"
+fi
+SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, $DOLT_PUSH_CLAUSE, result=$RESULT"
 log "$SUMMARY"
 
 _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
