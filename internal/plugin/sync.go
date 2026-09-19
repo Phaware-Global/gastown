@@ -296,12 +296,25 @@ func findGitDirFromDir(dir string) string {
 	return ""
 }
 
-// SyncFromOrigin fetches origin/main into gitDir and syncs its plugins/ tree
-// into targetDir. It reads the tree directly from git's object store via
-// `git archive`, so it never touches gitDir's working tree or index — the
-// checkout can be sitting on an unrelated or stale branch and this still
-// deploys the true origin/main content.
-func SyncFromOrigin(gitDir, targetDir string, clean bool) (*SyncResult, error) {
+// SyncFromOrigin fetches origin/main into gitDir and syncs the named
+// plugins/<name> directories into targetDir. It reads the tree directly from
+// git's object store via `git archive`, so it never touches gitDir's working
+// tree or index — the checkout can be sitting on an unrelated or stale branch
+// and this still deploys the true origin/main content.
+//
+// pluginNames must be explicit and non-empty — this does NOT sync "every
+// plugin in the repo". A townRoot/plugins checkout can accumulate plugins
+// whose deployed copy has diverged from the repo in the OTHER direction: a
+// hand-applied production fix that was never committed back (confirmed for
+// at least two plugins during the gt-2ea1 investigation — see gt-bpew).
+// Blanket-syncing from repo->target would silently overwrite those with
+// older, unfixed code. Callers must name only the plugins they've verified
+// are safe to make repo-authoritative.
+func SyncFromOrigin(gitDir, targetDir string, pluginNames []string, clean bool) (*SyncResult, error) {
+	if len(pluginNames) == 0 {
+		return nil, fmt.Errorf("no plugin names specified — refusing to sync all plugins blindly")
+	}
+
 	if err := runGit(gitDir, "fetch", "--quiet", "origin", "main"); err != nil {
 		return nil, fmt.Errorf("fetching origin/main: %w", err)
 	}
@@ -312,13 +325,13 @@ func SyncFromOrigin(gitDir, targetDir string, clean bool) (*SyncResult, error) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	if err := archivePluginsTree(gitDir, "origin/main", tmpDir); err != nil {
+	if err := archivePluginsTree(gitDir, "origin/main", tmpDir, pluginNames); err != nil {
 		return nil, fmt.Errorf("extracting plugins/ from origin/main: %w", err)
 	}
 
 	sourceDir := filepath.Join(tmpDir, "plugins")
 	if _, err := os.Stat(sourceDir); err != nil {
-		return nil, fmt.Errorf("origin/main has no plugins/ directory")
+		return nil, fmt.Errorf("origin/main has none of the requested plugins/ directories")
 	}
 
 	return SyncPlugins(sourceDir, targetDir, clean)
@@ -332,12 +345,16 @@ func runGit(dir string, args ...string) error {
 	return nil
 }
 
-// archivePluginsTree extracts the plugins/ directory at ref from gitDir's
-// object store into destDir, via `git archive | tar -x` — no working tree or
-// checkout involved.
-func archivePluginsTree(gitDir, ref, destDir string) error {
-	gitCmd := exec.Command("git", "-C", gitDir, "archive", ref, "--", "plugins") //nolint:gosec // G204: fixed args, ref/gitDir are caller-controlled
-	tarCmd := exec.Command("tar", "-x", "-C", destDir)                          //nolint:gosec // G204: fixed args
+// archivePluginsTree extracts the named plugins/<name> directories at ref
+// from gitDir's object store into destDir, via `git archive | tar -x` — no
+// working tree or checkout involved.
+func archivePluginsTree(gitDir, ref, destDir string, pluginNames []string) error {
+	args := []string{"-C", gitDir, "archive", ref, "--"}
+	for _, name := range pluginNames {
+		args = append(args, filepath.Join("plugins", name))
+	}
+	gitCmd := exec.Command("git", args...)             //nolint:gosec // G204: fixed subcommand, args are caller-controlled plugin names
+	tarCmd := exec.Command("tar", "-x", "-C", destDir) //nolint:gosec // G204: fixed args
 
 	pipe, err := gitCmd.StdoutPipe()
 	if err != nil {
@@ -379,7 +396,7 @@ func hasPlugins(dir string) bool {
 // DriftReport describes differences between source and runtime plugins.
 type DriftReport struct {
 	Source  string       `json:"source"`
-	Target string       `json:"target"`
+	Target  string       `json:"target"`
 	Drifted []DriftEntry `json:"drifted,omitempty"`
 	Missing []string     `json:"missing,omitempty"` // in source but not target
 	Extra   []string     `json:"extra,omitempty"`   // in target but not source

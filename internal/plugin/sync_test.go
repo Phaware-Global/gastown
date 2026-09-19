@@ -360,7 +360,7 @@ func TestSyncFromOrigin_IgnoresStaleWorkingTree(t *testing.T) {
 	runGitTest(t, checkoutDir, "checkout", "stale-local-branch")
 
 	targetDir := t.TempDir()
-	result, err := SyncFromOrigin(checkoutDir, targetDir, false)
+	result, err := SyncFromOrigin(checkoutDir, targetDir, []string{"some-plugin"}, false)
 	if err != nil {
 		t.Fatalf("SyncFromOrigin failed: %v", err)
 	}
@@ -390,7 +390,38 @@ func TestSyncFromOrigin_MissingPluginsDir(t *testing.T) {
 	runGitTest(t, checkoutDir, "commit", "-m", "no plugins")
 	runGitTest(t, checkoutDir, "push", "origin", "main")
 
-	if _, err := SyncFromOrigin(checkoutDir, t.TempDir(), false); err == nil {
+	if _, err := SyncFromOrigin(checkoutDir, t.TempDir(), []string{"some-plugin"}, false); err == nil {
 		t.Error("expected error when origin/main has no plugins/ directory")
+	}
+}
+
+func TestSyncFromOrigin_RequiresExplicitPluginNames(t *testing.T) {
+	checkoutDir := setupGastownCheckout(t)
+	if _, err := SyncFromOrigin(checkoutDir, t.TempDir(), nil, false); err == nil {
+		t.Error("expected error when no plugin names are given — must not sync everything by default")
+	}
+}
+
+// TestSyncFromOrigin_OnlySyncsNamedPlugin verifies a second plugin present in
+// the source tree is left untouched — the allowlist must be a true filter,
+// not just an initial-population hint.
+func TestSyncFromOrigin_OnlySyncsNamedPlugin(t *testing.T) {
+	checkoutDir := setupGastownCheckout(t)
+	createTestPlugin(t, filepath.Join(checkoutDir, "plugins"), "other-plugin",
+		"+++\nname = \"other-plugin\"\n+++\nother", nil)
+	runGitTest(t, checkoutDir, "add", "-A")
+	runGitTest(t, checkoutDir, "commit", "-m", "add other-plugin")
+	runGitTest(t, checkoutDir, "push", "origin", "main")
+
+	targetDir := t.TempDir()
+	result, err := SyncFromOrigin(checkoutDir, targetDir, []string{"some-plugin"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Copied) != 1 || result.Copied[0] != "some-plugin" {
+		t.Errorf("expected only some-plugin copied, got %+v", result)
+	}
+	if _, err := os.Stat(filepath.Join(targetDir, "other-plugin")); !os.IsNotExist(err) {
+		t.Error("other-plugin should not have been synced — it wasn't in the allowlist")
 	}
 }

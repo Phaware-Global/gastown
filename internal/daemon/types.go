@@ -115,35 +115,35 @@ type PatrolConfig struct {
 
 // PatrolsConfig holds configuration for all patrols.
 type PatrolsConfig struct {
-	Refinery       *PatrolConfig          `json:"refinery,omitempty"`
-	Witness        *PatrolConfig          `json:"witness,omitempty"`
-	Deacon         *PatrolConfig          `json:"deacon,omitempty"`
-	Handler        *PatrolConfig          `json:"handler,omitempty"`
+	Refinery *PatrolConfig `json:"refinery,omitempty"`
+	Witness  *PatrolConfig `json:"witness,omitempty"`
+	Deacon   *PatrolConfig `json:"deacon,omitempty"`
+	Handler  *PatrolConfig `json:"handler,omitempty"`
 	// Reviewer gates the stuck-reviewer reaper. Like witness/refinery (and
 	// unlike the opt-in dogs) it defaults to ENABLED when unset: it is a safety
 	// rail, and a town that never configured it is exactly the town that needs
 	// it. Set {"enabled": false} to opt out.
-	Reviewer       *PatrolConfig          `json:"reviewer,omitempty"`
+	Reviewer *PatrolConfig `json:"reviewer,omitempty"`
 	// PluginSync keeps <townRoot>/plugins synced with the gastown repo's
 	// plugins/ directory at origin/main. Like Reviewer, it defaults to
 	// ENABLED when unset: without it, a plugin's deployed copy can silently
 	// drift forever from the reviewed, merged source (gt-2ea1 — the
 	// dolt-archive plugin ran a 3-month-stale copy because nothing else
 	// deployed it, and nobody noticed). Set {"enabled": false} to opt out.
-	PluginSync     *PatrolConfig          `json:"plugin_sync,omitempty"`
-	DoltServer     *DoltServerConfig      `json:"dolt_server,omitempty"`
-	DoltRemotes    *DoltRemotesConfig     `json:"dolt_remotes,omitempty"`
-	DoltBackup     *DoltBackupConfig      `json:"dolt_backup,omitempty"`
-	JsonlGitBackup *JsonlGitBackupConfig  `json:"jsonl_git_backup,omitempty"`
-	WispReaper     *WispReaperConfig      `json:"wisp_reaper,omitempty"`
-	DoctorDog      *DoctorDogConfig       `json:"doctor_dog,omitempty"`
-	CompactorDog           *CompactorDogConfig            `json:"compactor_dog,omitempty"`
-	CheckpointDog          *CheckpointDogConfig           `json:"checkpoint_dog,omitempty"`
-	ScheduledMaintenance   *ScheduledMaintenanceConfig    `json:"scheduled_maintenance,omitempty"`
-	MainBranchTest         *MainBranchTestConfig          `json:"main_branch_test,omitempty"`
-	QuotaDog               *QuotaDogConfig                `json:"quota_dog,omitempty"`
-	RestartTracker         *RestartTrackerConfig          `json:"restart_tracker,omitempty"`
-	Telegraph              *TelegraphServerConfig         `json:"telegraph,omitempty"`
+	PluginSync           *PatrolConfig               `json:"plugin_sync,omitempty"`
+	DoltServer           *DoltServerConfig           `json:"dolt_server,omitempty"`
+	DoltRemotes          *DoltRemotesConfig          `json:"dolt_remotes,omitempty"`
+	DoltBackup           *DoltBackupConfig           `json:"dolt_backup,omitempty"`
+	JsonlGitBackup       *JsonlGitBackupConfig       `json:"jsonl_git_backup,omitempty"`
+	WispReaper           *WispReaperConfig           `json:"wisp_reaper,omitempty"`
+	DoctorDog            *DoctorDogConfig            `json:"doctor_dog,omitempty"`
+	CompactorDog         *CompactorDogConfig         `json:"compactor_dog,omitempty"`
+	CheckpointDog        *CheckpointDogConfig        `json:"checkpoint_dog,omitempty"`
+	ScheduledMaintenance *ScheduledMaintenanceConfig `json:"scheduled_maintenance,omitempty"`
+	MainBranchTest       *MainBranchTestConfig       `json:"main_branch_test,omitempty"`
+	QuotaDog             *QuotaDogConfig             `json:"quota_dog,omitempty"`
+	RestartTracker       *RestartTrackerConfig       `json:"restart_tracker,omitempty"`
+	Telegraph            *TelegraphServerConfig      `json:"telegraph,omitempty"`
 }
 
 // TelegraphServerConfig holds configuration for the daemon-managed Telegraph subprocess.
@@ -291,14 +291,14 @@ type JsonlGitBackupConfig struct {
 
 // DaemonPatrolConfig is the structure of mayor/daemon.json.
 type DaemonPatrolConfig struct {
-	Type      string            `json:"type"`
-	Version   int               `json:"version"`
-	Heartbeat *PatrolConfig     `json:"heartbeat,omitempty"`
-	Patrols   *PatrolsConfig    `json:"patrols,omitempty"`
+	Type      string         `json:"type"`
+	Version   int            `json:"version"`
+	Heartbeat *PatrolConfig  `json:"heartbeat,omitempty"`
+	Patrols   *PatrolsConfig `json:"patrols,omitempty"`
 	// Env holds environment variables to set at startup.
 	// Propagated to all sessions spawned by the daemon and read by gt up/mayor attach.
 	// Example: {"GT_DOLT_PORT": "43211"}
-	Env       map[string]string `json:"env,omitempty"`
+	Env map[string]string `json:"env,omitempty"`
 }
 
 // PatrolConfigFile returns the path to the patrol config file.
