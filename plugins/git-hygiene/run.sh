@@ -12,6 +12,36 @@ set -euo pipefail
 
 log() { echo "[git-hygiene] $*"; }
 
+# --- SAFETY GUARD (Mayor, 2026-09-05) ----------------------------------------
+# This plugin force-deletes orphan branches (branch -D), clears ALL stashes, and
+# runs gc --prune=now. It has been a silent NO-OP town-wide because it reads
+# 'repo_path' from `gt rig list --json`, a field that no longer exists (current
+# keys: name, beads_prefix, status, witness, refinery, polecats, crew).
+#
+# That means the destructive paths below have not run for an unknown period, so
+# the FIRST successful run would delete an accumulated backlog in one pass.
+# Measured at patch time: 262 polecat/dog/fix refs in gastown alone, across 7
+# rigs. Orphan polecat branches have repeatedly turned out to hold recoverable
+# work, and `stash clear` is unrecoverable.
+#
+# So: destructive mode now requires --destroy explicitly. Without it the script
+# reports what it WOULD remove and changes nothing.
+HYGIENE_AUTHORIZED=false
+for _arg in "$@"; do
+  case "$_arg" in
+    --destroy) HYGIENE_AUTHORIZED=true ;;
+  esac
+done
+if [ "$HYGIENE_AUTHORIZED" != "true" ]; then
+  DRY_RUN=true
+  log "--destroy not supplied; running in REPORT-ONLY mode (no deletions)."
+  log "  Destructive cleanup (branch -D, stash clear, gc --prune) requires --destroy."
+else
+  DRY_RUN=false
+  log "--destroy supplied; destructive cleanup ENABLED."
+fi
+# -----------------------------------------------------------------------------
+
 # --- Enumerate rig repos -----------------------------------------------------
 
 RIG_JSON=$(gt rig list --json 2>/dev/null) || {
@@ -84,7 +114,7 @@ while IFS= read -r REPO_PATH; do
       refinery-patrol|merge/*) continue ;;
     esac
     log "    Deleting merged: $BRANCH"
-    git -C "$REPO_PATH" branch -d "$BRANCH" 2>/dev/null && LOCAL_MERGED=$((LOCAL_MERGED + 1))
+    if [ "$DRY_RUN" = "true" ]; then log "  WOULD delete merged branch: $BRANCH"; LOCAL_MERGED=$((LOCAL_MERGED + 1)); else git -C "$REPO_PATH" branch -d "$BRANCH" 2>/dev/null && LOCAL_MERGED=$((LOCAL_MERGED + 1)); fi
   done <<< "$MERGED_BRANCHES"
   TOTAL_LOCAL_MERGED=$((TOTAL_LOCAL_MERGED + LOCAL_MERGED))
 
@@ -112,7 +142,7 @@ while IFS= read -r REPO_PATH; do
       continue
     fi
     log "    Deleting orphan: $BRANCH"
-    git -C "$REPO_PATH" branch -D "$BRANCH" 2>/dev/null && LOCAL_ORPHAN=$((LOCAL_ORPHAN + 1))
+    if [ "$DRY_RUN" = "true" ]; then log "  WOULD FORCE-delete orphan branch: $BRANCH"; LOCAL_ORPHAN=$((LOCAL_ORPHAN + 1)); else git -C "$REPO_PATH" branch -D "$BRANCH" 2>/dev/null && LOCAL_ORPHAN=$((LOCAL_ORPHAN + 1)); fi
   done <<< "$ALL_BRANCHES"
   TOTAL_LOCAL_ORPHAN=$((TOTAL_LOCAL_ORPHAN + LOCAL_ORPHAN))
 
@@ -152,13 +182,13 @@ while IFS= read -r REPO_PATH; do
   STASH_COUNT=$(git -C "$REPO_PATH" stash list 2>/dev/null | wc -l | tr -d ' ')
   if [ "$STASH_COUNT" -gt 0 ]; then
     log "    Clearing $STASH_COUNT stash(es)"
-    git -C "$REPO_PATH" stash clear 2>/dev/null
+    if [ "$DRY_RUN" = "true" ]; then log "  WOULD clear ALL stashes"; else git -C "$REPO_PATH" stash clear 2>/dev/null; fi
     TOTAL_STASHES=$((TOTAL_STASHES + STASH_COUNT))
   fi
 
   # Step 6: Garbage collect
   log "  Running git gc..."
-  git -C "$REPO_PATH" gc --prune=now --quiet 2>/dev/null && TOTAL_GC=$((TOTAL_GC + 1))
+  if [ "$DRY_RUN" = "true" ]; then log "  WOULD run gc --prune=now"; TOTAL_GC=$((TOTAL_GC + 1)); else git -C "$REPO_PATH" gc --prune=now --quiet 2>/dev/null && TOTAL_GC=$((TOTAL_GC + 1)); fi
 
   log "  Done: $LOCAL_MERGED merged, $LOCAL_ORPHAN orphan, $REMOTE_DELETED remote, $STASH_COUNT stash(es)"
 done <<< "$RIG_PATHS"
