@@ -44,6 +44,15 @@ func TestGithubOwnerRepo(t *testing.T) {
 		// userinfo (and port) and correctly resolves evil.com.
 		{"https://github.com:x@evil.com/repo", "", false},
 		{"ssh://git@github.com:x@evil.com/repo", "", false},
+
+		// gt-7lzz round 3: an '@' or ':' hiding inside the owner or repo
+		// segment of the scp-style path (git@github.com:<path>) must be
+		// refused by ownerRepoRe's charset, not merely by the URL-parsing
+		// path above — githubSCPRe extracts <path> verbatim, so it is
+		// ownerRepoRe alone standing between this and a pass.
+		{"git@github.com:evil@attacker.com/repo", "", false},
+		{"git@github.com:owner/evil@repo.git", "", false},
+		{"git@github.com:own:er/repo", "", false},
 	}
 
 	for _, tt := range tests {
