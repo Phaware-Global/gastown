@@ -161,7 +161,8 @@ MOCK
 # a repo already at parity with what this cycle would export.
 write_git_backup_repo() {
   local sandbox="$1"
-  local seed_content="${2:-{\"id\":\"old\"}}"
+  local seed_content="${2:-}"
+  [[ -z "$seed_content" ]] && seed_content='{"id":"old"}'
   local repo="$sandbox/home/gt/.dolt-archive/git"
   local bare="$sandbox/bare-origin.git"
   git init --quiet --bare "$bare"
