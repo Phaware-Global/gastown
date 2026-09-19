@@ -299,13 +299,15 @@ if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]] || $GIT_FAILE
   RESULT="warning"
 fi
 
-# Report against the total tried, not a ratio that conceals databases that
-# were never in the denominator (e.g. "0/2 succeeded" out of 13 exported).
-# The "with a remote" figure is scoped to exported databases specifically
-# (EXPORTED_DBS_WITH_REMOTE), so it's comparable to $EXPORTED; the raw
-# DBS_WITH_REMOTE total (which also counts never-exported databases) is
-# reported alongside for context, not in place of it.
-SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED)) of $EXPORTED_DBS_WITH_REMOTE/$EXPORTED exported dbs with a remote ($DBS_WITH_REMOTE total dbs with a remote), result=$RESULT"
+# dolt_push's own ratio (DOLT_PUSHED/DOLT_PUSH_FAILED) is attempted across
+# DBS_WITH_REMOTE — every PROD_DBS entry with a remote configured, exported
+# or not. EXPORTED_DBS_WITH_REMOTE/EXPORTED is a separate population (remotes
+# among exported databases only, for the shortfall check above). These two
+# figures must not be joined with "of" — that reads as one ratio nested
+# inside the other's denominator, when they're independently counted and can
+# disagree (e.g. a push succeeding on an unexported db while every exported
+# db lacks a remote). Report them side by side instead, each self-contained.
+SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED)) attempted across $DBS_WITH_REMOTE db(s) with a remote, exported_dbs_with_remote=$EXPORTED_DBS_WITH_REMOTE/$EXPORTED, result=$RESULT"
 log "$SUMMARY"
 
 _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
@@ -356,7 +358,7 @@ if $REMOTE_SHORTFALL; then
   if ! ESCALATE_ERR=$(gt escalate "dolt-archive: only $EXPORTED_DBS_WITH_REMOTE of $EXPORTED exported databases have a dolt remote configured" \
     -s critical \
     --fingerprint "dolt-archive:remote-shortfall" \
-    --reason "$((EXPORTED - EXPORTED_DBS_WITH_REMOTE)) exported database(s) have no dolt remote at all, so dolt push never attempts them. The dolt_push ratio only reports on the $EXPORTED_DBS_WITH_REMOTE that were tried." 2>&1); then
+    --reason "$((EXPORTED - EXPORTED_DBS_WITH_REMOTE)) exported database(s) have no dolt remote at all, so dolt push never attempts them. The dolt_push ratio in the summary covers all $DBS_WITH_REMOTE db(s) with a remote (exported or not), not just these $EXPORTED_DBS_WITH_REMOTE exported one(s)." 2>&1); then
     log "WARN: gt escalate failed:"
     logblock "$ESCALATE_ERR"
   fi
