@@ -98,6 +98,7 @@ mkdir -p "$JSONL_EXPORT_DIR"
 EXPORTED=0
 EXPORT_FAILED=0
 EXPORT_ERRORS=""
+EXPORTED_DBS=()
 
 for DB in "${PROD_DBS[@]}"; do
   EXPORT_FILE="$JSONL_EXPORT_DIR/${DB}-$(date +%Y%m%d-%H%M).jsonl"
@@ -129,6 +130,7 @@ for DB in "${PROD_DBS[@]}"; do
     log "  $DB: exported via SQL ($LINE_COUNT lines)"
     ln -sf "$(basename "$EXPORT_FILE")" "$LATEST_LINK"
     EXPORTED=$((EXPORTED + 1))
+    EXPORTED_DBS+=("$DB")
     rm -f "$QERR"
   else
     CAUSE=$(tr '\n' ' ' < "$QERR"); rm -f "$QERR"
@@ -227,6 +229,7 @@ fi
 DOLT_PUSHED=0
 DOLT_PUSH_FAILED=0
 DBS_WITH_REMOTE=0
+EXPORTED_DBS_WITH_REMOTE=0
 
 if ! $SKIP_DOLT_PUSH; then
   log ""
