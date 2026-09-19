@@ -2,10 +2,12 @@ package plugin
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -237,6 +239,126 @@ func isGastownModule(goModPath string) bool {
 		}
 	}
 	return false
+}
+
+// FindGastownGitDir locates a persistent git checkout of the gastown repo
+// suitable for fetching and archiving origin/main — e.g. <townRoot>/gastown/mayor/rig,
+// the Mayor's long-lived working clone (unlike a polecat worktree, which is
+// nuked on `gt done`).
+//
+// Unlike FindGastownSource, this does NOT require the checkout's working tree
+// to already contain an up-to-date plugins/ directory: SyncFromOrigin reads
+// the plugins/ tree straight out of the checkout's git object store at
+// origin/main, so the checkout's own branch and staleness are irrelevant.
+// This is what lets plugin sync stay correct even when every on-disk
+// checkout has drifted from main (gt-2ea1: the deployed dolt-archive plugin
+// was 3 months stale because every prior mechanism depended on some working
+// tree being kept current, and none was).
+func FindGastownGitDir(townRoot string) (string, error) {
+	if cwd, err := os.Getwd(); err == nil {
+		if dir := findGitDirFromDir(cwd); dir != "" {
+			return dir, nil
+		}
+	}
+
+	candidates := []string{
+		filepath.Join(townRoot, "gastown", "mayor", "rig"),
+		filepath.Join(townRoot, "gastown", "refinery", "rig"),
+		filepath.Join(townRoot, "gastown", "reviewer", "rig"),
+		filepath.Join(townRoot, "gastown", "crew", "den"),
+		filepath.Join(townRoot, "gastown"),
+	}
+	for _, candidate := range candidates {
+		if isGastownModule(filepath.Join(candidate, "go.mod")) {
+			if _, err := os.Stat(filepath.Join(candidate, ".git")); err == nil {
+				return candidate, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("could not locate a gastown git checkout; use --source to specify")
+}
+
+func findGitDirFromDir(dir string) string {
+	current := dir
+	for {
+		if isGastownModule(filepath.Join(current, "go.mod")) {
+			if _, err := os.Stat(filepath.Join(current, ".git")); err == nil {
+				return current
+			}
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+		current = parent
+	}
+	return ""
+}
+
+// SyncFromOrigin fetches origin/main into gitDir and syncs its plugins/ tree
+// into targetDir. It reads the tree directly from git's object store via
+// `git archive`, so it never touches gitDir's working tree or index — the
+// checkout can be sitting on an unrelated or stale branch and this still
+// deploys the true origin/main content.
+func SyncFromOrigin(gitDir, targetDir string, clean bool) (*SyncResult, error) {
+	if err := runGit(gitDir, "fetch", "--quiet", "origin", "main"); err != nil {
+		return nil, fmt.Errorf("fetching origin/main: %w", err)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "gastown-plugin-sync-*")
+	if err != nil {
+		return nil, fmt.Errorf("creating temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if err := archivePluginsTree(gitDir, "origin/main", tmpDir); err != nil {
+		return nil, fmt.Errorf("extracting plugins/ from origin/main: %w", err)
+	}
+
+	sourceDir := filepath.Join(tmpDir, "plugins")
+	if _, err := os.Stat(sourceDir); err != nil {
+		return nil, fmt.Errorf("origin/main has no plugins/ directory")
+	}
+
+	return SyncPlugins(sourceDir, targetDir, clean)
+}
+
+func runGit(dir string, args ...string) error {
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...) //nolint:gosec // G204: fixed subcommand, dir is caller-controlled
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// archivePluginsTree extracts the plugins/ directory at ref from gitDir's
+// object store into destDir, via `git archive | tar -x` — no working tree or
+// checkout involved.
+func archivePluginsTree(gitDir, ref, destDir string) error {
+	gitCmd := exec.Command("git", "-C", gitDir, "archive", ref, "--", "plugins") //nolint:gosec // G204: fixed args, ref/gitDir are caller-controlled
+	tarCmd := exec.Command("tar", "-x", "-C", destDir)                          //nolint:gosec // G204: fixed args
+
+	pipe, err := gitCmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("creating pipe: %w", err)
+	}
+	tarCmd.Stdin = pipe
+
+	var gitErr, tarErr bytes.Buffer
+	gitCmd.Stderr = &gitErr
+	tarCmd.Stderr = &tarErr
+
+	if err := tarCmd.Start(); err != nil {
+		return fmt.Errorf("starting tar: %w", err)
+	}
+	if err := gitCmd.Run(); err != nil {
+		return fmt.Errorf("git archive: %w: %s", err, strings.TrimSpace(gitErr.String()))
+	}
+	if err := tarCmd.Wait(); err != nil {
+		return fmt.Errorf("tar extract: %w: %s", err, strings.TrimSpace(tarErr.String()))
+	}
+	return nil
 }
 
 func hasPlugins(dir string) bool {

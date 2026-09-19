@@ -780,6 +780,20 @@ func (d *Daemon) Run() (err error) {
 		d.logger.Printf("Quota dog ticker started (interval %v)", interval)
 	}
 
+	// Start plugin sync ticker if configured.
+	// Re-deploys <townRoot>/plugins from the gastown repo's plugins/ at
+	// origin/main, so a plugin's running copy cannot drift permanently
+	// from its reviewed source (gt-2ea1).
+	var pluginSyncTicker *time.Ticker
+	var pluginSyncChan <-chan time.Time
+	if d.isPatrolActive("plugin_sync") {
+		interval := pluginSyncInterval(d.patrolConfig)
+		pluginSyncTicker = time.NewTicker(interval)
+		pluginSyncChan = pluginSyncTicker.C
+		defer pluginSyncTicker.Stop()
+		d.logger.Printf("Plugin sync ticker started (interval %v)", interval)
+	}
+
 	// Note: PATCH-010 uses per-session hooks in deacon/manager.go (SetAutoRespawnHook).
 	// Global pane-died hooks don't fire reliably in tmux 3.2a, so we rely on the
 	// per-session approach which has been tested to work for continuous recovery.
@@ -910,6 +924,13 @@ func (d *Daemon) Run() (err error) {
 			// rotates credentials to available accounts via keychain swap.
 			if !d.isShutdownInProgress() {
 				d.runQuotaDog()
+			}
+
+		case <-pluginSyncChan:
+			// Plugin sync — re-deploys <townRoot>/plugins from the gastown
+			// repo's plugins/ at origin/main.
+			if !d.isShutdownInProgress() {
+				d.runPluginSync()
 			}
 
 		case <-timer.C:

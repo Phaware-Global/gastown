@@ -124,6 +124,13 @@ type PatrolsConfig struct {
 	// rail, and a town that never configured it is exactly the town that needs
 	// it. Set {"enabled": false} to opt out.
 	Reviewer       *PatrolConfig          `json:"reviewer,omitempty"`
+	// PluginSync keeps <townRoot>/plugins synced with the gastown repo's
+	// plugins/ directory at origin/main. Like Reviewer, it defaults to
+	// ENABLED when unset: without it, a plugin's deployed copy can silently
+	// drift forever from the reviewed, merged source (gt-2ea1 — the
+	// dolt-archive plugin ran a 3-month-stale copy because nothing else
+	// deployed it, and nobody noticed). Set {"enabled": false} to opt out.
+	PluginSync     *PatrolConfig          `json:"plugin_sync,omitempty"`
 	DoltServer     *DoltServerConfig      `json:"dolt_server,omitempty"`
 	DoltRemotes    *DoltRemotesConfig     `json:"dolt_remotes,omitempty"`
 	DoltBackup     *DoltBackupConfig      `json:"dolt_backup,omitempty"`
@@ -427,6 +434,10 @@ func IsPatrolEnabled(config *DaemonPatrolConfig, patrol string) bool {
 	case constants.RoleReviewer:
 		if config.Patrols.Reviewer != nil {
 			return config.Patrols.Reviewer.Enabled
+		}
+	case "plugin_sync":
+		if config.Patrols.PluginSync != nil {
+			return config.Patrols.PluginSync.Enabled
 		}
 	}
 	return true // Default: enabled
