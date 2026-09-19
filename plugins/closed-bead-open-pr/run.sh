@@ -61,8 +61,10 @@ for RIG in $RIGS; do
       log "FLAG: $RIG/$BEAD_ID closed, PR #$PR_NUM still OPEN, $UNRESOLVED unresolved thread(s)"
     fi
 
-    # Mark checked either way so the same bead isn't rescanned every cycle.
-    bd -C "$RIG_DIR" label add "$BEAD_ID" "flagged:closed-bead-open-pr" 2>/dev/null || true
+    # Mark checked only once the PR state is actually known - a transient
+    # gh failure (rate limit, auth, network) must not permanently hide a
+    # real closed-bead/open-PR case behind this label.
+    [ "$PR_STATE" != "UNKNOWN" ] && bd -C "$RIG_DIR" label add "$BEAD_ID" "flagged:closed-bead-open-pr" 2>/dev/null || true
   done < <(echo "$CANDIDATES" | jq -c '.[]')
 done
 
@@ -96,8 +98,9 @@ BODY2
 fi
 
 SUMMARY="closed-bead-open-pr: ${#FINDINGS[@]} finding(s) this cycle"
-bd create "$SUMMARY" -t chore --ephemeral \
+_rid="$(bd create "$SUMMARY" -t chore --ephemeral \
   -l type:plugin-run,plugin:closed-bead-open-pr,result:success \
-  -d "$SUMMARY" --silent 2>/dev/null || true
+  -d "$SUMMARY" --silent 2>/dev/null)" || true
+[ -n "${_rid:-}" ] && bd close "$_rid" --reason "plugin run recorded" >/dev/null 2>&1 || true
 
 log "$SUMMARY"

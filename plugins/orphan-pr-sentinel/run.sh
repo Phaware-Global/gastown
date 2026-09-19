@@ -19,7 +19,9 @@ shopt -s nullglob
 
 TOWN_ROOT="${GT_TOWN_ROOT:-$HOME/gt}"
 RIGS_JSON_PATH="${TOWN_ROOT}/mayor/rigs.json"
+STATE_FILE="${GT_ORPHAN_PR_SENTINEL_STATE:-$TOWN_ROOT/.orphan-pr-sentinel-state.json}"
 DRY_RUN="${DRY_RUN:-0}"
+ERRORS=0
 
 log() { echo "[orphan-pr-sentinel] $*"; }
 
@@ -73,8 +75,12 @@ for RIG in $RIGS; do
   [ -z "$REPO" ] && continue
 
   PRS=$(gh pr list --repo "$REPO" --state open \
-    --json number,title,statusCheckRollup --limit 100 2>/dev/null)
-  [ -z "$PRS" ] && continue
+    --json number,title,statusCheckRollup,headRefOid --limit 100 2>/dev/null)
+  if [ -z "$PRS" ]; then
+    log "ERROR: gh pr list failed for $RIG ($REPO)"
+    ERRORS=1
+    continue
+  fi
   PR_COUNT=$(echo "$PRS" | jq 'length' 2>/dev/null || echo 0)
   [ "$PR_COUNT" -eq 0 ] && continue
 
@@ -82,22 +88,37 @@ for RIG in $RIGS; do
     [ -z "$PR_JSON" ] && continue
     PR_NUM=$(echo "$PR_JSON" | jq -r '.number')
     PR_TITLE=$(echo "$PR_JSON" | jq -r '.title')
+    PR_HEAD=$(echo "$PR_JSON" | jq -r '.headRefOid // ""')
 
     if is_suppressed "$RIG" "$PR_NUM"; then
       continue
     fi
 
     # Does any OPEN bead in this rig reference "PR #<N>"? bd list defaults
-    # to excluding closed issues.
+    # to excluding closed issues. Match on a number boundary so "PR #23"
+    # doesn't also match "PR #231", and treat a non-numeric result (bd
+    # hang/error) as a query failure rather than "zero owners".
     OWNERS_JSON=$(bd -C "$RIG_DIR" list --title-contains "PR #$PR_NUM" --json --limit 5 2>/dev/null)
-    OWNER_COUNT=$(echo "$OWNERS_JSON" | jq 'length' 2>/dev/null || echo 0)
+    OWNER_COUNT=$(echo "$OWNERS_JSON" | jq --arg n "$PR_NUM" \
+      '[.[] | select((.title // "") | test("PR #" + $n + "([^0-9]|$)"))] | length' 2>/dev/null)
+    if ! [[ "$OWNER_COUNT" =~ ^[0-9]+$ ]]; then
+      log "ERROR: bd title query failed for $RIG PR #$PR_NUM"
+      ERRORS=1
+      continue
+    fi
     if [ "$OWNER_COUNT" != "0" ]; then
       continue
     fi
     # Title match can miss a bead that only mentions the PR in its
     # description (e.g. "This is that bead" style follow-ups) - check too.
     DESC_OWNERS=$(bd -C "$RIG_DIR" list --desc-contains "PR #$PR_NUM" --json --limit 5 2>/dev/null)
-    DESC_OWNER_COUNT=$(echo "$DESC_OWNERS" | jq 'length' 2>/dev/null || echo 0)
+    DESC_OWNER_COUNT=$(echo "$DESC_OWNERS" | jq --arg n "$PR_NUM" \
+      '[.[] | select((.description // "") | test("PR #" + $n + "([^0-9]|$)"))] | length' 2>/dev/null)
+    if ! [[ "$DESC_OWNER_COUNT" =~ ^[0-9]+$ ]]; then
+      log "ERROR: bd desc query failed for $RIG PR #$PR_NUM"
+      ERRORS=1
+      continue
+    fi
     if [ "$DESC_OWNER_COUNT" != "0" ]; then
       continue
     fi
@@ -110,7 +131,17 @@ for RIG in $RIGS; do
     )] | length > 0' 2>/dev/null || echo "false")
 
     if { [ "$UNRESOLVED" != "0" ] && [ "$UNRESOLVED" != "?" ]; } || [ "$CI_FAILING" = "true" ]; then
-      FINDINGS+=("$RIG|$PR_NUM|$UNRESOLVED|$CI_FAILING|$PR_TITLE")
+      # Attacker-controlled title: this repo is public, so any GitHub user
+      # can open a PR and its title is untrusted input to the mayor/witness
+      # LLM inboxes below. Only forward the real title for a known insider;
+      # withhold it for anyone else. Checked only for actual candidates
+      # (post ownership/unresolved filtering), not every open PR.
+      PR_ASSOC=$(gh api "repos/$REPO/pulls/$PR_NUM" --jq '.author_association // "NONE"' 2>/dev/null)
+      case "$PR_ASSOC" in
+        OWNER|MEMBER|COLLABORATOR) ;;
+        *) PR_TITLE="(external PR — title withheld, untrusted author)" ;;
+      esac
+      FINDINGS+=("$RIG|$PR_NUM|$UNRESOLVED|$CI_FAILING|$PR_TITLE|$PR_HEAD")
       # Report the FACT ("no bead references it"), not the conclusion
       # ("orphaned") - the PR may still be owned out-of-band (e.g. by the
       # overseer), which this check structurally cannot see. Mayor
@@ -126,19 +157,44 @@ log ""
 log "=== ${#FINDINGS[@]} PR(s) with no owning bead (not necessarily orphaned) ==="
 
 if [ "${#FINDINGS[@]}" -gt 0 ]; then
+  STATE=$([ -f "$STATE_FILE" ] && cat "$STATE_FILE" 2>/dev/null)
+  [ -z "$STATE" ] && STATE="{}"
+  NOW=$(date +%s)
+
   BODY="rig|PR|unresolved|ci_failing|title"$'\n'
+  MAIL_BODY="rig|PR|unresolved|ci_failing|title"$'\n'
+  TO_MAIL=()
   for F in "${FINDINGS[@]}"; do
-    IFS='|' read -r RIG PR_NUM UNRESOLVED CI_FAILING TITLE <<< "$F"
+    IFS='|' read -r RIG PR_NUM UNRESOLVED CI_FAILING TITLE PR_HEAD <<< "$F"
     BODY+="$RIG|#$PR_NUM|$UNRESOLVED|$CI_FAILING|$TITLE"$'\n'
+
+    # Dedupe per rig/PR/head SHA: only mail when the PR is new to state, its
+    # head moved, or the last report is more than 24h old. Repeats are
+    # logged but not mailed, so a stuck orphan doesn't spam a permanent
+    # mail bead every cooldown cycle.
+    KEY="$RIG:$PR_NUM"
+    PREV_SHA=$(echo "$STATE" | jq -r --arg k "$KEY" '.[$k].sha // ""' 2>/dev/null)
+    PREV_TS=$(echo "$STATE" | jq -r --arg k "$KEY" '.[$k].ts // 0' 2>/dev/null)
+    [[ "$PREV_TS" =~ ^[0-9]+$ ]] || PREV_TS=0
+    if [ -n "$PR_HEAD" ] && [ "$PREV_SHA" = "$PR_HEAD" ] && [ $(( NOW - PREV_TS )) -lt 86400 ]; then
+      log "SKIP-DEDUPE: $RIG PR #$PR_NUM already reported at this head within 24h"
+      continue
+    fi
+    MAIL_BODY+="$RIG|#$PR_NUM|$UNRESOLVED|$CI_FAILING|$TITLE"$'\n'
+    TO_MAIL+=("$F")
+    STATE=$(echo "$STATE" | jq --arg k "$KEY" --arg sha "$PR_HEAD" --argjson ts "$NOW" \
+      '.[$k] = {"sha": $sha, "ts": $ts}' 2>/dev/null)
   done
 
   if [ "$DRY_RUN" = "1" ]; then
-    log "DRY_RUN=1 - not sending mail. Would have sent:"
+    log "DRY_RUN=1 - not sending mail. Would have sent (full findings, dedupe not applied):"
     echo "$BODY"
+  elif [ "${#TO_MAIL[@]}" -eq 0 ]; then
+    log "All findings already reported recently - nothing new to mail"
   else
-    gt mail send mayor/ -s "orphan-pr-sentinel: ${#FINDINGS[@]} PR(s) with no owning bead" --stdin <<< "$BODY"
-    for F in "${FINDINGS[@]}"; do
-      IFS='|' read -r RIG PR_NUM UNRESOLVED CI_FAILING TITLE <<< "$F"
+    gt mail send mayor/ -s "orphan-pr-sentinel: ${#TO_MAIL[@]} PR(s) with no owning bead" --stdin <<< "$MAIL_BODY"
+    for F in "${TO_MAIL[@]}"; do
+      IFS='|' read -r RIG PR_NUM UNRESOLVED CI_FAILING TITLE PR_HEAD <<< "$F"
       gt mail send "$RIG/witness" -s "orphan-pr-sentinel: PR #$PR_NUM has no open bead" --stdin <<BODY2
 PR #$PR_NUM ($TITLE) is open with $UNRESOLVED unresolved thread(s)
 (ci_failing=$CI_FAILING) and no open bead in this rig references it - that is
@@ -148,14 +204,22 @@ Confirm nobody already has it in flight before filing/claiming - do not
 dispatch on this alone. Visibility only. Mayor has the full table.
 BODY2
     done
+    echo "$STATE" > "$STATE_FILE" 2>/dev/null || true
   fi
 else
-  log "Clean: every open PR with unresolved work or failing CI has an open bead owning it"
+  if [ "$ERRORS" = "1" ]; then
+    log "Incomplete: bd/gh query failures occurred this cycle - skipping 'Clean' determination"
+  else
+    log "Clean: every open PR with unresolved work or failing CI has an open bead owning it"
+  fi
 fi
 
 if [ "$DRY_RUN" != "1" ]; then
+  RESULT="success"
+  [ "$ERRORS" = "1" ] && RESULT="failure"
   SUMMARY="orphan-pr-sentinel: ${#FINDINGS[@]} orphan(s) this cycle"
-  bd create "$SUMMARY" -t chore --ephemeral \
-    -l type:plugin-run,plugin:orphan-pr-sentinel,result:success \
-    -d "$SUMMARY" --silent 2>/dev/null || true
+  _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
+    -l "type:plugin-run,plugin:orphan-pr-sentinel,result:$RESULT" \
+    -d "$SUMMARY" --silent 2>/dev/null)" || true
+  [ -n "${_rid:-}" ] && bd close "$_rid" --reason "plugin run recorded" >/dev/null 2>&1 || true
 fi
