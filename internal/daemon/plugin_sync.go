@@ -1,11 +1,17 @@
 package daemon
 
 import (
+	"context"
 	"path/filepath"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/plugin"
 )
+
+// pluginSyncGitTimeout bounds a single runPluginSync cycle's git work
+// (fetch + rev-parse + archive). Tied to d.ctx so daemon shutdown cancels an
+// in-flight sync immediately rather than waiting out the full timeout.
+const pluginSyncGitTimeout = 3 * time.Minute
 
 // defaultPluginSyncInterval controls how often the daemon re-deploys
 // <townRoot>/plugins from the gastown repo's plugins/ directory at
@@ -35,7 +41,17 @@ func pluginSyncInterval(config *DaemonPatrolConfig) time.Duration {
 // the repo would silently regress production to older, unfixed code. Only
 // add a plugin here after confirming its production copy has no
 // uncommitted fix — see gt-bpew for the full audit and remaining plugins.
-var syncedPlugins = []string{"dolt-archive"}
+//
+// Currently empty: dolt-archive was the intended first entry (gt-2ea1), but
+// its own deployed copy turned out to have the same reverse-drift problem —
+// PROD_DBS narrowed to ("hq") because "gt"/"mo" were never real database
+// names, a bd export invocation fixed to use -C with the right rig root
+// instead of a nonexistent --db name flag, and a "KNOWN ISSUE: do not
+// escalate (hq-wisp-2egq1)" block in plugin.md — none of which are on
+// origin/main (PR #236 review). Syncing origin/main over it would silently
+// revert those fixes on the very first daemon tick. Add "dolt-archive" back
+// here only once that gap is backported to main as real commits.
+var syncedPlugins = []string{}
 
 // runPluginSync keeps syncedPlugins in <townRoot>/plugins matched to the
 // gastown repo's plugins/ tree at origin/main. Non-fatal: errors are logged
@@ -52,6 +68,12 @@ func (d *Daemon) runPluginSync() {
 	if !d.isPatrolActive("plugin_sync") {
 		return
 	}
+	if len(syncedPlugins) == 0 {
+		// Nothing allowlisted yet — see syncedPlugins' doc comment. Skip
+		// silently rather than calling SyncFromOrigin just to hit its
+		// empty-list error every cycle.
+		return
+	}
 
 	townRoot := d.config.TownRoot
 	gitDir, err := plugin.FindGastownGitDir(townRoot)
@@ -60,8 +82,11 @@ func (d *Daemon) runPluginSync() {
 		return
 	}
 
+	ctx, cancel := context.WithTimeout(d.ctx, pluginSyncGitTimeout)
+	defer cancel()
+
 	targetDir := filepath.Join(townRoot, "plugins")
-	result, err := plugin.SyncFromOrigin(gitDir, targetDir, syncedPlugins, false)
+	result, err := plugin.SyncFromOrigin(ctx, gitDir, targetDir, syncedPlugins, false)
 	if err != nil {
 		d.logger.Printf("plugin_sync: sync from %s failed: %v", gitDir, err)
 		return

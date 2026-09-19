@@ -66,3 +66,22 @@ func TestRunPluginSync_SkipsWhenDisabled(t *testing.T) {
 	}
 	d.runPluginSync() // must return without touching the filesystem or panicking
 }
+
+// TestRunPluginSync_SkipsWhenAllowlistEmpty is the regression guard for the
+// PR #236 review finding: dolt-archive's deployed copy carries prod fixes
+// that are not on origin/main, so syncedPlugins must stay empty until those
+// are backported (see its doc comment). This locks in that runPluginSync
+// no-ops on an empty allowlist instead of calling FindGastownGitDir/
+// SyncFromOrigin — which, with the patrol enabled by default, would
+// otherwise run (and fail loudly every cycle) as soon as this test's zero
+// values satisfy isPatrolActive.
+func TestRunPluginSync_SkipsWhenAllowlistEmpty(t *testing.T) {
+	if len(syncedPlugins) != 0 {
+		t.Fatalf("expected syncedPlugins to be empty pending gt-bpew backport, got %v", syncedPlugins)
+	}
+	d := &Daemon{
+		config: &Config{TownRoot: t.TempDir()},
+		logger: log.New(io.Discard, "", 0),
+	}
+	d.runPluginSync() // must return without touching the filesystem, network, or d.ctx
+}

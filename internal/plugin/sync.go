@@ -3,6 +3,7 @@ package plugin
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -10,6 +11,16 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
+)
+
+// fetchTimeout and archiveTimeout bound the git subprocesses SyncFromOrigin
+// runs. Without a deadline, a stalled network fetch blocks whichever
+// goroutine calls SyncFromOrigin indefinitely — in the daemon's case, that
+// goroutine also needs to notice shutdown promptly (PR #236 review).
+const (
+	fetchTimeout   = 2 * time.Minute
+	archiveTimeout = 1 * time.Minute
 )
 
 // SyncResult records the outcome of a plugin sync operation.
@@ -310,13 +321,29 @@ func findGitDirFromDir(dir string) string {
 // Blanket-syncing from repo->target would silently overwrite those with
 // older, unfixed code. Callers must name only the plugins they've verified
 // are safe to make repo-authoritative.
-func SyncFromOrigin(gitDir, targetDir string, pluginNames []string, clean bool) (*SyncResult, error) {
+func SyncFromOrigin(ctx context.Context, gitDir, targetDir string, pluginNames []string, clean bool) (*SyncResult, error) {
 	if len(pluginNames) == 0 {
 		return nil, fmt.Errorf("no plugin names specified — refusing to sync all plugins blindly")
 	}
 
-	if err := runGit(gitDir, "fetch", "--quiet", "origin", "main"); err != nil {
+	fetchCtx, cancel := context.WithTimeout(ctx, fetchTimeout)
+	defer cancel()
+	// Fetch only refs/heads/main, into the fully-qualified tracking ref, via
+	// an explicit refspec — never the ambiguous short name "origin/main".
+	// git's short-name DWIM resolution checks refs/tags/<name> before
+	// refs/remotes/<name>, so anyone who can push a tag named "origin/main"
+	// could otherwise have it resolved and deployed to every plugin
+	// directory in town, bypassing main's branch protection entirely
+	// (PR #236 review).
+	if err := runGit(fetchCtx, gitDir, "fetch", "--quiet", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main"); err != nil {
 		return nil, fmt.Errorf("fetching origin/main: %w", err)
+	}
+
+	revCtx, revCancel := context.WithTimeout(ctx, archiveTimeout)
+	defer revCancel()
+	sha, err := revParse(revCtx, gitDir, "refs/remotes/origin/main")
+	if err != nil {
+		return nil, fmt.Errorf("resolving origin/main: %w", err)
 	}
 
 	tmpDir, err := os.MkdirTemp("", "gastown-plugin-sync-*")
@@ -325,8 +352,12 @@ func SyncFromOrigin(gitDir, targetDir string, pluginNames []string, clean bool) 
 	}
 	defer os.RemoveAll(tmpDir)
 
-	if err := archivePluginsTree(gitDir, "origin/main", tmpDir, pluginNames); err != nil {
-		return nil, fmt.Errorf("extracting plugins/ from origin/main: %w", err)
+	archiveCtx, archiveCancel := context.WithTimeout(ctx, archiveTimeout)
+	defer archiveCancel()
+	// Archive the resolved SHA, not a ref name: once resolved, there is no
+	// remaining name for a tag to shadow.
+	if err := archivePluginsTree(archiveCtx, gitDir, sha, tmpDir, pluginNames); err != nil {
+		return nil, fmt.Errorf("extracting plugins/ from origin/main (%s): %w", sha, err)
 	}
 
 	sourceDir := filepath.Join(tmpDir, "plugins")
@@ -337,24 +368,57 @@ func SyncFromOrigin(gitDir, targetDir string, pluginNames []string, clean bool) 
 	return SyncPlugins(sourceDir, targetDir, clean)
 }
 
-func runGit(dir string, args ...string) error {
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...) //nolint:gosec // G204: fixed subcommand, dir is caller-controlled
+// gitSubprocessEnv returns the environment for a git child process, with
+// terminal credential prompts disabled — a daemon has no terminal to prompt,
+// so without this a git call against a remote requiring auth would hang
+// instead of failing fast.
+func gitSubprocessEnv() []string {
+	return append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+}
+
+// gitWaitDelay bounds how long Wait() blocks on I/O cleanup after a git/tar
+// subprocess exits or is killed via context cancellation — without it, a
+// grandchild process holding the stdout/stderr pipe open could hang Wait()
+// past the context deadline that was supposed to bound the whole call.
+const gitWaitDelay = 10 * time.Second
+
+func runGit(ctx context.Context, dir string, args ...string) error {
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...) //nolint:gosec // G204: fixed subcommand, dir is caller-controlled
+	cmd.Env = gitSubprocessEnv()
+	cmd.WaitDelay = gitWaitDelay
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
 
+// revParse resolves ref to a commit SHA via `git rev-parse --verify`.
+func revParse(ctx context.Context, dir, ref string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--verify", ref) //nolint:gosec // G204: fixed subcommand, dir/ref are caller-controlled
+	cmd.Env = gitSubprocessEnv()
+	cmd.WaitDelay = gitWaitDelay
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
 // archivePluginsTree extracts the named plugins/<name> directories at ref
 // from gitDir's object store into destDir, via `git archive | tar -x` — no
 // working tree or checkout involved.
-func archivePluginsTree(gitDir, ref, destDir string, pluginNames []string) error {
+func archivePluginsTree(ctx context.Context, gitDir, ref, destDir string, pluginNames []string) error {
 	args := []string{"-C", gitDir, "archive", ref, "--"}
 	for _, name := range pluginNames {
 		args = append(args, filepath.Join("plugins", name))
 	}
-	gitCmd := exec.Command("git", args...)             //nolint:gosec // G204: fixed subcommand, args are caller-controlled plugin names
-	tarCmd := exec.Command("tar", "-x", "-C", destDir) //nolint:gosec // G204: fixed args
+	gitCmd := exec.CommandContext(ctx, "git", args...)             //nolint:gosec // G204: fixed subcommand, args are caller-controlled plugin names
+	tarCmd := exec.CommandContext(ctx, "tar", "-x", "-C", destDir) //nolint:gosec // G204: fixed args
+	gitCmd.Env = gitSubprocessEnv()
+	gitCmd.WaitDelay = gitWaitDelay
+	tarCmd.WaitDelay = gitWaitDelay
 
 	pipe, err := gitCmd.StdoutPipe()
 	if err != nil {
@@ -369,11 +433,17 @@ func archivePluginsTree(gitDir, ref, destDir string, pluginNames []string) error
 	if err := tarCmd.Start(); err != nil {
 		return fmt.Errorf("starting tar: %w", err)
 	}
-	if err := gitCmd.Run(); err != nil {
-		return fmt.Errorf("git archive: %w: %s", err, strings.TrimSpace(gitErr.String()))
+	gitRunErr := gitCmd.Run()
+	// Always wait on tar, even when git archive failed: git holds tar's
+	// stdin pipe, so tar sees EOF and exits once git exits either way.
+	// Skipping this on the error path leaked a zombie tar process on every
+	// failed sync tick in the long-lived daemon (PR #236 review).
+	tarWaitErr := tarCmd.Wait()
+	if gitRunErr != nil {
+		return fmt.Errorf("git archive: %w: %s", gitRunErr, strings.TrimSpace(gitErr.String()))
 	}
-	if err := tarCmd.Wait(); err != nil {
-		return fmt.Errorf("tar extract: %w: %s", err, strings.TrimSpace(tarErr.String()))
+	if tarWaitErr != nil {
+		return fmt.Errorf("tar extract: %w: %s", tarWaitErr, strings.TrimSpace(tarErr.String()))
 	}
 	return nil
 }
