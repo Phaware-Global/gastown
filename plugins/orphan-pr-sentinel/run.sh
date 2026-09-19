@@ -201,9 +201,7 @@ if [ "${#FINDINGS[@]}" -gt 0 ]; then
       for F in "${TO_MAIL[@]}"; do
         IFS='|' read -r RIG PR_NUM UNRESOLVED CI_FAILING PR_HEAD TITLE <<< "$F"
         KEY="$RIG:$PR_NUM"
-        STATE=$(echo "$STATE" | jq --arg k "$KEY" --arg sha "$PR_HEAD" --argjson ts "$NOW" \
-          '.[$k] = {"sha": $sha, "ts": $ts}' 2>/dev/null)
-        gt mail send "$RIG/witness" -s "orphan-pr-sentinel: PR #$PR_NUM has no open bead" --stdin <<BODY2
+        if gt mail send "$RIG/witness" -s "orphan-pr-sentinel: PR #$PR_NUM has no open bead" --stdin <<BODY2
 PR #$PR_NUM ($TITLE) is open with $UNRESOLVED unresolved thread(s)
 (ci_failing=$CI_FAILING) and no open bead in this rig references it - that is
 the verified FACT. It does NOT mean the PR is abandoned: it could be owned
@@ -211,6 +209,13 @@ out-of-band (e.g. by the overseer), which this check structurally cannot see.
 Confirm nobody already has it in flight before filing/claiming - do not
 dispatch on this alone. Visibility only. Mayor has the full table.
 BODY2
+        then
+          STATE=$(echo "$STATE" | jq --arg k "$KEY" --arg sha "$PR_HEAD" --argjson ts "$NOW" \
+            '.[$k] = {"sha": $sha, "ts": $ts}' 2>/dev/null)
+        else
+          log "ERROR: witness mail failed for $RIG PR #$PR_NUM"
+          ERRORS=1
+        fi
       done
       echo "$STATE" > "$STATE_FILE" 2>/dev/null || true
     else
