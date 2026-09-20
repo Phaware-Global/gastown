@@ -151,6 +151,14 @@ fi
 
 Push production databases to GitHub/DoltHub remotes via `dolt push`.
 
+**Visibility guard (see `visibility_guard.sh`, gt-v3df):** before pushing any
+remote, run.sh resolves it to a GitHub `owner/repo` and checks its visibility
+via `gh api`. Push proceeds only when the repo is confirmed **private**. A
+public repo, a non-GitHub remote (including DoltHub), a missing `gh`, or a
+failed lookup all refuse to push — fail closed, not fail open. A refusal is
+logged, counted separately from a normal push failure, escalated with a
+fingerprint, and surfaced in the cycle summary as `dolt_push_refused`.
+
 ```bash
 echo "=== Dolt Push ==="
 DOLT_PUSHED=0
