@@ -102,6 +102,7 @@ mkdir -p "$JSONL_EXPORT_DIR"
 EXPORTED=0
 EXPORT_FAILED=0
 EXPORT_ERRORS=""
+EXPORTED_DBS=()
 
 for DB in "${PROD_DBS[@]}"; do
   EXPORT_FILE="$JSONL_EXPORT_DIR/${DB}-$(date +%Y%m%d-%H%M).jsonl"
@@ -133,6 +134,7 @@ for DB in "${PROD_DBS[@]}"; do
     log "  $DB: exported via SQL ($LINE_COUNT lines)"
     ln -sf "$(basename "$EXPORT_FILE")" "$LATEST_LINK"
     EXPORTED=$((EXPORTED + 1))
+    EXPORTED_DBS+=("$DB")
     rm -f "$QERR"
   else
     CAUSE=$(tr '\n' ' ' < "$QERR"); rm -f "$QERR"
@@ -158,6 +160,7 @@ log "JSONL export: $EXPORTED succeeded, $EXPORT_FAILED failed"
 
 GIT_PUSHED=false
 GIT_FAILED=false
+GIT_REPO_MISSING=false
 
 if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   log ""
@@ -206,8 +209,15 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   # cycle committed something. A commit stranded by an earlier failed push
   # (e.g. a network blip) must still be retried on a later cycle, even one
   # that stages nothing new itself.
-  if [[ -n "$(git rev-list origin/main..HEAD 2>/dev/null)" ]]; then
-    if git remote get-url origin > /dev/null 2>&1; then
+  #
+  # `git rev-list origin/main..HEAD` exits non-zero with EMPTY stdout when
+  # origin isn't configured, or refs/remotes/origin/main doesn't exist —
+  # indistinguishable, once stderr is discarded, from a genuine "nothing
+  # ahead". Check its own exit status instead of just testing the (possibly
+  # error-empty) output, so a missing push destination reads as a failure
+  # rather than the misleading all-clear.
+  if AHEAD="$(git rev-list origin/main..HEAD 2>&1)"; then
+    if [[ -n "$AHEAD" ]]; then
       if PUSH_ERR=$(git push origin main 2>&1); then
         GIT_PUSHED=true
         log "Pushed to GitHub"
@@ -216,18 +226,23 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
         logblock "$(printf '%s' "$PUSH_ERR" | redact)"
         GIT_FAILED=true
       fi
-    else
-      log "WARN: No git remote configured for backup repo"
     fi
+  else
+    log "WARN: Cannot determine git push status (no origin remote, or missing refs/remotes/origin/main):"
+    logblock "$(printf '%s' "$AHEAD" | redact)"
+    GIT_FAILED=true
   fi
 elif ! $SKIP_GIT; then
   log "No git backup repo at $BACKUP_REPO — skipping git push"
+  GIT_REPO_MISSING=true
 fi
 
 # --- Step 3: Dolt native push ------------------------------------------------
 
 DOLT_PUSHED=0
 DOLT_PUSH_FAILED=0
+DBS_WITH_REMOTE=0
+EXPORTED_DBS_WITH_REMOTE=0
 DOLT_PUSH_REFUSED=0
 DOLT_REFUSAL_DETAIL=""
 
@@ -249,6 +264,16 @@ if ! $SKIP_DOLT_PUSH; then
       continue
     fi
 
+    DBS_WITH_REMOTE=$((DBS_WITH_REMOTE + 1))
+    # Population for the shortfall check below must match EXPORTED (databases
+    # actually exported), not all databases with a remote — a never-exported
+    # db with a remote must not mask an exported db that lacks one.
+    for _exported_db in "${EXPORTED_DBS[@]:-}"; do
+      if [[ "$_exported_db" == "$DB" ]]; then
+        EXPORTED_DBS_WITH_REMOTE=$((EXPORTED_DBS_WITH_REMOTE + 1))
+        break
+      fi
+    done
     log "  $DB: pushing to remotes..."
     cd "$DB_DIR"
 
@@ -292,15 +317,65 @@ fi
 log ""
 log "=== Archive Cycle Complete ==="
 
+# A remote-configured count (among EXPORTED databases specifically) below
+# the exported count means some exported databases were never even
+# attempted by dolt push — they can't show up in DOLT_PUSH_FAILED because
+# they were never tried. Compared against EXPORTED_DBS_WITH_REMOTE, not the
+# raw DBS_WITH_REMOTE total, since that total also counts databases that
+# were never exported and would otherwise mask a shortfall among the ones
+# that were. Only meaningful when dolt push actually ran this cycle.
+REMOTE_SHORTFALL=false
+if ! $SKIP_DOLT_PUSH && [[ "$EXPORTED_DBS_WITH_REMOTE" -lt "$EXPORTED" ]]; then
+  REMOTE_SHORTFALL=true
+fi
+
 RESULT="success"
-if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_REFUSED" -gt 0 ]] || $GIT_FAILED; then
+if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_REFUSED" -gt 0 ]] || $GIT_FAILED || $GIT_REPO_MISSING || $REMOTE_SHORTFALL; then
   RESULT="warning"
 fi
 
-# dolt_push's denominator includes refused attempts too — a refusal is not
-# the same as "nothing to push" and must show up as a shortfall here, not
-# vanish into the count of things that just weren't attempted.
-SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), git=${GIT_PUSHED}, dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED + DOLT_PUSH_REFUSED)), dolt_push_refused=$DOLT_PUSH_REFUSED, result=$RESULT"
+# dolt_push's own ratio (DOLT_PUSHED/DOLT_PUSH_FAILED/DOLT_PUSH_REFUSED) is
+# attempted across DBS_WITH_REMOTE — every PROD_DBS entry with a remote
+# configured, exported or not. A refusal is not the same as "nothing to
+# push" — it must show up in the denominator as an attempted-but-blocked
+# push, not vanish into the count of things that just weren't attempted —
+# but it is also not the same as a FAILED push (the guard working as
+# intended), so it gets its own explicit token rather than folding into
+# DOLT_PUSH_FAILED. EXPORTED_DBS_WITH_REMOTE/EXPORTED is a separate
+# population (remotes among exported databases only, for the shortfall check
+# above). These figures must not be joined with "of" — that reads as one
+# ratio nested inside the other's denominator, when they're independently
+# counted and can disagree (e.g. a push succeeding on an unexported db while
+# every exported db lacks a remote). Report them side by side instead, each
+# self-contained. Both figures come from the Dolt Push loop, which never
+# runs under --skip-dolt-push — reporting them as 0 there would read as
+# "checked, found none" rather than "not checked", so state that the step
+# was skipped instead.
+if $SKIP_DOLT_PUSH; then
+  DOLT_PUSH_CLAUSE="dolt_push=skipped"
+else
+  DOLT_PUSH_CLAUSE="dolt_push=$DOLT_PUSHED/$((DOLT_PUSHED + DOLT_PUSH_FAILED + DOLT_PUSH_REFUSED)) attempted across $DBS_WITH_REMOTE db(s) with a remote, dolt_push_refused=$DOLT_PUSH_REFUSED, exported_dbs_with_remote=$EXPORTED_DBS_WITH_REMOTE/$EXPORTED"
+fi
+
+# git=true/false collapsed four different states into one token: skipped
+# (--skip-git), missing (no backup repo at $BACKUP_REPO), failed (add/commit/
+# push error), and nothing-to-push (repo present, nothing ahead of
+# origin/main) all read as "false". Same vocabulary as dolt_push's own
+# skipped/attempted distinction above. Checked in priority order: a push that
+# actually succeeded wins even if an earlier step in the same cycle failed.
+if $SKIP_GIT; then
+  GIT_CLAUSE="git=skipped"
+elif $GIT_REPO_MISSING; then
+  GIT_CLAUSE="git=missing"
+elif $GIT_PUSHED; then
+  GIT_CLAUSE="git=pushed"
+elif $GIT_FAILED; then
+  GIT_CLAUSE="git=failed"
+else
+  GIT_CLAUSE="git=nothing-to-push"
+fi
+
+SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), $GIT_CLAUSE, $DOLT_PUSH_CLAUSE, result=$RESULT"
 log "$SUMMARY"
 if [[ "$DOLT_PUSH_REFUSED" -gt 0 ]]; then
   log "  Refused (unsafe destination): $DOLT_REFUSAL_DETAIL"
@@ -315,6 +390,46 @@ if [[ "$EXPORT_FAILED" -gt 0 ]]; then
   if ! ESCALATE_ERR=$(gt escalate "dolt-archive: JSONL export failed for $EXPORT_FAILED databases ($EXPORT_ERRORS)" \
     -s critical \
     --reason "JSONL is our last-resort recovery layer. Failed databases: $EXPORT_ERRORS" 2>&1); then
+    log "WARN: gt escalate failed:"
+    logblock "$ESCALATE_ERR"
+  fi
+fi
+
+if [[ "$DOLT_PUSH_FAILED" -gt 0 ]]; then
+  if ! ESCALATE_ERR=$(gt escalate "dolt-archive: dolt push failed for $DOLT_PUSH_FAILED remote(s)" \
+    -s critical \
+    --fingerprint "dolt-archive:dolt-push-failed" \
+    --reason "Native Dolt replication did not reach $DOLT_PUSH_FAILED remote(s) this cycle. The data did not leave this machine via that path." 2>&1); then
+    log "WARN: gt escalate failed:"
+    logblock "$ESCALATE_ERR"
+  fi
+fi
+
+if $GIT_FAILED; then
+  if ! ESCALATE_ERR=$(gt escalate "dolt-archive: git backup add/commit/push failed" \
+    -s critical \
+    --fingerprint "dolt-archive:git-backup-failed" \
+    --reason "A git add, commit, or push to the backup repo at $BACKUP_REPO failed this cycle. The JSONL snapshot did not reach the offsite git backup via this path this cycle. See plugin logs for the specific git error." 2>&1); then
+    log "WARN: gt escalate failed:"
+    logblock "$ESCALATE_ERR"
+  fi
+fi
+
+if $GIT_REPO_MISSING; then
+  if ! ESCALATE_ERR=$(gt escalate "dolt-archive: no git backup repo at $BACKUP_REPO" \
+    -s critical \
+    --fingerprint "dolt-archive:git-repo-missing" \
+    --reason "The git-backup path is entirely a no-op with no repo at $BACKUP_REPO — JSONL snapshots are not leaving this machine via git." 2>&1); then
+    log "WARN: gt escalate failed:"
+    logblock "$ESCALATE_ERR"
+  fi
+fi
+
+if $REMOTE_SHORTFALL; then
+  if ! ESCALATE_ERR=$(gt escalate "dolt-archive: only $EXPORTED_DBS_WITH_REMOTE of $EXPORTED exported databases have a dolt remote configured" \
+    -s critical \
+    --fingerprint "dolt-archive:remote-shortfall" \
+    --reason "$((EXPORTED - EXPORTED_DBS_WITH_REMOTE)) exported database(s) have no dolt remote at all, so dolt push never attempts them. The dolt_push ratio in the summary covers all $DBS_WITH_REMOTE db(s) with a remote (exported or not), not just these $EXPORTED_DBS_WITH_REMOTE exported one(s)." 2>&1); then
     log "WARN: gt escalate failed:"
     logblock "$ESCALATE_ERR"
   fi
