@@ -28,6 +28,13 @@ COMMIT_THRESHOLD="${COMMIT_THRESHOLD:-2000}"
 DEFAULT_DBS="auto"
 DRY_RUN=false
 CHECK_ONLY=false
+# MAYOR SAFETY GATE 2026-09-03: destructive compaction requires an explicit
+# --compact. A flagless invocation previously soft-reset to root, flattened
+# history and force-pushed every production DB over the threshold, while the
+# daemon dispatch template described that same command as "monitor and
+# escalate". A dog ran it twice; the second run was safe only because every DB
+# happened to sit at <=93 commits. Refuse loudly rather than destroy quietly.
+COMPACT_AUTHORIZED=false
 LOGFILE=""
 LOCKFILE="/tmp/compactor-dog.lock"
 
@@ -39,17 +46,32 @@ while [[ $# -gt 0 ]]; do
     --databases)   DEFAULT_DBS="$2"; shift 2 ;;
     --dry-run)     DRY_RUN=true; shift ;;
     --check-only)  CHECK_ONLY=true; shift ;;
+    --compact)     COMPACT_AUTHORIZED=true; shift ;;
     --help|-h)
       echo "Usage: $0 [--threshold N] [--databases db1,db2,...] [--dry-run] [--check-only]"
       echo "  --threshold N        Commit count before compaction (default: 2000)"
       echo "  --databases db1,...  Comma-separated database list (default: auto-discover)"
       echo "  --dry-run            Report only, don't compact"
       echo "  --check-only         Monitor and report only (no compaction)"
+      echo "  --compact            REQUIRED to actually compact. Destructive:"
+      echo "                       flattens history and force-pushes remote main."
+      echo "                       Without it, this script reports and exits."
       exit 0
       ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
+
+# --- MAYOR SAFETY GATE (2026-09-03) ------------------------------------------
+# Fail safe, not silent: with no --compact, behave exactly as --check-only.
+if [[ "$COMPACT_AUTHORIZED" != "true" ]]; then
+  if [[ "$CHECK_ONLY" != "true" && "$DRY_RUN" != "true" ]]; then
+    echo "compactor-dog: --compact not supplied; running in --check-only mode." >&2
+    echo "  Destructive compaction (flatten + force-push) requires --compact." >&2
+    echo "  Mayor safety gate; see run.sh header. Reporting only." >&2
+  fi
+  CHECK_ONLY=true
+fi
 
 # --- Lock acquisition --------------------------------------------------------
 
