@@ -49,8 +49,11 @@ Find all active production databases on the Dolt server:
 ```bash
 echo "=== Compactor Dog: Checking commit health ==="
 
-PROD_DBS=$(dolt sql -q "SHOW DATABASES" \
-  --host "$DOLT_HOST" --port "$DOLT_PORT" -u "$DOLT_USER" \
+# --host/--port/--user/--no-tls are dolt GLOBAL args and must precede the
+# `sql` subcommand — placing them after `sql -q` is rejected by the dolt
+# CLI ("unknown option `host'"). Same for selecting a database: use the
+# global --use-db, not a `-d` flag after `sql`.
+PROD_DBS=$(DOLT_CLI_PASSWORD="" dolt --host "$DOLT_HOST" --port "$DOLT_PORT" --user "$DOLT_USER" --no-tls sql -q "SHOW DATABASES" \
   --result-format csv 2>/dev/null \
   | tail -n +2 \
   | grep -v -E '^(information_schema|mysql|dolt_cluster|testdb_|beads_t|beads_pt|doctest_)' \
@@ -80,27 +83,23 @@ while IFS= read -r DB; do
   [ -z "$DB" ] && continue
 
   # Total commit count
-  COUNT=$(dolt sql -q "SELECT count(*) AS cnt FROM dolt_log" \
-    --host "$DOLT_HOST" --port "$DOLT_PORT" -u "$DOLT_USER" \
-    -d "$DB" --result-format csv 2>/dev/null \
+  COUNT=$(DOLT_CLI_PASSWORD="" dolt --host "$DOLT_HOST" --port "$DOLT_PORT" --user "$DOLT_USER" --no-tls --use-db "$DB" sql -q "SELECT count(*) AS cnt FROM dolt_log" \
+    --result-format csv 2>/dev/null \
     | tail -1 | tr -d '\r')
 
   # Commits in last hour (growth rate indicator)
-  RECENT=$(dolt sql -q "SELECT count(*) AS cnt FROM dolt_log WHERE date > DATE_SUB(NOW(), INTERVAL 1 HOUR)" \
-    --host "$DOLT_HOST" --port "$DOLT_PORT" -u "$DOLT_USER" \
-    -d "$DB" --result-format csv 2>/dev/null \
+  RECENT=$(DOLT_CLI_PASSWORD="" dolt --host "$DOLT_HOST" --port "$DOLT_PORT" --user "$DOLT_USER" --no-tls --use-db "$DB" sql -q "SELECT count(*) AS cnt FROM dolt_log WHERE date > DATE_SUB(NOW(), INTERVAL 1 HOUR)" \
+    --result-format csv 2>/dev/null \
     | tail -1 | tr -d '\r')
 
   # Commits in last 24h
-  DAILY=$(dolt sql -q "SELECT count(*) AS cnt FROM dolt_log WHERE date > DATE_SUB(NOW(), INTERVAL 24 HOUR)" \
-    --host "$DOLT_HOST" --port "$DOLT_PORT" -u "$DOLT_USER" \
-    -d "$DB" --result-format csv 2>/dev/null \
+  DAILY=$(DOLT_CLI_PASSWORD="" dolt --host "$DOLT_HOST" --port "$DOLT_PORT" --user "$DOLT_USER" --no-tls --use-db "$DB" sql -q "SELECT count(*) AS cnt FROM dolt_log WHERE date > DATE_SUB(NOW(), INTERVAL 24 HOUR)" \
+    --result-format csv 2>/dev/null \
     | tail -1 | tr -d '\r')
 
   # Oldest commit date (approximation of last flatten)
-  OLDEST=$(dolt sql -q "SELECT MIN(date) AS oldest FROM dolt_log" \
-    --host "$DOLT_HOST" --port "$DOLT_PORT" -u "$DOLT_USER" \
-    -d "$DB" --result-format csv 2>/dev/null \
+  OLDEST=$(DOLT_CLI_PASSWORD="" dolt --host "$DOLT_HOST" --port "$DOLT_PORT" --user "$DOLT_USER" --no-tls --use-db "$DB" sql -q "SELECT MIN(date) AS oldest FROM dolt_log" \
+    --result-format csv 2>/dev/null \
     | tail -1 | tr -d '\r')
 
   LINE="$DB: total=$COUNT, last_1h=$RECENT, last_24h=$DAILY, oldest_commit=$OLDEST"
@@ -158,9 +157,8 @@ echo "  Last compactor run: $RECENT_RUNS"
 FLATTEN_CANDIDATES=""
 while IFS= read -r DB; do
   [ -z "$DB" ] && continue
-  COUNT=$(dolt sql -q "SELECT count(*) AS cnt FROM dolt_log" \
-    --host "$DOLT_HOST" --port "$DOLT_PORT" -u "$DOLT_USER" \
-    -d "$DB" --result-format csv 2>/dev/null \
+  COUNT=$(DOLT_CLI_PASSWORD="" dolt --host "$DOLT_HOST" --port "$DOLT_PORT" --user "$DOLT_USER" --no-tls --use-db "$DB" sql -q "SELECT count(*) AS cnt FROM dolt_log" \
+    --result-format csv 2>/dev/null \
     | tail -1 | tr -d '\r')
   if [ "${COUNT:-0}" -le 5 ]; then
     FLATTEN_CANDIDATES="$FLATTEN_CANDIDATES $DB(${COUNT})"

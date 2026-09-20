@@ -156,6 +156,18 @@ type Daemon struct {
 	checkpointDogRunning atomic.Bool
 	checkpointDogWG      sync.WaitGroup
 
+	// pluginSyncRunning guards runPluginSync so it never runs inline in the
+	// daemon's main select loop: it fetches from and archives origin/main,
+	// and even with a bounded context a stalled network call would otherwise
+	// block every other patrol (and shutdown) for up to that bound (PR #236
+	// review). Dispatched to a goroutine; the guard skips a cycle rather
+	// than piling overlapping runs up.
+	// pluginSyncWG tracks that goroutine so shutdown can wait (bounded) for
+	// an in-flight sync to notice context cancellation instead of exiting
+	// mid-copy.
+	pluginSyncRunning atomic.Bool
+	pluginSyncWG      sync.WaitGroup
+
 	// lastDoctorMolTime tracks when the last mol-dog-doctor molecule was poured.
 	// Option B throttling: only pour when anomaly detected AND cooldown elapsed.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
@@ -780,6 +792,20 @@ func (d *Daemon) Run() (err error) {
 		d.logger.Printf("Quota dog ticker started (interval %v)", interval)
 	}
 
+	// Start plugin sync ticker if configured.
+	// Re-deploys <townRoot>/plugins from the gastown repo's plugins/ at
+	// origin/main, so a plugin's running copy cannot drift permanently
+	// from its reviewed source (gt-2ea1).
+	var pluginSyncTicker *time.Ticker
+	var pluginSyncChan <-chan time.Time
+	if d.isPatrolActive("plugin_sync") {
+		interval := pluginSyncInterval(d.patrolConfig)
+		pluginSyncTicker = time.NewTicker(interval)
+		pluginSyncChan = pluginSyncTicker.C
+		defer pluginSyncTicker.Stop()
+		d.logger.Printf("Plugin sync ticker started (interval %v)", interval)
+	}
+
 	// Note: PATCH-010 uses per-session hooks in deacon/manager.go (SetAutoRespawnHook).
 	// Global pane-died hooks don't fire reliably in tmux 3.2a, so we rely on the
 	// per-session approach which has been tested to work for continuous recovery.
@@ -910,6 +936,26 @@ func (d *Daemon) Run() (err error) {
 			// rotates credentials to available accounts via keychain swap.
 			if !d.isShutdownInProgress() {
 				d.runQuotaDog()
+			}
+
+		case <-pluginSyncChan:
+			// Plugin sync — re-deploys <townRoot>/plugins from the gastown
+			// repo's plugins/ at origin/main. Run in a guarded goroutine,
+			// not inline: it fetches over the network, and running it in
+			// this select loop would block every other patrol (and
+			// shutdown handling) for up to its own timeout if the network
+			// stalls (PR #236 review).
+			if !d.isShutdownInProgress() {
+				if !d.pluginSyncRunning.CompareAndSwap(false, true) {
+					d.logger.Printf("plugin_sync: previous cycle still running, skipping this tick")
+				} else {
+					d.pluginSyncWG.Add(1)
+					go func() {
+						defer d.pluginSyncWG.Done()
+						defer d.pluginSyncRunning.Store(false)
+						d.runPluginSync()
+					}()
+				}
 			}
 
 		case <-timer.C:
@@ -2595,6 +2641,21 @@ func (d *Daemon) shutdown(state *State) error { //nolint:unparam // error return
 	case <-checkpointDone:
 	case <-time.After(90 * time.Second):
 		d.logger.Println("checkpoint_dog: still running after 90s shutdown wait — proceeding with shutdown")
+	}
+
+	// Wait (bounded) for an in-flight plugin sync cycle. d.cancel() above
+	// cancels the context its git/tar subprocesses run under, so this
+	// should resolve almost immediately; the bound just covers the two
+	// subprocesses' own WaitDelay cleanup on the way out.
+	pluginSyncDone := make(chan struct{})
+	go func() {
+		d.pluginSyncWG.Wait()
+		close(pluginSyncDone)
+	}()
+	select {
+	case <-pluginSyncDone:
+	case <-time.After(30 * time.Second):
+		d.logger.Println("plugin_sync: still running after 30s shutdown wait — proceeding with shutdown")
 	}
 
 	// Stop feed curator

@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -254,5 +255,216 @@ func TestDetectDrift_ExtraInTarget(t *testing.T) {
 	// Extra plugins are not drift (no HasDrift), but are reported
 	if len(report.Extra) != 1 || report.Extra[0] != "orphan" {
 		t.Errorf("expected orphan in extra, got %v", report.Extra)
+	}
+}
+
+// runGitTest runs a git command, failing the test on error. If dir is
+// non-empty, it runs with that directory via `-C` (for commands like
+// `commit`/`checkout` that operate on an existing repo); if empty, args must
+// be self-contained (e.g. `init --bare <path>`, `clone <src> <dst>`).
+func runGitTest(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	if dir != "" {
+		args = append([]string{"-C", dir}, args...)
+	}
+	cmd := exec.Command("git", args...)
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@test.com",
+		"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@test.com")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+}
+
+// setupGastownCheckout creates a bare "origin" repo plus a working checkout
+// of it, with a go.mod declaring the gastown module and a plugins/ directory
+// committed and pushed to origin/main. It returns the checkout dir.
+func setupGastownCheckout(t *testing.T) (checkoutDir string) {
+	t.Helper()
+	originDir := t.TempDir()
+	runGitTest(t, "", "init", "--bare", "--initial-branch=main", originDir)
+
+	checkoutDir = t.TempDir()
+	runGitTest(t, "", "init", "--initial-branch=main", checkoutDir)
+	runGitTest(t, checkoutDir, "remote", "add", "origin", originDir)
+	if err := os.WriteFile(filepath.Join(checkoutDir, "go.mod"), []byte("module github.com/steveyegge/gastown\n\ngo 1.21\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	createTestPlugin(t, filepath.Join(checkoutDir, "plugins"), "some-plugin",
+		"+++\nname = \"some-plugin\"\n+++\noriginal", map[string]string{"run.sh": "#!/bin/bash\necho v1"})
+	runGitTest(t, checkoutDir, "add", "-A")
+	runGitTest(t, checkoutDir, "commit", "-m", "initial")
+	runGitTest(t, checkoutDir, "push", "origin", "main")
+	return checkoutDir
+}
+
+func TestFindGastownGitDir_ResolvesCandidateUnderTownRoot(t *testing.T) {
+	townRoot := t.TempDir()
+	// Isolate from the real gastown checkout this test runs inside of: the
+	// cwd-walk-up in FindGastownGitDir would otherwise find it first.
+	t.Chdir(townRoot)
+	rigDir := filepath.Join(townRoot, "gastown", "mayor", "rig")
+	if err := os.MkdirAll(rigDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigDir, "go.mod"), []byte("module github.com/steveyegge/gastown\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(rigDir, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := FindGastownGitDir(townRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != rigDir {
+		t.Errorf("expected %s, got %s", rigDir, got)
+	}
+}
+
+func TestFindGastownGitDir_NoCandidateFound(t *testing.T) {
+	townRoot := t.TempDir()
+	t.Chdir(townRoot)
+	if _, err := FindGastownGitDir(townRoot); err == nil {
+		t.Error("expected error when no gastown checkout exists")
+	}
+}
+
+// TestSyncFromOrigin_IgnoresStaleWorkingTree is the regression test for
+// gt-2ea1: a checkout whose working tree sits on an unrelated, stale branch
+// must still deploy the true origin/main content, because SyncFromOrigin
+// reads the tree from git's object store rather than the working tree.
+func TestSyncFromOrigin_IgnoresStaleWorkingTree(t *testing.T) {
+	checkoutDir := setupGastownCheckout(t)
+
+	// Move the checkout onto a detached, stale branch with an old plugin
+	// version — simulating a long-lived rig checkout nobody has pulled.
+	runGitTest(t, checkoutDir, "checkout", "-b", "stale-local-branch")
+	pluginFile := filepath.Join(checkoutDir, "plugins", "some-plugin", "run.sh")
+	if err := os.WriteFile(pluginFile, []byte("#!/bin/bash\necho STALE"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	runGitTest(t, checkoutDir, "commit", "-am", "stale local-only change")
+
+	// Meanwhile origin/main moved forward with a real fix.
+	runGitTest(t, checkoutDir, "checkout", "main")
+	if err := os.WriteFile(pluginFile, []byte("#!/bin/bash\necho v2-fixed"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	runGitTest(t, checkoutDir, "commit", "-am", "v2 fix")
+	runGitTest(t, checkoutDir, "push", "origin", "main")
+
+	// Leave the working tree parked on the stale branch, as a drifted rig
+	// checkout would be.
+	runGitTest(t, checkoutDir, "checkout", "stale-local-branch")
+
+	targetDir := t.TempDir()
+	result, err := SyncFromOrigin(t.Context(), checkoutDir, targetDir, []string{"some-plugin"}, false)
+	if err != nil {
+		t.Fatalf("SyncFromOrigin failed: %v", err)
+	}
+	if len(result.Copied) != 1 || result.Copied[0] != "some-plugin" {
+		t.Errorf("expected some-plugin copied, got %+v", result)
+	}
+
+	data, err := os.ReadFile(filepath.Join(targetDir, "some-plugin", "run.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "#!/bin/bash\necho v2-fixed" {
+		t.Errorf("expected origin/main content, got working-tree content: %q", data)
+	}
+}
+
+func TestSyncFromOrigin_MissingPluginsDir(t *testing.T) {
+	originDir := t.TempDir()
+	runGitTest(t, "", "init", "--bare", "--initial-branch=main", originDir)
+	checkoutDir := t.TempDir()
+	runGitTest(t, "", "init", "--initial-branch=main", checkoutDir)
+	runGitTest(t, checkoutDir, "remote", "add", "origin", originDir)
+	if err := os.WriteFile(filepath.Join(checkoutDir, "README.md"), []byte("no plugins here"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGitTest(t, checkoutDir, "add", "-A")
+	runGitTest(t, checkoutDir, "commit", "-m", "no plugins")
+	runGitTest(t, checkoutDir, "push", "origin", "main")
+
+	if _, err := SyncFromOrigin(t.Context(), checkoutDir, t.TempDir(), []string{"some-plugin"}, false); err == nil {
+		t.Error("expected error when origin/main has no plugins/ directory")
+	}
+}
+
+func TestSyncFromOrigin_RequiresExplicitPluginNames(t *testing.T) {
+	checkoutDir := setupGastownCheckout(t)
+	if _, err := SyncFromOrigin(t.Context(), checkoutDir, t.TempDir(), nil, false); err == nil {
+		t.Error("expected error when no plugin names are given — must not sync everything by default")
+	}
+}
+
+// TestSyncFromOrigin_OnlySyncsNamedPlugin verifies a second plugin present in
+// the source tree is left untouched — the allowlist must be a true filter,
+// not just an initial-population hint.
+func TestSyncFromOrigin_OnlySyncsNamedPlugin(t *testing.T) {
+	checkoutDir := setupGastownCheckout(t)
+	createTestPlugin(t, filepath.Join(checkoutDir, "plugins"), "other-plugin",
+		"+++\nname = \"other-plugin\"\n+++\nother", nil)
+	runGitTest(t, checkoutDir, "add", "-A")
+	runGitTest(t, checkoutDir, "commit", "-m", "add other-plugin")
+	runGitTest(t, checkoutDir, "push", "origin", "main")
+
+	targetDir := t.TempDir()
+	result, err := SyncFromOrigin(t.Context(), checkoutDir, targetDir, []string{"some-plugin"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Copied) != 1 || result.Copied[0] != "some-plugin" {
+		t.Errorf("expected only some-plugin copied, got %+v", result)
+	}
+	if _, err := os.Stat(filepath.Join(targetDir, "other-plugin")); !os.IsNotExist(err) {
+		t.Error("other-plugin should not have been synced — it wasn't in the allowlist")
+	}
+}
+
+// TestSyncFromOrigin_IgnoresTagShadowingOriginMain is the regression test for
+// the PR #236 review finding: git's short-name DWIM resolution checks
+// refs/tags/<name> before refs/remotes/<name>, so a tag literally named
+// "origin/main" would otherwise take precedence over the real branch and get
+// deployed to every synced plugin directory in town, bypassing main's branch
+// protection entirely. SyncFromOrigin must fetch and archive via
+// fully-qualified refs so a same-named tag can never win.
+func TestSyncFromOrigin_IgnoresTagShadowingOriginMain(t *testing.T) {
+	checkoutDir := setupGastownCheckout(t)
+
+	// An attacker-controlled commit, reachable only via a tag named
+	// "origin/main" — never merged to the real main branch.
+	runGitTest(t, checkoutDir, "checkout", "--orphan", "evil")
+	evilPlugins := filepath.Join(checkoutDir, "plugins")
+	if err := os.RemoveAll(evilPlugins); err != nil {
+		t.Fatal(err)
+	}
+	createTestPlugin(t, evilPlugins, "some-plugin",
+		"+++\nname = \"some-plugin\"\n+++\nEVIL", map[string]string{"run.sh": "#!/bin/bash\necho EVIL"})
+	runGitTest(t, checkoutDir, "add", "-A")
+	runGitTest(t, checkoutDir, "commit", "-m", "evil payload")
+	runGitTest(t, checkoutDir, "tag", "origin/main")
+	runGitTest(t, checkoutDir, "push", "origin", "tag", "origin/main")
+	runGitTest(t, checkoutDir, "checkout", "main")
+
+	targetDir := t.TempDir()
+	result, err := SyncFromOrigin(t.Context(), checkoutDir, targetDir, []string{"some-plugin"}, false)
+	if err != nil {
+		t.Fatalf("SyncFromOrigin failed: %v", err)
+	}
+	if len(result.Copied) != 1 || result.Copied[0] != "some-plugin" {
+		t.Fatalf("expected some-plugin copied, got %+v", result)
+	}
+
+	data, err := os.ReadFile(filepath.Join(targetDir, "some-plugin", "run.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "#!/bin/bash\necho v1" {
+		t.Errorf("expected real origin/main content, got the tag-shadowed payload: %q", data)
 	}
 }
