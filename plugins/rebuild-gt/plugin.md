@@ -19,83 +19,31 @@ severity = "medium"
 
 # Rebuild gt Binary
 
-Checks if the gt binary is stale (built from older commit than HEAD) and rebuilds.
+Checks if the gt binary is stale (built from an older commit than HEAD) and
+rebuilds it from source when that is safe.
 
 **SAFETY**: This plugin MUST only rebuild forward (binary ancestor of HEAD) and
 only from the main branch. Rebuilding to an older or diverged commit caused a
 crash loop where every new session's startup hook failed, the witness respawned
-it, and the loop repeated every 1-2 minutes.
+it, and the loop repeated every 1-2 minutes. `run.sh` enforces this: it skips
+the rebuild when the repo is on a non-main branch, is dirty, or HEAD is not a
+descendant of the binary's commit.
 
-## Gate Check
+Rebuilds use `make safe-install` (not `make install`) so the daemon is not
+restarted while sessions are active; sessions pick up the new binary on their
+next cycle.
 
-The Deacon evaluates this before dispatch. If gate closed, skip.
+The Deacon evaluates the cooldown gate before dispatch. If the gate is closed,
+skip.
 
-## Detection
+## Run
 
-Check binary staleness:
-
-```bash
-gt stale --json
-```
-
-Parse the JSON output and check these fields:
-- If `"stale": false` → record success wisp and exit early (binary is fresh)
-- If `"safe_to_rebuild": false` → **DO NOT REBUILD**. Record a skip wisp and exit.
-  This means the repo is on a non-main branch or HEAD is not a descendant of the
-  binary commit (would be a downgrade).
-- If `"safe_to_rebuild": true` → proceed to build
-
-If `safe_to_rebuild` is false, record a skip wisp:
-```bash
-bd create --wisp-type patrol \
-  --labels type:plugin-run,plugin:rebuild-gt,rig:gastown,result:skipped \
-  --description "Skipped: not safe to rebuild (forward=$FORWARD, main=$ON_MAIN)" \
-  "Plugin: rebuild-gt [skipped]"
-```
-
-## Pre-flight Checks
-
-Before building, verify the source repo is clean and on main:
+All logic lives in `run.sh`. This file intentionally carries no executable
+copy of it.
 
 ```bash
-cd ~/gt/gastown/mayor/rig
-git status --porcelain  # Must be clean
-git branch --show-current  # Must be "main"
+cd <plugin dir> && bash run.sh
 ```
 
-If either check fails, skip the rebuild and record a wisp.
-
-## Action
-
-Rebuild from source (the mayor/rig directory is the canonical source):
-
-```bash
-cd ~/gt/gastown/mayor/rig && make build && make safe-install
-```
-
-**IMPORTANT**: Use `make safe-install` (not `make install`) to avoid restarting
-the daemon while sessions are active. safe-install replaces the binary but does
-NOT restart the daemon — sessions will pick up the new binary on their next cycle.
-
-## Record Result
-
-On success:
-```bash
-bd create --wisp-type patrol \
-  --labels type:plugin-run,plugin:rebuild-gt,rig:gastown,result:success \
-  --description "Rebuilt gt: $OLD → $NEW ($N commits)" \
-  "Plugin: rebuild-gt [success]"
-```
-
-On failure:
-```bash
-bd create --wisp-type patrol \
-  --labels type:plugin-run,plugin:rebuild-gt,rig:gastown,result:failure \
-  --description "Build failed: $ERROR" \
-  "Plugin: rebuild-gt [failure]"
-
-gt escalate --severity=medium \
-  --subject="Plugin FAILED: rebuild-gt" \
-  --body="$ERROR" \
-  --source="plugin:rebuild-gt"
-```
+Run the command exactly as shown. Do not build the binary by hand from this
+description. Report the script's output.
