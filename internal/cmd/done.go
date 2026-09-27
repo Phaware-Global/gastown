@@ -2018,7 +2018,7 @@ notifyWitness:
 	}
 
 	// Update agent bead state (ZFC: self-report completion)
-	updateAgentStateOnDone(cwd, townRoot, exitType, issueID)
+	updateAgentStateOnDone(cwd, townRoot, exitType, issueID, pushFailed, mrFailed)
 
 	// Nudge witness only after hook/cleanup state is updated. Otherwise witness can
 	// evaluate slot availability against stale hook_bead or cleanup_status and emit
@@ -2446,7 +2446,20 @@ func clearDoneCheckpoints(bd *beads.Beads, agentBeadID string) {
 // BUG FIX (hq-3xaxy): This function must be resilient to working directory deletion.
 // If the polecat's worktree is deleted before gt done finishes, we use env vars as fallback.
 // All errors are warnings, not failures - gt done must complete even if bead ops fail.
-func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
+// shouldCloseHookedBead reports whether gt done's completion path should
+// close the hooked bead. Never true when the push or MR creation did not
+// succeed (gt-35un/gt-xitk MAYOR DESIGN RULING, acceptance item 3): closing
+// the source bead when nothing actually landed in the merge queue leaves no
+// trace that the work still needs to be resubmitted — evidence 2026-09-27,
+// hga-x93f pushed but no MR yet the bead was closed anyway.
+func shouldCloseHookedBead(exitType string, isWorkflowStep, pushFailed, mrFailed bool) bool {
+	if pushFailed || mrFailed {
+		return false
+	}
+	return exitType != ExitDeferred || isWorkflowStep
+}
+
+func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string, pushFailed, mrFailed bool) {
 	// Get role context - try multiple sources for resilience
 	roleInfo, err := GetRoleWithContext(cwd, townRoot)
 	if err != nil {
@@ -2522,7 +2535,7 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 	// paused for resumption". Close them on DEFERRED so the convoy can advance.
 	isWorkflowStep := strings.Contains(hookedBeadID, "-wfs-")
 
-	if hookedBeadID != "" && (exitType != ExitDeferred || isWorkflowStep) {
+	if hookedBeadID != "" && shouldCloseHookedBead(exitType, isWorkflowStep, pushFailed, mrFailed) {
 		// BUG FIX (gt-pftz): Close hooked bead unless already terminal (closed/tombstone).
 		// Previously checked hookedBead.Status == StatusHooked, but polecats update
 		// their work bead to in_progress during work. The exact-match check caused
