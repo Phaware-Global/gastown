@@ -656,6 +656,7 @@ func runRefineryUnclaimed(cmd *cobra.Command, args []string) error {
 			Target:   fields.Target,
 			Worker:   fields.Worker,
 			Priority: issue.Priority,
+			ReviewPR: fields.ReviewPR,
 		}
 		unclaimed = append(unclaimed, mr)
 	}
