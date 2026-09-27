@@ -241,7 +241,14 @@ func initCheckpointTestRepo(t *testing.T) string {
 	}
 	run(localDir, "add", ".")
 	run(localDir, "commit", "-m", "initial")
+	// checkpointWorktree resolves its protected branch from rig config
+	// (gt-35un/gt-xitk MAYOR DESIGN RULING) and falls back to "main" when
+	// none is found — as here, since newTestDaemon has no config. The guard
+	// fails closed when that branch doesn't resolve on origin, so it must
+	// actually exist there, matching a real polecat worktree's origin/main.
+	run(localDir, "branch", "-M", "main")
 	run(localDir, "remote", "add", "origin", remoteDir)
+	run(localDir, "push", "-u", "origin", "main")
 	run(localDir, "checkout", "-b", "polecat/foo/bead@1")
 
 	return localDir

@@ -2,14 +2,37 @@ package git
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 )
 
+// addTestOriginRemote adds a bare "origin" remote to dir and pushes its
+// current branch, returning that branch's name. Tests that don't exercise
+// the unverified-commit guard's protected-branch behavior still need a
+// resolvable origin ref to satisfy it now that it fails closed (gt-35un/
+// gt-xitk) — call this before checking out any feature branch, so the
+// pushed name is the repo's real base, not the branch under test.
+func addTestOriginRemote(t *testing.T, dir string) string {
+	t.Helper()
+	remoteDir := filepath.Join(t.TempDir(), "remote.git")
+	if err := exec.Command("git", "init", "--bare", remoteDir).Run(); err != nil {
+		t.Fatalf("git init --bare: %v", err)
+	}
+	runGitTestCmd(t, dir, "remote", "add", "origin", remoteDir)
+	branch, err := NewGit(dir).CurrentBranch()
+	if err != nil {
+		t.Fatalf("CurrentBranch: %v", err)
+	}
+	runGitTestCmd(t, dir, "push", "-u", "origin", branch)
+	return branch
+}
+
 func TestAutoPreserveUncommittedWork_CommitsDirtyWork(t *testing.T) {
 	dir := initTestRepo(t)
+	protected := addTestOriginRemote(t, dir)
 	g := NewGit(dir)
 	runGitTestCmd(t, dir, "checkout", "-b", "polecat/foo/gt-y8ts@abc123")
 
@@ -20,7 +43,7 @@ func TestAutoPreserveUncommittedWork_CommitsDirtyWork(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	result, err := AutoPreserveUncommittedWork(g, "polecat/foo/gt-y8ts@abc123", PreserveOptions{IssueID: "gt-y8ts"})
+	result, err := AutoPreserveUncommittedWork(g, "polecat/foo/gt-y8ts@abc123", PreserveOptions{IssueID: "gt-y8ts", ProtectedBranches: []string{protected}})
 	if err != nil {
 		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
 	}
@@ -50,6 +73,7 @@ func TestAutoPreserveUncommittedWork_CommitsDirtyWork(t *testing.T) {
 
 func TestAutoPreserveUncommittedWork_ExcludesRuntimeArtifacts(t *testing.T) {
 	dir := initTestRepo(t)
+	protected := addTestOriginRemote(t, dir)
 	g := NewGit(dir)
 	runGitTestCmd(t, dir, "checkout", "-b", "polecat/foo/gt-y8ts@abc123")
 
@@ -60,7 +84,7 @@ func TestAutoPreserveUncommittedWork_ExcludesRuntimeArtifacts(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	result, err := AutoPreserveUncommittedWork(g, "polecat/foo/gt-y8ts@abc123", PreserveOptions{})
+	result, err := AutoPreserveUncommittedWork(g, "polecat/foo/gt-y8ts@abc123", PreserveOptions{ProtectedBranches: []string{protected}})
 	if err != nil {
 		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
 	}
@@ -79,6 +103,7 @@ func TestAutoPreserveUncommittedWork_ExcludesRuntimeArtifacts(t *testing.T) {
 
 func TestAutoPreserveUncommittedWork_ExtraExcludePaths(t *testing.T) {
 	dir := initTestRepo(t)
+	protected := addTestOriginRemote(t, dir)
 	g := NewGit(dir)
 	runGitTestCmd(t, dir, "checkout", "-b", "polecat/foo/gt-y8ts@abc123")
 
@@ -100,6 +125,7 @@ func TestAutoPreserveUncommittedWork_ExtraExcludePaths(t *testing.T) {
 
 	result, err := AutoPreserveUncommittedWork(g, "polecat/foo/gt-y8ts@abc123", PreserveOptions{
 		ExtraExcludePaths: []string{"CLAUDE.md"},
+		ProtectedBranches: []string{protected},
 	})
 	if err != nil {
 		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
@@ -149,6 +175,7 @@ func TestAutoPreserveUncommittedWork_ExtraExcludePaths(t *testing.T) {
 // brand-new untracked source file is not preserved by this safety net.
 func TestAutoPreserveUncommittedWork_NewUntrackedFileIsNotCaptured(t *testing.T) {
 	dir := initTestRepo(t)
+	protected := addTestOriginRemote(t, dir)
 	g := NewGit(dir)
 	runGitTestCmd(t, dir, "checkout", "-b", "polecat/foo/gt-y8ts@abc123")
 
@@ -156,7 +183,7 @@ func TestAutoPreserveUncommittedWork_NewUntrackedFileIsNotCaptured(t *testing.T)
 		t.Fatalf("write: %v", err)
 	}
 
-	result, err := AutoPreserveUncommittedWork(g, "polecat/foo/gt-y8ts@abc123", PreserveOptions{})
+	result, err := AutoPreserveUncommittedWork(g, "polecat/foo/gt-y8ts@abc123", PreserveOptions{ProtectedBranches: []string{protected}})
 	if err != nil {
 		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
 	}
@@ -244,7 +271,7 @@ func TestAutoPreserveUncommittedWork_RefusesUnmergedConflicts(t *testing.T) {
 }
 
 func TestAutoPreserveUncommittedWork_PushesAndVerifies(t *testing.T) {
-	localDir, _, _ := initTestRepoWithRemote(t)
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
 	g := NewGit(localDir)
 
 	branch := "polecat/foo/gt-y8ts@abc123"
@@ -260,7 +287,7 @@ func TestAutoPreserveUncommittedWork_PushesAndVerifies(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	result, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{IssueID: "gt-y8ts", Push: true})
+	result, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{IssueID: "gt-y8ts", Push: true, ProtectedBranches: []string{mainBranch}})
 	if err != nil {
 		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
 	}
@@ -288,7 +315,7 @@ func TestAutoPreserveUncommittedWork_PushesAndVerifies(t *testing.T) {
 	}
 
 	// A second call with nothing new to preserve should be a no-op.
-	result2, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{IssueID: "gt-y8ts", Push: true})
+	result2, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{IssueID: "gt-y8ts", Push: true, ProtectedBranches: []string{mainBranch}})
 	if err != nil {
 		t.Fatalf("second AutoPreserveUncommittedWork: %v", err)
 	}
@@ -299,6 +326,7 @@ func TestAutoPreserveUncommittedWork_PushesAndVerifies(t *testing.T) {
 
 func TestAutoPreserveUncommittedWork_CommitMessageOverride(t *testing.T) {
 	dir := initTestRepo(t)
+	protected := addTestOriginRemote(t, dir)
 	g := NewGit(dir)
 	runGitTestCmd(t, dir, "checkout", "-b", "polecat/foo/gt-y8ts@abc123")
 
@@ -309,8 +337,9 @@ func TestAutoPreserveUncommittedWork_CommitMessageOverride(t *testing.T) {
 	}
 
 	_, err := AutoPreserveUncommittedWork(g, "polecat/foo/gt-y8ts@abc123", PreserveOptions{
-		IssueID:       "gt-y8ts", // must be ignored when CommitMessage is set
-		CommitMessage: "WIP: checkpoint (auto)",
+		IssueID:           "gt-y8ts", // must be ignored when CommitMessage is set
+		CommitMessage:     "WIP: checkpoint (auto)",
+		ProtectedBranches: []string{protected},
 	})
 	if err != nil {
 		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
@@ -390,7 +419,7 @@ func TestAutoPreserveUncommittedWork_HookFailureBlocksPushButPreservesLocally(t 
 // onto the shared "polecat/preserve-HEAD" ref would make two different
 // polecats' preserved work collide on the same ref.
 func TestAutoPreserveUncommittedWork_DetachedHEADGetsUniqueRef(t *testing.T) {
-	localDir, _, _ := initTestRepoWithRemote(t)
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
 	g := NewGit(localDir)
 
 	head, err := g.Rev("HEAD")
@@ -412,7 +441,7 @@ func TestAutoPreserveUncommittedWork_DetachedHEADGetsUniqueRef(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	result, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{IssueID: "rictus", Push: true})
+	result, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{IssueID: "rictus", Push: true, ProtectedBranches: []string{mainBranch}})
 	if err != nil {
 		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
 	}
