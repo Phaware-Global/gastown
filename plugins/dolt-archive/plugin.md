@@ -100,7 +100,10 @@ echo "Exported: $EXPORTED, failed: $EXPORT_FAILED"
 
 ## Step 2: Git commit and push
 
-Commit JSONL snapshots to a backup branch and push to GitHub.
+Commit JSONL snapshots to a backup branch and push to GitHub. The push is
+gated by the visibility guard described under Step 3: a backup `origin` that is
+not confirmed private is refused (`git=refused`), never pushed. The snippet
+below is a simplified illustration; `run.sh` is authoritative and adds the guard.
 
 ```bash
 echo "=== Git Push ==="
@@ -151,13 +154,19 @@ fi
 
 Push production databases to GitHub/DoltHub remotes via `dolt push`.
 
-**Visibility guard (see `visibility_guard.sh`, gt-v3df):** before pushing any
-remote, run.sh resolves it to a GitHub `owner/repo` and checks its visibility
-via `gh api`. Push proceeds only when the repo is confirmed **private**. A
-public repo, a non-GitHub remote (including DoltHub), a missing `gh`, or a
-failed lookup all refuse to push — fail closed, not fail open. A refusal is
-logged, counted separately from a normal push failure, escalated with a
-fingerprint, and surfaced in the cycle summary as `dolt_push_refused`.
+**Visibility guard (see `visibility_guard.sh`, gt-v3df, gt-sg6n):** both push
+layers — the JSONL git push in Step 2 and the native Dolt push here — clear the
+same fail-closed check before anything leaves the machine. `run.sh` resolves the
+destination to a GitHub `owner/repo` and checks its visibility via `gh api`; the
+push proceeds only when the repo is confirmed **private**. A public repo, a
+non-GitHub remote (including DoltHub), a missing `gh`, or a failed lookup all
+refuse to push — fail closed, not fail open. For the git layer the destination
+judged is what `git push origin` would actually use (`git remote get-url --push
+--all origin`, so `pushurl`/`insteadOf` rewrites count, and every push URL must
+pass). A refusal is logged, counted separately from a normal push failure,
+escalated critical with a fingerprint, and surfaced in the cycle summary as
+`dolt_push_refused` (Dolt layer) or `git=refused` / `git_push_refused` (git
+layer).
 
 ```bash
 echo "=== Dolt Push ==="

@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # run_test.sh — integration tests for dolt-archive/run.sh.
 #
-# Two independent suites, run back-to-back, neither replacing the other:
+# Three independent suites, run back-to-back, neither replacing the other:
 #   Suite A (gt-igzm): escalation logic — mocked dolt/bd/gt, asserts on which
 #     escalations fire (dolt push failure, missing git backup repo, remote
 #     shortfall, git push failure/success/nothing-to-push, fingerprint dedup).
 #   Suite B (gt-v3df): the Dolt-push visibility guard — runs the REAL run.sh
 #     against a scratch DOLT_DATA_DIR with fake dolt/gh/bd/gt binaries,
 #     asserting a public remote is refused and a private one is pushed.
+#
+#   Suite C (gt-sg6n): the same guard on the JSONL git push layer — public,
+#     non-GitHub and undeterminable origins are refused; a private one is pushed.
 #
 # Usage: bash plugins/dolt-archive/run_test.sh
 set -euo pipefail
@@ -211,6 +214,50 @@ write_git_backup_repo() {
   )
 }
 
+# The git-layer visibility guard (gt-sg6n) judges the URL git would actually
+# push to (`git remote get-url --push --all origin`). These scenarios need a
+# REAL push to a local bare repo to succeed or fail, while the guard sees a
+# github.com URL — so the git shim below answers `git remote get-url` from
+# $sandbox/git-url-override when that file exists, and otherwise passes every
+# call straight through to the real git. Only the URL the guard reads is
+# faked; add/commit/rev-list/push all run for real.
+REAL_GIT="$(command -v git)"
+write_git_shim() {
+  local sandbox="$1" override_url="${2:-}"
+  cat > "$sandbox/bin/git" <<MOCK
+#!/usr/bin/env bash
+if [[ "\$1" == "remote" && "\${2:-}" == "get-url" && -f "$sandbox/git-url-override" ]]; then
+  cat "$sandbox/git-url-override"
+  exit 0
+fi
+exec "$REAL_GIT" "\$@"
+MOCK
+  chmod +x "$sandbox/bin/git"
+  if [[ -n "$override_url" ]]; then
+    printf '%s\n' "$override_url" > "$sandbox/git-url-override"
+  fi
+}
+
+# gh mock keyed off the owner segment, for the git-layer guard scenarios.
+write_gh_owner_mock() {
+  local sandbox="$1"
+  cat > "$sandbox/bin/gh" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "$1" == "api" ]]; then
+  repo=""
+  for a in "$@"; do [[ "$a" == repos/* ]] && repo="${a#repos/}"; done
+  case "${repo%%/*}" in
+    priv-owner) echo "private" ;;
+    lookup-fails-owner) exit 1 ;;
+    *) echo "public" ;;
+  esac
+  exit 0
+fi
+exit 1
+MOCK
+  chmod +x "$sandbox/bin/gh"
+}
+
 run_scenario() {
   local sandbox="$1"; shift
   : > "$sandbox/escalate.log"
@@ -332,6 +379,10 @@ assert_escalated "$SANDBOX" "no git backup repo" "missing git backup repo"
 assert_fingerprint "$SANDBOX" "no git backup repo" "dolt-archive:git-repo-missing" "missing git backup repo"
 assert_output_contains "$SANDBOX" "git=missing" "missing git backup repo — git clause"
 assert_output_contains "$SANDBOX" "dolt_push=skipped" "missing git backup repo — dolt_push summary clause (skipped case)"
+if grep -qF "git_push_refused" "$SANDBOX/output.log" 2>/dev/null; then
+  echo "FAIL: missing git backup repo — summary reports git_push_refused although the guard never ran"
+  FAILURES=$((FAILURES + 1))
+fi
 rm -rf "$SANDBOX"
 
 # --- Scenario 3: remote count below exported count must escalate critical ----
@@ -460,7 +511,9 @@ SANDBOX="$(setup_sandbox)"
 write_dolt_mock "$SANDBOX"
 write_bd_mock "$SANDBOX"
 write_gt_mock "$SANDBOX"
+write_gh_mock "$SANDBOX"
 write_git_backup_repo "$SANDBOX"
+write_git_shim "$SANDBOX" "https://github.com/test-owner/example-backup"
 
 # Break the remote AFTER origin/main is already tracked locally, so the
 # rev-list ahead-check still works but the actual push fails.
@@ -480,7 +533,9 @@ SANDBOX="$(setup_sandbox)"
 write_dolt_mock "$SANDBOX"
 write_bd_mock "$SANDBOX"
 write_gt_mock "$SANDBOX"
+write_gh_mock "$SANDBOX"
 write_git_backup_repo "$SANDBOX"
+write_git_shim "$SANDBOX" "https://github.com/test-owner/example-backup"
 
 run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
 assert_no_escalation "$SANDBOX" "successful git push"
@@ -714,11 +769,98 @@ if [[ "$FAIL" -ne 0 ]]; then
   cat "$OUTPUT"
 fi
 
+# =============================================================================
+# Suite C: git-layer visibility guard (gt-sg6n)
+#
+# The JSONL git push (`git push origin main`) must clear the same fail-closed
+# visibility check as the dolt push: public, non-GitHub or undeterminable all
+# REFUSE; only a GitHub repo confirmed private is pushed. Real git, real bare
+# origin; only gh/dolt/bd/gt are faked, and the git shim fakes just the URL
+# the guard reads (see write_git_shim). All remotes are example.invalid-style
+# placeholders — no real backup repo name appears here.
+# =============================================================================
+
+C_FAIL=0
+c_fail() { echo "FAIL: $*"; C_FAIL=$((C_FAIL + 1)); }
+
+bare_head() { "$REAL_GIT" -C "$1/bare-origin.git" rev-parse main; }
+
+# git_guard_scenario NAME PUSH_URL EXPECT(refused|pushed) [REASON]
+git_guard_scenario() {
+  local name="$1" url="$2" expect="$3" reason="${4:-}"
+  log "=== Scenario: git-layer guard — $name ==="
+  local sb before after
+  sb="$(setup_sandbox)"
+  write_dolt_mock "$sb"; write_bd_mock "$sb"; write_gt_mock "$sb"
+  write_gh_owner_mock "$sb"
+  write_git_backup_repo "$sb"
+  if [[ -n "$url" ]]; then write_git_shim "$sb" "$url"; else write_git_shim "$sb"; fi
+  before="$(bare_head "$sb")"
+
+  run_scenario "$sb" --databases testdb --skip-dolt-push
+  after="$(bare_head "$sb")"
+
+  if [[ "$expect" == "refused" ]]; then
+    [[ "$before" == "$after" ]] || c_fail "$name — origin received a push despite the guard"
+    grep -qF "git=refused" "$sb/output.log" || c_fail "$name — summary lacks git=refused"
+    grep -qF "git_push_refused=1" "$sb/output.log" || c_fail "$name — summary lacks git_push_refused=1"
+    grep -qF "REFUSED" "$sb/output.log" || c_fail "$name — log lacks REFUSED"
+    grep -qF "visibility=$reason" "$sb/output.log" || c_fail "$name — log lacks visibility=$reason"
+    grep -q -- "--fingerprint dolt-archive:git-push-refused:origin" "$sb/escalate.log" \
+      || c_fail "$name — refusal not escalated with the git-push-refused fingerprint"
+    grep -- "git-push-refused" "$sb/escalate.log" | grep -q -- "-s critical" \
+      || c_fail "$name — refusal escalation is not -s critical"
+    grep -q "result=warning" "$sb/output.log" || c_fail "$name — result is not warning"
+    if grep -qF "git=pushed" "$sb/output.log"; then c_fail "$name — reported git=pushed"; fi
+  else
+    [[ "$before" != "$after" ]] || c_fail "$name — private origin did not receive the push"
+    grep -qF "git=pushed" "$sb/output.log" || c_fail "$name — summary lacks git=pushed"
+    grep -qF "git_push_refused=0" "$sb/output.log" || c_fail "$name — summary lacks git_push_refused=0"
+    assert_no_escalation "$sb" "$name"
+  fi
+  rm -rf "$sb"
+}
+
+git_guard_scenario "public origin is refused"           "https://github.com/pub-owner/example-backup"         refused public
+git_guard_scenario "undeterminable visibility refused"  "https://github.com/lookup-fails-owner/example-backup" refused visibility-lookup-failed
+git_guard_scenario "non-GitHub origin is refused"       "https://git.example.invalid/team/example-backup.git" refused non-github-remote
+git_guard_scenario "private origin is pushed"           "https://github.com/priv-owner/example-backup"        pushed
+
+# A raw local-path origin (no shim, no GitHub URL at all) must also refuse.
+log "=== Scenario: git-layer guard — local-path origin is refused ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"; write_bd_mock "$SANDBOX"; write_gt_mock "$SANDBOX"
+write_gh_owner_mock "$SANDBOX"
+write_git_backup_repo "$SANDBOX"
+BEFORE="$(bare_head "$SANDBOX")"
+run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
+[[ "$BEFORE" == "$(bare_head "$SANDBOX")" ]] || c_fail "local-path origin received a push"
+grep -qF "visibility=non-github-remote" "$SANDBOX/output.log" || c_fail "local-path origin — log lacks visibility=non-github-remote"
+rm -rf "$SANDBOX"
+
+# A refusal is per-destination: a second push URL that is public must refuse
+# even though the first is private (git pushes to every pushurl).
+log "=== Scenario: git-layer guard — any public pushurl refuses ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"; write_bd_mock "$SANDBOX"; write_gt_mock "$SANDBOX"
+write_gh_owner_mock "$SANDBOX"
+write_git_backup_repo "$SANDBOX"
+write_git_shim "$SANDBOX"
+printf '%s\n%s\n' "https://github.com/priv-owner/example-backup" "https://github.com/pub-owner/example-backup" > "$SANDBOX/git-url-override"
+BEFORE="$(bare_head "$SANDBOX")"
+run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
+[[ "$BEFORE" == "$(bare_head "$SANDBOX")" ]] || c_fail "mixed pushurls — origin received a push"
+grep -qF "git=refused" "$SANDBOX/output.log" || c_fail "mixed pushurls — summary lacks git=refused"
+rm -rf "$SANDBOX"
+
+echo ""
+echo "Suite C (git-layer guard): $C_FAIL failure(s)"
+
 # --- Combined result ---------------------------------------------------------
 
 echo ""
-if [[ "$FAILURES" -gt 0 || "$FAIL" -gt 0 ]]; then
-  echo "FAILED: Suite A had $FAILURES failure(s), Suite B had $FAIL failure(s)"
+if [[ "$FAILURES" -gt 0 || "$FAIL" -gt 0 || "$C_FAIL" -gt 0 ]]; then
+  echo "FAILED: Suite A had $FAILURES failure(s), Suite B had $FAIL failure(s), Suite C had $C_FAIL failure(s)"
   exit 1
 fi
 echo "PASSED: all scenarios in both suites passed"
