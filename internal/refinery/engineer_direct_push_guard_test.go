@@ -131,44 +131,204 @@ func TestProcessMRInfo_PRRig_NoPushToTarget(t *testing.T) {
 	}
 }
 
-func TestProcessBatch_PRRig_MultiMR_NoPushToTarget(t *testing.T) {
-	for _, tc := range prRigCases {
-		t.Run(tc.name, func(t *testing.T) {
-			workDir, g, _ := testGitRepo(t)
-			e := newTestEngineer(t, workDir, g)
-			e.config.MergeStrategy = tc.memoryStrategy
-			escalations := recordEscalations(e)
-			isolatedBeads(t, e)
-			createFeatureBranch(t, workDir, "feat/a", "a.txt", "a")
-			createFeatureBranch(t, workDir, "feat/b", "b.txt", "b")
-			writeRigSettingsMergeStrategy(t, workDir, "pr")
-			before := remoteRef(t, workDir, "main")
-			localBefore := run(t, workDir, "git", "rev-parse", "main")
+// A rig whose in-memory config is stale (says direct, settings on disk say pr)
+// cannot be routed through the PR merge path — doMerge picks that path from the
+// in-memory strategy — so its batch is refused before anything is stacked.
+func TestProcessBatch_PRRig_StaleConfig_MultiMR_Refused(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.MergeStrategy = ""
+	escalations := recordEscalations(e)
+	isolatedBeads(t, e)
+	createFeatureBranch(t, workDir, "feat/a", "a.txt", "a")
+	createFeatureBranch(t, workDir, "feat/b", "b.txt", "b")
+	writeRigSettingsMergeStrategy(t, workDir, "pr")
+	before := remoteRef(t, workDir, "main")
+	localBefore := run(t, workDir, "git", "rev-parse", "main")
 
-			// One MR carries a review_pr, one does not: on a PR rig a direct
-			// push is refused for both, since it bypasses the PR merge API
-			// (branch protection, approvals, audit trail) either way.
-			withPR := makeMR("gt-mr-b", "feat/b", "main")
-			withPR.ReviewPR = 12
-			batch := []*MRInfo{makeMR("gt-mr-a", "feat/a", "main"), withPR}
+	batch := []*MRInfo{makeMR("gt-mr-a", "feat/a", "main"), makeMR("gt-mr-b", "feat/b", "main")}
+	result := e.ProcessBatch(context.Background(), batch, "main", &BatchConfig{MaxBatchSize: 5})
 
-			result := e.ProcessBatch(context.Background(), batch, "main", &BatchConfig{MaxBatchSize: 5})
-
-			if after := remoteRef(t, workDir, "main"); after != before {
-				t.Fatalf("origin/main moved %s -> %s: batch pushed to the target on a PR rig", before, after)
-			}
-			if len(result.Merged) != 0 || result.MergeCommit != "" {
-				t.Errorf("batch reported a merge: merged=%v commit=%q", mrIDs(result.Merged), result.MergeCommit)
-			}
-			if result.Error == nil {
-				t.Error("batch refusal must surface as result.Error")
-			}
-			if local := run(t, workDir, "git", "rev-parse", "main"); local != localBefore {
-				t.Errorf("local main left at %s, want %s (no stray squash commits)", local, localBefore)
-			}
-			assertOneEscalationPerMR(t, *escalations, "gt-mr-a", "gt-mr-b")
-		})
+	if after := remoteRef(t, workDir, "main"); after != before {
+		t.Fatalf("origin/main moved %s -> %s: batch pushed to the target on a PR rig", before, after)
 	}
+	if len(result.Merged) != 0 || result.MergeCommit != "" {
+		t.Errorf("batch reported a merge: merged=%v commit=%q", mrIDs(result.Merged), result.MergeCommit)
+	}
+	if result.Error == nil {
+		t.Error("batch refusal must surface as result.Error")
+	}
+	if local := run(t, workDir, "git", "rev-parse", "main"); local != localBefore {
+		t.Errorf("local main left at %s, want %s (no stray squash commits)", local, localBefore)
+	}
+	assertOneEscalationPerMR(t, *escalations, "gt-mr-a", "gt-mr-b")
+}
+
+// prRouteProvider is a PRProvider whose PRs are keyed by branch and whose
+// MergePR squash-merges the branch into origin/main from a scratch clone, the
+// way the forge would. Nothing the refinery itself pushes can be mistaken for
+// those merges: they are the only commits with the "fake-pr-merge" subject.
+type prRouteProvider struct {
+	populatingFakeProvider
+	t       *testing.T
+	workDir string
+	prs     map[string]int // branch -> PR number; absent = no PR
+	byPR    map[int]string // PR number -> branch
+	merged  []int          // PR numbers passed to MergePR, in order
+}
+
+func newPRRouteProvider(t *testing.T, workDir string, prs map[string]int) *prRouteProvider {
+	p := &prRouteProvider{t: t, workDir: workDir, prs: prs, byPR: map[int]string{}}
+	for branch, n := range prs {
+		p.byPR[n] = branch
+	}
+	return p
+}
+
+func (p *prRouteProvider) FindPRNumber(branch string) (int, error) { return p.prs[branch], nil }
+func (p *prRouteProvider) UnresolvedThreads(int) ([]ReviewThread, error) {
+	return nil, nil
+}
+
+func (p *prRouteProvider) MergePR(n int, _ string) (string, error) {
+	p.merged = append(p.merged, n)
+	remote := run(p.t, p.workDir, "git", "remote", "get-url", "origin")
+	clone := filepath.Join(p.t.TempDir(), "forge")
+	run(p.t, p.t.TempDir(), "git", "clone", remote, clone)
+	run(p.t, clone, "git", "config", "user.email", "forge@test.com")
+	run(p.t, clone, "git", "config", "user.name", "Forge")
+	run(p.t, clone, "git", "fetch", p.workDir, "refs/heads/"+p.byPR[n]+":refs/heads/pr-head")
+	run(p.t, clone, "git", "merge", "--squash", "pr-head")
+	run(p.t, clone, "git", "commit", "-m", "fake-pr-merge #"+strconv.Itoa(n))
+	run(p.t, clone, "git", "push", "origin", "HEAD:main")
+	return run(p.t, clone, "git", "rev-parse", "HEAD"), nil
+}
+
+// newPRRigEngineer is an engineer for a correctly configured merge_strategy=pr
+// rig whose approval gates are opted out, so a merge depends only on the PR.
+func newPRRigEngineer(t *testing.T, workDir string, g *gitpkg.Git, prs map[string]int) (*Engineer, *prRouteProvider, *[]recordedEscalation) {
+	e := newTestEngineer(t, workDir, g)
+	e.config.MergeStrategy = "pr"
+	e.config.PRRequiredApprovals = intPtr(0)
+	writeRigSettingsMergeStrategy(t, workDir, "pr")
+	escalations := recordEscalations(e)
+	isolatedBeads(t, e)
+	provider := newPRRouteProvider(t, workDir, prs)
+	e.prProvider = provider
+	return e, provider, escalations
+}
+
+// forgeMergeSubjects lists the "fake-pr-merge" commits on origin/main and the
+// total number of commits added to it since base.
+func forgeMergeSubjects(t *testing.T, workDir, base string) (forge []string, added int) {
+	t.Helper()
+	run(t, workDir, "git", "fetch", "origin")
+	for _, subject := range strings.Split(run(t, workDir, "git", "log", "--format=%s", base+"..origin/main"), "\n") {
+		if subject == "" {
+			continue
+		}
+		added++
+		if strings.HasPrefix(subject, "fake-pr-merge") {
+			forge = append(forge, subject)
+		}
+	}
+	return forge, added
+}
+
+// The batch on a PR rig must merge every MR through its own PR: nothing but
+// the forge's merges reaches the target and nothing is escalated.
+func TestProcessBatch_PRRig_MultiMR_MergesEachViaPR(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e, provider, escalations := newPRRigEngineer(t, workDir, g, map[string]int{"feat/a": 11, "feat/b": 12})
+	createFeatureBranch(t, workDir, "feat/a", "a.txt", "a")
+	createFeatureBranch(t, workDir, "feat/b", "b.txt", "b")
+	before := remoteRef(t, workDir, "main")
+	batch := []*MRInfo{makeMR("gt-mr-a", "feat/a", "main"), makeMR("gt-mr-b", "feat/b", "main")}
+	batch[0].ReviewPR, batch[1].ReviewPR = 11, 12
+
+	result := e.ProcessBatch(context.Background(), batch, "main", &BatchConfig{MaxBatchSize: 5})
+
+	if result.Error != nil {
+		t.Fatalf("batch error: %v", result.Error)
+	}
+	if got := mrIDs(result.Merged); len(got) != 2 {
+		t.Fatalf("merged=%v, want both MRs", got)
+	}
+	if want := []int{11, 12}; len(provider.merged) != 2 || provider.merged[0] != want[0] || provider.merged[1] != want[1] {
+		t.Errorf("MergePR calls = %v, want %v in batch order", provider.merged, want)
+	}
+	forge, added := forgeMergeSubjects(t, workDir, before)
+	if len(forge) != 2 || added != 2 {
+		t.Errorf("origin/main gained %d commits (%d from the forge %v); want exactly the 2 PR merges and no direct push", added, len(forge), forge)
+	}
+	if result.MergeCommit != remoteRef(t, workDir, "main") {
+		t.Errorf("MergeCommit %q is not origin/main's tip", result.MergeCommit)
+	}
+	if len(*escalations) != 0 {
+		t.Errorf("escalated a batch whose MRs all have PRs: %+v", *escalations)
+	}
+}
+
+// An MR with no PR is refused, escalated once and parked; its batch-mates
+// still merge.
+func TestProcessBatch_PRRig_OneMRLacksPR_ParksOnlyThatOne(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e, provider, escalations := newPRRigEngineer(t, workDir, g, map[string]int{"feat/b": 12})
+	createFeatureBranch(t, workDir, "feat/a", "a.txt", "a")
+	createFeatureBranch(t, workDir, "feat/b", "b.txt", "b")
+	before := remoteRef(t, workDir, "main")
+	batch := []*MRInfo{makeMR("gt-mr-a", "feat/a", "main"), makeMR("gt-mr-b", "feat/b", "main")}
+	batch[1].ReviewPR = 12
+
+	result := e.ProcessBatch(context.Background(), batch, "main", &BatchConfig{MaxBatchSize: 5})
+
+	if got := mrIDs(result.Merged); len(got) != 1 || got[0] != "gt-mr-b" {
+		t.Fatalf("merged=%v, want only gt-mr-b", got)
+	}
+	if len(provider.merged) != 1 || provider.merged[0] != 12 {
+		t.Errorf("MergePR calls = %v, want only PR 12", provider.merged)
+	}
+	if result.Error == nil || !strings.Contains(result.Error.Error(), "gt-mr-a") {
+		t.Errorf("result.Error = %v, want it to name the refused gt-mr-a", result.Error)
+	}
+	if forge, added := forgeMergeSubjects(t, workDir, before); len(forge) != 1 || added != 1 {
+		t.Errorf("origin/main gained %d commits (%v), want the single PR merge", added, forge)
+	}
+	assertOneEscalationPerMR(t, *escalations, "gt-mr-a")
+}
+
+// A batch-mate that is merely not ready (unresolved review threads here) is
+// left in the queue — no escalation, no park — and does not block the rest.
+func TestProcessBatch_PRRig_OneMRNotReady_DoesNotBlockTheRest(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e, provider, escalations := newPRRigEngineer(t, workDir, g, map[string]int{"feat/a": 11, "feat/b": 12})
+	createFeatureBranch(t, workDir, "feat/a", "a.txt", "a")
+	createFeatureBranch(t, workDir, "feat/b", "b.txt", "b")
+	e.prProvider = &threadsOnPRProvider{prRouteProvider: provider, blocked: 11}
+	batch := []*MRInfo{makeMR("gt-mr-a", "feat/a", "main"), makeMR("gt-mr-b", "feat/b", "main")}
+	batch[0].ReviewPR, batch[1].ReviewPR = 11, 12
+
+	result := e.ProcessBatch(context.Background(), batch, "main", &BatchConfig{MaxBatchSize: 5})
+
+	if got := mrIDs(result.Merged); len(got) != 1 || got[0] != "gt-mr-b" {
+		t.Fatalf("merged=%v, want only gt-mr-b", got)
+	}
+	if len(*escalations) != 0 {
+		t.Errorf("a not-ready PR was escalated: %+v", *escalations)
+	}
+}
+
+// threadsOnPRProvider reports an unresolved thread on one PR.
+type threadsOnPRProvider struct {
+	*prRouteProvider
+	blocked int
+}
+
+func (p *threadsOnPRProvider) UnresolvedThreads(n int) ([]ReviewThread, error) {
+	if n == p.blocked {
+		return []ReviewThread{{ID: "t1", Path: "a.txt", Line: 1}}, nil
+	}
+	return nil, nil
 }
 
 // A batch that shrinks to one surviving MR (verifyAndPush) and the degenerate

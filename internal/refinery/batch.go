@@ -213,12 +213,18 @@ func (e *Engineer) ProcessBatch(ctx context.Context, batch []*MRInfo, target str
 		return e.processSingleMR(ctx, batch[0], target)
 	}
 
-	// A multi-MR batch always ends in a direct push of the stacked tip, so on
-	// a rig that requires merge_strategy=pr the whole batch is refused before
-	// any of it is stacked. (A single MR takes doMerge, which applies the same
-	// guard itself.) Refusing the batch — rather than dropping only MRs that
-	// lack review_pr — is deliberate: a batch push bypasses the PR merge API's
-	// branch protection, approvals and audit trail for every MR in it.
+	// A PR rig never lands a batch by stacking and pushing: each MR merges
+	// through its own PR (doMergePR), which keeps branch protection, approvals
+	// and the audit trail intact for every MR in the batch.
+	if e.config.MergeStrategy == "pr" {
+		return e.processPRBatch(ctx, batch, target)
+	}
+
+	// A stacked batch ends in a direct push of the tip. The guard still fires
+	// here for a rig whose in-memory config is stale (says direct, settings
+	// on disk say pr): that batch cannot be routed through doMergePR, which
+	// doMerge only selects from the in-memory strategy, so it is refused
+	// before any of it is stacked.
 	if err := e.directPushGuard(target); err != nil {
 		return e.refuseBatch(batch, err)
 	}
@@ -296,6 +302,57 @@ func (e *Engineer) ProcessBatch(ctx context.Context, batch []*MRInfo, target str
 	}
 
 	return result
+}
+
+// processPRBatch merges each MR of a merge_strategy=pr batch through the PR
+// merge path, one at a time and never by pushing to the target. The PRs are
+// independent, so one MR that is refused, awaiting approval or failing does
+// not hold back the rest; result.Error joins the per-MR errors.
+//
+// Only an MR with no PR at all is refused — escalated once and parked, like
+// any MR the direct-push guard refuses.
+func (e *Engineer) processPRBatch(ctx context.Context, batch []*MRInfo, target string) *BatchResult {
+	result := &BatchResult{}
+	var errs []error
+
+	_, _ = fmt.Fprintf(e.output, "[Batch] merge_strategy=pr: merging %d MRs one at a time through the PR merge path\n", len(batch))
+	for _, mr := range batch {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
+		if cause := e.noPRCause(mr); cause != nil {
+			_, _ = fmt.Fprintf(e.output, "[Batch] Refusing MR %s: %v\n", mr.ID, cause)
+			e.HandleMRInfoFailure(mr, refusalResult(cause, mr.ID))
+			errs = append(errs, fmt.Errorf("MR %s refused: %w", mr.ID, cause))
+			continue
+		}
+
+		one := e.processSingleMR(ctx, mr, target)
+		result.Merged = append(result.Merged, one.Merged...)
+		result.Culprits = append(result.Culprits, one.Culprits...)
+		result.Conflicts = append(result.Conflicts, one.Conflicts...)
+		if one.MergeCommit != "" {
+			result.MergeCommit = one.MergeCommit
+		}
+		errs = append(errs, one.Error)
+	}
+	result.Error = errors.Join(errs...)
+	return result
+}
+
+// noPRCause reports why mr has no PR to merge through, or nil when it has one
+// (or when that can't be told — a failed lookup is left to doMergePR, which
+// reports it and lets the next poll retry rather than parking the MR).
+func (e *Engineer) noPRCause(mr *MRInfo) error {
+	if mr.ReviewPR > 0 || e.prProvider == nil {
+		return nil
+	}
+	n, err := e.prProvider.FindPRNumber(mr.Branch)
+	if err != nil || n > 0 {
+		return nil
+	}
+	return fmt.Errorf("merge_strategy=pr rig: MR tracks no review_pr and branch %s has no open PR, so it can land only once a PR exists", mr.Branch)
 }
 
 // processSingleMR handles the degenerate case of a batch with one MR.
