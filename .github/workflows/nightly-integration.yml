@@ -13,6 +13,12 @@ jobs:
     name: Full Integration Tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # Same as ci.yml's Integration job: with metrics on, bd's spooler writes
+      # $HOME/.beads/eventsData and a detached `bd send-metrics` flusher can
+      # create eventkit.lock there after a test returns. Tests set HOME to a
+      # t.TempDir(), so t.TempDir's RemoveAll fails "directory not empty".
+      BD_DISABLE_METRICS: "1"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
