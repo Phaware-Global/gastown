@@ -32,7 +32,7 @@ Gets production data off this machine. Three layers:
 
 All logic lives in `run.sh`. This file intentionally carries no executable
 copy of it: the script is the only implementation, and it is the only place
-the Dolt-replication remote-visibility guard is enforced.
+the remote-visibility guard (both push layers) is enforced.
 
 ```bash
 cd <plugin dir> && bash run.sh
@@ -46,14 +46,16 @@ description. Report the script's output.
 
 ## Visibility guard
 
-See `visibility_guard.sh`. Before each native Dolt push (layer 3), `run.sh` resolves
-the remote to a GitHub `owner/repo` and checks its visibility via `gh api`. A
-push proceeds only when the repo is confirmed **private**. A public repo, a
-non-GitHub remote, a missing `gh`, or a failed lookup all refuse to push — fail
-closed, not fail open. A refusal is logged, counted separately from a normal
-push failure, escalated with a fingerprint, and surfaced in the cycle summary as
-`dolt_push_refused`.
-
-The JSONL git push (layer 2) is **not** visibility-checked: `run.sh` runs
-a plain git push of `main` to `origin` with no guard. Verify by hand that the backup repo's
-`origin` is private.
+See `visibility_guard.sh`. Both push layers — the JSONL git push (layer 2) and
+the native Dolt push (layer 3) — clear the same fail-closed check before
+anything leaves the machine: `run.sh` resolves the destination to a GitHub
+`owner/repo` and checks its visibility via `gh api`. A push proceeds only when
+the repo is confirmed **private**. A public repo, a non-GitHub remote
+(including DoltHub), a missing `gh`, or a failed lookup all refuse to push —
+fail closed, not fail open. For the git layer the destination judged is what
+`git push origin` would actually use (`git remote get-url --push --all
+origin`, so `pushurl`/`insteadOf` rewrites count, and every push URL must
+pass). A refusal is logged, counted separately from a normal push failure,
+escalated with a fingerprint, and surfaced in the cycle summary as
+`dolt_push_refused` (Dolt layer) or `git=refused` / `git_push_refused` (git
+layer).

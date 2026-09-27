@@ -127,7 +127,10 @@ func freshSetupIntegrationEnv(homeDir, doltPort string) []string {
 		}
 		clean = append(clean, entry)
 	}
-	return append(clean, "HOME="+homeDir, "GT_DOLT_PORT="+doltPort, "BEADS_DOLT_PORT="+doltPort)
+	// Stripping BD_* also drops BD_DISABLE_METRICS; without it bd's detached
+	// metrics flusher writes eventkit.lock under homeDir and races the
+	// t.TempDir cleanup (gt-bglj). See testutil.CleanGTEnv.
+	return append(clean, "HOME="+homeDir, "GT_DOLT_PORT="+doltPort, "BEADS_DOLT_PORT="+doltPort, "BD_DISABLE_METRICS=1")
 }
 
 func configureGitIdentityForEnv(t *testing.T, env []string) {
@@ -357,4 +360,15 @@ func runFreshSetupOutputCmd(t *testing.T, dir string, env []string, name string,
 		t.Fatalf("%s %v failed: %v\n%s", name, args, err, debugOut)
 	}
 	return string(out)
+}
+
+// freshSetupIntegrationEnv strips BD_*, which drops the job-level
+// BD_DISABLE_METRICS; it must re-assert it (gt-6kbn, same race as gt-bglj).
+func TestFreshSetupIntegrationEnv_DisablesBDMetrics(t *testing.T) {
+	for name, setup := range bdMetricsEnvSetups {
+		t.Run(name, func(t *testing.T) {
+			setup(t)
+			assertBDMetricsDisabled(t, "freshSetupIntegrationEnv", freshSetupIntegrationEnv(t.TempDir(), "3307"))
+		})
+	}
 }

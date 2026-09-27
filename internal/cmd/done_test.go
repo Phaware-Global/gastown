@@ -585,6 +585,67 @@ func TestShouldNudgeRefinery(t *testing.T) {
 	}
 }
 
+// TestShouldCloseHookedBead covers acceptance item 3 of the gt-35un/gt-xitk
+// MAYOR DESIGN RULING: gt done must never close the source bead when the
+// push or MR creation did not succeed. Evidence 2026-09-27: hga-x93f pushed
+// but no MR was ever created, yet the bead was closed anyway — the prior
+// code closed the hooked bead based only on exitType, with no awareness of
+// pushFailed/mrFailed.
+func TestShouldCloseHookedBead(t *testing.T) {
+	tests := []struct {
+		name           string
+		exitType       string
+		isWorkflowStep bool
+		pushFailed     bool
+		mrFailed       bool
+		want           bool
+	}{
+		{"completed with successful push+MR closes", ExitCompleted, false, false, false, true},
+		{"completed but push failed does not close", ExitCompleted, false, true, false, false},
+		{"completed but MR creation failed does not close", ExitCompleted, false, false, true, false},
+		{"completed with both push and MR failed does not close", ExitCompleted, false, true, true, false},
+		{"deferred keeps bead open regardless", ExitDeferred, false, false, false, false},
+		{"deferred workflow step closes despite being deferred", ExitDeferred, true, false, false, true},
+		{"deferred workflow step still refuses on push failure", ExitDeferred, true, true, false, false},
+		{"escalated with no failures closes", ExitEscalated, false, false, false, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldCloseHookedBead(tt.exitType, tt.isWorkflowStep, tt.pushFailed, tt.mrFailed)
+			if got != tt.want {
+				t.Errorf("shouldCloseHookedBead(%q, %v, %v, %v) = %v, want %v",
+					tt.exitType, tt.isWorkflowStep, tt.pushFailed, tt.mrFailed, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestShouldForceCloseNoMerge covers the PR #253 review finding: the
+// no-merge completion path force-closed the work bead before
+// updateAgentStateOnDone (and its own shouldCloseHookedBead mrFailed check)
+// ever ran, so a failed PR/MR handoff under merge_strategy=pr was silently
+// reported as "No-merge work completed" with the bead closed anyway.
+func TestShouldForceCloseNoMerge(t *testing.T) {
+	tests := []struct {
+		name     string
+		mrFailed bool
+		want     bool
+	}{
+		{"handoff succeeded closes", false, true},
+		{"handoff failed does not close", true, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldForceCloseNoMerge(tt.mrFailed)
+			if got != tt.want {
+				t.Errorf("shouldForceCloseNoMerge(%v) = %v, want %v", tt.mrFailed, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestShouldSyncIdlePolecatWorktree(t *testing.T) {
 	tests := []struct {
 		name          string
