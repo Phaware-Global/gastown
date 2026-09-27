@@ -13,10 +13,13 @@ import (
 
 func TestNonInteractiveGitEnv(t *testing.T) {
 	env := nonInteractiveGitEnv("FOO=bar")
-	for _, want := range []string{"GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never", "FOO=bar"} {
+	for _, want := range []string{"GIT_TERMINAL_PROMPT=0", "FOO=bar"} {
 		if !slices.Contains(env, want) {
 			t.Errorf("nonInteractiveGitEnv missing %q", want)
 		}
+	}
+	if slices.Contains(env, "GCM_INTERACTIVE=never") {
+		t.Error("GCM_INTERACTIVE=never would disable GCM browser sign-in")
 	}
 	// Caller-supplied vars come last so they win over the defaults.
 	if env[len(env)-1] != "FOO=bar" {

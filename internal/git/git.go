@@ -134,8 +134,11 @@ func (g *Git) run(args ...string) (string, error) {
 // — a locked keychain behind `gh auth git-credential` over SSH — git must fail
 // fast instead of blocking on a `Username for ...` prompt on /dev/tty.
 // Callers already treat a failed remote query as "unknown/not safe".
+// GCM_INTERACTIVE is deliberately left alone: Git Credential Manager already
+// honors GIT_TERMINAL_PROMPT=0 for its terminal prompts, and forcing
+// GCM_INTERACTIVE=never would also disable its non-tty browser/GUI sign-in.
 func nonInteractiveGitEnv(extra ...string) []string {
-	env := append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never")
+	env := append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	return append(env, extra...)
 }
 
