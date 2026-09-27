@@ -171,6 +171,13 @@ const (
 	// surface a warning. Sized above the natural steady-state for the current
 	// dog/deacon emit rate (~23 wisps/h × 24h TTL ≈ 550). See hq-57jr8.
 	DefaultAlertThreshold = 800
+	// DefaultStaleIssueAge is the max issue staleness before AutoClose closes
+	// it (30 days). Single source of truth for the daemon's dispatch vars,
+	// the daemon's inline fallback, and the `gt reaper auto-close --stale-age`
+	// CLI default — previously these each hardcoded their own value and drifted
+	// out of sync (gt-73to: daemon used 7d while docs/CLI said 30d, silently
+	// closing ~1,165 live issues).
+	DefaultStaleIssueAge = 720 * time.Hour
 )
 
 // ValidateDBName returns an error if the database name is unsafe.
