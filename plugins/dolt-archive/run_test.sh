@@ -147,13 +147,17 @@ if [[ "\$1" == "escalate" ]]; then
     if [[ "\$prev" == "--fingerprint" ]]; then fp="\$arg"; fi
     prev="\$arg"
   done
-  if [[ -n "\$fp" ]]; then
+  if [[ -n "\$fp" && ! -f "$sandbox/.no-server-dedup" ]]; then
     mkdir -p "$sandbox/.fingerprints"
     seen_file="$sandbox/.fingerprints/\${fp//[^A-Za-z0-9_.-]/_}"
     if [[ -f "\$seen_file" ]]; then
       exit 0
     fi
     touch "\$seen_file"
+  fi
+  if [[ -f "$sandbox/.gt-escalate-fails" ]]; then
+    echo "mock gt escalate failure" >&2
+    exit 1
   fi
   printf '%s\n' "\$*" >> "$sandbox/escalate.log"
   exit 0
@@ -556,6 +560,131 @@ if grep -qF "git=nothing-to-push" "$SANDBOX/output.log" 2>/dev/null; then
   echo "FAIL: stale tracking ref, no remote — output.log still contains the misleading git=nothing-to-push"
   FAILURES=$((FAILURES + 1))
 fi
+rm -rf "$SANDBOX"
+
+# --- Scenarios 12-15: run.sh's OWN once-per-condition dedupe (gt-4kip) ------
+#
+# `gt escalate --fingerprint` only suppresses against OPEN escalation beads,
+# so once the mayor closes a repeat the next cycle files it again — alert
+# fatigue. These scenarios switch the mock's server-side dedupe OFF (as if
+# every prior escalation had already been closed) so only run.sh's own
+# state can keep a static condition from re-escalating.
+
+# Runs one archive cycle WITHOUT truncating escalate.log (run_scenario does).
+run_cycle() {
+  local sandbox="$1"; shift
+  (
+    export HOME="$sandbox/home"
+    export PATH="$sandbox/bin:$PATH"
+    export DOLT_DATA_DIR="$sandbox/home/gt/.dolt-data"
+    "$RUN_SH" "$@"
+  ) >> "$sandbox/output.log" 2>&1 || true
+}
+
+count_escalations() {
+  local sandbox="$1" needle="$2" n
+  n="$(grep -c -- "$needle" "$sandbox/escalate.log" 2>/dev/null || true)"
+  echo "${n:-0}"
+}
+
+assert_count() {
+  local sandbox="$1" needle="$2" want="$3" desc="$4" got
+  got="$(count_escalations "$sandbox" "$needle")"
+  if [[ "$got" -ne "$want" ]]; then
+    echo "FAIL: $desc — expected $want escalation(s) matching '$needle', got $got"
+    echo "  escalate.log contents:"
+    sed 's/^/    /' "$sandbox/escalate.log" 2>/dev/null || echo "    (empty)"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+# Sandbox with three static conditions at once: a failing dolt push, no git
+# backup repo, and an exported db with no remote (the shape from gt-4kip).
+setup_static_conditions() {
+  local sandbox
+  sandbox="$(setup_sandbox)"
+  write_dolt_mock "$sandbox"
+  write_bd_mock "$sandbox"
+  write_gt_mock "$sandbox"
+  write_gh_mock "$sandbox"
+  touch "$sandbox/.no-server-dedup"
+  mkdir -p "$sandbox/home/gt/.dolt-data/db-a/.dolt" "$sandbox/home/gt/.dolt-data/db-b/.dolt"
+  printf 'origin\thttps://github.com/test-owner/db-a (fetch)\n' > "$sandbox/home/gt/.dolt-data/db-a/.mock-remotes"
+  touch "$sandbox/home/gt/.dolt-data/db-a/.mock-push-fail-origin"
+  echo "$sandbox"
+}
+
+log "=== Scenario: identical state across two runs escalates once (gt-4kip) ==="
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+run_cycle "$SANDBOX" --databases db-a,db-b
+run_cycle "$SANDBOX" --databases db-a,db-b
+assert_count "$SANDBOX" "dolt push failed" 1 "identical state, 2 runs — push failure"
+assert_count "$SANDBOX" "no git backup repo" 1 "identical state, 2 runs — missing git repo"
+assert_count "$SANDBOX" "exported databases have a dolt remote" 1 "identical state, 2 runs — remote shortfall"
+assert_count "$SANDBOX" "dolt-archive:" 3 "identical state, 2 runs — total escalations"
+assert_output_contains "$SANDBOX" "unchanged, already escalated" "suppressed repeats are still logged"
+rm -rf "$SANDBOX"
+
+log "=== Scenario: changed affected-set re-escalates (gt-4kip) ==="
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+# A second remote on db-a now fails too: the failing set changed.
+printf 'origin\thttps://github.com/test-owner/db-a (fetch)\nmirror\thttps://github.com/test-owner/db-a-mirror (fetch)\n' \
+  > "$SANDBOX/home/gt/.dolt-data/db-a/.mock-remotes"
+touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 2 "affected remote set changed — must re-escalate"
+if grep -- "dolt push failed" "$SANDBOX/escalate.log" | grep -qv -- "-s critical"; then
+  echo "FAIL: changed affected-set — re-escalation must stay critical"
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$SANDBOX"
+
+log "=== Scenario: condition clears then returns re-escalates (gt-4kip) ==="
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+rm -f "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-origin"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-origin"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 2 "cleared then returned — must re-escalate"
+# The shortfall never cleared, so it must NOT have re-fired across those 3 runs.
+assert_count "$SANDBOX" "exported databases have a dolt remote" 1 "uncleared shortfall stays quiet"
+rm -rf "$SANDBOX"
+
+log "=== Scenario: --skip flags do not clear another step's state (gt-4kip) ==="
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-dolt-push --skip-git
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 1 "skipped dolt push must not read as 'condition cleared'"
+rm -rf "$SANDBOX"
+
+log "=== Scenario: long-interval digest is LOW, not CRITICAL (gt-4kip) ==="
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+ESCALATION_REPEAT_SECS=0 run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 2 "interval elapsed — digest fires"
+if [[ "$(grep -- "dolt push failed" "$SANDBOX/escalate.log" | grep -c -- "-s low")" -ne 1 ]]; then
+  echo "FAIL: interval digest — expected exactly one '-s low' repeat"
+  sed 's/^/    /' "$SANDBOX/escalate.log"
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$SANDBOX"
+
+log "=== Scenario: failed escalate is retried, not recorded as sent (gt-4kip) ==="
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+touch "$SANDBOX/.gt-escalate-fails"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+rm -f "$SANDBOX/.gt-escalate-fails"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 1 "escalate that failed once must still be delivered next run"
 rm -rf "$SANDBOX"
 
 echo ""
