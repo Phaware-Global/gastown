@@ -399,9 +399,8 @@ else
   GIT_CLAUSE="git=nothing-to-push"
 fi
 
-if $SKIP_GIT; then
-  GIT_CLAUSE="$GIT_CLAUSE"
-else
+# Skipped, the git step never ran — a 0 here would read as "checked, found none".
+if ! $SKIP_GIT; then
   GIT_CLAUSE="$GIT_CLAUSE, git_push_refused=$GIT_PUSH_REFUSED"
 fi
 
