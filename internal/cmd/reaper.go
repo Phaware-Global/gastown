@@ -664,9 +664,7 @@ func init() {
 		cmd.Flags().StringVar(&reaperMailAge, "mail-age", "168h", "Max closed mail age before purging (7d)")
 	}
 	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperAutoCloseCmd, reaperRunCmd} {
-		// "720h" (30d) must match reaper.DefaultStaleIssueAge — the daemon's
-		// dispatch vars and inline fallback share that same constant (gt-73to).
-		cmd.Flags().StringVar(&reaperStaleAge, "stale-age", "720h", "Max issue staleness before auto-close (30d)")
+		cmd.Flags().StringVar(&reaperStaleAge, "stale-age", reaper.DefaultStaleIssueAge.String(), "Max issue staleness before auto-close (30d)")
 	}
 
 	reaperCmd.AddCommand(reaperDatabasesCmd)
