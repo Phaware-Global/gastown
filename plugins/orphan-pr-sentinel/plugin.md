@@ -44,9 +44,16 @@ dry-run after editing the script before letting the cooldown gate fire it.
 ## What it checks, per rig with a GitHub remote
 
 1. List open PRs via `gh pr list`.
-2. For each, search open beads (title or description) for `PR #<N>`. If any
-   open bead references it, skip — it's owned, whether or not previous
-   round-beads for it have closed.
+2. For each, check for an owner and skip it if one exists — whether or not
+   previous round-beads for it have closed:
+   - an open merge-request bead (a wisp, so found via `bd sql` on the wisps
+     table, status not `closed`; queued PRs sit at `open` or `blocked`) whose
+     `review_pr:` is the PR number or whose `branch:` is the PR head branch.
+     A finished-but-unmerged PR has its work bead closed and only this MR
+     bead owning it (gt-gy1b);
+   - an open bead whose title or description mentions `PR #<N>`.
+   If the MR query fails, ownership is unknown: the PR is not flagged and the
+   run is recorded as failed.
 3. If no open bead owns it, check unresolved review-thread count
    (`gt refinery pr threads`) and CI status. Flag only if there's unresolved
    work or a failing check — a quiet, clean, unowned PR isn't urgent.
@@ -55,9 +62,9 @@ dry-run after editing the script before letting the cooldown gate fire it.
 
 ## Known limitation
 
-Ownership detection is a text match on `PR #<N>` in bead title/description.
-A bead that references the PR only by branch name, or a different citation
-style, would not be found and could produce a false orphan flag. Acceptable
+Bead ownership detection is a text match on `PR #<N>` in bead title/description
+(merge-request beads are matched structurally, above). A bead that references
+the PR only by branch name, or a different citation style, would not be found and could produce a false orphan flag. Acceptable
 for a detect-only visibility tool — a human dismisses false positives same
 as any other patrol finding — but worth knowing if a flagged PR turns out to
 actually be owned.
