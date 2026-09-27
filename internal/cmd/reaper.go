@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -155,41 +156,53 @@ The Dog uses this to understand the state before deciding what to reap.`,
 		if reaperJSON {
 			fmt.Println(reaper.FormatJSON(results))
 		} else {
-			var totalReap, totalMoleculeSteps, totalPurge, totalMail, totalStale, totalOpen int
-			for _, r := range results {
-				fmt.Printf("Database: %s\n", r.Database)
-				fmt.Printf("  Reap candidates:  %d\n", r.ReapCandidates)
-				if r.MoleculeStepCandidates > 0 {
-					fmt.Printf("  Molecule steps:   %d\n", r.MoleculeStepCandidates)
-				}
-				fmt.Printf("  Purge candidates: %d\n", r.PurgeCandidates)
-				fmt.Printf("  Mail candidates:  %d\n", r.MailCandidates)
-				fmt.Printf("  Stale candidates: %d\n", r.StaleCandidates)
-				fmt.Printf("  Open wisps:       %d\n", r.OpenWisps)
-				for _, a := range r.Anomalies {
-					fmt.Printf("  %s %s\n", style.Warning.Render("ANOMALY:"), a.Message)
-				}
-				totalReap += r.ReapCandidates
-				totalMoleculeSteps += r.MoleculeStepCandidates
-				totalPurge += r.PurgeCandidates
-				totalMail += r.MailCandidates
-				totalStale += r.StaleCandidates
-				totalOpen += r.OpenWisps
-			}
-			if len(results) > 1 {
-				fmt.Printf("\nScan summary (%d databases):\n", len(results))
-				fmt.Printf("  Reap candidates:  %d\n", totalReap)
-				if totalMoleculeSteps > 0 {
-					fmt.Printf("  Molecule steps:   %d\n", totalMoleculeSteps)
-				}
-				fmt.Printf("  Purge candidates: %d\n", totalPurge)
-				fmt.Printf("  Mail candidates:  %d\n", totalMail)
-				fmt.Printf("  Stale candidates: %d\n", totalStale)
-				fmt.Printf("  Open wisps:       %d\n", totalOpen)
-			}
+			printReaperScanText(os.Stdout, results)
 		}
 		return nil
 	},
+}
+
+// printReaperScanText renders scan results in the human-readable (non-JSON) format.
+func printReaperScanText(w io.Writer, results []*reaper.ScanResult) {
+	var totalReap, totalMoleculeSteps, totalFastTrack, totalPurge, totalMail, totalStale, totalOpen int
+	for _, r := range results {
+		fmt.Fprintf(w, "Database: %s\n", r.Database)
+		fmt.Fprintf(w, "  Reap candidates:  %d\n", r.ReapCandidates)
+		if r.MoleculeStepCandidates > 0 {
+			fmt.Fprintf(w, "  Molecule steps:   %d\n", r.MoleculeStepCandidates)
+		}
+		if r.FastTrackCandidates > 0 {
+			fmt.Fprintf(w, "  Fast-track:       %d\n", r.FastTrackCandidates)
+		}
+		fmt.Fprintf(w, "  Purge candidates: %d\n", r.PurgeCandidates)
+		fmt.Fprintf(w, "  Mail candidates:  %d\n", r.MailCandidates)
+		fmt.Fprintf(w, "  Stale candidates: %d\n", r.StaleCandidates)
+		fmt.Fprintf(w, "  Open wisps:       %d\n", r.OpenWisps)
+		for _, a := range r.Anomalies {
+			fmt.Fprintf(w, "  %s %s\n", style.Warning.Render("ANOMALY:"), a.Message)
+		}
+		totalReap += r.ReapCandidates
+		totalMoleculeSteps += r.MoleculeStepCandidates
+		totalFastTrack += r.FastTrackCandidates
+		totalPurge += r.PurgeCandidates
+		totalMail += r.MailCandidates
+		totalStale += r.StaleCandidates
+		totalOpen += r.OpenWisps
+	}
+	if len(results) > 1 {
+		fmt.Fprintf(w, "\nScan summary (%d databases):\n", len(results))
+		fmt.Fprintf(w, "  Reap candidates:  %d\n", totalReap)
+		if totalMoleculeSteps > 0 {
+			fmt.Fprintf(w, "  Molecule steps:   %d\n", totalMoleculeSteps)
+		}
+		if totalFastTrack > 0 {
+			fmt.Fprintf(w, "  Fast-track:       %d\n", totalFastTrack)
+		}
+		fmt.Fprintf(w, "  Purge candidates: %d\n", totalPurge)
+		fmt.Fprintf(w, "  Mail candidates:  %d\n", totalMail)
+		fmt.Fprintf(w, "  Stale candidates: %d\n", totalStale)
+		fmt.Fprintf(w, "  Open wisps:       %d\n", totalOpen)
+	}
 }
 
 var reaperReapCmd = &cobra.Command{
