@@ -169,24 +169,31 @@ escalate_once() {
     read -r prev_hashes last _k < "$file" || true
     # Unreadable state or a clock that went backwards: treat as no state.
     if [[ -n "$prev_hashes" && "$last" =~ ^[0-9]+$ && "$last" -le "$now" ]]; then
-      if [[ "$cur_hashes" == "$prev_hashes" ]]; then
+      if [[ "$cur_hashes" == "$prev_hashes" ]] || hash_set_is_subset "$cur_hashes" "$prev_hashes"; then
+        # Same set, or every currently-affected member already escalated as
+        # part of a larger set (a pure shrink/partial recovery). Either way,
+        # stay quiet until REPEAT_SECS, then send one low digest and keep
+        # recording the larger set so a member flapping back into it doesn't
+        # read as "new" (adversarial finding on #250).
         if (( now - last < REPEAT_SECS )); then
-          log "  $key: unchanged, already escalated $(( (now - last) / 60 ))m ago — not re-escalating"
+          if [[ "$cur_hashes" == "$prev_hashes" ]]; then
+            log "  $key: unchanged, already escalated $(( (now - last) / 60 ))m ago — not re-escalating"
+          else
+            log "  $key: affected set shrank (partial recovery) — not re-escalating"
+          fi
           return 0
         fi
         severity="low"
         title="$title (still unresolved)"
         fp="$fp:digest-$(date +%Y%m%d)"
-      elif hash_set_is_subset "$cur_hashes" "$prev_hashes"; then
-        # Every currently-affected member was already escalated as part of
-        # a larger set — a pure shrink (partial recovery), not a new
-        # member. Keep the larger recorded set and its timestamp so a
-        # member flapping back into it doesn't read as "new" either.
-        log "  $key: affected set shrank (partial recovery) — not re-escalating"
-        return 0
+        cur_hashes="$prev_hashes"
+      else
+        # The current set has a member the recorded set lacks (growth, or a
+        # simultaneous grow+shrink) — escalate fresh, but record the union
+        # so an already-escalated member isn't forgotten and re-escalated
+        # as "new" on a later flap (adversarial finding on #250).
+        cur_hashes="$(printf '%s' "${cur_hashes}${prev_hashes}" | tr ',' '\n' | sed '/^$/d' | sort -u | tr '\n' ',')"
       fi
-      # else: the current set has a member the recorded set lacks (growth,
-      # or a simultaneous grow+shrink) — falls through and escalates fresh.
     fi
   fi
 
@@ -206,7 +213,11 @@ escalate_once() {
 # run's checked-db set (space-separated): a key concerning a db outside it
 # was not looked at this cycle, so its absence from ACTIVE_KEYS means
 # "out of scope", not "resolved" — a --databases subset run must not clear
-# another db's state (adversarial finding on #250).
+# another db's state (adversarial finding on #250). The guard only applies
+# when --databases was explicitly given: on an auto-discovery run, PROD_DBS
+# is every live database, so a covered db that no longer exists (dropped or
+# renamed) was never "checked" and would otherwise pin its state forever —
+# it counts as resolved instead (adversarial finding on #250).
 clear_resolved() {
   local pattern="$1" checked_dbs="${2:-}" f k covered required db item ok
   [[ -d "$STATE_DIR" ]] || return 0
@@ -221,7 +232,7 @@ clear_resolved() {
     esac
     key_is_active "$k" && continue
 
-    if [[ -n "$checked_dbs" ]]; then
+    if [[ -n "$checked_dbs" && "$DEFAULT_DBS" != "auto" ]]; then
       required="$covered"
       if [[ -z "$required" && "$pattern" == *':*' ]]; then
         # Per-db key (e.g. push-refused:<db>:<remote>): the db is the

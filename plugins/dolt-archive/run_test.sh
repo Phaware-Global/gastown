@@ -719,6 +719,52 @@ run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
 assert_count "$SANDBOX" "dolt push failed" 1 "db-b-only run must not clear db-a's unresolved push failure"
 rm -rf "$SANDBOX"
 
+log "=== Scenario: a shrunk affected set still sends a digest past REPEAT_SECS (PR #250) ==="
+# 2 failing (origin+mirror) -> escalate. Mirror recovers (shrink of the
+# escalated set) but REPEAT_SECS has already elapsed -> must send exactly one
+# low digest instead of staying silent indefinitely (adversarial finding on
+# #250: the shrink branch used to return early with no age check at all).
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+printf 'origin\thttps://github.com/test-owner/db-a (fetch)\nmirror\thttps://github.com/test-owner/db-a-mirror (fetch)\n' \
+  > "$SANDBOX/home/gt/.dolt-data/db-a/.mock-remotes"
+touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+rm -f "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
+ESCALATION_REPEAT_SECS=0 run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 2 "shrink past REPEAT_SECS must still send a digest"
+if [[ "$(grep -- "dolt push failed" "$SANDBOX/escalate.log" | grep -c -- "-s low")" -ne 1 ]]; then
+  echo "FAIL: shrink digest — expected exactly one '-s low' repeat"
+  sed 's/^/    /' "$SANDBOX/escalate.log"
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$SANDBOX"
+
+log "=== Scenario: growth remembers prior members so a later flap-back doesn't re-escalate (PR #250) ==="
+# a fails -> escalate (state={a}). a+b fail (growth) -> escalate (state must
+# become {a,b}, not just {a,b}-at-this-instant). b recovers (shrink of {a,b})
+# -> quiet. a+c fail (c appears, b still recovered) -> growth relative to
+# {a,b} -> escalate, and state must remember the full history as {a,b,c} (not
+# just {a,c}). b flaps back alongside a+c -> must NOT re-escalate, since b was
+# already escalated in an earlier round (adversarial finding on #250: the
+# growth branch used to overwrite state with only the current set, dropping
+# already-escalated members).
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+printf 'origin\thttps://github.com/test-owner/db-a (fetch)\nmirror\thttps://github.com/test-owner/db-a-mirror (fetch)\nthird\thttps://github.com/test-owner/db-a-third (fetch)\n' \
+  > "$SANDBOX/home/gt/.dolt-data/db-a/.mock-remotes"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+rm -f "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-third"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 3 "growth must remember prior members so a later flap-back doesn't re-escalate"
+rm -rf "$SANDBOX"
+
 echo ""
 if [[ $FAILURES -gt 0 ]]; then
   echo "Suite A (escalation logic): FAILED — $FAILURES scenario(s) failed"
