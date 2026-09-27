@@ -75,7 +75,7 @@ for RIG in $RIGS; do
   [ -z "$REPO" ] && continue
 
   PRS=$(gh pr list --repo "$REPO" --state open \
-    --json number,title,statusCheckRollup,headRefOid,headRefName --limit 100 2>/dev/null)
+    --json number,title,statusCheckRollup,headRefOid --limit 100 2>/dev/null)
   if [ -z "$PRS" ]; then
     log "ERROR: gh pr list failed for $RIG ($REPO)"
     ERRORS=1
@@ -84,48 +84,13 @@ for RIG in $RIGS; do
   PR_COUNT=$(echo "$PRS" | jq 'length' 2>/dev/null || echo 0)
   [ "$PR_COUNT" -eq 0 ] && continue
 
-  # Open merge-request beads. A PR that has finished but is still queued has
-  # its work bead closed (gt done) and is owned by an open MR bead, which
-  # lives only in the wisps table (bd list never sees it) and cites the PR by
-  # `review_pr:` and `branch:` fields, not "PR #<N>" text (gt-gy1b). Fetched
-  # once per rig. A failed query is unknown ownership, not zero owners; like
-  # the parse guards below, bd sql prints its errors on stdout, so validate
-  # the shape rather than trusting the exit status. `<> 'closed'` (not
-  # `= 'open'`) because MRs waiting on review sit at status "blocked".
-  MR_ROWS=$(bd -C "$RIG_DIR" sql --json "SELECT w.id, w.status, w.description \
-FROM wisps w JOIN wisp_labels l ON w.id = l.issue_id \
-WHERE l.label = 'gt:merge-request' AND w.status <> 'closed'" 2>/dev/null)
-  MR_OK=1
-  echo "$MR_ROWS" | jq -e 'type == "array"' >/dev/null 2>&1 || MR_OK=0
-
   while IFS= read -r PR_JSON; do
     [ -z "$PR_JSON" ] && continue
     PR_NUM=$(echo "$PR_JSON" | jq -r '.number')
     PR_TITLE=$(echo "$PR_JSON" | jq -r '.title')
     PR_HEAD=$(echo "$PR_JSON" | jq -r '.headRefOid // ""')
-    PR_BRANCH=$(echo "$PR_JSON" | jq -r '.headRefName // ""')
 
     if is_suppressed "$RIG" "$PR_NUM"; then
-      continue
-    fi
-
-    # Owned by an open merge-request bead (review_pr or branch match)?
-    if [ "$MR_OK" != "1" ]; then
-      log "ERROR: merge-request bead query failed for $RIG PR #$PR_NUM"
-      ERRORS=1
-      continue
-    fi
-    MR_OWNERS=$(echo "$MR_ROWS" | jq --arg n "$PR_NUM" --arg b "$PR_BRANCH" '
-      [.[] | select((.status // "") != "closed") | (.description // "") as $d
-        | select(($d | test("(^|\n)review_pr: " + $n + "[ \t\r]*(\n|$)"))
-                 or ($b != "" and ($d | split("\n") | any(. == "branch: " + $b))))
-      ] | length' 2>/dev/null)
-    if ! [[ "$MR_OWNERS" =~ ^[0-9]+$ ]]; then
-      log "ERROR: merge-request bead parse failed for $RIG PR #$PR_NUM"
-      ERRORS=1
-      continue
-    fi
-    if [ "$MR_OWNERS" != "0" ]; then
       continue
     fi
 
