@@ -164,6 +164,7 @@ GIT_FAILED=false
 GIT_REPO_MISSING=false
 GIT_PUSH_REFUSED=0
 GIT_REFUSAL_DETAIL=""
+GIT_GUARD_RAN=false
 
 if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   log ""
@@ -226,6 +227,7 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
       # of the production issue/mail databases — see gt-sg6n. Refusal is not
       # a push failure (the guard working as intended), so it is counted and
       # escalated on its own, never folded into GIT_FAILED.
+      GIT_GUARD_RAN=true
       if VIS_REASON=$(git_push_allowed origin); then
         if PUSH_ERR=$(git push origin main 2>&1); then
           GIT_PUSHED=true
@@ -399,8 +401,11 @@ else
   GIT_CLAUSE="git=nothing-to-push"
 fi
 
-# Skipped, the git step never ran — a 0 here would read as "checked, found none".
-if ! $SKIP_GIT; then
+# Only append when git_push_allowed actually ran. If the guard never ran
+# (git=skipped, git=missing, the ahead-check itself failed, or there was
+# nothing to push), a 0 here would misleadingly read as "checked, found none"
+# instead of "never checked".
+if $GIT_GUARD_RAN; then
   GIT_CLAUSE="$GIT_CLAUSE, git_push_refused=$GIT_PUSH_REFUSED"
 fi
 
