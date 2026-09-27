@@ -678,6 +678,26 @@ if git -C "$REPO" grep -q yesterday HEAD 2>/dev/null; then
 fi
 rm -rf "$SANDBOX"
 
+log "=== Scenario: stale link cannot be removed — cycle continues, escalates, stale data not committed (gt-pgvd) ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"
+write_bd_mock "$SANDBOX"
+write_gt_mock "$SANDBOX"
+write_git_backup_repo "$SANDBOX" '{"id":"older"}'
+mkdir -p "$SANDBOX/home/gt/.dolt-data/testdb"
+touch "$SANDBOX/home/gt/.dolt-data/testdb/.mock-export-fail"
+seed_stale_latest "$SANDBOX" testdb
+# Read-only jsonl dir: the export write and the link removal both get EACCES.
+chmod a-w "$SANDBOX/home/gt/.dolt-archive/jsonl"
+
+run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
+chmod u+w "$SANDBOX/home/gt/.dolt-archive/jsonl"
+assert_output_contains "$SANDBOX" "could not remove stale testdb-latest.jsonl" "unremovable stale link — failure is visible in the run output"
+assert_output_contains "$SANDBOX" "jsonl=0/1" "unremovable stale link — cycle reached the summary"
+assert_escalated "$SANDBOX" "JSONL export failed" "unremovable stale link"
+assert_no_stale_commit "$SANDBOX" "unremovable stale link"
+rm -rf "$SANDBOX"
+
 echo ""
 if [[ $FAILURES -gt 0 ]]; then
   echo "Suite A (escalation logic): FAILED — $FAILURES scenario(s) failed"

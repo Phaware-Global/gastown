@@ -82,12 +82,22 @@ dolt_query_json() {
 # not survive — otherwise old data is committed under today's name and the run
 # reads as healthy. Dated snapshot files are history, not a claim of currency,
 # and are left alone.
+#
+# Removal is best-effort: run.sh runs under set -e, so a bare failing rm would
+# abort the cycle before the summary, receipt and escalation. If the link can't
+# be removed (e.g. read-only jsonl dir) the db is recorded in STALE_LATEST and
+# Step 2 refuses to copy it, so the guard still fails closed.
+STALE_LATEST=()
 discard_stale_latest() {
   local db="$1"
   local link="$JSONL_EXPORT_DIR/${db}-latest.jsonl"
   if [[ -e "$link" || -L "$link" ]]; then
-    rm -f "$link"
-    log "  WARN: $db removed stale ${db}-latest.jsonl (export failed; it would have republished an older snapshot as current)"
+    if rm -f "$link" 2>/dev/null; then
+      log "  WARN: $db removed stale ${db}-latest.jsonl (export failed; it would have republished an older snapshot as current)"
+    else
+      STALE_LATEST+=("$db")
+      log "  WARN: $db could not remove stale ${db}-latest.jsonl (export failed); it will not be copied to the git backup"
+    fi
   fi
 }
 
@@ -186,6 +196,14 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   # Copy latest JSONL files to git repo
   for DB in "${PROD_DBS[@]}"; do
     LATEST="$JSONL_EXPORT_DIR/${DB}-latest.jsonl"
+    _stale=false
+    for _stale_db in "${STALE_LATEST[@]:-}"; do
+      [[ "$_stale_db" == "$DB" ]] && _stale=true
+    done
+    if $_stale; then
+      log "  $DB: skipping copy of stale ${DB}-latest.jsonl (export failed and the link could not be removed)"
+      continue
+    fi
     if [[ -L "$LATEST" ]]; then
       REAL_FILE="$JSONL_EXPORT_DIR/$(readlink "$LATEST")"
       if [[ -f "$REAL_FILE" ]]; then
