@@ -316,10 +316,14 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		}
 	}
 
-	// Step 3d: Close stale one-way telegraph notification wisps. These are
-	// fire-and-forget (msg-type:notification) and never acked — the telegraph
-	// is one-way, so recipients reply out of band. Without this they sit
-	// delivery:pending and inflate the open-wisp count alongside receipts.
+	// Step 3d: Close stale telegraph notification wisps the recipient has
+	// actually read (msg-type:notification + the `read` label, set by
+	// `gt mail read`). Without this they inflate the open-wisp count alongside
+	// receipts. delivery:acked is set by the inject hook the moment a
+	// notification is first shown and does NOT mean read, so unread
+	// notifications are NOT closed here — the body lives only in the bead, so
+	// that would silently lose unread mail (gt-78xq); they age out via the
+	// normal max-age reap.
 	notificationAge := 1 * time.Hour
 	var totalNotifClosed int
 	for _, dbName := range databases {

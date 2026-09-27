@@ -1,8 +1,8 @@
 package cmd
 
 import (
-	"database/sql"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -12,14 +12,6 @@ import (
 	"github.com/steveyegge/gastown/internal/reaper"
 	"github.com/steveyegge/gastown/internal/style"
 )
-
-// fastTrackCloseAge is the age past which ephemeral receipt and notification
-// wisps are eligible for fast-track closing during `gt reaper reap`. Far
-// shorter than the wisp max-age (24h) because these beads reach terminal value
-// within minutes — keeping them open for a full day is what pushes the
-// open-wisp count over the alert threshold. Mirrors the daemon inline path's
-// 1h plugin-receipt window (internal/daemon/wisp_reaper.go).
-const fastTrackCloseAge = 1 * time.Hour
 
 var (
 	reaperDB       string
@@ -164,41 +156,53 @@ The Dog uses this to understand the state before deciding what to reap.`,
 		if reaperJSON {
 			fmt.Println(reaper.FormatJSON(results))
 		} else {
-			var totalReap, totalMoleculeSteps, totalPurge, totalMail, totalStale, totalOpen int
-			for _, r := range results {
-				fmt.Printf("Database: %s\n", r.Database)
-				fmt.Printf("  Reap candidates:  %d\n", r.ReapCandidates)
-				if r.MoleculeStepCandidates > 0 {
-					fmt.Printf("  Molecule steps:   %d\n", r.MoleculeStepCandidates)
-				}
-				fmt.Printf("  Purge candidates: %d\n", r.PurgeCandidates)
-				fmt.Printf("  Mail candidates:  %d\n", r.MailCandidates)
-				fmt.Printf("  Stale candidates: %d\n", r.StaleCandidates)
-				fmt.Printf("  Open wisps:       %d\n", r.OpenWisps)
-				for _, a := range r.Anomalies {
-					fmt.Printf("  %s %s\n", style.Warning.Render("ANOMALY:"), a.Message)
-				}
-				totalReap += r.ReapCandidates
-				totalMoleculeSteps += r.MoleculeStepCandidates
-				totalPurge += r.PurgeCandidates
-				totalMail += r.MailCandidates
-				totalStale += r.StaleCandidates
-				totalOpen += r.OpenWisps
-			}
-			if len(results) > 1 {
-				fmt.Printf("\nScan summary (%d databases):\n", len(results))
-				fmt.Printf("  Reap candidates:  %d\n", totalReap)
-				if totalMoleculeSteps > 0 {
-					fmt.Printf("  Molecule steps:   %d\n", totalMoleculeSteps)
-				}
-				fmt.Printf("  Purge candidates: %d\n", totalPurge)
-				fmt.Printf("  Mail candidates:  %d\n", totalMail)
-				fmt.Printf("  Stale candidates: %d\n", totalStale)
-				fmt.Printf("  Open wisps:       %d\n", totalOpen)
-			}
+			printReaperScanText(os.Stdout, results)
 		}
 		return nil
 	},
+}
+
+// printReaperScanText renders scan results in the human-readable (non-JSON) format.
+func printReaperScanText(w io.Writer, results []*reaper.ScanResult) {
+	var totalReap, totalMoleculeSteps, totalFastTrack, totalPurge, totalMail, totalStale, totalOpen int
+	for _, r := range results {
+		fmt.Fprintf(w, "Database: %s\n", r.Database)
+		fmt.Fprintf(w, "  Reap candidates:  %d\n", r.ReapCandidates)
+		if r.MoleculeStepCandidates > 0 {
+			fmt.Fprintf(w, "  Molecule steps:   %d\n", r.MoleculeStepCandidates)
+		}
+		if r.FastTrackCandidates > 0 {
+			fmt.Fprintf(w, "  Fast-track:       %d\n", r.FastTrackCandidates)
+		}
+		fmt.Fprintf(w, "  Purge candidates: %d\n", r.PurgeCandidates)
+		fmt.Fprintf(w, "  Mail candidates:  %d\n", r.MailCandidates)
+		fmt.Fprintf(w, "  Stale candidates: %d\n", r.StaleCandidates)
+		fmt.Fprintf(w, "  Open wisps:       %d\n", r.OpenWisps)
+		for _, a := range r.Anomalies {
+			fmt.Fprintf(w, "  %s %s\n", style.Warning.Render("ANOMALY:"), a.Message)
+		}
+		totalReap += r.ReapCandidates
+		totalMoleculeSteps += r.MoleculeStepCandidates
+		totalFastTrack += r.FastTrackCandidates
+		totalPurge += r.PurgeCandidates
+		totalMail += r.MailCandidates
+		totalStale += r.StaleCandidates
+		totalOpen += r.OpenWisps
+	}
+	if len(results) > 1 {
+		fmt.Fprintf(w, "\nScan summary (%d databases):\n", len(results))
+		fmt.Fprintf(w, "  Reap candidates:  %d\n", totalReap)
+		if totalMoleculeSteps > 0 {
+			fmt.Fprintf(w, "  Molecule steps:   %d\n", totalMoleculeSteps)
+		}
+		if totalFastTrack > 0 {
+			fmt.Fprintf(w, "  Fast-track:       %d\n", totalFastTrack)
+		}
+		fmt.Fprintf(w, "  Purge candidates: %d\n", totalPurge)
+		fmt.Fprintf(w, "  Mail candidates:  %d\n", totalMail)
+		fmt.Fprintf(w, "  Stale candidates: %d\n", totalStale)
+		fmt.Fprintf(w, "  Open wisps:       %d\n", totalOpen)
+	}
 }
 
 var reaperReapCmd = &cobra.Command{
@@ -259,34 +263,23 @@ Returns the count of reaped wisps. Use --dry-run to preview.`,
 			// closes them after maxAge (24h), leaving ~1 day's worth open at
 			// all times — over the alert threshold. Closing them on a short
 			// window here, on the live Dog-driven path, keeps the open-wisp
-			// count flat. fastTrackCloseAge is intentionally << maxAge.
-			for _, fc := range []struct {
-				name string
-				fn   func(*sql.DB, string, time.Duration, bool) (*reaper.ClosePluginReceiptResult, error)
-			}{
-				{"plugin receipts", reaper.ClosePluginReceipts},
-				{"plugin dispatches", reaper.ClosePluginDispatches},
-				{"stale notifications", reaper.CloseStaleNotifications},
-			} {
-				res, err := fc.fn(db, dbName, fastTrackCloseAge, reaperDryRun)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "%s: %s close error: %v\n", dbName, fc.name, err)
-					continue
-				}
-				if res != nil && res.Closed > 0 {
-					// Keep the result consistent: these closes count toward the
-					// reaped total AND reduce the open-remaining count, so the
-					// per-db line, the multi-db summary, and the >threshold
-					// warning all reflect the post-close state. Reap() computed
-					// OpenRemain before the fast-track closes ran, so adjust it
-					// here. Only in a real run — in dry-run nothing is closed and
-					// OpenRemain stays a true snapshot of currently-open wisps.
-					result.Reaped += res.Closed
-					if !reaperDryRun {
-						result.OpenRemain -= res.Closed
-						if result.OpenRemain < 0 {
-							result.OpenRemain = 0
-						}
+			// count flat. reaper.FastTrackCloseAge is intentionally << maxAge.
+			closed, errs := reaper.CloseFastTrack(db, dbName, reaperDryRun)
+			for _, err := range errs {
+				fmt.Fprintf(os.Stderr, "%s: fast-track close error: %v\n", dbName, err)
+			}
+			if closed > 0 {
+				// Reported separately from Reaped (gt-oqnc): Reaped is only what
+				// the max-age predicate selected, so it stays comparable with
+				// scan's reap_candidates. These closes still reduce the
+				// open-remaining count in a real run — Reap() computed OpenRemain
+				// before they ran. In dry-run nothing is closed and OpenRemain
+				// stays a true snapshot of currently-open wisps.
+				result.FastTrackClosed = closed
+				if !reaperDryRun {
+					result.OpenRemain -= closed
+					if result.OpenRemain < 0 {
+						result.OpenRemain = 0
 					}
 				}
 			}
@@ -296,7 +289,7 @@ Returns the count of reaped wisps. Use --dry-run to preview.`,
 		if reaperJSON {
 			fmt.Println(reaper.FormatJSON(results))
 		} else {
-			var totalReaped, totalMoleculeSteps, totalOpen int
+			var totalReaped, totalMoleculeSteps, totalFastTrack, totalOpen int
 			for _, r := range results {
 				prefix := ""
 				if r.DryRun {
@@ -306,10 +299,14 @@ Returns the count of reaped wisps. Use --dry-run to preview.`,
 				if r.MoleculeStepsClosed > 0 {
 					extra = fmt.Sprintf(" (+%d closed-molecule steps)", r.MoleculeStepsClosed)
 				}
+				if r.FastTrackClosed > 0 {
+					extra += fmt.Sprintf(" (+%d fast-track receipts/read notifications, >%s old)", r.FastTrackClosed, reaper.FastTrackCloseAge)
+				}
 				fmt.Printf("%s: %sreaped %d wisps%s, %d open remain\n",
 					r.Database, prefix, r.Reaped, extra, r.OpenRemain)
 				totalReaped += r.Reaped
 				totalMoleculeSteps += r.MoleculeStepsClosed
+				totalFastTrack += r.FastTrackClosed
 				totalOpen += r.OpenRemain
 			}
 			if len(results) > 1 {
@@ -320,6 +317,9 @@ Returns the count of reaped wisps. Use --dry-run to preview.`,
 				extra := ""
 				if totalMoleculeSteps > 0 {
 					extra = fmt.Sprintf(" (+%d closed-molecule steps)", totalMoleculeSteps)
+				}
+				if totalFastTrack > 0 {
+					extra += fmt.Sprintf(" (+%d fast-track)", totalFastTrack)
 				}
 				fmt.Printf("\n%sReap summary (%d databases): reaped %d wisps%s, %d open remain\n",
 					prefix, len(results), totalReaped, extra, totalOpen)
