@@ -34,6 +34,9 @@ log() { echo "[test] $*"; }
 #   9. nothing to push (repo present, no diff, nothing ahead) -> summary reads git=nothing-to-push
 #  10-11. origin remote entirely absent (with/without a stale tracking ref) -> must
 #     escalate as a failure, NOT read as the all-clear (gt-a7um)
+#  12-14. a failed export (or failed table check) must not leave the previous
+#     cycle's -latest.jsonl behind, and the git step must not commit that old
+#     data as this cycle's snapshot (gt-pgvd)
 # =============================================================================
 
 FAILURES=0
@@ -103,12 +106,20 @@ case "$query" in
     [[ -f "$MOCK_DB_LIST" ]] && cat "$MOCK_DB_LIST"
     ;;
   "SHOW TABLES LIKE 'issues'")
+    if [[ -f "${DOLT_DATA_DIR:-$HOME/gt/.dolt-data}/$db/.mock-table-check-fail" ]]; then
+      echo "mock table check failure for $db" >&2
+      exit 1
+    fi
     printf 'Tables_in_db\n'
     if [[ ! -f "${DOLT_DATA_DIR:-$HOME/gt/.dolt-data}/$db/.mock-no-issues-table" ]]; then
       printf 'issues\n'
     fi
     ;;
   "SELECT * FROM issues ORDER BY id")
+    if [[ -f "${DOLT_DATA_DIR:-$HOME/gt/.dolt-data}/$db/.mock-export-fail" ]]; then
+      echo "mock export failure for $db" >&2
+      exit 1
+    fi
     printf '{"id":"1"}\n'
     ;;
   *)
@@ -611,6 +622,135 @@ if grep -qF "git=nothing-to-push" "$SANDBOX/output.log" 2>/dev/null; then
   echo "FAIL: stale tracking ref, no remote — output.log still contains the misleading git=nothing-to-push"
   FAILURES=$((FAILURES + 1))
 fi
+rm -rf "$SANDBOX"
+
+# --- Scenarios 12-14: a failed export must not republish an older snapshot ---
+# --- as the current one (gt-pgvd) --------------------------------------------
+#
+# A previous cycle left testdb-latest.jsonl -> testdb-<old>.jsonl (content
+# "yesterday"). The git backup repo holds still-older content ("older"). If the
+# export fails and the stale link survives, the git step copies "yesterday"
+# into the repo and commits it as "Archive snapshot <now>" — old data under
+# today's name, with nothing in the repo history to tell them apart.
+
+# Seeds yesterday's snapshot + -latest link for $2 (db name) in sandbox $1.
+seed_stale_latest() {
+  local sandbox="$1" db="$2"
+  local dir="$sandbox/home/gt/.dolt-archive/jsonl"
+  printf '{"id":"yesterday"}\n' > "$dir/${db}-20000101-0000.jsonl"
+  ln -s "${db}-20000101-0000.jsonl" "$dir/${db}-latest.jsonl"
+}
+
+# Asserts no commit in the backup repo ever carried $2 as testdb.jsonl content
+# beyond the seed, i.e. the stale data was not committed under a new snapshot.
+assert_no_stale_commit() {
+  local sandbox="$1" desc="$2"
+  local repo="$sandbox/home/gt/.dolt-archive/git"
+  local commits
+  commits="$(git -C "$repo" rev-list --count HEAD)"
+  if [[ "$commits" -ne 1 ]]; then
+    echo "FAIL: $desc — expected the backup repo to stay at its seed commit, got $commits commits:"
+    git -C "$repo" log --format='    %h %s' | head -5
+    FAILURES=$((FAILURES + 1))
+  fi
+  if git -C "$repo" grep -q yesterday HEAD -- testdb.jsonl 2>/dev/null; then
+    echo "FAIL: $desc — yesterday's data was committed to the backup repo as a new snapshot"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+assert_latest_absent() {
+  local sandbox="$1" db="$2" desc="$3"
+  local link="$sandbox/home/gt/.dolt-archive/jsonl/${db}-latest.jsonl"
+  if [[ -e "$link" || -L "$link" ]]; then
+    echo "FAIL: $desc — ${db}-latest.jsonl still present after a failed export -> $(readlink "$link" 2>/dev/null || echo '(file)')"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+log "=== Scenario: failed export must not leave a stale -latest link (gt-pgvd) ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"
+write_bd_mock "$SANDBOX"
+write_gt_mock "$SANDBOX"
+write_git_backup_repo "$SANDBOX" '{"id":"older"}'
+mkdir -p "$SANDBOX/home/gt/.dolt-data/testdb"
+touch "$SANDBOX/home/gt/.dolt-data/testdb/.mock-export-fail"
+seed_stale_latest "$SANDBOX" testdb
+
+run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
+assert_latest_absent "$SANDBOX" testdb "failed export"
+assert_no_stale_commit "$SANDBOX" "failed export"
+assert_output_contains "$SANDBOX" "removed stale testdb-latest.jsonl" "failed export — removal is visible in the run output"
+assert_output_contains "$SANDBOX" "jsonl=0/1" "failed export — summary counts the failure"
+assert_escalated "$SANDBOX" "JSONL export failed" "failed export"
+# The dated snapshot itself is history, not a claim of currency: it stays.
+if [[ ! -f "$SANDBOX/home/gt/.dolt-archive/jsonl/testdb-20000101-0000.jsonl" ]]; then
+  echo "FAIL: failed export — the dated historical snapshot was deleted"
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$SANDBOX"
+
+log "=== Scenario: failed table check must not leave a stale -latest link (gt-pgvd) ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"
+write_bd_mock "$SANDBOX"
+write_gt_mock "$SANDBOX"
+write_git_backup_repo "$SANDBOX" '{"id":"older"}'
+mkdir -p "$SANDBOX/home/gt/.dolt-data/testdb"
+touch "$SANDBOX/home/gt/.dolt-data/testdb/.mock-table-check-fail"
+seed_stale_latest "$SANDBOX" testdb
+
+run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
+assert_latest_absent "$SANDBOX" testdb "failed table check"
+assert_no_stale_commit "$SANDBOX" "failed table check"
+assert_output_contains "$SANDBOX" "removed stale testdb-latest.jsonl" "failed table check — removal is visible in the run output"
+assert_escalated "$SANDBOX" "JSONL export failed" "failed table check"
+rm -rf "$SANDBOX"
+
+log "=== Scenario: one db fails, the other exports — only the failed db loses its link (gt-pgvd) ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"
+write_bd_mock "$SANDBOX"
+write_gt_mock "$SANDBOX"
+write_git_backup_repo "$SANDBOX" '{"id":"older"}'
+mkdir -p "$SANDBOX/home/gt/.dolt-data/testdb" "$SANDBOX/home/gt/.dolt-data/gooddb"
+touch "$SANDBOX/home/gt/.dolt-data/testdb/.mock-export-fail"
+seed_stale_latest "$SANDBOX" testdb
+seed_stale_latest "$SANDBOX" gooddb
+
+run_scenario "$SANDBOX" --databases testdb,gooddb --skip-dolt-push
+assert_latest_absent "$SANDBOX" testdb "failed db in a mixed run"
+GOOD_LINK="$SANDBOX/home/gt/.dolt-archive/jsonl/gooddb-latest.jsonl"
+if [[ ! -L "$GOOD_LINK" ]] || [[ "$(readlink "$GOOD_LINK")" == "gooddb-20000101-0000.jsonl" ]]; then
+  echo "FAIL: mixed run — gooddb-latest.jsonl was not advanced to this cycle's fresh export"
+  FAILURES=$((FAILURES + 1))
+fi
+REPO="$SANDBOX/home/gt/.dolt-archive/git"
+if git -C "$REPO" grep -q yesterday HEAD 2>/dev/null; then
+  echo "FAIL: mixed run — yesterday's data reached the backup repo"
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$SANDBOX"
+
+log "=== Scenario: stale link cannot be removed — cycle continues, escalates, stale data not committed (gt-pgvd) ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"
+write_bd_mock "$SANDBOX"
+write_gt_mock "$SANDBOX"
+write_git_backup_repo "$SANDBOX" '{"id":"older"}'
+mkdir -p "$SANDBOX/home/gt/.dolt-data/testdb"
+touch "$SANDBOX/home/gt/.dolt-data/testdb/.mock-export-fail"
+seed_stale_latest "$SANDBOX" testdb
+# Read-only jsonl dir: the export write and the link removal both get EACCES.
+chmod a-w "$SANDBOX/home/gt/.dolt-archive/jsonl"
+
+run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
+chmod u+w "$SANDBOX/home/gt/.dolt-archive/jsonl"
+assert_output_contains "$SANDBOX" "could not remove stale testdb-latest.jsonl" "unremovable stale link — failure is visible in the run output"
+assert_output_contains "$SANDBOX" "jsonl=0/1" "unremovable stale link — cycle reached the summary"
+assert_escalated "$SANDBOX" "JSONL export failed" "unremovable stale link"
+assert_no_stale_commit "$SANDBOX" "unremovable stale link"
 rm -rf "$SANDBOX"
 
 echo ""
