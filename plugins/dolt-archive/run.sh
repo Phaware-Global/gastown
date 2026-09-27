@@ -2,7 +2,8 @@
 # dolt-archive/run.sh — Deterministic JSONL backup + git push + dolt push.
 #
 # Exports production databases to JSONL, commits to git backup repo,
-# and pushes Dolt remotes. JSONL is the last-resort recovery layer.
+# and pushes Dolt remotes. JSONL is the last-resort recovery layer. Both push
+# layers refuse any destination not confirmed private (visibility_guard.sh).
 #
 # Usage: ./run.sh [--databases db1,db2,...] [--skip-git] [--skip-dolt-push]
 
@@ -188,6 +189,9 @@ log "JSONL export: $EXPORTED succeeded, $EXPORT_FAILED failed"
 GIT_PUSHED=false
 GIT_FAILED=false
 GIT_REPO_MISSING=false
+GIT_PUSH_REFUSED=0
+GIT_REFUSAL_DETAIL=""
+GIT_GUARD_RAN=false
 
 if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   log ""
@@ -253,13 +257,32 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   # rather than the misleading all-clear.
   if AHEAD="$(git rev-list origin/main..HEAD 2>&1)"; then
     if [[ -n "$AHEAD" ]]; then
-      if PUSH_ERR=$(git push origin main 2>&1); then
-        GIT_PUSHED=true
-        log "Pushed to GitHub"
-      else
-        log "WARN: Git push to remote failed:"
-        logblock "$(printf '%s' "$PUSH_ERR" | redact)"
+      # Same fail-closed gate as the dolt push below: refuse unless every
+      # push URL is a GitHub repo confirmed private. The JSONL is an export
+      # of the production issue/mail databases — see gt-sg6n. Refusal is not
+      # a push failure (the guard working as intended), so it is counted and
+      # escalated on its own, never folded into GIT_FAILED.
+      GIT_GUARD_RAN=true
+      if VIS_REASON=$(git_push_allowed origin); then
+        if PUSH_ERR=$(git push origin main 2>&1); then
+          GIT_PUSHED=true
+          log "Pushed to GitHub"
+        else
+          log "WARN: Git push to remote failed:"
+          logblock "$(printf '%s' "$PUSH_ERR" | redact)"
+          GIT_FAILED=true
+        fi
+      elif [[ "$VIS_REASON" == "push-url-unresolvable" ]]; then
+        # No push destination at all (origin removed but a stale
+        # refs/remotes/origin/main survives) — nothing was judged unsafe,
+        # the push simply cannot happen. Same failure as a missing origin.
+        log "WARN: Cannot resolve a push URL for origin (remote removed, stale refs/remotes/origin/main?):"
         GIT_FAILED=true
+      else
+        PUSH_URLS="$(git remote get-url --push --all origin 2>/dev/null | tr '\n' ' ' | redact || true)"
+        log "WARN: git origin: REFUSED — visibility=$VIS_REASON (not confirmed private): ${PUSH_URLS:-<unresolvable>}"
+        GIT_PUSH_REFUSED=$((GIT_PUSH_REFUSED + 1))
+        GIT_REFUSAL_DETAIL="origin(${VIS_REASON})"
       fi
     fi
   else
@@ -365,7 +388,7 @@ if ! $SKIP_DOLT_PUSH && [[ "$EXPORTED_DBS_WITH_REMOTE" -lt "$EXPORTED" ]]; then
 fi
 
 RESULT="success"
-if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_REFUSED" -gt 0 ]] || $GIT_FAILED || $GIT_REPO_MISSING || $REMOTE_SHORTFALL; then
+if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_REFUSED" -gt 0 ]] || [[ "$GIT_PUSH_REFUSED" -gt 0 ]] || $GIT_FAILED || $GIT_REPO_MISSING || $REMOTE_SHORTFALL; then
   RESULT="warning"
 fi
 
@@ -397,23 +420,37 @@ fi
 # push error), and nothing-to-push (repo present, nothing ahead of
 # origin/main) all read as "false". Same vocabulary as dolt_push's own
 # skipped/attempted distinction above. Checked in priority order: a push that
-# actually succeeded wins even if an earlier step in the same cycle failed.
+# actually succeeded wins even if an earlier step in the same cycle failed; a
+# visibility refusal outranks a plain failure so it is never read as one.
 if $SKIP_GIT; then
   GIT_CLAUSE="git=skipped"
 elif $GIT_REPO_MISSING; then
   GIT_CLAUSE="git=missing"
 elif $GIT_PUSHED; then
   GIT_CLAUSE="git=pushed"
+elif [[ "$GIT_PUSH_REFUSED" -gt 0 ]]; then
+  GIT_CLAUSE="git=refused"
 elif $GIT_FAILED; then
   GIT_CLAUSE="git=failed"
 else
   GIT_CLAUSE="git=nothing-to-push"
 fi
 
+# Only append when git_push_allowed actually ran. If the guard never ran
+# (git=skipped, git=missing, the ahead-check itself failed, or there was
+# nothing to push), a 0 here would misleadingly read as "checked, found none"
+# instead of "never checked".
+if $GIT_GUARD_RAN; then
+  GIT_CLAUSE="$GIT_CLAUSE, git_push_refused=$GIT_PUSH_REFUSED"
+fi
+
 SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), $GIT_CLAUSE, $DOLT_PUSH_CLAUSE, result=$RESULT"
 log "$SUMMARY"
 if [[ "$DOLT_PUSH_REFUSED" -gt 0 ]]; then
   log "  Refused (unsafe destination): $DOLT_REFUSAL_DETAIL"
+fi
+if [[ "$GIT_PUSH_REFUSED" -gt 0 ]]; then
+  log "  Refused git push (unsafe destination): $GIT_REFUSAL_DETAIL"
 fi
 
 _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
@@ -435,6 +472,16 @@ if [[ "$DOLT_PUSH_FAILED" -gt 0 ]]; then
     -s critical \
     --fingerprint "dolt-archive:dolt-push-failed" \
     --reason "Native Dolt replication did not reach $DOLT_PUSH_FAILED remote(s) this cycle. The data did not leave this machine via that path." 2>&1); then
+    log "WARN: gt escalate failed:"
+    logblock "$ESCALATE_ERR"
+  fi
+fi
+
+if [[ "$GIT_PUSH_REFUSED" -gt 0 ]]; then
+  if ! ESCALATE_ERR=$(gt escalate "dolt-archive: refused git backup push to unsafe remote origin" \
+    -s critical \
+    --fingerprint "dolt-archive:git-push-refused:origin" \
+    --reason "Push destination visibility is '${GIT_REFUSAL_DETAIL}', not confirmed private. Refusing to push JSONL exports of the production databases from $BACKUP_REPO to ${PUSH_URLS:-<unresolvable>} until it is. See gt-sg6n." 2>&1); then
     log "WARN: gt escalate failed:"
     logblock "$ESCALATE_ERR"
   fi
