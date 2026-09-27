@@ -110,6 +110,7 @@ func (g *Git) run(args ...string) (string, error) {
 
 	cmd := exec.Command("git", args...)
 	util.SetDetachedProcessGroup(cmd)
+	cmd.Env = nonInteractiveGitEnv()
 	if g.workDir != "" {
 		cmd.Dir = g.workDir
 	}
@@ -124,6 +125,18 @@ func (g *Git) run(args ...string) (string, error) {
 	}
 
 	return strings.TrimSpace(stdout.String()), nil
+}
+
+// nonInteractiveGitEnv returns the environment for a git child process with
+// credential prompting disabled. gt runs git with no way to answer a prompt
+// (daemon, patrols) or from commands the user expects to be read-only
+// (e.g. `gt polecat list --all`), so when a credential helper yields nothing
+// — a locked keychain behind `gh auth git-credential` over SSH — git must fail
+// fast instead of blocking on a `Username for ...` prompt on /dev/tty.
+// Callers already treat a failed remote query as "unknown/not safe".
+func nonInteractiveGitEnv(extra ...string) []string {
+	env := append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never")
+	return append(env, extra...)
 }
 
 // pushTimeout is the maximum time a git push is allowed to run before being
@@ -156,6 +169,7 @@ func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _
 
 	cmd := exec.CommandContext(ctx, "git", args...)
 	util.SetDetachedProcessGroup(cmd)
+	cmd.Env = nonInteractiveGitEnv()
 	if g.workDir != "" {
 		cmd.Dir = g.workDir
 	}
@@ -208,9 +222,7 @@ func (g *Git) runWithEnvAndTimeout(args []string, extraEnv []string, timeout tim
 	if g.workDir != "" {
 		cmd.Dir = g.workDir
 	}
-	if len(extraEnv) > 0 {
-		cmd.Env = append(os.Environ(), extraEnv...)
-	}
+	cmd.Env = nonInteractiveGitEnv(extraEnv...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -669,7 +681,7 @@ func (g *Git) cloneInternal(url, dest string, opts cloneOptions) error {
 	cmd := exec.Command("git", args...)
 	util.SetDetachedProcessGroup(cmd)
 	cmd.Dir = tmpDir
-	cmd.Env = append(os.Environ(), "GIT_CEILING_DIRECTORIES="+tmpDir)
+	cmd.Env = nonInteractiveGitEnv("GIT_CEILING_DIRECTORIES=" + tmpDir)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -844,6 +856,7 @@ func configureRefspec(repoPath string, singleBranch bool) error {
 			// Fallback: if HEAD is detached, try fetching all (shouldn't happen for clones)
 			fetchCmd := exec.Command("git", "--git-dir", gitDir, "fetch", "--depth", "1", "origin")
 			util.SetDetachedProcessGroup(fetchCmd)
+			fetchCmd.Env = nonInteractiveGitEnv()
 			fetchCmd.Stderr = &stderr
 			if fetchErr := fetchCmd.Run(); fetchErr != nil {
 				return fmt.Errorf("fetching origin: %s", strings.TrimSpace(stderr.String()))
@@ -856,6 +869,7 @@ func configureRefspec(repoPath string, singleBranch bool) error {
 
 		fetchCmd := exec.Command("git", "--git-dir", gitDir, "fetch", "--depth", "1", "origin", refspec)
 		util.SetDetachedProcessGroup(fetchCmd)
+		fetchCmd.Env = nonInteractiveGitEnv()
 		fetchCmd.Stderr = &stderr
 		if err := fetchCmd.Run(); err != nil {
 			return fmt.Errorf("fetching origin %s: %s", branch, strings.TrimSpace(stderr.String()))
@@ -865,6 +879,7 @@ func configureRefspec(repoPath string, singleBranch bool) error {
 
 	fetchCmd := exec.Command("git", "--git-dir", gitDir, "fetch", "origin")
 	util.SetDetachedProcessGroup(fetchCmd)
+	fetchCmd.Env = nonInteractiveGitEnv()
 	fetchCmd.Stderr = &stderr
 	if err := fetchCmd.Run(); err != nil {
 		return fmt.Errorf("fetching origin: %s", strings.TrimSpace(stderr.String()))
@@ -4152,6 +4167,7 @@ func InitSubmodules(repoPath string, referencePath ...string) error {
 
 	cmd := exec.Command("git", args...)
 	util.SetDetachedProcessGroup(cmd)
+	cmd.Env = nonInteractiveGitEnv()
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -4345,6 +4361,7 @@ func (g *Git) PushSubmoduleCommit(submodulePath, sha, remote string) error {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", "-C", absPath, "push", remote, sha+":refs/heads/"+defaultBranch)
 	util.SetDetachedProcessGroup(cmd)
+	cmd.Env = nonInteractiveGitEnv()
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -4390,6 +4407,7 @@ func submoduleDefaultBranch(submodulePath, remote string) (string, error) {
 	for _, candidate := range []string{"main", "master"} {
 		check := exec.Command("git", "-C", submodulePath, "ls-remote", "--exit-code", remote, "refs/heads/"+candidate)
 		util.SetDetachedProcessGroup(check)
+		check.Env = nonInteractiveGitEnv()
 		if check.Run() == nil {
 			return candidate, nil
 		}
