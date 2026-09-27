@@ -860,6 +860,72 @@ func TestFastTrackClosuresAreNotReapedAndScanPredictsThem(t *testing.T) {
 	}
 }
 
+// TestStaleNotificationsOnlyFastTrackAckedMail is the gt-78xq regression. A
+// notification's body exists only in its bead (a nudge merely announces it), so
+// a never-read one (delivery:pending) must not be closed at the 1h fast-track
+// age — that silently loses unread mail. Only delivery:acked (the recipient ran
+// `gt mail read`) is fast-tracked; pending mail falls back to the max-age Reap.
+func TestStaleNotificationsOnlyFastTrackAckedMail(t *testing.T) {
+	now := time.Now().UTC()
+	notif := func(id string, age time.Duration, delivery ...string) *fakeWisp {
+		labels := append([]string{"gt:message", "msg-type:notification"}, delivery...)
+		return &fakeWisp{id: id, status: "open", issueType: "task", createdAt: now.Add(-age), labels: labels}
+	}
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"acked-2h":       notif("acked-2h", 2*time.Hour, "delivery:acked"),
+			"acked-10m":      notif("acked-10m", 10*time.Minute, "delivery:acked"),
+			"pending-2h":     notif("pending-2h", 2*time.Hour, "delivery:pending"),
+			"pending-25h":    notif("pending-25h", 25*time.Hour, "delivery:pending"),
+			"both-labels-2h": notif("both-labels-2h", 2*time.Hour, "delivery:pending", "delivery:acked"),
+			"receipt-2h":     {id: "receipt-2h", status: "open", issueType: "task", createdAt: now.Add(-2 * time.Hour), labels: []string{"type:plugin-run"}},
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	maxAge := 24 * time.Hour
+	scan, err := Scan(db, "testdb", maxAge, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	// acked-2h, both-labels-2h (acked wins even if pending lingers), receipt-2h.
+	if scan.FastTrackCandidates != 3 {
+		t.Fatalf("scan.FastTrackCandidates = %d, want 3 (acked-2h, both-labels-2h, receipt-2h; never pending)", scan.FastTrackCandidates)
+	}
+
+	closed, errs := CloseFastTrack(db, "testdb", false)
+	if len(errs) != 0 {
+		t.Fatalf("CloseFastTrack errors: %v", errs)
+	}
+	if closed != scan.FastTrackCandidates {
+		t.Fatalf("CloseFastTrack closed %d, scan predicted %d", closed, scan.FastTrackCandidates)
+	}
+	for id, want := range map[string]string{
+		"acked-2h": "closed", "both-labels-2h": "closed", "receipt-2h": "closed",
+		"acked-10m": "open", "pending-2h": "open", "pending-25h": "open",
+	} {
+		if got := state.status(id); got != want {
+			t.Errorf("after fast-track: %s status = %q, want %q", id, got, want)
+		}
+	}
+
+	// The normal max-age path still closes pending mail once it is past maxAge.
+	reap, err := Reap(db, "testdb", maxAge, false)
+	if err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if reap.Reaped != 1 {
+		t.Fatalf("Reap Reaped = %d, want 1 (only pending-25h is past max-age)", reap.Reaped)
+	}
+	for id, want := range map[string]string{"pending-2h": "open", "pending-25h": "closed"} {
+		if got := state.status(id); got != want {
+			t.Errorf("after Reap: %s status = %q, want %q", id, got, want)
+		}
+	}
+}
+
 var fakeReaperDriverID uint64
 
 func openFakeReaperDB(t *testing.T, state *fakeReaperState) *sql.DB {
