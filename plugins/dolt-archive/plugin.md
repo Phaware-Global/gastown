@@ -293,10 +293,13 @@ fi
 `run.sh` escalates each unhealthy condition **once**, not once per run. Every
 run still logs every condition; only the `gt escalate` call is gated.
 
-Each condition has a key and an affected-set signature (which DBs/remotes; for a
-refused push, the remote URL and visibility reason too). State lives in
-`~/gt/.dolt-archive/escalation-state/` (override: `DOLT_ARCHIVE_STATE_DIR`) and
-holds only a hash of the signature.
+Each *independently-resolvable* condition — a specific db, or a specific
+db+remote pair, never a whole condition class lumped into one shared set —
+gets its own key and its own content signature (for a refused push, the
+remote URL and visibility reason). There is no history shared between keys:
+one entity's ongoing failure can never mask another entity's resolve-then-
+return. State lives in `~/gt/.dolt-archive/escalation-state/` (override:
+`DOLT_ARCHIVE_STATE_DIR`) and holds only a hash of the signature.
 
 | Situation | Result |
 |-----------|--------|

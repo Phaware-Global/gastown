@@ -111,15 +111,27 @@ discard_stale_latest() {
 
 # --- Escalation dedupe (gt-4kip) ---------------------------------------------
 #
-# Every condition has a KEY (which condition) and a SIG (its affected set: which
-# DBs/remotes, which URL+visibility). State per key is "<sig-hash> <epoch> <key> <covered>".
-#   - no state, or SIG changed  -> escalate critical (new, or materially different)
-#   - same SIG, < REPEAT_SECS   -> log only, no escalation
-#   - same SIG, >= REPEAT_SECS  -> escalate once more at LOW (digest)
-#   - condition absent this run -> state dropped, so its return escalates afresh
-# State is written only after `gt escalate` succeeds, so a failed escalation is
-# retried on the next cycle rather than silently swallowed. SIGs are stored only
-# as a hash: they may embed a remote URL, which must not land on disk in the clear.
+# Each independently-resolvable condition (a specific db, or a specific
+# db+remote pair) gets its OWN state file, keyed by name -- never a shared
+# set/union across conditions. That is deliberate: four review rounds on a
+# "sticky union" design (one state entry per condition *class*, remembering
+# every member it had ever seen so a later member-shrink didn't misread as
+# new) all failed the same way -- a member that resolved and later recurred
+# stayed masked by the memory of an unrelated member still failing. Per-entity
+# keys make that bug impossible: there is no union to keep growing, so a
+# specific entity's own history is the only thing that can suppress it.
+#
+# State per key is "<content-hash> <epoch> <key>":
+#   - no state, or content changed -> escalate critical (new, changed, or a
+#     resolved condition returning -- the state was dropped in between)
+#   - same content, < REPEAT_SECS   -> log only, no escalation
+#   - same content, >= REPEAT_SECS  -> escalate once more at LOW (digest)
+#   - condition absent from a run that checked it -> state dropped, so a
+#     later recurrence escalates afresh
+# State is written only after `gt escalate` succeeds, so a failed escalation
+# is retried on the next cycle rather than silently swallowed. Content is
+# stored only as a hash: some callers' content embeds a remote URL, which
+# must not land on disk in the clear.
 
 ACTIVE_KEYS=()
 
@@ -136,121 +148,147 @@ key_is_active() {
   return 1
 }
 
-# Deterministic, order-insensitive rendering of a whitespace-separated set.
+# Deterministic, order-insensitive rendering of a whitespace-separated set --
+# used only to normalize multi-entity fingerprints, never to track history.
 sorted_set() {
   # An all-empty input (every arg "") is a legitimate empty set, not an
   # error: grep -v '^$' then filters out every line and exits 1, which
   # would otherwise abort the whole script under set -e -o pipefail at
-  # any call site that assigns this into a variable (e.g. the covered-set
-  # union in escalate_once, whose args are "" until a condition has ever
-  # recorded one).
+  # any call site that assigns this into a variable.
   printf '%s\n' "$@" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '
   return 0
 }
 
-# member_hashes SIG — sorted, comma-joined (trailing comma), per-token cksum
-# hash of a whitespace-separated set. Hashing per member (instead of the
-# whole string at once) lets escalate_once tell "a member disappeared"
-# (shrink, e.g. partial recovery) from "a member appeared" (growth) instead
-# of treating any change to the set as equally new — a flapping member
-# otherwise re-escalates at critical on every toggle (adversarial finding
-# on #250). Members are hashed, not stored in the clear, because some
-# callers' sigs embed a remote URL.
-member_hashes() {
-  local -a items
-  local item out=""
-  read -ra items <<< "$1"
-  for item in "${items[@]}"; do
-    [[ -n "$item" ]] || continue
-    out="${out}$(printf '%s' "$item" | cksum | cut -d' ' -f1)"$'\n'
-  done
-  printf '%s' "$out" | sort -u | tr '\n' ','
+# The db a per-entity key concerns, or "" for a key with no db scoping
+# (git-repo-missing, git-backup-failed, git-push-refused:origin -- the
+# "origin" there is a remote name, not a db). Keys are "<condition>:<db>"
+# or "<condition>:<db>:<remote>"; the db is always the first segment after
+# the condition.
+key_scope_db() {
+  case "$1" in
+    export-failed:*|remote-shortfall:*|push-refused:*|dolt-push-failed:*)
+      local rest="${1#*:}"
+      printf '%s' "${rest%%:*}"
+      ;;
+    *) printf '' ;;
+  esac
 }
 
-# hash_set_is_subset A B — true if every hash in comma-joined set A (as
-# produced by member_hashes) is also present in comma-joined set B.
-hash_set_is_subset() {
-  local hay=",$2" item
-  local -a items
-  IFS=',' read -ra items <<< "$1"
-  for item in "${items[@]}"; do
-    [[ -n "$item" ]] || continue
-    [[ "$hay" == *",$item,"* ]] || return 1
-  done
-  return 0
-}
-
-# escalate_once KEY SIG TITLE REASON [COVERED_DBS]
-#
-# COVERED_DBS (optional) is the whitespace-separated set of databases this
-# condition concerns. It is recorded so clear_resolved can tell "not looked
-# at this run" apart from "looked at and no longer failing" on a
-# --databases subset run (adversarial finding on #250). Omitted for
-# conditions with no db-scoped meaning (push-refused's db already lives in
-# its key; the git-backup keys concern no db at all).
-#
-# Whenever cur_hashes carries forward any previously-recorded members (the
-# digest-repeat path, or the growth-union path below), the recorded COVERED
-# set must carry the same union — not just this run's covered arg. Val's
-# HIGH on #250: the growth-union kept hashes for old+new members but recorded
-# 'covered' for the new members only, so a later --databases subset run (that
-# only checks the new member) saw the old member's db as "out of scope" and
-# cleared its state, letting a still-unresolved condition re-file as if new.
-escalate_once() {
-  local key="$1" sig="$2" title="$3" reason="$4" covered="${5:-}"
-  local now file prev_hashes="" last="" _k prev_covered="" severity="critical" fp cur_hashes
-
-  ACTIVE_KEYS+=("$key")
-  now="$(date +%s)"
+# entity_status KEY CONTENT -- "new" (no prior state, or content changed --
+# escalate critical), "same" (identical content, still within REPEAT_SECS --
+# stay quiet), or "digest" (identical content, REPEAT_SECS elapsed -- one LOW
+# reminder).
+entity_status() {
+  local key="$1" content="$2" file hash prev_hash prev_last now
   file="$(state_file "$key")"
-  cur_hashes="$(member_hashes "$sig")"
-  fp="dolt-archive:${key}:$(printf '%s' "$cur_hashes" | cksum | cut -d' ' -f1)"
-
+  hash="$(printf '%s' "$content" | cksum | cut -d' ' -f1)"
+  now="$(date +%s)"
   if [[ -f "$file" ]]; then
-    read -r prev_hashes last _k prev_covered < "$file" || true
+    read -r prev_hash prev_last _ < "$file" || true
     # Unreadable state or a clock that went backwards: treat as no state.
-    if [[ -n "$prev_hashes" && "$last" =~ ^[0-9]+$ && "$last" -le "$now" ]]; then
-      if [[ "$cur_hashes" == "$prev_hashes" ]] || hash_set_is_subset "$cur_hashes" "$prev_hashes"; then
-        # Same set, or every currently-affected member already escalated as
-        # part of a larger set (a pure shrink/partial recovery). Either way,
-        # stay quiet until REPEAT_SECS, then send one low digest and keep
-        # recording the larger set so a member flapping back into it doesn't
-        # read as "new" (adversarial finding on #250).
-        if (( now - last < REPEAT_SECS )); then
-          if [[ "$cur_hashes" == "$prev_hashes" ]]; then
-            log "  $key: unchanged, already escalated $(( (now - last) / 60 ))m ago — not re-escalating"
-          else
-            log "  $key: affected set shrank (partial recovery) — not re-escalating"
-          fi
-          return 0
-        fi
-        severity="low"
-        title="$title (still unresolved)"
-        fp="$fp:digest-$(date +%Y%m%d)"
-        cur_hashes="$prev_hashes"
-        covered="$(sorted_set "$covered" "$prev_covered")"
-      else
-        # The current set has a member the recorded set lacks (growth, or a
-        # simultaneous grow+shrink) — escalate fresh, but record the union
-        # so an already-escalated member isn't forgotten and re-escalated
-        # as "new" on a later flap (adversarial finding on #250). The
-        # covered set must grow with it (val's HIGH on #250) so a later
-        # subset run that only checks the new member does not read the old
-        # member's db as never-checked and clear its still-unresolved state.
-        cur_hashes="$(printf '%s' "${cur_hashes}${prev_hashes}" | tr ',' '\n' | sed '/^$/d' | sort -u | tr '\n' ',')"
-        covered="$(sorted_set "$covered" "$prev_covered")"
+    if [[ "$hash" == "$prev_hash" && "$prev_last" =~ ^[0-9]+$ && "$prev_last" -le "$now" ]]; then
+      if (( now - prev_last < REPEAT_SECS )); then
+        echo "same"; return
       fi
+      echo "digest"; return
     fi
   fi
+  echo "new"
+}
+
+entity_record() {
+  local key="$1" content="$2" hash
+  hash="$(printf '%s' "$content" | cksum | cut -d' ' -f1)"
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  printf '%s %s %s\n' "$hash" "$(date +%s)" "$key" > "$(state_file "$key")" 2>/dev/null \
+    || log "WARN: cannot record escalation state in $STATE_DIR — repeats will re-escalate"
+}
+
+# escalate_entity KEY CONTENT TITLE REASON
+#
+# For a single, atomic condition (push-refused:<db>:<remote>,
+# git-push-refused:origin, git-backup-failed, git-repo-missing). CONTENT is
+# whatever should trigger an immediate re-escalation if it changes even
+# though the key doesn't (e.g. push-refused's URL+visibility-reason) --
+# pass "" for a condition with no such content.
+escalate_entity() {
+  local key="$1" content="$2" title="$3" reason="$4"
+  local status severity="critical" fp
+
+  ACTIVE_KEYS+=("$key")
+  status="$(entity_status "$key" "$content")"
+  case "$status" in
+    same)
+      log "  $key: unchanged, already escalated — not re-escalating"
+      return 0
+      ;;
+    digest)
+      severity="low"
+      title="$title (still unresolved)"
+      ;;
+  esac
+
+  fp="dolt-archive:${key}:$(printf '%s' "$content" | cksum | cut -d' ' -f1)"
+  [[ "$status" == "digest" ]] && fp="${fp}:digest-$(date +%Y%m%d)"
 
   if ! ESCALATE_ERR=$(gt escalate "$title" -s "$severity" --fingerprint "$fp" --reason "$reason" 2>&1); then
     log "WARN: gt escalate failed (will retry next cycle):"
     logblock "$ESCALATE_ERR"
     return 0
   fi
-  mkdir -p "$STATE_DIR" 2>/dev/null || true
-  printf '%s %s %s %s\n' "$cur_hashes" "$now" "$key" "$covered" > "$file" 2>/dev/null \
-    || log "WARN: cannot record escalation state in $STATE_DIR — repeats will re-escalate"
+  entity_record "$key" "$content"
+}
+
+# escalate_aggregate KEY_PREFIX SUBKEYS TITLE REASON
+#
+# For a condition that is naturally reported as one human-facing count
+# across several entities (export-failed, dolt-push-failed,
+# remote-shortfall). SUBKEYS is the whitespace-separated set of entities
+# (db names, or "db:remote" pairs) affected THIS cycle. Each gets its own
+# independently-tracked key "<KEY_PREFIX>:<subkey>" -- no shared history
+# between them. Fires ONE escalation, using the given aggregate TITLE/REASON
+# (which the caller has already built from this cycle's own totals), exactly
+# when at least one subkey is new-or-changed (critical) or, absent that, at
+# least one is due for its own periodic digest (low). A subkey unchanged and
+# not yet due contributes nothing either way.
+escalate_aggregate() {
+  local prefix="$1" subkeys="$2" title="$3" reason="$4"
+  local sk status has_new=false has_digest=false severity fp
+
+  [[ -z "$subkeys" ]] && return 0
+
+  for sk in $subkeys; do
+    ACTIVE_KEYS+=("${prefix}:${sk}")
+    status="$(entity_status "${prefix}:${sk}" "$sk")"
+    case "$status" in
+      new) has_new=true ;;
+      digest) has_digest=true ;;
+    esac
+  done
+
+  if ! $has_new && ! $has_digest; then
+    log "  $prefix: unchanged, already escalated — not re-escalating"
+    return 0
+  fi
+
+  severity="critical"
+  if ! $has_new; then
+    severity="low"
+    title="$title (still unresolved)"
+  fi
+
+  fp="dolt-archive:${prefix}:$(sorted_set "$subkeys" | cksum | cut -d' ' -f1)"
+  [[ "$severity" == "low" ]] && fp="${fp}:digest-$(date +%Y%m%d)"
+
+  if ! ESCALATE_ERR=$(gt escalate "$title" -s "$severity" --fingerprint "$fp" --reason "$reason" 2>&1); then
+    log "WARN: gt escalate failed (will retry next cycle):"
+    logblock "$ESCALATE_ERR"
+    return 0
+  fi
+
+  for sk in $subkeys; do
+    entity_record "${prefix}:${sk}" "$sk"
+  done
 }
 
 # Drop state for conditions that did not fire this cycle. Called only for the
@@ -259,18 +297,17 @@ escalate_once() {
 # run's checked-db set (space-separated): a key concerning a db outside it
 # was not looked at this cycle, so its absence from ACTIVE_KEYS means
 # "out of scope", not "resolved" — a --databases subset run must not clear
-# another db's state (adversarial finding on #250). The guard only applies
-# when --databases was explicitly given: on an auto-discovery run, PROD_DBS
-# is every live database, so a covered db that no longer exists (dropped or
-# renamed) was never "checked" and would otherwise pin its state forever —
-# it counts as resolved instead (adversarial finding on #250).
+# another db's state. The guard only applies when --databases was explicitly
+# given: on an auto-discovery run, PROD_DBS is every live database, so a
+# recorded db that no longer exists (dropped or renamed) was never "checked"
+# and would otherwise pin its state forever — it counts as resolved instead.
 clear_resolved() {
-  local pattern="$1" checked_dbs="${2:-}" f k covered required db item ok
+  local pattern="$1" checked_dbs="${2:-}" f k db ok
   [[ -d "$STATE_DIR" ]] || return 0
   for f in "$STATE_DIR"/*; do
     [[ -f "$f" ]] || continue
-    k="" covered=""
-    read -r _ _ k covered < "$f" || true
+    k=""
+    read -r _ _ k < "$f" || true
     [[ -n "$k" ]] || continue
     case "$pattern" in
       *'*') [[ "$k" == "${pattern%\*}"* ]] || continue ;;
@@ -279,20 +316,12 @@ clear_resolved() {
     key_is_active "$k" && continue
 
     if [[ -n "$checked_dbs" && "$DEFAULT_DBS" != "auto" ]]; then
-      required="$covered"
-      if [[ -z "$required" && "$pattern" == *':*' ]]; then
-        # Per-db key (e.g. push-refused:<db>:<remote>): the db is the
-        # segment between the key's first two colons.
-        db="${k#*:}"; required="${db%%:*}"
-      fi
-      if [[ -n "$required" ]]; then
-        ok=true
-        for item in ${required//,/ }; do
-          case " $checked_dbs " in
-            *" $item "*) ;;
-            *) ok=false; break ;;
-          esac
-        done
+      db="$(key_scope_db "$k")"
+      if [[ -n "$db" ]]; then
+        ok=false
+        case " $checked_dbs " in
+          *" $db "*) ok=true ;;
+        esac
         $ok || continue
       fi
     fi
@@ -555,14 +584,14 @@ if ! $SKIP_DOLT_PUSH; then
           log "    $REMOTE_NAME: FAILED:"
           logblock "$(printf '%s' "$PUSH_ERR" | redact)"
           DOLT_PUSH_FAILED=$((DOLT_PUSH_FAILED + 1))
-          DOLT_PUSH_FAILED_SET="${DOLT_PUSH_FAILED_SET}${DB}/${REMOTE_NAME} "
+          DOLT_PUSH_FAILED_SET="${DOLT_PUSH_FAILED_SET}${DB}:${REMOTE_NAME} "
         fi
       else
         log "    $REMOTE_NAME: REFUSED — visibility=$VIS_REASON (not confirmed private): $(printf '%s' "$REMOTE_URL" | redact)"
         DOLT_PUSH_REFUSED=$((DOLT_PUSH_REFUSED + 1))
         DOLT_REFUSAL_DETAIL="${DOLT_REFUSAL_DETAIL}${DB}/${REMOTE_NAME}(${VIS_REASON}) "
 
-        escalate_once "push-refused:${DB}:${REMOTE_NAME}" "${DB}|${REMOTE_NAME}|${REMOTE_URL}|${VIS_REASON}" \
+        escalate_entity "push-refused:${DB}:${REMOTE_NAME}" "${REMOTE_URL}|${VIS_REASON}" \
           "dolt-archive: refused dolt push for $DB to unsafe remote $REMOTE_NAME" \
           "Remote visibility is '$VIS_REASON', not confirmed private. Refusing to push $DB to $(printf '%s' "$REMOTE_URL" | redact) until it is. See gt-v3df."
       fi
@@ -661,28 +690,19 @@ _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
 [ -n "${_rid:-}" ] && bd close "$_rid" --reason "plugin run recorded" >/dev/null 2>&1 || true
 
 if [[ "$EXPORT_FAILED" -gt 0 ]]; then
-  escalate_once "export-failed" "$(sorted_set "$EXPORT_FAILED_DBS")" \
+  escalate_aggregate "export-failed" "$(sorted_set "$EXPORT_FAILED_DBS")" \
     "dolt-archive: JSONL export failed for $EXPORT_FAILED databases ($EXPORT_ERRORS)" \
-    "JSONL is our last-resort recovery layer. Failed databases: $EXPORT_ERRORS" \
-    "$(sorted_set "$EXPORT_FAILED_DBS")"
+    "JSONL is our last-resort recovery layer. Failed databases: $EXPORT_ERRORS"
 fi
-clear_resolved "export-failed" "${PROD_DBS[*]}"
+clear_resolved "export-failed:*" "${PROD_DBS[*]}"
 
 if ! $SKIP_DOLT_PUSH; then
   if [[ "$DOLT_PUSH_FAILED" -gt 0 ]]; then
-    # Coverage set for clear_resolved is the DBs behind each failing
-    # "db/remote" member, not the members themselves — a db is "checked"
-    # once this cycle attempts any of its remotes.
-    DOLT_PUSH_FAILED_DBS=""
-    for _member in $DOLT_PUSH_FAILED_SET; do
-      DOLT_PUSH_FAILED_DBS="${DOLT_PUSH_FAILED_DBS}${_member%%/*} "
-    done
-    escalate_once "dolt-push-failed" "$(sorted_set "$DOLT_PUSH_FAILED_SET")" \
+    escalate_aggregate "dolt-push-failed" "$(sorted_set "$DOLT_PUSH_FAILED_SET")" \
       "dolt-archive: dolt push failed for $DOLT_PUSH_FAILED remote(s)" \
-      "Native Dolt replication did not reach $DOLT_PUSH_FAILED remote(s) this cycle. The data did not leave this machine via that path." \
-      "$(sorted_set "$DOLT_PUSH_FAILED_DBS")"
+      "Native Dolt replication did not reach $DOLT_PUSH_FAILED remote(s) this cycle. The data did not leave this machine via that path."
   fi
-  clear_resolved "dolt-push-failed" "${PROD_DBS[*]}"
+  clear_resolved "dolt-push-failed:*" "${PROD_DBS[*]}"
 
   if $REMOTE_SHORTFALL; then
     # Affected set = exported DBs with no remote (names, not counts, so a
@@ -695,32 +715,37 @@ if ! $SKIP_DOLT_PUSH; then
         *) NO_REMOTE_SET="${NO_REMOTE_SET}${_db} " ;;
       esac
     done
-    escalate_once "remote-shortfall" "$(sorted_set "$NO_REMOTE_SET")" \
+    escalate_aggregate "remote-shortfall" "$(sorted_set "$NO_REMOTE_SET")" \
       "dolt-archive: only $EXPORTED_DBS_WITH_REMOTE of $EXPORTED exported databases have a dolt remote configured" \
-      "$((EXPORTED - EXPORTED_DBS_WITH_REMOTE)) exported database(s) have no dolt remote at all, so dolt push never attempts them. The dolt_push ratio in the summary covers all $DBS_WITH_REMOTE db(s) with a remote (exported or not), not just these $EXPORTED_DBS_WITH_REMOTE exported one(s)." \
-      "$(sorted_set "$NO_REMOTE_SET")"
+      "$((EXPORTED - EXPORTED_DBS_WITH_REMOTE)) exported database(s) have no dolt remote at all, so dolt push never attempts them. The dolt_push ratio in the summary covers all $DBS_WITH_REMOTE db(s) with a remote (exported or not), not just these $EXPORTED_DBS_WITH_REMOTE exported one(s)."
   fi
-  clear_resolved "remote-shortfall" "${PROD_DBS[*]}"
+  clear_resolved "remote-shortfall:*" "${PROD_DBS[*]}"
   clear_resolved "push-refused:*" "${PROD_DBS[*]}"
 fi
 
 if ! $SKIP_GIT; then
   if [[ "$GIT_PUSH_REFUSED" -gt 0 ]]; then
-    escalate_once "git-push-refused:origin" "${GIT_REFUSAL_DETAIL}|${PUSH_URLS:-}" \
+    escalate_entity "git-push-refused:origin" "${GIT_REFUSAL_DETAIL}|${PUSH_URLS:-}" \
       "dolt-archive: refused git backup push to unsafe remote origin" \
       "Push destination visibility is '${GIT_REFUSAL_DETAIL}', not confirmed private. Refusing to push JSONL exports of the production databases from $BACKUP_REPO to ${PUSH_URLS:-<unresolvable>} until it is. See gt-sg6n."
   fi
-  clear_resolved "git-push-refused:origin"
+  # Only clear when the guard actually ran this cycle (something was ahead
+  # of origin/main to push). Otherwise a cycle with nothing to push, or one
+  # where the ahead-check itself failed, would read as "checked, found
+  # clean" and wipe a still-unresolved refusal (val's LOW on #250).
+  if $GIT_GUARD_RAN; then
+    clear_resolved "git-push-refused:origin"
+  fi
 
   if $GIT_FAILED; then
-    escalate_once "git-backup-failed" "$BACKUP_REPO" \
+    escalate_entity "git-backup-failed" "" \
       "dolt-archive: git backup add/commit/push failed" \
       "A git add, commit, or push to the backup repo at $BACKUP_REPO failed this cycle. The JSONL snapshot did not reach the offsite git backup via this path this cycle. See plugin logs for the specific git error."
   fi
   clear_resolved "git-backup-failed"
 
   if $GIT_REPO_MISSING; then
-    escalate_once "git-repo-missing" "$BACKUP_REPO" \
+    escalate_entity "git-repo-missing" "" \
       "dolt-archive: no git backup repo at $BACKUP_REPO" \
       "The git-backup path is entirely a no-op with no repo at $BACKUP_REPO — JSONL snapshots are not leaving this machine via git."
   fi
