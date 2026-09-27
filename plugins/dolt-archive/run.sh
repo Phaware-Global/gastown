@@ -2,7 +2,8 @@
 # dolt-archive/run.sh — Deterministic JSONL backup + git push + dolt push.
 #
 # Exports production databases to JSONL, commits to git backup repo,
-# and pushes Dolt remotes. JSONL is the last-resort recovery layer.
+# and pushes Dolt remotes. JSONL is the last-resort recovery layer. Both push
+# layers refuse any destination not confirmed private (visibility_guard.sh).
 #
 # Usage: ./run.sh [--databases db1,db2,...] [--skip-git] [--skip-dolt-push]
 
@@ -83,10 +84,35 @@ dolt_query_json() {
     --use-db "$db" sql -q "$query" --result-format json
 }
 
+# A <db>-latest.jsonl left by an earlier cycle is not this cycle's snapshot.
+# Step 2 copies whatever it points at into the git backup repo and commits it
+# as "Archive snapshot <now>", so once this cycle's export has failed it must
+# not survive — otherwise old data is committed under today's name and the run
+# reads as healthy. Dated snapshot files are history, not a claim of currency,
+# and are left alone.
+#
+# Removal is best-effort: run.sh runs under set -e, so a bare failing rm would
+# abort the cycle before the summary, receipt and escalation. If the link can't
+# be removed (e.g. read-only jsonl dir) the db is recorded in STALE_LATEST and
+# Step 2 refuses to copy it, so the guard still fails closed.
+STALE_LATEST=()
+discard_stale_latest() {
+  local db="$1"
+  local link="$JSONL_EXPORT_DIR/${db}-latest.jsonl"
+  if [[ -e "$link" || -L "$link" ]]; then
+    if rm -f "$link" 2>/dev/null; then
+      log "  WARN: $db removed stale ${db}-latest.jsonl (export failed; it would have republished an older snapshot as current)"
+    else
+      STALE_LATEST+=("$db")
+      log "  WARN: $db could not remove stale ${db}-latest.jsonl (export failed); it will not be copied to the git backup"
+    fi
+  fi
+}
+
 # --- Escalation dedupe (gt-4kip) ---------------------------------------------
 #
 # Every condition has a KEY (which condition) and a SIG (its affected set: which
-# DBs/remotes, which URL+visibility). State per key is "<sig-hash> <epoch> <key>".
+# DBs/remotes, which URL+visibility). State per key is "<sig-hash> <epoch> <key> <covered>".
 #   - no state, or SIG changed  -> escalate critical (new, or materially different)
 #   - same SIG, < REPEAT_SECS   -> log only, no escalation
 #   - same SIG, >= REPEAT_SECS  -> escalate once more at LOW (digest)
@@ -112,7 +138,14 @@ key_is_active() {
 
 # Deterministic, order-insensitive rendering of a whitespace-separated set.
 sorted_set() {
+  # An all-empty input (every arg "") is a legitimate empty set, not an
+  # error: grep -v '^$' then filters out every line and exits 1, which
+  # would otherwise abort the whole script under set -e -o pipefail at
+  # any call site that assigns this into a variable (e.g. the covered-set
+  # union in escalate_once, whose args are "" until a condition has ever
+  # recorded one).
   printf '%s\n' "$@" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '
+  return 0
 }
 
 # member_hashes SIG — sorted, comma-joined (trailing comma), per-token cksum
@@ -155,9 +188,17 @@ hash_set_is_subset() {
 # --databases subset run (adversarial finding on #250). Omitted for
 # conditions with no db-scoped meaning (push-refused's db already lives in
 # its key; the git-backup keys concern no db at all).
+#
+# Whenever cur_hashes carries forward any previously-recorded members (the
+# digest-repeat path, or the growth-union path below), the recorded COVERED
+# set must carry the same union — not just this run's covered arg. Val's
+# HIGH on #250: the growth-union kept hashes for old+new members but recorded
+# 'covered' for the new members only, so a later --databases subset run (that
+# only checks the new member) saw the old member's db as "out of scope" and
+# cleared its state, letting a still-unresolved condition re-file as if new.
 escalate_once() {
   local key="$1" sig="$2" title="$3" reason="$4" covered="${5:-}"
-  local now file prev_hashes="" last="" _k severity="critical" fp cur_hashes
+  local now file prev_hashes="" last="" _k prev_covered="" severity="critical" fp cur_hashes
 
   ACTIVE_KEYS+=("$key")
   now="$(date +%s)"
@@ -166,7 +207,7 @@ escalate_once() {
   fp="dolt-archive:${key}:$(printf '%s' "$cur_hashes" | cksum | cut -d' ' -f1)"
 
   if [[ -f "$file" ]]; then
-    read -r prev_hashes last _k < "$file" || true
+    read -r prev_hashes last _k prev_covered < "$file" || true
     # Unreadable state or a clock that went backwards: treat as no state.
     if [[ -n "$prev_hashes" && "$last" =~ ^[0-9]+$ && "$last" -le "$now" ]]; then
       if [[ "$cur_hashes" == "$prev_hashes" ]] || hash_set_is_subset "$cur_hashes" "$prev_hashes"; then
@@ -187,12 +228,17 @@ escalate_once() {
         title="$title (still unresolved)"
         fp="$fp:digest-$(date +%Y%m%d)"
         cur_hashes="$prev_hashes"
+        covered="$(sorted_set "$covered" "$prev_covered")"
       else
         # The current set has a member the recorded set lacks (growth, or a
         # simultaneous grow+shrink) — escalate fresh, but record the union
         # so an already-escalated member isn't forgotten and re-escalated
-        # as "new" on a later flap (adversarial finding on #250).
+        # as "new" on a later flap (adversarial finding on #250). The
+        # covered set must grow with it (val's HIGH on #250) so a later
+        # subset run that only checks the new member does not read the old
+        # member's db as never-checked and clear its still-unresolved state.
         cur_hashes="$(printf '%s' "${cur_hashes}${prev_hashes}" | tr ',' '\n' | sed '/^$/d' | sort -u | tr '\n' ',')"
+        covered="$(sorted_set "$covered" "$prev_covered")"
       fi
     fi
   fi
@@ -297,6 +343,7 @@ for DB in "${PROD_DBS[@]}"; do
   if ! TABLE_CHECK=$(dolt_query "$DB" "SHOW TABLES LIKE 'issues'" 2>"$QERR"); then
     CAUSE=$(tr '\n' ' ' < "$QERR"); rm -f "$QERR"
     log "  WARN: $DB: table check query failed: $CAUSE"
+    discard_stale_latest "$DB"
     EXPORT_FAILED=$((EXPORT_FAILED + 1))
     EXPORT_ERRORS="${EXPORT_ERRORS}${DB}(table-check: $CAUSE) "
     EXPORT_FAILED_DBS="${EXPORT_FAILED_DBS}${DB} "
@@ -321,6 +368,7 @@ for DB in "${PROD_DBS[@]}"; do
     CAUSE=$(tr '\n' ' ' < "$QERR"); rm -f "$QERR"
     log "  WARN: $DB export failed: $CAUSE"
     rm -f "$EXPORT_FILE"
+    discard_stale_latest "$DB"
     EXPORT_FAILED=$((EXPORT_FAILED + 1))
     EXPORT_ERRORS="${EXPORT_ERRORS}${DB}(export: $CAUSE) "
     EXPORT_FAILED_DBS="${EXPORT_FAILED_DBS}${DB} "
@@ -343,6 +391,9 @@ log "JSONL export: $EXPORTED succeeded, $EXPORT_FAILED failed"
 GIT_PUSHED=false
 GIT_FAILED=false
 GIT_REPO_MISSING=false
+GIT_PUSH_REFUSED=0
+GIT_REFUSAL_DETAIL=""
+GIT_GUARD_RAN=false
 
 if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   log ""
@@ -351,6 +402,14 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   # Copy latest JSONL files to git repo
   for DB in "${PROD_DBS[@]}"; do
     LATEST="$JSONL_EXPORT_DIR/${DB}-latest.jsonl"
+    _stale=false
+    for _stale_db in "${STALE_LATEST[@]:-}"; do
+      [[ "$_stale_db" == "$DB" ]] && _stale=true
+    done
+    if $_stale; then
+      log "  $DB: skipping copy of stale ${DB}-latest.jsonl (export failed and the link could not be removed)"
+      continue
+    fi
     if [[ -L "$LATEST" ]]; then
       REAL_FILE="$JSONL_EXPORT_DIR/$(readlink "$LATEST")"
       if [[ -f "$REAL_FILE" ]]; then
@@ -400,13 +459,32 @@ if ! $SKIP_GIT && [[ -d "$BACKUP_REPO/.git" ]]; then
   # rather than the misleading all-clear.
   if AHEAD="$(git rev-list origin/main..HEAD 2>&1)"; then
     if [[ -n "$AHEAD" ]]; then
-      if PUSH_ERR=$(git push origin main 2>&1); then
-        GIT_PUSHED=true
-        log "Pushed to GitHub"
-      else
-        log "WARN: Git push to remote failed:"
-        logblock "$(printf '%s' "$PUSH_ERR" | redact)"
+      # Same fail-closed gate as the dolt push below: refuse unless every
+      # push URL is a GitHub repo confirmed private. The JSONL is an export
+      # of the production issue/mail databases — see gt-sg6n. Refusal is not
+      # a push failure (the guard working as intended), so it is counted and
+      # escalated on its own, never folded into GIT_FAILED.
+      GIT_GUARD_RAN=true
+      if VIS_REASON=$(git_push_allowed origin); then
+        if PUSH_ERR=$(git push origin main 2>&1); then
+          GIT_PUSHED=true
+          log "Pushed to GitHub"
+        else
+          log "WARN: Git push to remote failed:"
+          logblock "$(printf '%s' "$PUSH_ERR" | redact)"
+          GIT_FAILED=true
+        fi
+      elif [[ "$VIS_REASON" == "push-url-unresolvable" ]]; then
+        # No push destination at all (origin removed but a stale
+        # refs/remotes/origin/main survives) — nothing was judged unsafe,
+        # the push simply cannot happen. Same failure as a missing origin.
+        log "WARN: Cannot resolve a push URL for origin (remote removed, stale refs/remotes/origin/main?):"
         GIT_FAILED=true
+      else
+        PUSH_URLS="$(git remote get-url --push --all origin 2>/dev/null | tr '\n' ' ' | redact || true)"
+        log "WARN: git origin: REFUSED — visibility=$VIS_REASON (not confirmed private): ${PUSH_URLS:-<unresolvable>}"
+        GIT_PUSH_REFUSED=$((GIT_PUSH_REFUSED + 1))
+        GIT_REFUSAL_DETAIL="origin(${VIS_REASON})"
       fi
     fi
   else
@@ -512,7 +590,7 @@ if ! $SKIP_DOLT_PUSH && [[ "$EXPORTED_DBS_WITH_REMOTE" -lt "$EXPORTED" ]]; then
 fi
 
 RESULT="success"
-if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_REFUSED" -gt 0 ]] || $GIT_FAILED || $GIT_REPO_MISSING || $REMOTE_SHORTFALL; then
+if [[ "$EXPORT_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_FAILED" -gt 0 ]] || [[ "$DOLT_PUSH_REFUSED" -gt 0 ]] || [[ "$GIT_PUSH_REFUSED" -gt 0 ]] || $GIT_FAILED || $GIT_REPO_MISSING || $REMOTE_SHORTFALL; then
   RESULT="warning"
 fi
 
@@ -544,23 +622,37 @@ fi
 # push error), and nothing-to-push (repo present, nothing ahead of
 # origin/main) all read as "false". Same vocabulary as dolt_push's own
 # skipped/attempted distinction above. Checked in priority order: a push that
-# actually succeeded wins even if an earlier step in the same cycle failed.
+# actually succeeded wins even if an earlier step in the same cycle failed; a
+# visibility refusal outranks a plain failure so it is never read as one.
 if $SKIP_GIT; then
   GIT_CLAUSE="git=skipped"
 elif $GIT_REPO_MISSING; then
   GIT_CLAUSE="git=missing"
 elif $GIT_PUSHED; then
   GIT_CLAUSE="git=pushed"
+elif [[ "$GIT_PUSH_REFUSED" -gt 0 ]]; then
+  GIT_CLAUSE="git=refused"
 elif $GIT_FAILED; then
   GIT_CLAUSE="git=failed"
 else
   GIT_CLAUSE="git=nothing-to-push"
 fi
 
+# Only append when git_push_allowed actually ran. If the guard never ran
+# (git=skipped, git=missing, the ahead-check itself failed, or there was
+# nothing to push), a 0 here would misleadingly read as "checked, found none"
+# instead of "never checked".
+if $GIT_GUARD_RAN; then
+  GIT_CLAUSE="$GIT_CLAUSE, git_push_refused=$GIT_PUSH_REFUSED"
+fi
+
 SUMMARY="Archive: jsonl=$EXPORTED/$((EXPORTED + EXPORT_FAILED)), $GIT_CLAUSE, $DOLT_PUSH_CLAUSE, result=$RESULT"
 log "$SUMMARY"
 if [[ "$DOLT_PUSH_REFUSED" -gt 0 ]]; then
   log "  Refused (unsafe destination): $DOLT_REFUSAL_DETAIL"
+fi
+if [[ "$GIT_PUSH_REFUSED" -gt 0 ]]; then
+  log "  Refused git push (unsafe destination): $GIT_REFUSAL_DETAIL"
 fi
 
 _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
@@ -613,6 +705,13 @@ if ! $SKIP_DOLT_PUSH; then
 fi
 
 if ! $SKIP_GIT; then
+  if [[ "$GIT_PUSH_REFUSED" -gt 0 ]]; then
+    escalate_once "git-push-refused:origin" "${GIT_REFUSAL_DETAIL}|${PUSH_URLS:-}" \
+      "dolt-archive: refused git backup push to unsafe remote origin" \
+      "Push destination visibility is '${GIT_REFUSAL_DETAIL}', not confirmed private. Refusing to push JSONL exports of the production databases from $BACKUP_REPO to ${PUSH_URLS:-<unresolvable>} until it is. See gt-sg6n."
+  fi
+  clear_resolved "git-push-refused:origin"
+
   if $GIT_FAILED; then
     escalate_once "git-backup-failed" "$BACKUP_REPO" \
       "dolt-archive: git backup add/commit/push failed" \

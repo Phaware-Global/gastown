@@ -1186,9 +1186,21 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 		if branch == "HEAD" && nuclear {
 			style.PrintWarning("worktree %s is on a detached HEAD — nuclear removal skips local auto-preserve here (no branch ref would survive worktree teardown to hold the commit); any uncommitted work is discarded", name)
 		} else if result, presErr := git.AutoPreserveUncommittedWork(preserveGit, branch, git.PreserveOptions{
-			IssueID: name,
-			Push:    !nuclear,
+			IssueID:           name,
+			Push:              !nuclear,
+			ProtectedBranches: []string{m.rig.DefaultBranch()},
 		}); presErr != nil {
+			// A detached HEAD has no ref surviving worktree teardown to
+			// hold an uncommitted commit — WorktreeRemove deletes the
+			// per-worktree HEAD/reflog that were the only pointers to it.
+			// If the guard itself failed (e.g. the configured protected
+			// branch didn't resolve on origin), we can't know whether
+			// uncommitted work exists, so refuse rather than silently
+			// discard it (PR #253 review). force explicitly asks to
+			// bypass that.
+			if branch == "HEAD" && !force {
+				return fmt.Errorf("could not auto-preserve work in %s before removing a detached-HEAD worktree, and removal would discard any uncommitted commit with no recoverable ref: %w (use force to remove anyway)", name, presErr)
+			}
 			style.PrintWarning("could not auto-preserve work in %s before removal: %v", name, presErr)
 		} else if result.Pushed {
 			fmt.Printf("%s Preserved uncommitted work for %s: pushed %s to %s\n",
@@ -1302,7 +1314,7 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	if !nuclear {
 		polecatGit := git.NewGit(clonePath)
 		if branch, brErr := polecatGit.CurrentBranch(); brErr == nil && branch != "" {
-			if badSHA, chkErr := git.HasUnverifiedCommit(polecatGit, "origin"); chkErr != nil {
+			if badSHA, chkErr := git.HasUnverifiedCommit(polecatGit, "origin", []string{m.rig.DefaultBranch()}); chkErr != nil {
 				style.PrintWarning("could not verify %s's commits before the pre-removal push, not pushing branch %s: %v", name, branch, chkErr)
 			} else if badSHA != "" {
 				style.PrintWarning("branch %s carries commit %s made with pre-commit hooks bypassed — refusing the pre-removal push; the work remains in the local commit", branch, badSHA[:8])

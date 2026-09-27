@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # run_test.sh — integration tests for dolt-archive/run.sh.
 #
-# Two independent suites, run back-to-back, neither replacing the other:
+# Three independent suites, run back-to-back, neither replacing the other:
 #   Suite A (gt-igzm): escalation logic — mocked dolt/bd/gt, asserts on which
 #     escalations fire (dolt push failure, missing git backup repo, remote
 #     shortfall, git push failure/success/nothing-to-push, fingerprint dedup).
 #   Suite B (gt-v3df): the Dolt-push visibility guard — runs the REAL run.sh
 #     against a scratch DOLT_DATA_DIR with fake dolt/gh/bd/gt binaries,
 #     asserting a public remote is refused and a private one is pushed.
+#
+#   Suite C (gt-sg6n): the same guard on the JSONL git push layer — public,
+#     non-GitHub and undeterminable origins are refused; a private one is pushed.
 #
 # Usage: bash plugins/dolt-archive/run_test.sh
 set -euo pipefail
@@ -31,6 +34,14 @@ log() { echo "[test] $*"; }
 #   9. nothing to push (repo present, no diff, nothing ahead) -> summary reads git=nothing-to-push
 #  10-11. origin remote entirely absent (with/without a stale tracking ref) -> must
 #     escalate as a failure, NOT read as the all-clear (gt-a7um)
+#  12-14. a failed export (or failed table check) must not leave the previous
+#     cycle's -latest.jsonl behind, and the git step must not commit that old
+#     data as this cycle's snapshot (gt-pgvd)
+#  15+. run.sh's own once-per-condition escalation dedupe — identical/changed/
+#     cleared-then-returned/skip-scoped/interval-digest/retried-after-failure
+#     conditions, plus the shrink/growth/subset-scoping adversarial cases from
+#     PR #250 review, including growth recorded from a --databases subset
+#     (gt-4kip)
 # =============================================================================
 
 FAILURES=0
@@ -100,12 +111,20 @@ case "$query" in
     [[ -f "$MOCK_DB_LIST" ]] && cat "$MOCK_DB_LIST"
     ;;
   "SHOW TABLES LIKE 'issues'")
+    if [[ -f "${DOLT_DATA_DIR:-$HOME/gt/.dolt-data}/$db/.mock-table-check-fail" ]]; then
+      echo "mock table check failure for $db" >&2
+      exit 1
+    fi
     printf 'Tables_in_db\n'
     if [[ ! -f "${DOLT_DATA_DIR:-$HOME/gt/.dolt-data}/$db/.mock-no-issues-table" ]]; then
       printf 'issues\n'
     fi
     ;;
   "SELECT * FROM issues ORDER BY id")
+    if [[ -f "${DOLT_DATA_DIR:-$HOME/gt/.dolt-data}/$db/.mock-export-fail" ]]; then
+      echo "mock export failure for $db" >&2
+      exit 1
+    fi
     printf '{"id":"1"}\n'
     ;;
   *)
@@ -213,6 +232,50 @@ write_git_backup_repo() {
     git commit --quiet -m "seed"
     git push --quiet -u origin main
   )
+}
+
+# The git-layer visibility guard (gt-sg6n) judges the URL git would actually
+# push to (`git remote get-url --push --all origin`). These scenarios need a
+# REAL push to a local bare repo to succeed or fail, while the guard sees a
+# github.com URL — so the git shim below answers `git remote get-url` from
+# $sandbox/git-url-override when that file exists, and otherwise passes every
+# call straight through to the real git. Only the URL the guard reads is
+# faked; add/commit/rev-list/push all run for real.
+REAL_GIT="$(command -v git)"
+write_git_shim() {
+  local sandbox="$1" override_url="${2:-}"
+  cat > "$sandbox/bin/git" <<MOCK
+#!/usr/bin/env bash
+if [[ "\$1" == "remote" && "\${2:-}" == "get-url" && -f "$sandbox/git-url-override" ]]; then
+  cat "$sandbox/git-url-override"
+  exit 0
+fi
+exec "$REAL_GIT" "\$@"
+MOCK
+  chmod +x "$sandbox/bin/git"
+  if [[ -n "$override_url" ]]; then
+    printf '%s\n' "$override_url" > "$sandbox/git-url-override"
+  fi
+}
+
+# gh mock keyed off the owner segment, for the git-layer guard scenarios.
+write_gh_owner_mock() {
+  local sandbox="$1"
+  cat > "$sandbox/bin/gh" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "$1" == "api" ]]; then
+  repo=""
+  for a in "$@"; do [[ "$a" == repos/* ]] && repo="${a#repos/}"; done
+  case "${repo%%/*}" in
+    priv-owner) echo "private" ;;
+    lookup-fails-owner) exit 1 ;;
+    *) echo "public" ;;
+  esac
+  exit 0
+fi
+exit 1
+MOCK
+  chmod +x "$sandbox/bin/gh"
 }
 
 run_scenario() {
@@ -336,6 +399,10 @@ assert_escalated "$SANDBOX" "no git backup repo" "missing git backup repo"
 assert_fingerprint "$SANDBOX" "no git backup repo" "dolt-archive:git-repo-missing" "missing git backup repo"
 assert_output_contains "$SANDBOX" "git=missing" "missing git backup repo — git clause"
 assert_output_contains "$SANDBOX" "dolt_push=skipped" "missing git backup repo — dolt_push summary clause (skipped case)"
+if grep -qF "git_push_refused" "$SANDBOX/output.log" 2>/dev/null; then
+  echo "FAIL: missing git backup repo — summary reports git_push_refused although the guard never ran"
+  FAILURES=$((FAILURES + 1))
+fi
 rm -rf "$SANDBOX"
 
 # --- Scenario 3: remote count below exported count must escalate critical ----
@@ -464,7 +531,9 @@ SANDBOX="$(setup_sandbox)"
 write_dolt_mock "$SANDBOX"
 write_bd_mock "$SANDBOX"
 write_gt_mock "$SANDBOX"
+write_gh_mock "$SANDBOX"
 write_git_backup_repo "$SANDBOX"
+write_git_shim "$SANDBOX" "https://github.com/test-owner/example-backup"
 
 # Break the remote AFTER origin/main is already tracked locally, so the
 # rev-list ahead-check still works but the actual push fails.
@@ -484,7 +553,9 @@ SANDBOX="$(setup_sandbox)"
 write_dolt_mock "$SANDBOX"
 write_bd_mock "$SANDBOX"
 write_gt_mock "$SANDBOX"
+write_gh_mock "$SANDBOX"
 write_git_backup_repo "$SANDBOX"
+write_git_shim "$SANDBOX" "https://github.com/test-owner/example-backup"
 
 run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
 assert_no_escalation "$SANDBOX" "successful git push"
@@ -562,7 +633,136 @@ if grep -qF "git=nothing-to-push" "$SANDBOX/output.log" 2>/dev/null; then
 fi
 rm -rf "$SANDBOX"
 
-# --- Scenarios 12-15: run.sh's OWN once-per-condition dedupe (gt-4kip) ------
+# --- Scenarios 12-14: a failed export must not republish an older snapshot ---
+# --- as the current one (gt-pgvd) --------------------------------------------
+#
+# A previous cycle left testdb-latest.jsonl -> testdb-<old>.jsonl (content
+# "yesterday"). The git backup repo holds still-older content ("older"). If the
+# export fails and the stale link survives, the git step copies "yesterday"
+# into the repo and commits it as "Archive snapshot <now>" — old data under
+# today's name, with nothing in the repo history to tell them apart.
+
+# Seeds yesterday's snapshot + -latest link for $2 (db name) in sandbox $1.
+seed_stale_latest() {
+  local sandbox="$1" db="$2"
+  local dir="$sandbox/home/gt/.dolt-archive/jsonl"
+  printf '{"id":"yesterday"}\n' > "$dir/${db}-20000101-0000.jsonl"
+  ln -s "${db}-20000101-0000.jsonl" "$dir/${db}-latest.jsonl"
+}
+
+# Asserts no commit in the backup repo ever carried $2 as testdb.jsonl content
+# beyond the seed, i.e. the stale data was not committed under a new snapshot.
+assert_no_stale_commit() {
+  local sandbox="$1" desc="$2"
+  local repo="$sandbox/home/gt/.dolt-archive/git"
+  local commits
+  commits="$(git -C "$repo" rev-list --count HEAD)"
+  if [[ "$commits" -ne 1 ]]; then
+    echo "FAIL: $desc — expected the backup repo to stay at its seed commit, got $commits commits:"
+    git -C "$repo" log --format='    %h %s' | head -5
+    FAILURES=$((FAILURES + 1))
+  fi
+  if git -C "$repo" grep -q yesterday HEAD -- testdb.jsonl 2>/dev/null; then
+    echo "FAIL: $desc — yesterday's data was committed to the backup repo as a new snapshot"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+assert_latest_absent() {
+  local sandbox="$1" db="$2" desc="$3"
+  local link="$sandbox/home/gt/.dolt-archive/jsonl/${db}-latest.jsonl"
+  if [[ -e "$link" || -L "$link" ]]; then
+    echo "FAIL: $desc — ${db}-latest.jsonl still present after a failed export -> $(readlink "$link" 2>/dev/null || echo '(file)')"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+log "=== Scenario: failed export must not leave a stale -latest link (gt-pgvd) ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"
+write_bd_mock "$SANDBOX"
+write_gt_mock "$SANDBOX"
+write_git_backup_repo "$SANDBOX" '{"id":"older"}'
+mkdir -p "$SANDBOX/home/gt/.dolt-data/testdb"
+touch "$SANDBOX/home/gt/.dolt-data/testdb/.mock-export-fail"
+seed_stale_latest "$SANDBOX" testdb
+
+run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
+assert_latest_absent "$SANDBOX" testdb "failed export"
+assert_no_stale_commit "$SANDBOX" "failed export"
+assert_output_contains "$SANDBOX" "removed stale testdb-latest.jsonl" "failed export — removal is visible in the run output"
+assert_output_contains "$SANDBOX" "jsonl=0/1" "failed export — summary counts the failure"
+assert_escalated "$SANDBOX" "JSONL export failed" "failed export"
+# The dated snapshot itself is history, not a claim of currency: it stays.
+if [[ ! -f "$SANDBOX/home/gt/.dolt-archive/jsonl/testdb-20000101-0000.jsonl" ]]; then
+  echo "FAIL: failed export — the dated historical snapshot was deleted"
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$SANDBOX"
+
+log "=== Scenario: failed table check must not leave a stale -latest link (gt-pgvd) ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"
+write_bd_mock "$SANDBOX"
+write_gt_mock "$SANDBOX"
+write_git_backup_repo "$SANDBOX" '{"id":"older"}'
+mkdir -p "$SANDBOX/home/gt/.dolt-data/testdb"
+touch "$SANDBOX/home/gt/.dolt-data/testdb/.mock-table-check-fail"
+seed_stale_latest "$SANDBOX" testdb
+
+run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
+assert_latest_absent "$SANDBOX" testdb "failed table check"
+assert_no_stale_commit "$SANDBOX" "failed table check"
+assert_output_contains "$SANDBOX" "removed stale testdb-latest.jsonl" "failed table check — removal is visible in the run output"
+assert_escalated "$SANDBOX" "JSONL export failed" "failed table check"
+rm -rf "$SANDBOX"
+
+log "=== Scenario: one db fails, the other exports — only the failed db loses its link (gt-pgvd) ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"
+write_bd_mock "$SANDBOX"
+write_gt_mock "$SANDBOX"
+write_git_backup_repo "$SANDBOX" '{"id":"older"}'
+mkdir -p "$SANDBOX/home/gt/.dolt-data/testdb" "$SANDBOX/home/gt/.dolt-data/gooddb"
+touch "$SANDBOX/home/gt/.dolt-data/testdb/.mock-export-fail"
+seed_stale_latest "$SANDBOX" testdb
+seed_stale_latest "$SANDBOX" gooddb
+
+run_scenario "$SANDBOX" --databases testdb,gooddb --skip-dolt-push
+assert_latest_absent "$SANDBOX" testdb "failed db in a mixed run"
+GOOD_LINK="$SANDBOX/home/gt/.dolt-archive/jsonl/gooddb-latest.jsonl"
+if [[ ! -L "$GOOD_LINK" ]] || [[ "$(readlink "$GOOD_LINK")" == "gooddb-20000101-0000.jsonl" ]]; then
+  echo "FAIL: mixed run — gooddb-latest.jsonl was not advanced to this cycle's fresh export"
+  FAILURES=$((FAILURES + 1))
+fi
+REPO="$SANDBOX/home/gt/.dolt-archive/git"
+if git -C "$REPO" grep -q yesterday HEAD 2>/dev/null; then
+  echo "FAIL: mixed run — yesterday's data reached the backup repo"
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$SANDBOX"
+
+log "=== Scenario: stale link cannot be removed — cycle continues, escalates, stale data not committed (gt-pgvd) ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"
+write_bd_mock "$SANDBOX"
+write_gt_mock "$SANDBOX"
+write_git_backup_repo "$SANDBOX" '{"id":"older"}'
+mkdir -p "$SANDBOX/home/gt/.dolt-data/testdb"
+touch "$SANDBOX/home/gt/.dolt-data/testdb/.mock-export-fail"
+seed_stale_latest "$SANDBOX" testdb
+# Read-only jsonl dir: the export write and the link removal both get EACCES.
+chmod a-w "$SANDBOX/home/gt/.dolt-archive/jsonl"
+
+run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
+chmod u+w "$SANDBOX/home/gt/.dolt-archive/jsonl"
+assert_output_contains "$SANDBOX" "could not remove stale testdb-latest.jsonl" "unremovable stale link — failure is visible in the run output"
+assert_output_contains "$SANDBOX" "jsonl=0/1" "unremovable stale link — cycle reached the summary"
+assert_escalated "$SANDBOX" "JSONL export failed" "unremovable stale link"
+assert_no_stale_commit "$SANDBOX" "unremovable stale link"
+rm -rf "$SANDBOX"
+
+# --- Scenarios 15+: run.sh's OWN once-per-condition dedupe (gt-4kip) --------
 #
 # `gt escalate --fingerprint` only suppresses against OPEN escalation beads,
 # so once the mayor closes a repeat the next cycle files it again — alert
@@ -765,6 +965,29 @@ run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
 assert_count "$SANDBOX" "dolt push failed" 3 "growth must remember prior members so a later flap-back doesn't re-escalate"
 rm -rf "$SANDBOX"
 
+log "=== Scenario: a growth event recorded from a --databases subset must still block a later clear (val HIGH on #250) ==="
+# Full run: db-a fails -> escalate (state: hashes={a}, covered={db-a}).
+# --databases db-b run: db-b ALSO starts failing -> a growth event relative to
+# the recorded {a} (db-b's hash isn't in it), scoped to a run that only
+# checked db-b. The union of hashes must carry db-a's hash forward (already
+# fixed pre-#250) — but the recorded COVERED set must ALSO carry db-a
+# forward, not just this run's own covered=db-b. Otherwise the next
+# --databases db-b run (db-b now healthy) reads db-a as "in scope and
+# resolved" purely because covered never named it, and clears the whole
+# state — so a later full run, finding db-a's failure never fixed, re-files
+# it as brand new instead of staying quiet.
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+printf 'origin\thttps://github.com/test-owner/db-b (fetch)\n' > "$SANDBOX/home/gt/.dolt-data/db-b/.mock-remotes"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+touch "$SANDBOX/home/gt/.dolt-data/db-b/.mock-push-fail-origin"
+run_cycle "$SANDBOX" --databases db-b --skip-git
+rm -f "$SANDBOX/home/gt/.dolt-data/db-b/.mock-push-fail-origin"
+run_cycle "$SANDBOX" --databases db-b --skip-git
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 2 "growth's covered set must survive a later subset run so db-a's persisting failure doesn't re-file"
+rm -rf "$SANDBOX"
+
 echo ""
 if [[ $FAILURES -gt 0 ]]; then
   echo "Suite A (escalation logic): FAILED — $FAILURES scenario(s) failed"
@@ -943,11 +1166,105 @@ if [[ "$FAIL" -ne 0 ]]; then
   cat "$OUTPUT"
 fi
 
+# Suite B's escalation-dedupe state override must not leak into Suite C: an
+# `export` is process-wide for the rest of this script, so without this every
+# git_guard_scenario sandbox below would share Suite B's $WORKDIR/escalation-
+# state instead of getting its own per-sandbox state dir, letting one
+# scenario's git-push-refused escalation dedupe against an unrelated one's.
+unset DOLT_ARCHIVE_STATE_DIR
+
+# =============================================================================
+# Suite C: git-layer visibility guard (gt-sg6n)
+#
+# The JSONL git push (`git push origin main`) must clear the same fail-closed
+# visibility check as the dolt push: public, non-GitHub or undeterminable all
+# REFUSE; only a GitHub repo confirmed private is pushed. Real git, real bare
+# origin; only gh/dolt/bd/gt are faked, and the git shim fakes just the URL
+# the guard reads (see write_git_shim). All remotes are example.invalid-style
+# placeholders — no real backup repo name appears here.
+# =============================================================================
+
+C_FAIL=0
+c_fail() { echo "FAIL: $*"; C_FAIL=$((C_FAIL + 1)); }
+
+bare_head() { "$REAL_GIT" -C "$1/bare-origin.git" rev-parse main; }
+
+# git_guard_scenario NAME PUSH_URL EXPECT(refused|pushed) [REASON]
+git_guard_scenario() {
+  local name="$1" url="$2" expect="$3" reason="${4:-}"
+  log "=== Scenario: git-layer guard — $name ==="
+  local sb before after
+  sb="$(setup_sandbox)"
+  write_dolt_mock "$sb"; write_bd_mock "$sb"; write_gt_mock "$sb"
+  write_gh_owner_mock "$sb"
+  write_git_backup_repo "$sb"
+  if [[ -n "$url" ]]; then write_git_shim "$sb" "$url"; else write_git_shim "$sb"; fi
+  before="$(bare_head "$sb")"
+
+  run_scenario "$sb" --databases testdb --skip-dolt-push
+  after="$(bare_head "$sb")"
+
+  if [[ "$expect" == "refused" ]]; then
+    [[ "$before" == "$after" ]] || c_fail "$name — origin received a push despite the guard"
+    grep -qF "git=refused" "$sb/output.log" || c_fail "$name — summary lacks git=refused"
+    grep -qF "git_push_refused=1" "$sb/output.log" || c_fail "$name — summary lacks git_push_refused=1"
+    grep -qF "REFUSED" "$sb/output.log" || c_fail "$name — log lacks REFUSED"
+    grep -qF "visibility=$reason" "$sb/output.log" || c_fail "$name — log lacks visibility=$reason"
+    grep -q -- "--fingerprint dolt-archive:git-push-refused:origin" "$sb/escalate.log" \
+      || c_fail "$name — refusal not escalated with the git-push-refused fingerprint"
+    grep -- "git-push-refused" "$sb/escalate.log" | grep -q -- "-s critical" \
+      || c_fail "$name — refusal escalation is not -s critical"
+    grep -q "result=warning" "$sb/output.log" || c_fail "$name — result is not warning"
+    if grep -qF "git=pushed" "$sb/output.log"; then c_fail "$name — reported git=pushed"; fi
+  else
+    [[ "$before" != "$after" ]] || c_fail "$name — private origin did not receive the push"
+    grep -qF "git=pushed" "$sb/output.log" || c_fail "$name — summary lacks git=pushed"
+    grep -qF "git_push_refused=0" "$sb/output.log" || c_fail "$name — summary lacks git_push_refused=0"
+    assert_no_escalation "$sb" "$name"
+  fi
+  rm -rf "$sb"
+}
+
+git_guard_scenario "public origin is refused"           "https://github.com/pub-owner/example-backup"         refused public
+git_guard_scenario "undeterminable visibility refused"  "https://github.com/lookup-fails-owner/example-backup" refused visibility-lookup-failed
+git_guard_scenario "non-GitHub origin is refused"       "https://git.example.invalid/team/example-backup.git" refused non-github-remote
+git_guard_scenario "private origin is pushed"           "https://github.com/priv-owner/example-backup"        pushed
+
+# A raw local-path origin (no shim, no GitHub URL at all) must also refuse.
+log "=== Scenario: git-layer guard — local-path origin is refused ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"; write_bd_mock "$SANDBOX"; write_gt_mock "$SANDBOX"
+write_gh_owner_mock "$SANDBOX"
+write_git_backup_repo "$SANDBOX"
+BEFORE="$(bare_head "$SANDBOX")"
+run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
+[[ "$BEFORE" == "$(bare_head "$SANDBOX")" ]] || c_fail "local-path origin received a push"
+grep -qF "visibility=non-github-remote" "$SANDBOX/output.log" || c_fail "local-path origin — log lacks visibility=non-github-remote"
+rm -rf "$SANDBOX"
+
+# A refusal is per-destination: a second push URL that is public must refuse
+# even though the first is private (git pushes to every pushurl).
+log "=== Scenario: git-layer guard — any public pushurl refuses ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"; write_bd_mock "$SANDBOX"; write_gt_mock "$SANDBOX"
+write_gh_owner_mock "$SANDBOX"
+write_git_backup_repo "$SANDBOX"
+write_git_shim "$SANDBOX"
+printf '%s\n%s\n' "https://github.com/priv-owner/example-backup" "https://github.com/pub-owner/example-backup" > "$SANDBOX/git-url-override"
+BEFORE="$(bare_head "$SANDBOX")"
+run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
+[[ "$BEFORE" == "$(bare_head "$SANDBOX")" ]] || c_fail "mixed pushurls — origin received a push"
+grep -qF "git=refused" "$SANDBOX/output.log" || c_fail "mixed pushurls — summary lacks git=refused"
+rm -rf "$SANDBOX"
+
+echo ""
+echo "Suite C (git-layer guard): $C_FAIL failure(s)"
+
 # --- Combined result ---------------------------------------------------------
 
 echo ""
-if [[ "$FAILURES" -gt 0 || "$FAIL" -gt 0 ]]; then
-  echo "FAILED: Suite A had $FAILURES failure(s), Suite B had $FAIL failure(s)"
+if [[ "$FAILURES" -gt 0 || "$FAIL" -gt 0 || "$C_FAIL" -gt 0 ]]; then
+  echo "FAILED: Suite A had $FAILURES failure(s), Suite B had $FAIL failure(s), Suite C had $C_FAIL failure(s)"
   exit 1
 fi
 echo "PASSED: all scenarios in both suites passed"

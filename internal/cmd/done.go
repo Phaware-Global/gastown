@@ -336,6 +336,19 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		return fmt.Errorf("cannot determine current rig (working directory may be deleted)")
 	}
 
+	// Get configured default branch for this rig. Resolved here (before the
+	// gt-pvx auto-save below) rather than at first use, because it is also
+	// the unverified-commit guard's ONLY protected branch (gt-35un/gt-xitk
+	// MAYOR DESIGN RULING): sourced from rig config, never from a bead,
+	// --issue, or the branch name, all of which are agent-writable and
+	// would let a push exempt its own unverified commit by naming a
+	// fabricated base.
+	defaultBranch := "main" // fallback
+	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
+		defaultBranch = rigCfg.DefaultBranch
+	}
+	unverifiedGuardProtectedBranches := []string{defaultBranch}
+
 	// When gt is invoked via shell alias (cd ~/gt && gt), or when Claude Code
 	// resets the shell CWD to mayor/rig, cwd is NOT the polecat's worktree.
 	// Detect and reconstruct actual path.
@@ -594,6 +607,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		preserveResult, preserveErr := git.AutoPreserveUncommittedWork(g, branch, git.PreserveOptions{
 			IssueID:           parseBranchName(branch).Issue,
 			ExtraExcludePaths: extraExclude,
+			ProtectedBranches: unverifiedGuardProtectedBranches,
 		})
 		if preserveErr != nil {
 			return fmt.Errorf("gt-pvx safety net auto-save failed: %w\nResolve the issue first, or use --status DEFERRED to exit without completing", preserveErr)
@@ -744,12 +758,6 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	// Parallel to done-intent label for backwards compat during migration.
 	if sessionName := os.Getenv("GT_SESSION"); sessionName != "" && townRoot != "" {
 		polecat.TouchSessionHeartbeatWithState(townRoot, sessionName, polecat.HeartbeatExiting, "gt done", issueID)
-	}
-
-	// Get configured default branch for this rig
-	defaultBranch := "main" // fallback
-	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
-		defaultBranch = rigCfg.DefaultBranch
 	}
 
 	// For COMPLETED, we need an issue ID and branch must not be the default branch
@@ -1066,7 +1074,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Handle "direct" strategy: push to target branch, skip MR
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
-			if reason := refuseUnverifiedPush(g); reason != "" {
+			if reason := refuseUnverifiedPush(g, unverifiedGuardProtectedBranches); reason != "" {
 				pushFailed = true
 				doneErrors = append(doneErrors, reason)
 				style.PrintWarning("%s", reason)
@@ -1146,7 +1154,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// when the tree was dirty, but an earlier auto-save/checkpoint
 		// cycle can have left an unverified commit on a now-clean branch
 		// (PR #184 review).
-		if reason := refuseUnverifiedPush(g); reason != "" {
+		if reason := refuseUnverifiedPush(g, unverifiedGuardProtectedBranches); reason != "" {
 			pushFailed = true
 			doneErrors = append(doneErrors, reason)
 			style.PrintWarning("%s", reason)
@@ -1484,6 +1492,18 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				doneErrors = append(doneErrors, fmt.Sprintf(
 					"PR appears to exist on branch %s but PR number could not be resolved (URL parse + FindPRNumber both failed); refinery will not pick up and manual dispatcher intervention is required",
 					branch))
+			} else if completion.reusePR == 0 && mergeStrategyIsPR {
+				// mergeStrategyIsPR requested a PR (completion.createPR),
+				// but both `gh pr create` and the FindPRNumber fallback
+				// failed above: prNumber and prURL are both zero-valued.
+				// Without this branch, mrFailed stays false and the
+				// no-merge close path below reports "No-merge work
+				// completed" as if this were the legitimate branch-only
+				// no-merge case, closing the bead with no PR and no MR
+				// bead tracking it.
+				mrFailed = true
+				doneErrors = append(doneErrors, fmt.Sprintf(
+					"merge_strategy=pr requested but no PR could be created or found for branch %s; dispatcher intervention required", branch))
 			} else if completion.reusePR > 0 {
 				// Reused-PR path skips the handoff above on the assumption
 				// that PR #N's MR bead already exists and already carries
@@ -1563,6 +1583,17 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				goto notifyWitness
 			}
 
+			// mrFailed means the PR/MR handoff didn't verifiably land
+			// (handoff error, unparseable PR URL, no PR found at all, or
+			// no live MR bead for a reused review-fix PR). This must gate
+			// the force-close below: shouldCloseHookedBead's later
+			// mrFailed check (see updateAgentStateOnDone) never gets a
+			// say once bd.Show finds the bead already terminal.
+			if !shouldForceCloseNoMerge(mrFailed) {
+				fmt.Printf("%s Work bead %s left open — MR handoff failed, dispatcher intervention required\n", style.Bold.Render("→"), issueID)
+				goto notifyWitness
+			}
+
 			// No-merge path without a PR (or with MR-bead creation
 			// failure) — close the work bead so it doesn't sit open
 			// forever. This is the fix for #3363. Compose the reason
@@ -1629,7 +1660,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			fmt.Printf("%s Late-detected direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
 			fmt.Printf("  Convoy: %s\n", convoyInfo.ID)
 
-			if reason := refuseUnverifiedPush(g); reason != "" {
+			if reason := refuseUnverifiedPush(g, unverifiedGuardProtectedBranches); reason != "" {
 				pushFailed = true
 				doneErrors = append(doneErrors, reason)
 				style.PrintWarning("%s", reason)
@@ -2010,7 +2041,7 @@ notifyWitness:
 	}
 
 	// Update agent bead state (ZFC: self-report completion)
-	updateAgentStateOnDone(cwd, townRoot, exitType, issueID)
+	updateAgentStateOnDone(cwd, townRoot, exitType, issueID, pushFailed, mrFailed)
 
 	// Nudge witness only after hook/cleanup state is updated. Otherwise witness can
 	// evaluate slot availability against stale hook_bead or cleanup_status and emit
@@ -2425,6 +2456,29 @@ func clearDoneCheckpoints(bd *beads.Beads, agentBeadID string) {
 	}
 }
 
+// shouldCloseHookedBead reports whether gt done's completion path should
+// close the hooked bead. Never true when the push or MR creation did not
+// succeed (gt-35un/gt-xitk MAYOR DESIGN RULING, acceptance item 3): closing
+// the source bead when nothing actually landed in the merge queue leaves no
+// trace that the work still needs to be resubmitted — evidence 2026-09-27,
+// hga-x93f pushed but no MR yet the bead was closed anyway.
+func shouldCloseHookedBead(exitType string, isWorkflowStep, pushFailed, mrFailed bool) bool {
+	if pushFailed || mrFailed {
+		return false
+	}
+	return exitType != ExitDeferred || isWorkflowStep
+}
+
+// shouldForceCloseNoMerge reports whether the no-merge completion path
+// (merge_strategy=pr, PR created/reused, no refinery handoff) may
+// force-close the work bead. mrFailed means the PR/MR handoff didn't
+// verifiably land, so the bead must stay open for dispatcher intervention
+// instead of closing here and hiding the failure before
+// updateAgentStateOnDone's own mrFailed check ever runs (PR #253 review).
+func shouldForceCloseNoMerge(mrFailed bool) bool {
+	return !mrFailed
+}
+
 // updateAgentStateOnDone closes the hooked work bead and reports cleanup status.
 // Uses issueID directly to find the hooked bead instead of reading the agent bead's
 // hook_bead slot (hq-l6mm5: direct bead tracking).
@@ -2438,7 +2492,7 @@ func clearDoneCheckpoints(bd *beads.Beads, agentBeadID string) {
 // BUG FIX (hq-3xaxy): This function must be resilient to working directory deletion.
 // If the polecat's worktree is deleted before gt done finishes, we use env vars as fallback.
 // All errors are warnings, not failures - gt done must complete even if bead ops fail.
-func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
+func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string, pushFailed, mrFailed bool) {
 	// Get role context - try multiple sources for resilience
 	roleInfo, err := GetRoleWithContext(cwd, townRoot)
 	if err != nil {
@@ -2514,7 +2568,7 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 	// paused for resumption". Close them on DEFERRED so the convoy can advance.
 	isWorkflowStep := strings.Contains(hookedBeadID, "-wfs-")
 
-	if hookedBeadID != "" && (exitType != ExitDeferred || isWorkflowStep) {
+	if hookedBeadID != "" && shouldCloseHookedBead(exitType, isWorkflowStep, pushFailed, mrFailed) {
 		// BUG FIX (gt-pftz): Close hooked bead unless already terminal (closed/tombstone).
 		// Previously checked hookedBead.Status == StatusHooked, but polecats update
 		// their work bead to in_progress during work. The exact-match check caused
@@ -2803,8 +2857,8 @@ func findHookedBeadForAgent(bd *beads.Beads, agentID string) string {
 // gt done push site consults this because the auto-save's own HooksFailed
 // gate only fires when auto-save ran in the same invocation — an unverified
 // commit left by an earlier cycle sits on a clean tree (PR #184 review).
-func refuseUnverifiedPush(g *git.Git) string {
-	badSHA, err := git.HasUnverifiedCommit(g, "origin")
+func refuseUnverifiedPush(g *git.Git, protectedBranches []string) string {
+	badSHA, err := git.HasUnverifiedCommit(g, "origin", protectedBranches)
 	if err != nil {
 		return fmt.Sprintf("could not check the branch for unverified commits — refusing to push until it can be verified: %v", err)
 	}
