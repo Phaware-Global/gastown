@@ -2,7 +2,6 @@ package git
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -58,9 +57,7 @@ func TestHasUnverifiedCommit_AlreadyMergedToProtectedBranchNotFlagged(t *testing
 	// clean, but it carries badSHA in its ancestry because it forked after
 	// that commit landed on develop.
 	runGitTestCmd(t, localDir, "checkout", "-b", "polecat/foo/gt-35un@abc123", "develop")
-	if err := exec.Command("git", "fetch", "origin").Run(); err != nil {
-		t.Fatalf("fetch: %v", err)
-	}
+	runGitTestCmd(t, localDir, "fetch", "origin")
 
 	got, err := HasUnverifiedCommit(g, "origin", []string{"develop"})
 	if err != nil {
@@ -135,6 +132,59 @@ func TestHasUnverifiedCommit_UnresolvableProtectedRefFailsClosed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "develop-does-not-exist") {
 		t.Fatalf("error = %q, want it to name the missing ref", err)
+	}
+}
+
+func TestHasUnverifiedCommit_ShadowingLocalBranchNotExempt(t *testing.T) {
+	// Security: git resolves refs/heads/<name> before refs/remotes/<name>,
+	// so an unqualified "origin/develop" ref can be shadowed by a local
+	// branch of that same name in the checked worktree, exempting every
+	// unverified commit (PR #253 review). The scan baseline must not be
+	// selectable by the thing being checked.
+	localDir, _, _ := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	runGitTestCmd(t, localDir, "checkout", "-b", "develop")
+	runGitTestCmd(t, localDir, "push", "-u", "origin", "develop")
+
+	branch := "polecat/foo/gt-35un@abc123"
+	runGitTestCmd(t, localDir, "checkout", "-b", branch)
+	badSHA := commitUnverified(t, localDir, "own-work.txt", "own work", "bypassed hooks")
+
+	// Shadow refs/remotes/origin/develop with a local branch of the same
+	// unqualified name, at the tip of the unverified branch.
+	runGitTestCmd(t, localDir, "branch", "origin/develop", "HEAD")
+
+	got, err := HasUnverifiedCommit(g, "origin", []string{"develop"})
+	if err != nil {
+		t.Fatalf("HasUnverifiedCommit: %v", err)
+	}
+	if got != badSHA {
+		t.Fatalf("HasUnverifiedCommit = %q, want %q — a local branch named origin/develop must not shadow the tracking ref and exempt the unverified commit", got, badSHA)
+	}
+}
+
+func TestHasUnverifiedCommit_ShadowingLocalTagNotExempt(t *testing.T) {
+	localDir, _, _ := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	runGitTestCmd(t, localDir, "checkout", "-b", "develop")
+	runGitTestCmd(t, localDir, "push", "-u", "origin", "develop")
+
+	branch := "polecat/foo/gt-35un@abc123"
+	runGitTestCmd(t, localDir, "checkout", "-b", branch)
+	badSHA := commitUnverified(t, localDir, "own-work.txt", "own work", "bypassed hooks")
+
+	// Same shadow, but via a tag instead of a branch — the adversarial
+	// pass reproduced this variant independently.
+	runGitTestCmd(t, localDir, "tag", "origin/develop", "HEAD")
+
+	got, err := HasUnverifiedCommit(g, "origin", []string{"develop"})
+	if err != nil {
+		t.Fatalf("HasUnverifiedCommit: %v", err)
+	}
+	if got != badSHA {
+		t.Fatalf("HasUnverifiedCommit = %q, want %q — a local tag named origin/develop must not shadow the tracking ref and exempt the unverified commit", got, badSHA)
 	}
 }
 

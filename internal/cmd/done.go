@@ -1492,6 +1492,18 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				doneErrors = append(doneErrors, fmt.Sprintf(
 					"PR appears to exist on branch %s but PR number could not be resolved (URL parse + FindPRNumber both failed); refinery will not pick up and manual dispatcher intervention is required",
 					branch))
+			} else if completion.reusePR == 0 && mergeStrategyIsPR {
+				// mergeStrategyIsPR requested a PR (completion.createPR),
+				// but both `gh pr create` and the FindPRNumber fallback
+				// failed above: prNumber and prURL are both zero-valued.
+				// Without this branch, mrFailed stays false and the
+				// no-merge close path below reports "No-merge work
+				// completed" as if this were the legitimate branch-only
+				// no-merge case, closing the bead with no PR and no MR
+				// bead tracking it.
+				mrFailed = true
+				doneErrors = append(doneErrors, fmt.Sprintf(
+					"merge_strategy=pr requested but no PR could be created or found for branch %s; dispatcher intervention required", branch))
 			} else if completion.reusePR > 0 {
 				// Reused-PR path skips the handoff above on the assumption
 				// that PR #N's MR bead already exists and already carries
@@ -1568,6 +1580,17 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// source_issue.
 			if refineryOwnsMerge {
 				fmt.Printf("%s Work bead %s left open — refinery will close on merge\n", style.Bold.Render("→"), issueID)
+				goto notifyWitness
+			}
+
+			// mrFailed means the PR/MR handoff didn't verifiably land
+			// (handoff error, unparseable PR URL, no PR found at all, or
+			// no live MR bead for a reused review-fix PR). This must gate
+			// the force-close below: shouldCloseHookedBead's later
+			// mrFailed check (see updateAgentStateOnDone) never gets a
+			// say once bd.Show finds the bead already terminal.
+			if !shouldForceCloseNoMerge(mrFailed) {
+				fmt.Printf("%s Work bead %s left open — MR handoff failed, dispatcher intervention required\n", style.Bold.Render("→"), issueID)
 				goto notifyWitness
 			}
 
@@ -2444,6 +2467,16 @@ func shouldCloseHookedBead(exitType string, isWorkflowStep, pushFailed, mrFailed
 		return false
 	}
 	return exitType != ExitDeferred || isWorkflowStep
+}
+
+// shouldForceCloseNoMerge reports whether the no-merge completion path
+// (merge_strategy=pr, PR created/reused, no refinery handoff) may
+// force-close the work bead. mrFailed means the PR/MR handoff didn't
+// verifiably land, so the bead must stay open for dispatcher intervention
+// instead of closing here and hiding the failure before
+// updateAgentStateOnDone's own mrFailed check ever runs (PR #253 review).
+func shouldForceCloseNoMerge(mrFailed bool) bool {
+	return !mrFailed
 }
 
 // updateAgentStateOnDone closes the hooked work bead and reports cleanup status.
