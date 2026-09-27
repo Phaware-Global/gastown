@@ -355,8 +355,9 @@ type MRInfo struct {
 
 	// ReviewPR is the GitHub PR number already tracked on this MR bead
 	// (0 = none recorded yet). See beads.MRFields.ReviewPR — mirrored here
-	// so the merge path can enforce the never-push-without-review_pr
-	// invariant without re-parsing the bead on every check.
+	// so queue listings and the review-fix tooling can read it without
+	// re-parsing the bead. The direct-push guard does not consult it: on a
+	// merge_strategy=pr rig a direct push is refused whether or not one is set.
 	ReviewPR int
 
 	// Pre-verification fields (Phase 3: polecat-owned rebasing)
@@ -449,6 +450,15 @@ func NewEngineer(r *rig.Rig) *Engineer {
 	}
 	eng.escalate = eng.defaultEscalate
 	return eng
+}
+
+// fileEscalation files an escalation through the e.escalate seam, falling back
+// to the real `gt escalate` for an Engineer built without NewEngineer.
+func (e *Engineer) fileEscalation(severity, source, fingerprint, message string) error {
+	if e.escalate != nil {
+		return e.escalate(severity, source, fingerprint, message)
+	}
+	return e.defaultEscalate(severity, source, fingerprint, message)
 }
 
 // defaultEscalate shells out to `gt escalate`. Under `go test` it discards
@@ -923,8 +933,12 @@ type ProcessResult struct {
 	NoMerge               bool // Source issue has no_merge flag — intentionally blocked, not a failure
 	NeedsApproval         bool // PR exists but lacks required approving review (merge_strategy=pr)
 	NeedsReviewResolution bool // PR has unresolved reviewer threads — review-fix loop must run before merge
-	ReviewPRMissing       bool // gt-wgmf: refused a direct push — rig requires PR review but this MR has no review_pr
+	ReviewPRMissing       bool // refused a direct push — the rig requires merge_strategy=pr, so the MR must land through the PR merge path
 }
+
+// reviewPRMissingLabel parks an MR whose direct push the guard refused.
+// ListReadyMRs skips MRs carrying it; a human removes it once the cause is fixed.
+const reviewPRMissingLabel = "gt:review-pr-missing"
 
 // doMerge performs the actual git merge operation. mrID is the MR bead's
 // own ID — threaded through so the merge_strategy=pr safety checks and
@@ -940,6 +954,18 @@ func (e *Engineer) doMerge(ctx context.Context, mrID, branch, target, sourceIssu
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Source issue %s has no_merge=true — skipping merge\n", sourceIssue)
 				return ProcessResult{NoMerge: true, Error: "no_merge flag set on source issue"}
 			}
+		}
+	}
+
+	// Route: merge_strategy=pr lands through the VCS provider's PR merge API
+	// (doMergePR); anything else ends in a direct push to the target. Decide
+	// once, up front, so the direct-push guard runs before ANY side effect —
+	// including the submodule pushes in Step 3.5, which publish to a remote
+	// just as irreversibly as the parent push does.
+	viaPR := e.config.MergeStrategy == "pr"
+	if !viaPR {
+		if err := e.directPushGuard(target); err != nil {
+			return refusalResult(err, mrID)
 		}
 	}
 
@@ -1015,7 +1041,11 @@ func (e *Engineer) doMerge(ctx context.Context, mrID, branch, target, sourceIssu
 				continue // Submodule removed, nothing to push
 			}
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Pushing submodule %s (commit %s)...\n", sc.Path, shortSHA(sc.NewSHA))
-			if pushErr := e.git.PushSubmoduleCommit(sc.Path, sc.NewSHA, "origin"); pushErr != nil {
+			if pushErr := e.pushSubmoduleCommit(target, viaPR, sc.Path, sc.NewSHA); pushErr != nil {
+				var refused *directPushRefusedError
+				if errors.As(pushErr, &refused) {
+					return refusalResult(pushErr, mrID)
+				}
 				return ProcessResult{
 					Success: false,
 					Error:   fmt.Sprintf("failed to push submodule %s: %v", sc.Path, pushErr),
@@ -1055,36 +1085,8 @@ func (e *Engineer) doMerge(ctx context.Context, mrID, branch, target, sourceIssu
 	// instead of local squash merge + direct push. This respects branch
 	// protection/restriction rules and preserves the PR audit trail.
 	// The VCS provider (GitHub, Bitbucket) is selected via vcs_provider config.
-	if e.config.MergeStrategy == "pr" {
+	if viaPR {
 		return e.doMergePR(ctx, mrID, branch, target)
-	}
-
-	// gt-wgmf P0: an MR without review_pr must never be squash-merged and
-	// pushed directly to the default branch when the RIG actually requires
-	// PR review — even if e.config.MergeStrategy disagrees. e.config is a
-	// snapshot taken once (LoadConfig is a separate call the caller must
-	// remember to make); if that snapshot is stale, missing, or was never
-	// loaded, the check above silently falls through to here despite the
-	// rig's real settings requiring PR review. Re-reading settings fresh
-	// from disk, independent of e.config, catches that gap immediately
-	// before the one irreversible step (the push) rather than trusting a
-	// single earlier config read for the most consequential action in the
-	// merge. Only the default branch is guarded — feature/integration
-	// targets are not subject to the PR-review policy.
-	if target == e.rig.DefaultBranch() {
-		if requiresPR, checkErr := e.rigActuallyRequiresPRStrategy(); requiresPR {
-			errMsg := fmt.Sprintf(
-				"refusing direct push to %s: rig settings require merge_strategy=pr but this merge path has no review_pr for MR %s (in-memory MergeStrategy=%q) — escalate instead of pushing",
-				target, mrID, e.config.MergeStrategy)
-			if checkErr != nil {
-				errMsg += fmt.Sprintf(" (fresh settings re-check failed, failing closed: %v)", checkErr)
-			}
-			return ProcessResult{
-				Success:         false,
-				ReviewPRMissing: true,
-				Error:           errMsg,
-			}
-		}
 	}
 
 	// Step 5: Perform the actual merge using squash merge
@@ -1178,11 +1180,15 @@ func (e *Engineer) doMerge(ctx context.Context, mrID, branch, target, sourceIssu
 		}
 
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Pushing to origin/%s...\n", target)
-		if err := e.git.Push("origin", target, false); err != nil {
+		if err := e.pushTargetBranch(target); err != nil {
 			// Reset the checked-out target branch to undo the local squash commit.
 			// Without this, the next retry could see stale local state from the failed push.
 			if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
 				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to reset %s after push failure: %v\n", target, resetErr)
+			}
+			var refused *directPushRefusedError
+			if errors.As(err, &refused) {
+				return refusalResult(err, mrID)
 			}
 			return ProcessResult{
 				Success: false,
@@ -1248,7 +1254,7 @@ func (e *Engineer) doMergePR(ctx context.Context, mrID, branch, target string) P
 	}
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Found PR #%d for branch %s\n", prNumber, branch)
 
-	// gt-wgmf P0 (populate review_pr on MRs whose PR exists): a live PR was
+	// Populate review_pr on MRs whose PR exists: a live PR was
 	// just confirmed for this branch — persist it onto the MR bead if it
 	// isn't recorded there yet. Without this, an MR can carry a real,
 	// findable PR while still reading as "no review_pr" to every other
@@ -1342,11 +1348,15 @@ func (e *Engineer) doMergePR(ctx context.Context, mrID, branch, target string) P
 	}
 }
 
-// populateReviewPR persists prNumber as review_pr on MR bead mrID, unless
-// it's already set to that value. Read-modify-write via the bead lock
-// mirrors writeReviewPRToMR (the `gt refinery pr create --mr` path) so the
-// two writers can't clobber each other's other MR fields (review_loop_iter,
-// commit_sha, etc.) on a last-writer-wins race.
+// populateReviewPR records prNumber as review_pr on MR bead mrID, but only
+// when the bead has none. A recorded review_pr is never rewritten: it is what
+// the review-fix loop, await-review and the merge gates key off, and the value
+// passed here comes from a branch-name lookup that is weaker provenance than
+// what `gt refinery pr create --mr` wrote. If the bead already tracks a
+// different PR the bead is left alone and the mismatch is returned so the
+// caller can surface it. Read-modify-write via the bead lock mirrors
+// writeReviewPRToMR so the two writers can't clobber each other's other MR
+// fields (review_loop_iter, commit_sha, etc.) on a last-writer-wins race.
 func (e *Engineer) populateReviewPR(mrID string, prNumber int) error {
 	if prNumber <= 0 {
 		return fmt.Errorf("refusing to persist non-positive review_pr %d to MR %s", prNumber, mrID)
@@ -1370,8 +1380,11 @@ func (e *Engineer) populateReviewPR(mrID string, prNumber int) error {
 	if fields == nil {
 		fields = &beads.MRFields{}
 	}
-	if fields.ReviewPR == prNumber {
+	switch {
+	case fields.ReviewPR == prNumber:
 		return nil // already populated
+	case fields.ReviewPR != 0:
+		return fmt.Errorf("MR %s already tracks review_pr=%d; branch lookup found PR #%d — leaving review_pr unchanged", mrID, fields.ReviewPR, prNumber)
 	}
 	fields.ReviewPR = prNumber
 
@@ -1379,13 +1392,91 @@ func (e *Engineer) populateReviewPR(mrID string, prNumber int) error {
 	return e.beads.Update(mrID, beads.UpdateOptions{Description: &newDesc})
 }
 
+// directPushRefusedError reports that a direct push to a rig's default branch
+// was refused because the rig requires merge_strategy=pr. It is the one error
+// every guarded push helper returns, so callers can turn it into a
+// ProcessResult{ReviewPRMissing} with errors.As instead of matching text.
+type directPushRefusedError struct {
+	target    string
+	memory    string // e.config.MergeStrategy at refusal time
+	checkFail error  // non-nil when the fresh settings read failed and the guard failed closed
+}
+
+func (r *directPushRefusedError) Error() string {
+	msg := fmt.Sprintf(
+		"refusing direct push to %s: rig requires merge_strategy=pr (in-memory MergeStrategy=%q); a direct push bypasses the PR merge path (review_pr tracking, approvals, branch protection)",
+		r.target, r.memory)
+	if r.checkFail != nil {
+		msg += fmt.Sprintf(" (fresh settings re-check failed, failing closed: %v)", r.checkFail)
+	}
+	return msg
+}
+
+// directPushGuard is the single decision point for "may the refinery push
+// directly to this branch?". It returns a *directPushRefusedError when target
+// is the rig's default branch and the rig requires merge_strategy=pr, nil
+// otherwise. Only the default branch is guarded — feature/integration targets
+// are not subject to the PR-review policy.
+//
+// The answer comes from e.config when that already says "pr", and otherwise
+// from the rig's settings re-read fresh from disk: e.config is a snapshot
+// taken once (LoadConfig is a separate call the caller must remember to make)
+// and can be stale, defaulted, or never loaded, which is exactly how an
+// unreviewed MR reached the default branch. A failed fresh read fails closed.
+//
+// Do not call this from a merge path that ends in the provider's PR merge API
+// (doMergePR): that path never pushes to the target itself.
+func (e *Engineer) directPushGuard(target string) error {
+	if target != e.rig.DefaultBranch() {
+		return nil
+	}
+	if e.config.MergeStrategy == "pr" {
+		return &directPushRefusedError{target: target, memory: e.config.MergeStrategy}
+	}
+	requiresPR, checkErr := e.rigActuallyRequiresPRStrategy()
+	if !requiresPR {
+		return nil
+	}
+	return &directPushRefusedError{target: target, memory: e.config.MergeStrategy, checkFail: checkErr}
+}
+
+// pushTargetBranch is the only way the refinery pushes to a target branch.
+// The guard lives here, at the push itself, so a caller that forgets to check
+// first — or a new caller added later — cannot bypass it;
+// TestRawPushesOnlyInsideGuardedHelpers fails on any raw e.git.Push in this
+// package outside these helpers.
+func (e *Engineer) pushTargetBranch(target string) error {
+	if err := e.directPushGuard(target); err != nil {
+		return err
+	}
+	return e.git.Push("origin", target, false)
+}
+
+// pushSubmoduleCommit is the only way the refinery pushes a submodule commit.
+// When the merge lands through the PR merge API (viaPR) the submodule commit
+// is preparation for that merge and no direct push to target follows, so the
+// guard does not apply; on every other route it does.
+func (e *Engineer) pushSubmoduleCommit(target string, viaPR bool, submodulePath, sha string) error {
+	if !viaPR {
+		if err := e.directPushGuard(target); err != nil {
+			return err
+		}
+	}
+	return e.git.PushSubmoduleCommit(submodulePath, sha, "origin")
+}
+
+// refusalResult converts a guard refusal into the ProcessResult callers act on.
+func refusalResult(err error, mrID string) ProcessResult {
+	return ProcessResult{
+		Success:         false,
+		ReviewPRMissing: true,
+		Error:           fmt.Sprintf("MR %s: %v", mrID, err),
+	}
+}
+
 // rigActuallyRequiresPRStrategy re-reads this rig's merge_strategy directly
-// from its settings file, independent of e.config. e.config is populated
-// once (by LoadConfig, a call the caller must remember to make) and can be
-// stale, defaulted, or never loaded at all; this is the fresh, defense-in-
-// depth check that gt-wgmf's direct-push guard relies on immediately before
-// the one irreversible step in the merge. A dedicated Engineer is used
-// (rather than mutating e.config) so this check can never have a
+// from its settings file, independent of e.config. A dedicated Engineer is
+// used (rather than mutating e.config) so this check can never have a
 // side-effect on the caller's own merge decision.
 //
 // Fails CLOSED on error (returns true): a settings file that exists but
@@ -1909,20 +2000,29 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 		return
 	}
 
-	// ReviewPRMissing (gt-wgmf P0): the direct-push guard refused because the
-	// rig requires PR review and this MR carries no review_pr. This is not a
-	// build/test/conflict failure a polecat can "fix and resubmit" — it's a
-	// process/config problem (missing PR, or a config drift the guard
-	// caught) that needs a human to look at before this MR proceeds. Escalate
-	// at HIGH severity rather than the routine mayor nudge used below: an MR
-	// that got this close to an unreviewed push to the default branch is
-	// exactly the incident this bead exists to prevent a repeat of.
+	// ReviewPRMissing: the direct-push guard refused because the
+	// rig requires merge_strategy=pr. This is not a build/test/conflict failure
+	// a polecat can "fix and resubmit" — it's a process/config problem (missing
+	// PR, or a config drift the guard caught) that needs a human before this MR
+	// proceeds. Escalate at HIGH, then park the MR: without parking, the next
+	// poll would find it ready, be refused again, and file another HIGH
+	// escalation forever. The fingerprint makes a re-escalation (e.g. after a
+	// failed park) collapse onto the open one.
 	if result.ReviewPRMissing {
-		_, _ = fmt.Fprintf(e.output, "[Engineer] ✗ MR %s: refused direct push (no review_pr under merge_strategy=pr) — escalating\n%s\n", mr.ID, result.Error)
-		escMsg := fmt.Sprintf("MR %s (issue=%s branch=%s target=%s) refused a direct push: %s",
-			mr.ID, mr.SourceIssue, mr.Branch, mr.Target, result.Error)
-		if err := e.escalate("HIGH", "refinery:review-pr-missing", "", escMsg); err != nil {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to escalate review_pr-missing MR %s: %v\n", mr.ID, err)
+		_, _ = fmt.Fprintf(e.output, "[Engineer] ✗ MR %s: refused direct push (rig requires merge_strategy=pr) — escalating and parking\n%s\n", mr.ID, result.Error)
+		escMsg := fmt.Sprintf("MR %s (issue=%s branch=%s target=%s) refused a direct push: %s. The MR is parked with label %s and stays open; fix the cause, then `bd update %s --remove-label %s` to re-queue it.",
+			mr.ID, mr.SourceIssue, mr.Branch, mr.Target, result.Error, reviewPRMissingLabel, mr.ID, reviewPRMissingLabel)
+		fingerprint := fmt.Sprintf("refinery:review-pr-missing:%s:%s", e.rig.Name, mr.ID)
+		if err := e.fileEscalation("HIGH", "refinery:review-pr-missing", fingerprint, escMsg); err != nil {
+			// Leave the MR unparked so the next poll retries the escalation:
+			// parking after a failed escalation would hide it from everyone.
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to escalate review_pr-missing MR %s (not parking, will retry): %v\n", mr.ID, err)
+			return
+		}
+		if mr.ID != "" {
+			if err := e.beads.Update(mr.ID, beads.UpdateOptions{AddLabels: []string{reviewPRMissingLabel}}); err != nil {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to park review_pr-missing MR %s: %v\n", mr.ID, err)
+			}
 		}
 		return
 	}
@@ -2381,6 +2481,13 @@ func (e *Engineer) ListReadyMRs() ([]*MRInfo, error) {
 		// convoys), but if one slips through, the refinery should not process it.
 		if beads.HasLabel(issue, "gt:owned-direct") {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Skipping MR %s: owned+direct convoy (belt-and-suspenders)\n", issue.ID)
+			continue
+		}
+
+		// Skip MRs parked after a refused direct push (ReviewPRMissing). They
+		// stay open for a human to resolve; re-polling them only re-files the
+		// escalation. ListAllOpenMRs still returns them for queue-health views.
+		if beads.HasLabel(issue, reviewPRMissingLabel) {
 			continue
 		}
 

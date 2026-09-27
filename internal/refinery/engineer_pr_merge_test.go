@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -14,7 +13,6 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	gitpkg "github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
-	"github.com/steveyegge/gastown/internal/testutil"
 )
 
 // mustMarshalIndent is a test helper that fails the test immediately if
@@ -1001,32 +999,15 @@ func (f *populatingFakeProvider) DismissChangesRequestedReviews(int, string, str
 // the environment, not the code, so check for SKIP explicitly with -v
 // rather than trusting a bare PASS).
 func TestDoMergePR_PopulatesReviewPRWhenMissing(t *testing.T) {
-	testutil.RequireDoltContainer(t)
-	port, err := strconv.Atoi(testutil.DoltContainerPort())
-	if err != nil {
-		t.Fatalf("parsing dolt container port: %v", err)
-	}
-
 	workDir, g, _ := testGitRepo(t)
 	e := newTestEngineer(t, workDir, g)
 
-	rigPath := t.TempDir()
-	b := beads.NewIsolatedWithPort(rigPath, port)
-	if err := b.Init("gt"); err != nil {
-		t.Skipf("bd init unavailable in test environment: %v", err)
-	}
+	b := newDoltBeads(t)
 	e.beads = b
 
 	createFeatureBranch(t, workDir, "feat/populate", "test.txt", "hello")
 
-	mrIssue, err := b.Create(beads.CreateOptions{
-		Title:       "Merge: gt-test",
-		Labels:      []string{"gt:merge-request"},
-		Description: "branch: feat/populate\ntarget: main\nsource_issue: gt-test",
-	})
-	if err != nil {
-		t.Fatalf("create MR bead: %v", err)
-	}
+	mrIssue := createMRBead(t, b, "branch: feat/populate\ntarget: main\nsource_issue: gt-test")
 
 	e.prProvider = &populatingFakeProvider{prNumber: 77}
 

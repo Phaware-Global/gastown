@@ -2,6 +2,7 @@ package refinery
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -212,6 +213,16 @@ func (e *Engineer) ProcessBatch(ctx context.Context, batch []*MRInfo, target str
 		return e.processSingleMR(ctx, batch[0], target)
 	}
 
+	// A multi-MR batch always ends in a direct push of the stacked tip, so on
+	// a rig that requires merge_strategy=pr the whole batch is refused before
+	// any of it is stacked. (A single MR takes doMerge, which applies the same
+	// guard itself.) Refusing the batch — rather than dropping only MRs that
+	// lack review_pr — is deliberate: a batch push bypasses the PR merge API's
+	// branch protection, approvals and audit trail for every MR in it.
+	if err := e.directPushGuard(target); err != nil {
+		return e.refuseBatch(batch, err)
+	}
+
 	_, _ = fmt.Fprintf(e.output, "[Batch] Processing batch of %d MRs targeting %s\n", len(batch), target)
 
 	// Step 1: Build the stack
@@ -320,9 +331,30 @@ func (e *Engineer) processSingleMR(ctx context.Context, mr *MRInfo, target strin
 		// PR awaiting human approval — leave in queue for retry on next poll.
 		_, _ = fmt.Fprintf(e.output, "[Batch] MR %s: PR awaiting approval, will retry\n", mr.ID)
 		e.HandleMRInfoFailure(mr, processResult)
+	} else if processResult.ReviewPRMissing {
+		// Direct push refused on a merge_strategy=pr rig: escalate once and
+		// park the MR (HandleMRInfoFailure), and surface it to the caller.
+		e.HandleMRInfoFailure(mr, processResult)
+		result.Error = fmt.Errorf("merge refused: %s", processResult.Error)
 	} else {
 		result.Error = fmt.Errorf("merge failed: %s", processResult.Error)
 	}
+	return result
+}
+
+// refuseBatch refuses every MR in batch because a direct push to the target
+// would bypass a merge_strategy=pr rig's PR path. Each MR is escalated once
+// (under its own fingerprint) and parked, exactly as a refused single MR is.
+func (e *Engineer) refuseBatch(batch []*MRInfo, cause error) *BatchResult {
+	return e.refuseBatchWithResult(batch, cause, &BatchResult{})
+}
+
+func (e *Engineer) refuseBatchWithResult(batch []*MRInfo, cause error, result *BatchResult) *BatchResult {
+	_, _ = fmt.Fprintf(e.output, "[Batch] Refusing batch of %d MRs: %v\n", len(batch), cause)
+	for _, mr := range batch {
+		e.HandleMRInfoFailure(mr, refusalResult(cause, mr.ID))
+	}
+	result.Error = fmt.Errorf("batch refused: %w", cause)
 	return result
 }
 
@@ -396,9 +428,15 @@ func (e *Engineer) fastForwardBatch(ctx context.Context, stacked []*MRInfo, targ
 
 	// Push to origin
 	_, _ = fmt.Fprintf(e.output, "[Batch] Pushing %d merged MRs to origin/%s...\n", len(stacked), target)
-	if pushErr := e.git.Push("origin", target, false); pushErr != nil {
+	if pushErr := e.pushTargetBranch(target); pushErr != nil {
 		if resetErr := e.git.ResetHard("origin/" + target); resetErr != nil {
 			_, _ = fmt.Fprintf(e.output, "[Batch] Warning: failed to reset %s after push failure: %v\n", target, resetErr)
+		}
+		var refused *directPushRefusedError
+		if errors.As(pushErr, &refused) {
+			// Backstop: ProcessBatch refuses up front, but this is the last
+			// step before origin and must not depend on that having run.
+			return e.refuseBatchWithResult(stacked, pushErr, result)
 		}
 		result.Error = fmt.Errorf("push to origin: %w", pushErr)
 		return result
