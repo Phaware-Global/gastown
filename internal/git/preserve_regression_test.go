@@ -168,6 +168,7 @@ func TestAutoPreserveUncommittedWork_FailsClosedWhenDeletionQueryFails(t *testin
 // plumbing.
 func TestAutoPreserveUncommittedWork_UnstagesQuotedPathPreStagedFile(t *testing.T) {
 	dir := initTestRepo(t)
+	protected := addTestOriginRemote(t, dir)
 	g := NewGit(dir)
 	branch := "polecat/foo/gt-y8ts@abc123"
 	runGitTestCmd(t, dir, "checkout", "-b", branch)
@@ -181,7 +182,7 @@ func TestAutoPreserveUncommittedWork_UnstagesQuotedPathPreStagedFile(t *testing.
 		t.Fatalf("write: %v", err)
 	}
 
-	result, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{})
+	result, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{ProtectedBranches: []string{protected}})
 	if err != nil {
 		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
 	}
@@ -279,6 +280,7 @@ func TestAutoPreserveUncommittedWork_UnverifiedCommitGateSurvivesPushFalse(t *te
 		t.Skip("shell hook script not portable to windows")
 	}
 	dir := initTestRepo(t)
+	protected := addTestOriginRemote(t, dir)
 	g := NewGit(dir)
 	branch := "polecat/foo/gt-y8ts@abc123"
 	runGitTestCmd(t, dir, "checkout", "-b", branch)
@@ -292,7 +294,7 @@ func TestAutoPreserveUncommittedWork_UnverifiedCommitGateSurvivesPushFalse(t *te
 	}
 
 	// Cycle 1: the hook fails, the work is committed unverified.
-	res1, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{})
+	res1, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{ProtectedBranches: []string{protected}})
 	if err != nil {
 		t.Fatalf("cycle 1: %v", err)
 	}
@@ -303,7 +305,7 @@ func TestAutoPreserveUncommittedWork_UnverifiedCommitGateSurvivesPushFalse(t *te
 	// Cycle 2: clean tree, nothing to commit — but HEAD's ancestry still
 	// carries the unverified commit, and the caller is about to push the
 	// branch itself. HooksFailed must survive.
-	res2, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{})
+	res2, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{ProtectedBranches: []string{protected}})
 	if err != nil {
 		t.Fatalf("cycle 2: %v", err)
 	}
@@ -359,7 +361,7 @@ func TestAutoPreserveUncommittedWork_HookOutputIsRedacted(t *testing.T) {
 // otherwise the next bead's checkpoint force-pushes over the previous bead's
 // only preserved copy (PR #184 review).
 func TestAutoPreserveUncommittedWork_DetachedRefStablePerAssignment(t *testing.T) {
-	localDir, remoteDir, _ := initTestRepoWithRemote(t)
+	localDir, remoteDir, mainBranch := initTestRepoWithRemote(t)
 	g := NewGit(localDir)
 
 	base, err := g.Rev("HEAD")
@@ -374,7 +376,7 @@ func TestAutoPreserveUncommittedWork_DetachedRefStablePerAssignment(t *testing.T
 	if err := os.WriteFile(filepath.Join(localDir, "README.md"), []byte("# Test\nbead A work\n"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	res1, err := AutoPreserveUncommittedWork(g, "HEAD", PreserveOptions{IssueID: "furiosa", Push: true})
+	res1, err := AutoPreserveUncommittedWork(g, "HEAD", PreserveOptions{IssueID: "furiosa", Push: true, ProtectedBranches: []string{mainBranch}})
 	if err != nil {
 		t.Fatalf("assignment 1 checkpoint 1: %v", err)
 	}
@@ -387,7 +389,7 @@ func TestAutoPreserveUncommittedWork_DetachedRefStablePerAssignment(t *testing.T
 	if err := os.WriteFile(filepath.Join(localDir, "README.md"), []byte("# Test\nbead A work, more\n"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	res2, err := AutoPreserveUncommittedWork(g, "HEAD", PreserveOptions{IssueID: "furiosa", Push: true})
+	res2, err := AutoPreserveUncommittedWork(g, "HEAD", PreserveOptions{IssueID: "furiosa", Push: true, ProtectedBranches: []string{mainBranch}})
 	if err != nil {
 		t.Fatalf("assignment 1 checkpoint 2: %v", err)
 	}
@@ -402,7 +404,7 @@ func TestAutoPreserveUncommittedWork_DetachedRefStablePerAssignment(t *testing.T
 	if err := os.WriteFile(filepath.Join(localDir, "README.md"), []byte("# Test\nbead B work\n"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	res3, err := AutoPreserveUncommittedWork(g, "HEAD", PreserveOptions{IssueID: "furiosa", Push: true})
+	res3, err := AutoPreserveUncommittedWork(g, "HEAD", PreserveOptions{IssueID: "furiosa", Push: true, ProtectedBranches: []string{mainBranch}})
 	if err != nil {
 		t.Fatalf("assignment 2 checkpoint: %v", err)
 	}
