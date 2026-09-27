@@ -26,7 +26,7 @@ Gets production data off this machine. Three layers:
    whether the other layers work.
 2. **Git push** — the JSONL snapshots are committed to a backup repository and
    pushed.
-3. **Dolt push** — native Dolt replication to configured remotes.
+3. **Dolt replication** — native Dolt to configured remotes, run by `run.sh`.
 
 ## Run
 
@@ -38,7 +38,7 @@ the remote-visibility guard is enforced.
 cd <plugin dir> && bash run.sh
 cd <plugin dir> && bash run.sh --databases db1,db2   # specific databases only
 cd <plugin dir> && bash run.sh --skip-git            # skip the git layer
-cd <plugin dir> && bash run.sh --skip-dolt-push      # skip the dolt push layer
+cd <plugin dir> && bash run.sh --skip-dolt-push      # skip the Dolt replication layer
 ```
 
 Run the command exactly as shown. Do not reimplement any layer from this
