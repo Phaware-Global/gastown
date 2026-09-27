@@ -799,7 +799,10 @@ func cleanE2EEnv() []string {
 		}
 		clean = append(clean, env)
 	}
-	return clean
+	// Stripping BD_* also drops BD_DISABLE_METRICS; without it bd's detached
+	// metrics flusher writes eventkit.lock under the test HOME and races the
+	// t.TempDir cleanup (gt-bglj). See testutil.CleanGTEnv.
+	return append(clean, "BD_DISABLE_METRICS=1")
 }
 
 func isolatedE2EDoltEnv(t *testing.T, homeDir string) ([]string, string) {
@@ -851,5 +854,19 @@ func runGTCmd(t *testing.T, binary, dir string, env []string, args ...string) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("gt %v failed: %v\n%s", args, err, out)
+	}
+}
+
+// cleanE2EEnv strips BD_*, which drops the job-level BD_DISABLE_METRICS; it
+// and isolatedE2EDoltEnv (what tests actually call) must keep it on (gt-6kbn,
+// same race as gt-bglj).
+func TestCleanE2EEnv_DisablesBDMetrics(t *testing.T) {
+	for name, setup := range bdMetricsEnvSetups {
+		t.Run(name, func(t *testing.T) {
+			setup(t)
+			assertBDMetricsDisabled(t, "cleanE2EEnv", cleanE2EEnv())
+			env, _ := isolatedE2EDoltEnv(t, t.TempDir())
+			assertBDMetricsDisabled(t, "isolatedE2EDoltEnv", env)
+		})
 	}
 }

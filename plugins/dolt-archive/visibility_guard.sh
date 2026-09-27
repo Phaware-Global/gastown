@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# visibility_guard.sh — refuse to push a Dolt remote unless it is a GitHub
-# repo confirmed PRIVATE. Sourced by run.sh; also sourced directly by
+# visibility_guard.sh — refuse to push a Dolt remote or the JSONL git backup
+# remote unless it is a GitHub repo confirmed PRIVATE. Sourced by run.sh; also sourced directly by
 # run_test.sh for unit tests, so it must have no side effects of its own
 # (no top-level execution, nothing that touches the network or Dolt).
 #
@@ -83,4 +83,44 @@ remote_push_allowed() {
 
   echo "$visibility"
   return 1
+}
+
+# git_push_allowed REMOTE
+#
+# The git-backup counterpart of remote_push_allowed (gt-sg6n): judges where
+# `git push REMOTE` would ACTUALLY send data, for the repo in the current
+# directory. It asks git for the effective push URL(s) — `git remote get-url
+# --push --all` — so a pushurl, url.<base>.insteadOf or pushInsteadOf rewrite
+# is judged by its result, not by the raw remote.<name>.url. A remote with
+# several push URLs is pushed to all of them, so EVERY one must be confirmed
+# private; the first that is not decides the refusal.
+#
+# Same contract as remote_push_allowed: one-word reason on stdout, return 0
+# only when every push URL is a confirmed-private GitHub repo. An unresolvable
+# remote returns 1 with "push-url-unresolvable" — fail closed.
+git_push_allowed() {
+  local remote="$1"
+  local raw url reason
+  local urls=()
+
+  if ! raw="$(git remote get-url --push --all "$remote" 2>/dev/null)" || [[ -z "$raw" ]]; then
+    echo "push-url-unresolvable"
+    return 1
+  fi
+
+  IFS=$'\n' read -r -d '' -a urls <<< "$raw" || true
+  if [[ ${#urls[@]} -eq 0 ]]; then
+    echo "push-url-unresolvable"
+    return 1
+  fi
+
+  for url in "${urls[@]}"; do
+    if ! reason="$(remote_push_allowed "$url")"; then
+      echo "$reason"
+      return 1
+    fi
+  done
+
+  echo "private"
+  return 0
 }
