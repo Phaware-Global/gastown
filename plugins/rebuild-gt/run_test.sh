@@ -67,7 +67,9 @@ if [ "\$1" = "stale" ]; then
 fi
 if [ "\$1" = "version" ]; then
   SHA="\$(cat "$INSTALLED_SHA_FILE" 2>/dev/null || echo unknown)"
-  echo "gt version test-fake@\$SHA"
+  # Real format has no '@' when the cwd has no named branch to report:
+  # "gt version f4ad0de4 (dev: f4ad0de4)".
+  echo "gt version \${SHA:0:8} (dev: \${SHA:0:8})"
   exit 0
 fi
 if [ "\$1" = "escalate" ]; then
@@ -99,14 +101,22 @@ run_rebuild() {
   PATH="$STUB_BIN:$PATH" GT_TOWN_ROOT="$TOWN_ROOT" bash "$SCRIPT_DIR/run.sh"
 }
 
-: > "$STALE_JSON_FILE"
-echo '{"stale": true}' > "$STALE_JSON_FILE"
+# write_stale_json STALE BINARY_COMMIT [SKIPPED] [ERROR] — build the JSON
+# `gt stale --json` returns. binary_commit is what run.sh now compares
+# against instead of parsing `gt version`'s text output.
+write_stale_json() {
+  local stale="$1" commit="$2" skipped="${3:-false}" error="${4:-}"
+  cat > "$STALE_JSON_FILE" <<JSON
+{"stale": $stale, "binary_commit": "$commit", "skipped": $skipped, "error": "$error"}
+JSON
+}
 
 # --- Test 1: dirty/off-main mayor clone still rebuilds from origin/main -----
 # Installed binary is at the base commit (an ancestor of, but not equal to,
 # origin/main's tip) so a rebuild is both needed and forward-safe.
 
 echo "$INSTALLED_BASE_SHA" > "$INSTALLED_SHA_FILE"
+write_stale_json true "$INSTALLED_BASE_SHA"
 : > "$MAKE_LOG"
 rm -f "$SKIP_COUNT_FILE"
 
@@ -147,6 +157,7 @@ fi
 # as a build failure.
 
 echo "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" > "$INSTALLED_SHA_FILE"
+write_stale_json true "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 : > "$MAKE_LOG"
 : > "$ESCALATE_LOG"
 rm -f "$SKIP_COUNT_FILE"
@@ -166,6 +177,7 @@ fi
 # look like a build error and escalate a false alarm).
 
 echo "$ORIGIN_MAIN_SHA" > "$INSTALLED_SHA_FILE"
+write_stale_json true "$ORIGIN_MAIN_SHA"
 : > "$MAKE_LOG"
 : > "$ESCALATE_LOG"
 rm -f "$SKIP_COUNT_FILE"
@@ -185,6 +197,7 @@ fi
 # --- Test 4: escalate after 3 consecutive stale-but-skipped runs ------------
 
 echo "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" > "$INSTALLED_SHA_FILE"
+write_stale_json true "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 rm -f "$SKIP_COUNT_FILE"
 : > "$ESCALATE_LOG"
 
@@ -198,6 +211,126 @@ fi
 run_rebuild >/dev/null 2>&1 || true
 if ! [ -s "$ESCALATE_LOG" ]; then
   echo "FAIL: did not escalate after 3 consecutive skipped-while-stale runs"
+  FAILURES=$((FAILURES + 1))
+fi
+
+# --- Test 5: gt stale skipped/errored must NOT be read as "binary is fresh" ---
+# gt stale --json exits 0 with stale:false on both a skipped check and an
+# internal error (repo not found, no build-branch ref). Reading only "stale"
+# would log "binary is fresh" and reset_skip_count, silencing the new
+# escalation forever while the binary stays actually stale.
+
+rm -f "$SKIP_COUNT_FILE"
+: > "$MAKE_LOG"
+write_stale_json false "" true ""
+
+run_rebuild >/dev/null 2>&1 || { echo "FAIL: a skipped staleness check made the run exit non-zero"; FAILURES=$((FAILURES + 1)); }
+
+if [ -s "$MAKE_LOG" ]; then
+  echo "FAIL: make was invoked even though gt stale could not determine staleness (skipped)"
+  FAILURES=$((FAILURES + 1))
+fi
+
+if [ "$(cat "$SKIP_COUNT_FILE" 2>/dev/null || echo MISSING)" != "1" ]; then
+  echo "FAIL: a skipped staleness check was not counted as a skip"
+  FAILURES=$((FAILURES + 1))
+fi
+
+rm -f "$SKIP_COUNT_FILE"
+: > "$MAKE_LOG"
+write_stale_json false "" false "cannot determine binary commit (dev build?)"
+
+run_rebuild >/dev/null 2>&1 || { echo "FAIL: an errored staleness check made the run exit non-zero"; FAILURES=$((FAILURES + 1)); }
+
+if [ -s "$MAKE_LOG" ]; then
+  echo "FAIL: make was invoked even though gt stale reported an error"
+  FAILURES=$((FAILURES + 1))
+fi
+
+if [ "$(cat "$SKIP_COUNT_FILE" 2>/dev/null || echo MISSING)" != "1" ]; then
+  echo "FAIL: an errored staleness check was not counted as a skip"
+  FAILURES=$((FAILURES + 1))
+fi
+
+# --- Test 6: missing/invalid binary_commit skips cleanly, never aborts -----
+# The old code parsed `gt version`'s text output for the installed commit;
+# under set -euo pipefail a `grep` with no match aborted the whole script
+# with nothing recorded. binary_commit is taken from gt stale's JSON now and
+# must be validated instead of trusted blindly.
+
+echo "$INSTALLED_BASE_SHA" > "$INSTALLED_SHA_FILE"
+write_stale_json true ""
+: > "$MAKE_LOG"
+rm -f "$SKIP_COUNT_FILE"
+
+run_rebuild >/dev/null 2>&1 || { echo "FAIL: an empty binary_commit aborted the script instead of skipping"; FAILURES=$((FAILURES + 1)); }
+
+if [ -s "$MAKE_LOG" ]; then
+  echo "FAIL: make was invoked with no valid binary_commit to compare against"
+  FAILURES=$((FAILURES + 1))
+fi
+
+# --- Test 7: a corrupt skip-count file restarts cleanly and never leaks the lock ---
+# count=$((count + 1)) on unvalidated file content is a bash arithmetic
+# expression: garbage content is a syntax error (set -e aborts) or, worse,
+# can execute an embedded command substitution.
+
+echo "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" > "$INSTALLED_SHA_FILE"
+write_stale_json true "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+: > "$MAKE_LOG"
+rm -rf "${SKIP_COUNT_FILE}.lock"
+echo "1 2" > "$SKIP_COUNT_FILE"
+
+run_rebuild >/dev/null 2>&1 || { echo "FAIL: a corrupt skip-count file made the run abort instead of restarting the counter"; FAILURES=$((FAILURES + 1)); }
+
+if [ -d "${SKIP_COUNT_FILE}.lock" ]; then
+  echo "FAIL: the skip-count lock directory was left behind after corrupt content"
+  FAILURES=$((FAILURES + 1))
+fi
+
+if [ "$(cat "$SKIP_COUNT_FILE" 2>/dev/null || echo MISSING)" != "1" ]; then
+  echo "FAIL: skip count did not restart cleanly from corrupt content (got: $(cat "$SKIP_COUNT_FILE" 2>/dev/null || echo MISSING))"
+  FAILURES=$((FAILURES + 1))
+fi
+
+# --- Test 8: BUILD_ROOT never resolves to an enclosing repo -----------------
+# Simulate a town whose ancestor directory (e.g. an umbrella checkout, like
+# ~/gt) is itself a git repo. Without GIT_CEILING_DIRECTORIES, `git -C
+# "$BUILD_ROOT" rev-parse --git-dir` walks up and discovers that outer repo
+# instead of failing closed, the "invalid worktree" cleanup is skipped, and
+# the later fetch + checkout --force runs against the outer repo.
+
+OUTER_REPO="$WORK_ROOT"
+git init -q "$OUTER_REPO"
+git -C "$OUTER_REPO" config user.email "outer@example.com"
+git -C "$OUTER_REPO" config user.name "Outer"
+git -C "$OUTER_REPO" checkout -q -b outer-branch
+git -C "$OUTER_REPO" commit --allow-empty -q -m "outer initial"
+echo "outer wip" >> "$OUTER_REPO/outer-scratch.txt"
+
+rm -rf "$BUILD_ROOT"
+mkdir -p "$BUILD_ROOT" # exists, but is NOT a git repo of its own
+echo "$INSTALLED_BASE_SHA" > "$INSTALLED_SHA_FILE"
+write_stale_json true "$INSTALLED_BASE_SHA"
+rm -f "$SKIP_COUNT_FILE"
+: > "$MAKE_LOG"
+
+run_rebuild >/dev/null 2>&1 || { echo "FAIL: the enclosing-repo run exited non-zero unexpectedly"; FAILURES=$((FAILURES + 1)); }
+
+OUTER_BRANCH_AFTER="$(git -C "$OUTER_REPO" branch --show-current)"
+if [ "$OUTER_BRANCH_AFTER" != "outer-branch" ]; then
+  echo "FAIL: the enclosing repo's branch was touched (now: $OUTER_BRANCH_AFTER) — BUILD_ROOT resolved to it instead of its own worktree"
+  FAILURES=$((FAILURES + 1))
+fi
+
+if [ -z "$(git -C "$OUTER_REPO" status --porcelain -- outer-scratch.txt)" ]; then
+  echo "FAIL: the enclosing repo's uncommitted file was discarded — BUILD_ROOT resolved to it"
+  FAILURES=$((FAILURES + 1))
+fi
+
+BUILD_SHA="$(git -C "$BUILD_ROOT" rev-parse HEAD 2>/dev/null || echo MISSING)"
+if [ "$BUILD_SHA" != "$ORIGIN_MAIN_SHA" ]; then
+  echo "FAIL: BUILD_ROOT worktree HEAD ($BUILD_SHA) != origin/main ($ORIGIN_MAIN_SHA) — did it build in the enclosing repo instead?"
   FAILURES=$((FAILURES + 1))
 fi
 

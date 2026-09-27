@@ -15,6 +15,14 @@
 set -euo pipefail
 
 TOWN_ROOT="${GT_TOWN_ROOT:-$(gt town root 2>/dev/null)}"
+
+# Without this, a BUILD_ROOT that isn't a git repo yet (first run, or after
+# invalid-worktree cleanup) lets git's upward directory search discover an
+# enclosing repo (e.g. the town's umbrella .git) instead of failing closed.
+# The identity checks below then treat that discovered repo as BUILD_ROOT,
+# and fetch/checkout --force runs against it instead.
+export GIT_CEILING_DIRECTORIES="$TOWN_ROOT"
+
 RIG_ROOT="${TOWN_ROOT}/gastown/mayor/rig"
 BUILD_ROOT="${TOWN_ROOT}/gastown/.gt-build"
 SKIP_COUNT_FILE="${TOWN_ROOT}/gastown/.gt-build-skip-count"
@@ -70,6 +78,12 @@ skip_while_stale() {
   if [ -f "$SKIP_COUNT_FILE" ]; then
     count=$(cat "$SKIP_COUNT_FILE" 2>/dev/null || echo 0)
   fi
+  # Guard against garbage (partial write, hand edit, or an injection payload)
+  # before using it in arithmetic: unvalidated content can abort the script
+  # under set -e while the lock above is still held, leaking it forever.
+  case "$count" in
+  '' | *[!0-9]*) count=0 ;;
+  esac
   count=$((count + 1))
   echo "$count" > "$SKIP_COUNT_FILE" 2>/dev/null || true
   rmdir "$lockdir" 2>/dev/null || true
@@ -91,6 +105,15 @@ STALE_JSON=$(gt stale --json 2>/dev/null) || {
 }
 
 IS_STALE=$(echo "$STALE_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('stale', False))" 2>/dev/null || echo "False")
+IS_SKIPPED=$(echo "$STALE_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('skipped', False))" 2>/dev/null || echo "False")
+STALE_ERROR=$(echo "$STALE_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('error', ''))" 2>/dev/null || echo "")
+
+# gt stale exits 0 with stale:false on both a skipped check and an internal
+# error (repo not found, no build-branch ref) — reading only "stale" here
+# would record these as "binary is fresh" and reset the skip streak.
+if [ "$IS_SKIPPED" = "True" ] || [ -n "$STALE_ERROR" ]; then
+  skip_while_stale "gt stale could not determine staleness: ${STALE_ERROR:-skipped}"
+fi
 
 if [ "$IS_STALE" != "True" ]; then
   log "Binary is fresh. Nothing to do."
@@ -144,20 +167,27 @@ fi
 # misreported as a build failure below.
 
 BUILD_HEAD=$(git -C "$BUILD_ROOT" rev-parse HEAD)
-INSTALLED_COMMIT=$(gt version --verbose 2>/dev/null | grep -o '@[a-f0-9]*' | head -1 | tr -d '@')
 
-if [ -n "$INSTALLED_COMMIT" ] && [ "$INSTALLED_COMMIT" != "unknown" ]; then
-  case "$BUILD_HEAD" in
-  "$INSTALLED_COMMIT"*)
-    log "Installed binary is already at origin/main ($BUILD_HEAD). Nothing to do."
-    record_run "rebuild-gt: binary is fresh" "success"
-    reset_skip_count
-    exit 0
-    ;;
-  esac
-  if ! git -C "$BUILD_ROOT" merge-base --is-ancestor "$INSTALLED_COMMIT" "$BUILD_HEAD" 2>/dev/null; then
-    skip_while_stale "origin/main ($BUILD_HEAD) is not a forward descendant of the installed binary ($INSTALLED_COMMIT) — would be a downgrade"
-  fi
+# Taken from the already-fetched STALE_JSON's binary_commit rather than
+# parsing `gt version`'s text output: that format doesn't always include an
+# '@' (e.g. no named branch in cwd), and under `set -euo pipefail` a `grep`
+# that finds no match aborts the whole script right here on every run.
+INSTALLED_COMMIT=$(echo "$STALE_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('binary_commit', ''))" 2>/dev/null || echo "")
+
+if ! [[ "$INSTALLED_COMMIT" =~ ^[0-9a-f]{7,40}$ ]]; then
+  skip_while_stale "gt stale reported no valid binary_commit to compare against (got '${INSTALLED_COMMIT:-empty}')"
+fi
+
+case "$BUILD_HEAD" in
+"$INSTALLED_COMMIT"*)
+  log "Installed binary is already at origin/main ($BUILD_HEAD). Nothing to do."
+  record_run "rebuild-gt: binary is fresh" "success"
+  reset_skip_count
+  exit 0
+  ;;
+esac
+if ! git -C "$BUILD_ROOT" merge-base --is-ancestor "$INSTALLED_COMMIT" "$BUILD_HEAD" 2>/dev/null; then
+  skip_while_stale "origin/main ($BUILD_HEAD) is not a forward descendant of the installed binary ($INSTALLED_COMMIT) — would be a downgrade"
 fi
 
 # --- Build -------------------------------------------------------------------
