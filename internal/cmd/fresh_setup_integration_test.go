@@ -358,3 +358,14 @@ func runFreshSetupOutputCmd(t *testing.T, dir string, env []string, name string,
 	}
 	return string(out)
 }
+
+// freshSetupIntegrationEnv strips BD_*, which drops the job-level
+// BD_DISABLE_METRICS; it must re-assert it (gt-6kbn, same race as gt-bglj).
+func TestFreshSetupIntegrationEnv_DisablesBDMetrics(t *testing.T) {
+	for name, setup := range bdMetricsEnvSetups {
+		t.Run(name, func(t *testing.T) {
+			setup(t)
+			assertBDMetricsDisabled(t, "freshSetupIntegrationEnv", freshSetupIntegrationEnv(t.TempDir(), "3307"))
+		})
+	}
+}
