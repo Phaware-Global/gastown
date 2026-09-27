@@ -1168,21 +1168,26 @@ func ClosePluginReceipts(db *sql.DB, dbName string, maxAge time.Duration, dryRun
 // notifications are informational, not actionable, so closing them past a
 // short window keeps the open-wisp count from drifting upward indefinitely.
 //
-// Only notifications the recipient has read (`delivery:acked`) are closed here
-// (gt-78xq). A nudge merely announces mail; the body exists only in the bead,
-// so closing a still-`delivery:pending` notification silently loses unread
-// mail. Pending ones fall back to the normal max-age Reap. FastTrackClosers
-// (and thus Scan's FastTrackCandidates) call this same function, so the
-// preview and the real close apply one predicate.
+// Only notifications the recipient has actually read (the `read` label) are
+// closed here (gt-78xq). `delivery:acked` is set by the UserPromptSubmit
+// inject hook the moment a notification is first shown in the mail-check
+// summary — seconds after delivery, before anyone has read the body — so
+// gating on it fast-closed unread mail. `read` is set only by `gt mail read`
+// (mail.Mailbox.storeMarkReadOnly), which is the actual read signal. A nudge
+// merely announces mail; the body exists only in the bead, so closing a still
+// unread notification silently loses it. Unread ones fall back to the normal
+// max-age Reap. FastTrackClosers (and thus Scan's FastTrackCandidates) call
+// this same function, so the preview and the real close apply one predicate.
 func CloseStaleNotifications(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ClosePluginReceiptResult, error) {
-	return closeWispsByLabel(db, dbName, "msg-type:notification", maxAge, "stale notifications", dryRun, deliveryLabelAcked)
+	return closeWispsByLabel(db, dbName, "msg-type:notification", maxAge, "stale notifications", dryRun, readLabel)
 }
 
-// deliveryLabelAcked is the wisp label mail.Router's read path sets once the
-// recipient has read the message (mail.DeliveryLabelAcked). Duplicated rather
-// than imported: this package is a leaf and must not depend on internal/mail.
-// Acked wins over a lingering delivery:pending (see internal/mail/delivery.go).
-const deliveryLabelAcked = "delivery:acked"
+// readLabel is the wisp label mail.Mailbox's read path sets once the
+// recipient has actually read the message via `gt mail read`
+// (mail.Mailbox.storeMarkReadOnly writes the same bare "read" label).
+// Duplicated rather than imported: this package is a leaf and must not
+// depend on internal/mail.
+const readLabel = "read"
 
 // closeByLabelSelectQuery selects open wisps carrying a given label past a
 // cutoff. It targets the wisps/wisp_labels tables — the post-migration home of

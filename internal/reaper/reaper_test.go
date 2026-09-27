@@ -814,7 +814,7 @@ func TestFastTrackClosuresAreNotReapedAndScanPredictsThem(t *testing.T) {
 	now := time.Now().UTC()
 	state := &fakeReaperState{
 		wisps: map[string]*fakeWisp{
-			"stale-notification": {id: "stale-notification", status: "open", issueType: "task", createdAt: now.Add(-2 * time.Hour), labels: []string{"gt:message", "msg-type:notification", "delivery:acked"}},
+			"stale-notification": {id: "stale-notification", status: "open", issueType: "task", createdAt: now.Add(-2 * time.Hour), labels: []string{"gt:message", "msg-type:notification", "delivery:acked", "read"}},
 			"fresh-notification": {id: "fresh-notification", status: "open", issueType: "task", createdAt: now.Add(-10 * time.Minute), labels: []string{"gt:message", "msg-type:notification", "delivery:acked"}},
 			"plain-task":         {id: "plain-task", status: "open", issueType: "task", createdAt: now.Add(-2 * time.Hour)},
 		},
@@ -860,24 +860,29 @@ func TestFastTrackClosuresAreNotReapedAndScanPredictsThem(t *testing.T) {
 	}
 }
 
-// TestStaleNotificationsOnlyFastTrackAckedMail is the gt-78xq regression. A
-// notification's body exists only in its bead (a nudge merely announces it), so
-// a never-read one (delivery:pending) must not be closed at the 1h fast-track
-// age — that silently loses unread mail. Only delivery:acked (the recipient ran
-// `gt mail read`) is fast-tracked; pending mail falls back to the max-age Reap.
-func TestStaleNotificationsOnlyFastTrackAckedMail(t *testing.T) {
+// TestStaleNotificationsOnlyFastTrackReadMail is the gt-78xq regression,
+// updated for the fix that gates on the `read` label instead of
+// `delivery:acked`. A notification's body exists only in its bead (a nudge
+// merely announces it), so one the recipient hasn't actually read must not be
+// closed at the 1h fast-track age — that silently loses unread mail.
+// `delivery:acked` is set by the inject hook before the body is ever shown, so
+// it is NOT a read signal on its own (acked-only-2h below); only `read` (set
+// by `gt mail read`) is fast-tracked. Everything else falls back to the
+// max-age Reap.
+func TestStaleNotificationsOnlyFastTrackReadMail(t *testing.T) {
 	now := time.Now().UTC()
-	notif := func(id string, age time.Duration, delivery ...string) *fakeWisp {
-		labels := append([]string{"gt:message", "msg-type:notification"}, delivery...)
+	notif := func(id string, age time.Duration, labelSuffixes ...string) *fakeWisp {
+		labels := append([]string{"gt:message", "msg-type:notification"}, labelSuffixes...)
 		return &fakeWisp{id: id, status: "open", issueType: "task", createdAt: now.Add(-age), labels: labels}
 	}
 	state := &fakeReaperState{
 		wisps: map[string]*fakeWisp{
-			"acked-2h":       notif("acked-2h", 2*time.Hour, "delivery:acked"),
-			"acked-10m":      notif("acked-10m", 10*time.Minute, "delivery:acked"),
+			"read-2h":        notif("read-2h", 2*time.Hour, "read"),
+			"read-10m":       notif("read-10m", 10*time.Minute, "read"),
+			"acked-only-2h":  notif("acked-only-2h", 2*time.Hour, "delivery:acked"),
 			"pending-2h":     notif("pending-2h", 2*time.Hour, "delivery:pending"),
 			"pending-25h":    notif("pending-25h", 25*time.Hour, "delivery:pending"),
-			"both-labels-2h": notif("both-labels-2h", 2*time.Hour, "delivery:pending", "delivery:acked"),
+			"acked-and-read": notif("acked-and-read", 2*time.Hour, "delivery:pending", "delivery:acked", "read"),
 			"receipt-2h":     {id: "receipt-2h", status: "open", issueType: "task", createdAt: now.Add(-2 * time.Hour), labels: []string{"type:plugin-run"}},
 		},
 		ops: map[int][]string{},
@@ -890,9 +895,9 @@ func TestStaleNotificationsOnlyFastTrackAckedMail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
-	// acked-2h, both-labels-2h (acked wins even if pending lingers), receipt-2h.
+	// read-2h, acked-and-read (read wins even if pending lingers), receipt-2h.
 	if scan.FastTrackCandidates != 3 {
-		t.Fatalf("scan.FastTrackCandidates = %d, want 3 (acked-2h, both-labels-2h, receipt-2h; never pending)", scan.FastTrackCandidates)
+		t.Fatalf("scan.FastTrackCandidates = %d, want 3 (read-2h, acked-and-read, receipt-2h; acked alone never fast-tracks)", scan.FastTrackCandidates)
 	}
 
 	closed, errs := CloseFastTrack(db, "testdb", false)
@@ -903,15 +908,16 @@ func TestStaleNotificationsOnlyFastTrackAckedMail(t *testing.T) {
 		t.Fatalf("CloseFastTrack closed %d, scan predicted %d", closed, scan.FastTrackCandidates)
 	}
 	for id, want := range map[string]string{
-		"acked-2h": "closed", "both-labels-2h": "closed", "receipt-2h": "closed",
-		"acked-10m": "open", "pending-2h": "open", "pending-25h": "open",
+		"read-2h": "closed", "acked-and-read": "closed", "receipt-2h": "closed",
+		"read-10m": "open", "acked-only-2h": "open", "pending-2h": "open", "pending-25h": "open",
 	} {
 		if got := state.status(id); got != want {
 			t.Errorf("after fast-track: %s status = %q, want %q", id, got, want)
 		}
 	}
 
-	// The normal max-age path still closes pending mail once it is past maxAge.
+	// The normal max-age path still closes unread mail once it is past maxAge,
+	// regardless of delivery:acked.
 	reap, err := Reap(db, "testdb", maxAge, false)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
@@ -919,7 +925,7 @@ func TestStaleNotificationsOnlyFastTrackAckedMail(t *testing.T) {
 	if reap.Reaped != 1 {
 		t.Fatalf("Reap Reaped = %d, want 1 (only pending-25h is past max-age)", reap.Reaped)
 	}
-	for id, want := range map[string]string{"pending-2h": "open", "pending-25h": "closed"} {
+	for id, want := range map[string]string{"acked-only-2h": "open", "pending-2h": "open", "pending-25h": "closed"} {
 		if got := state.status(id); got != want {
 			t.Errorf("after Reap: %s status = %q, want %q", id, got, want)
 		}
