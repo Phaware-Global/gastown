@@ -76,6 +76,39 @@ type PreserveOptions struct {
 	// self-exemption once the checked branch was itself pushed). Empty
 	// means the scan fails closed rather than guessing a baseline.
 	ProtectedBranches []string
+
+	// Ephemeral, when true, un-advances branch back to its pre-call
+	// position (via a soft reset) once a new preservation commit this call
+	// made has been durably pushed and verified on the preservation ref.
+	// The commit still exists — reachable from the preservation ref — but
+	// branch's own ref (and HEAD, since it's the currently checked out
+	// branch) never carries it.
+	//
+	// Root fix for gt-94p1/gt-2stz: without this, a periodic safety-net
+	// commit (checkpoint_dog, pre-removal preserve) sits on the local
+	// branch after the call returns, and ANY later ordinary push of that
+	// branch — the polecat's own push, gt done, a pre-nuke best-effort
+	// push — carries it to a real (possibly already-reviewed) PR branch.
+	// Four incidents/near-misses on 2026-09-27 (graphql-api #162/#166,
+	// gastown #250/#251) all trace back to exactly this: the commit was
+	// never meant to be part of the branch's real history, only a
+	// recovery snapshot, but nothing stopped a subsequent push from
+	// publishing it anyway.
+	//
+	// Leave false for a caller where the commit IS the polecat's real,
+	// intentional work and a normal push of the branch follows in the very
+	// same flow (gt done): there the commit should become part of the
+	// branch, exactly as an ordinary commit would.
+	//
+	// Only commits made BY THIS CALL are ever rolled back — pre-existing
+	// commits the agent already made are real work and are left alone
+	// (see the !result.Committed push-existing-commits path below). A
+	// HooksFailed commit is also left alone: it was never pushed anywhere
+	// by this call, so an operator inspecting the worktree can still find
+	// and resolve it; requirement 3's WIP-commit push guard (HasWIPCommit)
+	// is the backstop that keeps it off a real branch if some other push
+	// path later tries to publish it.
+	Ephemeral bool
 }
 
 // PreserveResult reports what AutoPreserveUncommittedWork actually did.
@@ -158,6 +191,20 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 	}
 	if IsProtectedBranch(branch) {
 		return result, fmt.Errorf("refusing to auto-preserve uncommitted work on protected branch %q (G41 guard)", branch)
+	}
+
+	// Captured before any commit so Ephemeral can un-advance branch back to
+	// exactly this position once its new commit is safely on the
+	// preservation ref. Required up front: an Ephemeral caller that can't
+	// resolve a rollback anchor must not create the commit at all (fail
+	// closed rather than strand a commit it can't undo).
+	var origHead string
+	if opts.Ephemeral {
+		oh, revErr := g.Rev("HEAD")
+		if revErr != nil {
+			return result, fmt.Errorf("ephemeral preserve requires a resolvable HEAD to restore to: %w", revErr)
+		}
+		origHead = oh
 	}
 
 	status, err := g.CheckUncommittedWork()
@@ -434,6 +481,21 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 	result.Pushed = true
 	result.Ref = refName
 	result.Commit = head
+
+	// Ephemeral: the commit this call made is now durably reachable from
+	// refName on remote, so branch no longer needs to carry it locally.
+	// Soft reset only moves HEAD/the branch ref back to origHead — the
+	// index and working tree are left exactly as they were (still holding
+	// the same staged content), so nothing is lost if this is retried.
+	// Only reached when result.Committed is true (a new commit was made
+	// this call): the !result.Committed early-returns above never get
+	// here, so pushing the agent's own pre-existing unpushed commits is
+	// never rolled back.
+	if opts.Ephemeral && result.Committed {
+		if resetErr := g.ResetSoft(origHead); resetErr != nil {
+			return result, fmt.Errorf("preserved and pushed %s to %s, but failed to restore branch %q to %s: %w — the branch may now carry the preservation commit; resolve manually", shortSHA(head), refName, branch, shortSHA(origHead), resetErr)
+		}
+	}
 	return result, nil
 }
 
@@ -522,6 +584,63 @@ func hasUnverifiedCommit(g *Git, remote, head string, protectedBranches []string
 		return "", nil
 	}
 	return strings.Fields(out)[0], nil
+}
+
+// HasWIPCommit reports the SHA of the nearest commit reachable from HEAD,
+// not reachable from any of protectedBranches on remote, whose subject
+// starts with prefix (the checkpoint package's WIPCommitPrefix). Exported so
+// every push site that lands commits on a real branch — gt done, the
+// pre-nuke best-effort push, the polecat-removal helper — can refuse to
+// publish a checkpoint auto-save commit there (gt-94p1 requirement 3).
+//
+// This is defense in depth alongside AutoPreserveUncommittedWork's Ephemeral
+// mode, which is the primary fix: Ephemeral stops such a commit from ever
+// reaching branch in the first place. This guard catches one that got there
+// anyway — a commit made before Ephemeral existed, one made with a plain
+// `git commit` reusing the prefix, or any other path this repo grows later.
+//
+// protectedBranches must come from rig config — see
+// PreserveOptions.ProtectedBranches; fails closed exactly like
+// HasUnverifiedCommit.
+func HasWIPCommit(g *Git, remote, prefix string, protectedBranches []string) (string, error) {
+	head, err := g.Rev("HEAD")
+	if err != nil {
+		return "", err
+	}
+	if len(protectedBranches) == 0 {
+		return "", fmt.Errorf("no protected branches configured for the WIP-commit guard — refusing rather than scanning without a known-safe baseline")
+	}
+
+	const recordSep = "\x01"
+	args := []string{"log", head}
+	for _, branch := range protectedBranches {
+		// Fully qualified for the same reason as hasUnverifiedCommit: a
+		// bare "remote/branch" resolves refs/heads/ before refs/remotes/.
+		ref := "refs/remotes/" + remote + "/" + branch
+		if _, err := g.run("rev-parse", "--verify", ref); err != nil {
+			return "", fmt.Errorf("protected branch ref %s does not resolve — refusing to check for WIP commits until it can be verified: %w", ref, err)
+		}
+		args = append(args, "--not", ref)
+	}
+	args = append(args, "--format=%H"+recordSep+"%s")
+	out, err := g.run(args...)
+	if err != nil {
+		return "", err
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return "", nil
+	}
+	for _, line := range strings.Split(out, "\n") {
+		sha, subject, ok := strings.Cut(line, recordSep)
+		if !ok {
+			continue
+		}
+		if strings.HasPrefix(subject, prefix) {
+			return sha, nil
+		}
+	}
+	return "", nil
 }
 
 // pathExcluded reports whether staged path f falls under one of the

@@ -215,6 +215,13 @@ func (d *Daemon) checkpointWorktree(workDir, rigName, polecatName string) bool {
 		Push:              true,
 		CommitMessage:     checkpoint.WIPCommitPrefix,
 		ProtectedBranches: []string{protectedBranch},
+		// gt-94p1 root fix: this patrol runs unattended and repeatedly on a
+		// branch that may already have an open, reviewed PR. Ephemeral
+		// means the WIP commit is pushed to the preservation ref and then
+		// rolled back off branch's own ref — so a later ordinary push
+		// (the polecat's own push, gt done, a pre-nuke push) can never
+		// carry it onto the real branch.
+		Ephemeral: true,
 	})
 	if err != nil {
 		// Covers the G41 protected-branch refusal, unmerged-conflict refusal,

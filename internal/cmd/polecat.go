@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/checkpoint"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/rig"
@@ -1874,11 +1875,20 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 			}
 		}
 		if pushGit != nil {
-			refspec := branchToDelete + ":" + branchToDelete
-			if err := pushGit.Push("origin", refspec, false); err != nil {
-				fmt.Printf("  %s best-effort push failed (proceeding): %v\n", style.Dim.Render("○"), err)
+			// gt-94p1 requirement 3: never let this best-effort push carry a
+			// checkpoint auto-save commit onto the real branch. Backstop
+			// alongside AutoPreserveUncommittedWork's Ephemeral mode.
+			if wipSHA, wipErr := git.HasWIPCommit(pushGit, "origin", checkpoint.WIPCommitPrefix, []string{r.DefaultBranch()}); wipErr != nil {
+				fmt.Printf("  %s could not verify commits before best-effort push, skipping: %v\n", style.Dim.Render("○"), wipErr)
+			} else if wipSHA != "" {
+				fmt.Printf("  %s branch carries checkpoint auto-save commit %s — skipping best-effort push\n", style.Dim.Render("○"), wipSHA[:8])
 			} else {
-				fmt.Printf("  %s pushed branch %s before nuke\n", style.Success.Render("✓"), branchToDelete)
+				refspec := branchToDelete + ":" + branchToDelete
+				if err := pushGit.Push("origin", refspec, false); err != nil {
+					fmt.Printf("  %s best-effort push failed (proceeding): %v\n", style.Dim.Render("○"), err)
+				} else {
+					fmt.Printf("  %s pushed branch %s before nuke\n", style.Success.Render("✓"), branchToDelete)
+				}
 			}
 		}
 	}

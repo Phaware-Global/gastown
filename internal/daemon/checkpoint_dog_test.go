@@ -271,19 +271,27 @@ func TestCheckpointWorktree_CommitsAndPushesPreserveRef(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
+	headBeforeOut, err := exec.Command("git", "-C", workDir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD before: %v", err)
+	}
+	headBefore := strings.TrimSpace(string(headBeforeOut))
+
 	d := newTestDaemon()
 	if !d.checkpointWorktree(workDir, "myrig", "foo") {
 		t.Fatal("expected checkpointWorktree to report a preservation")
 	}
 
-	cmd := exec.Command("git", "log", "-1", "--format=%s")
-	cmd.Dir = workDir
-	out, err := cmd.Output()
+	// gt-94p1 root fix: a checkpoint must NEVER move the branch. If the WIP
+	// commit stayed on HEAD, any later ordinary push of this branch (the
+	// polecat's own push, gt done, a pre-nuke push) would carry it to a real
+	// PR branch — the mechanism behind gt-2stz's four incidents.
+	headAfterOut, err := exec.Command("git", "-C", workDir, "rev-parse", "HEAD").Output()
 	if err != nil {
-		t.Fatalf("git log: %v", err)
+		t.Fatalf("rev-parse HEAD after: %v", err)
 	}
-	if got := string(out); got != checkpoint.WIPCommitPrefix+"\n" {
-		t.Fatalf("commit subject = %q, want %q", got, checkpoint.WIPCommitPrefix)
+	if headAfter := strings.TrimSpace(string(headAfterOut)); headAfter != headBefore {
+		t.Fatalf("branch HEAD moved from %s to %s — a checkpoint must leave the branch exactly where it was", headBefore, headAfter)
 	}
 
 	// A test named "...AndPushesPreserveRef" must actually verify the push:
@@ -292,12 +300,6 @@ func TestCheckpointWorktree_CommitsAndPushesPreserveRef(t *testing.T) {
 	// on the local worktree (PR #184 review). Derive the expected ref name
 	// from the function under test rather than hand-writing it, and check
 	// the bare remote directly.
-	headOut, err := exec.Command("git", "-C", workDir, "rev-parse", "HEAD").Output()
-	if err != nil {
-		t.Fatalf("rev-parse HEAD: %v", err)
-	}
-	head := strings.TrimSpace(string(headOut))
-
 	wantRef := git.PreservationRefName("polecat/foo/bead@1")
 	lsOut, err := exec.Command("git", "ls-remote", "--heads", remoteDir, wantRef).Output()
 	if err != nil {
@@ -307,8 +309,20 @@ func TestCheckpointWorktree_CommitsAndPushesPreserveRef(t *testing.T) {
 	if len(fields) < 2 {
 		t.Fatalf("preservation ref %q was not pushed to the bare remote (ls-remote returned %q)", wantRef, lsOut)
 	}
-	if fields[0] != head {
-		t.Fatalf("ls-remote %s = %s, want sha %s", wantRef, fields[0], head)
+	preservedSHA := fields[0]
+	if preservedSHA == headBefore {
+		t.Fatalf("preservation ref %s points at the unchanged branch head %s — the checkpoint commit was not what got pushed", wantRef, headBefore)
+	}
+
+	// The WIP subject now lives ONLY on the preservation ref's commit. The
+	// commit object exists locally too (it was made here before being
+	// rolled off the branch), so it can be inspected directly.
+	subjOut, err := exec.Command("git", "-C", workDir, "log", "-1", "--format=%s", preservedSHA).Output()
+	if err != nil {
+		t.Fatalf("git log %s: %v", preservedSHA, err)
+	}
+	if got := string(subjOut); got != checkpoint.WIPCommitPrefix+"\n" {
+		t.Fatalf("preserved commit subject = %q, want %q", got, checkpoint.WIPCommitPrefix)
 	}
 }
 

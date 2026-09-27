@@ -19,6 +19,7 @@ import (
 	"github.com/gofrs/flock"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/checkpoint"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/git"
@@ -1189,6 +1190,13 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 			IssueID:           name,
 			Push:              !nuclear,
 			ProtectedBranches: []string{m.rig.DefaultBranch()},
+			// gt-94p1 root fix: this worktree may be a reused directory
+			// whose leftover uncommitted content has nothing to do with
+			// the branch it happens to be on right now. Ephemeral keeps
+			// the preserve commit off branch's own ref (pushed only to the
+			// preservation ref), so the best-effort branch push below only
+			// ever republishes commits the agent genuinely made itself.
+			Ephemeral: true,
 		}); presErr != nil {
 			// A detached HEAD has no ref surviving worktree teardown to
 			// hold an uncommitted commit — WorktreeRemove deletes the
@@ -1318,6 +1326,15 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 				style.PrintWarning("could not verify %s's commits before the pre-removal push, not pushing branch %s: %v", name, branch, chkErr)
 			} else if badSHA != "" {
 				style.PrintWarning("branch %s carries commit %s made with pre-commit hooks bypassed — refusing the pre-removal push; the work remains in the local commit", branch, badSHA[:8])
+			} else if wipSHA, wipErr := git.HasWIPCommit(polecatGit, "origin", checkpoint.WIPCommitPrefix, []string{m.rig.DefaultBranch()}); wipErr != nil {
+				style.PrintWarning("could not verify %s's commits before the pre-removal push, not pushing branch %s: %v", name, branch, wipErr)
+			} else if wipSHA != "" {
+				// gt-94p1 requirement 3: a checkpoint auto-save commit must
+				// never reach a real branch, even via this best-effort
+				// push. AutoPreserveUncommittedWork's Ephemeral mode (used
+				// just above) is the primary fix and should already keep
+				// one off branch — this is the backstop.
+				style.PrintWarning("branch %s carries a checkpoint auto-save commit %s — refusing the pre-removal push; the work remains reachable via its preservation ref", branch, wipSHA[:8])
 			} else {
 				pushed, unpushedCount, checkErr := polecatGit.BranchPushedToRemote(branch, "origin")
 				if checkErr == nil && !pushed && unpushedCount > 0 {
