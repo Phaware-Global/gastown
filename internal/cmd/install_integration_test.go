@@ -799,7 +799,10 @@ func cleanE2EEnv() []string {
 		}
 		clean = append(clean, env)
 	}
-	return clean
+	// Stripping BD_* also drops BD_DISABLE_METRICS; without it bd's detached
+	// metrics flusher writes eventkit.lock under the test HOME and races the
+	// t.TempDir cleanup (gt-bglj). See testutil.CleanGTEnv.
+	return append(clean, "BD_DISABLE_METRICS=1")
 }
 
 func isolatedE2EDoltEnv(t *testing.T, homeDir string) ([]string, string) {
