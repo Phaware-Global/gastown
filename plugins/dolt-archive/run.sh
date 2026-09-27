@@ -115,28 +115,78 @@ sorted_set() {
   printf '%s\n' "$@" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '
 }
 
-# escalate_once KEY SIG TITLE REASON
+# member_hashes SIG — sorted, comma-joined (trailing comma), per-token cksum
+# hash of a whitespace-separated set. Hashing per member (instead of the
+# whole string at once) lets escalate_once tell "a member disappeared"
+# (shrink, e.g. partial recovery) from "a member appeared" (growth) instead
+# of treating any change to the set as equally new — a flapping member
+# otherwise re-escalates at critical on every toggle (adversarial finding
+# on #250). Members are hashed, not stored in the clear, because some
+# callers' sigs embed a remote URL.
+member_hashes() {
+  local -a items
+  local item out=""
+  read -ra items <<< "$1"
+  for item in "${items[@]}"; do
+    [[ -n "$item" ]] || continue
+    out="${out}$(printf '%s' "$item" | cksum | cut -d' ' -f1)"$'\n'
+  done
+  printf '%s' "$out" | sort -u | tr '\n' ','
+}
+
+# hash_set_is_subset A B — true if every hash in comma-joined set A (as
+# produced by member_hashes) is also present in comma-joined set B.
+hash_set_is_subset() {
+  local hay=",$2" item
+  local -a items
+  IFS=',' read -ra items <<< "$1"
+  for item in "${items[@]}"; do
+    [[ -n "$item" ]] || continue
+    [[ "$hay" == *",$item,"* ]] || return 1
+  done
+  return 0
+}
+
+# escalate_once KEY SIG TITLE REASON [COVERED_DBS]
+#
+# COVERED_DBS (optional) is the whitespace-separated set of databases this
+# condition concerns. It is recorded so clear_resolved can tell "not looked
+# at this run" apart from "looked at and no longer failing" on a
+# --databases subset run (adversarial finding on #250). Omitted for
+# conditions with no db-scoped meaning (push-refused's db already lives in
+# its key; the git-backup keys concern no db at all).
 escalate_once() {
-  local key="$1" sig="$2" title="$3" reason="$4"
-  local sigsum now file prev_sum="" last="" _k severity="critical" fp
+  local key="$1" sig="$2" title="$3" reason="$4" covered="${5:-}"
+  local now file prev_hashes="" last="" _k severity="critical" fp cur_hashes
 
   ACTIVE_KEYS+=("$key")
-  sigsum="$(printf '%s' "$sig" | cksum | cut -d' ' -f1)"
   now="$(date +%s)"
   file="$(state_file "$key")"
-  fp="dolt-archive:${key}:${sigsum}"
+  cur_hashes="$(member_hashes "$sig")"
+  fp="dolt-archive:${key}:$(printf '%s' "$cur_hashes" | cksum | cut -d' ' -f1)"
 
   if [[ -f "$file" ]]; then
-    read -r prev_sum last _k < "$file" || true
+    read -r prev_hashes last _k < "$file" || true
     # Unreadable state or a clock that went backwards: treat as no state.
-    if [[ "$prev_sum" == "$sigsum" && "$last" =~ ^[0-9]+$ && "$last" -le "$now" ]]; then
-      if (( now - last < REPEAT_SECS )); then
-        log "  $key: unchanged, already escalated $(( (now - last) / 60 ))m ago — not re-escalating"
+    if [[ -n "$prev_hashes" && "$last" =~ ^[0-9]+$ && "$last" -le "$now" ]]; then
+      if [[ "$cur_hashes" == "$prev_hashes" ]]; then
+        if (( now - last < REPEAT_SECS )); then
+          log "  $key: unchanged, already escalated $(( (now - last) / 60 ))m ago — not re-escalating"
+          return 0
+        fi
+        severity="low"
+        title="$title (still unresolved)"
+        fp="$fp:digest-$(date +%Y%m%d)"
+      elif hash_set_is_subset "$cur_hashes" "$prev_hashes"; then
+        # Every currently-affected member was already escalated as part of
+        # a larger set — a pure shrink (partial recovery), not a new
+        # member. Keep the larger recorded set and its timestamp so a
+        # member flapping back into it doesn't read as "new" either.
+        log "  $key: affected set shrank (partial recovery) — not re-escalating"
         return 0
       fi
-      severity="low"
-      title="$title (still unresolved)"
-      fp="$fp:digest-$(date +%Y%m%d)"
+      # else: the current set has a member the recorded set lacks (growth,
+      # or a simultaneous grow+shrink) — falls through and escalates fresh.
     fi
   fi
 
@@ -146,26 +196,51 @@ escalate_once() {
     return 0
   fi
   mkdir -p "$STATE_DIR" 2>/dev/null || true
-  printf '%s %s %s\n' "$sigsum" "$now" "$key" > "$file" 2>/dev/null \
+  printf '%s %s %s %s\n' "$cur_hashes" "$now" "$key" "$covered" > "$file" 2>/dev/null \
     || log "WARN: cannot record escalation state in $STATE_DIR — repeats will re-escalate"
 }
 
 # Drop state for conditions that did not fire this cycle. Called only for the
 # steps that actually ran, so --skip-* never reads as "condition cleared".
-# $1 is a key or, with a trailing '*', a key prefix.
+# $1 is a key or, with a trailing '*', a key prefix. $2, when given, is this
+# run's checked-db set (space-separated): a key concerning a db outside it
+# was not looked at this cycle, so its absence from ACTIVE_KEYS means
+# "out of scope", not "resolved" — a --databases subset run must not clear
+# another db's state (adversarial finding on #250).
 clear_resolved() {
-  local pattern="$1" f k
+  local pattern="$1" checked_dbs="${2:-}" f k covered required db item ok
   [[ -d "$STATE_DIR" ]] || return 0
   for f in "$STATE_DIR"/*; do
     [[ -f "$f" ]] || continue
-    k=""
-    read -r _ _ k < "$f" || true
+    k="" covered=""
+    read -r _ _ k covered < "$f" || true
     [[ -n "$k" ]] || continue
     case "$pattern" in
       *'*') [[ "$k" == "${pattern%\*}"* ]] || continue ;;
       *)    [[ "$k" == "$pattern" ]] || continue ;;
     esac
-    key_is_active "$k" || rm -f "$f"
+    key_is_active "$k" && continue
+
+    if [[ -n "$checked_dbs" ]]; then
+      required="$covered"
+      if [[ -z "$required" && "$pattern" == *':*' ]]; then
+        # Per-db key (e.g. push-refused:<db>:<remote>): the db is the
+        # segment between the key's first two colons.
+        db="${k#*:}"; required="${db%%:*}"
+      fi
+      if [[ -n "$required" ]]; then
+        ok=true
+        for item in ${required//,/ }; do
+          case " $checked_dbs " in
+            *" $item "*) ;;
+            *) ok=false; break ;;
+          esac
+        done
+        $ok || continue
+      fi
+    fi
+
+    rm -f "$f"
   done
 }
 
@@ -485,17 +560,26 @@ _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
 if [[ "$EXPORT_FAILED" -gt 0 ]]; then
   escalate_once "export-failed" "$(sorted_set "$EXPORT_FAILED_DBS")" \
     "dolt-archive: JSONL export failed for $EXPORT_FAILED databases ($EXPORT_ERRORS)" \
-    "JSONL is our last-resort recovery layer. Failed databases: $EXPORT_ERRORS"
+    "JSONL is our last-resort recovery layer. Failed databases: $EXPORT_ERRORS" \
+    "$(sorted_set "$EXPORT_FAILED_DBS")"
 fi
-clear_resolved "export-failed"
+clear_resolved "export-failed" "${PROD_DBS[*]}"
 
 if ! $SKIP_DOLT_PUSH; then
   if [[ "$DOLT_PUSH_FAILED" -gt 0 ]]; then
+    # Coverage set for clear_resolved is the DBs behind each failing
+    # "db/remote" member, not the members themselves — a db is "checked"
+    # once this cycle attempts any of its remotes.
+    DOLT_PUSH_FAILED_DBS=""
+    for _member in $DOLT_PUSH_FAILED_SET; do
+      DOLT_PUSH_FAILED_DBS="${DOLT_PUSH_FAILED_DBS}${_member%%/*} "
+    done
     escalate_once "dolt-push-failed" "$(sorted_set "$DOLT_PUSH_FAILED_SET")" \
       "dolt-archive: dolt push failed for $DOLT_PUSH_FAILED remote(s)" \
-      "Native Dolt replication did not reach $DOLT_PUSH_FAILED remote(s) this cycle. The data did not leave this machine via that path."
+      "Native Dolt replication did not reach $DOLT_PUSH_FAILED remote(s) this cycle. The data did not leave this machine via that path." \
+      "$(sorted_set "$DOLT_PUSH_FAILED_DBS")"
   fi
-  clear_resolved "dolt-push-failed"
+  clear_resolved "dolt-push-failed" "${PROD_DBS[*]}"
 
   if $REMOTE_SHORTFALL; then
     # Affected set = exported DBs with no remote (names, not counts, so a
@@ -510,10 +594,11 @@ if ! $SKIP_DOLT_PUSH; then
     done
     escalate_once "remote-shortfall" "$(sorted_set "$NO_REMOTE_SET")" \
       "dolt-archive: only $EXPORTED_DBS_WITH_REMOTE of $EXPORTED exported databases have a dolt remote configured" \
-      "$((EXPORTED - EXPORTED_DBS_WITH_REMOTE)) exported database(s) have no dolt remote at all, so dolt push never attempts them. The dolt_push ratio in the summary covers all $DBS_WITH_REMOTE db(s) with a remote (exported or not), not just these $EXPORTED_DBS_WITH_REMOTE exported one(s)."
+      "$((EXPORTED - EXPORTED_DBS_WITH_REMOTE)) exported database(s) have no dolt remote at all, so dolt push never attempts them. The dolt_push ratio in the summary covers all $DBS_WITH_REMOTE db(s) with a remote (exported or not), not just these $EXPORTED_DBS_WITH_REMOTE exported one(s)." \
+      "$(sorted_set "$NO_REMOTE_SET")"
   fi
-  clear_resolved "remote-shortfall"
-  clear_resolved "push-refused:*"
+  clear_resolved "remote-shortfall" "${PROD_DBS[*]}"
+  clear_resolved "push-refused:*" "${PROD_DBS[*]}"
 fi
 
 if ! $SKIP_GIT; then

@@ -687,6 +687,38 @@ run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
 assert_count "$SANDBOX" "dolt push failed" 1 "escalate that failed once must still be delivered next run"
 rm -rf "$SANDBOX"
 
+log "=== Scenario: shrink-then-regrow of an affected set escalates once (PR #250) ==="
+# 2 failing (origin+mirror) -> escalate. Then 1 failing (mirror recovers) ->
+# must NOT re-escalate (a pure shrink of an already-escalated set is not
+# new). Then 2 failing again (mirror fails again, back to the original set)
+# -> must still NOT re-escalate, since escalate_once kept the larger
+# recorded set and its timestamp across the shrink.
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+printf 'origin\thttps://github.com/test-owner/db-a (fetch)\nmirror\thttps://github.com/test-owner/db-a-mirror (fetch)\n' \
+  > "$SANDBOX/home/gt/.dolt-data/db-a/.mock-remotes"
+touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+rm -f "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 1 "2-failing then 1 then 2 again must escalate exactly once"
+rm -rf "$SANDBOX"
+
+log "=== Scenario: a --databases subset run does not clear another db's state (PR #250) ==="
+# db-a fails on a full run (escalates). A subsequent run scoped to db-b only
+# must not treat db-a's unresolved failure as cleared just because db-a
+# wasn't checked this cycle — otherwise the next full run, finding the same
+# unfixed db-a failure, would wrongly re-escalate it as "new".
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+run_cycle "$SANDBOX" --databases db-b --skip-git
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 1 "db-b-only run must not clear db-a's unresolved push failure"
+rm -rf "$SANDBOX"
+
 echo ""
 if [[ $FAILURES -gt 0 ]]; then
   echo "Suite A (escalation logic): FAILED — $FAILURES scenario(s) failed"
