@@ -278,3 +278,25 @@ if [ "$EXPORT_FAILED" -gt 0 ]; then
     --reason "JSONL is our last-resort recovery layer. $EXPORT_FAILED databases failed to export."
 fi
 ```
+
+## Escalation dedupe (gt-4kip)
+
+`run.sh` escalates each unhealthy condition **once**, not once per run. Every
+run still logs every condition; only the `gt escalate` call is gated.
+
+Each condition has a key and an affected-set signature (which DBs/remotes; for a
+refused push, the remote URL and visibility reason too). State lives in
+`~/gt/.dolt-archive/escalation-state/` (override: `DOLT_ARCHIVE_STATE_DIR`) and
+holds only a hash of the signature.
+
+| Situation | Result |
+|-----------|--------|
+| New condition, or its affected set changed | `critical` escalation, immediately |
+| Unchanged since the last escalation | log line only |
+| Unchanged for `ESCALATION_REPEAT_SECS` (default 86400) | one `low` "still unresolved" digest |
+| Condition absent from a run that checked it | state dropped; its return escalates afresh |
+
+`gt escalate --fingerprint` alone is not enough: it only suppresses against
+*open* escalation beads, so a closed repeat is re-filed on the next run. State
+is recorded only after `gt escalate` succeeds, so a failed escalation retries.
+A `--skip-git` / `--skip-dolt-push` run never clears state for the step it skipped.

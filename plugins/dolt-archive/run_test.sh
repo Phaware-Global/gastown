@@ -805,13 +805,20 @@ mkdir -p "$REAL_JSONL_DIR"
 touch "$REAL_JSONL_DIR/db-public-20000101-0000.jsonl" "$REAL_JSONL_DIR/db-private-20000101-0000.jsonl"
 trap 'rm -rf "$WORKDIR"; rm -f "$REAL_JSONL_DIR/db-public-20000101-0000.jsonl" "$REAL_JSONL_DIR/db-private-20000101-0000.jsonl"' EXIT
 
+# Isolate escalation-dedupe state (gt-4kip): without this the suite would read
+# and write the real ~/gt/.dolt-archive/escalation-state.
+export DOLT_ARCHIVE_STATE_DIR="$WORKDIR/escalation-state"
+
 OUTPUT="$WORKDIR/run.log"
+run_suite_b() {
+  PATH="$FAKE_BIN:$PATH" \
+    DOLT_DATA_DIR="$DOLT_DATA_DIR" \
+    PUSH_LOG="$PUSH_LOG" \
+    ESCALATE_LOG="$ESCALATE_LOG" \
+    bash "$RUN_SH" --databases db-public,db-private --skip-git
+}
 set +e
-PATH="$FAKE_BIN:$PATH" \
-  DOLT_DATA_DIR="$DOLT_DATA_DIR" \
-  PUSH_LOG="$PUSH_LOG" \
-  ESCALATE_LOG="$ESCALATE_LOG" \
-  bash "$RUN_SH" --databases db-public,db-private --skip-git > "$OUTPUT" 2>&1
+run_suite_b > "$OUTPUT" 2>&1
 RUN_STATUS=$?
 set -e
 
@@ -835,6 +842,21 @@ check "refusal is escalated with a fingerprint" 'grep -q "push-refused:db-public
 check "no escalation for the private (allowed) push" '! grep -q "db-private:origin" "$ESCALATE_LOG"'
 check "summary line reports the refusal, not a silent skip" 'grep -q "dolt_push_refused=1" "$OUTPUT"'
 check "log shows the refusal reason inline" 'grep -q "REFUSED.*visibility=public" "$OUTPUT"'
+
+# gt-4kip: an unchanged refusal must not re-escalate; a changed remote URL must
+# escalate again immediately.
+refusals() { grep -c "push-refused:db-public:origin" "$ESCALATE_LOG" || true; }
+check "first refusal escalated exactly once" '[[ "$(refusals)" -eq 1 ]]'
+run_suite_b > "$WORKDIR/run2.log" 2>&1 || true
+check "unchanged refusal on the next run does not re-escalate" '[[ "$(refusals)" -eq 1 ]]'
+check "unchanged refusal is still logged" 'grep -q "REFUSED.*visibility=public" "$WORKDIR/run2.log"'
+echo "origin git+https://github.com/pub-owner/other-repo {}" > "$DOLT_DATA_DIR/db-public/.remotes"
+run_suite_b > "$WORKDIR/run3.log" 2>&1 || true
+check "changed remote URL re-escalates immediately" '[[ "$(refusals)" -eq 2 ]]'
+check "changed-URL escalation is critical" 'grep "push-refused:db-public:origin" "$ESCALATE_LOG" | tail -1 | grep -q -- "-s critical"'
+rm -f "$DOLT_DATA_DIR/db-public/.remotes"
+run_suite_b > "$WORKDIR/run4.log" 2>&1 || true
+check "refusal state cleared once the remote is gone" '[[ -z "$(ls "$DOLT_ARCHIVE_STATE_DIR" 2>/dev/null | grep push-refused)" ]]'
 
 echo ""
 echo "Suite B (visibility guard): $PASS passed, $FAIL failed"
