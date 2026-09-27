@@ -408,6 +408,7 @@ type Engineer struct {
 	mergeSlotEnsureExists func() (string, error)
 	mergeSlotAcquire      func(holder string, addWaiter bool) (*beads.MergeSlotStatus, error)
 	mergeSlotRelease      func(holder string) error
+	escalate              func(severity, source, fingerprint, message string) error
 	mergeSlotMaxRetries   int           // Max retries for slot acquisition (0 = no retry)
 	mergeSlotRetryBackoff time.Duration // Initial backoff between retries
 }
@@ -425,7 +426,7 @@ func NewEngineer(r *rig.Rig) *Engineer {
 	}
 	beadsClient := beads.New(r.Path)
 
-	return &Engineer{
+	eng := &Engineer{
 		rig:        r,
 		beads:      beadsClient,
 		git:        git.NewGit(gitDir),
@@ -446,6 +447,26 @@ func NewEngineer(r *rig.Rig) *Engineer {
 		mergeSlotMaxRetries:   10,
 		mergeSlotRetryBackoff: 500 * time.Millisecond,
 	}
+	eng.escalate = eng.defaultEscalate
+	return eng
+}
+
+// defaultEscalate shells out to `gt escalate`. Under `go test` it discards
+// the escalation instead, for the same reason defaultMailSender is
+// memory-backed there: a test that reaches an escalation path must not file
+// a real bead against the live town.
+func (e *Engineer) defaultEscalate(severity, source, fingerprint, message string) error {
+	if runningAsTestBinary() {
+		return nil
+	}
+	args := []string{"escalate", "-s", severity, "--source", source}
+	if fingerprint != "" {
+		args = append(args, "--fingerprint", fingerprint)
+	}
+	cmd := exec.Command("gt", append(args, message)...)
+	util.SetDetachedProcessGroup(cmd)
+	cmd.Dir = e.workDir
+	return cmd.Run()
 }
 
 // SetMailSender overrides the Engineer's mail-send path. Intended for
@@ -1900,10 +1921,7 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] ✗ MR %s: refused direct push (no review_pr under merge_strategy=pr) — escalating\n%s\n", mr.ID, result.Error)
 		escMsg := fmt.Sprintf("MR %s (issue=%s branch=%s target=%s) refused a direct push: %s",
 			mr.ID, mr.SourceIssue, mr.Branch, mr.Target, result.Error)
-		escCmd := exec.Command("gt", "escalate", "-s", "HIGH", "--source", "refinery:review-pr-missing", escMsg)
-		util.SetDetachedProcessGroup(escCmd)
-		escCmd.Dir = e.workDir
-		if err := escCmd.Run(); err != nil {
+		if err := e.escalate("HIGH", "refinery:review-pr-missing", "", escMsg); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to escalate review_pr-missing MR %s: %v\n", mr.ID, err)
 		}
 		return
