@@ -290,7 +290,7 @@ func (e *Engineer) ProcessBatch(ctx context.Context, batch []*MRInfo, target str
 // processSingleMR handles the degenerate case of a batch with one MR.
 func (e *Engineer) processSingleMR(ctx context.Context, mr *MRInfo, target string) *BatchResult {
 	result := &BatchResult{}
-	processResult := e.doMerge(ctx, mr.Branch, target, mr.SourceIssue)
+	processResult := e.doMerge(ctx, mr.ID, mr.Branch, target, mr.SourceIssue)
 	if processResult.Success {
 		result.Merged = []*MRInfo{mr}
 		result.MergeCommit = processResult.MergeCommit

@@ -353,6 +353,12 @@ type MRInfo struct {
 	CreatedAt       time.Time  // MR creation time
 	BlockedBy       string     // Task ID blocking this MR
 
+	// ReviewPR is the GitHub PR number already tracked on this MR bead
+	// (0 = none recorded yet). See beads.MRFields.ReviewPR — mirrored here
+	// so the merge path can enforce the never-push-without-review_pr
+	// invariant without re-parsing the bead on every check.
+	ReviewPR int
+
 	// Pre-verification fields (Phase 3: polecat-owned rebasing)
 	// When set, the refinery can skip gates if VerifiedBase matches target HEAD.
 	PreVerified     bool      // Polecat ran full gates after rebasing onto target
@@ -896,10 +902,14 @@ type ProcessResult struct {
 	NoMerge               bool // Source issue has no_merge flag — intentionally blocked, not a failure
 	NeedsApproval         bool // PR exists but lacks required approving review (merge_strategy=pr)
 	NeedsReviewResolution bool // PR has unresolved reviewer threads — review-fix loop must run before merge
+	ReviewPRMissing       bool // gt-wgmf: refused a direct push — rig requires PR review but this MR has no review_pr
 }
 
-// doMerge performs the actual git merge operation.
-func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue string, skipGates ...bool) ProcessResult {
+// doMerge performs the actual git merge operation. mrID is the MR bead's
+// own ID — threaded through so the merge_strategy=pr safety checks and
+// review_pr population in doMergePR can read/write the bead directly
+// instead of relying solely on the caller's possibly-stale MRInfo snapshot.
+func (e *Engineer) doMerge(ctx context.Context, mrID, branch, target, sourceIssue string, skipGates ...bool) ProcessResult {
 	// GH#2778: Check no_merge flag on source issue before merging. The polecat
 	// normally skips MR creation when no_merge is set, but if an MR is created
 	// manually (e.g., gh pr create) the refinery would otherwise auto-merge it.
@@ -1025,7 +1035,31 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	// protection/restriction rules and preserves the PR audit trail.
 	// The VCS provider (GitHub, Bitbucket) is selected via vcs_provider config.
 	if e.config.MergeStrategy == "pr" {
-		return e.doMergePR(ctx, branch, target)
+		return e.doMergePR(ctx, mrID, branch, target)
+	}
+
+	// gt-wgmf P0: an MR without review_pr must never be squash-merged and
+	// pushed directly to the default branch when the RIG actually requires
+	// PR review — even if e.config.MergeStrategy disagrees. e.config is a
+	// snapshot taken once (LoadConfig is a separate call the caller must
+	// remember to make); if that snapshot is stale, missing, or was never
+	// loaded, the check above silently falls through to here despite the
+	// rig's real settings requiring PR review. Re-reading settings fresh
+	// from disk, independent of e.config, catches that gap immediately
+	// before the one irreversible step (the push) rather than trusting a
+	// single earlier config read for the most consequential action in the
+	// merge. Only the default branch is guarded — feature/integration
+	// targets are not subject to the PR-review policy.
+	if target == e.rig.DefaultBranch() {
+		if requiresPR, checkErr := e.rigActuallyRequiresPRStrategy(); checkErr == nil && requiresPR {
+			return ProcessResult{
+				Success:         false,
+				ReviewPRMissing: true,
+				Error: fmt.Sprintf(
+					"refusing direct push to %s: rig settings require merge_strategy=pr but this merge path has no review_pr for MR %s (in-memory MergeStrategy=%q) — escalate instead of pushing",
+					target, mrID, e.config.MergeStrategy),
+			}
+		}
 	}
 
 	// Step 5: Perform the actual merge using squash merge
@@ -1156,7 +1190,7 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 // Called from doMerge after quality gates have passed.
 //
 //nolint:unparam // ctx is reserved for future use when git methods accept context
-func (e *Engineer) doMergePR(ctx context.Context, branch, target string) ProcessResult {
+func (e *Engineer) doMergePR(ctx context.Context, mrID, branch, target string) ProcessResult {
 	_ = ctx
 	provider := e.config.VCSProvider
 	if provider == "" {
@@ -1188,6 +1222,21 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
 		}
 	}
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Found PR #%d for branch %s\n", prNumber, branch)
+
+	// gt-wgmf P0 (populate review_pr on MRs whose PR exists): a live PR was
+	// just confirmed for this branch — persist it onto the MR bead if it
+	// isn't recorded there yet. Without this, an MR can carry a real,
+	// findable PR while still reading as "no review_pr" to every other
+	// check (dispatch-review-fix, await-review, and the direct-push guard
+	// above), which is exactly the gap that let a PR-tracked MR look
+	// eligible for a direct push. Best-effort: a failure here logs a
+	// warning but does not block the merge, since the PR itself (found via
+	// FindPRNumber) is the source of truth this function already trusts.
+	if mrID != "" {
+		if popErr := e.populateReviewPR(mrID, prNumber); popErr != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: could not persist review_pr=%d onto MR %s: %v\n", prNumber, mrID, popErr)
+		}
+	}
 
 	// Unresolved review threads block merge regardless of approval
 	// state — reviewer guidance must reach main, not slip through under
@@ -1266,6 +1315,59 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
 		Success:     true,
 		MergeCommit: mergeCommit,
 	}
+}
+
+// populateReviewPR persists prNumber as review_pr on MR bead mrID, unless
+// it's already set to that value. Read-modify-write via the bead lock
+// mirrors writeReviewPRToMR (the `gt refinery pr create --mr` path) so the
+// two writers can't clobber each other's other MR fields (review_loop_iter,
+// commit_sha, etc.) on a last-writer-wins race.
+func (e *Engineer) populateReviewPR(mrID string, prNumber int) error {
+	if prNumber <= 0 {
+		return fmt.Errorf("refusing to persist non-positive review_pr %d to MR %s", prNumber, mrID)
+	}
+
+	unlock, err := e.beads.LockBead(mrID)
+	if err != nil {
+		return fmt.Errorf("acquiring bead lock: %w", err)
+	}
+	defer unlock()
+
+	issue, err := e.beads.Show(mrID)
+	if err != nil {
+		return fmt.Errorf("loading MR bead: %w", err)
+	}
+	if issue == nil {
+		return fmt.Errorf("MR bead %s not found", mrID)
+	}
+
+	fields := beads.ParseMRFields(issue)
+	if fields == nil {
+		fields = &beads.MRFields{}
+	}
+	if fields.ReviewPR == prNumber {
+		return nil // already populated
+	}
+	fields.ReviewPR = prNumber
+
+	newDesc := beads.SetMRFields(issue, fields)
+	return e.beads.Update(mrID, beads.UpdateOptions{Description: &newDesc})
+}
+
+// rigActuallyRequiresPRStrategy re-reads this rig's merge_strategy directly
+// from its settings file, independent of e.config. e.config is populated
+// once (by LoadConfig, a call the caller must remember to make) and can be
+// stale, defaulted, or never loaded at all; this is the fresh, defense-in-
+// depth check that gt-wgmf's direct-push guard relies on immediately before
+// the one irreversible step in the merge. A dedicated Engineer is used
+// (rather than mutating e.config) so this check can never have a
+// side-effect on the caller's own merge decision.
+func (e *Engineer) rigActuallyRequiresPRStrategy() (bool, error) {
+	fresh := NewEngineer(e.rig)
+	if err := fresh.LoadConfig(); err != nil {
+		return false, err
+	}
+	return fresh.config.MergeStrategy == "pr", nil
 }
 
 func (e *Engineer) acquireMainPushSlot(ctx context.Context) (string, error) {
@@ -1587,7 +1689,7 @@ func (e *Engineer) ProcessMRInfo(ctx context.Context, mr *MRInfo) ProcessResult 
 	}
 
 	// Use the shared merge logic
-	return e.doMerge(ctx, mr.Branch, mr.Target, mr.SourceIssue, skipGates)
+	return e.doMerge(ctx, mr.ID, mr.Branch, mr.Target, mr.SourceIssue, skipGates)
 }
 
 // HandleMRInfoSuccess handles a successful merge from MRInfo.
@@ -2173,6 +2275,7 @@ func issueToMRInfo(issue *beads.Issue, fields *beads.MRFields) *MRInfo {
 		CreatedAt:       createdAt,
 		UpdatedAt:       updatedAt,
 		Assignee:        issue.Assignee,
+		ReviewPR:        fields.ReviewPR,
 	}
 }
 
