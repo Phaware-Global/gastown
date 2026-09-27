@@ -1190,6 +1190,17 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 			Push:              !nuclear,
 			ProtectedBranches: []string{m.rig.DefaultBranch()},
 		}); presErr != nil {
+			// A detached HEAD has no ref surviving worktree teardown to
+			// hold an uncommitted commit — WorktreeRemove deletes the
+			// per-worktree HEAD/reflog that were the only pointers to it.
+			// If the guard itself failed (e.g. the configured protected
+			// branch didn't resolve on origin), we can't know whether
+			// uncommitted work exists, so refuse rather than silently
+			// discard it (PR #253 review). force explicitly asks to
+			// bypass that.
+			if branch == "HEAD" && !force {
+				return fmt.Errorf("could not auto-preserve work in %s before removing a detached-HEAD worktree, and removal would discard any uncommitted commit with no recoverable ref: %w (use force to remove anyway)", name, presErr)
+			}
 			style.PrintWarning("could not auto-preserve work in %s before removal: %v", name, presErr)
 		} else if result.Pushed {
 			fmt.Printf("%s Preserved uncommitted work for %s: pushed %s to %s\n",

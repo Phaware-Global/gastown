@@ -502,7 +502,11 @@ func hasUnverifiedCommit(g *Git, remote, head string, protectedBranches []string
 	}
 	args := []string{"log", head}
 	for _, branch := range protectedBranches {
-		ref := remote + "/" + branch
+		// Fully qualified: a bare "remote/branch" resolves refs/heads/
+		// before refs/remotes/, so a local branch or tag named e.g.
+		// "origin/main" in the same worktree would shadow the tracking
+		// ref and exempt every unverified commit (PR #253 review).
+		ref := "refs/remotes/" + remote + "/" + branch
 		if _, err := g.run("rev-parse", "--verify", ref); err != nil {
 			return "", fmt.Errorf("protected branch ref %s does not resolve — refusing to check for unverified commits until it can be verified: %w", ref, err)
 		}

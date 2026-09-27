@@ -621,6 +621,31 @@ func TestShouldCloseHookedBead(t *testing.T) {
 	}
 }
 
+// TestShouldForceCloseNoMerge covers the PR #253 review finding: the
+// no-merge completion path force-closed the work bead before
+// updateAgentStateOnDone (and its own shouldCloseHookedBead mrFailed check)
+// ever ran, so a failed PR/MR handoff under merge_strategy=pr was silently
+// reported as "No-merge work completed" with the bead closed anyway.
+func TestShouldForceCloseNoMerge(t *testing.T) {
+	tests := []struct {
+		name     string
+		mrFailed bool
+		want     bool
+	}{
+		{"handoff succeeded closes", false, true},
+		{"handoff failed does not close", true, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldForceCloseNoMerge(tt.mrFailed)
+			if got != tt.want {
+				t.Errorf("shouldForceCloseNoMerge(%v) = %v, want %v", tt.mrFailed, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestShouldSyncIdlePolecatWorktree(t *testing.T) {
 	tests := []struct {
 		name          string
