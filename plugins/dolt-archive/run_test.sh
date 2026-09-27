@@ -379,6 +379,10 @@ assert_escalated "$SANDBOX" "no git backup repo" "missing git backup repo"
 assert_fingerprint "$SANDBOX" "no git backup repo" "dolt-archive:git-repo-missing" "missing git backup repo"
 assert_output_contains "$SANDBOX" "git=missing" "missing git backup repo — git clause"
 assert_output_contains "$SANDBOX" "dolt_push=skipped" "missing git backup repo — dolt_push summary clause (skipped case)"
+if grep -qF "git_push_refused" "$SANDBOX/output.log" 2>/dev/null; then
+  echo "FAIL: missing git backup repo — summary reports git_push_refused although the guard never ran"
+  FAILURES=$((FAILURES + 1))
+fi
 rm -rf "$SANDBOX"
 
 # --- Scenario 3: remote count below exported count must escalate critical ----
