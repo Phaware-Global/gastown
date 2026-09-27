@@ -336,6 +336,19 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		return fmt.Errorf("cannot determine current rig (working directory may be deleted)")
 	}
 
+	// Get configured default branch for this rig. Resolved here (before the
+	// gt-pvx auto-save below) rather than at first use, because it is also
+	// the unverified-commit guard's ONLY protected branch (gt-35un/gt-xitk
+	// MAYOR DESIGN RULING): sourced from rig config, never from a bead,
+	// --issue, or the branch name, all of which are agent-writable and
+	// would let a push exempt its own unverified commit by naming a
+	// fabricated base.
+	defaultBranch := "main" // fallback
+	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
+		defaultBranch = rigCfg.DefaultBranch
+	}
+	unverifiedGuardProtectedBranches := []string{defaultBranch}
+
 	// When gt is invoked via shell alias (cd ~/gt && gt), or when Claude Code
 	// resets the shell CWD to mayor/rig, cwd is NOT the polecat's worktree.
 	// Detect and reconstruct actual path.
@@ -594,6 +607,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		preserveResult, preserveErr := git.AutoPreserveUncommittedWork(g, branch, git.PreserveOptions{
 			IssueID:           parseBranchName(branch).Issue,
 			ExtraExcludePaths: extraExclude,
+			ProtectedBranches: unverifiedGuardProtectedBranches,
 		})
 		if preserveErr != nil {
 			return fmt.Errorf("gt-pvx safety net auto-save failed: %w\nResolve the issue first, or use --status DEFERRED to exit without completing", preserveErr)
@@ -744,12 +758,6 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	// Parallel to done-intent label for backwards compat during migration.
 	if sessionName := os.Getenv("GT_SESSION"); sessionName != "" && townRoot != "" {
 		polecat.TouchSessionHeartbeatWithState(townRoot, sessionName, polecat.HeartbeatExiting, "gt done", issueID)
-	}
-
-	// Get configured default branch for this rig
-	defaultBranch := "main" // fallback
-	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
-		defaultBranch = rigCfg.DefaultBranch
 	}
 
 	// For COMPLETED, we need an issue ID and branch must not be the default branch
@@ -1066,7 +1074,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Handle "direct" strategy: push to target branch, skip MR
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
-			if reason := refuseUnverifiedPush(g); reason != "" {
+			if reason := refuseUnverifiedPush(g, unverifiedGuardProtectedBranches); reason != "" {
 				pushFailed = true
 				doneErrors = append(doneErrors, reason)
 				style.PrintWarning("%s", reason)
@@ -1146,7 +1154,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// when the tree was dirty, but an earlier auto-save/checkpoint
 		// cycle can have left an unverified commit on a now-clean branch
 		// (PR #184 review).
-		if reason := refuseUnverifiedPush(g); reason != "" {
+		if reason := refuseUnverifiedPush(g, unverifiedGuardProtectedBranches); reason != "" {
 			pushFailed = true
 			doneErrors = append(doneErrors, reason)
 			style.PrintWarning("%s", reason)
@@ -1629,7 +1637,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			fmt.Printf("%s Late-detected direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
 			fmt.Printf("  Convoy: %s\n", convoyInfo.ID)
 
-			if reason := refuseUnverifiedPush(g); reason != "" {
+			if reason := refuseUnverifiedPush(g, unverifiedGuardProtectedBranches); reason != "" {
 				pushFailed = true
 				doneErrors = append(doneErrors, reason)
 				style.PrintWarning("%s", reason)
@@ -2803,8 +2811,8 @@ func findHookedBeadForAgent(bd *beads.Beads, agentID string) string {
 // gt done push site consults this because the auto-save's own HooksFailed
 // gate only fires when auto-save ran in the same invocation — an unverified
 // commit left by an earlier cycle sits on a clean tree (PR #184 review).
-func refuseUnverifiedPush(g *git.Git) string {
-	badSHA, err := git.HasUnverifiedCommit(g, "origin")
+func refuseUnverifiedPush(g *git.Git, protectedBranches []string) string {
+	badSHA, err := git.HasUnverifiedCommit(g, "origin", protectedBranches)
 	if err != nil {
 		return fmt.Sprintf("could not check the branch for unverified commits — refusing to push until it can be verified: %v", err)
 	}
