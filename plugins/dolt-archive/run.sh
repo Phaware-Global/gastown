@@ -76,6 +76,21 @@ dolt_query_json() {
     --use-db "$db" sql -q "$query" --result-format json
 }
 
+# A <db>-latest.jsonl left by an earlier cycle is not this cycle's snapshot.
+# Step 2 copies whatever it points at into the git backup repo and commits it
+# as "Archive snapshot <now>", so once this cycle's export has failed it must
+# not survive — otherwise old data is committed under today's name and the run
+# reads as healthy. Dated snapshot files are history, not a claim of currency,
+# and are left alone.
+discard_stale_latest() {
+  local db="$1"
+  local link="$JSONL_EXPORT_DIR/${db}-latest.jsonl"
+  if [[ -e "$link" || -L "$link" ]]; then
+    rm -f "$link"
+    log "  WARN: $db removed stale ${db}-latest.jsonl (export failed; it would have republished an older snapshot as current)"
+  fi
+}
+
 # --- Step 1: JSONL export ----------------------------------------------------
 
 # Auto-discover production databases or use the explicit list.
@@ -117,6 +132,7 @@ for DB in "${PROD_DBS[@]}"; do
   if ! TABLE_CHECK=$(dolt_query "$DB" "SHOW TABLES LIKE 'issues'" 2>"$QERR"); then
     CAUSE=$(tr '\n' ' ' < "$QERR"); rm -f "$QERR"
     log "  WARN: $DB: table check query failed: $CAUSE"
+    discard_stale_latest "$DB"
     EXPORT_FAILED=$((EXPORT_FAILED + 1))
     EXPORT_ERRORS="${EXPORT_ERRORS}${DB}(table-check: $CAUSE) "
     continue
@@ -140,6 +156,7 @@ for DB in "${PROD_DBS[@]}"; do
     CAUSE=$(tr '\n' ' ' < "$QERR"); rm -f "$QERR"
     log "  WARN: $DB export failed: $CAUSE"
     rm -f "$EXPORT_FILE"
+    discard_stale_latest "$DB"
     EXPORT_FAILED=$((EXPORT_FAILED + 1))
     EXPORT_ERRORS="${EXPORT_ERRORS}${DB}(export: $CAUSE) "
   fi
