@@ -10,7 +10,7 @@ import (
 // GT_DOLT_PORT, GT_DOLT_HOST, and GT_TEST_EXTERNAL_DOLT which are preserved so
 // subprocesses connect to and reuse the test Dolt server. BEADS_DOLT_PORT and
 // BEADS_DOLT_SERVER_HOST (prefix BEADS_, not BD_) pass through implicitly since
-// only BD_* is stripped.
+// only BD_* is stripped. BD_DISABLE_METRICS=1 is always set (see below).
 //
 // Use this when setting cmd.Env on bd/gt subprocess calls in tests.
 // If you do NOT set cmd.Env, the process env (including GT_DOLT_PORT) is
@@ -29,6 +29,12 @@ func CleanGTEnv(extraEnv ...string) []string {
 		}
 		clean = append(clean, e)
 	}
+	// Stripping BD_* also drops BD_DISABLE_METRICS. Tests point HOME at a
+	// t.TempDir(), and bd's metrics spooler writes $HOME/.beads/eventsData and
+	// spawns a detached `bd send-metrics` flusher that can create eventkit.lock
+	// there after the test returns, failing t.TempDir's RemoveAll with
+	// "directory not empty". Re-assert it so it does not depend on the caller.
+	clean = append(clean, "BD_DISABLE_METRICS=1")
 	return append(clean, extraEnv...)
 }
 
