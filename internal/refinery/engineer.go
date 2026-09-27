@@ -1051,13 +1051,17 @@ func (e *Engineer) doMerge(ctx context.Context, mrID, branch, target, sourceIssu
 	// merge. Only the default branch is guarded — feature/integration
 	// targets are not subject to the PR-review policy.
 	if target == e.rig.DefaultBranch() {
-		if requiresPR, checkErr := e.rigActuallyRequiresPRStrategy(); checkErr == nil && requiresPR {
+		if requiresPR, checkErr := e.rigActuallyRequiresPRStrategy(); requiresPR {
+			errMsg := fmt.Sprintf(
+				"refusing direct push to %s: rig settings require merge_strategy=pr but this merge path has no review_pr for MR %s (in-memory MergeStrategy=%q) — escalate instead of pushing",
+				target, mrID, e.config.MergeStrategy)
+			if checkErr != nil {
+				errMsg += fmt.Sprintf(" (fresh settings re-check failed, failing closed: %v)", checkErr)
+			}
 			return ProcessResult{
 				Success:         false,
 				ReviewPRMissing: true,
-				Error: fmt.Sprintf(
-					"refusing direct push to %s: rig settings require merge_strategy=pr but this merge path has no review_pr for MR %s (in-memory MergeStrategy=%q) — escalate instead of pushing",
-					target, mrID, e.config.MergeStrategy),
+				Error:           errMsg,
 			}
 		}
 	}
@@ -1362,10 +1366,18 @@ func (e *Engineer) populateReviewPR(mrID string, prNumber int) error {
 // the one irreversible step in the merge. A dedicated Engineer is used
 // (rather than mutating e.config) so this check can never have a
 // side-effect on the caller's own merge decision.
+//
+// Fails CLOSED on error (returns true): a settings file that exists but
+// fails to load — malformed JSON, or a merge_strategy=pr rig missing a
+// field LoadConfig's validation now requires (e.g. pr_approver) — is
+// exactly the ambiguous state where an unreviewed direct push must not be
+// allowed to slip through. Mirrors currentRigRequiresPRStrategy's contract
+// in tap_guard_push_main.go, the equivalent guard for a git push issued
+// directly from Bash.
 func (e *Engineer) rigActuallyRequiresPRStrategy() (bool, error) {
 	fresh := NewEngineer(e.rig)
 	if err := fresh.LoadConfig(); err != nil {
-		return false, err
+		return true, err
 	}
 	return fresh.config.MergeStrategy == "pr", nil
 }
@@ -1873,6 +1885,27 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 	// No polecat notification needed; the PR just needs a human review on GitHub.
 	if result.NeedsApproval {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: PR awaiting human approval, will retry next poll\n", mr.ID)
+		return
+	}
+
+	// ReviewPRMissing (gt-wgmf P0): the direct-push guard refused because the
+	// rig requires PR review and this MR carries no review_pr. This is not a
+	// build/test/conflict failure a polecat can "fix and resubmit" — it's a
+	// process/config problem (missing PR, or a config drift the guard
+	// caught) that needs a human to look at before this MR proceeds. Escalate
+	// at HIGH severity rather than the routine mayor nudge used below: an MR
+	// that got this close to an unreviewed push to the default branch is
+	// exactly the incident this bead exists to prevent a repeat of.
+	if result.ReviewPRMissing {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] ✗ MR %s: refused direct push (no review_pr under merge_strategy=pr) — escalating\n%s\n", mr.ID, result.Error)
+		escMsg := fmt.Sprintf("MR %s (issue=%s branch=%s target=%s) refused a direct push: %s",
+			mr.ID, mr.SourceIssue, mr.Branch, mr.Target, result.Error)
+		escCmd := exec.Command("gt", "escalate", "-s", "HIGH", "--source", "refinery:review-pr-missing", escMsg)
+		util.SetDetachedProcessGroup(escCmd)
+		escCmd.Dir = e.workDir
+		if err := escCmd.Run(); err != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to escalate review_pr-missing MR %s: %v\n", mr.ID, err)
+		}
 		return
 	}
 
