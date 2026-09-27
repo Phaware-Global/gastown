@@ -59,6 +59,23 @@ type PreserveOptions struct {
 	// (auto)" prefix, matched elsewhere for squashing) should set this
 	// rather than let their commits go unrecognized by that tooling.
 	CommitMessage string
+
+	// ProtectedBranches lists the rig's protected integration branches
+	// (e.g. its configured default branch, "develop") on Remote. A commit
+	// reachable from any of them is exempt from the unverified-commit scan
+	// — reaching a protected branch only happens through a reviewed PR
+	// under branch protection, which is what makes it safe to treat as
+	// "accepted."
+	//
+	// MUST be sourced from rig config (settings/config.json /
+	// config.json's default_branch) by the caller — NEVER derived from a
+	// bead, the branch name, or --issue. Those are agent-writable, and
+	// gt-xitk found that letting any of them influence this list is
+	// exactly how three earlier formulations of this guard were each
+	// defeated (either a false-positive on a develop-based rig, or a
+	// self-exemption once the checked branch was itself pushed). Empty
+	// means the scan fails closed rather than guessing a baseline.
+	ProtectedBranches []string
 }
 
 // PreserveResult reports what AutoPreserveUncommittedWork actually did.
@@ -341,7 +358,7 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 	// to the shared remote (PR #184 review). Skipped when this very call
 	// already set HooksFailed: its own commit carries the trailer.
 	if !result.HooksFailed {
-		if badSHA, chkErr := hasUnverifiedCommit(g, remote, head); chkErr != nil {
+		if badSHA, chkErr := hasUnverifiedCommit(g, remote, head, opts.ProtectedBranches); chkErr != nil {
 			return result, fmt.Errorf("checking for a prior unverified commit: %w", chkErr)
 		} else if badSHA != "" {
 			result.HooksFailed = true
@@ -445,36 +462,54 @@ func divergenceAnchor(g *Git, remote, head string) string {
 	return fields[0]
 }
 
-// HasUnverifiedCommit reports the SHA of a commit in HEAD's ancestry (back
-// to the merge-base with remote's default branch) that was committed with
+// HasUnverifiedCommit reports the SHA of a commit in HEAD's ancestry, not
+// reachable from any of protectedBranches on remote, that was committed with
 // hooks bypassed and never verified — see hasUnverifiedCommit. Exported for
 // callers that push a branch to origin themselves rather than through
 // AutoPreserveUncommittedWork's own push path (gt done, polecat removal's
 // best-effort branch push), so they can refuse to publish it even when no
 // preserve call happened in the same invocation (PR #184 review).
-func HasUnverifiedCommit(g *Git, remote string) (string, error) {
+//
+// protectedBranches must come from rig config — see PreserveOptions.ProtectedBranches.
+func HasUnverifiedCommit(g *Git, remote string, protectedBranches []string) (string, error) {
 	head, err := g.Rev("HEAD")
 	if err != nil {
 		return "", err
 	}
-	return hasUnverifiedCommit(g, remote, head)
+	return hasUnverifiedCommit(g, remote, head, protectedBranches)
 }
 
 // hasUnverifiedCommit reports the SHA of the nearest commit, reachable from
-// head back to its merge-base with remote's default branch, that carries
+// head but not from any of protectedBranches on remote, that carries
 // unverifiedCommitTrailer — i.e. was committed with hooks bypassed and has
-// never been confirmed safe to publish. Scoped to the merge-base range (this
-// branch's own commits since it diverged) rather than all of history, so an
-// unrelated marked commit merged in from elsewhere can't false-positive
-// every future push. Falls back to head's full ancestry if the merge-base
-// can't be resolved (e.g. the remote branch isn't fetched locally) — a
-// wider search is the safe direction here, not a skipped one.
-func hasUnverifiedCommit(g *Git, remote, head string) (string, error) {
-	revRange := head
-	if base, err := g.MergeBase(head, remote+"/"+g.RemoteDefaultBranch()); err == nil && base != "" {
-		revRange = base + ".." + head
+// never been confirmed safe to publish.
+//
+// MAYOR DESIGN RULING (gt-xitk, 2026-09-27): the exempt set is commits
+// reachable from the rig's protected integration branches ONLY — never a
+// merge-base against the repo's git-level default branch (that broke on
+// develop-based rigs, gt-35un) and never a base inferred from a bead,
+// --issue, or the branch name (agent-writable — the base a push is scoped
+// against must not be selectable by the thing being checked).
+//
+// Fails closed rather than guessing a baseline: an empty protectedBranches,
+// or any listed branch that doesn't resolve as remote/<branch>, is an error.
+// A wider or narrower search here was tried three times (see gt-xitk) and
+// each direction reopened a previous hole — refusing outright is the only
+// formulation that can't be quietly disarmed.
+func hasUnverifiedCommit(g *Git, remote, head string, protectedBranches []string) (string, error) {
+	if len(protectedBranches) == 0 {
+		return "", fmt.Errorf("no protected branches configured for the unverified-commit guard — refusing rather than scanning without a known-safe baseline")
 	}
-	out, err := g.run("log", revRange, "--fixed-strings", "--grep="+unverifiedCommitTrailer, "--format=%H")
+	args := []string{"log", head}
+	for _, branch := range protectedBranches {
+		ref := remote + "/" + branch
+		if _, err := g.run("rev-parse", "--verify", ref); err != nil {
+			return "", fmt.Errorf("protected branch ref %s does not resolve — refusing to check for unverified commits until it can be verified: %w", ref, err)
+		}
+		args = append(args, "--not", ref)
+	}
+	args = append(args, "--fixed-strings", "--grep="+unverifiedCommitTrailer, "--format=%H")
+	out, err := g.run(args...)
 	if err != nil {
 		return "", err
 	}
