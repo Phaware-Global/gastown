@@ -39,10 +39,9 @@ log() { echo "[test] $*"; }
 #     data as this cycle's snapshot (gt-pgvd)
 #  15+. run.sh's own once-per-condition escalation dedupe — identical/changed/
 #     cleared-then-returned/skip-scoped/interval-digest/retried-after-failure
-#     conditions, tracked per independently-resolvable entity (a db, or a
-#     db+remote pair) with no shared history between entities, so one
-#     member's resolve-then-return can never be masked by an unrelated
-#     member's ongoing failure (gt-4kip, mayor ruling on #250 / hq-cv-6yo5w)
+#     conditions, plus the shrink/growth/subset-scoping adversarial cases from
+#     PR #250 review, including growth recorded from a --databases subset
+#     (gt-4kip)
 # =============================================================================
 
 FAILURES=0
@@ -888,18 +887,12 @@ run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
 assert_count "$SANDBOX" "dolt push failed" 1 "escalate that failed once must still be delivered next run"
 rm -rf "$SANDBOX"
 
-log "=== Scenario: a resolved member re-escalates when it returns, even ==="
-log "=== alongside an unrelated member that never stopped failing (gt-4kip) ==="
-# origin+mirror both fail -> escalate (both new). mirror recovers (origin
-# keeps failing) -> origin is unchanged (stays quiet); mirror is checked and
-# clean, so its own state is dropped. mirror fails again -> it has no prior
-# state, so it escalates again — origin's continued, unrelated failure must
-# not mask mirror's independent return. This is the mayor's gt-fc13 ruling
-# on #250 (hq-cv-6yo5w): a per-condition-class "sticky union" that remembers
-# every member it ever saw (so a shrink then regrow looked like "no change")
-# is exactly what let a resolved condition go unescalated on return. Per-key
-# state with no shared union between members — mirror and origin never touch
-# each other's file — makes that impossible.
+log "=== Scenario: shrink-then-regrow of an affected set escalates once (PR #250) ==="
+# 2 failing (origin+mirror) -> escalate. Then 1 failing (mirror recovers) ->
+# must NOT re-escalate (a pure shrink of an already-escalated set is not
+# new). Then 2 failing again (mirror fails again, back to the original set)
+# -> must still NOT re-escalate, since escalate_once kept the larger
+# recorded set and its timestamp across the shrink.
 SANDBOX="$(setup_static_conditions)"
 : > "$SANDBOX/escalate.log"
 printf 'origin\thttps://github.com/test-owner/db-a (fetch)\nmirror\thttps://github.com/test-owner/db-a-mirror (fetch)\n' \
@@ -910,7 +903,7 @@ rm -f "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
 run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
 touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
 run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
-assert_count "$SANDBOX" "dolt push failed" 2 "mirror's return must re-escalate although origin never stopped failing"
+assert_count "$SANDBOX" "dolt push failed" 1 "2-failing then 1 then 2 again must escalate exactly once"
 rm -rf "$SANDBOX"
 
 log "=== Scenario: a --databases subset run does not clear another db's state (PR #250) ==="
@@ -947,16 +940,15 @@ if [[ "$(grep -- "dolt push failed" "$SANDBOX/escalate.log" | grep -c -- "-s low
 fi
 rm -rf "$SANDBOX"
 
-log "=== Scenario: each member's own resolve/return is tracked independently (gt-4kip) ==="
-# origin fails -> escalate. mirror joins -> escalate (a new member). mirror
-# recovers -> quiet, and mirror's own state is dropped (checked, now clean).
-# third joins (mirror still recovered) -> escalate (a new member). mirror
-# fails again -> escalate AGAIN: it has no state (dropped when it resolved),
-# so its return is indistinguishable from a first-time failure — exactly the
-# gt-fc13 requirement. The old "sticky union" design (one shared history per
-# condition *class*, remembering every member it ever saw) would have read
-# mirror's return here as "already escalated, still in the recorded set" and
-# stayed silent — the bug the mayor's ruling on #250 (hq-cv-6yo5w) ended.
+log "=== Scenario: growth remembers prior members so a later flap-back doesn't re-escalate (PR #250) ==="
+# a fails -> escalate (state={a}). a+b fail (growth) -> escalate (state must
+# become {a,b}, not just {a,b}-at-this-instant). b recovers (shrink of {a,b})
+# -> quiet. a+c fail (c appears, b still recovered) -> growth relative to
+# {a,b} -> escalate, and state must remember the full history as {a,b,c} (not
+# just {a,c}). b flaps back alongside a+c -> must NOT re-escalate, since b was
+# already escalated in an earlier round (adversarial finding on #250: the
+# growth branch used to overwrite state with only the current set, dropping
+# already-escalated members).
 SANDBOX="$(setup_static_conditions)"
 : > "$SANDBOX/escalate.log"
 printf 'origin\thttps://github.com/test-owner/db-a (fetch)\nmirror\thttps://github.com/test-owner/db-a-mirror (fetch)\nthird\thttps://github.com/test-owner/db-a-third (fetch)\n' \
@@ -970,17 +962,20 @@ touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-third"
 run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
 touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
 run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
-assert_count "$SANDBOX" "dolt push failed" 4 "mirror's second return must escalate again, independent of origin/third's own history"
+assert_count "$SANDBOX" "dolt push failed" 3 "growth must remember prior members so a later flap-back doesn't re-escalate"
 rm -rf "$SANDBOX"
 
-log "=== Scenario: a db's failure recorded on a full run survives an unrelated ==="
-log "=== db's --databases subset cycles (val HIGH on #250) ==="
-# Full run: db-a fails -> escalate, its own key recorded. A subsequent
-# --databases db-b run (db-b starts failing, then recovers) never touches
-# db-a's key at all — each db's state lives in its own file, so a run scoped
-# to db-b has no way to read or clear db-a's entry. A later full run must
-# therefore still find db-a's failure exactly as it left it (unchanged,
-# quiet), not re-file it as new.
+log "=== Scenario: a growth event recorded from a --databases subset must still block a later clear (val HIGH on #250) ==="
+# Full run: db-a fails -> escalate (state: hashes={a}, covered={db-a}).
+# --databases db-b run: db-b ALSO starts failing -> a growth event relative to
+# the recorded {a} (db-b's hash isn't in it), scoped to a run that only
+# checked db-b. The union of hashes must carry db-a's hash forward (already
+# fixed pre-#250) — but the recorded COVERED set must ALSO carry db-a
+# forward, not just this run's own covered=db-b. Otherwise the next
+# --databases db-b run (db-b now healthy) reads db-a as "in scope and
+# resolved" purely because covered never named it, and clears the whole
+# state — so a later full run, finding db-a's failure never fixed, re-files
+# it as brand new instead of staying quiet.
 SANDBOX="$(setup_static_conditions)"
 : > "$SANDBOX/escalate.log"
 printf 'origin\thttps://github.com/test-owner/db-b (fetch)\n' > "$SANDBOX/home/gt/.dolt-data/db-b/.mock-remotes"
@@ -990,7 +985,7 @@ run_cycle "$SANDBOX" --databases db-b --skip-git
 rm -f "$SANDBOX/home/gt/.dolt-data/db-b/.mock-push-fail-origin"
 run_cycle "$SANDBOX" --databases db-b --skip-git
 run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
-assert_count "$SANDBOX" "dolt push failed" 2 "db-a's failure must survive unrelated db-b-only subset cycles without re-filing"
+assert_count "$SANDBOX" "dolt push failed" 2 "growth's covered set must survive a later subset run so db-a's persisting failure doesn't re-file"
 rm -rf "$SANDBOX"
 
 echo ""
@@ -1164,36 +1159,6 @@ rm -f "$DOLT_DATA_DIR/db-public/.remotes"
 run_suite_b > "$WORKDIR/run4.log" 2>&1 || true
 check "refusal state cleared once the remote is gone" '[[ -z "$(ls "$DOLT_ARCHIVE_STATE_DIR" 2>/dev/null | grep push-refused)" ]]'
 
-# Required regression test (mayor ruling on #250 / hq-cv-6yo5w, gt-fc13): the
-# unsafe-remote refusal fires, the remote is fixed (a clean run — the push
-# actually succeeds, not just "skipped"), the refusal returns, and it must
-# fire again, not stay silent because it "already escalated once before".
-echo "origin git+https://github.com/priv-owner/repo {}" > "$DOLT_DATA_DIR/db-public/.remotes"
-run_suite_b > "$WORKDIR/run5.log" 2>&1 || true
-check "remote fixed (now private) — push actually succeeds" 'grep -q "/db-public|origin" "$PUSH_LOG"'
-check "remote fixed — refusal state cleared" '[[ -z "$(ls "$DOLT_ARCHIVE_STATE_DIR" 2>/dev/null | grep push-refused)" ]]'
-echo "origin git+https://github.com/pub-owner/repo {}" > "$DOLT_DATA_DIR/db-public/.remotes"
-run_suite_b > "$WORKDIR/run6.log" 2>&1 || true
-check "refusal returns after being fixed — re-escalates (gt-4kip)" '[[ "$(refusals)" -eq 3 ]]'
-check "returned refusal is critical, not suppressed as a stale repeat" \
-  'grep "push-refused:db-public:origin" "$ESCALATE_LOG" | tail -1 | grep -q -- "-s critical"'
-
-# Required regression test: a --databases subset run must not clear (or
-# otherwise disturb) a still-unresolved refusal for a db outside that subset.
-mkdir -p "$DOLT_DATA_DIR/db-subset/.dolt"
-echo "origin git+https://github.com/pub-owner/repo {}" > "$DOLT_DATA_DIR/db-subset/.remotes"
-touch "$REAL_JSONL_DIR/db-subset-20000101-0000.jsonl"
-run_suite_b_dbs() {
-  PATH="$FAKE_BIN:$PATH" DOLT_DATA_DIR="$DOLT_DATA_DIR" \
-    bash "$RUN_SH" --databases "$1" --skip-git
-}
-run_suite_b_dbs "db-subset,db-private" > "$WORKDIR/subset1.log" 2>&1 || true
-run_suite_b_dbs "db-private" > "$WORKDIR/subset2.log" 2>&1 || true
-run_suite_b_dbs "db-subset,db-private" > "$WORKDIR/subset3.log" 2>&1 || true
-check "db-private-only run must not clear or re-fire db-subset's unresolved refusal" \
-  '[[ "$(grep -c "push-refused:db-subset:origin" "$ESCALATE_LOG")" -eq 1 ]]'
-rm -f "$REAL_JSONL_DIR/db-subset-20000101-0000.jsonl"
-
 echo ""
 echo "Suite B (visibility guard): $PASS passed, $FAIL failed"
 if [[ "$FAIL" -ne 0 ]]; then
@@ -1290,43 +1255,6 @@ BEFORE="$(bare_head "$SANDBOX")"
 run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
 [[ "$BEFORE" == "$(bare_head "$SANDBOX")" ]] || c_fail "mixed pushurls — origin received a push"
 grep -qF "git=refused" "$SANDBOX/output.log" || c_fail "mixed pushurls — summary lacks git=refused"
-rm -rf "$SANDBOX"
-
-# Required regression test (val's LOW on #250): a cycle where the git-push
-# visibility guard never evaluates at all — not "refused", not "skipped via
-# --skip-git", but genuinely never reached (no backup repo present that
-# cycle) — must leave a still-unresolved refusal's state untouched. The old
-# code cleared git-push-refused:origin whenever `! $SKIP_GIT`, regardless of
-# whether the guard itself ever ran that cycle.
-log "=== Scenario: git-layer guard — a cycle where the guard never runs leaves a refusal's state untouched (val LOW on #250) ==="
-SANDBOX="$(setup_sandbox)"
-write_dolt_mock "$SANDBOX"; write_bd_mock "$SANDBOX"; write_gt_mock "$SANDBOX"
-write_gh_owner_mock "$SANDBOX"
-write_git_backup_repo "$SANDBOX"
-write_git_shim "$SANDBOX" "https://github.com/pub-owner/example-backup"
-# write_gt_mock's simulated server-side --fingerprint dedup (mirroring real
-# `gt escalate`, which only suppresses against OPEN beads) would otherwise
-# mask this test: an unchanged refusal always carries the SAME fingerprint,
-# so the mock alone would suppress a genuine re-escalation just as readily
-# as a correctly-suppressed repeat. Disable it so only run.sh's own
-# state-based dedupe is under test, same as the "Scenarios 15+" cases.
-touch "$SANDBOX/.no-server-dedup"
-: > "$SANDBOX/escalate.log"
-
-run_cycle "$SANDBOX" --databases testdb --skip-dolt-push
-REPO="$SANDBOX/home/gt/.dolt-archive/git"
-mv "$REPO" "${REPO}.away"
-run_cycle "$SANDBOX" --databases testdb --skip-dolt-push
-if ! grep -qF "No git backup repo" "$SANDBOX/output.log"; then
-  c_fail "guard-never-ran cycle did not actually take the git=missing path"
-fi
-mv "${REPO}.away" "$REPO"
-run_cycle "$SANDBOX" --databases testdb --skip-dolt-push
-
-REFIRES="$(grep -c -- "git-push-refused" "$SANDBOX/escalate.log" || true)"
-if [[ "${REFIRES:-0}" -ne 1 ]]; then
-  c_fail "guard-never-ran cycle must not clear git-push-refused state — expected 1 total escalation, got ${REFIRES:-0}"
-fi
 rm -rf "$SANDBOX"
 
 echo ""

@@ -32,9 +32,14 @@ send one mail. The Mayor does the work.
    exact subject, body, priority, and message type — it is intentionally
    parameter-free to keep this dog cheap and deterministic.
 
-2. Record the run as an ephemeral `type:plugin-run` receipt (labels
-   `plugin:mayor-loose-ends-nudge` and `result:success`) and close it
-   immediately, per the dispatch instructions.
+2. Record the run as a wisp:
+
+   ```bash
+   bd create "mayor-loose-ends-nudge: dispatched" -t chore --ephemeral \
+     -l type:plugin-run,plugin:mayor-loose-ends-nudge,result:success \
+     -d "5h cooldown nudge dispatched to mayor/" \
+     --silent 2>/dev/null || true
+   ```
 
 3. Exit. Do not wait for the Mayor's response.
 

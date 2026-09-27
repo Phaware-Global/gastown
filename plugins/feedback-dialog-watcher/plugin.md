@@ -56,17 +56,52 @@ If either is missing, no match. Capture only the bottom ~30 lines (the
 visible screen plus a small cushion) so historical scrollback that
 incidentally contains the strings cannot trigger a stale dismiss.
 
-## Run
-
-All logic lives in `run.sh`: it enumerates every tmux pane, applies the
-detection pattern above, sends the Dismiss key where it matches, and records a
-receipt. This file intentionally carries no executable copy of it.
+## Step 1: Enumerate every tmux pane
 
 ```bash
-cd <plugin dir> && bash run.sh
+# Bail early if no tmux server is running — nothing to do.
+if ! tmux list-sessions >/dev/null 2>&1; then
+  echo "No tmux server running; nothing to scan."
+  exit 0
+fi
+
+# `-a` walks every pane across every session in one call. `pane_id` is a
+# stable, unambiguous target (e.g. %12) — safer than session:window.pane
+# when window/pane indices renumber under user activity mid-scan.
+PANE_IDS=$(tmux list-panes -a -F '#{pane_id}')
 ```
 
-Run the command exactly as shown and report the output.
+## Step 2: Detect + dismiss
+
+```bash
+DISMISSED=0
+SCANNED=0
+
+while IFS= read -r PANE; do
+  [ -z "$PANE" ] && continue
+  SCANNED=$((SCANNED + 1))
+
+  CONTENT=$(tmux capture-pane -t "$PANE" -p -S -30 2>/dev/null || true)
+  [ -z "$CONTENT" ] && continue
+
+  # Both markers must be present. Either alone is too generic.
+  if [[ "$CONTENT" == *"1: Bad"* ]] && [[ "$CONTENT" == *"0: Dismiss"* ]]; then
+    tmux send-keys -t "$PANE" '0'
+    DISMISSED=$((DISMISSED + 1))
+  fi
+done <<< "$PANE_IDS"
+```
+
+## Step 3: Record receipt
+
+```bash
+SUMMARY="feedback-dialog-watcher: scanned $SCANNED panes, dismissed $DISMISSED dialog(s)"
+echo "$SUMMARY"
+
+bd create "$SUMMARY" -t chore --ephemeral \
+  -l type:plugin-run,plugin:feedback-dialog-watcher,result:success \
+  -d "$SUMMARY" --silent 2>/dev/null || true
+```
 
 The receipt bead is `--ephemeral` so it auto-prunes — successful runs are
 high-volume signal that nothing-was-wrong, and accumulating one permanent

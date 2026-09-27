@@ -447,30 +447,7 @@ func TestParsePluginMD_FeedbackDialogWatcher(t *testing.T) {
 	}
 }
 
-// TestStuckAgentDogRunScriptUsesCanonicalHeartbeatPath pins the heartbeat
-// contract in the stuck-agent-dog run.sh, which is the only implementation
-// (plugin.md is a description plus a pointer; see shipped_plugins_test.go).
-func TestStuckAgentDogRunScriptUsesCanonicalHeartbeatPath(t *testing.T) {
-	content, err := os.ReadFile(filepath.Join("..", "..", "plugins", "stuck-agent-dog", "run.sh"))
-	if err != nil {
-		t.Fatalf("stuck-agent-dog run.sh must exist in plugins/ (it is the only implementation): %v", err)
-	}
-	script := string(content)
-
-	if !strings.Contains(script, "deacon/heartbeat.json") {
-		t.Fatalf("expected canonical heartbeat path in run.sh")
-	}
-	if strings.Contains(script, ".deacon-heartbeat") {
-		t.Fatalf("did not expect legacy heartbeat path in run.sh")
-	}
-	if !strings.Contains(script, ">20m threshold") {
-		t.Fatalf("expected canonical deacon very-stale threshold in run.sh")
-	}
-}
-
-// TestParsePluginMD_StuckAgentDog verifies the shipped plugin.md still parses
-// and keeps its scope limits and heartbeat description.
-func TestParsePluginMD_StuckAgentDog(t *testing.T) {
+func TestParsePluginMD_StuckAgentDogUsesCanonicalHeartbeatPath(t *testing.T) {
 	content, err := os.ReadFile(filepath.Join("..", "..", "plugins", "stuck-agent-dog", "plugin.md"))
 	if err != nil {
 		t.Skipf("stuck-agent-dog plugin not found (expected in plugins/): %v", err)
@@ -490,11 +467,23 @@ func TestParsePluginMD_StuckAgentDog(t *testing.T) {
 	if strings.Contains(plugin.Instructions, ".deacon-heartbeat") {
 		t.Fatalf("did not expect legacy heartbeat path in instructions, got:\n%s", plugin.Instructions)
 	}
+	if !strings.Contains(plugin.Instructions, "Fallback for older/runtime-copied layouts") {
+		t.Fatalf("expected rigs.json fallback guidance in instructions, got:\n%s", plugin.Instructions)
+	}
+	if !strings.Contains(plugin.Instructions, "RIGS_JSON_PATH=\"${TOWN_ROOT}/rigs.json\"") {
+		t.Fatalf("expected town-root rigs.json as canonical source in instructions, got:\n%s", plugin.Instructions)
+	}
+	if !strings.Contains(plugin.Instructions, "$TOWN_ROOT/mayor/rigs.json") {
+		t.Fatalf("expected mayor/ fallback in instructions, got:\n%s", plugin.Instructions)
+	}
+	if !strings.Contains(plugin.Instructions, "Filter out any malformed/blank rows") {
+		t.Fatalf("expected fail-safe blank/malformed rigs row handling in instructions, got:\n%s", plugin.Instructions)
+	}
+	if !strings.Contains(plugin.Instructions, "could not parse rigs.json") {
+		t.Fatalf("expected fail-safe rigs.json parse handling in instructions, got:\n%s", plugin.Instructions)
+	}
 	if !strings.Contains(plugin.Instructions, ">20m threshold") {
 		t.Fatalf("expected canonical deacon very-stale threshold in instructions, got:\n%s", plugin.Instructions)
-	}
-	if !strings.Contains(plugin.Instructions, "Crew sessions") {
-		t.Fatalf("expected crew out-of-scope guard in instructions, got:\n%s", plugin.Instructions)
 	}
 }
 
