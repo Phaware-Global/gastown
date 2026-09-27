@@ -2433,19 +2433,6 @@ func clearDoneCheckpoints(bd *beads.Beads, agentBeadID string) {
 	}
 }
 
-// updateAgentStateOnDone closes the hooked work bead and reports cleanup status.
-// Uses issueID directly to find the hooked bead instead of reading the agent bead's
-// hook_bead slot (hq-l6mm5: direct bead tracking).
-//
-// Per gt-zecmc: observable states ("done", "idle") removed - use tmux to discover.
-// Non-observable states ("stuck", "awaiting-gate") are still set since they represent
-// intentional agent decisions that can't be observed from tmux.
-//
-// Also self-reports cleanup_status for ZFC compliance (#10).
-//
-// BUG FIX (hq-3xaxy): This function must be resilient to working directory deletion.
-// If the polecat's worktree is deleted before gt done finishes, we use env vars as fallback.
-// All errors are warnings, not failures - gt done must complete even if bead ops fail.
 // shouldCloseHookedBead reports whether gt done's completion path should
 // close the hooked bead. Never true when the push or MR creation did not
 // succeed (gt-35un/gt-xitk MAYOR DESIGN RULING, acceptance item 3): closing
@@ -2459,6 +2446,19 @@ func shouldCloseHookedBead(exitType string, isWorkflowStep, pushFailed, mrFailed
 	return exitType != ExitDeferred || isWorkflowStep
 }
 
+// updateAgentStateOnDone closes the hooked work bead and reports cleanup status.
+// Uses issueID directly to find the hooked bead instead of reading the agent bead's
+// hook_bead slot (hq-l6mm5: direct bead tracking).
+//
+// Per gt-zecmc: observable states ("done", "idle") removed - use tmux to discover.
+// Non-observable states ("stuck", "awaiting-gate") are still set since they represent
+// intentional agent decisions that can't be observed from tmux.
+//
+// Also self-reports cleanup_status for ZFC compliance (#10).
+//
+// BUG FIX (hq-3xaxy): This function must be resilient to working directory deletion.
+// If the polecat's worktree is deleted before gt done finishes, we use env vars as fallback.
+// All errors are warnings, not failures - gt done must complete even if bead ops fail.
 func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string, pushFailed, mrFailed bool) {
 	// Get role context - try multiple sources for resilience
 	roleInfo, err := GetRoleWithContext(cwd, townRoot)
