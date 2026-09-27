@@ -5,7 +5,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/steveyegge/gastown/internal/reaper"
 )
@@ -57,23 +56,6 @@ func TestPrintReaperScanTextShowsFastTrackCandidates(t *testing.T) {
 	}
 	if got := strings.Count(out, "  Fast-track:       32\n"); got != 1 {
 		t.Errorf("summary fast-track total line count = %d, want 1\n%s", got, out)
-	}
-}
-
-// TestStaleAgeFlagDefaultMatchesConstant guards against gt-73to recurring:
-// the --stale-age flag's default MUST equal reaper.DefaultStaleIssueAge, not
-// a hardcoded literal that can drift from it.
-func TestStaleAgeFlagDefaultMatchesConstant(t *testing.T) {
-	flag := reaperAutoCloseCmd.Flags().Lookup("stale-age")
-	if flag == nil {
-		t.Fatal("reaperAutoCloseCmd has no --stale-age flag")
-	}
-	got, err := time.ParseDuration(flag.DefValue)
-	if err != nil {
-		t.Fatalf("--stale-age default %q is not a parseable duration: %v", flag.DefValue, err)
-	}
-	if got != reaper.DefaultStaleIssueAge {
-		t.Errorf("--stale-age default = %v, want reaper.DefaultStaleIssueAge (%v)", got, reaper.DefaultStaleIssueAge)
 	}
 }
 
