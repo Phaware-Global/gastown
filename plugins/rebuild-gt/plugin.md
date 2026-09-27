@@ -1,7 +1,7 @@
 +++
 name = "rebuild-gt"
 description = "Rebuild stale gt binary from gastown source"
-version = 3
+version = 4
 
 [gate]
 type = "cooldown"

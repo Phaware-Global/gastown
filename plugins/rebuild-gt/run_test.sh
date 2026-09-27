@@ -30,13 +30,18 @@ git -C "$RIG_ROOT" config user.name "Test"
 git -C "$RIG_ROOT" commit --allow-empty -q -m "initial"
 git -C "$RIG_ROOT" branch -M main
 git -C "$RIG_ROOT" push -q origin main
+INSTALLED_BASE_SHA="$(git -C "$RIG_ROOT" rev-parse HEAD)"
+
+# A follow-up commit on origin/main, ahead of INSTALLED_BASE_SHA — this is
+# what a stale binary should be rebuilt to.
+git -C "$RIG_ROOT" commit --allow-empty -q -m "advance"
+git -C "$RIG_ROOT" push -q origin main
+ORIGIN_MAIN_SHA="$(git -C "$RIG_ROOT" rev-parse HEAD)"
 
 # Mayor's clone: dirty, and parked on a feature branch — exactly the state
 # that used to make rebuild-gt skip forever.
 git -C "$RIG_ROOT" checkout -q -b some-feature
 echo "wip" >> "$RIG_ROOT/scratch.txt"
-
-ORIGIN_MAIN_SHA="$(git -C "$ORIGIN_DIR" rev-parse main)"
 
 # --- Stub gt/bd/make on PATH --------------------------------------------------
 
@@ -48,6 +53,7 @@ ESCALATE_LOG="$WORK_ROOT/escalate_calls.log"
 : > "$ESCALATE_LOG"
 
 STALE_JSON_FILE="$WORK_ROOT/stale.json"
+INSTALLED_SHA_FILE="$WORK_ROOT/installed_sha.txt"
 
 cat > "$STUB_BIN/gt" <<EOF
 #!/usr/bin/env bash
@@ -60,7 +66,8 @@ if [ "\$1" = "stale" ]; then
   exit 0
 fi
 if [ "\$1" = "version" ]; then
-  echo "gt version test-fake"
+  SHA="\$(cat "$INSTALLED_SHA_FILE" 2>/dev/null || echo unknown)"
+  echo "gt version test-fake@\$SHA"
   exit 0
 fi
 if [ "\$1" = "escalate" ]; then
@@ -92,11 +99,14 @@ run_rebuild() {
   PATH="$STUB_BIN:$PATH" GT_TOWN_ROOT="$TOWN_ROOT" bash "$SCRIPT_DIR/run.sh"
 }
 
-# --- Test 1: dirty/off-main mayor clone still rebuilds from origin/main -----
+: > "$STALE_JSON_FILE"
+echo '{"stale": true}' > "$STALE_JSON_FILE"
 
-cat > "$STALE_JSON_FILE" <<'EOF'
-{"stale": true, "forward": true, "on_main_branch": false, "safe_to_rebuild": false}
-EOF
+# --- Test 1: dirty/off-main mayor clone still rebuilds from origin/main -----
+# Installed binary is at the base commit (an ancestor of, but not equal to,
+# origin/main's tip) so a rebuild is both needed and forward-safe.
+
+echo "$INSTALLED_BASE_SHA" > "$INSTALLED_SHA_FILE"
 : > "$MAKE_LOG"
 rm -f "$SKIP_COUNT_FILE"
 
@@ -130,23 +140,51 @@ if [ -z "$(git -C "$RIG_ROOT" status --porcelain)" ]; then
   FAILURES=$((FAILURES + 1))
 fi
 
-# --- Test 2: a downgrade (forward=false) is refused, never calls make ------
+# --- Test 2: a downgrade is refused, never calls make, never fails ---------
+# Installed binary is some commit not reachable from origin/main at all
+# (simulating a diverged/newer install) — origin/main is NOT its forward
+# descendant, so the rebuild must be skipped, not attempted and not reported
+# as a build failure.
 
-cat > "$STALE_JSON_FILE" <<'EOF'
-{"stale": true, "forward": false, "on_main_branch": false, "safe_to_rebuild": false}
-EOF
+echo "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" > "$INSTALLED_SHA_FILE"
 : > "$MAKE_LOG"
+: > "$ESCALATE_LOG"
 rm -f "$SKIP_COUNT_FILE"
 
 run_rebuild >/dev/null 2>&1 || { echo "FAIL: downgrade run exited non-zero (should skip cleanly)"; FAILURES=$((FAILURES + 1)); }
 
 if [ -s "$MAKE_LOG" ]; then
-  echo "FAIL: make was invoked despite forward=false (downgrade must be refused)"
+  echo "FAIL: make was invoked despite a would-be downgrade"
   FAILURES=$((FAILURES + 1))
 fi
 
-# --- Test 3: escalate after 3 consecutive stale-but-skipped runs ------------
+# --- Test 3: already-installed binary matches origin/main exactly ----------
+# gt stale's (possibly lagging) view says stale, but the binary actually
+# installed right now already IS origin/main's tip. This must be treated as
+# "nothing to do", never as a build failure (regression: run.sh used to call
+# make anyway, which made check-forward-only's "already at HEAD" refusal
+# look like a build error and escalate a false alarm).
 
+echo "$ORIGIN_MAIN_SHA" > "$INSTALLED_SHA_FILE"
+: > "$MAKE_LOG"
+: > "$ESCALATE_LOG"
+rm -f "$SKIP_COUNT_FILE"
+
+run_rebuild >/dev/null 2>&1 || { echo "FAIL: already-fresh run exited non-zero"; FAILURES=$((FAILURES + 1)); }
+
+if [ -s "$MAKE_LOG" ]; then
+  echo "FAIL: make was invoked even though the installed binary already matches origin/main"
+  FAILURES=$((FAILURES + 1))
+fi
+
+if [ -s "$ESCALATE_LOG" ]; then
+  echo "FAIL: escalated even though the installed binary already matches origin/main"
+  FAILURES=$((FAILURES + 1))
+fi
+
+# --- Test 4: escalate after 3 consecutive stale-but-skipped runs ------------
+
+echo "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" > "$INSTALLED_SHA_FILE"
 rm -f "$SKIP_COUNT_FILE"
 : > "$ESCALATE_LOG"
 

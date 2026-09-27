@@ -54,12 +54,25 @@ skip_while_stale() {
   log "Skipping rebuild: $reason"
   record_run "Plugin: rebuild-gt [skipped]" "skipped" "Skipped: $reason"
 
+  # mkdir is atomic, so this serializes the read-modify-write below against
+  # an overlapping invocation (e.g. a manual --force run overlapping the
+  # cooldown-gated automatic one) that would otherwise race and silently
+  # drop a consecutive skip from the streak.
+  local lockdir="${SKIP_COUNT_FILE}.lock"
+  local waited=0
+  while ! mkdir "$lockdir" 2>/dev/null; do
+    waited=$((waited + 1))
+    [ "$waited" -ge 50 ] && break # ~5s: give up on the lock rather than hang
+    sleep 0.1
+  done
+
   local count=0
   if [ -f "$SKIP_COUNT_FILE" ]; then
     count=$(cat "$SKIP_COUNT_FILE" 2>/dev/null || echo 0)
   fi
   count=$((count + 1))
   echo "$count" > "$SKIP_COUNT_FILE" 2>/dev/null || true
+  rmdir "$lockdir" 2>/dev/null || true
 
   if [ $((count % SKIP_ESCALATE_THRESHOLD)) -eq 0 ]; then
     gt escalate "rebuild-gt: binary stale for $count consecutive skipped runs" -s high \
@@ -86,19 +99,13 @@ if [ "$IS_STALE" != "True" ]; then
   exit 0
 fi
 
-# From here on the binary IS stale: every exit below is either a successful
-# rebuild or a skip that must be recorded via skip_while_stale.
-
-IS_FORWARD=$(echo "$STALE_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('forward', False))" 2>/dev/null || echo "False")
-
-if [ "$IS_FORWARD" != "True" ]; then
-  # NOTE: deliberately not gating on gt stale's on_main_branch/safe_to_rebuild
-  # here — those reflect RIG_ROOT's checked-out branch, which is irrelevant
-  # now that we always build from a fresh origin/main checkout in BUILD_ROOT.
-  # "forward" itself is already computed against origin/main regardless of
-  # what branch RIG_ROOT happens to be on.
-  skip_while_stale "origin/main is not a forward descendant of the installed binary (would be a downgrade)"
-fi
+# From here on gt stale THINKS the binary is stale, based on RIG_ROOT's
+# possibly-lagging local knowledge of the build-branch ref (RIG_ROOT is never
+# fetched by this script). The forward-only decision below is deliberately
+# NOT taken from gt stale's "forward" field for the same reason: it's re-
+# derived after the fresh fetch, from BUILD_ROOT's real origin/main HEAD and
+# the binary actually installed right now, so a lagging RIG_ROOT view can
+# only cost an extra fetch+compare — never a wrong build/skip/failure call.
 
 # --- Pre-flight: dedicated build worktree ------------------------------------
 
@@ -126,6 +133,31 @@ fi
 
 if ! git -C "$BUILD_ROOT" checkout --detach --force origin/main --quiet; then
   skip_while_stale "failed to checkout origin/main in build worktree"
+fi
+
+# --- Forward-only check, against the binary actually installed right now ----
+#
+# Re-derives both sides fresh here (the commit really installed + BUILD_ROOT's
+# real origin/main HEAD) instead of trusting gt stale's cached "forward"
+# field, so a legitimate "nothing to do" or "would be a downgrade" outcome
+# (which make safe-install's check-forward-only would also refuse) is never
+# misreported as a build failure below.
+
+BUILD_HEAD=$(git -C "$BUILD_ROOT" rev-parse HEAD)
+INSTALLED_COMMIT=$(gt version --verbose 2>/dev/null | grep -o '@[a-f0-9]*' | head -1 | tr -d '@')
+
+if [ -n "$INSTALLED_COMMIT" ] && [ "$INSTALLED_COMMIT" != "unknown" ]; then
+  case "$BUILD_HEAD" in
+  "$INSTALLED_COMMIT"*)
+    log "Installed binary is already at origin/main ($BUILD_HEAD). Nothing to do."
+    record_run "rebuild-gt: binary is fresh" "success"
+    reset_skip_count
+    exit 0
+    ;;
+  esac
+  if ! git -C "$BUILD_ROOT" merge-base --is-ancestor "$INSTALLED_COMMIT" "$BUILD_HEAD" 2>/dev/null; then
+    skip_while_stale "origin/main ($BUILD_HEAD) is not a forward descendant of the installed binary ($INSTALLED_COMMIT) — would be a downgrade"
+  fi
 fi
 
 # --- Build -------------------------------------------------------------------
