@@ -202,10 +202,12 @@ func (d *Daemon) checkpointWorktree(workDir, rigName, polecatName string) bool {
 	// Protected branch comes from rig config only (gt-35un/gt-xitk MAYOR
 	// DESIGN RULING) — never from bead/branch data, which this patrol has
 	// no access to anyway.
-	rigPath := filepath.Join(d.config.TownRoot, rigName)
 	protectedBranch := "main"
-	if rigCfg, cfgErr := rig.LoadRigConfig(rigPath); cfgErr == nil && rigCfg.DefaultBranch != "" {
-		protectedBranch = rigCfg.DefaultBranch
+	if d.config != nil {
+		rigPath := filepath.Join(d.config.TownRoot, rigName)
+		if rigCfg, cfgErr := rig.LoadRigConfig(rigPath); cfgErr == nil && rigCfg.DefaultBranch != "" {
+			protectedBranch = rigCfg.DefaultBranch
+		}
 	}
 
 	result, err := git.AutoPreserveUncommittedWork(g, branch, git.PreserveOptions{
