@@ -100,24 +100,33 @@ func DiscoverDatabases(host string, port int) []string {
 
 // ScanResult holds the results of scanning a database for reaper candidates.
 type ScanResult struct {
-	Database               string    `json:"database"`
-	ReapCandidates         int       `json:"reap_candidates"`
-	MoleculeStepCandidates int       `json:"molecule_step_candidates,omitempty"`
-	PurgeCandidates        int       `json:"purge_candidates"`
-	MailCandidates         int       `json:"mail_candidates"`
-	StaleCandidates        int       `json:"stale_candidates"`
-	OpenWisps              int       `json:"open_wisps"`
-	Anomalies              []Anomaly `json:"anomalies,omitempty"`
+	Database               string `json:"database"`
+	ReapCandidates         int    `json:"reap_candidates"`
+	MoleculeStepCandidates int    `json:"molecule_step_candidates,omitempty"`
+	// FastTrackCandidates counts wisps/mail the fast-track closers would close
+	// at FastTrackCloseAge, independent of max-age (gt-oqnc). Not disjoint from
+	// ReapCandidates: a wisp past both windows appears in each.
+	FastTrackCandidates int       `json:"fast_track_candidates,omitempty"`
+	PurgeCandidates     int       `json:"purge_candidates"`
+	MailCandidates      int       `json:"mail_candidates"`
+	StaleCandidates     int       `json:"stale_candidates"`
+	OpenWisps           int       `json:"open_wisps"`
+	Anomalies           []Anomaly `json:"anomalies,omitempty"`
 }
 
 // ReapResult holds the results of a reap operation.
 type ReapResult struct {
-	Database            string    `json:"database"`
-	Reaped              int       `json:"reaped"`
-	MoleculeStepsClosed int       `json:"molecule_steps_closed,omitempty"`
-	OpenRemain          int       `json:"open_remain"`
-	DryRun              bool      `json:"dry_run,omitempty"`
-	Anomalies           []Anomaly `json:"anomalies,omitempty"`
+	Database            string `json:"database"`
+	Reaped              int    `json:"reaped"`
+	MoleculeStepsClosed int    `json:"molecule_steps_closed,omitempty"`
+	// FastTrackClosed counts closes made by the fast-track closers at
+	// FastTrackCloseAge. They are NOT part of Reaped: Reaped is exactly what
+	// the max-age predicate selected, so it can be compared with Scan's
+	// ReapCandidates (gt-oqnc).
+	FastTrackClosed int       `json:"fast_track_closed,omitempty"`
+	OpenRemain      int       `json:"open_remain"`
+	DryRun          bool      `json:"dry_run,omitempty"`
+	Anomalies       []Anomaly `json:"anomalies,omitempty"`
 }
 
 // PurgeResult holds the results of a purge operation.
@@ -486,6 +495,18 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 		parentJoin, moleculeStepExcludeJoin, agentJoin, openWispStatusWhere, agentWhere, parentWhere)
 	if err := db.QueryRowContext(ctx, reapQuery, now.Add(-maxAge)).Scan(&result.ReapCandidates); err != nil {
 		return nil, fmt.Errorf("count reap candidates: %w", err)
+	}
+
+	// Count fast-track candidates (gt-oqnc). `gt reaper reap` closes these at
+	// FastTrackCloseAge regardless of max-age; without counting them here a
+	// scan reported 0 while the reap that followed closed dozens.
+	fastTrack, fastTrackErrs := CloseFastTrack(db, dbName, true)
+	result.FastTrackCandidates = fastTrack
+	for _, err := range fastTrackErrs {
+		result.Anomalies = append(result.Anomalies, Anomaly{
+			Type:    "fast_track_scan_failed",
+			Message: fmt.Sprintf("count fast-track candidates: %v", err),
+		})
 	}
 
 	// Count purge candidates: closed wisps past purge_age.
@@ -1252,6 +1273,49 @@ func closeWispsByLabel(db *sql.DB, dbName, label string, maxAge time.Duration, k
 	}
 
 	return result, nil
+}
+
+// FastTrackCloseAge is the age past which ephemeral receipt and notification
+// wisps are eligible for fast-track closing during `gt reaper reap`. Far
+// shorter than the wisp max-age (24h) because these beads reach terminal value
+// within minutes — keeping them open for a full day is what pushes the
+// open-wisp count over the alert threshold. Mirrors the daemon inline path's
+// 1h plugin-receipt window (internal/daemon/wisp_reaper.go).
+const FastTrackCloseAge = 1 * time.Hour
+
+// FastTrackCloser is one label/age-driven closer that runs independently of the
+// max-age Reap.
+type FastTrackCloser struct {
+	Name string
+	Fn   func(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ClosePluginReceiptResult, error)
+}
+
+// FastTrackClosers is the single list Scan (dry-run) and `gt reaper reap` both
+// iterate, so a preview and a real run cannot disagree on what is closed
+// (gt-oqnc).
+var FastTrackClosers = []FastTrackCloser{
+	{"plugin receipts", ClosePluginReceipts},
+	{"plugin dispatches", ClosePluginDispatches},
+	{"stale notifications", CloseStaleNotifications},
+}
+
+// CloseFastTrack runs every fast-track closer at FastTrackCloseAge and returns
+// the total closed (or that would be closed when dryRun). A failing closer does
+// not stop the rest; its error is returned, prefixed with its name.
+func CloseFastTrack(db *sql.DB, dbName string, dryRun bool) (int, []error) {
+	total := 0
+	var errs []error
+	for _, fc := range FastTrackClosers {
+		res, err := fc.Fn(db, dbName, FastTrackCloseAge, dryRun)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", fc.Name, err))
+			continue
+		}
+		if res != nil {
+			total += res.Closed
+		}
+	}
+	return total, errs
 }
 
 // ClosePluginDispatches closes open dispatch mail beads created by the daemon

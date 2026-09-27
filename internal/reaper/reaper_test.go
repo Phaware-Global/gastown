@@ -804,6 +804,62 @@ func TestScanAndReapAgreeOnCandidateSet(t *testing.T) {
 	}
 }
 
+// TestFastTrackClosuresAreNotReapedAndScanPredictsThem is the gt-oqnc
+// regression. A parentless notification wisp carrying msg-type:notification is
+// closed by the fast-track closer at FastTrackCloseAge (1h), NOT by the
+// max-age Reap. Before the fix, `gt reaper reap` folded those closes into
+// "reaped" while Scan reported 0 candidates, so a 24h max-age reap looked like
+// it had closed 1h-old wisps outside its age predicate.
+func TestFastTrackClosuresAreNotReapedAndScanPredictsThem(t *testing.T) {
+	now := time.Now().UTC()
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"stale-notification": {id: "stale-notification", status: "open", issueType: "task", createdAt: now.Add(-2 * time.Hour), labels: []string{"gt:message", "msg-type:notification"}},
+			"fresh-notification": {id: "fresh-notification", status: "open", issueType: "task", createdAt: now.Add(-10 * time.Minute), labels: []string{"gt:message", "msg-type:notification"}},
+			"plain-task":         {id: "plain-task", status: "open", issueType: "task", createdAt: now.Add(-2 * time.Hour)},
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	maxAge := 24 * time.Hour
+	scan, err := Scan(db, "testdb", maxAge, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if scan.ReapCandidates != 0 {
+		t.Fatalf("scan.ReapCandidates = %d, want 0 (nothing is past the 24h max-age)", scan.ReapCandidates)
+	}
+	if scan.FastTrackCandidates != 1 {
+		t.Fatalf("scan.FastTrackCandidates = %d, want 1 (only stale-notification is past the fast-track window)", scan.FastTrackCandidates)
+	}
+
+	reap, err := Reap(db, "testdb", maxAge, false)
+	if err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if reap.Reaped != 0 {
+		t.Fatalf("Reap Reaped = %d, want 0: max-age reap must not close wisps younger than max-age", reap.Reaped)
+	}
+	if got := state.status("stale-notification"); got != "open" {
+		t.Fatalf("stale-notification status = %q after Reap, want open (fast-track is a separate, explicitly reported step)", got)
+	}
+
+	closed, errs := CloseFastTrack(db, "testdb", false)
+	if len(errs) != 0 {
+		t.Fatalf("CloseFastTrack errors: %v", errs)
+	}
+	if closed != scan.FastTrackCandidates {
+		t.Fatalf("CloseFastTrack closed %d, scan predicted %d", closed, scan.FastTrackCandidates)
+	}
+	for id, want := range map[string]string{"stale-notification": "closed", "fresh-notification": "open", "plain-task": "open"} {
+		if got := state.status(id); got != want {
+			t.Errorf("%s status = %q, want %q", id, got, want)
+		}
+	}
+}
+
 var fakeReaperDriverID uint64
 
 func openFakeReaperDB(t *testing.T, state *fakeReaperState) *sql.DB {
@@ -1001,6 +1057,25 @@ func (s *fakeReaperState) purgeCandidatesLocked(cutoff time.Time) []*fakeWisp {
 	return wisps
 }
 
+// labelledOpenBeforeLocked mirrors closeByLabelSelectQuery: open wisps carrying
+// label in wisp_labels that were created before cutoff.
+func (s *fakeReaperState) labelledOpenBeforeLocked(label string, cutoff time.Time) []string {
+	var ids []string
+	for id, w := range s.wisps {
+		if !isOpenWispStatus(w.status) || !w.createdAt.Before(cutoff) {
+			continue
+		}
+		for _, l := range w.labels {
+			if l == label {
+				ids = append(ids, id)
+				break
+			}
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 func (s *fakeReaperState) hasOpenParentLocked(id string) bool {
 	for _, dep := range s.deps {
 		if dep.issueID != id || dep.depType != "parent-child" {
@@ -1062,6 +1137,14 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 	c.state.record(c.id, "QUERY "+normalized)
 
 	switch {
+	case normalized == normalizeSQL(closeByLabelSelectQuery):
+		// args: label, cutoff (closeWispsByLabel).
+		label, _ := args[0].Value.(string)
+		cutoff, _ := args[1].Value.(time.Time)
+		return fakeIDRows(c.state.labelledOpenBeforeLocked(label, cutoff)), nil
+	case strings.Contains(normalized, "issues i INNER JOIN") && strings.Contains(normalized, "i.title LIKE 'Plugin:"):
+		// ClosePluginDispatches targets the issues table; no fixture rows.
+		return fakeIDRows(nil), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps w") && strings.Contains(normalized, "created_at <"):
 		if err := validateStaleWispQuery(normalized); err != nil {
 			return nil, err
@@ -1115,6 +1198,17 @@ func (c *fakeReaperConn) ExecContext(_ context.Context, query string, args []dri
 	c.state.record(c.id, "EXEC "+normalized)
 
 	switch {
+	case strings.HasPrefix(normalized, "UPDATE wisps SET status = 'closed', closed_at = NOW() WHERE id IN"):
+		// closeWispsByLabel's close: no agent guard, ids come from the label select.
+		affected := int64(0)
+		for _, arg := range args {
+			id, _ := arg.Value.(string)
+			if w := c.state.wisps[id]; w != nil && isOpenWispStatus(w.status) {
+				w.status = "closed"
+				affected++
+			}
+		}
+		return fakeReaperResult(affected), nil
 	case strings.HasPrefix(normalized, "UPDATE wisps LEFT JOIN") && strings.Contains(normalized, "SET wisps.status='closed'"):
 		if err := validateAgentGuardedUpdateQuery(normalized); err != nil {
 			return nil, err
