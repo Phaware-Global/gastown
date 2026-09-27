@@ -1,6 +1,7 @@
 package testutil
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -137,5 +138,35 @@ func TestNewIsolatedGTCommand_SetEnv(t *testing.T) {
 
 	if !hasDoltPort {
 		t.Error("NewIsolatedGTCommand stripped GT_DOLT_PORT")
+	}
+}
+
+// bd's metrics spooler writes under $HOME/.beads/eventsData and spawns a
+// detached `bd send-metrics` flusher that can create eventkit.lock there after
+// the test returns. Tests set HOME to a t.TempDir(), so the late write races
+// t.TempDir's RemoveAll ("directory not empty", gt-bglj). CleanGTEnv strips
+// BD_*, so it must re-assert BD_DISABLE_METRICS itself — including when the
+// caller's environment (e.g. a developer shell) never set it.
+func TestCleanGTEnv_DisablesBDMetrics(t *testing.T) {
+	cases := map[string]func(t *testing.T){
+		"unset":     func(t *testing.T) { t.Setenv("BD_DISABLE_METRICS", ""); os.Unsetenv("BD_DISABLE_METRICS") },
+		"set to 0":  func(t *testing.T) { t.Setenv("BD_DISABLE_METRICS", "0") },
+		"set to 1":  func(t *testing.T) { t.Setenv("BD_DISABLE_METRICS", "1") },
+		"set empty": func(t *testing.T) { t.Setenv("BD_DISABLE_METRICS", "") },
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			setup(t)
+
+			var got []string
+			for _, e := range CleanGTEnv("HOME=/tmp/test") {
+				if strings.HasPrefix(e, "BD_DISABLE_METRICS=") {
+					got = append(got, e)
+				}
+			}
+			if len(got) != 1 || got[0] != "BD_DISABLE_METRICS=1" {
+				t.Errorf("CleanGTEnv BD_DISABLE_METRICS entries = %q, want exactly [BD_DISABLE_METRICS=1]", got)
+			}
+		})
 	}
 }
