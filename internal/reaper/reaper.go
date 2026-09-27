@@ -1214,7 +1214,8 @@ const closeByLabelRequireSelectQuery = closeByLabelSelectQuery + `
 // commit" from DOLT_COMMIT is expected and not treated as an error.
 //
 // requireLabel, when non-empty, additionally requires the wisp to carry that
-// label (used to restrict notification fast-tracking to acked mail, gt-78xq).
+// label (CloseStaleNotifications passes readLabel so only mail read via
+// `gt mail read` is fast-tracked; delivery:acked is not a read signal, gt-78xq).
 func closeWispsByLabel(db *sql.DB, dbName, label string, maxAge time.Duration, kind string, dryRun bool, requireLabel string) (*ClosePluginReceiptResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultQueryTimeout)
 	defer cancel()
