@@ -32,7 +32,7 @@ Gets production data off this machine. Three layers:
 
 All logic lives in `run.sh`. This file intentionally carries no executable
 copy of it: the script is the only implementation, and it is the only place
-the remote-visibility guard is enforced.
+the Dolt-replication remote-visibility guard is enforced.
 
 ```bash
 cd <plugin dir> && bash run.sh
@@ -46,10 +46,14 @@ description. Report the script's output.
 
 ## Visibility guard
 
-See `visibility_guard.sh`. Before pushing any remote, `run.sh` resolves it to a
-GitHub `owner/repo` and checks its visibility via `gh api`. A push proceeds
-only when the repo is confirmed **private**. A public repo, a non-GitHub
-remote, a missing `gh`, or a failed lookup all refuse to push — fail closed,
-not fail open. A refusal is logged, counted separately from a normal push
-failure, escalated with a fingerprint, and surfaced in the cycle summary as
+See `visibility_guard.sh`. Before each native Dolt push (layer 3), `run.sh` resolves
+the remote to a GitHub `owner/repo` and checks its visibility via `gh api`. A
+push proceeds only when the repo is confirmed **private**. A public repo, a
+non-GitHub remote, a missing `gh`, or a failed lookup all refuse to push — fail
+closed, not fail open. A refusal is logged, counted separately from a normal
+push failure, escalated with a fingerprint, and surfaced in the cycle summary as
 `dolt_push_refused`.
+
+The JSONL git push (layer 2) is **not** visibility-checked: `run.sh` runs
+a plain git push of `main` to `origin` with no guard. Verify by hand that the backup repo's
+`origin` is private.

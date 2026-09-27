@@ -453,7 +453,7 @@ func TestParsePluginMD_FeedbackDialogWatcher(t *testing.T) {
 func TestStuckAgentDogRunScriptUsesCanonicalHeartbeatPath(t *testing.T) {
 	content, err := os.ReadFile(filepath.Join("..", "..", "plugins", "stuck-agent-dog", "run.sh"))
 	if err != nil {
-		t.Skipf("stuck-agent-dog run.sh not found (expected in plugins/): %v", err)
+		t.Fatalf("stuck-agent-dog run.sh must exist in plugins/ (it is the only implementation): %v", err)
 	}
 	script := string(content)
 
