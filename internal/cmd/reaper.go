@@ -300,7 +300,7 @@ Returns the count of reaped wisps. Use --dry-run to preview.`,
 					extra = fmt.Sprintf(" (+%d closed-molecule steps)", r.MoleculeStepsClosed)
 				}
 				if r.FastTrackClosed > 0 {
-					extra += fmt.Sprintf(" (+%d fast-track receipts/notifications, >%s old)", r.FastTrackClosed, reaper.FastTrackCloseAge)
+					extra += fmt.Sprintf(" (+%d fast-track receipts/read notifications, >%s old)", r.FastTrackClosed, reaper.FastTrackCloseAge)
 				}
 				fmt.Printf("%s: %sreaped %d wisps%s, %d open remain\n",
 					r.Database, prefix, r.Reaped, extra, r.OpenRemain)

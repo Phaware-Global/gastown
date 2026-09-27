@@ -1158,19 +1158,31 @@ type ClosePluginReceiptResult struct {
 // open-wisp-count escalation (receipts piled up until the generic 24h Reap,
 // leaving ~1 day's worth — well over the alert threshold — open at all times).
 func ClosePluginReceipts(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ClosePluginReceiptResult, error) {
-	return closeWispsByLabel(db, dbName, "type:plugin-run", maxAge, "plugin receipts", dryRun)
+	return closeWispsByLabel(db, dbName, "type:plugin-run", maxAge, "plugin receipts", dryRun, "")
 }
 
 // CloseStaleNotifications closes open one-way notification mail wisps older
 // than maxAge. These are fire-and-forget telegraph notifications (e.g. deacon
 // → mayor "Re: Plugin: …" receipts) labeled `msg-type:notification`. The
 // telegraph is one-way — recipients reply out of band (Jira/gh), so these
-// notifications are never acked or delivered and sit `delivery:pending`
-// forever. They are informational, not actionable, so closing them past a
+// notifications are informational, not actionable, so closing them past a
 // short window keeps the open-wisp count from drifting upward indefinitely.
+//
+// Only notifications the recipient has read (`delivery:acked`) are closed here
+// (gt-78xq). A nudge merely announces mail; the body exists only in the bead,
+// so closing a still-`delivery:pending` notification silently loses unread
+// mail. Pending ones fall back to the normal max-age Reap. FastTrackClosers
+// (and thus Scan's FastTrackCandidates) call this same function, so the
+// preview and the real close apply one predicate.
 func CloseStaleNotifications(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ClosePluginReceiptResult, error) {
-	return closeWispsByLabel(db, dbName, "msg-type:notification", maxAge, "stale notifications", dryRun)
+	return closeWispsByLabel(db, dbName, "msg-type:notification", maxAge, "stale notifications", dryRun, deliveryLabelAcked)
 }
+
+// deliveryLabelAcked is the wisp label mail.Router's read path sets once the
+// recipient has read the message (mail.DeliveryLabelAcked). Duplicated rather
+// than imported: this package is a leaf and must not depend on internal/mail.
+// Acked wins over a lingering delivery:pending (see internal/mail/delivery.go).
+const deliveryLabelAcked = "delivery:acked"
 
 // closeByLabelSelectQuery selects open wisps carrying a given label past a
 // cutoff. It targets the wisps/wisp_labels tables — the post-migration home of
@@ -1185,19 +1197,31 @@ const closeByLabelSelectQuery = `
 		AND l.label = ?
 		AND w.created_at < ?`
 
+// closeByLabelRequireSelectQuery is closeByLabelSelectQuery narrowed to wisps
+// that ALSO carry a second label (args: label, cutoff, requiredLabel).
+const closeByLabelRequireSelectQuery = closeByLabelSelectQuery + `
+		AND EXISTS (SELECT 1 FROM wisp_labels rl WHERE rl.issue_id = w.id AND rl.label = ?)`
+
 // closeWispsByLabel closes open wisps carrying the given label that are older
 // than maxAge. Shared by the plugin-receipt and notification fast-track
 // closers. Operates on the `wisps`/`wisp_labels` tables where ephemeral beads
 // live. The wisps table is dolt-ignored in most installs, so a "nothing to
 // commit" from DOLT_COMMIT is expected and not treated as an error.
-func closeWispsByLabel(db *sql.DB, dbName, label string, maxAge time.Duration, kind string, dryRun bool) (*ClosePluginReceiptResult, error) {
+//
+// requireLabel, when non-empty, additionally requires the wisp to carry that
+// label (used to restrict notification fast-tracking to acked mail, gt-78xq).
+func closeWispsByLabel(db *sql.DB, dbName, label string, maxAge time.Duration, kind string, dryRun bool, requireLabel string) (*ClosePluginReceiptResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultQueryTimeout)
 	defer cancel()
 
 	cutoff := time.Now().UTC().Add(-maxAge)
 	result := &ClosePluginReceiptResult{Database: dbName, DryRun: dryRun}
 
-	rows, err := db.QueryContext(ctx, closeByLabelSelectQuery, label, cutoff)
+	selectQuery, selectArgs := closeByLabelSelectQuery, []interface{}{label, cutoff}
+	if requireLabel != "" {
+		selectQuery, selectArgs = closeByLabelRequireSelectQuery, append(selectArgs, requireLabel)
+	}
+	rows, err := db.QueryContext(ctx, selectQuery, selectArgs...)
 	if err != nil {
 		if isTableNotFound(err) {
 			return result, nil

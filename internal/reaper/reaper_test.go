@@ -814,8 +814,8 @@ func TestFastTrackClosuresAreNotReapedAndScanPredictsThem(t *testing.T) {
 	now := time.Now().UTC()
 	state := &fakeReaperState{
 		wisps: map[string]*fakeWisp{
-			"stale-notification": {id: "stale-notification", status: "open", issueType: "task", createdAt: now.Add(-2 * time.Hour), labels: []string{"gt:message", "msg-type:notification"}},
-			"fresh-notification": {id: "fresh-notification", status: "open", issueType: "task", createdAt: now.Add(-10 * time.Minute), labels: []string{"gt:message", "msg-type:notification"}},
+			"stale-notification": {id: "stale-notification", status: "open", issueType: "task", createdAt: now.Add(-2 * time.Hour), labels: []string{"gt:message", "msg-type:notification", "delivery:acked"}},
+			"fresh-notification": {id: "fresh-notification", status: "open", issueType: "task", createdAt: now.Add(-10 * time.Minute), labels: []string{"gt:message", "msg-type:notification", "delivery:acked"}},
 			"plain-task":         {id: "plain-task", status: "open", issueType: "task", createdAt: now.Add(-2 * time.Hour)},
 		},
 		ops: map[int][]string{},
@@ -955,6 +955,16 @@ type fakeWisp struct {
 	// here and NOT in labels (wisp_labels only gets it via an out-of-band
 	// repair), so this must be checked independently of labels above (gt-7a7j).
 	issueLabels []string
+}
+
+// hasLabel reports whether w carries label in wisp_labels.
+func (w *fakeWisp) hasLabel(label string) bool {
+	for _, l := range w.labels {
+		if l == label {
+			return true
+		}
+	}
+	return false
 }
 
 // isAgentWisp reports whether w is excluded by notAgentWispJoin: the
@@ -1208,6 +1218,18 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 		label, _ := args[0].Value.(string)
 		cutoff, _ := args[1].Value.(time.Time)
 		return fakeIDRows(c.state.labelledOpenBeforeLocked(label, cutoff)), nil
+	case normalized == normalizeSQL(closeByLabelRequireSelectQuery):
+		// args: label, cutoff, requiredLabel (closeWispsByLabel with requireLabel).
+		label, _ := args[0].Value.(string)
+		cutoff, _ := args[1].Value.(time.Time)
+		required, _ := args[2].Value.(string)
+		var ids []string
+		for _, id := range c.state.labelledOpenBeforeLocked(label, cutoff) {
+			if c.state.wisps[id].hasLabel(required) {
+				ids = append(ids, id)
+			}
+		}
+		return fakeIDRows(ids), nil
 	case strings.Contains(normalized, "issues i INNER JOIN") && strings.Contains(normalized, "i.title LIKE 'Plugin:"):
 		// ClosePluginDispatches targets the issues table; no fixture rows.
 		return fakeIDRows(nil), nil
