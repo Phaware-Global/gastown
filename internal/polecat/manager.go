@@ -1187,18 +1187,16 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 		if branch == "HEAD" && nuclear {
 			style.PrintWarning("worktree %s is on a detached HEAD — nuclear removal skips local auto-preserve here (no branch ref would survive worktree teardown to hold the commit); any uncommitted work is discarded", name)
 		} else if result, presErr := git.AutoPreserveUncommittedWork(preserveGit, branch, git.PreserveOptions{
-			IssueID: name,
-			Push:    !nuclear,
-			// The WIP prefix is what HasWIPCommit's push-site backstop
-			// matches; a snapshot without it would slip past that guard.
-			CommitMessage:     checkpoint.WIPCommitPrefix + " (" + name + ")",
-			ProtectedBranches: []string{m.rig.DefaultBranch()},
+			IssueID:       name,
+			CommitMessage: checkpoint.WIPCommitPrefix + " (" + name + ")",
 			// gt-94p1 root fix: this worktree may be a reused directory
 			// whose leftover uncommitted content has nothing to do with
-			// the branch it happens to be on right now. Ephemeral snapshots
-			// it without touching the branch (pushed only to the
-			// preservation ref), so the best-effort branch push below only
-			// ever republishes commits the agent genuinely made itself.
+			// the branch it happens to be on right now. Ephemeral records
+			// it as a snapshot in a LOCAL ref (refs/gt/preserve/..., in the
+			// shared repository, so it outlives this worktree) without
+			// touching the branch and without pushing anything, so the
+			// best-effort branch push below only ever republishes commits
+			// the agent genuinely made itself.
 			Ephemeral: true,
 		}); presErr != nil {
 			// A detached HEAD has no ref surviving worktree teardown to
@@ -1213,11 +1211,9 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 				return fmt.Errorf("could not auto-preserve work in %s before removing a detached-HEAD worktree, and removal would discard any uncommitted commit with no recoverable ref: %w (use force to remove anyway)", name, presErr)
 			}
 			style.PrintWarning("could not auto-preserve work in %s before removal: %v", name, presErr)
-		} else if result.Pushed {
-			fmt.Printf("%s Preserved uncommitted work for %s: pushed %s to %s\n",
+		} else if result.Committed {
+			fmt.Printf("%s Preserved uncommitted work for %s locally: %s at %s\n",
 				style.Bold.Render("✓"), name, result.Commit, result.Ref)
-		} else if result.HooksFailed {
-			style.PrintWarning("preserved uncommitted work for %s LOCALLY ONLY — its pre-commit hook FAILED, so it was not pushed (worktree is about to be removed): %s", name, result.HookOutput)
 		}
 	}
 

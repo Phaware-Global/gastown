@@ -1435,11 +1435,11 @@ func TestReuseIdlePolecat_ResumeBranchHardSyncsAwayStaleContent(t *testing.T) {
 	// CLAUDE.md is expected scaffolding, not stale content.
 }
 
-// TestRemoveWithOptions_PreservesDirtyWorkAsWIPSnapshotWithoutMovingBranch pins
-// gt-94p1: the pre-removal preserve records the work under a WIP-prefixed
-// commit (so the push-site backstop recognizes it) on the preservation ref
-// only — the polecat's branch is never advanced.
-func TestRemoveWithOptions_PreservesDirtyWorkAsWIPSnapshotWithoutMovingBranch(t *testing.T) {
+// TestRemoveWithOptions_PreservesDirtyWorkLocallyWithoutMovingBranchOrPushing
+// pins gt-94p1: the pre-removal preserve records the work in a LOCAL ref that
+// outlives the worktree, never advances the polecat's branch, and pushes
+// nothing.
+func TestRemoveWithOptions_PreservesDirtyWorkLocallyWithoutMovingBranchOrPushing(t *testing.T) {
 	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
 
 	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
@@ -1459,19 +1459,22 @@ func TestRemoveWithOptions_PreservesDirtyWorkAsWIPSnapshotWithoutMovingBranch(t 
 		t.Fatalf("RemoveWithOptions: %v", err)
 	}
 
-	// origin is mayorRig itself in this fixture.
-	out, err := exec.Command("git", "-C", mayorRig, "for-each-ref", "--format=%(refname) %(subject)", "refs/heads/polecat/preserve-*").Output()
-	if err != nil {
-		t.Fatalf("for-each-ref: %v", err)
+	// The worktree is gone, but the snapshot ref survives in the shared repo
+	// (mayorRig is that repo in this fixture) and holds the dirty content.
+	ref := git.LocalPreservationRefName(polecat.Branch)
+	out, err := exec.Command("git", "-C", mayorRig, "show", ref+":README.md").Output()
+	if err != nil || string(out) != "# Test\nunsaved polecat work\n" {
+		t.Fatalf("local preserve ref %s does not hold the dirty content after removal: %q (err %v)", ref, out, err)
 	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) != 1 || lines[0] == "" {
-		t.Fatalf("want exactly one preservation ref after removal, got %q", out)
-	}
-	if !strings.Contains(lines[0], checkpoint.WIPCommitPrefix) {
-		t.Fatalf("preservation commit %q lacks the WIP prefix %q — HasWIPCommit's backstop cannot recognize it", lines[0], checkpoint.WIPCommitPrefix)
+	subj, err := exec.Command("git", "-C", mayorRig, "log", "-1", "--format=%s", ref).Output()
+	if err != nil || !strings.Contains(string(subj), checkpoint.WIPCommitPrefix) {
+		t.Fatalf("preservation commit subject %q lacks the WIP prefix %q (err %v)", subj, checkpoint.WIPCommitPrefix, err)
 	}
 
+	// Nothing was pushed: origin is mayorRig itself, so no remote-style preserve ref.
+	if refs, _ := exec.Command("git", "-C", mayorRig, "for-each-ref", "refs/heads/polecat/preserve-*").Output(); len(strings.TrimSpace(string(refs))) != 0 {
+		t.Fatalf("a preserve ref was pushed: %s", refs)
+	}
 	branchTip, err := exec.Command("git", "-C", mayorRig, "rev-parse", "refs/heads/"+polecat.Branch).Output()
 	if err == nil && strings.TrimSpace(string(branchTip)) != headBefore {
 		t.Fatalf("polecat branch %s moved to %s, want it left at %s", polecat.Branch, strings.TrimSpace(string(branchTip)), headBefore)

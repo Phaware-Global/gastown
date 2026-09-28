@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/steveyegge/gastown/internal/checkpoint"
 	"github.com/steveyegge/gastown/internal/git"
 )
 
@@ -258,15 +257,10 @@ func newTestDaemon() *Daemon {
 	return &Daemon{logger: log.New(io.Discard, "", 0)}
 }
 
-func TestCheckpointWorktree_CommitsAndPushesPreserveRef(t *testing.T) {
+func TestCheckpointWorktree_RecordsLocalSnapshotAndNeverPushes(t *testing.T) {
 	workDir := initCheckpointTestRepo(t)
-	// initCheckpointTestRepo lays out <tmp>/remote.git next to <tmp>/local
-	// (the returned workDir) — see its definition below.
+	// initCheckpointTestRepo lays out <tmp>/remote.git next to <tmp>/local.
 	remoteDir := filepath.Join(filepath.Dir(workDir), "remote.git")
-	// Modify a file already tracked by initCheckpointTestRepo's initial
-	// commit: staging is `git add -u` (allowlist, gt-i4ej FIX 1), which only
-	// picks up changes to files git already tracks, never new untracked
-	// files (see the matching comment in preserve_test.go).
 	if err := os.WriteFile(filepath.Join(workDir, "README.md"), []byte("# Test\nmodified\n"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -282,7 +276,7 @@ func TestCheckpointWorktree_CommitsAndPushesPreserveRef(t *testing.T) {
 		t.Fatal("expected checkpointWorktree to report a preservation")
 	}
 
-	// gt-94p1 root fix: a checkpoint must NEVER move the branch. If the WIP
+	// gt-94p1 root fix: a checkpoint must NEVER move the branch. If a WIP
 	// commit stayed on HEAD, any later ordinary push of this branch (the
 	// polecat's own push, gt done, a pre-nuke push) would carry it to a real
 	// PR branch — the mechanism behind gt-2stz's four incidents.
@@ -294,35 +288,18 @@ func TestCheckpointWorktree_CommitsAndPushesPreserveRef(t *testing.T) {
 		t.Fatalf("branch HEAD moved from %s to %s — a checkpoint must leave the branch exactly where it was", headBefore, headAfter)
 	}
 
-	// A test named "...AndPushesPreserveRef" must actually verify the push:
-	// mutation testing showed the previous version here stayed green with
-	// Push:true deleted entirely, because it only ever inspected `git log`
-	// on the local worktree (PR #184 review). Derive the expected ref name
-	// from the function under test rather than hand-writing it, and check
-	// the bare remote directly.
-	wantRef := git.PreservationRefName("polecat/foo/bead@1")
-	lsOut, err := exec.Command("git", "ls-remote", "--heads", remoteDir, wantRef).Output()
+	// The snapshot is a LOCAL ref holding the dirty content...
+	ref := git.LocalPreservationRefName("polecat/foo/bead@1")
+	if out, err := exec.Command("git", "-C", workDir, "show", ref+":README.md").Output(); err != nil || string(out) != "# Test\nmodified\n" {
+		t.Fatalf("local ref %s does not hold the dirty content: %q (err %v)", ref, out, err)
+	}
+	// ...and nothing new reached the remote (only main was pushed by the fixture).
+	lsOut, err := exec.Command("git", "ls-remote", remoteDir).Output()
 	if err != nil {
 		t.Fatalf("ls-remote: %v", err)
 	}
-	fields := strings.Fields(string(lsOut))
-	if len(fields) < 2 {
-		t.Fatalf("preservation ref %q was not pushed to the bare remote (ls-remote returned %q)", wantRef, lsOut)
-	}
-	preservedSHA := fields[0]
-	if preservedSHA == headBefore {
-		t.Fatalf("preservation ref %s points at the unchanged branch head %s — the checkpoint commit was not what got pushed", wantRef, headBefore)
-	}
-
-	// The WIP subject now lives ONLY on the preservation ref's commit. The
-	// commit object exists locally too (it was made here before being
-	// rolled off the branch), so it can be inspected directly.
-	subjOut, err := exec.Command("git", "-C", workDir, "log", "-1", "--format=%s", preservedSHA).Output()
-	if err != nil {
-		t.Fatalf("git log %s: %v", preservedSHA, err)
-	}
-	if got := string(subjOut); got != checkpoint.WIPCommitPrefix+"\n" {
-		t.Fatalf("preserved commit subject = %q, want %q", got, checkpoint.WIPCommitPrefix)
+	if strings.Contains(string(lsOut), "preserve") || strings.Contains(string(lsOut), "bead@1") {
+		t.Fatalf("a checkpoint must never push; remote has:\n%s", lsOut)
 	}
 }
 

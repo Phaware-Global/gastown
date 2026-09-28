@@ -95,14 +95,18 @@ func TestEphemeralPreserve_LeavesHeadBranchIndexAndMergeHeadByteIdentical(t *tes
 	writeTestFile(t, dir, "README.md", "# Test\nstaged\nunstaged\n")
 
 	before := captureRepoState(t, dir, branch)
+	statusBefore := gitOut(t, dir, "status", "--porcelain")
 	result, err := AutoPreserveUncommittedWork(g, branch, opts)
 	if err != nil {
 		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
 	}
-	if !result.Committed || !result.Pushed {
-		t.Fatalf("expected a pushed snapshot, got %+v", result)
+	if !result.Committed || result.Pushed {
+		t.Fatalf("expected a local-only snapshot, got %+v", result)
 	}
 	requireSameRepoState(t, before, captureRepoState(t, dir, branch))
+	if got := gitOut(t, dir, "status", "--porcelain"); got != statusBefore {
+		t.Errorf("working tree status changed: %q, was %q", got, statusBefore)
+	}
 
 	// The snapshot is the WORKTREE content, a child of the untouched HEAD,
 	// and it is what the preservation ref holds.
@@ -112,11 +116,11 @@ func TestEphemeralPreserve_LeavesHeadBranchIndexAndMergeHeadByteIdentical(t *tes
 	if parent := gitOut(t, dir, "rev-parse", result.Commit+"^"); parent != before.head {
 		t.Errorf("snapshot parent = %s, want HEAD %s", parent, before.head)
 	}
-	if subj := gitOut(t, dir, "log", "-1", "--format=%s", result.Commit); subj != testWIPMessage {
-		t.Errorf("snapshot subject = %q, want %q", subj, testWIPMessage)
+	if subj := gitOut(t, dir, "log", "-1", "--format=%s", result.Commit); !strings.HasSuffix(subj, testWIPMessage) {
+		t.Errorf("snapshot subject = %q, want it to end with %q", subj, testWIPMessage)
 	}
-	if tip, err := g.RemoteBranchTip("origin", result.Ref); err != nil || tip != result.Commit {
-		t.Errorf("preservation ref tip = %q (err %v), want %s", tip, err, result.Commit)
+	if got := gitOut(t, dir, "rev-parse", LocalPreservationRefName(branch)); got != result.Commit || result.Ref != LocalPreservationRefName(branch) {
+		t.Errorf("local preserve ref = %s (result.Ref %q), want %s", got, result.Ref, result.Commit)
 	}
 	// The work is still uncommitted where the agent left it.
 	if gitOut(t, dir, "status", "--porcelain") == "" {
@@ -160,38 +164,6 @@ func TestEphemeralPreserve_RefusesWhileMergeHeadExists(t *testing.T) {
 	}
 }
 
-func TestEphemeralPreserve_UnverifiedAncestorStillSnapshotsLocally(t *testing.T) {
-	branch := "polecat/foo/gt-94p1@unverified"
-	dir, g, opts := ephemeralFixture(t, branch)
-	commitUnverified(t, dir, "bypassed.txt", "no-verify work", "bypassed hooks")
-	writeTestFile(t, dir, "README.md", "# Test\nprecious uncommitted work\n")
-
-	before := captureRepoState(t, dir, branch)
-	result, err := AutoPreserveUncommittedWork(g, branch, opts)
-	if err != nil {
-		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
-	}
-	if !result.HooksFailed {
-		t.Fatalf("an unverified ancestor must report HooksFailed, got %+v", result)
-	}
-	if result.Pushed {
-		t.Fatal("nothing descended from an unverified commit may be pushed")
-	}
-	if !result.Committed || result.Commit == "" {
-		t.Fatalf("the work must still be snapshotted and reported (callers print 'preserved locally'), got %+v", result)
-	}
-	requireSameRepoState(t, before, captureRepoState(t, dir, branch))
-	if got := gitOut(t, dir, "rev-parse", "refs/preserve/"+PreservationRefName(branch)); got != result.Commit {
-		t.Fatalf("local preserve ref = %s, want %s", got, result.Commit)
-	}
-	if got := gitOut(t, dir, "show", result.Commit+":README.md"); got != "# Test\nprecious uncommitted work" {
-		t.Fatalf("snapshot README.md = %q, want the worktree content", got)
-	}
-	if tip, _ := g.RemoteBranchTip("origin", PreservationRefName(branch)); tip != "" {
-		t.Fatalf("nothing may reach origin, preserve ref tip = %s", tip)
-	}
-}
-
 func writePreCommitHook(t *testing.T, dir, script string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -205,173 +177,65 @@ func writePreCommitHook(t *testing.T, dir, script string) {
 
 // The snapshot is made with commit-tree, which runs no hooks; the configured
 // pre-commit hook (typically the secret scanner) must still gate the push.
-func TestEphemeralPreserve_PreCommitHookFailureBlocksPush(t *testing.T) {
-	branch := "polecat/foo/gt-94p1@secret"
-	dir, g, opts := ephemeralFixture(t, branch)
-	writePreCommitHook(t, dir, `if git diff --cached | grep -q AKIAFAKEKEY; then echo "secret AKIAFAKEKEY found" >&2; exit 1; fi`)
-	writeTestFile(t, dir, "README.md", "# Test\naws_key=AKIAFAKEKEY\n")
-
-	before := captureRepoState(t, dir, branch)
-	result, err := AutoPreserveUncommittedWork(g, branch, opts)
-	if err != nil {
-		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
-	}
-	if !result.HooksFailed || result.Pushed {
-		t.Fatalf("a failing pre-commit hook must set HooksFailed and block the push, got %+v", result)
-	}
-	if strings.Contains(result.HookOutput, "AKIAFAKEKEY") {
-		t.Fatalf("HookOutput must not echo the matched secret: %q", result.HookOutput)
-	}
-	if !result.Committed || result.Commit == "" {
-		t.Fatalf("the work must still be pinned locally, got %+v", result)
-	}
-	requireSameRepoState(t, before, captureRepoState(t, dir, branch))
-	if got := gitOut(t, dir, "rev-parse", "refs/preserve/"+PreservationRefName(branch)); got != result.Commit {
-		t.Fatalf("local preserve ref = %s, want %s", got, result.Commit)
-	}
-	if tip, _ := g.RemoteBranchTip("origin", PreservationRefName(branch)); tip != "" {
-		t.Fatalf("the secret must not reach origin, preserve ref tip = %s", tip)
-	}
-}
-
-func TestEphemeralPreserve_PassingPreCommitHookStillPushes(t *testing.T) {
-	branch := "polecat/foo/gt-94p1@cleanhook"
-	dir, g, opts := ephemeralFixture(t, branch)
-	writePreCommitHook(t, dir, `if git diff --cached | grep -q AKIAFAKEKEY; then exit 1; fi`)
-	writeTestFile(t, dir, "README.md", "# Test\nharmless\n")
-
-	result, err := AutoPreserveUncommittedWork(g, branch, opts)
-	if err != nil || result.HooksFailed || !result.Pushed {
-		t.Fatalf("a passing hook must not block the push, got %+v err=%v", result, err)
-	}
-}
-
-func TestEphemeralPreserve_FailedPushLeavesBranchUntouched(t *testing.T) {
-	branch := "polecat/foo/gt-94p1@pushfail"
-	dir, g, opts := ephemeralFixture(t, branch)
-	writeTestFile(t, dir, "README.md", "# Test\nwork\n")
-
-	goodURL := gitOut(t, dir, "remote", "get-url", "origin")
-	runGitTestCmd(t, dir, "remote", "set-url", "--push", "origin", filepath.Join(t.TempDir(), "no-such-remote.git"))
-
-	before := captureRepoState(t, dir, branch)
-	if _, err := AutoPreserveUncommittedWork(g, branch, opts); err == nil {
-		t.Fatal("expected the push to fail")
-	}
-	requireSameRepoState(t, before, captureRepoState(t, dir, branch))
-
-	// A later cycle with the remote back must not find a stranded snapshot.
-	runGitTestCmd(t, dir, "remote", "set-url", "--push", "origin", goodURL)
-	result, err := AutoPreserveUncommittedWork(g, branch, opts)
-	if err != nil || !result.Pushed {
-		t.Fatalf("retry: result %+v, err %v", result, err)
-	}
-	requireSameRepoState(t, before, captureRepoState(t, dir, branch))
-	if gitOut(t, dir, "log", "--format=%s", "HEAD") == testWIPMessage {
-		t.Fatal("the branch carries a WIP commit")
-	}
-}
-
-func TestEphemeralPreserve_ConcurrentAgentCommitIsNeverDropped(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell hook script not portable to windows")
-	}
-	branch := "polecat/foo/gt-94p1@race"
-	dir, g, opts := ephemeralFixture(t, branch)
-	writeTestFile(t, dir, "README.md", "# Test\nwork\n")
-
-	// Stands in for the live agent: it commits during the preserve's push
-	// window, the interval in which a rollback-based design loses it.
-	hook := "#!/bin/sh\nunset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE\ngit -C '" + dir + "' commit --allow-empty -q -m 'agent real commit'\n"
-	if err := os.WriteFile(filepath.Join(dir, ".git", "hooks", "pre-push"), []byte(hook), 0755); err != nil {
-		t.Fatalf("write hook: %v", err)
-	}
-
-	before := captureRepoState(t, dir, branch)
-	if _, err := AutoPreserveUncommittedWork(g, branch, opts); err != nil {
-		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
-	}
-	if got := gitOut(t, dir, "log", "-1", "--format=%s", "HEAD"); got != "agent real commit" {
-		t.Fatalf("HEAD subject = %q — the agent's concurrent commit was dropped", got)
-	}
-	if got := gitOut(t, dir, "rev-parse", "HEAD^"); got != before.head {
-		t.Fatalf("agent commit's parent = %s, want %s", got, before.head)
-	}
-}
-
 func TestEphemeralPreserve_DetachedHeadReusesOneRefAcrossCycles(t *testing.T) {
 	dir := initTestRepo(t)
-	protected := addTestOriginRemote(t, dir)
+	addTestOriginRemote(t, dir)
 	g := NewGit(dir)
 	runGitTestCmd(t, dir, "checkout", "--detach")
-	opts := PreserveOptions{IssueID: "furiosa", Push: true, CommitMessage: testWIPMessage, ProtectedBranches: []string{protected}, Ephemeral: true}
+	opts := PreserveOptions{IssueID: "furiosa", CommitMessage: testWIPMessage, Ephemeral: true}
 
 	writeTestFile(t, dir, "README.md", "# Test\ncycle one\n")
 	first, err := AutoPreserveUncommittedWork(g, "HEAD", opts)
-	if err != nil || !first.Pushed {
+	if err != nil || !first.Committed {
 		t.Fatalf("cycle 1: %+v, err %v", first, err)
 	}
 	writeTestFile(t, dir, "README.md", "# Test\ncycle two\n")
 	second, err := AutoPreserveUncommittedWork(g, "HEAD", opts)
-	if err != nil || !second.Pushed {
+	if err != nil || !second.Committed {
 		t.Fatalf("cycle 2: %+v, err %v", second, err)
 	}
 	if first.Ref != second.Ref {
-		t.Fatalf("cycle refs differ: %s vs %s — a new permanent remote ref per cycle", first.Ref, second.Ref)
+		t.Fatalf("cycle refs differ: %s vs %s — a new ref per cycle", first.Ref, second.Ref)
 	}
 	if second.Commit == first.Commit {
-		t.Fatal("cycle 2 should have pushed a fresh snapshot of the changed work")
+		t.Fatal("cycle 2 should have recorded a fresh snapshot of the changed work")
 	}
-	remote := gitOut(t, dir, "remote", "get-url", "origin")
-	if refs := gitOut(t, dir, "ls-remote", "--heads", remote, "polecat/preserve-detached-*"); len(strings.Split(refs, "\n")) != 1 {
-		t.Fatalf("want exactly one detached preservation ref on the remote, got:\n%s", refs)
+	if refs := gitOut(t, dir, "for-each-ref", "refs/gt/preserve/"); len(strings.Split(refs, "\n")) != 1 {
+		t.Fatalf("want exactly one detached preservation ref, got:\n%s", refs)
 	}
 }
 
-func TestEphemeralPreserve_UnchangedWorkIsNotRepushedEachCycle(t *testing.T) {
+func TestEphemeralPreserve_UnchangedWorkIsNotRerecordedEachCycle(t *testing.T) {
 	branch := "polecat/foo/gt-94p1@dedupe"
 	dir, g, opts := ephemeralFixture(t, branch)
 	writeTestFile(t, dir, "README.md", "# Test\nwork\n")
 
 	first, err := AutoPreserveUncommittedWork(g, branch, opts)
-	if err != nil || !first.Pushed {
+	if err != nil || !first.Committed {
 		t.Fatalf("first: %+v, err %v", first, err)
 	}
 	second, err := AutoPreserveUncommittedWork(g, branch, opts)
 	if err != nil {
 		t.Fatalf("second: %v", err)
 	}
-	if second.Pushed || second.Committed {
+	if second.Committed {
 		t.Fatalf("an unchanged dirty tree must not be re-snapshotted, got %+v", second)
 	}
-	if tip, _ := g.RemoteBranchTip("origin", first.Ref); tip != first.Commit {
-		t.Fatalf("preservation ref moved to %s, want it left at %s", tip, first.Commit)
+	if got := gitOut(t, dir, "rev-parse", first.Ref); got != first.Commit {
+		t.Fatalf("preservation ref moved to %s, want it left at %s", got, first.Commit)
 	}
 }
 
-func TestEphemeralPreserve_SnapshotIsAnAllowlistOfTrackedModifications(t *testing.T) {
-	branch := "polecat/foo/gt-94p1@allow"
+// Untracked files are never captured; tracked modifications are.
+func TestEphemeralPreserve_CapturesTrackedChangesNotUntrackedFiles(t *testing.T) {
+	branch := "polecat/foo/gt-94p1@tracked"
 	dir, g, opts := ephemeralFixture(t, branch)
-	writeTestFile(t, dir, "notes.txt", "notes\n")
-	writeTestFile(t, dir, "CLAUDE.local.md", "overlay\n")
-	writeTestFile(t, dir, "extra.txt", "extra\n")
-	runGitTestCmd(t, dir, "add", "notes.txt", "CLAUDE.local.md", "extra.txt")
-	runGitTestCmd(t, dir, "commit", "-m", "track files")
+	writeTestFile(t, dir, "README.md", "# Test\nedited\n")
+	writeTestFile(t, dir, ".env", "SECRET=1\n") // untracked
 	head := gitOut(t, dir, "rev-parse", "HEAD")
 
-	writeTestFile(t, dir, "README.md", "# Test\nedited\n") // kept
-	writeTestFile(t, dir, "CLAUDE.local.md", "changed\n")  // runtime artifact
-	writeTestFile(t, dir, "extra.txt", "changed\n")        // ExtraExcludePaths
-	if err := os.Remove(filepath.Join(dir, "notes.txt")); err != nil {
-		t.Fatal(err)
-	}
-	writeTestFile(t, dir, ".env", "SECRET=1\n")      // untracked
-	writeTestFile(t, dir, "staged-new.txt", "new\n") // added to the index only
-	runGitTestCmd(t, dir, "add", "staged-new.txt")
-	opts.ExtraExcludePaths = []string{"extra.txt"}
-
 	result, err := AutoPreserveUncommittedWork(g, branch, opts)
-	if err != nil || !result.Pushed {
+	if err != nil || !result.Committed {
 		t.Fatalf("result %+v, err %v", result, err)
 	}
 	if got := gitOut(t, dir, "diff-tree", "-r", "--no-renames", "--name-status", head, result.Commit); got != "M\tREADME.md" {
@@ -393,41 +257,6 @@ func TestEphemeralPreserve_NothingModifiedMakesNoSnapshot(t *testing.T) {
 		t.Fatalf("expected a no-op, got %+v", result)
 	}
 	requireSameRepoState(t, before, captureRepoState(t, dir, branch))
-}
-
-func TestEphemeralPreserve_PreservesAgentsOwnUnpushedCommits(t *testing.T) {
-	branch := "polecat/foo/gt-94p1@real"
-	dir, g, opts := ephemeralFixture(t, branch)
-	writeTestFile(t, dir, "real.txt", "real work\n")
-	runGitTestCmd(t, dir, "add", "real.txt")
-	runGitTestCmd(t, dir, "commit", "-m", "real work, not a checkpoint")
-
-	before := captureRepoState(t, dir, branch)
-	result, err := AutoPreserveUncommittedWork(g, branch, opts)
-	if err != nil {
-		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
-	}
-	if result.Committed || !result.Pushed || result.Commit != before.head {
-		t.Fatalf("want the agent's own commit pushed to the preservation ref without a snapshot, got %+v", result)
-	}
-	requireSameRepoState(t, before, captureRepoState(t, dir, branch))
-}
-
-func TestEphemeralPreserve_WithoutPushPinsSnapshotUnderLocalRef(t *testing.T) {
-	branch := "polecat/foo/gt-94p1@nopush"
-	dir, g, opts := ephemeralFixture(t, branch)
-	opts.Push = false
-	writeTestFile(t, dir, "README.md", "# Test\nwork\n")
-
-	before := captureRepoState(t, dir, branch)
-	result, err := AutoPreserveUncommittedWork(g, branch, opts)
-	if err != nil || !result.Committed || result.Pushed {
-		t.Fatalf("result %+v, err %v", result, err)
-	}
-	requireSameRepoState(t, before, captureRepoState(t, dir, branch))
-	if got := gitOut(t, dir, "rev-parse", "refs/preserve/"+PreservationRefName(branch)); got != result.Commit {
-		t.Fatalf("local preserve ref = %s, want %s", got, result.Commit)
-	}
 }
 
 func TestEphemeralPreserve_RefusesUnmergedConflictsWithoutTouchingState(t *testing.T) {
@@ -456,16 +285,6 @@ func TestEphemeralPreserve_RefusesUnmergedConflictsWithoutTouchingState(t *testi
 	requireSameRepoState(t, before, captureRepoState(t, dir, "feature"))
 }
 
-func TestEphemeralPreserve_RequiresWIPCommitMessage(t *testing.T) {
-	branch := "polecat/foo/gt-94p1@nomsg"
-	dir, g, opts := ephemeralFixture(t, branch)
-	opts.CommitMessage = ""
-	writeTestFile(t, dir, "README.md", "# Test\nwork\n")
-	if _, err := AutoPreserveUncommittedWork(g, branch, opts); err == nil {
-		t.Fatal("an Ephemeral preserve without a CommitMessage would create a snapshot the WIP guard cannot recognize")
-	}
-}
-
 // A bare repo's HEAD is its default branch. Scanning HEAD there passes a push
 // whose actual source ref carries a WIP commit.
 func TestHasWIPCommit_ScansTheTipNotHEAD(t *testing.T) {
@@ -489,5 +308,109 @@ func TestHasWIPCommit_ScansTheTipNotHEAD(t *testing.T) {
 	}
 	if got, err := HasWIPCommit(g, "origin", "refs/heads/polecat/x", testWIPMessage, []string{"main"}); err != nil || got != wip {
 		t.Fatalf("scanning the pushed ref = %q, err %v; want the WIP commit %s", got, err, wip)
+	}
+}
+
+// gt-94p1 round 3 (mayor ruling): snapshots of uncommitted work never leave
+// the machine. They live in a ref of the repository's shared common git dir.
+
+func TestEphemeralPreserve_SnapshotSurvivesWorktreeRemoval(t *testing.T) {
+	repo := initTestRepo(t)
+	addTestOriginRemote(t, repo)
+	branch := "polecat/foo/gt-94p1@wtremove"
+	wt := filepath.Join(t.TempDir(), "wt")
+	runGitTestCmd(t, repo, "worktree", "add", "-b", branch, wt, "HEAD")
+	writeTestFile(t, wt, "README.md", "# Test\ndirty file in a linked worktree\n")
+
+	result, err := AutoPreserveUncommittedWork(NewGit(wt), branch, PreserveOptions{Push: true, CommitMessage: testWIPMessage, ProtectedBranches: []string{"master"}, Ephemeral: true})
+	if err != nil || !result.Committed {
+		t.Fatalf("result %+v, err %v", result, err)
+	}
+	ref := LocalPreservationRefName(branch)
+	if result.Ref != ref {
+		t.Fatalf("result.Ref = %q, want the local ref %q", result.Ref, ref)
+	}
+
+	runGitTestCmd(t, repo, "worktree", "remove", "--force", wt)
+
+	if got := gitOut(t, repo, "rev-parse", ref); got != result.Commit {
+		t.Fatalf("after worktree removal %s = %s, want %s", ref, got, result.Commit)
+	}
+	if got := gitOut(t, repo, "show", ref+":README.md"); got != "# Test\ndirty file in a linked worktree" {
+		t.Fatalf("snapshot README.md = %q, want the dirty file's content", got)
+	}
+}
+
+func TestEphemeralPreserve_NeverPushesToAnyRemote(t *testing.T) {
+	branch := "polecat/foo/gt-94p1@nopush2"
+	dir, g, opts := ephemeralFixture(t, branch)
+	writeTestFile(t, dir, "README.md", "# Test\nwork\n")
+
+	// Any push attempt errors (unreachable push URL) or trips the marker hook.
+	remote := gitOut(t, dir, "remote", "get-url", "origin")
+	runGitTestCmd(t, dir, "remote", "set-url", "--push", "origin", filepath.Join(t.TempDir(), "no-such-remote.git"))
+	marker := filepath.Join(t.TempDir(), "pushed")
+	hook := "#!/bin/sh\ntouch '" + marker + "'\n"
+	if err := os.WriteFile(filepath.Join(dir, ".git", "hooks", "pre-push"), []byte(hook), 0755); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+
+	result, err := AutoPreserveUncommittedWork(g, branch, opts)
+	if err != nil {
+		t.Fatalf("an Ephemeral preserve must not need a working remote: %v", err)
+	}
+	if result.Pushed || !result.Committed {
+		t.Fatalf("want a local-only snapshot, got %+v", result)
+	}
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Fatal("git push was invoked")
+	}
+	if refs := gitOut(t, dir, "ls-remote", "--heads", remote); strings.Contains(refs, "preserve") {
+		t.Fatalf("a preserve ref reached the remote:\n%s", refs)
+	}
+}
+
+func TestEphemeralPreserve_DoesNotRunHooks(t *testing.T) {
+	branch := "polecat/foo/gt-94p1@nohooks"
+	dir, g, opts := ephemeralFixture(t, branch)
+	marker := filepath.Join(t.TempDir(), "hook-ran")
+	writePreCommitHook(t, dir, "touch '"+marker+"'")
+	writeTestFile(t, dir, "README.md", "# Test\nwork\n")
+
+	result, err := AutoPreserveUncommittedWork(g, branch, opts)
+	if err != nil || !result.Committed {
+		t.Fatalf("result %+v, err %v", result, err)
+	}
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Fatal("a pre-commit hook ran against live worktree state; nothing leaves the machine, so no scan is needed")
+	}
+}
+
+func TestEphemeralPreserve_RefusesAnySequencerState(t *testing.T) {
+	for _, state := range []string{"MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"} {
+		t.Run(state, func(t *testing.T) {
+			branch := "polecat/foo/gt-94p1@seq"
+			dir, g, opts := ephemeralFixture(t, branch)
+			gitDir := gitOut(t, dir, "rev-parse", "--absolute-git-dir")
+			if strings.HasPrefix(state, "rebase-") {
+				if err := os.MkdirAll(filepath.Join(gitDir, state), 0755); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(filepath.Join(gitDir, state), []byte(gitOut(t, dir, "rev-parse", "HEAD")+"\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			writeTestFile(t, dir, "README.md", "# Test\nwork\n")
+
+			result, err := AutoPreserveUncommittedWork(g, branch, opts)
+			if err == nil || !strings.Contains(err.Error(), state) {
+				t.Fatalf("want a refusal naming %s, got err=%v result=%+v", state, err, result)
+			}
+			if result.Committed {
+				t.Fatalf("no snapshot may be made during %s", state)
+			}
+			if out, _ := exec.Command("git", "-C", dir, "rev-parse", "--verify", "-q", LocalPreservationRefName(branch)).Output(); len(out) != 0 {
+				t.Fatalf("no preserve ref may be recorded during %s", state)
+			}
+		})
 	}
 }

@@ -10,7 +10,6 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/polecat"
-	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 )
 
@@ -173,24 +172,15 @@ func (d *Daemon) checkpointRigPolecats(rigName string) (int, int) {
 	return scanned, checkpointed
 }
 
-// checkpointWorktree creates a WIP checkpoint for a single worktree and
-// pushes it to a preservation ref. Returns true if anything was preserved
-// (a new commit, a push of prior unpushed commits, or both).
+// checkpointWorktree snapshots a single worktree's uncommitted tracked changes
+// into a LOCAL preservation ref. Returns true if a new snapshot was recorded.
 //
-// Delegates to git.AutoPreserveUncommittedWork — the same implementation gt
-// done's gt-pvx safety net and polecat removal use — rather than reimplementing
-// staging/exclusion/commit logic a third time (gt-y8ts). This also fixes a
-// policy drift bug: the old hand-rolled exclusion list here
-// (.claude/.beads/.runtime/__pycache__) diverged from gt done's broader
-// runtime-artifact policy (also excludes .opencode, .logs, node_modules,
-// .vite, language caches, CLAUDE.local.md, .DS_Store, .db/.pyc/.pyo), so a
-// checkpoint could commit files gt done would have excluded.
-//
-// Unlike gt done, this pushes to a dedicated polecat/preserve-<branch> ref rather
-// than the branch itself: a checkpoint can fire while a PR is already open
-// on the branch, and force-pushing WIP commits onto it would disrupt review
-// and CI. Verified against the remote tip, since nothing else pushes on
-// this path before the worktree might be reassigned or removed.
+// Delegates to git.AutoPreserveUncommittedWork in Ephemeral mode — the same
+// entry point gt done's gt-pvx safety net and polecat removal use (gt-y8ts).
+// Unlike gt done, nothing is committed to the branch and nothing is pushed
+// (gt-94p1): a checkpoint can fire while a PR is already open on the branch,
+// and anything that reached the branch or a remote could ride along with a
+// later ordinary push.
 func (d *Daemon) checkpointWorktree(workDir, rigName, polecatName string) bool {
 	g := git.NewGit(workDir)
 	branch, err := g.CurrentBranch()
@@ -199,29 +189,16 @@ func (d *Daemon) checkpointWorktree(workDir, rigName, polecatName string) bool {
 		return false
 	}
 
-	// Protected branch comes from rig config only (gt-35un/gt-xitk MAYOR
-	// DESIGN RULING) — never from bead/branch data, which this patrol has
-	// no access to anyway.
-	protectedBranch := "main"
-	if d.config != nil {
-		rigPath := filepath.Join(d.config.TownRoot, rigName)
-		if rigCfg, cfgErr := rig.LoadRigConfig(rigPath); cfgErr == nil && rigCfg.DefaultBranch != "" {
-			protectedBranch = rigCfg.DefaultBranch
-		}
-	}
-
+	// gt-94p1 root fix: this patrol runs unattended and repeatedly on a branch
+	// that may already have an open, reviewed PR. Ephemeral snapshots the
+	// tracked changes into a LOCAL ref (refs/gt/preserve/<branch>, shared by all
+	// worktrees so it survives worktree removal) and never pushes: nothing
+	// touches the branch, HEAD, the index or the working tree, and nothing
+	// leaves the machine, so no later push can carry it onto a real branch.
 	result, err := git.AutoPreserveUncommittedWork(g, branch, git.PreserveOptions{
-		IssueID:           polecatName,
-		Push:              true,
-		CommitMessage:     checkpoint.WIPCommitPrefix,
-		ProtectedBranches: []string{protectedBranch},
-		// gt-94p1 root fix: this patrol runs unattended and repeatedly on a
-		// branch that may already have an open, reviewed PR. Ephemeral
-		// snapshots the work and pushes it to the preservation ref without
-		// ever touching the branch, HEAD, or the index — so a later ordinary
-		// push (the polecat's own push, gt done, a pre-nuke push) can never
-		// carry it onto the real branch.
-		Ephemeral: true,
+		IssueID:       polecatName,
+		CommitMessage: checkpoint.WIPCommitPrefix,
+		Ephemeral:     true,
 	})
 	if err != nil {
 		// Covers the G41 protected-branch refusal, unmerged-conflict refusal,
@@ -232,29 +209,10 @@ func (d *Daemon) checkpointWorktree(workDir, rigName, polecatName string) bool {
 		return false
 	}
 
-	if !result.Committed && !result.Pushed {
-		return false // clean worktree, nothing to preserve
+	if !result.Committed {
+		return false // nothing new to preserve
 	}
-	if result.Committed {
-		d.logger.Printf("checkpoint_dog: created WIP checkpoint in %s/%s", rigName, polecatName)
-	}
-	if result.HooksFailed {
-		// The commit exists locally but was never verified — pushing it
-		// would defeat the hooks (gt-i4ej FIX 2). Escalate loudly so a
-		// human resolves the hook failure — but do not copy the hook's
-		// stderr into this log (HookOutput is now redacted at the source
-		// for the same reason, but this site keeps its own wording): the
-		// hook this gate exists for is typically a secret scanner, so its
-		// verbatim output can contain the very credential it caught.
-		// Writing that into the daemon's shared, rotated, gzip-archived
-		// log would relocate the secret to a longer-lived, more
-		// widely-read artifact than the uncommitted file it came from
-		// (PR #184 review). Point at the worktree instead.
-		d.logger.Printf("checkpoint_dog: ERROR — %s/%s checkpoint committed locally but its pre-commit hook FAILED, so it was NOT pushed. Run `git commit` in %s to see the hook output.", rigName, polecatName, workDir)
-	}
-	if result.Pushed {
-		d.logger.Printf("checkpoint_dog: pushed %s/%s checkpoint to %s (%s)", rigName, polecatName, result.Ref, result.Commit)
-	}
+	d.logger.Printf("checkpoint_dog: recorded local checkpoint of %s/%s at %s (%s)", rigName, polecatName, result.Ref, result.Commit)
 	return true
 }
 
