@@ -1437,7 +1437,7 @@ func TestReuseIdlePolecat_ResumeBranchHardSyncsAwayStaleContent(t *testing.T) {
 
 // TestRemoveWithOptions_PreservesDirtyWorkAsWIPSnapshotWithoutMovingBranch pins
 // gt-94p1: the pre-removal preserve records the work under a WIP-prefixed
-// commit (so the push-site backstop recognises it) on the preservation ref
+// commit (so the push-site backstop recognizes it) on the preservation ref
 // only — the polecat's branch is never advanced.
 func TestRemoveWithOptions_PreservesDirtyWorkAsWIPSnapshotWithoutMovingBranch(t *testing.T) {
 	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
@@ -1469,7 +1469,7 @@ func TestRemoveWithOptions_PreservesDirtyWorkAsWIPSnapshotWithoutMovingBranch(t 
 		t.Fatalf("want exactly one preservation ref after removal, got %q", out)
 	}
 	if !strings.Contains(lines[0], checkpoint.WIPCommitPrefix) {
-		t.Fatalf("preservation commit %q lacks the WIP prefix %q — HasWIPCommit's backstop cannot recognise it", lines[0], checkpoint.WIPCommitPrefix)
+		t.Fatalf("preservation commit %q lacks the WIP prefix %q — HasWIPCommit's backstop cannot recognize it", lines[0], checkpoint.WIPCommitPrefix)
 	}
 
 	branchTip, err := exec.Command("git", "-C", mayorRig, "rev-parse", "refs/heads/"+polecat.Branch).Output()

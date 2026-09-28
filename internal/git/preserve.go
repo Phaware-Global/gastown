@@ -96,7 +96,7 @@ type PreserveOptions struct {
 	// (graphql-api #162/#166, gastown #250/#251).
 	//
 	// Requires CommitMessage, and it must begin with the WIP checkpoint prefix
-	// so HasWIPCommit's push-site backstop recognises the snapshot. With Push
+	// so HasWIPCommit's push-site backstop recognizes the snapshot. With Push
 	// false the snapshot is recorded under refs/preserve/<preservation ref
 	// name> in the local repo (which outlives a worktree removal) rather than
 	// left dangling.
@@ -518,7 +518,7 @@ const snapshotPathBatch = 256
 func autoPreserveEphemeral(g *Git, branch string, opts PreserveOptions) (*PreserveResult, error) {
 	result := &PreserveResult{}
 	if opts.CommitMessage == "" {
-		return result, fmt.Errorf("ephemeral preserve requires a CommitMessage carrying the WIP checkpoint prefix, so the WIP push guard can recognise the snapshot")
+		return result, fmt.Errorf("ephemeral preserve requires a CommitMessage carrying the WIP checkpoint prefix, so the WIP push guard can recognize the snapshot")
 	}
 	remote := opts.Remote
 	if remote == "" {

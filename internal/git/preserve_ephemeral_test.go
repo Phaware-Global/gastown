@@ -373,7 +373,7 @@ func TestEphemeralPreserve_RequiresWIPCommitMessage(t *testing.T) {
 	opts.CommitMessage = ""
 	writeTestFile(t, dir, "README.md", "# Test\nwork\n")
 	if _, err := AutoPreserveUncommittedWork(g, branch, opts); err == nil {
-		t.Fatal("an Ephemeral preserve without a CommitMessage would create a snapshot the WIP guard cannot recognise")
+		t.Fatal("an Ephemeral preserve without a CommitMessage would create a snapshot the WIP guard cannot recognize")
 	}
 }
 
