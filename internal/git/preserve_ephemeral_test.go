@@ -128,42 +128,6 @@ func TestEphemeralPreserve_LeavesHeadBranchIndexAndMergeHeadByteIdentical(t *tes
 	}
 }
 
-func TestEphemeralPreserve_RefusesWhileMergeHeadExists(t *testing.T) {
-	branch := "polecat/foo/gt-94p1@merge"
-	dir, g, opts := ephemeralFixture(t, branch)
-
-	// A resolved, uncommitted merge: MERGE_HEAD is set and other.txt is
-	// staged, exactly the state the agent's own next `git commit` consumes.
-	runGitTestCmd(t, dir, "checkout", "-b", "other", "HEAD")
-	writeTestFile(t, dir, "other.txt", "from other\n")
-	runGitTestCmd(t, dir, "add", "other.txt")
-	runGitTestCmd(t, dir, "commit", "-m", "other work")
-	runGitTestCmd(t, dir, "checkout", branch)
-	runGitTestCmd(t, dir, "merge", "--no-commit", "--no-ff", "other")
-	writeTestFile(t, dir, "README.md", "# Test\nedited mid-merge\n")
-
-	before := captureRepoState(t, dir, branch)
-	if before.mergeHead == "" {
-		t.Fatal("fixture: expected MERGE_HEAD to be set")
-	}
-	result, err := AutoPreserveUncommittedWork(g, branch, opts)
-	if err == nil || !strings.Contains(err.Error(), "MERGE_HEAD") {
-		t.Fatalf("want a refusal naming MERGE_HEAD, got err=%v result=%+v", err, result)
-	}
-	if result.Committed || result.Pushed {
-		t.Fatalf("a mid-merge preserve must make and push no snapshot, got %+v", result)
-	}
-	requireSameRepoState(t, before, captureRepoState(t, dir, branch))
-	if tip, _ := g.RemoteBranchTip("origin", PreservationRefName(branch)); tip != "" {
-		t.Fatalf("nothing may reach origin mid-merge, preserve ref tip = %s", tip)
-	}
-
-	runGitTestCmd(t, dir, "commit", "-am", "complete the merge")
-	if parents := strings.Fields(gitOut(t, dir, "rev-list", "--parents", "-n1", "HEAD")); len(parents) != 3 {
-		t.Fatalf("the agent's merge commit has %d parents, want 2 — the merge was flattened", len(parents)-1)
-	}
-}
-
 func writePreCommitHook(t *testing.T, dir, script string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -386,31 +350,94 @@ func TestEphemeralPreserve_DoesNotRunHooks(t *testing.T) {
 	}
 }
 
-func TestEphemeralPreserve_RefusesAnySequencerState(t *testing.T) {
+// git stash create reads no sequencer state, and the snapshot is the only
+// recovery path under a forced removal, so a snapshot is taken mid-operation.
+func TestEphemeralPreserve_SnapshotsDuringSequencerState(t *testing.T) {
 	for _, state := range []string{"MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"} {
 		t.Run(state, func(t *testing.T) {
 			branch := "polecat/foo/gt-94p1@seq"
 			dir, g, opts := ephemeralFixture(t, branch)
 			gitDir := gitOut(t, dir, "rev-parse", "--absolute-git-dir")
-			if strings.HasPrefix(state, "rebase-") {
+			switch state {
+			case "MERGE_HEAD":
+				runGitTestCmd(t, dir, "checkout", "-b", "other", "HEAD")
+				writeTestFile(t, dir, "other.txt", "from other\n")
+				runGitTestCmd(t, dir, "add", "other.txt")
+				runGitTestCmd(t, dir, "commit", "-m", "other work")
+				runGitTestCmd(t, dir, "checkout", branch)
+				runGitTestCmd(t, dir, "merge", "--no-commit", "--no-ff", "other")
+			case "rebase-merge", "rebase-apply":
 				if err := os.MkdirAll(filepath.Join(gitDir, state), 0755); err != nil {
 					t.Fatal(err)
 				}
-			} else if err := os.WriteFile(filepath.Join(gitDir, state), []byte(gitOut(t, dir, "rev-parse", "HEAD")+"\n"), 0644); err != nil {
-				t.Fatal(err)
+			default:
+				if err := os.WriteFile(filepath.Join(gitDir, state), []byte(gitOut(t, dir, "rev-parse", "HEAD")+"\n"), 0644); err != nil {
+					t.Fatal(err)
+				}
 			}
-			writeTestFile(t, dir, "README.md", "# Test\nwork\n")
+			writeTestFile(t, dir, "README.md", "# Test\nwork during "+state+"\n")
 
+			before := captureRepoState(t, dir, branch)
+			statusBefore := gitOut(t, dir, "status", "--porcelain")
 			result, err := AutoPreserveUncommittedWork(g, branch, opts)
-			if err == nil || !strings.Contains(err.Error(), state) {
-				t.Fatalf("want a refusal naming %s, got err=%v result=%+v", state, err, result)
+			if err != nil || !result.Committed {
+				t.Fatalf("a snapshot must be taken during %s, got err=%v result=%+v", state, err, result)
 			}
-			if result.Committed {
-				t.Fatalf("no snapshot may be made during %s", state)
+			if got := gitOut(t, dir, "show", result.Commit+":README.md"); got != "# Test\nwork during "+state {
+				t.Fatalf("snapshot README.md = %q, want the dirty content", got)
 			}
-			if out, _ := exec.Command("git", "-C", dir, "rev-parse", "--verify", "-q", LocalPreservationRefName(branch)).Output(); len(out) != 0 {
-				t.Fatalf("no preserve ref may be recorded during %s", state)
+			requireSameRepoState(t, before, captureRepoState(t, dir, branch))
+			if got := gitOut(t, dir, "status", "--porcelain"); got != statusBefore {
+				t.Errorf("working tree status changed: %q, was %q", got, statusBefore)
+			}
+			if _, err := os.Stat(filepath.Join(gitDir, state)); err != nil {
+				t.Fatalf("%s must be left in place: %v", state, err)
 			}
 		})
+	}
+}
+
+// A detached worktree's commits that no branch or remote-tracking ref reaches
+// live only in the worktree's own HEAD; removing it would orphan them.
+func TestEphemeralPreserve_CleanDetachedHeadWithUnreachableCommitIsPinned(t *testing.T) {
+	dir := initTestRepo(t)
+	addTestOriginRemote(t, dir)
+	g := NewGit(dir)
+	runGitTestCmd(t, dir, "checkout", "--detach")
+	writeTestFile(t, dir, "local.txt", "local work\n")
+	runGitTestCmd(t, dir, "add", "local.txt")
+	runGitTestCmd(t, dir, "commit", "-m", "local commit on a detached HEAD")
+	head := gitOut(t, dir, "rev-parse", "HEAD")
+	opts := PreserveOptions{IssueID: "furiosa", CommitMessage: testWIPMessage, Ephemeral: true}
+
+	before := captureRepoState(t, dir, "")
+	result, err := AutoPreserveUncommittedWork(g, "HEAD", opts)
+	if err != nil || !result.Committed || result.Ref == "" {
+		t.Fatalf("a clean detached HEAD with an unreachable commit must be pinned, got err=%v result=%+v", err, result)
+	}
+	requireSameRepoState(t, before, captureRepoState(t, dir, ""))
+	if got := gitOut(t, dir, "rev-parse", result.Ref); got != head {
+		t.Fatalf("%s = %s, want HEAD %s", result.Ref, got, head)
+	}
+
+	// Idempotent: nothing new to record on the next cycle.
+	again, err := AutoPreserveUncommittedWork(g, "HEAD", opts)
+	if err != nil || again.Committed {
+		t.Fatalf("second cycle must be a no-op, got err=%v result=%+v", err, again)
+	}
+}
+
+func TestEphemeralPreserve_CleanDetachedHeadOnABranchIsNotPinned(t *testing.T) {
+	dir := initTestRepo(t)
+	addTestOriginRemote(t, dir)
+	g := NewGit(dir)
+	runGitTestCmd(t, dir, "checkout", "--detach")
+
+	result, err := AutoPreserveUncommittedWork(g, "HEAD", PreserveOptions{IssueID: "furiosa", CommitMessage: testWIPMessage, Ephemeral: true})
+	if err != nil || result.Committed {
+		t.Fatalf("a detached HEAD already reachable from a branch needs no pin, got err=%v result=%+v", err, result)
+	}
+	if refs := gitOut(t, dir, "for-each-ref", "refs/gt/preserve/"); refs != "" {
+		t.Fatalf("no ref expected, got:\n%s", refs)
 	}
 }

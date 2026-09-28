@@ -1481,6 +1481,44 @@ func TestRemoveWithOptions_PreservesDirtyWorkLocallyWithoutMovingBranchOrPushing
 	}
 }
 
+// TestRemoveWithOptions_ForceRemovalKeepsCommitsOfACleanDetachedWorktree pins
+// that a clean detached worktree's local commit (reachable from no branch)
+// survives a forced removal via a local preserve ref.
+func TestRemoveWithOptions_ForceRemovalKeepsCommitsOfACleanDetachedWorktree(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+
+	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	wtGit := git.NewGit(polecat.ClonePath)
+	if err := wtGit.CheckoutDetach("HEAD"); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(polecat.ClonePath, "local.txt"), []byte("local work\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := wtGit.Add("local.txt"); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := wtGit.Commit("local commit on a detached HEAD"); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	commit, err := wtGit.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev HEAD: %v", err)
+	}
+
+	if err := mgr.RemoveWithOptions("toast", true, false, false); err != nil {
+		t.Fatalf("RemoveWithOptions: %v", err)
+	}
+
+	refs, err := exec.Command("git", "-C", mayorRig, "for-each-ref", "--contains", commit, "--format=%(refname)", "refs/gt/preserve/").Output()
+	if err != nil || strings.TrimSpace(string(refs)) == "" {
+		t.Fatalf("commit %s is not reachable from any refs/gt/preserve ref after forced removal (err %v)", commit, err)
+	}
+}
+
 func writeWispSetupCommand(t *testing.T, mgr *Manager, command string) {
 	t.Helper()
 

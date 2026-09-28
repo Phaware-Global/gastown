@@ -86,13 +86,16 @@ type PreserveOptions struct {
 	// Guarantees: nothing is ever pushed (Push, Remote and ProtectedBranches are
 	// ignored); the ref lives in the shared common git dir so it survives
 	// `git worktree remove`; HEAD, the branch ref, the index, the working tree
-	// and sequencer state are untouched; it refuses (error, no snapshot) while
-	// a merge, cherry-pick, revert or rebase is in progress or any path is
-	// unmerged; an unchanged dirty tree is not re-recorded each cycle; a
-	// detached HEAD keeps one ref across cycles.
+	// and sequencer state are untouched; a snapshot is taken even while a
+	// merge, cherry-pick, revert or rebase is in progress (it reads no
+	// sequencer state), but it refuses when any path is unmerged; an unchanged
+	// dirty tree is not re-recorded each cycle; a detached HEAD keeps one ref
+	// across cycles, and a clean detached HEAD whose commits no branch or
+	// remote-tracking ref reaches is pinned to that ref so they outlive the
+	// worktree.
 	//
 	// Does not: capture untracked files, or preserve the agent's own committed
-	// work (that lives on its branch ref). ExtraExcludePaths is ignored — the
+	// work on a branch (that lives on its branch ref). ExtraExcludePaths is ignored — the
 	// tracked-file allowlist existed to keep unattended PUSHES safe, and nothing
 	// leaves the machine now.
 	//
@@ -525,30 +528,6 @@ func preservationRefFor(g *Git, branch, remote, anchorHead, issueID string) (str
 // snapshot leaves .git/index byte-identical.
 var snapshotGitEnv = []string{"GIT_OPTIONAL_LOCKS=0"}
 
-// sequencerStateNames are the per-worktree paths (resolved with --git-path)
-// whose existence means a merge, cherry-pick, revert or rebase is in progress.
-var sequencerStateNames = []string{"MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"}
-
-// sequencerState returns the name of the first in-progress-operation marker
-// that exists for this worktree, or "" if none does.
-func sequencerState(g *Git) (string, error) {
-	for _, name := range sequencerStateNames {
-		p, err := g.runWithEnv([]string{"rev-parse", "--git-path", name}, snapshotGitEnv)
-		if err != nil {
-			return "", err
-		}
-		if !filepath.IsAbs(p) {
-			p = filepath.Join(g.WorkDir(), p)
-		}
-		if _, err := os.Stat(p); err == nil {
-			return name, nil
-		} else if !os.IsNotExist(err) {
-			return "", err
-		}
-	}
-	return "", nil
-}
-
 // autoPreserveEphemeral is the Ephemeral implementation of
 // AutoPreserveUncommittedWork (see PreserveOptions.Ephemeral): `git stash
 // create` builds a commit of the tracked changes without touching HEAD, the
@@ -581,14 +560,6 @@ func autoPreserveEphemeral(g *Git, branch string, opts PreserveOptions) (*Preser
 		return result, fmt.Errorf("cannot auto-preserve unmerged conflicts: %s", strings.Join(paths, ", "))
 	}
 
-	// A merge/cherry-pick/revert/rebase in progress means the tree is not a
-	// state the agent chose; refuse rather than record it.
-	if state, err := sequencerState(g); err != nil {
-		return result, fmt.Errorf("checking for an in-progress operation: %w", err)
-	} else if state != "" {
-		return result, fmt.Errorf("cannot auto-preserve: %s exists — a merge, cherry-pick, revert or rebase is in progress; finish or abort it first", state)
-	}
-
 	msg := opts.CommitMessage
 	if msg == "" {
 		msg = "gt preserve snapshot of uncommitted work"
@@ -605,10 +576,6 @@ func autoPreserveEphemeral(g *Git, branch string, opts PreserveOptions) (*Preser
 	if err != nil {
 		return result, fmt.Errorf("creating snapshot: %w", err)
 	}
-	if sha == "" {
-		return result, nil // no tracked changes
-	}
-
 	// Anchored on head, not the snapshot: head never moves under Ephemeral, so
 	// a detached worktree keeps one ref across cycles until the agent makes its
 	// own first commit.
@@ -617,6 +584,16 @@ func autoPreserveEphemeral(g *Git, branch string, opts PreserveOptions) (*Preser
 		return result, err
 	}
 	ref := LocalPreservationRefName(refBranch)
+
+	if sha == "" {
+		// Clean tree. A detached HEAD's own commits may be reachable from no
+		// branch at all; only the worktree's HEAD holds them, and removing the
+		// worktree would orphan them. Pin HEAD so they outlive it.
+		if branch == "HEAD" {
+			return pinUnreachableHead(g, head, ref, result)
+		}
+		return result, nil // no tracked changes
+	}
 
 	// The dirty tree hasn't changed since the last cycle: the snapshot is
 	// stamped with the wall clock, so recording it again would just churn.
@@ -629,6 +606,28 @@ func autoPreserveEphemeral(g *Git, branch string, opts PreserveOptions) (*Preser
 	}
 	result.Committed = true
 	result.Commit = sha
+	result.Ref = ref
+	return result, nil
+}
+
+// pinUnreachableHead records head under ref when no branch or remote-tracking
+// ref reaches it and ref does not already hold it.
+func pinUnreachableHead(g *Git, head, ref string, result *PreserveResult) (*PreserveResult, error) {
+	out, err := g.runWithEnv([]string{"for-each-ref", "--contains", head, "--count=1", "--format=%(refname)", "refs/heads/", "refs/remotes/"}, snapshotGitEnv)
+	if err != nil {
+		return result, fmt.Errorf("checking whether HEAD is reachable from a branch: %w", err)
+	}
+	if out != "" {
+		return result, nil
+	}
+	if cur, curErr := g.runWithEnv([]string{"rev-parse", "--verify", "-q", ref}, snapshotGitEnv); curErr == nil && cur == head {
+		return result, nil
+	}
+	if _, err := g.run("update-ref", ref, head); err != nil {
+		return result, fmt.Errorf("recording detached HEAD %s: %w", shortSHA(head), err)
+	}
+	result.Committed = true
+	result.Commit = head
 	result.Ref = ref
 	return result, nil
 }
