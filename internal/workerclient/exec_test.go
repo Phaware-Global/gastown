@@ -906,19 +906,7 @@ func TestExecStream_TTYExitsWhenADescendantHoldsTheSlave(t *testing.T) {
 	}, 10*time.Second, 50*time.Millisecond, "the exec slot must be released")
 }
 
-// TestExecStream_TTYDrainsQueuedOutputBeforeClosingTheMaster pins the teardown
-// order: the pump must be given the chance to read what the agent left in the pty
-// queue BEFORE the master is closed, because closing discards that queue.
-//
-// The race is made deterministic by stalling the pump instead of timing the
-// agent. The test holds the connection's write lock, so the pump reads the first
-// chunk and parks in writeFrame; the agent then writes a second chunk, which can
-// only sit unread in the pty queue, and exits. Close-then-wait closes the master
-// with that chunk still queued and loses it; drain-then-close waits for the pump,
-// which the test releases only after the agent is gone.
-//
-// It only discriminates on Linux: on darwin the chunk survives either order, so
-// a green run there says nothing about the ordering.
+// Only discriminates on Linux; on darwin the queued chunk survives either teardown order.
 func TestExecStream_TTYDrainsQueuedOutputBeforeClosingTheMaster(t *testing.T) {
 	prev := ptyDrainGrace
 	ptyDrainGrace = 10 * time.Second // far longer than the stall below
