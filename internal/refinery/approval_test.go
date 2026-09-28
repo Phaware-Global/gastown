@@ -68,7 +68,7 @@ func (f *fakePRProvider) ChangesRequestedReviewers(int) ([]string, error) {
 // Unused PRProvider methods — panic if exercised so mis-wired tests fail loudly.
 func (f *fakePRProvider) FindPRNumber(string) (int, error)              { panic("unused") }
 func (f *fakePRProvider) IsPRApproved(int) (bool, error)                { panic("unused") }
-func (f *fakePRProvider) MergePR(int, string) (string, error)           { panic("unused") }
+func (f *fakePRProvider) MergePR(int, string, string) (string, error)           { panic("unused") }
 func (f *fakePRProvider) CreatePR(CreatePROptions) (int, string, error) { panic("unused") }
 func (f *fakePRProvider) RequestReview(int, []string) error             { panic("unused") }
 func (f *fakePRProvider) UnresolvedThreads(int) ([]ReviewThread, error) { panic("unused") }

@@ -1233,7 +1233,8 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
 	// Policy is driven by MergeQueueConfig (PRApprover + GetPRRequiredApprovals).
 	// Shared with the `gt refinery pr merge` CLI subcommand via VerifyPRApproval
 	// so patrol and CLI paths enforce identical gates.
-	if err := VerifyPRApproval(e.prProvider, e.config, prNumber, e.output); err != nil {
+	verifiedHead, err := VerifyPRApprovalAtHead(e.prProvider, e.config, prNumber, e.output)
+	if err != nil {
 		var needsApproval *NeedsApprovalError
 		if errors.As(err, &needsApproval) {
 			return ProcessResult{
@@ -1254,7 +1255,7 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
 		method = "squash"
 	}
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Merging PR #%d via %s API (%s)...\n", prNumber, provider, method)
-	mergeCommit, err := e.prProvider.MergePR(prNumber, method)
+	mergeCommit, err := e.prProvider.MergePR(prNumber, method, verifiedHead)
 	if err != nil {
 		return ProcessResult{
 			Success: false,
