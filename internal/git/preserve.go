@@ -545,20 +545,31 @@ func autoPreserveEphemeral(g *Git, branch string, opts PreserveOptions) (*Preser
 		return result, fmt.Errorf("cannot auto-preserve unmerged conflicts: %s", strings.Join(paths, ", "))
 	}
 
-	// Refuse to publish anything descended from a commit that bypassed hooks.
-	// Checked before the snapshot is made: HooksFailed here always means a
-	// PRIOR unverified commit in head's ancestry, and a snapshot is a child
-	// of head.
+	// A merge whose conflicts are resolved and staged but not yet committed has
+	// no unmerged paths, yet the agent's next `git commit` is what completes it.
+	// Snapshotting mid-merge would record a tree the agent never chose, so
+	// refuse whenever MERGE_HEAD exists (gt-94p1 mayor ruling).
+	if inProgress, err := mergeInProgress(g); err != nil {
+		return result, fmt.Errorf("checking for an in-progress merge: %w", err)
+	} else if inProgress {
+		return result, fmt.Errorf("cannot auto-preserve: a merge is in progress (MERGE_HEAD exists) — finish or abort it first")
+	}
+
+	// A commit in head's ancestry that bypassed hooks means nothing descended
+	// from it may be PUBLISHED — but the work must still be saved, locally. A
+	// snapshot is a child of head, so it inherits that taint; it is still built
+	// and pinned below, just never pushed.
 	if err := markPriorUnverifiedCommit(g, remote, head, opts.ProtectedBranches, result); err != nil {
 		return result, err
 	}
-	if result.HooksFailed {
-		return result, nil
-	}
 
-	tree, headTree, err := snapshotTree(g, head, opts)
+	tree, headTree, hookFailed, err := snapshotTree(g, head, opts)
 	if err != nil {
 		return result, err
+	}
+	if hookFailed && !result.HooksFailed {
+		result.HooksFailed = true
+		result.HookOutput = fmt.Sprintf("pre-commit hook failed on the snapshot of %s — output withheld, it can contain the secret a scanner matched; the snapshot was kept locally and NOT pushed. Run `git commit` in the worktree to see the hook output", g.WorkDir())
 	}
 
 	pushSHA := head
@@ -579,13 +590,14 @@ func autoPreserveEphemeral(g *Git, branch string, opts PreserveOptions) (*Preser
 		return result, err
 	}
 
-	if !opts.Push {
+	if !opts.Push || result.HooksFailed {
 		if !haveSnapshot {
 			return result, nil
 		}
-		// Not pushed, so nothing else references the commit; pin it under a
-		// local ref (shared by all worktrees, so it outlives a worktree
-		// removal) rather than leave it to gc. Never a refs/heads ref.
+		// Not pushed (by request, or because it must not be published), so
+		// nothing else references the commit; pin it under a local ref (shared
+		// by all worktrees, so it outlives a worktree removal) rather than leave
+		// it to gc. Never a refs/heads ref.
 		if _, err := g.run("update-ref", "refs/preserve/"+refName, pushSHA); err != nil {
 			return result, fmt.Errorf("recording snapshot %s: %w", shortSHA(pushSHA), err)
 		}
@@ -628,6 +640,24 @@ func autoPreserveEphemeral(g *Git, branch string, opts PreserveOptions) (*Preser
 	return result, nil
 }
 
+// mergeInProgress reports whether MERGE_HEAD exists for this worktree.
+// --git-path resolves the per-worktree location and honors GIT_DIR.
+func mergeInProgress(g *Git) (bool, error) {
+	p, err := g.runWithEnv([]string{"rev-parse", "--git-path", "MERGE_HEAD"}, snapshotGitEnv)
+	if err != nil {
+		return false, err
+	}
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(g.WorkDir(), p)
+	}
+	if _, err := os.Stat(p); err == nil {
+		return true, nil
+	} else if !os.IsNotExist(err) {
+		return false, err
+	}
+	return false, nil
+}
+
 // preserveTipMatches reports whether commit tip is a snapshot of tree made on
 // top of parent. Any failure (e.g. tip isn't in this repo's object store)
 // reads as "no match", which just means the caller pushes.
@@ -653,15 +683,15 @@ func preserveTipMatches(g *Git, tip, parent, tree string) bool {
 // safety net that occasionally misses a new file is fine; one that
 // occasionally publishes a credential is not. Gas Town runtime artifacts,
 // CLAUDE.local.md and opts.ExtraExcludePaths are dropped from that set.
-func snapshotTree(g *Git, head string, opts PreserveOptions) (tree, headTree string, err error) {
+func snapshotTree(g *Git, head string, opts PreserveOptions) (tree, headTree string, hookFailed bool, err error) {
 	headTree, err = g.runWithEnv([]string{"rev-parse", head + "^{tree}"}, snapshotGitEnv)
 	if err != nil {
-		return "", "", fmt.Errorf("resolving HEAD tree: %w", err)
+		return "", "", false, fmt.Errorf("resolving HEAD tree: %w", err)
 	}
 
 	out, err := g.runWithEnv([]string{"diff", "--no-renames", "--name-only", "-z", "--diff-filter=MT", head}, snapshotGitEnv)
 	if err != nil {
-		return "", "", fmt.Errorf("listing modified files: %w", err)
+		return "", "", false, fmt.Errorf("listing modified files: %w", err)
 	}
 	var keep []string
 	keepSet := make(map[string]bool)
@@ -673,28 +703,28 @@ func snapshotTree(g *Git, head string, opts PreserveOptions) (tree, headTree str
 		keepSet[f] = true
 	}
 	if len(keep) == 0 {
-		return headTree, headTree, nil
+		return headTree, headTree, false, nil
 	}
 
 	tmpDir, err := os.MkdirTemp("", "gt-preserve-index-")
 	if err != nil {
-		return "", "", fmt.Errorf("creating temporary index dir: %w", err)
+		return "", "", false, fmt.Errorf("creating temporary index dir: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 	env := append([]string{"GIT_INDEX_FILE=" + filepath.Join(tmpDir, "index")}, snapshotGitEnv...)
 
 	if _, err := g.runWithEnv([]string{"read-tree", head}, env); err != nil {
-		return "", "", fmt.Errorf("seeding temporary index: %w", err)
+		return "", "", false, fmt.Errorf("seeding temporary index: %w", err)
 	}
 	for i := 0; i < len(keep); i += snapshotPathBatch {
 		batch := keep[i:min(i+snapshotPathBatch, len(keep))]
 		if _, err := g.runWithEnv(append([]string{"add", "-u", "--"}, batch...), env); err != nil {
-			return "", "", fmt.Errorf("staging into temporary index: %w", err)
+			return "", "", false, fmt.Errorf("staging into temporary index: %w", err)
 		}
 	}
 	tree, err = g.runWithEnv([]string{"write-tree"}, env)
 	if err != nil {
-		return "", "", fmt.Errorf("writing snapshot tree: %w", err)
+		return "", "", false, fmt.Errorf("writing snapshot tree: %w", err)
 	}
 
 	// Re-verify the result against the allowlist rather than trust the
@@ -703,16 +733,24 @@ func snapshotTree(g *Git, head string, opts PreserveOptions) (tree, headTree str
 	// it never destroys it.
 	diff, err := g.runWithEnv([]string{"diff-tree", "-r", "--no-renames", "--name-status", "-z", headTree, tree}, snapshotGitEnv)
 	if err != nil {
-		return "", "", fmt.Errorf("verifying snapshot tree: %w", err)
+		return "", "", false, fmt.Errorf("verifying snapshot tree: %w", err)
 	}
 	fields := splitNulPaths(diff)
 	for i := 0; i+1 < len(fields); i += 2 {
 		status, path := fields[i], fields[i+1]
 		if (status != "M" && status != "T") || !keepSet[path] {
-			return "", "", fmt.Errorf("refusing to auto-preserve: snapshot would record %s %q, which is not a tracked modification on the allowlist", status, path)
+			return "", "", false, fmt.Errorf("refusing to auto-preserve: snapshot would record %s %q, which is not a tracked modification on the allowlist", status, path)
 		}
 	}
-	return tree, headTree, nil
+
+	// commit-tree runs no hooks, so the configured pre-commit hook (typically
+	// the secret scanner) is run here on the snapshot, against the throwaway
+	// index that still holds it, before anything can be pushed. Fails closed:
+	// any error running the hook counts as a failure.
+	if _, hookErr := g.runWithEnv([]string{"hook", "run", "--ignore-missing", "pre-commit"}, env); hookErr != nil {
+		return tree, headTree, true, nil
+	}
+	return tree, headTree, false, nil
 }
 
 // divergenceAnchor returns the first commit reachable from head that is not

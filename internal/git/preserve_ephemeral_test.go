@@ -124,7 +124,7 @@ func TestEphemeralPreserve_LeavesHeadBranchIndexAndMergeHeadByteIdentical(t *tes
 	}
 }
 
-func TestEphemeralPreserve_MidMergeKeepsMergeHeadAndParents(t *testing.T) {
+func TestEphemeralPreserve_RefusesWhileMergeHeadExists(t *testing.T) {
 	branch := "polecat/foo/gt-94p1@merge"
 	dir, g, opts := ephemeralFixture(t, branch)
 
@@ -143,17 +143,106 @@ func TestEphemeralPreserve_MidMergeKeepsMergeHeadAndParents(t *testing.T) {
 		t.Fatal("fixture: expected MERGE_HEAD to be set")
 	}
 	result, err := AutoPreserveUncommittedWork(g, branch, opts)
-	if err != nil {
-		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "MERGE_HEAD") {
+		t.Fatalf("want a refusal naming MERGE_HEAD, got err=%v result=%+v", err, result)
 	}
-	if !result.Pushed {
-		t.Fatalf("expected a pushed snapshot, got %+v", result)
+	if result.Committed || result.Pushed {
+		t.Fatalf("a mid-merge preserve must make and push no snapshot, got %+v", result)
 	}
 	requireSameRepoState(t, before, captureRepoState(t, dir, branch))
+	if tip, _ := g.RemoteBranchTip("origin", PreservationRefName(branch)); tip != "" {
+		t.Fatalf("nothing may reach origin mid-merge, preserve ref tip = %s", tip)
+	}
 
 	runGitTestCmd(t, dir, "commit", "-am", "complete the merge")
 	if parents := strings.Fields(gitOut(t, dir, "rev-list", "--parents", "-n1", "HEAD")); len(parents) != 3 {
 		t.Fatalf("the agent's merge commit has %d parents, want 2 — the merge was flattened", len(parents)-1)
+	}
+}
+
+func TestEphemeralPreserve_UnverifiedAncestorStillSnapshotsLocally(t *testing.T) {
+	branch := "polecat/foo/gt-94p1@unverified"
+	dir, g, opts := ephemeralFixture(t, branch)
+	commitUnverified(t, dir, "bypassed.txt", "no-verify work", "bypassed hooks")
+	writeTestFile(t, dir, "README.md", "# Test\nprecious uncommitted work\n")
+
+	before := captureRepoState(t, dir, branch)
+	result, err := AutoPreserveUncommittedWork(g, branch, opts)
+	if err != nil {
+		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
+	}
+	if !result.HooksFailed {
+		t.Fatalf("an unverified ancestor must report HooksFailed, got %+v", result)
+	}
+	if result.Pushed {
+		t.Fatal("nothing descended from an unverified commit may be pushed")
+	}
+	if !result.Committed || result.Commit == "" {
+		t.Fatalf("the work must still be snapshotted and reported (callers print 'preserved locally'), got %+v", result)
+	}
+	requireSameRepoState(t, before, captureRepoState(t, dir, branch))
+	if got := gitOut(t, dir, "rev-parse", "refs/preserve/"+PreservationRefName(branch)); got != result.Commit {
+		t.Fatalf("local preserve ref = %s, want %s", got, result.Commit)
+	}
+	if got := gitOut(t, dir, "show", result.Commit+":README.md"); got != "# Test\nprecious uncommitted work" {
+		t.Fatalf("snapshot README.md = %q, want the worktree content", got)
+	}
+	if tip, _ := g.RemoteBranchTip("origin", PreservationRefName(branch)); tip != "" {
+		t.Fatalf("nothing may reach origin, preserve ref tip = %s", tip)
+	}
+}
+
+func writePreCommitHook(t *testing.T, dir, script string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell hook script not portable to windows")
+	}
+	hook := filepath.Join(dir, ".git", "hooks", "pre-commit")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\n"+script+"\n"), 0755); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+}
+
+// The snapshot is made with commit-tree, which runs no hooks; the configured
+// pre-commit hook (typically the secret scanner) must still gate the push.
+func TestEphemeralPreserve_PreCommitHookFailureBlocksPush(t *testing.T) {
+	branch := "polecat/foo/gt-94p1@secret"
+	dir, g, opts := ephemeralFixture(t, branch)
+	writePreCommitHook(t, dir, `if git diff --cached | grep -q AKIAFAKEKEY; then echo "secret AKIAFAKEKEY found" >&2; exit 1; fi`)
+	writeTestFile(t, dir, "README.md", "# Test\naws_key=AKIAFAKEKEY\n")
+
+	before := captureRepoState(t, dir, branch)
+	result, err := AutoPreserveUncommittedWork(g, branch, opts)
+	if err != nil {
+		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
+	}
+	if !result.HooksFailed || result.Pushed {
+		t.Fatalf("a failing pre-commit hook must set HooksFailed and block the push, got %+v", result)
+	}
+	if strings.Contains(result.HookOutput, "AKIAFAKEKEY") {
+		t.Fatalf("HookOutput must not echo the matched secret: %q", result.HookOutput)
+	}
+	if !result.Committed || result.Commit == "" {
+		t.Fatalf("the work must still be pinned locally, got %+v", result)
+	}
+	requireSameRepoState(t, before, captureRepoState(t, dir, branch))
+	if got := gitOut(t, dir, "rev-parse", "refs/preserve/"+PreservationRefName(branch)); got != result.Commit {
+		t.Fatalf("local preserve ref = %s, want %s", got, result.Commit)
+	}
+	if tip, _ := g.RemoteBranchTip("origin", PreservationRefName(branch)); tip != "" {
+		t.Fatalf("the secret must not reach origin, preserve ref tip = %s", tip)
+	}
+}
+
+func TestEphemeralPreserve_PassingPreCommitHookStillPushes(t *testing.T) {
+	branch := "polecat/foo/gt-94p1@cleanhook"
+	dir, g, opts := ephemeralFixture(t, branch)
+	writePreCommitHook(t, dir, `if git diff --cached | grep -q AKIAFAKEKEY; then exit 1; fi`)
+	writeTestFile(t, dir, "README.md", "# Test\nharmless\n")
+
+	result, err := AutoPreserveUncommittedWork(g, branch, opts)
+	if err != nil || result.HooksFailed || !result.Pushed {
+		t.Fatalf("a passing hook must not block the push, got %+v err=%v", result, err)
 	}
 }
 
