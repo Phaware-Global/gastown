@@ -24,8 +24,8 @@ func shimGhReviews(t *testing.T, reviewsJSON string) {
 }
 
 func TestGhPrApprovedReviewersAtSHA(t *testing.T) {
-	const head = "dd9388ffdd9388ffdd9388ffdd9388ffdd9388ff"
-	const old = "f6ae0053f6ae0053f6ae0053f6ae0053f6ae0053"
+	const head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	const old = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 	tests := []struct {
 		name    string

@@ -149,10 +149,9 @@ func VerifyPRApproval(provider PRProvider, cfg *MergeQueueConfig, prNumber int, 
 // Neither the named-approver gate nor the count gate can stand in for this:
 // GitHub keeps an approval after a push, so both keep passing on a human's
 // sign-off of code that has since changed, and an agent's approval at head
-// satisfies the count. A human who approved f6ae0053 never saw the 14 commits
-// after it, so their review must not license them. The check lives here, in
-// the code both merge paths share, so it is a refusal by the tool and not an
-// instruction the refinery LLM can skip.
+// satisfies the count. An older approval must not license newer commits. The
+// check lives here, in the code both merge paths share, so it is a refusal by
+// the tool and not an instruction the refinery LLM can skip.
 //
 // Every failure to establish the answer refuses. An unknown head SHA, a
 // provider that cannot list approvals, or a lookup error is not evidence that a

@@ -579,7 +579,7 @@ func TestVerifyPRApproval_ExternalReviewerIsNotTrusted(t *testing.T) {
 }
 
 // humanGateCfg is a pr rig that opted out of the per-user approval gates but
-// requires a human's approval at head — the graphql-api shape from gt-m2k8.
+// requires a human's approval at head — a pr rig where the agent reviewer alone would otherwise satisfy the gates.
 func humanGateCfg() *MergeQueueConfig {
 	return &MergeQueueConfig{
 		MergeStrategy:          "pr",
@@ -591,12 +591,12 @@ func humanGateCfg() *MergeQueueConfig {
 }
 
 func TestVerifyPRApproval_HumanGate_ApprovalOnOlderSHA_Refuses(t *testing.T) {
-	// gt-m2k8: the only human approval was on f6ae0053, 14 commits before head.
+	// The only human approval is on an older SHA than head.
 	provider := &fakePRProvider{
-		headSHA: "dd9388ff",
+		headSHA: "bbbbbbbb",
 		approvedAtSHA: map[string][]string{
-			"f6ae0053": {"kevin"},
-			"dd9388ff": {"phaware-val"},
+			"aaaaaaaa": {"kevin"},
+			"bbbbbbbb": {"phaware-val"},
 		},
 	}
 	err := VerifyPRApproval(provider, humanGateCfg(), 166, nil)
@@ -604,18 +604,18 @@ func TestVerifyPRApproval_HumanGate_ApprovalOnOlderSHA_Refuses(t *testing.T) {
 	if !errors.As(err, &needs) {
 		t.Fatalf("want *NeedsApprovalError, got %v", err)
 	}
-	if !strings.Contains(needs.Detail, "dd9388ff") {
+	if !strings.Contains(needs.Detail, "bbbbbbbb") {
 		t.Errorf("detail should name the head SHA, got: %s", needs.Detail)
 	}
-	if got := provider.approvedAtCalls; len(got) != 1 || got[0] != "dd9388ff" {
+	if got := provider.approvedAtCalls; len(got) != 1 || got[0] != "bbbbbbbb" {
 		t.Errorf("approvals must be queried at head only, got %v", got)
 	}
 }
 
 func TestVerifyPRApproval_HumanGate_AgentOnlyAtHead_Refuses(t *testing.T) {
 	provider := &fakePRProvider{
-		headSHA:       "dd9388ff",
-		approvedAtSHA: map[string][]string{"dd9388ff": {"phaware-val"}},
+		headSHA:       "bbbbbbbb",
+		approvedAtSHA: map[string][]string{"bbbbbbbb": {"phaware-val"}},
 	}
 	err := VerifyPRApproval(provider, humanGateCfg(), 166, nil)
 	var needs *NeedsApprovalError
@@ -629,8 +629,8 @@ func TestVerifyPRApproval_HumanGate_AgentOnlyAtHead_Refuses(t *testing.T) {
 
 func TestVerifyPRApproval_HumanGate_HumanAtHead_Passes(t *testing.T) {
 	provider := &fakePRProvider{
-		headSHA:       "dd9388ff",
-		approvedAtSHA: map[string][]string{"dd9388ff": {"phaware-val", "Kevin"}},
+		headSHA:       "bbbbbbbb",
+		approvedAtSHA: map[string][]string{"bbbbbbbb": {"phaware-val", "Kevin"}},
 	}
 	var out bytes.Buffer
 	if err := VerifyPRApproval(provider, humanGateCfg(), 166, &out); err != nil {
@@ -648,8 +648,8 @@ func TestVerifyPRApproval_HumanGate_ReviewerLoginNeverCounts(t *testing.T) {
 	cfg := humanGateCfg()
 	cfg.RequiredHumanReviewers = []string{"phaware-val"}
 	provider := &fakePRProvider{
-		headSHA:       "dd9388ff",
-		approvedAtSHA: map[string][]string{"dd9388ff": {"phaware-val"}},
+		headSHA:       "bbbbbbbb",
+		approvedAtSHA: map[string][]string{"bbbbbbbb": {"phaware-val"}},
 	}
 	err := VerifyPRApproval(provider, cfg, 166, nil)
 	var needs *NeedsApprovalError
@@ -665,8 +665,8 @@ func TestVerifyPRApproval_HumanGate_FailsClosed(t *testing.T) {
 	}{
 		{"head SHA lookup fails", &fakePRProvider{headSHAErr: errors.New("gh: 401")}},
 		{"head SHA empty", &fakePRProvider{headSHA: ""}},
-		{"provider cannot report per-commit approvals", &fakePRProvider{headSHA: "dd9388ff", approvedAtErr: ErrUnsupported}},
-		{"approval lookup fails", &fakePRProvider{headSHA: "dd9388ff", approvedAtErr: errors.New("gh: 502")}},
+		{"provider cannot report per-commit approvals", &fakePRProvider{headSHA: "bbbbbbbb", approvedAtErr: ErrUnsupported}},
+		{"approval lookup fails", &fakePRProvider{headSHA: "bbbbbbbb", approvedAtErr: errors.New("gh: 502")}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -702,9 +702,9 @@ func TestVerifyPRApproval_HumanGate_StacksWithNamedApprover(t *testing.T) {
 	cfg := humanGateCfg()
 	cfg.PRApprover = "gatekeeper"
 	provider := &fakePRProvider{
-		headSHA:       "dd9388ff",
+		headSHA:       "bbbbbbbb",
 		approvedBy:    map[string]bool{"gatekeeper": true},
-		approvedAtSHA: map[string][]string{"f6ae0053": {"kevin"}},
+		approvedAtSHA: map[string][]string{"aaaaaaaa": {"kevin"}},
 	}
 	if err := VerifyPRApproval(provider, cfg, 166, nil); err == nil {
 		t.Fatal("named approver satisfied must not bypass the human-at-head gate")
