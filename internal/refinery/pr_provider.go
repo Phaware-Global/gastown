@@ -47,7 +47,13 @@ type PRProvider interface {
 
 	// MergePR merges a PR using the specified method (e.g., "squash", "merge", "rebase").
 	// Returns the merge commit SHA on success (if available).
-	MergePR(prNumber int, method string) (string, error)
+	//
+	// A non-empty matchHeadSHA pins the merge to that head commit: the provider
+	// must refuse if the PR head has moved, so a push that lands after an
+	// approval check cannot be merged on the strength of that check. A provider
+	// that cannot enforce the pin must return ErrUnsupported rather than merge
+	// unpinned. Empty means no pin.
+	MergePR(prNumber int, method, matchHeadSHA string) (string, error)
 
 	// CreatePR creates a PR, or returns the existing one if an open PR already
 	// exists for opts.Branch. Returns the PR number and URL.
@@ -81,6 +87,14 @@ type PRProvider interface {
 	// or superseded by a CHANGES_REQUESTED review from the same user do not
 	// count. Used to enforce pr_required_approvals > 1.
 	CountApprovals(prNumber int) (int, error)
+
+	// ApprovedReviewersAtSHA returns the logins whose most recent terminal
+	// review is APPROVED and was submitted against commit sha. Approvals on
+	// other commits are excluded: GitHub keeps a stale approval alive after a
+	// push, so callers that must know a human saw the code being merged need
+	// the SHA-scoped answer, not CountApprovals. sha must be non-empty.
+	// Providers that cannot answer return ErrUnsupported.
+	ApprovedReviewersAtSHA(prNumber int, sha string) ([]string, error)
 
 	// ChecksRollup returns the CI status rollup for the PR:
 	//   state: "SUCCESS", "FAILURE", "ERROR", "PENDING", "NO_CHECKS", or "" if unknown

@@ -1478,6 +1478,18 @@ type MergeQueueConfig struct {
 	// merge_strategy="pr".
 	PRRequiredApprovals *int `json:"pr_required_approvals,omitempty"`
 
+	// RequiredHumanReviewers names the GitHub logins whose approval counts as
+	// human sign-off. When non-empty, the merge path refuses unless at least
+	// one of them has an APPROVED review whose commit is the PR's CURRENT head
+	// SHA — an approval on an earlier commit does not count, because GitHub
+	// keeps a stale approval after a push. Agent approvals (the in-town
+	// Reviewer's clean-pass APPROVE, the count gate) never satisfy it. The
+	// pr_reviewer login is rejected here at config load, since it is an agent.
+	// Empty means no head-SHA human gate (existing behavior), which is also
+	// what an approval opt-out rig (pr_required_approvals: 0, no pr_approver)
+	// keeps. Only meaningful when merge_strategy="pr".
+	RequiredHumanReviewers []string `json:"required_human_reviewers,omitempty"`
+
 	// PRReviewLoopMax is the maximum number of review-fix polecat dispatch
 	// cycles per PR before the refinery escalates. Defaults to 3 when
 	// merge_strategy="pr". Only meaningful when merge_strategy="pr".

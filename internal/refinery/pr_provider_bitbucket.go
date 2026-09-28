@@ -46,7 +46,12 @@ func (p *bitbucketPRProvider) IsPRApprovedBy(prNumber int, user string) (bool, e
 	return false, ErrUnsupported
 }
 
-func (p *bitbucketPRProvider) MergePR(prNumber int, method string) (string, error) {
+func (p *bitbucketPRProvider) MergePR(prNumber int, method, matchHeadSHA string) (string, error) {
+	// The Bitbucket merge call has no head-commit precondition, so a pinned
+	// merge cannot be honored. Refuse rather than merge a head nobody verified.
+	if matchHeadSHA != "" {
+		return "", ErrUnsupported
+	}
 	// Map generic merge methods to Bitbucket strategy names.
 	bbStrategy := method
 	switch method {
@@ -86,6 +91,10 @@ func (p *bitbucketPRProvider) AllThreads(prNumber int) ([]ReviewThread, error) {
 
 func (p *bitbucketPRProvider) CountApprovals(prNumber int) (int, error) {
 	return 0, ErrUnsupported
+}
+
+func (p *bitbucketPRProvider) ApprovedReviewersAtSHA(prNumber int, sha string) ([]string, error) {
+	return nil, ErrUnsupported
 }
 
 func (p *bitbucketPRProvider) ChecksRollup(prNumber int) (string, bool, error) {

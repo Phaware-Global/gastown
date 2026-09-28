@@ -83,11 +83,12 @@ func (p *awaitFakeProvider) UnresolvedThreads(prNumber int) ([]ReviewThread, err
 	return p.threads, p.threadsErr
 }
 
-func (p *awaitFakeProvider) FindPRNumber(string) (int, error)              { panic("unused") }
-func (p *awaitFakeProvider) IsPRApproved(int) (bool, error)                { panic("unused") }
-func (p *awaitFakeProvider) IsPRApprovedBy(int, string) (bool, error)      { panic("unused") }
-func (p *awaitFakeProvider) MergePR(int, string) (string, error)           { panic("unused") }
-func (p *awaitFakeProvider) CreatePR(CreatePROptions) (int, string, error) { panic("unused") }
+func (p *awaitFakeProvider) FindPRNumber(string) (int, error)                     { panic("unused") }
+func (p *awaitFakeProvider) IsPRApproved(int) (bool, error)                       { panic("unused") }
+func (p *awaitFakeProvider) IsPRApprovedBy(int, string) (bool, error)             { panic("unused") }
+func (p *awaitFakeProvider) ApprovedReviewersAtSHA(int, string) ([]string, error) { panic("unused") }
+func (p *awaitFakeProvider) MergePR(int, string, string) (string, error)          { panic("unused") }
+func (p *awaitFakeProvider) CreatePR(CreatePROptions) (int, string, error)        { panic("unused") }
 func (p *awaitFakeProvider) RequestReview(prNumber int, reviewers []string) error {
 	if p.requestReviewErr != nil {
 		return p.requestReviewErr

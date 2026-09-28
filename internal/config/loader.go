@@ -376,6 +376,9 @@ func validateMergeQueueConfig(c *MergeQueueConfig) error {
 				"the approval gate, or the bot approves its own reviews and merges without a human",
 				c.PRApprover)
 		}
+		if err := ValidateRequiredHumanReviewers(c.RequiredHumanReviewers, c.PRReviewer); err != nil {
+			return err
+		}
 		switch c.PRMergeMethod {
 		case "", PRMergeMethodSquash, PRMergeMethodMerge, PRMergeMethodRebase:
 			// valid
@@ -3090,4 +3093,23 @@ func (c *EscalationConfig) GetMaxReescalations() int {
 		return 2
 	}
 	return *c.MaxReescalations
+}
+
+// ValidateRequiredHumanReviewers rejects a required_human_reviewers list that
+// cannot mean "a human": blank entries, and the rig's own pr_reviewer, which is
+// the in-town Reviewer (or an external bot) and whose APPROVE is exactly what
+// this gate exists to not count.
+func ValidateRequiredHumanReviewers(logins []string, prReviewer string) error {
+	reviewer := strings.ToLower(strings.TrimSpace(prReviewer))
+	for _, l := range logins {
+		l = strings.ToLower(strings.TrimSpace(l))
+		if l == "" {
+			return fmt.Errorf("required_human_reviewers must not contain an empty login")
+		}
+		if reviewer != "" && l == reviewer {
+			return fmt.Errorf("required_human_reviewers must not contain pr_reviewer (%q): "+
+				"the reviewer is an agent, and its approval cannot count as human sign-off", prReviewer)
+		}
+	}
+	return nil
 }

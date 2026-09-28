@@ -1582,15 +1582,31 @@ func (g *Git) IsPRApproved(prNumber int) (bool, error) {
 	return result.ReviewDecision == "APPROVED", nil
 }
 
+// ErrPRHeadMoved is returned (wrapped) by GhPrMerge when a head-pinned merge is
+// refused because the PR head is no longer the pinned commit.
+var ErrPRHeadMoved = errors.New("PR head moved since the pinned commit")
+
 // GhPrMerge merges a GitHub PR using the gh CLI, respecting branch protection rules.
 // The method parameter should be "merge", "squash", or "rebase".
+// A non-empty matchHeadSHA is passed as --match-head-commit, so GitHub refuses
+// the merge if the PR head is no longer that commit.
 // Returns the merge commit SHA on success.
-func (g *Git) GhPrMerge(prNumber int, method string) (string, error) {
+func (g *Git) GhPrMerge(prNumber int, method, matchHeadSHA string) (string, error) {
 	args := []string{"pr", "merge", fmt.Sprintf("%d", prNumber), "--" + method, "--delete-branch"}
+	if matchHeadSHA != "" {
+		args = append(args, "--match-head-commit", matchHeadSHA)
+	}
 	cmd := exec.Command("gh", args...)
 	cmd.Dir = g.workDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		// A pinned merge that GitHub refuses because the head moved is not a
+		// merge failure the caller can fix by changing code: the approval was
+		// for a commit that is no longer the head. Report it as such.
+		if matchHeadSHA != "" && strings.Contains(strings.ToLower(string(out)), "head branch was modified") {
+			return "", fmt.Errorf("gh pr merge refused, head moved from %s: %s: %w",
+				matchHeadSHA, strings.TrimSpace(string(out)), ErrPRHeadMoved)
+		}
 		return "", fmt.Errorf("gh pr merge failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 
@@ -2460,6 +2476,54 @@ func (g *Git) GhPrApprovalCount(prNumber int) (int, error) {
 		}
 	}
 	return count, nil
+}
+
+// GhPrApprovedReviewersAtSHA returns the logins whose most recent terminal
+// review on the PR is APPROVED and was submitted against commit sha. An
+// approval on any other commit does not count: GitHub does not dismiss stale
+// approvals on push, so an APPROVED review can outlive the code it approved.
+//
+// Only the newest terminal review per login is considered, so a later
+// CHANGES_REQUESTED or DISMISSED review removes the login. A later COMMENTED
+// review is not terminal and neither removes nor re-anchors the approval.
+//
+// sha must be the full commit OID (compared case-insensitively); an empty sha
+// is an error rather than "any commit", since that is the exact bypass this
+// helper exists to close. Logins keep their original case and the slice is
+// sorted case-insensitively.
+func (g *Git) GhPrApprovedReviewersAtSHA(prNumber int, sha string) ([]string, error) {
+	if strings.TrimSpace(sha) == "" {
+		return nil, fmt.Errorf("GhPrApprovedReviewersAtSHA: sha must be non-empty")
+	}
+	reviews, err := g.ghFetchReviews(prNumber)
+	if err != nil {
+		return nil, err
+	}
+	type entry struct{ state, login, oid string }
+	latest := make(map[string]entry, len(reviews))
+	for _, r := range reviews {
+		login := r.Author.Login
+		if login == "" {
+			continue
+		}
+		switch r.State {
+		case "APPROVED", "CHANGES_REQUESTED", "DISMISSED":
+			latest[strings.ToLower(login)] = entry{state: r.State, login: login, oid: r.Commit.OID}
+		}
+	}
+	wantSHA := strings.ToLower(strings.TrimSpace(sha))
+	keys := make([]string, 0, len(latest))
+	for k, e := range latest {
+		if e.state == "APPROVED" && strings.ToLower(e.oid) == wantSHA {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	out := make([]string, len(keys))
+	for i, k := range keys {
+		out[i] = latest[k].login
+	}
+	return out, nil
 }
 
 // GhPrChangesRequestedReviewers returns the GitHub logins of every reviewer

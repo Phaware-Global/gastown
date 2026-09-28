@@ -23,6 +23,21 @@ type NeedsApprovalError struct {
 
 func (e *NeedsApprovalError) Error() string { return e.Detail }
 
+// HeadMovedError indicates a head-pinned merge was refused because the PR head
+// moved after the approval check. The approval no longer covers the head, so
+// this is an approval state, not a build or merge failure: nothing in the
+// polecat's code is wrong, and a human must re-approve the new head.
+type HeadMovedError struct {
+	PRNumber int
+	Err      error
+}
+
+func (e *HeadMovedError) Error() string {
+	return fmt.Sprintf("PR #%d head moved since approval; re-approval needed", e.PRNumber)
+}
+
+func (e *HeadMovedError) Unwrap() error { return e.Err }
+
 // VerifyPRApproval checks the PR's approval state against cfg's gates
 // (PRApprover and GetPRRequiredApprovals), plus one unconditional
 // invariant that isn't a "gate" in the configured sense. Returns nil when
@@ -82,15 +97,31 @@ func (e *NeedsApprovalError) Error() string { return e.Detail }
 // unchanged. Pass nil from contexts that don't want progress noise
 // (e.g., the CLI subcommand which has its own output format).
 func VerifyPRApproval(provider PRProvider, cfg *MergeQueueConfig, prNumber int, out io.Writer) error {
+	_, err := VerifyPRApprovalAtHead(provider, cfg, prNumber, out)
+	return err
+}
+
+// VerifyPRApprovalAtHead is VerifyPRApproval that also returns the head SHA the
+// required-human-reviewer gate verified, or "" when that gate is not configured.
+// A merge caller must pass the returned SHA to PRProvider.MergePR as
+// matchHeadSHA. The approval is a fact about that commit, and the gates that
+// run after it make further network calls during which a push can land; without
+// the pin the merge takes whatever head exists when it finally runs.
+func VerifyPRApprovalAtHead(provider PRProvider, cfg *MergeQueueConfig, prNumber int, out io.Writer) (string, error) {
 	if provider == nil {
-		return fmt.Errorf("no PR provider configured")
+		return "", fmt.Errorf("no PR provider configured")
 	}
 	if cfg == nil {
-		return fmt.Errorf("no MergeQueueConfig provided")
+		return "", fmt.Errorf("no MergeQueueConfig provided")
 	}
 
 	if err := verifyNoBlockingReview(provider, cfg, prNumber, out); err != nil {
-		return err
+		return "", err
+	}
+
+	verifiedHead, err := VerifyHumanApprovalAtHead(provider, cfg, prNumber, out)
+	if err != nil {
+		return "", err
 	}
 
 	approver := cfg.PRApprover
@@ -99,13 +130,13 @@ func VerifyPRApproval(provider PRProvider, cfg *MergeQueueConfig, prNumber int, 
 	if approver != "" {
 		approved, err := provider.IsPRApprovedBy(prNumber, approver)
 		if err != nil {
-			return fmt.Errorf("failed to check PR #%d approval by %s: %w", prNumber, approver, err)
+			return "", fmt.Errorf("failed to check PR #%d approval by %s: %w", prNumber, approver, err)
 		}
 		if !approved {
 			if out != nil {
 				_, _ = fmt.Fprintf(out, "[Engineer] PR #%d awaiting approval from %s — deferring merge\n", prNumber, approver)
 			}
-			return &NeedsApprovalError{
+			return "", &NeedsApprovalError{
 				PRNumber: prNumber,
 				Detail:   fmt.Sprintf("PR #%d requires approving review from %s before merge", prNumber, approver),
 			}
@@ -118,14 +149,14 @@ func VerifyPRApproval(provider PRProvider, cfg *MergeQueueConfig, prNumber int, 
 	if requiredApprovals > 0 {
 		count, err := provider.CountApprovals(prNumber)
 		if err != nil {
-			return fmt.Errorf("failed to count approvals on PR #%d: %w", prNumber, err)
+			return "", fmt.Errorf("failed to count approvals on PR #%d: %w", prNumber, err)
 		}
 		if count < requiredApprovals {
 			if out != nil {
 				_, _ = fmt.Fprintf(out, "[Engineer] PR #%d has %d/%d required approvals — deferring merge\n",
 					prNumber, count, requiredApprovals)
 			}
-			return &NeedsApprovalError{
+			return "", &NeedsApprovalError{
 				PRNumber: prNumber,
 				Detail:   fmt.Sprintf("PR #%d has %d of %d required approvals", prNumber, count, requiredApprovals),
 			}
@@ -135,7 +166,85 @@ func VerifyPRApproval(provider PRProvider, cfg *MergeQueueConfig, prNumber int, 
 		}
 	}
 
-	return nil
+	return verifiedHead, nil
+}
+
+// VerifyHumanApprovalAtHead refuses the merge unless one of
+// cfg.RequiredHumanReviewers has an APPROVED review on the PR's current head
+// SHA. It is a no-op when the list is empty.
+//
+// Neither the named-approver gate nor the count gate can stand in for this:
+// GitHub keeps an approval after a push, so both keep passing on a human's
+// sign-off of code that has since changed, and an agent's approval at head
+// satisfies the count. An older approval must not license newer commits. The
+// check lives here, in the code both merge paths share, so it is a refusal by
+// the tool and not an instruction the refinery LLM can skip.
+//
+// Every failure to establish the answer refuses. An unknown head SHA, a
+// provider that cannot list approvals, or a lookup error is not evidence that a
+// human approved, and this gate is the one place that must not fail open.
+// pr_reviewer is excluded even if listed, so a config that bypassed
+// ValidateRequiredHumanReviewers cannot let the Reviewer approve its own PR.
+//
+// Returns the head SHA the approval was found on, or "" when the gate is unset.
+// The caller pins the merge to it: a human's approval covers that commit only.
+func VerifyHumanApprovalAtHead(provider PRProvider, cfg *MergeQueueConfig, prNumber int, out io.Writer) (string, error) {
+	if len(cfg.RequiredHumanReviewers) == 0 {
+		return "", nil
+	}
+	head, err := provider.CurrentHeadSHA(prNumber)
+	if err != nil {
+		return "", fmt.Errorf("refusing to merge PR #%d: cannot determine the head SHA to check "+
+			"human approval against: %w", prNumber, err)
+	}
+	if strings.TrimSpace(head) == "" {
+		return "", fmt.Errorf("refusing to merge PR #%d: the provider returned an empty head SHA, "+
+			"so human approval cannot be checked", prNumber)
+	}
+	approvers, err := provider.ApprovedReviewersAtSHA(prNumber, head)
+	if err != nil {
+		if errors.Is(err, ErrUnsupported) {
+			return "", fmt.Errorf("refusing to merge PR #%d: required_human_reviewers is set but this "+
+				"provider cannot report which commit each approval is on", prNumber)
+		}
+		return "", fmt.Errorf("refusing to merge PR #%d: failed to list approvals at head %s: %w",
+			prNumber, shortSHA(head), err)
+	}
+
+	required := make(map[string]bool, len(cfg.RequiredHumanReviewers))
+	for _, l := range cfg.RequiredHumanReviewers {
+		if l = strings.ToLower(strings.TrimSpace(l)); l != "" {
+			required[l] = true
+		}
+	}
+	agent := strings.ToLower(strings.TrimSpace(cfg.PRReviewer))
+	for _, login := range approvers {
+		l := strings.ToLower(strings.TrimSpace(login))
+		if required[l] && l != agent {
+			if out != nil {
+				_, _ = fmt.Fprintf(out, "[Engineer] PR #%d has human approval from %s at head %s\n",
+					prNumber, login, shortSHA(head))
+			}
+			return head, nil
+		}
+	}
+
+	if out != nil {
+		_, _ = fmt.Fprintf(out, "[Engineer] PR #%d has no human approval at head %s — deferring merge\n",
+			prNumber, shortSHA(head))
+	}
+	seen := "none"
+	if len(approvers) > 0 {
+		seen = strings.Join(approvers, ", ")
+	}
+	return "", &NeedsApprovalError{
+		PRNumber: prNumber,
+		Detail: fmt.Sprintf(
+			"PR #%d has no APPROVED review at its current head %s from a required human reviewer (%s). "+
+				"Approvals at this head: %s. An approval on an earlier commit does not count, and neither "+
+				"does an agent's; the human must re-approve after the latest push",
+			prNumber, shortSHA(head), strings.Join(cfg.RequiredHumanReviewers, ", "), seen),
+	}
 }
 
 // trustedBlockingReviewers filters CHANGES_REQUESTED logins down to the
