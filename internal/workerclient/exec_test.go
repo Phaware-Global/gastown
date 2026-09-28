@@ -906,6 +906,79 @@ func TestExecStream_TTYExitsWhenADescendantHoldsTheSlave(t *testing.T) {
 	}, 10*time.Second, 50*time.Millisecond, "the exec slot must be released")
 }
 
+// TestExecStream_TTYDrainsQueuedOutputBeforeClosingTheMaster pins the teardown
+// order: the pump must be given the chance to read what the agent left in the pty
+// queue BEFORE the master is closed, because closing discards that queue.
+//
+// The race is made deterministic by stalling the pump instead of timing the
+// agent. The test holds the connection's write lock, so the pump reads the first
+// chunk and parks in writeFrame; the agent then writes a second chunk, which can
+// only sit unread in the pty queue, and exits. Close-then-wait closes the master
+// with that chunk still queued and loses it; drain-then-close waits for the pump,
+// which the test releases only after the agent is gone.
+//
+// It only discriminates on Linux: on darwin the chunk survives either order, so
+// a green run there says nothing about the ordering.
+func TestExecStream_TTYDrainsQueuedOutputBeforeClosingTheMaster(t *testing.T) {
+	prev := ptyDrainGrace
+	ptyDrainGrace = 10 * time.Second // far longer than the stall below
+	t.Cleanup(func() { ptyDrainGrace = prev })
+
+	svc, err := New(Config{
+		WorkerID:    "test-worker",
+		Token:       "t0k",
+		StateDir:    filepath.Join(t.TempDir(), "state"),
+		ProxyURL:    "http://127.0.0.1:1", // never dialed: the agent makes no requests
+		ExecModes:   []string{"native"},
+		MaxSessions: 1,
+	})
+	require.NoError(t, err)
+
+	launcher, worker := net.Pipe()
+	t.Cleanup(func() { _ = launcher.Close(); _ = worker.Close() })
+	c := &connState{codec: sockproto.NewCodec(worker), nc: worker}
+
+	gone := filepath.Join(t.TempDir(), "agent-gone")
+	script := fmt.Sprintf("echo FIRST; sleep 0.3; echo SECOND; : > %q; exit 5", gone)
+	m := &sockproto.Message{Session: "s", Argv: []string{"sh", "-c", script}, TTY: true, Cols: 80, Rows: 24}
+
+	// Park the pump the moment it has something to write.
+	c.sendMu.Lock()
+	unlocked := false
+	unlock := func() {
+		if !unlocked {
+			unlocked = true
+			c.sendMu.Unlock()
+		}
+	}
+	defer unlock()
+
+	streamDone := make(chan error, 1)
+	go func() {
+		streamDone <- svc.streamExec(context.Background(), c, &session{}, m, t.TempDir(), "", "")
+	}()
+	res := drainStreamAsync(sockproto.NewCodec(launcher))
+
+	// The agent has written its last byte and is exiting once the marker exists;
+	// the pause covers the reap and the teardown that follows it.
+	require.Eventually(t, func() bool { _, err := os.Stat(gone); return err == nil },
+		10*time.Second, 10*time.Millisecond, "the agent never finished")
+	time.Sleep(500 * time.Millisecond)
+	unlock()
+
+	select {
+	case got := <-res:
+		require.NoError(t, got.err)
+		assert.Equal(t, 5, got.code)
+		assert.Contains(t, got.stdout, "FIRST")
+		assert.Contains(t, got.stdout, "SECOND",
+			"output still queued in the pty when the agent exits must reach the launcher; closing the master first discards it")
+	case <-time.After(30 * time.Second):
+		t.Fatal("the stream never delivered an exit frame")
+	}
+	require.NoError(t, <-streamDone)
+}
+
 // TestExecCommand_ContainerTTYDisablesDetachKeys pins that a container exec turns
 // OFF docker's ctrl-p/ctrl-q sequence, which -t silently enables. The launcher
 // forwards raw bytes, so an operator pressing it would make the docker client
