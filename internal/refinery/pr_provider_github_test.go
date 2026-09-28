@@ -1,6 +1,7 @@
 package refinery
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -181,5 +182,41 @@ func TestBitbucketMergePR_RefusesPinnedMerge(t *testing.T) {
 	p := &bitbucketPRProvider{}
 	if _, err := p.MergePR(7, "squash", "bbbbbbbb"); err != ErrUnsupported {
 		t.Errorf("err = %v, want ErrUnsupported", err)
+	}
+}
+
+// GitHub's refusal of a --match-head-commit merge is an approval state, and
+// must reach callers as *HeadMovedError. Any other merge failure, or the same
+// text on an unpinned merge, is left as an ordinary error.
+func TestGitHubMergePR_HeadMovedIsTyped(t *testing.T) {
+	tests := []struct {
+		name      string
+		pin       string
+		ghOutput  string
+		wantMoved bool
+	}{
+		{"pinned and head moved", "bbbbbbbb", "Head branch was modified. Review and try the merge again.", true},
+		{"pinned, other failure", "bbbbbbbb", "Pull request is not mergeable", false},
+		{"unpinned, same text", "", "Head branch was modified. Review and try the merge again.", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			script := "#!/bin/sh\necho '" + tc.ghOutput + "'\nexit 1\n"
+			if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(script), 0o700); err != nil { //nolint:gosec // test stub must be executable
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			p := newGitHubPRProvider(git.NewGit(t.TempDir()))
+
+			_, err := p.MergePR(7, "squash", tc.pin)
+			var moved *HeadMovedError
+			if got := errors.As(err, &moved); got != tc.wantMoved {
+				t.Fatalf("errors.As(HeadMovedError) = %v, want %v (err: %v)", got, tc.wantMoved, err)
+			}
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+		})
 	}
 }
