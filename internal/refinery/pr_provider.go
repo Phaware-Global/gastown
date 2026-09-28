@@ -82,6 +82,14 @@ type PRProvider interface {
 	// count. Used to enforce pr_required_approvals > 1.
 	CountApprovals(prNumber int) (int, error)
 
+	// ApprovedReviewersAtSHA returns the logins whose most recent terminal
+	// review is APPROVED and was submitted against commit sha. Approvals on
+	// other commits are excluded: GitHub keeps a stale approval alive after a
+	// push, so callers that must know a human saw the code being merged need
+	// the SHA-scoped answer, not CountApprovals. sha must be non-empty.
+	// Providers that cannot answer return ErrUnsupported.
+	ApprovedReviewersAtSHA(prNumber int, sha string) ([]string, error)
+
 	// ChecksRollup returns the CI status rollup for the PR:
 	//   state: "SUCCESS", "FAILURE", "ERROR", "PENDING", "NO_CHECKS", or "" if unknown
 	//   done:  true once every check has reached a terminal state

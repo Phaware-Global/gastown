@@ -660,8 +660,11 @@ func (f *threadGateFakeProvider) MergePR(int, string) (string, error) {
 	panic("MergePR called — threads-resolved gate failed to short-circuit")
 }
 
-func (f *threadGateFakeProvider) IsPRApproved(int) (bool, error)                  { panic("unused") }
-func (f *threadGateFakeProvider) IsPRApprovedBy(int, string) (bool, error)        { panic("unused") }
+func (f *threadGateFakeProvider) IsPRApproved(int) (bool, error)           { panic("unused") }
+func (f *threadGateFakeProvider) IsPRApprovedBy(int, string) (bool, error) { panic("unused") }
+func (f *threadGateFakeProvider) ApprovedReviewersAtSHA(int, string) ([]string, error) {
+	panic("unused")
+}
 func (f *threadGateFakeProvider) CountApprovals(int) (int, error)                 { panic("unused") }
 func (f *threadGateFakeProvider) CreatePR(CreatePROptions) (int, string, error)   { panic("unused") }
 func (f *threadGateFakeProvider) RequestReview(int, []string) error               { panic("unused") }
@@ -816,5 +819,40 @@ func TestDoMergePR_RequireReview_NoApproval(t *testing.T) {
 	if _, err := gitpkg.NewGit(t.TempDir()).FindPRNumber("nonexistent"); err != nil {
 		// gh CLI not available or not authenticated — test the config path only
 		t.Skip("gh CLI not available for PR approval testing")
+	}
+}
+
+// A required_human_reviewers list that the runtime loader silently dropped
+// would turn the head-SHA human gate into a no-op with no error, so the
+// runtime read path is pinned separately from the config-write path.
+func TestEngineer_LoadConfig_RequiredHumanReviewers(t *testing.T) {
+	load := func(t *testing.T, humans []string) (*Engineer, error) {
+		t.Helper()
+		tmpDir := t.TempDir()
+		cfg := map[string]interface{}{
+			"type": "rig", "version": 1, "name": "test-rig",
+			"merge_queue": map[string]interface{}{
+				"merge_strategy":           "pr",
+				"pr_required_approvals":    0,
+				"pr_reviewer":              "phaware-val",
+				"required_human_reviewers": humans,
+			},
+		}
+		if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), mustMarshalIndent(t, cfg), 0644); err != nil {
+			t.Fatal(err)
+		}
+		e := NewEngineer(&rig.Rig{Name: "test-rig", Path: tmpDir})
+		return e, e.LoadConfig()
+	}
+
+	e, err := load(t, []string{"kevin"})
+	if err != nil {
+		t.Fatalf("valid list must load: %v", err)
+	}
+	if got := e.config.RequiredHumanReviewers; len(got) != 1 || got[0] != "kevin" {
+		t.Errorf("RequiredHumanReviewers = %v, want [kevin]", got)
+	}
+	if _, err := load(t, []string{"phaware-val"}); err == nil {
+		t.Error("pr_reviewer in required_human_reviewers must be rejected on the runtime path too")
 	}
 }

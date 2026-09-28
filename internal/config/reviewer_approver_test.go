@@ -95,3 +95,25 @@ func TestValidateMergeQueue_EmptyReviewerIsAKnownGapNotAGuarantee(t *testing.T) 
 			"rejection) or something else regressed", err)
 	}
 }
+
+func TestValidateMergeQueue_RequiredHumanReviewers(t *testing.T) {
+	zero := 0
+	cfg := func(reviewer string, humans ...string) *MergeQueueConfig {
+		c := prConfig("", reviewer)
+		c.PRRequiredApprovals = &zero
+		c.RequiredHumanReviewers = humans
+		return c
+	}
+	if err := validateMergeQueueConfig(cfg("phaware-val", "kevin", "john")); err != nil {
+		t.Errorf("distinct human logins must be accepted: %v", err)
+	}
+	if err := validateMergeQueueConfig(cfg("phaware-val")); err != nil {
+		t.Errorf("empty list is the default and must be accepted: %v", err)
+	}
+	if err := validateMergeQueueConfig(cfg("phaware-val", "Phaware-Val ")); err == nil {
+		t.Error("the pr_reviewer agent must be rejected as a required human (case/space-insensitive)")
+	}
+	if err := validateMergeQueueConfig(cfg("phaware-val", "kevin", " ")); err == nil {
+		t.Error("a blank login must be rejected")
+	}
+}

@@ -88,6 +88,10 @@ func (p *bitbucketPRProvider) CountApprovals(prNumber int) (int, error) {
 	return 0, ErrUnsupported
 }
 
+func (p *bitbucketPRProvider) ApprovedReviewersAtSHA(prNumber int, sha string) ([]string, error) {
+	return nil, ErrUnsupported
+}
+
 func (p *bitbucketPRProvider) ChecksRollup(prNumber int) (string, bool, error) {
 	return "", false, ErrUnsupported
 }

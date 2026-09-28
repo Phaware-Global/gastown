@@ -69,6 +69,10 @@ func (p *githubPRProvider) CountApprovals(prNumber int) (int, error) {
 	return p.git.GhPrApprovalCount(prNumber)
 }
 
+func (p *githubPRProvider) ApprovedReviewersAtSHA(prNumber int, sha string) ([]string, error) {
+	return p.git.GhPrApprovedReviewersAtSHA(prNumber, sha)
+}
+
 func (p *githubPRProvider) ChecksRollup(prNumber int) (string, bool, error) {
 	return p.git.GhPrChecksRollup(prNumber)
 }

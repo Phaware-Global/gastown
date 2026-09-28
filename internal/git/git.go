@@ -2462,6 +2462,54 @@ func (g *Git) GhPrApprovalCount(prNumber int) (int, error) {
 	return count, nil
 }
 
+// GhPrApprovedReviewersAtSHA returns the logins whose most recent terminal
+// review on the PR is APPROVED and was submitted against commit sha. An
+// approval on any other commit does not count: GitHub does not dismiss stale
+// approvals on push, so an APPROVED review can outlive the code it approved.
+//
+// Only the newest terminal review per login is considered, so a later
+// CHANGES_REQUESTED or DISMISSED review removes the login. A later COMMENTED
+// review is not terminal and neither removes nor re-anchors the approval.
+//
+// sha must be the full commit OID (compared case-insensitively); an empty sha
+// is an error rather than "any commit", since that is the exact bypass this
+// helper exists to close. Logins keep their original case and the slice is
+// sorted case-insensitively.
+func (g *Git) GhPrApprovedReviewersAtSHA(prNumber int, sha string) ([]string, error) {
+	if strings.TrimSpace(sha) == "" {
+		return nil, fmt.Errorf("GhPrApprovedReviewersAtSHA: sha must be non-empty")
+	}
+	reviews, err := g.ghFetchReviews(prNumber)
+	if err != nil {
+		return nil, err
+	}
+	type entry struct{ state, login, oid string }
+	latest := make(map[string]entry, len(reviews))
+	for _, r := range reviews {
+		login := r.Author.Login
+		if login == "" {
+			continue
+		}
+		switch r.State {
+		case "APPROVED", "CHANGES_REQUESTED", "DISMISSED":
+			latest[strings.ToLower(login)] = entry{state: r.State, login: login, oid: r.Commit.OID}
+		}
+	}
+	wantSHA := strings.ToLower(strings.TrimSpace(sha))
+	keys := make([]string, 0, len(latest))
+	for k, e := range latest {
+		if e.state == "APPROVED" && strings.ToLower(e.oid) == wantSHA {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	out := make([]string, len(keys))
+	for i, k := range keys {
+		out[i] = latest[k].login
+	}
+	return out, nil
+}
+
 // GhPrChangesRequestedReviewers returns the GitHub logins of every reviewer
 // whose most recent terminal review on the PR is CHANGES_REQUESTED — i.e. the
 // reviewers currently blocking the PR who must re-review. A reviewer who later
