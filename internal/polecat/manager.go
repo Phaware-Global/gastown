@@ -1153,35 +1153,7 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	// Polecat dir is the parent directory (polecats/<name>/)
 	polecatDir := m.polecatDir(name)
 
-	// Preserve any uncommitted or unpushed work before anything below can
-	// discard it. This runs unconditionally — including under force/nuclear,
-	// which bypass the uncommitted-work gate a few lines down — because that
-	// gate is exactly what force/nuclear exist to skip, and skipping it must
-	// not mean skipping preservation too (gt-y8ts: force-nuking a polecat
-	// used to destroy real uncommitted work with zero recovery path). Tries a
-	// verified commit first, falling back to --no-verify only if hooks fail
-	// (broken husky hooks in polecat worktrees can fail a plain commit while
-	// a later push still reports success) — in which case the commit is kept
-	// locally but never pushed (gt-i4ej FIX 2). Pushes to a dedicated
-	// polecat/preserve-<branch> ref, verified against the remote tip, since
-	// the worktree itself is about to be removed. Best-effort: a preservation
-	// failure is logged and does not block an operator-requested removal.
-	//
-	// Push is gated on !nuclear: nuclear/selfNuke is the operator reaching
-	// for the strongest destructive operation, often precisely BECAUSE a
-	// polecat's worktree contents must not survive (compromised, wrote
-	// credentials, staged hostile data). Publishing that worktree to a
-	// shared remote ref first would invert the operator's intent. For an
-	// attached branch, nuclear removal still commits locally — the content
-	// is not silently destroyed, recoverable via refs/heads/<branch>, which
-	// lives in the common git dir and survives worktree removal. A detached
-	// worktree has no such ref: CurrentBranch() reports the literal "HEAD"
-	// string, AutoPreserveUncommittedWork commits onto that detached HEAD,
-	// and WorktreeRemove's teardown deletes .git/worktrees/<id> — including
-	// the per-worktree HEAD and reflog that were the only things pointing
-	// at that commit — leaving an unreachable object awaiting gc. So the
-	// detached/nuclear case skips the commit entirely rather than promising
-	// a recoverability it can't deliver (PR #184 review).
+	// Best-effort, even under force/nuclear: snapshot uncommitted tracked work into a local refs/gt/preserve ref (never pushed) before the worktree is removed.
 	preserveGit := git.NewGit(clonePath)
 	if branch, brErr := preserveGit.CurrentBranch(); brErr == nil && branch != "" {
 		if branch == "HEAD" && nuclear {
@@ -1333,7 +1305,7 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 				// push. AutoPreserveUncommittedWork's Ephemeral mode (used
 				// just above) is the primary fix and should already keep
 				// one off branch — this is the backstop.
-				style.PrintWarning("branch %s carries a checkpoint auto-save commit %s — refusing the pre-removal push; the work remains reachable via its preservation ref", branch, wipSHA[:8])
+				style.PrintWarning("branch %s carries a checkpoint auto-save commit %s — refusing the pre-removal push; the commit stays on the local branch (refs/heads/%s) and is not pushed", branch, wipSHA[:8], branch)
 			} else {
 				pushed, unpushedCount, checkErr := polecatGit.BranchPushedToRemote(branch, "origin")
 				if checkErr == nil && !pushed && unpushedCount > 0 {
