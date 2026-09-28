@@ -835,7 +835,7 @@ func TestEngineer_LoadConfig_RequiredHumanReviewers(t *testing.T) {
 			"merge_queue": map[string]interface{}{
 				"merge_strategy":           "pr",
 				"pr_required_approvals":    0,
-				"pr_reviewer":              "phaware-val",
+				"pr_reviewer":              "gastown-reviewer",
 				"required_human_reviewers": humans,
 			},
 		}
@@ -853,7 +853,7 @@ func TestEngineer_LoadConfig_RequiredHumanReviewers(t *testing.T) {
 	if got := e.config.RequiredHumanReviewers; len(got) != 1 || got[0] != "alice" {
 		t.Errorf("RequiredHumanReviewers = %v, want [alice]", got)
 	}
-	if _, err := load(t, []string{"phaware-val"}); err == nil {
+	if _, err := load(t, []string{"gastown-reviewer"}); err == nil {
 		t.Error("pr_reviewer in required_human_reviewers must be rejected on the runtime path too")
 	}
 }

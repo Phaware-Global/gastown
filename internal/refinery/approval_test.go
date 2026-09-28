@@ -584,7 +584,7 @@ func humanGateCfg() *MergeQueueConfig {
 	return &MergeQueueConfig{
 		MergeStrategy:          "pr",
 		PRRequiredApprovals:    intPtr(0),
-		PRReviewer:             "phaware-val",
+		PRReviewer:             "gastown-reviewer",
 		ReviewerLocal:          true,
 		RequiredHumanReviewers: []string{"alice"},
 	}
@@ -596,7 +596,7 @@ func TestVerifyPRApproval_HumanGate_ApprovalOnOlderSHA_Refuses(t *testing.T) {
 		headSHA: "bbbbbbbb",
 		approvedAtSHA: map[string][]string{
 			"aaaaaaaa": {"alice"},
-			"bbbbbbbb": {"phaware-val"},
+			"bbbbbbbb": {"gastown-reviewer"},
 		},
 	}
 	err := VerifyPRApproval(provider, humanGateCfg(), 166, nil)
@@ -615,14 +615,14 @@ func TestVerifyPRApproval_HumanGate_ApprovalOnOlderSHA_Refuses(t *testing.T) {
 func TestVerifyPRApproval_HumanGate_AgentOnlyAtHead_Refuses(t *testing.T) {
 	provider := &fakePRProvider{
 		headSHA:       "bbbbbbbb",
-		approvedAtSHA: map[string][]string{"bbbbbbbb": {"phaware-val"}},
+		approvedAtSHA: map[string][]string{"bbbbbbbb": {"gastown-reviewer"}},
 	}
 	err := VerifyPRApproval(provider, humanGateCfg(), 166, nil)
 	var needs *NeedsApprovalError
 	if !errors.As(err, &needs) {
 		t.Fatalf("want *NeedsApprovalError, got %v", err)
 	}
-	if !strings.Contains(needs.Detail, "phaware-val") {
+	if !strings.Contains(needs.Detail, "gastown-reviewer") {
 		t.Errorf("detail should show who did approve at head, got: %s", needs.Detail)
 	}
 }
@@ -630,7 +630,7 @@ func TestVerifyPRApproval_HumanGate_AgentOnlyAtHead_Refuses(t *testing.T) {
 func TestVerifyPRApproval_HumanGate_HumanAtHead_Passes(t *testing.T) {
 	provider := &fakePRProvider{
 		headSHA:       "bbbbbbbb",
-		approvedAtSHA: map[string][]string{"bbbbbbbb": {"phaware-val", "Alice"}},
+		approvedAtSHA: map[string][]string{"bbbbbbbb": {"gastown-reviewer", "Alice"}},
 	}
 	var out bytes.Buffer
 	if err := VerifyPRApproval(provider, humanGateCfg(), 166, &out); err != nil {
@@ -646,10 +646,10 @@ func TestVerifyPRApproval_HumanGate_ReviewerLoginNeverCounts(t *testing.T) {
 	// (hand-edited config), the runtime gate must still not let the agent
 	// satisfy itself.
 	cfg := humanGateCfg()
-	cfg.RequiredHumanReviewers = []string{"phaware-val"}
+	cfg.RequiredHumanReviewers = []string{"gastown-reviewer"}
 	provider := &fakePRProvider{
 		headSHA:       "bbbbbbbb",
-		approvedAtSHA: map[string][]string{"bbbbbbbb": {"phaware-val"}},
+		approvedAtSHA: map[string][]string{"bbbbbbbb": {"gastown-reviewer"}},
 	}
 	err := VerifyPRApproval(provider, cfg, 166, nil)
 	var needs *NeedsApprovalError
