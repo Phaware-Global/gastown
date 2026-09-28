@@ -101,10 +101,15 @@ type PreserveOptions struct {
 	// name> in the local repo (which outlives a worktree removal) rather than
 	// left dangling.
 	//
-	// commit-tree runs no hooks, so no pre-commit scanner sees the snapshot;
-	// the add -u allowlist is the content gate and the push still passes
-	// through the pre-push hook. Committed reports that a snapshot commit was
-	// created and durably recorded, not that the branch advanced.
+	// commit-tree runs no hooks, so the configured pre-commit hook (typically
+	// the secret scanner) is run explicitly on the snapshot, against the
+	// throwaway index, before anything is pushed. If it fails, or head's
+	// ancestry holds an unverified commit, the snapshot is still built and
+	// pinned locally under refs/preserve/ but NEVER pushed, and HooksFailed is
+	// set so callers escalate. A merge in progress (MERGE_HEAD) is refused
+	// outright. Committed reports that a snapshot commit was created and
+	// durably recorded (locally or on the preservation ref), not that the
+	// branch advanced.
 	//
 	// Leave false for a caller where the commit IS the polecat's real work and
 	// a normal push of the branch follows in the same flow (gt done).
