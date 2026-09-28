@@ -35,35 +35,35 @@ func TestGhPrApprovedReviewersAtSHA(t *testing.T) {
 		{
 			name: "approval on an older commit does not count",
 			reviews: `{"reviews":[
-				{"author":{"login":"kevin"},"commit":{"oid":"` + old + `"},"state":"APPROVED","submittedAt":"2026-09-01T00:00:00Z"}]}`,
+				{"author":{"login":"alice"},"commit":{"oid":"` + old + `"},"state":"APPROVED","submittedAt":"2026-09-01T00:00:00Z"}]}`,
 			want: []string{},
 		},
 		{
 			name: "approval at head counts",
 			reviews: `{"reviews":[
-				{"author":{"login":"Kevin"},"commit":{"oid":"` + head + `"},"state":"APPROVED","submittedAt":"2026-09-01T00:00:00Z"}]}`,
-			want: []string{"Kevin"},
+				{"author":{"login":"Alice"},"commit":{"oid":"` + head + `"},"state":"APPROVED","submittedAt":"2026-09-01T00:00:00Z"}]}`,
+			want: []string{"Alice"},
 		},
 		{
 			name: "later comment at head does not re-anchor an old approval",
 			reviews: `{"reviews":[
-				{"author":{"login":"kevin"},"commit":{"oid":"` + old + `"},"state":"APPROVED","submittedAt":"2026-09-01T00:00:00Z"},
-				{"author":{"login":"kevin"},"commit":{"oid":"` + head + `"},"state":"COMMENTED","submittedAt":"2026-09-02T00:00:00Z"}]}`,
+				{"author":{"login":"alice"},"commit":{"oid":"` + old + `"},"state":"APPROVED","submittedAt":"2026-09-01T00:00:00Z"},
+				{"author":{"login":"alice"},"commit":{"oid":"` + head + `"},"state":"COMMENTED","submittedAt":"2026-09-02T00:00:00Z"}]}`,
 			want: []string{},
 		},
 		{
 			name: "later changes-requested at head removes the approval",
 			reviews: `{"reviews":[
-				{"author":{"login":"kevin"},"commit":{"oid":"` + head + `"},"state":"APPROVED","submittedAt":"2026-09-01T00:00:00Z"},
-				{"author":{"login":"kevin"},"commit":{"oid":"` + head + `"},"state":"CHANGES_REQUESTED","submittedAt":"2026-09-02T00:00:00Z"}]}`,
+				{"author":{"login":"alice"},"commit":{"oid":"` + head + `"},"state":"APPROVED","submittedAt":"2026-09-01T00:00:00Z"},
+				{"author":{"login":"alice"},"commit":{"oid":"` + head + `"},"state":"CHANGES_REQUESTED","submittedAt":"2026-09-02T00:00:00Z"}]}`,
 			want: []string{},
 		},
 		{
 			name: "re-approval at head after an old approval counts",
 			reviews: `{"reviews":[
-				{"author":{"login":"kevin"},"commit":{"oid":"` + old + `"},"state":"APPROVED","submittedAt":"2026-09-01T00:00:00Z"},
-				{"author":{"login":"kevin"},"commit":{"oid":"` + head + `"},"state":"APPROVED","submittedAt":"2026-09-02T00:00:00Z"}]}`,
-			want: []string{"kevin"},
+				{"author":{"login":"alice"},"commit":{"oid":"` + old + `"},"state":"APPROVED","submittedAt":"2026-09-01T00:00:00Z"},
+				{"author":{"login":"alice"},"commit":{"oid":"` + head + `"},"state":"APPROVED","submittedAt":"2026-09-02T00:00:00Z"}]}`,
+			want: []string{"alice"},
 		},
 		{
 			name: "result is sorted case-insensitively and excludes other logins' stale approvals",

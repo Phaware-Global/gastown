@@ -586,7 +586,7 @@ func humanGateCfg() *MergeQueueConfig {
 		PRRequiredApprovals:    intPtr(0),
 		PRReviewer:             "phaware-val",
 		ReviewerLocal:          true,
-		RequiredHumanReviewers: []string{"kevin"},
+		RequiredHumanReviewers: []string{"alice"},
 	}
 }
 
@@ -595,7 +595,7 @@ func TestVerifyPRApproval_HumanGate_ApprovalOnOlderSHA_Refuses(t *testing.T) {
 	provider := &fakePRProvider{
 		headSHA: "bbbbbbbb",
 		approvedAtSHA: map[string][]string{
-			"aaaaaaaa": {"kevin"},
+			"aaaaaaaa": {"alice"},
 			"bbbbbbbb": {"phaware-val"},
 		},
 	}
@@ -630,13 +630,13 @@ func TestVerifyPRApproval_HumanGate_AgentOnlyAtHead_Refuses(t *testing.T) {
 func TestVerifyPRApproval_HumanGate_HumanAtHead_Passes(t *testing.T) {
 	provider := &fakePRProvider{
 		headSHA:       "bbbbbbbb",
-		approvedAtSHA: map[string][]string{"bbbbbbbb": {"phaware-val", "Kevin"}},
+		approvedAtSHA: map[string][]string{"bbbbbbbb": {"phaware-val", "Alice"}},
 	}
 	var out bytes.Buffer
 	if err := VerifyPRApproval(provider, humanGateCfg(), 166, &out); err != nil {
 		t.Fatalf("human approval at head must pass, got %v", err)
 	}
-	if !strings.Contains(out.String(), "Kevin") {
+	if !strings.Contains(out.String(), "Alice") {
 		t.Errorf("progress line should name the approver, got %q", out.String())
 	}
 }
@@ -704,7 +704,7 @@ func TestVerifyPRApproval_HumanGate_StacksWithNamedApprover(t *testing.T) {
 	provider := &fakePRProvider{
 		headSHA:       "bbbbbbbb",
 		approvedBy:    map[string]bool{"gatekeeper": true},
-		approvedAtSHA: map[string][]string{"aaaaaaaa": {"kevin"}},
+		approvedAtSHA: map[string][]string{"aaaaaaaa": {"alice"}},
 	}
 	if err := VerifyPRApproval(provider, cfg, 166, nil); err == nil {
 		t.Fatal("named approver satisfied must not bypass the human-at-head gate")

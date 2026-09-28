@@ -845,12 +845,12 @@ func TestEngineer_LoadConfig_RequiredHumanReviewers(t *testing.T) {
 		return e, e.LoadConfig()
 	}
 
-	e, err := load(t, []string{"kevin"})
+	e, err := load(t, []string{"alice"})
 	if err != nil {
 		t.Fatalf("valid list must load: %v", err)
 	}
-	if got := e.config.RequiredHumanReviewers; len(got) != 1 || got[0] != "kevin" {
-		t.Errorf("RequiredHumanReviewers = %v, want [kevin]", got)
+	if got := e.config.RequiredHumanReviewers; len(got) != 1 || got[0] != "alice" {
+		t.Errorf("RequiredHumanReviewers = %v, want [alice]", got)
 	}
 	if _, err := load(t, []string{"phaware-val"}); err == nil {
 		t.Error("pr_reviewer in required_human_reviewers must be rejected on the runtime path too")

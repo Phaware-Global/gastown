@@ -104,7 +104,7 @@ func TestValidateMergeQueue_RequiredHumanReviewers(t *testing.T) {
 		c.RequiredHumanReviewers = humans
 		return c
 	}
-	if err := validateMergeQueueConfig(cfg("phaware-val", "kevin", "john")); err != nil {
+	if err := validateMergeQueueConfig(cfg("phaware-val", "alice", "bob")); err != nil {
 		t.Errorf("distinct human logins must be accepted: %v", err)
 	}
 	if err := validateMergeQueueConfig(cfg("phaware-val")); err != nil {
@@ -113,7 +113,7 @@ func TestValidateMergeQueue_RequiredHumanReviewers(t *testing.T) {
 	if err := validateMergeQueueConfig(cfg("phaware-val", "Phaware-Val ")); err == nil {
 		t.Error("the pr_reviewer agent must be rejected as a required human (case/space-insensitive)")
 	}
-	if err := validateMergeQueueConfig(cfg("phaware-val", "kevin", " ")); err == nil {
+	if err := validateMergeQueueConfig(cfg("phaware-val", "alice", " ")); err == nil {
 		t.Error("a blank login must be rejected")
 	}
 }
