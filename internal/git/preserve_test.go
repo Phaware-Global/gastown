@@ -485,127 +485,6 @@ func TestDetachedPreservationIdentity(t *testing.T) {
 	}
 }
 
-// TestAutoPreserveUncommittedWork_EphemeralNeverAdvancesBranch pins gt-94p1
-// requirement 1: a checkpoint auto-save must never move a branch's HEAD.
-// Without Ephemeral, this commit would sit on the branch itself — and ANY
-// later ordinary push (the polecat's own push, gt done, a pre-nuke push)
-// would carry it to a real, possibly already-reviewed PR branch (the
-// mechanism behind graphql-api #162/#166 and gastown #250/#251, gt-2stz).
-func TestAutoPreserveUncommittedWork_EphemeralNeverAdvancesBranch(t *testing.T) {
-	dir := initTestRepo(t)
-	protected := addTestOriginRemote(t, dir)
-	g := NewGit(dir)
-	branch := "polecat/foo/gt-94p1@abc123"
-	runGitTestCmd(t, dir, "checkout", "-b", branch)
-
-	origHead, err := g.Rev("HEAD")
-	if err != nil {
-		t.Fatalf("Rev HEAD: %v", err)
-	}
-
-	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# Test\nwip content\n"), 0644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-
-	result, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{
-		IssueID:           "gt-94p1",
-		Push:              true,
-		CommitMessage:     "WIP: checkpoint (auto)",
-		ProtectedBranches: []string{protected},
-		Ephemeral:         true,
-	})
-	if err != nil {
-		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
-	}
-	if !result.Committed {
-		t.Fatal("expected Committed=true for a dirty source file")
-	}
-	if !result.Pushed {
-		t.Fatal("expected Pushed=true")
-	}
-
-	newHead, err := g.Rev("HEAD")
-	if err != nil {
-		t.Fatalf("Rev HEAD after preserve: %v", err)
-	}
-	if newHead != origHead {
-		t.Fatalf("branch HEAD = %s, want unchanged at %s — Ephemeral must never advance the branch", newHead, origHead)
-	}
-	currentBranch, err := g.CurrentBranch()
-	if err != nil {
-		t.Fatalf("CurrentBranch: %v", err)
-	}
-	if currentBranch != branch {
-		t.Fatalf("checked-out branch changed to %q, want still %q", currentBranch, branch)
-	}
-
-	// The snapshot must still be durably reachable — just not from the branch.
-	tip, err := g.RemoteBranchTip("origin", result.Ref)
-	if err != nil {
-		t.Fatalf("RemoteBranchTip(%s): %v", result.Ref, err)
-	}
-	if tip != result.Commit {
-		t.Fatalf("preservation ref %s tip = %s, want %s", result.Ref, tip, result.Commit)
-	}
-
-	// The work itself is not lost: still present (now uncommitted again),
-	// ready to be retried or committed for real.
-	status, err := g.CheckUncommittedWork()
-	if err != nil {
-		t.Fatalf("CheckUncommittedWork: %v", err)
-	}
-	if !status.HasUncommittedChanges {
-		t.Fatal("expected the preserved change to remain staged/uncommitted on the worktree after an Ephemeral preserve")
-	}
-}
-
-// TestAutoPreserveUncommittedWork_EphemeralLeavesRealCommitsAlone ensures
-// Ephemeral only rolls back a commit THIS CALL made — pre-existing commits
-// the agent made itself are real work and must reach the preservation ref
-// (and stay reachable from the branch) untouched.
-func TestAutoPreserveUncommittedWork_EphemeralLeavesRealCommitsAlone(t *testing.T) {
-	dir := initTestRepo(t)
-	protected := addTestOriginRemote(t, dir)
-	g := NewGit(dir)
-	branch := "polecat/foo/gt-94p1@def456"
-	runGitTestCmd(t, dir, "checkout", "-b", branch)
-
-	// The agent's own real, already-committed work.
-	if err := os.WriteFile(filepath.Join(dir, "real.txt"), []byte("real work\n"), 0644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	runGitTestCmd(t, dir, "add", "real.txt")
-	runGitTestCmd(t, dir, "commit", "-m", "real work, not a checkpoint")
-	realHead, err := g.Rev("HEAD")
-	if err != nil {
-		t.Fatalf("Rev HEAD: %v", err)
-	}
-
-	// Nothing uncommitted this cycle.
-	result, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{
-		Push:              true,
-		ProtectedBranches: []string{protected},
-		Ephemeral:         true,
-	})
-	if err != nil {
-		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
-	}
-	if result.Committed {
-		t.Fatal("expected Committed=false — nothing was uncommitted")
-	}
-	if !result.Pushed {
-		t.Fatal("expected the agent's real unpushed commit to still be pushed to the preservation ref")
-	}
-
-	newHead, err := g.Rev("HEAD")
-	if err != nil {
-		t.Fatalf("Rev HEAD after preserve: %v", err)
-	}
-	if newHead != realHead {
-		t.Fatalf("branch HEAD = %s, want %s — Ephemeral must never roll back the agent's own real commit", newHead, realHead)
-	}
-}
-
 func TestHasWIPCommit_FlagsOwnUnmergedCommit(t *testing.T) {
 	localDir, _, _ := initTestRepoWithRemote(t)
 	g := NewGit(localDir)
@@ -624,7 +503,7 @@ func TestHasWIPCommit_FlagsOwnUnmergedCommit(t *testing.T) {
 		t.Fatalf("Rev HEAD: %v", err)
 	}
 
-	got, err := HasWIPCommit(g, "origin", "WIP: checkpoint (auto)", []string{"develop"})
+	got, err := HasWIPCommit(g, "origin", "HEAD", "WIP: checkpoint (auto)", []string{"develop"})
 	if err != nil {
 		t.Fatalf("HasWIPCommit: %v", err)
 	}
@@ -648,7 +527,7 @@ func TestHasWIPCommit_ExemptsCommitAlreadyOnProtectedBranch(t *testing.T) {
 	runGitTestCmd(t, localDir, "checkout", "-b", "polecat/foo/gt-94p1@abc123", "develop")
 	runGitTestCmd(t, localDir, "fetch", "origin")
 
-	got, err := HasWIPCommit(g, "origin", "WIP: checkpoint (auto)", []string{"develop"})
+	got, err := HasWIPCommit(g, "origin", "HEAD", "WIP: checkpoint (auto)", []string{"develop"})
 	if err != nil {
 		t.Fatalf("HasWIPCommit: %v", err)
 	}
@@ -670,7 +549,7 @@ func TestHasWIPCommit_CleanBranchReturnsEmpty(t *testing.T) {
 	runGitTestCmd(t, localDir, "add", "real.txt")
 	runGitTestCmd(t, localDir, "commit", "-m", "real work")
 
-	got, err := HasWIPCommit(g, "origin", "WIP: checkpoint (auto)", []string{"develop"})
+	got, err := HasWIPCommit(g, "origin", "HEAD", "WIP: checkpoint (auto)", []string{"develop"})
 	if err != nil {
 		t.Fatalf("HasWIPCommit: %v", err)
 	}

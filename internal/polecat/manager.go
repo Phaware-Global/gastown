@@ -1187,13 +1187,16 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 		if branch == "HEAD" && nuclear {
 			style.PrintWarning("worktree %s is on a detached HEAD — nuclear removal skips local auto-preserve here (no branch ref would survive worktree teardown to hold the commit); any uncommitted work is discarded", name)
 		} else if result, presErr := git.AutoPreserveUncommittedWork(preserveGit, branch, git.PreserveOptions{
-			IssueID:           name,
-			Push:              !nuclear,
+			IssueID: name,
+			Push:    !nuclear,
+			// The WIP prefix is what HasWIPCommit's push-site backstop
+			// matches; a snapshot without it would slip past that guard.
+			CommitMessage:     checkpoint.WIPCommitPrefix + " (" + name + ")",
 			ProtectedBranches: []string{m.rig.DefaultBranch()},
 			// gt-94p1 root fix: this worktree may be a reused directory
 			// whose leftover uncommitted content has nothing to do with
-			// the branch it happens to be on right now. Ephemeral keeps
-			// the preserve commit off branch's own ref (pushed only to the
+			// the branch it happens to be on right now. Ephemeral snapshots
+			// it without touching the branch (pushed only to the
 			// preservation ref), so the best-effort branch push below only
 			// ever republishes commits the agent genuinely made itself.
 			Ephemeral: true,
@@ -1326,7 +1329,7 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 				style.PrintWarning("could not verify %s's commits before the pre-removal push, not pushing branch %s: %v", name, branch, chkErr)
 			} else if badSHA != "" {
 				style.PrintWarning("branch %s carries commit %s made with pre-commit hooks bypassed — refusing the pre-removal push; the work remains in the local commit", branch, badSHA[:8])
-			} else if wipSHA, wipErr := git.HasWIPCommit(polecatGit, "origin", checkpoint.WIPCommitPrefix, []string{m.rig.DefaultBranch()}); wipErr != nil {
+			} else if wipSHA, wipErr := git.HasWIPCommit(polecatGit, "origin", "refs/heads/"+branch, checkpoint.WIPCommitPrefix, []string{m.rig.DefaultBranch()}); wipErr != nil {
 				style.PrintWarning("could not verify %s's commits before the pre-removal push, not pushing branch %s: %v", name, branch, wipErr)
 			} else if wipSHA != "" {
 				// gt-94p1 requirement 3: a checkpoint auto-save commit must

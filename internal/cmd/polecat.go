@@ -1878,7 +1878,7 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 			// gt-94p1 requirement 3: never let this best-effort push carry a
 			// checkpoint auto-save commit onto the real branch. Backstop
 			// alongside AutoPreserveUncommittedWork's Ephemeral mode.
-			if wipSHA, wipErr := git.HasWIPCommit(pushGit, "origin", checkpoint.WIPCommitPrefix, []string{r.DefaultBranch()}); wipErr != nil {
+			if wipSHA, wipErr := git.HasWIPCommit(pushGit, "origin", "refs/heads/"+branchToDelete, checkpoint.WIPCommitPrefix, []string{r.DefaultBranch()}); wipErr != nil {
 				fmt.Printf("  %s could not verify commits before best-effort push, skipping: %v\n", style.Dim.Render("○"), wipErr)
 			} else if wipSHA != "" {
 				fmt.Printf("  %s branch carries checkpoint auto-save commit %s — skipping best-effort push\n", style.Dim.Render("○"), wipSHA[:8])

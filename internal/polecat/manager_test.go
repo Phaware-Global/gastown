@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/checkpoint"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
@@ -1432,6 +1433,49 @@ func TestReuseIdlePolecat_ResumeBranchHardSyncsAwayStaleContent(t *testing.T) {
 	// ReuseIdlePolecat intentionally re-provisions an untracked CLAUDE.md
 	// overlay after the hard reset (see its own comment), so an untracked
 	// CLAUDE.md is expected scaffolding, not stale content.
+}
+
+// TestRemoveWithOptions_PreservesDirtyWorkAsWIPSnapshotWithoutMovingBranch pins
+// gt-94p1: the pre-removal preserve records the work under a WIP-prefixed
+// commit (so the push-site backstop recognises it) on the preservation ref
+// only — the polecat's branch is never advanced.
+func TestRemoveWithOptions_PreservesDirtyWorkAsWIPSnapshotWithoutMovingBranch(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+
+	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	wtGit := git.NewGit(polecat.ClonePath)
+	headBefore, err := wtGit.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev HEAD: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(polecat.ClonePath, "README.md"), []byte("# Test\nunsaved polecat work\n"), 0644); err != nil {
+		t.Fatalf("write README.md: %v", err)
+	}
+
+	if err := mgr.RemoveWithOptions("toast", true, false, false); err != nil {
+		t.Fatalf("RemoveWithOptions: %v", err)
+	}
+
+	// origin is mayorRig itself in this fixture.
+	out, err := exec.Command("git", "-C", mayorRig, "for-each-ref", "--format=%(refname) %(subject)", "refs/heads/polecat/preserve-*").Output()
+	if err != nil {
+		t.Fatalf("for-each-ref: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 1 || lines[0] == "" {
+		t.Fatalf("want exactly one preservation ref after removal, got %q", out)
+	}
+	if !strings.Contains(lines[0], checkpoint.WIPCommitPrefix) {
+		t.Fatalf("preservation commit %q lacks the WIP prefix %q — HasWIPCommit's backstop cannot recognise it", lines[0], checkpoint.WIPCommitPrefix)
+	}
+
+	branchTip, err := exec.Command("git", "-C", mayorRig, "rev-parse", "refs/heads/"+polecat.Branch).Output()
+	if err == nil && strings.TrimSpace(string(branchTip)) != headBefore {
+		t.Fatalf("polecat branch %s moved to %s, want it left at %s", polecat.Branch, strings.TrimSpace(string(branchTip)), headBefore)
+	}
 }
 
 func writeWispSetupCommand(t *testing.T, mgr *Manager, command string) {

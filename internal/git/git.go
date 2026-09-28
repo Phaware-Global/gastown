@@ -3055,16 +3055,6 @@ func (g *Git) ResetHard(ref string) error {
 	return err
 }
 
-// ResetSoft moves HEAD and the current branch to ref without touching the
-// index or working tree — whatever was staged or modified before the call
-// remains staged/modified after it. Used to un-advance a branch after an
-// Ephemeral preservation commit: the commit stays reachable elsewhere (the
-// preservation ref), while branch itself never carried it.
-func (g *Git) ResetSoft(ref string) error {
-	_, err := g.run("reset", "--soft", ref)
-	return err
-}
-
 // CleanForce removes untracked files and directories from the working tree.
 // Excludes .runtime/ to preserve agent lock files and session state.
 func (g *Git) CleanForce() error {
