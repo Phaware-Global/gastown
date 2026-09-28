@@ -449,20 +449,10 @@ func runRefineryPrWaitApproval(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	approver := refPrWaitApproverUser
-	minApprovals := refPrWaitApprovalMin
-	if minApprovals < 0 {
-		return fmt.Errorf("--min-approvals must be non-negative, got %d", minApprovals)
+	if refPrWaitApprovalMin < 0 {
+		return fmt.Errorf("--min-approvals must be non-negative, got %d", refPrWaitApprovalMin)
 	}
-	// Require at least one active gate so callers can't accidentally bypass
-	// the approval wait by omitting --approver and setting --min-approvals=0
-	// (or letting it default to 0). An explicit "no gates" configuration is
-	// almost always a scripting error.
-	if approver == "" && minApprovals == 0 {
-		return fmt.Errorf("wait-approval requires at least one gate: " +
-			"set --approver=<user> and/or --min-approvals=<n≥1>")
-	}
-	provider, _, _, err := getRefineryPRContext()
+	provider, cfg, _, err := getRefineryPRContext()
 	if err != nil {
 		return err
 	}
@@ -472,12 +462,36 @@ func runRefineryPrWaitApproval(cmd *cobra.Command, args []string) error {
 	// formula can pass the flag and the command works.
 	_ = refPrWaitApprovalEsc
 
-	// Two gates, both must pass to return success:
-	//   1. --approver set  → that specific user must have an active APPROVED
-	//   2. --min-approvals → distinct APPROVED reviewers count >= min
-	deadline := time.Now().Add(refPrWaitApprovalTO)
+	return waitForApproval(provider, cfg, prNumber, refPrWaitApproverUser, refPrWaitApprovalMin,
+		refPrWaitApprovalTO, refPrWaitApprovalInt)
+}
+
+// waitForApproval polls until every configured approval gate passes on the PR:
+//  1. approver set  → that specific user must have an active APPROVED
+//  2. minApprovals  → distinct APPROVED reviewers count >= min
+//  3. cfg.RequiredHumanReviewers set → one of them has APPROVED the current
+//     head SHA. This is the same gate `pr merge` refuses on
+//     (refinery.VerifyHumanApprovalAtHead); polling it here keeps PR.6 from
+//     reporting success for a PR that PR.7 will then refuse, which would loop.
+//
+// cfg may be nil (no human-reviewer gate).
+func waitForApproval(provider refinery.PRProvider, cfg *refinery.MergeQueueConfig, prNumber int,
+	approver string, minApprovals int, timeout, interval time.Duration) error {
+	humanGate := cfg != nil && len(cfg.RequiredHumanReviewers) > 0
+
+	// Require at least one active gate so callers can't accidentally bypass
+	// the approval wait by omitting --approver and setting --min-approvals=0
+	// (or letting it default to 0). An explicit "no gates" configuration is
+	// almost always a scripting error.
+	if approver == "" && minApprovals == 0 && !humanGate {
+		return fmt.Errorf("wait-approval requires at least one gate: " +
+			"set --approver=<user> and/or --min-approvals=<n≥1>")
+	}
+
+	deadline := time.Now().Add(timeout)
 	for {
 		approverOK := true
+		var err error
 		if approver != "" {
 			approverOK, err = provider.IsPRApprovedBy(prNumber, approver)
 			if err != nil {
@@ -495,8 +509,23 @@ func runRefineryPrWaitApproval(cmd *cobra.Command, args []string) error {
 			countOK = count >= minApprovals
 		}
 
-		if approverOK && countOK {
-			// The no-gate case is unreachable — we reject it above.
+		humanOK := true
+		var humanDetail string
+		if humanGate {
+			// Only an unmet approval keeps polling. A lookup failure or a provider
+			// that cannot answer is not going to clear by waiting, so it ends the
+			// wait rather than burning the timeout.
+			if _, herr := refinery.VerifyHumanApprovalAtHead(provider, cfg, prNumber, nil); herr != nil {
+				var needsApproval *refinery.NeedsApprovalError
+				if !errors.As(herr, &needsApproval) {
+					return herr
+				}
+				humanOK = false
+				humanDetail = needsApproval.Detail
+			}
+		}
+
+		if approverOK && countOK && humanOK {
 			switch {
 			case approver != "" && minApprovals > 0:
 				fmt.Fprintf(os.Stdout, "%s PR #%d approved by %s (%d/%d total approvals)\n",
@@ -507,6 +536,10 @@ func runRefineryPrWaitApproval(cmd *cobra.Command, args []string) error {
 			case minApprovals > 0:
 				fmt.Fprintf(os.Stdout, "%s PR #%d has %d/%d required approvals\n",
 					style.Bold.Render("✓"), prNumber, count, minApprovals)
+			}
+			if humanGate {
+				fmt.Fprintf(os.Stdout, "%s PR #%d has approval from a required human reviewer at its current head\n",
+					style.Bold.Render("✓"), prNumber)
 			}
 			return nil
 		}
@@ -519,9 +552,12 @@ func runRefineryPrWaitApproval(cmd *cobra.Command, args []string) error {
 			if minApprovals > 0 && !countOK {
 				parts = append(parts, fmt.Sprintf("have %d/%d approvals", count, minApprovals))
 			}
+			if !humanOK {
+				parts = append(parts, humanDetail)
+			}
 			return fmt.Errorf("timeout waiting for approval: %s", strings.Join(parts, ", "))
 		}
-		time.Sleep(refPrWaitApprovalInt)
+		time.Sleep(interval)
 	}
 }
 
@@ -534,7 +570,22 @@ func runRefineryPrMerge(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	sha, err := mergeVerifiedPR(provider, cfg, prNumber, refPrMergeMethod)
+	if err != nil {
+		return err
+	}
+	if sha == "" {
+		sha = "<unknown>"
+	}
+	fmt.Fprintf(os.Stdout, "%s PR #%d merged (%s): %s\n",
+		style.Bold.Render("✓"), prNumber, refPrMergeMethod, sha)
+	return nil
+}
 
+// mergeVerifiedPR runs the merge gates and merges. When the human-approval
+// gate is configured, the merge is pinned to the head SHA it verified, so a
+// push landing between the check and the merge is refused instead of merged.
+func mergeVerifiedPR(provider refinery.PRProvider, cfg *refinery.MergeQueueConfig, prNumber int, method string) (string, error) {
 	// Unresolved threads block merge, checked BEFORE the approval gate
 	// so the refinery LLM sees the thread list first — if threads are
 	// outstanding, fixing them often produces the missing approval as a
@@ -543,11 +594,11 @@ func runRefineryPrMerge(cmd *cobra.Command, args []string) error {
 	if err := refinery.VerifyReviewThreadsResolved(provider, prNumber, nil); err != nil {
 		var needsResolution *refinery.NeedsReviewResolutionError
 		if errors.As(err, &needsResolution) {
-			return fmt.Errorf("%w\nResolve each thread (fix the issue + mark resolved on GitHub) "+
+			return "", fmt.Errorf("%w\nResolve each thread (fix the issue + mark resolved on GitHub) "+
 				"before retrying `gt refinery pr merge`. The refinery patrol formula's PR.5 "+
 				"review-fix loop exists for this — do not merge around unresolved threads", err)
 		}
-		return err
+		return "", err
 	}
 
 	// G21 fix: enforce the same approval gate the patrol formula asserts at
@@ -568,28 +619,28 @@ func runRefineryPrMerge(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		var needsApproval *refinery.NeedsApprovalError
 		if errors.As(err, &needsApproval) {
-			return fmt.Errorf("%w\n\n"+
+			return "", fmt.Errorf("%w\n\n"+
 				"The refinery patrol formula requires `gt refinery pr await-review` (PR.4) "+
 				"and `gt refinery pr wait-approval` (PR.6) to run between pr-create and pr-merge. "+
 				"If PR #%d is genuinely ready to land, re-run those steps; if this is an operator "+
 				"adoption path for an orphan branch, merge via `gh pr merge` on the CLI outside "+
 				"the refinery session", err, prNumber)
 		}
-		return err
+		return "", err
 	}
 
 	// Pin the merge to the head the human-approval gate verified, so a push
 	// landing after the check is refused by the provider, not merged.
-	sha, err := provider.MergePR(prNumber, refPrMergeMethod, verifiedHead)
+	sha, err := provider.MergePR(prNumber, method, verifiedHead)
 	if err != nil {
-		return err
+		var headMoved *refinery.HeadMovedError
+		if errors.As(err, &headMoved) {
+			return "", fmt.Errorf("%w. Wait for a required human reviewer to approve the new head, "+
+				"then re-run `gt refinery pr wait-approval` and `gt refinery pr merge`", err)
+		}
+		return "", err
 	}
-	if sha == "" {
-		sha = "<unknown>"
-	}
-	fmt.Fprintf(os.Stdout, "%s PR #%d merged (%s): %s\n",
-		style.Bold.Render("✓"), prNumber, refPrMergeMethod, sha)
-	return nil
+	return sha, nil
 }
 
 func runRefineryPrAwaitReview(cmd *cobra.Command, args []string) error {

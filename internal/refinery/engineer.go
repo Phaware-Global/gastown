@@ -1257,6 +1257,17 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Merging PR #%d via %s API (%s)...\n", prNumber, provider, method)
 	mergeCommit, err := e.prProvider.MergePR(prNumber, method, verifiedHead)
 	if err != nil {
+		// The head moved after the approval check: the approval is stale, not the
+		// build broken. Keep the MR queued for re-approval rather than reporting a
+		// merge failure that tells the polecat to fix code.
+		var headMoved *HeadMovedError
+		if errors.As(err, &headMoved) {
+			return ProcessResult{
+				Success:       false,
+				NeedsApproval: true,
+				Error:         headMoved.Error(),
+			}
+		}
 		return ProcessResult{
 			Success: false,
 			Error:   fmt.Sprintf("PR merge failed for PR #%d: %v", prNumber, err),

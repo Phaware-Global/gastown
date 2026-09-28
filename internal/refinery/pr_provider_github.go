@@ -1,6 +1,7 @@
 package refinery
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -30,7 +31,11 @@ func (p *githubPRProvider) IsPRApprovedBy(prNumber int, user string) (bool, erro
 }
 
 func (p *githubPRProvider) MergePR(prNumber int, method, matchHeadSHA string) (string, error) {
-	return p.git.GhPrMerge(prNumber, method, matchHeadSHA)
+	sha, err := p.git.GhPrMerge(prNumber, method, matchHeadSHA)
+	if errors.Is(err, git.ErrPRHeadMoved) {
+		return "", &HeadMovedError{PRNumber: prNumber, Err: err}
+	}
+	return sha, err
 }
 
 func (p *githubPRProvider) CreatePR(opts CreatePROptions) (int, string, error) {

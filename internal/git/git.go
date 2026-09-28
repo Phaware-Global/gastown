@@ -1582,6 +1582,10 @@ func (g *Git) IsPRApproved(prNumber int) (bool, error) {
 	return result.ReviewDecision == "APPROVED", nil
 }
 
+// ErrPRHeadMoved is returned (wrapped) by GhPrMerge when a head-pinned merge is
+// refused because the PR head is no longer the pinned commit.
+var ErrPRHeadMoved = errors.New("PR head moved since the pinned commit")
+
 // GhPrMerge merges a GitHub PR using the gh CLI, respecting branch protection rules.
 // The method parameter should be "merge", "squash", or "rebase".
 // A non-empty matchHeadSHA is passed as --match-head-commit, so GitHub refuses
@@ -1596,6 +1600,13 @@ func (g *Git) GhPrMerge(prNumber int, method, matchHeadSHA string) (string, erro
 	cmd.Dir = g.workDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		// A pinned merge that GitHub refuses because the head moved is not a
+		// merge failure the caller can fix by changing code: the approval was
+		// for a commit that is no longer the head. Report it as such.
+		if matchHeadSHA != "" && strings.Contains(strings.ToLower(string(out)), "head branch was modified") {
+			return "", fmt.Errorf("gh pr merge refused, head moved from %s: %s: %w",
+				matchHeadSHA, strings.TrimSpace(string(out)), ErrPRHeadMoved)
+		}
 		return "", fmt.Errorf("gh pr merge failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 

@@ -23,6 +23,21 @@ type NeedsApprovalError struct {
 
 func (e *NeedsApprovalError) Error() string { return e.Detail }
 
+// HeadMovedError indicates a head-pinned merge was refused because the PR head
+// moved after the approval check. The approval no longer covers the head, so
+// this is an approval state, not a build or merge failure: nothing in the
+// polecat's code is wrong, and a human must re-approve the new head.
+type HeadMovedError struct {
+	PRNumber int
+	Err      error
+}
+
+func (e *HeadMovedError) Error() string {
+	return fmt.Sprintf("PR #%d head moved since approval; re-approval needed", e.PRNumber)
+}
+
+func (e *HeadMovedError) Unwrap() error { return e.Err }
+
 // VerifyPRApproval checks the PR's approval state against cfg's gates
 // (PRApprover and GetPRRequiredApprovals), plus one unconditional
 // invariant that isn't a "gate" in the configured sense. Returns nil when
@@ -104,7 +119,7 @@ func VerifyPRApprovalAtHead(provider PRProvider, cfg *MergeQueueConfig, prNumber
 		return "", err
 	}
 
-	verifiedHead, err := verifyHumanApprovalAtHead(provider, cfg, prNumber, out)
+	verifiedHead, err := VerifyHumanApprovalAtHead(provider, cfg, prNumber, out)
 	if err != nil {
 		return "", err
 	}
@@ -154,7 +169,7 @@ func VerifyPRApprovalAtHead(provider PRProvider, cfg *MergeQueueConfig, prNumber
 	return verifiedHead, nil
 }
 
-// verifyHumanApprovalAtHead refuses the merge unless one of
+// VerifyHumanApprovalAtHead refuses the merge unless one of
 // cfg.RequiredHumanReviewers has an APPROVED review on the PR's current head
 // SHA. It is a no-op when the list is empty.
 //
@@ -173,7 +188,7 @@ func VerifyPRApprovalAtHead(provider PRProvider, cfg *MergeQueueConfig, prNumber
 //
 // Returns the head SHA the approval was found on, or "" when the gate is unset.
 // The caller pins the merge to it: a human's approval covers that commit only.
-func verifyHumanApprovalAtHead(provider PRProvider, cfg *MergeQueueConfig, prNumber int, out io.Writer) (string, error) {
+func VerifyHumanApprovalAtHead(provider PRProvider, cfg *MergeQueueConfig, prNumber int, out io.Writer) (string, error) {
 	if len(cfg.RequiredHumanReviewers) == 0 {
 		return "", nil
 	}
