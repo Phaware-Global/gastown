@@ -47,7 +47,13 @@ type PRProvider interface {
 
 	// MergePR merges a PR using the specified method (e.g., "squash", "merge", "rebase").
 	// Returns the merge commit SHA on success (if available).
-	MergePR(prNumber int, method string) (string, error)
+	//
+	// A non-empty matchHeadSHA pins the merge to that head commit: the provider
+	// must refuse if the PR head has moved, so a push that lands after an
+	// approval check cannot be merged on the strength of that check. A provider
+	// that cannot enforce the pin must return ErrUnsupported rather than merge
+	// unpinned. Empty means no pin.
+	MergePR(prNumber int, method, matchHeadSHA string) (string, error)
 
 	// CreatePR creates a PR, or returns the existing one if an open PR already
 	// exists for opts.Branch. Returns the PR number and URL.

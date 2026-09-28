@@ -655,7 +655,7 @@ func (f *threadGateFakeProvider) FindPRNumber(string) (int, error) {
 func (f *threadGateFakeProvider) UnresolvedThreads(int) ([]ReviewThread, error) {
 	return f.unresolvedThreads, nil
 }
-func (f *threadGateFakeProvider) MergePR(int, string) (string, error) {
+func (f *threadGateFakeProvider) MergePR(int, string, string) (string, error) {
 	f.mergeCalls++
 	panic("MergePR called — threads-resolved gate failed to short-circuit")
 }

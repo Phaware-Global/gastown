@@ -31,7 +31,7 @@ func (p *threadsFakeProvider) FindPRNumber(string) (int, error)                 
 func (p *threadsFakeProvider) IsPRApproved(int) (bool, error)                       { panic("unused") }
 func (p *threadsFakeProvider) IsPRApprovedBy(int, string) (bool, error)             { panic("unused") }
 func (p *threadsFakeProvider) ApprovedReviewersAtSHA(int, string) ([]string, error) { panic("unused") }
-func (p *threadsFakeProvider) MergePR(int, string) (string, error)                  { panic("unused") }
+func (p *threadsFakeProvider) MergePR(int, string, string) (string, error)          { panic("unused") }
 func (p *threadsFakeProvider) CreatePR(CreatePROptions) (int, string, error)        { panic("unused") }
 func (p *threadsFakeProvider) RequestReview(int, []string) error                    { panic("unused") }
 func (p *threadsFakeProvider) ChangesRequestedReviewers(int) ([]string, error)      { panic("unused") }

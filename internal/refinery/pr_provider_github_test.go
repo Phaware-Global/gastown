@@ -136,3 +136,50 @@ func TestBitbucketDismissChangesRequestedReviews_Unsupported(t *testing.T) {
 		t.Errorf("err = %v, want ErrUnsupported", err)
 	}
 }
+
+// A pinned merge must reach gh as --match-head-commit, so GitHub refuses it if
+// the head moved after the approval check; an unpinned merge must not carry it.
+func TestGitHubMergePR_PinsHeadCommit(t *testing.T) {
+	const head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	tests := []struct {
+		name      string
+		pin       string
+		wantMatch bool
+	}{
+		{"pinned", head, true},
+		{"unpinned", "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			readCalls := ghStub(t, "")
+			p := newGitHubPRProvider(git.NewGit(t.TempDir()))
+
+			if _, err := p.MergePR(7, "squash", tc.pin); err != nil {
+				t.Fatalf("MergePR: %v", err)
+			}
+			var merge string
+			for _, c := range readCalls() {
+				if strings.HasPrefix(c, "pr merge") {
+					merge = c
+				}
+			}
+			if merge == "" {
+				t.Fatalf("gh pr merge was not invoked: %v", readCalls())
+			}
+			want := "--match-head-commit " + head
+			if got := strings.Contains(merge, want); got != tc.wantMatch {
+				t.Errorf("gh call %q: contains %q = %v, want %v", merge, want, got, tc.wantMatch)
+			}
+		})
+	}
+}
+
+// Bitbucket's merge call has no head precondition, so it must refuse a pinned
+// merge rather than merge a head nobody verified. An unpinned merge is not this
+// gate's concern and is left to the provider.
+func TestBitbucketMergePR_RefusesPinnedMerge(t *testing.T) {
+	p := &bitbucketPRProvider{}
+	if _, err := p.MergePR(7, "squash", "bbbbbbbb"); err != ErrUnsupported {
+		t.Errorf("err = %v, want ErrUnsupported", err)
+	}
+}

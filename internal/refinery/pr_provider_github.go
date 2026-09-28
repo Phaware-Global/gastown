@@ -29,8 +29,8 @@ func (p *githubPRProvider) IsPRApprovedBy(prNumber int, user string) (bool, erro
 	return p.git.GhPrApprovedBy(prNumber, user)
 }
 
-func (p *githubPRProvider) MergePR(prNumber int, method string) (string, error) {
-	return p.git.GhPrMerge(prNumber, method)
+func (p *githubPRProvider) MergePR(prNumber int, method, matchHeadSHA string) (string, error) {
+	return p.git.GhPrMerge(prNumber, method, matchHeadSHA)
 }
 
 func (p *githubPRProvider) CreatePR(opts CreatePROptions) (int, string, error) {

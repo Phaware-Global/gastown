@@ -68,7 +68,7 @@ func (f *fakePRProvider) ChangesRequestedReviewers(int) ([]string, error) {
 // Unused PRProvider methods — panic if exercised so mis-wired tests fail loudly.
 func (f *fakePRProvider) FindPRNumber(string) (int, error)              { panic("unused") }
 func (f *fakePRProvider) IsPRApproved(int) (bool, error)                { panic("unused") }
-func (f *fakePRProvider) MergePR(int, string) (string, error)           { panic("unused") }
+func (f *fakePRProvider) MergePR(int, string, string) (string, error)   { panic("unused") }
 func (f *fakePRProvider) CreatePR(CreatePROptions) (int, string, error) { panic("unused") }
 func (f *fakePRProvider) RequestReview(int, []string) error             { panic("unused") }
 func (f *fakePRProvider) UnresolvedThreads(int) ([]ReviewThread, error) { panic("unused") }
@@ -708,5 +708,48 @@ func TestVerifyPRApproval_HumanGate_StacksWithNamedApprover(t *testing.T) {
 	}
 	if err := VerifyPRApproval(provider, cfg, 166, nil); err == nil {
 		t.Fatal("named approver satisfied must not bypass the human-at-head gate")
+	}
+}
+
+// The merge is pinned to the head the human gate verified; VerifyPRApprovalAtHead
+// must hand back exactly that SHA, and "" when the gate is unset so opt-out rigs
+// keep merging unpinned.
+func TestVerifyPRApprovalAtHead_ReturnsVerifiedHead(t *testing.T) {
+	provider := &fakePRProvider{
+		headSHA:       "bbbbbbbb",
+		approvedAtSHA: map[string][]string{"bbbbbbbb": {"alice"}},
+	}
+	head, err := VerifyPRApprovalAtHead(provider, humanGateCfg(), 166, nil)
+	if err != nil {
+		t.Fatalf("human approval at head must pass, got %v", err)
+	}
+	if head != "bbbbbbbb" {
+		t.Errorf("verified head = %q, want the SHA the approval was found on", head)
+	}
+
+	cfg := humanGateCfg()
+	cfg.RequiredHumanReviewers = nil
+	head, err = VerifyPRApprovalAtHead(&fakePRProvider{}, cfg, 166, nil)
+	if err != nil {
+		t.Fatalf("opt-out rig must keep merging, got %v", err)
+	}
+	if head != "" {
+		t.Errorf("verified head = %q with the human gate unset, want empty (no pin)", head)
+	}
+}
+
+// A refusal must not leak a head: a caller that ignored the error and merged
+// with the returned SHA would otherwise be pinned to an unapproved commit.
+func TestVerifyPRApprovalAtHead_RefusalReturnsNoHead(t *testing.T) {
+	provider := &fakePRProvider{
+		headSHA:       "bbbbbbbb",
+		approvedAtSHA: map[string][]string{"aaaaaaaa": {"alice"}},
+	}
+	head, err := VerifyPRApprovalAtHead(provider, humanGateCfg(), 166, nil)
+	if err == nil {
+		t.Fatal("approval on an older SHA must refuse")
+	}
+	if head != "" {
+		t.Errorf("head = %q on refusal, want empty", head)
 	}
 }

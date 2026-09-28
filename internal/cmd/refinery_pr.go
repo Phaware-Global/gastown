@@ -564,7 +564,8 @@ func runRefineryPrMerge(cmd *cobra.Command, args []string) error {
 	// pr_reviewer/pr_approver, so a rig naming neither gets no blocking gate
 	// from it either. An earlier unconditional form broke that promise, and
 	// on a public repo let any account block the queue indefinitely.
-	if err := refinery.VerifyPRApproval(provider, cfg, prNumber, nil); err != nil {
+	verifiedHead, err := refinery.VerifyPRApprovalAtHead(provider, cfg, prNumber, nil)
+	if err != nil {
 		var needsApproval *refinery.NeedsApprovalError
 		if errors.As(err, &needsApproval) {
 			return fmt.Errorf("%w\n\n"+
@@ -577,7 +578,9 @@ func runRefineryPrMerge(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	sha, err := provider.MergePR(prNumber, refPrMergeMethod)
+	// Pin the merge to the head the human-approval gate verified, so a push
+	// landing after the check is refused by the provider, not merged.
+	sha, err := provider.MergePR(prNumber, refPrMergeMethod, verifiedHead)
 	if err != nil {
 		return err
 	}

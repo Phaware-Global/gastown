@@ -1584,9 +1584,14 @@ func (g *Git) IsPRApproved(prNumber int) (bool, error) {
 
 // GhPrMerge merges a GitHub PR using the gh CLI, respecting branch protection rules.
 // The method parameter should be "merge", "squash", or "rebase".
+// A non-empty matchHeadSHA is passed as --match-head-commit, so GitHub refuses
+// the merge if the PR head is no longer that commit.
 // Returns the merge commit SHA on success.
-func (g *Git) GhPrMerge(prNumber int, method string) (string, error) {
+func (g *Git) GhPrMerge(prNumber int, method, matchHeadSHA string) (string, error) {
 	args := []string{"pr", "merge", fmt.Sprintf("%d", prNumber), "--" + method, "--delete-branch"}
+	if matchHeadSHA != "" {
+		args = append(args, "--match-head-commit", matchHeadSHA)
+	}
 	cmd := exec.Command("gh", args...)
 	cmd.Dir = g.workDir
 	out, err := cmd.CombinedOutput()
