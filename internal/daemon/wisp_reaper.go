@@ -25,17 +25,21 @@ const (
 	// Closed mail older than this is permanently deleted. Formula var: mail_delete_age.
 	defaultMailDeleteAge = 7 * 24 * time.Hour
 	// Issues stale longer than this are auto-closed. Formula var: stale_issue_age.
-	defaultStaleIssueAge = 7 * 24 * time.Hour
+	// Single source of truth: reaper.DefaultStaleIssueAge (30d), also used by
+	// the `gt reaper auto-close --stale-age` CLI default and documented as the
+	// mol-dog-reaper formula's default. Do NOT hardcode a different value here.
+	defaultStaleIssueAge = reaper.DefaultStaleIssueAge
 )
 
 // WispReaperConfig holds configuration for the wisp_reaper patrol.
 type WispReaperConfig struct {
-	Enabled      bool     `json:"enabled"`
-	DryRun       bool     `json:"dry_run,omitempty"`
-	IntervalStr  string   `json:"interval,omitempty"`
-	MaxAgeStr    string   `json:"max_age,omitempty"`
-	DeleteAgeStr string   `json:"delete_age,omitempty"`
-	Databases    []string `json:"databases,omitempty"`
+	Enabled          bool     `json:"enabled"`
+	DryRun           bool     `json:"dry_run,omitempty"`
+	IntervalStr      string   `json:"interval,omitempty"`
+	MaxAgeStr        string   `json:"max_age,omitempty"`
+	DeleteAgeStr     string   `json:"delete_age,omitempty"`
+	StaleIssueAgeStr string   `json:"stale_issue_age,omitempty"`
+	Databases        []string `json:"databases,omitempty"`
 }
 
 // wispReaperInterval returns the configured interval, or the default (1h).
@@ -74,6 +78,18 @@ func wispDeleteAge(config *DaemonPatrolConfig) time.Duration {
 	return defaultWispDeleteAge
 }
 
+// wispStaleIssueAge returns the configured stale-issue age, or the default (30 days).
+func wispStaleIssueAge(config *DaemonPatrolConfig) time.Duration {
+	if config != nil && config.Patrols != nil && config.Patrols.WispReaper != nil {
+		if config.Patrols.WispReaper.StaleIssueAgeStr != "" {
+			if d, err := time.ParseDuration(config.Patrols.WispReaper.StaleIssueAgeStr); err == nil && d > 0 {
+				return d
+			}
+		}
+	}
+	return defaultStaleIssueAge
+}
+
 // reapWisps is the thin orchestrator for the wisp_reaper patrol.
 // It pours a mol-dog-reaper molecule, then dispatches a Dog to execute it.
 // The Dog reads the formula steps and calls `gt reaper` CLI helpers.
@@ -86,11 +102,12 @@ func (d *Daemon) reapWisps() {
 	config := d.patrolConfig.Patrols.WispReaper
 	maxAge := wispReaperMaxAge(d.patrolConfig)
 	deleteAge := wispDeleteAge(d.patrolConfig)
+	staleIssueAge := wispStaleIssueAge(d.patrolConfig)
 
 	vars := map[string]string{
 		"max_age":         maxAge.String(),
 		"purge_age":       deleteAge.String(),
-		"stale_issue_age": defaultStaleIssueAge.String(),
+		"stale_issue_age": staleIssueAge.String(),
 		"mail_delete_age": defaultMailDeleteAge.String(),
 		"alert_threshold": fmt.Sprintf("%d", wispAlertThreshold),
 		"dolt_port":       fmt.Sprintf("%d", d.doltServerPort()),
@@ -114,7 +131,7 @@ func (d *Daemon) reapWisps() {
 	// Try dispatching to a Dog for formula-driven execution.
 	if err := d.dispatchReaperDog(vars); err != nil {
 		d.logger.Printf("wisp_reaper: Dog dispatch failed (%v), running inline fallback", err)
-		d.reapWispsInline(config, maxAge, deleteAge, mol)
+		d.reapWispsInline(config, maxAge, deleteAge, staleIssueAge, mol)
 		return
 	}
 
@@ -144,7 +161,7 @@ func (d *Daemon) dispatchReaperDog(vars map[string]string) error {
 
 // reapWispsInline is the fallback that runs the reaper cycle inline when
 // Dog dispatch is unavailable. Delegates to the reaper package for SQL execution.
-func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge time.Duration, mol *dogMol) {
+func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge, staleIssueAge time.Duration, mol *dogMol) {
 	databases := config.Databases
 	if len(databases) == 0 {
 		databases = reaper.DiscoverDatabases("127.0.0.1", d.doltServerPort())
@@ -316,10 +333,14 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 		}
 	}
 
-	// Step 3d: Close stale one-way telegraph notification wisps. These are
-	// fire-and-forget (msg-type:notification) and never acked — the telegraph
-	// is one-way, so recipients reply out of band. Without this they sit
-	// delivery:pending and inflate the open-wisp count alongside receipts.
+	// Step 3d: Close stale telegraph notification wisps the recipient has
+	// actually read (msg-type:notification + the `read` label, set by
+	// `gt mail read`). Without this they inflate the open-wisp count alongside
+	// receipts. delivery:acked is set by the inject hook the moment a
+	// notification is first shown and does NOT mean read, so unread
+	// notifications are NOT closed here — the body lives only in the bead, so
+	// that would silently lose unread mail (gt-78xq); they age out via the
+	// normal max-age reap.
 	notificationAge := 1 * time.Hour
 	var totalNotifClosed int
 	for _, dbName := range databases {
@@ -375,7 +396,7 @@ func (d *Daemon) reapWispsInline(config *WispReaperConfig, maxAge, deleteAge tim
 			db.Close()
 			continue
 		}
-		result, err := reaper.AutoClose(db, dbName, defaultStaleIssueAge, dryRun)
+		result, err := reaper.AutoClose(db, dbName, staleIssueAge, dryRun)
 		db.Close()
 		if err != nil {
 			d.logger.Printf("wisp_reaper: %s: auto-close error: %v", dbName, err)
