@@ -84,3 +84,20 @@ func TestPrintReaperScanTextOmitsFastTrackWhenZero(t *testing.T) {
 		t.Errorf("zero fast-track candidates should not print a line:\n%s", out)
 	}
 }
+
+func TestPrintReaperScanTextShowsUnparentedStale(t *testing.T) {
+	var buf bytes.Buffer
+	printReaperScanText(&buf, []*reaper.ScanResult{{Database: "hq", UnparentedStale: 7}, {Database: "gastown"}})
+	out := buf.String()
+	if got := strings.Count(out, "  Unparented stale: 7 (never reaped)\n"); got != 2 {
+		t.Errorf("Unparented stale line count = %d, want 2 (per-DB and summary)\n%s", got, out)
+	}
+}
+
+func TestPrintReaperScanTextOmitsUnparentedStaleWhenZero(t *testing.T) {
+	var buf bytes.Buffer
+	printReaperScanText(&buf, []*reaper.ScanResult{{Database: "hq"}})
+	if out := buf.String(); strings.Contains(out, "Unparented stale") {
+		t.Errorf("zero unparented_stale should not print a line:\n%s", out)
+	}
+}
