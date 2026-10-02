@@ -203,17 +203,20 @@ func OpenDB(host string, port int, dbName string, readTimeout, writeTimeout time
 	return sql.Open("mysql", dsn)
 }
 
+// hasParentJoin marks wisps that have any parent-child row.
+const hasParentJoin = `LEFT JOIN (
+		SELECT DISTINCT wd.issue_id
+		FROM wisp_dependencies wd
+		WHERE wd.type = 'parent-child'
+	) has_parent ON has_parent.issue_id = w.id`
+
 // parentExcludeJoin returns the JOINs and WHERE condition for a max-age Reap
 // candidate's parentage: a parent-child row exists and no parent is open.
 // Wisps with no parent-child row are never candidates.
 //
 // Anti-joins, not correlated EXISTS, to stay O(n+m) on large tables.
 func parentExcludeJoin(dbName string) (joinClause, whereCondition string) {
-	joinClause = `LEFT JOIN (
-		SELECT DISTINCT wd.issue_id
-		FROM wisp_dependencies wd
-		WHERE wd.type = 'parent-child'
-	) has_parent ON has_parent.issue_id = w.id
+	joinClause = hasParentJoin + `
 	LEFT JOIN (
 		SELECT DISTINCT wd.issue_id
 		FROM wisp_dependencies wd
@@ -480,9 +483,13 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 
 	unparentedQuery := fmt.Sprintf(
 		"SELECT COUNT(*) FROM wisps w %s %s WHERE %s AND w.created_at < ? AND %s AND has_parent.issue_id IS NULL AND w.issue_type != 'molecule'",
-		parentJoin, agentJoin, openWispStatusWhere, agentWhere)
+		hasParentJoin, agentJoin, openWispStatusWhere, agentWhere)
 	if err := db.QueryRowContext(ctx, unparentedQuery, now.Add(-maxAge)).Scan(&result.UnparentedStale); err != nil {
-		return nil, fmt.Errorf("count unparented stale wisps: %w", err)
+		// Informational count: a failure must not discard the rest of the scan.
+		result.Anomalies = append(result.Anomalies, Anomaly{
+			Type:    "unparented_scan_failed",
+			Message: fmt.Sprintf("count unparented stale wisps: %v", err),
+		})
 	}
 
 	// Count fast-track candidates (gt-oqnc). `gt reaper reap` closes these at
