@@ -973,6 +973,67 @@ func TestReapAndScanLeaveUnreadMailAlone(t *testing.T) {
 	}
 }
 
+func TestReapClosesOnlyMoleculesAndOrphanedSteps(t *testing.T) {
+	now := time.Now().UTC()
+	old := now.Add(-72 * time.Hour)
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"merge-request":        {id: "merge-request", status: "open", issueType: "task", createdAt: old, labels: []string{"gt:merge-request"}},
+			"standalone-task":      {id: "standalone-task", status: "open", issueType: "task", createdAt: old},
+			"closed-molecule":      {id: "closed-molecule", status: "closed", issueType: "molecule", createdAt: old},
+			"step-closed-molecule": {id: "step-closed-molecule", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour)},
+			"step-missing-parent":  {id: "step-missing-parent", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour)},
+			"closed-task":          {id: "closed-task", status: "closed", issueType: "task", createdAt: old},
+			"step-closed-task":     {id: "step-closed-task", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour)},
+			"molecule-closed-par":  {id: "molecule-closed-par", status: "open", issueType: "molecule", createdAt: now.Add(-48 * time.Hour)},
+		},
+		deps: []fakeDep{
+			{issueID: "step-closed-molecule", dependsOnID: "closed-molecule", depType: "parent-child"},
+			{issueID: "step-missing-parent", dependsOnID: "purged", depType: "parent-child"},
+			{issueID: "step-closed-task", dependsOnID: "closed-task", depType: "parent-child"},
+			{issueID: "molecule-closed-par", dependsOnID: "closed-task", depType: "parent-child"},
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	maxAge := 24 * time.Hour
+	scan, err := Scan(db, "testdb", maxAge, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if scan.UnparentedStale != 2 {
+		t.Errorf("scan.UnparentedStale = %d, want 2 (merge-request, standalone-task)", scan.UnparentedStale)
+	}
+	if scan.ReapCandidates != 3 {
+		t.Errorf("scan.ReapCandidates = %d, want 3 (step-missing-parent, step-closed-task, molecule-closed-par)", scan.ReapCandidates)
+	}
+	if scan.MoleculeStepCandidates != 1 {
+		t.Errorf("scan.MoleculeStepCandidates = %d, want 1 (step-closed-molecule)", scan.MoleculeStepCandidates)
+	}
+	dryRun, err := Reap(db, "testdb", maxAge, true)
+	if err != nil {
+		t.Fatalf("dry-run Reap: %v", err)
+	}
+	if dryRun.Reaped != scan.ReapCandidates {
+		t.Fatalf("dry-run Reap would close %d but scan predicted %d", dryRun.Reaped, scan.ReapCandidates)
+	}
+
+	if _, err := Reap(db, "testdb", maxAge, false); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	for id, want := range map[string]string{
+		"merge-request": "open", "standalone-task": "open",
+		"step-closed-molecule": "closed", "step-missing-parent": "closed",
+		"step-closed-task": "closed", "molecule-closed-par": "closed",
+	} {
+		if got := state.status(id); got != want {
+			t.Errorf("%s status = %q after Reap, want %q", id, got, want)
+		}
+	}
+}
+
 func TestCloseStaleNotificationsStillClosesReadMail(t *testing.T) {
 	now := time.Now().UTC()
 	notif := func(id string, age time.Duration, extra ...string) *fakeWisp {
@@ -1170,13 +1231,16 @@ func (s *fakeReaperState) isMoleculeStepCandidateLocked(id string) bool {
 
 // staleCandidatesLocked simulates the max-age Reap/Scan eligibility query;
 // excludeMail applies only when the query carries the mail anti-join.
-func (s *fakeReaperState) staleCandidatesLocked(cutoff time.Time, excludeMoleculeSteps, excludeMail bool) []string {
+func (s *fakeReaperState) staleCandidatesLocked(cutoff time.Time, excludeMoleculeSteps, excludeMail, requireParent bool) []string {
 	var ids []string
 	for id, w := range s.wisps {
 		if !isOpenWispStatus(w.status) || w.isAgentWisp() || !w.createdAt.Before(cutoff) {
 			continue
 		}
 		if excludeMail && w.isMailWisp() {
+			continue
+		}
+		if requireParent && !s.hasParentLocked(id) {
 			continue
 		}
 		if s.hasOpenParentLocked(id) {
@@ -1189,6 +1253,22 @@ func (s *fakeReaperState) staleCandidatesLocked(cutoff time.Time, excludeMolecul
 			continue
 		}
 		if excludeMoleculeSteps && s.isMoleculeStepCandidateLocked(id) {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// unparentedStaleLocked mirrors Scan's unparented_stale count.
+func (s *fakeReaperState) unparentedStaleLocked(cutoff time.Time) []string {
+	var ids []string
+	for id, w := range s.wisps {
+		if !isOpenWispStatus(w.status) || w.isAgentWisp() || !w.createdAt.Before(cutoff) {
+			continue
+		}
+		if w.issueType == "molecule" || s.hasParentLocked(id) {
 			continue
 		}
 		ids = append(ids, id)
@@ -1325,11 +1405,16 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 	case strings.Contains(normalized, "issues i INNER JOIN") && strings.Contains(normalized, "i.title LIKE 'Plugin:"):
 		// ClosePluginDispatches targets the issues table; no fixture rows.
 		return fakeIDRows(nil), nil
+	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps w") && strings.Contains(normalized, "has_parent.issue_id IS NULL AND w.issue_type != 'molecule'"):
+		if err := validateWAliasedAgentGuard(normalized); err != nil {
+			return nil, err
+		}
+		return fakeCountRows(len(c.state.unparentedStaleLocked(namedTime(args)))), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps w") && strings.Contains(normalized, "created_at <"):
 		if err := validateStaleWispQuery(normalized); err != nil {
 			return nil, err
 		}
-		return fakeCountRows(len(c.state.staleCandidatesLocked(namedTime(args), strings.Contains(normalized, "closed_molecule_step.issue_id IS NULL"), strings.Contains(normalized, "mail_wl.issue_id IS NULL")))), nil
+		return fakeCountRows(len(c.state.staleCandidatesLocked(namedTime(args), strings.Contains(normalized, "closed_molecule_step.issue_id IS NULL"), strings.Contains(normalized, "mail_wl.issue_id IS NULL"), strings.Contains(normalized, "open_parent.issue_id IS NULL AND has_parent.issue_id IS NOT NULL")))), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps w") && strings.Contains(normalized, "pm.issue_type = 'molecule'"):
 		if err := validateMoleculeStepQuery(normalized); err != nil {
 			return nil, err
@@ -1350,7 +1435,7 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 		if err := validateStaleWispQuery(normalized); err != nil {
 			return nil, err
 		}
-		return fakeIDRows(c.state.staleCandidatesLocked(namedTime(args), strings.Contains(normalized, "closed_molecule_step.issue_id IS NULL"), strings.Contains(normalized, "mail_wl.issue_id IS NULL"))), nil
+		return fakeIDRows(c.state.staleCandidatesLocked(namedTime(args), strings.Contains(normalized, "closed_molecule_step.issue_id IS NULL"), strings.Contains(normalized, "mail_wl.issue_id IS NULL"), strings.Contains(normalized, "open_parent.issue_id IS NULL AND has_parent.issue_id IS NOT NULL"))), nil
 	case strings.Contains(normalized, "SELECT w.id FROM wisps w") && strings.Contains(normalized, "pm.issue_type = 'molecule'"):
 		if err := validateMoleculeStepQuery(normalized); err != nil {
 			return nil, err

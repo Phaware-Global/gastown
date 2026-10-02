@@ -103,6 +103,9 @@ type ScanResult struct {
 	Database               string `json:"database"`
 	ReapCandidates         int    `json:"reap_candidates"`
 	MoleculeStepCandidates int    `json:"molecule_step_candidates,omitempty"`
+	// UnparentedStale counts open, parentless, non-molecule wisps past max-age.
+	// Informational only: the max-age Reap never closes them.
+	UnparentedStale int `json:"unparented_stale"`
 	// FastTrackCandidates counts wisps/mail the fast-track closers would close
 	// at FastTrackCloseAge, independent of max-age (gt-oqnc). Not disjoint from
 	// ReapCandidates: a wisp past both windows appears in each.
