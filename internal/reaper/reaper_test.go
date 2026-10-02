@@ -1036,6 +1036,38 @@ func TestReapClosesOnlyMoleculesAndOrphanedSteps(t *testing.T) {
 	}
 }
 
+func TestScanUnparentedCountFailureIsNonFatal(t *testing.T) {
+	now := time.Now().UTC()
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"closed-parent": {id: "closed-parent", status: "closed", issueType: "task", createdAt: now.Add(-72 * time.Hour)},
+			"orphaned-step": {id: "orphaned-step", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour)},
+		},
+		deps:           []fakeDep{{issueID: "orphaned-step", dependsOnID: "closed-parent", depType: "parent-child"}},
+		ops:            map[int][]string{},
+		failUnparented: true,
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	scan, err := Scan(db, "testdb", 24*time.Hour, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Scan returned %v, want the unparented_stale failure recorded as an anomaly", err)
+	}
+	if scan.ReapCandidates != 1 {
+		t.Errorf("scan.ReapCandidates = %d, want 1", scan.ReapCandidates)
+	}
+	found := false
+	for _, a := range scan.Anomalies {
+		if a.Type == "unparented_scan_failed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("anomalies = %+v, want one of type unparented_scan_failed", scan.Anomalies)
+	}
+}
+
 func TestCloseStaleNotificationsStillClosesReadMail(t *testing.T) {
 	now := time.Now().UTC()
 	notif := func(id string, age time.Duration, extra ...string) *fakeWisp {
@@ -1142,6 +1174,8 @@ type fakeReaperState struct {
 	deps     []fakeDep
 	nextConn int
 	ops      map[int][]string
+	// failUnparented makes Scan's unparented_stale count query error.
+	failUnparented bool
 }
 
 func (s *fakeReaperState) status(id string) string {
@@ -1385,6 +1419,9 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 		// ClosePluginDispatches targets the issues table; no fixture rows.
 		return fakeIDRows(nil), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps w") && strings.Contains(normalized, "has_parent.issue_id IS NULL AND w.issue_type != 'molecule'"):
+		if c.state.failUnparented {
+			return nil, fmt.Errorf("injected unparented_stale failure")
+		}
 		if err := validateWAliasedAgentGuard(normalized); err != nil {
 			return nil, err
 		}
