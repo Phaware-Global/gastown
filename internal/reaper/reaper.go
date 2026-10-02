@@ -297,6 +297,29 @@ func notAgentWispJoin(alias string) (joinClause, whereCondition string) {
 	return
 }
 
+// notMailWispJoin returns a LEFT JOIN clause and WHERE condition that exclude
+// mail wisps (label gt:message) from the max-age Reap eligibility query, via
+// the same anti-join shape as notAgentWispJoin.
+//
+// Mail has no parent-child row, so parentExcludeJoin treats it as an eligible
+// top-level wisp and the max-age Reap would close it after maxAge whether or
+// not the recipient had read it (gt-yans: 1360 unread messages closed in hq
+// on 2026-10-02). Mail lifecycle belongs to the mail and notification closers
+// (CloseStaleNotifications, Purge), which check the read label. Scan's
+// reap_candidates and Reap (count and close) all splice this in so their
+// counts stay equal.
+//
+// The label is checked in wisp_labels and labels for the same reason as
+// notAgentWispJoin: bd create --labels writes only to labels.
+func notMailWispJoin(alias string) (joinClause, whereCondition string) {
+	joinClause = fmt.Sprintf(
+		`LEFT JOIN wisp_labels mail_wl ON mail_wl.issue_id = %[1]s.id AND mail_wl.label = 'gt:message'
+		LEFT JOIN labels mail_l ON mail_l.issue_id = %[1]s.id AND mail_l.label = 'gt:message'`,
+		alias)
+	whereCondition = "mail_wl.issue_id IS NULL AND mail_l.issue_id IS NULL"
+	return
+}
+
 // staleIssueExemptLabelsSQL returns the SQL IN-list of labels that exempt an
 // issue from staleness sweeps: the pre-existing standing-order/protection
 // labels plus gt:agent, the label-based marker for agent identity beads.
@@ -483,6 +506,7 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	moleculeStepExcludeJoin := closedMoleculeStepExcludeJoin("closed_molecule_step")
 
 	agentJoin, agentWhere := notAgentWispJoin("w")
+	mailJoin, mailWhere := notMailWispJoin("w")
 
 	moleculeStepQuery := fmt.Sprintf(
 		"SELECT COUNT(*) FROM wisps w %s %s WHERE %s AND %s",
@@ -497,9 +521,10 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	// Uses LEFT JOIN anti-pattern instead of correlated EXISTS to avoid O(n*m) cost
 	// (gt-jd1z) — notAgentWispJoin follows the same pattern for the same reason.
 	// Closed-molecule steps are counted separately above and excluded here so counts stay disjoint.
+	// Mail wisps are excluded as in Reap (gt-yans).
 	reapQuery := fmt.Sprintf(
-		"SELECT COUNT(*) FROM wisps w %s %s %s WHERE %s AND w.created_at < ? AND %s AND %s AND closed_molecule_step.issue_id IS NULL",
-		parentJoin, moleculeStepExcludeJoin, agentJoin, openWispStatusWhere, agentWhere, parentWhere)
+		"SELECT COUNT(*) FROM wisps w %s %s %s %s WHERE %s AND w.created_at < ? AND %s AND %s AND %s AND closed_molecule_step.issue_id IS NULL",
+		parentJoin, moleculeStepExcludeJoin, agentJoin, mailJoin, openWispStatusWhere, agentWhere, mailWhere, parentWhere)
 	if err := db.QueryRowContext(ctx, reapQuery, now.Add(-maxAge)).Scan(&result.ReapCandidates); err != nil {
 		return nil, fmt.Errorf("count reap candidates: %w", err)
 	}
@@ -608,13 +633,16 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	moleculeStepJoin := closedMoleculeStepJoin("closed_molecule_step")
 	moleculeStepExcludeJoin := closedMoleculeStepExcludeJoin("closed_molecule_step")
 	agentJoin, agentWhere := notAgentWispJoin("w")
+	mailJoin, mailWhere := notMailWispJoin("w")
 	// Exclude agent beads (issue_type='agent' or gt:agent label) from reaping —
 	// they have persistent identity and should not be closed by the wisp reaper
 	// regardless of age. Closed-molecule steps are closed immediately through a
 	// separate path, so stale max-age counts exclude them to keep dry-run and
-	// scan counts disjoint.
+	// scan counts disjoint. Mail wisps (gt:message) are excluded too: their
+	// lifecycle belongs to the mail closers, which check the read label
+	// (gt-yans).
 	whereClause := fmt.Sprintf(
-		"%s AND w.created_at < ? AND %s AND %s AND closed_molecule_step.issue_id IS NULL", openWispStatusWhere, agentWhere, parentWhere)
+		"%s AND w.created_at < ? AND %s AND %s AND %s AND closed_molecule_step.issue_id IS NULL", openWispStatusWhere, agentWhere, mailWhere, parentWhere)
 
 	result := &ReapResult{Database: dbName, DryRun: dryRun}
 
@@ -625,7 +653,7 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 		if err := db.QueryRowContext(ctx, moleculeStepCountQuery).Scan(&result.MoleculeStepsClosed); err != nil {
 			return nil, fmt.Errorf("dry-run molecule step count: %w", err)
 		}
-		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM wisps w %s %s %s WHERE %s", parentJoin, moleculeStepExcludeJoin, agentJoin, whereClause)
+		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM wisps w %s %s %s %s WHERE %s", parentJoin, moleculeStepExcludeJoin, agentJoin, mailJoin, whereClause)
 		if err := db.QueryRowContext(ctx, countQuery, cutoff).Scan(&result.Reaped); err != nil {
 			return nil, fmt.Errorf("dry-run count: %w", err)
 		}
@@ -666,8 +694,8 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	// This avoids holding a write lock on the entire table for minutes.
 	// Uses LEFT JOIN anti-pattern instead of correlated EXISTS to avoid O(n*m) cost (gt-jd1z).
 	idQuery := fmt.Sprintf(
-		"SELECT w.id FROM wisps w %s %s %s WHERE %s LIMIT %d",
-		parentJoin, moleculeStepExcludeJoin, agentJoin, whereClause, DefaultBatchSize)
+		"SELECT w.id FROM wisps w %s %s %s %s WHERE %s LIMIT %d",
+		parentJoin, moleculeStepExcludeJoin, agentJoin, mailJoin, whereClause, DefaultBatchSize)
 
 	totalReaped, err := closeWispsInBatches(ctx, conn, idQuery, []interface{}{cutoff}, "stale wisps")
 	if err != nil {
@@ -1182,9 +1210,10 @@ func ClosePluginReceipts(db *sql.DB, dbName string, maxAge time.Duration, dryRun
 // gating on it fast-closed unread mail. `read` is set only by `gt mail read`
 // (mail.Mailbox.storeMarkReadOnly), which is the actual read signal. A nudge
 // merely announces mail; the body exists only in the bead, so closing a still
-// unread notification silently loses it. Unread ones fall back to the normal
-// max-age Reap. FastTrackClosers (and thus Scan's FastTrackCandidates) call
-// this same function, so the preview and the real close apply one predicate.
+// unread notification silently loses it. Unread ones stay open: the max-age Reap
+// excludes mail entirely (gt-yans). FastTrackClosers (and thus Scan's
+// FastTrackCandidates) call this same function, so the preview and the real
+// close apply one predicate.
 func CloseStaleNotifications(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ClosePluginReceiptResult, error) {
 	return closeWispsByLabel(db, dbName, "msg-type:notification", maxAge, "stale notifications", dryRun, readLabel)
 }
