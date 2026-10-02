@@ -916,18 +916,102 @@ func TestStaleNotificationsOnlyFastTrackReadMail(t *testing.T) {
 		}
 	}
 
-	// The normal max-age path still closes unread mail once it is past maxAge,
-	// regardless of delivery:acked.
+	// The max-age path must not close unread mail either, however old
+	// (gt-yans): mail lifecycle belongs to the mail closers, which check the
+	// read label.
+	reap, err := Reap(db, "testdb", maxAge, false)
+	if err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if reap.Reaped != 0 {
+		t.Fatalf("Reap Reaped = %d, want 0 (pending-25h is unread mail and must survive max-age)", reap.Reaped)
+	}
+	for id, want := range map[string]string{"acked-only-2h": "open", "pending-2h": "open", "pending-25h": "open"} {
+		if got := state.status(id); got != want {
+			t.Errorf("after Reap: %s status = %q, want %q", id, got, want)
+		}
+	}
+}
+
+// TestReapAndScanLeaveUnreadMailAlone is the gt-yans regression. On
+// 2026-10-02 `gt reaper reap` closed 1360 unread gt:message wisps: mail has no
+// parent-child row, so parentExcludeJoin treated it as an eligible top-level
+// wisp and the 24h max-age Reap closed it whether or not it had been read. The
+// read-label gate (gt-78xq) covers only CloseStaleNotifications.
+func TestReapAndScanLeaveUnreadMailAlone(t *testing.T) {
+	now := time.Now().UTC()
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"unread-mail-48h": {id: "unread-mail-48h", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour), labels: []string{"gt:message", "delivery:pending"}},
+			// bd create --labels writes only to the labels table.
+			"unread-mail-issue-labels-48h": {id: "unread-mail-issue-labels-48h", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour), issueLabels: []string{"gt:message"}},
+			"plain-task-48h":               {id: "plain-task-48h", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour)},
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	maxAge := 24 * time.Hour
+	scan, err := Scan(db, "testdb", maxAge, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if scan.ReapCandidates != 1 {
+		t.Fatalf("scan.ReapCandidates = %d, want 1 (only plain-task-48h; mail is not a reap candidate)", scan.ReapCandidates)
+	}
+	dryRun, err := Reap(db, "testdb", maxAge, true)
+	if err != nil {
+		t.Fatalf("dry-run Reap: %v", err)
+	}
+	if dryRun.Reaped != scan.ReapCandidates {
+		t.Fatalf("dry-run Reap would close %d but scan predicted %d — Scan and Reap must share one predicate", dryRun.Reaped, scan.ReapCandidates)
+	}
+
 	reap, err := Reap(db, "testdb", maxAge, false)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
 	if reap.Reaped != 1 {
-		t.Fatalf("Reap Reaped = %d, want 1 (only pending-25h is past max-age)", reap.Reaped)
+		t.Fatalf("Reap Reaped = %d, want 1 (plain-task-48h only)", reap.Reaped)
 	}
-	for id, want := range map[string]string{"acked-only-2h": "open", "pending-2h": "open", "pending-25h": "closed"} {
+	for id, want := range map[string]string{"unread-mail-48h": "open", "unread-mail-issue-labels-48h": "open", "plain-task-48h": "closed"} {
 		if got := state.status(id); got != want {
-			t.Errorf("after Reap: %s status = %q, want %q", id, got, want)
+			t.Errorf("%s status = %q after Reap, want %q", id, got, want)
+		}
+	}
+}
+
+// TestCloseStaleNotificationsStillClosesReadMail guards against over-blocking
+// in the gt-yans fix: excluding mail from the max-age Reap must not stop the
+// notification closer from closing a notification the recipient has read, at
+// any age past the cutoff.
+func TestCloseStaleNotificationsStillClosesReadMail(t *testing.T) {
+	now := time.Now().UTC()
+	notif := func(id string, age time.Duration, extra ...string) *fakeWisp {
+		return &fakeWisp{id: id, status: "open", issueType: "task", createdAt: now.Add(-age), labels: append([]string{"gt:message", "msg-type:notification"}, extra...)}
+	}
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"read-2h":    notif("read-2h", 2*time.Hour, "read"),
+			"read-48h":   notif("read-48h", 48*time.Hour, "read"),
+			"unread-48h": notif("unread-48h", 48*time.Hour, "delivery:pending"),
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	res, err := CloseStaleNotifications(db, "testdb", FastTrackCloseAge, false)
+	if err != nil {
+		t.Fatalf("CloseStaleNotifications: %v", err)
+	}
+	if res.Closed != 2 {
+		t.Fatalf("CloseStaleNotifications closed %d, want 2 (read-2h, read-48h)", res.Closed)
+	}
+	for id, want := range map[string]string{"read-2h": "closed", "read-48h": "closed", "unread-48h": "open"} {
+		if got := state.status(id); got != want {
+			t.Errorf("%s status = %q, want %q", id, got, want)
 		}
 	}
 }
@@ -989,6 +1073,17 @@ func (w *fakeWisp) isAgentWisp() bool {
 	}
 	for _, l := range w.issueLabels {
 		if l == "gt:agent" {
+			return true
+		}
+	}
+	return false
+}
+
+// isMailWisp reports whether w carries the gt:message label in either label
+// table, mirroring notMailWispJoin.
+func (w *fakeWisp) isMailWisp() bool {
+	for _, l := range append(append([]string(nil), w.labels...), w.issueLabels...) {
+		if l == "gt:message" {
 			return true
 		}
 	}
@@ -1087,10 +1182,17 @@ func (s *fakeReaperState) isMoleculeStepCandidateLocked(id string) bool {
 	return false
 }
 
-func (s *fakeReaperState) staleCandidatesLocked(cutoff time.Time, excludeMoleculeSteps bool) []string {
+// staleCandidatesLocked simulates the max-age Reap/Scan eligibility query.
+// excludeMail is true only when the query under test carries the mail
+// anti-join, so a query that omits it surfaces mail wisps exactly as the real
+// SQL would (gt-yans).
+func (s *fakeReaperState) staleCandidatesLocked(cutoff time.Time, excludeMoleculeSteps, excludeMail bool) []string {
 	var ids []string
 	for id, w := range s.wisps {
 		if !isOpenWispStatus(w.status) || w.isAgentWisp() || !w.createdAt.Before(cutoff) {
+			continue
+		}
+		if excludeMail && w.isMailWisp() {
 			continue
 		}
 		if s.hasOpenParentLocked(id) {
@@ -1243,7 +1345,7 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 		if err := validateStaleWispQuery(normalized); err != nil {
 			return nil, err
 		}
-		return fakeCountRows(len(c.state.staleCandidatesLocked(namedTime(args), strings.Contains(normalized, "closed_molecule_step.issue_id IS NULL")))), nil
+		return fakeCountRows(len(c.state.staleCandidatesLocked(namedTime(args), strings.Contains(normalized, "closed_molecule_step.issue_id IS NULL"), strings.Contains(normalized, "mail_wl.issue_id IS NULL")))), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps w") && strings.Contains(normalized, "pm.issue_type = 'molecule'"):
 		if err := validateMoleculeStepQuery(normalized); err != nil {
 			return nil, err
@@ -1264,7 +1366,7 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 		if err := validateStaleWispQuery(normalized); err != nil {
 			return nil, err
 		}
-		return fakeIDRows(c.state.staleCandidatesLocked(namedTime(args), strings.Contains(normalized, "closed_molecule_step.issue_id IS NULL"))), nil
+		return fakeIDRows(c.state.staleCandidatesLocked(namedTime(args), strings.Contains(normalized, "closed_molecule_step.issue_id IS NULL"), strings.Contains(normalized, "mail_wl.issue_id IS NULL"))), nil
 	case strings.Contains(normalized, "SELECT w.id FROM wisps w") && strings.Contains(normalized, "pm.issue_type = 'molecule'"):
 		if err := validateMoleculeStepQuery(normalized); err != nil {
 			return nil, err
