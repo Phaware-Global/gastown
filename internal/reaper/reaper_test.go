@@ -916,9 +916,6 @@ func TestStaleNotificationsOnlyFastTrackReadMail(t *testing.T) {
 		}
 	}
 
-	// The max-age path must not close unread mail either, however old
-	// (gt-yans): mail lifecycle belongs to the mail closers, which check the
-	// read label.
 	reap, err := Reap(db, "testdb", maxAge, false)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
@@ -933,17 +930,11 @@ func TestStaleNotificationsOnlyFastTrackReadMail(t *testing.T) {
 	}
 }
 
-// TestReapAndScanLeaveUnreadMailAlone is the gt-yans regression. On
-// 2026-10-02 `gt reaper reap` closed 1360 unread gt:message wisps: mail has no
-// parent-child row, so parentExcludeJoin treated it as an eligible top-level
-// wisp and the 24h max-age Reap closed it whether or not it had been read. The
-// read-label gate (gt-78xq) covers only CloseStaleNotifications.
 func TestReapAndScanLeaveUnreadMailAlone(t *testing.T) {
 	now := time.Now().UTC()
 	state := &fakeReaperState{
 		wisps: map[string]*fakeWisp{
-			"unread-mail-48h": {id: "unread-mail-48h", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour), labels: []string{"gt:message", "delivery:pending"}},
-			// bd create --labels writes only to the labels table.
+			"unread-mail-48h":              {id: "unread-mail-48h", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour), labels: []string{"gt:message", "delivery:pending"}},
 			"unread-mail-issue-labels-48h": {id: "unread-mail-issue-labels-48h", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour), issueLabels: []string{"gt:message"}},
 			"plain-task-48h":               {id: "plain-task-48h", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour)},
 		},
@@ -982,10 +973,6 @@ func TestReapAndScanLeaveUnreadMailAlone(t *testing.T) {
 	}
 }
 
-// TestCloseStaleNotificationsStillClosesReadMail guards against over-blocking
-// in the gt-yans fix: excluding mail from the max-age Reap must not stop the
-// notification closer from closing a notification the recipient has read, at
-// any age past the cutoff.
 func TestCloseStaleNotificationsStillClosesReadMail(t *testing.T) {
 	now := time.Now().UTC()
 	notif := func(id string, age time.Duration, extra ...string) *fakeWisp {
@@ -1079,8 +1066,7 @@ func (w *fakeWisp) isAgentWisp() bool {
 	return false
 }
 
-// isMailWisp reports whether w carries the gt:message label in either label
-// table, mirroring notMailWispJoin.
+// isMailWisp reports whether w carries gt:message in either label table.
 func (w *fakeWisp) isMailWisp() bool {
 	for _, l := range append(append([]string(nil), w.labels...), w.issueLabels...) {
 		if l == "gt:message" {
@@ -1182,10 +1168,8 @@ func (s *fakeReaperState) isMoleculeStepCandidateLocked(id string) bool {
 	return false
 }
 
-// staleCandidatesLocked simulates the max-age Reap/Scan eligibility query.
-// excludeMail is true only when the query under test carries the mail
-// anti-join, so a query that omits it surfaces mail wisps exactly as the real
-// SQL would (gt-yans).
+// staleCandidatesLocked simulates the max-age Reap/Scan eligibility query;
+// excludeMail applies only when the query carries the mail anti-join.
 func (s *fakeReaperState) staleCandidatesLocked(cutoff time.Time, excludeMoleculeSteps, excludeMail bool) []string {
 	var ids []string
 	for id, w := range s.wisps {
