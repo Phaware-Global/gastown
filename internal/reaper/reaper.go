@@ -203,40 +203,11 @@ func OpenDB(host string, port int, dbName string, readTimeout, writeTimeout time
 	return sql.Open("mysql", dsn)
 }
 
-// parentExcludeJoin returns a LEFT JOIN clause and WHERE condition that restricts
-// results to wisps whose parent molecule is closed, missing, or nonexistent.
+// parentExcludeJoin returns the JOINs and WHERE condition for a max-age Reap
+// candidate's parentage: a parent-child row exists and no parent is open.
+// Wisps with no parent-child row are never candidates.
 //
-// This replaces the previous parentCheckWhere() which used 3 correlated EXISTS
-// subqueries per row, causing O(n*m) query cost on large wisp tables (gt-jd1z).
-// The LEFT JOIN approach runs the subquery once and hash-joins: O(n+m).
-//
-// Semantics:
-//   - No parent-child dependency at all → eligible for a non-molecule wisp
-//     (orphan wisps); NEVER eligible for a molecule wisp (see below, hq-s4azi).
-//   - Parent-child dependency exists and parent status is 'closed' → eligible
-//     (parent already reaped)
-//   - Parent-child dependency exists but the parent row is missing (dangling
-//     ref) → eligible (parent already purged)
-//
-// "No parent-child dependency at all" and "a parent-child dependency whose
-// parent is gone" are DIFFERENT CONDITIONS and must not share a branch for
-// molecules: a top-level molecule wisp (mol-dog-reaper itself, or any
-// dispatched work molecule) has no parent-child dependency row BY DESIGN, not
-// because its parent was purged. Collapsing the two let a top-level molecule
-// match the instant it passed max_age — including while HOOKED and actively
-// being worked (hq-s4azi). has_parent below distinguishes "never had a
-// parent" from "parent is gone" so the WHERE clause can require an actual
-// parent-child row before a molecule is eligible. Non-molecule wisps keep the
-// original orphan-eligible behavior — this reaper still needs to clean up
-// genuinely abandoned top-level tasks/notifications, just not molecules.
-//
-// The inverse of "has no open parent" is simpler: exclude wisps that have an
-// OPEN parent.
-//
-// Usage:
-//
-//	join, where := parentExcludeJoin(dbName)
-//	query := fmt.Sprintf("SELECT ... FROM wisps w %s WHERE ... AND %s", dbName, join, where)
+// Anti-joins, not correlated EXISTS, to stay O(n+m) on large tables.
 func parentExcludeJoin(dbName string) (joinClause, whereCondition string) {
 	joinClause = `LEFT JOIN (
 		SELECT DISTINCT wd.issue_id
@@ -250,7 +221,7 @@ func parentExcludeJoin(dbName string) (joinClause, whereCondition string) {
 		WHERE wd.type = 'parent-child'
 		AND (pw.status IN ('open', 'hooked', 'in_progress') OR pi.status IN ('open', 'hooked', 'in_progress') OR wd.depends_on_external IS NOT NULL)
 	) open_parent ON open_parent.issue_id = w.id`
-	whereCondition = "open_parent.issue_id IS NULL AND (w.issue_type != 'molecule' OR has_parent.issue_id IS NOT NULL)"
+	whereCondition = "open_parent.issue_id IS NULL AND has_parent.issue_id IS NOT NULL"
 	return
 }
 
@@ -297,17 +268,6 @@ func notAgentWispJoin(alias string) (joinClause, whereCondition string) {
 	whereCondition = fmt.Sprintf(
 		"%s != 'agent' AND agent_wl.issue_id IS NULL AND agent_l.issue_id IS NULL",
 		typeCol)
-	return
-}
-
-// notMailWispJoin excludes mail (gt:message) from max-age Reap and Scan;
-// mail closes only via the read-gated notification closer.
-func notMailWispJoin(alias string) (joinClause, whereCondition string) {
-	joinClause = fmt.Sprintf(
-		`LEFT JOIN wisp_labels mail_wl ON mail_wl.issue_id = %[1]s.id AND mail_wl.label = 'gt:message'
-		LEFT JOIN labels mail_l ON mail_l.issue_id = %[1]s.id AND mail_l.label = 'gt:message'`,
-		alias)
-	whereCondition = "mail_wl.issue_id IS NULL AND mail_l.issue_id IS NULL"
 	return
 }
 
@@ -497,7 +457,6 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	moleculeStepExcludeJoin := closedMoleculeStepExcludeJoin("closed_molecule_step")
 
 	agentJoin, agentWhere := notAgentWispJoin("w")
-	mailJoin, mailWhere := notMailWispJoin("w")
 
 	moleculeStepQuery := fmt.Sprintf(
 		"SELECT COUNT(*) FROM wisps w %s %s WHERE %s AND %s",
@@ -513,10 +472,17 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	// (gt-jd1z) — notAgentWispJoin follows the same pattern for the same reason.
 	// Closed-molecule steps are counted separately above and excluded here so counts stay disjoint.
 	reapQuery := fmt.Sprintf(
-		"SELECT COUNT(*) FROM wisps w %s %s %s %s WHERE %s AND w.created_at < ? AND %s AND %s AND %s AND closed_molecule_step.issue_id IS NULL",
-		parentJoin, moleculeStepExcludeJoin, agentJoin, mailJoin, openWispStatusWhere, agentWhere, mailWhere, parentWhere)
+		"SELECT COUNT(*) FROM wisps w %s %s %s WHERE %s AND w.created_at < ? AND %s AND %s AND closed_molecule_step.issue_id IS NULL",
+		parentJoin, moleculeStepExcludeJoin, agentJoin, openWispStatusWhere, agentWhere, parentWhere)
 	if err := db.QueryRowContext(ctx, reapQuery, now.Add(-maxAge)).Scan(&result.ReapCandidates); err != nil {
 		return nil, fmt.Errorf("count reap candidates: %w", err)
+	}
+
+	unparentedQuery := fmt.Sprintf(
+		"SELECT COUNT(*) FROM wisps w %s %s WHERE %s AND w.created_at < ? AND %s AND has_parent.issue_id IS NULL AND w.issue_type != 'molecule'",
+		parentJoin, agentJoin, openWispStatusWhere, agentWhere)
+	if err := db.QueryRowContext(ctx, unparentedQuery, now.Add(-maxAge)).Scan(&result.UnparentedStale); err != nil {
+		return nil, fmt.Errorf("count unparented stale wisps: %w", err)
 	}
 
 	// Count fast-track candidates (gt-oqnc). `gt reaper reap` closes these at
@@ -623,14 +589,13 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	moleculeStepJoin := closedMoleculeStepJoin("closed_molecule_step")
 	moleculeStepExcludeJoin := closedMoleculeStepExcludeJoin("closed_molecule_step")
 	agentJoin, agentWhere := notAgentWispJoin("w")
-	mailJoin, mailWhere := notMailWispJoin("w")
 	// Exclude agent beads (issue_type='agent' or gt:agent label) from reaping —
 	// they have persistent identity and should not be closed by the wisp reaper
 	// regardless of age. Closed-molecule steps are closed immediately through a
 	// separate path, so stale max-age counts exclude them to keep dry-run and
 	// scan counts disjoint.
 	whereClause := fmt.Sprintf(
-		"%s AND w.created_at < ? AND %s AND %s AND %s AND closed_molecule_step.issue_id IS NULL", openWispStatusWhere, agentWhere, mailWhere, parentWhere)
+		"%s AND w.created_at < ? AND %s AND %s AND closed_molecule_step.issue_id IS NULL", openWispStatusWhere, agentWhere, parentWhere)
 
 	result := &ReapResult{Database: dbName, DryRun: dryRun}
 
@@ -641,7 +606,7 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 		if err := db.QueryRowContext(ctx, moleculeStepCountQuery).Scan(&result.MoleculeStepsClosed); err != nil {
 			return nil, fmt.Errorf("dry-run molecule step count: %w", err)
 		}
-		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM wisps w %s %s %s %s WHERE %s", parentJoin, moleculeStepExcludeJoin, agentJoin, mailJoin, whereClause)
+		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM wisps w %s %s %s WHERE %s", parentJoin, moleculeStepExcludeJoin, agentJoin, whereClause)
 		if err := db.QueryRowContext(ctx, countQuery, cutoff).Scan(&result.Reaped); err != nil {
 			return nil, fmt.Errorf("dry-run count: %w", err)
 		}
@@ -682,8 +647,8 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	// This avoids holding a write lock on the entire table for minutes.
 	// Uses LEFT JOIN anti-pattern instead of correlated EXISTS to avoid O(n*m) cost (gt-jd1z).
 	idQuery := fmt.Sprintf(
-		"SELECT w.id FROM wisps w %s %s %s %s WHERE %s LIMIT %d",
-		parentJoin, moleculeStepExcludeJoin, agentJoin, mailJoin, whereClause, DefaultBatchSize)
+		"SELECT w.id FROM wisps w %s %s %s WHERE %s LIMIT %d",
+		parentJoin, moleculeStepExcludeJoin, agentJoin, whereClause, DefaultBatchSize)
 
 	totalReaped, err := closeWispsInBatches(ctx, conn, idQuery, []interface{}{cutoff}, "stale wisps")
 	if err != nil {

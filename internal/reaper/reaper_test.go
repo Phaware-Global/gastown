@@ -614,8 +614,8 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	if scan.MoleculeStepCandidates != 2 {
 		t.Fatalf("Scan MoleculeStepCandidates = %d, want 2", scan.MoleculeStepCandidates)
 	}
-	if scan.ReapCandidates != 2 {
-		t.Fatalf("Scan ReapCandidates = %d, want 2", scan.ReapCandidates)
+	if scan.ReapCandidates != 1 {
+		t.Fatalf("Scan ReapCandidates = %d, want 1", scan.ReapCandidates)
 	}
 
 	beforeDryRun := state.statuses()
@@ -626,8 +626,8 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	if dryRun.MoleculeStepsClosed != 2 {
 		t.Fatalf("dry-run MoleculeStepsClosed = %d, want 2", dryRun.MoleculeStepsClosed)
 	}
-	if dryRun.Reaped != 2 {
-		t.Fatalf("dry-run Reaped = %d, want 2", dryRun.Reaped)
+	if dryRun.Reaped != 1 {
+		t.Fatalf("dry-run Reaped = %d, want 1", dryRun.Reaped)
 	}
 	if dryRun.OpenRemain != 12 {
 		t.Fatalf("dry-run OpenRemain = %d, want 12", dryRun.OpenRemain)
@@ -644,19 +644,19 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	if realRun.MoleculeStepsClosed != 2 {
 		t.Fatalf("real MoleculeStepsClosed = %d, want 2", realRun.MoleculeStepsClosed)
 	}
-	if realRun.Reaped != 2 {
-		t.Fatalf("real Reaped = %d, want 2", realRun.Reaped)
+	if realRun.Reaped != 1 {
+		t.Fatalf("real Reaped = %d, want 1", realRun.Reaped)
 	}
-	if realRun.OpenRemain != 8 {
-		t.Fatalf("real OpenRemain = %d, want 8", realRun.OpenRemain)
+	if realRun.OpenRemain != 9 {
+		t.Fatalf("real OpenRemain = %d, want 9", realRun.OpenRemain)
 	}
 
-	for _, id := range []string{"step-closed-mol-recent", "step-closed-mol-old", "step-non-molecule-parent", "stale-orphan"} {
+	for _, id := range []string{"step-closed-mol-recent", "step-closed-mol-old", "step-non-molecule-parent"} {
 		if got := state.status(id); got != "closed" {
 			t.Fatalf("%s status = %q, want closed", id, got)
 		}
 	}
-	for _, id := range []string{"step-mixed-parent-old", "step-external-parent-old", "step-open-parent-old", "agent-step", "fresh-orphan", "mol-open", "label-agent-orphan", "issue-label-agent-orphan"} {
+	for _, id := range []string{"step-mixed-parent-old", "step-external-parent-old", "step-open-parent-old", "agent-step", "stale-orphan", "fresh-orphan", "mol-open", "label-agent-orphan", "issue-label-agent-orphan"} {
 		if got := state.status(id); got != "open" {
 			t.Fatalf("%s status = %q, want open", id, got)
 		}
@@ -799,8 +799,8 @@ func TestScanAndReapAgreeOnCandidateSet(t *testing.T) {
 	if scanTotal != reapTotal {
 		t.Fatalf("scan predicted %d candidates but reap (dry-run) would close %d — preview is not truthful", scanTotal, reapTotal)
 	}
-	if scan.ReapCandidates != 2 {
-		t.Fatalf("scan.ReapCandidates = %d, want 2 (top-level-task + child-of-closed-parent)", scan.ReapCandidates)
+	if scan.ReapCandidates != 1 {
+		t.Fatalf("scan.ReapCandidates = %d, want 1 (child-of-closed-parent; top-level-task is parentless)", scan.ReapCandidates)
 	}
 }
 
@@ -936,9 +936,11 @@ func TestReapAndScanLeaveUnreadMailAlone(t *testing.T) {
 		wisps: map[string]*fakeWisp{
 			"unread-mail-48h":              {id: "unread-mail-48h", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour), labels: []string{"gt:message", "delivery:pending"}},
 			"unread-mail-issue-labels-48h": {id: "unread-mail-issue-labels-48h", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour), issueLabels: []string{"gt:message"}},
-			"plain-task-48h":               {id: "plain-task-48h", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour)},
+			"closed-parent":                {id: "closed-parent", status: "closed", issueType: "task", createdAt: now.Add(-72 * time.Hour)},
+			"orphaned-step-48h":            {id: "orphaned-step-48h", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour)},
 		},
-		ops: map[int][]string{},
+		deps: []fakeDep{{issueID: "orphaned-step-48h", dependsOnID: "closed-parent", depType: "parent-child"}},
+		ops:  map[int][]string{},
 	}
 	db := openFakeReaperDB(t, state)
 	t.Cleanup(func() { _ = db.Close() })
@@ -949,7 +951,7 @@ func TestReapAndScanLeaveUnreadMailAlone(t *testing.T) {
 		t.Fatalf("Scan: %v", err)
 	}
 	if scan.ReapCandidates != 1 {
-		t.Fatalf("scan.ReapCandidates = %d, want 1 (only plain-task-48h; mail is not a reap candidate)", scan.ReapCandidates)
+		t.Fatalf("scan.ReapCandidates = %d, want 1 (only orphaned-step-48h; mail is not a reap candidate)", scan.ReapCandidates)
 	}
 	dryRun, err := Reap(db, "testdb", maxAge, true)
 	if err != nil {
@@ -964,9 +966,9 @@ func TestReapAndScanLeaveUnreadMailAlone(t *testing.T) {
 		t.Fatalf("Reap: %v", err)
 	}
 	if reap.Reaped != 1 {
-		t.Fatalf("Reap Reaped = %d, want 1 (plain-task-48h only)", reap.Reaped)
+		t.Fatalf("Reap Reaped = %d, want 1 (orphaned-step-48h only)", reap.Reaped)
 	}
-	for id, want := range map[string]string{"unread-mail-48h": "open", "unread-mail-issue-labels-48h": "open", "plain-task-48h": "closed"} {
+	for id, want := range map[string]string{"unread-mail-48h": "open", "unread-mail-issue-labels-48h": "open", "orphaned-step-48h": "closed"} {
 		if got := state.status(id); got != want {
 			t.Errorf("%s status = %q after Reap, want %q", id, got, want)
 		}
@@ -1127,16 +1129,6 @@ func (w *fakeWisp) isAgentWisp() bool {
 	return false
 }
 
-// isMailWisp reports whether w carries gt:message in either label table.
-func (w *fakeWisp) isMailWisp() bool {
-	for _, l := range append(append([]string(nil), w.labels...), w.issueLabels...) {
-		if l == "gt:message" {
-			return true
-		}
-	}
-	return false
-}
-
 type fakeDep struct {
 	issueID           string
 	dependsOnID       string
@@ -1229,27 +1221,14 @@ func (s *fakeReaperState) isMoleculeStepCandidateLocked(id string) bool {
 	return false
 }
 
-// staleCandidatesLocked simulates the max-age Reap/Scan eligibility query;
-// excludeMail applies only when the query carries the mail anti-join.
-func (s *fakeReaperState) staleCandidatesLocked(cutoff time.Time, excludeMoleculeSteps, excludeMail, requireParent bool) []string {
+// staleCandidatesLocked simulates the max-age Reap/Scan eligibility query.
+func (s *fakeReaperState) staleCandidatesLocked(cutoff time.Time, excludeMoleculeSteps bool) []string {
 	var ids []string
 	for id, w := range s.wisps {
 		if !isOpenWispStatus(w.status) || w.isAgentWisp() || !w.createdAt.Before(cutoff) {
 			continue
 		}
-		if excludeMail && w.isMailWisp() {
-			continue
-		}
-		if requireParent && !s.hasParentLocked(id) {
-			continue
-		}
-		if s.hasOpenParentLocked(id) {
-			continue
-		}
-		// A top-level molecule (no parent-child dependency row at all) is
-		// never eligible via the missing-parent rule — only a molecule with
-		// an actual (closed or dangling) parent-child row is (hq-s4azi).
-		if w.issueType == "molecule" && !s.hasParentLocked(id) {
+		if !s.hasParentLocked(id) || s.hasOpenParentLocked(id) {
 			continue
 		}
 		if excludeMoleculeSteps && s.isMoleculeStepCandidateLocked(id) {
@@ -1414,7 +1393,7 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 		if err := validateStaleWispQuery(normalized); err != nil {
 			return nil, err
 		}
-		return fakeCountRows(len(c.state.staleCandidatesLocked(namedTime(args), strings.Contains(normalized, "closed_molecule_step.issue_id IS NULL"), strings.Contains(normalized, "mail_wl.issue_id IS NULL"), strings.Contains(normalized, "open_parent.issue_id IS NULL AND has_parent.issue_id IS NOT NULL")))), nil
+		return fakeCountRows(len(c.state.staleCandidatesLocked(namedTime(args), strings.Contains(normalized, "closed_molecule_step.issue_id IS NULL")))), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps w") && strings.Contains(normalized, "pm.issue_type = 'molecule'"):
 		if err := validateMoleculeStepQuery(normalized); err != nil {
 			return nil, err
@@ -1435,7 +1414,7 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 		if err := validateStaleWispQuery(normalized); err != nil {
 			return nil, err
 		}
-		return fakeIDRows(c.state.staleCandidatesLocked(namedTime(args), strings.Contains(normalized, "closed_molecule_step.issue_id IS NULL"), strings.Contains(normalized, "mail_wl.issue_id IS NULL"), strings.Contains(normalized, "open_parent.issue_id IS NULL AND has_parent.issue_id IS NOT NULL"))), nil
+		return fakeIDRows(c.state.staleCandidatesLocked(namedTime(args), strings.Contains(normalized, "closed_molecule_step.issue_id IS NULL"))), nil
 	case strings.Contains(normalized, "SELECT w.id FROM wisps w") && strings.Contains(normalized, "pm.issue_type = 'molecule'"):
 		if err := validateMoleculeStepQuery(normalized); err != nil {
 			return nil, err
@@ -1641,7 +1620,7 @@ func validateStaleWispQuery(query string) error {
 		"open_parent.issue_id IS NULL",
 		"closed_molecule_step.issue_id IS NULL",
 		"has_parent.issue_id = w.id",
-		"w.issue_type != 'molecule' OR has_parent.issue_id IS NOT NULL",
+		"open_parent.issue_id IS NULL AND has_parent.issue_id IS NOT NULL",
 	)
 }
 
