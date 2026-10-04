@@ -28,8 +28,7 @@ var (
 	reaperJSON     bool
 )
 
-// requireReaperWritesAllowed refuses a writing invocation while the operator
-// kill switch is on. --dry-run never writes, so it is always allowed.
+// requireReaperWritesAllowed refuses writes while the kill switch is on; --dry-run writes nothing, so it passes.
 func requireReaperWritesAllowed() error {
 	if reaperDryRun {
 		return nil

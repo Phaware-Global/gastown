@@ -41,10 +41,7 @@ const (
 type WispReaperConfig struct {
 	Enabled bool `json:"enabled"`
 	DryRun  bool `json:"dry_run,omitempty"`
-	// Destructive is the operator kill switch; only an explicit false turns it
-	// on. The gt reaper write commands re-read it from daemon.json on every run,
-	// so it takes effect immediately. The daemon reads daemon.json at startup, so
-	// its own dispatch dry_run hint and patrol scheduling need a restart.
+	// Kill switch: gt reaper re-reads it from daemon.json on every write, but the daemon reads daemon.json only at startup.
 	Destructive      *bool    `json:"destructive,omitempty"`
 	IntervalStr      string   `json:"interval,omitempty"`
 	MaxAgeStr        string   `json:"max_age,omitempty"`
@@ -59,11 +56,7 @@ func wispReaperDestructive(config *WispReaperConfig) bool {
 	return config == nil || config.Destructive == nil || *config.Destructive
 }
 
-// CheckReaperWritesAllowed reads mayor/daemon.json from disk and returns an
-// error if the wisp_reaper patrol is switched off (enabled=false or
-// destructive=false). A missing file or wisp_reaper section means no switch is
-// set; an unreadable file fails closed. gt reaper calls this on every
-// invocation that writes, so flipping the switch needs no restart.
+// CheckReaperWritesAllowed re-reads mayor/daemon.json and errors if wisp_reaper is switched off; an unreadable file fails closed.
 func CheckReaperWritesAllowed(townRoot string) error {
 	path := PatrolConfigFile(townRoot)
 	data, err := os.ReadFile(path)
