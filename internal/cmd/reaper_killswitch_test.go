@@ -160,3 +160,54 @@ func TestReaperRefusesWhenDaemonConfigUnparseable(t *testing.T) {
 		t.Errorf("%d Dolt connections made with an unreadable kill switch", n)
 	}
 }
+
+func writeTownSettings(t *testing.T, body string) {
+	t.Helper()
+	if err := os.MkdirAll("settings", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join("settings", "config.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The town-level disabled_patrols list switches the reaper off even when
+// daemon.json enables it, matching the daemon's isPatrolActive.
+func TestReaperWriteCommandsRefuseWhenTownDisablesWispReaper(t *testing.T) {
+	for name, cmd := range reaperWriteCmds {
+		t.Run(name, func(t *testing.T) {
+			conns := reaperKillSwitchTown(t, `{"enabled":true,"destructive":true}`)
+			writeTownSettings(t, `{"disabled_patrols":["doctor_dog","wisp_reaper"]}`)
+			if err := cmd.RunE(cmd, nil); err == nil {
+				t.Fatal("expected a non-nil error, got nil")
+			}
+			time.Sleep(150 * time.Millisecond)
+			if n := conns.Load(); n != 0 {
+				t.Errorf("%d Dolt connections made; no reaper step may run", n)
+			}
+		})
+	}
+}
+
+// Other patrols in disabled_patrols must not block the reaper.
+func TestReaperRunsWhenTownDisablesOnlyOtherPatrols(t *testing.T) {
+	conns := reaperKillSwitchTown(t, `{"enabled":true,"destructive":true}`)
+	writeTownSettings(t, `{"disabled_patrols":["doctor_dog"]}`)
+	_ = reaperReapCmd.RunE(reaperReapCmd, nil)
+	if !waitForConns(conns, 1, 2*time.Second) {
+		t.Error("reap was blocked by an unrelated disabled patrol")
+	}
+}
+
+// A settings file that exists but cannot be parsed fails closed.
+func TestReaperRefusesWhenTownSettingsUnparseable(t *testing.T) {
+	conns := reaperKillSwitchTown(t, `{"enabled":true,"destructive":true}`)
+	writeTownSettings(t, "{not json")
+	if err := reaperReapCmd.RunE(reaperReapCmd, nil); err == nil {
+		t.Fatal("expected an error for unparseable town settings")
+	}
+	time.Sleep(150 * time.Millisecond)
+	if n := conns.Load(); n != 0 {
+		t.Errorf("%d Dolt connections made with unreadable town settings", n)
+	}
+}

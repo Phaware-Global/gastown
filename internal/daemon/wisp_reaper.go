@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -56,8 +57,16 @@ func wispReaperDestructive(config *WispReaperConfig) bool {
 	return config == nil || config.Destructive == nil || *config.Destructive
 }
 
-// CheckReaperWritesAllowed re-reads mayor/daemon.json and errors if wisp_reaper is switched off; an unreadable file fails closed.
+// CheckReaperWritesAllowed re-reads mayor/daemon.json and the town disabled_patrols list and errors if wisp_reaper is switched off; an unreadable file fails closed.
 func CheckReaperWritesAllowed(townRoot string) error {
+	disabled, err := readDisabledPatrols(townRoot)
+	if err != nil {
+		return fmt.Errorf("cannot read town settings to check the reaper kill switch: %w", err)
+	}
+	if disabled["wisp_reaper"] {
+		return fmt.Errorf("wisp_reaper is listed in disabled_patrols in %s", filepath.Join(townRoot, "settings", "config.json"))
+	}
+
 	path := PatrolConfigFile(townRoot)
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
