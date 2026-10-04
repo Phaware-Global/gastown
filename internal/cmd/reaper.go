@@ -506,8 +506,9 @@ var reaperRunCmd = &cobra.Command{
 	Short: "Run full reaper cycle across all databases",
 	Long: `Execute a full reaper cycle: scan → reap → purge → auto-close → report.
 
-This is the inline fallback for when Dog dispatch is unavailable.
-Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
+This is a manual operator command. The daemon never runs it as a fallback:
+it dispatches a Dog to execute the mol-dog-reaper formula and skips the
+cycle if dispatch fails.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		databases := reaperDatabaseNames()
 
