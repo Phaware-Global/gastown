@@ -1,7 +1,11 @@
 package daemon
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -29,15 +33,18 @@ const (
 	// the `gt reaper auto-close --stale-age` CLI default and documented as the
 	// mol-dog-reaper formula's default. Do NOT hardcode a different value here.
 	defaultStaleIssueAge = reaper.DefaultStaleIssueAge
+	// Consecutive failed Dog dispatches before the daemon escalates once.
+	reaperDispatchEscalateAfter = 3
 )
 
 // WispReaperConfig holds configuration for the wisp_reaper patrol.
 type WispReaperConfig struct {
 	Enabled bool `json:"enabled"`
 	DryRun  bool `json:"dry_run,omitempty"`
-	// Destructive is the operator kill switch. Nil or true runs the reaper
-	// normally; false forces every dispatch to dry_run so nothing is closed or
-	// purged. Flip it in daemon.json — no code change or daemon-wide disable.
+	// Destructive is the operator kill switch; only an explicit false turns it
+	// on. The gt reaper write commands re-read it from daemon.json on every run,
+	// so it takes effect immediately. The daemon reads daemon.json at startup, so
+	// its own dispatch dry_run hint and patrol scheduling need a restart.
 	Destructive      *bool    `json:"destructive,omitempty"`
 	IntervalStr      string   `json:"interval,omitempty"`
 	MaxAgeStr        string   `json:"max_age,omitempty"`
@@ -50,6 +57,37 @@ type WispReaperConfig struct {
 // It defaults to true; only an explicit destructive=false turns it off.
 func wispReaperDestructive(config *WispReaperConfig) bool {
 	return config == nil || config.Destructive == nil || *config.Destructive
+}
+
+// CheckReaperWritesAllowed reads mayor/daemon.json from disk and returns an
+// error if the wisp_reaper patrol is switched off (enabled=false or
+// destructive=false). A missing file or wisp_reaper section means no switch is
+// set; an unreadable file fails closed. gt reaper calls this on every
+// invocation that writes, so flipping the switch needs no restart.
+func CheckReaperWritesAllowed(townRoot string) error {
+	path := PatrolConfigFile(townRoot)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("cannot read %s to check the reaper kill switch: %w", path, err)
+	}
+	var cfg DaemonPatrolConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("cannot parse %s to check the reaper kill switch: %w", path, err)
+	}
+	if cfg.Patrols == nil || cfg.Patrols.WispReaper == nil {
+		return nil
+	}
+	wr := cfg.Patrols.WispReaper
+	switch {
+	case !wr.Enabled:
+		return fmt.Errorf("patrols.wisp_reaper.enabled is false in %s", path)
+	case !wispReaperDestructive(wr):
+		return fmt.Errorf("patrols.wisp_reaper.destructive is false in %s", path)
+	}
+	return nil
 }
 
 // wispReaperInterval returns the configured interval, or the default (1h).
@@ -144,10 +182,35 @@ func (d *Daemon) reapWisps() {
 	if err := d.dispatchReaperDog(vars); err != nil {
 		d.logger.Printf("wisp_reaper: Dog dispatch failed (%v); skipping this cycle, no destructive steps run in the daemon", err)
 		mol.failStep("scan", fmt.Sprintf("dog dispatch failed: %v", err))
+		d.noteReaperDispatchFailure(err)
+		return
+	}
+	d.reaperDispatchFailures, d.reaperDispatchEscalated = 0, false
+
+	d.logger.Printf("wisp_reaper: dispatched to Dog for formula-driven execution")
+}
+
+// noteReaperDispatchFailure escalates once after reaperDispatchEscalateAfter
+// consecutive failures; a successful dispatch re-arms it.
+func (d *Daemon) noteReaperDispatchFailure(cause error) {
+	d.reaperDispatchFailures++
+	if d.reaperDispatchFailures < reaperDispatchEscalateAfter || d.reaperDispatchEscalated {
 		return
 	}
 
-	d.logger.Printf("wisp_reaper: dispatched to Dog for formula-driven execution")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, d.gtPath, "escalate", "-s", "HIGH", //nolint:gosec // G204: d.gtPath resolved at daemon init via LookPath
+		fmt.Sprintf("wisp_reaper: Dog dispatch failed %d cycles in a row, reaper not running", d.reaperDispatchFailures),
+		"--reason", fmt.Sprintf("last error: %v", cause))
+	cmd.Dir = d.config.TownRoot
+	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon")
+	util.SetDetachedProcessGroup(cmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		d.logger.Printf("wisp_reaper: escalation failed: %v (%s)", err, strings.TrimSpace(string(out)))
+		return
+	}
+	d.reaperDispatchEscalated = true
 }
 
 // dispatchReaperDog dispatches the mol-dog-reaper formula to a Dog via gt sling.

@@ -241,3 +241,86 @@ func TestReapWispsDestructiveSwitch(t *testing.T) {
 		})
 	}
 }
+
+// failingDispatchGt returns a gt script that fails `sling` and records every
+// `escalate` invocation (one line each) to the returned file.
+func failingDispatchGt(t *testing.T, dir string) (gt, escalations string) {
+	t.Helper()
+	escalations = filepath.Join(dir, "escalations")
+	gt = writeFakeBin(t, dir, "gt-esc", `case "$1" in
+escalate) echo "$@" >> "`+escalations+`"; exit 0 ;;
+*) exit 1 ;;
+esac`)
+	return gt, escalations
+}
+
+func countEscalations(t *testing.T, path string) int {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Count(string(raw), "\n")
+}
+
+// Three consecutive failed dispatches raise exactly one HIGH escalation; later
+// failures stay quiet until a dispatch succeeds.
+func TestReapWispsEscalatesOnceAfterThreeConsecutiveDispatchFailures(t *testing.T) {
+	d, _ := newReaperTestDaemon(t, &WispReaperConfig{Enabled: true}, "exit 1")
+	gt, esc := failingDispatchGt(t, t.TempDir())
+	d.gtPath = gt
+
+	for i := 1; i <= 2; i++ {
+		d.reapWisps()
+		if n := countEscalations(t, esc); n != 0 {
+			t.Fatalf("after failure %d: %d escalations, want 0", i, n)
+		}
+	}
+	d.reapWisps()
+	if n := countEscalations(t, esc); n != 1 {
+		t.Fatalf("after failure 3: %d escalations, want 1", n)
+	}
+	raw, _ := os.ReadFile(esc)
+	if !strings.Contains(string(raw), "-s HIGH") {
+		t.Errorf("escalation severity is not HIGH: %s", raw)
+	}
+	d.reapWisps()
+	if n := countEscalations(t, esc); n != 1 {
+		t.Fatalf("after failure 4: %d escalations, want still 1", n)
+	}
+}
+
+// A successful dispatch re-arms the escalation.
+func TestReapWispsEscalationRearmsAfterSuccessfulDispatch(t *testing.T) {
+	d, _ := newReaperTestDaemon(t, &WispReaperConfig{Enabled: true}, "exit 1")
+	dir := t.TempDir()
+	flag := filepath.Join(dir, "ok")
+	esc := filepath.Join(dir, "escalations")
+	d.gtPath = writeFakeBin(t, dir, "gt-flip", `case "$1" in
+escalate) echo "$@" >> "`+esc+`"; exit 0 ;;
+sling) [ -e "`+flag+`" ] && exit 0; exit 1 ;;
+esac`)
+
+	for i := 0; i < 3; i++ {
+		d.reapWisps()
+	}
+	if n := countEscalations(t, esc); n != 1 {
+		t.Fatalf("first run: %d escalations, want 1", n)
+	}
+	if err := os.WriteFile(flag, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d.reapWisps() // success resets the streak
+	if err := os.Remove(flag); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		d.reapWisps()
+	}
+	if n := countEscalations(t, esc); n != 2 {
+		t.Fatalf("after re-arm: %d escalations, want 2", n)
+	}
+}
