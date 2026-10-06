@@ -854,18 +854,54 @@ KEY_C="$(fingerprint_of "$SANDBOX" "JSONL export failed")"
 assert_distinct_fingerprints "$KEY_A" "$KEY_C" "jsonl export failure — extra failed db"
 rm -rf "$SANDBOX"
 
-log "=== Scenario: dolt push failure is fingerprinted by the failure count ==="
+# Sandbox where every db after the first argument has a remote; only the dbs
+# named in the first argument (comma-separated) have a push that fails.
+setup_partial_push_fail_sandbox() {
+  local fail_dbs=",$1," sandbox db
+  shift
+  sandbox="$(setup_push_fail_sandbox)"
+  for db in "$@"; do
+    mkdir -p "$sandbox/home/gt/.dolt-data/$db/.dolt"
+    printf 'origin\thttps://github.com/test-owner/%s (fetch)\n' "$db" > "$sandbox/home/gt/.dolt-data/$db/.mock-remotes"
+    if [[ "$fail_dbs" == *",$db,"* ]]; then
+      touch "$sandbox/home/gt/.dolt-data/$db/.mock-push-fail-origin"
+    fi
+  done
+  echo "$sandbox"
+}
+
+log "=== Scenario: dolt push failure is fingerprinted by the failing db/remote pairs ==="
 SANDBOX="$(setup_push_fail_sandbox testdb)"
 assert_stable_fingerprint "$SANDBOX" "dolt push failed" "dolt push failure" --databases testdb --skip-git
-assert_fingerprint "$SANDBOX" "dolt push failed" "dolt-archive:dolt-push-failed:1" "dolt push failure"
+assert_fingerprint "$SANDBOX" "dolt push failed" "dolt-archive:dolt-push-failed:testdb_origin" "dolt push failure"
+assert_reason_contains "$SANDBOX" "dolt push failed" "testdb/origin" "dolt push failure — reason names the failing pair"
 KEY_A="$(fingerprint_of "$SANDBOX" "dolt push failed")"
 assert_fingerprint_charset "$KEY_A" "dolt push failure"
 rm -rf "$SANDBOX"
 
-SANDBOX="$(setup_push_fail_sandbox testdb otherdb)"
+# Same failure count (1), but a different db's remote is the one failing.
+SANDBOX="$(setup_partial_push_fail_sandbox otherdb testdb otherdb)"
 run_scenario "$SANDBOX" --databases testdb,otherdb --skip-git
 KEY_B="$(fingerprint_of "$SANDBOX" "dolt push failed")"
-assert_distinct_fingerprints "$KEY_A" "$KEY_B" "dolt push failure — different failure count"
+assert_distinct_fingerprints "$KEY_A" "$KEY_B" "dolt push failure — same count, different failing remote"
+rm -rf "$SANDBOX"
+
+# A larger failure set gets its own key too.
+SANDBOX="$(setup_push_fail_sandbox testdb otherdb)"
+run_scenario "$SANDBOX" --databases testdb,otherdb --skip-git
+KEY_C="$(fingerprint_of "$SANDBOX" "dolt push failed")"
+assert_distinct_fingerprints "$KEY_A" "$KEY_C" "dolt push failure — extra failing remote"
+assert_reason_contains "$SANDBOX" "dolt push failed" "otherdb/origin" "dolt push failure — reason names every failing pair"
+rm -rf "$SANDBOX"
+
+# The key does not depend on the order the databases are listed in.
+SANDBOX="$(setup_push_fail_sandbox testdb otherdb)"
+run_scenario "$SANDBOX" --databases otherdb,testdb --skip-git
+KEY_D="$(fingerprint_of "$SANDBOX" "dolt push failed")"
+if [[ -z "$KEY_C" || "$KEY_C" != "$KEY_D" ]]; then
+  echo "FAIL: dolt push failure — database order changed the key: '$KEY_C' vs '$KEY_D'"
+  FAILURES=$((FAILURES + 1))
+fi
 rm -rf "$SANDBOX"
 
 log "=== Scenario: missing git backup repo is fingerprinted by the repo path ==="
@@ -891,7 +927,7 @@ KEY_B="$(fingerprint_of "$SANDBOX" "no git backup repo")"
 assert_distinct_fingerprints "$KEY_A" "$KEY_B" "missing git backup repo — different repo path"
 rm -rf "$SANDBOX"
 
-log "=== Scenario: remote shortfall is fingerprinted by the counts ==="
+log "=== Scenario: remote shortfall is fingerprinted by the exported dbs lacking a remote ==="
 setup_shortfall_sandbox() {
   local sandbox db
   sandbox="$(setup_sandbox)"
@@ -909,15 +945,46 @@ setup_shortfall_sandbox() {
 
 SANDBOX="$(setup_shortfall_sandbox db-no-remote)"
 assert_stable_fingerprint "$SANDBOX" "only 1 of 2 exported" "remote shortfall" --databases db-with-remote,db-no-remote --skip-git
-assert_fingerprint "$SANDBOX" "only 1 of 2 exported" "dolt-archive:remote-shortfall:1-of-2" "remote shortfall"
+assert_fingerprint "$SANDBOX" "only 1 of 2 exported" "dolt-archive:remote-shortfall:db-no-remote" "remote shortfall"
+assert_reason_contains "$SANDBOX" "only 1 of 2 exported" "db-no-remote" "remote shortfall — reason names the db without a remote"
 KEY_A="$(fingerprint_of "$SANDBOX" "only 1 of 2 exported")"
 assert_fingerprint_charset "$KEY_A" "remote shortfall"
 rm -rf "$SANDBOX"
 
+# Same dbs lack a remote, but another exported db with a remote changes the
+# exported count (1-of-2 becomes 2-of-3): the standing shortfall keeps its key.
+SANDBOX="$(setup_shortfall_sandbox db-no-remote db-with-remote-2)"
+printf 'origin\thttps://github.com/test-owner/with-remote-2 (fetch)\n' > "$SANDBOX/home/gt/.dolt-data/db-with-remote-2/.mock-remotes"
+run_scenario "$SANDBOX" --databases db-with-remote,db-with-remote-2,db-no-remote --skip-git
+KEY_B="$(fingerprint_of "$SANDBOX" "only 2 of 3 exported")"
+if [[ -z "$KEY_B" || "$KEY_A" != "$KEY_B" ]]; then
+  echo "FAIL: remote shortfall — unchanged missing set got a different key: '$KEY_A' vs '$KEY_B'"
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$SANDBOX"
+
+# A different db lacking a remote at the same counts is a different shortfall.
+SANDBOX="$(setup_shortfall_sandbox db-no-remote-2)"
+run_scenario "$SANDBOX" --databases db-with-remote,db-no-remote-2 --skip-git
+KEY_C="$(fingerprint_of "$SANDBOX" "only 1 of 2 exported")"
+assert_distinct_fingerprints "$KEY_A" "$KEY_C" "remote shortfall — same counts, different db without a remote"
+rm -rf "$SANDBOX"
+
+# More dbs lacking a remote is a different shortfall.
 SANDBOX="$(setup_shortfall_sandbox db-no-remote db-no-remote-2)"
 run_scenario "$SANDBOX" --databases db-with-remote,db-no-remote,db-no-remote-2 --skip-git
-KEY_B="$(fingerprint_of "$SANDBOX" "only 1 of 3 exported")"
-assert_distinct_fingerprints "$KEY_A" "$KEY_B" "remote shortfall — different counts"
+KEY_D="$(fingerprint_of "$SANDBOX" "only 1 of 3 exported")"
+assert_distinct_fingerprints "$KEY_A" "$KEY_D" "remote shortfall — extra db without a remote"
+rm -rf "$SANDBOX"
+
+# The key does not depend on the order the databases are listed in.
+SANDBOX="$(setup_shortfall_sandbox db-no-remote db-no-remote-2)"
+run_scenario "$SANDBOX" --databases db-no-remote-2,db-with-remote,db-no-remote --skip-git
+KEY_E="$(fingerprint_of "$SANDBOX" "only 1 of 3 exported")"
+if [[ -z "$KEY_D" || "$KEY_D" != "$KEY_E" ]]; then
+  echo "FAIL: remote shortfall — database order changed the key: '$KEY_D' vs '$KEY_E'"
+  FAILURES=$((FAILURES + 1))
+fi
 rm -rf "$SANDBOX"
 
 log "=== Scenario: git backup failure keeps one fixed fingerprint ==="
