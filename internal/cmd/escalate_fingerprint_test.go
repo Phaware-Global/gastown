@@ -125,3 +125,37 @@ func TestCreateEscalationUnlessDuplicate_RealStore(t *testing.T) {
 		}
 	})
 }
+
+// ListEscalations and ListEscalationsBySeverity share the lookup path and must
+// see the wisp escalations too.
+func TestListEscalations_SeesWispEscalations_RealStore(t *testing.T) {
+	bd := setupEscalationTestStore(t)
+
+	fields := fingerprintedEscalation("")
+	fields.Severity = "critical"
+	issue, err := bd.CreateEscalationBead("listed escalation", fields)
+	if err != nil {
+		t.Fatalf("create escalation: %v", err)
+	}
+
+	for name, list := range map[string]func() ([]*beads.Issue, error){
+		"ListEscalations":           bd.ListEscalations,
+		"ListEscalationsBySeverity": func() ([]*beads.Issue, error) { return bd.ListEscalationsBySeverity("critical") },
+	} {
+		got, err := list()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(got) != 1 || got[0].ID != issue.ID {
+			t.Fatalf("%s = %v, want exactly %s", name, got, issue.ID)
+		}
+	}
+
+	other, err := bd.ListEscalationsBySeverity("low")
+	if err != nil {
+		t.Fatalf("ListEscalationsBySeverity(low): %v", err)
+	}
+	if len(other) != 0 {
+		t.Fatalf("severity filter leaked %d escalations", len(other))
+	}
+}
