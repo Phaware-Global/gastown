@@ -299,9 +299,29 @@ func (b *Beads) GetEscalationBead(id string) (*Issue, *EscalationFields, error) 
 	return issue, fields, nil
 }
 
-// ListEscalations returns all open escalation beads.
+// PartialEscalationListError reports that one of the two escalation stores
+// (issues, wisps) could not be read. The escalations returned alongside it come
+// from the store that did answer, so callers can warn and carry on with them.
+type PartialEscalationListError struct {
+	Store string
+	Err   error
+}
+
+func (e *PartialEscalationListError) Error() string {
+	return fmt.Sprintf("escalation lookup incomplete: %s query failed: %v", e.Store, e.Err)
+}
+
+func (e *PartialEscalationListError) Unwrap() error { return e.Err }
+
+// ListEscalations returns all open escalation beads. A *PartialEscalationListError
+// comes with whatever the surviving store returned.
 func (b *Beads) ListEscalations() ([]*Issue, error) {
-	return b.listOpenEscalations()
+	return b.listEscalations("open")
+}
+
+// ListAllEscalations returns open and closed escalation beads.
+func (b *Beads) ListAllEscalations() ([]*Issue, error) {
+	return b.listEscalations("all")
 }
 
 // ListEscalationsByFingerprint returns open escalation beads matching a stable fingerprint label.
@@ -309,58 +329,83 @@ func (b *Beads) ListEscalationsByFingerprint(fingerprintLabel string) ([]*Issue,
 	if fingerprintLabel == "" {
 		return nil, nil
 	}
-	return b.listOpenEscalations(fingerprintLabel)
+	return b.listEscalations("open", fingerprintLabel)
 }
 
 // ListEscalationsBySeverity returns open escalation beads filtered by severity.
 func (b *Beads) ListEscalationsBySeverity(severity string) ([]*Issue, error) {
-	return b.listOpenEscalations("severity:" + severity)
+	return b.listEscalations("open", "severity:"+severity)
 }
 
-// listOpenEscalations returns open escalation beads carrying every extra label.
+// listEscalations returns escalation beads carrying every extra label, either
+// open only (status "open") or in any state (status "all").
 // CreateEscalationBead stores escalations as wisps, which bd list cannot see, so
 // the wisps table is queried as well. The issues table is still listed for
-// escalations created before they became wisps.
-func (b *Beads) listOpenEscalations(extraLabels ...string) ([]*Issue, error) {
+// escalations created before they became wisps. When only one of the two
+// queries fails, its results are returned with a *PartialEscalationListError.
+func (b *Beads) listEscalations(status string, extraLabels ...string) ([]*Issue, error) {
 	labels := append([]string{"gt:escalation"}, extraLabels...)
 
-	listArgs := []string{"list", "--status=open", "--json"}
-	clauses := []string{"ephemeral=true", "status=open"}
+	listArgs := []string{"list", "--status=" + status, "--json"}
+	queryArgs := []string{"query", "--json", "--limit=0"}
+	clauses := []string{"ephemeral=true"}
+	if status == "open" {
+		clauses = append(clauses, "status=open")
+	} else {
+		// bd query hides closed issues unless asked.
+		queryArgs = append(queryArgs, "--all")
+	}
 	for _, l := range labels {
 		listArgs = append(listArgs, "--label="+l)
 		clauses = append(clauses, "label="+l)
 	}
 
-	out, err := b.run(listArgs...)
+	issues, listErr := b.listIssuesJSON(false, listArgs...)
+	wisps, wispErr := b.listIssuesJSON(true, append(queryArgs, strings.Join(clauses, " AND "))...)
+
+	switch {
+	case listErr != nil && wispErr != nil:
+		return nil, listErr
+	case listErr != nil:
+		issues = nil
+	}
+
+	seen := make(map[string]bool, len(issues))
+	for _, is := range issues {
+		seen[is.ID] = true
+	}
+	for _, w := range wisps {
+		if !seen[w.ID] {
+			issues = append(issues, w)
+		}
+	}
+	issues = filterEscalationRecords(issues)
+
+	switch {
+	case listErr != nil:
+		return issues, &PartialEscalationListError{Store: "issues", Err: listErr}
+	case wispErr != nil:
+		return issues, &PartialEscalationListError{Store: "wisps", Err: wispErr}
+	}
+	return issues, nil
+}
+
+// listIssuesJSON runs a bd command that prints a JSON issue array. bd query
+// prints prose instead of JSON when nothing matches, which proseIsEmpty reads
+// as no issues.
+func (b *Beads) listIssuesJSON(proseIsEmpty bool, args ...string) ([]*Issue, error) {
+	out, err := b.run(args...)
 	if err != nil {
 		return nil, err
+	}
+	if proseIsEmpty && (len(out) == 0 || !isJSONBytes(out)) {
+		return nil, nil
 	}
 	var issues []*Issue
 	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing bd list output: %w", err)
+		return nil, fmt.Errorf("parsing bd %s output: %w", args[0], err)
 	}
-
-	out, err = b.run("query", "--json", "--limit=0", strings.Join(clauses, " AND "))
-	if err != nil {
-		return nil, err
-	}
-	if len(out) > 0 && isJSONBytes(out) {
-		var wisps []*Issue
-		if err := json.Unmarshal(out, &wisps); err != nil {
-			return nil, fmt.Errorf("parsing bd query output: %w", err)
-		}
-		seen := make(map[string]bool, len(issues))
-		for _, is := range issues {
-			seen[is.ID] = true
-		}
-		for _, w := range wisps {
-			if !seen[w.ID] {
-				issues = append(issues, w)
-			}
-		}
-	}
-
-	return filterEscalationRecords(issues), nil
+	return issues, nil
 }
 
 func filterEscalationRecords(issues []*Issue) []*Issue {
@@ -375,11 +420,13 @@ func filterEscalationRecords(issues []*Issue) []*Issue {
 }
 
 // ListStaleEscalations returns escalations older than the given threshold.
-// threshold is a duration string like "1h" or "30m".
+// threshold is a duration string like "1h" or "30m". A *PartialEscalationListError
+// comes with the stale escalations found in the store that did answer.
 func (b *Beads) ListStaleEscalations(threshold time.Duration) ([]*Issue, error) {
 	// Get all open escalations
 	escalations, err := b.ListEscalations()
-	if err != nil {
+	var partial *PartialEscalationListError
+	if err != nil && !errors.As(err, &partial) {
 		return nil, err
 	}
 
@@ -403,6 +450,9 @@ func (b *Beads) ListStaleEscalations(threshold time.Duration) ([]*Issue, error) 
 		}
 	}
 
+	if partial != nil {
+		return stale, partial
+	}
 	return stale, nil
 }
 
