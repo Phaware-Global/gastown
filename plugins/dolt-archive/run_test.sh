@@ -802,6 +802,7 @@ setup_export_fail_sandbox() {
 assert_stable_fingerprint() {
   local sandbox="$1" needle="$2" desc="$3"; shift 3
   local first second
+  rm -rf "$sandbox/.fingerprints"
   run_scenario "$sandbox" "$@"
   first="$(fingerprint_of "$sandbox" "$needle")"
   rm -rf "$sandbox/.fingerprints"

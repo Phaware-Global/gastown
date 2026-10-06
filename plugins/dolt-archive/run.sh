@@ -59,6 +59,15 @@ redact() {
   sed -E 's#(://)[^/@[:space:]]*@#\1***@#g'
 }
 
+# Builds an escalation fingerprint from the values that distinguish one problem
+# from another, so a standing condition escalates once while a changed one
+# (different db, remote, count, path) still does. Parts are joined with ':' and
+# any character outside [A-Za-z0-9_.:-] becomes '_'.
+fingerprint() {
+  local IFS=:
+  printf '%s' "dolt-archive:$*" | tr -c 'A-Za-z0-9_.:-' '_'
+}
+
 dolt_query() {
   local db="$1"
   local query="$2"
@@ -128,6 +137,7 @@ mkdir -p "$JSONL_EXPORT_DIR"
 EXPORTED=0
 EXPORT_FAILED=0
 EXPORT_ERRORS=""
+EXPORT_FAILED_DBS=()
 EXPORTED_DBS=()
 
 for DB in "${PROD_DBS[@]}"; do
@@ -146,6 +156,7 @@ for DB in "${PROD_DBS[@]}"; do
     discard_stale_latest "$DB"
     EXPORT_FAILED=$((EXPORT_FAILED + 1))
     EXPORT_ERRORS="${EXPORT_ERRORS}${DB}(table-check: $CAUSE) "
+    EXPORT_FAILED_DBS+=("$DB")
     continue
   fi
   rm -f "$QERR"
@@ -170,6 +181,7 @@ for DB in "${PROD_DBS[@]}"; do
     discard_stale_latest "$DB"
     EXPORT_FAILED=$((EXPORT_FAILED + 1))
     EXPORT_ERRORS="${EXPORT_ERRORS}${DB}(export: $CAUSE) "
+    EXPORT_FAILED_DBS+=("$DB")
   fi
 done
 
@@ -358,7 +370,7 @@ if ! $SKIP_DOLT_PUSH; then
 
         if ! ESCALATE_ERR=$(gt escalate "dolt-archive: refused dolt push for $DB to unsafe remote $REMOTE_NAME" \
           -s critical \
-          --fingerprint "dolt-archive:push-refused:${DB}:${REMOTE_NAME}" \
+          --fingerprint "$(fingerprint push-refused "$DB" "$REMOTE_NAME")" \
           --reason "Remote visibility is '$VIS_REASON', not confirmed private. Refusing to push $DB to $(printf '%s' "$REMOTE_URL" | redact) until it is. See gt-v3df." 2>&1); then
           log "    WARN: gt escalate failed:"
           logblock "$ESCALATE_ERR"
@@ -461,6 +473,7 @@ _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
 if [[ "$EXPORT_FAILED" -gt 0 ]]; then
   if ! ESCALATE_ERR=$(gt escalate "dolt-archive: JSONL export failed for $EXPORT_FAILED databases ($EXPORT_ERRORS)" \
     -s critical \
+    --fingerprint "$(fingerprint jsonl-export-failed "$(printf '%s\n' "${EXPORT_FAILED_DBS[@]}" | sort | paste -sd: -)")" \
     --reason "JSONL is our last-resort recovery layer. Failed databases: $EXPORT_ERRORS" 2>&1); then
     log "WARN: gt escalate failed:"
     logblock "$ESCALATE_ERR"
@@ -470,7 +483,7 @@ fi
 if [[ "$DOLT_PUSH_FAILED" -gt 0 ]]; then
   if ! ESCALATE_ERR=$(gt escalate "dolt-archive: dolt push failed for $DOLT_PUSH_FAILED remote(s)" \
     -s critical \
-    --fingerprint "dolt-archive:dolt-push-failed" \
+    --fingerprint "$(fingerprint dolt-push-failed "$DOLT_PUSH_FAILED")" \
     --reason "Native Dolt replication did not reach $DOLT_PUSH_FAILED remote(s) this cycle. The data did not leave this machine via that path." 2>&1); then
     log "WARN: gt escalate failed:"
     logblock "$ESCALATE_ERR"
@@ -500,7 +513,7 @@ fi
 if $GIT_REPO_MISSING; then
   if ! ESCALATE_ERR=$(gt escalate "dolt-archive: no git backup repo at $BACKUP_REPO" \
     -s critical \
-    --fingerprint "dolt-archive:git-repo-missing" \
+    --fingerprint "$(fingerprint git-repo-missing "$BACKUP_REPO")" \
     --reason "The git-backup path is entirely a no-op with no repo at $BACKUP_REPO — JSONL snapshots are not leaving this machine via git." 2>&1); then
     log "WARN: gt escalate failed:"
     logblock "$ESCALATE_ERR"
@@ -510,7 +523,7 @@ fi
 if $REMOTE_SHORTFALL; then
   if ! ESCALATE_ERR=$(gt escalate "dolt-archive: only $EXPORTED_DBS_WITH_REMOTE of $EXPORTED exported databases have a dolt remote configured" \
     -s critical \
-    --fingerprint "dolt-archive:remote-shortfall" \
+    --fingerprint "$(fingerprint remote-shortfall "${EXPORTED_DBS_WITH_REMOTE}-of-${EXPORTED}")" \
     --reason "$((EXPORTED - EXPORTED_DBS_WITH_REMOTE)) exported database(s) have no dolt remote at all, so dolt push never attempts them. The dolt_push ratio in the summary covers all $DBS_WITH_REMOTE db(s) with a remote (exported or not), not just these $EXPORTED_DBS_WITH_REMOTE exported one(s)." 2>&1); then
     log "WARN: gt escalate failed:"
     logblock "$ESCALATE_ERR"
