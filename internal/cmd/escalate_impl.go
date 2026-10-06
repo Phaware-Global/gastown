@@ -89,28 +89,6 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 	// Create escalation bead
 	bd := beads.New(beads.ResolveBeadsDir(townRoot))
 	fingerprintLabel := escalationFingerprintLabel(escalateFingerprint)
-	if fingerprintLabel != "" {
-		matches, err := bd.ListEscalationsByFingerprint(fingerprintLabel)
-		if err != nil {
-			return fmt.Errorf("checking escalation fingerprint: %w", err)
-		}
-		if len(matches) > 0 {
-			existing := matches[0]
-			if escalateJSON {
-				result := map[string]interface{}{
-					"id":          existing.ID,
-					"status":      "duplicate_suppressed",
-					"fingerprint": fingerprintLabel,
-				}
-				out, _ := json.MarshalIndent(result, "", "  ")
-				fmt.Println(string(out))
-			} else {
-				fmt.Printf("%s Duplicate escalation suppressed: %s\n", style.Bold.Render("✓"), existing.ID)
-				fmt.Printf("  Fingerprint: %s\n", fingerprintLabel)
-			}
-			return nil
-		}
-	}
 	fields := &beads.EscalationFields{
 		Severity:    severity,
 		Reason:      escalateReason,
@@ -121,9 +99,24 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		Fingerprint: fingerprintLabel,
 	}
 
-	issue, err := bd.CreateEscalationBead(description, fields)
+	issue, existing, err := createEscalationUnlessDuplicate(bd, description, fields)
 	if err != nil {
-		return fmt.Errorf("creating escalation bead: %w", err)
+		return err
+	}
+	if existing != nil {
+		if escalateJSON {
+			result := map[string]interface{}{
+				"id":          existing.ID,
+				"status":      "duplicate_suppressed",
+				"fingerprint": fingerprintLabel,
+			}
+			out, _ := json.MarshalIndent(result, "", "  ")
+			fmt.Println(string(out))
+		} else {
+			fmt.Printf("%s Duplicate escalation suppressed: %s\n", style.Bold.Render("✓"), existing.ID)
+			fmt.Printf("  Fingerprint: %s\n", fingerprintLabel)
+		}
+		return nil
 	}
 
 	// Get routing actions for this severity
@@ -319,6 +312,27 @@ func collectMissingContactSkips(severity string, statuses []deliveryStatus) []st
 		}
 	}
 	return skips
+}
+
+// createEscalationUnlessDuplicate creates an escalation bead, unless an open
+// escalation already carries fields.Fingerprint. In that case it creates
+// nothing and returns the existing escalation as the second result.
+func createEscalationUnlessDuplicate(bd *beads.Beads, description string, fields *beads.EscalationFields) (created, existing *beads.Issue, err error) {
+	if fields.Fingerprint != "" {
+		matches, err := bd.ListEscalationsByFingerprint(fields.Fingerprint)
+		if err != nil {
+			return nil, nil, fmt.Errorf("checking escalation fingerprint: %w", err)
+		}
+		if len(matches) > 0 {
+			return nil, matches[0], nil
+		}
+	}
+
+	created, err = bd.CreateEscalationBead(description, fields)
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating escalation bead: %w", err)
+	}
+	return created, nil, nil
 }
 
 func escalationFingerprintLabel(raw string) string {
