@@ -301,17 +301,7 @@ func (b *Beads) GetEscalationBead(id string) (*Issue, *EscalationFields, error) 
 
 // ListEscalations returns all open escalation beads.
 func (b *Beads) ListEscalations() ([]*Issue, error) {
-	out, err := b.run("list", "--label=gt:escalation", "--status=open", "--json")
-	if err != nil {
-		return nil, err
-	}
-
-	var issues []*Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing bd list output: %w", err)
-	}
-
-	return filterEscalationRecords(issues), nil
+	return b.listOpenEscalations()
 }
 
 // ListEscalationsByFingerprint returns open escalation beads matching a stable fingerprint label.
@@ -319,39 +309,55 @@ func (b *Beads) ListEscalationsByFingerprint(fingerprintLabel string) ([]*Issue,
 	if fingerprintLabel == "" {
 		return nil, nil
 	}
-	out, err := b.run("list",
-		"--label=gt:escalation",
-		"--label="+fingerprintLabel,
-		"--status=open",
-		"--json",
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	var issues []*Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing bd list output: %w", err)
-	}
-
-	return filterEscalationRecords(issues), nil
+	return b.listOpenEscalations(fingerprintLabel)
 }
 
 // ListEscalationsBySeverity returns open escalation beads filtered by severity.
 func (b *Beads) ListEscalationsBySeverity(severity string) ([]*Issue, error) {
-	out, err := b.run("list",
-		"--label=gt:escalation",
-		"--label=severity:"+severity,
-		"--status=open",
-		"--json",
-	)
+	return b.listOpenEscalations("severity:" + severity)
+}
+
+// listOpenEscalations returns open escalation beads carrying every extra label.
+// CreateEscalationBead stores escalations as wisps, which bd list cannot see, so
+// the wisps table is queried as well. The issues table is still listed for
+// escalations created before they became wisps.
+func (b *Beads) listOpenEscalations(extraLabels ...string) ([]*Issue, error) {
+	labels := append([]string{"gt:escalation"}, extraLabels...)
+
+	listArgs := []string{"list", "--status=open", "--json"}
+	clauses := []string{"ephemeral=true", "status=open"}
+	for _, l := range labels {
+		listArgs = append(listArgs, "--label="+l)
+		clauses = append(clauses, "label="+l)
+	}
+
+	out, err := b.run(listArgs...)
 	if err != nil {
 		return nil, err
 	}
-
 	var issues []*Issue
 	if err := json.Unmarshal(out, &issues); err != nil {
 		return nil, fmt.Errorf("parsing bd list output: %w", err)
+	}
+
+	out, err = b.run("query", "--json", "--limit=0", strings.Join(clauses, " AND "))
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > 0 && isJSONBytes(out) {
+		var wisps []*Issue
+		if err := json.Unmarshal(out, &wisps); err != nil {
+			return nil, fmt.Errorf("parsing bd query output: %w", err)
+		}
+		seen := make(map[string]bool, len(issues))
+		for _, is := range issues {
+			seen[is.ID] = true
+		}
+		for _, w := range wisps {
+			if !seen[w.ID] {
+				issues = append(issues, w)
+			}
+		}
 	}
 
 	return filterEscalationRecords(issues), nil
