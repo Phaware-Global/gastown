@@ -319,12 +319,14 @@ func collectMissingContactSkips(severity string, statuses []deliveryStatus) []st
 // nothing and returns the existing escalation as the second result.
 func createEscalationUnlessDuplicate(bd *beads.Beads, description string, fields *beads.EscalationFields) (created, existing *beads.Issue, err error) {
 	if fields.Fingerprint != "" {
+		// A duplicate alert is acceptable; a lost one is not, so a failed
+		// lookup warns and escalates anyway.
 		matches, err := bd.ListEscalationsByFingerprint(fields.Fingerprint)
-		if err != nil {
-			return nil, nil, fmt.Errorf("checking escalation fingerprint: %w", err)
-		}
 		if len(matches) > 0 {
 			return nil, matches[0], nil
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not check for a duplicate escalation, creating it anyway: %v\n", err)
 		}
 	}
 
@@ -365,22 +367,20 @@ type deliveryStatus struct {
 }
 
 // collectEscalations returns the open escalations, or every escalation when
-// all is set.
+// all is set. If only one store could be read, it warns on stderr and returns
+// what it got.
 func collectEscalations(bd *beads.Beads, all bool) ([]*beads.Issue, error) {
-	var issues []*beads.Issue
+	list := bd.ListEscalations
 	if all {
-		out, err := bd.Run("list", "--label=gt:escalation", "--status=all", "--json")
-		if err != nil {
+		list = bd.ListAllEscalations
+	}
+	issues, err := list()
+	if err != nil {
+		var partial *beads.PartialEscalationListError
+		if !errors.As(err, &partial) {
 			return nil, fmt.Errorf("listing escalations: %w", err)
 		}
-		if err := json.Unmarshal(out, &issues); err != nil {
-			return nil, fmt.Errorf("parsing escalations: %w", err)
-		}
-		return issues, nil
-	}
-	issues, err := bd.ListEscalations()
-	if err != nil {
-		return nil, fmt.Errorf("listing escalations: %w", err)
+		fmt.Fprintf(os.Stderr, "warning: %v; the list below may be missing escalations\n", err)
 	}
 	return issues, nil
 }
@@ -536,7 +536,11 @@ func runEscalateStale(cmd *cobra.Command, args []string) error {
 	bd := beads.New(beads.ResolveBeadsDir(townRoot))
 	stale, err := bd.ListStaleEscalations(threshold)
 	if err != nil {
-		return fmt.Errorf("listing stale escalations: %w", err)
+		var partial *beads.PartialEscalationListError
+		if !errors.As(err, &partial) {
+			return fmt.Errorf("listing stale escalations: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "warning: %v; the list below may be missing escalations\n", err)
 	}
 
 	if len(stale) == 0 {
