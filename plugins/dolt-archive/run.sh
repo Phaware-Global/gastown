@@ -311,8 +311,10 @@ fi
 
 DOLT_PUSHED=0
 DOLT_PUSH_FAILED=0
+DOLT_PUSH_FAILED_PAIRS=()
 DBS_WITH_REMOTE=0
 EXPORTED_DBS_WITH_REMOTE=0
+EXPORTED_DBS_WITH_REMOTE_LIST=()
 DOLT_PUSH_REFUSED=0
 DOLT_REFUSAL_DETAIL=""
 
@@ -341,6 +343,7 @@ if ! $SKIP_DOLT_PUSH; then
     for _exported_db in "${EXPORTED_DBS[@]:-}"; do
       if [[ "$_exported_db" == "$DB" ]]; then
         EXPORTED_DBS_WITH_REMOTE=$((EXPORTED_DBS_WITH_REMOTE + 1))
+        EXPORTED_DBS_WITH_REMOTE_LIST+=("$DB")
         break
       fi
     done
@@ -362,6 +365,7 @@ if ! $SKIP_DOLT_PUSH; then
           log "    $REMOTE_NAME: FAILED:"
           logblock "$(printf '%s' "$PUSH_ERR" | redact)"
           DOLT_PUSH_FAILED=$((DOLT_PUSH_FAILED + 1))
+          DOLT_PUSH_FAILED_PAIRS+=("$DB/$REMOTE_NAME")
         fi
       else
         log "    $REMOTE_NAME: REFUSED — visibility=$VIS_REASON (not confirmed private): $(printf '%s' "$REMOTE_URL" | redact)"
@@ -395,8 +399,19 @@ log "=== Archive Cycle Complete ==="
 # were never exported and would otherwise mask a shortfall among the ones
 # that were. Only meaningful when dolt push actually ran this cycle.
 REMOTE_SHORTFALL=false
+EXPORTED_DBS_WITHOUT_REMOTE=()
 if ! $SKIP_DOLT_PUSH && [[ "$EXPORTED_DBS_WITH_REMOTE" -lt "$EXPORTED" ]]; then
   REMOTE_SHORTFALL=true
+  for _exported_db in "${EXPORTED_DBS[@]:-}"; do
+    _has_remote=false
+    for _remote_db in "${EXPORTED_DBS_WITH_REMOTE_LIST[@]:-}"; do
+      if [[ "$_remote_db" == "$_exported_db" ]]; then
+        _has_remote=true
+        break
+      fi
+    done
+    $_has_remote || EXPORTED_DBS_WITHOUT_REMOTE+=("$_exported_db")
+  done
 fi
 
 RESULT="success"
@@ -481,10 +496,11 @@ if [[ "$EXPORT_FAILED" -gt 0 ]]; then
 fi
 
 if [[ "$DOLT_PUSH_FAILED" -gt 0 ]]; then
+  _failed_pairs="$(printf '%s\n' "${DOLT_PUSH_FAILED_PAIRS[@]}" | sort | paste -sd, -)"
   if ! ESCALATE_ERR=$(gt escalate "dolt-archive: dolt push failed for $DOLT_PUSH_FAILED remote(s)" \
     -s critical \
-    --fingerprint "$(fingerprint dolt-push-failed "$DOLT_PUSH_FAILED")" \
-    --reason "Native Dolt replication did not reach $DOLT_PUSH_FAILED remote(s) this cycle. The data did not leave this machine via that path." 2>&1); then
+    --fingerprint "$(fingerprint dolt-push-failed "$(printf '%s\n' "${DOLT_PUSH_FAILED_PAIRS[@]}" | sort | paste -sd: -)")" \
+    --reason "Native Dolt replication did not reach $DOLT_PUSH_FAILED remote(s) this cycle ($_failed_pairs). The data did not leave this machine via that path." 2>&1); then
     log "WARN: gt escalate failed:"
     logblock "$ESCALATE_ERR"
   fi
@@ -521,10 +537,11 @@ if $GIT_REPO_MISSING; then
 fi
 
 if $REMOTE_SHORTFALL; then
+  _missing_dbs="$(printf '%s\n' "${EXPORTED_DBS_WITHOUT_REMOTE[@]}" | sort | paste -sd, -)"
   if ! ESCALATE_ERR=$(gt escalate "dolt-archive: only $EXPORTED_DBS_WITH_REMOTE of $EXPORTED exported databases have a dolt remote configured" \
     -s critical \
-    --fingerprint "$(fingerprint remote-shortfall "${EXPORTED_DBS_WITH_REMOTE}-of-${EXPORTED}")" \
-    --reason "$((EXPORTED - EXPORTED_DBS_WITH_REMOTE)) exported database(s) have no dolt remote at all, so dolt push never attempts them. The dolt_push ratio in the summary covers all $DBS_WITH_REMOTE db(s) with a remote (exported or not), not just these $EXPORTED_DBS_WITH_REMOTE exported one(s)." 2>&1); then
+    --fingerprint "$(fingerprint remote-shortfall "$(printf '%s\n' "${EXPORTED_DBS_WITHOUT_REMOTE[@]}" | sort | paste -sd: -)")" \
+    --reason "$((EXPORTED - EXPORTED_DBS_WITH_REMOTE)) exported database(s) have no dolt remote at all, so dolt push never attempts them. Without a remote: $_missing_dbs. The dolt_push ratio in the summary covers all $DBS_WITH_REMOTE db(s) with a remote (exported or not), not just these $EXPORTED_DBS_WITH_REMOTE exported one(s)." 2>&1); then
     log "WARN: gt escalate failed:"
     logblock "$ESCALATE_ERR"
   fi
