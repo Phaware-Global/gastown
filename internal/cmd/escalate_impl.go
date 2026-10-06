@@ -364,6 +364,27 @@ type deliveryStatus struct {
 	NotificationRoute string `json:"notification_route,omitempty"`
 }
 
+// collectEscalations returns the open escalations, or every escalation when
+// all is set.
+func collectEscalations(bd *beads.Beads, all bool) ([]*beads.Issue, error) {
+	var issues []*beads.Issue
+	if all {
+		out, err := bd.Run("list", "--label=gt:escalation", "--status=all", "--json")
+		if err != nil {
+			return nil, fmt.Errorf("listing escalations: %w", err)
+		}
+		if err := json.Unmarshal(out, &issues); err != nil {
+			return nil, fmt.Errorf("parsing escalations: %w", err)
+		}
+		return issues, nil
+	}
+	issues, err := bd.ListEscalations()
+	if err != nil {
+		return nil, fmt.Errorf("listing escalations: %w", err)
+	}
+	return issues, nil
+}
+
 func runEscalateList(cmd *cobra.Command, args []string) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
@@ -372,21 +393,9 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 
 	bd := beads.New(beads.ResolveBeadsDir(townRoot))
 
-	var issues []*beads.Issue
-	if escalateListAll {
-		// List all (open and closed)
-		out, err := bd.Run("list", "--label=gt:escalation", "--status=all", "--json")
-		if err != nil {
-			return fmt.Errorf("listing escalations: %w", err)
-		}
-		if err := json.Unmarshal(out, &issues); err != nil {
-			return fmt.Errorf("parsing escalations: %w", err)
-		}
-	} else {
-		issues, err = bd.ListEscalations()
-		if err != nil {
-			return fmt.Errorf("listing escalations: %w", err)
-		}
+	issues, err := collectEscalations(bd, escalateListAll)
+	if err != nil {
+		return err
 	}
 
 	// Cross-check each entry against live Dolt to filter out phantom escalations.
