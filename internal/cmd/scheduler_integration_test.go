@@ -159,6 +159,7 @@ func setupSchedulerIntegrationTown(t *testing.T) (hqPath, rigPath, gtBinary stri
 	if err != nil {
 		t.Fatalf("EvalSymlinks: %v", err)
 	}
+	settleTempDirRemoval(t, filepath.Dir(tmpDir))
 
 	// Configure git/dolt identity in isolated HOME (needed by bd init --server
 	// which initializes a git repo inside .beads/).
@@ -604,6 +605,7 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 	if err != nil {
 		t.Fatalf("EvalSymlinks: %v", err)
 	}
+	settleTempDirRemoval(t, filepath.Dir(tmpDir))
 
 	configureTestGitIdentity(t, tmpDir)
 
@@ -1549,4 +1551,26 @@ func TestScheduleBead_ClosedForceDoesNotBypass(t *testing.T) {
 	if !strings.Contains(out, "closed") || !strings.Contains(out, "work already completed") {
 		t.Errorf("--force should not bypass closed guard; got: %s", out)
 	}
+}
+
+// settleTempDirRemoval removes dir — the per-test TempDir ROOT, i.e. the parent
+// of what t.TempDir returns, because the isolated bd-init fallback writes into a
+// sibling TempDir (initDir) under the same root — before t.TempDir's own cleanup
+// runs (t.Cleanup is LIFO, so registering this after TempDir makes it run
+// first), retrying while detached bd/gt children spawned during the test are
+// still writing into it.
+// A single RemoveAll racing such a writer fails with "directory not empty" and
+// fails an otherwise-passing test (seen on TestSchedulerBlockedStatusReporting,
+// TestSchedulerDeferredAcceptsDogTarget, TestSchedulerDeferredNonRigRejection).
+func settleTempDirRemoval(t *testing.T, dir string) {
+	t.Helper()
+	t.Cleanup(func() {
+		var err error
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(250 * time.Millisecond) {
+			if err = os.RemoveAll(dir); err == nil {
+				return
+			}
+		}
+		t.Logf("cleanup: %s still not removable after 10s: %v", dir, err)
+	})
 }
