@@ -9,8 +9,10 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/reaper"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 var (
@@ -25,6 +27,21 @@ var (
 	reaperDryRun   bool
 	reaperJSON     bool
 )
+
+// requireReaperWritesAllowed refuses writes while the kill switch is on; --dry-run writes nothing, so it passes.
+func requireReaperWritesAllowed() error {
+	if reaperDryRun {
+		return nil
+	}
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("reaper writes refused: cannot locate the town to check the kill switch: %w", err)
+	}
+	if err := daemon.CheckReaperWritesAllowed(townRoot); err != nil {
+		return fmt.Errorf("reaper writes refused: %w (use --dry-run to preview)", err)
+	}
+	return nil
+}
 
 func reaperDatabaseNames() []string {
 	if reaperDB == "" {
@@ -216,6 +233,9 @@ all databases on the Dolt server and reaps each one.
 
 Returns the count of reaped wisps. Use --dry-run to preview.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := requireReaperWritesAllowed(); err != nil {
+			return err
+		}
 		maxAge, err := time.ParseDuration(reaperMaxAge)
 		if err != nil {
 			return fmt.Errorf("invalid --max-age: %w", err)
@@ -344,6 +364,9 @@ all databases on the Dolt server and purges each one.
 
 Returns counts of purged rows. Use --dry-run to preview.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := requireReaperWritesAllowed(); err != nil {
+			return err
+		}
 		purgeAge, err := time.ParseDuration(reaperPurgeAge)
 		if err != nil {
 			return fmt.Errorf("invalid --purge-age: %w", err)
@@ -430,6 +453,9 @@ auto-discovers all databases on the Dolt server and auto-closes in each one.
 
 Returns the count of closed issues. Use --dry-run to preview.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := requireReaperWritesAllowed(); err != nil {
+			return err
+		}
 		staleAge, err := time.ParseDuration(reaperStaleAge)
 		if err != nil {
 			return fmt.Errorf("invalid --stale-age: %w", err)
@@ -506,9 +532,13 @@ var reaperRunCmd = &cobra.Command{
 	Short: "Run full reaper cycle across all databases",
 	Long: `Execute a full reaper cycle: scan → reap → purge → auto-close → report.
 
-This is the inline fallback for when Dog dispatch is unavailable.
-Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
+This is a manual operator command. The daemon never runs it as a fallback:
+it dispatches a Dog to execute the mol-dog-reaper formula and skips the
+cycle if dispatch fails.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := requireReaperWritesAllowed(); err != nil {
+			return err
+		}
 		databases := reaperDatabaseNames()
 
 		maxAge, err := time.ParseDuration(reaperMaxAge)
