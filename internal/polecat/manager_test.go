@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/checkpoint"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
@@ -1319,6 +1320,202 @@ func TestReuseIdlePolecat_SetupCommandFailureCleansWorktree(t *testing.T) {
 	dirtyPath := filepath.Join(mgr.clonePath("toast"), "dirty-setup-marker")
 	if _, statErr := os.Stat(dirtyPath); !os.IsNotExist(statErr) {
 		t.Fatalf("dirty setup marker %s still exists after setup_command cleanup", dirtyPath)
+	}
+}
+
+// TestReuseIdlePolecat_ResumeBranchHardSyncsAwayStaleContent pins gt-94p1
+// requirement 2: re-slinging onto a reused worktree must hard-sync to the
+// remote head of the target branch, never starting from whatever content
+// the worktree's PREVIOUS assignment left behind — even content that was
+// itself fully committed and pushed as part of main, just not part of the
+// branch this polecat is about to resume. This is the mechanism behind the
+// graphql-api #166 incident (gt-2stz): a reused directory's stale pre-fix
+// content got auto-committed and pushed, exactly reverting a P0 fix.
+func TestReuseIdlePolecat_ResumeBranchHardSyncsAwayStaleContent(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	mayorGit := git.NewGit(mayorRig)
+
+	// The point main was at when the polecat pool/rig was set up — the
+	// target "PR branch" below forks from here, BEFORE old-content.txt
+	// exists, so old-content.txt is genuinely foreign to it.
+	preOldContentSHA, err := mayorGit.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("resolve pre-old-content HEAD: %v", err)
+	}
+
+	// Advance main with content unrelated to the branch under test — this
+	// stands in for "whatever a previous, unrelated bead merged," which a
+	// polecat cloned from main afterward would legitimately start with.
+	if err := os.WriteFile(filepath.Join(mayorRig, "old-content.txt"), []byte("from a previous bead\n"), 0644); err != nil {
+		t.Fatalf("write old-content.txt: %v", err)
+	}
+	if err := mayorGit.Add("old-content.txt"); err != nil {
+		t.Fatalf("git add old-content.txt: %v", err)
+	}
+	if err := mayorGit.Commit("merge previous bead's work"); err != nil {
+		t.Fatalf("git commit old-content.txt: %v", err)
+	}
+	cmd := exec.Command("git", "update-ref", "refs/remotes/origin/main", "HEAD")
+	cmd.Dir = mayorRig
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("update-ref origin/main: %v\n%s", err, out)
+	}
+
+	// A fresh idle polecat, cloned from the now-advanced main: perfectly
+	// clean and reusable, but its worktree legitimately contains
+	// old-content.txt — content that has nothing to do with the branch
+	// it's about to be re-slung onto.
+	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	_ = git.NewGit(polecat.ClonePath).CleanForce()
+	oldContentPath := filepath.Join(polecat.ClonePath, "old-content.txt")
+	if _, statErr := os.Stat(oldContentPath); statErr != nil {
+		t.Fatalf("expected the freshly cloned polecat to already carry old-content.txt from main: %v", statErr)
+	}
+
+	// The target "PR branch" on origin, forked from BEFORE old-content.txt
+	// existed, with its own real content — mimicking gh#3602's resume flow.
+	prBranch := "polecat/example/gt-166@fedcba"
+	prCommit := createStalePolecatCommit(t, mayorRig, preOldContentSHA, prBranch)
+	cmd = exec.Command("git", "update-ref", "refs/remotes/origin/"+prBranch, "HEAD")
+	cmd.Dir = mayorRig
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("update-ref origin/%s: %v\n%s", prBranch, err, out)
+	}
+	// mayorRig and the polecat worktree are linked worktrees of the same
+	// repo — leaving mayorRig checked out on prBranch would make
+	// ReuseIdlePolecat's plain `git checkout -B` below refuse it as
+	// "already used by worktree". Only the commit + remote-tracking ref
+	// are needed from createStalePolecatCommit, so hand mayorRig back.
+	if err := mayorGit.Checkout("main"); err != nil {
+		t.Fatalf("checkout mayorRig back to main: %v", err)
+	}
+
+	// A background codegraph watcher on the dev machine touches
+	// .codegraph/.gitignore in any git repo it notices, including this
+	// test's tmp worktree — an environmental artifact, not real dirtiness.
+	// Clear it so the reuse-safety gate below sees exactly what the test
+	// intends: a clean, pushed worktree.
+	_ = os.RemoveAll(filepath.Join(polecat.ClonePath, ".codegraph"))
+
+	reused, err := mgr.ReuseIdlePolecat("toast", AddOptions{ResumeBranch: prBranch, HookBead: "gt-166"})
+	if err != nil {
+		t.Fatalf("ReuseIdlePolecat: %v", err)
+	}
+	if reused.Branch != prBranch {
+		t.Fatalf("reused.Branch = %q, want %q", reused.Branch, prBranch)
+	}
+
+	worktreeGit := git.NewGit(reused.ClonePath)
+	current, err := worktreeGit.CurrentBranch()
+	if err != nil {
+		t.Fatalf("CurrentBranch: %v", err)
+	}
+	if current != prBranch {
+		t.Fatalf("worktree HEAD on branch %q, want %q", current, prBranch)
+	}
+
+	reachable, err := worktreeGit.IsAncestor(prCommit, "HEAD")
+	if err != nil {
+		t.Fatalf("IsAncestor: %v", err)
+	}
+	if !reachable {
+		t.Fatalf("target branch's commit %s must be reachable from HEAD after reuse", prCommit)
+	}
+
+	if _, statErr := os.Stat(oldContentPath); !os.IsNotExist(statErr) {
+		t.Fatal("old-content.txt (foreign to the target branch) survived reuse — worktree was not hard-synced to the remote head (gt-94p1 requirement 2)")
+	}
+
+	// Note: the worktree is deliberately NOT asserted fully clean here —
+	// ReuseIdlePolecat intentionally re-provisions an untracked CLAUDE.md
+	// overlay after the hard reset (see its own comment), so an untracked
+	// CLAUDE.md is expected scaffolding, not stale content.
+}
+
+// TestRemoveWithOptions_PreservesDirtyWorkLocallyWithoutMovingBranchOrPushing
+// pins gt-94p1: the pre-removal preserve records the work in a LOCAL ref that
+// outlives the worktree, never advances the polecat's branch, and pushes
+// nothing.
+func TestRemoveWithOptions_PreservesDirtyWorkLocallyWithoutMovingBranchOrPushing(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+
+	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	wtGit := git.NewGit(polecat.ClonePath)
+	headBefore, err := wtGit.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev HEAD: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(polecat.ClonePath, "README.md"), []byte("# Test\nunsaved polecat work\n"), 0644); err != nil {
+		t.Fatalf("write README.md: %v", err)
+	}
+
+	if err := mgr.RemoveWithOptions("toast", true, false, false); err != nil {
+		t.Fatalf("RemoveWithOptions: %v", err)
+	}
+
+	// The worktree is gone, but the snapshot ref survives in the shared repo
+	// (mayorRig is that repo in this fixture) and holds the dirty content.
+	ref := git.LocalPreservationRefName(polecat.Branch)
+	out, err := exec.Command("git", "-C", mayorRig, "show", ref+":README.md").Output()
+	if err != nil || string(out) != "# Test\nunsaved polecat work\n" {
+		t.Fatalf("local preserve ref %s does not hold the dirty content after removal: %q (err %v)", ref, out, err)
+	}
+	subj, err := exec.Command("git", "-C", mayorRig, "log", "-1", "--format=%s", ref).Output()
+	if err != nil || !strings.Contains(string(subj), checkpoint.WIPCommitPrefix) {
+		t.Fatalf("preservation commit subject %q lacks the WIP prefix %q (err %v)", subj, checkpoint.WIPCommitPrefix, err)
+	}
+
+	// Nothing was pushed: origin is mayorRig itself, so no remote-style preserve ref.
+	if refs, _ := exec.Command("git", "-C", mayorRig, "for-each-ref", "refs/heads/polecat/preserve-*").Output(); len(strings.TrimSpace(string(refs))) != 0 {
+		t.Fatalf("a preserve ref was pushed: %s", refs)
+	}
+	branchTip, err := exec.Command("git", "-C", mayorRig, "rev-parse", "refs/heads/"+polecat.Branch).Output()
+	if err == nil && strings.TrimSpace(string(branchTip)) != headBefore {
+		t.Fatalf("polecat branch %s moved to %s, want it left at %s", polecat.Branch, strings.TrimSpace(string(branchTip)), headBefore)
+	}
+}
+
+// TestRemoveWithOptions_ForceRemovalKeepsCommitsOfACleanDetachedWorktree pins
+// that a clean detached worktree's local commit (reachable from no branch)
+// survives a forced removal via a local preserve ref.
+func TestRemoveWithOptions_ForceRemovalKeepsCommitsOfACleanDetachedWorktree(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+
+	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	wtGit := git.NewGit(polecat.ClonePath)
+	if err := wtGit.CheckoutDetach("HEAD"); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(polecat.ClonePath, "local.txt"), []byte("local work\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := wtGit.Add("local.txt"); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := wtGit.Commit("local commit on a detached HEAD"); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	commit, err := wtGit.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev HEAD: %v", err)
+	}
+
+	if err := mgr.RemoveWithOptions("toast", true, false, false); err != nil {
+		t.Fatalf("RemoveWithOptions: %v", err)
+	}
+
+	refs, err := exec.Command("git", "-C", mayorRig, "for-each-ref", "--contains", commit, "--format=%(refname)", "refs/gt/preserve/").Output()
+	if err != nil || strings.TrimSpace(string(refs)) == "" {
+		t.Fatalf("commit %s is not reachable from any refs/gt/preserve ref after forced removal (err %v)", commit, err)
 	}
 }
 
