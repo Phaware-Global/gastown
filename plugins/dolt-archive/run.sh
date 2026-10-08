@@ -25,6 +25,13 @@ DEFAULT_DBS="auto"
 SKIP_GIT=false
 SKIP_DOLT_PUSH=false
 
+# Escalation dedupe state (gt-4kip). `gt escalate --fingerprint` only suppresses
+# against OPEN beads, so a closed repeat is re-filed on the next cycle. This
+# remembers what was already escalated so an unchanged condition stays quiet.
+STATE_DIR="${DOLT_ARCHIVE_STATE_DIR:-$HOME/gt/.dolt-archive/escalation-state}"
+# Re-notify (at low severity) for a condition that stays unchanged this long.
+REPEAT_SECS="${ESCALATION_REPEAT_SECS:-86400}"
+
 # --- Argument parsing --------------------------------------------------------
 
 while [[ $# -gt 0 ]]; do
@@ -102,6 +109,227 @@ discard_stale_latest() {
   fi
 }
 
+# --- Escalation dedupe (gt-4kip) ---------------------------------------------
+#
+# Each independently-resolvable condition (a specific db, or a specific
+# db+remote pair) gets its OWN state file, keyed by name -- never a shared
+# set/union across conditions. That is deliberate: four review rounds on a
+# "sticky union" design (one state entry per condition *class*, remembering
+# every member it had ever seen so a later member-shrink didn't misread as
+# new) all failed the same way -- a member that resolved and later recurred
+# stayed masked by the memory of an unrelated member still failing. Per-entity
+# keys make that bug impossible: there is no union to keep growing, so a
+# specific entity's own history is the only thing that can suppress it.
+#
+# State per key is "<content-hash> <epoch> <key>":
+#   - no state, or content changed -> escalate critical (new, changed, or a
+#     resolved condition returning -- the state was dropped in between)
+#   - same content, < REPEAT_SECS   -> log only, no escalation
+#   - same content, >= REPEAT_SECS  -> escalate once more at LOW (digest)
+#   - condition absent from a run that checked it -> state dropped, so a
+#     later recurrence escalates afresh
+# State is written only after `gt escalate` succeeds, so a failed escalation
+# is retried on the next cycle rather than silently swallowed. Content is
+# stored only as a hash: some callers' content embeds a remote URL, which
+# must not land on disk in the clear.
+
+ACTIVE_KEYS=()
+
+state_file() {
+  local safe="${1//[^A-Za-z0-9_.-]/_}"
+  printf '%s/%s-%s' "$STATE_DIR" "$safe" "$(printf '%s' "$1" | cksum | cut -d' ' -f1)"
+}
+
+key_is_active() {
+  local k
+  for k in "${ACTIVE_KEYS[@]:-}"; do
+    [[ "$k" == "$1" ]] && return 0
+  done
+  return 1
+}
+
+# Deterministic, order-insensitive rendering of a whitespace-separated set --
+# used only to normalize multi-entity fingerprints, never to track history.
+sorted_set() {
+  # An all-empty input (every arg "") is a legitimate empty set, not an
+  # error: grep -v '^$' then filters out every line and exits 1, which
+  # would otherwise abort the whole script under set -e -o pipefail at
+  # any call site that assigns this into a variable.
+  printf '%s\n' "$@" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '
+  return 0
+}
+
+# The db a per-entity key concerns, or "" for a key with no db scoping
+# (git-repo-missing, git-backup-failed, git-push-refused:origin -- the
+# "origin" there is a remote name, not a db). Keys are "<condition>:<db>"
+# or "<condition>:<db>:<remote>"; the db is always the first segment after
+# the condition.
+key_scope_db() {
+  case "$1" in
+    export-failed:*|remote-shortfall:*|push-refused:*|dolt-push-failed:*)
+      local rest="${1#*:}"
+      printf '%s' "${rest%%:*}"
+      ;;
+    *) printf '' ;;
+  esac
+}
+
+# entity_status KEY CONTENT -- "new" (no prior state, or content changed --
+# escalate critical), "same" (identical content, still within REPEAT_SECS --
+# stay quiet), or "digest" (identical content, REPEAT_SECS elapsed -- one LOW
+# reminder).
+entity_status() {
+  local key="$1" content="$2" file hash prev_hash prev_last now
+  file="$(state_file "$key")"
+  hash="$(printf '%s' "$content" | cksum | cut -d' ' -f1)"
+  now="$(date +%s)"
+  if [[ -f "$file" ]]; then
+    read -r prev_hash prev_last _ < "$file" || true
+    # Unreadable state or a clock that went backwards: treat as no state.
+    if [[ "$hash" == "$prev_hash" && "$prev_last" =~ ^[0-9]+$ && "$prev_last" -le "$now" ]]; then
+      if (( now - prev_last < REPEAT_SECS )); then
+        echo "same"; return
+      fi
+      echo "digest"; return
+    fi
+  fi
+  echo "new"
+}
+
+entity_record() {
+  local key="$1" content="$2" hash
+  hash="$(printf '%s' "$content" | cksum | cut -d' ' -f1)"
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  printf '%s %s %s\n' "$hash" "$(date +%s)" "$key" > "$(state_file "$key")" 2>/dev/null \
+    || log "WARN: cannot record escalation state in $STATE_DIR — repeats will re-escalate"
+}
+
+# escalate_entity KEY CONTENT TITLE REASON
+#
+# For a single, atomic condition (push-refused:<db>:<remote>,
+# git-push-refused:origin, git-backup-failed, git-repo-missing). CONTENT is
+# whatever should trigger an immediate re-escalation if it changes even
+# though the key doesn't (e.g. push-refused's URL+visibility-reason) --
+# pass "" for a condition with no such content.
+escalate_entity() {
+  local key="$1" content="$2" title="$3" reason="$4"
+  local status severity="critical" fp
+
+  ACTIVE_KEYS+=("$key")
+  status="$(entity_status "$key" "$content")"
+  case "$status" in
+    same)
+      log "  $key: unchanged, already escalated — not re-escalating"
+      return 0
+      ;;
+    digest)
+      severity="low"
+      title="$title (still unresolved)"
+      ;;
+  esac
+
+  fp="dolt-archive:${key}:$(printf '%s' "$content" | cksum | cut -d' ' -f1)"
+  [[ "$status" == "digest" ]] && fp="${fp}:digest-$(date +%Y%m%d)"
+
+  if ! ESCALATE_ERR=$(gt escalate "$title" -s "$severity" --fingerprint "$fp" --reason "$reason" 2>&1); then
+    log "WARN: gt escalate failed (will retry next cycle):"
+    logblock "$ESCALATE_ERR"
+    return 0
+  fi
+  entity_record "$key" "$content"
+}
+
+# escalate_aggregate KEY_PREFIX SUBKEYS TITLE REASON
+#
+# For a condition that is naturally reported as one human-facing count
+# across several entities (export-failed, dolt-push-failed,
+# remote-shortfall). SUBKEYS is the whitespace-separated set of entities
+# (db names, or "db:remote" pairs) affected THIS cycle. Each gets its own
+# independently-tracked key "<KEY_PREFIX>:<subkey>" -- no shared history
+# between them. Fires ONE escalation, using the given aggregate TITLE/REASON
+# (which the caller has already built from this cycle's own totals), exactly
+# when at least one subkey is new-or-changed (critical) or, absent that, at
+# least one is due for its own periodic digest (low). A subkey unchanged and
+# not yet due contributes nothing either way.
+escalate_aggregate() {
+  local prefix="$1" subkeys="$2" title="$3" reason="$4"
+  local sk status has_new=false has_digest=false severity fp
+
+  [[ -z "$subkeys" ]] && return 0
+
+  for sk in $subkeys; do
+    ACTIVE_KEYS+=("${prefix}:${sk}")
+    status="$(entity_status "${prefix}:${sk}" "$sk")"
+    case "$status" in
+      new) has_new=true ;;
+      digest) has_digest=true ;;
+    esac
+  done
+
+  if ! $has_new && ! $has_digest; then
+    log "  $prefix: unchanged, already escalated — not re-escalating"
+    return 0
+  fi
+
+  severity="critical"
+  if ! $has_new; then
+    severity="low"
+    title="$title (still unresolved)"
+  fi
+
+  fp="dolt-archive:${prefix}:$(sorted_set "$subkeys" | cksum | cut -d' ' -f1)"
+  [[ "$severity" == "low" ]] && fp="${fp}:digest-$(date +%Y%m%d)"
+
+  if ! ESCALATE_ERR=$(gt escalate "$title" -s "$severity" --fingerprint "$fp" --reason "$reason" 2>&1); then
+    log "WARN: gt escalate failed (will retry next cycle):"
+    logblock "$ESCALATE_ERR"
+    return 0
+  fi
+
+  for sk in $subkeys; do
+    entity_record "${prefix}:${sk}" "$sk"
+  done
+}
+
+# Drop state for conditions that did not fire this cycle. Called only for the
+# steps that actually ran, so --skip-* never reads as "condition cleared".
+# $1 is a key or, with a trailing '*', a key prefix. $2, when given, is this
+# run's checked-db set (space-separated): a key concerning a db outside it
+# was not looked at this cycle, so its absence from ACTIVE_KEYS means
+# "out of scope", not "resolved" — a --databases subset run must not clear
+# another db's state. The guard only applies when --databases was explicitly
+# given: on an auto-discovery run, PROD_DBS is every live database, so a
+# recorded db that no longer exists (dropped or renamed) was never "checked"
+# and would otherwise pin its state forever — it counts as resolved instead.
+clear_resolved() {
+  local pattern="$1" checked_dbs="${2:-}" f k db ok
+  [[ -d "$STATE_DIR" ]] || return 0
+  for f in "$STATE_DIR"/*; do
+    [[ -f "$f" ]] || continue
+    k=""
+    read -r _ _ k < "$f" || true
+    [[ -n "$k" ]] || continue
+    case "$pattern" in
+      *'*') [[ "$k" == "${pattern%\*}"* ]] || continue ;;
+      *)    [[ "$k" == "$pattern" ]] || continue ;;
+    esac
+    key_is_active "$k" && continue
+
+    if [[ -n "$checked_dbs" && "$DEFAULT_DBS" != "auto" ]]; then
+      db="$(key_scope_db "$k")"
+      if [[ -n "$db" ]]; then
+        ok=false
+        case " $checked_dbs " in
+          *" $db "*) ok=true ;;
+        esac
+        $ok || continue
+      fi
+    fi
+
+    rm -f "$f"
+  done
+}
+
 # --- Step 1: JSONL export ----------------------------------------------------
 
 # Auto-discover production databases or use the explicit list.
@@ -128,6 +356,7 @@ mkdir -p "$JSONL_EXPORT_DIR"
 EXPORTED=0
 EXPORT_FAILED=0
 EXPORT_ERRORS=""
+EXPORT_FAILED_DBS=""
 EXPORTED_DBS=()
 
 for DB in "${PROD_DBS[@]}"; do
@@ -146,6 +375,7 @@ for DB in "${PROD_DBS[@]}"; do
     discard_stale_latest "$DB"
     EXPORT_FAILED=$((EXPORT_FAILED + 1))
     EXPORT_ERRORS="${EXPORT_ERRORS}${DB}(table-check: $CAUSE) "
+    EXPORT_FAILED_DBS="${EXPORT_FAILED_DBS}${DB} "
     continue
   fi
   rm -f "$QERR"
@@ -170,6 +400,7 @@ for DB in "${PROD_DBS[@]}"; do
     discard_stale_latest "$DB"
     EXPORT_FAILED=$((EXPORT_FAILED + 1))
     EXPORT_ERRORS="${EXPORT_ERRORS}${DB}(export: $CAUSE) "
+    EXPORT_FAILED_DBS="${EXPORT_FAILED_DBS}${DB} "
   fi
 done
 
@@ -303,6 +534,8 @@ DBS_WITH_REMOTE=0
 EXPORTED_DBS_WITH_REMOTE=0
 DOLT_PUSH_REFUSED=0
 DOLT_REFUSAL_DETAIL=""
+DOLT_PUSH_FAILED_SET=""
+DBS_WITH_REMOTE_SET=""
 
 if ! $SKIP_DOLT_PUSH; then
   log ""
@@ -323,6 +556,7 @@ if ! $SKIP_DOLT_PUSH; then
     fi
 
     DBS_WITH_REMOTE=$((DBS_WITH_REMOTE + 1))
+    DBS_WITH_REMOTE_SET="${DBS_WITH_REMOTE_SET}${DB} "
     # Population for the shortfall check below must match EXPORTED (databases
     # actually exported), not all databases with a remote — a never-exported
     # db with a remote must not mask an exported db that lacks one.
@@ -350,19 +584,16 @@ if ! $SKIP_DOLT_PUSH; then
           log "    $REMOTE_NAME: FAILED:"
           logblock "$(printf '%s' "$PUSH_ERR" | redact)"
           DOLT_PUSH_FAILED=$((DOLT_PUSH_FAILED + 1))
+          DOLT_PUSH_FAILED_SET="${DOLT_PUSH_FAILED_SET}${DB}:${REMOTE_NAME} "
         fi
       else
         log "    $REMOTE_NAME: REFUSED — visibility=$VIS_REASON (not confirmed private): $(printf '%s' "$REMOTE_URL" | redact)"
         DOLT_PUSH_REFUSED=$((DOLT_PUSH_REFUSED + 1))
         DOLT_REFUSAL_DETAIL="${DOLT_REFUSAL_DETAIL}${DB}/${REMOTE_NAME}(${VIS_REASON}) "
 
-        if ! ESCALATE_ERR=$(gt escalate "dolt-archive: refused dolt push for $DB to unsafe remote $REMOTE_NAME" \
-          -s critical \
-          --fingerprint "dolt-archive:push-refused:${DB}:${REMOTE_NAME}" \
-          --reason "Remote visibility is '$VIS_REASON', not confirmed private. Refusing to push $DB to $(printf '%s' "$REMOTE_URL" | redact) until it is. See gt-v3df." 2>&1); then
-          log "    WARN: gt escalate failed:"
-          logblock "$ESCALATE_ERR"
-        fi
+        escalate_entity "push-refused:${DB}:${REMOTE_NAME}" "${REMOTE_URL}|${VIS_REASON}" \
+          "dolt-archive: refused dolt push for $DB to unsafe remote $REMOTE_NAME" \
+          "Remote visibility is '$VIS_REASON', not confirmed private. Refusing to push $DB to $(printf '%s' "$REMOTE_URL" | redact) until it is. See gt-v3df."
       fi
     done <<< "$REMOTES"
   done
@@ -459,62 +690,66 @@ _rid="$(bd create "$SUMMARY" -t chore --ephemeral \
 [ -n "${_rid:-}" ] && bd close "$_rid" --reason "plugin run recorded" >/dev/null 2>&1 || true
 
 if [[ "$EXPORT_FAILED" -gt 0 ]]; then
-  if ! ESCALATE_ERR=$(gt escalate "dolt-archive: JSONL export failed for $EXPORT_FAILED databases ($EXPORT_ERRORS)" \
-    -s critical \
-    --reason "JSONL is our last-resort recovery layer. Failed databases: $EXPORT_ERRORS" 2>&1); then
-    log "WARN: gt escalate failed:"
-    logblock "$ESCALATE_ERR"
+  escalate_aggregate "export-failed" "$(sorted_set "$EXPORT_FAILED_DBS")" \
+    "dolt-archive: JSONL export failed for $EXPORT_FAILED databases ($EXPORT_ERRORS)" \
+    "JSONL is our last-resort recovery layer. Failed databases: $EXPORT_ERRORS"
+fi
+clear_resolved "export-failed:*" "${PROD_DBS[*]}"
+
+if ! $SKIP_DOLT_PUSH; then
+  if [[ "$DOLT_PUSH_FAILED" -gt 0 ]]; then
+    escalate_aggregate "dolt-push-failed" "$(sorted_set "$DOLT_PUSH_FAILED_SET")" \
+      "dolt-archive: dolt push failed for $DOLT_PUSH_FAILED remote(s)" \
+      "Native Dolt replication did not reach $DOLT_PUSH_FAILED remote(s) this cycle. The data did not leave this machine via that path."
   fi
+  clear_resolved "dolt-push-failed:*" "${PROD_DBS[*]}"
+
+  if $REMOTE_SHORTFALL; then
+    # Affected set = exported DBs with no remote (names, not counts, so a
+    # different DB lacking one is a change even if the count is the same).
+    NO_REMOTE_SET=""
+    for _db in "${EXPORTED_DBS[@]:-}"; do
+      [[ -z "$_db" ]] && continue
+      case " $DBS_WITH_REMOTE_SET" in
+        *" $_db "*) ;;
+        *) NO_REMOTE_SET="${NO_REMOTE_SET}${_db} " ;;
+      esac
+    done
+    escalate_aggregate "remote-shortfall" "$(sorted_set "$NO_REMOTE_SET")" \
+      "dolt-archive: only $EXPORTED_DBS_WITH_REMOTE of $EXPORTED exported databases have a dolt remote configured" \
+      "$((EXPORTED - EXPORTED_DBS_WITH_REMOTE)) exported database(s) have no dolt remote at all, so dolt push never attempts them. The dolt_push ratio in the summary covers all $DBS_WITH_REMOTE db(s) with a remote (exported or not), not just these $EXPORTED_DBS_WITH_REMOTE exported one(s)."
+  fi
+  clear_resolved "remote-shortfall:*" "${PROD_DBS[*]}"
+  clear_resolved "push-refused:*" "${PROD_DBS[*]}"
 fi
 
-if [[ "$DOLT_PUSH_FAILED" -gt 0 ]]; then
-  if ! ESCALATE_ERR=$(gt escalate "dolt-archive: dolt push failed for $DOLT_PUSH_FAILED remote(s)" \
-    -s critical \
-    --fingerprint "dolt-archive:dolt-push-failed" \
-    --reason "Native Dolt replication did not reach $DOLT_PUSH_FAILED remote(s) this cycle. The data did not leave this machine via that path." 2>&1); then
-    log "WARN: gt escalate failed:"
-    logblock "$ESCALATE_ERR"
+if ! $SKIP_GIT; then
+  if [[ "$GIT_PUSH_REFUSED" -gt 0 ]]; then
+    escalate_entity "git-push-refused:origin" "${GIT_REFUSAL_DETAIL}|${PUSH_URLS:-}" \
+      "dolt-archive: refused git backup push to unsafe remote origin" \
+      "Push destination visibility is '${GIT_REFUSAL_DETAIL}', not confirmed private. Refusing to push JSONL exports of the production databases from $BACKUP_REPO to ${PUSH_URLS:-<unresolvable>} until it is. See gt-sg6n."
   fi
-fi
+  # Only clear when the guard actually ran this cycle (something was ahead
+  # of origin/main to push). Otherwise a cycle with nothing to push, or one
+  # where the ahead-check itself failed, would read as "checked, found
+  # clean" and wipe a still-unresolved refusal (val's LOW on #250).
+  if $GIT_GUARD_RAN; then
+    clear_resolved "git-push-refused:origin"
+  fi
 
-if [[ "$GIT_PUSH_REFUSED" -gt 0 ]]; then
-  if ! ESCALATE_ERR=$(gt escalate "dolt-archive: refused git backup push to unsafe remote origin" \
-    -s critical \
-    --fingerprint "dolt-archive:git-push-refused:origin" \
-    --reason "Push destination visibility is '${GIT_REFUSAL_DETAIL}', not confirmed private. Refusing to push JSONL exports of the production databases from $BACKUP_REPO to ${PUSH_URLS:-<unresolvable>} until it is. See gt-sg6n." 2>&1); then
-    log "WARN: gt escalate failed:"
-    logblock "$ESCALATE_ERR"
+  if $GIT_FAILED; then
+    escalate_entity "git-backup-failed" "" \
+      "dolt-archive: git backup add/commit/push failed" \
+      "A git add, commit, or push to the backup repo at $BACKUP_REPO failed this cycle. The JSONL snapshot did not reach the offsite git backup via this path this cycle. See plugin logs for the specific git error."
   fi
-fi
+  clear_resolved "git-backup-failed"
 
-if $GIT_FAILED; then
-  if ! ESCALATE_ERR=$(gt escalate "dolt-archive: git backup add/commit/push failed" \
-    -s critical \
-    --fingerprint "dolt-archive:git-backup-failed" \
-    --reason "A git add, commit, or push to the backup repo at $BACKUP_REPO failed this cycle. The JSONL snapshot did not reach the offsite git backup via this path this cycle. See plugin logs for the specific git error." 2>&1); then
-    log "WARN: gt escalate failed:"
-    logblock "$ESCALATE_ERR"
+  if $GIT_REPO_MISSING; then
+    escalate_entity "git-repo-missing" "" \
+      "dolt-archive: no git backup repo at $BACKUP_REPO" \
+      "The git-backup path is entirely a no-op with no repo at $BACKUP_REPO — JSONL snapshots are not leaving this machine via git."
   fi
-fi
-
-if $GIT_REPO_MISSING; then
-  if ! ESCALATE_ERR=$(gt escalate "dolt-archive: no git backup repo at $BACKUP_REPO" \
-    -s critical \
-    --fingerprint "dolt-archive:git-repo-missing" \
-    --reason "The git-backup path is entirely a no-op with no repo at $BACKUP_REPO — JSONL snapshots are not leaving this machine via git." 2>&1); then
-    log "WARN: gt escalate failed:"
-    logblock "$ESCALATE_ERR"
-  fi
-fi
-
-if $REMOTE_SHORTFALL; then
-  if ! ESCALATE_ERR=$(gt escalate "dolt-archive: only $EXPORTED_DBS_WITH_REMOTE of $EXPORTED exported databases have a dolt remote configured" \
-    -s critical \
-    --fingerprint "dolt-archive:remote-shortfall" \
-    --reason "$((EXPORTED - EXPORTED_DBS_WITH_REMOTE)) exported database(s) have no dolt remote at all, so dolt push never attempts them. The dolt_push ratio in the summary covers all $DBS_WITH_REMOTE db(s) with a remote (exported or not), not just these $EXPORTED_DBS_WITH_REMOTE exported one(s)." 2>&1); then
-    log "WARN: gt escalate failed:"
-    logblock "$ESCALATE_ERR"
-  fi
+  clear_resolved "git-repo-missing"
 fi
 
 log "Done."
