@@ -89,28 +89,6 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 	// Create escalation bead
 	bd := beads.New(beads.ResolveBeadsDir(townRoot))
 	fingerprintLabel := escalationFingerprintLabel(escalateFingerprint)
-	if fingerprintLabel != "" {
-		matches, err := bd.ListEscalationsByFingerprint(fingerprintLabel)
-		if err != nil {
-			return fmt.Errorf("checking escalation fingerprint: %w", err)
-		}
-		if len(matches) > 0 {
-			existing := matches[0]
-			if escalateJSON {
-				result := map[string]interface{}{
-					"id":          existing.ID,
-					"status":      "duplicate_suppressed",
-					"fingerprint": fingerprintLabel,
-				}
-				out, _ := json.MarshalIndent(result, "", "  ")
-				fmt.Println(string(out))
-			} else {
-				fmt.Printf("%s Duplicate escalation suppressed: %s\n", style.Bold.Render("✓"), existing.ID)
-				fmt.Printf("  Fingerprint: %s\n", fingerprintLabel)
-			}
-			return nil
-		}
-	}
 	fields := &beads.EscalationFields{
 		Severity:    severity,
 		Reason:      escalateReason,
@@ -121,9 +99,24 @@ func runEscalate(cmd *cobra.Command, args []string) error {
 		Fingerprint: fingerprintLabel,
 	}
 
-	issue, err := bd.CreateEscalationBead(description, fields)
+	issue, existing, err := createEscalationUnlessDuplicate(bd, description, fields)
 	if err != nil {
-		return fmt.Errorf("creating escalation bead: %w", err)
+		return err
+	}
+	if existing != nil {
+		if escalateJSON {
+			result := map[string]interface{}{
+				"id":          existing.ID,
+				"status":      "duplicate_suppressed",
+				"fingerprint": fingerprintLabel,
+			}
+			out, _ := json.MarshalIndent(result, "", "  ")
+			fmt.Println(string(out))
+		} else {
+			fmt.Printf("%s Duplicate escalation suppressed: %s\n", style.Bold.Render("✓"), existing.ID)
+			fmt.Printf("  Fingerprint: %s\n", fingerprintLabel)
+		}
+		return nil
 	}
 
 	// Get routing actions for this severity
@@ -321,6 +314,29 @@ func collectMissingContactSkips(severity string, statuses []deliveryStatus) []st
 	return skips
 }
 
+// createEscalationUnlessDuplicate creates an escalation bead, unless an open
+// escalation already carries fields.Fingerprint. In that case it creates
+// nothing and returns the existing escalation as the second result.
+func createEscalationUnlessDuplicate(bd *beads.Beads, description string, fields *beads.EscalationFields) (created, existing *beads.Issue, err error) {
+	if fields.Fingerprint != "" {
+		// A duplicate alert is acceptable; a lost one is not, so a failed
+		// lookup warns and escalates anyway.
+		matches, err := bd.ListEscalationsByFingerprint(fields.Fingerprint)
+		if len(matches) > 0 {
+			return nil, matches[0], nil
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not check for a duplicate escalation, creating it anyway: %v\n", err)
+		}
+	}
+
+	created, err = bd.CreateEscalationBead(description, fields)
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating escalation bead: %w", err)
+	}
+	return created, nil, nil
+}
+
 func escalationFingerprintLabel(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -350,6 +366,25 @@ type deliveryStatus struct {
 	NotificationRoute string `json:"notification_route,omitempty"`
 }
 
+// collectEscalations returns the open escalations, or every escalation when
+// all is set. If only one store could be read, it warns on stderr and returns
+// what it got.
+func collectEscalations(bd *beads.Beads, all bool) ([]*beads.Issue, error) {
+	list := bd.ListEscalations
+	if all {
+		list = bd.ListAllEscalations
+	}
+	issues, err := list()
+	if err != nil {
+		var partial *beads.PartialEscalationListError
+		if !errors.As(err, &partial) {
+			return nil, fmt.Errorf("listing escalations: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "warning: %v; the list below may be missing escalations\n", err)
+	}
+	return issues, nil
+}
+
 func runEscalateList(cmd *cobra.Command, args []string) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
@@ -358,21 +393,9 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 
 	bd := beads.New(beads.ResolveBeadsDir(townRoot))
 
-	var issues []*beads.Issue
-	if escalateListAll {
-		// List all (open and closed)
-		out, err := bd.Run("list", "--label=gt:escalation", "--status=all", "--json")
-		if err != nil {
-			return fmt.Errorf("listing escalations: %w", err)
-		}
-		if err := json.Unmarshal(out, &issues); err != nil {
-			return fmt.Errorf("parsing escalations: %w", err)
-		}
-	} else {
-		issues, err = bd.ListEscalations()
-		if err != nil {
-			return fmt.Errorf("listing escalations: %w", err)
-		}
+	issues, err := collectEscalations(bd, escalateListAll)
+	if err != nil {
+		return err
 	}
 
 	// Cross-check each entry against live Dolt to filter out phantom escalations.
@@ -513,7 +536,11 @@ func runEscalateStale(cmd *cobra.Command, args []string) error {
 	bd := beads.New(beads.ResolveBeadsDir(townRoot))
 	stale, err := bd.ListStaleEscalations(threshold)
 	if err != nil {
-		return fmt.Errorf("listing stale escalations: %w", err)
+		var partial *beads.PartialEscalationListError
+		if !errors.As(err, &partial) {
+			return fmt.Errorf("listing stale escalations: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "warning: %v; the list below may be missing escalations\n", err)
 	}
 
 	if len(stale) == 0 {
