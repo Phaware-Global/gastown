@@ -1,6 +1,7 @@
 package refinery
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -134,5 +135,88 @@ func TestBitbucketDismissChangesRequestedReviews_Unsupported(t *testing.T) {
 	p := &bitbucketPRProvider{}
 	if err := p.DismissChangesRequestedReviews(7, "someone", "Superseded"); err != ErrUnsupported {
 		t.Errorf("err = %v, want ErrUnsupported", err)
+	}
+}
+
+// A pinned merge must reach gh as --match-head-commit, so GitHub refuses it if
+// the head moved after the approval check; an unpinned merge must not carry it.
+func TestGitHubMergePR_PinsHeadCommit(t *testing.T) {
+	const head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	tests := []struct {
+		name      string
+		pin       string
+		wantMatch bool
+	}{
+		{"pinned", head, true},
+		{"unpinned", "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			readCalls := ghStub(t, "")
+			p := newGitHubPRProvider(git.NewGit(t.TempDir()))
+
+			if _, err := p.MergePR(7, "squash", tc.pin); err != nil {
+				t.Fatalf("MergePR: %v", err)
+			}
+			var merge string
+			for _, c := range readCalls() {
+				if strings.HasPrefix(c, "pr merge") {
+					merge = c
+				}
+			}
+			if merge == "" {
+				t.Fatalf("gh pr merge was not invoked: %v", readCalls())
+			}
+			want := "--match-head-commit " + head
+			if got := strings.Contains(merge, want); got != tc.wantMatch {
+				t.Errorf("gh call %q: contains %q = %v, want %v", merge, want, got, tc.wantMatch)
+			}
+		})
+	}
+}
+
+// Bitbucket's merge call has no head precondition, so it must refuse a pinned
+// merge rather than merge a head nobody verified. An unpinned merge is not this
+// gate's concern and is left to the provider.
+func TestBitbucketMergePR_RefusesPinnedMerge(t *testing.T) {
+	p := &bitbucketPRProvider{}
+	if _, err := p.MergePR(7, "squash", "bbbbbbbb"); err != ErrUnsupported {
+		t.Errorf("err = %v, want ErrUnsupported", err)
+	}
+}
+
+// GitHub's refusal of a --match-head-commit merge is an approval state, and
+// must reach callers as *HeadMovedError. Any other merge failure, or the same
+// text on an unpinned merge, is left as an ordinary error.
+func TestGitHubMergePR_HeadMovedIsTyped(t *testing.T) {
+	tests := []struct {
+		name      string
+		pin       string
+		ghOutput  string
+		wantMoved bool
+	}{
+		{"pinned and head moved", "bbbbbbbb", "Head branch was modified. Review and try the merge again.", true},
+		{"pinned, other failure", "bbbbbbbb", "Pull request is not mergeable", false},
+		{"unpinned, same text", "", "Head branch was modified. Review and try the merge again.", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			script := "#!/bin/sh\necho '" + tc.ghOutput + "'\nexit 1\n"
+			if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(script), 0o700); err != nil { //nolint:gosec // test stub must be executable
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			p := newGitHubPRProvider(git.NewGit(t.TempDir()))
+
+			_, err := p.MergePR(7, "squash", tc.pin)
+			var moved *HeadMovedError
+			if got := errors.As(err, &moved); got != tc.wantMoved {
+				t.Fatalf("errors.As(HeadMovedError) = %v, want %v (err: %v)", got, tc.wantMoved, err)
+			}
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+		})
 	}
 }

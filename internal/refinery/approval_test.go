@@ -27,6 +27,15 @@ type fakePRProvider struct {
 	changesRequestedReviewers []string
 	changesRequestedErr       error
 
+	// headSHA/approvedAtSHA back CurrentHeadSHA and ApprovedReviewersAtSHA
+	// for the human-approval-at-head gate. approvedAtSHA is keyed by commit,
+	// so a test can put an approval on a commit other than head.
+	headSHA         string
+	headSHAErr      error
+	approvedAtSHA   map[string][]string
+	approvedAtErr   error
+	approvedAtCalls []string // shas queried, in order
+
 	isApprovedCalls       []string // users queried, in order
 	countCalls            int
 	changesRequestedCalls int
@@ -59,7 +68,7 @@ func (f *fakePRProvider) ChangesRequestedReviewers(int) ([]string, error) {
 // Unused PRProvider methods — panic if exercised so mis-wired tests fail loudly.
 func (f *fakePRProvider) FindPRNumber(string) (int, error)              { panic("unused") }
 func (f *fakePRProvider) IsPRApproved(int) (bool, error)                { panic("unused") }
-func (f *fakePRProvider) MergePR(int, string) (string, error)           { panic("unused") }
+func (f *fakePRProvider) MergePR(int, string, string) (string, error)   { panic("unused") }
 func (f *fakePRProvider) CreatePR(CreatePROptions) (int, string, error) { panic("unused") }
 func (f *fakePRProvider) RequestReview(int, []string) error             { panic("unused") }
 func (f *fakePRProvider) UnresolvedThreads(int) ([]ReviewThread, error) { panic("unused") }
@@ -71,7 +80,19 @@ func (f *fakePRProvider) ListReviewAuthors(int) ([]string, error)       { panic(
 func (f *fakePRProvider) HasReviewFromOnSHA(int, string, string) (bool, error) {
 	panic("unused")
 }
-func (f *fakePRProvider) CurrentHeadSHA(int) (string, error)        { panic("unused") }
+func (f *fakePRProvider) CurrentHeadSHA(int) (string, error) {
+	if f.headSHAErr != nil {
+		return "", f.headSHAErr
+	}
+	return f.headSHA, nil
+}
+func (f *fakePRProvider) ApprovedReviewersAtSHA(_ int, sha string) ([]string, error) {
+	f.approvedAtCalls = append(f.approvedAtCalls, sha)
+	if f.approvedAtErr != nil {
+		return nil, f.approvedAtErr
+	}
+	return f.approvedAtSHA[sha], nil
+}
 func (f *fakePRProvider) CreatedAt(int) (time.Time, error)          { panic("unused") }
 func (f *fakePRProvider) SubmitReview(int, SubmitReviewInput) error { panic("unused") }
 func (f *fakePRProvider) DismissChangesRequestedReviews(int, string, string) error {
@@ -554,5 +575,181 @@ func TestVerifyPRApproval_ExternalReviewerIsNotTrusted(t *testing.T) {
 	cfg.ReviewerLocal = true
 	if err := VerifyPRApproval(provider, cfg, 42, nil); err == nil {
 		t.Error("the in-town Reviewer's verdict must block, since the loop can clear it")
+	}
+}
+
+// humanGateCfg is a pr rig that opted out of the per-user approval gates but
+// requires a human's approval at head — a pr rig where the agent reviewer alone would otherwise satisfy the gates.
+func humanGateCfg() *MergeQueueConfig {
+	return &MergeQueueConfig{
+		MergeStrategy:          "pr",
+		PRRequiredApprovals:    intPtr(0),
+		PRReviewer:             "gastown-reviewer",
+		ReviewerLocal:          true,
+		RequiredHumanReviewers: []string{"alice"},
+	}
+}
+
+func TestVerifyPRApproval_HumanGate_ApprovalOnOlderSHA_Refuses(t *testing.T) {
+	// The only human approval is on an older SHA than head.
+	provider := &fakePRProvider{
+		headSHA: "bbbbbbbb",
+		approvedAtSHA: map[string][]string{
+			"aaaaaaaa": {"alice"},
+			"bbbbbbbb": {"gastown-reviewer"},
+		},
+	}
+	err := VerifyPRApproval(provider, humanGateCfg(), 166, nil)
+	var needs *NeedsApprovalError
+	if !errors.As(err, &needs) {
+		t.Fatalf("want *NeedsApprovalError, got %v", err)
+	}
+	if !strings.Contains(needs.Detail, "bbbbbbbb") {
+		t.Errorf("detail should name the head SHA, got: %s", needs.Detail)
+	}
+	if got := provider.approvedAtCalls; len(got) != 1 || got[0] != "bbbbbbbb" {
+		t.Errorf("approvals must be queried at head only, got %v", got)
+	}
+}
+
+func TestVerifyPRApproval_HumanGate_AgentOnlyAtHead_Refuses(t *testing.T) {
+	provider := &fakePRProvider{
+		headSHA:       "bbbbbbbb",
+		approvedAtSHA: map[string][]string{"bbbbbbbb": {"gastown-reviewer"}},
+	}
+	err := VerifyPRApproval(provider, humanGateCfg(), 166, nil)
+	var needs *NeedsApprovalError
+	if !errors.As(err, &needs) {
+		t.Fatalf("want *NeedsApprovalError, got %v", err)
+	}
+	if !strings.Contains(needs.Detail, "gastown-reviewer") {
+		t.Errorf("detail should show who did approve at head, got: %s", needs.Detail)
+	}
+}
+
+func TestVerifyPRApproval_HumanGate_HumanAtHead_Passes(t *testing.T) {
+	provider := &fakePRProvider{
+		headSHA:       "bbbbbbbb",
+		approvedAtSHA: map[string][]string{"bbbbbbbb": {"gastown-reviewer", "Alice"}},
+	}
+	var out bytes.Buffer
+	if err := VerifyPRApproval(provider, humanGateCfg(), 166, &out); err != nil {
+		t.Fatalf("human approval at head must pass, got %v", err)
+	}
+	if !strings.Contains(out.String(), "Alice") {
+		t.Errorf("progress line should name the approver, got %q", out.String())
+	}
+}
+
+func TestVerifyPRApproval_HumanGate_ReviewerLoginNeverCounts(t *testing.T) {
+	// Config validation rejects pr_reviewer in the list; if that were bypassed
+	// (hand-edited config), the runtime gate must still not let the agent
+	// satisfy itself.
+	cfg := humanGateCfg()
+	cfg.RequiredHumanReviewers = []string{"gastown-reviewer"}
+	provider := &fakePRProvider{
+		headSHA:       "bbbbbbbb",
+		approvedAtSHA: map[string][]string{"bbbbbbbb": {"gastown-reviewer"}},
+	}
+	err := VerifyPRApproval(provider, cfg, 166, nil)
+	var needs *NeedsApprovalError
+	if !errors.As(err, &needs) {
+		t.Fatalf("want *NeedsApprovalError, got %v", err)
+	}
+}
+
+func TestVerifyPRApproval_HumanGate_FailsClosed(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider *fakePRProvider
+	}{
+		{"head SHA lookup fails", &fakePRProvider{headSHAErr: errors.New("gh: 401")}},
+		{"head SHA empty", &fakePRProvider{headSHA: ""}},
+		{"provider cannot report per-commit approvals", &fakePRProvider{headSHA: "bbbbbbbb", approvedAtErr: ErrUnsupported}},
+		{"approval lookup fails", &fakePRProvider{headSHA: "bbbbbbbb", approvedAtErr: errors.New("gh: 502")}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := VerifyPRApproval(tc.provider, humanGateCfg(), 166, nil)
+			if err == nil {
+				t.Fatal("must refuse when human approval at head cannot be established")
+			}
+			var needs *NeedsApprovalError
+			if errors.As(err, &needs) {
+				t.Errorf("a lookup failure is not a 'needs approval' state, got %v", err)
+			}
+		})
+	}
+}
+
+func TestVerifyPRApproval_HumanGate_UnsetLeavesOptOutRigsAlone(t *testing.T) {
+	cfg := humanGateCfg()
+	cfg.RequiredHumanReviewers = nil
+	// CurrentHeadSHA/ApprovedReviewersAtSHA on this fake would return zero
+	// values; asserting no calls proves the gate is skipped, not satisfied.
+	provider := &fakePRProvider{}
+	if err := VerifyPRApproval(provider, cfg, 166, nil); err != nil {
+		t.Fatalf("opt-out rig with no required_human_reviewers must keep merging, got %v", err)
+	}
+	if len(provider.approvedAtCalls) != 0 {
+		t.Errorf("gate must not query approvals when unset, got %v", provider.approvedAtCalls)
+	}
+}
+
+func TestVerifyPRApproval_HumanGate_StacksWithNamedApprover(t *testing.T) {
+	// Both gates must pass: the named approver's (possibly stale) approval
+	// does not substitute for a human at head, and vice versa.
+	cfg := humanGateCfg()
+	cfg.PRApprover = "gatekeeper"
+	provider := &fakePRProvider{
+		headSHA:       "bbbbbbbb",
+		approvedBy:    map[string]bool{"gatekeeper": true},
+		approvedAtSHA: map[string][]string{"aaaaaaaa": {"alice"}},
+	}
+	if err := VerifyPRApproval(provider, cfg, 166, nil); err == nil {
+		t.Fatal("named approver satisfied must not bypass the human-at-head gate")
+	}
+}
+
+// The merge is pinned to the head the human gate verified; VerifyPRApprovalAtHead
+// must hand back exactly that SHA, and "" when the gate is unset so opt-out rigs
+// keep merging unpinned.
+func TestVerifyPRApprovalAtHead_ReturnsVerifiedHead(t *testing.T) {
+	provider := &fakePRProvider{
+		headSHA:       "bbbbbbbb",
+		approvedAtSHA: map[string][]string{"bbbbbbbb": {"alice"}},
+	}
+	head, err := VerifyPRApprovalAtHead(provider, humanGateCfg(), 166, nil)
+	if err != nil {
+		t.Fatalf("human approval at head must pass, got %v", err)
+	}
+	if head != "bbbbbbbb" {
+		t.Errorf("verified head = %q, want the SHA the approval was found on", head)
+	}
+
+	cfg := humanGateCfg()
+	cfg.RequiredHumanReviewers = nil
+	head, err = VerifyPRApprovalAtHead(&fakePRProvider{}, cfg, 166, nil)
+	if err != nil {
+		t.Fatalf("opt-out rig must keep merging, got %v", err)
+	}
+	if head != "" {
+		t.Errorf("verified head = %q with the human gate unset, want empty (no pin)", head)
+	}
+}
+
+// A refusal must not leak a head: a caller that ignored the error and merged
+// with the returned SHA would otherwise be pinned to an unapproved commit.
+func TestVerifyPRApprovalAtHead_RefusalReturnsNoHead(t *testing.T) {
+	provider := &fakePRProvider{
+		headSHA:       "bbbbbbbb",
+		approvedAtSHA: map[string][]string{"aaaaaaaa": {"alice"}},
+	}
+	head, err := VerifyPRApprovalAtHead(provider, humanGateCfg(), 166, nil)
+	if err == nil {
+		t.Fatal("approval on an older SHA must refuse")
+	}
+	if head != "" {
+		t.Errorf("head = %q on refusal, want empty", head)
 	}
 }

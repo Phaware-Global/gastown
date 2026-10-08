@@ -1,6 +1,7 @@
 package refinery
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -29,8 +30,12 @@ func (p *githubPRProvider) IsPRApprovedBy(prNumber int, user string) (bool, erro
 	return p.git.GhPrApprovedBy(prNumber, user)
 }
 
-func (p *githubPRProvider) MergePR(prNumber int, method string) (string, error) {
-	return p.git.GhPrMerge(prNumber, method)
+func (p *githubPRProvider) MergePR(prNumber int, method, matchHeadSHA string) (string, error) {
+	sha, err := p.git.GhPrMerge(prNumber, method, matchHeadSHA)
+	if errors.Is(err, git.ErrPRHeadMoved) {
+		return "", &HeadMovedError{PRNumber: prNumber, Err: err}
+	}
+	return sha, err
 }
 
 func (p *githubPRProvider) CreatePR(opts CreatePROptions) (int, string, error) {
@@ -67,6 +72,10 @@ func (p *githubPRProvider) CreatedAt(prNumber int) (time.Time, error) {
 
 func (p *githubPRProvider) CountApprovals(prNumber int) (int, error) {
 	return p.git.GhPrApprovalCount(prNumber)
+}
+
+func (p *githubPRProvider) ApprovedReviewersAtSHA(prNumber int, sha string) ([]string, error) {
+	return p.git.GhPrApprovedReviewersAtSHA(prNumber, sha)
 }
 
 func (p *githubPRProvider) ChecksRollup(prNumber int) (string, bool, error) {

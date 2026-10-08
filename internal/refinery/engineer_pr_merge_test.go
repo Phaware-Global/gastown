@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -655,13 +656,16 @@ func (f *threadGateFakeProvider) FindPRNumber(string) (int, error) {
 func (f *threadGateFakeProvider) UnresolvedThreads(int) ([]ReviewThread, error) {
 	return f.unresolvedThreads, nil
 }
-func (f *threadGateFakeProvider) MergePR(int, string) (string, error) {
+func (f *threadGateFakeProvider) MergePR(int, string, string) (string, error) {
 	f.mergeCalls++
 	panic("MergePR called — threads-resolved gate failed to short-circuit")
 }
 
-func (f *threadGateFakeProvider) IsPRApproved(int) (bool, error)                  { panic("unused") }
-func (f *threadGateFakeProvider) IsPRApprovedBy(int, string) (bool, error)        { panic("unused") }
+func (f *threadGateFakeProvider) IsPRApproved(int) (bool, error)           { panic("unused") }
+func (f *threadGateFakeProvider) IsPRApprovedBy(int, string) (bool, error) { panic("unused") }
+func (f *threadGateFakeProvider) ApprovedReviewersAtSHA(int, string) ([]string, error) {
+	panic("unused")
+}
 func (f *threadGateFakeProvider) CountApprovals(int) (int, error)                 { panic("unused") }
 func (f *threadGateFakeProvider) CreatePR(CreatePROptions) (int, string, error)   { panic("unused") }
 func (f *threadGateFakeProvider) RequestReview(int, []string) error               { panic("unused") }
@@ -816,5 +820,134 @@ func TestDoMergePR_RequireReview_NoApproval(t *testing.T) {
 	if _, err := gitpkg.NewGit(t.TempDir()).FindPRNumber("nonexistent"); err != nil {
 		// gh CLI not available or not authenticated — test the config path only
 		t.Skip("gh CLI not available for PR approval testing")
+	}
+}
+
+// A required_human_reviewers list that the runtime loader silently dropped
+// would turn the head-SHA human gate into a no-op with no error, so the
+// runtime read path is pinned separately from the config-write path.
+func TestEngineer_LoadConfig_RequiredHumanReviewers(t *testing.T) {
+	load := func(t *testing.T, humans []string) (*Engineer, error) {
+		t.Helper()
+		tmpDir := t.TempDir()
+		cfg := map[string]interface{}{
+			"type": "rig", "version": 1, "name": "test-rig",
+			"merge_queue": map[string]interface{}{
+				"merge_strategy":           "pr",
+				"pr_required_approvals":    0,
+				"pr_reviewer":              "gastown-reviewer",
+				"required_human_reviewers": humans,
+			},
+		}
+		if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), mustMarshalIndent(t, cfg), 0644); err != nil {
+			t.Fatal(err)
+		}
+		e := NewEngineer(&rig.Rig{Name: "test-rig", Path: tmpDir})
+		return e, e.LoadConfig()
+	}
+
+	e, err := load(t, []string{"alice"})
+	if err != nil {
+		t.Fatalf("valid list must load: %v", err)
+	}
+	if got := e.config.RequiredHumanReviewers; len(got) != 1 || got[0] != "alice" {
+		t.Errorf("RequiredHumanReviewers = %v, want [alice]", got)
+	}
+	if _, err := load(t, []string{"gastown-reviewer"}); err == nil {
+		t.Error("pr_reviewer in required_human_reviewers must be rejected on the runtime path too")
+	}
+}
+
+// pinRecordingProvider is a fakePRProvider that gets through the thread gate
+// and records the head pin each MergePR call was given, so a test can assert
+// what doMergePR handed the provider rather than only that it merged.
+type pinRecordingProvider struct {
+	fakePRProvider
+	prNumber int
+	mergeErr error
+	pins     []string
+}
+
+func (p *pinRecordingProvider) FindPRNumber(string) (int, error)              { return p.prNumber, nil }
+func (p *pinRecordingProvider) UnresolvedThreads(int) ([]ReviewThread, error) { return nil, nil }
+func (p *pinRecordingProvider) MergePR(_ int, _, matchHeadSHA string) (string, error) {
+	p.pins = append(p.pins, matchHeadSHA)
+	return "", p.mergeErr
+}
+
+func humanGatedEngineer(t *testing.T, humans ...string) (*Engineer, string) {
+	t.Helper()
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	createFeatureBranch(t, workDir, "feat/pinned", "test.txt", "hello")
+	e.config.MergeStrategy = "pr"
+	e.config.PRRequiredApprovals = intPtr(0)
+	e.config.RequiredHumanReviewers = humans
+	return e, "feat/pinned"
+}
+
+// The approval is a fact about one commit, so doMergePR must hand MergePR the
+// exact head the gate verified. Dropping the argument makes a push that lands
+// after the check mergeable on the strength of it.
+func TestDoMergePR_PassesVerifiedHeadIntoMergePR(t *testing.T) {
+	e, branch := humanGatedEngineer(t, "alice")
+	provider := &pinRecordingProvider{
+		fakePRProvider: fakePRProvider{
+			headSHA:       "1111111111111111111111111111111111111111",
+			approvedAtSHA: map[string][]string{"1111111111111111111111111111111111111111": {"alice"}},
+		},
+		prNumber: 42,
+	}
+	e.prProvider = provider
+
+	e.doMergePR(context.Background(), branch, "main")
+
+	if len(provider.pins) != 1 || provider.pins[0] != "1111111111111111111111111111111111111111" {
+		t.Fatalf("MergePR pins = %v, want exactly the verified head", provider.pins)
+	}
+}
+
+// With no required_human_reviewers there is no verified head to pin to; the
+// merge must stay unpinned rather than pin to a SHA nothing checked.
+func TestDoMergePR_UnsetHumanGateLeavesMergeUnpinned(t *testing.T) {
+	e, branch := humanGatedEngineer(t)
+	provider := &pinRecordingProvider{prNumber: 42}
+	e.prProvider = provider
+
+	e.doMergePR(context.Background(), branch, "main")
+
+	if len(provider.pins) != 1 || provider.pins[0] != "" {
+		t.Fatalf("MergePR pins = %v, want one unpinned call", provider.pins)
+	}
+}
+
+// A head that moved after approval is an approval state. It must leave the MR
+// queued for re-approval, not report a merge failure whose handler tells the
+// polecat to fix its code.
+func TestDoMergePR_HeadMovedIsNeedsApproval(t *testing.T) {
+	e, branch := humanGatedEngineer(t, "alice")
+	provider := &pinRecordingProvider{
+		fakePRProvider: fakePRProvider{
+			headSHA:       "1111111111111111111111111111111111111111",
+			approvedAtSHA: map[string][]string{"1111111111111111111111111111111111111111": {"alice"}},
+		},
+		prNumber: 42,
+		mergeErr: &HeadMovedError{PRNumber: 42, Err: errors.New("gh: head branch was modified")},
+	}
+	e.prProvider = provider
+
+	result := e.doMergePR(context.Background(), branch, "main")
+
+	if result.Success {
+		t.Fatal("a refused merge must not report success")
+	}
+	if !result.NeedsApproval {
+		t.Errorf("head-moved must set NeedsApproval so the MR stays queued, got %+v", result)
+	}
+	if want := "PR #42 head moved since approval; re-approval needed"; result.Error != want {
+		t.Errorf("Error = %q, want %q", result.Error, want)
+	}
+	if strings.Contains(result.Error, "merge failed") {
+		t.Errorf("must not read as a merge failure: %q", result.Error)
 	}
 }

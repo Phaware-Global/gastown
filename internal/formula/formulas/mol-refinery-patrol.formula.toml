@@ -1357,9 +1357,15 @@ picks the MR back up within one cycle.
   --escalate
 ```
 
-The command polls until both the configured approver has APPROVED *and*
-the distinct-approver count meets `pr_required_approvals`. On timeout it
-returns non-zero with a message naming the unmet gate.
+The command polls until the configured approver has APPROVED, the
+distinct-approver count meets `pr_required_approvals`, *and* — when the rig
+sets `required_human_reviewers` — one of those humans has APPROVED the PR's
+**current head commit**. GitHub keeps an approval after a push, so an approval
+on an earlier commit does not count; a human must re-approve after the latest
+push. `wait-approval` needs at least one of these gates, and the human gate
+alone is enough. On timeout it returns non-zero with a message naming the unmet
+gate. A lookup failure (head SHA or approvals unreadable) ends the wait
+immediately instead of polling to the timeout: waiting will not clear it.
 
 **Step PR.7: Merge**
 
@@ -1376,10 +1382,19 @@ refused with a clear pointer back to PR.4 and PR.6. `gh pr merge` is
 blocked by the `pr-workflow` tap-guard (G21 fix); attempting it prints
 a banner titled `❌ DIRECT gh pr merge BLOCKED (G21 fix)` and exits
 non-zero. If `gt refinery pr merge` fails with an error like
-`PR #<n> requires approving review from <user> before merge` or
-`PR #<n> has N of M required approvals`, DO NOT try to work around
-it — go back to PR.4 (await-review) or PR.6 (wait-approval) and
+`PR #<n> requires approving review from <user> before merge`,
+`PR #<n> has N of M required approvals`, or
+`PR #<n> has no APPROVED review at its current head ...`, DO NOT try to work
+around it — go back to PR.4 (await-review) or PR.6 (wait-approval) and
 resolve the gate.
+
+When `required_human_reviewers` is set, the merge is **pinned to the head
+commit the human approval was verified on**. If a push lands between the check
+and the merge, GitHub refuses it and the command fails with
+`PR #<n> head moved since approval; re-approval needed`. That is an approval
+state, not a build failure: do not send it to the polecat as something to fix.
+Leave the MR queued, and re-run PR.6 once a required human has approved the new
+head.
 
 ⚠️ **STOP HERE - DO NOT PROCEED UNTIL THE PR IS ACTUALLY MERGED ON GITHUB**
 

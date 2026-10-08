@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/crew"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
@@ -223,6 +224,18 @@ type MergeQueueConfig struct {
 	// gate and the named approver's APPROVED review is still required.
 	// *int lets us distinguish zero from unset.
 	PRRequiredApprovals *int `json:"pr_required_approvals,omitempty"`
+
+	// RequiredHumanReviewers names the GitHub logins whose approval counts as
+	// human sign-off. When non-empty, the merge path refuses unless at least
+	// one of them has an APPROVED review whose commit is the PR's CURRENT head
+	// SHA — an approval on an earlier commit does not count, because GitHub
+	// keeps a stale approval after a push. Agent approvals (the in-town
+	// Reviewer's clean-pass APPROVE, the count gate) never satisfy it. The
+	// pr_reviewer login is rejected here at config load, since it is an agent.
+	// Empty means no head-SHA human gate (existing behavior), which is also
+	// what an approval opt-out rig (pr_required_approvals: 0, no pr_approver)
+	// keeps. Only meaningful when MergeStrategy="pr".
+	RequiredHumanReviewers []string `json:"required_human_reviewers,omitempty"`
 
 	// PRReviewLoopMax caps review-fix polecat dispatches per PR. Defaults to 3.
 	PRReviewLoopMax int `json:"pr_review_loop_max,omitempty"`
@@ -548,32 +561,33 @@ func (e *Engineer) LoadConfig() error {
 	// Parse merge_queue section into our config struct
 	// We need special handling for poll_interval (string -> Duration)
 	var mqRaw struct {
-		Enabled              *bool                     `json:"enabled"`
-		OnConflict           *string                   `json:"on_conflict"`
-		RunTests             *bool                     `json:"run_tests"`
-		TestCommand          *string                   `json:"test_command"`
-		DeleteMergedBranches *bool                     `json:"delete_merged_branches"`
-		RetryFlakyTests      *int                      `json:"retry_flaky_tests"`
-		PollInterval         *string                   `json:"poll_interval"`
-		MaxConcurrent        *int                      `json:"max_concurrent"`
-		StaleClaimTimeout    *string                   `json:"stale_claim_timeout"`
-		Gates                map[string]*gateConfigRaw `json:"gates"`
-		GatesParallel        *bool                     `json:"gates_parallel"`
-		AutoPush             *bool                     `json:"auto_push"`
-		MergeStrategy        *string                   `json:"merge_strategy"`
-		VCSProvider          *string                   `json:"vcs_provider"`
-		RequireReview        *bool                     `json:"require_review"`
-		PRReviewer           *string                   `json:"pr_reviewer"`
-		ReviewBypassBranches []string                  `json:"review_bypass_branches"`
-		PRApprover           *string                   `json:"pr_approver"`
-		PRRequiredApprovals  *int                      `json:"pr_required_approvals"`
-		PRReviewLoopMax      *int                      `json:"pr_review_loop_max"`
-		PRMergeMethod        *string                   `json:"pr_merge_method"`
-		PRReviewWait         *string                   `json:"pr_review_wait"`
-		PRReviewTimeout      *string                   `json:"pr_review_timeout"`
-		PRTriggerComment     *string                   `json:"pr_trigger_comment"`
-		ReviewerLocal        *bool                     `json:"reviewer_local"`
-		ReviewerTokenEnv     *string                   `json:"reviewer_token_env"`
+		Enabled                *bool                     `json:"enabled"`
+		OnConflict             *string                   `json:"on_conflict"`
+		RunTests               *bool                     `json:"run_tests"`
+		TestCommand            *string                   `json:"test_command"`
+		DeleteMergedBranches   *bool                     `json:"delete_merged_branches"`
+		RetryFlakyTests        *int                      `json:"retry_flaky_tests"`
+		PollInterval           *string                   `json:"poll_interval"`
+		MaxConcurrent          *int                      `json:"max_concurrent"`
+		StaleClaimTimeout      *string                   `json:"stale_claim_timeout"`
+		Gates                  map[string]*gateConfigRaw `json:"gates"`
+		GatesParallel          *bool                     `json:"gates_parallel"`
+		AutoPush               *bool                     `json:"auto_push"`
+		MergeStrategy          *string                   `json:"merge_strategy"`
+		VCSProvider            *string                   `json:"vcs_provider"`
+		RequireReview          *bool                     `json:"require_review"`
+		PRReviewer             *string                   `json:"pr_reviewer"`
+		ReviewBypassBranches   []string                  `json:"review_bypass_branches"`
+		PRApprover             *string                   `json:"pr_approver"`
+		PRRequiredApprovals    *int                      `json:"pr_required_approvals"`
+		RequiredHumanReviewers []string                  `json:"required_human_reviewers"`
+		PRReviewLoopMax        *int                      `json:"pr_review_loop_max"`
+		PRMergeMethod          *string                   `json:"pr_merge_method"`
+		PRReviewWait           *string                   `json:"pr_review_wait"`
+		PRReviewTimeout        *string                   `json:"pr_review_timeout"`
+		PRTriggerComment       *string                   `json:"pr_trigger_comment"`
+		ReviewerLocal          *bool                     `json:"reviewer_local"`
+		ReviewerTokenEnv       *string                   `json:"reviewer_token_env"`
 	}
 
 	if err := json.Unmarshal(mergeQueueRaw, &mqRaw); err != nil {
@@ -669,6 +683,9 @@ func (e *Engineer) LoadConfig() error {
 	}
 	if mqRaw.PRApprover != nil {
 		e.config.PRApprover = *mqRaw.PRApprover
+	}
+	if mqRaw.RequiredHumanReviewers != nil {
+		e.config.RequiredHumanReviewers = mqRaw.RequiredHumanReviewers
 	}
 	if mqRaw.PRRequiredApprovals != nil {
 		v := *mqRaw.PRRequiredApprovals
@@ -781,6 +798,9 @@ func (e *Engineer) LoadConfig() error {
 				"(both are %q): the reviewer's approval is informational and cannot also be "+
 				"the approval gate, or the bot approves its own reviews and merges without a human",
 				e.config.PRApprover)
+		}
+		if err := config.ValidateRequiredHumanReviewers(e.config.RequiredHumanReviewers, e.config.PRReviewer); err != nil {
+			return err
 		}
 		switch e.config.PRMergeMethod {
 		case "", "squash", "merge", "rebase":
@@ -1213,7 +1233,8 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
 	// Policy is driven by MergeQueueConfig (PRApprover + GetPRRequiredApprovals).
 	// Shared with the `gt refinery pr merge` CLI subcommand via VerifyPRApproval
 	// so patrol and CLI paths enforce identical gates.
-	if err := VerifyPRApproval(e.prProvider, e.config, prNumber, e.output); err != nil {
+	verifiedHead, err := VerifyPRApprovalAtHead(e.prProvider, e.config, prNumber, e.output)
+	if err != nil {
 		var needsApproval *NeedsApprovalError
 		if errors.As(err, &needsApproval) {
 			return ProcessResult{
@@ -1234,8 +1255,19 @@ func (e *Engineer) doMergePR(ctx context.Context, branch, target string) Process
 		method = "squash"
 	}
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Merging PR #%d via %s API (%s)...\n", prNumber, provider, method)
-	mergeCommit, err := e.prProvider.MergePR(prNumber, method)
+	mergeCommit, err := e.prProvider.MergePR(prNumber, method, verifiedHead)
 	if err != nil {
+		// The head moved after the approval check: the approval is stale, not the
+		// build broken. Keep the MR queued for re-approval rather than reporting a
+		// merge failure that tells the polecat to fix code.
+		var headMoved *HeadMovedError
+		if errors.As(err, &headMoved) {
+			return ProcessResult{
+				Success:       false,
+				NeedsApproval: true,
+				Error:         headMoved.Error(),
+			}
+		}
 		return ProcessResult{
 			Success: false,
 			Error:   fmt.Sprintf("PR merge failed for PR #%d: %v", prNumber, err),

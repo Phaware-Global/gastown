@@ -152,6 +152,15 @@ New fields on `config.MergeQueueConfig` (`internal/config/types.go`):
   merge. Required when `merge_strategy=pr`. Hard-fail on refinery start if
   unset.
 - `PRRequiredApprovals int` — approvals required. Defaults to 1.
+- `RequiredHumanReviewers []string` — logins whose APPROVED review, on the
+  PR's *current head SHA*, is required before merge. GitHub keeps an approval
+  after a push, so neither `PRApprover` nor the count gate proves a human saw
+  the code being merged; this gate does. It is enforced in
+  `refinery.VerifyPRApproval`, so `gt refinery pr merge` and the patrol merge
+  path both refuse. Lookup failures and providers that cannot report
+  per-commit approvals refuse too. `pr_reviewer` is rejected in the list.
+  Empty (default) means no such gate, which keeps approval opt-out rigs
+  (`pr_required_approvals: 0`, no `pr_approver`) merging as before.
 - `PRReviewLoopMax int` — max polecat dispatch cycles per PR. Defaults to 3.
 - `PRMergeMethod string` — passed to `gh pr merge`. Defaults to `squash`.
 
