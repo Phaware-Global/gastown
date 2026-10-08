@@ -76,8 +76,8 @@ func init() {
 }
 
 // beadIDPattern accepts the standard bd issue-id forms: a lowercase
-// rig prefix (a letter followed by 1-15 lowercase alphanumerics) and one
-// or more `-segment` parts, where each segment is lowercase-alphanumeric
+// rig prefix (a letter followed by 0-19 lowercase alphanumerics, matching
+// beadsPrefixRegexp's 1-20 char bound) and one or more `-segment` parts, where each segment is lowercase-alphanumeric
 // and may include `.` for subtask suffixes. Rig prefixes are configured
 // per rig and vary in length. Covers gt-mwy, gt-mwy.5, gt-mwy.5.2,
 // gt-i71, hq-1pl, hq-wisp-ku6, gt-1qlg, hmetet-za9w. Rejects shell-injection-friendly characters
@@ -88,7 +88,7 @@ func init() {
 // ref-rule checks (no `..`, no leading/trailing `.`, no `.lock`
 // suffix) live in validateBeadID, since they don't compose cleanly
 // with a single regex.
-var beadIDPattern = regexp.MustCompile(`^[a-z][a-z0-9]{1,15}(-[a-z0-9.]+)+$`)
+var beadIDPattern = regexp.MustCompile(`^[a-z][a-z0-9]{0,19}(-[a-z0-9.]+)+$`)
 
 // validateBeadID applies the bead-id pattern AND the git-ref-rule
 // fragments that don't fit a single regex (git refuses refs containing
