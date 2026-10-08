@@ -164,10 +164,13 @@ The Dog uses this to understand the state before deciding what to reap.`,
 
 // printReaperScanText renders scan results in the human-readable (non-JSON) format.
 func printReaperScanText(w io.Writer, results []*reaper.ScanResult) {
-	var totalReap, totalMoleculeSteps, totalFastTrack, totalPurge, totalMail, totalStale, totalOpen int
+	var totalReap, totalUnparented, totalMoleculeSteps, totalFastTrack, totalPurge, totalMail, totalStale, totalOpen int
 	for _, r := range results {
 		fmt.Fprintf(w, "Database: %s\n", r.Database)
 		fmt.Fprintf(w, "  Reap candidates:  %d\n", r.ReapCandidates)
+		if r.UnparentedStale > 0 {
+			fmt.Fprintf(w, "  Unparented stale: %d (never reaped)\n", r.UnparentedStale)
+		}
 		if r.MoleculeStepCandidates > 0 {
 			fmt.Fprintf(w, "  Molecule steps:   %d\n", r.MoleculeStepCandidates)
 		}
@@ -182,6 +185,7 @@ func printReaperScanText(w io.Writer, results []*reaper.ScanResult) {
 			fmt.Fprintf(w, "  %s %s\n", style.Warning.Render("ANOMALY:"), a.Message)
 		}
 		totalReap += r.ReapCandidates
+		totalUnparented += r.UnparentedStale
 		totalMoleculeSteps += r.MoleculeStepCandidates
 		totalFastTrack += r.FastTrackCandidates
 		totalPurge += r.PurgeCandidates
@@ -192,6 +196,9 @@ func printReaperScanText(w io.Writer, results []*reaper.ScanResult) {
 	if len(results) > 1 {
 		fmt.Fprintf(w, "\nScan summary (%d databases):\n", len(results))
 		fmt.Fprintf(w, "  Reap candidates:  %d\n", totalReap)
+		if totalUnparented > 0 {
+			fmt.Fprintf(w, "  Unparented stale: %d (never reaped)\n", totalUnparented)
+		}
 		if totalMoleculeSteps > 0 {
 			fmt.Fprintf(w, "  Molecule steps:   %d\n", totalMoleculeSteps)
 		}
