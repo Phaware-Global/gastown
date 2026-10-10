@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -6024,5 +6025,96 @@ func TestResolveRoleAgentConfig_DogUnresolvableNameKeepsHaiku(t *testing.T) {
 	got := strings.Join(rc.Args, " ")
 	if !strings.Contains(got, "haiku") {
 		t.Errorf("dog args = %q, want the haiku default when role_agents names an undefined agent", got)
+	}
+}
+
+func TestEscalationConfigSlackOverseerOnlyDefaultsTrue(t *testing.T) {
+	t.Parallel()
+
+	if !NewEscalationConfig().IsSlackOverseerOnly() {
+		t.Error("NewEscalationConfig().IsSlackOverseerOnly() = false, want true")
+	}
+	if !(&EscalationConfig{}).IsSlackOverseerOnly() {
+		t.Error("zero-value (key absent) IsSlackOverseerOnly() = false, want true")
+	}
+	if (&EscalationConfig{SlackOverseerOnly: boolPtr(false)}).IsSlackOverseerOnly() {
+		t.Error("explicit false IsSlackOverseerOnly() = true, want false")
+	}
+}
+
+func TestLoadEscalationConfigStripsSlackRoutes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		json      string
+		wantSlack bool
+	}{
+		{
+			name:      "key absent defaults to overseer-only and strips slack",
+			json:      `{"type":"escalation","version":1,"routes":{"critical":["bead","mail:mayor","slack"],"high":["bead","slack","mail:mayor"],"medium":["bead","mail:mayor"]}}`,
+			wantSlack: false,
+		},
+		{
+			name:      "explicit true strips slack",
+			json:      `{"type":"escalation","version":1,"slack_overseer_only":true,"routes":{"critical":["bead","mail:mayor","slack"],"high":["bead","slack","mail:mayor"]}}`,
+			wantSlack: false,
+		},
+		{
+			name:      "explicit false keeps slack",
+			json:      `{"type":"escalation","version":1,"slack_overseer_only":false,"routes":{"critical":["bead","mail:mayor","slack"],"high":["bead","slack","mail:mayor"]}}`,
+			wantSlack: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "escalation.json")
+			if err := os.WriteFile(path, []byte(tt.json), 0644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadEscalationConfig(path)
+			if err != nil {
+				t.Fatalf("LoadEscalationConfig: %v", err)
+			}
+			for _, severity := range []string{SeverityCritical, SeverityHigh} {
+				got := false
+				for _, action := range cfg.Routes[severity] {
+					if action == "slack" {
+						got = true
+					}
+				}
+				if got != tt.wantSlack {
+					t.Errorf("Routes[%s] = %v, slack present = %v, want %v", severity, cfg.Routes[severity], got, tt.wantSlack)
+				}
+			}
+			// Non-slack actions and their order must survive stripping.
+			if want := []string{"bead", "mail:mayor"}; !tt.wantSlack && !reflect.DeepEqual(cfg.Routes[SeverityHigh], want) {
+				t.Errorf("Routes[high] = %v, want %v", cfg.Routes[SeverityHigh], want)
+			}
+		})
+	}
+}
+
+func TestStripSlackRoutesReportsSeverities(t *testing.T) {
+	t.Parallel()
+
+	cfg := &EscalationConfig{Routes: map[string][]string{
+		SeverityCritical: {"bead", "slack"},
+		SeverityHigh:     {"bead", "mail:mayor"},
+		SeverityLow:      {"slack"},
+	}}
+	got := stripSlackRoutes(cfg)
+	if want := []string{SeverityLow, SeverityCritical}; !reflect.DeepEqual(got, want) {
+		t.Errorf("stripSlackRoutes() = %v, want %v", got, want)
+	}
+	if len(cfg.Routes[SeverityLow]) != 0 {
+		t.Errorf("Routes[low] = %v, want empty", cfg.Routes[SeverityLow])
+	}
+
+	off := &EscalationConfig{SlackOverseerOnly: boolPtr(false), Routes: map[string][]string{SeverityCritical: {"bead", "slack"}}}
+	if got := stripSlackRoutes(off); got != nil {
+		t.Errorf("stripSlackRoutes() with slack_overseer_only=false = %v, want nil", got)
 	}
 }

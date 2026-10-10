@@ -59,7 +59,8 @@ Config file: `~/gt/settings/escalation.json`
     "sms_webhook": ""
   },
   "stale_threshold": "4h",
-  "max_reescalations": 2
+  "max_reescalations": 2,
+  "slack_overseer_only": true
 }
 ```
 
@@ -71,8 +72,27 @@ Config file: `~/gt/settings/escalation.json`
 | `mail:<target>` | `mail:mayor` | Send gt mail to target |
 | `email:human` | `email:human` | Send email to `contacts.human_email` |
 | `sms:human` | `sms:human` | Send SMS to `contacts.human_sms` |
-| `slack` | `slack` | Post to `contacts.slack_webhook` |
+| `slack` | `slack` | Post to `contacts.slack_webhook` — **suppressed** unless `slack_overseer_only` is `false` (see below) |
 | `log` | `log` | Write to escalation log file |
+
+### Slack is overseer-only (`slack_overseer_only`)
+
+Slack reaches a human's phone. Routing every escalation there produced a DM
+flood of raw, unfiltered beads (dozens per hour during a dolt-archive outage).
+Slack is therefore reserved for the mayor's judgment:
+
+- `slack_overseer_only` defaults to `true` when the key is absent.
+- While it is `true`, `LoadEscalationConfig` strips every `slack` action from
+  `routes` and prints one warning per affected severity. `gt escalate` also
+  gates the action at execution time and records
+  `slack route suppressed: use gt notify-overseer for Slack (slack_overseer_only=true)`
+  in the delivery status. The suppression is not a missing-contact skip, so it
+  never hard-fails a HIGH/CRITICAL escalation.
+- `gt escalate stale` re-routes only `mail:` targets and never ran external
+  actions; nothing in the automated re-escalation path can reach Slack.
+- Set `"slack_overseer_only": false` to restore per-escalation Slack posts.
+
+The only path to Slack is `gt notify-overseer` (below).
 
 ## Escalation Beads
 
@@ -124,10 +144,45 @@ body or the follow-up bead before restarting services.
 
 ### gt escalate ack
 
-Acknowledge an escalation (prevents re-escalation).
+Acknowledge one or more escalations (prevents re-escalation).
 
 ```bash
-gt escalate ack <bead-id> [--note="Investigating"]
+gt escalate ack <bead-id> [<bead-id>...]
+```
+
+### gt notify-overseer
+
+Mayor-only. Posts one composed, human-readable ops brief to
+`contacts.slack_webhook`. Restricted to the mayor identity (a human at the
+terminal with no agent identity is also allowed, for testing the webhook).
+
+```bash
+gt notify-overseer -s "<subject>" --category <infra|ops|security> \
+  (-m "<composed summary>" | --stdin) [--refs <id1,id2,...>]
+```
+
+- `--category` is required and limited to `infra`, `ops`, `security`. Product
+  direction, stakeholder asks, feature scoping, PR reviews, and Jira decisions
+  are rejected by construction — they belong in GitHub comments or Jira.
+- `--refs` resolves each bead (any prefix) and pulls its title into the brief;
+  an unknown ID fails the send. After a successful post each referenced bead
+  gets a `slack-forwarded:<UTC timestamp>` label as the audit trail.
+- The mayor's operating rules (role template) require batching related
+  escalations into one brief, waiting at least one check cycle or 30 minutes,
+  and sending at most one brief per incident per hour.
+
+Payload format (Slack mrkdwn):
+
+```
+🚨 *Gastown Ops Brief – 2026-10-10 14:05 UTC*
+`[INFRA]` *CI pipeline down*
+GitHub Actions runners offline since 09:40 UTC; 4 PRs blocked. Retried twice.
+
+*References:*
+• hq-abc — dolt-archive: dolt push failed for 1 remote(s)
+• hq-def — Agent host disk 96% full
+
+_Ack with: `gt escalate ack hq-abc hq-def`_
 ```
 
 ### gt escalate list

@@ -38,8 +38,61 @@ happens to look. Never wait for inline input.
   - `{{ cmd }} escalate "<question>" --severity <level> --reason "<context>"`
   - Jira comment on the pertinent ticket, @-mentioning the decision owner
   - GitHub PR/issue comment
+  - NOT Slack — see "Overseer Escalation via Slack" below.
 - Never block waiting for an answer. Choose a reasonable default, note it,
   and pick up replies on a later cycle (mail, Jira, escalation ack).
+
+---
+
+## Overseer Escalation via Slack
+
+`{{ cmd }} escalate` never posts to Slack (`slack_overseer_only` is on by
+default). Slack reaches the overseer's phone; YOU decide when that is
+warranted, and you compose the message. One brief per incident, not one
+message per escalation bead.
+
+**When to use it** — only infrastructure/operational blocks that stop agents
+from making progress and cannot be resolved inside Gas Town:
+- External service unreachable (GitHub, Dolt remote, package registry, Jira API)
+- CI/CD pipeline broken for every PR
+- Credential or token rotation needed
+- Agent host out of disk/memory, Docker needing a human reset
+- Mass agent death or a crashed agent that needs a human restart
+- Merge queue stuck with no in-town remedy
+- Security incident (credential exposure, unauthorized access)
+
+**When NOT to use it** — these go through GitHub comments or Jira only, never Slack:
+- Product direction, priority, or scope questions
+- Stakeholder communication or status updates
+- Feature scoping and design choices
+- PR review requests or review findings
+- Jira ticket decisions
+
+**How to use it** — `--category` is required and must be `infra`, `ops`, or
+`security`; anything else is rejected. `--refs` attaches escalation bead IDs
+(their titles are pulled into the brief) and labels each one
+`slack-forwarded:<timestamp>` as the audit trail.
+
+```bash
+{{ cmd }} notify-overseer -s "CI pipeline down" --category infra \
+  --refs hq-abc,hq-def \
+  -m "GitHub Actions runners offline since 09:40 UTC; 4 PRs blocked. Retried twice, no change."
+
+# Longer bodies: --stdin avoids shell quoting
+{{ cmd }} notify-overseer -s "Agent host disk 96% full" --category ops --refs hq-an95vu --stdin <<'BODY'
+Docker.raw holds 98 GB unused since 10/08. Polecat spawns fail on both rigs.
+Agents cannot prune Docker safely; needs a human reset of Docker Desktop.
+BODY
+```
+
+**Batching rule**: before sending, wait at least one full check cycle or 30
+minutes, whichever is shorter. Consolidate every related escalation (same
+root cause, same service, same host) into ONE brief with all bead IDs in
+`--refs`. Ack the beads you forwarded with `{{ cmd }} escalate ack <id> [<id2> ...]`.
+
+**Frequency limit**: at most ONE Slack notification per unique operational
+incident per hour. A follow-up for the same incident waits an hour unless the
+situation materially changes (resolved, or got worse in a new way).
 
 ---
 
@@ -214,6 +267,7 @@ Routes defined in `{{ .TownRoot }}/.beads/routes.jsonl`. `{{ cmd }} rig add` aut
 ## Key Commands
 
 ### Communication
+- `{{ cmd }} notify-overseer -s "..." -m "..." --category infra|ops|security [--refs id1,id2]` — ONE composed Slack ops brief per infra/ops incident (see "Overseer Escalation via Slack")
 - `{{ cmd }} mail inbox` — Check your messages
 - `{{ cmd }} mail read <id>` — Read a specific message
 - `{{ cmd }} mail send <addr> -s "Subject" -m "Message"` — Send mail

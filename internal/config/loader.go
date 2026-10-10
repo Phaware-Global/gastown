@@ -2987,7 +2987,40 @@ func LoadEscalationConfig(path string) (*EscalationConfig, error) {
 		return nil, err
 	}
 
+	for _, severity := range stripSlackRoutes(&config) {
+		fmt.Fprintf(os.Stderr, "warning: %s: slack route for severity '%s' suppressed: use gt notify-overseer for Slack (slack_overseer_only=true)\n", path, severity)
+	}
+
 	return &config, nil
+}
+
+// stripSlackRoutes removes the "slack" action from every route when
+// slack_overseer_only is in effect, so gt escalate never posts to Slack on
+// its own. Returns the severities that had a slack action stripped, in
+// ValidSeverities order, so the caller can warn the operator once per route.
+func stripSlackRoutes(c *EscalationConfig) []string {
+	if !c.IsSlackOverseerOnly() {
+		return nil
+	}
+	var stripped []string
+	for _, severity := range ValidSeverities() {
+		actions, ok := c.Routes[severity]
+		if !ok {
+			continue
+		}
+		kept := actions[:0:0]
+		for _, action := range actions {
+			if action == "slack" {
+				continue
+			}
+			kept = append(kept, action)
+		}
+		if len(kept) != len(actions) {
+			c.Routes[severity] = kept
+			stripped = append(stripped, severity)
+		}
+	}
+	return stripped
 }
 
 // LoadOrCreateEscalationConfig loads the escalation config, creating a default if not found.

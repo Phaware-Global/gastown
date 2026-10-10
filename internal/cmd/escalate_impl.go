@@ -436,8 +436,6 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 }
 
 func runEscalateAck(cmd *cobra.Command, args []string) error {
-	escalationID := args[0]
-
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
@@ -450,17 +448,19 @@ func runEscalateAck(cmd *cobra.Command, args []string) error {
 	}
 
 	bd := beads.New(beads.ResolveBeadsDir(townRoot))
-	if err := bd.AckEscalation(escalationID, ackedBy); err != nil {
-		return fmt.Errorf("acknowledging escalation: %w", err)
+	for _, escalationID := range args {
+		if err := bd.AckEscalation(escalationID, ackedBy); err != nil {
+			return fmt.Errorf("acknowledging escalation %s: %w", escalationID, err)
+		}
+
+		// Log to activity feed
+		_ = events.LogFeed(events.TypeEscalationAcked, ackedBy, map[string]interface{}{
+			"escalation_id": escalationID,
+			"acked_by":      ackedBy,
+		})
+
+		fmt.Printf("%s Escalation acknowledged: %s\n", style.Bold.Render("✓"), escalationID)
 	}
-
-	// Log to activity feed
-	_ = events.LogFeed(events.TypeEscalationAcked, ackedBy, map[string]interface{}{
-		"escalation_id": escalationID,
-		"acked_by":      ackedBy,
-	})
-
-	fmt.Printf("%s Escalation acknowledged: %s\n", style.Bold.Render("✓"), escalationID)
 	return nil
 }
 
@@ -813,7 +813,13 @@ func executeExternalActions(actions []string, cfg *config.EscalationConfig, bead
 
 		case action == "slack":
 			status := deliveryStatus{Channel: "slack", Target: "slack", Severity: severity}
-			if cfg.Contacts.SlackWebhook == "" {
+			if cfg.IsSlackOverseerOnly() {
+				// Slack is reserved for the mayor's composed ops briefs
+				// (gt notify-overseer). Not a missing-contact skip, so the
+				// G39 hard-fail collector must not treat it as one.
+				status.Warning = "slack route suppressed: use gt notify-overseer for Slack (slack_overseer_only=true)"
+				style.PrintWarning("slack route suppressed: use gt notify-overseer for Slack (slack_overseer_only=true)")
+			} else if cfg.Contacts.SlackWebhook == "" {
 				status.Warning = "contacts.slack_webhook not configured"
 				status.Skipped = true
 				style.PrintWarning("slack action skipped: contacts.slack_webhook not configured in settings/escalation.json")
@@ -894,16 +900,21 @@ func sendEscalationSlack(cfg *config.EscalationConfig, beadID, severity, descrip
 		emoji = "⚪"
 	}
 
-	payload := map[string]string{
-		"text": fmt.Sprintf("%s *[%s] Escalation %s*\n%s\n_Acknowledge: `gt escalate ack %s`_",
-			emoji, strings.ToUpper(severity), beadID, description, beadID),
-	}
-	body, err := json.Marshal(payload)
+	text := fmt.Sprintf("%s *[%s] Escalation %s*\n%s\n_Acknowledge: `gt escalate ack %s`_",
+		emoji, strings.ToUpper(severity), beadID, description, beadID)
+	return postSlackWebhook(cfg.Contacts.SlackWebhook, text)
+}
+
+// postSlackWebhook posts a text message to a Slack incoming webhook.
+// Shared by the per-escalation path (slack_overseer_only=false) and
+// gt notify-overseer.
+func postSlackWebhook(webhook, text string) error {
+	body, err := json.Marshal(map[string]string{"text": text})
 	if err != nil {
 		return fmt.Errorf("marshaling slack payload: %w", err)
 	}
 
-	resp, err := escalationHTTPClient.Post(cfg.Contacts.SlackWebhook, "application/json", strings.NewReader(string(body)))
+	resp, err := escalationHTTPClient.Post(webhook, "application/json", strings.NewReader(string(body)))
 	if err != nil {
 		return fmt.Errorf("posting to slack: %w", err)
 	}
