@@ -44,7 +44,7 @@ unresponsive, merge queue stuck, external dependency unreachable, credential
 rotation. Product direction, stakeholder asks, feature scoping, and PR review
 requests must never reach Slack — route those through GitHub or Jira.
 
-Each referenced bead is labelled slack-forwarded:<timestamp> as an audit trail.
+Each referenced bead is labeled slack-forwarded:<timestamp> as an audit trail.
 
 Examples:
   gt notify-overseer -s "CI pipeline down" -m "GitHub Actions runners offline since 09:40; 4 PRs blocked." --category infra --refs hq-abc,hq-def
@@ -101,7 +101,7 @@ type notifyOverseerRef struct {
 	bd *beads.Beads
 }
 
-// slackEscape neutralises Slack mrkdwn control sequences (<!channel>, <@U..>,
+// slackEscape neutralizes Slack mrkdwn control sequences (<!channel>, <@U..>,
 // <url|text>) in text that was not composed by the mayor, so an agent-written
 // bead title cannot ping the channel or plant a disguised link in the brief.
 func slackEscape(s string) string {
@@ -209,7 +209,7 @@ func runNotifyOverseer(cmd *cobra.Command, args []string) error {
 			style.PrintWarning("posted, but failed to record forward on %s: %v", ref.ID, err)
 			continue
 		}
-		fmt.Printf("  🏷  %s labelled %s\n", ref.ID, label)
+		fmt.Printf("  🏷  %s labeled %s\n", ref.ID, label)
 	}
 	return nil
 }
