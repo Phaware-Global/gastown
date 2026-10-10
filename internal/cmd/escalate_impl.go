@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/smtp"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -436,8 +437,6 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 }
 
 func runEscalateAck(cmd *cobra.Command, args []string) error {
-	escalationID := args[0]
-
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
@@ -449,19 +448,25 @@ func runEscalateAck(cmd *cobra.Command, args []string) error {
 		ackedBy = "unknown"
 	}
 
+	// Keep going past a bad ID so an ops-brief footer with several IDs acks
+	// everything it can; report every failure at the end.
 	bd := beads.New(beads.ResolveBeadsDir(townRoot))
-	if err := bd.AckEscalation(escalationID, ackedBy); err != nil {
-		return fmt.Errorf("acknowledging escalation: %w", err)
+	var errs []error
+	for _, escalationID := range args {
+		if err := bd.AckEscalation(escalationID, ackedBy); err != nil {
+			errs = append(errs, fmt.Errorf("acknowledging escalation %s: %w", escalationID, err))
+			continue
+		}
+
+		// Log to activity feed
+		_ = events.LogFeed(events.TypeEscalationAcked, ackedBy, map[string]interface{}{
+			"escalation_id": escalationID,
+			"acked_by":      ackedBy,
+		})
+
+		fmt.Printf("%s Escalation acknowledged: %s\n", style.Bold.Render("✓"), escalationID)
 	}
-
-	// Log to activity feed
-	_ = events.LogFeed(events.TypeEscalationAcked, ackedBy, map[string]interface{}{
-		"escalation_id": escalationID,
-		"acked_by":      ackedBy,
-	})
-
-	fmt.Printf("%s Escalation acknowledged: %s\n", style.Bold.Render("✓"), escalationID)
-	return nil
+	return errors.Join(errs...)
 }
 
 func runEscalateClose(cmd *cobra.Command, args []string) error {
@@ -813,7 +818,13 @@ func executeExternalActions(actions []string, cfg *config.EscalationConfig, bead
 
 		case action == "slack":
 			status := deliveryStatus{Channel: "slack", Target: "slack", Severity: severity}
-			if cfg.Contacts.SlackWebhook == "" {
+			if cfg.IsSlackOverseerOnly() {
+				// Slack is reserved for the mayor's composed ops briefs
+				// (gt notify-overseer). Not a missing-contact skip, so the
+				// G39 hard-fail collector must not treat it as one.
+				status.Warning = "slack route suppressed: use gt notify-overseer for Slack (slack_overseer_only=true)"
+				style.PrintWarning("slack route suppressed: use gt notify-overseer for Slack (slack_overseer_only=true)")
+			} else if cfg.Contacts.SlackWebhook == "" {
 				status.Warning = "contacts.slack_webhook not configured"
 				status.Skipped = true
 				style.PrintWarning("slack action skipped: contacts.slack_webhook not configured in settings/escalation.json")
@@ -894,17 +905,29 @@ func sendEscalationSlack(cfg *config.EscalationConfig, beadID, severity, descrip
 		emoji = "⚪"
 	}
 
-	payload := map[string]string{
-		"text": fmt.Sprintf("%s *[%s] Escalation %s*\n%s\n_Acknowledge: `gt escalate ack %s`_",
-			emoji, strings.ToUpper(severity), beadID, description, beadID),
-	}
-	body, err := json.Marshal(payload)
+	text := fmt.Sprintf("%s *[%s] Escalation %s*\n%s\n_Acknowledge: `gt escalate ack %s`_",
+		emoji, strings.ToUpper(severity), beadID, description, beadID)
+	return postSlackWebhook(cfg.Contacts.SlackWebhook, text)
+}
+
+// postSlackWebhook posts a text message to a Slack incoming webhook.
+// Shared by the per-escalation path (slack_overseer_only=false) and
+// gt notify-overseer.
+func postSlackWebhook(webhook, text string) error {
+	body, err := json.Marshal(map[string]string{"text": text})
 	if err != nil {
 		return fmt.Errorf("marshaling slack payload: %w", err)
 	}
 
-	resp, err := escalationHTTPClient.Post(cfg.Contacts.SlackWebhook, "application/json", strings.NewReader(string(body)))
+	resp, err := escalationHTTPClient.Post(webhook, "application/json", strings.NewReader(string(body)))
 	if err != nil {
+		// *url.Error quotes the full request URL, and a Slack webhook's
+		// secret lives in the path — keep it out of terminals, beads, and
+		// mail by surfacing only the underlying transport error.
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			err = uerr.Err
+		}
 		return fmt.Errorf("posting to slack: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
