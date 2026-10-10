@@ -2012,7 +2012,7 @@ type EscalationConfig struct {
 	//   - "mail:<target>" → Send gt mail to target (e.g., "mail:mayor")
 	//   - "email:human" → Send email to contacts.human_email
 	//   - "sms:human"   → Send SMS to contacts.human_sms
-	//   - "slack"       → Post to contacts.slack_webhook
+	//   - "slack"       → Post to contacts.slack_webhook (only when slack_overseer_only=false)
 	//   - "log"         → Write to escalation log file
 	Routes map[string][]string `json:"routes"`
 
@@ -2029,6 +2029,14 @@ type EscalationConfig struct {
 	// re-escalated. Default: 2 (low→medium→high, then stops)
 	// Pointer type to distinguish "not configured" (nil) from explicit 0.
 	MaxReescalations *int `json:"max_reescalations,omitempty"`
+
+	// SlackOverseerOnly restricts Slack to the mayor's explicit
+	// `gt notify-overseer` command. When true (the default), any "slack"
+	// action in Routes is stripped at load time and `gt escalate` never
+	// posts to contacts.slack_webhook on its own. Set to false to restore
+	// per-escalation Slack posts.
+	// Pointer type so a missing key defaults to true; use IsSlackOverseerOnly().
+	SlackOverseerOnly *bool `json:"slack_overseer_only,omitempty"`
 }
 
 // EscalationContacts contains contact information for external notification channels.
@@ -2088,6 +2096,12 @@ func NextSeverity(severity string) string {
 // intPtr returns a pointer to the given int value.
 func intPtr(v int) *int { return &v }
 
+// IsSlackOverseerOnly reports whether Slack is reserved for gt notify-overseer.
+// Defaults to true when the key is absent from settings/escalation.json.
+func (c *EscalationConfig) IsSlackOverseerOnly() bool {
+	return c.SlackOverseerOnly == nil || *c.SlackOverseerOnly
+}
+
 // NewEscalationConfig creates a new EscalationConfig with sensible defaults.
 func NewEscalationConfig() *EscalationConfig {
 	return &EscalationConfig{
@@ -2099,8 +2113,9 @@ func NewEscalationConfig() *EscalationConfig {
 			SeverityHigh:     {"bead", "mail:mayor", "email:human"},
 			SeverityCritical: {"bead", "mail:mayor", "email:human", "sms:human"},
 		},
-		Contacts:         EscalationContacts{},
-		StaleThreshold:   "4h",
-		MaxReescalations: intPtr(2),
+		Contacts:          EscalationContacts{},
+		StaleThreshold:    "4h",
+		MaxReescalations:  intPtr(2),
+		SlackOverseerOnly: boolPtr(true),
 	}
 }
