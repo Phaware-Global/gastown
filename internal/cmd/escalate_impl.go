@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/smtp"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -447,10 +448,14 @@ func runEscalateAck(cmd *cobra.Command, args []string) error {
 		ackedBy = "unknown"
 	}
 
+	// Keep going past a bad ID so an ops-brief footer with several IDs acks
+	// everything it can; report every failure at the end.
 	bd := beads.New(beads.ResolveBeadsDir(townRoot))
+	var errs []error
 	for _, escalationID := range args {
 		if err := bd.AckEscalation(escalationID, ackedBy); err != nil {
-			return fmt.Errorf("acknowledging escalation %s: %w", escalationID, err)
+			errs = append(errs, fmt.Errorf("acknowledging escalation %s: %w", escalationID, err))
+			continue
 		}
 
 		// Log to activity feed
@@ -461,7 +466,7 @@ func runEscalateAck(cmd *cobra.Command, args []string) error {
 
 		fmt.Printf("%s Escalation acknowledged: %s\n", style.Bold.Render("✓"), escalationID)
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func runEscalateClose(cmd *cobra.Command, args []string) error {
@@ -916,6 +921,13 @@ func postSlackWebhook(webhook, text string) error {
 
 	resp, err := escalationHTTPClient.Post(webhook, "application/json", strings.NewReader(string(body)))
 	if err != nil {
+		// *url.Error quotes the full request URL, and a Slack webhook's
+		// secret lives in the path — keep it out of terminals, beads, and
+		// mail by surfacing only the underlying transport error.
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			err = uerr.Err
+		}
 		return fmt.Errorf("posting to slack: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -80,10 +81,12 @@ func validateNotifyOverseerCategory(category string) (string, error) {
 
 // validateNotifyOverseerSender restricts the command to the mayor. A human at
 // the terminal (no agent identity) is also allowed so the overseer can test
-// the webhook; every other agent role is rejected.
+// the webhook; every other agent role is rejected. detectSender yields
+// "mayor/" from GT_ROLE and "mayor" from the cwd fallback, so compare without
+// the trailing slash.
 func validateNotifyOverseerSender(sender string) error {
-	switch sender {
-	case "mayor/", "overseer", "":
+	switch strings.TrimSuffix(sender, "/") {
+	case "mayor", "overseer":
 		return nil
 	}
 	return fmt.Errorf("gt notify-overseer is restricted to the mayor (current identity: %s); escalate with gt escalate and let the mayor decide", sender)
@@ -93,9 +96,21 @@ func validateNotifyOverseerSender(sender string) error {
 type notifyOverseerRef struct {
 	ID    string
 	Title string
+	// bd is bound to the database that owns the bead (rig-prefixed IDs
+	// route to their rig), so the audit label lands next to the bead.
+	bd *beads.Beads
 }
 
-// formatOpsBrief renders the Slack payload for an ops brief.
+// slackEscape neutralises Slack mrkdwn control sequences (<!channel>, <@U..>,
+// <url|text>) in text that was not composed by the mayor, so an agent-written
+// bead title cannot ping the channel or plant a disguised link in the brief.
+func slackEscape(s string) string {
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
+}
+
+// formatOpsBrief renders the Slack payload for an ops brief. Subject and body
+// are mayor-composed and rendered as written; referenced bead IDs and titles
+// are pulled from agent-written beads and therefore escaped.
 func formatOpsBrief(now time.Time, category, subject, body string, refs []notifyOverseerRef) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "🚨 *Gastown Ops Brief – %s*\n", now.UTC().Format("2006-01-02 15:04 UTC"))
@@ -110,11 +125,12 @@ func formatOpsBrief(now time.Time, category, subject, body string, refs []notify
 	b.WriteString("\n*References:*\n")
 	ids := make([]string, 0, len(refs))
 	for _, ref := range refs {
-		ids = append(ids, ref.ID)
+		id := slackEscape(ref.ID)
+		ids = append(ids, id)
 		if ref.Title != "" {
-			fmt.Fprintf(&b, "• %s — %s\n", ref.ID, ref.Title)
+			fmt.Fprintf(&b, "• %s — %s\n", id, slackEscape(ref.Title))
 		} else {
-			fmt.Fprintf(&b, "• %s\n", ref.ID)
+			fmt.Fprintf(&b, "• %s\n", id)
 		}
 	}
 	fmt.Fprintf(&b, "\n_Ack with: `gt escalate ack %s`_\n", strings.Join(ids, " "))
@@ -165,18 +181,20 @@ func runNotifyOverseer(cmd *cobra.Command, args []string) error {
 
 	// Resolve references before posting so a typo fails the whole send
 	// rather than producing a brief that points at nothing.
-	bd := beads.New(beads.ResolveBeadsDir(townRoot))
+	townBeadsDir := beads.ResolveBeadsDir(townRoot)
 	refs := make([]notifyOverseerRef, 0, len(notifyOverseerRefs))
 	for _, id := range notifyOverseerRefs {
 		id = strings.TrimSpace(id)
 		if id == "" {
 			continue
 		}
-		issue, err := bd.Show(id)
+		targetDir := beads.ResolveRoutingTarget(townRoot, id, townBeadsDir)
+		refBd := beads.NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+		issue, err := refBd.Show(id)
 		if err != nil {
 			return fmt.Errorf("resolving --refs %s: %w", id, err)
 		}
-		refs = append(refs, notifyOverseerRef{ID: id, Title: issue.Title})
+		refs = append(refs, notifyOverseerRef{ID: id, Title: issue.Title, bd: refBd})
 	}
 
 	now := time.Now()
@@ -187,7 +205,7 @@ func runNotifyOverseer(cmd *cobra.Command, args []string) error {
 
 	label := slackForwardedLabel(now)
 	for _, ref := range refs {
-		if err := bd.Update(ref.ID, beads.UpdateOptions{AddLabels: []string{label}}); err != nil {
+		if err := ref.bd.Update(ref.ID, beads.UpdateOptions{AddLabels: []string{label}}); err != nil {
 			style.PrintWarning("posted, but failed to record forward on %s: %v", ref.ID, err)
 			continue
 		}

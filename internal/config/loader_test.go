@@ -6103,14 +6103,25 @@ func TestStripSlackRoutesReportsSeverities(t *testing.T) {
 	cfg := &EscalationConfig{Routes: map[string][]string{
 		SeverityCritical: {"bead", "slack"},
 		SeverityHigh:     {"bead", "mail:mayor"},
+		SeverityMedium:   {"bead", "mail:mayor", "slack"},
 		SeverityLow:      {"slack"},
 	}}
 	got := stripSlackRoutes(cfg)
-	if want := []string{SeverityLow, SeverityCritical}; !reflect.DeepEqual(got, want) {
+	if want := []string{SeverityLow, SeverityMedium, SeverityCritical}; !reflect.DeepEqual(got, want) {
 		t.Errorf("stripSlackRoutes() = %v, want %v", got, want)
 	}
-	if len(cfg.Routes[SeverityLow]) != 0 {
-		t.Errorf("Routes[low] = %v, want empty", cfg.Routes[SeverityLow])
+	// A route that loses slack must still reach the mayor, never go silent.
+	if want := []string{"mail:mayor"}; !reflect.DeepEqual(cfg.Routes[SeverityLow], want) {
+		t.Errorf("Routes[low] = %v, want %v", cfg.Routes[SeverityLow], want)
+	}
+	if want := []string{"bead", "mail:mayor"}; !reflect.DeepEqual(cfg.Routes[SeverityCritical], want) {
+		t.Errorf("Routes[critical] = %v, want %v", cfg.Routes[SeverityCritical], want)
+	}
+	if want := []string{"bead", "mail:mayor"}; !reflect.DeepEqual(cfg.Routes[SeverityMedium], want) {
+		t.Errorf("Routes[medium] = %v, want %v (mail:mayor must not be duplicated)", cfg.Routes[SeverityMedium], want)
+	}
+	if want := []string{"bead", "mail:mayor"}; !reflect.DeepEqual(cfg.Routes[SeverityHigh], want) {
+		t.Errorf("Routes[high] = %v, want %v (untouched)", cfg.Routes[SeverityHigh], want)
 	}
 
 	off := &EscalationConfig{SlackOverseerOnly: boolPtr(false), Routes: map[string][]string{SeverityCritical: {"bead", "slack"}}}

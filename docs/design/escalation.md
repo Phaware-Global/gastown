@@ -83,7 +83,9 @@ Slack is therefore reserved for the mayor's judgment:
 
 - `slack_overseer_only` defaults to `true` when the key is absent.
 - While it is `true`, `LoadEscalationConfig` strips every `slack` action from
-  `routes` and prints one warning per affected severity. `gt escalate` also
+  `routes` and prints one warning per affected severity. A route that loses a
+  `slack` action keeps (or gains) `mail:mayor`, so a suppressed route degrades
+  to the gatekeeper rather than to silence. `gt escalate` also
   gates the action at execution time and records
   `slack route suppressed: use gt notify-overseer for Slack (slack_overseer_only=true)`
   in the delivery status. The suppression is not a missing-contact skip, so it
@@ -164,9 +166,12 @@ gt notify-overseer -s "<subject>" --category <infra|ops|security> \
 - `--category` is required and limited to `infra`, `ops`, `security`. Product
   direction, stakeholder asks, feature scoping, PR reviews, and Jira decisions
   are rejected by construction — they belong in GitHub comments or Jira.
-- `--refs` resolves each bead (any prefix) and pulls its title into the brief;
-  an unknown ID fails the send. After a successful post each referenced bead
-  gets a `slack-forwarded:<UTC timestamp>` label as the audit trail.
+- `--refs` resolves each bead (any prefix, routed to its owning database) and
+  pulls its title into the brief; an unknown ID fails the send. Bead IDs and
+  titles are agent-written, so they are mrkdwn-escaped (`&`, `<`, `>`) before
+  posting; the mayor's subject and body are rendered as written. After a
+  successful post each referenced bead gets a `slack-forwarded:<UTC timestamp>`
+  label (in its own database) as the audit trail.
 - The mayor's operating rules (role template) require batching related
   escalations into one brief, waiting at least one check cycle or 30 minutes,
   and sending at most one brief per incident per hour.

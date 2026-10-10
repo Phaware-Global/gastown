@@ -75,12 +75,12 @@ func TestValidateNotifyOverseerCategory(t *testing.T) {
 }
 
 func TestValidateNotifyOverseerSender(t *testing.T) {
-	for _, ok := range []string{"mayor/", "overseer", ""} {
+	for _, ok := range []string{"mayor/", "mayor", "overseer"} {
 		if err := validateNotifyOverseerSender(ok); err != nil {
 			t.Errorf("validateNotifyOverseerSender(%q) = %v, want nil", ok, err)
 		}
 	}
-	for _, bad := range []string{"deacon/", "gastown/witness", "gastown/crew/dom", "gastown/polecats/toast"} {
+	for _, bad := range []string{"", "deacon/", "gastown/witness", "gastown/crew/dom", "gastown/polecats/toast", "gastown/mayor"} {
 		if err := validateNotifyOverseerSender(bad); err == nil || !strings.Contains(err.Error(), "restricted to the mayor") {
 			t.Errorf("validateNotifyOverseerSender(%q) = %v, want mayor-only rejection", bad, err)
 		}
@@ -115,6 +115,33 @@ func TestFormatOpsBrief(t *testing.T) {
 	// Must not look like the old per-escalation format.
 	if strings.Contains(got, "Escalation hq-") || strings.Contains(got, "🔴") {
 		t.Errorf("formatOpsBrief() must not reuse the per-escalation format, got:\n%s", got)
+	}
+}
+
+func TestFormatOpsBriefEscapesBeadContent(t *testing.T) {
+	now := time.Date(2026, 10, 10, 14, 5, 0, 0, time.UTC)
+	refs := []notifyOverseerRef{{ID: "hq-<evil>", Title: "<!channel> <https://evil.example/rotate|Rotate GitHub token here> & co"}}
+	got := formatOpsBrief(now, "security", "subject", "body", refs)
+	for _, raw := range []string{"<!channel>", "<https://evil.example", "hq-<evil>"} {
+		if strings.Contains(got, raw) {
+			t.Errorf("formatOpsBrief() leaked raw mrkdwn %q:\n%s", raw, got)
+		}
+	}
+	if !strings.Contains(got, "&lt;!channel&gt; &lt;https://evil.example/rotate|Rotate GitHub token here&gt; &amp; co") {
+		t.Errorf("formatOpsBrief() title not escaped as expected:\n%s", got)
+	}
+}
+
+func TestPostSlackWebhookRedactsWebhookURL(t *testing.T) {
+	err := postSlackWebhook("http://127.0.0.1:1/services/T000/B000/SECRETTOKEN", "hi")
+	if err == nil {
+		t.Fatal("expected connection error")
+	}
+	if strings.Contains(err.Error(), "SECRETTOKEN") || strings.Contains(err.Error(), "/services/") {
+		t.Errorf("error leaks webhook URL: %v", err)
+	}
+	if !strings.HasPrefix(err.Error(), "posting to slack: ") {
+		t.Errorf("error = %v, want posting to slack: prefix", err)
 	}
 }
 
