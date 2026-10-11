@@ -488,7 +488,12 @@ func (s *Service) streamExec(ctx context.Context, c *connState, sess *session, m
 	// assumption about how a terminal behaves at teardown.
 	if tty == nil {
 		pumps.Wait()
-	} else {
+	} else if !waitOrTimeout(&pumps, ptyDrainGrace) {
+		// Drain BEFORE closing. The agent's last output can still sit in the
+		// pty queue when Wait returns, and closing the master discards it — a
+		// fast `echo …; exit` then reached the launcher as nothing at all. With
+		// no descendant holding the slave, the pump reads that queue and then
+		// hits EIO on its own; only a lingering holder needs the close.
 		_ = tty.Close() // pollable, so this unblocks the pump's read
 		if !waitOrTimeout(&pumps, ptyDrainGrace) {
 			s.log.Warn("pty output pump did not drain; writing the exit frame anyway",
