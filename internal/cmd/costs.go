@@ -1186,9 +1186,10 @@ func runCostsRecord(cmd *cobra.Command, args []string) error {
 		// Same transcript as before: charge the growth since then. The clamp
 		// absorbs a total that shrank because the pricing table changed.
 		cost = math.Max(cumulative-entryCumulative(lastSame), 0)
-	case lastAny != nil && lastAny.Transcript == "" && !lastAny.Baseline:
-		// Previous entry predates transcript tracking: compare totals, and
-		// treat a drop as a new transcript whose whole total is new spend.
+	case lastAny != nil && lastAny.Transcript == "":
+		// Previous entry predates transcript tracking (or is a digest marker
+		// made from one): compare totals, and treat a drop as a new transcript
+		// whose whole total is new spend.
 		if prev := entryCumulative(lastAny); cumulative >= prev {
 			cost = cumulative - prev
 		}
@@ -1579,14 +1580,26 @@ func deleteSessionCostEntries(targetDate time.Time) (int, error) {
 	}
 
 	targetDay := targetDate.Format("2006-01-02")
+	lines := strings.Split(string(data), "\n")
+
+	// Pass 1: find each session's last entry on the target date. It becomes a
+	// baseline marker, kept in place so that file order stays chronological
+	// and entries recorded after the digested day still follow it.
+	lastOnDay := make(map[string]int)
+	for i, line := range lines {
+		var logEntry CostLogEntry
+		if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &logEntry); err != nil {
+			continue
+		}
+		if logEntry.EndedAt.Format("2006-01-02") == targetDay {
+			lastOnDay[logEntry.SessionID] = i
+		}
+	}
+
+	// Pass 2: drop the target date's entries, substituting the markers.
 	var keepLines []string
 	deletedCount := 0
-	lastDeleted := make(map[string]CostLogEntry)
-	var deletedSessions []string
-
-	// Filter out entries for target date
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
+	for i, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -1599,28 +1612,19 @@ func deleteSessionCostEntries(targetDate time.Time) (int, error) {
 			continue
 		}
 
-		// Remove entries from target date, remembering each session's last
-		// one: `gt costs record` needs it as the baseline for its next increment.
-		if logEntry.EndedAt.Format("2006-01-02") == targetDay {
-			deletedCount++
-			if _, seen := lastDeleted[logEntry.SessionID]; !seen {
-				deletedSessions = append(deletedSessions, logEntry.SessionID)
-			}
-			lastDeleted[logEntry.SessionID] = logEntry
+		if logEntry.EndedAt.Format("2006-01-02") != targetDay {
+			keepLines = append(keepLines, line)
 			continue
 		}
 
-		keepLines = append(keepLines, line)
-	}
-
-	if deletedCount == 0 {
-		return 0, nil
-	}
-
-	// Re-append one baseline marker per session: no spend, same total.
-	for _, sessionID := range deletedSessions {
-		marker := lastDeleted[sessionID]
-		total := entryCumulative(&marker)
+		deletedCount++
+		if lastOnDay[logEntry.SessionID] != i {
+			continue
+		}
+		// Baseline marker: no spend, same total, so the session's next
+		// `gt costs record` is charged only its growth from here.
+		total := entryCumulative(&logEntry)
+		marker := logEntry
 		marker.CostUSD = 0
 		marker.CumulativeUSD = &total
 		marker.Baseline = true
@@ -1630,6 +1634,10 @@ func deleteSessionCostEntries(targetDate time.Time) (int, error) {
 			return 0, fmt.Errorf("marshaling baseline entry: %w", err)
 		}
 		keepLines = append(keepLines, string(b))
+	}
+
+	if deletedCount == 0 {
+		return 0, nil
 	}
 
 	// Rewrite file without deleted entries

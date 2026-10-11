@@ -330,3 +330,67 @@ func TestQuerySessionCostEntries_CollapsesLegacyCumulativeRows(t *testing.T) {
 		t.Errorf("countDistinctSessions = %d, want 2", n)
 	}
 }
+
+func TestDeleteSessionCostEntries_YesterdayDigestKeepsTodayBaseline(t *testing.T) {
+	projectDir := setupRecordEnv(t)
+	oneTurn := calculateCost(&TokenUsage{Model: "claude-opus-5-5", InputTokens: 1000, OutputTokens: 100})
+	a := filepath.Join(projectDir, "session-a.jsonl")
+	yesterday := time.Now().Add(-24 * time.Hour)
+	base := time.Now().Add(-time.Hour)
+
+	// Yesterday: the session recorded a total of 5 turns.
+	five := 5 * oneTurn
+	writeCostLog(t, []CostLogEntry{{SessionID: "hq-mayor", Role: "mayor", CostUSD: five, CumulativeUSD: &five, Transcript: "session-a.jsonl", EndedAt: yesterday}})
+	writeTranscriptTurns(t, a, 5, base)
+
+	// Today: +2 and +1 are recorded while the session keeps running.
+	writeTranscriptTurns(t, a, 2, base.Add(1*time.Minute))
+	record(t, "record today 1")
+	writeTranscriptTurns(t, a, 1, base.Add(2*time.Minute))
+	record(t, "record today 2")
+
+	// The deacon digests yesterday, then one more turn is recorded.
+	if _, err := deleteSessionCostEntries(yesterday); err != nil {
+		t.Fatal(err)
+	}
+	writeTranscriptTurns(t, a, 1, base.Add(3*time.Minute))
+	record(t, "record after digest")
+
+	entries := readCostLog(t)
+	if len(entries) != 4 || !entries[0].Baseline {
+		t.Fatalf("got %d entries (first baseline=%v), want the marker first followed by 3 records", len(entries), len(entries) > 0 && entries[0].Baseline)
+	}
+	approxEqual(t, entries[3].CostUSD, oneTurn, "record after yesterday's digest")
+
+	dayEntries, err := querySessionCostEntries(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var total float64
+	for _, e := range dayEntries {
+		total += e.CostUSD
+	}
+	approxEqual(t, total, 4*oneTurn, "today's total after digesting yesterday")
+}
+
+func TestRunCostsRecord_LegacyDigestMarkerIsBaseline(t *testing.T) {
+	projectDir := setupRecordEnv(t)
+	oneTurn := calculateCost(&TokenUsage{Model: "claude-opus-5-5", InputTokens: 1000, OutputTokens: 100})
+	yesterday := time.Now().Add(-24 * time.Hour)
+
+	// Yesterday's only entry predates transcript tracking; digest it.
+	writeCostLog(t, []CostLogEntry{{SessionID: "hq-mayor", Role: "mayor", CostUSD: 5 * oneTurn, EndedAt: yesterday}})
+	if _, err := deleteSessionCostEntries(yesterday); err != nil {
+		t.Fatal(err)
+	}
+
+	// The transcript has grown by one turn since then.
+	writeTranscriptTurns(t, filepath.Join(projectDir, "session-a.jsonl"), 6, time.Now())
+	record(t, "record after legacy digest")
+
+	entries := readCostLog(t)
+	if len(entries) != 2 {
+		t.Fatalf("got %d entries, want marker + record", len(entries))
+	}
+	approxEqual(t, entries[1].CostUSD, oneTurn, "record after legacy digest marker")
+}
