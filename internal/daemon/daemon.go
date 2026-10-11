@@ -80,6 +80,11 @@ type Daemon struct {
 	// mayor/daemon.json. Checked by isPatrolActive alongside patrolConfig.
 	disabledPatrols map[string]bool
 
+	// Consecutive failed wisp_reaper Dog dispatches, and whether the one
+	// escalation for the current streak has been raised.
+	reaperDispatchFailures  int
+	reaperDispatchEscalated bool
+
 	// Mass death detection: track recent session deaths
 	deathsMu     sync.Mutex
 	recentDeaths []sessionDeath

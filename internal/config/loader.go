@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -2987,7 +2988,46 @@ func LoadEscalationConfig(path string) (*EscalationConfig, error) {
 		return nil, err
 	}
 
+	for _, severity := range stripSlackRoutes(&config) {
+		fmt.Fprintf(os.Stderr, "warning: %s: slack route for severity '%s' suppressed: use gt notify-overseer for Slack (slack_overseer_only=true)\n", path, severity)
+	}
+
 	return &config, nil
+}
+
+// stripSlackRoutes removes the "slack" action from every route when
+// slack_overseer_only is in effect, so gt escalate never posts to Slack on
+// its own. Any route that loses a slack action keeps (or gains) mail:mayor. Returns the severities that had a slack action stripped, in
+// ValidSeverities order, so the caller can warn the operator once per route.
+func stripSlackRoutes(c *EscalationConfig) []string {
+	if !c.IsSlackOverseerOnly() {
+		return nil
+	}
+	var stripped []string
+	for _, severity := range ValidSeverities() {
+		actions, ok := c.Routes[severity]
+		if !ok {
+			continue
+		}
+		kept := actions[:0:0]
+		for _, action := range actions {
+			if action == "slack" {
+				continue
+			}
+			kept = append(kept, action)
+		}
+		if len(kept) != len(actions) {
+			// A suppressed Slack route must degrade to the gatekeeper, not to
+			// silence: the mayor is now the only path to Slack, so make sure
+			// the escalation reaches the mayor's mailbox.
+			if !slices.Contains(kept, "mail:mayor") {
+				kept = append(kept, "mail:mayor")
+			}
+			c.Routes[severity] = kept
+			stripped = append(stripped, severity)
+		}
+	}
+	return stripped
 }
 
 // LoadOrCreateEscalationConfig loads the escalation config, creating a default if not found.

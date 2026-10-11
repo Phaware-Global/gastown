@@ -47,6 +47,8 @@ CONFIGURATION:
   Routing is configured in ~/gt/settings/escalation.json:
   - routes: Map severity to action lists (bead, mail:mayor, email:human, sms:human)
   - contacts: Human email/SMS for external notifications
+  - slack_overseer_only: true (default) reserves Slack for gt notify-overseer;
+    "slack" route actions are suppressed with a warning
   - stale_threshold: When unacked escalations are re-escalated (default: 4h)
   - max_reescalations: How many times to bump severity (default: 2)
 
@@ -77,16 +79,17 @@ Examples:
 }
 
 var escalateAckCmd = &cobra.Command{
-	Use:   "ack <escalation-id>",
-	Short: "Acknowledge an escalation",
+	Use:   "ack <escalation-id> [<escalation-id>...]",
+	Short: "Acknowledge one or more escalations",
 	Long: `Acknowledge an escalation to indicate you're working on it.
 
 Adds an "acked" label and records who acknowledged and when.
 This stops the stale escalation warnings.
 
 Examples:
-  gt escalate ack hq-abc123`,
-	Args: cobra.ExactArgs(1),
+  gt escalate ack hq-abc123
+  gt escalate ack hq-abc123 hq-def456   # Ack several at once (e.g. from an ops brief)`,
+	Args: cobra.MinimumNArgs(1),
 	RunE: runEscalateAck,
 }
 

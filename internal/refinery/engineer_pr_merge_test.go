@@ -491,7 +491,7 @@ func TestDoMerge_PRStrategy_RoutesToPRPath(t *testing.T) {
 	// Create a feature branch
 	createFeatureBranch(t, workDir, "feat/test-pr", "test.txt", "hello")
 
-	result := e.doMerge(context.Background(), "feat/test-pr", "main", "gt-test")
+	result := e.doMerge(context.Background(), "gt-mr-test", "feat/test-pr", "main", "gt-test")
 
 	if result.Success {
 		t.Error("expected failure (no GitHub PR exists)")
@@ -511,7 +511,7 @@ func TestDoMerge_DirectStrategy_SkipsPRPath(t *testing.T) {
 
 	createFeatureBranch(t, workDir, "feat/test-direct", "test.txt", "hello")
 
-	result := e.doMerge(context.Background(), "feat/test-direct", "main", "gt-test")
+	result := e.doMerge(context.Background(), "gt-mr-test", "feat/test-direct", "main", "gt-test")
 
 	// Should succeed with direct merge
 	if !result.Success {
@@ -531,7 +531,7 @@ func TestDoMergePR_NoPR_ReturnsError(t *testing.T) {
 
 	createFeatureBranch(t, workDir, "feat/no-pr", "test.txt", "hello")
 
-	result := e.doMergePR(context.Background(), "feat/no-pr", "main")
+	result := e.doMergePR(context.Background(), "", "feat/no-pr", "main")
 
 	if result.Success {
 		t.Error("expected failure when no PR exists")
@@ -710,7 +710,7 @@ func TestDoMergePR_UnresolvedThreads_ShortCircuits(t *testing.T) {
 	}
 	e.prProvider = provider
 
-	result := e.doMergePR(context.Background(), "feat/with-threads", "main")
+	result := e.doMergePR(context.Background(), "", "feat/with-threads", "main")
 
 	if result.Success {
 		t.Errorf("expected Success=false when threads block, got Success=true")
@@ -816,5 +816,212 @@ func TestDoMergePR_RequireReview_NoApproval(t *testing.T) {
 	if _, err := gitpkg.NewGit(t.TempDir()).FindPRNumber("nonexistent"); err != nil {
 		// gh CLI not available or not authenticated — test the config path only
 		t.Skip("gh CLI not available for PR approval testing")
+	}
+}
+
+// --- gt-wgmf P0: never push without review_pr under merge_strategy=pr ---
+
+// TestDoMerge_RefusesDirectPushWhenRigSettingsRequirePR is the regression
+// test for the incident this bead records: an MR without review_pr landed
+// on the default branch via a direct push even though the rig's settings
+// declared merge_strategy=pr. e.config.MergeStrategy is left at its stale/
+// never-loaded zero value here (simulating exactly that failure — a caller
+// that forgot LoadConfig, or loaded it before the rig's settings changed)
+// while the rig's settings/config.json on disk says "pr". doMerge must
+// refuse the squash+push and report ReviewPRMissing, not silently push.
+func TestDoMerge_RefusesDirectPushWhenRigSettingsRequirePR(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.MergeStrategy = "" // stale/never-loaded — the bug this guards against
+
+	createFeatureBranch(t, workDir, "feat/no-review-pr", "test.txt", "hello")
+
+	// Written AFTER createFeatureBranch (which ends back on main): writing
+	// it first would get swept into the feature-branch commit by that
+	// helper's `git add .` and then deleted from the working tree by its
+	// final `git checkout main`, since main's tree never had it.
+	writeRigSettingsMergeStrategy(t, workDir, "pr")
+
+	result := e.doMerge(context.Background(), "gt-mr-missing", "feat/no-review-pr", "main", "gt-test")
+
+	if result.Success {
+		t.Fatal("expected refusal, got Success=true — pushed to main without review_pr")
+	}
+	if !result.ReviewPRMissing {
+		t.Errorf("expected ReviewPRMissing=true, got false. Result: %+v", result)
+	}
+	if !strings.Contains(result.Error, "review_pr") {
+		t.Errorf("expected error to mention review_pr, got: %s", result.Error)
+	}
+
+	// The feature commit must not have landed on main.
+	out := run(t, workDir, "git", "log", "main", "--oneline")
+	if strings.Contains(out, "add test.txt") {
+		t.Errorf("feature commit landed on main despite refusal: %s", out)
+	}
+}
+
+// TestDoMerge_AllowsDirectPushWhenRigSettingsSayDirect is the control case:
+// when the rig's settings genuinely declare merge_strategy=direct (or omit
+// merge_queue entirely), the same in-memory MergeStrategy="" must NOT be
+// treated as suspicious — direct-strategy rigs are supposed to push
+// directly with no PR. Guards against the new check over-firing.
+func TestDoMerge_AllowsDirectPushWhenRigSettingsSayDirect(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.MergeStrategy = ""
+
+	createFeatureBranch(t, workDir, "feat/direct-ok", "test.txt", "hello")
+	writeRigSettingsMergeStrategy(t, workDir, "direct")
+
+	result := e.doMerge(context.Background(), "gt-mr-direct", "feat/direct-ok", "main", "gt-test")
+
+	if !result.Success {
+		t.Errorf("expected direct merge to succeed, got error: %s", result.Error)
+	}
+	if result.ReviewPRMissing {
+		t.Error("ReviewPRMissing should not fire for a genuinely direct-strategy rig")
+	}
+}
+
+// TestDoMerge_RefusalOnlyGuardsDefaultBranch confirms the new check is
+// scoped to the rig's default branch: pushing a completed piece of an
+// integration/epic branch (target != default) is unaffected even when the
+// rig's settings say merge_strategy=pr, since that policy governs landing
+// on the default branch, not intermediate integration targets.
+func TestDoMerge_RefusalOnlyGuardsDefaultBranch(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	e.config.MergeStrategy = ""
+
+	// Integration branch target, distinct from "main".
+	run(t, workDir, "git", "checkout", "-b", "integration/epic", "main")
+	run(t, workDir, "git", "checkout", "main")
+
+	createFeatureBranch(t, workDir, "feat/into-integration", "test.txt", "hello")
+	writeRigSettingsMergeStrategy(t, workDir, "pr")
+
+	result := e.doMerge(context.Background(), "gt-mr-integration", "feat/into-integration", "integration/epic", "gt-test")
+
+	if result.ReviewPRMissing {
+		t.Errorf("ReviewPRMissing should not fire for a non-default target branch. Result: %+v", result)
+	}
+	if !result.Success {
+		t.Errorf("expected merge into integration branch to succeed, got error: %s", result.Error)
+	}
+}
+
+// writeRigSettingsMergeStrategy writes <rigPath>/settings/config.json with
+// the given merge_strategy, matching the on-disk shape LoadConfig expects.
+// A "pr" strategy carries a pr_approver so the config is validly loadable
+// (LoadConfig requires one for merge_strategy=pr) — the test scenario is a
+// genuinely well-configured PR-mode rig with a stale in-memory snapshot,
+// not a malformed-config edge case (that's covered separately by the
+// fail-closed contract documented on rigActuallyRequiresPRStrategy).
+func writeRigSettingsMergeStrategy(t *testing.T, rigPath, mergeStrategy string) {
+	t.Helper()
+	settingsDir := filepath.Join(rigPath, "settings")
+	if err := os.MkdirAll(settingsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	mq := map[string]interface{}{
+		"merge_strategy": mergeStrategy,
+	}
+	if mergeStrategy == "pr" {
+		mq["pr_approver"] = "test-approver"
+	}
+	settings := map[string]interface{}{
+		"type":        "rig-settings",
+		"version":     1,
+		"merge_queue": mq,
+	}
+	data := mustMarshalIndent(t, settings)
+	if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPopulateReviewPR_RefusesNonPositivePRNumber is a pure/zero-dependency
+// guard test: populateReviewPR must reject a non-positive PR number before
+// touching beads at all (a zero-valued Engineer has no working beads
+// client, so reaching past this guard would panic rather than error).
+func TestPopulateReviewPR_RefusesNonPositivePRNumber(t *testing.T) {
+	e := &Engineer{}
+	if err := e.populateReviewPR("gt-mr-1", 0); err == nil {
+		t.Fatal("expected error for non-positive prNumber, got nil")
+	}
+}
+
+// populatingFakeProvider is a minimal PRProvider fake for
+// TestDoMergePR_PopulatesReviewPRWhenMissing: FindPRNumber succeeds, then an
+// unresolved thread short-circuits before any merge attempt, so the test
+// only needs to prove the review_pr write-back happens — not exercise a
+// full merge.
+type populatingFakeProvider struct {
+	prNumber int
+}
+
+func (f *populatingFakeProvider) FindPRNumber(string) (int, error) { return f.prNumber, nil }
+func (f *populatingFakeProvider) UnresolvedThreads(int) ([]ReviewThread, error) {
+	return []ReviewThread{{ID: "t1", IsResolved: false}}, nil
+}
+func (f *populatingFakeProvider) MergePR(int, string) (string, error) {
+	panic("MergePR called — unresolved-threads gate should have short-circuited first")
+}
+func (f *populatingFakeProvider) IsPRApproved(int) (bool, error)                  { return false, nil }
+func (f *populatingFakeProvider) IsPRApprovedBy(int, string) (bool, error)        { return false, nil }
+func (f *populatingFakeProvider) CountApprovals(int) (int, error)                 { return 0, nil }
+func (f *populatingFakeProvider) CreatePR(CreatePROptions) (int, string, error)   { return 0, "", nil }
+func (f *populatingFakeProvider) RequestReview(int, []string) error               { return nil }
+func (f *populatingFakeProvider) ChangesRequestedReviewers(int) ([]string, error) { return nil, nil }
+func (f *populatingFakeProvider) AllThreads(int) ([]ReviewThread, error)          { return nil, nil }
+func (f *populatingFakeProvider) ChecksRollup(int) (string, bool, error)          { return "", true, nil }
+func (f *populatingFakeProvider) PostComment(int, string) error                   { return nil }
+func (f *populatingFakeProvider) HasReviewFrom(int, string) (bool, error)         { return false, nil }
+func (f *populatingFakeProvider) ListReviewAuthors(int) ([]string, error)         { return nil, nil }
+func (f *populatingFakeProvider) HasReviewFromOnSHA(int, string, string) (bool, error) {
+	return false, nil
+}
+func (f *populatingFakeProvider) CurrentHeadSHA(int) (string, error)        { return "", nil }
+func (f *populatingFakeProvider) CreatedAt(int) (time.Time, error)          { return time.Time{}, nil }
+func (f *populatingFakeProvider) SubmitReview(int, SubmitReviewInput) error { return nil }
+func (f *populatingFakeProvider) DismissChangesRequestedReviews(int, string, string) error {
+	return nil
+}
+
+// TestDoMergePR_PopulatesReviewPRWhenMissing is the regression test for the
+// other half of gt-wgmf: once a PR is confirmed to exist for the branch,
+// its number must be persisted onto the MR bead's review_pr field even
+// though the merge itself doesn't complete this cycle (blocked on unresolved
+// threads here). Requires a real beads store — needs Docker for the Dolt
+// test container; skips if bd init fails in this environment (see
+// reference_bd_init_metrics_notice_skips_tests memory: a SKIP here can mean
+// the environment, not the code, so check for SKIP explicitly with -v
+// rather than trusting a bare PASS).
+func TestDoMergePR_PopulatesReviewPRWhenMissing(t *testing.T) {
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+
+	b := newDoltBeads(t)
+	e.beads = b
+
+	createFeatureBranch(t, workDir, "feat/populate", "test.txt", "hello")
+
+	mrIssue := createMRBead(t, b, "branch: feat/populate\ntarget: main\nsource_issue: gt-test")
+
+	e.prProvider = &populatingFakeProvider{prNumber: 77}
+
+	result := e.doMergePR(context.Background(), mrIssue.ID, "feat/populate", "main")
+	if !result.NeedsReviewResolution {
+		t.Fatalf("expected NeedsReviewResolution=true (unresolved thread gate), got: %+v", result)
+	}
+
+	updated, err := b.Show(mrIssue.ID)
+	if err != nil {
+		t.Fatalf("re-reading MR bead: %v", err)
+	}
+	fields := beads.ParseMRFields(updated)
+	if fields == nil || fields.ReviewPR != 77 {
+		t.Fatalf("expected review_pr=77 populated on MR bead %s, got fields=%+v", mrIssue.ID, fields)
 	}
 }
