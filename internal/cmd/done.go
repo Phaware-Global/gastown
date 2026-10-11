@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/checkpoint"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
@@ -1080,6 +1081,12 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				style.PrintWarning("%s", reason)
 				goto notifyWitness
 			}
+			if reason := refuseWIPCommitPush(g, branch, unverifiedGuardProtectedBranches); reason != "" {
+				pushFailed = true
+				doneErrors = append(doneErrors, reason)
+				style.PrintWarning("%s", reason)
+				goto notifyWitness
+			}
 			// Push submodule changes before direct push (gt-dzs)
 			pushSubmoduleChanges(g, defaultBranch)
 			directRefspec := branch + ":" + defaultBranch
@@ -1155,6 +1162,12 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// cycle can have left an unverified commit on a now-clean branch
 		// (PR #184 review).
 		if reason := refuseUnverifiedPush(g, unverifiedGuardProtectedBranches); reason != "" {
+			pushFailed = true
+			doneErrors = append(doneErrors, reason)
+			style.PrintWarning("%s", reason)
+			goto notifyWitness
+		}
+		if reason := refuseWIPCommitPush(g, branch, unverifiedGuardProtectedBranches); reason != "" {
 			pushFailed = true
 			doneErrors = append(doneErrors, reason)
 			style.PrintWarning("%s", reason)
@@ -1661,6 +1674,12 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			fmt.Printf("  Convoy: %s\n", convoyInfo.ID)
 
 			if reason := refuseUnverifiedPush(g, unverifiedGuardProtectedBranches); reason != "" {
+				pushFailed = true
+				doneErrors = append(doneErrors, reason)
+				style.PrintWarning("%s", reason)
+				goto notifyWitness
+			}
+			if reason := refuseWIPCommitPush(g, branch, unverifiedGuardProtectedBranches); reason != "" {
 				pushFailed = true
 				doneErrors = append(doneErrors, reason)
 				style.PrintWarning("%s", reason)
@@ -2864,6 +2883,24 @@ func refuseUnverifiedPush(g *git.Git, protectedBranches []string) string {
 	}
 	if badSHA != "" {
 		return fmt.Sprintf("commit %s was made with pre-commit hooks bypassed (Gastown-Unverified) and never verified — refusing to push it to origin. Resolve the hook failure, rewrite the marked commit so hooks re-run (e.g. `git commit --amend` / `git rebase -i`), then re-run gt done", badSHA[:8])
+	}
+	return ""
+}
+
+// refuseWIPCommitPush returns a non-empty, operator-facing reason when branch
+// (the ref about to be pushed) carries a checkpoint auto-save (WIP) commit —
+// one that was only ever meant to live on the preservation ref, never on a
+// real branch. Defense in depth alongside AutoPreserveUncommittedWork's
+// Ephemeral mode (the primary fix, which never puts such a commit on the
+// branch): this catches one that got there anyway, e.g. from a worktree that
+// predates the Ephemeral fix.
+func refuseWIPCommitPush(g *git.Git, branch string, protectedBranches []string) string {
+	badSHA, err := git.HasWIPCommit(g, "origin", "refs/heads/"+branch, checkpoint.WIPCommitPrefix, protectedBranches)
+	if err != nil {
+		return fmt.Sprintf("could not check the branch for checkpoint auto-save commits — refusing to push until it can be verified: %v", err)
+	}
+	if badSHA != "" {
+		return fmt.Sprintf("commit %s is a checkpoint auto-save commit (%q) — refusing to push it to origin as part of the real branch. Drop just that commit non-interactively with `git rebase --onto %s^ %s` (or, if it is the branch tip, `git reset --soft HEAD~1` un-commits it and keeps its changes), then re-run gt done", badSHA[:8], checkpoint.WIPCommitPrefix, badSHA[:8], badSHA[:8])
 	}
 	return ""
 }
