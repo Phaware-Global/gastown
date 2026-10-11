@@ -746,6 +746,21 @@ func TestFormatMailBody_WithRunScript(t *testing.T) {
 	if strings.Contains(body, "## Instructions") {
 		t.Error("expected mail body to NOT contain markdown instructions section")
 	}
+	assertReceiptInstruction(t, body, "test-plugin")
+}
+
+// assertReceiptInstruction checks that the fallback receipt command is complete
+// enough to run as written: bd create requires a title, and dogs that follow
+// the text literally fail and retry when it is missing.
+func assertReceiptInstruction(t *testing.T, body, pluginName string) {
+	t.Helper()
+	want := "`bd create --ephemeral --silent --title=\"plugin-run: " + pluginName + "\" -l type:plugin-run,plugin:" + pluginName + ",result:<outcome>`"
+	if !strings.Contains(body, want) {
+		t.Errorf("expected mail body to contain the full receipt command %s\n got body:\n%s", want, body)
+	}
+	if !strings.Contains(body, "`bd close <id>`") {
+		t.Error("expected mail body to tell the dog to close the receipt by ID")
+	}
 }
 
 func TestParsePluginMD_ExecWrapper(t *testing.T) {
@@ -921,4 +936,5 @@ func TestFormatMailBody_WithoutRunScript(t *testing.T) {
 	if strings.Contains(body, "bash run.sh") {
 		t.Error("expected mail body to NOT contain run.sh command")
 	}
+	assertReceiptInstruction(t, body, "test-plugin")
 }
