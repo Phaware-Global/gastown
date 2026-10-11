@@ -2,6 +2,7 @@ package git
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -76,19 +77,55 @@ type PreserveOptions struct {
 	// self-exemption once the checked branch was itself pushed). Empty
 	// means the scan fails closed rather than guessing a baseline.
 	ProtectedBranches []string
+
+	// Ephemeral, when true, snapshots the uncommitted TRACKED changes with
+	// `git stash create` (which builds a commit without touching HEAD, the
+	// index or the working tree, and runs no hooks) and records it under a
+	// LOCAL ref, LocalPreservationRefName(branch) = refs/gt/preserve/<branch>.
+	//
+	// Guarantees: nothing is ever pushed (Push, Remote and ProtectedBranches are
+	// ignored); the ref lives in the shared common git dir so it survives
+	// `git worktree remove`; HEAD, the branch ref, the index, the working tree
+	// and sequencer state are untouched; a snapshot is taken even while a
+	// merge, cherry-pick, revert or rebase is in progress (it reads no
+	// sequencer state), but it refuses when any path is unmerged; an unchanged
+	// dirty tree is not re-recorded each cycle; a detached HEAD keeps one ref
+	// across cycles, and a clean detached HEAD whose commits no branch or
+	// remote-tracking ref reaches is pinned to that ref so they outlive the
+	// worktree.
+	//
+	// Does not: capture untracked files, or preserve the agent's own committed
+	// work on a branch (that lives on its branch ref). ExtraExcludePaths is ignored — the
+	// tracked-file allowlist existed to keep unattended PUSHES safe, and nothing
+	// leaves the machine now.
+	//
+	// Root fix for gt-94p1/gt-2stz: a periodic safety-net commit made ON the
+	// branch (checkpoint_dog, pre-removal preserve) rode along with any later
+	// ordinary push of that branch onto a real, possibly already-reviewed PR
+	// branch (graphql-api #162/#166, gastown #250/#251). Committed reports that
+	// a snapshot was recorded, not that the branch advanced; Pushed is always
+	// false; Ref is the local ref.
+	//
+	// Leave false for a caller where the commit IS the polecat's real work and
+	// a normal push of the branch follows in the same flow (gt done).
+	Ephemeral bool
 }
 
 // PreserveResult reports what AutoPreserveUncommittedWork actually did.
 type PreserveResult struct {
-	// Committed is true if a new auto-save commit was created.
+	// Committed is true if a new auto-save commit was created. Under
+	// Ephemeral that commit is a snapshot recorded on the preservation ref
+	// (or a local refs/preserve ref), never on the branch.
 	Committed bool
-	// Pushed is true if HEAD was pushed to the preservation ref and the
+	// Pushed is true if the commit was pushed to the preservation ref and the
 	// push was verified against the remote tip.
 	Pushed bool
-	// Commit is the HEAD SHA after the call, set whenever Committed or
-	// Pushed is true.
+	// Commit is the SHA that was preserved (HEAD, or the Ephemeral snapshot),
+	// set whenever Committed or Pushed is true.
 	Commit string
-	// Ref is the preservation ref HEAD was pushed to, set when Pushed.
+	// Ref is the preservation ref: the remote ref HEAD was pushed to when
+	// Pushed, or the LOCAL ref (refs/gt/preserve/...) an Ephemeral snapshot was
+	// recorded under.
 	Ref string
 
 	// HooksFailed is true when the auto-save commit could only be made by
@@ -119,6 +156,16 @@ type PreserveResult struct {
 func PreservationRefName(branch string) string {
 	sanitized := strings.NewReplacer("/", "-", " ", "-").Replace(branch)
 	return "polecat/preserve-" + sanitized
+}
+
+// LocalPreservationRefName returns the LOCAL ref an Ephemeral snapshot of
+// branch is recorded under: refs/gt/preserve/<sanitized branch>. Refs outside
+// refs/worktree/ live in the repository's common git dir, shared by every
+// worktree, so the snapshot survives `git worktree remove` of the worktree it
+// was taken in. Never pushed anywhere (gt-94p1).
+func LocalPreservationRefName(branch string) string {
+	sanitized := strings.NewReplacer("/", "-", " ", "-").Replace(branch)
+	return "refs/gt/preserve/" + sanitized
 }
 
 // detachedPreservationIdentity returns a value unique to the calling
@@ -158,6 +205,10 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 	}
 	if IsProtectedBranch(branch) {
 		return result, fmt.Errorf("refusing to auto-preserve uncommitted work on protected branch %q (G41 guard)", branch)
+	}
+
+	if opts.Ephemeral {
+		return autoPreserveEphemeral(g, branch, opts)
 	}
 
 	status, err := g.CheckUncommittedWork()
@@ -357,13 +408,8 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 	// Push:true path let a prior cycle's unverified commit straight through
 	// to the shared remote (PR #184 review). Skipped when this very call
 	// already set HooksFailed: its own commit carries the trailer.
-	if !result.HooksFailed {
-		if badSHA, chkErr := hasUnverifiedCommit(g, remote, head, opts.ProtectedBranches); chkErr != nil {
-			return result, fmt.Errorf("checking for a prior unverified commit: %w", chkErr)
-		} else if badSHA != "" {
-			result.HooksFailed = true
-			result.HookOutput = fmt.Sprintf("commit %s bypassed pre-commit hooks (%s) and was never verified — refusing to publish until resolved. To clear it: verify the work, then rewrite the marked commit so hooks re-run and the trailer is dropped (e.g. `git commit --amend`, or `git rebase -i` for older commits)", shortSHA(badSHA), unverifiedCommitTrailer)
-		}
+	if err := markPriorUnverifiedCommit(g, remote, head, opts.ProtectedBranches, result); err != nil {
+		return result, err
 	}
 
 	if !opts.Push {
@@ -379,30 +425,9 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 		return result, nil
 	}
 
-	// A detached HEAD reports as literal "HEAD" from `git rev-parse
-	// --abbrev-ref HEAD`, not "". It is the normal idle state for a
-	// polecat worktree, not an exotic one, so collapsing every detached
-	// worktree onto the same "polecat/preserve-HEAD" ref is a real
-	// collision risk, not a theoretical one. Derive a ref unique to this
-	// polecat instead (gt-i4ej FIX 3).
-	refBranch := branch
-	if branch == "HEAD" {
-		identity, idErr := detachedPreservationIdentity(g, opts.IssueID)
-		if idErr != nil {
-			return result, fmt.Errorf("cannot derive a unique preservation ref for detached HEAD: %w", idErr)
-		}
-		// Identity + the first commit this worktree added past the remote
-		// default branch. Stable across repeated checkpoints of one
-		// assignment (later checkpoints stack on top of the same first
-		// commit), so the ref force-pushes over its own prior state instead
-		// of minting a brand-new permanent remote branch every cycle
-		// (PR #184 review, round 3). But polecat names are a recycled pool:
-		// identity alone made the ref a function of the NAME, so the next
-		// bead assigned to it force-pushed over the previous bead's only
-		// preserved copy — the divergence anchor changes across
-		// assignments, so each assignment gets its own ref (PR #184
-		// review, round 4).
-		refBranch = "detached-" + identity + "-" + shortSHA(divergenceAnchor(g, remote, head))
+	refName, refErr := preservationRefFor(g, branch, remote, head, opts.IssueID)
+	if refErr != nil {
+		return result, refErr
 	}
 
 	// Skip the push only when we're certain there's nothing new to preserve.
@@ -416,7 +441,7 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 	// the "committed but never pushed, worktree about to vanish" case this
 	// function exists to catch.
 	if !result.Committed {
-		if tip, err := g.PushRemoteBranchTip(remote, PreservationRefName(refBranch)); err == nil && tip == head {
+		if tip, err := g.PushRemoteBranchTip(remote, refName); err == nil && tip == head {
 			return result, nil
 		}
 		if status.UnpushedCommits == 0 {
@@ -424,7 +449,6 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 		}
 	}
 
-	refName := PreservationRefName(refBranch)
 	if err := g.Push(remote, "HEAD:refs/heads/"+refName, true); err != nil {
 		return result, fmt.Errorf("pushing preservation ref %s: %w", refName, err)
 	}
@@ -435,6 +459,219 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 	result.Ref = refName
 	result.Commit = head
 	return result, nil
+}
+
+// markPriorUnverifiedCommit sets result.HooksFailed/HookOutput when head's
+// ancestry holds a commit that bypassed pre-commit hooks — see
+// unverifiedCommitTrailer. A no-op when result.HooksFailed is already set.
+func markPriorUnverifiedCommit(g *Git, remote, head string, protectedBranches []string, result *PreserveResult) error {
+	if result.HooksFailed {
+		return nil
+	}
+	badSHA, err := hasUnverifiedCommit(g, remote, head, protectedBranches)
+	if err != nil {
+		return fmt.Errorf("checking for a prior unverified commit: %w", err)
+	}
+	if badSHA != "" {
+		result.HooksFailed = true
+		result.HookOutput = fmt.Sprintf("commit %s bypassed pre-commit hooks (%s) and was never verified — refusing to publish until resolved. To clear it: verify the work, then rewrite the marked commit so hooks re-run and the trailer is dropped (e.g. `git commit --amend`, or `git rebase -i` for older commits)", shortSHA(badSHA), unverifiedCommitTrailer)
+	}
+	return nil
+}
+
+// preservationRefFor returns the preservation ref name for branch.
+// anchorHead is the commit the detached-HEAD ref is anchored on: the current
+// HEAD for the commit-on-branch path, and the PRE-snapshot HEAD for an
+// Ephemeral call (which never advances HEAD, so the anchor — and therefore
+// the ref — stays stable across cycles).
+func preservationRefBranch(g *Git, branch, remote, anchorHead, issueID string) (string, error) {
+	// A detached HEAD reports as literal "HEAD" from `git rev-parse
+	// --abbrev-ref HEAD`, not "". It is the normal idle state for a
+	// polecat worktree, not an exotic one, so collapsing every detached
+	// worktree onto the same "polecat/preserve-HEAD" ref is a real
+	// collision risk, not a theoretical one. Derive a ref unique to this
+	// polecat instead (gt-i4ej FIX 3).
+	refBranch := branch
+	if branch == "HEAD" {
+		identity, idErr := detachedPreservationIdentity(g, issueID)
+		if idErr != nil {
+			return "", fmt.Errorf("cannot derive a unique preservation ref for detached HEAD: %w", idErr)
+		}
+		// Identity + the first commit this worktree added past the remote
+		// default branch. Stable across repeated checkpoints of one
+		// assignment (later checkpoints stack on top of the same first
+		// commit), so the ref force-pushes over its own prior state instead
+		// of minting a brand-new permanent remote branch every cycle
+		// (PR #184 review, round 3). But polecat names are a recycled pool:
+		// identity alone made the ref a function of the NAME, so the next
+		// bead assigned to it force-pushed over the previous bead's only
+		// preserved copy — the divergence anchor changes across
+		// assignments, so each assignment gets its own ref (PR #184
+		// review, round 4).
+		refBranch = "detached-" + identity + "-" + shortSHA(divergenceAnchor(g, remote, anchorHead))
+	}
+	return refBranch, nil
+}
+
+// preservationRefFor returns the remote preservation ref name for branch.
+func preservationRefFor(g *Git, branch, remote, anchorHead, issueID string) (string, error) {
+	refBranch, err := preservationRefBranch(g, branch, remote, anchorHead, issueID)
+	if err != nil {
+		return "", err
+	}
+	return PreservationRefName(refBranch), nil
+}
+
+// snapshotGitEnv is the environment for git reads of the REAL repo state made
+// by an Ephemeral preserve. GIT_OPTIONAL_LOCKS=0 stops git from opportunistically
+// refreshing (rewriting) the real index as a side effect of a read, so the
+// snapshot leaves .git/index byte-identical.
+var snapshotGitEnv = []string{"GIT_OPTIONAL_LOCKS=0"}
+
+// autoPreserveEphemeral is the Ephemeral implementation of
+// AutoPreserveUncommittedWork (see PreserveOptions.Ephemeral): `git stash
+// create` builds a commit of the tracked changes without touching HEAD, the
+// index or the working tree and runs no hooks, and update-ref records it under
+// a LOCAL ref. Nothing is ever pushed.
+func autoPreserveEphemeral(g *Git, branch string, opts PreserveOptions) (*PreserveResult, error) {
+	result := &PreserveResult{}
+	remote := opts.Remote
+	if remote == "" {
+		remote = "origin"
+	}
+
+	head, err := g.Rev("HEAD")
+	if err != nil {
+		return result, fmt.Errorf("ephemeral preserve requires a resolvable HEAD: %w", err)
+	}
+
+	// An unresolved conflict would put conflict markers into the snapshot.
+	unmerged, err := g.runWithEnv([]string{"ls-files", "-u", "-z"}, snapshotGitEnv)
+	if err != nil {
+		return result, fmt.Errorf("checking for unmerged paths: %w", err)
+	}
+	if unmerged != "" {
+		var paths []string
+		for _, rec := range strings.Split(unmerged, "\x00") {
+			if _, p, ok := strings.Cut(rec, "\t"); ok {
+				paths = append(paths, p)
+			}
+		}
+		return result, fmt.Errorf("cannot auto-preserve unmerged conflicts: %s", strings.Join(paths, ", "))
+	}
+
+	msg := opts.CommitMessage
+	if msg == "" {
+		msg = "gt preserve snapshot of uncommitted work"
+	}
+	// stash create refreshes and rewrites the index it is given, so give it a
+	// COPY: the agent's real index (and its index.lock) is never touched, and a
+	// concurrent `git add` by the live agent cannot collide with the daemon.
+	env, cleanup, err := scratchIndexEnv(g)
+	if err != nil {
+		return result, err
+	}
+	defer cleanup()
+	sha, err := g.runWithEnv([]string{"stash", "create", msg}, env)
+	if err != nil {
+		return result, fmt.Errorf("creating snapshot: %w", err)
+	}
+	// Anchored on head, not the snapshot: head never moves under Ephemeral, so
+	// a detached worktree keeps one ref across cycles until the agent makes its
+	// own first commit.
+	refBranch, err := preservationRefBranch(g, branch, remote, head, opts.IssueID)
+	if err != nil {
+		return result, err
+	}
+	ref := LocalPreservationRefName(refBranch)
+
+	if sha == "" {
+		// Clean tree. A detached HEAD's own commits may be reachable from no
+		// branch at all; only the worktree's HEAD holds them, and removing the
+		// worktree would orphan them. Pin HEAD so they outlive it.
+		if branch == "HEAD" {
+			return pinUnreachableHead(g, head, ref, result)
+		}
+		return result, nil // no tracked changes
+	}
+
+	// The dirty tree hasn't changed since the last cycle: the snapshot is
+	// stamped with the wall clock, so recording it again would just churn.
+	if cur, curErr := g.runWithEnv([]string{"rev-parse", "--verify", "-q", ref}, snapshotGitEnv); curErr == nil && cur != "" && snapshotMatches(g, cur, sha) {
+		return result, nil
+	}
+
+	if _, err := g.run("update-ref", ref, sha); err != nil {
+		return result, fmt.Errorf("recording snapshot %s: %w", shortSHA(sha), err)
+	}
+	result.Committed = true
+	result.Commit = sha
+	result.Ref = ref
+	return result, nil
+}
+
+// pinUnreachableHead records head under ref when no branch or remote-tracking
+// ref reaches it and ref does not already hold it.
+func pinUnreachableHead(g *Git, head, ref string, result *PreserveResult) (*PreserveResult, error) {
+	out, err := g.runWithEnv([]string{"for-each-ref", "--contains", head, "--count=1", "--format=%(refname)", "refs/heads/", "refs/remotes/"}, snapshotGitEnv)
+	if err != nil {
+		return result, fmt.Errorf("checking whether HEAD is reachable from a branch: %w", err)
+	}
+	if out != "" {
+		return result, nil
+	}
+	if cur, curErr := g.runWithEnv([]string{"rev-parse", "--verify", "-q", ref}, snapshotGitEnv); curErr == nil && cur == head {
+		return result, nil
+	}
+	if _, err := g.run("update-ref", ref, head); err != nil {
+		return result, fmt.Errorf("recording detached HEAD %s: %w", shortSHA(head), err)
+	}
+	result.Committed = true
+	result.Commit = head
+	result.Ref = ref
+	return result, nil
+}
+
+// scratchIndexEnv returns the environment for a git command that must not
+// write the real index: GIT_INDEX_FILE pointing at a private copy of it.
+func scratchIndexEnv(g *Git) ([]string, func(), error) {
+	noop := func() {}
+	p, err := g.runWithEnv([]string{"rev-parse", "--git-path", "index"}, snapshotGitEnv)
+	if err != nil {
+		return nil, noop, fmt.Errorf("locating index: %w", err)
+	}
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(g.WorkDir(), p)
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return nil, noop, fmt.Errorf("reading index: %w", err)
+	}
+	tmpDir, err := os.MkdirTemp("", "gt-preserve-index-")
+	if err != nil {
+		return nil, noop, fmt.Errorf("creating scratch index dir: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(tmpDir) }
+	idx := filepath.Join(tmpDir, "index")
+	if err := os.WriteFile(idx, data, 0600); err != nil {
+		cleanup()
+		return nil, noop, fmt.Errorf("writing scratch index: %w", err)
+	}
+	return append([]string{"GIT_INDEX_FILE=" + idx}, snapshotGitEnv...), cleanup, nil
+}
+
+// snapshotMatches reports whether stash commits a and b hold the same tree on
+// the same parent. Any failure reads as "no match", which just means the
+// caller records the new snapshot.
+func snapshotMatches(g *Git, a, b string) bool {
+	for _, spec := range []string{"^{tree}", "^1"} {
+		x, errX := g.runWithEnv([]string{"rev-parse", a + spec}, snapshotGitEnv)
+		y, errY := g.runWithEnv([]string{"rev-parse", b + spec}, snapshotGitEnv)
+		if errX != nil || errY != nil || x != y {
+			return false
+		}
+	}
+	return true
 }
 
 // divergenceAnchor returns the first commit reachable from head that is not
@@ -522,6 +759,68 @@ func hasUnverifiedCommit(g *Git, remote, head string, protectedBranches []string
 		return "", nil
 	}
 	return strings.Fields(out)[0], nil
+}
+
+// HasWIPCommit reports the SHA of the nearest commit reachable from tip, not
+// reachable from any of protectedBranches on remote, whose subject starts with
+// prefix (the checkpoint package's WIPCommitPrefix).
+//
+// tip is the ref the caller is about to publish, e.g. "refs/heads/<branch>" —
+// NOT necessarily HEAD: a bare repo's HEAD is its default branch, and a
+// worktree's HEAD can differ from the branch being pushed, so scanning HEAD
+// can pass a push whose actual source carries a WIP commit. Exported so
+// every push site that lands commits on a real branch — gt done, the
+// pre-nuke best-effort push, the polecat-removal helper — can refuse to
+// publish a checkpoint auto-save commit there (gt-94p1 requirement 3).
+//
+// This is defense in depth alongside AutoPreserveUncommittedWork's Ephemeral
+// mode, which is the primary fix: Ephemeral stops such a commit from ever
+// reaching branch in the first place. This guard catches one that got there
+// anyway — a commit made before Ephemeral existed, one made with a plain
+// `git commit` reusing the prefix, or any other path this repo grows later.
+//
+// protectedBranches must come from rig config — see
+// PreserveOptions.ProtectedBranches; fails closed exactly like
+// HasUnverifiedCommit.
+func HasWIPCommit(g *Git, remote, tip, prefix string, protectedBranches []string) (string, error) {
+	head, err := g.Rev(tip)
+	if err != nil {
+		return "", fmt.Errorf("resolving %s: %w", tip, err)
+	}
+	if len(protectedBranches) == 0 {
+		return "", fmt.Errorf("no protected branches configured for the WIP-commit guard — refusing rather than scanning without a known-safe baseline")
+	}
+
+	const recordSep = "\x01"
+	args := []string{"log", head}
+	for _, branch := range protectedBranches {
+		// Fully qualified for the same reason as hasUnverifiedCommit: a
+		// bare "remote/branch" resolves refs/heads/ before refs/remotes/.
+		ref := "refs/remotes/" + remote + "/" + branch
+		if _, err := g.run("rev-parse", "--verify", ref); err != nil {
+			return "", fmt.Errorf("protected branch ref %s does not resolve — refusing to check for WIP commits until it can be verified: %w", ref, err)
+		}
+		args = append(args, "--not", ref)
+	}
+	args = append(args, "--format=%H"+recordSep+"%s")
+	out, err := g.run(args...)
+	if err != nil {
+		return "", err
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return "", nil
+	}
+	for _, line := range strings.Split(out, "\n") {
+		sha, subject, ok := strings.Cut(line, recordSep)
+		if !ok {
+			continue
+		}
+		if strings.HasPrefix(subject, prefix) {
+			return sha, nil
+		}
+	}
+	return "", nil
 }
 
 // pathExcluded reports whether staged path f falls under one of the

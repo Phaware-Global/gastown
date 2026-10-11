@@ -103,6 +103,9 @@ type ScanResult struct {
 	Database               string `json:"database"`
 	ReapCandidates         int    `json:"reap_candidates"`
 	MoleculeStepCandidates int    `json:"molecule_step_candidates,omitempty"`
+	// UnparentedStale counts open, parentless, non-molecule wisps past max-age.
+	// Informational only: the max-age Reap never closes them.
+	UnparentedStale int `json:"unparented_stale"`
 	// FastTrackCandidates counts wisps/mail the fast-track closers would close
 	// at FastTrackCloseAge, independent of max-age (gt-oqnc). Not disjoint from
 	// ReapCandidates: a wisp past both windows appears in each.
@@ -200,46 +203,20 @@ func OpenDB(host string, port int, dbName string, readTimeout, writeTimeout time
 	return sql.Open("mysql", dsn)
 }
 
-// parentExcludeJoin returns a LEFT JOIN clause and WHERE condition that restricts
-// results to wisps whose parent molecule is closed, missing, or nonexistent.
-//
-// This replaces the previous parentCheckWhere() which used 3 correlated EXISTS
-// subqueries per row, causing O(n*m) query cost on large wisp tables (gt-jd1z).
-// The LEFT JOIN approach runs the subquery once and hash-joins: O(n+m).
-//
-// Semantics:
-//   - No parent-child dependency at all → eligible for a non-molecule wisp
-//     (orphan wisps); NEVER eligible for a molecule wisp (see below, hq-s4azi).
-//   - Parent-child dependency exists and parent status is 'closed' → eligible
-//     (parent already reaped)
-//   - Parent-child dependency exists but the parent row is missing (dangling
-//     ref) → eligible (parent already purged)
-//
-// "No parent-child dependency at all" and "a parent-child dependency whose
-// parent is gone" are DIFFERENT CONDITIONS and must not share a branch for
-// molecules: a top-level molecule wisp (mol-dog-reaper itself, or any
-// dispatched work molecule) has no parent-child dependency row BY DESIGN, not
-// because its parent was purged. Collapsing the two let a top-level molecule
-// match the instant it passed max_age — including while HOOKED and actively
-// being worked (hq-s4azi). has_parent below distinguishes "never had a
-// parent" from "parent is gone" so the WHERE clause can require an actual
-// parent-child row before a molecule is eligible. Non-molecule wisps keep the
-// original orphan-eligible behavior — this reaper still needs to clean up
-// genuinely abandoned top-level tasks/notifications, just not molecules.
-//
-// The inverse of "has no open parent" is simpler: exclude wisps that have an
-// OPEN parent.
-//
-// Usage:
-//
-//	join, where := parentExcludeJoin(dbName)
-//	query := fmt.Sprintf("SELECT ... FROM wisps w %s WHERE ... AND %s", dbName, join, where)
-func parentExcludeJoin(dbName string) (joinClause, whereCondition string) {
-	joinClause = `LEFT JOIN (
+// hasParentJoin marks wisps that have any parent-child row.
+const hasParentJoin = `LEFT JOIN (
 		SELECT DISTINCT wd.issue_id
 		FROM wisp_dependencies wd
 		WHERE wd.type = 'parent-child'
-	) has_parent ON has_parent.issue_id = w.id
+	) has_parent ON has_parent.issue_id = w.id`
+
+// parentExcludeJoin returns the JOINs and WHERE condition for a max-age Reap
+// candidate's parentage: a parent-child row exists and no parent is open.
+// Wisps with no parent-child row are never candidates.
+//
+// Anti-joins, not correlated EXISTS, to stay O(n+m) on large tables.
+func parentExcludeJoin(dbName string) (joinClause, whereCondition string) {
+	joinClause = hasParentJoin + `
 	LEFT JOIN (
 		SELECT DISTINCT wd.issue_id
 		FROM wisp_dependencies wd
@@ -247,7 +224,7 @@ func parentExcludeJoin(dbName string) (joinClause, whereCondition string) {
 		WHERE wd.type = 'parent-child'
 		AND (pw.status IN ('open', 'hooked', 'in_progress') OR pi.status IN ('open', 'hooked', 'in_progress') OR wd.depends_on_external IS NOT NULL)
 	) open_parent ON open_parent.issue_id = w.id`
-	whereCondition = "open_parent.issue_id IS NULL AND (w.issue_type != 'molecule' OR has_parent.issue_id IS NOT NULL)"
+	whereCondition = "open_parent.issue_id IS NULL AND has_parent.issue_id IS NOT NULL"
 	return
 }
 
@@ -502,6 +479,17 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 		parentJoin, moleculeStepExcludeJoin, agentJoin, openWispStatusWhere, agentWhere, parentWhere)
 	if err := db.QueryRowContext(ctx, reapQuery, now.Add(-maxAge)).Scan(&result.ReapCandidates); err != nil {
 		return nil, fmt.Errorf("count reap candidates: %w", err)
+	}
+
+	unparentedQuery := fmt.Sprintf(
+		"SELECT COUNT(*) FROM wisps w %s %s WHERE %s AND w.created_at < ? AND %s AND has_parent.issue_id IS NULL AND w.issue_type != 'molecule'",
+		hasParentJoin, agentJoin, openWispStatusWhere, agentWhere)
+	if err := db.QueryRowContext(ctx, unparentedQuery, now.Add(-maxAge)).Scan(&result.UnparentedStale); err != nil {
+		// Informational count: a failure must not discard the rest of the scan.
+		result.Anomalies = append(result.Anomalies, Anomaly{
+			Type:    "unparented_scan_failed",
+			Message: fmt.Sprintf("count unparented stale wisps: %v", err),
+		})
 	}
 
 	// Count fast-track candidates (gt-oqnc). `gt reaper reap` closes these at
@@ -1182,9 +1170,9 @@ func ClosePluginReceipts(db *sql.DB, dbName string, maxAge time.Duration, dryRun
 // gating on it fast-closed unread mail. `read` is set only by `gt mail read`
 // (mail.Mailbox.storeMarkReadOnly), which is the actual read signal. A nudge
 // merely announces mail; the body exists only in the bead, so closing a still
-// unread notification silently loses it. Unread ones fall back to the normal
-// max-age Reap. FastTrackClosers (and thus Scan's FastTrackCandidates) call
-// this same function, so the preview and the real close apply one predicate.
+// unread notification silently loses it. Unread ones stay open. FastTrackClosers
+// (and thus Scan's FastTrackCandidates) call this same function, so the preview
+// and the real close apply one predicate.
 func CloseStaleNotifications(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ClosePluginReceiptResult, error) {
 	return closeWispsByLabel(db, dbName, "msg-type:notification", maxAge, "stale notifications", dryRun, readLabel)
 }

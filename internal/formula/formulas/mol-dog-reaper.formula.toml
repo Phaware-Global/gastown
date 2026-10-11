@@ -95,7 +95,10 @@ title = "Reap stale wisps"
 needs = ["scan"]
 description = """
 Close wisps past max_age whose parent molecule is closed or missing, and close
-step-wisps immediately when their parent molecule is already closed.
+step-wisps immediately when their parent molecule is already closed. Parentless
+non-molecule wisps (mail, merge requests, escalations) are never closed here;
+scan reports them as `unparented_stale`. That count is informational: do not
+escalate on it and do not close those wisps by hand.
 
 **1. For each database with `reap_candidates` or `molecule_step_candidates`:**
 ```bash
