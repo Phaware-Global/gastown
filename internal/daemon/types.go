@@ -10,6 +10,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -472,24 +473,39 @@ func GetPatrolRigs(config *DaemonPatrolConfig, patrol string) []string {
 }
 
 // loadDisabledPatrolsFromTownSettings loads the disabled_patrols list from
-// town settings (settings/config.json) as a set for O(1) lookup.
+// town settings (settings/config.json) as a set for O(1) lookup. Errors are
+// ignored: the daemon treats unreadable settings as "nothing disabled".
 func loadDisabledPatrolsFromTownSettings(townRoot string) map[string]bool {
+	disabled, _ := readDisabledPatrols(townRoot)
+	return disabled
+}
+
+// readDisabledPatrols is loadDisabledPatrolsFromTownSettings with errors
+// surfaced. A missing settings file is not an error; an unreadable or
+// unparseable one is.
+func readDisabledPatrols(townRoot string) (map[string]bool, error) {
 	settingsPath := filepath.Join(townRoot, "settings", "config.json")
 	data, err := os.ReadFile(settingsPath) //nolint:gosec // G304: path constructed internally
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("read %s: %w", settingsPath, err)
 	}
 	var raw struct {
 		DisabledPatrols []string `json:"disabled_patrols"`
 	}
-	if err := json.Unmarshal(data, &raw); err != nil || len(raw.DisabledPatrols) == 0 {
-		return nil
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", settingsPath, err)
+	}
+	if len(raw.DisabledPatrols) == 0 {
+		return nil, nil
 	}
 	disabled := make(map[string]bool, len(raw.DisabledPatrols))
 	for _, p := range raw.DisabledPatrols {
 		disabled[p] = true
 	}
-	return disabled
+	return disabled, nil
 }
 
 // isPatrolActive checks whether a patrol should run, combining the

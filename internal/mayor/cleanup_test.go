@@ -2,12 +2,28 @@ package mayor
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"syscall"
 	"testing"
 )
+
+// deadPID returns the PID of a child process that has already exited and been
+// reaped, so no process holds it at the moment the test uses it. A fixed or
+// derived constant (own PID minus N, a large literal) can belong to a live
+// process on a busy host or exceed pid_max on some systems.
+func deadPID(t *testing.T) int {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return 999999
+	}
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("failed to run helper process: %v", err)
+	}
+	return cmd.Process.Pid
+}
 
 func TestWriteAndRemoveACPPid(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -83,7 +99,7 @@ func TestIsACPActive_DeadProcess(t *testing.T) {
 	}
 
 	pidPath := ACPPidFilePath(tmpDir)
-	deadPid := 999999
+	deadPid := deadPID(t)
 	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(deadPid)), 0644); err != nil {
 		t.Fatalf("failed to write PID file: %v", err)
 	}
@@ -236,10 +252,7 @@ func TestRemoveACPPid_RemovesStalePid(t *testing.T) {
 		t.Fatalf("failed to create mayor dir: %v", err)
 	}
 
-	initialPid := syscall.Getpid() - 10000
-	if initialPid < 1 {
-		initialPid = 1
-	}
+	initialPid := deadPID(t)
 	pidPath := ACPPidFilePath(tmpDir)
 	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(initialPid)), 0644); err != nil {
 		t.Fatalf("failed to write stale PID file: %v", err)

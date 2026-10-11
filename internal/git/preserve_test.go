@@ -485,6 +485,79 @@ func TestDetachedPreservationIdentity(t *testing.T) {
 	}
 }
 
+func TestHasWIPCommit_FlagsOwnUnmergedCommit(t *testing.T) {
+	localDir, _, _ := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	runGitTestCmd(t, localDir, "checkout", "-b", "develop")
+	runGitTestCmd(t, localDir, "push", "-u", "origin", "develop")
+
+	runGitTestCmd(t, localDir, "checkout", "-b", "polecat/foo/gt-94p1@abc123")
+	if err := os.WriteFile(filepath.Join(localDir, "wip.txt"), []byte("wip\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	runGitTestCmd(t, localDir, "add", "wip.txt")
+	runGitTestCmd(t, localDir, "commit", "-m", "WIP: checkpoint (auto) (gt-94p1)")
+	wipSHA, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev HEAD: %v", err)
+	}
+
+	got, err := HasWIPCommit(g, "origin", "HEAD", "WIP: checkpoint (auto)", []string{"develop"})
+	if err != nil {
+		t.Fatalf("HasWIPCommit: %v", err)
+	}
+	if got != wipSHA {
+		t.Fatalf("HasWIPCommit = %q, want %q", got, wipSHA)
+	}
+}
+
+func TestHasWIPCommit_ExemptsCommitAlreadyOnProtectedBranch(t *testing.T) {
+	localDir, _, _ := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	runGitTestCmd(t, localDir, "checkout", "-b", "develop")
+	if err := os.WriteFile(filepath.Join(localDir, "wip.txt"), []byte("wip\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	runGitTestCmd(t, localDir, "add", "wip.txt")
+	runGitTestCmd(t, localDir, "commit", "-m", "WIP: checkpoint (auto) (gt-94p1)")
+	runGitTestCmd(t, localDir, "push", "-u", "origin", "develop")
+
+	runGitTestCmd(t, localDir, "checkout", "-b", "polecat/foo/gt-94p1@abc123", "develop")
+	runGitTestCmd(t, localDir, "fetch", "origin")
+
+	got, err := HasWIPCommit(g, "origin", "HEAD", "WIP: checkpoint (auto)", []string{"develop"})
+	if err != nil {
+		t.Fatalf("HasWIPCommit: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("HasWIPCommit = %q, want \"\" — a WIP commit already merged to a protected branch is accepted history, not a leak in progress", got)
+	}
+}
+
+func TestHasWIPCommit_CleanBranchReturnsEmpty(t *testing.T) {
+	localDir, _, _ := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	runGitTestCmd(t, localDir, "checkout", "-b", "develop")
+	runGitTestCmd(t, localDir, "push", "-u", "origin", "develop")
+	runGitTestCmd(t, localDir, "checkout", "-b", "polecat/foo/gt-94p1@abc123")
+	if err := os.WriteFile(filepath.Join(localDir, "real.txt"), []byte("real\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	runGitTestCmd(t, localDir, "add", "real.txt")
+	runGitTestCmd(t, localDir, "commit", "-m", "real work")
+
+	got, err := HasWIPCommit(g, "origin", "HEAD", "WIP: checkpoint (auto)", []string{"develop"})
+	if err != nil {
+		t.Fatalf("HasWIPCommit: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("HasWIPCommit = %q, want \"\" for a branch with no checkpoint commits", got)
+	}
+}
+
 func TestCommitNoVerify_BypassesHook(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell hook script not portable to windows")
