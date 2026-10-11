@@ -59,3 +59,20 @@ pass). A refusal is logged, counted separately from a normal push failure,
 escalated with a fingerprint, and surfaced in the cycle summary as
 `dolt_push_refused` (Dolt layer) or `git=refused` / `git_push_refused` (git
 layer).
+
+## Escalation dedupe
+
+`run.sh` escalates each unhealthy condition **once**, not once per run
+(`gt escalate --fingerprint` alone isn't enough: it only suppresses against
+*open* beads, so a closed repeat would otherwise be re-filed next cycle).
+Every *independently-resolvable* condition — a specific db, or a specific
+db+remote pair, never a whole condition class lumped into one shared set —
+is tracked in its own state file under `~/gt/.dolt-archive/escalation-state/`
+(override: `DOLT_ARCHIVE_STATE_DIR`), with no history shared between them: one
+entity's ongoing failure can never mask another entity's resolve-then-return.
+A condition unchanged since its last escalation stays quiet (one `low`
+"still unresolved" digest after `ESCALATION_REPEAT_SECS`, default 86400); new,
+changed, or returned-after-resolving escalates immediately at `critical`; a
+condition a run checked and found clean drops its state, so a later
+recurrence escalates afresh; a condition a run didn't check (a `--databases`
+subset, or a layer that didn't run) is left untouched either way.

@@ -207,6 +207,15 @@ func (p *Plugin) Summary() PluginSummary {
 	}
 }
 
+// receiptInstruction returns the exact command a dog should run to record a
+// plugin-run receipt when the plugin did not record one itself. It spells out
+// the whole command, title included: `bd create` rejects a title-less call,
+// and models that follow the text literally otherwise fail and retry.
+func receiptInstruction(pluginName string) string {
+	return fmt.Sprintf("`bd create --ephemeral --silent --title=\"plugin-run: %s\" -l type:plugin-run,plugin:%s,result:<outcome>` (prints the new ID), then immediately `bd close <id>` — receipts are write-once audit records and must not be left open (open receipts pile up as wisps until the reaper's 24h pass).",
+		pluginName, pluginName)
+}
+
 // FormatMailBody formats the plugin as instructions for a dog worker.
 // This is the canonical formatting used by both the daemon dispatcher
 // and the gt dog dispatch command.
@@ -220,9 +229,9 @@ func (p *Plugin) FormatMailBody() string {
 				"Run this command EXACTLY. Do NOT interpret the plugin.md instructions.\n"+
 				"Do NOT write your own implementation. Just run the script and report the output.\n\n"+
 				"After completion:\n"+
-				"1. The script should record a plugin-run receipt. If it did not, create one with `bd create --ephemeral --silent` using labels `type:plugin-run`, `plugin:%s`, and `result:<outcome>`, then immediately `bd close` it — receipts are write-once audit records and must not be left open (open receipts pile up as wisps until the reaper's 24h pass).\n"+
+				"1. The script should record a plugin-run receipt. If it did not, create one with %s\n"+
 				"2. Run `gt dog done` — this clears your work and auto-terminates the session. Run this even if recording fails.\n",
-			p.Name, p.Description, p.Path, p.Name)
+			p.Name, p.Description, p.Path, receiptInstruction(p.Name))
 	}
 
 	var sb strings.Builder
@@ -241,7 +250,7 @@ func (p *Plugin) FormatMailBody() string {
 	sb.WriteString(p.Instructions)
 	sb.WriteString("\n\n---\n\n")
 	sb.WriteString("After completion:\n")
-	sb.WriteString("1. Follow the plugin's recording instructions above. If none are provided, create a receipt with `bd create --ephemeral --silent` using labels `type:plugin-run`, `plugin:" + p.Name + "`, and `result:<outcome>`, then immediately `bd close` it — receipts are write-once audit records and must not be left open (open receipts pile up as wisps until the reaper's 24h pass).\n")
+	sb.WriteString("1. Follow the plugin's recording instructions above. If none are provided, create a receipt with " + receiptInstruction(p.Name) + "\n")
 	sb.WriteString("2. Run `gt dog done` — this clears your work and auto-terminates the session. Run this even if recording fails.\n")
 
 	return sb.String()

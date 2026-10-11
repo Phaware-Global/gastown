@@ -37,6 +37,12 @@ log() { echo "[test] $*"; }
 #  12-14. a failed export (or failed table check) must not leave the previous
 #     cycle's -latest.jsonl behind, and the git step must not commit that old
 #     data as this cycle's snapshot (gt-pgvd)
+#  15+. run.sh's own once-per-condition escalation dedupe — identical/changed/
+#     cleared-then-returned/skip-scoped/interval-digest/retried-after-failure
+#     conditions, tracked per independently-resolvable entity (a db, or a
+#     db+remote pair) with no shared history between entities, so one
+#     member's resolve-then-return can never be masked by an unrelated
+#     member's ongoing failure (gt-4kip, mayor ruling on #250 / hq-cv-6yo5w)
 # =============================================================================
 
 FAILURES=0
@@ -161,13 +167,17 @@ if [[ "\$1" == "escalate" ]]; then
     if [[ "\$prev" == "--fingerprint" ]]; then fp="\$arg"; fi
     prev="\$arg"
   done
-  if [[ -n "\$fp" ]]; then
+  if [[ -n "\$fp" && ! -f "$sandbox/.no-server-dedup" ]]; then
     mkdir -p "$sandbox/.fingerprints"
     seen_file="$sandbox/.fingerprints/\${fp//[^A-Za-z0-9_.-]/_}"
     if [[ -f "\$seen_file" ]]; then
       exit 0
     fi
     touch "\$seen_file"
+  fi
+  if [[ -f "$sandbox/.gt-escalate-fails" ]]; then
+    echo "mock gt escalate failure" >&2
+    exit 1
   fi
   printf '%s\n' "\$*" >> "$sandbox/escalate.log"
   exit 0
@@ -753,6 +763,475 @@ assert_escalated "$SANDBOX" "JSONL export failed" "unremovable stale link"
 assert_no_stale_commit "$SANDBOX" "unremovable stale link"
 rm -rf "$SANDBOX"
 
+# --- Scenarios 15+: run.sh's OWN once-per-condition dedupe (gt-4kip) --------
+#
+# `gt escalate --fingerprint` only suppresses against OPEN escalation beads,
+# so once the mayor closes a repeat the next cycle files it again — alert
+# fatigue. These scenarios switch the mock's server-side dedupe OFF (as if
+# every prior escalation had already been closed) so only run.sh's own
+# state can keep a static condition from re-escalating.
+
+# Runs one archive cycle WITHOUT truncating escalate.log (run_scenario does).
+run_cycle() {
+  local sandbox="$1"; shift
+  (
+    export HOME="$sandbox/home"
+    export PATH="$sandbox/bin:$PATH"
+    export DOLT_DATA_DIR="$sandbox/home/gt/.dolt-data"
+    "$RUN_SH" "$@"
+  ) >> "$sandbox/output.log" 2>&1 || true
+}
+
+count_escalations() {
+  local sandbox="$1" needle="$2" n
+  n="$(grep -c -- "$needle" "$sandbox/escalate.log" 2>/dev/null || true)"
+  echo "${n:-0}"
+}
+
+assert_count() {
+  local sandbox="$1" needle="$2" want="$3" desc="$4" got
+  got="$(count_escalations "$sandbox" "$needle")"
+  if [[ "$got" -ne "$want" ]]; then
+    echo "FAIL: $desc — expected $want escalation(s) matching '$needle', got $got"
+    echo "  escalate.log contents:"
+    sed 's/^/    /' "$sandbox/escalate.log" 2>/dev/null || echo "    (empty)"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+# Sandbox with three static conditions at once: a failing dolt push, no git
+# backup repo, and an exported db with no remote (the shape from gt-4kip).
+setup_static_conditions() {
+  local sandbox
+  sandbox="$(setup_sandbox)"
+  write_dolt_mock "$sandbox"
+  write_bd_mock "$sandbox"
+  write_gt_mock "$sandbox"
+  write_gh_mock "$sandbox"
+  touch "$sandbox/.no-server-dedup"
+  mkdir -p "$sandbox/home/gt/.dolt-data/db-a/.dolt" "$sandbox/home/gt/.dolt-data/db-b/.dolt"
+  printf 'origin\thttps://github.com/test-owner/db-a (fetch)\n' > "$sandbox/home/gt/.dolt-data/db-a/.mock-remotes"
+  touch "$sandbox/home/gt/.dolt-data/db-a/.mock-push-fail-origin"
+  echo "$sandbox"
+}
+
+log "=== Scenario: identical state across two runs escalates once (gt-4kip) ==="
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+run_cycle "$SANDBOX" --databases db-a,db-b
+run_cycle "$SANDBOX" --databases db-a,db-b
+assert_count "$SANDBOX" "dolt push failed" 1 "identical state, 2 runs — push failure"
+assert_count "$SANDBOX" "no git backup repo" 1 "identical state, 2 runs — missing git repo"
+assert_count "$SANDBOX" "exported databases have a dolt remote" 1 "identical state, 2 runs — remote shortfall"
+assert_count "$SANDBOX" "dolt-archive:" 3 "identical state, 2 runs — total escalations"
+assert_output_contains "$SANDBOX" "unchanged, already escalated" "suppressed repeats are still logged"
+rm -rf "$SANDBOX"
+
+log "=== Scenario: changed affected-set re-escalates (gt-4kip) ==="
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+# A second remote on db-a now fails too: the failing set changed.
+printf 'origin\thttps://github.com/test-owner/db-a (fetch)\nmirror\thttps://github.com/test-owner/db-a-mirror (fetch)\n' \
+  > "$SANDBOX/home/gt/.dolt-data/db-a/.mock-remotes"
+touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 2 "affected remote set changed — must re-escalate"
+if grep -- "dolt push failed" "$SANDBOX/escalate.log" | grep -qv -- "-s critical"; then
+  echo "FAIL: changed affected-set — re-escalation must stay critical"
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$SANDBOX"
+
+log "=== Scenario: condition clears then returns re-escalates (gt-4kip) ==="
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+rm -f "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-origin"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-origin"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 2 "cleared then returned — must re-escalate"
+# The shortfall never cleared, so it must NOT have re-fired across those 3 runs.
+assert_count "$SANDBOX" "exported databases have a dolt remote" 1 "uncleared shortfall stays quiet"
+rm -rf "$SANDBOX"
+
+log "=== Scenario: --skip flags do not clear another step's state (gt-4kip) ==="
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-dolt-push --skip-git
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 1 "skipped dolt push must not read as 'condition cleared'"
+rm -rf "$SANDBOX"
+
+log "=== Scenario: long-interval digest is LOW, not CRITICAL (gt-4kip) ==="
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+ESCALATION_REPEAT_SECS=0 run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 2 "interval elapsed — digest fires"
+if [[ "$(grep -- "dolt push failed" "$SANDBOX/escalate.log" | grep -c -- "-s low")" -ne 1 ]]; then
+  echo "FAIL: interval digest — expected exactly one '-s low' repeat"
+  sed 's/^/    /' "$SANDBOX/escalate.log"
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$SANDBOX"
+
+log "=== Scenario: failed escalate is retried, not recorded as sent (gt-4kip) ==="
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+touch "$SANDBOX/.gt-escalate-fails"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+rm -f "$SANDBOX/.gt-escalate-fails"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 1 "escalate that failed once must still be delivered next run"
+rm -rf "$SANDBOX"
+
+log "=== Scenario: a resolved member re-escalates when it returns, even ==="
+log "=== alongside an unrelated member that never stopped failing (gt-4kip) ==="
+# origin+mirror both fail -> escalate (both new). mirror recovers (origin
+# keeps failing) -> origin is unchanged (stays quiet); mirror is checked and
+# clean, so its own state is dropped. mirror fails again -> it has no prior
+# state, so it escalates again — origin's continued, unrelated failure must
+# not mask mirror's independent return. This is the mayor's gt-fc13 ruling
+# on #250 (hq-cv-6yo5w): a per-condition-class "sticky union" that remembers
+# every member it ever saw (so a shrink then regrow looked like "no change")
+# is exactly what let a resolved condition go unescalated on return. Per-key
+# state with no shared union between members — mirror and origin never touch
+# each other's file — makes that impossible.
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+printf 'origin\thttps://github.com/test-owner/db-a (fetch)\nmirror\thttps://github.com/test-owner/db-a-mirror (fetch)\n' \
+  > "$SANDBOX/home/gt/.dolt-data/db-a/.mock-remotes"
+touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+rm -f "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 2 "mirror's return must re-escalate although origin never stopped failing"
+rm -rf "$SANDBOX"
+
+log "=== Scenario: a --databases subset run does not clear another db's state (PR #250) ==="
+# db-a fails on a full run (escalates). A subsequent run scoped to db-b only
+# must not treat db-a's unresolved failure as cleared just because db-a
+# wasn't checked this cycle — otherwise the next full run, finding the same
+# unfixed db-a failure, would wrongly re-escalate it as "new".
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+run_cycle "$SANDBOX" --databases db-b --skip-git
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 1 "db-b-only run must not clear db-a's unresolved push failure"
+rm -rf "$SANDBOX"
+
+log "=== Scenario: a shrunk affected set still sends a digest past REPEAT_SECS (PR #250) ==="
+# 2 failing (origin+mirror) -> escalate. Mirror recovers (shrink of the
+# escalated set) but REPEAT_SECS has already elapsed -> must send exactly one
+# low digest instead of staying silent indefinitely (adversarial finding on
+# #250: the shrink branch used to return early with no age check at all).
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+printf 'origin\thttps://github.com/test-owner/db-a (fetch)\nmirror\thttps://github.com/test-owner/db-a-mirror (fetch)\n' \
+  > "$SANDBOX/home/gt/.dolt-data/db-a/.mock-remotes"
+touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+rm -f "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
+ESCALATION_REPEAT_SECS=0 run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 2 "shrink past REPEAT_SECS must still send a digest"
+if [[ "$(grep -- "dolt push failed" "$SANDBOX/escalate.log" | grep -c -- "-s low")" -ne 1 ]]; then
+  echo "FAIL: shrink digest — expected exactly one '-s low' repeat"
+  sed 's/^/    /' "$SANDBOX/escalate.log"
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$SANDBOX"
+
+log "=== Scenario: each member's own resolve/return is tracked independently (gt-4kip) ==="
+# origin fails -> escalate. mirror joins -> escalate (a new member). mirror
+# recovers -> quiet, and mirror's own state is dropped (checked, now clean).
+# third joins (mirror still recovered) -> escalate (a new member). mirror
+# fails again -> escalate AGAIN: it has no state (dropped when it resolved),
+# so its return is indistinguishable from a first-time failure — exactly the
+# gt-fc13 requirement. The old "sticky union" design (one shared history per
+# condition *class*, remembering every member it ever saw) would have read
+# mirror's return here as "already escalated, still in the recorded set" and
+# stayed silent — the bug the mayor's ruling on #250 (hq-cv-6yo5w) ended.
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+printf 'origin\thttps://github.com/test-owner/db-a (fetch)\nmirror\thttps://github.com/test-owner/db-a-mirror (fetch)\nthird\thttps://github.com/test-owner/db-a-third (fetch)\n' \
+  > "$SANDBOX/home/gt/.dolt-data/db-a/.mock-remotes"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+rm -f "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-third"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+touch "$SANDBOX/home/gt/.dolt-data/db-a/.mock-push-fail-mirror"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 4 "mirror's second return must escalate again, independent of origin/third's own history"
+rm -rf "$SANDBOX"
+
+log "=== Scenario: a db's failure recorded on a full run survives an unrelated ==="
+log "=== db's --databases subset cycles (val HIGH on #250) ==="
+# Full run: db-a fails -> escalate, its own key recorded. A subsequent
+# --databases db-b run (db-b starts failing, then recovers) never touches
+# db-a's key at all — each db's state lives in its own file, so a run scoped
+# to db-b has no way to read or clear db-a's entry. A later full run must
+# therefore still find db-a's failure exactly as it left it (unchanged,
+# quiet), not re-file it as new.
+SANDBOX="$(setup_static_conditions)"
+: > "$SANDBOX/escalate.log"
+printf 'origin\thttps://github.com/test-owner/db-b (fetch)\n' > "$SANDBOX/home/gt/.dolt-data/db-b/.mock-remotes"
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+touch "$SANDBOX/home/gt/.dolt-data/db-b/.mock-push-fail-origin"
+run_cycle "$SANDBOX" --databases db-b --skip-git
+rm -f "$SANDBOX/home/gt/.dolt-data/db-b/.mock-push-fail-origin"
+run_cycle "$SANDBOX" --databases db-b --skip-git
+run_cycle "$SANDBOX" --databases db-a,db-b --skip-git
+assert_count "$SANDBOX" "dolt push failed" 2 "db-a's failure must survive unrelated db-b-only subset cycles without re-filing"
+rm -rf "$SANDBOX"
+
+# --- Scenarios 18+: every escalation is fingerprinted by the values that -----
+# --- distinguish one problem from another, so a standing condition alerts ----
+# --- once but a changed condition still alerts -------------------------------
+#
+# Each key is "dolt-archive:<condition>:<checksum of the affected set>", so the
+# assertions below match the condition prefix and compare whole keys across runs.
+
+# Prints the --fingerprint value of the first escalate.log line matching $needle.
+fingerprint_of() {
+  local sandbox="$1" needle="$2"
+  grep -- "$needle" "$sandbox/escalate.log" 2>/dev/null | head -n1 \
+    | sed -n 's/.*--fingerprint \([^ ]*\).*/\1/p' || true
+}
+
+# Sandbox where each named db exports and has a remote whose push fails.
+setup_push_fail_sandbox() {
+  local sandbox db
+  sandbox="$(setup_sandbox)"
+  write_dolt_mock "$sandbox"
+  write_bd_mock "$sandbox"
+  write_gt_mock "$sandbox"
+  write_gh_mock "$sandbox"
+  for db in "$@"; do
+    mkdir -p "$sandbox/home/gt/.dolt-data/$db/.dolt"
+    printf 'origin\thttps://github.com/test-owner/%s (fetch)\n' "$db" > "$sandbox/home/gt/.dolt-data/$db/.mock-remotes"
+    touch "$sandbox/home/gt/.dolt-data/$db/.mock-push-fail-origin"
+  done
+  echo "$sandbox"
+}
+
+# Sandbox where each named db fails its export.
+setup_export_fail_sandbox() {
+  local sandbox db
+  sandbox="$(setup_sandbox)"
+  write_dolt_mock "$sandbox"
+  write_bd_mock "$sandbox"
+  write_gt_mock "$sandbox"
+  for db in "$@"; do
+    mkdir -p "$sandbox/home/gt/.dolt-data/$db"
+    touch "$sandbox/home/gt/.dolt-data/$db/.mock-export-fail"
+    # run.sh's prune loop aborts on a db with no snapshot at all (see the
+    # population-correctness scenario), so give each db a dated one.
+    touch "$sandbox/home/gt/.dolt-archive/jsonl/$db-20000101-0000.jsonl"
+  done
+  echo "$sandbox"
+}
+
+# Forgets everything that would suppress a repeat escalation: the gt mock's open
+# fingerprints and run.sh's own once-per-condition state.
+reset_dedupe() {
+  rm -rf "$1/.fingerprints" "$1/home/gt/.dolt-archive/escalation-state"
+}
+
+# Runs the scenario twice in one sandbox, forgetting suppressed escalations in
+# between, and checks both runs produce the same key.
+assert_stable_fingerprint() {
+  local sandbox="$1" needle="$2" desc="$3"; shift 3
+  local first second
+  reset_dedupe "$sandbox"
+  run_scenario "$sandbox" "$@"
+  first="$(fingerprint_of "$sandbox" "$needle")"
+  reset_dedupe "$sandbox"
+  run_scenario "$sandbox" "$@"
+  second="$(fingerprint_of "$sandbox" "$needle")"
+  if [[ -z "$first" ]]; then
+    echo "FAIL: $desc — escalation carries no --fingerprint"
+    FAILURES=$((FAILURES + 1))
+  elif [[ "$first" != "$second" ]]; then
+    echo "FAIL: $desc — same inputs gave different keys: '$first' vs '$second'"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+assert_distinct_fingerprints() {
+  local a="$1" b="$2" desc="$3"
+  if [[ -z "$a" || -z "$b" || "$a" == "$b" ]]; then
+    echo "FAIL: $desc — expected two distinct non-empty keys, got '$a' and '$b'"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+assert_fingerprint_charset() {
+  local fp="$1" desc="$2"
+  if [[ -z "$fp" || "$fp" =~ [^A-Za-z0-9_.:-] ]]; then
+    echo "FAIL: $desc — key '$fp' is empty or has characters outside [A-Za-z0-9_.:-]"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+log "=== Scenario: JSONL export failure is fingerprinted by the failed databases ==="
+SANDBOX="$(setup_export_fail_sandbox testdb)"
+run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
+assert_fingerprint "$SANDBOX" "JSONL export failed" "dolt-archive:export-failed" "jsonl export failure"
+KEY_A="$(fingerprint_of "$SANDBOX" "JSONL export failed")"
+assert_fingerprint_charset "$KEY_A" "jsonl export failure"
+assert_stable_fingerprint "$SANDBOX" "JSONL export failed" "jsonl export failure" --databases testdb --skip-dolt-push
+rm -rf "$SANDBOX"
+
+SANDBOX="$(setup_export_fail_sandbox otherdb)"
+run_scenario "$SANDBOX" --databases otherdb --skip-dolt-push
+KEY_B="$(fingerprint_of "$SANDBOX" "JSONL export failed")"
+assert_distinct_fingerprints "$KEY_A" "$KEY_B" "jsonl export failure — different failed db"
+rm -rf "$SANDBOX"
+
+SANDBOX="$(setup_export_fail_sandbox testdb otherdb)"
+run_scenario "$SANDBOX" --databases testdb,otherdb --skip-dolt-push
+KEY_C="$(fingerprint_of "$SANDBOX" "JSONL export failed")"
+assert_distinct_fingerprints "$KEY_A" "$KEY_C" "jsonl export failure — extra failed db"
+rm -rf "$SANDBOX"
+
+# Sandbox where every db after the first argument has a remote; only the dbs
+# named in the first argument (comma-separated) have a push that fails.
+setup_partial_push_fail_sandbox() {
+  local fail_dbs=",$1," sandbox db
+  shift
+  sandbox="$(setup_push_fail_sandbox)"
+  for db in "$@"; do
+    mkdir -p "$sandbox/home/gt/.dolt-data/$db/.dolt"
+    printf 'origin\thttps://github.com/test-owner/%s (fetch)\n' "$db" > "$sandbox/home/gt/.dolt-data/$db/.mock-remotes"
+    if [[ "$fail_dbs" == *",$db,"* ]]; then
+      touch "$sandbox/home/gt/.dolt-data/$db/.mock-push-fail-origin"
+    fi
+  done
+  echo "$sandbox"
+}
+
+log "=== Scenario: dolt push failure is fingerprinted by the failing db/remote pairs ==="
+SANDBOX="$(setup_push_fail_sandbox testdb)"
+assert_stable_fingerprint "$SANDBOX" "dolt push failed" "dolt push failure" --databases testdb --skip-git
+assert_fingerprint "$SANDBOX" "dolt push failed" "dolt-archive:dolt-push-failed" "dolt push failure"
+KEY_A="$(fingerprint_of "$SANDBOX" "dolt push failed")"
+assert_fingerprint_charset "$KEY_A" "dolt push failure"
+rm -rf "$SANDBOX"
+
+# Same failure count (1), but a different db's remote is the one failing.
+SANDBOX="$(setup_partial_push_fail_sandbox otherdb testdb otherdb)"
+run_scenario "$SANDBOX" --databases testdb,otherdb --skip-git
+KEY_B="$(fingerprint_of "$SANDBOX" "dolt push failed")"
+assert_distinct_fingerprints "$KEY_A" "$KEY_B" "dolt push failure — same count, different failing remote"
+rm -rf "$SANDBOX"
+
+# A larger failure set gets its own key too.
+SANDBOX="$(setup_push_fail_sandbox testdb otherdb)"
+run_scenario "$SANDBOX" --databases testdb,otherdb --skip-git
+KEY_C="$(fingerprint_of "$SANDBOX" "dolt push failed")"
+assert_distinct_fingerprints "$KEY_A" "$KEY_C" "dolt push failure — extra failing remote"
+rm -rf "$SANDBOX"
+
+# The key does not depend on the order the databases are listed in.
+SANDBOX="$(setup_push_fail_sandbox testdb otherdb)"
+run_scenario "$SANDBOX" --databases otherdb,testdb --skip-git
+KEY_D="$(fingerprint_of "$SANDBOX" "dolt push failed")"
+if [[ -z "$KEY_C" || "$KEY_C" != "$KEY_D" ]]; then
+  echo "FAIL: dolt push failure — database order changed the key: '$KEY_C' vs '$KEY_D'"
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$SANDBOX"
+
+log "=== Scenario: missing git backup repo is fingerprinted ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"
+write_bd_mock "$SANDBOX"
+write_gt_mock "$SANDBOX"
+assert_stable_fingerprint "$SANDBOX" "no git backup repo" "missing git backup repo" --databases testdb --skip-dolt-push
+assert_fingerprint "$SANDBOX" "no git backup repo" "dolt-archive:git-repo-missing" "missing git backup repo"
+KEY_A="$(fingerprint_of "$SANDBOX" "no git backup repo")"
+assert_fingerprint_charset "$KEY_A" "missing git backup repo"
+rm -rf "$SANDBOX"
+
+log "=== Scenario: remote shortfall is fingerprinted by the exported dbs lacking a remote ==="
+setup_shortfall_sandbox() {
+  local sandbox db
+  sandbox="$(setup_sandbox)"
+  write_dolt_mock "$sandbox"
+  write_bd_mock "$sandbox"
+  write_gt_mock "$sandbox"
+  write_gh_mock "$sandbox"
+  mkdir -p "$sandbox/home/gt/.dolt-data/db-with-remote/.dolt"
+  printf 'origin\thttps://github.com/test-owner/with-remote (fetch)\n' > "$sandbox/home/gt/.dolt-data/db-with-remote/.mock-remotes"
+  for db in "$@"; do
+    mkdir -p "$sandbox/home/gt/.dolt-data/$db/.dolt"
+  done
+  echo "$sandbox"
+}
+
+SANDBOX="$(setup_shortfall_sandbox db-no-remote)"
+assert_stable_fingerprint "$SANDBOX" "only 1 of 2 exported" "remote shortfall" --databases db-with-remote,db-no-remote --skip-git
+assert_fingerprint "$SANDBOX" "only 1 of 2 exported" "dolt-archive:remote-shortfall" "remote shortfall"
+KEY_A="$(fingerprint_of "$SANDBOX" "only 1 of 2 exported")"
+assert_fingerprint_charset "$KEY_A" "remote shortfall"
+rm -rf "$SANDBOX"
+
+# Same dbs lack a remote, but another exported db with a remote changes the
+# exported count (1-of-2 becomes 2-of-3): the standing shortfall keeps its key.
+SANDBOX="$(setup_shortfall_sandbox db-no-remote db-with-remote-2)"
+printf 'origin\thttps://github.com/test-owner/with-remote-2 (fetch)\n' > "$SANDBOX/home/gt/.dolt-data/db-with-remote-2/.mock-remotes"
+run_scenario "$SANDBOX" --databases db-with-remote,db-with-remote-2,db-no-remote --skip-git
+KEY_B="$(fingerprint_of "$SANDBOX" "only 2 of 3 exported")"
+if [[ -z "$KEY_B" || "$KEY_A" != "$KEY_B" ]]; then
+  echo "FAIL: remote shortfall — unchanged missing set got a different key: '$KEY_A' vs '$KEY_B'"
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$SANDBOX"
+
+# A different db lacking a remote at the same counts is a different shortfall.
+SANDBOX="$(setup_shortfall_sandbox db-no-remote-2)"
+run_scenario "$SANDBOX" --databases db-with-remote,db-no-remote-2 --skip-git
+KEY_C="$(fingerprint_of "$SANDBOX" "only 1 of 2 exported")"
+assert_distinct_fingerprints "$KEY_A" "$KEY_C" "remote shortfall — same counts, different db without a remote"
+rm -rf "$SANDBOX"
+
+# More dbs lacking a remote is a different shortfall.
+SANDBOX="$(setup_shortfall_sandbox db-no-remote db-no-remote-2)"
+run_scenario "$SANDBOX" --databases db-with-remote,db-no-remote,db-no-remote-2 --skip-git
+KEY_D="$(fingerprint_of "$SANDBOX" "only 1 of 3 exported")"
+assert_distinct_fingerprints "$KEY_A" "$KEY_D" "remote shortfall — extra db without a remote"
+rm -rf "$SANDBOX"
+
+# The key does not depend on the order the databases are listed in.
+SANDBOX="$(setup_shortfall_sandbox db-no-remote db-no-remote-2)"
+run_scenario "$SANDBOX" --databases db-no-remote-2,db-with-remote,db-no-remote --skip-git
+KEY_E="$(fingerprint_of "$SANDBOX" "only 1 of 3 exported")"
+if [[ -z "$KEY_D" || "$KEY_D" != "$KEY_E" ]]; then
+  echo "FAIL: remote shortfall — database order changed the key: '$KEY_D' vs '$KEY_E'"
+  FAILURES=$((FAILURES + 1))
+fi
+rm -rf "$SANDBOX"
+
+log "=== Scenario: git backup failure keeps one fixed fingerprint ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"
+write_bd_mock "$SANDBOX"
+write_gt_mock "$SANDBOX"
+write_git_backup_repo "$SANDBOX" '{"id":"older"}'
+git -C "$SANDBOX/home/gt/.dolt-archive/git" remote remove origin
+assert_stable_fingerprint "$SANDBOX" "git backup add/commit/push failed" "git backup failure" --databases testdb --skip-dolt-push
+assert_fingerprint "$SANDBOX" "git backup add/commit/push failed" "dolt-archive:git-backup-failed" "git backup failure"
+rm -rf "$SANDBOX"
+
 echo ""
 if [[ $FAILURES -gt 0 ]]; then
   echo "Suite A (escalation logic): FAILED — $FAILURES scenario(s) failed"
@@ -871,13 +1350,20 @@ mkdir -p "$REAL_JSONL_DIR"
 touch "$REAL_JSONL_DIR/db-public-20000101-0000.jsonl" "$REAL_JSONL_DIR/db-private-20000101-0000.jsonl"
 trap 'rm -rf "$WORKDIR"; rm -f "$REAL_JSONL_DIR/db-public-20000101-0000.jsonl" "$REAL_JSONL_DIR/db-private-20000101-0000.jsonl"' EXIT
 
+# Isolate escalation-dedupe state (gt-4kip): without this the suite would read
+# and write the real ~/gt/.dolt-archive/escalation-state.
+export DOLT_ARCHIVE_STATE_DIR="$WORKDIR/escalation-state"
+
 OUTPUT="$WORKDIR/run.log"
+run_suite_b() {
+  PATH="$FAKE_BIN:$PATH" \
+    DOLT_DATA_DIR="$DOLT_DATA_DIR" \
+    PUSH_LOG="$PUSH_LOG" \
+    ESCALATE_LOG="$ESCALATE_LOG" \
+    bash "$RUN_SH" --databases db-public,db-private --skip-git
+}
 set +e
-PATH="$FAKE_BIN:$PATH" \
-  DOLT_DATA_DIR="$DOLT_DATA_DIR" \
-  PUSH_LOG="$PUSH_LOG" \
-  ESCALATE_LOG="$ESCALATE_LOG" \
-  bash "$RUN_SH" --databases db-public,db-private --skip-git > "$OUTPUT" 2>&1
+run_suite_b > "$OUTPUT" 2>&1
 RUN_STATUS=$?
 set -e
 
@@ -902,12 +1388,64 @@ check "no escalation for the private (allowed) push" '! grep -q "db-private:orig
 check "summary line reports the refusal, not a silent skip" 'grep -q "dolt_push_refused=1" "$OUTPUT"'
 check "log shows the refusal reason inline" 'grep -q "REFUSED.*visibility=public" "$OUTPUT"'
 
+# gt-4kip: an unchanged refusal must not re-escalate; a changed remote URL must
+# escalate again immediately.
+refusals() { grep -c "push-refused:db-public:origin" "$ESCALATE_LOG" || true; }
+check "first refusal escalated exactly once" '[[ "$(refusals)" -eq 1 ]]'
+run_suite_b > "$WORKDIR/run2.log" 2>&1 || true
+check "unchanged refusal on the next run does not re-escalate" '[[ "$(refusals)" -eq 1 ]]'
+check "unchanged refusal is still logged" 'grep -q "REFUSED.*visibility=public" "$WORKDIR/run2.log"'
+echo "origin git+https://github.com/pub-owner/other-repo {}" > "$DOLT_DATA_DIR/db-public/.remotes"
+run_suite_b > "$WORKDIR/run3.log" 2>&1 || true
+check "changed remote URL re-escalates immediately" '[[ "$(refusals)" -eq 2 ]]'
+check "changed-URL escalation is critical" 'grep "push-refused:db-public:origin" "$ESCALATE_LOG" | tail -1 | grep -q -- "-s critical"'
+rm -f "$DOLT_DATA_DIR/db-public/.remotes"
+run_suite_b > "$WORKDIR/run4.log" 2>&1 || true
+check "refusal state cleared once the remote is gone" '[[ -z "$(ls "$DOLT_ARCHIVE_STATE_DIR" 2>/dev/null | grep push-refused)" ]]'
+
+# Required regression test (mayor ruling on #250 / hq-cv-6yo5w, gt-fc13): the
+# unsafe-remote refusal fires, the remote is fixed (a clean run — the push
+# actually succeeds, not just "skipped"), the refusal returns, and it must
+# fire again, not stay silent because it "already escalated once before".
+echo "origin git+https://github.com/priv-owner/repo {}" > "$DOLT_DATA_DIR/db-public/.remotes"
+run_suite_b > "$WORKDIR/run5.log" 2>&1 || true
+check "remote fixed (now private) — push actually succeeds" 'grep -q "/db-public|origin" "$PUSH_LOG"'
+check "remote fixed — refusal state cleared" '[[ -z "$(ls "$DOLT_ARCHIVE_STATE_DIR" 2>/dev/null | grep push-refused)" ]]'
+echo "origin git+https://github.com/pub-owner/repo {}" > "$DOLT_DATA_DIR/db-public/.remotes"
+run_suite_b > "$WORKDIR/run6.log" 2>&1 || true
+check "refusal returns after being fixed — re-escalates (gt-4kip)" '[[ "$(refusals)" -eq 3 ]]'
+check "returned refusal is critical, not suppressed as a stale repeat" \
+  'grep "push-refused:db-public:origin" "$ESCALATE_LOG" | tail -1 | grep -q -- "-s critical"'
+
+# Required regression test: a --databases subset run must not clear (or
+# otherwise disturb) a still-unresolved refusal for a db outside that subset.
+mkdir -p "$DOLT_DATA_DIR/db-subset/.dolt"
+echo "origin git+https://github.com/pub-owner/repo {}" > "$DOLT_DATA_DIR/db-subset/.remotes"
+touch "$REAL_JSONL_DIR/db-subset-20000101-0000.jsonl"
+run_suite_b_dbs() {
+  PATH="$FAKE_BIN:$PATH" DOLT_DATA_DIR="$DOLT_DATA_DIR" \
+    bash "$RUN_SH" --databases "$1" --skip-git
+}
+run_suite_b_dbs "db-subset,db-private" > "$WORKDIR/subset1.log" 2>&1 || true
+run_suite_b_dbs "db-private" > "$WORKDIR/subset2.log" 2>&1 || true
+run_suite_b_dbs "db-subset,db-private" > "$WORKDIR/subset3.log" 2>&1 || true
+check "db-private-only run must not clear or re-fire db-subset's unresolved refusal" \
+  '[[ "$(grep -c "push-refused:db-subset:origin" "$ESCALATE_LOG")" -eq 1 ]]'
+rm -f "$REAL_JSONL_DIR/db-subset-20000101-0000.jsonl"
+
 echo ""
 echo "Suite B (visibility guard): $PASS passed, $FAIL failed"
 if [[ "$FAIL" -ne 0 ]]; then
   echo "--- run.sh output ---"
   cat "$OUTPUT"
 fi
+
+# Suite B's escalation-dedupe state override must not leak into Suite C: an
+# `export` is process-wide for the rest of this script, so without this every
+# git_guard_scenario sandbox below would share Suite B's $WORKDIR/escalation-
+# state instead of getting its own per-sandbox state dir, letting one
+# scenario's git-push-refused escalation dedupe against an unrelated one's.
+unset DOLT_ARCHIVE_STATE_DIR
 
 # =============================================================================
 # Suite C: git-layer visibility guard (gt-sg6n)
@@ -991,6 +1529,43 @@ BEFORE="$(bare_head "$SANDBOX")"
 run_scenario "$SANDBOX" --databases testdb --skip-dolt-push
 [[ "$BEFORE" == "$(bare_head "$SANDBOX")" ]] || c_fail "mixed pushurls — origin received a push"
 grep -qF "git=refused" "$SANDBOX/output.log" || c_fail "mixed pushurls — summary lacks git=refused"
+rm -rf "$SANDBOX"
+
+# Required regression test (val's LOW on #250): a cycle where the git-push
+# visibility guard never evaluates at all — not "refused", not "skipped via
+# --skip-git", but genuinely never reached (no backup repo present that
+# cycle) — must leave a still-unresolved refusal's state untouched. The old
+# code cleared git-push-refused:origin whenever `! $SKIP_GIT`, regardless of
+# whether the guard itself ever ran that cycle.
+log "=== Scenario: git-layer guard — a cycle where the guard never runs leaves a refusal's state untouched (val LOW on #250) ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"; write_bd_mock "$SANDBOX"; write_gt_mock "$SANDBOX"
+write_gh_owner_mock "$SANDBOX"
+write_git_backup_repo "$SANDBOX"
+write_git_shim "$SANDBOX" "https://github.com/pub-owner/example-backup"
+# write_gt_mock's simulated server-side --fingerprint dedup (mirroring real
+# `gt escalate`, which only suppresses against OPEN beads) would otherwise
+# mask this test: an unchanged refusal always carries the SAME fingerprint,
+# so the mock alone would suppress a genuine re-escalation just as readily
+# as a correctly-suppressed repeat. Disable it so only run.sh's own
+# state-based dedupe is under test, same as the "Scenarios 15+" cases.
+touch "$SANDBOX/.no-server-dedup"
+: > "$SANDBOX/escalate.log"
+
+run_cycle "$SANDBOX" --databases testdb --skip-dolt-push
+REPO="$SANDBOX/home/gt/.dolt-archive/git"
+mv "$REPO" "${REPO}.away"
+run_cycle "$SANDBOX" --databases testdb --skip-dolt-push
+if ! grep -qF "No git backup repo" "$SANDBOX/output.log"; then
+  c_fail "guard-never-ran cycle did not actually take the git=missing path"
+fi
+mv "${REPO}.away" "$REPO"
+run_cycle "$SANDBOX" --databases testdb --skip-dolt-push
+
+REFIRES="$(grep -c -- "git-push-refused" "$SANDBOX/escalate.log" || true)"
+if [[ "${REFIRES:-0}" -ne 1 ]]; then
+  c_fail "guard-never-ran cycle must not clear git-push-refused state — expected 1 total escalation, got ${REFIRES:-0}"
+fi
 rm -rf "$SANDBOX"
 
 echo ""
