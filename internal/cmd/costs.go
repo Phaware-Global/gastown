@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -203,38 +204,110 @@ type modelPrice struct {
 	CacheCreatePerMillion float64 // 25% premium on input price
 }
 
-// Model pricing per million tokens (as of Jan 2025).
-// See: https://www.anthropic.com/pricing
+// Model pricing per million tokens, keyed by "<family>-<version>" as produced
+// by parseModelFamilyVersion. Columns: input, output, cache read, cache write.
+// Source: https://platform.claude.com/docs/en/about-claude/pricing (2026-10-10).
+// Cache writes are priced at the 5-minute rate because transcripts do not say
+// which TTL was used; Haiku 5.5 uses its <=100k-token prompt tier.
 var modelPricing = map[string]modelPrice{
-	// Claude Opus 4.5
-	"claude-opus-4-5-20251101": {15.0, 75.0, 1.5, 18.75},
-	// Claude Sonnet 4
-	"claude-sonnet-4-20250514": {3.0, 15.0, 0.3, 3.75},
-	// Claude Haiku 3.5
-	"claude-3-5-haiku-20241022": {1.0, 5.0, 0.1, 1.25},
-	// Fallback for unknown models (use Sonnet pricing)
-	"default": {3.0, 15.0, 0.3, 3.75},
+	"fable-5.1":  {10, 50, 0.25, 12.5},
+	"mythos-5.1": {10, 50, 0.25, 12.5},
+	"fable-5":    {10, 50, 1, 12.5},
+	"mythos-5":   {10, 50, 1, 12.5},
+	"opus-5.5":   {4, 20, 0.20, 5},
+	"opus-5":     {5, 25, 0.50, 6.25},
+	"opus-4.8":   {5, 25, 0.50, 6.25},
+	"opus-4.7":   {5, 25, 0.50, 6.25},
+	"opus-4.6":   {5, 25, 0.50, 6.25},
+	"opus-4.5":   {5, 25, 0.50, 6.25},
+	"opus-4.1":   {15, 75, 1.5, 18.75},
+	"opus-4":     {15, 75, 1.5, 18.75},
+	"sonnet-5.5": {2, 10, 0.10, 2.5},
+	"sonnet-5":   {2, 10, 0.20, 2.5},
+	"sonnet-4.6": {3, 15, 0.30, 3.75},
+	"sonnet-4.5": {3, 15, 0.30, 3.75},
+	"sonnet-4":   {3, 15, 0.30, 3.75},
+	"haiku-5.5":  {0.10, 0.50, 0.01, 0.125},
+	"haiku-4.5":  {1, 5, 0.10, 1.25},
+	"haiku-3.5":  {0.80, 4, 0.08, 1},
+	// Fallback for unknown models (current Sonnet pricing)
+	"default": {2, 10, 0.10, 2.5},
 }
 
-// modelFamilyPricing maps a model family substring to the modelPricing entry
-// used for model IDs that have no exact entry (e.g. "claude-opus-5-5").
-// Without this, every newer model silently falls through to Sonnet pricing.
-var modelFamilyPricing = []struct{ family, key string }{
-	{"opus", "claude-opus-4-5-20251101"},
-	{"sonnet", "claude-sonnet-4-20250514"},
-	{"haiku", "claude-3-5-haiku-20241022"},
+// modelFamilies lists the recognized model families, and modelFamilyLatest the
+// row used for a recognized family whose version has no entry yet.
+var modelFamilies = []string{"fable", "mythos", "opus", "sonnet", "haiku"}
+
+var modelFamilyLatest = map[string]string{
+	"fable":  "fable-5.1",
+	"mythos": "mythos-5.1",
+	"opus":   "opus-5.5",
+	"sonnet": "sonnet-5.5",
+	"haiku":  "haiku-5.5",
 }
 
-// pricingForModel returns the price list for a model ID: an exact match first,
-// then the model family inferred from the ID, then the default.
+// parseModelFamilyVersion extracts the family and dotted version from a model
+// ID: "claude-opus-5-5" and "claude-opus-5-5[1m]" give ("opus", "5.5"),
+// "claude-sonnet-4-20250514" gives ("sonnet", "4") and the older
+// "claude-3-5-haiku-20241022" gives ("haiku", "3.5"). Unknown input gives "".
+func parseModelFamilyVersion(model string) (family, version string) {
+	id := strings.ToLower(model)
+	if i := strings.IndexAny(id, "[("); i >= 0 {
+		id = id[:i] // strip context-window suffixes such as "[1m]"
+	}
+	parts := strings.Split(id, "-")
+	fi := -1
+	for i, p := range parts {
+		for _, f := range modelFamilies {
+			if p == f {
+				family, fi = f, i
+				break
+			}
+		}
+		if fi >= 0 {
+			break
+		}
+	}
+	if fi < 0 {
+		return "", ""
+	}
+	// Version digits follow the family in current IDs and precede it in 3.x IDs.
+	// Date suffixes (8 digits) are not version components.
+	isVersionPart := func(p string) bool {
+		if len(p) == 0 || len(p) > 2 {
+			return false
+		}
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	var nums []string
+	for _, p := range parts[fi+1:] {
+		if !isVersionPart(p) {
+			break
+		}
+		nums = append(nums, p)
+	}
+	if len(nums) == 0 {
+		for i := fi - 1; i >= 0 && isVersionPart(parts[i]); i-- {
+			nums = append([]string{parts[i]}, nums...)
+		}
+	}
+	return family, strings.Join(nums, ".")
+}
+
+// pricingForModel returns the price list for a model ID: the exact
+// family+version row, else the family's latest row, else the default.
 func pricingForModel(model string) modelPrice {
-	if p, ok := modelPricing[model]; ok {
+	family, version := parseModelFamilyVersion(model)
+	if p, ok := modelPricing[family+"-"+version]; ok {
 		return p
 	}
-	for _, f := range modelFamilyPricing {
-		if strings.Contains(model, f.family) {
-			return modelPricing[f.key]
-		}
+	if key, ok := modelFamilyLatest[family]; ok {
+		return modelPricing[key]
 	}
 	return modelPricing["default"]
 }
@@ -280,7 +353,7 @@ func runLiveCosts() error {
 		}
 
 		// Extract cost from Claude transcript
-		cost, err := extractCostFromWorkDir(workDir)
+		cost, _, err := extractCostFromWorkDir(workDir)
 		if err != nil {
 			if costsVerbose {
 				fmt.Fprintf(os.Stderr, "[costs] could not extract cost for %s: %v\n", sess, err)
@@ -825,24 +898,25 @@ func calculateCost(usage *TokenUsage) float64 {
 }
 
 // extractCostFromWorkDir extracts cost from Claude Code transcript for a working directory.
-// This reads the most recent transcript file and sums all token usage.
-func extractCostFromWorkDir(workDir string) (float64, error) {
+// This reads the most recent transcript file and sums all token usage. It also
+// returns that transcript's file name so callers can tell sessions apart.
+func extractCostFromWorkDir(workDir string) (float64, string, error) {
 	projectDir, err := getClaudeProjectDir(workDir)
 	if err != nil {
-		return 0, fmt.Errorf("getting project dir: %w", err)
+		return 0, "", fmt.Errorf("getting project dir: %w", err)
 	}
 
 	transcriptPath, err := findLatestTranscript(projectDir)
 	if err != nil {
-		return 0, fmt.Errorf("finding transcript: %w", err)
+		return 0, "", fmt.Errorf("finding transcript: %w", err)
 	}
 
 	usage, err := parseTranscriptUsage(transcriptPath)
 	if err != nil {
-		return 0, fmt.Errorf("parsing transcript: %w", err)
+		return 0, "", fmt.Errorf("parsing transcript: %w", err)
 	}
 
-	return calculateCost(usage), nil
+	return calculateCost(usage), filepath.Base(transcriptPath), nil
 }
 
 // getTmuxSessionWorkDir gets the current working directory of a tmux session.
@@ -945,6 +1019,11 @@ func outputLedgerHuman(output CostsOutput, entries []CostEntry) error {
 // response, not once per session. CostUSD is therefore the cost accrued since
 // the previous entry for the same session (safe to sum), and CumulativeUSD is
 // the session transcript's running total at the time of the record.
+// Transcript names the transcript file the total came from, so a session
+// name that is reused across runs (a new transcript each time) starts a new
+// baseline instead of being charged only the difference between two
+// unrelated totals. Baseline marks a row that `gt costs digest` left behind
+// solely to preserve that baseline; it carries no spend.
 // Entries without CumulativeUSD predate this split and hold the cumulative
 // total in CostUSD; see collapseLegacyCostEntries.
 type CostLogEntry struct {
@@ -954,21 +1033,31 @@ type CostLogEntry struct {
 	Worker        string    `json:"worker,omitempty"`
 	CostUSD       float64   `json:"cost_usd"`
 	CumulativeUSD *float64  `json:"cumulative_usd,omitempty"`
+	Transcript    string    `json:"transcript,omitempty"`
+	Baseline      bool      `json:"baseline,omitempty"`
 	EndedAt       time.Time `json:"ended_at"`
 	WorkItem      string    `json:"work_item,omitempty"`
 }
 
-// lastRecordedCumulative returns the session's cumulative cost as of its most
-// recent entry in the costs log, and whether such an entry exists.
-func lastRecordedCumulative(logPath, sessionID string) (float64, bool) {
+// entryCumulative returns the session total an entry recorded. Legacy entries
+// stored it in CostUSD.
+func entryCumulative(e *CostLogEntry) float64 {
+	if e.CumulativeUSD != nil {
+		return *e.CumulativeUSD
+	}
+	return e.CostUSD
+}
+
+// costBaselines scans the costs log for the session's most recent entry
+// (lastAny) and its most recent entry for the given transcript (lastSame).
+// Either is nil when no such entry exists.
+func costBaselines(logPath, sessionID, transcript string) (lastAny, lastSame *CostLogEntry) {
 	f, err := os.Open(logPath)
 	if err != nil {
-		return 0, false
+		return nil, nil
 	}
 	defer f.Close()
 
-	var last float64
-	found := false
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -976,14 +1065,13 @@ func lastRecordedCumulative(logPath, sessionID string) (float64, bool) {
 		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil || entry.SessionID != sessionID {
 			continue
 		}
-		found = true
-		if entry.CumulativeUSD != nil {
-			last = *entry.CumulativeUSD
-		} else {
-			last = entry.CostUSD // legacy entry: cost_usd was the cumulative total
+		e := entry
+		lastAny = &e
+		if transcript != "" && entry.Transcript == transcript {
+			lastSame = &e
 		}
 	}
-	return last, found
+	return lastAny, lastSame
 }
 
 // collapseLegacyCostEntries rewrites CostUSD on legacy (cumulative) entries to
@@ -1066,15 +1154,16 @@ func runCostsRecord(cmd *cobra.Command, args []string) error {
 
 	// Extract the session's cumulative cost from the Claude transcript
 	var cumulative float64
+	var transcript string
 	extracted := false
 	if workDir != "" {
 		var err error
-		cumulative, err = extractCostFromWorkDir(workDir)
+		cumulative, transcript, err = extractCostFromWorkDir(workDir)
 		if err != nil {
 			if costsVerbose {
 				fmt.Fprintf(os.Stderr, "[costs] could not extract cost from transcript: %v\n", err)
 			}
-			cumulative = 0.0
+			cumulative, transcript = 0.0, ""
 		} else {
 			extracted = true
 		}
@@ -1085,18 +1174,26 @@ func runCostsRecord(cmd *cobra.Command, args []string) error {
 	// The Stop hook fires after every response, so log the increment since the
 	// previous record for this session rather than the running total.
 	cost := cumulative
-	if prev, ok := lastRecordedCumulative(logPath, session); ok {
-		switch {
-		case !extracted:
-			// Transcript unreadable this time: carry the baseline forward so the
-			// next successful record is not charged the whole session again.
-			cumulative, cost = prev, 0
-		case cumulative >= prev:
-			cost = cumulative - prev
-		default:
-			// Cumulative dropped: the transcript rolled over to a new session
-			// file, so everything in the new file is new spend.
+	lastAny, lastSame := costBaselines(logPath, session, transcript)
+	switch {
+	case !extracted:
+		// Transcript unreadable this time: carry the baseline forward so the
+		// next successful record is not charged the whole session again.
+		if lastAny != nil {
+			cumulative, transcript, cost = entryCumulative(lastAny), lastAny.Transcript, 0
 		}
+	case lastSame != nil:
+		// Same transcript as before: charge the growth since then. The clamp
+		// absorbs a total that shrank because the pricing table changed.
+		cost = math.Max(cumulative-entryCumulative(lastSame), 0)
+	case lastAny != nil && lastAny.Transcript == "" && !lastAny.Baseline:
+		// Previous entry predates transcript tracking: compare totals, and
+		// treat a drop as a new transcript whose whole total is new spend.
+		if prev := entryCumulative(lastAny); cumulative >= prev {
+			cost = cumulative - prev
+		}
+	default:
+		// First record for this transcript: everything in it is new spend.
 	}
 
 	// Parse session name
@@ -1110,6 +1207,7 @@ func runCostsRecord(cmd *cobra.Command, args []string) error {
 		Worker:        worker,
 		CostUSD:       cost,
 		CumulativeUSD: &cumulative,
+		Transcript:    transcript,
 		EndedAt:       time.Now(),
 		WorkItem:      recordWorkItem,
 	}
@@ -1363,8 +1461,8 @@ func querySessionCostEntries(targetDate time.Time) ([]CostEntry, error) {
 			continue
 		}
 
-		// Filter by target date
-		if logEntry.EndedAt.Format("2006-01-02") != targetDay {
+		// Filter by target date; baseline markers carry no spend
+		if logEntry.Baseline || logEntry.EndedAt.Format("2006-01-02") != targetDay {
 			continue
 		}
 
@@ -1483,6 +1581,8 @@ func deleteSessionCostEntries(targetDate time.Time) (int, error) {
 	targetDay := targetDate.Format("2006-01-02")
 	var keepLines []string
 	deletedCount := 0
+	lastDeleted := make(map[string]CostLogEntry)
+	var deletedSessions []string
 
 	// Filter out entries for target date
 	lines := strings.Split(string(data), "\n")
@@ -1499,9 +1599,14 @@ func deleteSessionCostEntries(targetDate time.Time) (int, error) {
 			continue
 		}
 
-		// Remove entries from target date
+		// Remove entries from target date, remembering each session's last
+		// one: `gt costs record` needs it as the baseline for its next increment.
 		if logEntry.EndedAt.Format("2006-01-02") == targetDay {
 			deletedCount++
+			if _, seen := lastDeleted[logEntry.SessionID]; !seen {
+				deletedSessions = append(deletedSessions, logEntry.SessionID)
+			}
+			lastDeleted[logEntry.SessionID] = logEntry
 			continue
 		}
 
@@ -1510,6 +1615,21 @@ func deleteSessionCostEntries(targetDate time.Time) (int, error) {
 
 	if deletedCount == 0 {
 		return 0, nil
+	}
+
+	// Re-append one baseline marker per session: no spend, same total.
+	for _, sessionID := range deletedSessions {
+		marker := lastDeleted[sessionID]
+		total := entryCumulative(&marker)
+		marker.CostUSD = 0
+		marker.CumulativeUSD = &total
+		marker.Baseline = true
+		marker.WorkItem = ""
+		b, err := json.Marshal(marker)
+		if err != nil {
+			return 0, fmt.Errorf("marshaling baseline entry: %w", err)
+		}
+		keepLines = append(keepLines, string(b))
 	}
 
 	// Rewrite file without deleted entries
