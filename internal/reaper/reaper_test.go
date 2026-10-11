@@ -614,8 +614,8 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	if scan.MoleculeStepCandidates != 2 {
 		t.Fatalf("Scan MoleculeStepCandidates = %d, want 2", scan.MoleculeStepCandidates)
 	}
-	if scan.ReapCandidates != 2 {
-		t.Fatalf("Scan ReapCandidates = %d, want 2", scan.ReapCandidates)
+	if scan.ReapCandidates != 1 {
+		t.Fatalf("Scan ReapCandidates = %d, want 1", scan.ReapCandidates)
 	}
 
 	beforeDryRun := state.statuses()
@@ -626,8 +626,8 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	if dryRun.MoleculeStepsClosed != 2 {
 		t.Fatalf("dry-run MoleculeStepsClosed = %d, want 2", dryRun.MoleculeStepsClosed)
 	}
-	if dryRun.Reaped != 2 {
-		t.Fatalf("dry-run Reaped = %d, want 2", dryRun.Reaped)
+	if dryRun.Reaped != 1 {
+		t.Fatalf("dry-run Reaped = %d, want 1", dryRun.Reaped)
 	}
 	if dryRun.OpenRemain != 12 {
 		t.Fatalf("dry-run OpenRemain = %d, want 12", dryRun.OpenRemain)
@@ -644,19 +644,19 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	if realRun.MoleculeStepsClosed != 2 {
 		t.Fatalf("real MoleculeStepsClosed = %d, want 2", realRun.MoleculeStepsClosed)
 	}
-	if realRun.Reaped != 2 {
-		t.Fatalf("real Reaped = %d, want 2", realRun.Reaped)
+	if realRun.Reaped != 1 {
+		t.Fatalf("real Reaped = %d, want 1", realRun.Reaped)
 	}
-	if realRun.OpenRemain != 8 {
-		t.Fatalf("real OpenRemain = %d, want 8", realRun.OpenRemain)
+	if realRun.OpenRemain != 9 {
+		t.Fatalf("real OpenRemain = %d, want 9", realRun.OpenRemain)
 	}
 
-	for _, id := range []string{"step-closed-mol-recent", "step-closed-mol-old", "step-non-molecule-parent", "stale-orphan"} {
+	for _, id := range []string{"step-closed-mol-recent", "step-closed-mol-old", "step-non-molecule-parent"} {
 		if got := state.status(id); got != "closed" {
 			t.Fatalf("%s status = %q, want closed", id, got)
 		}
 	}
-	for _, id := range []string{"step-mixed-parent-old", "step-external-parent-old", "step-open-parent-old", "agent-step", "fresh-orphan", "mol-open", "label-agent-orphan", "issue-label-agent-orphan"} {
+	for _, id := range []string{"step-mixed-parent-old", "step-external-parent-old", "step-open-parent-old", "agent-step", "stale-orphan", "fresh-orphan", "mol-open", "label-agent-orphan", "issue-label-agent-orphan"} {
 		if got := state.status(id); got != "open" {
 			t.Fatalf("%s status = %q, want open", id, got)
 		}
@@ -799,8 +799,8 @@ func TestScanAndReapAgreeOnCandidateSet(t *testing.T) {
 	if scanTotal != reapTotal {
 		t.Fatalf("scan predicted %d candidates but reap (dry-run) would close %d — preview is not truthful", scanTotal, reapTotal)
 	}
-	if scan.ReapCandidates != 2 {
-		t.Fatalf("scan.ReapCandidates = %d, want 2 (top-level-task + child-of-closed-parent)", scan.ReapCandidates)
+	if scan.ReapCandidates != 1 {
+		t.Fatalf("scan.ReapCandidates = %d, want 1 (child-of-closed-parent; top-level-task is parentless)", scan.ReapCandidates)
 	}
 }
 
@@ -916,18 +916,184 @@ func TestStaleNotificationsOnlyFastTrackReadMail(t *testing.T) {
 		}
 	}
 
-	// The normal max-age path still closes unread mail once it is past maxAge,
-	// regardless of delivery:acked.
+	reap, err := Reap(db, "testdb", maxAge, false)
+	if err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if reap.Reaped != 0 {
+		t.Fatalf("Reap Reaped = %d, want 0 (pending-25h is unread mail and must survive max-age)", reap.Reaped)
+	}
+	for id, want := range map[string]string{"acked-only-2h": "open", "pending-2h": "open", "pending-25h": "open"} {
+		if got := state.status(id); got != want {
+			t.Errorf("after Reap: %s status = %q, want %q", id, got, want)
+		}
+	}
+}
+
+func TestReapAndScanLeaveUnreadMailAlone(t *testing.T) {
+	now := time.Now().UTC()
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"unread-mail-48h":              {id: "unread-mail-48h", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour), labels: []string{"gt:message", "delivery:pending"}},
+			"unread-mail-issue-labels-48h": {id: "unread-mail-issue-labels-48h", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour), issueLabels: []string{"gt:message"}},
+			"closed-parent":                {id: "closed-parent", status: "closed", issueType: "task", createdAt: now.Add(-72 * time.Hour)},
+			"orphaned-step-48h":            {id: "orphaned-step-48h", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour)},
+		},
+		deps: []fakeDep{{issueID: "orphaned-step-48h", dependsOnID: "closed-parent", depType: "parent-child"}},
+		ops:  map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	maxAge := 24 * time.Hour
+	scan, err := Scan(db, "testdb", maxAge, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if scan.ReapCandidates != 1 {
+		t.Fatalf("scan.ReapCandidates = %d, want 1 (only orphaned-step-48h; mail is not a reap candidate)", scan.ReapCandidates)
+	}
+	dryRun, err := Reap(db, "testdb", maxAge, true)
+	if err != nil {
+		t.Fatalf("dry-run Reap: %v", err)
+	}
+	if dryRun.Reaped != scan.ReapCandidates {
+		t.Fatalf("dry-run Reap would close %d but scan predicted %d — Scan and Reap must share one predicate", dryRun.Reaped, scan.ReapCandidates)
+	}
+
 	reap, err := Reap(db, "testdb", maxAge, false)
 	if err != nil {
 		t.Fatalf("Reap: %v", err)
 	}
 	if reap.Reaped != 1 {
-		t.Fatalf("Reap Reaped = %d, want 1 (only pending-25h is past max-age)", reap.Reaped)
+		t.Fatalf("Reap Reaped = %d, want 1 (orphaned-step-48h only)", reap.Reaped)
 	}
-	for id, want := range map[string]string{"acked-only-2h": "open", "pending-2h": "open", "pending-25h": "closed"} {
+	for id, want := range map[string]string{"unread-mail-48h": "open", "unread-mail-issue-labels-48h": "open", "orphaned-step-48h": "closed"} {
 		if got := state.status(id); got != want {
-			t.Errorf("after Reap: %s status = %q, want %q", id, got, want)
+			t.Errorf("%s status = %q after Reap, want %q", id, got, want)
+		}
+	}
+}
+
+func TestReapClosesOnlyMoleculesAndOrphanedSteps(t *testing.T) {
+	now := time.Now().UTC()
+	old := now.Add(-72 * time.Hour)
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"merge-request":        {id: "merge-request", status: "open", issueType: "task", createdAt: old, labels: []string{"gt:merge-request"}},
+			"standalone-task":      {id: "standalone-task", status: "open", issueType: "task", createdAt: old},
+			"closed-molecule":      {id: "closed-molecule", status: "closed", issueType: "molecule", createdAt: old},
+			"step-closed-molecule": {id: "step-closed-molecule", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour)},
+			"step-missing-parent":  {id: "step-missing-parent", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour)},
+			"closed-task":          {id: "closed-task", status: "closed", issueType: "task", createdAt: old},
+			"step-closed-task":     {id: "step-closed-task", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour)},
+			"molecule-closed-par":  {id: "molecule-closed-par", status: "open", issueType: "molecule", createdAt: now.Add(-48 * time.Hour)},
+		},
+		deps: []fakeDep{
+			{issueID: "step-closed-molecule", dependsOnID: "closed-molecule", depType: "parent-child"},
+			{issueID: "step-missing-parent", dependsOnID: "purged", depType: "parent-child"},
+			{issueID: "step-closed-task", dependsOnID: "closed-task", depType: "parent-child"},
+			{issueID: "molecule-closed-par", dependsOnID: "closed-task", depType: "parent-child"},
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	maxAge := 24 * time.Hour
+	scan, err := Scan(db, "testdb", maxAge, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if scan.UnparentedStale != 2 {
+		t.Errorf("scan.UnparentedStale = %d, want 2 (merge-request, standalone-task)", scan.UnparentedStale)
+	}
+	if scan.ReapCandidates != 3 {
+		t.Errorf("scan.ReapCandidates = %d, want 3 (step-missing-parent, step-closed-task, molecule-closed-par)", scan.ReapCandidates)
+	}
+	if scan.MoleculeStepCandidates != 1 {
+		t.Errorf("scan.MoleculeStepCandidates = %d, want 1 (step-closed-molecule)", scan.MoleculeStepCandidates)
+	}
+	dryRun, err := Reap(db, "testdb", maxAge, true)
+	if err != nil {
+		t.Fatalf("dry-run Reap: %v", err)
+	}
+	if dryRun.Reaped != scan.ReapCandidates {
+		t.Fatalf("dry-run Reap would close %d but scan predicted %d", dryRun.Reaped, scan.ReapCandidates)
+	}
+
+	if _, err := Reap(db, "testdb", maxAge, false); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	for id, want := range map[string]string{
+		"merge-request": "open", "standalone-task": "open",
+		"step-closed-molecule": "closed", "step-missing-parent": "closed",
+		"step-closed-task": "closed", "molecule-closed-par": "closed",
+	} {
+		if got := state.status(id); got != want {
+			t.Errorf("%s status = %q after Reap, want %q", id, got, want)
+		}
+	}
+}
+
+func TestScanUnparentedCountFailureIsNonFatal(t *testing.T) {
+	now := time.Now().UTC()
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"closed-parent": {id: "closed-parent", status: "closed", issueType: "task", createdAt: now.Add(-72 * time.Hour)},
+			"orphaned-step": {id: "orphaned-step", status: "open", issueType: "task", createdAt: now.Add(-48 * time.Hour)},
+		},
+		deps:           []fakeDep{{issueID: "orphaned-step", dependsOnID: "closed-parent", depType: "parent-child"}},
+		ops:            map[int][]string{},
+		failUnparented: true,
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	scan, err := Scan(db, "testdb", 24*time.Hour, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Scan returned %v, want the unparented_stale failure recorded as an anomaly", err)
+	}
+	if scan.ReapCandidates != 1 {
+		t.Errorf("scan.ReapCandidates = %d, want 1", scan.ReapCandidates)
+	}
+	found := false
+	for _, a := range scan.Anomalies {
+		if a.Type == "unparented_scan_failed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("anomalies = %+v, want one of type unparented_scan_failed", scan.Anomalies)
+	}
+}
+
+func TestCloseStaleNotificationsStillClosesReadMail(t *testing.T) {
+	now := time.Now().UTC()
+	notif := func(id string, age time.Duration, extra ...string) *fakeWisp {
+		return &fakeWisp{id: id, status: "open", issueType: "task", createdAt: now.Add(-age), labels: append([]string{"gt:message", "msg-type:notification"}, extra...)}
+	}
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"read-2h":    notif("read-2h", 2*time.Hour, "read"),
+			"read-48h":   notif("read-48h", 48*time.Hour, "read"),
+			"unread-48h": notif("unread-48h", 48*time.Hour, "delivery:pending"),
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	res, err := CloseStaleNotifications(db, "testdb", FastTrackCloseAge, false)
+	if err != nil {
+		t.Fatalf("CloseStaleNotifications: %v", err)
+	}
+	if res.Closed != 2 {
+		t.Fatalf("CloseStaleNotifications closed %d, want 2 (read-2h, read-48h)", res.Closed)
+	}
+	for id, want := range map[string]string{"read-2h": "closed", "read-48h": "closed", "unread-48h": "open"} {
+		if got := state.status(id); got != want {
+			t.Errorf("%s status = %q, want %q", id, got, want)
 		}
 	}
 }
@@ -1008,6 +1174,8 @@ type fakeReaperState struct {
 	deps     []fakeDep
 	nextConn int
 	ops      map[int][]string
+	// failUnparented makes Scan's unparented_stale count query error.
+	failUnparented bool
 }
 
 func (s *fakeReaperState) status(id string) string {
@@ -1087,22 +1255,33 @@ func (s *fakeReaperState) isMoleculeStepCandidateLocked(id string) bool {
 	return false
 }
 
+// staleCandidatesLocked simulates the max-age Reap/Scan eligibility query.
 func (s *fakeReaperState) staleCandidatesLocked(cutoff time.Time, excludeMoleculeSteps bool) []string {
 	var ids []string
 	for id, w := range s.wisps {
 		if !isOpenWispStatus(w.status) || w.isAgentWisp() || !w.createdAt.Before(cutoff) {
 			continue
 		}
-		if s.hasOpenParentLocked(id) {
-			continue
-		}
-		// A top-level molecule (no parent-child dependency row at all) is
-		// never eligible via the missing-parent rule — only a molecule with
-		// an actual (closed or dangling) parent-child row is (hq-s4azi).
-		if w.issueType == "molecule" && !s.hasParentLocked(id) {
+		if !s.hasParentLocked(id) || s.hasOpenParentLocked(id) {
 			continue
 		}
 		if excludeMoleculeSteps && s.isMoleculeStepCandidateLocked(id) {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// unparentedStaleLocked mirrors Scan's unparented_stale count.
+func (s *fakeReaperState) unparentedStaleLocked(cutoff time.Time) []string {
+	var ids []string
+	for id, w := range s.wisps {
+		if !isOpenWispStatus(w.status) || w.isAgentWisp() || !w.createdAt.Before(cutoff) {
+			continue
+		}
+		if w.issueType == "molecule" || s.hasParentLocked(id) {
 			continue
 		}
 		ids = append(ids, id)
@@ -1239,6 +1418,14 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 	case strings.Contains(normalized, "issues i INNER JOIN") && strings.Contains(normalized, "i.title LIKE 'Plugin:"):
 		// ClosePluginDispatches targets the issues table; no fixture rows.
 		return fakeIDRows(nil), nil
+	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps w") && strings.Contains(normalized, "has_parent.issue_id IS NULL AND w.issue_type != 'molecule'"):
+		if c.state.failUnparented {
+			return nil, fmt.Errorf("injected unparented_stale failure")
+		}
+		if err := validateWAliasedAgentGuard(normalized); err != nil {
+			return nil, err
+		}
+		return fakeCountRows(len(c.state.unparentedStaleLocked(namedTime(args)))), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisps w") && strings.Contains(normalized, "created_at <"):
 		if err := validateStaleWispQuery(normalized); err != nil {
 			return nil, err
@@ -1470,7 +1657,7 @@ func validateStaleWispQuery(query string) error {
 		"open_parent.issue_id IS NULL",
 		"closed_molecule_step.issue_id IS NULL",
 		"has_parent.issue_id = w.id",
-		"w.issue_type != 'molecule' OR has_parent.issue_id IS NOT NULL",
+		"open_parent.issue_id IS NULL AND has_parent.issue_id IS NOT NULL",
 	)
 }
 
