@@ -152,6 +152,7 @@ type DoltServerManager struct {
 	nowFn             func() time.Time
 	escalateFn        func(int)
 	unhealthyAlertFn  func(error)
+	imposterAlertFn   func(error)
 	readOnlyAlertFn   func(error)
 	crashAlertFn      func(int)
 	listDatabasesFn   func() ([]string, error)
@@ -457,7 +458,7 @@ func (m *DoltServerManager) EnsureRunning() error {
 			if err := m.checkDatabaseIdentityLocked(); err != nil {
 				m.logger("Dolt server identity check failed: %v, restarting...", err)
 				if m.writeUnhealthySignal("imposter_detected", err.Error()) {
-					m.sendUnhealthyAlert(fmt.Errorf("identity check: %w", err))
+					m.sendImposterAlert(err)
 				} else {
 					m.logger("Dolt incident already active; suppressing duplicate identity alert")
 				}
@@ -724,6 +725,33 @@ This may indicate high load, connection exhaustion, or internal server errors.`,
 	go func() {
 		sendDoltAlertMail(townRoot, "mayor/", subject, body, logger)
 		sendDoltAlertToWitnesses(townRoot, subject, body, logger)
+	}()
+}
+
+// sendImposterAlert escalates CRITICAL when the configured Dolt port is held by
+// a process that is not the town's server. Agents connected to it see an
+// empty or wrong database, so this is an outage, not a load problem.
+func (m *DoltServerManager) sendImposterAlert(identityErr error) {
+	if m.imposterAlertFn != nil {
+		m.imposterAlertFn(identityErr)
+		return
+	}
+	townRoot := m.townRoot
+	logger := m.logger
+	summary := fmt.Sprintf("Dolt: port %d held by a server not serving %s", m.config.Port, m.config.DataDir)
+	reason := fmt.Sprintf("Identity check failed: %v. The daemon is killing the squatter and restarting the canonical server. "+
+		"Check for a bd auto-start from an embedded-mode .beads dir (BEADS_DOLT_AUTO_START should be 0 in gt sessions).", identityErr)
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "gt", "escalate", "-s", "CRITICAL", summary, "--reason", reason) //nolint:gosec // G204: args are constructed internally
+		cmd.Dir = townRoot
+		cmd.Env = append(os.Environ(), "BD_ACTOR=daemon")
+		setSysProcAttr(cmd)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			logger("Warning: failed to escalate Dolt imposter: %v (%s)", err, strings.TrimSpace(string(output)))
+		}
 	}()
 }
 

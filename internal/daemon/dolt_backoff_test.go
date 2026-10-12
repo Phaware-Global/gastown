@@ -1327,3 +1327,29 @@ func TestEnsureRunning_HealthyAfterReadOnlyRecovery(t *testing.T) {
 		t.Error("expected DOLT_UNHEALTHY signal to be cleared after recovery")
 	}
 }
+
+// TestEnsureRunning_ImposterEscalatesCritically verifies a failed identity
+// check goes to the imposter alert (CRITICAL escalation), not the generic
+// "unhealthy, high load" mail.
+func TestEnsureRunning_ImposterEscalatesCritically(t *testing.T) {
+	var imposterAlerts, unhealthyAlerts atomic.Int32
+	var running atomic.Bool
+	running.Store(true)
+
+	m := newTestManager(t)
+	m.runningFn = func() (int, bool) { return 1234, running.Load() }
+	m.writeProbeCheckFn = func() error { return nil }
+	m.identityCheckFn = func() error { return fmt.Errorf("server ownership mismatch") }
+	m.stopFn = func() { running.Store(false) }
+	m.startFn = func() error { running.Store(true); return nil }
+	m.sleepFn = func(time.Duration) {}
+	m.imposterAlertFn = func(error) { imposterAlerts.Add(1) }
+	m.unhealthyAlertFn = func(error) { unhealthyAlerts.Add(1) }
+
+	if err := m.EnsureRunning(); err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+	if imposterAlerts.Load() != 1 || unhealthyAlerts.Load() != 0 {
+		t.Fatalf("imposter alerts = %d, unhealthy alerts = %d; want 1, 0", imposterAlerts.Load(), unhealthyAlerts.Load())
+	}
+}
