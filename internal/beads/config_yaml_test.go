@@ -156,3 +156,18 @@ func TestConfigYAMLDisablesAutoExport(t *testing.T) {
 		})
 	}
 }
+
+func TestEnsureConfigYAML_DisablesDoltAutoStart(t *testing.T) {
+	beadsDir := t.TempDir()
+	path := filepath.Join(beadsDir, "config.yaml")
+	if err := os.WriteFile(path, []byte("prefix: gt\ndolt.auto-start: true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureConfigYAML(beadsDir, "gt"); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(path)
+	if got := string(data); strings.Count(got, "dolt.auto-start: false\n") != 1 || strings.Contains(got, "auto-start: true") {
+		t.Fatalf("config.yaml = %q, want dolt.auto-start: false exactly once", got)
+	}
+}

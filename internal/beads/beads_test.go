@@ -136,7 +136,30 @@ func TestBuildPinnedBDEnvUsesSelectedConnectionMetadata(t *testing.T) {
 		}
 	}
 	if got["BEADS_DOLT_AUTO_START"] != "0" {
-		t.Fatalf("BEADS_DOLT_AUTO_START should be preserved, got %q in %v", got["BEADS_DOLT_AUTO_START"], env)
+		t.Fatalf("BEADS_DOLT_AUTO_START should be 0, got %q in %v", got["BEADS_DOLT_AUTO_START"], env)
+	}
+}
+
+// A caller that did not inherit the guard from a gt session (the daemon, a
+// hand-run command) must still not let bd auto-start a server on the shared
+// port; an inherited "1" is overridden, not preserved.
+func TestBuildBDEnv_ForcesAutoStartOff(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for name, base := range map[string][]string{
+		"unset":     {"PATH=/usr/bin"},
+		"inherited": {"PATH=/usr/bin", "BEADS_DOLT_AUTO_START=1"},
+	} {
+		for builder, env := range map[string][]string{
+			"pinned":  BuildPinnedBDEnv(base, beadsDir),
+			"routing": BuildRoutingBDEnv(base, beadsDir),
+		} {
+			if n := countEnvPrefix(env, "BEADS_DOLT_AUTO_START="); n != 1 || !containsEnv(env, "BEADS_DOLT_AUTO_START=0") {
+				t.Errorf("%s/%s: want exactly BEADS_DOLT_AUTO_START=0, got %v", name, builder, env)
+			}
+		}
 	}
 }
 
@@ -188,8 +211,8 @@ func TestBuildPinnedBDEnvStripsCaseVariantTargetEnvWhenKeysAreCaseInsensitive(t 
 	if got["BEADS_DOLT_SERVER_HOST"] != "127.0.0.1" || got["BEADS_DOLT_SERVER_PORT"] != "4407" || got["BEADS_DOLT_PORT"] != "4407" {
 		t.Fatalf("connection env not restored canonically: %v", env)
 	}
-	if got["beads_dolt_auto_start"] != "0" {
-		t.Fatalf("case-variant BEADS_DOLT_AUTO_START should be preserved, got %v", env)
+	if _, ok := got["beads_dolt_auto_start"]; ok || got["BEADS_DOLT_AUTO_START"] != "0" {
+		t.Fatalf("case-variant BEADS_DOLT_AUTO_START should be replaced by the canonical 0, got %v", env)
 	}
 	if got["BD_EXPORT_AUTO"] != "false" {
 		t.Fatalf("BD_EXPORT_AUTO = %q, want false in %v", got["BD_EXPORT_AUTO"], env)
