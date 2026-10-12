@@ -94,7 +94,7 @@ func sanitizeBeadsDir(beadsDir string) string {
 // inherited selectors are stripped first so stale shell state cannot make bd
 // write to a different database than the selected .beads directory.
 func BuildPinnedBDEnv(base []string, beadsDir string) []string {
-	env := SuppressBDSideEffects(StripBDTargetEnv(base))
+	env := forceNoAutoStart(SuppressBDSideEffects(StripBDTargetEnv(base)))
 	beadsDir = sanitizeBeadsDir(beadsDir)
 	if beadsDir == "" {
 		return addGTDerivedDoltTargetEnv(env)
@@ -111,7 +111,7 @@ func BuildPinnedBDEnv(base []string, beadsDir string) []string {
 // bd prefix routing. It strips stale target/database selectors, then re-adds only
 // connection host/port from fallbackBeadsDir so routing can choose the database.
 func BuildRoutingBDEnv(base []string, fallbackBeadsDir string) []string {
-	env := SuppressBDSideEffects(StripBDTargetEnv(base))
+	env := forceNoAutoStart(SuppressBDSideEffects(StripBDTargetEnv(base)))
 	env = append(env, doltTargetEnvFromBeadsDir(sanitizeBeadsDir(fallbackBeadsDir))...)
 	return addGTDerivedDoltTargetEnv(env)
 }
@@ -212,6 +212,16 @@ func SuppressBDSideEffects(env []string) []string {
 		"BD_EXPORT_GIT_ADD=false",
 		"BD_NO_GIT_OPS=true",
 	)
+}
+
+// forceNoAutoStart pins BEADS_DOLT_AUTO_START=0 regardless of what the caller
+// inherited. The town's Dolt server is managed by gt; when it is briefly down
+// (reboot, restart), an auto-starting bd binds the shared port from its own
+// .beads/dolt dir and every agent then talks to an empty database. Callers such
+// as the daemon do not inherit the variable from a gt session, so it cannot be
+// left to the environment.
+func forceNoAutoStart(env []string) []string {
+	return append(StripEnvKey(env, "BEADS_DOLT_AUTO_START"), "BEADS_DOLT_AUTO_START=0")
 }
 
 func forceBDReadOnly(env []string) []string {
