@@ -1247,6 +1247,24 @@ func doltProcessOwnerPath(townRoot string, pid int) string {
 	)
 }
 
+// ForeignListener reports a process listening on the town's local Dolt port
+// that is not the town's server (wrong data dir/config/cwd) — typically a
+// sql-server bd auto-started from a .beads/dolt dir. owner is the path evidence
+// that disqualified it. Unlike IsRunning, which falls back to bare TCP
+// reachability and reports such a listener as running with PID 0, this names it.
+// Remote configs have no local listener to inspect and never report foreign.
+func ForeignListener(townRoot string) (pid int, owner string, foreign bool) {
+	config := DefaultConfig(townRoot)
+	if config.IsRemote() {
+		return 0, "", false
+	}
+	pid = findDoltServerOnPort(config.Port)
+	if pid <= 0 || doltProcessMatchesTown(townRoot, pid, config) {
+		return 0, "", false
+	}
+	return pid, doltProcessOwnerPath(townRoot, pid), true
+}
+
 // VerifyServerDataDir checks whether the running Dolt server is serving the
 // expected databases from the correct data directory. Returns true if the server
 // is legitimate (serving databases from config.DataDir), false if it's an imposter
@@ -1258,6 +1276,15 @@ func VerifyServerDataDir(townRoot string) (bool, error) {
 	running, pid, err := IsRunning(townRoot)
 	if err != nil || !running {
 		return false, fmt.Errorf("server not running")
+	}
+
+	// IsRunning reports PID 0 when the port answers but the listener isn't ours.
+	// With no PID, the owner check below would fall back to the state file's
+	// data dir — the canonical one, left by the server that went down — and
+	// vouch for the squatter.
+	if fpid, fowner, foreign := ForeignListener(townRoot); foreign {
+		expectedDir, _ := filepath.Abs(config.DataDir)
+		return false, fmt.Errorf("server ownership mismatch: expected %s, got %s (PID %d)", expectedDir, fowner, fpid)
 	}
 
 	ownerPath := doltProcessOwnerPath(townRoot, pid)
