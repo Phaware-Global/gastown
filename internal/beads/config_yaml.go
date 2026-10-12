@@ -108,11 +108,14 @@ func ensureConfigYAML(beadsDir, prefix string, onlyIfMissing bool) error {
 	// Gas Town stores beads in Dolt/server-mode runtime directories that are often
 	// redirected or gitignored; bd's post-run auto-export git-add is noisy there.
 	wantExportAuto := "export.auto: \"false\""
+	// bd launches a local sql-server from .beads/dolt when the shared one is
+	// unreachable; on the town's port that squats the canonical server.
+	wantAutoStart := "dolt.auto-start: false"
 
 	data, err := os.ReadFile(configPath)
 	if os.IsNotExist(err) {
 		// New config: include all Gas Town defaults
-		content := wantPrefix + "\n" + wantIssuePrefix + "\n" + wantIdleTimeout + "\n" + wantExportAuto + "\n"
+		content := wantPrefix + "\n" + wantIssuePrefix + "\n" + wantIdleTimeout + "\n" + wantExportAuto + "\n" + wantAutoStart + "\n"
 		return os.WriteFile(configPath, []byte(content), 0644)
 	}
 	if err != nil {
@@ -128,6 +131,7 @@ func ensureConfigYAML(beadsDir, prefix string, onlyIfMissing bool) error {
 	foundIssuePrefix := false
 	foundIdleTimeout := false
 	foundExportAuto := false
+	foundAutoStart := false
 
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -151,6 +155,11 @@ func ensureConfigYAML(beadsDir, prefix string, onlyIfMissing bool) error {
 			foundExportAuto = true
 			continue
 		}
+		if strings.HasPrefix(trimmed, "dolt.auto-start:") {
+			lines[i] = wantAutoStart
+			foundAutoStart = true
+			continue
+		}
 	}
 
 	if !foundPrefix {
@@ -164,6 +173,9 @@ func ensureConfigYAML(beadsDir, prefix string, onlyIfMissing bool) error {
 	}
 	if !foundExportAuto {
 		lines = append(lines, wantExportAuto)
+	}
+	if !foundAutoStart {
+		lines = append(lines, wantAutoStart)
 	}
 
 	newContent := strings.Join(lines, "\n")
