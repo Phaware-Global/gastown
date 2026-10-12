@@ -45,6 +45,15 @@ func doltBackupInterval(config *DaemonPatrolConfig) time.Duration {
 	return defaultDoltBackupInterval
 }
 
+// doltOffsiteEnabled reports whether the iCloud offsite rsync should run.
+// Defaults to true when unset.
+func doltOffsiteEnabled(config *DoltBackupConfig) bool {
+	if config != nil && config.Offsite != nil {
+		return *config.Offsite
+	}
+	return true
+}
+
 // syncDoltBackups syncs each production database to its configured backup location.
 // Non-fatal: errors are logged but don't stop the daemon.
 func (d *Daemon) syncDoltBackups() {
@@ -127,6 +136,11 @@ func (d *Daemon) syncDoltBackups() {
 	// molecule from here: it records the offsite step from the actual rsync
 	// outcome and performs the final close.
 	if synced == 0 {
+		mol.closeStep("offsite")
+		return
+	}
+	if !doltOffsiteEnabled(config) {
+		d.logger.Printf("dolt_backup: offsite sync disabled by config, skipping")
 		mol.closeStep("offsite")
 		return
 	}
