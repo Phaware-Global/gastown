@@ -141,7 +141,7 @@ func (d *Daemon) syncDoltBackups() {
 	}
 	if !doltOffsiteEnabled(config) {
 		d.logger.Printf("dolt_backup: offsite sync disabled by config, skipping")
-		mol.closeStep("offsite")
+		mol.failStep("offsite", "skipped: offsite disabled by config")
 		return
 	}
 	if !d.offsiteBackupRunning.CompareAndSwap(false, true) {
