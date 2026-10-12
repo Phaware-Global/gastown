@@ -510,6 +510,12 @@ type WitnessThresholds struct {
 	// possibly stuck at startup (e.g., auth 401 blocking initialization, default "5m").
 	// The witness exposes the signal; patrol formula decides whether to escalate.
 	HeartbeatStartupGrace string `json:"heartbeat_startup_grace,omitempty"`
+
+	// IdleUnsubmittedThreshold is how long a live polecat's heartbeat may be
+	// stale, with pushed commits on a clean branch and its bead still open,
+	// before the witness nudges it to run gt done (default "15m"). The witness
+	// only nudges; the polecat decides whether its work is finished.
+	IdleUnsubmittedThreshold string `json:"idle_unsubmitted_threshold,omitempty"`
 }
 
 // DefaultOperationalConfig returns an OperationalConfig with all defaults.
