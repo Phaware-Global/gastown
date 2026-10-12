@@ -22,7 +22,7 @@ type finishedNotSubmittedInput struct {
 	HookOpen        bool // the hooked bead exists and is still open/hooked/in_progress
 	Submitted       bool // submission evidence (MR) already exists
 	NoMergeOrFix    bool // bead is no_merge / review-fix: it lives on an existing PR branch
-	OnPolecatBranch bool // HEAD is on a polecat/* branch (not detached, not the base)
+	OnPolecatBranch bool // HEAD is on this polecat's own branch for its hooked bead
 	Clean           bool // no uncommitted changes, stash or unpushed commits
 	AheadOfBase     int  // commits ahead of the base branch
 }
@@ -33,6 +33,22 @@ func isFinishedNotSubmitted(in finishedNotSubmittedInput, threshold time.Duratio
 	return in.HasHeartbeat && in.HeartbeatAge >= threshold &&
 		in.HookOpen && !in.Submitted && !in.NoMergeOrFix &&
 		in.OnPolecatBranch && in.Clean && in.AheadOfBase > 0
+}
+
+// branchOwnedByPolecat reports whether branch is polecat/<polecatName>/<hookBead>
+// with an optional @suffix. A worktree can sit on another polecat's branch (a
+// branch collision or inherited work); gt done from there would submit that
+// branch as this bead's MR, so only an exact owner-and-bead match counts.
+func branchOwnedByPolecat(branch, polecatName, hookBead string) bool {
+	if polecatName == "" || hookBead == "" {
+		return false
+	}
+	rest, ok := strings.CutPrefix(branch, "polecat/"+polecatName+"/")
+	if !ok {
+		return false
+	}
+	bead, _, _ := strings.Cut(rest, "@")
+	return bead == hookBead
 }
 
 // detectFinishedNotSubmitted nudges a live polecat whose work is pushed and
@@ -83,7 +99,7 @@ func detectFinishedNotSubmitted(bd *BdCli, workDir, townRoot, rigName, polecatNa
 	if err != nil {
 		return ZombieResult{}, false
 	}
-	in.OnPolecatBranch = strings.HasPrefix(branch, "polecat/")
+	in.OnPolecatBranch = branchOwnedByPolecat(branch, polecatName, snap.HookBead)
 	ws, err := g.CheckUncommittedWork()
 	if err != nil {
 		return ZombieResult{}, false
