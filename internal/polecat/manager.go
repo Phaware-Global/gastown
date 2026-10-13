@@ -1368,7 +1368,7 @@ func (e *UnpublishedWorkError) Error() string {
 		"The worktree has been left intact. To recover, list the commits with:\n"+
 		"  %s\n"+
 		"then fix the cause (e.g. amend a hooks-bypassed commit so hooks re-run) or push or move the commits somewhere durable, and retry the removal. "+
-		"Discarding them requires a deliberate nuclear removal.",
+		"Do not use gt polecat nuke to discard them: it pushes the branch, hooks-bypassed commits included, before deleting it.",
 		e.PolecatName, e.Reason, count, e.Branch, e.ClonePath, e.RecoveryCommand())
 }
 
@@ -1402,7 +1402,7 @@ func (e *UnpublishedWorkError) Unwrap() error {
 // unpushed commits (or that can't be established) the removal fails with an
 // UnpublishedWorkError and the caller must not touch the worktree (gt-renk).
 // Refusing to publish must never be followed by destroying. A detached HEAD
-// has no branch to push; removal proceeds only once a durable ref is confirmed to hold HEAD.
+// has no branch to push; removal proceeds only once a remote-tracking or preserve ref is confirmed to hold HEAD.
 func (m *Manager) pushBeforeRemoval(name, clonePath string) error {
 	polecatGit := git.NewGit(clonePath)
 	branch, brErr := polecatGit.CurrentBranch()
@@ -1450,13 +1450,13 @@ func (m *Manager) pushBeforeRemoval(name, clonePath string) error {
 		// best-effort, so confirm a ref really holds HEAD rather than assume.
 		held, holdErr := polecatGit.HeadHeldByDurableRef()
 		if holdErr == nil && held {
-			style.PrintWarning("%s: %s; detached HEAD is held by a durable ref, continuing", name, refusal)
+			style.PrintWarning("%s: %s; detached HEAD is held by a remote-tracking or preserve ref, continuing", name, refusal)
 			return nil
 		}
 		if holdErr != nil {
 			refusal = fmt.Sprintf("%s (and could not confirm a ref holds the detached HEAD: %v)", refusal, holdErr)
 		} else {
-			refusal = fmt.Sprintf("%s (and no branch, remote-tracking or preserve ref holds the detached HEAD)", refusal)
+			refusal = fmt.Sprintf("%s (and no remote-tracking or preserve ref holds the detached HEAD)", refusal)
 		}
 	}
 	return &UnpublishedWorkError{

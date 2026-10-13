@@ -1731,6 +1731,33 @@ func TestRemoveWithOptions_DetachedHeadWithoutPreserveRefIsRefused(t *testing.T)
 	}
 }
 
+// TestRemoveWithOptions_DetachedHeadHeldOnlyByPolecatBranchIsRefused: the
+// polecat's own refs/heads/polecat/* branch is force-deleted by gt polecat gc
+// and the sling rollback, so it must not count as a durable holder of a
+// detached HEAD's unpushed (here hooks-bypassed) commits.
+func TestRemoveWithOptions_DetachedHeadHeldOnlyByPolecatBranchIsRefused(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	useBareOrigin(t, mayorRig)
+
+	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	commit := commitInWorktree(t, polecat.ClonePath, "unverified.txt", "Gastown-Unverified: pre-commit hook failed")
+	wtGit := git.NewGit(polecat.ClonePath)
+	if err := wtGit.CheckoutDetach("HEAD"); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+
+	err = mgr.RemoveWithOptions("toast", true, false, false)
+	if !errors.Is(err, ErrUnpublishedWork) {
+		t.Fatalf("error = %v, want ErrUnpublishedWork: only the polecat's own branch holds the commit", err)
+	}
+	if _, statErr := os.Stat(polecat.ClonePath); statErr != nil {
+		t.Fatalf("worktree was removed although only a gc-deletable branch holds %s: %v", commit, statErr)
+	}
+}
+
 // TestUnpublishedWorkError_RecoveryHint pins that the hint works for a branch
 // that was never pushed and never interpolates the polecat-controlled branch
 // name into a command unquoted.
@@ -1750,6 +1777,9 @@ func TestUnpublishedWorkError_RecoveryHint(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "--nuclear") {
 		t.Errorf("hint names a flag the remove command does not have: %v", err)
+	}
+	if strings.Contains(err.Error(), "nuclear removal") || !strings.Contains(err.Error(), "gt polecat nuke to discard them: it pushes the branch") {
+		t.Errorf("hint must warn that gt polecat nuke pushes the branch, not recommend it: %v", err)
 	}
 	out, runErr := exec.Command("sh", "-c", unpublished.RecoveryCommand()).CombinedOutput()
 	if runErr != nil || !strings.Contains(string(out), "polecat work unverified.txt") {
