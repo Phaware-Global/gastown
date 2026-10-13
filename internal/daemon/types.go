@@ -261,6 +261,12 @@ type DoltBackupConfig struct {
 	// Databases lists specific database names to back up.
 	// If empty, auto-discovers databases with configured backup remotes.
 	Databases []string `json:"databases,omitempty"`
+
+	// Offsite controls the rsync of the local backups to iCloud Drive after
+	// each sync. Default: true. Set false on machines that are not signed
+	// into iCloud (the mirror never leaves the disk) or that have another
+	// offsite path (e.g. the dolt-archive JSONL git repo).
+	Offsite *bool `json:"offsite,omitempty"`
 }
 
 // JsonlGitBackupConfig holds configuration for the jsonl_git_backup patrol.
