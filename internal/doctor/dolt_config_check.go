@@ -128,6 +128,13 @@ func (c *DoltConfigCheck) checkBeadsDir(ctx *CheckContext, beadsDir, defaultHost
 	if port == 0 {
 		port = defaultPort
 	}
+	// A local metadata port that disagrees with the town's configured Dolt port
+	// is stale (e.g. left by a rogue bd auto-start) and stale-dolt-port repairs
+	// it later in the same run. Pinning it into a tracked config.yaml would aim
+	// every worktree at a port nothing listens on.
+	if configured := configuredDoltPort(ctx.TownRoot); configured != 0 && port != configured && isLocalDoltHost(host) {
+		port = configured
+	}
 
 	issues := doltConfigIssues(string(data))
 	if len(issues) == 0 {
@@ -275,4 +282,12 @@ func ensureDoltConfigKeys(beadsDir, host string, port int) error {
 		return nil
 	}
 	return os.WriteFile(configPath, []byte(newContent), 0644)
+}
+
+func isLocalDoltHost(host string) bool {
+	switch host {
+	case "", "127.0.0.1", "localhost", "::1", "[::1]":
+		return true
+	}
+	return false
 }
