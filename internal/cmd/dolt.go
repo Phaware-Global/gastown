@@ -606,6 +606,19 @@ func runDoltStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	if running {
+		// A listener on the port is not the same as our server. A squatter (e.g.
+		// a sql-server bd auto-started from a .beads/dolt dir) answers queries
+		// from the wrong data dir, so report it instead of reading healthy.
+		if legitimate, idErr := doltserver.VerifyServerDataDir(townRoot); !legitimate {
+			fmt.Printf("%s Dolt server is %s\n", style.Bold.Render("!!!"), style.Bold.Render("UNHEALTHY"))
+			fmt.Printf("  Port %d is answering, but not from this town's data dir %s\n", config.Port, config.DataDir)
+			if idErr != nil {
+				fmt.Printf("  %v\n", idErr)
+			}
+			fmt.Printf("  Fix: %s (stops the squatter and starts the canonical server)\n", style.Dim.Render("gt dolt start"))
+			return fmt.Errorf("dolt server on port %d is not serving %s", config.Port, config.DataDir)
+		}
+
 		fmt.Printf("%s Dolt server is %s (PID %d)\n",
 			style.Bold.Render("●"),
 			style.Bold.Render("running"),
