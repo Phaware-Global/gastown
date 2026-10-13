@@ -140,25 +140,31 @@ func TestStripOverlayCLAUDEmd_LeavesUnrelatedStagedFilesStaged(t *testing.T) {
 	}
 }
 
-// Restoring a tracked CLAUDE.local.md must not overwrite the polecat's
-// on-disk overlay.
-func TestStripOverlayCLAUDEmd_PreservesWorkingTreeOverlay(t *testing.T) {
-	dir := overlayRepo(t, map[string]string{"CLAUDE.local.md": "repo-owned\n"})
-	const overlay = "repo-owned\npolecat overlay\n"
-	path := filepath.Join(dir, "CLAUDE.local.md")
-	if err := os.WriteFile(path, []byte(overlay), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	runGit(t, dir, "commit", "-am", "feat: work")
+// A tracked overlay file is restored on disk too, so the worktree is left
+// clean and gt done's idle sync (which skips on non-runtime dirt) still runs.
+func TestStripOverlayCLAUDEmd_RestoredTrackedFilesLeaveWorktreeClean(t *testing.T) {
+	for _, name := range []string{"CLAUDE.local.md", "CLAUDE.md"} {
+		t.Run(name, func(t *testing.T) {
+			dir := overlayRepo(t, map[string]string{name: "repo-owned\n"})
+			path := filepath.Join(dir, name)
+			if err := os.WriteFile(path, []byte("repo-owned\n"+templates.PolecatLifecycleMarker+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runGit(t, dir, "commit", "-am", "feat: work")
 
-	if !stripOverlayCLAUDEmd(git.NewGit(dir), "main") {
-		t.Fatal("expected a cleanup commit")
-	}
+			if !stripOverlayCLAUDEmd(git.NewGit(dir), "main") {
+				t.Fatal("expected a cleanup commit")
+			}
 
-	if got, _ := os.ReadFile(path); string(got) != overlay {
-		t.Errorf("working-tree CLAUDE.local.md = %q, want the overlay preserved", got)
-	}
-	if got := gitOut(t, dir, "diff", "--name-only", "origin/main", "HEAD"); got != "" {
-		t.Errorf("branch diff vs origin/main = %q, want empty", got)
+			if got, _ := os.ReadFile(path); string(got) != "repo-owned\n" {
+				t.Errorf("working-tree %s = %q, want origin content", name, got)
+			}
+			if got := gitOut(t, dir, "status", "--porcelain"); got != "" {
+				t.Errorf("worktree dirty after cleanup: %q", got)
+			}
+			if got := gitOut(t, dir, "diff", "--name-only", "origin/main", "HEAD"); got != "" {
+				t.Errorf("branch diff vs origin/main = %q, want empty", got)
+			}
+		})
 	}
 }

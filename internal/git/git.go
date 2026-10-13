@@ -1058,8 +1058,9 @@ func (g *Git) CommitNoVerify(message string) error {
 // version at ref (removed when ref does not track them), authored as
 // name/email. The commit is built in a temporary index, so nothing else staged
 // in the real index is committed and no hook runs. The real index entries for
-// the paths are then moved to match the new HEAD; the working tree is not
-// touched.
+// the paths are then moved to match the new HEAD, and paths that ref tracks
+// are restored on disk too (a modified tracked file would otherwise read as
+// dirt); paths ref does not track keep their working-tree copy.
 func (g *Git) CommitPathsFromRef(ref string, paths []string, message, name, email string) error {
 	parent, err := g.Rev("HEAD")
 	if err != nil {
@@ -1079,7 +1080,7 @@ func (g *Git) CommitPathsFromRef(ref string, paths []string, message, name, emai
 	if _, err := g.runWithEnv([]string{"read-tree", "HEAD"}, tmpEnv); err != nil {
 		return err
 	}
-	if err := g.setIndexPathsFromRef(ref, paths, tmpEnv); err != nil {
+	if err := g.setIndexPathsFromRef(ref, paths, tmpEnv, false); err != nil {
 		return err
 	}
 	tree, err := g.runWithEnv([]string{"write-tree"}, tmpEnv)
@@ -1093,13 +1094,14 @@ func (g *Git) CommitPathsFromRef(ref string, paths []string, message, name, emai
 	if _, err := g.run("update-ref", "-m", "commit: "+message, "HEAD", commit, parent); err != nil {
 		return err
 	}
-	return g.setIndexPathsFromRef(ref, paths, nil)
+	return g.setIndexPathsFromRef(ref, paths, nil, true)
 }
 
 // setIndexPathsFromRef points each path's index entry at its version in ref,
 // or removes the entry when ref does not track it. extraEnv may redirect the
-// index via GIT_INDEX_FILE.
-func (g *Git) setIndexPathsFromRef(ref string, paths []string, extraEnv []string) error {
+// index via GIT_INDEX_FILE. With restoreWorktree, tracked paths are checked out
+// from ref (index and working tree) instead of only re-pointing the index.
+func (g *Git) setIndexPathsFromRef(ref string, paths []string, extraEnv []string, restoreWorktree bool) error {
 	for _, p := range paths {
 		entry, err := g.run("ls-tree", ref, "--", p)
 		if err != nil {
@@ -1107,6 +1109,12 @@ func (g *Git) setIndexPathsFromRef(ref string, paths []string, extraEnv []string
 		}
 		if entry == "" {
 			if _, err := g.runWithEnv([]string{"update-index", "--force-remove", "--", p}, extraEnv); err != nil {
+				return err
+			}
+			continue
+		}
+		if restoreWorktree {
+			if err := g.CheckoutFileFromRef(ref, p); err != nil {
 				return err
 			}
 			continue

@@ -2973,8 +2973,8 @@ const (
 // authored for this task, riding into an unrelated MR.
 //
 // The cleanup commit contains only the overlay paths: anything else staged
-// stays staged and uncommitted, and the working tree (including the polecat's
-// on-disk overlay) is left alone.
+// stays staged and uncommitted. Tracked overlay files are restored on disk as
+// well, so the worktree is not left dirty (the overlay is regenerated).
 //
 // Returns true if a cleanup commit was created.
 func stripOverlayCLAUDEmd(g *git.Git, defaultBranch string) bool {
