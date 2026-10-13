@@ -506,3 +506,14 @@ func TestPressureThresholds_JSON(t *testing.T) {
 		t.Errorf("JSON max sessions: got %v, want 8", raw.Daemon.PressureMaxSessionsV())
 	}
 }
+
+func TestWitnessIdleUnsubmittedThresholdD(t *testing.T) {
+	var wt *WitnessThresholds
+	if got := wt.IdleUnsubmittedThresholdD(); got != DefaultWitnessIdleUnsubmittedThreshold {
+		t.Fatalf("nil receiver = %v, want default", got)
+	}
+	wt = &WitnessThresholds{IdleUnsubmittedThreshold: "7m"}
+	if got := wt.IdleUnsubmittedThresholdD(); got != 7*time.Minute {
+		t.Fatalf("configured = %v, want 7m", got)
+	}
+}

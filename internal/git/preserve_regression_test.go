@@ -326,7 +326,7 @@ func TestAutoPreserveUncommittedWork_HookOutputIsRedacted(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell hook script not portable to windows")
 	}
-	dir := initTestRepo(t)
+	dir, _, mainBranch := initTestRepoWithRemote(t)
 	g := NewGit(dir)
 	branch := "polecat/foo/gt-y8ts@abc123"
 	runGitTestCmd(t, dir, "checkout", "-b", branch)
@@ -339,7 +339,7 @@ func TestAutoPreserveUncommittedWork_HookOutputIsRedacted(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	result, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{})
+	result, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{ProtectedBranches: []string{mainBranch}})
 	if err != nil {
 		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
 	}
