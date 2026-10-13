@@ -1692,6 +1692,10 @@ const (
 	// session stayed alive with an open hook and no fresh heartbeat. This catches
 	// the post-submit/pre-exit ghost idle gap from GH#3055.
 	ZombieSubmittedStillRunning ZombieClassification = "submitted-still-running"
+	// ZombieFinishedNotSubmitted: live session, pushed commits on a clean branch,
+	// bead still open and no heartbeat for a long time, but gt done never ran.
+	// The witness only nudges the polecat; it never runs gt done for it.
+	ZombieFinishedNotSubmitted ZombieClassification = "finished-not-submitted"
 )
 
 // ImpliesActiveWork returns true if this classification indicates the polecat
@@ -1980,6 +1984,12 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 	// and the hook is either gone or still open, nudge the live session to finish
 	// instead of letting it sit idle forever.
 	if zombie, found := detectSubmittedStillRunning(bd, workDir, polecatName, sessionName, t, hb, snap, witCfg.HeartbeatStartupGraceD()); found {
+		return zombie, true
+	}
+
+	// Finished and pushed but never ran gt done (the case the Stop hook used to
+	// cover by running gt done on every turn): nudge, never act.
+	if zombie, found := detectFinishedNotSubmitted(bd, workDir, townRoot, rigName, polecatName, sessionName, t, hb, snap, witCfg.IdleUnsubmittedThresholdD()); found {
 		return zombie, true
 	}
 
