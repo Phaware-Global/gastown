@@ -7,8 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/steveyegge/gastown/internal/beads"
 )
 
 // maxBeadsScanDepth bounds the walk for .beads stores under the town root. The
@@ -32,7 +30,7 @@ type AutoStartConfigCheck struct {
 // prefix to write a new one with) is still reported; it is never passed over.
 type autoStartIssue struct {
 	dir     string
-	missing bool   // no config.yaml; Fix creates the full default config
+	missing bool   // no config.yaml
 	reason  string // non-empty: not fixable, and why
 }
 
@@ -69,14 +67,14 @@ func (c *AutoStartConfigCheck) Run(ctx *CheckContext) *CheckResult {
 		data, err := readRegularConfig(filepath.Join(dir, "config.yaml"))
 		switch {
 		case errors.Is(err, os.ErrNotExist):
-			// bd falls back to its defaults, which auto-start. Fix writes the
-			// full default config (prefix included) rather than a one-liner,
-			// which would make later repairs see a file and skip.
-			is := autoStartIssue{dir: dir, missing: true}
-			if beads.ConfigDefaultsFromMetadata(dir, "") == "" {
-				is.reason = "config.yaml is missing and metadata.json has no prefix to create it with"
-			}
-			c.issues = append(c.issues, is)
+			// bd falls back to its defaults, which auto-start. The check cannot
+			// create the file: a new config.yaml needs the store's prefix, and the
+			// one derivable from metadata.json is wrong for canonical rig stores.
+			c.issues = append(c.issues, autoStartIssue{
+				dir:     dir,
+				missing: true,
+				reason:  "auto-start not pinned off; set dolt.auto-start: false manually in config.yaml",
+			})
 		case err != nil:
 			c.issues = append(c.issues, autoStartIssue{dir: dir, reason: "refused: " + err.Error()})
 		case !configDisablesAutoStart(string(data)):
@@ -100,8 +98,6 @@ func (c *AutoStartConfigCheck) Run(ctx *CheckContext) *CheckResult {
 		case is.reason != "":
 			details[i] += " (cannot fix: " + is.reason + ")"
 			unfixable++
-		case is.missing:
-			details[i] += " (config.yaml missing)"
 		}
 	}
 	hint := "Run 'gt doctor --fix' to set dolt.auto-start: false"
@@ -117,8 +113,9 @@ func (c *AutoStartConfigCheck) Run(ctx *CheckContext) *CheckResult {
 	}
 }
 
-// Fix repairs every fixable store Run flagged and keeps going past failures. It
-// returns an error naming each store it could not repair or refused to touch.
+// Fix sets dolt.auto-start: false in every existing config.yaml Run flagged and
+// keeps going past failures. It never creates a file. It returns an error naming
+// each store it could not repair or refused to touch.
 func (c *AutoStartConfigCheck) Fix(ctx *CheckContext) error {
 	var errs []error
 	for _, is := range c.issues {
@@ -126,10 +123,6 @@ func (c *AutoStartConfigCheck) Fix(ctx *CheckContext) error {
 		switch {
 		case is.reason != "":
 			errs = append(errs, fmt.Errorf("%s: %s", rel, is.reason))
-		case is.missing:
-			if err := beads.EnsureConfigYAMLFromMetadataIfMissing(is.dir, ""); err != nil {
-				errs = append(errs, fmt.Errorf("%s: %w", rel, err))
-			}
 		default:
 			if err := setConfigAutoStartDisabled(is.dir); err != nil {
 				errs = append(errs, fmt.Errorf("%s: %w", rel, err))
