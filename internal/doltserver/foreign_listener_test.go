@@ -16,6 +16,7 @@ import (
 // is not the town's server.
 func listenForeign(t *testing.T) int {
 	t.Helper()
+	t.Cleanup(SetDoltProcessDetectorForTest(func(int) bool { return true }))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -92,5 +93,21 @@ func TestForeignListener_NothingListening(t *testing.T) {
 
 	if pid, _, foreign := ForeignListener(townRoot); foreign {
 		t.Fatalf("no listener on port, got foreign pid %d", pid)
+	}
+}
+
+// A port forwarded into a container is held by a non-dolt process (docker-proxy,
+// vpnkit, ssh -L). It must not read as a squatter: that would mark a healthy
+// containerized server UNHEALTHY and have the daemon kill the forwarder.
+func TestForeignListener_NonDoltListenerIsNotForeign(t *testing.T) {
+	townRoot := t.TempDir()
+	port := listenForeign(t)
+	t.Cleanup(SetDoltProcessDetectorForTest(func(int) bool { return false }))
+	t.Setenv("GT_DOLT_PORT", strconv.Itoa(port))
+	t.Setenv("GT_DOLT_IGNORE_CONFIG", "")
+	t.Setenv("GT_DOLT_HOST", "")
+
+	if pid, _, foreign := ForeignListener(townRoot); foreign {
+		t.Fatalf("non-dolt listener pid %d reported foreign", pid)
 	}
 }
