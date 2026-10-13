@@ -1361,11 +1361,32 @@ func (e *UnpublishedWorkError) Error() string {
 	if e.UnpushedCount >= 0 {
 		count = fmt.Sprintf("%d", e.UnpushedCount)
 	}
-	return fmt.Sprintf("refusing to remove polecat %s: %s, and branch %s has %s unpushed commit(s) that exist only in %s\n"+
-		"The worktree has been left intact. To recover: inspect the commits (git -C %s log origin/%s..%s), "+
-		"push or move them somewhere durable, then retry the removal; "+
-		"use --nuclear only if you accept discarding them",
-		e.PolecatName, e.Reason, e.Branch, count, e.ClonePath, e.ClonePath, e.Branch, e.Branch)
+	return fmt.Sprintf("refusing to remove polecat %s: %s\n"+
+		"%s unpushed commit(s) exist only in this worktree:\n"+
+		"  branch:   %s\n"+
+		"  worktree: %s\n"+
+		"The worktree has been left intact. To recover, list the commits with:\n"+
+		"  %s\n"+
+		"then fix the cause (e.g. amend a hooks-bypassed commit so hooks re-run) or push or move the commits somewhere durable, and retry the removal. "+
+		"Discarding them requires a deliberate nuclear removal.",
+		e.PolecatName, e.Reason, count, e.Branch, e.ClonePath, e.RecoveryCommand())
+}
+
+// RecoveryCommand lists the commits at risk. It works for a branch that was
+// never pushed (no origin/<branch> to range against) and single-quotes the
+// polecat-controlled branch name and path so pasting it cannot run anything
+// embedded in them.
+func (e *UnpublishedWorkError) RecoveryCommand() string {
+	ref := "HEAD"
+	if e.Branch != "" && e.Branch != "HEAD" {
+		ref = e.Branch
+	}
+	return fmt.Sprintf("git -C %s log --oneline %s --not --remotes", shellQuote(e.ClonePath), shellQuote(ref))
+}
+
+// shellQuote single-quotes s for a POSIX shell.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func (e *UnpublishedWorkError) Unwrap() error {
@@ -1381,7 +1402,7 @@ func (e *UnpublishedWorkError) Unwrap() error {
 // unpushed commits (or that can't be established) the removal fails with an
 // UnpublishedWorkError and the caller must not touch the worktree (gt-renk).
 // Refusing to publish must never be followed by destroying. A detached HEAD
-// has no branch to push; its work is held by the earlier local preserve ref.
+// has no branch to push; removal proceeds only once a durable ref is confirmed to hold HEAD.
 func (m *Manager) pushBeforeRemoval(name, clonePath string) error {
 	polecatGit := git.NewGit(clonePath)
 	branch, brErr := polecatGit.CurrentBranch()
@@ -1424,8 +1445,19 @@ func (m *Manager) pushBeforeRemoval(name, clonePath string) error {
 	}
 
 	if branch == "HEAD" {
-		style.PrintWarning("%s: %s; detached HEAD, relying on the local preserve ref", name, refusal)
-		return nil
+		// A detached HEAD has no branch to push; the earlier auto-preserve step
+		// is meant to pin its commits under refs/gt/preserve. That step is
+		// best-effort, so confirm a ref really holds HEAD rather than assume.
+		held, holdErr := polecatGit.HeadHeldByDurableRef()
+		if holdErr == nil && held {
+			style.PrintWarning("%s: %s; detached HEAD is held by a durable ref, continuing", name, refusal)
+			return nil
+		}
+		if holdErr != nil {
+			refusal = fmt.Sprintf("%s (and could not confirm a ref holds the detached HEAD: %v)", refusal, holdErr)
+		} else {
+			refusal = fmt.Sprintf("%s (and no branch, remote-tracking or preserve ref holds the detached HEAD)", refusal)
+		}
 	}
 	return &UnpublishedWorkError{
 		PolecatName:   name,

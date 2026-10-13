@@ -1631,6 +1631,138 @@ func TestRemoveWithOptions_PushFailureKeepsWorktree(t *testing.T) {
 	}
 }
 
+// TestRemoveWithOptions_UnknownPushedStateFailsClosed: when whether the branch
+// is pushed cannot be established at all (no comparison ref resolves), removal
+// must refuse with an unknown count rather than assume nothing is at risk.
+func TestRemoveWithOptions_UnknownPushedStateFailsClosed(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	useBareOrigin(t, mayorRig)
+
+	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	commitInWorktree(t, polecat.ClonePath, "work.txt", "")
+	// Without any origin ref both the guards and the pushed-state check error.
+	if out, err := exec.Command("git", "-C", mayorRig, "update-ref", "-d", "refs/remotes/origin/main").CombinedOutput(); err != nil {
+		t.Fatalf("delete origin/main: %v\n%s", err, out)
+	}
+
+	err = mgr.RemoveWithOptions("toast", true, false, false)
+	var unpublished *UnpublishedWorkError
+	if !errors.As(err, &unpublished) {
+		t.Fatalf("error = %v, want *UnpublishedWorkError", err)
+	}
+	if unpublished.UnpushedCount != -1 {
+		t.Errorf("UnpushedCount = %d, want -1 (unknown)", unpublished.UnpushedCount)
+	}
+	if !strings.Contains(err.Error(), "an unknown number of") {
+		t.Errorf("error should say the count is unknown: %v", err)
+	}
+	if _, statErr := os.Stat(polecat.ClonePath); statErr != nil {
+		t.Fatalf("worktree was removed although its pushed state is unknown: %v", statErr)
+	}
+}
+
+// TestRemoveWithOptions_RefusedButAlreadyPushedContinues: a guard refusing to
+// push is harmless when the commits are already on origin.
+func TestRemoveWithOptions_RefusedButAlreadyPushedContinues(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	useBareOrigin(t, mayorRig)
+
+	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	commitInWorktree(t, polecat.ClonePath, "unverified.txt", "Gastown-Unverified: pre-commit hook failed")
+	if out, err := exec.Command("git", "-C", polecat.ClonePath, "push", "origin", polecat.Branch).CombinedOutput(); err != nil {
+		t.Fatalf("push: %v\n%s", err, out)
+	}
+
+	if err := mgr.RemoveWithOptions("toast", true, false, false); err != nil {
+		t.Fatalf("RemoveWithOptions: %v (everything is on origin, nothing is at risk)", err)
+	}
+	if _, statErr := os.Stat(polecat.ClonePath); !os.IsNotExist(statErr) {
+		t.Fatalf("worktree still exists (stat err %v)", statErr)
+	}
+}
+
+// TestRemoveWithOptions_DetachedHeadWithoutPreserveRefIsRefused: a detached
+// HEAD is only safe to drop when a ref holds its commits. If the auto-preserve
+// step could not pin one, removal must refuse instead of trusting it ran.
+func TestRemoveWithOptions_DetachedHeadWithoutPreserveRefIsRefused(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	useBareOrigin(t, mayorRig)
+
+	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	wtGit := git.NewGit(polecat.ClonePath)
+	if err := wtGit.CheckoutDetach("HEAD"); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	commit := commitInWorktree(t, polecat.ClonePath, "local.txt", "")
+	// A ref nested under the name the preserve step wants makes its update-ref
+	// fail (directory/file conflict), so no preserve ref can be created.
+	blocker := git.LocalPreservationRefName("detached-toast-"+commit[:8]) + "/blocker"
+	if out, err := exec.Command("git", "-C", mayorRig, "update-ref", blocker, commit).CombinedOutput(); err != nil {
+		t.Fatalf("create blocking ref %s: %v\n%s", blocker, err, out)
+	}
+	// The blocker itself holds the commit; delete it from consideration by
+	// pointing it at an unrelated commit so only the preserve ref could.
+	base, err := exec.Command("git", "-C", mayorRig, "rev-parse", "refs/remotes/origin/main").Output()
+	if err != nil {
+		t.Fatalf("rev-parse origin/main: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", mayorRig, "update-ref", blocker, strings.TrimSpace(string(base))).CombinedOutput(); err != nil {
+		t.Fatalf("repoint blocking ref: %v\n%s", err, out)
+	}
+
+	err = mgr.RemoveWithOptions("toast", true, false, false)
+	if !errors.Is(err, ErrUnpublishedWork) {
+		t.Fatalf("error = %v, want ErrUnpublishedWork", err)
+	}
+	if _, statErr := os.Stat(polecat.ClonePath); statErr != nil {
+		t.Fatalf("detached worktree was removed with its commit held by no ref: %v", statErr)
+	}
+	if got, _ := wtGit.Rev("HEAD"); got != commit {
+		t.Fatalf("HEAD = %s, want %s", got, commit)
+	}
+}
+
+// TestUnpublishedWorkError_RecoveryHint pins that the hint works for a branch
+// that was never pushed and never interpolates the polecat-controlled branch
+// name into a command unquoted.
+func TestUnpublishedWorkError_RecoveryHint(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	useBareOrigin(t, mayorRig)
+	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	commitInWorktree(t, polecat.ClonePath, "unverified.txt", "Gastown-Unverified: pre-commit hook failed")
+
+	err = mgr.RemoveWithOptions("toast", true, false, false)
+	var unpublished *UnpublishedWorkError
+	if !errors.As(err, &unpublished) {
+		t.Fatalf("error = %v, want *UnpublishedWorkError", err)
+	}
+	if strings.Contains(err.Error(), "--nuclear") {
+		t.Errorf("hint names a flag the remove command does not have: %v", err)
+	}
+	out, runErr := exec.Command("sh", "-c", unpublished.RecoveryCommand()).CombinedOutput()
+	if runErr != nil || !strings.Contains(string(out), "polecat work unverified.txt") {
+		t.Fatalf("recovery command %q must list the unpushed commit on a never-pushed branch: %v\n%s", unpublished.RecoveryCommand(), runErr, out)
+	}
+
+	evil := &UnpublishedWorkError{PolecatName: "p", Branch: "polecat/x;touch${IFS}pwned", ClonePath: "/tmp/it's", UnpushedCount: 1, Reason: "r"}
+	cmd := evil.RecoveryCommand()
+	if !strings.Contains(cmd, `'polecat/x;touch${IFS}pwned'`) || !strings.Contains(cmd, `'/tmp/it'\''s'`) {
+		t.Errorf("branch and path must be single-quoted in %q", cmd)
+	}
+}
+
 // TestRemoveWithOptions_PushedBranchIsRemoved: with everything on origin the
 // removal proceeds as before, both when the branch was already pushed and when
 // the pre-removal push is what publishes it.
