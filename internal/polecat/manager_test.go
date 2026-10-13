@@ -1519,6 +1519,157 @@ func TestRemoveWithOptions_ForceRemovalKeepsCommitsOfACleanDetachedWorktree(t *t
 	}
 }
 
+// commitInWorktree makes a real commit in the polecat worktree. A non-empty
+// trailer makes it a hooks-bypassed commit the unverified-commit guard refuses
+// to publish.
+func commitInWorktree(t *testing.T, clonePath, file, trailer string) string {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(clonePath, file), []byte(file+"\n"), 0644); err != nil {
+		t.Fatalf("write %s: %v", file, err)
+	}
+	args := []string{"-C", clonePath, "commit", "-m", "polecat work " + file}
+	if trailer != "" {
+		args = []string{"-C", clonePath, "commit", "--no-verify", "-m", "polecat work " + file + "\n\n" + trailer}
+	}
+	for _, step := range [][]string{{"-C", clonePath, "add", file}, args} {
+		if out, err := exec.Command("git", step...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", step, err, out)
+		}
+	}
+	sha, err := git.NewGit(clonePath).Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev HEAD: %v", err)
+	}
+	return sha
+}
+
+// useBareOrigin repoints origin at a separate bare repository seeded with main.
+// The default fixture's origin is the repo itself, so every branch looks pushed
+// the moment it exists locally — useless for exercising unpushed commits.
+func useBareOrigin(t *testing.T, mayorRig string) string {
+	t.Helper()
+	bare := filepath.Join(t.TempDir(), "origin.git")
+	for _, step := range [][]string{
+		{"init", "--bare", "-b", "main", bare},
+		{"-C", mayorRig, "remote", "set-url", "origin", bare},
+		{"-C", mayorRig, "push", "origin", "main"},
+		{"-C", mayorRig, "fetch", "origin"},
+	} {
+		if out, err := exec.Command("git", step...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", step, err, out)
+		}
+	}
+	return bare
+}
+
+// TestRemoveWithOptions_RefusedPreRemovalPushKeepsWorktree pins gt-renk: when
+// the pre-removal push is refused (a genuinely unverified commit) and the
+// branch has unpushed commits, removal fails, the worktree and commit survive,
+// and the error names the recovery details. force is set: it waives the
+// unpushed-commit check, not the refusal.
+func TestRemoveWithOptions_RefusedPreRemovalPushKeepsWorktree(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	bare := useBareOrigin(t, mayorRig)
+
+	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	sha := commitInWorktree(t, polecat.ClonePath, "unverified.txt", "Gastown-Unverified: pre-commit hook failed")
+
+	err = mgr.RemoveWithOptions("toast", true, false, false)
+	if err == nil {
+		t.Fatal("RemoveWithOptions succeeded; want a refusal while an unverified commit is unpushed")
+	}
+	var unpublished *UnpublishedWorkError
+	if !errors.As(err, &unpublished) || !errors.Is(err, ErrUnpublishedWork) {
+		t.Fatalf("error = %v, want *UnpublishedWorkError wrapping ErrUnpublishedWork", err)
+	}
+	if unpublished.UnpushedCount != 1 {
+		t.Errorf("UnpushedCount = %d, want 1", unpublished.UnpushedCount)
+	}
+	for _, want := range []string{polecat.Branch, polecat.ClonePath, "1 unpushed", "hooks bypassed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error lacks %q: %v", want, err)
+		}
+	}
+	if _, statErr := os.Stat(polecat.ClonePath); statErr != nil {
+		t.Fatalf("worktree was removed despite the refused push: %v", statErr)
+	}
+	if got, revErr := git.NewGit(polecat.ClonePath).Rev("HEAD"); revErr != nil || got != sha {
+		t.Fatalf("worktree HEAD = %q (err %v), want the unpushed commit %s", got, revErr, sha)
+	}
+	if !mgr.exists("toast") {
+		t.Fatal("polecat no longer exists after a refused removal")
+	}
+	if out, _ := exec.Command("git", "-C", bare, "branch", "--list", polecat.Branch).Output(); strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("the refused commit reached origin: %s", out)
+	}
+}
+
+// TestRemoveWithOptions_PushFailureKeepsWorktree: the push itself failing with
+// unpushed commits must also abort rather than warn and delete.
+func TestRemoveWithOptions_PushFailureKeepsWorktree(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	useBareOrigin(t, mayorRig)
+
+	polecat, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	commitInWorktree(t, polecat.ClonePath, "work.txt", "")
+	if out, err := exec.Command("git", "-C", mayorRig, "config", "remote.origin.pushurl", filepath.Join(t.TempDir(), "missing.git")).CombinedOutput(); err != nil {
+		t.Fatalf("git config pushurl: %v\n%s", err, out)
+	}
+
+	err = mgr.RemoveWithOptions("toast", true, false, false)
+	if !errors.Is(err, ErrUnpublishedWork) {
+		t.Fatalf("error = %v, want ErrUnpublishedWork", err)
+	}
+	if _, statErr := os.Stat(polecat.ClonePath); statErr != nil {
+		t.Fatalf("worktree was removed despite the failed push: %v", statErr)
+	}
+}
+
+// TestRemoveWithOptions_PushedBranchIsRemoved: with everything on origin the
+// removal proceeds as before, both when the branch was already pushed and when
+// the pre-removal push is what publishes it.
+func TestRemoveWithOptions_PushedBranchIsRemoved(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		prePush bool
+	}{
+		{"already pushed", true},
+		{"pushed by the pre-removal push", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+			bare := useBareOrigin(t, mayorRig)
+			polecat, err := mgr.AddWithOptions("toast", AddOptions{})
+			if err != nil {
+				t.Fatalf("AddWithOptions: %v", err)
+			}
+			sha := commitInWorktree(t, polecat.ClonePath, "work.txt", "")
+			if tc.prePush {
+				if out, err := exec.Command("git", "-C", polecat.ClonePath, "push", "origin", polecat.Branch).CombinedOutput(); err != nil {
+					t.Fatalf("push: %v\n%s", err, out)
+				}
+			}
+
+			if err := mgr.RemoveWithOptions("toast", true, false, false); err != nil {
+				t.Fatalf("RemoveWithOptions: %v", err)
+			}
+			if _, statErr := os.Stat(polecat.ClonePath); !os.IsNotExist(statErr) {
+				t.Fatalf("worktree still exists after a fully pushed removal (stat err %v)", statErr)
+			}
+			tip, err := exec.Command("git", "-C", bare, "rev-parse", "refs/heads/"+polecat.Branch).Output()
+			if err != nil || strings.TrimSpace(string(tip)) != sha {
+				t.Fatalf("origin branch tip = %q (err %v), want %s", tip, err, sha)
+			}
+		})
+	}
+}
+
 func writeWispSetupCommand(t *testing.T, mgr *Manager, command string) {
 	t.Helper()
 

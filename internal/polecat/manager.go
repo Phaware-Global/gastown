@@ -122,6 +122,7 @@ var (
 	ErrDoltUnhealthy      = errors.New("dolt health check failed")
 	ErrDoltAtCapacity     = errors.New("dolt server at connection capacity")
 	ErrDiskSpaceLow       = errors.New("insufficient disk space")
+	ErrUnpublishedWork    = errors.New("polecat branch has unpushed commits that could not be published")
 )
 
 // UncommittedWorkError provides details about uncommitted work.
@@ -1232,6 +1233,15 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 		}
 	}
 
+	// Publish the polecat's branch before anything is torn down. A refusal or
+	// failure here with unpushed commits aborts the removal while the agent bead,
+	// work-bead assignments and worktree are all still intact.
+	if !nuclear {
+		if err := m.pushBeforeRemoval(name, clonePath); err != nil {
+			return err
+		}
+	}
+
 	// Reset agent bead FIRST, before any filesystem operations.
 	// This prevents a race where a concurrent sling allocates the same name,
 	// sets hook_bead, and then has it cleared by this cleanup. By resetting
@@ -1273,49 +1283,6 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 			if strings.HasPrefix(cwdAbs, cloneAbs) || strings.HasPrefix(cwdAbs, polecatAbs) {
 				return fmt.Errorf("%w: your shell is in %s\n\nPlease cd elsewhere first, then retry:\n  cd ~/gt\n  gt polecat nuke %s/%s --force",
 					ErrShellInWorktree, cwd, m.rig.Name, name)
-			}
-		}
-	}
-
-	// Best-effort: Push the polecat's branch to remote before removing the worktree.
-	// This preserves committed work that hasn't been pushed yet — without this,
-	// nuking a stalled polecat (e.g., after disk space recovery) permanently loses
-	// any commits on the branch. The push is non-blocking: failures are warnings,
-	// not errors, so nuke still proceeds. See: disk-space-resilience.
-	//
-	// Two gates (PR #184 review): never under nuclear — the operator reached
-	// for nuclear precisely because this worktree's contents must not survive
-	// (see the auto-preserve gating above), and this push would publish them
-	// anyway; and never when the branch carries a commit made with hooks
-	// bypassed — the auto-preserve gate above refuses to push those, and
-	// pushing the same commits here on the polecat's REAL branch would be
-	// strictly worse than the preserve ref it just refused.
-	if !nuclear {
-		polecatGit := git.NewGit(clonePath)
-		if branch, brErr := polecatGit.CurrentBranch(); brErr == nil && branch != "" {
-			if badSHA, chkErr := git.HasUnverifiedCommit(polecatGit, "origin", []string{m.rig.DefaultBranch()}); chkErr != nil {
-				style.PrintWarning("could not verify %s's commits before the pre-removal push, not pushing branch %s: %v", name, branch, chkErr)
-			} else if badSHA != "" {
-				style.PrintWarning("branch %s carries commit %s made with pre-commit hooks bypassed — refusing the pre-removal push; the work remains in the local commit", branch, badSHA[:8])
-			} else if wipSHA, wipErr := git.HasWIPCommit(polecatGit, "origin", "refs/heads/"+branch, checkpoint.WIPCommitPrefix, []string{m.rig.DefaultBranch()}); wipErr != nil {
-				style.PrintWarning("could not verify %s's commits before the pre-removal push, not pushing branch %s: %v", name, branch, wipErr)
-			} else if wipSHA != "" {
-				// gt-94p1 requirement 3: a checkpoint auto-save commit must
-				// never reach a real branch, even via this best-effort
-				// push. AutoPreserveUncommittedWork's Ephemeral mode (used
-				// just above) is the primary fix and should already keep
-				// one off branch — this is the backstop.
-				style.PrintWarning("branch %s carries a checkpoint auto-save commit %s — refusing the pre-removal push; the commit stays on the local branch (refs/heads/%s) and is not pushed", branch, wipSHA[:8], branch)
-			} else {
-				pushed, unpushedCount, checkErr := polecatGit.BranchPushedToRemote(branch, "origin")
-				if checkErr == nil && !pushed && unpushedCount > 0 {
-					if pushErr := polecatGit.Push("origin", branch, false); pushErr != nil {
-						style.PrintWarning("could not push branch %s before removal (%d unpushed commit(s)): %v",
-							branch, unpushedCount, pushErr)
-						style.PrintWarning("WORK AT RISK: branch %s has %d unpushed commit(s) in worktree %s",
-							branch, unpushedCount, clonePath)
-					}
-				}
 			}
 		}
 	}
@@ -1376,6 +1343,97 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	_ = m.namePool.Save()
 
 	return nil
+}
+
+// UnpublishedWorkError reports that a polecat's pre-removal push was refused or
+// failed while the branch still holds commits that exist nowhere else.
+// Removal is aborted and the worktree left intact.
+type UnpublishedWorkError struct {
+	PolecatName   string
+	Branch        string
+	ClonePath     string
+	UnpushedCount int // -1 when the count could not be determined
+	Reason        string
+}
+
+func (e *UnpublishedWorkError) Error() string {
+	count := "an unknown number of"
+	if e.UnpushedCount >= 0 {
+		count = fmt.Sprintf("%d", e.UnpushedCount)
+	}
+	return fmt.Sprintf("refusing to remove polecat %s: %s, and branch %s has %s unpushed commit(s) that exist only in %s\n"+
+		"The worktree has been left intact. To recover: inspect the commits (git -C %s log origin/%s..%s), "+
+		"push or move them somewhere durable, then retry the removal; "+
+		"use --nuclear only if you accept discarding them",
+		e.PolecatName, e.Reason, e.Branch, count, e.ClonePath, e.ClonePath, e.Branch, e.Branch)
+}
+
+func (e *UnpublishedWorkError) Unwrap() error {
+	return ErrUnpublishedWork
+}
+
+// pushBeforeRemoval pushes the polecat's branch to origin so committed work
+// survives the worktree. Two gates keep it from publishing what it shouldn't
+// (PR #184 review): never when the branch carries a commit made with hooks
+// bypassed, and never a checkpoint auto-save commit (gt-94p1).
+//
+// A gate refusing the push is not a license to delete: if the branch has
+// unpushed commits (or that can't be established) the removal fails with an
+// UnpublishedWorkError and the caller must not touch the worktree (gt-renk).
+// Refusing to publish must never be followed by destroying. A detached HEAD
+// has no branch to push; its work is held by the earlier local preserve ref.
+func (m *Manager) pushBeforeRemoval(name, clonePath string) error {
+	polecatGit := git.NewGit(clonePath)
+	branch, brErr := polecatGit.CurrentBranch()
+	if brErr != nil || branch == "" {
+		return nil
+	}
+
+	var refusal string
+	if badSHA, chkErr := git.HasUnverifiedCommit(polecatGit, "origin", []string{m.rig.DefaultBranch()}); chkErr != nil {
+		refusal = fmt.Sprintf("could not verify its commits before the pre-removal push (not pushing branch %s): %v", branch, chkErr)
+	} else if badSHA != "" {
+		refusal = fmt.Sprintf("branch %s carries commit %s made with pre-commit hooks bypassed, so the pre-removal push was refused", branch, badSHA[:8])
+	} else if wipSHA, wipErr := git.HasWIPCommit(polecatGit, "origin", "refs/heads/"+branch, checkpoint.WIPCommitPrefix, []string{m.rig.DefaultBranch()}); wipErr != nil {
+		refusal = fmt.Sprintf("could not verify its commits before the pre-removal push (not pushing branch %s): %v", branch, wipErr)
+	} else if wipSHA != "" {
+		// gt-94p1 requirement 3: backstop for AutoPreserveUncommittedWork's
+		// Ephemeral mode, which should already keep one off the branch.
+		refusal = fmt.Sprintf("branch %s carries a checkpoint auto-save commit %s, so the pre-removal push was refused", branch, wipSHA[:8])
+	}
+
+	pushed, unpushedCount, checkErr := polecatGit.BranchPushedToRemote(branch, "origin")
+	if checkErr == nil && (pushed || unpushedCount == 0) {
+		if refusal != "" {
+			style.PrintWarning("%s: %s; nothing unpushed, continuing", name, refusal)
+		}
+		return nil
+	}
+	if checkErr != nil {
+		unpushedCount = -1
+		if refusal == "" {
+			refusal = fmt.Sprintf("could not determine whether branch %s is pushed: %v", branch, checkErr)
+		}
+	}
+	if refusal == "" {
+		pushErr := polecatGit.Push("origin", branch, false)
+		if pushErr == nil {
+			return nil
+		}
+		refusal = fmt.Sprintf("could not push branch %s: %v", branch, pushErr)
+	}
+
+	if branch == "HEAD" {
+		style.PrintWarning("%s: %s; detached HEAD, relying on the local preserve ref", name, refusal)
+		return nil
+	}
+	return &UnpublishedWorkError{
+		PolecatName:   name,
+		Branch:        branch,
+		ClonePath:     clonePath,
+		UnpushedCount: unpushedCount,
+		Reason:        refusal,
+	}
 }
 
 // verifyRemovalComplete checks that polecat directories were actually removed.
