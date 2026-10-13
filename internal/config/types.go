@@ -1609,7 +1609,7 @@ const (
 
 // NormalizePRUpdateStrategy maps the configured pr_update_strategy to a
 // canonical value. The empty string means the default (rebase). Any other
-// unrecognised value is an error — callers must not guess, because the wrong
+// unrecognized value is an error — callers must not guess, because the wrong
 // guess either rewrites history a rig forbids rewriting or silently skips a
 // sync the rig expects.
 func NormalizePRUpdateStrategy(s string) (string, error) {
