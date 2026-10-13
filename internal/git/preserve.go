@@ -358,7 +358,7 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 			return nil, fmt.Errorf("checking staged changes: %w", hsErr)
 		}
 		if hasStaged {
-			if err := refuseHarmfulStagedCommit(g, branch, remoteName, opts.ProtectedBranches); err != nil {
+			if err := refuseHarmfulStagedCommit(g, branch, remoteName, opts); err != nil {
 				return nil, err
 			}
 			msg := opts.CommitMessage
@@ -896,15 +896,24 @@ func refuseIfHEADNotBranchTip(g *Git, branch, remote string) error {
 
 // revertShareNum/revertShareDen: a pure removal of branch-added lines is
 // treated as a revert once it drops at least this share of what the branch
-// added to the file. Small cleanups of the branch's own additions (a debug
-// line) stay well under it.
+// added to the file. This is a heuristic: it cannot tell a worktree holding
+// stale content from a deliberate removal (a debug line that was most of what
+// the branch added, a helper a reviewer asked to drop), so a match refuses the
+// commit without asserting which one it was.
 const revertShareNum, revertShareDen = 1, 2
 
 // refuseHarmfulStagedCommit inspects the index an auto-save is about to commit
 // and refuses when it would revert what the branch already changed relative to
 // its protected base branch (gt-2stz). .beads/ paths never get this far: the
 // runtime-artifact exclusion unstages them, and refuses if it cannot.
-func refuseHarmfulStagedCommit(g *Git, branch, remote string, protectedBranches []string) error {
+//
+// Every revert check is a guess about intent: stale worktree content and a
+// deliberate removal look the same on disk. The refusal therefore snapshots the
+// tracked changes to a local preservation ref first, so declining to commit
+// never costs the work, and tells the caller to commit by hand if the removal
+// was intended.
+func refuseHarmfulStagedCommit(g *Git, branch, remote string, opts PreserveOptions) error {
+	protectedBranches := opts.ProtectedBranches
 	staged, err := g.StagedFiles()
 	if err != nil {
 		return fmt.Errorf("refusing to auto-preserve: could not list staged files to vet: %w", err)
@@ -926,18 +935,32 @@ func refuseHarmfulStagedCommit(g *Git, branch, remote string, protectedBranches 
 			return fmt.Errorf("refusing to auto-preserve: no merge-base with %s, so a revert of the branch's own changes cannot be ruled out", ref)
 		}
 		for _, f := range staged {
-			if reverted, why := stagedPathReverts(g, base, f); reverted {
-				return fmt.Errorf("refusing to auto-preserve: staging %q would revert %s that this branch made relative to %s — the worktree holds stale content, not new work", f, why, ref)
+			if reverted, why := stagedPathReverts(g, base, ref, f); reverted {
+				return revertRefusal(g, branch, opts, f, why, ref)
 			}
 		}
 	}
 	return nil
 }
 
+// revertRefusal builds the error for a staged path that looks like a revert,
+// after recording the tracked changes under the local preservation ref.
+func revertRefusal(g *Git, branch string, opts PreserveOptions, path, why, protectedRef string) error {
+	saved := "its tracked changes could not be snapshotted"
+	if snap, err := autoPreserveEphemeral(g, branch, opts); err == nil && snap.Ref != "" {
+		saved = "its tracked changes are snapshotted at " + snap.Ref
+	} else if err == nil {
+		saved = "an identical snapshot of its tracked changes is already recorded"
+	}
+	return fmt.Errorf("refusing to auto-preserve: staging %q would revert %s that this branch made relative to %s. "+
+		"The worktree may hold stale content, or this may be an intentional removal; an intentional removal must be committed by hand (%s)",
+		path, why, protectedRef, saved)
+}
+
 // stagedPathReverts reports whether the staged version of path undoes the
 // branch's change to it, where base is the merge-base with the protected
-// branch. why describes what was undone.
-func stagedPathReverts(g *Git, base, path string) (bool, string) {
+// branch and tip the protected branch itself. why describes what was undone.
+func stagedPathReverts(g *Git, base, tip, path string) (bool, string) {
 	head, headErr := g.run("rev-parse", "HEAD:"+path)
 	staged, stagedErr := g.run("rev-parse", ":"+path)
 	if headErr != nil || stagedErr != nil || head == staged {
@@ -947,6 +970,21 @@ func stagedPathReverts(g *Git, base, path string) (bool, string) {
 		return false, "" // the branch never changed this file
 	} else if err == nil && atBase == staged {
 		return true, "its changes to the file entirely"
+	}
+	// The base branch moved on after the branch was cut and the worktree holds
+	// its copy (the android #100 shape): the staged blob is the base's, not the
+	// branch's.
+	if atTip, err := g.run("rev-parse", tip+":"+path); err == nil && atTip == staged {
+		return true, "its changes to the file entirely (the worktree holds " + tip + "'s copy)"
+	}
+	// The worktree holds an earlier version of the file from this branch, e.g.
+	// the one a review fix since replaced.
+	if commits, err := g.run("log", "--format=%H", "--no-renames", base+"..HEAD", "--", path); err == nil {
+		for _, c := range strings.Fields(commits) {
+			if blob, err := g.run("rev-parse", c+":"+path); err == nil && blob == staged {
+				return true, "a later change to the file (the worktree holds its version from " + shortSHA(c) + ")"
+			}
+		}
 	}
 
 	branchDiff, err := g.run("diff", "--no-renames", "-U0", base, "HEAD", "--", path)
@@ -962,6 +1000,12 @@ func stagedPathReverts(g *Git, base, path string) (bool, string) {
 	if len(branchAdded) == 0 {
 		return false, ""
 	}
+	// Lines the protected branch added since the merge-base are base content
+	// too: restoring them is not new work.
+	var tipAdded map[string]bool
+	if tipDiff, err := g.run("diff", "--no-renames", "-U0", base, tip, "--", path); err == nil {
+		tipAdded, _ = diffLineSets(tipDiff)
+	}
 
 	dropped := 0
 	for line := range stagedRemoved {
@@ -975,7 +1019,7 @@ func stagedPathReverts(g *Git, base, path string) (bool, string) {
 	// The staged change may only drop the branch's lines and put the base's
 	// back; anything it adds beyond that is new work layered on top.
 	for line := range stagedAdded {
-		if !branchRemoved[line] {
+		if !branchRemoved[line] && !tipAdded[line] {
 			return false, ""
 		}
 	}
@@ -984,11 +1028,21 @@ func stagedPathReverts(g *Git, base, path string) (bool, string) {
 
 // diffLineSets returns the trimmed, non-trivial lines a zero-context diff
 // adds and removes. Lines of fewer than three characters ("}", ")") match
-// everywhere and carry no signal.
+// everywhere and carry no signal. Only lines inside a hunk count: the "---" and
+// "+++" file headers sit before the first "@@" of each file section, while a
+// content line such as "-- note" renders as "--- note" inside it.
 func diffLineSets(diff string) (added, removed map[string]bool) {
 	added, removed = map[string]bool{}, map[string]bool{}
+	inHunk := false
 	for _, l := range strings.Split(diff, "\n") {
-		if strings.HasPrefix(l, "+++") || strings.HasPrefix(l, "---") || len(l) < 2 {
+		switch {
+		case strings.HasPrefix(l, "diff --git "):
+			inHunk = false
+			continue
+		case strings.HasPrefix(l, "@@"):
+			inHunk = true
+			continue
+		case !inHunk || len(l) < 2:
 			continue
 		}
 		body := strings.TrimSpace(l[1:])

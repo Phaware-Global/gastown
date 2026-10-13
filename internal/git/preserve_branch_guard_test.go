@@ -196,3 +196,206 @@ func TestAutoPreserveUncommittedWork_NeverCommitsBeadsPaths(t *testing.T) {
 		t.Fatalf("auto-save commit lost the real work:\n%s", out)
 	}
 }
+
+// pushedBranchWithFile creates branch off main, commits each content to
+// README.md in order, and publishes it, so HEAD is the remote tip and the
+// HEAD-not-branch-tip refusal stays out of the way.
+func pushedBranchWithFile(t *testing.T, localDir, branch string, contents ...string) {
+	t.Helper()
+	runGitTestCmd(t, localDir, "checkout", "-b", branch)
+	for i, c := range contents {
+		commitFiles(t, localDir, map[string]string{"README.md": c}, "commit "+string(rune('1'+i)))
+	}
+	runGitTestCmd(t, localDir, "push", "origin", branch)
+}
+
+// localPreserveRefs lists the local snapshot refs an Ephemeral preserve wrote.
+func localPreserveRefs(t *testing.T, dir string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", dir, "for-each-ref", "--format=%(refname)", "refs/gt/preserve/").Output()
+	if err != nil {
+		t.Fatalf("for-each-ref: %v", err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// (b) The worktree holds an earlier version of the branch's file — the one a
+// review fix replaced. The lines it brings back were never in the merge-base,
+// so only a comparison against the branch's own history catches it.
+func TestAutoPreserveUncommittedWork_RefusesRestoreOfEarlierBranchVersion(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	branch := "polecat/foo/gt-2stz@abc123"
+	pushedBranchWithFile(t, localDir, branch,
+		"# Test\nallow(user)\n",
+		"# Test\nif authorized(user) { allow(user) }\n")
+	headBefore, _ := g.Rev("HEAD")
+
+	writeTestFile(t, localDir, "README.md", "# Test\nallow(user)\n")
+
+	res, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{ProtectedBranches: []string{mainBranch}})
+	assertRefusedWithoutCommit(t, g, branch, headBefore, res, err, "revert")
+}
+
+// (b) The base branch changed the file after the branch was cut and the
+// worktree holds the base's current copy (the android #100 shape).
+func TestAutoPreserveUncommittedWork_RefusesBaseBranchCopyOfAdvancedFile(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	branch := "polecat/foo/gt-2stz@abc123"
+	pushedBranchWithFile(t, localDir, branch, "# Test\nif !authorized(user) { return }\n")
+	headBefore, _ := g.Rev("HEAD")
+
+	mainCopy := "# Test\nimport \"log\"\nlog.Println(user)\n"
+	runGitTestCmd(t, localDir, "checkout", mainBranch)
+	commitFiles(t, localDir, map[string]string{"README.md": mainCopy}, "main moves on")
+	runGitTestCmd(t, localDir, "push", "origin", mainBranch)
+	runGitTestCmd(t, localDir, "checkout", branch)
+
+	writeTestFile(t, localDir, "README.md", mainCopy)
+
+	res, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{ProtectedBranches: []string{mainBranch}})
+	assertRefusedWithoutCommit(t, g, branch, headBefore, res, err, "revert")
+}
+
+// (b) Same shape, but the worktree holds only part of what the base added:
+// lines the base branch added are base content, not new work, so dropping the
+// branch's line while restoring them is still a revert.
+func TestAutoPreserveUncommittedWork_RefusesPartialBaseBranchContent(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	branch := "polecat/foo/gt-2stz@abc123"
+	pushedBranchWithFile(t, localDir, branch, "# Test\nif !authorized(user) { return }\n")
+	headBefore, _ := g.Rev("HEAD")
+
+	runGitTestCmd(t, localDir, "checkout", mainBranch)
+	commitFiles(t, localDir, map[string]string{"README.md": "# Test\nimport \"log\"\nlog.Println(user)\n"}, "main moves on")
+	runGitTestCmd(t, localDir, "push", "origin", mainBranch)
+	runGitTestCmd(t, localDir, "checkout", branch)
+
+	writeTestFile(t, localDir, "README.md", "# Test\nimport \"log\"\n")
+
+	res, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{ProtectedBranches: []string{mainBranch}})
+	assertRefusedWithoutCommit(t, g, branch, headBefore, res, err, "revert")
+}
+
+// (b) A removal the heuristic cannot tell from a revert — here the branch's
+// only change to the file — is refused without claiming the worktree is stale,
+// the tracked changes are snapshotted, and the caller is told to commit by hand.
+func TestAutoPreserveUncommittedWork_IntentionalRemovalRefusalSnapshotsAndAdvises(t *testing.T) {
+	cases := []struct {
+		name    string
+		branch  string // README.md content committed on the branch
+		removed string // worktree content after the removal
+	}{
+		{"only change is one debug line", "# Test\ndebug print here\n", "# Test\n"},
+		{"two debug lines of three added", "# Test\nthe real fix\ndebug line one\ndebug line two\n", "# Test\nthe real fix\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			localDir, _, mainBranch := initTestRepoWithRemote(t)
+			g := NewGit(localDir)
+			branch := "polecat/foo/gt-2stz@abc123"
+			pushedBranchWithFile(t, localDir, branch, tc.branch)
+			headBefore, _ := g.Rev("HEAD")
+
+			writeTestFile(t, localDir, "README.md", tc.removed)
+
+			res, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{ProtectedBranches: []string{mainBranch}})
+			assertRefusedWithoutCommit(t, g, branch, headBefore, res, err, "committed by hand")
+			if strings.Contains(err.Error(), "not new work") {
+				t.Fatalf("refusal asserts staleness it cannot know: %v", err)
+			}
+			ref := localPreserveRefs(t, localDir)
+			if ref == "" {
+				t.Fatal("no snapshot of the refused removal was recorded")
+			}
+			if !strings.Contains(err.Error(), ref) {
+				t.Fatalf("error %q does not name the snapshot ref %q", err, ref)
+			}
+			if got, _ := g.run("show", ref+":README.md"); got != strings.TrimRight(tc.removed, "\n") {
+				t.Fatalf("snapshot holds %q, want the removal %q", got, tc.removed)
+			}
+		})
+	}
+}
+
+// diffLineSets must keep content lines that merely look like diff headers.
+func TestDiffLineSets_KeepsContentLinesThatLookLikeHeaders(t *testing.T) {
+	diff := strings.Join([]string{
+		"diff --git a/q.sql b/q.sql",
+		"index 1111111..2222222 100644",
+		"--- a/q.sql",
+		"+++ b/q.sql",
+		"@@ -2 +2 @@",
+		"--- note about backfill",
+		"+++counter;",
+		"diff --git a/other.sql b/other.sql",
+		"--- a/other.sql",
+		"+++ b/other.sql",
+		"@@ -1 +1 @@",
+		"-old statement",
+		"+new statement",
+	}, "\n")
+	added, removed := diffLineSets(diff)
+	for _, want := range []string{"++counter;", "new statement"} {
+		if !added[want] {
+			t.Errorf("added is missing %q: %v", want, added)
+		}
+	}
+	for _, want := range []string{"-- note about backfill", "old statement"} {
+		if !removed[want] {
+			t.Errorf("removed is missing %q: %v", want, removed)
+		}
+	}
+	for _, header := range []string{"a/q.sql", "b/q.sql", "a/other.sql", "b/other.sql"} {
+		if added[header] || removed[header] {
+			t.Errorf("file header %q leaked into the line sets", header)
+		}
+	}
+}
+
+// (b) End to end for the same: replacing a branch-added statement with a SQL
+// comment is new work layered on the removal, so it is saved, not refused.
+func TestAutoPreserveUncommittedWork_CommitsRemovalPlusDashDashComment(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	branch := "polecat/foo/gt-2stz@abc123"
+	pushedBranchWithFile(t, localDir, branch, "# Test\ndelete from staging;\n")
+	headBefore, _ := g.Rev("HEAD")
+
+	writeTestFile(t, localDir, "README.md", "# Test\n-- re-add after backfill\n")
+
+	res, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{ProtectedBranches: []string{mainBranch}})
+	if err != nil {
+		t.Fatalf("a removal plus a new comment line is new work: %v", err)
+	}
+	if !res.Committed {
+		t.Fatalf("want Committed, got %+v", res)
+	}
+	if headAfter, _ := g.Rev("HEAD"); headAfter == headBefore {
+		t.Fatal("HEAD did not advance")
+	}
+}
+
+// (b) The worktree holds the base branch's exact copy of a file the base has
+// since advanced. Even when the line-level share is too small to read as a
+// revert (one of four branch lines differs), the blob match is conclusive.
+func TestAutoPreserveUncommittedWork_RefusesExactBaseBranchCopyBelowLineThreshold(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	branch := "polecat/foo/gt-2stz@abc123"
+	pushedBranchWithFile(t, localDir, branch, "# Test\nline alpha\nline bravo\nline charlie\nline delta\n")
+	headBefore, _ := g.Rev("HEAD")
+
+	mainCopy := "# Test\nline alpha\nline bravo\nline charlie\nmain-only line\n"
+	runGitTestCmd(t, localDir, "checkout", mainBranch)
+	commitFiles(t, localDir, map[string]string{"README.md": mainCopy}, "main moves on")
+	runGitTestCmd(t, localDir, "push", "origin", mainBranch)
+	runGitTestCmd(t, localDir, "checkout", branch)
+
+	writeTestFile(t, localDir, "README.md", mainCopy)
+
+	res, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{ProtectedBranches: []string{mainBranch}})
+	assertRefusedWithoutCommit(t, g, branch, headBefore, res, err, "revert")
+}
