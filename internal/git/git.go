@@ -1054,11 +1054,73 @@ func (g *Git) CommitNoVerify(message string) error {
 	return err
 }
 
-// CommitNoVerifyAs is CommitNoVerify with an explicit author ("Name <email>"),
-// for tool-authored commits that must not be attributed to the running agent.
-func (g *Git) CommitNoVerifyAs(message, author string) error {
-	_, err := g.run("commit", "--no-verify", "--author", author, "-m", message)
-	return err
+// CommitPathsFromRef commits HEAD with only the given paths set to their
+// version at ref (removed when ref does not track them), authored as
+// name/email. The commit is built in a temporary index, so nothing else staged
+// in the real index is committed and no hook runs. The real index entries for
+// the paths are then moved to match the new HEAD; the working tree is not
+// touched.
+func (g *Git) CommitPathsFromRef(ref string, paths []string, message, name, email string) error {
+	parent, err := g.Rev("HEAD")
+	if err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp("", "gt-pathcommit-*")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	tmpEnv := []string{
+		"GIT_INDEX_FILE=" + filepath.Join(dir, "index"),
+		"GIT_AUTHOR_NAME=" + name, "GIT_AUTHOR_EMAIL=" + email,
+		"GIT_COMMITTER_NAME=" + name, "GIT_COMMITTER_EMAIL=" + email,
+	}
+
+	if _, err := g.runWithEnv([]string{"read-tree", "HEAD"}, tmpEnv); err != nil {
+		return err
+	}
+	if err := g.setIndexPathsFromRef(ref, paths, tmpEnv); err != nil {
+		return err
+	}
+	tree, err := g.runWithEnv([]string{"write-tree"}, tmpEnv)
+	if err != nil {
+		return err
+	}
+	commit, err := g.runWithEnv([]string{"commit-tree", tree, "-p", parent, "-m", message}, tmpEnv)
+	if err != nil {
+		return err
+	}
+	if _, err := g.run("update-ref", "-m", "commit: "+message, "HEAD", commit, parent); err != nil {
+		return err
+	}
+	return g.setIndexPathsFromRef(ref, paths, nil)
+}
+
+// setIndexPathsFromRef points each path's index entry at its version in ref,
+// or removes the entry when ref does not track it. extraEnv may redirect the
+// index via GIT_INDEX_FILE.
+func (g *Git) setIndexPathsFromRef(ref string, paths []string, extraEnv []string) error {
+	for _, p := range paths {
+		entry, err := g.run("ls-tree", ref, "--", p)
+		if err != nil {
+			return err
+		}
+		if entry == "" {
+			if _, err := g.runWithEnv([]string{"update-index", "--force-remove", "--", p}, extraEnv); err != nil {
+				return err
+			}
+			continue
+		}
+		meta, _, _ := strings.Cut(entry, "\t")
+		fields := strings.Fields(meta) // mode type sha
+		if len(fields) != 3 {
+			return fmt.Errorf("unexpected ls-tree output for %s: %q", p, entry)
+		}
+		if _, err := g.runWithEnv([]string{"update-index", "--add", "--cacheinfo", fields[0] + "," + fields[2] + "," + p}, extraEnv); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // CommitAll stages all changes and commits.

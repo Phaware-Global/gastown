@@ -110,3 +110,55 @@ func TestStripOverlayCLAUDEmd_NoopWithoutOverlay(t *testing.T) {
 		t.Fatal("unexpected cleanup commit")
 	}
 }
+
+// The cleanup commit holds only the overlay paths: an unrelated staged file
+// stays staged and out of the commit.
+func TestStripOverlayCLAUDEmd_LeavesUnrelatedStagedFilesStaged(t *testing.T) {
+	dir := overlayRepo(t, map[string]string{})
+	if err := os.WriteFile(filepath.Join(dir, "CLAUDE.local.md"), []byte("overlay\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, dir, "add", "-f", "CLAUDE.local.md")
+	runGit(t, dir, "commit", "-m", "feat: work")
+	if err := os.WriteFile(filepath.Join(dir, "staged.txt"), []byte("unrelated\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, dir, "add", "staged.txt")
+
+	if !stripOverlayCLAUDEmd(git.NewGit(dir), "main") {
+		t.Fatal("expected a cleanup commit")
+	}
+
+	if got := gitOut(t, dir, "show", "--name-only", "--format=", "HEAD"); got != "CLAUDE.local.md" {
+		t.Errorf("cleanup commit paths = %q, want only CLAUDE.local.md", got)
+	}
+	if got := gitOut(t, dir, "diff", "--cached", "--name-status"); got != "A\tstaged.txt" {
+		t.Errorf("staged after cleanup = %q, want staged.txt still staged", got)
+	}
+	if got := gitOut(t, dir, "status", "--porcelain", "--", "CLAUDE.local.md"); strings.Contains(got, "D ") {
+		t.Errorf("overlay path left a stale staged change: %q", got)
+	}
+}
+
+// Restoring a tracked CLAUDE.local.md must not overwrite the polecat's
+// on-disk overlay.
+func TestStripOverlayCLAUDEmd_PreservesWorkingTreeOverlay(t *testing.T) {
+	dir := overlayRepo(t, map[string]string{"CLAUDE.local.md": "repo-owned\n"})
+	const overlay = "repo-owned\npolecat overlay\n"
+	path := filepath.Join(dir, "CLAUDE.local.md")
+	if err := os.WriteFile(path, []byte(overlay), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, dir, "commit", "-am", "feat: work")
+
+	if !stripOverlayCLAUDEmd(git.NewGit(dir), "main") {
+		t.Fatal("expected a cleanup commit")
+	}
+
+	if got, _ := os.ReadFile(path); string(got) != overlay {
+		t.Errorf("working-tree CLAUDE.local.md = %q, want the overlay preserved", got)
+	}
+	if got := gitOut(t, dir, "diff", "--name-only", "origin/main", "HEAD"); got != "" {
+		t.Errorf("branch diff vs origin/main = %q, want empty", got)
+	}
+}

@@ -2953,10 +2953,13 @@ func isPolecatActor(actor string) bool {
 	return len(parts) >= 2 && parts[1] == "polecats"
 }
 
-// overlayCleanupAuthor is the git author for the overlay cleanup commit. The
-// cleanup is a tool action, not the polecat's work, so it must not be
-// attributed to the polecat's identity (git blame / provenance).
-const overlayCleanupAuthor = "Gas Town <gt@gastown.local>"
+// Git identity for the overlay cleanup commit. The cleanup is a tool action,
+// not the polecat's work, so it must not be attributed to the polecat
+// (git blame / provenance).
+const (
+	overlayCleanupAuthorName  = "Gas Town"
+	overlayCleanupAuthorEmail = "gt@gastown.local"
+)
 
 // stripOverlayCLAUDEmd removes Gas Town overlay content from CLAUDE.md and
 // CLAUDE.local.md before the branch is pushed. Polecats were committing the
@@ -2964,10 +2967,14 @@ const overlayCleanupAuthor = "Gas Town <gt@gastown.local>"
 // protocol, etc.) into actual repos, overwriting project-specific content.
 //
 // This runs after all commits but before push. If overlay files differ from
-// the target branch, they are put back to the target branch's version (when
-// the target tracks the file) or dropped from the index (when it does not).
-// A file the target branch already tracks is never deleted: that would be a
-// change nobody authored for this task, riding into an unrelated MR.
+// the target branch, a cleanup commit sets them back to the target branch's
+// version (or removes them when the target does not track them). A file the
+// target branch already tracks is never deleted: that would be a change nobody
+// authored for this task, riding into an unrelated MR.
+//
+// The cleanup commit contains only the overlay paths: anything else staged
+// stays staged and uncommitted, and the working tree (including the polecat's
+// on-disk overlay) is left alone.
 //
 // Returns true if a cleanup commit was created.
 func stripOverlayCLAUDEmd(g *git.Git, defaultBranch string) bool {
@@ -2980,72 +2987,31 @@ func stripOverlayCLAUDEmd(g *git.Git, defaultBranch string) bool {
 		return false
 	}
 
-	claudeChanged := false
-	claudeLocalChanged := false
+	var overlayPaths []string
 	for _, f := range changedFiles {
 		switch f {
 		case "CLAUDE.md":
-			claudeChanged = true
-		case "CLAUDE.local.md":
-			claudeLocalChanged = true
-		}
-	}
-
-	if !claudeChanged && !claudeLocalChanged {
-		return false // Nothing to strip
-	}
-
-	needsCommit := false
-
-	// CLAUDE.md is a project file: only touch it when HEAD carries the overlay.
-	if claudeChanged {
-		currentContent, showErr := g.ShowFile("HEAD", "CLAUDE.md")
-		if showErr == nil && strings.Contains(currentContent, templates.PolecatLifecycleMarker) {
-			if restoreOrDropOverlayFile(g, originRef, "CLAUDE.md") {
-				needsCommit = true
+			// CLAUDE.md is a project file: only touch it when HEAD carries the overlay.
+			if content, showErr := g.ShowFile("HEAD", "CLAUDE.md"); showErr == nil && strings.Contains(content, templates.PolecatLifecycleMarker) {
+				overlayPaths = append(overlayPaths, f)
 			}
+		case "CLAUDE.local.md":
+			// Always a runtime artifact.
+			overlayPaths = append(overlayPaths, f)
 		}
 	}
-
-	// CLAUDE.local.md is always a runtime artifact.
-	if claudeLocalChanged {
-		if restoreOrDropOverlayFile(g, originRef, "CLAUDE.local.md") {
-			needsCommit = true
-		}
-	}
-
-	if !needsCommit {
+	if len(overlayPaths) == 0 {
 		return false
 	}
 
-	if commitErr := g.CommitNoVerifyAs("chore: strip Gas Town overlay from CLAUDE files", overlayCleanupAuthor); commitErr != nil {
+	if commitErr := g.CommitPathsFromRef(originRef, overlayPaths, "chore: strip Gas Town overlay from CLAUDE files",
+		overlayCleanupAuthorName, overlayCleanupAuthorEmail); commitErr != nil {
 		style.PrintWarning("failed to create overlay cleanup commit: %v", commitErr)
 		return false
 	}
 
-	fmt.Printf("%s Created cleanup commit to remove Gas Town overlay files\n",
-		style.Bold.Render("✓"))
-	return true
-}
-
-// restoreOrDropOverlayFile stages path back to its originRef version, or
-// unstages it when originRef does not track it. Reports whether it staged a change.
-func restoreOrDropOverlayFile(g *git.Git, originRef, path string) bool {
-	if _, showErr := g.ShowFile(originRef, path); showErr != nil {
-		// Not tracked on the target branch — the overlay created it.
-		if rmErr := g.RmCached(path); rmErr != nil {
-			return false
-		}
-		fmt.Printf("%s Removed overlay %s (not tracked on %s)\n", style.Bold.Render("→"), path, originRef)
-		return true
-	}
-	if coErr := g.CheckoutFileFromRef(originRef, path); coErr != nil {
-		return false
-	}
-	if addErr := g.Add(path); addErr != nil {
-		return false
-	}
-	fmt.Printf("%s Restored %s from %s (stripped Gas Town overlay)\n", style.Bold.Render("→"), path, originRef)
+	fmt.Printf("%s Created cleanup commit stripping Gas Town overlay from %s\n",
+		style.Bold.Render("✓"), strings.Join(overlayPaths, ", "))
 	return true
 }
 
