@@ -355,20 +355,21 @@ func TestDiffLineSets_KeepsContentLinesThatLookLikeHeaders(t *testing.T) {
 	}
 }
 
-// (b) End to end for the same: replacing a branch-added statement with a SQL
-// comment is new work layered on the removal, so it is saved, not refused.
-func TestAutoPreserveUncommittedWork_CommitsRemovalPlusDashDashComment(t *testing.T) {
+// (b) End to end for the same: replacing a branch-added line with one that
+// renders as "+++counter;" in a diff is new work layered on the removal, so it
+// is saved, not refused as a pure removal.
+func TestAutoPreserveUncommittedWork_CommitsRemovalPlusPlusPlusLine(t *testing.T) {
 	localDir, _, mainBranch := initTestRepoWithRemote(t)
 	g := NewGit(localDir)
 	branch := "polecat/foo/gt-2stz@abc123"
 	pushedBranchWithFile(t, localDir, branch, "# Test\ndelete from staging;\n")
 	headBefore, _ := g.Rev("HEAD")
 
-	writeTestFile(t, localDir, "README.md", "# Test\n-- re-add after backfill\n")
+	writeTestFile(t, localDir, "README.md", "# Test\n++counter;\n")
 
 	res, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{ProtectedBranches: []string{mainBranch}})
 	if err != nil {
-		t.Fatalf("a removal plus a new comment line is new work: %v", err)
+		t.Fatalf("a removal plus a new line is new work: %v", err)
 	}
 	if !res.Committed {
 		t.Fatalf("want Committed, got %+v", res)
