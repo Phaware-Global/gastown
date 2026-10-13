@@ -1016,6 +1016,30 @@ func (g *Git) Push(remote, branch string, force bool) error {
 	return err
 }
 
+// PushForceWithLease force-pushes src to refs/heads/dst on the remote, but only
+// if the remote branch still points at expectedSHA. A push from a stale view of
+// the remote is rejected instead of clobbering someone else's commits.
+func (g *Git) PushForceWithLease(remote, src, dst, expectedSHA string) error {
+	ref := "refs/heads/" + dst
+	_, err := g.runWithTimeout(pushTimeout,
+		"push", "--force-with-lease="+ref+":"+expectedSHA, remote, src+":"+ref)
+	return err
+}
+
+// CountCommitsBetween returns how many commits are reachable from `to` but not
+// from `from` (git rev-list --count from..to).
+func (g *Git) CountCommitsBetween(from, to string) (int, error) {
+	out, err := g.run("rev-list", "--count", from+".."+to)
+	if err != nil {
+		return 0, err
+	}
+	var count int
+	if _, err := fmt.Sscanf(out, "%d", &count); err != nil {
+		return 0, fmt.Errorf("parsing commit count: %w", err)
+	}
+	return count, nil
+}
+
 // PushWithEnv pushes with additional environment variables.
 // Used by gt mq integration land to set GT_INTEGRATION_LAND=1, which the
 // pre-push hook checks to allow integration branch content landing on main.

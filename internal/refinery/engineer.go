@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/crew"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
@@ -230,6 +231,10 @@ type MergeQueueConfig struct {
 	// PRMergeMethod is passed to the VCS provider on merge ("squash" default).
 	PRMergeMethod string `json:"pr_merge_method,omitempty"`
 
+	// PRUpdateStrategy is how a behind-base branch is brought up to date:
+	// "rebase" (default), "merge", or "none". See config.MergeQueueConfig.
+	PRUpdateStrategy string `json:"pr_update_strategy,omitempty"`
+
 	// PRReviewWait is the minimum duration that must elapse between
 	// `gt refinery pr await-review` posting the trigger comment and
 	// the next call running the first mergeability check. The
@@ -268,6 +273,16 @@ type MergeQueueConfig struct {
 	// Batch holds configuration for the batch-then-bisect merge queue.
 	// When nil or MaxBatchSize <= 1, batching is disabled and MRs process sequentially.
 	Batch *BatchConfig `json:"batch,omitempty"`
+}
+
+// GetPRUpdateStrategy returns the canonical branch-update strategy
+// (rebase|merge|none), defaulting to rebase.
+func (c *MergeQueueConfig) GetPRUpdateStrategy() string {
+	s, err := config.NormalizePRUpdateStrategy(c.PRUpdateStrategy)
+	if err != nil {
+		return config.PRUpdateStrategyRebase
+	}
+	return s
 }
 
 // GetPRRequiredApprovals resolves the number of approvals required before the
@@ -606,6 +621,7 @@ func (e *Engineer) LoadConfig() error {
 		PRRequiredApprovals  *int                      `json:"pr_required_approvals"`
 		PRReviewLoopMax      *int                      `json:"pr_review_loop_max"`
 		PRMergeMethod        *string                   `json:"pr_merge_method"`
+		PRUpdateStrategy     *string                   `json:"pr_update_strategy"`
 		PRReviewWait         *string                   `json:"pr_review_wait"`
 		PRReviewTimeout      *string                   `json:"pr_review_timeout"`
 		PRTriggerComment     *string                   `json:"pr_trigger_comment"`
@@ -716,6 +732,12 @@ func (e *Engineer) LoadConfig() error {
 	}
 	if mqRaw.PRMergeMethod != nil {
 		e.config.PRMergeMethod = *mqRaw.PRMergeMethod
+	}
+	if mqRaw.PRUpdateStrategy != nil {
+		e.config.PRUpdateStrategy = *mqRaw.PRUpdateStrategy
+	}
+	if _, err := config.NormalizePRUpdateStrategy(e.config.PRUpdateStrategy); err != nil {
+		return err
 	}
 	if dur, ok, err := parseDurationField(mqRaw.PRReviewWait, "pr_review_wait", true); err != nil {
 		return err

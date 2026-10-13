@@ -1515,6 +1515,14 @@ type MergeQueueConfig struct {
 	// merge_strategy="pr". Only meaningful when merge_strategy="pr".
 	PRMergeMethod string `json:"pr_merge_method,omitempty"`
 
+	// PRUpdateStrategy controls how the refinery brings a work branch that is
+	// behind its target up to date: "rebase" (default; rewrites history and
+	// force-pushes), "merge" (merges the target into the branch with a merge
+	// commit and a plain push), or "none" (never touches the branch; reports
+	// "behind base" instead). Regardless of the value, the refinery never
+	// force-pushes a branch with an open PR that has an approving review.
+	PRUpdateStrategy string `json:"pr_update_strategy,omitempty"`
+
 	// OnConflict specifies conflict resolution strategy: "assign_back" or "auto_rebase".
 	OnConflict string `json:"on_conflict"`
 
@@ -1590,6 +1598,30 @@ const (
 	PRMergeMethodMerge  = "merge"
 	PRMergeMethodRebase = "rebase"
 )
+
+// PRUpdateStrategy constants: how a branch that is behind its target is
+// brought up to date.
+const (
+	PRUpdateStrategyRebase = "rebase"
+	PRUpdateStrategyMerge  = "merge"
+	PRUpdateStrategyNone   = "none"
+)
+
+// NormalizePRUpdateStrategy maps the configured pr_update_strategy to a
+// canonical value. The empty string means the default (rebase). Any other
+// unrecognised value is an error — callers must not guess, because the wrong
+// guess either rewrites history a rig forbids rewriting or silently skips a
+// sync the rig expects.
+func NormalizePRUpdateStrategy(s string) (string, error) {
+	switch s {
+	case "":
+		return PRUpdateStrategyRebase, nil
+	case PRUpdateStrategyRebase, PRUpdateStrategyMerge, PRUpdateStrategyNone:
+		return s, nil
+	}
+	return "", fmt.Errorf("invalid pr_update_strategy %q (want %q, %q, or %q)",
+		s, PRUpdateStrategyRebase, PRUpdateStrategyMerge, PRUpdateStrategyNone)
+}
 
 // Defaults for merge_strategy=pr.
 const (
@@ -1809,6 +1841,20 @@ func (c *MergeQueueConfig) GetPRMergeMethod() string {
 		return c.PRMergeMethod
 	}
 	return PRMergeMethodSquash
+}
+
+// GetPRUpdateStrategy returns the canonical branch-update strategy, defaulting
+// to rebase. An invalid configured value falls back to the default here;
+// validation rejects it before this is reached on the load path.
+func (c *MergeQueueConfig) GetPRUpdateStrategy() string {
+	if c == nil {
+		return PRUpdateStrategyRebase
+	}
+	s, err := NormalizePRUpdateStrategy(c.PRUpdateStrategy)
+	if err != nil {
+		return PRUpdateStrategyRebase
+	}
+	return s
 }
 
 // GetVCSProvider returns the VCS provider, defaulting to github.

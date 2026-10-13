@@ -316,6 +316,12 @@ func validateMergeQueueConfig(c *MergeQueueConfig) error {
 			c.VCSProvider, VCSProviderGitHub, VCSProviderBitbucket)
 	}
 
+	// Validate pr_update_strategy. Applies to every merge_strategy: the
+	// refinery syncs a behind-base branch before merging in either mode.
+	if _, err := NormalizePRUpdateStrategy(c.PRUpdateStrategy); err != nil {
+		return err
+	}
+
 	// PR-strategy-specific validation
 	if c.MergeStrategy == MergeStrategyPR {
 		// Phase 1 only ships a GitHub PRProvider. The Bitbucket provider
