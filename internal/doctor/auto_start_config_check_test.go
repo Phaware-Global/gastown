@@ -134,13 +134,15 @@ func writeMetadata(t *testing.T, dir, body string) {
 	}
 }
 
-// A store with metadata.json but no config.yaml must not pass: bd would
-// auto-start for it. When the prefix is derivable, Fix creates the complete
-// config (prefix and all defaults, via EnsureConfigYAML), not a one-liner.
-func TestAutoStartConfigCheck_MissingConfigIsReportedAndFixedWithFullDefaults(t *testing.T) {
+// A store with metadata.json but no config.yaml must not pass (bd would
+// auto-start), but the check must not create the file either: a new config
+// needs a prefix, and the metadata-derived one is wrong for canonical rig
+// stores. It is reported as needing manual repair; other stores still get fixed.
+func TestAutoStartConfigCheck_MissingConfigIsReportedAndNeverCreated(t *testing.T) {
 	townRoot := t.TempDir()
-	dir := writeStore(t, townRoot, "gastown/crew/x", "")
-	writeMetadata(t, dir, `{"dolt_mode":"server","dolt_database":"gt"}`)
+	noConfig := writeStore(t, townRoot, "gastown/crew/x", "")
+	writeMetadata(t, noConfig, `{"dolt_mode":"server","dolt_database":"gt"}`)
+	other := writeStore(t, townRoot, "z-other", "prefix: z\n")
 
 	check := NewAutoStartConfigCheck()
 	ctx := &CheckContext{TownRoot: townRoot}
@@ -148,30 +150,39 @@ func TestAutoStartConfigCheck_MissingConfigIsReportedAndFixedWithFullDefaults(t 
 	if r.Status != StatusWarning {
 		t.Fatalf("missing config.yaml: status = %v, want warning", r.Status)
 	}
-	if !check.CanFix() {
-		t.Fatal("derivable prefix: CanFix = false, want true")
-	}
-	if err := check.Fix(ctx); err != nil {
-		t.Fatalf("Fix: %v", err)
-	}
-	data, _ := os.ReadFile(filepath.Join(dir, "config.yaml"))
-	got := string(data)
-	for _, want := range []string{"prefix: gt\n", "issue-prefix: gt\n", "dolt.idle-timeout: \"0\"\n", "dolt.auto-start: false\n"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("config.yaml = %q, missing %q", got, want)
+	var found bool
+	for _, d := range r.Details {
+		if strings.HasPrefix(d, filepath.Join("gastown", "crew", "x", ".beads")) {
+			found = true
+			if !strings.Contains(d, "set dolt.auto-start: false manually") {
+				t.Errorf("detail %q does not tell the operator to set it manually", d)
+			}
 		}
 	}
-	if r := NewAutoStartConfigCheck().Run(ctx); r.Status != StatusOK {
-		t.Fatalf("after fix: %v %v", r.Status, r.Details)
+	if !found {
+		t.Fatalf("config-less store not reported: %v", r.Details)
+	}
+	if !check.CanFix() {
+		t.Fatal("CanFix = false though another store is repairable")
+	}
+
+	err := check.Fix(ctx)
+	if err == nil || !strings.Contains(err.Error(), filepath.Join("gastown", "crew", "x")) {
+		t.Fatalf("Fix error = %v, want it to name the config-less store", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(noConfig, "config.yaml")); !os.IsNotExist(statErr) {
+		t.Fatalf("Fix created config.yaml (stat err = %v)", statErr)
+	}
+	data, _ := os.ReadFile(filepath.Join(other, "config.yaml"))
+	if !strings.Contains(string(data), "dolt.auto-start: false") {
+		t.Fatalf("other store not repaired: %q", data)
 	}
 }
 
-// With no prefix to derive, creating config.yaml would write an empty prefix.
-// The store is reported and the check is not fixable; nothing is created.
-func TestAutoStartConfigCheck_MissingConfigWithoutPrefixIsUnfixable(t *testing.T) {
+func TestAutoStartConfigCheck_OnlyMissingConfigIsNotFixable(t *testing.T) {
 	townRoot := t.TempDir()
 	dir := writeStore(t, townRoot, "deacon", "")
-	writeMetadata(t, dir, `{"dolt_mode":"server"}`)
+	writeMetadata(t, dir, `{"dolt_mode":"server","dolt_database":"deacon"}`)
 
 	check := NewAutoStartConfigCheck()
 	ctx := &CheckContext{TownRoot: townRoot}
@@ -179,10 +190,7 @@ func TestAutoStartConfigCheck_MissingConfigWithoutPrefixIsUnfixable(t *testing.T
 		t.Fatalf("status = %v, want warning", r.Status)
 	}
 	if check.CanFix() {
-		t.Fatal("no derivable prefix: CanFix = true, want false")
-	}
-	if err := check.Fix(ctx); err == nil {
-		t.Fatal("Fix reported success for an unfixable store")
+		t.Fatal("only a config-less store: CanFix = true, want false")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "config.yaml")); !os.IsNotExist(err) {
 		t.Fatalf("config.yaml created (stat err = %v)", err)
