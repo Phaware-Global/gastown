@@ -673,6 +673,10 @@ func TestIsDoltUnhealthy_NoDir(t *testing.T) {
 // Default hooks: server not running, health check passes, start succeeds.
 func newTestManager(t *testing.T) *DoltServerManager {
 	t.Helper()
+	// Point anything that resolves the Dolt port from the environment at a port
+	// nothing listens on, never the live town's 3307.
+	t.Setenv("GT_DOLT_PORT", "13306")
+	t.Setenv("GT_DOLT_IGNORE_CONFIG", "")
 	tmpDir := t.TempDir()
 	daemonDir := filepath.Join(tmpDir, "daemon")
 	if err := os.MkdirAll(daemonDir, 0755); err != nil {
@@ -698,6 +702,9 @@ func newTestManager(t *testing.T) *DoltServerManager {
 		stopFn:           func() {},
 		unhealthyAlertFn: func(error) {},
 		crashAlertFn:     func(int) {},
+		// Never signal real processes: the real KillImposters targets whatever
+		// holds GT_DOLT_PORT, which on a dev machine is the live town Dolt.
+		killImpostersFn: func() error { return nil },
 	}
 }
 
@@ -1345,11 +1352,16 @@ func TestEnsureRunning_ImposterEscalatesCritically(t *testing.T) {
 	m.sleepFn = func(time.Duration) {}
 	m.imposterAlertFn = func(error) { imposterAlerts.Add(1) }
 	m.unhealthyAlertFn = func(error) { unhealthyAlerts.Add(1) }
+	var kills atomic.Int32
+	m.killImpostersFn = func() error { kills.Add(1); return nil }
 
 	if err := m.EnsureRunning(); err != nil {
 		t.Fatalf("EnsureRunning: %v", err)
 	}
 	if imposterAlerts.Load() != 1 || unhealthyAlerts.Load() != 0 {
 		t.Fatalf("imposter alerts = %d, unhealthy alerts = %d; want 1, 0", imposterAlerts.Load(), unhealthyAlerts.Load())
+	}
+	if kills.Load() != 1 {
+		t.Fatalf("KillImposters calls = %d, want 1", kills.Load())
 	}
 }

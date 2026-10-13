@@ -148,6 +148,7 @@ type DoltServerManager struct {
 	startFn           func() error
 	runningFn         func() (int, bool)
 	stopFn            func()
+	killImpostersFn   func() error // nil = use real doltserver.KillImposters (signals whatever holds the configured port)
 	sleepFn           func(time.Duration)
 	nowFn             func() time.Time
 	escalateFn        func(int)
@@ -184,6 +185,13 @@ func (m *DoltServerManager) now() time.Time {
 		return m.nowFn()
 	}
 	return time.Now()
+}
+
+func (m *DoltServerManager) killImposters() error {
+	if m.killImpostersFn != nil {
+		return m.killImpostersFn()
+	}
+	return doltserver.KillImposters(m.townRoot)
 }
 
 func (m *DoltServerManager) doSleep(d time.Duration) {
@@ -464,7 +472,7 @@ func (m *DoltServerManager) EnsureRunning() error {
 				}
 				m.stopLocked()
 				// Also kill any imposters before restarting
-				if killErr := doltserver.KillImposters(m.townRoot); killErr != nil {
+				if killErr := m.killImposters(); killErr != nil {
 					m.logger("Warning: failed to kill imposters: %v", killErr)
 				}
 				time.Sleep(500 * time.Millisecond)

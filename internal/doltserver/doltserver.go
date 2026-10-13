@@ -1247,9 +1247,29 @@ func doltProcessOwnerPath(townRoot string, pid int) string {
 	)
 }
 
+// isDoltProcess reports whether pid is a dolt process, judged by its executable
+// name. A port forwarded into a container (docker-proxy, vpnkit, ssh -L) is
+// held by a non-dolt process and is a legitimate way to reach the server, so
+// only a dolt process serving the wrong data dir counts as a squatter. Unknown
+// (ps unavailable) reads as not-dolt: no verdict beats a false alarm.
+var isDoltProcess = func(pid int) bool {
+	args := getProcessArgs(pid)
+	return len(args) > 0 && strings.HasPrefix(strings.ToLower(filepath.Base(args[0])), "dolt")
+}
+
+// SetDoltProcessDetectorForTest replaces the dolt-process detector and returns
+// a restore func. Tests that stand in a plain listener for a squatting
+// sql-server need this, since the test binary is not named dolt.
+func SetDoltProcessDetectorForTest(fn func(pid int) bool) (restore func()) {
+	prev := isDoltProcess
+	isDoltProcess = fn
+	return func() { isDoltProcess = prev }
+}
+
 // ForeignListener reports a process listening on the town's local Dolt port
 // that is not the town's server (wrong data dir/config/cwd) — typically a
-// sql-server bd auto-started from a .beads/dolt dir. owner is the path evidence
+// sql-server bd auto-started from a .beads/dolt dir. A listener that is not a
+// dolt process (a container port forward) is not reported. owner is the path evidence
 // that disqualified it. Unlike IsRunning, which falls back to bare TCP
 // reachability and reports such a listener as running with PID 0, this names it.
 // Remote configs have no local listener to inspect and never report foreign.
@@ -1259,7 +1279,7 @@ func ForeignListener(townRoot string) (pid int, owner string, foreign bool) {
 		return 0, "", false
 	}
 	pid = findDoltServerOnPort(config.Port)
-	if pid <= 0 || doltProcessMatchesTown(townRoot, pid, config) {
+	if pid <= 0 || !isDoltProcess(pid) || doltProcessMatchesTown(townRoot, pid, config) {
 		return 0, "", false
 	}
 	return pid, doltProcessOwnerPath(townRoot, pid), true

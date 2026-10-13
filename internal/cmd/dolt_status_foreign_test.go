@@ -42,6 +42,7 @@ func assertForeignListenerUnhealthy(t *testing.T, statePID int) {
 	t.Helper()
 	// Resolve symlinks so the town path is spelled the same on every platform:
 	// macOS /var -> /private/var otherwise hides path-equality bugs that Linux hits.
+	t.Cleanup(doltserver.SetDoltProcessDetectorForTest(func(int) bool { return true }))
 	townRoot, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)

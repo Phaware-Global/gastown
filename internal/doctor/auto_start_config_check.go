@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -43,7 +44,13 @@ func (c *AutoStartConfigCheck) Run(ctx *CheckContext) *CheckResult {
 	var checked int
 	for _, dir := range findBeadsStores(ctx.TownRoot) {
 		checked++
-		data, err := os.ReadFile(filepath.Join(dir, "config.yaml"))
+		data, err := readRegularConfig(filepath.Join(dir, "config.yaml"))
+		if errors.Is(err, os.ErrNotExist) {
+			// A store with no config.yaml is for EnsureConfigYAML to create with
+			// its prefix; writing a one-line file here would make that repair
+			// see an existing file and skip the prefix and the other defaults.
+			continue
+		}
 		if err != nil || !configDisablesAutoStart(string(data)) {
 			c.stale = append(c.stale, dir)
 		}
@@ -80,13 +87,33 @@ func (c *AutoStartConfigCheck) Fix(ctx *CheckContext) error {
 	return nil
 }
 
-// setConfigAutoStartDisabled adds or rewrites dolt.auto-start in dir/config.yaml,
-// leaving every other line untouched. EnsureConfigYAML is not used here: it
-// needs the store's prefix, and a wrong guess would rewrite it.
+// readRegularConfig reads path only if it is a regular file. A symlinked
+// config.yaml (or a directory/device in its place) is refused rather than
+// followed, so a repair never reads or rewrites a file outside the store.
+func readRegularConfig(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file (mode %s)", path, info.Mode().Type())
+	}
+	return os.ReadFile(path)
+}
+
+// setConfigAutoStartDisabled rewrites dir/config.yaml with dolt.auto-start set
+// to false, leaving every other line untouched. It never creates the file (see
+// Run) and refuses a non-regular file. The write goes to a temp file renamed
+// over the original, so a symlink swapped in after the check is replaced, not
+// followed.
 func setConfigAutoStartDisabled(beadsDir string) error {
 	path := filepath.Join(beadsDir, "config.yaml")
-	data, err := os.ReadFile(path)
-	if err != nil && !os.IsNotExist(err) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	data, err := readRegularConfig(path)
+	if err != nil {
 		return err
 	}
 	const want = "dolt.auto-start: false"
@@ -108,7 +135,24 @@ func setConfigAutoStartDisabled(beadsDir string) error {
 	if !strings.HasSuffix(out, "\n") {
 		out += "\n"
 	}
-	return os.WriteFile(path, []byte(out), 0644)
+
+	tmp, err := os.CreateTemp(beadsDir, ".config.yaml.*")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if _, err := tmp.WriteString(out); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // configDisablesAutoStart reports whether config.yaml content sets
