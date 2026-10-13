@@ -1054,6 +1054,13 @@ func (g *Git) CommitNoVerify(message string) error {
 	return err
 }
 
+// CommitNoVerifyAs is CommitNoVerify with an explicit author ("Name <email>"),
+// for tool-authored commits that must not be attributed to the running agent.
+func (g *Git) CommitNoVerifyAs(message, author string) error {
+	_, err := g.run("commit", "--no-verify", "--author", author, "-m", message)
+	return err
+}
+
 // CommitAll stages all changes and commits.
 func (g *Git) CommitAll(message string) error {
 	_, err := g.run("commit", "-am", message)
