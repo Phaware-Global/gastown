@@ -114,6 +114,7 @@ const (
 	DefaultWitnessDoneIntentStuckTimeout    = 60 * time.Second
 	DefaultWitnessDoneIntentRecentGrace     = 30 * time.Second
 	DefaultWitnessHeartbeatStartupGrace     = 5 * time.Minute
+	DefaultWitnessIdleUnsubmittedThreshold  = 15 * time.Minute
 )
 
 // LoadOperationalConfig loads operational config from a town root.
@@ -753,6 +754,15 @@ func (wt *WitnessThresholds) DoneIntentRecentGraceD() time.Duration {
 		return ParseDurationOrDefault(wt.DoneIntentRecentGrace, DefaultWitnessDoneIntentRecentGrace)
 	}
 	return DefaultWitnessDoneIntentRecentGrace
+}
+
+// IdleUnsubmittedThresholdD returns the configured or default time a live polecat
+// may sit with finished, pushed work and no gt done before the witness nudges it.
+func (wt *WitnessThresholds) IdleUnsubmittedThresholdD() time.Duration {
+	if wt != nil {
+		return ParseDurationOrDefault(wt.IdleUnsubmittedThreshold, DefaultWitnessIdleUnsubmittedThreshold)
+	}
+	return DefaultWitnessIdleUnsubmittedThreshold
 }
 
 // HeartbeatStartupGraceD returns the configured or default heartbeat startup grace period.

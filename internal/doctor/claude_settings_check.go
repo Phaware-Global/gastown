@@ -551,7 +551,7 @@ func (c *ClaudeSettingsCheck) findSettingsFiles(townRoot string) []staleSettings
 // Returns a list of what's missing. Stop-hook expectations are role-specific
 // to match the canonical hook templates in internal/hooks/config.go (#3648):
 //
-//   - polecat → `gt tap polecat-stop-check` (idle-polecat catcher)
+//   - polecat → `gt tap polecat-stop-check` (idle-polecat reminder)
 //   - everyone else → `gt costs record` (autonomous cost accounting)
 //
 // Without this, doctor never converged for polecats: hooks sync wrote

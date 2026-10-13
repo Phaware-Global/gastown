@@ -14,22 +14,21 @@ import (
 
 var tapPolecatStopCmd = &cobra.Command{
 	Use:   "polecat-stop-check",
-	Short: "Auto-run gt done on session Stop if polecat has pending work",
-	Long: `Safety net for the "idle polecat" problem: polecats that finish work
-but forget to call gt done before the session ends.
+	Short: "Remind a polecat with pending work to run gt done (Stop hook; never acts)",
+	Long: `Stop-hook check for the "idle polecat" problem: polecats that finish work
+but forget to call gt done.
 
-This command is designed to run from a Claude Code Stop hook. It checks:
-1. Whether this is a polecat session (GT_POLECAT env var)
-2. Whether gt done has already run (heartbeat state is "exiting" or "idle")
-3. Whether the polecat has commits on its branch
+Claude Code fires the Stop hook at the end of EVERY assistant turn, not only
+when the session ends. The session is therefore always alive when this runs, and
+the polecat may simply be waiting on a build, a review or a tool. This command
+never runs gt done, closes a bead or touches the worktree: doing so would close
+the hooked bead, mail the dispatcher, possibly create an MR and check the
+worktree out to origin/<base> in the middle of the polecat's work. It only
+prints a reminder to stderr when the polecat has commits ahead of origin/main
+and has not started gt done. The Witness owns recovery of polecats that really
+are idle.
 
-If the polecat has pending work that wasn't submitted, this command
-runs gt done to submit it. If gt done already ran or there's nothing
-to submit, it exits silently.
-
-Exit codes:
-  0 - No action needed (not a polecat, already done, or gt done succeeded)
-  1 - gt done was attempted but failed`,
+Exit code is always 0 so the hook never blocks the session.`,
 	RunE:         runTapPolecatStop,
 	SilenceUsage: true,
 }
@@ -59,14 +58,7 @@ func runTapPolecatStop(cmd *cobra.Command, args []string) error {
 		return nil // Can't find workspace — exit quietly
 	}
 
-	// Check heartbeat state: if already "exiting" or "idle", gt done already ran
 	hb := polecat.ReadSessionHeartbeat(townRoot, sessionName)
-	if hb != nil {
-		state := hb.EffectiveState()
-		if state == polecat.HeartbeatExiting || state == polecat.HeartbeatIdle {
-			return nil // gt done already ran or polecat is idle — nothing to do
-		}
-	}
 
 	// Check if the polecat is on a feature branch with commits
 	rigName := os.Getenv("GT_RIG")
@@ -86,54 +78,49 @@ func runTapPolecatStop(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Check current branch — skip if on main/master
+	// Check current branch
 	branchCmd := exec.Command("git", "-C", cloneDir, "rev-parse", "--abbrev-ref", "HEAD")
 	branchOut, err := branchCmd.Output()
 	if err != nil {
 		return nil // Can't determine branch — exit quietly
 	}
 	branch := strings.TrimSpace(string(branchOut))
-	if branch == "main" || branch == "master" || branch == "HEAD" {
-		return nil // On default branch — nothing to submit
-	}
 
-	// Check for commits ahead of origin/main
 	aheadCmd := exec.Command("git", "-C", cloneDir, "rev-list", "--count", "origin/main..HEAD")
 	aheadOut, err := aheadCmd.Output()
 	if err != nil {
 		return nil // Can't check — exit quietly (don't block session stop)
 	}
 	ahead := strings.TrimSpace(string(aheadOut))
-	if ahead == "0" {
-		return nil // No commits ahead — nothing to submit
+
+	if decidePolecatStopAction(hb, branch, ahead) == stopActionRemind {
+		fmt.Fprintf(os.Stderr, "Polecat %s has %s commit(s) ahead of origin/main on %s. Run gt done when the work is finished.\n", polecatName, ahead, branch)
 	}
-
-	// Polecat has pending work! Run gt done as a safety net.
-	fmt.Fprintf(os.Stderr, "\n")
-	fmt.Fprintf(os.Stderr, "⚠️  Polecat %s has %s unpushed commit(s) on branch %s\n", polecatName, ahead, branch)
-	fmt.Fprintf(os.Stderr, "   Auto-running gt done as safety net...\n")
-	fmt.Fprintf(os.Stderr, "\n")
-
-	// Find gt binary path
-	gtBin, err := os.Executable()
-	if err != nil {
-		gtBin = "gt"
-	}
-
-	// Run gt done in the polecat's worktree context
-	doneCmd := exec.Command(gtBin, "done")
-	doneCmd.Dir = cloneDir
-	doneCmd.Stdout = os.Stdout
-	doneCmd.Stderr = os.Stderr
-	// Inherit environment (GT_POLECAT, GT_RIG, etc. are already set)
-	doneCmd.Env = os.Environ()
-
-	if err := doneCmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "⚠️  Auto gt done failed: %v\n", err)
-		fmt.Fprintf(os.Stderr, "   Witness will handle cleanup.\n")
-		// Don't return error — don't block session stop
-		return nil
-	}
-
 	return nil
+}
+
+type polecatStopAction int
+
+const (
+	stopActionNone polecatStopAction = iota
+	stopActionRemind
+)
+
+// decidePolecatStopAction maps the polecat's heartbeat, current branch and
+// commits-ahead count (as printed by git rev-list --count) to an action. No
+// action ever mutates anything: see the command documentation.
+func decidePolecatStopAction(hb *polecat.SessionHeartbeat, branch, ahead string) polecatStopAction {
+	if hb != nil {
+		state := hb.EffectiveState()
+		if state == polecat.HeartbeatExiting || state == polecat.HeartbeatIdle {
+			return stopActionNone // gt done already ran or polecat is idle
+		}
+	}
+	if branch == "main" || branch == "master" || branch == "HEAD" {
+		return stopActionNone // On default branch — nothing to submit
+	}
+	if ahead == "0" {
+		return stopActionNone // No commits ahead — nothing to submit
+	}
+	return stopActionRemind
 }
