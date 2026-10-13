@@ -98,6 +98,11 @@ directory.
 - If integration-target merging is disabled: always use `{{ .DefaultBranch }}`
 
 **Example: Handling a Conflict**
+
+`{{ cmd }} refinery pr sync-branch` applies the rig's `pr_update_strategy` and exits 3 on a conflict
+(already aborted, nothing changed). The commands below show what it does under the default `rebase`
+strategy; under `merge` it is `git merge origin/<rebase-target>` / `git merge --abort`, and under `none`
+it never touches the branch (exit 2 — report "behind base" to the mayor).
 ```bash
 git checkout -b temp origin/polecat/rictus-12345
 # Resolve <rebase-target> per Target Resolution Rule above.
@@ -204,12 +209,17 @@ gt mq list {{ .RigName }}
 ⚠️ **CRITICAL**: `{{ cmd }} mq list` is the ONLY source of truth. NEVER use `git branch -r | grep polecat`.
 If queue empty, skip to context-check.
 
-**process-branch**: Pick next branch, rebase on effective target
+**process-branch**: Pick next branch, bring it up to date with the effective target per the
+rig's `pr_update_strategy` (rebase | merge | none; default rebase)
 ```bash
-git checkout -b temp polecat/<worker>    # Local branch (shared via .repo.git)
 ## Resolve <rebase-target> per Target Resolution Rule above.
-git rebase origin/<rebase-target>
+{{ cmd }} refinery pr sync-branch --branch <polecat-branch> --target <rebase-target>
+# exit 0 = synced onto local `temp`; 2 = behind base, strategy none (report to mayor, leave the branch alone);
+# 3 = conflict (aborted, nothing changed); 4 = refused/error (e.g. force-push of an approved PR)
 ```
+Do NOT run `git rebase`, `git merge`, or `git push --force` on a work branch yourself — the strategy
+and the approved-PR force-push guard live in `sync-branch` / `push-branch`. (Under `rebase` the
+sync is `git rebase origin/<rebase-target>`; under `merge` it is a merge of `origin/<rebase-target>`.)
 If conflicts unresolvable: reopen source issue, notify witness (MERGE_FAILED), close MR, skip to loop-check.
 
 **run-tests**: Run each configured command (skip empty ones):
@@ -237,7 +247,7 @@ review-fix loop, and escalation-on-loop-cap behavior. Do NOT paste the block bel
 ```bash
 ## Resolve <merge-target> per Target Resolution Rule above.
 git checkout temp
-git push origin temp:refs/heads/<polecat-branch> --force-with-lease
+{{ cmd }} refinery pr push-branch --branch <polecat-branch>   # never force-pushes an approved PR
 # ... build PR body into /tmp/pr-body-<issue-id>.md (see formula step) ...
 PR=$({{ cmd }} refinery pr create --branch <polecat-branch> --base <merge-target> \
        --title "<issue-title> (<issue-id>)" \
@@ -315,7 +325,7 @@ RIGHT (sequential rebase):
                     on target  on target+A
 ```
 
-**After every merge, the target branch moves. Next branch MUST rebase on that new baseline.**
+**After every merge, the target branch moves. Next branch MUST be brought up to date with that new baseline (rebase, or merge under `pr_update_strategy=merge`).**
 
 ## Conflict Handling
 
@@ -343,7 +353,8 @@ gt mail send {{ .RigName }}/witness -s "MERGE_FAILED" \
 
 ### Git Operations
 - `git fetch origin` — Fetch all remote branches
-- `git rebase origin/<rebase-target>` — Rebase on resolved target (per Target Resolution Rule)
+- `{{ cmd }} refinery pr sync-branch --branch <polecat-branch> --target <rebase-target>` — Bring the branch up to date per `pr_update_strategy` (default rebase: `git rebase origin/<rebase-target>`)
+- `{{ cmd }} refinery pr push-branch --branch <polecat-branch>` — Publish it; never force-pushes a branch whose open PR has an approving review
 - `git push origin <merge-target>` — Push merged changes to resolved target (per Target Resolution Rule)
 
 **IMPORTANT**: Merge queue source of truth is `{{ cmd }} mq list {{ .RigName }}`, NOT git branches.

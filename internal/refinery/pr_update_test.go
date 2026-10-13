@@ -399,3 +399,30 @@ func TestPRUpdateStrategyConfig(t *testing.T) {
 		t.Error("want error for invalid strategy")
 	}
 }
+
+func TestConflictResolutionInstructions(t *testing.T) {
+	for _, strategy := range []string{"merge", "none"} {
+		got := ConflictResolutionInstructions(strategy, testBranch, "main")
+		if !strings.Contains(got, "git merge origin/main") {
+			t.Errorf("%s: want a base-merge instruction, got:\n%s", strategy, got)
+		}
+		for _, banned := range []string{"git rebase", "push -f", "--force"} {
+			// "no rebase, no force-push" is prose; the commands must be absent.
+			if strings.Contains(got, banned) {
+				t.Errorf("%s: instructions contain %q:\n%s", strategy, banned, got)
+			}
+		}
+	}
+	for _, strategy := range []string{"", "rebase"} {
+		got := ConflictResolutionInstructions(strategy, testBranch, "main")
+		if !strings.Contains(got, "git rebase origin/main") || !strings.Contains(got, "--force-with-lease") {
+			t.Errorf("%q: default must stay rebase + lease, got:\n%s", strategy, got)
+		}
+		if strings.Contains(got, "push -f") {
+			t.Errorf("%q: bare -f must not be suggested:\n%s", strategy, got)
+		}
+		if !strings.Contains(got, "approving review") {
+			t.Errorf("%q: must warn off rewriting an approved PR:\n%s", strategy, got)
+		}
+	}
+}

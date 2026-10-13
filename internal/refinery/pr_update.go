@@ -232,3 +232,30 @@ func short(sha string) string {
 	}
 	return sha
 }
+
+// ConflictResolutionInstructions returns the numbered steps for a
+// conflict-resolution task, matching the rig's update strategy. Only the
+// rebase strategy ever tells anyone to force-push, and even then it is gated
+// on the branch not having an approved PR.
+func ConflictResolutionInstructions(strategy, branch, target string) string {
+	strategy, err := config.NormalizePRUpdateStrategy(strategy)
+	if err != nil || strategy != config.PRUpdateStrategyRebase {
+		return fmt.Sprintf(`1. Check out the branch: git checkout %[1]s
+2. Merge the target in: git merge origin/%[2]s
+3. Resolve conflicts in your editor, then commit the merge
+4. Push normally: git push origin %[1]s  (no rebase, no force-push)
+5. Close this task: bd close <this-task-id>
+
+The Refinery will automatically retry the merge after you push.`, branch, target)
+	}
+	return fmt.Sprintf(`1. Check out the branch: git checkout %[1]s
+2. If the branch has an open PR with an approving review, do NOT rebase: merge
+   the target in instead (git merge origin/%[2]s, resolve, commit,
+   git push origin %[1]s) and skip to step 6
+3. Rebase onto target: git rebase origin/%[2]s
+4. Resolve conflicts in your editor, then complete the rebase: git add . && git rebase --continue
+5. Push with a lease: git push --force-with-lease origin %[1]s
+6. Close this task: bd close <this-task-id>
+
+The Refinery will automatically retry the merge after you push.`, branch, target)
+}

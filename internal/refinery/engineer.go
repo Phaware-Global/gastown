@@ -2218,22 +2218,14 @@ func (e *Engineer) createConflictResolutionTaskForMR(mr *MRInfo, _ ProcessResult
 - Retry count: %d
 
 ## Instructions
-1. Check out the branch: git checkout %s
-2. Rebase onto target: git rebase origin/%s
-3. Resolve conflicts in your editor
-4. Complete the rebase: git add . && git rebase --continue
-5. Force-push the resolved branch: git push -f
-6. Close this task: bd close <this-task-id>
-
-The Refinery will automatically retry the merge after you force-push.`,
+%s`,
 		mr.Branch,
 		mr.ID,
 		mr.Branch,
 		mr.Target, shortSHA(mainSHA),
 		mr.SourceIssue,
 		retryCount,
-		mr.Branch,
-		mr.Target,
+		ConflictResolutionInstructions(e.config.GetPRUpdateStrategy(), mr.Branch, mr.Target),
 	)
 
 	// Create the conflict resolution task

@@ -68,6 +68,7 @@ source of truth.
 | review_depth | standard | Review depth: quick, standard, or deep |
 | merge_strategy | direct | Merge strategy: 'direct' (ff-only merge+push) or 'pr' (GitHub PR) |
 | require_review | false | Require at least one approving GitHub review before merging (pr mode only) |
+| pr_update_strategy | rebase | How a behind-base branch is brought up to date: 'rebase', 'merge' (merge the target in, plain push), or 'none' (never touch the branch; report it) |
 
 ## Target Resolution Rule
 
@@ -193,6 +194,10 @@ default = "3"
 [vars.pr_merge_method]
 description = "Merge method passed to the VCS provider when merging the PR. One of: squash, merge, rebase. Only applies when merge_strategy=pr."
 default = "squash"
+
+[vars.pr_update_strategy]
+description = "How the refinery brings a work branch that is behind its target up to date. One of: rebase (rewrite onto the target; the only strategy that force-pushes), merge (merge the target into the branch with a merge commit and a plain push), none (never touch the branch; report 'behind base' to the mayor). Enforced by 'gt refinery pr sync-branch' / 'push-branch', which read the rig config; this value only mirrors it for the prose. A branch whose open PR has an approving review is never force-pushed regardless of this value."
+default = "rebase"
 
 [vars.rig]
 description = "Name of the rig this refinery belongs to (e.g., gastown, laser)"
@@ -466,7 +471,7 @@ process-branch as before."""
 [[steps]]
 id = "process-branch"
 target = "refinery"
-title = "Mechanical rebase"
+title = "Sync branch with target"
 # Serialize on orphan-branch-check so the orphan scan runs BEFORE any
 # branch processing in a single patrol cycle. Without this, both steps
 # had `needs = ["queue-scan"]` and a fan-out runner could schedule them
@@ -476,12 +481,18 @@ title = "Mechanical rebase"
 # ordering invariant explicit.
 needs = ["orphan-branch-check"]
 description = """
-Pick next branch from queue. Attempt mechanical rebase on the MR's effective target branch.
+Pick next branch from queue. Bring it up to date with the MR's effective target branch
+using the rig's configured update strategy.
 
 **Config: integration_branch_refinery_enabled = {{integration_branch_refinery_enabled}}**
 **Config: target_branch = {{target_branch}}**
+**Config: pr_update_strategy = {{pr_update_strategy}}** (rebase | merge | none; the binary reads the rig config, this line only mirrors it)
 
-**Step 0: Determine rebase target (must match merge target)**
+**Do NOT run `git rebase`, `git merge`, or any `git push --force` on a work branch yourself.**
+The strategy and the approved-PR force-push guard live in `gt refinery pr sync-branch` and
+`gt refinery pr push-branch`. Raw git bypasses them.
+
+**Step 0: Determine the sync target (must match merge target)**
 
 Resolve `<rebase-target>` using the **Target Resolution Rule** above.
 Do NOT hardcode `main` unless `main` is actually the resolved MR target.
@@ -499,45 +510,45 @@ If the branch no longer exists (exit code non-zero):
 - Archive the MERGE_READY mail: `gt mail archive <message-id>`
 - Skip to loop-check — do NOT treat as a merge failure, do NOT nudge the polecat
 
-**Step 1: Checkout and attempt rebase**
+**Step 1: Sync the branch**
 ```bash
-git checkout -b temp origin/<polecat-branch>
-git rebase origin/<rebase-target>
+{{ cmd }} refinery pr sync-branch --branch <polecat-branch> --target <rebase-target>
 ```
+It fetches, then — depending on the rig's `pr_update_strategy` — merges the target into the
+branch (`merge`), rebases the branch onto it (`rebase`), or changes nothing (`none`). The
+result is left on a local `temp` branch; nothing is pushed here.
 
-**Step 2: Check rebase result**
+**Step 2: Act on the exit code**
 
-The rebase exits with:
-- Exit code 0: Success - proceed to run-tests
-- Exit code 1 (conflicts): Conflict detected - proceed to Step 3
+- **0** (up-to-date or synced): proceed to run-tests.
+- **2** (`behind-base`, strategy `none`): the rig forbids touching the branch. Do NOT
+  rebase, merge, push, or create a conflict task. Report to the mayor with
+  `gt nudge mayor "<polecat-branch> is behind <rebase-target> (pr_update_strategy=none); needs a base merge by its owner"`,
+  leave the MR bead open, skip this MR, and continue to loop-check.
+- **3** (conflict): the merge/rebase was aborted and nothing changed. Go to Step 3.
+- **4** (refused or error): read the message. If it is a force-push refusal for an approved PR,
+  the branch must be updated by a base merge instead — report to the mayor, leave the branch and
+  MR bead alone, skip this MR. Do NOT retry with raw git or work around the refusal.
 
-To detect conflict state after rebase fails:
+**Step 3: Handle conflicts (exit 3)**
+
+1. **Record conflict metadata**:
 ```bash
-# Check if we're in a conflicted rebase state
-ls .git/rebase-merge 2>/dev/null && echo "CONFLICT_STATE"
-```
-
-**Step 3: Handle conflicts (if any)**
-
-If rebase SUCCEEDED (exit code 0):
-- Skip to run-tests step (continue normal merge flow)
-
-If rebase FAILED with conflicts:
-
-1. **Abort the rebase** (DO NOT leave repo in conflicted state):
-```bash
-git rebase --abort
-```
-
-2. **Record conflict metadata**:
-```bash
-# Capture target SHA for reference
 TARGET_SHA=$(git rev-parse origin/<rebase-target>)
 BRANCH_SHA=$(git rev-parse origin/<polecat-branch>)
 ```
 
-3. **Create conflict-resolution task**:
+2. **Create conflict-resolution task**. The instructions MUST match the rig's
+   `pr_update_strategy` ({{pr_update_strategy}}):
+
+   - If `merge` (or `none`, where the owner does the base merge): the instructions say
+     **merge the target into the branch and push normally — no rebase, no force-push.**
+   - If `rebase` (the default): the instructions say rebase and force-push **with lease**, and
+     that this is forbidden when the branch has an open PR with an approving review (merge the
+     target in instead).
+
 ```bash
+# strategy = merge
 bd create --type=task --priority=1 \
   --title="Resolve merge conflicts: <original-issue-title>" \
   --description="## Conflict Resolution Required
@@ -550,15 +561,22 @@ Branch SHA: ${BRANCH_SHA}
 
 ## Instructions
 1. Clone/checkout the branch
-2. Rebase on target: git rebase origin/<rebase-target>
-3. Resolve conflicts
-4. Force push: git push -f origin <branch>
+2. Merge the target in: git merge origin/<rebase-target>
+3. Resolve conflicts and commit the merge
+4. Push normally: git push origin <branch>   (NO rebase, NO force-push)
 5. Close this task when done
 
 The MR will be re-queued for processing after conflicts are resolved."
+
+# strategy = rebase: same header, then
+#   2. Rebase on target: git rebase origin/<rebase-target>
+#   3. Resolve conflicts
+#   4. Push with a lease: git push --force-with-lease origin <branch>
+#      (If the branch has an open PR with an approving review, do NOT rebase or
+#       force-push: merge the target in and push normally instead.)
 ```
 
-4. **Skip this MR** (do NOT delete branch or close MR bead):
+3. **Skip this MR** (do NOT delete branch or close MR bead):
 - Leave branch intact for conflict resolution
 - Leave MR bead open (will be re-processed after resolution)
 - Continue to loop-check for next branch
@@ -566,7 +584,7 @@ The MR will be re-queued for processing after conflicts are resolved."
 **CRITICAL**: Never delete a branch that has conflicts. The branch contains
 the original work and must be preserved for conflict resolution.
 
-Track: rebase result (success/conflict), conflict task ID if created."""
+Track: sync result (up-to-date/synced/behind-base/conflict/refused), conflict task ID if created."""
 
 [[steps]]
 id = "run-tests"
@@ -831,12 +849,18 @@ through `gt refinery pr …` subcommands. The subcommands encapsulate
 gh-CLI/graphql plumbing (idempotent PR creation, paginated thread listing,
 approver-aware gating, etc.) so the formula stays short and portable.
 
-**Step PR.1: Push the rebased polecat branch**
+**Step PR.1: Publish the synced polecat branch**
 
 ```bash
 git checkout temp
-git push origin temp:refs/heads/<polecat-branch> --force-with-lease
+{{ cmd }} refinery pr push-branch --branch <polecat-branch>
 ```
+
+`push-branch` is the only way the refinery publishes a work branch. It pushes a fast-forward
+(the `merge` strategy's merge commit) plainly, force-pushes only under `rebase` and only with a
+lease, and **refuses to force-push any branch whose open PR has an approving review** (exit 4).
+Under `none` it pushes nothing. On exit 4, do NOT retry with `git push --force`/`--force-with-lease`;
+report to the mayor and skip this MR.
 
 **Step PR.2: Create the PR (idempotent — returns existing PR if one is open)**
 
@@ -1605,7 +1629,7 @@ git fetch origin
 git checkout origin/<branch>
 git merge origin/<target>
 ```
-Resolve the conflicts on the integration branch (force-push), then re-run
+Resolve the conflicts on the integration branch (merge the target in and push normally; do not rebase and force-push), then re-run
 `gt mq integration land <epic-id>` to retry the consolidation.
 
 ## Why this exists
