@@ -363,7 +363,7 @@ func TestAutoPreserveUncommittedWork_HookFailureBlocksPushButPreservesLocally(t 
 	if runtime.GOOS == "windows" {
 		t.Skip("shell hook script not portable to windows")
 	}
-	localDir, _, _ := initTestRepoWithRemote(t)
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
 	g := NewGit(localDir)
 
 	branch := "polecat/foo/gt-y8ts@abc123"
@@ -383,7 +383,7 @@ func TestAutoPreserveUncommittedWork_HookFailureBlocksPushButPreservesLocally(t 
 		t.Fatalf("write: %v", err)
 	}
 
-	result, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{IssueID: "gt-y8ts", Push: true})
+	result, err := AutoPreserveUncommittedWork(g, branch, PreserveOptions{IssueID: "gt-y8ts", Push: true, ProtectedBranches: []string{mainBranch}})
 	if err != nil {
 		t.Fatalf("AutoPreserveUncommittedWork: %v", err)
 	}

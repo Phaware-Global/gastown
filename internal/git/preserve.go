@@ -221,6 +221,17 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 			return result, fmt.Errorf("cannot auto-preserve unmerged conflicts: %s", strings.Join(status.UnmergedFiles, ", "))
 		}
 
+		// Refuse before staging anything: a commit made while HEAD is not the
+		// tip of the branch it would be pushed to is how an approved PR branch
+		// got a revert of its own fix pushed onto it (gt-2stz).
+		remoteName := opts.Remote
+		if remoteName == "" {
+			remoteName = "origin"
+		}
+		if err := refuseIfHEADNotBranchTip(g, branch, remoteName); err != nil {
+			return nil, err
+		}
+
 		// ALLOWLIST, not denylist: stage only modifications/deletions to
 		// files git already tracks (`git add -u`). `git add -A` stages
 		// every untracked file too, and a denylist of known Gas Town
@@ -347,6 +358,9 @@ func AutoPreserveUncommittedWork(g *Git, branch string, opts PreserveOptions) (*
 			return nil, fmt.Errorf("checking staged changes: %w", hsErr)
 		}
 		if hasStaged {
+			if err := refuseHarmfulStagedCommit(g, branch, remoteName, opts.ProtectedBranches); err != nil {
+				return nil, err
+			}
 			msg := opts.CommitMessage
 			if msg == "" {
 				msg = "fix: auto-save uncommitted implementation work (gt-pvx safety net)"
@@ -839,4 +853,154 @@ func pathExcluded(f string, exclude []string) bool {
 		}
 	}
 	return false
+}
+
+// refuseIfHEADNotBranchTip refuses an auto-save commit onto branch unless HEAD
+// is branch itself and contains every commit already published as remote's
+// copy of branch. A worktree that has moved off the branch, or sits behind a
+// remote that other work has advanced, holds file contents that are stale
+// relative to the branch: committing them records a revert, and a push of that
+// commit lands it on a PR branch that was approved without it (gt-2stz:
+// graphql-api #162/#166, gastown #251, heartworks-android #100).
+//
+// A detached HEAD named "HEAD" is exempt: that commit belongs to no branch and
+// is only ever published to a preservation ref.
+func refuseIfHEADNotBranchTip(g *Git, branch, remote string) error {
+	if branch == "HEAD" {
+		return nil
+	}
+	ref, err := g.run("symbolic-ref", "-q", "HEAD")
+	if err != nil || ref == "" {
+		return fmt.Errorf("refusing to auto-preserve onto %q: HEAD is detached, so a commit would not be on that branch", branch)
+	}
+	if ref != "refs/heads/"+branch {
+		return fmt.Errorf("refusing to auto-preserve onto %q: HEAD is on %q, not that branch", branch, ref)
+	}
+
+	tip, tipErr := g.PushRemoteBranchTip(remote, branch)
+	if tipErr != nil {
+		// Offline or remote unreachable: fall back to the last fetched copy
+		// rather than blocking on the network. No copy at all means the branch
+		// was never published from here and there is nothing to protect.
+		tip, _ = g.run("rev-parse", "--verify", "-q", "refs/remotes/"+remote+"/"+branch)
+	}
+	if tip == "" {
+		return nil
+	}
+	contained, err := g.IsAncestor(tip, "HEAD")
+	if err != nil || !contained {
+		return fmt.Errorf("refusing to auto-preserve onto %q: HEAD is not the tip of %s/%s (remote tip %s is not in HEAD's history)", branch, remote, branch, shortSHA(tip))
+	}
+	return nil
+}
+
+// revertShareNum/revertShareDen: a pure removal of branch-added lines is
+// treated as a revert once it drops at least this share of what the branch
+// added to the file. Small cleanups of the branch's own additions (a debug
+// line) stay well under it.
+const revertShareNum, revertShareDen = 1, 2
+
+// refuseHarmfulStagedCommit inspects the index an auto-save is about to commit
+// and refuses when it would revert what the branch already changed relative to
+// its protected base branch (gt-2stz). .beads/ paths never get this far: the
+// runtime-artifact exclusion unstages them, and refuses if it cannot.
+func refuseHarmfulStagedCommit(g *Git, branch, remote string, protectedBranches []string) error {
+	staged, err := g.StagedFiles()
+	if err != nil {
+		return fmt.Errorf("refusing to auto-preserve: could not list staged files to vet: %w", err)
+	}
+	if branch == "HEAD" || len(staged) == 0 {
+		return nil
+	}
+
+	if len(protectedBranches) == 0 {
+		return fmt.Errorf("refusing to auto-preserve: no protected branches configured, so a revert of the branch's own changes cannot be ruled out")
+	}
+	for _, pb := range protectedBranches {
+		ref := "refs/remotes/" + remote + "/" + pb
+		if _, err := g.run("rev-parse", "--verify", ref); err != nil {
+			return fmt.Errorf("refusing to auto-preserve: protected branch ref %s does not resolve, so a revert of the branch's own changes cannot be ruled out: %w", ref, err)
+		}
+		base, err := g.MergeBase("HEAD", ref)
+		if err != nil || base == "" {
+			return fmt.Errorf("refusing to auto-preserve: no merge-base with %s, so a revert of the branch's own changes cannot be ruled out", ref)
+		}
+		for _, f := range staged {
+			if reverted, why := stagedPathReverts(g, base, f); reverted {
+				return fmt.Errorf("refusing to auto-preserve: staging %q would revert %s that this branch made relative to %s — the worktree holds stale content, not new work", f, why, ref)
+			}
+		}
+	}
+	return nil
+}
+
+// stagedPathReverts reports whether the staged version of path undoes the
+// branch's change to it, where base is the merge-base with the protected
+// branch. why describes what was undone.
+func stagedPathReverts(g *Git, base, path string) (bool, string) {
+	head, headErr := g.run("rev-parse", "HEAD:"+path)
+	staged, stagedErr := g.run("rev-parse", ":"+path)
+	if headErr != nil || stagedErr != nil || head == staged {
+		return false, ""
+	}
+	if atBase, err := g.run("rev-parse", base+":"+path); err == nil && atBase == head {
+		return false, "" // the branch never changed this file
+	} else if err == nil && atBase == staged {
+		return true, "its changes to the file entirely"
+	}
+
+	branchDiff, err := g.run("diff", "--no-renames", "-U0", base, "HEAD", "--", path)
+	if err != nil {
+		return false, ""
+	}
+	stagedDiff, err := g.run("diff", "--no-renames", "--cached", "-U0", "--", path)
+	if err != nil {
+		return false, ""
+	}
+	branchAdded, branchRemoved := diffLineSets(branchDiff)
+	stagedAdded, stagedRemoved := diffLineSets(stagedDiff)
+	if len(branchAdded) == 0 {
+		return false, ""
+	}
+
+	dropped := 0
+	for line := range stagedRemoved {
+		if branchAdded[line] {
+			dropped++
+		}
+	}
+	if dropped == 0 || dropped*revertShareDen < len(branchAdded)*revertShareNum {
+		return false, ""
+	}
+	// The staged change may only drop the branch's lines and put the base's
+	// back; anything it adds beyond that is new work layered on top.
+	for line := range stagedAdded {
+		if !branchRemoved[line] {
+			return false, ""
+		}
+	}
+	return true, fmt.Sprintf("%d of the %d line(s) it added to the file", dropped, len(branchAdded))
+}
+
+// diffLineSets returns the trimmed, non-trivial lines a zero-context diff
+// adds and removes. Lines of fewer than three characters ("}", ")") match
+// everywhere and carry no signal.
+func diffLineSets(diff string) (added, removed map[string]bool) {
+	added, removed = map[string]bool{}, map[string]bool{}
+	for _, l := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(l, "+++") || strings.HasPrefix(l, "---") || len(l) < 2 {
+			continue
+		}
+		body := strings.TrimSpace(l[1:])
+		if len(body) < 3 {
+			continue
+		}
+		switch l[0] {
+		case '+':
+			added[body] = true
+		case '-':
+			removed[body] = true
+		}
+	}
+	return added, removed
 }
