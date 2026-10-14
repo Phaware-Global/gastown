@@ -324,6 +324,12 @@ func isIssueBlocked(ctx context.Context, store beadsdk.Storage, issueID string, 
 // next close event triggers another feed cycle.
 // gtPath is the resolved path to the gt binary.
 func feedNextReadyIssue(ctx context.Context, store beadsdk.Storage, townRoot, convoyID, caller string, logger func(format string, args ...interface{}), gtPath string, isRigParked func(string) bool, resolver *StoreResolver) {
+	// Workflow convoys are never fed to polecats; say so once rather than per step.
+	if reason := polecatFeedBlock(convoyID, trackedIssue{}); reason != "" {
+		logger("%s: convoy %s: not feeding: %s", caller, convoyID, reason)
+		return
+	}
+
 	tracked := getConvoyTrackedIssues(ctx, store, convoyID, townRoot, resolver)
 	if len(tracked) == 0 {
 		return
