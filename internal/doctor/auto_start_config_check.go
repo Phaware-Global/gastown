@@ -123,6 +123,10 @@ func (c *AutoStartConfigCheck) Fix(ctx *CheckContext) error {
 		switch {
 		case is.reason != "":
 			errs = append(errs, fmt.Errorf("%s: %s", rel, is.reason))
+		case isGitTracked(filepath.Join(is.dir, "config.yaml")):
+			// Unattended --fix must not dirty a worktree; auto-save would commit
+			// the edit into an unrelated MR (gt-pyrkd).
+			errs = append(errs, fmt.Errorf("%s: config.yaml is git-tracked; set dolt.auto-start: false in a reviewed commit", rel))
 		default:
 			if err := setConfigAutoStartDisabled(is.dir); err != nil {
 				errs = append(errs, fmt.Errorf("%s: %w", rel, err))

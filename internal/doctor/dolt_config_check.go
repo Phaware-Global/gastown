@@ -218,14 +218,28 @@ func configYAMLValues(content string) map[string]string {
 }
 
 // Fix writes only the shared Dolt connection keys, preserving existing config.
+//
+// It never edits a git-tracked config.yaml. Doctor --fix runs unattended inside
+// worktrees, where a tracked edit dirties the tree and auto-save then commits it
+// into whatever MR that worktree owns. Tracked configs are left alone and
+// reported; changing them is a reviewed commit.
 func (c *DoltConfigCheck) Fix(ctx *CheckContext) error {
 	if len(c.targets) == 0 {
 		return nil
 	}
+	var tracked []string
 	for _, target := range c.targets {
+		if isGitTracked(filepath.Join(target.beadsDir, "config.yaml")) {
+			tracked = append(tracked, target.beadsDir)
+			continue
+		}
 		if err := ensureDoltConfigKeys(target.beadsDir, target.host, target.port); err != nil {
 			return err
 		}
+	}
+	if len(tracked) > 0 {
+		return fmt.Errorf("left %d git-tracked config.yaml unmodified (fix via a reviewed commit): %s",
+			len(tracked), strings.Join(tracked, ", "))
 	}
 	return nil
 }
