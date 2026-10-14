@@ -1545,6 +1545,11 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 				if !convoyops.IsSlingableType(t.IssueType) {
 					continue
 				}
+				// Role-created and workflow-convoy steps run on their owning
+				// roles, never on a rig polecat (gt-p1n2).
+				if convoyops.PolecatFeedBlock(convoy.ID, t.CreatedBy) != "" {
+					continue
+				}
 				readyIssues = append(readyIssues, t.ID)
 			}
 		}
@@ -2248,6 +2253,7 @@ type trackedIssueInfo struct {
 	IssueType string   `json:"issue_type"`
 	Blocked   bool     `json:"blocked,omitempty"`    // True if issue currently has blockers
 	Assignee  string   `json:"assignee,omitempty"`   // Assigned agent (e.g., gastown/polecats/goose)
+	CreatedBy string   `json:"-"`                    // Bead creator (bd show "Owner"); routing only, kept out of --json output
 	Labels    []string `json:"labels,omitempty"`     // Bead labels (propagated from trackedDependency)
 	Worker    string   `json:"worker,omitempty"`     // Worker currently assigned (e.g., gastown/nux)
 	WorkerAge string   `json:"worker_age,omitempty"` // How long worker has been on this issue
@@ -2260,6 +2266,7 @@ type trackedDependency struct {
 	Status         string   `json:"status"`
 	IssueType      string   `json:"issue_type"`
 	Assignee       string   `json:"assignee"`
+	CreatedBy      string   `json:"-"`
 	DependencyType string   `json:"dependency_type"`
 	Labels         []string `json:"labels"`
 	Blocked        bool     `json:"-"`
@@ -2284,6 +2291,7 @@ func applyFreshIssueDetails(dep *trackedDependency, details *issueDetails) {
 	// labels are empty clears stale queue labels that would otherwise
 	// suppress stranded issue detection.
 	dep.Labels = details.Labels
+	dep.CreatedBy = details.CreatedBy
 }
 
 // getTrackedIssues gets issues tracked by a convoy with fresh cross-rig details.
@@ -2361,6 +2369,7 @@ func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
 			IssueType: dep.IssueType,
 			Blocked:   dep.Blocked,
 			Assignee:  dep.Assignee,
+			CreatedBy: dep.CreatedBy,
 			Labels:    dep.Labels,
 		}
 
@@ -2452,6 +2461,7 @@ type issueDetailsJSON struct {
 	Status         string            `json:"status"`
 	IssueType      string            `json:"issue_type"`
 	Assignee       string            `json:"assignee"`
+	CreatedBy      string            `json:"created_by"`
 	Labels         []string          `json:"labels"`
 	BlockedBy      []string          `json:"blocked_by"`
 	BlockedByCount int               `json:"blocked_by_count"`
@@ -2465,6 +2475,7 @@ func (issue issueDetailsJSON) toIssueDetails() *issueDetails {
 		Status:         issue.Status,
 		IssueType:      issue.IssueType,
 		Assignee:       issue.Assignee,
+		CreatedBy:      issue.CreatedBy,
 		Labels:         issue.Labels,
 		BlockedBy:      issue.BlockedBy,
 		BlockedByCount: issue.BlockedByCount,
@@ -2511,6 +2522,7 @@ type issueDetails struct {
 	Status         string
 	IssueType      string
 	Assignee       string
+	CreatedBy      string
 	Labels         []string
 	BlockedBy      []string
 	BlockedByCount int

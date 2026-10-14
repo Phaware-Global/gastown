@@ -270,6 +270,10 @@ func runFormulaRun(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s Using default formula: %s\n", style.Dim.Render("Note:"), formulaName)
 	}
 
+	if err := roleFormulaRefusal(formulaName); err != nil {
+		return err
+	}
+
 	// Find the formula file
 	formulaPath, err := findFormulaFile(formulaName)
 	if err != nil {
@@ -702,6 +706,41 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 	fmt.Printf("\n  Track progress: gt convoy status %s\n", convoyID)
 
 	return nil
+}
+
+// roleOnlyFormulas are infrastructure formulas executed by a specific role
+// (deacon, dogs, witness, ...), in addition to the mol-*-patrol and mol-dog-*
+// families matched by roleFormulaFamily.
+var roleOnlyFormulas = map[string]bool{
+	"mol-session-gc":      true,
+	"mol-boot-triage":     true,
+	"mol-convoy-cleanup":  true,
+	"mol-dep-propagate":   true,
+	"mol-orphan-scan":     true,
+	"mol-shutdown-dance":  true,
+	"mol-town-shutdown":   true,
+	"mol-polecat-lease":   true,
+	"mol-digest-generate": true,
+}
+
+func roleFormulaFamily(name string) bool {
+	return roleOnlyFormulas[name] ||
+		(strings.HasPrefix(name, "mol-") && strings.HasSuffix(name, "-patrol")) ||
+		strings.HasPrefix(name, "mol-dog-")
+}
+
+// roleFormulaRefusal returns an error if name is a role or infrastructure
+// formula. `gt formula run` creates an hq-wf-* convoy whose steps the convoy
+// feeder slings to rig polecats under mol-polecat-work; a role's patrol steps
+// can only stall there, and the role skips its own patrol (gt-p1n2).
+func roleFormulaRefusal(name string) error {
+	if !roleFormulaFamily(name) {
+		return nil
+	}
+	return fmt.Errorf("'%s' is a role/infrastructure formula and cannot run through 'gt formula run': "+
+		"that dispatches each step to a rig polecat, which cannot execute it.\n\n"+
+		"Run it as the owning role's molecule instead:\n"+
+		"  gt sling %s <role-or-dog>   (e.g. gt sling mol-deacon-patrol deacon)", name, name)
 }
 
 // executeWorkflowFormula creates step beads with dependency wiring and dispatches

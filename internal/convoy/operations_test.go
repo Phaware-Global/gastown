@@ -1848,7 +1848,7 @@ func slungIDs(t *testing.T, logPath string) []string {
 
 // A convoy carrying dog-, deacon-, and role-owned steps must never hand any of
 // them to a rig polecat; the ordinary task is the only thing that may be slung.
-func TestFeedNextReadyIssue_NeverFeedsNonPolecatOwnedSteps(t *testing.T) {
+func TestFeedNextReadyIssue_NeverFeedsNonPolecatCreatedSteps(t *testing.T) {
 	for _, owner := range []string{"dog", "deacon", "boot", "deacon/dogs/alpha", "gastown/witness", "gastown/refinery", "Deacon"} {
 		t.Run(owner, func(t *testing.T) {
 			store, cleanup := setupTestStore(t)
@@ -1857,7 +1857,7 @@ func TestFeedNextReadyIssue_NeverFeedsNonPolecatOwnedSteps(t *testing.T) {
 
 			seedConvoy(t, ctx, store, "test-convoyown", []*beadsdk.Issue{
 				// Sorts first (priority 1) so a missing guard dispatches it.
-				{ID: "test-wfs-step1", Title: "Patrol step", Status: beadsdk.StatusOpen, Priority: 1, IssueType: beadsdk.TypeTask, Owner: owner},
+				{ID: "test-wfs-step1", Title: "Patrol step", Status: beadsdk.StatusOpen, Priority: 1, IssueType: beadsdk.TypeTask, CreatedBy: owner},
 				{ID: "test-plain1", Title: "Ordinary task", Status: beadsdk.StatusOpen, Priority: 2, IssueType: beadsdk.TypeTask},
 			})
 
@@ -1869,14 +1869,14 @@ func TestFeedNextReadyIssue_NeverFeedsNonPolecatOwnedSteps(t *testing.T) {
 
 			got := slungIDs(t, logPath)
 			if len(got) != 1 || got[0] != "test-plain1" {
-				t.Errorf("slung %v, want only [test-plain1]; owner %q must not reach a polecat", got, owner)
+				t.Errorf("slung %v, want only [test-plain1]; creator %q must not reach a polecat", got, owner)
 			}
 		})
 	}
 }
 
-// Owners that merely name a human or the mayor are ordinary polecat work.
-func TestFeedNextReadyIssue_FeedsHumanOrMayorOwnedTask(t *testing.T) {
+// Creators that merely name a human or the mayor are ordinary polecat work.
+func TestFeedNextReadyIssue_FeedsHumanOrMayorCreatedTask(t *testing.T) {
 	for _, owner := range []string{"", "mayor", "dev@example.com", "gastown/polecats/furiosa"} {
 		t.Run("owner="+owner, func(t *testing.T) {
 			store, cleanup := setupTestStore(t)
@@ -1884,7 +1884,7 @@ func TestFeedNextReadyIssue_FeedsHumanOrMayorOwnedTask(t *testing.T) {
 			ctx := context.Background()
 
 			seedConvoy(t, ctx, store, "test-convoyhum", []*beadsdk.Issue{
-				{ID: "test-human1", Title: "Task", Status: beadsdk.StatusOpen, Priority: 2, IssueType: beadsdk.TypeTask, Owner: owner},
+				{ID: "test-human1", Title: "Task", Status: beadsdk.StatusOpen, Priority: 2, IssueType: beadsdk.TypeTask, CreatedBy: owner},
 			})
 
 			townRoot := setupTownRoot(t)
@@ -1901,7 +1901,7 @@ func TestFeedNextReadyIssue_FeedsHumanOrMayorOwnedTask(t *testing.T) {
 }
 
 // hq-wf-* workflow convoys are executed by the roles that own each step, so the
-// feeder never dispatches anything from them, whatever the step's owner field says.
+// feeder never dispatches anything from them, whatever the step's creator is.
 func TestFeedNextReadyIssue_SkipsWorkflowConvoy(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
@@ -1932,19 +1932,19 @@ func TestPolecatFeedBlock(t *testing.T) {
 		wantSkip bool
 	}{
 		{"plain task", "hq-cv-1", trackedIssue{ID: "gt-1"}, false},
-		{"mayor owner", "hq-cv-1", trackedIssue{ID: "gt-1", Owner: "mayor"}, false},
-		{"human owner", "hq-cv-1", trackedIssue{ID: "gt-1", Owner: "dev@example.com"}, false},
-		{"polecat owner", "hq-cv-1", trackedIssue{ID: "gt-1", Owner: "gastown/polecats/nux"}, false},
-		{"dog owner", "hq-cv-1", trackedIssue{ID: "gt-wfs-i6uae", Owner: "dog"}, true},
-		{"dogs owner", "hq-cv-1", trackedIssue{ID: "gt-1", Owner: "dogs"}, true},
-		{"deacon owner", "hq-cv-1", trackedIssue{ID: "gt-wfs-awe24", Owner: "deacon"}, true},
-		{"deacon owner mixed case", "hq-cv-1", trackedIssue{ID: "gt-1", Owner: " Deacon "}, true},
-		{"boot owner", "hq-cv-1", trackedIssue{ID: "gt-1", Owner: "boot"}, true},
-		{"dog path owner", "hq-cv-1", trackedIssue{ID: "gt-1", Owner: "deacon/dogs/alpha"}, true},
-		{"witness owner", "hq-cv-1", trackedIssue{ID: "gt-1", Owner: "gastown/witness"}, true},
-		{"refinery owner", "hq-cv-1", trackedIssue{ID: "gt-1", Owner: "gastown/refinery"}, true},
-		{"workflow convoy, no owner", "hq-wf-vujja", trackedIssue{ID: "gt-wfs-sgtta"}, true},
-		{"workflow convoy, mayor owner", "hq-wf-bsbse", trackedIssue{ID: "gt-wfs-x", Owner: "mayor"}, true},
+		{"mayor creator", "hq-cv-1", trackedIssue{ID: "gt-1", CreatedBy: "mayor"}, false},
+		{"human creator", "hq-cv-1", trackedIssue{ID: "gt-1", CreatedBy: "dev@example.com"}, false},
+		{"polecat creator", "hq-cv-1", trackedIssue{ID: "gt-1", CreatedBy: "gastown/polecats/nux"}, false},
+		{"dog creator", "hq-cv-1", trackedIssue{ID: "gt-wfs-i6uae", CreatedBy: "dog"}, true},
+		{"dogs creator", "hq-cv-1", trackedIssue{ID: "gt-1", CreatedBy: "dogs"}, true},
+		{"deacon creator", "hq-cv-1", trackedIssue{ID: "gt-wfs-awe24", CreatedBy: "deacon"}, true},
+		{"deacon creator mixed case", "hq-cv-1", trackedIssue{ID: "gt-1", CreatedBy: " Deacon "}, true},
+		{"boot creator", "hq-cv-1", trackedIssue{ID: "gt-1", CreatedBy: "boot"}, true},
+		{"dog path creator", "hq-cv-1", trackedIssue{ID: "gt-1", CreatedBy: "deacon/dogs/alpha"}, true},
+		{"witness creator", "hq-cv-1", trackedIssue{ID: "gt-1", CreatedBy: "gastown/witness"}, true},
+		{"refinery creator", "hq-cv-1", trackedIssue{ID: "gt-1", CreatedBy: "gastown/refinery"}, true},
+		{"workflow convoy, no creator", "hq-wf-vujja", trackedIssue{ID: "gt-wfs-sgtta"}, true},
+		{"workflow convoy, mayor creator", "hq-wf-bsbse", trackedIssue{ID: "gt-wfs-x", CreatedBy: "mayor"}, true},
 		{"cv prefix is not a workflow", "hq-cv-wf", trackedIssue{ID: "gt-1"}, false},
 	}
 	for _, tt := range tests {
