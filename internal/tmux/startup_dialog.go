@@ -24,7 +24,7 @@ type dialogOption struct {
 // TUI's highlight glyph (❯, ›, >, ▶, ➤) and the "N." prefix is optional.
 var dialogLineRe = regexp.MustCompile(`^\s*([❯›>▶➤])?\s*(?:(\d+)[.)]\s+)?(\S.*?)\s*$`)
 
-// yesNoLeadRe recognises an unnumbered, unhighlighted option line.
+// yesNoLeadRe recognizes an unnumbered, unhighlighted option line.
 var yesNoLeadRe = regexp.MustCompile(`^(Yes|No)\b`)
 
 // dialogFooterMarkers end the option list; anything after them is not an option.
