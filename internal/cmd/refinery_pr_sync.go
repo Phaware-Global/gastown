@@ -91,17 +91,26 @@ func (noOpenPR) FindPRNumber(string) (int, error) { return 0, nil }
 func (noOpenPR) IsPRApproved(int) (bool, error)   { return false, nil }
 func (noOpenPR) CountApprovals(int) (int, error)  { return 0, nil }
 
+// refusePrSync reports a failure that happens before the sync/push itself runs
+// (bad flags, no workspace, invalid config) the same way a refused sync is
+// reported: on stderr with exit code 4, so the patrol formula's exit-code
+// handling covers it instead of seeing an unhandled exit 1.
+func refusePrSync(cmd *cobra.Command, name string, err error) error {
+	fmt.Fprintf(cmd.ErrOrStderr(), "%s: %v\n", name, err)
+	return NewSilentExit(syncExitRefused)
+}
+
 func runRefineryPrSyncBranch(cmd *cobra.Command, _ []string) error {
 	if refPrSyncBranch == "" || refPrSyncTarget == "" {
-		return errors.New("--branch and --target are required")
+		return refusePrSync(cmd, "sync-branch", errors.New("--branch and --target are required"))
 	}
 	provider, cfg, _, err := getRefineryPRContext()
 	if err != nil {
-		return err
+		return refusePrSync(cmd, "sync-branch", err)
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
-		return err
+		return refusePrSync(cmd, "sync-branch", err)
 	}
 	var probe refinery.PRApprovalProbe = provider
 	if cfg.MergeStrategy != "pr" {
@@ -111,8 +120,7 @@ func runRefineryPrSyncBranch(cmd *cobra.Command, _ []string) error {
 
 	res, err := refinery.SyncBranch(git.NewGit(cwd), probe, strategy, refPrSyncBranch, refPrSyncTarget, refPrSyncLocal)
 	if err != nil {
-		fmt.Fprintf(cmd.ErrOrStderr(), "sync-branch: %v\n", err)
-		return NewSilentExit(syncExitRefused)
+		return refusePrSync(cmd, "sync-branch", err)
 	}
 	out := cmd.OutOrStdout()
 	switch res.Outcome {
@@ -135,20 +143,19 @@ func runRefineryPrSyncBranch(cmd *cobra.Command, _ []string) error {
 
 func runRefineryPrPushBranch(cmd *cobra.Command, _ []string) error {
 	if refPrPushBranch == "" {
-		return errors.New("--branch is required")
+		return refusePrSync(cmd, "push-branch", errors.New("--branch is required"))
 	}
 	provider, cfg, _, err := getRefineryPRContext()
 	if err != nil {
-		return err
+		return refusePrSync(cmd, "push-branch", err)
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
-		return err
+		return refusePrSync(cmd, "push-branch", err)
 	}
 	res, err := refinery.PushBranch(git.NewGit(cwd), provider, cfg.GetPRUpdateStrategy(), refPrPushBranch, refPrPushLocal)
 	if err != nil {
-		fmt.Fprintf(cmd.ErrOrStderr(), "push-branch: %v\n", err)
-		return NewSilentExit(syncExitRefused)
+		return refusePrSync(cmd, "push-branch", err)
 	}
 	out := cmd.OutOrStdout()
 	switch {

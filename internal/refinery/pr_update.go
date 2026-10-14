@@ -124,7 +124,7 @@ func SyncBranch(g *git.Git, p PRApprovalProbe, strategy, branch, target, local s
 	switch {
 	case res.Behind == 0:
 		res.Outcome = SyncUpToDate
-		return res, g.CheckoutResetBranch(local, branchRef)
+		return res, resetToSyncedTip(g, local, res.BranchSHA)
 	case strategy == config.PRUpdateStrategyNone:
 		res.Outcome = SyncBehindBase
 		return res, nil
@@ -134,7 +134,7 @@ func SyncBranch(g *git.Git, p PRApprovalProbe, strategy, branch, target, local s
 		}
 	}
 
-	if err := g.CheckoutResetBranch(local, branchRef); err != nil {
+	if err := resetToSyncedTip(g, local, res.BranchSHA); err != nil {
 		return res, fmt.Errorf("checking out %s: %w", branchRef, err)
 	}
 	var opErr error
@@ -162,12 +162,30 @@ func SyncBranch(g *git.Git, p PRApprovalProbe, strategy, branch, target, local s
 	return res, nil
 }
 
+// syncedFromKey is the git config key under which SyncBranch records the tip of
+// origin/<branch> that `local` was built from.
+func syncedFromKey(local string) string {
+	return "branch." + local + ".gtSyncedFrom"
+}
+
+// resetToSyncedTip points `local` at sha, the tip SyncBranch resolved, and
+// records it for PushBranch. It checks out the SHA rather than origin/<branch>
+// so a fetch landing in between (the refinery shares refs with every polecat
+// through .repo.git) cannot make the recorded tip differ from what was built on.
+func resetToSyncedTip(g *git.Git, local, sha string) error {
+	if err := g.CheckoutResetBranch(local, sha); err != nil {
+		return err
+	}
+	return g.ConfigSet(syncedFromKey(local), sha)
+}
+
 // PushBranch publishes the local branch `local` to origin/<branch> as left by
 // SyncBranch. The push is a plain fast-forward push whenever possible. Only the
 // rebase strategy may force-push, and then only with a lease on the tip that
-// was fetched at sync time and only when CheckForcePushAllowed passes. Under
-// "none" nothing is ever pushed, and under "merge" a non-fast-forward is an
-// error, never a force.
+// SyncBranch recorded (not the live origin/<branch> ref, which a fetch can move)
+// and only when CheckForcePushAllowed passes. Under "none" nothing is ever
+// pushed, and under "merge" a non-fast-forward is an error, never a force. It
+// refuses when no sync was recorded for `local`.
 func PushBranch(g *git.Git, p PRApprovalProbe, strategy, branch, local string) (PushResult, error) {
 	strategy, err := config.NormalizePRUpdateStrategy(strategy)
 	if err != nil {
@@ -180,29 +198,24 @@ func PushBranch(g *git.Git, p PRApprovalProbe, strategy, branch, local string) (
 	res := PushResult{SHA: localSHA}
 	dst := "refs/heads/" + branch
 
-	remoteSHA, err := g.Rev("origin/" + branch)
+	syncedFrom, err := g.ConfigGet(syncedFromKey(local))
 	if err != nil {
-		// No remote-tracking ref: the branch is new to the remote.
-		if strategy == config.PRUpdateStrategyNone {
-			return res, fmt.Errorf("pr_update_strategy=none: refusing to push %s", branch)
-		}
-		if err := g.Push("origin", local+":"+dst, false); err != nil {
-			return res, err
-		}
-		res.Pushed = true
-		return res, nil
+		return res, fmt.Errorf("reading the synced tip of %s: %w", local, err)
 	}
-	if remoteSHA == localSHA {
+	if syncedFrom == "" {
+		return res, fmt.Errorf("no sync recorded for %s: run sync-branch first", local)
+	}
+	if syncedFrom == localSHA {
 		return res, nil
 	}
 	if strategy == config.PRUpdateStrategyNone {
-		return res, fmt.Errorf("pr_update_strategy=none: refusing to update %s (local %s differs from origin %s)",
-			branch, short(localSHA), short(remoteSHA))
+		return res, fmt.Errorf("pr_update_strategy=none: refusing to update %s (local %s differs from synced %s)",
+			branch, short(localSHA), short(syncedFrom))
 	}
 
-	fastForward, err := g.IsAncestor(remoteSHA, localSHA)
+	fastForward, err := g.IsAncestor(syncedFrom, localSHA)
 	if err != nil {
-		return res, fmt.Errorf("comparing %s with origin: %w", local, err)
+		return res, fmt.Errorf("comparing %s with synced tip: %w", local, err)
 	}
 	if fastForward {
 		if err := g.Push("origin", local+":"+dst, false); err != nil {
@@ -213,13 +226,13 @@ func PushBranch(g *git.Git, p PRApprovalProbe, strategy, branch, local string) (
 	}
 
 	if strategy != config.PRUpdateStrategyRebase {
-		return res, fmt.Errorf("pr_update_strategy=%s: %s is not a fast-forward of origin/%s; refusing to force-push — re-run sync-branch",
+		return res, fmt.Errorf("pr_update_strategy=%s: %s is not a fast-forward of the tip it was synced from (origin/%s); refusing to force-push — re-run sync-branch",
 			strategy, local, branch)
 	}
 	if err := CheckForcePushAllowed(p, branch); err != nil {
 		return res, err
 	}
-	if err := g.PushForceWithLease("origin", local, branch, remoteSHA); err != nil {
+	if err := g.PushForceWithLease("origin", local, branch, syncedFrom); err != nil {
 		return res, err
 	}
 	res.Pushed, res.Forced = true, true

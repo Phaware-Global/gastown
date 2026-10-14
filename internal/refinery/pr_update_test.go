@@ -362,6 +362,45 @@ func TestPushBranch_Rebase_ForceWithLeaseRejectsStaleView(t *testing.T) {
 	}
 }
 
+// The refinery worktree shares refs with every polecat, so a fetch between
+// sync-branch and push-branch moves origin/<branch>. The lease must stay on the
+// tip the sync started from, or it would adopt the late commit and overwrite it.
+func TestPushBranch_Rebase_LeaseSurvivesFetchBetweenSyncAndPush(t *testing.T) {
+	r := newSyncRepos(t, false)
+	if _, err := SyncBranch(r.g, &probeFake{}, "rebase", testBranch, "main", "temp"); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, r.origin, "config", "receive.denyNonFastForwards", "false")
+	mustGit(t, r.seed, "checkout", testBranch)
+	commitFile(t, r.seed, "late.txt", "late\n", "late commit")
+	mustGit(t, r.seed, "push", "origin", testBranch)
+	mustGit(t, r.work, "fetch", "origin")
+	before := r.originSHA(t, testBranch)
+
+	if _, err := PushBranch(r.g, &probeFake{}, "rebase", testBranch, "temp"); err == nil {
+		t.Fatal("want lease rejection after a fetch moved origin/" + testBranch)
+	}
+	if got := r.originSHA(t, testBranch); got != before {
+		t.Fatalf("late commit overwritten: %s -> %s", before, got)
+	}
+}
+
+func TestPushBranch_RefusesWithoutRecordedSync(t *testing.T) {
+	r := newSyncRepos(t, false)
+	mustGit(t, r.work, "checkout", "-B", "temp", "origin/"+testBranch)
+	commitFile(t, r.work, "extra.txt", "extra\n", "unsynced work")
+	before := r.originSHA(t, testBranch)
+
+	for _, strategy := range []string{"rebase", "merge"} {
+		if _, err := PushBranch(r.g, &probeFake{}, strategy, testBranch, "temp"); err == nil {
+			t.Fatalf("%s: want refusal when no sync was recorded for temp", strategy)
+		}
+	}
+	if got := r.originSHA(t, testBranch); got != before {
+		t.Fatalf("origin branch moved without a recorded sync: %s -> %s", before, got)
+	}
+}
+
 func TestPushBranch_None_RefusesToPushChanges(t *testing.T) {
 	r := newSyncRepos(t, false)
 	if _, err := SyncBranch(r.g, &probeFake{}, "merge", testBranch, "main", "temp"); err != nil {
@@ -378,7 +417,9 @@ func TestPushBranch_None_RefusesToPushChanges(t *testing.T) {
 
 func TestPushBranch_NothingToPush(t *testing.T) {
 	r := newSyncRepos(t, false)
-	mustGit(t, r.work, "checkout", "-B", "temp", "origin/"+testBranch)
+	if _, err := SyncBranch(r.g, &probeFake{}, "none", testBranch, testBranch, "temp"); err != nil {
+		t.Fatal(err)
+	}
 	res, err := PushBranch(r.g, &probeFake{}, "none", testBranch, "temp")
 	if err != nil {
 		t.Fatal(err)

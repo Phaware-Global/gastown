@@ -1486,6 +1486,12 @@ func (g *Git) ConfigGet(key string) (string, error) {
 	return out, nil
 }
 
+// ConfigSet sets a git config key in the repository's shared config.
+func (g *Git) ConfigSet(key, value string) error {
+	_, err := g.run("config", key, value)
+	return err
+}
+
 // Merge merges the given branch into the current branch.
 func (g *Git) Merge(branch string) error {
 	_, err := g.run("merge", branch)
