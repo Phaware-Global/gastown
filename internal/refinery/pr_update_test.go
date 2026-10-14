@@ -401,6 +401,58 @@ func TestPushBranch_RefusesWithoutRecordedSync(t *testing.T) {
 	}
 }
 
+func TestPushBranch_RefusesSyncRecordedForAnotherBranch(t *testing.T) {
+	r := newSyncRepos(t, false)
+	mustGit(t, r.seed, "push", "origin", "main:feature/y")
+	if _, err := SyncBranch(r.g, &probeFake{}, "merge", testBranch, "main", "temp"); err != nil {
+		t.Fatal(err)
+	}
+	before := r.originSHA(t, "feature/y")
+
+	for _, strategy := range []string{"rebase", "merge"} {
+		if _, err := PushBranch(r.g, &probeFake{}, strategy, "feature/y", "temp"); err == nil {
+			t.Fatalf("%s: want refusal when temp was synced from %s, not feature/y", strategy, testBranch)
+		}
+	}
+	if got := r.originSHA(t, "feature/y"); got != before {
+		t.Fatalf("feature/y moved: %s -> %s", before, got)
+	}
+}
+
+func TestPushBranch_RefusesAfterFailedSyncOfAnotherBranch(t *testing.T) {
+	r := newSyncRepos(t, false)
+	mustGit(t, r.seed, "push", "origin", "main:feature/y")
+	if _, err := SyncBranch(r.g, &probeFake{}, "merge", testBranch, "main", "temp"); err != nil {
+		t.Fatal(err)
+	}
+	before := r.originSHA(t, "feature/y")
+
+	// The second sync fails before it touches temp; the first sync's record
+	// must not survive it.
+	if _, err := SyncBranch(r.g, &probeFake{}, "merge", "feature/y", "no-such-target", "temp"); err == nil {
+		t.Fatal("want error syncing against a missing target")
+	}
+	if _, err := PushBranch(r.g, &probeFake{}, "merge", "feature/y", "temp"); err == nil {
+		t.Fatal("want refusal: the failed sync left no record to push on")
+	}
+	if got := r.originSHA(t, "feature/y"); got != before {
+		t.Fatalf("feature/y moved: %s -> %s", before, got)
+	}
+}
+
+func TestSyncBranch_RefusedRebaseClearsPriorRecord(t *testing.T) {
+	r := newSyncRepos(t, false)
+	if _, err := SyncBranch(r.g, &probeFake{}, "merge", testBranch, "main", "temp"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SyncBranch(r.g, &probeFake{pr: 3, approved: true}, "rebase", testBranch, "main", "temp"); err == nil {
+		t.Fatal("want rebase refused for an approved PR")
+	}
+	if _, err := PushBranch(r.g, &probeFake{}, "merge", testBranch, "temp"); err == nil {
+		t.Fatal("want refusal: the refused sync cleared the record")
+	}
+}
+
 func TestPushBranch_None_RefusesToPushChanges(t *testing.T) {
 	r := newSyncRepos(t, false)
 	if _, err := SyncBranch(r.g, &probeFake{}, "merge", testBranch, "main", "temp"); err != nil {

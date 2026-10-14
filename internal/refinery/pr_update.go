@@ -3,6 +3,7 @@ package refinery
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
@@ -101,7 +102,14 @@ func CheckForcePushAllowed(p PRApprovalProbe, branch string) error {
 //     published by force-pushing.
 //
 // A conflict aborts the merge/rebase and is reported as SyncConflict.
+//
+// The synced-tip record for `local` is cleared before anything else, so a sync
+// that fails part-way leaves no record for PushBranch to mistake for proof of
+// an earlier sync of a different branch.
 func SyncBranch(g *git.Git, p PRApprovalProbe, strategy, branch, target, local string) (SyncResult, error) {
+	if err := g.ConfigUnset(syncedFromKey(local)); err != nil {
+		return SyncResult{}, fmt.Errorf("clearing the synced tip of %s: %w", local, err)
+	}
 	strategy, err := config.NormalizePRUpdateStrategy(strategy)
 	if err != nil {
 		return SyncResult{}, err
@@ -124,7 +132,7 @@ func SyncBranch(g *git.Git, p PRApprovalProbe, strategy, branch, target, local s
 	switch {
 	case res.Behind == 0:
 		res.Outcome = SyncUpToDate
-		return res, resetToSyncedTip(g, local, res.BranchSHA)
+		return res, resetToSyncedTip(g, local, branch, res.BranchSHA)
 	case strategy == config.PRUpdateStrategyNone:
 		res.Outcome = SyncBehindBase
 		return res, nil
@@ -134,7 +142,7 @@ func SyncBranch(g *git.Git, p PRApprovalProbe, strategy, branch, target, local s
 		}
 	}
 
-	if err := resetToSyncedTip(g, local, res.BranchSHA); err != nil {
+	if err := resetToSyncedTip(g, local, branch, res.BranchSHA); err != nil {
 		return res, fmt.Errorf("checking out %s: %w", branchRef, err)
 	}
 	var opErr error
@@ -163,7 +171,9 @@ func SyncBranch(g *git.Git, p PRApprovalProbe, strategy, branch, target, local s
 }
 
 // syncedFromKey is the git config key under which SyncBranch records the tip of
-// origin/<branch> that `local` was built from.
+// origin/<branch> that `local` was built from, as "<branch> <sha>". The branch
+// is part of the record because `local` is reused across MRs: without it, the
+// record left by one branch's sync would authorize publishing to another.
 func syncedFromKey(local string) string {
 	return "branch." + local + ".gtSyncedFrom"
 }
@@ -172,11 +182,25 @@ func syncedFromKey(local string) string {
 // records it for PushBranch. It checks out the SHA rather than origin/<branch>
 // so a fetch landing in between (the refinery shares refs with every polecat
 // through .repo.git) cannot make the recorded tip differ from what was built on.
-func resetToSyncedTip(g *git.Git, local, sha string) error {
+func resetToSyncedTip(g *git.Git, local, branch, sha string) error {
 	if err := g.CheckoutResetBranch(local, sha); err != nil {
 		return err
 	}
-	return g.ConfigSet(syncedFromKey(local), sha)
+	return g.ConfigSet(syncedFromKey(local), branch+" "+sha)
+}
+
+// readSyncedTip returns the branch and tip recorded by the last successful
+// SyncBranch into `local`. Both are empty when there is no record.
+func readSyncedTip(g *git.Git, local string) (branch, sha string, err error) {
+	v, err := g.ConfigGet(syncedFromKey(local))
+	if err != nil || v == "" {
+		return "", "", err
+	}
+	branch, sha, ok := strings.Cut(v, " ")
+	if !ok {
+		return "", "", fmt.Errorf("malformed synced-tip record %q", v)
+	}
+	return branch, sha, nil
 }
 
 // PushBranch publishes the local branch `local` to origin/<branch> as left by
@@ -185,7 +209,8 @@ func resetToSyncedTip(g *git.Git, local, sha string) error {
 // SyncBranch recorded (not the live origin/<branch> ref, which a fetch can move)
 // and only when CheckForcePushAllowed passes. Under "none" nothing is ever
 // pushed, and under "merge" a non-fast-forward is an error, never a force. It
-// refuses when no sync was recorded for `local`.
+// refuses when no sync was recorded for `local`, or when the recorded sync was
+// of a different branch.
 func PushBranch(g *git.Git, p PRApprovalProbe, strategy, branch, local string) (PushResult, error) {
 	strategy, err := config.NormalizePRUpdateStrategy(strategy)
 	if err != nil {
@@ -198,12 +223,16 @@ func PushBranch(g *git.Git, p PRApprovalProbe, strategy, branch, local string) (
 	res := PushResult{SHA: localSHA}
 	dst := "refs/heads/" + branch
 
-	syncedFrom, err := g.ConfigGet(syncedFromKey(local))
+	syncedBranch, syncedFrom, err := readSyncedTip(g, local)
 	if err != nil {
 		return res, fmt.Errorf("reading the synced tip of %s: %w", local, err)
 	}
 	if syncedFrom == "" {
 		return res, fmt.Errorf("no sync recorded for %s: run sync-branch first", local)
+	}
+	if syncedBranch != branch {
+		return res, fmt.Errorf("%s was synced from %s, not %s: run sync-branch for %s first",
+			local, syncedBranch, branch, branch)
 	}
 	if syncedFrom == localSHA {
 		return res, nil

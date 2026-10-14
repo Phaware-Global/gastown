@@ -1492,6 +1492,24 @@ func (g *Git) ConfigSet(key, value string) error {
 	return err
 }
 
+// ConfigUnset removes a git config key from the repository's shared config.
+// Unsetting a key that is not set is not an error.
+func (g *Git) ConfigUnset(key string) error {
+	_, err := g.run("config", "--unset-all", key)
+	if err != nil {
+		// git config --unset-all returns exit code 5 if the key is not set.
+		var ge *GitError
+		if errors.As(err, &ge) {
+			var exitErr *exec.ExitError
+			if errors.As(ge.Err, &exitErr) && exitErr.ExitCode() == 5 {
+				return nil
+			}
+		}
+		return err
+	}
+	return nil
+}
+
 // Merge merges the given branch into the current branch.
 func (g *Git) Merge(branch string) error {
 	_, err := g.run("merge", branch)
