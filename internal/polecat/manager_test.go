@@ -3,6 +3,7 @@ package polecat
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2743,4 +2744,171 @@ func TestReuseIdlePolecat_NoSessionNoop(t *testing.T) {
 	if reuseErr == nil {
 		t.Fatal("expected error from worktree operations")
 	}
+}
+
+// breakOrigin points origin at a path that cannot accept a push while leaving
+// the refs/remotes/origin/* tracking refs intact, so the "unpushed" comparison
+// still works but publishing fails.
+func breakOrigin(t *testing.T, repo string) {
+	t.Helper()
+	if out, err := exec.Command("git", "-C", repo, "remote", "set-url", "origin", filepath.Join(repo, "does-not-exist.git")).CombinedOutput(); err != nil {
+		t.Fatalf("break origin: %v\n%s", err, out)
+	}
+}
+
+// commitInWorktree makes one real commit in the polecat worktree.
+func commitInWorktree(t *testing.T, clonePath, file, msg string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(clonePath, file), []byte(msg+"\n"), 0644); err != nil {
+		t.Fatalf("write %s: %v", file, err)
+	}
+	wtGit := git.NewGit(clonePath)
+	if err := wtGit.Add(file); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := wtGit.Commit(msg); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+}
+
+// TestRemoveWithOptions_RefusesWhenUnpushedCommitsCannotBePublished pins gt-yu9l
+// defect A: a removal that finds commits living only in the worktree and cannot
+// publish them must abort and leave the worktree in place, under force AND
+// nuclear — neither is the explicit discard flag.
+func TestRemoveWithOptions_RefusesWhenUnpushedCommitsCannotBePublished(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		force, nuclear bool
+	}{
+		{"force", true, false},
+		{"nuclear", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+			p, err := mgr.AddWithOptions("toast", AddOptions{})
+			if err != nil {
+				t.Fatalf("AddWithOptions: %v", err)
+			}
+			commitInWorktree(t, p.ClonePath, "real-work.txt", "genuinely unpushed work")
+			breakOrigin(t, mayorRig)
+
+			err = mgr.RemoveWithOptions("toast", tc.force, tc.nuclear, false)
+			var risk *WorkAtRiskError
+			if !errors.As(err, &risk) {
+				t.Fatalf("RemoveWithOptions err = %v, want *WorkAtRiskError", err)
+			}
+			if risk.Unpushed != 1 {
+				t.Errorf("Unpushed = %d, want 1", risk.Unpushed)
+			}
+			if _, statErr := os.Stat(filepath.Join(p.ClonePath, "real-work.txt")); statErr != nil {
+				t.Fatalf("worktree content was deleted despite the refusal: %v", statErr)
+			}
+		})
+	}
+}
+
+// TestRemoveWithOptions_DiscardUnpushedIsTheExplicitOverride pins that the
+// named flag — and only it — lets the removal proceed.
+func TestRemoveWithOptions_DiscardUnpushedIsTheExplicitOverride(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	commitInWorktree(t, p.ClonePath, "real-work.txt", "genuinely unpushed work")
+	breakOrigin(t, mayorRig)
+
+	if err := mgr.RemoveWith("toast", RemoveOptions{Force: true, Nuclear: true, DiscardUnpushed: true}); err != nil {
+		t.Fatalf("RemoveWith(DiscardUnpushed): %v", err)
+	}
+	if _, statErr := os.Stat(p.ClonePath); !os.IsNotExist(statErr) {
+		t.Fatalf("worktree still present after an explicit discard: %v", statErr)
+	}
+}
+
+// TestRemoveWithOptions_PublishesUnpushedCommitsInsteadOfRefusing pins that the
+// gate only fires when publishing failed: a reachable origin gets the branch.
+func TestRemoveWithOptions_PublishesUnpushedCommitsInsteadOfRefusing(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	commitInWorktree(t, p.ClonePath, "real-work.txt", "genuinely unpushed work")
+
+	if err := mgr.RemoveWithOptions("toast", true, false, false); err != nil {
+		t.Fatalf("RemoveWithOptions: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", mayorRig, "log", "-1", "--format=%s", "refs/heads/"+p.Branch).Output(); err != nil || !strings.Contains(string(out), "genuinely unpushed work") {
+		t.Fatalf("branch %s does not carry the commit after removal: %q (err %v)", p.Branch, out, err)
+	}
+}
+
+// TestRemoveWithOptions_DetachedHeadIsNeverPushedByLiteralName pins gt-yu9l
+// defect B: on a detached HEAD the push target must not be the literal "HEAD",
+// and a clean detached HEAD that is an ancestor of the remote target must not
+// raise a WORK AT RISK warning.
+func TestRemoveWithOptions_DetachedHeadIsNeverPushedByLiteralName(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	if err := git.NewGit(p.ClonePath).CheckoutDetach("origin/main"); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+
+	stderr := captureStderr(t, func() {
+		if err := mgr.RemoveWithOptions("toast", true, false, false); err != nil {
+			t.Fatalf("RemoveWithOptions: %v", err)
+		}
+	})
+	if strings.Contains(stderr, "WORK AT RISK") || strings.Contains(stderr, "HEAD -> HEAD") {
+		t.Fatalf("clean detached worktree (HEAD is an ancestor of the remote target) raised a false alarm:\n%s", stderr)
+	}
+}
+
+// TestRemoveWithOptions_UnpushedDetachedCommitDoesNotAttemptLiteralHeadPush
+// covers the detached branch of defect B with a commit that really is local.
+func TestRemoveWithOptions_UnpushedDetachedCommitDoesNotAttemptLiteralHeadPush(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	if err := git.NewGit(p.ClonePath).CheckoutDetach("HEAD"); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	commitInWorktree(t, p.ClonePath, "local.txt", "local detached commit")
+
+	stderr := captureStderr(t, func() {
+		if err := mgr.RemoveWithOptions("toast", true, false, false); err != nil {
+			t.Fatalf("RemoveWithOptions: %v", err)
+		}
+	})
+	for _, bad := range []string{"HEAD -> HEAD", "branch HEAD", "refs/heads/HEAD", "WORK AT RISK"} {
+		if strings.Contains(stderr, bad) {
+			t.Fatalf("treated the literal ref HEAD as a branch name (%q in stderr):\n%s", bad, stderr)
+		}
+	}
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stderr = w
+	done := make(chan string)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+	func() {
+		defer func() { os.Stderr = old; _ = w.Close() }()
+		fn()
+	}()
+	return <-done
 }

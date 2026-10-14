@@ -1135,7 +1135,40 @@ func (m *Manager) Remove(name string, force bool) error {
 //
 // ZFC #10: Uses cleanup_status from agent bead if available (polecat self-report),
 // falls back to git check for backward compatibility.
-func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) (retErr error) {
+func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) error {
+	return m.RemoveWith(name, RemoveOptions{Force: force, Nuclear: nuclear, SelfNuke: selfNuke})
+}
+
+// RemoveOptions controls RemoveWith. See RemoveWithOptions for Force, Nuclear
+// and SelfNuke.
+type RemoveOptions struct {
+	Force    bool
+	Nuclear  bool
+	SelfNuke bool
+	// DiscardUnpushed is the only way past a *WorkAtRiskError. Force and
+	// Nuclear deliberately do not imply it.
+	DiscardUnpushed bool
+}
+
+// WorkAtRiskError means removal would destroy commits that exist nowhere but
+// the worktree being removed.
+type WorkAtRiskError struct {
+	Polecat   string
+	Branch    string
+	ClonePath string
+	Unpushed  int
+	Reason    string
+}
+
+func (e *WorkAtRiskError) Error() string {
+	return fmt.Sprintf("WORK AT RISK: refusing to remove polecat %s: branch %s has %d unpushed commit(s) that exist only in worktree %s (%s)\n"+
+		"Push the branch, or pass the explicit discard-unpushed override (gt polecat nuke --discard-unpushed) to delete the work anyway",
+		e.Polecat, e.Branch, e.Unpushed, e.ClonePath, e.Reason)
+}
+
+// RemoveWith is RemoveWithOptions with the full option set.
+func (m *Manager) RemoveWith(name string, opts RemoveOptions) (retErr error) {
+	force, nuclear, selfNuke := opts.Force, opts.Nuclear, opts.SelfNuke
 	defer func() { telemetry.RecordPolecatRemove(context.Background(), name, retErr) }()
 	// Acquire per-polecat file lock to prevent concurrent Remove races
 	fl, err := m.lockPolecat(name)
@@ -1232,6 +1265,14 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 		}
 	}
 
+	// Publish the branch's unpushed commits, or refuse. This runs before the
+	// first mutation (agent bead reset, bead unassignment) so a refusal leaves
+	// the polecat exactly as it was. Force and nuclear do not skip it: only the
+	// explicit DiscardUnpushed override accepts losing commits (gt-yu9l).
+	if err := m.preserveUnpushedWork(name, clonePath, nuclear, opts.DiscardUnpushed); err != nil {
+		return err
+	}
+
 	// Reset agent bead FIRST, before any filesystem operations.
 	// This prevents a race where a concurrent sling allocates the same name,
 	// sets hook_bead, and then has it cleared by this cleanup. By resetting
@@ -1273,49 +1314,6 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 			if strings.HasPrefix(cwdAbs, cloneAbs) || strings.HasPrefix(cwdAbs, polecatAbs) {
 				return fmt.Errorf("%w: your shell is in %s\n\nPlease cd elsewhere first, then retry:\n  cd ~/gt\n  gt polecat nuke %s/%s --force",
 					ErrShellInWorktree, cwd, m.rig.Name, name)
-			}
-		}
-	}
-
-	// Best-effort: Push the polecat's branch to remote before removing the worktree.
-	// This preserves committed work that hasn't been pushed yet — without this,
-	// nuking a stalled polecat (e.g., after disk space recovery) permanently loses
-	// any commits on the branch. The push is non-blocking: failures are warnings,
-	// not errors, so nuke still proceeds. See: disk-space-resilience.
-	//
-	// Two gates (PR #184 review): never under nuclear — the operator reached
-	// for nuclear precisely because this worktree's contents must not survive
-	// (see the auto-preserve gating above), and this push would publish them
-	// anyway; and never when the branch carries a commit made with hooks
-	// bypassed — the auto-preserve gate above refuses to push those, and
-	// pushing the same commits here on the polecat's REAL branch would be
-	// strictly worse than the preserve ref it just refused.
-	if !nuclear {
-		polecatGit := git.NewGit(clonePath)
-		if branch, brErr := polecatGit.CurrentBranch(); brErr == nil && branch != "" {
-			if badSHA, chkErr := git.HasUnverifiedCommit(polecatGit, "origin", []string{m.rig.DefaultBranch()}); chkErr != nil {
-				style.PrintWarning("could not verify %s's commits before the pre-removal push, not pushing branch %s: %v", name, branch, chkErr)
-			} else if badSHA != "" {
-				style.PrintWarning("branch %s carries commit %s made with pre-commit hooks bypassed — refusing the pre-removal push; the work remains in the local commit", branch, badSHA[:8])
-			} else if wipSHA, wipErr := git.HasWIPCommit(polecatGit, "origin", "refs/heads/"+branch, checkpoint.WIPCommitPrefix, []string{m.rig.DefaultBranch()}); wipErr != nil {
-				style.PrintWarning("could not verify %s's commits before the pre-removal push, not pushing branch %s: %v", name, branch, wipErr)
-			} else if wipSHA != "" {
-				// gt-94p1 requirement 3: a checkpoint auto-save commit must
-				// never reach a real branch, even via this best-effort
-				// push. AutoPreserveUncommittedWork's Ephemeral mode (used
-				// just above) is the primary fix and should already keep
-				// one off branch — this is the backstop.
-				style.PrintWarning("branch %s carries a checkpoint auto-save commit %s — refusing the pre-removal push; the commit stays on the local branch (refs/heads/%s) and is not pushed", branch, wipSHA[:8], branch)
-			} else {
-				pushed, unpushedCount, checkErr := polecatGit.BranchPushedToRemote(branch, "origin")
-				if checkErr == nil && !pushed && unpushedCount > 0 {
-					if pushErr := polecatGit.Push("origin", branch, false); pushErr != nil {
-						style.PrintWarning("could not push branch %s before removal (%d unpushed commit(s)): %v",
-							branch, unpushedCount, pushErr)
-						style.PrintWarning("WORK AT RISK: branch %s has %d unpushed commit(s) in worktree %s",
-							branch, unpushedCount, clonePath)
-					}
-				}
 			}
 		}
 	}
@@ -1376,6 +1374,81 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	_ = m.namePool.Save()
 
 	return nil
+}
+
+// PreserveUnpushedWork is the removal-time unpushed-work gate on its own, for
+// callers that must learn about a refusal before they take any destructive
+// step of their own (stopping the session, burning molecules). It publishes
+// the branch when it can and returns *WorkAtRiskError when commits would
+// otherwise be lost. With discard it only makes the best-effort push.
+func (m *Manager) PreserveUnpushedWork(name string, discard bool) error {
+	if !m.exists(name) {
+		return ErrPolecatNotFound
+	}
+	return m.preserveUnpushedWork(name, m.clonePath(name), false, discard)
+}
+
+// preserveUnpushedWork makes sure every commit on the worktree's branch exists
+// somewhere other than the worktree, then reports whether any does not.
+//
+// "Unpushed" is decided by comparing the worktree against the remote's actual
+// refs (BranchPushedToRemote), never inferred from a failed push. A detached
+// HEAD has no name to push under: pushing the literal ref "HEAD" is malformed,
+// and the removal path pins a detached HEAD's commits under refs/gt/preserve
+// itself, so a detached worktree is neither pushed nor refused here.
+//
+// nuclear never publishes (the operator reached for it because the contents
+// must not survive), so under nuclear any unpushed commit is at risk.
+func (m *Manager) preserveUnpushedWork(name, clonePath string, nuclear, discard bool) error {
+	polecatGit := git.NewGit(clonePath)
+	branch, err := polecatGit.CurrentBranch()
+	if err != nil || branch == "" || branch == "HEAD" {
+		return nil
+	}
+	pushed, unpushed, err := polecatGit.BranchPushedToRemote(branch, "origin")
+	if err != nil || pushed || unpushed == 0 {
+		return nil
+	}
+
+	risk := &WorkAtRiskError{Polecat: name, Branch: branch, ClonePath: clonePath, Unpushed: unpushed}
+	switch {
+	case nuclear:
+		risk.Reason = "nuclear removal never publishes"
+	default:
+		risk.Reason = m.pushUnpushedBranch(polecatGit, branch)
+	}
+	if risk.Reason == "" {
+		return nil
+	}
+	if discard {
+		style.PrintWarning("discarding %d unpushed commit(s) on branch %s (%s) at the operator's explicit request", unpushed, branch, risk.Reason)
+		return nil
+	}
+	return risk
+}
+
+// pushUnpushedBranch pushes branch to origin and returns "" on success, or the
+// reason the commits stayed local. It refuses to publish a commit made with
+// hooks bypassed or a checkpoint auto-save commit: pushing either onto the
+// polecat's real branch would be worse than leaving it local.
+func (m *Manager) pushUnpushedBranch(polecatGit *git.Git, branch string) string {
+	defaultBranches := []string{m.rig.DefaultBranch()}
+	if badSHA, err := git.HasUnverifiedCommit(polecatGit, "origin", defaultBranches); err != nil {
+		return fmt.Sprintf("could not verify the branch's commits before pushing: %v", err)
+	} else if badSHA != "" {
+		return fmt.Sprintf("commit %s was made with pre-commit hooks bypassed, so it is not pushed", badSHA[:8])
+	}
+	if wipSHA, err := git.HasWIPCommit(polecatGit, "origin", "refs/heads/"+branch, checkpoint.WIPCommitPrefix, defaultBranches); err != nil {
+		return fmt.Sprintf("could not verify the branch's commits before pushing: %v", err)
+	} else if wipSHA != "" {
+		// gt-94p1 requirement 3: a checkpoint auto-save commit must never
+		// reach a real branch, even via this best-effort push.
+		return fmt.Sprintf("checkpoint auto-save commit %s is not pushed", wipSHA[:8])
+	}
+	if err := polecatGit.Push("origin", branch+":refs/heads/"+branch, false); err != nil {
+		return fmt.Sprintf("push failed: %v", err)
+	}
+	return ""
 }
 
 // verifyRemovalComplete checks that polecat directories were actually removed.
