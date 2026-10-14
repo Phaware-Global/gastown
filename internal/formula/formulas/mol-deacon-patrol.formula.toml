@@ -992,7 +992,7 @@ Skip dispatch - system is healthy.
 **Cleanup types (for reference):**
 - orphan-sessions: Dead tmux sessions
 - orphan-processes: Orphaned Claude processes
-- wisp-gc: Old wisps past retention
+- wisp-gc: Closed wisps (open wisps are never deleted)
 
 **Exit criteria:** Session GC dispatched to dog (if needed)."""
 
