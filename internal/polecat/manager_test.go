@@ -2893,6 +2893,97 @@ func TestRemoveWithOptions_UnpushedDetachedCommitDoesNotAttemptLiteralHeadPush(t
 	}
 }
 
+// TestRemoveWithOptions_NuclearRefusesUnpushedDetachedCommit pins that the
+// detached-HEAD exemption holds only where the removal path pins the commit
+// under refs/gt/preserve. Nuclear skips that pin, so a detached commit that
+// exists nowhere else is at risk exactly like a branch's, and only
+// DiscardUnpushed may delete it.
+func TestRemoveWithOptions_NuclearRefusesUnpushedDetachedCommit(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	if err := git.NewGit(p.ClonePath).CheckoutDetach("HEAD"); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	commitInWorktree(t, p.ClonePath, "local.txt", "local detached commit")
+	breakOrigin(t, mayorRig)
+
+	err = mgr.RemoveWith("toast", RemoveOptions{Force: true, Nuclear: true})
+	var risk *WorkAtRiskError
+	if !errors.As(err, &risk) {
+		t.Fatalf("RemoveWith err = %v, want *WorkAtRiskError", err)
+	}
+	if risk.Branch != "(detached)" || risk.Unpushed != 1 {
+		t.Errorf("risk = %+v, want Branch (detached) with 1 unpushed commit", risk)
+	}
+	if _, statErr := os.Stat(filepath.Join(p.ClonePath, "local.txt")); statErr != nil {
+		t.Fatalf("worktree content was deleted despite the refusal: %v", statErr)
+	}
+
+	if err := mgr.RemoveWith("toast", RemoveOptions{Force: true, Nuclear: true, DiscardUnpushed: true}); err != nil {
+		t.Fatalf("RemoveWith(DiscardUnpushed): %v", err)
+	}
+}
+
+// TestRemoveWithOptions_NuclearAllowsCleanDetachedWorktree pins that the
+// stricter nuclear detached check does not refuse a detached HEAD whose commits
+// the remote already has.
+func TestRemoveWithOptions_NuclearAllowsCleanDetachedWorktree(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	if err := git.NewGit(p.ClonePath).CheckoutDetach("origin/main"); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	if err := mgr.RemoveWith("toast", RemoveOptions{Force: true, Nuclear: true}); err != nil {
+		t.Fatalf("RemoveWith: %v", err)
+	}
+}
+
+// TestPreserveUnpushedWork_FailsClosedWhenComparisonErrors pins that a worktree
+// whose commits cannot be compared against the remote is refused, not treated
+// as pushed — the same "could not verify" answer pushUnpushedBranch gives.
+func TestPreserveUnpushedWork_FailsClosedWhenComparisonErrors(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	commitInWorktree(t, p.ClonePath, "real-work.txt", "genuinely unpushed work")
+
+	// Unreachable origin and no tracking refs to fall back on: nothing resolves.
+	breakOrigin(t, mayorRig)
+	refs, err := exec.Command("git", "-C", p.ClonePath, "for-each-ref", "--format=%(refname)", "refs/remotes/origin/").Output()
+	if err != nil {
+		t.Fatalf("list tracking refs: %v", err)
+	}
+	for _, ref := range strings.Fields(string(refs)) {
+		if out, err := exec.Command("git", "-C", p.ClonePath, "update-ref", "-d", ref).CombinedOutput(); err != nil {
+			t.Fatalf("delete %s: %v\n%s", ref, err, out)
+		}
+	}
+	_ = exec.Command("git", "-C", p.ClonePath, "branch", "--unset-upstream").Run()
+
+	err = mgr.PreserveUnpushedWork("toast", false)
+	var risk *WorkAtRiskError
+	if !errors.As(err, &risk) {
+		t.Fatalf("PreserveUnpushedWork err = %v, want *WorkAtRiskError", err)
+	}
+	if !strings.Contains(risk.Reason, "could not determine whether commits are pushed") {
+		t.Errorf("Reason = %q, want the could-not-determine reason", risk.Reason)
+	}
+	if !strings.Contains(risk.Error(), "possibly unpushed commits") {
+		t.Errorf("Error() = %q, want it to say the count is unknown", risk.Error())
+	}
+	if err := mgr.PreserveUnpushedWork("toast", true); err != nil {
+		t.Fatalf("PreserveUnpushedWork(discard) = %v, want nil", err)
+	}
+}
+
 func captureStderr(t *testing.T, fn func()) string {
 	t.Helper()
 	old := os.Stderr

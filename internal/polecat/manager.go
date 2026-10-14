@@ -1161,9 +1161,14 @@ type WorkAtRiskError struct {
 }
 
 func (e *WorkAtRiskError) Error() string {
-	return fmt.Sprintf("WORK AT RISK: refusing to remove polecat %s: branch %s has %d unpushed commit(s) that exist only in worktree %s (%s)\n"+
+	// Unpushed < 0 means the comparison itself failed, so the count is unknown.
+	count := fmt.Sprintf("%d unpushed commit(s)", e.Unpushed)
+	if e.Unpushed < 0 {
+		count = "possibly unpushed commits"
+	}
+	return fmt.Sprintf("WORK AT RISK: refusing to remove polecat %s: branch %s has %s that exist only in worktree %s (%s)\n"+
 		"Push the branch, or pass the explicit discard-unpushed override (gt polecat nuke --discard-unpushed) to delete the work anyway",
-		e.Polecat, e.Branch, e.Unpushed, e.ClonePath, e.Reason)
+		e.Polecat, e.Branch, count, e.ClonePath, e.Reason)
 }
 
 // RemoveWith is RemoveWithOptions with the full option set.
@@ -1393,24 +1398,38 @@ func (m *Manager) PreserveUnpushedWork(name string, discard bool) error {
 //
 // "Unpushed" is decided by comparing the worktree against the remote's actual
 // refs (BranchPushedToRemote), never inferred from a failed push. A detached
-// HEAD has no name to push under: pushing the literal ref "HEAD" is malformed,
-// and the removal path pins a detached HEAD's commits under refs/gt/preserve
-// itself, so a detached worktree is neither pushed nor refused here.
+// HEAD has no name to push under: pushing the literal ref "HEAD" is malformed.
+// Without nuclear, the removal path pins a detached HEAD's commits under
+// refs/gt/preserve itself, so such a worktree is neither pushed nor refused
+// here. Nuclear skips that pin, so a detached HEAD is held to the same
+// standard as a branch.
 //
 // nuclear never publishes (the operator reached for it because the contents
-// must not survive), so under nuclear any unpushed commit is at risk.
+// must not survive), so under nuclear any unpushed commit is at risk. A
+// comparison that cannot be made is treated as at risk too, never as pushed.
 func (m *Manager) preserveUnpushedWork(name, clonePath string, nuclear, discard bool) error {
 	polecatGit := git.NewGit(clonePath)
 	branch, err := polecatGit.CurrentBranch()
-	if err != nil || branch == "" || branch == "HEAD" {
+	if err != nil {
+		return m.unverifiedWorkRisk(name, clonePath, "(unknown)", fmt.Errorf("current branch: %w", err), discard)
+	}
+	detached := branch == "" || branch == "HEAD"
+	if detached && !nuclear {
 		return nil
 	}
+	label := branch
+	if detached {
+		label = "(detached)"
+	}
 	pushed, unpushed, err := polecatGit.BranchPushedToRemote(branch, "origin")
-	if err != nil || pushed || unpushed == 0 {
+	if err != nil {
+		return m.unverifiedWorkRisk(name, clonePath, label, err, discard)
+	}
+	if pushed || unpushed == 0 {
 		return nil
 	}
 
-	risk := &WorkAtRiskError{Polecat: name, Branch: branch, ClonePath: clonePath, Unpushed: unpushed}
+	risk := &WorkAtRiskError{Polecat: name, Branch: label, ClonePath: clonePath, Unpushed: unpushed}
 	switch {
 	case nuclear:
 		risk.Reason = "nuclear removal never publishes"
@@ -1421,10 +1440,22 @@ func (m *Manager) preserveUnpushedWork(name, clonePath string, nuclear, discard 
 		return nil
 	}
 	if discard {
-		style.PrintWarning("discarding %d unpushed commit(s) on branch %s (%s) at the operator's explicit request", unpushed, branch, risk.Reason)
+		style.PrintWarning("discarding %d unpushed commit(s) on branch %s (%s) at the operator's explicit request", unpushed, label, risk.Reason)
 		return nil
 	}
 	return risk
+}
+
+// unverifiedWorkRisk is the fail-closed answer for a worktree whose commits
+// could not be compared against the remote: removal is refused unless the
+// operator passed the explicit discard override.
+func (m *Manager) unverifiedWorkRisk(name, clonePath, branch string, cause error, discard bool) error {
+	reason := fmt.Sprintf("could not determine whether commits are pushed: %v", cause)
+	if discard {
+		style.PrintWarning("discarding possibly unpushed commits on branch %s (%s) at the operator's explicit request", branch, reason)
+		return nil
+	}
+	return &WorkAtRiskError{Polecat: name, Branch: branch, ClonePath: clonePath, Unpushed: -1, Reason: reason}
 }
 
 // pushUnpushedBranch pushes branch to origin and returns "" on success, or the
