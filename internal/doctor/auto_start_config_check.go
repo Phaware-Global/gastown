@@ -78,7 +78,12 @@ func (c *AutoStartConfigCheck) Run(ctx *CheckContext) *CheckResult {
 		case err != nil:
 			c.issues = append(c.issues, autoStartIssue{dir: dir, reason: "refused: " + err.Error()})
 		case !configDisablesAutoStart(string(data)):
-			c.issues = append(c.issues, autoStartIssue{dir: dir})
+			is := autoStartIssue{dir: dir}
+			if isGitTracked(filepath.Join(dir, "config.yaml")) {
+				// --fix never edits a tracked file (gt-pyrkd), so it cannot clear this.
+				is.reason = "config.yaml is git-tracked; commit dolt.auto-start: false"
+			}
+			c.issues = append(c.issues, is)
 		}
 	}
 
@@ -124,8 +129,9 @@ func (c *AutoStartConfigCheck) Fix(ctx *CheckContext) error {
 		case is.reason != "":
 			errs = append(errs, fmt.Errorf("%s: %s", rel, is.reason))
 		case isGitTracked(filepath.Join(is.dir, "config.yaml")):
-			// Unattended --fix must not dirty a worktree; auto-save would commit
-			// the edit into an unrelated MR (gt-pyrkd).
+			// Run reports tracked stores as unfixable; this covers one that became
+			// tracked after Run. Unattended --fix must not dirty a worktree, or
+			// auto-save would commit the edit into an unrelated MR (gt-pyrkd).
 			errs = append(errs, fmt.Errorf("%s: config.yaml is git-tracked; set dolt.auto-start: false in a reviewed commit", rel))
 		default:
 			if err := setConfigAutoStartDisabled(is.dir); err != nil {
