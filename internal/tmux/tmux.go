@@ -2267,7 +2267,9 @@ func (t *Tmux) NudgePane(pane, message string) error {
 // AcceptStartupDialogs dismisses startup dialogs that can block automated
 // sessions. Currently handles (in order):
 //  1. Workspace trust dialog (Claude "Quick safety check", Codex "Do you trust the contents of this directory?")
-//  2. Bypass permissions warning ("Bypass Permissions mode") — requires Down+Enter
+//  2. Bypass permissions warning ("Bypass Permissions mode")
+//
+// Each dialog's "Yes" option is selected by its rendered text, not by assumed position.
 //
 // Call this after starting the agent and waiting for it to initialize (WaitForCommand),
 // but before sending any prompts. Idempotent: safe to call on sessions without dialogs.
@@ -2306,14 +2308,20 @@ func (t *Tmux) CheckStartupBlocked(session string) error {
 
 // AcceptWorkspaceTrustDialog dismisses workspace trust dialogs for supported
 // agents. Claude shows "Quick safety check"; Codex shows
-// "Do you trust the contents of this directory?". In both cases the safe
-// continue option is pre-selected, so Enter accepts the dialog.
+// "Do you trust the contents of this directory?".
+//
+// The option order and pre-selected entry vary by agent version (Claude Code
+// 2.1.299 lists "No, exit" first and pre-selects it), so the "Yes" option is
+// located from the rendered text and the highlight moved onto it before Enter.
+// If a trust dialog is visible but its options never become identifiable, an
+// error is returned and no key is sent.
 //
 // Uses a polling loop instead of a single check to handle the race condition where
 // the agent hasn't rendered the dialog yet when we first check. Exits early if the
 // agent prompt appears (indicating no dialog will be shown).
 func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 	deadline := time.Now().Add(constants.DialogPollTimeout)
+	var pending error
 	for time.Now().Before(deadline) {
 		content, err := t.CapturePane(session, 30)
 		if err != nil {
@@ -2325,9 +2333,11 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 		// Codex trust screens include a leading ">" banner line, so prompt
 		// detection alone would exit too early.
 		if containsWorkspaceTrustDialog(content) {
-			// Dialog found — accept it (option 1 is pre-selected, just press Enter)
-			if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
-				return err
+			// The title can render before its options; retry until they parse.
+			if err := t.selectAffirmativeOption(session, content, workspaceTrustMarkers); err != nil {
+				pending = err
+				time.Sleep(constants.DialogPollInterval)
+				continue
 			}
 			// Wait for dialog to dismiss before proceeding
 			time.Sleep(500 * time.Millisecond)
@@ -2344,6 +2354,9 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 		time.Sleep(constants.DialogPollInterval)
 	}
 
+	if pending != nil {
+		return fmt.Errorf("workspace trust dialog visible but not accepted: %w", pending)
+	}
 	// Timeout — no dialog detected, safe to proceed
 	return nil
 }
@@ -2447,10 +2460,12 @@ func lastPromptIndicatorLine(content string) int {
 }
 
 // AcceptBypassPermissionsWarning dismisses the Claude Code bypass permissions warning dialog.
-// When Claude starts with --dangerously-skip-permissions, it shows a warning dialog that
-// requires pressing Down arrow to select "Yes, I accept" and then Enter to confirm.
-// This function checks if the warning is present before sending keys to avoid interfering
-// with sessions that don't show the warning (e.g., already accepted or different config).
+// When Claude starts with --dangerously-skip-permissions, it shows a warning dialog whose
+// "Yes, I accept" option must be highlighted before Enter confirms it. The option is located
+// from the rendered text rather than assumed to be second. This function checks if the
+// warning is present before sending keys to avoid interfering with sessions that don't show
+// it (e.g., already accepted or different config). If the warning is visible but its options
+// never become identifiable, an error is returned and no key is sent.
 //
 // Uses a polling loop instead of a single check to handle the race condition where
 // Claude hasn't rendered the dialog yet when we first check. Exits early if the
@@ -2460,6 +2475,7 @@ func lastPromptIndicatorLine(content string) int {
 // but before sending any prompts.
 func (t *Tmux) AcceptBypassPermissionsWarning(session string) error {
 	deadline := time.Now().Add(constants.DialogPollTimeout)
+	var pending error
 	for time.Now().Before(deadline) {
 		content, err := t.CapturePane(session, 30)
 		if err != nil {
@@ -2469,13 +2485,10 @@ func (t *Tmux) AcceptBypassPermissionsWarning(session string) error {
 
 		// Look for the characteristic warning text
 		if strings.Contains(content, "Bypass Permissions mode") {
-			// Dialog found — press Down to select "Yes, I accept" then Enter
-			if _, err := t.run("send-keys", "-t", session, "Down"); err != nil {
-				return err
-			}
-			time.Sleep(200 * time.Millisecond)
-			if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
-				return err
+			if err := t.selectAffirmativeOption(session, content, bypassPermissionsMarkers); err != nil {
+				pending = err
+				time.Sleep(constants.DialogPollInterval)
+				continue
 			}
 			return nil
 		}
@@ -2488,39 +2501,47 @@ func (t *Tmux) AcceptBypassPermissionsWarning(session string) error {
 		time.Sleep(constants.DialogPollInterval)
 	}
 
+	if pending != nil {
+		return fmt.Errorf("bypass permissions warning visible but not accepted: %w", pending)
+	}
 	// Timeout — no dialog detected, safe to proceed
 	return nil
 }
 
-// DismissStartupDialogsBlind sends the key sequences needed to dismiss all
-// known Claude Code startup dialogs without screen-scraping pane content.
-// This avoids coupling to third-party TUI strings that can change with any update.
+// DismissStartupDialogsBlind dismisses any known Claude Code startup dialog
+// that is currently on screen. The name is historical: it no longer sends keys
+// without looking, because the dialogs' option order is not stable across
+// releases and a blind Enter selects "No, exit" on Claude Code 2.1.299+.
 //
-// The sequence handles (in order):
-//  1. Workspace trust dialog — Enter (option 1 "Yes, I trust this folder" is pre-selected)
-//  2. Bypass permissions warning — Down+Enter (select "Yes, I accept" then confirm)
-//
-// Safe to call on sessions where no dialog is showing: Enter sends a blank input
-// to an idle Claude prompt (harmless for a stalled session), and Down+Enter either
-// does nothing or sends another blank input.
+// It captures the pane once per dialog (workspace trust, then bypass
+// permissions) and moves the highlight to the "Yes" option by its text before
+// pressing Enter. Sessions with no dialog on screen are left untouched. A
+// dialog that is visible but whose options cannot be identified yields an
+// error and no keypress, so the caller can escalate instead of guessing.
 //
 // This is intended for remediation of stalled sessions detected via structured
-// signals (session age + activity). For startup-time dialog handling where
-// precision matters, use AcceptStartupDialogs instead.
+// signals (session age + activity). For startup-time dialog handling, use
+// AcceptStartupDialogs, which also polls for dialogs that have not rendered yet.
 func (t *Tmux) DismissStartupDialogsBlind(session string) error {
-	// Step 1: Send Enter to dismiss trust dialog (if present)
-	if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
-		return fmt.Errorf("sending Enter for trust dialog: %w", err)
+	content, err := t.CapturePane(session, 30)
+	if err != nil {
+		return fmt.Errorf("capturing pane for startup dialogs: %w", err)
 	}
-	time.Sleep(500 * time.Millisecond)
 
-	// Step 2: Send Down+Enter to dismiss bypass permissions dialog (if present)
-	if _, err := t.run("send-keys", "-t", session, "Down"); err != nil {
-		return fmt.Errorf("sending Down for bypass dialog: %w", err)
+	if !promptAppearsAfterStartupBlocker(content) && containsWorkspaceTrustDialog(content) {
+		if err := t.selectAffirmativeOption(session, content, workspaceTrustMarkers); err != nil {
+			return fmt.Errorf("workspace trust dialog: %w", err)
+		}
+		time.Sleep(500 * time.Millisecond)
+		if content, err = t.CapturePane(session, 30); err != nil {
+			return fmt.Errorf("capturing pane for startup dialogs: %w", err)
+		}
 	}
-	time.Sleep(200 * time.Millisecond)
-	if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
-		return fmt.Errorf("sending Enter for bypass dialog: %w", err)
+
+	if !promptAppearsAfterStartupBlocker(content) && strings.Contains(content, "Bypass Permissions mode") {
+		if err := t.selectAffirmativeOption(session, content, bypassPermissionsMarkers); err != nil {
+			return fmt.Errorf("bypass permissions warning: %w", err)
+		}
 	}
 
 	return nil
