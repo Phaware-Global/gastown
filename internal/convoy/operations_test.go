@@ -1793,3 +1793,166 @@ exit 0
 		t.Errorf("expected gt nudge gastown/witness in log, got: %q\nlogger output: %v", logStr, logged)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Worker-class routing (gt-p1n2)
+// ---------------------------------------------------------------------------
+
+// seedConvoy creates a convoy tracking the given issues in the test store.
+func seedConvoy(t *testing.T, ctx context.Context, store beadsdk.Storage, convoyID string, issues []*beadsdk.Issue) {
+	t.Helper()
+	now := time.Now().UTC()
+	all := append([]*beadsdk.Issue{{
+		ID:        convoyID,
+		Title:     "Routing Test Convoy",
+		Status:    beadsdk.StatusOpen,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}}, issues...)
+	for _, iss := range all {
+		iss.CreatedAt, iss.UpdatedAt = now, now
+		if err := store.CreateIssue(ctx, iss, "test"); err != nil {
+			t.Fatalf("CreateIssue %s: %v", iss.ID, err)
+		}
+	}
+	for _, iss := range issues {
+		dep := &beadsdk.Dependency{
+			IssueID:     convoyID,
+			DependsOnID: iss.ID,
+			Type:        beadsdk.DependencyType("tracks"),
+			CreatedAt:   now,
+			CreatedBy:   "test",
+		}
+		if err := store.AddDependency(ctx, dep, "test"); err != nil {
+			t.Fatalf("AddDependency %s: %v", iss.ID, err)
+		}
+	}
+}
+
+func slungIDs(t *testing.T, logPath string) []string {
+	t.Helper()
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return nil
+	}
+	var ids []string
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if f := strings.Fields(line); len(f) >= 2 && f[0] == "sling" {
+			ids = append(ids, f[1])
+		}
+	}
+	return ids
+}
+
+// A convoy carrying dog-, deacon-, and role-owned steps must never hand any of
+// them to a rig polecat; the ordinary task is the only thing that may be slung.
+func TestFeedNextReadyIssue_NeverFeedsNonPolecatOwnedSteps(t *testing.T) {
+	for _, owner := range []string{"dog", "deacon", "boot", "deacon/dogs/alpha", "gastown/witness", "gastown/refinery", "Deacon"} {
+		t.Run(owner, func(t *testing.T) {
+			store, cleanup := setupTestStore(t)
+			defer cleanup()
+			ctx := context.Background()
+
+			seedConvoy(t, ctx, store, "test-convoyown", []*beadsdk.Issue{
+				// Sorts first (priority 1) so a missing guard dispatches it.
+				{ID: "test-wfs-step1", Title: "Patrol step", Status: beadsdk.StatusOpen, Priority: 1, IssueType: beadsdk.TypeTask, Owner: owner},
+				{ID: "test-plain1", Title: "Ordinary task", Status: beadsdk.StatusOpen, Priority: 2, IssueType: beadsdk.TypeTask},
+			})
+
+			townRoot := setupTownRoot(t)
+			gtPath, logPath := makeGTStub(t, 0)
+			logger, _ := makeLogger()
+
+			feedNextReadyIssue(ctx, store, townRoot, "test-convoyown", "test", logger, gtPath, func(string) bool { return false }, nil)
+
+			got := slungIDs(t, logPath)
+			if len(got) != 1 || got[0] != "test-plain1" {
+				t.Errorf("slung %v, want only [test-plain1]; owner %q must not reach a polecat", got, owner)
+			}
+		})
+	}
+}
+
+// Owners that merely name a human or the mayor are ordinary polecat work.
+func TestFeedNextReadyIssue_FeedsHumanOrMayorOwnedTask(t *testing.T) {
+	for _, owner := range []string{"", "mayor", "dev@example.com", "gastown/polecats/furiosa"} {
+		t.Run("owner="+owner, func(t *testing.T) {
+			store, cleanup := setupTestStore(t)
+			defer cleanup()
+			ctx := context.Background()
+
+			seedConvoy(t, ctx, store, "test-convoyhum", []*beadsdk.Issue{
+				{ID: "test-human1", Title: "Task", Status: beadsdk.StatusOpen, Priority: 2, IssueType: beadsdk.TypeTask, Owner: owner},
+			})
+
+			townRoot := setupTownRoot(t)
+			gtPath, logPath := makeGTStub(t, 0)
+			logger, _ := makeLogger()
+
+			feedNextReadyIssue(ctx, store, townRoot, "test-convoyhum", "test", logger, gtPath, func(string) bool { return false }, nil)
+
+			if got := slungIDs(t, logPath); len(got) != 1 || got[0] != "test-human1" {
+				t.Errorf("slung %v, want [test-human1]", got)
+			}
+		})
+	}
+}
+
+// hq-wf-* workflow convoys are executed by the roles that own each step, so the
+// feeder never dispatches anything from them, whatever the step's owner field says.
+func TestFeedNextReadyIssue_SkipsWorkflowConvoy(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	seedConvoy(t, ctx, store, "hq-wf-test1", []*beadsdk.Issue{
+		{ID: "test-wfs-a", Title: "Step A", Status: beadsdk.StatusOpen, Priority: 1, IssueType: beadsdk.TypeTask},
+		{ID: "test-wfs-b", Title: "Step B", Status: beadsdk.StatusOpen, Priority: 2, IssueType: beadsdk.TypeTask},
+	})
+
+	townRoot := setupTownRoot(t)
+	gtPath, logPath := makeGTStub(t, 0)
+	logger, _ := makeLogger()
+
+	feedNextReadyIssue(ctx, store, townRoot, "hq-wf-test1", "test", logger, gtPath, func(string) bool { return false }, nil)
+
+	if got := slungIDs(t, logPath); len(got) != 0 {
+		t.Errorf("workflow convoy fed %v to a polecat, want nothing", got)
+	}
+}
+
+// The routing decision itself, without a store: these run everywhere.
+func TestPolecatFeedBlock(t *testing.T) {
+	tests := []struct {
+		name     string
+		convoy   string
+		issue    trackedIssue
+		wantSkip bool
+	}{
+		{"plain task", "hq-cv-1", trackedIssue{ID: "gt-1"}, false},
+		{"mayor owner", "hq-cv-1", trackedIssue{ID: "gt-1", Owner: "mayor"}, false},
+		{"human owner", "hq-cv-1", trackedIssue{ID: "gt-1", Owner: "dev@example.com"}, false},
+		{"polecat owner", "hq-cv-1", trackedIssue{ID: "gt-1", Owner: "gastown/polecats/nux"}, false},
+		{"dog owner", "hq-cv-1", trackedIssue{ID: "gt-wfs-i6uae", Owner: "dog"}, true},
+		{"dogs owner", "hq-cv-1", trackedIssue{ID: "gt-1", Owner: "dogs"}, true},
+		{"deacon owner", "hq-cv-1", trackedIssue{ID: "gt-wfs-awe24", Owner: "deacon"}, true},
+		{"deacon owner mixed case", "hq-cv-1", trackedIssue{ID: "gt-1", Owner: " Deacon "}, true},
+		{"boot owner", "hq-cv-1", trackedIssue{ID: "gt-1", Owner: "boot"}, true},
+		{"dog path owner", "hq-cv-1", trackedIssue{ID: "gt-1", Owner: "deacon/dogs/alpha"}, true},
+		{"witness owner", "hq-cv-1", trackedIssue{ID: "gt-1", Owner: "gastown/witness"}, true},
+		{"refinery owner", "hq-cv-1", trackedIssue{ID: "gt-1", Owner: "gastown/refinery"}, true},
+		{"workflow convoy, no owner", "hq-wf-vujja", trackedIssue{ID: "gt-wfs-sgtta"}, true},
+		{"workflow convoy, mayor owner", "hq-wf-bsbse", trackedIssue{ID: "gt-wfs-x", Owner: "mayor"}, true},
+		{"cv prefix is not a workflow", "hq-cv-wf", trackedIssue{ID: "gt-1"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reason := polecatFeedBlock(tt.convoy, tt.issue)
+			if (reason != "") != tt.wantSkip {
+				t.Errorf("polecatFeedBlock(%q, %+v) = %q, wantSkip=%v", tt.convoy, tt.issue, reason, tt.wantSkip)
+			}
+		})
+	}
+}

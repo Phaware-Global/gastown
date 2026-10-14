@@ -154,6 +154,7 @@ type trackedIssue struct {
 	Assignee  string `json:"assignee"`
 	Priority  int    `json:"priority"`
 	IssueType string `json:"issue_type"`
+	Owner     string `json:"owner"`
 }
 
 // slingableTypes are bead types that can be dispatched via gt sling.
@@ -626,3 +627,6 @@ func dispatchIssue(ctx context.Context, townRoot, issueID, rig, gtPath, baseBran
 
 	return nil
 }
+
+// stub for RED run
+func polecatFeedBlock(convoyID string, t trackedIssue) string { return "" }
