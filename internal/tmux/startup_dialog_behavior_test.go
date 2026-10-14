@@ -10,22 +10,27 @@ import (
 	"time"
 )
 
-// fakeDialogScript renders a numbered-option dialog in the pane, highlights
-// option <selected> with a "❯" marker, and moves the highlight on Up/Down.
+// fakeDialogScript renders an option dialog in the pane, highlights option
+// <selected> with a "❯" marker, and moves the highlight on Up/Down. Options are
+// numbered unless <numbered> is 0, in which case the layout mirrors Claude Code
+// 2.1.299: unnumbered options with body prose above and a footer below.
 // Enter prints "CHOSEN: <option text>" and exits. It stands in for a real TUI
 // so the tests observe which option a key sequence actually lands on.
 const fakeDialogScript = `#!/bin/bash
-title="$1"; selected="$2"; shift 2
+title="$1"; selected="$2"; numbered="$3"; shift 3
 options=("$@")
 draw() {
   printf '\033[2J\033[H%s\n\n' "$title"
+  [ "$numbered" -eq 0 ] && printf " Claude Code'll be able to read, edit, and execute files here.\n\n"
   for i in "${!options[@]}"; do
-    if [ "$i" -eq "$selected" ]; then
-      printf ' ❯ %d. %s\n' "$((i+1))" "${options[$i]}"
+    if [ "$i" -eq "$selected" ]; then mark='❯'; else mark=' '; fi
+    if [ "$numbered" -eq 1 ]; then
+      printf ' %s %d. %s\n' "$mark" "$((i+1))" "${options[$i]}"
     else
-      printf '   %d. %s\n' "$((i+1))" "${options[$i]}"
+      printf ' %s %s\n' "$mark" "${options[$i]}"
     fi
   done
+  [ "$numbered" -eq 0 ] && printf '\n Enter to confirm · Esc to cancel\n'
 }
 draw
 while IFS= read -rsn1 key; do
@@ -46,9 +51,21 @@ done
 
 var invalidSessionChars = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
 
-// startFakeDialog starts a session running the fake dialog and returns once
-// the dialog is on screen.
+// startFakeDialog starts a session running the fake numbered dialog and
+// returns once the dialog is on screen.
 func startFakeDialog(t *testing.T, tm *Tmux, title string, selected int, options ...string) string {
+	t.Helper()
+	return startFakeDialogMode(t, tm, true, title, selected, options...)
+}
+
+// startFakeUnnumberedDialog is startFakeDialog with the Claude Code 2.1.299
+// unnumbered layout.
+func startFakeUnnumberedDialog(t *testing.T, tm *Tmux, title string, selected int, options ...string) string {
+	t.Helper()
+	return startFakeDialogMode(t, tm, false, title, selected, options...)
+}
+
+func startFakeDialogMode(t *testing.T, tm *Tmux, numbered bool, title string, selected int, options ...string) string {
 	t.Helper()
 	dir := t.TempDir()
 	script := filepath.Join(dir, "dialog.sh")
@@ -58,7 +75,11 @@ func startFakeDialog(t *testing.T, tm *Tmux, title string, selected int, options
 	session := "gt-test-fakedlg-" + invalidSessionChars.ReplaceAllString(t.Name(), "-")
 	_ = tm.KillSession(session)
 
-	cmd := fmt.Sprintf("bash %q %q %d", script, title, selected)
+	numberedFlag := 0
+	if numbered {
+		numberedFlag = 1
+	}
+	cmd := fmt.Sprintf("bash %q %q %d %d", script, title, selected, numberedFlag)
 	for _, o := range options {
 		cmd += fmt.Sprintf(" %q", o)
 	}
@@ -107,6 +128,15 @@ const (
 	trustNo          = "No, exit"
 )
 
+// dialogLayouts are the renderings every dialog test must handle.
+var dialogLayouts = []struct {
+	name  string
+	start func(t *testing.T, tm *Tmux, title string, selected int, options ...string) string
+}{
+	{"numbered", startFakeDialog},
+	{"unnumbered", startFakeUnnumberedDialog},
+}
+
 // Claude Code 2.1.299 lists "No, exit" first and pre-selects it; earlier
 // versions listed "Yes" first. Both orders must land on "Yes".
 func TestAcceptWorkspaceTrustDialog_SelectsYesInEitherOrder(t *testing.T) {
@@ -120,18 +150,20 @@ func TestAcceptWorkspaceTrustDialog_SelectsYesInEitherOrder(t *testing.T) {
 		{"yes first, no preselected", 1, []string{trustYes, trustNo}},
 		{"no first, yes preselected", 1, []string{trustNo, trustYes}},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			tm := newTestTmux(t)
-			session := startFakeDialog(t, tm, claudeTrustTitle, tc.selected, tc.options...)
+	for _, layout := range dialogLayouts {
+		for _, tc := range cases {
+			t.Run(layout.name+"/"+tc.name, func(t *testing.T) {
+				tm := newTestTmux(t)
+				session := layout.start(t, tm, claudeTrustTitle, tc.selected, tc.options...)
 
-			if err := tm.AcceptWorkspaceTrustDialog(session); err != nil {
-				t.Fatalf("AcceptWorkspaceTrustDialog: %v", err)
-			}
-			if got := chosen(t, tm, session); got != trustYes {
-				t.Errorf("chose %q, want %q", got, trustYes)
-			}
-		})
+				if err := tm.AcceptWorkspaceTrustDialog(session); err != nil {
+					t.Fatalf("AcceptWorkspaceTrustDialog: %v", err)
+				}
+				if got := chosen(t, tm, session); got != trustYes {
+					t.Errorf("chose %q, want %q", got, trustYes)
+				}
+			})
+		}
 	}
 }
 
@@ -163,18 +195,20 @@ func TestAcceptWorkspaceTrustDialog_CodexOrders(t *testing.T) {
 // DismissStartupDialogsBlind is the witness's stalled-startup remediation; it
 // must not press Enter on whatever happens to be highlighted.
 func TestDismissStartupDialogsBlind_SelectsYesOnTrustDialog(t *testing.T) {
-	for _, options := range [][]string{{trustYes, trustNo}, {trustNo, trustYes}} {
-		t.Run(options[0], func(t *testing.T) {
-			tm := newTestTmux(t)
-			session := startFakeDialog(t, tm, claudeTrustTitle, 0, options...)
+	for _, layout := range dialogLayouts {
+		for _, options := range [][]string{{trustYes, trustNo}, {trustNo, trustYes}} {
+			t.Run(layout.name+"/"+options[0], func(t *testing.T) {
+				tm := newTestTmux(t)
+				session := layout.start(t, tm, claudeTrustTitle, 0, options...)
 
-			if err := tm.DismissStartupDialogsBlind(session); err != nil {
-				t.Fatalf("DismissStartupDialogsBlind: %v", err)
-			}
-			if got := chosen(t, tm, session); got != trustYes {
-				t.Errorf("chose %q, want %q", got, trustYes)
-			}
-		})
+				if err := tm.DismissStartupDialogsBlind(session); err != nil {
+					t.Fatalf("DismissStartupDialogsBlind: %v", err)
+				}
+				if got := chosen(t, tm, session); got != trustYes {
+					t.Errorf("chose %q, want %q", got, trustYes)
+				}
+			})
+		}
 	}
 }
 
@@ -184,35 +218,41 @@ func TestAcceptBypassPermissionsWarning_SelectsAcceptInEitherOrder(t *testing.T)
 		accept = "Yes, I accept"
 		exit   = "No, exit"
 	)
-	for _, options := range [][]string{{exit, accept}, {accept, exit}} {
-		t.Run(options[0], func(t *testing.T) {
-			tm := newTestTmux(t)
-			session := startFakeDialog(t, tm, title, 0, options...)
+	for _, layout := range dialogLayouts {
+		for _, options := range [][]string{{exit, accept}, {accept, exit}} {
+			t.Run(layout.name+"/"+options[0], func(t *testing.T) {
+				tm := newTestTmux(t)
+				session := layout.start(t, tm, title, 0, options...)
 
-			if err := tm.AcceptBypassPermissionsWarning(session); err != nil {
-				t.Fatalf("AcceptBypassPermissionsWarning: %v", err)
-			}
-			if got := chosen(t, tm, session); got != accept {
-				t.Errorf("chose %q, want %q", got, accept)
-			}
-		})
+				if err := tm.AcceptBypassPermissionsWarning(session); err != nil {
+					t.Fatalf("AcceptBypassPermissionsWarning: %v", err)
+				}
+				if got := chosen(t, tm, session); got != accept {
+					t.Errorf("chose %q, want %q", got, accept)
+				}
+			})
+		}
 	}
 }
 
 // A trust dialog whose options we can't identify must fail loudly rather than
 // guess at a key.
 func TestAcceptWorkspaceTrustDialog_FailsLoudlyWithoutKnownOption(t *testing.T) {
-	tm := newTestTmux(t)
-	session := startFakeDialog(t, tm, claudeTrustTitle, 0, "Proceed", "Abort")
+	for _, layout := range dialogLayouts {
+		t.Run(layout.name, func(t *testing.T) {
+			tm := newTestTmux(t)
+			session := layout.start(t, tm, claudeTrustTitle, 0, "Proceed", "Abort")
 
-	err := tm.AcceptWorkspaceTrustDialog(session)
-	if err == nil {
-		t.Fatal("expected error when no trust option is recognisable, got nil")
-	}
-	// Nothing may have been sent: the dialog must still be waiting.
-	time.Sleep(300 * time.Millisecond)
-	c, _ := tm.CapturePane(session, 40)
-	if strings.Contains(c, "CHOSEN:") {
-		t.Errorf("a key was sent despite the unrecognised dialog:\n%s", c)
+			err := tm.AcceptWorkspaceTrustDialog(session)
+			if err == nil {
+				t.Fatal("expected error when no trust option is recognisable, got nil")
+			}
+			// Nothing may have been sent: the dialog must still be waiting.
+			time.Sleep(300 * time.Millisecond)
+			c, _ := tm.CapturePane(session, 40)
+			if strings.Contains(c, "CHOSEN:") {
+				t.Errorf("a key was sent despite the unrecognised dialog:\n%s", c)
+			}
+		})
 	}
 }

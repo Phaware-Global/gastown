@@ -7,32 +7,56 @@ import (
 	"time"
 )
 
-// Startup dialogs (workspace trust, bypass permissions) are numbered option
-// lists whose order and pre-selected entry are chosen by the agent vendor and
-// have changed between releases. Instead of assuming "Yes" is highlighted, we
-// read the rendered options, find the affirmative one, and move the highlight
-// to it before pressing Enter.
+// Startup dialogs (workspace trust, bypass permissions) are option lists whose
+// order and pre-selected entry are chosen by the agent vendor and have changed
+// between releases; some releases number the options and some (Claude Code
+// 2.1.299) do not. Instead of assuming "Yes" is highlighted, we read the
+// rendered options, find the affirmative one, and move the highlight to it
+// before pressing Enter.
 
-// dialogOption is one numbered line of a rendered dialog, e.g. " ❯ 1. No, exit".
+// dialogOption is one line of a rendered dialog, e.g. " ❯ No, exit".
 type dialogOption struct {
 	text     string
 	selected bool
 }
 
-// dialogOptionRe matches "[marker] N. text" where marker is the TUI's
-// highlight glyph (❯, ›, >, ▶, ➤).
-var dialogOptionRe = regexp.MustCompile(`^\s*([❯›>▶➤])?\s*(\d+)[.)]\s+(\S.*?)\s*$`)
+// dialogLineRe splits a line into "[marker] [N.] text" where marker is the
+// TUI's highlight glyph (❯, ›, >, ▶, ➤) and the "N." prefix is optional.
+var dialogLineRe = regexp.MustCompile(`^\s*([❯›>▶➤])?\s*(?:(\d+)[.)]\s+)?(\S.*?)\s*$`)
 
-// parseDialogOptions extracts the numbered options that follow the last
-// non-option line containing one of markers. Anchoring on the last marker keeps stale dialogs
-// earlier in the scrollback from being mistaken for the live one.
+// yesNoLeadRe recognises an unnumbered, unhighlighted option line.
+var yesNoLeadRe = regexp.MustCompile(`^(Yes|No)\b`)
+
+// dialogFooterMarkers end the option list; anything after them is not an option.
+var dialogFooterMarkers = []string{"Enter to confirm", "Esc to cancel"}
+
+// parseDialogLine reports whether line is a dialog option. strict limits the
+// match to lines that are unmistakably options (numbered, or starting with
+// "Yes"/"No"); otherwise a highlight glyph alone also qualifies.
+func parseDialogLine(line string, strict bool) (dialogOption, bool) {
+	m := dialogLineRe.FindStringSubmatch(line)
+	if m == nil {
+		return dialogOption{}, false
+	}
+	marker, number, text := m[1], m[2], m[3]
+	if number == "" && !yesNoLeadRe.MatchString(text) && (strict || marker == "") {
+		return dialogOption{}, false
+	}
+	return dialogOption{text: text, selected: marker != ""}, true
+}
+
+// parseDialogOptions extracts the options that follow the last non-option line
+// containing one of markers, up to the dialog's footer. Anchoring on the last
+// marker keeps stale dialogs earlier in the scrollback from being mistaken for
+// the live one; stopping at the footer and requiring each line to look like an
+// option keeps body prose from being parsed as options.
 func parseDialogOptions(content string, markers ...string) []dialogOption {
 	lines := strings.Split(content, "\n")
 	start := -1
 	for i, line := range lines {
 		// Option lines can echo a marker ("Yes, I trust this folder"); only
 		// the title line anchors the dialog.
-		if dialogOptionRe.MatchString(line) {
+		if _, isOption := parseDialogLine(line, true); isOption {
 			continue
 		}
 		for _, m := range markers {
@@ -45,14 +69,24 @@ func parseDialogOptions(content string, markers ...string) []dialogOption {
 		return nil
 	}
 	var opts []dialogOption
-	for _, line := range lines[start:] {
-		m := dialogOptionRe.FindStringSubmatch(line)
-		if m == nil {
-			continue
+	for _, line := range lines[start+1:] {
+		if containsAny(line, dialogFooterMarkers) {
+			break
 		}
-		opts = append(opts, dialogOption{text: m[3], selected: m[1] != ""})
+		if o, ok := parseDialogLine(line, false); ok {
+			opts = append(opts, o)
+		}
 	}
 	return opts
+}
+
+func containsAny(s string, subs []string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // affirmativeOption reports whether an option text accepts the dialog
@@ -67,7 +101,7 @@ func affirmativeOption(text string) bool {
 // callers never press Enter on a guess.
 func planDialogSelection(opts []dialogOption) ([]string, error) {
 	if len(opts) == 0 {
-		return nil, fmt.Errorf("no numbered options visible")
+		return nil, fmt.Errorf("no options visible")
 	}
 	yes, sel := -1, -1
 	for i, o := range opts {

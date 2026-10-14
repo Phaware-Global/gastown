@@ -5,14 +5,27 @@ import (
 	"testing"
 )
 
-// claudeTrustCapture mirrors Claude Code 2.1.299: "No, exit" is listed first
-// and pre-selected.
+// claudeTrustCapture is the trust dialog as Claude Code 2.1.299 renders it:
+// options are unnumbered, and "No, exit" is listed first and pre-selected.
 const claudeTrustCapture = `
  Accessing workspace:
 
  /Users/agent/gt/gastown
 
  Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+`
+
+// numberedTrustCapture is the numbered rendering used by other releases and
+// by Codex.
+const numberedTrustCapture = `
+ Quick safety check: Is this a project you created or one you trust?
 
  Claude Code'll be able to read, edit, and execute files here.
 
@@ -34,14 +47,41 @@ func TestParseDialogOptions(t *testing.T) {
 	}
 }
 
+func TestParseDialogOptions_Numbered(t *testing.T) {
+	t.Parallel()
+	got := parseDialogOptions(numberedTrustCapture, workspaceTrustMarkers...)
+	want := []dialogOption{
+		{text: "No, exit", selected: true},
+		{text: "Yes, I trust this folder"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+
+// Body prose between the title and the options, and the footer after them,
+// are not options.
+func TestParseDialogOptions_UnnumberedIgnoresProseAndFooter(t *testing.T) {
+	t.Parallel()
+	content := claudeTrustCapture + "\nNo further changes will be made.\n❯ stray\n"
+	got := parseDialogOptions(content, workspaceTrustMarkers...)
+	if len(got) != 2 {
+		t.Fatalf("got %+v, want exactly the two dialog options", got)
+	}
+}
+
 // An option line that echoes a marker ("Yes, I trust this folder") must not
 // become the anchor, or the options listed above it would be dropped.
 func TestParseDialogOptions_OptionLineEchoingMarker(t *testing.T) {
 	t.Parallel()
-	content := "Quick safety check\n  1. No, exit\n❯ 2. Yes, I trust this folder\n"
-	got := parseDialogOptions(content, workspaceTrustMarkers...)
-	if len(got) != 2 {
-		t.Fatalf("got %+v, want both options", got)
+	for name, content := range map[string]string{
+		"numbered":   "Quick safety check\n  1. No, exit\n❯ 2. Yes, I trust this folder\n",
+		"unnumbered": "Quick safety check\n  No, exit\n❯ Yes, I trust this folder\n",
+	} {
+		got := parseDialogOptions(content, workspaceTrustMarkers...)
+		if len(got) != 2 {
+			t.Errorf("%s: got %+v, want both options", name, got)
+		}
 	}
 }
 
@@ -49,10 +89,14 @@ func TestParseDialogOptions_OptionLineEchoingMarker(t *testing.T) {
 // contribute options.
 func TestParseDialogOptions_IgnoresStaleDialog(t *testing.T) {
 	t.Parallel()
-	content := "Quick safety check\n❯ 1. Yes, I trust this folder\n  2. No, exit\nuser@host:~$\nQuick safety check\n❯ 1. No, exit\n  2. Yes, I trust this folder\n"
-	got := parseDialogOptions(content, workspaceTrustMarkers...)
-	if len(got) != 2 || got[0].text != "No, exit" || !got[0].selected {
-		t.Fatalf("got %+v, want the latest dialog", got)
+	for name, content := range map[string]string{
+		"numbered":   "Quick safety check\n❯ 1. Yes, I trust this folder\n  2. No, exit\nuser@host:~$\nQuick safety check\n❯ 1. No, exit\n  2. Yes, I trust this folder\n",
+		"unnumbered": "Quick safety check\n❯ Yes, I trust this folder\n  No, exit\nuser@host:~$\nQuick safety check\n❯ No, exit\n  Yes, I trust this folder\n",
+	} {
+		got := parseDialogOptions(content, workspaceTrustMarkers...)
+		if len(got) != 2 || got[0].text != "No, exit" || !got[0].selected {
+			t.Errorf("%s: got %+v, want the latest dialog", name, got)
+		}
 	}
 }
 
@@ -99,13 +143,18 @@ func TestPlanDialogSelection(t *testing.T) {
 	}
 }
 
-func TestPlanDialogSelection_ClaudeTrustCapture(t *testing.T) {
+func TestPlanDialogSelection_TrustCaptures(t *testing.T) {
 	t.Parallel()
-	keys, err := planDialogSelection(parseDialogOptions(claudeTrustCapture, workspaceTrustMarkers...))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := []string{"Down"}; !reflect.DeepEqual(keys, want) {
-		t.Fatalf("keys = %v, want %v", keys, want)
+	for name, capture := range map[string]string{
+		"unnumbered (2.1.299)": claudeTrustCapture,
+		"numbered":             numberedTrustCapture,
+	} {
+		keys, err := planDialogSelection(parseDialogOptions(capture, workspaceTrustMarkers...))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if want := []string{"Down"}; !reflect.DeepEqual(keys, want) {
+			t.Errorf("%s: keys = %v, want %v", name, keys, want)
+		}
 	}
 }
