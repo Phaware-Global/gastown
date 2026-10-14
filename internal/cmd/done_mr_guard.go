@@ -14,8 +14,10 @@ type mrGuardEnv struct {
 	// OpenPRs lists the repository's open PRs. An error means PR state is
 	// unknown; the PR-dependent checks then fail open with a warning.
 	OpenPRs func() ([]git.OpenPR, error)
-	// RangeCommits returns commits reachable from head but not from base.
-	RangeCommits func(base, head string) ([]string, error)
+	// RangePatchIDs returns the patch-id of each commit reachable from head
+	// but not from base. Patch-ids, unlike SHAs, survive the rebase that
+	// gt done performs before queuing.
+	RangePatchIDs func(base, head string) ([]string, error)
 }
 
 // checkMRSubmitGuards refuses to queue an MR whose contents or target are
@@ -37,8 +39,10 @@ func checkMRSubmitGuards(env mrGuardEnv, branch, target string) (warnings []stri
 
 	// This branch's own PR, if any: its base is authoritative for the target,
 	// and a draft PR must not be fast-pathed through the queue.
+	// Fork PRs are skipped throughout: their head ref names a branch in the
+	// fork, not in this repository, so they say nothing about this branch.
 	for _, pr := range prs {
-		if pr.HeadRefName != branch {
+		if pr.IsCrossRepository || pr.HeadRefName != branch {
 			continue
 		}
 		if pr.IsDraft {
@@ -50,9 +54,9 @@ func checkMRSubmitGuards(env mrGuardEnv, branch, target string) (warnings []stri
 	}
 
 	// Commits this MR would carry that already live on a different open PR.
-	mine, rangeErr := env.RangeCommits("origin/"+target, "HEAD")
+	mine, rangeErr := env.RangePatchIDs("origin/"+target, "HEAD")
 	if rangeErr != nil {
-		return []string{fmt.Sprintf("could not compute origin/%s..HEAD, skipping shared-commit guard: %v", target, rangeErr)}, nil
+		return []string{fmt.Sprintf("could not compute patches in origin/%s..HEAD, skipping shared-commit guard: %v", target, rangeErr)}, nil
 	}
 	if len(mine) == 0 {
 		return nil, nil
@@ -63,10 +67,10 @@ func checkMRSubmitGuards(env mrGuardEnv, branch, target string) (warnings []stri
 	}
 	var conflicts []string
 	for _, pr := range prs {
-		if pr.HeadRefName == branch {
+		if pr.IsCrossRepository || pr.HeadRefName == branch {
 			continue
 		}
-		theirs, err := env.RangeCommits("origin/"+target, "origin/"+pr.HeadRefName)
+		theirs, err := env.RangePatchIDs("origin/"+target, "origin/"+pr.HeadRefName)
 		if err != nil {
 			continue // head not fetched locally; cannot prove overlap
 		}
@@ -83,11 +87,11 @@ func checkMRSubmitGuards(env mrGuardEnv, branch, target string) (warnings []stri
 		if pr.IsDraft {
 			state = ", DRAFT"
 		}
-		conflicts = append(conflicts, fmt.Sprintf("PR #%d (%s%s): %d shared commit(s)", pr.Number, pr.HeadRefName, state, shared))
+		conflicts = append(conflicts, fmt.Sprintf("PR #%d (%s%s): %d shared patch(es)", pr.Number, pr.HeadRefName, state, shared))
 	}
 	if len(conflicts) > 0 {
 		sort.Strings(conflicts)
-		return nil, fmt.Errorf("refusing to queue MR: origin/%s..HEAD contains commits already on other open PRs — "+
+		return nil, fmt.Errorf("refusing to queue MR: origin/%s..HEAD contains patches already on other open PRs — "+
 			"this branch looks like a copy of an existing PR's branch; push your commit to that PR's branch instead of queuing it.\n  %s",
 			target, strings.Join(conflicts, "\n  "))
 	}
@@ -95,5 +99,5 @@ func checkMRSubmitGuards(env mrGuardEnv, branch, target string) (warnings []stri
 }
 
 func realMRGuardEnv(g *git.Git) mrGuardEnv {
-	return mrGuardEnv{OpenPRs: g.ListOpenPRs, RangeCommits: g.CommitsInRange}
+	return mrGuardEnv{OpenPRs: g.ListOpenPRs, RangePatchIDs: g.PatchIDsInRange}
 }

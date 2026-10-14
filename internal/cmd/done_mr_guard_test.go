@@ -11,7 +11,7 @@ import (
 func guardEnv(prs []git.OpenPR, prsErr error, ranges map[string][]string) mrGuardEnv {
 	return mrGuardEnv{
 		OpenPRs: func() ([]git.OpenPR, error) { return prs, prsErr },
-		RangeCommits: func(base, head string) ([]string, error) {
+		RangePatchIDs: func(base, head string) ([]string, error) {
 			if c, ok := ranges[head]; ok {
 				return c, nil
 			}
@@ -47,16 +47,26 @@ func TestCheckMRSubmitGuards(t *testing.T) {
 		{
 			name: "copy of a draft PR branch", branch: "fix/on-pr113", target: "develop",
 			env: guardEnv([]git.OpenPR{pr113}, nil, map[string][]string{
-				"HEAD":                           {"c8116bd", "a1", "a2"},
-				"origin/polecat/furiosa/hga-kep": {"c8116b0", "a1", "a2"},
+				"HEAD":                           {"mine", "p1", "p2"},
+				"origin/polecat/furiosa/hga-kep": {"p1", "p2"},
 			}),
-			wantErr: "PR #113 (polecat/furiosa/hga-kep, DRAFT): 2 shared",
+			wantErr: "PR #113 (polecat/furiosa/hga-kep, DRAFT): 2 shared patch",
+		},
+		{
+			name: "fork PR with same head name does not veto", branch: "polecat/x/gt-1", target: "develop",
+			env: guardEnv([]git.OpenPR{{Number: 9, HeadRefName: "polecat/x/gt-1", BaseRefName: "other", IsDraft: true, IsCrossRepository: true}}, nil,
+				map[string][]string{"HEAD": {"n1"}}),
+		},
+		{
+			name: "fork PR carrying the same patches does not veto", branch: "polecat/x/gt-1", target: "develop",
+			env: guardEnv([]git.OpenPR{{Number: 10, HeadRefName: "polecat/y/gt-2", BaseRefName: "develop", IsCrossRepository: true}}, nil,
+				map[string][]string{"HEAD": {"p1"}, "origin/polecat/y/gt-2": {"p1"}}),
 		},
 		{
 			name: "fresh branch, unrelated open PR", branch: "polecat/x/gt-1", target: "main",
 			env: guardEnv([]git.OpenPR{pr113}, nil, map[string][]string{
 				"HEAD":                           {"n1"},
-				"origin/polecat/furiosa/hga-kep": {"a1", "a2"},
+				"origin/polecat/furiosa/hga-kep": {"p1", "p2"},
 			}),
 		},
 		{
