@@ -1840,7 +1840,7 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 	// This precedes every destructive step — a refusal must not leave behind a
 	// killed session or a burned molecule. --force does not skip it; only the
 	// separate --discard-unpushed flag accepts losing commits.
-	if err := mgr.PreserveUnpushedWork(polecatName, opts.DiscardUnpushed); err != nil && !errors.Is(err, polecat.ErrPolecatNotFound) {
+	if err := mgr.PreserveUnpushedWork(polecatName, true, opts.DiscardUnpushed); err != nil && !errors.Is(err, polecat.ErrPolecatNotFound) {
 		return err
 	}
 

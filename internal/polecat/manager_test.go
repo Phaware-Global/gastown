@@ -2968,7 +2968,7 @@ func TestPreserveUnpushedWork_FailsClosedWhenComparisonErrors(t *testing.T) {
 	}
 	_ = exec.Command("git", "-C", p.ClonePath, "branch", "--unset-upstream").Run()
 
-	err = mgr.PreserveUnpushedWork("toast", false)
+	err = mgr.PreserveUnpushedWork("toast", false, false)
 	var risk *WorkAtRiskError
 	if !errors.As(err, &risk) {
 		t.Fatalf("PreserveUnpushedWork err = %v, want *WorkAtRiskError", err)
@@ -2979,7 +2979,7 @@ func TestPreserveUnpushedWork_FailsClosedWhenComparisonErrors(t *testing.T) {
 	if !strings.Contains(risk.Error(), "possibly unpushed commits") {
 		t.Errorf("Error() = %q, want it to say the count is unknown", risk.Error())
 	}
-	if err := mgr.PreserveUnpushedWork("toast", true); err != nil {
+	if err := mgr.PreserveUnpushedWork("toast", false, true); err != nil {
 		t.Fatalf("PreserveUnpushedWork(discard) = %v, want nil", err)
 	}
 }
@@ -3001,7 +3001,7 @@ func TestRemoveWithOptions_RemovesPolecatDirWithNoWorktree(t *testing.T) {
 		t.Fatalf("polecat dir should remain: %v", err)
 	}
 
-	if err := mgr.PreserveUnpushedWork("toast", false); err != nil {
+	if err := mgr.PreserveUnpushedWork("toast", false, false); err != nil {
 		t.Fatalf("PreserveUnpushedWork on a missing worktree = %v, want nil", err)
 	}
 	if err := mgr.RemoveWith("toast", RemoveOptions{Force: true}); err != nil {
@@ -3009,6 +3009,70 @@ func TestRemoveWithOptions_RemovesPolecatDirWithNoWorktree(t *testing.T) {
 	}
 	if _, err := os.Stat(mgr.polecatDir("toast")); !os.IsNotExist(err) {
 		t.Fatalf("polecat dir still present after removal: %v", err)
+	}
+}
+
+// TestRemoveWithOptions_MissingWorktreeChecksTheBranchInTheSharedRepo pins that
+// an absent worktree is judged by its branch in the shared repo: commits that
+// exist only on that branch still block removal, even under force.
+func TestRemoveWithOptions_MissingWorktreeChecksTheBranchInTheSharedRepo(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	commitInWorktree(t, p.ClonePath, "real-work.txt", "genuinely unpushed work")
+	breakOrigin(t, mayorRig)
+	if err := os.RemoveAll(p.ClonePath); err != nil {
+		t.Fatalf("remove worktree: %v", err)
+	}
+
+	err = mgr.RemoveWith("toast", RemoveOptions{Force: true})
+	var risk *WorkAtRiskError
+	if !errors.As(err, &risk) {
+		t.Fatalf("RemoveWith err = %v, want *WorkAtRiskError", err)
+	}
+	if risk.Unpushed != 1 {
+		t.Errorf("risk = %+v, want 1 unpushed commit", risk)
+	}
+	if _, statErr := os.Stat(mgr.polecatDir("toast")); statErr != nil {
+		t.Fatalf("polecat dir removed despite the refusal: %v", statErr)
+	}
+	if err := mgr.RemoveWith("toast", RemoveOptions{Force: true, DiscardUnpushed: true}); err != nil {
+		t.Fatalf("RemoveWith(DiscardUnpushed): %v", err)
+	}
+}
+
+// TestRemoveWithOptions_MissingWorktreeWithUnresolvableBranchNamesForce pins
+// that when neither the worktree nor its branch can be found, removal is
+// refused with a message that names --force, and force lets it through.
+func TestRemoveWithOptions_MissingWorktreeWithUnresolvableBranchNamesForce(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	if err := os.RemoveAll(p.ClonePath); err != nil {
+		t.Fatalf("remove worktree: %v", err)
+	}
+	repo, err := mgr.repoBase()
+	if err != nil {
+		t.Fatalf("repoBase: %v", err)
+	}
+	if err := repo.WorktreePrune(); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	err = mgr.RemoveWith("toast", RemoveOptions{})
+	var risk *WorkAtRiskError
+	if !errors.As(err, &risk) {
+		t.Fatalf("RemoveWith err = %v, want *WorkAtRiskError", err)
+	}
+	if !strings.Contains(risk.Error(), "--force") {
+		t.Errorf("Error() = %q, want it to name --force", risk.Error())
+	}
+	if err := mgr.RemoveWith("toast", RemoveOptions{Force: true}); err != nil {
+		t.Fatalf("RemoveWith(force): %v", err)
 	}
 }
 

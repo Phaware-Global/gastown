@@ -1284,7 +1284,7 @@ func (m *Manager) RemoveWith(name string, opts RemoveOptions) (retErr error) {
 	// first mutation (agent bead reset, bead unassignment) so a refusal leaves
 	// the polecat exactly as it was. Force and nuclear do not skip it: only the
 	// explicit DiscardUnpushed override accepts losing commits (gt-yu9l).
-	if err := m.preserveUnpushedWork(name, clonePath, nuclear, pinned, opts.DiscardUnpushed); err != nil {
+	if err := m.preserveUnpushedWork(name, clonePath, nuclear, pinned, force, opts.DiscardUnpushed); err != nil {
 		return err
 	}
 
@@ -1397,15 +1397,18 @@ func (m *Manager) RemoveWith(name string, opts RemoveOptions) (retErr error) {
 // the branch when it can and returns *WorkAtRiskError when commits would
 // otherwise be lost. With discard it only makes the best-effort push.
 //
+// force is only consulted when the worktree is already gone and its branch
+// cannot be resolved either (see missingWorktreeRisk).
+//
 // The gate runs before the removal does, so it has pinned nothing: a detached
 // HEAD is checked against the remote like a branch, which is the standard a
 // nuclear removal applies later. Passing nuclear here would also stop the
 // gate from publishing branches, which the removals after it rely on.
-func (m *Manager) PreserveUnpushedWork(name string, discard bool) error {
+func (m *Manager) PreserveUnpushedWork(name string, force, discard bool) error {
 	if !m.exists(name) {
 		return ErrPolecatNotFound
 	}
-	return m.preserveUnpushedWork(name, m.clonePath(name), false, false, discard)
+	return m.preserveUnpushedWork(name, m.clonePath(name), false, false, force, discard)
 }
 
 // preserveUnpushedWork makes sure every commit on the worktree's branch exists
@@ -1420,15 +1423,16 @@ func (m *Manager) PreserveUnpushedWork(name string, discard bool) error {
 // leaves nothing holding the commits, so in both cases a detached HEAD is held
 // to the same standard as a branch.
 //
-// A worktree directory that does not exist, or has no .git entry, holds no
-// commits at all and passes.
+// A worktree directory that does not exist, or has no .git entry, cannot be
+// inspected, so its branch is judged in the shared repo instead
+// (missingWorktreeRisk). force only matters there.
 //
 // nuclear never publishes (the operator reached for it because the contents
 // must not survive), so under nuclear any unpushed commit is at risk. A
 // comparison that cannot be made is treated as at risk too, never as pushed.
-func (m *Manager) preserveUnpushedWork(name, clonePath string, nuclear, pinned, discard bool) error {
+func (m *Manager) preserveUnpushedWork(name, clonePath string, nuclear, pinned, force, discard bool) error {
 	if _, statErr := os.Lstat(filepath.Join(clonePath, ".git")); errors.Is(statErr, os.ErrNotExist) {
-		return nil
+		return m.missingWorktreeRisk(name, clonePath, force, discard)
 	}
 	polecatGit := git.NewGit(clonePath)
 	branch, err := polecatGit.CurrentBranch()
@@ -1468,6 +1472,77 @@ func (m *Manager) preserveUnpushedWork(name, clonePath string, nuclear, pinned, 
 		return nil
 	}
 	return risk
+}
+
+// missingWorktreeRisk judges a polecat whose worktree directory is gone by the
+// branch the shared repo still has registered for it, since running git in the
+// missing directory can only fail. Commits on that branch that no remote has
+// are published when possible and otherwise refused. When the branch cannot be
+// resolved either, nothing is known about the work: removal is refused unless
+// force or discard accepts that.
+func (m *Manager) missingWorktreeRisk(name, clonePath string, force, discard bool) error {
+	unresolved := func(cause error) error {
+		reason := fmt.Sprintf("worktree is missing and its branch could not be checked: %v; pass --force to remove it anyway", cause)
+		if force || discard {
+			style.PrintWarning("removing polecat %s with a missing worktree and an unchecked branch (%v)", name, cause)
+			return nil
+		}
+		return &WorkAtRiskError{Polecat: name, Branch: "(unknown)", ClonePath: clonePath, Unpushed: -1, Reason: reason}
+	}
+
+	repoGit, err := m.repoBase()
+	if err != nil {
+		return unresolved(err)
+	}
+	worktrees, err := repoGit.WorktreeList()
+	if err != nil {
+		return unresolved(err)
+	}
+	want := resolveMissingPath(clonePath)
+	branch := ""
+	for _, wt := range worktrees {
+		if resolveMissingPath(wt.Path) == want {
+			branch = wt.Branch
+			break
+		}
+	}
+	if branch == "" {
+		return unresolved(fmt.Errorf("no branch registered for %s", clonePath))
+	}
+	// Not BranchPushedToRemote: that compares the repo base's checked-out HEAD,
+	// not the polecat's branch.
+	unpushed, err := repoGit.BranchCommitsNotOnRemote(branch, "origin")
+	if err != nil {
+		return unresolved(err)
+	}
+	if unpushed == 0 {
+		return nil
+	}
+	risk := &WorkAtRiskError{Polecat: name, Branch: branch, ClonePath: clonePath, Unpushed: unpushed}
+	if risk.Reason = m.pushUnpushedBranch(repoGit, branch); risk.Reason == "" {
+		return nil
+	}
+	if discard {
+		style.PrintWarning("discarding %d unpushed commit(s) on branch %s (%s) at the operator's explicit request", unpushed, branch, risk.Reason)
+		return nil
+	}
+	return risk
+}
+
+// resolveMissingPath resolves symlinks in the nearest existing ancestor of
+// path, so a worktree path git reports can be compared with one whose
+// directory no longer exists.
+func resolveMissingPath(path string) string {
+	rest := ""
+	for p := filepath.Clean(path); ; p = filepath.Dir(p) {
+		if real, err := filepath.EvalSymlinks(p); err == nil {
+			return filepath.Join(real, rest)
+		}
+		if filepath.Dir(p) == p {
+			return filepath.Clean(path)
+		}
+		rest = filepath.Join(filepath.Base(p), rest)
+	}
 }
 
 // unverifiedWorkRisk is the fail-closed answer for a worktree whose commits
