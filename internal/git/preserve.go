@@ -723,9 +723,18 @@ func divergenceAnchor(g *Git, remote, head string) string {
 //
 // protectedBranches must come from rig config — see PreserveOptions.ProtectedBranches.
 func HasUnverifiedCommit(g *Git, remote string, protectedBranches []string) (string, error) {
-	head, err := g.Rev("HEAD")
+	return HasUnverifiedCommitAt(g, remote, "HEAD", protectedBranches)
+}
+
+// HasUnverifiedCommitAt is HasUnverifiedCommit for an explicit tip, e.g.
+// "refs/heads/<branch>". Callers that run git against a repo whose HEAD is not
+// the branch being published (a bare repo's HEAD is its default branch) must
+// pass the branch tip: scanning HEAD would pass a push whose actual source
+// carries an unverified commit. See HasWIPCommit for the same trap.
+func HasUnverifiedCommitAt(g *Git, remote, tip string, protectedBranches []string) (string, error) {
+	head, err := g.Rev(tip)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("resolving %s: %w", tip, err)
 	}
 	return hasUnverifiedCommit(g, remote, head, protectedBranches)
 }

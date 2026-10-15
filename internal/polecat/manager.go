@@ -1432,7 +1432,7 @@ func (m *Manager) PreserveUnpushedWork(name string, force, discard bool) error {
 // comparison that cannot be made is treated as at risk too, never as pushed.
 func (m *Manager) preserveUnpushedWork(name, clonePath string, nuclear, pinned, force, discard bool) error {
 	if _, statErr := os.Lstat(filepath.Join(clonePath, ".git")); errors.Is(statErr, os.ErrNotExist) {
-		return m.missingWorktreeRisk(name, clonePath, force, discard)
+		return m.missingWorktreeRisk(name, clonePath, nuclear, force, discard)
 	}
 	polecatGit := git.NewGit(clonePath)
 	branch, err := polecatGit.CurrentBranch()
@@ -1479,8 +1479,9 @@ func (m *Manager) preserveUnpushedWork(name, clonePath string, nuclear, pinned, 
 // missing directory can only fail. Commits on that branch that no remote has
 // are published when possible and otherwise refused. When the branch cannot be
 // resolved either, nothing is known about the work: removal is refused unless
-// force or discard accepts that.
-func (m *Manager) missingWorktreeRisk(name, clonePath string, force, discard bool) error {
+// force or discard accepts that. Nuclear never publishes, as in the
+// present-worktree path.
+func (m *Manager) missingWorktreeRisk(name, clonePath string, nuclear, force, discard bool) error {
 	unresolved := func(cause error) error {
 		reason := fmt.Sprintf("worktree is missing and its branch could not be checked: %v; pass --force to remove it anyway", cause)
 		if force || discard {
@@ -1519,7 +1520,12 @@ func (m *Manager) missingWorktreeRisk(name, clonePath string, force, discard boo
 		return nil
 	}
 	risk := &WorkAtRiskError{Polecat: name, Branch: branch, ClonePath: clonePath, Unpushed: unpushed}
-	if risk.Reason = m.pushUnpushedBranch(repoGit, branch); risk.Reason == "" {
+	if nuclear {
+		risk.Reason = "nuclear removal never publishes"
+	} else {
+		risk.Reason = m.pushUnpushedBranch(repoGit, branch)
+	}
+	if risk.Reason == "" {
 		return nil
 	}
 	if discard {
@@ -1563,7 +1569,7 @@ func (m *Manager) unverifiedWorkRisk(name, clonePath, branch string, cause error
 // polecat's real branch would be worse than leaving it local.
 func (m *Manager) pushUnpushedBranch(polecatGit *git.Git, branch string) string {
 	defaultBranches := []string{m.rig.DefaultBranch()}
-	if badSHA, err := git.HasUnverifiedCommit(polecatGit, "origin", defaultBranches); err != nil {
+	if badSHA, err := git.HasUnverifiedCommitAt(polecatGit, "origin", "refs/heads/"+branch, defaultBranches); err != nil {
 		return fmt.Sprintf("could not verify the branch's commits before pushing: %v", err)
 	} else if badSHA != "" {
 		return fmt.Sprintf("commit %s was made with pre-commit hooks bypassed, so it is not pushed", badSHA[:8])

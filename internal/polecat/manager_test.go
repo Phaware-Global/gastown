@@ -3148,3 +3148,108 @@ func captureStderr(t *testing.T, fn func()) string {
 	}()
 	return <-done
 }
+
+// useBareOrigin repoints the shared repo's origin at a separate bare clone, so a
+// test can tell whether a branch was published: with origin pointing at the
+// shared repo itself, the branch is "on the remote" before any push.
+func useBareOrigin(t *testing.T, mayorRig string) string {
+	t.Helper()
+	bare := filepath.Join(t.TempDir(), "origin.git")
+	for _, args := range [][]string{
+		{"clone", "--bare", mayorRig, bare},
+		{"-C", mayorRig, "remote", "set-url", "origin", bare},
+		{"-C", mayorRig, "fetch", "origin"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	return bare
+}
+
+// remoteBranches lists the polecat branches the bare origin holds.
+func remoteBranches(t *testing.T, bare string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", bare, "for-each-ref", "--format=%(refname)", "refs/heads/polecat/").Output()
+	if err != nil {
+		t.Fatalf("list remote branches: %v", err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// TestPreserveUnpushedWork_MissingWorktreeDoesNotPublishUnverifiedCommit pins
+// that the missing-worktree push scans the branch's tip, not the shared repo's
+// HEAD: a commit made with hooks bypassed is refused with the worktree gone
+// exactly as it is with the worktree present.
+func TestPreserveUnpushedWork_MissingWorktreeDoesNotPublishUnverifiedCommit(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		rmWorktree bool
+	}{
+		{"worktree present", false},
+		{"worktree missing", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+			bare := useBareOrigin(t, mayorRig)
+			p, err := mgr.AddWithOptions("toast", AddOptions{})
+			if err != nil {
+				t.Fatalf("AddWithOptions: %v", err)
+			}
+			commitInWorktree(t, p.ClonePath, "unverified.txt",
+				"made with the no-verify fallback\n\nGastown-Unverified: pre-commit hook failed")
+			if tc.rmWorktree {
+				if err := os.RemoveAll(p.ClonePath); err != nil {
+					t.Fatalf("remove worktree: %v", err)
+				}
+			}
+
+			err = mgr.PreserveUnpushedWork("toast", false, false)
+			var risk *WorkAtRiskError
+			if !errors.As(err, &risk) {
+				t.Fatalf("PreserveUnpushedWork err = %v, want *WorkAtRiskError", err)
+			}
+			if !strings.Contains(risk.Reason, "hooks bypassed") {
+				t.Errorf("Reason = %q, want it to mention hooks bypassed", risk.Reason)
+			}
+			if got := remoteBranches(t, bare); got != "" {
+				t.Errorf("origin gained %q; an unverified commit must not be published", got)
+			}
+		})
+	}
+}
+
+// TestRemoveWith_NuclearMissingWorktreeNeverPublishes pins that nuclear's
+// promise (the contents must not survive, so nothing is published) holds when
+// the worktree is already gone, as it does when the worktree is present.
+func TestRemoveWith_NuclearMissingWorktreeNeverPublishes(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	bare := useBareOrigin(t, mayorRig)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	commitInWorktree(t, p.ClonePath, "real-work.txt", "genuinely unpushed work")
+	if err := os.RemoveAll(p.ClonePath); err != nil {
+		t.Fatalf("remove worktree: %v", err)
+	}
+
+	err = mgr.RemoveWith("toast", RemoveOptions{Force: true, Nuclear: true})
+	var risk *WorkAtRiskError
+	if !errors.As(err, &risk) {
+		t.Fatalf("RemoveWith err = %v, want *WorkAtRiskError", err)
+	}
+	if risk.Reason != "nuclear removal never publishes" {
+		t.Errorf("Reason = %q, want the nuclear reason", risk.Reason)
+	}
+	if got := remoteBranches(t, bare); got != "" {
+		t.Errorf("nuclear removal published %q", got)
+	}
+
+	if err := mgr.RemoveWith("toast", RemoveOptions{Force: true, Nuclear: true, DiscardUnpushed: true}); err != nil {
+		t.Fatalf("RemoveWith(DiscardUnpushed): %v", err)
+	}
+	if got := remoteBranches(t, bare); got != "" {
+		t.Errorf("discarding nuclear removal published %q", got)
+	}
+}
