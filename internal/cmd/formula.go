@@ -289,7 +289,7 @@ func runFormulaRun(cmd *cobra.Command, args []string) error {
 
 	// The argument is joined into a path, so ./mol-deacon-patrol or a
 	// differently-cased name can resolve to a role formula the early check
-	// above did not recognise. Check what actually loaded.
+	// above did not recognize. Check what actually loaded.
 	if err := roleFormulaRefusal(f.Name); err != nil {
 		return err
 	}
