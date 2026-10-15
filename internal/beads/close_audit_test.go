@@ -8,7 +8,16 @@ import (
 	"testing"
 )
 
+// enableCloseAuditForTest lets a test exercise the audit write, which is
+// otherwise refused under go test.
+func enableCloseAuditForTest(t *testing.T) {
+	t.Helper()
+	closeAuditInTests = true
+	t.Cleanup(func() { closeAuditInTests = false })
+}
+
 func TestAuditWispCloseRecordsOnlyWisps(t *testing.T) {
+	enableCloseAuditForTest(t)
 	root := t.TempDir()
 	t.Setenv("GT_ROOT", root)
 	t.Setenv("BD_ACTOR", "gastown/polecats/goose")
@@ -37,6 +46,7 @@ func TestAuditWispCloseRecordsOnlyWisps(t *testing.T) {
 }
 
 func TestAuditWispCloseSkippedWhenIsolated(t *testing.T) {
+	enableCloseAuditForTest(t)
 	root := t.TempDir()
 	t.Setenv("GT_ROOT", root)
 	b := &Beads{workDir: root, isolated: true}
@@ -45,5 +55,35 @@ func TestAuditWispCloseSkippedWhenIsolated(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(root, closeAuditFile)); !os.IsNotExist(err) {
 		t.Fatalf("isolated Beads must not write the audit log, stat err = %v", err)
+	}
+}
+
+// A go test binary inherits GT_ROOT from the agent session that launched it.
+// Closing a wisp through the real Beads entry points must not write into that
+// root's logs directory.
+func TestWispCloseDoesNotTouchGTRootLogsUnderGoTest(t *testing.T) {
+	townRoot := t.TempDir()
+	t.Setenv("GT_ROOT", townRoot)
+
+	binDir := t.TempDir()
+	fakeBd := filepath.Join(binDir, "bd")
+	if err := os.WriteFile(fakeBd, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	b := &Beads{workDir: t.TempDir()}
+	if err := b.Close("gt-wisp-abc"); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := b.CloseWithReason("done", "gt-wisp-def"); err != nil {
+		t.Fatalf("CloseWithReason: %v", err)
+	}
+	if err := b.ForceCloseWithReason("done", "gt-wisp-ghi"); err != nil {
+		t.Fatalf("ForceCloseWithReason: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(townRoot, "logs")); !os.IsNotExist(err) {
+		t.Fatalf("closing wisps under go test must not create GT_ROOT/logs, stat err = %v", err)
 	}
 }
