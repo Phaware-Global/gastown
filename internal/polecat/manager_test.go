@@ -2984,6 +2984,87 @@ func TestPreserveUnpushedWork_FailsClosedWhenComparisonErrors(t *testing.T) {
 	}
 }
 
+// TestRemoveWithOptions_RemovesPolecatDirWithNoWorktree pins that a polecat
+// directory whose worktree is already gone is removable without the discard
+// override: no worktree means no commits that live only there, so the
+// fail-closed branch comparison must not fire.
+func TestRemoveWithOptions_RemovesPolecatDirWithNoWorktree(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	if err := os.RemoveAll(p.ClonePath); err != nil {
+		t.Fatalf("remove worktree: %v", err)
+	}
+	if _, err := os.Stat(mgr.polecatDir("toast")); err != nil {
+		t.Fatalf("polecat dir should remain: %v", err)
+	}
+
+	if err := mgr.PreserveUnpushedWork("toast", false); err != nil {
+		t.Fatalf("PreserveUnpushedWork on a missing worktree = %v, want nil", err)
+	}
+	if err := mgr.RemoveWith("toast", RemoveOptions{Force: true}); err != nil {
+		t.Fatalf("RemoveWith(force) on a polecat dir with no worktree: %v", err)
+	}
+	if _, err := os.Stat(mgr.polecatDir("toast")); !os.IsNotExist(err) {
+		t.Fatalf("polecat dir still present after removal: %v", err)
+	}
+}
+
+// TestRemoveWithOptions_ForceRefusesDetachedCommitWhenPinFails pins that the
+// detached-HEAD exemption rests on the pin having succeeded. Force lets a
+// failed pin through as a warning, but then nothing holds the commit, so the
+// unpushed-work gate must refuse unless DiscardUnpushed is passed.
+func TestRemoveWithOptions_ForceRefusesDetachedCommitWhenPinFails(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	if err := git.NewGit(p.ClonePath).CheckoutDetach("HEAD"); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	commitInWorktree(t, p.ClonePath, "local.txt", "local detached commit")
+	breakOrigin(t, mayorRig)
+
+	// A regular file where the refs/gt/preserve directory must go makes every
+	// pin under it fail.
+	commonDir, err := exec.Command("git", "-C", p.ClonePath, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+	if err != nil {
+		t.Fatalf("git-common-dir: %v", err)
+	}
+	gtRefs := filepath.Join(strings.TrimSpace(string(commonDir)), "refs", "gt")
+	if err := os.MkdirAll(gtRefs, 0755); err != nil {
+		t.Fatalf("mkdir refs/gt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(gtRefs, "preserve"), []byte("block\n"), 0644); err != nil {
+		t.Fatalf("block preserve refs: %v", err)
+	}
+
+	var rmErr error
+	captureStderr(t, func() {
+		rmErr = mgr.RemoveWith("toast", RemoveOptions{Force: true})
+	})
+	var risk *WorkAtRiskError
+	if !errors.As(rmErr, &risk) {
+		t.Fatalf("RemoveWith err = %v, want *WorkAtRiskError", rmErr)
+	}
+	if risk.Branch != "(detached)" || risk.Unpushed != 1 {
+		t.Errorf("risk = %+v, want Branch (detached) with 1 unpushed commit", risk)
+	}
+	if _, statErr := os.Stat(filepath.Join(p.ClonePath, "local.txt")); statErr != nil {
+		t.Fatalf("worktree content was deleted despite the refusal: %v", statErr)
+	}
+
+	captureStderr(t, func() {
+		rmErr = mgr.RemoveWith("toast", RemoveOptions{Force: true, DiscardUnpushed: true})
+	})
+	if rmErr != nil {
+		t.Fatalf("RemoveWith(DiscardUnpushed): %v", rmErr)
+	}
+}
+
 func captureStderr(t *testing.T, fn func()) string {
 	t.Helper()
 	old := os.Stderr

@@ -77,6 +77,26 @@ func TestNukeRefusesUnpushedCommitsBeforeAnyDestructiveStep(t *testing.T) {
 	}
 }
 
+// TestNukeRefusesUnpushedDetachedCommitBeforeAnyDestructiveStep pins that the
+// nuke preflight holds a detached HEAD to the nuclear standard the removal
+// step will apply, so the refusal still comes before the session is killed.
+func TestNukeRefusesUnpushedDetachedCommitBeforeAnyDestructiveStep(t *testing.T) {
+	mgr, r, clone := nukeFixture(t)
+	runGitT(t, clone, "checkout", "--detach")
+
+	err := nukePolecatFullWithOptions("toast", "rig", mgr, r, nukePolecatOptions{})
+	var risk *polecat.WorkAtRiskError
+	if !errors.As(err, &risk) {
+		t.Fatalf("nuke err = %v, want *polecat.WorkAtRiskError", err)
+	}
+	if strings.Contains(err.Error(), "worktree removal failed") {
+		t.Fatalf("refusal came from the removal step, not the preflight: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(clone, "real-work.txt")); statErr != nil {
+		t.Fatalf("worktree content gone after a refused nuke: %v", statErr)
+	}
+}
+
 func TestNukeDiscardUnpushedIsASeparateFlagFromForce(t *testing.T) {
 	f := polecatNukeCmd.Flags()
 	if f.Lookup("discard-unpushed") == nil {

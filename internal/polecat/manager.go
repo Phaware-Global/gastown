@@ -1193,6 +1193,10 @@ func (m *Manager) RemoveWith(name string, opts RemoveOptions) (retErr error) {
 
 	// Best-effort, even under force/nuclear: snapshot uncommitted tracked work into a local refs/gt/preserve ref (never pushed) before the worktree is removed.
 	preserveGit := git.NewGit(clonePath)
+	// pinned records that a detached HEAD's commits are known to be held by a
+	// ref that outlives the worktree; preserveUnpushedWork exempts a detached
+	// HEAD only on that evidence, never on the attempt.
+	pinned := false
 	if branch, brErr := preserveGit.CurrentBranch(); brErr == nil && branch != "" {
 		if branch == "HEAD" && nuclear {
 			style.PrintWarning("worktree %s is on a detached HEAD — nuclear removal skips local auto-preserve here (no branch ref would survive worktree teardown to hold the commit); any uncommitted work is discarded", name)
@@ -1221,9 +1225,15 @@ func (m *Manager) RemoveWith(name string, opts RemoveOptions) (retErr error) {
 				return fmt.Errorf("could not auto-preserve work in %s before removing a detached-HEAD worktree, and removal would discard any uncommitted commit with no recoverable ref: %w (use force to remove anyway)", name, presErr)
 			}
 			style.PrintWarning("could not auto-preserve work in %s before removal: %v", name, presErr)
-		} else if result.Committed {
-			fmt.Printf("%s Preserved uncommitted work for %s locally: %s at %s\n",
-				style.Bold.Render("✓"), name, result.Commit, result.Ref)
+		} else {
+			// AutoPreserve succeeding on a detached HEAD means its commits are
+			// reachable from a branch, a remote-tracking ref, or the
+			// refs/gt/preserve pin it just recorded.
+			pinned = branch == "HEAD"
+			if result.Committed {
+				fmt.Printf("%s Preserved uncommitted work for %s locally: %s at %s\n",
+					style.Bold.Render("✓"), name, result.Commit, result.Ref)
+			}
 		}
 	}
 
@@ -1274,7 +1284,7 @@ func (m *Manager) RemoveWith(name string, opts RemoveOptions) (retErr error) {
 	// first mutation (agent bead reset, bead unassignment) so a refusal leaves
 	// the polecat exactly as it was. Force and nuclear do not skip it: only the
 	// explicit DiscardUnpushed override accepts losing commits (gt-yu9l).
-	if err := m.preserveUnpushedWork(name, clonePath, nuclear, opts.DiscardUnpushed); err != nil {
+	if err := m.preserveUnpushedWork(name, clonePath, nuclear, pinned, opts.DiscardUnpushed); err != nil {
 		return err
 	}
 
@@ -1386,11 +1396,16 @@ func (m *Manager) RemoveWith(name string, opts RemoveOptions) (retErr error) {
 // step of their own (stopping the session, burning molecules). It publishes
 // the branch when it can and returns *WorkAtRiskError when commits would
 // otherwise be lost. With discard it only makes the best-effort push.
+//
+// The gate runs before the removal does, so it has pinned nothing: a detached
+// HEAD is checked against the remote like a branch, which is the standard a
+// nuclear removal applies later. Passing nuclear here would also stop the
+// gate from publishing branches, which the removals after it rely on.
 func (m *Manager) PreserveUnpushedWork(name string, discard bool) error {
 	if !m.exists(name) {
 		return ErrPolecatNotFound
 	}
-	return m.preserveUnpushedWork(name, m.clonePath(name), false, discard)
+	return m.preserveUnpushedWork(name, m.clonePath(name), false, false, discard)
 }
 
 // preserveUnpushedWork makes sure every commit on the worktree's branch exists
@@ -1399,22 +1414,29 @@ func (m *Manager) PreserveUnpushedWork(name string, discard bool) error {
 // "Unpushed" is decided by comparing the worktree against the remote's actual
 // refs (BranchPushedToRemote), never inferred from a failed push. A detached
 // HEAD has no name to push under: pushing the literal ref "HEAD" is malformed.
-// Without nuclear, the removal path pins a detached HEAD's commits under
-// refs/gt/preserve itself, so such a worktree is neither pushed nor refused
-// here. Nuclear skips that pin, so a detached HEAD is held to the same
-// standard as a branch.
+// The removal path pins a detached HEAD's commits under refs/gt/preserve
+// itself; pinned says that pin succeeded, and only then is such a worktree
+// neither pushed nor refused here. Nuclear skips the pin and a failed pin
+// leaves nothing holding the commits, so in both cases a detached HEAD is held
+// to the same standard as a branch.
+//
+// A worktree directory that does not exist, or has no .git entry, holds no
+// commits at all and passes.
 //
 // nuclear never publishes (the operator reached for it because the contents
 // must not survive), so under nuclear any unpushed commit is at risk. A
 // comparison that cannot be made is treated as at risk too, never as pushed.
-func (m *Manager) preserveUnpushedWork(name, clonePath string, nuclear, discard bool) error {
+func (m *Manager) preserveUnpushedWork(name, clonePath string, nuclear, pinned, discard bool) error {
+	if _, statErr := os.Lstat(filepath.Join(clonePath, ".git")); errors.Is(statErr, os.ErrNotExist) {
+		return nil
+	}
 	polecatGit := git.NewGit(clonePath)
 	branch, err := polecatGit.CurrentBranch()
 	if err != nil {
 		return m.unverifiedWorkRisk(name, clonePath, "(unknown)", fmt.Errorf("current branch: %w", err), discard)
 	}
 	detached := branch == "" || branch == "HEAD"
-	if detached && !nuclear {
+	if detached && !nuclear && pinned {
 		return nil
 	}
 	label := branch
@@ -1433,6 +1455,8 @@ func (m *Manager) preserveUnpushedWork(name, clonePath string, nuclear, discard 
 	switch {
 	case nuclear:
 		risk.Reason = "nuclear removal never publishes"
+	case detached:
+		risk.Reason = "detached HEAD commits are held by no branch and could not be pinned"
 	default:
 		risk.Reason = m.pushUnpushedBranch(polecatGit, branch)
 	}
