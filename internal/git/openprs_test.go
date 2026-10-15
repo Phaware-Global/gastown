@@ -115,3 +115,34 @@ func TestListOpenPRs_TimesOut(t *testing.T) {
 		t.Fatalf("listOpenPRs took %v; deadline not enforced", elapsed)
 	}
 }
+
+// A user or agent with color.ui=always must not blind the guard: colored patch
+// output makes git patch-id parse nothing, which reads as "nothing to check".
+func TestPatchIDsInRange_IgnoresColorConfig(t *testing.T) {
+	dir := t.TempDir()
+	g := NewGit(dir)
+	runGit(t, dir, "init", "--initial-branch", "main")
+	runGit(t, dir, "config", "user.email", "t@t.com")
+	runGit(t, dir, "config", "user.name", "T")
+	commitFile(t, dir, "base.txt", "base\n")
+	runGit(t, dir, "checkout", "-b", "pr")
+	commitFile(t, dir, "a1.txt", "a1\n")
+
+	plain, err := g.PatchIDsInRange("main", "pr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plain) != 1 {
+		t.Fatalf("baseline: got %d patch-ids, want 1", len(plain))
+	}
+
+	runGit(t, dir, "config", "color.ui", "always")
+	runGit(t, dir, "config", "color.diff", "always")
+	colored, err := g.PatchIDsInRange("main", "pr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(colored) != 1 || colored[0] != plain[0] {
+		t.Fatalf("color.ui=always: got %v, want %v", colored, plain)
+	}
+}

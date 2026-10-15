@@ -59,7 +59,7 @@ func (g *Git) listOpenPRs(timeout time.Duration) ([]OpenPR, error) {
 // reachable from head but not from base. Patch-ids identify a change by its
 // content, so they match across a rebase or cherry-pick that rewrites SHAs.
 func (g *Git) PatchIDsInRange(base, head string) ([]string, error) {
-	patches, err := g.run("log", "-p", "--no-merges", "--format=commit %H", base+".."+head)
+	patches, err := g.run("-c", "color.ui=never", "log", "-p", "--no-color", "--no-ext-diff", "--no-merges", "--format=commit %H", base+".."+head)
 	if err != nil {
 		return nil, err
 	}
