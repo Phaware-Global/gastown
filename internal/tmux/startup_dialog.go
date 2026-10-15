@@ -50,7 +50,12 @@ func parseDialogLine(line string, strict bool) (dialogOption, bool) {
 // marker keeps stale dialogs earlier in the scrollback from being mistaken for
 // the live one; stopping at the footer and requiring each line to look like an
 // option keeps body prose from being parsed as options.
-func parseDialogOptions(content string, markers ...string) []dialogOption {
+//
+// A non-blank line between two options that does not parse as an option (an
+// unnumbered, unhighlighted entry not led by Yes/No) would silently skew the
+// arrow count, so it is an error naming that line rather than a skipped one.
+// Lines after the last option are not between options and are ignored.
+func parseDialogOptions(content string, markers ...string) ([]dialogOption, error) {
 	lines := strings.Split(content, "\n")
 	start := -1
 	for i, line := range lines {
@@ -66,18 +71,28 @@ func parseDialogOptions(content string, markers ...string) []dialogOption {
 		}
 	}
 	if start < 0 {
-		return nil
+		return nil, nil
 	}
 	var opts []dialogOption
+	var unclassified []string
 	for _, line := range lines[start+1:] {
 		if containsAny(line, dialogFooterMarkers) {
 			break
 		}
 		if o, ok := parseDialogLine(line, false); ok {
+			if len(opts) > 0 && len(unclassified) > 0 {
+				return nil, fmt.Errorf("cannot classify dialog line %s between options %s",
+					describeLines(unclassified), describeOptions(append(opts, o)))
+			}
 			opts = append(opts, o)
+			unclassified = nil
+			continue
+		}
+		if strings.TrimSpace(line) != "" {
+			unclassified = append(unclassified, strings.TrimSpace(line))
 		}
 	}
-	return opts
+	return opts, nil
 }
 
 func containsAny(s string, subs []string) bool {
@@ -134,6 +149,28 @@ func planDialogSelection(opts []dialogOption) ([]string, error) {
 	return keys, nil
 }
 
+func describeLines(lines []string) string {
+	quoted := make([]string, len(lines))
+	for i, l := range lines {
+		quoted[i] = fmt.Sprintf("%q", l)
+	}
+	return strings.Join(quoted, ", ")
+}
+
+// confirmAffirmativeHighlighted errors unless exactly the affirmative option
+// is highlighted, so Enter is only ever pressed on a confirmed "Yes".
+func confirmAffirmativeHighlighted(opts []dialogOption) error {
+	for _, o := range opts {
+		if o.selected {
+			if !affirmativeOption(o.text) {
+				return fmt.Errorf("highlight is on %q, not the affirmative option, among %s", o.text, describeOptions(opts))
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("cannot tell which option is highlighted among %s", describeOptions(opts))
+}
+
 func describeOptions(opts []dialogOption) string {
 	texts := make([]string, len(opts))
 	for i, o := range opts {
@@ -151,11 +188,21 @@ var workspaceTrustMarkers = []string{
 
 var bypassPermissionsMarkers = []string{"Bypass Permissions mode"}
 
+// dialogRecheckAttempts bounds how long selectAffirmativeOption waits for the
+// TUI to redraw the highlight after the arrow keys.
+const dialogRecheckAttempts = 10
+
 // selectAffirmativeOption highlights the affirmative option of the dialog
 // introduced by markers and presses Enter. If the options are not (yet)
-// parseable it returns an error without sending any key.
+// parseable it returns an error without sending any key. After moving, it
+// re-reads the pane and presses Enter only if the highlight is on the
+// affirmative option; otherwise it returns an error and Enter is not sent.
 func (t *Tmux) selectAffirmativeOption(session, content string, markers []string) error {
-	keys, err := planDialogSelection(parseDialogOptions(content, markers...))
+	opts, err := parseDialogOptions(content, markers...)
+	if err != nil {
+		return err
+	}
+	keys, err := planDialogSelection(opts)
 	if err != nil {
 		return err
 	}
@@ -165,6 +212,34 @@ func (t *Tmux) selectAffirmativeOption(session, content string, markers []string
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	if err := t.confirmHighlightOnAffirmative(session, markers); err != nil {
+		return fmt.Errorf("not pressing Enter: %w", err)
+	}
 	_, err = t.run("send-keys", "-t", session, "Enter")
 	return err
+}
+
+// confirmHighlightOnAffirmative re-reads the pane until the highlighted option
+// is the affirmative one, giving the TUI a moment to redraw after the arrows.
+func (t *Tmux) confirmHighlightOnAffirmative(session string, markers []string) error {
+	var last error
+	for i := 0; i < dialogRecheckAttempts; i++ {
+		if i > 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
+		content, err := t.CapturePane(session, 40)
+		if err != nil {
+			last = err
+			continue
+		}
+		opts, err := parseDialogOptions(content, markers...)
+		if err == nil {
+			err = confirmAffirmativeHighlighted(opts)
+		}
+		if err == nil {
+			return nil
+		}
+		last = err
+	}
+	return last
 }

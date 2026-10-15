@@ -2,6 +2,7 @@ package tmux
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -35,9 +36,18 @@ const numberedTrustCapture = `
  Enter to confirm · Esc to cancel
 `
 
+func mustParseDialogOptions(t *testing.T, content string) []dialogOption {
+	t.Helper()
+	opts, err := parseDialogOptions(content, workspaceTrustMarkers...)
+	if err != nil {
+		t.Fatalf("parseDialogOptions: %v", err)
+	}
+	return opts
+}
+
 func TestParseDialogOptions(t *testing.T) {
 	t.Parallel()
-	got := parseDialogOptions(claudeTrustCapture, workspaceTrustMarkers...)
+	got := mustParseDialogOptions(t, claudeTrustCapture)
 	want := []dialogOption{
 		{text: "No, exit", selected: true},
 		{text: "Yes, I trust this folder"},
@@ -49,7 +59,7 @@ func TestParseDialogOptions(t *testing.T) {
 
 func TestParseDialogOptions_Numbered(t *testing.T) {
 	t.Parallel()
-	got := parseDialogOptions(numberedTrustCapture, workspaceTrustMarkers...)
+	got := mustParseDialogOptions(t, numberedTrustCapture)
 	want := []dialogOption{
 		{text: "No, exit", selected: true},
 		{text: "Yes, I trust this folder"},
@@ -64,7 +74,7 @@ func TestParseDialogOptions_Numbered(t *testing.T) {
 func TestParseDialogOptions_UnnumberedIgnoresProseAndFooter(t *testing.T) {
 	t.Parallel()
 	content := claudeTrustCapture + "\nNo further changes will be made.\n❯ stray\n"
-	got := parseDialogOptions(content, workspaceTrustMarkers...)
+	got := mustParseDialogOptions(t, content)
 	if len(got) != 2 {
 		t.Fatalf("got %+v, want exactly the two dialog options", got)
 	}
@@ -78,7 +88,7 @@ func TestParseDialogOptions_OptionLineEchoingMarker(t *testing.T) {
 		"numbered":   "Quick safety check\n  1. No, exit\n❯ 2. Yes, I trust this folder\n",
 		"unnumbered": "Quick safety check\n  No, exit\n❯ Yes, I trust this folder\n",
 	} {
-		got := parseDialogOptions(content, workspaceTrustMarkers...)
+		got := mustParseDialogOptions(t, content)
 		if len(got) != 2 {
 			t.Errorf("%s: got %+v, want both options", name, got)
 		}
@@ -93,7 +103,7 @@ func TestParseDialogOptions_IgnoresStaleDialog(t *testing.T) {
 		"numbered":   "Quick safety check\n❯ 1. Yes, I trust this folder\n  2. No, exit\nuser@host:~$\nQuick safety check\n❯ 1. No, exit\n  2. Yes, I trust this folder\n",
 		"unnumbered": "Quick safety check\n❯ Yes, I trust this folder\n  No, exit\nuser@host:~$\nQuick safety check\n❯ No, exit\n  Yes, I trust this folder\n",
 	} {
-		got := parseDialogOptions(content, workspaceTrustMarkers...)
+		got := mustParseDialogOptions(t, content)
 		if len(got) != 2 || got[0].text != "No, exit" || !got[0].selected {
 			t.Errorf("%s: got %+v, want the latest dialog", name, got)
 		}
@@ -102,7 +112,7 @@ func TestParseDialogOptions_IgnoresStaleDialog(t *testing.T) {
 
 func TestParseDialogOptions_NoMarker(t *testing.T) {
 	t.Parallel()
-	if got := parseDialogOptions("1. foo\n2. bar", workspaceTrustMarkers...); got != nil {
+	if got := mustParseDialogOptions(t, "1. foo\n2. bar"); got != nil {
 		t.Fatalf("got %+v, want nil", got)
 	}
 }
@@ -149,12 +159,61 @@ func TestPlanDialogSelection_TrustCaptures(t *testing.T) {
 		"unnumbered (2.1.299)": claudeTrustCapture,
 		"numbered":             numberedTrustCapture,
 	} {
-		keys, err := planDialogSelection(parseDialogOptions(capture, workspaceTrustMarkers...))
+		keys, err := planDialogSelection(mustParseDialogOptions(t, capture))
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
 		if want := []string{"Down"}; !reflect.DeepEqual(keys, want) {
 			t.Errorf("%s: keys = %v, want %v", name, keys, want)
 		}
+	}
+}
+
+// A non-blank line between two options that parses as neither is an error that
+// names it; guessing past it would skew the arrow count.
+func TestParseDialogOptions_UnclassifiableLineBetweenOptions(t *testing.T) {
+	t.Parallel()
+	content := "Quick safety check\n\n ❯ No, exit\n   Maybe later\n   Yes, I trust this folder\n\n Enter to confirm · Esc to cancel\n"
+	opts, err := parseDialogOptions(content, workspaceTrustMarkers...)
+	if err == nil {
+		t.Fatalf("got %+v, want an error", opts)
+	}
+	if !strings.Contains(err.Error(), "Maybe later") {
+		t.Errorf("error should name the line, got: %v", err)
+	}
+}
+
+// Lines after the last option (a wrapped footer, trailing prose) are not
+// between options and must not fail the parse.
+func TestParseDialogOptions_TrailingProseAfterLastOptionIsIgnored(t *testing.T) {
+	t.Parallel()
+	content := "Quick safety check\n ❯ No, exit\n   Yes, I trust this folder\n\n Some trailing note\n"
+	opts, err := parseDialogOptions(content, workspaceTrustMarkers...)
+	if err != nil || len(opts) != 2 {
+		t.Fatalf("got %+v, %v; want both options and no error", opts, err)
+	}
+}
+
+func TestConfirmAffirmativeHighlighted(t *testing.T) {
+	t.Parallel()
+	yes := dialogOption{text: "Yes, I trust this folder"}
+	no := dialogOption{text: "No, exit"}
+	sel := func(o dialogOption) dialogOption { o.selected = true; return o }
+	tests := []struct {
+		name    string
+		opts    []dialogOption
+		wantErr bool
+	}{
+		{"yes highlighted", []dialogOption{no, sel(yes)}, false},
+		{"no highlighted", []dialogOption{sel(no), yes}, true},
+		{"nothing highlighted", []dialogOption{no, yes}, true},
+		{"no options", nil, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := confirmAffirmativeHighlighted(tt.opts); (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
 	}
 }

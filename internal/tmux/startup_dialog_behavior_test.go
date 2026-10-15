@@ -256,3 +256,44 @@ func TestAcceptWorkspaceTrustDialog_FailsLoudlyWithoutKnownOption(t *testing.T) 
 		})
 	}
 }
+
+// An unnumbered, unhighlighted option that is not led by Yes/No is invisible to
+// the parser, which would skew the arrow count and land Enter on it. The
+// dialog must be refused with nothing pressed.
+func TestAcceptWorkspaceTrustDialog_RefusesUnclassifiableOptionBetweenOptions(t *testing.T) {
+	tm := newTestTmux(t)
+	session := startFakeUnnumberedDialog(t, tm, claudeTrustTitle, 0, trustNo, "Maybe later", trustYes)
+
+	err := tm.AcceptWorkspaceTrustDialog(session)
+	if err == nil {
+		t.Fatal("expected error for a dialog line that cannot be classified, got nil")
+	}
+	if !strings.Contains(err.Error(), "Maybe later") {
+		t.Errorf("error should name the offending dialog text, got: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	c, _ := tm.CapturePane(session, 40)
+	if strings.Contains(c, "CHOSEN:") {
+		t.Errorf("a key was sent despite the unclassifiable option:\n%s", c)
+	}
+}
+
+// A dialog with no affirmative option at all must press nothing, whichever
+// option is highlighted.
+func TestAcceptWorkspaceTrustDialog_RefusesDialogWithoutYes(t *testing.T) {
+	for _, layout := range dialogLayouts {
+		t.Run(layout.name, func(t *testing.T) {
+			tm := newTestTmux(t)
+			session := layout.start(t, tm, claudeTrustTitle, 0, trustNo, "Cancel")
+
+			if err := tm.AcceptWorkspaceTrustDialog(session); err == nil {
+				t.Fatal("expected error for a dialog with no Yes option, got nil")
+			}
+			time.Sleep(300 * time.Millisecond)
+			c, _ := tm.CapturePane(session, 40)
+			if strings.Contains(c, "CHOSEN:") {
+				t.Errorf("a key was sent to a dialog with no Yes option:\n%s", c)
+			}
+		})
+	}
+}
