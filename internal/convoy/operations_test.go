@@ -1849,7 +1849,7 @@ func slungIDs(t *testing.T, logPath string) []string {
 // A convoy carrying dog-, deacon-, and role-owned steps must never hand any of
 // them to a rig polecat; the ordinary task is the only thing that may be slung.
 func TestFeedNextReadyIssue_NeverFeedsNonPolecatCreatedSteps(t *testing.T) {
-	for _, owner := range []string{"dog", "deacon", "boot", "deacon/dogs/alpha", "gastown/witness", "gastown/refinery", "Deacon"} {
+	for _, owner := range []string{"dog", "deacon", "boot", "deacon/dogs/alpha", "Deacon"} {
 		t.Run(owner, func(t *testing.T) {
 			store, cleanup := setupTestStore(t)
 			defer cleanup()
@@ -1875,9 +1875,11 @@ func TestFeedNextReadyIssue_NeverFeedsNonPolecatCreatedSteps(t *testing.T) {
 	}
 }
 
-// Creators that merely name a human or the mayor are ordinary polecat work.
+// Creators that merely name a human, the mayor, or the witness/refinery (whose
+// merge-conflict and similar tasks are meant for an available polecat) are
+// ordinary polecat work.
 func TestFeedNextReadyIssue_FeedsHumanOrMayorCreatedTask(t *testing.T) {
-	for _, owner := range []string{"", "mayor", "dev@example.com", "gastown/polecats/furiosa"} {
+	for _, owner := range []string{"", "mayor", "dev@example.com", "gastown/polecats/furiosa", "gastown/refinery", "gastown/witness"} {
 		t.Run("owner="+owner, func(t *testing.T) {
 			store, cleanup := setupTestStore(t)
 			defer cleanup()
@@ -1900,26 +1902,145 @@ func TestFeedNextReadyIssue_FeedsHumanOrMayorCreatedTask(t *testing.T) {
 	}
 }
 
-// hq-wf-* workflow convoys are executed by the roles that own each step, so the
-// feeder never dispatches anything from them, whatever the step's creator is.
-func TestFeedNextReadyIssue_SkipsWorkflowConvoy(t *testing.T) {
+// setWorkflowFormula stamps a convoy with the description executeWorkflowFormula
+// writes, which is the only place a workflow convoy records its formula.
+func setWorkflowFormula(t *testing.T, ctx context.Context, store beadsdk.Storage, convoyID, formulaName string) {
+	t.Helper()
+	desc := "Workflow: " + formulaName + "\n\nSteps: 3\nRig: gastown"
+	if err := store.UpdateIssue(ctx, convoyID, map[string]interface{}{"description": desc}, "test"); err != nil {
+		t.Fatalf("UpdateIssue description: %v", err)
+	}
+}
+
+func addBlocks(t *testing.T, ctx context.Context, store beadsdk.Storage, issueID, dependsOn string) {
+	t.Helper()
+	dep := &beadsdk.Dependency{IssueID: issueID, DependsOnID: dependsOn, Type: beadsdk.DepBlocks, CreatedAt: time.Now().UTC(), CreatedBy: "test"}
+	if err := store.AddDependency(ctx, dep, "test"); err != nil {
+		t.Fatalf("AddDependency %s->%s: %v", issueID, dependsOn, err)
+	}
+}
+
+// executeWorkflowFormula only slings the first wave of an hq-wf-* convoy; this
+// feeder dispatches every later wave as its dependencies close, so an ordinary
+// (non-role) workflow must keep feeding across waves.
+func TestFeedNextReadyIssue_FeedsEveryWaveOfNonRoleWorkflow(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 	ctx := context.Background()
 
-	seedConvoy(t, ctx, store, "hq-wf-test1", []*beadsdk.Issue{
-		{ID: "test-wfs-a", Title: "Step A", Status: beadsdk.StatusOpen, Priority: 1, IssueType: beadsdk.TypeTask},
-		{ID: "test-wfs-b", Title: "Step B", Status: beadsdk.StatusOpen, Priority: 2, IssueType: beadsdk.TypeTask},
+	seedConvoy(t, ctx, store, "hq-wf-wave", []*beadsdk.Issue{
+		{ID: "test-wfs-a", Title: "Design", Status: beadsdk.StatusClosed, Priority: 2, IssueType: beadsdk.TypeTask},
+		{ID: "test-wfs-b", Title: "Implement", Status: beadsdk.StatusOpen, Priority: 2, IssueType: beadsdk.TypeTask},
+		{ID: "test-wfs-c", Title: "Review", Status: beadsdk.StatusOpen, Priority: 2, IssueType: beadsdk.TypeTask},
+	})
+	setWorkflowFormula(t, ctx, store, "hq-wf-wave", "shiny")
+	addBlocks(t, ctx, store, "test-wfs-b", "test-wfs-a")
+	addBlocks(t, ctx, store, "test-wfs-c", "test-wfs-b")
+
+	townRoot := setupTownRoot(t)
+	gtPath, logPath := makeGTStub(t, 0)
+	logger, _ := makeLogger()
+	feed := func() {
+		feedNextReadyIssue(ctx, store, townRoot, "hq-wf-wave", "test", logger, gtPath, func(string) bool { return false }, nil)
+	}
+
+	// Wave 1 (a) was slung by `gt formula run` itself and is already closed.
+	feed()
+	if err := store.UpdateIssue(ctx, "test-wfs-b", map[string]interface{}{"status": "closed"}, "test"); err != nil {
+		t.Fatalf("close b: %v", err)
+	}
+	feed()
+
+	if got := slungIDs(t, logPath); len(got) != 2 || got[0] != "test-wfs-b" || got[1] != "test-wfs-c" {
+		t.Errorf("slung %v, want [test-wfs-b test-wfs-c]: later waves of a non-role workflow must keep feeding", got)
+	}
+}
+
+// A workflow convoy built from a role formula (deacon/witness/refinery patrol,
+// dog formulas) is refused as a whole: its steps belong to that role, and
+// wrapping them in mol-polecat-work can only stall.
+func TestFeedNextReadyIssue_RefusesRoleFormulaWorkflowConvoy(t *testing.T) {
+	for _, name := range []string{"mol-deacon-patrol", "mol-dog-reaper", "Mol-Witness-Patrol", "mol-session-gc"} {
+		t.Run(name, func(t *testing.T) {
+			store, cleanup := setupTestStore(t)
+			defer cleanup()
+			ctx := context.Background()
+
+			seedConvoy(t, ctx, store, "hq-wf-role", []*beadsdk.Issue{
+				{ID: "test-wfs-a", Title: "Patrol step", Status: beadsdk.StatusOpen, Priority: 1, IssueType: beadsdk.TypeTask},
+			})
+			setWorkflowFormula(t, ctx, store, "hq-wf-role", name)
+
+			townRoot := setupTownRoot(t)
+			gtPath, logPath := makeGTStub(t, 0)
+			logger, _ := makeLogger()
+
+			feedNextReadyIssue(ctx, store, townRoot, "hq-wf-role", "test", logger, gtPath, func(string) bool { return false }, nil)
+
+			if got := slungIDs(t, logPath); len(got) != 0 {
+				t.Errorf("role-formula workflow %q fed %v to a polecat, want nothing", name, got)
+			}
+		})
+	}
+}
+
+// Merge-conflict tasks the refinery files are meant for an available polecat,
+// so one orphaned by a dead polecat must be re-fed.
+func TestFeedNextReadyIssue_FeedsOrphanedRefineryConflictTask(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	seedConvoy(t, ctx, store, "hq-cv-conflict", []*beadsdk.Issue{
+		{ID: "test-conflict1", Title: "Resolve merge conflicts: polecat/x", Status: beadsdk.StatusOpen, Priority: 1, IssueType: beadsdk.TypeTask, CreatedBy: "gastown/refinery", Labels: []string{"gt:task"}},
 	})
 
 	townRoot := setupTownRoot(t)
 	gtPath, logPath := makeGTStub(t, 0)
 	logger, _ := makeLogger()
 
-	feedNextReadyIssue(ctx, store, townRoot, "hq-wf-test1", "test", logger, gtPath, func(string) bool { return false }, nil)
+	feedNextReadyIssue(ctx, store, townRoot, "hq-cv-conflict", "test", logger, gtPath, func(string) bool { return false }, nil)
 
-	if got := slungIDs(t, logPath); len(got) != 0 {
-		t.Errorf("workflow convoy fed %v to a polecat, want nothing", got)
+	if got := slungIDs(t, logPath); len(got) != 1 || got[0] != "test-conflict1" {
+		t.Errorf("slung %v, want [test-conflict1]", got)
+	}
+}
+
+func TestRoleWorkflowBlock(t *testing.T) {
+	tests := []struct {
+		name     string
+		desc     string
+		wantSkip bool
+	}{
+		{"empty description", "", false},
+		{"not a workflow", "Convoy: fix things", false},
+		{"ordinary workflow", "Workflow: shiny\n\nSteps: 4\nRig: gastown", false},
+		{"release workflow", "Workflow: gastown-release\n\nSteps: 9", false},
+		{"deacon patrol", "Workflow: mol-deacon-patrol\n\nSteps: 3", true},
+		{"mixed case", "Workflow: Mol-Deacon-Patrol\n\nSteps: 3", true},
+		{"dog formula", "Workflow: mol-dog-reaper\n\nSteps: 3", true},
+		{"infra formula", "Workflow: mol-session-gc\n\nSteps: 3", true},
+		{"padded name", "Workflow:   mol-witness-patrol  \n", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := RoleWorkflowBlock(tt.desc); (got != "") != tt.wantSkip {
+				t.Errorf("RoleWorkflowBlock(%q) = %q, wantSkip=%v", tt.desc, got, tt.wantSkip)
+			}
+		})
+	}
+}
+
+func TestIsRoleFormula(t *testing.T) {
+	for _, name := range []string{"mol-deacon-patrol", "./mol-deacon-patrol", "x/../mol-dog-reaper", "Mol-Deacon-Patrol", "MOL-DOG-REAPER", "mol-deacon-patrol.formula.toml", "/town/.beads/formulas/mol-witness-patrol.formula.json", "mol-session-gc"} {
+		if !IsRoleFormula(name) {
+			t.Errorf("IsRoleFormula(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{"", "shiny", "mol-polecat-work", "mol-idea-to-plan", "./my-formula", "mol-convoy-feed"} {
+		if IsRoleFormula(name) {
+			t.Errorf("IsRoleFormula(%q) = true, want false", name)
+		}
 	}
 }
 
@@ -1927,31 +2048,27 @@ func TestFeedNextReadyIssue_SkipsWorkflowConvoy(t *testing.T) {
 func TestPolecatFeedBlock(t *testing.T) {
 	tests := []struct {
 		name     string
-		convoy   string
 		issue    trackedIssue
 		wantSkip bool
 	}{
-		{"plain task", "hq-cv-1", trackedIssue{ID: "gt-1"}, false},
-		{"mayor creator", "hq-cv-1", trackedIssue{ID: "gt-1", CreatedBy: "mayor"}, false},
-		{"human creator", "hq-cv-1", trackedIssue{ID: "gt-1", CreatedBy: "dev@example.com"}, false},
-		{"polecat creator", "hq-cv-1", trackedIssue{ID: "gt-1", CreatedBy: "gastown/polecats/nux"}, false},
-		{"dog creator", "hq-cv-1", trackedIssue{ID: "gt-wfs-i6uae", CreatedBy: "dog"}, true},
-		{"dogs creator", "hq-cv-1", trackedIssue{ID: "gt-1", CreatedBy: "dogs"}, true},
-		{"deacon creator", "hq-cv-1", trackedIssue{ID: "gt-wfs-awe24", CreatedBy: "deacon"}, true},
-		{"deacon creator mixed case", "hq-cv-1", trackedIssue{ID: "gt-1", CreatedBy: " Deacon "}, true},
-		{"boot creator", "hq-cv-1", trackedIssue{ID: "gt-1", CreatedBy: "boot"}, true},
-		{"dog path creator", "hq-cv-1", trackedIssue{ID: "gt-1", CreatedBy: "deacon/dogs/alpha"}, true},
-		{"witness creator", "hq-cv-1", trackedIssue{ID: "gt-1", CreatedBy: "gastown/witness"}, true},
-		{"refinery creator", "hq-cv-1", trackedIssue{ID: "gt-1", CreatedBy: "gastown/refinery"}, true},
-		{"workflow convoy, no creator", "hq-wf-vujja", trackedIssue{ID: "gt-wfs-sgtta"}, true},
-		{"workflow convoy, mayor creator", "hq-wf-bsbse", trackedIssue{ID: "gt-wfs-x", CreatedBy: "mayor"}, true},
-		{"cv prefix is not a workflow", "hq-cv-wf", trackedIssue{ID: "gt-1"}, false},
+		{"plain task", trackedIssue{ID: "gt-1"}, false},
+		{"mayor creator", trackedIssue{ID: "gt-1", CreatedBy: "mayor"}, false},
+		{"human creator", trackedIssue{ID: "gt-1", CreatedBy: "dev@example.com"}, false},
+		{"polecat creator", trackedIssue{ID: "gt-1", CreatedBy: "gastown/polecats/nux"}, false},
+		{"dog creator", trackedIssue{ID: "gt-wfs-i6uae", CreatedBy: "dog"}, true},
+		{"dogs creator", trackedIssue{ID: "gt-1", CreatedBy: "dogs"}, true},
+		{"deacon creator", trackedIssue{ID: "gt-wfs-awe24", CreatedBy: "deacon"}, true},
+		{"deacon creator mixed case", trackedIssue{ID: "gt-1", CreatedBy: " Deacon "}, true},
+		{"boot creator", trackedIssue{ID: "gt-1", CreatedBy: "boot"}, true},
+		{"dog path creator", trackedIssue{ID: "gt-1", CreatedBy: "deacon/dogs/alpha"}, true},
+		{"witness creator", trackedIssue{ID: "gt-1", CreatedBy: "gastown/witness"}, false},
+		{"refinery creator", trackedIssue{ID: "gt-1", CreatedBy: "gastown/refinery"}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reason := polecatFeedBlock(tt.convoy, tt.issue)
+			reason := polecatFeedBlock(tt.issue)
 			if (reason != "") != tt.wantSkip {
-				t.Errorf("polecatFeedBlock(%q, %+v) = %q, wantSkip=%v", tt.convoy, tt.issue, reason, tt.wantSkip)
+				t.Errorf("polecatFeedBlock(%+v) = %q, wantSkip=%v", tt.issue, reason, tt.wantSkip)
 			}
 		})
 	}

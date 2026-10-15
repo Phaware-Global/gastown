@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	convoyops "github.com/steveyegge/gastown/internal/convoy"
 	"github.com/steveyegge/gastown/internal/formula"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -284,6 +285,16 @@ func runFormulaRun(cmd *cobra.Command, args []string) error {
 	f, err := parseFormulaFile(formulaPath)
 	if err != nil {
 		return fmt.Errorf("parsing formula: %w", err)
+	}
+
+	// The argument is joined into a path, so ./mol-deacon-patrol or a
+	// differently-cased name can resolve to a role formula the early check
+	// above did not recognise. Check what actually loaded.
+	if err := roleFormulaRefusal(f.Name); err != nil {
+		return err
+	}
+	if err := roleFormulaRefusal(formulaPath); err != nil {
+		return err
 	}
 
 	// Handle dry-run mode
@@ -708,39 +719,18 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 	return nil
 }
 
-// roleOnlyFormulas are infrastructure formulas executed by a specific role
-// (deacon, dogs, witness, ...), in addition to the mol-*-patrol and mol-dog-*
-// families matched by roleFormulaFamily.
-var roleOnlyFormulas = map[string]bool{
-	"mol-session-gc":      true,
-	"mol-boot-triage":     true,
-	"mol-convoy-cleanup":  true,
-	"mol-dep-propagate":   true,
-	"mol-orphan-scan":     true,
-	"mol-shutdown-dance":  true,
-	"mol-town-shutdown":   true,
-	"mol-polecat-lease":   true,
-	"mol-digest-generate": true,
-}
-
-func roleFormulaFamily(name string) bool {
-	return roleOnlyFormulas[name] ||
-		(strings.HasPrefix(name, "mol-") && strings.HasSuffix(name, "-patrol")) ||
-		strings.HasPrefix(name, "mol-dog-")
-}
-
 // roleFormulaRefusal returns an error if name is a role or infrastructure
 // formula. `gt formula run` creates an hq-wf-* convoy whose steps the convoy
 // feeder slings to rig polecats under mol-polecat-work; a role's patrol steps
 // can only stall there, and the role skips its own patrol (gt-p1n2).
 func roleFormulaRefusal(name string) error {
-	if !roleFormulaFamily(name) {
+	if !convoyops.IsRoleFormula(name) {
 		return nil
 	}
 	return fmt.Errorf("'%s' is a role/infrastructure formula and cannot run through 'gt formula run': "+
 		"that dispatches each step to a rig polecat, which cannot execute it.\n\n"+
 		"Run it as the owning role's molecule instead:\n"+
-		"  gt sling %s <role-or-dog>   (e.g. gt sling mol-deacon-patrol deacon)", name, name)
+		"  gt sling %s <role-or-dog>   (e.g. gt sling mol-deacon-patrol deacon)", name, convoyops.CanonicalFormulaName(name))
 }
 
 // executeWorkflowFormula creates step beads with dependency wiring and dispatches

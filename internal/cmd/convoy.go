@@ -1524,6 +1524,11 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 			continue
 		}
 
+		// A role formula's steps belong to that role, not a rig polecat (gt-p1n2).
+		if convoyops.RoleWorkflowBlock(convoy.Description) != "" {
+			continue
+		}
+
 		// Find ready issues (open, not blocked, no live assignee, slingable).
 		// Town-level beads (hq- prefix with path=".") are excluded because
 		// they can't be dispatched via gt sling -- they're handled by the deacon.
@@ -1545,9 +1550,9 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 				if !convoyops.IsSlingableType(t.IssueType) {
 					continue
 				}
-				// Role-created and workflow-convoy steps run on their owning
-				// roles, never on a rig polecat (gt-p1n2).
-				if convoyops.PolecatFeedBlock(convoy.ID, t.CreatedBy) != "" {
+				// Role-created steps run on their owning roles, never on a rig
+				// polecat (gt-p1n2).
+				if convoyops.PolecatFeedBlock(t.CreatedBy) != "" {
 					continue
 				}
 				readyIssues = append(readyIssues, t.ID)

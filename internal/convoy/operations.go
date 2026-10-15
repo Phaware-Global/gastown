@@ -175,26 +175,19 @@ var slingableTypes = map[string]bool{
 // the human's git email. Creators that merely name the mayor or a human are not
 // listed: that is ordinary work a polecat may pick up.
 var nonPolecatCreatorRoles = map[string]bool{
-	"dog":      true,
-	"dogs":     true,
-	"deacon":   true,
-	"boot":     true,
-	"witness":  true,
-	"refinery": true,
+	"dog":    true,
+	"dogs":   true,
+	"deacon": true,
+	"boot":   true,
 }
-
-// workflowConvoyPrefix identifies convoys created by `gt formula run`. Their
-// steps are executed by the roles that own them, never by rig polecats.
-const workflowConvoyPrefix = "hq-wf-"
 
 // polecatFeedBlock returns why the convoy feeder must not hand t to a rig
 // polecat, or "" if it may. The feeder sends everything through `gt sling
-// <id> <rig>`, which attaches mol-polecat-work; a dog/deacon patrol step or a
-// workflow step wrapped in that formula can only stall the convoy (gt-p1n2).
-func polecatFeedBlock(convoyID string, t trackedIssue) string {
-	if strings.HasPrefix(convoyID, workflowConvoyPrefix) {
-		return fmt.Sprintf("convoy %s is a workflow convoy; its steps run on their owning roles", convoyID)
-	}
+// <id> <rig>`, which attaches mol-polecat-work; a dog/deacon patrol step
+// wrapped in that formula can only stall the convoy (gt-p1n2). Workflow
+// convoys (hq-wf-*) are fed like any other: sling reroutes role-targeted steps
+// via workflow_target.
+func polecatFeedBlock(t trackedIssue) string {
 	for _, seg := range strings.Split(strings.ToLower(strings.TrimSpace(t.CreatedBy)), "/") {
 		if nonPolecatCreatorRoles[strings.TrimSpace(seg)] {
 			return fmt.Sprintf("created by %q, which is not a polecat role", t.CreatedBy)
@@ -204,9 +197,9 @@ func polecatFeedBlock(convoyID string, t trackedIssue) string {
 }
 
 // PolecatFeedBlock is polecatFeedBlock for callers outside this package (the
-// stranded-convoy scan), which have only the convoy ID and the bead's creator.
-func PolecatFeedBlock(convoyID, createdBy string) string {
-	return polecatFeedBlock(convoyID, trackedIssue{CreatedBy: createdBy})
+// stranded-convoy scan), which have only the bead's creator.
+func PolecatFeedBlock(createdBy string) string {
+	return polecatFeedBlock(trackedIssue{CreatedBy: createdBy})
 }
 
 // IsSlingableType reports whether a bead type can be dispatched via gt sling.
@@ -324,12 +317,6 @@ func isIssueBlocked(ctx context.Context, store beadsdk.Storage, issueID string, 
 // next close event triggers another feed cycle.
 // gtPath is the resolved path to the gt binary.
 func feedNextReadyIssue(ctx context.Context, store beadsdk.Storage, townRoot, convoyID, caller string, logger func(format string, args ...interface{}), gtPath string, isRigParked func(string) bool, resolver *StoreResolver) {
-	// Workflow convoys are never fed to polecats; say so once rather than per step.
-	if reason := polecatFeedBlock(convoyID, trackedIssue{}); reason != "" {
-		logger("%s: convoy %s: not feeding: %s", caller, convoyID, reason)
-		return
-	}
-
 	tracked := getConvoyTrackedIssues(ctx, store, convoyID, townRoot, resolver)
 	if len(tracked) == 0 {
 		return
@@ -338,6 +325,11 @@ func feedNextReadyIssue(ctx context.Context, store beadsdk.Storage, townRoot, co
 	// Extract base_branch from convoy description fields
 	var baseBranch string
 	if convoy, err := store.GetIssue(ctx, convoyID); err == nil && convoy != nil {
+		// A role formula's steps are not polecat work; say so once, not per step.
+		if reason := RoleWorkflowBlock(convoy.Description); reason != "" {
+			logger("%s: convoy %s: not feeding: %s", caller, convoyID, reason)
+			return
+		}
 		if cf := beads.ParseConvoyFields(&beads.Issue{Description: convoy.Description}); cf != nil {
 			baseBranch = cf.BaseBranch
 		}
@@ -365,9 +357,8 @@ func feedNextReadyIssue(ctx context.Context, store beadsdk.Storage, townRoot, co
 			continue
 		}
 
-		// Worker class: never feed a role-created step or a workflow-convoy step
-		// to a rig polecat (gt-p1n2).
-		if reason := polecatFeedBlock(convoyID, issue); reason != "" {
+		// Worker class: never feed a role-created step to a rig polecat (gt-p1n2).
+		if reason := polecatFeedBlock(issue); reason != "" {
 			logger("%s: convoy %s: %s not fed to a polecat: %s", caller, convoyID, issue.ID, reason)
 			continue
 		}

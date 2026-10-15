@@ -39,6 +39,24 @@ func TestRoleFormulaRefusal(t *testing.T) {
 		})
 	}
 
+	// The argument is joined into a path, so spellings that findFormulaFile
+	// resolves to a role formula must be refused too.
+	aliased := []string{
+		"./mol-deacon-patrol",
+		"x/../mol-dog-reaper",
+		"Mol-Deacon-Patrol",
+		"MOL-DOG-REAPER",
+		"mol-deacon-patrol.formula.toml",
+		"/town/.beads/formulas/mol-witness-patrol.formula.toml",
+	}
+	for _, name := range aliased {
+		t.Run("refuses alias "+name, func(t *testing.T) {
+			if err := roleFormulaRefusal(name); err == nil {
+				t.Fatalf("roleFormulaRefusal(%q) = nil, want a refusal", name)
+			}
+		})
+	}
+
 	allowed := []string{
 		"code-review",
 		"security-audit",
@@ -53,6 +71,7 @@ func TestRoleFormulaRefusal(t *testing.T) {
 		"mol-sync-workspace",
 		"mol-convoy-feed",
 		"my-custom-formula",
+		"./my-custom-formula",
 	}
 	for _, name := range allowed {
 		t.Run("allows "+name, func(t *testing.T) {
