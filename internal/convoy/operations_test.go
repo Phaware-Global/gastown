@@ -1846,32 +1846,32 @@ func slungIDs(t *testing.T, logPath string) []string {
 	return ids
 }
 
-// A convoy carrying dog-, deacon-, and role-owned steps must never hand any of
-// them to a rig polecat; the ordinary task is the only thing that may be slung.
-func TestFeedNextReadyIssue_NeverFeedsNonPolecatCreatedSteps(t *testing.T) {
-	for _, owner := range []string{"dog", "deacon", "boot", "deacon/dogs/alpha", "Deacon"} {
-		t.Run(owner, func(t *testing.T) {
-			store, cleanup := setupTestStore(t)
-			defer cleanup()
-			ctx := context.Background()
+// Who filed a bead says nothing about who may work it: the deacon and dogs file
+// ordinary gt/bd bugs for polecats. The feeder decides by what the step is, so a
+// deacon- or dog-created bug or task must be slung.
+func TestFeedNextReadyIssue_FeedsDeaconAndDogCreatedWork(t *testing.T) {
+	for _, owner := range []string{"deacon", "dog", "dogs", "boot", "deacon/dogs/alpha", "Deacon", "gastown/witness", "gastown/refinery"} {
+		for _, issueType := range []beadsdk.IssueType{beadsdk.TypeBug, beadsdk.TypeTask} {
+			t.Run(owner+"/"+string(issueType), func(t *testing.T) {
+				store, cleanup := setupTestStore(t)
+				defer cleanup()
+				ctx := context.Background()
 
-			seedConvoy(t, ctx, store, "test-convoyown", []*beadsdk.Issue{
-				// Sorts first (priority 1) so a missing guard dispatches it.
-				{ID: "test-wfs-step1", Title: "Patrol step", Status: beadsdk.StatusOpen, Priority: 1, IssueType: beadsdk.TypeTask, CreatedBy: owner},
-				{ID: "test-plain1", Title: "Ordinary task", Status: beadsdk.StatusOpen, Priority: 2, IssueType: beadsdk.TypeTask},
+				seedConvoy(t, ctx, store, "test-convoyown", []*beadsdk.Issue{
+					{ID: "test-bug1", Title: "Fix gt bug", Status: beadsdk.StatusOpen, Priority: 1, IssueType: issueType, CreatedBy: owner},
+				})
+
+				townRoot := setupTownRoot(t)
+				gtPath, logPath := makeGTStub(t, 0)
+				logger, _ := makeLogger()
+
+				feedNextReadyIssue(ctx, store, townRoot, "test-convoyown", "test", logger, gtPath, func(string) bool { return false }, nil)
+
+				if got := slungIDs(t, logPath); len(got) != 1 || got[0] != "test-bug1" {
+					t.Errorf("slung %v, want [test-bug1]; a %s filed by %q is polecat work", got, issueType, owner)
+				}
 			})
-
-			townRoot := setupTownRoot(t)
-			gtPath, logPath := makeGTStub(t, 0)
-			logger, _ := makeLogger()
-
-			feedNextReadyIssue(ctx, store, townRoot, "test-convoyown", "test", logger, gtPath, func(string) bool { return false }, nil)
-
-			got := slungIDs(t, logPath)
-			if len(got) != 1 || got[0] != "test-plain1" {
-				t.Errorf("slung %v, want only [test-plain1]; creator %q must not reach a polecat", got, owner)
-			}
-		})
+		}
 	}
 }
 
@@ -2041,35 +2041,5 @@ func TestIsRoleFormula(t *testing.T) {
 		if IsRoleFormula(name) {
 			t.Errorf("IsRoleFormula(%q) = true, want false", name)
 		}
-	}
-}
-
-// The routing decision itself, without a store: these run everywhere.
-func TestPolecatFeedBlock(t *testing.T) {
-	tests := []struct {
-		name     string
-		issue    trackedIssue
-		wantSkip bool
-	}{
-		{"plain task", trackedIssue{ID: "gt-1"}, false},
-		{"mayor creator", trackedIssue{ID: "gt-1", CreatedBy: "mayor"}, false},
-		{"human creator", trackedIssue{ID: "gt-1", CreatedBy: "dev@example.com"}, false},
-		{"polecat creator", trackedIssue{ID: "gt-1", CreatedBy: "gastown/polecats/nux"}, false},
-		{"dog creator", trackedIssue{ID: "gt-wfs-i6uae", CreatedBy: "dog"}, true},
-		{"dogs creator", trackedIssue{ID: "gt-1", CreatedBy: "dogs"}, true},
-		{"deacon creator", trackedIssue{ID: "gt-wfs-awe24", CreatedBy: "deacon"}, true},
-		{"deacon creator mixed case", trackedIssue{ID: "gt-1", CreatedBy: " Deacon "}, true},
-		{"boot creator", trackedIssue{ID: "gt-1", CreatedBy: "boot"}, true},
-		{"dog path creator", trackedIssue{ID: "gt-1", CreatedBy: "deacon/dogs/alpha"}, true},
-		{"witness creator", trackedIssue{ID: "gt-1", CreatedBy: "gastown/witness"}, false},
-		{"refinery creator", trackedIssue{ID: "gt-1", CreatedBy: "gastown/refinery"}, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			reason := polecatFeedBlock(tt.issue)
-			if (reason != "") != tt.wantSkip {
-				t.Errorf("polecatFeedBlock(%+v) = %q, wantSkip=%v", tt.issue, reason, tt.wantSkip)
-			}
-		})
 	}
 }

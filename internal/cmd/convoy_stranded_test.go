@@ -1,31 +1,10 @@
 package cmd
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 )
-
-// The stranded scan routes on the bead's creator (what bd show labels
-// "Owner"), so it must survive the fresh-details merge (gt-p1n2).
-func TestApplyFreshIssueDetails_CarriesCreatedBy(t *testing.T) {
-	dep := &trackedDependency{ID: "gt-wfs-i6uae"}
-	applyFreshIssueDetails(dep, &issueDetails{ID: "gt-wfs-i6uae", Status: "open", CreatedBy: "dog"})
-	if dep.CreatedBy != "dog" {
-		t.Errorf("CreatedBy = %q, want dog", dep.CreatedBy)
-	}
-}
-
-func TestIssueDetailsJSON_ParsesCreatedBy(t *testing.T) {
-	var raw issueDetailsJSON
-	if err := json.Unmarshal([]byte(`{"id":"gt-wfs-awe24","owner":"dev@example.com","created_by":"deacon"}`), &raw); err != nil {
-		t.Fatal(err)
-	}
-	if got := raw.toIssueDetails().CreatedBy; got != "deacon" {
-		t.Errorf("CreatedBy = %q, want deacon (owner is the human email, not the routing signal)", got)
-	}
-}
 
 func TestIsReadyIssue_BlockingAndStatus(t *testing.T) {
 	tests := []struct {

@@ -154,7 +154,6 @@ type trackedIssue struct {
 	Assignee  string `json:"assignee"`
 	Priority  int    `json:"priority"`
 	IssueType string `json:"issue_type"`
-	CreatedBy string `json:"created_by"` // bd show labels this "Owner"
 }
 
 // slingableTypes are bead types that can be dispatched via gt sling.
@@ -167,39 +166,6 @@ var slingableTypes = map[string]bool{
 	"feature": true,
 	"chore":   true,
 	"":        true, // Empty type defaults to task
-}
-
-// nonPolecatCreatorRoles are creator path segments that mark a bead as
-// belonging to a role agent rather than the polecat pool. This is the bead's
-// created_by (shown as "Owner:" by bd show), not its owner field, which holds
-// the human's git email. Creators that merely name the mayor or a human are not
-// listed: that is ordinary work a polecat may pick up.
-var nonPolecatCreatorRoles = map[string]bool{
-	"dog":    true,
-	"dogs":   true,
-	"deacon": true,
-	"boot":   true,
-}
-
-// polecatFeedBlock returns why the convoy feeder must not hand t to a rig
-// polecat, or "" if it may. The feeder sends everything through `gt sling
-// <id> <rig>`, which attaches mol-polecat-work; a dog/deacon patrol step
-// wrapped in that formula can only stall the convoy (gt-p1n2). Workflow
-// convoys (hq-wf-*) are fed like any other: sling reroutes role-targeted steps
-// via workflow_target.
-func polecatFeedBlock(t trackedIssue) string {
-	for _, seg := range strings.Split(strings.ToLower(strings.TrimSpace(t.CreatedBy)), "/") {
-		if nonPolecatCreatorRoles[strings.TrimSpace(seg)] {
-			return fmt.Sprintf("created by %q, which is not a polecat role", t.CreatedBy)
-		}
-	}
-	return ""
-}
-
-// PolecatFeedBlock is polecatFeedBlock for callers outside this package (the
-// stranded-convoy scan), which have only the bead's creator.
-func PolecatFeedBlock(createdBy string) string {
-	return polecatFeedBlock(trackedIssue{CreatedBy: createdBy})
 }
 
 // IsSlingableType reports whether a bead type can be dispatched via gt sling.
@@ -357,12 +323,6 @@ func feedNextReadyIssue(ctx context.Context, store beadsdk.Storage, townRoot, co
 			continue
 		}
 
-		// Worker class: never feed a role-created step to a rig polecat (gt-p1n2).
-		if reason := polecatFeedBlock(issue); reason != "" {
-			logger("%s: convoy %s: %s not fed to a polecat: %s", caller, convoyID, issue.ID, reason)
-			continue
-		}
-
 		// Check blocking dependencies: blocks and conditional-blocks with
 		// non-closed targets prevent dispatch. parent-child is NOT treated
 		// as blocking (consistent with molecule step behavior).
@@ -411,7 +371,6 @@ func getConvoyTrackedIssues(ctx context.Context, store beadsdk.Storage, convoyID
 		assignee  string
 		priority  int
 		issueType string
-		createdBy string
 	}
 	metaByID := make(map[string]depMeta)
 	for _, d := range deps {
@@ -423,7 +382,6 @@ func getConvoyTrackedIssues(ctx context.Context, store beadsdk.Storage, convoyID
 				assignee:  d.Assignee,
 				priority:  d.Priority,
 				issueType: string(d.IssueType),
-				createdBy: d.CreatedBy,
 			}
 		}
 	}
@@ -478,13 +436,11 @@ func getConvoyTrackedIssues(ctx context.Context, store beadsdk.Storage, convoyID
 			t.Assignee = fresh.Assignee
 			t.Priority = fresh.Priority
 			t.IssueType = string(fresh.IssueType)
-			t.CreatedBy = fresh.CreatedBy
 		} else if meta, ok := metaByID[id]; ok {
 			t.Status = meta.status
 			t.Assignee = meta.assignee
 			t.Priority = meta.priority
 			t.IssueType = meta.issueType
-			t.CreatedBy = meta.createdBy
 		}
 		result = append(result, t)
 	}
