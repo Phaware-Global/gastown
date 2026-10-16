@@ -3155,8 +3155,14 @@ func captureStderr(t *testing.T, fn func()) string {
 func useBareOrigin(t *testing.T, mayorRig string) string {
 	t.Helper()
 	bare := filepath.Join(t.TempDir(), "origin.git")
+	// Auto-gc and maintenance detach from fetch/push and write into the repo
+	// while t.TempDir is being removed, which fails the cleanup.
 	for _, args := range [][]string{
+		{"-C", mayorRig, "config", "gc.auto", "0"},
+		{"-C", mayorRig, "config", "maintenance.auto", "false"},
 		{"clone", "--bare", mayorRig, bare},
+		{"-C", bare, "config", "gc.auto", "0"},
+		{"-C", bare, "config", "maintenance.auto", "false"},
 		{"-C", mayorRig, "remote", "set-url", "origin", bare},
 		{"-C", mayorRig, "fetch", "origin"},
 	} {
@@ -3177,79 +3183,147 @@ func remoteBranches(t *testing.T, bare string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// TestPreserveUnpushedWork_MissingWorktreeDoesNotPublishUnverifiedCommit pins
-// that the missing-worktree push scans the branch's tip, not the shared repo's
-// HEAD: a commit made with hooks bypassed is refused with the worktree gone
-// exactly as it is with the worktree present.
-func TestPreserveUnpushedWork_MissingWorktreeDoesNotPublishUnverifiedCommit(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		rmWorktree bool
-	}{
-		{"worktree present", false},
-		{"worktree missing", true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			mgr, mayorRig := setupCanonicalBranchManagerTest(t)
-			bare := useBareOrigin(t, mayorRig)
-			p, err := mgr.AddWithOptions("toast", AddOptions{})
-			if err != nil {
-				t.Fatalf("AddWithOptions: %v", err)
-			}
-			commitInWorktree(t, p.ClonePath, "unverified.txt",
-				"made with the no-verify fallback\n\nGastown-Unverified: pre-commit hook failed")
-			if tc.rmWorktree {
-				if err := os.RemoveAll(p.ClonePath); err != nil {
-					t.Fatalf("remove worktree: %v", err)
-				}
-			}
-
-			err = mgr.PreserveUnpushedWork("toast", false, false)
-			var risk *WorkAtRiskError
-			if !errors.As(err, &risk) {
-				t.Fatalf("PreserveUnpushedWork err = %v, want *WorkAtRiskError", err)
-			}
-			if !strings.Contains(risk.Reason, "hooks bypassed") {
-				t.Errorf("Reason = %q, want it to mention hooks bypassed", risk.Reason)
-			}
-			if got := remoteBranches(t, bare); got != "" {
-				t.Errorf("origin gained %q; an unverified commit must not be published", got)
-			}
-		})
-	}
+// missingWorktreeFixture is a polecat with a real bare origin whose worktree
+// directory has been removed, leaving only its branch in the shared repo.
+type missingWorktreeFixture struct {
+	mgr    *Manager
+	bare   string
+	branch string
+	tip    string
+	p      *Polecat
 }
 
-// TestRemoveWith_NuclearMissingWorktreeNeverPublishes pins that nuclear's
-// promise (the contents must not survive, so nothing is published) holds when
-// the worktree is already gone, as it does when the worktree is present.
-func TestRemoveWith_NuclearMissingWorktreeNeverPublishes(t *testing.T) {
+// newMissingWorktreeFixture adds toast, commits msg in its worktree, and
+// removes the worktree directory. The commit is local-only unless the test
+// pushes it.
+func newMissingWorktreeFixture(t *testing.T, msg string, rmWorktree bool) *missingWorktreeFixture {
+	t.Helper()
 	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
 	bare := useBareOrigin(t, mayorRig)
 	p, err := mgr.AddWithOptions("toast", AddOptions{})
 	if err != nil {
 		t.Fatalf("AddWithOptions: %v", err)
 	}
-	commitInWorktree(t, p.ClonePath, "real-work.txt", "genuinely unpushed work")
-	if err := os.RemoveAll(p.ClonePath); err != nil {
-		t.Fatalf("remove worktree: %v", err)
+	commitInWorktree(t, p.ClonePath, "work.txt", msg)
+	wtGit := git.NewGit(p.ClonePath)
+	branch, err := wtGit.CurrentBranch()
+	if err != nil {
+		t.Fatalf("current branch: %v", err)
 	}
+	tip, err := wtGit.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("rev HEAD: %v", err)
+	}
+	if rmWorktree {
+		if err := os.RemoveAll(p.ClonePath); err != nil {
+			t.Fatalf("remove worktree: %v", err)
+		}
+	}
+	return &missingWorktreeFixture{mgr: mgr, bare: bare, branch: branch, tip: tip, p: p}
+}
 
-	err = mgr.RemoveWith("toast", RemoveOptions{Force: true, Nuclear: true})
+func (f *missingWorktreeFixture) requireRefused(t *testing.T, err error) *WorkAtRiskError {
+	t.Helper()
 	var risk *WorkAtRiskError
 	if !errors.As(err, &risk) {
-		t.Fatalf("RemoveWith err = %v, want *WorkAtRiskError", err)
+		t.Fatalf("err = %v, want *WorkAtRiskError", err)
 	}
-	if risk.Reason != "nuclear removal never publishes" {
-		t.Errorf("Reason = %q, want the nuclear reason", risk.Reason)
+	if !strings.Contains(risk.Reason, f.tip[:8]) {
+		t.Errorf("Reason = %q, want it to name the tip %s", risk.Reason, f.tip[:8])
 	}
-	if got := remoteBranches(t, bare); got != "" {
-		t.Errorf("nuclear removal published %q", got)
+	if !strings.Contains(risk.Reason, "--discard-unpushed") {
+		t.Errorf("Reason = %q, want it to name the --discard-unpushed flag", risk.Reason)
 	}
+	return risk
+}
 
-	if err := mgr.RemoveWith("toast", RemoveOptions{Force: true, Nuclear: true, DiscardUnpushed: true}); err != nil {
-		t.Fatalf("RemoveWith(DiscardUnpushed): %v", err)
+func (f *missingWorktreeFixture) requireNothingPublished(t *testing.T) {
+	t.Helper()
+	if got := remoteBranches(t, f.bare); got != "" {
+		t.Errorf("origin gained %q; a missing worktree's branch must never be published", got)
 	}
-	if got := remoteBranches(t, bare); got != "" {
-		t.Errorf("discarding nuclear removal published %q", got)
+}
+
+// TestPreserveUnpushedWork_MissingWorktreeNeverPublishes pins the missing-
+// worktree design: the branch tip is judged against the remote and removal is
+// refused when no remote holds it, but nothing is ever pushed — not a plain
+// commit, and not a commit carrying the Gastown-Unverified trailer, which the
+// present-worktree gate refuses to publish for the same reason.
+func TestPreserveUnpushedWork_MissingWorktreeNeverPublishes(t *testing.T) {
+	for _, tc := range []struct {
+		name, msg string
+	}{
+		{"plain commit", "genuinely unpushed work"},
+		{"unverified commit", "made with the no-verify fallback\n\nGastown-Unverified: pre-commit hook failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newMissingWorktreeFixture(t, tc.msg, true)
+			risk := f.requireRefused(t, f.mgr.PreserveUnpushedWork("toast", false, false))
+			if risk.Unpushed != 1 {
+				t.Errorf("risk = %+v, want 1 unpushed commit", risk)
+			}
+			f.requireNothingPublished(t)
+		})
+	}
+}
+
+// TestRemoveWith_MissingWorktreeNeverPublishesUnderAnyFlag pins that no
+// removal flag turns the missing-worktree check into a push. Force and Nuclear
+// without the discard override are refused; the discard override (what
+// gt start --shutdown --nuclear passes at start.go, Force+Nuclear+
+// DiscardUnpushed) removes the polecat, and still publishes nothing.
+func TestRemoveWith_MissingWorktreeNeverPublishesUnderAnyFlag(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		opts        RemoveOptions
+		wantRefused bool
+	}{
+		{"force", RemoveOptions{Force: true}, true},
+		{"nuclear", RemoveOptions{Force: true, Nuclear: true}, true},
+		{"discard", RemoveOptions{Force: true, DiscardUnpushed: true}, false},
+		{"nuclear+discard (gt start --shutdown --nuclear)", RemoveOptions{Force: true, Nuclear: true, DiscardUnpushed: true}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newMissingWorktreeFixture(t, "genuinely unpushed work", true)
+			err := f.mgr.RemoveWith("toast", tc.opts)
+			if tc.wantRefused {
+				f.requireRefused(t, err)
+				if _, statErr := os.Stat(f.mgr.polecatDir("toast")); statErr != nil {
+					t.Errorf("polecat dir removed despite the refusal: %v", statErr)
+				}
+			} else if err != nil {
+				t.Fatalf("RemoveWith: %v", err)
+			}
+			f.requireNothingPublished(t)
+		})
+	}
+}
+
+// TestRemoveWith_MissingWorktreeAllowedWhenTipIsOnARemote pins that a branch
+// whose tip a remote already holds is removable without any override, and that
+// the check publishes nothing further.
+func TestRemoveWith_MissingWorktreeAllowedWhenTipIsOnARemote(t *testing.T) {
+	f := newMissingWorktreeFixture(t, "work that was pushed", false)
+	// The worktree owner pushed the branch before its directory went away.
+	if out, err := exec.Command("git", "-C", f.p.ClonePath, "push", "origin", f.branch+":refs/heads/"+f.branch).CombinedOutput(); err != nil {
+		t.Fatalf("push: %v\n%s", err, out)
+	}
+	repo, err := f.mgr.repoBase()
+	if err != nil {
+		t.Fatalf("repoBase: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", repo.WorkDir(), "fetch", "origin").CombinedOutput(); err != nil {
+		t.Fatalf("fetch: %v\n%s", err, out)
+	}
+	if err := os.RemoveAll(f.p.ClonePath); err != nil {
+		t.Fatalf("remove worktree: %v", err)
+	}
+	before := remoteBranches(t, f.bare)
+
+	if err := f.mgr.RemoveWith("toast", RemoveOptions{Force: true}); err != nil {
+		t.Fatalf("RemoveWith: %v", err)
+	}
+	if got := remoteBranches(t, f.bare); got != before {
+		t.Errorf("remote branches changed from %q to %q", before, got)
 	}
 }

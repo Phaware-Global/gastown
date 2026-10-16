@@ -713,7 +713,7 @@ func divergenceAnchor(g *Git, remote, head string) string {
 	return fields[0]
 }
 
-// HasUnverifiedCommit reports the SHA of a commit in HEAD's ancestry, not
+// HasUnverifiedCommitAt reports the SHA of a commit in tip's ancestry, not
 // reachable from any of protectedBranches on remote, that was committed with
 // hooks bypassed and never verified — see hasUnverifiedCommit. Exported for
 // callers that push a branch to origin themselves rather than through
@@ -721,16 +721,13 @@ func divergenceAnchor(g *Git, remote, head string) string {
 // best-effort branch push), so they can refuse to publish it even when no
 // preserve call happened in the same invocation (PR #184 review).
 //
+// tip is the ref the caller is about to publish, e.g. "refs/heads/<branch>" —
+// never an implicit HEAD: a bare repo's HEAD is its default branch, and a
+// worktree's HEAD can differ from the branch being pushed, so scanning HEAD
+// can pass a push whose actual source carries an unverified commit. See
+// HasWIPCommit for the same trap.
+//
 // protectedBranches must come from rig config — see PreserveOptions.ProtectedBranches.
-func HasUnverifiedCommit(g *Git, remote string, protectedBranches []string) (string, error) {
-	return HasUnverifiedCommitAt(g, remote, "HEAD", protectedBranches)
-}
-
-// HasUnverifiedCommitAt is HasUnverifiedCommit for an explicit tip, e.g.
-// "refs/heads/<branch>". Callers that run git against a repo whose HEAD is not
-// the branch being published (a bare repo's HEAD is its default branch) must
-// pass the branch tip: scanning HEAD would pass a push whose actual source
-// carries an unverified commit. See HasWIPCommit for the same trap.
 func HasUnverifiedCommitAt(g *Git, remote, tip string, protectedBranches []string) (string, error) {
 	head, err := g.Rev(tip)
 	if err != nil {

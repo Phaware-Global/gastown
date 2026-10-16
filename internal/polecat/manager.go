@@ -1398,7 +1398,7 @@ func (m *Manager) RemoveWith(name string, opts RemoveOptions) (retErr error) {
 // otherwise be lost. With discard it only makes the best-effort push.
 //
 // force is only consulted when the worktree is already gone and its branch
-// cannot be resolved either (see missingWorktreeRisk).
+// cannot be resolved either (see missingWorktreeRisk), which never publishes.
 //
 // The gate runs before the removal does, so it has pinned nothing: a detached
 // HEAD is checked against the remote like a branch, which is the standard a
@@ -1432,7 +1432,7 @@ func (m *Manager) PreserveUnpushedWork(name string, force, discard bool) error {
 // comparison that cannot be made is treated as at risk too, never as pushed.
 func (m *Manager) preserveUnpushedWork(name, clonePath string, nuclear, pinned, force, discard bool) error {
 	if _, statErr := os.Lstat(filepath.Join(clonePath, ".git")); errors.Is(statErr, os.ErrNotExist) {
-		return m.missingWorktreeRisk(name, clonePath, nuclear, force, discard)
+		return m.missingWorktreeRisk(name, clonePath, force, discard)
 	}
 	polecatGit := git.NewGit(clonePath)
 	branch, err := polecatGit.CurrentBranch()
@@ -1476,12 +1476,16 @@ func (m *Manager) preserveUnpushedWork(name, clonePath string, nuclear, pinned, 
 
 // missingWorktreeRisk judges a polecat whose worktree directory is gone by the
 // branch the shared repo still has registered for it, since running git in the
-// missing directory can only fail. Commits on that branch that no remote has
-// are published when possible and otherwise refused. When the branch cannot be
-// resolved either, nothing is known about the work: removal is refused unless
-// force or discard accepts that. Nuclear never publishes, as in the
-// present-worktree path.
-func (m *Manager) missingWorktreeRisk(name, clonePath string, nuclear, force, discard bool) error {
+// missing directory can only fail.
+//
+// It never publishes anything, under any flag: the worktree that could have
+// been inspected for hook bypasses, checkpoint commits and the like is gone, and
+// the shared repo's HEAD is not the branch. The branch's tip (refs/heads/<branch>,
+// never HEAD) is resolved explicitly and removal is allowed only if a remote
+// already holds it; otherwise it is refused, naming the tip and the explicit
+// discard override. When the branch cannot be resolved either, nothing is known
+// about the work: removal is refused unless force or discard accepts that.
+func (m *Manager) missingWorktreeRisk(name, clonePath string, force, discard bool) error {
 	unresolved := func(cause error) error {
 		reason := fmt.Sprintf("worktree is missing and its branch could not be checked: %v; pass --force to remove it anyway", cause)
 		if force || discard {
@@ -1510,6 +1514,10 @@ func (m *Manager) missingWorktreeRisk(name, clonePath string, nuclear, force, di
 	if branch == "" {
 		return unresolved(fmt.Errorf("no branch registered for %s", clonePath))
 	}
+	tip, err := repoGit.Rev("refs/heads/" + branch)
+	if err != nil {
+		return unresolved(fmt.Errorf("resolving the tip of %s: %w", branch, err))
+	}
 	// Not BranchPushedToRemote: that compares the repo base's checked-out HEAD,
 	// not the polecat's branch.
 	unpushed, err := repoGit.BranchCommitsNotOnRemote(branch, "origin")
@@ -1519,20 +1527,12 @@ func (m *Manager) missingWorktreeRisk(name, clonePath string, nuclear, force, di
 	if unpushed == 0 {
 		return nil
 	}
-	risk := &WorkAtRiskError{Polecat: name, Branch: branch, ClonePath: clonePath, Unpushed: unpushed}
-	if nuclear {
-		risk.Reason = "nuclear removal never publishes"
-	} else {
-		risk.Reason = m.pushUnpushedBranch(repoGit, branch)
-	}
-	if risk.Reason == "" {
-		return nil
-	}
+	reason := fmt.Sprintf("tip %s is on no remote and the worktree is gone, so it is not pushed; pass --discard-unpushed to delete it", tip[:8])
 	if discard {
-		style.PrintWarning("discarding %d unpushed commit(s) on branch %s (%s) at the operator's explicit request", unpushed, branch, risk.Reason)
+		style.PrintWarning("discarding %d unpushed commit(s) on branch %s (%s) at the operator's explicit request", unpushed, branch, reason)
 		return nil
 	}
-	return risk
+	return &WorkAtRiskError{Polecat: name, Branch: branch, ClonePath: clonePath, Unpushed: unpushed, Reason: reason}
 }
 
 // resolveMissingPath resolves symlinks in the nearest existing ancestor of

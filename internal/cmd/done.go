@@ -1075,7 +1075,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Handle "direct" strategy: push to target branch, skip MR
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
-			if reason := refuseUnverifiedPush(g, unverifiedGuardProtectedBranches); reason != "" {
+			if reason := refuseUnverifiedPush(g, branch, unverifiedGuardProtectedBranches); reason != "" {
 				pushFailed = true
 				doneErrors = append(doneErrors, reason)
 				style.PrintWarning("%s", reason)
@@ -1161,7 +1161,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// when the tree was dirty, but an earlier auto-save/checkpoint
 		// cycle can have left an unverified commit on a now-clean branch
 		// (PR #184 review).
-		if reason := refuseUnverifiedPush(g, unverifiedGuardProtectedBranches); reason != "" {
+		if reason := refuseUnverifiedPush(g, branch, unverifiedGuardProtectedBranches); reason != "" {
 			pushFailed = true
 			doneErrors = append(doneErrors, reason)
 			style.PrintWarning("%s", reason)
@@ -1673,7 +1673,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			fmt.Printf("%s Late-detected direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
 			fmt.Printf("  Convoy: %s\n", convoyInfo.ID)
 
-			if reason := refuseUnverifiedPush(g, unverifiedGuardProtectedBranches); reason != "" {
+			if reason := refuseUnverifiedPush(g, branch, unverifiedGuardProtectedBranches); reason != "" {
 				pushFailed = true
 				doneErrors = append(doneErrors, reason)
 				style.PrintWarning("%s", reason)
@@ -2876,8 +2876,8 @@ func findHookedBeadForAgent(bd *beads.Beads, agentID string) string {
 // gt done push site consults this because the auto-save's own HooksFailed
 // gate only fires when auto-save ran in the same invocation — an unverified
 // commit left by an earlier cycle sits on a clean tree (PR #184 review).
-func refuseUnverifiedPush(g *git.Git, protectedBranches []string) string {
-	badSHA, err := git.HasUnverifiedCommit(g, "origin", protectedBranches)
+func refuseUnverifiedPush(g *git.Git, branch string, protectedBranches []string) string {
+	badSHA, err := git.HasUnverifiedCommitAt(g, "origin", "refs/heads/"+branch, protectedBranches)
 	if err != nil {
 		return fmt.Sprintf("could not check the branch for unverified commits — refusing to push until it can be verified: %v", err)
 	}
