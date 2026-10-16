@@ -26,6 +26,8 @@ func TestRoleFormulaRefusal(t *testing.T) {
 		"mol-town-shutdown",
 		"mol-polecat-lease",
 		"mol-digest-generate",
+		"mol-convoy-feed",
+		"mol-gastown-boot",
 	}
 	for _, name := range refused {
 		t.Run("refuses "+name, func(t *testing.T) {
@@ -67,9 +69,7 @@ func TestRoleFormulaRefusal(t *testing.T) {
 		"mol-idea-to-plan",
 		"mol-plan-review",
 		"mol-prd-review",
-		"mol-gastown-boot",
 		"mol-sync-workspace",
-		"mol-convoy-feed",
 		"my-custom-formula",
 		"./my-custom-formula",
 	}

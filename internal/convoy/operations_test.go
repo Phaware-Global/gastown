@@ -2042,12 +2042,12 @@ func TestRoleWorkflowBlock(t *testing.T) {
 }
 
 func TestIsRoleFormula(t *testing.T) {
-	for _, name := range []string{"mol-deacon-patrol", "./mol-deacon-patrol", "x/../mol-dog-reaper", "Mol-Deacon-Patrol", "MOL-DOG-REAPER", "mol-deacon-patrol.formula.toml", "/town/.beads/formulas/mol-witness-patrol.formula.json", "mol-session-gc"} {
+	for _, name := range []string{"mol-deacon-patrol", "./mol-deacon-patrol", "x/../mol-dog-reaper", "Mol-Deacon-Patrol", "MOL-DOG-REAPER", "mol-deacon-patrol.formula.toml", "/town/.beads/formulas/mol-witness-patrol.formula.json", "mol-session-gc", "mol-convoy-feed", "mol-gastown-boot"} {
 		if !IsRoleFormula(name) {
 			t.Errorf("IsRoleFormula(%q) = false, want true", name)
 		}
 	}
-	for _, name := range []string{"", "shiny", "mol-polecat-work", "mol-idea-to-plan", "./my-formula", "mol-convoy-feed"} {
+	for _, name := range []string{"", "shiny", "mol-polecat-work", "mol-idea-to-plan", "./my-formula"} {
 		if IsRoleFormula(name) {
 			t.Errorf("IsRoleFormula(%q) = true, want false", name)
 		}

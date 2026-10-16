@@ -13,6 +13,8 @@ var roleOnlyFormulas = map[string]bool{
 	"mol-session-gc":      true,
 	"mol-boot-triage":     true,
 	"mol-convoy-cleanup":  true,
+	"mol-convoy-feed":     true,
+	"mol-gastown-boot":    true,
 	"mol-dep-propagate":   true,
 	"mol-orphan-scan":     true,
 	"mol-shutdown-dance":  true,
