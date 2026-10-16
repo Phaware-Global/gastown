@@ -1849,26 +1849,33 @@ func slungIDs(t *testing.T, logPath string) []string {
 // Who filed a bead says nothing about who may work it: the deacon and dogs file
 // ordinary gt/bd bugs for polecats. The feeder decides by what the step is, so a
 // deacon- or dog-created bug or task must be slung.
+//
+// One store serves every case (each case is its own convoy): opening an embedded
+// Dolt store per subtest dominates this package's run time.
 func TestFeedNextReadyIssue_FeedsDeaconAndDogCreatedWork(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	townRoot := setupTownRoot(t)
+
+	n := 0
 	for _, owner := range []string{"deacon", "dog", "dogs", "boot", "deacon/dogs/alpha", "Deacon", "gastown/witness", "gastown/refinery"} {
 		for _, issueType := range []beadsdk.IssueType{beadsdk.TypeBug, beadsdk.TypeTask} {
+			n++
+			convoyID := fmt.Sprintf("test-convoyown%d", n)
+			issueID := fmt.Sprintf("test-bug%d", n)
 			t.Run(owner+"/"+string(issueType), func(t *testing.T) {
-				store, cleanup := setupTestStore(t)
-				defer cleanup()
-				ctx := context.Background()
-
-				seedConvoy(t, ctx, store, "test-convoyown", []*beadsdk.Issue{
-					{ID: "test-bug1", Title: "Fix gt bug", Status: beadsdk.StatusOpen, Priority: 1, IssueType: issueType, CreatedBy: owner},
+				seedConvoy(t, ctx, store, convoyID, []*beadsdk.Issue{
+					{ID: issueID, Title: "Fix gt bug", Status: beadsdk.StatusOpen, Priority: 1, IssueType: issueType, CreatedBy: owner},
 				})
 
-				townRoot := setupTownRoot(t)
 				gtPath, logPath := makeGTStub(t, 0)
 				logger, _ := makeLogger()
 
-				feedNextReadyIssue(ctx, store, townRoot, "test-convoyown", "test", logger, gtPath, func(string) bool { return false }, nil)
+				feedNextReadyIssue(ctx, store, townRoot, convoyID, "test", logger, gtPath, func(string) bool { return false }, nil)
 
-				if got := slungIDs(t, logPath); len(got) != 1 || got[0] != "test-bug1" {
-					t.Errorf("slung %v, want [test-bug1]; a %s filed by %q is polecat work", got, issueType, owner)
+				if got := slungIDs(t, logPath); len(got) != 1 || got[0] != issueID {
+					t.Errorf("slung %v, want [%s]; a %s filed by %q is polecat work", got, issueID, issueType, owner)
 				}
 			})
 		}
@@ -1879,24 +1886,26 @@ func TestFeedNextReadyIssue_FeedsDeaconAndDogCreatedWork(t *testing.T) {
 // merge-conflict and similar tasks are meant for an available polecat) are
 // ordinary polecat work.
 func TestFeedNextReadyIssue_FeedsHumanOrMayorCreatedTask(t *testing.T) {
-	for _, owner := range []string{"", "mayor", "dev@example.com", "gastown/polecats/furiosa", "gastown/refinery", "gastown/witness"} {
-		t.Run("owner="+owner, func(t *testing.T) {
-			store, cleanup := setupTestStore(t)
-			defer cleanup()
-			ctx := context.Background()
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	townRoot := setupTownRoot(t)
 
-			seedConvoy(t, ctx, store, "test-convoyhum", []*beadsdk.Issue{
-				{ID: "test-human1", Title: "Task", Status: beadsdk.StatusOpen, Priority: 2, IssueType: beadsdk.TypeTask, CreatedBy: owner},
+	for i, owner := range []string{"", "mayor", "dev@example.com", "gastown/polecats/furiosa", "gastown/refinery", "gastown/witness"} {
+		convoyID := fmt.Sprintf("test-convoyhum%d", i)
+		issueID := fmt.Sprintf("test-human%d", i)
+		t.Run("owner="+owner, func(t *testing.T) {
+			seedConvoy(t, ctx, store, convoyID, []*beadsdk.Issue{
+				{ID: issueID, Title: "Task", Status: beadsdk.StatusOpen, Priority: 2, IssueType: beadsdk.TypeTask, CreatedBy: owner},
 			})
 
-			townRoot := setupTownRoot(t)
 			gtPath, logPath := makeGTStub(t, 0)
 			logger, _ := makeLogger()
 
-			feedNextReadyIssue(ctx, store, townRoot, "test-convoyhum", "test", logger, gtPath, func(string) bool { return false }, nil)
+			feedNextReadyIssue(ctx, store, townRoot, convoyID, "test", logger, gtPath, func(string) bool { return false }, nil)
 
-			if got := slungIDs(t, logPath); len(got) != 1 || got[0] != "test-human1" {
-				t.Errorf("slung %v, want [test-human1]", got)
+			if got := slungIDs(t, logPath); len(got) != 1 || got[0] != issueID {
+				t.Errorf("slung %v, want [%s]", got, issueID)
 			}
 		})
 	}
@@ -1960,22 +1969,23 @@ func TestFeedNextReadyIssue_FeedsEveryWaveOfNonRoleWorkflow(t *testing.T) {
 // dog formulas) is refused as a whole: its steps belong to that role, and
 // wrapping them in mol-polecat-work can only stall.
 func TestFeedNextReadyIssue_RefusesRoleFormulaWorkflowConvoy(t *testing.T) {
-	for _, name := range []string{"mol-deacon-patrol", "mol-dog-reaper", "Mol-Witness-Patrol", "mol-session-gc"} {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	townRoot := setupTownRoot(t)
+
+	for i, name := range []string{"mol-deacon-patrol", "mol-dog-reaper", "Mol-Witness-Patrol", "mol-session-gc"} {
+		convoyID := fmt.Sprintf("hq-wf-role%d", i)
 		t.Run(name, func(t *testing.T) {
-			store, cleanup := setupTestStore(t)
-			defer cleanup()
-			ctx := context.Background()
-
-			seedConvoy(t, ctx, store, "hq-wf-role", []*beadsdk.Issue{
-				{ID: "test-wfs-a", Title: "Patrol step", Status: beadsdk.StatusOpen, Priority: 1, IssueType: beadsdk.TypeTask},
+			seedConvoy(t, ctx, store, convoyID, []*beadsdk.Issue{
+				{ID: fmt.Sprintf("test-wfs-role%d", i), Title: "Patrol step", Status: beadsdk.StatusOpen, Priority: 1, IssueType: beadsdk.TypeTask},
 			})
-			setWorkflowFormula(t, ctx, store, "hq-wf-role", name)
+			setWorkflowFormula(t, ctx, store, convoyID, name)
 
-			townRoot := setupTownRoot(t)
 			gtPath, logPath := makeGTStub(t, 0)
 			logger, _ := makeLogger()
 
-			feedNextReadyIssue(ctx, store, townRoot, "hq-wf-role", "test", logger, gtPath, func(string) bool { return false }, nil)
+			feedNextReadyIssue(ctx, store, townRoot, convoyID, "test", logger, gtPath, func(string) bool { return false }, nil)
 
 			if got := slungIDs(t, logPath); len(got) != 0 {
 				t.Errorf("role-formula workflow %q fed %v to a polecat, want nothing", name, got)
