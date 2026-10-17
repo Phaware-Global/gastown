@@ -205,7 +205,7 @@ func stripControls(text string) string {
 // canonicalLine), so spacing, dashes and punctuation never matter. The bare
 // "Operator policy" heading is included so a forged heading without the
 // "(from telegraph config)" suffix is caught too.
-var trustMarkers = []string{"EXTERNALCONTENT", "OPERATORPROMPT", "OPERATORPOLICY"}
+var trustMarkers = []string{"EXTERNALCONTENT", "OPERATORPROMPT", "OPERATORPOLICY", "TELEGRAPHBOUNDARY"}
 
 // homoglyphs folds characters that render like Latin capitals so the
 // letters-only comparison sees the Latin word: Cyrillic and Greek capitals,
@@ -235,6 +235,15 @@ var homoglyphs = map[rune]rune{
 // NFKC maps U+3164 to U+1160, so both forms are listed.
 var invisibleLetters = map[rune]bool{0x115F: true, 0x1160: true, 0x3164: true, 0xFFA0: true}
 
+// canonicalForms returns the two canonical spellings of a line that are
+// compared against trustMarkers: one with look-alike digits folded to letters
+// (catches "C0NTENT") and one with digits dropped (catches "EXTERNAL 1
+// CONTENT", where a digit is used as a separator). A line is a marker if
+// either form contains one.
+func canonicalForms(line string) [2]string {
+	return [2]string{canonicalLine(line, true), canonicalLine(line, false)}
+}
+
 // canonicalLine reduces a line to the letters an LLM effectively reads:
 // NFKC-normalized (fullwidth and compatibility forms folded), every rune that
 // is not a letter dropped (whitespace, dashes, punctuation, zero-width and
@@ -242,9 +251,12 @@ var invisibleLetters = map[rune]bool{0x115F: true, 0x1160: true, 0x3164: true, 0
 // Cyrillic/Greek homoglyphs folded to Latin, and everything upper-cased.
 // Matching an allowlist of letters, rather than denying categories one at a
 // time, is what makes the comparison robust to new separator tricks.
-func canonicalLine(line string) string {
+func canonicalLine(line string, foldDigits bool) string {
 	var b strings.Builder
 	for _, r := range norm.NFKC.String(line) {
+		if unicode.IsDigit(r) && !foldDigits {
+			continue
+		}
 		if folded, ok := homoglyphs[r]; ok {
 			b.WriteRune(folded) // digits and small caps fold before the letter test
 			continue
@@ -261,6 +273,37 @@ func canonicalLine(line string) string {
 	return b.String()
 }
 
+// lineHasTrustMarker reports whether either canonical form of line contains
+// a trust marker (delimiter phrase, trusted heading, or the Telegraph-Boundary
+// header name — a forged header line must never compete with the real one).
+func lineHasTrustMarker(line string) bool {
+	for _, canon := range canonicalForms(line) {
+		for _, marker := range trustMarkers {
+			if strings.Contains(canon, marker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// flattenPrompt prepares resolved operator-prompt text for the nonce-certified
+// OPERATOR PROMPT block: substituted values such as {actor} may carry
+// U+2028/VT/FF/CR that a model reads as line breaks, so every separator other
+// than the template's own "\n" becomes a space and remaining controls are
+// stripped. Lines are kept so operator-authored formatting survives.
+func flattenPrompt(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.Map(func(r rune) rune {
+		switch r {
+		case '\r', '\v', '\f', '\u2028', '\u2029', '\u0085':
+			return ' '
+		}
+		return r
+	}, text)
+	return stripControls(text)
+}
+
 // neutralizeDelimiters defuses trust-delimiter lines inside external text so
 // a provider comment cannot close its own EXTERNAL CONTENT block, open a fake
 // OPERATOR PROMPT, or forge the assistant's "Operator policy" heading and
@@ -273,12 +316,8 @@ func neutralizeDelimiters(text string) string {
 	text = stripControls(lineSeparators.Replace(text))
 	lines := strings.Split(text, "\n")
 	for i, line := range lines {
-		canon := canonicalLine(line)
-		for _, marker := range trustMarkers {
-			if strings.Contains(canon, marker) {
-				lines[i] = "[neutralized delimiter] " + line
-				break
-			}
+		if lineHasTrustMarker(line) {
+			lines[i] = "[neutralized delimiter] " + line
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -420,7 +459,9 @@ func (t *Transformer) buildBody(event *telegraph.NormalizedEvent, promptText str
 	// Per-message boundary nonce: the real trust delimiters below carry it, so
 	// external text cannot forge them no matter how it is encoded. Readers
 	// treat a delimiter-looking line as a delimiter only if it carries the
-	// nonce from this header.
+	// nonce from THIS header — the one in the header block before the first
+	// delimiter; any later header-looking line is external text and is
+	// neutralized.
 	boundary := newBoundary()
 	fmt.Fprintf(&b, "Telegraph-Boundary: %s\n", boundary)
 	fmt.Fprintf(&b, "Telegraph-Actor: %s\n", sanitizeHeaderValue(event.Actor))
@@ -447,7 +488,7 @@ func (t *Transformer) buildBody(event *telegraph.NormalizedEvent, promptText str
 	// Operator prompt block — emitted only when a prompt resolved.
 	// Sits between metadata headers and external content.
 	if promptText != "" {
-		fmt.Fprintf(&b, "\n--- OPERATOR PROMPT (trusted) %s ---\n%s\n--- END OPERATOR PROMPT %s ---", boundary, promptText, boundary)
+		fmt.Fprintf(&b, "\n--- OPERATOR PROMPT (trusted) %s ---\n%s\n--- END OPERATOR PROMPT %s ---", boundary, flattenPrompt(promptText), boundary)
 	}
 
 	// External content block with explicit trust delimiter (nonce-bearing).
