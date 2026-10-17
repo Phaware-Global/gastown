@@ -578,7 +578,7 @@ API queries and a dry-run mode that prints the queries it would issue.
 
 | Setting | Where | Default | Purpose |
 |---|---|---|---|
-| `assistant_sweep_interval` | `settings/config.json` (town) | `"1h"` | Cooldown for the `assistant-sweep` plugin. Any Go duration string (`"30m"`, `"2h"`). Rendered into the assistant's prompt so it knows its cadence. |
+| `assistant_sweep_interval` | `settings/config.json` (town) | `"1h"` | Cooldown for the `assistant-sweep` plugin. A Go duration string of at least `5m` (`"30m"`, `"2h"`); an absent, unparseable or shorter value is ignored and the gate falls back to the plugin's static `duration`, then to 1h. Rendered into the assistant's prompt so it knows its cadence. |
 | `assistant.sweep` | `settings/config.json` (town) | beads port only | Enabled sweep ports and their per-port settings (humans, thresholds, Jira site/board, GitHub repos). See [Sweep ports](#sweep-ports). Secrets come from the named environment variables, never from the file. |
 | `role_agents["assistant"]` | `settings/config.json` (town) | town `default_agent` | Agent/model preset for the assistant, resolved through the same 3-tier hierarchy as every other role. |
 | `roles/assistant.toml` | `<town>/roles/` | built-in | Override session pattern, work dir, start command, health thresholds, nudge, or template name. |
