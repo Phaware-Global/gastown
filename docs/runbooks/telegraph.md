@@ -51,7 +51,7 @@ events        = [
 |-------|---------|-------|
 | `listen_addr` | `:8765` | TCP address for the HTTP webhook listener |
 | `buffer_size` | `256` | Max queued events between L1 and L2; full → HTTP 503 to caller |
-| `nudge_window` | `30s` | Max one Mayor nudge per this window regardless of event volume |
+| `nudge_window` | `30s` | Max one Mayor's Assistant nudge per this window regardless of event volume |
 | `body_cap` | `4096` | Max bytes of Jira content in mail body; excess is truncated |
 | `prompt_cap` | `2048` | Max bytes for a single resolved operator prompt; excess truncated |
 | `log_file` | `""` (stderr) | Path to log file; empty → logs go to stderr |
@@ -233,10 +233,11 @@ curl -s -X POST http://127.0.0.1:8765/webhook/jira \
 # Expected: HTTP 200, empty body
 ```
 
-Then check Mayor's inbox to confirm the mail arrived:
+Then check the Mayor's Assistant inbox to confirm the mail arrived (Telegraph
+mail is routed to `mayors-assistant/`, which briefs the Mayor):
 
 ```bash
-gt mail inbox
+gt mail inbox   # from the mayors-assistant session
 # Should show a new message from telegraph/jira/testuser
 ```
 
@@ -245,8 +246,10 @@ gt mail inbox
 ## Operator Prompts
 
 Operator prompts let you attach per-event-type instructions to each mail Telegraph
-delivers. The receiving agent (Mayor) reads these before the external webhook content,
-giving it policy context without requiring each receiver to infer operator intent.
+delivers. The receiving agent (the Mayor's Assistant) reads these before the external
+webhook content and relays the block verbatim to the Mayor in a labelled "Operator
+policy" section; the assistant never executes operator-prompt instructions itself
+(see design/mayors-assistant-role.md, Trust boundary).
 
 ### Mail body shape (with a configured prompt)
 
@@ -400,10 +403,10 @@ jq 'select(.reason == "actor_filtered")' ~/gt/logs/telegraph.log
 
 ## GitHub Provider
 
-The GitHub Telegraph provider notifies Mayor about PR activity (comments,
-reviews, merges) and failing CI checks. It mirrors the Jira provider's
-shape: HMAC-authenticated webhook deliveries → normalized event → Mayor
-mail. The differences are documented here.
+The GitHub Telegraph provider notifies the Mayor's Assistant about PR activity
+(comments, reviews, merges) and failing CI checks. It mirrors the Jira provider's
+shape: HMAC-authenticated webhook deliveries → normalized event →
+`mayors-assistant/` mail. The differences are documented here.
 
 ### Supported events
 
@@ -495,7 +498,7 @@ ignore_actors = ["mayor-bot"]   # GitHub login of the operator persona
 
 Useful when Mayor posts back to the PR via a bot account; GitHub fires a
 fresh `issue_comment` event back, which would otherwise feed back into
-Mayor's inbox. Filtering uses GitHub login (case-sensitive), not the
+the Mayor's Assistant inbox. Filtering uses GitHub login (case-sensitive), not the
 display name. Filtered drops emit `reason=actor_filtered`.
 
 ### Sending a signed test POST
@@ -516,10 +519,10 @@ curl -s -X POST http://127.0.0.1:8765/webhook/github \
 # Expected: HTTP 200, empty body
 ```
 
-Then check Mayor's inbox:
+Then check the Mayor's Assistant inbox:
 
 ```bash
-gt mail inbox   # should show telegraph/github/testuser → mayor/
+gt mail inbox   # should show telegraph/github/testuser → mayors-assistant/
 ```
 
 ### Recovering from secret rotation
@@ -562,10 +565,10 @@ They reset on restart. The counters are:
 | `RejectBackpressure` | Internal buffer full (HTTP 503 returned) |
 | `RejectParseError` | HTTP body read failure or request body exceeds size limit |
 | `RejectProviderDis` | Provider set to `enabled = false` |
-| `Deliver` | Mail successfully sent to Mayor |
+| `Deliver` | Mail successfully sent to the Mayor's Assistant |
 | `Drop` | Event discarded post-L2 without delivery |
-| `NudgeSent` | Mayor nudge sent (within rate-limit window) |
-| `NudgeSuppressed` | Mayor nudge skipped (rate-limit window active) |
+| `NudgeSent` | Mayor's Assistant nudge sent (within rate-limit window) |
+| `NudgeSuppressed` | Mayor's Assistant nudge skipped (rate-limit window active) |
 
 **Useful `jq` queries:**
 
