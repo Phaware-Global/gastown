@@ -1051,7 +1051,7 @@ func runDeaconForceKill(cmd *cobra.Command, args []string) error {
 	if !forceKillSkipNotify {
 		fmt.Printf("%s Notifying mayor's assistant...\n", style.Dim.Render("4."))
 		notifyBody := fmt.Sprintf("Agent %s was force-killed by Deacon.\nReason: %s", agent, reason)
-		sendMail(townRoot, constants.RoleMayorsAssistant+"/", "Agent killed: "+agent, notifyBody)
+		sendMail(townRoot, constants.RoleAssistant+"/", "Agent killed: "+agent, notifyBody)
 	}
 
 	// Record force-kill in state

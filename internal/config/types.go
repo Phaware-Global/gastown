@@ -2062,7 +2062,7 @@ type EscalationConfig struct {
 	// Actions are executed in order for each escalation.
 	// Action formats:
 	//   - "bead"        → Create escalation bead (always first, implicit)
-	//   - "mail:<target>" → Send gt mail to target (e.g., "mail:mayors-assistant")
+	//   - "mail:<target>" → Send gt mail to target (e.g., "mail:assistant")
 	//   - "email:human" → Send email to contacts.human_email
 	//   - "sms:human"   → Send SMS to contacts.human_sms
 	//   - "slack"       → Post to contacts.slack_webhook (only when slack_overseer_only=false)
@@ -2167,9 +2167,9 @@ func NewEscalationConfig() *EscalationConfig {
 		// marks such items "already delivered to mayor/" in its briefings).
 		Routes: map[string][]string{
 			SeverityLow:      {"bead"},
-			SeverityMedium:   {"bead", "mail:mayors-assistant"},
-			SeverityHigh:     {"bead", "mail:mayors-assistant", "mail:mayor", "email:human"},
-			SeverityCritical: {"bead", "mail:mayors-assistant", "mail:mayor", "email:human", "sms:human"},
+			SeverityMedium:   {"bead", "mail:assistant"},
+			SeverityHigh:     {"bead", "mail:assistant", "mail:mayor", "email:human"},
+			SeverityCritical: {"bead", "mail:assistant", "mail:mayor", "email:human", "sms:human"},
 		},
 		Contacts:          EscalationContacts{},
 		StaleThreshold:    "4h",

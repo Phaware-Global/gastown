@@ -232,7 +232,7 @@ if [ "${#FINDINGS[@]}" -gt 0 ]; then
     # Only persist dedupe state once the report mail actually went out -
     # otherwise a transient send failure would silently mute these PRs for
     # 24h with nothing ever delivered. Routed to the Mayor's Assistant.
-    if gt mail send mayors-assistant/ -s "orphan-pr-sentinel: ${#TO_MAIL[@]} PR(s) with no owning bead" --stdin <<< "$MAIL_BODY"; then
+    if gt mail send assistant/ -s "orphan-pr-sentinel: ${#TO_MAIL[@]} PR(s) with no owning bead" --stdin <<< "$MAIL_BODY"; then
       for F in "${TO_MAIL[@]}"; do
         IFS='|' read -r RIG PR_NUM UNRESOLVED CI_FAILING PR_HEAD TITLE <<< "$F"
         KEY="$RIG:$PR_NUM"
@@ -254,7 +254,7 @@ BODY2
       done
       echo "$STATE" > "$STATE_FILE" 2>/dev/null || true
     else
-      log "ERROR: gt mail send mayors-assistant/ failed - not persisting dedupe state this cycle"
+      log "ERROR: gt mail send assistant/ failed - not persisting dedupe state this cycle"
       ERRORS=1
     fi
   fi

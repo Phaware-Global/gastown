@@ -68,7 +68,7 @@ Apply thresholds to each worker's average score:
 For each worker in BREACH status, send an alert:
 
 ```bash
-gt mail send mayors-assistant/ -s "Quality BREACH: <worker>" -m "Worker: <worker>
+gt mail send assistant/ -s "Quality BREACH: <worker>" -m "Worker: <worker>
 Rig: <rig>
 Avg Score: <avg>
 Reviews: <count>

@@ -3004,7 +3004,7 @@ func LoadEscalationConfig(path string) (*EscalationConfig, error) {
 // stripSlackRoutes removes the "slack" action from every route when
 // slack_overseer_only is in effect, so gt escalate never posts to Slack on
 // its own. Any route that loses a slack action keeps its existing mayor/assistant mail
-// route or gains mail:mayors-assistant. Returns the severities that had a slack action stripped, in
+// route or gains mail:assistant. Returns the severities that had a slack action stripped, in
 // ValidSeverities order, so the caller can warn the operator once per route.
 func stripSlackRoutes(c *EscalationConfig) []string {
 	if !c.IsSlackOverseerOnly() {
@@ -3122,7 +3122,7 @@ func (c *EscalationConfig) GetStaleThreshold() time.Duration {
 }
 
 // GetRouteForSeverity returns the escalation route actions for a given severity.
-// Falls back to ["bead", "mail:mayors-assistant"] if no specific route is
+// Falls back to ["bead", "mail:assistant"] if no specific route is
 // configured; high and critical additionally fall back to a direct
 // "mail:mayor" so a dead assistant session cannot blackhole them.
 func (c *EscalationConfig) GetRouteForSeverity(severity string) []string {
@@ -3130,13 +3130,13 @@ func (c *EscalationConfig) GetRouteForSeverity(severity string) []string {
 		return route
 	}
 	// Fallback to default route (Routed to the Mayor's Assistant)
-	return ensureMayorReachable(severity, []string{"bead", "mail:" + constants.RoleMayorsAssistant})
+	return ensureMayorReachable(severity, []string{"bead", "mail:" + constants.RoleAssistant})
 }
 
 // ensureMayorReachable guarantees an escalation route reaches the Mayor.
 // High and critical must carry a direct mail:mayor route regardless of the
 // assistant's liveness; other severities need either mail:mayor or the
-// assistant's triage inbox and gain mail:mayors-assistant if they have neither.
+// assistant's triage inbox and gain mail:assistant if they have neither.
 func ensureMayorReachable(severity string, route []string) []string {
 	switch severity {
 	case SeverityHigh, SeverityCritical:
@@ -3144,8 +3144,8 @@ func ensureMayorReachable(severity string, route []string) []string {
 			route = append(route, "mail:mayor")
 		}
 	default:
-		if !slices.Contains(route, "mail:mayor") && !slices.Contains(route, "mail:"+constants.RoleMayorsAssistant) {
-			route = append(route, "mail:"+constants.RoleMayorsAssistant)
+		if !slices.Contains(route, "mail:mayor") && !slices.Contains(route, "mail:"+constants.RoleAssistant) {
+			route = append(route, "mail:"+constants.RoleAssistant)
 		}
 	}
 	return route

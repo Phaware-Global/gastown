@@ -45,7 +45,7 @@ WORKFLOW:
 
 CONFIGURATION:
   Routing is configured in ~/gt/settings/escalation.json:
-  - routes: Map severity to action lists (bead, mail:mayors-assistant, email:human, sms:human)
+  - routes: Map severity to action lists (bead, mail:assistant, email:human, sms:human)
   - contacts: Human email/SMS for external notifications
   - slack_overseer_only: true (default) reserves Slack for gt notify-overseer;
     "slack" route actions are suppressed with a warning

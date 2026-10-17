@@ -492,7 +492,7 @@ Please investigate and either:
 		beadState.LastAttemptTime.Format(time.RFC3339),
 	)
 
-	cmd := exec.Command("gt", "mail", "send", "mayors-assistant/", "-s", subject, "-m", body)
+	cmd := exec.Command("gt", "mail", "send", "assistant/", "-s", subject, "-m", body)
 	cmd.Dir = townRoot
 	cmd.Env = deaconMutationRoutingEnv(townRoot)
 	util.SetDetachedProcessGroup(cmd)

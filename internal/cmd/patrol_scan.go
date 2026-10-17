@@ -278,7 +278,7 @@ func sendZombieNotification(router *mail.Router, rigName string, result *witness
 		"  gt sling <bead-id> <rig> --create --force"
 	mayorMsg := &mail.Message{
 		From:    fmt.Sprintf("%s/witness", rigName),
-		To:      "mayors-assistant/",
+		To:      "assistant/",
 		Subject: fmt.Sprintf("POLECAT_DIED: %d polecat(s) died with active work in %s", activeCount, rigName),
 		Body:    mayorBody,
 	}
