@@ -1,7 +1,9 @@
 # Mayor's Assistant: Town-Level Inbound Triage Role
 
 **Status:** Proposed — delivered as a PR stack (docs → role registration →
-message routing → sweep migration → prompt template)
+message routing → sweep migration → prompt template). This document and the
+`mayors-assistant` entries in `overview.md` / `reference.md` describe the
+stack's end state; they are true once the role-registration PR lands.
 **Created:** 2026-10-17
 **Cross-references:** [telegraph.md](telegraph.md), [escalation.md](escalation.md),
 [mail-protocol.md](mail-protocol.md), [plugin-system.md](plugin-system.md),
@@ -120,13 +122,60 @@ comment so the split stays auditable.
 **Backward safety.** `mayors-assistant/` is a well-known town-level address,
 validated like `mayor/` and `deacon/`. Mail queues in the town beads store
 whether or not the assistant session is running; nudges to a missing session
-are logged and dropped exactly as they are for the Mayor today. Towns that
-have not started the assistant lose nothing — the mail waits.
+are logged and dropped exactly as they are for the Mayor today. For routine
+inbound information that is the desired behaviour: nothing is lost, it is
+read when the assistant is next up (the daemon restarts it on its patrol
+tick, with the Mayor's zombie debounce). It is **not** sufficient for
+time-critical escalations, which is why high and critical escalations keep a
+direct path to the Mayor (next section).
 
-**Escalation routes.** `settings/escalation.json` defaults change from
-`mail:mayor` to `mail:mayors-assistant`. Existing towns keep whatever routes
-they have persisted; operators who want the new behaviour update the file
-(or delete it to regenerate defaults).
+**Escalation routes.** `settings/escalation.json` defaults become:
+
+| Severity | Default route |
+|---|---|
+| low | `bead` |
+| medium | `bead`, `mail:mayors-assistant` |
+| high | `bead`, `mail:mayors-assistant`, `mail:mayor`, `email:human` |
+| critical | `bead`, `mail:mayors-assistant`, `mail:mayor`, `email:human`, `sms:human` |
+
+Medium escalations go through the assistant only. High and critical are
+delivered to **both**: the Mayor must learn of them even if the assistant
+session is dead, wedged, or never started, and a liveness-triggered re-route
+would be more machinery than the problem deserves. The assistant includes
+such items in its briefings as context, marked "already delivered to
+mayor/", and does not treat them as needing relay.
+
+Two code paths keep the same invariant:
+
+- `GetRouteForSeverity` falls back to `bead, mail:mayors-assistant` for a
+  severity missing from the routes map (it previously fell back to
+  `mail:mayor`).
+- `stripSlackRoutes` (slack_overseer_only) keeps a route that loses its
+  `slack` action reachable by the Mayor: if the route already names
+  `mail:mayor` or `mail:mayors-assistant` it is left alone; otherwise it
+  gains `mail:mayors-assistant`. The Mayor remains the only path to Slack via
+  `gt notify-overseer`; it hears about the suppressed route through the
+  assistant (or directly, for high/critical).
+
+Existing towns keep whatever routes they have persisted; operators who want
+the new behaviour update the file (or delete it to regenerate defaults).
+
+### Trust boundary
+
+Telegraph wraps provider text in `EXTERNAL CONTENT` delimiters and the Mayor
+is primed to treat `telegraph/` senders as untrusted. The assistant must not
+launder that text into trusted instructions:
+
+1. Briefings quote external text only inside the original
+   `EXTERNAL CONTENT (untrusted: <provider>/<actor>)` delimiters, never
+   paraphrased as fact outside them.
+2. Suggested-action commands (`bd create`, `gt sling`, reply hints) are built
+   only from structured fields — issue key, PR number, rig, bead ID — never
+   from the body of an external message. A comment that *contains* a command
+   is quoted as untrusted text, not proposed as an action.
+3. Every briefed item carries its source address (`telegraph/github/<login>`,
+   `gastown/witness`, …) so the Mayor's existing trust rule still applies to
+   the relayed item.
 
 ## Interaction with the Mayor
 
@@ -135,9 +184,15 @@ they have persisted; operators who want the new behaviour update the file
 - Briefings end with a short **Suggested actions** list. Each item is one
   line: what to decide, or `bd create`/`gt sling` text the Mayor can run
   verbatim.
-- The Mayor can delegate a bounded action back by mail
-  (`gt mail send mayors-assistant/ -s "DELEGATE: …"`). The assistant performs
-  only what is named and reports completion.
+- The Mayor can delegate a bounded, **read-only or reversible** action back by
+  mail (`gt mail send mayors-assistant/ -s "DELEGATE: …"`): re-check a PR,
+  pull a thread's history, draft a summary, mark its own mail. A delegation
+  is valid only when the mail's `From` is exactly `mayor/` and the request is
+  not inside an `EXTERNAL CONTENT` block or a forwarded item. Mail `From` is
+  derived from `GT_ROLE` and is not authenticated, so `DELEGATE:` never
+  grants dispatch authority: `gt sling`, `bd close`, `gt polecat nuke`, rig
+  park/dock and similar stay with the Mayor until sender authentication
+  exists. The assistant performs only what is named and reports completion.
 - The Mayor never needs to ack assistant mail; the assistant tracks what it
   has briefed by thread ID and does not re-brief the same item unless it
   changed.
