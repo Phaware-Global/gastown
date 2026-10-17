@@ -316,16 +316,21 @@ type Finding struct {
     Since    time.Time         // when the condition started (comment time, request time)
     Severity string            // "urgent" | "actionable" | "info"
     Suggest  string            // one-line action built from IDs only (key, PR number, repo, rig, bead ID)
-    Fields   map[string]string // machine facts only: status, head SHA, account ID, counts, timestamps
-    External map[string]string // EVERY human-authored or display value: title, comment excerpt,
-                               // actor display name, assignee name — rendered fenced, never trusted
+    Fields   map[string]string // closed allowlist of machine shapes, see below
+    External map[string]string // everything else read from the API — rendered fenced, never trusted
 }
 ```
 
-`Fields` may hold only values the port computed or read from an API as an
-opaque identifier; anything a person could have typed (titles, comment
-bodies, display names, labels) goes in `External`. `Suggest` is assembled
-from `Key`/`Fields` and never from `External`.
+`Fields` is a **closed allowlist of value shapes**, validated by the runner
+before output: integers, RFC 3339 timestamps, hex SHAs, account IDs and
+logins matching fixed patterns (`^[A-Za-z0-9-]+$`, `^[0-9a-f:]+$`), and
+enum states the port maps to its own constants (`approved`,
+`changes_requested`, `failing`). A value that fails the allowlist is moved
+to `External`, never printed as a field. Branch and ref names, check-run
+and job names, Jira status and tag names, labels, titles, comment bodies,
+and every display name are `External` by definition — all of them are
+typed by people (a PR author chooses the job names in the head's workflow
+file). `Suggest` is assembled from `Key` and allowlisted `Fields` only.
 
 `gt assistant sweep` loads the town's sweep config, runs each enabled port
 with a bounded timeout, dedupes against the last *acknowledged* run, and
@@ -338,12 +343,16 @@ is empty because the check could not run.
 by an agent that runs with permissions bypassed, so the fence is applied
 before the agent sees the text, not after. In both the Markdown and
 `--json` output every `External` value is emitted inside an
-`--- EXTERNAL CONTENT (untrusted: <port>/<key>) ---` block with the same
-delimiter/heading neutralization and byte cap that Telegraph's transform
-applies (`neutralizeDelimiters`, `body_cap`); the JSON form carries them
-under an `external` object that the assistant's prompt names as untrusted.
-Nothing human-authored appears outside a fence, in `Suggest`, or in
-`Fields`.
+`--- EXTERNAL CONTENT (untrusted: <port>/<key>) ---` block. Inside the
+block the runner first normalizes every line separator (`\r\n`, `\r`,
+U+2028, U+2029, U+0085) to `\n`, applies the same delimiter/heading
+neutralization and byte cap as Telegraph's transform
+(`neutralizeDelimiters`, `body_cap`), and then prefixes **every line** with
+`> `, so no line of external text can ever match a delimiter or heading in
+the receiving prompt. The JSON form carries the same prefixed text under an
+`external` object that the assistant's prompt names as untrusted. The
+invariant is one sentence: every byte the runner did not compute or
+allowlist is inside a fence and starts with `> `.
 
 ```mermaid
 flowchart LR
@@ -352,17 +361,19 @@ flowchart LR
     S --> B["beads port"]
     S --> J["jira port"]
     S --> G["github port"]
-    B --> R["report: findings + port errors<br/>(deduped vs last run)"]
+    B --> R["report: findings + port errors<br/>(deduped vs last acked run)"]
     J --> R
     G --> R
     R --> A
     A -- "SWEEP: mail (judgement, grouping, suggestions)" --> M["mayor/"]
+    A -- "gt assistant sweep --ack <run-id> (after the mail is sent)" --> S
 ```
 
 **Dedup and state.** The runner keeps `<town>/assistant/.runtime/sweep-state.json`:
 for each `(port, kind, key)` it stores the fingerprint last **acknowledged**
-(comment ID, head SHA, status, updated-at). A finding is **new** when the
-fingerprint differs from the acknowledged one, **standing** otherwise. The
+(comment ID, head SHA, status, updated-at), plus the port's completion
+status for that run. A finding is **new** when the fingerprint differs from
+the acknowledged one, **standing** otherwise. The
 report lists new findings in full and standing ones as counts with the
 oldest age, so the `SWEEP:` mail is short and the Mayor is never re-briefed
 on an unchanged item.
@@ -375,17 +386,21 @@ set as acknowledged. A run that is never acked (session died before
 mailing, context compacted, health-kill) leaves the acknowledged state
 untouched, so the next run reports the same findings as new again. Manual
 re-checks (`--json`, `--dry-run`, or any run outside the sweep protocol)
-never write state. Entries are **evicted** when their condition clears
-(the finding is absent from a run), so a recurrence with the same
+never write state. Entries are **evicted only at `--ack`**, and only for
+ports that completed that run without error or truncation: an entry absent
+from a clean run's findings is dropped, so a recurrence with the same
 fingerprint — a CI re-run failing on the same head — is new again rather
-than standing. Reminders to humans (the GitHub review re-ping) are
-rate-limited by the acknowledged state only: a reminder that was never
-mailed is not counted as sent.
+than standing. A port that failed, timed out, or stopped mid-pagination
+carries its acknowledged entries forward unchanged (its "not checked"
+status is what the mail reports), so a one-sweep outage never turns every
+standing item into a re-brief or resets reminder history. Reminders to
+humans (the GitHub review re-ping) are rate-limited by the acknowledged
+state only: a reminder that was never mailed is not counted as sent.
 
 **Trust.** Port output is data. The runner fences it (above); the assistant
-then carries the fenced blocks into briefings unchanged per the
-[trust boundary](#trust-boundary). The assistant never builds an action from
-anything inside a fence.
+carries the fenced blocks into briefings with every `> ` prefix intact —
+the same fencing rule 1 of the [trust boundary](#trust-boundary) requires of
+its own quotes — and never builds an action from anything inside a fence.
 
 **Identity and credentials.** Ports reuse what Telegraph already knows
 about the town's persona, matched by **immutable identifiers only**:
@@ -394,7 +409,11 @@ about the town's persona, matched by **immutable identifiers only**:
 (`telegraph.mayor.jira_usernames`) are never used for matching in the sweep:
 a display name is mutable and non-unique, so an account renamed to the
 persona's name could otherwise suppress `unanswered-comment` findings on
-every sweep. Secrets come from the environment, never from settings files:
+every sweep. Telegraph accepts a usernames-only configuration, so the Jira
+port **requires** a non-empty `jira_account_ids`; without one it disables
+itself and reports a port error ("no persona account ID configured;
+jira_usernames is not used by the sweep"), exactly as for missing
+credentials — never an empty, all-clear result. Secrets come from the environment, never from settings files:
 `JIRA_API_TOKEN` (plus the persona's Jira email) as the existing
 `jira-move-to-board` skill already requires, and `GITHUB_TOKEN` or an
 authenticated `gh` as the merge queue already requires. A port with no
@@ -403,8 +422,8 @@ credentials disables itself and reports why.
 **Humans.** One rule, used by every check that asks "is this a person we
 wait on": an actor is a human when its immutable ID (Jira `accountId`,
 GitHub login) is in the port's `humans` list. The persona and known bots
-(`Automation for Jira`, the internal reviewer login, GitHub apps) are never
-humans even if listed. Actors outside the list are neither: their comments
+are never humans even if listed; bots are identified by ID too
+(`bots` list of account IDs / app logins), never by display name. Actors outside the list are neither: their comments
 are reported under a separate `unknown-actor` note rather than silently
 counted or ignored, so a new team member shows up as a config gap instead
 of a missed thread.
@@ -431,7 +450,7 @@ persona is involved in (assignee, reporter, or @-mentioned) unless noted.
 
 | Kind | Condition (deterministic) | Why it exists |
 |---|---|---|
-| `unanswered-comment` | last comment on an involved issue is by a listed human (by account ID) and is older than `unanswered_after`; or any comment @-mentions the persona's account ID with no later persona comment | The loose-ends bucket the Mayor checked first every sweep ("new human comments in Jira first") |
+| `unanswered-comment` | the most recent comment by a listed human (by account ID) on an involved issue is newer than the persona's most recent comment and older than `unanswered_after` — comments by unlisted actors or bots in between do not hide it; or any comment @-mentions the persona's account ID with no later persona comment | The loose-ends bucket the Mayor checked first every sweep ("new human comments in Jira first") |
 | `question-unanswered` | last comment is the persona's and contains a question or the issue is `Blocked`, with no human reply for `chase_after` | Operator prompt: block and ask, then wait — someone must notice the wait |
 | `needs-status-update` | issue assigned to the persona in an active status (`To Do`, `Research`, `In Progress`, `In Review`) with no persona comment or status change for `status_update_after`; a queued (`To Do`) issue with no comment at all saying why it waits is reported regardless of age | Loose-ends bucket 5 ("a note on any assigned issue that's waiting"); status sweeps requested by the product owner; the Mayor's own check "5 of my 46 open tickets may lack a note on why they're waiting" |
 | `review-handoff` | issue whose linked PR is waiting on a human reviewer but is not in `In Review` or not assigned to that reviewer; and the reverse — issue in `In Review` whose PR has changes requested or was handed back, still assigned to the reviewer instead of the persona in `In Progress` | Standing rule from the overseer (2026-10-14): work handed over for review is assigned to the reviewer and moved to In Review; handed back means In Progress again |
@@ -487,7 +506,7 @@ agents.
 | `approved-unmerged` | open PR approved by the required human on its current head, CI green, not merged for `approved_unmerged_after` | Every sweep asked "does any open PR have the human reviewer's approval on its current head?" |
 | `changes-requested-stale` | our PR with `CHANGES_REQUESTED` or unresolved threads older than `respond_after` and no newer push | Loose-ends bucket 2: respond before the reviewer has to ask again |
 | `no-review-loop` | our PR in a rig with `pr_reviewer` configured, open longer than `review_loop_after`, with no review from that login | "If no internal reviewer loop has been performed, start one" |
-| `ci-failing` | open PR whose latest check suite failed for `ci_failing_after` and has no open fix bead — the bead `mol-pr-feedback-patrol` creates, labelled `pr-num-<N>` (title "Fix CI failure on PR #<N>") | The town already dispatches CI fixes through the PR-feedback patrol; reporting a PR that a polecat is fixing invites the duplicate review-fix dispatch the town has suffered from. (`github-sheriff` records only ephemeral plugin-run summaries; it is not a dedup source.) |
+| `ci-failing` | open PR whose latest check suite failed for `ci_failing_after` and has no open fix bead in the PR's rig carrying both the `pr-num-<N>` label and the CI-fix type label (`mol-pr-feedback-patrol` labels its beads; dedup is on labels only, never on titles, which embed the attacker-controlled PR title; `pr-num-<N>` alone also marks review-fix beads, so the type label is required) | The town already dispatches CI fixes through the PR-feedback patrol; reporting a PR that a polecat is fixing invites the duplicate review-fix dispatch the town has suffered from. (`github-sheriff` records only ephemeral plugin-run summaries; it is not a dedup source.) |
 | `release-unclosed` | merged PR into one of the repo's release branches (per-repo config, default `release/*`) in the last `release_window`, where no tag is reachable from the merge commit | Release-wave phases 4–5 are the ones that quietly stall |
 | `draft-stale` | our draft PR with no push for `stale_after` | Abandoned work hides in drafts |
 
@@ -516,7 +535,8 @@ which already mail the assistant; the port does not duplicate them.
    `gt assistant sweep`; note the run ID.
 2. Compose the `SWEEP:` mail from the report: new findings in full, standing
    counts, port errors stated as "not checked: <reason>", fenced blocks
-   carried verbatim, suggestions only from the report's `Suggest` lines.
+   carried with every `> ` prefix intact, suggestions only from the
+   report's `Suggest` lines.
 3. Send it to `mayor/`; then `gt assistant sweep --ack <run-id>`.
 4. If step 3 fails, do not ack; the next sweep reports everything again.
 
