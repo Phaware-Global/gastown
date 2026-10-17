@@ -324,11 +324,13 @@ type Finding struct {
 `Fields` is a **closed, per-key allowlist**: each port declares the keys it
 may emit and the exact shape of each value — integers, RFC 3339 timestamps,
 40-hex SHAs, Jira account IDs (`^\d+:[0-9a-f-]{36}$` or `^[0-9a-f]{24}$`),
-GitHub logins (`^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$`, so no
-leading `-` and no hyphenated prose), and enum states the port maps to its
-own constants (`approved`, `changes_requested`, `failing`). Every shape has a
-length cap. A value that fails its key's shape, or any key the port did not
-declare, is moved to `External`, never printed as a field. Branch and ref names, check-run
+GitHub logins (`^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$`, at most 39 characters, so
+never a leading `-`), and enum states the port maps to its own constants
+(`approved`, `changes_requested`, `failing`). Every shape has a length cap.
+A value that fails its key's shape, or any key the port did not declare, is
+moved to `External`, never printed as a field. A login is self-chosen text
+even when it fits the shape, so only the persona's and listed humans'
+logins ever appear in `Suggest`; any other login is `External`. Branch and ref names, check-run
 and job names, Jira status and tag names, labels, titles, comment bodies,
 and every display name are `External` by definition — all of them are
 typed by people (a PR author chooses the job names in the head's workflow
@@ -517,7 +519,7 @@ GitHub identity; there is no separate agent login).
 | `approved-unmerged` | open PR approved by the required human on its current head, CI green, not merged for `approved_unmerged_after` | Every sweep asked "does any open PR have the human reviewer's approval on its current head?" |
 | `changes-requested-stale` | our PR with `CHANGES_REQUESTED` or unresolved threads older than `respond_after` and no newer push | Loose-ends bucket 2: respond before the reviewer has to ask again |
 | `no-review-loop` | our PR in a rig with `pr_reviewer` configured, open longer than `review_loop_after`, with no review from that login | "If no internal reviewer loop has been performed, start one" |
-| `ci-failing` | open PR whose latest check suite failed for `ci_failing_after` and has no open bead in the PR's rig labelled both `pr-num-<N>` and `pr-feedback-patrol` — the PR-feedback patrol's own dedup key. That is sufficient because the patrol never opens a second bead (CI-fix or review-fix) for a PR while one is open: any open patrol bead means a polecat already owns that PR. Dedup is on labels only, never on titles, which embed the attacker-controlled PR title | The town already dispatches CI fixes through the PR-feedback patrol; reporting a PR that a polecat is fixing invites the duplicate review-fix dispatch the town has suffered from. (`github-sheriff` records only ephemeral plugin-run summaries; it is not a dedup source.) |
+| `ci-failing` | open PR whose latest check suite failed for `ci_failing_after` and has no **non-closed** bead (`open`, `hooked`, `in_progress`, `blocked`) in the PR's rig labelled both `pr-num-<N>` and `pr-feedback-patrol`. This is deliberately wider than the patrol's own `--status open` dedup query: `gt sling` moves a fresh patrol bead to `hooked` and the polecat to `in_progress`, so a PR being fixed never has an *open* patrol bead. Any non-closed patrol bead means a polecat owns that PR. Dedup is on labels only, never on titles, which embed the attacker-controlled PR title | The town already dispatches CI fixes through the PR-feedback patrol; reporting a PR that a polecat is fixing invites the duplicate review-fix dispatch the town has suffered from. (`github-sheriff` records only ephemeral plugin-run summaries; it is not a dedup source.) |
 | `release-unclosed` | merged PR into one of the repo's release branches (per-repo config, default `release/*`) in the last `release_window`, where no tag is reachable from the merge commit | Release-wave phases 4–5 are the ones that quietly stall |
 | `draft-stale` | our draft PR with no push for `stale_after` | Abandoned work hides in drafts |
 
