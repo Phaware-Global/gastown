@@ -603,6 +603,50 @@ func TestPurgeClosedWispsProtectsUnmergedMRWisps(t *testing.T) {
 	}
 }
 
+// TestPurgeClosedWispsKeepsParentsOfOpenChildren: a closed molecule root past
+// the purge cutoff survives while any step is still open, so the step keeps
+// its parent-child row and stays reachable by Reap. Once the steps close the
+// root is purged normally (gt-wuinx).
+func TestPurgeClosedWispsKeepsParentsOfOpenChildren(t *testing.T) {
+	now := time.Now().UTC()
+	oldEnough := now.Add(-10 * 24 * time.Hour)
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"mol-open-step":    {id: "mol-open-step", status: "closed", issueType: "molecule", closedAt: oldEnough},
+			"mol-hooked-step":  {id: "mol-hooked-step", status: "closed", issueType: "molecule", closedAt: oldEnough},
+			"mol-closed-steps": {id: "mol-closed-steps", status: "closed", issueType: "molecule", closedAt: oldEnough},
+			"step-open":        {id: "step-open", status: "open", issueType: "task"},
+			"step-hooked":      {id: "step-hooked", status: "hooked", issueType: "task"},
+			"step-closed":      {id: "step-closed", status: "closed", issueType: "task", closedAt: now},
+		},
+		deps: []fakeDep{
+			{issueID: "step-open", dependsOnID: "mol-open-step", depType: "parent-child"},
+			{issueID: "step-hooked", dependsOnID: "mol-hooked-step", depType: "parent-child"},
+			{issueID: "step-closed", dependsOnID: "mol-closed-steps", depType: "parent-child"},
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	purged, _, err := purgeClosedWisps(db, "testdb", 7*24*time.Hour, false)
+	if err != nil {
+		t.Fatalf("purgeClosedWisps: %v", err)
+	}
+	if purged != 1 {
+		t.Fatalf("purged = %d, want 1 (only the molecule whose steps are all closed)", purged)
+	}
+	remaining := state.statuses()
+	for _, id := range []string{"mol-open-step", "mol-hooked-step"} {
+		if _, ok := remaining[id]; !ok {
+			t.Errorf("%s has an open step and must survive purge", id)
+		}
+	}
+	if _, ok := remaining["mol-closed-steps"]; ok {
+		t.Error("mol-closed-steps has only closed steps and should have been purged")
+	}
+}
+
 func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	now := time.Now().UTC()
 	state := &fakeReaperState{
@@ -1360,6 +1404,20 @@ func (s *fakeReaperState) hasParentLocked(id string) bool {
 	return false
 }
 
+// hasOpenChildLocked reports whether any open wisp has a parent-child row
+// pointing at id. Mirrors purgeableParentJoin.
+func (s *fakeReaperState) hasOpenChildLocked(id string) bool {
+	for _, dep := range s.deps {
+		if dep.dependsOnID != id || dep.depType != "parent-child" {
+			continue
+		}
+		if child := s.wisps[dep.issueID]; child != nil && isOpenWispStatus(child.status) {
+			return true
+		}
+	}
+	return false
+}
+
 // purgeCandidatesLocked returns closed wisps past cutoff, excluding agent
 // wisps by the same isAgentWisp() check every other eligibility helper here
 // uses — mirrors purgeClosedWisps' real query so the fake can assert on
@@ -1371,6 +1429,9 @@ func (s *fakeReaperState) purgeCandidatesLocked(cutoff time.Time) []*fakeWisp {
 			continue
 		}
 		if w.isProtectedMRWisp(time.Now().UTC()) {
+			continue
+		}
+		if s.hasOpenChildLocked(w.id) {
 			continue
 		}
 		wisps = append(wisps, w)
@@ -1757,6 +1818,12 @@ func validateWAliasedAgentGuard(query string) error {
 			"w.closed_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)",
 		); err != nil {
 			return fmt.Errorf("purge query missing merge-request guard: %w", err)
+		}
+		if err := requireSQL(query,
+			"open_child.status IN ('open', 'hooked', 'in_progress')",
+			"open_children.parent_id IS NULL",
+		); err != nil {
+			return fmt.Errorf("purge query missing open-children guard: %w", err)
 		}
 	}
 	return requireSQL(query,

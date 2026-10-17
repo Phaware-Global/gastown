@@ -294,6 +294,31 @@ func purgeableMRWispJoin(alias string) (joinClause, whereCondition string) {
 	return
 }
 
+// purgeableParentJoin returns the join and WHERE condition that keep a closed
+// wisp out of a purge while any of its parent-child children is still open.
+// alias is the wisps table alias.
+//
+// Purging a wisp also removes the inbound wisp_dependencies rows that point at it. A closed molecule root purged while its steps are still open would
+// strip their only parent-child row, leaving them "unparented": Reap's
+// max-age allowlist requires a parent-child row and the closed-molecule-step
+// path requires the parent row, so no reap path would ever close them again.
+// Deferring the parent until its children close keeps those paths reachable.
+//
+// Anti-join, not correlated NOT EXISTS, for the same O(n+m) reason as
+// parentExcludeJoin.
+func purgeableParentJoin(alias string) (joinClause, whereCondition string) {
+	joinClause = fmt.Sprintf(`LEFT JOIN (
+		SELECT DISTINCT wd.depends_on_wisp_id AS parent_id
+		FROM wisp_dependencies wd
+		INNER JOIN wisps open_child ON open_child.id = wd.issue_id
+		WHERE wd.type = 'parent-child'
+		AND wd.depends_on_wisp_id IS NOT NULL
+		AND open_child.status IN ('open', 'hooked', 'in_progress')
+	) open_children ON open_children.parent_id = %s.id`, alias)
+	whereCondition = "open_children.parent_id IS NULL"
+	return
+}
+
 // staleIssueExemptLabelsSQL returns the SQL IN-list of labels that exempt an
 // issue from staleness sweeps: the pre-existing standing-order/protection
 // labels plus gt:agent, the label-based marker for agent identity beads.
@@ -525,16 +550,18 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	}
 
 	// Count purge candidates: closed wisps past purge_age.
-	// No parent check needed — closed wisps past the delete age are unconditionally purgeable.
-	// The parent check (correlated subqueries on wisp_dependencies) was causing O(n*m) query
-	// cost with 1800+ closed wisps, leading to CPU spikes and connection timeouts (gt-wvd2).
+	// Closed wisps past the delete age are purgeable unless they still have open
+	// children (purgeableParentJoin, gt-wuinx). That guard must match
+	// purgeClosedWisps' exactly, and stays an anti-join: the correlated subqueries
+	// once used here caused O(n*m) cost, CPU spikes and connection timeouts (gt-wvd2).
 	// Agent guard must match purgeClosedWisps' own guard exactly, or this count and Purge
 	// diverge the same way reap/scan used to: PurgeCandidates > 0 forever with purged = 0
 	// once an agent wisp is closed (gt-7a7j, gt-h8oq).
 	mrJoin, mrWhere := purgeableMRWispJoin("w")
+	childJoin, childWhere := purgeableParentJoin("w")
 	purgeQuery := fmt.Sprintf(
-		"SELECT COUNT(*) FROM wisps w %s %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s AND %s",
-		agentJoin, mrJoin, agentWhere, mrWhere)
+		"SELECT COUNT(*) FROM wisps w %s %s %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s AND %s AND %s",
+		agentJoin, mrJoin, childJoin, agentWhere, mrWhere, childWhere)
 	if err := db.QueryRowContext(ctx, purgeQuery, now.Add(-purgeAge)).Scan(&result.PurgeCandidates); err != nil {
 		return nil, fmt.Errorf("count purge candidates: %w", err)
 	}
@@ -804,9 +831,12 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	var anomalies []Anomaly
 
 	// Digest: count by wisp_type.
-	// No parent check — closed wisps past the delete age are unconditionally purgeable.
-	// The parent check (correlated subqueries on wisp_dependencies) was causing O(n*m)
-	// query cost with 1800+ closed wisps, leading to CPU spikes and timeouts (gt-wvd2).
+	// No check on a candidate's own parents. The only parentage guard is
+	// purgeableParentJoin, which keeps a closed parent whose children are still
+	// open: purging it would delete those children's parent-child rows and make
+	// them permanently unreapable (gt-wuinx). It is an anti-join; the correlated
+	// subqueries once used for parent checks caused O(n*m) query cost with 1800+
+	// closed wisps, leading to CPU spikes and timeouts (gt-wvd2).
 	// Agent identity beads ARE excluded, unlike the parent check above: closed wisps
 	// past purgeAge are hard-deleted (wisp_labels/wisp_events included), and Reap's
 	// guard only stops a wisp-backed agent bead from being closed in the first place —
@@ -883,17 +913,19 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 func purgeDigestQuery() string {
 	agentJoin, agentWhere := notAgentWispJoin("w")
 	mrJoin, mrWhere := purgeableMRWispJoin("w")
+	childJoin, childWhere := purgeableParentJoin("w")
 	return fmt.Sprintf(
-		"SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w %s %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s AND %s GROUP BY wtype",
-		agentJoin, mrJoin, agentWhere, mrWhere)
+		"SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w %s %s %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s AND %s AND %s GROUP BY wtype",
+		agentJoin, mrJoin, childJoin, agentWhere, mrWhere, childWhere)
 }
 
 func purgeBatchIDQuery() string {
 	agentJoin, agentWhere := notAgentWispJoin("w")
 	mrJoin, mrWhere := purgeableMRWispJoin("w")
+	childJoin, childWhere := purgeableParentJoin("w")
 	return fmt.Sprintf(
-		"SELECT w.id FROM wisps w %s %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s AND %s LIMIT %d",
-		agentJoin, mrJoin, agentWhere, mrWhere, DefaultBatchSize)
+		"SELECT w.id FROM wisps w %s %s %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s AND %s AND %s LIMIT %d",
+		agentJoin, mrJoin, childJoin, agentWhere, mrWhere, childWhere, DefaultBatchSize)
 }
 
 func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun bool) (int, error) {
