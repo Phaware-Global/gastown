@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The variants are bd's own wording (store.go, doltserver.go); the first is the
@@ -189,5 +190,61 @@ func TestRelayStderr_LeavesCallerWriterAlone(t *testing.T) {
 	RelayStderr(c)()
 	if c.Stderr != &buf {
 		t.Fatal("RelayStderr replaced a caller-supplied stderr")
+	}
+}
+
+// A bd that leaves a long-lived child holding its stderr (an auto-started dolt
+// sql-server) must not keep the relay waiting once bd itself has exited.
+func stubBdWithLingeringChild() *exec.Cmd {
+	return exec.Command("sh", "-c", "sleep 4 >/dev/null & echo bd-done >&2")
+}
+
+func assertReturnsPromptly(t *testing.T, name string, run func() error) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- run() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("%s: exit 0 with a lingering child reported %v", name, err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("%s still blocked 2s after bd exited: a child holding stderr hangs the relay", name)
+	}
+}
+
+func TestRunRelayed_LingeringChildDoesNotHang(t *testing.T) {
+	assertReturnsPromptly(t, "RunRelayed", func() error {
+		return RunRelayed(stubBdWithLingeringChild())
+	})
+}
+
+func TestOutputRelayed_LingeringChildDoesNotHang(t *testing.T) {
+	assertReturnsPromptly(t, "OutputRelayed", func() error {
+		_, err := OutputRelayed(stubBdWithLingeringChild())
+		return err
+	})
+}
+
+func TestRelayStderr_LingeringChildDoesNotHang(t *testing.T) {
+	assertReturnsPromptly(t, "RelayStderr", func() error {
+		c := stubBdWithLingeringChild()
+		c.Stderr = os.Stderr
+		defer RelayStderr(c)()
+		return TrimWaitDelay(c.Run())
+	})
+}
+
+// A failing bd keeps its own error; only the "I/O still open" report is dropped.
+func TestTrimWaitDelay(t *testing.T) {
+	if err := TrimWaitDelay(exec.ErrWaitDelay); err != nil {
+		t.Errorf("ErrWaitDelay not dropped: %v", err)
+	}
+	exit := exec.Command("sh", "-c", "exit 3").Run()
+	if got := TrimWaitDelay(exit); got != exit {
+		t.Errorf("exit error changed: %v", got)
+	}
+	if TrimWaitDelay(nil) != nil {
+		t.Error("nil changed")
 	}
 }

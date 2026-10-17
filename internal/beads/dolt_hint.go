@@ -2,10 +2,12 @@ package beads
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // DoltStartGuidance replaces bd's "run bd dolt start" advice in anything gt
@@ -108,17 +110,40 @@ func (h *HintWriter) emit(line, eol string) error {
 	return err
 }
 
+// relayWaitDelay bounds how long Wait lingers on the stderr copy after bd exits.
+// Wrapping stderr makes exec create a pipe, and Wait does not return until every
+// holder of that pipe closes it: bd can leave a long-lived child (an auto-started
+// dolt sql-server) holding it, which would hang the gt command indefinitely.
+const relayWaitDelay = time.Second
+
 // RelayStderr swaps a c.Stderr that is os.Stderr for a HintWriter around it and
 // returns the flush to call once c has exited. Any other stderr (a buffer, a
 // discard) is left alone: those callers capture the output and format it
 // themselves, which is where RedirectDoltStartHint applies instead.
+//
+// A wrapped command gets c.WaitDelay (unless the caller set one), so when bd
+// exits successfully but a child still holds stderr, Wait reports
+// exec.ErrWaitDelay; pass the result through TrimWaitDelay.
 func RelayStderr(c *exec.Cmd) (flush func()) {
 	if f, ok := c.Stderr.(*os.File); !ok || f != os.Stderr {
 		return func() {}
 	}
+	if c.WaitDelay == 0 {
+		c.WaitDelay = relayWaitDelay
+	}
 	h := NewHintWriter(os.Stderr)
 	c.Stderr = h
 	return func() { _ = h.Flush() }
+}
+
+// TrimWaitDelay drops exec.ErrWaitDelay, which Wait returns for a command that
+// exited successfully while a child it started still held a pipe open. The
+// command itself succeeded; any other error is returned unchanged.
+func TrimWaitDelay(err error) error {
+	if errors.Is(err, exec.ErrWaitDelay) {
+		return nil
+	}
+	return err
 }
 
 // RunRelayed runs c with its stderr relayed to os.Stderr, minus bd's
@@ -126,13 +151,14 @@ func RelayStderr(c *exec.Cmd) (flush func()) {
 // bd command.
 func RunRelayed(c *exec.Cmd) error {
 	defer relayByDefault(c)()
-	return c.Run()
+	return TrimWaitDelay(c.Run())
 }
 
 // OutputRelayed is RunRelayed for a command whose stdout the caller reads.
 func OutputRelayed(c *exec.Cmd) ([]byte, error) {
 	defer relayByDefault(c)()
-	return c.Output()
+	out, err := c.Output()
+	return out, TrimWaitDelay(err)
 }
 
 func relayByDefault(c *exec.Cmd) func() {

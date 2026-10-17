@@ -269,7 +269,7 @@ func (b *bdCmd) Run() error {
 	defer cancel()
 	cmd := b.buildContextCommand(ctx)
 	defer beads.RelayStderr(cmd)()
-	return b.wrapCommandError(ctx, cmd.Run(), deadline)
+	return b.wrapCommandError(ctx, beads.TrimWaitDelay(cmd.Run()), deadline)
 }
 
 // Output builds and runs the command, returning stdout and any error.
@@ -283,7 +283,7 @@ func (b *bdCmd) Output() ([]byte, error) {
 	cmd := b.buildContextCommand(ctx)
 	defer beads.RelayStderr(cmd)()
 	out, err := cmd.Output()
-	return out, b.wrapCommandError(ctx, err, deadline)
+	return out, b.wrapCommandError(ctx, beads.TrimWaitDelay(err), deadline)
 }
 
 // CombinedOutput builds and runs the command, returning combined stdout+stderr.
