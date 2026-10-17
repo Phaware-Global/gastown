@@ -711,7 +711,7 @@ func (b *Beads) Run(args ...string) ([]byte, error) {
 // Exception: ErrNotInstalled (exec.ErrNotFound) and ErrNotFound (issue lookup) are
 // acceptable as they enable basic error handling without decision-making.
 func (b *Beads) wrapError(err error, stderr string, args []string) error {
-	stderr = strings.TrimSpace(stderr)
+	stderr = RedirectDoltStartHint(strings.TrimSpace(stderr))
 
 	// Check for bd not installed
 	if execErr, ok := err.(*exec.Error); ok && errors.Is(execErr.Err, exec.ErrNotFound) {
