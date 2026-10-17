@@ -2390,9 +2390,10 @@ type DetectStalledPolecatsResult struct {
 //   - Its last tmux activity is older than StartupActivityGrace (60s)
 //
 // When a startup stall is detected, DismissStartupDialogsBlind is called to
-// send blind key sequences that dismiss known blocking dialogs (workspace trust,
-// bypass permissions) without screen-scraping pane content. This avoids coupling
-// to third-party TUI strings that can change with any Claude Code update.
+// dismiss known blocking dialogs (workspace trust, bypass permissions). It reads
+// the dialog's rendered options and selects "Yes" by text, because the option
+// order changes between Claude Code releases (2.1.299 pre-selects "No, exit");
+// a dialog it cannot interpret is reported as an escalation, never guessed at.
 func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult {
 	result := &DetectStalledPolecatsResult{}
 
@@ -2475,8 +2476,7 @@ func DetectStalledPolecats(workDir, rigName string) *DetectStalledPolecatsResult
 		}
 
 		// Session is old enough and has no recent activity: startup stall.
-		// Send blind key sequences to dismiss any startup dialogs without
-		// screen-scraping pane content (avoids coupling to third-party TUI strings).
+		// Dismiss any visible startup dialog by selecting its "Yes" option.
 		stalled := StalledResult{
 			PolecatName: polecatName,
 			StallType:   "startup-stall",
