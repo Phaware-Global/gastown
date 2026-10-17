@@ -171,24 +171,29 @@ func (t *Transformer) maybeNudge(_ *telegraph.NormalizedEvent) {
 	t.log.NudgeSent()
 }
 
+// operatorPolicyHeading is the section heading the Mayor's Assistant uses
+// when it relays a genuine OPERATOR PROMPT block to the Mayor. External text
+// must not be able to smuggle that heading through a briefing.
+const operatorPolicyHeading = "operator policy (from telegraph config)"
+
 // neutralizeDelimiters defuses trust-delimiter lines inside external text so
-// a provider comment cannot close its own EXTERNAL CONTENT block (or open a
-// fake OPERATOR PROMPT) and have the tail read as trusted. Any line that
-// starts with "---" and names either delimiter is prefixed with a visible
-// marker, which keeps the text readable but stops it matching the real
-// delimiters emitted around it.
+// a provider comment cannot close its own EXTERNAL CONTENT block, open a fake
+// OPERATOR PROMPT, or forge the assistant's "Operator policy" heading and
+// have the tail read as trusted. Any line that starts with "---" and names
+// either delimiter, or that contains the operator-policy heading, is prefixed
+// with a visible marker, which keeps the text readable but stops it matching
+// the real delimiters and headings emitted around it.
 func neutralizeDelimiters(text string) string {
-	if !strings.Contains(text, "---") {
+	if !strings.Contains(text, "---") && !strings.Contains(strings.ToLower(text), operatorPolicyHeading) {
 		return text
 	}
 	lines := strings.Split(text, "\n")
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "---") {
-			continue
-		}
 		upper := strings.ToUpper(trimmed)
-		if strings.Contains(upper, "EXTERNAL CONTENT") || strings.Contains(upper, "OPERATOR PROMPT") {
+		delimiter := strings.HasPrefix(trimmed, "---") &&
+			(strings.Contains(upper, "EXTERNAL CONTENT") || strings.Contains(upper, "OPERATOR PROMPT"))
+		if delimiter || strings.Contains(strings.ToLower(trimmed), operatorPolicyHeading) {
 			lines[i] = "[neutralized delimiter] " + line
 		}
 	}
