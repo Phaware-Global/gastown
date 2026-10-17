@@ -117,17 +117,27 @@ func validateCrewName(name string) error {
 	if strings.Contains(name, "..") {
 		return fmt.Errorf("%w: %q contains path traversal sequence", ErrInvalidCrewName, name)
 	}
-	// Reject town-level role names: a crew member called "mayor" or
-	// "assistant" would collide with those roles' addresses and directories.
-	switch strings.ToLower(name) {
-	case "mayor", "assistant", "deacon":
-		return fmt.Errorf("%w: %q is reserved for a town-level role", ErrInvalidCrewName, name)
-	}
 	// Reject characters that break agent ID parsing (same as rig names)
 	if strings.ContainsAny(name, "-. ") {
 		sanitized := strings.NewReplacer("-", "_", ".", "_", " ", "_").Replace(name)
 		sanitized = strings.ToLower(sanitized)
 		return fmt.Errorf("%w: %q contains invalid characters; hyphens, dots, and spaces are reserved for agent ID parsing. Try %q instead", ErrInvalidCrewName, name, sanitized)
+	}
+	return nil
+}
+
+// validateNewCrewName applies validateCrewName plus the rules that only
+// matter when a name is being created (Add, Rename target): town-level role
+// names are reserved, because a crew member called "mayor" or "assistant"
+// would collide with that role's address and directory. Existing members
+// that predate the reservation stay manageable through the plain validator.
+func validateNewCrewName(name string) error {
+	if err := validateCrewName(name); err != nil {
+		return err
+	}
+	switch strings.ToLower(name) {
+	case "mayor", "assistant", "deacon":
+		return fmt.Errorf("%w: %q is reserved for a town-level role", ErrInvalidCrewName, name)
 	}
 	return nil
 }
@@ -186,7 +196,7 @@ func (m *Manager) lockCrew(name string) (*flock.Flock, error) {
 
 // Add creates a new crew worker with a clone of the rig.
 func (m *Manager) Add(name string, createBranch bool) (*CrewWorker, error) {
-	if err := validateCrewName(name); err != nil {
+	if err := validateNewCrewName(name); err != nil {
 		return nil, err
 	}
 	fl, err := m.lockCrew(name)
@@ -570,7 +580,7 @@ func (m *Manager) loadState(name string) (*CrewWorker, error) {
 
 // Rename renames a crew worker from oldName to newName.
 func (m *Manager) Rename(oldName, newName string) error {
-	if err := validateCrewName(newName); err != nil {
+	if err := validateNewCrewName(newName); err != nil {
 		return err
 	}
 	// Lock both names in alphabetical order to prevent deadlock.
