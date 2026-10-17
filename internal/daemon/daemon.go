@@ -61,6 +61,10 @@ type Daemon struct {
 	curator       *feed.Curator
 	convoyManager *ConvoyManager
 	beadsStores   map[string]beadsdk.Storage
+	// capReliefInFlight holds the rig names with a cap-relief cleanup still running,
+	// so a slow cleanup is never launched twice concurrently (see
+	// reapRigStalePolecatDirsNearCap).
+	capReliefInFlight sync.Map
 	// storesMu guards beadsStores. Two writers exist: the synchronous
 	// initialization in Run() (before the convoy goroutine starts) and the
 	// lazy storeOpener callback (called from the convoy poll goroutine when
@@ -3521,23 +3525,17 @@ func shouldReapForCapRelief(dirCount, cap int) bool {
 // hits its cap and fresh spawns are refused before a worktree is even created. This
 // trims the pool only when near the cap — idle dirs are otherwise left for reuse.
 func (d *Daemon) reapStalePolecatDirsNearCap() {
-	d.rigPool.runPerRig(d.ctx, d.getKnownRigs(), func(ctx context.Context, rigName string) error {
-		d.reapRigStalePolecatDirsNearCap(ctx, rigName)
+	d.rigPool.runPerRig(d.ctx, d.getKnownRigs(), func(_ context.Context, rigName string) error {
+		d.reapRigStalePolecatDirsNearCap(rigName)
 		return nil
 	})
 }
 
-func (d *Daemon) reapRigStalePolecatDirsNearCap(ctx context.Context, rigName string) {
+func (d *Daemon) reapRigStalePolecatDirsNearCap(rigName string) {
 	polecatsDir := filepath.Join(d.config.TownRoot, rigName, "polecats")
-	entries, err := os.ReadDir(polecatsDir)
+	dirCount, err := polecat.CountPolecatDirs(polecatsDir)
 	if err != nil {
 		return // no polecats directory
-	}
-	dirCount := 0
-	for _, e := range entries {
-		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
-			dirCount++
-		}
 	}
 	// Cheap pre-filter: the floor (MinPolecatDirsPerRig) is the smallest possible cap,
 	// so below its relief threshold no rig can be near its cap. This runs every
@@ -3554,31 +3552,58 @@ func (d *Daemon) reapRigStalePolecatDirsNearCap(ctx context.Context, rigName str
 	}
 	d.logger.Printf("Rig %s at %d/%d polecat dirs — reaping stale polecats to relieve the directory cap",
 		rigName, dirCount, effectiveCap)
-	// Reap via `gt polecat stale --cleanup`. It reaps only polecats assessStaleness
-	// deems stale: session-less AND not paused (protected agent states) AND with no
-	// uncommitted or unpushed work (CleanExcludingBeads counts unpushed commits), and
-	// nukePolecatFull does a best-effort push and preserves the remote branch for the
-	// refinery. So no unpushed work is lost; a fully-pushed idle polecat is reclaimed
-	// even if it has an open MR (the MR branch survives on the remote). Uses the
-	// established gt-shellout pattern and the per-rig worker ctx so the pool bounds it.
-	// The RigWorkerPool already gives each rig a bounded context (defaultRigTimeout,
-	// 30s), so use it directly — a longer inner timeout could never fire. A cleanup cut
-	// short by the deadline simply resumes on the next heartbeat.
+	// A cleanup walks every polecat directory (tmux, git status, rev-list and an agent
+	// bead lookup each) and then nukes the stale ones, which takes minutes on a rig at
+	// its cap. The per-rig worker ctx (defaultRigTimeout, 30s) killed it every time
+	// before a single directory was reclaimed, so the rig never got relief. Run it in
+	// the background under its own deadline instead, single-flighted per rig so the
+	// heartbeat neither blocks on it nor stacks a second cleanup behind a slow one.
+	if _, running := d.capReliefInFlight.LoadOrStore(rigName, struct{}{}); running {
+		return
+	}
+	parent := d.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	go func() {
+		defer d.capReliefInFlight.Delete(rigName)
+		d.runCapReliefCleanup(parent, rigName)
+	}()
+}
+
+// capReliefCleanupTimeout bounds one background cap-relief cleanup. A cleanup cut
+// short by it resumes on a later heartbeat, because the dirs it already nuked no
+// longer count toward the cap.
+const capReliefCleanupTimeout = 10 * time.Minute
+
+// runCapReliefCleanup reaps via `gt polecat stale --cleanup`. It reaps only polecats
+// assessStaleness deems stale: session-less AND not paused (protected agent states)
+// AND with no uncommitted or unpushed work (CleanExcludingBeads counts unpushed
+// commits), and nukePolecatFull does a best-effort push and preserves the remote
+// branch for the refinery. So no unpushed work is lost; a fully-pushed idle polecat
+// is reclaimed even if it has an open MR (the MR branch survives on the remote).
+func (d *Daemon) runCapReliefCleanup(parent context.Context, rigName string) {
+	ctx, cancel := context.WithTimeout(parent, capReliefCleanupTimeout)
+	defer cancel()
 	cmd := exec.CommandContext(ctx, d.gtPath, "polecat", "stale", rigName, "--cleanup") //nolint:gosec // G204: args are constructed internally
 	cmd.Dir = d.config.TownRoot
 	util.SetDetachedProcessGroup(cmd)
 	// The detached process group means the ctx-kill only signals the top gt pid, and
 	// CombinedOutput can then block on the pipe a git grandchild still holds. WaitDelay
 	// bounds that: after the deadline fires, Wait abandons the process and its pipes
-	// within WaitDelay so a hung child can't stall the heartbeat worker indefinitely.
+	// within WaitDelay so a hung child can't leak this goroutine (and its in-flight
+	// slot) indefinitely.
 	cmd.WaitDelay = 10 * time.Second
-	if out, err := cmd.CombinedOutput(); err != nil {
+	out, err := cmd.CombinedOutput()
+	if err != nil {
 		msg := string(out)
 		if len(msg) > 500 {
-			msg = msg[:500]
+			msg = msg[len(msg)-500:]
 		}
 		d.logger.Printf("Warning: cap-relief cleanup for rig %s failed: %v\n%s", rigName, err, msg)
+		return
 	}
+	d.logger.Printf("Cap-relief cleanup for rig %s finished", rigName)
 }
 
 // resolveRigPolecatCap returns the effective polecat-directory cap for a rig
