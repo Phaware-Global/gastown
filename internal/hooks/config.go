@@ -914,7 +914,7 @@ func DiscoverTargets(townRoot string) ([]Target, error) {
 	}
 
 	for _, entry := range entries {
-		if !entry.IsDir() || entry.Name() == "mayor" || entry.Name() == "deacon" ||
+		if !entry.IsDir() || entry.Name() == "mayor" || entry.Name() == "assistant" || entry.Name() == "deacon" ||
 			entry.Name() == ".beads" || strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
@@ -1005,7 +1005,7 @@ func DiscoverRoleLocations(townRoot string) ([]RoleLocation, error) {
 	var locations []RoleLocation
 
 	// Town-level roles
-	for _, role := range []string{"mayor", "deacon"} {
+	for _, role := range []string{"mayor", "assistant", "deacon"} {
 		dir := filepath.Join(townRoot, role)
 		if info, err := os.Stat(dir); err == nil && info.IsDir() {
 			locations = append(locations, RoleLocation{Dir: dir, Role: role})
@@ -1019,7 +1019,7 @@ func DiscoverRoleLocations(townRoot string) ([]RoleLocation, error) {
 	}
 
 	for _, entry := range entries {
-		if !entry.IsDir() || entry.Name() == "mayor" || entry.Name() == "deacon" ||
+		if !entry.IsDir() || entry.Name() == "mayor" || entry.Name() == "assistant" || entry.Name() == "deacon" ||
 			entry.Name() == ".beads" || strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
@@ -1313,7 +1313,7 @@ func NormalizeTarget(target string) (string, bool) {
 
 	validRoles := map[string]bool{
 		"crew": true, "witness": true, "refinery": true,
-		"polecats": true, "mayor": true, "deacon": true,
+		"polecats": true, "mayor": true, "assistant": true, "deacon": true,
 		"reviewer": true,
 	}
 

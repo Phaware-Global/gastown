@@ -71,7 +71,7 @@ func (m *Manager) Start(agentOverride string) error {
 	// upgraded with such a rig must rename it first.
 	if rigs, err := config.LoadRigsConfig(constants.MayorRigsPath(m.townRoot)); err == nil && rigs != nil {
 		if _, taken := rigs.Rigs[constants.RoleAssistant]; taken {
-			return fmt.Errorf("a rig named %q is registered in rigs.json; rename it before starting the Mayor's Assistant (its work dir is <town>/%s)", constants.RoleAssistant, constants.RoleAssistant)
+			return fmt.Errorf("a rig named %q is registered in rigs.json; that name is reserved for the Mayor's Assistant (work dir <town>/%s) and the rig has been excluded from town-root scans since this gt version was installed — rename the rig, then start the assistant", constants.RoleAssistant, constants.RoleAssistant)
 		}
 	}
 
