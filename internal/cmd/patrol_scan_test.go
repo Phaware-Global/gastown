@@ -221,3 +221,13 @@ func TestPatrolScanZombieItemSerialization(t *testing.T) {
 		t.Errorf("Error = %q, want %q", parsed.Error, "restart failed: tmux error")
 	}
 }
+
+func TestPatrolScanNoRestartFlagRegistered(t *testing.T) {
+	f := patrolScanCmd.Flags().Lookup("no-restart")
+	if f == nil {
+		t.Fatal("gt patrol scan has no --no-restart flag")
+	}
+	if f.DefValue != "false" {
+		t.Errorf("--no-restart default = %q, want false (restart stays the default)", f.DefValue)
+	}
+}

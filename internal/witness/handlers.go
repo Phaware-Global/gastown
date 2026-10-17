@@ -1161,6 +1161,24 @@ func RestartPolecatSession(workDir, rigName, polecatName string) error {
 	return nil
 }
 
+// restartPolecatSession is the restart call used by zombie detection; a var so
+// tests can observe whether a restart was attempted.
+var restartPolecatSession = RestartPolecatSession
+
+// DetectZombieOptions tunes DetectZombiePolecats.
+type DetectZombieOptions struct {
+	// NoRestart reports zombies without acting on their sessions or worktrees:
+	// no session restart and no archive-nuke of already-merged work. Used to
+	// enforce a detect-and-flag-only hold.
+	NoRestart bool
+}
+
+// restartSuppressedAction is the Action recorded for a zombie whose restart
+// was held back by DetectZombieOptions.NoRestart.
+func restartSuppressedAction(c ZombieClassification) string {
+	return fmt.Sprintf("detected-restart-suppressed (%s)", c)
+}
+
 // NukePolecat executes the actual nuke operation for a polecat.
 // This kills the tmux session, removes the worktree, and cleans up beads.
 // Refuses to nuke polecats with pending MRs in the refinery queue (gt-6a9d).
@@ -1721,7 +1739,7 @@ type ZombieResult struct {
 	HookBead       string
 	CleanupStatus  string // Observed cleanup_status (ZFC: report data, agent decides policy)
 	WasActive      bool   // true if evidence of recent work (active state or hooked bead)
-	Action         string // "restarted", "escalated", "cleanup-wisp-created", "auto-nuked" (explicit nuke only)
+	Action         string // "restarted", "escalated", "cleanup-wisp-created", "auto-nuked" (explicit nuke only), "detected-restart-suppressed" (NoRestart)
 	BeadRecovered  bool   // true if hooked bead was reset to open for re-dispatch
 	Error          error
 }
@@ -1764,6 +1782,13 @@ type DetectZombiePolecatsResult struct {
 //   - If git state is dirty (unpushed/uncommitted work): report cleanup_status,
 //     create cleanup wisp (witness agent decides escalation policy, gt-5rne)
 func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Router) *DetectZombiePolecatsResult {
+	return DetectZombiePolecatsWithOptions(bd, workDir, rigName, router, DetectZombieOptions{})
+}
+
+// DetectZombiePolecatsWithOptions is DetectZombiePolecats with caller-supplied
+// options. With opts.NoRestart, zombies are detected and reported but no
+// session is restarted (see DetectZombieOptions).
+func DetectZombiePolecatsWithOptions(bd *BdCli, workDir, rigName string, router *mail.Router, opts DetectZombieOptions) *DetectZombiePolecatsResult {
 	result := &DetectZombiePolecatsResult{}
 
 	townRoot, err := workspace.Find(workDir)
@@ -1842,13 +1867,13 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 				continue
 			}
 
-			if zombie, found := detectZombieLiveSession(bd, workDir, townRoot, rigName, polecatName, sessionName, t, doneIntent, witCfg, snap); found {
+			if zombie, found := detectZombieLiveSession(bd, workDir, townRoot, rigName, polecatName, sessionName, t, doneIntent, witCfg, snap, opts); found {
 				result.Zombies = append(result.Zombies, zombie)
 			}
 			continue // Either handled or not a zombie
 		}
 
-		if zombie, found := detectZombieDeadSession(bd, workDir, townRoot, rigName, polecatName, sessionName, t, doneIntent, detectedAt, witCfg, snap); found {
+		if zombie, found := detectZombieDeadSession(bd, workDir, townRoot, rigName, polecatName, sessionName, t, doneIntent, detectedAt, witCfg, snap, opts); found {
 			result.Zombies = append(result.Zombies, zombie)
 		}
 	}
@@ -1866,7 +1891,7 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 //
 // gt-dsgp: Uses restart-first policy. Instead of nuking polecats, restarts their
 // sessions to preserve worktrees and branches.
-func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName, sessionName string, t *tmux.Tmux, doneIntent *DoneIntent, witCfg *config.WitnessThresholds, snap *agentBeadSnapshot) (ZombieResult, bool) {
+func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName, sessionName string, t *tmux.Tmux, doneIntent *DoneIntent, witCfg *config.WitnessThresholds, snap *agentBeadSnapshot, opts DetectZombieOptions) (ZombieResult, bool) {
 	// gt-2gra: Agent state and hook bead are read from the pre-fetched snapshot
 	// instead of calling getAgentBeadState multiple times per code path.
 	snapState, snapHook := "", ""
@@ -1925,7 +1950,9 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 		if alive, _ := t.HasSession(sessionName); !alive {
 			return ZombieResult{}, false
 		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+		if opts.NoRestart {
+			zombie.Action = restartSuppressedAction(zombie.Classification)
+		} else if err := restartPolecatSession(workDir, rigName, polecatName); err != nil {
 			zombie.Error = err
 			zombie.Action = fmt.Sprintf("restart-stuck-session-failed: %v", err)
 		}
@@ -1948,7 +1975,9 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 		if alive, _ := t.HasSession(sessionName); !alive {
 			return ZombieResult{}, false
 		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+		if opts.NoRestart {
+			zombie.Action = restartSuppressedAction(zombie.Classification)
+		} else if err := restartPolecatSession(workDir, rigName, polecatName); err != nil {
 			zombie.Error = err
 			zombie.Action = fmt.Sprintf("restart-agent-dead-session-failed: %v", err)
 		}
@@ -1972,7 +2001,9 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 		if alive, _ := t.HasSession(sessionName); !alive {
 			return ZombieResult{}, false
 		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+		if opts.NoRestart {
+			zombie.Action = restartSuppressedAction(zombie.Classification)
+		} else if err := restartPolecatSession(workDir, rigName, polecatName); err != nil {
 			zombie.Error = err
 			zombie.Action = fmt.Sprintf("restart-bead-closed-failed: %v", err)
 		}
@@ -2102,7 +2133,7 @@ func hasSuccessfulSubmissionEvidence(snap *agentBeadSnapshot) bool {
 //
 // gt-dsgp: Uses restart-first policy. Instead of nuking polecats with dead sessions,
 // restarts them to preserve worktrees and branches.
-func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName, sessionName string, t *tmux.Tmux, doneIntent *DoneIntent, detectedAt time.Time, witCfg *config.WitnessThresholds, snap *agentBeadSnapshot) (ZombieResult, bool) {
+func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName, sessionName string, t *tmux.Tmux, doneIntent *DoneIntent, detectedAt time.Time, witCfg *config.WitnessThresholds, snap *agentBeadSnapshot, opts DetectZombieOptions) (ZombieResult, bool) {
 	// gt-2gra: Agent state and hook bead are read from the pre-fetched snapshot.
 	snapState, snapHook := "", ""
 	if snap != nil {
@@ -2160,7 +2191,9 @@ func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 			WasActive:      true,
 			Action:         fmt.Sprintf("restarted (done-intent age=%v, type=%s)", age.Round(time.Second), doneIntent.ExitType),
 		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+		if opts.NoRestart {
+			zombie.Action = restartSuppressedAction(zombie.Classification)
+		} else if err := restartPolecatSession(workDir, rigName, polecatName); err != nil {
 			zombie.Error = err
 			zombie.Action = fmt.Sprintf("restart-failed (done-intent): %v", err)
 		}
@@ -2226,7 +2259,7 @@ func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 	// gt-dsgp: Restart instead of nuking. For dirty state, escalate AND restart.
 	// gt-2gra: Use snapshot's cleanup status instead of calling getCleanupStatus.
 	cleanupStatus := snap.cleanupStatus()
-	handleZombieRestart(bd, workDir, rigName, polecatName, snapHook, cleanupStatus, &zombie)
+	handleZombieRestart(bd, workDir, rigName, polecatName, snapHook, cleanupStatus, &zombie, opts)
 	return zombie, true
 }
 
@@ -2252,9 +2285,17 @@ func isZombieState(agentState beads.AgentState, hookBead string) bool {
 // wisp ID) ensures exactly one patrol proceeds with the restart.
 //
 // gt-qnp: If Mayor ACP session is active, vetoes automatic cleanup to allow Mayor review.
-func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cleanupStatus string, zombie *ZombieResult) {
+func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cleanupStatus string, zombie *ZombieResult, opts DetectZombieOptions) {
 	zombie.CleanupStatus = cleanupStatus
 	skipRestart := false
+
+	// Detect-only hold: report the zombie and its cleanup_status but
+	// touch nothing — no restart, no archive-nuke, and no cleanup wisp (a wisp
+	// would read to the next patrol as "already restarted").
+	if opts.NoRestart {
+		zombie.Action = restartSuppressedAction(zombie.Classification)
+		return
+	}
 
 	// aa-apw: If this polecat's branch work is already merged into the default
 	// branch (including via squash merge, which rewrites SHAs and fools a plain
@@ -2342,7 +2383,7 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 	}
 
 	// Restart regardless of cleanup state — the worktree is preserved.
-	if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+	if err := restartPolecatSession(workDir, rigName, polecatName); err != nil {
 		if zombie.Error == nil {
 			zombie.Error = fmt.Errorf("restart: %w", err)
 		} else {
