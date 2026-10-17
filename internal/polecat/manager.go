@@ -1201,8 +1201,11 @@ func (e *WorkAtRiskError) Unwrap() error {
 // branch name and paths so pasting it cannot run anything embedded in them.
 // The ref comes after --not --end-of-options (the second --not makes it
 // positive again), so a name beginning with '-' is never read as a git option.
-// It is passed as reported, not rewritten, so the heads/<branch> form git
-// reports for a branch shadowed by a same-named tag still resolves.
+// The two producers need different treatment of the name. A worktree's comes
+// from CurrentBranch and is used as reported: git reports heads/<branch> for a
+// branch shadowed by a same-named tag, and that form resolves. A missing
+// worktree's (RepoPath set) comes from WorktreeList and is always a plain
+// branch name, which a same-named tag would shadow, so it is qualified.
 func (e *WorkAtRiskError) RecoveryCommand() string {
 	dir, ref := e.ClonePath, e.Branch
 	switch ref {
@@ -1217,6 +1220,7 @@ func (e *WorkAtRiskError) RecoveryCommand() string {
 	}
 	if e.RepoPath != "" {
 		dir = e.RepoPath
+		ref = "refs/heads/" + ref
 	}
 	return fmt.Sprintf("git -C %s log --oneline --not --remotes --not --end-of-options %s", shellQuote(dir), shellQuote(ref))
 }
