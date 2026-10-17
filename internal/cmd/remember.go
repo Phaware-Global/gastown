@@ -7,12 +7,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/style"
 )
 
@@ -366,8 +366,7 @@ func runBdMemoryCmd(args []string) ([]byte, error) {
 	var stdout bytes.Buffer
 	cmd := exec.Command("bd", args...)
 	cmd.Stdout = &stdout
-	cmd.Stderr = os.Stderr
-	err := cmd.Run()
+	err := beads.RunRelayed(cmd)
 	return stdout.Bytes(), err
 }
 

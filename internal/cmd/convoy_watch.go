@@ -288,7 +288,7 @@ func updateConvoyDescription(townBeads, convoyID, newDesc string) error {
 	updateCmd.Stderr = &stderr
 
 	if err := updateCmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
+		errMsg := beads.RedirectDoltStartHint(strings.TrimSpace(stderr.String()))
 		if errMsg != "" {
 			return fmt.Errorf("bd update: %s", errMsg)
 		}

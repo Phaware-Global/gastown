@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -196,7 +197,7 @@ func listAnnounceMessages(townRoot, channelName string) ([]announceMessage, erro
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
+		errMsg := beads.RedirectDoltStartHint(strings.TrimSpace(stderr.String()))
 		if errMsg != "" {
 			return nil, fmt.Errorf("%s", errMsg)
 		}

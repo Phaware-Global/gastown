@@ -196,8 +196,7 @@ func runFormulaList(cmd *cobra.Command, args []string) error {
 
 	bdCmd := exec.Command("bd", bdArgs...)
 	bdCmd.Stdout = os.Stdout
-	bdCmd.Stderr = os.Stderr
-	return bdCmd.Run()
+	return beads.RunRelayed(bdCmd)
 }
 
 // runFormulaShow delegates to bd formula show
@@ -210,8 +209,7 @@ func runFormulaShow(cmd *cobra.Command, args []string) error {
 
 	bdCmd := exec.Command("bd", bdArgs...)
 	bdCmd.Stdout = os.Stdout
-	bdCmd.Stderr = os.Stderr
-	return bdCmd.Run()
+	return beads.RunRelayed(bdCmd)
 }
 
 // runFormulaRun executes a formula by spawning a convoy of polecats.
@@ -487,8 +485,7 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 
 	createCmd := exec.Command("bd", createArgs...)
 	createCmd.Dir = townBeads
-	createCmd.Stderr = os.Stderr
-	if err := createCmd.Run(); err != nil {
+	if err := beads.RunRelayed(createCmd); err != nil {
 		return fmt.Errorf("creating convoy bead: %w", err)
 	}
 

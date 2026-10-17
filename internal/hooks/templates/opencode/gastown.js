@@ -116,7 +116,31 @@ export const GasTown = async ({ $, directory }) => {
     return context;
   };
 
+  // opencode sessions (the deacon, dogs) do not run the Claude PreToolUse
+  // hooks, so the bash guard is asked here. It refuses 'bd dolt start' and
+  // 'dolt sql-server', which would bind the shared Dolt port to this agent's
+  // own, empty store. Only the guard's exit code 2 blocks; any other failure
+  // lets the command through.
+  const doltStartBlock = async (command) => {
+    if (typeof command !== "string" || !/dolt/.test(command)) return "";
+    const payload = JSON.stringify({ tool_name: "Bash", tool_input: { command } });
+    const guardCmd = `printf %s ${shellQuote(payload)} | ${gtCommand()} tap guard dolt-start 2>&1`;
+    try {
+      await $`/bin/sh -lc ${guardCmd}`.cwd(directory).quiet();
+      return "";
+    } catch (err) {
+      if (exitCode(err) === 2) return outputTail(err?.stdout);
+      console.error(`[gastown] dolt-start guard failed (command allowed): ${err?.message || err}`);
+      return "";
+    }
+  };
+
   return {
+    "tool.execute.before": async (input, output) => {
+      if (input?.tool !== "bash") return;
+      const blocked = await doltStartBlock(output?.args?.command);
+      if (blocked) throw new Error(blocked);
+    },
     event: async ({ event }) => {
       if (event?.type === "session.created") {
         if (didInit) return;

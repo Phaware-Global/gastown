@@ -226,7 +226,7 @@ func modifyAgentState(agentBead, beadsDir string, hasIncr bool) error {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
+		errMsg := beads.RedirectDoltStartHint(strings.TrimSpace(stderr.String()))
 		if errMsg != "" {
 			return fmt.Errorf("%s", errMsg)
 		}
@@ -280,7 +280,7 @@ func getAllAgentLabels(agentBead, beadsDir string) ([]string, error) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
+		errMsg := beads.RedirectDoltStartHint(strings.TrimSpace(stderr.String()))
 		if strings.Contains(errMsg, "not found") {
 			return nil, fmt.Errorf("agent bead not found: %s", agentBead)
 		}

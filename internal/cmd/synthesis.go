@@ -356,9 +356,8 @@ func runSynthesisClose(cmd *cobra.Command, args []string) error {
 	}
 	closeCmd := exec.Command("bd", closeArgs...)
 	closeCmd.Dir = townBeads
-	closeCmd.Stderr = os.Stderr
 
-	if err := closeCmd.Run(); err != nil {
+	if err := beads.RunRelayed(closeCmd); err != nil {
 		return fmt.Errorf("closing convoy: %w", err)
 	}
 
@@ -605,9 +604,8 @@ func createSynthesisBead(convoyID string, meta *ConvoyMeta, f *formula.Formula,
 	createCmd.Dir = townBeads
 	var stdout bytes.Buffer
 	createCmd.Stdout = &stdout
-	createCmd.Stderr = os.Stderr
 
-	if err := createCmd.Run(); err != nil {
+	if err := beads.RunRelayed(createCmd); err != nil {
 		return "", fmt.Errorf("creating synthesis bead: %w", err)
 	}
 
