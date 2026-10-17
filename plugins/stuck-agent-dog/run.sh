@@ -53,8 +53,8 @@ has_in_progress_work() {
 }
 
 # --- Beads resolution helpers -------------------------------------------------
-# Plugin scripts may run outside a beads workspace. Resolve hook and status
-# lookups from the target rig workspace, and make missing/inactive rigs
+# Plugin scripts may run outside a beads workspace. Resolve hook lookups from
+# the target rig workspace, and make missing/inactive rigs
 # non-fatal so one bad rig does not abort the dog under `set -e` (hq-9e770).
 
 rig_workdir() {
@@ -73,41 +73,52 @@ rig_workdir() {
   return 1
 }
 
+# Hook lookups are batched: one `bd list` per rig and status instead of a
+# `gt hook show` + `bd show` pair per polecat directory. After a town-wide down
+# nearly every session is dead and every dead session needs a hook lookup, so a
+# per-polecat process (~5s each) cannot finish inside the plugin timeout.
+#
+# HOOK_MAP holds one "assignee|bead_id|status" line per hooked or in_progress
+# bead, hooked first, so the first match for an assignee is the same bead
+# `gt hook show` would report. Beads in these two statuses are exactly the
+# restartable ones; closed or unhooked work never appears.
+HOOK_MAP=""
+
+load_hook_map() {
+  local rig="" dir="" status="" out="" lines="" loc=""
+  local locations=()
+
+  while IFS='|' read -r rig _prefix; do
+    [ -z "$rig" ] && continue
+    if dir=$(rig_workdir "$rig"); then
+      locations+=("$rig|$dir")
+    fi
+  done <<< "$RIG_PREFIX_MAP"
+  # Town beads last: convoys hooked for convoy-driver mode live there.
+  locations+=("town|$TOWN_ROOT")
+
+  for status in hooked in_progress; do
+    for loc in "${locations[@]}"; do
+      rig="${loc%%|*}"
+      dir="${loc#*|}"
+      if ! out=$(cd "$dir" 2>/dev/null && bd list --status="$status" --json --limit=0 2>/dev/null); then
+        log "  WARN: could not list $status beads for $rig; its polecats are not checked"
+        continue
+      fi
+      lines=$(printf '%s' "$out" \
+        | jq -r '.[] | select((.assignee // "") != "") | "\(.assignee)|\(.id)|\(.status)"' 2>/dev/null || true)
+      [ -n "$lines" ] && HOOK_MAP+="$lines"$'\n'
+    done
+  done
+  return 0
+}
+
+# Prints the bead id hooked to the given polecat, or nothing.
 rig_hook_bead() {
-  local rig="$1" pcat="$2" dir=""
+  local rig="$1" pcat="$2"
 
-  if ! dir=$(rig_workdir "$rig"); then
-    return 0
-  fi
-
-  ( cd "$dir" 2>/dev/null && gt hook show "$rig/polecats/$pcat" --json 2>/dev/null ) \
-    | jq -r '.bead_id // empty' 2>/dev/null || true
-}
-
-rig_bead_status() {
-  local rig="$1" bead="$2" dir=""
-
-  if ! dir=$(rig_workdir "$rig"); then
-    return 0
-  fi
-
-  ( cd "$dir" 2>/dev/null && bd show "$bead" --json 2>/dev/null ) \
-    | jq -r '.[0].status // empty' 2>/dev/null || true
-}
-
-bead_restartable() {
-  local session="$1" rig="$2" bead="$3" status=""
-
-  status=$(rig_bead_status "$rig" "$bead")
-
-  case "$status" in
-    open|hooked|in_progress) return 0 ;;
-    closed) log "  SKIP $session: bead closed (completed normally)" ;;
-    "") log "  SKIP $session: hook=$bead status unavailable" ;;
-    *) log "  SKIP $session: hook=$bead status=$status not actionable" ;;
-  esac
-
-  return 1
+  printf '%s' "$HOOK_MAP" \
+    | awk -F'|' -v a="$rig/polecats/$pcat" '$1 == a && !found { print $2; found = 1 }'
 }
 
 # --- Enumerate agents ---------------------------------------------------------
@@ -128,6 +139,8 @@ fi
 
 # --- Check polecat health ----------------------------------------------------
 
+load_hook_map
+
 CRASHED=()
 STUCK=()
 HEALTHY=0
@@ -146,7 +159,7 @@ while IFS='|' read -r RIG PREFIX; do
       # Session dead — check hook
       HOOK_BEAD=$(rig_hook_bead "$RIG" "$PCAT_NAME")
 
-      if [ -n "$HOOK_BEAD" ] && bead_restartable "$SESSION_NAME" "$RIG" "$HOOK_BEAD"; then
+      if [ -n "$HOOK_BEAD" ]; then
         CRASHED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD")
         log "  CRASHED: $SESSION_NAME (hook=$HOOK_BEAD)"
       fi
@@ -158,7 +171,7 @@ while IFS='|' read -r RIG PREFIX; do
         if [ -z "$PROC_COMM" ]; then
           # Zombie: process dead, session alive
           HOOK_BEAD=$(rig_hook_bead "$RIG" "$PCAT_NAME")
-          if [ -n "$HOOK_BEAD" ] && bead_restartable "$SESSION_NAME" "$RIG" "$HOOK_BEAD"; then
+          if [ -n "$HOOK_BEAD" ]; then
             STUCK+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|agent_dead")
             log "  ZOMBIE: $SESSION_NAME (pid=$PANE_PID dead, hook=$HOOK_BEAD)"
           fi
