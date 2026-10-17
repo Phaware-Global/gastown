@@ -57,7 +57,8 @@ var compactCmd = &cobra.Command{
 	Long: `Apply TTL-based compaction policy to ephemeral wisps.
 
 For non-closed wisps past TTL: promotes to permanent beads (something is stuck).
-For closed wisps past TTL: deletes them (Dolt AS OF preserves history).
+For closed wisps past TTL: deletes them. Wisps are not versioned by Dolt, so
+deletes are permanent and cannot be recovered.
 Wisps with comments or keep labels are always promoted.
 
 TTLs by wisp type:
@@ -105,19 +106,7 @@ func loadTTLConfigWithRole(townRoot, rigName string) map[string]time.Duration {
 	// Layer 2: Rig config - wisp layer (middle precedence)
 	if rigName != "" {
 		cfg := wisp.NewConfig(townRoot, rigName)
-		raw := cfg.Get("wisp_ttl")
-		if raw != nil {
-			// wisp_ttl is stored as map[string]interface{} in JSON config
-			if ttlMap, ok := raw.(map[string]interface{}); ok {
-				for wispType, val := range ttlMap {
-					if s, ok := val.(string); ok {
-						if d, err := time.ParseDuration(s); err == nil {
-							ttls[wispType] = d
-						}
-					}
-				}
-			}
-		}
+		applyTTLConfig(ttls, cfg.Get("wisp_ttl"))
 
 		// Layer 2b: Rig identity bead labels (wisp_ttl_*:value)
 		applyRigBeadTTLOverrides(ttls, townRoot, rigName)
@@ -138,7 +127,27 @@ func applyRigBeadTTLOverrides(ttls map[string]time.Duration, townRoot, rigName s
 		return
 	}
 
-	for _, label := range issue.Labels {
+	applyTTLLabels(ttls, issue.Labels)
+}
+
+// applyTTLConfig applies the rig config's wisp_ttl map (wisp type -> duration
+// string) over ttls.
+func applyTTLConfig(ttls map[string]time.Duration, raw interface{}) {
+	// wisp_ttl is stored as map[string]interface{} in JSON config
+	ttlMap, ok := raw.(map[string]interface{})
+	if !ok {
+		return
+	}
+	for wispType, val := range ttlMap {
+		if s, ok := val.(string); ok {
+			setTTL(ttls, wispType, s)
+		}
+	}
+}
+
+// applyTTLLabels applies wisp_ttl_<type>:<duration> labels over ttls.
+func applyTTLLabels(ttls map[string]time.Duration, labels []string) {
+	for _, label := range labels {
 		colonIdx := strings.Index(label, ":")
 		if colonIdx == -1 {
 			continue
@@ -147,10 +156,17 @@ func applyRigBeadTTLOverrides(ttls map[string]time.Duration, townRoot, rigName s
 		value := strings.TrimSpace(label[colonIdx+1:])
 
 		if wispType, ok := beads.ParseWispTTLKey(key); ok {
-			if dur, err := time.ParseDuration(value); err == nil {
-				ttls[wispType] = dur
-			}
+			setTTL(ttls, wispType, value)
 		}
+	}
+}
+
+// setTTL parses value as a duration and stores it for wispType. A zero or
+// negative TTL would make every wisp of that type instantly deletable, and the
+// override can come from a label any agent may set, so it is ignored.
+func setTTL(ttls map[string]time.Duration, wispType, value string) {
+	if d, err := time.ParseDuration(value); err == nil && d > 0 {
+		ttls[wispType] = d
 	}
 }
 
@@ -533,7 +549,8 @@ func deleteWisp(bd *beads.Beads, w *compactIssue, reason string, result *compact
 		return
 	}
 
-	// bd delete --force (safe: Dolt AS OF preserves history)
+	// bd delete --force. Permanent: wisps are dolt-ignored, so there is no
+	// AS OF history to recover a deleted row from.
 	_, err := bd.Run("delete", w.ID, "--force")
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("delete %s: %v", w.ID, err))

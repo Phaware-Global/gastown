@@ -154,8 +154,13 @@ func runDailyDigest() error {
 		return nil
 	}
 
-	// Run compaction with --json to get results
-	compactOut, err := exec.Command("gt", "compact", "--json").Output()
+	// Run compaction with --json to get results. A previewed digest must not
+	// mutate: a real run deletes wisps permanently.
+	compactArgs := []string{"compact", "--json"}
+	if compactReportDryRun {
+		compactArgs = append(compactArgs, "--dry-run")
+	}
+	compactOut, err := exec.Command("gt", compactArgs...).Output()
 	if err != nil {
 		return fmt.Errorf("running compaction: %w", err)
 	}

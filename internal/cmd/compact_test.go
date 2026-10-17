@@ -404,3 +404,52 @@ func TestDetectAnomaliesBlindScan(t *testing.T) {
 		t.Errorf("scan with wisps but no patrols should still flag patrols: %v", got)
 	}
 }
+
+func TestApplyTTLLabelsRejectsNonPositive(t *testing.T) {
+	for _, value := range []string{"0s", "0", "-1h", "-30m"} {
+		t.Run(value, func(t *testing.T) {
+			ttls := map[string]time.Duration{"default": 24 * time.Hour, "patrol": 24 * time.Hour}
+			applyTTLLabels(ttls, []string{"wisp_ttl_default:" + value, "wisp_ttl_patrol:" + value})
+			if ttls["default"] != 24*time.Hour || ttls["patrol"] != 24*time.Hour {
+				t.Errorf("non-positive TTL %q must be ignored, got default=%v patrol=%v", value, ttls["default"], ttls["patrol"])
+			}
+		})
+	}
+}
+
+func TestApplyTTLConfigRejectsNonPositive(t *testing.T) {
+	ttls := map[string]time.Duration{"default": 24 * time.Hour}
+	applyTTLConfig(ttls, map[string]interface{}{"default": "0s", "patrol": "-2h"})
+	if ttls["default"] != 24*time.Hour {
+		t.Errorf("default TTL = %v, want unchanged 24h", ttls["default"])
+	}
+	if _, ok := ttls["patrol"]; ok {
+		t.Errorf("negative patrol TTL must not be stored, got %v", ttls["patrol"])
+	}
+}
+
+func TestApplyTTLOverridesAcceptPositive(t *testing.T) {
+	ttls := map[string]time.Duration{"default": 24 * time.Hour}
+	applyTTLLabels(ttls, []string{"wisp_ttl_default:48h", "unrelated:label"})
+	applyTTLConfig(ttls, map[string]interface{}{"patrol": "2h"})
+	if ttls["default"] != 48*time.Hour || ttls["patrol"] != 2*time.Hour {
+		t.Errorf("positive overrides not applied: %v", ttls)
+	}
+}
+
+// Wisps are dolt-ignored, so a deleted wisp has no AS OF history to read back.
+func TestCompactDocsDoNotPromiseDeletedWispsAreRecoverable(t *testing.T) {
+	if strings.Contains(compactCmd.Long, "AS OF") {
+		t.Errorf("compact help claims Dolt AS OF preserves deleted wisps:\n%s", compactCmd.Long)
+	}
+	if !strings.Contains(compactCmd.Long, "permanent") {
+		t.Errorf("compact help must say deletes are permanent:\n%s", compactCmd.Long)
+	}
+	data, err := os.ReadFile("compact.go")
+	if err != nil {
+		t.Fatalf("read compact.go: %v", err)
+	}
+	if strings.Contains(string(data), "AS OF preserves") {
+		t.Errorf("compact.go still carries the false 'AS OF preserves history' comment")
+	}
+}
