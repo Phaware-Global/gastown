@@ -2810,7 +2810,7 @@ func findAssignedBeadsForAgent(workDir, agentID string) []string {
 	if len(parts) > 0 {
 		rigName = parts[0]
 	}
-	if rigName != "" && rigName != "mayor" && rigName != "deacon" {
+	if rigName != "" && rigName != "mayor" && rigName != "assistant" && rigName != "deacon" {
 		rigWorkDir := filepath.Join(townRoot, rigName, "mayor", "rig")
 		if rigWorkDir != workDir {
 			assigned = assignedIssueIDs(queryAssignedBeads(beads.New(rigWorkDir), agentID))

@@ -456,9 +456,12 @@ func (c *OrphanedAttachmentsCheck) agentExists(agent, townRoot string) bool {
 		return dirExists(path)
 	}
 
-	// Handle mayor
+	// Handle mayor and the Mayor's Assistant
 	if agent == "mayor" {
 		return dirExists(filepath.Join(townRoot, "mayor"))
+	}
+	if agent == "assistant" {
+		return dirExists(filepath.Join(townRoot, "assistant"))
 	}
 
 	// Handle crew (rig/crew/name pattern)

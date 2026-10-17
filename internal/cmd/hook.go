@@ -285,7 +285,7 @@ func runHook(_ *cobra.Command, args []string) error {
 		}
 		rigName := strings.Split(agentID, "/")[0]
 		var fallbackPath string
-		if rigName == "mayor" || rigName == "deacon" {
+		if rigName == "mayor" || rigName == "assistant" || rigName == "deacon" {
 			fallbackPath = townRoot
 		} else {
 			fallbackPath = filepath.Join(townRoot, rigName)
@@ -505,7 +505,7 @@ func runHookShow(cmd *cobra.Command, args []string) error {
 		townRoot, townErr := workspace.FindFromCwd()
 		if townErr == nil && townRoot != "" {
 			rigName := strings.Split(target, "/")[0]
-			if rigName != "" && rigName != "mayor" && rigName != "deacon" {
+			if rigName != "" && rigName != "mayor" && rigName != "assistant" && rigName != "deacon" {
 				// Agent beads can be stale or missing during recovery. The source
 				// work assignment is authoritative, so query the target rig DB directly.
 				workDir = filepath.Join(townRoot, rigName, "mayor", "rig")
@@ -649,7 +649,7 @@ func normalizeHookShowTarget(target string) string {
 		name := parts[1]
 		// Check for known roles — don't expand those
 		switch strings.ToLower(name) {
-		case "witness", "refinery", "mayor", "deacon":
+		case "witness", "refinery", "mayor", "assistant", "deacon":
 			// Already a valid canonical address
 		default:
 			// Check if it's a crew member by looking for the directory

@@ -35,8 +35,10 @@ var (
 
 // reservedRigNames are names that cannot be used for rigs because they
 // collide with town-level infrastructure. "hq" is special-cased by
-// EnsureMetadata and dolt routing as the town-level beads alias.
-var reservedRigNames = []string{"hq"}
+// EnsureMetadata and dolt routing as the town-level beads alias; "assistant"
+// is the Mayor's Assistant role (work dir <town>/assistant, address
+// assistant/), a single-token name that would otherwise be a legal rig name.
+var reservedRigNames = []string{"hq", "assistant"}
 
 // wrapCloneError wraps clone errors with helpful suggestions.
 // Detects common auth failures and suggests SSH as an alternative.
