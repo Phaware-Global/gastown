@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -65,6 +66,10 @@ type Daemon struct {
 	// so a slow cleanup is never launched twice concurrently (see
 	// reapRigStalePolecatDirsNearCap).
 	capReliefInFlight sync.Map
+	// capReliefWG tracks the background cleanup goroutines so shutdown can wait
+	// (bounded) for an in-flight nuke to reach a polecat boundary instead of
+	// exiting under it and leaving a half-removed worktree.
+	capReliefWG sync.WaitGroup
 	// storesMu guards beadsStores. Two writers exist: the synchronous
 	// initialization in Run() (before the convoy goroutine starts) and the
 	// lazy storeOpener callback (called from the convoy poll goroutine when
@@ -2667,6 +2672,20 @@ func (d *Daemon) shutdown(state *State) error { //nolint:unparam // error return
 		d.logger.Println("plugin_sync: still running after 30s shutdown wait — proceeding with shutdown")
 	}
 
+	// Wait (bounded) for an in-flight cap-relief cleanup. d.cancel() above asks its
+	// gt process to stop (SIGTERM), and it finishes the polecat it is nuking before
+	// exiting; the bound is that grace period plus slack for the process to exit.
+	capReliefDone := make(chan struct{})
+	go func() {
+		d.capReliefWG.Wait()
+		close(capReliefDone)
+	}()
+	select {
+	case <-capReliefDone:
+	case <-time.After(capReliefStopGrace + 15*time.Second):
+		d.logger.Println("cap_relief: still running after shutdown wait — proceeding with shutdown")
+	}
+
 	// Stop feed curator
 	if d.curator != nil {
 		d.curator.Stop()
@@ -3565,7 +3584,9 @@ func (d *Daemon) reapRigStalePolecatDirsNearCap(rigName string) {
 	if parent == nil {
 		parent = context.Background()
 	}
+	d.capReliefWG.Add(1)
 	go func() {
+		defer d.capReliefWG.Done()
 		defer d.capReliefInFlight.Delete(rigName)
 		d.runCapReliefCleanup(parent, rigName)
 	}()
@@ -3575,6 +3596,10 @@ func (d *Daemon) reapRigStalePolecatDirsNearCap(rigName string) {
 // short by it resumes on a later heartbeat, because the dirs it already nuked no
 // longer count toward the cap.
 const capReliefCleanupTimeout = 10 * time.Minute
+
+// capReliefStopGrace is how long a cleanup gets to finish the polecat it is nuking
+// after it is asked to stop (SIGTERM) before it is killed outright.
+const capReliefStopGrace = 60 * time.Second
 
 // runCapReliefCleanup reaps via `gt polecat stale --cleanup`. It reaps only polecats
 // assessStaleness deems stale: session-less AND not paused (protected agent states)
@@ -3593,7 +3618,18 @@ func (d *Daemon) runCapReliefCleanup(parent context.Context, rigName string) {
 	// bounds that: after the deadline fires, Wait abandons the process and its pipes
 	// within WaitDelay so a hung child can't leak this goroutine (and its in-flight
 	// slot) indefinitely.
-	cmd.WaitDelay = 10 * time.Second
+	//
+	// On cancellation (deadline or daemon shutdown) ask gt to stop with SIGTERM rather
+	// than SIGKILL: it checks for the signal between polecats, so the nuke in progress
+	// finishes instead of dying between killing the session and removing the worktree.
+	// WaitDelay is the grace period before the hard kill.
+	cmd.Cancel = func() error {
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			return cmd.Process.Kill()
+		}
+		return nil
+	}
+	cmd.WaitDelay = capReliefStopGrace
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := string(out)

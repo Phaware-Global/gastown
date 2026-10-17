@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -2165,8 +2167,31 @@ func runPolecatStale(cmd *cobra.Command, args []string) error {
 			fmt.Printf("Cleaning up %d stale polecat(s)...\n", staleCount)
 			nuked := 0
 			batchPurge := staleCount > 1
+			// The daemon stops this process with SIGTERM when it shuts down or the
+			// cleanup deadline passes. Honour it between polecats so a nuke is never
+			// cut off between killing the session and removing the worktree.
+			stopCh := make(chan os.Signal, 1)
+			signal.Notify(stopCh, syscall.SIGTERM, os.Interrupt)
+			defer signal.Stop(stopCh)
 			for _, info := range staleInfos {
 				if !info.IsStale {
+					continue
+				}
+				select {
+				case sig := <-stopCh:
+					fmt.Printf("Received %v; stopping before the next nuke.\n", sig)
+					return nil
+				default:
+				}
+				// The detection snapshot can be minutes old (sling may have reused this
+				// polecat since), so confirm it is still stale right before destroying it.
+				fresh, err := mgr.ReassessStale(info, polecatStaleThreshold)
+				if err != nil {
+					fmt.Printf("Skipping %s: re-assessment failed: %v\n", info.Name, err)
+					continue
+				}
+				if !fresh.IsStale {
+					fmt.Printf("Skipping %s: no longer stale (%s)\n", info.Name, fresh.Reason)
 					continue
 				}
 				fmt.Printf("Nuking %s...\n", info.Name)
