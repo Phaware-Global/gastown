@@ -36,11 +36,23 @@ func (dm *dogMol) closeWisp(id string, extra ...string) error {
 		if _, err = dm.runBd(args...); err == nil {
 			return nil
 		}
+		// A dependency block is deterministic: retrying the same close cannot
+		// succeed until the blocker closes, so fail fast and let the caller
+		// reorder.
+		if isCloseBlocked(err) {
+			return err
+		}
 		if attempt < dogCloseMaxAttempts {
 			time.Sleep(time.Duration(attempt) * dogCloseRetryDelay)
 		}
 	}
 	return err
+}
+
+// isCloseBlocked reports whether err is bd refusing to close an issue because
+// an open issue still blocks it ("cannot close X: blocked by open issues [Y]").
+func isCloseBlocked(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "blocked by open issues")
 }
 
 // dogMol tracks a molecule (wisp) lifecycle for a daemon dog patrol.
@@ -135,8 +147,13 @@ func (dm *dogMol) close() {
 		return
 	}
 
-	// Close any step wisps that were never explicitly closed/failed.
-	dm.closeRemainingSteps()
+	// Close any step wisps that were never explicitly closed/failed. If some
+	// stay open, closing the root would orphan them (their parent gone, nothing
+	// left to sweep them), so leave the root open as the handle for a later sweep.
+	if left := dm.closeRemainingSteps(); left > 0 {
+		dm.logger.Printf("dog_molecule: not closing root %s: %d step wisp(s) still open", dm.rootID, left)
+		return
+	}
 
 	if err := dm.closeWisp(dm.rootID); err != nil {
 		dm.logger.Printf("dog_molecule: close root %s failed after %d attempts (non-fatal): %v", dm.rootID, dogCloseMaxAttempts, err)
@@ -146,40 +163,68 @@ func (dm *dogMol) close() {
 // closeRemainingSteps queries all children of the root wisp and closes any that
 // are still open. This is the backstop that prevents step wisp leaks regardless
 // of whether individual callers remembered to close each step.
-func (dm *dogMol) closeRemainingSteps() {
+//
+// Steps in a formula are chained with blocks dependencies, and bd refuses to
+// close a step while an earlier one is open, so bd-list order is not a safe
+// close order. Rather than reconstruct the chain, sweep the open steps in
+// passes: each pass closes whatever is no longer blocked, and the sweep ends
+// when everything is closed or a pass makes no progress.
+//
+// Returns the number of child steps still open (0 when none remain or when the
+// children could not be listed).
+func (dm *dogMol) closeRemainingSteps() int {
 	if dm.rootID == "" {
-		return
+		return 0
 	}
 
 	out, err := dm.runBd("show", dm.rootID, "--children", "--json")
 	if err != nil {
 		dm.logger.Printf("dog_molecule: closeRemainingSteps: list children of %s failed: %v", dm.rootID, err)
-		return
+		return 0
 	}
 
 	children, parseErr := parseChildrenJSON(out)
 	if parseErr != nil {
 		dm.logger.Printf("dog_molecule: closeRemainingSteps: parse children JSON for %s failed: %v", dm.rootID, parseErr)
-		return
+		return 0
 	}
 
-	closed := 0
+	// Collect children that are still open/hooked/in_progress.
+	var pending []string
 	for _, child := range children {
 		if child.ID == "" || child.Status == "" {
 			continue
 		}
-		// Close any child that is still open/hooked/in_progress.
 		if child.Status == "open" || child.Status == "hooked" || child.Status == "in_progress" {
-			if err := dm.closeWisp(child.ID); err != nil {
-				dm.logger.Printf("dog_molecule: closeRemainingSteps: close %s failed after %d attempts: %v", child.ID, dogCloseMaxAttempts, err)
+			pending = append(pending, child.ID)
+		}
+	}
+
+	closed := 0
+	lastErr := make(map[string]error)
+	for len(pending) > 0 {
+		var stuck []string
+		for _, id := range pending {
+			if err := dm.closeWisp(id); err != nil {
+				lastErr[id] = err
+				stuck = append(stuck, id)
 			} else {
 				closed++
 			}
 		}
+		if len(stuck) == len(pending) {
+			break // No progress this pass; another would fail the same way.
+		}
+		pending = stuck
+	}
+
+	for _, id := range pending {
+		dm.logger.Printf("dog_molecule: closeRemainingSteps: close %s failed: %v", id, lastErr[id])
 	}
 	if closed > 0 {
 		dm.logger.Printf("dog_molecule: closeRemainingSteps: closed %d orphan step wisp(s) under %s", closed, dm.rootID)
 	}
+	return len(pending)
 }
 
 // discoverSteps lists children of the root wisp and maps step slugs to IDs.
