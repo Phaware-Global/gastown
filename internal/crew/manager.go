@@ -117,6 +117,12 @@ func validateCrewName(name string) error {
 	if strings.Contains(name, "..") {
 		return fmt.Errorf("%w: %q contains path traversal sequence", ErrInvalidCrewName, name)
 	}
+	// Reject town-level role names: a crew member called "mayor" or
+	// "assistant" would collide with those roles' addresses and directories.
+	switch strings.ToLower(name) {
+	case "mayor", "assistant", "deacon":
+		return fmt.Errorf("%w: %q is reserved for a town-level role", ErrInvalidCrewName, name)
+	}
 	// Reject characters that break agent ID parsing (same as rig names)
 	if strings.ContainsAny(name, "-. ") {
 		sanitized := strings.NewReplacer("-", "_", ".", "_", " ", "_").Replace(name)
