@@ -16,9 +16,16 @@ const DoltStartGuidance = "Dolt is managed by Gas Town, not by bd. Do NOT start 
 	"it ignores dolt.auto-start and binds the shared port to an empty store. " +
 	"Run 'gt dolt status'; if the server is down, escalate: gt escalate -s HIGH \"Dolt: server unreachable\"."
 
+// serverMayNotBeRunning is the diagnosis half of bd's "may not be running. Try:"
+// lead-in. It is kept because callers match on it to tell a down server from a
+// transient failure (polecat isDoltConfigError): bd's dial errors other than
+// "connection refused" (i/o timeout, no route to host) carry no other marker.
+const serverMayNotBeRunning = "The Dolt server may not be running."
+
 // RedirectDoltStartHint rewrites every line of bd output that advises running
-// `bd dolt start` into DoltStartGuidance (once per message) and drops the lead-in
-// lines that introduced the advice. Output without the advice is returned as is.
+// `bd dolt start` into DoltStartGuidance (once per message) and drops the
+// "Try:" lead-in that introduced the advice, keeping its diagnosis. Output
+// without the advice is returned as is.
 func RedirectDoltStartHint(s string) string {
 	if !strings.Contains(s, "bd dolt start") {
 		return s
@@ -28,9 +35,10 @@ func RedirectDoltStartHint(s string) string {
 	redirected := false
 	for _, line := range lines {
 		switch trimmed := strings.TrimSpace(line); {
-		case trimmed == "Start the server manually:",
-			trimmed == "The Dolt server may not be running. Try:":
+		case trimmed == "Start the server manually:":
 			continue
+		case trimmed == serverMayNotBeRunning+" Try:":
+			out = append(out, serverMayNotBeRunning)
 		case strings.Contains(line, "bd dolt start"):
 			if !redirected {
 				out = append(out, DoltStartGuidance)
