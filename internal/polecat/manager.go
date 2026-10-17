@@ -3160,7 +3160,7 @@ func (m *Manager) assessPolecat(p *Polecat, defaultBranch string, threshold int)
 	// Check agent bead state. A missing bead comes back as (nil, nil, nil); any
 	// error is a failed probe, not an absent bead.
 	agentID := m.agentBeadID(p.Name)
-	_, fields, err := m.beads.GetAgentBead(agentID)
+	_, fields, err := m.agentBeads().GetAgentBead(agentID)
 	if err != nil {
 		if info.ProbeError == "" {
 			info.ProbeError = fmt.Sprintf("reading agent bead: %v", err)
@@ -3199,11 +3199,22 @@ func (m *Manager) ReassessStale(prev *StalenessInfo, threshold int) (*StalenessI
 		defaultBranch = rigCfg.DefaultBranch
 	}
 	info := m.assessPolecat(p, defaultBranch, threshold)
-	if info.IsStale && (p.State == StateWorking || p.Issue != prev.HookedIssue) {
-		info.IsStale = false
-		info.Reason = fmt.Sprintf("re-dispatched since detection (state=%s, issue=%q, was %q)", p.State, p.Issue, prev.HookedIssue)
-	}
+	applyRedispatchCheck(info, p, prev)
 	return info, nil
+}
+
+// applyRedispatchCheck clears info's staleness when p has been re-dispatched since
+// the prev snapshot. Reuse writes agent_state=spawning under the per-polecat lock,
+// but the hook bead that moves p.State/p.Issue lands later, outside it, so an active
+// agent state is the only signal a completed reuse leaves in that gap.
+func applyRedispatchCheck(info *StalenessInfo, p *Polecat, prev *StalenessInfo) {
+	if !info.IsStale {
+		return
+	}
+	if p.State == StateWorking || p.Issue != prev.HookedIssue || beads.AgentState(info.AgentState).IsActive() {
+		info.IsStale = false
+		info.Reason = fmt.Sprintf("re-dispatched since detection (state=%s, issue=%q, was %q, agent_state=%q)", p.State, p.Issue, prev.HookedIssue, info.AgentState)
+	}
 }
 
 // checkTmuxSession checks if a tmux session exists.
