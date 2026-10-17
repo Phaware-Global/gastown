@@ -196,7 +196,7 @@ func (m *Manager) lockCrew(name string) (*flock.Flock, error) {
 
 // Add creates a new crew worker with a clone of the rig.
 func (m *Manager) Add(name string, createBranch bool) (*CrewWorker, error) {
-	if err := validateNewCrewName(name); err != nil {
+	if err := validateCrewName(name); err != nil {
 		return nil, err
 	}
 	fl, err := m.lockCrew(name)
@@ -209,6 +209,11 @@ func (m *Manager) Add(name string, createBranch bool) (*CrewWorker, error) {
 
 // addLocked creates a new crew worker, assumes caller holds lockCrew(name).
 func (m *Manager) addLocked(name string, createBranch bool) (*CrewWorker, error) {
+	// Every creation path (Add, and Start's implicit create) goes through
+	// here, so this is where reserved names are enforced.
+	if err := validateNewCrewName(name); err != nil {
+		return nil, err
+	}
 	if m.exists(name) {
 		return nil, ErrCrewExists
 	}

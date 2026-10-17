@@ -188,6 +188,7 @@ func TestAddressToSessionIDs(t *testing.T) {
 		{"deacon/boot", []string{"hq-boot"}},          // deacon family, not a rig named deacon
 		{"deacon/dogs/alpha", []string{"hq-dog-alpha"}},
 		{"deacon/dogs/alpha/", []string{"hq-dog-alpha"}},
+		{"deacon/dogs/alpha//", []string{"hq-dog-alpha"}},
 
 		// Rig singletons - single session (no crew/polecat ambiguity)
 		{"gastown/refinery", []string{"gt-refinery"}},
