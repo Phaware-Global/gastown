@@ -162,7 +162,7 @@ func (c *StalledPolecatCheck) findRigs(ctx *CheckContext) []string {
 
 	var rigs []string
 	for _, entry := range entries {
-		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") || entry.Name() == "mayor" {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") || entry.Name() == "mayor" || entry.Name() == "assistant" {
 			continue
 		}
 		polecatsDir := filepath.Join(ctx.TownRoot, entry.Name(), "polecats")

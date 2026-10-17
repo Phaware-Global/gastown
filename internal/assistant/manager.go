@@ -64,6 +64,17 @@ func (m *Manager) Start(agentOverride string) error {
 		return ErrAlreadyRunning
 	}
 
+	// Refuse to start in a town whose rig registry already uses the
+	// assistant's name: the work dir would be that rig's container and cwd
+	// role detection, mail addresses and bead IDs would become ambiguous.
+	// New rigs cannot take the name (it is reserved in rig.AddRig); a town
+	// upgraded with such a rig must rename it first.
+	if rigs, err := config.LoadRigsConfig(constants.MayorRigsPath(m.townRoot)); err == nil && rigs != nil {
+		if _, taken := rigs.Rigs[constants.RoleAssistant]; taken {
+			return fmt.Errorf("a rig named %q is registered in rigs.json; rename it before starting the Mayor's Assistant (its work dir is <town>/%s)", constants.RoleAssistant, constants.RoleAssistant)
+		}
+	}
+
 	workDir := m.WorkDir()
 	if err := os.MkdirAll(workDir, 0755); err != nil {
 		return fmt.Errorf("creating assistant directory: %w", err)

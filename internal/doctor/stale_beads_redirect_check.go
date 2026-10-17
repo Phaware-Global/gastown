@@ -196,7 +196,7 @@ func findRigDirs(townRoot string) ([]string, error) {
 
 		name := entry.Name()
 		// Skip hidden dirs, mayor, docs
-		if strings.HasPrefix(name, ".") || name == "mayor" || name == "docs" {
+		if strings.HasPrefix(name, ".") || name == "mayor" || name == "assistant" || name == "docs" {
 			continue
 		}
 

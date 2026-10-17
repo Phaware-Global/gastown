@@ -34,12 +34,13 @@ const (
 // ReservedInfraAgentNames contains names reserved for infrastructure agents.
 // These names must never be allocated to polecats.
 var ReservedInfraAgentNames = map[string]bool{
-	"witness":  true,
-	"mayor":    true,
-	"deacon":   true,
-	"refinery": true,
-	"crew":     true,
-	"polecats": true,
+	"witness":   true,
+	"mayor":     true,
+	"assistant": true,
+	"deacon":    true,
+	"refinery":  true,
+	"crew":      true,
+	"polecats":  true,
 }
 
 // Built-in themes with themed polecat names.

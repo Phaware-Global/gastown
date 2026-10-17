@@ -809,7 +809,7 @@ func discoverRigs(townRoot string) []string {
 
 		name := entry.Name()
 		// Skip known non-rig directories
-		if name == "mayor" || name == "daemon" || name == "deacon" ||
+		if name == "mayor" || name == constants.RoleAssistant || name == "daemon" || name == "deacon" ||
 			name == ".git" || name == "docs" || name[0] == '.' {
 			continue
 		}
