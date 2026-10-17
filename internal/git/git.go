@@ -1016,6 +1016,30 @@ func (g *Git) Push(remote, branch string, force bool) error {
 	return err
 }
 
+// PushForceWithLease force-pushes src to refs/heads/dst on the remote, but only
+// if the remote branch still points at expectedSHA. A push from a stale view of
+// the remote is rejected instead of clobbering someone else's commits.
+func (g *Git) PushForceWithLease(remote, src, dst, expectedSHA string) error {
+	ref := "refs/heads/" + dst
+	_, err := g.runWithTimeout(pushTimeout,
+		"push", "--force-with-lease="+ref+":"+expectedSHA, remote, src+":"+ref)
+	return err
+}
+
+// CountCommitsBetween returns how many commits are reachable from `to` but not
+// from `from` (git rev-list --count from..to).
+func (g *Git) CountCommitsBetween(from, to string) (int, error) {
+	out, err := g.run("rev-list", "--count", from+".."+to)
+	if err != nil {
+		return 0, err
+	}
+	var count int
+	if _, err := fmt.Sscanf(out, "%d", &count); err != nil {
+		return 0, fmt.Errorf("parsing commit count: %w", err)
+	}
+	return count, nil
+}
+
 // PushWithEnv pushes with additional environment variables.
 // Used by gt mq integration land to set GT_INTEGRATION_LAND=1, which the
 // pre-push hook checks to allow integration branch content landing on main.
@@ -1052,6 +1076,83 @@ func (g *Git) Commit(message string) error {
 func (g *Git) CommitNoVerify(message string) error {
 	_, err := g.run("commit", "--no-verify", "-m", message)
 	return err
+}
+
+// CommitPathsFromRef commits HEAD with only the given paths set to their
+// version at ref (removed when ref does not track them), authored as
+// name/email. The commit is built in a temporary index, so nothing else staged
+// in the real index is committed and no hook runs. The real index entries for
+// the paths are then moved to match the new HEAD, and paths that ref tracks
+// are restored on disk too (a modified tracked file would otherwise read as
+// dirt); paths ref does not track keep their working-tree copy.
+func (g *Git) CommitPathsFromRef(ref string, paths []string, message, name, email string) error {
+	parent, err := g.Rev("HEAD")
+	if err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp("", "gt-pathcommit-*")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	tmpEnv := []string{
+		"GIT_INDEX_FILE=" + filepath.Join(dir, "index"),
+		"GIT_AUTHOR_NAME=" + name, "GIT_AUTHOR_EMAIL=" + email,
+		"GIT_COMMITTER_NAME=" + name, "GIT_COMMITTER_EMAIL=" + email,
+	}
+
+	if _, err := g.runWithEnv([]string{"read-tree", "HEAD"}, tmpEnv); err != nil {
+		return err
+	}
+	if err := g.setIndexPathsFromRef(ref, paths, tmpEnv, false); err != nil {
+		return err
+	}
+	tree, err := g.runWithEnv([]string{"write-tree"}, tmpEnv)
+	if err != nil {
+		return err
+	}
+	commit, err := g.runWithEnv([]string{"commit-tree", tree, "-p", parent, "-m", message}, tmpEnv)
+	if err != nil {
+		return err
+	}
+	if _, err := g.run("update-ref", "-m", "commit: "+message, "HEAD", commit, parent); err != nil {
+		return err
+	}
+	return g.setIndexPathsFromRef(ref, paths, nil, true)
+}
+
+// setIndexPathsFromRef points each path's index entry at its version in ref,
+// or removes the entry when ref does not track it. extraEnv may redirect the
+// index via GIT_INDEX_FILE. With restoreWorktree, tracked paths are checked out
+// from ref (index and working tree) instead of only re-pointing the index.
+func (g *Git) setIndexPathsFromRef(ref string, paths []string, extraEnv []string, restoreWorktree bool) error {
+	for _, p := range paths {
+		entry, err := g.run("ls-tree", ref, "--", p)
+		if err != nil {
+			return err
+		}
+		if entry == "" {
+			if _, err := g.runWithEnv([]string{"update-index", "--force-remove", "--", p}, extraEnv); err != nil {
+				return err
+			}
+			continue
+		}
+		if restoreWorktree {
+			if err := g.CheckoutFileFromRef(ref, p); err != nil {
+				return err
+			}
+			continue
+		}
+		meta, _, _ := strings.Cut(entry, "\t")
+		fields := strings.Fields(meta) // mode type sha
+		if len(fields) != 3 {
+			return fmt.Errorf("unexpected ls-tree output for %s: %q", p, entry)
+		}
+		if _, err := g.runWithEnv([]string{"update-index", "--add", "--cacheinfo", fields[0] + "," + fields[2] + "," + p}, extraEnv); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // CommitAll stages all changes and commits.
@@ -1460,6 +1561,30 @@ func (g *Git) ConfigGet(key string) (string, error) {
 		return "", nil
 	}
 	return out, nil
+}
+
+// ConfigSet sets a git config key in the repository's shared config.
+func (g *Git) ConfigSet(key, value string) error {
+	_, err := g.run("config", key, value)
+	return err
+}
+
+// ConfigUnset removes a git config key from the repository's shared config.
+// Unsetting a key that is not set is not an error.
+func (g *Git) ConfigUnset(key string) error {
+	_, err := g.run("config", "--unset-all", key)
+	if err != nil {
+		// git config --unset-all returns exit code 5 if the key is not set.
+		var ge *GitError
+		if errors.As(err, &ge) {
+			var exitErr *exec.ExitError
+			if errors.As(ge.Err, &exitErr) && exitErr.ExitCode() == 5 {
+				return nil
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 // Merge merges the given branch into the current branch.
@@ -3623,6 +3748,20 @@ func (g *Git) unpushedFromExactRemoteBranch(localBranch, remote string) (int, bo
 
 	count, err := g.countCommitsAhead(remoteSHA)
 	return count, true, err
+}
+
+// HeadHeldByDurableRef reports whether a remote-tracking ref or a
+// refs/gt/preserve ref contains HEAD, i.e. whether the commits survive the
+// removal of a worktree whose detached HEAD is the only thing pointing at them.
+// Local branches deliberately do not count: polecat/* branches are
+// force-deleted by branch cleanup (gt polecat gc, sling rollback), so a commit
+// held only by one is not durable.
+func (g *Git) HeadHeldByDurableRef() (bool, error) {
+	out, err := g.run("for-each-ref", "--contains", "HEAD", "--count=1", "--format=%(refname)", "refs/remotes/", "refs/gt/preserve/")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "", nil
 }
 
 // remoteBranchContainingHead returns the first branch on remote whose tip

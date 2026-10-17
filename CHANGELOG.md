@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`merge_queue.pr_update_strategy` (rebase | merge | none)** — a rig can now
+  stop the refinery from rewriting PR branches. `merge` merges the target into
+  the branch with a plain push; `none` reports "behind base" and leaves the
+  branch alone; the default stays `rebase`. Enforced by the new
+  `gt refinery pr sync-branch` / `push-branch` commands, which the patrol
+  formula now calls instead of raw git. Whatever the strategy, a branch whose
+  open PR has an approving review is never force-pushed.
+
 ## [1.2.1] - 2026-06-06
 
 ### Fixed

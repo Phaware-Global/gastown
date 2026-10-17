@@ -324,6 +324,47 @@ gt version
 gt doctor --fix
 ```
 
+On macOS, if you have granted `gt` Full Disk Access or Removable Volumes
+access, sign the installed binary with a stable identity so those grants
+survive rebuilds. An ad-hoc signature changes hash on every build, which
+invalidates the grants and makes tccd re-hash the binary on every gt call.
+
+1. In Keychain Access, create a self-signed certificate (Certificate
+   Assistant, type Code Signing), for example `gt-local`. Set the validity
+   period there if you want more than the one-year default.
+2. Install with the identity passed on the command line:
+
+   ```bash
+   make install GT_CODESIGN_IDENTITY=gt-local
+   ```
+
+   The first signed run shows a keychain dialog asking whether `codesign` may
+   use the key. Choose **Always Allow**, or unattended rebuilds will block on
+   that dialog. Equivalent, without the dialog (it prompts for the login
+   password; do not pass it with `-k`, which exposes it in `ps` and history,
+   and `-l` limits the change to this one key):
+
+   ```bash
+   security set-key-partition-list -S apple-tool:,apple:,codesign: -s -l gt-local ~/Library/Keychains/login.keychain-db
+   ```
+
+3. Remove and re-add `gt` under Full Disk Access, and approve the Removable
+   Volumes prompt, once. Later signed rebuilds keep the grants.
+
+Signing needs the login keychain, so run it from a GUI login session (a tmux
+session is fine), not a bare ssh session. If signing fails, the existing
+install is left untouched and `make` exits non-zero.
+
+Do not export `GT_CODESIGN_IDENTITY` in a shell profile or shared agent
+environment. Keeping it out of the environment prevents unrelated builds
+(a polecat worktree, a `go test`) from signing by accident; the rebuild-gt
+plugin reads the identity from `$TOWN_ROOT/settings/gt-codesign-identity`
+for its origin/main build only (see plugins/rebuild-gt/plugin.md). It is not
+an access boundary: once the key allows `codesign` without a prompt, any
+process running as this user can sign a binary that inherits gt's privacy
+grants. Grant Full Disk Access to `gt` only on hosts where that is
+acceptable.
+
 If you maintain Beads separately from Homebrew, update `bd` from its own source:
 
 ```bash
