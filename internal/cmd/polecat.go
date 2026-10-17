@@ -1861,6 +1861,10 @@ func nukePolecatFull(polecatName, rigName string, mgr *polecat.Manager, r *rig.R
 
 type nukePolecatOptions struct {
 	PurgeClosedEphemerals bool
+	// RemovalGuard, if set, runs under the per-polecat lock right before the worktree
+	// is removed; an error aborts the nuke. Staleness cleanup uses it to re-verify the
+	// polecat is still stale atomically with the removal.
+	RemovalGuard func() error
 }
 
 func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manager, r *rig.Rig, opts nukePolecatOptions) error {
@@ -1931,7 +1935,10 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 	}
 
 	// Step 3: Delete worktree (nuclear=true to bypass safety checks for stale polecats)
-	if err := mgr.RemoveWithOptions(polecatName, true, true, false); err != nil {
+	if err := mgr.RemoveWithGuard(polecatName, true, true, false, opts.RemovalGuard); err != nil {
+		if errors.Is(err, polecat.ErrNoLongerStale) {
+			return err
+		}
 		if errors.Is(err, polecat.ErrPolecatNotFound) {
 			fmt.Printf("  %s worktree already gone\n", style.Dim.Render("○"))
 			resetPolecatAgentBeadForReuse(r, rigName, polecatName)
@@ -2173,14 +2180,17 @@ func runPolecatStale(cmd *cobra.Command, args []string) error {
 			stopCh := make(chan os.Signal, 1)
 			signal.Notify(stopCh, syscall.SIGTERM, os.Interrupt)
 			defer signal.Stop(stopCh)
+		nukeLoop:
 			for _, info := range staleInfos {
 				if !info.IsStale {
 					continue
 				}
 				select {
 				case sig := <-stopCh:
+					// Leave the loop, not the function: the batch purge and orphan
+					// cleanup below still owe work for polecats already nuked.
 					fmt.Printf("Received %v; stopping before the next nuke.\n", sig)
-					return nil
+					break nukeLoop
 				default:
 				}
 				// The detection snapshot can be minutes old (sling may have reused this
@@ -2195,7 +2205,15 @@ func runPolecatStale(cmd *cobra.Command, args []string) error {
 					continue
 				}
 				fmt.Printf("Nuking %s...\n", info.Name)
-				if err := nukePolecatFullWithOptions(info.Name, rigName, mgr, r, nukePolecatOptions{PurgeClosedEphemerals: !batchPurge}); err != nil {
+				opts := nukePolecatOptions{
+					PurgeClosedEphemerals: !batchPurge,
+					RemovalGuard:          mgr.StaleRemovalGuard(info, polecatStaleThreshold),
+				}
+				if err := nukePolecatFullWithOptions(info.Name, rigName, mgr, r, opts); err != nil {
+					if errors.Is(err, polecat.ErrNoLongerStale) {
+						fmt.Printf("  Skipped %s: %v\n", info.Name, err)
+						continue
+					}
 					fmt.Printf("  %s (%v)\n", style.Error.Render("failed"), err)
 				} else {
 					nuked++
