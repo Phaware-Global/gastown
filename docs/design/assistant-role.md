@@ -59,11 +59,15 @@ symptom.
 6. Keep its own inbox at zero: every processed message is marked read.
 
 **Secondary — periodic sweep.** At the configured interval (default 1h) a
-sweep plugin mails the assistant. The assistant then reviews open work in
-beads and sends the Mayor a `SWEEP:` mail covering stalled decisions,
-blocked external actors (PRs awaiting human review, unanswered Jira threads),
-unslung ready work, and anything that needs executive action. Sweeps are
-mail, not nudges, so they never interrupt the Mayor mid-task.
+sweep plugin mails the assistant. The assistant then runs `gt assistant
+sweep`, which executes every enabled **sweep port** — deterministic checks
+against beads *and* the external systems the town works in (Jira and GitHub
+first) — and sends the Mayor a `SWEEP:` mail covering stalled decisions,
+unanswered external threads, blocked external actors (PRs awaiting human
+review, tickets waiting on a human), unslung ready work, board and WIP
+hygiene, and anything that needs executive action. Sweeps are mail, not
+nudges, so they never interrupt the Mayor mid-task. See
+[Sweep ports](#sweep-ports).
 
 **Non-responsibilities.**
 
@@ -281,11 +285,262 @@ Other plugins that mail `mayor/` with findings (sentinels, reports) are
 retargeted to `assistant/` as part of the routing change; their gates
 are untouched.
 
+## Sweep ports
+
+The old loose-ends nudge asked the Mayor to sweep five buckets by hand:
+unanswered Jira threads, blocked PRs, stalled beads, unslung work, and the
+Mayor's own assigned Jira tickets. The Mayor's sweep replies on the live town
+(Aug–Oct 2026, `~/gt/mayor` sessions) show what that costs: every sweep
+re-queries Jira and GitHub with the same questions, reasons about the same
+thresholds ("re-ping only if the review has waited more than a day", "rank
+changes are not updates"), and occasionally forgets a bucket. Those checks
+are deterministic. They belong in Go, run by the assistant, with the agent's
+judgement reserved for what the findings mean.
+
+### Port model
+
+A sweep port is a Go implementation of one interface, registered by name:
+
+```go
+// internal/assistant/sweep
+type Port interface {
+    Name() string                                   // "beads", "jira", "github"
+    Sweep(ctx context.Context, in Input) ([]Finding, error)
+}
+
+type Finding struct {
+    Port     string            // which port produced it
+    Kind     string            // stable identifier, see the tables below
+    Key      string            // issue key, "owner/repo#123", bead ID
+    URL      string
+    Since    time.Time         // when the condition started (comment time, request time)
+    Severity string            // "urgent" | "actionable" | "info"
+    Suggest  string            // one-line action built from IDs only (key, PR number, repo, rig, bead ID)
+    Fields   map[string]string // machine facts only: status, head SHA, account ID, counts, timestamps
+    External map[string]string // EVERY human-authored or display value: title, comment excerpt,
+                               // actor display name, assignee name — rendered fenced, never trusted
+}
+```
+
+`Fields` may hold only values the port computed or read from an API as an
+opaque identifier; anything a person could have typed (titles, comment
+bodies, display names, labels) goes in `External`. `Suggest` is assembled
+from `Key`/`Fields` and never from `External`.
+
+`gt assistant sweep` loads the town's sweep config, runs each enabled port
+with a bounded timeout, dedupes against the last *acknowledged* run, and
+prints a report (`--json` for machines, Markdown by default) grouped by port
+and kind. A port that fails (missing token, API down) is reported as a port
+error, not as "all clear": the assistant must never tell the Mayor a bucket
+is empty because the check could not run.
+
+**The runner owns the trust boundary.** The report is command output read
+by an agent that runs with permissions bypassed, so the fence is applied
+before the agent sees the text, not after. In both the Markdown and
+`--json` output every `External` value is emitted inside an
+`--- EXTERNAL CONTENT (untrusted: <port>/<key>) ---` block with the same
+delimiter/heading neutralization and byte cap that Telegraph's transform
+applies (`neutralizeDelimiters`, `body_cap`); the JSON form carries them
+under an `external` object that the assistant's prompt names as untrusted.
+Nothing human-authored appears outside a fence, in `Suggest`, or in
+`Fields`.
+
+```mermaid
+flowchart LR
+    TRIG["assistant-sweep plugin<br/>(cooldown = assistant_sweep_interval)"] -- "SWEEP: due" --> A
+    A["assistant session"] -- "gt assistant sweep" --> S["sweep runner<br/>(Go, deterministic)"]
+    S --> B["beads port"]
+    S --> J["jira port"]
+    S --> G["github port"]
+    B --> R["report: findings + port errors<br/>(deduped vs last run)"]
+    J --> R
+    G --> R
+    R --> A
+    A -- "SWEEP: mail (judgement, grouping, suggestions)" --> M["mayor/"]
+```
+
+**Dedup and state.** The runner keeps `<town>/assistant/.runtime/sweep-state.json`:
+for each `(port, kind, key)` it stores the fingerprint last **acknowledged**
+(comment ID, head SHA, status, updated-at). A finding is **new** when the
+fingerprint differs from the acknowledged one, **standing** otherwise. The
+report lists new findings in full and standing ones as counts with the
+oldest age, so the `SWEEP:` mail is short and the Mayor is never re-briefed
+on an unchanged item.
+
+State advances only when the Mayor has actually been told. `gt assistant
+sweep` writes the run's fingerprints to a *pending* file keyed by a run ID
+printed at the top of the report; the assistant sends the `SWEEP:` mail and
+then runs `gt assistant sweep --ack <run-id>`, which commits that pending
+set as acknowledged. A run that is never acked (session died before
+mailing, context compacted, health-kill) leaves the acknowledged state
+untouched, so the next run reports the same findings as new again. Manual
+re-checks (`--json`, `--dry-run`, or any run outside the sweep protocol)
+never write state. Entries are **evicted** when their condition clears
+(the finding is absent from a run), so a recurrence with the same
+fingerprint — a CI re-run failing on the same head — is new again rather
+than standing. Reminders to humans (the GitHub review re-ping) are
+rate-limited by the acknowledged state only: a reminder that was never
+mailed is not counted as sent.
+
+**Trust.** Port output is data. The runner fences it (above); the assistant
+then carries the fenced blocks into briefings unchanged per the
+[trust boundary](#trust-boundary). The assistant never builds an action from
+anything inside a fence.
+
+**Identity and credentials.** Ports reuse what Telegraph already knows
+about the town's persona, matched by **immutable identifiers only**:
+`telegraph.mayor.jira_account_ids` (Jira account IDs) and
+`telegraph.mayor.github_logins`. Jira display names
+(`telegraph.mayor.jira_usernames`) are never used for matching in the sweep:
+a display name is mutable and non-unique, so an account renamed to the
+persona's name could otherwise suppress `unanswered-comment` findings on
+every sweep. Secrets come from the environment, never from settings files:
+`JIRA_API_TOKEN` (plus the persona's Jira email) as the existing
+`jira-move-to-board` skill already requires, and `GITHUB_TOKEN` or an
+authenticated `gh` as the merge queue already requires. A port with no
+credentials disables itself and reports why.
+
+**Humans.** One rule, used by every check that asks "is this a person we
+wait on": an actor is a human when its immutable ID (Jira `accountId`,
+GitHub login) is in the port's `humans` list. The persona and known bots
+(`Automation for Jira`, the internal reviewer login, GitHub apps) are never
+humans even if listed. Actors outside the list are neither: their comments
+are reported under a separate `unknown-actor` note rather than silently
+counted or ignored, so a new team member shows up as a config gap instead
+of a missed thread.
+
+### Beads port
+
+Replaces the inline `bd` queries the template lists today, so the beads
+bucket goes through the same dedup and report path.
+
+| Kind | Condition | Suggest |
+|---|---|---|
+| `stalled-decision` | open escalation or bead assigned to `mayor/` with no activity for `stale_after` | decide / `gt escalate ack` |
+| `stalled` | open bead `in_progress`/`hooked` with no update for `stale_after` | reassign, sling onward, or close with reason |
+| `blocked` | `bd blocked` entries whose blocker has not moved for `stale_after` | chase the blocker |
+| `unslung` | `bd ready` beads with no hook | `gt sling <id> <rig>` |
+| `convoy-stuck` | convoy with no progress for `stale_after` | review the convoy |
+
+### Jira port
+
+Checks derived from the Mayor's sweep history, the Telegraph operator
+prompts, and the `jira-move-to-board` / `orchestrate-release-wave` skills.
+All queries are JQL against the configured projects, scoped to issues the
+persona is involved in (assignee, reporter, or @-mentioned) unless noted.
+
+| Kind | Condition (deterministic) | Why it exists |
+|---|---|---|
+| `unanswered-comment` | last comment on an involved issue is by a listed human (by account ID) and is older than `unanswered_after`; or any comment @-mentions the persona's account ID with no later persona comment | The loose-ends bucket the Mayor checked first every sweep ("new human comments in Jira first") |
+| `question-unanswered` | last comment is the persona's and contains a question or the issue is `Blocked`, with no human reply for `chase_after` | Operator prompt: block and ask, then wait — someone must notice the wait |
+| `needs-status-update` | issue assigned to the persona in an active status (`To Do`, `Research`, `In Progress`, `In Review`) with no persona comment or status change for `status_update_after`; a queued (`To Do`) issue with no comment at all saying why it waits is reported regardless of age | Loose-ends bucket 5 ("a note on any assigned issue that's waiting"); status sweeps requested by the product owner; the Mayor's own check "5 of my 46 open tickets may lack a note on why they're waiting" |
+| `review-handoff` | issue whose linked PR is waiting on a human reviewer but is not in `In Review` or not assigned to that reviewer; and the reverse — issue in `In Review` whose PR has changes requested or was handed back, still assigned to the reviewer instead of the persona in `In Progress` | Standing rule from the overseer (2026-10-14): work handed over for review is assigned to the reviewer and moved to In Review; handed back means In Progress again |
+| `off-board` | issue in an active status, or created by the persona in the last `off_board_window`, that is not on the configured board (backlog) | `jira-move-to-board`: new issues are stranded in the backlog; "off-board WIP" sweeps |
+| `wip-over-limit` | persona's `In Progress` + `Research` count exceeds `wip_limit` (severity `info`: a human can override the limit for a ticket, as the product owner has done) | WIP limit the Mayor already checks ("3 In Progress + 1 Research = 4, not over") |
+| `done-not-in-uat` | issue transitioned to `Done` by the persona, linked to a PR merged into a release branch, not moved to `In UAT` within `uat_sweep_after` | Release-wave phase 2 Jira sweep |
+| `release-wave-stale` | open "Release wave" parent whose subtasks have not changed for `stale_after` | Release-wave skill: waves stall after UAT |
+
+Explicitly **not** findings, because the sweep history shows they are noise:
+rank-only updates (board reordering logs an `issue.updated` with no field
+change); `Done` transitions by humans on old tickets; acknowledgement
+comments ("thanks").
+
+Config (`settings/config.json`):
+
+```json
+"assistant": {
+  "sweep": {
+    "ports": ["beads", "jira", "github"],
+    "jira": {
+      "site": "example.atlassian.net",
+      "email": "persona@example.com",
+      "token_env": "JIRA_API_TOKEN",
+      "projects": ["PROJ"],
+      "board_id": 1,
+      "humans": ["<product-owner-accountId>", "<reviewer-accountId>"],
+      "active_statuses": ["To Do", "Research", "In Progress", "In Review"],
+      "wip_limit": 4,
+      "unanswered_after": "4h",
+      "chase_after": "1d",
+      "status_update_after": "3d",
+      "off_board_window": "7d",
+      "uat_sweep_after": "1d",
+      "stale_after": "3d"
+    }
+  }
+}
+```
+
+### GitHub port
+
+Checks derived from the sweep history (review re-pings, "nothing to merge"
+checks), the loose-ends bucket 2 rules, and the merge-queue conventions.
+Repos come from the town's rig registry plus `telegraph.providers.github
+.extra_repos`; "our" PRs are those authored by the persona or by town
+agents.
+
+| Kind | Condition (deterministic) | Why it exists |
+|---|---|---|
+| `ready-for-human-review` | our PR whose internal reviewer (`pr_reviewer`) approved the current head, CI green, and no human review request yet | The Mayor's gate before asking a human: "the internal reviewer approved the current head and CI is green, so I can ask the human reviewer to review this version" |
+| `review-waiting` | open PR with a review requested from a human, no review from them on the current head, request older than `remind_after`; re-reported once per `remind_after` | "Re-ping only if the review has waited more than a day"; never re-ping a revision that already has a request |
+| `approval-stale` | open PR a human approved on an earlier head; new commits since, no re-approval | "Confirming the change is the same as what the reviewer approved, then asking for re-approval" |
+| `approved-unmerged` | open PR approved by the required human on its current head, CI green, not merged for `approved_unmerged_after` | Every sweep asked "does any open PR have the human reviewer's approval on its current head?" |
+| `changes-requested-stale` | our PR with `CHANGES_REQUESTED` or unresolved threads older than `respond_after` and no newer push | Loose-ends bucket 2: respond before the reviewer has to ask again |
+| `no-review-loop` | our PR in a rig with `pr_reviewer` configured, open longer than `review_loop_after`, with no review from that login | "If no internal reviewer loop has been performed, start one" |
+| `ci-failing` | open PR whose latest check suite failed for `ci_failing_after` and has no open fix bead — the bead `mol-pr-feedback-patrol` creates, labelled `pr-num-<N>` (title "Fix CI failure on PR #<N>") | The town already dispatches CI fixes through the PR-feedback patrol; reporting a PR that a polecat is fixing invites the duplicate review-fix dispatch the town has suffered from. (`github-sheriff` records only ephemeral plugin-run summaries; it is not a dedup source.) |
+| `release-unclosed` | merged PR into one of the repo's release branches (per-repo config, default `release/*`) in the last `release_window`, where no tag is reachable from the merge commit | Release-wave phases 4–5 are the ones that quietly stall |
+| `draft-stale` | our draft PR with no push for `stale_after` | Abandoned work hides in drafts |
+
+Orphan PRs and closed-bead/open-PR pairs stay with their existing plugins,
+which already mail the assistant; the port does not duplicate them.
+
+```json
+"github": {
+  "token_env": "GITHUB_TOKEN",
+  "extra_repos": [],
+  "humans": ["<reviewer-github-login>"],
+  "release_branches": {"<owner/repo>": ["release/*"]},
+  "remind_after": "24h",
+  "approved_unmerged_after": "4h",
+  "respond_after": "12h",
+  "review_loop_after": "2h",
+  "ci_failing_after": "1h",
+  "release_window": "14d",
+  "stale_after": "7d"
+}
+```
+
+### Sweep protocol (assistant side)
+
+1. On `SWEEP: loose-ends sweep due` (or when overdue and idle): run
+   `gt assistant sweep`; note the run ID.
+2. Compose the `SWEEP:` mail from the report: new findings in full, standing
+   counts, port errors stated as "not checked: <reason>", fenced blocks
+   carried verbatim, suggestions only from the report's `Suggest` lines.
+3. Send it to `mayor/`; then `gt assistant sweep --ack <run-id>`.
+4. If step 3 fails, do not ack; the next sweep reports everything again.
+
+### Adding a port
+
+A new port (Azure DevOps approvals, Slack mentions, …) is one Go package
+under `internal/assistant/sweep/<name>` implementing `Port`, a config block
+under `assistant.sweep.<name>`, and a row in this document. Ports never
+write to the external system; the assistant reports, the Mayor acts.
+
+### Delivery
+
+Adds three layers to the stack after the template PR: the sweep runner with
+the beads port and `gt assistant sweep` (plus the template change that
+replaces the inline `bd` queries with the command), then the Jira port, then
+the GitHub port. Each port lands with a recorded-response test suite for its
+API queries and a dry-run mode that prints the queries it would issue.
+
 ## Configuration reference
 
 | Setting | Where | Default | Purpose |
 |---|---|---|---|
 | `assistant_sweep_interval` | `settings/config.json` (town) | `"1h"` | Cooldown for the `assistant-sweep` plugin. Any Go duration string (`"30m"`, `"2h"`). Rendered into the assistant's prompt so it knows its cadence. |
+| `assistant.sweep` | `settings/config.json` (town) | beads port only | Enabled sweep ports and their per-port settings (humans, thresholds, Jira site/board, GitHub repos). See [Sweep ports](#sweep-ports). Secrets come from the named environment variables, never from the file. |
 | `role_agents["assistant"]` | `settings/config.json` (town) | town `default_agent` | Agent/model preset for the assistant, resolved through the same 3-tier hierarchy as every other role. |
 | `roles/assistant.toml` | `<town>/roles/` | built-in | Override session pattern, work dir, start command, health thresholds, nudge, or template name. |
 | `theme.role_defaults["assistant"]` | `mayor/config.json` | `slate` | tmux theme for the session. |
