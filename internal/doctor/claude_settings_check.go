@@ -225,6 +225,18 @@ func (c *ClaudeSettingsCheck) findSettingsFiles(townRoot string) []staleSettings
 			missing:       []string{"stale settings.local.json (should be settings.json)"},
 		})
 	}
+
+	// Town-level: assistant - check for stale settings.local.json (should be settings.json)
+	assistantStaleLocal := filepath.Join(townRoot, "assistant", ".claude", "settings.local.json")
+	if fileExists(assistantStaleLocal) {
+		files = append(files, staleSettingsInfo{
+			path:          assistantStaleLocal,
+			agentType:     "assistant",
+			sessionName:   "hq-assistant",
+			wrongLocation: true,
+			missing:       []string{"stale settings.local.json (should be settings.json)"},
+		})
+	}
 	// Check for correct settings.json
 	mayorSettings := filepath.Join(townRoot, "mayor", ".claude", "settings.json")
 	mayorWorkDir := filepath.Join(townRoot, "mayor")

@@ -105,7 +105,7 @@ func (c *SparseCheckoutCheck) discoverRigPaths(townRoot string) []string {
 		}
 		name := entry.Name()
 		// Skip known non-rig directories
-		if name == "mayor" || name == "deacon" || name == "daemon" ||
+		if name == "mayor" || name == "assistant" || name == "deacon" || name == "daemon" ||
 			name == ".git" || name == "docs" || name[0] == '.' {
 			continue
 		}
