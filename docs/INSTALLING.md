@@ -324,6 +324,20 @@ gt version
 gt doctor --fix
 ```
 
+On macOS, if you have granted `gt` Full Disk Access or Removable Volumes
+access, sign the installed binary with a stable identity so those grants
+survive rebuilds. Create a self-signed Code Signing certificate in Keychain
+Access (for example `gt-local`), then install with:
+
+```bash
+make install GT_CODESIGN_IDENTITY=gt-local
+```
+
+Set `GT_CODESIGN_IDENTITY` in the shell environment that runs rebuilds to make
+this the default. Re-grant the privacy permissions once after the first signed
+install; later rebuilds keep them. Signing needs the login keychain, so run it
+from a GUI login session (a tmux session is fine), not a bare ssh session.
+
 If you maintain Beads separately from Homebrew, update `bd` from its own source:
 
 ```bash

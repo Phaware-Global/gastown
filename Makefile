@@ -4,6 +4,19 @@ BINARY := gt
 BINARY_DESKTOP := gt-desktop
 BUILD_DIR := .
 INSTALL_DIR := $(HOME)/.local/bin
+# Optional: sign the installed gt with a stable keychain identity (macOS).
+# An ad-hoc signature hashes differently on every build, so macOS TCC grants
+# (Full Disk Access, Removable Volumes) stop matching after each rebuild and
+# tccd re-hashes the binary on every gt call until an operator re-grants them.
+# A self-signed Code Signing certificate keeps the designated requirement
+# stable across rebuilds. Opt in with: make install GT_CODESIGN_IDENTITY=gt-local
+GT_CODESIGN_IDENTITY ?=
+define codesign-binary
+	if [ -n "$(GT_CODESIGN_IDENTITY)" ]; then \
+		codesign -f -s "$(GT_CODESIGN_IDENTITY)" --identifier com.gastown.$(BINARY) "$(1)" && \
+		echo "Signed $(1) with identity $(GT_CODESIGN_IDENTITY)"; \
+	fi
+endef
 # Per-platform artifacts for push_binaries (§4.1). A worker is refreshed from
 # the tree matching ITS os/arch, which is why this exists at all: the two
 # pushable binaries are pure Go and cross-compile in seconds, so a macOS
@@ -117,6 +130,7 @@ install: check-up-to-date build
 	@mkdir -p $(INSTALL_DIR)
 	@rm -f $(INSTALL_DIR)/$(BINARY)
 	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY)
+	@$(call codesign-binary,$(INSTALL_DIR)/$(BINARY))
 	@$(MAKE) --no-print-directory install-remote-execution-binaries
 	@# Nuke any stale go-install binaries that shadow the canonical location
 	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY); do \
@@ -149,6 +163,7 @@ safe-install: check-up-to-date check-forward-only build
 	@mkdir -p $(INSTALL_DIR)
 	@# Atomic-ish replace: copy to temp then move (move is atomic on same filesystem)
 	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY).new
+	@$(call codesign-binary,$(INSTALL_DIR)/$(BINARY).new)
 	@mv $(INSTALL_DIR)/$(BINARY).new $(INSTALL_DIR)/$(BINARY)
 	@$(MAKE) --no-print-directory install-remote-execution-binaries
 	@# Nuke any stale go-install binaries that shadow the canonical location
