@@ -338,10 +338,15 @@ legal rig name (rig names may not contain hyphens, so `mayors-assistant`
 never was). The registration PR therefore reserves it — `rig.AddRig` rejects
 it like `hq`, and the polecat name pool lists it with `mayor` and `deacon` —
 and treats `<town>/assistant` as a system directory in every town-root scan
-that already skips `mayor/` and `deacon/`. A town upgraded with an existing
-rig named `assistant` is not migrated: `gt assistant start` (and the daemon's
-ensure-running) refuse with an error naming the conflict, and the operator
-renames the rig first.
+that already skips `mayor/` and `deacon/`. A town with an existing rig named
+`assistant` is not migrated, and the exclusion takes effect at **upgrade**,
+not at first start: from the moment the new binary runs, that rig is skipped
+by the scheduler's beads search, the hooks installer, and the
+done/hook/unsling rig fallbacks, and cwd role detection resolves its
+witness, refinery and polecats as the assistant. Such a rig must be renamed
+before upgrading. As a backstop, `gt assistant start` (and the daemon's
+ensure-running) refuse with an error that names the conflict and says the
+rig has been excluded since the upgrade.
 
 ## Rejected alternatives
 
