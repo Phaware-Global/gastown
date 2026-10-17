@@ -127,7 +127,7 @@ Town-level role defaults live in `mayor/config.json` under:
 }
 ```
 
-`role_defaults` supports `mayor`, `mayors-assistant`, `deacon`, `witness`, `refinery`, `crew`, and `polecat`.
+`role_defaults` supports `mayor`, `assistant`, `deacon`, `witness`, `refinery`, `crew`, and `polecat`.
 
 **Merge queue fields:**
 
@@ -283,7 +283,7 @@ These are set in tmux session environment when agents are spawned.
 
 | Variable | Purpose | Example |
 |----------|---------|---------|
-| `GT_ROLE` | Agent role type | `mayor`, `mayors-assistant`, `witness`, `polecat`, `crew` |
+| `GT_ROLE` | Agent role type | `mayor`, `assistant`, `witness`, `polecat`, `crew` |
 | `GT_ROOT` | Town root directory | `/home/user/gt` |
 | `BD_ACTOR` | Agent identity for attribution | `gastown/polecats/toast` |
 | `GIT_AUTHOR_NAME` | Commit attribution (same as BD_ACTOR) | `gastown/polecats/toast` |
@@ -311,7 +311,7 @@ These are set in tmux session environment when agents are spawned.
 | Role | Key Variables |
 |------|---------------|
 | **Mayor** | `GT_ROLE=mayor`, `BD_ACTOR=mayor` |
-| **Mayor's Assistant** | `GT_ROLE=mayors-assistant`, `BD_ACTOR=mayors-assistant` |
+| **Mayor's Assistant** | `GT_ROLE=assistant`, `BD_ACTOR=assistant` |
 | **Deacon** | `GT_ROLE=deacon`, `BD_ACTOR=deacon` |
 | **Boot** | `GT_ROLE=deacon/boot`, `BD_ACTOR=deacon-boot` |
 | **Witness** | `GT_ROLE=witness`, `GT_RIG=<rig>`, `BD_ACTOR=<rig>/witness` |
@@ -341,7 +341,7 @@ Understanding this hierarchy is essential for proper configuration.
 | Role | Working Directory | Notes |
 |------|-------------------|-------|
 | **Mayor** | `~/gt/mayor/` | Town-level coordinator, isolated from rigs |
-| **Mayor's Assistant** | `~/gt/mayors-assistant/` | Town-level inbound triage ([design](design/mayors-assistant-role.md)) |
+| **Mayor's Assistant** | `~/gt/assistant/` | Town-level inbound triage ([design](design/assistant-role.md)) |
 | **Deacon** | `~/gt/deacon/` | Background supervisor daemon |
 | **Witness** | `~/gt/<rig>/witness/` | No git clone, monitors polecats only |
 | **Refinery** | `~/gt/<rig>/refinery/rig/` | Worktree on main branch |
@@ -583,7 +583,7 @@ gt sling <bead> <rig>                    # Auto-convoy for dashboard visibility
 Agent overrides:
 
 - `gt start --agent <alias>` overrides the Mayor/Deacon runtime for this launch.
-- `gt mayor start|attach|restart --agent <alias>`, `gt mayors-assistant start|attach|restart --agent <alias>`, and `gt deacon start|attach|restart --agent <alias>` do the same.
+- `gt mayor start|attach|restart --agent <alias>`, `gt assistant start|attach|restart --agent <alias>`, and `gt deacon start|attach|restart --agent <alias>` do the same.
 - `gt start crew <name> --agent <alias>` and `gt crew at <name> --agent <alias>` override the crew worker runtime.
 
 ### Communication
