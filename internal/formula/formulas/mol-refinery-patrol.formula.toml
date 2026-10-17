@@ -207,10 +207,12 @@ id = "inbox-check"
 target = "refinery"
 title = "Check refinery mail"
 description = """
-First, clean up CLOSED wisps from previous cycles:
-```bash
-bd mol wisp gc --closed --force
-```
+Do NOT purge closed wisps from this patrol (gt-9yhyh). A blanket closed-wisp
+purge deletes every closed wisp regardless of age or close reason, including the
+merge-request wisp of an open PR that something closed by mistake; wisps are not
+in Dolt history, so the row and its evidence are unrecoverable. Closed-wisp
+cleanup belongs to the reaper, which purges by age and keeps unmerged
+merge-request wisps for at least 24h.
 
 > **Warning (gt-7ie, hga-27i):** Do not run age-based wisp GC (`--age`) from
 > inside this patrol. It treats any non-closed wisp older than the threshold
