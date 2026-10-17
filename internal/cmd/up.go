@@ -207,7 +207,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 	var doltSkipped bool
 
 	var startupWg sync.WaitGroup
-	startupWg.Add(5)
+	startupWg.Add(6) // dolt, daemon, deacon, mayor, mayor's assistant, rig prefetch
 
 	// 0. Dolt server (if configured)
 	go func() {
