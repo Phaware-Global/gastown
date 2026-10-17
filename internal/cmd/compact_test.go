@@ -397,6 +397,11 @@ func manyWispRows(prefix, status string, n int) string {
 	return "[" + strings.Join(rows, ",") + "]"
 }
 
+// typed gives every wisp in rows the wisp_type t.
+func typed(rows, t string) string {
+	return strings.ReplaceAll(rows, `"wisp_type":""`, `"wisp_type":"`+t+`"`)
+}
+
 var compactTestNow = time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
 
 // withCompactFlags isolates the package-level flags and zeroes the write pause.
@@ -562,7 +567,7 @@ func TestPlanCompactionCapsDeletesOldestFirst(t *testing.T) {
 }
 
 func TestPlanCompactionCapsPromotes(t *testing.T) {
-	f := newFakeBD(manyWispRows("p", "open", 300))
+	f := newFakeBD(typed(manyWispRows("p", "open", 300), "error"))
 	wisps, _ := listWispsWith(f.run)
 	plan := planWispCompaction(wisps, defaultTTLs, compactTestNow, compactLimits{MaxPromotes: 100, MaxDeletes: 500})
 	if len(plan.Promote) != 100 || plan.DeferredPromotes != 200 {
@@ -703,7 +708,7 @@ func TestPlanCompactionLeavesLiveAssignmentsAndOpenMail(t *testing.T) {
 		wispRow("hooked", "hooked", "2026-01-01T00:00:00Z", ""),
 		wispRow("pinned", "pinned", "2026-01-01T00:00:00Z", ""),
 		wispRow("mail", "open", "2026-01-01T00:00:00Z", ""),
-		wispRow("plain", "open", "2026-01-01T00:00:00Z", ""),
+		typed(wispRow("plain", "open", "2026-01-01T00:00:00Z", ""), "error"),
 	}, ",") + "]"
 	f := newFakeBD(wisps)
 	f.labels = `[{"issue_id":"mail","label":"gt:message"}]`
@@ -812,5 +817,79 @@ func TestCompactDocsDoNotPromiseDeletedWispsAreRecoverable(t *testing.T) {
 	}
 	if strings.Contains(string(data), "AS OF preserves") {
 		t.Errorf("compact.go still carries the false 'AS OF preserves history' comment")
+	}
+}
+
+// --- promotion needs a sign of real work ---
+
+// ~7k orphaned dog formula steps and acked escalations on a busy town would
+// otherwise become permanent open issues (round 3).
+func TestPlanCompactionDoesNotPromoteOrphanedStepsOrAckedEscalations(t *testing.T) {
+	wisps := "[" + strings.Join([]string{
+		wispRow("dog-step", "open", "2026-01-01T00:00:00Z", `,"has_parent":0`),
+		typed(wispRow("acked-esc", "open", "2026-01-01T00:00:00Z", ""), "escalation"),
+	}, ",") + "]"
+	f := newFakeBD(wisps)
+	f.labels = `[{"issue_id":"acked-esc","label":"gt:escalation"},{"issue_id":"acked-esc","label":"acked"}]`
+	got, err := listWispsWith(f.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := planWispCompaction(got, defaultTTLs, compactTestNow, testCompactLimits)
+	if len(plan.Promote) != 0 || len(plan.Delete) != 0 {
+		t.Fatalf("orphaned step / acked escalation planned for a write: promote %+v delete %+v", plan.Promote, plan.Delete)
+	}
+	if plan.OrphanedOpen != 1 {
+		t.Errorf("orphaned_open = %d, want 1 (the untyped step)", plan.OrphanedOpen)
+	}
+	if plan.Skipped != 1 {
+		t.Errorf("skipped = %d, want 1 (the acked escalation)", plan.Skipped)
+	}
+}
+
+func TestPlanCompactionStillPromotesRealStuckWork(t *testing.T) {
+	wisps := "[" + strings.Join([]string{
+		typed(wispRow("stuck-error", "open", "2026-01-01T00:00:00Z", ""), "error"),
+		typed(wispRow("unacked-esc", "open", "2026-01-01T00:00:00Z", ""), "escalation"),
+		wispRow("claimed", "in_progress", "2026-01-01T00:00:00Z", ""),
+		wispRow("kept", "open", "2026-01-01T00:00:00Z", ""),
+	}, ",") + "]"
+	f := newFakeBD(wisps)
+	f.labels = `[{"issue_id":"kept","label":"keep"},{"issue_id":"unacked-esc","label":"gt:escalation"}]`
+	got, _ := listWispsWith(f.run)
+	plan := planWispCompaction(got, defaultTTLs, compactTestNow, testCompactLimits)
+	if len(plan.Promote) != 4 || plan.OrphanedOpen != 0 {
+		t.Fatalf("want all 4 promoted, got %d (orphaned %d): %+v", len(plan.Promote), plan.OrphanedOpen, plan.Promote)
+	}
+}
+
+func TestRunCompactReportsOrphanedOpenWithoutWriting(t *testing.T) {
+	withCompactFlags(t)
+	f := newFakeBD(manyWispRows("o", "open", 25))
+	result, err := runCompactWith(f.run, defaultTTLs, compactTestNow, testCompactLimits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.OrphanedOpen != 25 || len(f.writes) != 0 {
+		t.Fatalf("orphaned_open %d writes %v, want 25 and none", result.OrphanedOpen, f.writes)
+	}
+}
+
+func TestSetTTLEnforcesMinimum(t *testing.T) {
+	for _, value := range []string{"1ns", "1s", "59m", "30m59s"} {
+		ttls := map[string]time.Duration{"default": 24 * time.Hour}
+		applyTTLLabels(ttls, []string{"wisp_ttl_default:" + value})
+		applyTTLConfig(ttls, map[string]interface{}{"patrol": value})
+		if ttls["default"] != 24*time.Hour {
+			t.Errorf("label TTL %q below the floor was accepted: %v", value, ttls["default"])
+		}
+		if _, ok := ttls["patrol"]; ok {
+			t.Errorf("config TTL %q below the floor was accepted", value)
+		}
+	}
+	ttls := map[string]time.Duration{}
+	applyTTLLabels(ttls, []string{"wisp_ttl_default:1h"})
+	if ttls["default"] != time.Hour {
+		t.Errorf("a TTL at the floor must be accepted, got %v", ttls["default"])
 	}
 }

@@ -52,6 +52,7 @@ type compactResult struct {
 	Promoted         []compactAction `json:"promoted"`
 	Deleted          []compactAction `json:"deleted"`
 	Skipped          int             `json:"skipped"`                     // wisps still within TTL, or exempt
+	OrphanedOpen     int             `json:"orphaned_open,omitempty"`     // untyped open wisps with no sign of real work, left alone
 	DeferredPromotes int             `json:"deferred_promotes,omitempty"` // eligible but over --max-promotes
 	DeferredDeletes  int             `json:"deferred_deletes,omitempty"`  // eligible but over --max-deletes
 	OrphanedWispDeps int             `json:"orphaned_wisp_deps"`          // stale wisp_dependencies removed
@@ -79,8 +80,11 @@ Wisps with comments or keep labels are always promoted.
 Each run is capped (--max-promotes, --max-deletes), oldest wisps first, and
 writes are batched and paced; a large backlog drains over successive runs.
 Left alone regardless of age: open merge-request wisps and closed ones inside
-the reaper's 24h recovery window, hooked or pinned wisps, open mail, agent
-beads, and steps of a live molecule.
+the reaper's 24h recovery window, hooked or pinned wisps, open mail,
+acknowledged escalations, agent beads, and steps of a live molecule. Open
+untyped wisps with no parent (orphaned formula steps) are counted, not
+promoted: promotion needs a wisp type, comments or a keep label. TTL overrides
+below 1h are ignored.
 
 TTLs by wisp type:
   heartbeat, ping:              6h
@@ -185,11 +189,15 @@ func applyTTLLabels(ttls map[string]time.Duration, labels []string) {
 	}
 }
 
-// setTTL parses value as a duration and stores it for wispType. A zero or
-// negative TTL would make every wisp of that type instantly deletable, and the
-// override can come from a label any agent may set, so it is ignored.
+// minWispTTL is the shortest TTL an override may set.
+const minWispTTL = time.Hour
+
+// setTTL parses value as a duration and stores it for wispType. A tiny TTL
+// (0s, -1h, 1ns) would make every wisp of that type deletable at once, and the
+// override can come from a label any agent may set, so anything under
+// minWispTTL is ignored.
 func setTTL(ttls map[string]time.Duration, wispType, value string) {
-	if d, err := time.ParseDuration(value); err == nil && d > 0 {
+	if d, err := time.ParseDuration(value); err == nil && d >= minWispTTL {
 		ttls[wispType] = d
 	}
 }
@@ -308,6 +316,7 @@ func runCompactWith(run wispSQLRunner, ttls map[string]time.Duration, now time.T
 	plan := planWispCompaction(allWisps, ttls, now, lim)
 	result := &compactResult{
 		Skipped:          plan.Skipped,
+		OrphanedOpen:     plan.OrphanedOpen,
 		DeferredPromotes: plan.DeferredPromotes,
 		DeferredDeletes:  plan.DeferredDeletes,
 		Errors:           plan.Errors,
@@ -329,6 +338,7 @@ type wispCompactPlan struct {
 	Promote          []compactAction
 	Delete           []compactAction
 	Skipped          int
+	OrphanedOpen     int // untyped open parentless wisps past TTL: not promoted
 	DeferredPromotes int // eligible, but over the per-run cap
 	DeferredDeletes  int
 	Errors           []string
@@ -347,6 +357,10 @@ func compactExemption(w *compactIssue) string {
 		return "merge-request wisp inside its recovery window"
 	case w.Status == "hooked" || w.Status == "pinned":
 		return "live assignment (" + w.Status + ")"
+	case !closed && hasLabel(w.Labels, "acked"):
+		// An acknowledged escalation is finished with; its own lifecycle
+		// closes it. Promoting it would resurrect it as an open issue.
+		return "acknowledged escalation"
 	case !closed && hasLabel(w.Labels, "gt:message"):
 		// Mail is aged out by the reaper's mail purge; promoting it would
 		// turn every unread message into a permanent bead.
@@ -405,8 +419,16 @@ func planWispCompaction(wisps []*compactIssue, ttls map[string]time.Duration, no
 			action.Reason = "molecule step past TTL"
 			plan.addDelete(action, lim)
 		case w.Status == "in_progress":
+			// Someone claimed it: a sign of real work that stalled.
 			action.Reason = "stuck in_progress past TTL"
 			plan.addPromote(action, lim)
+		case w.WispType == "":
+			// Open, parentless and untyped is what an orphaned formula step
+			// looks like (its molecule is gone). Age alone is no sign of real
+			// work, and promoting thousands would flood the issues table with
+			// open tasks. Promotion needs a type (error, escalation, ...),
+			// comments or a keep label; the rest is counted and left alone.
+			plan.OrphanedOpen++
 		default:
 			action.Reason = "open past TTL"
 			plan.addPromote(action, lim)
@@ -784,7 +806,14 @@ func printCompactSummary(result *compactResult) {
 
 	fmt.Printf("  Promoted: %d\n", promoted)
 	fmt.Printf("  Deleted:  %d\n", deleted)
-	fmt.Printf("  Skipped:  %d (within TTL)\n", result.Skipped)
+	fmt.Printf("  Skipped:  %d (within TTL or exempt)\n", result.Skipped)
+	if result.DeferredPromotes > 0 || result.DeferredDeletes > 0 {
+		fmt.Printf("  Deferred: %d promote(s), %d delete(s) over the per-run cap (re-run, or raise --max-promotes / --max-deletes)\n",
+			result.DeferredPromotes, result.DeferredDeletes)
+	}
+	if result.OrphanedOpen > 0 {
+		fmt.Printf("  Orphaned: %d open untyped wisp(s) left alone (not promoted)\n", result.OrphanedOpen)
+	}
 	if result.OrphanedWispDeps > 0 {
 		fmt.Printf("  Cleaned:  %d orphaned wisp dependency ref(s)\n", result.OrphanedWispDeps)
 	}
