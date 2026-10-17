@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/steveyegge/gastown/internal/mail"
@@ -195,29 +196,59 @@ func stripControls(text string) string {
 	}, text)
 }
 
+// trustMarkers are the phrases that, on a line of their own, an LLM reads as
+// a trust delimiter or trusted heading. Matched on the canonical form of each
+// line (see canonicalLine), never on raw bytes.
+var trustMarkers = []string{"EXTERNAL CONTENT", "OPERATOR PROMPT", strings.ToUpper(operatorPolicyHeading)}
+
+// canonicalLine reduces a line to the form an LLM effectively reads: Unicode
+// format characters (zero-width space/joiner, word joiner, …) dropped, any run
+// of whitespace (including NBSP) collapsed to one space, dash-like runes
+// (hyphens, en/em dashes, minus, small/fullwidth hyphen) folded to '-', and
+// everything upper-cased.
+func canonicalLine(line string) string {
+	var b strings.Builder
+	prevSpace := false
+	for _, r := range line {
+		switch {
+		case unicode.Is(unicode.Cf, r):
+			continue
+		case unicode.IsSpace(r):
+			if !prevSpace {
+				b.WriteByte(' ')
+				prevSpace = true
+			}
+			continue
+		case (r >= 0x2010 && r <= 0x2015) || r == 0x2212 || r == 0xFE58 || r == 0xFF0D:
+			r = '-'
+		}
+		prevSpace = false
+		b.WriteRune(unicode.ToUpper(r))
+	}
+	return strings.TrimSpace(b.String())
+}
+
 // neutralizeDelimiters defuses trust-delimiter lines inside external text so
 // a provider comment cannot close its own EXTERNAL CONTENT block, open a fake
 // OPERATOR PROMPT, or forge the assistant's "Operator policy" heading and
-// have the tail read as trusted. Any line that starts with "---" and names
-// either delimiter, or that contains the operator-policy heading, is prefixed
-// with a visible marker, which keeps the text readable but stops it matching
-// the real delimiters and headings emitted around it.
+// have the tail read as trusted. Line separators and control characters are
+// normalized first; then any line whose canonical form contains a trust
+// marker — regardless of leading dashes, zero-width characters, spacing or
+// dash variants — is prefixed with a visible marker, which keeps the text
+// readable but stops it reading as a real delimiter or heading.
 func neutralizeDelimiters(text string) string {
-	// Normalize every line separator first: a delimiter joined by \r, U+2028,
-	// U+2029 or U+0085 would otherwise sit inside a "line" the matcher never
-	// sees as starting with "---", while an LLM still reads it as a line.
 	text = stripControls(lineSeparators.Replace(text))
-	if !strings.Contains(text, "---") && !strings.Contains(strings.ToLower(text), operatorPolicyHeading) {
-		return text
-	}
 	lines := strings.Split(text, "\n")
 	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		upper := strings.ToUpper(trimmed)
-		delimiter := strings.HasPrefix(trimmed, "---") &&
-			(strings.Contains(upper, "EXTERNAL CONTENT") || strings.Contains(upper, "OPERATOR PROMPT"))
-		if delimiter || strings.Contains(strings.ToLower(trimmed), operatorPolicyHeading) {
-			lines[i] = "[neutralized delimiter] " + line
+		// Compare with spaces removed too: a zero-width character inside the
+		// phrase ("EXTERNAL\u200bCONTENT") is dropped by canonicalLine and
+		// leaves no space behind.
+		canon := strings.ReplaceAll(canonicalLine(line), " ", "")
+		for _, marker := range trustMarkers {
+			if strings.Contains(canon, strings.ReplaceAll(marker, " ", "")) {
+				lines[i] = "[neutralized delimiter] " + line
+				break
+			}
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -233,6 +264,14 @@ func buildFrom(event *telegraph.NormalizedEvent) string {
 //
 // Format: [<PROVIDER> <SUBJECT>] <EventType prose>
 func buildSubject(event *telegraph.NormalizedEvent) string {
+	// The subject sits outside the EXTERNAL CONTENT block and embeds the
+	// provider's subject key and actor verbatim; normalize the whole line so
+	// no Unicode line break or control character can smuggle a forged
+	// delimiter onto its own line.
+	return sanitizeHeaderValue(buildSubjectRaw(event))
+}
+
+func buildSubjectRaw(event *telegraph.NormalizedEvent) string {
 	provider := strings.ToUpper(event.Provider)
 	tag := fmt.Sprintf("[%s %s]", provider, event.Subject)
 
@@ -284,6 +323,10 @@ func reviewState(labels []string) string {
 // safeTitle returns at most the first line of text (no raw body content in subject).
 // Truncation is rune-based to avoid splitting multi-byte UTF-8 sequences.
 func safeTitle(text string) string {
+	// Subjects sit outside the EXTERNAL CONTENT block, so a forged delimiter
+	// after a Unicode line break would read as a real one: normalize breaks
+	// and controls exactly as the body does before cutting at the first line.
+	text = stripControls(lineSeparators.Replace(text))
 	if idx := strings.IndexByte(text, '\n'); idx >= 0 {
 		text = text[:idx]
 	}
@@ -314,6 +357,11 @@ func replyHintFor(provider string) string {
 // written into a header line. A newline in a header value would allow
 // injection of arbitrary header lines into the mail body.
 func sanitizeHeaderValue(s string) string {
+	// Header values (actor, labels, check names) sit outside the EXTERNAL
+	// CONTENT block: normalize every line separator and control character
+	// first so a U+2028- or VT-joined forged delimiter cannot survive as a
+	// line of its own, then drop the resulting newlines.
+	s = stripControls(lineSeparators.Replace(s))
 	return strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\r' {
 			return -1
