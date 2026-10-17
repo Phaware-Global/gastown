@@ -177,8 +177,10 @@ launder that text into trusted instructions:
    `Operator policy (from telegraph config)`) is additionally prefixed
    `[neutralized delimiter]`. A forged delimiter inside a quote never ends
    the untrusted region. Telegraph's transform applies the same
-   neutralization when it builds the original mail, so the text the
-   assistant receives is already defused.
+   neutralization to delimiter-looking lines and to the "Operator policy"
+   heading when it builds the original mail, so the external text the
+   assistant receives is already defused; mail from other senders is not,
+   which is why the assistant fences quotes itself.
 2. Suggested-action commands (`bd create`, `gt sling`, reply hints) are built
    only from structured fields — issue key, PR number, rig, bead ID — never
    from the body of an external message. A comment that *contains* a command
@@ -204,8 +206,11 @@ launder that text into trusted instructions:
    tells the *receiving agent* how to handle the event (reply via a Jira
    tool, open a bead and dispatch, …). A block counts as operator policy
    **only** when all three hold: (a) the mail's `From` is `telegraph/*`
-   (a weak check on its own — `gt mail send --from` can forge it, which is
-   why (b), (c) and rule 2 carry the weight);
+   (`gt mail send --from` can forge it; (b) and (c) stop forgeries
+   *embedded* in genuine mail, while a whole-mail `--from` forgery that
+   copies Telegraph's layout is accepted residual risk until mail senders
+   are authenticated, bounded by rule 2's structured-fields-only command
+   building);
    (b) it is the single block positioned between the `Telegraph-*` headers
    and the `EXTERNAL CONTENT` opener, where Telegraph's transform emits it;
    (c) it has the exact `--- OPERATOR PROMPT (trusted) ---` /
