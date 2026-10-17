@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -154,8 +155,13 @@ func runDailyDigest() error {
 		return nil
 	}
 
-	// Run compaction with --json to get results
-	compactOut, err := exec.Command("gt", "compact", "--json").Output()
+	// Run compaction with --json to get results. A previewed digest must not
+	// mutate: a real run deletes wisps permanently.
+	compactArgs := []string{"compact", "--json"}
+	if compactReportDryRun {
+		compactArgs = append(compactArgs, "--dry-run")
+	}
+	compactOut, err := exec.Command("gt", compactArgs...).Output()
 	if err != nil {
 		return fmt.Errorf("running compaction: %w", err)
 	}
@@ -172,6 +178,10 @@ func runDailyDigest() error {
 	}
 	bd := beads.New(workDir)
 	activeWisps, err := listWisps(bd)
+	if errors.Is(err, errNoWispTables) {
+		// Nothing to report on; the compaction above skipped such a database too.
+		activeWisps, err = nil, nil
+	}
 	if err != nil {
 		return fmt.Errorf("listing active wisps: %w", err)
 	}
@@ -265,6 +275,18 @@ func wispTypeToCategory(wispType, title string) string {
 // detectAnomalies checks for unusual patterns in the compaction data.
 func detectAnomalies(report *compactReport) []string {
 	var anomalies []string
+
+	// An all-empty report means the scan saw nothing at all. That is a blind
+	// scan, not evidence about any agent, so say so and skip the per-category
+	// inferences that would read emptiness as an outage.
+	seen := 0
+	for _, cat := range categoryOrder {
+		stats := report.Categories[cat]
+		seen += stats.Active + stats.Deleted + stats.Promoted
+	}
+	if seen == 0 {
+		return append(anomalies, "scan saw 0 wisps — compactor may be blind (check against `gt reaper scan`)")
+	}
 
 	for _, cat := range categoryOrder {
 		stats := report.Categories[cat]
