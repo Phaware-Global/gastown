@@ -188,6 +188,43 @@ func TestRenderRole_Refinery_DefaultBranch(t *testing.T) {
 	}
 }
 
+func TestRenderRole_MayorsAssistant(t *testing.T) {
+	tmpl, err := New()
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	data := RoleData{
+		Role:          "mayors-assistant",
+		TownRoot:      "/test/town",
+		TownName:      "test",
+		WorkDir:       "/test/town/mayors-assistant",
+		MayorSession:  "hq-mayor",
+		DeaconSession: "hq-deacon",
+		SweepInterval: "45m",
+	}
+	output, err := tmpl.RenderRole("mayors-assistant", data)
+	if err != nil {
+		t.Fatalf("RenderRole(mayors-assistant) error = %v", err)
+	}
+	// Load-bearing instructions: the briefing contract, inbox-zero, the
+	// configured sweep cadence, and the resolved session names.
+	for _, want := range []string{
+		"BRIEF:", "URGENT:", "SWEEP:",
+		"gt mail send mayor/",
+		"mail mark-read",
+		"**45m**",
+		"hq-mayor", "hq-deacon",
+		"Town root: /test/town",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("mayors-assistant template missing %q", want)
+		}
+	}
+	if strings.Contains(output, "<no value>") {
+		t.Error("mayors-assistant template rendered an unresolved variable")
+	}
+}
+
 func TestRenderRole_Reviewer(t *testing.T) {
 	tmpl, err := New()
 	if err != nil {
