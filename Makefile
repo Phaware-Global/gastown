@@ -15,8 +15,15 @@ INSTALL_DIR := $(HOME)/.local/bin
 # The macro signs the staged copy ($(1), always a .new file) before it is moved
 # into place, so a failed signature leaves the existing install untouched.
 GT_CODESIGN_IDENTITY ?=
+# Never export it: the install recipe restarts the daemon, and anything the
+# daemon spawns would otherwise inherit the identity.
+unexport GT_CODESIGN_IDENTITY
 define codesign-binary
 	if [ -n "$(GT_CODESIGN_IDENTITY)" ]; then \
+		case "$(GT_CODESIGN_IDENTITY)" in -*) \
+			echo "Error: GT_CODESIGN_IDENTITY must name a keychain identity; '-' is ad-hoc signing and does not keep TCC grants"; \
+			rm -f "$(1)"; exit 1;; \
+		esac; \
 		if ! command -v codesign >/dev/null 2>&1; then \
 			echo "Warning: GT_CODESIGN_IDENTITY is set but codesign is not available; installing unsigned"; \
 		elif codesign -f -s "$(GT_CODESIGN_IDENTITY)" --identifier com.gastown.$(BINARY) "$(1)"; then \
@@ -154,17 +161,20 @@ install: check-up-to-date build
 	@$(MAKE) --no-print-directory check-install-path
 	@# Restart daemon so it picks up the new binary.
 	@# A stale daemon is a recurring source of bugs (wrong session prefixes, etc.)
+	@# The daemon and plugin sync run under a scrubbed environment so the
+	@# long-lived daemon never inherits GT_CODESIGN_IDENTITY (make also
+	@# carries command-line variables in MAKEFLAGS).
 	@if $(INSTALL_DIR)/$(BINARY) daemon status >/dev/null 2>&1; then \
 		echo "Restarting daemon to pick up new binary..."; \
 		$(INSTALL_DIR)/$(BINARY) daemon stop >/dev/null 2>&1 || true; \
 		sleep 1; \
-		$(INSTALL_DIR)/$(BINARY) daemon start >/dev/null 2>&1 && \
+		env -u GT_CODESIGN_IDENTITY -u MAKEFLAGS -u MFLAGS $(INSTALL_DIR)/$(BINARY) daemon start >/dev/null 2>&1 && \
 			echo "Daemon restarted." || \
 			echo "Warning: daemon restart failed (start manually with: gt daemon start)"; \
 	fi
 	@# Sync plugins from build repo to town runtime directories.
 	@# Prevents drift when plugin fixes merge but runtime dirs are stale.
-	@$(INSTALL_DIR)/$(BINARY) plugin sync --source $(CURDIR)/plugins 2>/dev/null && \
+	@env -u GT_CODESIGN_IDENTITY -u MAKEFLAGS -u MFLAGS $(INSTALL_DIR)/$(BINARY) plugin sync --source $(CURDIR)/plugins 2>/dev/null && \
 		echo "Plugins synced." || true
 
 # safe-install: Replace binary WITHOUT restarting daemon or killing sessions.

@@ -206,6 +206,11 @@ if [ -r "$CODESIGN_IDENTITY_FILE" ]; then
   # An empty first line means signing is off, same as a missing file.
   if [ -z "$GT_CODESIGN_IDENTITY" ]; then
     log "$CODESIGN_IDENTITY_FILE is empty; installing unsigned"
+  elif [ "${GT_CODESIGN_IDENTITY#-}" != "$GT_CODESIGN_IDENTITY" ]; then
+    # codesign treats '-' as ad-hoc signing, whose requirement changes every build.
+    log "FAILED: $CODESIGN_IDENTITY_FILE starts with '-'; ad-hoc signing does not keep TCC grants. Name a keychain identity or empty the file to install unsigned"
+    record_run "Plugin: rebuild-gt [failure]" "failure" "ad-hoc code-signing identity in $CODESIGN_IDENTITY_FILE"
+    exit 1
   elif ! printf '%s' "$GT_CODESIGN_IDENTITY" | grep -Eq '^[A-Za-z0-9 ._:()-]+$'; then
     log "FAILED: $CODESIGN_IDENTITY_FILE holds an identity with unsupported characters; use the certificate name or its SHA-1 hash"
     record_run "Plugin: rebuild-gt [failure]" "failure" "invalid code-signing identity in $CODESIGN_IDENTITY_FILE"
