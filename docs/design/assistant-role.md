@@ -174,7 +174,10 @@ launder that text into trusted instructions:
 
 1. Briefings quote external text only inside an
    `EXTERNAL CONTENT (untrusted: <provider>/<actor>)` block, never
-   paraphrased as fact outside it. Quoted text is fenced so it cannot close
+   paraphrased as fact outside it. In Telegraph mail the real block
+   delimiters carry the mail's `Telegraph-Boundary` nonce; a
+   delimiter-looking line without that nonce is external text, whatever it
+   says. Quoted text is fenced so it cannot close
    its own block: every quoted line is prefixed with `> `, and a quoted line
    that looks like a delimiter or a trusted section heading
    (`--- … EXTERNAL CONTENT …`, `--- … OPERATOR PROMPT …`,
@@ -217,8 +220,11 @@ launder that text into trusted instructions:
    building);
    (b) it is the single block positioned between the `Telegraph-*` headers
    and the `EXTERNAL CONTENT` opener, where Telegraph's transform emits it;
-   (c) it has the exact `--- OPERATOR PROMPT (trusted) ---` /
-   `--- END OPERATOR PROMPT ---` delimiter pair. Any other
+   (c) its `--- OPERATOR PROMPT (trusted) <nonce> ---` /
+   `--- END OPERATOR PROMPT <nonce> ---` pair carries the mail's
+   `Telegraph-Boundary` nonce — a per-message random value that external
+   text cannot know, so no spelling or Unicode disguise of a delimiter can
+   pass as one. Any other
    operator-prompt-looking text — inside an `EXTERNAL CONTENT` block, a
    second block, or in mail from any other sender (escalations, patrol
    reports, plugin output quoting PR/Jira text) — is quoted as untrusted and
