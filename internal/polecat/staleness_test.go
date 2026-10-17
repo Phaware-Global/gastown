@@ -1,6 +1,9 @@
 package polecat
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -56,5 +59,59 @@ func TestApplyRedispatchCheck(t *testing.T) {
 				t.Errorf("IsStale = %v, want %v (reason %q)", info.IsStale, tt.wantStale, info.Reason)
 			}
 		})
+	}
+}
+
+// A polecats/<name> dir whose worktree is missing or has a dangling gitdir passes
+// List() but fails every git probe. It holds no work to protect and still counts
+// toward the dir cap, so it must stay reclaimable rather than read as "probe failed".
+func TestProbeUncommittedWork_MissingWorktreeIsNotAProbeFailure(t *testing.T) {
+	dangling := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dangling, ".git"), []byte("gitdir: "+filepath.Join(dangling, "gone", "worktrees", "x")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string]string{
+		"clone path does not exist": filepath.Join(t.TempDir(), "nope"),
+		"dir without .git":          t.TempDir(),
+		"dangling gitdir file":      dangling,
+	}
+	for name, path := range tests {
+		t.Run(name, func(t *testing.T) {
+			has, probeErr := probeUncommittedWork(path)
+			if probeErr != "" || has {
+				t.Errorf("probeUncommittedWork = (%v, %q), want (false, \"\")", has, probeErr)
+			}
+		})
+	}
+}
+
+func TestProbeUncommittedWork_RealRepo(t *testing.T) {
+	dir := t.TempDir()
+	for _, args := range [][]string{{"init", "-q"}, {"-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "i"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if has, probeErr := probeUncommittedWork(dir); has || probeErr != "" {
+		t.Fatalf("clean repo = (%v, %q), want (false, \"\")", has, probeErr)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if has, probeErr := probeUncommittedWork(dir); !has || probeErr != "" {
+		t.Fatalf("dirty repo = (%v, %q), want (true, \"\")", has, probeErr)
+	}
+}
+
+// A present but unreadable repository still fails closed.
+func TestProbeUncommittedWork_BrokenRepoFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, probeErr := probeUncommittedWork(dir); probeErr == "" {
+		t.Fatal("a .git dir that git cannot read must report a probe error")
 	}
 }

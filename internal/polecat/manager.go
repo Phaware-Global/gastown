@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"math/rand/v2"
 	"os"
 	"os/exec"
@@ -3060,12 +3061,7 @@ func (m *Manager) assessPolecat(p *Polecat, defaultBranch string, threshold int)
 	info.CommitsBehind = countCommitsBehind(polecatGit, defaultBranch)
 
 	// Check for uncommitted work (excluding .beads/ files which are synced across worktrees)
-	status, err := polecatGit.CheckUncommittedWork()
-	if err != nil {
-		info.ProbeError = fmt.Sprintf("checking uncommitted work: %v", err)
-	} else if !status.CleanExcludingBeads() {
-		info.HasUncommittedWork = true
-	}
+	info.HasUncommittedWork, info.ProbeError = probeUncommittedWork(p.ClonePath)
 
 	// Check agent bead state. A missing bead comes back as (nil, nil, nil); any
 	// error is a failed probe, not an absent bead.
@@ -3082,6 +3078,48 @@ func (m *Manager) assessPolecat(p *Polecat, defaultBranch string, threshold int)
 	// Determine staleness
 	info.IsStale, info.Reason = assessStaleness(info, threshold)
 	return info
+}
+
+// worktreeMissing reports whether clonePath has no usable git worktree: the dir is
+// gone, has no .git, or its .git file points at a gitdir that no longer exists. Such
+// a polecat has no working tree whose changes could be lost.
+func worktreeMissing(clonePath string) bool {
+	gitPath := filepath.Join(clonePath, ".git")
+	fi, err := os.Stat(gitPath)
+	if err != nil {
+		return errors.Is(err, fs.ErrNotExist)
+	}
+	if fi.IsDir() {
+		return false
+	}
+	data, err := os.ReadFile(gitPath)
+	if err != nil {
+		return false
+	}
+	target, ok := strings.CutPrefix(strings.TrimSpace(string(data)), "gitdir:")
+	if !ok {
+		return false
+	}
+	target = strings.TrimSpace(target)
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(clonePath, target)
+	}
+	_, err = os.Stat(target)
+	return errors.Is(err, fs.ErrNotExist)
+}
+
+// probeUncommittedWork reports whether the worktree at clonePath has uncommitted work
+// (excluding .beads/ files). A failed git probe is returned as probeErr rather than
+// read as a clean tree.
+func probeUncommittedWork(clonePath string) (has bool, probeErr string) {
+	if worktreeMissing(clonePath) {
+		return false, ""
+	}
+	status, err := git.NewGit(clonePath).CheckUncommittedWork()
+	if err != nil {
+		return false, fmt.Sprintf("checking uncommitted work: %v", err)
+	}
+	return !status.CleanExcludingBeads(), ""
 }
 
 // ReassessStale re-evaluates one polecat's staleness from live state. A caller that
