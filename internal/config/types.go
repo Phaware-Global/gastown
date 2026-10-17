@@ -2161,12 +2161,15 @@ func NewEscalationConfig() *EscalationConfig {
 		Type:    "escalation",
 		Version: CurrentEscalationVersion,
 		// Routed to the Mayor's Assistant: escalation mail is inbound
-		// information for triage; the assistant briefs mayor/.
+		// information for triage; the assistant briefs mayor/. High and
+		// critical ALSO go straight to mayor/ so a dead or wedged assistant
+		// session cannot blackhole a time-critical escalation (the assistant
+		// marks such items "already delivered to mayor/" in its briefings).
 		Routes: map[string][]string{
 			SeverityLow:      {"bead"},
 			SeverityMedium:   {"bead", "mail:mayors-assistant"},
-			SeverityHigh:     {"bead", "mail:mayors-assistant", "email:human"},
-			SeverityCritical: {"bead", "mail:mayors-assistant", "email:human", "sms:human"},
+			SeverityHigh:     {"bead", "mail:mayors-assistant", "mail:mayor", "email:human"},
+			SeverityCritical: {"bead", "mail:mayors-assistant", "mail:mayor", "email:human", "sms:human"},
 		},
 		Contacts:          EscalationContacts{},
 		StaleThreshold:    "4h",

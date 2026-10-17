@@ -44,8 +44,8 @@ Config file: `~/gt/settings/escalation.json`
   "version": 1,
   "routes": {
     "medium": ["bead", "mail:mayors-assistant"],
-    "high": ["bead", "mail:mayors-assistant", "email:human"],
-    "critical": ["bead", "mail:mayors-assistant", "email:human", "sms:human"]
+    "high": ["bead", "mail:mayors-assistant", "mail:mayor", "email:human"],
+    "critical": ["bead", "mail:mayors-assistant", "mail:mayor", "email:human", "sms:human"]
   },
   "contacts": {
     "human_email": "",

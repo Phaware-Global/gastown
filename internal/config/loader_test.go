@@ -4529,8 +4529,9 @@ func TestEscalationConfigDefaults(t *testing.T) {
 	if len(cfg.Routes[SeverityLow]) != 1 || cfg.Routes[SeverityLow][0] != "bead" {
 		t.Errorf("Routes[low] = %v, want [bead]", cfg.Routes[SeverityLow])
 	}
-	if len(cfg.Routes[SeverityCritical]) != 4 {
-		t.Errorf("Routes[critical] len = %d, want 4", len(cfg.Routes[SeverityCritical]))
+	// bead, mail:mayors-assistant, mail:mayor, email:human, sms:human
+	if len(cfg.Routes[SeverityCritical]) != 5 {
+		t.Errorf("Routes[critical] len = %d, want 5", len(cfg.Routes[SeverityCritical]))
 	}
 }
 
@@ -6139,12 +6140,18 @@ func TestNewEscalationConfigRoutesToMayorsAssistant(t *testing.T) {
 	t.Parallel()
 	cfg := NewEscalationConfig()
 	for _, severity := range []string{SeverityMedium, SeverityHigh, SeverityCritical} {
-		route := cfg.Routes[severity]
-		if slices.Contains(route, "mail:mayor") {
-			t.Errorf("Routes[%s] = %v: default must not mail mayor/ directly", severity, route)
-		}
-		if !slices.Contains(route, "mail:mayors-assistant") {
+		if route := cfg.Routes[severity]; !slices.Contains(route, "mail:mayors-assistant") {
 			t.Errorf("Routes[%s] = %v: missing mail:mayors-assistant", severity, route)
+		}
+	}
+	// Medium goes through the assistant only; high/critical keep a direct
+	// path to the Mayor so a dead assistant session cannot blackhole them.
+	if route := cfg.Routes[SeverityMedium]; slices.Contains(route, "mail:mayor") {
+		t.Errorf("Routes[medium] = %v: must not mail mayor/ directly", route)
+	}
+	for _, severity := range []string{SeverityHigh, SeverityCritical} {
+		if route := cfg.Routes[severity]; !slices.Contains(route, "mail:mayor") {
+			t.Errorf("Routes[%s] = %v: must keep a direct mail:mayor route", severity, route)
 		}
 	}
 	if slices.Contains(cfg.Routes[SeverityLow], "mail:mayors-assistant") {
