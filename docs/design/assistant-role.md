@@ -333,6 +333,16 @@ misrouted to the Mayor by any future prefix check. The prefix checks are
 replaced by exact matches regardless, and the registration PR adds tests
 for `hq-assistant` and `assistant/`.
 
+The single token trades one collision class for another: `assistant` is a
+legal rig name (rig names may not contain hyphens, so `mayors-assistant`
+never was). The registration PR therefore reserves it — `rig.AddRig` rejects
+it like `hq`, and the polecat name pool lists it with `mayor` and `deacon` —
+and treats `<town>/assistant` as a system directory in every town-root scan
+that already skips `mayor/` and `deacon/`. A town upgraded with an existing
+rig named `assistant` is not migrated: `gt assistant start` (and the daemon's
+ensure-running) refuse with an error naming the conflict, and the operator
+renames the rig first.
+
 ## Rejected alternatives
 
 - **A Telegraph-only filter inside the Mayor's session.** Does not help with
