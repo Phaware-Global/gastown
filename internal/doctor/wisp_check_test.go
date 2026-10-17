@@ -85,9 +85,9 @@ func TestCountAbandonedWispsFromJSON(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := countAbandonedWispsFromJSON([]byte(tt.in), cutoff)
+			_, got := countWispsFromJSON([]byte(tt.in), cutoff)
 			if got != tt.want {
-				t.Errorf("countAbandonedWispsFromJSON = %d, want %d", got, tt.want)
+				t.Errorf("countWispsFromJSON stale = %d, want %d", got, tt.want)
 			}
 		})
 	}

@@ -60,10 +60,9 @@ gt hook               # Shows mode in hook_bead
 **Conservative targets:**
 - tmux sessions with no processes
 - Claude processes with no tmux parent
-- Wisps > 24 hours old
+- CLOSED wisps (reclaimed by `gt doctor --fix`)
 
 **Aggressive additions:**
-- Wisps > 1 hour old
 - Branches with no matching polecat
 - State files > 7 days old
 
@@ -85,7 +84,7 @@ gt doctor -v
 **2. Parse doctor output for:**
 - orphan-sessions: Tmux sessions to kill
 - orphan-processes: Claude processes to terminate
-- wisp-gc: Wisps to delete
+- wisp-gc: Closed wisps to delete (stale OPEN wisps are listed but never deleted)
 
 **3. Additional scans (for aggressive mode):**
 ```bash
@@ -119,7 +118,7 @@ Actually remove the garbage.
 **1. Run doctor with fix:**
 ```bash
 gt doctor --fix
-# This handles sessions, processes, and wisps
+# This handles sessions, processes, and CLOSED wisps (open wisps are never deleted)
 ```
 
 **2. For aggressive mode, additional cleanup:**
@@ -137,7 +136,11 @@ Record each item actually removed for the report.
 **Safety checks:**
 - Never delete active sessions (tmux list-clients)
 - Never delete branches with uncommitted polecat work
-- Never delete wisps < 1 hour old
+- Never delete a non-closed wisp, whatever its age. Open merge-request,
+  escalation, agent, hooked/pinned and molecule-attached wisps look idle but
+  are live, and wisps cannot be recovered once deleted (gt-pyrkd, gt-7ie).
+  Do NOT run `bd mol wisp gc` without `--closed`, in aggressive mode either.
+  Stale open wisps are reported to the reaper, not deleted here.
 
 **Exit criteria:** Garbage collected."""
 
