@@ -80,27 +80,32 @@ mail, not nudges, so they never interrupt the Mayor mid-task.
 
 ### Before
 
-```
-Telegraph (Jira/GitHub) ─┐
-gt escalate (mail:mayor) ─┤
-Dolt alerts / daemon ─────┼──▶ mayor/ inbox + nudges ──▶ Mayor
-Patrol reports / Deacon ──┤
-Plugins (sentinels, ───────┤
-  loose-ends nudge) ───────┘
-Witness/Refinery dispatch signals ──▶ mayor/ (SLOT_OPEN, MERGED, …)
+```mermaid
+flowchart LR
+    TG["Telegraph (Jira / GitHub)"] --> M
+    ESC["gt escalate (mail:mayor)"] --> M
+    ALERT["Dolt alerts / daemon"] --> M
+    PATROL["Patrol reports / Deacon"] --> M
+    PLUG["Plugins: sentinels, loose-ends nudge"] --> M
+    DISP["Witness / Refinery dispatch signals<br/>(SLOT_OPEN, MERGED, …)"] --> M
+    M["mayor/ inbox + nudges"] --> MAYOR[Mayor]
 ```
 
 ### After
 
-```
-Telegraph (Jira/GitHub) ─┐
-gt escalate ──────────────┤                        BRIEF: / URGENT: / SWEEP:
-Dolt alerts / daemon ─────┼──▶ mayors-assistant/ ──▶ mail ──▶ mayor/
-Patrol reports / Deacon ──┤        (triage, group,
-Plugins (sentinels, ───────┤         due diligence)
-  sweep trigger) ──────────┘
-Witness/Refinery dispatch signals ──▶ mayor/ (unchanged)
-Direct `gt mail send mayor/` ────────▶ mayor/ (unchanged)
+```mermaid
+flowchart LR
+    TG["Telegraph (Jira / GitHub)"] --> MA
+    ESCM["gt escalate (medium)"] --> MA
+    ESCH["gt escalate (high / critical)"] --> MA
+    ESCH --> M
+    ALERT["Dolt alerts / daemon"] --> MA
+    PATROL["Patrol reports / Deacon"] --> MA
+    PLUG["Plugins: sentinels, sweep trigger"] --> MA
+    MA["mayors-assistant/<br/>triage · group · due diligence"] -- "BRIEF: / URGENT: / SWEEP: mail" --> M
+    DISP["Witness / Refinery dispatch signals<br/>(SLOT_OPEN, MERGED, …) — unchanged"] --> M
+    DIRECT["Direct gt mail send mayor/ — unchanged"] --> M
+    M["mayor/"] --> MAYOR[Mayor]
 ```
 
 The rule for deciding which existing `mayor/` destinations move:
