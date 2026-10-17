@@ -1793,3 +1793,263 @@ exit 0
 		t.Errorf("expected gt nudge gastown/witness in log, got: %q\nlogger output: %v", logStr, logged)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Worker-class routing (gt-p1n2)
+// ---------------------------------------------------------------------------
+
+// seedConvoy creates a convoy tracking the given issues in the test store.
+func seedConvoy(t *testing.T, ctx context.Context, store beadsdk.Storage, convoyID string, issues []*beadsdk.Issue) {
+	t.Helper()
+	now := time.Now().UTC()
+	all := append([]*beadsdk.Issue{{
+		ID:        convoyID,
+		Title:     "Routing Test Convoy",
+		Status:    beadsdk.StatusOpen,
+		Priority:  2,
+		IssueType: beadsdk.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}}, issues...)
+	for _, iss := range all {
+		iss.CreatedAt, iss.UpdatedAt = now, now
+		if err := store.CreateIssue(ctx, iss, "test"); err != nil {
+			t.Fatalf("CreateIssue %s: %v", iss.ID, err)
+		}
+	}
+	for _, iss := range issues {
+		dep := &beadsdk.Dependency{
+			IssueID:     convoyID,
+			DependsOnID: iss.ID,
+			Type:        beadsdk.DependencyType("tracks"),
+			CreatedAt:   now,
+			CreatedBy:   "test",
+		}
+		if err := store.AddDependency(ctx, dep, "test"); err != nil {
+			t.Fatalf("AddDependency %s: %v", iss.ID, err)
+		}
+	}
+}
+
+func slungIDs(t *testing.T, logPath string) []string {
+	t.Helper()
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return nil
+	}
+	var ids []string
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if f := strings.Fields(line); len(f) >= 2 && f[0] == "sling" {
+			ids = append(ids, f[1])
+		}
+	}
+	return ids
+}
+
+// Who filed a bead says nothing about who may work it: the deacon and dogs file
+// ordinary gt/bd bugs for polecats. The feeder decides by what the step is, so a
+// deacon- or dog-created bug or task must be slung.
+//
+// One store serves every case (each case is its own convoy): opening an embedded
+// Dolt store per subtest dominates this package's run time.
+func TestFeedNextReadyIssue_FeedsDeaconAndDogCreatedWork(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	townRoot := setupTownRoot(t)
+
+	n := 0
+	for _, owner := range []string{"deacon", "dog", "dogs", "boot", "deacon/dogs/alpha", "Deacon", "gastown/witness", "gastown/refinery"} {
+		for _, issueType := range []beadsdk.IssueType{beadsdk.TypeBug, beadsdk.TypeTask} {
+			n++
+			convoyID := fmt.Sprintf("test-convoyown%d", n)
+			issueID := fmt.Sprintf("test-bug%d", n)
+			t.Run(owner+"/"+string(issueType), func(t *testing.T) {
+				seedConvoy(t, ctx, store, convoyID, []*beadsdk.Issue{
+					{ID: issueID, Title: "Fix gt bug", Status: beadsdk.StatusOpen, Priority: 1, IssueType: issueType, CreatedBy: owner},
+				})
+
+				gtPath, logPath := makeGTStub(t, 0)
+				logger, _ := makeLogger()
+
+				feedNextReadyIssue(ctx, store, townRoot, convoyID, "test", logger, gtPath, func(string) bool { return false }, nil)
+
+				if got := slungIDs(t, logPath); len(got) != 1 || got[0] != issueID {
+					t.Errorf("slung %v, want [%s]; a %s filed by %q is polecat work", got, issueID, issueType, owner)
+				}
+			})
+		}
+	}
+}
+
+// Creators that merely name a human, the mayor, or the witness/refinery (whose
+// merge-conflict and similar tasks are meant for an available polecat) are
+// ordinary polecat work.
+func TestFeedNextReadyIssue_FeedsHumanOrMayorCreatedTask(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	townRoot := setupTownRoot(t)
+
+	for i, owner := range []string{"", "mayor", "dev@example.com", "gastown/polecats/furiosa", "gastown/refinery", "gastown/witness"} {
+		convoyID := fmt.Sprintf("test-convoyhum%d", i)
+		issueID := fmt.Sprintf("test-human%d", i)
+		t.Run("owner="+owner, func(t *testing.T) {
+			seedConvoy(t, ctx, store, convoyID, []*beadsdk.Issue{
+				{ID: issueID, Title: "Task", Status: beadsdk.StatusOpen, Priority: 2, IssueType: beadsdk.TypeTask, CreatedBy: owner},
+			})
+
+			gtPath, logPath := makeGTStub(t, 0)
+			logger, _ := makeLogger()
+
+			feedNextReadyIssue(ctx, store, townRoot, convoyID, "test", logger, gtPath, func(string) bool { return false }, nil)
+
+			if got := slungIDs(t, logPath); len(got) != 1 || got[0] != issueID {
+				t.Errorf("slung %v, want [%s]", got, issueID)
+			}
+		})
+	}
+}
+
+// setWorkflowFormula stamps a convoy with the description executeWorkflowFormula
+// writes, which is the only place a workflow convoy records its formula.
+func setWorkflowFormula(t *testing.T, ctx context.Context, store beadsdk.Storage, convoyID, formulaName string) {
+	t.Helper()
+	desc := "Workflow: " + formulaName + "\n\nSteps: 3\nRig: gastown"
+	if err := store.UpdateIssue(ctx, convoyID, map[string]interface{}{"description": desc}, "test"); err != nil {
+		t.Fatalf("UpdateIssue description: %v", err)
+	}
+}
+
+func addBlocks(t *testing.T, ctx context.Context, store beadsdk.Storage, issueID, dependsOn string) {
+	t.Helper()
+	dep := &beadsdk.Dependency{IssueID: issueID, DependsOnID: dependsOn, Type: beadsdk.DepBlocks, CreatedAt: time.Now().UTC(), CreatedBy: "test"}
+	if err := store.AddDependency(ctx, dep, "test"); err != nil {
+		t.Fatalf("AddDependency %s->%s: %v", issueID, dependsOn, err)
+	}
+}
+
+// executeWorkflowFormula only slings the first wave of an hq-wf-* convoy; this
+// feeder dispatches every later wave as its dependencies close, so an ordinary
+// (non-role) workflow must keep feeding across waves.
+func TestFeedNextReadyIssue_FeedsEveryWaveOfNonRoleWorkflow(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	seedConvoy(t, ctx, store, "hq-wf-wave", []*beadsdk.Issue{
+		{ID: "test-wfs-a", Title: "Design", Status: beadsdk.StatusClosed, Priority: 2, IssueType: beadsdk.TypeTask},
+		{ID: "test-wfs-b", Title: "Implement", Status: beadsdk.StatusOpen, Priority: 2, IssueType: beadsdk.TypeTask},
+		{ID: "test-wfs-c", Title: "Review", Status: beadsdk.StatusOpen, Priority: 2, IssueType: beadsdk.TypeTask},
+	})
+	setWorkflowFormula(t, ctx, store, "hq-wf-wave", "shiny")
+	addBlocks(t, ctx, store, "test-wfs-b", "test-wfs-a")
+	addBlocks(t, ctx, store, "test-wfs-c", "test-wfs-b")
+
+	townRoot := setupTownRoot(t)
+	gtPath, logPath := makeGTStub(t, 0)
+	logger, _ := makeLogger()
+	feed := func() {
+		feedNextReadyIssue(ctx, store, townRoot, "hq-wf-wave", "test", logger, gtPath, func(string) bool { return false }, nil)
+	}
+
+	// Wave 1 (a) was slung by `gt formula run` itself and is already closed.
+	feed()
+	if err := store.UpdateIssue(ctx, "test-wfs-b", map[string]interface{}{"status": "closed"}, "test"); err != nil {
+		t.Fatalf("close b: %v", err)
+	}
+	feed()
+
+	if got := slungIDs(t, logPath); len(got) != 2 || got[0] != "test-wfs-b" || got[1] != "test-wfs-c" {
+		t.Errorf("slung %v, want [test-wfs-b test-wfs-c]: later waves of a non-role workflow must keep feeding", got)
+	}
+}
+
+// A workflow convoy built from a role formula (deacon/witness/refinery patrol,
+// dog formulas) is refused as a whole: its steps belong to that role, and
+// wrapping them in mol-polecat-work can only stall.
+func TestFeedNextReadyIssue_RefusesRoleFormulaWorkflowConvoy(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	townRoot := setupTownRoot(t)
+
+	for i, name := range []string{"mol-deacon-patrol", "mol-dog-reaper", "Mol-Witness-Patrol", "mol-session-gc"} {
+		convoyID := fmt.Sprintf("hq-wf-role%d", i)
+		t.Run(name, func(t *testing.T) {
+			seedConvoy(t, ctx, store, convoyID, []*beadsdk.Issue{
+				{ID: fmt.Sprintf("test-wfs-role%d", i), Title: "Patrol step", Status: beadsdk.StatusOpen, Priority: 1, IssueType: beadsdk.TypeTask},
+			})
+			setWorkflowFormula(t, ctx, store, convoyID, name)
+
+			gtPath, logPath := makeGTStub(t, 0)
+			logger, _ := makeLogger()
+
+			feedNextReadyIssue(ctx, store, townRoot, convoyID, "test", logger, gtPath, func(string) bool { return false }, nil)
+
+			if got := slungIDs(t, logPath); len(got) != 0 {
+				t.Errorf("role-formula workflow %q fed %v to a polecat, want nothing", name, got)
+			}
+		})
+	}
+}
+
+// Merge-conflict tasks the refinery files are meant for an available polecat,
+// so one orphaned by a dead polecat must be re-fed.
+func TestFeedNextReadyIssue_FeedsOrphanedRefineryConflictTask(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	seedConvoy(t, ctx, store, "hq-cv-conflict", []*beadsdk.Issue{
+		{ID: "test-conflict1", Title: "Resolve merge conflicts: polecat/x", Status: beadsdk.StatusOpen, Priority: 1, IssueType: beadsdk.TypeTask, CreatedBy: "gastown/refinery", Labels: []string{"gt:task"}},
+	})
+
+	townRoot := setupTownRoot(t)
+	gtPath, logPath := makeGTStub(t, 0)
+	logger, _ := makeLogger()
+
+	feedNextReadyIssue(ctx, store, townRoot, "hq-cv-conflict", "test", logger, gtPath, func(string) bool { return false }, nil)
+
+	if got := slungIDs(t, logPath); len(got) != 1 || got[0] != "test-conflict1" {
+		t.Errorf("slung %v, want [test-conflict1]", got)
+	}
+}
+
+func TestRoleWorkflowBlock(t *testing.T) {
+	tests := []struct {
+		name     string
+		desc     string
+		wantSkip bool
+	}{
+		{"empty description", "", false},
+		{"not a workflow", "Convoy: fix things", false},
+		{"ordinary workflow", "Workflow: shiny\n\nSteps: 4\nRig: gastown", false},
+		{"release workflow", "Workflow: gastown-release\n\nSteps: 9", false},
+		{"deacon patrol", "Workflow: mol-deacon-patrol\n\nSteps: 3", true},
+		{"mixed case", "Workflow: Mol-Deacon-Patrol\n\nSteps: 3", true},
+		{"dog formula", "Workflow: mol-dog-reaper\n\nSteps: 3", true},
+		{"infra formula", "Workflow: mol-session-gc\n\nSteps: 3", true},
+		{"padded name", "Workflow:   mol-witness-patrol  \n", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := RoleWorkflowBlock(tt.desc); (got != "") != tt.wantSkip {
+				t.Errorf("RoleWorkflowBlock(%q) = %q, wantSkip=%v", tt.desc, got, tt.wantSkip)
+			}
+		})
+	}
+}
+
+func TestIsRoleFormula(t *testing.T) {
+	for _, name := range []string{"mol-deacon-patrol", "./mol-deacon-patrol", "x/../mol-dog-reaper", "Mol-Deacon-Patrol", "MOL-DOG-REAPER", "mol-deacon-patrol.formula.toml", "/town/.beads/formulas/mol-witness-patrol.formula.json", "mol-session-gc", "mol-convoy-feed", "mol-gastown-boot"} {
+		if !IsRoleFormula(name) {
+			t.Errorf("IsRoleFormula(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{"", "shiny", "mol-polecat-work", "mol-idea-to-plan", "./my-formula"} {
+		if IsRoleFormula(name) {
+			t.Errorf("IsRoleFormula(%q) = true, want false", name)
+		}
+	}
+}
