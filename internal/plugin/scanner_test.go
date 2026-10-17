@@ -976,7 +976,7 @@ func TestShippedSweepPluginGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir := filepath.Join(root, "mayors-assistant-sweep")
+	dir := filepath.Join(root, "assistant-sweep")
 	content, err := os.ReadFile(filepath.Join(dir, "plugin.md"))
 	if err != nil {
 		t.Fatalf("reading shipped sweep plugin: %v", err)

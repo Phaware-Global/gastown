@@ -1,17 +1,17 @@
 +++
-name = "mayors-assistant-sweep"
+name = "assistant-sweep"
 description = "Trigger the Mayor's Assistant loose-ends sweep (stalled decisions, blocked external actors, unslung work) at the configured interval; the assistant mails the Mayor a SWEEP: summary"
 version = 2
 
 [gate]
 type = "cooldown"
 # Fallback only. The effective cooldown comes from settings/config.json
-# `assistant_sweep_interval` (default "1h"); see docs/design/mayors-assistant-role.md.
+# `assistant_sweep_interval` (default "1h"); see docs/design/assistant-role.md.
 duration = "1h"
 duration_setting = "assistant_sweep_interval"
 
 [tracking]
-labels = ["plugin:mayors-assistant-sweep", "category:coordination"]
+labels = ["plugin:assistant-sweep", "category:coordination"]
 digest = true
 
 [execution]
@@ -34,12 +34,12 @@ the work and briefs the Mayor.
 
 ## Steps
 
-1. Run `./run.sh` to send the trigger mail to `mayors-assistant/`. The script
+1. Run `./run.sh` to send the trigger mail to `assistant/`. The script
    handles the exact subject, body, priority, and message type — it is
    intentionally parameter-free to keep this dog cheap and deterministic.
 
 2. Record the run as an ephemeral `type:plugin-run` receipt (labels
-   `plugin:mayors-assistant-sweep` and `result:success`) and close it
+   `plugin:assistant-sweep` and `result:success`) and close it
    immediately, per the dispatch instructions.
 
 3. Exit. Do not wait for the assistant's response.
@@ -49,7 +49,7 @@ the work and briefs the Mayor.
 The body is fixed; agent execution exists so the dog can handle transient
 mail-send failures (retry once, escalate if still failing) without a
 second-class script gate. If `./run.sh` exits non-zero, retry once after a
-short delay; if still failing, `gt escalate "mayors-assistant-sweep: mail
+short delay; if still failing, `gt escalate "assistant-sweep: mail
 delivery failed" -s LOW` and record a `result:failure` wisp instead.
 
 ## What the trigger asks the assistant to do
