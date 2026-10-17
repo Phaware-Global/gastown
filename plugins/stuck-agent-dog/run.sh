@@ -73,19 +73,35 @@ rig_workdir() {
   return 1
 }
 
-# Hook lookups are batched: one `bd list` per rig and status instead of a
-# `gt hook show` + `bd show` pair per polecat directory. After a town-wide down
-# nearly every session is dead and every dead session needs a hook lookup, so a
-# per-polecat process (~5s each) cannot finish inside the plugin timeout.
+# Hook lookups are batched: one `bd list` (plus one wisps query) per rig and
+# status instead of a `gt hook show` + `bd show` pair per polecat directory.
+# After a town-wide down nearly every session is dead and every dead session
+# needs a hook lookup, so a per-polecat process (~5s each) cannot finish inside
+# the plugin timeout.
 #
-# HOOK_MAP holds one "assignee|bead_id|status" line per hooked or in_progress
-# bead, hooked first, so the first match for an assignee is the same bead
-# `gt hook show` would report. Beads in these two statuses are exactly the
-# restartable ones; closed or unhooked work never appears.
+# HOOK_MAP holds one tab-separated "location assignee bead_id status" line per
+# hooked or in_progress bead. Location is the rig whose DB the row came from, or
+# "@town". Fields are emitted with jq @tsv, which escapes tabs and newlines, and
+# rows with control characters in any field are dropped, so a bead cannot forge
+# another record by what it puts in its assignee. Beads in these two statuses
+# are exactly the restartable ones; closed or unhooked work never appears.
 HOOK_MAP=""
 
+# Wisps live in their own table that `bd list` cannot see (beads v1.1.0+), so
+# hooked formula wisps are read with a constant-predicate query.
+WISP_HOOK_SQL="SELECT assignee, id, status FROM wisps WHERE status = 'hooked' AND assignee IS NOT NULL AND assignee <> ''"
+
+# Prints tab-separated hook rows for the JSON array on stdin, tagged with $1.
+hook_rows() {
+  jq -r --arg loc "$1" '.[]
+    | select((.assignee // "") != "")
+    | [$loc, .assignee, .id, .status]
+    | select(all(.[]; type == "string" and ((explode | any(. < 32 or . == 127)) | not)))
+    | @tsv' 2>/dev/null || true
+}
+
 load_hook_map() {
-  local rig="" dir="" status="" out="" lines="" loc=""
+  local rig="" dir="" status="" out="" lines="" loc="" tag=""
   local locations=()
 
   while IFS='|' read -r rig _prefix; do
@@ -94,31 +110,75 @@ load_hook_map() {
       locations+=("$rig|$dir")
     fi
   done <<< "$RIG_PREFIX_MAP"
-  # Town beads last: convoys hooked for convoy-driver mode live there.
-  locations+=("town|$TOWN_ROOT")
+  # Town beads: convoys hooked for convoy-driver mode live there.
+  locations+=("@town|$TOWN_ROOT")
 
-  for status in hooked in_progress; do
-    for loc in "${locations[@]}"; do
-      rig="${loc%%|*}"
-      dir="${loc#*|}"
+  for loc in "${locations[@]}"; do
+    tag="${loc%%|*}"
+    dir="${loc#*|}"
+    for status in hooked in_progress; do
       if ! out=$(cd "$dir" 2>/dev/null && bd list --status="$status" --json --limit=0 2>/dev/null); then
-        log "  WARN: could not list $status beads for $rig; its polecats are not checked"
+        log "  WARN: could not list $status beads for $tag; its polecats are not checked"
         continue
       fi
-      lines=$(printf '%s' "$out" \
-        | jq -r '.[] | select((.assignee // "") != "") | "\(.assignee)|\(.id)|\(.status)"' 2>/dev/null || true)
+      lines=$(printf '%s' "$out" | hook_rows "$tag")
       [ -n "$lines" ] && HOOK_MAP+="$lines"$'\n'
     done
+    if out=$(cd "$dir" 2>/dev/null && bd sql --json "$WISP_HOOK_SQL" 2>/dev/null); then
+      lines=$(printf '%s' "$out" | hook_rows "$tag")
+      [ -n "$lines" ] && HOOK_MAP+="$lines"$'\n'
+    else
+      log "  WARN: could not list hooked wisps for $tag; its polecats on wisps are not checked"
+    fi
   done
   return 0
 }
 
-# Prints the bead id hooked to the given polecat, or nothing.
+# Prints "location<TAB>bead_id" for the bead hooked to the given polecat, or
+# nothing. Only the polecat's own rig DB and town beads are consulted, and the
+# winner follows `gt hook show`: rig hooked, rig in_progress, town hooked, town
+# in_progress.
 rig_hook_bead() {
   local rig="$1" pcat="$2"
 
   printf '%s' "$HOOK_MAP" \
-    | awk -F'|' -v a="$rig/polecats/$pcat" '$1 == a && !found { print $2; found = 1 }'
+    | awk -F'\t' -v rig="$rig" -v a="$rig/polecats/$pcat" '
+        $2 == a && ($1 == rig || $1 == "@town") {
+          r = ($1 == "@town" ? 2 : 0) + ($4 == "hooked" ? 0 : 1)
+          if (best == "" || r < best) { best = r; row = $1 "\t" $3 }
+        }
+        END { if (best != "") print row }'
+}
+
+# Prints the bead's current status, read from the DB its hook row came from.
+hook_bead_status() {
+  local loc="$1" bead="$2" dir=""
+
+  if [ "$loc" = "@town" ]; then
+    dir="$TOWN_ROOT"
+  elif ! dir=$(rig_workdir "$loc"); then
+    return 0
+  fi
+
+  ( cd "$dir" 2>/dev/null && bd show "$bead" --json 2>/dev/null ) \
+    | jq -r '.[0].status // empty' 2>/dev/null || true
+}
+
+# The hook map is read once, before the per-polecat session checks, so a polecat
+# that ran `gt done` since then still looks hooked. Re-read the one bead's status
+# before acting on it; a closed bead means the polecat completed normally.
+bead_restartable() {
+  local session="$1" loc="$2" bead="$3" status=""
+
+  status=$(hook_bead_status "$loc" "$bead")
+
+  case "$status" in
+    open|hooked|in_progress) return 0 ;;
+    closed) log "  SKIP $session: bead closed (completed normally)" ;;
+    "") log "  SKIP $session: hook=$bead status unavailable" ;;
+    *) log "  SKIP $session: hook=$bead status=$status not actionable" ;;
+  esac
+  return 1
 }
 
 # --- Enumerate agents ---------------------------------------------------------
@@ -157,9 +217,11 @@ while IFS='|' read -r RIG PREFIX; do
 
     if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
       # Session dead — check hook
-      HOOK_BEAD=$(rig_hook_bead "$RIG" "$PCAT_NAME")
+      HOOK_ROW=$(rig_hook_bead "$RIG" "$PCAT_NAME")
+      HOOK_LOC="${HOOK_ROW%%$'\t'*}"
+      HOOK_BEAD="${HOOK_ROW#*$'\t'}"
 
-      if [ -n "$HOOK_BEAD" ]; then
+      if [ -n "$HOOK_ROW" ] && bead_restartable "$SESSION_NAME" "$HOOK_LOC" "$HOOK_BEAD"; then
         CRASHED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD")
         log "  CRASHED: $SESSION_NAME (hook=$HOOK_BEAD)"
       fi
@@ -170,8 +232,10 @@ while IFS='|' read -r RIG PREFIX; do
         PROC_COMM=$(ps -o comm= -p "$PANE_PID" 2>/dev/null || true)
         if [ -z "$PROC_COMM" ]; then
           # Zombie: process dead, session alive
-          HOOK_BEAD=$(rig_hook_bead "$RIG" "$PCAT_NAME")
-          if [ -n "$HOOK_BEAD" ]; then
+          HOOK_ROW=$(rig_hook_bead "$RIG" "$PCAT_NAME")
+          HOOK_LOC="${HOOK_ROW%%$'\t'*}"
+          HOOK_BEAD="${HOOK_ROW#*$'\t'}"
+          if [ -n "$HOOK_ROW" ] && bead_restartable "$SESSION_NAME" "$HOOK_LOC" "$HOOK_BEAD"; then
             STUCK+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|agent_dead")
             log "  ZOMBIE: $SESSION_NAME (pid=$PANE_PID dead, hook=$HOOK_BEAD)"
           fi
