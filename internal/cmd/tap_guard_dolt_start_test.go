@@ -1,6 +1,11 @@
 package cmd
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+)
 
 func TestMatchesDoltServerStart(t *testing.T) {
 	blocked := []string{
@@ -118,5 +123,43 @@ func TestTapGuardDoltStart_OnlyInAgentContext(t *testing.T) {
 	}
 	if err := run("gt dolt status"); err != nil {
 		t.Errorf("guard blocked gt dolt status: %v", err)
+	}
+}
+
+// Unclosed "$( runs make the quote scanner backtrack exponentially. The guard
+// must still return within its budget, and let the command run.
+func TestTapGuardDoltStart_FailsOpenWhenMatcherIsSlow(t *testing.T) {
+	for _, v := range []string{"GT_POLECAT", "GT_CREW", "GT_WITNESS", "GT_REFINERY", "GT_MAYOR", "GT_DEACON", "GT_ROLE", "GT_RIG", "GT_TOWN_ROOT"} {
+		t.Setenv(v, "")
+	}
+	t.Chdir(t.TempDir())
+	t.Setenv("GT_ROLE", "deacon")
+
+	adversarial := "echo " + strings.Repeat(`"$(`, 32) + "\nbd dolt start"
+	payload, err := json.Marshal(map[string]any{
+		"tool_name":  "Bash",
+		"tool_input": map[string]string{"command": adversarial},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer setStdinForTest(t, string(payload))()
+
+	start := time.Now()
+	err = runTapGuardDoltStart(tapGuardDoltStartCmd, nil)
+	if elapsed := time.Since(start); elapsed > 5*doltStartMatchBudget {
+		t.Errorf("guard took %v, want about %v", elapsed, doltStartMatchBudget)
+	}
+	if err != nil {
+		t.Errorf("guard blocked on timeout, want fail-open: %v", err)
+	}
+}
+
+func TestMatchesDoltServerStartWithin(t *testing.T) {
+	if reason, ok := matchesDoltServerStartWithin("bd dolt start", time.Second); !ok || reason == "" {
+		t.Errorf("real start: reason=%q ok=%v, want a verdict", reason, ok)
+	}
+	if reason, ok := matchesDoltServerStartWithin("gt dolt status", time.Second); !ok || reason != "" {
+		t.Errorf("benign: reason=%q ok=%v, want allowed", reason, ok)
 	}
 }

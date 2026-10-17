@@ -6,6 +6,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -76,11 +77,37 @@ func runTapGuardDoltStart(cmd *cobra.Command, args []string) error {
 	if command == "" {
 		return nil
 	}
-	if reason := matchesDoltServerStart(command); reason != "" {
+	reason, ok := matchesDoltServerStartWithin(command, doltStartMatchBudget)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "[gastown] dolt-start guard timed out after %v (command allowed)\n", doltStartMatchBudget)
+		return nil
+	}
+	if reason != "" {
 		printDoltStartBlock(reason, command)
 		return NewSilentExit(2)
 	}
 	return nil
+}
+
+// doltStartMatchBudget bounds the matcher: the quote scanner can backtrack
+// exponentially on crafted input, and this guard runs in front of every agent
+// command. It fails open, like the guard's other error paths.
+const doltStartMatchBudget = 200 * time.Millisecond
+
+// matchesDoltServerStartWithin runs matchesDoltServerStart for at most budget.
+// ok is false when the budget ran out, in which case the matcher is abandoned
+// (the guard process exits right after) and no verdict is given.
+func matchesDoltServerStartWithin(command string, budget time.Duration) (reason string, ok bool) {
+	done := make(chan string, 1)
+	go func() { done <- matchesDoltServerStart(command) }()
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	select {
+	case reason = <-done:
+		return reason, true
+	case <-timer.C:
+		return "", false
+	}
 }
 
 // shellCArg matches the end of text that has just named a shell's -c script, so
