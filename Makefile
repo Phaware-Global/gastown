@@ -4,6 +4,36 @@ BINARY := gt
 BINARY_DESKTOP := gt-desktop
 BUILD_DIR := .
 INSTALL_DIR := $(HOME)/.local/bin
+# Optional: sign the installed gt with a stable keychain identity (macOS).
+# An ad-hoc signature hashes differently on every build, so macOS TCC grants
+# (Full Disk Access, Removable Volumes) stop matching after each rebuild and
+# tccd re-hashes the binary on every gt call until an operator re-grants them.
+# A self-signed Code Signing certificate keeps the designated requirement
+# stable across rebuilds. Opt in with: make install GT_CODESIGN_IDENTITY=gt-local
+# Pass it per invocation rather than exporting it globally: any process that
+# can use the key can mint a gt that inherits gt's privacy grants.
+# The macro signs the staged copy ($(1), always a .new file) before it is moved
+# into place, so a failed signature leaves the existing install untouched.
+GT_CODESIGN_IDENTITY ?=
+# Never export it: the install recipe restarts the daemon, and anything the
+# daemon spawns would otherwise inherit the identity.
+unexport GT_CODESIGN_IDENTITY
+define codesign-binary
+	if [ -n "$(GT_CODESIGN_IDENTITY)" ]; then \
+		case "$(GT_CODESIGN_IDENTITY)" in -*) \
+			echo "Error: GT_CODESIGN_IDENTITY must name a keychain identity; '-' is ad-hoc signing and does not keep TCC grants"; \
+			rm -f "$(1)"; exit 1;; \
+		esac; \
+		if ! command -v codesign >/dev/null 2>&1; then \
+			echo "Warning: GT_CODESIGN_IDENTITY is set but codesign is not available; installing unsigned"; \
+		elif codesign -f -s "$(GT_CODESIGN_IDENTITY)" --identifier com.gastown.$(BINARY) "$(1)"; then \
+			echo "Signed $(1) with identity $(GT_CODESIGN_IDENTITY)"; \
+		else \
+			echo "Error: codesign with identity $(GT_CODESIGN_IDENTITY) failed; existing install left untouched"; \
+			rm -f "$(1)"; exit 1; \
+		fi; \
+	fi
+endef
 # Per-platform artifacts for push_binaries (§4.1). A worker is refreshed from
 # the tree matching ITS os/arch, which is why this exists at all: the two
 # pushable binaries are pure Go and cross-compile in seconds, so a macOS
@@ -115,8 +145,10 @@ check-install-path:
 
 install: check-up-to-date build
 	@mkdir -p $(INSTALL_DIR)
-	@rm -f $(INSTALL_DIR)/$(BINARY)
-	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY)
+	@# Stage, sign, then move: a failed signature must not leave a half-done install.
+	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY).new
+	@$(call codesign-binary,$(INSTALL_DIR)/$(BINARY).new)
+	@mv $(INSTALL_DIR)/$(BINARY).new $(INSTALL_DIR)/$(BINARY)
 	@$(MAKE) --no-print-directory install-remote-execution-binaries
 	@# Nuke any stale go-install binaries that shadow the canonical location
 	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY); do \
@@ -129,17 +161,20 @@ install: check-up-to-date build
 	@$(MAKE) --no-print-directory check-install-path
 	@# Restart daemon so it picks up the new binary.
 	@# A stale daemon is a recurring source of bugs (wrong session prefixes, etc.)
+	@# The daemon and plugin sync run under a scrubbed environment so the
+	@# long-lived daemon never inherits GT_CODESIGN_IDENTITY (make also
+	@# carries command-line variables in MAKEFLAGS).
 	@if $(INSTALL_DIR)/$(BINARY) daemon status >/dev/null 2>&1; then \
 		echo "Restarting daemon to pick up new binary..."; \
 		$(INSTALL_DIR)/$(BINARY) daemon stop >/dev/null 2>&1 || true; \
 		sleep 1; \
-		$(INSTALL_DIR)/$(BINARY) daemon start >/dev/null 2>&1 && \
+		env -u GT_CODESIGN_IDENTITY -u MAKEFLAGS -u MFLAGS $(INSTALL_DIR)/$(BINARY) daemon start >/dev/null 2>&1 && \
 			echo "Daemon restarted." || \
 			echo "Warning: daemon restart failed (start manually with: gt daemon start)"; \
 	fi
 	@# Sync plugins from build repo to town runtime directories.
 	@# Prevents drift when plugin fixes merge but runtime dirs are stale.
-	@$(INSTALL_DIR)/$(BINARY) plugin sync --source $(CURDIR)/plugins 2>/dev/null && \
+	@env -u GT_CODESIGN_IDENTITY -u MAKEFLAGS -u MFLAGS $(INSTALL_DIR)/$(BINARY) plugin sync --source $(CURDIR)/plugins 2>/dev/null && \
 		echo "Plugins synced." || true
 
 # safe-install: Replace binary WITHOUT restarting daemon or killing sessions.
@@ -149,6 +184,7 @@ safe-install: check-up-to-date check-forward-only build
 	@mkdir -p $(INSTALL_DIR)
 	@# Atomic-ish replace: copy to temp then move (move is atomic on same filesystem)
 	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY).new
+	@$(call codesign-binary,$(INSTALL_DIR)/$(BINARY).new)
 	@mv $(INSTALL_DIR)/$(BINARY).new $(INSTALL_DIR)/$(BINARY)
 	@$(MAKE) --no-print-directory install-remote-execution-binaries
 	@# Nuke any stale go-install binaries that shadow the canonical location
