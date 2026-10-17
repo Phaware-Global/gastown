@@ -3612,3 +3612,89 @@ func TestRemoveWith_MissingWorktreeAllowedWhenTipIsOnARemote(t *testing.T) {
 		t.Errorf("remote branches changed from %q to %q", before, got)
 	}
 }
+
+// TestWorkAtRiskError_RecoveryCommandCannotInjectGitOptions pins that a branch
+// whose name begins with '-' is a ref, never an option, in the generated
+// command: --output=<path> would otherwise truncate that file when the
+// operator pastes the hint. Both the worktree form and the shared-repo form
+// (missing worktree) are covered.
+func TestWorkAtRiskError_RecoveryCommandCannotInjectGitOptions(t *testing.T) {
+	mgr, _ := setupCanonicalBranchManagerTest(t)
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	repo, err := mgr.repoBase()
+	if err != nil {
+		t.Fatalf("repoBase: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		risk func(victim string) *WorkAtRiskError
+	}{
+		{"worktree", func(victim string) *WorkAtRiskError {
+			return &WorkAtRiskError{Polecat: "toast", Branch: "--output=" + victim, ClonePath: p.ClonePath, Unpushed: 1}
+		}},
+		{"shared repo", func(victim string) *WorkAtRiskError {
+			return &WorkAtRiskError{Polecat: "toast", Branch: "--output=" + victim, ClonePath: p.ClonePath, RepoPath: repo.WorkDir(), Unpushed: 1}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			victim := filepath.Join(t.TempDir(), "victim")
+			if err := os.WriteFile(victim, []byte("precious\n"), 0644); err != nil {
+				t.Fatalf("write victim: %v", err)
+			}
+			cmd := tc.risk(victim).RecoveryCommand()
+			// The command is expected to fail (no such branch); it must not act on the name.
+			_ = exec.Command("sh", "-c", cmd).Run()
+			got, err := os.ReadFile(victim)
+			if err != nil || string(got) != "precious\n" {
+				t.Fatalf("recovery command %q modified the victim file: %q (err %v)", cmd, got, err)
+			}
+		})
+	}
+}
+
+// TestRemoveWith_MissingWorktreeOnBareRepoHintRunsInTheBareRepo pins the
+// production layout, where the shared repo is <rig>/.repo.git and has no work
+// dir: the refusal must name that repo and its recovery command must list the
+// stranded commit from it, not run inside the worktree that is gone.
+func TestRemoveWith_MissingWorktreeOnBareRepoHintRunsInTheBareRepo(t *testing.T) {
+	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
+	bare := filepath.Join(mgr.rig.Path, ".repo.git")
+	for _, args := range [][]string{
+		{"clone", "--bare", mayorRig, bare},
+		{"-C", bare, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"},
+		{"-C", bare, "config", "gc.auto", "0"},
+		{"-C", bare, "fetch", "origin"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	p, err := mgr.AddWithOptions("toast", AddOptions{})
+	if err != nil {
+		t.Fatalf("AddWithOptions: %v", err)
+	}
+	commitInWorktree(t, p.ClonePath, "work.txt", "stranded bare-repo work")
+	if err := os.RemoveAll(p.ClonePath); err != nil {
+		t.Fatalf("remove worktree: %v", err)
+	}
+
+	err = mgr.RemoveWith("toast", RemoveOptions{Force: true})
+	var risk *WorkAtRiskError
+	if !errors.As(err, &risk) {
+		t.Fatalf("RemoveWith err = %v, want *WorkAtRiskError", err)
+	}
+	if risk.RepoPath != bare {
+		t.Errorf("RepoPath = %q, want the bare repo %q", risk.RepoPath, bare)
+	}
+	if !strings.Contains(risk.Error(), "shared repo") {
+		t.Errorf("Error() should say the commits live in the shared repo: %v", risk)
+	}
+	out, runErr := exec.Command("sh", "-c", risk.RecoveryCommand()).CombinedOutput()
+	if runErr != nil || !strings.Contains(string(out), "stranded bare-repo work") {
+		t.Fatalf("recovery command %q must list the stranded commit: %v\n%s", risk.RecoveryCommand(), runErr, out)
+	}
+}
