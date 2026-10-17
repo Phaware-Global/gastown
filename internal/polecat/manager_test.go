@@ -3613,69 +3613,77 @@ func TestRemoveWith_MissingWorktreeAllowedWhenTipIsOnARemote(t *testing.T) {
 	}
 }
 
-// TestWorkAtRiskError_RecoveryCommandCannotInjectGitOptions pins that a branch
-// whose name begins with '-' is a ref, never an option, in the generated
-// command: --output=<path> would otherwise truncate that file when the
-// operator pastes the hint. Both the worktree form and the shared-repo form
-// (missing worktree) are covered.
-func TestWorkAtRiskError_RecoveryCommandCannotInjectGitOptions(t *testing.T) {
-	mgr, _ := setupCanonicalBranchManagerTest(t)
-	p, err := mgr.AddWithOptions("toast", AddOptions{})
-	if err != nil {
-		t.Fatalf("AddWithOptions: %v", err)
-	}
-	repo, err := mgr.repoBase()
-	if err != nil {
-		t.Fatalf("repoBase: %v", err)
-	}
+// TestWorkAtRiskError_RecoveryCommand pins the recovery hint on both of its
+// producers, for the three branch names that have each broken it. The
+// worktree form takes the name from CurrentBranch, which reports heads/<b> for
+// a branch shadowed by a same-named tag; the shared-repo form takes a bare name
+// from WorktreeList, and a same-named tag must not shadow it. A name beginning
+// with '-' must never be read by git as an option (--output=<path> would
+// truncate that file when the operator pastes the hint).
+func TestWorkAtRiskError_RecoveryCommand(t *testing.T) {
+	const branchWork, tagWork = "BRANCHWORK", "TAGWORK"
+	for _, path := range []string{"worktree", "shared repo"} {
+		for _, name := range []string{"plain", "same-named tag", "dash-leading"} {
+			t.Run(path+"/"+name, func(t *testing.T) {
+				dir := t.TempDir()
+				victim := filepath.Join(t.TempDir(), "victim")
+				if err := os.WriteFile(victim, []byte("precious\n"), 0644); err != nil {
+					t.Fatalf("write victim: %v", err)
+				}
+				branch := "polecat/x"
+				if name == "dash-leading" {
+					branch = "--output=" + victim
+				}
+				run := func(args ...string) string {
+					t.Helper()
+					out, err := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.com"}, args...)...).CombinedOutput()
+					if err != nil {
+						t.Fatalf("git %v: %v\n%s", args, err, out)
+					}
+					return strings.TrimSpace(string(out))
+				}
+				run("init", "-q", "-b", "main")
+				run("commit", "-q", "--allow-empty", "-m", "base")
+				base := run("rev-parse", "HEAD")
+				run("commit", "-q", "--allow-empty", "-m", branchWork)
+				run("update-ref", "refs/heads/"+branch, "HEAD")
+				run("symbolic-ref", "HEAD", "refs/heads/"+branch)
+				if name == "same-named tag" {
+					// A commit disjoint from the branch's, so a hint that walks the
+					// tag instead of the branch lists the wrong work.
+					tagged := run("commit-tree", "-m", tagWork, "-p", base, base+"^{tree}")
+					run("tag", branch, tagged)
+				}
 
-	for _, tc := range []struct {
-		name string
-		risk func(victim string) *WorkAtRiskError
-	}{
-		{"worktree", func(victim string) *WorkAtRiskError {
-			return &WorkAtRiskError{Polecat: "toast", Branch: "--output=" + victim, ClonePath: p.ClonePath, Unpushed: 1}
-		}},
-		{"shared repo", func(victim string) *WorkAtRiskError {
-			return &WorkAtRiskError{Polecat: "toast", Branch: "--output=" + victim, ClonePath: p.ClonePath, RepoPath: repo.WorkDir(), Unpushed: 1}
-		}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			victim := filepath.Join(t.TempDir(), "victim")
-			if err := os.WriteFile(victim, []byte("precious\n"), 0644); err != nil {
-				t.Fatalf("write victim: %v", err)
-			}
-			cmd := tc.risk(victim).RecoveryCommand()
-			// The command is expected to fail (no such branch); it must not act on the name.
-			_ = exec.Command("sh", "-c", cmd).Run()
-			got, err := os.ReadFile(victim)
-			if err != nil || string(got) != "precious\n" {
-				t.Fatalf("recovery command %q modified the victim file: %q (err %v)", cmd, got, err)
-			}
-		})
-	}
+				risk := &WorkAtRiskError{Polecat: "toast", ClonePath: dir, Unpushed: 1}
+				if path == "worktree" {
+					got, err := git.NewGit(dir).CurrentBranch()
+					if err != nil {
+						t.Fatalf("CurrentBranch: %v", err)
+					}
+					if wantShadow := name == "same-named tag"; wantShadow != strings.HasPrefix(got, "heads/") {
+						t.Fatalf("CurrentBranch = %q; the fixture no longer exercises the disambiguated form", got)
+					}
+					risk.Branch = got
+				} else {
+					wts, err := git.NewGit(dir).WorktreeList()
+					if err != nil || len(wts) == 0 {
+						t.Fatalf("WorktreeList = %v, %v", wts, err)
+					}
+					risk.Branch, risk.RepoPath = wts[0].Branch, dir
+				}
 
-	// A tag named like the branch makes rev-parse --abbrev-ref report
-	// heads/<branch>; the hint must still list the commits, so the name cannot
-	// be rewritten on the way into the command.
-	t.Run("branch shadowed by a same-named tag", func(t *testing.T) {
-		sha := commitInWorktree(t, p.ClonePath, "tagged.txt", "work under a shadowed branch name")
-		if out, err := exec.Command("git", "-C", p.ClonePath, "tag", p.Branch).CombinedOutput(); err != nil {
-			t.Fatalf("tag %s: %v\n%s", p.Branch, err, out)
+				cmd := risk.RecoveryCommand()
+				out, err := exec.Command("sh", "-c", cmd).CombinedOutput()
+				if err != nil || !strings.Contains(string(out), branchWork) || strings.Contains(string(out), tagWork) {
+					t.Fatalf("recovery command %q must list %s and not %s: %v\n%s", cmd, branchWork, tagWork, err, out)
+				}
+				if got, err := os.ReadFile(victim); err != nil || string(got) != "precious\n" {
+					t.Fatalf("recovery command %q modified the victim file: %q (err %v)", cmd, got, err)
+				}
+			})
 		}
-		branch, err := git.NewGit(p.ClonePath).CurrentBranch()
-		if err != nil {
-			t.Fatalf("CurrentBranch: %v", err)
-		}
-		if branch == p.Branch {
-			t.Fatalf("CurrentBranch = %q, want the disambiguated heads/ form; the fixture no longer shadows the branch", branch)
-		}
-		cmd := (&WorkAtRiskError{Polecat: "toast", Branch: branch, ClonePath: p.ClonePath, Unpushed: 1}).RecoveryCommand()
-		out, err := exec.Command("sh", "-c", cmd).CombinedOutput()
-		if err != nil || !strings.Contains(string(out), sha[:7]) {
-			t.Fatalf("recovery command %q must list the commit %s: %v\n%s", cmd, sha[:7], err, out)
-		}
-	})
+	}
 }
 
 // TestRemoveWith_MissingWorktreeOnBareRepoHintRunsInTheBareRepo pins the
