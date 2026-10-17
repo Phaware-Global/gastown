@@ -1136,7 +1136,103 @@ func (m *Manager) Remove(name string, force bool) error {
 //
 // ZFC #10: Uses cleanup_status from agent bead if available (polecat self-report),
 // falls back to git check for backward compatibility.
-func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) (retErr error) {
+func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) error {
+	return m.RemoveWith(name, RemoveOptions{Force: force, Nuclear: nuclear, SelfNuke: selfNuke})
+}
+
+// RemoveOptions controls RemoveWith. See RemoveWithOptions for Force, Nuclear
+// and SelfNuke.
+type RemoveOptions struct {
+	Force    bool
+	Nuclear  bool
+	SelfNuke bool
+	// DiscardUnpushed is the only way past a *WorkAtRiskError. Force and
+	// Nuclear deliberately do not imply it.
+	DiscardUnpushed bool
+}
+
+// WorkAtRiskError means removal would destroy commits that exist nowhere but
+// the worktree being removed (or, when RepoPath is set, that branch in the
+// shared repo). Removal is aborted before anything is touched. It wraps
+// ErrUnpublishedWork.
+type WorkAtRiskError struct {
+	Polecat   string
+	Branch    string
+	ClonePath string
+	// RepoPath is the shared repo that still holds Branch when the worktree
+	// itself is gone; the recovery command is run there instead of in ClonePath.
+	RepoPath string
+	// Unpushed is the number of commits at risk, or -1 when the comparison
+	// itself failed and the count is unknown.
+	Unpushed int
+	Reason   string
+}
+
+func (e *WorkAtRiskError) Error() string {
+	count := fmt.Sprintf("%d unpushed commit(s) exist", e.Unpushed)
+	if e.Unpushed < 0 {
+		count = "an unknown number of possibly unpushed commits may exist"
+	}
+	where := "this worktree"
+	if e.RepoPath != "" {
+		where = "the shared repo, whose worktree is gone"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "WORK AT RISK: refusing to remove polecat %s: %s\n", e.Polecat, e.Reason)
+	fmt.Fprintf(&b, "%s only in %s:\n  branch:   %s\n  worktree: %s\n", count, where, e.Branch, e.ClonePath)
+	b.WriteString("Nothing was removed.")
+	if cmd := e.RecoveryCommand(); cmd != "" {
+		fmt.Fprintf(&b, " To recover, list the commits with:\n  %s\nthen", cmd)
+	} else {
+		b.WriteString(" To recover,")
+	}
+	b.WriteString(" fix the cause (e.g. amend a hooks-bypassed commit so hooks re-run) or push or move the commits somewhere durable, and retry the removal. " +
+		"gt polecat nuke refuses these commits too; the only way to delete them on purpose is its --discard-unpushed flag.")
+	return b.String()
+}
+
+func (e *WorkAtRiskError) Unwrap() error {
+	return ErrUnpublishedWork
+}
+
+// RecoveryCommand lists the commits at risk, or returns "" when no branch is
+// known to list them from. It works for a branch that was never pushed (no
+// origin/<branch> to range against) and single-quotes the polecat-controlled
+// branch name and paths so pasting it cannot run anything embedded in them.
+// The ref comes after --not --end-of-options (the second --not makes it
+// positive again), so a name beginning with '-' is never read as a git option.
+// The two producers need different treatment of the name. A worktree's comes
+// from CurrentBranch and is used as reported: git reports heads/<branch> for a
+// branch shadowed by a same-named tag, and that form resolves. A missing
+// worktree's (RepoPath set) comes from WorktreeList and is always a plain
+// branch name, which a same-named tag would shadow, so it is qualified.
+func (e *WorkAtRiskError) RecoveryCommand() string {
+	dir, ref := e.ClonePath, e.Branch
+	switch ref {
+	case "", "HEAD", "(detached)":
+		// A detached HEAD only exists inside its worktree.
+		if e.RepoPath != "" {
+			return ""
+		}
+		ref = "HEAD"
+	case "(unknown)":
+		return ""
+	}
+	if e.RepoPath != "" {
+		dir = e.RepoPath
+		ref = "refs/heads/" + ref
+	}
+	return fmt.Sprintf("git -C %s log --oneline --not --remotes --not --end-of-options %s", shellQuote(dir), shellQuote(ref))
+}
+
+// shellQuote single-quotes s for a POSIX shell.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// RemoveWith is RemoveWithOptions with the full option set.
+func (m *Manager) RemoveWith(name string, opts RemoveOptions) (retErr error) {
+	force, nuclear, selfNuke := opts.Force, opts.Nuclear, opts.SelfNuke
 	defer func() { telemetry.RecordPolecatRemove(context.Background(), name, retErr) }()
 	// Acquire per-polecat file lock to prevent concurrent Remove races
 	fl, err := m.lockPolecat(name)
@@ -1156,6 +1252,10 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 
 	// Best-effort, even under force/nuclear: snapshot uncommitted tracked work into a local refs/gt/preserve ref (never pushed) before the worktree is removed.
 	preserveGit := git.NewGit(clonePath)
+	// pinned records that a detached HEAD's commits are known to be held by a
+	// ref that outlives the worktree; preserveUnpushedWork exempts a detached
+	// HEAD only on that evidence, never on the attempt.
+	pinned := false
 	if branch, brErr := preserveGit.CurrentBranch(); brErr == nil && branch != "" {
 		if branch == "HEAD" && nuclear {
 			style.PrintWarning("worktree %s is on a detached HEAD — nuclear removal skips local auto-preserve here (no branch ref would survive worktree teardown to hold the commit); any uncommitted work is discarded", name)
@@ -1184,9 +1284,15 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 				return fmt.Errorf("could not auto-preserve work in %s before removing a detached-HEAD worktree, and removal would discard any uncommitted commit with no recoverable ref: %w (use force to remove anyway)", name, presErr)
 			}
 			style.PrintWarning("could not auto-preserve work in %s before removal: %v", name, presErr)
-		} else if result.Committed {
-			fmt.Printf("%s Preserved uncommitted work for %s locally: %s at %s\n",
-				style.Bold.Render("✓"), name, result.Commit, result.Ref)
+		} else {
+			// AutoPreserve succeeding on a detached HEAD means its commits are
+			// reachable from a branch, a remote-tracking ref, or the
+			// refs/gt/preserve pin it just recorded.
+			pinned = branch == "HEAD"
+			if result.Committed {
+				fmt.Printf("%s Preserved uncommitted work for %s locally: %s at %s\n",
+					style.Bold.Render("✓"), name, result.Commit, result.Ref)
+			}
 		}
 	}
 
@@ -1233,13 +1339,12 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 		}
 	}
 
-	// Publish the polecat's branch before anything is torn down. A refusal or
-	// failure here with unpushed commits aborts the removal while the agent bead,
-	// work-bead assignments and worktree are all still intact.
-	if !nuclear {
-		if err := m.pushBeforeRemoval(name, clonePath); err != nil {
-			return err
-		}
+	// Publish the branch's unpushed commits, or refuse. This runs before the
+	// first mutation (agent bead reset, bead unassignment) so a refusal leaves
+	// the polecat exactly as it was. Force and nuclear do not skip it: only the
+	// explicit DiscardUnpushed override accepts losing commits (gt-yu9l).
+	if err := m.preserveUnpushedWork(name, clonePath, nuclear, pinned, force, opts.DiscardUnpushed); err != nil {
+		return err
 	}
 
 	// Reset agent bead FIRST, before any filesystem operations.
@@ -1345,127 +1450,215 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	return nil
 }
 
-// UnpublishedWorkError reports that a polecat's pre-removal push was refused or
-// failed while the branch still holds commits that exist nowhere else.
-// Removal is aborted and the worktree left intact.
-type UnpublishedWorkError struct {
-	PolecatName   string
-	Branch        string
-	ClonePath     string
-	UnpushedCount int // -1 when the count could not be determined
-	Reason        string
-}
-
-func (e *UnpublishedWorkError) Error() string {
-	count := "an unknown number of"
-	if e.UnpushedCount >= 0 {
-		count = fmt.Sprintf("%d", e.UnpushedCount)
-	}
-	return fmt.Sprintf("refusing to remove polecat %s: %s\n"+
-		"%s unpushed commit(s) exist only in this worktree:\n"+
-		"  branch:   %s\n"+
-		"  worktree: %s\n"+
-		"The worktree has been left intact. To recover, list the commits with:\n"+
-		"  %s\n"+
-		"then fix the cause (e.g. amend a hooks-bypassed commit so hooks re-run) or push or move the commits somewhere durable, and retry the removal. "+
-		"Do not use gt polecat nuke to discard them: it pushes the branch, hooks-bypassed commits included, before deleting it.",
-		e.PolecatName, e.Reason, count, e.Branch, e.ClonePath, e.RecoveryCommand())
-}
-
-// RecoveryCommand lists the commits at risk. It works for a branch that was
-// never pushed (no origin/<branch> to range against) and single-quotes the
-// polecat-controlled branch name and path so pasting it cannot run anything
-// embedded in them.
-func (e *UnpublishedWorkError) RecoveryCommand() string {
-	ref := "HEAD"
-	if e.Branch != "" && e.Branch != "HEAD" {
-		ref = e.Branch
-	}
-	return fmt.Sprintf("git -C %s log --oneline %s --not --remotes", shellQuote(e.ClonePath), shellQuote(ref))
-}
-
-// shellQuote single-quotes s for a POSIX shell.
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
-func (e *UnpublishedWorkError) Unwrap() error {
-	return ErrUnpublishedWork
-}
-
-// pushBeforeRemoval pushes the polecat's branch to origin so committed work
-// survives the worktree. Two gates keep it from publishing what it shouldn't
-// (PR #184 review): never when the branch carries a commit made with hooks
-// bypassed, and never a checkpoint auto-save commit (gt-94p1).
+// PreserveUnpushedWork is the removal-time unpushed-work gate on its own, for
+// callers that must learn about a refusal before they take any destructive
+// step of their own (stopping the session, burning molecules). It publishes
+// the branch when it can and returns *WorkAtRiskError when commits would
+// otherwise be lost. With discard it only makes the best-effort push.
 //
-// A gate refusing the push is not a license to delete: if the branch has
-// unpushed commits (or that can't be established) the removal fails with an
-// UnpublishedWorkError and the caller must not touch the worktree (gt-renk).
-// Refusing to publish must never be followed by destroying. A detached HEAD
-// has no branch to push; removal proceeds only once a remote-tracking or preserve ref is confirmed to hold HEAD.
-func (m *Manager) pushBeforeRemoval(name, clonePath string) error {
+// force is only consulted when the worktree is already gone and its branch
+// cannot be resolved either (see missingWorktreeRisk), which never publishes.
+//
+// The gate runs before the removal does, so it has pinned nothing: a detached
+// HEAD is checked against the remote like a branch, which is the standard a
+// nuclear removal applies later. Passing nuclear here would also stop the
+// gate from publishing branches, which the removals after it rely on.
+func (m *Manager) PreserveUnpushedWork(name string, force, discard bool) error {
+	if !m.exists(name) {
+		return ErrPolecatNotFound
+	}
+	return m.preserveUnpushedWork(name, m.clonePath(name), false, false, force, discard)
+}
+
+// preserveUnpushedWork makes sure every commit on the worktree's branch exists
+// somewhere other than the worktree, then reports whether any does not.
+//
+// "Unpushed" is decided by comparing the worktree against the remote's actual
+// refs (BranchPushedToRemote), never inferred from a failed push. A detached
+// HEAD has no name to push under: pushing the literal ref "HEAD" is malformed.
+// The removal path pins a detached HEAD's commits under refs/gt/preserve
+// itself; pinned says that pin succeeded, and only then, with a remote-tracking
+// or preserve ref confirmed to hold HEAD (HeadHeldByDurableRef), is such a
+// worktree neither pushed nor refused here. Nuclear skips the pin and a failed
+// pin leaves nothing holding the commits, so in both cases a detached HEAD is
+// held to the same standard as a branch.
+//
+// A worktree directory that does not exist, or has no .git entry, cannot be
+// inspected, so its branch is judged in the shared repo instead
+// (missingWorktreeRisk). force only matters there.
+//
+// nuclear never publishes (the operator reached for it because the contents
+// must not survive), so under nuclear any unpushed commit is at risk. A
+// comparison that cannot be made is treated as at risk too, never as pushed.
+func (m *Manager) preserveUnpushedWork(name, clonePath string, nuclear, pinned, force, discard bool) error {
+	if _, statErr := os.Lstat(filepath.Join(clonePath, ".git")); errors.Is(statErr, os.ErrNotExist) {
+		return m.missingWorktreeRisk(name, clonePath, force, discard)
+	}
 	polecatGit := git.NewGit(clonePath)
-	branch, brErr := polecatGit.CurrentBranch()
-	if brErr != nil || branch == "" {
-		return nil
+	branch, err := polecatGit.CurrentBranch()
+	if err != nil {
+		return m.unverifiedWorkRisk(name, clonePath, "(unknown)", fmt.Errorf("current branch: %w", err), discard)
 	}
-
-	var refusal string
-	if badSHA, chkErr := git.HasUnverifiedCommit(polecatGit, "origin", []string{m.rig.DefaultBranch()}); chkErr != nil {
-		refusal = fmt.Sprintf("could not verify its commits before the pre-removal push (not pushing branch %s): %v", branch, chkErr)
-	} else if badSHA != "" {
-		refusal = fmt.Sprintf("branch %s carries commit %s made with pre-commit hooks bypassed, so the pre-removal push was refused", branch, badSHA[:8])
-	} else if wipSHA, wipErr := git.HasWIPCommit(polecatGit, "origin", "refs/heads/"+branch, checkpoint.WIPCommitPrefix, []string{m.rig.DefaultBranch()}); wipErr != nil {
-		refusal = fmt.Sprintf("could not verify its commits before the pre-removal push (not pushing branch %s): %v", branch, wipErr)
-	} else if wipSHA != "" {
-		// gt-94p1 requirement 3: backstop for AutoPreserveUncommittedWork's
-		// Ephemeral mode, which should already keep one off the branch.
-		refusal = fmt.Sprintf("branch %s carries a checkpoint auto-save commit %s, so the pre-removal push was refused", branch, wipSHA[:8])
-	}
-
-	pushed, unpushedCount, checkErr := polecatGit.BranchPushedToRemote(branch, "origin")
-	if checkErr == nil && (pushed || unpushedCount == 0) {
-		if refusal != "" {
-			style.PrintWarning("%s: %s; nothing unpushed, continuing", name, refusal)
-		}
-		return nil
-	}
-	if checkErr != nil {
-		unpushedCount = -1
-		if refusal == "" {
-			refusal = fmt.Sprintf("could not determine whether branch %s is pushed: %v", branch, checkErr)
-		}
-	}
-	if refusal == "" {
-		pushErr := polecatGit.Push("origin", branch, false)
-		if pushErr == nil {
-			return nil
-		}
-		refusal = fmt.Sprintf("could not push branch %s: %v", branch, pushErr)
-	}
-
-	if branch == "HEAD" {
-		// A detached HEAD has no branch to push; the earlier auto-preserve step
-		// is meant to pin its commits under refs/gt/preserve. That step is
-		// best-effort, so confirm a ref really holds HEAD rather than assume.
+	detached := branch == "" || branch == "HEAD"
+	if detached && !nuclear && pinned {
+		// The pin is trusted only once a ref that outlives the worktree is seen
+		// to hold HEAD. The polecat's own branch does not count: gc and the
+		// sling rollback force-delete it.
 		held, holdErr := polecatGit.HeadHeldByDurableRef()
-		if holdErr == nil && held {
-			style.PrintWarning("%s: %s; detached HEAD is held by a remote-tracking or preserve ref, continuing", name, refusal)
+		if holdErr != nil {
+			return m.unverifiedWorkRisk(name, clonePath, "(detached)", fmt.Errorf("confirming a ref holds the detached HEAD: %w", holdErr), discard)
+		}
+		if held {
 			return nil
 		}
-		if holdErr != nil {
-			refusal = fmt.Sprintf("%s (and could not confirm a ref holds the detached HEAD: %v)", refusal, holdErr)
-		} else {
-			refusal = fmt.Sprintf("%s (and no remote-tracking or preserve ref holds the detached HEAD)", refusal)
+	}
+	label := branch
+	if detached {
+		label = "(detached)"
+	}
+	pushed, unpushed, err := polecatGit.BranchPushedToRemote(branch, "origin")
+	if err != nil {
+		return m.unverifiedWorkRisk(name, clonePath, label, err, discard)
+	}
+	if pushed || unpushed == 0 {
+		return nil
+	}
+
+	risk := &WorkAtRiskError{Polecat: name, Branch: label, ClonePath: clonePath, Unpushed: unpushed}
+	switch {
+	case nuclear:
+		risk.Reason = "nuclear removal never publishes"
+	case detached:
+		risk.Reason = "detached HEAD commits are held by no remote-tracking or preserve ref"
+	default:
+		risk.Reason = m.pushUnpushedBranch(polecatGit, branch)
+	}
+	if risk.Reason == "" {
+		return nil
+	}
+	if discard {
+		style.PrintWarning("discarding %d unpushed commit(s) on branch %s (%s) at the operator's explicit request", unpushed, label, risk.Reason)
+		return nil
+	}
+	return risk
+}
+
+// missingWorktreeRisk judges a polecat whose worktree directory is gone by the
+// branch the shared repo still has registered for it, since running git in the
+// missing directory can only fail.
+//
+// It never publishes anything, under any flag: the worktree that could have
+// been inspected for hook bypasses, checkpoint commits and the like is gone, and
+// the shared repo's HEAD is not the branch. The branch's tip (refs/heads/<branch>,
+// never HEAD) is resolved explicitly and removal is allowed only if a remote
+// already holds it; otherwise it is refused, naming the tip and the explicit
+// discard override. When the branch cannot be resolved either, nothing is known
+// about the work: removal is refused unless force or discard accepts that.
+func (m *Manager) missingWorktreeRisk(name, clonePath string, force, discard bool) error {
+	unresolved := func(cause error) error {
+		reason := fmt.Sprintf("worktree is missing and its branch could not be checked: %v; pass --force to remove it anyway", cause)
+		if force || discard {
+			style.PrintWarning("removing polecat %s with a missing worktree and an unchecked branch (%v)", name, cause)
+			return nil
+		}
+		return &WorkAtRiskError{Polecat: name, Branch: "(unknown)", ClonePath: clonePath, Unpushed: -1, Reason: reason}
+	}
+
+	repoGit, err := m.repoBase()
+	if err != nil {
+		return unresolved(err)
+	}
+	worktrees, err := repoGit.WorktreeList()
+	if err != nil {
+		return unresolved(err)
+	}
+	want := resolveMissingPath(clonePath)
+	branch := ""
+	for _, wt := range worktrees {
+		if resolveMissingPath(wt.Path) == want {
+			branch = wt.Branch
+			break
 		}
 	}
-	return &UnpublishedWorkError{
-		PolecatName:   name,
-		Branch:        branch,
-		ClonePath:     clonePath,
-		UnpushedCount: unpushedCount,
-		Reason:        refusal,
+	if branch == "" {
+		return unresolved(fmt.Errorf("no branch registered for %s", clonePath))
 	}
+	tip, err := repoGit.Rev("refs/heads/" + branch)
+	if err != nil {
+		return unresolved(fmt.Errorf("resolving the tip of %s: %w", branch, err))
+	}
+	// Not BranchPushedToRemote: that compares the repo base's checked-out HEAD,
+	// not the polecat's branch.
+	unpushed, err := repoGit.BranchCommitsNotOnRemote(branch, "origin")
+	if err != nil {
+		return unresolved(err)
+	}
+	if unpushed == 0 {
+		return nil
+	}
+	reason := fmt.Sprintf("tip %s is on no remote and the worktree is gone, so it is not pushed; pass --discard-unpushed to delete it", tip[:8])
+	if discard {
+		style.PrintWarning("discarding %d unpushed commit(s) on branch %s (%s) at the operator's explicit request", unpushed, branch, reason)
+		return nil
+	}
+	// The shared bare repo has no work dir; it is the repo's own git dir.
+	repoPath := repoGit.WorkDir()
+	if repoPath == "" {
+		repoPath = filepath.Join(m.rig.Path, ".repo.git")
+	}
+	return &WorkAtRiskError{Polecat: name, Branch: branch, ClonePath: clonePath, RepoPath: repoPath, Unpushed: unpushed, Reason: reason}
+}
+
+// resolveMissingPath resolves symlinks in the nearest existing ancestor of
+// path, so a worktree path git reports can be compared with one whose
+// directory no longer exists.
+func resolveMissingPath(path string) string {
+	rest := ""
+	for p := filepath.Clean(path); ; p = filepath.Dir(p) {
+		if real, err := filepath.EvalSymlinks(p); err == nil {
+			return filepath.Join(real, rest)
+		}
+		if filepath.Dir(p) == p {
+			return filepath.Clean(path)
+		}
+		rest = filepath.Join(filepath.Base(p), rest)
+	}
+}
+
+// unverifiedWorkRisk is the fail-closed answer for a worktree whose commits
+// could not be compared against the remote: removal is refused unless the
+// operator passed the explicit discard override.
+func (m *Manager) unverifiedWorkRisk(name, clonePath, branch string, cause error, discard bool) error {
+	reason := fmt.Sprintf("could not determine whether commits are pushed: %v", cause)
+	if discard {
+		style.PrintWarning("discarding possibly unpushed commits on branch %s (%s) at the operator's explicit request", branch, reason)
+		return nil
+	}
+	return &WorkAtRiskError{Polecat: name, Branch: branch, ClonePath: clonePath, Unpushed: -1, Reason: reason}
+}
+
+// pushUnpushedBranch pushes branch to origin and returns "" on success, or the
+// reason the commits stayed local. It refuses to publish a commit made with
+// hooks bypassed or a checkpoint auto-save commit: pushing either onto the
+// polecat's real branch would be worse than leaving it local.
+func (m *Manager) pushUnpushedBranch(polecatGit *git.Git, branch string) string {
+	defaultBranches := []string{m.rig.DefaultBranch()}
+	if badSHA, err := git.HasUnverifiedCommitAt(polecatGit, "origin", "refs/heads/"+branch, defaultBranches); err != nil {
+		return fmt.Sprintf("could not verify the branch's commits before pushing: %v", err)
+	} else if badSHA != "" {
+		return fmt.Sprintf("commit %s was made with pre-commit hooks bypassed, so it is not pushed", badSHA[:8])
+	}
+	if wipSHA, err := git.HasWIPCommit(polecatGit, "origin", "refs/heads/"+branch, checkpoint.WIPCommitPrefix, defaultBranches); err != nil {
+		return fmt.Sprintf("could not verify the branch's commits before pushing: %v", err)
+	} else if wipSHA != "" {
+		// gt-94p1 requirement 3: a checkpoint auto-save commit must never
+		// reach a real branch, even via this best-effort push.
+		return fmt.Sprintf("checkpoint auto-save commit %s is not pushed", wipSHA[:8])
+	}
+	if err := polecatGit.Push("origin", branch+":refs/heads/"+branch, false); err != nil {
+		return fmt.Sprintf("push failed: %v", err)
+	}
+	return ""
 }
 
 // verifyRemovalComplete checks that polecat directories were actually removed.

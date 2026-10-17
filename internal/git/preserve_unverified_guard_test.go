@@ -59,7 +59,7 @@ func TestHasUnverifiedCommit_AlreadyMergedToProtectedBranchNotFlagged(t *testing
 	runGitTestCmd(t, localDir, "checkout", "-b", "polecat/foo/gt-35un@abc123", "develop")
 	runGitTestCmd(t, localDir, "fetch", "origin")
 
-	got, err := HasUnverifiedCommit(g, "origin", []string{"develop"})
+	got, err := HasUnverifiedCommitAt(g, "origin", "HEAD", []string{"develop"})
 	if err != nil {
 		t.Fatalf("HasUnverifiedCommit: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestHasUnverifiedCommit_OwnUnpushedCommitStillFlagged(t *testing.T) {
 	runGitTestCmd(t, localDir, "checkout", "-b", "polecat/foo/gt-35un@abc123")
 	badSHA := commitUnverified(t, localDir, "own-work.txt", "own work", "bypassed hooks")
 
-	got, err := HasUnverifiedCommit(g, "origin", []string{"develop"})
+	got, err := HasUnverifiedCommitAt(g, "origin", "HEAD", []string{"develop"})
 	if err != nil {
 		t.Fatalf("HasUnverifiedCommit: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestHasUnverifiedCommit_OwnPushedCommitStillFlagged(t *testing.T) {
 	badSHA := commitUnverified(t, localDir, "own-work.txt", "own work", "bypassed hooks")
 	runGitTestCmd(t, localDir, "push", "-u", "origin", branch)
 
-	got, err := HasUnverifiedCommit(g, "origin", []string{"develop"})
+	got, err := HasUnverifiedCommitAt(g, "origin", "HEAD", []string{"develop"})
 	if err != nil {
 		t.Fatalf("HasUnverifiedCommit: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestHasUnverifiedCommit_UnresolvableProtectedRefFailsClosed(t *testing.T) {
 	runGitTestCmd(t, localDir, "add", "f.txt")
 	runGitTestCmd(t, localDir, "commit", "-m", "clean commit, no trailer")
 
-	_, err := HasUnverifiedCommit(g, "origin", []string{"develop-does-not-exist"})
+	_, err := HasUnverifiedCommitAt(g, "origin", "HEAD", []string{"develop-does-not-exist"})
 	if err == nil {
 		t.Fatal("expected an error when the configured protected branch does not resolve on origin — a missing ref must fail closed, not fall back to scanning everything or nothing")
 	}
@@ -155,7 +155,7 @@ func TestHasUnverifiedCommit_ShadowingLocalBranchNotExempt(t *testing.T) {
 	// unqualified name, at the tip of the unverified branch.
 	runGitTestCmd(t, localDir, "branch", "origin/develop", "HEAD")
 
-	got, err := HasUnverifiedCommit(g, "origin", []string{"develop"})
+	got, err := HasUnverifiedCommitAt(g, "origin", "HEAD", []string{"develop"})
 	if err != nil {
 		t.Fatalf("HasUnverifiedCommit: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestHasUnverifiedCommit_ShadowingLocalTagNotExempt(t *testing.T) {
 	// pass reproduced this variant independently.
 	runGitTestCmd(t, localDir, "tag", "origin/develop", "HEAD")
 
-	got, err := HasUnverifiedCommit(g, "origin", []string{"develop"})
+	got, err := HasUnverifiedCommitAt(g, "origin", "HEAD", []string{"develop"})
 	if err != nil {
 		t.Fatalf("HasUnverifiedCommit: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestHasUnverifiedCommit_NoProtectedBranchesFailsClosed(t *testing.T) {
 	localDir, _, _ := initTestRepoWithRemote(t)
 	g := NewGit(localDir)
 
-	got, err := HasUnverifiedCommit(g, "origin", nil)
+	got, err := HasUnverifiedCommitAt(g, "origin", "HEAD", nil)
 	if err == nil {
 		t.Fatalf("expected an error when no protected branches are configured, got badSHA=%q with no error — this must refuse rather than guess a baseline (e.g. by falling back to RemoteDefaultBranch)", got)
 	}

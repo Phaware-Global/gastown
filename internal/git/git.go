@@ -3522,6 +3522,25 @@ func (g *Git) CommitsAhead(base, branch string) (int, error) {
 	return count, nil
 }
 
+// BranchCommitsNotOnRemote returns how many commits on the named local branch
+// are reachable from no remote-tracking ref of remote. Unlike
+// BranchPushedToRemote it judges the branch itself, not the checked-out HEAD,
+// so it works from a repo whose worktree for that branch is gone.
+func (g *Git) BranchCommitsNotOnRemote(branch, remote string) (int, error) {
+	if remote == "" {
+		remote = "origin"
+	}
+	out, err := g.run("rev-list", "--count", "refs/heads/"+branch, "--not", "--remotes="+remote)
+	if err != nil {
+		return 0, err
+	}
+	var count int
+	if _, err := fmt.Sscanf(out, "%d", &count); err != nil {
+		return 0, fmt.Errorf("parsing commit count: %w", err)
+	}
+	return count, nil
+}
+
 // CountCommitsBehind returns the number of commits that HEAD is behind the given ref.
 // For example, CountCommitsBehind("origin/main") returns how many commits
 // are on origin/main that are not on the current HEAD.

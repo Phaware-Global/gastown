@@ -11,7 +11,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
-	"github.com/steveyegge/gastown/internal/checkpoint"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/rig"
@@ -143,6 +142,7 @@ var (
 	polecatNukeAll                       bool
 	polecatNukeDryRun                    bool
 	polecatNukeForce                     bool
+	polecatNukeDiscardUnpushed           bool
 	polecatCheckRecoveryJSON             bool
 	polecatCheckRecoveryReconcileCleanup bool
 	polecatPoolInitDryRun                bool
@@ -176,7 +176,7 @@ var polecatNukeCmd = &cobra.Command{
 
 This is the nuclear option for post-merge cleanup. It:
   1. Kills the Claude session (if running)
-  2. Deletes the git worktree (bypassing all safety checks)
+  2. Deletes the git worktree (bypassing the routine safety checks)
   3. Deletes the polecat branch
   4. Closes the agent bead (if exists)
 
@@ -186,7 +186,13 @@ SAFETY CHECKS: The command refuses to nuke a polecat if:
   - Polecat has an open merge request (MR bead or active_mr)
   - Polecat has work on its hook
 
-Use --force to bypass safety checks (LOSES WORK).
+Use --force to bypass these safety checks (LOSES WORK).
+
+Unpushed commits get their own gate that --force does NOT bypass: the branch
+is pushed first, and if commits would still exist only in the worktree the
+nuke aborts before touching anything. Pass --discard-unpushed to delete them
+anyway.
+
 Use --dry-run to see what would happen and safety check status.
 
 Examples:
@@ -346,7 +352,8 @@ func init() {
 	// Nuke flags
 	polecatNukeCmd.Flags().BoolVar(&polecatNukeAll, "all", false, "Nuke all polecats in the rig")
 	polecatNukeCmd.Flags().BoolVar(&polecatNukeDryRun, "dry-run", false, "Show what would be nuked without doing it")
-	polecatNukeCmd.Flags().BoolVarP(&polecatNukeForce, "force", "f", false, "Force nuke, bypassing all safety checks (LOSES WORK)")
+	polecatNukeCmd.Flags().BoolVarP(&polecatNukeForce, "force", "f", false, "Force nuke, bypassing the routine safety checks (does NOT bypass unpushed commits; see --discard-unpushed)")
+	polecatNukeCmd.Flags().BoolVar(&polecatNukeDiscardUnpushed, "discard-unpushed", false, "Delete commits that exist only in the worktree if they cannot be pushed (LOSES WORK)")
 
 	// Check-recovery flags
 	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryJSON, "json", false, "Output as JSON")
@@ -1755,7 +1762,7 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 			fmt.Printf("Nuking %s/%s...\n", p.rigName, p.polecatName)
 		}
 
-		if err := nukePolecatFullWithOptions(p.polecatName, p.rigName, p.mgr, p.r, nukePolecatOptions{PurgeClosedEphemerals: !batchPurge}); err != nil {
+		if err := nukePolecatFullWithOptions(p.polecatName, p.rigName, p.mgr, p.r, nukePolecatOptions{PurgeClosedEphemerals: !batchPurge, DiscardUnpushed: polecatNukeDiscardUnpushed}); err != nil {
 			nukeErrors = append(nukeErrors, fmt.Sprintf("%s/%s: %v", p.rigName, p.polecatName, err))
 			continue
 		}
@@ -1824,9 +1831,19 @@ func nukePolecatFull(polecatName, rigName string, mgr *polecat.Manager, r *rig.R
 
 type nukePolecatOptions struct {
 	PurgeClosedEphemerals bool
+	// DiscardUnpushed accepts deleting commits that exist only in the worktree.
+	DiscardUnpushed bool
 }
 
 func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manager, r *rig.Rig, opts nukePolecatOptions) error {
+	// Step 0: Publish unpushed commits, or refuse (gt-4vr guardrail, gt-yu9l).
+	// This precedes every destructive step — a refusal must not leave behind a
+	// killed session or a burned molecule. --force does not skip it; only the
+	// separate --discard-unpushed flag accepts losing commits.
+	if err := mgr.PreserveUnpushedWork(polecatName, true, opts.DiscardUnpushed); err != nil && !errors.Is(err, polecat.ErrPolecatNotFound) {
+		return err
+	}
+
 	t := tmux.NewTmux()
 
 	// Step 1: Kill tmux session unconditionally to prevent ghost sessions
@@ -1855,46 +1872,8 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 		nukeCleanupMolecules(polecatInfo.Issue, r)
 	}
 
-	// Step 2.75: Best-effort push before nuke (gt-4vr guardrail).
-	// Try to preserve any unpushed commits on the branch. If push fails,
-	// proceed — --force already means "I accept data loss".
-	if branchToDelete != "" {
-		var pushGit *git.Git
-		// Try worktree first (may still exist), then bare repo fallback.
-		// Use ClonePath from the polecat record — the worktree lives at
-		// <rig>/polecats/<name>/<rigName>/, not <rig>/polecats/<name>/.
-		if polecatInfo != nil && polecatInfo.ClonePath != "" {
-			if _, statErr := os.Stat(polecatInfo.ClonePath); statErr == nil {
-				pushGit = git.NewGit(polecatInfo.ClonePath)
-			}
-		}
-		if pushGit == nil {
-			bareRepoPath := filepath.Join(r.Path, ".repo.git")
-			if info, statErr := os.Stat(bareRepoPath); statErr == nil && info.IsDir() {
-				pushGit = git.NewGitWithDir(bareRepoPath, "")
-			}
-		}
-		if pushGit != nil {
-			// gt-94p1 requirement 3: never let this best-effort push carry a
-			// checkpoint auto-save commit onto the real branch. Backstop
-			// alongside AutoPreserveUncommittedWork's Ephemeral mode.
-			if wipSHA, wipErr := git.HasWIPCommit(pushGit, "origin", "refs/heads/"+branchToDelete, checkpoint.WIPCommitPrefix, []string{r.DefaultBranch()}); wipErr != nil {
-				fmt.Printf("  %s could not verify commits before best-effort push, skipping: %v\n", style.Dim.Render("○"), wipErr)
-			} else if wipSHA != "" {
-				fmt.Printf("  %s branch carries checkpoint auto-save commit %s — skipping best-effort push\n", style.Dim.Render("○"), wipSHA[:8])
-			} else {
-				refspec := branchToDelete + ":" + branchToDelete
-				if err := pushGit.Push("origin", refspec, false); err != nil {
-					fmt.Printf("  %s best-effort push failed (proceeding): %v\n", style.Dim.Render("○"), err)
-				} else {
-					fmt.Printf("  %s pushed branch %s before nuke\n", style.Success.Render("✓"), branchToDelete)
-				}
-			}
-		}
-	}
-
 	// Step 3: Delete worktree (nuclear=true to bypass safety checks for stale polecats)
-	if err := mgr.RemoveWithOptions(polecatName, true, true, false); err != nil {
+	if err := mgr.RemoveWith(polecatName, polecat.RemoveOptions{Force: true, Nuclear: true, DiscardUnpushed: opts.DiscardUnpushed}); err != nil {
 		if errors.Is(err, polecat.ErrPolecatNotFound) {
 			fmt.Printf("  %s worktree already gone\n", style.Dim.Render("○"))
 			resetPolecatAgentBeadForReuse(r, rigName, polecatName)
