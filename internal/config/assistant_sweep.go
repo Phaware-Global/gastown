@@ -10,7 +10,7 @@ const DefaultAssistantSweepInterval = "1h"
 // Assistant as a duration string, defaulting to DefaultAssistantSweepInterval
 // when unset or unparseable. It is safe to call on a nil receiver.
 //
-// The value feeds the mayors-assistant-sweep plugin's cooldown gate (via
+// The value feeds the assistant-sweep plugin's cooldown gate (via
 // `duration_setting = "assistant_sweep_interval"`) and the assistant's prompt.
 func (s *TownSettings) AssistantSweepInterval() string {
 	if s == nil || s.AssistantSweepIntervalRaw == "" {

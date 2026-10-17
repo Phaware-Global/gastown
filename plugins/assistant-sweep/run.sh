@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mayors-assistant-sweep/run.sh — Trigger the Mayor's Assistant loose-ends sweep.
+# assistant-sweep/run.sh — Trigger the Mayor's Assistant loose-ends sweep.
 #
 # Body is fixed. The assistant does the sweep and mails the Mayor a SWEEP:
 # summary; this script just delivers the trigger. Cadence is the plugin's
@@ -10,7 +10,7 @@ set -euo pipefail
 
 SUBJECT="SWEEP: loose-ends sweep due"
 
-gt mail send mayors-assistant/ \
+gt mail send assistant/ \
   --subject "$SUBJECT" \
   --type task \
   --priority 2 \
