@@ -567,6 +567,7 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 
 	if len(allPolecats) == 0 {
 		fmt.Println("No polecats found.")
+		printPolecatDirCapacity(rigs)
 		return nil
 	}
 
@@ -616,7 +617,41 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	printPolecatDirCapacity(rigs)
 	return nil
+}
+
+// printPolecatDirCapacity prints, per rig, how many of its polecat directory slots
+// are used. The cap counts directories whether or not they have a live session, so
+// a rig full of dead checkouts looks idle in the list above yet refuses every new
+// spawn; this line makes that condition self-diagnosing. Text output only: the
+// --json output is a bare array that scripts already parse.
+func printPolecatDirCapacity(rigs []*rig.Rig) {
+	fmt.Println()
+	for _, r := range rigs {
+		used, err := polecat.CountPolecatDirs(filepath.Join(r.Path, "polecats"))
+		if err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "warning: failed to count polecat directories in %s: %v\n", r.Name, err)
+			continue
+		}
+		limit := polecat.EffectivePolecatDirCap(r.GetIntConfig("max_polecats"))
+		line := fmt.Sprintf("Slots %s: %d/%d polecat directories used, %d free", r.Name, used, limit, max(limit-used, 0))
+		switch {
+		case used >= limit:
+			line = style.Error.Render(line + " — FULL: new spawns are refused; run: gt polecat stale " + r.Name + " --cleanup")
+		case shouldWarnPolecatDirCapacity(used, limit):
+			line = style.Warning.Render(line)
+		default:
+			line = style.Dim.Render(line)
+		}
+		fmt.Println(line)
+	}
+}
+
+// shouldWarnPolecatDirCapacity flags a rig within 5 slots of its cap, the same
+// headroom at which the daemon starts reaping.
+func shouldWarnPolecatDirCapacity(used, limit int) bool {
+	return used >= limit-5
 }
 
 func runPolecatAdd(cmd *cobra.Command, args []string) error {
