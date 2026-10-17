@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"math/rand/v2"
 	"os"
 	"os/exec"
@@ -1136,7 +1137,17 @@ func (m *Manager) Remove(name string, force bool) error {
 //
 // ZFC #10: Uses cleanup_status from agent bead if available (polecat self-report),
 // falls back to git check for backward compatibility.
-func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) (retErr error) {
+func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) error {
+	return m.RemoveWithGuard(name, force, nuclear, selfNuke, nil)
+}
+
+// RemoveWithGuard is RemoveWithOptions with a check that runs under the per-polecat
+// lock, after it is taken and before anything is touched. A non-nil error from guard
+// aborts the removal and is returned as is. A caller that decided to remove the
+// polecat earlier (staleness cleanup) uses it to re-verify that decision atomically
+// with the removal: otherwise sling can reuse the polecat between its check and the
+// removal's own lock.
+func (m *Manager) RemoveWithGuard(name string, force, nuclear, selfNuke bool, guard func() error) (retErr error) {
 	defer func() { telemetry.RecordPolecatRemove(context.Background(), name, retErr) }()
 	// Acquire per-polecat file lock to prevent concurrent Remove races
 	fl, err := m.lockPolecat(name)
@@ -1147,6 +1158,11 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 
 	if !m.exists(name) {
 		return ErrPolecatNotFound
+	}
+	if guard != nil {
+		if err := guard(); err != nil {
+			return err
+		}
 	}
 
 	// Clone path is where the git worktree lives (new or old structure)
@@ -3080,6 +3096,8 @@ type StalenessInfo struct {
 	HasActiveSession   bool   // Whether tmux session is running
 	HasUncommittedWork bool   // Whether there's uncommitted or unpushed work
 	AgentState         string // From agent bead (empty if no bead)
+	HookedIssue        string // Issue assigned to the polecat when assessed (empty if none)
+	ProbeError         string // A probe (git status, agent bead) failed; staleness is unknown, never stale
 	IsStale            bool   // Overall assessment: safe to clean up
 	Reason             string // Why it's considered stale (or not)
 }
@@ -3107,40 +3125,173 @@ func (m *Manager) DetectStalePolecats(threshold int) ([]*StalenessInfo, error) {
 		defaultBranch = rigCfg.DefaultBranch
 	}
 
-	var results []*StalenessInfo
-	for _, p := range polecats {
-		info := &StalenessInfo{
-			Name: p.Name,
-		}
-
-		// Check for active tmux session
-		// Session name follows pattern: gt-<rig>-<polecat>
-		sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), p.Name)
-		info.HasActiveSession = checkTmuxSession(sessionName)
-
-		// Check how far behind main
-		polecatGit := git.NewGit(p.ClonePath)
-		info.CommitsBehind = countCommitsBehind(polecatGit, defaultBranch)
-
-		// Check for uncommitted work (excluding .beads/ files which are synced across worktrees)
-		status, err := polecatGit.CheckUncommittedWork()
-		if err == nil && !status.CleanExcludingBeads() {
-			info.HasUncommittedWork = true
-		}
-
-		// Check agent bead state
-		agentID := m.agentBeadID(p.Name)
-		_, fields, err := m.beads.GetAgentBead(agentID)
-		if err == nil && fields != nil {
-			info.AgentState = fields.AgentState
-		}
-
-		// Determine staleness
-		info.IsStale, info.Reason = assessStaleness(info, threshold)
-		results = append(results, info)
+	// Each polecat costs a tmux probe, two git invocations and an agent-bead lookup
+	// (~3s together), and they are independent, so probe them concurrently. Serial
+	// detection took minutes on a rig near its directory cap, longer than the
+	// daemon's cap-relief reaper was willing to wait. Results keep List() order.
+	results := make([]*StalenessInfo, len(polecats))
+	sem := make(chan struct{}, staleDetectConcurrency)
+	var wg sync.WaitGroup
+	for i, p := range polecats {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, p *Polecat) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			results[i] = m.assessPolecat(p, defaultBranch, threshold)
+		}(i, p)
 	}
+	wg.Wait()
 
 	return results, nil
+}
+
+// staleDetectConcurrency bounds how many polecats DetectStalePolecats probes at once.
+const staleDetectConcurrency = 8
+
+// assessPolecat gathers the staleness signals for one polecat and assesses them.
+func (m *Manager) assessPolecat(p *Polecat, defaultBranch string, threshold int) *StalenessInfo {
+	info := &StalenessInfo{
+		Name:        p.Name,
+		HookedIssue: p.Issue,
+	}
+
+	// Check for active tmux session
+	// Session name follows pattern: gt-<rig>-<polecat>
+	sessionName := session.PolecatSessionName(session.PrefixFor(m.rig.Name), p.Name)
+	info.HasActiveSession = checkTmuxSession(sessionName)
+
+	// Check how far behind main
+	polecatGit := git.NewGit(p.ClonePath)
+	info.CommitsBehind = countCommitsBehind(polecatGit, defaultBranch)
+
+	// Check for uncommitted work (excluding .beads/ files which are synced across worktrees)
+	info.HasUncommittedWork, info.ProbeError = probeUncommittedWork(p.ClonePath)
+
+	// Check agent bead state. A missing bead comes back as (nil, nil, nil); any
+	// error is a failed probe, not an absent bead.
+	agentID := m.agentBeadID(p.Name)
+	_, fields, err := m.agentBeads().GetAgentBead(agentID)
+	if err != nil {
+		if info.ProbeError == "" {
+			info.ProbeError = fmt.Sprintf("reading agent bead: %v", err)
+		}
+	} else if fields != nil {
+		info.AgentState = fields.AgentState
+	}
+
+	// Determine staleness
+	info.IsStale, info.Reason = assessStaleness(info, threshold)
+	return info
+}
+
+// worktreeMissing reports whether clonePath has no usable git worktree: the dir is
+// gone, has no .git, or its .git file points at a gitdir that no longer exists. Such
+// a polecat has no working tree whose changes could be lost.
+func worktreeMissing(clonePath string) bool {
+	gitPath := filepath.Join(clonePath, ".git")
+	fi, err := os.Stat(gitPath)
+	if err != nil {
+		return errors.Is(err, fs.ErrNotExist)
+	}
+	if fi.IsDir() {
+		return false
+	}
+	data, err := os.ReadFile(gitPath)
+	if err != nil {
+		return false
+	}
+	target, ok := strings.CutPrefix(strings.TrimSpace(string(data)), "gitdir:")
+	if !ok {
+		return false
+	}
+	target = strings.TrimSpace(target)
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(clonePath, target)
+	}
+	_, err = os.Stat(target)
+	return errors.Is(err, fs.ErrNotExist)
+}
+
+// probeUncommittedWork reports whether the worktree at clonePath has uncommitted work
+// (excluding .beads/ files). A failed git probe is returned as probeErr rather than
+// read as a clean tree.
+func probeUncommittedWork(clonePath string) (has bool, probeErr string) {
+	if worktreeMissing(clonePath) {
+		return false, ""
+	}
+	status, err := git.NewGit(clonePath).CheckUncommittedWork()
+	if err != nil {
+		return false, fmt.Sprintf("checking uncommitted work: %v", err)
+	}
+	return !status.CleanExcludingBeads(), ""
+}
+
+// ErrNoLongerStale means a polecat chosen for cleanup was re-dispatched (or stopped
+// being a cleanup candidate) before it could be removed.
+var ErrNoLongerStale = errors.New("polecat is no longer stale")
+
+// ReassessStale re-evaluates one polecat's staleness from live state. A caller that
+// acts on a DetectStalePolecats snapshot (which can be minutes old by the time it
+// reaches a given polecat) calls this immediately before destroying the polecat:
+// sling may have reused an idle polecat in the meantime. prev is the snapshot being
+// acted on: a polecat whose hooked issue differs from it has been re-dispatched.
+//
+// The result is only a point-in-time answer: the lock is released on return. The
+// destructive step must go through StaleRemovalGuard so the check is repeated under
+// the lock the removal holds.
+func (m *Manager) ReassessStale(prev *StalenessInfo, threshold int) (*StalenessInfo, error) {
+	fl, err := m.lockPolecat(prev.Name)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = fl.Unlock() }()
+	return m.reassessLocked(prev, threshold)
+}
+
+// StaleRemovalGuard returns a RemoveWithGuard guard that re-runs the staleness
+// check under the removal's per-polecat lock and aborts with ErrNoLongerStale if
+// the polecat is no longer a cleanup candidate.
+func (m *Manager) StaleRemovalGuard(prev *StalenessInfo, threshold int) func() error {
+	return func() error {
+		fresh, err := m.reassessLocked(prev, threshold)
+		if err != nil {
+			return fmt.Errorf("re-assessing %s before removal: %w", prev.Name, err)
+		}
+		if !fresh.IsStale {
+			return fmt.Errorf("%w: %s", ErrNoLongerStale, fresh.Reason)
+		}
+		return nil
+	}
+}
+
+// reassessLocked is ReassessStale for a caller already holding the polecat's lock.
+func (m *Manager) reassessLocked(prev *StalenessInfo, threshold int) (*StalenessInfo, error) {
+	p, err := m.Get(prev.Name)
+	if err != nil {
+		return nil, err
+	}
+	defaultBranch := "main"
+	if rigCfg, err := rig.LoadRigConfig(m.rig.Path); err == nil && rigCfg.DefaultBranch != "" {
+		defaultBranch = rigCfg.DefaultBranch
+	}
+	info := m.assessPolecat(p, defaultBranch, threshold)
+	applyRedispatchCheck(info, p, prev)
+	return info, nil
+}
+
+// applyRedispatchCheck clears info's staleness when p has been re-dispatched since
+// the prev snapshot. Reuse writes agent_state=spawning under the per-polecat lock,
+// but the hook bead that moves p.State/p.Issue lands later, outside it, so an active
+// agent state is the only signal a completed reuse leaves in that gap.
+func applyRedispatchCheck(info *StalenessInfo, p *Polecat, prev *StalenessInfo) {
+	if !info.IsStale {
+		return
+	}
+	if p.State == StateWorking || p.Issue != prev.HookedIssue || beads.AgentState(info.AgentState).IsActive() {
+		info.IsStale = false
+		info.Reason = fmt.Sprintf("re-dispatched since detection (state=%s, issue=%q, was %q, agent_state=%q)", p.State, p.Issue, prev.HookedIssue, info.AgentState)
+	}
 }
 
 // checkTmuxSession checks if a tmux session exists.
@@ -3166,6 +3317,12 @@ func countCommitsBehind(g *git.Git, defaultBranch string) int {
 // Per gt-zecmc: uses tmux state (HasActiveSession) rather than agent_state
 // since observable states (running, done, idle) are no longer recorded in beads.
 func assessStaleness(info *StalenessInfo, threshold int) (bool, string) {
+	// A failed probe means we don't know whether there is unpushed work or a
+	// protected agent state; destroying the polecat on that basis fails open.
+	if info.ProbeError != "" {
+		return false, "probe failed: " + info.ProbeError
+	}
+
 	// Never clean up if there's uncommitted work
 	if info.HasUncommittedWork {
 		return false, "has uncommitted work"
