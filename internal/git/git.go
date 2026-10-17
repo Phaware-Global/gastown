@@ -1007,7 +1007,18 @@ func (g *Git) GetPushURL(remote string) (string, error) {
 
 // Push pushes to the remote branch with a timeout to prevent indefinite hangs
 // when the remote is unreachable.
+//
+// A bare branch name is qualified as refs/heads/<branch>, so a same-named tag
+// cannot be pushed in its place and a name beginning with '-' is never read as
+// an option. An explicit refspec (src:dst, HEAD, refs/...) is passed through
+// unchanged, except that one beginning with '-' is refused.
 func (g *Git) Push(remote, branch string, force bool) error {
+	if strings.HasPrefix(branch, "-") {
+		return fmt.Errorf("refusing to push %q: not a branch name or refspec", branch)
+	}
+	if !strings.ContainsAny(branch, ":+") && branch != "HEAD" && !strings.HasPrefix(branch, "refs/") {
+		branch = "refs/heads/" + branch
+	}
 	args := []string{"push", remote, branch}
 	if force {
 		args = append(args, "--force")
@@ -3027,7 +3038,7 @@ func (g *Git) IsEmpty() (bool, error) {
 // NOTE: For named remotes with a separate pushurl, this checks the fetch URL.
 // Use PushRemoteBranchExists to verify branches that were pushed.
 func (g *Git) RemoteBranchExists(remote, branch string) (bool, error) {
-	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--heads", remote, branch)
+	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--heads", remote, "refs/heads/"+branch)
 	if err != nil {
 		return false, err
 	}
@@ -3037,7 +3048,7 @@ func (g *Git) RemoteBranchExists(remote, branch string) (bool, error) {
 // RemoteBranchTip returns the SHA at refs/heads/<branch> on the remote.
 // An empty SHA with nil error means the branch is missing.
 func (g *Git) RemoteBranchTip(remote, branch string) (string, error) {
-	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--heads", remote, branch)
+	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--heads", remote, "refs/heads/"+branch)
 	if err != nil {
 		return "", err
 	}
@@ -3055,7 +3066,7 @@ func (g *Git) PushRemoteBranchExists(remote, branch string) (bool, error) {
 	if fetchErr != nil || pushErr != nil || pushURL == fetchURL {
 		return g.RemoteBranchExists(remote, branch)
 	}
-	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--heads", pushURL, branch)
+	out, err := g.runWithTimeout(remoteQueryTimeout, "ls-remote", "--heads", pushURL, "refs/heads/"+branch)
 	if err != nil {
 		return false, err
 	}

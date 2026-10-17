@@ -1759,6 +1759,28 @@ func TestWorkAtRiskError_RecoveryHint(t *testing.T) {
 	}
 }
 
+// TestWorkAtRiskError_ForceWording pins that the text an operator sees agrees
+// with what --force actually does: it never implies --force deletes known
+// unpushed commits, and it does not deny --force where --force is the way past
+// an unchecked branch (the Reason names it).
+func TestWorkAtRiskError_ForceWording(t *testing.T) {
+	known := &WorkAtRiskError{Polecat: "p", Branch: "polecat/x", ClonePath: "/tmp/p", Unpushed: 2, Reason: "r"}
+	msg := known.Error()
+	if !strings.Contains(msg, "--force does not bypass this") || !strings.Contains(msg, "--discard-unpushed") {
+		t.Errorf("known unpushed commits: Error() must say --force does not bypass and name --discard-unpushed: %v", msg)
+	}
+
+	unchecked := &WorkAtRiskError{Polecat: "p", Branch: "(unknown)", ClonePath: "/tmp/p", Unpushed: -1,
+		Reason: "worktree is missing and its branch could not be checked: boom; pass --force to remove it anyway", ForceBypasses: true}
+	msg = unchecked.Error()
+	if strings.Contains(msg, "does not bypass") || strings.Contains(msg, "the only way to delete") {
+		t.Errorf("unchecked branch: Error() contradicts the Reason's --force advice: %v", msg)
+	}
+	if !strings.Contains(msg, "--force") {
+		t.Errorf("unchecked branch: Error() must mention --force: %v", msg)
+	}
+}
+
 // TestRemoveWithOptions_PushedBranchIsRemoved: with everything on origin the
 // removal proceeds as before, both when the branch was already pushed and when
 // the pre-removal push is what publishes it.
