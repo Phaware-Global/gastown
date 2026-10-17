@@ -65,8 +65,11 @@ func TestTransform_SendsMailToMayor(t *testing.T) {
 		t.Fatalf("want 1 message, got %d", len(msgs))
 	}
 	msg := msgs[0]
-	if msg.To != "mayor/" {
-		t.Errorf("To = %q, want mayor/", msg.To)
+	if msg.To != transform.Recipient {
+		t.Errorf("To = %q, want %q", msg.To, transform.Recipient)
+	}
+	if transform.Recipient != "mayors-assistant/" {
+		t.Errorf("Recipient = %q, want mayors-assistant/ (telegraph is routed to the Mayor's Assistant)", transform.Recipient)
 	}
 	if msg.From != "telegraph/jira/alice" {
 		t.Errorf("From = %q, want telegraph/jira/alice", msg.From)

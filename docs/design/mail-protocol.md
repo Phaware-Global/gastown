@@ -260,6 +260,7 @@ greenplace/witness       # Witness for greenplace rig
 beads/refinery           # Refinery for beads rig
 greenplace/polecats/nux  # Specific polecat
 mayor/                # Town-level Mayor
+mayors-assistant/     # Town-level Mayor's Assistant (inbound triage)
 deacon/               # Town-level Deacon
 ```
 

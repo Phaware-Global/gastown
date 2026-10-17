@@ -271,14 +271,14 @@ func sendZombieNotification(router *mail.Router, rigName string, result *witness
 	}
 	_ = router.Send(witMsg)
 
-	// Also notify the mayor so dead polecats don't go unnoticed. (GH #3584)
-	// The mayor needs to know so work can be reslung.
+	// Also report dead polecats so they don't go unnoticed. (GH #3584)
+	// Routed to the Mayor's Assistant: it briefs the mayor, who reslings.
 	mayorBody := strings.Join(lines, "\n") +
-		"\n\nResling instructions:\n" +
+		"\n\nResling instructions (for the mayor):\n" +
 		"  gt sling <bead-id> <rig> --create --force"
 	mayorMsg := &mail.Message{
 		From:    fmt.Sprintf("%s/witness", rigName),
-		To:      "mayor/",
+		To:      "mayors-assistant/",
 		Subject: fmt.Sprintf("POLECAT_DIED: %d polecat(s) died with active work in %s", activeCount, rigName),
 		Body:    mayorBody,
 	}

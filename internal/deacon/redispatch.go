@@ -468,7 +468,8 @@ func slingBead(townRoot, beadID, rig, agent string) error {
 	return cmd.Run()
 }
 
-// escalateToMayor sends an escalation mail to the Mayor about a repeatedly-failing bead.
+// escalateToMayor reports a repeatedly-failing bead. Routed to the Mayor's
+// Assistant, which briefs the Mayor; the body still asks for the Mayor's decision.
 func escalateToMayor(townRoot, beadID string, beadState *BeadRedispatchState) error {
 	subject := fmt.Sprintf("REDISPATCH_FAILED: %s (%d attempts)", beadID, beadState.AttemptCount)
 	body := fmt.Sprintf(`Bead %s has been recovered and re-dispatched %d times but keeps failing.
@@ -491,7 +492,7 @@ Please investigate and either:
 		beadState.LastAttemptTime.Format(time.RFC3339),
 	)
 
-	cmd := exec.Command("gt", "mail", "send", "mayor/", "-s", subject, "-m", body)
+	cmd := exec.Command("gt", "mail", "send", "mayors-assistant/", "-s", subject, "-m", body)
 	cmd.Dir = townRoot
 	cmd.Env = deaconMutationRoutingEnv(townRoot)
 	util.SetDetachedProcessGroup(cmd)
