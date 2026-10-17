@@ -70,6 +70,14 @@ func runTapList(cmd *cobra.Command, args []string) error {
 			implemented: true,
 		},
 		{
+			name:        "dolt-start",
+			kind:        "guard",
+			description: "Block bd dolt start and dolt sql-server in agent sessions (Claude hooks and the opencode plugin)",
+			event:       "PreToolUse",
+			matchers:    []string{"Bash(bd dolt start*)", "Bash(dolt sql-server*)"},
+			implemented: true,
+		},
+		{
 			name:        "memory-write",
 			kind:        "guard",
 			description: "Block Write/Edit/NotebookEdit to Claude Code memory paths for worker roles",

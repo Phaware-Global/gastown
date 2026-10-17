@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	beadsdk "github.com/steveyegge/beads"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/convoy"
 	"github.com/steveyegge/gastown/internal/workspace"
 
@@ -85,14 +86,13 @@ func runClose(cmd *cobra.Command, args []string) error {
 	bdCmd := exec.Command("bd", bdArgs...)
 	bdCmd.Stdin = os.Stdin
 	bdCmd.Stdout = os.Stdout
-	bdCmd.Stderr = os.Stderr
 	if beadIDs := extractBeadIDs(convertedArgs); len(beadIDs) > 0 {
 		if dir := resolveBeadDir(beadIDs[0]); dir != "" && dir != "." {
 			bdCmd.Dir = dir
 			bdCmd.Env = filterEnvKey(os.Environ(), "BEADS_DIR")
 		}
 	}
-	if err := bdCmd.Run(); err != nil {
+	if err := beads.RunRelayed(bdCmd); err != nil {
 		return err
 	}
 
@@ -194,12 +194,11 @@ func closeChildren(parentID string, visited map[string]bool, depth int) error {
 
 	closeBd := exec.Command("bd", closeArgs...)
 	closeBd.Stdout = os.Stdout
-	closeBd.Stderr = os.Stderr
 	if dir := resolveBeadDir(parentID); dir != "" && dir != "." {
 		closeBd.Dir = dir
 		closeBd.Env = filterEnvKey(os.Environ(), "BEADS_DIR")
 	}
-	return closeBd.Run()
+	return beads.RunRelayed(closeBd)
 }
 
 // extractBeadIDs extracts bead IDs from raw args, skipping flags and flag values.

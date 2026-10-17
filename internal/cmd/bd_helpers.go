@@ -258,13 +258,18 @@ func (b *bdCmd) resolvedArgs() []string {
 	return filtered
 }
 
-// Run builds and runs the command, returning any error.
+// Run builds and runs the command, returning any error. A stderr left at the
+// default has bd's "run bd dolt start" advice rewritten (beads.DoltStartGuidance);
+// Build() does not, since it cannot flush the writer, so run a built command that
+// keeps the default stderr with beads.RunRelayed.
 // This is a convenience method equivalent to Build().Run().
 func (b *bdCmd) Run() error {
 	deadline := resolveBdCmdTimeout()
 	ctx, cancel := context.WithTimeout(context.Background(), deadline)
 	defer cancel()
-	return b.wrapCommandError(ctx, b.buildContextCommand(ctx).Run(), deadline)
+	cmd := b.buildContextCommand(ctx)
+	defer beads.RelayStderr(cmd)()
+	return b.wrapCommandError(ctx, cmd.Run(), deadline)
 }
 
 // Output builds and runs the command, returning stdout and any error.
@@ -275,7 +280,9 @@ func (b *bdCmd) Output() ([]byte, error) {
 	deadline := resolveBdCmdTimeout()
 	ctx, cancel := context.WithTimeout(context.Background(), deadline)
 	defer cancel()
-	out, err := b.buildContextCommand(ctx).Output()
+	cmd := b.buildContextCommand(ctx)
+	defer beads.RelayStderr(cmd)()
+	out, err := cmd.Output()
 	return out, b.wrapCommandError(ctx, err, deadline)
 }
 
@@ -292,5 +299,6 @@ func (b *bdCmd) CombinedOutput() ([]byte, error) {
 	cmd.Dir = b.dir
 	cmd.Env = b.buildEnv()
 	out, err := cmd.CombinedOutput()
+	out = []byte(beads.RedirectDoltStartHint(string(out)))
 	return out, b.wrapCommandError(ctx, err, deadline)
 }

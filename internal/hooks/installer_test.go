@@ -223,6 +223,27 @@ func TestOpenCodeTemplateUsesHookPrime(t *testing.T) {
 	}
 }
 
+// opencode sessions run no Claude PreToolUse hooks, so the plugin is the only
+// place an opencode agent's 'bd dolt start' can be refused.
+func TestOpenCodeTemplateGuardsDoltStart(t *testing.T) {
+	template, err := templateFS.ReadFile("templates/opencode/gastown.js")
+	if err != nil {
+		t.Fatalf("read opencode template: %v", err)
+	}
+	content := string(template)
+	for _, want := range []string{
+		`"tool.execute.before"`,
+		`input?.tool !== "bash"`,
+		"tap guard dolt-start",
+		"exitCode(err) === 2",
+		"throw new Error(blocked)",
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("opencode template missing %q", want)
+		}
+	}
+}
+
 func TestInstallForRole_SkipsExisting(t *testing.T) {
 	dir := t.TempDir()
 	hooksPath := filepath.Join(dir, ".claude", "settings.json")

@@ -1404,7 +1404,7 @@ func (h *APIHandler) runBdCommand(ctx context.Context, timeout time.Duration, ar
 		if output != "" {
 			output += "\n"
 		}
-		output += stderr.String()
+		output += beads.RedirectDoltStartHint(stderr.String())
 	}
 
 	if ctx.Err() == context.DeadlineExceeded {
