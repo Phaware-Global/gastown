@@ -302,3 +302,105 @@ func compactSourceBetween(t *testing.T, source, startMarker, endMarker string) s
 	}
 	return source[start : start+end]
 }
+
+// fakeWispSQL answers the five listWispsWith queries from canned rows, keyed
+// by the table each query reads. Any bd subcommand other than `sql --json`
+// (notably `list`, which never returns wisps) yields an empty array, as the
+// real bd does.
+func fakeWispSQL(wisps, labels, agents, comments, parents string) wispSQLRunner {
+	return func(args ...string) ([]byte, error) {
+		if len(args) != 3 || args[0] != "sql" || args[1] != "--json" {
+			return []byte("[]"), nil
+		}
+		q := args[2]
+		switch {
+		case strings.Contains(q, "FROM wisp_labels"):
+			return []byte(labels), nil
+		case strings.Contains(q, "FROM labels"):
+			return []byte(agents), nil
+		case strings.Contains(q, "FROM wisp_comments"):
+			return []byte(comments), nil
+		case strings.Contains(q, "FROM wisp_dependencies"):
+			return []byte(parents), nil
+		case strings.Contains(q, "FROM wisps"):
+			return []byte(wisps), nil
+		}
+		return nil, os.ErrInvalid
+	}
+}
+
+func TestListWispsReadsWispsTable(t *testing.T) {
+	wisps := `[
+	 {"id":"gt-wisp-a","title":"patrol","status":"open","issue_type":"task","wisp_type":"patrol","created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z"},
+	 {"id":"gt-wisp-b","title":"step","status":"open","issue_type":"task","wisp_type":"","created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z"},
+	 {"id":"gt-wisp-c","title":"agent via type","status":"open","issue_type":"agent","wisp_type":"","created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z"},
+	 {"id":"gt-wisp-d","title":"agent via wisp_labels","status":"open","issue_type":"task","wisp_type":"","created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z"},
+	 {"id":"gt-wisp-e","title":"agent via labels","status":"open","issue_type":"task","wisp_type":"","created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z"}
+	]`
+	got, err := listWispsWith(fakeWispSQL(wisps,
+		`[{"issue_id":"gt-wisp-a","label":"keep"},{"issue_id":"gt-wisp-d","label":"gt:agent"}]`,
+		`[{"issue_id":"gt-wisp-e"}]`,
+		`[{"issue_id":"gt-wisp-a","n":2}]`,
+		`[{"issue_id":"gt-wisp-b","parent_id":"gt-wisp-p","parent_open":1}]`))
+	if err != nil {
+		t.Fatalf("listWispsWith: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("scanned %d wisps, want 2 (a, b); agent beads must be excluded", len(got))
+	}
+	a, b := got[0], got[1]
+	if a.ID != "gt-wisp-a" || a.WispType != "patrol" || a.CommentCount != 2 || !hasKeepLabel(a) || !a.Ephemeral {
+		t.Errorf("wisp a mis-decoded: %+v", a)
+	}
+	if b.ID != "gt-wisp-b" || b.Parent != "gt-wisp-p" || !b.ParentOpen {
+		t.Errorf("wisp b parent mis-decoded: %+v", b)
+	}
+}
+
+// TestListWispsDoesNotDependOnBdList pins the gt-jux2 regression: bd list
+// returns no wisps, so a scan built on it saw zero rows forever.
+func TestListWispsDoesNotDependOnBdList(t *testing.T) {
+	row := `[{"id":"gt-wisp-a","title":"t","status":"open","issue_type":"task","wisp_type":"","created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z"}]`
+	run := fakeWispSQL(row, "[]", "[]", "[]", "[]")
+	guarded := func(args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "list" {
+			t.Errorf("listWisps must not call bd list: %v", args)
+		}
+		return run(args...)
+	}
+	got, err := listWispsWith(guarded)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("got %d wisps, err %v; want 1", len(got), err)
+	}
+}
+
+func TestListWispsPropagatesQueryErrors(t *testing.T) {
+	_, err := listWispsWith(func(args ...string) ([]byte, error) { return nil, os.ErrPermission })
+	if err == nil {
+		t.Fatal("expected error when the wisps query fails, got silent empty result")
+	}
+}
+
+func TestDetectAnomaliesBlindScan(t *testing.T) {
+	empty := buildReport("2026-10-17", &compactResult{}, nil)
+	got := detectAnomalies(empty)
+	if len(got) != 1 || !strings.Contains(got[0], "compactor may be blind") {
+		t.Errorf("empty scan anomalies = %v, want single blind-scan warning", got)
+	}
+	for _, a := range got {
+		if strings.Contains(a, "agents may be down") {
+			t.Errorf("empty scan must not infer patrol agents are down: %q", a)
+		}
+	}
+
+	// A working scan that really sees no patrols may still flag them.
+	hb := []*compactIssue{{WispType: "heartbeat"}}
+	got = detectAnomalies(buildReport("2026-10-17", &compactResult{}, hb))
+	found := false
+	for _, a := range got {
+		found = found || strings.Contains(a, "0 patrol wisps")
+	}
+	if !found {
+		t.Errorf("scan with wisps but no patrols should still flag patrols: %v", got)
+	}
+}
