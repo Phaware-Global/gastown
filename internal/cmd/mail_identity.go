@@ -219,11 +219,16 @@ func detectSenderFromCwd() string {
 		}
 	}
 
-	// If in the town's assistant directory (checked before mayor: both are
-	// town-level, and a path under <town>/assistant must not fall through to
-	// "overseer").
-	if strings.HasSuffix(cwd, "/"+constants.RoleAssistant) || strings.Contains(cwd, "/"+constants.RoleAssistant+"/") {
-		return constants.RoleAssistant + "/"
+	// If in the town's assistant directory. Anchored to the town root: only
+	// a cwd whose first component under the town root is "assistant" counts
+	// (a rig checkout containing internal/assistant must not).
+	if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+		if rel, err := filepath.Rel(townRoot, cwd); err == nil {
+			first := strings.SplitN(filepath.ToSlash(rel), "/", 2)[0]
+			if first == constants.RoleAssistant {
+				return constants.RoleAssistant + "/"
+			}
+		}
 	}
 
 	// If in the town's mayor directory
