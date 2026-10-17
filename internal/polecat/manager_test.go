@@ -3654,6 +3654,28 @@ func TestWorkAtRiskError_RecoveryCommandCannotInjectGitOptions(t *testing.T) {
 			}
 		})
 	}
+
+	// A tag named like the branch makes rev-parse --abbrev-ref report
+	// heads/<branch>; the hint must still list the commits, so the name cannot
+	// be rewritten on the way into the command.
+	t.Run("branch shadowed by a same-named tag", func(t *testing.T) {
+		sha := commitInWorktree(t, p.ClonePath, "tagged.txt", "work under a shadowed branch name")
+		if out, err := exec.Command("git", "-C", p.ClonePath, "tag", p.Branch).CombinedOutput(); err != nil {
+			t.Fatalf("tag %s: %v\n%s", p.Branch, err, out)
+		}
+		branch, err := git.NewGit(p.ClonePath).CurrentBranch()
+		if err != nil {
+			t.Fatalf("CurrentBranch: %v", err)
+		}
+		if branch == p.Branch {
+			t.Fatalf("CurrentBranch = %q, want the disambiguated heads/ form; the fixture no longer shadows the branch", branch)
+		}
+		cmd := (&WorkAtRiskError{Polecat: "toast", Branch: branch, ClonePath: p.ClonePath, Unpushed: 1}).RecoveryCommand()
+		out, err := exec.Command("sh", "-c", cmd).CombinedOutput()
+		if err != nil || !strings.Contains(string(out), sha[:7]) {
+			t.Fatalf("recovery command %q must list the commit %s: %v\n%s", cmd, sha[:7], err, out)
+		}
+	})
 }
 
 // TestRemoveWith_MissingWorktreeOnBareRepoHintRunsInTheBareRepo pins the
