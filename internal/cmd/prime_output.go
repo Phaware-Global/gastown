@@ -83,6 +83,15 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 		}
 	}
 
+	// The Mayor's Assistant renders its sweep cadence so the role is aware of
+	// the town's assistant_sweep_interval. Harmless (default "1h") for others.
+	sweepInterval := config.DefaultAssistantSweepInterval
+	if ctx.TownRoot != "" {
+		if ts, err := config.LoadOrCreateTownSettings(config.TownSettingsPath(ctx.TownRoot)); err == nil {
+			sweepInterval = ts.AssistantSweepInterval()
+		}
+	}
+
 	data := templates.RoleData{
 		Role:          roleName,
 		RigName:       ctx.Rig,
@@ -95,6 +104,7 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 		MayorSession:  session.MayorSessionName(),
 		DeaconSession: session.DeaconSessionName(),
 		MergeStrategy: mergeStrategy,
+		SweepInterval: sweepInterval,
 	}
 
 	// Render and output
