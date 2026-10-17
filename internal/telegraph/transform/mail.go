@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"golang.org/x/text/unicode/norm"
 	"unicode/utf8"
 
 	"github.com/steveyegge/gastown/internal/mail"
@@ -197,35 +199,44 @@ func stripControls(text string) string {
 }
 
 // trustMarkers are the phrases that, on a line of their own, an LLM reads as
-// a trust delimiter or trusted heading. Matched on the canonical form of each
-// line (see canonicalLine), never on raw bytes.
-var trustMarkers = []string{"EXTERNAL CONTENT", "OPERATOR PROMPT", strings.ToUpper(operatorPolicyHeading)}
+// a trust delimiter or trusted heading. They are compared letters-only (see
+// canonicalLine), so spacing, dashes and punctuation never matter. The bare
+// "Operator policy" heading is included so a forged heading without the
+// "(from telegraph config)" suffix is caught too.
+var trustMarkers = []string{"EXTERNALCONTENT", "OPERATORPROMPT", "OPERATORPOLICY"}
 
-// canonicalLine reduces a line to the form an LLM effectively reads: Unicode
-// format characters (zero-width space/joiner, word joiner, …) dropped, any run
-// of whitespace (including NBSP) collapsed to one space, dash-like runes
-// (hyphens, en/em dashes, minus, small/fullwidth hyphen) folded to '-', and
-// everything upper-cased.
+// homoglyphs folds the Cyrillic and Greek letters that render identically to
+// Latin capitals (the usual confusables) so "\u0415XTERNAL" reads as EXTERNAL.
+var homoglyphs = map[rune]rune{
+	'А': 'A', 'В': 'B', 'Е': 'E', 'К': 'K', 'М': 'M', 'Н': 'H', 'О': 'O', 'Р': 'P', 'С': 'C', 'Т': 'T', 'Х': 'X', 'У': 'Y', 'І': 'I', 'Ѕ': 'S', 'Ј': 'J',
+	'Α': 'A', 'Β': 'B', 'Ε': 'E', 'Ζ': 'Z', 'Η': 'H', 'Ι': 'I', 'Κ': 'K', 'Μ': 'M', 'Ν': 'N', 'Ο': 'O', 'Ρ': 'P', 'Τ': 'T', 'Υ': 'Y', 'Χ': 'X',
+}
+
+// invisibleLetters are runes Unicode classes as letters (Lo) but that render
+// as blanks: the Hangul choseong/jungseong fillers and the halfwidth filler.
+// NFKC maps U+3164 to U+1160, so both forms are listed.
+var invisibleLetters = map[rune]bool{0x115F: true, 0x1160: true, 0x3164: true, 0xFFA0: true}
+
+// canonicalLine reduces a line to the letters an LLM effectively reads:
+// NFKC-normalized (fullwidth and compatibility forms folded), every rune that
+// is not a letter dropped (whitespace, dashes, punctuation, zero-width and
+// invisible fillers, combining marks, braille blanks, emoji), common
+// Cyrillic/Greek homoglyphs folded to Latin, and everything upper-cased.
+// Matching an allowlist of letters, rather than denying categories one at a
+// time, is what makes the comparison robust to new separator tricks.
 func canonicalLine(line string) string {
 	var b strings.Builder
-	prevSpace := false
-	for _, r := range line {
-		switch {
-		case unicode.Is(unicode.Cf, r):
+	for _, r := range norm.NFKC.String(line) {
+		if !unicode.IsLetter(r) || invisibleLetters[r] {
 			continue
-		case unicode.IsSpace(r):
-			if !prevSpace {
-				b.WriteByte(' ')
-				prevSpace = true
-			}
-			continue
-		case (r >= 0x2010 && r <= 0x2015) || r == 0x2212 || r == 0xFE58 || r == 0xFF0D:
-			r = '-'
 		}
-		prevSpace = false
-		b.WriteRune(unicode.ToUpper(r))
+		r = unicode.ToUpper(r)
+		if folded, ok := homoglyphs[r]; ok {
+			r = folded
+		}
+		b.WriteRune(r)
 	}
-	return strings.TrimSpace(b.String())
+	return b.String()
 }
 
 // neutralizeDelimiters defuses trust-delimiter lines inside external text so
@@ -240,12 +251,9 @@ func neutralizeDelimiters(text string) string {
 	text = stripControls(lineSeparators.Replace(text))
 	lines := strings.Split(text, "\n")
 	for i, line := range lines {
-		// Compare with spaces removed too: a zero-width character inside the
-		// phrase ("EXTERNAL\u200bCONTENT") is dropped by canonicalLine and
-		// leaves no space behind.
-		canon := strings.ReplaceAll(canonicalLine(line), " ", "")
+		canon := canonicalLine(line)
 		for _, marker := range trustMarkers {
-			if strings.Contains(canon, strings.ReplaceAll(marker, " ", "")) {
+			if strings.Contains(canon, marker) {
 				lines[i] = "[neutralized delimiter] " + line
 				break
 			}
@@ -254,9 +262,12 @@ func neutralizeDelimiters(text string) string {
 	return strings.Join(lines, "\n")
 }
 
-// buildFrom returns the sender address: telegraph/<provider>/<actor>.
+// buildFrom returns the sender address: telegraph/<provider>/<actor>. The
+// actor is a provider display name and `gt mail read` prints From on a line
+// of its own outside the EXTERNAL CONTENT block, so it gets the same
+// normalization as every other header field.
 func buildFrom(event *telegraph.NormalizedEvent) string {
-	return "telegraph/" + event.Provider + "/" + event.Actor
+	return "telegraph/" + sanitizeHeaderValue(event.Provider) + "/" + sanitizeHeaderValue(event.Actor)
 }
 
 // buildSubject constructs the mail subject from structured NormalizedEvent fields.
