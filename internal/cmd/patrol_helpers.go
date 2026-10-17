@@ -219,7 +219,7 @@ func autoSpawnPatrol(cfg PatrolConfig) (string, error) {
 	cmdCatalog.Stderr = &stderrCatalog
 
 	if err := cmdCatalog.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderrCatalog.String())
+		errMsg := beads.RedirectDoltStartHint(strings.TrimSpace(stderrCatalog.String()))
 		if errMsg != "" {
 			return "", fmt.Errorf("failed to list formulas: %s", errMsg)
 		}
@@ -261,7 +261,7 @@ func autoSpawnPatrol(cfg PatrolConfig) (string, error) {
 	cmdSpawn.Stderr = &stderrSpawn
 
 	if err := cmdSpawn.Run(); err != nil {
-		return "", fmt.Errorf("failed to create patrol wisp: %s", stderrSpawn.String())
+		return "", fmt.Errorf("failed to create patrol wisp: %s", beads.RedirectDoltStartHint(stderrSpawn.String()))
 	}
 
 	// Parse the created molecule ID from output

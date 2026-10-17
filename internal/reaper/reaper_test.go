@@ -249,7 +249,7 @@ func TestPurgeDigestQueryNoDatabaseNameInjection(t *testing.T) {
 
 	// See TestReapUpdateQueryNoDatabaseNameInjection: "gt:agent" itself
 	// contains "gt", so strip it before checking for an injected dbName.
-	if strings.Contains(strings.ReplaceAll(digestQuery, "gt:agent", ""), dbName) {
+	if strings.Contains(strings.ReplaceAll(strings.ReplaceAll(digestQuery, "gt:agent", ""), "gt:merge-request", ""), dbName) {
 		t.Errorf("purgeDigestQuery contains injected database name %q: %s", dbName, digestQuery)
 	}
 	if !strings.Contains(digestQuery, "GROUP BY wtype") {
@@ -269,7 +269,7 @@ func TestPurgeBatchQueryNoDatabaseNameInjection(t *testing.T) {
 
 	// See TestReapUpdateQueryNoDatabaseNameInjection: "gt:agent" itself
 	// contains "gt", so strip it before checking for an injected dbName.
-	if strings.Contains(strings.ReplaceAll(idQuery, "gt:agent", ""), dbName) {
+	if strings.Contains(strings.ReplaceAll(strings.ReplaceAll(idQuery, "gt:agent", ""), "gt:merge-request", ""), dbName) {
 		t.Errorf("purgeBatchIDQuery contains injected database name %q: %s", dbName, idQuery)
 	}
 	expected := fmt.Sprintf("LIMIT %d", DefaultBatchSize)
@@ -556,6 +556,49 @@ func TestPurgeClosedWispsExcludesAgentBeads(t *testing.T) {
 	for _, id := range []string{"closed-agent-label", "closed-agent-wisplabel", "closed-recent", "open-normal"} {
 		if _, ok := remaining[id]; !ok {
 			t.Errorf("%s should have survived purge, but was deleted", id)
+		}
+	}
+}
+
+// TestPurgeClosedWispsProtectsUnmergedMRWisps: an MR wisp closed for any reason
+// other than "merged" survives a purge until MRWispMinPurgeAge has passed;
+// a merged one is purged straight away (gt-9yhyh).
+func TestPurgeClosedWispsProtectsUnmergedMRWisps(t *testing.T) {
+	now := time.Now().UTC()
+	oldEnough := now.Add(-10 * 24 * time.Hour)
+	mr := []string{"gt:merge-request"}
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"mr-merged":        {id: "mr-merged", status: "closed", issueType: "task", closedAt: oldEnough, labels: mr, closeReason: "merged"},
+			"mr-merged-in":     {id: "mr-merged-in", status: "closed", issueType: "task", closedAt: oldEnough, labels: mr, closeReason: "Merged in abc123"},
+			"mr-superseded":    {id: "mr-superseded", status: "closed", issueType: "task", closedAt: now.Add(-2 * time.Hour), labels: mr, closeReason: "superseded by gt-wisp-x"},
+			"mr-no-reason":     {id: "mr-no-reason", status: "closed", issueType: "task", closedAt: now.Add(-2 * time.Hour), labels: mr},
+			"mr-stale-closed":  {id: "mr-stale-closed", status: "closed", issueType: "task", closedAt: oldEnough, labels: mr, closeReason: "rejected: stale"},
+			"plain-closed-new": {id: "plain-closed-new", status: "closed", issueType: "task", closedAt: now.Add(-2 * time.Hour)},
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	// purgeAge 0: everything closed is age-eligible, so only the MR guard
+	// decides what survives.
+	purged, _, err := purgeClosedWisps(db, "testdb", 0, false)
+	if err != nil {
+		t.Fatalf("purgeClosedWisps: %v", err)
+	}
+	if purged != 4 {
+		t.Fatalf("purged = %d, want 4 (merged, merged-in, stale-closed MR, plain)", purged)
+	}
+	remaining := state.statuses()
+	for _, id := range []string{"mr-superseded", "mr-no-reason"} {
+		if _, ok := remaining[id]; !ok {
+			t.Errorf("%s: unmerged MR closed <24h ago must survive purge", id)
+		}
+	}
+	for _, id := range []string{"mr-merged", "mr-merged-in", "mr-stale-closed", "plain-closed-new"} {
+		if _, ok := remaining[id]; ok {
+			t.Errorf("%s should have been purged", id)
 		}
 	}
 }
@@ -1118,6 +1161,8 @@ type fakeWisp struct {
 	wispType  string
 	createdAt time.Time
 	closedAt  time.Time
+	// closeReason simulates wisps.close_reason.
+	closeReason string
 	// labels simulates rows in wisp_labels for this wisp.
 	labels []string
 	// issueLabels simulates rows in the separate `labels` table for this
@@ -1137,6 +1182,19 @@ func (w *fakeWisp) hasLabel(label string) bool {
 		}
 	}
 	return false
+}
+
+// isProtectedMRWisp mirrors purgeableMRWispJoin: a merge-request wisp is
+// protected from purge unless it closed as merged or has been closed for
+// MRWispMinPurgeAge.
+func (w *fakeWisp) isProtectedMRWisp(now time.Time) bool {
+	if !w.hasLabel("gt:merge-request") {
+		return false
+	}
+	if strings.HasPrefix(strings.ToLower(w.closeReason), "merged") {
+		return false
+	}
+	return !w.closedAt.Before(now.Add(-MRWispMinPurgeAge))
 }
 
 // isAgentWisp reports whether w is excluded by notAgentWispJoin: the
@@ -1310,6 +1368,9 @@ func (s *fakeReaperState) purgeCandidatesLocked(cutoff time.Time) []*fakeWisp {
 	var wisps []*fakeWisp
 	for _, w := range s.wisps {
 		if w.status != "closed" || w.isAgentWisp() || !w.closedAt.Before(cutoff) {
+			continue
+		}
+		if w.isProtectedMRWisp(time.Now().UTC()) {
 			continue
 		}
 		wisps = append(wisps, w)
@@ -1688,6 +1749,16 @@ func validateAgentGuardedUpdateQuery(query string) error {
 // guard is present on a Scan/Purge eligibility query (as opposed to the
 // bare-table form checked by validateAgentGuardedUpdateQuery above).
 func validateWAliasedAgentGuard(query string) error {
+	if strings.Contains(query, "w.status = 'closed' AND w.closed_at < ?") {
+		if err := requireSQL(query,
+			"LEFT JOIN wisp_labels mr_wl ON mr_wl.issue_id = w.id AND mr_wl.label = 'gt:merge-request'",
+			"mr_wl.issue_id IS NULL",
+			"LOWER(w.close_reason) LIKE 'merged%'",
+			"w.closed_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)",
+		); err != nil {
+			return fmt.Errorf("purge query missing merge-request guard: %w", err)
+		}
+	}
 	return requireSQL(query,
 		"w.issue_type != 'agent'",
 		"LEFT JOIN wisp_labels agent_wl ON agent_wl.issue_id = w.id AND agent_wl.label = 'gt:agent'",
