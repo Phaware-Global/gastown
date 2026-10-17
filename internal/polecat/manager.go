@@ -1199,8 +1199,10 @@ func (e *WorkAtRiskError) Unwrap() error {
 // known to list them from. It works for a branch that was never pushed (no
 // origin/<branch> to range against) and single-quotes the polecat-controlled
 // branch name and paths so pasting it cannot run anything embedded in them.
-// A named branch is passed fully qualified, so a name beginning with '-' can
-// never be read by git as an option.
+// The ref comes after --not --end-of-options (the second --not makes it
+// positive again), so a name beginning with '-' is never read as a git option.
+// It is passed as reported, not rewritten, so the heads/<branch> form git
+// reports for a branch shadowed by a same-named tag still resolves.
 func (e *WorkAtRiskError) RecoveryCommand() string {
 	dir, ref := e.ClonePath, e.Branch
 	switch ref {
@@ -1212,13 +1214,11 @@ func (e *WorkAtRiskError) RecoveryCommand() string {
 		ref = "HEAD"
 	case "(unknown)":
 		return ""
-	default:
-		ref = "refs/heads/" + ref
 	}
 	if e.RepoPath != "" {
 		dir = e.RepoPath
 	}
-	return fmt.Sprintf("git -C %s log --oneline %s --not --remotes", shellQuote(dir), shellQuote(ref))
+	return fmt.Sprintf("git -C %s log --oneline --not --remotes --not --end-of-options %s", shellQuote(dir), shellQuote(ref))
 }
 
 // shellQuote single-quotes s for a POSIX shell.

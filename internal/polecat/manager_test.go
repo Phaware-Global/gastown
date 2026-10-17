@@ -1754,7 +1754,7 @@ func TestWorkAtRiskError_RecoveryHint(t *testing.T) {
 
 	evil := &WorkAtRiskError{Polecat: "p", Branch: "polecat/x;touch${IFS}pwned", ClonePath: "/tmp/it's", Unpushed: 1, Reason: "r"}
 	cmd := evil.RecoveryCommand()
-	if !strings.Contains(cmd, `'refs/heads/polecat/x;touch${IFS}pwned'`) || !strings.Contains(cmd, `'/tmp/it'\''s'`) {
+	if !strings.Contains(cmd, `'polecat/x;touch${IFS}pwned'`) || !strings.Contains(cmd, `'/tmp/it'\''s'`) {
 		t.Errorf("branch and path must be single-quoted in %q", cmd)
 	}
 }
