@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/gastown/internal/config"
 )
 
 func TestParsePluginMD(t *testing.T) {
@@ -937,4 +939,56 @@ func TestFormatMailBody_WithoutRunScript(t *testing.T) {
 		t.Error("expected mail body to NOT contain run.sh command")
 	}
 	assertReceiptInstruction(t, body, "test-plugin")
+}
+
+// TestGateCooldownDuration covers duration_setting resolution: a gate that
+// names assistant_sweep_interval follows town settings (default 1h), while a
+// plain gate keeps its static duration.
+func TestGateCooldownDuration(t *testing.T) {
+	sweep := &Gate{Type: GateCooldown, Duration: "5h", DurationSetting: "assistant_sweep_interval"}
+	if got := sweep.CooldownDuration(nil); got != "1h" {
+		t.Errorf("nil settings: got %q, want default 1h", got)
+	}
+	if got := sweep.CooldownDuration(&config.TownSettings{AssistantSweepIntervalRaw: "30m"}); got != "30m" {
+		t.Errorf("configured 30m: got %q", got)
+	}
+	if got := sweep.CooldownDuration(&config.TownSettings{AssistantSweepIntervalRaw: "bogus"}); got != "1h" {
+		t.Errorf("invalid setting: got %q, want default 1h", got)
+	}
+
+	plain := &Gate{Type: GateCooldown, Duration: "5h"}
+	if got := plain.CooldownDuration(&config.TownSettings{AssistantSweepIntervalRaw: "30m"}); got != "5h" {
+		t.Errorf("plain gate must ignore the sweep setting: got %q", got)
+	}
+	if got := (&Gate{Type: GateCooldown}).CooldownDuration(nil); got != DefaultCooldown {
+		t.Errorf("empty duration: got %q, want %q", got, DefaultCooldown)
+	}
+	unknown := &Gate{Type: GateCooldown, Duration: "2h", DurationSetting: "no_such_setting"}
+	if got := unknown.CooldownDuration(nil); got != "2h" {
+		t.Errorf("unknown setting must fall back to static duration: got %q", got)
+	}
+}
+
+// TestShippedSweepPluginGate pins the shipped sweep plugin's gate wiring so a
+// future edit cannot silently detach it from assistant_sweep_interval.
+func TestShippedSweepPluginGate(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", "..", "plugins"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "mayors-assistant-sweep")
+	content, err := os.ReadFile(filepath.Join(dir, "plugin.md"))
+	if err != nil {
+		t.Fatalf("reading shipped sweep plugin: %v", err)
+	}
+	p, err := parsePluginMD(content, dir, LocationTown, "")
+	if err != nil {
+		t.Fatalf("parsing shipped sweep plugin: %v", err)
+	}
+	if p.Gate == nil || p.Gate.Type != GateCooldown || p.Gate.DurationSetting != "assistant_sweep_interval" {
+		t.Fatalf("sweep plugin gate = %+v, want cooldown with duration_setting=assistant_sweep_interval", p.Gate)
+	}
+	if _, err := os.Stat(filepath.Join(root, "mayor-loose-ends-nudge")); !os.IsNotExist(err) {
+		t.Error("plugins/mayor-loose-ends-nudge still shipped; the Mayor must no longer receive direct sweep nudges")
+	}
 }
