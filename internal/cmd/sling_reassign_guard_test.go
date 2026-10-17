@@ -156,11 +156,10 @@ func TestSlingTargetIsHolder(t *testing.T) {
 	}
 }
 
-// TestSlingForceRigTargetRefusedBeforeSpawn: the guard must refuse a forced
-// re-sling to a rig before resolveTarget spawns a replacement. Refusing after
-// the spawn rolls the replacement back through rollbackSlingArtifacts, which
-// clears the protected holder's hook and molecule.
-func TestSlingForceRigTargetRefusedBeforeSpawn(t *testing.T) {
+// setupHookedBeadTown builds a town whose bead gt-abc123 is hooked to
+// gastown/polecats/toast, which has a worktree, and chdirs into it.
+func setupHookedBeadTown(t *testing.T) string {
+	t.Helper()
 	townRoot := t.TempDir()
 
 	for _, dir := range []string{
@@ -217,7 +216,15 @@ exit /b 0
 	if err := os.Chdir(filepath.Join(townRoot, "mayor", "rig")); err != nil {
 		t.Fatalf("chdir: %v", err)
 	}
+	return townRoot
+}
 
+// TestSlingForceRigTargetRefusedBeforeSpawn: the guard must refuse a forced
+// re-sling to a rig before resolveTarget spawns a replacement. Refusing after
+// the spawn rolls the replacement back through rollbackSlingArtifacts, which
+// clears the protected holder's hook and molecule.
+func TestSlingForceRigTargetRefusedBeforeSpawn(t *testing.T) {
+	townRoot := setupHookedBeadTown(t)
 	prevForce := slingForce
 	prevDryRun := slingDryRun
 	prevNoConvoy := slingNoConvoy
@@ -245,7 +252,7 @@ exit /b 0
 	rollbackSlingArtifactsFn = func(*SpawnedPolecatInfo, string, string, string) { rolledBack = true }
 	calls := stubPolecatWorkStatus(t, &git.UncommittedWorkStatus{UnpushedCommits: 1}, nil)
 
-	err = runSling(nil, []string{"gt-abc123", "gastown"})
+	err := runSling(nil, []string{"gt-abc123", "gastown"})
 
 	if err == nil || !strings.Contains(err.Error(), "unpreserved work") {
 		t.Fatalf("runSling error = %v, want unpreserved-work refusal", err)
@@ -255,6 +262,58 @@ exit /b 0
 	}
 	if rolledBack {
 		t.Error("rollbackSlingArtifacts ran, which would clear the protected holder's hook")
+	}
+	if *calls != 1 {
+		t.Errorf("work-status checks = %d, want 1", *calls)
+	}
+}
+
+// TestSlingDeadHolderTargetStillGuarded: targeting the holder only keeps its
+// worktree while its session is alive. When the session is dead,
+// resolveTarget spawns a fresh polecat and the force block then shuts the
+// holder down, so the guard must still run.
+func TestSlingDeadHolderTargetStillGuarded(t *testing.T) {
+	townRoot := setupHookedBeadTown(t)
+
+	prevForce := slingForce
+	prevDryRun := slingDryRun
+	prevNoConvoy := slingNoConvoy
+	prevNoBoot := slingNoBoot
+	prevSpawn := spawnPolecatForSling
+	prevResolve := resolveTargetAgentFn
+	prevDead := isHookedAgentDeadFn
+	t.Cleanup(func() {
+		slingForce = prevForce
+		slingDryRun = prevDryRun
+		slingNoConvoy = prevNoConvoy
+		slingNoBoot = prevNoBoot
+		spawnPolecatForSling = prevSpawn
+		resolveTargetAgentFn = prevResolve
+		isHookedAgentDeadFn = prevDead
+	})
+	slingForce = false
+	slingDryRun = false
+	slingNoConvoy = true
+	slingNoBoot = true
+
+	isHookedAgentDeadFn = func(string) bool { return true }
+	resolveTargetAgentFn = func(string) (string, string, string, error) {
+		return "", "", "", errors.New("simulated dead session")
+	}
+	spawned := false
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		spawned = true
+		return &SpawnedPolecatInfo{RigName: rigName, PolecatName: "nux", ClonePath: filepath.Join(townRoot, "fake-polecat")}, nil
+	}
+	calls := stubPolecatWorkStatus(t, &git.UncommittedWorkStatus{UnpushedCommits: 1}, nil)
+
+	err := runSling(nil, []string{"gt-abc123", "gastown/polecats/toast"})
+
+	if err == nil || !strings.Contains(err.Error(), "unpreserved work") {
+		t.Fatalf("runSling error = %v, want unpreserved-work refusal", err)
+	}
+	if spawned {
+		t.Error("a replacement polecat was spawned for a dead holder with unpushed work")
 	}
 	if *calls != 1 {
 		t.Errorf("work-status checks = %d, want 1", *calls)
