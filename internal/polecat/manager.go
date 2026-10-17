@@ -2990,6 +2990,8 @@ type StalenessInfo struct {
 	HasActiveSession   bool   // Whether tmux session is running
 	HasUncommittedWork bool   // Whether there's uncommitted or unpushed work
 	AgentState         string // From agent bead (empty if no bead)
+	HookedIssue        string // Issue assigned to the polecat when assessed (empty if none)
+	ProbeError         string // A probe (git status, agent bead) failed; staleness is unknown, never stale
 	IsStale            bool   // Overall assessment: safe to clean up
 	Reason             string // Why it's considered stale (or not)
 }
@@ -3044,7 +3046,8 @@ const staleDetectConcurrency = 8
 // assessPolecat gathers the staleness signals for one polecat and assesses them.
 func (m *Manager) assessPolecat(p *Polecat, defaultBranch string, threshold int) *StalenessInfo {
 	info := &StalenessInfo{
-		Name: p.Name,
+		Name:        p.Name,
+		HookedIssue: p.Issue,
 	}
 
 	// Check for active tmux session
@@ -3058,20 +3061,59 @@ func (m *Manager) assessPolecat(p *Polecat, defaultBranch string, threshold int)
 
 	// Check for uncommitted work (excluding .beads/ files which are synced across worktrees)
 	status, err := polecatGit.CheckUncommittedWork()
-	if err == nil && !status.CleanExcludingBeads() {
+	if err != nil {
+		info.ProbeError = fmt.Sprintf("checking uncommitted work: %v", err)
+	} else if !status.CleanExcludingBeads() {
 		info.HasUncommittedWork = true
 	}
 
-	// Check agent bead state
+	// Check agent bead state. A missing bead comes back as (nil, nil, nil); any
+	// error is a failed probe, not an absent bead.
 	agentID := m.agentBeadID(p.Name)
 	_, fields, err := m.beads.GetAgentBead(agentID)
-	if err == nil && fields != nil {
+	if err != nil {
+		if info.ProbeError == "" {
+			info.ProbeError = fmt.Sprintf("reading agent bead: %v", err)
+		}
+	} else if fields != nil {
 		info.AgentState = fields.AgentState
 	}
 
 	// Determine staleness
 	info.IsStale, info.Reason = assessStaleness(info, threshold)
 	return info
+}
+
+// ReassessStale re-evaluates one polecat's staleness from live state. A caller that
+// acts on a DetectStalePolecats snapshot (which can be minutes old by the time it
+// reaches a given polecat) calls this immediately before destroying the polecat:
+// sling may have reused an idle polecat in the meantime. The check runs under the
+// per-polecat lock that ReuseIdlePolecat takes, so a reuse either completes before
+// the check (and is seen) or waits for it. The lock cannot be held across the
+// removal itself, which takes it again. prev is the snapshot being acted on: a
+// polecat whose hooked issue differs from it has been re-dispatched.
+func (m *Manager) ReassessStale(prev *StalenessInfo, threshold int) (*StalenessInfo, error) {
+	name := prev.Name
+	fl, err := m.lockPolecat(name)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	p, err := m.Get(name)
+	if err != nil {
+		return nil, err
+	}
+	defaultBranch := "main"
+	if rigCfg, err := rig.LoadRigConfig(m.rig.Path); err == nil && rigCfg.DefaultBranch != "" {
+		defaultBranch = rigCfg.DefaultBranch
+	}
+	info := m.assessPolecat(p, defaultBranch, threshold)
+	if info.IsStale && (p.State == StateWorking || p.Issue != prev.HookedIssue) {
+		info.IsStale = false
+		info.Reason = fmt.Sprintf("re-dispatched since detection (state=%s, issue=%q, was %q)", p.State, p.Issue, prev.HookedIssue)
+	}
+	return info, nil
 }
 
 // checkTmuxSession checks if a tmux session exists.
@@ -3097,6 +3139,12 @@ func countCommitsBehind(g *git.Git, defaultBranch string) int {
 // Per gt-zecmc: uses tmux state (HasActiveSession) rather than agent_state
 // since observable states (running, done, idle) are no longer recorded in beads.
 func assessStaleness(info *StalenessInfo, threshold int) (bool, string) {
+	// A failed probe means we don't know whether there is unpushed work or a
+	// protected agent state; destroying the polecat on that basis fails open.
+	if info.ProbeError != "" {
+		return false, "probe failed: " + info.ProbeError
+	}
+
 	// Never clean up if there's uncommitted work
 	if info.HasUncommittedWork {
 		return false, "has uncommitted work"
