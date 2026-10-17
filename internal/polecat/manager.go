@@ -1136,7 +1136,17 @@ func (m *Manager) Remove(name string, force bool) error {
 //
 // ZFC #10: Uses cleanup_status from agent bead if available (polecat self-report),
 // falls back to git check for backward compatibility.
-func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) (retErr error) {
+func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) error {
+	return m.RemoveWithGuard(name, force, nuclear, selfNuke, nil)
+}
+
+// RemoveWithGuard is RemoveWithOptions with a check that runs under the per-polecat
+// lock, after it is taken and before anything is touched. A non-nil error from guard
+// aborts the removal and is returned as is. A caller that decided to remove the
+// polecat earlier (staleness cleanup) uses it to re-verify that decision atomically
+// with the removal: otherwise sling can reuse the polecat between its check and the
+// removal's own lock.
+func (m *Manager) RemoveWithGuard(name string, force, nuclear, selfNuke bool, guard func() error) (retErr error) {
 	defer func() { telemetry.RecordPolecatRemove(context.Background(), name, retErr) }()
 	// Acquire per-polecat file lock to prevent concurrent Remove races
 	fl, err := m.lockPolecat(name)
@@ -1147,6 +1157,11 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 
 	if !m.exists(name) {
 		return ErrPolecatNotFound
+	}
+	if guard != nil {
+		if err := guard(); err != nil {
+			return err
+		}
 	}
 
 	// Clone path is where the git worktree lives (new or old structure)
@@ -3122,23 +3137,47 @@ func probeUncommittedWork(clonePath string) (has bool, probeErr string) {
 	return !status.CleanExcludingBeads(), ""
 }
 
+// ErrNoLongerStale means a polecat chosen for cleanup was re-dispatched (or stopped
+// being a cleanup candidate) before it could be removed.
+var ErrNoLongerStale = errors.New("polecat is no longer stale")
+
 // ReassessStale re-evaluates one polecat's staleness from live state. A caller that
 // acts on a DetectStalePolecats snapshot (which can be minutes old by the time it
 // reaches a given polecat) calls this immediately before destroying the polecat:
-// sling may have reused an idle polecat in the meantime. The check runs under the
-// per-polecat lock that ReuseIdlePolecat takes, so a reuse either completes before
-// the check (and is seen) or waits for it. The lock cannot be held across the
-// removal itself, which takes it again. prev is the snapshot being acted on: a
-// polecat whose hooked issue differs from it has been re-dispatched.
+// sling may have reused an idle polecat in the meantime. prev is the snapshot being
+// acted on: a polecat whose hooked issue differs from it has been re-dispatched.
+//
+// The result is only a point-in-time answer: the lock is released on return. The
+// destructive step must go through StaleRemovalGuard so the check is repeated under
+// the lock the removal holds.
 func (m *Manager) ReassessStale(prev *StalenessInfo, threshold int) (*StalenessInfo, error) {
-	name := prev.Name
-	fl, err := m.lockPolecat(name)
+	fl, err := m.lockPolecat(prev.Name)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = fl.Unlock() }()
+	return m.reassessLocked(prev, threshold)
+}
 
-	p, err := m.Get(name)
+// StaleRemovalGuard returns a RemoveWithGuard guard that re-runs the staleness
+// check under the removal's per-polecat lock and aborts with ErrNoLongerStale if
+// the polecat is no longer a cleanup candidate.
+func (m *Manager) StaleRemovalGuard(prev *StalenessInfo, threshold int) func() error {
+	return func() error {
+		fresh, err := m.reassessLocked(prev, threshold)
+		if err != nil {
+			return fmt.Errorf("re-assessing %s before removal: %w", prev.Name, err)
+		}
+		if !fresh.IsStale {
+			return fmt.Errorf("%w: %s", ErrNoLongerStale, fresh.Reason)
+		}
+		return nil
+	}
+}
+
+// reassessLocked is ReassessStale for a caller already holding the polecat's lock.
+func (m *Manager) reassessLocked(prev *StalenessInfo, threshold int) (*StalenessInfo, error) {
+	p, err := m.Get(prev.Name)
 	if err != nil {
 		return nil, err
 	}
