@@ -175,15 +175,21 @@ Telegraph-Actor: alice
 Telegraph-Subject: PROJ-1234
 Telegraph-URL: https://company.atlassian.net/browse/PROJ-1234
 Telegraph-Labels: story, critical
+Telegraph-Boundary: 3f9a1c0e7b2d4e61
 
---- EXTERNAL CONTENT (untrusted: jira/alice) ---
+--- EXTERNAL CONTENT (untrusted: jira/alice) 3f9a1c0e7b2d4e61 ---
 <Text field from NormalizedEvent here>
---- END EXTERNAL CONTENT ---
+--- END EXTERNAL CONTENT 3f9a1c0e7b2d4e61 ---
 ```
 
 Rules:
 - Metadata block appears first, as `Telegraph-*` headers.
 - External content is wrapped in explicit delimiters that identify it as untrusted.
+- Each mail carries a random per-message `Telegraph-Boundary` nonce and the
+  real delimiters embed it; a delimiter line without the mail's nonce is
+  external text. Delimiter-looking lines inside the external text are also
+  prefixed `[neutralized delimiter]` (matched on a letters-only canonical form)
+  as defense in depth.
 - No user-supplied text appears outside the delimited block.
 - Body length is capped (default 4 KB) to prevent oversized context injection.
   Content beyond the cap is truncated with a `[… truncated]` notice inside the block.
@@ -476,7 +482,7 @@ in an issue title or comment body.
 | Layer | Mitigation | Rationale |
 |-------|-----------|-----------|
 | L2 (Translation) | Subject line constructed from structured fields only (event type, issue key, status labels) — never from raw user text | Prevents injection via subject |
-| L3 (Transformation) | External text in body is always wrapped in `--- EXTERNAL CONTENT ---` delimiters with untrusted label | Mayor's model can identify the trust boundary structurally |
+| L3 (Transformation) | External text in body is always wrapped in `--- EXTERNAL CONTENT … <nonce> ---` delimiters with untrusted label; the nonce is per-message (`Telegraph-Boundary`) and delimiter-looking lines inside the text are neutralized | Mayor's model can identify the trust boundary structurally, and external text cannot forge it |
 | L3 (Transformation) | Body content is capped at `body_cap` bytes; remainder truncated | Limits payload surface |
 | L3 (Transformation) | `Telegraph-*` metadata headers are constructed from `NormalizedEvent` fields, never from raw text | Metadata cannot carry injected instructions |
 | L1 (Transport) | Unauthenticated requests rejected at the perimeter | Reduces attacker surface to authenticated Jira instances |

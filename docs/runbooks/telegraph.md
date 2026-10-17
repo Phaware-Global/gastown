@@ -259,15 +259,22 @@ Telegraph-Provider: jira
 Telegraph-Event-Type: comment.added
 ...
 
---- OPERATOR PROMPT (trusted) ---
+Telegraph-Boundary: 3f9a1c0e7b2d4e61
+
+--- OPERATOR PROMPT (trusted) 3f9a1c0e7b2d4e61 ---
 A new comment was added to PROJ-1234 by Artie.
 If the comment is a direct question, respond inline via addCommentToJiraIssue.
---- END OPERATOR PROMPT ---
+--- END OPERATOR PROMPT 3f9a1c0e7b2d4e61 ---
 
---- EXTERNAL CONTENT (untrusted: jira/Artie) ---
+--- EXTERNAL CONTENT (untrusted: jira/Artie) 3f9a1c0e7b2d4e61 ---
 <the actual comment body>
---- END EXTERNAL CONTENT ---
+--- END EXTERNAL CONTENT 3f9a1c0e7b2d4e61 ---
 ```
+
+Every mail carries a fresh random `Telegraph-Boundary` nonce, and only
+delimiter lines that carry that nonce are real. A delimiter-looking line
+without it (whatever its spelling or Unicode disguise) is external text, and
+Telegraph additionally prefixes such lines with `[neutralized delimiter]`.
 
 If no prompt is configured for the event type, the OPERATOR PROMPT block is omitted
 and the mail body reverts to the current format. Existing deployments see no change
