@@ -33,26 +33,6 @@ SKIP_COUNT_FILE="${TOWN_ROOT}/gastown/.gt-build-skip-count"
 # original incident this bead fixes ran silently for hours.
 SKIP_ESCALATE_THRESHOLD=3
 
-# Optional stable code-signing identity for the installed gt, so macOS TCC
-# grants (Full Disk Access, Removable Volumes) survive rebuilds. Read from a
-# town settings file and passed only to this origin/main build, never exported
-# globally: any process able to use the key can mint a gt that inherits gt's
-# privacy grants. See docs/INSTALLING.md.
-CODESIGN_IDENTITY_FILE="${TOWN_ROOT}/settings/gt-codesign-identity"
-GT_CODESIGN_IDENTITY=""
-if [ -r "$CODESIGN_IDENTITY_FILE" ]; then
-  # First line, trimmed at the ends only: identity names may contain spaces
-  # ("gt local", "Apple Development: Name (TEAMID)"). A SHA-1 hash also works.
-  IFS= read -r GT_CODESIGN_IDENTITY < "$CODESIGN_IDENTITY_FILE" || true
-  GT_CODESIGN_IDENTITY=$(printf '%s' "$GT_CODESIGN_IDENTITY" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-  # The value lands inside a make recipe; refuse anything outside a safe charset.
-  if ! printf '%s' "$GT_CODESIGN_IDENTITY" | grep -Eq '^[A-Za-z0-9 ._:()-]+$'; then
-    log "FAILED: $CODESIGN_IDENTITY_FILE holds an identity with unsupported characters; use the certificate name or its SHA-1 hash"
-    record_run "Plugin: rebuild-gt [failure]" "failure" "invalid code-signing identity in $CODESIGN_IDENTITY_FILE"
-    exit 1
-  fi
-fi
-
 log() { echo "[rebuild-gt] $*"; }
 
 # record_run TITLE RESULT [DETAIL] — write the ephemeral plugin-run receipt.
@@ -208,6 +188,29 @@ case "$BUILD_HEAD" in
 esac
 if ! git -C "$BUILD_ROOT" merge-base --is-ancestor "$INSTALLED_COMMIT" "$BUILD_HEAD" 2>/dev/null; then
   skip_while_stale "origin/main ($BUILD_HEAD) is not a forward descendant of the installed binary ($INSTALLED_COMMIT) — would be a downgrade"
+fi
+
+# Optional stable code-signing identity for the installed gt, so macOS TCC
+# grants (Full Disk Access, Removable Volumes) survive rebuilds. Read from a
+# town settings file and passed only to this origin/main build, never exported
+# globally: any process able to use the key can mint a gt that inherits gt's
+# privacy grants. See docs/INSTALLING.md.
+CODESIGN_IDENTITY_FILE="${TOWN_ROOT}/settings/gt-codesign-identity"
+GT_CODESIGN_IDENTITY=""
+if [ -r "$CODESIGN_IDENTITY_FILE" ]; then
+  # First line, trimmed at the ends only: identity names may contain spaces
+  # ("gt local", "Apple Development: Name (TEAMID)"). A SHA-1 hash also works.
+  IFS= read -r GT_CODESIGN_IDENTITY < "$CODESIGN_IDENTITY_FILE" || true
+  GT_CODESIGN_IDENTITY=$(printf '%s' "$GT_CODESIGN_IDENTITY" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  # The value lands inside a make recipe; refuse anything outside a safe charset.
+  # An empty first line means signing is off, same as a missing file.
+  if [ -z "$GT_CODESIGN_IDENTITY" ]; then
+    log "$CODESIGN_IDENTITY_FILE is empty; installing unsigned"
+  elif ! printf '%s' "$GT_CODESIGN_IDENTITY" | grep -Eq '^[A-Za-z0-9 ._:()-]+$'; then
+    log "FAILED: $CODESIGN_IDENTITY_FILE holds an identity with unsupported characters; use the certificate name or its SHA-1 hash"
+    record_run "Plugin: rebuild-gt [failure]" "failure" "invalid code-signing identity in $CODESIGN_IDENTITY_FILE"
+    exit 1
+  fi
 fi
 
 # --- Build -------------------------------------------------------------------
