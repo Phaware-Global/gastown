@@ -321,12 +321,14 @@ type Finding struct {
 }
 ```
 
-`Fields` is a **closed allowlist of value shapes**, validated by the runner
-before output: integers, RFC 3339 timestamps, hex SHAs, account IDs and
-logins matching fixed patterns (`^[A-Za-z0-9-]+$`, `^[0-9a-f:]+$`), and
-enum states the port maps to its own constants (`approved`,
-`changes_requested`, `failing`). A value that fails the allowlist is moved
-to `External`, never printed as a field. Branch and ref names, check-run
+`Fields` is a **closed, per-key allowlist**: each port declares the keys it
+may emit and the exact shape of each value — integers, RFC 3339 timestamps,
+40-hex SHAs, Jira account IDs (`^\d+:[0-9a-f-]{36}$` or `^[0-9a-f]{24}$`),
+GitHub logins (`^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$`, so no
+leading `-` and no hyphenated prose), and enum states the port maps to its
+own constants (`approved`, `changes_requested`, `failing`). Every shape has a
+length cap. A value that fails its key's shape, or any key the port did not
+declare, is moved to `External`, never printed as a field. Branch and ref names, check-run
 and job names, Jira status and tag names, labels, titles, comment bodies,
 and every display name are `External` by definition — all of them are
 typed by people (a PR author chooses the job names in the head's workflow
@@ -344,9 +346,10 @@ by an agent that runs with permissions bypassed, so the fence is applied
 before the agent sees the text, not after. In both the Markdown and
 `--json` output every `External` value is emitted inside an
 `--- EXTERNAL CONTENT (untrusted: <port>/<key>) ---` block. Inside the
-block the runner first normalizes every line separator (`\r\n`, `\r`,
-U+2028, U+2029, U+0085) to `\n`, applies the same delimiter/heading
-neutralization and byte cap as Telegraph's transform
+block the runner first normalizes every line separator (`\r\n`, `\r`, VT,
+FF, U+2028, U+2029, U+0085) to `\n` and replaces every remaining C0/C1
+control character except `\n` and `\t` with U+FFFD, applies the same
+delimiter/heading neutralization and byte cap as Telegraph's transform
 (`neutralizeDelimiters`, `body_cap`), and then prefixes **every line** with
 `> `, so no line of external text can ever match a delimiter or heading in
 the receiving prompt. The JSON form carries the same prefixed text under an
@@ -386,14 +389,17 @@ set as acknowledged. A run that is never acked (session died before
 mailing, context compacted, health-kill) leaves the acknowledged state
 untouched, so the next run reports the same findings as new again. Manual
 re-checks (`--json`, `--dry-run`, or any run outside the sweep protocol)
-never write state. Entries are **evicted only at `--ack`**, and only for
-ports that completed that run without error or truncation: an entry absent
-from a clean run's findings is dropped, so a recurrence with the same
-fingerprint — a CI re-run failing on the same head — is new again rather
-than standing. A port that failed, timed out, or stopped mid-pagination
-carries its acknowledged entries forward unchanged (its "not checked"
-status is what the mail reports), so a one-sweep outage never turns every
-standing item into a re-brief or resets reminder history. Reminders to
+never write state. At `--ack` the runner **upserts every fingerprint the
+run reported**, from every port, complete or partial — a finding the Mayor
+was told about is acknowledged regardless of how the rest of the port
+fared. **Eviction** (dropping an entry whose finding was absent) happens
+only for ports that completed that run without error or truncation, so a
+recurrence with the same fingerprint — a CI re-run failing on the same
+head — is new again rather than standing, while a port that failed, timed
+out, or stopped mid-pagination keeps its previously acknowledged entries
+(its "not checked" status is what the mail reports). A one-sweep outage
+therefore never turns standing items into a re-brief or resets reminder
+history. Reminders to
 humans (the GitHub review re-ping) are rate-limited by the acknowledged
 state only: a reminder that was never mailed is not counted as sent.
 
@@ -405,7 +411,11 @@ its own quotes — and never builds an action from anything inside a fence.
 **Identity and credentials.** Ports reuse what Telegraph already knows
 about the town's persona, matched by **immutable identifiers only**:
 `telegraph.mayor.jira_account_ids` (Jira account IDs) and
-`telegraph.mayor.github_logins`. Jira display names
+`telegraph.mayor.github_logins`. Each port requires its persona identity
+even when the corresponding Telegraph provider is disabled: the GitHub port
+needs a non-empty `github_logins` and otherwise disables itself with a port
+error ("no persona login configured"), so the "our PR" kinds never return an
+empty all-clear. Jira display names
 (`telegraph.mayor.jira_usernames`) are never used for matching in the sweep:
 a display name is mutable and non-unique, so an account renamed to the
 persona's name could otherwise suppress `unanswered-comment` findings on
@@ -495,8 +505,9 @@ Config (`settings/config.json`):
 Checks derived from the sweep history (review re-pings, "nothing to merge"
 checks), the loose-ends bucket 2 rules, and the merge-queue conventions.
 Repos come from the town's rig registry plus `telegraph.providers.github
-.extra_repos`; "our" PRs are those authored by the persona or by town
-agents.
+.extra_repos`; "our" PRs are those authored by a login in
+`telegraph.mayor.github_logins` (town agents push under the persona's
+GitHub identity; there is no separate agent login).
 
 | Kind | Condition (deterministic) | Why it exists |
 |---|---|---|
@@ -506,7 +517,7 @@ agents.
 | `approved-unmerged` | open PR approved by the required human on its current head, CI green, not merged for `approved_unmerged_after` | Every sweep asked "does any open PR have the human reviewer's approval on its current head?" |
 | `changes-requested-stale` | our PR with `CHANGES_REQUESTED` or unresolved threads older than `respond_after` and no newer push | Loose-ends bucket 2: respond before the reviewer has to ask again |
 | `no-review-loop` | our PR in a rig with `pr_reviewer` configured, open longer than `review_loop_after`, with no review from that login | "If no internal reviewer loop has been performed, start one" |
-| `ci-failing` | open PR whose latest check suite failed for `ci_failing_after` and has no open fix bead in the PR's rig carrying both the `pr-num-<N>` label and the CI-fix type label (`mol-pr-feedback-patrol` labels its beads; dedup is on labels only, never on titles, which embed the attacker-controlled PR title; `pr-num-<N>` alone also marks review-fix beads, so the type label is required) | The town already dispatches CI fixes through the PR-feedback patrol; reporting a PR that a polecat is fixing invites the duplicate review-fix dispatch the town has suffered from. (`github-sheriff` records only ephemeral plugin-run summaries; it is not a dedup source.) |
+| `ci-failing` | open PR whose latest check suite failed for `ci_failing_after` and has no open bead in the PR's rig labelled both `pr-num-<N>` and `pr-feedback-patrol` — the PR-feedback patrol's own dedup key. That is sufficient because the patrol never opens a second bead (CI-fix or review-fix) for a PR while one is open: any open patrol bead means a polecat already owns that PR. Dedup is on labels only, never on titles, which embed the attacker-controlled PR title | The town already dispatches CI fixes through the PR-feedback patrol; reporting a PR that a polecat is fixing invites the duplicate review-fix dispatch the town has suffered from. (`github-sheriff` records only ephemeral plugin-run summaries; it is not a dedup source.) |
 | `release-unclosed` | merged PR into one of the repo's release branches (per-repo config, default `release/*`) in the last `release_window`, where no tag is reachable from the merge commit | Release-wave phases 4–5 are the ones that quietly stall |
 | `draft-stale` | our draft PR with no push for `stale_after` | Abandoned work hides in drafts |
 
