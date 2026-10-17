@@ -143,8 +143,13 @@ func (c *StaleDoltPortCheck) Fix(ctx *CheckContext) error {
 
 // getCorrectPort returns the port from the main Dolt server config.
 func (c *StaleDoltPortCheck) getCorrectPort(ctx *CheckContext) int {
-	// Check the main Dolt server config
-	configPath := filepath.Join(ctx.TownRoot, ".dolt-data", "config.yaml")
+	return configuredDoltPort(ctx.TownRoot)
+}
+
+// configuredDoltPort returns the listener port in the town's managed
+// .dolt-data/config.yaml, or 0 when the file is absent or has no port.
+func configuredDoltPort(townRoot string) int {
+	configPath := filepath.Join(townRoot, ".dolt-data", "config.yaml")
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return 0
