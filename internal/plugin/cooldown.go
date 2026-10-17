@@ -7,19 +7,20 @@ const DefaultCooldown = "1h"
 
 // CooldownDuration returns the effective cooldown for a cooldown gate.
 //
-// When the gate names a town setting via `duration_setting`, that setting's
-// value wins over the static `duration` (which then only documents the
-// fallback). Only settings listed here are recognised; an unknown name is
-// ignored so a typo degrades to the static duration rather than disabling the
-// gate. settings may be nil.
+// Resolution order: a valid value of the town setting named by
+// `duration_setting` (only settings listed here are recognised; an unknown
+// name is ignored), then the gate's static `duration`, then DefaultCooldown.
+// So the static duration really is the fallback when settings are missing,
+// unparseable, below the setting's floor, or failed to load (nil settings).
 func (g *Gate) CooldownDuration(settings *config.TownSettings) string {
 	if g == nil {
 		return DefaultCooldown
 	}
 	switch g.DurationSetting {
 	case "assistant_sweep_interval":
-		// The Mayor's Assistant sweep cadence; defaults to 1h in config.
-		return settings.AssistantSweepInterval()
+		if v, ok := settings.AssistantSweepIntervalSetting(); ok {
+			return v
+		}
 	}
 	if g.Duration == "" {
 		return DefaultCooldown

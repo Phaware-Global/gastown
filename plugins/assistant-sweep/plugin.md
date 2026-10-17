@@ -5,8 +5,8 @@ version = 2
 
 [gate]
 type = "cooldown"
-# Fallback only. The effective cooldown comes from settings/config.json
-# `assistant_sweep_interval` (default "1h"); see docs/design/assistant-role.md.
+# Effective cooldown: settings/config.json `assistant_sweep_interval` when it
+# is set, parseable and at least 5m; otherwise this static duration.
 duration = "1h"
 duration_setting = "assistant_sweep_interval"
 
@@ -31,6 +31,15 @@ the Mayor directly; the Mayor now receives the *result* of the sweep as a
 
 You do **not** sweep anything yourself. You send one mail. The assistant does
 the work and briefs the Mayor.
+
+## Deploying to a town
+
+The daemon scans `<town>/plugins`, not this repository, and the daemon's
+plugin sync is additive. Deploy this plugin explicitly, per plugin: copy
+`plugins/assistant-sweep` from the repository into `<town>/plugins/`, then
+delete `<town>/plugins/mayor-loose-ends-nudge` (otherwise both plugins fire).
+Do **not** run a whole-tree `gt plugin sync --clean`, which would also
+overwrite deployed plugins that have drifted on purpose.
 
 ## Steps
 

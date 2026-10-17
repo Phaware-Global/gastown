@@ -264,7 +264,7 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 	}
 
 	// Town settings feed cooldown gates that name a setting (duration_setting).
-	// A load failure degrades to each gate's static duration.
+	// A load failure (nil settings) degrades to each gate's static duration.
 	townSettings, err := config.LoadOrCreateTownSettings(config.TownSettingsPath(d.config.TownRoot))
 	if err != nil {
 		d.logger.Printf("Handler: could not load town settings for plugin gates: %v", err)

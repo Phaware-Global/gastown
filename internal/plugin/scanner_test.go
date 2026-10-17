@@ -946,14 +946,21 @@ func TestFormatMailBody_WithoutRunScript(t *testing.T) {
 // plain gate keeps its static duration.
 func TestGateCooldownDuration(t *testing.T) {
 	sweep := &Gate{Type: GateCooldown, Duration: "5h", DurationSetting: "assistant_sweep_interval"}
-	if got := sweep.CooldownDuration(nil); got != "1h" {
-		t.Errorf("nil settings: got %q, want default 1h", got)
+	if got := sweep.CooldownDuration(nil); got != "5h" {
+		t.Errorf("nil settings must fall back to the gate's static duration: got %q, want 5h", got)
 	}
 	if got := sweep.CooldownDuration(&config.TownSettings{AssistantSweepIntervalRaw: "30m"}); got != "30m" {
 		t.Errorf("configured 30m: got %q", got)
 	}
-	if got := sweep.CooldownDuration(&config.TownSettings{AssistantSweepIntervalRaw: "bogus"}); got != "1h" {
-		t.Errorf("invalid setting: got %q, want default 1h", got)
+	if got := sweep.CooldownDuration(&config.TownSettings{AssistantSweepIntervalRaw: "bogus"}); got != "5h" {
+		t.Errorf("invalid setting must fall back to the static duration: got %q, want 5h", got)
+	}
+	if got := sweep.CooldownDuration(&config.TownSettings{AssistantSweepIntervalRaw: "10s"}); got != "5h" {
+		t.Errorf("below-floor setting must fall back to the static duration: got %q, want 5h", got)
+	}
+	noStatic := &Gate{Type: GateCooldown, DurationSetting: "assistant_sweep_interval"}
+	if got := noStatic.CooldownDuration(nil); got != DefaultCooldown {
+		t.Errorf("no setting and no static duration: got %q, want %q", got, DefaultCooldown)
 	}
 
 	plain := &Gate{Type: GateCooldown, Duration: "5h"}
