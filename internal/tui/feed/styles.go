@@ -103,7 +103,7 @@ var (
 	// Role icons - uses centralized emojis from constants package
 	RoleIcons = map[string]string{
 		constants.RoleMayor:           constants.EmojiMayor,
-		constants.RoleMayorsAssistant: constants.EmojiMayorsAssistant,
+		constants.RoleAssistant: constants.EmojiAssistant,
 		constants.RoleWitness:         constants.EmojiWitness,
 		constants.RoleRefinery:        constants.EmojiRefinery,
 		constants.RoleCrew:            constants.EmojiCrew,

@@ -1091,7 +1091,7 @@ func (d *Daemon) heartbeat(state *State) {
 	d.ensureMayorRunning()
 
 	// 6.1. Ensure the Mayor's Assistant is running (restart if dead)
-	d.ensureMayorsAssistantRunning()
+	d.ensureAssistantRunning()
 
 	// 6.5. Handle Dog lifecycle: cleanup stuck dogs and dispatch plugins
 	// Pressure-gated: dog dispatch spawns new agent sessions.
@@ -2194,9 +2194,9 @@ func (d *Daemon) ensureMayorRunning() {
 	d.logger.Println("Mayor started successfully")
 }
 
-// ensureMayorsAssistantRunning ensures the Mayor's Assistant is running,
+// ensureAssistantRunning ensures the Mayor's Assistant is running,
 // with the same zombie-debounce as ensureMayorRunning.
-func (d *Daemon) ensureMayorsAssistantRunning() {
+func (d *Daemon) ensureAssistantRunning() {
 	mgr := assistant.NewManager(d.config.TownRoot)
 
 	if err := mgr.Start(""); err != nil {

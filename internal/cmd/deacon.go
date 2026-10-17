@@ -1122,8 +1122,8 @@ func agentAddressToIDs(address string) (beadID, sessionName string, err error) {
 		return beads.DeaconBeadIDTown(), session.DeaconSessionName(), nil
 	case constants.RoleMayor:
 		return beads.MayorBeadIDTown(), session.MayorSessionName(), nil
-	case constants.RoleMayorsAssistant:
-		return beads.MayorsAssistantBeadIDTown(), session.MayorsAssistantSessionName(), nil
+	case constants.RoleAssistant:
+		return beads.AssistantBeadIDTown(), session.AssistantSessionName(), nil
 	}
 
 	parts := strings.Split(address, "/")

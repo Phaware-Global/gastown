@@ -67,8 +67,8 @@ func runPeek(cmd *cobra.Command, args []string) error {
 	townAgentSessions := map[string]string{
 		"mayor":                               "hq-mayor",
 		"hq/mayor":                            "hq-mayor",
-		constants.RoleMayorsAssistant:         "hq-" + constants.RoleMayorsAssistant,
-		"hq/" + constants.RoleMayorsAssistant: "hq-" + constants.RoleMayorsAssistant,
+		constants.RoleAssistant:         "hq-" + constants.RoleAssistant,
+		"hq/" + constants.RoleAssistant: "hq-" + constants.RoleAssistant,
 		"deacon":                              "hq-deacon",
 		"hq/deacon":                           "hq-deacon",
 		"boot":                                "hq-boot",

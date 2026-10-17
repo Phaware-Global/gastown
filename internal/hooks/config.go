@@ -477,7 +477,7 @@ func DefaultOverrides() map[string]*HooksConfig {
 		},
 		// Mayor's Assistant: same autonomy guard as the Mayor — it triages an
 		// unattended inbox and must never block on a human answer.
-		"mayors-assistant": {
+		"assistant": {
 			PreToolUse: []HookEntry{
 				{
 					Matcher: "AskUserQuestion",
@@ -889,9 +889,9 @@ func DiscoverTargets(townRoot string) ([]Target, error) {
 		Role: "deacon",
 	})
 	targets = append(targets, Target{
-		Path: filepath.Join(townRoot, "mayors-assistant", ".claude", "settings.json"),
-		Key:  "mayors-assistant",
-		Role: "mayors-assistant",
+		Path: filepath.Join(townRoot, "assistant", ".claude", "settings.json"),
+		Key:  "assistant",
+		Role: "assistant",
 	})
 
 	// Boot watchdog — ephemeral Claude agent in deacon/dogs/boot/.

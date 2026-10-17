@@ -413,14 +413,14 @@ func TestParseAddress(t *testing.T) {
 			want:    AgentIdentity{Role: RoleDeacon},
 		},
 		{
-			name:    "mayors-assistant with slash",
-			address: "mayors-assistant/",
-			want:    AgentIdentity{Role: RoleMayorsAssistant},
+			name:    "assistant with slash",
+			address: "assistant/",
+			want:    AgentIdentity{Role: RoleAssistant},
 		},
 		{
-			name:    "mayors-assistant bare",
-			address: "mayors-assistant",
-			want:    AgentIdentity{Role: RoleMayorsAssistant},
+			name:    "assistant bare",
+			address: "assistant",
+			want:    AgentIdentity{Role: RoleAssistant},
 		},
 		{
 			name:    "witness",
@@ -494,27 +494,27 @@ func TestPrefixRegistry(t *testing.T) {
 	}
 }
 
-// TestMayorsAssistantIdentity covers the hyphenated, "mayor"-prefixed role end
-// to end: session name ↔ identity ↔ address must all round-trip and must never
+// TestAssistantIdentity covers the town-level assistant role end to end:
+// session name ↔ identity ↔ address must all round-trip and must never
 // collapse into the Mayor's identity.
-func TestMayorsAssistantIdentity(t *testing.T) {
-	id, err := ParseSessionName("hq-mayors-assistant")
+func TestAssistantIdentity(t *testing.T) {
+	id, err := ParseSessionName("hq-assistant")
 	if err != nil {
-		t.Fatalf("ParseSessionName(hq-mayors-assistant) error: %v", err)
+		t.Fatalf("ParseSessionName(hq-assistant) error: %v", err)
 	}
-	if id.Role != RoleMayorsAssistant || id.Rig != "" || id.Name != "" {
-		t.Errorf("ParseSessionName = %+v, want Role=mayors-assistant", *id)
+	if id.Role != RoleAssistant || id.Rig != "" || id.Name != "" {
+		t.Errorf("ParseSessionName = %+v, want Role=assistant", *id)
 	}
-	if got := id.SessionName(); got != "hq-mayors-assistant" {
-		t.Errorf("SessionName() = %q, want hq-mayors-assistant", got)
+	if got := id.SessionName(); got != "hq-assistant" {
+		t.Errorf("SessionName() = %q, want hq-assistant", got)
 	}
-	if got := id.Address(); got != "mayors-assistant" {
-		t.Errorf("Address() = %q, want mayors-assistant", got)
+	if got := id.Address(); got != "assistant" {
+		t.Errorf("Address() = %q, want assistant", got)
 	}
-	if got := id.BeaconAddress(); got != "mayors-assistant" {
-		t.Errorf("BeaconAddress() = %q, want mayors-assistant", got)
+	if got := id.BeaconAddress(); got != "assistant" {
+		t.Errorf("BeaconAddress() = %q, want assistant", got)
 	}
-	if got := MayorsAssistantSessionName(); got != "hq-mayors-assistant" {
-		t.Errorf("MayorsAssistantSessionName() = %q", got)
+	if got := AssistantSessionName(); got != "hq-assistant" {
+		t.Errorf("AssistantSessionName() = %q", got)
 	}
 }

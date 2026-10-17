@@ -54,7 +54,7 @@ func parsePolecatSessionName(sessionName string) (rigName, polecatName string, o
 	// Mayor/deacon use hq- prefix in practice, but gt-<rig>-mayor/deacon
 	// patterns should still be excluded defensively.
 	switch identity.Name {
-	case constants.RoleMayor, constants.RoleMayorsAssistant, constants.RoleDeacon:
+	case constants.RoleMayor, constants.RoleAssistant, constants.RoleDeacon:
 		return "", "", false
 	}
 	return identity.Rig, identity.Name, true

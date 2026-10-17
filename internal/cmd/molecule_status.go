@@ -46,8 +46,8 @@ func buildAgentBeadID(identity string, role Role, townRoot string) string {
 		switch {
 		case identity == "mayor":
 			return beads.MayorBeadIDTown()
-		case identity == constants.RoleMayorsAssistant:
-			return beads.MayorsAssistantBeadIDTown()
+		case identity == constants.RoleAssistant:
+			return beads.AssistantBeadIDTown()
 		case identity == "deacon":
 			return beads.DeaconBeadIDTown()
 		case identity == "deacon-boot":
@@ -73,8 +73,8 @@ func buildAgentBeadID(identity string, role Role, townRoot string) string {
 	switch role {
 	case RoleMayor:
 		return beads.MayorBeadIDTown()
-	case RoleMayorsAssistant:
-		return beads.MayorsAssistantBeadIDTown()
+	case RoleAssistant:
+		return beads.AssistantBeadIDTown()
 	case RoleDeacon:
 		return beads.DeaconBeadIDTown()
 	case RoleWitness:
@@ -562,8 +562,8 @@ func buildAgentIdentity(ctx RoleContext) string {
 	switch ctx.Role {
 	case RoleMayor:
 		return "mayor/"
-	case RoleMayorsAssistant:
-		return constants.RoleMayorsAssistant + "/"
+	case RoleAssistant:
+		return constants.RoleAssistant + "/"
 	case RoleDeacon:
 		return "deacon/"
 	case RoleBoot:
@@ -1188,7 +1188,7 @@ func outputMoleculeCurrent(info MoleculeCurrentInfo) error {
 // Accepts both "mayor" and "mayor/" formats for compatibility.
 func isTownLevelRole(agentID string) bool {
 	return agentID == "mayor" || agentID == "mayor/" ||
-		agentID == constants.RoleMayorsAssistant || agentID == constants.RoleMayorsAssistant+"/" ||
+		agentID == constants.RoleAssistant || agentID == constants.RoleAssistant+"/" ||
 		agentID == "deacon" || agentID == "deacon/" ||
 		agentID == "deacon/boot" || agentID == "deacon-boot"
 }

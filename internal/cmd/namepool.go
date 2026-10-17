@@ -409,7 +409,7 @@ func detectCurrentRigWithPath() (string, string) {
 
 	// Extract first path component (rig name)
 	parts := strings.Split(rel, string(filepath.Separator))
-	if len(parts) > 0 && parts[0] != "." && parts[0] != constants.RoleMayor && parts[0] != constants.RoleMayorsAssistant && parts[0] != constants.RoleDeacon {
+	if len(parts) > 0 && parts[0] != "." && parts[0] != constants.RoleMayor && parts[0] != constants.RoleAssistant && parts[0] != constants.RoleDeacon {
 		return parts[0], filepath.Join(townRoot, parts[0])
 	}
 
