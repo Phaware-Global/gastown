@@ -55,15 +55,15 @@ const (
 	RoleMayor Role = "mayor"
 	// RoleAssistant is the Mayor's inbound-triage assistant (town-level).
 	RoleAssistant Role = "assistant"
-	RoleDeacon          Role = "deacon"
-	RoleBoot            Role = "boot"
-	RoleWitness         Role = "witness"
-	RoleRefinery        Role = "refinery"
-	RolePolecat         Role = "polecat"
-	RoleCrew            Role = "crew"
-	RoleReviewer        Role = "reviewer"
-	RoleDog             Role = "dog"
-	RoleUnknown         Role = "unknown"
+	RoleDeacon    Role = "deacon"
+	RoleBoot      Role = "boot"
+	RoleWitness   Role = "witness"
+	RoleRefinery  Role = "refinery"
+	RolePolecat   Role = "polecat"
+	RoleCrew      Role = "crew"
+	RoleReviewer  Role = "reviewer"
+	RoleDog       Role = "dog"
+	RoleUnknown   Role = "unknown"
 )
 
 var primeCmd = &cobra.Command{

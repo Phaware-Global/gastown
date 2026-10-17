@@ -65,14 +65,14 @@ func runPeek(cmd *cobra.Command, args []string) error {
 	// Handle town-level agents: mayor, deacon, boot
 	// These use session names like "hq-mayor", "hq-deacon" but have no rig.
 	townAgentSessions := map[string]string{
-		"mayor":                               "hq-mayor",
-		"hq/mayor":                            "hq-mayor",
+		"mayor":                         "hq-mayor",
+		"hq/mayor":                      "hq-mayor",
 		constants.RoleAssistant:         "hq-" + constants.RoleAssistant,
 		"hq/" + constants.RoleAssistant: "hq-" + constants.RoleAssistant,
-		"deacon":                              "hq-deacon",
-		"hq/deacon":                           "hq-deacon",
-		"boot":                                "hq-boot",
-		"hq/boot":                             "hq-boot",
+		"deacon":                        "hq-deacon",
+		"hq/deacon":                     "hq-deacon",
+		"boot":                          "hq-boot",
+		"hq/boot":                       "hq-boot",
 	}
 	if sessionName, ok := townAgentSessions[address]; ok {
 		_, err := workspace.FindFromCwdOrError()
