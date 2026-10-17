@@ -7,6 +7,8 @@ package transform
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -205,11 +207,27 @@ func stripControls(text string) string {
 // "(from telegraph config)" suffix is caught too.
 var trustMarkers = []string{"EXTERNALCONTENT", "OPERATORPROMPT", "OPERATORPOLICY"}
 
-// homoglyphs folds the Cyrillic and Greek letters that render identically to
-// Latin capitals (the usual confusables) so "\u0415XTERNAL" reads as EXTERNAL.
+// homoglyphs folds characters that render like Latin capitals so the
+// letters-only comparison sees the Latin word: Cyrillic and Greek capitals,
+// Latin small capitals, Cherokee and Lisu letters, Armenian Օ, and the digits
+// commonly swapped for letters (0→O, 1→I, 3→E, 4→A, 5→S, 7→T, 8→B). This is
+// defense in depth behind the per-message boundary nonce, not the primary
+// guard, so the table need not be exhaustive.
 var homoglyphs = map[rune]rune{
+	// Cyrillic
 	'А': 'A', 'В': 'B', 'Е': 'E', 'К': 'K', 'М': 'M', 'Н': 'H', 'О': 'O', 'Р': 'P', 'С': 'C', 'Т': 'T', 'Х': 'X', 'У': 'Y', 'І': 'I', 'Ѕ': 'S', 'Ј': 'J',
+	// Greek
 	'Α': 'A', 'Β': 'B', 'Ε': 'E', 'Ζ': 'Z', 'Η': 'H', 'Ι': 'I', 'Κ': 'K', 'Μ': 'M', 'Ν': 'N', 'Ο': 'O', 'Ρ': 'P', 'Τ': 'T', 'Υ': 'Y', 'Χ': 'X',
+	// Latin small capitals (upper-cased forms have no mapping, so list the originals)
+	'ᴀ': 'A', 'ʙ': 'B', 'ᴄ': 'C', 'ᴅ': 'D', 'ᴇ': 'E', 'ꜰ': 'F', 'ɢ': 'G', 'ʜ': 'H', 'ɪ': 'I', 'ᴊ': 'J', 'ᴋ': 'K', 'ʟ': 'L', 'ᴍ': 'M', 'ɴ': 'N', 'ᴏ': 'O', 'ᴘ': 'P', 'ʀ': 'R', 'ꜱ': 'S', 'ᴛ': 'T', 'ᴜ': 'U', 'ᴠ': 'V', 'ᴡ': 'W', 'ʏ': 'Y', 'ᴢ': 'Z',
+	// Cherokee
+	'Ꭺ': 'A', 'Ꭱ': 'R', 'Ꭲ': 'T', 'Ꭼ': 'E', 'Ꭻ': 'J', 'Ꮇ': 'M', 'Ꮋ': 'H', 'Ꮎ': 'O', 'Ꮐ': 'G', 'Ꮓ': 'Z', 'Ꮩ': 'V', 'Ꮪ': 'S', 'Ꮮ': 'L', 'Ꮯ': 'C', 'Ꮲ': 'P', 'Ꮃ': 'W', 'Ꮶ': 'K', 'Ꭰ': 'D', 'Ꮟ': 'B', 'Ꮢ': 'R', 'Ꮍ': 'Y',
+	// Lisu
+	'ꓐ': 'B', 'ꓚ': 'C', 'ꓓ': 'D', 'ꓰ': 'E', 'ꓝ': 'F', 'ꓖ': 'G', 'ꓧ': 'H', 'ꓲ': 'I', 'ꓙ': 'J', 'ꓗ': 'K', 'ꓡ': 'L', 'ꓟ': 'M', 'ꓠ': 'N', 'ꓳ': 'O', 'ꓑ': 'P', 'ꓣ': 'R', 'ꓢ': 'S', 'ꓔ': 'T', 'ꓴ': 'U', 'ꓦ': 'V', 'ꓪ': 'W', 'ꓫ': 'X', 'ꓬ': 'Y', 'ꓜ': 'Z', 'ꓮ': 'A',
+	// Armenian
+	'Օ': 'O', 'Տ': 'S',
+	// Digits swapped for letters
+	'0': 'O', '1': 'I', '3': 'E', '4': 'A', '5': 'S', '7': 'T', '8': 'B',
 }
 
 // invisibleLetters are runes Unicode classes as letters (Lo) but that render
@@ -227,6 +245,10 @@ var invisibleLetters = map[rune]bool{0x115F: true, 0x1160: true, 0x3164: true, 0
 func canonicalLine(line string) string {
 	var b strings.Builder
 	for _, r := range norm.NFKC.String(line) {
+		if folded, ok := homoglyphs[r]; ok {
+			b.WriteRune(folded) // digits and small caps fold before the letter test
+			continue
+		}
 		if !unicode.IsLetter(r) || invisibleLetters[r] {
 			continue
 		}
@@ -395,6 +417,12 @@ func (t *Transformer) buildBody(event *telegraph.NormalizedEvent, promptText str
 	fmt.Fprintf(&b, "Telegraph-Event-Type: %s\n", sanitizeHeaderValue(event.EventType))
 	fmt.Fprintf(&b, "Telegraph-Event-ID: %s\n", sanitizeHeaderValue(event.EventID))
 	fmt.Fprintf(&b, "Telegraph-Timestamp: %s\n", event.Timestamp.UTC().Format(time.RFC3339))
+	// Per-message boundary nonce: the real trust delimiters below carry it, so
+	// external text cannot forge them no matter how it is encoded. Readers
+	// treat a delimiter-looking line as a delimiter only if it carries the
+	// nonce from this header.
+	boundary := newBoundary()
+	fmt.Fprintf(&b, "Telegraph-Boundary: %s\n", boundary)
 	fmt.Fprintf(&b, "Telegraph-Actor: %s\n", sanitizeHeaderValue(event.Actor))
 	fmt.Fprintf(&b, "Telegraph-Subject: %s\n", sanitizeHeaderValue(event.Subject))
 	if event.CanonicalURL != "" {
@@ -419,13 +447,13 @@ func (t *Transformer) buildBody(event *telegraph.NormalizedEvent, promptText str
 	// Operator prompt block — emitted only when a prompt resolved.
 	// Sits between metadata headers and external content.
 	if promptText != "" {
-		fmt.Fprintf(&b, "\n--- OPERATOR PROMPT (trusted) ---\n%s\n--- END OPERATOR PROMPT ---", promptText)
+		fmt.Fprintf(&b, "\n--- OPERATOR PROMPT (trusted) %s ---\n%s\n--- END OPERATOR PROMPT %s ---", boundary, promptText, boundary)
 	}
 
-	// External content block with explicit trust delimiter.
+	// External content block with explicit trust delimiter (nonce-bearing).
 	// Provider and Actor are sanitized to prevent delimiter spoofing.
-	fmt.Fprintf(&b, "\n--- EXTERNAL CONTENT (untrusted: %s/%s) ---\n",
-		sanitizeHeaderValue(event.Provider), sanitizeHeaderValue(event.Actor))
+	fmt.Fprintf(&b, "\n--- EXTERNAL CONTENT (untrusted: %s/%s) %s ---\n",
+		sanitizeHeaderValue(event.Provider), sanitizeHeaderValue(event.Actor), boundary)
 
 	text := neutralizeDelimiters(event.Text)
 	if t.bodyCap > 0 && len(text) > t.bodyCap {
@@ -433,7 +461,19 @@ func (t *Transformer) buildBody(event *telegraph.NormalizedEvent, promptText str
 	}
 	b.WriteString(text)
 
-	b.WriteString("\n--- END EXTERNAL CONTENT ---\n")
+	fmt.Fprintf(&b, "\n--- END EXTERNAL CONTENT %s ---\n", boundary)
 
 	return b.String()
+}
+
+// newBoundary returns the per-message delimiter nonce: 16 hex characters from
+// crypto/rand. It is unguessable by the webhook author, so a forged delimiter
+// can never carry it. Falls back to a time-derived value only if the system
+// random source fails, which still defeats pre-computed forgeries.
+func newBoundary() string {
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return fmt.Sprintf("%016x", uint64(time.Now().UnixNano()))
+	}
+	return hex.EncodeToString(buf[:])
 }

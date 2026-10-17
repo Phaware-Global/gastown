@@ -326,10 +326,10 @@ func TestIntegration_MailBody_ExternalContentDelimiters(t *testing.T) {
 	msgs := p.waitMessages(t, 1, 2*time.Second)
 	mb := msgs[0].Body
 
-	if !strings.Contains(mb, "--- EXTERNAL CONTENT (untrusted: jira/carol) ---") {
+	if !strings.Contains(mb, "--- EXTERNAL CONTENT (untrusted: jira/carol) ") {
 		t.Errorf("missing opening delimiter\nbody:\n%s", mb)
 	}
-	if !strings.Contains(mb, "--- END EXTERNAL CONTENT ---") {
+	if !strings.Contains(mb, "--- END EXTERNAL CONTENT ") {
 		t.Errorf("missing closing delimiter\nbody:\n%s", mb)
 	}
 	if !strings.Contains(mb, "The actual description content") {
@@ -856,7 +856,7 @@ func TestIntegration_GitHub_PRMerged_DeliveredToMayor(t *testing.T) {
 	if !strings.Contains(msg.Body, "Telegraph-Provider: github") {
 		t.Errorf("body missing provider header:\n%s", msg.Body)
 	}
-	if !strings.Contains(msg.Body, "--- EXTERNAL CONTENT (untrusted: github/alice) ---") {
+	if !strings.Contains(msg.Body, "--- EXTERNAL CONTENT (untrusted: github/alice) ") {
 		t.Errorf("body missing external content delimiter:\n%s", msg.Body)
 	}
 }
