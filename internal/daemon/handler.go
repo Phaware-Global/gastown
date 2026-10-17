@@ -263,6 +263,14 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 		router.SetStores(stores)
 	}
 
+	// Town settings feed cooldown gates that name a setting (duration_setting).
+	// A load failure degrades to each gate's static duration.
+	townSettings, err := config.LoadOrCreateTownSettings(config.TownSettingsPath(d.config.TownRoot))
+	if err != nil {
+		d.logger.Printf("Handler: could not load town settings for plugin gates: %v", err)
+		townSettings = nil
+	}
+
 	for _, p := range plugins {
 		// Never auto-dispatch manual-gate plugins — they require an explicit trigger.
 		if p.Gate != nil && p.Gate.Type == plugin.GateManual {
@@ -276,8 +284,8 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 		}
 
 		// Evaluate cooldown: skip if plugin ran recently.
-		if p.Gate.Duration != "" {
-			count, err := recorder.CountRunsSince(p.Name, p.Gate.Duration)
+		if cooldown := p.Gate.CooldownDuration(townSettings); cooldown != "" {
+			count, err := recorder.CountRunsSince(p.Name, cooldown)
 			if err != nil {
 				d.logger.Printf("Handler: error checking cooldown for plugin %s: %v", p.Name, err)
 				continue

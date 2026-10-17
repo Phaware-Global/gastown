@@ -347,6 +347,9 @@ func outputPluginShowText(p *plugin.Plugin) error {
 		if p.Gate.Duration != "" {
 			fmt.Printf("  Duration: %s\n", p.Gate.Duration)
 		}
+		if p.Gate.DurationSetting != "" {
+			fmt.Printf("  Duration setting: %s (town settings override duration)\n", p.Gate.DurationSetting)
+		}
 		if p.Gate.Schedule != "" {
 			fmt.Printf("  Schedule: %s\n", p.Gate.Schedule)
 		}
@@ -427,10 +430,8 @@ func runPluginRun(cmd *cobra.Command, args []string) error {
 	gateReason := ""
 	if p.Gate != nil && p.Gate.Type == plugin.GateCooldown && !pluginRunForce {
 		recorder := plugin.NewRecorder(townRoot)
-		duration := p.Gate.Duration
-		if duration == "" {
-			duration = "1h" // default
-		}
+		townSettings, _ := config.LoadOrCreateTownSettings(config.TownSettingsPath(townRoot))
+		duration := p.Gate.CooldownDuration(townSettings)
 		count, err := recorder.CountRunsSince(p.Name, duration)
 		if err != nil {
 			// Log warning but continue
