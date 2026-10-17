@@ -45,8 +45,8 @@ restarted while sessions are active; sessions pick up the new binary on their
 next cycle.
 
 On macOS hosts where `gt` holds privacy grants (Full Disk Access, Removable
-Volumes), put a keychain code-signing identity name (for example `gt-local`)
-on the first line of `$TOWN_ROOT/settings/gt-codesign-identity`. `run.sh`
+Volumes), put a keychain code-signing identity (its name, for example `gt-local`,
+or its SHA-1 hash) on the first line of `$TOWN_ROOT/settings/gt-codesign-identity`. `run.sh`
 passes it to `make safe-install` for the origin/main build only, so the
 installed binary keeps a stable designated requirement and the grants survive
 rebuilds. Do not export `GT_CODESIGN_IDENTITY` in the shared agent

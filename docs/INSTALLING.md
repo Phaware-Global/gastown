@@ -340,10 +340,12 @@ invalidates the grants and makes tccd re-hash the binary on every gt call.
 
    The first signed run shows a keychain dialog asking whether `codesign` may
    use the key. Choose **Always Allow**, or unattended rebuilds will block on
-   that dialog. Equivalent, without the dialog:
+   that dialog. Equivalent, without the dialog (it prompts for the login
+   password; do not pass it with `-k`, which exposes it in `ps` and history,
+   and `-l` limits the change to this one key):
 
    ```bash
-   security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k <login password> ~/Library/Keychains/login.keychain-db
+   security set-key-partition-list -S apple-tool:,apple:,codesign: -s -l gt-local ~/Library/Keychains/login.keychain-db
    ```
 
 3. Remove and re-add `gt` under Full Disk Access, and approve the Removable
@@ -354,11 +356,14 @@ session is fine), not a bare ssh session. If signing fails, the existing
 install is left untouched and `make` exits non-zero.
 
 Do not export `GT_CODESIGN_IDENTITY` in a shell profile or shared agent
-environment. Anything able to use the key can produce a `gt` that silently
-inherits gt's privacy grants, so limit signing to deliberate installs and to
-the rebuild-gt plugin, which reads the identity from
-`$TOWN_ROOT/settings/gt-codesign-identity` for its origin/main build only
-(see plugins/rebuild-gt/plugin.md).
+environment. Keeping it out of the environment prevents unrelated builds
+(a polecat worktree, a `go test`) from signing by accident; the rebuild-gt
+plugin reads the identity from `$TOWN_ROOT/settings/gt-codesign-identity`
+for its origin/main build only (see plugins/rebuild-gt/plugin.md). It is not
+an access boundary: once the key allows `codesign` without a prompt, any
+process running as this user can sign a binary that inherits gt's privacy
+grants. Grant Full Disk Access to `gt` only on hosts where that is
+acceptable.
 
 If you maintain Beads separately from Homebrew, update `bd` from its own source:
 

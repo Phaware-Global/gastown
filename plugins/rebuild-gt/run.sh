@@ -41,7 +41,16 @@ SKIP_ESCALATE_THRESHOLD=3
 CODESIGN_IDENTITY_FILE="${TOWN_ROOT}/settings/gt-codesign-identity"
 GT_CODESIGN_IDENTITY=""
 if [ -r "$CODESIGN_IDENTITY_FILE" ]; then
-  GT_CODESIGN_IDENTITY=$(head -n 1 "$CODESIGN_IDENTITY_FILE" | tr -d '[:space:]')
+  # First line, trimmed at the ends only: identity names may contain spaces
+  # ("gt local", "Apple Development: Name (TEAMID)"). A SHA-1 hash also works.
+  IFS= read -r GT_CODESIGN_IDENTITY < "$CODESIGN_IDENTITY_FILE" || true
+  GT_CODESIGN_IDENTITY=$(printf '%s' "$GT_CODESIGN_IDENTITY" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  # The value lands inside a make recipe; refuse anything outside a safe charset.
+  if ! printf '%s' "$GT_CODESIGN_IDENTITY" | grep -Eq '^[A-Za-z0-9 ._:()-]+$'; then
+    log "FAILED: $CODESIGN_IDENTITY_FILE holds an identity with unsupported characters; use the certificate name or its SHA-1 hash"
+    record_run "Plugin: rebuild-gt [failure]" "failure" "invalid code-signing identity in $CODESIGN_IDENTITY_FILE"
+    exit 1
+  fi
 fi
 
 log() { echo "[rebuild-gt] $*"; }
