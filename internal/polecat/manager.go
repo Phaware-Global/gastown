@@ -1199,6 +1199,8 @@ func (e *WorkAtRiskError) Unwrap() error {
 // known to list them from. It works for a branch that was never pushed (no
 // origin/<branch> to range against) and single-quotes the polecat-controlled
 // branch name and paths so pasting it cannot run anything embedded in them.
+// A named branch is passed fully qualified, so a name beginning with '-' can
+// never be read by git as an option.
 func (e *WorkAtRiskError) RecoveryCommand() string {
 	dir, ref := e.ClonePath, e.Branch
 	switch ref {
@@ -1210,6 +1212,8 @@ func (e *WorkAtRiskError) RecoveryCommand() string {
 		ref = "HEAD"
 	case "(unknown)":
 		return ""
+	default:
+		ref = "refs/heads/" + ref
 	}
 	if e.RepoPath != "" {
 		dir = e.RepoPath
@@ -1593,7 +1597,12 @@ func (m *Manager) missingWorktreeRisk(name, clonePath string, force, discard boo
 		style.PrintWarning("discarding %d unpushed commit(s) on branch %s (%s) at the operator's explicit request", unpushed, branch, reason)
 		return nil
 	}
-	return &WorkAtRiskError{Polecat: name, Branch: branch, ClonePath: clonePath, RepoPath: repoGit.WorkDir(), Unpushed: unpushed, Reason: reason}
+	// The shared bare repo has no work dir; it is the repo's own git dir.
+	repoPath := repoGit.WorkDir()
+	if repoPath == "" {
+		repoPath = filepath.Join(m.rig.Path, ".repo.git")
+	}
+	return &WorkAtRiskError{Polecat: name, Branch: branch, ClonePath: clonePath, RepoPath: repoPath, Unpushed: unpushed, Reason: reason}
 }
 
 // resolveMissingPath resolves symlinks in the nearest existing ancestor of

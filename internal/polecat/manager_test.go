@@ -1754,7 +1754,7 @@ func TestWorkAtRiskError_RecoveryHint(t *testing.T) {
 
 	evil := &WorkAtRiskError{Polecat: "p", Branch: "polecat/x;touch${IFS}pwned", ClonePath: "/tmp/it's", Unpushed: 1, Reason: "r"}
 	cmd := evil.RecoveryCommand()
-	if !strings.Contains(cmd, `'polecat/x;touch${IFS}pwned'`) || !strings.Contains(cmd, `'/tmp/it'\''s'`) {
+	if !strings.Contains(cmd, `'refs/heads/polecat/x;touch${IFS}pwned'`) || !strings.Contains(cmd, `'/tmp/it'\''s'`) {
 		t.Errorf("branch and path must be single-quoted in %q", cmd)
 	}
 }
@@ -3664,9 +3664,14 @@ func TestRemoveWith_MissingWorktreeOnBareRepoHintRunsInTheBareRepo(t *testing.T)
 	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
 	bare := filepath.Join(mgr.rig.Path, ".repo.git")
 	for _, args := range [][]string{
+		// Auto-gc and maintenance detach and write into the repos while t.TempDir
+		// is being removed, which fails the cleanup.
+		{"-C", mayorRig, "config", "gc.auto", "0"},
+		{"-C", mayorRig, "config", "maintenance.auto", "false"},
 		{"clone", "--bare", mayorRig, bare},
 		{"-C", bare, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"},
 		{"-C", bare, "config", "gc.auto", "0"},
+		{"-C", bare, "config", "maintenance.auto", "false"},
 		{"-C", bare, "fetch", "origin"},
 	} {
 		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
