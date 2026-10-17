@@ -427,6 +427,9 @@ func buildRefineryPatrolVars(ctx RoleContext) []string {
 			vars = append(vars, fmt.Sprintf("merge_strategy=%s", mq.MergeStrategy))
 		}
 		vars = append(vars, fmt.Sprintf("require_review=%t", mq.IsRequireReviewEnabled()))
+		if mq.PRUpdateStrategy != "" {
+			vars = append(vars, fmt.Sprintf("pr_update_strategy=%s", mq.GetPRUpdateStrategy()))
+		}
 		return vars
 	}
 
@@ -444,7 +447,7 @@ func buildRefineryPatrolVars(ctx RoleContext) []string {
 					labelMap[label[:idx]] = label[idx+1:]
 				}
 			}
-			for _, key := range []string{"integration_branch_refinery_enabled", "integration_branch_auto_land", "run_tests", "delete_merged_branches", "setup_command", "typecheck_command", "lint_command", "test_command", "build_command", "merge_strategy", "require_review"} {
+			for _, key := range []string{"integration_branch_refinery_enabled", "integration_branch_auto_land", "run_tests", "delete_merged_branches", "setup_command", "typecheck_command", "lint_command", "test_command", "build_command", "merge_strategy", "require_review", "pr_update_strategy"} {
 				if val := labelMap[key]; val != "" {
 					vars = append(vars, fmt.Sprintf("%s=%s", key, val))
 				}

@@ -554,3 +554,62 @@ func TestRefineryPatrolHasMergeStrategyVar(t *testing.T) {
 		t.Error("mol-refinery-patrol must declare a require_review variable (kept for backward compatibility with Phase 1 rigs)")
 	}
 }
+
+// TestRefineryPatrolBranchUpdateGoesThroughCode pins that every formula path
+// that updates or publishes a work branch calls the strategy-aware commands
+// rather than raw git. A directive in prose is not a control: the refinery has
+// rebased and force-pushed approved PR branches while told not to, so the
+// instructions themselves must not teach the raw commands.
+func TestRefineryPatrolBranchUpdateGoesThroughCode(t *testing.T) {
+	data, err := formulasFS.ReadFile("formulas/mol-refinery-patrol.formula.toml")
+	if err != nil {
+		t.Fatalf("reading formula: %v", err)
+	}
+	f, err := Parse(data)
+	if err != nil {
+		t.Fatalf("parsing formula: %v", err)
+	}
+	if _, ok := f.Vars["pr_update_strategy"]; !ok {
+		t.Error("formula must declare the pr_update_strategy var")
+	} else if got := f.Vars["pr_update_strategy"].Default; got != "rebase" {
+		t.Errorf("pr_update_strategy default = %q, want rebase (unchanged behaviour for rigs that do not set it)", got)
+	}
+
+	desc := func(id string) string {
+		t.Helper()
+		for i := range f.Steps {
+			if f.Steps[i].ID == id {
+				return f.Steps[i].Description
+			}
+		}
+		t.Fatalf("step %q not found", id)
+		return ""
+	}
+
+	process := desc("process-branch")
+	for _, want := range []string{
+		"gt refinery pr sync-branch", "pr_update_strategy",
+	} {
+		if !strings.Contains(process, want) && !strings.Contains(process, strings.Replace(want, "gt ", "{{ cmd }} ", 1)) {
+			t.Errorf("process-branch missing %q", want)
+		}
+	}
+	// The raw commands the refinery used to be taught.
+	for _, banned := range []string{
+		"git rebase origin/<rebase-target>\n```",
+		"git push -f origin",
+		"Force push: git push -f",
+	} {
+		if strings.Contains(process, banned) {
+			t.Errorf("process-branch still teaches raw %q", banned)
+		}
+	}
+
+	merge := desc("merge-push")
+	if !strings.Contains(merge, "refinery pr push-branch") {
+		t.Error("merge-push PR.1 must publish via push-branch")
+	}
+	if strings.Contains(merge, "git push origin temp:refs/heads/<polecat-branch> --force-with-lease") {
+		t.Error("merge-push PR.1 still force-pushes with raw git")
+	}
+}

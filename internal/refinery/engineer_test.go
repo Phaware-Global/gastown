@@ -300,6 +300,47 @@ func TestEngineer_LoadConfig_RejectsSameApproverAndReviewer(t *testing.T) {
 	}
 }
 
+func TestEngineer_LoadConfig_PRUpdateStrategy(t *testing.T) {
+	load := func(t *testing.T, mq map[string]interface{}) (*Engineer, error) {
+		t.Helper()
+		dir := t.TempDir()
+		cfg := map[string]interface{}{"type": "rig", "version": 1, "name": "test-rig", "merge_queue": mq}
+		data, _ := json.MarshalIndent(cfg, "", "  ")
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), data, 0644); err != nil {
+			t.Fatal(err)
+		}
+		e := NewEngineer(&rig.Rig{Name: "test-rig", Path: dir})
+		return e, e.LoadConfig()
+	}
+
+	t.Run("unset defaults to rebase", func(t *testing.T) {
+		e, err := load(t, map[string]interface{}{"enabled": true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := e.Config().GetPRUpdateStrategy(); got != "rebase" {
+			t.Errorf("default = %q, want rebase", got)
+		}
+	})
+	for _, want := range []string{"rebase", "merge", "none"} {
+		t.Run("reads "+want, func(t *testing.T) {
+			e, err := load(t, map[string]interface{}{"pr_update_strategy": want})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := e.Config().GetPRUpdateStrategy(); got != want {
+				t.Errorf("got %q, want %q", got, want)
+			}
+		})
+	}
+	t.Run("rejects invalid", func(t *testing.T) {
+		_, err := load(t, map[string]interface{}{"pr_update_strategy": "force"})
+		if err == nil || !strings.Contains(err.Error(), "pr_update_strategy") {
+			t.Fatalf("want error naming pr_update_strategy, got %v", err)
+		}
+	})
+}
+
 // TestEngineer_LoadConfig_AllowsDistinctApproverAndReviewer is the
 // non-regression companion: a legitimately distinct approver/reviewer pair
 // must still load cleanly through the same runtime path.
