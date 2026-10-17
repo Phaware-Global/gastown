@@ -22,6 +22,7 @@ import (
 
 	"github.com/gofrs/flock"
 	beadsdk "github.com/steveyegge/beads"
+	"github.com/steveyegge/gastown/internal/assistant"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/boot"
 	agentconfig "github.com/steveyegge/gastown/internal/config"
@@ -187,6 +188,9 @@ type Daemon struct {
 	// triggers a zombie restart, debouncing transient gaps during handoffs.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	mayorZombieCount int
+
+	// assistantZombieCount is the Mayor's Assistant counterpart of mayorZombieCount.
+	assistantZombieCount int
 
 	// rigPool runs per-rig heartbeat operations (witness checks, refinery checks,
 	// polecat health, idle reaping, branch pruning) with bounded concurrency and
@@ -1085,6 +1089,9 @@ func (d *Daemon) heartbeat(state *State) {
 
 	// 6. Ensure Mayor is running (restart if dead)
 	d.ensureMayorRunning()
+
+	// 6.1. Ensure the Mayor's Assistant is running (restart if dead)
+	d.ensureMayorsAssistantRunning()
 
 	// 6.5. Handle Dog lifecycle: cleanup stuck dogs and dispatch plugins
 	// Pressure-gated: dog dispatch spawns new agent sessions.
@@ -2185,6 +2192,43 @@ func (d *Daemon) ensureMayorRunning() {
 
 	d.mayorZombieCount = 0
 	d.logger.Println("Mayor started successfully")
+}
+
+// ensureMayorsAssistantRunning ensures the Mayor's Assistant is running,
+// with the same zombie-debounce as ensureMayorRunning.
+func (d *Daemon) ensureMayorsAssistantRunning() {
+	mgr := assistant.NewManager(d.config.TownRoot)
+
+	if err := mgr.Start(""); err != nil {
+		if err == assistant.ErrAlreadyRunning {
+			if !tmux.NewTmux().IsAgentAlive(mgr.SessionName()) {
+				d.assistantZombieCount++
+				if d.assistantZombieCount >= 3 {
+					d.logger.Printf("Mayor's Assistant zombie detected (%d cycles), restarting", d.assistantZombieCount)
+					if stopErr := mgr.Stop(); stopErr != nil && stopErr != assistant.ErrNotRunning {
+						d.logger.Printf("Error stopping zombie Mayor's Assistant: %v", stopErr)
+						return
+					}
+					d.assistantZombieCount = 0
+					if startErr := mgr.Start(""); startErr != nil {
+						d.logger.Printf("Error restarting Mayor's Assistant after zombie cleanup: %v", startErr)
+						return
+					}
+					d.logger.Println("Mayor's Assistant restarted after zombie cleanup")
+				} else {
+					d.logger.Printf("Mayor's Assistant agent not detected (cycle %d/3), waiting before restart", d.assistantZombieCount)
+				}
+			} else {
+				d.assistantZombieCount = 0
+			}
+			return
+		}
+		d.logger.Printf("Error starting Mayor's Assistant: %v", err)
+		return
+	}
+
+	d.assistantZombieCount = 0
+	d.logger.Println("Mayor's Assistant started successfully")
 }
 
 // isMayorAgentAlive checks if the Mayor's agent process is running in tmux.

@@ -22,6 +22,7 @@ type TownSession struct {
 func TownSessions() []TownSession {
 	return []TownSession{
 		{"Mayor", MayorSessionName()},
+		{"Mayor's Assistant", MayorsAssistantSessionName()},
 		{"Boot", BootSessionName()},
 		{"Deacon", DeaconSessionName()},
 	}

@@ -239,6 +239,12 @@ const (
 	// RoleMayor is the mayor agent role.
 	RoleMayor = "mayor"
 
+	// RoleMayorsAssistant is the mayor's assistant role: a town-level singleton
+	// that triages inbound mail/telegraph/escalations and briefs the Mayor.
+	// NOTE: the name contains a hyphen and shares the "mayor" prefix. Code that
+	// splits agent IDs on "-" or prefix-matches "mayor" must special-case it.
+	RoleMayorsAssistant = "mayors-assistant"
+
 	// RoleWitness is the witness agent role.
 	RoleWitness = "witness"
 
@@ -266,6 +272,9 @@ const (
 const (
 	// EmojiMayor is the mayor emoji (fox conductor).
 	EmojiMayor = "🎩"
+
+	// EmojiMayorsAssistant is the mayor's assistant emoji (inbox tray).
+	EmojiMayorsAssistant = "📨"
 
 	// EmojiDeacon is the deacon emoji (wolf in the engine room).
 	EmojiDeacon = "🐺"
@@ -337,6 +346,8 @@ func RoleEmoji(role string) string {
 	switch role {
 	case RoleMayor:
 		return EmojiMayor
+	case RoleMayorsAssistant:
+		return EmojiMayorsAssistant
 	case RoleDeacon:
 		return EmojiDeacon
 	case RoleWitness:

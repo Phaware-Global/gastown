@@ -17,6 +17,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/state"
 	"github.com/steveyegge/gastown/internal/style"
@@ -51,16 +52,18 @@ var primeHandoffReason string
 type Role string
 
 const (
-	RoleMayor    Role = "mayor"
-	RoleDeacon   Role = "deacon"
-	RoleBoot     Role = "boot"
-	RoleWitness  Role = "witness"
-	RoleRefinery Role = "refinery"
-	RolePolecat  Role = "polecat"
-	RoleCrew     Role = "crew"
-	RoleReviewer Role = "reviewer"
-	RoleDog      Role = "dog"
-	RoleUnknown  Role = "unknown"
+	RoleMayor Role = "mayor"
+	// RoleMayorsAssistant is the Mayor's inbound-triage assistant (town-level).
+	RoleMayorsAssistant Role = "mayors-assistant"
+	RoleDeacon          Role = "deacon"
+	RoleBoot            Role = "boot"
+	RoleWitness         Role = "witness"
+	RoleRefinery        Role = "refinery"
+	RolePolecat         Role = "polecat"
+	RoleCrew            Role = "crew"
+	RoleReviewer        Role = "reviewer"
+	RoleDog             Role = "dog"
+	RoleUnknown         Role = "unknown"
 )
 
 var primeCmd = &cobra.Command{
@@ -1097,6 +1100,8 @@ func buildRoleAnnouncement(ctx RoleContext) string {
 	switch ctx.Role {
 	case RoleMayor:
 		return "Mayor, checking in."
+	case RoleMayorsAssistant:
+		return "Mayor's Assistant, checking in."
 	case RoleDeacon:
 		return "Deacon, checking in."
 	case RoleBoot:
@@ -1133,6 +1138,8 @@ func getAgentIdentity(ctx RoleContext) string {
 		return fmt.Sprintf("%s/polecats/%s", ctx.Rig, ctx.Polecat)
 	case RoleMayor:
 		return "mayor"
+	case RoleMayorsAssistant:
+		return constants.RoleMayorsAssistant
 	case RoleDeacon:
 		return "deacon"
 	case RoleBoot:
@@ -1206,6 +1213,8 @@ func getAgentBeadID(ctx RoleContext) string {
 	switch ctx.Role {
 	case RoleMayor:
 		return beads.MayorBeadIDTown()
+	case RoleMayorsAssistant:
+		return beads.MayorsAssistantBeadIDTown()
 	case RoleDeacon:
 		return beads.DeaconBeadIDTown()
 	case RoleBoot:

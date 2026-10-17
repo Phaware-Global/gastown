@@ -182,6 +182,8 @@ func TestAddressToSessionIDs(t *testing.T) {
 		// Town-level addresses - single session
 		{"mayor", []string{"hq-mayor"}},
 		{"mayor/", []string{"hq-mayor"}},
+		{"mayors-assistant", []string{"hq-mayors-assistant"}}, // shares "mayor" prefix; must not map to hq-mayor
+		{"mayors-assistant/", []string{"hq-mayors-assistant"}},
 		{"deacon", []string{"hq-deacon"}},
 
 		// Rig singletons - single session (no crew/polecat ambiguity)
@@ -2239,5 +2241,21 @@ func TestBuildReplyReminderMessage(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestAddressToAgentBeadID_MayorsAssistant guards the prefix-collision fix:
+// "mayors-assistant" starts with "mayor" and used to resolve to the Mayor.
+func TestAddressToAgentBeadID_MayorsAssistant(t *testing.T) {
+	for _, addr := range []string{"mayors-assistant", "mayors-assistant/"} {
+		if got := addressToAgentBeadID(addr); got != "hq-mayors-assistant" {
+			t.Errorf("addressToAgentBeadID(%q) = %q, want hq-mayors-assistant", addr, got)
+		}
+	}
+	if got := addressToAgentBeadID("mayor/"); got != "hq-mayor" {
+		t.Errorf("addressToAgentBeadID(mayor/) = %q, want hq-mayor", got)
+	}
+	if got := agentBeadToAddress(&agentBead{ID: "hq-mayors-assistant"}); got != "mayors-assistant/" {
+		t.Errorf("agentBeadToAddress(hq-mayors-assistant) = %q, want mayors-assistant/", got)
 	}
 }

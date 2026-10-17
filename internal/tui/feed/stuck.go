@@ -288,6 +288,8 @@ func deriveSessionName(rig, role, name string) string {
 	switch role {
 	case constants.RoleMayor:
 		return session.MayorSessionName()
+	case constants.RoleMayorsAssistant:
+		return session.MayorsAssistantSessionName()
 	case constants.RoleDeacon:
 		return session.DeaconSessionName()
 	case constants.RoleWitness:

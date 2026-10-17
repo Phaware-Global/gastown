@@ -137,6 +137,7 @@ func (c *AgentBeadsCheck) Run(ctx *CheckContext) *CheckResult {
 
 	checkAgentBead(deaconID)
 	checkAgentBead(mayorID)
+	checkAgentBead(beads.MayorsAssistantBeadIDTown())
 
 	if len(prefixToRig) == 0 {
 		// No rigs to check, but we still checked global agents
@@ -325,6 +326,13 @@ func (c *AgentBeadsCheck) Fix(ctx *CheckContext) error {
 	if err := fixAgentBead(townBd, townBeadsPath, mayorID,
 		"Mayor - global coordinator, handles cross-rig communication and escalations.",
 		&beads.AgentFields{RoleType: "mayor", AgentState: "idle"},
+	); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := fixAgentBead(townBd, townBeadsPath, beads.MayorsAssistantBeadIDTown(),
+		"Mayor's Assistant - triages inbound mail, telegraph and escalations; briefs the Mayor.",
+		&beads.AgentFields{RoleType: "mayors-assistant", AgentState: "idle"},
 	); err != nil {
 		errs = append(errs, err)
 	}

@@ -97,7 +97,7 @@ func detectRigFromPath(townRoot, absPath string) string {
 	candidateRig := parts[0]
 
 	switch candidateRig {
-	case constants.RoleMayor, constants.RoleDeacon, ".beads", ".claude", ".git", "plugins":
+	case constants.RoleMayor, constants.RoleMayorsAssistant, constants.RoleDeacon, ".beads", ".claude", ".git", "plugins":
 		return ""
 	}
 

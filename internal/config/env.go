@@ -124,6 +124,11 @@ func AgentEnv(cfg AgentEnvConfig) map[string]string {
 		env["BD_ACTOR"] = constants.RoleMayor
 		env["GIT_AUTHOR_NAME"] = constants.RoleMayor
 
+	case constants.RoleMayorsAssistant:
+		env["GT_ROLE"] = constants.RoleMayorsAssistant
+		env["BD_ACTOR"] = constants.RoleMayorsAssistant
+		env["GIT_AUTHOR_NAME"] = constants.RoleMayorsAssistant
+
 	case constants.RoleDeacon:
 		env["GT_ROLE"] = constants.RoleDeacon
 		env["BD_ACTOR"] = constants.RoleDeacon

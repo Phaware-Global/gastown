@@ -102,12 +102,13 @@ var (
 
 	// Role icons - uses centralized emojis from constants package
 	RoleIcons = map[string]string{
-		constants.RoleMayor:    constants.EmojiMayor,
-		constants.RoleWitness:  constants.EmojiWitness,
-		constants.RoleRefinery: constants.EmojiRefinery,
-		constants.RoleCrew:     constants.EmojiCrew,
-		constants.RolePolecat:  constants.EmojiPolecat,
-		constants.RoleDeacon:   constants.EmojiDeacon,
+		constants.RoleMayor:           constants.EmojiMayor,
+		constants.RoleMayorsAssistant: constants.EmojiMayorsAssistant,
+		constants.RoleWitness:         constants.EmojiWitness,
+		constants.RoleRefinery:        constants.EmojiRefinery,
+		constants.RoleCrew:            constants.EmojiCrew,
+		constants.RolePolecat:         constants.EmojiPolecat,
+		constants.RoleDeacon:          constants.EmojiDeacon,
 	}
 
 	// MQ event styles
