@@ -463,3 +463,62 @@ func TestDogFormatTimeAgo_ZeroTime(t *testing.T) {
 		t.Errorf("dogFormatTimeAgo(zero) = %q, want '(unknown)'", got)
 	}
 }
+
+// =============================================================================
+// Work timing in --json output
+// =============================================================================
+
+func fixedDogTimeout(d time.Duration) func(string) time.Duration {
+	return func(string) time.Duration { return d }
+}
+
+func TestDogListJSON_WorkTimingFields(t *testing.T) {
+	loc := time.FixedZone("MDT", -6*3600)
+	started := time.Date(2026, 10, 17, 11, 53, 53, 0, loc)
+	now := started.Add(7 * time.Minute)
+
+	dogs := []*dog.Dog{
+		{Name: "alpha", State: dog.StateWorking, Work: "plugin:stuck-agent-dog", WorkStartedAt: started},
+		{Name: "bravo", State: dog.StateIdle},
+	}
+
+	b, err := json.Marshal(buildDogListItems(dogs, fixedDogTimeout(5*time.Minute), now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got[0]["work_elapsed_seconds"] != 420.0 || got[0]["timeout_seconds"] != 300.0 || got[0]["over_timeout_ratio"] != 1.4 {
+		t.Errorf("working dog timing = %v, want elapsed 420 / timeout 300 / ratio 1.4", got[0])
+	}
+	for _, k := range []string{"work_elapsed_seconds", "timeout_seconds", "over_timeout_ratio"} {
+		if _, ok := got[1][k]; ok {
+			t.Errorf("idle dog should not carry %s: %v", k, got[1])
+		}
+	}
+}
+
+func TestDogStatusJSON_WorkTimingFieldsKeepDogFields(t *testing.T) {
+	started := time.Date(2026, 10, 17, 17, 53, 53, 0, time.UTC)
+	d := &dog.Dog{Name: "alpha", State: dog.StateWorking, Work: "gt-abc", WorkStartedAt: started}
+
+	b, err := json.Marshal(buildDogStatusOutput(d, fixedDogTimeout(dog.DefaultWorkTimeout), started.Add(30*time.Minute)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	// Existing consumers read the Dog's own (untagged) field names.
+	if got["Name"] != "alpha" || got["State"] != "working" || got["WorkStartedAt"] == nil {
+		t.Errorf("dog fields missing from status JSON: %s", b)
+	}
+	if got["work_elapsed_seconds"] != 1800.0 || got["timeout_seconds"] != 600.0 || got["over_timeout_ratio"] != 3.0 {
+		t.Errorf("timing fields wrong: %s", b)
+	}
+}
