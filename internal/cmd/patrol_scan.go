@@ -16,10 +16,11 @@ import (
 )
 
 var (
-	patrolScanJSON    bool
-	patrolScanNotify  bool
-	patrolScanRig     string
-	patrolScanVerbose bool
+	patrolScanJSON      bool
+	patrolScanNotify    bool
+	patrolScanRig       string
+	patrolScanVerbose   bool
+	patrolScanNoRestart bool
 )
 
 var patrolScanCmd = &cobra.Command{
@@ -38,8 +39,13 @@ Detections:
 
 Actions taken automatically:
   - Zombie restart: Sessions are restarted (not nuked) to preserve worktrees
+    (suppressed by --no-restart)
   - Cleanup wisps: Created for dirty state tracking
   - Completion routing: MR cleanup wisps created, refinery nudged
+
+Use --no-restart to enforce a detect-and-flag-only hold: zombies are still
+detected, reported, and notified, but no session is restarted and no
+already-merged polecat is archived. Stall and completion handling are unchanged.
 
 Use --notify to send mail when zombies with active work are detected.
 Long-running scan phases emit progress diagnostics to stderr so JSON stdout
@@ -49,13 +55,15 @@ Examples:
   gt patrol scan                    # Scan current rig
   gt patrol scan --rig gastown      # Scan specific rig
   gt patrol scan --json             # Machine-readable output
-  gt patrol scan --notify           # Send mail on zombie detection`,
+  gt patrol scan --notify           # Send mail on zombie detection
+  gt patrol scan --no-restart       # Detect and report only; never restart`,
 	RunE: runPatrolScan,
 }
 
 func init() {
 	patrolScanCmd.Flags().BoolVar(&patrolScanJSON, "json", false, "Output as JSON")
 	patrolScanCmd.Flags().BoolVar(&patrolScanNotify, "notify", false, "Send mail to witness/mayor when active-work zombies are detected")
+	patrolScanCmd.Flags().BoolVar(&patrolScanNoRestart, "no-restart", false, "Detect and report zombies but never restart their sessions (for detect-only holds)")
 	patrolScanCmd.Flags().StringVar(&patrolScanRig, "rig", "", "Rig to scan (default: infer from cwd or GT_RIG)")
 	patrolScanCmd.Flags().BoolVarP(&patrolScanVerbose, "verbose", "v", false, "Verbose output")
 
@@ -159,7 +167,7 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	// are sent exclusively below via --notify, avoiding double-send.
 	diagnostics := cmd.ErrOrStderr()
 	zombieResult := runPatrolScanPhase(diagnostics, "zombie detection", func() *witness.DetectZombiePolecatsResult {
-		return witness.DetectZombiePolecats(bd, workDir, rigName, router)
+		return witness.DetectZombiePolecatsWithOptions(bd, workDir, rigName, router, witness.DetectZombieOptions{NoRestart: patrolScanNoRestart})
 	})
 	stallResult := runPatrolScanPhase(diagnostics, "stall detection", func() *witness.DetectStalledPolecatsResult {
 		return witness.DetectStalledPolecats(workDir, rigName)
