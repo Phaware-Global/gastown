@@ -44,7 +44,7 @@ We want a single place where the operator can write **per-event-type framing pro
 ## Non-goals
 
 - **Conditional logic / templating engine inside prompts.** Plain string substitution only. If you need branching, write multiple sentences or move the logic into the receiving agent.
-- **Per-recipient prompts.** Telegraph mails go to a single hardcoded mailbox (`mayor/`) regardless of audience; recipient-specific framing is Mayor's job downstream, not Telegraph's.
+- **Per-recipient prompts.** Telegraph mails go to a single hardcoded mailbox (`mayors-assistant/`) regardless of audience; recipient-specific framing is the Mayor's Assistant's job downstream, not Telegraph's.
 - **Per-rig prompts.** Same reason — rig-aware routing is Mayor's responsibility. Mayor can layer rig-specific framing on top when forwarding mail.
 - **Cross-provider inheritance.** No "every comment-ish event in any provider gets this fragment." Prompts are scoped per `<provider>:<event-type>` plus a single global `default`.
 - **Hot reload / SIGHUP.** Defer until operators are actively iterating; v1 requires a Telegraph restart.

@@ -1,6 +1,8 @@
 // Package transform implements Telegraph L3: envelope builder and rate-limited nudge.
 // It is provider-agnostic; it consumes NormalizedEvent from L2 and produces
-// Mayor-addressed mail plus at most one nudge per configured window.
+// mail addressed to the Mayor's Assistant plus at most one nudge per configured
+// window. (Routed to the Mayor's Assistant: the assistant triages inbound
+// events and briefs the Mayor; see docs/design/mayors-assistant-role.md.)
 package transform
 
 import (
@@ -57,16 +59,22 @@ func (n *ExecNudger) Nudge(target, message string) error {
 	return cmd.Run()
 }
 
+// Recipient is the single destination for every Telegraph event: the Mayor's
+// Assistant inbox. Telegraph has no routing logic; the assistant consolidates
+// events and briefs mayor/. The address is a well-known town-level singleton,
+// so mail queues in the town store even when the assistant session is down.
+const Recipient = "mayors-assistant/"
+
 // nudgeCommandArgs builds the `gt nudge` argument vector for telegraph wakeups.
 //
 // Queue mode (not the default wait-idle): telegraph fires one wakeup per inbound
-// webhook event, and its only target — the mayor — is a Claude agent with a
-// UserPromptSubmit turn-boundary drain. Wait-idle would optimistically
-// send-keys-inject each wakeup the instant the mayor looked idle; under the
-// mayor's high event volume those injections pile into its input box during
-// busy windows. Cooperative queueing drains at the next turn boundary instead.
-// The mayor is still woken promptly: each underlying message also arrives as a
-// per-message mail notification delivered by the router.
+// webhook event, and its only target — the assistant — is a Claude agent with a
+// turn-boundary drain. Wait-idle would optimistically send-keys-inject each
+// wakeup the instant the assistant looked idle; under high event volume those
+// injections pile into its input box during busy windows. Cooperative queueing
+// drains at the next turn boundary instead. The assistant is still woken
+// promptly: each underlying message also arrives as a per-message mail
+// notification delivered by the router.
 func nudgeCommandArgs(target, message string) []string {
 	return []string{"nudge", target, "--mode=queue", "-m", message}
 }
@@ -113,9 +121,9 @@ func NewProduction(townRoot string, bodyCap int, nudgeWindow time.Duration, reso
 	return New(router, &ExecNudger{TownRoot: townRoot}, bodyCap, nudgeWindow, resolver, logger)
 }
 
-// Transform builds a Mayor-addressed mail envelope from event, sends it via the
-// configured MailSender, and conditionally nudges Mayor within the rate-limit
-// window. It is safe to call concurrently.
+// Transform builds a mail envelope addressed to the Mayor's Assistant from
+// event, sends it via the configured MailSender, and conditionally nudges the
+// assistant within the rate-limit window. It is safe to call concurrently.
 func (t *Transformer) Transform(event *telegraph.NormalizedEvent) error {
 	var promptText, promptKey string
 	if t.resolver != nil {
@@ -124,7 +132,7 @@ func (t *Transformer) Transform(event *telegraph.NormalizedEvent) error {
 
 	msg := mail.NewMessage(
 		buildFrom(event),
-		"mayor/",
+		Recipient,
 		buildSubject(event),
 		t.buildBody(event, promptText),
 	)
@@ -140,7 +148,7 @@ func (t *Transformer) Transform(event *telegraph.NormalizedEvent) error {
 	return nil
 }
 
-// maybeNudge sends a nudge to Mayor if the rate-limit window has elapsed.
+// maybeNudge sends a nudge to the assistant if the rate-limit window has elapsed.
 // event is used for logging context only.
 func (t *Transformer) maybeNudge(_ *telegraph.NormalizedEvent) {
 	if t.nudgeWindow <= 0 || t.nudger == nil {
@@ -157,8 +165,9 @@ func (t *Transformer) maybeNudge(_ *telegraph.NormalizedEvent) {
 	t.lastNudge = now
 	t.mu.Unlock()
 
-	// Nudge failure is non-fatal: Mayor will discover mail on next inbox check.
-	_ = t.nudger.Nudge("mayor/", "Telegraph: new events pending")
+	// Nudge failure is non-fatal (e.g. assistant session not running): the
+	// mail is already queued and is discovered on the next inbox check.
+	_ = t.nudger.Nudge(Recipient, "Telegraph: new events pending")
 	t.log.NudgeSent()
 }
 

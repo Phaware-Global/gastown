@@ -3003,7 +3003,8 @@ func LoadEscalationConfig(path string) (*EscalationConfig, error) {
 
 // stripSlackRoutes removes the "slack" action from every route when
 // slack_overseer_only is in effect, so gt escalate never posts to Slack on
-// its own. Any route that loses a slack action keeps (or gains) mail:mayor. Returns the severities that had a slack action stripped, in
+// its own. Any route that loses a slack action keeps its existing mayor/assistant mail
+// route or gains mail:mayors-assistant. Returns the severities that had a slack action stripped, in
 // ValidSeverities order, so the caller can warn the operator once per route.
 func stripSlackRoutes(c *EscalationConfig) []string {
 	if !c.IsSlackOverseerOnly() {
@@ -3024,10 +3025,12 @@ func stripSlackRoutes(c *EscalationConfig) []string {
 		}
 		if len(kept) != len(actions) {
 			// A suppressed Slack route must degrade to the gatekeeper, not to
-			// silence: the mayor is now the only path to Slack, so make sure
-			// the escalation reaches the mayor's mailbox.
-			if !slices.Contains(kept, "mail:mayor") {
-				kept = append(kept, "mail:mayor")
+			// silence: the mayor is the only path to Slack, so make sure the
+			// escalation reaches the mayor — via the assistant's triage inbox
+			// (Routed to the Mayor's Assistant) unless the operator already
+			// routes it to mayor/ directly.
+			if !slices.Contains(kept, "mail:mayor") && !slices.Contains(kept, "mail:"+constants.RoleMayorsAssistant) {
+				kept = append(kept, "mail:"+constants.RoleMayorsAssistant)
 			}
 			c.Routes[severity] = kept
 			stripped = append(stripped, severity)
@@ -3120,13 +3123,13 @@ func (c *EscalationConfig) GetStaleThreshold() time.Duration {
 }
 
 // GetRouteForSeverity returns the escalation route actions for a given severity.
-// Falls back to ["bead", "mail:mayor"] if no specific route is configured.
+// Falls back to ["bead", "mail:mayors-assistant"] if no specific route is configured.
 func (c *EscalationConfig) GetRouteForSeverity(severity string) []string {
 	if route, ok := c.Routes[severity]; ok {
 		return route
 	}
-	// Fallback to default route
-	return []string{"bead", "mail:mayor"}
+	// Fallback to default route (Routed to the Mayor's Assistant)
+	return []string{"bead", "mail:" + constants.RoleMayorsAssistant}
 }
 
 // GetMaxReescalations returns the maximum number of re-escalations allowed.
