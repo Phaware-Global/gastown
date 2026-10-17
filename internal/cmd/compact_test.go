@@ -1,12 +1,15 @@
 package cmd
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/reaper"
 )
 
 func TestGetTTL(t *testing.T) {
@@ -303,70 +306,178 @@ func compactSourceBetween(t *testing.T, source, startMarker, endMarker string) s
 	return source[start : start+end]
 }
 
-// fakeWispSQL answers the five listWispsWith queries from canned rows, keyed
-// by the table each query reads. Any bd subcommand other than `sql --json`
-// (notably `list`, which never returns wisps) yields an empty array, as the
-// real bd does.
-func fakeWispSQL(wisps, labels, agents, comments, parents string) wispSQLRunner {
-	return func(args ...string) ([]byte, error) {
-		if len(args) != 3 || args[0] != "sql" || args[1] != "--json" {
-			return []byte("[]"), nil
-		}
-		q := args[2]
+// fakeBD stands in for the bd CLI. It answers the scan's `bd sql` queries
+// from canned rows and records every other call, so tests can assert exactly
+// which writes a run issued.
+type fakeBD struct {
+	wisps    string   // rows for the main scan
+	labels   string   // rows for wisp_labels
+	comments string   // rows for wisp_comments
+	count    string   // rows for the blind-scan count
+	tables   []string // SHOW TABLES; nil means the full wisp schema
+	columns  string   // SHOW COLUMNS FROM wisp_dependencies; "" means the full set
+
+	// failWrite, if set, is consulted for every write; a non-nil error fails it.
+	failWrite func(args []string) error
+
+	queries []string   // every `bd sql --json` query
+	writes  [][]string // every call that is not a bd sql read
+}
+
+func newFakeBD(wisps string) *fakeBD {
+	return &fakeBD{wisps: wisps, labels: "[]", comments: "[]", count: `[{"n":0}]`}
+}
+
+func (f *fakeBD) run(args ...string) ([]byte, error) {
+	if len(args) >= 3 && args[0] == "sql" && args[1] == "--csv" {
 		switch {
-		case strings.Contains(q, "FROM wisp_labels"):
-			return []byte(labels), nil
-		case strings.Contains(q, "FROM labels"):
-			return []byte(agents), nil
-		case strings.Contains(q, "FROM wisp_comments"):
-			return []byte(comments), nil
-		case strings.Contains(q, "FROM wisp_dependencies"):
-			return []byte(parents), nil
-		case strings.Contains(q, "FROM wisps"):
-			return []byte(wisps), nil
+		case args[2] == "SHOW TABLES":
+			tables := f.tables
+			if tables == nil {
+				tables = requiredWispTables
+			}
+			return []byte("Tables_in_test\n" + strings.Join(tables, "\n") + "\n"), nil
+		case strings.HasPrefix(args[2], "SHOW COLUMNS"):
+			if f.columns != "" {
+				return []byte(f.columns), nil
+			}
+			return []byte("Field,Type\nissue_id,varchar\ndepends_on_wisp_id,varchar\ndepends_on_issue_id,varchar\ndepends_on_external,varchar\n"), nil
+		}
+	}
+	if len(args) >= 3 && args[0] == "sql" && args[1] == "--json" {
+		q := args[2]
+		f.queries = append(f.queries, q)
+		switch {
+		case strings.HasPrefix(q, "SELECT COUNT(*) AS n"):
+			return []byte(f.count), nil
+		case strings.HasPrefix(q, "SELECT w.id AS id"):
+			return []byte(f.wisps), nil
+		case strings.HasPrefix(q, "SELECT issue_id, label FROM wisp_labels"):
+			return []byte(f.labels), nil
+		case strings.HasPrefix(q, "SELECT issue_id, COUNT(*)"):
+			return []byte(f.comments), nil
 		}
 		return nil, os.ErrInvalid
 	}
+	if len(args) >= 2 && args[0] == "sql" {
+		return []byte("OK, 0 rows affected"), nil
+	}
+	f.writes = append(f.writes, args)
+	if f.failWrite != nil {
+		if err := f.failWrite(args); err != nil {
+			return nil, err
+		}
+	}
+	return nil, nil
 }
 
+// writesOf returns the recorded writes whose bd subcommand is verb.
+func (f *fakeBD) writesOf(verb string) [][]string {
+	var out [][]string
+	for _, w := range f.writes {
+		if w[0] == verb {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+func wispRow(id, status, updated string, extra string) string {
+	return `{"id":"` + id + `","title":"t ` + id + `","status":"` + status + `","issue_type":"task","wisp_type":"",` +
+		`"created_at":"` + updated + `","updated_at":"` + updated + `"` + extra + `}`
+}
+
+// manyWispRows returns n wisps, ids <prefix>0000.. in ascending age order
+// (oldest first), all long past any default TTL.
+func manyWispRows(prefix, status string, n int) string {
+	rows := make([]string, n)
+	for i := range rows {
+		rows[i] = wispRow(fmt.Sprintf("%s%04d", prefix, i), status, "2026-01-01T00:00:00Z", "")
+	}
+	return "[" + strings.Join(rows, ",") + "]"
+}
+
+var compactTestNow = time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+
+// withCompactFlags isolates the package-level flags and zeroes the write pause.
+func withCompactFlags(t *testing.T) {
+	t.Helper()
+	oldDry, oldJSON, oldVerbose, oldPause := compactDryRun, compactJSON, compactVerbose, compactBatchPause
+	compactDryRun, compactJSON, compactVerbose, compactBatchPause = false, true, false, 0
+	t.Cleanup(func() {
+		compactDryRun, compactJSON, compactVerbose, compactBatchPause = oldDry, oldJSON, oldVerbose, oldPause
+	})
+}
+
+var testCompactLimits = compactLimits{MaxPromotes: defaultCompactMaxPromotes, MaxDeletes: defaultCompactMaxDeletes}
+
 func TestListWispsReadsWispsTable(t *testing.T) {
-	wisps := `[
-	 {"id":"gt-wisp-a","title":"patrol","status":"open","issue_type":"task","wisp_type":"patrol","created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z"},
-	 {"id":"gt-wisp-b","title":"step","status":"open","issue_type":"task","wisp_type":"","created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z"},
-	 {"id":"gt-wisp-c","title":"agent via type","status":"open","issue_type":"agent","wisp_type":"","created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z"},
-	 {"id":"gt-wisp-d","title":"agent via wisp_labels","status":"open","issue_type":"task","wisp_type":"","created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z"},
-	 {"id":"gt-wisp-e","title":"agent via labels","status":"open","issue_type":"task","wisp_type":"","created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z"}
-	]`
-	got, err := listWispsWith(fakeWispSQL(wisps,
-		`[{"issue_id":"gt-wisp-a","label":"keep"},{"issue_id":"gt-wisp-d","label":"gt:agent"}]`,
-		`[{"issue_id":"gt-wisp-e"}]`,
-		`[{"issue_id":"gt-wisp-a","n":2}]`,
-		`[{"issue_id":"gt-wisp-b","parent_id":"gt-wisp-p","parent_open":1}]`))
+	wisps := "[" + strings.Join([]string{
+		wispRow("gt-wisp-a", "open", "2026-10-01T00:00:00Z", `,"has_parent":0,"parent_open":0,"is_mr":0,"mr_purgeable":1`),
+		wispRow("gt-wisp-b", "open", "2026-10-01T00:00:00Z", `,"has_parent":1,"parent_open":1,"is_mr":0,"mr_purgeable":1`),
+		wispRow("gt-wisp-c", "closed", "2026-10-01T00:00:00Z", `,"has_parent":0,"parent_open":0,"is_mr":1,"mr_purgeable":0`),
+	}, ",") + "]"
+	f := newFakeBD(wisps)
+	f.labels = `[{"issue_id":"gt-wisp-a","label":"keep"}]`
+	f.comments = `[{"issue_id":"gt-wisp-a","n":2}]`
+
+	got, err := listWispsWith(f.run)
 	if err != nil {
 		t.Fatalf("listWispsWith: %v", err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("scanned %d wisps, want 2 (a, b); agent beads must be excluded", len(got))
+	if len(got) != 3 {
+		t.Fatalf("scanned %d wisps, want 3", len(got))
 	}
-	a, b := got[0], got[1]
-	if a.ID != "gt-wisp-a" || a.WispType != "patrol" || a.CommentCount != 2 || !hasKeepLabel(a) || !a.Ephemeral {
+	a, b, c := got[0], got[1], got[2]
+	if a.ID != "gt-wisp-a" || a.CommentCount != 2 || !hasKeepLabel(a) || !a.Ephemeral || a.HasParent || a.IsMR || !a.MRPurgeable {
 		t.Errorf("wisp a mis-decoded: %+v", a)
 	}
-	if b.ID != "gt-wisp-b" || b.Parent != "gt-wisp-p" || !b.ParentOpen {
-		t.Errorf("wisp b parent mis-decoded: %+v", b)
+	if !b.HasParent || !b.ParentOpen {
+		t.Errorf("wisp b parentage mis-decoded: %+v", b)
+	}
+	if !c.IsMR || c.MRPurgeable {
+		t.Errorf("wisp c merge-request state mis-decoded: %+v", c)
+	}
+}
+
+// The scan must reuse the reaper's eligibility SQL, not a copy: agent identity
+// exclusion (both label tables) and the merge-request recovery window.
+func TestListWispsUsesReaperEligibilitySQL(t *testing.T) {
+	f := newFakeBD("[]")
+	if _, err := listWispsWith(f.run); err != nil {
+		t.Fatalf("listWispsWith: %v", err)
+	}
+	var scan string
+	for _, q := range f.queries {
+		if strings.HasPrefix(q, "SELECT w.id AS id") {
+			scan = q
+		}
+	}
+	if scan == "" {
+		t.Fatalf("no scan query issued: %v", f.queries)
+	}
+	agentJoin, agentWhere := reaper.NotAgentWispJoin("w")
+	mrJoin, mrWhere := reaper.PurgeableMRWispJoin("w")
+	parentJoin, _ := reaper.ParentExcludeJoin("")
+	for _, want := range []string{agentJoin, agentWhere, mrJoin, mrWhere, parentJoin} {
+		if !strings.Contains(scan, want) {
+			t.Errorf("scan query is missing reaper SQL %q:\n%s", want, scan)
+		}
+	}
+	if !strings.Contains(mrWhere, "INTERVAL 24 HOUR") {
+		t.Errorf("reaper MR window changed from 24h: %s", mrWhere)
 	}
 }
 
 // TestListWispsDoesNotDependOnBdList pins the gt-jux2 regression: bd list
 // returns no wisps, so a scan built on it saw zero rows forever.
 func TestListWispsDoesNotDependOnBdList(t *testing.T) {
-	row := `[{"id":"gt-wisp-a","title":"t","status":"open","issue_type":"task","wisp_type":"","created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z"}]`
-	run := fakeWispSQL(row, "[]", "[]", "[]", "[]")
+	f := newFakeBD("[" + wispRow("gt-wisp-a", "open", "2026-10-01T00:00:00Z", "") + "]")
 	guarded := func(args ...string) ([]byte, error) {
 		if len(args) > 0 && args[0] == "list" {
 			t.Errorf("listWisps must not call bd list: %v", args)
 		}
-		return run(args...)
+		return f.run(args...)
 	}
 	got, err := listWispsWith(guarded)
 	if err != nil || len(got) != 1 {
@@ -378,6 +489,256 @@ func TestListWispsPropagatesQueryErrors(t *testing.T) {
 	_, err := listWispsWith(func(args ...string) ([]byte, error) { return nil, os.ErrPermission })
 	if err == nil {
 		t.Fatal("expected error when the wisps query fails, got silent empty result")
+	}
+	if errors.Is(err, errNoWispTables) {
+		t.Fatal("a failing bd must not be mistaken for a database with no wisp tables")
+	}
+}
+
+// --- schema gate (reaper's HasReaperSchema parity) ---
+
+func TestListWispsReportsMissingSchema(t *testing.T) {
+	for name, f := range map[string]*fakeBD{
+		"no wisps table": func() *fakeBD {
+			f := newFakeBD("[]")
+			f.tables = []string{"issues", "labels"}
+			return f
+		}(),
+		"no labels table": func() *fakeBD {
+			f := newFakeBD("[]")
+			f.tables = []string{"wisps", "wisp_labels", "wisp_comments", "wisp_dependencies", "issues"}
+			return f
+		}(),
+		"old wisp_dependencies columns": func() *fakeBD {
+			f := newFakeBD("[]")
+			f.columns = "Field,Type\nissue_id,varchar\ndepends_on_id,varchar\n"
+			return f
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := listWispsWith(f.run)
+			if !errors.Is(err, errNoWispTables) {
+				t.Fatalf("err = %v, want errNoWispTables", err)
+			}
+		})
+	}
+}
+
+func TestRunCompactOnDatabaseWithoutWispTablesSucceeds(t *testing.T) {
+	withCompactFlags(t)
+	f := newFakeBD("[]")
+	f.tables = []string{"issues"}
+
+	result, err := runCompactWith(f.run, defaultTTLs, compactTestNow, testCompactLimits)
+	if err != nil {
+		t.Fatalf("a database without wisp tables must not fail compaction: %v", err)
+	}
+	if result == nil || len(result.Deleted)+len(result.Promoted) != 0 {
+		t.Fatalf("result = %+v, want empty", result)
+	}
+	if len(f.writes) != 0 {
+		t.Fatalf("issued writes against a database with no wisp tables: %v", f.writes)
+	}
+}
+
+// --- per-run cap and batching ---
+
+func TestPlanCompactionCapsDeletesOldestFirst(t *testing.T) {
+	f := newFakeBD(manyWispRows("d", "closed", 1200))
+	wisps, err := listWispsWith(f.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := planWispCompaction(wisps, defaultTTLs, compactTestNow, compactLimits{MaxPromotes: 100, MaxDeletes: 500})
+	if len(plan.Delete) != 500 {
+		t.Fatalf("planned %d deletes, want the cap of 500", len(plan.Delete))
+	}
+	if plan.DeferredDeletes != 700 {
+		t.Errorf("deferred deletes = %d, want 700", plan.DeferredDeletes)
+	}
+	if plan.Delete[0].ID != "d0000" || plan.Delete[499].ID != "d0499" {
+		t.Errorf("cap must keep the oldest-first order: first %s last %s", plan.Delete[0].ID, plan.Delete[499].ID)
+	}
+}
+
+func TestPlanCompactionCapsPromotes(t *testing.T) {
+	f := newFakeBD(manyWispRows("p", "open", 300))
+	wisps, _ := listWispsWith(f.run)
+	plan := planWispCompaction(wisps, defaultTTLs, compactTestNow, compactLimits{MaxPromotes: 100, MaxDeletes: 500})
+	if len(plan.Promote) != 100 || plan.DeferredPromotes != 200 {
+		t.Fatalf("promotes %d deferred %d, want 100 and 200", len(plan.Promote), plan.DeferredPromotes)
+	}
+}
+
+func TestRunCompactBatchesDeletes(t *testing.T) {
+	withCompactFlags(t)
+	f := newFakeBD(manyWispRows("d", "closed", 1200))
+
+	result, err := runCompactWith(f.run, defaultTTLs, compactTestNow, testCompactLimits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Deleted) != 500 || result.DeferredDeletes != 700 {
+		t.Fatalf("deleted %d deferred %d, want 500 and 700", len(result.Deleted), result.DeferredDeletes)
+	}
+	calls := f.writesOf("delete")
+	if len(calls) != 10 {
+		t.Fatalf("%d bd delete calls for 500 wisps, want 10 batched calls of 50", len(calls))
+	}
+	for _, c := range calls {
+		// delete <ids...> --force
+		if ids := len(c) - 2; ids != 50 || c[len(c)-1] != "--force" {
+			t.Fatalf("bad batch %v", c[:3])
+		}
+	}
+}
+
+func TestRunCompactBatchFailureFallsBackToSingles(t *testing.T) {
+	withCompactFlags(t)
+	f := newFakeBD(manyWispRows("d", "closed", 3))
+	f.failWrite = func(args []string) error {
+		if len(args) > 3 { // the batch call; single-id calls succeed
+			return os.ErrInvalid
+		}
+		return nil
+	}
+	result, err := runCompactWith(f.run, defaultTTLs, compactTestNow, testCompactLimits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Deleted) != 3 {
+		t.Fatalf("deleted %d, want 3 via single-id fallback (errors: %v)", len(result.Deleted), result.Errors)
+	}
+}
+
+func TestRunCompactAbortsAfterRepeatedWriteFailures(t *testing.T) {
+	withCompactFlags(t)
+	f := newFakeBD(manyWispRows("d", "closed", 200))
+	f.failWrite = func([]string) error { return os.ErrInvalid }
+
+	result, err := runCompactWith(f.run, defaultTTLs, compactTestNow, testCompactLimits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Deleted) != 0 {
+		t.Fatalf("deleted %d with every write failing", len(result.Deleted))
+	}
+	if got := len(f.writes); got > 1+compactMaxConsecutiveFailures {
+		t.Fatalf("issued %d writes against a failing server, want at most %d", got, 1+compactMaxConsecutiveFailures)
+	}
+	if !strings.Contains(strings.Join(result.Errors, "\n"), "aborting") {
+		t.Errorf("abort not reported: %v", result.Errors)
+	}
+	if result.DeferredDeletes == 0 {
+		t.Errorf("remaining work should be reported as deferred")
+	}
+}
+
+func TestRunCompactDryRunWritesNothing(t *testing.T) {
+	withCompactFlags(t)
+	compactDryRun = true
+	f := newFakeBD(manyWispRows("d", "closed", 10))
+
+	result, err := runCompactWith(f.run, defaultTTLs, compactTestNow, testCompactLimits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.writes) != 0 {
+		t.Fatalf("dry run issued writes: %v", f.writes)
+	}
+	if len(result.Deleted) != 10 {
+		t.Fatalf("dry run should report the 10 planned deletes, got %d", len(result.Deleted))
+	}
+}
+
+func TestRunCompactRejectsNonPositiveCaps(t *testing.T) {
+	oldP, oldD := compactMaxPromotes, compactMaxDeletes
+	t.Cleanup(func() { compactMaxPromotes, compactMaxDeletes = oldP, oldD })
+	for _, c := range [][2]int{{0, 500}, {100, 0}, {-1, -1}} {
+		compactMaxPromotes, compactMaxDeletes = c[0], c[1]
+		if err := runCompact(nil, nil); err == nil {
+			t.Errorf("caps %v accepted, want an error", c)
+		}
+	}
+}
+
+// --- exemptions: merge-request wisps, live assignments, mail ---
+
+func TestPlanCompactionNeverTouchesOpenMergeRequestWisp(t *testing.T) {
+	for _, status := range []string{"open", "in_progress", "hooked"} {
+		t.Run(status, func(t *testing.T) {
+			f := newFakeBD("[" + wispRow("mr", status, "2026-01-01T00:00:00Z", `,"is_mr":1,"mr_purgeable":1`) + "]")
+			wisps, _ := listWispsWith(f.run)
+			plan := planWispCompaction(wisps, defaultTTLs, compactTestNow, testCompactLimits)
+			if len(plan.Delete)+len(plan.Promote) != 0 {
+				t.Fatalf("open MR wisp was planned for a write: %+v", plan)
+			}
+		})
+	}
+}
+
+func TestPlanCompactionKeepsClosedMergeRequestInsideRecoveryWindow(t *testing.T) {
+	// Closed unmerged <24h ago: the reaper's MR window says not purgeable, even
+	// though updated_at and a lowered TTL make it look expired.
+	f := newFakeBD("[" + wispRow("mr", "closed", "2026-10-17T11:00:00Z", `,"is_mr":1,"mr_purgeable":0`) + "]")
+	wisps, _ := listWispsWith(f.run)
+	ttls := map[string]time.Duration{"default": time.Minute}
+	plan := planWispCompaction(wisps, ttls, compactTestNow, testCompactLimits)
+	if len(plan.Delete) != 0 {
+		t.Fatalf("closed MR wisp inside the recovery window was planned for delete")
+	}
+}
+
+func TestPlanCompactionDeletesPurgeableClosedMergeRequest(t *testing.T) {
+	f := newFakeBD("[" + wispRow("mr", "closed", "2026-01-01T00:00:00Z", `,"is_mr":1,"mr_purgeable":1`) + "]")
+	wisps, _ := listWispsWith(f.run)
+	plan := planWispCompaction(wisps, defaultTTLs, compactTestNow, testCompactLimits)
+	if len(plan.Delete) != 1 {
+		t.Fatalf("merged/old closed MR wisp should still age out, got %+v", plan)
+	}
+}
+
+func TestPlanCompactionLeavesLiveAssignmentsAndOpenMail(t *testing.T) {
+	wisps := "[" + strings.Join([]string{
+		wispRow("hooked", "hooked", "2026-01-01T00:00:00Z", ""),
+		wispRow("pinned", "pinned", "2026-01-01T00:00:00Z", ""),
+		wispRow("mail", "open", "2026-01-01T00:00:00Z", ""),
+		wispRow("plain", "open", "2026-01-01T00:00:00Z", ""),
+	}, ",") + "]"
+	f := newFakeBD(wisps)
+	f.labels = `[{"issue_id":"mail","label":"gt:message"}]`
+	got, _ := listWispsWith(f.run)
+	plan := planWispCompaction(got, defaultTTLs, compactTestNow, testCompactLimits)
+	if len(plan.Promote) != 1 || plan.Promote[0].ID != "plain" {
+		t.Fatalf("only the plain stuck wisp should be promoted, got %+v", plan.Promote)
+	}
+	if plan.Skipped != 3 {
+		t.Errorf("skipped = %d, want 3 exempt", plan.Skipped)
+	}
+}
+
+// --- blind-scan warning counts the scan's own population ---
+
+func TestBlindScanWarningUsesAgentFilter(t *testing.T) {
+	f := newFakeBD("[]")
+	f.count = `[{"n":0}]` // the filtered population is empty: only agent beads exist
+	if w := blindScanWarning(f.run); w != "" {
+		t.Fatalf("warned on a table of only agent beads: %q", w)
+	}
+	var q string
+	for _, got := range f.queries {
+		if strings.HasPrefix(got, "SELECT COUNT(*)") {
+			q = got
+		}
+	}
+	agentJoin, agentWhere := reaper.NotAgentWispJoin("w")
+	if !strings.Contains(q, agentJoin) || !strings.Contains(q, agentWhere) {
+		t.Fatalf("blind-scan count does not apply the scan's agent exclusion:\n%s", q)
+	}
+
+	f.count = `[{"n":7}]`
+	if w := blindScanWarning(f.run); !strings.Contains(w, "7") {
+		t.Fatalf("expected a warning naming 7 rows, got %q", w)
 	}
 }
 

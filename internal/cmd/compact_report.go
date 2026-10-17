@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -177,6 +178,10 @@ func runDailyDigest() error {
 	}
 	bd := beads.New(workDir)
 	activeWisps, err := listWisps(bd)
+	if errors.Is(err, errNoWispTables) {
+		// Nothing to report on; the compaction above skipped such a database too.
+		activeWisps, err = nil, nil
+	}
 	if err != nil {
 		return fmt.Errorf("listing active wisps: %w", err)
 	}
