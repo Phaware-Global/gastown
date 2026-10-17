@@ -4,14 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -197,19 +200,36 @@ func (d *Daemon) syncBackupCycle(dataDir string, databases []string) (synced int
 	return synced, failures
 }
 
-// doltServerAcceptingConnections reports whether a backup sync may run. It is
-// true when no daemon-managed server is configured (nothing to check) or the
-// managed server's port accepts connections.
+// doltServerAcceptingConnections reports whether a backup sync may run: the
+// Dolt server must accept connections. A daemon-managed server is checked on
+// its configured port; when the daemon does not manage Dolt (the default), the
+// town's server, started by `gt dolt start`, is checked at the address
+// doltserver.DefaultConfig resolves.
 func (d *Daemon) doltServerAcceptingConnections() bool {
-	if d.doltServer == nil || !d.doltServer.IsEnabled() {
-		return true
+	if d.doltServer != nil && d.doltServer.IsEnabled() {
+		return d.doltServer.isDoltServerOnPort()
 	}
-	return d.doltServer.isDoltServerOnPort()
+	townRoot := ""
+	if d.config != nil {
+		townRoot = d.config.TownRoot
+	}
+	cfg := doltserver.DefaultConfig(townRoot)
+	host := cfg.Host
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(cfg.Port)), 2*time.Second)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }
 
 // syncBackup runs `dolt backup sync <backup-name>` for a single database,
 // retrying once on failure so a transient lock or large delta does not fail the
 // cycle (gt-ye21). A timeout is not retried: it returns errDoltBackupTimeout.
+// Nor is a failure once the server has stopped accepting connections.
 func (d *Daemon) syncBackup(dataDir, db, backupName string) error {
 	parentCtx := d.ctx
 	if parentCtx == nil {
@@ -227,6 +247,12 @@ func (d *Daemon) syncBackup(dataDir, db, backupName string) error {
 			case <-parentCtx.Done():
 				timer.Stop()
 				return parentCtx.Err()
+			}
+			// The server may have gone down since the failed attempt; a retry
+			// against a down server would take noms/LOCK directly.
+			if !d.doltServerAcceptingConnections() {
+				d.logger.Printf("dolt_backup: %s: dolt server not accepting connections, not retrying", db)
+				return lastErr
 			}
 		}
 
