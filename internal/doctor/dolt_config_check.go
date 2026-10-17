@@ -14,7 +14,8 @@ import (
 // DoltConfigCheck verifies shared-server beads dirs have explicit bd config.
 type DoltConfigCheck struct {
 	FixableCheck
-	targets []doltConfigTarget
+	targets []doltConfigTarget // untracked configs Fix can edit
+	tracked []string           // git-tracked configs: reported, never edited
 }
 
 type doltConfigTarget struct {
@@ -46,6 +47,7 @@ func NewDoltConfigCheck() *DoltConfigCheck {
 // Run checks every .beads/config.yaml that belongs to a server-mode beads dir.
 func (c *DoltConfigCheck) Run(ctx *CheckContext) *CheckResult {
 	c.targets = nil
+	c.tracked = nil
 	if ctx == nil || ctx.TownRoot == "" {
 		return &CheckResult{
 			Name:     c.Name(),
@@ -87,7 +89,7 @@ func (c *DoltConfigCheck) Run(ctx *CheckContext) *CheckResult {
 		}
 	}
 
-	if len(c.targets) == 0 {
+	if len(c.targets) == 0 && len(c.tracked) == 0 {
 		return &CheckResult{
 			Name:     c.Name(),
 			Status:   StatusOK,
@@ -96,10 +98,23 @@ func (c *DoltConfigCheck) Run(ctx *CheckContext) *CheckResult {
 		}
 	}
 
+	// Tracked configs are not fixable by --fix, so they must not count as errors
+	// or point at --fix: that would fail every unattended run forever.
+	if len(c.targets) == 0 {
+		return &CheckResult{
+			Name:     c.Name(),
+			Status:   StatusWarning,
+			Message:  fmt.Sprintf("%d git-tracked shared Dolt config(s) missing explicit bd keys", len(c.tracked)),
+			Details:  details,
+			FixHint:  "git-tracked; add storage.backend, dolt.server, and dolt.port in a reviewed commit",
+			Category: c.CheckCategory,
+		}
+	}
+
 	return &CheckResult{
 		Name:     c.Name(),
 		Status:   StatusError,
-		Message:  fmt.Sprintf("%d shared Dolt config(s) missing explicit bd keys", len(c.targets)),
+		Message:  fmt.Sprintf("%d shared Dolt config(s) missing explicit bd keys", len(c.targets)+len(c.tracked)),
 		Details:  details,
 		FixHint:  "Run 'gt doctor --fix' to set storage.backend, dolt.server, and dolt.port",
 		Category: c.CheckCategory,
@@ -144,6 +159,11 @@ func (c *DoltConfigCheck) checkBeadsDir(ctx *CheckContext, beadsDir, defaultHost
 	rel, err := filepath.Rel(ctx.TownRoot, beadsDir)
 	if err != nil {
 		rel = beadsDir
+	}
+	if isGitTracked(configPath) {
+		*details = append(*details, fmt.Sprintf("%s/config.yaml: %s (git-tracked; fix via a reviewed commit)", rel, strings.Join(issues, ", ")))
+		c.tracked = append(c.tracked, beadsDir)
+		return
 	}
 	*details = append(*details, fmt.Sprintf("%s/config.yaml: %s", rel, strings.Join(issues, ", ")))
 	c.targets = append(c.targets, doltConfigTarget{beadsDir: beadsDir, host: host, port: port, issues: issues})
@@ -225,14 +245,26 @@ func configYAMLValues(content string) map[string]string {
 }
 
 // Fix writes only the shared Dolt connection keys, preserving existing config.
+//
+// It never edits a git-tracked config.yaml. Doctor --fix runs unattended inside
+// worktrees, where a tracked edit dirties the tree and auto-save then commits it
+// into whatever MR that worktree owns. Run keeps tracked configs out of
+// c.targets and reports them as a warning; changing them is a reviewed commit.
+// The check here covers a config that became tracked after Run.
 func (c *DoltConfigCheck) Fix(ctx *CheckContext) error {
-	if len(c.targets) == 0 {
-		return nil
-	}
+	var tracked []string
 	for _, target := range c.targets {
+		if isGitTracked(filepath.Join(target.beadsDir, "config.yaml")) {
+			tracked = append(tracked, target.beadsDir)
+			continue
+		}
 		if err := ensureDoltConfigKeys(target.beadsDir, target.host, target.port); err != nil {
 			return err
 		}
+	}
+	if len(tracked) > 0 {
+		return fmt.Errorf("left %d git-tracked config.yaml unmodified (fix via a reviewed commit): %s",
+			len(tracked), strings.Join(tracked, ", "))
 	}
 	return nil
 }

@@ -35,7 +35,8 @@ var refineryCmd = &cobra.Command{
 
 The Refinery serializes all merges to main for a rig:
   - Receives MRs submitted by polecats (via gt done)
-  - Rebases work branches onto latest main
+  - Brings work branches up to date with latest main (rebase by default;
+    merge_queue.pr_update_strategy selects merge or none)
   - Runs validation (tests, builds, checks)
   - Merges to main when clear
   - If conflict: spawns FRESH polecat to re-implement (original is gone)

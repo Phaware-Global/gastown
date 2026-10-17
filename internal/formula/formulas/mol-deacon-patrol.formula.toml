@@ -105,10 +105,12 @@ id = "inbox-check"
 title = "Handle callbacks from agents"
 needs = ["heartbeat"]
 description = """
-First, clean up CLOSED wisps from previous cycles:
-```bash
-bd mol wisp gc --closed --force
-```
+Do NOT purge closed wisps from this patrol (gt-9yhyh). A blanket closed-wisp
+purge deletes every closed wisp regardless of age or close reason, including the
+merge-request wisp of an open PR that something closed by mistake; wisps are not
+in Dolt history, so the row and its evidence are unrecoverable. Closed-wisp
+cleanup belongs to the reaper, which purges by age and keeps unmerged
+merge-request wisps for at least 24h.
 
 > **Warning (hq-3pp):** Do not run unscoped age-based wisp GC from inside
 > this patrol. Active patrol step wisps can be older than 1h before they run;
@@ -992,7 +994,7 @@ Skip dispatch - system is healthy.
 **Cleanup types (for reference):**
 - orphan-sessions: Dead tmux sessions
 - orphan-processes: Orphaned Claude processes
-- wisp-gc: Old wisps past retention
+- wisp-gc: Closed wisps (open wisps are never deleted)
 
 **Exit criteria:** Session GC dispatched to dog (if needed)."""
 
