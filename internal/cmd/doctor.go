@@ -54,7 +54,7 @@ Cleanup checks (fixable):
   - stalled-polecats         Detect polecats with dead sessions and unpushed work (fixable)
   - orphan-processes         Detect orphaned Claude processes
   - session-name-format      Detect sessions with outdated naming format (fixable)
-  - wisp-gc                  Detect and clean abandoned wisps (>1h)
+  - wisp-gc                  Reclaim closed wisps; report (never delete) stale open wisps
   - misclassified-wisps      Detect issues that should be wisps (purges to wisps table, fixable)
   - jsonl-bloat              Detect stale/bloated issues.jsonl vs live database
   - stale-beads-redirect     Detect stale files in .beads directories with redirects

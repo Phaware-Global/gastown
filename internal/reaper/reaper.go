@@ -273,6 +273,27 @@ func notAgentWispJoin(alias string) (joinClause, whereCondition string) {
 	return
 }
 
+// MRWispMinPurgeAge is how long a closed merge-request wisp that did NOT close
+// as merged must linger before a purge may delete it. An MR wisp is the only
+// record tying an open PR to the refinery queue, and wisps are in dolt_ignore
+// so a deleted row cannot be recovered. A wrong close therefore has to stay
+// visible and recoverable for a while instead of vanishing with the next purge
+// (gt-9yhyh).
+const MRWispMinPurgeAge = 24 * time.Hour
+
+// purgeableMRWispJoin returns the join and WHERE condition that keep closed
+// merge-request wisps out of a purge unless the MR closed as merged or has
+// been closed for MRWispMinPurgeAge. alias is the wisps table alias.
+func purgeableMRWispJoin(alias string) (joinClause, whereCondition string) {
+	joinClause = fmt.Sprintf(
+		"LEFT JOIN wisp_labels mr_wl ON mr_wl.issue_id = %s.id AND mr_wl.label = 'gt:merge-request'",
+		alias)
+	whereCondition = fmt.Sprintf(
+		"(mr_wl.issue_id IS NULL OR LOWER(%s.close_reason) LIKE 'merged%%' OR %s.closed_at < DATE_SUB(NOW(), INTERVAL %d HOUR))",
+		alias, alias, int(MRWispMinPurgeAge.Hours()))
+	return
+}
+
 // staleIssueExemptLabelsSQL returns the SQL IN-list of labels that exempt an
 // issue from staleness sweeps: the pre-existing standing-order/protection
 // labels plus gt:agent, the label-based marker for agent identity beads.
@@ -510,9 +531,10 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	// Agent guard must match purgeClosedWisps' own guard exactly, or this count and Purge
 	// diverge the same way reap/scan used to: PurgeCandidates > 0 forever with purged = 0
 	// once an agent wisp is closed (gt-7a7j, gt-h8oq).
+	mrJoin, mrWhere := purgeableMRWispJoin("w")
 	purgeQuery := fmt.Sprintf(
-		"SELECT COUNT(*) FROM wisps w %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s",
-		agentJoin, agentWhere)
+		"SELECT COUNT(*) FROM wisps w %s %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s AND %s",
+		agentJoin, mrJoin, agentWhere, mrWhere)
 	if err := db.QueryRowContext(ctx, purgeQuery, now.Add(-purgeAge)).Scan(&result.PurgeCandidates); err != nil {
 		return nil, fmt.Errorf("count purge candidates: %w", err)
 	}
@@ -860,16 +882,18 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 // its addition).
 func purgeDigestQuery() string {
 	agentJoin, agentWhere := notAgentWispJoin("w")
+	mrJoin, mrWhere := purgeableMRWispJoin("w")
 	return fmt.Sprintf(
-		"SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s GROUP BY wtype",
-		agentJoin, agentWhere)
+		"SELECT COALESCE(w.wisp_type, 'unknown') AS wtype, COUNT(*) AS cnt FROM wisps w %s %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s AND %s GROUP BY wtype",
+		agentJoin, mrJoin, agentWhere, mrWhere)
 }
 
 func purgeBatchIDQuery() string {
 	agentJoin, agentWhere := notAgentWispJoin("w")
+	mrJoin, mrWhere := purgeableMRWispJoin("w")
 	return fmt.Sprintf(
-		"SELECT w.id FROM wisps w %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s LIMIT %d",
-		agentJoin, agentWhere, DefaultBatchSize)
+		"SELECT w.id FROM wisps w %s %s WHERE w.status = 'closed' AND w.closed_at < ? AND %s AND %s LIMIT %d",
+		agentJoin, mrJoin, agentWhere, mrWhere, DefaultBatchSize)
 }
 
 func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun bool) (int, error) {
