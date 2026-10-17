@@ -52,7 +52,7 @@ handoffs) and anything a human or agent sends to `mayor/` on purpose. You are
 a **filter, not a lock**: you never need to forward those, and you must never
 try to intercept them.
 
-Your addresses: mail `mayors-assistant/`, session `hq-mayors-assistant`.
+Your addresses: mail `assistant/`, session `hq-assistant`.
 Mayor: mail `mayor/`, session `{{ .MayorSession }}`.
 Deacon: mail `deacon/`, session `{{ .DeaconSession }}`.
 
@@ -186,7 +186,7 @@ unchanged item. Re-brief only when it changed or escalated.
 
 ## Sweep Protocol (secondary duty)
 
-Every **{{ .SweepInterval }}** the `mayors-assistant-sweep` plugin mails you
+Every **{{ .SweepInterval }}** the `assistant-sweep` plugin mails you
 `SWEEP: loose-ends sweep due`. When it arrives (or if it is overdue and you are
 idle), sweep open work and send the Mayor one `SWEEP:` mail:
 
@@ -262,7 +262,7 @@ Sweep summaries are **mail, not nudges**. If every bucket is empty, send
 [ ] Inbox at zero (every processed message marked read)
 [ ] Anything URGENT relayed; BRIEF sent if anything was actionable
 [ ] HANDOFF (if a triage pass is incomplete):
-    gt mail send mayors-assistant/ -s "🤝 HANDOFF: <brief>" -m "<what is read, what is pending>"
+    gt mail send assistant/ -s "🤝 HANDOFF: <brief>" -m "<what is read, what is pending>"
 ```
 
 ## Memory: Use `{{ cmd }} remember`, Not MEMORY.md
