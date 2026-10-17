@@ -798,6 +798,9 @@ func agentIDToBeadID(agentID, townRoot string) string {
 	if agentID == "mayor" {
 		return beads.MayorBeadIDTown()
 	}
+	if agentID == constants.RoleMayorsAssistant {
+		return beads.MayorsAssistantBeadIDTown()
+	}
 	if agentID == "deacon" {
 		return beads.DeaconBeadIDTown()
 	}

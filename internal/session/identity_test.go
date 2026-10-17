@@ -413,6 +413,16 @@ func TestParseAddress(t *testing.T) {
 			want:    AgentIdentity{Role: RoleDeacon},
 		},
 		{
+			name:    "mayors-assistant with slash",
+			address: "mayors-assistant/",
+			want:    AgentIdentity{Role: RoleMayorsAssistant},
+		},
+		{
+			name:    "mayors-assistant bare",
+			address: "mayors-assistant",
+			want:    AgentIdentity{Role: RoleMayorsAssistant},
+		},
+		{
 			name:    "witness",
 			address: "gastown/witness",
 			want:    AgentIdentity{Role: RoleWitness, Rig: "gastown", Prefix: PrefixFor("gastown")},
@@ -481,5 +491,30 @@ func TestPrefixRegistry(t *testing.T) {
 	// Unknown prefix returns the prefix itself
 	if got := r.RigForPrefix("zz"); got != "zz" {
 		t.Errorf("RigForPrefix(zz) = %q, want %q", got, "zz")
+	}
+}
+
+// TestMayorsAssistantIdentity covers the hyphenated, "mayor"-prefixed role end
+// to end: session name ↔ identity ↔ address must all round-trip and must never
+// collapse into the Mayor's identity.
+func TestMayorsAssistantIdentity(t *testing.T) {
+	id, err := ParseSessionName("hq-mayors-assistant")
+	if err != nil {
+		t.Fatalf("ParseSessionName(hq-mayors-assistant) error: %v", err)
+	}
+	if id.Role != RoleMayorsAssistant || id.Rig != "" || id.Name != "" {
+		t.Errorf("ParseSessionName = %+v, want Role=mayors-assistant", *id)
+	}
+	if got := id.SessionName(); got != "hq-mayors-assistant" {
+		t.Errorf("SessionName() = %q, want hq-mayors-assistant", got)
+	}
+	if got := id.Address(); got != "mayors-assistant" {
+		t.Errorf("Address() = %q, want mayors-assistant", got)
+	}
+	if got := id.BeaconAddress(); got != "mayors-assistant" {
+		t.Errorf("BeaconAddress() = %q, want mayors-assistant", got)
+	}
+	if got := MayorsAssistantSessionName(); got != "hq-mayors-assistant" {
+		t.Errorf("MayorsAssistantSessionName() = %q", got)
 	}
 }

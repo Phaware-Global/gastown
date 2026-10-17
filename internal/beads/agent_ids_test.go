@@ -266,3 +266,26 @@ func TestAgentBeadIDRoundTrip(t *testing.T) {
 	}
 }
 
+
+// TestMayorsAssistantBeadID covers the hyphenated town-level role. Its ID
+// must parse and validate as a single town-level role rather than being split
+// on "-" into a rig named "mayors".
+func TestMayorsAssistantBeadID(t *testing.T) {
+	id := MayorsAssistantBeadIDTown()
+	if id != "hq-mayors-assistant" {
+		t.Fatalf("MayorsAssistantBeadIDTown() = %q, want hq-mayors-assistant", id)
+	}
+	if err := ValidateAgentID(id); err != nil {
+		t.Errorf("ValidateAgentID(%q) error: %v", id, err)
+	}
+	rig, role, name, ok := ParseAgentBeadID(id)
+	if !ok || rig != "" || role != "mayors-assistant" || name != "" {
+		t.Errorf("ParseAgentBeadID(%q) = (%q, %q, %q, %v), want (\"\", mayors-assistant, \"\", true)", id, rig, role, name, ok)
+	}
+	if !IsAgentSessionBead(id) {
+		t.Errorf("IsAgentSessionBead(%q) = false, want true", id)
+	}
+	if got := AgentBeadIDWithPrefix(TownBeadsPrefix, "", "mayors-assistant", ""); got != id {
+		t.Errorf("AgentBeadIDWithPrefix = %q, want %q", got, id)
+	}
+}

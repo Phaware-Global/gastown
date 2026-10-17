@@ -1074,13 +1074,14 @@ func outputStatusText(w io.Writer, status TownStatus) error {
 
 	// Role icons - uses centralized emojis from constants package
 	roleIcons := map[string]string{
-		constants.RoleMayor:    constants.EmojiMayor,
-		constants.RoleDeacon:   constants.EmojiDeacon,
-		constants.RoleWitness:  constants.EmojiWitness,
-		constants.RoleRefinery: constants.EmojiRefinery,
-		constants.RoleReviewer: constants.EmojiReviewer,
-		constants.RoleCrew:     constants.EmojiCrew,
-		constants.RolePolecat:  constants.EmojiPolecat,
+		constants.RoleMayor:           constants.EmojiMayor,
+		constants.RoleMayorsAssistant: constants.EmojiMayorsAssistant,
+		constants.RoleDeacon:          constants.EmojiDeacon,
+		constants.RoleWitness:         constants.EmojiWitness,
+		constants.RoleRefinery:        constants.EmojiRefinery,
+		constants.RoleReviewer:        constants.EmojiReviewer,
+		constants.RoleCrew:            constants.EmojiCrew,
+		constants.RolePolecat:         constants.EmojiPolecat,
 		// Legacy names for backwards compatibility
 		"coordinator":  constants.EmojiMayor,
 		"health-check": constants.EmojiDeacon,
@@ -1647,6 +1648,7 @@ func discoverGlobalAgents(townRoot string, allSessions map[string]bool, allAgent
 		beadID  string
 	}{
 		{constants.RoleMayor, constants.RoleMayor + "/", mayorSession, "coordinator", beads.MayorBeadIDTown()},
+		{constants.RoleMayorsAssistant, constants.RoleMayorsAssistant + "/", session.MayorsAssistantSessionName(), constants.RoleMayorsAssistant, beads.MayorsAssistantBeadIDTown()},
 		{constants.RoleDeacon, constants.RoleDeacon + "/", deaconSession, "health-check", beads.DeaconBeadIDTown()},
 	}
 

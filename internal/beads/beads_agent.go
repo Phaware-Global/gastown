@@ -703,6 +703,9 @@ func (b *Beads) ListAgentBeadsFromWisps() (map[string]*Issue, error) {
 // The collapsed form has only 2 parts for role-only IDs, so we must check
 // from parts[1:] not parts[2:].
 func isAgentBeadByID(id string) bool {
+	if strings.HasSuffix(id, "-"+constants.RoleMayorsAssistant) {
+		return true // hyphenated role: hq-mayors-assistant
+	}
 	parts := strings.Split(id, "-")
 	if len(parts) < 2 {
 		return false

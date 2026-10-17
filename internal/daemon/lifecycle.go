@@ -233,6 +233,8 @@ func parseIdentity(identity string) (*ParsedIdentity, error) {
 	switch identity {
 	case constants.RoleMayor:
 		return &ParsedIdentity{RoleType: constants.RoleMayor}, nil
+	case constants.RoleMayorsAssistant:
+		return &ParsedIdentity{RoleType: constants.RoleMayorsAssistant}, nil
 	case constants.RoleDeacon:
 		return &ParsedIdentity{RoleType: constants.RoleDeacon}, nil
 	}
@@ -322,6 +324,8 @@ func (d *Daemon) identityToSession(identity string) string {
 	switch parsed.RoleType {
 	case constants.RoleMayor:
 		return session.MayorSessionName()
+	case constants.RoleMayorsAssistant:
+		return session.MayorsAssistantSessionName()
 	case constants.RoleDeacon:
 		return session.DeaconSessionName()
 	case constants.RoleWitness:
@@ -439,6 +443,8 @@ func (d *Daemon) getWorkDir(config *beads.RoleConfig, parsed *ParsedIdentity) st
 	switch parsed.RoleType {
 	case constants.RoleMayor:
 		return d.config.TownRoot
+	case constants.RoleMayorsAssistant:
+		return filepath.Join(d.config.TownRoot, constants.RoleMayorsAssistant)
 	case constants.RoleDeacon:
 		return d.config.TownRoot
 	case constants.RoleWitness:
@@ -608,9 +614,13 @@ func (d *Daemon) applySessionTheme(sessionName string, parsed *ParsedIdentity) {
 	rigName := parsed.RigName
 	role := parsed.RoleType
 	worker := parsed.RoleType
-	if role == constants.RoleMayor {
+	switch role {
+	case constants.RoleMayor:
 		rigName = ""
 		worker = "Mayor"
+	case constants.RoleMayorsAssistant:
+		rigName = ""
+		worker = "Mayor's Assistant"
 	}
 	theme := tmux.ResolveSessionTheme(d.config.TownRoot, rigName, role, parsed.AgentName)
 	_ = d.tmux.ConfigureGasTownSession(sessionName, theme, rigName, worker, role)
@@ -917,6 +927,8 @@ func (d *Daemon) identityToAgentBeadID(identity string) string {
 		return beads.DeaconBeadIDTown()
 	case constants.RoleMayor:
 		return beads.MayorBeadIDTown()
+	case constants.RoleMayorsAssistant:
+		return beads.MayorsAssistantBeadIDTown()
 	case constants.RoleWitness:
 		prefix := config.GetRigPrefix(d.config.TownRoot, parsed.RigName)
 		return beads.WitnessBeadIDWithPrefix(prefix, parsed.RigName)
@@ -953,7 +965,7 @@ func identityToBDActor(identity string) string {
 	}
 
 	switch parsed.RoleType {
-	case constants.RoleMayor, constants.RoleDeacon:
+	case constants.RoleMayor, constants.RoleMayorsAssistant, constants.RoleDeacon:
 		return parsed.RoleType
 	case constants.RoleWitness:
 		return parsed.RigName + "/witness"

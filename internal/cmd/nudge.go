@@ -510,6 +510,8 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		switch roleInfo.Role {
 		case RoleMayor:
 			sender = constants.RoleMayor
+		case RoleMayorsAssistant:
+			sender = constants.RoleMayorsAssistant
 		case RoleCrew:
 			sender = fmt.Sprintf("%s/crew/%s", roleInfo.Rig, roleInfo.Polecat)
 		case RolePolecat:
@@ -556,6 +558,8 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 	switch target {
 	case constants.RoleMayor:
 		target = session.MayorSessionName()
+	case constants.RoleMayorsAssistant:
+		target = session.MayorsAssistantSessionName()
 	case constants.RoleWitness, constants.RoleRefinery:
 		// These need the current rig
 		roleInfo, err := GetRole()
@@ -825,6 +829,8 @@ func resolveNudgePattern(pattern string, agents []*AgentSession) []string {
 	switch pattern {
 	case constants.RoleMayor:
 		return []string{session.MayorSessionName()}
+	case constants.RoleMayorsAssistant:
+		return []string{session.MayorsAssistantSessionName()}
 	case constants.RoleDeacon:
 		return []string{session.DeaconSessionName()}
 	}
@@ -930,6 +936,8 @@ func sessionNameToAddress(sessionName string) string {
 	switch identity.Role {
 	case session.RoleMayor:
 		return constants.RoleMayor
+	case session.RoleMayorsAssistant:
+		return constants.RoleMayorsAssistant
 	case session.RoleDeacon:
 		return constants.RoleDeacon
 	case session.RoleWitness:
@@ -958,6 +966,8 @@ func addressToAgentBeadID(address string) string {
 	switch address {
 	case constants.RoleMayor:
 		return session.MayorSessionName()
+	case constants.RoleMayorsAssistant:
+		return session.MayorsAssistantSessionName()
 	case constants.RoleDeacon:
 		return session.DeaconSessionName()
 	}

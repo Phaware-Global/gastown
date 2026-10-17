@@ -117,13 +117,14 @@ func TestLoadRoleDefinition_UnknownRole(t *testing.T) {
 
 func TestAllRoles(t *testing.T) {
 	roles := AllRoles()
-	if len(roles) != 8 {
-		t.Errorf("AllRoles() returned %d roles, want 8", len(roles))
+	if len(roles) != 9 {
+		t.Errorf("AllRoles() returned %d roles, want 9", len(roles))
 	}
 
 	expected := map[string]bool{
-		"mayor":    true,
-		"deacon":   true,
+		"mayor":            true,
+		"mayors-assistant": true,
+		"deacon":           true,
 		"dog":      true,
 		"witness":  true,
 		"refinery": true,
@@ -141,8 +142,8 @@ func TestAllRoles(t *testing.T) {
 
 func TestTownRoles(t *testing.T) {
 	roles := TownRoles()
-	if len(roles) != 3 {
-		t.Errorf("TownRoles() returned %d roles, want 3", len(roles))
+	if len(roles) != 4 {
+		t.Errorf("TownRoles() returned %d roles, want 4", len(roles))
 	}
 
 	for _, r := range roles {
@@ -153,6 +154,31 @@ func TestTownRoles(t *testing.T) {
 		if def.Scope != "town" {
 			t.Errorf("role %s has scope %q, expected 'town'", r, def.Scope)
 		}
+	}
+}
+
+func TestMayorsAssistantRoleDefinition(t *testing.T) {
+	def, err := loadBuiltinRoleDefinition("mayors-assistant")
+	if err != nil {
+		t.Fatalf("loadBuiltinRoleDefinition(mayors-assistant) error: %v", err)
+	}
+	if def.Role != "mayors-assistant" || def.Scope != "town" {
+		t.Errorf("role/scope = %q/%q, want mayors-assistant/town", def.Role, def.Scope)
+	}
+	if def.Session.Pattern != "hq-mayors-assistant" {
+		t.Errorf("session pattern = %q, want hq-mayors-assistant", def.Session.Pattern)
+	}
+	if def.Session.WorkDir != "{town}/mayors-assistant" {
+		t.Errorf("work_dir = %q, want {town}/mayors-assistant", def.Session.WorkDir)
+	}
+	if def.Env["GT_ROLE"] != "mayors-assistant" || def.Env["GT_SCOPE"] != "town" {
+		t.Errorf("env = %v, want GT_ROLE=mayors-assistant GT_SCOPE=town", def.Env)
+	}
+	if def.PromptTemplate != "mayors-assistant.md.tmpl" {
+		t.Errorf("prompt_template = %q", def.PromptTemplate)
+	}
+	if got := BuiltinRoleThemes()["mayors-assistant"]; got != "slate" {
+		t.Errorf("builtin theme = %q, want slate", got)
 	}
 }
 

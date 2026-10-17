@@ -117,6 +117,8 @@ func detectSenderFromRole(role string) string {
 	switch role {
 	case constants.RoleMayor:
 		return "mayor/"
+	case constants.RoleMayorsAssistant:
+		return constants.RoleMayorsAssistant + "/"
 	case constants.RoleDeacon:
 		return "deacon/"
 	case constants.RolePolecat:
@@ -262,6 +264,8 @@ func identityFromAgentFile(parsed agentIdentityFile) string {
 	switch role {
 	case constants.RoleMayor:
 		return "mayor/"
+	case constants.RoleMayorsAssistant:
+		return constants.RoleMayorsAssistant + "/"
 	case constants.RoleDeacon:
 		return "deacon/"
 	case constants.RoleWitness:

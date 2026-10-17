@@ -2570,7 +2570,7 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string, pushFailed,
 	// work even if the polecat worktree is deleted.
 	var beadsPath string
 	switch ctx.Role {
-	case RoleMayor, RoleDeacon:
+	case RoleMayor, RoleMayorsAssistant, RoleDeacon:
 		beadsPath = townRoot
 	default:
 		beadsPath = filepath.Join(townRoot, ctx.Rig)

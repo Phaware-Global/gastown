@@ -475,6 +475,26 @@ func DefaultOverrides() map[string]*HooksConfig {
 				},
 			},
 		},
+		// Mayor's Assistant: same autonomy guard as the Mayor — it triages an
+		// unattended inbox and must never block on a human answer.
+		"mayors-assistant": {
+			PreToolUse: []HookEntry{
+				{
+					Matcher: "AskUserQuestion",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: gtCommand("gt tap guard interactive-input"),
+					}},
+				},
+				{
+					Matcher: "EnterPlanMode",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: gtCommand("gt tap guard interactive-input"),
+					}},
+				},
+			},
+		},
 		// Reviewer roles: write-surface guard (P23-2376).
 		// The Reviewer's only sanctioned write surfaces are its review bead, its
 		// own worktree (checkout only), and PR review comments posted through
@@ -867,6 +887,11 @@ func DiscoverTargets(townRoot string) ([]Target, error) {
 		Path: filepath.Join(townRoot, "deacon", ".claude", "settings.json"),
 		Key:  "deacon",
 		Role: "deacon",
+	})
+	targets = append(targets, Target{
+		Path: filepath.Join(townRoot, "mayors-assistant", ".claude", "settings.json"),
+		Key:  "mayors-assistant",
+		Role: "mayors-assistant",
 	})
 
 	// Boot watchdog — ephemeral Claude agent in deacon/dogs/boot/.
