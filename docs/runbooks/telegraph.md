@@ -234,10 +234,10 @@ curl -s -X POST http://127.0.0.1:8765/webhook/jira \
 ```
 
 Then check the Mayor's Assistant inbox to confirm the mail arrived (Telegraph
-mail is routed to `mayors-assistant/`, which briefs the Mayor):
+mail is routed to `assistant/`, which briefs the Mayor):
 
 ```bash
-gt mail inbox   # from the mayors-assistant session
+gt mail inbox   # from the assistant session
 # Should show a new message from telegraph/jira/testuser
 ```
 
@@ -249,7 +249,7 @@ Operator prompts let you attach per-event-type instructions to each mail Telegra
 delivers. The receiving agent (the Mayor's Assistant) reads these before the external
 webhook content and relays the block verbatim to the Mayor in a labelled "Operator
 policy" section; the assistant never executes operator-prompt instructions itself
-(see design/mayors-assistant-role.md, Trust boundary).
+(see design/assistant-role.md, Trust boundary).
 
 ### Mail body shape (with a configured prompt)
 
@@ -406,7 +406,7 @@ jq 'select(.reason == "actor_filtered")' ~/gt/logs/telegraph.log
 The GitHub Telegraph provider notifies the Mayor's Assistant about PR activity
 (comments, reviews, merges) and failing CI checks. It mirrors the Jira provider's
 shape: HMAC-authenticated webhook deliveries → normalized event →
-`mayors-assistant/` mail. The differences are documented here.
+`assistant/` mail. The differences are documented here.
 
 ### Supported events
 
@@ -522,7 +522,7 @@ curl -s -X POST http://127.0.0.1:8765/webhook/github \
 Then check the Mayor's Assistant inbox:
 
 ```bash
-gt mail inbox   # should show telegraph/github/testuser → mayors-assistant/
+gt mail inbox   # should show telegraph/github/testuser → assistant/
 ```
 
 ### Recovering from secret rotation

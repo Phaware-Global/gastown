@@ -349,7 +349,7 @@ func sendCompactDigest(dateStr, body string) error {
 	// Routed to the Mayor's Assistant (digest = inbound information for
 	// triage). deacon/ is not a valid mail address (audit bead serves as the
 	// deacon-side record).
-	mailCmd := exec.Command("gt", "mail", "send", "mayors-assistant/",
+	mailCmd := exec.Command("gt", "mail", "send", "assistant/",
 		"-s", subject,
 		"-m", body,
 	)
@@ -472,7 +472,7 @@ func runWeeklyRollup() error {
 
 	// Routed to the Mayor's Assistant
 	subject := fmt.Sprintf("Weekly Wisp Compaction: %s to %s", weekStart, weekEnd)
-	mailCmd := exec.Command("gt", "mail", "send", "mayors-assistant/",
+	mailCmd := exec.Command("gt", "mail", "send", "assistant/",
 		"-s", subject,
 		"-m", markdown,
 	)

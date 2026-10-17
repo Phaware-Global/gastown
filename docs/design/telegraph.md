@@ -50,7 +50,7 @@ External System
 │   Rate-limited nudge: one nudge per window                      │
 │   Uses existing gt mail + gt nudge primitives                   │
 └─────────────────────────────────────────────────────────────────┘
-      │  gt mail send mayors-assistant/ + gt nudge mayors-assistant/
+      │  gt mail send assistant/ + gt nudge assistant/
       ▼
   Mayor's Assistant ──(BRIEF:/URGENT: mail)──▶ Mayor
 ```
@@ -140,11 +140,11 @@ Never an internal agent address.
 ### To
 
 ```
-mayors-assistant/
+assistant/
 ```
 
 Fixed. Telegraph has no routing logic; the Mayor's Assistant triages events
-and briefs `mayor/` (see [mayors-assistant-role.md](mayors-assistant-role.md)).
+and briefs `mayor/` (see [assistant-role.md](assistant-role.md)).
 
 ### Subject
 
@@ -367,7 +367,7 @@ trigger operator action (observable via log `reason=backpressure` count).
 The assistant should not be flooded with nudges during high event volume.
 Telegraph accumulates mail at full event rate but limits nudges.
 
-**Policy:** at most one `gt nudge mayors-assistant/` per `nudge_window` (default 30 seconds).
+**Policy:** at most one `gt nudge assistant/` per `nudge_window` (default 30 seconds).
 
 **Implementation:**
 ```
@@ -375,7 +375,7 @@ lastNudge time.Time  // zero value = never nudged
 
 after each mail delivery:
     if now - lastNudge >= nudge_window:
-        gt nudge mayors-assistant/ "Telegraph: new events pending"
+        gt nudge assistant/ "Telegraph: new events pending"
         lastNudge = now
 ```
 
@@ -760,10 +760,10 @@ dispatchLoop goroutine
 L3 · Transformer
      │  6. Build Telegraph-* metadata headers from NormalizedEvent
      │  7. Build From, Subject, delimited Body
-     │  8. gt mail send mayors-assistant/ (creates mail bead)
+     │  8. gt mail send assistant/ (creates mail bead)
      │  9. log "deliver"
      │  10. if now - lastNudge >= nudge_window:
-     │        gt nudge mayors-assistant/ "Telegraph: new events pending"
+     │        gt nudge assistant/ "Telegraph: new events pending"
      │        lastNudge = now
      ▼
    Mayor's Assistant inbox (triaged into BRIEF:/URGENT: mail for the Mayor)

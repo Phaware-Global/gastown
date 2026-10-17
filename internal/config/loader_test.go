@@ -4529,7 +4529,7 @@ func TestEscalationConfigDefaults(t *testing.T) {
 	if len(cfg.Routes[SeverityLow]) != 1 || cfg.Routes[SeverityLow][0] != "bead" {
 		t.Errorf("Routes[low] = %v, want [bead]", cfg.Routes[SeverityLow])
 	}
-	// bead, mail:mayors-assistant, mail:mayor, email:human, sms:human
+	// bead, mail:assistant, mail:mayor, email:human, sms:human
 	if len(cfg.Routes[SeverityCritical]) != 5 {
 		t.Errorf("Routes[critical] len = %d, want 5", len(cfg.Routes[SeverityCritical]))
 	}
@@ -4687,8 +4687,8 @@ func TestEscalationConfigGetRouteForSeverity(t *testing.T) {
 	}{
 		{SeverityLow, []string{"bead"}},
 		{SeverityMedium, []string{"bead", "mail:mayor"}},
-		{SeverityHigh, []string{"bead", "mail:mayors-assistant", "mail:mayor"}},     // fallback for missing: direct mayor route
-		{SeverityCritical, []string{"bead", "mail:mayors-assistant", "mail:mayor"}}, // fallback for missing: direct mayor route
+		{SeverityHigh, []string{"bead", "mail:assistant", "mail:mayor"}},     // fallback for missing: direct mayor route
+		{SeverityCritical, []string{"bead", "mail:assistant", "mail:mayor"}}, // fallback for missing: direct mayor route
 	}
 
 	for _, tt := range tests {
@@ -6114,7 +6114,7 @@ func TestStripSlackRoutesReportsSeverities(t *testing.T) {
 	}
 	// A route that loses slack must still reach the mayor, never go silent:
 	// low goes via the assistant's triage inbox, critical directly to mayor/.
-	if want := []string{"mail:mayors-assistant"}; !reflect.DeepEqual(cfg.Routes[SeverityLow], want) {
+	if want := []string{"mail:assistant"}; !reflect.DeepEqual(cfg.Routes[SeverityLow], want) {
 		t.Errorf("Routes[low] = %v, want %v", cfg.Routes[SeverityLow], want)
 	}
 	if want := []string{"bead", "mail:mayor"}; !reflect.DeepEqual(cfg.Routes[SeverityCritical], want) {
@@ -6133,15 +6133,15 @@ func TestStripSlackRoutesReportsSeverities(t *testing.T) {
 	}
 }
 
-// TestNewEscalationConfigRoutesToMayorsAssistant pins the routing change:
+// TestNewEscalationConfigRoutesToAssistant pins the routing change:
 // escalation mail is inbound information for triage, so the shipped defaults
 // deliver to the Mayor's Assistant rather than directly to the Mayor.
-func TestNewEscalationConfigRoutesToMayorsAssistant(t *testing.T) {
+func TestNewEscalationConfigRoutesToAssistant(t *testing.T) {
 	t.Parallel()
 	cfg := NewEscalationConfig()
 	for _, severity := range []string{SeverityMedium, SeverityHigh, SeverityCritical} {
-		if route := cfg.Routes[severity]; !slices.Contains(route, "mail:mayors-assistant") {
-			t.Errorf("Routes[%s] = %v: missing mail:mayors-assistant", severity, route)
+		if route := cfg.Routes[severity]; !slices.Contains(route, "mail:assistant") {
+			t.Errorf("Routes[%s] = %v: missing mail:assistant", severity, route)
 		}
 	}
 	// Medium goes through the assistant only; high/critical keep a direct
@@ -6154,7 +6154,7 @@ func TestNewEscalationConfigRoutesToMayorsAssistant(t *testing.T) {
 			t.Errorf("Routes[%s] = %v: must keep a direct mail:mayor route", severity, route)
 		}
 	}
-	if slices.Contains(cfg.Routes[SeverityLow], "mail:mayors-assistant") {
+	if slices.Contains(cfg.Routes[SeverityLow], "mail:assistant") {
 		t.Errorf("Routes[low] = %v: low severity stays bead-only", cfg.Routes[SeverityLow])
 	}
 }

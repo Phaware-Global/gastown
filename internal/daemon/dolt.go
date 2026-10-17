@@ -661,7 +661,7 @@ Action needed: Investigate and fix the root cause, then restart the daemon or th
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		// Routed to the Mayor's Assistant (infrastructure alert = inbound information for triage).
-		cmd := exec.CommandContext(ctx, "gt", "mail", "send", "mayors-assistant/", "-s", subject, "-m", body) //nolint:gosec // G204: args are constructed internally
+		cmd := exec.CommandContext(ctx, "gt", "mail", "send", "assistant/", "-s", subject, "-m", body) //nolint:gosec // G204: args are constructed internally
 		setSysProcAttr(cmd)
 		cmd.Dir = townRoot
 		cmd.Env = os.Environ()
@@ -702,7 +702,7 @@ Check the log file for crash details. If crashes recur, the daemon will escalate
 	logger := m.logger
 
 	go func() {
-		sendDoltAlertMail(townRoot, "mayors-assistant/", subject, body, logger) // Routed to the Mayor's Assistant
+		sendDoltAlertMail(townRoot, "assistant/", subject, body, logger) // Routed to the Mayor's Assistant
 		sendDoltAlertToWitnesses(townRoot, subject, body, logger)
 	}()
 }
@@ -732,7 +732,7 @@ This may indicate high load, connection exhaustion, or internal server errors.`,
 	logger := m.logger
 
 	go func() {
-		sendDoltAlertMail(townRoot, "mayors-assistant/", subject, body, logger) // Routed to the Mayor's Assistant
+		sendDoltAlertMail(townRoot, "assistant/", subject, body, logger) // Routed to the Mayor's Assistant
 		sendDoltAlertToWitnesses(townRoot, subject, body, logger)
 	}()
 }
@@ -1497,7 +1497,7 @@ concurrent polecat count or staggering write-heavy operations.`,
 	logger := m.logger
 
 	go func() {
-		sendDoltAlertMail(townRoot, "mayors-assistant/", subject, body, logger) // Routed to the Mayor's Assistant
+		sendDoltAlertMail(townRoot, "assistant/", subject, body, logger) // Routed to the Mayor's Assistant
 		sendDoltAlertToWitnesses(townRoot, subject, body, logger)
 	}()
 }

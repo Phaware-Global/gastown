@@ -278,8 +278,8 @@ func TestIntegration_IssueCreated_MailEnvelope(t *testing.T) {
 	msgs := p.waitMessages(t, 1, 2*time.Second)
 	msg := msgs[0]
 
-	if msg.To != "mayors-assistant/" {
-		t.Errorf("To = %q, want mayors-assistant/", msg.To)
+	if msg.To != "assistant/" {
+		t.Errorf("To = %q, want assistant/", msg.To)
 	}
 	if msg.From != "telegraph/jira/alice" {
 		t.Errorf("From = %q, want telegraph/jira/alice", msg.From)
@@ -844,8 +844,8 @@ func TestIntegration_GitHub_PRMerged_DeliveredToMayor(t *testing.T) {
 	if msg.From != "telegraph/github/alice" {
 		t.Errorf("From = %q", msg.From)
 	}
-	if msg.To != "mayors-assistant/" {
-		t.Errorf("To = %q, want mayors-assistant/", msg.To)
+	if msg.To != "assistant/" {
+		t.Errorf("To = %q, want assistant/", msg.To)
 	}
 	if !strings.Contains(msg.Subject, "[GITHUB acme/widget#42]") {
 		t.Errorf("subject missing tag: %q", msg.Subject)

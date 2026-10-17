@@ -86,7 +86,7 @@ if [ "${#FINDINGS[@]}" -gt 0 ]; then
   [ "$HAS_REAL" = true ] && SUBJECT="$SUBJECT — includes unresolved work"
 
   # Routed to the Mayor's Assistant (findings = inbound information for triage).
-  gt mail send mayors-assistant/ -s "$SUBJECT" --stdin <<< "$BODY"
+  gt mail send assistant/ -s "$SUBJECT" --stdin <<< "$BODY"
 
   for F in "${FINDINGS[@]}"; do
     IFS='|' read -r RIG BEAD_ID PR_NUM UNRESOLVED TITLE <<< "$F"

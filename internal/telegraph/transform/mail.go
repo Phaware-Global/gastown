@@ -2,7 +2,7 @@
 // It is provider-agnostic; it consumes NormalizedEvent from L2 and produces
 // mail addressed to the Mayor's Assistant plus at most one nudge per configured
 // window. (Routed to the Mayor's Assistant: the assistant triages inbound
-// events and briefs the Mayor; see docs/design/mayors-assistant-role.md.)
+// events and briefs the Mayor; see docs/design/assistant-role.md.)
 package transform
 
 import (
@@ -63,7 +63,7 @@ func (n *ExecNudger) Nudge(target, message string) error {
 // Assistant inbox. Telegraph has no routing logic; the assistant consolidates
 // events and briefs mayor/. The address is a well-known town-level singleton,
 // so mail queues in the town store even when the assistant session is down.
-const Recipient = "mayors-assistant/"
+const Recipient = "assistant/"
 
 // nudgeCommandArgs builds the `gt nudge` argument vector for telegraph wakeups.
 //
