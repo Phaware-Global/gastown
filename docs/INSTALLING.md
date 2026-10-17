@@ -326,17 +326,39 @@ gt doctor --fix
 
 On macOS, if you have granted `gt` Full Disk Access or Removable Volumes
 access, sign the installed binary with a stable identity so those grants
-survive rebuilds. Create a self-signed Code Signing certificate in Keychain
-Access (for example `gt-local`), then install with:
+survive rebuilds. An ad-hoc signature changes hash on every build, which
+invalidates the grants and makes tccd re-hash the binary on every gt call.
 
-```bash
-make install GT_CODESIGN_IDENTITY=gt-local
-```
+1. In Keychain Access, create a self-signed certificate (Certificate
+   Assistant, type Code Signing), for example `gt-local`. Set the validity
+   period there if you want more than the one-year default.
+2. Install with the identity passed on the command line:
 
-Set `GT_CODESIGN_IDENTITY` in the shell environment that runs rebuilds to make
-this the default. Re-grant the privacy permissions once after the first signed
-install; later rebuilds keep them. Signing needs the login keychain, so run it
-from a GUI login session (a tmux session is fine), not a bare ssh session.
+   ```bash
+   make install GT_CODESIGN_IDENTITY=gt-local
+   ```
+
+   The first signed run shows a keychain dialog asking whether `codesign` may
+   use the key. Choose **Always Allow**, or unattended rebuilds will block on
+   that dialog. Equivalent, without the dialog:
+
+   ```bash
+   security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k <login password> ~/Library/Keychains/login.keychain-db
+   ```
+
+3. Remove and re-add `gt` under Full Disk Access, and approve the Removable
+   Volumes prompt, once. Later signed rebuilds keep the grants.
+
+Signing needs the login keychain, so run it from a GUI login session (a tmux
+session is fine), not a bare ssh session. If signing fails, the existing
+install is left untouched and `make` exits non-zero.
+
+Do not export `GT_CODESIGN_IDENTITY` in a shell profile or shared agent
+environment. Anything able to use the key can produce a `gt` that silently
+inherits gt's privacy grants, so limit signing to deliberate installs and to
+the rebuild-gt plugin, which reads the identity from
+`$TOWN_ROOT/settings/gt-codesign-identity` for its origin/main build only
+(see plugins/rebuild-gt/plugin.md).
 
 If you maintain Beads separately from Homebrew, update `bd` from its own source:
 

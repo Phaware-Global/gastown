@@ -45,10 +45,15 @@ restarted while sessions are active; sessions pick up the new binary on their
 next cycle.
 
 On macOS hosts where `gt` holds privacy grants (Full Disk Access, Removable
-Volumes), export `GT_CODESIGN_IDENTITY` in the rebuild environment so
-`safe-install` signs the binary with a stable identity. An unsigned rebuild
-invalidates those grants and floods tccd on every gt call until an operator
-re-grants them. See docs/INSTALLING.md.
+Volumes), put a keychain code-signing identity name (for example `gt-local`)
+on the first line of `$TOWN_ROOT/settings/gt-codesign-identity`. `run.sh`
+passes it to `make safe-install` for the origin/main build only, so the
+installed binary keeps a stable designated requirement and the grants survive
+rebuilds. Do not export `GT_CODESIGN_IDENTITY` in the shared agent
+environment: anything able to use the key can mint a `gt` that inherits those
+grants. The key must allow `codesign` without a prompt (choose Always Allow on
+the first signed install), or an unattended rebuild blocks on the keychain
+dialog. See docs/INSTALLING.md.
 
 The Deacon evaluates the cooldown gate before dispatch. If the gate is closed,
 skip.

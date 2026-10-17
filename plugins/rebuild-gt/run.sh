@@ -33,6 +33,17 @@ SKIP_COUNT_FILE="${TOWN_ROOT}/gastown/.gt-build-skip-count"
 # original incident this bead fixes ran silently for hours.
 SKIP_ESCALATE_THRESHOLD=3
 
+# Optional stable code-signing identity for the installed gt, so macOS TCC
+# grants (Full Disk Access, Removable Volumes) survive rebuilds. Read from a
+# town settings file and passed only to this origin/main build, never exported
+# globally: any process able to use the key can mint a gt that inherits gt's
+# privacy grants. See docs/INSTALLING.md.
+CODESIGN_IDENTITY_FILE="${TOWN_ROOT}/settings/gt-codesign-identity"
+GT_CODESIGN_IDENTITY=""
+if [ -r "$CODESIGN_IDENTITY_FILE" ]; then
+  GT_CODESIGN_IDENTITY=$(head -n 1 "$CODESIGN_IDENTITY_FILE" | tr -d '[:space:]')
+fi
+
 log() { echo "[rebuild-gt] $*"; }
 
 # record_run TITLE RESULT [DETAIL] — write the ephemeral plugin-run receipt.
@@ -194,8 +205,11 @@ fi
 
 OLD_VER=$(gt version 2>/dev/null | head -1 || echo "unknown")
 log "Rebuilding gt from $BUILD_ROOT (origin/main)..."
+if [ -n "$GT_CODESIGN_IDENTITY" ]; then
+  log "Signing the installed binary with identity '$GT_CODESIGN_IDENTITY' (from $CODESIGN_IDENTITY_FILE)"
+fi
 
-if (cd "$BUILD_ROOT" && make build && make safe-install) 2>&1; then
+if (cd "$BUILD_ROOT" && make build && make safe-install GT_CODESIGN_IDENTITY="$GT_CODESIGN_IDENTITY") 2>&1; then
   NEW_VER=$(gt version 2>/dev/null | head -1 || echo "unknown")
   log "Rebuilt: $OLD_VER -> $NEW_VER"
   record_run "rebuild-gt: $OLD_VER -> $NEW_VER" "success"

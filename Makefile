@@ -10,11 +10,21 @@ INSTALL_DIR := $(HOME)/.local/bin
 # tccd re-hashes the binary on every gt call until an operator re-grants them.
 # A self-signed Code Signing certificate keeps the designated requirement
 # stable across rebuilds. Opt in with: make install GT_CODESIGN_IDENTITY=gt-local
+# Pass it per invocation rather than exporting it globally: any process that
+# can use the key can mint a gt that inherits gt's privacy grants.
+# The macro signs the staged copy ($(1), always a .new file) before it is moved
+# into place, so a failed signature leaves the existing install untouched.
 GT_CODESIGN_IDENTITY ?=
 define codesign-binary
 	if [ -n "$(GT_CODESIGN_IDENTITY)" ]; then \
-		codesign -f -s "$(GT_CODESIGN_IDENTITY)" --identifier com.gastown.$(BINARY) "$(1)" && \
-		echo "Signed $(1) with identity $(GT_CODESIGN_IDENTITY)"; \
+		if ! command -v codesign >/dev/null 2>&1; then \
+			echo "Warning: GT_CODESIGN_IDENTITY is set but codesign is not available; installing unsigned"; \
+		elif codesign -f -s "$(GT_CODESIGN_IDENTITY)" --identifier com.gastown.$(BINARY) "$(1)"; then \
+			echo "Signed $(1) with identity $(GT_CODESIGN_IDENTITY)"; \
+		else \
+			echo "Error: codesign with identity $(GT_CODESIGN_IDENTITY) failed; existing install left untouched"; \
+			rm -f "$(1)"; exit 1; \
+		fi; \
 	fi
 endef
 # Per-platform artifacts for push_binaries (§4.1). A worker is refreshed from
@@ -128,9 +138,10 @@ check-install-path:
 
 install: check-up-to-date build
 	@mkdir -p $(INSTALL_DIR)
-	@rm -f $(INSTALL_DIR)/$(BINARY)
-	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY)
-	@$(call codesign-binary,$(INSTALL_DIR)/$(BINARY))
+	@# Stage, sign, then move: a failed signature must not leave a half-done install.
+	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY).new
+	@$(call codesign-binary,$(INSTALL_DIR)/$(BINARY).new)
+	@mv $(INSTALL_DIR)/$(BINARY).new $(INSTALL_DIR)/$(BINARY)
 	@$(MAKE) --no-print-directory install-remote-execution-binaries
 	@# Nuke any stale go-install binaries that shadow the canonical location
 	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY); do \
