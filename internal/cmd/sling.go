@@ -796,6 +796,15 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 
 	// Handle --force when bead is already hooked/in_progress: send shutdown to old polecat and unhook (GH#1380)
 	if (info.Status == "hooked" || info.Status == "in_progress") && force && info.Assignee != "" {
+		// Never shut down a polecat whose worktree holds unpreserved work (gt-a02n).
+		// Re-slinging to the same polecat keeps its worktree, so nothing is lost there.
+		if info.Assignee != targetAgent && !slingDryRun {
+			if err := checkReassignPreservesWork(townRoot, info.Assignee); err != nil {
+				rollbackSpawnedPolecat("Reassign guard failed")
+				return err
+			}
+		}
+
 		fmt.Printf("%s Bead already hooked to %s, forcing reassignment...\n", style.Warning.Render("⚠"), info.Assignee)
 
 		// Determine requester identity from env vars, fall back to "gt-sling"
