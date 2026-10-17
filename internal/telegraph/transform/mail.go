@@ -176,6 +176,10 @@ func (t *Transformer) maybeNudge(_ *telegraph.NormalizedEvent) {
 // must not be able to smuggle that heading through a briefing.
 const operatorPolicyHeading = "operator policy (from telegraph config)"
 
+// lineSeparators maps the Unicode line separators to "\n" so delimiter
+// matching sees the same lines a model does.
+var lineSeparators = strings.NewReplacer("\r\n", "\n", "\r", "\n", "\u2028", "\n", "\u2029", "\n", "\u0085", "\n")
+
 // neutralizeDelimiters defuses trust-delimiter lines inside external text so
 // a provider comment cannot close its own EXTERNAL CONTENT block, open a fake
 // OPERATOR PROMPT, or forge the assistant's "Operator policy" heading and
@@ -184,6 +188,10 @@ const operatorPolicyHeading = "operator policy (from telegraph config)"
 // with a visible marker, which keeps the text readable but stops it matching
 // the real delimiters and headings emitted around it.
 func neutralizeDelimiters(text string) string {
+	// Normalize every line separator first: a delimiter joined by \r, U+2028,
+	// U+2029 or U+0085 would otherwise sit inside a "line" the matcher never
+	// sees as starting with "---", while an LLM still reads it as a line.
+	text = lineSeparators.Replace(text)
 	if !strings.Contains(text, "---") && !strings.Contains(strings.ToLower(text), operatorPolicyHeading) {
 		return text
 	}
