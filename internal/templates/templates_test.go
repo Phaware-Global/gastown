@@ -210,7 +210,7 @@ func TestRenderRole_MayorsAssistant(t *testing.T) {
 	// configured sweep cadence, and the resolved session names.
 	for _, want := range []string{
 		"BRIEF:", "URGENT:", "SWEEP:",
-		"EXTERNAL CONTENT", "[neutralized delimiter]", "not delegable", // trust boundary + delegation limits (review of #283)
+		"EXTERNAL CONTENT", "[neutralized delimiter]", "not delegable", "Operator policy (from telegraph", // trust boundary + delegation limits (review of #283)
 		"gt mail send mayor/",
 		"mail mark-read",
 		"**45m**",
