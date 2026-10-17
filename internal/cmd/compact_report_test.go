@@ -433,7 +433,7 @@ func setupCompactReportCommandStubs(t *testing.T) string {
 
 	bdScript := `#!/bin/sh
 case "$1" in
-  list)
+  list|sql)
     printf '[]\n'
     ;;
   create)
