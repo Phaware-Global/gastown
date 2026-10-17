@@ -2,36 +2,55 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
 const (
 	defaultDoltBackupInterval = 15 * time.Minute
-	// doltBackupTimeout is generous so a large commit delta on a big database
-	// (e.g. hq under a wisp flood) does not blow the deadline mid-sync. The old
-	// 120s ceiling produced spurious exit-1 backup failures (gt-ye21).
-	doltBackupTimeout = 5 * time.Minute
-	// doltBackupRetries / doltBackupRetryDelay retry a failed sync after a short
-	// pause, so a transient lock (a concurrent dolt op holding the db) does not
-	// fail the whole backup cycle.
-	doltBackupRetries    = 1
-	doltBackupRetryDelay = 5 * time.Second
+	// doltBackupRetries retries a failed sync after a short pause
+	// (doltBackupRetryDelay), so a transient lock (a concurrent dolt op holding
+	// the db) does not fail the whole backup cycle.
+	doltBackupRetries = 1
 	// doltOffsiteBackupTimeout bounds the offsite rsync to iCloud. The backup
 	// tree can reach many GB (hq alone hit 1.5GB during the hq-09sb1 wisp
 	// flood); the old 60s ceiling SIGKILLed rsync every cycle, so the offsite
 	// copy silently fell days behind. The rsync runs in a guarded goroutine,
 	// so a long catch-up sync does not block the daemon loop.
 	doltOffsiteBackupTimeout = 30 * time.Minute
+	// doltBackupWaitDelay bounds how long Wait lingers after the sync process is
+	// killed: a grandchild that inherited the output pipe must not hold the
+	// daemon's main loop past the deadline.
+	doltBackupWaitDelay = 10 * time.Second
 )
+
+// Vars rather than consts so tests can shorten them.
+var (
+	// doltBackupTimeout is generous so a large commit delta on a big database
+	// (e.g. hq under a wisp flood) does not blow the deadline mid-sync. The old
+	// 120s ceiling produced spurious exit-1 backup failures (gt-ye21).
+	doltBackupTimeout    = 5 * time.Minute
+	doltBackupRetryDelay = 5 * time.Second
+)
+
+// errDoltBackupTimeout marks a sync killed at doltBackupTimeout. A timed-out
+// sync means the server (or the filesystem) is wedged, so retrying it or moving
+// on to the next database only stacks more hung processes: on 2026-10-13 every
+// sync hit the ceiling for 1h24m, 2 attempts x 5m x 13 databases, before the
+// server stopped answering handshakes.
+var errDoltBackupTimeout = errors.New("dolt backup sync timed out")
 
 // doltBackupInterval returns the configured backup interval, or the default (15m).
 func doltBackupInterval(config *DaemonPatrolConfig) time.Duration {
@@ -105,17 +124,7 @@ func (d *Daemon) syncDoltBackups() {
 
 	d.logger.Printf("dolt_backup: syncing %d database(s)", len(databases))
 
-	synced := 0
-	var failures []string
-	for _, db := range databases {
-		backupName := db + "-backup"
-		if err := d.syncBackup(dataDir, db, backupName); err != nil {
-			d.logger.Printf("dolt_backup: %s: sync failed: %v", db, err)
-			failures = append(failures, db)
-		} else {
-			synced++
-		}
-	}
+	synced, failures := d.syncBackupCycle(dataDir, databases)
 
 	d.logger.Printf("dolt_backup: synced %d/%d database(s)", synced, len(databases))
 
@@ -161,9 +170,66 @@ func (d *Daemon) syncDoltBackups() {
 	}()
 }
 
+// syncBackupCycle syncs each database in order and returns how many succeeded
+// and which did not. It stops early, counting the rest as failed, when the
+// server stops accepting connections or a sync times out.
+func (d *Daemon) syncBackupCycle(dataDir string, databases []string) (synced int, failures []string) {
+	for i, db := range databases {
+		// With the server down, `dolt backup sync` falls back to opening the
+		// database files directly and takes the exclusive noms/LOCK, which then
+		// blocks `gt dolt start` until the sync exits. Only sync through a live
+		// server.
+		if !d.doltServerAcceptingConnections() {
+			d.logger.Printf("dolt_backup: dolt server not accepting connections, skipping %d remaining database(s)", len(databases)-i)
+			failures = append(failures, databases[i:]...)
+			break
+		}
+		backupName := db + "-backup"
+		if err := d.syncBackup(dataDir, db, backupName); err != nil {
+			d.logger.Printf("dolt_backup: %s: sync failed: %v", db, err)
+			failures = append(failures, db)
+			if errors.Is(err, errDoltBackupTimeout) {
+				d.logger.Printf("dolt_backup: %s: timed out, aborting cycle (%d database(s) not attempted)", db, len(databases)-i-1)
+				failures = append(failures, databases[i+1:]...)
+				break
+			}
+		} else {
+			synced++
+		}
+	}
+	return synced, failures
+}
+
+// doltServerAcceptingConnections reports whether a backup sync may run: the
+// Dolt server must accept connections. A daemon-managed server is checked on
+// its configured port; when the daemon does not manage Dolt (the default), the
+// town's server, started by `gt dolt start`, is checked at the address
+// doltserver.DefaultConfig resolves.
+func (d *Daemon) doltServerAcceptingConnections() bool {
+	if d.doltServer != nil && d.doltServer.IsEnabled() {
+		return d.doltServer.isDoltServerOnPort()
+	}
+	townRoot := ""
+	if d.config != nil {
+		townRoot = d.config.TownRoot
+	}
+	cfg := doltserver.DefaultConfig(townRoot)
+	host := cfg.Host
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(cfg.Port)), 2*time.Second)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
 // syncBackup runs `dolt backup sync <backup-name>` for a single database,
 // retrying once on failure so a transient lock or large delta does not fail the
-// cycle (gt-ye21).
+// cycle (gt-ye21). A timeout is not retried: it returns errDoltBackupTimeout.
+// Nor is a failure once the server has stopped accepting connections.
 func (d *Daemon) syncBackup(dataDir, db, backupName string) error {
 	parentCtx := d.ctx
 	if parentCtx == nil {
@@ -182,18 +248,29 @@ func (d *Daemon) syncBackup(dataDir, db, backupName string) error {
 				timer.Stop()
 				return parentCtx.Err()
 			}
+			// The server may have gone down since the failed attempt; a retry
+			// against a down server would take noms/LOCK directly.
+			if !d.doltServerAcceptingConnections() {
+				d.logger.Printf("dolt_backup: %s: dolt server not accepting connections, not retrying", db)
+				return lastErr
+			}
 		}
 
 		ctx, cancel := context.WithTimeout(parentCtx, doltBackupTimeout)
 		cmd := exec.CommandContext(ctx, "dolt", "backup", "sync", backupName)
 		cmd.Dir = dbDir
 		util.SetProcessGroup(cmd)
+		cmd.WaitDelay = doltBackupWaitDelay
 
 		output, err := cmd.CombinedOutput()
+		timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
 		cancel()
 		if err == nil {
 			d.logger.Printf("dolt_backup: %s: synced to %s", db, backupName)
 			return nil
+		}
+		if timedOut {
+			return fmt.Errorf("%w after %s: %s", errDoltBackupTimeout, doltBackupTimeout, strings.TrimSpace(string(output)))
 		}
 		lastErr = fmt.Errorf("%s: %s", err, strings.TrimSpace(string(output)))
 	}
