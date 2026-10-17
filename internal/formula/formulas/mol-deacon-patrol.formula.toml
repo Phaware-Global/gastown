@@ -884,46 +884,48 @@ gt dog list --json
 # Filter for state: "working"
 ```
 
-**Step 2: Check work duration**
-For each working dog:
-```bash
-gt dog status <name> --json
-# Check: work_started_at, current_work
-```
+**Step 2: Read work timing**
+`gt dog list --json` and `gt dog status <name> --json` report timing for every
+working dog. Use these fields as given:
 
-Compare against timeout:
-- If plugin has [execution] timeout in plugin.md, use that
-- Default timeout: 10 minutes for infrastructure tasks
+| Field | Meaning |
+|-------|---------|
+| `work_elapsed_seconds` | How long the current work has run |
+| `timeout_seconds` | The plugin's `[execution]` timeout, or 600 (10m) when the work names none |
+| `over_timeout_ratio` | `work_elapsed_seconds / timeout_seconds` |
 
-**Duration calculation:**
-```
-stuck_threshold = plugin_timeout or 10m
-duration = now - work_started_at
-is_stuck = duration > stuck_threshold
-```
+**Never compute a duration yourself.** Do not subtract `work_started_at` from
+the current time or convert between time zones: the timestamp carries a UTC
+offset, and hand-computed durations have come out wrong by exactly that offset
+(a 7-minute run reported as ~6 hours). Quote `work_elapsed_seconds` and
+`timeout_seconds` in any warrant or mail.
 
 **Step 3: Handle stuck dogs**
 
-For dogs working > timeout:
+Act on `over_timeout_ratio` only. A dog at or below 1.0 is healthy.
+
+For dogs with `over_timeout_ratio` > 2:
 ```bash
 # Option A: File death warrant (Boot handles termination)
-gt warrant file deacon/dogs/<name> --reason "Stuck: working on <work> for <duration>"
+gt warrant file deacon/dogs/<name> --reason "Stuck: working on <work> for <work_elapsed_seconds>s (timeout <timeout_seconds>s)"
 
 # Option B: Force clear work and notify
 gt dog clear <name> --force
-gt mail send deacon/ -s "DOG_TIMEOUT <name>" -m "Dog <name> timed out on <work> after <duration>"
+gt mail send deacon/ -s "DOG_TIMEOUT <name>" -m "Dog <name> timed out on <work> after <work_elapsed_seconds>s (timeout <timeout_seconds>s)"
 ```
 
 **Decision matrix:**
 
-| Duration over timeout | Action |
+| `over_timeout_ratio` | Action |
 |----------------------|--------|
-| < 2x timeout | Log warning, check next cycle |
-| 2x - 5x timeout | File death warrant |
-| > 5x timeout | Force clear + escalate to Mayor |
+| <= 1 | Healthy, nothing to do |
+| > 1 and <= 2 | Log warning, check next cycle. No warrant, no mail |
+| > 2 and <= 5 | File death warrant |
+| > 5 | Force clear + escalate to Mayor |
 
 **Step 4: Track chronic failures**
-If same dog gets stuck repeatedly:
+Only when the same dog has timed out repeatedly (N >= 2 in the last 24h).
+A single overrun, even one that earned a warrant, is not chronic:
 ```bash
 gt mail send mayor/ -s "Dog <name> chronic failures" \
   -m "Dog has timed out N times in last 24h. Consider removing from pool."
