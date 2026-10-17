@@ -17,10 +17,10 @@ func MayorSessionName() string {
 	return HQPrefix + "mayor"
 }
 
-// MayorsAssistantSessionName returns the session name for the Mayor's Assistant.
+// AssistantSessionName returns the session name for the Mayor's Assistant.
 // One assistant per machine, like the Mayor it serves.
-func MayorsAssistantSessionName() string {
-	return HQPrefix + "mayors-assistant"
+func AssistantSessionName() string {
+	return HQPrefix + "assistant"
 }
 
 // DeaconSessionName returns the session name for the Deacon agent.

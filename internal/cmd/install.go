@@ -872,8 +872,8 @@ func initTownAgentBeads(townPath string) error {
 			title:    "Mayor - global coordinator, handles cross-rig communication and escalations.",
 		},
 		{
-			id:       beads.MayorsAssistantBeadIDTown(),
-			roleType: constants.RoleMayorsAssistant,
+			id:       beads.AssistantBeadIDTown(),
+			roleType: constants.RoleAssistant,
 			title:    "Mayor's Assistant - triages inbound mail, telegraph and escalations; briefs the Mayor.",
 		},
 		{

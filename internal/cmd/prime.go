@@ -53,8 +53,8 @@ type Role string
 
 const (
 	RoleMayor Role = "mayor"
-	// RoleMayorsAssistant is the Mayor's inbound-triage assistant (town-level).
-	RoleMayorsAssistant Role = "mayors-assistant"
+	// RoleAssistant is the Mayor's inbound-triage assistant (town-level).
+	RoleAssistant Role = "assistant"
 	RoleDeacon          Role = "deacon"
 	RoleBoot            Role = "boot"
 	RoleWitness         Role = "witness"
@@ -1100,7 +1100,7 @@ func buildRoleAnnouncement(ctx RoleContext) string {
 	switch ctx.Role {
 	case RoleMayor:
 		return "Mayor, checking in."
-	case RoleMayorsAssistant:
+	case RoleAssistant:
 		return "Mayor's Assistant, checking in."
 	case RoleDeacon:
 		return "Deacon, checking in."
@@ -1138,8 +1138,8 @@ func getAgentIdentity(ctx RoleContext) string {
 		return fmt.Sprintf("%s/polecats/%s", ctx.Rig, ctx.Polecat)
 	case RoleMayor:
 		return "mayor"
-	case RoleMayorsAssistant:
-		return constants.RoleMayorsAssistant
+	case RoleAssistant:
+		return constants.RoleAssistant
 	case RoleDeacon:
 		return "deacon"
 	case RoleBoot:
@@ -1213,8 +1213,8 @@ func getAgentBeadID(ctx RoleContext) string {
 	switch ctx.Role {
 	case RoleMayor:
 		return beads.MayorBeadIDTown()
-	case RoleMayorsAssistant:
-		return beads.MayorsAssistantBeadIDTown()
+	case RoleAssistant:
+		return beads.AssistantBeadIDTown()
 	case RoleDeacon:
 		return beads.DeaconBeadIDTown()
 	case RoleBoot:

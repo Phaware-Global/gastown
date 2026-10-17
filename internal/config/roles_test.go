@@ -123,7 +123,7 @@ func TestAllRoles(t *testing.T) {
 
 	expected := map[string]bool{
 		"mayor":            true,
-		"mayors-assistant": true,
+		"assistant": true,
 		"deacon":           true,
 		"dog":      true,
 		"witness":  true,
@@ -157,27 +157,27 @@ func TestTownRoles(t *testing.T) {
 	}
 }
 
-func TestMayorsAssistantRoleDefinition(t *testing.T) {
-	def, err := loadBuiltinRoleDefinition("mayors-assistant")
+func TestAssistantRoleDefinition(t *testing.T) {
+	def, err := loadBuiltinRoleDefinition("assistant")
 	if err != nil {
-		t.Fatalf("loadBuiltinRoleDefinition(mayors-assistant) error: %v", err)
+		t.Fatalf("loadBuiltinRoleDefinition(assistant) error: %v", err)
 	}
-	if def.Role != "mayors-assistant" || def.Scope != "town" {
-		t.Errorf("role/scope = %q/%q, want mayors-assistant/town", def.Role, def.Scope)
+	if def.Role != "assistant" || def.Scope != "town" {
+		t.Errorf("role/scope = %q/%q, want assistant/town", def.Role, def.Scope)
 	}
-	if def.Session.Pattern != "hq-mayors-assistant" {
-		t.Errorf("session pattern = %q, want hq-mayors-assistant", def.Session.Pattern)
+	if def.Session.Pattern != "hq-assistant" {
+		t.Errorf("session pattern = %q, want hq-assistant", def.Session.Pattern)
 	}
-	if def.Session.WorkDir != "{town}/mayors-assistant" {
-		t.Errorf("work_dir = %q, want {town}/mayors-assistant", def.Session.WorkDir)
+	if def.Session.WorkDir != "{town}/assistant" {
+		t.Errorf("work_dir = %q, want {town}/assistant", def.Session.WorkDir)
 	}
-	if def.Env["GT_ROLE"] != "mayors-assistant" || def.Env["GT_SCOPE"] != "town" {
-		t.Errorf("env = %v, want GT_ROLE=mayors-assistant GT_SCOPE=town", def.Env)
+	if def.Env["GT_ROLE"] != "assistant" || def.Env["GT_SCOPE"] != "town" {
+		t.Errorf("env = %v, want GT_ROLE=assistant GT_SCOPE=town", def.Env)
 	}
-	if def.PromptTemplate != "mayors-assistant.md.tmpl" {
+	if def.PromptTemplate != "assistant.md.tmpl" {
 		t.Errorf("prompt_template = %q", def.PromptTemplate)
 	}
-	if got := BuiltinRoleThemes()["mayors-assistant"]; got != "slate" {
+	if got := BuiltinRoleThemes()["assistant"]; got != "slate" {
 		t.Errorf("builtin theme = %q, want slate", got)
 	}
 }

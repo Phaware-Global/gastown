@@ -182,8 +182,8 @@ func TestAddressToSessionIDs(t *testing.T) {
 		// Town-level addresses - single session
 		{"mayor", []string{"hq-mayor"}},
 		{"mayor/", []string{"hq-mayor"}},
-		{"mayors-assistant", []string{"hq-mayors-assistant"}}, // shares "mayor" prefix; must not map to hq-mayor
-		{"mayors-assistant/", []string{"hq-mayors-assistant"}},
+		{"assistant", []string{"hq-assistant"}},
+		{"assistant/", []string{"hq-assistant"}},
 		{"deacon", []string{"hq-deacon"}},
 
 		// Rig singletons - single session (no crew/polecat ambiguity)
@@ -2244,18 +2244,18 @@ func TestBuildReplyReminderMessage(t *testing.T) {
 	}
 }
 
-// TestAddressToAgentBeadID_MayorsAssistant guards the prefix-collision fix:
-// "mayors-assistant" starts with "mayor" and used to resolve to the Mayor.
-func TestAddressToAgentBeadID_MayorsAssistant(t *testing.T) {
-	for _, addr := range []string{"mayors-assistant", "mayors-assistant/"} {
-		if got := addressToAgentBeadID(addr); got != "hq-mayors-assistant" {
-			t.Errorf("addressToAgentBeadID(%q) = %q, want hq-mayors-assistant", addr, got)
+// TestAddressToAgentBeadID_Assistant guards the exact-match routing of the
+// town-level assistant address (and that mayor/ still maps to the Mayor).
+func TestAddressToAgentBeadID_Assistant(t *testing.T) {
+	for _, addr := range []string{"assistant", "assistant/"} {
+		if got := addressToAgentBeadID(addr); got != "hq-assistant" {
+			t.Errorf("addressToAgentBeadID(%q) = %q, want hq-assistant", addr, got)
 		}
 	}
 	if got := addressToAgentBeadID("mayor/"); got != "hq-mayor" {
 		t.Errorf("addressToAgentBeadID(mayor/) = %q, want hq-mayor", got)
 	}
-	if got := agentBeadToAddress(&agentBead{ID: "hq-mayors-assistant"}); got != "mayors-assistant/" {
-		t.Errorf("agentBeadToAddress(hq-mayors-assistant) = %q, want mayors-assistant/", got)
+	if got := agentBeadToAddress(&agentBead{ID: "hq-assistant"}); got != "assistant/" {
+		t.Errorf("agentBeadToAddress(hq-assistant) = %q, want assistant/", got)
 	}
 }

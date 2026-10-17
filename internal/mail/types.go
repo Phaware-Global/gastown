@@ -563,8 +563,8 @@ func normalizeAddress(s string) string {
 	if s == "deacon" || s == "deacon/" {
 		return "deacon/"
 	}
-	if s == "mayors-assistant" || s == "mayors-assistant/" {
-		return "mayors-assistant/"
+	if s == "assistant" || s == "assistant/" {
+		return "assistant/"
 	}
 
 	// Resolve rig-scoped town-level roles to their canonical form (gt-te23).
@@ -577,8 +577,8 @@ func normalizeAddress(s string) string {
 			return "mayor/"
 		case "deacon":
 			return "deacon/"
-		case "mayors-assistant":
-			return "mayors-assistant/"
+		case "assistant":
+			return "assistant/"
 		}
 	}
 

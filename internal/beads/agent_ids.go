@@ -26,11 +26,10 @@ func MayorBeadIDTown() string {
 	return TownBeadsPrefix + "-mayor"
 }
 
-// MayorsAssistantBeadIDTown returns the Mayor's Assistant agent bead ID for
-// town-level beads (hq-mayors-assistant). The role name is hyphenated, so
-// ParseAgentBeadID/ValidateAgentID match it whole before splitting on "-".
-func MayorsAssistantBeadIDTown() string {
-	return TownBeadsPrefix + "-" + constants.RoleMayorsAssistant
+// AssistantBeadIDTown returns the Mayor's Assistant agent bead ID for
+// town-level beads (hq-assistant).
+func AssistantBeadIDTown() string {
+	return TownBeadsPrefix + "-" + constants.RoleAssistant
 }
 
 // DeaconBeadIDTown returns the Deacon agent bead ID for town-level beads.
@@ -49,18 +48,18 @@ func DogBeadIDTown(name string) string {
 
 // ValidAgentRoles are the known agent role types for ID pattern validation.
 var ValidAgentRoles = []string{
-	constants.RoleMayor,           // Town-level: gt-mayor
-	constants.RoleMayorsAssistant, // Town-level: hq-mayors-assistant (hyphenated; matched whole)
-	constants.RoleDeacon,          // Town-level: gt-deacon
-	"dog",                         // Town-level with name: gt-dog-<name>
-	constants.RoleWitness,         // Per-rig: gt-<rig>-witness
-	constants.RoleRefinery,        // Per-rig: gt-<rig>-refinery
-	constants.RoleCrew,            // Per-rig with name: gt-<rig>-crew-<name>
-	constants.RolePolecat,         // Per-rig with name: gt-<rig>-polecat-<name>
+	constants.RoleMayor,     // Town-level: gt-mayor
+	constants.RoleAssistant, // Town-level: hq-assistant
+	constants.RoleDeacon,    // Town-level: gt-deacon
+	"dog",                   // Town-level with name: gt-dog-<name>
+	constants.RoleWitness,   // Per-rig: gt-<rig>-witness
+	constants.RoleRefinery,  // Per-rig: gt-<rig>-refinery
+	constants.RoleCrew,      // Per-rig with name: gt-<rig>-crew-<name>
+	constants.RolePolecat,   // Per-rig with name: gt-<rig>-polecat-<name>
 }
 
 // TownLevelRoles are agent roles that don't have a rig.
-var TownLevelRoles = []string{constants.RoleMayor, constants.RoleMayorsAssistant, constants.RoleDeacon}
+var TownLevelRoles = []string{constants.RoleMayor, constants.RoleAssistant, constants.RoleDeacon}
 
 // TownLevelNamedRoles are town-level agent roles that include a name.
 var TownLevelNamedRoles = []string{"dog"}
@@ -162,9 +161,6 @@ func ValidateAgentID(id string) error {
 
 	// Split into parts after the prefix
 	rest := id[hyphenIdx+1:] // Skip "<prefix>-"
-	if rest == constants.RoleMayorsAssistant {
-		return nil // Hyphenated town-level role; must not be split on "-"
-	}
 	parts := strings.Split(rest, "-")
 	if len(parts) < 1 || parts[0] == "" {
 		return fmt.Errorf("agent ID must include content after prefix (got %q)", id)
@@ -390,10 +386,6 @@ func ParseAgentBeadID(id string) (rig, role, name string, ok bool) {
 
 	prefix := id[:hyphenIdx]
 	rest := id[hyphenIdx+1:]
-	if rest == constants.RoleMayorsAssistant {
-		// Hyphenated town-level role; must not be split on "-".
-		return "", constants.RoleMayorsAssistant, "", true
-	}
 	parts := strings.Split(rest, "-")
 
 	if len(parts) == 0 {
@@ -479,7 +471,7 @@ func IsAgentSessionBead(beadID string) bool {
 	}
 	// Known agent roles
 	switch role {
-	case constants.RoleMayor, constants.RoleMayorsAssistant, constants.RoleDeacon, constants.RoleWitness, constants.RoleRefinery, constants.RoleCrew, constants.RolePolecat, "dog":
+	case constants.RoleMayor, constants.RoleAssistant, constants.RoleDeacon, constants.RoleWitness, constants.RoleRefinery, constants.RoleCrew, constants.RolePolecat, "dog":
 		return true
 	default:
 		return false

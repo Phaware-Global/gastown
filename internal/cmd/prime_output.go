@@ -38,8 +38,8 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 	switch ctx.Role {
 	case RoleMayor:
 		roleName = constants.RoleMayor
-	case RoleMayorsAssistant:
-		roleName = constants.RoleMayorsAssistant
+	case RoleAssistant:
+		roleName = constants.RoleAssistant
 	case RoleDeacon:
 		roleName = constants.RoleDeacon
 	case RoleWitness:
@@ -535,7 +535,7 @@ func outputStartupDirective(ctx RoleContext) {
 		fmt.Println("4. Check for attached work: `" + cli.Name() + " hook`")
 		fmt.Println("   - If mol attached → **RUN IT** (no human input needed)")
 		fmt.Println("   - If no mol → await user instruction")
-	case RoleMayorsAssistant:
+	case RoleAssistant:
 		fmt.Println()
 		fmt.Println("---")
 		fmt.Println()

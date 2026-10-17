@@ -1075,7 +1075,7 @@ func outputStatusText(w io.Writer, status TownStatus) error {
 	// Role icons - uses centralized emojis from constants package
 	roleIcons := map[string]string{
 		constants.RoleMayor:           constants.EmojiMayor,
-		constants.RoleMayorsAssistant: constants.EmojiMayorsAssistant,
+		constants.RoleAssistant: constants.EmojiAssistant,
 		constants.RoleDeacon:          constants.EmojiDeacon,
 		constants.RoleWitness:         constants.EmojiWitness,
 		constants.RoleRefinery:        constants.EmojiRefinery,
@@ -1648,7 +1648,7 @@ func discoverGlobalAgents(townRoot string, allSessions map[string]bool, allAgent
 		beadID  string
 	}{
 		{constants.RoleMayor, constants.RoleMayor + "/", mayorSession, "coordinator", beads.MayorBeadIDTown()},
-		{constants.RoleMayorsAssistant, constants.RoleMayorsAssistant + "/", session.MayorsAssistantSessionName(), constants.RoleMayorsAssistant, beads.MayorsAssistantBeadIDTown()},
+		{constants.RoleAssistant, constants.RoleAssistant + "/", session.AssistantSessionName(), constants.RoleAssistant, beads.AssistantBeadIDTown()},
 		{constants.RoleDeacon, constants.RoleDeacon + "/", deaconSession, "health-check", beads.DeaconBeadIDTown()},
 	}
 

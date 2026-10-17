@@ -57,7 +57,7 @@ func TestAgentBeadIDToAddress(t *testing.T) {
 		// Town-level agents (hq- prefix)
 		{"hq-mayor", "mayor/"},
 		{"hq-deacon", "deacon/"},
-		{"hq-mayors-assistant", "mayors-assistant/"}, // hyphenated role, matched whole
+		{"hq-assistant", "assistant/"},
 
 		// Rig singletons
 		{"gt-gastown-witness", "gastown/witness"},

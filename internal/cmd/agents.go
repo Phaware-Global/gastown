@@ -34,9 +34,9 @@ const (
 	// (<prefix>-reviewer). Appended at the end so the existing iota values
 	// (which may be persisted in telemetry) do not renumber.
 	AgentReviewer
-	// AgentMayorsAssistant is the town-level Mayor's Assistant session
-	// (hq-mayors-assistant). Appended for the same iota-stability reason.
-	AgentMayorsAssistant
+	// AgentAssistant is the town-level Mayor's Assistant session
+	// (hq-assistant). Appended for the same iota-stability reason.
+	AgentAssistant
 )
 
 // AgentSession represents a categorized tmux session.
@@ -183,8 +183,8 @@ func categorizeSession(name string) *AgentSession {
 	switch identity.Role {
 	case session.RoleMayor:
 		sess.Type = AgentMayor
-	case session.RoleMayorsAssistant:
-		sess.Type = AgentMayorsAssistant
+	case session.RoleAssistant:
+		sess.Type = AgentAssistant
 	case session.RoleDeacon:
 		sess.Type = AgentDeacon
 	case session.RoleWitness:

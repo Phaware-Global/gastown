@@ -1366,7 +1366,7 @@ func BuiltinRoleThemes() map[string]string {
 		"witness":          "rust",   // Red/rust - watchful, alert
 		"refinery":         "plum",   // Purple - processing, refining
 		"reviewer":         "forest", // Green - evaluative, go/no-go
-		"mayors-assistant": "slate",  // Gray - clerical, low-key next to the Mayor's default
+		"assistant": "slate",  // Gray - clerical, low-key next to the Mayor's default
 		// crew and polecat use rig theme by default (no override)
 	}
 }

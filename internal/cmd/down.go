@@ -444,7 +444,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 
 	if allOK {
 		fmt.Printf("%s All services stopped\n", style.Bold.Render("✓"))
-		stoppedServices := []string{"dolt", "daemon", "deacon", "boot", "mayor", constants.RoleMayorsAssistant}
+		stoppedServices := []string{"dolt", "daemon", "deacon", "boot", "mayor", constants.RoleAssistant}
 		for _, rigName := range rigs {
 			stoppedServices = append(stoppedServices, fmt.Sprintf("%s/refinery", rigName))
 			stoppedServices = append(stoppedServices, fmt.Sprintf("%s/witness", rigName))

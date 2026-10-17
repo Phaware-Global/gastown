@@ -331,7 +331,7 @@ func (r *Router) buildLabels(msg *Message) []string {
 // isTownLevelAddress returns true if the address is for a town-level agent or the overseer.
 func isTownLevelAddress(address string) bool {
 	addr := strings.TrimSuffix(address, "/")
-	return addr == constants.RoleMayor || addr == constants.RoleMayorsAssistant || addr == constants.RoleDeacon || addr == "overseer"
+	return addr == constants.RoleMayor || addr == constants.RoleAssistant || addr == constants.RoleDeacon || addr == "overseer"
 }
 
 // isGroupAddress returns true if the address is a @group address.
@@ -447,9 +447,8 @@ func agentBeadToAddress(bead *agentBead) string {
 		if id == "hq-deacon" {
 			return "deacon/"
 		}
-		// Hyphenated role name: must be matched whole, not split on "-".
-		if id == "hq-"+constants.RoleMayorsAssistant {
-			return constants.RoleMayorsAssistant + "/"
+		if id == "hq-"+constants.RoleAssistant {
+			return constants.RoleAssistant + "/"
 		}
 
 		// For other hq- agents, fall back to description parsing
@@ -1027,7 +1026,7 @@ func (r *Router) validateRecipient(identity string) error {
 
 	// Well-known town-level singletons always valid
 	switch identity {
-	case "mayor", "mayor/", "deacon", "deacon/", "mayors-assistant", "mayors-assistant/":
+	case "mayor", "mayor/", "deacon", "deacon/", "assistant", "assistant/":
 		return nil
 	}
 
@@ -2061,15 +2060,15 @@ func (r *Router) isRecipientMuted(address string) bool {
 // addressToAgentBeadID converts a mail address to an agent bead ID for DND lookup.
 // Returns empty string if the address cannot be converted.
 func addressToAgentBeadID(address string) string {
-	// Exact matches (with optional trailing slash): "mayors-assistant" shares
-	// the "mayor" prefix, so prefix matching would misroute it to the Mayor.
+	// Exact matches (with optional trailing slash). Prefix matching here
+	// would misroute any future role whose name starts with "mayor".
 	switch strings.TrimSuffix(address, "/") {
 	case "overseer":
 		return "" // Overseer is a human, no agent bead
 	case constants.RoleMayor:
 		return session.MayorSessionName()
-	case constants.RoleMayorsAssistant:
-		return session.MayorsAssistantSessionName()
+	case constants.RoleAssistant:
+		return session.AssistantSessionName()
 	case constants.RoleDeacon:
 		return session.DeaconSessionName()
 	}
@@ -2116,13 +2115,13 @@ func AddressToSessionIDs(address string) []string {
 		return []string{session.OverseerSessionName()}
 	}
 
-	// Town-level singletons: "mayor/", "mayors-assistant/", "deacon/" (slash
-	// optional). Exact matches — "mayors-assistant" shares the "mayor" prefix.
+	// Town-level singletons: "mayor/", "assistant/", "deacon/" (slash
+	// optional). Exact matches, not prefixes.
 	switch strings.TrimSuffix(address, "/") {
 	case constants.RoleMayor:
 		return []string{session.MayorSessionName()}
-	case constants.RoleMayorsAssistant:
-		return []string{session.MayorsAssistantSessionName()}
+	case constants.RoleAssistant:
+		return []string{session.AssistantSessionName()}
 	case constants.RoleDeacon:
 		return []string{session.DeaconSessionName()}
 	}

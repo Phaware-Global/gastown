@@ -10,74 +10,74 @@ import (
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
-var mayorsAssistantCmd = &cobra.Command{
-	Use:     "mayors-assistant",
-	Aliases: []string{"assistant", "ma"},
+var assistantCmd = &cobra.Command{
+	Use:     "assistant",
+	Aliases: []string{"mayors-assistant", "ma"},
 	GroupID: GroupAgents,
 	Short:   "Manage the Mayor's Assistant (inbound triage buffer for the Mayor)",
 	RunE:    requireSubcommand,
 	Long: `Manage the Mayor's Assistant - the town-level inbound triage buffer.
 
 The assistant receives Telegraph events, escalations, alerts and reports in
-its own inbox (mayors-assistant/), consolidates them, and briefs the Mayor by
+its own inbox (assistant/), consolidates them, and briefs the Mayor by
 mail. It also runs the periodic loose-ends sweep on the Mayor's behalf.
 
-Role shortcuts: "mayors-assistant" in mail/nudge addresses resolves to this agent.
-See docs/design/mayors-assistant-role.md.`,
+Role shortcuts: "assistant" in mail/nudge addresses resolves to this agent.
+See docs/design/assistant-role.md.`,
 }
 
 var (
-	mayorsAssistantAgentOverride string
-	mayorsAssistantStatusRunning bool
+	assistantAgentOverride string
+	assistantStatusRunning bool
 )
 
-var mayorsAssistantStartCmd = &cobra.Command{
+var assistantStartCmd = &cobra.Command{
 	Use:   "start",
 	Short: "Start the Mayor's Assistant session",
-	RunE:  runMayorsAssistantStart,
+	RunE:  runAssistantStart,
 }
 
-var mayorsAssistantStopCmd = &cobra.Command{
+var assistantStopCmd = &cobra.Command{
 	Use:   "stop",
 	Short: "Stop the Mayor's Assistant session",
-	RunE:  runMayorsAssistantStop,
+	RunE:  runAssistantStop,
 }
 
-var mayorsAssistantAttachCmd = &cobra.Command{
+var assistantAttachCmd = &cobra.Command{
 	Use:     "attach",
 	Aliases: []string{"at"},
 	Short:   "Attach to the Mayor's Assistant session (starts it if needed)",
-	RunE:    runMayorsAssistantAttach,
+	RunE:    runAssistantAttach,
 }
 
-var mayorsAssistantStatusCmd = &cobra.Command{
+var assistantStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Check Mayor's Assistant session status",
-	RunE:  runMayorsAssistantStatus,
+	RunE:  runAssistantStatus,
 }
 
-var mayorsAssistantRestartCmd = &cobra.Command{
+var assistantRestartCmd = &cobra.Command{
 	Use:   "restart",
 	Short: "Restart the Mayor's Assistant session",
-	RunE:  runMayorsAssistantRestart,
+	RunE:  runAssistantRestart,
 }
 
 func init() {
-	mayorsAssistantCmd.AddCommand(mayorsAssistantStartCmd)
-	mayorsAssistantCmd.AddCommand(mayorsAssistantStopCmd)
-	mayorsAssistantCmd.AddCommand(mayorsAssistantAttachCmd)
-	mayorsAssistantCmd.AddCommand(mayorsAssistantStatusCmd)
-	mayorsAssistantCmd.AddCommand(mayorsAssistantRestartCmd)
+	assistantCmd.AddCommand(assistantStartCmd)
+	assistantCmd.AddCommand(assistantStopCmd)
+	assistantCmd.AddCommand(assistantAttachCmd)
+	assistantCmd.AddCommand(assistantStatusCmd)
+	assistantCmd.AddCommand(assistantRestartCmd)
 
-	mayorsAssistantStatusCmd.Flags().BoolVar(&mayorsAssistantStatusRunning, "running", false, "Output only true/false for running status")
-	for _, c := range []*cobra.Command{mayorsAssistantStartCmd, mayorsAssistantAttachCmd, mayorsAssistantRestartCmd} {
-		c.Flags().StringVar(&mayorsAssistantAgentOverride, "agent", "", "Agent alias to run the Mayor's Assistant with (overrides town default)")
+	assistantStatusCmd.Flags().BoolVar(&assistantStatusRunning, "running", false, "Output only true/false for running status")
+	for _, c := range []*cobra.Command{assistantStartCmd, assistantAttachCmd, assistantRestartCmd} {
+		c.Flags().StringVar(&assistantAgentOverride, "agent", "", "Agent alias to run the Mayor's Assistant with (overrides town default)")
 	}
 
-	rootCmd.AddCommand(mayorsAssistantCmd)
+	rootCmd.AddCommand(assistantCmd)
 }
 
-func getMayorsAssistantManager() (*assistant.Manager, error) {
+func getAssistantManager() (*assistant.Manager, error) {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return nil, fmt.Errorf("not in a Gas Town workspace: %w", err)
@@ -85,28 +85,28 @@ func getMayorsAssistantManager() (*assistant.Manager, error) {
 	return assistant.NewManager(townRoot), nil
 }
 
-func runMayorsAssistantStart(cmd *cobra.Command, args []string) error {
-	mgr, err := getMayorsAssistantManager()
+func runAssistantStart(cmd *cobra.Command, args []string) error {
+	mgr, err := getAssistantManager()
 	if err != nil {
 		return err
 	}
 
 	fmt.Println("Starting Mayor's Assistant session...")
-	if err := mgr.Start(mayorsAssistantAgentOverride); err != nil {
+	if err := mgr.Start(assistantAgentOverride); err != nil {
 		if errors.Is(err, assistant.ErrAlreadyRunning) {
-			return fmt.Errorf("Mayor's Assistant session already running. Attach with: gt mayors-assistant attach")
+			return fmt.Errorf("Mayor's Assistant session already running. Attach with: gt assistant attach")
 		}
 		return err
 	}
 
 	fmt.Printf("%s Mayor's Assistant session started. Attach with: %s\n",
 		style.Bold.Render("✓"),
-		style.Dim.Render("gt mayors-assistant attach"))
+		style.Dim.Render("gt assistant attach"))
 	return nil
 }
 
-func runMayorsAssistantStop(cmd *cobra.Command, args []string) error {
-	mgr, err := getMayorsAssistantManager()
+func runAssistantStop(cmd *cobra.Command, args []string) error {
+	mgr, err := getAssistantManager()
 	if err != nil {
 		return err
 	}
@@ -123,8 +123,8 @@ func runMayorsAssistantStop(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func runMayorsAssistantAttach(cmd *cobra.Command, args []string) error {
-	mgr, err := getMayorsAssistantManager()
+func runAssistantAttach(cmd *cobra.Command, args []string) error {
+	mgr, err := getAssistantManager()
 	if err != nil {
 		return err
 	}
@@ -135,7 +135,7 @@ func runMayorsAssistantAttach(cmd *cobra.Command, args []string) error {
 	}
 	if !running {
 		fmt.Println("Mayor's Assistant session not running, starting...")
-		if err := mgr.Start(mayorsAssistantAgentOverride); err != nil {
+		if err := mgr.Start(assistantAgentOverride); err != nil {
 			return err
 		}
 	}
@@ -144,21 +144,21 @@ func runMayorsAssistantAttach(cmd *cobra.Command, args []string) error {
 	return attachToTmuxSession(mgr.SessionName())
 }
 
-func runMayorsAssistantStatus(cmd *cobra.Command, args []string) error {
-	mgr, err := getMayorsAssistantManager()
+func runAssistantStatus(cmd *cobra.Command, args []string) error {
+	mgr, err := getAssistantManager()
 	if err != nil {
 		return err
 	}
 
 	info, err := mgr.Status()
-	if mayorsAssistantStatusRunning {
+	if assistantStatusRunning {
 		fmt.Println(err == nil)
 		return nil
 	}
 	if err != nil {
 		if errors.Is(err, assistant.ErrNotRunning) {
 			fmt.Printf("%s Mayor's Assistant session is %s\n", style.Dim.Render("○"), "not running")
-			fmt.Printf("\nStart with: %s\n", style.Dim.Render("gt mayors-assistant start"))
+			fmt.Printf("\nStart with: %s\n", style.Dim.Render("gt assistant start"))
 			return nil
 		}
 		return err
@@ -171,12 +171,12 @@ func runMayorsAssistantStatus(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s Mayor's Assistant is %s\n", style.Bold.Render("●"), style.Bold.Render("running"))
 	fmt.Printf("  Status: %s\n", attachedStatus)
 	fmt.Printf("  Created: %s\n", info.Created)
-	fmt.Printf("\nAttach with: %s\n", style.Dim.Render("gt mayors-assistant attach"))
+	fmt.Printf("\nAttach with: %s\n", style.Dim.Render("gt assistant attach"))
 	return nil
 }
 
-func runMayorsAssistantRestart(cmd *cobra.Command, args []string) error {
-	mgr, err := getMayorsAssistantManager()
+func runAssistantRestart(cmd *cobra.Command, args []string) error {
+	mgr, err := getAssistantManager()
 	if err != nil {
 		return err
 	}
@@ -186,5 +186,5 @@ func runMayorsAssistantRestart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("stopping session: %w", err)
 	}
 
-	return runMayorsAssistantStart(cmd, args)
+	return runAssistantStart(cmd, args)
 }

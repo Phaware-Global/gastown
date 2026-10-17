@@ -886,7 +886,7 @@ func (f *LiveConvoyFetcher) FetchWorkers() ([]WorkerRow, error) {
 
 		// Skip non-worker sessions (witness, mayor, deacon, boot)
 		switch identity.Role {
-		case session.RoleMayor, session.RoleMayorsAssistant, session.RoleDeacon, session.RoleWitness:
+		case session.RoleMayor, session.RoleAssistant, session.RoleDeacon, session.RoleWitness:
 			continue
 		}
 

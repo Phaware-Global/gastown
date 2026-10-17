@@ -142,7 +142,7 @@ func (r *Resolver) validateAgentAddress(address string) error {
 	// Well-known town-level singletons always valid
 	switch normalized {
 	case constants.RoleMayor + "/", constants.RoleMayor, constants.RoleDeacon + "/", constants.RoleDeacon,
-		constants.RoleMayorsAssistant + "/", constants.RoleMayorsAssistant, "overseer":
+		constants.RoleAssistant + "/", constants.RoleAssistant, "overseer":
 		return nil
 	}
 
@@ -477,11 +477,6 @@ func AgentBeadIDToAddress(id string) string {
 		rest = strings.TrimPrefix(id, "hq-")
 	} else {
 		return ""
-	}
-
-	// Hyphenated town-level role: match whole before splitting on "-".
-	if rest == constants.RoleMayorsAssistant {
-		return constants.RoleMayorsAssistant + "/"
 	}
 
 	// Agent bead IDs include the role explicitly: <prefix>-<rig>-<role>[-<name>]

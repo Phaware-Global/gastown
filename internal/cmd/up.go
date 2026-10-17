@@ -329,7 +329,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 	if !mayorResult.ok {
 		allOK = false
 	}
-	services = append(services, ServiceStatus{Name: assistantResult.name, Type: constants.RoleMayorsAssistant, OK: assistantResult.ok, Detail: assistantResult.detail})
+	services = append(services, ServiceStatus{Name: assistantResult.name, Type: constants.RoleAssistant, OK: assistantResult.ok, Detail: assistantResult.detail})
 	if !assistantResult.ok {
 		allOK = false
 	}
@@ -438,7 +438,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 	// Log boot event for both JSON and text paths
 	if allOK {
-		startedServices := []string{"dolt", "daemon", "deacon", "mayor", constants.RoleMayorsAssistant}
+		startedServices := []string{"dolt", "daemon", "deacon", "mayor", constants.RoleAssistant}
 		for _, rigName := range rigs {
 			startedServices = append(startedServices, fmt.Sprintf("%s/witness", rigName))
 			startedServices = append(startedServices, fmt.Sprintf("%s/refinery", rigName))
