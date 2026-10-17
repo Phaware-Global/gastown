@@ -295,14 +295,17 @@ func purgeableMRWispJoin(alias string) (joinClause, whereCondition string) {
 }
 
 // purgeableParentJoin returns the join and WHERE condition that keep a closed
-// wisp out of a purge while any of its parent-child children is still open.
-// alias is the wisps table alias.
+// wisp out of a purge while any of its parent-child children is non-terminal
+// (open, hooked, in_progress, blocked, deferred, pinned). alias is the wisps
+// table alias.
 //
-// Purging a wisp also removes the inbound wisp_dependencies rows that point at it. A closed molecule root purged while its steps are still open would
-// strip their only parent-child row, leaving them "unparented": Reap's
-// max-age allowlist requires a parent-child row and the closed-molecule-step
-// path requires the parent row, so no reap path would ever close them again.
-// Deferring the parent until its children close keeps those paths reachable.
+// Purging a wisp also removes the inbound wisp_dependencies rows that point at
+// it. A closed molecule root purged while a step is still live would strip its
+// only parent-child row, leaving it "unparented": Reap's max-age allowlist
+// requires a parent-child row and the closed-molecule-step path requires the
+// parent row, so no reap path could close it once it returns to open.
+// Deferring the parent until its children are terminal keeps those paths
+// reachable.
 //
 // Anti-join, not correlated NOT EXISTS, for the same O(n+m) reason as
 // parentExcludeJoin.
@@ -313,7 +316,7 @@ func purgeableParentJoin(alias string) (joinClause, whereCondition string) {
 		INNER JOIN wisps open_child ON open_child.id = wd.issue_id
 		WHERE wd.type = 'parent-child'
 		AND wd.depends_on_wisp_id IS NOT NULL
-		AND open_child.status IN ('open', 'hooked', 'in_progress')
+		AND open_child.status NOT IN ('closed', 'tombstone')
 	) open_children ON open_children.parent_id = %s.id`, alias)
 	whereCondition = "open_children.parent_id IS NULL"
 	return
