@@ -1,10 +1,5 @@
 # Mayor's Assistant: Town-Level Inbound Triage Role
 
-**Status:** Proposed — delivered as a PR stack (docs → role registration →
-message routing → sweep migration → prompt template). This document and the
-`mayors-assistant` entries in `overview.md` / `reference.md` describe the
-stack's end state; they are true once the role-registration PR lands.
-**Created:** 2026-10-17
 **Cross-references:** [telegraph.md](telegraph.md), [escalation.md](escalation.md),
 [mail-protocol.md](mail-protocol.md), [plugin-system.md](plugin-system.md),
 [../agent-provider-integration.md](../agent-provider-integration.md)
