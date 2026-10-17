@@ -3673,6 +3673,20 @@ func (g *Git) unpushedFromExactRemoteBranch(localBranch, remote string) (int, bo
 	return count, true, err
 }
 
+// HeadHeldByDurableRef reports whether a remote-tracking ref or a
+// refs/gt/preserve ref contains HEAD, i.e. whether the commits survive the
+// removal of a worktree whose detached HEAD is the only thing pointing at them.
+// Local branches deliberately do not count: polecat/* branches are
+// force-deleted by branch cleanup (gt polecat gc, sling rollback), so a commit
+// held only by one is not durable.
+func (g *Git) HeadHeldByDurableRef() (bool, error) {
+	out, err := g.run("for-each-ref", "--contains", "HEAD", "--count=1", "--format=%(refname)", "refs/remotes/", "refs/gt/preserve/")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
 // remoteBranchContainingHead returns the first branch on remote whose tip
 // contains HEAD, or "" if none does. Used as preservation evidence when HEAD is
 // detached and there is no local branch name to look up on the remote.
