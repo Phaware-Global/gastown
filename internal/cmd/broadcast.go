@@ -162,6 +162,8 @@ func formatAgentName(agent *AgentSession) string {
 	switch agent.Type {
 	case AgentMayor:
 		return "mayor"
+	case AgentAssistant:
+		return "assistant"
 	case AgentDeacon:
 		return "deacon"
 	case AgentWitness:

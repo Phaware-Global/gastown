@@ -219,6 +219,13 @@ func detectSenderFromCwd() string {
 		}
 	}
 
+	// If in the town's assistant directory (checked before mayor: both are
+	// town-level, and a path under <town>/assistant must not fall through to
+	// "overseer").
+	if strings.HasSuffix(cwd, "/"+constants.RoleAssistant) || strings.Contains(cwd, "/"+constants.RoleAssistant+"/") {
+		return constants.RoleAssistant + "/"
+	}
+
 	// If in the town's mayor directory
 	if strings.Contains(cwd, "/mayor") {
 		return "mayor"

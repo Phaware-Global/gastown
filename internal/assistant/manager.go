@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
@@ -70,8 +71,12 @@ func (m *Manager) Start(agentOverride string) error {
 	// New rigs cannot take the name (it is reserved in rig.AddRig); a town
 	// upgraded with such a rig must rename it first.
 	if rigs, err := config.LoadRigsConfig(constants.MayorRigsPath(m.townRoot)); err == nil && rigs != nil {
-		if _, taken := rigs.Rigs[constants.RoleAssistant]; taken {
-			return fmt.Errorf("a rig named %q is registered in rigs.json; that name is reserved for the Mayor's Assistant (work dir <town>/%s) and the rig has been excluded from town-root scans since this gt version was installed — rename the rig, then start the assistant", constants.RoleAssistant, constants.RoleAssistant)
+		for name := range rigs.Rigs {
+			// Case-insensitive: on a case-insensitive filesystem "Assistant"
+			// and "assistant" are the same directory.
+			if strings.EqualFold(name, constants.RoleAssistant) {
+				return fmt.Errorf("a rig named %q is registered in rigs.json; that name is reserved for the Mayor's Assistant (work dir <town>/%s) and the rig has been excluded from town-root scans since this gt version was installed — rename the rig, then start the assistant", name, constants.RoleAssistant)
+			}
 		}
 	}
 

@@ -193,7 +193,8 @@ func (d *Daemon) countAgentSessions() int {
 func isAgentSession(name string) bool {
 	// Agent sessions contain role markers
 	for _, marker := range []string{
-		constants.RoleMayor, // also matches hq-assistant
+		constants.RoleMayor,
+		constants.RoleAssistant,
 		constants.RoleWitness,
 		constants.RoleRefinery,
 		constants.RolePolecat,

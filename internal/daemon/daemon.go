@@ -2199,34 +2199,40 @@ func (d *Daemon) ensureMayorRunning() {
 func (d *Daemon) ensureAssistantRunning() {
 	mgr := assistant.NewManager(d.config.TownRoot)
 
-	if err := mgr.Start(""); err != nil {
-		if err == assistant.ErrAlreadyRunning {
-			if !tmux.NewTmux().IsAgentAlive(mgr.SessionName()) {
-				d.assistantZombieCount++
-				if d.assistantZombieCount >= 3 {
-					d.logger.Printf("Mayor's Assistant zombie detected (%d cycles), restarting", d.assistantZombieCount)
-					if stopErr := mgr.Stop(); stopErr != nil && stopErr != assistant.ErrNotRunning {
-						d.logger.Printf("Error stopping zombie Mayor's Assistant: %v", stopErr)
-						return
-					}
-					d.assistantZombieCount = 0
-					if startErr := mgr.Start(""); startErr != nil {
-						d.logger.Printf("Error restarting Mayor's Assistant after zombie cleanup: %v", startErr)
-						return
-					}
-					d.logger.Println("Mayor's Assistant restarted after zombie cleanup")
-				} else {
-					d.logger.Printf("Mayor's Assistant agent not detected (cycle %d/3), waiting before restart", d.assistantZombieCount)
-				}
-			} else {
-				d.assistantZombieCount = 0
-			}
+	// Debounce BEFORE calling Start: Start kills a session whose agent is not
+	// alive at once, which would defeat the debounce and kill a session that
+	// is briefly agentless mid-handoff. Only after three consecutive zombie
+	// cycles do we stop and start it.
+	if running, _ := mgr.IsRunning(); running {
+		if tmux.NewTmux().IsAgentAlive(mgr.SessionName()) {
+			d.assistantZombieCount = 0
 			return
 		}
-		d.logger.Printf("Error starting Mayor's Assistant: %v", err)
+		d.assistantZombieCount++
+		if d.assistantZombieCount < 3 {
+			d.logger.Printf("Mayor's Assistant agent not detected (cycle %d/3), waiting before restart", d.assistantZombieCount)
+			return
+		}
+		d.logger.Printf("Mayor's Assistant zombie detected (%d cycles), restarting", d.assistantZombieCount)
+		if stopErr := mgr.Stop(); stopErr != nil && stopErr != assistant.ErrNotRunning {
+			d.logger.Printf("Error stopping zombie Mayor's Assistant: %v", stopErr)
+			return
+		}
+		d.assistantZombieCount = 0
+		if startErr := mgr.Start(""); startErr != nil {
+			d.logger.Printf("Error restarting Mayor's Assistant after zombie cleanup: %v", startErr)
+			return
+		}
+		d.logger.Println("Mayor's Assistant restarted after zombie cleanup")
 		return
 	}
 
+	if err := mgr.Start(""); err != nil {
+		if err != assistant.ErrAlreadyRunning { // ErrAlreadyRunning here is a start race; retry next tick
+			d.logger.Printf("Error starting Mayor's Assistant: %v", err)
+		}
+		return
+	}
 	d.assistantZombieCount = 0
 	d.logger.Println("Mayor's Assistant started successfully")
 }

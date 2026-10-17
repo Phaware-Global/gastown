@@ -2072,6 +2072,11 @@ func addressToAgentBeadID(address string) string {
 	case constants.RoleDeacon:
 		return session.DeaconSessionName()
 	}
+	// Deacon-family addresses (deacon/boot, deacon/dogs/<name>) are not rigs:
+	// their DND state is the Deacon's, as before the exact-match change.
+	if strings.HasPrefix(address, constants.RoleDeacon+"/") {
+		return session.DeaconSessionName()
+	}
 
 	parts := strings.SplitN(address, "/", 2)
 	if len(parts) != 2 || parts[1] == "" {
@@ -2124,6 +2129,18 @@ func AddressToSessionIDs(address string) []string {
 		return []string{session.AssistantSessionName()}
 	case constants.RoleDeacon:
 		return []string{session.DeaconSessionName()}
+	}
+	// Deacon-family addresses are not rigs: "deacon" must never be split off
+	// as a rig name (that would nudge a crew member or polecat named boot).
+	if rest, ok := strings.CutPrefix(address, constants.RoleDeacon+"/"); ok {
+		switch {
+		case rest == "boot":
+			return []string{session.BootSessionName()}
+		case strings.HasPrefix(rest, "dogs/") && len(rest) > len("dogs/"):
+			return []string{session.DogSessionName(strings.TrimPrefix(rest, "dogs/"))}
+		default:
+			return []string{session.DeaconSessionName()}
+		}
 	}
 
 	// Rig-based address: "rig/target" or "rig/crew/name" or "rig/polecats/name"
