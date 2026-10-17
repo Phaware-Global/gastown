@@ -36,14 +36,14 @@ func init() {
 }
 
 // The start commands are matched where a command word can begin: the start of
-// any line (once heredoc bodies are removed), or after a shell operator or a -c
-// wrapper.
+// any line or after a shell operator, in text with heredoc bodies and quoted
+// strings removed (see splitQuoted).
 // A prefix of VAR=value assignments and launcher words (nohup, env, ...) is
 // allowed. The command word itself must be bd or dolt, so 'gt dolt ...' never
 // matches, and 'bd create "fix dolt start"' does not either: only flags may sit
 // between bd and 'dolt'.
 const (
-	doltStartBoundary = "(?m)(?:^|[|&;(`]|\\bthen\\b|\\bdo\\b|-[a-z]*c\\s+['\"])\\s*"
+	doltStartBoundary = "(?m)(?:^|[|&;(`]|\\bthen\\b|\\bdo\\b)\\s*"
 	doltStartPrefix   = "(?:[A-Za-z_][A-Za-z0-9_]*=\\S*\\s+)*(?:(?:nohup|exec|env|command|time|setsid|sudo)\\s+(?:-\\S+\\s+)*(?:[A-Za-z_][A-Za-z0-9_]*=\\S*\\s+)*)*"
 	doltFlags         = "(?:\\s+-{1,2}[\\w-]+(?:=\\S+)?(?:\\s+[^\\s-]\\S*)?)*"
 )
@@ -83,15 +83,161 @@ func runTapGuardDoltStart(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// shellCArg matches the end of text that has just named a shell's -c script, so
+// the quoted string that follows is code rather than data.
+var shellCArg = regexp.MustCompile(`\b(?:ba|z|da|k)?sh\s+(?:-\S+\s+)*-[A-Za-z]*c\s*$`)
+
 // matchesDoltServerStart returns why command starts a Dolt server, or "".
 func matchesDoltServerStart(command string) string {
-	code := stripHeredocBodies(command)
+	bare, nested := splitQuoted(stripHeredocBodies(command))
 	for _, p := range doltStartPatterns {
-		if p.re.MatchString(code) {
+		if p.re.MatchString(bare) {
 			return p.reason
 		}
 	}
+	// Each nested script is strictly shorter than the text it came from.
+	for _, n := range nested {
+		if reason := matchesDoltServerStart(n); reason != "" {
+			return reason
+		}
+	}
 	return ""
+}
+
+// splitQuoted separates a command line into its code and the code hidden in its
+// quotes. Quoted text is data (an escalation or mail that quotes 'bd dolt start'
+// to warn about it), so bare has every '...', "..." and $'...' replaced by an
+// empty pair of the same quote; the patterns then see only real command words.
+// Two kinds of quoted text do run, and come back in nested to be matched on
+// their own: the script after sh -c, and $(...) or `...` inside double quotes.
+// A quote that never closes is left in bare, so it can only add matches.
+func splitQuoted(s string) (bare string, nested []string) {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		switch c := s[i]; {
+		case c == '\\' && i+1 < len(s):
+			b.WriteString(s[i : i+2])
+			i += 2
+		case c == '\'' || (c == '$' && i+1 < len(s) && s[i+1] == '\''):
+			start := i + 1
+			if c == '$' {
+				start++
+			}
+			end := closingSingleQuote(s, start, c == '$')
+			if end < 0 {
+				b.WriteString(s[i:])
+				return b.String(), nested
+			}
+			if shellCArg.MatchString(b.String()) {
+				nested = append(nested, s[start:end])
+			}
+			b.WriteString("''")
+			i = end + 1
+		case c == '"':
+			end := closingDoubleQuote(s, i+1)
+			if end < 0 {
+				b.WriteString(s[i:])
+				return b.String(), nested
+			}
+			if shellCArg.MatchString(b.String()) {
+				nested = append(nested, s[i+1:end])
+			}
+			nested = append(nested, substitutions(s[i+1:end])...)
+			b.WriteString(`""`)
+			i = end + 1
+		default:
+			b.WriteByte(c)
+			i++
+		}
+	}
+	return b.String(), nested
+}
+
+// closingSingleQuote returns the index of the quote ending a single-quoted
+// string whose body starts at from, or -1. Only $'...' honors backslash escapes.
+func closingSingleQuote(s string, from int, ansiC bool) int {
+	for i := from; i < len(s); i++ {
+		switch {
+		case ansiC && s[i] == '\\':
+			i++
+		case s[i] == '\'':
+			return i
+		}
+	}
+	return -1
+}
+
+// closingDoubleQuote returns the index of the quote ending a double-quoted
+// string whose body starts at from, or -1. A $(...) inside may hold quotes of
+// its own, so it is skipped as a unit.
+func closingDoubleQuote(s string, from int) int {
+	for i := from; i < len(s); i++ {
+		switch {
+		case s[i] == '\\':
+			i++
+		case s[i] == '"':
+			return i
+		case s[i] == '$' && i+1 < len(s) && s[i+1] == '(':
+			end := closingParen(s, i+2)
+			if end < 0 {
+				return -1
+			}
+			i = end
+		}
+	}
+	return -1
+}
+
+// closingParen returns the index of the ')' matching a '(' just before from, or -1.
+func closingParen(s string, from int) int {
+	for depth, i := 1, from; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++
+		case '\'':
+			if end := closingSingleQuote(s, i+1, false); end >= 0 {
+				i = end
+			}
+		case '"':
+			if end := closingDoubleQuote(s, i+1); end >= 0 {
+				i = end
+			}
+		case '(':
+			depth++
+		case ')':
+			if depth--; depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// substitutions returns the commands run by $(...) and `...` inside the body of
+// a double-quoted string.
+func substitutions(body string) []string {
+	var out []string
+	for i := 0; i < len(body); i++ {
+		switch {
+		case body[i] == '\\':
+			i++
+		case body[i] == '$' && i+1 < len(body) && body[i+1] == '(':
+			end := closingParen(body, i+2)
+			if end < 0 {
+				end = len(body)
+			}
+			out = append(out, body[i+2:end])
+			i = end
+		case body[i] == '`':
+			end := strings.IndexByte(body[i+1:], '`')
+			if end < 0 {
+				end = len(body) - i - 1
+			}
+			out = append(out, body[i+1:i+1+end])
+			i += end + 1
+		}
+	}
+	return out
 }
 
 // stripHeredocBodies drops the text of heredocs, which is data (a mail body, a

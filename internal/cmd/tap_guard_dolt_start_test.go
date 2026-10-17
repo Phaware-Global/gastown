@@ -27,6 +27,19 @@ func TestMatchesDoltServerStart(t *testing.T) {
 		"cd ~/gt/.dolt-data && dolt --data-dir=. sql-server",
 		"/opt/homebrew/bin/dolt sql-server",
 		"sudo dolt sql-server",
+		// Quotes that run code: a shell -c script and a substitution.
+		`bash -c "cd /x && bd dolt start"`,
+		"bash -c $'bd dolt start'",
+		`sh -c 'echo "x"; dolt sql-server'`,
+		`bash -c "bash -c 'bd dolt start'"`,
+		`echo "$(bd dolt start)"`,
+		"echo \"`bd dolt start`\"",
+		`echo "ok: $(cd /x && dolt sql-server)"`,
+		// Quoted data before a real start command.
+		`gt mail send mayor/ -s "hi; there" && bd dolt start`,
+		`bd --db "/x/.beads" dolt start`,
+		`echo 'it'"'"'s' ; bd dolt start`,
+		"bd create --title \"x\"\nbd dolt start",
 	}
 	for _, c := range blocked {
 		if matchesDoltServerStart(c) == "" {
@@ -53,6 +66,18 @@ func TestMatchesDoltServerStart(t *testing.T) {
 		"cat <<'EOF'\nbd dolt start\nEOF",
 		"gt mail send mayor/ -s hi --body \"$(cat <<EOF\ndolt sql-server\nEOF\n)\"",
 		"bd create foo <<-EOT\n\tdolt sql-server\n\tEOT\necho done",
+		// Text that quotes the commands: an escalation or mail warning about them.
+		`gt escalate -s HIGH "Dolt: bd said run bd dolt start"`,
+		"gt escalate -s HIGH \"Dolt unreachable.\nbd dolt start\nis what bd advised\"",
+		"gt mail send mayor/ -s hi -m 'agent ran; bd dolt start'",
+		"gt mail send mayor/ -s hi -m $'do not\\nbd dolt start'",
+		`bd create --title "x && bd dolt start && y" --type=bug`,
+		`bd create -d "then bd dolt start | dolt sql-server"`,
+		`gt nudge deacon "never run (bd dolt start) or dolt sql-server"`,
+		`gt escalate "it's down; bd dolt start" && gt dolt status`,
+		`echo "$(gt dolt status) mentions bd dolt start"`,
+		`grep -c "bd dolt start" notes.txt`,
+		`bash -c "gt dolt status" 'bd dolt start'`,
 	}
 	for _, c := range allowed {
 		if reason := matchesDoltServerStart(c); reason != "" {
