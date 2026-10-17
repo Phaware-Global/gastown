@@ -2168,7 +2168,7 @@ func runPolecatStale(cmd *cobra.Command, args []string) error {
 			nuked := 0
 			batchPurge := staleCount > 1
 			// The daemon stops this process with SIGTERM when it shuts down or the
-			// cleanup deadline passes. Honour it between polecats so a nuke is never
+			// cleanup deadline passes. Honor it between polecats so a nuke is never
 			// cut off between killing the session and removing the worktree.
 			stopCh := make(chan os.Signal, 1)
 			signal.Notify(stopCh, syscall.SIGTERM, os.Interrupt)
