@@ -4687,8 +4687,8 @@ func TestEscalationConfigGetRouteForSeverity(t *testing.T) {
 	}{
 		{SeverityLow, []string{"bead"}},
 		{SeverityMedium, []string{"bead", "mail:mayor"}},
-		{SeverityHigh, []string{"bead", "mail:mayors-assistant"}},     // fallback for missing
-		{SeverityCritical, []string{"bead", "mail:mayors-assistant"}}, // fallback for missing
+		{SeverityHigh, []string{"bead", "mail:mayors-assistant", "mail:mayor"}},     // fallback for missing: direct mayor route
+		{SeverityCritical, []string{"bead", "mail:mayors-assistant", "mail:mayor"}}, // fallback for missing: direct mayor route
 	}
 
 	for _, tt := range tests {
@@ -6112,12 +6112,12 @@ func TestStripSlackRoutesReportsSeverities(t *testing.T) {
 	if want := []string{SeverityLow, SeverityMedium, SeverityCritical}; !reflect.DeepEqual(got, want) {
 		t.Errorf("stripSlackRoutes() = %v, want %v", got, want)
 	}
-	// A route that loses slack must still reach the mayor (via the assistant's
-	// triage inbox), never go silent.
+	// A route that loses slack must still reach the mayor, never go silent:
+	// low goes via the assistant's triage inbox, critical directly to mayor/.
 	if want := []string{"mail:mayors-assistant"}; !reflect.DeepEqual(cfg.Routes[SeverityLow], want) {
 		t.Errorf("Routes[low] = %v, want %v", cfg.Routes[SeverityLow], want)
 	}
-	if want := []string{"bead", "mail:mayors-assistant"}; !reflect.DeepEqual(cfg.Routes[SeverityCritical], want) {
+	if want := []string{"bead", "mail:mayor"}; !reflect.DeepEqual(cfg.Routes[SeverityCritical], want) {
 		t.Errorf("Routes[critical] = %v, want %v", cfg.Routes[SeverityCritical], want)
 	}
 	if want := []string{"bead", "mail:mayor"}; !reflect.DeepEqual(cfg.Routes[SeverityMedium], want) {

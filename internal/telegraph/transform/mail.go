@@ -171,6 +171,30 @@ func (t *Transformer) maybeNudge(_ *telegraph.NormalizedEvent) {
 	t.log.NudgeSent()
 }
 
+// neutralizeDelimiters defuses trust-delimiter lines inside external text so
+// a provider comment cannot close its own EXTERNAL CONTENT block (or open a
+// fake OPERATOR PROMPT) and have the tail read as trusted. Any line that
+// starts with "---" and names either delimiter is prefixed with a visible
+// marker, which keeps the text readable but stops it matching the real
+// delimiters emitted around it.
+func neutralizeDelimiters(text string) string {
+	if !strings.Contains(text, "---") {
+		return text
+	}
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "---") {
+			continue
+		}
+		upper := strings.ToUpper(trimmed)
+		if strings.Contains(upper, "EXTERNAL CONTENT") || strings.Contains(upper, "OPERATOR PROMPT") {
+			lines[i] = "[neutralized delimiter] " + line
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 // buildFrom returns the sender address: telegraph/<provider>/<actor>.
 func buildFrom(event *telegraph.NormalizedEvent) string {
 	return "telegraph/" + event.Provider + "/" + event.Actor
@@ -316,7 +340,7 @@ func (t *Transformer) buildBody(event *telegraph.NormalizedEvent, promptText str
 	fmt.Fprintf(&b, "\n--- EXTERNAL CONTENT (untrusted: %s/%s) ---\n",
 		sanitizeHeaderValue(event.Provider), sanitizeHeaderValue(event.Actor))
 
-	text := event.Text
+	text := neutralizeDelimiters(event.Text)
 	if t.bodyCap > 0 && len(text) > t.bodyCap {
 		text = text[:t.bodyCap] + "\n[… truncated]"
 	}
