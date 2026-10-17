@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -2133,7 +2134,7 @@ func AddressToSessionIDs(address string) []string {
 	// Deacon-family addresses are not rigs: "deacon" must never be split off
 	// as a rig name (that would nudge a crew member or polecat named boot).
 	if rest, ok := strings.CutPrefix(address, constants.RoleDeacon+"/"); ok {
-		rest = strings.TrimSuffix(rest, "/")
+		rest = strings.Trim(path.Clean(rest), "/")
 		switch {
 		case rest == "boot":
 			return []string{session.BootSessionName()}
