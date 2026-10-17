@@ -22,7 +22,7 @@ func TestRedirectDoltStartHint(t *testing.T) {
 		{
 			name: "server may not be running hint",
 			in:   "Dolt server unreachable\n\nThe Dolt server may not be running. Try:\n  bd dolt start",
-			keep: []string{"Dolt server unreachable"},
+			keep: []string{"Dolt server unreachable", "The Dolt server may not be running."},
 		},
 		{
 			name: "externally managed hint",
@@ -32,7 +32,7 @@ func TestRedirectDoltStartHint(t *testing.T) {
 		{
 			name: "orchestrator hint",
 			in:   "failed to connect\n\nThe Dolt server may not be running. Try:\n  bd dolt start    # Start a local server\n  gt dolt start    # If using an orchestrator",
-			keep: []string{"failed to connect"},
+			keep: []string{"failed to connect", "The Dolt server may not be running."},
 		},
 	}
 	for _, tt := range tests {

@@ -894,7 +894,7 @@ func TestIsDoltConfigError(t *testing.T) {
 		{"server appears down", fmt.Errorf("server appears down"), true},
 		{"server down", fmt.Errorf("server down"), true},
 		{"server not running", fmt.Errorf("Dolt server is not running"), true},
-		{"server may not be running", fmt.Errorf("Dolt server may not be running"), true},
+		{"server may not be running", fmt.Errorf("Dolt server unreachable at 127.0.0.1:3307: dial tcp: i/o timeout\n\nThe Dolt server may not be running."), true},
 		{"configure custom types", fmt.Errorf("configure custom types in /path: exit 1"), true},
 		{"identity mismatch", fmt.Errorf("identity mismatch: local project_id != database project_id"), true},
 		{"Unknown database", fmt.Errorf("Unknown database 'gastown'"), true},
@@ -2742,5 +2742,41 @@ func TestReuseIdlePolecat_NoSessionNoop(t *testing.T) {
 	// Error should be from later steps (worktree ops), not session handling
 	if reuseErr == nil {
 		t.Fatal("expected error from worktree operations")
+	}
+}
+
+// bd's dial errors other than "connection refused" (i/o timeout, no route to
+// host) carry no marker isDoltConfigError matches except bd's "The Dolt server
+// may not be running" diagnosis. The error must keep it after bd's `bd dolt
+// start` advice is rewritten, or the health check retries for ~2 minutes.
+func TestIsDoltConfigError_NonRefusedBdDialError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a sh mock bd")
+	}
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+cat >&2 <<'EOF'
+Error: failed to open database: Dolt server unreachable at 127.0.0.1:3307: dial tcp 127.0.0.1:3307: i/o timeout
+
+The Dolt server may not be running. Try:
+  bd dolt start    # Start a local server
+  gt dolt start    # If using an orchestrator
+EOF
+exit 1
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write mock bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, err := beads.New(t.TempDir()).Show("gt-abc")
+	if err == nil {
+		t.Fatal("Show succeeded against a failing mock bd")
+	}
+	if strings.Contains(err.Error(), "bd dolt start") {
+		t.Errorf("error still advises bd dolt start: %v", err)
+	}
+	if !isDoltConfigError(err) {
+		t.Errorf("isDoltConfigError(%v) = false, want true (would retry ~2 min instead of failing fast)", err)
 	}
 }
