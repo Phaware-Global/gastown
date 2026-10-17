@@ -334,6 +334,59 @@ if [ "$BUILD_SHA" != "$ORIGIN_MAIN_SHA" ]; then
   FAILURES=$((FAILURES + 1))
 fi
 
+# --- Test 9: the code-signing identity file ---------------------------------
+# $TOWN_ROOT/settings/gt-codesign-identity feeds GT_CODESIGN_IDENTITY to
+# make safe-install. Names may contain spaces, an empty file means unsigned,
+# and a bad charset or an ad-hoc '-' must refuse before make runs. Two
+# earlier bugs lived in this block (helpers used before definition, empty
+# file hard-failing), so every branch is exercised here.
+
+IDENTITY_FILE="$TOWN_ROOT/settings/gt-codesign-identity"
+mkdir -p "$TOWN_ROOT/settings"
+
+# identity_case LABEL FILE_CONTENT|MISSING EXPECT_EXIT EXPECT_MAKE_ARG
+# Resets to the forward+stale state so a rebuild is attempted each time.
+identity_case() {
+  local label="$1" content="$2" expect_exit="$3" expect_arg="$4" rc=0
+  echo "$INSTALLED_BASE_SHA" > "$INSTALLED_SHA_FILE"
+  write_stale_json true "$INSTALLED_BASE_SHA"
+  rm -f "$SKIP_COUNT_FILE"
+  : > "$MAKE_LOG"
+  if [ "$content" = "MISSING" ]; then
+    rm -f "$IDENTITY_FILE"
+  else
+    printf '%s\nsecond line is ignored\n' "$content" > "$IDENTITY_FILE"
+  fi
+  run_rebuild >/dev/null 2>&1 || rc=$?
+  if [ "$expect_exit" = "0" ] && [ "$rc" != "0" ]; then
+    echo "FAIL [$label]: run exited $rc, expected success"
+    FAILURES=$((FAILURES + 1))
+  elif [ "$expect_exit" != "0" ] && [ "$rc" = "0" ]; then
+    echo "FAIL [$label]: run exited 0, expected a refusal"
+    FAILURES=$((FAILURES + 1))
+  fi
+  if [ -n "$expect_arg" ]; then
+    if ! grep -qF "safe-install $expect_arg" "$MAKE_LOG"; then
+      echo "FAIL [$label]: make was not called with '$expect_arg'; log: $(cat "$MAKE_LOG")"
+      FAILURES=$((FAILURES + 1))
+    fi
+  elif [ -s "$MAKE_LOG" ]; then
+    echo "FAIL [$label]: make was invoked although the identity was refused; log: $(cat "$MAKE_LOG")"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+identity_case "missing file"     MISSING                 0 "GT_CODESIGN_IDENTITY="
+identity_case "empty file"       ""                      0 "GT_CODESIGN_IDENTITY="
+identity_case "blank line"       "   "                   0 "GT_CODESIGN_IDENTITY="
+identity_case "plain name"       "gt-local"              0 "GT_CODESIGN_IDENTITY=gt-local"
+identity_case "name with spaces" "  gt local signing  "  0 "GT_CODESIGN_IDENTITY=gt local signing"
+identity_case "sha1 hash"        "ff286f822393038bc3ff2de9b5dad33fb5da192e" 0 "GT_CODESIGN_IDENTITY=ff286f822393038bc3ff2de9b5dad33fb5da192e"
+identity_case "ad-hoc dash"      "-"                     1 ""
+identity_case "leading dash"     "-foo"                  1 ""
+identity_case "bad charset"      'bad"$(id)'             1 ""
+rm -f "$IDENTITY_FILE"
+
 echo ""
 if [[ $FAILURES -gt 0 ]]; then
   echo "FAILED: $FAILURES test(s) failed"

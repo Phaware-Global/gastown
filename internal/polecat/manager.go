@@ -122,6 +122,7 @@ var (
 	ErrDoltUnhealthy      = errors.New("dolt health check failed")
 	ErrDoltAtCapacity     = errors.New("dolt server at connection capacity")
 	ErrDiskSpaceLow       = errors.New("insufficient disk space")
+	ErrUnpublishedWork    = errors.New("polecat branch has unpushed commits that could not be published")
 )
 
 // UncommittedWorkError provides details about uncommitted work.
@@ -1151,24 +1152,74 @@ type RemoveOptions struct {
 }
 
 // WorkAtRiskError means removal would destroy commits that exist nowhere but
-// the worktree being removed.
+// the worktree being removed (or, when RepoPath is set, that branch in the
+// shared repo). Removal is aborted before anything is touched. It wraps
+// ErrUnpublishedWork.
 type WorkAtRiskError struct {
 	Polecat   string
 	Branch    string
 	ClonePath string
-	Unpushed  int
-	Reason    string
+	// RepoPath is the shared repo that still holds Branch when the worktree
+	// itself is gone; the recovery command is run there instead of in ClonePath.
+	RepoPath string
+	// Unpushed is the number of commits at risk, or -1 when the comparison
+	// itself failed and the count is unknown.
+	Unpushed int
+	Reason   string
 }
 
 func (e *WorkAtRiskError) Error() string {
-	// Unpushed < 0 means the comparison itself failed, so the count is unknown.
-	count := fmt.Sprintf("%d unpushed commit(s)", e.Unpushed)
+	count := fmt.Sprintf("%d unpushed commit(s) exist", e.Unpushed)
 	if e.Unpushed < 0 {
-		count = "possibly unpushed commits"
+		count = "an unknown number of possibly unpushed commits may exist"
 	}
-	return fmt.Sprintf("WORK AT RISK: refusing to remove polecat %s: branch %s has %s that exist only in worktree %s (%s)\n"+
-		"Push the branch, or pass the explicit discard-unpushed override (gt polecat nuke --discard-unpushed) to delete the work anyway",
-		e.Polecat, e.Branch, count, e.ClonePath, e.Reason)
+	where := "this worktree"
+	if e.RepoPath != "" {
+		where = "the shared repo, whose worktree is gone"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "WORK AT RISK: refusing to remove polecat %s: %s\n", e.Polecat, e.Reason)
+	fmt.Fprintf(&b, "%s only in %s:\n  branch:   %s\n  worktree: %s\n", count, where, e.Branch, e.ClonePath)
+	b.WriteString("Nothing was removed.")
+	if cmd := e.RecoveryCommand(); cmd != "" {
+		fmt.Fprintf(&b, " To recover, list the commits with:\n  %s\nthen", cmd)
+	} else {
+		b.WriteString(" To recover,")
+	}
+	b.WriteString(" fix the cause (e.g. amend a hooks-bypassed commit so hooks re-run) or push or move the commits somewhere durable, and retry the removal. " +
+		"gt polecat nuke refuses these commits too; the only way to delete them on purpose is its --discard-unpushed flag.")
+	return b.String()
+}
+
+func (e *WorkAtRiskError) Unwrap() error {
+	return ErrUnpublishedWork
+}
+
+// RecoveryCommand lists the commits at risk, or returns "" when no branch is
+// known to list them from. It works for a branch that was never pushed (no
+// origin/<branch> to range against) and single-quotes the polecat-controlled
+// branch name and paths so pasting it cannot run anything embedded in them.
+func (e *WorkAtRiskError) RecoveryCommand() string {
+	dir, ref := e.ClonePath, e.Branch
+	switch ref {
+	case "", "HEAD", "(detached)":
+		// A detached HEAD only exists inside its worktree.
+		if e.RepoPath != "" {
+			return ""
+		}
+		ref = "HEAD"
+	case "(unknown)":
+		return ""
+	}
+	if e.RepoPath != "" {
+		dir = e.RepoPath
+	}
+	return fmt.Sprintf("git -C %s log --oneline %s --not --remotes", shellQuote(dir), shellQuote(ref))
+}
+
+// shellQuote single-quotes s for a POSIX shell.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // RemoveWith is RemoveWithOptions with the full option set.
@@ -1418,10 +1469,11 @@ func (m *Manager) PreserveUnpushedWork(name string, force, discard bool) error {
 // refs (BranchPushedToRemote), never inferred from a failed push. A detached
 // HEAD has no name to push under: pushing the literal ref "HEAD" is malformed.
 // The removal path pins a detached HEAD's commits under refs/gt/preserve
-// itself; pinned says that pin succeeded, and only then is such a worktree
-// neither pushed nor refused here. Nuclear skips the pin and a failed pin
-// leaves nothing holding the commits, so in both cases a detached HEAD is held
-// to the same standard as a branch.
+// itself; pinned says that pin succeeded, and only then, with a remote-tracking
+// or preserve ref confirmed to hold HEAD (HeadHeldByDurableRef), is such a
+// worktree neither pushed nor refused here. Nuclear skips the pin and a failed
+// pin leaves nothing holding the commits, so in both cases a detached HEAD is
+// held to the same standard as a branch.
 //
 // A worktree directory that does not exist, or has no .git entry, cannot be
 // inspected, so its branch is judged in the shared repo instead
@@ -1441,7 +1493,16 @@ func (m *Manager) preserveUnpushedWork(name, clonePath string, nuclear, pinned, 
 	}
 	detached := branch == "" || branch == "HEAD"
 	if detached && !nuclear && pinned {
-		return nil
+		// The pin is trusted only once a ref that outlives the worktree is seen
+		// to hold HEAD. The polecat's own branch does not count: gc and the
+		// sling rollback force-delete it.
+		held, holdErr := polecatGit.HeadHeldByDurableRef()
+		if holdErr != nil {
+			return m.unverifiedWorkRisk(name, clonePath, "(detached)", fmt.Errorf("confirming a ref holds the detached HEAD: %w", holdErr), discard)
+		}
+		if held {
+			return nil
+		}
 	}
 	label := branch
 	if detached {
@@ -1460,7 +1521,7 @@ func (m *Manager) preserveUnpushedWork(name, clonePath string, nuclear, pinned, 
 	case nuclear:
 		risk.Reason = "nuclear removal never publishes"
 	case detached:
-		risk.Reason = "detached HEAD commits are held by no branch and could not be pinned"
+		risk.Reason = "detached HEAD commits are held by no remote-tracking or preserve ref"
 	default:
 		risk.Reason = m.pushUnpushedBranch(polecatGit, branch)
 	}
@@ -1532,7 +1593,7 @@ func (m *Manager) missingWorktreeRisk(name, clonePath string, force, discard boo
 		style.PrintWarning("discarding %d unpushed commit(s) on branch %s (%s) at the operator's explicit request", unpushed, branch, reason)
 		return nil
 	}
-	return &WorkAtRiskError{Polecat: name, Branch: branch, ClonePath: clonePath, Unpushed: unpushed, Reason: reason}
+	return &WorkAtRiskError{Polecat: name, Branch: branch, ClonePath: clonePath, RepoPath: repoGit.WorkDir(), Unpushed: unpushed, Reason: reason}
 }
 
 // resolveMissingPath resolves symlinks in the nearest existing ancestor of

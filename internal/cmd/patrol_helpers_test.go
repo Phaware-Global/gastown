@@ -1022,3 +1022,34 @@ func TestBurnPreviousPatrolWisps_IgnoresOtherBeads(t *testing.T) {
 		t.Errorf("non-patrol bead status = %q, want %q (should not be burned)", otherIssue.Status, beads.StatusHooked)
 	}
 }
+
+func TestBuildRefineryPatrolVars_PRUpdateStrategy(t *testing.T) {
+	build := func(t *testing.T, strategy string) map[string]string {
+		t.Helper()
+		tmpDir := t.TempDir()
+		settingsDir := filepath.Join(tmpDir, "testrig", "settings")
+		if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mq := config.DefaultMergeQueueConfig()
+		mq.PRUpdateStrategy = strategy
+		data, _ := json.Marshal(config.RigSettings{Type: "rig-settings", Version: 1, MergeQueue: mq})
+		if err := os.WriteFile(filepath.Join(settingsDir, "config.json"), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		varMap := map[string]string{}
+		for _, v := range buildRefineryPatrolVars(RoleContext{TownRoot: tmpDir, Rig: "testrig"}) {
+			if parts := splitFirstEquals(v); len(parts) == 2 {
+				varMap[parts[0]] = parts[1]
+			}
+		}
+		return varMap
+	}
+	if got := build(t, "merge")["pr_update_strategy"]; got != "merge" {
+		t.Errorf("pr_update_strategy = %q, want merge", got)
+	}
+	// Unset: the formula default (rebase) applies; nothing is injected.
+	if got, ok := build(t, "")["pr_update_strategy"]; ok {
+		t.Errorf("unset strategy should not be injected, got %q", got)
+	}
+}

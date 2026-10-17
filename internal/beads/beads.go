@@ -711,7 +711,7 @@ func (b *Beads) Run(args ...string) ([]byte, error) {
 // Exception: ErrNotInstalled (exec.ErrNotFound) and ErrNotFound (issue lookup) are
 // acceptable as they enable basic error handling without decision-making.
 func (b *Beads) wrapError(err error, stderr string, args []string) error {
-	stderr = strings.TrimSpace(stderr)
+	stderr = RedirectDoltStartHint(strings.TrimSpace(stderr))
 
 	// Check for bd not installed
 	if execErr, ok := err.(*exec.Error); ok && errors.Is(execErr.Err, exec.ErrNotFound) {
@@ -1954,7 +1954,9 @@ func (b *Beads) Close(ids ...string) error {
 	}
 
 	if b.store != nil {
-		return b.storeClose("", runtime.SessionIDFromEnv(), ids...)
+		err := b.storeClose("", runtime.SessionIDFromEnv(), ids...)
+		b.auditWispClose("", ids, err)
+		return err
 	}
 
 	args := append([]string{"close"}, ids...)
@@ -1965,6 +1967,7 @@ func (b *Beads) Close(ids ...string) error {
 	}
 
 	_, err := b.run(args...)
+	b.auditWispClose("", ids, err)
 	return err
 }
 
@@ -1977,7 +1980,9 @@ func (b *Beads) CloseWithReason(reason string, ids ...string) error {
 	}
 
 	if b.store != nil {
-		return b.storeClose(reason, runtime.SessionIDFromEnv(), ids...)
+		err := b.storeClose(reason, runtime.SessionIDFromEnv(), ids...)
+		b.auditWispClose(reason, ids, err)
+		return err
 	}
 
 	args := append([]string{"close"}, ids...)
@@ -1989,6 +1994,7 @@ func (b *Beads) CloseWithReason(reason string, ids ...string) error {
 	}
 
 	_, err := b.run(args...)
+	b.auditWispClose(reason, ids, err)
 	return err
 }
 
@@ -2006,7 +2012,9 @@ func (b *Beads) ForceCloseWithReason(reason string, ids ...string) error {
 	// ForceCloseWithReason (e.g., gt done nuking polecat wisps) are already
 	// accepting that deps may remain dangling, so this is intentional.
 	if b.store != nil {
-		return b.storeClose(reason, runtime.SessionIDFromEnv(), ids...)
+		err := b.storeClose(reason, runtime.SessionIDFromEnv(), ids...)
+		b.auditWispClose(reason, ids, err)
+		return err
 	}
 
 	args := append([]string{"close"}, ids...)
@@ -2018,6 +2026,7 @@ func (b *Beads) ForceCloseWithReason(reason string, ids ...string) error {
 	}
 
 	_, err := b.run(args...)
+	b.auditWispClose(reason, ids, err)
 	return err
 }
 
