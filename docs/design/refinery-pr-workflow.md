@@ -138,7 +138,8 @@ Rig settings (`<rig>/settings/config.json`):
     "pr_approver": "kevinpjones",
     "pr_required_approvals": 1,
     "pr_review_loop_max": 3,
-    "pr_merge_method": "squash"
+    "pr_merge_method": "squash",
+    "pr_update_strategy": "rebase"
   }
 }
 ```
@@ -154,6 +155,36 @@ New fields on `config.MergeQueueConfig` (`internal/config/types.go`):
 - `PRRequiredApprovals int` — approvals required. Defaults to 1.
 - `PRReviewLoopMax int` — max polecat dispatch cycles per PR. Defaults to 3.
 - `PRMergeMethod string` — passed to `gh pr merge`. Defaults to `squash`.
+- `PRUpdateStrategy string` — how the refinery brings a work branch that is
+  behind its target up to date: `rebase` (default; rewrites history and
+  force-pushes), `merge` (merges the target into the branch with a merge
+  commit and a plain push), or `none` (never touches the branch; reports
+  "behind base"). Applies to both merge strategies. See
+  [Branch update strategy](#branch-update-strategy).
+
+### Branch update strategy
+
+Some rigs forbid rewriting a PR branch (human reviewers track it by commit).
+A prose directive to the refinery was not enough, so the policy is enforced by
+the binary. The patrol formula calls two commands instead of raw git:
+
+- `gt refinery pr sync-branch --branch B --target T` — leaves the result on a
+  local `temp` branch and never pushes. Exit 0 = up-to-date/synced; 2 = behind
+  base under `none` (report, leave the branch alone); 3 = conflict (aborted,
+  nothing changed); 4 = refused or error.
+- `gt refinery pr push-branch --branch B` — a fast-forward is pushed plainly.
+  Only `rebase` may force-push, with a lease on the tip fetched at sync time.
+  Under `none` nothing is pushed; under `merge` a non-fast-forward is an error,
+  never a force.
+
+Independent of the strategy, a force-push of a branch whose open PR has an
+approving review is refused (exit 4). The check is fail-closed: if the PR or its
+approvals cannot be read, the force-push is refused too. Under `rebase` an
+approved PR is refused at `sync-branch`, before any history is rewritten, and
+the branch must be updated with a base merge instead.
+
+Not covered: the review-fix polecat's own push to its branch (it is a separate
+actor) and the integration-branch land path.
 
 Existing `RequireReview *bool` becomes an alias for `PRRequiredApprovals>0`
 for backward compatibility; remove after one release.

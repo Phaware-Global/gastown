@@ -1778,6 +1778,17 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			}
 		}
 
+		// gt-beuz: refuse an MR that is self-referential, targets the wrong base,
+		// or carries commits already on another open PR (e.g. a copy of a draft PR's branch).
+		if guardWarnings, guardErr := checkMRSubmitGuards(realMRGuardEnv(g), branch, target); guardErr != nil {
+			clearDoneIntentOnHardFail(cwd, townRoot, agentBeadID, issueID)
+			return guardErr
+		} else {
+			for _, w := range guardWarnings {
+				style.PrintWarning("%s", w)
+			}
+		}
+
 		// Get source issue for priority inheritance
 		var priority int
 		if donePriority >= 0 {

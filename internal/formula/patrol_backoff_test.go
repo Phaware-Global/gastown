@@ -198,14 +198,14 @@ func TestHandoffPatrolFormulasSelfPerpetuate(t *testing.T) {
 	}
 }
 
-// TestPatrolFormulasHaveWispGC verifies that all three patrol formulas
-// include `bd mol wisp gc` in their inbox-check step for safe cleanup.
-//
-// Closed-wisp cleanup is safe inside active patrols. Stale open-wisp cleanup
-// belongs to reaper paths that are not running inside the active patrol molecule.
-//
-// Regression test for steveyegge/gastown#1712.
-func TestPatrolFormulasHaveWispGC(t *testing.T) {
+// TestPatrolFormulasDoNotRunBlanketClosedWispGC verifies that no patrol
+// formula runs `bd mol wisp gc --closed`. That command deletes every closed
+// wisp regardless of age or close_reason, and merge-request wisps are
+// issue_type=task so --exclude-type cannot protect them: a wrongly closed MR
+// wisp for an open PR was deleted by the next patrol, taking the queue entry
+// with it (gt-9yhyh). Closed-wisp cleanup belongs to the reaper, whose purge
+// is age-gated and keeps unmerged MR wisps.
+func TestPatrolFormulasDoNotRunBlanketClosedWispGC(t *testing.T) {
 	patrolFormulas := []string{
 		"mol-witness-patrol.formula.toml",
 		"mol-deacon-patrol.formula.toml",
@@ -236,12 +236,9 @@ func TestPatrolFormulasHaveWispGC(t *testing.T) {
 				t.Fatalf("%s: inbox-check step not found or has empty description", name)
 			}
 
-			if !strings.Contains(inboxDesc, "bd mol wisp gc") {
-				t.Errorf("%s inbox-check step missing \"bd mol wisp gc\"\n"+
-					"All patrol formulas must run wisp GC at the start of each cycle\n"+
-					"to clean up stale wisps from abnormal exits.\n"+
-					"See steveyegge/gastown#1712.",
-					name)
+			if strings.Contains(inboxDesc, "bd mol wisp gc") {
+				t.Errorf("%s inbox-check must not run bd mol wisp gc: --closed deletes "+
+					"merge-request wisps of open PRs regardless of close_reason (gt-9yhyh)", name)
 			}
 		})
 	}
@@ -322,9 +319,6 @@ func TestPatrolFormulasDoNotRunAgeBasedWispGC(t *testing.T) {
 				t.Fatalf("%s: inbox-check step not found or has empty description", name)
 			}
 
-			if !strings.Contains(inboxDesc, "bd mol wisp gc --closed --force") {
-				t.Errorf("%s inbox-check must keep closed-wisp cleanup", name)
-			}
 			if strings.Contains(inboxDesc, "bd mol wisp gc --age") {
 				t.Errorf("%s inbox-check must not run age-based wisp GC inside the active patrol", name)
 			}

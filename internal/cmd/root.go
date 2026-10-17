@@ -299,9 +299,21 @@ func checkStaleBinaryWarning() {
 	}
 }
 
+// pinBdNoAutoStart makes every bd subprocess gt spawns inherit
+// BEADS_DOLT_AUTO_START=0. gt has well over a hundred raw exec.Command("bd")
+// sites that pass the parent environment through, and a gt process started
+// outside a gt-managed session (the daemon, a hook, a launchd job) may not
+// carry the variable. Without it, bd restarts a Dolt server from an
+// embedded-mode .beads/dolt directory on the shared town port whenever the
+// canonical server is briefly down, and every agent then reads an empty store.
+func pinBdNoAutoStart() {
+	_ = os.Setenv("BEADS_DOLT_AUTO_START", "0")
+}
+
 // Execute runs the root command and returns an exit code.
 // The caller (main) should call os.Exit with this code.
 func Execute() int {
+	pinBdNoAutoStart()
 	ctx := context.Background()
 	provider, err := telemetry.Init(ctx, "gastown", Version)
 	if err != nil {
