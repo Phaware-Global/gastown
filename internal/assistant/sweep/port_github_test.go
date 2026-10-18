@@ -131,6 +131,8 @@ type ghFixture struct {
 	jiraBadKey  string                      // a `key in (...)` batch naming this key answers 400
 	jiraRateKey string                      // a per-key `key = X` lookup for this key answers 429
 	jira404     bool                        // every Jira search answers 404 (wrong origin / no v3 endpoint)
+	noBrowse    bool                        // the visibility probe (project in …) answers no issues
+	jiraBadKeys []string                    // additional keys that answer the naming 400
 }
 
 func (fx *ghFixture) handler(t *testing.T) http.Handler {
@@ -154,8 +156,18 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 				http.Error(w, `{"message":"rate limited"}`, 429)
 				return
 			}
-			if fx.jiraBadKey != "" && strings.Contains(jql, fx.jiraBadKey) {
-				http.Error(w, `{"errorMessages":["An issue with key '`+fx.jiraBadKey+`' does not exist for field 'key'."]}`, 400)
+			for _, bad := range append([]string{fx.jiraBadKey}, fx.jiraBadKeys...) {
+				if bad != "" && (strings.Contains(jql, `"`+bad+`"`) || strings.HasPrefix(jql, "key = "+bad+" ") || strings.HasSuffix(jql, "key = "+bad)) {
+					http.Error(w, `{"errorMessages":["An issue with key '`+bad+`' does not exist for field 'key'."]}`, 400)
+					return
+				}
+			}
+			if strings.HasPrefix(jql, "project in") { // visibility probe
+				if fx.noBrowse {
+					_ = json.NewEncoder(w).Encode(map[string]any{"issues": []any{}, "isLast": true})
+				} else {
+					_ = json.NewEncoder(w).Encode(map[string]any{"issues": []map[string]any{issue("P23-1", "To Do", "new", personaID, time.Hour, time.Hour, "probe")}, "isLast": true})
+				}
 				return
 			}
 			var hit []map[string]any
@@ -1123,25 +1135,44 @@ func TestGitHubPort_LinkedKindsRound2Fixes(t *testing.T) {
 			t.Errorf("merged PRs outside the release window/branches must not yield linked-key-missing: %+v", f)
 		}
 	}
-	// Every key unknown at once (lost Browse permission looks exactly like
-	// unknown keys): an outage, partial, no linked-key-missing nagging.
-	appTwo := &ghRepoData{}
-	appTwo.Open.Nodes = []ghPR{
-		pr(96, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-96"), requested("kevin", 30*h)),
-		pr(97, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-97"), requested("kevin", 30*h)),
-	}
-	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appTwo, "acme/extra": {}}, jiraBadKey: "P23-9"} // every key answers 400 naming it
+	// Lost Browse with one key per repo: each lookup is all-unknown, nothing
+	// resolved, the probe sees nothing → outage (partial, no nagging, no
+	// handoffs), decided at sweep scope.
+	appX := &ghRepoData{}
+	appX.Open.Nodes = []ghPR{pr(96, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-96"), requested("kevin", 30*h))}
+	appY := &ghRepoData{}
+	appY.Open.Nodes = []ghPR{pr(97, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-97"), requested("kevin", 30*h))}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appX, "acme/extra": appY}, noBrowse: true, jiraBadKeys: []string{"P23-96", "P23-97"}}
 	p, in = newGitHubTest(t, fx, []string{"artie"})
 	withJira(p, in, p.apiBase)
 	findings, err = p.Sweep(context.Background(), in)
 	var pPerm *PartialError
-	if !errors.As(err, &pPerm) || !strings.Contains(pPerm.Reason, "check the token's Browse permission") {
-		t.Errorf("all keys unknown must read as lost permissions: %v", err)
+	if !errors.As(err, &pPerm) || !strings.Contains(pPerm.Reason, "check its Browse permission") {
+		t.Errorf("lost Browse with one key per repo must read as an outage: %v", err)
 	}
 	for _, f := range findings {
 		if f.Kind == "linked-key-missing" || f.Kind == "review-handoff" {
 			t.Errorf("lost permissions must yield neither nagging nor handoffs: %+v", f)
 		}
+	}
+	// Two typos in repo A and a valid key in repo B: the probe sees the
+	// project, so the typos are per-PR info and B's handoff fires, no partial.
+	appA2 := &ghRepoData{}
+	appA2.Open.Nodes = []ghPR{pr(98, "artie", 40*h, 40*h, "SUCCESS", func(p *ghPR) { p.Title = "fix P23-99999998 and P23-99999999" })}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appA2, "acme/extra": appB}, jiraBadKeys: []string{"P23-99999998", "P23-99999999"},
+		issues: []map[string]any{issue("P23-91", "In Progress", "indeterminate", personaID, 100*h, 1*h, "needs handoff")}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	findings, err = p.Sweep(context.Background(), in)
+	if err != nil {
+		t.Errorf("typos must not make the port partial: %v", err)
+	}
+	got = map[string]bool{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = true
+	}
+	if !got["review-handoff/P23-91"] || !got["linked-key-missing/acme/app#98"] {
+		t.Errorf("two typos in repo A must be per-PR info and must not blind repo B: %v", got)
 	}
 	// The inWindow gates, one at a time: an in-window PR on main, and an old PR on a release branch.
 	for _, c := range []struct {

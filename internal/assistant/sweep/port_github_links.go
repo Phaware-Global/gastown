@@ -142,6 +142,9 @@ type ghLinks struct {
 	note                            func(string, ...any)
 	cache                           map[string]*jiraIssue
 	notFound                        map[string]bool // keys Jira rejected as unknown or hidden
+	projects                        []string        // configured Jira projects, for the visibility probe
+	resolved                        bool            // at least one key resolved this sweep: the token can see the projects
+	probed                          *bool           // result of the visibility probe, once per sweep
 	failed                          bool
 }
 
@@ -161,7 +164,7 @@ func (p *GitHubPort) newLinks(ctx context.Context, in Input, note func(string, .
 	}
 	l := &ghLinks{client: client, keyRe: regexp.MustCompile(`\b(?:` + strings.Join(projects, "|") + `)-\d+\b`),
 		reviewers: lowerKeys(cfg.Reviewers), inReview: cfg.InReviewStatus, inProgress: cfg.InProgressStatus, done: cfg.DoneStatus, uat: cfg.UATStatus,
-		uatAfter: parseDur(cfg.UATSweepAfter, 24*time.Hour), note: note, cache: map[string]*jiraIssue{}, notFound: map[string]bool{}}
+		uatAfter: parseDur(cfg.UATSweepAfter, 24*time.Hour), note: note, cache: map[string]*jiraIssue{}, notFound: map[string]bool{}, projects: cfg.Projects}
 	for field, def := range map[*string]string{&l.inReview: "In Review", &l.inProgress: "In Progress", &l.done: "Done", &l.uat: "In UAT"} {
 		if *field == "" {
 			*field = def
@@ -221,6 +224,7 @@ func (l *ghLinks) load(keys []string) {
 	if err == nil {
 		for i := range issues {
 			l.cache[issues[i].Key] = &issues[i]
+			l.resolved = true
 		}
 		return
 	}
@@ -245,15 +249,17 @@ func (l *ghLinks) load(keys []string) {
 			lastErr = err
 		case len(one) > 0:
 			l.cache[one[0].Key] = &one[0]
+			l.resolved = true
 		}
 	}
 	// Jira answers the same 400 for a key that does not exist and for one
-	// the token cannot see. One unknown key among others that resolved is a
-	// typo (reported per PR as an info finding); every key unknown looks
-	// like lost permissions, which is an outage: partial, no eviction, no
-	// "fix the key" nagging.
-	if len(unknown) == len(missing) && len(missing) >= 2 {
-		l.note("all %d linked Jira keys unknown or hidden; check the token's Browse permission", len(missing))
+	// the token cannot see. When every key of this lookup is unknown and
+	// nothing has resolved this sweep, one cheap probe of the configured
+	// projects decides at sweep scope: an empty or failed probe means lost
+	// Browse (outage: partial, no eviction, no "fix the key" nagging);
+	// otherwise the keys are typos, reported per PR.
+	if len(unknown) > 0 && len(unknown) == len(missing) && !l.resolved && !l.canSee() {
+		l.note("linked Jira keys unknown and the token sees nothing in %s; check its Browse permission", strings.Join(l.projects, ", "))
 		l.failed = true
 		return
 	}
@@ -268,6 +274,19 @@ func (l *ghLinks) load(keys []string) {
 	if outages > 0 && outages == len(missing) {
 		l.failed = true
 	}
+}
+
+// canSee probes once per sweep whether the token can read anything in the
+// configured projects.
+func (l *ghLinks) canSee() bool {
+	if l.probed == nil {
+		ok := false
+		if issues, err := l.client.searchFirst(fmt.Sprintf(`project in %s ORDER BY updated DESC`, jqlList(l.projects))); err == nil && len(issues) > 0 {
+			ok = true
+		}
+		l.probed = &ok
+	}
+	return *l.probed
 }
 
 // isNotFound reports Jira's answer for a key that does not exist or that
