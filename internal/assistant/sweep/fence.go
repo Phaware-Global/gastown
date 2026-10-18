@@ -11,7 +11,7 @@ const externalCap = 2048
 
 // Fence renders one external value for an agent to read: the same
 // normalization and delimiter neutralization Telegraph applies, a byte cap,
-// and a "> " prefix on every line, inside an EXTERNAL CONTENT block labelled
+// and a "> " prefix on every line, inside an EXTERNAL CONTENT block labeled
 // with the port and key. The invariant: every byte the runner did not compute
 // or allowlist is inside a fence and starts with "> ".
 func Fence(port, key, name, value string) string {

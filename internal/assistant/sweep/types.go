@@ -48,7 +48,7 @@ type Port interface {
 	// gate, but their fingerprints then move together). A partial result
 	// (truncated pagination, timeout) must be reported through *PartialError
 	// so the runner can keep acknowledged entries for this port. Sweep must
-	// honour ctx: the runner stops waiting at PortTimeout.
+	// honor ctx: the runner stops waiting at PortTimeout.
 	Sweep(ctx context.Context, in Input) ([]Finding, error)
 }
 
@@ -77,7 +77,7 @@ type PartialError struct{ Reason string }
 
 func (e *PartialError) Error() string { return "partial result: " + e.Reason }
 
-// Standing summarises acknowledged, unchanged findings of one kind.
+// Standing summarizes acknowledged, unchanged findings of one kind.
 type Standing struct {
 	Kind     string    `json:"kind"`
 	Severity string    `json:"severity,omitempty"` // overflow only: worst severity among the counted findings
