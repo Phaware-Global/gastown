@@ -586,6 +586,18 @@ Agent overrides:
 - `gt mayor start|attach|restart --agent <alias>`, `gt assistant start|attach|restart --agent <alias>`, and `gt deacon start|attach|restart --agent <alias>` do the same.
 - `gt start crew <name> --agent <alias>` and `gt crew at <name> --agent <alias>` override the crew worker runtime.
 
+### Sweep (Mayor's Assistant)
+
+```bash
+gt assistant sweep                    # run the enabled ports (default: beads), print report + run ID
+gt assistant sweep --ack <run-id>     # after the SWEEP: mail was sent: commit the run as acknowledged
+gt assistant sweep --dry-run          # local ports run, external ports only print their queries; nothing recorded
+gt assistant sweep --json             # machine-readable report; never records state
+```
+
+Ports and thresholds: `settings/config.json` → `assistant.sweep` (see
+docs/design/assistant-role.md, "Sweep ports").
+
 ### Communication
 
 ```bash
