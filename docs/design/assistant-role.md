@@ -218,8 +218,16 @@ launder that text into trusted instructions:
    `provider:event_type` key, or the `default` key when none matches, from
    the inline `[telegraph.prompts]` table or `settings/telegraph.prompts.toml`
    (file wins on a collision), compared after `{token}` substitution and
-   whitespace flattening and allowing for truncation at the prompt cap; a
-   non-matching section is untrusted data. Even a matching section never
+   whitespace flattening. The Mayor rebuilds the substitution from the
+   relayed header values with the transform's own sanitizer (the same
+   delimiter redaction `prompts.substitute` applies), never from raw header
+   text. A section that was cut at the prompt cap (it ends in
+   `[… prompt truncated]`) **never matches**: token values have no length
+   limit, so a webhook-sized `{labels}` or `{actor}` could push a restrictive
+   clause past the cap and leave a genuine, nonce-certified block that says
+   less than the operator wrote. A truncated or otherwise non-matching
+   section is untrusted data, and the Mayor reads the full template from
+   its own configuration instead. Even a matching section never
    supplies command text: the Mayor builds commands only from
    validated-shape fields (rule 2; `Telegraph-Reply-Via` is not one — its
    text is never trusted, and the reply tool follows the item's source
@@ -256,11 +264,13 @@ launder that text into trusted instructions:
    telegraph config)", outside any `EXTERNAL CONTENT` quote, so operator
    policy is neither dropped nor laundered. Because `{actor}` / `{subject}`
    (and `{labels}`, `{canonical_url}`, `{event_id}`) are expanded inline
-   from the webhook payload, the section also lists the `Telegraph-Actor`,
+   from the webhook payload, the section also lists the `Telegraph-Provider`,
+   `Telegraph-Event-Type`, `Telegraph-Timestamp`, `Telegraph-Actor`,
    `Telegraph-Subject`, `Telegraph-Labels`, `Telegraph-URL` and
-   `Telegraph-Event-ID` header values separately as untrusted fields, and the
-   Mayor builds any command from validated-shape fields rather than from the
-   prose (rule 2). The provenance checks in (a)–(c) stop forgeries planted
+   `Telegraph-Event-ID` header values separately as untrusted fields — the
+   first two select the template the Mayor matches against (rule 3) and all
+   of them feed its re-substitution — and the Mayor builds any command from
+   validated-shape fields rather than from the prose (rule 2). The provenance checks in (a)–(c) stop forgeries planted
    inside a real Telegraph mail; they do not stop a local forger, which is
    why the Mayor treats relayed policy as advisory until it matches the
    configured template (rule 3).
