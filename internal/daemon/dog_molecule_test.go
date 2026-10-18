@@ -244,24 +244,24 @@ func TestDogMolCloseDependencyOrder(t *testing.T) {
 }
 
 // A step blocked by something outside the molecule can never close; the root
-// must stay open so the leaked step is not orphaned.
-func TestDogMolCloseKeepsRootWhenStepsRemain(t *testing.T) {
+// is still closed so the reaper's closed-molecule-step pass can sweep it.
+func TestDogMolCloseClosesRootWhenStepsRemain(t *testing.T) {
 	dm, dir := newFakeBdMol(t,
 		[]string{"s2", "s1"},
 		map[string]string{"s2": "s1", "s1": "external"})
 
 	dm.close()
 
-	if got := readCloseLog(t, dir); len(got) != 0 {
-		t.Errorf("closed %v, want nothing closed", got)
+	if got := strings.Join(readCloseLog(t, dir), ","); got != "root-wisp" {
+		t.Errorf("closed = %s, want root-wisp", got)
 	}
 	if left := dm.closeRemainingSteps(); left != 2 {
 		t.Errorf("closeRemainingSteps left = %d, want 2", left)
 	}
 }
 
-// A partially closable molecule closes what it can but still keeps the root.
-func TestDogMolClosePartialProgressKeepsRoot(t *testing.T) {
+// A partially closable molecule closes what it can, then the root.
+func TestDogMolClosePartialProgressClosesRoot(t *testing.T) {
 	dm, dir := newFakeBdMol(t,
 		[]string{"s2", "s1", "s0"},
 		map[string]string{"s2": "s1", "s1": "external"})
@@ -269,8 +269,8 @@ func TestDogMolClosePartialProgressKeepsRoot(t *testing.T) {
 	dm.close()
 
 	got := strings.Join(readCloseLog(t, dir), ",")
-	if want := "s0"; got != want {
-		t.Errorf("closed = %s, want %s (root must stay open)", got, want)
+	if want := "s0,root-wisp"; got != want {
+		t.Errorf("closed = %s, want %s", got, want)
 	}
 }
 
