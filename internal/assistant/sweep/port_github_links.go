@@ -145,6 +145,7 @@ type ghLinks struct {
 	projects                        []string         // configured Jira projects
 	resolved                        map[string]bool  // projects in which a key resolved this sweep: the token can see them
 	probed                          map[string]error // visibility probe per project, once per sweep (nil: readable)
+	hidden                          map[string]bool  // projects whose probe said lost Browse (not a probe failure)
 	failed                          bool
 }
 
@@ -165,7 +166,7 @@ func (p *GitHubPort) newLinks(ctx context.Context, in Input, note func(string, .
 	l := &ghLinks{client: client, keyRe: regexp.MustCompile(`\b(?:` + strings.Join(projects, "|") + `)-\d+\b`),
 		reviewers: lowerKeys(cfg.Reviewers), inReview: cfg.InReviewStatus, inProgress: cfg.InProgressStatus, done: cfg.DoneStatus, uat: cfg.UATStatus,
 		uatAfter: parseDur(cfg.UATSweepAfter, 24*time.Hour), note: note, cache: map[string]*jiraIssue{}, notFound: map[string]bool{}, projects: cfg.Projects,
-		resolved: map[string]bool{}, probed: map[string]error{}}
+		resolved: map[string]bool{}, probed: map[string]error{}, hidden: map[string]bool{}}
 	for field, def := range map[*string]string{&l.inReview: "In Review", &l.inProgress: "In Progress", &l.done: "Done", &l.uat: "In UAT"} {
 		if *field == "" {
 			*field = def
@@ -265,14 +266,17 @@ func (l *ghLinks) load(keys []string) {
 			l.notFound[k] = true
 		}
 	}
+	// Only lost Browse on every configured project (a probe failure is not
+	// that, and neither is a project in which a key has been read) turns
+	// the linked kinds off for the rest of the sweep.
 	unreadable := 0
 	for _, proj := range l.projects {
-		if err, done := l.probed[proj]; done && err != nil {
+		if l.hidden[proj] && !l.resolved[proj] {
 			unreadable++
 		}
 	}
 	if unreadable > 0 && unreadable == len(l.projects) {
-		l.failed = true // nothing is readable: the linked kinds are off for this sweep
+		l.failed = true
 		return
 	}
 	if outages > 0 {
@@ -293,13 +297,15 @@ func (l *ghLinks) canSee(project string) bool {
 	if err, done := l.probed[project]; done {
 		return err == nil
 	}
-	issues, err := l.client.searchFirst(fmt.Sprintf(`project = "%s" ORDER BY updated DESC`, project))
+	issues, err := l.client.searchFirst(fmt.Sprintf(`project in %s ORDER BY updated DESC`, jqlList([]string{project})))
 	switch {
-	case err != nil && badRequestRe.MatchString(err.Error()):
+	case err != nil && badRequestRe.MatchString(err.Error()) && strings.Contains(err.Error(), project):
+		l.hidden[project] = true
 		err = fmt.Errorf("linked Jira keys in %s unknown and the token sees nothing there; check its Browse permission (%v)", project, err)
 	case err != nil:
 		err = fmt.Errorf("linked Jira keys in %s unknown and the visibility probe failed: %v", project, err)
 	case len(issues) == 0:
+		l.hidden[project] = true
 		err = fmt.Errorf("linked Jira keys in %s unknown and the token sees nothing there; check its Browse permission", project)
 	}
 	l.probed[project] = err

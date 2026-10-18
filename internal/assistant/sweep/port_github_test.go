@@ -135,6 +135,8 @@ type ghFixture struct {
 	jiraBadKeys []string                    // additional keys that answer the naming 400
 	noBrowseIn  []string                    // projects whose visibility probe answers no issues
 	probe503    bool                        // the visibility probe answers 503
+	probe429In  []string                    // projects whose visibility probe answers 429
+	probe400In  []string                    // projects whose visibility probe answers 400 naming the project
 	probeCalls  atomic.Int32
 }
 
@@ -165,9 +167,9 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 					return
 				}
 			}
-			if strings.HasPrefix(jql, "project = ") { // visibility probe, one project
+			if strings.HasPrefix(jql, "project in (") { // visibility probe, one project
 				fx.probeCalls.Add(1)
-				proj := strings.Trim(strings.Fields(strings.TrimPrefix(jql, "project = "))[0], `"`)
+				proj := strings.Trim(strings.Fields(strings.TrimPrefix(jql, "project in ("))[0], `")`)
 				if fx.probe503 {
 					http.Error(w, "upstream unavailable", 503)
 					return
@@ -175,6 +177,18 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 				hidden := fx.noBrowse
 				for _, h := range fx.noBrowseIn {
 					hidden = hidden || h == proj
+				}
+				for _, h := range fx.probe429In {
+					if h == proj {
+						http.Error(w, `{"message":"rate limited"}`, 429)
+						return
+					}
+				}
+				for _, h := range fx.probe400In {
+					if h == proj {
+						http.Error(w, `{"errorMessages":["The value '`+proj+`' does not exist for the field 'project'."]}`, 400)
+						return
+					}
 				}
 				if hidden {
 					_ = json.NewEncoder(w).Encode(map[string]any{"issues": []any{}, "isLast": true})
@@ -1205,6 +1219,60 @@ func TestGitHubPort_LinkedKindsRound2Fixes(t *testing.T) {
 	}
 	if !got["review-handoff/P23-91"] || got["linked-key-missing/acme/app#100"] {
 		t.Errorf("the readable project still fires and the hidden one is not a typo: %v", got)
+	}
+	// A 400 naming the project is Jira's own "cannot see it" answer: lost Browse.
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appX, "acme/extra": {}}, probe400In: []string{"P23"}, jiraBadKeys: []string{"P23-96"}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	_, err = p.Sweep(context.Background(), in)
+	var p400 *PartialError
+	if !errors.As(err, &p400) || !strings.Contains(p400.Reason, "check its Browse permission") {
+		t.Errorf("a probe 400 naming the project must read as lost Browse: %v", err)
+	}
+	// A transient probe 429 on P23 in repo A must not blind P23 once a P23
+	// key resolves in repo B, even with OPS hidden: the handoff still fires.
+	appTypo := &ghRepoData{}
+	appTypo.Open.Nodes = []ghPR{pr(96, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-96"), requested("kevin", 30*h))}
+	appMixed := &ghRepoData{}
+	appMixed.Open.Nodes = []ghPR{
+		pr(91, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-91"), requested("kevin", 30*h)),
+		pr(100, "artie", 40*h, 40*h, "SUCCESS", branch("feat/OPS-7"), requested("kevin", 30*h)),
+	}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appTypo, "acme/extra": appMixed}, probe429In: []string{"P23"}, noBrowseIn: []string{"OPS"}, jiraBadKeys: []string{"P23-96", "OPS-7"},
+		issues: []map[string]any{issue("P23-91", "In Progress", "indeterminate", personaID, 100*h, 1*h, "needs handoff")}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	in.Settings.Assistant.Sweep.Jira.Projects = []string{"P23", "OPS"}
+	findings, err = p.Sweep(context.Background(), in)
+	var p429 *PartialError
+	if !errors.As(err, &p429) || !strings.Contains(p429.Reason, "visibility probe failed") {
+		t.Errorf("the probe 429 must be noted as a probe failure: %v", err)
+	}
+	got = map[string]bool{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = true
+	}
+	if !got["review-handoff/P23-91"] || got["linked-key-missing/acme/app#96"] || got["linked-key-missing/acme/extra#100"] {
+		t.Errorf("a failed probe must neither blind a project that resolves nor read as typos: %v", got)
+	}
+	// A project in which a key resolved is never probed: a typo beside a
+	// valid key is a typo without any probe call.
+	appBoth := &ghRepoData{}
+	appBoth.Open.Nodes = []ghPR{pr(98, "artie", 40*h, 40*h, "SUCCESS", func(p *ghPR) { p.Title = "fix P23-91 and P23-99999999" })}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appBoth, "acme/extra": {}}, noBrowse: true, jiraBadKeys: []string{"P23-99999999"},
+		issues: []map[string]any{issue("P23-91", "In Progress", "indeterminate", personaID, 100*h, 1*h, "needs handoff")}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	findings, err = p.Sweep(context.Background(), in)
+	if err != nil || fx.probeCalls.Load() != 0 {
+		t.Errorf("a resolved project must not be probed (calls=%d): %v", fx.probeCalls.Load(), err)
+	}
+	got = map[string]bool{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = true
+	}
+	if !got["linked-key-missing/acme/app#98"] {
+		t.Errorf("the typo beside a resolved key is a typo: %v", got)
 	}
 	// Two typos in repo A and a valid key in repo B: the probe sees the
 	// project, so the typos are per-PR info and B's handoff fires, no partial.
