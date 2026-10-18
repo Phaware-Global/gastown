@@ -655,3 +655,32 @@ func TestRun_CountedFindingKeepsItsAckedEntry(t *testing.T) {
 		t.Fatalf("counted item's acked entry must survive untouched: %+v ok=%v", e, ok)
 	}
 }
+
+type tracingPort struct{ *fakePort }
+
+func (t tracingPort) Sweep(_ context.Context, in Input) ([]Finding, error) {
+	if in.DryRun {
+		if in.Trace != nil {
+			in.Trace("GET /would/query")
+		}
+		return nil, nil
+	}
+	return t.fakePort.findings, nil
+}
+
+func TestRun_DryRunIsNotChecked(t *testing.T) {
+	r := newTestRunner(t, &fakePort{name: "x"})
+	r.Ports["x"] = tracingPort{&fakePort{name: "x"}}
+	rep, err := r.Run(context.Background(), Options{DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := rep.Ports[0]
+	if !res.DryRun || res.Clean() || len(res.Queries) != 1 {
+		t.Fatalf("dry run must be flagged and never clean: %+v", res)
+	}
+	md := Markdown(rep)
+	if strings.Contains(md, "all clear") || !strings.Contains(md, "DRY RUN: not checked") || !strings.Contains(md, "would query: GET /would/query") {
+		t.Errorf("dry-run rendering:\n%s", md)
+	}
+}

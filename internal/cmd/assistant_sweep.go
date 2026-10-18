@@ -39,7 +39,7 @@ report is fenced as EXTERNAL CONTENT with every line prefixed "> ".`,
 
 func init() {
 	assistantSweepCmd.Flags().BoolVar(&assistantSweepJSON, "json", false, "Emit the report as JSON (does not record state)")
-	assistantSweepCmd.Flags().BoolVar(&assistantSweepDryRun, "dry-run", false, "Run the ports but do not record state")
+	assistantSweepCmd.Flags().BoolVar(&assistantSweepDryRun, "dry-run", false, "Local ports run; external ports only print the queries they would issue; nothing is recorded")
 	assistantSweepCmd.Flags().StringVar(&assistantSweepAck, "ack", "", "Acknowledge a pending run (after mailing the Mayor) by its run ID")
 	assistantCmd.AddCommand(assistantSweepCmd)
 }
@@ -61,7 +61,7 @@ func runAssistantSweep(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("loading town settings: %w", err)
 	}
 	runner := sweep.NewRunner(townRoot, settings)
-	report, err := runner.Run(context.Background(), sweep.Options{Write: !assistantSweepJSON && !assistantSweepDryRun})
+	report, err := runner.Run(context.Background(), sweep.Options{Write: !assistantSweepJSON && !assistantSweepDryRun, DryRun: assistantSweepDryRun})
 	if err != nil {
 		return err
 	}

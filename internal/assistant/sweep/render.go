@@ -29,7 +29,9 @@ func Markdown(r *Report) string {
 		if p.Partial {
 			b.WriteString("PARTIAL: some findings may be missing; standing items are unchanged, not cleared\n")
 		}
-		if len(p.New) == 0 && len(p.Standing) == 0 {
+		if p.DryRun {
+			b.WriteString("DRY RUN: not checked — the queries below were traced, not issued\n")
+		} else if len(p.New) == 0 && len(p.Standing) == 0 {
 			b.WriteString("all clear\n")
 		}
 		for _, f := range p.New {
@@ -57,6 +59,9 @@ func Markdown(r *Report) string {
 				fmt.Fprintf(&b, ", oldest %s", humanAge(r.GeneratedAt.Sub(o.Oldest)))
 			}
 			b.WriteString(")\n")
+		}
+		for _, q := range p.Queries {
+			fmt.Fprintf(&b, "would query: %s\n", q)
 		}
 		for _, s := range p.Standing {
 			fmt.Fprintf(&b, "\nstanding: %s ×%d", s.Kind, s.Count)
