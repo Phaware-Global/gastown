@@ -185,7 +185,7 @@ func TestAddressToSessionIDs(t *testing.T) {
 		{"assistant", []string{"hq-assistant"}},
 		{"assistant/", []string{"hq-assistant"}},
 		{"deacon", []string{"hq-deacon"}},
-		{"deacon/boot", []string{"hq-boot"}},          // deacon family, not a rig named deacon
+		{"deacon/boot", []string{"hq-boot"}}, // deacon family, not a rig named deacon
 		{"deacon/dogs/alpha", []string{"hq-dog-alpha"}},
 		{"deacon/dogs/alpha/", []string{"hq-dog-alpha"}},
 		{"deacon/dogs/alpha//", []string{"hq-dog-alpha"}},
@@ -2261,5 +2261,27 @@ func TestAddressToAgentBeadID_Assistant(t *testing.T) {
 	}
 	if got := agentBeadToAddress(&agentBead{ID: "hq-assistant"}); got != "assistant/" {
 		t.Errorf("agentBeadToAddress(hq-assistant) = %q, want assistant/", got)
+	}
+}
+
+// A telegraph reminder addressed to the Mayor's Assistant must not point at
+// the Jira/GitHub tools: the assistant relays and the Mayor replies. Other
+// recipients and non-telegraph senders keep the existing texts.
+func TestBuildReplyReminderMessageFor_AssistantRelays(t *testing.T) {
+	for _, c := range []struct {
+		to, from, want, mustNot string
+	}{
+		{"assistant/", "telegraph/jira/PROJ-42", "You relay; you do not respond", "addCommentToJiraIssue"},
+		{"assistant", "telegraph/github/alice", "summarize it for the Mayor", "comment on the GitHub PR/issue directly"},
+		{"mayor/", "telegraph/jira/PROJ-42", "addCommentToJiraIssue", "You relay"},
+		{"assistant/", "gastown/witness", "Remember to reply to gastown/witness", "You relay"},
+	} {
+		got := buildReplyReminderMessageFor(c.to, c.from, "subj")
+		if !strings.Contains(got, c.want) || strings.Contains(got, c.mustNot) {
+			t.Errorf("to=%s from=%s: got %q, want it to contain %q and not %q", c.to, c.from, got, c.want, c.mustNot)
+		}
+	}
+	if got := buildReplyReminderMessageFor("assistant/", "telegraph/unknown/x", "subj"); got != "" {
+		t.Errorf("unknown telegraph provider must stay silent for the assistant too, got %q", got)
 	}
 }

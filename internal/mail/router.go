@@ -1980,7 +1980,7 @@ func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 	if delay <= 0 {
 		return // Disabled by config
 	}
-	reminderMsg := buildReplyReminderMessage(msg.From, msg.Subject)
+	reminderMsg := buildReplyReminderMessageFor(msg.To, msg.From, msg.Subject)
 	if reminderMsg == "" {
 		return // Non-sendable sender (e.g. telegraph/*) — suppress reminder
 	}
@@ -1995,6 +1995,22 @@ func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 	if err := nudge.Enqueue(r.townRoot, sessionID, reminder); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to enqueue reply reminder for %s: %v\n", sessionID, err)
 	}
+}
+
+// buildReplyReminderMessageFor is buildReplyReminderMessage with the recipient
+// taken into account. The Mayor's Assistant relays inbound information and
+// never replies on Jira or GitHub itself, so a telegraph reminder addressed to
+// it must not point at the Jira or GitHub tools: on the live town that text
+// made an opencode assistant transition and comment on Jira issues within two
+// minutes of starting. Mail from agents keeps the usual "reply by mail" text.
+func buildReplyReminderMessageFor(to, from, subject string) string {
+	if addressToAgentBeadID(to) == "hq-assistant" && strings.HasPrefix(from, "telegraph/") {
+		if buildReplyReminderMessage(from, subject) == "" {
+			return ""
+		}
+		return fmt.Sprintf("Received mail from %s (subject: %q). You relay; you do not respond: summarize it for the Mayor, who replies on Jira/GitHub. Never use Jira or GitHub tools yourself.", from, subject)
+	}
+	return buildReplyReminderMessage(from, subject)
 }
 
 // buildReplyReminderMessage returns the nudge text for a reply reminder.
