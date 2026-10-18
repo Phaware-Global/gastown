@@ -147,12 +147,12 @@ func (dm *dogMol) close() {
 		return
 	}
 
-	// Close any step wisps that were never explicitly closed/failed. If some
-	// stay open, closing the root would orphan them (their parent gone, nothing
-	// left to sweep them), so leave the root open as the handle for a later sweep.
+	// Close any step wisps that were never explicitly closed/failed. Steps that
+	// stay open are left to the reaper, which closes open steps once their
+	// parent molecule is closed; an open root would hide them from it, so the
+	// root is closed regardless.
 	if left := dm.closeRemainingSteps(); left > 0 {
-		dm.logger.Printf("dog_molecule: not closing root %s: %d step wisp(s) still open", dm.rootID, left)
-		return
+		dm.logger.Printf("dog_molecule: closing root %s with %d step wisp(s) still open; reaper will sweep them", dm.rootID, left)
 	}
 
 	if err := dm.closeWisp(dm.rootID); err != nil {
@@ -171,7 +171,8 @@ func (dm *dogMol) close() {
 // when everything is closed or a pass makes no progress.
 //
 // Returns the number of child steps still open (0 when none remain or when the
-// children could not be listed).
+// children could not be listed). Callers close the root anyway; the reaper
+// sweeps open steps whose parent molecule is closed.
 func (dm *dogMol) closeRemainingSteps() int {
 	if dm.rootID == "" {
 		return 0
