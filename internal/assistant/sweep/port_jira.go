@@ -2,11 +2,14 @@ package sweep
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -131,6 +134,9 @@ type jiraIssue struct {
 		Assignee *jiraUser `json:"assignee"`
 		Reporter *jiraUser `json:"reporter"`
 		Creator  *jiraUser `json:"creator"`
+		Watches  struct {
+			IsWatching bool `json:"isWatching"`
+		} `json:"watches"`
 	} `json:"fields"`
 }
 
@@ -219,11 +225,21 @@ func truncate(s string, n int) string {
 
 // search runs a JQL query through every page (bounded by jiraMaxPages).
 func (c *jiraClient) search(jql string) ([]jiraIssue, bool, error) {
+	return c.searchN(jql, jiraPageSize, jiraMaxPages)
+}
+
+// searchFirst returns at most the first issue of a query in one call.
+func (c *jiraClient) searchFirst(jql string) ([]jiraIssue, error) {
+	issues, _, err := c.searchN(jql, 1, 1)
+	return issues, err
+}
+
+func (c *jiraClient) searchN(jql string, pageSize, maxPages int) ([]jiraIssue, bool, error) {
 	var all []jiraIssue
 	token := ""
-	for page := 0; page < jiraMaxPages; page++ {
-		q := url.Values{"jql": {jql}, "maxResults": {fmt.Sprint(jiraPageSize)},
-			"fields": {"summary,status,assignee,reporter,creator,created,updated"}}
+	for page := 0; page < maxPages; page++ {
+		q := url.Values{"jql": {jql}, "maxResults": {fmt.Sprint(pageSize)},
+			"fields": {"summary,status,assignee,reporter,creator,created,updated,watches"}}
 		if token != "" {
 			q.Set("nextPageToken", token)
 		}
@@ -241,7 +257,18 @@ func (c *jiraClient) search(jql string) ([]jiraIssue, bool, error) {
 		}
 		token = res.NextPageToken
 	}
-	return all, false, nil
+	return all, maxPages == 1, nil
+}
+
+// jiraKeyRe is the shape an issue key must have before it is printed outside
+// a fence or interpolated into JQL.
+var jiraKeyRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]{1,15}-\d{1,9}$`)
+
+// timeLeft reports whether the port still has budget for another call;
+// when the deadline is near it stops and reports what it has as partial.
+func timeLeft(ctx context.Context) bool {
+	dl, ok := ctx.Deadline()
+	return !ok || time.Until(dl) > 15*time.Second
 }
 
 func (c *jiraClient) comments(key string) ([]jiraComment, error) {
@@ -361,9 +388,11 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	// 2. Issues whose status changed recently (a transition counts as a
 	//    status update even without a comment).
 	transitioned := map[string]bool{}
-	tIssues, _, err := c.search(fmt.Sprintf(`project in %s AND status changed after %s`, projects, jqlMinutes(d.statusUpdate)))
+	tIssues, tComplete, err := c.search(fmt.Sprintf(`project in %s AND status changed after %s`, projects, jqlMinutes(d.statusUpdate)))
 	if err != nil {
 		note("status-change search failed: %v", err)
+	} else if !tComplete {
+		note("status-change search truncated after %d pages", jiraMaxPages)
 	}
 	for _, i := range tIssues {
 		transitioned[i.Key] = true
@@ -381,9 +410,11 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		}
 	}
 	// 4. Release-wave parents.
-	waves, _, err := c.search(fmt.Sprintf(`project in %s AND statusCategory != Done AND summary ~ "\"Release wave\"" ORDER BY created DESC`, projects))
+	waves, wComplete, err := c.search(fmt.Sprintf(`project in %s AND statusCategory != Done AND summary ~ "\"Release wave\"" ORDER BY created DESC`, projects))
 	if err != nil {
 		note("release-wave search failed: %v", err)
+	} else if !wComplete {
+		note("release-wave search truncated after %d pages", jiraMaxPages)
 	}
 	if in.DryRun {
 		c.trace("GET /rest/api/3/issue/{key}/comment orderBy=-created maxResults=" + fmt.Sprint(jiraCommentPage) + " (per involved issue)")
@@ -398,8 +429,17 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 			note("comments fetched for the first %d of %d issues", jiraMaxCommentIssues, len(issues))
 			break
 		}
+		if !timeLeft(ctx) {
+			note("time budget exhausted after %d of %d issues", n, len(issues))
+			break
+		}
 		f := is.Fields
 		assignedToPersona := f.Assignee != nil && isPersona[f.Assignee.AccountID]
+		// Only issues the persona is involved in get the full set of checks;
+		// the rest came in through the recently-updated clause and are
+		// scanned for @-mentions of the persona only.
+		involved := assignedToPersona || f.Watches.IsWatching ||
+			(f.Reporter != nil && isPersona[f.Reporter.AccountID]) || (f.Creator != nil && isPersona[f.Creator.AccountID])
 		status := f.Status.Name
 		if assignedToPersona && contains(wipStatuses, status) {
 			wip++
@@ -409,41 +449,41 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 			note("%s: comments unavailable: %v", is.Key, err)
 			continue
 		}
-		base := func(kind, severity string) Finding {
-			return Finding{Kind: kind, Key: is.Key, URL: browse + is.Key, Severity: severity,
-				Fields:   map[string]string{"status_category": f.Status.Category.Key},
-				External: map[string]string{"summary": f.Summary, "status": status}}
-		}
+		base := jiraBase(is, browse)
 		// Comments after the persona's last word, newest first.
 		var lastPersona time.Time
-		var lastPersonaID string
+		var lastPersonaID, lastPersonaText string
 		for _, cm := range comments {
 			if isPersona[cm.Author.AccountID] {
 				lastPersona, lastPersonaID = time.Time(cm.Created), cm.ID
+				lastPersonaText, _ = adfWalk(cm.Body)
 				break
 			}
 		}
 		var waiting, unknown *jiraComment
 		var waitingHuman string
+		humanAfter := false // a listed human spoke after the persona
 		for i := range comments {
 			cm := &comments[i]
 			at := time.Time(cm.Created)
 			if !at.After(lastPersona) {
 				break
 			}
+			_, mentions := adfWalk(cm.Body)
+			mentioned := mentionsAny(mentions, isPersona)
 			switch {
 			case isPersona[cm.Author.AccountID]:
 			case isBot[cm.Author.AccountID]:
 			case isHuman[cm.Author.AccountID]:
-				if waiting == nil {
+				humanAfter = true
+				if waiting == nil && (involved || mentioned) {
 					waiting, waitingHuman = cm, cm.Author.AccountID
 				}
 			default:
-				_, mentions := adfWalk(cm.Body)
-				if mentionsAny(mentions, isPersona) && waiting == nil {
+				if mentioned && waiting == nil {
 					waiting = cm
 				}
-				if unknown == nil {
+				if unknown == nil && involved {
 					unknown = cm
 				}
 			}
@@ -466,12 +506,16 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 			fd.Since = time.Time(unknown.Created)
 			fd.Fields["comment_id"] = unknown.ID
 			fd.Fields["account_id"] = unknown.Author.AccountID
-			fd.Suggest = "add " + unknown.Author.AccountID + " to assistant.sweep.jira.humans or .bots"
+			if jiraAccountRe.MatchString(unknown.Author.AccountID) {
+				fd.Suggest = "add " + unknown.Author.AccountID + " to assistant.sweep.jira.humans or .bots"
+			}
 			fd.Fingerprint = unknown.ID
 			out = append(out, fd)
 		}
-		if len(comments) > 0 && isPersona[comments[0].Author.AccountID] && in.Now.Sub(lastPersona) >= d.chase {
-			text, _ := adfWalk(comments[0].Body)
+		// The persona asked (or is blocked) and no listed human has answered
+		// since; bot or unlisted comments in between do not count as answers.
+		if involved && !lastPersona.IsZero() && !humanAfter && in.Now.Sub(lastPersona) >= d.chase {
+			text := lastPersonaText
 			if strings.Contains(text, "?") || strings.EqualFold(status, "Blocked") {
 				fd := base("question-unanswered", SeverityActionable)
 				fd.Since = lastPersona
@@ -504,7 +548,7 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 				}
 			}
 		}
-		if backlog[is.Key] {
+		if involved && backlog[is.Key] {
 			createdByPersona := f.Creator != nil && isPersona[f.Creator.AccountID]
 			if contains(active, status) || (createdByPersona && in.Now.Sub(time.Time(f.Created)) <= d.offBoard) {
 				fd := base("off-board", SeverityActionable)
@@ -522,7 +566,15 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 			Suggest: "finish or hand off before starting more", Fingerprint: fmt.Sprint(wip)})
 	}
 	for _, w := range waves {
-		children, _, err := c.search(fmt.Sprintf(`parent = "%s" ORDER BY updated DESC`, w.Key))
+		if !jiraKeyRe.MatchString(w.Key) {
+			note("release wave with malformed key skipped")
+			continue
+		}
+		if !timeLeft(ctx) {
+			note("time budget exhausted before release wave %s", w.Key)
+			break
+		}
+		children, err := c.searchFirst(fmt.Sprintf(`parent = %s ORDER BY updated DESC`, w.Key))
 		if err != nil {
 			note("%s: subtasks unavailable: %v", w.Key, err)
 			continue
@@ -532,16 +584,42 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 			last = time.Time(children[0].Fields.Updated)
 		}
 		if in.Now.Sub(last) >= d.stale {
-			out = append(out, Finding{Kind: "release-wave-stale", Key: w.Key, URL: browse + w.Key, Severity: SeverityInfo, Since: last,
-				Fields:   map[string]string{"status_category": w.Fields.Status.Category.Key},
-				External: map[string]string{"summary": w.Fields.Summary, "status": w.Fields.Status.Name},
-				Suggest:  "review release wave " + w.Key, Fingerprint: last.UTC().Format(time.RFC3339)})
+			fd := jiraBase(w, browse)("release-wave-stale", SeverityInfo)
+			fd.Since = last
+			fd.Suggest = "review release wave " + w.Key
+			fd.Fingerprint = last.UTC().Format(time.RFC3339)
+			out = append(out, fd)
+		}
+	}
+	for i := range out {
+		if strings.HasPrefix(out[i].Key, "invalid-key-") {
+			out[i].Suggest = "" // would quote a malformed key
 		}
 	}
 	if len(partial) > 0 {
 		return out, &PartialError{Reason: strings.Join(partial, "; ")}
 	}
 	return out, nil
+}
+
+// jiraBase returns a Finding constructor for an issue. A key outside
+// jiraKeyRe never reaches Key, URL or Suggest: the Key becomes a hash
+// placeholder, the raw key is fenced, and callers' Suggest (which quotes
+// the key) is cleared by the returned constructor's shape flag.
+func jiraBase(is jiraIssue, browse string) func(kind, severity string) Finding {
+	f := is.Fields
+	valid := jiraKeyRe.MatchString(is.Key)
+	return func(kind, severity string) Finding {
+		fd := Finding{Kind: kind, Key: is.Key, URL: browse + is.Key, Severity: severity,
+			Fields:   map[string]string{"status_category": f.Status.Category.Key},
+			External: map[string]string{"summary": f.Summary, "status": f.Status.Name}}
+		if !valid {
+			sum := sha256.Sum256([]byte(is.Key))
+			fd.Key, fd.URL = "invalid-key-"+hex.EncodeToString(sum[:6]), ""
+			fd.External["key"] = is.Key
+		}
+		return fd
+	}
 }
 
 func contains(list []string, s string) bool {

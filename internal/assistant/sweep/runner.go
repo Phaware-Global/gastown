@@ -84,6 +84,7 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Report, error) {
 		qmu.Lock()
 		res.Queries = append([]string(nil), queries...)
 		qmu.Unlock()
+		res.DryRun = opts.DryRun && len(res.Queries) > 0
 		var partial *PartialError
 		switch {
 		case errors.As(perr, &partial):

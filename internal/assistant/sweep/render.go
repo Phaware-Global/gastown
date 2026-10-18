@@ -29,7 +29,9 @@ func Markdown(r *Report) string {
 		if p.Partial {
 			b.WriteString("PARTIAL: some findings may be missing; standing items are unchanged, not cleared\n")
 		}
-		if len(p.New) == 0 && len(p.Standing) == 0 {
+		if p.DryRun {
+			b.WriteString("DRY RUN: not checked — the queries below were traced, not issued\n")
+		} else if len(p.New) == 0 && len(p.Standing) == 0 {
 			b.WriteString("all clear\n")
 		}
 		for _, f := range p.New {

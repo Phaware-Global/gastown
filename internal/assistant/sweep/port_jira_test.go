@@ -27,13 +27,22 @@ var jiraNow = time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 func jt(ago time.Duration) string { return jiraNow.Add(-ago).Format("2006-01-02T15:04:05.000-0700") }
 
 func issue(key, status, category, assignee string, created, updated time.Duration, summary string) map[string]any {
-	f := map[string]any{"summary": summary, "created": jt(created), "updated": jt(updated),
+	f := map[string]any{"summary": summary, "created": jt(created), "updated": jt(updated), "watches": map[string]any{"isWatching": false},
 		"status":  map[string]any{"name": status, "statusCategory": map[string]any{"key": category}},
 		"creator": map[string]any{"accountId": personaID}, "reporter": map[string]any{"accountId": personaID}}
 	if assignee != "" {
 		f["assignee"] = map[string]any{"accountId": assignee}
 	}
 	return map[string]any{"key": key, "fields": f}
+}
+
+// other makes an issue the persona is not involved in (reported and created
+// by a human, not watched).
+func other(is map[string]any) map[string]any {
+	f := is["fields"].(map[string]any)
+	f["creator"] = map[string]any{"accountId": humanID}
+	f["reporter"] = map[string]any{"accountId": humanID}
+	return is
 }
 
 func comment(id, author string, ago time.Duration, text string, mention string) map[string]any {
@@ -133,18 +142,26 @@ func TestJiraPort_Findings(t *testing.T) {
 			issue("P23-7", "In Progress", "indeterminate", humanID, 240*h, 1*h, "answered"),
 			issue("P23-8", "In Progress", "indeterminate", humanID, 240*h, 1*h, "bot noise"),
 			issue("P23-10", "In Progress", "indeterminate", personaID, 240*h, 1*h, "transitioned recently"),
+			other(issue("P23-11", "In Progress", "indeterminate", humanID, 240*h, 1*h, "not ours: human comment")),
+			other(issue("P23-12", "In Progress", "indeterminate", humanID, 240*h, 1*h, "not ours: mentions us")),
+			issue("P23-13", "In Progress", "indeterminate", personaID, 240*h, 1*h, "we asked, bot replied"),
+			issue("P23-1; DROP", "In Progress", "indeterminate", personaID, 240*h, 1*h, "malformed key"),
 		},
 		comments: map[string][]map[string]any{
-			"P23-1":  {comment("101", humanID, 5*h, "can you look?", ""), comment("100", personaID, 30*h, "done", "")},
-			"P23-2":  {comment("201", personaID, 50*h, "which env should this target?", "")},
-			"P23-3":  {comment("301", personaID, 120*h, "working", "")},
-			"P23-5":  {comment("501", personaID, 1*h, "note", "")},
-			"P23-6":  {comment("601", strangeID, 6*h, "ping", personaID)},
-			"P23-7":  {comment("702", personaID, 1*h, "fixed", ""), comment("701", humanID, 3*h, "broken?", "")},
-			"P23-8":  {comment("801", botID, 1*h, "build passed", ""), comment("800", personaID, 3*h, "ok", "")},
-			"P23-10": {comment("1001", personaID, 120*h, "old note", "")},
+			"P23-1":       {comment("101", humanID, 5*h, "can you look?", ""), comment("100", personaID, 30*h, "done", "")},
+			"P23-2":       {comment("201", personaID, 50*h, "which env should this target?", "")},
+			"P23-3":       {comment("301", personaID, 120*h, "working", "")},
+			"P23-5":       {comment("501", personaID, 1*h, "note", "")},
+			"P23-6":       {comment("601", strangeID, 6*h, "ping", personaID)},
+			"P23-7":       {comment("702", personaID, 1*h, "fixed", ""), comment("701", humanID, 3*h, "broken?", "")},
+			"P23-8":       {comment("801", botID, 1*h, "build passed", ""), comment("800", personaID, 3*h, "ok", "")},
+			"P23-10":      {comment("1001", personaID, 120*h, "old note", "")},
+			"P23-11":      {comment("1101", humanID, 5*h, "unrelated question for someone else?", ""), comment("1100", strangeID, 6*h, "hi", "")},
+			"P23-12":      {comment("1201", strangeID, 5*h, "please look", personaID)},
+			"P23-13":      {comment("1302", botID, 1*h, "branch created", ""), comment("1301", personaID, 50*h, "which env?", "")},
+			"P23-1; DROP": {comment("1401", humanID, 5*h, "?", "")},
 		},
-		backlog:   []string{"P23-5", "P23-99"},
+		backlog:   []string{"P23-5", "P23-99", "P23-11"},
 		waves:     []map[string]any{issue("P23-9", "In Progress", "indeterminate", "", 500*h, 300*h, "Release wave 12")},
 		waveChild: map[string][]map[string]any{"P23-9": {issue("P23-91", "In UAT", "indeterminate", "", 400*h, 250*h, "child")}},
 		changed:   []map[string]any{{"key": "P23-10"}},
@@ -159,12 +176,14 @@ func TestJiraPort_Findings(t *testing.T) {
 		got[f.Kind+"/"+f.Key] = f
 	}
 	for _, want := range []string{"unanswered-comment/P23-1", "question-unanswered/P23-2", "needs-status-update/P23-3",
-		"needs-status-update/P23-4", "off-board/P23-5", "unanswered-comment/P23-6", "unknown-actor/P23-6", "wip-over-limit/wip", "release-wave-stale/P23-9"} {
+		"needs-status-update/P23-4", "off-board/P23-5", "unanswered-comment/P23-6", "unknown-actor/P23-6", "wip-over-limit/wip", "release-wave-stale/P23-9",
+		"unanswered-comment/P23-12", "question-unanswered/P23-13"} {
 		if _, ok := got[want]; !ok {
 			t.Errorf("missing %s; got %v", want, keysOf(got))
 		}
 	}
-	for _, absent := range []string{"unanswered-comment/P23-7", "unanswered-comment/P23-8", "unknown-actor/P23-8", "needs-status-update/P23-10", "off-board/P23-99", "needs-status-update/P23-5"} {
+	for _, absent := range []string{"unanswered-comment/P23-7", "unanswered-comment/P23-8", "unknown-actor/P23-8", "needs-status-update/P23-10", "off-board/P23-99", "needs-status-update/P23-5",
+		"unanswered-comment/P23-11", "unknown-actor/P23-11", "off-board/P23-11", "unknown-actor/P23-12"} {
 		if _, ok := got[absent]; ok {
 			t.Errorf("unexpected %s", absent)
 		}
@@ -172,7 +191,22 @@ func TestJiraPort_Findings(t *testing.T) {
 	if f := got["unanswered-comment/P23-1"]; f.Fields["human"] != humanID || f.Fields["comment_id"] != "101" || f.Fingerprint != "101" || f.External["comment"] != "can you look?" {
 		t.Errorf("P23-1 finding: %+v", f)
 	}
-	if f := got["wip-over-limit/wip"]; f.Fields["count"] != "3" || f.Fields["limit"] != "2" {
+	placeholders := 0
+	for k, f := range got {
+		if strings.HasPrefix(f.Key, "invalid-key-") {
+			placeholders++
+			if f.Suggest != "" || f.URL != "" || f.External["key"] == "" {
+				t.Errorf("%s: malformed key must be fenced with no Suggest/URL: %+v", k, f)
+			}
+		}
+		if strings.Contains(f.Key, ";") || strings.Contains(f.Suggest, "DROP") {
+			t.Errorf("%s: malformed key leaked outside the fence: %+v", k, f)
+		}
+	}
+	if placeholders == 0 {
+		t.Error("malformed key fixture produced no placeholder finding")
+	}
+	if f := got["wip-over-limit/wip"]; f.Fields["count"] != "5" || f.Fields["limit"] != "2" {
 		t.Errorf("wip: %+v", f.Fields)
 	}
 	if f := got["unknown-actor/P23-6"]; !strings.Contains(f.Suggest, strangeID) {
@@ -182,7 +216,7 @@ func TestJiraPort_Findings(t *testing.T) {
 		if _, ok := f.Fields["status"]; ok {
 			t.Errorf("%s: status name must be External", k)
 		}
-		if f.Kind != "wip-over-limit" && !strings.HasPrefix(f.URL, "http") {
+		if f.Kind != "wip-over-limit" && !strings.HasPrefix(f.Key, "invalid-key-") && !strings.HasPrefix(f.URL, "http") {
 			t.Errorf("%s: missing URL", k)
 		}
 		before := f.Suggest

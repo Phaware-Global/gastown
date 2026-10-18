@@ -100,11 +100,12 @@ type PortResult struct {
 	Standing []Standing `json:"standing,omitempty"` // acknowledged and unchanged, counts only
 	Overflow []Standing `json:"overflow,omitempty"` // new findings beyond MaxNewPerKind, counts only
 	Queries  []string   `json:"queries,omitempty"`  // external queries traced in a dry run
+	DryRun   bool       `json:"dry_run,omitempty"`  // the port traced queries instead of running them: NOT checked
 }
 
 // Clean reports whether the port completed without error or truncation, which
 // is the condition for evicting its absent entries at --ack.
-func (r PortResult) Clean() bool { return r.Error == "" && !r.Partial }
+func (r PortResult) Clean() bool { return r.Error == "" && !r.Partial && !r.DryRun }
 
 // Report is the output of one run.
 type Report struct {
