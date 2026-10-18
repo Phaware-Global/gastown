@@ -45,7 +45,7 @@ func NewRunner(townRoot string, settings *config.TownSettings) *Runner {
 	return &Runner{
 		TownRoot: townRoot,
 		Settings: settings,
-		Ports:    map[string]Port{},
+		Ports:    map[string]Port{"beads": NewBeadsPort(townRoot)},
 		Store:    NewStore(townRoot),
 		Now:      time.Now,
 	}

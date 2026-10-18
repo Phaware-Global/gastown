@@ -1458,6 +1458,30 @@ func (b *Beads) Ready() ([]*Issue, error) {
 	return issues, nil
 }
 
+// ReadyLimit is Ready with an explicit page size (bd ready defaults to 100),
+// for callers that need to know whether they saw the whole ready set.
+func (b *Beads) ReadyLimit(limit int) ([]*Issue, error) {
+	if b.store != nil {
+		issues, err := b.storeReady()
+		if err == nil && limit > 0 && len(issues) > limit {
+			issues = issues[:limit]
+		}
+		return issues, err
+	}
+
+	out, err := b.run("ready", "--json", "--limit", strconv.Itoa(limit))
+	if err != nil {
+		return nil, err
+	}
+
+	var issues []*Issue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return nil, fmt.Errorf("parsing bd ready output: %w", err)
+	}
+
+	return issues, nil
+}
+
 // ReadyForMol returns ready steps within a specific molecule.
 // Delegates to bd ready --mol which uses beads' canonical blocking semantics
 // (blocked_issues_cache), handling all blocking types, transitive propagation,
