@@ -133,6 +133,9 @@ type ghFixture struct {
 	jira404     bool                        // every Jira search answers 404 (wrong origin / no v3 endpoint)
 	noBrowse    bool                        // the visibility probe (project in …) answers no issues
 	jiraBadKeys []string                    // additional keys that answer the naming 400
+	noBrowseIn  []string                    // projects whose visibility probe answers no issues
+	probe503    bool                        // the visibility probe answers 503
+	probeCalls  atomic.Int32
 }
 
 func (fx *ghFixture) handler(t *testing.T) http.Handler {
@@ -162,11 +165,21 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 					return
 				}
 			}
-			if strings.HasPrefix(jql, "project in") { // visibility probe
-				if fx.noBrowse {
+			if strings.HasPrefix(jql, "project = ") { // visibility probe, one project
+				fx.probeCalls.Add(1)
+				proj := strings.Trim(strings.Fields(strings.TrimPrefix(jql, "project = "))[0], `"`)
+				if fx.probe503 {
+					http.Error(w, "upstream unavailable", 503)
+					return
+				}
+				hidden := fx.noBrowse
+				for _, h := range fx.noBrowseIn {
+					hidden = hidden || h == proj
+				}
+				if hidden {
 					_ = json.NewEncoder(w).Encode(map[string]any{"issues": []any{}, "isLast": true})
 				} else {
-					_ = json.NewEncoder(w).Encode(map[string]any{"issues": []map[string]any{issue("P23-1", "To Do", "new", personaID, time.Hour, time.Hour, "probe")}, "isLast": true})
+					_ = json.NewEncoder(w).Encode(map[string]any{"issues": []map[string]any{issue(proj+"-1", "To Do", "new", personaID, time.Hour, time.Hour, "probe")}, "isLast": true})
 				}
 				return
 			}
@@ -1154,6 +1167,44 @@ func TestGitHubPort_LinkedKindsRound2Fixes(t *testing.T) {
 		if f.Kind == "linked-key-missing" || f.Kind == "review-handoff" {
 			t.Errorf("lost permissions must yield neither nagging nor handoffs: %+v", f)
 		}
+	}
+	if fx.probeCalls.Load() != 1 {
+		t.Errorf("the probe must run once per project per sweep, got %d calls", fx.probeCalls.Load())
+	}
+	// A probe that itself fails (503) is a probe failure, never a Browse diagnosis.
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appX, "acme/extra": {}}, probe503: true, jiraBadKeys: []string{"P23-96"}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	findings, err = p.Sweep(context.Background(), in)
+	var pProbe *PartialError
+	if !errors.As(err, &pProbe) || !strings.Contains(pProbe.Reason, "visibility probe failed") || strings.Contains(pProbe.Reason, "Browse") {
+		t.Errorf("a failing probe must be reported as a probe failure: %v", err)
+	}
+	for _, f := range findings {
+		if f.Kind == "linked-key-missing" {
+			t.Errorf("a failed probe must not read as a typo: %+v", f)
+		}
+	}
+	// Two projects, P23 readable and OPS hidden: P23's key resolves and its
+	// handoff fires; OPS's key is a Browse note on OPS alone, not a typo.
+	appOps := &ghRepoData{}
+	appOps.Open.Nodes = []ghPR{pr(100, "artie", 40*h, 40*h, "SUCCESS", branch("feat/OPS-7"), requested("kevin", 30*h))}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appOps, "acme/extra": appB}, noBrowseIn: []string{"OPS"}, jiraBadKeys: []string{"OPS-7"},
+		issues: []map[string]any{issue("P23-91", "In Progress", "indeterminate", personaID, 100*h, 1*h, "needs handoff")}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	in.Settings.Assistant.Sweep.Jira.Projects = []string{"P23", "OPS"}
+	findings, err = p.Sweep(context.Background(), in)
+	var pOps *PartialError
+	if !errors.As(err, &pOps) || !strings.Contains(pOps.Reason, "keys in OPS unknown and the token sees nothing there") || strings.Contains(pOps.Reason, "P23") {
+		t.Errorf("a hidden project must be reported as a Browse loss on that project alone: %v", err)
+	}
+	got = map[string]bool{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = true
+	}
+	if !got["review-handoff/P23-91"] || got["linked-key-missing/acme/app#100"] {
+		t.Errorf("the readable project still fires and the hidden one is not a typo: %v", got)
 	}
 	// Two typos in repo A and a valid key in repo B: the probe sees the
 	// project, so the typos are per-PR info and B's handoff fires, no partial.
