@@ -10,8 +10,10 @@ import (
 	"net/url"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,7 +28,7 @@ const (
 	githubDefaultTokenEnv  = "GITHUB_TOKEN" //nolint:gosec // G101: the name of an environment variable, not a secret
 	githubPRPage           = 50
 	githubMaxPRPages       = 3  // open PRs per repo; more is reported as partial
-	githubComparesPerSweep = 20 // compare calls spent on stale approvals (two per PR); beyond that the diff is "unknown"
+	githubComparesPerSweep = 30 // compare calls spent on stale approvals (four or five per PR); beyond that the diff is "unknown"
 )
 
 // patrolWait bounds one patrol-bead lookup (further capped at a quarter of
@@ -407,23 +409,38 @@ func (c *ghClient) do(req *http.Request, out any) error {
 	return json.Unmarshal(body, out)
 }
 
-// prDiff returns the PR's own changes at a head — GitHub's three-dot compare
-// against the base branch, i.e. from the merge base — as the unified diff
-// text, normalized so two heads can be compared for material change: a head
-// that only merged the base branch has the same diff as the approved one.
-// The diff text (not the JSON file list) carries file modes and rename
-// sources, so a chmod or a rename after the approval reads as changed.
-// Blob ids ("index" lines) and hunk ranges shift whenever the base touches
-// a PR file and are dropped; the hunk bodies are kept whole.
-func (c *ghClient) prDiff(ref repoRef, base, head string) ([]string, error) {
+// prSnapshot is a PR's own diff at one head: GitHub's three-dot compare
+// against the base branch, i.e. from the merge base, as raw unified diff
+// sections keyed by file, plus that merge base.
+type prSnapshot struct {
+	mergeBase string
+	sections  map[string][]string // new-side path → diff lines
+}
+
+// prDiff fetches a PR's diff at a head: one JSON compare for the merge base
+// and one diff-text compare for the content (the diff text, unlike the JSON
+// file list, carries file modes and rename sources).
+func (c *ghClient) prDiff(ref repoRef, base, head string) (*prSnapshot, error) {
 	p := fmt.Sprintf("/repos/%s/%s/compare/%s...%s", ref.Owner, ref.Name, url.PathEscape(base), url.PathEscape(head))
 	if c.trace != nil {
 		c.trace("GET " + p)
 	}
 	if c.dry {
-		return nil, nil
+		return &prSnapshot{sections: map[string][]string{}}, nil
 	}
-	req, err := http.NewRequestWithContext(c.ctx, http.MethodGet, c.port.apiBase+p, nil)
+	req, err := http.NewRequestWithContext(c.ctx, http.MethodGet, c.port.apiBase+p+"?per_page=1", nil)
+	if err != nil {
+		return nil, err
+	}
+	var meta struct {
+		MergeBase struct {
+			SHA string `json:"sha"`
+		} `json:"merge_base_commit"`
+	}
+	if err := c.do(req, &meta); err != nil {
+		return nil, err
+	}
+	req, err = http.NewRequestWithContext(c.ctx, http.MethodGet, c.port.apiBase+p, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -432,22 +449,81 @@ func (c *ghClient) prDiff(ref repoRef, base, head string) ([]string, error) {
 	if err := c.do(req, &raw); err != nil {
 		return nil, err
 	}
-	return normalizeDiff(string(raw)), nil
-}
-
-// normalizeDiff keeps every line of a unified diff that says what the
-// change is (file headers, modes, renames, hunk bodies and their function
-// context, so a moved hunk is a change) and drops what moves with the merge
-// base (blob ids, hunk line numbers). A file entry with no hunk body (a
-// binary) keeps its head-side blob id: that is its only content identity,
-// so a binary swap after the approval is a change.
-func normalizeDiff(raw string) []string {
-	var out []string
-	for i, sec := range strings.Split(strings.TrimRight(raw, "\n"), "\ndiff --git ") {
+	snap := &prSnapshot{mergeBase: meta.MergeBase.SHA, sections: map[string][]string{}}
+	for i, sec := range strings.Split(strings.TrimRight(string(raw), "\n"), "\ndiff --git ") {
 		if i > 0 {
 			sec = "diff --git " + sec
 		}
+		if sec == "" {
+			continue
+		}
 		lines := strings.Split(sec, "\n")
+		snap.sections[diffPath(lines[0])] = lines
+	}
+	return snap, nil
+}
+
+// diffPath returns the new-side path of a "diff --git a/X b/Y" line.
+func diffPath(header string) string {
+	if i := strings.LastIndex(header, " b/"); i >= 0 {
+		return header[i+3:]
+	}
+	return header
+}
+
+// touchedBetween lists the files the base branch changed between two merge
+// bases (a JSON compare; names on both sides of a rename).
+func (c *ghClient) touchedBetween(ref repoRef, from, to string) (map[string]bool, error) {
+	p := fmt.Sprintf("/repos/%s/%s/compare/%s...%s", ref.Owner, ref.Name, url.PathEscape(from), url.PathEscape(to))
+	if c.trace != nil {
+		c.trace("GET " + p)
+	}
+	if c.dry {
+		return map[string]bool{}, nil
+	}
+	req, err := http.NewRequestWithContext(c.ctx, http.MethodGet, c.port.apiBase+p+"?per_page=1", nil)
+	if err != nil {
+		return nil, err
+	}
+	var res struct {
+		Files []struct {
+			Filename         string `json:"filename"`
+			PreviousFilename string `json:"previous_filename"`
+		} `json:"files"`
+	}
+	if err := c.do(req, &res); err != nil {
+		return nil, err
+	}
+	if len(res.Files) >= 300 {
+		return nil, fmt.Errorf("base moved 300 or more files; not comparable")
+	}
+	out := map[string]bool{}
+	for _, f := range res.Files {
+		out[f.Filename] = true
+		if f.PreviousFilename != "" {
+			out[f.PreviousFilename] = true
+		}
+	}
+	return out, nil
+}
+
+// normalizeDiff renders a snapshot for comparison. It keeps every line that
+// says what the change is — file headers, modes, renames, hunk bodies with
+// their function context and line numbers, so a moved hunk is a change —
+// and drops what moves with the merge base: blob ids always, and in files
+// the base itself touched between the two merge bases the hunk line numbers
+// are reduced to their old-to-new shift, which a base-only move does not
+// alter. A file entry with no hunk body (a binary) keeps its head-side blob
+// id, the only identity it has, so a binary swap is a change.
+func normalizeDiff(snap *prSnapshot, baseTouched map[string]bool) []string {
+	paths := make([]string, 0, len(snap.sections))
+	for p := range snap.sections {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	var out []string
+	for _, p := range paths {
+		lines := snap.sections[p]
 		hasHunk := false
 		for _, l := range lines {
 			if strings.HasPrefix(l, "@@") {
@@ -461,15 +537,26 @@ func normalizeDiff(raw string) []string {
 				continue // text: the hunks say what changed; blob ids move with the merge base
 			case strings.HasPrefix(line, "index "):
 				line = "blob " + headBlob(line)
-			case strings.HasPrefix(line, "@@"):
-				if j := strings.Index(line[2:], "@@"); j >= 0 {
-					line = "@@" + line[2+j+2:] // drop the line numbers, keep the function context
-				}
+			case strings.HasPrefix(line, "@@") && baseTouched[p]:
+				line = shiftOnly(line)
 			}
 			out = append(out, line)
 		}
 	}
 	return out
+}
+
+var hunkRe = regexp.MustCompile(`^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$`)
+
+// shiftOnly rewrites a hunk header to its old-to-new line shift and context.
+func shiftOnly(line string) string {
+	m := hunkRe.FindStringSubmatch(line)
+	if m == nil {
+		return line
+	}
+	oldStart, _ := strconv.Atoi(m[1])
+	newStart, _ := strconv.Atoi(m[2])
+	return fmt.Sprintf("@@ shift=%d @@%s", newStart-oldStart, m[3])
 }
 
 // headBlob returns the head-side blob id of an "index <base>..<head> [mode]" line.
@@ -693,9 +780,9 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	compares := 0
 	diffSince := func(ref repoRef, base, old, head string) (string, error) {
 		if compares >= githubComparesPerSweep {
-			return "unknown", nil // not an outage: "unknown" already asks for review, and partial would stop eviction every sweep
+			return "unknown", fmt.Errorf("compare budget of %d calls spent", githubComparesPerSweep) // not an outage: "unknown" already asks for review
 		}
-		compares += 2
+		compares += 4
 		was, err := c.prDiff(ref, base, old)
 		if err != nil {
 			return "unknown", err
@@ -704,7 +791,14 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		if err != nil {
 			return "unknown", err
 		}
-		if slices.Equal(was, is) {
+		touched := map[string]bool{}
+		if was.mergeBase != is.mergeBase {
+			compares++
+			if touched, err = c.touchedBetween(ref, was.mergeBase, is.mergeBase); err != nil {
+				return "unknown", err
+			}
+		}
+		if slices.Equal(normalizeDiff(was, touched), normalizeDiff(is, touched)) {
 			return "unchanged", nil
 		}
 		return "changed", nil
@@ -1040,22 +1134,23 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 		// A compare that cannot answer (error, too large, budget) is
 		// "unknown": the advice is already to re-approve, and a persistent
 		// failure must not make the port partial — and stop eviction — on
-		// every sweep.
-		diff, _ := diffSince(ref, pr.BaseRefName, latest[humanApprovedOld].oid, head)
+		// every sweep; the reason is fenced so it is not lost.
+		approvedOid := latest[humanApprovedOld].oid
+		diff, err := diffSince(ref, pr.BaseRefName, approvedOid, head)
+		if err != nil {
+			f.External["diff_error"] = err.Error()
+		}
 		f.Fields["diff"] = diff
 		if diff == "unchanged" {
 			f.Suggest = key + " only merged its base branch since " + humanApprovedOld + " approved: no new review needed"
 		} else {
 			f.Suggest = "ask " + humanApprovedOld + " to re-approve " + key
 		}
-		// Fingerprint the action, not the verdict: "changed" and "unknown"
-		// give the same advice, so a transient compare error must not
-		// re-page an acknowledged item.
-		action := "reapprove"
-		if diff == "unchanged" {
-			action = "unchanged"
-		}
-		f.Fingerprint = head + "|" + action
+		// Fingerprint the pair of heads, not the verdict: for a fixed
+		// approved head and current head the verdict only varies with
+		// errors, and a transient compare error must not re-page an
+		// acknowledged item.
+		f.Fingerprint = head + "|" + approvedOid
 		out = append(out, f)
 	}
 	if approverOK && ci == "success" && now.Sub(approvedAt) >= d.approvedUnmerged {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -86,9 +87,11 @@ type ghFixture struct {
 	nullNodePR  int                    // repo query: this PR's whole node comes back null (NON_NULL field denied)
 	pageQueries []int                  // PR numbers the per-PR paging query was asked for
 	patrolCalls atomic.Int32
-	diffs       map[string]string // "base...sha" → unified diff text; unlisted specs differ from each other
-	compareFail []string          // compare specs that answer 500
-	patrolDelay time.Duration     // patrolBeads sleeps this long
+	diffs       map[string]string   // "base...sha" → unified diff text; unlisted specs differ from each other
+	mergeBases  map[string]string   // "base...sha" → merge base sha (default "mb0": the base never moved)
+	baseFiles   map[string][]string // "mbOld...mbNew" → files the base touched between the merge bases
+	compareFail []string            // compare specs that answer 500
+	patrolDelay time.Duration       // patrolBeads sleeps this long
 }
 
 func (fx *ghFixture) handler(t *testing.T) http.Handler {
@@ -114,7 +117,15 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 				_, _ = w.Write([]byte(d))
 				return
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ahead"})
+			mb := fx.mergeBases[spec]
+			if mb == "" {
+				mb = "mb0"
+			}
+			var files []map[string]any
+			for _, f := range fx.baseFiles[spec] {
+				files = append(files, map[string]any{"filename": f})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ahead", "merge_base_commit": map[string]any{"sha": mb}, "files": files})
 		case r.URL.Path == "/graphql":
 			if fx.slow > 0 {
 				select {
@@ -268,10 +279,13 @@ func TestGitHubPort_ApproverIsHumanWithoutHumansList(t *testing.T) {
 
 // A stale approval tells a base-branch merge (the PR's own diff is
 // unchanged: no new review needed) from a material change (ask again),
-// including a mode change, a rename, a binary swap or a moved hunk; a
+// including a mode change, a rename, a binary swap or a moved hunk — even a
+// hunk moved within one function context, since line numbers are kept
+// unless the base itself touched the file between the two merge bases. A
 // compare that cannot answer (error or spent budget) is "unknown", asks
-// again, and never makes the port partial. The fingerprint is the action,
-// so a transient compare error never re-pages an acked item.
+// again, fences the reason, and never makes the port partial. The
+// fingerprint is the pair of heads, so a transient compare error never
+// re-pages an acked item.
 func TestGitHubPort_ApprovalStaleDiff(t *testing.T) {
 	h := time.Hour
 	sha := func(c byte) string { return strings.Repeat(string(c), 40) }
@@ -280,20 +294,23 @@ func TestGitHubPort_ApprovalStaleDiff(t *testing.T) {
 		return pr(n, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", headSHA, 1*h), review("kevin", "APPROVED", shaB, 20*h), head(headSHA))
 	}
 	const approved = "diff --git a/a.go b/a.go\nindex 1111111..2222222 100644\n--- a/a.go\n+++ b/a.go\n@@ -1,3 +1,3 @@ func f()\n-x\n+y\n"
+	const approvedBinary = "diff --git a/x.bin b/x.bin\nindex 1111111..aaaaaaa 100644\nBinary files a/x.bin and b/x.bin differ\n"
 	diffs := map[string]string{
 		"main..." + shaB:     approved,
-		"main..." + sha('a'): "diff --git a/a.go b/a.go\nindex 3333333..4444444 100644\n--- a/a.go\n+++ b/a.go\n@@ -7,3 +7,3 @@ func f()\n-x\n+y\n",                                                         // base moved: blob ids and ranges shift
+		"main..." + sha('a'): "diff --git a/a.go b/a.go\nindex 3333333..4444444 100644\n--- a/a.go\n+++ b/a.go\n@@ -7,3 +7,3 @@ func f()\n-x\n+y\n",                                                         // base moved a.go: blob ids and ranges shift equally
 		"main..." + sha('c'): strings.Replace(approved, "+y", "+z", 1),                                                                                                                                      // material change
 		"main..." + sha('e'): "diff --git a/a.go b/a.go\nold mode 100644\nnew mode 100755\nindex 1111111..2222222\n--- a/a.go\n+++ b/a.go\n@@ -1,3 +1,3 @@ func f()\n-x\n+y\n",                              // chmod +x
 		"main..." + sha('f'): "diff --git a/a.go b/b.go\nsimilarity index 90%\nrename from a.go\nrename to b.go\nindex 1111111..2222222 100644\n--- a/a.go\n+++ b/b.go\n@@ -1,3 +1,3 @@ func f()\n-x\n+y\n", // rename
 		"main..." + sha('g'): "diff --git a/a.go b/a.go\nindex 1111111..2222222 100644\n--- a/a.go\n+++ b/a.go\n@@ -40,3 +40,3 @@ func g()\n-x\n+y\n",                                                       // same hunk body moved into another function
 		"main..." + sha('h'): "diff --git a/x.bin b/x.bin\nindex 1111111..bbbbbbb 100644\nBinary files a/x.bin and b/x.bin differ\n",                                                                        // binary swapped after approval
 		"main..." + sha('i'): "diff --git a/x.bin b/x.bin\nindex 3333333..aaaaaaa 100644\nBinary files a/x.bin and b/x.bin differ\n",                                                                        // same head blob, base moved
+		"main..." + sha('j'): "diff --git a/a.go b/a.go\nindex 1111111..2222222 100644\n--- a/a.go\n+++ b/a.go\n@@ -40,3 +40,3 @@ func f()\n-x\n+y\n",                                                       // same body and context, moved within the function; base did not touch a.go
 	}
-	const approvedBinary = "diff --git a/x.bin b/x.bin\nindex 1111111..aaaaaaa 100644\nBinary files a/x.bin and b/x.bin differ\n"
+	mergeBases := map[string]string{"main..." + sha('a'): "mb1", "main..." + sha('i'): "mb1"}
+	baseFiles := map[string][]string{"mb0...mb1": {"a.go", "x.bin"}}
 	app := &ghRepoData{}
-	app.Open.Nodes = []ghPR{stale(1, sha('a')), stale(2, sha('c')), stale(3, sha('d')), stale(4, sha('e')), stale(5, sha('f')), stale(6, sha('g'))}
-	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, diffs: diffs, compareFail: []string{"main..." + sha('d')}}
+	app.Open.Nodes = []ghPR{stale(1, sha('a')), stale(2, sha('c')), stale(3, sha('d')), stale(4, sha('e')), stale(5, sha('f')), stale(6, sha('g')), stale(9, sha('j'))}
+	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, diffs: diffs, mergeBases: mergeBases, baseFiles: baseFiles, compareFail: []string{"main..." + sha('d')}}
 	p, in := newGitHubTest(t, fx, []string{"artie"})
 	findings, err := p.Sweep(context.Background(), in)
 	if err != nil {
@@ -304,24 +321,27 @@ func TestGitHubPort_ApprovalStaleDiff(t *testing.T) {
 		got[f.Kind+"/"+f.Key] = f
 	}
 	for _, c := range []struct{ key, diff, suggest, fp string }{
-		{"acme/app#1", "unchanged", "acme/app#1 only merged its base branch since kevin approved: no new review needed", sha('a') + "|unchanged"},
-		{"acme/app#2", "changed", "ask kevin to re-approve acme/app#2", sha('c') + "|reapprove"},
-		{"acme/app#3", "unknown", "ask kevin to re-approve acme/app#3", sha('d') + "|reapprove"},
-		{"acme/app#4", "changed", "ask kevin to re-approve acme/app#4", sha('e') + "|reapprove"},
-		{"acme/app#5", "changed", "ask kevin to re-approve acme/app#5", sha('f') + "|reapprove"},
-		{"acme/app#6", "changed", "ask kevin to re-approve acme/app#6", sha('g') + "|reapprove"},
+		{"acme/app#1", "unchanged", "acme/app#1 only merged its base branch since kevin approved: no new review needed", sha('a') + "|" + shaB},
+		{"acme/app#2", "changed", "ask kevin to re-approve acme/app#2", sha('c') + "|" + shaB},
+		{"acme/app#3", "unknown", "ask kevin to re-approve acme/app#3", sha('d') + "|" + shaB},
+		{"acme/app#4", "changed", "ask kevin to re-approve acme/app#4", sha('e') + "|" + shaB},
+		{"acme/app#5", "changed", "ask kevin to re-approve acme/app#5", sha('f') + "|" + shaB},
+		{"acme/app#6", "changed", "ask kevin to re-approve acme/app#6", sha('g') + "|" + shaB},
+		{"acme/app#9", "changed", "ask kevin to re-approve acme/app#9", sha('j') + "|" + shaB},
 	} {
 		f, ok := got["approval-stale/"+c.key]
 		if !ok || f.Fields["diff"] != c.diff || f.Suggest != c.suggest || f.Fingerprint != c.fp {
 			t.Errorf("%s: want diff=%s suggest=%q fp=%s, got ok=%v %+v", c.key, c.diff, c.suggest, c.fp, ok, f)
 		}
 	}
+	if e := got["approval-stale/acme/app#3"].External["diff_error"]; !strings.Contains(e, "500") {
+		t.Errorf("the compare error must be fenced in diff_error, got %q", e)
+	}
 	// Binary entries: the approved head added x.bin; a swapped binary is a
 	// change even though the diff has no hunk body, while a base merge that
 	// only moved the base-side blob is not.
-	binDiffs := map[string]string{"main..." + shaB: approvedBinary, "main..." + sha('h'): diffs["main..."+sha('h')], "main..." + sha('i'): diffs["main..."+sha('i')]}
 	app.Open.Nodes = []ghPR{stale(7, sha('h')), stale(8, sha('i'))}
-	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, diffs: binDiffs}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, diffs: map[string]string{"main..." + shaB: approvedBinary, "main..." + sha('h'): diffs["main..."+sha('h')], "main..." + sha('i'): diffs["main..."+sha('i')]}, mergeBases: mergeBases, baseFiles: baseFiles}
 	p, in = newGitHubTest(t, fx, []string{"artie"})
 	findings, _ = p.Sweep(context.Background(), in)
 	got = map[string]Finding{}
@@ -331,21 +351,30 @@ func TestGitHubPort_ApprovalStaleDiff(t *testing.T) {
 	if got["approval-stale/acme/app#7"].Fields["diff"] != "changed" || got["approval-stale/acme/app#8"].Fields["diff"] != "unchanged" {
 		t.Errorf("binary: want #7 changed (swapped blob) and #8 unchanged (same head blob), got %v / %v", got["approval-stale/acme/app#7"].Fields, got["approval-stale/acme/app#8"].Fields)
 	}
-	// The same PR on a later sweep whose compare fails: same advice, same
-	// fingerprint, so an acked "changed" item stays standing.
-	app.Open.Nodes = []ghPR{stale(2, sha('c'))}
-	fx.compareFail = append(fx.compareFail, "main..."+sha('c'))
-	p, in = newGitHubTest(t, fx, []string{"artie"})
-	findings, _ = p.Sweep(context.Background(), in)
-	got = map[string]Finding{}
-	for _, f := range findings {
-		got[f.Kind+"/"+f.Key] = f
+	// Three sweeps of one merge-only PR: unchanged, then a compare 500, then
+	// unchanged again — same fingerprint throughout, so an acked item never
+	// re-pages on a hiccup.
+	app.Open.Nodes = []ghPR{stale(1, sha('a'))}
+	var fps []string
+	for i, fail := range [][]string{nil, {"main..." + sha('a')}, nil} {
+		fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, diffs: diffs, mergeBases: mergeBases, baseFiles: baseFiles, compareFail: fail}
+		p, in = newGitHubTest(t, fx, []string{"artie"})
+		findings, err = p.Sweep(context.Background(), in)
+		if err != nil {
+			t.Fatalf("sweep %d: %v", i+1, err)
+		}
+		for _, f := range findings {
+			if f.Kind == "approval-stale" {
+				fps = append(fps, f.Fingerprint+"/"+f.Fields["diff"])
+			}
+		}
 	}
-	if f := got["approval-stale/acme/app#2"]; f.Fields["diff"] != "unknown" || f.Fingerprint != sha('c')+"|reapprove" {
-		t.Errorf("a transient compare error must keep the fingerprint: %+v", f)
+	want := []string{sha('a') + "|" + shaB + "/unchanged", sha('a') + "|" + shaB + "/unknown", sha('a') + "|" + shaB + "/unchanged"}
+	if !slices.Equal(fps, want) {
+		t.Errorf("fingerprint must survive a transient compare error: got %v", fps)
 	}
-	// Eleven stale approvals: the 20-call budget covers ten; the eleventh
-	// is "unknown" with re-approve advice and no partial note.
+	// Many stale approvals: the per-sweep compare budget covers some; the
+	// rest are "unknown" with re-approve advice and no partial note.
 	app.Open.Nodes = nil
 	for n := 1; n <= 11; n++ {
 		app.Open.Nodes = append(app.Open.Nodes, stale(n, sha('c')))
@@ -362,8 +391,9 @@ func TestGitHubPort_ApprovalStaleDiff(t *testing.T) {
 			counts[f.Fields["diff"]]++
 		}
 	}
-	if counts["changed"] != 10 || counts["unknown"] != 1 {
-		t.Errorf("budget: want 10 changed + 1 unknown, got %v", counts)
+	covered := (githubComparesPerSweep + 3) / 4 // a PR starts while calls so far < budget, four calls each (same merge base)
+	if counts["changed"] != covered || counts["unknown"] != 11-covered {
+		t.Errorf("budget: want %d changed + %d unknown, got %v", covered, 11-covered, counts)
 	}
 }
 
