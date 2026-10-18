@@ -86,7 +86,9 @@ type ghFixture struct {
 	nullNodePR  int                    // repo query: this PR's whole node comes back null (NON_NULL field denied)
 	pageQueries []int                  // PR numbers the per-PR paging query was asked for
 	patrolCalls atomic.Int32
-	patrolDelay time.Duration // patrolBeads sleeps this long
+	patches     map[string][]map[string]any // "base...sha" → compare files; unlisted specs differ from each other
+	compareFail []string                    // compare specs that answer 500
+	patrolDelay time.Duration               // patrolBeads sleeps this long
 }
 
 func (fx *ghFixture) handler(t *testing.T) http.Handler {
@@ -96,6 +98,19 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 			t.Errorf("missing token on %s", r.URL)
 		}
 		switch {
+		case strings.Contains(r.URL.Path, "/compare/"):
+			spec := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			for _, f := range fx.compareFail {
+				if f == spec {
+					http.Error(w, "compare unavailable", 500)
+					return
+				}
+			}
+			files, ok := fx.patches[spec]
+			if !ok {
+				files = []map[string]any{{"filename": "unlisted-" + spec, "status": "modified", "patch": "@@ " + spec}}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ahead", "files": files})
 		case r.URL.Path == "/graphql":
 			if fx.slow > 0 {
 				select {
@@ -244,6 +259,49 @@ func TestGitHubPort_ApproverIsHumanWithoutHumansList(t *testing.T) {
 	}
 	if !got["review-waiting/acme/app#2@kevin"] {
 		t.Errorf("the approver's pending request must be review-waiting; got %v", got)
+	}
+}
+
+// A stale approval tells a base-branch merge (the PR's own diff is
+// unchanged: no new review needed) from a material change (ask again); a
+// compare that cannot answer asks again and makes the port partial.
+func TestGitHubPort_ApprovalStaleDiff(t *testing.T) {
+	h := time.Hour
+	const shaC, shaD = "cccccccccccccccccccccccccccccccccccccccc", "dddddddddddddddddddddddddddddddddddddddd"
+	head := func(sha string) func(*ghPR) { return func(p *ghPR) { p.HeadRefOid = sha } }
+	same := []map[string]any{{"filename": "a.go", "status": "modified", "patch": "@@ -1 +1 @@\n-x\n+y"}}
+	other := []map[string]any{{"filename": "a.go", "status": "modified", "patch": "@@ -1 +1 @@\n-x\n+z"}}
+	app := &ghRepoData{}
+	app.Open.Nodes = []ghPR{
+		pr(1, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", shaA, 1*h), review("kevin", "APPROVED", shaB, 20*h), head(shaA)),
+		pr(2, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", shaC, 1*h), review("kevin", "APPROVED", shaB, 20*h), head(shaC)),
+		pr(3, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", shaD, 1*h), review("kevin", "APPROVED", shaB, 20*h), head(shaD)),
+	}
+	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}},
+		patches:     map[string][]map[string]any{"main..." + shaB: same, "main..." + shaA: same, "main..." + shaC: other},
+		compareFail: []string{"main..." + shaD}}
+	p, in := newGitHubTest(t, fx, []string{"artie"})
+	findings, err := p.Sweep(context.Background(), in)
+	var partial *PartialError
+	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "could not compare the head") {
+		t.Fatalf("a failed compare must make the port partial: %v", err)
+	}
+	got := map[string]Finding{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = f
+	}
+	for _, c := range []struct{ key, diff, suggest string }{
+		{"acme/app#1", "unchanged", "acme/app#1 only merged its base branch since kevin approved: no new review needed"},
+		{"acme/app#2", "changed", "ask kevin to re-approve acme/app#2"},
+		{"acme/app#3", "unknown", "ask kevin to re-approve acme/app#3"},
+	} {
+		f, ok := got["approval-stale/"+c.key]
+		if !ok || f.Fields["diff"] != c.diff || f.Suggest != c.suggest {
+			t.Errorf("%s: want diff=%s suggest=%q, got ok=%v %+v", c.key, c.diff, c.suggest, ok, f)
+		}
+	}
+	if fx.calls.Load() == 0 {
+		t.Fatal("no calls recorded")
 	}
 }
 

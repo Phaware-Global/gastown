@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -21,9 +22,10 @@ import (
 
 // GitHub port defaults (design: docs/design/assistant-role.md, "GitHub port").
 const (
-	githubDefaultTokenEnv = "GITHUB_TOKEN" //nolint:gosec // G101: the name of an environment variable, not a secret
-	githubPRPage          = 50
-	githubMaxPRPages      = 3 // open PRs per repo; more is reported as partial
+	githubDefaultTokenEnv  = "GITHUB_TOKEN" //nolint:gosec // G101: the name of an environment variable, not a secret
+	githubPRPage           = 50
+	githubMaxPRPages       = 3  // open PRs per repo; more is reported as partial
+	githubComparesPerSweep = 20 // compare calls spent on stale approvals (two per PR); beyond that the diff is "unknown"
 )
 
 // patrolWait bounds one patrol-bead lookup (further capped at a quarter of
@@ -164,6 +166,7 @@ func (p *GitHubPort) Suggestions() []string {
 		"request human review on {key}",
 		"re-ping {human} on {key}",
 		"ask {human} to re-approve {key}",
+		"{key} only merged its base branch since {human} approved: no new review needed",
 		"check why {key} is not merged yet",
 		"respond to review comments on {key}",
 		"start the internal review loop on {key}",
@@ -179,6 +182,7 @@ func (p *GitHubPort) Schema() map[string]Shape {
 		"reviewer":     ShapeGitHubLogin, // rig's configured internal reviewer
 		"head":         ShapeSHA,
 		"ci":           ShapeEnum, // success | failure | pending | none
+		"diff":         ShapeEnum, // approval-stale: unchanged | changed | unknown since the approved head
 		"threads":      ShapeInt,  // unresolved review threads
 		"requested_at": ShapeTime,
 		"rig":          ShapeEnum,
@@ -388,6 +392,52 @@ func (c *ghClient) do(req *http.Request, out any) error {
 	return json.Unmarshal(body, out)
 }
 
+// prDiff returns the PR's own changes at a head — GitHub's three-dot compare
+// against the base branch, i.e. from the merge base — as one line per file,
+// so two heads can be compared for material change: a head that only merged
+// the base branch has the same files and patches as the approved one. A
+// file without a patch (binary or too large) is identified by blob SHA and
+// line counts, which can only err towards "changed".
+func (c *ghClient) prDiff(ref repoRef, base, head string) ([]string, error) {
+	p := fmt.Sprintf("/repos/%s/%s/compare/%s...%s", ref.Owner, ref.Name, base, head)
+	if c.trace != nil {
+		c.trace("GET " + p)
+	}
+	if c.dry {
+		return nil, nil
+	}
+	req, err := http.NewRequestWithContext(c.ctx, http.MethodGet, c.port.apiBase+p+"?per_page=1", nil)
+	if err != nil {
+		return nil, err
+	}
+	var res struct {
+		Files []struct {
+			Filename  string `json:"filename"`
+			Status    string `json:"status"`
+			Additions int    `json:"additions"`
+			Deletions int    `json:"deletions"`
+			SHA       string `json:"sha"`
+			Patch     string `json:"patch"`
+		} `json:"files"`
+	}
+	if err := c.do(req, &res); err != nil {
+		return nil, err
+	}
+	if len(res.Files) >= 300 {
+		return nil, fmt.Errorf("compare lists 300 or more files; not comparable")
+	}
+	out := make([]string, 0, len(res.Files))
+	for _, f := range res.Files {
+		id := f.Patch
+		if id == "" {
+			id = fmt.Sprintf("%s|%d|%d", f.SHA, f.Additions, f.Deletions)
+		}
+		out = append(out, f.Filename+"|"+f.Status+"|"+id)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 // repo fetches one page of a repository's open PRs. A field-level GraphQL
 // error with the repository still present (a least-privilege token denied
 // one field) keeps the data and is returned as a warning; the PRs whose
@@ -590,6 +640,29 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	var out []Finding
 	var partial []string
 	note := func(format string, args ...any) { partial = append(partial, fmt.Sprintf(format, args...)) }
+	// diffSince tells whether a PR's own diff changed between the head a
+	// human approved and the current head: "unchanged" means only the base
+	// branch was merged in. Two compare calls per stale approval, capped
+	// per sweep; anything unanswerable is "unknown" (and asks for review).
+	compares := 0
+	diffSince := func(ref repoRef, base, old, head string) (string, error) {
+		if compares >= githubComparesPerSweep {
+			return "unknown", fmt.Errorf("compare budget of %d calls spent", githubComparesPerSweep)
+		}
+		compares += 2
+		was, err := c.prDiff(ref, base, old)
+		if err != nil {
+			return "unknown", err
+		}
+		is, err := c.prDiff(ref, base, head)
+		if err != nil {
+			return "unknown", err
+		}
+		if slices.Equal(was, is) {
+			return "unchanged", nil
+		}
+		return "changed", nil
+	}
 	// One patrol-bead lookup per rig per sweep, run under the budget: a
 	// hung bd turns into a note, never into the runner timeout. Failures
 	// are cached too, so a rig is tried once.
@@ -691,7 +764,7 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 					note("%s#%d: reviews or threads could not be paged in full; review state not fully checked", ref.slug(), pr.Number)
 				}
 			}
-			out = append(out, p.checkPR(ref, pr, in.Now, d, isPersona, isHuman, owns, note)...)
+			out = append(out, p.checkPR(ref, pr, in.Now, d, isPersona, isHuman, owns, diffSince, note)...)
 		}
 	}
 	if len(partial) > 0 {
@@ -700,7 +773,7 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	return out, nil
 }
 
-func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurations, isPersona, isHuman map[string]bool, owns func(string, int) (bool, error), note func(string, ...any)) []Finding {
+func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurations, isPersona, isHuman map[string]bool, owns func(string, int) (bool, error), diffSince func(repoRef, string, string, string) (string, error), note func(string, ...any)) []Finding {
 	key := fmt.Sprintf("%s#%d", ref.slug(), pr.Number)
 	ours := isPersona[strings.ToLower(pr.Author.Login)]
 	head := pr.HeadRefOid
@@ -914,8 +987,21 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 	if humanApprovedHead == "" && humanApprovedOld != "" {
 		f := base("approval-stale", SeverityActionable)
 		f.Fields["human"] = humanApprovedOld
-		f.Suggest = "ask " + humanApprovedOld + " to re-approve " + key
-		f.Fingerprint = head
+		// A head that only merged the base branch since the approval
+		// leaves the PR's own diff unchanged: nothing to re-review. Any
+		// material change, or a compare that cannot answer, asks for a
+		// fresh approval.
+		diff, err := diffSince(ref, pr.BaseRefName, latest[humanApprovedOld].oid, head)
+		if err != nil {
+			note("%s: could not compare the head with the one %s approved: %v", key, humanApprovedOld, err)
+		}
+		f.Fields["diff"] = diff
+		if diff == "unchanged" {
+			f.Suggest = key + " only merged its base branch since " + humanApprovedOld + " approved: no new review needed"
+		} else {
+			f.Suggest = "ask " + humanApprovedOld + " to re-approve " + key
+		}
+		f.Fingerprint = head + "|" + diff
 		out = append(out, f)
 	}
 	if approverOK && ci == "success" && now.Sub(approvedAt) >= d.approvedUnmerged {
