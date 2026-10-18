@@ -225,7 +225,46 @@ deterministic sweep, and always end with the ack:
 
 The report lists, per port (beads first; Jira and GitHub when configured),
 **new** findings in full and **standing** ones as counts, deduped against the
-last *acknowledged* run. Compose the mail from the report:
+last *acknowledged* run. The report is already the mail body: it is
+deterministic, fenced and complete. Never retype it — a first run can list a
+hundred findings and retyping it is slow and lossy. Save it under your own
+work dir (`$GT_ROOT/assistant/.runtime/`, private to this town — never a
+shared path such as /tmp, which another local account could read or
+pre-plant), read its header, then send the file as the body and ack the
+run ID the file itself names. The second step is one command: it reads
+the path from `$GT_ROOT` (set in your session, not from an earlier shell),
+refuses to mail an empty or missing file, takes the run ID from the file
+with `sed` rather than from your memory, and fails closed at every step:
+
+```bash
+mkdir -p "$GT_ROOT/assistant/.runtime" && umask 077 && r="$GT_ROOT/assistant/.runtime/sweep-report.md" \
+  && {{ cmd }} assistant sweep > "$r" \
+  && grep -E '^(Run-ID:|## Port:|PARTIAL|NOT CHECKED|DRY RUN|all clear|… and )' "$r" \
+  && echo "listed in full: $(grep -c '^### ' "$r"); not shown: $(awk '/^… and /{n+=$3} END{print n+0}' "$r")"
+```
+
+(`umask 077` keeps the report readable by you alone; the `grep` prints
+the run ID, each port's heading and status, and every "… and N more"
+overflow line; the last line gives the two counts. `<N>` in the subject
+is their sum — the report lists at most 25 new findings per kind and
+counts the rest, and the Mayor must see the whole number.)
+
+```bash
+set -o pipefail; r="$GT_ROOT/assistant/.runtime/sweep-report.md"; test -s "$r" && { cat <<'HDR'
+<your header: what is urgent, what needs a decision — plain text, no commands>
+HDR
+echo; cat "$r"; } | {{ cmd }} mail send mayor/ -s "SWEEP: <N> new findings (<ports>)" --stdin \
+  && {{ cmd }} assistant sweep --ack "$(sed -n 's/^Run-ID: //p' "$r")" && rm -f "$r"
+```
+
+The header goes through a quoted heredoc (`<<'HDR'`), as the BRIEF recipe
+does, because it may echo PR titles and issue summaries that outsiders
+wrote: inside double quotes a title containing `$(…)` would run as you.
+
+The subject carries counts only (new findings, ports checked, "PARTIAL"
+or "not checked" when a port says so). The body is the saved report with
+at most a few lines of your own on top. The subject argument never holds
+the body. What the report already guarantees (check it, do not retype it):
 
 1. New findings in full, standing findings as counts, in report order. The
    report shows at most 25 new findings per kind and counts the rest on an
@@ -242,7 +281,9 @@ last *acknowledged* run. Compose the mail from the report:
 4. Suggestions come only from the report's `Suggest` lines (reassign, sling
    onward, close-with-reason, answer, re-request review).
 
-Send it to `mayor/`, then acknowledge the run. If sending fails, do **not**
+Send it to `mayor/`, then acknowledge the run with the `Run-ID` from the
+saved report's header — never from memory and never from an issue key. If
+sending fails, do **not**
 ack — the next sweep reports everything again. `--json` and `--dry-run` never
 record state, so a manual look cannot consume findings the Mayor has not seen.
 
