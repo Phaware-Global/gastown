@@ -1883,3 +1883,15 @@ func TestResolvePresetForAgent_InfersProviderFromCommand(t *testing.T) {
 		}
 	}
 }
+
+// The opencode TUI treats Escape as interrupt, so the nudge path must not
+// send one before Enter; the pasted nudge would stay unsubmitted (seen live).
+func TestOpenCodePreset_EscapeCancelsRequest(t *testing.T) {
+	p := GetAgentPresetByName("opencode")
+	if p == nil || !p.EscapeCancelsRequest {
+		t.Fatalf("opencode preset = %+v, want EscapeCancelsRequest", p)
+	}
+	if p.ReadyPromptPrefix != "" {
+		t.Fatalf("opencode preset has no ready prompt; got %q", p.ReadyPromptPrefix)
+	}
+}

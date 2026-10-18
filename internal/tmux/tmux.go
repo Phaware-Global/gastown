@@ -3457,14 +3457,18 @@ func (t *Tmux) shouldSendEscape(target string) bool {
 }
 
 func readyPromptPrefixForSession(t *Tmux, session string) string {
-	promptPrefix := DefaultReadyPromptPrefix
 	agentName, err := t.GetEnvironment(session, "GT_AGENT")
 	if err != nil || agentName == "" {
-		return promptPrefix
+		return DefaultReadyPromptPrefix
 	}
-	preset := config.GetAgentPresetByName(agentName)
-	if preset == nil || preset.ReadyPromptPrefix == "" {
-		return promptPrefix
+	// Resolve town-defined agents through their provider preset (a custom
+	// "opencode-nemotron" is opencode, not Claude). A preset that renders no
+	// ready prompt gets "" rather than Claude's prefix: with the wrong prefix,
+	// inputBoxSubmitted judged an opencode pane "submitted" while the pasted
+	// nudge still sat in its input box, and the Enter retries never ran.
+	preset := t.presetForSession(session)
+	if preset == nil {
+		return DefaultReadyPromptPrefix
 	}
 	return preset.ReadyPromptPrefix
 }
