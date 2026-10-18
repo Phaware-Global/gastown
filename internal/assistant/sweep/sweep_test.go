@@ -624,3 +624,34 @@ func TestRun_CapNeverHidesUrgentOrUndatedOrder(t *testing.T) {
 		t.Errorf("overflow severities: %v", sev)
 	}
 }
+
+func TestRun_CountedFindingKeepsItsAckedEntry(t *testing.T) {
+	// An item that was acked earlier, then changed fingerprint and landed in
+	// the "… and N more" count on a clean port, must keep its entry: the
+	// cap is a report limit, never truncation.
+	first := []Finding{{Kind: "k", Key: "old", Fingerprint: "a", Severity: SeverityInfo, Since: time.Unix(10, 0)}}
+	p := &fakePort{name: "x", findings: first}
+	r := newTestRunner(t, p)
+	rep, _ := r.Run(context.Background(), Options{Write: true})
+	if err := r.Store.Ack(rep.RunID, r.Now()); err != nil {
+		t.Fatal(err)
+	}
+	var many []Finding
+	for i := 0; i < MaxNewPerKind; i++ { // older than "old", so they fill the cap first
+		many = append(many, Finding{Kind: "k", Key: fmt.Sprintf("n-%d", i), Fingerprint: "a", Severity: SeverityInfo, Since: time.Unix(1, 0)})
+	}
+	many = append(many, Finding{Kind: "k", Key: "old", Fingerprint: "b", Severity: SeverityInfo, Since: time.Unix(10, 0)})
+	p.findings = many
+	rep2, _ := r.Run(context.Background(), Options{Write: true})
+	if len(rep2.Ports[0].Overflow) != 1 || rep2.Ports[0].Overflow[0].Count != 1 {
+		t.Fatalf("expected 'old' to be the one counted item: %+v", rep2.Ports[0].Overflow)
+	}
+	if err := r.Store.Ack(rep2.RunID, r.Now()); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := r.Store.Load()
+	e, ok := st.Entries["x|k|old"]
+	if !ok || e.Fingerprint != "a" {
+		t.Fatalf("counted item's acked entry must survive untouched: %+v ok=%v", e, ok)
+	}
+}

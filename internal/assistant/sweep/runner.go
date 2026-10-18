@@ -126,9 +126,12 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Report, error) {
 			return a.Since.Before(b.Since) // oldest first within a severity
 		})
 		res.New, res.Overflow = capPerKind(res.New, MaxNewPerKind)
-		for _, f := range append(acked, res.New...) {
-			pend.Seen[name] = append(pend.Seen[name], f.ID())
-			pend.Findings = append(pend.Findings, f)
+		// Upserted at ack: standing findings plus the new ones listed in full.
+		pend.Findings = append(pend.Findings, append(acked, res.New...)...)
+		// Seen (for eviction): every finding the port returned, counted ones
+		// included, so the report cap never evicts an acknowledged entry.
+		for i := range findings {
+			pend.Seen[name] = append(pend.Seen[name], findings[i].ID())
 		}
 		if res.Clean() {
 			pend.CleanPorts = append(pend.CleanPorts, name)

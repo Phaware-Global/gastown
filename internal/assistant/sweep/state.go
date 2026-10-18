@@ -164,6 +164,11 @@ func (s *Store) Ack(runID string, now time.Time) error {
 		}
 	}
 	seen := map[string]bool{}
+	for _, ids := range p.Seen {
+		for _, id := range ids {
+			seen[id] = true
+		}
+	}
 	for _, f := range p.Findings {
 		id := f.ID()
 		seen[id] = true
