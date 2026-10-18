@@ -719,11 +719,12 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	// Never shut down a polecat whose worktree holds unpreserved work (gt-a02n).
 	// This runs before resolveTarget: a rig target spawns a fresh polecat there,
 	// and rolling that spawn back would clear the holder's hook and molecule.
-	// Re-slinging to a live holder keeps its worktree, so nothing is lost. A dead
-	// holder is not exempt: resolveTarget cannot reach its session, spawns a fresh
-	// polecat, and the force block then shuts the holder down.
+	// Re-slinging to a live holder keeps its worktree, so nothing is lost. Only
+	// confirmed liveness exempts: when the holder is dead or its liveness is
+	// unknown, resolveTarget cannot reach its session, spawns a fresh polecat,
+	// and the force block then shuts the holder down.
 	if (info.Status == "hooked" || info.Status == "in_progress") && force && info.Assignee != "" &&
-		!slingDryRun && !(slingTargetIsHolder(target, info.Assignee) && !isHookedAgentDeadFn(info.Assignee)) {
+		!slingDryRun && !(slingTargetIsHolder(target, info.Assignee) && isHookedAgentConfirmedAliveFn(info.Assignee)) {
 		if err := checkReassignPreservesWork(townRoot, info.Assignee); err != nil {
 			return err
 		}

@@ -4,12 +4,14 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 func stubPolecatWorkStatus(t *testing.T, status *git.UncommittedWorkStatus, err error) *int {
@@ -281,7 +283,7 @@ func TestSlingDeadHolderTargetStillGuarded(t *testing.T) {
 	prevNoBoot := slingNoBoot
 	prevSpawn := spawnPolecatForSling
 	prevResolve := resolveTargetAgentFn
-	prevDead := isHookedAgentDeadFn
+	prevAlive := isHookedAgentConfirmedAliveFn
 	t.Cleanup(func() {
 		slingForce = prevForce
 		slingDryRun = prevDryRun
@@ -289,14 +291,14 @@ func TestSlingDeadHolderTargetStillGuarded(t *testing.T) {
 		slingNoBoot = prevNoBoot
 		spawnPolecatForSling = prevSpawn
 		resolveTargetAgentFn = prevResolve
-		isHookedAgentDeadFn = prevDead
+		isHookedAgentConfirmedAliveFn = prevAlive
 	})
 	slingForce = false
 	slingDryRun = false
 	slingNoConvoy = true
 	slingNoBoot = true
 
-	isHookedAgentDeadFn = func(string) bool { return true }
+	isHookedAgentConfirmedAliveFn = func(string) bool { return false }
 	resolveTargetAgentFn = func(string) (string, string, string, error) {
 		return "", "", "", errors.New("simulated dead session")
 	}
@@ -317,5 +319,99 @@ func TestSlingDeadHolderTargetStillGuarded(t *testing.T) {
 	}
 	if *calls != 1 {
 		t.Errorf("work-status checks = %d, want 1", *calls)
+	}
+}
+
+// TestSlingUnknownLivenessHolderTargetStillGuarded: a tmux error that is not
+// "session not found" leaves the holder's liveness unknown. resolveTarget
+// fails on the same error and spawns a replacement, so the guard must run
+// instead of treating the holder as live.
+func TestSlingUnknownLivenessHolderTargetStillGuarded(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("tmux stub is a shell script")
+	}
+	townRoot := setupHookedBeadTown(t)
+
+	tmuxStub := "#!/bin/sh\necho 'unexpected tmux failure' >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(townRoot, "bin", "tmux"), []byte(tmuxStub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if alive, err := tmux.NewTmux().HasSession("gt-gastown-toast"); err == nil || alive {
+		t.Fatalf("stub must make liveness unknown, got alive=%v err=%v", alive, err)
+	}
+
+	prevForce := slingForce
+	prevDryRun := slingDryRun
+	prevNoConvoy := slingNoConvoy
+	prevNoBoot := slingNoBoot
+	prevSpawn := spawnPolecatForSling
+	prevResolve := resolveTargetAgentFn
+	t.Cleanup(func() {
+		slingForce = prevForce
+		slingDryRun = prevDryRun
+		slingNoConvoy = prevNoConvoy
+		slingNoBoot = prevNoBoot
+		spawnPolecatForSling = prevSpawn
+		resolveTargetAgentFn = prevResolve
+	})
+	slingForce = true
+	slingDryRun = false
+	slingNoConvoy = true
+	slingNoBoot = true
+
+	resolveTargetAgentFn = func(string) (string, string, string, error) {
+		return "", "", "", errors.New("simulated tmux failure")
+	}
+	spawned := false
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		spawned = true
+		return &SpawnedPolecatInfo{RigName: rigName, PolecatName: "nux", ClonePath: filepath.Join(townRoot, "fake-polecat")}, nil
+	}
+	calls := stubPolecatWorkStatus(t, &git.UncommittedWorkStatus{UnpushedCommits: 1}, nil)
+
+	err := runSling(nil, []string{"gt-abc123", "gastown/polecats/toast"})
+
+	if err == nil || !strings.Contains(err.Error(), "unpreserved work") {
+		t.Fatalf("runSling error = %v, want unpreserved-work refusal", err)
+	}
+	if spawned {
+		t.Error("a replacement polecat was spawned for a holder of unknown liveness")
+	}
+	if *calls != 1 {
+		t.Errorf("work-status checks = %d, want 1", *calls)
+	}
+}
+
+// TestIsHookedAgentConfirmedAlive: only a positive has-session answer counts
+// as alive; an unknown session name or a tmux error fails closed.
+func TestIsHookedAgentConfirmedAlive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("tmux stub is a shell script")
+	}
+	binDir := t.TempDir()
+	write := func(script string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(binDir, "tmux"), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	const holder = "gastown/polecats/toast"
+
+	write("#!/bin/sh\nexit 0\n")
+	if !isHookedAgentConfirmedAlive(holder) {
+		t.Error("existing session must be confirmed alive")
+	}
+	write("#!/bin/sh\necho \"can't find session\" >&2\nexit 1\n")
+	if isHookedAgentConfirmedAlive(holder) {
+		t.Error("missing session must not be confirmed alive")
+	}
+	write("#!/bin/sh\necho 'unexpected tmux failure' >&2\nexit 1\n")
+	if isHookedAgentConfirmedAlive(holder) {
+		t.Error("tmux error must not be confirmed alive")
+	}
+	write("#!/bin/sh\nexit 0\n")
+	if isHookedAgentConfirmedAlive("gastown") {
+		t.Error("unresolvable session name must not be confirmed alive")
 	}
 }

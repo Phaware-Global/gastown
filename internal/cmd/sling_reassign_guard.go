@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 // polecatWorkStatusFn is a seam for tests. It reports the uncommitted-work
@@ -37,6 +38,24 @@ func polecatClonePath(townRoot, rigName, polecatName string) (string, error) {
 		return "", fmt.Errorf("%s: %w", polecatDir, err)
 	}
 	return "", nil
+}
+
+// isHookedAgentConfirmedAliveFn is a seam for tests. Production uses
+// isHookedAgentConfirmedAlive.
+var isHookedAgentConfirmedAliveFn = isHookedAgentConfirmedAlive
+
+// isHookedAgentConfirmedAlive reports whether the assignee's session is
+// positively known to exist. Unlike !isHookedAgentDead, an unknown state (empty
+// session name, or a tmux error other than not-found/no-server) is not alive:
+// the guard exemption fails closed, because resolveTarget treats the same
+// transient failure as an unreachable session and spawns a replacement.
+func isHookedAgentConfirmedAlive(assignee string) bool {
+	sessionName, _ := assigneeToSessionName(assignee)
+	if sessionName == "" {
+		return false
+	}
+	alive, err := tmux.NewTmux().HasSession(sessionName)
+	return err == nil && alive
 }
 
 // slingTargetIsHolder reports whether the sling target is the bead's current
