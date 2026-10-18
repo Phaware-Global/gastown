@@ -997,7 +997,7 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 			patterns = githubDefaultRelease
 		}
 		out = append(out, p.checkReleases(c, ref, first, patterns, in.Now, d, note)...)
-		out = append(out, links.check(open, first.Merged.Nodes, patterns, in.Now, d, isHuman)...)
+		out = append(out, links.check(open, first.Merged.Nodes, patterns, in.Now, d, isPersona, isHuman)...)
 	}
 	if len(partial) > 0 {
 		return out, &PartialError{Reason: strings.Join(partial, "; ")}

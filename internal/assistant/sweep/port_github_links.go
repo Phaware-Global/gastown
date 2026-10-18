@@ -59,6 +59,10 @@ func (p *GitHubPort) checkReleases(c *ghClient, ref repoRef, data *ghRepoData, p
 		}
 		tags = append(tags, tg)
 	}
+	// Newest first: a newer tag on the line contains everything earlier.
+	for i, j := 0, len(tags)-1; i < j; i, j = i+1, j-1 {
+		tags[i], tags[j] = tags[j], tags[i]
+	}
 	var out []Finding
 	for _, pr := range data.Merged.Nodes {
 		if pr.MergeCommit == nil || pr.MergedAt.IsZero() || now.Sub(pr.MergedAt) > d.releaseWindow || !matchAny(patterns, pr.BaseRefName) {
@@ -67,8 +71,18 @@ func (p *GitHubPort) checkReleases(c *ghClient, ref repoRef, data *ghRepoData, p
 		key := fmt.Sprintf("%s#%d", ref.slug(), pr.Number)
 		tagged, checked := false, 0
 		for _, t := range tags {
-			if t.at.Before(pr.MergedAt) || checked == githubTagsChecked {
+			if t.oid == pr.MergeCommit.Oid {
+				tagged = true // the tag sits on the merge commit itself
+				break
+			}
+			// Tagged-commit dates can precede mergedAt by a little (push
+			// merges, clock skew), so the gate is loose; contains() decides.
+			if t.at.Before(pr.MergedAt.Add(-24*time.Hour)) || checked == githubTagsChecked {
 				continue
+			}
+			if !timeLeft(c.ctx) {
+				note("%s: time budget exhausted before the release tag check", key)
+				return out
 			}
 			checked++
 			ok, err := c.contains(ref, pr.MergeCommit.Oid, t.oid)
@@ -124,7 +138,7 @@ func (p *GitHubPort) newLinks(ctx context.Context, in Input, note func(string, .
 		projects = append(projects, regexp.QuoteMeta(pr))
 	}
 	l := &ghLinks{client: client, keyRe: regexp.MustCompile(`\b(?:` + strings.Join(projects, "|") + `)-\d+\b`),
-		reviewers: cfg.Reviewers, inReview: cfg.InReviewStatus, inProgress: cfg.InProgressStatus, done: cfg.DoneStatus, uat: cfg.UATStatus,
+		reviewers: lowerKeys(cfg.Reviewers), inReview: cfg.InReviewStatus, inProgress: cfg.InProgressStatus, done: cfg.DoneStatus, uat: cfg.UATStatus,
 		uatAfter: parseDur(cfg.UATSweepAfter, 24*time.Hour), note: note, cache: map[string]*jiraIssue{}}
 	for field, def := range map[*string]string{&l.inReview: "In Review", &l.inProgress: "In Progress", &l.done: "Done", &l.uat: "In UAT"} {
 		if *field == "" {
@@ -134,17 +148,36 @@ func (p *GitHubPort) newLinks(ctx context.Context, in Input, note func(string, .
 	return l
 }
 
-// keys returns the issue keys a PR names, deduplicated and sorted.
+// maxKeysPerPR bounds how many issue keys one PR (whose title and branch
+// are author-chosen text) may contribute to the Jira lookup.
+const maxKeysPerPR = 5
+
+// keys returns the issue keys a PR names, shape-checked, deduplicated,
+// sorted and capped.
 func (l *ghLinks) keys(pr *ghPR) []string {
 	seen := map[string]bool{}
 	for _, k := range append(l.keyRe.FindAllString(strings.ToUpper(pr.HeadRefName), -1), l.keyRe.FindAllString(pr.Title, -1)...) {
-		seen[k] = true
+		if jiraKeyRe.MatchString(k) {
+			seen[k] = true
+		}
 	}
 	var out []string
 	for k := range seen {
 		out = append(out, k)
 	}
 	sort.Strings(out)
+	if len(out) > maxKeysPerPR {
+		out = out[:maxKeysPerPR]
+	}
+	return out
+}
+
+// lowerKeys case-folds a login-keyed map.
+func lowerKeys(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[strings.ToLower(strings.TrimSpace(k))] = v
+	}
 	return out
 }
 
@@ -159,29 +192,61 @@ func (l *ghLinks) load(keys []string) {
 	if len(missing) == 0 || l.failed {
 		return
 	}
-	issues, _, err := l.client.search(fmt.Sprintf(`key in %s`, jqlList(missing)))
-	if err != nil {
-		l.note("linked Jira issues unavailable: %v", err)
-		l.failed = true
-		return
-	}
 	for _, k := range missing {
 		l.cache[k] = nil // not found stays nil
 	}
-	for i := range issues {
-		l.cache[issues[i].Key] = &issues[i]
+	issues, _, err := l.client.search(fmt.Sprintf(`key in %s`, jqlList(missing)))
+	if err == nil {
+		for i := range issues {
+			l.cache[issues[i].Key] = &issues[i]
+		}
+		return
+	}
+	// One bad key (a typo or an attacker-chosen key in a PR title) fails
+	// the batch with a 400: look the keys up one by one so it only drops
+	// its own PR, and give up only if every lookup fails.
+	failures := 0
+	for _, k := range missing {
+		if !timeLeft(l.client.ctx) {
+			l.note("time budget exhausted while looking up linked Jira issues")
+			l.failed = true
+			return
+		}
+		one, err := l.client.searchFirst(fmt.Sprintf(`key = %s`, k))
+		if err != nil {
+			failures++
+			continue
+		}
+		if len(one) > 0 {
+			l.cache[one[0].Key] = &one[0]
+		}
+	}
+	if failures > 0 {
+		l.note("%d of %d linked Jira keys could not be looked up (batch error: %v)", failures, len(missing), err)
+	}
+	if failures == len(missing) {
+		l.failed = true
 	}
 }
 
-func (l *ghLinks) check(open []ghPR, merged []ghPR, patterns []string, now time.Time, d githubDurations, isHuman map[string]bool) []Finding {
+func (l *ghLinks) check(open []ghPR, merged []ghPR, patterns []string, now time.Time, d githubDurations, isPersona, isHuman map[string]bool) []Finding {
 	if l == nil {
 		return nil
 	}
+	// Only the persona's own PRs carry the persona's Jira handoffs; a PR
+	// anyone else opened must not be able to name an issue into a reassign
+	// suggestion.
+	ours := func(pr *ghPR) bool { return isPersona[strings.ToLower(pr.Author.Login)] }
 	var all []string
 	for i := range open {
-		all = append(all, l.keys(&open[i])...)
+		if ours(&open[i]) {
+			all = append(all, l.keys(&open[i])...)
+		}
 	}
 	for i := range merged {
+		if !ours(&merged[i]) {
+			continue
+		}
 		all = append(all, l.keys(&merged[i])...)
 	}
 	l.load(all)
@@ -196,24 +261,33 @@ func (l *ghLinks) check(open []ghPR, merged []ghPR, patterns []string, now time.
 	}
 	for i := range open {
 		pr := &open[i]
-		if pr.IsDraft {
+		if pr.IsDraft || !ours(pr) {
 			continue
 		}
-		// Outstanding request to a listed human with no review on this head.
-		var waitingOn string
-		reviewed := map[string]bool{}
-		var handedBackBy string
+		// Each listed human's latest review state on this head (reviews
+		// arrive oldest first, so later entries win); an outstanding
+		// request from a human who has not reviewed this head.
+		latest := map[string]string{}
 		for _, r := range pr.Reviews.Nodes {
-			if r.Commit.Oid == pr.HeadRefOid && isHuman[r.Author.Login] {
-				reviewed[r.Author.Login] = true
-				if r.State == "CHANGES_REQUESTED" {
-					handedBackBy = r.Author.Login
-				}
+			if login := strings.ToLower(r.Author.Login); r.Commit.Oid == pr.HeadRefOid && isHuman[login] && r.State != "COMMENTED" && r.State != "PENDING" {
+				latest[login] = r.State
 			}
 		}
+		var waitingOn, handedBackBy string
 		for _, rr := range pr.ReviewRequests.Nodes {
-			if login := rr.RequestedReviewer.Login; isHuman[login] && !reviewed[login] {
+			if login := strings.ToLower(rr.RequestedReviewer.Login); isHuman[login] && latest[login] == "" {
 				waitingOn = login
+				break
+			}
+		}
+		logins := make([]string, 0, len(latest))
+		for login := range latest {
+			logins = append(logins, login)
+		}
+		sort.Strings(logins)
+		for _, login := range logins {
+			if latest[login] == "CHANGES_REQUESTED" {
+				handedBackBy = login
 				break
 			}
 		}
@@ -250,7 +324,7 @@ func (l *ghLinks) check(open []ghPR, merged []ghPR, patterns []string, now time.
 	}
 	for i := range merged {
 		pr := &merged[i]
-		if pr.MergedAt.IsZero() || now.Sub(pr.MergedAt) > d.releaseWindow || now.Sub(pr.MergedAt) < l.uatAfter || !matchAny(patterns, pr.BaseRefName) {
+		if !ours(pr) || pr.MergedAt.IsZero() || now.Sub(pr.MergedAt) > d.releaseWindow || now.Sub(pr.MergedAt) < l.uatAfter || !matchAny(patterns, pr.BaseRefName) {
 			continue
 		}
 		for _, key := range l.keys(pr) {

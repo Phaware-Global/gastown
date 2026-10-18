@@ -128,6 +128,7 @@ type ghFixture struct {
 	compare     map[string]string           // "base...head" → status
 	issues      []map[string]any            // Jira issues returned for `key in (...)`
 	jiraErr     bool                        // Jira search fails
+	jiraBadKey  string                      // a `key in (...)` batch naming this key answers 400
 }
 
 func (fx *ghFixture) handler(t *testing.T) http.Handler {
@@ -143,9 +144,14 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 				return
 			}
 			jql := r.URL.Query().Get("jql")
+			if fx.jiraBadKey != "" && strings.Contains(jql, fx.jiraBadKey) {
+				http.Error(w, `{"errorMessages":["An issue with key '`+fx.jiraBadKey+`' does not exist for field 'key'."]}`, 400)
+				return
+			}
 			var hit []map[string]any
 			for _, is := range fx.issues {
-				if strings.Contains(jql, `"`+is["key"].(string)+`"`) {
+				k := is["key"].(string)
+				if strings.Contains(jql, `"`+k+`"`) || strings.HasPrefix(jql, "key = "+k+" ") || strings.HasSuffix(jql, "key = "+k) {
 					hit = append(hit, is)
 				}
 			}
@@ -243,7 +249,7 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 				raw, _ := json.Marshal(data)
 				var m map[string]any
 				_ = json.Unmarshal(raw, &m)
-				nodes := m["open"].(map[string]any)["nodes"].([]any)
+				nodes, _ := m["open"].(map[string]any)["nodes"].([]any) // nil for a repo with no open PRs
 				for i, n := range nodes {
 					if int(n.(map[string]any)["number"].(float64)) == fx.nullNodePR {
 						nodes[i] = nil
@@ -258,7 +264,8 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 				raw, _ := json.Marshal(data)
 				var m map[string]any
 				_ = json.Unmarshal(raw, &m)
-				for _, n := range m["open"].(map[string]any)["nodes"].([]any) {
+				nodes, _ := m["open"].(map[string]any)["nodes"].([]any)
+				for _, n := range nodes {
 					node := n.(map[string]any)
 					if int(node["number"].(float64)) == fx.fieldErrPR {
 						node["reviews"] = nil
@@ -649,13 +656,13 @@ func TestGitHubPort_ReleasesAndLinkedIssues(t *testing.T) {
 	for _, f := range findings {
 		got[f.Kind+"/"+f.Key] = f
 	}
-	for _, want := range []string{"review-handoff/P23-30", "review-handoff/P23-32", "done-not-in-uat/P23-40", "release-unclosed/acme/app#41", "release-unclosed/acme/app#43"} {
+	for _, want := range []string{"review-handoff/P23-30", "review-handoff/P23-32", "done-not-in-uat/P23-40", "release-unclosed/acme/app#41"} {
 		if _, ok := got[want]; !ok {
 			t.Errorf("missing %s; got %v", want, keysOf(got))
 		}
 	}
 	for _, absent := range []string{"review-handoff/P23-31", "review-handoff/P23-33", "done-not-in-uat/P23-41", "done-not-in-uat/P23-42", "done-not-in-uat/P23-43",
-		"release-unclosed/acme/app#40", "release-unclosed/acme/app#42"} {
+		"release-unclosed/acme/app#40", "release-unclosed/acme/app#42", "release-unclosed/acme/app#43"} {
 		if _, ok := got[absent]; ok {
 			t.Errorf("unexpected %s", absent)
 		}
@@ -681,7 +688,7 @@ func TestGitHubPort_ReleasesAndLinkedIssues(t *testing.T) {
 	fx.jiraErr = true
 	findings, err = p.Sweep(context.Background(), in)
 	var partial *PartialError
-	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "linked Jira issues unavailable") {
+	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "could not be looked up") {
 		t.Fatalf("Jira failure must be partial: %v", err)
 	}
 	for _, f := range findings {
@@ -984,5 +991,59 @@ func TestGitHubPort_GraphQLErrorGuardsPinnedSeparately(t *testing.T) {
 	}
 	if !keys["no-review-loop/acme/app#81"] {
 		t.Errorf("the other PR must still be checked: %v", keys)
+	}
+}
+
+func authoredBy(login string) func(*ghPR) { return func(p *ghPR) { p.Author.Login = login } }
+
+func TestGitHubPort_LinkedKindsRound1Fixes(t *testing.T) {
+	h := time.Hour
+	app := &ghRepoData{}
+	app.Open.Nodes = []ghPR{
+		// 90: not ours — a stranger's PR naming an issue must not produce a reassign suggestion.
+		pr(90, "stranger", 40*h, 40*h, "SUCCESS", branch("feat/P23-90"), authoredBy("stranger"), requested("kevin", 30*h)),
+		// 91: mixed-case login in the request still matches the listed human.
+		pr(91, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-91"), requested("Kevin", 30*h)),
+		// 92: changes requested then approved on the same head → no hand-back.
+		pr(92, "artie", 40*h, 20*h, "SUCCESS", branch("feat/P23-92"), review("kevin", "CHANGES_REQUESTED", shaA, 5*h), review("kevin", "APPROVED", shaA, 2*h)),
+		// 94: one bogus key in the title must not blind the real one.
+		pr(94, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-94"), func(p *ghPR) { p.Title = "P23-99999999 and P23-94" }, requested("kevin", 30*h)),
+	}
+	// 93: the release tag sits on the merge commit itself (dated 1s before mergedAt).
+	app.Merged.Nodes = []ghPR{mergedPR(93, "release/2.0", "feat/P23-93", 48*h, shaM)}
+	app.Tags.Nodes = []ghTag{tagAt(shaM, 48*h+time.Second)}
+	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, jiraBadKey: "P23-99999999",
+		issues: []map[string]any{
+			issue("P23-90", "In Progress", "indeterminate", personaID, 100*h, 1*h, "stranger's key"),
+			issue("P23-91", "In Progress", "indeterminate", personaID, 100*h, 1*h, "needs handoff"),
+			issue("P23-92", "In Review", "indeterminate", humanID, 100*h, 1*h, "approved after changes"),
+			issue("P23-94", "In Progress", "indeterminate", personaID, 100*h, 1*h, "real key next to a bogus one"),
+		}}
+	p, in := newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	in.Settings.Assistant.Sweep.Jira.Reviewers = map[string]string{"KEVIN": humanID} // mis-cased config key
+	findings, err := p.Sweep(context.Background(), in)
+	var partial *PartialError
+	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "could not be looked up") {
+		t.Fatalf("the bogus key must be noted, not fatal: %v", err)
+	}
+	got := map[string]Finding{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = f
+	}
+	if _, ok := got["review-handoff/P23-90"]; ok {
+		t.Error("a stranger's PR must never yield a review-handoff")
+	}
+	if f, ok := got["review-handoff/P23-91"]; !ok || f.Fields["human"] != "kevin" || f.Fields["account_id"] != humanID {
+		t.Errorf("mixed-case login and config key must still match: %+v (%v)", f, keysOf(got))
+	}
+	if _, ok := got["review-handoff/P23-92"]; ok {
+		t.Error("an approval after changes-requested on the same head is not a hand-back")
+	}
+	if _, ok := got["release-unclosed/acme/app#93"]; ok {
+		t.Error("a tag on the merge commit itself means the release is closed")
+	}
+	if _, ok := got["review-handoff/P23-94"]; !ok {
+		t.Errorf("a bogus key in the same title must not blind the real key: %v", keysOf(got))
 	}
 }
