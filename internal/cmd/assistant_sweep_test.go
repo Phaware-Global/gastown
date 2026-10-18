@@ -19,6 +19,14 @@ func TestAssistantSweepTriggerNamesRegisteredCommand(t *testing.T) {
 			t.Errorf("trigger body must mention %q", want)
 		}
 	}
+	// The trigger may defer to a role-prompt protocol only once the template
+	// actually carries one.
+	if strings.Contains(string(script), "Sweep Protocol") {
+		tmpl, err := os.ReadFile(filepath.Join("..", "templates", "roles", "assistant.md.tmpl"))
+		if err != nil || !strings.Contains(string(tmpl), "## Sweep Protocol") {
+			t.Error("trigger defers to a Sweep Protocol the assistant template does not define")
+		}
+	}
 	found := false
 	for _, c := range assistantCmd.Commands() {
 		if c.Name() == "sweep" {

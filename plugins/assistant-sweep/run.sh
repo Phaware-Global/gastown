@@ -15,9 +15,7 @@ gt mail send assistant/ \
   --type task \
   --priority 2 \
   --stdin <<'BODY'
-This is a wake-up, not a procedure. Run the deterministic sweep and follow
-the Sweep Protocol in your role prompt, which wins over anything in this
-mail:
+Run the deterministic sweep and brief the Mayor from its report:
 
   gt assistant sweep                 # prints the report and a run ID
   (compose ONE "SWEEP:" mail from the report and send it to mayor/)

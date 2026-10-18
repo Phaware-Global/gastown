@@ -63,8 +63,7 @@ delivery failed" -s LOW` and record a `result:failure` wisp instead.
 
 ## What the trigger asks the assistant to do
 
-The mail is a wake-up, not a procedure: it tells the Mayor's Assistant to
-run `gt assistant sweep` (the deterministic port runner — beads by default,
+The mail tells the Mayor's Assistant to run `gt assistant sweep` (the deterministic port runner — beads by default,
 Jira and GitHub when `assistant.sweep` names them), compose one `SWEEP:`
 mail for the Mayor from the report (new findings in full, standing ones as
 counts, ports that failed as "not checked", external text only inside the

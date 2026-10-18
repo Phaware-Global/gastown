@@ -20,8 +20,7 @@ const DefaultBeadsStaleAfter = 72 * time.Hour
 // Page caps: a result that fills its cap may be truncated, which the port
 // reports as partial so standing entries beyond the cut are never evicted.
 const (
-	beadsReadyCap  = 100 // bd ready default limit
-	beadsListCap   = 1000
+	beadsListCap   = 1000 // list and ready page size (bd ready alone would cap at 100)
 	beadsConvoyCap = 500
 )
 
@@ -29,7 +28,7 @@ const (
 // substitute a fake.
 type beadsSource interface {
 	List(opts beads.ListOptions) ([]*beads.Issue, error)
-	Ready() ([]*beads.Issue, error)
+	ReadyLimit(limit int) ([]*beads.Issue, error)
 	Blocked() ([]*beads.Issue, error)
 	ListEscalations() ([]*beads.Issue, error)
 }
@@ -167,16 +166,16 @@ func (p *BeadsPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 				out = append(out, f)
 			}
 		}
-		ready, err := src.Ready()
+		ready, err := src.ReadyLimit(beadsListCap)
 		if err != nil {
 			partial = append(partial, rig+": ready: "+err.Error())
 		}
-		if len(ready) >= beadsReadyCap {
-			partial = append(partial, fmt.Sprintf("%s: ready list truncated at %d", rig, beadsReadyCap))
+		if len(ready) >= beadsListCap {
+			partial = append(partial, fmt.Sprintf("%s: ready list truncated at %d", rig, beadsListCap))
 		}
 		for _, i := range ready {
-			if beads.HasLabel(i, "gt:escalation") {
-				continue // escalations are decisions, not slingable work
+			if beads.HasLabel(i, "gt:escalation") || beads.IsProtectedBead(i) {
+				continue // escalations and agent/rig/role identity beads are not slingable work
 			}
 			if i.HookBead == "" && i.Assignee == "" {
 				out = append(out, p.finding("unslung", rig, i, in.Now, SeverityInfo, fmt.Sprintf("`gt sling %s %s`", i.ID, rig)))
