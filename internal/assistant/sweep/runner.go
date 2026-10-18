@@ -17,9 +17,11 @@ import (
 var PortTimeout = 2 * time.Minute
 
 // MaxNewPerKind bounds how many new findings of one kind a report prints in
-// full; the rest are counted on an overflow line. All of them are still
-// recorded in the pending run, so acking the report acknowledges the count
-// the Mayor was told, not only the items shown.
+// full (urgent findings are never capped); the rest are counted on an
+// overflow line. Only listed findings enter the pending run, so an ack
+// never consumes an item the Mayor did not see by key: overflow items stay
+// new and are promoted into the full list as listed items clear. The cap
+// is a report limit, not truncation, so it never affects eviction.
 const MaxNewPerKind = 25
 
 // Options controls one run.
@@ -90,12 +92,12 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Report, error) {
 			enforceSchema(schema, templates, f)
 		}
 		findings = mergeDuplicates(findings)
+		var acked []Finding // standing findings plus the new ones listed in full
 		for i := range findings {
 			f := &findings[i]
 			id := f.ID()
-			pend.Seen[name] = append(pend.Seen[name], id)
-			pend.Findings = append(pend.Findings, *f)
 			if e, ok := state.Entries[id]; ok && e.Fingerprint == f.Fingerprint {
+				acked = append(acked, *f)
 				s := standing[f.Kind]
 				if s == nil {
 					s = &Standing{Kind: f.Kind}
@@ -124,6 +126,10 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Report, error) {
 			return a.Since.Before(b.Since) // oldest first within a severity
 		})
 		res.New, res.Overflow = capPerKind(res.New, MaxNewPerKind)
+		for _, f := range append(acked, res.New...) {
+			pend.Seen[name] = append(pend.Seen[name], f.ID())
+			pend.Findings = append(pend.Findings, f)
+		}
 		if res.Clean() {
 			pend.CleanPorts = append(pend.CleanPorts, name)
 		}

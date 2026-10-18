@@ -573,9 +573,16 @@ func TestRun_CapsNewFindingsPerKind(t *testing.T) {
 	if err := r.Store.Ack(rep.RunID, r.Now()); err != nil {
 		t.Fatal(err)
 	}
+	// Only the listed findings were acknowledged: the five counted ones are
+	// promoted into the full list on the next run, and nothing was consumed.
 	rep2, _ := r.Run(context.Background(), Options{})
-	if len(rep2.Ports[0].New) != 0 || len(rep2.Ports[0].Overflow) != 0 || rep2.Ports[0].Standing[1].Count != MaxNewPerKind+5 {
-		t.Errorf("acking the report must acknowledge the counted findings too: %+v", rep2.Ports[0])
+	if len(rep2.Ports[0].New) != 5 || len(rep2.Ports[0].Overflow) != 0 || rep2.Ports[0].Standing[1].Count != MaxNewPerKind {
+		t.Errorf("overflow items must stay new until listed and acked: new=%d overflow=%+v standing=%+v", len(rep2.Ports[0].New), rep2.Ports[0].Overflow, rep2.Ports[0].Standing)
+	}
+	for _, f := range rep2.Ports[0].New {
+		if f.Kind != "unslung" || !f.Since.After(time.Unix(1000-MaxNewPerKind, 0)) {
+			t.Errorf("promoted finding should be one of the five newest unslung: %+v", f)
+		}
 	}
 }
 
