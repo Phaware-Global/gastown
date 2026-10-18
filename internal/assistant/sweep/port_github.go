@@ -472,9 +472,10 @@ func (c *ghClient) prDiff(ref repoRef, base, head string) (*prSnapshot, error) {
 // contains " b/"; the "+++ b/" line read before the first hunk is not (a
 // hunk body line "++ b/…" would render as "+++ b/…", hence the cut-off).
 // Git appends a tab to a "+++" path that contains a space; it is trimmed so
-// the key matches the API's file names. A deletion ("+++ /dev/null") is
-// keyed apart from a creation of the same path, so a file-to-symlink
-// typechange (two sections under one header) is not a duplicate. An entry
+// the key matches the API's file names. A deletion ("deleted file mode"
+// header, which git writes for text, binary and empty files alike) is keyed
+// apart from a creation of the same path, so a file-to-symlink typechange
+// (two sections under one header) is not a duplicate. An entry
 // without a "+++" line (binary, mode-only, rename-only) uses its "rename to"
 // line, then the header's last " b/".
 func sectionPath(lines []string) string {
@@ -482,11 +483,11 @@ func sectionPath(lines []string) string {
 		if strings.HasPrefix(l, "@@") {
 			break
 		}
+		if strings.HasPrefix(l, "deleted file mode ") || l == "+++ /dev/null" {
+			return headerPath(lines[0]) + " (deleted)"
+		}
 		if strings.HasPrefix(l, "+++ b/") {
 			return strings.TrimSuffix(l[len("+++ b/"):], "\t")
-		}
-		if l == "+++ /dev/null" {
-			return headerPath(lines[0]) + " (deleted)"
 		}
 	}
 	for _, l := range lines {
