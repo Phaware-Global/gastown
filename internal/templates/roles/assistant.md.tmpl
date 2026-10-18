@@ -239,12 +239,15 @@ with `sed` rather than from your memory, and fails closed at every step:
 ```bash
 mkdir -p "$GT_ROOT/assistant/.runtime" && umask 077 && r="$GT_ROOT/assistant/.runtime/sweep-report.md" \
   && {{ cmd }} assistant sweep > "$r" \
-  && grep -E '^(Run-ID:|## Port:|PARTIAL|NOT CHECKED|DRY RUN|all clear)' "$r" && echo "new findings: $(grep -c '^### ' "$r")"
+  && grep -E '^(Run-ID:|## Port:|PARTIAL|NOT CHECKED|DRY RUN|all clear|… and )' "$r" \
+  && echo "listed in full: $(grep -c '^### ' "$r"); not shown: $(awk '/^… and /{n+=$3} END{print n+0}' "$r")"
 ```
 
 (`umask 077` keeps the report readable by you alone; the `grep` prints
-the run ID, each port's heading and status, and the count the subject
-needs.)
+the run ID, each port's heading and status, and every "… and N more"
+overflow line; the last line gives the two counts. `<N>` in the subject
+is their sum — the report lists at most 25 new findings per kind and
+counts the rest, and the Mayor must see the whole number.)
 
 ```bash
 set -o pipefail; r="$GT_ROOT/assistant/.runtime/sweep-report.md"; test -s "$r" && { cat <<'HDR'
