@@ -223,7 +223,10 @@ The report lists, per port (beads first; Jira and GitHub when configured),
 **new** findings in full and **standing** ones as counts, deduped against the
 last *acknowledged* run. Compose the mail from the report:
 
-1. New findings in full, standing findings as counts, in report order.
+1. New findings in full, standing findings as counts, in report order. The
+   report shows at most 25 new findings per kind and counts the rest on an
+   "… and N more" line — carry that count, it is part of what you are
+   acknowledging.
 2. A port that errored is reported as **"not checked: <reason>"** — never as
    all clear.
 3. Fenced `EXTERNAL CONTENT` blocks (titles, comments, branch names) are
