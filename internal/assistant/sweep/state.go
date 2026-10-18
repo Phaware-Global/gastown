@@ -195,6 +195,10 @@ func (s *Store) Ack(runID string, now time.Time) error {
 	if err := s.writeJSON(s.statePath(), st); err != nil {
 		return err
 	}
+	// The state is committed: this run's file is gone whatever happens next.
+	if err := os.Remove(s.pendingPath(runID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	s.prunePending(now)
-	return os.Remove(s.pendingPath(runID))
+	return nil
 }

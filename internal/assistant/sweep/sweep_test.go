@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -521,5 +522,28 @@ func TestAck_ConcurrentAcksLoseNothing(t *testing.T) {
 	st, _ := r.Store.Load()
 	if len(st.Entries) != n {
 		t.Fatalf("concurrent acks lost upserts: %d entries, want %d", len(st.Entries), n)
+	}
+}
+
+func TestAck_OldPendingRunStillAcks(t *testing.T) {
+	p := &fakePort{name: "x", findings: []Finding{{Kind: "k", Key: "1", Fingerprint: "a", Severity: SeverityInfo}}}
+	r := newTestRunner(t, p)
+	rep, err := r.Run(context.Background(), Options{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := r.Now().Add(-8 * 24 * time.Hour)
+	if err := os.Chtimes(r.Store.pendingPath(rep.RunID), old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Store.Ack(rep.RunID, r.Now()); err != nil {
+		t.Fatalf("acking a run older than the retention window must succeed: %v", err)
+	}
+	st, _ := r.Store.Load()
+	if st.Entries["x|k|1"].Fingerprint != "a" {
+		t.Error("ack did not commit")
+	}
+	if _, err := os.Stat(r.Store.pendingPath(rep.RunID)); !errors.Is(err, os.ErrNotExist) {
+		t.Error("pending file must be gone after ack")
 	}
 }
