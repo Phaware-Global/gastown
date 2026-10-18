@@ -95,7 +95,6 @@ type GitHubSweepConfig struct {
 	RespondAfter          string `json:"respond_after,omitempty"`           // default "12h"
 	ReviewLoopAfter       string `json:"review_loop_after,omitempty"`       // default "2h"
 	CIFailingAfter        string `json:"ci_failing_after,omitempty"`        // default "1h"
-	ReleaseWindow         string `json:"release_window,omitempty"`          // default "336h" (14d)
 	StaleAfter            string `json:"stale_after,omitempty"`             // default "168h" (7d)
 }
 
