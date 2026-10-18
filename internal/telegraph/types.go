@@ -1,10 +1,11 @@
 // Package telegraph implements the town-level inbound external event transport.
-// It converts external webhook events into Mayor-addressed mail with rate-limited nudges.
+// It converts external webhook events into mail addressed to the Mayor's Assistant
+// (assistant/), which triages them for the Mayor, with rate-limited nudges.
 //
 // Architecture: three layers
 //   - L1 (Transport): HTTP webhook listener, authenticates via provider signature
 //   - L2 (Translation): per-provider Translator converts RawEvent → NormalizedEvent
-//   - L3 (Transformation): builds mail envelope, rate-limits nudges to Mayor
+//   - L3 (Transformation): builds mail envelope, rate-limits nudges to the Mayor's Assistant
 package telegraph
 
 import (

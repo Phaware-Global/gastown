@@ -130,7 +130,7 @@ func (l *Logger) Reject(provider, sourceIP, reason, eventID string) {
 	})
 }
 
-// Deliver logs a successful mail send to Mayor from L3.
+// Deliver logs a successful mail send to the Mayor's Assistant from L3.
 // mailID is the bead ID of the created mail; may be empty if unavailable.
 // promptKey is the resolved prompt template key ("jira:comment.added", "default",
 // or "" if no operator prompt block was emitted).
@@ -274,7 +274,7 @@ func (l *Logger) Drop(provider, eventType, eventID, actor, subject, reason strin
 	})
 }
 
-// NudgeSent logs a Mayor nudge that was sent (within rate-limit policy).
+// NudgeSent logs an assistant nudge that was sent (within rate-limit policy).
 func (l *Logger) NudgeSent() {
 	if l == nil {
 		return
@@ -283,7 +283,7 @@ func (l *Logger) NudgeSent() {
 	l.emit(logEntry{Event: "nudge_sent"})
 }
 
-// NudgeSuppressed logs a Mayor nudge that was suppressed by the rate-limit window.
+// NudgeSuppressed logs an assistant nudge that was suppressed by the rate-limit window.
 func (l *Logger) NudgeSuppressed() {
 	if l == nil {
 		return

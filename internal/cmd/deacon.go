@@ -1046,11 +1046,12 @@ func runDeaconForceKill(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s Updating agent bead state to 'killed'...\n", style.Dim.Render("3."))
 	updateAgentBeadState(townRoot, agent, "killed", reason)
 
-	// Step 4: Notify mayor (optional)
+	// Step 4: Notify the Mayor's Assistant (optional). Routed to the Mayor's
+	// Assistant: a force-kill notice is inbound information for triage.
 	if !forceKillSkipNotify {
-		fmt.Printf("%s Notifying mayor...\n", style.Dim.Render("4."))
+		fmt.Printf("%s Notifying mayor's assistant...\n", style.Dim.Render("4."))
 		notifyBody := fmt.Sprintf("Agent %s was force-killed by Deacon.\nReason: %s", agent, reason)
-		sendMail(townRoot, "mayor/", "Agent killed: "+agent, notifyBody)
+		sendMail(townRoot, constants.RoleAssistant+"/", "Agent killed: "+agent, notifyBody)
 	}
 
 	// Record force-kill in state

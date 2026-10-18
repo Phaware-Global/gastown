@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -4528,8 +4529,9 @@ func TestEscalationConfigDefaults(t *testing.T) {
 	if len(cfg.Routes[SeverityLow]) != 1 || cfg.Routes[SeverityLow][0] != "bead" {
 		t.Errorf("Routes[low] = %v, want [bead]", cfg.Routes[SeverityLow])
 	}
-	if len(cfg.Routes[SeverityCritical]) != 4 {
-		t.Errorf("Routes[critical] len = %d, want 4", len(cfg.Routes[SeverityCritical]))
+	// bead, mail:assistant, mail:mayor, email:human, sms:human
+	if len(cfg.Routes[SeverityCritical]) != 5 {
+		t.Errorf("Routes[critical] len = %d, want 5", len(cfg.Routes[SeverityCritical]))
 	}
 }
 
@@ -4685,8 +4687,8 @@ func TestEscalationConfigGetRouteForSeverity(t *testing.T) {
 	}{
 		{SeverityLow, []string{"bead"}},
 		{SeverityMedium, []string{"bead", "mail:mayor"}},
-		{SeverityHigh, []string{"bead", "mail:mayor"}},     // fallback for missing
-		{SeverityCritical, []string{"bead", "mail:mayor"}}, // fallback for missing
+		{SeverityHigh, []string{"bead", "mail:assistant", "mail:mayor"}},     // fallback for missing: direct mayor route
+		{SeverityCritical, []string{"bead", "mail:assistant", "mail:mayor"}}, // fallback for missing: direct mayor route
 	}
 
 	for _, tt := range tests {
@@ -6110,8 +6112,9 @@ func TestStripSlackRoutesReportsSeverities(t *testing.T) {
 	if want := []string{SeverityLow, SeverityMedium, SeverityCritical}; !reflect.DeepEqual(got, want) {
 		t.Errorf("stripSlackRoutes() = %v, want %v", got, want)
 	}
-	// A route that loses slack must still reach the mayor, never go silent.
-	if want := []string{"mail:mayor"}; !reflect.DeepEqual(cfg.Routes[SeverityLow], want) {
+	// A route that loses slack must still reach the mayor, never go silent:
+	// low goes via the assistant's triage inbox, critical directly to mayor/.
+	if want := []string{"mail:assistant"}; !reflect.DeepEqual(cfg.Routes[SeverityLow], want) {
 		t.Errorf("Routes[low] = %v, want %v", cfg.Routes[SeverityLow], want)
 	}
 	if want := []string{"bead", "mail:mayor"}; !reflect.DeepEqual(cfg.Routes[SeverityCritical], want) {
@@ -6127,5 +6130,31 @@ func TestStripSlackRoutesReportsSeverities(t *testing.T) {
 	off := &EscalationConfig{SlackOverseerOnly: boolPtr(false), Routes: map[string][]string{SeverityCritical: {"bead", "slack"}}}
 	if got := stripSlackRoutes(off); got != nil {
 		t.Errorf("stripSlackRoutes() with slack_overseer_only=false = %v, want nil", got)
+	}
+}
+
+// TestNewEscalationConfigRoutesToAssistant pins the routing change:
+// escalation mail is inbound information for triage, so the shipped defaults
+// deliver to the Mayor's Assistant rather than directly to the Mayor.
+func TestNewEscalationConfigRoutesToAssistant(t *testing.T) {
+	t.Parallel()
+	cfg := NewEscalationConfig()
+	for _, severity := range []string{SeverityMedium, SeverityHigh, SeverityCritical} {
+		if route := cfg.Routes[severity]; !slices.Contains(route, "mail:assistant") {
+			t.Errorf("Routes[%s] = %v: missing mail:assistant", severity, route)
+		}
+	}
+	// Medium goes through the assistant only; high/critical keep a direct
+	// path to the Mayor so a dead assistant session cannot blackhole them.
+	if route := cfg.Routes[SeverityMedium]; slices.Contains(route, "mail:mayor") {
+		t.Errorf("Routes[medium] = %v: must not mail mayor/ directly", route)
+	}
+	for _, severity := range []string{SeverityHigh, SeverityCritical} {
+		if route := cfg.Routes[severity]; !slices.Contains(route, "mail:mayor") {
+			t.Errorf("Routes[%s] = %v: must keep a direct mail:mayor route", severity, route)
+		}
+	}
+	if slices.Contains(cfg.Routes[SeverityLow], "mail:assistant") {
+		t.Errorf("Routes[low] = %v: low severity stays bead-only", cfg.Routes[SeverityLow])
 	}
 }

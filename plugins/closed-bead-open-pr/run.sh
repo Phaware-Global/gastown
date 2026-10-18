@@ -85,7 +85,8 @@ if [ "${#FINDINGS[@]}" -gt 0 ]; then
   SUBJECT="closed-bead-open-pr: ${#FINDINGS[@]} finding(s)"
   [ "$HAS_REAL" = true ] && SUBJECT="$SUBJECT — includes unresolved work"
 
-  gt mail send mayor/ -s "$SUBJECT" --stdin <<< "$BODY"
+  # Routed to the Mayor's Assistant (findings = inbound information for triage).
+  gt mail send assistant/ -s "$SUBJECT" --stdin <<< "$BODY"
 
   for F in "${FINDINGS[@]}"; do
     IFS='|' read -r RIG BEAD_ID PR_NUM UNRESOLVED TITLE <<< "$F"
