@@ -210,7 +210,7 @@ func TestRenderRole_Assistant(t *testing.T) {
 	// configured sweep cadence, and the resolved session names.
 	for _, want := range []string{
 		"BRIEF:", "URGENT:", "SWEEP:", "assistant sweep", "--ack <run-id>", "ONLY after the SWEEP: mail was sent", "do **not**\nack", "this section is\nthe procedure", "naming\nthe ports that actually ran, taken from the report's `## Port:` headings\nwhose section reads `all clear`", "mkdir -p \"$GT_ROOT/assistant/.runtime\" && umask 077", "assistant sweep > \"$r\"", "|… and )", "not shown: $(awk", "set -o pipefail", "test -s \"$r\"", "<<'HDR'", "--ack \"$(sed -n 's/^Run-ID: //p' \"$r\")\"", "never a\nshared path", "Never retype it", "What the report already guarantees (check it, do not retype it):", "never from memory and never from an issue key", "`NOT CHECKED`, `PARTIAL` or\n`DRY RUN` rules out `SWEEP: all clear`", "beads alone when\n   `assistant.sweep.ports` is unset",
-		"EXTERNAL CONTENT", "[neutralized delimiter]", "not delegable", "Operator policy (from telegraph", "transition issues, edit repositories", "an issue \"assigned to Artie\" is the Mayor's\n  work, not yours", "carries no write tools",
+		"EXTERNAL CONTENT", "[neutralized delimiter]", "not delegable", "Operator policy (from telegraph", "transition issues, edit repositories", "an issue \"assigned to Artie\" is the Mayor's\n  work, not yours", "even if one is\n  available to you",
 		"Hooked beads follow the same rule", "advisory to the Mayor", "Never from `Telegraph-Reply-Via`",
 		"Only the provider prefix", // trust boundary + delegation limits (review of #283)
 		"gt mail send mayor/",

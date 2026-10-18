@@ -2285,3 +2285,32 @@ func TestBuildReplyReminderMessageFor_AssistantRelays(t *testing.T) {
 		t.Errorf("unknown telegraph provider must stay silent for the assistant too, got %q", got)
 	}
 }
+
+// The production path for the live failure: a telegraph mail addressed to
+// assistant/ goes through notifyRecipient → enqueueReplyReminder, and the
+// queued nudge must tell the assistant to relay, never to use the Jira or
+// GitHub tools. Reverting the call site to the recipient-blind helper fails
+// this test.
+func TestEnqueueReplyReminder_AssistantRecipientRelays(t *testing.T) {
+	for _, c := range []struct{ from, mustNot string }{
+		{"telegraph/jira/PROJ-42", "addCommentToJiraIssue"},
+		{"telegraph/github/alice", "comment on the GitHub PR/issue directly"},
+	} {
+		townRoot := t.TempDir()
+		r := &Router{workDir: t.TempDir(), townRoot: townRoot}
+		r.enqueueReplyReminder(&Message{From: c.from, To: "assistant/", Subject: "Issue updated", Type: TypeNotification}, "hq-assistant")
+		dir := filepath.Join(townRoot, ".runtime", "nudge_queue", "hq-assistant")
+		entries, err := os.ReadDir(dir)
+		if err != nil || len(entries) != 1 {
+			t.Fatalf("%s: expected 1 queued reminder, got %d (%v)", c.from, len(entries), err)
+		}
+		data, _ := os.ReadFile(filepath.Join(dir, entries[0].Name()))
+		var q nudge.QueuedNudge
+		if err := json.Unmarshal(data, &q); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if !strings.Contains(q.Message, "You relay; you do not respond") || strings.Contains(q.Message, c.mustNot) {
+			t.Errorf("%s → assistant/: reminder must tell the assistant to relay, got %q", c.from, q.Message)
+		}
+	}
+}
