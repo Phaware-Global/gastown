@@ -70,6 +70,11 @@ type Gate struct {
 	// Duration is for cooldown gates (e.g., "1h", "24h").
 	Duration string `json:"duration,omitempty" toml:"duration,omitempty"`
 
+	// DurationSetting optionally names a town setting (settings/config.json)
+	// whose value overrides Duration for cooldown gates. Recognised values:
+	// "assistant_sweep_interval". See (*Gate).CooldownDuration.
+	DurationSetting string `json:"duration_setting,omitempty" toml:"duration_setting,omitempty"`
+
 	// Schedule is for cron gates (e.g., "0 9 * * *").
 	Schedule string `json:"schedule,omitempty" toml:"schedule,omitempty"`
 
