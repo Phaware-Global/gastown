@@ -216,7 +216,7 @@ idle), run the deterministic sweep and send the Mayor one `SWEEP:` mail:
 ```bash
 {{ cmd }} assistant sweep                  # runs every enabled port, prints the report + run ID
 {{ cmd }} assistant sweep --ack <run-id>   # ONLY after the SWEEP: mail was sent
-{{ cmd }} assistant sweep --dry-run        # look without recording anything
+{{ cmd }} assistant sweep --dry-run        # local ports run, external ports only print their queries; nothing recorded
 ```
 
 The report lists, per port (beads first; Jira and GitHub when configured),
