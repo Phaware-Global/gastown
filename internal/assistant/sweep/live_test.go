@@ -130,3 +130,27 @@ func TestLiveJira(t *testing.T) {
 		}
 	}
 }
+
+func TestLiveGitHub(t *testing.T) {
+	in := liveInput(t)
+	port := NewGitHubPort(in.TownRoot, os.Getenv)
+	repos, err := port.repos()
+	if err != nil {
+		t.Fatalf("rig repos: %v", err)
+	}
+	logins, extra, err := port.persona()
+	if err != nil {
+		t.Fatalf("persona: %v", err)
+	}
+	slugs := make([]string, 0, len(repos))
+	for _, r := range repos {
+		slugs = append(slugs, r.slug())
+	}
+	t.Logf("github: persona=%s rigs=%s extra=%s", strings.Join(logins, ","), strings.Join(slugs, ","), strings.Join(append(extra, in.Settings.GitHubSweep().ExtraRepos...), ","))
+	findings := liveSweep(t, port, in)
+	for _, f := range findings {
+		if !strings.HasPrefix(f.URL, "https://") {
+			t.Errorf("%s/%s: URL %q is not a browse URL", f.Kind, f.Key, f.URL)
+		}
+	}
+}
