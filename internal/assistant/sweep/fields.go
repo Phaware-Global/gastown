@@ -45,23 +45,6 @@ var (
 
 const maxSuggestLen, maxURLLen = 200, 512
 
-// suggestVocabulary is the closed word list a Suggest line may use besides
-// the finding's own Key and its allowlisted Fields values. A port that
-// needs a new word adds it here; provider text can never reach this line.
-var suggestVocabulary = set(strings.Fields(`
-a an and the to on onto for from with before after or why it its this
-reply chase answer respond ask note status update decide reassign sling
-onward close reason review re-request request re-ping re-approval
-re-run rebase merge push fix tag release wave escalate ack convoy
-blocker blocked hand off finish starting more waits add humans bots
-list board move human reviewer approval approve ci check checks
-draft stale open pull pr issue bead rig run start loop internal
-config setting gt bd jira github assistant sweep
-jira-move-to-board assistant.sweep.jira.humans assistant.sweep.jira.bots
-assistant.sweep.github.humans`))
-
-var tokenTrim = "`()[]{}.,:;\"'"
-
 var spaceRe = regexp.MustCompile(`\s`)
 
 // ValidShape reports whether v matches shape (and its length cap).
@@ -100,7 +83,7 @@ func ValidShape(shape Shape, v string) bool {
 // with an existing External entry lands under "<key>.field", and a value
 // with an unprintable key name lands under "x<n>" with the name folded into
 // the fenced text.
-func enforceSchema(schema map[string]Shape, f *Finding) {
+func enforceSchema(schema map[string]Shape, templates []string, f *Finding) {
 	for k, v := range f.Fields {
 		if !nameRe.MatchString(k) {
 			delete(f.Fields, k)
@@ -132,7 +115,7 @@ func enforceSchema(schema map[string]Shape, f *Finding) {
 		f.addExternal("url", f.URL)
 		f.URL = ""
 	}
-	if f.Suggest != "" && !allowedSuggest(f) {
+	if f.Suggest != "" && !allowedSuggest(templates, f) {
 		f.addExternal("suggest", f.Suggest)
 		f.Suggest = ""
 	}
@@ -146,30 +129,38 @@ func enforceSchema(schema map[string]Shape, f *Finding) {
 	}
 }
 
-// allowedSuggest: single printable line whose every word is in the
-// vocabulary, is the finding's Key, or is one of its (already validated)
-// Fields values. Surrounding punctuation and backticks are ignored.
-func allowedSuggest(f *Finding) bool {
+// allowedSuggest reports whether Suggest equals one of the port's templates
+// with {key} replaced by the finding's Key and every other {name} by that
+// validated Fields value. Templates are port-authored constants, so the
+// only bytes a provider can influence are the Key and allowlisted Fields.
+func allowedSuggest(templates []string, f *Finding) bool {
 	if !printable(f.Suggest, maxSuggestLen) {
 		return false
 	}
-	for _, tok := range strings.Fields(f.Suggest) {
-		tok = strings.Trim(tok, tokenTrim)
-		if tok == "" || tok == f.Key || suggestVocabulary[tok] {
-			continue
-		}
-		known := false
-		for _, v := range f.Fields {
-			if tok == v {
-				known = true
-				break
-			}
-		}
-		if !known {
-			return false
+	for _, tpl := range templates {
+		if expanded, ok := expandTemplate(tpl, f); ok && expanded == f.Suggest {
+			return true
 		}
 	}
-	return true
+	return false
+}
+
+var placeholderRe = regexp.MustCompile(`\{([a-z0-9_]+)\}`)
+
+func expandTemplate(tpl string, f *Finding) (string, bool) {
+	ok := true
+	out := placeholderRe.ReplaceAllStringFunc(tpl, func(m string) string {
+		name := m[1 : len(m)-1]
+		if name == "key" {
+			return f.Key
+		}
+		if v, declared := f.Fields[name]; declared {
+			return v
+		}
+		ok = false
+		return m
+	})
+	return out, ok
 }
 
 func set(items []string) map[string]bool {

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/lock"
 )
 
 // Entry is the acknowledged state of one finding.
@@ -95,38 +97,25 @@ func (s *Store) writeJSON(path string, v any) error {
 	return os.Rename(tmp.Name(), path)
 }
 
-// lock serializes Ack across processes with an exclusive-create lock file;
-// a lock older than lockStale is treated as abandoned.
-const lockStale = time.Minute
-
+// lock serializes Ack across processes with an advisory flock, which the
+// OS releases when the holder dies, so no stale-lock handling is needed.
 func (s *Store) lock() (release func(), err error) {
 	if err := os.MkdirAll(s.dir, 0o755); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(s.dir, "sweep-state.lock")
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-		if err == nil {
-			f.Close()
-			return func() { os.Remove(path) }, nil
+	return lock.FlockAcquire(filepath.Join(s.dir, "sweep-state.lock"))
+}
+
+// pendingRetention bounds how long a never-acknowledged pending run is kept.
+const pendingRetention = 7 * 24 * time.Hour
+
+// prunePending removes pending files older than pendingRetention.
+func (s *Store) prunePending(now time.Time) {
+	matches, _ := filepath.Glob(filepath.Join(s.dir, "sweep-pending-*.json"))
+	for _, m := range matches {
+		if fi, err := os.Stat(m); err == nil && now.Sub(fi.ModTime()) > pendingRetention {
+			os.Remove(m)
 		}
-		if !errors.Is(err, os.ErrExist) {
-			return nil, err
-		}
-		if fi, statErr := os.Stat(path); statErr == nil && time.Since(fi.ModTime()) > lockStale {
-			// Claim the stale lock by renaming it: only one waiter can win
-			// the rename, the others see ErrNotExist and retry the create.
-			stale := fmt.Sprintf("%s.stale.%d", path, time.Now().UnixNano())
-			if os.Rename(path, stale) == nil {
-				os.Remove(stale)
-			}
-			continue
-		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("sweep state is locked by another ack (%s)", path)
-		}
-		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -206,5 +195,6 @@ func (s *Store) Ack(runID string, now time.Time) error {
 	if err := s.writeJSON(s.statePath(), st); err != nil {
 		return err
 	}
+	s.prunePending(now)
 	return os.Remove(s.pendingPath(runID))
 }

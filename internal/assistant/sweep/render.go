@@ -75,6 +75,7 @@ func JSON(r *Report) ([]byte, error) {
 		q.New = make([]Finding, len(p.New))
 		for j, f := range p.New {
 			g := f
+			g.Fingerprint = FenceJSON(f.Fingerprint) // port-computed from provider data
 			if len(f.External) > 0 {
 				g.External = make(map[string]string, len(f.External))
 				for k, v := range f.External {

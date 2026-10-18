@@ -37,6 +37,12 @@ type Port interface {
 	// A value that fails its shape, or a key not declared here, is moved to
 	// External by the runner.
 	Schema() map[string]Shape
+	// Suggestions declares the port's Suggest templates, e.g.
+	// "gt sling {key} {rig}". A finding's Suggest is printed only when it
+	// equals one of them with {key} replaced by the finding's Key and every
+	// other placeholder by that validated Fields value; anything else is
+	// fenced. Provider text therefore never reaches the Suggest line.
+	Suggestions() []string
 	// Sweep returns the port's findings. Key must be unique per Kind within
 	// one run (the runner merges duplicates so they cannot defeat the ack
 	// gate, but their fingerprints then move together). A partial result

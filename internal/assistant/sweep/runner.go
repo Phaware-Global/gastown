@@ -75,13 +75,13 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Report, error) {
 			rep.Ports = append(rep.Ports, res)
 			continue
 		}
-		schema := port.Schema()
+		schema, templates := port.Schema(), port.Suggestions()
 		standing := map[string]*Standing{}
 		pend.Seen[name] = []string{} // the port ran, even if it found nothing
 		for i := range findings {
 			f := &findings[i]
 			f.Port = name
-			enforceSchema(schema, f)
+			enforceSchema(schema, templates, f)
 		}
 		findings = mergeDuplicates(findings)
 		for i := range findings {
