@@ -229,8 +229,9 @@ last *acknowledged* run. Compose the mail from the report:
 
 1. New findings in full, standing findings as counts, in report order. The
    report shows at most 25 new findings per kind and counts the rest on an
-   "… and N more" line — carry that count, it is part of what you are
-   acknowledging.
+   "… and N more" line — carry that count. The ack covers only the items
+   listed in full; counted items come back in full on later runs as the
+   listed ones clear.
 2. A port that errored is reported as **"not checked: <reason>"** — never as
    all clear. Only ports that are configured run at all (beads always; Jira
    and GitHub once `assistant.sweep` names them), so a clean report proves

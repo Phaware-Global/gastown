@@ -127,7 +127,10 @@ inline `[telegraph.prompts]` table or `settings/telegraph.prompts.toml` (the
 file wins on a collision), compared after `{token}` substitution and
 whitespace flattening. Rebuild the substitution from the relayed
 `Telegraph-*` header values with the same delimiter redaction the transform
-applies, never from raw header text. A section that was cut at the prompt
+applies, never from raw header text; an omitted `Telegraph-URL` or
+`Telegraph-Labels` header and a zero `Telegraph-Timestamp`
+(`0001-01-01T00:00:00Z`) substitute as the empty string, as the transform
+did. A section that was cut at the prompt
 cap (it ends in `[… prompt truncated]`) **never matches** — a webhook-sized
 `{labels}` or `{actor}` can push a restrictive clause past the cap — so read
 the full template from your own configuration instead. A section that does
