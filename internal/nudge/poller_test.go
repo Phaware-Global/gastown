@@ -129,7 +129,7 @@ func TestPollerAlive_LiveProcess(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("command-line inspection is unix-only")
 	}
-	child := exec.Command("sh", "-c", "sleep 30", "nudge-poller", session)
+	child := exec.Command("sh", "-c", "sleep 30; exit 0", "nudge-poller", session) // "; exit 0" keeps sh from exec'ing sleep, so the argv survives
 	if err := child.Start(); err != nil {
 		t.Fatalf("starting child: %v", err)
 	}
