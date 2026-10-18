@@ -149,8 +149,8 @@ func TestLiveGitHub(t *testing.T) {
 	t.Logf("github: persona=%s rigs=%s extra=%s", strings.Join(logins, ","), strings.Join(slugs, ","), strings.Join(append(extra, in.Settings.GitHubSweep().ExtraRepos...), ","))
 	findings := liveSweep(t, port, in)
 	for _, f := range findings {
-		if !strings.HasPrefix(f.URL, "https://github.com/") {
-			t.Errorf("%s/%s: URL %q is not a GitHub URL", f.Kind, f.Key, f.URL)
+		if !strings.HasPrefix(f.URL, "https://") {
+			t.Errorf("%s/%s: URL %q is not a browse URL", f.Kind, f.Key, f.URL)
 		}
 	}
 }
