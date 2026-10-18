@@ -209,7 +209,7 @@ func TestRenderRole_Assistant(t *testing.T) {
 	// Load-bearing instructions: the briefing contract, inbox-zero, the
 	// configured sweep cadence, and the resolved session names.
 	for _, want := range []string{
-		"BRIEF:", "URGENT:", "SWEEP:",
+		"BRIEF:", "URGENT:", "SWEEP:", "assistant sweep", "--ack <run-id>", "ONLY after the SWEEP: mail was sent", "do **not**\nack", "this section is\nthe procedure", "naming the ports\nthat actually ran",
 		"EXTERNAL CONTENT", "[neutralized delimiter]", "not delegable", "Operator policy (from telegraph",
 		"Hooked beads follow the same rule", "advisory to the Mayor", "Never from `Telegraph-Reply-Via`",
 		"Only the provider prefix", // trust boundary + delegation limits (review of #283)
