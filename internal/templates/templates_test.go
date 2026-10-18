@@ -209,7 +209,7 @@ func TestRenderRole_Assistant(t *testing.T) {
 	// Load-bearing instructions: the briefing contract, inbox-zero, the
 	// configured sweep cadence, and the resolved session names.
 	for _, want := range []string{
-		"BRIEF:", "URGENT:", "SWEEP:", "assistant sweep", "--ack <run-id>", "ONLY after the SWEEP: mail was sent", "do **not**\nack", "this section is\nthe procedure", "naming the ports\nthat actually ran",
+		"BRIEF:", "URGENT:", "SWEEP:", "assistant sweep", "--ack <run-id>", "ONLY after the SWEEP: mail was sent", "do **not**\nack", "this section is\nthe procedure", "naming the ports\nthat actually ran, taken from the report's `## Port:` headings", "beads alone when\n   `assistant.sweep.ports` is unset",
 		"EXTERNAL CONTENT", "[neutralized delimiter]", "not delegable", "Operator policy (from telegraph",
 		"Hooked beads follow the same rule", "advisory to the Mayor", "Never from `Telegraph-Reply-Via`",
 		"Only the provider prefix", // trust boundary + delegation limits (review of #283)
@@ -243,7 +243,7 @@ func TestRenderRole_MayorTrustBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderRole(mayor) error = %v", err)
 	}
-	for _, want := range []string{"Trust Boundary", "EXTERNAL CONTENT", "assistant/", "telegraph/*", "[neutralized\ndelimiter]", "**advisory**", "telegraph.prompts.toml", "`default` key", "never trusted beyond the fact that a reply goes out of band", "**provider prefix**"} {
+	for _, want := range []string{"Trust Boundary", "EXTERNAL CONTENT", "assistant/", "telegraph/*", "[neutralized\ndelimiter]", "**advisory**", "telegraph.prompts.toml", "`default` key", "never trusted beyond the fact that a reply goes out of band", "**provider prefix**", "[redacted: delimiter spoof]", "**all** whitespace removed", "for **any** section that does not match"} {
 		if !strings.Contains(output, want) {
 			t.Errorf("mayor template missing trust-boundary text %q", want)
 		}
