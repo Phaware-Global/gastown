@@ -129,6 +129,7 @@ type ghFixture struct {
 	issues      []map[string]any            // Jira issues returned for `key in (...)`
 	jiraErr     bool                        // Jira search fails
 	jiraBadKey  string                      // a `key in (...)` batch naming this key answers 400
+	jiraRateKey string                      // a per-key `key = X` lookup for this key answers 429
 }
 
 func (fx *ghFixture) handler(t *testing.T) http.Handler {
@@ -144,6 +145,10 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 				return
 			}
 			jql := r.URL.Query().Get("jql")
+			if fx.jiraRateKey != "" && strings.HasPrefix(jql, "key = "+fx.jiraRateKey) {
+				http.Error(w, `{"message":"rate limited"}`, 429)
+				return
+			}
 			if fx.jiraBadKey != "" && strings.Contains(jql, fx.jiraBadKey) {
 				http.Error(w, `{"errorMessages":["An issue with key '`+fx.jiraBadKey+`' does not exist for field 'key'."]}`, 400)
 				return
@@ -1023,13 +1028,15 @@ func TestGitHubPort_LinkedKindsRound1Fixes(t *testing.T) {
 	withJira(p, in, p.apiBase)
 	in.Settings.Assistant.Sweep.Jira.Reviewers = map[string]string{"KEVIN": humanID} // mis-cased config key
 	findings, err := p.Sweep(context.Background(), in)
-	var partial *PartialError
-	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "do not exist or are not visible") {
-		t.Fatalf("the bogus key must be noted as not-found, not fatal: %v", err)
+	if err != nil {
+		t.Fatalf("a bogus key is reported per PR, never as a partial port: %v", err)
 	}
 	got := map[string]Finding{}
 	for _, f := range findings {
 		got[f.Kind+"/"+f.Key] = f
+	}
+	if f, ok := got["linked-key-missing/acme/app#94"]; !ok || !strings.Contains(f.External["keys"], "P23-99999999") {
+		t.Errorf("the bogus key must surface as an info finding on its PR: %v", keysOf(got))
 	}
 	if _, ok := got["review-handoff/P23-90"]; ok {
 		t.Error("a stranger's PR must never yield a review-handoff")
@@ -1064,12 +1071,8 @@ func TestGitHubPort_LinkedKindsRound2Fixes(t *testing.T) {
 	p, in := newGitHubTest(t, fx, []string{"artie"})
 	withJira(p, in, p.apiBase)
 	findings, err := p.Sweep(context.Background(), in)
-	var partial *PartialError
-	if !errors.As(err, &partial) {
-		t.Fatalf("expected a partial result (bogus key, tag cap), got %v", err)
-	}
-	if strings.Contains(partial.Reason, "could not be looked up") || !strings.Contains(partial.Reason, "do not exist or are not visible") {
-		t.Errorf("a per-key 400 is not-found, never an outage: %s", partial.Reason)
+	if err != nil {
+		t.Fatalf("a bogus key and a tag-cap miss are per-PR info, never a partial port: %v", err)
 	}
 	got := map[string]bool{}
 	for _, f := range findings {
@@ -1078,10 +1081,21 @@ func TestGitHubPort_LinkedKindsRound2Fixes(t *testing.T) {
 	if !got["review-handoff/P23-91"] {
 		t.Errorf("a bogus key in repo A must not blind repo B's linked kinds: %v", got)
 	}
-	if got["release-unclosed/acme/app#40"] {
-		t.Error("running out of the tag cap with candidates left is unknown, never untagged")
+	if got["release-unclosed/acme/app#40"] || !got["release-unchecked/acme/app#40"] {
+		t.Errorf("running out of the tag cap with candidates left is unknown (release-unchecked), never untagged: %v", got)
 	}
-	if !strings.Contains(partial.Reason, "candidate tags; release tag not checked") {
-		t.Errorf("cap exhaustion must be noted: %s", partial.Reason)
+	if !got["linked-key-missing/acme/app#95"] {
+		t.Errorf("the bogus key must surface on its own PR: %v", got)
+	}
+	// A per-key 429 is an outage, not a missing key: noted as such, and since
+	// it is the only lookup, the linked kinds stop for the sweep.
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appB, "acme/extra": {}}, jiraBadKey: "P23-91", jiraRateKey: "P23-91",
+		issues: []map[string]any{issue("P23-91", "In Progress", "indeterminate", personaID, 100*h, 1*h, "needs handoff")}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	_, err = p.Sweep(context.Background(), in)
+	var partial *PartialError
+	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "could not be looked up") || strings.Contains(partial.Reason, "do not exist") {
+		t.Errorf("a 429 must be an outage, not a missing key: %v", err)
 	}
 }

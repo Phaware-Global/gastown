@@ -186,6 +186,8 @@ func (p *GitHubPort) Suggestions() []string {
 		"move {key} to the review status and assign it to {human}",
 		"move {key} back to in progress and assign it to the persona",
 		"move {key} to the uat status",
+		"check the release tag for {key}",
+		"fix the issue key named by {key}",
 	}
 }
 

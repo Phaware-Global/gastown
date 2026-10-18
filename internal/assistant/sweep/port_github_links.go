@@ -35,6 +35,15 @@ func (c *ghClient) contains(ref repoRef, base, head string) (bool, error) {
 	return res.Status == "ahead" || res.Status == "identical", nil
 }
 
+// repoSlugOf derives "owner/repo" from a PR's URL.
+func repoSlugOf(pr *ghPR) string {
+	parts := strings.Split(strings.TrimPrefix(pr.URL, "https://github.com/"), "/")
+	if len(parts) >= 2 {
+		return parts[0] + "/" + parts[1]
+	}
+	return "unknown"
+}
+
 func matchAny(patterns []string, name string) bool {
 	for _, p := range patterns {
 		if ok, _ := path.Match(p, name); ok {
@@ -82,8 +91,13 @@ func (p *GitHubPort) checkReleases(c *ghClient, ref repoRef, data *ghRepoData, p
 			}
 			if checked == githubTagsChecked {
 				// Candidates left uncompared (tags on other lines used the
-				// cap): unknown, which is never reported as untagged.
-				note("%s: more than %d candidate tags; release tag not checked", key, githubTagsChecked)
+				// cap): unknown for this PR only — an info finding, never
+				// "untagged" and never a port-wide partial.
+				out = append(out, Finding{Kind: "release-unchecked", Key: key, URL: pr.URL, Severity: SeverityInfo, Since: pr.MergedAt,
+					Fields:      map[string]string{"merge_commit": pr.MergeCommit.Oid},
+					External:    map[string]string{"title": pr.Title, "base": pr.BaseRefName},
+					Suggest:     "check the release tag for " + key,
+					Fingerprint: pr.MergeCommit.Oid})
 				tagged = true
 				break
 			}
@@ -127,6 +141,7 @@ type ghLinks struct {
 	uatAfter                        time.Duration
 	note                            func(string, ...any)
 	cache                           map[string]*jiraIssue
+	notFound                        map[string]bool // keys Jira rejected as unknown or hidden
 	failed                          bool
 }
 
@@ -146,7 +161,7 @@ func (p *GitHubPort) newLinks(ctx context.Context, in Input, note func(string, .
 	}
 	l := &ghLinks{client: client, keyRe: regexp.MustCompile(`\b(?:` + strings.Join(projects, "|") + `)-\d+\b`),
 		reviewers: lowerKeys(cfg.Reviewers), inReview: cfg.InReviewStatus, inProgress: cfg.InProgressStatus, done: cfg.DoneStatus, uat: cfg.UATStatus,
-		uatAfter: parseDur(cfg.UATSweepAfter, 24*time.Hour), note: note, cache: map[string]*jiraIssue{}}
+		uatAfter: parseDur(cfg.UATSweepAfter, 24*time.Hour), note: note, cache: map[string]*jiraIssue{}, notFound: map[string]bool{}}
 	for field, def := range map[*string]string{&l.inReview: "In Review", &l.inProgress: "In Progress", &l.done: "Done", &l.uat: "In UAT"} {
 		if *field == "" {
 			*field = def
@@ -212,7 +227,8 @@ func (l *ghLinks) load(keys []string) {
 	// One bad key (a typo or an attacker-chosen key in a PR title) fails
 	// the batch with a 400: look the keys up one by one so it only drops
 	// its own PR, and give up only if every lookup fails.
-	notFound, outages := 0, 0
+	outages := 0
+	var lastErr error
 	for _, k := range missing {
 		if !timeLeft(l.client.ctx) {
 			l.note("time budget exhausted while looking up linked Jira issues")
@@ -221,34 +237,33 @@ func (l *ghLinks) load(keys []string) {
 		}
 		one, err := l.client.searchFirst(fmt.Sprintf(`key = %s`, k))
 		switch {
-		case err != nil && isClientError(err):
-			notFound++ // Jira rejects an unknown or hidden key with a 400: that key alone
+		case err != nil && isNotFound(err):
+			l.notFound[k] = true // reported per PR as an info finding, never as partial
 		case err != nil:
 			outages++
+			lastErr = err
 		case len(one) > 0:
 			l.cache[one[0].Key] = &one[0]
 		}
 	}
-	if notFound > 0 {
-		l.note("%d of %d linked Jira keys do not exist or are not visible (ignored)", notFound, len(missing))
-	}
 	if outages > 0 {
-		l.note("%d of %d linked Jira keys could not be looked up: %v", outages, len(missing), err)
+		l.note("%d of %d linked Jira keys could not be looked up: %v", outages, len(missing), lastErr)
 	}
-	// Only a Jira outage (every lookup a transport or server error) disables
-	// the linked kinds for the rest of the sweep.
+	// Only a Jira outage (every lookup a transport, auth, rate-limit or
+	// server error) disables the linked kinds for the rest of the sweep.
 	if outages > 0 && outages == len(missing) {
 		l.failed = true
 	}
 }
 
-// isClientError reports a Jira 4xx answer (the client's own error text is
-// "GET <path>: HTTP <code>: <body>").
-func isClientError(err error) bool {
-	return err != nil && clientErrRe.MatchString(err.Error())
+// isNotFound reports Jira's answer for an unknown or hidden key: a 400 (JQL
+// validation) or 404 at the status position of the client's error text
+// "GET <path>: HTTP <code>: <body>". 401, 403, 429 and 5xx are outages.
+func isNotFound(err error) bool {
+	return err != nil && notFoundRe.MatchString(err.Error())
 }
 
-var clientErrRe = regexp.MustCompile(`: HTTP 4\d\d\b`)
+var notFoundRe = regexp.MustCompile(`^GET \S+: HTTP (400|404):`)
 
 func (l *ghLinks) check(open []ghPR, merged []ghPR, patterns []string, now time.Time, d githubDurations, isPersona, isHuman map[string]bool) []Finding {
 	if l == nil {
@@ -279,6 +294,31 @@ func (l *ghLinks) check(open []ghPR, merged []ghPR, patterns []string, now time.
 		return Finding{Kind: kind, Key: key, URL: l.client.origin + "/browse/" + key, Severity: SeverityActionable, Since: pr.CreatedAt,
 			Fields:   map[string]string{"pr": fmt.Sprint(pr.Number), "status_category": is.Fields.Status.Category.Key},
 			External: map[string]string{"summary": is.Fields.Summary, "status": is.Fields.Status.Name, "pr_title": pr.Title}}
+	}
+	missingKeys := func(pr *ghPR) Finding {
+		var keys []string
+		for _, k := range l.keys(pr) {
+			if l.notFound[k] {
+				keys = append(keys, k)
+			}
+		}
+		if len(keys) == 0 {
+			return Finding{}
+		}
+		key := fmt.Sprintf("%s#%d", repoSlugOf(pr), pr.Number)
+		return Finding{Kind: "linked-key-missing", Key: key, URL: pr.URL, Severity: SeverityInfo, Since: pr.CreatedAt,
+			External:    map[string]string{"keys": strings.Join(keys, ", "), "pr_title": pr.Title},
+			Suggest:     "fix the issue key named by " + key,
+			Fingerprint: strings.Join(keys, ",")}
+	}
+	for _, prs := range [][]ghPR{open, merged} {
+		for i := range prs {
+			if pr := &prs[i]; ours(pr) {
+				if f := missingKeys(pr); f.Kind != "" {
+					out = append(out, f)
+				}
+			}
+		}
 	}
 	for i := range open {
 		pr := &open[i]
