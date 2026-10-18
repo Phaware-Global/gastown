@@ -125,6 +125,12 @@ type TownSettings struct {
 	// Example: ["doctor_dog", "compactor_dog"]
 	DisabledPatrols []string `json:"disabled_patrols,omitempty"`
 
+	// AssistantSweepIntervalRaw is the cooldown between Mayor's Assistant
+	// loose-ends sweeps, as a Go duration string (e.g. "30m", "2h").
+	// Default "1h". Read through AssistantSweepInterval(), which applies the
+	// default and rejects unparseable values.
+	AssistantSweepIntervalRaw string `json:"assistant_sweep_interval,omitempty"`
+
 	// CodeGraph configures automatic codegraph indexing of new worktrees.
 	// A rig-level CodeGraph setting overrides this town-level setting.
 	// Default: enabled (nil = inherit default true).

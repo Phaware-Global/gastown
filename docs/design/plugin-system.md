@@ -180,6 +180,7 @@ version = 1               # Schema version (for future evolution)
 type = "cooldown|cron|condition|event|manual"
 # Type-specific fields:
 duration = "1h"           # For cooldown
+duration_setting = "assistant_sweep_interval"  # Optional: town setting overriding duration
 schedule = "0 9 * * *"    # For cron
 check = "gt stale -q"     # For condition (exit 0 = run)
 on = "startup"            # For event
@@ -198,7 +199,7 @@ severity = "low"          # Escalation severity if failed
 
 | Type | Config | Behavior |
 |------|--------|----------|
-| `cooldown` | `duration = "1h"` | Query wisps, run if none in window |
+| `cooldown` | `duration = "1h"` | Query wisps, run if none in window. `duration_setting = "<town setting>"` makes a valid value in `settings/config.json` the source of the window (recognised: `assistant_sweep_interval`, floor 5m); when the setting is absent, invalid, or settings fail to load, `duration` applies, then the 1h default. |
 | `cron` | `schedule = "0 9 * * *"` | Run on cron schedule |
 | `condition` | `check = "cmd"` | Run check command, run if exit 0 |
 | `event` | `on = "startup"` | Run on Deacon startup |
