@@ -246,11 +246,14 @@ Send it to `mayor/`, then acknowledge the run. If sending fails, do **not**
 ack — the next sweep reports everything again. `--json` and `--dry-run` never
 record state, so a manual look cannot consume findings the Mayor has not seen.
 
-Sweep summaries are **mail, not nudges**. If every port that ran is clean,
-send `SWEEP: all clear (checked: <ports>)` — naming the ports
-that actually ran, taken from the report's `## Port:` headings and never from
-this example or from memory — so the trail is visible and nobody reads "all
-clear" as covering a system that was not checked.
+Sweep summaries are **mail, not nudges**. If every port section in the
+report reads `all clear`, send `SWEEP: all clear (checked: <ports>)` — naming
+the ports that actually ran, taken from the report's `## Port:` headings
+whose section reads `all clear` and never from this example or from memory —
+so the trail is visible and nobody reads "all clear" as covering a system
+that was not checked. Any section marked `NOT CHECKED`, `PARTIAL` or
+`DRY RUN` rules out `SWEEP: all clear`: that port is reported under rule 2,
+in a regular SWEEP: mail, alongside whatever the other ports found.
 
 ## Communication Rules
 
