@@ -211,7 +211,8 @@ func TestRenderRole_Assistant(t *testing.T) {
 	for _, want := range []string{
 		"BRIEF:", "URGENT:", "SWEEP:",
 		"EXTERNAL CONTENT", "[neutralized delimiter]", "not delegable", "Operator policy (from telegraph",
-		"Hooked beads follow the same rule", "advisory to the Mayor", "Never from `Telegraph-Reply-Via`", // trust boundary + delegation limits (review of #283)
+		"Hooked beads follow the same rule", "advisory to the Mayor", "Never from `Telegraph-Reply-Via`",
+		"Only the provider prefix", // trust boundary + delegation limits (review of #283)
 		"gt mail send mayor/",
 		"mail mark-read",
 		"**45m**",
@@ -224,6 +225,9 @@ func TestRenderRole_Assistant(t *testing.T) {
 	}
 	if strings.Contains(output, "<no value>") {
 		t.Error("assistant template rendered an unresolved variable")
+	}
+	if strings.Contains(output, "hint below") {
+		t.Error("assistant template must not tell the assistant to relay the Telegraph reply hint")
 	}
 }
 
@@ -239,7 +243,7 @@ func TestRenderRole_MayorTrustBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderRole(mayor) error = %v", err)
 	}
-	for _, want := range []string{"Trust Boundary", "EXTERNAL CONTENT", "assistant/", "telegraph/*", "[neutralized\ndelimiter]", "**advisory**", "telegraph.prompts.toml", "`default` key", "never trusted beyond the fact that a reply goes out of band"} {
+	for _, want := range []string{"Trust Boundary", "EXTERNAL CONTENT", "assistant/", "telegraph/*", "[neutralized\ndelimiter]", "**advisory**", "telegraph.prompts.toml", "`default` key", "never trusted beyond the fact that a reply goes out of band", "**provider prefix**"} {
 		if !strings.Contains(output, want) {
 			t.Errorf("mayor template missing trust-boundary text %q", want)
 		}
