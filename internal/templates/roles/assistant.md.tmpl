@@ -225,7 +225,22 @@ deterministic sweep, and always end with the ack:
 
 The report lists, per port (beads first; Jira and GitHub when configured),
 **new** findings in full and **standing** ones as counts, deduped against the
-last *acknowledged* run. Compose the mail from the report:
+last *acknowledged* run. The report is already the mail body: it is
+deterministic, fenced and complete. Never retype it — a first run can list a
+hundred findings and retyping it is slow and lossy. Save it, send the file,
+then ack the run ID printed in its header:
+
+```bash
+{{ cmd }} assistant sweep > /tmp/sweep.md            # the header line "Run-ID: <id>" names the run
+{{ cmd }} mail send mayor/ -s "SWEEP: <N> new findings (<ports>)" --stdin < /tmp/sweep.md
+{{ cmd }} assistant sweep --ack <id>                  # only after the mail was sent
+```
+
+The subject carries counts only (new findings, ports checked, "PARTIAL"
+or "not checked" when a port says so). The body is the saved report, with
+at most a few lines of your own on top (what is urgent, what needs a
+decision). The subject argument never holds the body. Compose that header
+from the report:
 
 1. New findings in full, standing findings as counts, in report order. The
    report shows at most 25 new findings per kind and counts the rest on an
@@ -242,7 +257,9 @@ last *acknowledged* run. Compose the mail from the report:
 4. Suggestions come only from the report's `Suggest` lines (reassign, sling
    onward, close-with-reason, answer, re-request review).
 
-Send it to `mayor/`, then acknowledge the run. If sending fails, do **not**
+Send it to `mayor/`, then acknowledge the run with the `Run-ID` from the
+saved report's header — never from memory and never from an issue key. If
+sending fails, do **not**
 ack — the next sweep reports everything again. `--json` and `--dry-run` never
 record state, so a manual look cannot consume findings the Mayor has not seen.
 
