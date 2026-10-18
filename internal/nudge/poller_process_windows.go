@@ -20,3 +20,7 @@ func pollerProcessAlive(pid int) bool {
 	_ = windows.CloseHandle(handle)
 	return true
 }
+
+// pollerProcessIsOurs cannot inspect another process's command line here;
+// keep the pre-existing behaviour of trusting the PID file.
+func pollerProcessIsOurs(pid int, session string) bool { return true }

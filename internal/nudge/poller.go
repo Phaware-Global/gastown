@@ -121,6 +121,12 @@ func StopPoller(townRoot, session string) error {
 		_ = os.Remove(pidPath)
 		return nil
 	}
+	if !pollerProcessIsOurs(pid, session) {
+		// The poller exited without cleaning up and the PID was reused by
+		// an unrelated process (a Dolt server, say): never signal it.
+		_ = os.Remove(pidPath)
+		return nil
+	}
 
 	proc, err := os.FindProcess(pid)
 	if err != nil {
@@ -153,13 +159,27 @@ func pollerAlive(townRoot, session string) (int, bool) {
 		return 0, false
 	}
 
-	if !pollerProcessAlive(pid) {
-		// Stale PID file — clean up.
+	if !pollerProcessAlive(pid) || !pollerProcessIsOurs(pid, session) {
+		// Stale PID file (dead, or the PID reused by another process) — clean up.
 		_ = os.Remove(pidPath)
 		return 0, false
 	}
 
 	return pid, true
+}
+
+// RemoveOwnPollerPidFile removes the session's poller PID file when it names
+// the calling process, so a poller cleans up after itself on every exit path
+// without ever deleting a newer poller's file.
+func RemoveOwnPollerPidFile(townRoot, session string) {
+	pidPath := pollerPidFile(townRoot, session)
+	data, err := os.ReadFile(pidPath)
+	if err != nil {
+		return
+	}
+	if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid == os.Getpid() {
+		_ = os.Remove(pidPath)
+	}
 }
 
 // Watcher provides a filesystem-event-driven interface to the nudge queue.
