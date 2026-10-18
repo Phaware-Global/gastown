@@ -134,9 +134,6 @@ type jiraIssue struct {
 		Assignee *jiraUser `json:"assignee"`
 		Reporter *jiraUser `json:"reporter"`
 		Creator  *jiraUser `json:"creator"`
-		Watches  struct {
-			IsWatching bool `json:"isWatching"`
-		} `json:"watches"`
 	} `json:"fields"`
 }
 
@@ -239,7 +236,7 @@ func (c *jiraClient) searchN(jql string, pageSize, maxPages int) ([]jiraIssue, b
 	token := ""
 	for page := 0; page < maxPages; page++ {
 		q := url.Values{"jql": {jql}, "maxResults": {fmt.Sprint(pageSize)},
-			"fields": {"summary,status,assignee,reporter,creator,created,updated,watches"}}
+			"fields": {"summary,status,assignee,reporter,creator,created,updated"}}
 		if token != "" {
 			q.Set("nextPageToken", token)
 		}
@@ -266,9 +263,20 @@ var jiraKeyRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]{1,15}-\d{1,9}$`)
 
 // timeLeft reports whether the port still has budget for another call;
 // when the deadline is near it stops and reports what it has as partial.
-func timeLeft(ctx context.Context) bool {
-	dl, ok := ctx.Deadline()
-	return !ok || time.Until(dl) > 15*time.Second
+func timeLeft(ctx context.Context) bool { return ctx.Err() == nil }
+
+// budgetMargin is how long before the port deadline the Jira calls stop,
+// so an in-flight request is cut with time left to return a partial result.
+var budgetMargin = 15 * time.Second
+
+// withBudget derives the context Jira calls run under: the port deadline
+// minus budgetMargin. In-flight calls are canceled at the margin instead of
+// running into the runner's timeout, which would discard every finding.
+func withBudget(ctx context.Context) (context.Context, context.CancelFunc) {
+	if dl, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(ctx, dl.Add(-budgetMargin))
+	}
+	return context.WithCancel(ctx)
 }
 
 func (c *jiraClient) comments(key string) ([]jiraComment, error) {
@@ -329,6 +337,8 @@ func parseDur(raw string, def time.Duration) time.Duration {
 
 func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	cfg := in.Settings.JiraSweep()
+	ctx, cancel := withBudget(ctx)
+	defer cancel()
 	if cfg.Site == "" || len(cfg.Projects) == 0 {
 		return nil, fmt.Errorf("jira port not configured: set assistant.sweep.jira.site and .projects")
 	}
@@ -385,6 +395,18 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	if !complete {
 		note("involved-issue search truncated after %d pages", jiraMaxPages)
 	}
+	// 1b. Issues any persona account watches: watches.isWatching only
+	//     answers for the token's user, so membership comes from JQL.
+	watched := map[string]bool{}
+	wIssues, wOK, err := c.search(fmt.Sprintf(`project in %s AND statusCategory != Done AND watcher in %s`, projects, people))
+	if err != nil {
+		note("watcher search failed (watched issues get mention checks only): %v", err)
+	} else if !wOK {
+		note("watcher search truncated after %d pages", jiraMaxPages)
+	}
+	for _, i := range wIssues {
+		watched[i.Key] = true
+	}
 	// 2. Issues whose status changed recently (a transition counts as a
 	//    status update even without a comment).
 	transitioned := map[string]bool{}
@@ -438,11 +460,20 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		// Only issues the persona is involved in get the full set of checks;
 		// the rest came in through the recently-updated clause and are
 		// scanned for @-mentions of the persona only.
-		involved := assignedToPersona || f.Watches.IsWatching ||
+		involved := assignedToPersona || watched[is.Key] ||
 			(f.Reporter != nil && isPersona[f.Reporter.AccountID]) || (f.Creator != nil && isPersona[f.Creator.AccountID])
 		status := f.Status.Name
 		if assignedToPersona && contains(wipStatuses, status) {
 			wip++
+		}
+		if !jiraKeyRe.MatchString(is.Key) {
+			// Never send a malformed key down the REST path; report it as a
+			// config/data oddity instead (the raw key is fenced by jiraBase).
+			fd := jiraBase(is, browse)("malformed-key", SeverityInfo)
+			fd.Since = time.Time(f.Updated)
+			fd.Fingerprint = "malformed"
+			out = append(out, fd)
+			continue
 		}
 		comments, err := c.comments(is.Key)
 		if err != nil {
