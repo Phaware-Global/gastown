@@ -63,13 +63,14 @@ delivery failed" -s LOW` and record a `result:failure` wisp instead.
 
 ## What the trigger asks the assistant to do
 
-The mail body asks the Mayor's Assistant to sweep open work in beads and the
-Telegraph trail, then mail the Mayor one `SWEEP:` summary covering:
-
-1. **Stalled decisions** — beads or threads waiting on the Mayor.
-2. **Blocked external actors** — PRs stuck on human review, unanswered Jira
-   mentions, review requests older than a day.
-3. **Stalled beads** — open work without recent progress.
-4. **Unslung work** — beads ready to dispatch but not yet on a hook.
+The mail is a wake-up, not a procedure: it tells the Mayor's Assistant to
+run `gt assistant sweep` (the deterministic port runner — beads by default,
+Jira and GitHub when `assistant.sweep` names them), compose one `SWEEP:`
+mail for the Mayor from the report (new findings in full, standing ones as
+counts, ports that failed as "not checked", external text only inside the
+report's fenced blocks, suggestions only from the report's Suggest lines),
+send it, and then `gt assistant sweep --ack <run-id>` so the next sweep
+dedupes against what the Mayor was told. If the command fails the assistant
+mails "SWEEP: not checked" and stops; it never sweeps by hand.
 
 The assistant reports and suggests; the Mayor decides. This dog does neither.
