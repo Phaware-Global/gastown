@@ -426,12 +426,14 @@ report lists new findings in full and standing ones as counts with the
 oldest age, so the `SWEEP:` mail is short and the Mayor is never re-briefed
 on an unchanged item. New findings are capped at 25 per kind (worst
 severity first, then oldest; urgent findings are never capped); the rest
-appear as one "… and N more" count. Only the findings the report listed in
-full enter the pending run, so an ack never consumes an item the Mayor did
-not see by key: counted items stay new and are promoted into the full list
-as listed items clear, and reminders (the GitHub re-ping) count only for
-listed items. The cap is a report limit, not truncation — it never affects
-eviction.
+appear as one "… and N more" count. Standing findings and the new findings
+listed in full enter the pending run and are upserted at the ack; counted
+items are not, so an ack never consumes an item the Mayor did not see by
+key: they stay new and are promoted into the full list as listed items
+clear, and reminders (the GitHub re-ping) count only for listed items. The
+cap is a report limit, not truncation: eviction considers every finding the
+port returned, counted ones included, so a counted item whose fingerprint
+changed keeps its earlier acknowledged entry.
 
 State advances only when the Mayor has actually been told. `gt assistant
 sweep` writes the run's fingerprints to a *pending* file keyed by a run ID
