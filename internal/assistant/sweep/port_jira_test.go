@@ -58,18 +58,21 @@ func comment(id, author string, ago time.Duration, text string, mention string) 
 
 // recorded responses for one sweep
 type jiraFixture struct {
-	calls     atomic.Int32
-	issues    []map[string]any
-	comments  map[string][]map[string]any
-	failKey   string
-	offBoard  []string // keys the board's render data leaves out
-	boardFail bool     // the board render data answers 500
-	waves     []map[string]any
-	waveChild map[string][]map[string]any
-	changed   []map[string]any
-	watched   []map[string]any // returned for the watcher-only query
-	slowKey   string           // comments for this key take slowFor
-	slowFor   time.Duration
+	calls         atomic.Int32
+	issues        []map[string]any
+	comments      map[string][]map[string]any
+	failKey       string
+	offBoard      []string // keys the board's render data leaves out
+	boardFail     bool     // the board render data answers 500
+	boardEmpty    bool     // the board render data lists no issues
+	boardNoIssues bool     // the board render data has no issues list at all
+	boardProjects []string // projects the board covers (default P23)
+	waves         []map[string]any
+	waveChild     map[string][]map[string]any
+	changed       []map[string]any
+	watched       []map[string]any // returned for the watcher-only query
+	slowKey       string           // comments for this key take slowFor
+	slowFor       time.Duration
 }
 
 func (fx *jiraFixture) handler(t *testing.T) http.Handler {
@@ -120,6 +123,14 @@ func (fx *jiraFixture) handler(t *testing.T) http.Handler {
 				http.Error(w, "board unavailable", 500)
 				return
 			}
+			if fx.boardNoIssues {
+				write(map[string]any{"issuesData": map[string]any{}})
+				return
+			}
+			if fx.boardEmpty {
+				write(map[string]any{"issuesData": map[string]any{"issues": []any{}}})
+				return
+			}
 			// Every fixture issue is on the board except the listed ones.
 			off := map[string]bool{}
 			for _, k := range fx.offBoard {
@@ -134,6 +145,16 @@ func (fx *jiraFixture) handler(t *testing.T) http.Handler {
 				}
 			}
 			write(map[string]any{"issuesData": map[string]any{"issues": is}})
+		case r.URL.Path == "/rest/agile/1.0/board/18/project":
+			projects := fx.boardProjects
+			if projects == nil {
+				projects = []string{"P23"}
+			}
+			var vs []map[string]any
+			for _, k := range projects {
+				vs = append(vs, map[string]any{"key": k})
+			}
+			write(map[string]any{"values": vs, "isLast": true})
 		default:
 			t.Errorf("unexpected request %s", r.URL)
 			http.NotFound(w, r)
@@ -151,7 +172,7 @@ func newJiraTest(t *testing.T, fx *jiraFixture, personaIDs []string) (*JiraPort,
 		base:    func(string) string { return srv.URL },
 	}
 	settings := &config.TownSettings{Assistant: &config.AssistantConfig{Sweep: &config.SweepConfig{Jira: &config.JiraSweepConfig{
-		Site: "example.atlassian.net", Email: "persona@example.com", Projects: []string{"P23"}, BoardID: 18,
+		Site: "example.atlassian.net", Email: "persona@example.com", Projects: []string{"P23", "OPS"}, BoardID: 18,
 		Humans: []string{humanID}, Bots: []string{botID}, WIPLimit: 2,
 	}}}}
 	return p, Input{Now: jiraNow, Settings: settings}
@@ -175,6 +196,7 @@ func TestJiraPort_Findings(t *testing.T) {
 			issue("P23-13", "In Progress", "indeterminate", personaID, 240*h, 1*h, "we asked, bot replied"),
 			issue("P23-1; DROP", "In Progress", "indeterminate", personaID, 240*h, 1*h, "malformed key"),
 			other(issue("P23-14", "In Progress", "indeterminate", humanID, 240*h, 1*h, "watched by a second persona account")),
+			issue("OPS-4", "To Do", "new", personaID, 240*h, 1*h, "project the board does not cover"),
 		},
 		comments: map[string][]map[string]any{
 			"P23-1":       {comment("101", humanID, 5*h, "can you look?", ""), comment("100", personaID, 30*h, "done", "")},
@@ -192,7 +214,7 @@ func TestJiraPort_Findings(t *testing.T) {
 			"P23-14":      {comment("1402", humanID, 5*h, "question for the team?", "")},
 		},
 		watched:   []map[string]any{{"key": "P23-14"}},
-		offBoard:  []string{"P23-5", "P23-99", "P23-11"},
+		offBoard:  []string{"P23-5", "P23-99", "P23-11", "OPS-4"},
 		waves:     []map[string]any{issue("P23-9", "In Progress", "indeterminate", "", 500*h, 300*h, "Release wave 12")},
 		waveChild: map[string][]map[string]any{"P23-9": {issue("P23-91", "In UAT", "indeterminate", "", 400*h, 250*h, "child")}},
 		changed:   []map[string]any{{"key": "P23-10"}},
@@ -214,7 +236,7 @@ func TestJiraPort_Findings(t *testing.T) {
 		}
 	}
 	for _, absent := range []string{"unanswered-comment/P23-7", "unanswered-comment/P23-8", "unknown-actor/P23-8", "needs-status-update/P23-10", "off-board/P23-99", "needs-status-update/P23-5",
-		"unanswered-comment/P23-11", "unknown-actor/P23-11", "off-board/P23-11", "unknown-actor/P23-12"} {
+		"unanswered-comment/P23-11", "unknown-actor/P23-11", "off-board/P23-11", "unknown-actor/P23-12", "off-board/OPS-4"} {
 		if _, ok := got[absent]; ok {
 			t.Errorf("unexpected %s", absent)
 		}
@@ -275,22 +297,29 @@ func TestJiraPort_PartialAndErrors(t *testing.T) {
 		t.Fatalf("a failed comment fetch must be partial, keeping the rest: %v / %v", err, findings)
 	}
 
-	// Board render data unavailable: off-board is not checked (never "all
-	// off the board"), the port is partial and the other kinds survive.
-	fx = &jiraFixture{
-		issues:    []map[string]any{issue("P23-5", "Research", "indeterminate", personaID, 240*h, 1*h, "would be off-board")},
-		comments:  map[string][]map[string]any{"P23-5": {comment("501", personaID, 1*h, "note", "")}},
-		offBoard:  []string{"P23-5"},
-		boardFail: true,
-	}
-	p, in = newJiraTest(t, fx, []string{personaID})
-	findings, err = p.Sweep(context.Background(), in)
-	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "off-board not checked") {
-		t.Errorf("an unavailable board must be partial with the reason: %v", err)
-	}
-	for _, f := range findings {
-		if f.Kind == "off-board" {
-			t.Errorf("an unavailable board must not yield off-board findings: %+v", f)
+	// Board render data unavailable, empty, or without an issue list:
+	// off-board is not checked (never "all off the board"), the port is
+	// partial and the other kinds survive.
+	for name, set := range map[string]func(*jiraFixture){
+		"500":       func(fx *jiraFixture) { fx.boardFail = true },
+		"no issues": func(fx *jiraFixture) { fx.boardEmpty = true },
+		"no list":   func(fx *jiraFixture) { fx.boardNoIssues = true },
+	} {
+		fx = &jiraFixture{
+			issues:   []map[string]any{issue("P23-5", "Research", "indeterminate", personaID, 240*h, 1*h, "would be off-board")},
+			comments: map[string][]map[string]any{"P23-5": {comment("501", personaID, 1*h, "note", "")}},
+			offBoard: []string{"P23-5"},
+		}
+		set(fx)
+		p, in = newJiraTest(t, fx, []string{personaID})
+		findings, err = p.Sweep(context.Background(), in)
+		if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "off-board not checked") {
+			t.Errorf("%s: a board without membership data must be partial with the reason: %v", name, err)
+		}
+		for _, f := range findings {
+			if f.Kind == "off-board" {
+				t.Errorf("%s: must not yield off-board findings: %+v", name, f)
+			}
 		}
 	}
 

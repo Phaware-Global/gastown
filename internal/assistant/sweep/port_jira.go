@@ -291,27 +291,68 @@ func (c *jiraClient) comments(key string) ([]jiraComment, error) {
 	return res.Comments, err
 }
 
-// onBoard returns the keys the board currently shows. The board's render
-// data is the only authoritative membership source: the agile backlog and
-// board-issue endpoints list a project's issues regardless of side (on this
-// instance the backlog listing alone runs to thousands of issues), as the
-// move-to-board skill warns, and it is one request instead of a paged walk.
-func (c *jiraClient) onBoard(boardID int) (map[string]bool, error) {
+// onBoard returns the keys the board currently shows and the projects the
+// board covers. The board's render data is the only authoritative
+// membership source: the agile backlog and board-issue endpoints list a
+// project's issues regardless of side (on this instance the backlog listing
+// alone runs to thousands of issues), as the move-to-board skill warns, and
+// it is one request instead of a paged walk. A reply without an issue list
+// (a reshaped private endpoint, a Scrum board between sprints, a board the
+// token sees as empty) is an error, so off-board is reported as not checked
+// rather than as "everything is off the board".
+func (c *jiraClient) onBoard(boardID int) (keys, projects map[string]bool, err error) {
 	var res struct {
 		IssuesData struct {
-			Issues []struct {
+			Issues *[]struct {
 				Key string `json:"key"`
 			} `json:"issues"`
 		} `json:"issuesData"`
 	}
 	if err := c.get("/rest/greenhopper/1.0/xboard/work/allData.json", url.Values{"rapidViewId": {fmt.Sprint(boardID)}}, &res); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	keys := make(map[string]bool, len(res.IssuesData.Issues))
-	for _, i := range res.IssuesData.Issues {
+	if res.IssuesData.Issues == nil {
+		return nil, nil, fmt.Errorf("board render data has no issuesData.issues")
+	}
+	if len(*res.IssuesData.Issues) == 0 {
+		return nil, nil, fmt.Errorf("board render data lists no issues")
+	}
+	keys = make(map[string]bool, len(*res.IssuesData.Issues))
+	for _, i := range *res.IssuesData.Issues {
 		keys[i.Key] = true
 	}
-	return keys, nil
+	// Only issues in a project the board covers can be moved onto it.
+	projects = map[string]bool{}
+	for start, page := 0, 0; page < 5; page++ {
+		var pr struct {
+			Values []struct {
+				Key string `json:"key"`
+			} `json:"values"`
+			IsLast bool `json:"isLast"`
+		}
+		if err := c.get(fmt.Sprintf("/rest/agile/1.0/board/%d/project", boardID), url.Values{"startAt": {fmt.Sprint(start)}, "maxResults": {"50"}}, &pr); err != nil {
+			return nil, nil, err
+		}
+		for _, v := range pr.Values {
+			projects[v.Key] = true
+		}
+		start += len(pr.Values)
+		if pr.IsLast || len(pr.Values) == 0 {
+			break
+		}
+	}
+	if len(projects) == 0 {
+		return nil, nil, fmt.Errorf("board lists no projects")
+	}
+	return keys, projects, nil
+}
+
+// keyProject returns the project part of an issue key ("P23-12" → "P23").
+func keyProject(key string) string {
+	if i := strings.LastIndex(key, "-"); i > 0 {
+		return key[:i]
+	}
+	return key
 }
 
 // --- the sweep -------------------------------------------------------------
@@ -417,15 +458,16 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	for _, i := range tIssues {
 		transitioned[i.Key] = true
 	}
-	// 3. Board membership (off-board). nil means not checked: a missing
-	//    board must never read as "everything is off the board".
-	var onBoard map[string]bool
+	// 3. Board membership (off-board). nil means not checked: a missing or
+	//    empty board must never read as "everything is off the board", and
+	//    only issues in a project the board covers can be off it.
+	var onBoard, boardProjects map[string]bool
 	if cfg.BoardID > 0 {
-		onBoard, err = c.onBoard(cfg.BoardID)
-		if err != nil {
-			note("board %d unavailable (off-board not checked): %v", cfg.BoardID, err)
+		onBoard, boardProjects, err = c.onBoard(cfg.BoardID)
+		if in.DryRun {
 			onBoard = nil
-		} else if in.DryRun {
+		} else if err != nil {
+			note("board %d unavailable (off-board not checked): %v", cfg.BoardID, err)
 			onBoard = nil
 		}
 	}
@@ -577,7 +619,7 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 				}
 			}
 		}
-		if involved && onBoard != nil && !onBoard[is.Key] {
+		if involved && onBoard != nil && boardProjects[keyProject(is.Key)] && !onBoard[is.Key] {
 			createdByPersona := f.Creator != nil && isPersona[f.Creator.AccountID]
 			if contains(active, status) || (createdByPersona && in.Now.Sub(time.Time(f.Created)) <= d.offBoard) {
 				fd := base("off-board", SeverityActionable)

@@ -55,7 +55,7 @@ type JiraSweepConfig struct {
 	Email    string   `json:"email,omitempty"`     // persona's Atlassian login for basic auth
 	TokenEnv string   `json:"token_env,omitempty"` // default "JIRA_API_TOKEN"
 	Projects []string `json:"projects,omitempty"`  // project keys to sweep
-	BoardID  int      `json:"board_id,omitempty"`  // Kanban board whose backlog means "off board"; 0 disables off-board
+	BoardID  int      `json:"board_id,omitempty"`  // Kanban board the issues should sit on (its render data decides membership); 0 disables off-board
 	Humans   []string `json:"humans,omitempty"`    // account IDs the persona waits on
 	Bots     []string `json:"bots,omitempty"`      // account IDs that are never humans
 
