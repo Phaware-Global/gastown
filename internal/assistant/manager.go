@@ -9,6 +9,8 @@ package assistant
 import (
 	"errors"
 	"fmt"
+	"github.com/steveyegge/gastown/internal/nudge"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -114,6 +116,15 @@ func (m *Manager) Start(agentOverride string) error {
 	})
 	if err != nil {
 		return err
+	}
+
+	// Start the nudge-queue poller, as the witness and refinery managers do.
+	// Mail and telegraph nudges reach this session through the queue; a
+	// Claude session drains it from its UserPromptSubmit hook, but an
+	// opencode session has no such hook and, when idle, never submits a
+	// prompt, so without the poller every queued nudge sits undelivered.
+	if _, pollerErr := nudge.StartPoller(m.townRoot, sessionID); pollerErr != nil {
+		log.Printf("warning: could not start nudge poller for %s: %v", sessionID, pollerErr)
 	}
 
 	time.Sleep(session.ShutdownDelay())

@@ -1849,3 +1849,37 @@ func TestResolvePresetForAgent(t *testing.T) {
 		}
 	})
 }
+
+// A town agent defined by command alone ({"command": "opencode", ...}, the
+// shape config.json actually uses) resolves to the opencode preset, not to
+// the claude default: nudge delivery and process liveness depend on it.
+func TestResolvePresetForAgent_InfersProviderFromCommand(t *testing.T) {
+	townRoot := t.TempDir()
+	path := TownSettingsPath(townRoot)
+	settings, err := LoadOrCreateTownSettings(path)
+	if err != nil {
+		t.Fatalf("settings: %v", err)
+	}
+	settings.Agents["opencode-nemotron"] = &RuntimeConfig{Command: "opencode", Env: map[string]string{"OPENCODE_MODEL": "x"}}
+	settings.Agents["wrapped-opencode"] = &RuntimeConfig{Command: "env", Args: []string{"FOO=1", "opencode"}}
+	settings.Agents["claude-sonnet"] = &RuntimeConfig{Command: "claude", Args: []string{"--model", "sonnet"}}
+	settings.Agents["mystery"] = &RuntimeConfig{Command: "/opt/tools/mystery-agent"}
+	if err := SaveTownSettings(path, settings); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	for _, c := range []struct{ agent, want string }{
+		{"opencode-nemotron", "opencode"},
+		{"wrapped-opencode", "opencode"},
+		{"claude-sonnet", "claude"},
+		{"mystery", "claude"}, // unknown command keeps the claude default
+	} {
+		p := ResolvePresetForAgent(c.agent, townRoot)
+		if p == nil || string(p.Name) != c.want {
+			got := "<nil>"
+			if p != nil {
+				got = string(p.Name)
+			}
+			t.Errorf("ResolvePresetForAgent(%q) = %s, want %s", c.agent, got, c.want)
+		}
+	}
+}

@@ -729,10 +729,52 @@ func ResolvePresetForAgent(agentName, townRoot string) *AgentPresetInfo {
 	if rc := ts.Agents[agentName]; rc != nil {
 		provider := rc.Provider
 		if provider == "" {
-			// RuntimeConfig normalization defaults an unset provider to claude.
+			// A town agent written without "provider" (the common shape:
+			// command + args + env) is still recognizable by its command:
+			// {"command": "opencode"} is the opencode preset, not claude.
+			// Only when the command matches no preset does the claude default
+			// of RuntimeConfig normalization apply.
+			if p := presetForCommand(rc.Command, rc.Args...); p != nil {
+				return p
+			}
 			provider = string(AgentClaude)
 		}
 		return GetAgentPresetByName(provider)
+	}
+	return nil
+}
+
+// presetForCommand returns the built-in or registered preset whose command
+// has the same basename as the given command (looking past a wrapper such as
+// env or nohup to the real binary in args), or nil.
+func presetForCommand(command string, args ...string) *AgentPresetInfo {
+	if command == "" {
+		return nil
+	}
+	bin := filepath.Base(command)
+	if wrapperCommands[bin] {
+		bin = extractWrappedBinary(bin, args)
+		if bin == "" {
+			return nil
+		}
+	}
+	registryMu.Lock()
+	initRegistryLocked()
+	defer registryMu.Unlock()
+	// Several presets can share a binary (wrappers around claude, say):
+	// the preset named after the binary wins, then the first by name.
+	if p := globalRegistry.Agents[bin]; p != nil && p.Command != "" && filepath.Base(p.Command) == bin {
+		return p
+	}
+	names := make([]string, 0, len(globalRegistry.Agents))
+	for name := range globalRegistry.Agents {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if p := globalRegistry.Agents[name]; p.Command != "" && filepath.Base(p.Command) == bin {
+			return p
+		}
 	}
 	return nil
 }
