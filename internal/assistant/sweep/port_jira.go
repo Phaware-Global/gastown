@@ -16,7 +16,7 @@ import (
 
 // Jira port defaults (design: docs/design/assistant-role.md, "Jira port").
 const (
-	jiraDefaultTokenEnv  = "JIRA_API_TOKEN"
+	jiraDefaultTokenEnv  = "JIRA_API_TOKEN" //nolint:gosec // G101: the name of an environment variable, not a secret
 	jiraPageSize         = 100
 	jiraMaxPages         = 10  // per search; more is reported as partial
 	jiraMaxCommentIssues = 150 // issues whose comments are fetched per run
@@ -202,7 +202,7 @@ func (c *jiraClient) get(path string, q url.Values, out any) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("GET %s: HTTP %d: %s", path, resp.StatusCode, truncate(string(body), 300))
