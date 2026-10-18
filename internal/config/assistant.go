@@ -65,6 +65,7 @@ type JiraSweepConfig struct {
 
 	UnansweredAfter   string `json:"unanswered_after,omitempty"`    // default "4h"
 	ChaseAfter        string `json:"chase_after,omitempty"`         // default "24h"
+	UnansweredMaxAge  string `json:"unanswered_max_age,omitempty"`  // default "720h": an older wait is noise, not a finding
 	StatusUpdateAfter string `json:"status_update_after,omitempty"` // default "72h"
 	OffBoardWindow    string `json:"off_board_window,omitempty"`    // default "168h"
 	StaleAfter        string `json:"stale_after,omitempty"`         // default "72h"

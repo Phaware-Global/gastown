@@ -33,6 +33,7 @@ var (
 
 type jiraDurations struct {
 	unanswered, chase, statusUpdate, offBoard, stale time.Duration
+	maxAge                                           time.Duration // unanswered-comment and question-unanswered older than this are not reported
 }
 
 // JiraPort reports unanswered threads, unchased questions, assigned work
@@ -399,6 +400,7 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	d := jiraDurations{
 		unanswered:   parseDur(cfg.UnansweredAfter, 4*time.Hour),
 		chase:        parseDur(cfg.ChaseAfter, 24*time.Hour),
+		maxAge:       parseDur(cfg.UnansweredMaxAge, 30*24*time.Hour),
 		statusUpdate: parseDur(cfg.StatusUpdateAfter, 72*time.Hour),
 		offBoard:     parseDur(cfg.OffBoardWindow, 7*24*time.Hour),
 		stale:        parseDur(cfg.StaleAfter, 72*time.Hour),
@@ -559,7 +561,9 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 				}
 			}
 		}
-		if waiting != nil && in.Now.Sub(time.Time(waiting.Created)) >= d.unanswered {
+		// A wait older than maxAge is noise: nobody wants a reply to a
+		// months-old comment surfaced every sweep.
+		if waiting != nil && in.Now.Sub(time.Time(waiting.Created)) >= d.unanswered && in.Now.Sub(time.Time(waiting.Created)) <= d.maxAge {
 			fd := base("unanswered-comment", SeverityActionable)
 			fd.Since = time.Time(waiting.Created)
 			fd.Fields["comment_id"] = waiting.ID
@@ -585,7 +589,7 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		}
 		// The persona asked (or is blocked) and no listed human has answered
 		// since; bot or unlisted comments in between do not count as answers.
-		if involved && !lastPersona.IsZero() && !humanAfter && in.Now.Sub(lastPersona) >= d.chase {
+		if age := in.Now.Sub(lastPersona); involved && !lastPersona.IsZero() && !humanAfter && age >= d.chase && age <= d.maxAge {
 			text := lastPersonaText
 			if strings.Contains(text, "?") || strings.EqualFold(status, "Blocked") {
 				fd := base("question-unanswered", SeverityActionable)

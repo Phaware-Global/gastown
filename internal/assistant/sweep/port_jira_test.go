@@ -283,6 +283,42 @@ func TestJiraPort_Findings(t *testing.T) {
 	}
 }
 
+// A wait older than unanswered_max_age (default 30d) is not reported: a
+// reply to a months-old comment is noise. The cap is configurable.
+func TestJiraPort_UnansweredMaxAge(t *testing.T) {
+	h := time.Hour
+	fx := &jiraFixture{
+		issues: []map[string]any{
+			issue("P23-15", "In Progress", "indeterminate", humanID, 900*h, 800*h, "old human ask"),
+			issue("P23-16", "In Progress", "indeterminate", personaID, 900*h, 800*h, "old persona question"),
+		},
+		comments: map[string][]map[string]any{
+			"P23-15": {comment("1501", humanID, 800*h, "still relevant?", ""), comment("1500", personaID, 850*h, "done", "")},
+			"P23-16": {comment("1601", personaID, 800*h, "which env?", "")},
+		},
+	}
+	for _, c := range []struct {
+		maxAge string
+		want   bool
+	}{{"", false}, {"1000h", true}} {
+		p, in := newJiraTest(t, fx, []string{personaID})
+		in.Settings.Assistant.Sweep.Jira.UnansweredMaxAge = c.maxAge
+		findings, err := p.Sweep(context.Background(), in)
+		if err != nil {
+			t.Fatalf("max_age=%q: %v", c.maxAge, err)
+		}
+		got := map[string]bool{}
+		for _, f := range findings {
+			got[f.Kind+"/"+f.Key] = true
+		}
+		for _, id := range []string{"unanswered-comment/P23-15", "question-unanswered/P23-16"} {
+			if got[id] != c.want {
+				t.Errorf("max_age=%q: %s present=%v, want %v (got %v)", c.maxAge, id, got[id], c.want, got)
+			}
+		}
+	}
+}
+
 func TestJiraPort_PartialAndErrors(t *testing.T) {
 	h := time.Hour
 	fx := &jiraFixture{
