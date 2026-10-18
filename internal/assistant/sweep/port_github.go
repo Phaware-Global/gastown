@@ -212,6 +212,24 @@ type ghThread struct {
 	} `json:"comments"`
 }
 
+// UnmarshalJSON decodes a PR and remembers which connections came back null.
+func (p *ghPR) UnmarshalJSON(b []byte) error {
+	type alias ghPR
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	var probe struct {
+		Reviews       json.RawMessage `json:"reviews"`
+		ReviewThreads json.RawMessage `json:"reviewThreads"`
+	}
+	_ = json.Unmarshal(b, &probe)
+	*p = ghPR(a)
+	p.reviewsNull = len(probe.Reviews) == 0 || string(probe.Reviews) == "null"
+	p.threadsNull = len(probe.ReviewThreads) == 0 || string(probe.ReviewThreads) == "null"
+	return nil
+}
+
 // ghPage flags a fixed-window connection that did not fit: the PR's review
 // state is then not fully known and the port reports partial.
 type ghPage struct {
@@ -243,7 +261,13 @@ type ghRequestEvent struct {
 	RequestedReviewer ghActor   `json:"requestedReviewer"`
 }
 
+// ghPR is one pull request as returned by githubRepoQuery. reviewsNull and
+// threadsNull record a null connection (a field-level GraphQL error such as
+// a FORBIDDEN from a least-privilege token), which must never read as "no
+// reviews": such a PR is paged separately or reported as not fully checked.
 type ghPR struct {
+	reviewsNull, threadsNull bool
+
 	Number         int       `json:"number"`
 	Title          string    `json:"title"`
 	URL            string    `json:"url"`
@@ -359,12 +383,16 @@ func (c *ghClient) do(req *http.Request, out any) error {
 	return json.Unmarshal(body, out)
 }
 
-func (c *ghClient) repo(ref repoRef, after string) (*ghRepoData, error) {
+// repo fetches one page of a repository's open PRs. A field-level GraphQL
+// error with the repository still present (a least-privilege token denied
+// one field) keeps the data and is returned as a warning; the PRs whose
+// review connections came back null are paged separately by the caller.
+func (c *ghClient) repo(ref repoRef, after string) (*ghRepoData, string, error) {
 	if c.trace != nil {
 		c.trace(fmt.Sprintf("POST /graphql repository(%s) open PRs after=%q", ref.slug(), after))
 	}
 	if c.dry {
-		return &ghRepoData{}, nil
+		return &ghRepoData{}, "", nil
 	}
 	vars := map[string]any{"owner": ref.Owner, "name": ref.Name}
 	if after != "" {
@@ -373,27 +401,38 @@ func (c *ghClient) repo(ref repoRef, after string) (*ghRepoData, error) {
 	body, _ := json.Marshal(map[string]any{"query": githubRepoQuery, "variables": vars})
 	req, err := http.NewRequestWithContext(c.ctx, http.MethodPost, c.port.apiBase+"/graphql", bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	var res struct {
 		Data struct {
-			Repository *ghRepoData `json:"repository"`
+			Repository *struct {
+				Open       json.RawMessage `json:"open"`
+				ghRepoData                 // value-embedded: json cannot allocate an embedded pointer to an unexported type
+			} `json:"repository"`
 		} `json:"data"`
 		Errors []struct {
 			Message string `json:"message"`
 		} `json:"errors"`
 	}
 	if err := c.do(req, &res); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	if res.Data.Repository == nil || len(res.Errors) > 0 {
+	if res.Data.Repository == nil || len(res.Data.Repository.Open) == 0 || string(res.Data.Repository.Open) == "null" {
 		msg := "repository not found or not accessible"
 		if len(res.Errors) > 0 {
 			msg = "graphql: " + res.Errors[0].Message
 		}
-		return nil, fmt.Errorf("%s: %s", ref.slug(), msg)
+		return nil, "", fmt.Errorf("%s: %s", ref.slug(), msg)
 	}
-	return res.Data.Repository, nil
+	data := &res.Data.Repository.ghRepoData
+	if err := json.Unmarshal(res.Data.Repository.Open, &data.Open); err != nil {
+		return nil, "", err
+	}
+	warn := ""
+	if len(res.Errors) > 0 {
+		warn = fmt.Sprintf("%s: graphql: %s (data kept; affected PRs paged or marked not fully checked)", ref.slug(), res.Errors[0].Message)
+	}
+	return data, warn, nil
 }
 
 // prPage fetches one page of a PR's reviews and threads.
@@ -549,10 +588,13 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		err error
 	}
 	patrol := map[string]patrolResult{}
+	var bdDown error // set by the first timed-out lookup: every rig shares one Dolt server
 	owns := func(rig string, n int) (bool, error) {
 		res, ok := patrol[rig]
 		if !ok {
-			if !timeLeft(ctx) {
+			if bdDown != nil {
+				res = patrolResult{err: bdDown}
+			} else if !timeLeft(ctx) {
 				res = patrolResult{err: fmt.Errorf("time budget exhausted")}
 			} else {
 				// Bound each lookup on its own timer so a wedged bd costs one
@@ -573,7 +615,8 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 				case <-ctx.Done():
 					res = patrolResult{err: fmt.Errorf("time budget exhausted waiting for bd")}
 				case <-time.After(wait):
-					res = patrolResult{err: fmt.Errorf("bd did not answer within %s", wait.Round(time.Millisecond))}
+					bdDown = fmt.Errorf("bd unavailable this sweep: did not answer within %s", wait.Round(time.Millisecond))
+					res = patrolResult{err: bdDown}
 				}
 			}
 			if res.set == nil {
@@ -601,7 +644,7 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 				note("%s: more than %d open PRs; the rest were not checked", ref.slug(), githubMaxPRPages*githubPRPage)
 				break
 			}
-			d, err := c.repo(ref, after)
+			d, warn, err := c.repo(ref, after)
 			if err != nil {
 				if ctx.Err() != nil {
 					note("%s: time budget exhausted mid-call; open PRs not checked", ref.slug())
@@ -609,6 +652,9 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 					note("%s: %v", ref.slug(), err)
 				}
 				break
+			}
+			if warn != "" {
+				note("%s", warn)
 			}
 			checked = true
 			open = append(open, d.Open.Nodes...)
@@ -622,7 +668,7 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		}
 		for i := range open {
 			pr := &open[i]
-			if pr.Reviews.PageInfo.truncated() || pr.ReviewThreads.PageInfo.truncated() {
+			if pr.Reviews.PageInfo.truncated() || pr.ReviewThreads.PageInfo.truncated() || pr.reviewsNull || pr.threadsNull {
 				// Page this one PR instead of declaring the whole port partial
 				// over a window nobody has read.
 				if complete, err := c.fillPR(ctx, ref, pr); err != nil || !complete {

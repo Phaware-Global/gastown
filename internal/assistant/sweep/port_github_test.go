@@ -81,7 +81,10 @@ type ghFixture struct {
 	paged       map[int]*ghPRPage      // full reviews/threads served to the per-PR paging query
 	pages       map[int][]*ghPRPage    // multi-page answers, selected by the rcur cursor "p<n>"
 	pageErr     int                    // 1-based page index that answers with errors and null connections (0 = none)
-	patrolDelay time.Duration          // patrolBeads sleeps this long
+	pageErrMode string                 // "both" (default): errors + null connections; "errors": errors with valid data; "null": null connections, no errors
+	fieldErrPR  int                    // repo query: this PR's reviews come back null and an errors entry is attached
+	patrolCalls atomic.Int32
+	patrolDelay time.Duration // patrolBeads sleeps this long
 }
 
 func (fx *ghFixture) handler(t *testing.T) http.Handler {
@@ -113,8 +116,18 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 						fmt.Sscanf(cur, "p%d", &idx)
 					}
 					if fx.pageErr > 0 && idx+1 == fx.pageErr {
-						_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": map[string]any{"reviews": nil, "reviewThreads": nil}}},
-							"errors": []map[string]string{{"message": "Something went wrong while executing your query."}}})
+						errs := []map[string]string{{"message": "Something went wrong while executing your query."}}
+						switch fx.pageErrMode {
+						case "errors": // valid-looking data with an errors entry
+							if idx >= len(pages) {
+								idx = len(pages) - 1
+							}
+							_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": pages[idx]}}, "errors": errs})
+						case "null": // null connections, no errors entry
+							_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": map[string]any{"reviews": nil, "reviewThreads": nil}}}})
+						default:
+							_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": map[string]any{"reviews": nil, "reviewThreads": nil}}}, "errors": errs})
+						}
 						return
 					}
 					if idx >= len(pages) {
@@ -140,6 +153,21 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 				_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": nil}, "errors": []map[string]string{{"message": "Could not resolve to a Repository"}}})
 				return
 			}
+			if fx.fieldErrPR > 0 {
+				// Field-level error: repository present, one PR's reviews null, errors attached.
+				raw, _ := json.Marshal(data)
+				var m map[string]any
+				_ = json.Unmarshal(raw, &m)
+				for _, n := range m["open"].(map[string]any)["nodes"].([]any) {
+					node := n.(map[string]any)
+					if int(node["number"].(float64)) == fx.fieldErrPR {
+						node["reviews"] = nil
+					}
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": m},
+					"errors": []map[string]any{{"message": "Resource not accessible by personal access token", "type": "FORBIDDEN", "path": []any{"repository", "open", "nodes", 0, "reviews"}}}})
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": data}})
 		default:
 			t.Errorf("unexpected %s", r.URL)
@@ -158,6 +186,7 @@ func newGitHubTest(t *testing.T, fx *ghFixture, logins []string) (*GitHubPort, I
 		},
 		token: func(string) string { return "tok" },
 		patrolBeads: func(rig string) (map[int]bool, error) {
+			fx.patrolCalls.Add(1)
 			if fx.patrolDelay > 0 {
 				time.Sleep(fx.patrolDelay)
 			}
@@ -469,7 +498,7 @@ func TestGitHubPort_HungPatrolCostsOneRigNotTheSweep(t *testing.T) {
 	app := &ghRepoData{}
 	app.Open.Nodes = []ghPR{pr(7, "someone", 30*h, 2*h, "FAILURE")}
 	other := &ghRepoData{}
-	other.Open.Nodes = []ghPR{pr(6, "artie", 3*h, 3*h, "PENDING")}
+	other.Open.Nodes = []ghPR{pr(6, "artie", 3*h, 3*h, "PENDING"), pr(8, "someone", 30*h, 2*h, "FAILURE")}
 	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": other}, patrolDelay: 5 * time.Second}
 	p, in := newGitHubTest(t, fx, []string{"artie"})
 	p.repos = func() ([]repoRef, error) {
@@ -493,7 +522,57 @@ func TestGitHubPort_HungPatrolCostsOneRigNotTheSweep(t *testing.T) {
 	for _, f := range findings {
 		keys[f.Kind+"/"+f.Key] = true
 	}
-	if !keys["ci-failing/acme/app#7"] || !keys["no-review-loop/acme/extra#6"] {
+	if !keys["ci-failing/acme/app#7"] || !keys["no-review-loop/acme/extra#6"] || !keys["ci-failing/acme/extra#8"] {
 		t.Errorf("the second repo must still be checked after a hung lookup in the first: %v", keys)
+	}
+	if fx.patrolCalls.Load() != 1 {
+		t.Errorf("one hung bd must stop further lookups this sweep (shared Dolt), got %d calls", fx.patrolCalls.Load())
+	}
+	if !strings.Contains(partial.Reason, "bd unavailable this sweep") {
+		t.Errorf("later rigs must carry the sweep-scoped reason: %s", partial.Reason)
+	}
+}
+
+func TestGitHubPort_GraphQLErrorGuardsPinnedSeparately(t *testing.T) {
+	h := time.Hour
+	newApp := func() *ghRepoData {
+		app := &ghRepoData{}
+		app.Open.Nodes = []ghPR{pr(60, "artie", 60*h, 40*h, "SUCCESS", truncatedReviews)}
+		return app
+	}
+	var partial *PartialError
+	// prPage: an errors entry with valid-looking data is still an error.
+	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": newApp(), "acme/extra": {}}, pages: map[int][]*ghPRPage{60: twoPages()}, pageErr: 2, pageErrMode: "errors"}
+	p, in := newGitHubTest(t, fx, []string{"artie"})
+	if _, err := p.Sweep(context.Background(), in); !errors.As(err, &partial) || !strings.Contains(partial.Reason, "could not be paged in full") {
+		t.Errorf("errors with data must not read as complete: %v", err)
+	}
+	// prPage: null connections without an errors entry are an error too.
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": newApp(), "acme/extra": {}}, pages: map[int][]*ghPRPage{60: twoPages()}, pageErr: 2, pageErrMode: "null"}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	if _, err := p.Sweep(context.Background(), in); !errors.As(err, &partial) || !strings.Contains(partial.Reason, "could not be paged in full") {
+		t.Errorf("null connections must not read as an empty page: %v", err)
+	}
+	// repo(): a field-level error keeps the repo's PRs; the PR whose reviews came
+	// back null is paged (kevin's CHANGES_REQUESTED lives on the page) and the
+	// error is noted.
+	paged := &ghPRPage{}
+	hidden := ghReview{Author: ghActor{Login: "kevin"}, State: "CHANGES_REQUESTED", SubmittedAt: ago(20 * h)}
+	hidden.Commit.Oid = shaA
+	paged.Reviews.Nodes = []ghReview{hidden}
+	app := &ghRepoData{}
+	app.Open.Nodes = []ghPR{pr(70, "artie", 60*h, 40*h, "SUCCESS"), pr(71, "artie", 3*h, 3*h, "PENDING")}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, fieldErrPR: 70, paged: map[int]*ghPRPage{70: paged}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	findings, err := p.Sweep(context.Background(), in)
+	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "graphql: Resource not accessible") {
+		t.Fatalf("a field-level error must be noted, not fatal: %v", err)
+	}
+	keys := map[string]bool{}
+	for _, f := range findings {
+		keys[f.Kind+"/"+f.Key] = true
+	}
+	if !keys["changes-requested-stale/acme/app#70"] || !keys["no-review-loop/acme/app#71"] {
+		t.Errorf("the repo's PRs must still be checked and the null connection paged: %v", keys)
 	}
 }
