@@ -21,7 +21,9 @@ func Markdown(r *Report) string {
 	for _, p := range r.Ports {
 		fmt.Fprintf(&b, "\n## Port: %s\n", p.Name)
 		if p.Error != "" {
-			fmt.Fprintf(&b, "NOT CHECKED: %s\n", p.Error)
+			b.WriteString("NOT CHECKED: the port failed; its error is external text (below), not a result\n")
+			b.WriteString(Fence(p.Name, "error", "", p.Error))
+			b.WriteByte('\n')
 			continue
 		}
 		if p.Partial {
@@ -67,6 +69,9 @@ func JSON(r *Report) ([]byte, error) {
 	out.Ports = make([]PortResult, len(r.Ports))
 	for i, p := range r.Ports {
 		q := p
+		if p.Error != "" {
+			q.Error = FenceJSON(p.Error)
+		}
 		q.New = make([]Finding, len(p.New))
 		for j, f := range p.New {
 			g := f

@@ -37,9 +37,12 @@ type Port interface {
 	// A value that fails its shape, or a key not declared here, is moved to
 	// External by the runner.
 	Schema() map[string]Shape
-	// Sweep returns the port's findings. A partial result (truncated
-	// pagination, timeout) must be reported through *PartialError so the
-	// runner can keep acknowledged entries for this port.
+	// Sweep returns the port's findings. Key must be unique per Kind within
+	// one run (the runner merges duplicates so they cannot defeat the ack
+	// gate, but their fingerprints then move together). A partial result
+	// (truncated pagination, timeout) must be reported through *PartialError
+	// so the runner can keep acknowledged entries for this port. Sweep must
+	// honour ctx: the runner stops waiting at PortTimeout.
 	Sweep(ctx context.Context, in Input) ([]Finding, error)
 }
 

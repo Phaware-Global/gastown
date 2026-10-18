@@ -15,6 +15,9 @@ type Entry struct {
 	Fingerprint string    `json:"fingerprint"`
 	FirstSeen   time.Time `json:"first_seen"`
 	LastAcked   time.Time `json:"last_acked"`
+	// RunAt is GeneratedAt of the run whose ack wrote this entry; an older
+	// run acknowledged later never rolls a newer acknowledgement back.
+	RunAt time.Time `json:"run_at,omitempty"`
 }
 
 // State is the acknowledged dedup state: fingerprints the Mayor has actually
@@ -72,11 +75,50 @@ func (s *Store) writeJSON(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	tmp, err := os.CreateTemp(s.dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
+// lock serializes Ack across processes with an exclusive-create lock file;
+// a lock older than lockStale is treated as abandoned.
+const lockStale = time.Minute
+
+func (s *Store) lock() (release func(), err error) {
+	if err := os.MkdirAll(s.dir, 0o755); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(s.dir, "sweep-state.lock")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			f.Close()
+			return func() { os.Remove(path) }, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+		if fi, statErr := os.Stat(path); statErr == nil && time.Since(fi.ModTime()) > lockStale {
+			os.Remove(path)
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("sweep state is locked by another ack (%s)", path)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // WritePending records a run for a later Ack.
@@ -102,6 +144,11 @@ func (s *Store) Ack(runID string, now time.Time) error {
 	if err := json.Unmarshal(data, &p); err != nil {
 		return fmt.Errorf("parsing pending run: %w", err)
 	}
+	release, err := s.lock()
+	if err != nil {
+		return err
+	}
+	defer release()
 	st, err := s.Load()
 	if err != nil {
 		return err
@@ -115,6 +162,9 @@ func (s *Store) Ack(runID string, now time.Time) error {
 		id := f.ID()
 		seen[id] = true
 		e, ok := st.Entries[id]
+		if ok && e.RunAt.After(p.GeneratedAt) {
+			continue // a newer run was already acknowledged; never roll back
+		}
 		if !ok {
 			e = Entry{FirstSeen: f.Since}
 			if e.FirstSeen.IsZero() {
@@ -123,11 +173,12 @@ func (s *Store) Ack(runID string, now time.Time) error {
 		}
 		e.Fingerprint = f.Fingerprint
 		e.LastAcked = now
+		e.RunAt = p.GeneratedAt
 		st.Entries[id] = e
 	}
-	for id := range st.Entries {
+	for id, e := range st.Entries {
 		port := strings.SplitN(id, "|", 2)[0]
-		if clean[port] && !seen[id] {
+		if clean[port] && !seen[id] && !e.RunAt.After(p.GeneratedAt) {
 			delete(st.Entries, id) // condition cleared on a clean run
 		}
 	}

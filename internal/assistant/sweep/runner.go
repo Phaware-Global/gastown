@@ -7,13 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
 )
 
 // PortTimeout bounds each port's Sweep call.
-const PortTimeout = 2 * time.Minute
+var PortTimeout = 2 * time.Minute
 
 // Options controls one run.
 type Options struct {
@@ -61,18 +62,16 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Report, error) {
 			rep.Ports = append(rep.Ports, res)
 			continue
 		}
-		pctx, cancel := context.WithTimeout(ctx, PortTimeout)
-		findings, perr := port.Sweep(pctx, Input{TownRoot: r.TownRoot, Settings: r.Settings, Now: now})
-		cancel()
+		findings, perr := runPort(ctx, port, Input{TownRoot: r.TownRoot, Settings: r.Settings, Now: now})
 		var partial *PartialError
 		switch {
 		case errors.As(perr, &partial):
 			res.Partial = true
 			res.Error = "" // findings below are usable; absence is not
 			res.New = append(res.New, Finding{Port: name, Kind: "port-partial", Key: name, Severity: SeverityInfo,
-				Fields: map[string]string{"reason": "partial"}, External: map[string]string{"detail": partial.Reason}, Fingerprint: "partial"})
+				External: map[string]string{"detail": partial.Reason}, Fingerprint: "partial"})
 		case perr != nil:
-			res.Error = perr.Error() + " (not checked)"
+			res.Error = perr.Error() // external text: rendered fenced, never as a bare line
 			rep.Ports = append(rep.Ports, res)
 			continue
 		}
@@ -82,6 +81,10 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Report, error) {
 			f := &findings[i]
 			f.Port = name
 			enforceSchema(schema, f)
+		}
+		findings = mergeDuplicates(findings)
+		for i := range findings {
+			f := &findings[i]
 			id := f.ID()
 			pend.Seen[name] = append(pend.Seen[name], id)
 			pend.Findings = append(pend.Findings, *f)
@@ -117,6 +120,56 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Report, error) {
 		rep.Pending = true
 	}
 	return rep, nil
+}
+
+// runPort calls port.Sweep with PortTimeout and returns when the port does or
+// when the timeout fires, whichever is first, so a port that ignores ctx
+// cannot block the run.
+func runPort(ctx context.Context, port Port, in Input) ([]Finding, error) {
+	pctx, cancel := context.WithTimeout(ctx, PortTimeout)
+	defer cancel()
+	type out struct {
+		f   []Finding
+		err error
+	}
+	ch := make(chan out, 1)
+	go func() {
+		f, err := port.Sweep(pctx, in)
+		ch <- out{f, err}
+	}()
+	select {
+	case o := <-ch:
+		return o.f, o.err
+	case <-pctx.Done():
+		return nil, fmt.Errorf("port did not return within %s", PortTimeout)
+	}
+}
+
+// mergeDuplicates folds findings that share an ID (Key must be unique per
+// Kind; a port that breaks that rule must not defeat the ack gate). The first
+// finding is kept; later fingerprints join it (sorted, "+"-separated) so the
+// merged entry is standing only when every duplicate was acknowledged, and
+// later External values are kept under "<key>.2", "<key>.3", ….
+func mergeDuplicates(findings []Finding) []Finding {
+	byID := map[string]int{}
+	out := findings[:0]
+	for _, f := range findings {
+		idx, seen := byID[f.ID()]
+		if !seen {
+			byID[f.ID()] = len(out)
+			out = append(out, f)
+			continue
+		}
+		m := &out[idx]
+		fps := append(strings.Split(m.Fingerprint, "+"), f.Fingerprint)
+		sort.Strings(fps)
+		m.Fingerprint = strings.Join(fps, "+")
+		n := strings.Count(m.Fingerprint, "+") + 1
+		for k, v := range f.External {
+			m.addExternal(fmt.Sprintf("%s.%d", k, n), v)
+		}
+	}
+	return out
 }
 
 func severityRank(s string) int {
