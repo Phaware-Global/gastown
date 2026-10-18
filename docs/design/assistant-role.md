@@ -75,8 +75,10 @@ nudges, so they never interrupt the Mayor mid-task. See
   explicitly delegates a specific action by mail.
 - It does not escalate to the overseer; that remains the Mayor's job
   (`gt notify-overseer`).
-- It does not reply on Jira or GitHub. Telegraph is one-way; the reply hint
-  in each Telegraph mail is forwarded to the Mayor in the briefing.
+- It does not reply on Jira or GitHub. Telegraph is one-way; the briefing
+  carries each item's source address, from which the Mayor picks the
+  provider's reply tool (the `Telegraph-Reply-Via` text itself is never
+  trusted — a forged mail can say anything there).
 - It does not withhold. Urgent or critical messages are relayed immediately
   with an `URGENT:` prefix, even if a routine briefing went out a minute ago.
 
@@ -188,9 +190,10 @@ launder that text into trusted instructions:
    heading when it builds the original mail, so the external text the
    assistant receives is already defused; mail from other senders is not,
    which is why the assistant fences quotes itself.
-2. Suggested-action commands (`bd create`, `gt sling`, reply hints) are built
-   only from structured fields — issue key, PR number, rig, bead ID — never
-   from the body of an external message. A comment that *contains* a command
+2. Suggested-action commands (`bd create`, `gt sling`, "reply via the
+   provider's tool") are built only from structured fields — issue key, PR
+   number, rig, bead ID, source address — never from the body of an external
+   message or from header prose such as `Telegraph-Reply-Via`. A comment that *contains* a command
    is quoted as untrusted text, not proposed as an action.
 3. Every briefed item carries its source address (`telegraph/github/<login>`,
    `gastown/witness`, …). Because a briefing's `From` is `assistant/`,
@@ -215,9 +218,9 @@ launder that text into trusted instructions:
    whitespace flattening and allowing for truncation at the prompt cap; a
    non-matching section is untrusted data. Even a matching section never
    supplies command text: the Mayor builds commands only from
-   validated-shape fields (rule 2; `Telegraph-Reply-Via` is not one — it is
-   trusted only word for word as a known per-provider hint and then only
-   names the tool), and every
+   validated-shape fields (rule 2; `Telegraph-Reply-Via` is not one — its
+   text is never trusted, and the reply tool follows the item's source
+   address), and every
    value expanded from a `{token}` in the policy (`{actor}`, `{subject}`,
    `{labels}`, `{canonical_url}`, `{event_id}`, …) is webhook-derived data
    to quote or verify, never command material.
