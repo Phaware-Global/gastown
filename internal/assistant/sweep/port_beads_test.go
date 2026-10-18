@@ -61,10 +61,16 @@ func TestBeadsPort(t *testing.T) {
 			t.Errorf("unexpected finding %s", absent)
 		}
 	}
-	// Titles are external, never fields.
+	// Titles are external, never fields; every Suggest survives the runner's
+	// closed-vocabulary check.
 	for _, f := range findings {
 		if _, ok := f.Fields["title"]; ok {
 			t.Errorf("title must be External, got Fields %v", f.Fields)
+		}
+		before := f.Suggest
+		enforceSchema(p.Schema(), &f)
+		if f.Suggest != before {
+			t.Errorf("%s/%s: suggest %q rejected by the vocabulary", f.Kind, f.Key, before)
 		}
 	}
 	// A failing rig store makes the result partial, not an error and not all clear.
