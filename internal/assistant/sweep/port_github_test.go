@@ -367,12 +367,18 @@ func TestGitHubPort_ApprovalStaleDiff(t *testing.T) {
 	// duplicate key.
 	const spacedApproved = "diff --git a/foo bar.go b/foo bar.go\nindex 1111111..2222222 100644\n--- a/foo bar.go\t\n+++ b/foo bar.go\t\n@@ -1,3 +1,3 @@ func f()\n-x\n+y\n"
 	const typechange = "diff --git a/t b/t\ndeleted file mode 100644\nindex 1111111..0000000\n--- a/t\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\ndiff --git a/t b/t\nnew file mode 120000\nindex 0000000..2222222\n--- /dev/null\n+++ b/t\n@@ -0,0 +1 @@\n+target\n"
-	app.Open.Nodes = []ghPR{stale(12, sha('m')), stale(13, sha('n'))}
+	// Binary and empty files turned into symlinks have a deletion half with
+	// no "---"/"+++" lines; the "deleted file mode" header keys it apart, so
+	// an identical diff at both heads is "unchanged".
+	const binTypechange = "diff --git a/b.bin b/b.bin\ndeleted file mode 100644\nindex 1111111..0000000\nBinary files a/b.bin and /dev/null differ\ndiff --git a/b.bin b/b.bin\nnew file mode 120000\nindex 0000000..2222222\n--- /dev/null\n+++ b/b.bin\n@@ -0,0 +1 @@\n+target\n"
+	const emptyTypechange = "diff --git a/e b/e\ndeleted file mode 100644\nindex e69de29..0000000\ndiff --git a/e b/e\nnew file mode 120000\nindex 0000000..2222222\n--- /dev/null\n+++ b/e\n@@ -0,0 +1 @@\n+target\n"
+	app.Open.Nodes = []ghPR{stale(12, sha('m')), stale(13, sha('n')), stale(14, sha('o'))}
 	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}},
 		diffs: map[string]string{
-			"main..." + shaB:     spacedApproved + typechange,
-			"main..." + sha('m'): strings.Replace(spacedApproved, "@@ -1,3 +1,3 @@", "@@ -9,3 +9,3 @@", 1) + typechange, // base moved "foo bar.go"
-			"main..." + sha('n'): spacedApproved + strings.Replace(typechange, "+target", "+elsewhere", 1),              // symlink target changed
+			"main..." + shaB:     spacedApproved + typechange + binTypechange + emptyTypechange,
+			"main..." + sha('m'): strings.Replace(spacedApproved, "@@ -1,3 +1,3 @@", "@@ -9,3 +9,3 @@", 1) + typechange + binTypechange + emptyTypechange, // base moved "foo bar.go"
+			"main..." + sha('n'): spacedApproved + strings.Replace(typechange, "+target", "+elsewhere", 1) + binTypechange + emptyTypechange,              // symlink target changed
+			"main..." + sha('o'): spacedApproved + typechange + binTypechange + emptyTypechange,                                                           // byte-identical
 		},
 		mergeBases: map[string]string{"main..." + sha('m'): "mb1", "main..." + sha('n'): "mb1"},
 		baseFiles:  map[string][]string{"mb0...mb1": {"foo bar.go"}}}
@@ -382,8 +388,8 @@ func TestGitHubPort_ApprovalStaleDiff(t *testing.T) {
 	for _, f := range findings {
 		got[f.Kind+"/"+f.Key] = f
 	}
-	if got["approval-stale/acme/app#12"].Fields["diff"] != "unchanged" || got["approval-stale/acme/app#13"].Fields["diff"] != "changed" {
-		t.Errorf("spaced path / typechange: want #12 unchanged and #13 changed, got %v / %v (%v)", got["approval-stale/acme/app#12"].Fields, got["approval-stale/acme/app#13"].Fields, got["approval-stale/acme/app#13"].External["diff_error"])
+	if got["approval-stale/acme/app#12"].Fields["diff"] != "unchanged" || got["approval-stale/acme/app#13"].Fields["diff"] != "changed" || got["approval-stale/acme/app#14"].Fields["diff"] != "unchanged" {
+		t.Errorf("spaced path / typechanges: want #12 unchanged, #13 changed, #14 unchanged; got %v / %v / %v (%v)", got["approval-stale/acme/app#12"].Fields, got["approval-stale/acme/app#13"].Fields, got["approval-stale/acme/app#14"].Fields, got["approval-stale/acme/app#14"].External["diff_error"])
 	}
 	// Binary entries: the approved head added x.bin; a swapped binary is a
 	// change even though the diff has no hunk body, while a base merge that
