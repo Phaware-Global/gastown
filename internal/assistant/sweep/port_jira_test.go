@@ -186,9 +186,9 @@ func TestJiraPort_Findings(t *testing.T) {
 			t.Errorf("%s: missing URL", k)
 		}
 		before := f.Suggest
-		enforceSchema(p.Schema(), &f) // the test server is http, so only Suggest is checked here
+		enforceSchema(p.Schema(), p.Suggestions(), &f) // the test server is http, so only Suggest is checked here
 		if f.Suggest != before {
-			t.Errorf("%s: suggest %q rejected by the vocabulary", k, before)
+			t.Errorf("%s: suggest %q rejected by the templates", k, before)
 		}
 	}
 }

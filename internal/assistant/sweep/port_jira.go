@@ -69,6 +69,19 @@ func NewJiraPort(townRoot string, getenv func(string) string) *JiraPort {
 
 func (p *JiraPort) Name() string { return "jira" }
 
+func (p *JiraPort) Suggestions() []string {
+	return []string{
+		"reply on {key}",
+		"add {account_id} to assistant.sweep.jira.humans or .bots",
+		"chase {key}",
+		"note on {key} why it waits",
+		"status note on {key}",
+		"move {key} onto board {board} (jira-move-to-board)",
+		"finish or hand off before starting more",
+		"review release wave {key}",
+	}
+}
+
 func (p *JiraPort) Schema() map[string]Shape {
 	return map[string]Shape{
 		"status_category": ShapeEnum,          // new | indeterminate | done
