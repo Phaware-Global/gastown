@@ -411,7 +411,10 @@ status for that run. A finding is **new** when the fingerprint differs from
 the acknowledged one, **standing** otherwise. The
 report lists new findings in full and standing ones as counts with the
 oldest age, so the `SWEEP:` mail is short and the Mayor is never re-briefed
-on an unchanged item.
+on an unchanged item. New findings are capped at 25 per kind (worst
+severity first, then oldest); the rest appear as one "… and N more" count,
+and every one of them is still part of the run that the ack acknowledges,
+so a backlog of hundreds is briefed once as a number, not once per item.
 
 State advances only when the Mayor has actually been told. `gt assistant
 sweep` writes the run's fingerprints to a *pending* file keyed by a run ID
