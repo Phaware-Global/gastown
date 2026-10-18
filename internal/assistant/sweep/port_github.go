@@ -458,17 +458,42 @@ func (c *ghClient) prDiff(ref repoRef, base, head string) (*prSnapshot, error) {
 			continue
 		}
 		lines := strings.Split(sec, "\n")
-		snap.sections[diffPath(lines[0])] = lines
+		key := sectionPath(lines)
+		if _, dup := snap.sections[key]; dup {
+			return nil, fmt.Errorf("ambiguous diff path %q", key) // a decoy path containing " b/": compare as unknown
+		}
+		snap.sections[key] = lines
 	}
 	return snap, nil
 }
 
-// diffPath returns the new-side path of a "diff --git a/X b/Y" line.
-func diffPath(header string) string {
-	if i := strings.LastIndex(header, " b/"); i >= 0 {
-		return header[i+3:]
+// sectionPath returns the path a diff section describes. Git does not quote
+// spaces, so the "diff --git a/X b/Y" header is ambiguous for a path that
+// contains " b/"; the "+++ b/" line read before the first hunk is not (a
+// hunk body line "++ b/…" would render as "+++ b/…", hence the cut-off).
+// An entry without one (binary, mode-only, rename-only, deletion) uses its
+// "rename to" line, then the header's last " b/".
+func sectionPath(lines []string) string {
+	for _, l := range lines {
+		if strings.HasPrefix(l, "@@") {
+			break
+		}
+		if strings.HasPrefix(l, "+++ b/") {
+			return l[len("+++ b/"):]
+		}
 	}
-	return header
+	for _, l := range lines {
+		if strings.HasPrefix(l, "@@") {
+			break
+		}
+		if strings.HasPrefix(l, "rename to ") {
+			return l[len("rename to "):]
+		}
+	}
+	if i := strings.LastIndex(lines[0], " b/"); i >= 0 {
+		return lines[0][i+3:]
+	}
+	return lines[0]
 }
 
 // touchedBetween lists the files the base branch changed between two merge

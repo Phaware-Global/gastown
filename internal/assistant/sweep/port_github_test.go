@@ -337,6 +337,30 @@ func TestGitHubPort_ApprovalStaleDiff(t *testing.T) {
 	if e := got["approval-stale/acme/app#3"].External["diff_error"]; !strings.Contains(e, "500") {
 		t.Errorf("the compare error must be fenced in diff_error, got %q", e)
 	}
+	// Decoy paths containing " b/": a text decoy is keyed on its own "+++ b/"
+	// path, so a change to the real internal/auth.go beside it still reads
+	// "changed"; a binary decoy that aliases a real entry's key makes the
+	// verdict "unknown" rather than hiding the real change.
+	const decoyApproved = "diff --git a/zz b/internal/auth.go b/zz b/internal/auth.go\nindex 1111111..2222222 100644\n--- a/zz b/internal/auth.go\n+++ b/zz b/internal/auth.go\n@@ -1 +1 @@ decoy\n-d\n+e\ndiff --git a/internal/auth.go b/internal/auth.go\nindex 1111111..2222222 100644\n--- a/internal/auth.go\n+++ b/internal/auth.go\n@@ -1 +1 @@ func auth()\n-x\n+y\n"
+	const decoyBinaryApproved = "diff --git a/zz b/x.bin b/zz b/x.bin\nindex 1111111..2222222 100644\nBinary files a/zz b/x.bin and b/zz b/x.bin differ\ndiff --git a/x.bin b/x.bin\nindex 1111111..aaaaaaa 100644\nBinary files a/x.bin and b/x.bin differ\n"
+	app.Open.Nodes = []ghPR{stale(10, sha('k')), stale(11, sha('l'))}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, diffs: map[string]string{
+		"main..." + shaB:     decoyApproved,
+		"main..." + sha('k'): strings.Replace(decoyApproved, "+y", "+z", 1), // the real file changed after approval
+		"main..." + sha('l'): decoyBinaryApproved,                           // aliased keys
+	}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	findings, _ = p.Sweep(context.Background(), in)
+	got = map[string]Finding{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = f
+	}
+	if got["approval-stale/acme/app#10"].Fields["diff"] != "changed" {
+		t.Errorf("a text decoy must not hide a change to the real file: %v", got["approval-stale/acme/app#10"].Fields)
+	}
+	if f := got["approval-stale/acme/app#11"]; f.Fields["diff"] != "unknown" || !strings.Contains(f.External["diff_error"], "ambiguous diff path") {
+		t.Errorf("aliased keys must be unknown with the reason fenced: %v / %v", f.Fields, f.External)
+	}
 	// Binary entries: the approved head added x.bin; a swapped binary is a
 	// change even though the diff has no hunk body, while a base merge that
 	// only moved the base-side blob is not.
