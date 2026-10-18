@@ -227,20 +227,23 @@ The report lists, per port (beads first; Jira and GitHub when configured),
 **new** findings in full and **standing** ones as counts, deduped against the
 last *acknowledged* run. The report is already the mail body: it is
 deterministic, fenced and complete. Never retype it — a first run can list a
-hundred findings and retyping it is slow and lossy. Save it, send the file,
-then ack the run ID printed in its header:
+hundred findings and retyping it is slow and lossy. Save it to a private
+temporary file (never a fixed, shared path such as /tmp/sweep.md: another
+local account could read or pre-plant it), send the file as the body, then
+ack the run ID printed in its header. Chain the steps with `&&` so a failed
+sweep or redirect never mails:
 
 ```bash
-{{ cmd }} assistant sweep > /tmp/sweep.md            # the header line "Run-ID: <id>" names the run
-{{ cmd }} mail send mayor/ -s "SWEEP: <N> new findings (<ports>)" --stdin < /tmp/sweep.md
-{{ cmd }} assistant sweep --ack <id>                  # only after the mail was sent
+f=$(mktemp) && {{ cmd }} assistant sweep > "$f" && head -3 "$f"   # the header line "Run-ID: <id>" names the run
+{ printf '%s\n\n' "<your header: what is urgent, what needs a decision>"; cat "$f"; } \
+  | {{ cmd }} mail send mayor/ -s "SWEEP: <N> new findings (<ports>)" --stdin \
+  && {{ cmd }} assistant sweep --ack <id> && rm -f "$f"           # ack only after the mail was sent
 ```
 
 The subject carries counts only (new findings, ports checked, "PARTIAL"
-or "not checked" when a port says so). The body is the saved report, with
-at most a few lines of your own on top (what is urgent, what needs a
-decision). The subject argument never holds the body. Compose that header
-from the report:
+or "not checked" when a port says so). The body is the saved report with
+at most a few lines of your own on top. The subject argument never holds
+the body. What the report already guarantees (check it, do not retype it):
 
 1. New findings in full, standing findings as counts, in report order. The
    report shows at most 25 new findings per kind and counts the rest on an

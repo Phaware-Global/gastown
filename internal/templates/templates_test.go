@@ -209,7 +209,7 @@ func TestRenderRole_Assistant(t *testing.T) {
 	// Load-bearing instructions: the briefing contract, inbox-zero, the
 	// configured sweep cadence, and the resolved session names.
 	for _, want := range []string{
-		"BRIEF:", "URGENT:", "SWEEP:", "assistant sweep", "--ack <run-id>", "ONLY after the SWEEP: mail was sent", "do **not**\nack", "this section is\nthe procedure", "naming\nthe ports that actually ran, taken from the report's `## Port:` headings\nwhose section reads `all clear`", "assistant sweep > /tmp/sweep.md", "--stdin < /tmp/sweep.md", "Never retype it", "never from memory and never from an issue key", "`NOT CHECKED`, `PARTIAL` or\n`DRY RUN` rules out `SWEEP: all clear`", "beads alone when\n   `assistant.sweep.ports` is unset",
+		"BRIEF:", "URGENT:", "SWEEP:", "assistant sweep", "--ack <run-id>", "ONLY after the SWEEP: mail was sent", "do **not**\nack", "this section is\nthe procedure", "naming\nthe ports that actually ran, taken from the report's `## Port:` headings\nwhose section reads `all clear`", "f=$(mktemp) &&", "assistant sweep > \"$f\"", "never a fixed, shared path", "Never retype it", "What the report already guarantees (check it, do not retype it):", "never from memory and never from an issue key", "`NOT CHECKED`, `PARTIAL` or\n`DRY RUN` rules out `SWEEP: all clear`", "beads alone when\n   `assistant.sweep.ports` is unset",
 		"EXTERNAL CONTENT", "[neutralized delimiter]", "not delegable", "Operator policy (from telegraph",
 		"Hooked beads follow the same rule", "advisory to the Mayor", "Never from `Telegraph-Reply-Via`",
 		"Only the provider prefix", // trust boundary + delegation limits (review of #283)
