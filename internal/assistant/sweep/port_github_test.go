@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -78,6 +79,8 @@ type ghFixture struct {
 	owned       map[int]bool           // patrol-owned PR numbers
 	slow        time.Duration          // delay every GraphQL answer
 	paged       map[int]*ghPRPage      // full reviews/threads served to the per-PR paging query
+	pages       map[int][]*ghPRPage    // multi-page answers, selected by the rcur cursor "p<n>"
+	pageErr     int                    // 1-based page index that answers with errors and null connections (0 = none)
 	patrolDelay time.Duration          // patrolBeads sleeps this long
 }
 
@@ -104,6 +107,23 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 			slug := body.Variables["owner"].(string) + "/" + body.Variables["name"].(string)
 			if strings.Contains(body.Query, "pullRequest(number:$number)") {
 				n := int(body.Variables["number"].(float64))
+				if pages := fx.pages[n]; pages != nil {
+					idx := 0
+					if cur, _ := body.Variables["rcur"].(string); cur != "" {
+						fmt.Sscanf(cur, "p%d", &idx)
+					}
+					if fx.pageErr > 0 && idx+1 == fx.pageErr {
+						_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": map[string]any{"reviews": nil, "reviewThreads": nil}}},
+							"errors": []map[string]string{{"message": "Something went wrong while executing your query."}}})
+						return
+					}
+					if idx >= len(pages) {
+						idx = len(pages) - 1
+					}
+					pg := pages[idx]
+					_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": pg}}})
+					return
+				}
 				pg := fx.paged[n]
 				if pg == nil {
 					pg = &ghPRPage{}
@@ -385,5 +405,95 @@ func TestGitHubPort_BudgetReturnsPartialThroughRunPort(t *testing.T) {
 	}
 	if len(findings) == 0 {
 		t.Error("findings from the first repo must survive the cut")
+	}
+}
+
+// twoPages builds a two-page review answer: page 1 holds an old approval
+// and points at page 2 ("p1"), which holds kevin's newer CHANGES_REQUESTED.
+func twoPages() []*ghPRPage {
+	p1, p2 := &ghPRPage{}, &ghPRPage{}
+	old := ghReview{Author: ghActor{Login: "kevin"}, State: "APPROVED", SubmittedAt: ago(40 * time.Hour)}
+	old.Commit.Oid = shaB
+	p1.Reviews.Nodes = []ghReview{old}
+	p1.Reviews.PageInfo.HasNextPage, p1.Reviews.PageInfo.EndCursor = true, "p1"
+	newer := ghReview{Author: ghActor{Login: "kevin"}, State: "CHANGES_REQUESTED", SubmittedAt: ago(20 * time.Hour)}
+	newer.Commit.Oid = shaA
+	p2.Reviews.Nodes = []ghReview{newer}
+	return []*ghPRPage{p1, p2}
+}
+
+func TestGitHubPort_PagingFollowsCursorsAndNeverReadsErrorsAsComplete(t *testing.T) {
+	h := time.Hour
+	newApp := func() *ghRepoData {
+		app := &ghRepoData{}
+		app.Open.Nodes = []ghPR{pr(60, "artie", 60*h, 40*h, "SUCCESS", truncatedReviews)}
+		return app
+	}
+	// 1. Both pages are read: the newest review (page 2) drives the finding and the port is clean.
+	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": newApp(), "acme/extra": {}}, pages: map[int][]*ghPRPage{60: twoPages()}}
+	p, in := newGitHubTest(t, fx, []string{"artie"})
+	findings, err := p.Sweep(context.Background(), in)
+	if err != nil {
+		t.Fatalf("two clean pages must not be partial: %v", err)
+	}
+	found := false
+	for _, f := range findings {
+		if f.Kind == "changes-requested-stale" && f.Key == "acme/app#60" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("the review on page 2 must be seen (cursor not followed)")
+	}
+	// 2. Page 2 answers with errors and null connections: not complete, noted, partial.
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": newApp(), "acme/extra": {}}, pages: map[int][]*ghPRPage{60: twoPages()}, pageErr: 2}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	_, err = p.Sweep(context.Background(), in)
+	var partial *PartialError
+	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "acme/app#60: reviews or threads could not be paged in full") {
+		t.Fatalf("an errored page must be reported, got %v", err)
+	}
+	// 3. Endless pages hit the cap: noted, partial.
+	loop := &ghPRPage{}
+	loop.Reviews.PageInfo.HasNextPage, loop.Reviews.PageInfo.EndCursor = true, "p0"
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": newApp(), "acme/extra": {}}, pages: map[int][]*ghPRPage{60: {loop}}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	_, err = p.Sweep(context.Background(), in)
+	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "could not be paged in full") {
+		t.Fatalf("hitting the page cap must be reported, got %v", err)
+	}
+}
+
+func TestGitHubPort_HungPatrolCostsOneRigNotTheSweep(t *testing.T) {
+	h := time.Hour
+	app := &ghRepoData{}
+	app.Open.Nodes = []ghPR{pr(7, "someone", 30*h, 2*h, "FAILURE")}
+	other := &ghRepoData{}
+	other.Open.Nodes = []ghPR{pr(6, "artie", 3*h, 3*h, "PENDING")}
+	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": other}, patrolDelay: 5 * time.Second}
+	p, in := newGitHubTest(t, fx, []string{"artie"})
+	p.repos = func() ([]repoRef, error) {
+		return []repoRef{{Owner: "acme", Name: "app", Rig: "app", Reviewer: "phaware-val", Approver: "kevin"}, {Owner: "acme", Name: "extra", Rig: "extra", Reviewer: "phaware-val"}}, nil
+	}
+	oldWait, oldMargin := patrolWait, budgetMargin
+	patrolWait, budgetMargin = 150*time.Millisecond, 200*time.Millisecond
+	defer func() { patrolWait, budgetMargin = oldWait, oldMargin }()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	findings, err := p.Sweep(ctx, in)
+	var partial *PartialError
+	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "did not answer") {
+		t.Fatalf("a hung lookup must be noted as such, got %v", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Errorf("the lookup must be bounded on its own timer, took %s", time.Since(start))
+	}
+	keys := map[string]bool{}
+	for _, f := range findings {
+		keys[f.Kind+"/"+f.Key] = true
+	}
+	if !keys["ci-failing/acme/app#7"] || !keys["no-review-loop/acme/extra#6"] {
+		t.Errorf("the second repo must still be checked after a hung lookup in the first: %v", keys)
 	}
 }

@@ -26,6 +26,10 @@ const (
 	githubMaxPRPages      = 3 // open PRs per repo; more is reported as partial
 )
 
+// patrolWait bounds one patrol-bead lookup (further capped at a quarter of
+// the remaining budget).
+var patrolWait = 20 * time.Second
+
 // repoRef is one repository the port sweeps, with the rig settings that
 // decide who the internal reviewer and the required approver are.
 type repoRef struct {
@@ -382,10 +386,10 @@ func (c *ghClient) repo(ref repoRef, after string) (*ghRepoData, error) {
 	if err := c.do(req, &res); err != nil {
 		return nil, err
 	}
-	if res.Data.Repository == nil {
+	if res.Data.Repository == nil || len(res.Errors) > 0 {
 		msg := "repository not found or not accessible"
 		if len(res.Errors) > 0 {
-			msg = res.Errors[0].Message
+			msg = "graphql: " + res.Errors[0].Message
 		}
 		return nil, fmt.Errorf("%s: %s", ref.slug(), msg)
 	}
@@ -412,17 +416,35 @@ func (c *ghClient) prPage(ref repoRef, number int, rcur, tcur string) (*ghPRPage
 	var res struct {
 		Data struct {
 			Repository struct {
-				PullRequest *ghPRPage `json:"pullRequest"`
+				PullRequest *struct {
+					Reviews       *json.RawMessage `json:"reviews"`
+					ReviewThreads *json.RawMessage `json:"reviewThreads"`
+				} `json:"pullRequest"`
 			} `json:"repository"`
 		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
 	}
 	if err := c.do(req, &res); err != nil {
 		return nil, err
 	}
-	if res.Data.Repository.PullRequest == nil {
-		return nil, fmt.Errorf("%s#%d: not found", ref.slug(), number)
+	if len(res.Errors) > 0 {
+		return nil, fmt.Errorf("%s#%d: graphql: %s", ref.slug(), number, res.Errors[0].Message)
 	}
-	return res.Data.Repository.PullRequest, nil
+	pr := res.Data.Repository.PullRequest
+	// A null connection is a field-level failure, never an empty page.
+	if pr == nil || pr.Reviews == nil || pr.ReviewThreads == nil {
+		return nil, fmt.Errorf("%s#%d: reviews or threads missing from the page", ref.slug(), number)
+	}
+	var page ghPRPage
+	if err := json.Unmarshal(*pr.Reviews, &page.Reviews); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(*pr.ReviewThreads, &page.ReviewThreads); err != nil {
+		return nil, err
+	}
+	return &page, nil
 }
 
 // fillPR replaces a PR's reviews and threads with the complete, paged lists
@@ -533,6 +555,14 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 			if !timeLeft(ctx) {
 				res = patrolResult{err: fmt.Errorf("time budget exhausted")}
 			} else {
+				// Bound each lookup on its own timer so a wedged bd costs one
+				// rig its dedup, not every later repo its findings.
+				wait := patrolWait
+				if dl, ok := ctx.Deadline(); ok {
+					if quarter := time.Until(dl) / 4; quarter < wait {
+						wait = quarter
+					}
+				}
 				done := make(chan patrolResult, 1)
 				go func() {
 					set, err := p.patrolBeads(rig)
@@ -542,6 +572,8 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 				case res = <-done:
 				case <-ctx.Done():
 					res = patrolResult{err: fmt.Errorf("time budget exhausted waiting for bd")}
+				case <-time.After(wait):
+					res = patrolResult{err: fmt.Errorf("bd did not answer within %s", wait.Round(time.Millisecond))}
 				}
 			}
 			if res.set == nil {
