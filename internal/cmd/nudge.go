@@ -150,6 +150,21 @@ var idleWatcherTimeout = 60 * time.Second
 // Var so tests can override.
 var idleWatcherPollInterval = 1 * time.Second
 
+// agentHasPromptDetection reports whether a session's agent shows a ready
+// prompt that idle detection and the UserPromptSubmit drain rely on. A
+// town-defined agent (settings/config.json "agents", e.g. an opencode preset
+// named "opencode-nemotron") resolves through its provider's built-in preset;
+// the built-in registry alone knows nothing about it and would wrongly treat
+// it as Claude-like. An agent that resolves to no preset at all keeps the
+// Claude path, as before.
+func agentHasPromptDetection(townRoot, agentName string) bool {
+	if agentName == "" {
+		return true
+	}
+	preset := config.ResolvePresetForAgent(agentName, townRoot)
+	return preset == nil || preset.ReadyPromptPrefix != ""
+}
+
 // deliverNudge routes a nudge based on the --mode flag.
 // For "immediate" mode: sends directly via tmux (current behavior).
 // For "queue" mode: writes to the nudge queue for cooperative delivery.
@@ -188,11 +203,23 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		if townRoot == "" {
 			return fmt.Errorf("--mode=queue requires a Gas Town workspace")
 		}
-		return nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+		if err := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
 			Sender:   sender,
 			Message:  message,
 			Priority: nudgePriorityFlag,
-		})
+		}); err != nil {
+			return err
+		}
+		// Claude sessions drain the queue from their UserPromptSubmit hook. An
+		// agent without prompt detection (a town-defined opencode preset, say)
+		// has no such hook and, when idle, never submits a prompt, so without a
+		// poller the queue is never read. StartPoller is idempotent.
+		if agentName, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && agentName != "" && !agentHasPromptDetection(townRoot, agentName) {
+			if _, pollerErr := nudge.StartPoller(townRoot, sessionName); pollerErr != nil {
+				fmt.Fprintf(os.Stderr, "queue: could not start nudge poller for %s: %v\n", sessionName, pollerErr)
+			}
+		}
+		return nil
 
 	case NudgeModeWaitIdle:
 		if townRoot == "" {
@@ -207,8 +234,7 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		// and matches stale prompt characters in the pane buffer. (GH#gt-5ey3)
 		// Degrade to queue mode for agents without prompt-based detection.
 		if agentName, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && agentName != "" {
-			preset := config.GetAgentPresetByName(agentName)
-			if preset != nil && preset.ReadyPromptPrefix == "" {
+			if !agentHasPromptDetection(townRoot, agentName) {
 				fmt.Fprintf(os.Stderr, "wait-idle: %s agent %q has no prompt detection, using queue mode\n", sessionName, agentName)
 				if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
 					Sender:   sender,

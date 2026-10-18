@@ -9,6 +9,8 @@ package assistant
 import (
 	"errors"
 	"fmt"
+	"github.com/steveyegge/gastown/internal/nudge"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,6 +66,13 @@ func (m *Manager) Start(agentOverride string) error {
 	if _, err := session.KillExistingSession(t, sessionID, true); err != nil {
 		return ErrAlreadyRunning
 	}
+	// A poller left by a previous session of the same name decided its
+	// agent's prompt detection once, at its own start; after a restart with
+	// another agent it would never drain (or drain mid-stream). Stop it so
+	// the start below spawns a fresh one for the agent actually running.
+	if err := nudge.StopPoller(m.townRoot, sessionID); err != nil {
+		log.Printf("warning: stopping stale nudge poller for %s: %v", sessionID, err)
+	}
 
 	// Refuse to start in a town whose rig registry already uses the
 	// assistant's name: the work dir would be that rig's container and cwd
@@ -116,6 +125,15 @@ func (m *Manager) Start(agentOverride string) error {
 		return err
 	}
 
+	// Start the nudge-queue poller, as the witness and refinery managers do.
+	// Mail and telegraph nudges reach this session through the queue; a
+	// Claude session drains it from its UserPromptSubmit hook, but an
+	// opencode session has no such hook and, when idle, never submits a
+	// prompt, so without the poller every queued nudge sits undelivered.
+	if _, pollerErr := nudge.StartPoller(m.townRoot, sessionID); pollerErr != nil {
+		log.Printf("warning: could not start nudge poller for %s: %v", sessionID, pollerErr)
+	}
+
 	time.Sleep(session.ShutdownDelay())
 	return nil
 }
@@ -137,6 +155,9 @@ func (m *Manager) Stop() error {
 	_ = t.SendKeysRaw(sessionID, "C-c")
 	time.Sleep(100 * time.Millisecond)
 
+	if err := nudge.StopPoller(m.townRoot, sessionID); err != nil {
+		log.Printf("warning: stopping nudge poller for %s: %v", sessionID, err)
+	}
 	if err := t.KillSessionWithProcesses(sessionID); err != nil {
 		return fmt.Errorf("killing session: %w", err)
 	}

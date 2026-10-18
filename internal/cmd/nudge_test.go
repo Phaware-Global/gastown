@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"github.com/steveyegge/gastown/internal/config"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -547,5 +548,39 @@ func TestQueueLen(t *testing.T) {
 	_, _ = nudge.Drain(tmpDir, "test-session")
 	if got := nudge.QueueLen(tmpDir, "test-session"); got != 0 {
 		t.Errorf("QueueLen after drain = %d, want 0", got)
+	}
+}
+
+// A town-defined agent built on a provider without a ready prompt (opencode)
+// has no prompt detection; the built-in registry alone cannot tell, which is
+// how nudges to the opencode assistant ended up queued with nothing draining
+// them. Claude-provider agents, custom or built-in, keep prompt detection, and
+// an agent that resolves nowhere keeps the Claude path.
+func TestAgentHasPromptDetection_ResolvesTownCustomAgents(t *testing.T) {
+	townRoot := t.TempDir()
+	path := config.TownSettingsPath(townRoot)
+	settings, err := config.LoadOrCreateTownSettings(path)
+	if err != nil {
+		t.Fatalf("settings: %v", err)
+	}
+	settings.Agents["opencode-nemotron"] = &config.RuntimeConfig{Command: "opencode"} // no "provider": the shape config.json uses
+	settings.Agents["claude-sonnet"] = &config.RuntimeConfig{Command: "claude", Args: []string{"--model", "sonnet"}}
+	if err := config.SaveTownSettings(path, settings); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	for _, c := range []struct {
+		agent string
+		want  bool
+	}{
+		{"opencode-nemotron", false}, // custom, provider opencode: no ready prompt
+		{"opencode", false},          // built-in opencode preset
+		{"claude-sonnet", true},      // custom, provider defaults to claude
+		{"claude", true},             // built-in
+		{"no-such-agent", true},      // unknown: keep the Claude path
+		{"", true},
+	} {
+		if got := agentHasPromptDetection(townRoot, c.agent); got != c.want {
+			t.Errorf("agentHasPromptDetection(%q) = %v, want %v", c.agent, got, c.want)
+		}
 	}
 }
