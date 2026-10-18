@@ -46,10 +46,11 @@ type Runner struct {
 
 // NewRunner wires the built-in ports for a town.
 func NewRunner(townRoot string, settings *config.TownSettings) *Runner {
+	jira := NewJiraPort(townRoot, os.Getenv)
 	return &Runner{
 		TownRoot: townRoot,
 		Settings: settings,
-		Ports:    map[string]Port{"beads": NewBeadsPort(townRoot), "jira": NewJiraPort(townRoot, os.Getenv), "github": NewGitHubPort(townRoot, os.Getenv)},
+		Ports:    map[string]Port{"beads": NewBeadsPort(townRoot), "jira": jira, "github": NewGitHubPort(townRoot, os.Getenv, jira)},
 		Store:    NewStore(townRoot),
 		Now:      time.Now,
 	}

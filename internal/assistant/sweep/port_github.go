@@ -29,11 +29,14 @@ const (
 	githubPRPage           = 50
 	githubMaxPRPages       = 3  // open PRs per repo; more is reported as partial
 	githubComparesPerSweep = 30 // compare calls spent on stale approvals (four or five per PR); beyond that the diff is "unknown"
+	githubTagsChecked      = 5  // tags compared per merged release PR
 )
 
 // patrolWait bounds one patrol-bead lookup (further capped at a quarter of
 // the remaining budget).
 var patrolWait = 20 * time.Second
+
+var githubDefaultRelease = []string{"release/*"}
 
 // repoRef is one repository the port sweeps, with the rig settings that
 // decide who the internal reviewer and the required approver are.
@@ -47,9 +50,10 @@ type repoRef struct {
 func (r repoRef) slug() string { return r.Owner + "/" + r.Name }
 
 // GitHubPort reports PRs waiting on humans, stale approvals, unanswered
-// review feedback, missing internal review loops, failing CI nobody owns and
-// abandoned drafts. It only reads. (release-unclosed follows in the next
-// layer together with the PR-linked Jira kinds.)
+// review feedback, missing internal review loops, failing CI nobody owns,
+// abandoned drafts and untagged release merges, plus the PR-linked Jira
+// kinds when the Jira port is configured (port_github_links.go). It only
+// reads.
 type GitHubPort struct {
 	townRoot string
 	persona  func() ([]string, []string, error) // logins, telegraph extra repos
@@ -61,11 +65,14 @@ type GitHubPort struct {
 	patrolBeads func(rig string) (map[int]bool, error)
 	client      *http.Client
 	apiBase     string // "https://api.github.com"
+	// jira, when configured, supplies issue status for the PR-linked kinds.
+	jira *JiraPort
 }
 
 // NewGitHubPort returns the production GitHub port.
-func NewGitHubPort(townRoot string, getenv func(string) string) *GitHubPort {
+func NewGitHubPort(townRoot string, getenv func(string) string, jira *JiraPort) *GitHubPort {
 	return &GitHubPort{
+		jira:     jira,
 		townRoot: townRoot,
 		persona: func() ([]string, []string, error) {
 			cfg, err := telegraph.LoadWithDefaults(telegraph.DefaultPath(townRoot))
@@ -175,20 +182,28 @@ func (p *GitHubPort) Suggestions() []string {
 		"start the internal review loop on {key}",
 		"fix ci on {key}",
 		"add them to assistant.sweep.github.humans or ignore",
+		"cut the release tag for {key}",
+		"move {key} to the review status and assign it to {human}",
+		"move {key} back to in progress and assign it to the persona",
+		"move {key} to the uat status",
 	}
 }
 
 func (p *GitHubPort) Schema() map[string]Shape {
 	return map[string]Shape{
-		"human":        ShapeGitHubLogin, // listed human we wait on
-		"approver":     ShapeGitHubLogin, // rig's configured approver
-		"reviewer":     ShapeGitHubLogin, // rig's configured internal reviewer
-		"head":         ShapeSHA,
-		"ci":           ShapeEnum, // success | failure | pending | none
-		"diff":         ShapeEnum, // approval-stale: unchanged | changed | unknown since the approved head
-		"threads":      ShapeInt,  // unresolved review threads
-		"requested_at": ShapeTime,
-		"rig":          ShapeEnum,
+		"human":           ShapeGitHubLogin, // listed human we wait on
+		"approver":        ShapeGitHubLogin, // rig's configured approver
+		"reviewer":        ShapeGitHubLogin, // rig's configured internal reviewer
+		"head":            ShapeSHA,
+		"ci":              ShapeEnum, // success | failure | pending | none
+		"diff":            ShapeEnum, // approval-stale: unchanged | changed | unknown since the approved head
+		"threads":         ShapeInt,  // unresolved review threads
+		"requested_at":    ShapeTime,
+		"rig":             ShapeEnum,
+		"merge_commit":    ShapeSHA,
+		"pr":              ShapeInt,           // PR number of a linked issue
+		"status_category": ShapeEnum,          // linked Jira issue
+		"account_id":      ShapeJiraAccountID, // reviewer's Jira account
 	}
 }
 
@@ -272,6 +287,18 @@ type ghRequestEvent struct {
 	RequestedReviewer ghActor   `json:"requestedReviewer"`
 }
 
+type ghTag struct {
+	Name   string `json:"name"`
+	Target struct {
+		Oid           string    `json:"oid"`
+		CommittedDate time.Time `json:"committedDate"`
+		Target        *struct { // annotated tag → the commit it points at
+			Oid           string    `json:"oid"`
+			CommittedDate time.Time `json:"committedDate"`
+		} `json:"target"`
+	} `json:"target"`
+}
+
 // ghPR is one pull request as returned by githubRepoQuery. reviewsNull and
 // threadsNull record a null connection (a field-level GraphQL error such as
 // a FORBIDDEN from a least-privilege token), which must never read as "no
@@ -279,7 +306,10 @@ type ghRequestEvent struct {
 type ghPR struct {
 	nodeNull                 bool // the whole node came back null (a NON_NULL field was denied): unknown PR, never paged
 	reviewsNull, threadsNull bool
-
+	MergedAt                 time.Time `json:"mergedAt"`
+	MergeCommit              *struct {
+		Oid string `json:"oid"`
+	} `json:"mergeCommit"`
 	Number         int       `json:"number"`
 	Title          string    `json:"title"`
 	URL            string    `json:"url"`
@@ -323,9 +353,15 @@ type ghRepoData struct {
 		} `json:"pageInfo"`
 		Nodes []ghPR `json:"nodes"`
 	} `json:"open"`
+	Merged struct {
+		Nodes []ghPR `json:"nodes"`
+	} `json:"merged"`
+	Tags struct {
+		Nodes []ghTag `json:"nodes"`
+	} `json:"tags"`
 }
 
-const githubRepoQuery = `query($owner:String!,$name:String!,$after:String){
+const githubRepoQuery = `query($owner:String!,$name:String!,$after:String,$withTags:Boolean!){
   repository(owner:$owner,name:$name){
     open: pullRequests(states:OPEN, first:50, after:$after, orderBy:{field:UPDATED_AT,direction:DESC}){
       pageInfo{hasNextPage endCursor}
@@ -338,6 +374,12 @@ const githubRepoQuery = `query($owner:String!,$name:String!,$after:String){
         timelineItems(last:30, itemTypes:[REVIEW_REQUESTED_EVENT]){pageInfo{hasPreviousPage} nodes{__typename ... on ReviewRequestedEvent{createdAt requestedReviewer{... on User{login}}}}}
         forcePushes: timelineItems(last:1, itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{__typename ... on HeadRefForcePushedEvent{createdAt}}}
       }
+    }
+    merged: pullRequests(states:MERGED, first:30, orderBy:{field:UPDATED_AT,direction:DESC}) @include(if:$withTags){
+      nodes{number title url mergedAt baseRefName headRefName author{login} mergeCommit{oid}}
+    }
+    tags: refs(refPrefix:"refs/tags/", last:30, orderBy:{field:TAG_COMMIT_DATE,direction:ASC}) @include(if:$withTags){
+      nodes{name target{oid ... on Commit{committedDate} ... on Tag{target{oid ... on Commit{committedDate}}}}}
     }
   }
 }`
@@ -612,14 +654,14 @@ func headBlob(index string) string {
 // error with the repository still present (a least-privilege token denied
 // one field) keeps the data and is returned as a warning; the PRs whose
 // review connections came back null are paged separately by the caller.
-func (c *ghClient) repo(ref repoRef, after string) (*ghRepoData, string, error) {
+func (c *ghClient) repo(ref repoRef, after string, withTags bool) (*ghRepoData, string, error) {
 	if c.trace != nil {
-		c.trace(fmt.Sprintf("POST /graphql repository(%s) open PRs after=%q", ref.slug(), after))
+		c.trace(fmt.Sprintf("POST /graphql repository(%s) open PRs after=%q merged+tags=%v", ref.slug(), after, withTags))
 	}
 	if c.dry {
 		return &ghRepoData{}, "", nil
 	}
-	vars := map[string]any{"owner": ref.Owner, "name": ref.Name}
+	vars := map[string]any{"owner": ref.Owner, "name": ref.Name, "withTags": withTags}
 	if after != "" {
 		vars["after"] = after
 	}
@@ -746,7 +788,7 @@ func (c *ghClient) fillPR(ctx context.Context, ref repoRef, pr *ghPR) (bool, err
 // --- the sweep -------------------------------------------------------------
 
 type githubDurations struct {
-	remind, approvedUnmerged, respond, reviewLoop, ciFailing, stale time.Duration
+	remind, approvedUnmerged, respond, reviewLoop, ciFailing, releaseWindow, stale time.Duration
 }
 
 func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
@@ -796,6 +838,7 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		respond:          parseDur(cfg.RespondAfter, 12*time.Hour),
 		reviewLoop:       parseDur(cfg.ReviewLoopAfter, 2*time.Hour),
 		ciFailing:        parseDur(cfg.CIFailingAfter, time.Hour),
+		releaseWindow:    parseDur(cfg.ReleaseWindow, 14*24*time.Hour),
 		stale:            parseDur(cfg.StaleAfter, 7*24*time.Hour),
 	}
 	isHuman := lowerSet(cfg.Humans)
@@ -887,13 +930,14 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		return res.set[n], res.err
 	}
 
+	links := p.newLinks(ctx, in, note)
 	for _, ref := range repos {
 		if !timeLeft(ctx) {
 			note("time budget exhausted before %s", ref.slug())
 			break
 		}
 		var open []ghPR
-		checked := false
+		var first *ghRepoData
 		after := ""
 		for page := 0; ; page++ {
 			if !timeLeft(ctx) {
@@ -904,7 +948,7 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 				note("%s: more than %d open PRs; the rest were not checked", ref.slug(), githubMaxPRPages*githubPRPage)
 				break
 			}
-			d, warn, err := c.repo(ref, after)
+			d, warn, err := c.repo(ref, after, page == 0)
 			if err != nil {
 				if ctx.Err() != nil {
 					note("%s: time budget exhausted mid-call; open PRs not checked", ref.slug())
@@ -916,14 +960,16 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 			if warn != "" {
 				note("%s", warn)
 			}
-			checked = true
+			if page == 0 {
+				first = d
+			}
 			open = append(open, d.Open.Nodes...)
 			if !d.Open.PageInfo.HasNextPage {
 				break
 			}
 			after = d.Open.PageInfo.EndCursor
 		}
-		if !checked {
+		if first == nil {
 			continue
 		}
 		for i := range open {
@@ -943,6 +989,15 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 			}
 			out = append(out, p.checkPR(ref, pr, in.Now, d, isPersona, isHuman, owns, diffSince, note)...)
 		}
+		patterns := cfg.ReleaseBranches[ref.slug()]
+		if patterns == nil {
+			patterns = cfg.ReleaseBranches["*"]
+		}
+		if patterns == nil {
+			patterns = githubDefaultRelease
+		}
+		out = append(out, p.checkReleases(c, ref, first, patterns, in.Now, d, note)...)
+		out = append(out, links.check(ref, open, first.Merged.Nodes, patterns, in.Now, d, isHuman)...)
 	}
 	if len(partial) > 0 {
 		return out, &PartialError{Reason: strings.Join(partial, "; ")}

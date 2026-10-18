@@ -24,6 +24,9 @@ func ago(d time.Duration) time.Time { return ghNow.Add(-d) }
 const (
 	shaA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	shaB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	shaM = "cccccccccccccccccccccccccccccccccccccccc"
+	shaN = "dddddddddddddddddddddddddddddddddddddddd"
+	shaT = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 )
 
 // pr builds an open PR fixture; opts mutate it.
@@ -73,6 +76,35 @@ func thread(login string, at time.Duration, resolved bool) func(*ghPR) {
 
 func draft(p *ghPR) { p.IsDraft = true }
 
+func branch(name string) func(*ghPR) { return func(p *ghPR) { p.HeadRefName = name } }
+
+func mergedPR(n int, base, branch string, mergedAgo time.Duration, oid string) ghPR {
+	p := ghPR{Number: n, Title: "release pr", URL: "https://github.com/acme/app/pull/" + strconv.Itoa(n), BaseRefName: base, HeadRefName: branch,
+		MergedAt: ago(mergedAgo), CreatedAt: ago(mergedAgo + time.Hour), Author: ghActor{Login: "artie"}}
+	p.MergeCommit = &struct {
+		Oid string `json:"oid"`
+	}{Oid: oid}
+	return p
+}
+
+func tagAt(oid string, at time.Duration) ghTag {
+	t := ghTag{Name: "v"}
+	t.Target.Oid, t.Target.CommittedDate = oid, ago(at)
+	return t
+}
+
+// withJira wires a Jira port at the same test server and the link settings.
+func withJira(p *GitHubPort, in Input, srvURL string) {
+	p.jira = &JiraPort{
+		persona: func() ([]string, error) { return []string{personaID}, nil },
+		getenv:  func(string) string { return "tok" },
+		client:  p.client,
+		base:    func(string) string { return srvURL },
+	}
+	in.Settings.Assistant.Sweep.Jira = &config.JiraSweepConfig{Site: "example.atlassian.net", Email: "persona@example.com", Projects: []string{"P23"},
+		Reviewers: map[string]string{"kevin": humanID}}
+}
+
 type ghFixture struct {
 	calls       atomic.Int32
 	repos       map[string]*ghRepoData // "owner/name"
@@ -87,20 +119,37 @@ type ghFixture struct {
 	nullNodePR  int                    // repo query: this PR's whole node comes back null (NON_NULL field denied)
 	pageQueries []int                  // PR numbers the per-PR paging query was asked for
 	patrolCalls atomic.Int32
-	diffs       map[string]string   // "base...sha" → unified diff text; unlisted specs differ from each other
-	mergeBases  map[string]string   // "base...sha" → merge base sha (default "mb0": the base never moved)
-	baseFiles   map[string][]string // "mbOld...mbNew" → files the base touched between the merge bases
-	compareFail []string            // compare specs that answer 500
-	patrolDelay time.Duration       // patrolBeads sleeps this long
+	diffs       map[string]string           // "base...sha" → unified diff text; unlisted specs differ from each other
+	mergeBases  map[string]string           // "base...sha" → merge base sha (default "mb0": the base never moved)
+	baseFiles   map[string][]string         // "mbOld...mbNew" → files the base touched between the merge bases
+	compareFail []string                    // compare specs that answer 500
+	patrolDelay time.Duration               // patrolBeads sleeps this long
+	patches     map[string][]map[string]any // "base...sha" → compare files; unlisted specs differ from each other
+	compare     map[string]string           // "base...head" → status
+	issues      []map[string]any            // Jira issues returned for `key in (...)`
+	jiraErr     bool                        // Jira search fails
 }
 
 func (fx *ghFixture) handler(t *testing.T) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fx.calls.Add(1)
-		if r.Header.Get("Authorization") != "Bearer tok" {
+		if !strings.HasPrefix(r.URL.Path, "/rest/") && r.Header.Get("Authorization") != "Bearer tok" {
 			t.Errorf("missing token on %s", r.URL)
 		}
 		switch {
+		case r.URL.Path == "/rest/api/3/search/jql":
+			if fx.jiraErr {
+				http.Error(w, "jira down", 500)
+				return
+			}
+			jql := r.URL.Query().Get("jql")
+			var hit []map[string]any
+			for _, is := range fx.issues {
+				if strings.Contains(jql, `"`+is["key"].(string)+`"`) {
+					hit = append(hit, is)
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"issues": hit, "isLast": true})
 		case strings.Contains(r.URL.Path, "/compare/"):
 			spec := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
 			for _, f := range fx.compareFail {
@@ -117,6 +166,10 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 				_, _ = w.Write([]byte(d))
 				return
 			}
+			st := fx.compare[spec]
+			if st == "" {
+				st = "diverged"
+			}
 			mb := fx.mergeBases[spec]
 			if mb == "" {
 				mb = "mb0"
@@ -125,7 +178,7 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 			for _, f := range fx.baseFiles[spec] {
 				files = append(files, map[string]any{"filename": f})
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ahead", "merge_base_commit": map[string]any{"sha": mb}, "files": files})
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": st, "merge_base_commit": map[string]any{"sha": mb}, "files": files})
 		case r.URL.Path == "/graphql":
 			if fx.slow > 0 {
 				select {
@@ -558,6 +611,89 @@ func TestGitHubOwnerRepo(t *testing.T) {
 	}
 }
 
+func TestGitHubPort_ReleasesAndLinkedIssues(t *testing.T) {
+	h := time.Hour
+	app := &ghRepoData{}
+	app.Open.Nodes = []ghPR{
+		pr(30, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-30-thing"), requested("kevin", 30*h)),
+		pr(31, "artie", 40*h, 40*h, "SUCCESS", branch("feat/p23-31-lower"), requested("kevin", 30*h)),
+		pr(32, "artie", 40*h, 20*h, "SUCCESS", branch("feat/P23-32"), review("kevin", "CHANGES_REQUESTED", shaA, 2*h)),
+		pr(33, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-33"), requested("kevin", 30*h), draft),
+	}
+	app.Merged.Nodes = []ghPR{
+		mergedPR(40, "release/1.4", "feat/P23-40", 48*h, shaM),
+		mergedPR(41, "release/1.4", "feat/P23-41", 48*h, shaN),
+		mergedPR(42, "main", "feat/P23-42", 48*h, shaB),
+		mergedPR(43, "release/1.5", "feat/P23-43", 2*h, shaT),
+	}
+	app.Tags.Nodes = []ghTag{tagAt(shaB, 100*h), tagAt(shaT, 30*h)}
+	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}},
+		compare: map[string]string{shaM + "..." + shaT: "ahead"}, // v tag contains #40's merge
+		issues: []map[string]any{
+			issue("P23-30", "In Progress", "indeterminate", personaID, 100*h, 1*h, "needs handoff"),
+			issue("P23-31", "In Review", "indeterminate", humanID, 100*h, 1*h, "handed off correctly"),
+			issue("P23-32", "In Review", "indeterminate", humanID, 100*h, 1*h, "handed back"),
+			issue("P23-33", "To Do", "new", personaID, 100*h, 1*h, "draft"),
+			issue("P23-40", "Done", "done", personaID, 100*h, 1*h, "done, merged, tagged, not in UAT"),
+			issue("P23-41", "In UAT", "indeterminate", personaID, 100*h, 1*h, "already in UAT"),
+			issue("P23-42", "Done", "done", personaID, 100*h, 1*h, "merged to main"),
+			issue("P23-43", "Done", "done", personaID, 100*h, 1*h, "merged too recently for the UAT check"),
+		}}
+	p, in := newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	findings, err := p.Sweep(context.Background(), in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := map[string]Finding{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = f
+	}
+	for _, want := range []string{"review-handoff/P23-30", "review-handoff/P23-32", "done-not-in-uat/P23-40", "release-unclosed/acme/app#41", "release-unclosed/acme/app#43"} {
+		if _, ok := got[want]; !ok {
+			t.Errorf("missing %s; got %v", want, keysOf(got))
+		}
+	}
+	for _, absent := range []string{"review-handoff/P23-31", "review-handoff/P23-33", "done-not-in-uat/P23-41", "done-not-in-uat/P23-42", "done-not-in-uat/P23-43",
+		"release-unclosed/acme/app#40", "release-unclosed/acme/app#42"} {
+		if _, ok := got[absent]; ok {
+			t.Errorf("unexpected %s", absent)
+		}
+	}
+	if f := got["review-handoff/P23-30"]; f.Fields["human"] != "kevin" || f.Fields["account_id"] != humanID || f.Fields["pr"] != "30" || !strings.Contains(f.Suggest, "review status") {
+		t.Errorf("handoff: %+v", f)
+	}
+	if f := got["review-handoff/P23-32"]; !strings.Contains(f.Suggest, "back to in progress") {
+		t.Errorf("hand-back: %+v", f)
+	}
+	for k, f := range got {
+		if _, ok := f.Fields["status"]; ok {
+			t.Errorf("%s: status name must be External", k)
+		}
+		before := f.Suggest
+		enforceSchema(p.Schema(), p.Suggestions(), &f)
+		if f.Suggest != before {
+			t.Errorf("%s: suggest %q rejected by the templates", k, before)
+		}
+	}
+
+	// Jira down: PR-linked kinds are skipped with a partial note; the rest stands.
+	fx.jiraErr = true
+	findings, err = p.Sweep(context.Background(), in)
+	var partial *PartialError
+	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "linked Jira issues unavailable") {
+		t.Fatalf("Jira failure must be partial: %v", err)
+	}
+	for _, f := range findings {
+		if f.Kind == "review-handoff" || f.Kind == "done-not-in-uat" {
+			t.Errorf("linked kind reported without Jira data: %+v", f)
+		}
+		if f.Kind == "release-unclosed" {
+			return
+		}
+	}
+	t.Error("release-unclosed must still be reported when Jira is down")
+}
 func forcePushed(at time.Duration) func(*ghPR) {
 	return func(p *ghPR) {
 		p.Commits.Nodes[0].Commit.CheckSuites.Nodes = nil
