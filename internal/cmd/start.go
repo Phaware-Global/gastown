@@ -887,7 +887,7 @@ func cleanupPolecats(townRoot string) {
 
 			// Clean: remove worktree and branch
 			// selfNuke=false because this is gt start --shutdown cleanup, not polecat self-deleting
-			if err := polecatMgr.RemoveWithOptions(p.Name, true, shutdownNuclear, false); err != nil {
+			if err := polecatMgr.RemoveWith(p.Name, polecat.RemoveOptions{Force: true, Nuclear: shutdownNuclear, DiscardUnpushed: shutdownNuclear}); err != nil {
 				fmt.Printf("  %s %s/%s: cleanup failed: %v\n",
 					style.Dim.Render("○"), r.Name, p.Name, err)
 				totalSkipped++

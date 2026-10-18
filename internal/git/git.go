@@ -1078,6 +1078,83 @@ func (g *Git) CommitNoVerify(message string) error {
 	return err
 }
 
+// CommitPathsFromRef commits HEAD with only the given paths set to their
+// version at ref (removed when ref does not track them), authored as
+// name/email. The commit is built in a temporary index, so nothing else staged
+// in the real index is committed and no hook runs. The real index entries for
+// the paths are then moved to match the new HEAD, and paths that ref tracks
+// are restored on disk too (a modified tracked file would otherwise read as
+// dirt); paths ref does not track keep their working-tree copy.
+func (g *Git) CommitPathsFromRef(ref string, paths []string, message, name, email string) error {
+	parent, err := g.Rev("HEAD")
+	if err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp("", "gt-pathcommit-*")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	tmpEnv := []string{
+		"GIT_INDEX_FILE=" + filepath.Join(dir, "index"),
+		"GIT_AUTHOR_NAME=" + name, "GIT_AUTHOR_EMAIL=" + email,
+		"GIT_COMMITTER_NAME=" + name, "GIT_COMMITTER_EMAIL=" + email,
+	}
+
+	if _, err := g.runWithEnv([]string{"read-tree", "HEAD"}, tmpEnv); err != nil {
+		return err
+	}
+	if err := g.setIndexPathsFromRef(ref, paths, tmpEnv, false); err != nil {
+		return err
+	}
+	tree, err := g.runWithEnv([]string{"write-tree"}, tmpEnv)
+	if err != nil {
+		return err
+	}
+	commit, err := g.runWithEnv([]string{"commit-tree", tree, "-p", parent, "-m", message}, tmpEnv)
+	if err != nil {
+		return err
+	}
+	if _, err := g.run("update-ref", "-m", "commit: "+message, "HEAD", commit, parent); err != nil {
+		return err
+	}
+	return g.setIndexPathsFromRef(ref, paths, nil, true)
+}
+
+// setIndexPathsFromRef points each path's index entry at its version in ref,
+// or removes the entry when ref does not track it. extraEnv may redirect the
+// index via GIT_INDEX_FILE. With restoreWorktree, tracked paths are checked out
+// from ref (index and working tree) instead of only re-pointing the index.
+func (g *Git) setIndexPathsFromRef(ref string, paths []string, extraEnv []string, restoreWorktree bool) error {
+	for _, p := range paths {
+		entry, err := g.run("ls-tree", ref, "--", p)
+		if err != nil {
+			return err
+		}
+		if entry == "" {
+			if _, err := g.runWithEnv([]string{"update-index", "--force-remove", "--", p}, extraEnv); err != nil {
+				return err
+			}
+			continue
+		}
+		if restoreWorktree {
+			if err := g.CheckoutFileFromRef(ref, p); err != nil {
+				return err
+			}
+			continue
+		}
+		meta, _, _ := strings.Cut(entry, "\t")
+		fields := strings.Fields(meta) // mode type sha
+		if len(fields) != 3 {
+			return fmt.Errorf("unexpected ls-tree output for %s: %q", p, entry)
+		}
+		if _, err := g.runWithEnv([]string{"update-index", "--add", "--cacheinfo", fields[0] + "," + fields[2] + "," + p}, extraEnv); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // CommitAll stages all changes and commits.
 func (g *Git) CommitAll(message string) error {
 	_, err := g.run("commit", "-am", message)
@@ -3445,6 +3522,25 @@ func (g *Git) CommitsAhead(base, branch string) (int, error) {
 	return count, nil
 }
 
+// BranchCommitsNotOnRemote returns how many commits on the named local branch
+// are reachable from no remote-tracking ref of remote. Unlike
+// BranchPushedToRemote it judges the branch itself, not the checked-out HEAD,
+// so it works from a repo whose worktree for that branch is gone.
+func (g *Git) BranchCommitsNotOnRemote(branch, remote string) (int, error) {
+	if remote == "" {
+		remote = "origin"
+	}
+	out, err := g.run("rev-list", "--count", "refs/heads/"+branch, "--not", "--remotes="+remote)
+	if err != nil {
+		return 0, err
+	}
+	var count int
+	if _, err := fmt.Sscanf(out, "%d", &count); err != nil {
+		return 0, fmt.Errorf("parsing commit count: %w", err)
+	}
+	return count, nil
+}
+
 // CountCommitsBehind returns the number of commits that HEAD is behind the given ref.
 // For example, CountCommitsBehind("origin/main") returns how many commits
 // are on origin/main that are not on the current HEAD.
@@ -3671,6 +3767,20 @@ func (g *Git) unpushedFromExactRemoteBranch(localBranch, remote string) (int, bo
 
 	count, err := g.countCommitsAhead(remoteSHA)
 	return count, true, err
+}
+
+// HeadHeldByDurableRef reports whether a remote-tracking ref or a
+// refs/gt/preserve ref contains HEAD, i.e. whether the commits survive the
+// removal of a worktree whose detached HEAD is the only thing pointing at them.
+// Local branches deliberately do not count: polecat/* branches are
+// force-deleted by branch cleanup (gt polecat gc, sling rollback), so a commit
+// held only by one is not durable.
+func (g *Git) HeadHeldByDurableRef() (bool, error) {
+	out, err := g.run("for-each-ref", "--contains", "HEAD", "--count=1", "--format=%(refname)", "refs/remotes/", "refs/gt/preserve/")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "", nil
 }
 
 // remoteBranchContainingHead returns the first branch on remote whose tip

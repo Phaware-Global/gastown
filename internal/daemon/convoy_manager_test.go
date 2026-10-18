@@ -975,6 +975,34 @@ func TestScanStranded_ClosesEmptyConvoys(t *testing.T) {
 	}
 }
 
+// A role-workflow convoy reaches the sweep as tracked>0, ready=0, feedable=false:
+// it gets the completion check (which closes it once its steps are closed) and
+// is never fed.
+func TestScanStranded_RoleWorkflowConvoyGetsCompletionCheckNotFeed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows")
+	}
+
+	paths := mockGtForScanTest(t, scanTestOpts{
+		strandedJSON: `[{"id":"hq-wf-role","title":"Patrol","tracked_count":2,"ready_count":0,"ready_issues":[],"feedable":false,"not_feedable_reason":"role formula"}]`,
+		routes:       `{"prefix":"gt-","path":"gt/.beads"}` + "\n",
+	})
+
+	m := NewConvoyManager(paths.townRoot, func(string, ...interface{}) {}, "gt", 10*time.Minute, nil, nil, nil)
+	m.scan()
+
+	data, err := os.ReadFile(paths.checkLogPath)
+	if err != nil {
+		t.Fatalf("read check log: %v", err)
+	}
+	if !strings.Contains(string(data), "hq-wf-role") {
+		t.Errorf("expected gt convoy check for hq-wf-role, got: %q", data)
+	}
+	if sling, err := os.ReadFile(paths.slingLogPath); err == nil && strings.Contains(string(sling), "sling") {
+		t.Errorf("role-workflow convoy was fed: %q", sling)
+	}
+}
+
 func TestScanStranded_SkipsWhenDoltUnhealthy(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on Windows")

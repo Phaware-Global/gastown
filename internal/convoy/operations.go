@@ -291,6 +291,11 @@ func feedNextReadyIssue(ctx context.Context, store beadsdk.Storage, townRoot, co
 	// Extract base_branch from convoy description fields
 	var baseBranch string
 	if convoy, err := store.GetIssue(ctx, convoyID); err == nil && convoy != nil {
+		// A role formula's steps are not polecat work; say so once, not per step.
+		if reason := RoleWorkflowBlock(convoy.Description); reason != "" {
+			logger("%s: convoy %s: not feeding: %s", caller, convoyID, reason)
+			return
+		}
 		if cf := beads.ParseConvoyFields(&beads.Issue{Description: convoy.Description}); cf != nil {
 			baseBranch = cf.BaseBranch
 		}

@@ -1075,7 +1075,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Handle "direct" strategy: push to target branch, skip MR
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
-			if reason := refuseUnverifiedPush(g, unverifiedGuardProtectedBranches); reason != "" {
+			if reason := refuseUnverifiedPush(g, branch, unverifiedGuardProtectedBranches); reason != "" {
 				pushFailed = true
 				doneErrors = append(doneErrors, reason)
 				style.PrintWarning("%s", reason)
@@ -1161,7 +1161,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// when the tree was dirty, but an earlier auto-save/checkpoint
 		// cycle can have left an unverified commit on a now-clean branch
 		// (PR #184 review).
-		if reason := refuseUnverifiedPush(g, unverifiedGuardProtectedBranches); reason != "" {
+		if reason := refuseUnverifiedPush(g, branch, unverifiedGuardProtectedBranches); reason != "" {
 			pushFailed = true
 			doneErrors = append(doneErrors, reason)
 			style.PrintWarning("%s", reason)
@@ -1673,7 +1673,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			fmt.Printf("%s Late-detected direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
 			fmt.Printf("  Convoy: %s\n", convoyInfo.ID)
 
-			if reason := refuseUnverifiedPush(g, unverifiedGuardProtectedBranches); reason != "" {
+			if reason := refuseUnverifiedPush(g, branch, unverifiedGuardProtectedBranches); reason != "" {
 				pushFailed = true
 				doneErrors = append(doneErrors, reason)
 				style.PrintWarning("%s", reason)
@@ -2887,8 +2887,8 @@ func findHookedBeadForAgent(bd *beads.Beads, agentID string) string {
 // gt done push site consults this because the auto-save's own HooksFailed
 // gate only fires when auto-save ran in the same invocation — an unverified
 // commit left by an earlier cycle sits on a clean tree (PR #184 review).
-func refuseUnverifiedPush(g *git.Git, protectedBranches []string) string {
-	badSHA, err := git.HasUnverifiedCommit(g, "origin", protectedBranches)
+func refuseUnverifiedPush(g *git.Git, branch string, protectedBranches []string) string {
+	badSHA, err := git.HasUnverifiedCommitAt(g, "origin", "refs/heads/"+branch, protectedBranches)
 	if err != nil {
 		return fmt.Sprintf("could not check the branch for unverified commits — refusing to push until it can be verified: %v", err)
 	}
@@ -2964,15 +2964,30 @@ func isPolecatActor(actor string) bool {
 	return len(parts) >= 2 && parts[1] == "polecats"
 }
 
-// stripOverlayCLAUDEmd detects and removes Gas Town overlay content from CLAUDE.md
-// and CLAUDE.local.md before the branch is pushed. Polecats were committing the
-// overlay (which contains polecat lifecycle boilerplate like "Idle Polecat Heresy",
-// "gt done" protocol, etc.) into actual repos, overwriting project-specific CLAUDE.md
-// content. (gt-p35)
+// Git identity for the overlay cleanup commit. The cleanup is a tool action,
+// not the polecat's work, so it must not be attributed to the polecat
+// (git blame / provenance).
+const (
+	overlayCleanupAuthorName  = "Gas Town"
+	overlayCleanupAuthorEmail = "gt@gastown.local"
+)
+
+// stripOverlayCLAUDEmd removes Gas Town overlay content from CLAUDE.md and
+// CLAUDE.local.md before the branch is pushed. Polecats were committing the
+// overlay (polecat lifecycle boilerplate like "Idle Polecat Heresy", "gt done"
+// protocol, etc.) into actual repos, overwriting project-specific content.
 //
-// This runs after all commits but before push. If overlay files are detected in
-// the branch diff, they are restored (CLAUDE.md) or removed (CLAUDE.local.md)
-// and a cleanup commit is created.
+// This runs after all commits but before push. If overlay files differ from
+// the target branch, a cleanup commit sets them back to the target branch's
+// version (or removes them when the target does not track them). A file the
+// target branch already tracks is never deleted: that would be a change nobody
+// authored for this task, riding into an unrelated MR.
+//
+// The cleanup commit contains only the overlay paths: anything else staged
+// stays staged and uncommitted. Tracked overlay files are restored on disk from
+// origin/<default> as well, so the worktree is not left dirty. The overlay is
+// not regenerated after gt done, and if the push then fails the files stay
+// stripped.
 //
 // Returns true if a cleanup commit was created.
 func stripOverlayCLAUDEmd(g *git.Git, defaultBranch string) bool {
@@ -2985,73 +3000,31 @@ func stripOverlayCLAUDEmd(g *git.Git, defaultBranch string) bool {
 		return false
 	}
 
-	claudeChanged := false
-	claudeLocalChanged := false
+	var overlayPaths []string
 	for _, f := range changedFiles {
 		switch f {
 		case "CLAUDE.md":
-			claudeChanged = true
-		case "CLAUDE.local.md":
-			claudeLocalChanged = true
-		}
-	}
-
-	if !claudeChanged && !claudeLocalChanged {
-		return false // Nothing to strip
-	}
-
-	needsCommit := false
-
-	// Handle CLAUDE.md: check if the committed version contains overlay marker
-	if claudeChanged {
-		// Read current CLAUDE.md from HEAD
-		currentContent, showErr := g.ShowFile("HEAD", "CLAUDE.md")
-		if showErr == nil && strings.Contains(currentContent, templates.PolecatLifecycleMarker) {
-			// Current CLAUDE.md has overlay content — restore from origin
-			origContent, origErr := g.ShowFile(originRef, "CLAUDE.md")
-			if origErr != nil {
-				// CLAUDE.md didn't exist on origin/main — the overlay created it.
-				// Remove it from tracking.
-				if rmErr := g.RmCached("CLAUDE.md"); rmErr == nil {
-					needsCommit = true
-					fmt.Printf("%s Removed overlay CLAUDE.md (did not exist on %s)\n",
-						style.Bold.Render("→"), defaultBranch)
-				}
-			} else {
-				// CLAUDE.md existed on origin — restore original content
-				_ = origContent // Restore via checkout
-				if coErr := g.CheckoutFileFromRef(originRef, "CLAUDE.md"); coErr == nil {
-					if addErr := g.Add("CLAUDE.md"); addErr == nil {
-						needsCommit = true
-						fmt.Printf("%s Restored original CLAUDE.md (stripped Gas Town overlay)\n",
-							style.Bold.Render("→"))
-					}
-				}
+			// CLAUDE.md is a project file: only touch it when HEAD carries the overlay.
+			if content, showErr := g.ShowFile("HEAD", "CLAUDE.md"); showErr == nil && strings.Contains(content, templates.PolecatLifecycleMarker) {
+				overlayPaths = append(overlayPaths, f)
 			}
+		case "CLAUDE.local.md":
+			// Always a runtime artifact.
+			overlayPaths = append(overlayPaths, f)
 		}
 	}
-
-	// Handle CLAUDE.local.md: always remove from commits (it's a runtime artifact)
-	if claudeLocalChanged {
-		if rmErr := g.RmCached("CLAUDE.local.md"); rmErr == nil {
-			needsCommit = true
-			fmt.Printf("%s Removed CLAUDE.local.md from branch (Gas Town overlay)\n",
-				style.Bold.Render("→"))
-		}
-	}
-
-	if !needsCommit {
+	if len(overlayPaths) == 0 {
 		return false
 	}
 
-	// Create cleanup commit
-	if commitErr := g.Commit("chore: strip Gas Town overlay from CLAUDE.md (gt-p35)"); commitErr != nil {
+	if commitErr := g.CommitPathsFromRef(originRef, overlayPaths, "chore: strip Gas Town overlay from CLAUDE files",
+		overlayCleanupAuthorName, overlayCleanupAuthorEmail); commitErr != nil {
 		style.PrintWarning("failed to create overlay cleanup commit: %v", commitErr)
 		return false
 	}
 
-	fmt.Printf("%s Created cleanup commit to remove Gas Town overlay files\n",
-		style.Bold.Render("✓"))
+	fmt.Printf("%s Created cleanup commit stripping Gas Town overlay from %s\n",
+		style.Bold.Render("✓"), strings.Join(overlayPaths, ", "))
 	return true
 }
 

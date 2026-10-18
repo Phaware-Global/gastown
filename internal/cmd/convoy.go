@@ -1395,6 +1395,11 @@ type strandedConvoyInfo struct {
 	ReadyIssues  []string `json:"ready_issues"`
 	CreatedAt    string   `json:"created_at,omitempty"`
 	BaseBranch   string   `json:"base_branch,omitempty"`
+	// Feedable is true when ReadyIssues can be dispatched to a polecat. A convoy
+	// can be stranded and not feedable (empty, nothing ready, or a role workflow
+	// whose steps run on the owning role); NotFeedableReason says why for the last.
+	Feedable          bool   `json:"feedable"`
+	NotFeedableReason string `json:"not_feedable_reason,omitempty"`
 }
 
 // readyIssueInfo holds info about a ready (stranded) issue.
@@ -1431,6 +1436,8 @@ func runConvoyStranded(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  🚚 %s: %s\n", s.ID, s.Title)
 		if s.ReadyCount == 0 && s.TrackedCount == 0 {
 			fmt.Printf("     Empty convoy (0 tracked issues) — needs cleanup\n")
+		} else if s.NotFeedableReason != "" {
+			fmt.Printf("     %d tracked issues, feedable=false — %s\n", s.TrackedCount, s.NotFeedableReason)
 		} else if s.ReadyCount == 0 && s.TrackedCount > 0 {
 			fmt.Printf("     %d tracked issues, 0 ready — needs agent review\n", s.TrackedCount)
 		} else {
@@ -1466,6 +1473,10 @@ func runConvoyStranded(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Println("Needs agent review (tracked issues exist but none are ready):")
 		for _, s := range needsAttention {
+			if s.NotFeedableReason != "" {
+				fmt.Printf("  🚚 %s (%d tracked, feedable=false)\n", s.ID, s.TrackedCount)
+				continue
+			}
 			fmt.Printf("  🚚 %s (%d tracked, 0 ready)\n", s.ID, s.TrackedCount)
 		}
 	}
@@ -1524,6 +1535,11 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 			continue
 		}
 
+		// A role formula's steps belong to that role, not a rig polecat (gt-p1n2).
+		// The convoy stays in the result, not feedable, so the completion sweep
+		// still closes it and an operator still sees it.
+		notFeedable := convoyops.RoleWorkflowBlock(convoy.Description)
+
 		// Find ready issues (open, not blocked, no live assignee, slingable).
 		// Town-level beads (hq- prefix with path=".") are excluded because
 		// they can't be dispatched via gt sling -- they're handled by the deacon.
@@ -1538,15 +1554,16 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 
 		var readyIssues []string
 		for _, t := range tracked {
-			if isReadyIssue(t, scheduledSet) {
-				if !isSlingableBead(townBeads, t.ID) {
-					continue
-				}
-				if !convoyops.IsSlingableType(t.IssueType) {
-					continue
-				}
-				readyIssues = append(readyIssues, t.ID)
+			if notFeedable != "" {
+				break
 			}
+			if !isReadyIssue(t, scheduledSet) {
+				continue
+			}
+			if !isSlingableBead(townBeads, t.ID) || !convoyops.IsSlingableType(t.IssueType) {
+				continue
+			}
+			readyIssues = append(readyIssues, t.ID)
 		}
 
 		if len(readyIssues) > 0 {
@@ -1558,18 +1575,20 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 				ReadyIssues:  readyIssues,
 				CreatedAt:    convoy.CreatedAt,
 				BaseBranch:   baseBranch,
+				Feedable:     true,
 			})
 		} else {
 			// Has tracked issues but none are ready — include in stranded
 			// list so callers can distinguish from truly empty convoys.
 			stranded = append(stranded, strandedConvoyInfo{
-				ID:           convoy.ID,
-				Title:        convoy.Title,
-				TrackedCount: len(tracked),
-				ReadyCount:   0,
-				ReadyIssues:  []string{},
-				CreatedAt:    convoy.CreatedAt,
-				BaseBranch:   baseBranch,
+				ID:                convoy.ID,
+				Title:             convoy.Title,
+				TrackedCount:      len(tracked),
+				ReadyCount:        0,
+				ReadyIssues:       []string{},
+				CreatedAt:         convoy.CreatedAt,
+				BaseBranch:        baseBranch,
+				NotFeedableReason: notFeedable,
 			})
 		}
 	}
