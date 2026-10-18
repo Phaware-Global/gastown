@@ -430,10 +430,17 @@ appear as one "… and N more" count. Standing findings and the new findings
 listed in full enter the pending run and are upserted at the ack; counted
 items are not, so an ack never consumes an item the Mayor did not see by
 key: they stay new and are promoted into the full list as listed items
-clear, and reminders (the GitHub re-ping) count only for listed items. The
-cap is a report limit, not truncation: eviction considers every finding the
-port returned, counted ones included, so a counted item whose fingerprint
-changed keeps its earlier acknowledged entry.
+clear. The cap is a report limit, not truncation: eviction considers every
+finding the port returned, counted ones included, so a counted item whose
+fingerprint changed keeps its earlier acknowledged entry.
+
+The reminder clock is the fingerprint, never `LastAcked`: the GitHub port
+folds the elapsed `remind_after` periods into a `review-waiting` finding's
+fingerprint (`<head>|<periods waited>`), so the item turns **new** once per
+period and is re-briefed as a listed item; a standing item's upsert
+refreshes `LastAcked` but moves no reminder. A period in which the item was
+only counted, not listed, sends no reminder — the next period's fingerprint
+makes it new again.
 
 State advances only when the Mayor has actually been told. `gt assistant
 sweep` writes the run's fingerprints to a *pending* file keyed by a run ID
@@ -443,10 +450,11 @@ set as acknowledged. A run that is never acked (session died before
 mailing, context compacted, health-kill) leaves the acknowledged state
 untouched, so the next run reports the same findings as new again. Manual
 re-checks (`--json`, `--dry-run`, or any run outside the sweep protocol)
-never write state. At `--ack` the runner **upserts every fingerprint the
-run reported**, from every port, complete or partial — a finding the Mayor
-was told about is acknowledged regardless of how the rest of the port
-fared. **Eviction** (dropping an entry whose finding was absent) happens
+never write state. At `--ack` the runner **upserts every listed fingerprint the
+run reported** (standing items and new items printed in full), from every
+port, complete or partial — a finding the Mayor was told about is
+acknowledged regardless of how the rest of the port fared, and a counted
+item is not. **Eviction** (dropping an entry whose finding was absent) happens
 only for ports that completed that run without error or truncation, so a
 recurrence with the same fingerprint — a CI re-run failing on the same
 head — is new again rather than standing, while a port that failed, timed
