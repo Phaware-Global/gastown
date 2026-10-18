@@ -150,10 +150,6 @@ var idleWatcherTimeout = 60 * time.Second
 // Var so tests can override.
 var idleWatcherPollInterval = 1 * time.Second
 
-// deliverNudge routes a nudge based on the --mode flag.
-// For "immediate" mode: sends directly via tmux (current behavior).
-// For "queue" mode: writes to the nudge queue for cooperative delivery.
-// For "wait-idle" mode: waits for idle, then delivers or falls back to queue.
 // agentHasPromptDetection reports whether a session's agent shows a ready
 // prompt that idle detection and the UserPromptSubmit drain rely on. A
 // town-defined agent (settings/config.json "agents", e.g. an opencode preset
@@ -169,6 +165,10 @@ func agentHasPromptDetection(townRoot, agentName string) bool {
 	return preset == nil || preset.ReadyPromptPrefix != ""
 }
 
+// deliverNudge routes a nudge based on the --mode flag.
+// For "immediate" mode: sends directly via tmux (current behavior).
+// For "queue" mode: writes to the nudge queue for cooperative delivery.
+// For "wait-idle" mode: waits for idle, then delivers or falls back to queue.
 func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 	// Test hook: when GT_TEST_NUDGE_LOG is set, log the nudge instead of
 	// delivering through real tmux/queue transport. Prevents test-suite
