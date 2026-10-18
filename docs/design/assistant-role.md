@@ -221,7 +221,10 @@ launder that text into trusted instructions:
    whitespace flattening. The Mayor rebuilds the substitution from the
    relayed header values with the transform's own sanitizer (the same
    delimiter redaction `prompts.substitute` applies), never from raw header
-   text. A section that was cut at the prompt cap (it ends in
+   text, using the same header-to-token mapping the transform used: an
+   omitted `Telegraph-URL` or `Telegraph-Labels` header and a zero
+   `Telegraph-Timestamp` (`0001-01-01T00:00:00Z`, the transform's value for
+   an event with no provider time) substitute as the empty string. A section that was cut at the prompt cap (it ends in
    `[… prompt truncated]`) **never matches**: token values have no length
    limit, so a webhook-sized `{labels}` or `{actor}` could push a restrictive
    clause past the cap and leave a genuine, nonce-certified block that says
@@ -422,9 +425,13 @@ the acknowledged one, **standing** otherwise. The
 report lists new findings in full and standing ones as counts with the
 oldest age, so the `SWEEP:` mail is short and the Mayor is never re-briefed
 on an unchanged item. New findings are capped at 25 per kind (worst
-severity first, then oldest); the rest appear as one "… and N more" count,
-and every one of them is still part of the run that the ack acknowledges,
-so a backlog of hundreds is briefed once as a number, not once per item.
+severity first, then oldest; urgent findings are never capped); the rest
+appear as one "… and N more" count. Only the findings the report listed in
+full enter the pending run, so an ack never consumes an item the Mayor did
+not see by key: counted items stay new and are promoted into the full list
+as listed items clear, and reminders (the GitHub re-ping) count only for
+listed items. The cap is a report limit, not truncation — it never affects
+eviction.
 
 State advances only when the Mayor has actually been told. `gt assistant
 sweep` writes the run's fingerprints to a *pending* file keyed by a run ID
