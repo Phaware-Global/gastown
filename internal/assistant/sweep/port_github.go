@@ -21,7 +21,7 @@ import (
 
 // GitHub port defaults (design: docs/design/assistant-role.md, "GitHub port").
 const (
-	githubDefaultTokenEnv = "GITHUB_TOKEN"
+	githubDefaultTokenEnv = "GITHUB_TOKEN" //nolint:gosec // G101: the name of an environment variable, not a secret
 	githubPRPage          = 50
 	githubMaxPRPages      = 3 // open PRs per repo; more is reported as partial
 )
@@ -278,7 +278,7 @@ func (c *ghClient) do(req *http.Request, out any) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s %s: HTTP %d: %s", req.Method, req.URL.Path, resp.StatusCode, truncate(string(body), 300))
