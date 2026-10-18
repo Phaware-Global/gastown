@@ -1776,8 +1776,11 @@ func TestWorkAtRiskError_ForceWording(t *testing.T) {
 	if strings.Contains(msg, "does not bypass") || strings.Contains(msg, "the only way to delete") {
 		t.Errorf("unchecked branch: Error() contradicts the Reason's --force advice: %v", msg)
 	}
-	if !strings.Contains(msg, "--force") {
-		t.Errorf("unchecked branch: Error() must mention --force: %v", msg)
+	if !strings.Contains(msg, "gt polecat remove --force") {
+		t.Errorf("unchecked branch: Error() must name gt polecat remove --force: %v", msg)
+	}
+	if strings.Contains(msg, "--discard-unpushed") {
+		t.Errorf("unchecked branch: Error() must not offer --discard-unpushed, which gt polecat remove lacks: %v", msg)
 	}
 }
 

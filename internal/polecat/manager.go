@@ -1192,7 +1192,7 @@ func (e *WorkAtRiskError) Error() string {
 	}
 	b.WriteString(" fix the cause (e.g. amend a hooks-bypassed commit so hooks re-run) or push or move the commits somewhere durable, and retry the removal. ")
 	if e.ForceBypasses {
-		b.WriteString("Nothing is known to be unpushed here, so --force (or --discard-unpushed) removes it anyway.")
+		b.WriteString("Nothing is known to be unpushed here, so gt polecat remove --force removes it anyway.")
 	} else {
 		b.WriteString("--force does not bypass this. gt polecat nuke refuses these commits too; the only way to delete them on purpose is its --discard-unpushed flag.")
 	}

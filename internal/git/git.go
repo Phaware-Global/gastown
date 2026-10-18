@@ -1008,21 +1008,29 @@ func (g *Git) GetPushURL(remote string) (string, error) {
 // Push pushes to the remote branch with a timeout to prevent indefinite hangs
 // when the remote is unreachable.
 //
-// A bare branch name is qualified as refs/heads/<branch>, so a same-named tag
-// cannot be pushed in its place and a name beginning with '-' is never read as
-// an option. An explicit refspec (src:dst, HEAD, refs/...) is passed through
-// unchanged, except that one beginning with '-' is refused.
+// A bare branch name is pushed as refs/heads/<branch>:refs/heads/<branch>, so a
+// same-named tag cannot be pushed in its place and a name beginning with '+' is
+// never read as a forced refspec; forcing goes only through the force flag. A
+// name beginning with '-' is refused, and --end-of-options keeps the remote and
+// refspec from being read as options. An explicit refspec (src:dst, HEAD,
+// refs/...) is passed through unchanged, except that one beginning with '+' is
+// refused.
 func (g *Git) Push(remote, branch string, force bool) error {
 	if strings.HasPrefix(branch, "-") {
 		return fmt.Errorf("refusing to push %q: not a branch name or refspec", branch)
 	}
-	if !strings.ContainsAny(branch, ":+") && branch != "HEAD" && !strings.HasPrefix(branch, "refs/") {
-		branch = "refs/heads/" + branch
+	if strings.Contains(branch, ":") || branch == "HEAD" || strings.HasPrefix(branch, "refs/") {
+		if strings.HasPrefix(branch, "+") {
+			return fmt.Errorf("refusing to push %q: a '+' refspec forces; pass force instead", branch)
+		}
+	} else {
+		branch = "refs/heads/" + branch + ":refs/heads/" + branch
 	}
-	args := []string{"push", remote, branch}
+	args := []string{"push"}
 	if force {
 		args = append(args, "--force")
 	}
+	args = append(args, "--end-of-options", remote, branch)
 	_, err := g.runWithTimeout(pushTimeout, args...)
 	return err
 }

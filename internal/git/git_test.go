@@ -3562,6 +3562,47 @@ func TestPushAndRemoteQueries_QualifyBareBranch(t *testing.T) {
 	if err := g.Push("origin", "--delete", false); err == nil {
 		t.Error("Push of an option-shaped name must be refused")
 	}
+
+	// A leading '+' is a branch name, not a forced refspec: Push("+victim") must
+	// not force-update the remote's diverged "victim" branch.
+	const victim = "victim"
+	remoteTip := func(ref string) string {
+		out, _ := exec.Command("git", "-C", remoteDir, "rev-parse", "--verify", "-q", ref).Output()
+		return strings.TrimSpace(string(out))
+	}
+	runGit(t, localDir, "checkout", "-b", victim)
+	if err := g.Push("origin", victim, false); err != nil {
+		t.Fatalf("Push(%s): %v", victim, err)
+	}
+	runGit(t, localDir, "commit", "--amend", "-m", "diverged from the remote's victim")
+	before := remoteTip("refs/heads/" + victim)
+	runGit(t, localDir, "checkout", "-b", "+"+victim)
+	if err := g.Push("origin", "+"+victim, false); err != nil {
+		t.Fatalf("Push(+%s): %v", victim, err)
+	}
+	if after := remoteTip("refs/heads/" + victim); after != before {
+		t.Errorf("Push(+%s, force=false) force-updated remote refs/heads/%s: %s -> %s", victim, victim, before, after)
+	}
+	if remoteTip("refs/heads/+"+victim) == "" {
+		t.Errorf("remote refs/heads/+%s missing after Push", victim)
+	}
+
+	// An explicit '+' refspec is refused rather than forced through.
+	if err := g.Push("origin", "+HEAD:refs/heads/"+victim, false); err == nil {
+		t.Error("Push of a '+' refspec must be refused")
+	}
+	if after := remoteTip("refs/heads/" + victim); after != before {
+		t.Errorf("refused '+' refspec moved remote refs/heads/%s: %s -> %s", victim, before, after)
+	}
+
+	// A mid-name '+' is an ordinary branch character and is qualified.
+	runGit(t, localDir, "checkout", "-b", "feat+x")
+	if err := g.Push("origin", "feat+x", false); err != nil {
+		t.Fatalf("Push(feat+x): %v", err)
+	}
+	if remoteTip("refs/heads/feat+x") == "" {
+		t.Error("remote refs/heads/feat+x missing after Push(feat+x)")
+	}
 	if exists, err := g.RemoteBranchExists("origin", "--exit-code"); err != nil || exists {
 		t.Errorf("RemoteBranchExists(--exit-code) = (%v, %v), want (false, nil)", exists, err)
 	}
