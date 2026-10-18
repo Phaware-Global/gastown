@@ -227,18 +227,30 @@ The report lists, per port (beads first; Jira and GitHub when configured),
 **new** findings in full and **standing** ones as counts, deduped against the
 last *acknowledged* run. The report is already the mail body: it is
 deterministic, fenced and complete. Never retype it — a first run can list a
-hundred findings and retyping it is slow and lossy. Save it to a private
-temporary file (never a fixed, shared path such as /tmp/sweep.md: another
-local account could read or pre-plant it), send the file as the body, then
-ack the run ID printed in its header. Chain the steps with `&&` so a failed
-sweep or redirect never mails:
+hundred findings and retyping it is slow and lossy. Save it under your own
+work dir (`$GT_ROOT/assistant/.runtime/`, private to this town — never a
+shared path such as /tmp, which another local account could read or
+pre-plant), read its header, then send the file as the body and ack the
+run ID the file itself names. The second step is one command: it reads
+the path from `$GT_ROOT` (set in your session, not from an earlier shell),
+refuses to mail an empty or missing file, takes the run ID from the file
+with `sed` rather than from your memory, and fails closed at every step:
 
 ```bash
-f=$(mktemp) && {{ cmd }} assistant sweep > "$f" && head -3 "$f"   # the header line "Run-ID: <id>" names the run
-{ printf '%s\n\n' "<your header: what is urgent, what needs a decision>"; cat "$f"; } \
-  | {{ cmd }} mail send mayor/ -s "SWEEP: <N> new findings (<ports>)" --stdin \
-  && {{ cmd }} assistant sweep --ack <id> && rm -f "$f"           # ack only after the mail was sent
+{{ cmd }} assistant sweep > "$GT_ROOT/assistant/.runtime/sweep-report.md" && head -3 "$GT_ROOT/assistant/.runtime/sweep-report.md"
 ```
+
+```bash
+set -o pipefail; r="$GT_ROOT/assistant/.runtime/sweep-report.md"; test -s "$r" && { cat <<'HDR'
+<your header: what is urgent, what needs a decision — plain text, no commands>
+HDR
+echo; cat "$r"; } | {{ cmd }} mail send mayor/ -s "SWEEP: <N> new findings (<ports>)" --stdin \
+  && {{ cmd }} assistant sweep --ack "$(sed -n 's/^Run-ID: //p' "$r")" && rm -f "$r"
+```
+
+The header goes through a quoted heredoc (`<<'HDR'`), as the BRIEF recipe
+does, because it may echo PR titles and issue summaries that outsiders
+wrote: inside double quotes a title containing `$(…)` would run as you.
 
 The subject carries counts only (new findings, ports checked, "PARTIAL"
 or "not checked" when a port says so). The body is the saved report with
