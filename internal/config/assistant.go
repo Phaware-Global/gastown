@@ -18,6 +18,9 @@ type SweepConfig struct {
 
 	// Jira configures the Jira port (disabled until site and projects are set).
 	Jira *JiraSweepConfig `json:"jira,omitempty"`
+
+	// GitHub configures the GitHub port (repos come from the rig registry).
+	GitHub *GitHubSweepConfig `json:"github,omitempty"`
 }
 
 // BeadsSweepConfig tunes the beads port.
@@ -77,4 +80,29 @@ func (s *TownSettings) JiraSweep() *JiraSweepConfig {
 		return &JiraSweepConfig{}
 	}
 	return s.Assistant.Sweep.Jira
+}
+
+// GitHubSweepConfig configures the GitHub port. "Our" PRs are those authored
+// by a login in telegraph.mayor.github_logins; repos are the rig registry's
+// GitHub remotes plus telegraph.providers.github.extra_repos plus ExtraRepos.
+type GitHubSweepConfig struct {
+	TokenEnv   string   `json:"token_env,omitempty"`   // default "GITHUB_TOKEN"; falls back to `gh auth token`
+	ExtraRepos []string `json:"extra_repos,omitempty"` // "owner/repo"
+	Humans     []string `json:"humans,omitempty"`      // GitHub logins the persona waits on
+
+	RemindAfter           string `json:"remind_after,omitempty"`            // default "24h"
+	ApprovedUnmergedAfter string `json:"approved_unmerged_after,omitempty"` // default "4h"
+	RespondAfter          string `json:"respond_after,omitempty"`           // default "12h"
+	ReviewLoopAfter       string `json:"review_loop_after,omitempty"`       // default "2h"
+	CIFailingAfter        string `json:"ci_failing_after,omitempty"`        // default "1h"
+	ReleaseWindow         string `json:"release_window,omitempty"`          // default "336h" (14d)
+	StaleAfter            string `json:"stale_after,omitempty"`             // default "168h" (7d)
+}
+
+// GitHubSweep returns the GitHub port configuration, never nil.
+func (s *TownSettings) GitHubSweep() *GitHubSweepConfig {
+	if s == nil || s.Assistant == nil || s.Assistant.Sweep == nil || s.Assistant.Sweep.GitHub == nil {
+		return &GitHubSweepConfig{}
+	}
+	return s.Assistant.Sweep.GitHub
 }

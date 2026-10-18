@@ -49,7 +49,7 @@ func NewRunner(townRoot string, settings *config.TownSettings) *Runner {
 	return &Runner{
 		TownRoot: townRoot,
 		Settings: settings,
-		Ports:    map[string]Port{"beads": NewBeadsPort(townRoot), "jira": NewJiraPort(townRoot, os.Getenv)},
+		Ports:    map[string]Port{"beads": NewBeadsPort(townRoot), "jira": NewJiraPort(townRoot, os.Getenv), "github": NewGitHubPort(townRoot, os.Getenv)},
 		Store:    NewStore(townRoot),
 		Now:      time.Now,
 	}
