@@ -149,7 +149,7 @@ func TestGitHubPort_Findings(t *testing.T) {
 	for _, f := range findings {
 		got[f.Kind+"/"+f.Key] = f
 	}
-	for _, want := range []string{"ready-for-human-review/acme/app#1", "review-waiting/acme/app#2", "approval-stale/acme/app#3", "approved-unmerged/acme/app#4",
+	for _, want := range []string{"ready-for-human-review/acme/app#1", "review-waiting/acme/app#2@kevin", "approval-stale/acme/app#3", "approved-unmerged/acme/app#4",
 		"changes-requested-stale/acme/app#5", "no-review-loop/acme/app#6", "ci-failing/acme/app#7", "draft-stale/acme/app#9", "unknown-actor/acme/app#11"} {
 		if _, ok := got[want]; !ok {
 			t.Errorf("missing %s; got %v", want, keysOf(got))
@@ -160,7 +160,7 @@ func TestGitHubPort_Findings(t *testing.T) {
 			t.Errorf("unexpected %s", absent)
 		}
 	}
-	if f := got["review-waiting/acme/app#2"]; f.Fields["human"] != "kevin" || f.Fingerprint != shaA+"|1" {
+	if f := got["review-waiting/acme/app#2@kevin"]; f.Fields["human"] != "kevin" || f.Fingerprint != "kevin|1" || !strings.Contains(f.Suggest, "on acme/app#2@kevin") {
 		t.Errorf("review-waiting: %+v", f)
 	}
 	if f := got["ready-for-human-review/acme/app#1"]; f.Fields["approver"] != "kevin" || !strings.Contains(f.Suggest, "kevin") {
