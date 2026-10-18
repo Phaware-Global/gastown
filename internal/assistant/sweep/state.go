@@ -15,15 +15,16 @@ type Entry struct {
 	Fingerprint string    `json:"fingerprint"`
 	FirstSeen   time.Time `json:"first_seen"`
 	LastAcked   time.Time `json:"last_acked"`
-	// RunAt is GeneratedAt of the run whose ack wrote this entry; an older
-	// run acknowledged later never rolls a newer acknowledgement back.
-	RunAt time.Time `json:"run_at,omitempty"`
 }
 
 // State is the acknowledged dedup state: fingerprints the Mayor has actually
 // been told about. It advances only through Ack.
 type State struct {
 	Entries map[string]Entry `json:"entries"` // keyed by Finding.ID()
+	// PortRunAt is GeneratedAt of the newest acknowledged run per port. An
+	// older run acknowledged later neither upserts nor evicts for that port,
+	// so it can neither roll a fingerprint back nor resurrect an evicted entry.
+	PortRunAt map[string]time.Time `json:"port_run_at,omitempty"`
 }
 
 // pending is what a run wrote and Ack commits.
@@ -50,7 +51,7 @@ func (s *Store) pendingPath(run string) string {
 
 // Load returns the acknowledged state (empty when none exists).
 func (s *Store) Load() (*State, error) {
-	st := &State{Entries: map[string]Entry{}}
+	st := &State{Entries: map[string]Entry{}, PortRunAt: map[string]time.Time{}}
 	data, err := os.ReadFile(s.statePath())
 	if errors.Is(err, os.ErrNotExist) {
 		return st, nil
@@ -63,6 +64,9 @@ func (s *Store) Load() (*State, error) {
 	}
 	if st.Entries == nil {
 		st.Entries = map[string]Entry{}
+	}
+	if st.PortRunAt == nil {
+		st.PortRunAt = map[string]time.Time{}
 	}
 	return st, nil
 }
@@ -111,7 +115,12 @@ func (s *Store) lock() (release func(), err error) {
 			return nil, err
 		}
 		if fi, statErr := os.Stat(path); statErr == nil && time.Since(fi.ModTime()) > lockStale {
-			os.Remove(path)
+			// Claim the stale lock by renaming it: only one waiter can win
+			// the rename, the others see ErrNotExist and retry the create.
+			stale := fmt.Sprintf("%s.stale.%d", path, time.Now().UnixNano())
+			if os.Rename(path, stale) == nil {
+				os.Remove(stale)
+			}
 			continue
 		}
 		if time.Now().After(deadline) {
@@ -157,14 +166,22 @@ func (s *Store) Ack(runID string, now time.Time) error {
 	for _, c := range p.CleanPorts {
 		clean[c] = true
 	}
+	// A port whose newer run was already acknowledged is frozen for this
+	// (older) run: no upserts, no evictions.
+	frozen := map[string]bool{}
+	for port, at := range st.PortRunAt {
+		if at.After(p.GeneratedAt) {
+			frozen[port] = true
+		}
+	}
 	seen := map[string]bool{}
 	for _, f := range p.Findings {
 		id := f.ID()
 		seen[id] = true
-		e, ok := st.Entries[id]
-		if ok && e.RunAt.After(p.GeneratedAt) {
-			continue // a newer run was already acknowledged; never roll back
+		if frozen[f.Port] {
+			continue
 		}
+		e, ok := st.Entries[id]
 		if !ok {
 			e = Entry{FirstSeen: f.Since}
 			if e.FirstSeen.IsZero() {
@@ -173,13 +190,17 @@ func (s *Store) Ack(runID string, now time.Time) error {
 		}
 		e.Fingerprint = f.Fingerprint
 		e.LastAcked = now
-		e.RunAt = p.GeneratedAt
 		st.Entries[id] = e
 	}
-	for id, e := range st.Entries {
+	for id := range st.Entries {
 		port := strings.SplitN(id, "|", 2)[0]
-		if clean[port] && !seen[id] && !e.RunAt.After(p.GeneratedAt) {
+		if clean[port] && !seen[id] && !frozen[port] {
 			delete(st.Entries, id) // condition cleared on a clean run
+		}
+	}
+	for port := range p.Seen {
+		if !frozen[port] {
+			st.PortRunAt[port] = p.GeneratedAt
 		}
 	}
 	if err := s.writeJSON(s.statePath(), st); err != nil {

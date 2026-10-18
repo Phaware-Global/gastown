@@ -77,6 +77,7 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Report, error) {
 		}
 		schema := port.Schema()
 		standing := map[string]*Standing{}
+		pend.Seen[name] = []string{} // the port ran, even if it found nothing
 		for i := range findings {
 			f := &findings[i]
 			f.Port = name
@@ -146,27 +147,49 @@ func runPort(ctx context.Context, port Port, in Input) ([]Finding, error) {
 }
 
 // mergeDuplicates folds findings that share an ID (Key must be unique per
-// Kind; a port that breaks that rule must not defeat the ack gate). The first
-// finding is kept; later fingerprints join it (sorted, "+"-separated) so the
-// merged entry is standing only when every duplicate was acknowledged, and
-// later External values are kept under "<key>.2", "<key>.3", ….
+// Kind; a port that breaks that rule must not defeat the ack gate). The
+// merged finding keeps the highest severity and the earliest Since; every
+// fingerprint joins it (sorted once, "+"-separated) so it is standing only
+// when every duplicate was acknowledged; the later duplicates' URL, Suggest,
+// Fields and External are kept under "<name>.2", "<name>.3", ….
 func mergeDuplicates(findings []Finding) []Finding {
 	byID := map[string]int{}
+	fps := map[string][]string{}
 	out := findings[:0]
 	for _, f := range findings {
-		idx, seen := byID[f.ID()]
+		id := f.ID()
+		fps[id] = append(fps[id], f.Fingerprint)
+		idx, seen := byID[id]
 		if !seen {
-			byID[f.ID()] = len(out)
+			byID[id] = len(out)
 			out = append(out, f)
 			continue
 		}
 		m := &out[idx]
-		fps := append(strings.Split(m.Fingerprint, "+"), f.Fingerprint)
-		sort.Strings(fps)
-		m.Fingerprint = strings.Join(fps, "+")
-		n := strings.Count(m.Fingerprint, "+") + 1
+		n := len(fps[id])
+		if severityRank(f.Severity) < severityRank(m.Severity) {
+			m.Severity = f.Severity
+		}
+		if !f.Since.IsZero() && (m.Since.IsZero() || f.Since.Before(m.Since)) {
+			m.Since = f.Since
+		}
+		if f.URL != "" {
+			m.addExternal(fmt.Sprintf("url.%d", n), f.URL)
+		}
+		if f.Suggest != "" {
+			m.addExternal(fmt.Sprintf("suggest.%d", n), f.Suggest)
+		}
+		for k, v := range f.Fields {
+			m.addExternal(fmt.Sprintf("%s.%d", k, n), v)
+		}
 		for k, v := range f.External {
 			m.addExternal(fmt.Sprintf("%s.%d", k, n), v)
+		}
+	}
+	for i := range out {
+		if parts := fps[out[i].ID()]; len(parts) > 1 {
+			sort.Strings(parts)
+			out[i].Fingerprint = strings.Join(parts, "+")
 		}
 	}
 	return out

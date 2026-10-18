@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 	"unicode"
 )
@@ -43,6 +44,23 @@ var (
 )
 
 const maxSuggestLen, maxURLLen = 200, 512
+
+// suggestVocabulary is the closed word list a Suggest line may use besides
+// the finding's own Key and its allowlisted Fields values. A port that
+// needs a new word adds it here; provider text can never reach this line.
+var suggestVocabulary = set(strings.Fields(`
+a an and the to on onto for from with before after or why it its this
+reply chase answer respond ask note status update decide reassign sling
+onward close reason review re-request request re-ping re-approval
+re-run rebase merge push fix tag release wave escalate ack convoy
+blocker blocked hand off finish starting more waits add humans bots
+list board move human reviewer approval approve ci check checks
+draft stale open pull pr issue bead rig run start loop internal
+config setting gt bd jira github assistant sweep
+jira-move-to-board assistant.sweep.jira.humans assistant.sweep.jira.bots
+assistant.sweep.github.humans`))
+
+var tokenTrim = "`()[]{}.,:;\"'"
 
 var spaceRe = regexp.MustCompile(`\s`)
 
@@ -114,10 +132,54 @@ func enforceSchema(schema map[string]Shape, f *Finding) {
 		f.addExternal("url", f.URL)
 		f.URL = ""
 	}
-	if f.Suggest != "" && !printable(f.Suggest, maxSuggestLen) {
+	if f.Suggest != "" && !allowedSuggest(f) {
 		f.addExternal("suggest", f.Suggest)
 		f.Suggest = ""
 	}
+	switch f.Severity {
+	case SeverityUrgent, SeverityActionable, SeverityInfo:
+	case "":
+		f.Severity = SeverityInfo
+	default:
+		f.addExternal("severity", f.Severity)
+		f.Severity = SeverityInfo
+	}
+}
+
+// allowedSuggest: single printable line whose every word is in the
+// vocabulary, is the finding's Key, or is one of its (already validated)
+// Fields values. Surrounding punctuation and backticks are ignored.
+func allowedSuggest(f *Finding) bool {
+	if !printable(f.Suggest, maxSuggestLen) {
+		return false
+	}
+	for _, tok := range strings.Fields(f.Suggest) {
+		tok = strings.Trim(tok, tokenTrim)
+		if tok == "" || tok == f.Key || suggestVocabulary[tok] {
+			continue
+		}
+		known := false
+		for _, v := range f.Fields {
+			if tok == v {
+				known = true
+				break
+			}
+		}
+		if !known {
+			return false
+		}
+	}
+	return true
+}
+
+func set(items []string) map[string]bool {
+	m := map[string]bool{}
+	for _, s := range items {
+		if s = strings.TrimSpace(s); s != "" {
+			m[s] = true
+		}
+	}
+	return m
 }
 
 // addExternal stores v under k without overwriting an existing entry.
