@@ -471,15 +471,22 @@ func (c *ghClient) prDiff(ref repoRef, base, head string) (*prSnapshot, error) {
 // spaces, so the "diff --git a/X b/Y" header is ambiguous for a path that
 // contains " b/"; the "+++ b/" line read before the first hunk is not (a
 // hunk body line "++ b/…" would render as "+++ b/…", hence the cut-off).
-// An entry without one (binary, mode-only, rename-only, deletion) uses its
-// "rename to" line, then the header's last " b/".
+// Git appends a tab to a "+++" path that contains a space; it is trimmed so
+// the key matches the API's file names. A deletion ("+++ /dev/null") is
+// keyed apart from a creation of the same path, so a file-to-symlink
+// typechange (two sections under one header) is not a duplicate. An entry
+// without a "+++" line (binary, mode-only, rename-only) uses its "rename to"
+// line, then the header's last " b/".
 func sectionPath(lines []string) string {
 	for _, l := range lines {
 		if strings.HasPrefix(l, "@@") {
 			break
 		}
 		if strings.HasPrefix(l, "+++ b/") {
-			return l[len("+++ b/"):]
+			return strings.TrimSuffix(l[len("+++ b/"):], "\t")
+		}
+		if l == "+++ /dev/null" {
+			return headerPath(lines[0]) + " (deleted)"
 		}
 	}
 	for _, l := range lines {
@@ -490,10 +497,14 @@ func sectionPath(lines []string) string {
 			return l[len("rename to "):]
 		}
 	}
-	if i := strings.LastIndex(lines[0], " b/"); i >= 0 {
-		return lines[0][i+3:]
+	return headerPath(lines[0])
+}
+
+func headerPath(header string) string {
+	if i := strings.LastIndex(header, " b/"); i >= 0 {
+		return header[i+3:]
 	}
-	return lines[0]
+	return header
 }
 
 // touchedBetween lists the files the base branch changed between two merge

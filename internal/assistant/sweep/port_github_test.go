@@ -361,6 +361,30 @@ func TestGitHubPort_ApprovalStaleDiff(t *testing.T) {
 	if f := got["approval-stale/acme/app#11"]; f.Fields["diff"] != "unknown" || !strings.Contains(f.External["diff_error"], "ambiguous diff path") {
 		t.Errorf("aliased keys must be unknown with the reason fenced: %v / %v", f.Fields, f.External)
 	}
+	// Git writes "+++ b/foo bar.go\t" for a spaced path: the key drops the
+	// tab, so a base-only move of that file still reads "unchanged"; a
+	// file-to-symlink typechange (two sections under one header) is not a
+	// duplicate key.
+	const spacedApproved = "diff --git a/foo bar.go b/foo bar.go\nindex 1111111..2222222 100644\n--- a/foo bar.go\t\n+++ b/foo bar.go\t\n@@ -1,3 +1,3 @@ func f()\n-x\n+y\n"
+	const typechange = "diff --git a/t b/t\ndeleted file mode 100644\nindex 1111111..0000000\n--- a/t\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\ndiff --git a/t b/t\nnew file mode 120000\nindex 0000000..2222222\n--- /dev/null\n+++ b/t\n@@ -0,0 +1 @@\n+target\n"
+	app.Open.Nodes = []ghPR{stale(12, sha('m')), stale(13, sha('n'))}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}},
+		diffs: map[string]string{
+			"main..." + shaB:     spacedApproved + typechange,
+			"main..." + sha('m'): strings.Replace(spacedApproved, "@@ -1,3 +1,3 @@", "@@ -9,3 +9,3 @@", 1) + typechange, // base moved "foo bar.go"
+			"main..." + sha('n'): spacedApproved + strings.Replace(typechange, "+target", "+elsewhere", 1),              // symlink target changed
+		},
+		mergeBases: map[string]string{"main..." + sha('m'): "mb1", "main..." + sha('n'): "mb1"},
+		baseFiles:  map[string][]string{"mb0...mb1": {"foo bar.go"}}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	findings, _ = p.Sweep(context.Background(), in)
+	got = map[string]Finding{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = f
+	}
+	if got["approval-stale/acme/app#12"].Fields["diff"] != "unchanged" || got["approval-stale/acme/app#13"].Fields["diff"] != "changed" {
+		t.Errorf("spaced path / typechange: want #12 unchanged and #13 changed, got %v / %v (%v)", got["approval-stale/acme/app#12"].Fields, got["approval-stale/acme/app#13"].Fields, got["approval-stale/acme/app#13"].External["diff_error"])
+	}
 	// Binary entries: the approved head added x.bin; a swapped binary is a
 	// change even though the diff has no hunk body, while a base merge that
 	// only moved the base-side blob is not.
