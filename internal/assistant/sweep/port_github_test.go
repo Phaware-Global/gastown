@@ -28,8 +28,10 @@ const (
 func pr(n int, author string, created, pushed time.Duration, ci string, opts ...func(*ghPR)) ghPR {
 	p := ghPR{Number: n, Title: "pr " + author, URL: "https://github.com/acme/app/pull/" + strconv.Itoa(n), CreatedAt: ago(created),
 		HeadRefName: "feat/" + strconv.Itoa(n), HeadRefOid: shaA, BaseRefName: "main", Author: ghActor{Login: author}}
-	t := ago(pushed)
-	c := ghCommit{PushedDate: &t}
+	c := ghCommit{CommittedDate: ago(pushed + 48*time.Hour)} // committed long before the push
+	c.CheckSuites.Nodes = append(c.CheckSuites.Nodes, struct {
+		CreatedAt time.Time `json:"createdAt"`
+	}{ago(pushed)})
 	if ci != "" {
 		c.StatusCheckRollup = &struct {
 			State string `json:"state"`
@@ -55,7 +57,7 @@ func review(login, state, oid string, at time.Duration) func(*ghPR) {
 func requested(login string, at time.Duration) func(*ghPR) {
 	return func(p *ghPR) {
 		p.ReviewRequests.Nodes = append(p.ReviewRequests.Nodes, ghRequestEvent{RequestedReviewer: ghActor{Login: login}})
-		p.TimelineItems.Nodes = append(p.TimelineItems.Nodes, ghRequestEvent{CreatedAt: ago(at), RequestedReviewer: ghActor{Login: login}})
+		p.TimelineItems.Nodes = append(p.TimelineItems.Nodes, ghRequestEvent{Typename: "ReviewRequestedEvent", CreatedAt: ago(at), RequestedReviewer: ghActor{Login: login}})
 	}
 }
 
@@ -74,6 +76,7 @@ type ghFixture struct {
 	repos   map[string]*ghRepoData // "owner/name"
 	failing string                 // repo slug whose GraphQL call errors
 	owned   map[int]bool           // patrol-owned PR numbers
+	slow    time.Duration          // delay every GraphQL answer
 }
 
 func (fx *ghFixture) handler(t *testing.T) http.Handler {
@@ -84,6 +87,13 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 		}
 		switch {
 		case r.URL.Path == "/graphql":
+			if fx.slow > 0 {
+				select {
+				case <-time.After(fx.slow):
+				case <-r.Context().Done():
+					return
+				}
+			}
 			var body struct {
 				Variables map[string]any `json:"variables"`
 			}
@@ -114,10 +124,10 @@ func newGitHubTest(t *testing.T, fx *ghFixture, logins []string) (*GitHubPort, I
 		repos: func() ([]repoRef, error) {
 			return []repoRef{{Owner: "acme", Name: "app", Rig: "app", Reviewer: "phaware-val", Approver: "kevin"}}, nil
 		},
-		token:      func(string) string { return "tok" },
-		patrolOwns: func(rig string, n int) (bool, error) { return fx.owned[n], nil },
-		client:     srv.Client(),
-		apiBase:    srv.URL,
+		token:       func(string) string { return "tok" },
+		patrolBeads: func(rig string) (map[int]bool, error) { return fx.owned, nil },
+		client:      srv.Client(),
+		apiBase:     srv.URL,
 	}
 	settings := &config.TownSettings{Assistant: &config.AssistantConfig{Sweep: &config.SweepConfig{GitHub: &config.GitHubSweepConfig{Humans: []string{"kevin"}}}}}
 	return p, Input{Now: ghNow, Settings: settings}
@@ -227,5 +237,88 @@ func TestGitHubOwnerRepo(t *testing.T) {
 		if got := o + "/" + r; (ok && got != want) || (!ok && want != "") {
 			t.Errorf("%s → %q ok=%v, want %q", raw, got, ok, want)
 		}
+	}
+}
+
+func forcePushed(at time.Duration) func(*ghPR) {
+	return func(p *ghPR) {
+		p.Commits.Nodes[0].Commit.CheckSuites.Nodes = nil
+		p.TimelineItems.Nodes = append(p.TimelineItems.Nodes, ghRequestEvent{Typename: "HeadRefForcePushedEvent", CreatedAt: ago(at)})
+	}
+}
+
+func truncatedReviews(p *ghPR) { p.Reviews.PageInfo.HasPreviousPage = true }
+
+func TestGitHubPort_ReviewRound1Fixes(t *testing.T) {
+	h := time.Hour
+	app := &ghRepoData{}
+	app.Open.Nodes = []ghPR{
+		// 50: two humans requested changes; the earliest one and the sorted set drive the finding, whatever the map order.
+		pr(50, "artie", 60*h, 40*h, "SUCCESS", review("phaware-val", "APPROVED", shaA, 39*h), review("Kevin", "CHANGES_REQUESTED", shaA, 20*h), review("ada", "CHANGES_REQUESTED", shaA, 30*h)),
+		// 51: Kevin reviewed this head 20h ago, then was re-requested 10h ago → waiting again (not suppressed).
+		pr(51, "artie", 60*h, 40*h, "SUCCESS", review("kevin", "CHANGES_REQUESTED", shaA, 20*h), requested("kevin", 10*h)),
+		// 52: reviews window truncated → review state not fully checked.
+		pr(52, "artie", 60*h, 40*h, "SUCCESS", truncatedReviews),
+		// 53: no check suite; committed 48h+ ago but force-pushed 10 minutes ago → CI failure is too fresh to report.
+		pr(53, "someone", 60*h, 1*h, "FAILURE", forcePushed(10*time.Minute)),
+		// 54: the persona approved its own PR while also listed as a human → not a human approval.
+		pr(54, "artie", 60*h, 10*h, "SUCCESS", review("artie", "APPROVED", shaA, 5*h)),
+	}
+	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}}
+	p, in := newGitHubTest(t, fx, []string{"artie"})
+	in.Settings.Assistant.Sweep.GitHub.Humans = []string{"KEVIN", "ada", "artie"} // mis-cased and persona-polluted on purpose
+	in.Settings.Assistant.Sweep.GitHub.RemindAfter = "1h"
+	run := func() (map[string]Finding, error) {
+		fs, err := p.Sweep(context.Background(), in)
+		got := map[string]Finding{}
+		for _, f := range fs {
+			got[f.Kind+"/"+f.Key] = f
+		}
+		return got, err
+	}
+	got, err := run()
+	var partial *PartialError
+	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "acme/app#52") {
+		t.Fatalf("a truncated review window must make the port partial: %v", err)
+	}
+	f := got["changes-requested-stale/acme/app#50"]
+	if f.Fields["human"] != "ada" || !strings.HasSuffix(f.Fingerprint, "|ada,kevin") {
+		t.Errorf("earliest requester and sorted login set expected: %+v", f)
+	}
+	for i := 0; i < 5; i++ { // deterministic across runs
+		again, _ := run()
+		if again["changes-requested-stale/acme/app#50"].Fingerprint != f.Fingerprint {
+			t.Fatalf("fingerprint flipped between runs")
+		}
+	}
+	if _, ok := got["review-waiting/acme/app#51@kevin"]; !ok {
+		t.Errorf("a re-request after a review on the same head must wait again: %v", keysOf(got))
+	}
+	if _, ok := got["ci-failing/acme/app#53"]; ok {
+		t.Error("a force-push 10 minutes ago must not count as an hour-old failure")
+	}
+	if _, ok := got["approved-unmerged/acme/app#54"]; ok {
+		t.Error("the persona's own approval must never count as the human gate")
+	}
+	if _, ok := got["unknown-actor/acme/app#50"]; ok {
+		t.Error("mis-cased listed humans must still be recognised")
+	}
+}
+
+func TestGitHubPort_BudgetReturnsPartialThroughRunPort(t *testing.T) {
+	app := &ghRepoData{}
+	app.Open.Nodes = []ghPR{pr(6, "artie", 3*time.Hour, 3*time.Hour, "PENDING")}
+	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, slow: 700 * time.Millisecond}
+	p, in := newGitHubTest(t, fx, []string{"artie"})
+	oldMargin, oldTimeout := budgetMargin, PortTimeout
+	budgetMargin, PortTimeout = 200*time.Millisecond, 1200*time.Millisecond
+	defer func() { budgetMargin, PortTimeout = oldMargin, oldTimeout }()
+	findings, err := runPort(context.Background(), p, in)
+	var partial *PartialError
+	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "time budget") {
+		t.Fatalf("the port must return a partial result before PortTimeout, got %v", err)
+	}
+	if len(findings) == 0 {
+		t.Error("findings from the first repo must survive the cut")
 	}
 }

@@ -46,11 +46,12 @@ type GitHubPort struct {
 	persona  func() ([]string, []string, error) // logins, telegraph extra repos
 	repos    func() ([]repoRef, error)
 	token    func(env string) string
-	// patrolOwns reports whether a non-closed pr-feedback-patrol bead for the
-	// PR exists in the rig (then a polecat already owns the CI failure).
-	patrolOwns func(rig string, pr int) (bool, error)
-	client     *http.Client
-	apiBase    string // "https://api.github.com"
+	// patrolBeads returns the PR numbers that have a non-closed
+	// pr-feedback-patrol bead in the rig (a polecat already owns that CI
+	// failure). Called once per rig per sweep.
+	patrolBeads func(rig string) (map[int]bool, error)
+	client      *http.Client
+	apiBase     string // "https://api.github.com"
 }
 
 // NewGitHubPort returns the production GitHub port.
@@ -79,27 +80,39 @@ func NewGitHubPort(townRoot string, getenv func(string) string) *GitHubPort {
 			}
 			return strings.TrimSpace(string(out))
 		},
-		patrolOwns: func(rig string, pr int) (bool, error) {
+		patrolBeads: func(rig string) (map[int]bool, error) {
 			issues, err := beads.New(filepath.Join(townRoot, rig)).List(beads.ListOptions{Status: "all", Label: "pr-feedback-patrol", NoWisps: true})
 			if err != nil {
-				return false, err
+				return nil, err
 			}
-			want := fmt.Sprintf("pr-num-%d", pr)
+			owned := map[int]bool{}
 			for _, i := range issues {
 				if i.Status == "closed" {
 					continue
 				}
 				for _, l := range i.Labels {
-					if l == want {
-						return true, nil
+					var n int
+					if _, err := fmt.Sscanf(l, "pr-num-%d", &n); err == nil && n > 0 {
+						owned[n] = true
 					}
 				}
 			}
-			return false, nil
+			return owned, nil
 		},
 		client:  &http.Client{Timeout: 30 * time.Second},
 		apiBase: "https://api.github.com",
 	}
+}
+
+// lowerSet is set() with case-folded members, for GitHub logins.
+func lowerSet(items []string) map[string]bool {
+	m := map[string]bool{}
+	for _, s := range items {
+		if s = strings.ToLower(strings.TrimSpace(s)); s != "" {
+			m[s] = true
+		}
+	}
+	return m
 }
 
 // rigRepos reads the rig registry and each rig's merge-queue settings.
@@ -195,15 +208,33 @@ type ghThread struct {
 	} `json:"comments"`
 }
 
+// ghPage flags a fixed-window connection that did not fit: the PR's review
+// state is then not fully known and the port reports partial.
+type ghPage struct {
+	HasNextPage     bool `json:"hasNextPage"`
+	HasPreviousPage bool `json:"hasPreviousPage"`
+}
+
+func (p ghPage) truncated() bool { return p.HasNextPage || p.HasPreviousPage }
+
 type ghCommit struct {
-	PushedDate        *time.Time `json:"pushedDate"`
-	CommittedDate     time.Time  `json:"committedDate"`
+	// pushedDate is deprecated and always null on GitHub; the push time is
+	// the head's newest check suite, else a force-push event, else the
+	// committer date.
+	CommittedDate     time.Time `json:"committedDate"`
 	StatusCheckRollup *struct {
 		State string `json:"state"`
 	} `json:"statusCheckRollup"`
+	CheckSuites struct {
+		Nodes []struct {
+			CreatedAt time.Time `json:"createdAt"`
+		} `json:"nodes"`
+	} `json:"checkSuites"`
 }
 
+// ghRequestEvent is a ReviewRequestedEvent or a HeadRefForcePushedEvent.
 type ghRequestEvent struct {
+	Typename          string    `json:"__typename"`
 	CreatedAt         time.Time `json:"createdAt"`
 	RequestedReviewer ghActor   `json:"requestedReviewer"`
 }
@@ -219,13 +250,16 @@ type ghPR struct {
 	BaseRefName    string    `json:"baseRefName"`
 	Author         ghActor   `json:"author"`
 	ReviewRequests struct {
-		Nodes []ghRequestEvent `json:"nodes"` // only RequestedReviewer is populated
+		PageInfo ghPage           `json:"pageInfo"`
+		Nodes    []ghRequestEvent `json:"nodes"` // only RequestedReviewer is populated
 	} `json:"reviewRequests"`
 	Reviews struct {
-		Nodes []ghReview `json:"nodes"`
+		PageInfo ghPage     `json:"pageInfo"`
+		Nodes    []ghReview `json:"nodes"`
 	} `json:"reviews"`
 	ReviewThreads struct {
-		Nodes []ghThread `json:"nodes"`
+		PageInfo ghPage     `json:"pageInfo"`
+		Nodes    []ghThread `json:"nodes"`
 	} `json:"reviewThreads"`
 	Commits struct {
 		Nodes []struct {
@@ -233,7 +267,8 @@ type ghPR struct {
 		} `json:"nodes"`
 	} `json:"commits"`
 	TimelineItems struct {
-		Nodes []ghRequestEvent `json:"nodes"`
+		PageInfo ghPage           `json:"pageInfo"`
+		Nodes    []ghRequestEvent `json:"nodes"`
 	} `json:"timelineItems"`
 }
 
@@ -253,11 +288,11 @@ const githubRepoQuery = `query($owner:String!,$name:String!,$after:String){
       pageInfo{hasNextPage endCursor}
       nodes{
         number title url isDraft createdAt headRefName headRefOid baseRefName author{login}
-        reviewRequests(first:20){nodes{requestedReviewer{... on User{login}}}}
-        reviews(last:50){nodes{author{login} state submittedAt commit{oid}}}
-        reviewThreads(first:50){nodes{isResolved comments(first:1){nodes{author{login} createdAt}}}}
-        commits(last:1){nodes{commit{pushedDate committedDate statusCheckRollup{state}}}}
-        timelineItems(last:30, itemTypes:[REVIEW_REQUESTED_EVENT]){nodes{... on ReviewRequestedEvent{createdAt requestedReviewer{... on User{login}}}}}
+        reviewRequests(first:20){pageInfo{hasNextPage} nodes{requestedReviewer{... on User{login}}}}
+        reviews(last:50){pageInfo{hasPreviousPage} nodes{author{login} state submittedAt commit{oid}}}
+        reviewThreads(first:50){pageInfo{hasNextPage} nodes{isResolved comments(first:1){nodes{author{login} createdAt}}}}
+        commits(last:1){nodes{commit{committedDate statusCheckRollup{state} checkSuites(last:1){nodes{createdAt}}}}}
+        timelineItems(last:30, itemTypes:[REVIEW_REQUESTED_EVENT, HEAD_REF_FORCE_PUSHED_EVENT]){pageInfo{hasPreviousPage} nodes{__typename ... on ReviewRequestedEvent{createdAt requestedReviewer{... on User{login}}} ... on HeadRefForcePushedEvent{createdAt}}}
       }
     }
   }
@@ -335,7 +370,9 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading telegraph.toml: %w", err)
 	}
-	isPersona := set(logins)
+	ctx, cancel := withBudget(ctx)
+	defer cancel()
+	isPersona := lowerSet(logins)
 	if len(isPersona) == 0 {
 		return nil, fmt.Errorf("no persona login configured (telegraph.mayor.github_logins)")
 	}
@@ -376,23 +413,54 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		ciFailing:        parseDur(cfg.CIFailingAfter, time.Hour),
 		stale:            parseDur(cfg.StaleAfter, 7*24*time.Hour),
 	}
-	isHuman := set(cfg.Humans)
+	isHuman := lowerSet(cfg.Humans)
+	for l := range isPersona {
+		delete(isHuman, l) // the persona is never a human reviewer, even if listed
+	}
 	var out []Finding
 	var partial []string
 	note := func(format string, args ...any) { partial = append(partial, fmt.Sprintf(format, args...)) }
+	// One patrol-bead lookup per rig per sweep.
+	patrol := map[string]map[int]bool{}
+	owns := func(rig string, n int) (bool, error) {
+		set, ok := patrol[rig]
+		if !ok {
+			var err error
+			if set, err = p.patrolBeads(rig); err != nil {
+				return false, err
+			}
+			if set == nil {
+				set = map[int]bool{}
+			}
+			patrol[rig] = set
+		}
+		return set[n], nil
+	}
 
 	for _, ref := range repos {
+		if !timeLeft(ctx) {
+			note("time budget exhausted before %s", ref.slug())
+			break
+		}
 		var open []ghPR
 		checked := false
 		after := ""
 		for page := 0; ; page++ {
+			if !timeLeft(ctx) {
+				note("%s: time budget exhausted after %d open PRs", ref.slug(), len(open))
+				break
+			}
 			if page == githubMaxPRPages {
 				note("%s: more than %d open PRs; the rest were not checked", ref.slug(), githubMaxPRPages*githubPRPage)
 				break
 			}
 			d, err := c.repo(ref, after)
 			if err != nil {
-				note("%s: %v", ref.slug(), err)
+				if ctx.Err() != nil {
+					note("%s: time budget exhausted mid-call; open PRs not checked", ref.slug())
+				} else {
+					note("%s: %v", ref.slug(), err)
+				}
 				break
 			}
 			checked = true
@@ -406,7 +474,7 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 			continue
 		}
 		for i := range open {
-			out = append(out, p.checkPR(ref, &open[i], in.Now, d, isPersona, isHuman, note)...)
+			out = append(out, p.checkPR(ref, &open[i], in.Now, d, isPersona, isHuman, owns, note)...)
 		}
 	}
 	if len(partial) > 0 {
@@ -415,18 +483,37 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	return out, nil
 }
 
-func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurations, isPersona, isHuman map[string]bool, note func(string, ...any)) []Finding {
+func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurations, isPersona, isHuman map[string]bool, owns func(string, int) (bool, error), note func(string, ...any)) []Finding {
 	key := fmt.Sprintf("%s#%d", ref.slug(), pr.Number)
-	ours := isPersona[pr.Author.Login]
+	ours := isPersona[strings.ToLower(pr.Author.Login)]
 	head := pr.HeadRefOid
 	ci := "none"
+	// Fixed-window connections that did not fit mean the review state is
+	// not fully known: say so, which makes the port partial.
+	if pr.Reviews.PageInfo.truncated() || pr.ReviewThreads.PageInfo.truncated() || pr.ReviewRequests.PageInfo.truncated() || pr.TimelineItems.PageInfo.truncated() {
+		note("%s: more than the fetched window of reviews, threads, requests or events; review state not fully checked", key)
+	}
+	// Push time: the head's newest check suite, else the latest force-push
+	// event, else the committer date (pushedDate is always null).
 	pushed := pr.CreatedAt
+	var forcePushed time.Time
+	for _, ev := range pr.TimelineItems.Nodes {
+		if ev.Typename == "HeadRefForcePushedEvent" && ev.CreatedAt.After(forcePushed) {
+			forcePushed = ev.CreatedAt
+		}
+	}
 	if len(pr.Commits.Nodes) > 0 {
 		cm := pr.Commits.Nodes[0].Commit
-		if cm.PushedDate != nil {
-			pushed = *cm.PushedDate
-		} else if !cm.CommittedDate.IsZero() {
+		switch {
+		case len(cm.CheckSuites.Nodes) > 0 && !cm.CheckSuites.Nodes[0].CreatedAt.IsZero():
+			pushed = cm.CheckSuites.Nodes[0].CreatedAt
+		case !forcePushed.IsZero():
+			pushed = forcePushed
+		case !cm.CommittedDate.IsZero():
 			pushed = cm.CommittedDate
+		}
+		if forcePushed.After(pushed) {
+			pushed = forcePushed
 		}
 		if cm.StatusCheckRollup != nil {
 			switch cm.StatusCheckRollup.State {
@@ -454,58 +541,73 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 		oid   string
 		at    time.Time
 	}
-	latest := map[string]rv{}
+	latest := map[string]rv{} // keyed by lower-cased login
 	reviewerSawHead, reviewerEver := false, false
 	for _, r := range pr.Reviews.Nodes {
-		if r.State == "COMMENTED" || r.State == "PENDING" {
-			continue
-		}
+		login := strings.ToLower(r.Author.Login)
 		if ref.Reviewer != "" && strings.EqualFold(r.Author.Login, ref.Reviewer) {
-			reviewerEver = true
+			reviewerEver = true // a COMMENTED pass is still a pass of the loop
 			if r.Commit.Oid == head && r.State == "APPROVED" {
 				reviewerSawHead = true
 			}
 		}
-		if r.State == "DISMISSED" {
-			delete(latest, r.Author.Login)
+		if r.State == "COMMENTED" || r.State == "PENDING" {
 			continue
 		}
-		latest[r.Author.Login] = rv{r.State, r.Commit.Oid, r.SubmittedAt}
+		if r.State == "DISMISSED" {
+			delete(latest, login)
+			continue
+		}
+		latest[login] = rv{r.State, r.Commit.Oid, r.SubmittedAt}
 	}
 	requested := map[string]time.Time{}
 	for _, rr := range pr.ReviewRequests.Nodes {
-		if l := rr.RequestedReviewer.Login; isHuman[l] {
+		if l := strings.ToLower(rr.RequestedReviewer.Login); isHuman[l] {
 			requested[l] = pr.CreatedAt
 		}
 	}
 	for _, ev := range pr.TimelineItems.Nodes {
-		if l := ev.RequestedReviewer.Login; requested[l].Before(ev.CreatedAt) {
+		if l := strings.ToLower(ev.RequestedReviewer.Login); l != "" && requested[l].Before(ev.CreatedAt) {
 			if _, ok := requested[l]; ok {
 				requested[l] = ev.CreatedAt
 			}
 		}
 	}
+	// Deterministic choices over the review map: sorted logins, earliest
+	// time wins, the configured approver wins among head approvals.
+	logins := make([]string, 0, len(latest))
+	for login := range latest {
+		if isHuman[login] {
+			logins = append(logins, login)
+		}
+	}
+	sort.Strings(logins)
 	var humanApprovedHead, humanApprovedOld, humanChanges string
 	var approvedAt, changesAt time.Time
-	for login, r := range latest {
-		if !isHuman[login] {
-			continue
-		}
+	var changesLogins []string
+	for _, login := range logins {
+		r := latest[login]
 		switch {
 		case r.state == "APPROVED" && r.oid == head:
-			if humanApprovedHead == "" || (ref.Approver != "" && strings.EqualFold(login, ref.Approver)) {
+			isApprover := ref.Approver != "" && strings.EqualFold(login, ref.Approver)
+			if humanApprovedHead == "" || isApprover || (!strings.EqualFold(humanApprovedHead, ref.Approver) && r.at.Before(approvedAt)) {
 				humanApprovedHead, approvedAt = login, r.at
 			}
 		case r.state == "APPROVED":
-			humanApprovedOld = login
+			if humanApprovedOld == "" || r.at.Before(latest[humanApprovedOld].at) {
+				humanApprovedOld = login
+			}
 		case r.state == "CHANGES_REQUESTED":
-			humanChanges, changesAt = login, r.at
+			changesLogins = append(changesLogins, login)
+			if humanChanges == "" || r.at.Before(changesAt) {
+				humanChanges, changesAt = login, r.at
+			}
 		}
 	}
 	unresolved := 0
 	var oldestThread time.Time
 	for _, th := range pr.ReviewThreads.Nodes {
-		if th.IsResolved || len(th.Comments.Nodes) == 0 || !isHuman[th.Comments.Nodes[0].Author.Login] {
+		if th.IsResolved || len(th.Comments.Nodes) == 0 || !isHuman[strings.ToLower(th.Comments.Nodes[0].Author.Login)] {
 			continue
 		}
 		unresolved++
@@ -519,6 +621,7 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 	// A reviewer or requested reviewer that is neither the persona, a listed
 	// human nor the rig's internal reviewer is a config gap, not a human.
 	known := func(l string) bool {
+		l = strings.ToLower(l)
 		return l == "" || isPersona[l] || isHuman[l] || strings.EqualFold(l, ref.Reviewer)
 	}
 	var strangers []string
@@ -527,9 +630,9 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 			strangers = append(strangers, l)
 		}
 	}
-	for login := range latest {
-		if !known(login) {
-			strangers = append(strangers, login)
+	for _, r := range pr.Reviews.Nodes {
+		if l := r.Author.Login; !known(l) && (r.State == "APPROVED" || r.State == "CHANGES_REQUESTED") {
+			strangers = append(strangers, strings.ToLower(l))
 		}
 	}
 	if len(strangers) > 0 {
@@ -561,9 +664,15 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 		f.Fingerprint = head
 		out = append(out, f)
 	}
-	for login, at := range requested {
-		if r, ok := latest[login]; ok && r.oid == head {
-			continue // they reviewed this head
+	reqLogins := make([]string, 0, len(requested))
+	for login := range requested {
+		reqLogins = append(reqLogins, login)
+	}
+	sort.Strings(reqLogins)
+	for _, login := range reqLogins {
+		at := requested[login]
+		if r, ok := latest[login]; ok && r.oid == head && !r.at.Before(at) {
+			continue // they reviewed this head after the request; a re-request after a review starts a new wait
 		}
 		if age := now.Sub(at); age >= d.remind {
 			// Keyed per requested human; the fingerprint carries the request
@@ -612,7 +721,7 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 				f.Fields["human"] = humanChanges
 			}
 			f.Suggest = "respond to review comments on " + key
-			f.Fingerprint = fmt.Sprintf("%s|%d|%s", head, unresolved, humanChanges)
+			f.Fingerprint = fmt.Sprintf("%s|%d|%s", head, unresolved, strings.Join(changesLogins, ","))
 			out = append(out, f)
 		}
 		if ref.Reviewer != "" && !reviewerEver && now.Sub(pr.CreatedAt) >= d.reviewLoop {
@@ -628,7 +737,7 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 		owned := false
 		if ref.Rig != "" {
 			var err error
-			if owned, err = p.patrolOwns(ref.Rig, pr.Number); err != nil {
+			if owned, err = owns(ref.Rig, pr.Number); err != nil {
 				note("%s: patrol beads unavailable (ci-failing reported without dedup): %v", key, err)
 			}
 		}
