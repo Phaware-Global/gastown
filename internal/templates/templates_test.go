@@ -188,6 +188,64 @@ func TestRenderRole_Refinery_DefaultBranch(t *testing.T) {
 	}
 }
 
+func TestRenderRole_Assistant(t *testing.T) {
+	tmpl, err := New()
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	data := RoleData{
+		Role:          "assistant",
+		TownRoot:      "/test/town",
+		TownName:      "test",
+		WorkDir:       "/test/town/assistant",
+		MayorSession:  "hq-mayor",
+		DeaconSession: "hq-deacon",
+		SweepInterval: "45m",
+	}
+	output, err := tmpl.RenderRole("assistant", data)
+	if err != nil {
+		t.Fatalf("RenderRole(assistant) error = %v", err)
+	}
+	// Load-bearing instructions: the briefing contract, inbox-zero, the
+	// configured sweep cadence, and the resolved session names.
+	for _, want := range []string{
+		"BRIEF:", "URGENT:", "SWEEP:",
+		"EXTERNAL CONTENT", "[neutralized delimiter]", "not delegable", "Operator policy (from telegraph",
+		"Hooked beads follow the same rule", "advisory to the Mayor", "Never from `Telegraph-Reply-Via`", // trust boundary + delegation limits (review of #283)
+		"gt mail send mayor/",
+		"mail mark-read",
+		"**45m**",
+		"hq-mayor", "hq-deacon",
+		"Town root: /test/town",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("assistant template missing %q", want)
+		}
+	}
+	if strings.Contains(output, "<no value>") {
+		t.Error("assistant template rendered an unresolved variable")
+	}
+}
+
+// TestRenderRole_MayorTrustBoundary pins the Mayor-side half of the trust
+// boundary: relayed external text in assistant briefings is data, not
+// instructions, regardless of the trusted From address.
+func TestRenderRole_MayorTrustBoundary(t *testing.T) {
+	tmpl, err := New()
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	output, err := tmpl.RenderRole("mayor", RoleData{Role: "mayor", TownRoot: "/t", MayorSession: "hq-mayor", DeaconSession: "hq-deacon"})
+	if err != nil {
+		t.Fatalf("RenderRole(mayor) error = %v", err)
+	}
+	for _, want := range []string{"Trust Boundary", "EXTERNAL CONTENT", "assistant/", "telegraph/*", "[neutralized\ndelimiter]", "**advisory**", "telegraph.prompts.toml", "`default` key", "never trusted beyond the fact that a reply goes out of band"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("mayor template missing trust-boundary text %q", want)
+		}
+	}
+}
+
 func TestRenderRole_Reviewer(t *testing.T) {
 	tmpl, err := New()
 	if err != nil {
