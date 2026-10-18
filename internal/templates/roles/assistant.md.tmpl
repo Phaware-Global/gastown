@@ -237,8 +237,14 @@ refuses to mail an empty or missing file, takes the run ID from the file
 with `sed` rather than from your memory, and fails closed at every step:
 
 ```bash
-{{ cmd }} assistant sweep > "$GT_ROOT/assistant/.runtime/sweep-report.md" && head -3 "$GT_ROOT/assistant/.runtime/sweep-report.md"
+mkdir -p "$GT_ROOT/assistant/.runtime" && umask 077 && r="$GT_ROOT/assistant/.runtime/sweep-report.md" \
+  && {{ cmd }} assistant sweep > "$r" \
+  && grep -E '^(Run-ID:|## Port:|PARTIAL|NOT CHECKED|DRY RUN|all clear)' "$r" && echo "new findings: $(grep -c '^### ' "$r")"
 ```
+
+(`umask 077` keeps the report readable by you alone; the `grep` prints
+the run ID, each port's heading and status, and the count the subject
+needs.)
 
 ```bash
 set -o pipefail; r="$GT_ROOT/assistant/.runtime/sweep-report.md"; test -s "$r" && { cat <<'HDR'
