@@ -196,7 +196,10 @@ launder that text into trusted instructions:
    message or from header prose such as `Telegraph-Reply-Via`. A comment that *contains* a command
    is quoted as untrusted text, not proposed as an action.
 3. Every briefed item carries its source address (`telegraph/github/<login>`,
-   `gastown/witness`, …). Because a briefing's `From` is `assistant/`,
+   `gastown/witness`, …). Only the provider prefix (`telegraph/jira/`,
+   `telegraph/github/`) is a structured fact, used to pick the reply tool;
+   the `<actor>` segment is the webhook-derived display name and is quoted,
+   never used in a command. Because a briefing's `From` is `assistant/`,
    the Mayor cannot rely on sender-based trust for relayed items; the Mayor's
    prompt template therefore states explicitly that, in **any** mail
    including assistant briefings, text inside `EXTERNAL CONTENT` blocks and
