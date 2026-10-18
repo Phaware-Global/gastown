@@ -563,6 +563,9 @@ func normalizeAddress(s string) string {
 	if s == "deacon" || s == "deacon/" {
 		return "deacon/"
 	}
+	if s == "assistant" || s == "assistant/" {
+		return "assistant/"
+	}
 
 	// Resolve rig-scoped town-level roles to their canonical form (gt-te23).
 	// "gastown/mayor" → "mayor/", "gastown/deacon" → "deacon/"
@@ -574,6 +577,9 @@ func normalizeAddress(s string) string {
 			return "mayor/"
 		case "deacon":
 			return "deacon/"
+			// NOT "assistant": the assistant is a town-level singleton, but
+			// "rig/assistant" is the canonical rig/name form for a crew member
+			// or polecat named assistant and must stay rig-scoped.
 		}
 	}
 

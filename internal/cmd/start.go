@@ -731,6 +731,7 @@ func runImmediateShutdown(t *tmux.Tmux, gtSessions []string, townRoot string) er
 func killSessionsInOrder(t *tmux.Tmux, sessions []string, mayorSession, deaconSession string) int {
 	stopped := 0
 	bootSession := session.BootSessionName()
+	assistantSession := session.AssistantSessionName()
 
 	// Build a set for O(1) lookup of town-level sessions
 	sessionSet := make(map[string]bool, len(sessions))
@@ -742,7 +743,7 @@ func killSessionsInOrder(t *tmux.Tmux, sessions []string, mayorSession, deaconSe
 	var polecats, refineries, witnesses []string
 	for _, sess := range sessions {
 		// Skip town-level sessions (handled explicitly below)
-		if sess == mayorSession || sess == deaconSession || sess == bootSession {
+		if sess == mayorSession || sess == assistantSession || sess == deaconSession || sess == bootSession {
 			continue
 		}
 
@@ -809,6 +810,11 @@ func killSessionsInOrder(t *tmux.Tmux, sessions []string, mayorSession, deaconSe
 	// 4. Stop town sessions: Mayor, Boot, Deacon (matching TownSessions() order)
 	if sessionSet[mayorSession] {
 		if killAndVerify(mayorSession) {
+			stopped++
+		}
+	}
+	if sessionSet[assistantSession] {
+		if killAndVerify(assistantSession) {
 			stopped++
 		}
 	}

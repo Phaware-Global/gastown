@@ -107,12 +107,12 @@ func (d Duration) String() string {
 
 // AllRoles returns the list of all known role names.
 func AllRoles() []string {
-	return []string{"mayor", "deacon", "dog", "witness", "refinery", "polecat", "crew", "reviewer"}
+	return []string{"mayor", "assistant", "deacon", "dog", "witness", "refinery", "polecat", "crew", "reviewer"}
 }
 
 // TownRoles returns roles that operate at town scope.
 func TownRoles() []string {
-	return []string{"mayor", "deacon", "dog"}
+	return []string{"mayor", "assistant", "deacon", "dog"}
 }
 
 // RigRoles returns roles that operate at rig scope.
@@ -283,4 +283,3 @@ func ExpandPattern(pattern, townRoot, rig, name, role, prefix string) string {
 	result = strings.ReplaceAll(result, "{prefix}", prefix)
 	return result
 }
-

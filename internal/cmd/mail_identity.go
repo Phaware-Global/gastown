@@ -117,6 +117,8 @@ func detectSenderFromRole(role string) string {
 	switch role {
 	case constants.RoleMayor:
 		return "mayor/"
+	case constants.RoleAssistant:
+		return constants.RoleAssistant + "/"
 	case constants.RoleDeacon:
 		return "deacon/"
 	case constants.RolePolecat:
@@ -217,6 +219,18 @@ func detectSenderFromCwd() string {
 		}
 	}
 
+	// If in the town's assistant directory. Anchored to the town root: only
+	// a cwd whose first component under the town root is "assistant" counts
+	// (a rig checkout containing internal/assistant must not).
+	if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+		if rel, err := filepath.Rel(townRoot, cwd); err == nil {
+			first := strings.SplitN(filepath.ToSlash(rel), "/", 2)[0]
+			if first == constants.RoleAssistant {
+				return constants.RoleAssistant + "/"
+			}
+		}
+	}
+
 	// If in the town's mayor directory
 	if strings.Contains(cwd, "/mayor") {
 		return "mayor"
@@ -262,6 +276,8 @@ func identityFromAgentFile(parsed agentIdentityFile) string {
 	switch role {
 	case constants.RoleMayor:
 		return "mayor/"
+	case constants.RoleAssistant:
+		return constants.RoleAssistant + "/"
 	case constants.RoleDeacon:
 		return "deacon/"
 	case constants.RoleWitness:

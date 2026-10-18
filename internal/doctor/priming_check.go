@@ -109,6 +109,16 @@ func (c *PrimingCheck) Run(ctx *CheckContext) *CheckResult {
 		c.issues = append(c.issues, deaconIssues...)
 	}
 
+	// Check 3b: Mayor's Assistant priming
+	assistantPath := filepath.Join(ctx.TownRoot, "assistant")
+	if dirExists(assistantPath) {
+		assistantIssues := c.checkAgentPriming(ctx.TownRoot, "assistant", "assistant", "")
+		for _, issue := range assistantIssues {
+			details = append(details, fmt.Sprintf("%s: %s", issue.location, issue.description))
+		}
+		c.issues = append(c.issues, assistantIssues...)
+	}
+
 	// Check 4: Rig-level agents (witness, refinery, crew, polecats)
 	rigIssues := c.checkRigPriming(ctx.TownRoot)
 	for _, issue := range rigIssues {

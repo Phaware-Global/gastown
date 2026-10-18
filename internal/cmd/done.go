@@ -2570,7 +2570,7 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string, pushFailed,
 	// work even if the polecat worktree is deleted.
 	var beadsPath string
 	switch ctx.Role {
-	case RoleMayor, RoleDeacon:
+	case RoleMayor, RoleAssistant, RoleDeacon:
 		beadsPath = townRoot
 	default:
 		beadsPath = filepath.Join(townRoot, ctx.Rig)
@@ -2810,7 +2810,7 @@ func findAssignedBeadsForAgent(workDir, agentID string) []string {
 	if len(parts) > 0 {
 		rigName = parts[0]
 	}
-	if rigName != "" && rigName != "mayor" && rigName != "deacon" {
+	if rigName != "" && rigName != "mayor" && rigName != "assistant" && rigName != "deacon" {
 		rigWorkDir := filepath.Join(townRoot, rigName, "mayor", "rig")
 		if rigWorkDir != workDir {
 			assigned = assignedIssueIDs(queryAssignedBeads(beads.New(rigWorkDir), agentID))

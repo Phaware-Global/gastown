@@ -169,6 +169,10 @@ func runThemeApply(cmd *cobra.Command, args []string) error {
 			theme = tmux.ResolveSessionTheme(townRoot, "", constants.RoleMayor, "")
 			worker = "Mayor"
 			role = constants.RoleMayor
+		case session.RoleAssistant:
+			theme = tmux.ResolveSessionTheme(townRoot, "", constants.RoleAssistant, "")
+			worker = "Mayor's Assistant"
+			role = constants.RoleAssistant
 		case session.RoleDeacon:
 			theme = tmux.ResolveSessionTheme(townRoot, "", constants.RoleDeacon, "")
 			worker = "Deacon"
@@ -268,7 +272,7 @@ func detectCurrentRig() string {
 	// Extract first path component (rig name)
 	// Patterns: <rig>/..., mayor/..., deacon/...
 	parts := strings.Split(rel, string(filepath.Separator))
-	if len(parts) > 0 && parts[0] != "." && parts[0] != constants.RoleMayor && parts[0] != constants.RoleDeacon {
+	if len(parts) > 0 && parts[0] != "." && parts[0] != constants.RoleMayor && parts[0] != constants.RoleAssistant && parts[0] != constants.RoleDeacon {
 		return parts[0]
 	}
 

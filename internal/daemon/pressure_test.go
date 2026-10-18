@@ -84,6 +84,7 @@ func TestIsAgentSession(t *testing.T) {
 		want bool
 	}{
 		{"hq-mayor", true},
+		{"hq-assistant", true},
 		{"rig-witness", true},
 		{"rig-refinery", true},
 		{"rig-polecat-abc", true},

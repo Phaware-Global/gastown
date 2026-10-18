@@ -636,6 +636,9 @@ func resolveRoleToSession(role string) (string, error) {
 	case constants.RoleMayor, "may":
 		return getMayorSessionName(), nil
 
+	case constants.RoleAssistant:
+		return session.AssistantSessionName(), nil
+
 	case constants.RoleDeacon, "dea":
 		return getDeaconSessionName(), nil
 
@@ -1085,6 +1088,8 @@ func sessionWorkDir(sessionName, townRoot string) (string, error) {
 		switch identity.Role {
 		case session.RoleMayor:
 			return townRoot + "/mayor", nil
+		case session.RoleAssistant:
+			return townRoot + "/" + constants.RoleAssistant, nil
 		case session.RoleDeacon:
 			return townRoot + "/deacon", nil
 		case session.RoleOverseer:

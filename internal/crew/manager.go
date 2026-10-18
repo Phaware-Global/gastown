@@ -126,6 +126,22 @@ func validateCrewName(name string) error {
 	return nil
 }
 
+// validateNewCrewName applies validateCrewName plus the rules that only
+// matter when a name is being created (Add, Rename target): town-level role
+// names are reserved, because a crew member called "mayor" or "assistant"
+// would collide with that role's address and directory. Existing members
+// that predate the reservation stay manageable through the plain validator.
+func validateNewCrewName(name string) error {
+	if err := validateCrewName(name); err != nil {
+		return err
+	}
+	switch strings.ToLower(name) {
+	case "mayor", "assistant", "deacon":
+		return fmt.Errorf("%w: %q is reserved for a town-level role", ErrInvalidCrewName, name)
+	}
+	return nil
+}
+
 // Manager handles crew worker lifecycle.
 type Manager struct {
 	rig *rig.Rig
@@ -193,6 +209,11 @@ func (m *Manager) Add(name string, createBranch bool) (*CrewWorker, error) {
 
 // addLocked creates a new crew worker, assumes caller holds lockCrew(name).
 func (m *Manager) addLocked(name string, createBranch bool) (*CrewWorker, error) {
+	// Every creation path (Add, and Start's implicit create) goes through
+	// here, so this is where reserved names are enforced.
+	if err := validateNewCrewName(name); err != nil {
+		return nil, err
+	}
 	if m.exists(name) {
 		return nil, ErrCrewExists
 	}
@@ -564,7 +585,7 @@ func (m *Manager) loadState(name string) (*CrewWorker, error) {
 
 // Rename renames a crew worker from oldName to newName.
 func (m *Manager) Rename(oldName, newName string) error {
-	if err := validateCrewName(newName); err != nil {
+	if err := validateNewCrewName(newName); err != nil {
 		return err
 	}
 	// Lock both names in alphabetical order to prevent deadlock.

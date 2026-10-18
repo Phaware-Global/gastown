@@ -16,9 +16,12 @@ func TestAddressToIdentity(t *testing.T) {
 		{"mayor/", "mayor/"},
 		{"deacon", "deacon/"},
 		{"deacon/", "deacon/"},
+		{"assistant", "assistant/"},
+		{"assistant/", "assistant/"},
 
 		// Rig-scoped town-level roles resolve to canonical form (gt-te23)
 		{"gastown/mayor", "mayor/"},
+		{"gastown/assistant", "gastown/assistant"}, // rig-scoped name, not the town assistant
 		{"gastown/deacon", "deacon/"},
 		{"laser/mayor", "mayor/"},
 		{"laser/deacon", "deacon/"},

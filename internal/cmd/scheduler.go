@@ -467,7 +467,7 @@ func beadsSearchDirs(townRoot string) []string {
 		return dirs
 	}
 	for _, e := range entries {
-		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") || e.Name() == "mayor" || e.Name() == "settings" {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") || e.Name() == "mayor" || e.Name() == "assistant" || e.Name() == "settings" {
 			continue
 		}
 		rigDir := filepath.Join(townRoot, e.Name())

@@ -194,7 +194,7 @@ func parseBeadContext(beadID string) (actor, rig, role string) {
 
 	// Build actor identifier
 	switch parsedRole {
-	case constants.RoleMayor, constants.RoleDeacon:
+	case constants.RoleMayor, constants.RoleAssistant, constants.RoleDeacon:
 		actor = parsedRole
 	case constants.RoleWitness, constants.RoleRefinery:
 		actor = parsedRole
@@ -373,7 +373,7 @@ func parseGtEventLine(line string) *Event {
 	if rig == "" && ge.Actor != "" {
 		// Extract rig from actor like "gastown/witness"
 		parts := strings.Split(ge.Actor, "/")
-		if len(parts) > 0 && parts[0] != constants.RoleMayor && parts[0] != constants.RoleDeacon {
+		if len(parts) > 0 && parts[0] != constants.RoleMayor && parts[0] != constants.RoleAssistant && parts[0] != constants.RoleDeacon {
 			rig = parts[0]
 		}
 	}

@@ -38,6 +38,8 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 	switch ctx.Role {
 	case RoleMayor:
 		roleName = constants.RoleMayor
+	case RoleAssistant:
+		roleName = constants.RoleAssistant
 	case RoleDeacon:
 		roleName = constants.RoleDeacon
 	case RoleWitness:
@@ -533,6 +535,15 @@ func outputStartupDirective(ctx RoleContext) {
 		fmt.Println("4. Check for attached work: `" + cli.Name() + " hook`")
 		fmt.Println("   - If mol attached → **RUN IT** (no human input needed)")
 		fmt.Println("   - If no mol → await user instruction")
+	case RoleAssistant:
+		fmt.Println()
+		fmt.Println("---")
+		fmt.Println()
+		fmt.Println("**STARTUP PROTOCOL**: You are the Mayor's Assistant. Please:")
+		fmt.Println("1. Run `" + cli.Name() + " prime` (loads full context, mail, and pending work)")
+		fmt.Println("2. Announce: \"Mayor's Assistant, checking in.\"")
+		fmt.Println("3. Check mail: `" + cli.Name() + " mail inbox` — read every message, triage, brief the Mayor")
+		fmt.Println("4. Check for attached work: `" + cli.Name() + " hook`")
 	case RoleWitness:
 		if stopped, reason := IsRigParkedOrDocked(ctx.TownRoot, ctx.Rig); stopped {
 			fmt.Println()

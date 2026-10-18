@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -64,12 +65,14 @@ func runPeek(cmd *cobra.Command, args []string) error {
 	// Handle town-level agents: mayor, deacon, boot
 	// These use session names like "hq-mayor", "hq-deacon" but have no rig.
 	townAgentSessions := map[string]string{
-		"mayor":     "hq-mayor",
-		"hq/mayor":  "hq-mayor",
-		"deacon":    "hq-deacon",
-		"hq/deacon": "hq-deacon",
-		"boot":      "hq-boot",
-		"hq/boot":   "hq-boot",
+		"mayor":                         "hq-mayor",
+		"hq/mayor":                      "hq-mayor",
+		constants.RoleAssistant:         "hq-" + constants.RoleAssistant,
+		"hq/" + constants.RoleAssistant: "hq-" + constants.RoleAssistant,
+		"deacon":                        "hq-deacon",
+		"hq/deacon":                     "hq-deacon",
+		"boot":                          "hq-boot",
+		"hq/boot":                       "hq-boot",
 	}
 	if sessionName, ok := townAgentSessions[address]; ok {
 		_, err := workspace.FindFromCwdOrError()

@@ -194,6 +194,7 @@ func isAgentSession(name string) bool {
 	// Agent sessions contain role markers
 	for _, marker := range []string{
 		constants.RoleMayor,
+		constants.RoleAssistant,
 		constants.RoleWitness,
 		constants.RoleRefinery,
 		constants.RolePolecat,

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -331,7 +332,7 @@ func (r *Router) buildLabels(msg *Message) []string {
 // isTownLevelAddress returns true if the address is for a town-level agent or the overseer.
 func isTownLevelAddress(address string) bool {
 	addr := strings.TrimSuffix(address, "/")
-	return addr == constants.RoleMayor || addr == constants.RoleDeacon || addr == "overseer"
+	return addr == constants.RoleMayor || addr == constants.RoleAssistant || addr == constants.RoleDeacon || addr == "overseer"
 }
 
 // isGroupAddress returns true if the address is a @group address.
@@ -446,6 +447,9 @@ func agentBeadToAddress(bead *agentBead) string {
 		}
 		if id == "hq-deacon" {
 			return "deacon/"
+		}
+		if id == "hq-"+constants.RoleAssistant {
+			return constants.RoleAssistant + "/"
 		}
 
 		// For other hq- agents, fall back to description parsing
@@ -1023,7 +1027,7 @@ func (r *Router) validateRecipient(identity string) error {
 
 	// Well-known town-level singletons always valid
 	switch identity {
-	case "mayor", "mayor/", "deacon", "deacon/":
+	case "mayor", "mayor/", "deacon", "deacon/", "assistant", "assistant/":
 		return nil
 	}
 
@@ -2057,12 +2061,21 @@ func (r *Router) isRecipientMuted(address string) bool {
 // addressToAgentBeadID converts a mail address to an agent bead ID for DND lookup.
 // Returns empty string if the address cannot be converted.
 func addressToAgentBeadID(address string) string {
-	switch {
-	case address == "overseer":
+	// Exact matches (with optional trailing slash). Prefix matching here
+	// would misroute any future role whose name starts with "mayor".
+	switch strings.TrimSuffix(address, "/") {
+	case "overseer":
 		return "" // Overseer is a human, no agent bead
-	case strings.HasPrefix(address, constants.RoleMayor):
+	case constants.RoleMayor:
 		return session.MayorSessionName()
-	case strings.HasPrefix(address, constants.RoleDeacon):
+	case constants.RoleAssistant:
+		return session.AssistantSessionName()
+	case constants.RoleDeacon:
+		return session.DeaconSessionName()
+	}
+	// Deacon-family addresses (deacon/boot, deacon/dogs/<name>) are not rigs:
+	// their DND state is the Deacon's, as before the exact-match change.
+	if strings.HasPrefix(address, constants.RoleDeacon+"/") {
 		return session.DeaconSessionName()
 	}
 
@@ -2108,14 +2121,28 @@ func AddressToSessionIDs(address string) []string {
 		return []string{session.OverseerSessionName()}
 	}
 
-	// Mayor address: "mayor/" or "mayor"
-	if strings.HasPrefix(address, constants.RoleMayor) {
+	// Town-level singletons: "mayor/", "assistant/", "deacon/" (slash
+	// optional). Exact matches, not prefixes.
+	switch strings.TrimSuffix(address, "/") {
+	case constants.RoleMayor:
 		return []string{session.MayorSessionName()}
-	}
-
-	// Deacon address: "deacon/" or "deacon"
-	if strings.HasPrefix(address, constants.RoleDeacon) {
+	case constants.RoleAssistant:
+		return []string{session.AssistantSessionName()}
+	case constants.RoleDeacon:
 		return []string{session.DeaconSessionName()}
+	}
+	// Deacon-family addresses are not rigs: "deacon" must never be split off
+	// as a rig name (that would nudge a crew member or polecat named boot).
+	if rest, ok := strings.CutPrefix(address, constants.RoleDeacon+"/"); ok {
+		rest = strings.Trim(path.Clean(rest), "/")
+		switch {
+		case rest == "boot":
+			return []string{session.BootSessionName()}
+		case strings.HasPrefix(rest, "dogs/") && len(rest) > len("dogs/"):
+			return []string{session.DogSessionName(strings.TrimPrefix(rest, "dogs/"))}
+		default:
+			return []string{session.DeaconSessionName()}
+		}
 	}
 
 	// Rig-based address: "rig/target" or "rig/crew/name" or "rig/polecats/name"

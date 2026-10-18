@@ -872,6 +872,11 @@ func initTownAgentBeads(townPath string) error {
 			title:    "Mayor - global coordinator, handles cross-rig communication and escalations.",
 		},
 		{
+			id:       beads.AssistantBeadIDTown(),
+			roleType: constants.RoleAssistant,
+			title:    "Mayor's Assistant - triages inbound mail, telegraph and escalations; briefs the Mayor.",
+		},
+		{
 			id:       beads.DeaconBeadIDTown(),
 			roleType: "deacon",
 			title:    "Deacon (daemon beacon) - receives mechanical heartbeats, runs town plugins and monitoring.",

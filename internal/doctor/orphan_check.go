@@ -179,7 +179,7 @@ func (c *OrphanSessionCheck) getValidRigs(townRoot string) []string {
 		entries, err := os.ReadDir(townRoot)
 		if err == nil {
 			for _, entry := range entries {
-				if entry.IsDir() && entry.Name() != "mayor" && entry.Name() != ".beads" && !strings.HasPrefix(entry.Name(), ".") {
+				if entry.IsDir() && entry.Name() != "mayor" && entry.Name() != "assistant" && entry.Name() != ".beads" && !strings.HasPrefix(entry.Name(), ".") {
 					// Check if it looks like a rig (has polecats/ or crew/ directory)
 					polecatsDir := filepath.Join(townRoot, entry.Name(), "polecats")
 					crewDir := filepath.Join(townRoot, entry.Name(), "crew")
