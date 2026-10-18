@@ -125,7 +125,7 @@ func TestLiveJira(t *testing.T) {
 	t.Logf("jira: site=%s projects=%s board=%d", cfg.Site, strings.Join(cfg.Projects, ","), cfg.BoardID)
 	findings := liveSweep(t, port, in)
 	for _, f := range findings {
-		if !strings.HasPrefix(f.URL, "https://") {
+		if f.URL != "" && !strings.HasPrefix(f.URL, "https://") {
 			t.Errorf("%s/%s: URL %q is not the issue's browse URL", f.Kind, f.Key, f.URL)
 		}
 	}

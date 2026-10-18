@@ -291,29 +291,27 @@ func (c *jiraClient) comments(key string) ([]jiraComment, error) {
 	return res.Comments, err
 }
 
-// backlog returns the keys sitting in the board's backlog (off the board).
-func (c *jiraClient) backlog(boardID int) (map[string]bool, bool, error) {
-	keys := map[string]bool{}
-	for start, page := 0, 0; page < 20; page++ {
-		var res struct {
+// onBoard returns the keys the board currently shows. The board's render
+// data is the only authoritative membership source: the agile backlog and
+// board-issue endpoints list a project's issues regardless of side (on this
+// instance the backlog listing alone runs to thousands of issues), as the
+// move-to-board skill warns, and it is one request instead of a paged walk.
+func (c *jiraClient) onBoard(boardID int) (map[string]bool, error) {
+	var res struct {
+		IssuesData struct {
 			Issues []struct {
 				Key string `json:"key"`
 			} `json:"issues"`
-			Total int `json:"total"`
-		}
-		if err := c.get(fmt.Sprintf("/rest/agile/1.0/board/%d/backlog", boardID),
-			url.Values{"startAt": {fmt.Sprint(start)}, "maxResults": {fmt.Sprint(jiraPageSize)}, "fields": {"key"}}, &res); err != nil {
-			return keys, false, err
-		}
-		for _, i := range res.Issues {
-			keys[i.Key] = true
-		}
-		start += len(res.Issues)
-		if c.dry || len(res.Issues) == 0 || start >= res.Total {
-			return keys, true, nil
-		}
+		} `json:"issuesData"`
 	}
-	return keys, false, nil
+	if err := c.get("/rest/greenhopper/1.0/xboard/work/allData.json", url.Values{"rapidViewId": {fmt.Sprint(boardID)}}, &res); err != nil {
+		return nil, err
+	}
+	keys := make(map[string]bool, len(res.IssuesData.Issues))
+	for _, i := range res.IssuesData.Issues {
+		keys[i.Key] = true
+	}
+	return keys, nil
 }
 
 // --- the sweep -------------------------------------------------------------
@@ -419,16 +417,16 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	for _, i := range tIssues {
 		transitioned[i.Key] = true
 	}
-	// 3. Backlog membership (off-board).
-	var backlog map[string]bool
+	// 3. Board membership (off-board). nil means not checked: a missing
+	//    board must never read as "everything is off the board".
+	var onBoard map[string]bool
 	if cfg.BoardID > 0 {
-		var ok bool
-		backlog, ok, err = c.backlog(cfg.BoardID)
+		onBoard, err = c.onBoard(cfg.BoardID)
 		if err != nil {
-			note("board %d backlog unavailable (off-board not checked): %v", cfg.BoardID, err)
-			backlog = nil
-		} else if !ok {
-			note("board %d backlog truncated", cfg.BoardID)
+			note("board %d unavailable (off-board not checked): %v", cfg.BoardID, err)
+			onBoard = nil
+		} else if in.DryRun {
+			onBoard = nil
 		}
 	}
 	// 4. Release-wave parents.
@@ -579,7 +577,7 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 				}
 			}
 		}
-		if involved && backlog[is.Key] {
+		if involved && onBoard != nil && !onBoard[is.Key] {
 			createdByPersona := f.Creator != nil && isPersona[f.Creator.AccountID]
 			if contains(active, status) || (createdByPersona && in.Now.Sub(time.Time(f.Created)) <= d.offBoard) {
 				fd := base("off-board", SeverityActionable)

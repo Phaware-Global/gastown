@@ -62,7 +62,8 @@ type jiraFixture struct {
 	issues    []map[string]any
 	comments  map[string][]map[string]any
 	failKey   string
-	backlog   []string
+	offBoard  []string // keys the board's render data leaves out
+	boardFail bool     // the board render data answers 500
 	waves     []map[string]any
 	waveChild map[string][]map[string]any
 	changed   []map[string]any
@@ -111,15 +112,28 @@ func (fx *jiraFixture) handler(t *testing.T) http.Handler {
 				}
 			}
 			write(map[string]any{"comments": fx.comments[key]})
-		case r.URL.Path == "/rest/agile/1.0/board/18/backlog":
-			if r.URL.Query().Has("jql") {
-				t.Error("backlog must not be filtered with jql (skill: misleading)")
+		case r.URL.Path == "/rest/greenhopper/1.0/xboard/work/allData.json":
+			if r.URL.Query().Get("rapidViewId") != "18" {
+				t.Errorf("board render data for the wrong board: %s", r.URL.RawQuery)
+			}
+			if fx.boardFail {
+				http.Error(w, "board unavailable", 500)
+				return
+			}
+			// Every fixture issue is on the board except the listed ones.
+			off := map[string]bool{}
+			for _, k := range fx.offBoard {
+				off[k] = true
 			}
 			var is []map[string]any
-			for _, k := range fx.backlog {
-				is = append(is, map[string]any{"key": k})
+			for _, list := range [][]map[string]any{fx.issues, fx.watched, fx.changed, fx.waves} {
+				for _, i := range list {
+					if k, _ := i["key"].(string); k != "" && !off[k] {
+						is = append(is, map[string]any{"key": k})
+					}
+				}
 			}
-			write(map[string]any{"issues": is, "total": len(is)})
+			write(map[string]any{"issuesData": map[string]any{"issues": is}})
 		default:
 			t.Errorf("unexpected request %s", r.URL)
 			http.NotFound(w, r)
@@ -178,7 +192,7 @@ func TestJiraPort_Findings(t *testing.T) {
 			"P23-14":      {comment("1402", humanID, 5*h, "question for the team?", "")},
 		},
 		watched:   []map[string]any{{"key": "P23-14"}},
-		backlog:   []string{"P23-5", "P23-99", "P23-11"},
+		offBoard:  []string{"P23-5", "P23-99", "P23-11"},
 		waves:     []map[string]any{issue("P23-9", "In Progress", "indeterminate", "", 500*h, 300*h, "Release wave 12")},
 		waveChild: map[string][]map[string]any{"P23-9": {issue("P23-91", "In UAT", "indeterminate", "", 400*h, 250*h, "child")}},
 		changed:   []map[string]any{{"key": "P23-10"}},
@@ -261,6 +275,25 @@ func TestJiraPort_PartialAndErrors(t *testing.T) {
 		t.Fatalf("a failed comment fetch must be partial, keeping the rest: %v / %v", err, findings)
 	}
 
+	// Board render data unavailable: off-board is not checked (never "all
+	// off the board"), the port is partial and the other kinds survive.
+	fx = &jiraFixture{
+		issues:    []map[string]any{issue("P23-5", "Research", "indeterminate", personaID, 240*h, 1*h, "would be off-board")},
+		comments:  map[string][]map[string]any{"P23-5": {comment("501", personaID, 1*h, "note", "")}},
+		offBoard:  []string{"P23-5"},
+		boardFail: true,
+	}
+	p, in = newJiraTest(t, fx, []string{personaID})
+	findings, err = p.Sweep(context.Background(), in)
+	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "off-board not checked") {
+		t.Errorf("an unavailable board must be partial with the reason: %v", err)
+	}
+	for _, f := range findings {
+		if f.Kind == "off-board" {
+			t.Errorf("an unavailable board must not yield off-board findings: %+v", f)
+		}
+	}
+
 	// No persona ID: hard error, never an empty all-clear.
 	p, in = newJiraTest(t, &jiraFixture{}, nil)
 	if _, err := p.Sweep(context.Background(), in); err == nil || !strings.Contains(err.Error(), "jira_usernames is not used") {
@@ -290,7 +323,7 @@ func TestJiraPort_DryRunTracesWithoutCalling(t *testing.T) {
 		t.Fatalf("dry run must not call Jira: err=%v findings=%d calls=%d", err, len(findings), fx.calls.Load())
 	}
 	joined := strings.Join(traced, "\n")
-	for _, want := range []string{"/rest/api/3/search/jql", "watcher in", "status changed after", "Release wave", "/rest/agile/1.0/board/18/backlog", "/comment"} {
+	for _, want := range []string{"/rest/api/3/search/jql", "watcher in", "status changed after", "Release wave", "/rest/greenhopper/1.0/xboard/work/allData.json", "/comment"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("dry run should trace %q:\n%s", want, joined)
 		}
