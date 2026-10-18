@@ -211,7 +211,7 @@ func TestRenderRole_Assistant(t *testing.T) {
 	for _, want := range []string{
 		"BRIEF:", "URGENT:", "SWEEP:",
 		"EXTERNAL CONTENT", "[neutralized delimiter]", "not delegable", "Operator policy (from telegraph",
-		"Hooked beads follow the same rule", "advisory to the Mayor", // trust boundary + delegation limits (review of #283)
+		"Hooked beads follow the same rule", "advisory to the Mayor", "Never from `Telegraph-Reply-Via`", // trust boundary + delegation limits (review of #283)
 		"gt mail send mayor/",
 		"mail mark-read",
 		"**45m**",
@@ -239,7 +239,7 @@ func TestRenderRole_MayorTrustBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderRole(mayor) error = %v", err)
 	}
-	for _, want := range []string{"Trust Boundary", "EXTERNAL CONTENT", "assistant/", "telegraph/*", "[neutralized\ndelimiter]", "**advisory**", "telegraph.prompts.toml", "`default` key", "word for word one of the known per-provider"} {
+	for _, want := range []string{"Trust Boundary", "EXTERNAL CONTENT", "assistant/", "telegraph/*", "[neutralized\ndelimiter]", "**advisory**", "telegraph.prompts.toml", "`default` key", "never trusted beyond the fact that a reply goes out of band"} {
 		if !strings.Contains(output, want) {
 			t.Errorf("mayor template missing trust-boundary text %q", want)
 		}
