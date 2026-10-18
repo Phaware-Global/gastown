@@ -417,9 +417,9 @@ func safeTitle(text string) string {
 func replyHintFor(provider string) string {
 	switch provider {
 	case "jira":
-		return "out-of-band only — use Jira MCP tools (e.g. mcp__atlassian__addCommentToJiraIssue, mcp__atlassian__transitionJiraIssue); do NOT reply via bead"
+		return "out-of-band only — relayed to the Mayor, who replies on Jira; do NOT reply via bead"
 	case "github":
-		return "out-of-band only — use `gh` CLI or GitHub MCP (e.g. gh pr comment, gh pr review); do NOT reply via bead"
+		return "out-of-band only — relayed to the Mayor, who replies on GitHub; do NOT reply via bead"
 	default:
 		return ""
 	}
