@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os/exec"
 	"path/filepath"
 	"slices"
@@ -377,65 +378,79 @@ type ghClient struct {
 	dry   bool
 }
 
+// do sends an authenticated request and decodes the JSON reply into out, or
+// hands the raw body over when out is a *[]byte (a non-JSON Accept set by
+// the caller is kept). A body at the 8MiB cap is an error, never silently
+// truncated data.
 func (c *ghClient) do(req *http.Request, out any) error {
 	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Accept", "application/vnd.github+json")
+	if req.Header.Get("Accept") == "" {
+		req.Header.Set("Accept", "application/vnd.github+json")
+	}
 	resp, err := c.port.client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	const capBytes = 8 << 20
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, capBytes))
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s %s: HTTP %d: %s", req.Method, req.URL.Path, resp.StatusCode, truncate(string(body), 300))
+	}
+	if len(body) >= capBytes {
+		return fmt.Errorf("%s %s: response exceeds %d bytes", req.Method, req.URL.Path, capBytes)
+	}
+	if raw, ok := out.(*[]byte); ok {
+		*raw = body
+		return nil
 	}
 	return json.Unmarshal(body, out)
 }
 
 // prDiff returns the PR's own changes at a head — GitHub's three-dot compare
-// against the base branch, i.e. from the merge base — as one line per file,
-// so two heads can be compared for material change: a head that only merged
-// the base branch has the same files and patches as the approved one. A
-// file without a patch (binary or too large) is identified by blob SHA and
-// line counts, which can only err towards "changed".
+// against the base branch, i.e. from the merge base — as the unified diff
+// text, normalized so two heads can be compared for material change: a head
+// that only merged the base branch has the same diff as the approved one.
+// The diff text (not the JSON file list) carries file modes and rename
+// sources, so a chmod or a rename after the approval reads as changed.
+// Blob ids ("index" lines) and hunk ranges shift whenever the base touches
+// a PR file and are dropped; the hunk bodies are kept whole.
 func (c *ghClient) prDiff(ref repoRef, base, head string) ([]string, error) {
-	p := fmt.Sprintf("/repos/%s/%s/compare/%s...%s", ref.Owner, ref.Name, base, head)
+	p := fmt.Sprintf("/repos/%s/%s/compare/%s...%s", ref.Owner, ref.Name, url.PathEscape(base), url.PathEscape(head))
 	if c.trace != nil {
 		c.trace("GET " + p)
 	}
 	if c.dry {
 		return nil, nil
 	}
-	req, err := http.NewRequestWithContext(c.ctx, http.MethodGet, c.port.apiBase+p+"?per_page=1", nil)
+	req, err := http.NewRequestWithContext(c.ctx, http.MethodGet, c.port.apiBase+p, nil)
 	if err != nil {
 		return nil, err
 	}
-	var res struct {
-		Files []struct {
-			Filename  string `json:"filename"`
-			Status    string `json:"status"`
-			Additions int    `json:"additions"`
-			Deletions int    `json:"deletions"`
-			SHA       string `json:"sha"`
-			Patch     string `json:"patch"`
-		} `json:"files"`
-	}
-	if err := c.do(req, &res); err != nil {
+	req.Header.Set("Accept", "application/vnd.github.diff")
+	var raw []byte
+	if err := c.do(req, &raw); err != nil {
 		return nil, err
 	}
-	if len(res.Files) >= 300 {
-		return nil, fmt.Errorf("compare lists 300 or more files; not comparable")
-	}
-	out := make([]string, 0, len(res.Files))
-	for _, f := range res.Files {
-		id := f.Patch
-		if id == "" {
-			id = fmt.Sprintf("%s|%d|%d", f.SHA, f.Additions, f.Deletions)
+	return normalizeDiff(string(raw)), nil
+}
+
+// normalizeDiff keeps every line of a unified diff that says what the
+// change is (file headers, modes, renames, hunk bodies) and drops what moves
+// with the merge base (blob ids, hunk line ranges).
+func normalizeDiff(raw string) []string {
+	lines := strings.Split(strings.TrimRight(raw, "\n"), "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "index "):
+			continue
+		case strings.HasPrefix(line, "@@"):
+			line = "@@"
 		}
-		out = append(out, f.Filename+"|"+f.Status+"|"+id)
+		out = append(out, line)
 	}
-	sort.Strings(out)
-	return out, nil
+	return out
 }
 
 // repo fetches one page of a repository's open PRs. A field-level GraphQL
@@ -647,7 +662,7 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	compares := 0
 	diffSince := func(ref repoRef, base, old, head string) (string, error) {
 		if compares >= githubComparesPerSweep {
-			return "unknown", fmt.Errorf("compare budget of %d calls spent", githubComparesPerSweep)
+			return "unknown", nil // not an outage: "unknown" already asks for review, and partial would stop eviction every sweep
 		}
 		compares += 2
 		was, err := c.prDiff(ref, base, old)
@@ -1001,7 +1016,14 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 		} else {
 			f.Suggest = "ask " + humanApprovedOld + " to re-approve " + key
 		}
-		f.Fingerprint = head + "|" + diff
+		// Fingerprint the action, not the verdict: "changed" and "unknown"
+		// give the same advice, so a transient compare error must not
+		// re-page an acknowledged item.
+		action := "reapprove"
+		if diff == "unchanged" {
+			action = "unchanged"
+		}
+		f.Fingerprint = head + "|" + action
 		out = append(out, f)
 	}
 	if approverOK && ci == "success" && now.Sub(approvedAt) >= d.approvedUnmerged {

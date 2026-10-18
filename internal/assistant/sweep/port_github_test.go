@@ -86,9 +86,9 @@ type ghFixture struct {
 	nullNodePR  int                    // repo query: this PR's whole node comes back null (NON_NULL field denied)
 	pageQueries []int                  // PR numbers the per-PR paging query was asked for
 	patrolCalls atomic.Int32
-	patches     map[string][]map[string]any // "base...sha" → compare files; unlisted specs differ from each other
-	compareFail []string                    // compare specs that answer 500
-	patrolDelay time.Duration               // patrolBeads sleeps this long
+	diffs       map[string]string // "base...sha" → unified diff text; unlisted specs differ from each other
+	compareFail []string          // compare specs that answer 500
+	patrolDelay time.Duration     // patrolBeads sleeps this long
 }
 
 func (fx *ghFixture) handler(t *testing.T) http.Handler {
@@ -106,11 +106,15 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 					return
 				}
 			}
-			files, ok := fx.patches[spec]
-			if !ok {
-				files = []map[string]any{{"filename": "unlisted-" + spec, "status": "modified", "patch": "@@ " + spec}}
+			if r.Header.Get("Accept") == "application/vnd.github.diff" {
+				d, ok := fx.diffs[spec]
+				if !ok {
+					d = "diff --git a/unlisted b/unlisted\n--- a/unlisted\n+++ b/unlisted\n@@ -1 +1 @@\n-" + spec + "\n+x\n"
+				}
+				_, _ = w.Write([]byte(d))
+				return
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ahead", "files": files})
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ahead"})
 		case r.URL.Path == "/graphql":
 			if fx.slow > 0 {
 				select {
@@ -263,23 +267,29 @@ func TestGitHubPort_ApproverIsHumanWithoutHumansList(t *testing.T) {
 }
 
 // A stale approval tells a base-branch merge (the PR's own diff is
-// unchanged: no new review needed) from a material change (ask again); a
-// compare that cannot answer asks again and makes the port partial.
+// unchanged: no new review needed) from a material change (ask again),
+// including a mode change or a rename that the JSON file list would hide; a
+// compare that cannot answer asks again and makes the port partial, while a
+// spent compare budget is "unknown" without partial. The fingerprint is the
+// action, so a transient compare error never re-pages an acked item.
 func TestGitHubPort_ApprovalStaleDiff(t *testing.T) {
 	h := time.Hour
-	const shaC, shaD = "cccccccccccccccccccccccccccccccccccccccc", "dddddddddddddddddddddddddddddddddddddddd"
+	sha := func(c byte) string { return strings.Repeat(string(c), 40) }
 	head := func(sha string) func(*ghPR) { return func(p *ghPR) { p.HeadRefOid = sha } }
-	same := []map[string]any{{"filename": "a.go", "status": "modified", "patch": "@@ -1 +1 @@\n-x\n+y"}}
-	other := []map[string]any{{"filename": "a.go", "status": "modified", "patch": "@@ -1 +1 @@\n-x\n+z"}}
-	app := &ghRepoData{}
-	app.Open.Nodes = []ghPR{
-		pr(1, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", shaA, 1*h), review("kevin", "APPROVED", shaB, 20*h), head(shaA)),
-		pr(2, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", shaC, 1*h), review("kevin", "APPROVED", shaB, 20*h), head(shaC)),
-		pr(3, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", shaD, 1*h), review("kevin", "APPROVED", shaB, 20*h), head(shaD)),
+	stale := func(n int, headSHA string) ghPR {
+		return pr(n, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", headSHA, 1*h), review("kevin", "APPROVED", shaB, 20*h), head(headSHA))
 	}
-	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}},
-		patches:     map[string][]map[string]any{"main..." + shaB: same, "main..." + shaA: same, "main..." + shaC: other},
-		compareFail: []string{"main..." + shaD}}
+	const approved = "diff --git a/a.go b/a.go\nindex 1111111..2222222 100644\n--- a/a.go\n+++ b/a.go\n@@ -1,3 +1,3 @@ func f()\n-x\n+y\n"
+	diffs := map[string]string{
+		"main..." + shaB:     approved,
+		"main..." + sha('a'): "diff --git a/a.go b/a.go\nindex 3333333..4444444 100644\n--- a/a.go\n+++ b/a.go\n@@ -7,3 +7,3 @@ func f()\n-x\n+y\n",                                                         // base moved: blob ids and ranges shift
+		"main..." + sha('c'): strings.Replace(approved, "+y", "+z", 1),                                                                                                                                      // material change
+		"main..." + sha('e'): "diff --git a/a.go b/a.go\nold mode 100644\nnew mode 100755\nindex 1111111..2222222\n--- a/a.go\n+++ b/a.go\n@@ -1,3 +1,3 @@ func f()\n-x\n+y\n",                              // chmod +x
+		"main..." + sha('f'): "diff --git a/a.go b/b.go\nsimilarity index 90%\nrename from a.go\nrename to b.go\nindex 1111111..2222222 100644\n--- a/a.go\n+++ b/b.go\n@@ -1,3 +1,3 @@ func f()\n-x\n+y\n", // rename
+	}
+	app := &ghRepoData{}
+	app.Open.Nodes = []ghPR{stale(1, sha('a')), stale(2, sha('c')), stale(3, sha('d')), stale(4, sha('e')), stale(5, sha('f'))}
+	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, diffs: diffs, compareFail: []string{"main..." + sha('d')}}
 	p, in := newGitHubTest(t, fx, []string{"artie"})
 	findings, err := p.Sweep(context.Background(), in)
 	var partial *PartialError
@@ -290,18 +300,51 @@ func TestGitHubPort_ApprovalStaleDiff(t *testing.T) {
 	for _, f := range findings {
 		got[f.Kind+"/"+f.Key] = f
 	}
-	for _, c := range []struct{ key, diff, suggest string }{
-		{"acme/app#1", "unchanged", "acme/app#1 only merged its base branch since kevin approved: no new review needed"},
-		{"acme/app#2", "changed", "ask kevin to re-approve acme/app#2"},
-		{"acme/app#3", "unknown", "ask kevin to re-approve acme/app#3"},
+	for _, c := range []struct{ key, diff, suggest, fp string }{
+		{"acme/app#1", "unchanged", "acme/app#1 only merged its base branch since kevin approved: no new review needed", sha('a') + "|unchanged"},
+		{"acme/app#2", "changed", "ask kevin to re-approve acme/app#2", sha('c') + "|reapprove"},
+		{"acme/app#3", "unknown", "ask kevin to re-approve acme/app#3", sha('d') + "|reapprove"},
+		{"acme/app#4", "changed", "ask kevin to re-approve acme/app#4", sha('e') + "|reapprove"},
+		{"acme/app#5", "changed", "ask kevin to re-approve acme/app#5", sha('f') + "|reapprove"},
 	} {
 		f, ok := got["approval-stale/"+c.key]
-		if !ok || f.Fields["diff"] != c.diff || f.Suggest != c.suggest {
-			t.Errorf("%s: want diff=%s suggest=%q, got ok=%v %+v", c.key, c.diff, c.suggest, ok, f)
+		if !ok || f.Fields["diff"] != c.diff || f.Suggest != c.suggest || f.Fingerprint != c.fp {
+			t.Errorf("%s: want diff=%s suggest=%q fp=%s, got ok=%v %+v", c.key, c.diff, c.suggest, c.fp, ok, f)
 		}
 	}
-	if fx.calls.Load() == 0 {
-		t.Fatal("no calls recorded")
+	// The same PR on a later sweep whose compare fails: same advice, same
+	// fingerprint, so an acked "changed" item stays standing.
+	app.Open.Nodes = []ghPR{stale(2, sha('c'))}
+	fx.compareFail = append(fx.compareFail, "main..."+sha('c'))
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	findings, _ = p.Sweep(context.Background(), in)
+	got = map[string]Finding{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = f
+	}
+	if f := got["approval-stale/acme/app#2"]; f.Fields["diff"] != "unknown" || f.Fingerprint != sha('c')+"|reapprove" {
+		t.Errorf("a transient compare error must keep the fingerprint: %+v", f)
+	}
+	// Eleven stale approvals: the 20-call budget covers ten; the eleventh
+	// is "unknown" with re-approve advice and no partial note.
+	app.Open.Nodes = nil
+	for n := 1; n <= 11; n++ {
+		app.Open.Nodes = append(app.Open.Nodes, stale(n, sha('c')))
+	}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, diffs: diffs}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	findings, err = p.Sweep(context.Background(), in)
+	if err != nil {
+		t.Errorf("a spent compare budget must not make the port partial: %v", err)
+	}
+	counts := map[string]int{}
+	for _, f := range findings {
+		if f.Kind == "approval-stale" {
+			counts[f.Fields["diff"]]++
+		}
+	}
+	if counts["changed"] != 10 || counts["unknown"] != 1 {
+		t.Errorf("budget: want 10 changed + 1 unknown, got %v", counts)
 	}
 }
 
