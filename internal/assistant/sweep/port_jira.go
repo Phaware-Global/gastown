@@ -382,19 +382,20 @@ func parseDur(raw string, def time.Duration) time.Duration {
 	return def
 }
 
-func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
+// newClient validates the Jira configuration and credentials and returns a
+// client plus the persona's account IDs. Shared with the GitHub port's
+// PR-linked kinds.
+func (p *JiraPort) newClient(ctx context.Context, in Input) (*jiraClient, []string, error) {
 	cfg := in.Settings.JiraSweep()
-	ctx, cancel := withBudget(ctx)
-	defer cancel()
 	if cfg.Site == "" || len(cfg.Projects) == 0 {
-		return nil, fmt.Errorf("jira port not configured: set assistant.sweep.jira.site and .projects")
+		return nil, nil, fmt.Errorf("jira port not configured: set assistant.sweep.jira.site and .projects")
 	}
 	ids, err := p.persona()
 	if err != nil {
-		return nil, fmt.Errorf("reading telegraph.toml: %w", err)
+		return nil, nil, fmt.Errorf("reading telegraph.toml: %w", err)
 	}
 	if len(ids) == 0 {
-		return nil, fmt.Errorf("no persona account ID configured (telegraph.mayor.jira_account_ids); jira_usernames is not used by the sweep")
+		return nil, nil, fmt.Errorf("no persona account ID configured (telegraph.mayor.jira_account_ids); jira_usernames is not used by the sweep")
 	}
 	tokenEnv := cfg.TokenEnv
 	if tokenEnv == "" {
@@ -402,7 +403,24 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	}
 	c := &jiraClient{ctx: ctx, port: p, origin: p.base(cfg.Site), email: cfg.Email, token: p.getenv(tokenEnv), trace: in.Trace, dry: in.DryRun}
 	if !in.DryRun && (c.token == "" || c.email == "") {
-		return nil, fmt.Errorf("jira credentials missing: %s and assistant.sweep.jira.email are required", tokenEnv)
+		return nil, nil, fmt.Errorf("jira credentials missing: %s and assistant.sweep.jira.email are required", tokenEnv)
+	}
+	return c, ids, nil
+}
+
+// configured reports whether the Jira port has a site and projects.
+func (p *JiraPort) configured(in Input) bool {
+	cfg := in.Settings.JiraSweep()
+	return cfg.Site != "" && len(cfg.Projects) > 0
+}
+
+func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
+	cfg := in.Settings.JiraSweep()
+	ctx, cancel := withBudget(ctx)
+	defer cancel()
+	c, ids, err := p.newClient(ctx, in)
+	if err != nil {
+		return nil, err
 	}
 	d := jiraDurations{
 		unanswered:   parseDur(cfg.UnansweredAfter, 4*time.Hour),

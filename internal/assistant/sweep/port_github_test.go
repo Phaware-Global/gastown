@@ -24,6 +24,9 @@ func ago(d time.Duration) time.Time { return ghNow.Add(-d) }
 const (
 	shaA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	shaB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	shaM = "cccccccccccccccccccccccccccccccccccccccc"
+	shaN = "dddddddddddddddddddddddddddddddddddddddd"
+	shaT = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 )
 
 // pr builds an open PR fixture; opts mutate it.
@@ -73,6 +76,35 @@ func thread(login string, at time.Duration, resolved bool) func(*ghPR) {
 
 func draft(p *ghPR) { p.IsDraft = true }
 
+func branch(name string) func(*ghPR) { return func(p *ghPR) { p.HeadRefName = name } }
+
+func mergedPR(n int, base, branch string, mergedAgo time.Duration, oid string) ghPR {
+	p := ghPR{Number: n, Title: "release pr", URL: "https://github.com/acme/app/pull/" + strconv.Itoa(n), BaseRefName: base, HeadRefName: branch,
+		MergedAt: ago(mergedAgo), CreatedAt: ago(mergedAgo + time.Hour), Author: ghActor{Login: "artie"}}
+	p.MergeCommit = &struct {
+		Oid string `json:"oid"`
+	}{Oid: oid}
+	return p
+}
+
+func tagAt(oid string, at time.Duration) ghTag {
+	t := ghTag{Name: "v"}
+	t.Target.Oid, t.Target.CommittedDate = oid, ago(at)
+	return t
+}
+
+// withJira wires a Jira port at the same test server and the link settings.
+func withJira(p *GitHubPort, in Input, srvURL string) {
+	p.jira = &JiraPort{
+		persona: func() ([]string, error) { return []string{personaID}, nil },
+		getenv:  func(string) string { return "tok" },
+		client:  p.client,
+		base:    func(string) string { return srvURL },
+	}
+	in.Settings.Assistant.Sweep.Jira = &config.JiraSweepConfig{Site: "example.atlassian.net", Email: "persona@example.com", Projects: []string{"P23"},
+		Reviewers: map[string]string{"kevin": humanID}}
+}
+
 type ghFixture struct {
 	calls       atomic.Int32
 	repos       map[string]*ghRepoData // "owner/name"
@@ -92,15 +124,86 @@ type ghFixture struct {
 	baseFiles   map[string][]string // "mbOld...mbNew" → files the base touched between the merge bases
 	compareFail []string            // compare specs that answer 500
 	patrolDelay time.Duration       // patrolBeads sleeps this long
+	compare     map[string]string   // "base...head" → status
+	issues      []map[string]any    // Jira issues returned for `key in (...)`
+	jiraErr     bool                // Jira search fails
+	jiraBadKey  string              // a `key in (...)` batch naming this key answers 400
+	jiraRateKey string              // a per-key `key = X` lookup for this key answers 429
+	jira404     bool                // every Jira search answers 404 (wrong origin / no v3 endpoint)
+	noBrowse    bool                // the visibility probe (project in …) answers no issues
+	jiraBadKeys []string            // additional keys that answer the naming 400
+	noBrowseIn  []string            // projects whose visibility probe answers no issues
+	probe503    bool                // the visibility probe answers 503
+	probe429In  []string            // projects whose visibility probe answers 429
+	probe400In  []string            // projects whose visibility probe answers 400 naming the project
+	probeCalls  atomic.Int32
 }
 
 func (fx *ghFixture) handler(t *testing.T) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fx.calls.Add(1)
-		if r.Header.Get("Authorization") != "Bearer tok" {
+		if !strings.HasPrefix(r.URL.Path, "/rest/") && r.Header.Get("Authorization") != "Bearer tok" {
 			t.Errorf("missing token on %s", r.URL)
 		}
 		switch {
+		case r.URL.Path == "/rest/api/3/search/jql":
+			if fx.jiraErr {
+				http.Error(w, "jira down", 500)
+				return
+			}
+			jql := r.URL.Query().Get("jql")
+			if fx.jira404 {
+				http.Error(w, "not found", 404)
+				return
+			}
+			if fx.jiraRateKey != "" && strings.HasPrefix(jql, "key = "+fx.jiraRateKey) {
+				http.Error(w, `{"message":"rate limited"}`, 429)
+				return
+			}
+			for _, bad := range append([]string{fx.jiraBadKey}, fx.jiraBadKeys...) {
+				if bad != "" && (strings.Contains(jql, `"`+bad+`"`) || strings.HasPrefix(jql, "key = "+bad+" ") || strings.HasSuffix(jql, "key = "+bad)) {
+					http.Error(w, `{"errorMessages":["An issue with key '`+bad+`' does not exist for field 'key'."]}`, 400)
+					return
+				}
+			}
+			if strings.HasPrefix(jql, "project in (") { // visibility probe, one project
+				fx.probeCalls.Add(1)
+				proj := strings.Trim(strings.Fields(strings.TrimPrefix(jql, "project in ("))[0], `")`)
+				if fx.probe503 {
+					http.Error(w, "upstream unavailable", 503)
+					return
+				}
+				hidden := fx.noBrowse
+				for _, h := range fx.noBrowseIn {
+					hidden = hidden || h == proj
+				}
+				for _, h := range fx.probe429In {
+					if h == proj {
+						http.Error(w, `{"message":"rate limited"}`, 429)
+						return
+					}
+				}
+				for _, h := range fx.probe400In {
+					if h == proj {
+						http.Error(w, `{"errorMessages":["The value '`+proj+`' does not exist for the field 'project'."]}`, 400)
+						return
+					}
+				}
+				if hidden {
+					_ = json.NewEncoder(w).Encode(map[string]any{"issues": []any{}, "isLast": true})
+				} else {
+					_ = json.NewEncoder(w).Encode(map[string]any{"issues": []map[string]any{issue(proj+"-1", "To Do", "new", personaID, time.Hour, time.Hour, "probe")}, "isLast": true})
+				}
+				return
+			}
+			var hit []map[string]any
+			for _, is := range fx.issues {
+				k := is["key"].(string)
+				if strings.Contains(jql, `"`+k+`"`) || strings.HasPrefix(jql, "key = "+k+" ") || strings.HasSuffix(jql, "key = "+k) {
+					hit = append(hit, is)
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"issues": hit, "isLast": true})
 		case strings.Contains(r.URL.Path, "/compare/"):
 			spec := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
 			for _, f := range fx.compareFail {
@@ -117,6 +220,10 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 				_, _ = w.Write([]byte(d))
 				return
 			}
+			st := fx.compare[spec]
+			if st == "" {
+				st = "diverged"
+			}
 			mb := fx.mergeBases[spec]
 			if mb == "" {
 				mb = "mb0"
@@ -125,7 +232,7 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 			for _, f := range fx.baseFiles[spec] {
 				files = append(files, map[string]any{"filename": f})
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ahead", "merge_base_commit": map[string]any{"sha": mb}, "files": files})
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": st, "merge_base_commit": map[string]any{"sha": mb}, "files": files})
 		case r.URL.Path == "/graphql":
 			if fx.slow > 0 {
 				select {
@@ -190,7 +297,7 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 				raw, _ := json.Marshal(data)
 				var m map[string]any
 				_ = json.Unmarshal(raw, &m)
-				nodes := m["open"].(map[string]any)["nodes"].([]any)
+				nodes, _ := m["open"].(map[string]any)["nodes"].([]any) // nil for a repo with no open PRs
 				for i, n := range nodes {
 					if int(n.(map[string]any)["number"].(float64)) == fx.nullNodePR {
 						nodes[i] = nil
@@ -205,7 +312,8 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 				raw, _ := json.Marshal(data)
 				var m map[string]any
 				_ = json.Unmarshal(raw, &m)
-				for _, n := range m["open"].(map[string]any)["nodes"].([]any) {
+				nodes, _ := m["open"].(map[string]any)["nodes"].([]any)
+				for _, n := range nodes {
 					node := n.(map[string]any)
 					if int(node["number"].(float64)) == fx.fieldErrPR {
 						node["reviews"] = nil
@@ -558,6 +666,89 @@ func TestGitHubOwnerRepo(t *testing.T) {
 	}
 }
 
+func TestGitHubPort_ReleasesAndLinkedIssues(t *testing.T) {
+	h := time.Hour
+	app := &ghRepoData{}
+	app.Open.Nodes = []ghPR{
+		pr(30, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-30-thing"), requested("kevin", 30*h)),
+		pr(31, "artie", 40*h, 40*h, "SUCCESS", branch("feat/p23-31-lower"), requested("kevin", 30*h)),
+		pr(32, "artie", 40*h, 20*h, "SUCCESS", branch("feat/P23-32"), review("kevin", "CHANGES_REQUESTED", shaA, 2*h)),
+		pr(33, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-33"), requested("kevin", 30*h), draft),
+	}
+	app.Merged.Nodes = []ghPR{
+		mergedPR(40, "release/1.4", "feat/P23-40", 48*h, shaM),
+		mergedPR(41, "release/1.4", "feat/P23-41", 48*h, shaN),
+		mergedPR(42, "main", "feat/P23-42", 48*h, shaB),
+		mergedPR(43, "release/1.5", "feat/P23-43", 2*h, shaT),
+	}
+	app.Tags.Nodes = []ghTag{tagAt(shaB, 100*h), tagAt(shaT, 30*h)}
+	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}},
+		compare: map[string]string{shaM + "..." + shaT: "ahead"}, // v tag contains #40's merge
+		issues: []map[string]any{
+			issue("P23-30", "In Progress", "indeterminate", personaID, 100*h, 1*h, "needs handoff"),
+			issue("P23-31", "In Review", "indeterminate", humanID, 100*h, 1*h, "handed off correctly"),
+			issue("P23-32", "In Review", "indeterminate", humanID, 100*h, 1*h, "handed back"),
+			issue("P23-33", "To Do", "new", personaID, 100*h, 1*h, "draft"),
+			issue("P23-40", "Done", "done", personaID, 100*h, 1*h, "done, merged, tagged, not in UAT"),
+			issue("P23-41", "In UAT", "indeterminate", personaID, 100*h, 1*h, "already in UAT"),
+			issue("P23-42", "Done", "done", personaID, 100*h, 1*h, "merged to main"),
+			issue("P23-43", "Done", "done", personaID, 100*h, 1*h, "merged too recently for the UAT check"),
+		}}
+	p, in := newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	findings, err := p.Sweep(context.Background(), in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := map[string]Finding{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = f
+	}
+	for _, want := range []string{"review-handoff/P23-30", "review-handoff/P23-32", "done-not-in-uat/P23-40", "release-unclosed/acme/app#41"} {
+		if _, ok := got[want]; !ok {
+			t.Errorf("missing %s; got %v", want, keysOf(got))
+		}
+	}
+	for _, absent := range []string{"review-handoff/P23-31", "review-handoff/P23-33", "done-not-in-uat/P23-41", "done-not-in-uat/P23-42", "done-not-in-uat/P23-43",
+		"release-unclosed/acme/app#40", "release-unclosed/acme/app#42", "release-unclosed/acme/app#43"} {
+		if _, ok := got[absent]; ok {
+			t.Errorf("unexpected %s", absent)
+		}
+	}
+	if f := got["review-handoff/P23-30"]; f.Fields["human"] != "kevin" || f.Fields["account_id"] != humanID || f.Fields["pr"] != "30" || !strings.Contains(f.Suggest, "review status") {
+		t.Errorf("handoff: %+v", f)
+	}
+	if f := got["review-handoff/P23-32"]; !strings.Contains(f.Suggest, "back to in progress") {
+		t.Errorf("hand-back: %+v", f)
+	}
+	for k, f := range got {
+		if _, ok := f.Fields["status"]; ok {
+			t.Errorf("%s: status name must be External", k)
+		}
+		before := f.Suggest
+		enforceSchema(p.Schema(), p.Suggestions(), &f)
+		if f.Suggest != before {
+			t.Errorf("%s: suggest %q rejected by the templates", k, before)
+		}
+	}
+
+	// Jira down: PR-linked kinds are skipped with a partial note; the rest stands.
+	fx.jiraErr = true
+	findings, err = p.Sweep(context.Background(), in)
+	var partial *PartialError
+	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "could not be looked up") {
+		t.Fatalf("Jira failure must be partial: %v", err)
+	}
+	for _, f := range findings {
+		if f.Kind == "review-handoff" || f.Kind == "done-not-in-uat" {
+			t.Errorf("linked kind reported without Jira data: %+v", f)
+		}
+		if f.Kind == "release-unclosed" {
+			return
+		}
+	}
+	t.Error("release-unclosed must still be reported when Jira is down")
+}
 func forcePushed(at time.Duration) func(*ghPR) {
 	return func(p *ghPR) {
 		p.Commits.Nodes[0].Commit.CheckSuites.Nodes = nil
@@ -848,5 +1039,291 @@ func TestGitHubPort_GraphQLErrorGuardsPinnedSeparately(t *testing.T) {
 	}
 	if !keys["no-review-loop/acme/app#81"] {
 		t.Errorf("the other PR must still be checked: %v", keys)
+	}
+}
+
+func authoredBy(login string) func(*ghPR) { return func(p *ghPR) { p.Author.Login = login } }
+
+func TestGitHubPort_LinkedKindsRound1Fixes(t *testing.T) {
+	h := time.Hour
+	app := &ghRepoData{}
+	app.Open.Nodes = []ghPR{
+		// 90: not ours — a stranger's PR naming an issue must not produce a reassign suggestion.
+		pr(90, "stranger", 40*h, 40*h, "SUCCESS", branch("feat/P23-90"), authoredBy("stranger"), requested("kevin", 30*h)),
+		// 91: mixed-case login in the request still matches the listed human.
+		pr(91, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-91"), requested("Kevin", 30*h)),
+		// 92: changes requested then approved on the same head → no hand-back.
+		pr(92, "artie", 40*h, 20*h, "SUCCESS", branch("feat/P23-92"), review("kevin", "CHANGES_REQUESTED", shaA, 5*h), review("kevin", "APPROVED", shaA, 2*h)),
+		// 94: one bogus key in the title must not blind the real one.
+		pr(94, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-94"), func(p *ghPR) { p.Title = "P23-99999999 and P23-94" }, requested("kevin", 30*h)),
+	}
+	// 93: the release tag sits on the merge commit itself (dated 1s before mergedAt).
+	app.Merged.Nodes = []ghPR{mergedPR(93, "release/2.0", "feat/P23-93", 48*h, shaM)}
+	app.Tags.Nodes = []ghTag{tagAt(shaM, 48*h+time.Second)}
+	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, jiraBadKey: "P23-99999999",
+		issues: []map[string]any{
+			issue("P23-90", "In Progress", "indeterminate", personaID, 100*h, 1*h, "stranger's key"),
+			issue("P23-91", "In Progress", "indeterminate", personaID, 100*h, 1*h, "needs handoff"),
+			issue("P23-92", "In Review", "indeterminate", humanID, 100*h, 1*h, "approved after changes"),
+			issue("P23-94", "In Progress", "indeterminate", personaID, 100*h, 1*h, "real key next to a bogus one"),
+		}}
+	p, in := newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	in.Settings.Assistant.Sweep.Jira.Reviewers = map[string]string{"KEVIN": humanID} // mis-cased config key
+	findings, err := p.Sweep(context.Background(), in)
+	if err != nil {
+		t.Fatalf("a bogus key is reported per PR, never as a partial port: %v", err)
+	}
+	got := map[string]Finding{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = f
+	}
+	if f, ok := got["linked-key-missing/acme/app#94"]; !ok || !strings.Contains(f.External["keys"], "P23-99999999") {
+		t.Errorf("the bogus key must surface as an info finding on its PR: %v", keysOf(got))
+	}
+	if _, ok := got["review-handoff/P23-90"]; ok {
+		t.Error("a stranger's PR must never yield a review-handoff")
+	}
+	if f, ok := got["review-handoff/P23-91"]; !ok || f.Fields["human"] != "kevin" || f.Fields["account_id"] != humanID {
+		t.Errorf("mixed-case login and config key must still match: %+v (%v)", f, keysOf(got))
+	}
+	if _, ok := got["review-handoff/P23-92"]; ok {
+		t.Error("an approval after changes-requested on the same head is not a hand-back")
+	}
+	if _, ok := got["release-unclosed/acme/app#93"]; ok {
+		t.Error("a tag on the merge commit itself means the release is closed")
+	}
+	if _, ok := got["review-handoff/P23-94"]; !ok {
+		t.Errorf("a bogus key in the same title must not blind the real key: %v", keysOf(got))
+	}
+}
+
+func TestGitHubPort_LinkedKindsRound2Fixes(t *testing.T) {
+	h := time.Hour
+	// Repo A's only key is bogus (Jira answers 400); repo B must still yield review-handoff.
+	appA := &ghRepoData{}
+	appA.Open.Nodes = []ghPR{pr(95, "artie", 40*h, 40*h, "SUCCESS", func(p *ghPR) { p.Title = "fix P23-99999999" })}
+	appB := &ghRepoData{}
+	appB.Open.Nodes = []ghPR{pr(91, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-91"), requested("kevin", 30*h))}
+	// Release: the real tag (shaT, contains the merge) is older than five newer tags on another line.
+	appA.Merged.Nodes = []ghPR{mergedPR(40, "release/1.4", "feat/P23-40", 48*h, shaM)}
+	appA.Tags.Nodes = []ghTag{tagAt(shaT, 47*h), tagAt(shaB, 10*h), tagAt(shaB, 8*h), tagAt(shaB, 6*h), tagAt(shaB, 4*h), tagAt(shaB, 2*h)}
+	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": appA, "acme/extra": appB}, jiraBadKey: "P23-99999999",
+		compare: map[string]string{shaM + "..." + shaT: "ahead"},
+		issues:  []map[string]any{issue("P23-91", "In Progress", "indeterminate", personaID, 100*h, 1*h, "needs handoff")}}
+	p, in := newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	findings, err := p.Sweep(context.Background(), in)
+	if err != nil {
+		t.Fatalf("a bogus key and a tag-cap miss are per-PR info, never a partial port: %v", err)
+	}
+	got := map[string]bool{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = true
+	}
+	if !got["review-handoff/P23-91"] {
+		t.Errorf("a bogus key in repo A must not blind repo B's linked kinds: %v", got)
+	}
+	if got["release-unclosed/acme/app#40"] || !got["release-unchecked/acme/app#40"] {
+		t.Errorf("running out of the tag cap with candidates left is unknown (release-unchecked), never untagged: %v", got)
+	}
+	if !got["linked-key-missing/acme/app#95"] {
+		t.Errorf("the bogus key must surface on its own PR: %v", got)
+	}
+	// Every search answering 404 (wrong origin, proxy, no v3 endpoint) is an
+	// outage: partial, no linked-key-missing, no eviction.
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appB, "acme/extra": {}}, jira404: true}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	findings, err = p.Sweep(context.Background(), in)
+	var p404 *PartialError
+	if !errors.As(err, &p404) || !strings.Contains(p404.Reason, "could not be looked up") {
+		t.Errorf("a blanket 404 must be an outage: %v", err)
+	}
+	for _, f := range findings {
+		if f.Kind == "linked-key-missing" {
+			t.Errorf("a 404 outage must never read as a missing key: %+v", f)
+		}
+	}
+	// An old persona PR merged into main with a bogus key feeds no check and
+	// must not be nagged about.
+	appOld := &ghRepoData{}
+	appOld.Merged.Nodes = []ghPR{mergedPR(12, "main", "feat/P23-99999999-old", 300*24*h, shaB)}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appOld, "acme/extra": {}}, jiraBadKey: "P23-99999999"}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	findings, err = p.Sweep(context.Background(), in)
+	if err != nil {
+		t.Errorf("an out-of-window merged PR must not even be looked up: %v", err)
+	}
+	for _, f := range findings {
+		if f.Kind == "linked-key-missing" {
+			t.Errorf("merged PRs outside the release window/branches must not yield linked-key-missing: %+v", f)
+		}
+	}
+	// Lost Browse with one key per repo: each lookup is all-unknown, nothing
+	// resolved, the probe sees nothing → outage (partial, no nagging, no
+	// handoffs), decided at sweep scope.
+	appX := &ghRepoData{}
+	appX.Open.Nodes = []ghPR{pr(96, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-96"), requested("kevin", 30*h))}
+	appY := &ghRepoData{}
+	appY.Open.Nodes = []ghPR{pr(97, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-97"), requested("kevin", 30*h))}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appX, "acme/extra": appY}, noBrowse: true, jiraBadKeys: []string{"P23-96", "P23-97"}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	findings, err = p.Sweep(context.Background(), in)
+	var pPerm *PartialError
+	if !errors.As(err, &pPerm) || !strings.Contains(pPerm.Reason, "check its Browse permission") {
+		t.Errorf("lost Browse with one key per repo must read as an outage: %v", err)
+	}
+	for _, f := range findings {
+		if f.Kind == "linked-key-missing" || f.Kind == "review-handoff" {
+			t.Errorf("lost permissions must yield neither nagging nor handoffs: %+v", f)
+		}
+	}
+	if fx.probeCalls.Load() != 1 {
+		t.Errorf("the probe must run once per project per sweep, got %d calls", fx.probeCalls.Load())
+	}
+	// A probe that itself fails (503) is a probe failure, never a Browse diagnosis.
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appX, "acme/extra": {}}, probe503: true, jiraBadKeys: []string{"P23-96"}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	findings, err = p.Sweep(context.Background(), in)
+	var pProbe *PartialError
+	if !errors.As(err, &pProbe) || !strings.Contains(pProbe.Reason, "visibility probe failed") || strings.Contains(pProbe.Reason, "Browse") {
+		t.Errorf("a failing probe must be reported as a probe failure: %v", err)
+	}
+	for _, f := range findings {
+		if f.Kind == "linked-key-missing" {
+			t.Errorf("a failed probe must not read as a typo: %+v", f)
+		}
+	}
+	// Two projects, P23 readable and OPS hidden: P23's key resolves and its
+	// handoff fires; OPS's key is a Browse note on OPS alone, not a typo.
+	appOps := &ghRepoData{}
+	appOps.Open.Nodes = []ghPR{pr(100, "artie", 40*h, 40*h, "SUCCESS", branch("feat/OPS-7"), requested("kevin", 30*h))}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appOps, "acme/extra": appB}, noBrowseIn: []string{"OPS"}, jiraBadKeys: []string{"OPS-7"},
+		issues: []map[string]any{issue("P23-91", "In Progress", "indeterminate", personaID, 100*h, 1*h, "needs handoff")}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	in.Settings.Assistant.Sweep.Jira.Projects = []string{"P23", "OPS"}
+	findings, err = p.Sweep(context.Background(), in)
+	var pOps *PartialError
+	if !errors.As(err, &pOps) || !strings.Contains(pOps.Reason, "keys in OPS unknown and the token sees nothing there") || strings.Contains(pOps.Reason, "P23") {
+		t.Errorf("a hidden project must be reported as a Browse loss on that project alone: %v", err)
+	}
+	got = map[string]bool{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = true
+	}
+	if !got["review-handoff/P23-91"] || got["linked-key-missing/acme/app#100"] {
+		t.Errorf("the readable project still fires and the hidden one is not a typo: %v", got)
+	}
+	// A 400 naming the project is Jira's own "cannot see it" answer: lost Browse.
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appX, "acme/extra": {}}, probe400In: []string{"P23"}, jiraBadKeys: []string{"P23-96"}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	_, err = p.Sweep(context.Background(), in)
+	var p400 *PartialError
+	if !errors.As(err, &p400) || !strings.Contains(p400.Reason, "check its Browse permission") {
+		t.Errorf("a probe 400 naming the project must read as lost Browse: %v", err)
+	}
+	// A transient probe 429 on P23 in repo A must not blind P23 once a P23
+	// key resolves in repo B, even with OPS hidden: the handoff still fires.
+	appTypo := &ghRepoData{}
+	appTypo.Open.Nodes = []ghPR{pr(96, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-96"), requested("kevin", 30*h))}
+	appMixed := &ghRepoData{}
+	appMixed.Open.Nodes = []ghPR{
+		pr(91, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-91"), requested("kevin", 30*h)),
+		pr(100, "artie", 40*h, 40*h, "SUCCESS", branch("feat/OPS-7"), requested("kevin", 30*h)),
+	}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appTypo, "acme/extra": appMixed}, probe429In: []string{"P23"}, noBrowseIn: []string{"OPS"}, jiraBadKeys: []string{"P23-96", "OPS-7"},
+		issues: []map[string]any{issue("P23-91", "In Progress", "indeterminate", personaID, 100*h, 1*h, "needs handoff")}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	in.Settings.Assistant.Sweep.Jira.Projects = []string{"P23", "OPS"}
+	findings, err = p.Sweep(context.Background(), in)
+	var p429 *PartialError
+	if !errors.As(err, &p429) || !strings.Contains(p429.Reason, "visibility probe failed") {
+		t.Errorf("the probe 429 must be noted as a probe failure: %v", err)
+	}
+	got = map[string]bool{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = true
+	}
+	if !got["review-handoff/P23-91"] || got["linked-key-missing/acme/app#96"] || got["linked-key-missing/acme/extra#100"] {
+		t.Errorf("a failed probe must neither blind a project that resolves nor read as typos: %v", got)
+	}
+	// A project in which a key resolved is never probed: a typo beside a
+	// valid key is a typo without any probe call.
+	appBoth := &ghRepoData{}
+	appBoth.Open.Nodes = []ghPR{pr(98, "artie", 40*h, 40*h, "SUCCESS", func(p *ghPR) { p.Title = "fix P23-91 and P23-99999999" })}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appBoth, "acme/extra": {}}, noBrowse: true, jiraBadKeys: []string{"P23-99999999"},
+		issues: []map[string]any{issue("P23-91", "In Progress", "indeterminate", personaID, 100*h, 1*h, "needs handoff")}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	findings, err = p.Sweep(context.Background(), in)
+	if err != nil || fx.probeCalls.Load() != 0 {
+		t.Errorf("a resolved project must not be probed (calls=%d): %v", fx.probeCalls.Load(), err)
+	}
+	got = map[string]bool{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = true
+	}
+	if !got["linked-key-missing/acme/app#98"] {
+		t.Errorf("the typo beside a resolved key is a typo: %v", got)
+	}
+	// Two typos in repo A and a valid key in repo B: the probe sees the
+	// project, so the typos are per-PR info and B's handoff fires, no partial.
+	appA2 := &ghRepoData{}
+	appA2.Open.Nodes = []ghPR{pr(98, "artie", 40*h, 40*h, "SUCCESS", func(p *ghPR) { p.Title = "fix P23-99999998 and P23-99999999" })}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appA2, "acme/extra": appB}, jiraBadKeys: []string{"P23-99999998", "P23-99999999"},
+		issues: []map[string]any{issue("P23-91", "In Progress", "indeterminate", personaID, 100*h, 1*h, "needs handoff")}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	findings, err = p.Sweep(context.Background(), in)
+	if err != nil {
+		t.Errorf("typos must not make the port partial: %v", err)
+	}
+	got = map[string]bool{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = true
+	}
+	if !got["review-handoff/P23-91"] || !got["linked-key-missing/acme/app#98"] {
+		t.Errorf("two typos in repo A must be per-PR info and must not blind repo B: %v", got)
+	}
+	// The inWindow gates, one at a time: an in-window PR on main, and an old PR on a release branch.
+	for _, c := range []struct {
+		name   string
+		merged ghPR
+	}{
+		{"in-window on main", mergedPR(13, "main", "feat/P23-99999999-main", 2*h, shaB)},
+		{"old on release branch", mergedPR(14, "release/1.0", "feat/P23-99999999-old", 300*24*h, shaB)},
+	} {
+		appG := &ghRepoData{}
+		appG.Merged.Nodes = []ghPR{c.merged}
+		fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appG, "acme/extra": {}}, jiraBadKey: "P23-99999999"}
+		p, in = newGitHubTest(t, fx, []string{"artie"})
+		withJira(p, in, p.apiBase)
+		findings, err = p.Sweep(context.Background(), in)
+		if err != nil {
+			t.Errorf("%s: must not be looked up: %v", c.name, err)
+		}
+		for _, f := range findings {
+			if f.Kind == "linked-key-missing" {
+				t.Errorf("%s: must not yield linked-key-missing: %+v", c.name, f)
+			}
+		}
+	}
+	// A per-key 429 is an outage, not a missing key: noted as such, and since
+	// it is the only lookup, the linked kinds stop for the sweep.
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appB, "acme/extra": {}}, jiraBadKey: "P23-91", jiraRateKey: "P23-91",
+		issues: []map[string]any{issue("P23-91", "In Progress", "indeterminate", personaID, 100*h, 1*h, "needs handoff")}}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	_, err = p.Sweep(context.Background(), in)
+	var partial *PartialError
+	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "could not be looked up") || strings.Contains(partial.Reason, "do not exist") {
+		t.Errorf("a 429 must be an outage, not a missing key: %v", err)
 	}
 }

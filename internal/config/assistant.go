@@ -66,6 +66,16 @@ type JiraSweepConfig struct {
 	WIPStatuses    []string `json:"wip_statuses,omitempty"`    // counted against WIPLimit; default In Progress, Research
 	WIPLimit       int      `json:"wip_limit,omitempty"`       // default 4
 
+	// Reviewers maps a GitHub login to the Jira account ID of the same
+	// person, for the PR-linked kinds (review-handoff, done-not-in-uat).
+	Reviewers map[string]string `json:"reviewers,omitempty"`
+	// Status names used by the PR-linked kinds (defaults in parentheses).
+	InReviewStatus   string `json:"in_review_status,omitempty"`   // "In Review"
+	InProgressStatus string `json:"in_progress_status,omitempty"` // "In Progress"
+	DoneStatus       string `json:"done_status,omitempty"`        // "Done"
+	UATStatus        string `json:"uat_status,omitempty"`         // "In UAT"
+	UATSweepAfter    string `json:"uat_sweep_after,omitempty"`    // default "24h"
+
 	UnansweredAfter   string `json:"unanswered_after,omitempty"`    // default "4h"
 	ChaseAfter        string `json:"chase_after,omitempty"`         // default "24h"
 	UnansweredMaxAge  string `json:"unanswered_max_age,omitempty"`  // default "720h": an older wait is noise, not a finding
@@ -89,12 +99,16 @@ type GitHubSweepConfig struct {
 	TokenEnv   string   `json:"token_env,omitempty"`   // default "GITHUB_TOKEN"; falls back to `gh auth token`
 	ExtraRepos []string `json:"extra_repos,omitempty"` // "owner/repo"
 	Humans     []string `json:"humans,omitempty"`      // GitHub logins the persona waits on
+	// ReleaseBranches maps "owner/repo" to path.Match patterns of release
+	// branches; "*" is the default for repos not listed (default "release/*").
+	ReleaseBranches map[string][]string `json:"release_branches,omitempty"`
 
 	RemindAfter           string `json:"remind_after,omitempty"`            // default "24h"
 	ApprovedUnmergedAfter string `json:"approved_unmerged_after,omitempty"` // default "4h"
 	RespondAfter          string `json:"respond_after,omitempty"`           // default "12h"
 	ReviewLoopAfter       string `json:"review_loop_after,omitempty"`       // default "2h"
 	CIFailingAfter        string `json:"ci_failing_after,omitempty"`        // default "1h"
+	ReleaseWindow         string `json:"release_window,omitempty"`          // default "336h" (14d)
 	StaleAfter            string `json:"stale_after,omitempty"`             // default "168h" (7d)
 }
 

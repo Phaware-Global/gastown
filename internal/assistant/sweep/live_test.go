@@ -133,7 +133,8 @@ func TestLiveJira(t *testing.T) {
 
 func TestLiveGitHub(t *testing.T) {
 	in := liveInput(t)
-	port := NewGitHubPort(in.TownRoot, os.Getenv)
+	// With the Jira port configured the PR-linked kinds run too.
+	port := NewGitHubPort(in.TownRoot, os.Getenv, NewJiraPort(in.TownRoot, os.Getenv))
 	repos, err := port.repos()
 	if err != nil {
 		t.Fatalf("rig repos: %v", err)
