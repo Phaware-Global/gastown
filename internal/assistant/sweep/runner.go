@@ -16,6 +16,12 @@ import (
 // PortTimeout bounds each port's Sweep call.
 var PortTimeout = 2 * time.Minute
 
+// MaxNewPerKind bounds how many new findings of one kind a report prints in
+// full; the rest are counted on an overflow line. All of them are still
+// recorded in the pending run, so acking the report acknowledges the count
+// the Mayor was told, not only the items shown.
+const MaxNewPerKind = 25
+
 // Options controls one run.
 type Options struct {
 	// Write records a pending state file so the run can be acknowledged.
@@ -107,7 +113,14 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Report, error) {
 			res.Standing = append(res.Standing, *s)
 		}
 		sort.Slice(res.Standing, func(i, j int) bool { return res.Standing[i].Kind < res.Standing[j].Kind })
-		sort.SliceStable(res.New, func(i, j int) bool { return severityRank(res.New[i].Severity) < severityRank(res.New[j].Severity) })
+		sort.SliceStable(res.New, func(i, j int) bool {
+			a, b := res.New[i], res.New[j]
+			if severityRank(a.Severity) != severityRank(b.Severity) {
+				return severityRank(a.Severity) < severityRank(b.Severity)
+			}
+			return a.Since.Before(b.Since) // oldest first within a severity
+		})
+		res.New, res.Overflow = capPerKind(res.New, MaxNewPerKind)
 		if res.Clean() {
 			pend.CleanPorts = append(pend.CleanPorts, name)
 		}
@@ -121,6 +134,36 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Report, error) {
 		rep.Pending = true
 	}
 	return rep, nil
+}
+
+// capPerKind keeps at most max findings of each kind (in the given order)
+// and returns the rest as per-kind counts with the oldest Since.
+func capPerKind(findings []Finding, max int) ([]Finding, []Standing) {
+	shown := map[string]int{}
+	over := map[string]*Standing{}
+	var kept []Finding
+	for _, f := range findings {
+		if shown[f.Kind] < max {
+			shown[f.Kind]++
+			kept = append(kept, f)
+			continue
+		}
+		o := over[f.Kind]
+		if o == nil {
+			o = &Standing{Kind: f.Kind}
+			over[f.Kind] = o
+		}
+		o.Count++
+		if o.Oldest.IsZero() || (!f.Since.IsZero() && f.Since.Before(o.Oldest)) {
+			o.Oldest = f.Since
+		}
+	}
+	var overflow []Standing
+	for _, o := range over {
+		overflow = append(overflow, *o)
+	}
+	sort.Slice(overflow, func(i, j int) bool { return overflow[i].Kind < overflow[j].Kind })
+	return kept, overflow
 }
 
 // runPort calls port.Sweep with PortTimeout and returns when the port does or

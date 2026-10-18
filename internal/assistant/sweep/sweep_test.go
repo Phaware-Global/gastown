@@ -547,3 +547,34 @@ func TestAck_OldPendingRunStillAcks(t *testing.T) {
 		t.Error("pending file must be gone after ack")
 	}
 }
+
+func TestRun_CapsNewFindingsPerKind(t *testing.T) {
+	var many []Finding
+	for i := 0; i < MaxNewPerKind+5; i++ {
+		many = append(many, Finding{Kind: "unslung", Key: fmt.Sprintf("gt-%d", i), Fingerprint: "a", Severity: SeverityInfo, Since: time.Unix(int64(1000-i), 0)})
+	}
+	many = append(many, Finding{Kind: "blocked", Key: "gt-b", Fingerprint: "a", Severity: SeverityActionable})
+	p := &fakePort{name: "x", findings: many}
+	r := newTestRunner(t, p)
+	rep, err := r.Run(context.Background(), Options{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := rep.Ports[0]
+	if len(res.New) != MaxNewPerKind+1 || len(res.Overflow) != 1 || res.Overflow[0].Kind != "unslung" || res.Overflow[0].Count != 5 {
+		t.Fatalf("cap: new=%d overflow=%+v", len(res.New), res.Overflow)
+	}
+	if res.New[0].Kind != "blocked" || res.New[1].Key != "gt-29" {
+		t.Errorf("order must be severity then oldest first: %s %s", res.New[0].Kind, res.New[1].Key)
+	}
+	if md := Markdown(rep); !strings.Contains(md, "and 5 more new unslung not shown") {
+		t.Errorf("overflow line missing:\n%s", md)
+	}
+	if err := r.Store.Ack(rep.RunID, r.Now()); err != nil {
+		t.Fatal(err)
+	}
+	rep2, _ := r.Run(context.Background(), Options{})
+	if len(rep2.Ports[0].New) != 0 || len(rep2.Ports[0].Overflow) != 0 || rep2.Ports[0].Standing[1].Count != MaxNewPerKind+5 {
+		t.Errorf("acking the report must acknowledge the counted findings too: %+v", rep2.Ports[0])
+	}
+}

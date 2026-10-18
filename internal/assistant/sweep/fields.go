@@ -34,7 +34,7 @@ var (
 	jiraAccountRe   = regexp.MustCompile(`^(\d+:[0-9a-f-]{36}|[0-9a-f]{24})$`)
 	githubLoginRe   = regexp.MustCompile(`^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$`)
 	beadIDRe        = regexp.MustCompile(`^[a-z0-9]{1,8}-[a-z0-9.-]{1,40}$`)
-	enumRe          = regexp.MustCompile(`^[a-z_]{1,32}$`)
+	enumRe          = regexp.MustCompile(`^[a-z_]{1,64}$`) // rig names can exceed 32
 	allowedShapeLen = map[Shape]int{ShapeGitHubLogin: 39}
 
 	// Shapes of the parts of a Finding that print outside the fence.

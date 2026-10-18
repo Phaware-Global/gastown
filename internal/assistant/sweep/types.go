@@ -91,6 +91,7 @@ type PortResult struct {
 	Partial  bool       `json:"partial,omitempty"`  // ran but may be missing findings
 	New      []Finding  `json:"new,omitempty"`      // fingerprint differs from the acknowledged one
 	Standing []Standing `json:"standing,omitempty"` // acknowledged and unchanged, counts only
+	Overflow []Standing `json:"overflow,omitempty"` // new findings beyond MaxNewPerKind, counts only
 }
 
 // Clean reports whether the port completed without error or truncation, which
