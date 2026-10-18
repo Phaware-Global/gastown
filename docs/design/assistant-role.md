@@ -434,13 +434,18 @@ clear. The cap is a report limit, not truncation: eviction considers every
 finding the port returned, counted ones included, so a counted item whose
 fingerprint changed keeps its earlier acknowledged entry.
 
-The reminder clock is the fingerprint, never `LastAcked`: the GitHub port
-folds the elapsed `remind_after` periods into a `review-waiting` finding's
-fingerprint (`<head>|<periods waited>`), so the item turns **new** once per
-period and is re-briefed as a listed item; a standing item's upsert
-refreshes `LastAcked` but moves no reminder. A period in which the item was
-only counted, not listed, sends no reminder — the next period's fingerprint
-makes it new again.
+The reminder clock is the fingerprint, never `LastAcked`: a
+`review-waiting` finding is keyed per requested human
+(`<owner/repo>#<n>@<login>`) and its fingerprint is
+`<login>|<periods since the request>`, so the item turns **new** once per
+`remind_after` and is re-briefed as a listed item. The head SHA is not in
+that fingerprint: a new push on a PR whose review request is still open
+does not re-ping on its own (the request did not change), and
+`approval-stale` covers the case where the human had already reviewed. A
+standing item's upsert refreshes `LastAcked` but moves no reminder, and a
+period in which the item was only counted, not listed, sends none — the next
+period's fingerprint makes it new again. The GitHub port (#306) implements
+exactly this.
 
 State advances only when the Mayor has actually been told. `gt assistant
 sweep` writes the run's fingerprints to a *pending* file keyed by a run ID
@@ -587,7 +592,7 @@ GitHub identity; there is no separate agent login).
 | Kind | Condition (deterministic) | Why it exists |
 |---|---|---|
 | `ready-for-human-review` | our PR whose internal reviewer (`pr_reviewer`) approved the current head, CI green, and no human review request yet | The Mayor's gate before asking a human: "the internal reviewer approved the current head and CI is green, so I can ask the human reviewer to review this version" |
-| `review-waiting` | open PR with a review requested from a human, no review from them on the current head, request older than `remind_after`; re-reported once per `remind_after` | "Re-ping only if the review has waited more than a day"; never re-ping a revision that already has a request |
+| `review-waiting` | open PR with a review requested from a human, no review from them on the current head, request older than `remind_after`; keyed per human, re-reported once per `remind_after` (fingerprint `<login>\|<periods>`, so a new push alone does not re-ping) | "Re-ping only if the review has waited more than a day"; never re-ping a revision that already has a request |
 | `approval-stale` | open PR a human approved on an earlier head; new commits since, no re-approval | "Confirming the change is the same as what the reviewer approved, then asking for re-approval" |
 | `approved-unmerged` | open PR approved by the required human on its current head, CI green, not merged for `approved_unmerged_after` | Every sweep asked "does any open PR have the human reviewer's approval on its current head?" |
 | `changes-requested-stale` | our PR with `CHANGES_REQUESTED` or unresolved threads older than `respond_after` and no newer push | Loose-ends bucket 2: respond before the reviewer has to ask again |
