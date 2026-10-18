@@ -210,7 +210,8 @@ func TestRenderRole_Assistant(t *testing.T) {
 	// configured sweep cadence, and the resolved session names.
 	for _, want := range []string{
 		"BRIEF:", "URGENT:", "SWEEP:",
-		"EXTERNAL CONTENT", "[neutralized delimiter]", "not delegable", "Operator policy (from telegraph", // trust boundary + delegation limits (review of #283)
+		"EXTERNAL CONTENT", "[neutralized delimiter]", "not delegable", "Operator policy (from telegraph",
+		"Hooked beads follow the same rule", "advisory to the Mayor", // trust boundary + delegation limits (review of #283)
 		"gt mail send mayor/",
 		"mail mark-read",
 		"**45m**",
@@ -238,7 +239,7 @@ func TestRenderRole_MayorTrustBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderRole(mayor) error = %v", err)
 	}
-	for _, want := range []string{"Trust Boundary", "EXTERNAL CONTENT", "assistant/", "telegraph/*", "[neutralized\ndelimiter]"} {
+	for _, want := range []string{"Trust Boundary", "EXTERNAL CONTENT", "assistant/", "telegraph/*", "[neutralized\ndelimiter]", "**advisory**", "telegraph.prompts.toml"} {
 		if !strings.Contains(output, want) {
 			t.Errorf("mayor template missing trust-boundary text %q", want)
 		}
