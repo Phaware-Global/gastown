@@ -1123,6 +1123,49 @@ func TestGitHubPort_LinkedKindsRound2Fixes(t *testing.T) {
 			t.Errorf("merged PRs outside the release window/branches must not yield linked-key-missing: %+v", f)
 		}
 	}
+	// Every key unknown at once (lost Browse permission looks exactly like
+	// unknown keys): an outage, partial, no linked-key-missing nagging.
+	appTwo := &ghRepoData{}
+	appTwo.Open.Nodes = []ghPR{
+		pr(96, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-96"), requested("kevin", 30*h)),
+		pr(97, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-97"), requested("kevin", 30*h)),
+	}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appTwo, "acme/extra": {}}, jiraBadKey: "P23-9"} // every key answers 400 naming it
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	findings, err = p.Sweep(context.Background(), in)
+	var pPerm *PartialError
+	if !errors.As(err, &pPerm) || !strings.Contains(pPerm.Reason, "check the token's Browse permission") {
+		t.Errorf("all keys unknown must read as lost permissions: %v", err)
+	}
+	for _, f := range findings {
+		if f.Kind == "linked-key-missing" || f.Kind == "review-handoff" {
+			t.Errorf("lost permissions must yield neither nagging nor handoffs: %+v", f)
+		}
+	}
+	// The inWindow gates, one at a time: an in-window PR on main, and an old PR on a release branch.
+	for _, c := range []struct {
+		name   string
+		merged ghPR
+	}{
+		{"in-window on main", mergedPR(13, "main", "feat/P23-99999999-main", 2*h, shaB)},
+		{"old on release branch", mergedPR(14, "release/1.0", "feat/P23-99999999-old", 300*24*h, shaB)},
+	} {
+		appG := &ghRepoData{}
+		appG.Merged.Nodes = []ghPR{c.merged}
+		fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appG, "acme/extra": {}}, jiraBadKey: "P23-99999999"}
+		p, in = newGitHubTest(t, fx, []string{"artie"})
+		withJira(p, in, p.apiBase)
+		findings, err = p.Sweep(context.Background(), in)
+		if err != nil {
+			t.Errorf("%s: must not be looked up: %v", c.name, err)
+		}
+		for _, f := range findings {
+			if f.Kind == "linked-key-missing" {
+				t.Errorf("%s: must not yield linked-key-missing: %+v", c.name, f)
+			}
+		}
+	}
 	// A per-key 429 is an outage, not a missing key: noted as such, and since
 	// it is the only lookup, the linked kinds stop for the sweep.
 	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appB, "acme/extra": {}}, jiraBadKey: "P23-91", jiraRateKey: "P23-91",

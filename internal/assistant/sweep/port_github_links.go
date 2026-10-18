@@ -229,6 +229,7 @@ func (l *ghLinks) load(keys []string) {
 	// its own PR, and give up only if every lookup fails.
 	outages := 0
 	var lastErr error
+	var unknown []string
 	for _, k := range missing {
 		if !timeLeft(l.client.ctx) {
 			l.note("time budget exhausted while looking up linked Jira issues")
@@ -238,13 +239,26 @@ func (l *ghLinks) load(keys []string) {
 		one, err := l.client.searchFirst(fmt.Sprintf(`key = %s`, k))
 		switch {
 		case err != nil && isNotFound(err, k):
-			l.notFound[k] = true // reported per PR as an info finding, never as partial
+			unknown = append(unknown, k)
 		case err != nil:
 			outages++
 			lastErr = err
 		case len(one) > 0:
 			l.cache[one[0].Key] = &one[0]
 		}
+	}
+	// Jira answers the same 400 for a key that does not exist and for one
+	// the token cannot see. One unknown key among others that resolved is a
+	// typo (reported per PR as an info finding); every key unknown looks
+	// like lost permissions, which is an outage: partial, no eviction, no
+	// "fix the key" nagging.
+	if len(unknown) == len(missing) && len(missing) >= 2 {
+		l.note("all %d linked Jira keys unknown or hidden; check the token's Browse permission", len(missing))
+		l.failed = true
+		return
+	}
+	for _, k := range unknown {
+		l.notFound[k] = true
 	}
 	if outages > 0 {
 		l.note("%d of %d linked Jira keys could not be looked up: %v", outages, len(missing), lastErr)
@@ -256,11 +270,13 @@ func (l *ghLinks) load(keys []string) {
 	}
 }
 
-// isNotFound reports Jira's answer for an unknown or hidden key: a 400 (JQL
-// validation) whose body names the key or the field. The client's error
-// text is "GET <path>: HTTP <code>: <body>". A 404 (wrong origin, proxy,
-// no v3 search endpoint), a blanket 400 (lost Browse permission), 401,
-// 403, 429 and 5xx are outages, so they can never read as "N missing keys".
+// isNotFound reports Jira's answer for a key that does not exist or that
+// the token cannot see (Jira gives the same 400 for both): a 400 whose body
+// names the key or the field. The client's error text is
+// "GET <path>: HTTP <code>: <body>". A 404 (wrong origin, proxy, no v3
+// search endpoint), a 400 that names neither, 401, 403, 429 and 5xx are
+// outages. Lost permissions are caught by the caller: every key unknown at
+// once is treated as an outage, not as N typos.
 func isNotFound(err error, key string) bool {
 	if err == nil || !badRequestRe.MatchString(err.Error()) {
 		return false
