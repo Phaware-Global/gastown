@@ -388,7 +388,7 @@ func TestJiraPort_DryRunTracesWithoutCalling(t *testing.T) {
 		t.Fatalf("dry run must not call Jira: err=%v findings=%d calls=%d", err, len(findings), fx.calls.Load())
 	}
 	joined := strings.Join(traced, "\n")
-	for _, want := range []string{"/rest/api/3/search/jql", "watcher in", "status changed after", "Release wave", "/rest/greenhopper/1.0/xboard/work/allData.json", "/comment"} {
+	for _, want := range []string{"/rest/api/3/search/jql", "watcher in", "status changed after", "Release wave", "/rest/greenhopper/1.0/xboard/work/allData.json", "/rest/agile/1.0/board/18/project", "/comment"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("dry run should trace %q:\n%s", want, joined)
 		}

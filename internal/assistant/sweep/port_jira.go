@@ -312,6 +312,13 @@ func (c *jiraClient) onBoard(boardID int) (keys, projects map[string]bool, err e
 	if err := c.get("/rest/greenhopper/1.0/xboard/work/allData.json", url.Values{"rapidViewId": {fmt.Sprint(boardID)}}, &res); err != nil {
 		return nil, nil, err
 	}
+	projectPath := fmt.Sprintf("/rest/agile/1.0/board/%d/project", boardID)
+	if c.dry {
+		// Trace the second query too: a dry run previews every endpoint
+		// the token must reach, and this one is a different API family.
+		_ = c.get(projectPath, url.Values{"startAt": {"0"}, "maxResults": {"50"}}, nil)
+		return nil, nil, nil
+	}
 	if res.IssuesData.Issues == nil {
 		return nil, nil, fmt.Errorf("board render data has no issuesData.issues")
 	}
@@ -331,7 +338,7 @@ func (c *jiraClient) onBoard(boardID int) (keys, projects map[string]bool, err e
 			} `json:"values"`
 			IsLast bool `json:"isLast"`
 		}
-		if err := c.get(fmt.Sprintf("/rest/agile/1.0/board/%d/project", boardID), url.Values{"startAt": {fmt.Sprint(start)}, "maxResults": {"50"}}, &pr); err != nil {
+		if err := c.get(projectPath, url.Values{"startAt": {fmt.Sprint(start)}, "maxResults": {"50"}}, &pr); err != nil {
 			return nil, nil, err
 		}
 		for _, v := range pr.Values {
