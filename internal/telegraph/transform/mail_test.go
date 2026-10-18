@@ -144,7 +144,7 @@ func TestTransform_BodyReplyViaHint_Jira(t *testing.T) {
 	if !strings.Contains(body, "Telegraph-Reply-Via:") {
 		t.Fatalf("missing Telegraph-Reply-Via header\nbody:\n%s", body)
 	}
-	if !strings.Contains(body, "Jira MCP") {
+	if !strings.Contains(body, "who replies on Jira") {
 		t.Errorf("Jira reply hint must point to Jira MCP tools\nbody:\n%s", body)
 	}
 	if !strings.Contains(body, "do NOT reply via bead") {
@@ -161,7 +161,7 @@ func TestTransform_BodyReplyViaHint_GitHub(t *testing.T) {
 	if !strings.Contains(body, "Telegraph-Reply-Via:") {
 		t.Fatalf("missing Telegraph-Reply-Via header\nbody:\n%s", body)
 	}
-	if !strings.Contains(body, "`gh` CLI") {
+	if !strings.Contains(body, "who replies on GitHub") {
 		t.Errorf("GitHub reply hint must point to gh CLI\nbody:\n%s", body)
 	}
 	if !strings.Contains(body, "do NOT reply via bead") {
