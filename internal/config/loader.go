@@ -3003,7 +3003,8 @@ func LoadEscalationConfig(path string) (*EscalationConfig, error) {
 
 // stripSlackRoutes removes the "slack" action from every route when
 // slack_overseer_only is in effect, so gt escalate never posts to Slack on
-// its own. Any route that loses a slack action keeps (or gains) mail:mayor. Returns the severities that had a slack action stripped, in
+// its own. Any route that loses a slack action keeps its existing mayor/assistant mail
+// route or gains mail:assistant. Returns the severities that had a slack action stripped, in
 // ValidSeverities order, so the caller can warn the operator once per route.
 func stripSlackRoutes(c *EscalationConfig) []string {
 	if !c.IsSlackOverseerOnly() {
@@ -3024,11 +3025,12 @@ func stripSlackRoutes(c *EscalationConfig) []string {
 		}
 		if len(kept) != len(actions) {
 			// A suppressed Slack route must degrade to the gatekeeper, not to
-			// silence: the mayor is now the only path to Slack, so make sure
-			// the escalation reaches the mayor's mailbox.
-			if !slices.Contains(kept, "mail:mayor") {
-				kept = append(kept, "mail:mayor")
-			}
+			// silence: the mayor is the only path to Slack, so make sure the
+			// escalation reaches the mayor. High/critical get a direct
+			// mail:mayor route (the assistant may be down); lower severities
+			// go via the assistant's triage inbox (Routed to the Mayor's
+			// Assistant) unless the operator already routes them somewhere.
+			kept = ensureMayorReachable(severity, kept)
 			c.Routes[severity] = kept
 			stripped = append(stripped, severity)
 		}
@@ -3120,13 +3122,33 @@ func (c *EscalationConfig) GetStaleThreshold() time.Duration {
 }
 
 // GetRouteForSeverity returns the escalation route actions for a given severity.
-// Falls back to ["bead", "mail:mayor"] if no specific route is configured.
+// Falls back to ["bead", "mail:assistant"] if no specific route is
+// configured; high and critical additionally fall back to a direct
+// "mail:mayor" so a dead assistant session cannot blackhole them.
 func (c *EscalationConfig) GetRouteForSeverity(severity string) []string {
 	if route, ok := c.Routes[severity]; ok {
 		return route
 	}
-	// Fallback to default route
-	return []string{"bead", "mail:mayor"}
+	// Fallback to default route (Routed to the Mayor's Assistant)
+	return ensureMayorReachable(severity, []string{"bead", "mail:" + constants.RoleAssistant})
+}
+
+// ensureMayorReachable guarantees an escalation route reaches the Mayor.
+// High and critical must carry a direct mail:mayor route regardless of the
+// assistant's liveness; other severities need either mail:mayor or the
+// assistant's triage inbox and gain mail:assistant if they have neither.
+func ensureMayorReachable(severity string, route []string) []string {
+	switch severity {
+	case SeverityHigh, SeverityCritical:
+		if !slices.Contains(route, "mail:mayor") {
+			route = append(route, "mail:mayor")
+		}
+	default:
+		if !slices.Contains(route, "mail:mayor") && !slices.Contains(route, "mail:"+constants.RoleAssistant) {
+			route = append(route, "mail:"+constants.RoleAssistant)
+		}
+	}
+	return route
 }
 
 // GetMaxReescalations returns the maximum number of re-escalations allowed.

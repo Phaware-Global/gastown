@@ -658,17 +658,22 @@ Action needed: Investigate and fix the root cause, then restart the daemon or th
 	logger := m.logger
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, "gt", "mail", "send", "mayor/", "-s", subject, "-m", body) //nolint:gosec // G204: args are constructed internally
-		setSysProcAttr(cmd)
-		cmd.Dir = townRoot
-		cmd.Env = os.Environ()
-
-		if err := cmd.Run(); err != nil {
-			logger("Warning: failed to send escalation mail to mayor: %v", err)
-		} else {
-			logger("Sent escalation mail to mayor about Dolt server crash-loop")
+		// A crash-loop is a critical-class, time-critical event: like high and
+		// critical escalation routes, it goes to the Mayor's Assistant for
+		// triage AND straight to mayor/, so a dead or wedged assistant session
+		// cannot blackhole it.
+		for _, recipient := range []string{"assistant/", "mayor/"} {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			cmd := exec.CommandContext(ctx, "gt", "mail", "send", recipient, "-s", subject, "-m", body) //nolint:gosec // G204: args are constructed internally
+			setSysProcAttr(cmd)
+			cmd.Dir = townRoot
+			cmd.Env = os.Environ()
+			if err := cmd.Run(); err != nil {
+				logger("Warning: failed to send Dolt crash-loop escalation mail to %s: %v", recipient, err)
+			} else {
+				logger("Sent Dolt crash-loop escalation mail to %s", recipient)
+			}
+			cancel()
 		}
 
 		// Also notify all witnesses so they can react to degraded Dolt state
@@ -701,7 +706,7 @@ Check the log file for crash details. If crashes recur, the daemon will escalate
 	logger := m.logger
 
 	go func() {
-		sendDoltAlertMail(townRoot, "mayor/", subject, body, logger)
+		sendDoltAlertMail(townRoot, "assistant/", subject, body, logger) // Routed to the Mayor's Assistant
 		sendDoltAlertToWitnesses(townRoot, subject, body, logger)
 	}()
 }
@@ -731,7 +736,7 @@ This may indicate high load, connection exhaustion, or internal server errors.`,
 	logger := m.logger
 
 	go func() {
-		sendDoltAlertMail(townRoot, "mayor/", subject, body, logger)
+		sendDoltAlertMail(townRoot, "assistant/", subject, body, logger) // Routed to the Mayor's Assistant
 		sendDoltAlertToWitnesses(townRoot, subject, body, logger)
 	}()
 }
@@ -1496,7 +1501,7 @@ concurrent polecat count or staggering write-heavy operations.`,
 	logger := m.logger
 
 	go func() {
-		sendDoltAlertMail(townRoot, "mayor/", subject, body, logger)
+		sendDoltAlertMail(townRoot, "assistant/", subject, body, logger) // Routed to the Mayor's Assistant
 		sendDoltAlertToWitnesses(townRoot, subject, body, logger)
 	}()
 }

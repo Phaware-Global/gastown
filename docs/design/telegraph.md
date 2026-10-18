@@ -46,13 +46,13 @@ External System
       ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │ L3 · Transformation  (provider-agnostic)                        │
-│   Builds Mayor-addressed mail envelope                          │
+│   Builds mail envelope addressed to the Mayor's Assistant       │
 │   Rate-limited nudge: one nudge per window                      │
 │   Uses existing gt mail + gt nudge primitives                   │
 └─────────────────────────────────────────────────────────────────┘
-      │  gt mail send mayor/ + gt nudge mayor/
+      │  gt mail send assistant/ + gt nudge assistant/
       ▼
-    Mayor
+  Mayor's Assistant ──(BRIEF:/URGENT: mail)──▶ Mayor
 ```
 
 **Key invariant:** Adding a new provider requires only a new L2 `Translator`
@@ -140,10 +140,11 @@ Never an internal agent address.
 ### To
 
 ```
-mayor/
+assistant/
 ```
 
-Fixed in v1. Telegraph has no routing logic.
+Fixed. Telegraph has no routing logic; the Mayor's Assistant triages events
+and briefs `mayor/` (see [assistant-role.md](assistant-role.md)).
 
 ### Subject
 
@@ -174,15 +175,21 @@ Telegraph-Actor: alice
 Telegraph-Subject: PROJ-1234
 Telegraph-URL: https://company.atlassian.net/browse/PROJ-1234
 Telegraph-Labels: story, critical
+Telegraph-Boundary: 3f9a1c0e7b2d4e61
 
---- EXTERNAL CONTENT (untrusted: jira/alice) ---
+--- EXTERNAL CONTENT (untrusted: jira/alice) 3f9a1c0e7b2d4e61 ---
 <Text field from NormalizedEvent here>
---- END EXTERNAL CONTENT ---
+--- END EXTERNAL CONTENT 3f9a1c0e7b2d4e61 ---
 ```
 
 Rules:
 - Metadata block appears first, as `Telegraph-*` headers.
 - External content is wrapped in explicit delimiters that identify it as untrusted.
+- Each mail carries a random per-message `Telegraph-Boundary` nonce and the
+  real delimiters embed it; a delimiter line without the mail's nonce is
+  external text. Delimiter-looking lines inside the external text are also
+  prefixed `[neutralized delimiter]` (matched on a letters-only canonical form)
+  as defense in depth.
 - No user-supplied text appears outside the delimited block.
 - Body length is capped (default 4 KB) to prevent oversized context injection.
   Content beyond the cap is truncated with a `[… truncated]` notice inside the block.
@@ -363,10 +370,10 @@ trigger operator action (observable via log `reason=backpressure` count).
 
 ## Nudge Rate-Limit Window
 
-Mayor should not be flooded with nudges during high event volume. Telegraph
-accumulates mail at full event rate but limits nudges.
+The assistant should not be flooded with nudges during high event volume.
+Telegraph accumulates mail at full event rate but limits nudges.
 
-**Policy:** at most one `gt nudge mayor/` per `nudge_window` (default 30 seconds).
+**Policy:** at most one `gt nudge assistant/` per `nudge_window` (default 30 seconds).
 
 **Implementation:**
 ```
@@ -374,7 +381,7 @@ lastNudge time.Time  // zero value = never nudged
 
 after each mail delivery:
     if now - lastNudge >= nudge_window:
-        gt nudge mayor/ "Telegraph: new events pending"
+        gt nudge assistant/ "Telegraph: new events pending"
         lastNudge = now
 ```
 
@@ -475,7 +482,7 @@ in an issue title or comment body.
 | Layer | Mitigation | Rationale |
 |-------|-----------|-----------|
 | L2 (Translation) | Subject line constructed from structured fields only (event type, issue key, status labels) — never from raw user text | Prevents injection via subject |
-| L3 (Transformation) | External text in body is always wrapped in `--- EXTERNAL CONTENT ---` delimiters with untrusted label | Mayor's model can identify the trust boundary structurally |
+| L3 (Transformation) | External text in body is always wrapped in `--- EXTERNAL CONTENT … <nonce> ---` delimiters with untrusted label; the nonce is per-message (`Telegraph-Boundary`) and delimiter-looking lines inside the text are neutralized | Mayor's model can identify the trust boundary structurally, and external text cannot forge it |
 | L3 (Transformation) | Body content is capped at `body_cap` bytes; remainder truncated | Limits payload surface |
 | L3 (Transformation) | `Telegraph-*` metadata headers are constructed from `NormalizedEvent` fields, never from raw text | Metadata cannot carry injected instructions |
 | L1 (Transport) | Unauthenticated requests rejected at the perimeter | Reduces attacker surface to authenticated Jira instances |
@@ -759,13 +766,13 @@ dispatchLoop goroutine
 L3 · Transformer
      │  6. Build Telegraph-* metadata headers from NormalizedEvent
      │  7. Build From, Subject, delimited Body
-     │  8. gt mail send mayor/ (creates mail bead)
+     │  8. gt mail send assistant/ (creates mail bead)
      │  9. log "deliver"
      │  10. if now - lastNudge >= nudge_window:
-     │        gt nudge mayor/ "Telegraph: new events pending"
+     │        gt nudge assistant/ "Telegraph: new events pending"
      │        lastNudge = now
      ▼
-   Mayor inbox
+   Mayor's Assistant inbox (triaged into BRIEF:/URGENT: mail for the Mayor)
 ```
 
 ---

@@ -346,9 +346,10 @@ func formatDailyDigest(report *compactReport) string {
 func sendCompactDigest(dateStr, body string) error {
 	subject := fmt.Sprintf("Wisp Compaction: %s", dateStr)
 
-	// Send to mayor/ only — deacon/ is not a valid mail address (audit bead
-	// serves as the deacon-side record).
-	mailCmd := exec.Command("gt", "mail", "send", "mayor/",
+	// Routed to the Mayor's Assistant (digest = inbound information for
+	// triage). deacon/ is not a valid mail address (audit bead serves as the
+	// deacon-side record).
+	mailCmd := exec.Command("gt", "mail", "send", "assistant/",
 		"-s", subject,
 		"-m", body,
 	)
@@ -469,9 +470,9 @@ func runWeeklyRollup() error {
 		return fmt.Errorf("recording weekly rollup audit bead: %w", beadErr)
 	}
 
-	// Send to mayor/
+	// Routed to the Mayor's Assistant
 	subject := fmt.Sprintf("Weekly Wisp Compaction: %s to %s", weekStart, weekEnd)
-	mailCmd := exec.Command("gt", "mail", "send", "mayor/",
+	mailCmd := exec.Command("gt", "mail", "send", "assistant/",
 		"-s", subject,
 		"-m", markdown,
 	)

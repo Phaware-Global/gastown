@@ -43,9 +43,9 @@ Config file: `~/gt/settings/escalation.json`
   "type": "escalation",
   "version": 1,
   "routes": {
-    "medium": ["bead", "mail:mayor"],
-    "high": ["bead", "mail:mayor", "email:human"],
-    "critical": ["bead", "mail:mayor", "email:human", "sms:human"]
+    "medium": ["bead", "mail:assistant"],
+    "high": ["bead", "mail:assistant", "mail:mayor", "email:human"],
+    "critical": ["bead", "mail:assistant", "mail:mayor", "email:human", "sms:human"]
   },
   "contacts": {
     "human_email": "",
@@ -69,7 +69,7 @@ Config file: `~/gt/settings/escalation.json`
 | Action | Format | Behavior |
 |--------|--------|----------|
 | `bead` | `bead` | Create escalation bead (always first, implicit) |
-| `mail:<target>` | `mail:mayor` | Send gt mail to target |
+| `mail:<target>` | `mail:assistant` | Send gt mail to target (default: the Mayor's Assistant triage inbox; `mail:mayor` reaches the Mayor directly) |
 | `email:human` | `email:human` | Send email to `contacts.human_email` |
 | `sms:human` | `sms:human` | Send SMS to `contacts.human_sms` |
 | `slack` | `slack` | Post to `contacts.slack_webhook` — **suppressed** unless `slack_overseer_only` is `false` (see below) |
@@ -84,7 +84,7 @@ Slack is therefore reserved for the mayor's judgment:
 - `slack_overseer_only` defaults to `true` when the key is absent.
 - While it is `true`, `LoadEscalationConfig` strips every `slack` action from
   `routes` and prints one warning per affected severity. A route that loses a
-  `slack` action keeps (or gains) `mail:mayor`, so a suppressed route degrades
+  `slack` action keeps its `mail:mayor`/`mail:assistant` route (or gains `mail:assistant`), so a suppressed route degrades
   to the gatekeeper rather than to silence. `gt escalate` also
   gates the action at execution time and records
   `slack route suppressed: use gt notify-overseer for Slack (slack_overseer_only=true)`

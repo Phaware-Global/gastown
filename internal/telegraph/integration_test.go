@@ -278,8 +278,8 @@ func TestIntegration_IssueCreated_MailEnvelope(t *testing.T) {
 	msgs := p.waitMessages(t, 1, 2*time.Second)
 	msg := msgs[0]
 
-	if msg.To != "mayor/" {
-		t.Errorf("To = %q, want mayor/", msg.To)
+	if msg.To != "assistant/" {
+		t.Errorf("To = %q, want assistant/", msg.To)
 	}
 	if msg.From != "telegraph/jira/alice" {
 		t.Errorf("From = %q, want telegraph/jira/alice", msg.From)
@@ -326,10 +326,10 @@ func TestIntegration_MailBody_ExternalContentDelimiters(t *testing.T) {
 	msgs := p.waitMessages(t, 1, 2*time.Second)
 	mb := msgs[0].Body
 
-	if !strings.Contains(mb, "--- EXTERNAL CONTENT (untrusted: jira/carol) ---") {
+	if !strings.Contains(mb, "--- EXTERNAL CONTENT (untrusted: jira/carol) ") {
 		t.Errorf("missing opening delimiter\nbody:\n%s", mb)
 	}
-	if !strings.Contains(mb, "--- END EXTERNAL CONTENT ---") {
+	if !strings.Contains(mb, "--- END EXTERNAL CONTENT ") {
 		t.Errorf("missing closing delimiter\nbody:\n%s", mb)
 	}
 	if !strings.Contains(mb, "The actual description content") {
@@ -844,8 +844,8 @@ func TestIntegration_GitHub_PRMerged_DeliveredToMayor(t *testing.T) {
 	if msg.From != "telegraph/github/alice" {
 		t.Errorf("From = %q", msg.From)
 	}
-	if msg.To != "mayor/" {
-		t.Errorf("To = %q", msg.To)
+	if msg.To != "assistant/" {
+		t.Errorf("To = %q, want assistant/", msg.To)
 	}
 	if !strings.Contains(msg.Subject, "[GITHUB acme/widget#42]") {
 		t.Errorf("subject missing tag: %q", msg.Subject)
@@ -856,7 +856,7 @@ func TestIntegration_GitHub_PRMerged_DeliveredToMayor(t *testing.T) {
 	if !strings.Contains(msg.Body, "Telegraph-Provider: github") {
 		t.Errorf("body missing provider header:\n%s", msg.Body)
 	}
-	if !strings.Contains(msg.Body, "--- EXTERNAL CONTENT (untrusted: github/alice) ---") {
+	if !strings.Contains(msg.Body, "--- EXTERNAL CONTENT (untrusted: github/alice) ") {
 		t.Errorf("body missing external content delimiter:\n%s", msg.Body)
 	}
 }
