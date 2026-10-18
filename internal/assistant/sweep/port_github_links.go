@@ -77,8 +77,15 @@ func (p *GitHubPort) checkReleases(c *ghClient, ref repoRef, data *ghRepoData, p
 			}
 			// Tagged-commit dates can precede mergedAt by a little (push
 			// merges, clock skew), so the gate is loose; contains() decides.
-			if t.at.Before(pr.MergedAt.Add(-24*time.Hour)) || checked == githubTagsChecked {
+			if t.at.Before(pr.MergedAt.Add(-24 * time.Hour)) {
 				continue
+			}
+			if checked == githubTagsChecked {
+				// Candidates left uncompared (tags on other lines used the
+				// cap): unknown, which is never reported as untagged.
+				note("%s: more than %d candidate tags; release tag not checked", key, githubTagsChecked)
+				tagged = true
+				break
 			}
 			if !timeLeft(c.ctx) {
 				note("%s: time budget exhausted before the release tag check", key)
@@ -205,7 +212,7 @@ func (l *ghLinks) load(keys []string) {
 	// One bad key (a typo or an attacker-chosen key in a PR title) fails
 	// the batch with a 400: look the keys up one by one so it only drops
 	// its own PR, and give up only if every lookup fails.
-	failures := 0
+	notFound, outages := 0, 0
 	for _, k := range missing {
 		if !timeLeft(l.client.ctx) {
 			l.note("time budget exhausted while looking up linked Jira issues")
@@ -213,21 +220,35 @@ func (l *ghLinks) load(keys []string) {
 			return
 		}
 		one, err := l.client.searchFirst(fmt.Sprintf(`key = %s`, k))
-		if err != nil {
-			failures++
-			continue
-		}
-		if len(one) > 0 {
+		switch {
+		case err != nil && isClientError(err):
+			notFound++ // Jira rejects an unknown or hidden key with a 400: that key alone
+		case err != nil:
+			outages++
+		case len(one) > 0:
 			l.cache[one[0].Key] = &one[0]
 		}
 	}
-	if failures > 0 {
-		l.note("%d of %d linked Jira keys could not be looked up (batch error: %v)", failures, len(missing), err)
+	if notFound > 0 {
+		l.note("%d of %d linked Jira keys do not exist or are not visible (ignored)", notFound, len(missing))
 	}
-	if failures == len(missing) {
+	if outages > 0 {
+		l.note("%d of %d linked Jira keys could not be looked up: %v", outages, len(missing), err)
+	}
+	// Only a Jira outage (every lookup a transport or server error) disables
+	// the linked kinds for the rest of the sweep.
+	if outages > 0 && outages == len(missing) {
 		l.failed = true
 	}
 }
+
+// isClientError reports a Jira 4xx answer (the client's own error text is
+// "GET <path>: HTTP <code>: <body>").
+func isClientError(err error) bool {
+	return err != nil && clientErrRe.MatchString(err.Error())
+}
+
+var clientErrRe = regexp.MustCompile(`: HTTP 4\d\d\b`)
 
 func (l *ghLinks) check(open []ghPR, merged []ghPR, patterns []string, now time.Time, d githubDurations, isPersona, isHuman map[string]bool) []Finding {
 	if l == nil {

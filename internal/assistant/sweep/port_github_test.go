@@ -1024,8 +1024,8 @@ func TestGitHubPort_LinkedKindsRound1Fixes(t *testing.T) {
 	in.Settings.Assistant.Sweep.Jira.Reviewers = map[string]string{"KEVIN": humanID} // mis-cased config key
 	findings, err := p.Sweep(context.Background(), in)
 	var partial *PartialError
-	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "could not be looked up") {
-		t.Fatalf("the bogus key must be noted, not fatal: %v", err)
+	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "do not exist or are not visible") {
+		t.Fatalf("the bogus key must be noted as not-found, not fatal: %v", err)
 	}
 	got := map[string]Finding{}
 	for _, f := range findings {
@@ -1045,5 +1045,43 @@ func TestGitHubPort_LinkedKindsRound1Fixes(t *testing.T) {
 	}
 	if _, ok := got["review-handoff/P23-94"]; !ok {
 		t.Errorf("a bogus key in the same title must not blind the real key: %v", keysOf(got))
+	}
+}
+
+func TestGitHubPort_LinkedKindsRound2Fixes(t *testing.T) {
+	h := time.Hour
+	// Repo A's only key is bogus (Jira answers 400); repo B must still yield review-handoff.
+	appA := &ghRepoData{}
+	appA.Open.Nodes = []ghPR{pr(95, "artie", 40*h, 40*h, "SUCCESS", func(p *ghPR) { p.Title = "fix P23-99999999" })}
+	appB := &ghRepoData{}
+	appB.Open.Nodes = []ghPR{pr(91, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-91"), requested("kevin", 30*h))}
+	// Release: the real tag (shaT, contains the merge) is older than five newer tags on another line.
+	appA.Merged.Nodes = []ghPR{mergedPR(40, "release/1.4", "feat/P23-40", 48*h, shaM)}
+	appA.Tags.Nodes = []ghTag{tagAt(shaT, 47*h), tagAt(shaB, 10*h), tagAt(shaB, 8*h), tagAt(shaB, 6*h), tagAt(shaB, 4*h), tagAt(shaB, 2*h)}
+	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": appA, "acme/extra": appB}, jiraBadKey: "P23-99999999",
+		compare: map[string]string{shaM + "..." + shaT: "ahead"},
+		issues:  []map[string]any{issue("P23-91", "In Progress", "indeterminate", personaID, 100*h, 1*h, "needs handoff")}}
+	p, in := newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	findings, err := p.Sweep(context.Background(), in)
+	var partial *PartialError
+	if !errors.As(err, &partial) {
+		t.Fatalf("expected a partial result (bogus key, tag cap), got %v", err)
+	}
+	if strings.Contains(partial.Reason, "could not be looked up") || !strings.Contains(partial.Reason, "do not exist or are not visible") {
+		t.Errorf("a per-key 400 is not-found, never an outage: %s", partial.Reason)
+	}
+	got := map[string]bool{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = true
+	}
+	if !got["review-handoff/P23-91"] {
+		t.Errorf("a bogus key in repo A must not blind repo B's linked kinds: %v", got)
+	}
+	if got["release-unclosed/acme/app#40"] {
+		t.Error("running out of the tag cap with candidates left is unknown, never untagged")
+	}
+	if !strings.Contains(partial.Reason, "candidate tags; release tag not checked") {
+		t.Errorf("cap exhaustion must be noted: %s", partial.Reason)
 	}
 }
