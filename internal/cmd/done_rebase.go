@@ -16,7 +16,10 @@ type rebaseGit interface {
 // behind the target. It is a no-op when there is nothing to rebase, when the
 // polecat ran the formula's pre-verify step (rebasing again would invalidate
 // the gate results that --pre-verified attests to), or when a prior push
-// checkpoint exists (rebasing after pushing would require a force-push).
+// checkpoint exists (rebasing after pushing would require a force-push). A
+// review-fix dispatch is skipped too: its work is pushed onto the PR's
+// existing branch, and rebasing HEAD afterwards would rewrite it so it is no
+// longer a descendant of what was pushed.
 //
 // Returns:
 //   - rebased: true if a rebase actually ran successfully.
@@ -25,7 +28,7 @@ type rebaseGit interface {
 //   - err: rebase failure, after AbortRebase has been attempted to clean up.
 //
 // gh#3400.
-func autoRebaseOnTarget(g rebaseGit, base string, behind int, preVerified, alreadyPushed bool) (rebased bool, skipReason string, err error) {
+func autoRebaseOnTarget(g rebaseGit, base string, behind int, preVerified, alreadyPushed, reviewFix bool) (rebased bool, skipReason string, err error) {
 	if behind <= 0 {
 		return false, "", nil
 	}
@@ -34,6 +37,8 @@ func autoRebaseOnTarget(g rebaseGit, base string, behind int, preVerified, alrea
 		return false, "--pre-verified is set", nil
 	case alreadyPushed:
 		return false, "prior push checkpoint exists", nil
+	case reviewFix:
+		return false, "review-fix dispatch pushes onto the PR's existing branch", nil
 	}
 
 	fmt.Printf("→ Auto-rebasing onto %s (%d commits behind)\n", base, behind)

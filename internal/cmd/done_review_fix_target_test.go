@@ -2,8 +2,11 @@ package cmd
 
 import (
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	gitpkg "github.com/steveyegge/gastown/internal/git"
 )
 
 func TestVerifyReviewFixTarget(t *testing.T) {
@@ -103,4 +106,53 @@ func TestVerifyReviewFixTarget(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestHeadOnReviewBranch_IgnoresShadowingRefs proves the push check reads the
+// remote-tracking ref, not whatever git's short-name rules find first: a stray
+// local branch or tag named origin/<review_branch> must not stand in for a push.
+func TestHeadOnReviewBranch_IgnoresShadowingRefs(t *testing.T) {
+	const review = "polecat/capable/gt-tjz4@mu7bhq24"
+
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	testRunGit(t, tmp, "init", "--initial-branch", "main", repo)
+	testRunGit(t, repo, "config", "user.email", "test@test.com")
+	testRunGit(t, repo, "config", "user.name", "Test")
+
+	writeRepoFile(t, repo, "a.txt", "a\n")
+	testRunGit(t, repo, "add", ".")
+	testRunGit(t, repo, "commit", "-m", "base")
+	// The review branch as last fetched from origin.
+	testRunGit(t, repo, "update-ref", "refs/remotes/origin/"+review, "HEAD")
+
+	// A local fix that was never pushed.
+	writeRepoFile(t, repo, "b.txt", "b\n")
+	testRunGit(t, repo, "add", ".")
+	testRunGit(t, repo, "commit", "-m", "unpushed fix")
+
+	g := gitpkg.NewGit(repo)
+	check := func(want bool, why string) {
+		t.Helper()
+		got, err := headOnReviewBranch(g, review)
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", why, err)
+		}
+		if got != want {
+			t.Fatalf("%s: headOnReviewBranch = %v, want %v", why, got, want)
+		}
+	}
+
+	check(false, "unpushed HEAD")
+
+	testRunGit(t, repo, "branch", "origin/"+review, "HEAD")
+	check(false, "with shadowing local branch origin/<review>")
+	testRunGit(t, repo, "branch", "-D", "origin/"+review)
+
+	testRunGit(t, repo, "tag", "origin/"+review, "HEAD")
+	check(false, "with shadowing tag origin/<review>")
+	testRunGit(t, repo, "tag", "-d", "origin/"+review)
+
+	testRunGit(t, repo, "update-ref", "refs/remotes/origin/"+review, "HEAD")
+	check(true, "after the push lands on the remote-tracking ref")
 }

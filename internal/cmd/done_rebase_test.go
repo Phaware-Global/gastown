@@ -37,6 +37,7 @@ func TestAutoRebaseOnTarget_GatingDecisions(t *testing.T) {
 		behind        int
 		preVerified   bool
 		alreadyPushed bool
+		reviewFix     bool
 		wantRebased   bool
 		wantSkip      string
 		wantCalls     int
@@ -79,6 +80,14 @@ func TestAutoRebaseOnTarget_GatingDecisions(t *testing.T) {
 			wantCalls:     0,
 		},
 		{
+			name:        "review-fix dispatch: skip even when behind",
+			behind:      3,
+			reviewFix:   true,
+			wantRebased: false,
+			wantSkip:    "review-fix dispatch pushes onto the PR's existing branch",
+			wantCalls:   0,
+		},
+		{
 			name:          "pre-verified takes precedence over already-pushed",
 			behind:        3,
 			preVerified:   true,
@@ -92,7 +101,7 @@ func TestAutoRebaseOnTarget_GatingDecisions(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fake := &fakeRebaseGit{}
-			rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", tt.behind, tt.preVerified, tt.alreadyPushed)
+			rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", tt.behind, tt.preVerified, tt.alreadyPushed, tt.reviewFix)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -117,7 +126,7 @@ func TestAutoRebaseOnTarget_GatingDecisions(t *testing.T) {
 func TestAutoRebaseOnTarget_ConflictAborts(t *testing.T) {
 	fake := &fakeRebaseGit{rebaseErr: errors.New("CONFLICT (content): merge conflict in foo.txt")}
 
-	rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", 1, false, false)
+	rebased, skipReason, err := autoRebaseOnTarget(fake, "origin/main", 1, false, false, false)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -176,7 +185,7 @@ func TestAutoRebaseOnTarget_RealRepoSuccess(t *testing.T) {
 	testRunGit(t, repo, "checkout", "feature")
 
 	g := gitpkg.NewGit(repo)
-	rebased, skipReason, err := autoRebaseOnTarget(g, "main", 1, false, false)
+	rebased, skipReason, err := autoRebaseOnTarget(g, "main", 1, false, false, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -224,7 +233,7 @@ func TestAutoRebaseOnTarget_RealRepoConflictAborts(t *testing.T) {
 	testRunGit(t, repo, "checkout", "feature")
 
 	g := gitpkg.NewGit(repo)
-	rebased, skipReason, err := autoRebaseOnTarget(g, "main", 1, false, false)
+	rebased, skipReason, err := autoRebaseOnTarget(g, "main", 1, false, false, false)
 	if err == nil {
 		t.Fatal("expected conflict error, got nil")
 	}

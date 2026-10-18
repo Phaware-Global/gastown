@@ -817,11 +817,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// a thread can be resolved with replies alone (zero commits).
 		// Must be checked before the zero-commit guard below (GH#2496, gt-kvf).
 		isNoMergeTask := false
+		isReviewFix := false
 		if issueID != "" {
 			noMergeBd := beads.New(cwd)
 			if noMergeIssue, showErr := noMergeBd.Show(issueID); showErr == nil {
 				if af := beads.ParseAttachmentFields(noMergeIssue); af != nil && (af.NoMerge || af.ReviewOnly || isReviewFixDispatch(af)) {
 					isNoMergeTask = true
+					isReviewFix = isReviewFixDispatch(af)
 				}
 			}
 		}
@@ -1020,7 +1022,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// gh#3400: Auto-rebase the polecat branch onto the latest target before
 			// push, so the resulting MR/PR has a current base.
 			alreadyPushed := checkpoints[CheckpointPushed] == branch
-			rebased, skipReason, rebaseErr := autoRebaseOnTarget(g, contaminationBase, contam.Behind, donePreVerified, alreadyPushed)
+			rebased, skipReason, rebaseErr := autoRebaseOnTarget(g, contaminationBase, contam.Behind, donePreVerified, alreadyPushed, isReviewFix)
 			if rebaseErr != nil {
 				return rebaseErr
 			}
@@ -1339,7 +1341,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				warning, verifyErr := verifyReviewFixTarget(completion.reusePR, branch, attachmentFields.ReviewBranch,
 					g.FindPRNumber,
 					func(reviewBranch string) (bool, error) {
-						return g.IsAncestor("HEAD", "origin/"+reviewBranch)
+						return headOnReviewBranch(g, reviewBranch)
 					})
 				if warning != "" {
 					style.PrintWarning("%s", warning)
@@ -3059,6 +3061,17 @@ func resolveNoMergeCompletion(fields *beads.AttachmentFields, mergeStrategyIsPR 
 		return noMergeCompletionTarget{reusePR: fields.ReviewPR}, nil
 	}
 	return noMergeCompletionTarget{createPR: mergeStrategyIsPR}, nil
+}
+
+// headOnReviewBranch reports whether HEAD is contained in the remote-tracking
+// ref of reviewBranch. The ref is fully qualified: a bare "origin/<branch>" is
+// resolved by git's short-name rules, which try refs/tags/origin/<branch> and
+// refs/heads/origin/<branch> before refs/remotes/, so a stray local branch or
+// tag of that name would satisfy the check without anything being pushed.
+func headOnReviewBranch(g interface {
+	IsAncestor(ancestor, descendant string) (bool, error)
+}, reviewBranch string) (bool, error) {
+	return g.IsAncestor("HEAD", "refs/remotes/origin/"+reviewBranch)
 }
 
 // verifyReviewFixTarget checks that a review-fix completion really landed on
