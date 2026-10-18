@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
@@ -29,6 +31,8 @@ type Options struct {
 	// Write records a pending state file so the run can be acknowledged.
 	// Manual, --json and --dry-run invocations leave it false.
 	Write bool
+	// DryRun makes ports trace their external queries instead of running them.
+	DryRun bool
 }
 
 // Runner executes the enabled ports against the acknowledged state.
@@ -45,7 +49,7 @@ func NewRunner(townRoot string, settings *config.TownSettings) *Runner {
 	return &Runner{
 		TownRoot: townRoot,
 		Settings: settings,
-		Ports:    map[string]Port{"beads": NewBeadsPort(townRoot)},
+		Ports:    map[string]Port{"beads": NewBeadsPort(townRoot), "jira": NewJiraPort(townRoot, os.Getenv)},
 		Store:    NewStore(townRoot),
 		Now:      time.Now,
 	}
@@ -70,7 +74,16 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Report, error) {
 			rep.Ports = append(rep.Ports, res)
 			continue
 		}
-		findings, perr := runPort(ctx, port, Input{TownRoot: r.TownRoot, Settings: r.Settings, Now: now})
+		in := Input{TownRoot: r.TownRoot, Settings: r.Settings, Now: now, DryRun: opts.DryRun}
+		var qmu sync.Mutex
+		var queries []string
+		if opts.DryRun {
+			in.Trace = func(q string) { qmu.Lock(); queries = append(queries, q); qmu.Unlock() }
+		}
+		findings, perr := runPort(ctx, port, in)
+		qmu.Lock()
+		res.Queries = append([]string(nil), queries...)
+		qmu.Unlock()
 		var partial *PartialError
 		switch {
 		case errors.As(perr, &partial):

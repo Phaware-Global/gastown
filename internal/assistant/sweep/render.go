@@ -58,6 +58,9 @@ func Markdown(r *Report) string {
 			}
 			b.WriteString(")\n")
 		}
+		for _, q := range p.Queries {
+			fmt.Fprintf(&b, "would query: %s\n", q)
+		}
 		for _, s := range p.Standing {
 			fmt.Fprintf(&b, "\nstanding: %s ×%d", s.Kind, s.Count)
 			if !s.Oldest.IsZero() {

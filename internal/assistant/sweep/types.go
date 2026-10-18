@@ -27,6 +27,12 @@ type Input struct {
 	TownRoot string
 	Settings *config.TownSettings
 	Now      time.Time
+
+	// DryRun asks ports that talk to external systems to trace the queries
+	// they would issue (via Trace) instead of issuing them.
+	DryRun bool
+	// Trace records one external query; nil when nobody is listening.
+	Trace func(query string)
 }
 
 // Port is one deterministic source of sweep findings.
@@ -93,6 +99,7 @@ type PortResult struct {
 	New      []Finding  `json:"new,omitempty"`      // fingerprint differs from the acknowledged one
 	Standing []Standing `json:"standing,omitempty"` // acknowledged and unchanged, counts only
 	Overflow []Standing `json:"overflow,omitempty"` // new findings beyond MaxNewPerKind, counts only
+	Queries  []string   `json:"queries,omitempty"`  // external queries traced in a dry run
 }
 
 // Clean reports whether the port completed without error or truncation, which

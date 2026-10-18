@@ -15,6 +15,9 @@ type SweepConfig struct {
 
 	// Beads tunes the beads port.
 	Beads *BeadsSweepConfig `json:"beads,omitempty"`
+
+	// Jira configures the Jira port (disabled until site and projects are set).
+	Jira *JiraSweepConfig `json:"jira,omitempty"`
 }
 
 // BeadsSweepConfig tunes the beads port.
@@ -42,4 +45,35 @@ func (s *TownSettings) BeadsSweep() *BeadsSweepConfig {
 		return &BeadsSweepConfig{}
 	}
 	return s.Assistant.Sweep.Beads
+}
+
+// JiraSweepConfig configures the Jira port. Identity comes from
+// telegraph.toml (telegraph.mayor.jira_account_ids); the API token from the
+// environment variable named by TokenEnv. Durations are Go duration strings.
+type JiraSweepConfig struct {
+	Site     string   `json:"site,omitempty"`      // "example.atlassian.net"
+	Email    string   `json:"email,omitempty"`     // persona's Atlassian login for basic auth
+	TokenEnv string   `json:"token_env,omitempty"` // default "JIRA_API_TOKEN"
+	Projects []string `json:"projects,omitempty"`  // project keys to sweep
+	BoardID  int      `json:"board_id,omitempty"`  // Kanban board whose backlog means "off board"; 0 disables off-board
+	Humans   []string `json:"humans,omitempty"`    // account IDs the persona waits on
+	Bots     []string `json:"bots,omitempty"`      // account IDs that are never humans
+
+	ActiveStatuses []string `json:"active_statuses,omitempty"` // default To Do, Research, In Progress, In Review
+	WIPStatuses    []string `json:"wip_statuses,omitempty"`    // counted against WIPLimit; default In Progress, Research
+	WIPLimit       int      `json:"wip_limit,omitempty"`       // default 4
+
+	UnansweredAfter   string `json:"unanswered_after,omitempty"`    // default "4h"
+	ChaseAfter        string `json:"chase_after,omitempty"`         // default "24h"
+	StatusUpdateAfter string `json:"status_update_after,omitempty"` // default "72h"
+	OffBoardWindow    string `json:"off_board_window,omitempty"`    // default "168h"
+	StaleAfter        string `json:"stale_after,omitempty"`         // default "72h"
+}
+
+// JiraSweep returns the Jira port configuration, never nil.
+func (s *TownSettings) JiraSweep() *JiraSweepConfig {
+	if s == nil || s.Assistant == nil || s.Assistant.Sweep == nil || s.Assistant.Sweep.Jira == nil {
+		return &JiraSweepConfig{}
+	}
+	return s.Assistant.Sweep.Jira
 }
