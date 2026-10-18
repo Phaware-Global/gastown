@@ -266,10 +266,13 @@ type ghPR struct {
 			Commit ghCommit `json:"commit"`
 		} `json:"nodes"`
 	} `json:"commits"`
-	TimelineItems struct {
+	TimelineItems struct { // review-request events only
 		PageInfo ghPage           `json:"pageInfo"`
 		Nodes    []ghRequestEvent `json:"nodes"`
 	} `json:"timelineItems"`
+	ForcePushes struct { // newest force-push only; its own window so it never crowds requests out
+		Nodes []ghRequestEvent `json:"nodes"`
+	} `json:"forcePushes"`
 }
 
 type ghRepoData struct {
@@ -292,11 +295,42 @@ const githubRepoQuery = `query($owner:String!,$name:String!,$after:String){
         reviews(last:50){pageInfo{hasPreviousPage} nodes{author{login} state submittedAt commit{oid}}}
         reviewThreads(first:50){pageInfo{hasNextPage} nodes{isResolved comments(first:1){nodes{author{login} createdAt}}}}
         commits(last:1){nodes{commit{committedDate statusCheckRollup{state} checkSuites(last:1){nodes{createdAt}}}}}
-        timelineItems(last:30, itemTypes:[REVIEW_REQUESTED_EVENT, HEAD_REF_FORCE_PUSHED_EVENT]){pageInfo{hasPreviousPage} nodes{__typename ... on ReviewRequestedEvent{createdAt requestedReviewer{... on User{login}}} ... on HeadRefForcePushedEvent{createdAt}}}
+        timelineItems(last:30, itemTypes:[REVIEW_REQUESTED_EVENT]){pageInfo{hasPreviousPage} nodes{__typename ... on ReviewRequestedEvent{createdAt requestedReviewer{... on User{login}}}}}
+        forcePushes: timelineItems(last:1, itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{__typename ... on HeadRefForcePushedEvent{createdAt}}}
       }
     }
   }
 }`
+
+// githubPRPageQuery pages one PR's reviews and threads when the fixed
+// window in githubRepoQuery overflowed, so an outsider cannot turn the whole
+// port partial by flooding one PR.
+const githubPRPageQuery = `query($owner:String!,$name:String!,$number:Int!,$rcur:String,$tcur:String){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$number){
+      reviews(first:100, after:$rcur){pageInfo{hasNextPage endCursor} nodes{author{login} state submittedAt commit{oid}}}
+      reviewThreads(first:100, after:$tcur){pageInfo{hasNextPage endCursor} nodes{isResolved comments(first:1){nodes{author{login} createdAt}}}}
+    }
+  }
+}`
+
+// ghPRPage is one page of a PR's reviews and threads.
+type ghPRPage struct {
+	Reviews struct {
+		PageInfo struct {
+			HasNextPage bool   `json:"hasNextPage"`
+			EndCursor   string `json:"endCursor"`
+		} `json:"pageInfo"`
+		Nodes []ghReview `json:"nodes"`
+	} `json:"reviews"`
+	ReviewThreads struct {
+		PageInfo struct {
+			HasNextPage bool   `json:"hasNextPage"`
+			EndCursor   string `json:"endCursor"`
+		} `json:"pageInfo"`
+		Nodes []ghThread `json:"nodes"`
+	} `json:"reviewThreads"`
+}
 
 type ghClient struct {
 	ctx   context.Context
@@ -356,6 +390,71 @@ func (c *ghClient) repo(ref repoRef, after string) (*ghRepoData, error) {
 		return nil, fmt.Errorf("%s: %s", ref.slug(), msg)
 	}
 	return res.Data.Repository, nil
+}
+
+// prPage fetches one page of a PR's reviews and threads.
+func (c *ghClient) prPage(ref repoRef, number int, rcur, tcur string) (*ghPRPage, error) {
+	if c.trace != nil {
+		c.trace(fmt.Sprintf("POST /graphql repository(%s) pullRequest(%d) reviews/threads page", ref.slug(), number))
+	}
+	vars := map[string]any{"owner": ref.Owner, "name": ref.Name, "number": number}
+	if rcur != "" {
+		vars["rcur"] = rcur
+	}
+	if tcur != "" {
+		vars["tcur"] = tcur
+	}
+	body, _ := json.Marshal(map[string]any{"query": githubPRPageQuery, "variables": vars})
+	req, err := http.NewRequestWithContext(c.ctx, http.MethodPost, c.port.apiBase+"/graphql", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	var res struct {
+		Data struct {
+			Repository struct {
+				PullRequest *ghPRPage `json:"pullRequest"`
+			} `json:"repository"`
+		} `json:"data"`
+	}
+	if err := c.do(req, &res); err != nil {
+		return nil, err
+	}
+	if res.Data.Repository.PullRequest == nil {
+		return nil, fmt.Errorf("%s#%d: not found", ref.slug(), number)
+	}
+	return res.Data.Repository.PullRequest, nil
+}
+
+// fillPR replaces a PR's reviews and threads with the complete, paged lists
+// when the fixed window overflowed. It returns false when paging was cut
+// (budget or page cap), in which case the caller notes the PR as not fully
+// checked.
+func (c *ghClient) fillPR(ctx context.Context, ref repoRef, pr *ghPR) (bool, error) {
+	const maxPages = 10
+	var reviews []ghReview
+	var threads []ghThread
+	rcur, tcur := "", ""
+	moreR, moreT := true, true
+	for page := 0; moreR || moreT; page++ {
+		if page == maxPages || !timeLeft(ctx) {
+			return false, nil
+		}
+		pg, err := c.prPage(ref, pr.Number, rcur, tcur)
+		if err != nil {
+			return false, err
+		}
+		if moreR {
+			reviews = append(reviews, pg.Reviews.Nodes...)
+			moreR, rcur = pg.Reviews.PageInfo.HasNextPage, pg.Reviews.PageInfo.EndCursor
+		}
+		if moreT {
+			threads = append(threads, pg.ReviewThreads.Nodes...)
+			moreT, tcur = pg.ReviewThreads.PageInfo.HasNextPage, pg.ReviewThreads.PageInfo.EndCursor
+		}
+	}
+	pr.Reviews.Nodes, pr.Reviews.PageInfo = reviews, ghPage{}
+	pr.ReviewThreads.Nodes, pr.ReviewThreads.PageInfo = threads, ghPage{}
+	return true, nil
 }
 
 // --- the sweep -------------------------------------------------------------
@@ -420,21 +519,37 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	var out []Finding
 	var partial []string
 	note := func(format string, args ...any) { partial = append(partial, fmt.Sprintf(format, args...)) }
-	// One patrol-bead lookup per rig per sweep.
-	patrol := map[string]map[int]bool{}
+	// One patrol-bead lookup per rig per sweep, run under the budget: a
+	// hung bd turns into a note, never into the runner timeout. Failures
+	// are cached too, so a rig is tried once.
+	type patrolResult struct {
+		set map[int]bool
+		err error
+	}
+	patrol := map[string]patrolResult{}
 	owns := func(rig string, n int) (bool, error) {
-		set, ok := patrol[rig]
+		res, ok := patrol[rig]
 		if !ok {
-			var err error
-			if set, err = p.patrolBeads(rig); err != nil {
-				return false, err
+			if !timeLeft(ctx) {
+				res = patrolResult{err: fmt.Errorf("time budget exhausted")}
+			} else {
+				done := make(chan patrolResult, 1)
+				go func() {
+					set, err := p.patrolBeads(rig)
+					done <- patrolResult{set, err}
+				}()
+				select {
+				case res = <-done:
+				case <-ctx.Done():
+					res = patrolResult{err: fmt.Errorf("time budget exhausted waiting for bd")}
+				}
 			}
-			if set == nil {
-				set = map[int]bool{}
+			if res.set == nil {
+				res.set = map[int]bool{}
 			}
-			patrol[rig] = set
+			patrol[rig] = res
 		}
-		return set[n], nil
+		return res.set[n], res.err
 	}
 
 	for _, ref := range repos {
@@ -474,7 +589,15 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 			continue
 		}
 		for i := range open {
-			out = append(out, p.checkPR(ref, &open[i], in.Now, d, isPersona, isHuman, owns, note)...)
+			pr := &open[i]
+			if pr.Reviews.PageInfo.truncated() || pr.ReviewThreads.PageInfo.truncated() {
+				// Page this one PR instead of declaring the whole port partial
+				// over a window nobody has read.
+				if complete, err := c.fillPR(ctx, ref, pr); err != nil || !complete {
+					note("%s#%d: reviews or threads could not be paged in full; review state not fully checked", ref.slug(), pr.Number)
+				}
+			}
+			out = append(out, p.checkPR(ref, pr, in.Now, d, isPersona, isHuman, owns, note)...)
 		}
 	}
 	if len(partial) > 0 {
@@ -488,17 +611,17 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 	ours := isPersona[strings.ToLower(pr.Author.Login)]
 	head := pr.HeadRefOid
 	ci := "none"
-	// Fixed-window connections that did not fit mean the review state is
-	// not fully known: say so, which makes the port partial.
-	if pr.Reviews.PageInfo.truncated() || pr.ReviewThreads.PageInfo.truncated() || pr.ReviewRequests.PageInfo.truncated() || pr.TimelineItems.PageInfo.truncated() {
-		note("%s: more than the fetched window of reviews, threads, requests or events; review state not fully checked", key)
+	// Reviews and threads are paged by the caller when their window
+	// overflowed; only the request windows (author-controlled) remain fixed.
+	if pr.ReviewRequests.PageInfo.truncated() || pr.TimelineItems.PageInfo.truncated() {
+		note("%s: more than the fetched window of review requests; request times not fully checked", key)
 	}
-	// Push time: the head's newest check suite, else the latest force-push
-	// event, else the committer date (pushedDate is always null).
+	// Push time: the head's newest check suite, else the later of the latest
+	// force-push event and the committer date (pushedDate is always null).
 	pushed := pr.CreatedAt
 	var forcePushed time.Time
-	for _, ev := range pr.TimelineItems.Nodes {
-		if ev.Typename == "HeadRefForcePushedEvent" && ev.CreatedAt.After(forcePushed) {
+	for _, ev := range pr.ForcePushes.Nodes {
+		if ev.CreatedAt.After(forcePushed) {
 			forcePushed = ev.CreatedAt
 		}
 	}
@@ -507,7 +630,7 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 		switch {
 		case len(cm.CheckSuites.Nodes) > 0 && !cm.CheckSuites.Nodes[0].CreatedAt.IsZero():
 			pushed = cm.CheckSuites.Nodes[0].CreatedAt
-		case !forcePushed.IsZero():
+		case forcePushed.After(cm.CommittedDate):
 			pushed = forcePushed
 		case !cm.CommittedDate.IsZero():
 			pushed = cm.CommittedDate
@@ -624,16 +747,20 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 		l = strings.ToLower(l)
 		return l == "" || isPersona[l] || isHuman[l] || strings.EqualFold(l, ref.Reviewer)
 	}
-	var strangers []string
+	strangerSet := map[string]bool{}
 	for _, rr := range pr.ReviewRequests.Nodes {
-		if l := rr.RequestedReviewer.Login; !known(l) {
-			strangers = append(strangers, l)
+		if l := strings.ToLower(rr.RequestedReviewer.Login); !known(l) {
+			strangerSet[l] = true
 		}
 	}
 	for _, r := range pr.Reviews.Nodes {
-		if l := r.Author.Login; !known(l) && (r.State == "APPROVED" || r.State == "CHANGES_REQUESTED") {
-			strangers = append(strangers, strings.ToLower(l))
+		if l := strings.ToLower(r.Author.Login); !known(l) && (r.State == "APPROVED" || r.State == "CHANGES_REQUESTED") {
+			strangerSet[l] = true
 		}
+	}
+	var strangers []string
+	for l := range strangerSet {
+		strangers = append(strangers, l)
 	}
 	if len(strangers) > 0 {
 		sort.Strings(strangers)
