@@ -239,7 +239,7 @@ func TestRenderRole_MayorTrustBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderRole(mayor) error = %v", err)
 	}
-	for _, want := range []string{"Trust Boundary", "EXTERNAL CONTENT", "assistant/", "telegraph/*", "[neutralized\ndelimiter]", "**advisory**", "telegraph.prompts.toml"} {
+	for _, want := range []string{"Trust Boundary", "EXTERNAL CONTENT", "assistant/", "telegraph/*", "[neutralized\ndelimiter]", "**advisory**", "telegraph.prompts.toml", "`default` key", "word for word one of the known per-provider"} {
 		if !strings.Contains(output, want) {
 			t.Errorf("mayor template missing trust-boundary text %q", want)
 		}
