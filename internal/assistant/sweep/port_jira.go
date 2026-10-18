@@ -596,7 +596,9 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		}
 		// The persona asked (or is blocked) and no listed human has answered
 		// since; bot or unlisted comments in between do not count as answers.
-		if age := in.Now.Sub(lastPersona); involved && !lastPersona.IsZero() && !humanAfter && age >= d.chase && age <= d.maxAge {
+		// A Blocked issue never ages out: no other kind covers it, so the
+		// most stalled ticket must not go silent after maxAge.
+		if age := in.Now.Sub(lastPersona); involved && !lastPersona.IsZero() && !humanAfter && age >= d.chase && (age <= d.maxAge || strings.EqualFold(status, "Blocked")) {
 			text := lastPersonaText
 			if strings.Contains(text, "?") || strings.EqualFold(status, "Blocked") {
 				fd := base("question-unanswered", SeverityActionable)

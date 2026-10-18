@@ -291,10 +291,12 @@ func TestJiraPort_UnansweredMaxAge(t *testing.T) {
 		issues: []map[string]any{
 			issue("P23-15", "In Progress", "indeterminate", humanID, 900*h, 800*h, "old human ask"),
 			issue("P23-16", "In Progress", "indeterminate", personaID, 900*h, 800*h, "old persona question"),
+			issue("P23-17", "Blocked", "indeterminate", personaID, 900*h, 800*h, "old blocked wait"),
 		},
 		comments: map[string][]map[string]any{
 			"P23-15": {comment("1501", humanID, 800*h, "still relevant?", ""), comment("1500", personaID, 850*h, "done", "")},
 			"P23-16": {comment("1601", personaID, 800*h, "which env?", "")},
+			"P23-17": {comment("1701", personaID, 800*h, "waiting on infra", "")},
 		},
 	}
 	for _, c := range []struct {
@@ -315,6 +317,9 @@ func TestJiraPort_UnansweredMaxAge(t *testing.T) {
 			if got[id] != c.want {
 				t.Errorf("max_age=%q: %s present=%v, want %v (got %v)", c.maxAge, id, got[id], c.want, got)
 			}
+		}
+		if !got["question-unanswered/P23-17"] {
+			t.Errorf("max_age=%q: a Blocked issue's wait must never age out (got %v)", c.maxAge, got)
 		}
 	}
 }
