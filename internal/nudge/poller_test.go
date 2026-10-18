@@ -123,13 +123,23 @@ func TestPollerAlive_LiveProcess(t *testing.T) {
 	townRoot := t.TempDir()
 	session := "gt-gastown-crew-test"
 
-	// Write our own PID — we're definitely alive.
+	// A live process whose command line reads like this session's poller
+	// ("… nudge-poller <session>"): the test binary itself would not pass
+	// the command-line check and must not.
+	if runtime.GOOS == "windows" {
+		t.Skip("command-line inspection is unix-only")
+	}
+	child := exec.Command("sh", "-c", "sleep 30; exit 0", "nudge-poller", session) // "; exit 0" keeps sh from exec'ing sleep, so the argv survives
+	if err := child.Start(); err != nil {
+		t.Fatalf("starting child: %v", err)
+	}
+	defer func() { _ = child.Process.Kill(); _, _ = child.Process.Wait() }()
 	pidDir := pollerPidDir(townRoot)
 	if err := os.MkdirAll(pidDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 	pidPath := pollerPidFile(townRoot, session)
-	myPid := os.Getpid()
+	myPid := child.Process.Pid
 	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(myPid)), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -179,5 +189,38 @@ func TestSetProcessGroup_InstallsCancelHook(t *testing.T) {
 
 	if cmd.Cancel == nil {
 		t.Fatal("SetProcessGroup() should install a cancel hook")
+	}
+}
+
+// A PID file whose PID was reused by an unrelated live process must be
+// cleaned up, never signaled: StopPoller leaves the process running.
+func TestStopPoller_IgnoresReusedPID(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("command-line inspection is unix-only")
+	}
+	townRoot := t.TempDir()
+	child := exec.Command("sleep", "30")
+	if err := child.Start(); err != nil {
+		t.Fatalf("starting child: %v", err)
+	}
+	defer func() { _ = child.Process.Kill(); _, _ = child.Process.Wait() }()
+	if err := os.MkdirAll(pollerPidDir(townRoot), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pidPath := pollerPidFile(townRoot, "hq-assistant")
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(child.Process.Pid)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := StopPoller(townRoot, "hq-assistant"); err != nil {
+		t.Fatalf("StopPoller: %v", err)
+	}
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Errorf("stale PID file must be removed, stat err=%v", err)
+	}
+	if !pollerProcessAlive(child.Process.Pid) {
+		t.Fatal("StopPoller signaled an unrelated process that merely reused the PID")
+	}
+	if pid, alive := pollerAlive(townRoot, "hq-assistant"); alive || pid != 0 {
+		t.Errorf("pollerAlive must not report a reused PID as a poller: %d %v", pid, alive)
 	}
 }

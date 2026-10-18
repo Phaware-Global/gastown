@@ -57,6 +57,9 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("invalid --interval: %w", err)
 	}
+	// Clean up the PID file on every exit path (session gone, signal), so a
+	// stale file never names a PID that another process may later reuse.
+	defer nudge.RemoveOwnPollerPidFile(townRoot, sessionName)
 
 	idleTimeout, err := time.ParseDuration(nudgePollerIdleFlag)
 	if err != nil {
