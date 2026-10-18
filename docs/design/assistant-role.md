@@ -502,10 +502,10 @@ persona is involved in (assignee, reporter, or @-mentioned) unless noted.
 | `release-wave-stale` | open "Release wave" parent whose subtasks have not changed for `stale_after` | Release-wave skill: waves stall after UAT |
 
 `review-handoff` and `done-not-in-uat` need the linked pull request's
-state as well as the issue's, so they land with the GitHub port rather than
-with the Jira port; the Jira port alone ships the other six kinds plus an
-`unknown-actor` note (a comment by an account that is neither the persona,
-a listed human nor a listed bot).
+state as well as the issue's, so they land after the GitHub port rather
+than with the Jira port; the Jira port alone ships the other six kinds plus
+an `unknown-actor` note (a comment by an account that is neither the
+persona, a listed human nor a listed bot).
 
 Explicitly **not** findings, because the sweep history shows they are noise:
 rank-only updates (board reordering logs an `issue.updated` with no field
@@ -601,9 +601,11 @@ write to the external system; the assistant reports, the Mayor acts.
 
 Adds layers to the stack between the sweep-migration PR and the template
 PR: the sweep runner (schema enforcement, fencing, ack-gated state), the
-beads port with `gt assistant sweep`, the Jira port, then the GitHub port
-with the two PR-linked Jira kinds. The template PR then replaces the inline
-`bd` queries with the command. Each external port lands with a
+beads port with `gt assistant sweep`, the Jira port, the GitHub port's open
+pull-request kinds, then a final layer with `release-unclosed` and the two
+PR-linked Jira kinds (`review-handoff`, `done-not-in-uat`), which read both
+systems. The template PR then replaces the inline `bd` queries with the
+command. Each external port lands with a
 recorded-response test suite for its API queries and a dry-run mode that
 prints the queries it would issue instead of calling the API.
 
