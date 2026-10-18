@@ -79,9 +79,10 @@ func (e *PartialError) Error() string { return "partial result: " + e.Reason }
 
 // Standing summarises acknowledged, unchanged findings of one kind.
 type Standing struct {
-	Kind   string    `json:"kind"`
-	Count  int       `json:"count"`
-	Oldest time.Time `json:"oldest,omitempty"`
+	Kind     string    `json:"kind"`
+	Severity string    `json:"severity,omitempty"` // overflow only: worst severity among the counted findings
+	Count    int       `json:"count"`
+	Oldest   time.Time `json:"oldest,omitempty"`
 }
 
 // PortResult is one port's contribution to a report.

@@ -52,11 +52,11 @@ func Markdown(r *Report) string {
 			}
 		}
 		for _, o := range p.Overflow {
-			fmt.Fprintf(&b, "\n… and %d more new %s not shown", o.Count, o.Kind)
+			fmt.Fprintf(&b, "\n… and %d more new %s not shown (worst: %s", o.Count, o.Kind, o.Severity)
 			if !o.Oldest.IsZero() {
-				fmt.Fprintf(&b, " (oldest %s)", humanAge(r.GeneratedAt.Sub(o.Oldest)))
+				fmt.Fprintf(&b, ", oldest %s", humanAge(r.GeneratedAt.Sub(o.Oldest)))
 			}
-			b.WriteByte('\n')
+			b.WriteString(")\n")
 		}
 		for _, s := range p.Standing {
 			fmt.Fprintf(&b, "\nstanding: %s ×%d", s.Kind, s.Count)

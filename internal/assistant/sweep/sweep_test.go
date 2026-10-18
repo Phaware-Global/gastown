@@ -567,7 +567,7 @@ func TestRun_CapsNewFindingsPerKind(t *testing.T) {
 	if res.New[0].Kind != "blocked" || res.New[1].Key != "gt-29" {
 		t.Errorf("order must be severity then oldest first: %s %s", res.New[0].Kind, res.New[1].Key)
 	}
-	if md := Markdown(rep); !strings.Contains(md, "and 5 more new unslung not shown") {
+	if md := Markdown(rep); !strings.Contains(md, "and 5 more new unslung not shown (worst: info, oldest") {
 		t.Errorf("overflow line missing:\n%s", md)
 	}
 	if err := r.Store.Ack(rep.RunID, r.Now()); err != nil {
@@ -576,5 +576,44 @@ func TestRun_CapsNewFindingsPerKind(t *testing.T) {
 	rep2, _ := r.Run(context.Background(), Options{})
 	if len(rep2.Ports[0].New) != 0 || len(rep2.Ports[0].Overflow) != 0 || rep2.Ports[0].Standing[1].Count != MaxNewPerKind+5 {
 		t.Errorf("acking the report must acknowledge the counted findings too: %+v", rep2.Ports[0])
+	}
+}
+
+func TestRun_CapNeverHidesUrgentOrUndatedOrder(t *testing.T) {
+	var many []Finding
+	for i := 0; i < MaxNewPerKind+3; i++ {
+		many = append(many, Finding{Kind: "k", Key: fmt.Sprintf("u-%d", i), Fingerprint: "a", Severity: SeverityUrgent})
+	}
+	for i := 0; i < MaxNewPerKind; i++ { // undated info findings …
+		many = append(many, Finding{Kind: "j", Key: fmt.Sprintf("n-%d", i), Fingerprint: "a", Severity: SeverityInfo})
+	}
+	// … must not push a 30-day-old dated one past the cap; an actionable overflow keeps its severity.
+	many = append(many, Finding{Kind: "j", Key: "old", Fingerprint: "a", Severity: SeverityInfo, Since: time.Unix(1, 0)})
+	for i := 0; i < MaxNewPerKind+1; i++ {
+		many = append(many, Finding{Kind: "m", Key: fmt.Sprintf("a-%d", i), Fingerprint: "a", Severity: SeverityActionable})
+	}
+	rep, _ := newTestRunner(t, &fakePort{name: "x", findings: many}).Run(context.Background(), Options{})
+	res := rep.Ports[0]
+	urgent, shownOld := 0, false
+	for _, f := range res.New {
+		if f.Severity == SeverityUrgent {
+			urgent++
+		}
+		if f.Key == "old" {
+			shownOld = true
+		}
+	}
+	if urgent != MaxNewPerKind+3 {
+		t.Errorf("urgent findings must never be capped: %d shown", urgent)
+	}
+	if !shownOld {
+		t.Error("a dated finding must rank before undated ones within a severity")
+	}
+	sev := map[string]string{}
+	for _, o := range res.Overflow {
+		sev[o.Kind] = o.Severity
+	}
+	if sev["m"] != SeverityActionable || sev["j"] != SeverityInfo || sev["k"] != "" {
+		t.Errorf("overflow severities: %v", sev)
 	}
 }

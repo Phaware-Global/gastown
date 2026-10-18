@@ -118,6 +118,9 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Report, error) {
 			if severityRank(a.Severity) != severityRank(b.Severity) {
 				return severityRank(a.Severity) < severityRank(b.Severity)
 			}
+			if a.Since.IsZero() != b.Since.IsZero() {
+				return !a.Since.IsZero() // dated before undated within a severity
+			}
 			return a.Since.Before(b.Since) // oldest first within a severity
 		})
 		res.New, res.Overflow = capPerKind(res.New, MaxNewPerKind)
@@ -137,13 +140,14 @@ func (r *Runner) Run(ctx context.Context, opts Options) (*Report, error) {
 }
 
 // capPerKind keeps at most max findings of each kind (in the given order)
-// and returns the rest as per-kind counts with the oldest Since.
+// and returns the rest as per-kind counts with the oldest Since and the
+// worst severity among them. Urgent findings are never capped.
 func capPerKind(findings []Finding, max int) ([]Finding, []Standing) {
 	shown := map[string]int{}
 	over := map[string]*Standing{}
 	var kept []Finding
 	for _, f := range findings {
-		if shown[f.Kind] < max {
+		if f.Severity == SeverityUrgent || shown[f.Kind] < max {
 			shown[f.Kind]++
 			kept = append(kept, f)
 			continue
@@ -154,6 +158,9 @@ func capPerKind(findings []Finding, max int) ([]Finding, []Standing) {
 			over[f.Kind] = o
 		}
 		o.Count++
+		if o.Severity == "" || severityRank(f.Severity) < severityRank(o.Severity) {
+			o.Severity = f.Severity
+		}
 		if o.Oldest.IsZero() || (!f.Since.IsZero() && f.Since.Before(o.Oldest)) {
 			o.Oldest = f.Since
 		}
