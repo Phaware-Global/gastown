@@ -585,18 +585,20 @@ which already mail the assistant; the port does not duplicate them.
 
 ### Adding a port
 
-A new port (Azure DevOps approvals, Slack mentions, …) is one Go package
-under `internal/assistant/sweep/<name>` implementing `Port`, a config block
-under `assistant.sweep.<name>`, and a row in this document. Ports never
+A new port (Azure DevOps approvals, Slack mentions, …) is a `Port`
+implementation in `internal/assistant/sweep` (`port_<name>.go`, registered in
+`NewRunner`), a config block under `assistant.sweep.<name>`, and a row in
+this document. Ports never
 write to the external system; the assistant reports, the Mayor acts.
 
 ### Delivery
 
-Adds three layers to the stack after the template PR: the sweep runner with
-the beads port and `gt assistant sweep` (plus the template change that
-replaces the inline `bd` queries with the command), then the Jira port, then
-the GitHub port. Each port lands with a recorded-response test suite for its
-API queries and a dry-run mode that prints the queries it would issue.
+Adds four layers to the stack between the sweep-migration PR and the
+template PR: the sweep runner (schema enforcement, fencing, ack-gated state),
+the beads port with `gt assistant sweep`, the Jira port, and the GitHub port.
+The template PR then replaces the inline `bd` queries with the command. Each
+external port lands with a recorded-response test suite for its API queries
+and a dry-run mode that prints the queries it would issue.
 
 ## Configuration reference
 
