@@ -314,39 +314,64 @@ var _ = fmt.Sprint
 
 func TestJiraPort_BudgetCutsInFlightCallAndKeepsFindings(t *testing.T) {
 	h := time.Hour
-	fx := &jiraFixture{
-		issues: []map[string]any{
-			issue("P23-1", "In Progress", "indeterminate", humanID, 240*h, 5*h, "fast"),
-			issue("P23-2", "In Progress", "indeterminate", humanID, 240*h, 5*h, "slow"),
-			issue("P23-3", "In Progress", "indeterminate", humanID, 240*h, 5*h, "never reached"),
-		},
-		comments: map[string][]map[string]any{
-			"P23-1": {comment("101", humanID, 5*h, "a?", "")},
-			"P23-2": {comment("201", humanID, 5*h, "b?", "")},
-			"P23-3": {comment("301", humanID, 5*h, "c?", "")},
-		},
-		slowKey: "P23-2", slowFor: 2 * time.Second,
+	newFixture := func() *jiraFixture {
+		return &jiraFixture{
+			issues: []map[string]any{
+				issue("P23-1", "In Progress", "indeterminate", humanID, 240*h, 5*h, "fast"),
+				issue("P23-2", "In Progress", "indeterminate", humanID, 240*h, 5*h, "slow"),
+				issue("P23-3", "In Progress", "indeterminate", humanID, 240*h, 5*h, "never reached"),
+			},
+			comments: map[string][]map[string]any{
+				"P23-1": {comment("101", humanID, 5*h, "a?", "")},
+				"P23-2": {comment("201", humanID, 5*h, "b?", "")},
+				"P23-3": {comment("301", humanID, 5*h, "c?", "")},
+			},
+			slowKey: "P23-2", slowFor: 5 * time.Second,
+		}
 	}
-	p, in := newJiraTest(t, fx, []string{personaID})
-	old := budgetMargin
-	budgetMargin = 50 * time.Millisecond
-	defer func() { budgetMargin = old }()
-	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	keysOfFindings := func(fs []Finding) map[string]bool {
+		keys := map[string]bool{}
+		for _, f := range fs {
+			keys[f.Key] = true
+		}
+		return keys
+	}
+
+	// 1. The margin is observable: with a 1 s deadline and a 600 ms margin,
+	//    Sweep returns around the 400 ms mark, well before the parent
+	//    deadline, with the earlier findings and a partial note.
+	oldMargin := budgetMargin
+	budgetMargin = 600 * time.Millisecond
+	defer func() { budgetMargin = oldMargin }()
+	p, in := newJiraTest(t, newFixture(), []string{personaID})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	start := time.Now()
 	findings, err := p.Sweep(ctx, in)
+	elapsed := time.Since(start)
 	var partial *PartialError
 	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "time budget") {
-		t.Fatalf("a cut call must yield a partial result, got %v after %s", err, time.Since(start))
+		t.Fatalf("a cut call must yield a partial result, got %v after %s", err, elapsed)
 	}
-	if time.Since(start) > time.Second {
-		t.Errorf("the in-flight call must be cancelled at the margin, took %s", time.Since(start))
+	if elapsed > 800*time.Millisecond {
+		t.Errorf("Sweep must return at the margin (~400 ms), not at the parent deadline: took %s", elapsed)
 	}
-	keys := map[string]bool{}
-	for _, f := range findings {
-		keys[f.Key] = true
-	}
-	if !keys["P23-1"] || keys["P23-3"] {
+	if keys := keysOfFindings(findings); !keys["P23-1"] || keys["P23-3"] {
 		t.Errorf("findings before the cut must survive and none after it: %v", keys)
+	}
+
+	// 2. Through the runner: with PortTimeout lowered, the port must come
+	//    back as a partial result carrying P23-1, not as "port did not
+	//    return" (which would discard everything).
+	oldTimeout := PortTimeout
+	PortTimeout = time.Second
+	defer func() { PortTimeout = oldTimeout }()
+	p2, in2 := newJiraTest(t, newFixture(), []string{personaID})
+	findings, err = runPort(context.Background(), p2, in2)
+	if !errors.As(err, &partial) {
+		t.Fatalf("through runPort the port must return a PartialError before PortTimeout, got %v", err)
+	}
+	if keys := keysOfFindings(findings); !keys["P23-1"] {
+		t.Errorf("runPort must receive the findings collected before the cut: %v", keys)
 	}
 }
