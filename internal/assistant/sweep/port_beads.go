@@ -2,6 +2,8 @@ package sweep
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -14,6 +16,14 @@ import (
 
 // DefaultBeadsStaleAfter is the beads port's staleness window when unset.
 const DefaultBeadsStaleAfter = 72 * time.Hour
+
+// Page caps: a result that fills its cap may be truncated, which the port
+// reports as partial so standing entries beyond the cut are never evicted.
+const (
+	beadsReadyCap  = 100 // bd ready default limit
+	beadsListCap   = 1000
+	beadsConvoyCap = 500
+)
 
 // beadsSource is the slice of *beads.Beads the port needs, so tests can
 // substitute a fake.
@@ -31,7 +41,7 @@ type BeadsPort struct {
 	// open returns the beads client for a directory; replaced in tests.
 	open func(dir string) beadsSource
 	// rigs returns the registered rig names; replaced in tests.
-	rigs func() []string
+	rigs func() ([]string, error)
 }
 
 // NewBeadsPort returns the production beads port.
@@ -39,16 +49,19 @@ func NewBeadsPort(townRoot string) *BeadsPort {
 	return &BeadsPort{
 		townRoot: townRoot,
 		open:     func(dir string) beadsSource { return beads.New(dir) },
-		rigs: func() []string {
+		rigs: func() ([]string, error) {
 			cfg, err := config.LoadRigsConfig(constants.MayorRigsPath(townRoot))
-			if err != nil || cfg == nil {
-				return nil
+			if err != nil {
+				return nil, err
+			}
+			if cfg == nil {
+				return nil, fmt.Errorf("rigs registry %s is empty", constants.MayorRigsPath(townRoot))
 			}
 			var names []string
 			for name := range cfg.Rigs {
 				names = append(names, name)
 			}
-			return names
+			return names, nil
 		},
 	}
 }
@@ -98,14 +111,20 @@ func (p *BeadsPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		partial = append(partial, "escalations: "+err.Error())
 	}
 	for _, i := range esc {
+		if beads.HasLabel(i, "acked") {
+			continue // the Mayor already acknowledged it; acking again only resets the clock
+		}
 		if age := in.Now.Sub(updatedAt(i, in.Now)); age >= stale {
 			out = append(out, p.finding("stalled-decision", "hq", i, in.Now, SeverityActionable,
 				fmt.Sprintf("decide or `gt escalate ack %s`", i.ID)))
 		}
 	}
-	convoys, err := hq.List(beads.ListOptions{Status: "open", Label: "gt:convoy", Priority: -1, Limit: 500})
+	convoys, err := hq.List(beads.ListOptions{Status: "open", Label: "gt:convoy", Priority: -1, Limit: beadsConvoyCap})
 	if err != nil {
 		partial = append(partial, "convoys: "+err.Error())
+	}
+	if len(convoys) >= beadsConvoyCap {
+		partial = append(partial, fmt.Sprintf("convoys truncated at %d", beadsConvoyCap))
 	}
 	for _, i := range convoys {
 		if in.Now.Sub(updatedAt(i, in.Now)) >= stale {
@@ -113,18 +132,27 @@ func (p *BeadsPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		}
 	}
 
-	for _, rig := range p.rigs() {
+	rigs, err := p.rigs()
+	if err != nil {
+		partial = append(partial, "rigs: "+err.Error())
+	}
+	for _, rig := range rigs {
 		if ctx.Err() != nil {
 			partial = append(partial, "timeout before rig "+rig)
 			break
 		}
 		src := p.open(filepath.Join(p.townRoot, rig))
-		open, err := src.List(beads.ListOptions{Status: "open", Priority: -1, Limit: 1000})
+		// in_progress and hooked are stored statuses: "open" would never match
+		// them, and asking for "hooked" also unions the hooked wisps.
+		active, err := src.List(beads.ListOptions{Status: "in_progress,hooked", Priority: -1, Limit: beadsListCap})
 		if err != nil {
 			partial = append(partial, rig+": list: "+err.Error())
 		}
-		for _, i := range open {
-			if (i.Status == "in_progress" || i.Status == "hooked") && in.Now.Sub(updatedAt(i, in.Now)) >= stale {
+		if len(active) >= beadsListCap {
+			partial = append(partial, fmt.Sprintf("%s: active list truncated at %d", rig, beadsListCap))
+		}
+		for _, i := range active {
+			if in.Now.Sub(updatedAt(i, in.Now)) >= stale {
 				out = append(out, p.finding("stalled", rig, i, in.Now, SeverityActionable, "reassign, sling onward, or close with reason"))
 			}
 		}
@@ -143,7 +171,13 @@ func (p *BeadsPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		if err != nil {
 			partial = append(partial, rig+": ready: "+err.Error())
 		}
+		if len(ready) >= beadsReadyCap {
+			partial = append(partial, fmt.Sprintf("%s: ready list truncated at %d", rig, beadsReadyCap))
+		}
 		for _, i := range ready {
+			if beads.HasLabel(i, "gt:escalation") {
+				continue // escalations are decisions, not slingable work
+			}
 			if i.HookBead == "" && i.Assignee == "" {
 				out = append(out, p.finding("unslung", rig, i, in.Now, SeverityInfo, fmt.Sprintf("`gt sling %s %s`", i.ID, rig)))
 			}
@@ -155,14 +189,26 @@ func (p *BeadsPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	return out, nil
 }
 
+// finding builds a Finding for a bead. A bead ID is operator-chosen text
+// (`bd create --id` accepts anything with a hyphen), so an ID outside
+// ShapeBeadID never reaches Key or Suggest: the Key becomes a hash
+// placeholder, the raw ID is fenced under External["id"], and the
+// suggestion (which would quote the ID) is dropped.
 func (p *BeadsPort) finding(kind, rig string, i *beads.Issue, now time.Time, severity, suggest string) Finding {
 	upd := updatedAt(i, now)
-	return Finding{
+	f := Finding{
 		Kind: kind, Key: i.ID, Since: upd, Severity: severity, Suggest: suggest,
 		Fields:      map[string]string{"status": i.Status, "priority": fmt.Sprint(i.Priority), "updated": upd.UTC().Format(time.RFC3339), "rig": rig},
 		External:    map[string]string{"title": i.Title},
 		Fingerprint: i.Status + "|" + i.UpdatedAt + "|" + i.Assignee,
 	}
+	if !ValidShape(ShapeBeadID, i.ID) {
+		sum := sha256.Sum256([]byte(i.ID))
+		f.Key = "invalid-id-" + hex.EncodeToString(sum[:6])
+		f.External["id"] = i.ID
+		f.Suggest = ""
+	}
+	return f
 }
 
 // updatedAt parses a bead timestamp in either format bd emits; an unparseable
