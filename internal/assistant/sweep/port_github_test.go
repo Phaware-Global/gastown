@@ -160,7 +160,7 @@ func TestGitHubPort_Findings(t *testing.T) {
 			t.Errorf("unexpected %s", absent)
 		}
 	}
-	if f := got["review-waiting/acme/app#2@kevin"]; f.Fields["human"] != "kevin" || f.Fingerprint != "kevin|1" || !strings.Contains(f.Suggest, "on acme/app#2@kevin") {
+	if f := got["review-waiting/acme/app#2@kevin"]; f.Fields["human"] != "kevin" || f.Fingerprint != "kevin|"+ago(30*time.Hour).UTC().Format(time.RFC3339)+"|1" || !strings.Contains(f.Suggest, "on acme/app#2@kevin") {
 		t.Errorf("review-waiting: %+v", f)
 	}
 	if f := got["ready-for-human-review/acme/app#1"]; f.Fields["approver"] != "kevin" || !strings.Contains(f.Suggest, "kevin") {

@@ -566,16 +566,18 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 			continue // they reviewed this head
 		}
 		if age := now.Sub(at); age >= d.remind {
-			// Keyed per requested human; the fingerprint counts remind_after
-			// periods since the request and ignores the head, so a new push
-			// on an unchanged request never re-pings on its own.
+			// Keyed per requested human; the fingerprint carries the request
+			// time and the remind_after periods since it, and ignores the
+			// head: a new push on an unchanged request never re-pings on its
+			// own, while a re-request starts a fresh cycle even if a partial
+			// port kept the old entry from being evicted.
 			f := base("review-waiting", SeverityActionable)
 			f.Key = key + "@" + login
 			f.Since = at
 			f.Fields["human"] = login
 			f.Fields["requested_at"] = at.UTC().Format(time.RFC3339)
 			f.Suggest = "re-ping " + login + " on " + f.Key
-			f.Fingerprint = fmt.Sprintf("%s|%d", login, int(age/d.remind)) // once per remind_after
+			f.Fingerprint = fmt.Sprintf("%s|%s|%d", login, at.UTC().Format(time.RFC3339), int(age/d.remind)) // once per remind_after per request
 			out = append(out, f)
 		}
 	}
