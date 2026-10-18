@@ -71,7 +71,7 @@ type Gate struct {
 	Duration string `json:"duration,omitempty" toml:"duration,omitempty"`
 
 	// DurationSetting optionally names a town setting (settings/config.json)
-	// whose value overrides Duration for cooldown gates. Recognised values:
+	// whose value overrides Duration for cooldown gates. Recognized values:
 	// "assistant_sweep_interval". See (*Gate).CooldownDuration.
 	DurationSetting string `json:"duration_setting,omitempty" toml:"duration_setting,omitempty"`
 
