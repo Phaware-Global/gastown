@@ -173,7 +173,7 @@ func (l *ghLinks) load(keys []string) {
 	}
 }
 
-func (l *ghLinks) check(ref repoRef, open []ghPR, merged []ghPR, patterns []string, now time.Time, d githubDurations, isHuman map[string]bool) []Finding {
+func (l *ghLinks) check(open []ghPR, merged []ghPR, patterns []string, now time.Time, d githubDurations, isHuman map[string]bool) []Finding {
 	if l == nil {
 		return nil
 	}
