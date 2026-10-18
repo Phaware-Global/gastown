@@ -83,6 +83,8 @@ type ghFixture struct {
 	pageErr     int                    // 1-based page index that answers with errors and null connections (0 = none)
 	pageErrMode string                 // "both" (default): errors + null connections; "errors": errors with valid data; "null": null connections, no errors
 	fieldErrPR  int                    // repo query: this PR's reviews come back null and an errors entry is attached
+	nullNodePR  int                    // repo query: this PR's whole node comes back null (NON_NULL field denied)
+	pageQueries []int                  // PR numbers the per-PR paging query was asked for
 	patrolCalls atomic.Int32
 	patrolDelay time.Duration // patrolBeads sleeps this long
 }
@@ -110,6 +112,7 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 			slug := body.Variables["owner"].(string) + "/" + body.Variables["name"].(string)
 			if strings.Contains(body.Query, "pullRequest(number:$number)") {
 				n := int(body.Variables["number"].(float64))
+				fx.pageQueries = append(fx.pageQueries, n)
 				if pages := fx.pages[n]; pages != nil {
 					idx := 0
 					if cur, _ := body.Variables["rcur"].(string); cur != "" {
@@ -151,6 +154,20 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 			data := fx.repos[slug]
 			if data == nil {
 				_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": nil}, "errors": []map[string]string{{"message": "Could not resolve to a Repository"}}})
+				return
+			}
+			if fx.nullNodePR > 0 {
+				raw, _ := json.Marshal(data)
+				var m map[string]any
+				_ = json.Unmarshal(raw, &m)
+				nodes := m["open"].(map[string]any)["nodes"].([]any)
+				for i, n := range nodes {
+					if int(n.(map[string]any)["number"].(float64)) == fx.nullNodePR {
+						nodes[i] = nil
+					}
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": m},
+					"errors": []map[string]any{{"message": "Resource not accessible by personal access token", "type": "FORBIDDEN", "path": []any{"repository", "open", "nodes", 0, "reviewThreads"}}}})
 				return
 			}
 			if fx.fieldErrPR > 0 {
@@ -574,5 +591,27 @@ func TestGitHubPort_GraphQLErrorGuardsPinnedSeparately(t *testing.T) {
 	}
 	if !keys["changes-requested-stale/acme/app#70"] || !keys["no-review-loop/acme/app#71"] {
 		t.Errorf("the repo's PRs must still be checked and the null connection paged: %v", keys)
+	}
+	// repo(): a denied NON_NULL field nulls the whole node; it is named and
+	// skipped, never paged as phantom PR #0, and the other PR is checked.
+	app = &ghRepoData{}
+	app.Open.Nodes = []ghPR{pr(80, "artie", 60*h, 40*h, "SUCCESS"), pr(81, "artie", 3*h, 3*h, "PENDING")}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, nullNodePR: 80}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	findings, err = p.Sweep(context.Background(), in)
+	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "open PR at index 0 came back null") {
+		t.Fatalf("a null node must be named in the partial note: %v", err)
+	}
+	for _, n := range fx.pageQueries {
+		if n == 0 {
+			t.Error("a null node must never be paged as PR #0")
+		}
+	}
+	keys = map[string]bool{}
+	for _, f := range findings {
+		keys[f.Kind+"/"+f.Key] = true
+	}
+	if !keys["no-review-loop/acme/app#81"] {
+		t.Errorf("the other PR must still be checked: %v", keys)
 	}
 }

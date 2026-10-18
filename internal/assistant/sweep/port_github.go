@@ -214,6 +214,10 @@ type ghThread struct {
 
 // UnmarshalJSON decodes a PR and remembers which connections came back null.
 func (p *ghPR) UnmarshalJSON(b []byte) error {
+	if string(bytes.TrimSpace(b)) == "null" {
+		*p = ghPR{nodeNull: true}
+		return nil
+	}
 	type alias ghPR
 	var a alias
 	if err := json.Unmarshal(b, &a); err != nil {
@@ -266,6 +270,7 @@ type ghRequestEvent struct {
 // a FORBIDDEN from a least-privilege token), which must never read as "no
 // reviews": such a PR is paged separately or reported as not fully checked.
 type ghPR struct {
+	nodeNull                 bool // the whole node came back null (a NON_NULL field was denied): unknown PR, never paged
 	reviewsNull, threadsNull bool
 
 	Number         int       `json:"number"`
@@ -668,6 +673,12 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		}
 		for i := range open {
 			pr := &open[i]
+			if pr.nodeNull {
+				// A denied NON_NULL field nulls the whole node: GitHub gave us no
+				// number to page, so name the slot and move on.
+				note("%s: open PR at index %d came back null (a field was denied); not checked", ref.slug(), i)
+				continue
+			}
 			if pr.Reviews.PageInfo.truncated() || pr.ReviewThreads.PageInfo.truncated() || pr.reviewsNull || pr.threadsNull {
 				// Page this one PR instead of declaring the whole port partial
 				// over a window nobody has read.
