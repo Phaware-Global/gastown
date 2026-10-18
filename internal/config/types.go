@@ -125,6 +125,10 @@ type TownSettings struct {
 	// Example: ["doctor_dog", "compactor_dog"]
 	DisabledPatrols []string `json:"disabled_patrols,omitempty"`
 
+	// Assistant configures the Mayor's Assistant role (sweep ports and their
+	// per-port settings). See docs/design/assistant-role.md.
+	Assistant *AssistantConfig `json:"assistant,omitempty"`
+
 	// AssistantSweepIntervalRaw is the cooldown between Mayor's Assistant
 	// loose-ends sweeps, as a Go duration string (e.g. "30m", "2h").
 	// Default "1h". Read through AssistantSweepInterval(), which applies the
