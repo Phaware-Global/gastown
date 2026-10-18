@@ -237,7 +237,7 @@ func (l *ghLinks) load(keys []string) {
 		}
 		one, err := l.client.searchFirst(fmt.Sprintf(`key = %s`, k))
 		switch {
-		case err != nil && isNotFound(err):
+		case err != nil && isNotFound(err, k):
 			l.notFound[k] = true // reported per PR as an info finding, never as partial
 		case err != nil:
 			outages++
@@ -257,13 +257,19 @@ func (l *ghLinks) load(keys []string) {
 }
 
 // isNotFound reports Jira's answer for an unknown or hidden key: a 400 (JQL
-// validation) or 404 at the status position of the client's error text
-// "GET <path>: HTTP <code>: <body>". 401, 403, 429 and 5xx are outages.
-func isNotFound(err error) bool {
-	return err != nil && notFoundRe.MatchString(err.Error())
+// validation) whose body names the key or the field. The client's error
+// text is "GET <path>: HTTP <code>: <body>". A 404 (wrong origin, proxy,
+// no v3 search endpoint), a blanket 400 (lost Browse permission), 401,
+// 403, 429 and 5xx are outages, so they can never read as "N missing keys".
+func isNotFound(err error, key string) bool {
+	if err == nil || !badRequestRe.MatchString(err.Error()) {
+		return false
+	}
+	body := err.Error()
+	return strings.Contains(body, key) || strings.Contains(body, "does not exist for field 'key'")
 }
 
-var notFoundRe = regexp.MustCompile(`^GET \S+: HTTP (400|404):`)
+var badRequestRe = regexp.MustCompile(`^GET \S+: HTTP 400:`)
 
 func (l *ghLinks) check(open []ghPR, merged []ghPR, patterns []string, now time.Time, d githubDurations, isPersona, isHuman map[string]bool) []Finding {
 	if l == nil {
@@ -279,8 +285,13 @@ func (l *ghLinks) check(open []ghPR, merged []ghPR, patterns []string, now time.
 			all = append(all, l.keys(&open[i])...)
 		}
 	}
+	// Merged PRs matter only where done-not-in-uat looks: inside the release
+	// window, on a release branch.
+	inWindow := func(pr *ghPR) bool {
+		return !pr.MergedAt.IsZero() && now.Sub(pr.MergedAt) <= d.releaseWindow && matchAny(patterns, pr.BaseRefName)
+	}
 	for i := range merged {
-		if !ours(&merged[i]) {
+		if !ours(&merged[i]) || !inWindow(&merged[i]) {
 			continue
 		}
 		all = append(all, l.keys(&merged[i])...)
@@ -306,17 +317,26 @@ func (l *ghLinks) check(open []ghPR, merged []ghPR, patterns []string, now time.
 			return Finding{}
 		}
 		key := fmt.Sprintf("%s#%d", repoSlugOf(pr), pr.Number)
-		return Finding{Kind: "linked-key-missing", Key: key, URL: pr.URL, Severity: SeverityInfo, Since: pr.CreatedAt,
+		since := pr.CreatedAt
+		if !pr.MergedAt.IsZero() {
+			since = pr.MergedAt // merged PRs are fetched without createdAt
+		}
+		return Finding{Kind: "linked-key-missing", Key: key, URL: pr.URL, Severity: SeverityInfo, Since: since,
 			External:    map[string]string{"keys": strings.Join(keys, ", "), "pr_title": pr.Title},
 			Suggest:     "fix the issue key named by " + key,
 			Fingerprint: strings.Join(keys, ",")}
 	}
-	for _, prs := range [][]ghPR{open, merged} {
-		for i := range prs {
-			if pr := &prs[i]; ours(pr) {
-				if f := missingKeys(pr); f.Kind != "" {
-					out = append(out, f)
-				}
+	for i := range open {
+		if pr := &open[i]; ours(pr) {
+			if f := missingKeys(pr); f.Kind != "" {
+				out = append(out, f)
+			}
+		}
+	}
+	for i := range merged {
+		if pr := &merged[i]; ours(pr) && inWindow(pr) {
+			if f := missingKeys(pr); f.Kind != "" {
+				out = append(out, f)
 			}
 		}
 	}

@@ -130,6 +130,7 @@ type ghFixture struct {
 	jiraErr     bool                        // Jira search fails
 	jiraBadKey  string                      // a `key in (...)` batch naming this key answers 400
 	jiraRateKey string                      // a per-key `key = X` lookup for this key answers 429
+	jira404     bool                        // every Jira search answers 404 (wrong origin / no v3 endpoint)
 }
 
 func (fx *ghFixture) handler(t *testing.T) http.Handler {
@@ -145,6 +146,10 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 				return
 			}
 			jql := r.URL.Query().Get("jql")
+			if fx.jira404 {
+				http.Error(w, "not found", 404)
+				return
+			}
 			if fx.jiraRateKey != "" && strings.HasPrefix(jql, "key = "+fx.jiraRateKey) {
 				http.Error(w, `{"message":"rate limited"}`, 429)
 				return
@@ -1086,6 +1091,37 @@ func TestGitHubPort_LinkedKindsRound2Fixes(t *testing.T) {
 	}
 	if !got["linked-key-missing/acme/app#95"] {
 		t.Errorf("the bogus key must surface on its own PR: %v", got)
+	}
+	// Every search answering 404 (wrong origin, proxy, no v3 endpoint) is an
+	// outage: partial, no linked-key-missing, no eviction.
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appB, "acme/extra": {}}, jira404: true}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	findings, err = p.Sweep(context.Background(), in)
+	var p404 *PartialError
+	if !errors.As(err, &p404) || !strings.Contains(p404.Reason, "could not be looked up") {
+		t.Errorf("a blanket 404 must be an outage: %v", err)
+	}
+	for _, f := range findings {
+		if f.Kind == "linked-key-missing" {
+			t.Errorf("a 404 outage must never read as a missing key: %+v", f)
+		}
+	}
+	// An old persona PR merged into main with a bogus key feeds no check and
+	// must not be nagged about.
+	appOld := &ghRepoData{}
+	appOld.Merged.Nodes = []ghPR{mergedPR(12, "main", "feat/P23-99999999-old", 300*24*h, shaB)}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": appOld, "acme/extra": {}}, jiraBadKey: "P23-99999999"}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	findings, err = p.Sweep(context.Background(), in)
+	if err != nil {
+		t.Errorf("an out-of-window merged PR must not even be looked up: %v", err)
+	}
+	for _, f := range findings {
+		if f.Kind == "linked-key-missing" {
+			t.Errorf("merged PRs outside the release window/branches must not yield linked-key-missing: %+v", f)
+		}
 	}
 	// A per-key 429 is an outage, not a missing key: noted as such, and since
 	// it is the only lookup, the linked kinds stop for the sweep.
