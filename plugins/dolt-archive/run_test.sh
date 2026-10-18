@@ -513,16 +513,38 @@ DB_B_DIR="$SANDBOX/home/gt/.dolt-data/db-b"
 mkdir -p "$DB_B_DIR/.dolt"
 printf 'origin\thttps://github.com/test-owner/db-b (fetch)\n' > "$DB_B_DIR/.mock-remotes"
 touch "$DB_B_DIR/.mock-no-issues-table"
-# Pre-existing, unrelated bug (filed separately, not this bead's scope): the
-# prune loop globs "${DB}-2*.jsonl" for every PROD_DBS entry including ones
-# skipped this cycle; with no snapshot ever written for db-b, the glob
-# matches nothing and (under set -eo pipefail) aborts the whole script. Seed
-# a dummy snapshot so db-b's prune-loop iteration is a no-op and this
-# scenario can exercise the export/remote population logic it's actually for.
-touch "$SANDBOX/home/gt/.dolt-archive/jsonl/db-b-20200101-0000.jsonl"
-
 run_scenario "$SANDBOX" --databases db-a,db-b --skip-git
 assert_escalated "$SANDBOX" "only 0 of 1 exported databases have a dolt remote configured" "population correctness"
+rm -rf "$SANDBOX"
+
+# --- Scenario 6b: a db that was never exported must not abort the run via ---
+# --- the prune loop (gt-wobc) ---------------------------------------------------
+# The prune loop globs "${DB}-2*.jsonl" for every database. With no snapshot
+# ever written for a skipped db the glob matches nothing; ls exits 1 and
+# pipefail used to abort the whole script silently, so the healthy db's dolt
+# push never ran.
+
+log "=== Scenario: never-exported db does not abort the prune loop ==="
+SANDBOX="$(setup_sandbox)"
+write_dolt_mock "$SANDBOX"
+write_bd_mock "$SANDBOX"
+write_gt_mock "$SANDBOX"
+write_gh_mock "$SANDBOX"
+
+GOOD_DIR="$SANDBOX/home/gt/.dolt-data/db-good"
+mkdir -p "$GOOD_DIR/.dolt"
+printf 'origin\thttps://github.com/test-owner/db-good (fetch)\n' > "$GOOD_DIR/.mock-remotes"
+
+SKIPPED_DIR="$SANDBOX/home/gt/.dolt-data/db-never-exported"
+mkdir -p "$SKIPPED_DIR/.dolt"
+touch "$SKIPPED_DIR/.mock-no-issues-table"
+
+run_scenario "$SANDBOX" --databases db-good,db-never-exported --skip-git
+assert_output_contains "$SANDBOX" "JSONL export: 1 succeeded, 0 failed" \
+  "never-exported db — script reaches the end of Step 1"
+assert_output_contains "$SANDBOX" \
+  "dolt_push=1/1 attempted across 1 db(s) with a remote" \
+  "never-exported db — dolt push still runs for the healthy db"
 rm -rf "$SANDBOX"
 
 # --- Scenario 7: git push failure (repo present) must escalate critical -----

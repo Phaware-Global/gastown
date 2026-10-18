@@ -406,7 +406,11 @@ done
 
 # Prune old exports (keep last 24 snapshots per DB)
 for DB in "${PROD_DBS[@]}"; do
-  SNAPSHOTS=$(ls -t "$JSONL_EXPORT_DIR/${DB}-2"*.jsonl 2>/dev/null | tail -n +25)
+  # A db that was never exported (no issues table, or new) matches no snapshot:
+  # ls exits 1, and pipefail would carry that through the pipeline and abort the
+  # whole script under set -e before the git and dolt pushes run. "Nothing to
+  # prune" is not an error, so swallow the status.
+  SNAPSHOTS=$(ls -t "$JSONL_EXPORT_DIR/${DB}-2"*.jsonl 2>/dev/null | tail -n +25 || true)
   if [[ -n "$SNAPSHOTS" ]]; then
     echo "$SNAPSHOTS" | xargs rm -f
     log "Pruned old $DB snapshots"
