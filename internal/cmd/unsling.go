@@ -115,7 +115,7 @@ func runUnslingWith(cmd *cobra.Command, args []string, dryRun, force bool) error
 	// beads use hq- prefix stored at town level.
 	rigName := strings.Split(agentID, "/")[0]
 	var fallbackPath string
-	if rigName == "mayor" || rigName == "deacon" {
+	if rigName == "mayor" || rigName == constants.RoleAssistant || rigName == "deacon" {
 		fallbackPath = townRoot
 	} else {
 		fallbackPath = filepath.Join(townRoot, rigName)
@@ -383,7 +383,7 @@ func isAgentTarget(s string) bool {
 
 	// Known role names
 	switch s {
-	case constants.RoleMayor, constants.RoleDeacon, constants.RoleWitness, constants.RoleRefinery, constants.RoleCrew:
+	case constants.RoleMayor, constants.RoleAssistant, constants.RoleDeacon, constants.RoleWitness, constants.RoleRefinery, constants.RoleCrew:
 		return true
 	}
 

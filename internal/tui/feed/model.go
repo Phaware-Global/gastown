@@ -631,7 +631,7 @@ func (m *Model) attachToSelected() (tea.Model, tea.Cmd) {
 // and role shortcuts for singletons (mayor, deacon, witness, refinery).
 func nudgeTarget(agent *ProblemAgent) string {
 	switch agent.Role {
-	case constants.RoleMayor, constants.RoleDeacon:
+	case constants.RoleMayor, constants.RoleAssistant, constants.RoleDeacon:
 		return agent.Role
 	case constants.RoleWitness, constants.RoleRefinery:
 		return agent.Rig + "/" + agent.Role

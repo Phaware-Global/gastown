@@ -475,6 +475,26 @@ func DefaultOverrides() map[string]*HooksConfig {
 				},
 			},
 		},
+		// Mayor's Assistant: same autonomy guard as the Mayor — it triages an
+		// unattended inbox and must never block on a human answer.
+		"assistant": {
+			PreToolUse: []HookEntry{
+				{
+					Matcher: "AskUserQuestion",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: gtCommand("gt tap guard interactive-input"),
+					}},
+				},
+				{
+					Matcher: "EnterPlanMode",
+					Hooks: []Hook{{
+						Type:    "command",
+						Command: gtCommand("gt tap guard interactive-input"),
+					}},
+				},
+			},
+		},
 		// Reviewer roles: write-surface guard (P23-2376).
 		// The Reviewer's only sanctioned write surfaces are its review bead, its
 		// own worktree (checkout only), and PR review comments posted through
@@ -868,6 +888,11 @@ func DiscoverTargets(townRoot string) ([]Target, error) {
 		Key:  "deacon",
 		Role: "deacon",
 	})
+	targets = append(targets, Target{
+		Path: filepath.Join(townRoot, "assistant", ".claude", "settings.json"),
+		Key:  "assistant",
+		Role: "assistant",
+	})
 
 	// Boot watchdog — ephemeral Claude agent in deacon/dogs/boot/.
 	// Only added when the directory exists (gitignored and optional).
@@ -889,7 +914,7 @@ func DiscoverTargets(townRoot string) ([]Target, error) {
 	}
 
 	for _, entry := range entries {
-		if !entry.IsDir() || entry.Name() == "mayor" || entry.Name() == "deacon" ||
+		if !entry.IsDir() || entry.Name() == "mayor" || entry.Name() == "assistant" || entry.Name() == "deacon" ||
 			entry.Name() == ".beads" || strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
@@ -980,7 +1005,7 @@ func DiscoverRoleLocations(townRoot string) ([]RoleLocation, error) {
 	var locations []RoleLocation
 
 	// Town-level roles
-	for _, role := range []string{"mayor", "deacon"} {
+	for _, role := range []string{"mayor", "assistant", "deacon"} {
 		dir := filepath.Join(townRoot, role)
 		if info, err := os.Stat(dir); err == nil && info.IsDir() {
 			locations = append(locations, RoleLocation{Dir: dir, Role: role})
@@ -994,7 +1019,7 @@ func DiscoverRoleLocations(townRoot string) ([]RoleLocation, error) {
 	}
 
 	for _, entry := range entries {
-		if !entry.IsDir() || entry.Name() == "mayor" || entry.Name() == "deacon" ||
+		if !entry.IsDir() || entry.Name() == "mayor" || entry.Name() == "assistant" || entry.Name() == "deacon" ||
 			entry.Name() == ".beads" || strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
@@ -1288,7 +1313,7 @@ func NormalizeTarget(target string) (string, bool) {
 
 	validRoles := map[string]bool{
 		"crew": true, "witness": true, "refinery": true,
-		"polecats": true, "mayor": true, "deacon": true,
+		"polecats": true, "mayor": true, "assistant": true, "deacon": true,
 		"reviewer": true,
 	}
 

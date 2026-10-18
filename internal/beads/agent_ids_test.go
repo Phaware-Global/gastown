@@ -266,3 +266,25 @@ func TestAgentBeadIDRoundTrip(t *testing.T) {
 	}
 }
 
+
+// TestAssistantBeadID covers the town-level assistant role's bead ID
+// (hq-assistant) through validation, parsing, and reconstruction.
+func TestAssistantBeadID(t *testing.T) {
+	id := AssistantBeadIDTown()
+	if id != "hq-assistant" {
+		t.Fatalf("AssistantBeadIDTown() = %q, want hq-assistant", id)
+	}
+	if err := ValidateAgentID(id); err != nil {
+		t.Errorf("ValidateAgentID(%q) error: %v", id, err)
+	}
+	rig, role, name, ok := ParseAgentBeadID(id)
+	if !ok || rig != "" || role != "assistant" || name != "" {
+		t.Errorf("ParseAgentBeadID(%q) = (%q, %q, %q, %v), want (\"\", assistant, \"\", true)", id, rig, role, name, ok)
+	}
+	if !IsAgentSessionBead(id) {
+		t.Errorf("IsAgentSessionBead(%q) = false, want true", id)
+	}
+	if got := AgentBeadIDWithPrefix(TownBeadsPrefix, "", "assistant", ""); got != id {
+		t.Errorf("AgentBeadIDWithPrefix = %q, want %q", got, id)
+	}
+}

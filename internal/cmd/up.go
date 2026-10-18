@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/assistant"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
@@ -198,7 +199,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// Start daemon, deacon, mayor, and rig prefetch in parallel
 	var daemonErr error
 	var daemonPID int
-	var deaconResult, mayorResult agentStartResult
+	var deaconResult, mayorResult, assistantResult agentStartResult
 	var prefetchedRigs map[string]*rig.Rig
 	var rigErrors map[string]error
 	var doltOK bool
@@ -206,7 +207,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 	var doltSkipped bool
 
 	var startupWg sync.WaitGroup
-	startupWg.Add(5)
+	startupWg.Add(6) // dolt, daemon, deacon, mayor, mayor's assistant, rig prefetch
 
 	// 0. Dolt server (if configured)
 	go func() {
@@ -275,6 +276,21 @@ func runUp(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
+	// 3.1. Mayor's Assistant
+	go func() {
+		defer startupWg.Done()
+		mgr := assistant.NewManager(townRoot)
+		if err := mgr.Start(""); err != nil {
+			if errors.Is(err, assistant.ErrAlreadyRunning) {
+				assistantResult = agentStartResult{name: "Mayor's Assistant", ok: true, detail: mgr.SessionName()}
+			} else {
+				assistantResult = agentStartResult{name: "Mayor's Assistant", ok: false, detail: err.Error()}
+			}
+		} else {
+			assistantResult = agentStartResult{name: "Mayor's Assistant", ok: true, detail: mgr.SessionName()}
+		}
+	}()
+
 	// 4. Prefetch rig configs (overlaps with daemon/deacon/mayor startup)
 	go func() {
 		defer startupWg.Done()
@@ -311,6 +327,10 @@ func runUp(cmd *cobra.Command, args []string) error {
 	}
 	services = append(services, ServiceStatus{Name: mayorResult.name, Type: constants.RoleMayor, OK: mayorResult.ok, Detail: mayorResult.detail})
 	if !mayorResult.ok {
+		allOK = false
+	}
+	services = append(services, ServiceStatus{Name: assistantResult.name, Type: constants.RoleAssistant, OK: assistantResult.ok, Detail: assistantResult.detail})
+	if !assistantResult.ok {
 		allOK = false
 	}
 
@@ -418,7 +438,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 	// Log boot event for both JSON and text paths
 	if allOK {
-		startedServices := []string{"dolt", "daemon", "deacon", "mayor"}
+		startedServices := []string{"dolt", "daemon", "deacon", "mayor", constants.RoleAssistant}
 		for _, rigName := range rigs {
 			startedServices = append(startedServices, fmt.Sprintf("%s/witness", rigName))
 			startedServices = append(startedServices, fmt.Sprintf("%s/refinery", rigName))
@@ -789,7 +809,7 @@ func discoverRigs(townRoot string) []string {
 
 		name := entry.Name()
 		// Skip known non-rig directories
-		if name == "mayor" || name == "daemon" || name == "deacon" ||
+		if name == "mayor" || name == constants.RoleAssistant || name == "daemon" || name == "deacon" ||
 			name == ".git" || name == "docs" || name[0] == '.' {
 			continue
 		}

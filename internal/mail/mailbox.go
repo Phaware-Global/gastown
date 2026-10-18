@@ -434,6 +434,8 @@ func (m *Mailbox) identityVariants() []string {
 		variants = append(variants, "mayor")
 	} else if m.identity == "deacon/" {
 		variants = append(variants, "deacon")
+	} else if m.identity == "assistant/" {
+		variants = append(variants, "assistant")
 	}
 
 	return variants

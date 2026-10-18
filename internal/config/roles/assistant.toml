@@ -1,0 +1,26 @@
+# Mayor's Assistant role definition
+# Town-level inbound triage buffer for the Mayor. One per town.
+# Receives telegraph events, escalations, alerts and reports; delivers
+# consolidated BRIEF:/URGENT:/SWEEP: mail to mayor/. See
+# docs/design/assistant-role.md.
+
+role = "assistant"
+scope = "town"
+nudge = "Check your inbox, triage, and brief the Mayor if anything is actionable."
+prompt_template = "assistant.md.tmpl"
+
+[session]
+pattern = "hq-assistant"
+work_dir = "{town}/assistant"
+needs_pre_sync = false
+start_command = "exec claude --dangerously-skip-permissions"
+
+[env]
+GT_ROLE = "assistant"
+GT_SCOPE = "town"
+
+[health]
+ping_timeout = "30s"
+consecutive_failures = 3
+kill_cooldown = "5m"
+stuck_threshold = "1h"

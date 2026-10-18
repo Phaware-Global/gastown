@@ -33,13 +33,14 @@ func NewUnregisteredBeadsDirsCheck() *UnregisteredBeadsDirsCheck {
 // knownSystemDirs are directories at town root that are expected to exist
 // without being registered in rigs.json.
 var knownSystemDirs = map[string]bool{
-	"mayor":     true,
-	"deacon":    true,
-	".beads":    true,
+	"mayor":      true,
+	"assistant":  true,
+	"deacon":     true,
+	".beads":     true,
 	".dolt-data": true,
-	".runtime":  true,
-	".git":      true,
-	".github":   true,
+	".runtime":   true,
+	".git":       true,
+	".github":    true,
 }
 
 // Run checks for unregistered directories with beads metadata.

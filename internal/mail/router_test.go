@@ -182,7 +182,13 @@ func TestAddressToSessionIDs(t *testing.T) {
 		// Town-level addresses - single session
 		{"mayor", []string{"hq-mayor"}},
 		{"mayor/", []string{"hq-mayor"}},
+		{"assistant", []string{"hq-assistant"}},
+		{"assistant/", []string{"hq-assistant"}},
 		{"deacon", []string{"hq-deacon"}},
+		{"deacon/boot", []string{"hq-boot"}},          // deacon family, not a rig named deacon
+		{"deacon/dogs/alpha", []string{"hq-dog-alpha"}},
+		{"deacon/dogs/alpha/", []string{"hq-dog-alpha"}},
+		{"deacon/dogs/alpha//", []string{"hq-dog-alpha"}},
 
 		// Rig singletons - single session (no crew/polecat ambiguity)
 		{"gastown/refinery", []string{"gt-refinery"}},
@@ -2239,5 +2245,21 @@ func TestBuildReplyReminderMessage(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestAddressToAgentBeadID_Assistant guards the exact-match routing of the
+// town-level assistant address (and that mayor/ still maps to the Mayor).
+func TestAddressToAgentBeadID_Assistant(t *testing.T) {
+	for _, addr := range []string{"assistant", "assistant/"} {
+		if got := addressToAgentBeadID(addr); got != "hq-assistant" {
+			t.Errorf("addressToAgentBeadID(%q) = %q, want hq-assistant", addr, got)
+		}
+	}
+	if got := addressToAgentBeadID("mayor/"); got != "hq-mayor" {
+		t.Errorf("addressToAgentBeadID(mayor/) = %q, want hq-mayor", got)
+	}
+	if got := agentBeadToAddress(&agentBead{ID: "hq-assistant"}); got != "assistant/" {
+		t.Errorf("agentBeadToAddress(hq-assistant) = %q, want assistant/", got)
 	}
 }

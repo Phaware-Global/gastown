@@ -10,14 +10,16 @@ import (
 type Role string
 
 const (
-	RoleMayor    Role = "mayor"
-	RoleDeacon   Role = "deacon"
-	RoleOverseer Role = "overseer"
-	RoleWitness  Role = "witness"
-	RoleRefinery Role = "refinery"
-	RoleCrew     Role = "crew"
-	RolePolecat  Role = "polecat"
-	RoleDog      Role = "dog"
+	RoleMayor Role = "mayor"
+	// RoleAssistant is the Mayor's inbound-triage assistant (town-level).
+	RoleAssistant Role = "assistant"
+	RoleDeacon    Role = "deacon"
+	RoleOverseer  Role = "overseer"
+	RoleWitness   Role = "witness"
+	RoleRefinery  Role = "refinery"
+	RoleCrew      Role = "crew"
+	RolePolecat   Role = "polecat"
+	RoleDog       Role = "dog"
 )
 
 // AgentIdentity represents a parsed Gas Town agent identity.
@@ -37,6 +39,9 @@ func ParseAddress(address string) (*AgentIdentity, error) {
 
 	if address == string(RoleMayor) || address == string(RoleMayor)+"/" {
 		return &AgentIdentity{Role: RoleMayor}, nil
+	}
+	if address == string(RoleAssistant) || address == string(RoleAssistant)+"/" {
+		return &AgentIdentity{Role: RoleAssistant}, nil
 	}
 	if address == string(RoleDeacon) || address == string(RoleDeacon)+"/" {
 		return &AgentIdentity{Role: RoleDeacon}, nil
@@ -87,6 +92,7 @@ func ParseAddress(address string) (*AgentIdentity, error) {
 //
 // Session name formats:
 //   - hq-mayor → Role: mayor (town-level, one per machine)
+//   - hq-assistant → Role: assistant (town-level, one per machine)
 //   - hq-deacon → Role: deacon (town-level, one per machine)
 //   - hq-boot → Role: deacon, Name: boot (boot watchdog)
 //   - <prefix>-witness → Role: witness (e.g., gt-witness for gastown)
@@ -118,6 +124,8 @@ func ParseSessionNameWithRegistry(session string, registry *PrefixRegistry) (*Ag
 		switch suffix {
 		case string(RoleMayor):
 			return &AgentIdentity{Role: RoleMayor}, nil
+		case string(RoleAssistant):
+			return &AgentIdentity{Role: RoleAssistant}, nil
 		case string(RoleDeacon):
 			return &AgentIdentity{Role: RoleDeacon}, nil
 		case "boot":
@@ -178,6 +186,8 @@ func (a *AgentIdentity) SessionName() string {
 	switch a.Role {
 	case RoleMayor:
 		return MayorSessionName()
+	case RoleAssistant:
+		return AssistantSessionName()
 	case RoleDeacon:
 		if a.Name == "boot" {
 			return BootSessionName()
@@ -224,6 +234,8 @@ func (a *AgentIdentity) BeaconAddress() string {
 	switch a.Role {
 	case RoleMayor:
 		return "mayor"
+	case RoleAssistant:
+		return "assistant"
 	case RoleDeacon:
 		return "deacon"
 	case RoleOverseer:
@@ -255,6 +267,8 @@ func (a *AgentIdentity) Address() string {
 	switch a.Role {
 	case RoleMayor:
 		return "mayor"
+	case RoleAssistant:
+		return "assistant"
 	case RoleDeacon:
 		return "deacon"
 	case RoleOverseer:

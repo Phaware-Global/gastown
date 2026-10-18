@@ -141,7 +141,8 @@ func (r *Resolver) validateAgentAddress(address string) error {
 
 	// Well-known town-level singletons always valid
 	switch normalized {
-	case constants.RoleMayor + "/", constants.RoleMayor, constants.RoleDeacon + "/", constants.RoleDeacon, "overseer":
+	case constants.RoleMayor + "/", constants.RoleMayor, constants.RoleDeacon + "/", constants.RoleDeacon,
+		constants.RoleAssistant + "/", constants.RoleAssistant, "overseer":
 		return nil
 	}
 

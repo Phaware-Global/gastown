@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/session"
 )
 
 // townCycleSession is the --session flag for town next/prev commands.
@@ -15,7 +16,7 @@ var townCycleSession string
 func getTownLevelSessions() []string {
 	mayorSession := getMayorSessionName()
 	deaconSession := getDeaconSessionName()
-	return []string{mayorSession, deaconSession}
+	return []string{mayorSession, session.AssistantSessionName(), deaconSession}
 }
 
 // isTownLevelSession checks if the given session name is a town-level session.
@@ -26,7 +27,7 @@ func isTownLevelSession(sessionName string) bool {
 	// Town-level sessions are identified by their fixed names
 	mayorSession := getMayorSessionName()   // "hq-mayor"
 	deaconSession := getDeaconSessionName() // "hq-deacon"
-	return sessionName == mayorSession || sessionName == deaconSession
+	return sessionName == mayorSession || sessionName == session.AssistantSessionName() || sessionName == deaconSession
 }
 
 func init() {
