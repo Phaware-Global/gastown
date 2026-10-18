@@ -268,10 +268,10 @@ func TestGitHubPort_ApproverIsHumanWithoutHumansList(t *testing.T) {
 
 // A stale approval tells a base-branch merge (the PR's own diff is
 // unchanged: no new review needed) from a material change (ask again),
-// including a mode change or a rename that the JSON file list would hide; a
-// compare that cannot answer asks again and makes the port partial, while a
-// spent compare budget is "unknown" without partial. The fingerprint is the
-// action, so a transient compare error never re-pages an acked item.
+// including a mode change, a rename, a binary swap or a moved hunk; a
+// compare that cannot answer (error or spent budget) is "unknown", asks
+// again, and never makes the port partial. The fingerprint is the action,
+// so a transient compare error never re-pages an acked item.
 func TestGitHubPort_ApprovalStaleDiff(t *testing.T) {
 	h := time.Hour
 	sha := func(c byte) string { return strings.Repeat(string(c), 40) }
@@ -286,15 +286,18 @@ func TestGitHubPort_ApprovalStaleDiff(t *testing.T) {
 		"main..." + sha('c'): strings.Replace(approved, "+y", "+z", 1),                                                                                                                                      // material change
 		"main..." + sha('e'): "diff --git a/a.go b/a.go\nold mode 100644\nnew mode 100755\nindex 1111111..2222222\n--- a/a.go\n+++ b/a.go\n@@ -1,3 +1,3 @@ func f()\n-x\n+y\n",                              // chmod +x
 		"main..." + sha('f'): "diff --git a/a.go b/b.go\nsimilarity index 90%\nrename from a.go\nrename to b.go\nindex 1111111..2222222 100644\n--- a/a.go\n+++ b/b.go\n@@ -1,3 +1,3 @@ func f()\n-x\n+y\n", // rename
+		"main..." + sha('g'): "diff --git a/a.go b/a.go\nindex 1111111..2222222 100644\n--- a/a.go\n+++ b/a.go\n@@ -40,3 +40,3 @@ func g()\n-x\n+y\n",                                                       // same hunk body moved into another function
+		"main..." + sha('h'): "diff --git a/x.bin b/x.bin\nindex 1111111..bbbbbbb 100644\nBinary files a/x.bin and b/x.bin differ\n",                                                                        // binary swapped after approval
+		"main..." + sha('i'): "diff --git a/x.bin b/x.bin\nindex 3333333..aaaaaaa 100644\nBinary files a/x.bin and b/x.bin differ\n",                                                                        // same head blob, base moved
 	}
+	const approvedBinary = "diff --git a/x.bin b/x.bin\nindex 1111111..aaaaaaa 100644\nBinary files a/x.bin and b/x.bin differ\n"
 	app := &ghRepoData{}
-	app.Open.Nodes = []ghPR{stale(1, sha('a')), stale(2, sha('c')), stale(3, sha('d')), stale(4, sha('e')), stale(5, sha('f'))}
+	app.Open.Nodes = []ghPR{stale(1, sha('a')), stale(2, sha('c')), stale(3, sha('d')), stale(4, sha('e')), stale(5, sha('f')), stale(6, sha('g'))}
 	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, diffs: diffs, compareFail: []string{"main..." + sha('d')}}
 	p, in := newGitHubTest(t, fx, []string{"artie"})
 	findings, err := p.Sweep(context.Background(), in)
-	var partial *PartialError
-	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "could not compare the head") {
-		t.Fatalf("a failed compare must make the port partial: %v", err)
+	if err != nil {
+		t.Fatalf("a failed compare must not make the port partial: %v", err)
 	}
 	got := map[string]Finding{}
 	for _, f := range findings {
@@ -306,11 +309,27 @@ func TestGitHubPort_ApprovalStaleDiff(t *testing.T) {
 		{"acme/app#3", "unknown", "ask kevin to re-approve acme/app#3", sha('d') + "|reapprove"},
 		{"acme/app#4", "changed", "ask kevin to re-approve acme/app#4", sha('e') + "|reapprove"},
 		{"acme/app#5", "changed", "ask kevin to re-approve acme/app#5", sha('f') + "|reapprove"},
+		{"acme/app#6", "changed", "ask kevin to re-approve acme/app#6", sha('g') + "|reapprove"},
 	} {
 		f, ok := got["approval-stale/"+c.key]
 		if !ok || f.Fields["diff"] != c.diff || f.Suggest != c.suggest || f.Fingerprint != c.fp {
 			t.Errorf("%s: want diff=%s suggest=%q fp=%s, got ok=%v %+v", c.key, c.diff, c.suggest, c.fp, ok, f)
 		}
+	}
+	// Binary entries: the approved head added x.bin; a swapped binary is a
+	// change even though the diff has no hunk body, while a base merge that
+	// only moved the base-side blob is not.
+	binDiffs := map[string]string{"main..." + shaB: approvedBinary, "main..." + sha('h'): diffs["main..."+sha('h')], "main..." + sha('i'): diffs["main..."+sha('i')]}
+	app.Open.Nodes = []ghPR{stale(7, sha('h')), stale(8, sha('i'))}
+	fx = &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, diffs: binDiffs}
+	p, in = newGitHubTest(t, fx, []string{"artie"})
+	findings, _ = p.Sweep(context.Background(), in)
+	got = map[string]Finding{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = f
+	}
+	if got["approval-stale/acme/app#7"].Fields["diff"] != "changed" || got["approval-stale/acme/app#8"].Fields["diff"] != "unchanged" {
+		t.Errorf("binary: want #7 changed (swapped blob) and #8 unchanged (same head blob), got %v / %v", got["approval-stale/acme/app#7"].Fields, got["approval-stale/acme/app#8"].Fields)
 	}
 	// The same PR on a later sweep whose compare fails: same advice, same
 	// fingerprint, so an acked "changed" item stays standing.

@@ -436,21 +436,52 @@ func (c *ghClient) prDiff(ref repoRef, base, head string) ([]string, error) {
 }
 
 // normalizeDiff keeps every line of a unified diff that says what the
-// change is (file headers, modes, renames, hunk bodies) and drops what moves
-// with the merge base (blob ids, hunk line ranges).
+// change is (file headers, modes, renames, hunk bodies and their function
+// context, so a moved hunk is a change) and drops what moves with the merge
+// base (blob ids, hunk line numbers). A file entry with no hunk body (a
+// binary) keeps its head-side blob id: that is its only content identity,
+// so a binary swap after the approval is a change.
 func normalizeDiff(raw string) []string {
-	lines := strings.Split(strings.TrimRight(raw, "\n"), "\n")
-	out := make([]string, 0, len(lines))
-	for _, line := range lines {
-		switch {
-		case strings.HasPrefix(line, "index "):
-			continue
-		case strings.HasPrefix(line, "@@"):
-			line = "@@"
+	var out []string
+	for i, sec := range strings.Split(strings.TrimRight(raw, "\n"), "\ndiff --git ") {
+		if i > 0 {
+			sec = "diff --git " + sec
 		}
-		out = append(out, line)
+		lines := strings.Split(sec, "\n")
+		hasHunk := false
+		for _, l := range lines {
+			if strings.HasPrefix(l, "@@") {
+				hasHunk = true
+				break
+			}
+		}
+		for _, line := range lines {
+			switch {
+			case strings.HasPrefix(line, "index ") && hasHunk:
+				continue // text: the hunks say what changed; blob ids move with the merge base
+			case strings.HasPrefix(line, "index "):
+				line = "blob " + headBlob(line)
+			case strings.HasPrefix(line, "@@"):
+				if j := strings.Index(line[2:], "@@"); j >= 0 {
+					line = "@@" + line[2+j+2:] // drop the line numbers, keep the function context
+				}
+			}
+			out = append(out, line)
+		}
 	}
 	return out
+}
+
+// headBlob returns the head-side blob id of an "index <base>..<head> [mode]" line.
+func headBlob(index string) string {
+	rest := strings.TrimPrefix(index, "index ")
+	if f := strings.Fields(rest); len(f) > 0 {
+		rest = f[0]
+	}
+	if i := strings.Index(rest, ".."); i >= 0 {
+		return rest[i+2:]
+	}
+	return rest
 }
 
 // repo fetches one page of a repository's open PRs. A field-level GraphQL
@@ -1006,10 +1037,11 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 		// leaves the PR's own diff unchanged: nothing to re-review. Any
 		// material change, or a compare that cannot answer, asks for a
 		// fresh approval.
-		diff, err := diffSince(ref, pr.BaseRefName, latest[humanApprovedOld].oid, head)
-		if err != nil {
-			note("%s: could not compare the head with the one %s approved: %v", key, humanApprovedOld, err)
-		}
+		// A compare that cannot answer (error, too large, budget) is
+		// "unknown": the advice is already to re-approve, and a persistent
+		// failure must not make the port partial — and stop eviction — on
+		// every sweep.
+		diff, _ := diffSince(ref, pr.BaseRefName, latest[humanApprovedOld].oid, head)
 		f.Fields["diff"] = diff
 		if diff == "unchanged" {
 			f.Suggest = key + " only merged its base branch since " + humanApprovedOld + " approved: no new review needed"
