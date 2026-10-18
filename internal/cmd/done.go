@@ -1329,31 +1329,23 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			if completion.reusePR > 0 {
 				// The reuse path force-closes the bead as "completed against
 				// PR #N" without ever pushing anything to that PR — verify
-				// the branch we're actually on is PR #N's head before taking
-				// it, or a review-fix polecat landed on the wrong branch
-				// (e.g. its own polecat/<name>-<bead> branch instead of the
-				// PR's branch) silently reports success while the reviewed
-				// defect merges unfixed. n==0 (no open PR on this branch) is
-				// also a mismatch and fails here.
+				// the work actually reached PR #N's head before taking it, or
+				// a review-fix polecat that never pushed silently reports
+				// success while the reviewed defect merges unfixed.
 				//
-				// FindPRNumber's error return covers real failures (gh
-				// unauthenticated, rate-limited, offline, not installed),
-				// not just "no open PR" — a real failure must not silently
-				// skip verification. Fall back to comparing branch against
-				// the dispatch bead's review_branch (no network needed) and
-				// only accept the reuse when one of the two checks passed.
-				verified := false
-				if n, findErr := g.FindPRNumber(branch); findErr == nil {
-					verified = true
-					if n != completion.reusePR {
-						return fmt.Errorf("review-fix bead targets PR #%d but branch %s is on PR #%d", completion.reusePR, branch, n)
-					}
-				} else {
-					style.PrintWarning("could not verify branch %s is PR #%d via gh: %v", branch, completion.reusePR, findErr)
+				// The PR is resolved from the branch the work was pushed to
+				// (the dispatch's review_branch), not the polecat's own
+				// assigned branch, which never has a PR in this dispatch shape.
+				warning, verifyErr := verifyReviewFixTarget(completion.reusePR, branch, attachmentFields.ReviewBranch,
+					g.FindPRNumber,
+					func(reviewBranch string) (bool, error) {
+						return g.IsAncestor("HEAD", "origin/"+reviewBranch)
+					})
+				if warning != "" {
+					style.PrintWarning("%s", warning)
 				}
-				if !verified && (attachmentFields.ReviewBranch == "" || attachmentFields.ReviewBranch != branch) {
-					return fmt.Errorf("could not verify branch %s is PR #%d's head (gh lookup failed and branch doesn't match the dispatch bead's review_branch %q) — refusing to report success against an unverified branch",
-						branch, completion.reusePR, attachmentFields.ReviewBranch)
+				if verifyErr != nil {
+					return verifyErr
 				}
 				prNumber = completion.reusePR
 				prURL = fmt.Sprintf("#%d", prNumber)
@@ -3067,6 +3059,64 @@ func resolveNoMergeCompletion(fields *beads.AttachmentFields, mergeStrategyIsPR 
 		return noMergeCompletionTarget{reusePR: fields.ReviewPR}, nil
 	}
 	return noMergeCompletionTarget{createPR: mergeStrategyIsPR}, nil
+}
+
+// verifyReviewFixTarget checks that a review-fix completion really landed on
+// PR reusePR. localBranch is the polecat's own branch; reviewBranch is the
+// dispatch bead's review_branch (empty when the dispatch named only a PR).
+//
+// The PR is looked up by the branch the work was pushed to: reviewBranch when
+// set, else localBranch. When that differs from localBranch, HEAD must also be
+// contained in origin/<reviewBranch> — otherwise a polecat that never pushed
+// would pass on the strength of the PR existing.
+//
+// findPR's error covers real failures (gh unauthenticated, rate-limited,
+// offline), not just "no open PR"; a failure must not silently skip
+// verification. It falls back to the no-network evidence — the work is on
+// review_branch — and returns a warning so the operator sees the PR identity
+// went unchecked.
+func verifyReviewFixTarget(reusePR int, localBranch, reviewBranch string,
+	findPR func(branch string) (int, error),
+	headPushed func(reviewBranch string) (bool, error)) (warning string, err error) {
+	target := localBranch
+	if reviewBranch != "" {
+		target = reviewBranch
+	}
+
+	// A review-fix push to someone else's branch is the normal shape; the
+	// ancestry proof is what ties this polecat's work to that branch.
+	pushedToTarget := func() error {
+		if target == localBranch {
+			return nil
+		}
+		ok, pushErr := headPushed(target)
+		if pushErr != nil {
+			return fmt.Errorf("could not verify HEAD reached origin/%s: %w", target, pushErr)
+		}
+		if !ok {
+			return fmt.Errorf("HEAD is not on origin/%s — push the fix to the review branch (git push origin HEAD:%s) before 'gt done'", target, target)
+		}
+		return nil
+	}
+
+	n, findErr := findPR(target)
+	if findErr != nil {
+		if reviewBranch == "" {
+			return "", fmt.Errorf("could not verify branch %s is PR #%d's head (gh lookup failed: %v and the dispatch bead has no review_branch) — refusing to report success against an unverified branch",
+				target, reusePR, findErr)
+		}
+		if pushErr := pushedToTarget(); pushErr != nil {
+			return "", fmt.Errorf("could not verify PR #%d via gh (%v) and %w — refusing to report success against an unverified branch", reusePR, findErr, pushErr)
+		}
+		return fmt.Sprintf("could not verify branch %s is PR #%d via gh: %v", target, reusePR, findErr), nil
+	}
+	if n == 0 {
+		return "", fmt.Errorf("no open PR found for branch %s (searched %s; review-fix bead targets PR #%d)", target, target, reusePR)
+	}
+	if n != reusePR {
+		return "", fmt.Errorf("review-fix bead targets PR #%d but branch %s is on PR #%d", reusePR, target, n)
+	}
+	return "", pushedToTarget()
 }
 
 // reviewFixMRLookupResult is what gt done needs from FindMRForReviewPR's
