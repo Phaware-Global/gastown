@@ -55,6 +55,16 @@ func NewBeadsPort(townRoot string) *BeadsPort {
 
 func (p *BeadsPort) Name() string { return "beads" }
 
+func (p *BeadsPort) Suggestions() []string {
+	return []string{
+		"decide or `gt escalate ack {key}`",
+		"review `gt convoy status {key}`",
+		"reassign, sling onward, or close with reason",
+		"chase the blocker",
+		"`gt sling {key} {rig}`",
+	}
+}
+
 // Schema: every bead field the port emits has a machine shape.
 func (p *BeadsPort) Schema() map[string]Shape {
 	return map[string]Shape{

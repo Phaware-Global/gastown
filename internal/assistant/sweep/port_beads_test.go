@@ -68,9 +68,9 @@ func TestBeadsPort(t *testing.T) {
 			t.Errorf("title must be External, got Fields %v", f.Fields)
 		}
 		before := f.Suggest
-		enforceSchema(p.Schema(), &f)
+		enforceSchema(p.Schema(), p.Suggestions(), &f)
 		if f.Suggest != before {
-			t.Errorf("%s/%s: suggest %q rejected by the vocabulary", f.Kind, f.Key, before)
+			t.Errorf("%s/%s: suggest %q rejected by the templates", f.Kind, f.Key, before)
 		}
 	}
 	// A failing rig store makes the result partial, not an error and not all clear.
