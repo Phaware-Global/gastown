@@ -579,6 +579,11 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		stale:            parseDur(cfg.StaleAfter, 7*24*time.Hour),
 	}
 	isHuman := lowerSet(cfg.Humans)
+	for _, ref := range repos {
+		if ref.Approver != "" {
+			isHuman[strings.ToLower(ref.Approver)] = true // a rig's configured approver is human by definition
+		}
+	}
 	for l := range isPersona {
 		delete(isHuman, l) // the persona is never a human reviewer, even if listed
 	}

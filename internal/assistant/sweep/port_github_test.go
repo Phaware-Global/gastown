@@ -216,6 +216,37 @@ func newGitHubTest(t *testing.T, fx *ghFixture, logins []string) (*GitHubPort, I
 	return p, Input{Now: ghNow, Settings: settings}
 }
 
+// The rig's configured approver is human even when assistant.sweep.github
+// .humans is empty: their approval and their pending request must be seen,
+// or every reviewer-approved PR reads as "ready for human review" forever.
+func TestGitHubPort_ApproverIsHumanWithoutHumansList(t *testing.T) {
+	h := time.Hour
+	app := &ghRepoData{}
+	app.Open.Nodes = []ghPR{
+		pr(1, "artie", 5*h, 5*h, "SUCCESS", review("phaware-val", "APPROVED", shaA, 4*h), review("kevin", "APPROVED", shaA, 3*h)),
+		pr(2, "artie", 40*h, 40*h, "SUCCESS", review("phaware-val", "APPROVED", shaA, 39*h), requested("kevin", 30*h)),
+	}
+	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}}
+	p, in := newGitHubTest(t, fx, []string{"artie"})
+	in.Settings.Assistant.Sweep.GitHub.Humans = nil
+	findings, err := p.Sweep(context.Background(), in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := map[string]bool{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = true
+	}
+	for _, absent := range []string{"ready-for-human-review/acme/app#1", "ready-for-human-review/acme/app#2", "unknown-actor/acme/app#1", "unknown-actor/acme/app#2"} {
+		if got[absent] {
+			t.Errorf("unexpected %s; got %v", absent, got)
+		}
+	}
+	if !got["review-waiting/acme/app#2@kevin"] {
+		t.Errorf("the approver's pending request must be review-waiting; got %v", got)
+	}
+}
+
 func TestGitHubPort_Findings(t *testing.T) {
 	h := time.Hour
 	app := &ghRepoData{}
