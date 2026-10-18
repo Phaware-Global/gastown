@@ -119,24 +119,23 @@ type ghFixture struct {
 	nullNodePR  int                    // repo query: this PR's whole node comes back null (NON_NULL field denied)
 	pageQueries []int                  // PR numbers the per-PR paging query was asked for
 	patrolCalls atomic.Int32
-	diffs       map[string]string           // "base...sha" → unified diff text; unlisted specs differ from each other
-	mergeBases  map[string]string           // "base...sha" → merge base sha (default "mb0": the base never moved)
-	baseFiles   map[string][]string         // "mbOld...mbNew" → files the base touched between the merge bases
-	compareFail []string                    // compare specs that answer 500
-	patrolDelay time.Duration               // patrolBeads sleeps this long
-	patches     map[string][]map[string]any // "base...sha" → compare files; unlisted specs differ from each other
-	compare     map[string]string           // "base...head" → status
-	issues      []map[string]any            // Jira issues returned for `key in (...)`
-	jiraErr     bool                        // Jira search fails
-	jiraBadKey  string                      // a `key in (...)` batch naming this key answers 400
-	jiraRateKey string                      // a per-key `key = X` lookup for this key answers 429
-	jira404     bool                        // every Jira search answers 404 (wrong origin / no v3 endpoint)
-	noBrowse    bool                        // the visibility probe (project in …) answers no issues
-	jiraBadKeys []string                    // additional keys that answer the naming 400
-	noBrowseIn  []string                    // projects whose visibility probe answers no issues
-	probe503    bool                        // the visibility probe answers 503
-	probe429In  []string                    // projects whose visibility probe answers 429
-	probe400In  []string                    // projects whose visibility probe answers 400 naming the project
+	diffs       map[string]string   // "base...sha" → unified diff text; unlisted specs differ from each other
+	mergeBases  map[string]string   // "base...sha" → merge base sha (default "mb0": the base never moved)
+	baseFiles   map[string][]string // "mbOld...mbNew" → files the base touched between the merge bases
+	compareFail []string            // compare specs that answer 500
+	patrolDelay time.Duration       // patrolBeads sleeps this long
+	compare     map[string]string   // "base...head" → status
+	issues      []map[string]any    // Jira issues returned for `key in (...)`
+	jiraErr     bool                // Jira search fails
+	jiraBadKey  string              // a `key in (...)` batch naming this key answers 400
+	jiraRateKey string              // a per-key `key = X` lookup for this key answers 429
+	jira404     bool                // every Jira search answers 404 (wrong origin / no v3 endpoint)
+	noBrowse    bool                // the visibility probe (project in …) answers no issues
+	jiraBadKeys []string            // additional keys that answer the naming 400
+	noBrowseIn  []string            // projects whose visibility probe answers no issues
+	probe503    bool                // the visibility probe answers 503
+	probe429In  []string            // projects whose visibility probe answers 429
+	probe400In  []string            // projects whose visibility probe answers 400 naming the project
 	probeCalls  atomic.Int32
 }
 
