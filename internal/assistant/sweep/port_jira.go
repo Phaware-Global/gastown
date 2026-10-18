@@ -531,16 +531,6 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	return out, nil
 }
 
-func set(items []string) map[string]bool {
-	m := map[string]bool{}
-	for _, s := range items {
-		if s = strings.TrimSpace(s); s != "" {
-			m[s] = true
-		}
-	}
-	return m
-}
-
 func contains(list []string, s string) bool {
 	for _, l := range list {
 		if strings.EqualFold(l, s) {
