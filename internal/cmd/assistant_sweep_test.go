@@ -14,7 +14,7 @@ func TestAssistantSweepTriggerNamesRegisteredCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("assistant-sweep run.sh must exist: %v", err)
 	}
-	for _, want := range []string{"gt assistant sweep --send-to mayor/", "SWEEP: not checked"} {
+	for _, want := range []string{"gt assistant sweep --protocol", "gt assistant sweep --send-to mayor/", "SWEEP: not checked"} {
 		if !strings.Contains(string(script), want) {
 			t.Errorf("trigger body must mention %q", want)
 		}
@@ -31,7 +31,7 @@ func TestAssistantSweepTriggerNamesRegisteredCommand(t *testing.T) {
 	for _, c := range assistantCmd.Commands() {
 		if c.Name() == "sweep" {
 			found = true
-			for _, flag := range []string{"ack", "dry-run", "json", "send-to"} {
+			for _, flag := range []string{"ack", "dry-run", "json", "send-to", "protocol"} {
 				if c.Flags().Lookup(flag) == nil {
 					t.Errorf("gt assistant sweep must register --%s", flag)
 				}

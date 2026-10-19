@@ -72,6 +72,7 @@ type RoleData struct {
 	DeaconSession string   // e.g., "gt-ai-deacon" - dynamic deacon session name
 	MergeStrategy string   // rig's merge_queue.merge_strategy ("direct" or "pr"); used by refinery quick-reference
 	SweepInterval string   // town assistant_sweep_interval (e.g., "1h"); used by the assistant template
+	SweepMode     string   // town assistant.sweep.mode: "deterministic" or "inference"; used by the assistant template
 }
 
 // SpawnData contains information for spawn assignment messages.

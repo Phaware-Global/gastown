@@ -715,3 +715,35 @@ func TestSubject(t *testing.T) {
 		t.Errorf("summary: %q", sum)
 	}
 }
+
+// A deterministic SWEEP: mail goes out only when there is something new or a
+// port did not fully run; the trigger body names the commands for each mode.
+func TestShouldMailAndTriggerBody(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		ports []PortResult
+		want  bool
+	}{
+		{"nothing new, all clean", []PortResult{{Name: "beads", Standing: []Standing{{Kind: "unslung", Count: 9}}}, {Name: "jira"}}, false},
+		{"new finding", []PortResult{{Name: "beads", New: []Finding{{Kind: "k", Key: "1"}}}}, true},
+		{"overflow only", []PortResult{{Name: "beads", Overflow: []Standing{{Kind: "unslung", Count: 3}}}}, true},
+		{"port failed", []PortResult{{Name: "beads"}, {Name: "jira", Error: "500"}}, true},
+		{"port partial", []PortResult{{Name: "beads", Partial: true}}, true},
+	} {
+		if got := ShouldMail(&Report{Ports: c.ports}); got != c.want {
+			t.Errorf("%s: ShouldMail=%v, want %v", c.name, got, c.want)
+		}
+	}
+	if b := TriggerBody("deterministic"); !strings.Contains(b, "gt assistant sweep --send-to mayor/") || !strings.Contains(b, "SWEEP: not checked") {
+		t.Errorf("deterministic trigger: %q", b)
+	}
+	if b := TriggerBody("unknown"); b != TriggerBody("deterministic") {
+		t.Error("an unknown mode must get the deterministic trigger")
+	}
+	b := TriggerBody("inference")
+	for _, want := range []string{"gt assistant sweep > \"$r\"", "gt assistant sweep --ack \"$(sed -n 's/^Run-ID: //p' \"$r\")\"", "NOT CHECKED or PARTIAL always reaches the Mayor", "SWEEP: not checked"} {
+		if !strings.Contains(b, want) {
+			t.Errorf("inference trigger must contain %q", want)
+		}
+	}
+}

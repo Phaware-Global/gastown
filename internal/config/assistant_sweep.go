@@ -40,3 +40,20 @@ func (s *TownSettings) AssistantSweepInterval() string {
 	}
 	return DefaultAssistantSweepInterval
 }
+
+// Sweep modes (assistant.sweep.mode).
+const (
+	SweepModeDeterministic = "deterministic"
+	SweepModeInference     = "inference"
+)
+
+// SweepMode returns the configured sweep mode: SweepModeInference only when
+// assistant.sweep.mode says so exactly, otherwise SweepModeDeterministic, so
+// a typo never hands the decision to a model that was not meant to have it.
+// Safe to call on a nil receiver.
+func (s *TownSettings) SweepMode() string {
+	if s != nil && s.Assistant != nil && s.Assistant.Sweep != nil && s.Assistant.Sweep.Mode == SweepModeInference {
+		return SweepModeInference
+	}
+	return SweepModeDeterministic
+}

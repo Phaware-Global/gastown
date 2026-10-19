@@ -118,6 +118,19 @@ func Subject(r *Report) string {
 	return subject + ")"
 }
 
+// ShouldMail reports whether a report is worth a deterministic SWEEP: mail:
+// something new (listed or counted), or a port that did not fully run. A
+// run with nothing new from ports that all ran clean is a no-op the Mayor
+// does not need to be woken for; its acknowledgement keeps the trail.
+func ShouldMail(r *Report) bool {
+	for _, p := range r.Ports {
+		if len(p.New) > 0 || len(p.Overflow) > 0 || !p.Clean() {
+			return true
+		}
+	}
+	return false
+}
+
 // Summary is the few lines the assistant sees after a --send-to run: the
 // subject and one status line per port, never the findings themselves.
 func Summary(r *Report) string {
