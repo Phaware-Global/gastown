@@ -180,6 +180,7 @@ func (p *GitHubPort) Suggestions() []string {
 		"check why {key} is not merged yet",
 		"ask the refinery to merge {key}: {human} approved it and only the base branch was merged since",
 		"re-check {key} before merging: {human} approved an earlier head and the compare since could not be verified",
+		"wait for ci on {key}: {human} approved an earlier head",
 		"respond to review comments on {key}",
 		"start the internal review loop on {key}",
 		"fix ci on {key}",
@@ -201,7 +202,7 @@ func (p *GitHubPort) Schema() map[string]Shape {
 		"head":            ShapeSHA,
 		"ci":              ShapeEnum, // success | failure | pending | none
 		"diff":            ShapeEnum, // approval-stale: unchanged | changed | unknown since the approved head
-		"approval":        ShapeEnum, // approved-unmerged: head | base_merged | changed | unknown
+		"approval":        ShapeEnum, // approved-unmerged: head | base_merged | changed | unknown | pending (CI still running since the base merge)
 		"threads":         ShapeInt,  // unresolved review threads
 		"requested_at":    ShapeTime,
 		"rig":             ShapeEnum,
@@ -1278,10 +1279,12 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 	// (re-approval needed), or unknown (the compare errored or the per-sweep
 	// budget was spent). The finding is present for every such candidate
 	// whatever the verdict, with the same fingerprint (approved head and
-	// time): presence must not depend on compare health, or a transient
-	// error evicts an acknowledged item and re-pages it on the next sweep.
-	// The compare runs only once CI is green and the approval old enough,
-	// so a red or young PR spends none of the shared budget here.
+	// time): presence must not depend on compare health or on CI being
+	// mid-run (every base merge restarts it), or a transient state evicts
+	// an acknowledged item and re-pages it on the next sweep; while CI is
+	// pending the finding says so and no compare is spent. The compare
+	// runs only once CI is green and the approval old enough, so a red or
+	// young PR spends none of the shared budget here.
 	effectiveApprover, effectiveAt, effectiveOid, approvalVia := "", time.Time{}, "", ""
 	var approvalErr error
 	if approverOK {
@@ -1294,18 +1297,21 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 			candidate = humanApprovedOld
 		}
 		if r, ok := latest[candidate]; ok && candidate != "" && isHuman[candidate] && !isPersona[candidate] && r.state == "APPROVED" && r.oid != head &&
-			ci == "success" && now.Sub(r.at) >= d.approvedUnmerged {
-			diff, err := compare(r.oid)
-			effectiveApprover, effectiveAt, effectiveOid, approvalVia, approvalErr = candidate, r.at, r.oid, "unknown", err
-			switch diff {
-			case "unchanged":
-				approvalVia = "base_merged"
-			case "changed":
-				approvalVia = "changed"
+			(ci == "success" || ci == "pending") && now.Sub(r.at) >= d.approvedUnmerged {
+			effectiveApprover, effectiveAt, effectiveOid, approvalVia = candidate, r.at, r.oid, "pending"
+			if ci == "success" {
+				diff, err := compare(r.oid)
+				approvalVia, approvalErr = "unknown", err
+				switch diff {
+				case "unchanged":
+					approvalVia = "base_merged"
+				case "changed":
+					approvalVia = "changed"
+				}
 			}
 		}
 	}
-	if effectiveApprover != "" && ci == "success" && now.Sub(effectiveAt) >= d.approvedUnmerged {
+	if effectiveApprover != "" && (ci == "success" || approvalVia == "pending") && now.Sub(effectiveAt) >= d.approvedUnmerged {
 		f := base("approved-unmerged", SeverityActionable)
 		f.Since = effectiveAt
 		f.Fields["human"] = effectiveApprover
@@ -1320,6 +1326,8 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 			if approvalErr != nil {
 				f.External["diff_error"] = approvalErr.Error()
 			}
+		case "pending":
+			f.Suggest = "wait for ci on " + key + ": " + effectiveApprover + " approved an earlier head"
 		default:
 			f.Suggest = "check why " + key + " is not merged yet"
 		}

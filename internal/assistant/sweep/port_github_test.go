@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -123,19 +124,21 @@ type ghFixture struct {
 	mergeBases  map[string]string   // "base...sha" → merge base sha (default "mb0": the base never moved)
 	baseFiles   map[string][]string // "mbOld...mbNew" → files the base touched between the merge bases
 	compareFail []string            // compare specs that answer 500
-	patrolDelay time.Duration       // patrolBeads sleeps this long
-	compare     map[string]string   // "base...head" → status
-	issues      []map[string]any    // Jira issues returned for `key in (...)`
-	jiraErr     bool                // Jira search fails
-	jiraBadKey  string              // a `key in (...)` batch naming this key answers 400
-	jiraRateKey string              // a per-key `key = X` lookup for this key answers 429
-	jira404     bool                // every Jira search answers 404 (wrong origin / no v3 endpoint)
-	noBrowse    bool                // the visibility probe (project in …) answers no issues
-	jiraBadKeys []string            // additional keys that answer the naming 400
-	noBrowseIn  []string            // projects whose visibility probe answers no issues
-	probe503    bool                // the visibility probe answers 503
-	probe429In  []string            // projects whose visibility probe answers 429
-	probe400In  []string            // projects whose visibility probe answers 400 naming the project
+	mu          sync.Mutex
+	compared    []string          // compare specs asked for, in order
+	patrolDelay time.Duration     // patrolBeads sleeps this long
+	compare     map[string]string // "base...head" → status
+	issues      []map[string]any  // Jira issues returned for `key in (...)`
+	jiraErr     bool              // Jira search fails
+	jiraBadKey  string            // a `key in (...)` batch naming this key answers 400
+	jiraRateKey string            // a per-key `key = X` lookup for this key answers 429
+	jira404     bool              // every Jira search answers 404 (wrong origin / no v3 endpoint)
+	noBrowse    bool              // the visibility probe (project in …) answers no issues
+	jiraBadKeys []string          // additional keys that answer the naming 400
+	noBrowseIn  []string          // projects whose visibility probe answers no issues
+	probe503    bool              // the visibility probe answers 503
+	probe429In  []string          // projects whose visibility probe answers 429
+	probe400In  []string          // projects whose visibility probe answers 400 naming the project
 	probeCalls  atomic.Int32
 }
 
@@ -206,6 +209,9 @@ func (fx *ghFixture) handler(t *testing.T) http.Handler {
 			_ = json.NewEncoder(w).Encode(map[string]any{"issues": hit, "isLast": true})
 		case strings.Contains(r.URL.Path, "/compare/"):
 			spec := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			fx.mu.Lock()
+			fx.compared = append(fx.compared, spec)
+			fx.mu.Unlock()
 			for _, f := range fx.compareFail {
 				if f == spec {
 					http.Error(w, "compare unavailable", 500)
@@ -1384,8 +1390,9 @@ func TestGitHubPort_ApprovedUnmergedRequiresTheApprover(t *testing.T) {
 		pr(11, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", sha('a'), 1*h), review("alice", "APPROVED", shaB, 25*h), review("kevin", "APPROVED", sha('k'), 20*h), head(sha('a'))),
 		// case B: alice approved the current head, kevin an earlier one
 		pr(12, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", sha('a'), 1*h), review("alice", "APPROVED", sha('a'), 1*h), review("kevin", "APPROVED", sha('k'), 20*h), head(sha('a'))),
-		// kevin's earlier approval on a PR whose CI is red: no finding, no compare spent
-		pr(13, "artie", 50*h, 2*h, "FAILURE", review("kevin", "APPROVED", sha('k'), 20*h), head(sha('a'))),
+		// kevin's earlier approval on a PR whose CI is red, with alice on the head so
+		// approval-stale cannot compare it either: no finding and no compare spent
+		pr(13, "artie", 50*h, 2*h, "FAILURE", review("alice", "APPROVED", sha('a'), 1*h), review("kevin", "APPROVED", sha('m'), 20*h), head(sha('a'))),
 		// the persona approved an earlier head: never counts, even as the configured approver
 		pr(14, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", sha('a'), 1*h), review("artie", "APPROVED", shaB, 20*h), head(sha('a'))),
 	}
@@ -1419,6 +1426,14 @@ func TestGitHubPort_ApprovedUnmergedRequiresTheApprover(t *testing.T) {
 	for _, absent := range []string{"approved-unmerged/acme/app#13", "approved-unmerged/acme/app#14"} {
 		if _, ok := got[absent]; ok {
 			t.Errorf("unexpected %s: red CI gates the finding, and the persona is never an approver", absent)
+		}
+	}
+	fx.mu.Lock()
+	compared := slices.Clone(fx.compared)
+	fx.mu.Unlock()
+	for _, spec := range compared {
+		if strings.Contains(spec, sha('m')) {
+			t.Errorf("red CI must gate the compare before it spends budget, got compare %s", spec)
 		}
 	}
 	// The persona configured as the approver (misconfiguration) still never counts.
@@ -1512,5 +1527,44 @@ func TestGitHubPort_ApprovedUnmergedSurvivesCompareFailure(t *testing.T) {
 	}
 	if ks := newKeys(rep3); slices.Contains(ks, "approved-unmerged/acme/app#1") || slices.Contains(ks, "approved-unmerged/acme/app#2") {
 		t.Errorf("the clean sweep after a failed compare must report the items as standing, got new %v", ks)
+	}
+	// CI restarts on every base merge: while it is pending the item stays
+	// (as "pending") and is standing again once CI is green. (The compare
+	// gate is covered by TestGitHubPort_ApprovedUnmergedRequiresTheApprover;
+	// here approval-stale compares the same head regardless.)
+	if err := r.Store.Ack(rep3.RunID, r.Now()); err != nil {
+		t.Fatal(err)
+	}
+	app.Open.Nodes[0].Commits.Nodes[0].Commit.StatusCheckRollup.State = "PENDING"
+	rep4, err := r.Run(ctx, Options{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ks := newKeys(rep4); slices.Contains(ks, "approved-unmerged/acme/app#1") {
+		t.Errorf("pending CI must not re-page the acknowledged item, got new %v", ks)
+	}
+	direct, err := p.Sweep(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pending *Finding
+	for i := range direct {
+		if direct[i].Kind == "approved-unmerged" && direct[i].Key == "acme/app#1" {
+			pending = &direct[i]
+		}
+	}
+	if pending == nil || pending.Fields["approval"] != "pending" || !strings.HasPrefix(pending.Suggest, "wait for ci on acme/app#1") || pending.Fingerprint != shaB+"|"+ago(20*time.Hour).UTC().Format(time.RFC3339) {
+		t.Errorf("the item must be reported as pending while CI runs, under the same fingerprint: %+v", pending)
+	}
+	if err := r.Store.Ack(rep4.RunID, r.Now()); err != nil {
+		t.Fatal(err)
+	}
+	app.Open.Nodes[0].Commits.Nodes[0].Commit.StatusCheckRollup.State = "SUCCESS"
+	rep5, err := r.Run(ctx, Options{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ks := newKeys(rep5); slices.Contains(ks, "approved-unmerged/acme/app#1") {
+		t.Errorf("CI going green again must not re-page the acknowledged item, got new %v", ks)
 	}
 }
