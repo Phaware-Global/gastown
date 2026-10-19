@@ -380,12 +380,17 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 			"OPENCODE_PERMISSION":     `{"*":"allow"}`,
 			"OPENCODE_CONFIG_CONTENT": `{"lsp":true}`,
 		},
-		ProcessNames:        []string{"opencode", "node", "bun"}, // Runs as Node.js or Bun
-		SessionIDEnv:        "",                                  // OpenCode manages sessions internally
-		ResumeFlag:          "",                                  // No resume support yet
-		ResumeStyle:         "",
-		SupportsHooks:       true, // Uses .opencode/plugins/gastown.js
-		SupportsForkSession: false,
+		ProcessNames: []string{"opencode", "node", "bun"}, // Runs as Node.js or Bun
+		// The opencode TUI maps Escape to "interrupt" (and, when idle, to
+		// leaving the prompt editor), so the vim-safety Escape gt sends
+		// before Enter leaves a pasted nudge sitting unsubmitted in the input
+		// box: verified live, paste+Esc+Enter strands, paste+Enter submits.
+		EscapeCancelsRequest: true,
+		SessionIDEnv:         "", // OpenCode manages sessions internally
+		ResumeFlag:           "", // No resume support yet
+		ResumeStyle:          "",
+		SupportsHooks:        true, // Uses .opencode/plugins/gastown.js
+		SupportsForkSession:  false,
 		NonInteractive: &NonInteractiveConfig{
 			Subcommand: "run",
 			OutputFlag: "--format json",

@@ -3456,15 +3456,49 @@ func (t *Tmux) shouldSendEscape(target string) bool {
 	return shouldSendEscapeForLines(lines)
 }
 
+// readyPromptPrefixForSession returns the prefix idle detection (WaitForIdle,
+// IsIdle, RequireIdle) matches for the session's agent. Town-defined agents
+// resolve through their provider preset; a preset without a ready prompt
+// keeps the default prefix here, as before, so those idle checks behave as
+// they always did.
 func readyPromptPrefixForSession(t *Tmux, session string) string {
-	promptPrefix := DefaultReadyPromptPrefix
-	agentName, err := t.GetEnvironment(session, "GT_AGENT")
-	if err != nil || agentName == "" {
-		return promptPrefix
+	agentName, townRoot := agentAndTownForSession(t, session)
+	return promptPrefixForAgent(agentName, townRoot, false)
+}
+
+func agentAndTownForSession(t *Tmux, session string) (agentName, townRoot string) {
+	if a, err := t.GetEnvironment(session, "GT_AGENT"); err == nil {
+		agentName = a
 	}
-	preset := config.GetAgentPresetByName(agentName)
-	if preset == nil || preset.ReadyPromptPrefix == "" {
-		return promptPrefix
+	if r, err := t.GetEnvironment(session, "GT_ROOT"); err == nil && r != "" {
+		townRoot = r
+	} else {
+		townRoot = os.Getenv("GT_ROOT")
+	}
+	return agentName, townRoot
+}
+
+// promptPrefixForAgent resolves an agent's ready-prompt prefix through its
+// provider preset (a town-defined "opencode-nemotron" is opencode, not
+// Claude). For a preset that renders no ready prompt the two users differ:
+// idle detection keeps the default prefix (forSubmit=false), while submit
+// verification gets "" (forSubmit=true) so inputBoxSubmitted is inconclusive
+// and the snapshot comparison and Enter retries decide — with Claude's prefix
+// it judged an opencode pane "submitted" while the pasted nudge still sat in
+// its input box, and the retries never ran.
+func promptPrefixForAgent(agentName, townRoot string, forSubmit bool) string {
+	if agentName == "" {
+		return DefaultReadyPromptPrefix
+	}
+	preset := config.ResolvePresetForAgent(agentName, townRoot)
+	if preset == nil {
+		return DefaultReadyPromptPrefix
+	}
+	if preset.ReadyPromptPrefix == "" {
+		if forSubmit {
+			return ""
+		}
+		return DefaultReadyPromptPrefix
 	}
 	return preset.ReadyPromptPrefix
 }
@@ -3476,15 +3510,14 @@ func readyPromptPrefixForSession(t *Tmux, session string) string {
 // and bare shells can repopulate the prompt line (e.g. zsh-autosuggestions),
 // which would otherwise read as a falsely-stranded nudge.
 func (t *Tmux) submitVerifyPrefix(session string) string {
-	// Empty session (e.g. sessionForPane failed) — skip the GetEnvironment call,
-	// which would spawn a guaranteed-to-fail `show-environment -t ""`.
 	if session == "" {
 		return ""
 	}
-	if agentName, err := t.GetEnvironment(session, "GT_AGENT"); err != nil || agentName == "" {
+	agentName, townRoot := agentAndTownForSession(t, session)
+	if agentName == "" {
 		return ""
 	}
-	return readyPromptPrefixForSession(t, session)
+	return promptPrefixForAgent(agentName, townRoot, true)
 }
 
 func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, timeout time.Duration) error {
