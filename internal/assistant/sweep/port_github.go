@@ -178,6 +178,7 @@ func (p *GitHubPort) Suggestions() []string {
 		"ask {human} to re-approve {key}",
 		"{key} only merged its base branch since {human} approved: no new review needed",
 		"check why {key} is not merged yet",
+		"ask the refinery to merge {key}: {human} approved it and only the base branch was merged since",
 		"respond to review comments on {key}",
 		"start the internal review loop on {key}",
 		"fix ci on {key}",
@@ -1218,6 +1219,16 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 			out = append(out, f)
 		}
 	}
+	// The approval that counts for "approved but not merged": the human's
+	// approval on the current head, or an earlier approval whose PR diff is
+	// unchanged since (only the base branch was merged in), which the
+	// refinery's merge-in strategy produces on every sibling merge and which
+	// needs no new review. A material change or an unanswerable compare
+	// leaves only the approval-stale finding.
+	effectiveApprover, effectiveAt, effectiveOid, approvalVia := "", time.Time{}, "", ""
+	if approverOK {
+		effectiveApprover, effectiveAt, effectiveOid, approvalVia = humanApprovedHead, approvedAt, head, "head"
+	}
 	if humanApprovedHead == "" && humanApprovedOld != "" {
 		f := base("approval-stale", SeverityActionable)
 		f.Fields["human"] = humanApprovedOld
@@ -1237,6 +1248,9 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 		f.Fields["diff"] = diff
 		if diff == "unchanged" {
 			f.Suggest = key + " only merged its base branch since " + humanApprovedOld + " approved: no new review needed"
+			if ref.Approver == "" || strings.EqualFold(humanApprovedOld, ref.Approver) {
+				effectiveApprover, effectiveAt, effectiveOid, approvalVia = humanApprovedOld, latest[humanApprovedOld].at, approvedOid, "base-merged"
+			}
 		} else {
 			f.Suggest = "ask " + humanApprovedOld + " to re-approve " + key
 		}
@@ -1247,12 +1261,20 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 		f.Fingerprint = head + "|" + approvedOid
 		out = append(out, f)
 	}
-	if approverOK && ci == "success" && now.Sub(approvedAt) >= d.approvedUnmerged {
+	if effectiveApprover != "" && ci == "success" && now.Sub(effectiveAt) >= d.approvedUnmerged {
 		f := base("approved-unmerged", SeverityActionable)
-		f.Since = approvedAt
-		f.Fields["human"] = humanApprovedHead
-		f.Suggest = "check why " + key + " is not merged yet"
-		f.Fingerprint = head + "|" + approvedAt.UTC().Format(time.RFC3339)
+		f.Since = effectiveAt
+		f.Fields["human"] = effectiveApprover
+		f.Fields["approval"] = approvalVia
+		if approvalVia == "base-merged" {
+			f.Suggest = "ask the refinery to merge " + key + ": " + effectiveApprover + " approved it and only the base branch was merged since"
+		} else {
+			f.Suggest = "check why " + key + " is not merged yet"
+		}
+		// Keyed on the approved head, not the current one: a base merge
+		// moves the head without changing what was approved and must not
+		// re-page an acknowledged item.
+		f.Fingerprint = effectiveOid + "|" + effectiveAt.UTC().Format(time.RFC3339)
 		out = append(out, f)
 	}
 	if ours {

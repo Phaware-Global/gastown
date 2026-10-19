@@ -445,6 +445,19 @@ func TestGitHubPort_ApprovalStaleDiff(t *testing.T) {
 	if e := got["approval-stale/acme/app#3"].External["diff_error"]; !strings.Contains(e, "500") {
 		t.Errorf("the compare error must be fenced in diff_error, got %q", e)
 	}
+	// An unchanged diff makes the earlier approval count: the PR is approved
+	// and unmerged, suggested to the refinery, fingerprinted on the approved
+	// head so the next base merge does not re-page it. A changed or unknown
+	// diff leaves only the approval-stale finding.
+	if f, ok := got["approved-unmerged/acme/app#1"]; !ok || f.Fields["human"] != "kevin" || f.Fields["approval"] != "base-merged" ||
+		f.Suggest != "ask the refinery to merge acme/app#1: kevin approved it and only the base branch was merged since" || f.Fingerprint != shaB+"|"+ago(20*time.Hour).UTC().Format(time.RFC3339) {
+		t.Errorf("approved-unmerged after a base-only merge: ok=%v %+v", ok, f)
+	}
+	for _, absent := range []string{"approved-unmerged/acme/app#2", "approved-unmerged/acme/app#3", "approved-unmerged/acme/app#9"} {
+		if _, ok := got[absent]; ok {
+			t.Errorf("unexpected %s: a changed or unknown diff is not an approval", absent)
+		}
+	}
 	// Decoy paths containing " b/": a text decoy is keyed on its own "+++ b/"
 	// path, so a change to the real internal/auth.go beside it still reads
 	// "changed"; a binary decoy that aliases a real entry's key makes the
