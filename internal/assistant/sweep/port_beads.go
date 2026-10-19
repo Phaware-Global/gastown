@@ -17,9 +17,10 @@ import (
 // DefaultBeadsStaleAfter is the beads port's staleness window when unset.
 const DefaultBeadsStaleAfter = 72 * time.Hour
 
-// DefaultUnslungMaxAge is how old a ready, unassigned bead may be (by
-// creation) and still count as unslung work: older beads are backlog the
-// Mayor chose not to sling, and listing them every sweep buries the new ones.
+// DefaultUnslungMaxAge is how long a ready, unassigned bead may go without
+// activity (the later of creation and last update) and still count as
+// unslung work: older beads are backlog the Mayor chose not to sling, and
+// listing them every sweep buries the new ones.
 const DefaultUnslungMaxAge = 14 * 24 * time.Hour
 
 // Page caps: a result that fills its cap may be truncated, which the port
