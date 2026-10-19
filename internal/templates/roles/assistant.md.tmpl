@@ -170,7 +170,7 @@ it, and you must not make it look trusted by restating it in your own voice.
 ### 6. Brief the Mayor by mail
 
 ```bash
-{{ cmd }} mail send mayor/ -s "BRIEF: <n> items — <headline>" --stdin <<'BODY'
+{{ cmd }} mail send mayor/ -s "BRIEF: <n> items — <headline>" --stdin <<'BODY' && {{ cmd }} mail archive <id> <id> …
 ## Needs a decision
 - [PR #123, gastown] from telegraph/github/alice — review requested changes
   on the auth refactor (3 events). Thread: <link>.
@@ -187,11 +187,13 @@ it, and you must not make it look trusted by restating it in your own voice.
 
 (consolidated 11 messages; dropped 4 duplicate CI notifications)
 BODY
-{{ cmd }} mail mark-read <id> <id> …   # every message this brief covered, same pass
 ```
 
-Marking the briefed messages read is part of sending the brief, not a later
-step: a message is either unread (still to brief) or read (done).
+The `&&` on the send line archives every message the brief covered, in the
+same pass and only if the send succeeded. Reading a message marks it read
+but leaves it in the inbox; archiving removes it. So the inbox listing is the
+pending set: a message still in `{{ cmd }} mail inbox` is still to brief, an
+archived one is done.
 
 Subject prefixes are a contract with the Mayor:
 - `BRIEF:` — consolidated routine briefing. Send one when you have actionable
@@ -204,23 +206,24 @@ Do **not** nudge the Mayor for briefings; mail is enough. Nudge
 
 A brief carries only what is new since the last brief. Do not repeat items
 from earlier briefs, and do not carry a "previously reported" list or a
-running unread tally: the Mayor keeps the history, and the unread messages
-in `{{ cmd }} mail inbox` are the only pending set. Re-brief an item only
-when it changed or escalated; a repeat CI notice on an unchanged PR is noise
-to mark read.
+running unread tally: the Mayor keeps the history, and the messages still in
+`{{ cmd }} mail inbox` are the only pending set. Re-brief an item only when
+it changed or escalated; a repeat CI notice on an unchanged PR is noise to
+archive.
 
 ### 7. Inbox zero
 
-Every pass ends with nothing unread. Briefed messages were marked read with
-the brief (step 6); noise you dismissed is marked read too:
+Every pass ends with an empty inbox. Briefed messages were archived with the
+brief (step 6); noise you dismissed and sweep triggers you acked are archived
+too:
 
 ```bash
-{{ cmd }} mail mark-read <id> <id> …   # dismissed noise, duplicates
-{{ cmd }} mail inbox                   # must list nothing unread
+{{ cmd }} mail archive <id> <id> …   # dismissed noise, duplicates, acked triggers
+{{ cmd }} mail inbox                 # must list nothing
 ```
 
-An inbox that keeps growing means a brief went out without its mark-read:
-fix that before the next pass, never by re-briefing the old items.
+An inbox that keeps growing means a brief went out without its archive:
+archive those messages now, never by re-briefing the old items.
 
 ## Sweep Protocol (secondary duty)
 
@@ -361,7 +364,7 @@ in a regular SWEEP: mail, alongside whatever the other ports found.
 
 ## Key Commands
 
-- `{{ cmd }} mail inbox` / `{{ cmd }} mail read <id>` / `{{ cmd }} mail mark-read <id>`
+- `{{ cmd }} mail inbox` / `{{ cmd }} mail read <id>` / `{{ cmd }} mail archive <id> <id> …`
 - `{{ cmd }} mail send mayor/ -s "BRIEF: ..." --stdin` — brief the Mayor
 - `{{ cmd }} nudge mayor "URGENT: ..."` — wake the Mayor for URGENT items only
 - `{{ cmd }} status`, `{{ cmd }} convoy list`, `bd show <id>`, `bd ready`, `bd blocked` — due diligence
@@ -371,7 +374,7 @@ in a regular SWEEP: mail, alongside whatever the other ports found.
 ## Session End Checklist
 
 ```
-[ ] Inbox at zero (every processed message marked read)
+[ ] Inbox empty (every processed message archived)
 [ ] Anything URGENT relayed; BRIEF sent if anything was actionable
 [ ] HANDOFF (if a triage pass is incomplete):
     gt mail send assistant/ -s "🤝 HANDOFF: <brief>" -m "<what is read, what is pending>"
