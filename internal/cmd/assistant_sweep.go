@@ -89,6 +89,7 @@ func runAssistantSweep(cmd *cobra.Command, args []string) error {
 	if assistantSweepSendTo != "" && strings.TrimSuffix(assistantSweepSendTo, "/") != strings.TrimSuffix(sweepRecipient, "/") {
 		return fmt.Errorf("--send-to only accepts %s (the sweep report is for the Mayor)", sweepRecipient)
 	}
+	assistantSweepAck = strings.TrimSpace(assistantSweepAck) // a CR or space left by the recipe's sed
 	if assistantSweepAck != "" {
 		if err := sweep.NewStore(townRoot).Ack(assistantSweepAck, time.Now()); err != nil {
 			return err

@@ -110,3 +110,39 @@ func TestSendSweepReport(t *testing.T) {
 		}
 	}
 }
+
+// An explicitly empty --ack (the inference recipe's sed matched nothing) is
+// an error and must not fall through to a new recorded sweep that would
+// replace the pending run the Mayor was mailed; a --send-to other than
+// mayor/ is refused before any port runs. Neither writes sweep state.
+func TestAssistantSweepRejectsBeforeRunning(t *testing.T) {
+	town := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(town, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(town, "mayor", "town.json"), []byte(`{"name":"t"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(town)
+	reset := func() {
+		for _, name := range []string{"ack", "send-to"} {
+			f := assistantSweepCmd.Flags().Lookup(name)
+			_ = f.Value.Set("")
+			f.Changed = false
+		}
+	}
+	t.Cleanup(reset)
+	for _, c := range []struct{ flag, value string }{{"ack", ""}, {"ack", "  "}, {"send-to", "gastown/polecats/nux"}} {
+		reset()
+		if err := assistantSweepCmd.Flags().Set(c.flag, c.value); err != nil {
+			t.Fatal(err)
+		}
+		if err := runAssistantSweep(assistantSweepCmd, nil); err == nil {
+			t.Errorf("--%s=%q must be rejected", c.flag, c.value)
+		}
+		entries, _ := os.ReadDir(filepath.Join(town, "assistant", ".runtime"))
+		if len(entries) != 0 {
+			t.Errorf("--%s=%q wrote sweep state before being rejected: %v", c.flag, c.value, entries)
+		}
+	}
+}
