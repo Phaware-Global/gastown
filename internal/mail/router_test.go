@@ -2264,53 +2264,64 @@ func TestAddressToAgentBeadID_Assistant(t *testing.T) {
 	}
 }
 
-// A telegraph reminder addressed to the Mayor's Assistant must not point at
-// the Jira/GitHub tools: the assistant relays and the Mayor replies. Other
-// recipients and non-telegraph senders keep the existing texts.
-func TestBuildReplyReminderMessageFor_AssistantRelays(t *testing.T) {
-	for _, c := range []struct {
-		to, from, want, mustNot string
-	}{
-		{"assistant/", "telegraph/jira/PROJ-42", "You relay; you do not respond", "addCommentToJiraIssue"},
-		{"assistant", "telegraph/github/alice", "summarize it for the Mayor", "comment on the GitHub PR/issue directly"},
-		{"mayor/", "telegraph/jira/PROJ-42", "addCommentToJiraIssue", "You relay"},
-		{"assistant/", "gastown/witness", "Remember to reply to gastown/witness", "You relay"},
-	} {
-		got := buildReplyReminderMessageFor(c.to, c.from, "subj")
-		if !strings.Contains(got, c.want) || strings.Contains(got, c.mustNot) {
-			t.Errorf("to=%s from=%s: got %q, want it to contain %q and not %q", c.to, c.from, got, c.want, c.mustNot)
+// Telegraph mail addressed to the Mayor's Assistant gets no reply reminder:
+// the assistant relays and the Mayor replies, so the reminder was only a
+// second wake-up for the same mail. Other recipients and non-telegraph
+// senders keep the existing texts.
+func TestBuildReplyReminderMessageFor_AssistantTelegraphSilent(t *testing.T) {
+	for _, from := range []string{"telegraph/jira/PROJ-42", "telegraph/github/alice", "telegraph/unknown/x"} {
+		for _, to := range []string{"assistant/", "assistant"} {
+			if got := buildReplyReminderMessageFor(to, from, "subj"); got != "" {
+				t.Errorf("to=%s from=%s: want no reminder, got %q", to, from, got)
+			}
 		}
 	}
-	if got := buildReplyReminderMessageFor("assistant/", "telegraph/unknown/x", "subj"); got != "" {
-		t.Errorf("unknown telegraph provider must stay silent for the assistant too, got %q", got)
+	for _, c := range []struct{ to, from, want string }{
+		{"mayor/", "telegraph/jira/PROJ-42", "addCommentToJiraIssue"},
+		{"mayor/", "telegraph/github/alice", "comment on the GitHub PR/issue directly"},
+		{"assistant/", "gastown/witness", "Remember to reply to gastown/witness"},
+		{"assistant/", "deacon/dogs/bravo", "Remember to reply to deacon/dogs/bravo"},
+	} {
+		if got := buildReplyReminderMessageFor(c.to, c.from, "subj"); !strings.Contains(got, c.want) {
+			t.Errorf("to=%s from=%s: got %q, want it to contain %q", c.to, c.from, got, c.want)
+		}
 	}
 }
 
-// The production path for the live failure: a telegraph mail addressed to
-// assistant/ goes through notifyRecipient → enqueueReplyReminder, and the
-// queued nudge must tell the assistant to relay, never to use the Jira or
-// GitHub tools. Reverting the call site to the recipient-blind helper fails
-// this test.
-func TestEnqueueReplyReminder_AssistantRecipientRelays(t *testing.T) {
-	for _, c := range []struct{ from, mustNot string }{
-		{"telegraph/jira/PROJ-42", "addCommentToJiraIssue"},
-		{"telegraph/github/alice", "comment on the GitHub PR/issue directly"},
-	} {
+// The production path: a telegraph mail addressed to assistant/ goes through
+// notifyRecipient → enqueueReplyReminder and must queue nothing, while mail
+// from an agent (a sweep trigger the assistant acks by mail) still queues
+// the usual reminder. Reverting the call site to the recipient-blind helper
+// fails this test.
+func TestEnqueueReplyReminder_AssistantTelegraphQueuesNothing(t *testing.T) {
+	queued := func(t *testing.T, from string) []nudge.QueuedNudge {
+		t.Helper()
 		townRoot := t.TempDir()
 		r := &Router{workDir: t.TempDir(), townRoot: townRoot}
-		r.enqueueReplyReminder(&Message{From: c.from, To: "assistant/", Subject: "Issue updated", Type: TypeNotification}, "hq-assistant")
+		r.enqueueReplyReminder(&Message{From: from, To: "assistant/", Subject: "Issue updated", Type: TypeNotification}, "hq-assistant")
 		dir := filepath.Join(townRoot, ".runtime", "nudge_queue", "hq-assistant")
 		entries, err := os.ReadDir(dir)
-		if err != nil || len(entries) != 1 {
-			t.Fatalf("%s: expected 1 queued reminder, got %d (%v)", c.from, len(entries), err)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("%s: reading queue: %v", from, err)
 		}
-		data, _ := os.ReadFile(filepath.Join(dir, entries[0].Name()))
-		var q nudge.QueuedNudge
-		if err := json.Unmarshal(data, &q); err != nil {
-			t.Fatalf("unmarshal: %v", err)
+		var out []nudge.QueuedNudge
+		for _, e := range entries {
+			data, _ := os.ReadFile(filepath.Join(dir, e.Name()))
+			var q nudge.QueuedNudge
+			if err := json.Unmarshal(data, &q); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			out = append(out, q)
 		}
-		if !strings.Contains(q.Message, "You relay; you do not respond") || strings.Contains(q.Message, c.mustNot) {
-			t.Errorf("%s → assistant/: reminder must tell the assistant to relay, got %q", c.from, q.Message)
+		return out
+	}
+	for _, from := range []string{"telegraph/jira/PROJ-42", "telegraph/github/alice"} {
+		if got := queued(t, from); len(got) != 0 {
+			t.Errorf("%s → assistant/: expected no queued reminder, got %d: %q", from, len(got), got[0].Message)
 		}
+	}
+	got := queued(t, "deacon/dogs/bravo")
+	if len(got) != 1 || !strings.Contains(got[0].Message, "Remember to reply to deacon/dogs/bravo") {
+		t.Errorf("deacon/dogs/bravo → assistant/: expected the usual reminder, got %q", got)
 	}
 }
