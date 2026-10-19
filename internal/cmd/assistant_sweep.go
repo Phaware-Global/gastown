@@ -83,6 +83,12 @@ func runAssistantSweep(cmd *cobra.Command, args []string) error {
 	if assistantSweepSendTo != "" && (assistantSweepJSON || assistantSweepDryRun || assistantSweepAck != "") {
 		return fmt.Errorf("--send-to runs a recorded sweep: it cannot be combined with --json, --dry-run or --ack")
 	}
+	if cmd.Flags().Changed("ack") && strings.TrimSpace(assistantSweepAck) == "" {
+		return fmt.Errorf("--ack needs a run ID; an empty value (e.g. a sed that matched nothing) must not start a new recorded sweep")
+	}
+	if assistantSweepSendTo != "" && strings.TrimSuffix(assistantSweepSendTo, "/") != strings.TrimSuffix(sweepRecipient, "/") {
+		return fmt.Errorf("--send-to only accepts %s (the sweep report is for the Mayor)", sweepRecipient)
+	}
 	if assistantSweepAck != "" {
 		if err := sweep.NewStore(townRoot).Ack(assistantSweepAck, time.Now()); err != nil {
 			return err
@@ -150,13 +156,13 @@ func sendSweepReport(townRoot, to string, report *sweep.Report) error {
 		fmt.Printf("%s Nothing new: no mail sent to %s; run %s acknowledged\n%s", style.Bold.Render("✓"), to, report.RunID, sweep.Summary(report))
 		return nil
 	}
-	// The sender must be a real agent identity: without GT_ROLE, detectSender
-	// falls back to "overseer", the human, which this report must never
-	// claim to come from.
-	if os.Getenv("GT_ROLE") == "" {
-		return fmt.Errorf("GT_ROLE is unset, so the sender cannot be determined; run %s is pending, not acknowledged", report.RunID)
-	}
+	// The sender must resolve to a real agent identity: detectSender falls
+	// back to "overseer", the human, when GT_ROLE is unset, unknown, or lacks
+	// its rig/name variables, and this report must never claim the human.
 	from := detectSender()
+	if from == "" || from == "overseer" {
+		return fmt.Errorf("the sender resolves to %q, not an agent identity (check GT_ROLE and its rig/name variables); run %s is pending, not acknowledged", from, report.RunID)
+	}
 	workDir, err := findMailWorkDir()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)

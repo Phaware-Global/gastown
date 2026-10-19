@@ -97,9 +97,16 @@ func TestSendSweepReport(t *testing.T) {
 	if err := sendSweepReport(town, "gastown/polecats/nux", withNew); err == nil || len(sent) != 0 || len(acked) != 0 {
 		t.Errorf("a recipient other than mayor/ must be refused before sending or acking: err=%v", err)
 	}
-	reset()
-	t.Setenv("GT_ROLE", "")
-	if err := sendSweepReport(town, "mayor/", withNew); err == nil || len(sent) != 0 || len(acked) != 0 {
-		t.Errorf("without GT_ROLE the report must not be sent (it would claim the overseer): err=%v", err)
+	// Any session whose identity resolves to the overseer is refused: no
+	// GT_ROLE, or a role set without the variables that name it.
+	t.Chdir(t.TempDir())
+	for _, env := range []map[string]string{{"GT_ROLE": ""}, {"GT_ROLE": "polecat", "GT_RIG": "", "GT_POLECAT": ""}, {"GT_ROLE": "bogus"}} {
+		reset()
+		for k, v := range env {
+			t.Setenv(k, v)
+		}
+		if err := sendSweepReport(town, "mayor/", withNew); err == nil || len(sent) != 0 || len(acked) != 0 {
+			t.Errorf("%v: a sender resolving to the overseer must be refused before sending or acking: err=%v", env, err)
+		}
 	}
 }
