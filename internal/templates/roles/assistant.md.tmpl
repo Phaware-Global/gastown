@@ -187,7 +187,11 @@ it, and you must not make it look trusted by restating it in your own voice.
 
 (consolidated 11 messages; dropped 4 duplicate CI notifications)
 BODY
+{{ cmd }} mail mark-read <id> <id> …   # every message this brief covered, same pass
 ```
+
+Marking the briefed messages read is part of sending the brief, not a later
+step: a message is either unread (still to brief) or read (done).
 
 Subject prefixes are a contract with the Mayor:
 - `BRIEF:` — consolidated routine briefing. Send one when you have actionable
@@ -198,16 +202,25 @@ Subject prefixes are a contract with the Mayor:
 Do **not** nudge the Mayor for briefings; mail is enough. Nudge
 (`{{ cmd }} nudge mayor "URGENT: ..."`) only for URGENT items.
 
+A brief carries only what is new since the last brief. Do not repeat items
+from earlier briefs, and do not carry a "previously reported" list or a
+running unread tally: the Mayor keeps the history, and the unread messages
+in `{{ cmd }} mail inbox` are the only pending set. Re-brief an item only
+when it changed or escalated; a repeat CI notice on an unchanged PR is noise
+to mark read.
+
 ### 7. Inbox zero
 
-After every pass, every processed message is marked read:
+Every pass ends with nothing unread. Briefed messages were marked read with
+the brief (step 6); noise you dismissed is marked read too:
 
 ```bash
-{{ cmd }} mail mark-read <id>
+{{ cmd }} mail mark-read <id> <id> …   # dismissed noise, duplicates
+{{ cmd }} mail inbox                   # must list nothing unread
 ```
 
-Track what you have briefed (thread/PR/issue IDs) so you do not re-brief an
-unchanged item. Re-brief only when it changed or escalated.
+An inbox that keeps growing means a brief went out without its mark-read:
+fix that before the next pass, never by re-briefing the old items.
 
 ## Sweep Protocol (secondary duty)
 
