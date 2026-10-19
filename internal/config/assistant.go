@@ -28,9 +28,10 @@ type BeadsSweepConfig struct {
 	// StaleAfter is how long an in-progress bead, blocker, escalation or
 	// convoy may go without an update before it is reported (default "3d").
 	StaleAfter string `json:"stale_after,omitempty"`
-	// UnslungMaxAge caps how old (by creation) a ready, unassigned bead may
-	// be and still be reported as unslung (default "336h", 14 days): older
-	// ones are backlog, not loose ends. "0" disables the cap.
+	// UnslungMaxAge caps how long a ready, unassigned bead may have gone
+	// without activity (the later of its creation and last update) and still
+	// be reported as unslung (default "336h", 14 days): older ones are
+	// backlog, not loose ends. "0" disables the cap.
 	UnslungMaxAge string `json:"unslung_max_age,omitempty"`
 }
 

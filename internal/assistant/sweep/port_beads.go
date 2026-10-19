@@ -116,14 +116,21 @@ func unslungMaxAge(in Input) time.Duration {
 	return d
 }
 
-// createdAt parses a bead's creation time, falling back to its update time.
-func createdAt(i *beads.Issue, now time.Time) time.Time {
+// lastActivity is the later of a bead's creation and last update: a bead
+// reset to open (a dead polecat's work unassigned, a witness respawn reset)
+// or a backlog bead touched when its blocker closed counts from that
+// activity, not from when it was first filed.
+func lastActivity(i *beads.Issue, now time.Time) time.Time {
+	last := updatedAt(i, now)
 	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05"} {
 		if t, err := time.Parse(layout, i.CreatedAt); err == nil {
-			return t
+			if t.After(last) {
+				last = t
+			}
+			break
 		}
 	}
-	return updatedAt(i, now)
+	return last
 }
 
 // Sweep runs the five beads checks. Rig store failures are reported as a
@@ -210,8 +217,8 @@ func (p *BeadsPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 			if i.HookBead != "" || i.Assignee != "" {
 				continue
 			}
-			if maxAge > 0 && in.Now.Sub(createdAt(i, in.Now)) > maxAge {
-				continue // backlog, not a loose end: older than unslung_max_age
+			if maxAge > 0 && in.Now.Sub(lastActivity(i, in.Now)) > maxAge {
+				continue // backlog, not a loose end: no activity within unslung_max_age
 			}
 			out = append(out, p.finding("unslung", rig, i, in.Now, SeverityInfo, fmt.Sprintf("`gt sling %s %s`", i.ID, rig)))
 		}
