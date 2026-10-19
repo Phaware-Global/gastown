@@ -169,7 +169,7 @@ func TestBeadsPort_UnslungMaxAge(t *testing.T) {
 		{ID: "gt-new", Status: "open", CreatedAt: ago(2 * day), UpdatedAt: ago(2 * day)},
 		{ID: "gt-old", Status: "open", CreatedAt: ago(40 * day), UpdatedAt: ago(30 * day)},
 		{ID: "gt-reset", Status: "open", CreatedAt: ago(60 * day), UpdatedAt: ago(time.Hour)}, // in-flight work reset to open
-		{ID: "gt-undated", Status: "open", UpdatedAt: ago(time.Hour)},                          // no creation time: the update time counts
+		{ID: "gt-undated", Status: "open", UpdatedAt: ago(time.Hour)},                         // no creation time: the update time counts
 	}}
 	hq := &fakeBeads{}
 	for _, c := range []struct {
