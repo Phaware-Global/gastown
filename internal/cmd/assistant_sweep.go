@@ -9,6 +9,8 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/assistant/sweep"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -17,6 +19,7 @@ var (
 	assistantSweepJSON   bool
 	assistantSweepDryRun bool
 	assistantSweepAck    string
+	assistantSweepSendTo string
 )
 
 var assistantSweepCmd = &cobra.Command{
@@ -31,6 +34,15 @@ state file; after the SWEEP: mail has been sent to mayor/, commit it with
 
   gt assistant sweep --ack <run-id>
 
+or let the command do both, which is what the assistant's trigger asks for:
+
+  gt assistant sweep --send-to mayor/
+
+runs the ports, mails the report verbatim as "SWEEP: <n> new findings
+(<ports>)" (or "SWEEP: all clear (checked: <ports>)"), and acknowledges the
+run only once the mail was sent; it prints a few summary lines, never the
+report. A port that failed is named "not checked" in the subject.
+
 --json and --dry-run never write state, so a manual check cannot silently
 consume findings the Mayor has not seen. Every human-authored value in the
 report is fenced as EXTERNAL CONTENT with every line prefixed "> ".`,
@@ -41,6 +53,7 @@ func init() {
 	assistantSweepCmd.Flags().BoolVar(&assistantSweepJSON, "json", false, "Emit the report as JSON (does not record state)")
 	assistantSweepCmd.Flags().BoolVar(&assistantSweepDryRun, "dry-run", false, "Local ports run; external ports only print the queries they would issue; nothing is recorded")
 	assistantSweepCmd.Flags().StringVar(&assistantSweepAck, "ack", "", "Acknowledge a pending run (after mailing the Mayor) by its run ID")
+	assistantSweepCmd.Flags().StringVar(&assistantSweepSendTo, "send-to", "", "Run, mail the report verbatim to this address (e.g. mayor/) and acknowledge the run once sent")
 	assistantCmd.AddCommand(assistantSweepCmd)
 }
 
@@ -48,6 +61,9 @@ func runAssistantSweep(cmd *cobra.Command, args []string) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+	if assistantSweepSendTo != "" && (assistantSweepJSON || assistantSweepDryRun || assistantSweepAck != "") {
+		return fmt.Errorf("--send-to runs a recorded sweep: it cannot be combined with --json, --dry-run or --ack")
 	}
 	if assistantSweepAck != "" {
 		if err := sweep.NewStore(townRoot).Ack(assistantSweepAck, time.Now()); err != nil {
@@ -65,6 +81,9 @@ func runAssistantSweep(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if assistantSweepSendTo != "" {
+		return sendSweepReport(townRoot, assistantSweepSendTo, report)
+	}
 	if assistantSweepJSON {
 		data, err := sweep.JSON(report)
 		if err != nil {
@@ -74,5 +93,35 @@ func runAssistantSweep(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	fmt.Print(sweep.Markdown(report))
+	return nil
+}
+
+// sendSweepReport mails the rendered report verbatim to the recipient and
+// acknowledges the run only after the send succeeded, so a failed send leaves
+// the run pending and the next sweep reports everything again. The assistant
+// never handles the report text: it only sees the summary printed here.
+func sendSweepReport(townRoot, to string, report *sweep.Report) error {
+	from := detectSender()
+	if from == "" {
+		return fmt.Errorf("cannot determine the sender identity (GT_ROLE is unset); report %s is pending, not acknowledged", report.RunID)
+	}
+	workDir, err := findMailWorkDir()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+	msg := mail.NewMessage(from, to, sweep.Subject(report), sweep.Markdown(report))
+	msg.ThreadID = generateThreadID()
+	router := mail.NewRouter(workDir)
+	defer router.WaitPendingNotifications()
+	if err := router.Send(msg); err != nil {
+		return fmt.Errorf("sending the sweep report to %s: %w (run %s is pending, not acknowledged)", to, err, report.RunID)
+	}
+	_ = events.LogFeed(events.TypeMail, from, events.MailPayload(to, msg.Subject))
+	if report.Pending {
+		if err := sweep.NewStore(townRoot).Ack(report.RunID, time.Now()); err != nil {
+			return fmt.Errorf("report mailed to %s but run %s could not be acknowledged: %w", to, report.RunID, err)
+		}
+	}
+	fmt.Printf("%s Sweep report mailed to %s and run %s acknowledged\n%s", style.Bold.Render("✓"), to, report.RunID, sweep.Summary(report))
 	return nil
 }

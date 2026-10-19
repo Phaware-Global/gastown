@@ -74,6 +74,78 @@ func Markdown(r *Report) string {
 	return b.String()
 }
 
+// Subject is the SWEEP: mail subject for a report: the number of new
+// findings (listed plus the counted overflow) and the ports that ran, with
+// every port that did not fully run named — a port that errored is "not
+// checked", never silently all clear.
+func Subject(r *Report) string {
+	n := 0
+	var checked, partial, failed, dry []string
+	for _, p := range r.Ports {
+		n += len(p.New)
+		for _, o := range p.Overflow {
+			n += o.Count
+		}
+		switch {
+		case p.Error != "":
+			failed = append(failed, p.Name)
+		case p.DryRun:
+			dry = append(dry, p.Name)
+		case p.Partial:
+			partial = append(partial, p.Name)
+			checked = append(checked, p.Name)
+		default:
+			checked = append(checked, p.Name)
+		}
+	}
+	var marks []string
+	if len(partial) > 0 {
+		marks = append(marks, "PARTIAL: "+strings.Join(partial, ", "))
+	}
+	if len(failed) > 0 {
+		marks = append(marks, "not checked: "+strings.Join(failed, ", "))
+	}
+	if len(dry) > 0 {
+		marks = append(marks, "DRY RUN: "+strings.Join(dry, ", "))
+	}
+	if n == 0 && len(marks) == 0 {
+		return fmt.Sprintf("SWEEP: all clear (checked: %s)", strings.Join(checked, ", "))
+	}
+	subject := fmt.Sprintf("SWEEP: %d new findings (%s", n, strings.Join(checked, ", "))
+	if len(marks) > 0 {
+		subject += "; " + strings.Join(marks, "; ")
+	}
+	return subject + ")"
+}
+
+// Summary is the few lines the assistant sees after a --send-to run: the
+// subject and one status line per port, never the findings themselves.
+func Summary(r *Report) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\nRun-ID: %s\n", Subject(r), r.RunID)
+	for _, p := range r.Ports {
+		standing := 0
+		for _, s := range p.Standing {
+			standing += s.Count
+		}
+		overflow := 0
+		for _, o := range p.Overflow {
+			overflow += o.Count
+		}
+		status := "ok"
+		switch {
+		case p.Error != "":
+			status = "NOT CHECKED"
+		case p.DryRun:
+			status = "DRY RUN"
+		case p.Partial:
+			status = "PARTIAL"
+		}
+		fmt.Fprintf(&b, "%s: %s — %d new listed, %d more counted, %d standing\n", p.Name, status, len(p.New), overflow, standing)
+	}
+	return b.String()
+}
+
 // JSON renders a report for machines. External values are neutralized and
 // "> "-prefixed per line; the `external` object itself is the fence.
 func JSON(r *Report) ([]byte, error) {

@@ -413,8 +413,9 @@ flowchart LR
     J --> R
     G --> R
     R --> A
-    A -- "SWEEP: mail (judgement, grouping, suggestions)" --> M["mayor/"]
-    A -- "gt assistant sweep --ack <run-id> (after the mail is sent)" --> S
+    A -- "gt assistant sweep --send-to mayor/" --> S
+    S -- "SWEEP: mail (the report, verbatim)" --> M["mayor/"]
+    S -- "ack (only after the mail was sent)" --> S
 ```
 
 **Dedup and state.** The runner keeps `<town>/assistant/.runtime/sweep-state.json`:
@@ -451,9 +452,14 @@ exactly this.
 
 State advances only when the Mayor has actually been told. `gt assistant
 sweep` writes the run's fingerprints to a *pending* file keyed by a run ID
-printed at the top of the report; the assistant sends the `SWEEP:` mail and
-then runs `gt assistant sweep --ack <run-id>`, which commits that pending
-set as acknowledged. A run that is never acked (session died before
+printed at the top of the report; `gt assistant sweep --send-to mayor/`
+mails the report verbatim and then acknowledges the run (the manual path is
+the same two steps by hand: send the `SWEEP:` mail, then `gt assistant sweep
+--ack <run-id>`), which commits that pending set as acknowledged. The
+assistant never handles the report text: on the live town a model asked to
+"compose ONE SWEEP: mail from the report" sent 700-character summaries of a
+300-line report and carried stale ids and totals from earlier runs into
+later mails, which the Mayor read as a counting bug in the beads port. A run that is never acked (session died before
 mailing, context compacted, health-kill) leaves the acknowledged state
 untouched, so the next run reports the same findings as new again. Manual
 re-checks (`--json`, `--dry-run`, or any run outside the sweep protocol)
@@ -634,8 +640,8 @@ unparseable value silently falls back to the setting's default.
    counts, port errors stated as "not checked: <reason>", fenced blocks
    carried with every `> ` prefix intact, suggestions only from the
    report's `Suggest` lines.
-3. Send it to `mayor/`; then `gt assistant sweep --ack <run-id>`.
-4. If step 3 fails, do not ack; the next sweep reports everything again.
+3. `--send-to mayor/` sends it and acks; a failed send leaves the run
+   pending and the next sweep reports everything again.
 
 ### Adding a port
 
