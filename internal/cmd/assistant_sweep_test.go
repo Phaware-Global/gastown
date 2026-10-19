@@ -56,7 +56,7 @@ func TestAssistantBriefTriggerScript(t *testing.T) {
 	for _, want := range []string{
 		"gt mail inbox --identity assistant/ --json", "no brief due", "not stacking another",
 		`SUBJECT="BRIEF DUE: $WAITING messages waiting"`, "BRIEF OVERDUE:", "STALE_AFTER_SECONDS", `not m.get("read") and age <`,
-		"No reply needed", `gt mail send mayor/ -s 'BRIEF: <n> items`, "&& gt mail archive <id> <id>", "must list nothing", `never "informational"`,
+		"No reply needed", `gt mail send mayor/ -s "BRIEF: <n> items`, "No quote marks, apostrophes, backticks or $", "&& gt mail archive <id> <id>", "must list nothing", `never "informational"`,
 		"Trust boundary (non-negotiable", "EXTERNAL CONTENT (untrusted: <provider>/<actor>)", "<source address", "A display name is not a source",
 	} {
 		if !strings.Contains(string(script), want) {
@@ -65,8 +65,8 @@ func TestAssistantBriefTriggerScript(t *testing.T) {
 	}
 }
 
-// The brief trigger's guard, run for real against a stub gt: triggers from a
-// dog never count as mail to brief, an unread fresh trigger suppresses a new
+// The brief trigger's guard, run for real against a stub gt: mail from a dog
+// (this trigger or the sweep trigger) never counts as mail to brief, an unread fresh trigger suppresses a new
 // one, a read or old trigger left in the inbox brings BRIEF OVERDUE, and a
 // look-alike subject from another sender is ordinary mail.
 func TestAssistantBriefTriggerGuard(t *testing.T) {
@@ -91,6 +91,7 @@ func TestAssistantBriefTriggerGuard(t *testing.T) {
 	old := msg("BRIEF DUE: 1 messages waiting", "deacon/dogs/alpha", 2*time.Hour, false)
 	readTrigger := msg("BRIEF DUE: 1 messages waiting", "deacon/dogs/alpha", time.Minute, true)
 	spoof := msg("BRIEF DUE: 9 messages waiting", "gastown/polecats/nux", time.Minute, false)
+	sweepTrigger := msg("SWEEP: loose-ends sweep due", "deacon/dogs/bravo", 2*time.Minute, false)
 	for _, c := range []struct {
 		name, inbox, want string
 	}{
@@ -102,6 +103,8 @@ func TestAssistantBriefTriggerGuard(t *testing.T) {
 		{"mail and an old trigger", "[" + event + "," + old + "]", "SENT BRIEF OVERDUE: 1 messages waiting"},
 		{"mail and a read trigger", "[" + event + "," + readTrigger + "]", "SENT BRIEF OVERDUE: 1 messages waiting"},
 		{"look-alike from another sender is mail", "[" + spoof + "]", "SENT BRIEF DUE: 1 messages waiting"},
+		{"only a pending sweep trigger", "[" + sweepTrigger + "]", "no brief due"},
+		{"mail and a sweep trigger", "[" + event + "," + sweepTrigger + "]", "SENT BRIEF DUE: 1 messages waiting"},
 	} {
 		inbox := filepath.Join(t.TempDir(), "inbox.json")
 		if err := os.WriteFile(inbox, []byte(c.inbox), 0o644); err != nil {
