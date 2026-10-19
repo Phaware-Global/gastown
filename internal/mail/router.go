@@ -1969,6 +1969,8 @@ func prioritySeverityLabel(priority Priority) string {
 //   - No town root (can't use nudge queue)
 //   - Message type is TypeReply (recipient is already replying)
 //   - Configured delay is zero or negative (feature disabled)
+//   - The sender is one-way (telegraph/*) and the recipient is the Mayor's
+//     Assistant, which relays such mail and never replies to it
 func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 	if r.townRoot == "" {
 		return
@@ -1999,16 +2001,14 @@ func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 
 // buildReplyReminderMessageFor is buildReplyReminderMessage with the recipient
 // taken into account. The Mayor's Assistant relays inbound information and
-// never replies on Jira or GitHub itself, so a telegraph reminder addressed to
-// it must not point at the Jira or GitHub tools: on the live town that text
-// made an opencode assistant transition and comment on Jira issues within two
-// minutes of starting. Mail from agents keeps the usual "reply by mail" text.
+// never replies on Jira or GitHub itself, so telegraph mail addressed to it
+// gets no reply reminder at all: on the live town every such reminder was a
+// second wake-up for the same mail, which the assistant answered with
+// "already summarized" (a fifth of its turns). Mail from agents keeps the
+// usual "reply by mail" text, which is how the assistant acks sweep triggers.
 func buildReplyReminderMessageFor(to, from, subject string) string {
 	if addressToAgentBeadID(to) == "hq-assistant" && strings.HasPrefix(from, "telegraph/") {
-		if buildReplyReminderMessage(from, subject) == "" {
-			return ""
-		}
-		return fmt.Sprintf("Received mail from %s (subject: %q). You relay; you do not respond: summarize it for the Mayor, who replies on Jira/GitHub. Never use Jira or GitHub tools yourself.", from, subject)
+		return ""
 	}
 	return buildReplyReminderMessage(from, subject)
 }
