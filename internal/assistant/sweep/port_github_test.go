@@ -447,15 +447,31 @@ func TestGitHubPort_ApprovalStaleDiff(t *testing.T) {
 	}
 	// An unchanged diff makes the earlier approval count: the PR is approved
 	// and unmerged, suggested to the refinery, fingerprinted on the approved
-	// head so the next base merge does not re-page it. A changed or unknown
-	// diff leaves only the approval-stale finding.
-	if f, ok := got["approved-unmerged/acme/app#1"]; !ok || f.Fields["human"] != "kevin" || f.Fields["approval"] != "base-merged" ||
-		f.Suggest != "ask the refinery to merge acme/app#1: kevin approved it and only the base branch was merged since" || f.Fingerprint != shaB+"|"+ago(20*time.Hour).UTC().Format(time.RFC3339) {
+	// head so the next base merge does not re-page it. A compare that cannot
+	// answer keeps the finding as "unknown" with the same fingerprint and the
+	// error fenced; a changed diff leaves only the approval-stale finding.
+	kevinAt := ago(20 * time.Hour).UTC().Format(time.RFC3339)
+	if f, ok := got["approved-unmerged/acme/app#1"]; !ok || f.Fields["human"] != "kevin" || f.Fields["approval"] != "base_merged" ||
+		f.Suggest != "ask the refinery to merge acme/app#1: kevin approved it and only the base branch was merged since" || f.Fingerprint != shaB+"|"+kevinAt {
 		t.Errorf("approved-unmerged after a base-only merge: ok=%v %+v", ok, f)
 	}
-	for _, absent := range []string{"approved-unmerged/acme/app#2", "approved-unmerged/acme/app#3", "approved-unmerged/acme/app#9"} {
+	if f, ok := got["approved-unmerged/acme/app#3"]; !ok || f.Fields["approval"] != "unknown" || f.Fingerprint != shaB+"|"+kevinAt ||
+		f.Suggest != "re-check acme/app#3 before merging: kevin approved an earlier head and the compare since could not be verified" || !strings.Contains(f.External["diff_error"], "500") {
+		t.Errorf("approved-unmerged on a failed compare must stay, as unknown, with the error fenced: ok=%v %+v", ok, f)
+	}
+	for _, absent := range []string{"approved-unmerged/acme/app#2", "approved-unmerged/acme/app#9"} {
 		if _, ok := got[absent]; ok {
-			t.Errorf("unexpected %s: a changed or unknown diff is not an approval", absent)
+			t.Errorf("unexpected %s: a changed diff is not an approval", absent)
+		}
+	}
+	for k, f := range got {
+		if f.Kind != "approved-unmerged" {
+			continue
+		}
+		before := f.Suggest
+		enforceSchema(p.Schema(), p.Suggestions(), &f)
+		if f.Fields["approval"] == "" || f.Suggest != before {
+			t.Errorf("%s: approval must be a declared field and the suggestion a template, got %+v", k, f)
 		}
 	}
 	// Decoy paths containing " b/": a text decoy is keyed on its own "+++ b/"
@@ -1338,5 +1354,135 @@ func TestGitHubPort_LinkedKindsRound2Fixes(t *testing.T) {
 	var partial *PartialError
 	if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "could not be looked up") || strings.Contains(partial.Reason, "do not exist") {
 		t.Errorf("a 429 must be an outage, not a missing key: %v", err)
+	}
+}
+
+// With a configured approver only their own earlier approval can make a PR
+// approved-unmerged after a base merge: not another human's, whether that
+// human approved an earlier head (alice-only, case A: alice earlier than
+// kevin) or the current one (case B). Without a configured approver any
+// human's earliest approval counts.
+func TestGitHubPort_ApprovedUnmergedRequiresTheApprover(t *testing.T) {
+	h := time.Hour
+	sha := func(c byte) string { return strings.Repeat(string(c), 40) }
+	head := func(sha string) func(*ghPR) { return func(p *ghPR) { p.HeadRefOid = sha } }
+	const approved = "diff --git a/a.go b/a.go\nindex 1111111..2222222 100644\n--- a/a.go\n+++ b/a.go\n@@ -1,3 +1,3 @@ func f()\n-x\n+y\n"
+	diffs := map[string]string{
+		"main..." + shaB:     approved,
+		"main..." + sha('k'): approved,
+		"main..." + sha('a'): "diff --git a/a.go b/a.go\nindex 3333333..4444444 100644\n--- a/a.go\n+++ b/a.go\n@@ -7,3 +7,3 @@ func f()\n-x\n+y\n",
+	}
+	mergeBases := map[string]string{"main..." + sha('a'): "mb1"}
+	baseFiles := map[string][]string{"mb0...mb1": {"a.go"}}
+	app := &ghRepoData{}
+	app.Open.Nodes = []ghPR{
+		// alice-only earlier approval, unchanged diff: stale, never approved-unmerged
+		pr(10, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", sha('a'), 1*h), review("alice", "APPROVED", shaB, 20*h), head(sha('a'))),
+		// case A: alice approved first, kevin later on another earlier head
+		pr(11, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", sha('a'), 1*h), review("alice", "APPROVED", shaB, 25*h), review("kevin", "APPROVED", sha('k'), 20*h), head(sha('a'))),
+		// case B: alice approved the current head, kevin an earlier one
+		pr(12, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", sha('a'), 1*h), review("alice", "APPROVED", sha('a'), 1*h), review("kevin", "APPROVED", sha('k'), 20*h), head(sha('a'))),
+	}
+	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, diffs: diffs, mergeBases: mergeBases, baseFiles: baseFiles}
+	p, in := newGitHubTest(t, fx, []string{"artie"})
+	in.Settings.Assistant.Sweep.GitHub.Humans = []string{"kevin", "alice"}
+	findings, err := p.Sweep(context.Background(), in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := map[string]Finding{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = f
+	}
+	if _, ok := got["approval-stale/acme/app#10"]; !ok {
+		t.Errorf("alice's stale approval must still be reported as approval-stale: %v", keysOf(got))
+	}
+	if _, ok := got["approved-unmerged/acme/app#10"]; ok {
+		t.Error("a non-approver's base-only approval must not read as approved-unmerged")
+	}
+	kevinAt := ago(20 * time.Hour).UTC().Format(time.RFC3339)
+	for _, n := range []string{"11", "12"} {
+		f, ok := got["approved-unmerged/acme/app#"+n]
+		if !ok || f.Fields["human"] != "kevin" || f.Fields["approval"] != "base_merged" || f.Fingerprint != sha('k')+"|"+kevinAt {
+			t.Errorf("acme/app#%s: kevin's base-only approval must count whatever alice did: ok=%v %+v", n, ok, f)
+		}
+	}
+	if _, ok := got["approval-stale/acme/app#12"]; ok {
+		t.Error("case B: a human approval on the head is not stale")
+	}
+
+	// No configured approver: alice's earliest approval counts.
+	p.repos = func() ([]repoRef, error) {
+		return []repoRef{{Owner: "acme", Name: "app", Rig: "app", Reviewer: "phaware-val"}}, nil
+	}
+	findings, err = p.Sweep(context.Background(), in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got = map[string]Finding{}
+	for _, f := range findings {
+		got[f.Kind+"/"+f.Key] = f
+	}
+	if f, ok := got["approved-unmerged/acme/app#10"]; !ok || f.Fields["human"] != "alice" || f.Fields["approval"] != "base_merged" {
+		t.Errorf("without a configured approver any human's base-only approval counts: ok=%v %+v", ok, f)
+	}
+}
+
+// An acknowledged base-merged approved-unmerged item survives a sweep whose
+// compare fails (error or spent budget): the finding is kept as "unknown"
+// with the same fingerprint, so the clean sweep after that reports it as
+// standing, not new.
+func TestGitHubPort_ApprovedUnmergedSurvivesCompareFailure(t *testing.T) {
+	h := time.Hour
+	sha := func(c byte) string { return strings.Repeat(string(c), 40) }
+	head := func(sha string) func(*ghPR) { return func(p *ghPR) { p.HeadRefOid = sha } }
+	const approved = "diff --git a/a.go b/a.go\nindex 1111111..2222222 100644\n--- a/a.go\n+++ b/a.go\n@@ -1,3 +1,3 @@ func f()\n-x\n+y\n"
+	diffs := map[string]string{
+		"main..." + shaB:     approved,
+		"main..." + sha('a'): "diff --git a/a.go b/a.go\nindex 3333333..4444444 100644\n--- a/a.go\n+++ b/a.go\n@@ -7,3 +7,3 @@ func f()\n-x\n+y\n",
+	}
+	app := &ghRepoData{}
+	app.Open.Nodes = []ghPR{pr(1, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", sha('a'), 1*h), review("kevin", "APPROVED", shaB, 20*h), head(sha('a')))}
+	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, diffs: diffs, mergeBases: map[string]string{"main..." + sha('a'): "mb1"}, baseFiles: map[string][]string{"mb0...mb1": {"a.go"}}}
+	p, in := newGitHubTest(t, fx, []string{"artie"})
+	town := t.TempDir()
+	in.Settings.Assistant.Sweep.Ports = []string{"github"}
+	r := &Runner{TownRoot: town, Settings: in.Settings, Ports: map[string]Port{"github": p}, Store: NewStore(town), Now: func() time.Time { return ghNow }}
+	ctx := context.Background()
+	newKeys := func(rep *Report) []string {
+		var out []string
+		for _, f := range rep.Ports[0].New {
+			out = append(out, f.Kind+"/"+f.Key)
+		}
+		return out
+	}
+	rep, err := r.Run(ctx, Options{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ks := newKeys(rep); !slices.Contains(ks, "approved-unmerged/acme/app#1") {
+		t.Fatalf("first sweep must report the base-merged approval as new, got %v", ks)
+	}
+	if err := r.Store.Ack(rep.RunID, r.Now()); err != nil {
+		t.Fatal(err)
+	}
+	fx.compareFail = []string{"main..." + shaB}
+	rep2, err := r.Run(ctx, Options{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ks := newKeys(rep2); slices.Contains(ks, "approved-unmerged/acme/app#1") {
+		t.Errorf("a failed compare must not re-page the acknowledged item, got new %v", ks)
+	}
+	if err := r.Store.Ack(rep2.RunID, r.Now()); err != nil {
+		t.Fatal(err)
+	}
+	fx.compareFail = nil
+	rep3, err := r.Run(ctx, Options{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ks := newKeys(rep3); slices.Contains(ks, "approved-unmerged/acme/app#1") {
+		t.Errorf("the clean sweep after a failed compare must report the item as standing, got new %v", ks)
 	}
 }

@@ -179,6 +179,7 @@ func (p *GitHubPort) Suggestions() []string {
 		"{key} only merged its base branch since {human} approved: no new review needed",
 		"check why {key} is not merged yet",
 		"ask the refinery to merge {key}: {human} approved it and only the base branch was merged since",
+		"re-check {key} before merging: {human} approved an earlier head and the compare since could not be verified",
 		"respond to review comments on {key}",
 		"start the internal review loop on {key}",
 		"fix ci on {key}",
@@ -200,6 +201,7 @@ func (p *GitHubPort) Schema() map[string]Shape {
 		"head":            ShapeSHA,
 		"ci":              ShapeEnum, // success | failure | pending | none
 		"diff":            ShapeEnum, // approval-stale: unchanged | changed | unknown since the approved head
+		"approval":        ShapeEnum, // approved-unmerged: head | base_merged | unknown
 		"threads":         ShapeInt,  // unresolved review threads
 		"requested_at":    ShapeTime,
 		"rig":             ShapeEnum,
@@ -1219,15 +1221,22 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 			out = append(out, f)
 		}
 	}
-	// The approval that counts for "approved but not merged": the human's
-	// approval on the current head, or an earlier approval whose PR diff is
-	// unchanged since (only the base branch was merged in), which the
-	// refinery's merge-in strategy produces on every sibling merge and which
-	// needs no new review. A material change or an unanswerable compare
-	// leaves only the approval-stale finding.
-	effectiveApprover, effectiveAt, effectiveOid, approvalVia := "", time.Time{}, "", ""
-	if approverOK {
-		effectiveApprover, effectiveAt, effectiveOid, approvalVia = humanApprovedHead, approvedAt, head, "head"
+	// One compare per approved head: approval-stale and the base-merged
+	// approval below may ask about the same head.
+	compares := map[string]struct {
+		diff string
+		err  error
+	}{}
+	compare := func(approvedOid string) (string, error) {
+		if c, ok := compares[approvedOid]; ok {
+			return c.diff, c.err
+		}
+		diff, err := diffSince(ref, pr.BaseRefName, approvedOid, head)
+		compares[approvedOid] = struct {
+			diff string
+			err  error
+		}{diff, err}
+		return diff, err
 	}
 	if humanApprovedHead == "" && humanApprovedOld != "" {
 		f := base("approval-stale", SeverityActionable)
@@ -1241,16 +1250,13 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 		// failure must not make the port partial — and stop eviction — on
 		// every sweep; the reason is fenced so it is not lost.
 		approvedOid := latest[humanApprovedOld].oid
-		diff, err := diffSince(ref, pr.BaseRefName, approvedOid, head)
+		diff, err := compare(approvedOid)
 		if err != nil {
 			f.External["diff_error"] = err.Error()
 		}
 		f.Fields["diff"] = diff
 		if diff == "unchanged" {
 			f.Suggest = key + " only merged its base branch since " + humanApprovedOld + " approved: no new review needed"
-			if ref.Approver == "" || strings.EqualFold(humanApprovedOld, ref.Approver) {
-				effectiveApprover, effectiveAt, effectiveOid, approvalVia = humanApprovedOld, latest[humanApprovedOld].at, approvedOid, "base-merged"
-			}
 		} else {
 			f.Suggest = "ask " + humanApprovedOld + " to re-approve " + key
 		}
@@ -1261,19 +1267,59 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 		f.Fingerprint = head + "|" + approvedOid
 		out = append(out, f)
 	}
+	// The approval that counts for "approved but not merged": the required
+	// human's approval on the current head, or their approval on an earlier
+	// head whose PR diff is unchanged since — only the base branch was
+	// merged in, which the refinery's merge-in update strategy does on every
+	// sibling merge and which needs no new review. With a configured
+	// approver only their own approval counts, whatever other humans did on
+	// any head; without one, the earliest human approval does. A compare
+	// that cannot answer keeps the finding with approval "unknown" and the
+	// same fingerprint: a transient error or a spent compare budget must not
+	// evict an acknowledged item and re-page it on the next clean sweep.
+	effectiveApprover, effectiveAt, effectiveOid, approvalVia := "", time.Time{}, "", ""
+	var approvalErr error
+	if approverOK {
+		effectiveApprover, effectiveAt, effectiveOid, approvalVia = humanApprovedHead, approvedAt, head, "head"
+	} else {
+		candidate := ""
+		if ref.Approver != "" {
+			if r, ok := latest[strings.ToLower(ref.Approver)]; ok && r.state == "APPROVED" && r.oid != head {
+				candidate = strings.ToLower(ref.Approver)
+			}
+		} else if humanApprovedHead == "" {
+			candidate = humanApprovedOld
+		}
+		if candidate != "" {
+			r := latest[candidate]
+			diff, err := compare(r.oid)
+			switch diff {
+			case "unchanged":
+				effectiveApprover, effectiveAt, effectiveOid, approvalVia = candidate, r.at, r.oid, "base_merged"
+			case "unknown":
+				effectiveApprover, effectiveAt, effectiveOid, approvalVia, approvalErr = candidate, r.at, r.oid, "unknown", err
+			}
+		}
+	}
 	if effectiveApprover != "" && ci == "success" && now.Sub(effectiveAt) >= d.approvedUnmerged {
 		f := base("approved-unmerged", SeverityActionable)
 		f.Since = effectiveAt
 		f.Fields["human"] = effectiveApprover
 		f.Fields["approval"] = approvalVia
-		if approvalVia == "base-merged" {
+		switch approvalVia {
+		case "base_merged":
 			f.Suggest = "ask the refinery to merge " + key + ": " + effectiveApprover + " approved it and only the base branch was merged since"
-		} else {
+		case "unknown":
+			f.Suggest = "re-check " + key + " before merging: " + effectiveApprover + " approved an earlier head and the compare since could not be verified"
+			if approvalErr != nil {
+				f.External["diff_error"] = approvalErr.Error()
+			}
+		default:
 			f.Suggest = "check why " + key + " is not merged yet"
 		}
-		// Keyed on the approved head, not the current one: a base merge
-		// moves the head without changing what was approved and must not
-		// re-page an acknowledged item.
+		// Keyed on the approved head and time, not the current head: a
+		// base merge moves the head without changing what was approved
+		// and must not re-page an acknowledged item.
 		f.Fingerprint = effectiveOid + "|" + effectiveAt.UTC().Format(time.RFC3339)
 		out = append(out, f)
 	}
