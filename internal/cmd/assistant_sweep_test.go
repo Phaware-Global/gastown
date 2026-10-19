@@ -42,3 +42,21 @@ func TestAssistantSweepTriggerNamesRegisteredCommand(t *testing.T) {
 		t.Fatal("gt assistant sweep is not registered but the trigger mail names it")
 	}
 }
+
+// The brief trigger carries the exact brief-and-archive commands, skips an
+// empty inbox, and never stacks a second trigger on an unarchived one.
+func TestAssistantBriefTriggerScript(t *testing.T) {
+	script, err := os.ReadFile(filepath.Join("..", "..", "plugins", "assistant-brief", "run.sh"))
+	if err != nil {
+		t.Fatalf("assistant-brief run.sh must exist: %v", err)
+	}
+	for _, want := range []string{
+		"gt mail inbox --identity assistant/ --json", "no brief due", "not stacking another",
+		`--subject "BRIEF DUE: $WAITING messages waiting"`,
+		`gt mail send mayor/ -s "BRIEF: <n> items`, "&& gt mail archive <id> <id>", "must list nothing", `never "informational"`,
+	} {
+		if !strings.Contains(string(script), want) {
+			t.Errorf("brief trigger must contain %q", want)
+		}
+	}
+}

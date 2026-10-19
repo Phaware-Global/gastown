@@ -970,6 +970,13 @@ func TestGateCooldownDuration(t *testing.T) {
 	if got := (&Gate{Type: GateCooldown}).CooldownDuration(nil); got != DefaultCooldown {
 		t.Errorf("empty duration: got %q, want %q", got, DefaultCooldown)
 	}
+	brief := &Gate{Type: GateCooldown, Duration: "15m", DurationSetting: "assistant_brief_interval"}
+	if got := brief.CooldownDuration(&config.TownSettings{AssistantBriefIntervalRaw: "10m", AssistantSweepIntervalRaw: "2h"}); got != "10m" {
+		t.Errorf("brief gate must follow assistant_brief_interval: got %q", got)
+	}
+	if got := brief.CooldownDuration(&config.TownSettings{AssistantBriefIntervalRaw: "1m"}); got != "15m" {
+		t.Errorf("below-floor brief interval must fall back to the static duration: got %q", got)
+	}
 	unknown := &Gate{Type: GateCooldown, Duration: "2h", DurationSetting: "no_such_setting"}
 	if got := unknown.CooldownDuration(nil); got != "2h" {
 		t.Errorf("unknown setting must fall back to static duration: got %q", got)
@@ -997,5 +1004,17 @@ func TestShippedSweepPluginGate(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "mayor-loose-ends-nudge")); !os.IsNotExist(err) {
 		t.Error("plugins/mayor-loose-ends-nudge still shipped; the Mayor must no longer receive direct sweep nudges")
+	}
+	bdir := filepath.Join(root, "assistant-brief")
+	bcontent, err := os.ReadFile(filepath.Join(bdir, "plugin.md"))
+	if err != nil {
+		t.Fatalf("reading shipped brief plugin: %v", err)
+	}
+	bp, err := parsePluginMD(bcontent, bdir, LocationTown, "")
+	if err != nil {
+		t.Fatalf("parsing shipped brief plugin: %v", err)
+	}
+	if bp.Gate == nil || bp.Gate.Type != GateCooldown || bp.Gate.DurationSetting != "assistant_brief_interval" {
+		t.Fatalf("brief plugin gate = %+v, want cooldown with duration_setting=assistant_brief_interval", bp.Gate)
 	}
 }

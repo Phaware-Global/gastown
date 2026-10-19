@@ -195,6 +195,11 @@ but leaves it in the inbox; archiving removes it. So the inbox listing is the
 pending set: a message still in `{{ cmd }} mail inbox` is still to brief, an
 archived one is done.
 
+The `assistant-brief` plugin mails you `BRIEF DUE: <n> messages waiting` at
+the town's `assistant_brief_interval` (default 15m) while your inbox holds
+mail. It carries these commands: run them, then archive it. Telegraph events
+are never "informational" for you; each one is an item to brief.
+
 Subject prefixes are a contract with the Mayor:
 - `BRIEF:` — consolidated routine briefing. Send one when you have actionable
   items, and at least once per sweep interval if anything arrived.

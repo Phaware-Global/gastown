@@ -324,6 +324,14 @@ duration = "1h"                              # fallback
 duration_setting = "assistant_sweep_interval" # town setting overrides duration
 ```
 
+Briefing gets the same treatment. The `assistant-brief` plugin (cooldown
+`assistant_brief_interval`, default 15m) mails the assistant a
+`BRIEF DUE: <n> messages waiting` trigger with the exact brief-and-archive
+commands while its inbox holds mail; it sends nothing when the inbox is
+empty and never stacks a second trigger on an unarchived one. On the live
+town the assistant left 73 telegraph events unbriefed for six hours and
+briefed all of them within three minutes of a mail carrying the commands.
+
 Other plugins that mail `mayor/` with findings (sentinels, reports) are
 retargeted to `assistant/` as part of the routing change; their gates
 are untouched.
@@ -661,6 +669,7 @@ prints the queries it would issue instead of calling the API.
 
 | Setting | Where | Default | Purpose |
 |---|---|---|---|
+| `assistant_brief_interval` | `settings/config.json` (town) | `"15m"` | Cooldown for the `assistant-brief` plugin, which mails the assistant a `BRIEF DUE:` trigger carrying the brief-and-archive commands while its inbox holds mail (nothing when it is empty or an earlier trigger is still there). A Go duration of at least `5m`; otherwise the plugin's static `duration`. Exists because the live assistant briefed reliably only when a mail put the commands in front of it. |
 | `assistant_sweep_interval` | `settings/config.json` (town) | `"1h"` | Cooldown for the `assistant-sweep` plugin. A Go duration string of at least `5m` (`"30m"`, `"2h"`); an absent, unparseable or shorter value is ignored and the gate falls back to the plugin's static `duration`, then to 1h. Rendered into the assistant's prompt so it knows its cadence. |
 | `assistant.sweep` | `settings/config.json` (town) | beads port only | Enabled sweep ports and their per-port settings (humans, thresholds, Jira site/board, GitHub repos). See [Sweep ports](#sweep-ports). Secrets come from the named environment variables, never from the file. |
 | `role_agents["assistant"]` | `settings/config.json` (town) | town `default_agent` | Agent/model preset for the assistant, resolved through the same 3-tier hierarchy as every other role. Give it a preset with its write paths closed: the role only reads and mails, and a model that can reach Jira, GitHub or file-editing tools will eventually act on an "assigned to Artie" item (seen live on the first opencode deployment, twice: the second time through the code-execution tool, which can call MCP tools programmatically). Nothing in gt enforces this boundary; the prompt alone is not enough. For opencode the lockdown must be a **config file in the assistant's directory** (`<town>/assistant/opencode.json`), not preset environment: opencode 2.x runs one shared background service for every session on the machine, and that service resolves config from each session's directory upward, so per-process `OPENCODE_CONFIG_CONTENT` / `OPENCODE_PERMISSION` never reach it (verified live: a preset carrying those variables left every tool enabled, and the assistant edited reviewer rigs for ten minutes after its tmux pane was killed, because the turn kept running inside the service). The file is a top-level `permission` block: `{"permission":{"*":"allow","edit":"deny","write":"deny","patch":"deny","multiedit":"deny","execute":"deny","task":"deny","subagent":"deny","atlassian_*":"deny","github_*":"deny","bash":{"*":"allow","git push*":"deny","gh pr comment*":"deny","gh pr review*":"deny","gh pr merge*":"deny","gh api*":"deny","curl*":"deny","sed -i*":"deny", …}}}` (the `"*"` catch-all first; the last matching rule wins). It applies only to sessions started in that directory, so the deacon and dogs under the same town are untouched. Verify after any change with a probe from the same directory, `opencode run "use the write tool to create ./probe.txt"`, which must answer that the tool is unavailable. The deprecated `tools` map and `OPENCODE_PERMISSION` are not honoured by the service. Bash remains a write path for anything the deny list misses (shell redirection can still write files), and the sweep's `JIRA_API_TOKEN` / GitHub token sit in the session environment: give the sweep read-only scoped tokens where the provider offers them. |

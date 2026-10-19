@@ -135,6 +135,12 @@ type TownSettings struct {
 	// default and rejects unparseable values.
 	AssistantSweepIntervalRaw string `json:"assistant_sweep_interval,omitempty"`
 
+	// AssistantBriefIntervalRaw is the cooldown of the assistant-brief
+	// plugin, which reminds the Mayor's Assistant to brief the Mayor when its
+	// inbox holds mail, as a Go duration string. Default "15m". Read through
+	// AssistantBriefIntervalSetting().
+	AssistantBriefIntervalRaw string `json:"assistant_brief_interval,omitempty"`
+
 	// CodeGraph configures automatic codegraph indexing of new worktrees.
 	// A rig-level CodeGraph setting overrides this town-level setting.
 	// Default: enabled (nil = inherit default true).
