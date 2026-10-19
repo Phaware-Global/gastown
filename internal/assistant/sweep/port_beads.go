@@ -17,6 +17,11 @@ import (
 // DefaultBeadsStaleAfter is the beads port's staleness window when unset.
 const DefaultBeadsStaleAfter = 72 * time.Hour
 
+// DefaultUnslungMaxAge is how old a ready, unassigned bead may be (by
+// creation) and still count as unslung work: older beads are backlog the
+// Mayor chose not to sling, and listing them every sweep buries the new ones.
+const DefaultUnslungMaxAge = 14 * 24 * time.Hour
+
 // Page caps: a result that fills its cap may be truncated, which the port
 // reports as partial so standing entries beyond the cut are never evicted.
 const (
@@ -97,10 +102,35 @@ func staleAfter(in Input) time.Duration {
 	return DefaultBeadsStaleAfter
 }
 
+// unslungMaxAge returns the unslung age cap: the configured duration, the
+// default when unset or unparseable, and no cap (zero) when configured as "0".
+func unslungMaxAge(in Input) time.Duration {
+	raw := in.Settings.BeadsSweep().UnslungMaxAge
+	if raw == "" {
+		return DefaultUnslungMaxAge
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 {
+		return DefaultUnslungMaxAge
+	}
+	return d
+}
+
+// createdAt parses a bead's creation time, falling back to its update time.
+func createdAt(i *beads.Issue, now time.Time) time.Time {
+	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05"} {
+		if t, err := time.Parse(layout, i.CreatedAt); err == nil {
+			return t
+		}
+	}
+	return updatedAt(i, now)
+}
+
 // Sweep runs the five beads checks. Rig store failures are reported as a
 // PartialError so the runner keeps that rig's acknowledged entries.
 func (p *BeadsPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	stale := staleAfter(in)
+	maxAge := unslungMaxAge(in)
 	var out []Finding
 	var partial []string
 
@@ -177,9 +207,13 @@ func (p *BeadsPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 			if beads.HasLabel(i, "gt:escalation") || beads.IsProtectedBead(i) {
 				continue // escalations and agent/rig/role identity beads are not slingable work
 			}
-			if i.HookBead == "" && i.Assignee == "" {
-				out = append(out, p.finding("unslung", rig, i, in.Now, SeverityInfo, fmt.Sprintf("`gt sling %s %s`", i.ID, rig)))
+			if i.HookBead != "" || i.Assignee != "" {
+				continue
 			}
+			if maxAge > 0 && in.Now.Sub(createdAt(i, in.Now)) > maxAge {
+				continue // backlog, not a loose end: older than unslung_max_age
+			}
+			out = append(out, p.finding("unslung", rig, i, in.Now, SeverityInfo, fmt.Sprintf("`gt sling %s %s`", i.ID, rig)))
 		}
 	}
 	if len(partial) > 0 {
