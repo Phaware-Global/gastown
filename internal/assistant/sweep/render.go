@@ -111,11 +111,12 @@ func Subject(r *Report) string {
 	if n == 0 && len(marks) == 0 {
 		return fmt.Sprintf("SWEEP: all clear (checked: %s)", strings.Join(checked, ", "))
 	}
-	subject := fmt.Sprintf("SWEEP: %d new findings (%s", n, strings.Join(checked, ", "))
-	if len(marks) > 0 {
-		subject += "; " + strings.Join(marks, "; ")
+	var parts []string
+	if len(checked) > 0 {
+		parts = append(parts, strings.Join(checked, ", "))
 	}
-	return subject + ")"
+	parts = append(parts, marks...)
+	return fmt.Sprintf("SWEEP: %d new findings (%s)", n, strings.Join(parts, "; "))
 }
 
 // ShouldMail reports whether a report is worth a deterministic SWEEP: mail:

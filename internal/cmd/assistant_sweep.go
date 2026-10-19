@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -61,7 +62,7 @@ func init() {
 	assistantSweepCmd.Flags().BoolVar(&assistantSweepJSON, "json", false, "Emit the report as JSON (does not record state)")
 	assistantSweepCmd.Flags().BoolVar(&assistantSweepDryRun, "dry-run", false, "Local ports run; external ports only print the queries they would issue; nothing is recorded")
 	assistantSweepCmd.Flags().StringVar(&assistantSweepAck, "ack", "", "Acknowledge a pending run (after mailing the Mayor) by its run ID")
-	assistantSweepCmd.Flags().StringVar(&assistantSweepSendTo, "send-to", "", "Run, mail the report verbatim to this address (e.g. mayor/) when there is something new, and acknowledge the run")
+	assistantSweepCmd.Flags().StringVar(&assistantSweepSendTo, "send-to", "", "Run, mail the report verbatim to mayor/ (the only accepted address) when there is something new, and acknowledge the run")
 	assistantSweepCmd.Flags().BoolVar(&assistantSweepProtocol, "protocol", false, "Print the sweep procedure for the configured assistant.sweep.mode (the trigger mail body) and exit")
 	assistantCmd.AddCommand(assistantSweepCmd)
 }
@@ -113,38 +114,62 @@ func runAssistantSweep(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// sendSweepReport mails the rendered report verbatim to the recipient and
+// Seams for tests: how a sweep report is mailed and how a run is acked.
+var (
+	sweepSend = func(workDir string, msg *mail.Message) error {
+		router := mail.NewRouter(workDir)
+		defer router.WaitPendingNotifications()
+		return router.Send(msg)
+	}
+	sweepAck = func(townRoot, runID string) error {
+		return sweep.NewStore(townRoot).Ack(runID, time.Now())
+	}
+)
+
+// sweepRecipient is the only --send-to address: the sweep report is for the
+// Mayor, and a trigger mail (unauthenticated, as all mail is) must not be
+// able to redirect it to another agent and ack it there.
+const sweepRecipient = "mayor/"
+
+// sendSweepReport mails the rendered report verbatim to the Mayor and
 // acknowledges the run only after the send succeeded, so a failed send leaves
-// the run pending and the next sweep reports everything again. The assistant
-// never handles the report text: it only sees the summary printed here.
+// the run pending and the next sweep reports everything again. A run with
+// nothing new from ports that all ran clean is acked without a mail. The
+// assistant never handles the report text: it only sees the summary.
 func sendSweepReport(townRoot, to string, report *sweep.Report) error {
+	if strings.TrimSuffix(to, "/") != strings.TrimSuffix(sweepRecipient, "/") {
+		return fmt.Errorf("--send-to only accepts %s (the sweep report is for the Mayor); run %s is pending, not acknowledged", sweepRecipient, report.RunID)
+	}
+	to = sweepRecipient
 	if !sweep.ShouldMail(report) {
 		if report.Pending {
-			if err := sweep.NewStore(townRoot).Ack(report.RunID, time.Now()); err != nil {
+			if err := sweepAck(townRoot, report.RunID); err != nil {
 				return fmt.Errorf("nothing new, but run %s could not be acknowledged: %w", report.RunID, err)
 			}
 		}
 		fmt.Printf("%s Nothing new: no mail sent to %s; run %s acknowledged\n%s", style.Bold.Render("✓"), to, report.RunID, sweep.Summary(report))
 		return nil
 	}
-	from := detectSender()
-	if from == "" {
-		return fmt.Errorf("cannot determine the sender identity (GT_ROLE is unset); report %s is pending, not acknowledged", report.RunID)
+	// The sender must be a real agent identity: without GT_ROLE, detectSender
+	// falls back to "overseer", the human, which this report must never
+	// claim to come from.
+	if os.Getenv("GT_ROLE") == "" {
+		return fmt.Errorf("GT_ROLE is unset, so the sender cannot be determined; run %s is pending, not acknowledged", report.RunID)
 	}
+	from := detectSender()
 	workDir, err := findMailWorkDir()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
 	}
 	msg := mail.NewMessage(from, to, sweep.Subject(report), sweep.Markdown(report))
 	msg.ThreadID = generateThreadID()
-	router := mail.NewRouter(workDir)
-	defer router.WaitPendingNotifications()
-	if err := router.Send(msg); err != nil {
+	msg.Wisp = true // like gt mail send's default: a report every interval must not pile up permanent beads
+	if err := sweepSend(workDir, msg); err != nil {
 		return fmt.Errorf("sending the sweep report to %s: %w (run %s is pending, not acknowledged)", to, err, report.RunID)
 	}
 	_ = events.LogFeed(events.TypeMail, from, events.MailPayload(to, msg.Subject))
 	if report.Pending {
-		if err := sweep.NewStore(townRoot).Ack(report.RunID, time.Now()); err != nil {
+		if err := sweepAck(townRoot, report.RunID); err != nil {
 			return fmt.Errorf("report mailed to %s but run %s could not be acknowledged: %w", to, report.RunID, err)
 		}
 	}

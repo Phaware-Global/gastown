@@ -31,8 +31,8 @@ const triggerInference = `This town runs sweeps in inference mode: the report is
 judgement, not the mail itself. Follow the Sweep Protocol in your role
 prompt; in short:
 
-  r="$GT_ROOT/assistant/.runtime/sweep-report.md"
-  gt assistant sweep > "$r"        # save the report; read it from the file
+  mkdir -p "$GT_ROOT/assistant/.runtime" && umask 077 && r="$GT_ROOT/assistant/.runtime/sweep-report.md" \
+    && gt assistant sweep > "$r" && test -s "$r"   # save the report; read it from the file
   (decide: verify findings read-only if needed, then mail the Mayor the
    report with your header, fold it into your BRIEF, or send nothing)
   gt assistant sweep --ack "$(sed -n 's/^Run-ID: //p' "$r")"

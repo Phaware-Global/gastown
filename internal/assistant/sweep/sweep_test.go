@@ -704,6 +704,7 @@ func TestSubject(t *testing.T) {
 		{"all clear", []PortResult{{Name: "beads"}, {Name: "jira"}}, "SWEEP: all clear (checked: beads, jira)"},
 		{"new plus overflow", []PortResult{{Name: "beads", New: f(2), Overflow: []Standing{{Kind: "unslung", Count: 30}}}, {Name: "github", New: f(1)}}, "SWEEP: 33 new findings (beads, github)"},
 		{"errored port is not all clear", []PortResult{{Name: "beads"}, {Name: "jira", Error: "500"}}, "SWEEP: 0 new findings (beads; not checked: jira)"},
+		{"every port failed", []PortResult{{Name: "beads", Error: "dolt down"}}, "SWEEP: 0 new findings (not checked: beads)"},
 		{"partial and dry run", []PortResult{{Name: "beads", New: f(1), Partial: true}, {Name: "github", DryRun: true}}, "SWEEP: 1 new findings (beads; PARTIAL: beads; DRY RUN: github)"},
 	} {
 		if got := Subject(&Report{Ports: c.ports}); got != c.want {
