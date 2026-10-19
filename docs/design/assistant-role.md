@@ -328,7 +328,11 @@ Briefing gets the same treatment. The `assistant-brief` plugin (cooldown
 `assistant_brief_interval`, default 15m) mails the assistant a
 `BRIEF DUE: <n> messages waiting` trigger with the exact brief-and-archive
 commands while its inbox holds mail; it sends nothing when the inbox is
-empty and never stacks a second trigger on an unarchived one. On the live
+empty or while an earlier trigger is still unread and under 45 minutes old,
+and sends `BRIEF OVERDUE:` when an earlier trigger was read or aged without
+being archived, so an ignored trigger cannot stop briefing silently. The
+body repeats the role's trust boundary (source address per item, external
+text only inside `EXTERNAL CONTENT` blocks) and says no reply is needed. On the live
 town the assistant left 73 telegraph events unbriefed for six hours and
 briefed all of them within three minutes of a mail carrying the commands.
 

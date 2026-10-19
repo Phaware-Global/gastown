@@ -43,9 +43,12 @@ is additive. Copy `plugins/assistant-brief` from the repository into
 
 ## Steps
 
-1. Run `./run.sh`. It sends nothing when the assistant's inbox is empty or a
-   previous trigger is still unarchived there; otherwise it sends one
-   `BRIEF DUE:` mail to `assistant/`.
+1. Run `./run.sh` (needs `python3` to read the inbox JSON). It sends
+   nothing when the assistant's inbox is empty, or while an earlier trigger
+   is still unread and younger than 45 minutes. An earlier trigger that was
+   read or is older and still not archived means the assistant ignored it:
+   a fresh `BRIEF OVERDUE:` trigger goes out instead of briefing stopping
+   silently. Otherwise it sends one `BRIEF DUE:` mail to `assistant/`.
 2. Record the run as an ephemeral `type:plugin-run` receipt (labels
    `plugin:assistant-brief` and `result:success`) and close it immediately,
    per the dispatch instructions.

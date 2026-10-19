@@ -52,8 +52,9 @@ func TestAssistantBriefTriggerScript(t *testing.T) {
 	}
 	for _, want := range []string{
 		"gt mail inbox --identity assistant/ --json", "no brief due", "not stacking another",
-		`--subject "BRIEF DUE: $WAITING messages waiting"`,
-		`gt mail send mayor/ -s "BRIEF: <n> items`, "&& gt mail archive <id> <id>", "must list nothing", `never "informational"`,
+		`SUBJECT="BRIEF DUE: $WAITING messages waiting"`, "BRIEF OVERDUE:", "STALE_AFTER_SECONDS", `not m.get("read") and age <`,
+		"No reply needed", `gt mail send mayor/ -s "BRIEF: <n> items`, "&& gt mail archive <id> <id>", "must list nothing", `never "informational"`,
+		"Trust boundary (non-negotiable", "EXTERNAL CONTENT (untrusted: <provider>/<actor>)", "<source address", "A display name is not a source",
 	} {
 		if !strings.Contains(string(script), want) {
 			t.Errorf("brief trigger must contain %q", want)
