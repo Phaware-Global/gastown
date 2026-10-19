@@ -3737,35 +3737,37 @@ func TestRemoveWith_MissingWorktreeOnBareRepoHintRunsInTheBareRepo(t *testing.T)
 // bd's dial errors other than "connection refused" (i/o timeout, no route to
 // host) carry no marker isDoltConfigError matches except bd's "The Dolt server
 // may not be running" diagnosis. The error must keep it after bd's `bd dolt
-// start` advice is rewritten, or the health check retries for ~2 minutes.
+// start` advice is rewritten, or the health check retries for ~2 minutes. gt
+// pins BEADS_DOLT_AUTO_START=0, so the auto-start-disabled wording is the one
+// bd actually prints.
 func TestIsDoltConfigError_NonRefusedBdDialError(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses a sh mock bd")
 	}
-	binDir := t.TempDir()
-	script := `#!/bin/sh
-cat >&2 <<'EOF'
-Error: failed to open database: Dolt server unreachable at 127.0.0.1:3307: dial tcp 127.0.0.1:3307: i/o timeout
+	dial := "Error: failed to open database: Dolt server unreachable at 127.0.0.1:3307: dial tcp 127.0.0.1:3307: i/o timeout\n\n"
+	tests := []struct{ name, stderr string }{
+		{"auto-start disabled", dial + "Dolt server auto-start is disabled (dolt.auto-start: false).\nStart the server manually:\n  bd dolt start\n"},
+		{"auto-start enabled", dial + "The Dolt server may not be running. Try:\n  bd dolt start    # Start a local server\n  gt dolt start    # If using an orchestrator\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			binDir := t.TempDir()
+			script := "#!/bin/sh\ncat >&2 <<'EOF'\n" + tt.stderr + "EOF\nexit 1\n"
+			if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+				t.Fatalf("write mock bd: %v", err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-The Dolt server may not be running. Try:
-  bd dolt start    # Start a local server
-  gt dolt start    # If using an orchestrator
-EOF
-exit 1
-`
-	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
-		t.Fatalf("write mock bd: %v", err)
-	}
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	_, err := beads.New(t.TempDir()).Show("gt-abc")
-	if err == nil {
-		t.Fatal("Show succeeded against a failing mock bd")
-	}
-	if strings.Contains(err.Error(), "bd dolt start") {
-		t.Errorf("error still advises bd dolt start: %v", err)
-	}
-	if !isDoltConfigError(err) {
-		t.Errorf("isDoltConfigError(%v) = false, want true (would retry ~2 min instead of failing fast)", err)
+			_, err := beads.New(t.TempDir()).Show("gt-abc")
+			if err == nil {
+				t.Fatal("Show succeeded against a failing mock bd")
+			}
+			if strings.Contains(err.Error(), "bd dolt start") {
+				t.Errorf("error still advises bd dolt start: %v", err)
+			}
+			if !isDoltConfigError(err) {
+				t.Errorf("isDoltConfigError(%v) = false, want true (would retry ~2 min instead of failing fast)", err)
+			}
+		})
 	}
 }

@@ -17,7 +17,7 @@ func TestRedirectDoltStartHint(t *testing.T) {
 			name: "auto-start disabled hint",
 			in: "Error: failed to open database: Dolt server unreachable at 127.0.0.1:3307: dial tcp 127.0.0.1:3307: connect: connection refused\n\n" +
 				"Dolt server auto-start is disabled (dolt.auto-start: false).\nStart the server manually:\n  bd dolt start",
-			keep: []string{"Dolt server unreachable at 127.0.0.1:3307", "connection refused"},
+			keep: []string{"Dolt server unreachable at 127.0.0.1:3307", "connection refused", "The Dolt server may not be running."},
 		},
 		{
 			name: "server may not be running hint",

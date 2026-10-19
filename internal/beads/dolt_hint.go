@@ -23,22 +23,25 @@ const DoltStartGuidance = "Dolt is managed by Gas Town, not by bd. Do NOT start 
 const serverMayNotBeRunning = "The Dolt server may not be running."
 
 // RedirectDoltStartHint rewrites every line of bd output that advises running
-// `bd dolt start` into DoltStartGuidance (once per message) and drops the
-// "Try:" lead-in that introduced the advice, keeping its diagnosis. Output
-// without the advice is returned as is.
+// `bd dolt start` into DoltStartGuidance (once per message) and replaces the
+// lead-in that introduced the advice with its diagnosis, once. gt pins
+// BEADS_DOLT_AUTO_START=0, so the lead-in it sees from bd is "Start the server
+// manually:", not "may not be running. Try:". Output without the advice is
+// returned as is.
 func RedirectDoltStartHint(s string) string {
 	if !strings.Contains(s, "bd dolt start") {
 		return s
 	}
 	lines := strings.Split(s, "\n")
 	out := make([]string, 0, len(lines))
-	redirected := false
+	redirected, diagnosed := false, false
 	for _, line := range lines {
 		switch trimmed := strings.TrimSpace(line); {
-		case trimmed == "Start the server manually:":
-			continue
-		case trimmed == serverMayNotBeRunning+" Try:":
-			out = append(out, serverMayNotBeRunning)
+		case trimmed == "Start the server manually:" || trimmed == serverMayNotBeRunning+" Try:":
+			if !diagnosed {
+				out = append(out, serverMayNotBeRunning)
+				diagnosed = true
+			}
 		case strings.Contains(line, "bd dolt start"):
 			if !redirected {
 				out = append(out, DoltStartGuidance)
