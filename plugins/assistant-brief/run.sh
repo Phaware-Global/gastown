@@ -21,15 +21,17 @@ msgs = json.load(sys.stdin) or []
 waiting = fresh = stale = 0
 now = datetime.now(timezone.utc)
 for m in msgs:
-    # Mail from a deacon dog is a trigger (this one, or the hourly SWEEP
-    # trigger that stays until the sweep is acked), never an item to brief.
-    # Only BRIEF DUE/OVERDUE triggers decide suppression. A look-alike
-    # subject from any other sender is ordinary mail to brief.
+    # Only the known triggers from a deacon dog are not items to brief: the
+    # BRIEF DUE/OVERDUE triggers and the SWEEP trigger, which stays until the
+    # sweep is acked. Every other mail is briefable, including findings dogs
+    # send (orphan-pr-sentinel, Quality BREACH) and look-alike subjects from
+    # any other sender. Only BRIEF triggers decide suppression.
     subject = str(m.get("subject", ""))
-    if not str(m.get("from", "")).startswith("deacon/dogs/"):
-        waiting += 1
+    from_dog = str(m.get("from", "")).startswith("deacon/dogs/")
+    if from_dog and subject.startswith("SWEEP: loose-ends sweep due"):
         continue
-    if not subject.startswith(("BRIEF DUE:", "BRIEF OVERDUE:")):
+    if not (from_dog and subject.startswith(("BRIEF DUE:", "BRIEF OVERDUE:"))):
+        waiting += 1
         continue
     try:
         ts = datetime.fromisoformat(str(m.get("timestamp", "")).replace("Z", "+00:00"))

@@ -65,8 +65,9 @@ func TestAssistantBriefTriggerScript(t *testing.T) {
 	}
 }
 
-// The brief trigger's guard, run for real against a stub gt: mail from a dog
-// (this trigger or the sweep trigger) never counts as mail to brief, an unread fresh trigger suppresses a new
+// The brief trigger's guard, run for real against a stub gt: the known dog
+// triggers (BRIEF DUE/OVERDUE, SWEEP) never count as mail to brief while a
+// dog's findings do, an unread fresh trigger suppresses a new
 // one, a read or old trigger left in the inbox brings BRIEF OVERDUE, and a
 // look-alike subject from another sender is ordinary mail.
 func TestAssistantBriefTriggerGuard(t *testing.T) {
@@ -92,6 +93,7 @@ func TestAssistantBriefTriggerGuard(t *testing.T) {
 	readTrigger := msg("BRIEF DUE: 1 messages waiting", "deacon/dogs/alpha", time.Minute, true)
 	spoof := msg("BRIEF DUE: 9 messages waiting", "gastown/polecats/nux", time.Minute, false)
 	sweepTrigger := msg("SWEEP: loose-ends sweep due", "deacon/dogs/bravo", 2*time.Minute, false)
+	dogReport := msg("orphan-pr-sentinel: 2 PR(s) with no owning bead", "deacon/dogs/charlie", time.Minute, false)
 	for _, c := range []struct {
 		name, inbox, want string
 	}{
@@ -105,6 +107,8 @@ func TestAssistantBriefTriggerGuard(t *testing.T) {
 		{"look-alike from another sender is mail", "[" + spoof + "]", "SENT BRIEF DUE: 1 messages waiting"},
 		{"only a pending sweep trigger", "[" + sweepTrigger + "]", "no brief due"},
 		{"mail and a sweep trigger", "[" + event + "," + sweepTrigger + "]", "SENT BRIEF DUE: 1 messages waiting"},
+		{"a dog's finding is mail to brief", "[" + dogReport + "]", "SENT BRIEF DUE: 1 messages waiting"},
+		{"a dog's finding and a read trigger", "[" + dogReport + "," + readTrigger + "]", "SENT BRIEF OVERDUE: 1 messages waiting"},
 	} {
 		inbox := filepath.Join(t.TempDir(), "inbox.json")
 		if err := os.WriteFile(inbox, []byte(c.inbox), 0o644); err != nil {
