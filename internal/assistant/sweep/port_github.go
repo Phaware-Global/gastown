@@ -201,7 +201,7 @@ func (p *GitHubPort) Schema() map[string]Shape {
 		"head":            ShapeSHA,
 		"ci":              ShapeEnum, // success | failure | pending | none
 		"diff":            ShapeEnum, // approval-stale: unchanged | changed | unknown since the approved head
-		"approval":        ShapeEnum, // approved-unmerged: head | base_merged | unknown
+		"approval":        ShapeEnum, // approved-unmerged: head | base_merged | changed | unknown
 		"threads":         ShapeInt,  // unresolved review threads
 		"requested_at":    ShapeTime,
 		"rig":             ShapeEnum,
@@ -1269,14 +1269,19 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 	}
 	// The approval that counts for "approved but not merged": the required
 	// human's approval on the current head, or their approval on an earlier
-	// head whose PR diff is unchanged since — only the base branch was
-	// merged in, which the refinery's merge-in update strategy does on every
-	// sibling merge and which needs no new review. With a configured
-	// approver only their own approval counts, whatever other humans did on
-	// any head; without one, the earliest human approval does. A compare
-	// that cannot answer keeps the finding with approval "unknown" and the
-	// same fingerprint: a transient error or a spent compare budget must not
-	// evict an acknowledged item and re-page it on the next clean sweep.
+	// head. With a configured approver only their own approval counts,
+	// whatever other humans did on any head; without one, the earliest
+	// human approval does; the persona never does. For an earlier head the
+	// PR's own diff since decides what the finding says: unchanged (only
+	// the base branch was merged in, which the refinery's merge-in update
+	// strategy does on every sibling merge; no new review needed), changed
+	// (re-approval needed), or unknown (the compare errored or the per-sweep
+	// budget was spent). The finding is present for every such candidate
+	// whatever the verdict, with the same fingerprint (approved head and
+	// time): presence must not depend on compare health, or a transient
+	// error evicts an acknowledged item and re-pages it on the next sweep.
+	// The compare runs only once CI is green and the approval old enough,
+	// so a red or young PR spends none of the shared budget here.
 	effectiveApprover, effectiveAt, effectiveOid, approvalVia := "", time.Time{}, "", ""
 	var approvalErr error
 	if approverOK {
@@ -1284,20 +1289,19 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 	} else {
 		candidate := ""
 		if ref.Approver != "" {
-			if r, ok := latest[strings.ToLower(ref.Approver)]; ok && r.state == "APPROVED" && r.oid != head {
-				candidate = strings.ToLower(ref.Approver)
-			}
+			candidate = strings.ToLower(ref.Approver)
 		} else if humanApprovedHead == "" {
 			candidate = humanApprovedOld
 		}
-		if candidate != "" {
-			r := latest[candidate]
+		if r, ok := latest[candidate]; ok && candidate != "" && isHuman[candidate] && !isPersona[candidate] && r.state == "APPROVED" && r.oid != head &&
+			ci == "success" && now.Sub(r.at) >= d.approvedUnmerged {
 			diff, err := compare(r.oid)
+			effectiveApprover, effectiveAt, effectiveOid, approvalVia, approvalErr = candidate, r.at, r.oid, "unknown", err
 			switch diff {
 			case "unchanged":
-				effectiveApprover, effectiveAt, effectiveOid, approvalVia = candidate, r.at, r.oid, "base_merged"
-			case "unknown":
-				effectiveApprover, effectiveAt, effectiveOid, approvalVia, approvalErr = candidate, r.at, r.oid, "unknown", err
+				approvalVia = "base_merged"
+			case "changed":
+				approvalVia = "changed"
 			}
 		}
 	}
@@ -1309,6 +1313,8 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 		switch approvalVia {
 		case "base_merged":
 			f.Suggest = "ask the refinery to merge " + key + ": " + effectiveApprover + " approved it and only the base branch was merged since"
+		case "changed":
+			f.Suggest = "ask " + effectiveApprover + " to re-approve " + key
 		case "unknown":
 			f.Suggest = "re-check " + key + " before merging: " + effectiveApprover + " approved an earlier head and the compare since could not be verified"
 			if approvalErr != nil {
@@ -1317,9 +1323,9 @@ func (p *GitHubPort) checkPR(ref repoRef, pr *ghPR, now time.Time, d githubDurat
 		default:
 			f.Suggest = "check why " + key + " is not merged yet"
 		}
-		// Keyed on the approved head and time, not the current head: a
-		// base merge moves the head without changing what was approved
-		// and must not re-page an acknowledged item.
+		// Keyed on the approved head and time, not the current head or the
+		// verdict: a base merge moves the head without changing what was
+		// approved, and compare health must not re-page an acknowledged item.
 		f.Fingerprint = effectiveOid + "|" + effectiveAt.UTC().Format(time.RFC3339)
 		out = append(out, f)
 	}

@@ -459,9 +459,11 @@ func TestGitHubPort_ApprovalStaleDiff(t *testing.T) {
 		f.Suggest != "re-check acme/app#3 before merging: kevin approved an earlier head and the compare since could not be verified" || !strings.Contains(f.External["diff_error"], "500") {
 		t.Errorf("approved-unmerged on a failed compare must stay, as unknown, with the error fenced: ok=%v %+v", ok, f)
 	}
-	for _, absent := range []string{"approved-unmerged/acme/app#2", "approved-unmerged/acme/app#9"} {
-		if _, ok := got[absent]; ok {
-			t.Errorf("unexpected %s: a changed diff is not an approval", absent)
+	// A changed diff keeps the finding too (presence never depends on the
+	// verdict), saying re-approval is needed, under the same fingerprint.
+	for _, n := range []string{"2", "9"} {
+		if f, ok := got["approved-unmerged/acme/app#"+n]; !ok || f.Fields["approval"] != "changed" || f.Suggest != "ask kevin to re-approve acme/app#"+n || f.Fingerprint != shaB+"|"+kevinAt {
+			t.Errorf("acme/app#%s: a changed diff must still be reported, as changed: ok=%v %+v", n, ok, f)
 		}
 	}
 	for k, f := range got {
@@ -1382,6 +1384,10 @@ func TestGitHubPort_ApprovedUnmergedRequiresTheApprover(t *testing.T) {
 		pr(11, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", sha('a'), 1*h), review("alice", "APPROVED", shaB, 25*h), review("kevin", "APPROVED", sha('k'), 20*h), head(sha('a'))),
 		// case B: alice approved the current head, kevin an earlier one
 		pr(12, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", sha('a'), 1*h), review("alice", "APPROVED", sha('a'), 1*h), review("kevin", "APPROVED", sha('k'), 20*h), head(sha('a'))),
+		// kevin's earlier approval on a PR whose CI is red: no finding, no compare spent
+		pr(13, "artie", 50*h, 2*h, "FAILURE", review("kevin", "APPROVED", sha('k'), 20*h), head(sha('a'))),
+		// the persona approved an earlier head: never counts, even as the configured approver
+		pr(14, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", sha('a'), 1*h), review("artie", "APPROVED", shaB, 20*h), head(sha('a'))),
 	}
 	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, diffs: diffs, mergeBases: mergeBases, baseFiles: baseFiles}
 	p, in := newGitHubTest(t, fx, []string{"artie"})
@@ -1409,6 +1415,24 @@ func TestGitHubPort_ApprovedUnmergedRequiresTheApprover(t *testing.T) {
 	}
 	if _, ok := got["approval-stale/acme/app#12"]; ok {
 		t.Error("case B: a human approval on the head is not stale")
+	}
+	for _, absent := range []string{"approved-unmerged/acme/app#13", "approved-unmerged/acme/app#14"} {
+		if _, ok := got[absent]; ok {
+			t.Errorf("unexpected %s: red CI gates the finding, and the persona is never an approver", absent)
+		}
+	}
+	// The persona configured as the approver (misconfiguration) still never counts.
+	p.repos = func() ([]repoRef, error) {
+		return []repoRef{{Owner: "acme", Name: "app", Rig: "app", Reviewer: "phaware-val", Approver: "artie"}}, nil
+	}
+	findings, err = p.Sweep(context.Background(), in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, f := range findings {
+		if f.Kind == "approved-unmerged" && f.Key == "acme/app#14" {
+			t.Errorf("persona as configured approver must not yield approved-unmerged: %+v", f)
+		}
 	}
 
 	// No configured approver: alice's earliest approval counts.
@@ -1442,7 +1466,11 @@ func TestGitHubPort_ApprovedUnmergedSurvivesCompareFailure(t *testing.T) {
 		"main..." + sha('a'): "diff --git a/a.go b/a.go\nindex 3333333..4444444 100644\n--- a/a.go\n+++ b/a.go\n@@ -7,3 +7,3 @@ func f()\n-x\n+y\n",
 	}
 	app := &ghRepoData{}
-	app.Open.Nodes = []ghPR{pr(1, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", sha('a'), 1*h), review("kevin", "APPROVED", shaB, 20*h), head(sha('a')))}
+	diffs["main..."+sha('c')] = strings.Replace(approved, "+y", "+z", 1) // PR 2: a material change since kevin's approval
+	app.Open.Nodes = []ghPR{
+		pr(1, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", sha('a'), 1*h), review("kevin", "APPROVED", shaB, 20*h), head(sha('a'))),
+		pr(2, "artie", 50*h, 2*h, "SUCCESS", review("phaware-val", "APPROVED", sha('c'), 1*h), review("kevin", "APPROVED", shaB, 20*h), head(sha('c'))),
+	}
 	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": {}}, diffs: diffs, mergeBases: map[string]string{"main..." + sha('a'): "mb1"}, baseFiles: map[string][]string{"mb0...mb1": {"a.go"}}}
 	p, in := newGitHubTest(t, fx, []string{"artie"})
 	town := t.TempDir()
@@ -1460,8 +1488,8 @@ func TestGitHubPort_ApprovedUnmergedSurvivesCompareFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ks := newKeys(rep); !slices.Contains(ks, "approved-unmerged/acme/app#1") {
-		t.Fatalf("first sweep must report the base-merged approval as new, got %v", ks)
+	if ks := newKeys(rep); !slices.Contains(ks, "approved-unmerged/acme/app#1") || !slices.Contains(ks, "approved-unmerged/acme/app#2") {
+		t.Fatalf("first sweep must report both approvals as new (base-merged and changed), got %v", ks)
 	}
 	if err := r.Store.Ack(rep.RunID, r.Now()); err != nil {
 		t.Fatal(err)
@@ -1471,8 +1499,8 @@ func TestGitHubPort_ApprovedUnmergedSurvivesCompareFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ks := newKeys(rep2); slices.Contains(ks, "approved-unmerged/acme/app#1") {
-		t.Errorf("a failed compare must not re-page the acknowledged item, got new %v", ks)
+	if ks := newKeys(rep2); slices.Contains(ks, "approved-unmerged/acme/app#1") || slices.Contains(ks, "approved-unmerged/acme/app#2") {
+		t.Errorf("a failed compare must not re-page an acknowledged item, whatever its last verdict, got new %v", ks)
 	}
 	if err := r.Store.Ack(rep2.RunID, r.Now()); err != nil {
 		t.Fatal(err)
@@ -1482,7 +1510,7 @@ func TestGitHubPort_ApprovedUnmergedSurvivesCompareFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ks := newKeys(rep3); slices.Contains(ks, "approved-unmerged/acme/app#1") {
-		t.Errorf("the clean sweep after a failed compare must report the item as standing, got new %v", ks)
+	if ks := newKeys(rep3); slices.Contains(ks, "approved-unmerged/acme/app#1") || slices.Contains(ks, "approved-unmerged/acme/app#2") {
+		t.Errorf("the clean sweep after a failed compare must report the items as standing, got new %v", ks)
 	}
 }
