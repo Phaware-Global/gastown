@@ -74,6 +74,7 @@ type jiraFixture struct {
 	queue         []map[string]any // returned for the persona's ranked To Do query
 	queueJQL      string           // the queue query as sent
 	queueMore     bool             // every queue page says more follow
+	queueFailPage int              // the queue page (1-based) that answers 500
 	slowKey       string           // comments for this key take slowFor
 	slowFor       time.Duration
 }
@@ -100,6 +101,14 @@ func (fx *jiraFixture) handler(t *testing.T) http.Handler {
 				write(map[string]any{"issues": fx.changed, "isLast": true})
 			case strings.HasSuffix(jql, "ORDER BY Rank ASC"):
 				fx.queueJQL = jql
+				page := 1
+				if r.URL.Query().Get("nextPageToken") != "" {
+					page = 2
+				}
+				if page == fx.queueFailPage {
+					http.Error(w, "queue unavailable", 500)
+					return
+				}
 				if fx.queueMore {
 					write(map[string]any{"issues": fx.queue, "isLast": false, "nextPageToken": "more"})
 					return
@@ -575,5 +584,19 @@ func TestJiraPort_WIPUnderLimit(t *testing.T) {
 	var partial *PartialError
 	if len(got) != 0 || !errors.As(lastErr, &partial) || !strings.Contains(partial.Reason, "queue search truncated") {
 		t.Errorf("a truncated queue with no candidate must be partial: got %+v err=%v", got, lastErr)
+	}
+	// A failed queue search says so, never "truncated"; a failure on the
+	// second page still names candidates from the first.
+	fx = base()
+	fx.queueFailPage = 1
+	got = under(t, fx, 3)
+	if len(got) != 0 || !errors.As(lastErr, &partial) || !strings.Contains(partial.Reason, "queue search failed after 0 issues") || strings.Contains(partial.Reason, "truncated") {
+		t.Errorf("a failed queue search must be partial with only the failure: got %+v err=%v", got, lastErr)
+	}
+	fx = base()
+	fx.queueMore, fx.queueFailPage = true, 2
+	got = under(t, fx, 3)
+	if len(got) != 2 || got[0].Key != "P23-20" || !errors.As(lastErr, &partial) || !strings.Contains(partial.Reason, "queue search failed after 5 issues") || strings.Contains(partial.Reason, "truncated") {
+		t.Errorf("a page-2 failure must keep page 1's candidates: got %+v err=%v", got, lastErr)
 	}
 }

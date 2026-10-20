@@ -510,11 +510,12 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	// 5. The persona's queue: To Do issues assigned to it, in board rank
 	//    order, for the free WIP slots. Two pages: searchN reports a single
 	//    page as complete, which would hide a truncated queue.
-	queue, queueComplete, err := c.searchN(fmt.Sprintf(`project in %s AND assignee in %s AND statusCategory = new AND status not in %s ORDER BY Rank ASC`,
+	queue, queueComplete, queueErr := c.searchN(fmt.Sprintf(`project in %s AND assignee in %s AND statusCategory = new AND status not in %s ORDER BY Rank ASC`,
 		projects, people, jqlList(wipStatuses)), jiraPageSize, 2)
-	if err != nil {
-		note("queue search failed (free WIP slots not checked): %v", err)
-		queue = nil
+	if queueErr != nil {
+		// A failed later page keeps the issues already read: they are still
+		// the top of the queue in rank order.
+		note("queue search failed after %d issues (free WIP slots named from those only): %v", len(queue), queueErr)
 	}
 	if in.DryRun {
 		c.trace("GET /rest/api/3/issue/{key}/comment orderBy=-created maxResults=" + fmt.Sprint(jiraCommentPage) + " (per involved issue)")
@@ -709,7 +710,7 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 			fd.Fingerprint = fmt.Sprint(wip)
 			out = append(out, fd)
 		}
-		if rank < free && !queueComplete {
+		if rank < free && !queueComplete && queueErr == nil {
 			note("queue search truncated after %d issues: %d of %d free WIP slots named", len(queue), rank, free)
 		}
 	}
