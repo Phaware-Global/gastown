@@ -37,8 +37,8 @@ type jiraDurations struct {
 }
 
 // JiraPort reports unanswered threads, unchased questions, assigned work
-// without a status note, off-board issues, WIP over the limit and stale
-// release waves for the persona's Jira projects. It only reads.
+// without a status note, off-board issues, WIP over or under the limit and
+// stale release waves for the persona's Jira projects. It only reads.
 type JiraPort struct {
 	// persona returns the persona's Jira account IDs (telegraph.toml).
 	persona func() ([]string, error)
@@ -82,6 +82,7 @@ func (p *JiraPort) Suggestions() []string {
 		"status note on {key}",
 		"move {key} onto board {board} (jira-move-to-board)",
 		"finish or hand off before starting more",
+		"start {key} after reading its comments (WIP {count} of {limit})",
 		"review release wave {key}",
 	}
 }
@@ -505,6 +506,14 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	} else if !wComplete {
 		note("release-wave search truncated after %d pages", jiraMaxPages)
 	}
+	// 5. The persona's queue: To Do issues assigned to it, in board rank
+	//    order, for the free WIP slots.
+	queue, _, err := c.searchN(fmt.Sprintf(`project in %s AND assignee in %s AND statusCategory = new AND status not in %s ORDER BY Rank ASC`,
+		projects, people, jqlList(wipStatuses)), jiraPageSize, 1)
+	if err != nil {
+		note("queue search failed (free WIP slots not checked): %v", err)
+		queue = nil
+	}
 	if in.DryRun {
 		c.trace("GET /rest/api/3/issue/{key}/comment orderBy=-created maxResults=" + fmt.Sprint(jiraCommentPage) + " (per involved issue)")
 		c.trace(`GET /rest/api/3/search/jql jql=parent = {wave} ORDER BY updated DESC maxResults=1 (per release wave)`)
@@ -513,13 +522,16 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 
 	var out []Finding
 	wip := 0
+	wipCounted := complete // every involved issue was seen, so wip is not an undercount
 	for n, is := range issues {
 		if n >= jiraMaxCommentIssues {
 			note("comments fetched for the first %d of %d issues", jiraMaxCommentIssues, len(issues))
+			wipCounted = false
 			break
 		}
 		if !timeLeft(ctx) {
 			note("time budget exhausted after %d of %d issues", n, len(issues))
+			wipCounted = false
 			break
 		}
 		f := is.Fields
@@ -666,6 +678,29 @@ func (p *JiraPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		out = append(out, Finding{Kind: "wip-over-limit", Key: "wip", Severity: SeverityInfo, Since: in.Now,
 			Fields:  map[string]string{"count": fmt.Sprint(wip), "limit": fmt.Sprint(wipLimit)},
 			Suggest: "finish or hand off before starting more", Fingerprint: fmt.Sprint(wip)})
+	}
+	// Free WIP slots: the top of the queue, one finding per slot. Only
+	// issues on the board count (a ticket moved to the backlog is not
+	// queued), so an unread board or an undercounted WIP reports nothing
+	// rather than a slot that may not be free. The fingerprint is the WIP
+	// count, so the same candidate comes back whenever a slot frees.
+	if free := wipLimit - wip; free > 0 && wipCounted && onBoard != nil {
+		for _, is := range queue {
+			if free == 0 {
+				break
+			}
+			if !jiraKeyRe.MatchString(is.Key) || !onBoard[is.Key] {
+				continue
+			}
+			fd := jiraBase(is, browse)("wip-under-limit", SeverityActionable)
+			fd.Since = time.Time(is.Fields.Updated)
+			fd.Fields["count"] = fmt.Sprint(wip)
+			fd.Fields["limit"] = fmt.Sprint(wipLimit)
+			fd.Suggest = fmt.Sprintf("start %s after reading its comments (WIP %d of %d)", is.Key, wip, wipLimit)
+			fd.Fingerprint = fmt.Sprint(wip)
+			out = append(out, fd)
+			free--
+		}
 	}
 	for _, w := range waves {
 		if !jiraKeyRe.MatchString(w.Key) {

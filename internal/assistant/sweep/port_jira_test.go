@@ -71,6 +71,8 @@ type jiraFixture struct {
 	waveChild     map[string][]map[string]any
 	changed       []map[string]any
 	watched       []map[string]any // returned for the watcher-only query
+	queue         []map[string]any // returned for the persona's ranked To Do query
+	queueJQL      string           // the queue query as sent
 	slowKey       string           // comments for this key take slowFor
 	slowFor       time.Duration
 }
@@ -95,6 +97,9 @@ func (fx *jiraFixture) handler(t *testing.T) http.Handler {
 				write(map[string]any{"issues": fx.watched, "isLast": true})
 			case strings.Contains(jql, "status changed after"):
 				write(map[string]any{"issues": fx.changed, "isLast": true})
+			case strings.HasSuffix(jql, "ORDER BY Rank ASC"):
+				fx.queueJQL = jql
+				write(map[string]any{"issues": fx.queue, "isLast": true})
 			default:
 				if !strings.Contains(jql, `assignee in ("`+personaID+`")`) {
 					t.Errorf("involved query must scope to the persona: %s", jql)
@@ -137,7 +142,7 @@ func (fx *jiraFixture) handler(t *testing.T) http.Handler {
 				off[k] = true
 			}
 			var is []map[string]any
-			for _, list := range [][]map[string]any{fx.issues, fx.watched, fx.changed, fx.waves} {
+			for _, list := range [][]map[string]any{fx.issues, fx.watched, fx.changed, fx.waves, fx.queue} {
 				for _, i := range list {
 					if k, _ := i["key"].(string); k != "" && !off[k] {
 						is = append(is, map[string]any{"key": k})
@@ -476,5 +481,78 @@ func TestJiraPort_BudgetCutsInFlightCallAndKeepsFindings(t *testing.T) {
 	}
 	if keys := keysOfFindings(findings); !keys["P23-1"] {
 		t.Errorf("runPort must receive the findings collected before the cut: %v", keys)
+	}
+}
+
+// Below the WIP limit the port names the top of the persona's ranked To Do
+// queue, one finding per free slot, skipping issues not on the board (the
+// backlog). The fingerprint is the WIP count, so a candidate comes back
+// whenever a slot frees. An unread board or an undercounted WIP reports no
+// free slot at all.
+func TestJiraPort_WIPUnderLimit(t *testing.T) {
+	h := time.Hour
+	base := func() *jiraFixture {
+		return &jiraFixture{
+			issues: []map[string]any{issue("P23-1", "In Progress", "indeterminate", personaID, 240*h, 1*h, "working")},
+			comments: map[string][]map[string]any{
+				"P23-1": {comment("100", personaID, 1*h, "progress", "")},
+			},
+			changed: []map[string]any{{"key": "P23-1"}},
+			queue: []map[string]any{
+				issue("P23-21", "To Do", "new", personaID, 240*h, 2*h, "parked in the backlog"),
+				issue("P23-20", "To Do", "new", personaID, 240*h, 2*h, "top of the queue"),
+				issue("P23-2; DROP", "To Do", "new", personaID, 240*h, 2*h, "malformed key"),
+				issue("P23-22", "To Do", "new", personaID, 240*h, 2*h, "second"),
+				issue("P23-23", "To Do", "new", personaID, 240*h, 2*h, "third, no slot left"),
+			},
+			offBoard: []string{"P23-21"},
+		}
+	}
+	under := func(t *testing.T, fx *jiraFixture, limit int) []Finding {
+		t.Helper()
+		p, in := newJiraTest(t, fx, []string{personaID})
+		in.Settings.Assistant.Sweep.Jira.WIPLimit = limit
+		findings, _ := p.Sweep(context.Background(), in)
+		var out []Finding
+		for _, f := range findings {
+			if f.Kind == "wip-under-limit" {
+				enforceSchema(p.Schema(), p.Suggestions(), &f)
+				out = append(out, f)
+			}
+		}
+		return out
+	}
+
+	fx := base()
+	got := under(t, fx, 3)
+	if len(got) != 2 || got[0].Key != "P23-20" || got[1].Key != "P23-22" {
+		t.Fatalf("WIP 1 of 3 must name the top two on-board queue issues, got %+v", got)
+	}
+	for _, f := range got {
+		want := "start " + f.Key + " after reading its comments (WIP 1 of 3)"
+		if f.Suggest != want || f.Fingerprint != "1" || f.Fields["count"] != "1" || f.Fields["limit"] != "3" || f.Severity != SeverityActionable {
+			t.Errorf("%s: %+v", f.Key, f)
+		}
+	}
+	for _, want := range []string{`assignee in ("` + personaID + `")`, "statusCategory = new", `status not in ("In Progress", "Research")`} {
+		if !strings.Contains(fx.queueJQL, want) {
+			t.Errorf("queue query %q must contain %q", fx.queueJQL, want)
+		}
+	}
+	if got := under(t, base(), 1); len(got) != 0 {
+		t.Errorf("WIP at the limit must report no free slot: %+v", got)
+	}
+	fx = base()
+	fx.boardFail = true
+	if got := under(t, fx, 3); len(got) != 0 {
+		t.Errorf("an unread board must report no free slot: %+v", got)
+	}
+	// More involved issues than the comment cap: the WIP count may be short.
+	fx = base()
+	for i := 0; i < jiraMaxCommentIssues; i++ {
+		fx.issues = append([]map[string]any{issue(fmt.Sprintf("P23-%d", 1000+i), "To Do", "new", humanID, 240*h, 1*h, "filler")}, fx.issues...)
+	}
+	if got := under(t, fx, 3); len(got) != 0 {
+		t.Errorf("an undercounted WIP must report no free slot: %+v", got)
 	}
 }
