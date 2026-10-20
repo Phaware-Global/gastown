@@ -21,6 +21,14 @@ type SweepConfig struct {
 
 	// GitHub configures the GitHub port (repos come from the rig registry).
 	GitHub *GitHubSweepConfig `json:"github,omitempty"`
+
+	// Mode decides who decides what a sweep sends to the Mayor:
+	// "deterministic" (default): gt mails the report verbatim, and nothing
+	// when there is nothing new; the assistant only runs one command.
+	// "inference": the assistant reads the report, may verify findings
+	// read-only, and decides whether and how to brief the Mayor. Unknown
+	// values read as deterministic. See TownSettings.SweepMode.
+	Mode string `json:"mode,omitempty"`
 }
 
 // BeadsSweepConfig tunes the beads port.

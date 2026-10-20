@@ -86,9 +86,11 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 	// The Mayor's Assistant renders its sweep cadence so the role is aware of
 	// the town's assistant_sweep_interval. Harmless (default "1h") for others.
 	sweepInterval := config.DefaultAssistantSweepInterval
+	sweepMode := config.SweepModeDeterministic
 	if ctx.TownRoot != "" {
 		if ts, err := config.LoadOrCreateTownSettings(config.TownSettingsPath(ctx.TownRoot)); err == nil {
 			sweepInterval = ts.AssistantSweepInterval()
+			sweepMode = ts.SweepMode()
 		}
 	}
 
@@ -105,6 +107,7 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 		DeaconSession: session.DeaconSessionName(),
 		MergeStrategy: mergeStrategy,
 		SweepInterval: sweepInterval,
+		SweepMode:     sweepMode,
 	}
 
 	// Render and output

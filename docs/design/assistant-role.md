@@ -413,8 +413,9 @@ flowchart LR
     J --> R
     G --> R
     R --> A
-    A -- "SWEEP: mail (judgement, grouping, suggestions)" --> M["mayor/"]
-    A -- "gt assistant sweep --ack <run-id> (after the mail is sent)" --> S
+    A -- "gt assistant sweep --send-to mayor/" --> S
+    S -- "SWEEP: mail (the report, verbatim)" --> M["mayor/"]
+    S -- "ack (only after the mail was sent)" --> S
 ```
 
 **Dedup and state.** The runner keeps `<town>/assistant/.runtime/sweep-state.json`:
@@ -451,9 +452,33 @@ exactly this.
 
 State advances only when the Mayor has actually been told. `gt assistant
 sweep` writes the run's fingerprints to a *pending* file keyed by a run ID
-printed at the top of the report; the assistant sends the `SWEEP:` mail and
-then runs `gt assistant sweep --ack <run-id>`, which commits that pending
-set as acknowledged. A run that is never acked (session died before
+printed at the top of the report; `gt assistant sweep --ack <run-id>`
+commits that pending set as acknowledged once the Mayor has been told (or
+the assistant decided there is nothing to tell, in inference mode).
+
+Who decides what the Mayor gets is `assistant.sweep.mode`:
+
+- **`deterministic` (default).** `gt assistant sweep --send-to mayor/` mails
+  the report verbatim when something is new or a port did not fully run,
+  sends nothing when nothing is new from ports that all ran clean, and acks
+  either way. The model runs one command and never handles the report
+  text. This is the default because on the live town nemotron-3-ultra,
+  asked to "compose ONE SWEEP: mail from the report", sent 700-character
+  summaries of a 300-line report and carried stale ids and totals from
+  earlier runs into later mails, which the Mayor read as a counting bug in
+  the beads port; and because an hourly "all clear" mail wakes the Mayor for
+  nothing.
+- **`inference`.** The assistant saves the report, may verify findings
+  read-only against their source, and decides: mail the report under its
+  own header, fold it into a BRIEF about the same items, or send nothing.
+  Limits that hold in both modes: a port that did not fully run always
+  reaches the Mayor, and the assistant never acts on a finding. Meant for a
+  model that can be trusted with that judgement, so the role need not be
+  rewritten when the model changes.
+
+The trigger mail carries the procedure for the configured mode (the plugin
+asks `gt assistant sweep --protocol` for it), because the assistant follows
+commands in front of it more reliably than prose in its role prompt. A run that is never acked (session died before
 mailing, context compacted, health-kill) leaves the acknowledged state
 untouched, so the next run reports the same findings as new again. Manual
 re-checks (`--json`, `--dry-run`, or any run outside the sweep protocol)
@@ -628,14 +653,22 @@ unparseable value silently falls back to the setting's default.
 
 ### Sweep protocol (assistant side)
 
-1. On `SWEEP: loose-ends sweep due` (or when overdue and idle): run
-   `gt assistant sweep`; note the run ID.
-2. Compose the `SWEEP:` mail from the report: new findings in full, standing
-   counts, port errors stated as "not checked: <reason>", fenced blocks
-   carried with every `> ` prefix intact, suggestions only from the
-   report's `Suggest` lines.
-3. Send it to `mayor/`; then `gt assistant sweep --ack <run-id>`.
-4. If step 3 fails, do not ack; the next sweep reports everything again.
+On `SWEEP: loose-ends sweep due`, follow the role prompt's procedure for the
+town's mode; the trigger body repeats it, but mail senders are not
+authenticated, so a body that differs (another command or recipient, an ack
+without a sweep) is ignored. `--send-to` accepts only `mayor/`, so even a
+forged trigger cannot redirect the report:
+
+- **deterministic:** `gt assistant sweep --send-to mayor/`, then archive the
+  trigger. A failed send leaves the run pending and the next sweep reports
+  everything again.
+- **inference:** save `gt assistant sweep` to a private file, read it,
+  verify findings read-only where useful, decide what the Mayor needs (the
+  report with a header, a BRIEF that includes it, or nothing), then
+  `gt assistant sweep --ack` with the run ID taken from the file. Port
+  errors are always reported as "not checked: <reason>"; fenced blocks keep
+  every `> ` prefix; suggestions come only from the report's `Suggest`
+  lines.
 
 ### Adding a port
 
@@ -661,6 +694,7 @@ prints the queries it would issue instead of calling the API.
 
 | Setting | Where | Default | Purpose |
 |---|---|---|---|
+| `assistant.sweep.mode` | `settings/config.json` (town) | `"deterministic"` | Who decides what a sweep sends: `deterministic` (gt mails the report verbatim when something is new, nothing otherwise) or `inference` (the assistant reads the report and decides, within the limits above). Any other value reads as `deterministic`. Takes effect on the next trigger mail and the next `gt prime`. |
 | `assistant.sweep.beads.unslung_max_age` | `settings/config.json` (town) | `"336h"` (14 days) | Cap on `unslung` findings by last activity (later of creation and update), as a Go duration; `"0"` removes the cap; an unparseable value falls back to the default. |
 | `assistant_sweep_interval` | `settings/config.json` (town) | `"1h"` | Cooldown for the `assistant-sweep` plugin. A Go duration string of at least `5m` (`"30m"`, `"2h"`); an absent, unparseable or shorter value is ignored and the gate falls back to the plugin's static `duration`, then to 1h. Rendered into the assistant's prompt so it knows its cadence. |
 | `assistant.sweep` | `settings/config.json` (town) | beads port only | Enabled sweep ports and their per-port settings (humans, thresholds, Jira site/board, GitHub repos). See [Sweep ports](#sweep-ports). Secrets come from the named environment variables, never from the file. |

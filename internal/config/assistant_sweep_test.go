@@ -21,3 +21,17 @@ func TestAssistantSweepInterval(t *testing.T) {
 		t.Errorf("45m: got (%q, %v), want (45m, true)", v, ok)
 	}
 }
+
+func TestSweepMode(t *testing.T) {
+	t.Parallel()
+	var nilSettings *TownSettings
+	if got := nilSettings.SweepMode(); got != SweepModeDeterministic {
+		t.Errorf("nil settings: got %q", got)
+	}
+	for raw, want := range map[string]string{"": SweepModeDeterministic, "deterministic": SweepModeDeterministic, "inference": SweepModeInference, "Inference": SweepModeDeterministic, "llm": SweepModeDeterministic} {
+		s := &TownSettings{Assistant: &AssistantConfig{Sweep: &SweepConfig{Mode: raw}}}
+		if got := s.SweepMode(); got != want {
+			t.Errorf("mode %q: got %q, want %q", raw, got, want)
+		}
+	}
+}

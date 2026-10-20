@@ -684,3 +684,67 @@ func TestRun_DryRunIsNotChecked(t *testing.T) {
 		t.Errorf("dry-run rendering:\n%s", md)
 	}
 }
+
+// The SWEEP: subject carries the number of new findings including the
+// counted overflow, the ports that ran, and every port that did not fully
+// run; all clear only when every port ran clean and found nothing new.
+func TestSubject(t *testing.T) {
+	f := func(n int) []Finding {
+		out := make([]Finding, n)
+		for i := range out {
+			out[i] = Finding{Kind: "k", Key: fmt.Sprint(i)}
+		}
+		return out
+	}
+	for _, c := range []struct {
+		name  string
+		ports []PortResult
+		want  string
+	}{
+		{"all clear", []PortResult{{Name: "beads"}, {Name: "jira"}}, "SWEEP: all clear (checked: beads, jira)"},
+		{"new plus overflow", []PortResult{{Name: "beads", New: f(2), Overflow: []Standing{{Kind: "unslung", Count: 30}}}, {Name: "github", New: f(1)}}, "SWEEP: 33 new findings (beads, github)"},
+		{"errored port is not all clear", []PortResult{{Name: "beads"}, {Name: "jira", Error: "500"}}, "SWEEP: 0 new findings (beads; not checked: jira)"},
+		{"every port failed", []PortResult{{Name: "beads", Error: "dolt down"}}, "SWEEP: 0 new findings (not checked: beads)"},
+		{"partial and dry run", []PortResult{{Name: "beads", New: f(1), Partial: true}, {Name: "github", DryRun: true}}, "SWEEP: 1 new findings (beads; PARTIAL: beads; DRY RUN: github)"},
+	} {
+		if got := Subject(&Report{Ports: c.ports}); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+	sum := Summary(&Report{RunID: "abc", Ports: []PortResult{{Name: "beads", New: f(1), Standing: []Standing{{Kind: "unslung", Count: 7}}}}})
+	if !strings.Contains(sum, "Run-ID: abc") || !strings.Contains(sum, "beads: ok — 1 new listed, 0 more counted, 7 standing") {
+		t.Errorf("summary: %q", sum)
+	}
+}
+
+// A deterministic SWEEP: mail goes out only when there is something new or a
+// port did not fully run; the trigger body names the commands for each mode.
+func TestShouldMailAndTriggerBody(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		ports []PortResult
+		want  bool
+	}{
+		{"nothing new, all clean", []PortResult{{Name: "beads", Standing: []Standing{{Kind: "unslung", Count: 9}}}, {Name: "jira"}}, false},
+		{"new finding", []PortResult{{Name: "beads", New: []Finding{{Kind: "k", Key: "1"}}}}, true},
+		{"overflow only", []PortResult{{Name: "beads", Overflow: []Standing{{Kind: "unslung", Count: 3}}}}, true},
+		{"port failed", []PortResult{{Name: "beads"}, {Name: "jira", Error: "500"}}, true},
+		{"port partial", []PortResult{{Name: "beads", Partial: true}}, true},
+	} {
+		if got := ShouldMail(&Report{Ports: c.ports}); got != c.want {
+			t.Errorf("%s: ShouldMail=%v, want %v", c.name, got, c.want)
+		}
+	}
+	if b := TriggerBody("deterministic"); !strings.Contains(b, "gt assistant sweep --send-to mayor/") || !strings.Contains(b, "SWEEP: not checked") {
+		t.Errorf("deterministic trigger: %q", b)
+	}
+	if b := TriggerBody("unknown"); b != TriggerBody("deterministic") {
+		t.Error("an unknown mode must get the deterministic trigger")
+	}
+	b := TriggerBody("inference")
+	for _, want := range []string{"gt assistant sweep > \"$r\"", "gt assistant sweep --ack \"$(sed -n 's/^Run-ID: //p' \"$r\")\"", "NOT CHECKED or PARTIAL always reaches the Mayor", "SWEEP: not checked"} {
+		if !strings.Contains(b, want) {
+			t.Errorf("inference trigger must contain %q", want)
+		}
+	}
+}
