@@ -21,6 +21,10 @@ func (g *Gate) CooldownDuration(settings *config.TownSettings) string {
 		if v, ok := settings.AssistantSweepIntervalSetting(); ok {
 			return v
 		}
+	case "assistant_brief_interval":
+		if v, ok := settings.AssistantBriefIntervalSetting(); ok {
+			return v
+		}
 	}
 	if g.Duration == "" {
 		return DefaultCooldown
