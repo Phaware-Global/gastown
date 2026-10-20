@@ -1,6 +1,6 @@
 +++
 name = "assistant-sweep"
-description = "Trigger the Mayor's Assistant loose-ends sweep (stalled decisions, blocked external actors, unslung work) at the configured interval; the assistant mails the Mayor a SWEEP: summary"
+description = "Trigger the Mayor's Assistant loose-ends sweep at the configured interval; the trigger carries the procedure for assistant.sweep.mode"
 version = 2
 
 [gate]
@@ -44,8 +44,9 @@ overwrite deployed plugins that have drifted on purpose.
 ## Steps
 
 1. Run `./run.sh` to send the trigger mail to `assistant/`. The script
-   handles the exact subject, body, priority, and message type — it is
-   intentionally parameter-free to keep this dog cheap and deterministic.
+   handles the exact subject, body (from `gt assistant sweep --protocol`),
+   priority, and message type — it is intentionally parameter-free to keep
+   this dog cheap and deterministic.
 
 2. Record the run as an ephemeral `type:plugin-run` receipt (labels
    `plugin:assistant-sweep` and `result:success`) and close it
@@ -55,7 +56,7 @@ overwrite deployed plugins that have drifted on purpose.
 
 ## Why script-style content with agent execution
 
-The body is fixed; agent execution exists so the dog can handle transient
+The body comes from gt; agent execution exists so the dog can handle transient
 mail-send failures (retry once, escalate if still failing) without a
 second-class script gate. If `./run.sh` exits non-zero, retry once after a
 short delay; if still failing, `gt escalate "assistant-sweep: mail
@@ -63,13 +64,21 @@ delivery failed" -s LOW` and record a `result:failure` wisp instead.
 
 ## What the trigger asks the assistant to do
 
-The mail tells the Mayor's Assistant to run `gt assistant sweep` (the deterministic port runner — beads by default,
-Jira and GitHub when `assistant.sweep` names them), compose one `SWEEP:`
-mail for the Mayor from the report (new findings in full, standing ones as
-counts, ports that failed as "not checked", external text only inside the
-report's fenced blocks, suggestions only from the report's Suggest lines),
-send it, and then `gt assistant sweep --ack <run-id>` so the next sweep
-dedupes against what the Mayor was told. If the command fails the assistant
-mails "SWEEP: not checked" and stops; it never sweeps by hand.
+The mail body is the procedure for the town's `assistant.sweep.mode`, as
+printed by `gt assistant sweep --protocol` (a static deterministic fallback
+is used when that command is unavailable):
+
+- **deterministic** (default): run `gt assistant sweep --send-to mayor/`,
+  which mails the Mayor the report verbatim when something is new or a port
+  did not fully run, sends nothing otherwise, and acknowledges the run; then
+  archive the trigger.
+- **inference**: save the report, read it, verify findings read-only where
+  useful, decide what the Mayor needs (the report with a header, a BRIEF
+  that includes it, or nothing), then `gt assistant sweep --ack` with the
+  run ID from the saved file. A port that did not fully run always reaches
+  the Mayor.
+
+In both modes, if the command fails the assistant mails "SWEEP: not
+checked" and stops; it never sweeps by hand.
 
 The assistant reports and suggests; the Mayor decides. This dog does neither.

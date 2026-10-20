@@ -21,6 +21,14 @@ type SweepConfig struct {
 
 	// GitHub configures the GitHub port (repos come from the rig registry).
 	GitHub *GitHubSweepConfig `json:"github,omitempty"`
+
+	// Mode decides who decides what a sweep sends to the Mayor:
+	// "deterministic" (default): gt mails the report verbatim, and nothing
+	// when there is nothing new; the assistant only runs one command.
+	// "inference": the assistant reads the report, may verify findings
+	// read-only, and decides whether and how to brief the Mayor. Unknown
+	// values read as deterministic. See TownSettings.SweepMode.
+	Mode string `json:"mode,omitempty"`
 }
 
 // BeadsSweepConfig tunes the beads port.
@@ -28,6 +36,11 @@ type BeadsSweepConfig struct {
 	// StaleAfter is how long an in-progress bead, blocker, escalation or
 	// convoy may go without an update before it is reported (default "3d").
 	StaleAfter string `json:"stale_after,omitempty"`
+	// UnslungMaxAge caps how long a ready, unassigned bead may have gone
+	// without activity (the later of its creation and last update) and still
+	// be reported as unslung (default "336h", 14 days): older ones are
+	// backlog, not loose ends. "0" disables the cap.
+	UnslungMaxAge string `json:"unslung_max_age,omitempty"`
 }
 
 // DefaultSweepPorts is the port list when assistant.sweep.ports is unset.
