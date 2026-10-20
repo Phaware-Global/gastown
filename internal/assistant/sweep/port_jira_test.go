@@ -71,6 +71,10 @@ type jiraFixture struct {
 	waveChild     map[string][]map[string]any
 	changed       []map[string]any
 	watched       []map[string]any // returned for the watcher-only query
+	queue         []map[string]any // returned for the persona's ranked To Do query
+	queueJQL      string           // the queue query as sent
+	queueMore     bool             // every queue page says more follow
+	queueFailPage int              // the queue page (1-based) that answers 500
 	slowKey       string           // comments for this key take slowFor
 	slowFor       time.Duration
 }
@@ -95,6 +99,21 @@ func (fx *jiraFixture) handler(t *testing.T) http.Handler {
 				write(map[string]any{"issues": fx.watched, "isLast": true})
 			case strings.Contains(jql, "status changed after"):
 				write(map[string]any{"issues": fx.changed, "isLast": true})
+			case strings.HasSuffix(jql, "ORDER BY Rank ASC"):
+				fx.queueJQL = jql
+				page := 1
+				if r.URL.Query().Get("nextPageToken") != "" {
+					page = 2
+				}
+				if page == fx.queueFailPage {
+					http.Error(w, "queue unavailable", 500)
+					return
+				}
+				if fx.queueMore {
+					write(map[string]any{"issues": fx.queue, "isLast": false, "nextPageToken": "more"})
+					return
+				}
+				write(map[string]any{"issues": fx.queue, "isLast": true})
 			default:
 				if !strings.Contains(jql, `assignee in ("`+personaID+`")`) {
 					t.Errorf("involved query must scope to the persona: %s", jql)
@@ -137,7 +156,7 @@ func (fx *jiraFixture) handler(t *testing.T) http.Handler {
 				off[k] = true
 			}
 			var is []map[string]any
-			for _, list := range [][]map[string]any{fx.issues, fx.watched, fx.changed, fx.waves} {
+			for _, list := range [][]map[string]any{fx.issues, fx.watched, fx.changed, fx.waves, fx.queue} {
 				for _, i := range list {
 					if k, _ := i["key"].(string); k != "" && !off[k] {
 						is = append(is, map[string]any{"key": k})
@@ -354,7 +373,7 @@ func TestJiraPort_PartialAndErrors(t *testing.T) {
 		set(fx)
 		p, in = newJiraTest(t, fx, []string{personaID})
 		findings, err = p.Sweep(context.Background(), in)
-		if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "off-board not checked") {
+		if !errors.As(err, &partial) || !strings.Contains(partial.Reason, "off-board and free WIP slots not checked") {
 			t.Errorf("%s: a board without membership data must be partial with the reason: %v", name, err)
 		}
 		for _, f := range findings {
@@ -476,5 +495,108 @@ func TestJiraPort_BudgetCutsInFlightCallAndKeepsFindings(t *testing.T) {
 	}
 	if keys := keysOfFindings(findings); !keys["P23-1"] {
 		t.Errorf("runPort must receive the findings collected before the cut: %v", keys)
+	}
+}
+
+// Below the WIP limit the port names the top of the persona's ranked To Do
+// queue, one finding per free slot, skipping issues not on the board (the
+// backlog). The fingerprint is the WIP count, so a candidate comes back
+// whenever a slot frees, and the rank keeps the queue order. The count does
+// not depend on the comment cap. An unread board reports no free slot at
+// all; a truncated queue that yields too few candidates says so.
+func TestJiraPort_WIPUnderLimit(t *testing.T) {
+	h := time.Hour
+	base := func() *jiraFixture {
+		return &jiraFixture{
+			issues: []map[string]any{issue("P23-1", "In Progress", "indeterminate", personaID, 240*h, 1*h, "working")},
+			comments: map[string][]map[string]any{
+				"P23-1": {comment("100", personaID, 1*h, "progress", "")},
+			},
+			changed: []map[string]any{{"key": "P23-1"}},
+			queue: []map[string]any{
+				issue("P23-21", "To Do", "new", personaID, 240*h, 2*h, "parked in the backlog"),
+				issue("P23-20", "To Do", "new", personaID, 240*h, 2*h, "top of the queue"),
+				issue("P23-2; DROP", "To Do", "new", personaID, 240*h, 2*h, "malformed key"),
+				issue("P23-22", "To Do", "new", personaID, 240*h, 2*h, "second"),
+				issue("P23-23", "To Do", "new", personaID, 240*h, 2*h, "third, no slot left"),
+			},
+			offBoard: []string{"P23-21"},
+		}
+	}
+	var lastErr error
+	under := func(t *testing.T, fx *jiraFixture, limit int) []Finding {
+		t.Helper()
+		p, in := newJiraTest(t, fx, []string{personaID})
+		in.Settings.Assistant.Sweep.Jira.WIPLimit = limit
+		findings, err := p.Sweep(context.Background(), in)
+		lastErr = err
+		var out []Finding
+		for _, f := range findings {
+			if f.Kind == "wip-under-limit" {
+				enforceSchema(p.Schema(), p.Suggestions(), &f)
+				out = append(out, f)
+			}
+		}
+		return out
+	}
+
+	fx := base()
+	got := under(t, fx, 3)
+	if len(got) != 2 || got[0].Key != "P23-20" || got[1].Key != "P23-22" {
+		t.Fatalf("WIP 1 of 3 must name the top two on-board queue issues, got %+v", got)
+	}
+	for i, f := range got {
+		rank := fmt.Sprint(i + 1)
+		want := "start " + f.Key + ", rank " + rank + " in the queue, after reading its comments (WIP 1 of 3)"
+		if f.Suggest != want || f.Fingerprint != "1" || f.Fields["count"] != "1" || f.Fields["limit"] != "3" || f.Fields["rank"] != rank || f.Severity != SeverityActionable {
+			t.Errorf("%s: %+v", f.Key, f)
+		}
+	}
+	for _, want := range []string{`assignee in ("` + personaID + `")`, "statusCategory = new", `status not in ("In Progress", "Research")`} {
+		if !strings.Contains(fx.queueJQL, want) {
+			t.Errorf("queue query %q must contain %q", fx.queueJQL, want)
+		}
+	}
+	if got := under(t, base(), 1); len(got) != 0 {
+		t.Errorf("WIP at the limit must report no free slot: %+v", got)
+	}
+	fx = base()
+	fx.boardFail = true
+	if got := under(t, fx, 3); len(got) != 0 {
+		t.Errorf("an unread board must report no free slot: %+v", got)
+	}
+	// More involved issues than the comment cap, with the persona's WIP
+	// beyond it: the count still sees every issue.
+	fx = base()
+	for i := 0; i < jiraMaxCommentIssues; i++ {
+		fx.issues = append([]map[string]any{issue(fmt.Sprintf("P23-%d", 1000+i), "To Do", "new", humanID, 240*h, 1*h, "filler")}, fx.issues...)
+	}
+	fx.issues = append(fx.issues, issue("P23-2", "Research", "indeterminate", personaID, 240*h, 1*h, "past the cap"))
+	if got := under(t, fx, 3); len(got) != 1 || got[0].Key != "P23-20" || got[0].Fields["count"] != "2" {
+		t.Errorf("past the comment cap, WIP 2 of 3 must name exactly the top issue: %+v", got)
+	}
+	// A queue whose pages all hold backlog issues names nothing and says
+	// the queue was cut short.
+	fx = base()
+	fx.queue = fx.queue[:1] // P23-21, in the backlog
+	fx.queueMore = true
+	got = under(t, fx, 3)
+	var partial *PartialError
+	if len(got) != 0 || !errors.As(lastErr, &partial) || !strings.Contains(partial.Reason, "queue search truncated") {
+		t.Errorf("a truncated queue with no candidate must be partial: got %+v err=%v", got, lastErr)
+	}
+	// A failed queue search says so, never "truncated"; a failure on the
+	// second page still names candidates from the first.
+	fx = base()
+	fx.queueFailPage = 1
+	got = under(t, fx, 3)
+	if len(got) != 0 || !errors.As(lastErr, &partial) || !strings.Contains(partial.Reason, "queue search failed after 0 issues") || strings.Contains(partial.Reason, "truncated") {
+		t.Errorf("a failed queue search must be partial with only the failure: got %+v err=%v", got, lastErr)
+	}
+	fx = base()
+	fx.queueMore, fx.queueFailPage = true, 2
+	got = under(t, fx, 3)
+	if len(got) != 2 || got[0].Key != "P23-20" || !errors.As(lastErr, &partial) || !strings.Contains(partial.Reason, "queue search failed after 5 issues") || strings.Contains(partial.Reason, "truncated") {
+		t.Errorf("a page-2 failure must keep page 1's candidates: got %+v err=%v", got, lastErr)
 	}
 }
