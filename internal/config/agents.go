@@ -304,7 +304,7 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		SessionIDEnv:        "",                // Codex captures from JSONL output
 		ResumeFlag:          "resume",
 		ResumeStyle:         "subcommand",
-		SupportsHooks:       false, // Use env/files instead
+		SupportsHooks:       true, // Managed hooks in /etc/codex/requirements.toml; see gt hooks codex
 		SupportsForkSession: false,
 		NonInteractive: &NonInteractiveConfig{
 			Subcommand: "exec",
@@ -315,6 +315,9 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		ReadyPromptPrefix: "› ",
 		ReadyDelayMs:      3000,
 		InstructionsFile:  "AGENTS.md",
+		// No HooksDir/HooksSettingsFile: nothing is written per worktree.
+		// Agent startup verifies the managed hooks instead.
+		HooksProvider: "codex",
 	},
 	AgentCursor: {
 		Name:    AgentCursor,
