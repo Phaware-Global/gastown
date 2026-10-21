@@ -460,7 +460,8 @@ command for talking to past agent sessions.
 For agents that don't support hooks at all, a wrapper script can inject
 Gas Town context before launching the agent.
 
-Reference: `internal/wrappers/scripts/gt-codex`
+Reference: `internal/wrappers/scripts/gt-codex` (for running Codex by hand;
+Gas Town's Codex agents use [managed hooks](#codex-managed-hooks))
 
 ```bash
 #!/bin/bash
@@ -476,41 +477,31 @@ exec codex "$@"
 The wrapper runs `gt prime` before `exec`-ing the real agent binary. Users
 install it as `gt-codex` in their PATH.
 
-### Experimental Codex hooks via custom profile
+### Codex managed hooks
 
-Gas Town also supports an experimental opt-in Codex hooks path for users who define a custom Codex agent profile with explicit hook settings.
+Codex has the same hook events and protocol as Claude Code, but it runs a
+project or user hook only after a human trusts that hook's hash. Gas Town
+therefore installs Codex hooks as managed hooks in the system requirements
+file, `/etc/codex/requirements.toml`, which Codex trusts by policy and an
+agent cannot edit:
 
-Use this only when both of these are true:
-- Your custom agent profile sets `prompt_mode: "arg"` plus `hooks.provider: "codex"`, `hooks.dir: ".codex"`, and `hooks.settings_file: "hooks.json"`
-- Codex has its upstream hooks feature enabled via `[features].codex_hooks = true`
-
-This installs `.codex/hooks.json` through the existing provider installer path and keeps the implementation intentionally small:
-- `SessionStart` runs `gt prime --hook`
-- Autonomous `SessionStart` also runs `gt mail check --inject`
-- `Stop` runs `gt costs record`
-
-Example custom profile:
-
-```json
-{
-  "agents": {
-    "codex-worker-hooks": {
-      "command": "codex",
-      "args": ["--dangerously-bypass-approvals-and-sandbox"],
-      "prompt_mode": "arg",
-      "hooks": {
-        "provider": "codex",
-        "dir": ".codex",
-        "settings_file": "hooks.json"
-      }
-    }
-  }
-}
+```bash
+gt hooks codex requirements | sudo tee /etc/codex/requirements.toml
+gt hooks codex check
 ```
 
-This path does not attempt broader hook parity such as tool guards, prompt-submit hooks, or pre-compact behavior.
+Each event calls `gt hooks codex run <event>`, which runs the hooks a Claude
+agent in the same role gets (base config plus role and rig overrides) and
+translates the payloads, so the tap guards, `gt prime` and mail injection
+apply to Codex agents. (The Stop hook runs `gt costs record`, which reads only
+Claude transcripts today.) The built-in `codex` preset sets
+`hooks_provider: "codex"` with no hooks directory: nothing is written into the
+worktree, and agent startup fails until `gt hooks codex check` passes.
+[HOOKS.md](HOOKS.md#codex-managed-hooks) describes the payload translation.
 
-The default built-in `codex` preset does not change. It remains on the no-hooks fallback path, and the `gt-codex` wrapper guidance above still applies to that default path unless you explicitly opt into a custom hook-capable Codex profile.
+The earlier opt-in profile that installed `.codex/hooks.json` is gone: Codex
+skips an untrusted project hook file, so it never ran unattended. A custom
+profile with `hooks.provider: "codex"` now uses the managed hooks too.
 
 ### Slash commands
 
@@ -528,7 +519,7 @@ Current agent capabilities at a glance:
 |-------|-------|--------|-----------------|------|-------------|---------------|
 | Claude | Yes (settings.json) | `--resume` (flag) | Native | Yes | arg | node, claude |
 | Gemini | Yes | `--resume` (flag) | `-p` | No | arg | gemini |
-| Codex | No | `resume` (subcmd) | `exec` subcmd | No | none | codex |
+| Codex | Yes (managed, `/etc/codex/requirements.toml`) | `resume` (subcmd) | `exec` subcmd | No | arg | codex |
 | Cursor | Yes (`.cursor/hooks.json`) | `--resume` (flag) | `-p` / `--print` + `--output-format` | No | arg | cursor-agent, agent |
 | Auggie | No | `--resume` (flag) | No | No | arg | auggie |
 | AMP | No | `threads continue` (subcmd) | No | No | arg | amp |
