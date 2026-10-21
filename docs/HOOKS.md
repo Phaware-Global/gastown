@@ -258,6 +258,20 @@ When no base config exists, the system uses sensible defaults:
 - **PreCompact**: PATH setup + `gt prime --hook`
 - **UserPromptSubmit**: PATH setup + `gt mail check --inject`
 - **Stop**: PATH setup + `gt costs record`
+- **PreToolUse**: `pr-workflow` and `command-substitution` on every Bash call,
+  `dangerous-command` on `rm -rf /` and force pushes, `push-main` on pushes,
+  and `memory-write` on Write/Edit/NotebookEdit
+
+The built-in overrides add `dangerous-command` on `sudo` and system package
+installs for the autonomous roles (polecats, witness, refinery, deacon, boot,
+reviewer, assistant). A Stop override for polecats repeats `gt costs record`
+next to `gt tap polecat-stop-check`, because an override entry with the same
+matcher replaces the base entry.
+
+`gt hooks sync` writes this computed config over the hooks a settings
+template installed, so every guard has to be here, not only in the template;
+`TestComputeExpectedKeepsTemplateHooks` fails when a template hook would be
+lost.
 
 ## Codex managed hooks
 

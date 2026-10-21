@@ -67,8 +67,17 @@ func TestReviewerOverrideBlocksWriteSurfaces(t *testing.T) {
 		}
 	}
 
-	// Every guard must actually block (exit 2), not just warn.
+	// Every guard must actually block (exit 2), not just warn. The privilege
+	// guards every autonomous role shares call the dangerous-command guard,
+	// which decides for itself.
+	shared := map[string]bool{}
+	for _, e := range privilegeGuardEntries() {
+		shared[e.Matcher] = true
+	}
 	for _, entry := range rev.PreToolUse {
+		if shared[entry.Matcher] {
+			continue
+		}
 		for _, h := range entry.Hooks {
 			if !strings.Contains(h.Command, "exit 2") {
 				t.Errorf("guard %q does not block (missing 'exit 2'): %q", entry.Matcher, h.Command)
