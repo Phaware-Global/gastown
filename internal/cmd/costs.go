@@ -45,12 +45,16 @@ var (
 var costsCmd = &cobra.Command{
 	Use:     "costs",
 	GroupID: GroupDiag,
-	Short:   "Show costs for running Claude sessions",
-	Long: `Display costs for Claude Code sessions in Gas Town.
+	Short:   "Show costs for running Claude and Codex sessions",
+	Long: `Display costs for Claude Code and Codex sessions in Gas Town.
 
 Costs are calculated from Claude Code transcript files in
 $CLAUDE_CONFIG_DIR/projects/ (defaults to ~/.claude/projects/) by summing
 token usage from assistant messages and applying model-specific pricing.
+Codex sessions are read from the rollouts in $CODEX_HOME/sessions/ (defaults
+to ~/.codex/sessions/) and priced at the OpenAI API rate, since a ChatGPT
+subscription has no per-token price. A work directory's newer transcript or
+rollout is the one counted.
 
 Examples:
   gt costs              # Live costs from running sessions
@@ -72,9 +76,10 @@ var costsRecordCmd = &cobra.Command{
 	Short: "Record session cost to local log file (called by Stop hook)",
 	Long: `Record a session's cost since its previous record to a local log file.
 
-This command is intended to be called from a Claude Code Stop hook, which
-fires after every response. It reads token usage from the Claude Code
-transcript file ($CLAUDE_CONFIG_DIR/projects/... or ~/.claude/projects/...),
+This command is intended to be called from a Claude Code or Codex Stop hook,
+which fires after every response. It reads token usage from the Claude Code
+transcript file ($CLAUDE_CONFIG_DIR/projects/... or ~/.claude/projects/...)
+or the Codex rollout (~/.codex/sessions/...), whichever is newer,
 prices it by model, and appends one entry to ~/.gt/costs.jsonl holding the
 increment since the last entry for the session (cost_usd) and the session's
 running total (cumulative_usd). This is a simple append operation that never
@@ -899,19 +904,26 @@ func calculateCost(usage *TokenUsage) float64 {
 	return inputCost + cacheReadCost + cacheCreateCost + outputCost
 }
 
-// extractCostFromWorkDir extracts cost from Claude Code transcript for a working directory.
+// extractCostFromWorkDir extracts cost from the newest Claude Code transcript or
+// Codex rollout for a working directory.
 // This reads the most recent transcript file and sums all token usage. It also
 // returns that transcript's file name so callers can tell sessions apart.
 func extractCostFromWorkDir(workDir string) (float64, string, error) {
-	projectDir, err := getClaudeProjectDir(workDir)
-	if err != nil {
-		return 0, "", fmt.Errorf("getting project dir: %w", err)
+	claudePath, claudeErr := latestClaudeTranscript(workDir)
+	// A work dir can hold both Claude transcripts and Codex rollouts when its
+	// role changed provider; the newer one is the running session.
+	if codexCost, codexName, codexMod, err := extractCodexCostFromWorkDir(workDir); err == nil {
+		if claudeErr != nil {
+			return codexCost, codexName, nil
+		}
+		if info, statErr := os.Stat(claudePath); statErr != nil || codexMod.After(info.ModTime()) {
+			return codexCost, codexName, nil
+		}
 	}
-
-	transcriptPath, err := findLatestTranscript(projectDir)
-	if err != nil {
-		return 0, "", fmt.Errorf("finding transcript: %w", err)
+	if claudeErr != nil {
+		return 0, "", claudeErr
 	}
+	transcriptPath := claudePath
 
 	usage, err := parseTranscriptUsage(transcriptPath)
 	if err != nil {
@@ -919,6 +931,19 @@ func extractCostFromWorkDir(workDir string) (float64, string, error) {
 	}
 
 	return calculateCost(usage), filepath.Base(transcriptPath), nil
+}
+
+// latestClaudeTranscript is the newest Claude Code transcript for workDir.
+func latestClaudeTranscript(workDir string) (string, error) {
+	projectDir, err := getClaudeProjectDir(workDir)
+	if err != nil {
+		return "", fmt.Errorf("getting project dir: %w", err)
+	}
+	transcriptPath, err := findLatestTranscript(projectDir)
+	if err != nil {
+		return "", fmt.Errorf("finding transcript: %w", err)
+	}
+	return transcriptPath, nil
 }
 
 // getTmuxSessionWorkDir gets the current working directory of a tmux session.
