@@ -189,6 +189,7 @@ func (p *GitHubPort) Suggestions() []string {
 		"move {key} to the review status and assign it to {human}",
 		"move {key} back to in progress and assign it to the persona",
 		"move {key} to the uat status",
+		"evaluate whether {key} is done: move it to the done status, or back to to do or in progress if work remains",
 		"check the release tag for {key}",
 		"fix the issue key named by {key}",
 	}
@@ -937,9 +938,11 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 	}
 
 	links := p.newLinks(ctx, in, note)
+	openRead := true // every repo's open PRs read in full, for merged-in-review
 	for _, ref := range repos {
 		if !timeLeft(ctx) {
 			note("time budget exhausted before %s", ref.slug())
+			openRead = false
 			break
 		}
 		var open []ghPR
@@ -948,10 +951,12 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		for page := 0; ; page++ {
 			if !timeLeft(ctx) {
 				note("%s: time budget exhausted after %d open PRs", ref.slug(), len(open))
+				openRead = false
 				break
 			}
 			if page == githubMaxPRPages {
 				note("%s: more than %d open PRs; the rest were not checked", ref.slug(), githubMaxPRPages*githubPRPage)
+				openRead = false
 				break
 			}
 			d, warn, err := c.repo(ref, after, page == 0)
@@ -961,6 +966,7 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 				} else {
 					note("%s: %v", ref.slug(), err)
 				}
+				openRead = false
 				break
 			}
 			if warn != "" {
@@ -984,6 +990,7 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 				// A denied NON_NULL field nulls the whole node: GitHub gave us no
 				// number to page, so name the slot and move on.
 				note("%s: open PR at index %d came back null (a field was denied); not checked", ref.slug(), i)
+				openRead = false
 				continue
 			}
 			if pr.Reviews.PageInfo.truncated() || pr.ReviewThreads.PageInfo.truncated() || pr.reviewsNull || pr.threadsNull {
@@ -1004,6 +1011,9 @@ func (p *GitHubPort) Sweep(ctx context.Context, in Input) ([]Finding, error) {
 		}
 		out = append(out, p.checkReleases(c, ref, first, patterns, in.Now, d, note)...)
 		out = append(out, links.check(open, first.Merged.Nodes, patterns, in.Now, d, isPersona, isHuman)...)
+	}
+	if openRead {
+		out = append(out, links.mergedInReview()...)
 	}
 	if len(partial) > 0 {
 		return out, &PartialError{Reason: strings.Join(partial, "; ")}

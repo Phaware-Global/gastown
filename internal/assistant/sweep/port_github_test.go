@@ -1568,3 +1568,68 @@ func TestGitHubPort_ApprovedUnmergedSurvivesCompareFailure(t *testing.T) {
 		t.Errorf("CI going green again must not re-page the acknowledged item, got new %v", ks)
 	}
 }
+
+// merged-in-review: an issue still in review whose persona PRs are all
+// merged, on any branch, is reported for the Mayor to decide; one with a
+// persona PR still open in any repo is not, and an unread repo stops the
+// kind rather than guess.
+func TestGitHubPort_MergedInReview(t *testing.T) {
+	h := time.Hour
+	app := &ghRepoData{}
+	app.Merged.Nodes = []ghPR{
+		mergedPR(50, "develop", "feat/P23-50", 30*h, shaM),     // reported
+		mergedPR(51, "develop", "feat/P23-51", 30*h, shaN),     // a PR in acme/extra is still open
+		mergedPR(52, "develop", "feat/P23-52", 30*h, shaB),     // already Done
+		mergedPR(53, "develop", "feat/P23-53", 300*24*h, shaT), // outside the release window
+		mergedPR(54, "develop", "feat/P23-54", 30*h, shaA),     // not the persona's
+		mergedPR(55, "develop", "feat/P23-55", 50*h, shaA),
+		mergedPR(56, "develop", "feat/P23-55-part2", 20*h, shaA), // the latest merge for P23-55
+	}
+	app.Merged.Nodes[4].Author.Login = "outsider"
+	extra := &ghRepoData{}
+	extra.Open.Nodes = []ghPR{pr(60, "artie", 40*h, 40*h, "SUCCESS", branch("feat/P23-51-ios"), draft)}
+	inReview := func(key string) map[string]any {
+		return issue(key, "In Review", "indeterminate", humanID, 100*h, 1*h, "in review")
+	}
+	fx := &ghFixture{repos: map[string]*ghRepoData{"acme/app": app, "acme/extra": extra},
+		issues: []map[string]any{inReview("P23-50"), inReview("P23-51"), issue("P23-52", "Done", "done", personaID, 100*h, 1*h, "done"),
+			inReview("P23-53"), inReview("P23-54"), inReview("P23-55")}}
+	p, in := newGitHubTest(t, fx, []string{"artie"})
+	withJira(p, in, p.apiBase)
+	findings, err := p.Sweep(context.Background(), in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := map[string]Finding{}
+	for _, f := range findings {
+		if f.Kind == "merged-in-review" {
+			got[f.Key] = f
+		}
+	}
+	if len(got) != 2 || got["P23-50"].Key == "" || got["P23-55"].Key == "" {
+		t.Fatalf("want merged-in-review for P23-50 and P23-55 only, got %v", keysOf(got))
+	}
+	f := got["P23-55"]
+	if f.Fields["pr"] != "56" || f.External["merged_pr"] != "acme/app#56" || !f.Since.Equal(ago(20*h)) || f.Fingerprint != "In Review|acme/app#56" {
+		t.Errorf("P23-55 must name its latest merged PR: %+v", f)
+	}
+	before := f.Suggest
+	enforceSchema(p.Schema(), p.Suggestions(), &f)
+	if f.Suggest != before || !strings.Contains(before, "back to to do or in progress") {
+		t.Errorf("suggest %q must ask for an evaluation and pass the templates", before)
+	}
+
+	// A repo whose open PRs could not be read might hold an open PR for
+	// the issue: the kind is skipped, the sweep is partial.
+	fx.failing = "acme/extra"
+	findings, err = p.Sweep(context.Background(), in)
+	var partial *PartialError
+	if !errors.As(err, &partial) {
+		t.Fatalf("a failing repo must make the sweep partial: %v", err)
+	}
+	for _, f := range findings {
+		if f.Kind == "merged-in-review" {
+			t.Errorf("merged-in-review reported with a repo unread: %+v", f)
+		}
+	}
+}
