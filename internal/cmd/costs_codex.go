@@ -21,7 +21,7 @@ import (
 // offers, keyed by the model slug Codex records. Columns: input, output,
 // cached input, cache write. OpenAI publishes no separate cache-write price,
 // so cache writes are charged at the input rate. Requests over 272K input
-// tokens are billed at a higher tier, which is not modelled.
+// tokens are billed at a higher tier, which is not modeled.
 // Source: OpenAI API pricing via https://benchlm.ai/openai/api-pricing and
 // https://openai.com/index/introducing-gpt-6-1-sol/ (2026-10-20).
 var openAIPricing = map[string]modelPrice{
