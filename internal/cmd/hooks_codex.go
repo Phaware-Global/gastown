@@ -57,7 +57,10 @@ var hooksCodexRunCmd = &cobra.Command{
 	Short:  "Run the Gas Town hooks for a Codex hook event (called by Codex)",
 	Hidden: true,
 	Args:   cobra.ExactArgs(1),
-	RunE:   runHooksCodexRun,
+	// A block is an exit-2 SilentExit; usage text would land in the
+	// reason Codex shows the model.
+	SilenceUsage: true,
+	RunE:         runHooksCodexRun,
 }
 
 func init() {
