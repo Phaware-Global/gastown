@@ -286,11 +286,22 @@ gt hooks codex check
 
 The file has one hook per event (SessionStart, UserPromptSubmit, PreToolUse,
 PostToolUse, PreCompact, Stop), each calling `gt hooks codex run <event>` by
-the gt binary's full path. It also pins `[features] hooks = true`, so a session
-cannot turn hooks off, and `memories = false`, so Codex's own memory files
-cannot hold policy outside the formula, beads and mail. The file names the gt
-binary by path, so reinstall it only when that path changes. Gas Town refuses
-to start a Codex agent until `gt hooks codex check` passes.
+the gt binary's full path. It sets `allow_managed_hooks_only = true`, so Codex
+runs no user, project, session or plugin hooks: an agent never stops at the
+"Hooks need review" dialog (the beads plugin ships hooks of its own) and
+cannot add hooks of its own. It also pins `[features] hooks = true`, so a
+session cannot turn hooks off, and `memories = false`, so Codex's own memory
+files cannot hold policy outside the formula, beads and mail. The file names
+the gt binary by path, so reinstall it only when that path changes. Gas Town
+refuses to start a Codex agent until `gt hooks codex check` passes.
+
+Codex also stops at a "Trust this folder?" dialog the first time it opens a
+project, and reads that trust only from the user's `~/.codex/config.toml`
+(`$CODEX_HOME`), not from a `-c` override. Polecats run in a new worktree per
+name, so before a Codex agent starts, Gas Town adds a trusted
+`[projects."<path>"]` table for its work dir, the work dir's git toplevel and,
+for a linked worktree, the main checkout. Existing tables, including one a
+person marked untrusted, are left as they are.
 
 The dispatcher translates between Codex and Claude hook payloads:
 

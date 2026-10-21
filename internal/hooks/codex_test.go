@@ -243,7 +243,7 @@ func TestCodexRequirementsRoundTrip(t *testing.T) {
 	if err := CheckCodexRequirements([]byte(toml), gt); err != nil {
 		t.Fatalf("generated requirements fail the check: %v\n%s", err, toml)
 	}
-	for _, want := range []string{"hooks = true", "memories = false", "additionalContextLimit = 0", `"/Users/agent/.local/bin/gt hooks codex run PreToolUse"`} {
+	for _, want := range []string{"allow_managed_hooks_only = true", "hooks = true", "memories = false", "additionalContextLimit = 0", `"/Users/agent/.local/bin/gt hooks codex run PreToolUse"`} {
 		if !strings.Contains(toml, want) {
 			t.Errorf("requirements missing %q", want)
 		}
@@ -252,7 +252,8 @@ func TestCodexRequirementsRoundTrip(t *testing.T) {
 		t.Error("check passed for a different gt binary")
 	}
 	broken := []struct{ name, from, to string }{
-		{"hooks off", "hooks = true", "hooks = false"},
+		{"other hook sources allowed", "allow_managed_hooks_only = true", "allow_managed_hooks_only = false"},
+		{"hooks off", "\nhooks = true", "\nhooks = false"},
 		{"memories on", "memories = false", "memories = true"},
 		{"Stop missing", `"` + gt + ` hooks codex run Stop"`, `"/bin/true"`},
 	}

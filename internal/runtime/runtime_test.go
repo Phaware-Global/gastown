@@ -266,12 +266,17 @@ func TestEnsureSettingsForRole_UnknownProvider(t *testing.T) {
 	}
 }
 
-// A Codex agent starts only when the managed hooks are installed, and
-// nothing is written into its worktree: Codex would skip an untrusted
-// project hook file anyway.
+// A Codex agent starts only when the managed hooks are installed, its work
+// dir is then trusted, and nothing is written into its worktree: Codex would
+// skip an untrusted project hook file anyway.
 func TestEnsureSettingsForRole_CodexRequiresManagedHooks(t *testing.T) {
-	orig := verifyCodexManagedHooks
-	t.Cleanup(func() { verifyCodexManagedHooks = orig })
+	orig, origTrust := verifyCodexManagedHooks, ensureCodexProjectTrust
+	t.Cleanup(func() { verifyCodexManagedHooks, ensureCodexProjectTrust = orig, origTrust })
+	var trusted []string
+	ensureCodexProjectTrust = func(workDir string) error {
+		trusted = append(trusted, workDir)
+		return nil
+	}
 
 	rc := &config.RuntimeConfig{Hooks: &config.RuntimeHooksConfig{Provider: "codex", Dir: ".codex", SettingsFile: "hooks.json"}}
 	for _, installed := range []bool{true, false} {
@@ -288,6 +293,12 @@ func TestEnsureSettingsForRole_CodexRequiresManagedHooks(t *testing.T) {
 		}
 		if !installed && err == nil {
 			t.Error("not installed: expected an error so the agent does not start")
+		}
+		if installed && (len(trusted) != 1 || trusted[0] != workDir) {
+			t.Errorf("installed: trusted %v, want the work dir %s", trusted, workDir)
+		}
+		if !installed && len(trusted) != 1 {
+			t.Errorf("not installed: trust ran anyway (%v)", trusted)
 		}
 		for _, dir := range []string{settingsDir, workDir} {
 			if _, err := os.Stat(dir + "/.codex/hooks.json"); err == nil {

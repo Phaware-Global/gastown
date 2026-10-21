@@ -37,9 +37,13 @@ func EnsureSettingsForRole(settingsDir, workDir, role string, rc *config.Runtime
 	}
 
 	// Codex hooks are machine-wide managed hooks, not a per-worktree file.
-	// Refuse to start a Codex agent whose guards are not installed.
+	// Refuse to start a Codex agent whose guards are not installed, and trust
+	// its work dir so it does not stop at Codex's folder-trust dialog.
 	if provider == "codex" {
-		return verifyCodexManagedHooks()
+		if err := verifyCodexManagedHooks(); err != nil {
+			return err
+		}
+		return ensureCodexProjectTrust(workDir)
 	}
 
 	// 1. Provider-specific settings via generic installer.
@@ -74,6 +78,10 @@ func EnsureSettingsForRole(settingsDir, workDir, role string, rc *config.Runtime
 // verifyCodexManagedHooks is a variable so tests can run without
 // /etc/codex/requirements.toml.
 var verifyCodexManagedHooks = hooks.VerifyCodexManagedHooks
+
+// ensureCodexProjectTrust is a variable so tests do not write the real
+// ~/.codex/config.toml.
+var ensureCodexProjectTrust = hooks.EnsureCodexProjectTrust
 
 func ensureGeminiContextFile(workDir string) error {
 	if workDir == "" {

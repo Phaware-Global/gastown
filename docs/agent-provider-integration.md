@@ -492,12 +492,20 @@ gt hooks codex check
 
 Each event calls `gt hooks codex run <event>`, which runs the hooks a Claude
 agent in the same role gets (base config plus role and rig overrides) and
-translates the payloads, so the tap guards, `gt prime` and mail injection
-apply to Codex agents. (The Stop hook runs `gt costs record`, which reads only
-Claude transcripts today.) The built-in `codex` preset sets
+translates the payloads, so the tap guards, `gt prime`, mail injection and
+`gt costs record` apply to Codex agents. The built-in `codex` preset sets
 `hooks_provider: "codex"` with no hooks directory: nothing is written into the
-worktree, and agent startup fails until `gt hooks codex check` passes.
+worktree, agent startup fails until `gt hooks codex check` passes, and the
+agent's work dir is added to the trusted projects in `~/.codex/config.toml` so
+it does not stop at Codex's folder-trust dialog.
 [HOOKS.md](HOOKS.md#codex-managed-hooks) describes the payload translation.
+
+Gas Town agents need their `GT_*` and beads environment in their shell
+commands. If the Codex config sets `shell_environment_policy.inherit = "core"`
+(or excludes those variables), a custom Codex agent must override it, e.g.
+`"args": ["--dangerously-bypass-approvals-and-sandbox", "-c",
+"shell_environment_policy.inherit=all"]`; otherwise `gt` and `bd` commands
+run without the agent's role.
 
 The earlier opt-in profile that installed `.codex/hooks.json` is gone: Codex
 skips an untrusted project hook file, so it never ran unattended. A custom
