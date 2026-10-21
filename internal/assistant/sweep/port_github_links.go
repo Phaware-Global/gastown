@@ -147,6 +147,11 @@ type ghLinks struct {
 	probed                          map[string]error // visibility probe per project, once per sweep (nil: readable)
 	hidden                          map[string]bool  // projects whose probe said lost Browse (not a probe failure)
 	failed                          bool
+	// merged-in-review is decided across repos, since one issue's PRs can
+	// span several: the keys any persona PR still open names, and the
+	// latest merged persona PR naming each key.
+	openKeys map[string]bool
+	merged   map[string]*ghPR
 }
 
 func (p *GitHubPort) newLinks(ctx context.Context, in Input, note func(string, ...any)) *ghLinks {
@@ -166,7 +171,7 @@ func (p *GitHubPort) newLinks(ctx context.Context, in Input, note func(string, .
 	l := &ghLinks{client: client, keyRe: regexp.MustCompile(`\b(?:` + strings.Join(projects, "|") + `)-\d+\b`),
 		reviewers: lowerKeys(cfg.Reviewers), inReview: cfg.InReviewStatus, inProgress: cfg.InProgressStatus, done: cfg.DoneStatus, uat: cfg.UATStatus,
 		uatAfter: parseDur(cfg.UATSweepAfter, 24*time.Hour), note: note, cache: map[string]*jiraIssue{}, notFound: map[string]bool{}, projects: cfg.Projects,
-		resolved: map[string]bool{}, probed: map[string]error{}, hidden: map[string]bool{}}
+		resolved: map[string]bool{}, probed: map[string]error{}, hidden: map[string]bool{}, openKeys: map[string]bool{}, merged: map[string]*ghPR{}}
 	for field, def := range map[*string]string{&l.inReview: "In Review", &l.inProgress: "In Progress", &l.done: "Done", &l.uat: "In UAT"} {
 		if *field == "" {
 			*field = def
@@ -352,19 +357,27 @@ func (l *ghLinks) check(open []ghPR, merged []ghPR, patterns []string, now time.
 	var all []string
 	for i := range open {
 		if ours(&open[i]) {
-			all = append(all, l.keys(&open[i])...)
+			for _, k := range l.keys(&open[i]) {
+				all = append(all, k)
+				l.openKeys[k] = true
+			}
 		}
 	}
-	// Merged PRs matter only where done-not-in-uat looks: inside the release
-	// window, on a release branch.
-	inWindow := func(pr *ghPR) bool {
-		return !pr.MergedAt.IsZero() && now.Sub(pr.MergedAt) <= d.releaseWindow && matchAny(patterns, pr.BaseRefName)
-	}
+	// Merged PRs matter only inside the release window: on any branch for
+	// merged-in-review, on a release branch for done-not-in-uat.
+	recent := func(pr *ghPR) bool { return !pr.MergedAt.IsZero() && now.Sub(pr.MergedAt) <= d.releaseWindow }
+	inWindow := func(pr *ghPR) bool { return recent(pr) && matchAny(patterns, pr.BaseRefName) }
 	for i := range merged {
-		if !ours(&merged[i]) || !inWindow(&merged[i]) {
+		pr := &merged[i]
+		if !ours(pr) || !recent(pr) {
 			continue
 		}
-		all = append(all, l.keys(&merged[i])...)
+		for _, k := range l.keys(pr) {
+			all = append(all, k)
+			if last := l.merged[k]; last == nil || pr.MergedAt.After(last.MergedAt) {
+				l.merged[k] = pr
+			}
+		}
 	}
 	l.load(all)
 	if l.failed {
@@ -495,6 +508,36 @@ func (l *ghLinks) check(open []ghPR, merged []ghPR, patterns []string, now time.
 			}
 			out = append(out, f)
 		}
+	}
+	return out
+}
+
+// mergedInReview reports issues still in the review status whose linked
+// persona PRs are all merged: no persona PR open in any repo swept names
+// them. Call it once, after check has run for every repo, and only when
+// every repo's open PRs were read; an unread open PR could still name the
+// issue.
+func (l *ghLinks) mergedInReview() []Finding {
+	if l == nil || l.failed {
+		return nil
+	}
+	keys := make([]string, 0, len(l.merged))
+	for k := range l.merged {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var out []Finding
+	for _, key := range keys {
+		is, pr := l.cache[key], l.merged[key]
+		if is == nil || l.openKeys[key] || !strings.EqualFold(is.Fields.Status.Name, l.inReview) {
+			continue
+		}
+		prKey := fmt.Sprintf("%s#%d", repoSlugOf(pr), pr.Number)
+		out = append(out, Finding{Kind: "merged-in-review", Key: key, URL: l.client.origin + "/browse/" + key, Severity: SeverityActionable, Since: pr.MergedAt,
+			Fields:      map[string]string{"pr": fmt.Sprint(pr.Number), "status_category": is.Fields.Status.Category.Key},
+			External:    map[string]string{"summary": is.Fields.Summary, "status": is.Fields.Status.Name, "pr_title": pr.Title, "merged_pr": prKey},
+			Suggest:     "evaluate whether " + key + " is done: move it to the done status, or back to to do or in progress if work remains",
+			Fingerprint: is.Fields.Status.Name + "|" + prKey})
 	}
 	return out
 }
