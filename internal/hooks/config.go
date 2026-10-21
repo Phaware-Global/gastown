@@ -273,17 +273,46 @@ func Merge(base, override *HooksConfig) *HooksConfig {
 // Crew workers get auto-session-cycling on PreCompact: instead of compacting
 // context (which degrades quality), the session is replaced with a fresh one.
 // The successor picks up hooked work via SessionStart hook (gt prime --hook).
+// autonomousOverrideKeys are the override targets of the roles
+// hookutil.IsAutonomousRole classes as autonomous. They run without a human
+// at the keyboard, so they also get privilegeGuardEntries.
+var autonomousOverrideKeys = []string{"polecats", "witness", "refinery", "deacon", "boot", "reviewer", "assistant"}
+
+// privilegeGuardEntries send sudo and system package installs to the
+// dangerous-command guard. They were in the autonomous settings template
+// only, so gt hooks sync dropped them; mayor and crew keep the interactive
+// template's behavior and do not get them.
+func privilegeGuardEntries() []HookEntry {
+	var entries []HookEntry
+	for _, m := range []string{"Bash(sudo *)", "Bash(apt install*)", "Bash(apt-get install*)", "Bash(dnf install*)", "Bash(yum install*)", "Bash(pacman -S*)", "Bash(brew install*)"} {
+		entries = append(entries, HookEntry{
+			Matcher: m,
+			Hooks: []Hook{{
+				Type:    "command",
+				Command: gtCommand("gt tap guard dangerous-command"),
+			}},
+		})
+	}
+	return entries
+}
+
 func DefaultOverrides() map[string]*HooksConfig {
-	return map[string]*HooksConfig{
+	overrides := map[string]*HooksConfig{
 		// Polecats: remind on Stop when commits are pending without gt done.
 		// Stop fires at the end of every assistant turn, so the session is
 		// alive and the polecat may be mid-task; the polecat-stop-check
 		// command therefore only prints a reminder and never runs gt done.
+		// The entry replaces the base Stop entry (same matcher), so it
+		// repeats the base costs record.
 		"polecats": {
 			Stop: []HookEntry{
 				{
 					Matcher: "",
 					Hooks: []Hook{
+						{
+							Type:    "command",
+							Command: gtCommand("gt costs record &"),
+						},
 						{
 							Type:    "command",
 							Command: gtCommand("gt tap polecat-stop-check"),
@@ -819,6 +848,15 @@ func DefaultOverrides() map[string]*HooksConfig {
 			},
 		},
 	}
+	for _, key := range autonomousOverrideKeys {
+		cfg := overrides[key]
+		if cfg == nil {
+			cfg = &HooksConfig{}
+			overrides[key] = cfg
+		}
+		cfg.PreToolUse = append(cfg.PreToolUse, privilegeGuardEntries()...)
+	}
+	return overrides
 }
 
 // ComputeExpected computes the expected HooksConfig for a target by loading
@@ -1449,11 +1487,30 @@ func DefaultBase() *HooksConfig {
 			// Bash call and let the guard decide relevance — the same
 			// fix pr-workflow's guard applied for the identical reason
 			// (see tap_guard.go's runTapGuardPRWorkflow comment).
+			// pr-workflow runs here too: the prefix matchers above miss
+			// "cd x && gh pr create", and the settings templates have
+			// always run it on every Bash call. Identical commands
+			// matched twice are deduplicated by the client.
 			{
 				Matcher: "Bash",
+				Hooks: []Hook{
+					{
+						Type:    "command",
+						Command: gtCommand("gt tap guard pr-workflow"),
+					},
+					{
+						Type:    "command",
+						Command: gtCommand("gt tap guard command-substitution"),
+					},
+				},
+			},
+			// Worker roles must not persist private memory; see
+			// tap_guard_memory_write.go.
+			{
+				Matcher: "Write|Edit|NotebookEdit",
 				Hooks: []Hook{{
 					Type:    "command",
-					Command: gtCommand("gt tap guard command-substitution"),
+					Command: gtCommand("gt tap guard memory-write"),
 				}},
 			},
 		},
