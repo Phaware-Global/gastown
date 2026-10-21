@@ -11,13 +11,22 @@ Gas Town manages context injection for all supported agents. The mechanism varie
 | Claude Code, Gemini | `settings.json` lifecycle hooks | `<role>/.claude/settings.json` |
 | OpenCode | JS plugin | `workDir/.opencode/plugins/gastown.js` |
 | GitHub Copilot | JSON lifecycle hooks | `workDir/.github/hooks/gastown.json` |
-| Codex, others | Startup nudge fallback | *(no file — nudge only)* |
+| Codex | Managed hooks that run the role's Claude hooks | `/etc/codex/requirements.toml` (root-owned, machine-wide) |
+| Others | Startup nudge fallback | *(no file — nudge only)* |
 
 > **GitHub Copilot note**: Copilot CLI supports full executable lifecycle hooks
 > (`sessionStart`, `userPromptSubmitted`, `preToolUse`, `sessionEnd`) via
 > `.github/hooks/gastown.json`. This is the same lifecycle coverage as Claude Code,
 > delivered in Copilot's JSON format rather than Claude's `settings.json` format.
 > The `gt hooks` commands below apply to Claude Code (and Gemini) only.
+
+> **Codex note**: Codex runs a project or user hook only after a human trusts
+> its hash, so Gas Town installs Codex hooks as *managed* hooks in Codex's
+> system requirements file instead. Each Codex event runs
+> `gt hooks codex run <event>`, which runs the same hooks a Claude agent in
+> that role gets: the base config plus role and rig overrides described below.
+> Changing the base or an override therefore changes Codex agents too, with no
+> reinstall. See [Codex managed hooks](#codex-managed-hooks).
 
 Gas Town manages `.claude/settings.json` files in gastown-managed parent directories
 and passes them to Claude Code via the `--settings` flag. This keeps customer repos
@@ -249,3 +258,46 @@ When no base config exists, the system uses sensible defaults:
 - **PreCompact**: PATH setup + `gt prime --hook`
 - **UserPromptSubmit**: PATH setup + `gt mail check --inject`
 - **Stop**: PATH setup + `gt costs record`
+
+## Codex managed hooks
+
+Codex agents get their hooks from `/etc/codex/requirements.toml`. Codex trusts
+hooks in that file by policy, and an agent cannot edit a root-owned file, so it
+cannot remove or untrust its own guards. Install or update it with:
+
+```bash
+gt hooks codex requirements | sudo tee /etc/codex/requirements.toml
+gt hooks codex check
+```
+
+The file has one hook per event (SessionStart, UserPromptSubmit, PreToolUse,
+PostToolUse, PreCompact, Stop), each calling `gt hooks codex run <event>` by
+the gt binary's full path. It also pins `[features] hooks = true`, so a session
+cannot turn hooks off, and `memories = false`, so Codex's own memory files
+cannot hold policy outside the formula, beads and mail. The file names the gt
+binary by path, so reinstall it only when that path changes. Gas Town refuses
+to start a Codex agent until `gt hooks codex check` passes.
+
+The dispatcher translates between Codex and Claude hook payloads:
+
+| Codex | Runs the Claude hooks for |
+|-------|---------------------------|
+| `Bash` (shell and `exec_command`) | `Bash`, with `Bash(<glob>)` matchers tested against the command and each subcommand split at `&&`, `\|\|`, `;`, `\|` and newlines |
+| `apply_patch` | `Edit`, once per file the patch adds, updates, deletes or moves to, with `tool_input.file_path` resolved against the session cwd |
+| `request_user_input` | `AskUserQuestion` |
+| MCP tools (`mcp__server__tool`) | the same name |
+| SessionStart `source`, PreCompact `trigger` | the matcher value, as in Claude |
+
+A hook that exits 2 blocks the call and no later hook runs. Codex ignores an
+exit-2 block with an empty stderr, so when a guard writes its reason to stdout
+(the inline `echo … && exit 2` guards), the dispatcher passes that as the
+reason. Stdout reaches Codex as context only for SessionStart and
+UserPromptSubmit (`additionalContextLimit = 0` keeps `gt prime` output inline
+rather than spilled to a file); Stop and PostToolUse pass it only when it is a
+JSON object, which is all Codex accepts there. Codex ignores PreCompact
+stdout, so context comes back after compaction from the SessionStart hook,
+which Codex fires again with `source` set to `compact`.
+
+The dispatcher runs for every Codex session on the machine and does nothing
+outside a Gas Town agent context, so a person's own Codex sessions get no
+Gas Town hooks.

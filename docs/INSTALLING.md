@@ -167,6 +167,15 @@ gt config agent set claude-haiku "claude --model haiku --dangerously-skip-permis
 gt config default-agent codex-low
 ```
 
+Codex agents also need Gas Town's managed hooks, installed once per machine
+as root (Gas Town refuses to start a Codex agent without them; see
+[HOOKS.md](HOOKS.md#codex-managed-hooks)):
+
+```bash
+gt hooks codex requirements | sudo tee /etc/codex/requirements.toml
+gt hooks codex check
+```
+
 You can also override the agent per command without changing defaults:
 
 ```bash

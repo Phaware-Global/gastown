@@ -601,44 +601,6 @@ func TestInstallForRole_GeminiRoleAware(t *testing.T) {
 	}
 }
 
-func TestInstallForRole_CodexRoleAware(t *testing.T) {
-	dir := t.TempDir()
-	err := InstallForRole("codex", dir, dir, "crew", ".codex", "hooks.json", false)
-	if err != nil {
-		t.Fatalf("InstallForRole(codex, crew): %v", err)
-	}
-
-	got, _ := os.ReadFile(filepath.Join(dir, ".codex", "hooks.json"))
-	want, err := resolveAndSubstitute("codex", "hooks-interactive.json", "crew")
-	if err != nil {
-		t.Fatalf("resolveAndSubstitute: %v", err)
-	}
-	if string(got) != string(want) {
-		t.Error("codex interactive: content mismatch")
-	}
-	if !strings.Contains(string(got), "costs record >/dev/null 2>&1 &") {
-		t.Error("codex interactive: stop hook should silence gt costs record output")
-	}
-
-	dir2 := t.TempDir()
-	err = InstallForRole("codex", dir2, dir2, "polecat", ".codex", "hooks.json", false)
-	if err != nil {
-		t.Fatalf("InstallForRole(codex, polecat): %v", err)
-	}
-
-	got, _ = os.ReadFile(filepath.Join(dir2, ".codex", "hooks.json"))
-	want, err = resolveAndSubstitute("codex", "hooks-autonomous.json", "polecat")
-	if err != nil {
-		t.Fatalf("resolveAndSubstitute: %v", err)
-	}
-	if string(got) != string(want) {
-		t.Error("codex autonomous: content mismatch")
-	}
-	if !strings.Contains(string(got), "costs record >/dev/null 2>&1 &") {
-		t.Error("codex autonomous: stop hook should silence gt costs record output")
-	}
-}
-
 func TestInstallForRole_CopilotRoleAware(t *testing.T) {
 	// Copilot uses gastown-autonomous.json / gastown-interactive.json naming
 	dir := t.TempDir()

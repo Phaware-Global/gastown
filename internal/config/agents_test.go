@@ -1440,6 +1440,11 @@ func TestAllHookSupportingAgentsHaveHookFields(t *testing.T) {
 		if preset.HooksProvider == "" {
 			t.Errorf("agent %q: SupportsHooks=true but HooksProvider is empty", name)
 		}
+		if preset.HooksProvider == "codex" {
+			// Codex hooks are managed hooks in the system requirements
+			// file (gt hooks codex), so there is no per-worktree file.
+			continue
+		}
 		if preset.HooksDir == "" {
 			t.Errorf("agent %q: SupportsHooks=true but HooksDir is empty", name)
 		}

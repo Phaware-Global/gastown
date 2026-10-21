@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -265,6 +266,37 @@ func TestEnsureSettingsForRole_UnknownProvider(t *testing.T) {
 	}
 }
 
+// A Codex agent starts only when the managed hooks are installed, and
+// nothing is written into its worktree: Codex would skip an untrusted
+// project hook file anyway.
+func TestEnsureSettingsForRole_CodexRequiresManagedHooks(t *testing.T) {
+	orig := verifyCodexManagedHooks
+	t.Cleanup(func() { verifyCodexManagedHooks = orig })
+
+	rc := &config.RuntimeConfig{Hooks: &config.RuntimeHooksConfig{Provider: "codex", Dir: ".codex", SettingsFile: "hooks.json"}}
+	for _, installed := range []bool{true, false} {
+		verifyCodexManagedHooks = func() error {
+			if installed {
+				return nil
+			}
+			return errors.New("not installed")
+		}
+		settingsDir, workDir := t.TempDir(), t.TempDir()
+		err := EnsureSettingsForRole(settingsDir, workDir, "polecat", rc)
+		if installed && err != nil {
+			t.Errorf("installed: unexpected error %v", err)
+		}
+		if !installed && err == nil {
+			t.Error("not installed: expected an error so the agent does not start")
+		}
+		for _, dir := range []string{settingsDir, workDir} {
+			if _, err := os.Stat(dir + "/.codex/hooks.json"); err == nil {
+				t.Errorf("installed=%v: a project hooks file was written in %s", installed, dir)
+			}
+		}
+	}
+}
+
 func TestEnsureSettingsForRole_OpenCodeUsesWorkDir(t *testing.T) {
 	// OpenCode plugins must be installed in workDir (not settingsDir) because
 	// OpenCode has no --settings equivalent for path redirection.
@@ -360,7 +392,7 @@ func TestGetStartupFallbackInfo_HooksNoPrompt(t *testing.T) {
 }
 
 func TestGetStartupFallbackInfo_NoHooksWithPrompt(t *testing.T) {
-	// Codex: no hooks, but has prompt support
+	// e.g. Auggie: no hooks, but has prompt support
 	rc := &config.RuntimeConfig{
 		PromptMode: "arg",
 		Hooks: &config.RuntimeHooksConfig{

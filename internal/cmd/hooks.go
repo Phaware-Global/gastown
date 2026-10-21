@@ -23,6 +23,7 @@ Subcommands:
   scan       Scan workspace for existing hooks
   registry   List hooks from the registry
   install    Install a hook from the registry
+  codex      Managed hooks for Codex agents
 
 Config structure:
   Base:      ~/.gt/hooks-base.json
