@@ -105,9 +105,10 @@ func containsAny(s string, subs []string) bool {
 }
 
 // affirmativeOption reports whether an option text accepts the dialog
-// ("Yes, I trust this folder", "Yes, continue", "Yes, I accept").
+// ("Yes, I trust this folder", "Yes, continue", "Yes, I accept", or Codex's
+// "Trust and continue").
 func affirmativeOption(text string) bool {
-	return strings.HasPrefix(text, "Yes")
+	return strings.HasPrefix(text, "Yes") || strings.HasPrefix(text, "Trust and continue")
 }
 
 // planDialogSelection returns the arrow keys (excluding the final Enter) that
@@ -184,6 +185,9 @@ var workspaceTrustMarkers = []string{
 	"trust this folder",
 	"Quick safety check",
 	"Do you trust the contents of this directory?",
+	// Codex 0.163: "Trust this folder? Codex can read, edit, and run files
+	// here", options "1. Trust and continue" / "2. Quit".
+	"Trust this folder?",
 }
 
 var bypassPermissionsMarkers = []string{"Bypass Permissions mode"}
