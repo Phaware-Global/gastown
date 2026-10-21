@@ -2362,9 +2362,7 @@ func (t *Tmux) AcceptWorkspaceTrustDialog(session string) error {
 }
 
 func containsWorkspaceTrustDialog(content string) bool {
-	return strings.Contains(content, "trust this folder") ||
-		strings.Contains(content, "Quick safety check") ||
-		strings.Contains(content, "Do you trust the contents of this directory?")
+	return containsAny(content, workspaceTrustMarkers)
 }
 
 func containsBlockingStartupDialog(content string) (string, bool) {
@@ -2397,11 +2395,9 @@ func lastStartupBlockerLine(content string) int {
 		"Update available!",
 		"Update now",
 		"Skip until next version",
-		"trust this folder",
-		"Quick safety check",
-		"Do you trust the contents of this directory?",
 		"Bypass Permissions mode",
 	}
+	markers = append(markers, workspaceTrustMarkers...)
 	last := -1
 	for i, line := range strings.Split(content, "\n") {
 		for _, marker := range markers {
@@ -3546,10 +3542,15 @@ func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, tim
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
-		// Look for runtime prompt indicator at start of line
-		for _, line := range lines {
-			if matchesPromptPrefix(line, rc.Tmux.ReadyPromptPrefix) {
-				return nil
+		// A startup dialog's highlighted option can look like the prompt
+		// (Codex renders "› 1. Trust and continue"), so the runtime is not
+		// ready while one is on screen.
+		if _, blocked := containsBlockingStartupDialog(strings.Join(lines, "\n")); !blocked {
+			// Look for runtime prompt indicator at start of line
+			for _, line := range lines {
+				if matchesPromptPrefix(line, rc.Tmux.ReadyPromptPrefix) {
+					return nil
+				}
 			}
 		}
 		time.Sleep(200 * time.Millisecond)
