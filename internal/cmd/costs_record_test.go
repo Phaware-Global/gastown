@@ -123,13 +123,15 @@ func writeCostLog(t *testing.T, rows []CostLogEntry) {
 }
 
 // setupRecordEnv points gt costs record at a temp log, a temp Claude config
-// dir and a fixed session, and returns the project dir transcripts go in.
+// dir, a temp Codex home and a fixed session, and returns the project dir
+// transcripts go in.
 func setupRecordEnv(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
 	workDir := filepath.Join(home, "mayor")
 	t.Setenv("GT_HOME", home)
 	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, "claude"))
+	t.Setenv("CODEX_HOME", filepath.Join(home, "codex"))
 	t.Setenv("GT_SESSION", "hq-mayor")
 	t.Setenv("GT_CWD", workDir)
 	oldSession, oldWorkItem := recordSession, recordWorkItem
