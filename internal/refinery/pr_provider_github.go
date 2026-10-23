@@ -65,6 +65,11 @@ func (p *githubPRProvider) CreatedAt(prNumber int) (time.Time, error) {
 	return p.git.GhPrCreatedAt(prNumber)
 }
 
+// IsDraft implements PRDraftChecker.
+func (p *githubPRProvider) IsDraft(prNumber int) (bool, error) {
+	return p.git.GhPrIsDraft(prNumber)
+}
+
 func (p *githubPRProvider) CountApprovals(prNumber int) (int, error) {
 	return p.git.GhPrApprovalCount(prNumber)
 }
