@@ -956,6 +956,7 @@ type ProcessResult struct {
 	NoMerge               bool // Source issue has no_merge flag — intentionally blocked, not a failure
 	NeedsApproval         bool // PR exists but lacks required approving review (merge_strategy=pr)
 	NeedsReviewResolution bool // PR has unresolved reviewer threads — review-fix loop must run before merge
+	Held                  bool // refused by the draft/hold gate (draft PR, held MR or source, unreadable source) — not a build failure
 	ReviewPRMissing       bool // refused a direct push — the rig requires merge_strategy=pr, so the MR must land through the PR merge path
 }
 

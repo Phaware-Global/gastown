@@ -1,8 +1,11 @@
 package refinery
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -183,5 +186,100 @@ func TestVerifyPRNotHeld_MissingMRBeadFailsClosed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "gt-mr-1") {
 		t.Errorf("err = %v, want it to name the MR bead", err)
+	}
+}
+
+// stubGtOnPath puts a recording `gt` first on PATH so a nudge the code under
+// test sends lands in the returned log instead of the live town.
+func stubGtOnPath(t *testing.T) (logPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	logPath = filepath.Join(dir, "gt.log")
+	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "gt"), []byte(script), 0o755); err != nil { //nolint:gosec // test stub must be executable
+		t.Fatalf("write gt stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return logPath
+}
+
+func guessedSourceMR() *beads.Issue {
+	return &beads.Issue{
+		ID:          "gt-mr-1",
+		Description: "branch: feat/x\ntarget: main\nsource_issue: refinery-hold\nreview_pr: 42",
+	}
+}
+
+// gt mq submit can record a source_issue guessed from the branch name that
+// never existed. Refusing it stays fail-closed, but the error has to tell an
+// operator what to fix.
+func TestDoMergePR_SourceNotFoundNamesMRSourceAndRemedy(t *testing.T) {
+	prov := &draftFakeProvider{}
+	res := mergeWith(t, prov, showFrom(map[string]*beads.Issue{"gt-mr-1": guessedSourceMR()}), "gt-mr-1")
+	if prov.merged || res.Success {
+		t.Fatalf("merged=%v result=%+v, want a refusal", prov.merged, res)
+	}
+	for _, want := range []string{"gt-mr-1", "refinery-hold", "source_issue"} {
+		if !strings.Contains(res.Error, want) {
+			t.Errorf("error = %q, want it to name %q", res.Error, want)
+		}
+	}
+	if !res.Held {
+		t.Errorf("result = %+v, want Held: a refused hold check is not a build failure", res)
+	}
+}
+
+// A hold refusal repeats on every poll until an operator acts. It is reported
+// as its own non-build result, once per MR state change, and never as a
+// MERGE_FAILED nudge to the polecat and the mayor.
+func TestHandleMRInfoFailure_HoldRefusalReportsOncePerStateChange(t *testing.T) {
+	gtLog := stubGtOnPath(t)
+	workDir, g, _ := testGitRepo(t)
+	e := newTestEngineer(t, workDir, g)
+	out := &bytes.Buffer{}
+	e.output = out
+	escalations := recordEscalations(e)
+	prov := &draftFakeProvider{}
+	e.prProvider = prov
+	issues := map[string]*beads.Issue{"gt-mr-1": guessedSourceMR()}
+	e.showBead = showFrom(issues)
+	createFeatureBranch(t, workDir, "feat/x", "test.txt", "hello")
+	mr := &MRInfo{ID: "gt-mr-1", Branch: "feat/x", Target: "main", SourceIssue: "refinery-hold", Worker: "polecats/nux"}
+
+	poll := func(n int) {
+		for i := 0; i < n; i++ {
+			if res := e.doMergePR(context.Background(), mr.ID, mr.Branch, mr.Target); !res.Success {
+				e.HandleMRInfoFailure(mr, res)
+			}
+		}
+	}
+
+	poll(4)
+	if prov.merged {
+		t.Fatal("the PR was merged")
+	}
+	if len(*escalations) != 1 {
+		t.Fatalf("got %d reports across 4 polls, want 1: %+v", len(*escalations), *escalations)
+	}
+	first := (*escalations)[0]
+	if !strings.Contains(first.fingerprint, "gt-mr-1") || !strings.Contains(first.message, "refinery-hold") {
+		t.Errorf("report = %+v, want a fingerprint and message naming the MR and its source_issue", first)
+	}
+
+	// The operator puts the MR on hold: a different state, reported once more.
+	issues["gt-mr-1"] = &beads.Issue{ID: "gt-mr-1", Labels: []string{"hold"}, Description: guessedSourceMR().Description}
+	poll(3)
+	if len(*escalations) != 2 {
+		t.Fatalf("got %d reports after the MR state changed, want 2: %+v", len(*escalations), *escalations)
+	}
+	if (*escalations)[1].fingerprint == first.fingerprint {
+		t.Errorf("a changed MR state reused fingerprint %q", first.fingerprint)
+	}
+
+	if strings.Contains(out.String(), "MERGE_FAILED") {
+		t.Errorf("output reports a build failure:\n%s", out.String())
+	}
+	if data, _ := os.ReadFile(gtLog); len(data) != 0 { //nolint:gosec // test-owned path
+		t.Errorf("gt was invoked (a nudge to the polecat or mayor):\n%s", data)
 	}
 }
