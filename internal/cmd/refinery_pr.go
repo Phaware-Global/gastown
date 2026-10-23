@@ -722,6 +722,12 @@ func awaitReviewInner(args []string) error {
 				prNumber, held.Reason)
 			return NewSilentExit(1)
 		}
+		var missing *refinery.SourceIssueNotFoundError
+		if errors.As(err, &missing) {
+			fmt.Fprintf(os.Stdout, "PR #%d: %v — not requesting review; will look again next patrol\n",
+				prNumber, missing)
+			return NewSilentExit(1)
+		}
 		return err
 	}
 

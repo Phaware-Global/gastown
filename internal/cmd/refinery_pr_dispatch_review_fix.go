@@ -401,6 +401,14 @@ func reviewFixHoldGate(provider refinery.PRProvider, state dispatchReviewFixStat
 			state.PRNumber, held.Reason)
 		return NewSilentExit(1)
 	}
+	// A source issue that reads not found is the MR's problem, not an outage: say
+	// what to correct and look again next patrol.
+	var missing *refinery.SourceIssueNotFoundError
+	if errors.As(err, &missing) {
+		fmt.Fprintf(os.Stdout, "PR #%d: %v — skipping review-fix dispatch; will look again next patrol\n",
+			state.PRNumber, missing)
+		return NewSilentExit(1)
+	}
 	return wrapOperationalErr(err)
 }
 
