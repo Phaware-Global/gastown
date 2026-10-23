@@ -1835,7 +1835,7 @@ func DetectZombiePolecatsWithOptions(bd *BdCli, workDir, rigName string, router 
 		if snap != nil {
 			labels = snap.Labels
 		}
-		doneIntent := extractDoneIntent(labels)
+		doneIntent := effectiveDoneIntent(bd, workDir, agentBeadID, snap, labels)
 
 		if sessionAlive {
 			// gt-s8bq: Idle Polecat Heresy fix. Idle polecats are HEALTHY — they
@@ -3454,6 +3454,12 @@ func closeDescendantsViaCLI(bd *BdCli, workDir, parentID string) (int, error) {
 		return totalClosed, errs[0]
 	}
 	return totalClosed, nil
+}
+
+// effectiveDoneIntent returns the done-intent that applies to the polecat's
+// current assignment, or nil.
+func effectiveDoneIntent(bd *BdCli, workDir, agentBeadID string, snap *agentBeadSnapshot, labels []string) *DoneIntent {
+	return extractDoneIntent(labels)
 }
 
 // DoneIntent represents a parsed done-intent label from an agent bead.
