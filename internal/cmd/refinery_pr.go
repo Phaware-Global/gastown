@@ -696,7 +696,15 @@ func awaitReviewInner(args []string) error {
 	}
 
 	// A draft or held PR gets no review request, trigger comment or re-request.
+	// Held is a wait (exit 1, patrol again), not an operational failure that
+	// would escalate every patrol.
 	if err := verifyNotHeldForCLI(provider, prNumber, refPrAwaitMR); err != nil {
+		var held *refinery.PRHeldError
+		if errors.As(err, &held) {
+			fmt.Fprintf(os.Stdout, "PR #%d: %s — not requesting review; will look again next patrol\n",
+				prNumber, held.Reason)
+			return NewSilentExit(1)
+		}
 		return err
 	}
 

@@ -391,7 +391,17 @@ func mrAndSourceShower(id string) (*beads.Issue, error) {
 // resumes once the hold is lifted. Exit 1 is the "patrol again" code; a failure
 // to establish the hold state is operational (exit 4) rather than a go-ahead.
 func reviewFixHoldGate(provider refinery.PRProvider, state dispatchReviewFixState, mrID string, show refinery.BeadShower) error {
-	return nil
+	err := refinery.VerifyPRNotHeld(provider, state.PRNumber, mrID, show)
+	if err == nil {
+		return nil
+	}
+	var held *refinery.PRHeldError
+	if errors.As(err, &held) {
+		fmt.Fprintf(os.Stdout, "PR #%d: %s — skipping review-fix dispatch; will look again next patrol\n",
+			state.PRNumber, held.Reason)
+		return NewSilentExit(1)
+	}
+	return wrapOperationalErr(err)
 }
 
 // reviewFixCapacityExhausted probes the town scheduler for a review-fix
