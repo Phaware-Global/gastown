@@ -1007,7 +1007,13 @@ func TestDoMergePR_PopulatesReviewPRWhenMissing(t *testing.T) {
 
 	createFeatureBranch(t, workDir, "feat/populate", "test.txt", "hello")
 
-	mrIssue := createMRBead(t, b, "branch: feat/populate\ntarget: main\nsource_issue: gt-test")
+	// The hold check reads the source issue, so it has to exist.
+	src, err := b.Create(beads.CreateOptions{Title: "Source: gt-test"})
+	if err != nil {
+		t.Fatalf("create source issue: %v", err)
+	}
+	t.Cleanup(func() { _ = b.CloseWithReason("test cleanup", src.ID) })
+	mrIssue := createMRBead(t, b, "branch: feat/populate\ntarget: main\nsource_issue: "+src.ID)
 
 	e.prProvider = &populatingFakeProvider{prNumber: 77}
 

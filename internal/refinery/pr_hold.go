@@ -33,11 +33,11 @@ func (e *PRHeldError) Error() string {
 // when the caller has no MR bead; only the draft check applies then.
 //
 // It fails closed: if draft status or a bead cannot be read, the error is
-// returned and the caller must not proceed on a guess. That includes an MR bead
-// that reads as not found: callers pass an MR they expect to exist, and a
-// misrouted lookup reports "not found" too. A provider that cannot report draft
-// status (ErrUnsupported or no PRDraftChecker) and a source issue that no
-// longer exists (the usual state after gt done) are not holds.
+// returned and the caller must not proceed on a guess. That includes an MR or
+// source bead that reads as not found: gt done closes the source issue rather
+// than deleting it, and a misrouted lookup (wrong database, embedded clone)
+// reports "not found" too. A provider that cannot report draft status
+// (ErrUnsupported or no PRDraftChecker) is not a hold.
 func VerifyPRNotHeld(provider PRProvider, prNumber int, mrID string, show BeadShower) error {
 	if checker, ok := provider.(PRDraftChecker); ok {
 		draft, err := checker.IsDraft(prNumber)
@@ -66,9 +66,6 @@ func VerifyPRNotHeld(provider PRProvider, prNumber int, mrID string, show BeadSh
 		return nil
 	}
 	src, err := show(fields.SourceIssue)
-	if errors.Is(err, beads.ErrNotFound) {
-		return nil
-	}
 	if err != nil {
 		return fmt.Errorf("reading source issue %s for the hold check on PR #%d: %w", fields.SourceIssue, prNumber, err)
 	}
