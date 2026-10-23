@@ -257,11 +257,17 @@ func getRefineryPRContext() (refinery.PRProvider, *refinery.MergeQueueConfig, *r
 // verifyNotHeldForCLI is the draft/hold gate for the refinery CLI commands. mrID
 // may be empty, in which case only the draft check applies.
 func verifyNotHeldForCLI(provider refinery.PRProvider, prNumber int, mrID string) error {
-	var show refinery.BeadShower
-	if mrID != "" {
-		show = func(id string) (*beads.Issue, error) {
-			return beads.New(resolveBeadDir(id)).Show(id)
-		}
+	show := func(id string) (*beads.Issue, error) {
+		return beads.New(resolveBeadDir(id)).Show(id)
+	}
+	return verifyNotHeld(provider, prNumber, mrID, nil, show)
+}
+
+// verifyNotHeld is verifyNotHeldForCLI with its bead access injected.
+func verifyNotHeld(provider refinery.PRProvider, prNumber int, mrID string,
+	findMR func(prNumber int) (*beads.Issue, error), show refinery.BeadShower) error {
+	if mrID == "" {
+		show = nil
 	}
 	return refinery.VerifyPRNotHeld(provider, prNumber, mrID, show)
 }

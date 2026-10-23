@@ -149,3 +149,19 @@ func TestDoMergePR_UnheldPRReachesTheMerge(t *testing.T) {
 		}
 	})
 }
+
+// A missing MR bead is a routing fault (a misrouted or embedded clone reads
+// "database not found" as ErrNotFound), not the absence of a hold.
+func TestVerifyPRNotHeld_MissingMRBeadFailsClosed(t *testing.T) {
+	err := VerifyPRNotHeld(&draftFakeProvider{}, 42, "gt-mr-1", showFrom(map[string]*beads.Issue{}))
+	if err == nil {
+		t.Fatal("VerifyPRNotHeld = nil for an MR bead that cannot be read, want an error")
+	}
+	var held *PRHeldError
+	if errors.As(err, &held) {
+		t.Errorf("err = %v, want an operational error, not a hold", err)
+	}
+	if !strings.Contains(err.Error(), "gt-mr-1") {
+		t.Errorf("err = %v, want it to name the MR bead", err)
+	}
+}
