@@ -1142,6 +1142,10 @@ func extractPolecatFromJSON(output string) string {
 	return ""
 }
 
+// restartPolecatSession is the restart the zombie detectors use. Tests replace
+// it so detection never shells out to the live town's gt.
+var restartPolecatSession = RestartPolecatSession
+
 // RestartPolecatSession restarts a polecat's tmux session without destroying
 // the worktree or branch. This preserves the polecat's work (commits, branches)
 // while giving it a fresh agent process.
@@ -1812,7 +1816,7 @@ func DetectZombiePolecats(bd *BdCli, workDir, rigName string, router *mail.Route
 		if snap != nil {
 			labels = snap.Labels
 		}
-		doneIntent := extractDoneIntent(labels)
+		doneIntent := effectiveDoneIntent(bd, workDir, agentBeadID, snap, labels)
 
 		if sessionAlive {
 			// gt-s8bq: Idle Polecat Heresy fix. Idle polecats are HEALTHY — they
@@ -1925,7 +1929,7 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 		if alive, _ := t.HasSession(sessionName); !alive {
 			return ZombieResult{}, false
 		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+		if err := restartPolecatSession(workDir, rigName, polecatName); err != nil {
 			zombie.Error = err
 			zombie.Action = fmt.Sprintf("restart-stuck-session-failed: %v", err)
 		}
@@ -1948,7 +1952,7 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 		if alive, _ := t.HasSession(sessionName); !alive {
 			return ZombieResult{}, false
 		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+		if err := restartPolecatSession(workDir, rigName, polecatName); err != nil {
 			zombie.Error = err
 			zombie.Action = fmt.Sprintf("restart-agent-dead-session-failed: %v", err)
 		}
@@ -1972,7 +1976,7 @@ func detectZombieLiveSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 		if alive, _ := t.HasSession(sessionName); !alive {
 			return ZombieResult{}, false
 		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+		if err := restartPolecatSession(workDir, rigName, polecatName); err != nil {
 			zombie.Error = err
 			zombie.Action = fmt.Sprintf("restart-bead-closed-failed: %v", err)
 		}
@@ -2160,7 +2164,7 @@ func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 			WasActive:      true,
 			Action:         fmt.Sprintf("restarted (done-intent age=%v, type=%s)", age.Round(time.Second), doneIntent.ExitType),
 		}
-		if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+		if err := restartPolecatSession(workDir, rigName, polecatName); err != nil {
 			zombie.Error = err
 			zombie.Action = fmt.Sprintf("restart-failed (done-intent): %v", err)
 		}
@@ -2342,7 +2346,7 @@ func handleZombieRestart(bd *BdCli, workDir, rigName, polecatName, hookBead, cle
 	}
 
 	// Restart regardless of cleanup state — the worktree is preserved.
-	if err := RestartPolecatSession(workDir, rigName, polecatName); err != nil {
+	if err := restartPolecatSession(workDir, rigName, polecatName); err != nil {
 		if zombie.Error == nil {
 			zombie.Error = fmt.Errorf("restart: %w", err)
 		} else {
@@ -3419,6 +3423,12 @@ func closeDescendantsViaCLI(bd *BdCli, workDir, parentID string) (int, error) {
 		return totalClosed, errs[0]
 	}
 	return totalClosed, nil
+}
+
+// effectiveDoneIntent returns the done-intent that applies to the polecat's
+// current assignment, or nil.
+func effectiveDoneIntent(bd *BdCli, workDir, agentBeadID string, snap *agentBeadSnapshot, labels []string) *DoneIntent {
+	return extractDoneIntent(labels)
 }
 
 // DoneIntent represents a parsed done-intent label from an agent bead.
