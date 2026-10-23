@@ -44,6 +44,38 @@ func TestIsReadyIssue_BlockingAndStatus(t *testing.T) {
 			},
 			want: true,
 		},
+		{
+			name: "hooked unassigned issue treated ready for recovery",
+			in: trackedIssueInfo{
+				Status: "hooked",
+			},
+			want: true,
+		},
+		{
+			// A deferred bead is parked on purpose; gt sling refuses it, so
+			// feeding it only fails every scan.
+			name: "deferred unassigned issue not ready",
+			in: trackedIssueInfo{
+				Status: "deferred",
+			},
+			want: false,
+		},
+		{
+			// A bead that could not be resolved (deleted wisp, unreachable
+			// rig) cannot be slung either.
+			name: "unknown status not ready",
+			in: trackedIssueInfo{
+				Status: trackedStatusUnknown,
+			},
+			want: false,
+		},
+		{
+			name: "pinned unassigned issue not ready",
+			in: trackedIssueInfo{
+				Status: "pinned",
+			},
+			want: false,
+		},
 	}
 
 	for _, tc := range tests {
