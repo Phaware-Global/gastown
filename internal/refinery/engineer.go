@@ -4,6 +4,7 @@ package refinery
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -428,6 +429,9 @@ type Engineer struct {
 	escalate              func(severity, source, fingerprint, message string) error
 	mergeSlotMaxRetries   int           // Max retries for slot acquisition (0 = no retry)
 	mergeSlotRetryBackoff time.Duration // Initial backoff between retries
+
+	heldReportedMu sync.Mutex
+	heldReported   map[string]struct{} // fingerprints of hold refusals already reported by this engineer
 }
 
 // NewEngineer creates a new Engineer for the given rig.
@@ -1284,6 +1288,7 @@ func (e *Engineer) doMergePR(ctx context.Context, mrID, branch, target string) P
 	if err := VerifyPRNotHeld(e.prProvider, prNumber, mrID, e.beadShower()); err != nil {
 		return ProcessResult{
 			Success: false,
+			Held:    IsHoldRefusal(err),
 			Error:   err.Error(),
 		}
 	}
@@ -2001,6 +2006,40 @@ func (e *Engineer) clearAgentActiveMR(agentBeadID string) error {
 	return e.beads.ForAgentBead().UpdateAgentActiveMR(agentBeadID, "")
 }
 
+// reportHeldRefusal logs a hold refusal and files one escalation for it. The
+// fingerprint carries the MR and a hash of the refusal text, so it is reported
+// again only when the MR's state (and with it the reason) changes; an engineer
+// that polls the same refusal again, or a restarted one, collapses onto the
+// open escalation.
+func (e *Engineer) reportHeldRefusal(mr *MRInfo, result ProcessResult) {
+	_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s held: %s\n[Engineer] MR remains in queue; not a build failure, no polecat nudge\n", mr.ID, result.Error)
+
+	sum := sha256.Sum256([]byte(result.Error))
+	fingerprint := fmt.Sprintf("refinery:pr-held:%s:%s:%x", e.rig.Name, mr.ID, sum[:4])
+
+	e.heldReportedMu.Lock()
+	_, seen := e.heldReported[fingerprint]
+	if !seen {
+		if e.heldReported == nil {
+			e.heldReported = make(map[string]struct{})
+		}
+		e.heldReported[fingerprint] = struct{}{}
+	}
+	e.heldReportedMu.Unlock()
+	if seen {
+		return
+	}
+
+	msg := fmt.Sprintf("MR %s (issue=%s branch=%s target=%s) is not being merged: %s", mr.ID, mr.SourceIssue, mr.Branch, mr.Target, result.Error)
+	if err := e.fileEscalation("MEDIUM", "refinery:pr-held", fingerprint, msg); err != nil {
+		// Forget it so the next poll retries the report.
+		e.heldReportedMu.Lock()
+		delete(e.heldReported, fingerprint)
+		e.heldReportedMu.Unlock()
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to report held MR %s (will retry): %v\n", mr.ID, err)
+	}
+}
+
 // HandleMRInfoFailure handles a failed merge from MRInfo.
 // For conflicts, creates a resolution task and blocks the MR until resolved.
 // For slot timeouts, the MR stays in queue for automatic retry without notifying polecats.
@@ -2043,6 +2082,15 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 	// No polecat notification needed; the PR just needs a human review on GitHub.
 	if result.NeedsApproval {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] MR %s: PR awaiting human approval, will retry next poll\n", mr.ID)
+		return
+	}
+
+	// Held: the draft/hold gate refused the PR (draft, held MR or source issue,
+	// or a source issue that reads as not found). Nothing for the polecat to fix
+	// by resubmitting, so no MERGE_FAILED nudge. The refusal repeats every poll
+	// until an operator acts, so report it once per MR state change.
+	if result.Held {
+		e.reportHeldRefusal(mr, result)
 		return
 	}
 
