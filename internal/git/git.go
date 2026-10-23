@@ -4576,6 +4576,28 @@ func submoduleDefaultBranch(submodulePath, remote string) (string, error) {
 	return "", fmt.Errorf("could not determine default branch for remote %s", remote)
 }
 
+// GhPrIsDraft reports whether the PR is a draft, via `gh pr view --json isDraft`.
+func (g *Git) GhPrIsDraft(prNumber int) (bool, error) {
+	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "isDraft")
+	cmd.Dir = g.workDir
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return false, fmt.Errorf("gh pr view (isDraft) failed: %s: %w", strings.TrimSpace(stderr.String()), err)
+	}
+	var resp struct {
+		IsDraft *bool `json:"isDraft"`
+	}
+	if jerr := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &resp); jerr != nil {
+		return false, fmt.Errorf("parsing isDraft: %w", jerr)
+	}
+	if resp.IsDraft == nil {
+		return false, fmt.Errorf("gh pr view returned no isDraft for PR #%d", prNumber)
+	}
+	return *resp.IsDraft, nil
+}
+
 // GhPrCreatedAt returns the time a PR was opened.
 //
 // Used by the review loop's convergence assessment to tell a PR that is

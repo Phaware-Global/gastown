@@ -47,6 +47,10 @@ func recordEscalations(e *Engineer) *[]recordedEscalation {
 func isolatedBeads(t *testing.T, e *Engineer) {
 	t.Helper()
 	e.beads = beads.NewIsolated(t.TempDir())
+	// The store is empty, so the hold check would read bd's "no beads database"
+	// error and fail closed; serve every MR as an existing bead with no hold
+	// and no source issue instead.
+	e.showBead = func(id string) (*beads.Issue, error) { return &beads.Issue{ID: id}, nil }
 }
 
 // remoteRef returns the SHA that origin's ref points at, read from the remote

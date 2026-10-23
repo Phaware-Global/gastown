@@ -55,6 +55,7 @@ var (
 
 	// gt refinery pr merge
 	refPrMergeMethod string
+	refPrMergeMR     string
 
 	// gt refinery pr await-review
 	refPrAwaitReviewer       string
@@ -202,6 +203,8 @@ func init() {
 	refineryPrWaitApprovalCmd.Flags().BoolVar(&refPrWaitApprovalEsc, "escalate", false, "open an escalation on first call (reserved; Phase 3)")
 
 	refineryPrMergeCmd.Flags().StringVar(&refPrMergeMethod, "method", "squash", "merge method: squash, merge, or rebase")
+	refineryPrMergeCmd.Flags().StringVar(&refPrMergeMR, "mr", "",
+		"MR bead ID; when set, a hold on the MR or its source bead also blocks the merge")
 
 	refineryPrAwaitReviewCmd.Flags().StringVar(&refPrAwaitMR, "mr", "",
 		"MR bead ID for state persistence (required for patrol-resumable use; "+
@@ -249,6 +252,35 @@ func getRefineryPRContext() (refinery.PRProvider, *refinery.MergeQueueConfig, *r
 		return nil, nil, nil, fmt.Errorf("no PR provider for rig %s (merge_strategy=%q)", rigName, eng.Config().MergeStrategy)
 	}
 	return provider, eng.Config(), r, nil
+}
+
+// verifyNotHeldForCLI is the draft/hold gate for the refinery CLI commands. When
+// mrID is empty (the patrol formula passes no --mr) the MR bead is looked up by
+// PR number so a hold set while the refinery waited is still seen.
+func verifyNotHeldForCLI(provider refinery.PRProvider, r *rig.Rig, prNumber int, mrID string) error {
+	findMR := func(pr int) (*beads.Issue, error) {
+		return beads.New(r.BeadsPath()).FindMRForReviewPR(pr)
+	}
+	show := func(id string) (*beads.Issue, error) {
+		return beads.New(resolveBeadDir(id)).Show(id)
+	}
+	return verifyNotHeld(provider, prNumber, mrID, findMR, show)
+}
+
+// verifyNotHeld is verifyNotHeldForCLI with its bead access injected. A failed
+// MR lookup fails closed; no MR tracking the PR leaves only the draft check.
+func verifyNotHeld(provider refinery.PRProvider, prNumber int, mrID string,
+	findMR func(prNumber int) (*beads.Issue, error), show refinery.BeadShower) error {
+	if mrID == "" && findMR != nil {
+		mr, err := findMR(prNumber)
+		if err != nil {
+			return fmt.Errorf("finding the MR bead for PR #%d for the hold check: %w", prNumber, err)
+		}
+		if mr != nil {
+			mrID = mr.ID
+		}
+	}
+	return refinery.VerifyPRNotHeld(provider, prNumber, mrID, show)
 }
 
 func parsePRNumber(arg string) (int, error) {
@@ -395,8 +427,11 @@ func runRefineryPrRequestReview(cmd *cobra.Command, args []string) error {
 	if len(refPrRequestReviewers) == 0 {
 		return fmt.Errorf("at least one --user is required")
 	}
-	provider, _, _, err := getRefineryPRContext()
+	provider, _, r, err := getRefineryPRContext()
 	if err != nil {
+		return err
+	}
+	if err := verifyNotHeldForCLI(provider, r, prNumber, ""); err != nil {
 		return err
 	}
 	if err := provider.RequestReview(prNumber, refPrRequestReviewers); err != nil {
@@ -530,8 +565,13 @@ func runRefineryPrMerge(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	provider, cfg, _, err := getRefineryPRContext()
+	provider, cfg, r, err := getRefineryPRContext()
 	if err != nil {
+		return err
+	}
+
+	// Never merge a draft, or a PR whose MR or source bead is on hold.
+	if err := verifyNotHeldForCLI(provider, r, prNumber, refPrMergeMR); err != nil {
 		return err
 	}
 
@@ -667,8 +707,27 @@ func awaitReviewInner(args []string) error {
 	if err != nil {
 		return err
 	}
-	provider, cfg, _, err := getRefineryPRContext()
+	provider, cfg, r, err := getRefineryPRContext()
 	if err != nil {
+		return err
+	}
+
+	// A draft or held PR gets no review request, trigger comment or re-request.
+	// Held is a wait (exit 1, patrol again), not an operational failure that
+	// would escalate every patrol.
+	if err := verifyNotHeldForCLI(provider, r, prNumber, refPrAwaitMR); err != nil {
+		var held *refinery.PRHeldError
+		if errors.As(err, &held) {
+			fmt.Fprintf(os.Stdout, "PR #%d: %s — not requesting review; will look again next patrol\n",
+				prNumber, held.Reason)
+			return NewSilentExit(1)
+		}
+		var missing *refinery.SourceIssueNotFoundError
+		if errors.As(err, &missing) {
+			fmt.Fprintf(os.Stdout, "PR #%d: %v — not requesting review; will look again next patrol\n",
+				prNumber, missing)
+			return NewSilentExit(1)
+		}
 		return err
 	}
 
