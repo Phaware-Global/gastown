@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
@@ -69,6 +70,18 @@ func TestReviewFixHoldGate(t *testing.T) {
 		err := reviewFixHoldGate(&holdGateProvider{draftErr: errors.New("gh: rate limited")}, holdGateState(), "gt-mr-1",
 			holdGateShow(map[string]*beads.Issue{"gt-mr-1": holdGateMR()}))
 		wantExit(t, err, 4)
+	})
+	t.Run("a source issue that reads not found waits with the remedy, not an operational error", func(t *testing.T) {
+		out := captureStdout(t, func() {
+			err := reviewFixHoldGate(&holdGateProvider{}, holdGateState(), "gt-mr-1",
+				holdGateShow(map[string]*beads.Issue{"gt-mr-1": holdGateMR()}))
+			wantExit(t, err, 1)
+		})
+		for _, want := range []string{"gt-mr-1", "gt-src-1", "source_issue"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("output = %q, want it to name %q", out, want)
+			}
+		}
 	})
 	t.Run("a PR that is not held proceeds", func(t *testing.T) {
 		err := reviewFixHoldGate(&holdGateProvider{}, holdGateState(), "gt-mr-1",
