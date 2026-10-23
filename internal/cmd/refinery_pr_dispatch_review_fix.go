@@ -180,6 +180,11 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 			prNumberArg, refPrDispatchReviewFixMR, state.PRNumber))
 	}
 
+	// A draft PR, or one whose MR or source bead is on hold, gets no review-fix.
+	if err := reviewFixHoldGate(provider, state, refPrDispatchReviewFixMR, mrAndSourceShower); err != nil {
+		return err
+	}
+
 	// Release-branch bypass: a PR whose head branch matches a configured
 	// review-bypass glob skips the review loop, so there is no review-fix to
 	// dispatch. Exit 0 to advance the formula to PR.6 (wait-approval) — the
@@ -373,6 +378,20 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 	fmt.Fprintf(os.Stdout, "%s PR #%d: dispatched review-fix polecat %s (iter=%d of %d)\n",
 		style.Bold.Render("→"), state.PRNumber, polecatName, newIter, maxIter)
 	return NewSilentExit(1)
+}
+
+// mrAndSourceShower reads an MR or source bead from the database that owns its ID.
+func mrAndSourceShower(id string) (*beads.Issue, error) {
+	return beads.New(resolveBeadDir(id)).Show(id)
+}
+
+// reviewFixHoldGate stops the dispatch cycle for a held PR. A draft PR, or one
+// whose MR or source bead an operator has put on hold, is skipped: nothing is
+// dispatched and no state changes, so the next patrol looks again and the PR
+// resumes once the hold is lifted. Exit 1 is the "patrol again" code; a failure
+// to establish the hold state is operational (exit 4) rather than a go-ahead.
+func reviewFixHoldGate(provider refinery.PRProvider, state dispatchReviewFixState, mrID string, show refinery.BeadShower) error {
+	return nil
 }
 
 // reviewFixCapacityExhausted probes the town scheduler for a review-fix

@@ -414,6 +414,7 @@ var mergeSlotSeq uint64
 type Engineer struct {
 	rig                   *rig.Rig
 	beads                 *beads.Beads
+	showBead              BeadShower // overrides beads.Show for hold checks; tests only
 	git                   *git.Git
 	config                *MergeQueueConfig
 	prProvider            PRProvider // VCS-specific PR operations (nil when MergeStrategy != "pr")
@@ -1276,6 +1277,16 @@ func (e *Engineer) doMergePR(ctx context.Context, mrID, branch, target string) P
 	}
 	_, _ = fmt.Fprintf(e.output, "[Engineer] Found PR #%d for branch %s\n", prNumber, branch)
 
+	// A draft PR, or one whose MR or source bead an operator has put on hold,
+	// is never merged. This gate comes first so nothing else (review_pr
+	// write-back, thread and approval checks) acts on a held PR.
+	if err := VerifyPRNotHeld(e.prProvider, prNumber, mrID, e.beadShower()); err != nil {
+		return ProcessResult{
+			Success: false,
+			Error:   err.Error(),
+		}
+	}
+
 	// Populate review_pr on MRs whose PR exists: a live PR was
 	// just confirmed for this branch — persist it onto the MR bead if it
 	// isn't recorded there yet. Without this, an MR can carry a real,
@@ -1368,6 +1379,18 @@ func (e *Engineer) doMergePR(ctx context.Context, mrID, branch, target string) P
 		Success:     true,
 		MergeCommit: mergeCommit,
 	}
+}
+
+// beadShower returns the function used to read MR and source beads, or nil
+// when the engineer has no beads client.
+func (e *Engineer) beadShower() BeadShower {
+	if e.showBead != nil {
+		return e.showBead
+	}
+	if e.beads != nil {
+		return e.beads.Show
+	}
+	return nil
 }
 
 // populateReviewPR records prNumber as review_pr on MR bead mrID, but only

@@ -55,6 +55,7 @@ var (
 
 	// gt refinery pr merge
 	refPrMergeMethod string
+	refPrMergeMR     string
 
 	// gt refinery pr await-review
 	refPrAwaitReviewer       string
@@ -202,6 +203,8 @@ func init() {
 	refineryPrWaitApprovalCmd.Flags().BoolVar(&refPrWaitApprovalEsc, "escalate", false, "open an escalation on first call (reserved; Phase 3)")
 
 	refineryPrMergeCmd.Flags().StringVar(&refPrMergeMethod, "method", "squash", "merge method: squash, merge, or rebase")
+	refineryPrMergeCmd.Flags().StringVar(&refPrMergeMR, "mr", "",
+		"MR bead ID; when set, a hold on the MR or its source bead also blocks the merge")
 
 	refineryPrAwaitReviewCmd.Flags().StringVar(&refPrAwaitMR, "mr", "",
 		"MR bead ID for state persistence (required for patrol-resumable use; "+
@@ -249,6 +252,18 @@ func getRefineryPRContext() (refinery.PRProvider, *refinery.MergeQueueConfig, *r
 		return nil, nil, nil, fmt.Errorf("no PR provider for rig %s (merge_strategy=%q)", rigName, eng.Config().MergeStrategy)
 	}
 	return provider, eng.Config(), r, nil
+}
+
+// verifyNotHeldForCLI is the draft/hold gate for the refinery CLI commands. mrID
+// may be empty, in which case only the draft check applies.
+func verifyNotHeldForCLI(provider refinery.PRProvider, prNumber int, mrID string) error {
+	var show refinery.BeadShower
+	if mrID != "" {
+		show = func(id string) (*beads.Issue, error) {
+			return beads.New(resolveBeadDir(id)).Show(id)
+		}
+	}
+	return refinery.VerifyPRNotHeld(provider, prNumber, mrID, show)
 }
 
 func parsePRNumber(arg string) (int, error) {
@@ -399,6 +414,9 @@ func runRefineryPrRequestReview(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := verifyNotHeldForCLI(provider, prNumber, ""); err != nil {
+		return err
+	}
 	if err := provider.RequestReview(prNumber, refPrRequestReviewers); err != nil {
 		return err
 	}
@@ -532,6 +550,11 @@ func runRefineryPrMerge(cmd *cobra.Command, args []string) error {
 	}
 	provider, cfg, _, err := getRefineryPRContext()
 	if err != nil {
+		return err
+	}
+
+	// Never merge a draft, or a PR whose MR or source bead is on hold.
+	if err := verifyNotHeldForCLI(provider, prNumber, refPrMergeMR); err != nil {
 		return err
 	}
 
@@ -669,6 +692,11 @@ func awaitReviewInner(args []string) error {
 	}
 	provider, cfg, _, err := getRefineryPRContext()
 	if err != nil {
+		return err
+	}
+
+	// A draft or held PR gets no review request, trigger comment or re-request.
+	if err := verifyNotHeldForCLI(provider, prNumber, refPrAwaitMR); err != nil {
 		return err
 	}
 
