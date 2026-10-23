@@ -1603,8 +1603,12 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 // - AND not blocked (cross-rig-aware from issue details)
 // scheduledSet is a pre-computed set of bead IDs with open sling contexts (from areScheduled).
 func isReadyIssue(t trackedIssueInfo, scheduledSet map[string]bool) bool {
-	// Closed issues are never ready
-	if t.Status == "closed" || t.Status == "tombstone" {
+	// Only open work, or an in_progress/hooked molecule whose worker died, is
+	// dispatchable. Closed, deferred, pinned and unresolved (unknown) beads
+	// are not: gt sling refuses them, so feeding them fails on every scan.
+	switch t.Status {
+	case "open", "in_progress", "hooked":
+	default:
 		return false
 	}
 
