@@ -72,7 +72,10 @@ func TestReviewFixHoldGate(t *testing.T) {
 	})
 	t.Run("a PR that is not held proceeds", func(t *testing.T) {
 		err := reviewFixHoldGate(&holdGateProvider{}, holdGateState(), "gt-mr-1",
-			holdGateShow(map[string]*beads.Issue{"gt-mr-1": holdGateMR("gt:merge-request")}))
+			holdGateShow(map[string]*beads.Issue{
+				"gt-mr-1":  holdGateMR("gt:merge-request"),
+				"gt-src-1": {ID: "gt-src-1", Status: "closed"},
+			}))
 		if err != nil {
 			t.Errorf("err = %v, want nil", err)
 		}

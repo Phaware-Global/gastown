@@ -129,7 +129,10 @@ func TestDoMergePR_RefusesWhenHoldCheckFails(t *testing.T) {
 func TestDoMergePR_UnheldPRReachesTheMerge(t *testing.T) {
 	t.Run("not draft, not held", func(t *testing.T) {
 		prov := &draftFakeProvider{}
-		mergeWith(t, prov, showFrom(map[string]*beads.Issue{"gt-mr-1": mrBead("gt:merge-request")}), "gt-mr-1")
+		mergeWith(t, prov, showFrom(map[string]*beads.Issue{
+			"gt-mr-1":  mrBead("gt:merge-request"),
+			"gt-src-1": {ID: "gt-src-1", Status: "closed"},
+		}), "gt-mr-1")
 		if !prov.merged {
 			t.Error("a PR that is not held never reached MergePR")
 		}
@@ -141,13 +144,30 @@ func TestDoMergePR_UnheldPRReachesTheMerge(t *testing.T) {
 			t.Error("a provider without draft support never reached MergePR")
 		}
 	})
-	t.Run("source issue already gone", func(t *testing.T) {
+	t.Run("source issue closed by gt done", func(t *testing.T) {
 		prov := &draftFakeProvider{}
-		mergeWith(t, prov, showFrom(map[string]*beads.Issue{"gt-mr-1": mrBead()}), "gt-mr-1")
+		show := showFrom(map[string]*beads.Issue{
+			"gt-mr-1":  mrBead(),
+			"gt-src-1": {ID: "gt-src-1", Status: "closed"},
+		})
+		mergeWith(t, prov, show, "gt-mr-1")
 		if !prov.merged {
-			t.Error("a PR whose source issue is gone (normal after gt done) never reached MergePR")
+			t.Error("a PR whose source issue is closed (normal after gt done) never reached MergePR")
 		}
 	})
+}
+
+// gt done closes the source issue, it does not delete it, and a misrouted
+// lookup reads "not found" too, so an unreadable source is not a go-ahead.
+func TestDoMergePR_RefusesWhenSourceIssueNotFound(t *testing.T) {
+	prov := &draftFakeProvider{}
+	res := mergeWith(t, prov, showFrom(map[string]*beads.Issue{"gt-mr-1": mrBead()}), "gt-mr-1")
+	if prov.merged || res.Success {
+		t.Errorf("merged=%v result=%+v, want a refusal", prov.merged, res)
+	}
+	if !strings.Contains(res.Error, "gt-src-1") {
+		t.Errorf("error = %q, want it to name the source issue", res.Error)
+	}
 }
 
 // A missing MR bead is a routing fault (a misrouted or embedded clone reads
