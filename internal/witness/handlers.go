@@ -3458,8 +3458,87 @@ func closeDescendantsViaCLI(bd *BdCli, workDir, parentID string) (int, error) {
 
 // effectiveDoneIntent returns the done-intent that applies to the polecat's
 // current assignment, or nil.
+//
+// A done-intent label records that a gt done started, and nothing clears it for
+// a polecat that completed and sat idle. When the name is reused, the label of
+// the finished task would make the new, live session look stuck in done and get
+// it restarted mid-work. A label written before the hook bead was assigned
+// belongs to an earlier task: it is ignored and every such label is cleared.
+// Without a known assignment time the labels are used as they are.
 func effectiveDoneIntent(bd *BdCli, workDir, agentBeadID string, snap *agentBeadSnapshot, labels []string) *DoneIntent {
-	return extractDoneIntent(labels)
+	entries := parseDoneIntentLabels(labels)
+	if len(entries) == 0 {
+		return nil
+	}
+	newest := entries[0]
+	for _, e := range entries[1:] {
+		if e.intent.Timestamp.After(newest.intent.Timestamp) {
+			newest = e
+		}
+	}
+
+	hookBead := ""
+	if snap != nil {
+		hookBead = snap.HookBead
+	}
+	assignedAt, ok := hookAssignedAt(bd, workDir, hookBead)
+	if !ok {
+		return newest.intent
+	}
+
+	var current *DoneIntent
+	var stale []string
+	for _, e := range entries {
+		if e.intent.Timestamp.Before(assignedAt) {
+			stale = append(stale, e.label)
+		} else if current == nil || e.intent.Timestamp.After(current.Timestamp) {
+			current = e.intent
+		}
+	}
+	if len(stale) > 0 {
+		clearDoneIntentLabels(bd, workDir, agentBeadID, stale)
+	}
+	return current
+}
+
+// hookAssignedAt returns when the hook bead was attached to its polecat, from
+// the attached_at field gt sling writes on it.
+func hookAssignedAt(bd *BdCli, workDir, hookBead string) (time.Time, bool) {
+	if hookBead == "" {
+		return time.Time{}, false
+	}
+	output, err := bd.Exec(workDir, "show", hookBead, "--json")
+	if err != nil || output == "" {
+		return time.Time{}, false
+	}
+	var issues []struct {
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal([]byte(output), &issues); err != nil || len(issues) == 0 {
+		return time.Time{}, false
+	}
+	attachment := beads.ParseAttachmentFields(&beads.Issue{Description: issues[0].Description})
+	if attachment == nil || attachment.AttachedAt == "" {
+		return time.Time{}, false
+	}
+	at, err := time.Parse(time.RFC3339, attachment.AttachedAt)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return at, true
+}
+
+// clearDoneIntentLabels removes the given done-intent labels from the agent
+// bead. Best effort: a failure leaves them for the next patrol to retry.
+func clearDoneIntentLabels(bd *BdCli, workDir, agentBeadID string, labels []string) {
+	if agentBeadID == "" || len(labels) == 0 {
+		return
+	}
+	args := []string{"update", agentBeadID}
+	for _, label := range labels {
+		args = append(args, "--remove-label="+label)
+	}
+	_ = bd.Run(workDir, args...)
 }
 
 // DoneIntent represents a parsed done-intent label from an agent bead.
@@ -3468,28 +3547,45 @@ type DoneIntent struct {
 	Timestamp time.Time
 }
 
-// extractDoneIntent parses a done-intent:<type>:<unix-ts> label from a label list.
-// Returns nil if no done-intent label is found or if the label is malformed.
-func extractDoneIntent(labels []string) *DoneIntent {
+type doneIntentLabel struct {
+	label  string
+	intent *DoneIntent
+}
+
+// parseDoneIntentLabels parses every well-formed done-intent:<type>:<unix-ts>
+// label. Labels accumulate when completed polecats are reused, so there can be
+// several. Malformed ones are skipped.
+func parseDoneIntentLabels(labels []string) []doneIntentLabel {
+	var out []doneIntentLabel
 	for _, label := range labels {
 		if !strings.HasPrefix(label, "done-intent:") {
 			continue
 		}
-		// Format: done-intent:<type>:<unix-ts>
 		parts := strings.SplitN(label, ":", 3)
 		if len(parts) != 3 {
-			return nil // Malformed
+			continue
 		}
 		ts, err := strconv.ParseInt(parts[2], 10, 64)
 		if err != nil {
-			return nil // Malformed timestamp
+			continue
 		}
-		return &DoneIntent{
-			ExitType:  parts[1],
-			Timestamp: time.Unix(ts, 0),
+		out = append(out, doneIntentLabel{
+			label:  label,
+			intent: &DoneIntent{ExitType: parts[1], Timestamp: time.Unix(ts, 0)},
+		})
+	}
+	return out
+}
+
+// extractDoneIntent returns the newest well-formed done-intent label, or nil.
+func extractDoneIntent(labels []string) *DoneIntent {
+	var newest *DoneIntent
+	for _, e := range parseDoneIntentLabels(labels) {
+		if newest == nil || e.intent.Timestamp.After(newest.Timestamp) {
+			newest = e.intent
 		}
 	}
-	return nil
+	return newest
 }
 
 // getAgentBeadLabels reads the labels from an agent bead.
