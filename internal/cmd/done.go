@@ -1843,6 +1843,21 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// Continue with creation attempt - Create will fail if duplicate
 		}
 
+		// A branch whose PR the refinery already tracks gets no second MR when
+		// its HEAD moves: the SHA-keyed lookup above misses it, and the supersede
+		// below only closes MRs of the same source issue, so a review-fix bead
+		// without review_pr (e.g. scoped by the mayor) would mint a duplicate
+		// beside the in-flight one (gt-lil3e).
+		if existingMR == nil {
+			if inFlight, ifErr := bd.FindInFlightPRMRForBranch(branch); ifErr != nil {
+				style.PrintWarning("could not check for an in-flight PR MR: %v", ifErr)
+			} else if inFlight != nil {
+				existingMR = inFlight
+				fmt.Printf("%s Branch %s already has in-flight MR %s tracking its PR — not creating another\n",
+					style.Bold.Render("✓"), branch, inFlight.ID)
+			}
+		}
+
 		if existingMR != nil {
 			// MR already exists with same branch AND commit — true idempotent retry
 			mrID = existingMR.ID

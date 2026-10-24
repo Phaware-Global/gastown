@@ -195,3 +195,34 @@ func MatchesMRSourceIssue(description, issueID string) bool {
 	needle := "source_issue: " + issueID + "\n"
 	return strings.Contains(description, needle)
 }
+
+// FindInFlightPRMRForBranch returns a live merge-request bead for the branch
+// that already tracks a GitHub PR (review_pr set), or nil.
+func (b *Beads) FindInFlightPRMRForBranch(branch string) (*Issue, error) {
+	issues, err := b.ListMergeRequests(ListOptions{
+		Status: "all",
+		Label:  "gt:merge-request",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return pickInFlightPRMRForBranch(issues, branch), nil
+}
+
+// pickInFlightPRMRForBranch is the pure matching logic: the first non-terminal
+// MR whose parsed branch matches exactly and whose review_pr is set.
+func pickInFlightPRMRForBranch(issues []*Issue, branch string) *Issue {
+	if branch == "" {
+		return nil
+	}
+	for _, issue := range issues {
+		if IssueStatus(issue.Status).IsTerminal() {
+			continue
+		}
+		fields := ParseMRFields(issue)
+		if fields != nil && fields.Branch == branch && fields.ReviewPR > 0 {
+			return issue
+		}
+	}
+	return nil
+}

@@ -232,6 +232,13 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 		return NewSilentExit(1)
 	}
 
+	// Stage 1b: MR state records no review-fix polecat, but a scoped bead held by
+	// another polecat may already own this PR's fixes. Dispatching on top of it
+	// puts two polecats on one PR branch.
+	if err := reviewFixHolderGate(listReviewFixHolderCandidates(refPrDispatchReviewFixMR), state, refPrDispatchReviewFixMR); err != nil {
+		return err
+	}
+
 	// Stage 2: no polecat in flight — poll unresolved threads. Author-
 	// agnostic: every unresolved thread counts regardless of who opened it.
 	// Filtering by author here would re-introduce the G12b dogfood failure
