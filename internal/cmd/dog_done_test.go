@@ -3,6 +3,9 @@ package cmd
 import (
 	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -225,5 +228,47 @@ func TestTerminateDogSession_ReportsFailedNudge(t *testing.T) {
 	killed, err := terminateDogSession(m, "delta", func() error { return nil }, func(string) error { return wantErr })
 	if killed || !errors.Is(err, wantErr) {
 		t.Fatalf("terminateDogSession = (%v, %v), want (false, %v)", killed, err, wantErr)
+	}
+}
+
+// The detached nudge outlives gt dog done, so its output must land in the
+// town's runtime log, where a failed delivery can be traced.
+func TestStartDetachedDogNudge_LogsNudgeOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("stub gt is a shell script")
+	}
+	town := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(town, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(town, "mayor", "town.json"), []byte("{}"), 0o644); err != nil { //nolint:gosec // G306: test fixture
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	stub := "#!/bin/sh\necho \"stub gt: $*\"\necho 'stub gt: no such session' >&2\n"
+	if err := os.WriteFile(filepath.Join(bin, "gt"), []byte(stub), 0o755); err != nil { //nolint:gosec // G306: executable test stub
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Chdir(town)
+
+	if err := startDetachedDogNudge("hq-dog-delta", "y"); err != nil {
+		t.Fatal(err)
+	}
+
+	logPath := filepath.Join(town, ".runtime", dogNudgeLog)
+	deadline := time.Now().Add(5 * time.Second)
+	var got string
+	for time.Now().Before(deadline) {
+		b, _ := os.ReadFile(logPath)
+		if got = string(b); strings.Contains(got, "no such session") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	for _, want := range []string{"nudge hq-dog-delta for plugin y", "stub gt: nudge hq-dog-delta", `"Plugin: y"`, "stub gt: no such session"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("nudge log missing %q:\n%s", want, got)
+		}
 	}
 }

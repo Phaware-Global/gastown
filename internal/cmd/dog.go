@@ -803,18 +803,45 @@ func terminateDogSession(mgr idleLocker, name string, kill func() error, nudge f
 	return false, nudge(plugin)
 }
 
+// dogNudgeLog records the detached reassignment nudges' output, under the
+// town's .runtime.
+const dogNudgeLog = "dog-nudge.log"
+
 // startDetachedDogNudge tells a reassigned dog session to start the plugin it
 // was dispatched. It runs gt nudge (wait-idle) as a detached process: the
 // session is busy with this gt dog done until it returns, and this process
-// exits about a second after starting the nudge.
+// exits about a second after starting the nudge. The nudge's output goes to
+// .runtime/dog-nudge.log, so a delivery that fails after this process exits
+// can still be traced.
 func startDetachedDogNudge(sessionID, plugin string) error {
 	msg := fmt.Sprintf("You were dispatched plugin %s. Run `gt mail inbox` and follow the \"Plugin: %s\" mail.", plugin, plugin)
 	cmd := exec.Command("gt", "nudge", sessionID, msg) //nolint:gosec // G204: session and plugin names come from the dog's own state
 	util.SetDetachedProcessGroup(cmd)
+	if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+		if logFile, err := openDogNudgeLog(townRoot, sessionID, plugin); err == nil {
+			defer func() { _ = logFile.Close() }()
+			cmd.Stdout, cmd.Stderr = logFile, logFile
+		}
+	}
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	return cmd.Process.Release()
+}
+
+// openDogNudgeLog opens the town's dog nudge log for appending and writes a
+// header line for this nudge.
+func openDogNudgeLog(townRoot, sessionID, plugin string) (*os.File, error) {
+	dir := filepath.Join(townRoot, ".runtime")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, dogNudgeLog), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644) //nolint:gosec // G302: operator-readable runtime log
+	if err != nil {
+		return nil, err
+	}
+	_, _ = fmt.Fprintf(f, "%s nudge %s for plugin %s\n", time.Now().Format(time.RFC3339), sessionID, plugin)
+	return f, nil
 }
 
 // completeDogDone returns the dog to idle, then runs the best-effort cleanup
