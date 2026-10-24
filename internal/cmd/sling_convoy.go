@@ -213,7 +213,7 @@ func getConvoyInfoForIssue(issueID string) *ConvoyInfo {
 		// Phantom convoys occur when a convoy bead is deleted from HQ but tracking
 		// deps still exist in local beads DB (gt-9xum2). Return nil to treat as
 		// untracked, allowing normal MR flow to proceed.
-		stderrStr := stderr.String()
+		stderrStr := beads.RedirectDoltStartHint(stderr.String())
 		if strings.Contains(stderrStr, "not found") ||
 			strings.Contains(stderrStr, "Issue not found") ||
 			strings.Contains(stderrStr, "no issue found") {
