@@ -32,6 +32,9 @@ type Manager struct {
 	townRoot   string
 	kennelPath string // ~/gt/deacon/dogs/
 	rigsConfig *config.RigsConfig
+
+	// writeState persists a dog's .dog.json; a field so tests can inject failures.
+	writeState func(path string, v interface{}) error
 }
 
 // NewManager creates a new dog manager.
@@ -40,6 +43,7 @@ func NewManager(townRoot string, rigsConfig *config.RigsConfig) *Manager {
 		townRoot:   townRoot,
 		kennelPath: filepath.Join(townRoot, "deacon", "dogs"),
 		rigsConfig: rigsConfig,
+		writeState: atomicfile.WriteJSON,
 	}
 }
 
@@ -401,6 +405,59 @@ func (m *Manager) ClearWork(name string) error {
 	return m.saveState(name, state)
 }
 
+// ClearWorkWithRetry is ClearWork with up to attempts tries, sleeping backoff
+// (doubling) between them. A dog's state write is a local file, so a failure is
+// rare and usually transient (lock contention, a full or briefly busy disk). An
+// unknown or invalid dog is not transient and fails at once. The last error is
+// returned so a caller can refuse to report success.
+func (m *Manager) ClearWorkWithRetry(name string, attempts int, backoff time.Duration) error {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var err error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(backoff)
+			backoff *= 2
+		}
+		if err = m.ClearWork(name); err == nil {
+			return nil
+		}
+		if errors.Is(err, ErrDogNotFound) || errors.Is(err, ErrInvalidName) {
+			return err
+		}
+	}
+	return fmt.Errorf("after %d attempts: %w", attempts, err)
+}
+
+// WithIdleLock runs fn only if the dog is idle, holding the dog's lock for the
+// whole call so AssignWork cannot give it new work between the check and fn.
+// It reports whether fn ran. Use it for actions that would destroy a running
+// job, such as killing the dog's session.
+func (m *Manager) WithIdleLock(name string, fn func() error) (ran bool, err error) {
+	if err := validateDogName(name); err != nil {
+		return false, err
+	}
+	if !m.exists(name) {
+		return false, ErrDogNotFound
+	}
+
+	fl, err := m.lockDog(name)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	state, err := m.loadState(name)
+	if err != nil {
+		return false, fmt.Errorf("loading state: %w", err)
+	}
+	if state.State != StateIdle {
+		return false, nil
+	}
+	return true, fn()
+}
+
 // Refresh recreates all worktrees for a dog with fresh branches.
 // This is useful when worktrees have drifted or become stale.
 // Each rig is refreshed atomically with a state save, so a failure at rig N
@@ -639,7 +696,7 @@ func (m *Manager) loadState(name string) (*DogState, error) {
 // saveState saves a dog's state to .dog.json using atomic write (write-to-temp + rename).
 // This prevents concurrent loadState from seeing a truncated/empty file.
 func (m *Manager) saveState(name string, state *DogState) error {
-	return atomicfile.WriteJSON(m.stateFilePath(name), state)
+	return m.writeState(m.stateFilePath(name), state)
 }
 
 // GetIdleDog returns an idle dog suitable for work assignment.
