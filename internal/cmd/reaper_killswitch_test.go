@@ -67,10 +67,11 @@ func waitForConns(conns *atomic.Int32, want int32, d time.Duration) bool {
 }
 
 var reaperWriteCmds = map[string]*cobra.Command{
-	"reap":       reaperReapCmd,
-	"purge":      reaperPurgeCmd,
-	"auto-close": reaperAutoCloseCmd,
-	"run":        reaperRunCmd,
+	"reap":               reaperReapCmd,
+	"purge":              reaperPurgeCmd,
+	"auto-close":         reaperAutoCloseCmd,
+	"close-orphan-steps": reaperCloseOrphanStepsCmd,
+	"run":                reaperRunCmd,
 }
 
 // The reaper CLI must refuse to write when the operator has switched the

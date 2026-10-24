@@ -534,6 +534,79 @@ Returns the count of closed issues. Use --dry-run to preview.`,
 	},
 }
 
+var reaperCloseOrphanStepsCmd = &cobra.Command{
+	Use:   "close-orphan-steps",
+	Short: "Close open molecule steps whose molecule root is closed",
+	Long: `Close open step wisps whose parent molecule has already closed, at any age.
+
+Dog molecules used to close their root while leaving blocked step wisps open
+(gt-78kgc). Reap already closes these on every cycle regardless of age; this
+is a targeted one-off for the existing backlog. A step is closed when it has
+at least one closed molecule parent and no parent that is open, hooked,
+in_progress or external. Agent beads are never touched.
+
+When --db is provided, runs against a single database. When omitted, runs
+against every database on the Dolt server. Use --dry-run to list the count per
+database without writing. Writes honor the wisp reaper kill switch.`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := requireReaperWritesAllowed(); err != nil {
+			return err
+		}
+
+		var results []*reaper.OrphanStepsResult
+		for i, dbName := range reaperDatabaseNames() {
+			if err := waitBeforeReaperDatabase(i); err != nil {
+				return err
+			}
+			if err := reaper.ValidateDBName(dbName); err != nil {
+				fmt.Fprintf(os.Stderr, "skip invalid db: %s\n", dbName)
+				continue
+			}
+
+			db, err := reaper.OpenDB(reaperHost, reaperPort, dbName, 10*time.Second, 10*time.Second)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s: connect error: %v\n", dbName, err)
+				continue
+			}
+
+			if ok, err := reaper.HasReaperSchema(db); err != nil {
+				fmt.Fprintf(os.Stderr, "%s: schema check error: %v\n", dbName, err)
+				db.Close()
+				continue
+			} else if !ok {
+				db.Close()
+				continue
+			}
+
+			result, err := reaper.CloseOrphanedMoleculeSteps(db, dbName, reaperDryRun)
+			db.Close()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s: close-orphan-steps error: %v\n", dbName, err)
+				continue
+			}
+			results = append(results, result)
+		}
+
+		if reaperJSON {
+			fmt.Println(reaper.FormatJSON(results))
+			return nil
+		}
+		total := 0
+		for _, r := range results {
+			verb := "closed"
+			if r.DryRun {
+				verb = "[DRY RUN] would close"
+			}
+			fmt.Printf("%s: %s %d orphaned molecule step(s)\n", r.Database, verb, r.Steps)
+			total += r.Steps
+		}
+		if len(results) > 1 {
+			fmt.Printf("\nTotal across %d databases: %d\n", len(results), total)
+		}
+		return nil
+	},
+}
+
 var reaperRunCmd = &cobra.Command{
 	Use:   "run",
 	Short: "Run full reaper cycle across all databases",
@@ -677,18 +750,18 @@ func init() {
 		}
 	}
 
-	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperRunCmd, reaperDatabasesCmd} {
+	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperCloseOrphanStepsCmd, reaperRunCmd, reaperDatabasesCmd} {
 		cmd.Flags().StringVar(&reaperDB, "db", "", "Database name (required for single-db commands)")
 		cmd.Flags().StringVar(&reaperHost, "host", defaultHost, "Dolt server host (env: GT_DOLT_HOST)")
 		cmd.Flags().IntVar(&reaperPort, "port", defaultPort, "Dolt server port (env: GT_DOLT_PORT)")
 		cmd.Flags().BoolVar(&reaperDryRun, "dry-run", false, "Report what would happen without acting")
 	}
-	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperRunCmd} {
+	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperCloseOrphanStepsCmd, reaperRunCmd} {
 		cmd.Flags().StringVar(&reaperDBDelay, "db-delay", "250ms", "Delay between databases to reduce Dolt load")
 	}
 
 	// JSON output flag for single-db commands
-	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperDatabasesCmd} {
+	for _, cmd := range []*cobra.Command{reaperScanCmd, reaperReapCmd, reaperPurgeCmd, reaperAutoCloseCmd, reaperCloseOrphanStepsCmd, reaperDatabasesCmd} {
 		cmd.Flags().BoolVar(&reaperJSON, "json", false, "Output as JSON")
 	}
 
@@ -709,6 +782,7 @@ func init() {
 	reaperCmd.AddCommand(reaperReapCmd)
 	reaperCmd.AddCommand(reaperPurgeCmd)
 	reaperCmd.AddCommand(reaperAutoCloseCmd)
+	reaperCmd.AddCommand(reaperCloseOrphanStepsCmd)
 	reaperCmd.AddCommand(reaperRunCmd)
 
 	rootCmd.AddCommand(reaperCmd)

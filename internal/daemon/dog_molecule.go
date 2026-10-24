@@ -36,6 +36,13 @@ func (dm *dogMol) closeWisp(id string, extra ...string) error {
 		if _, err = dm.runBd(args...); err == nil {
 			return nil
 		}
+		// A dependency-guard refusal is deterministic: it clears only when the
+		// blocker closes, never by waiting. Sleeping through the retries here
+		// stalls the caller for nothing (closeRemainingSteps retries it after
+		// the blocker closes).
+		if isBlockedCloseErr(err) {
+			return err
+		}
 		if attempt < dogCloseMaxAttempts {
 			time.Sleep(time.Duration(attempt) * dogCloseRetryDelay)
 		}
@@ -105,7 +112,7 @@ func (dm *dogMol) closeStep(stepSlug string) {
 	}
 
 	if err := dm.closeWisp(stepID); err != nil {
-		dm.logger.Printf("dog_molecule: close step %s (%s) failed after %d attempts (non-fatal): %v", stepSlug, stepID, dogCloseMaxAttempts, err)
+		dm.logCloseFailure(fmt.Sprintf("close step %s (%s)", stepSlug, stepID), err, " (non-fatal)")
 		return
 	}
 }
@@ -123,7 +130,7 @@ func (dm *dogMol) failStep(stepSlug, reason string) {
 	}
 
 	if err := dm.closeWisp(stepID, "--reason", reason); err != nil {
-		dm.logger.Printf("dog_molecule: fail step %s (%s) failed after %d attempts (non-fatal): %v", stepSlug, stepID, dogCloseMaxAttempts, err)
+		dm.logCloseFailure(fmt.Sprintf("fail step %s (%s)", stepSlug, stepID), err, " (non-fatal)")
 	}
 }
 
@@ -143,9 +150,37 @@ func (dm *dogMol) close() {
 	}
 }
 
+// logCloseFailure logs a failed closeWisp. A dependency-guard refusal is tried
+// once and is not a retry exhaustion, so it is reported as still blocked rather
+// than as dogCloseMaxAttempts failures.
+func (dm *dogMol) logCloseFailure(what string, err error, suffix string) {
+	if isBlockedCloseErr(err) {
+		dm.logger.Printf("dog_molecule: %s still blocked%s: %v", what, suffix, err)
+		return
+	}
+	dm.logger.Printf("dog_molecule: %s failed after %d attempts%s: %v", what, dogCloseMaxAttempts, suffix, err)
+}
+
+// isBlockedCloseErr reports whether err is bd refusing to close an issue
+// because an open issue still blocks it ("blocked by open issues ... use
+// --force to override").
+func isBlockedCloseErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "blocked by open issues")
+}
+
 // closeRemainingSteps queries all children of the root wisp and closes any that
 // are still open. This is the backstop that prevents step wisp leaks regardless
 // of whether individual callers remembered to close each step.
+//
+// Steps are chained by blocking dependencies and bd refuses to close a step
+// while its blocker is open (we never pass --force). `bd show --children`
+// lists them in no particular order, so a single pass in listing order closed
+// a later step's blocker only after that step had already failed, leaving the
+// step open under a closed root (gt-78kgc). Close in passes instead: each pass
+// closes every step whose blocker is already closed, and the loop ends when a
+// pass makes no progress. That is dependency order without having to read the
+// dependency edges, and it terminates because every pass either closes a step
+// or stops.
 func (dm *dogMol) closeRemainingSteps() {
 	if dm.rootID == "" {
 		return
@@ -163,19 +198,36 @@ func (dm *dogMol) closeRemainingSteps() {
 		return
 	}
 
-	closed := 0
+	var pending []childInfo
 	for _, child := range children {
 		if child.ID == "" || child.Status == "" {
 			continue
 		}
 		// Close any child that is still open/hooked/in_progress.
 		if child.Status == "open" || child.Status == "hooked" || child.Status == "in_progress" {
-			if err := dm.closeWisp(child.ID); err != nil {
-				dm.logger.Printf("dog_molecule: closeRemainingSteps: close %s failed after %d attempts: %v", child.ID, dogCloseMaxAttempts, err)
-			} else {
-				closed++
-			}
+			pending = append(pending, child)
 		}
+	}
+
+	closed := 0
+	lastErr := make(map[string]error)
+	for len(pending) > 0 {
+		var stuck []childInfo
+		for _, child := range pending {
+			if err := dm.closeWisp(child.ID); err != nil {
+				lastErr[child.ID] = err
+				stuck = append(stuck, child)
+				continue
+			}
+			closed++
+		}
+		if len(stuck) == len(pending) {
+			break // No progress: what remains is blocked on something we will not force.
+		}
+		pending = stuck
+	}
+	for _, child := range pending {
+		dm.logCloseFailure("closeRemainingSteps: close "+child.ID, lastErr[child.ID], "")
 	}
 	if closed > 0 {
 		dm.logger.Printf("dog_molecule: closeRemainingSteps: closed %d orphan step wisp(s) under %s", closed, dm.rootID)
