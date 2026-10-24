@@ -24,37 +24,54 @@ const DoltStartGuidance = "Dolt is managed by Gas Town, not by bd. Do NOT start 
 	"it ignores dolt.auto-start and binds the shared port to an empty store. " +
 	"Run 'gt dolt status'; if the server is down, escalate: gt escalate -s HIGH \"Dolt: server unreachable\"."
 
+// serverMayNotBeRunning is the diagnosis half of bd's "may not be running. Try:"
+// lead-in. It is kept because callers match on it to tell a down server from a
+// transient failure (polecat isDoltConfigError): bd's dial errors other than
+// "connection refused" (i/o timeout, no route to host) carry no other marker.
+const serverMayNotBeRunning = "The Dolt server may not be running."
+
 // RedirectDoltStartHint rewrites every line of bd output that advises running
-// `bd dolt start` into DoltStartGuidance (once per message) and drops the lead-in
-// lines that introduced the advice. Output without the advice is returned as is.
+// `bd dolt start` into DoltStartGuidance (once per message) and replaces the
+// lead-in that introduced the advice with its diagnosis, once. gt pins
+// BEADS_DOLT_AUTO_START=0, so the lead-in it sees from bd is "Start the server
+// manually:", not "may not be running. Try:". Output without the advice is
+// returned as is.
 func RedirectDoltStartHint(s string) string {
 	if !strings.Contains(s, "bd dolt start") {
 		return s
 	}
 	lines := strings.Split(s, "\n")
 	out := make([]string, 0, len(lines))
-	redirected := false
+	var st hintState
 	for _, line := range lines {
-		if rewritten, keep := redirectHintLine(line, &redirected); keep {
+		if rewritten, keep := redirectHintLine(line, &st); keep {
 			out = append(out, rewritten)
 		}
 	}
 	return strings.Join(out, "\n")
 }
 
+// hintState tracks, for one message, whether the guidance and the diagnosis
+// were already emitted.
+type hintState struct {
+	redirected, diagnosed bool
+}
+
 // redirectHintLine applies the rewrite to one line. keep is false for a line
-// that must be dropped; redirected tracks whether the guidance was already
-// emitted for this message.
-func redirectHintLine(line string, redirected *bool) (out string, keep bool) {
+// that must be dropped.
+func redirectHintLine(line string, st *hintState) (out string, keep bool) {
 	switch trimmed := strings.TrimSpace(line); {
-	case trimmed == "Start the server manually:",
-		trimmed == "The Dolt server may not be running. Try:":
-		return "", false
-	case strings.Contains(line, "bd dolt start"):
-		if *redirected {
+	case trimmed == "Start the server manually:" || trimmed == serverMayNotBeRunning+" Try:":
+		if st.diagnosed {
 			return "", false
 		}
-		*redirected = true
+		st.diagnosed = true
+		return serverMayNotBeRunning, true
+	case strings.Contains(line, "bd dolt start"):
+		if st.redirected {
+			return "", false
+		}
+		st.redirected = true
 		return DoltStartGuidance, true
 	default:
 		return line, true
@@ -66,9 +83,9 @@ func redirectHintLine(line string, redirected *bool) (out string, keep bool) {
 // line by line so the advice is caught even when bd's writes split it. The final
 // unterminated line is held until Flush, so call Flush after the command exits.
 type HintWriter struct {
-	w          io.Writer
-	pending    []byte
-	redirected bool
+	w       io.Writer
+	pending []byte
+	st      hintState
 }
 
 // NewHintWriter wraps w.
@@ -102,7 +119,7 @@ func (h *HintWriter) Flush() error {
 }
 
 func (h *HintWriter) emit(line, eol string) error {
-	out, keep := redirectHintLine(line, &h.redirected)
+	out, keep := redirectHintLine(line, &h.st)
 	if !keep {
 		return nil
 	}
