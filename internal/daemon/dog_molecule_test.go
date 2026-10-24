@@ -1,6 +1,12 @@
 package daemon
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+)
 
 func TestParseWispID(t *testing.T) {
 	tests := []struct {
@@ -153,4 +159,134 @@ func TestDogMolGracefulDegradation(t *testing.T) {
 	dm.closeStep("scan")
 	dm.failStep("scan", "test failure")
 	dm.close()
+}
+
+// fakeBlockingBD writes a stand-in `bd` that models the real CLI's dependency
+// guard: `bd close X` fails with "blocked by open issues" while any of X's
+// blockers is still open, and succeeds otherwise. `show <root> --children`
+// lists the children in the order given by children (each "id:title"), with
+// blockers wired as blockedBy[id] = blocker. Any `--force` makes the fake
+// record a violation, because completion must never override the guard.
+func fakeBlockingBD(t *testing.T, root string, children []string, blockedBy map[string]string) (bdPath, stateDir string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake bd is a shell script")
+	}
+	stateDir = t.TempDir()
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(stateDir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(root+".status", "open")
+	var listing []string
+	for _, c := range children {
+		id, title, _ := strings.Cut(c, ":")
+		write(id+".status", "open")
+		write(id+".title", title)
+		listing = append(listing, id)
+	}
+	for id, blocker := range blockedBy {
+		write(id+".blocker", blocker)
+	}
+	write("order", strings.Join(listing, "\n")+"\n")
+
+	script := `#!/bin/sh
+S="` + stateDir + `"
+case "$1" in
+show)
+  printf '{"%s": [' "$2"
+  first=1
+  while read -r id; do
+    [ -n "$id" ] || continue
+    [ $first -eq 1 ] || printf ','
+    first=0
+    printf '{"id":"%s","title":"%s","status":"%s"}' "$id" "$(cat "$S/$id.title")" "$(cat "$S/$id.status")"
+  done < "$S/order"
+  printf '], "schema_version": 1}\n'
+  ;;
+close)
+  id="$2"
+  for a in "$@"; do [ "$a" = "--force" ] && echo "$id" >> "$S/forced"; done
+  if [ -f "$S/$id.blocker" ] && [ "$(cat "$S/$(cat "$S/$id.blocker").status")" != "closed" ]; then
+    echo "cannot close $id: blocked by open issues [$(cat "$S/$id.blocker")] (use --force to override)" >&2
+    exit 1
+  fi
+  printf closed > "$S/$id.status"
+  ;;
+*)
+  echo "unexpected bd call: $*" >&2
+  exit 2
+  ;;
+esac
+`
+	bdPath = filepath.Join(t.TempDir(), "bd")
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bdPath, stateDir
+}
+
+func readState(t *testing.T, dir, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+type testLogger struct{ t *testing.T }
+
+func (l testLogger) Printf(format string, args ...interface{}) { l.t.Logf(format, args...) }
+
+// TestDogMolCloseLeavesNoOpenStepsWhenListedOutOfDependencyOrder is the RED
+// test for gt-78kgc: steps form a blocks chain, and bd lists a later step
+// before the step that blocks it. A single listing-order pass fails to close
+// the later step (blocked) and never revisits it once its blocker closes,
+// leaving it open under a closed root.
+func TestDogMolCloseLeavesNoOpenStepsWhenListedOutOfDependencyOrder(t *testing.T) {
+	bdPath, state := fakeBlockingBD(t, "root",
+		[]string{"report:Report findings and return to kennel", "push:Commit and push to git archive", "export:Export databases to JSONL"},
+		map[string]string{"report": "push", "push": "export"},
+	)
+	dm := &dogMol{
+		rootID:   "root",
+		stepIDs:  map[string]string{},
+		bdPath:   bdPath,
+		townRoot: t.TempDir(),
+		logger:   testLogger{t},
+	}
+
+	dm.close()
+
+	for _, id := range []string{"report", "push", "export", "root"} {
+		if got := readState(t, state, id+".status"); got != "closed" {
+			t.Errorf("%s status = %q, want closed", id, got)
+		}
+	}
+	if forced := readState(t, state, "forced"); forced != "" {
+		t.Errorf("completion used --force on: %s", forced)
+	}
+}
+
+// A step whose blocker can never close (the blocker's own close keeps failing)
+// must stay open without looping forever, and must not be force-closed.
+func TestDogMolCloseTerminatesOnPermanentlyBlockedStep(t *testing.T) {
+	bdPath, state := fakeBlockingBD(t, "root",
+		[]string{"b:Report findings", "a:Commit and push"},
+		map[string]string{"b": "a", "a": "b"},
+	)
+	dm := &dogMol{rootID: "root", stepIDs: map[string]string{}, bdPath: bdPath, townRoot: t.TempDir(), logger: testLogger{t}}
+
+	dm.close()
+
+	for _, id := range []string{"a", "b"} {
+		if got := readState(t, state, id+".status"); got != "open" {
+			t.Errorf("%s status = %q, want open (cyclic blockers cannot close without --force)", id, got)
+		}
+	}
+	if forced := readState(t, state, "forced"); forced != "" {
+		t.Errorf("completion used --force on: %s", forced)
+	}
 }

@@ -778,6 +778,115 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	}
 }
 
+// orphanStepFixture is a closed dog molecule whose blocked step chain was left
+// open (gt-78kgc), next to steps that must never be touched.
+func orphanStepFixture() *fakeReaperState {
+	now := time.Now().UTC()
+	return &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"mol-closed":          {id: "mol-closed", status: "closed", issueType: "molecule", createdAt: now},
+			"mol-open":            {id: "mol-open", status: "open", issueType: "molecule", createdAt: now},
+			"orphan-push":         {id: "orphan-push", status: "open", issueType: "task", createdAt: now},
+			"orphan-report":       {id: "orphan-report", status: "open", issueType: "task", createdAt: now},
+			"live-step":           {id: "live-step", status: "open", issueType: "task", createdAt: now},
+			"live-step-inprog":    {id: "live-step-inprog", status: "in_progress", issueType: "task", createdAt: now},
+			"mixed-parent-step":   {id: "mixed-parent-step", status: "open", issueType: "task", createdAt: now},
+			"agent-step":          {id: "agent-step", status: "open", issueType: "agent", createdAt: now},
+			"already-closed-step": {id: "already-closed-step", status: "closed", issueType: "task", createdAt: now},
+			"unparented":          {id: "unparented", status: "open", issueType: "task", createdAt: now},
+		},
+		deps: []fakeDep{
+			{issueID: "orphan-push", dependsOnID: "mol-closed", depType: "parent-child"},
+			{issueID: "orphan-report", dependsOnID: "mol-closed", depType: "parent-child"},
+			{issueID: "orphan-report", dependsOnID: "orphan-push", depType: "blocks"},
+			{issueID: "live-step", dependsOnID: "mol-open", depType: "parent-child"},
+			{issueID: "live-step-inprog", dependsOnID: "mol-open", depType: "parent-child"},
+			{issueID: "mixed-parent-step", dependsOnID: "mol-closed", depType: "parent-child"},
+			{issueID: "mixed-parent-step", dependsOnID: "mol-open", depType: "parent-child"},
+			{issueID: "agent-step", dependsOnID: "mol-closed", depType: "parent-child"},
+			{issueID: "already-closed-step", dependsOnID: "mol-closed", depType: "parent-child"},
+		},
+		ops: map[int][]string{},
+	}
+}
+
+var orphanStepsUntouched = []string{"mol-open", "live-step", "live-step-inprog", "mixed-parent-step", "agent-step", "unparented"}
+
+func TestCloseOrphanedMoleculeStepsClosesOnlyStepsOfClosedRoots(t *testing.T) {
+	state := orphanStepFixture()
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	before := state.statuses()
+	result, err := CloseOrphanedMoleculeSteps(db, "testdb", false)
+	if err != nil {
+		t.Fatalf("CloseOrphanedMoleculeSteps: %v", err)
+	}
+	if result.Steps != 2 || result.Database != "testdb" || result.DryRun {
+		t.Fatalf("result = %+v, want 2 steps closed in testdb", result)
+	}
+	for _, id := range []string{"orphan-push", "orphan-report"} {
+		if got := state.status(id); got != "closed" {
+			t.Errorf("%s status = %q, want closed", id, got)
+		}
+	}
+	for _, id := range orphanStepsUntouched {
+		if got := state.status(id); got != before[id] {
+			t.Errorf("%s status = %q, want unchanged %q", id, got, before[id])
+		}
+	}
+}
+
+func TestCloseOrphanedMoleculeStepsDryRunCountsWithoutWriting(t *testing.T) {
+	state := orphanStepFixture()
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	before := state.statuses()
+	result, err := CloseOrphanedMoleculeSteps(db, "testdb", true)
+	if err != nil {
+		t.Fatalf("CloseOrphanedMoleculeSteps dry run: %v", err)
+	}
+	if result.Steps != 2 || !result.DryRun {
+		t.Fatalf("result = %+v, want dry run counting 2 steps", result)
+	}
+	if after := state.statuses(); !reflect.DeepEqual(after, before) {
+		t.Fatalf("dry run mutated statuses: before=%v after=%v", before, after)
+	}
+}
+
+func TestCloseOrphanedMoleculeStepsLeavesOpenRootsAloneWhenNothingOrphaned(t *testing.T) {
+	now := time.Now().UTC()
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"mol-open": {id: "mol-open", status: "open", issueType: "molecule", createdAt: now},
+			"step":     {id: "step", status: "open", issueType: "task", createdAt: now.Add(-72 * time.Hour)},
+		},
+		deps: []fakeDep{{issueID: "step", dependsOnID: "mol-open", depType: "parent-child"}},
+		ops:  map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+
+	result, err := CloseOrphanedMoleculeSteps(db, "testdb", false)
+	if err != nil {
+		t.Fatalf("CloseOrphanedMoleculeSteps: %v", err)
+	}
+	if result.Steps != 0 {
+		t.Fatalf("Steps = %d, want 0", result.Steps)
+	}
+	if got := state.status("step"); got != "open" {
+		t.Fatalf("step of an open root status = %q, want open (age must not matter)", got)
+	}
+	for _, ops := range state.ops {
+		for _, op := range ops {
+			if strings.Contains(op, "DOLT_COMMIT") {
+				t.Fatalf("committed with nothing closed: %s", op)
+			}
+		}
+	}
+}
+
 // TestTopLevelMoleculeNotReapedWhileHooked is the RED test for hq-s4azi: a
 // top-level molecule wisp (mol-dog-reaper itself, or any dispatched work
 // molecule) has no parent-child dependency row BY DESIGN. The old

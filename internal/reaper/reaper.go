@@ -644,7 +644,6 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 
 	cutoff := time.Now().UTC().Add(-maxAge)
 	parentJoin, parentWhere := parentExcludeJoin(dbName)
-	moleculeStepJoin := closedMoleculeStepJoin("closed_molecule_step")
 	moleculeStepExcludeJoin := closedMoleculeStepExcludeJoin("closed_molecule_step")
 	agentJoin, agentWhere := notAgentWispJoin("w")
 	// Exclude agent beads (issue_type='agent' or gt:agent label) from reaping —
@@ -658,10 +657,7 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 	result := &ReapResult{Database: dbName, DryRun: dryRun}
 
 	if dryRun {
-		moleculeStepCountQuery := fmt.Sprintf(
-			"SELECT COUNT(*) FROM wisps w %s %s WHERE %s AND %s",
-			moleculeStepJoin, agentJoin, openWispStatusWhere, agentWhere)
-		if err := db.QueryRowContext(ctx, moleculeStepCountQuery).Scan(&result.MoleculeStepsClosed); err != nil {
+		if err := db.QueryRowContext(ctx, closedMoleculeStepCountQuery()).Scan(&result.MoleculeStepsClosed); err != nil {
 			return nil, fmt.Errorf("dry-run molecule step count: %w", err)
 		}
 		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM wisps w %s %s %s WHERE %s", parentJoin, moleculeStepExcludeJoin, agentJoin, whereClause)
@@ -692,10 +688,7 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 		_, _ = conn.ExecContext(context.Background(), "SET @@autocommit = 1")
 	}()
 
-	moleculeStepIDQuery := fmt.Sprintf(
-		"SELECT w.id FROM wisps w %s %s WHERE %s AND %s LIMIT %d",
-		moleculeStepJoin, agentJoin, openWispStatusWhere, agentWhere, DefaultBatchSize)
-	moleculeStepsClosed, err := closeWispsInBatches(ctx, conn, moleculeStepIDQuery, nil, "closed molecule steps")
+	moleculeStepsClosed, err := closeWispsInBatches(ctx, conn, closedMoleculeStepIDQuery(), nil, "closed molecule steps")
 	if err != nil {
 		return nil, err
 	}
@@ -742,6 +735,94 @@ func Reap(db *sql.DB, dbName string, maxAge time.Duration, dryRun bool) (*ReapRe
 		return result, fmt.Errorf("count open: %w", err)
 	}
 
+	return result, nil
+}
+
+// closedMoleculeStepCountQuery counts open steps whose molecule has closed.
+// Reap's dry run and CloseOrphanedMoleculeSteps share it so the two report the
+// same set.
+func closedMoleculeStepCountQuery() string {
+	agentJoin, agentWhere := notAgentWispJoin("w")
+	return fmt.Sprintf(
+		"SELECT COUNT(*) FROM wisps w %s %s WHERE %s AND %s",
+		closedMoleculeStepJoin("closed_molecule_step"), agentJoin, openWispStatusWhere, agentWhere)
+}
+
+// closedMoleculeStepIDQuery selects one batch of open steps whose molecule has
+// closed.
+func closedMoleculeStepIDQuery() string {
+	agentJoin, agentWhere := notAgentWispJoin("w")
+	return fmt.Sprintf(
+		"SELECT w.id FROM wisps w %s %s WHERE %s AND %s LIMIT %d",
+		closedMoleculeStepJoin("closed_molecule_step"), agentJoin, openWispStatusWhere, agentWhere, DefaultBatchSize)
+}
+
+// OrphanStepsResult reports open step wisps whose molecule root already closed.
+type OrphanStepsResult struct {
+	Database string `json:"database"`
+	// Steps is the number of steps closed, or in a dry run the number that
+	// would be closed.
+	Steps  int  `json:"steps"`
+	DryRun bool `json:"dry_run,omitempty"`
+}
+
+// CloseOrphanedMoleculeSteps closes open step wisps whose parent molecule is
+// already closed, regardless of age. Dog molecules used to close their root
+// while leaving blocked steps open (gt-78kgc); Reap already closes these on
+// each cycle, and this clears the existing backlog directly.
+//
+// A step is touched when it has at least one closed molecule parent and no
+// parent-child parent that is open, hooked, in_progress or external; agent
+// beads are left alone. A dry run only counts.
+func CloseOrphanedMoleculeSteps(db *sql.DB, dbName string, dryRun bool) (*OrphanStepsResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	result := &OrphanStepsResult{Database: dbName, DryRun: dryRun}
+
+	if dryRun {
+		if err := db.QueryRowContext(ctx, closedMoleculeStepCountQuery()).Scan(&result.Steps); err != nil {
+			return nil, fmt.Errorf("dry-run orphan step count: %w", err)
+		}
+		return result, nil
+	}
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("pin connection: %w", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
+		return nil, fmt.Errorf("disable autocommit: %w", err)
+	}
+	sqlCommitted := false
+	defer func() {
+		if !sqlCommitted {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+		_, _ = conn.ExecContext(context.Background(), "SET @@autocommit = 1")
+	}()
+
+	closed, err := closeWispsInBatches(ctx, conn, closedMoleculeStepIDQuery(), nil, "orphaned molecule steps")
+	if err != nil {
+		return nil, err
+	}
+	result.Steps = closed
+	if closed == 0 {
+		return result, nil
+	}
+
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return result, fmt.Errorf("sql commit: %w", err)
+	}
+	sqlCommitted = true
+	commitMsg := fmt.Sprintf("reaper: close %d orphaned molecule steps in %s", closed, dbName)
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+		if !isNothingToCommit(err) {
+			return result, fmt.Errorf("dolt commit: %w", err)
+		}
+	}
 	return result, nil
 }
 
