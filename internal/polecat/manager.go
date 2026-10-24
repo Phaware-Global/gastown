@@ -1173,6 +1173,10 @@ type WorkAtRiskError struct {
 	// itself failed and the count is unknown.
 	Unpushed int
 	Reason   string
+	// ForceBypasses is set only when the refusal is one --force accepts (the
+	// branch could not be checked at all). For known unpushed commits --force
+	// does not bypass it, and Error() says so rather than implying it would.
+	ForceBypasses bool
 }
 
 func (e *WorkAtRiskError) Error() string {
@@ -1193,8 +1197,12 @@ func (e *WorkAtRiskError) Error() string {
 	} else {
 		b.WriteString(" To recover,")
 	}
-	b.WriteString(" fix the cause (e.g. amend a hooks-bypassed commit so hooks re-run) or push or move the commits somewhere durable, and retry the removal. " +
-		"gt polecat nuke refuses these commits too; the only way to delete them on purpose is its --discard-unpushed flag.")
+	b.WriteString(" fix the cause (e.g. amend a hooks-bypassed commit so hooks re-run) or push or move the commits somewhere durable, and retry the removal. ")
+	if e.ForceBypasses {
+		b.WriteString("Nothing is known to be unpushed here, so gt polecat remove --force removes it anyway.")
+	} else {
+		b.WriteString("--force does not bypass this. gt polecat nuke refuses these commits too; the only way to delete them on purpose is its --discard-unpushed flag.")
+	}
 	return b.String()
 }
 
@@ -1573,7 +1581,7 @@ func (m *Manager) missingWorktreeRisk(name, clonePath string, force, discard boo
 			style.PrintWarning("removing polecat %s with a missing worktree and an unchecked branch (%v)", name, cause)
 			return nil
 		}
-		return &WorkAtRiskError{Polecat: name, Branch: "(unknown)", ClonePath: clonePath, Unpushed: -1, Reason: reason}
+		return &WorkAtRiskError{Polecat: name, Branch: "(unknown)", ClonePath: clonePath, Unpushed: -1, Reason: reason, ForceBypasses: true}
 	}
 
 	repoGit, err := m.repoBase()
@@ -1667,7 +1675,7 @@ func (m *Manager) pushUnpushedBranch(polecatGit *git.Git, branch string) string 
 		// reach a real branch, even via this best-effort push.
 		return fmt.Sprintf("checkpoint auto-save commit %s is not pushed", wipSHA[:8])
 	}
-	if err := polecatGit.Push("origin", branch+":refs/heads/"+branch, false); err != nil {
+	if err := polecatGit.Push("origin", "refs/heads/"+branch+":refs/heads/"+branch, false); err != nil {
 		return fmt.Sprintf("push failed: %v", err)
 	}
 	return ""
