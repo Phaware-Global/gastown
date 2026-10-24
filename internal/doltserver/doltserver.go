@@ -1419,6 +1419,68 @@ func containsPathBoundary(line, path string) bool {
 	return false
 }
 
+// FindBackupLockHolders returns the PIDs of `dolt backup ...` CLI processes
+// whose working directory is inside dataDir. With no server listening, such a
+// process opens the database files directly and holds the exclusive noms/LOCK,
+// which makes `dolt sql-server` fail to start with "database ... is locked by
+// another dolt process" (gt-80aj).
+func FindBackupLockHolders(dataDir string) []int {
+	return findBackupLockHoldersFromPS(processList(), dataDir, getProcessCWD)
+}
+
+func findBackupLockHoldersFromPS(output, dataDir string, cwdOf func(pid int) string) []int {
+	root := resolvedPath(dataDir)
+	var pids []int
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 || filepath.Base(fields[1]) != "dolt" || fields[2] != "backup" {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil || pid <= 0 {
+			continue
+		}
+		cwd := resolvedPath(cwdOf(pid))
+		if cwd == root || strings.HasPrefix(cwd, root+string(filepath.Separator)) {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
+}
+
+// resolvedPath cleans path and resolves symlinks (macOS /var vs /private/var)
+// so a process cwd compares equal to the configured data dir. An empty path
+// stays empty so it matches nothing.
+func resolvedPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	return filepath.Clean(path)
+}
+
+// backupLockHint describes any `dolt backup` processes that may hold database
+// locks under dataDir, for appending to a start failure. Empty when none.
+func backupLockHint(dataDir string) string {
+	return formatBackupLockHint(FindBackupLockHolders(dataDir))
+}
+
+func formatBackupLockHint(pids []int) string {
+	if len(pids) == 0 {
+		return ""
+	}
+	ids := make([]string, len(pids))
+	for i, pid := range pids {
+		ids[i] = strconv.Itoa(pid)
+	}
+	return fmt.Sprintf("`dolt backup` process(es) PID %s hold database locks under the data dir while the server is down "+
+		"(a stuck daemon backup sync ignores SIGTERM). Inspect with `ps -p %s -o pid,ppid,etime,args`, "+
+		"then `kill -9 %s` and retry (do not touch .dolt/noms/LOCK)",
+		strings.Join(ids, ","), strings.Join(ids, ","), strings.Join(ids, " "))
+}
+
 // FindIdleMonitorProcesses finds "bd dolt idle-monitor" processes scoped to
 // this town. Matches by town root path in process args, or by the town's
 // configured Dolt port. It is side-effect free so callers can use it for dry-run
@@ -1951,6 +2013,13 @@ func Start(townRoot string) error {
 		return fmt.Errorf("creating data directory: %w", err)
 	}
 
+	// A `dolt backup` process left over from the server being down holds the
+	// database lock and would make the server fail to start. Say so up front,
+	// naming the PIDs, instead of surfacing dolt's anonymous lock error.
+	if hint := backupLockHint(config.DataDir); hint != "" {
+		return fmt.Errorf("cannot start Dolt server: %s", hint)
+	}
+
 	// Quarantine corrupted/phantom database dirs before server launch.
 	// WARNING: DO NOT remove, delete, or modify files inside Dolt's .dolt/
 	// directory — including noms/LOCK files. These are Dolt-internal files.
@@ -2075,7 +2144,11 @@ func Start(townRoot string) error {
 
 		// Check if the process we started is still alive.
 		if !processIsAlive(cmd.Process.Pid) {
-			return fmt.Errorf("Dolt server process died during startup (check logs with 'gt dolt logs')")
+			msg := "Dolt server process died during startup (check logs with 'gt dolt logs')"
+			if hint := backupLockHint(config.DataDir); hint != "" {
+				msg += "\n" + hint
+			}
+			return errors.New(msg)
 		}
 
 		if !tcpReachable {

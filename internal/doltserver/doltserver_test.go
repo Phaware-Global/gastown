@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -5251,6 +5252,62 @@ func TestSanitizeControlChars(t *testing.T) {
 	for _, tt := range tests {
 		if got := sanitizeControlChars(tt.in); got != tt.want {
 			t.Errorf("%s: sanitizeControlChars(%q) = %q, want %q", tt.name, tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestFindBackupLockHoldersFromPS(t *testing.T) {
+	data := t.TempDir()
+	other := t.TempDir()
+	if err := os.Mkdir(filepath.Join(data, "heartworks_web_portal"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	ps := strings.Join([]string{
+		"  PID ARGS",
+		"49186 dolt backup sync heartworks_web_portal-backup",
+		"49187 /opt/homebrew/bin/dolt backup sync gt-backup",
+		"49188 dolt backup sync elsewhere-backup",
+		"49189 dolt sql-server --config x.yaml",
+		"49190 dolt backup sync no-cwd-backup",
+		"49191 vim dolt backup notes",
+	}, "\n")
+	cwds := map[int]string{
+		49186: filepath.Join(data, "heartworks_web_portal"),
+		49187: data,
+		49188: other,
+		49189: data,
+		49191: data,
+	}
+	got := findBackupLockHoldersFromPS(ps, data, func(pid int) string { return cwds[pid] })
+	want := []int{49186, 49187}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("holders = %v, want %v", got, want)
+	}
+}
+
+func TestFindBackupLockHoldersSiblingPrefix(t *testing.T) {
+	parent := t.TempDir()
+	data := filepath.Join(parent, "dolt-data")
+	sibling := filepath.Join(parent, "dolt-data-old")
+	for _, d := range []string{data, sibling} {
+		if err := os.Mkdir(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := findBackupLockHoldersFromPS("1 dolt backup sync x", data, func(int) string { return sibling })
+	if len(got) != 0 {
+		t.Errorf("sibling dir matched as holder: %v", got)
+	}
+}
+
+func TestFormatBackupLockHint(t *testing.T) {
+	if got := formatBackupLockHint(nil); got != "" {
+		t.Errorf("no holders: hint = %q, want empty", got)
+	}
+	got := formatBackupLockHint([]int{49186, 49187})
+	for _, want := range []string{"49186,49187", "kill -9 49186 49187", "noms/LOCK"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("hint %q missing %q", got, want)
 		}
 	}
 }
