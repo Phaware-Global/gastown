@@ -996,6 +996,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// the effective target branch, which indicates the branch may contain stale merge-base
 		// artifacts that will pollute the PR diff. (GH#2220)
 		//
+		// The merge strategy is resolved here, ahead of the auto-rebase below,
+		// because a direct push to the default branch must still rebase a
+		// branch that is already on origin. It is acted on further down.
+		convoyInfo = resolveConvoyInfoForIssue(issueID, cwd, townRoot, rigName)
+
 		// gh#3400: Refresh remote tracking refs first so contamination check (and
 		// the auto-rebase below) sees the current state of origin. Without this,
 		// the local view of origin/<base> may be stale and we'd skip a rebase that
@@ -1020,7 +1025,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// gh#3400: Auto-rebase the polecat branch onto the latest target before
 			// push, so the resulting MR/PR has a current base.
 			alreadyPushed := checkpoints[CheckpointPushed] == branch
-			rebased, skipReason, rebaseErr := autoRebaseOnTarget(g, contaminationBase, contam.Behind, donePreVerified, alreadyPushed)
+			rebased, skipReason, rebaseErr := autoRebaseOnTarget(g, branch, contaminationBase, contam.Behind, donePreVerified, alreadyPushed,
+				convoyInfo != nil && convoyInfo.MergeStrategy == "direct")
 			if rebaseErr != nil {
 				return rebaseErr
 			}
@@ -1058,7 +1064,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// through the same helper — if the override only fires at one
 		// site, the bypass walks past it to the other. See the helper's
 		// doc for the full rationale.
-		convoyInfo = resolveConvoyInfoForIssue(issueID, cwd, townRoot, rigName)
+		// (convoyInfo was resolved above, before the auto-rebase.)
 
 		// Handle "local" strategy: skip push and MR entirely
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "local" {
