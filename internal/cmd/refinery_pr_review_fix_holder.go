@@ -23,9 +23,9 @@ var reviewFixHolderStatuses = []string{"in_progress", "hooked"}
 // looks again and the PR resumes once the holder finishes.
 //
 // A bead that claims the PR holds it only while its assignee is a live polecat of
-// this rig: a dead or absent assignee leaves nothing to race, and counting it
-// would stall the PR for as long as the bead exists. A liveness lookup that
-// fails is treated as held, like reviewFixSourceHeldByWorkingPolecat, because
+// this rig: a dead, nuked or absent assignee leaves nothing to race, and
+// counting it would stall the PR for as long as the bead exists. A liveness
+// lookup that fails for any other reason is treated as held, like reviewFixSourceHeldByWorkingPolecat, because
 // dispatching blind is the duplicate this gate exists to prevent. Every hold
 // prints the holder bead and why, so a stalled PR is never silent.
 //

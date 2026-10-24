@@ -2,10 +2,13 @@ package cmd
 
 import (
 	"errors"
+	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/polecat"
 )
 
 func holderState() dispatchReviewFixState {
@@ -121,7 +124,9 @@ func TestReviewFixHolder_IgnoresBeadsThatDoNotClaimThePR(t *testing.T) {
 const holderRig = "gastown"
 
 // holderAlive builds a liveness probe from a name -> alive/err table; an
-// unlisted polecat is an unknown one, which gt reports as not alive.
+// unlisted polecat is reported as not alive. That is a stub's convenience, not
+// what the real probe does for a polecat that was nuked: see
+// stubRealLivenessProbe for a probe that returns the real result.
 func holderAlive(alive map[string]bool, errs map[string]error) func(string) (bool, error) {
 	return func(name string) (bool, error) {
 		if err := errs[name]; err != nil {
@@ -272,6 +277,149 @@ func TestNextReviewFixStep(t *testing.T) {
 		step, err := nextReviewFixStep(2, 0, 3, open)
 		if err != nil || step != reviewFixDispatch {
 			t.Errorf("step, err = %v, %v; want dispatch, nil", step, err)
+		}
+	})
+}
+
+// stubRealLivenessProbe stands in for the two lookups behind
+// isReviewFixPolecatAlive. exists is what the polecat manager answers for the
+// polecat (polecat.ErrPolecatNotFound once it is nuked); status is what
+// `gt polecat status --json` prints and returns, which for a nuked polecat is an
+// exit 1 with empty stdout.
+func stubRealLivenessProbe(t *testing.T, exists error, statusOut string, statusErr error) {
+	t.Helper()
+	origLookup, origStatus := reviewFixPolecatLookup, reviewFixPolecatStatusJSON
+	t.Cleanup(func() { reviewFixPolecatLookup, reviewFixPolecatStatusJSON = origLookup, origStatus })
+	reviewFixPolecatLookup = func(rig, name string) error { return exists }
+	reviewFixPolecatStatusJSON = func(rig, name string) ([]byte, error) {
+		return []byte(statusOut), statusErr
+	}
+}
+
+// nukedStatusExit is the failure `gt polecat status` exits with for a polecat
+// whose worktree is gone: runPolecatStatus returns an error, so stdout is empty.
+func nukedStatusExit(t *testing.T) error {
+	t.Helper()
+	err := exec.Command("sh", "-c", "exit 1").Run()
+	if err == nil {
+		t.Fatal("expected a non-zero exit")
+	}
+	return err
+}
+
+func TestIsReviewFixPolecatAlive_NukedPolecatIsNotAlive(t *testing.T) {
+	t.Run("not found is dead, not an error", func(t *testing.T) {
+		stubRealLivenessProbe(t, polecat.ErrPolecatNotFound, "", nukedStatusExit(t))
+		alive, err := isReviewFixPolecatAlive(holderRig, "nuked")
+		if err != nil || alive {
+			t.Errorf("isReviewFixPolecatAlive = %v, %v; want false, nil", alive, err)
+		}
+	})
+	t.Run("a wrapped not found is dead too", func(t *testing.T) {
+		stubRealLivenessProbe(t, fmt.Errorf("loading: %w", polecat.ErrPolecatNotFound), "", nukedStatusExit(t))
+		alive, err := isReviewFixPolecatAlive(holderRig, "nuked")
+		if err != nil || alive {
+			t.Errorf("isReviewFixPolecatAlive = %v, %v; want false, nil", alive, err)
+		}
+	})
+	t.Run("a lookup that fails for another reason stays an error", func(t *testing.T) {
+		stubRealLivenessProbe(t, errors.New("rig 'gastown' not found"), "", nukedStatusExit(t))
+		if _, err := isReviewFixPolecatAlive(holderRig, "nuked"); err == nil {
+			t.Error("err = nil, want the lookup failure")
+		}
+	})
+	t.Run("stderr text that merely says not found is not a not-found", func(t *testing.T) {
+		stubRealLivenessProbe(t, errors.New("polecat 'x' not found in rig 'gastown'"), "", nukedStatusExit(t))
+		if _, err := isReviewFixPolecatAlive(holderRig, "x"); err == nil {
+			t.Error("err = nil, want an error: only polecat.ErrPolecatNotFound is definitive")
+		}
+	})
+	t.Run("an existing polecat whose status fails stays an error", func(t *testing.T) {
+		stubRealLivenessProbe(t, nil, "", nukedStatusExit(t))
+		if _, err := isReviewFixPolecatAlive(holderRig, "capable"); err == nil {
+			t.Error("err = nil, want the status failure")
+		}
+	})
+	t.Run("an existing working polecat is alive", func(t *testing.T) {
+		stubRealLivenessProbe(t, nil, `{"state":"working"}`, nil)
+		alive, err := isReviewFixPolecatAlive(holderRig, "capable")
+		if err != nil || !alive {
+			t.Errorf("isReviewFixPolecatAlive = %v, %v; want true, nil", alive, err)
+		}
+	})
+}
+
+// The gate must not stall a PR on a bead whose assignee was nuked.
+func TestReviewFixHolderGate_NukedAssigneeDoesNotHold(t *testing.T) {
+	realProbe := func(name string) (bool, error) { return isReviewFixPolecatAlive(holderRig, name) }
+
+	t.Run("a nuked assignee does not hold", func(t *testing.T) {
+		stubRealLivenessProbe(t, polecat.ErrPolecatNotFound, "", nukedStatusExit(t))
+		err := reviewFixHolderGate(holderLister(scopedHolder("in_progress", "gastown/polecats/nuked")),
+			realProbe, holderRig, holderState(), "gt-mr-1")
+		if err != nil {
+			t.Errorf("err = %v, want nil", err)
+		}
+	})
+	t.Run("any other status failure still holds, with the loud message", func(t *testing.T) {
+		stubRealLivenessProbe(t, nil, "", nukedStatusExit(t))
+		out := captureStdout(t, func() {
+			err := reviewFixHolderGate(holderLister(scopedHolder("in_progress", "gastown/polecats/capable")),
+				realProbe, holderRig, holderState(), "gt-mr-1")
+			wantExit(t, err, 1)
+		})
+		for _, want := range []string{"gt-scoped", "capable", "liveness lookup failed"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("output %q missing %q", out, want)
+			}
+		}
+	})
+}
+
+// Stage 1 shares the probe: a recorded review-fix polecat that was nuked is past
+// its dispatch, so the marker is cleared and the next patrol re-enters PR.4
+// instead of retrying the status check forever.
+func TestReviewFixInFlight_NukedRecordedPolecatProceeds(t *testing.T) {
+	state := holderState()
+	state.ReviewFixName = "nuked"
+
+	t.Run("a nuked recorded polecat clears the marker", func(t *testing.T) {
+		stubRealLivenessProbe(t, polecat.ErrPolecatNotFound, "", nukedStatusExit(t))
+		cleared := false
+		out := captureStdout(t, func() {
+			err := reviewFixInFlight(holderRig, state, isReviewFixPolecatAlive,
+				func() error { cleared = true; return nil })
+			wantExit(t, err, 1)
+		})
+		if !cleared {
+			t.Errorf("marker not cleared; output %q", out)
+		}
+	})
+	t.Run("any other status failure keeps the marker", func(t *testing.T) {
+		stubRealLivenessProbe(t, nil, "", nukedStatusExit(t))
+		cleared := false
+		out := captureStdout(t, func() {
+			err := reviewFixInFlight(holderRig, state, isReviewFixPolecatAlive,
+				func() error { cleared = true; return nil })
+			wantExit(t, err, 1)
+		})
+		if cleared {
+			t.Error("marker cleared on a transient status failure")
+		}
+		if !strings.Contains(out, "status check failed") {
+			t.Errorf("output %q missing the retry message", out)
+		}
+	})
+	t.Run("a working recorded polecat keeps the marker", func(t *testing.T) {
+		stubRealLivenessProbe(t, nil, `{"state":"working"}`, nil)
+		cleared := false
+		captureStdout(t, func() {
+			err := reviewFixInFlight(holderRig, state, isReviewFixPolecatAlive,
+				func() error { cleared = true; return nil })
+			wantExit(t, err, 1)
+		})
+		if cleared {
+			t.Error("marker cleared while the polecat is working")
 		}
 	})
 }

@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/reviewer"
 	"github.com/steveyegge/gastown/internal/style"
@@ -205,31 +206,8 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 	// either keep waiting OR clear the marker so the next patrol cycle can
 	// re-enter PR.4 for the new HEAD.
 	if state.ReviewFixName != "" {
-		alive, lookupErr := isReviewFixPolecatAlive(rigName, state.ReviewFixName)
-		if lookupErr != nil {
-			// Status-lookup failure: keep state, retry next patrol. NEVER
-			// clear review_fix_polecat on a transient lookup error — that
-			// would re-dispatch the same work and burn an iteration.
-			fmt.Fprintf(os.Stdout, "PR #%d: polecat %s status check failed (%v); retrying next patrol\n",
-				state.PRNumber, state.ReviewFixName, lookupErr)
-			return NewSilentExit(1)
-		}
-		if alive {
-			fmt.Fprintf(os.Stdout, "PR #%d awaiting review-fix polecat %s (iter=%d)\n",
-				state.PRNumber, state.ReviewFixName, state.ReviewLoopIter)
-			return NewSilentExit(1)
-		}
-		// Polecat finished or otherwise terminal: clear state + the await
-		// timestamp so the next patrol cycle re-enters PR.4 for the new
-		// HEAD. The G35/G36 drift detection in await-review (PR #50) will
-		// then re-post the trigger automatically when it sees the new SHA.
-		if err := mqClearReviewState(refPrDispatchReviewFixMR); err != nil {
-			return wrapOperationalErr(fmt.Errorf("clearing review-fix state on MR %s: %w", refPrDispatchReviewFixMR, err))
-		}
-		fmt.Fprintf(os.Stdout,
-			"PR #%d: review-fix polecat %s done — cleared review_fix_polecat + await_review_started_at; next patrol re-enters PR.4\n",
-			state.PRNumber, state.ReviewFixName)
-		return NewSilentExit(1)
+		return reviewFixInFlight(rigName, state, isReviewFixPolecatAlive,
+			func() error { return mqClearReviewState(refPrDispatchReviewFixMR) })
 	}
 
 	// Stage 2: no polecat in flight — poll unresolved threads. Author-
@@ -390,6 +368,38 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 	return NewSilentExit(1)
 }
 
+// reviewFixInFlight is Stage 1: a review-fix polecat is recorded on the MR, so
+// either keep waiting for it or clear the marker so the next patrol re-enters
+// PR.4 for the new HEAD. It always returns a silent exit 1 (patrol again) or an
+// operational error; it never falls through to a dispatch.
+func reviewFixInFlight(rigName string, state dispatchReviewFixState, alive func(rig, polecat string) (bool, error), clear func() error) error {
+	live, lookupErr := alive(rigName, state.ReviewFixName)
+	if lookupErr != nil {
+		// Status-lookup failure: keep state, retry next patrol. NEVER
+		// clear review_fix_polecat on a transient lookup error — that
+		// would re-dispatch the same work and burn an iteration.
+		fmt.Fprintf(os.Stdout, "PR #%d: polecat %s status check failed (%v); retrying next patrol\n",
+			state.PRNumber, state.ReviewFixName, lookupErr)
+		return NewSilentExit(1)
+	}
+	if live {
+		fmt.Fprintf(os.Stdout, "PR #%d awaiting review-fix polecat %s (iter=%d)\n",
+			state.PRNumber, state.ReviewFixName, state.ReviewLoopIter)
+		return NewSilentExit(1)
+	}
+	// Polecat finished, nuked, or otherwise terminal: clear state + the await
+	// timestamp so the next patrol cycle re-enters PR.4 for the new
+	// HEAD. The G35/G36 drift detection in await-review (PR #50) will
+	// then re-post the trigger automatically when it sees the new SHA.
+	if err := clear(); err != nil {
+		return wrapOperationalErr(fmt.Errorf("clearing review-fix state on MR %s: %w", refPrDispatchReviewFixMR, err))
+	}
+	fmt.Fprintf(os.Stdout,
+		"PR #%d: review-fix polecat %s done — cleared review_fix_polecat + await_review_started_at; next patrol re-enters PR.4\n",
+		state.PRNumber, state.ReviewFixName)
+	return NewSilentExit(1)
+}
+
 // reviewFixStep is what the dispatch does once Stage 1 has found no polecat in
 // flight.
 type reviewFixStep int
@@ -535,13 +545,20 @@ func reviewFixCapacityExitCode(snap polecatCapacitySnapshot) int {
 // signals the polecat is past the dispatch and the refinery should clear
 // state + advance.
 //
-// Empty stdout from a successful exit is treated as "polecat not found"
-// (gt polecat status returns empty JSON for unknown polecats). That maps
-// to "terminal" — same handling as `idle`/`done`.
+// A polecat the manager reports as nonexistent (polecat.ErrPolecatNotFound) is
+// terminal, and so is empty stdout from a successful status; both get the same
+// handling as `idle`/`done`. Every other lookup or status failure is an error,
+// which callers treat as "alive, try again next patrol". This probe backs both
+// the Stage 1 in-flight check and the holder gate.
 func isReviewFixPolecatAlive(rigName, polecatName string) (bool, error) {
-	cmd := exec.Command(gtBinary(), "polecat", "status",
-		fmt.Sprintf("%s/%s", rigName, polecatName), "--json")
-	out, err := cmd.Output()
+	// A polecat that no longer exists (nuked) is terminal. Only the polecat
+	// manager's ErrPolecatNotFound says so: `gt polecat status` reports a missing
+	// polecat as a plain error, indistinguishable from a failed lookup, and
+	// matching its text would call a broken rig lookup "dead".
+	if lerr := reviewFixPolecatLookup(rigName, polecatName); errors.Is(lerr, polecat.ErrPolecatNotFound) {
+		return false, nil
+	}
+	out, err := reviewFixPolecatStatusJSON(rigName, polecatName)
 	if err != nil {
 		// Don't auto-clear on lookup failure. The caller treats this as
 		// "transient — try again next patrol" so we never lose track of an
@@ -560,6 +577,25 @@ func isReviewFixPolecatAlive(rigName, polecatName string) (bool, error) {
 		return false, fmt.Errorf("parsing polecat status JSON: %w", jerr)
 	}
 	return resp.State == "working", nil
+}
+
+// reviewFixPolecatLookup reports whether the polecat exists in the rig: nil when
+// it does, an error wrapping polecat.ErrPolecatNotFound when it does not. Any
+// other error means the lookup itself failed. A package variable so tests can
+// supply the real not-found result without a rig on disk.
+var reviewFixPolecatLookup = func(rigName, polecatName string) error {
+	mgr, _, err := getPolecatManager(rigName)
+	if err != nil {
+		return err
+	}
+	_, err = mgr.Get(polecatName)
+	return err
+}
+
+// reviewFixPolecatStatusJSON returns `gt polecat status <rig>/<name> --json`.
+var reviewFixPolecatStatusJSON = func(rigName, polecatName string) ([]byte, error) {
+	return exec.Command(gtBinary(), "polecat", "status",
+		fmt.Sprintf("%s/%s", rigName, polecatName), "--json").Output()
 }
 
 // gtBinary returns the absolute path to the running `gt` binary so the
