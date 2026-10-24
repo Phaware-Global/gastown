@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`gt patrol scan --no-restart`** — detect-only mode for mayor-declared holds.
+  Zombies are still detected, reported, and notified, but no session is
+  restarted and no already-merged polecat is archived (the reported action is
+  `detected-restart-suppressed`). Previously the scan always restarted
+  zombies, resetting live worktrees, with no way to turn that off.
 - **`merge_queue.pr_update_strategy` (rebase | merge | none)** — a rig can now
   stop the refinery from rewriting PR branches. `merge` merges the target into
   the branch with a plain push; `none` reports "behind base" and leaves the

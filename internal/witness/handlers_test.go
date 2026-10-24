@@ -2956,7 +2956,7 @@ func TestHandleZombieRestart_SkipsWhenBranchAlreadyMerged(t *testing.T) {
 	)
 
 	z := &ZombieResult{PolecatName: "scavenger", HookBead: "ma-poc.4"}
-	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "ma-poc.4", "has_unpushed", z)
+	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "ma-poc.4", "has_unpushed", z, DetectZombieOptions{})
 
 	// Action must reflect the archive decision; must NOT be a "restarted*" action.
 	if !strings.Contains(z.Action, "work-already-merged") {
@@ -2985,10 +2985,129 @@ func TestHandleZombieRestart_RestartsWhenBranchNotMerged(t *testing.T) {
 	)
 
 	z := &ZombieResult{PolecatName: "scavenger", HookBead: "ma-poc.4"}
-	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "ma-poc.4", "clean", z)
+	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "ma-poc.4", "clean", z, DetectZombieOptions{})
 
 	// Should NOT take the archive path.
 	if strings.Contains(z.Action, "work-already-merged") {
 		t.Errorf("action = %q, should not archive when work is not merged", z.Action)
+	}
+}
+
+// TestHandleZombieRestart_NoRestartTouchesNothing verifies that with
+// NoRestart the zombie is reported but no restart, archive-nuke, or cleanup
+// wisp happens, for every cleanup_status — including the already-merged case
+// that would otherwise nuke the polecat.
+//
+// Not parallel: overrides package-level seams.
+func TestHandleZombieRestart_NoRestartTouchesNothing(t *testing.T) {
+	for _, merged := range []bool{false, true} {
+		for _, cleanup := range []string{"clean", "has_unpushed", "has_uncommitted"} {
+			t.Run(fmt.Sprintf("merged=%v/%s", merged, cleanup), func(t *testing.T) {
+				oldVerify, oldRestart := verifyBranchAlreadyMerged, restartPolecatSession
+				verifyBranchAlreadyMerged = func(workDir, rigName, polecatName string) (bool, error) {
+					return merged, nil
+				}
+				restarts := 0
+				restartPolecatSession = func(workDir, rigName, polecatName string) error {
+					restarts++
+					return nil
+				}
+				t.Cleanup(func() { verifyBranchAlreadyMerged, restartPolecatSession = oldVerify, oldRestart })
+
+				bdCalls := 0
+				bd, _ := mockBd(
+					func(args []string) (string, error) { bdCalls++; return "[]", nil },
+					func(args []string) error { bdCalls++; return nil },
+				)
+
+				z := &ZombieResult{PolecatName: "scavenger", HookBead: "ma-poc.4", Classification: ZombieSessionDeadActive}
+				handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "ma-poc.4", cleanup, z, DetectZombieOptions{NoRestart: true})
+
+				if restarts != 0 {
+					t.Errorf("restartPolecatSession called %d times, want 0", restarts)
+				}
+				if bdCalls != 0 {
+					t.Errorf("bd called %d times, want 0 (no wisp, no nuke)", bdCalls)
+				}
+				if want := restartSuppressedAction(ZombieSessionDeadActive); z.Action != want {
+					t.Errorf("action = %q, want %q", z.Action, want)
+				}
+				if z.CleanupStatus != cleanup {
+					t.Errorf("CleanupStatus = %q, want %q (still reported)", z.CleanupStatus, cleanup)
+				}
+				if z.Error != nil {
+					t.Errorf("unexpected error: %v", z.Error)
+				}
+			})
+		}
+	}
+}
+
+// TestHandleZombieRestart_RestartsByDefault pins the default: without NoRestart
+// the restart still happens.
+//
+// Not parallel: overrides package-level seams.
+func TestHandleZombieRestart_RestartsByDefault(t *testing.T) {
+	oldVerify, oldRestart := verifyBranchAlreadyMerged, restartPolecatSession
+	verifyBranchAlreadyMerged = func(workDir, rigName, polecatName string) (bool, error) { return false, nil }
+	restarts := 0
+	restartPolecatSession = func(workDir, rigName, polecatName string) error { restarts++; return nil }
+	t.Cleanup(func() { verifyBranchAlreadyMerged, restartPolecatSession = oldVerify, oldRestart })
+
+	bd, _ := mockBd(
+		func(args []string) (string, error) { return "[]", nil },
+		func(args []string) error { return nil },
+	)
+	z := &ZombieResult{PolecatName: "scavenger", HookBead: "ma-poc.4"}
+	handleZombieRestart(bd, t.TempDir(), "testrig", "scavenger", "ma-poc.4", "clean", z, DetectZombieOptions{})
+
+	if restarts != 1 {
+		t.Errorf("restartPolecatSession called %d times, want 1", restarts)
+	}
+	if z.Action != "restarted" {
+		t.Errorf("action = %q, want %q", z.Action, "restarted")
+	}
+}
+
+// TestDetectZombieDeadSession_DoneIntentNoRestart verifies NoRestart on the
+// done-intent branch of dead-session detection, which restarts directly rather
+// than through handleZombieRestart.
+//
+// Not parallel: overrides a package-level seam.
+func TestDetectZombieDeadSession_DoneIntentNoRestart(t *testing.T) {
+	for _, noRestart := range []bool{true, false} {
+		t.Run(fmt.Sprintf("noRestart=%v", noRestart), func(t *testing.T) {
+			oldRestart := restartPolecatSession
+			restarts := 0
+			restartPolecatSession = func(workDir, rigName, polecatName string) error { restarts++; return nil }
+			t.Cleanup(func() { restartPolecatSession = oldRestart })
+
+			bd, _ := mockBd(
+				func(args []string) (string, error) { return "[]", nil },
+				func(args []string) error { return nil },
+			)
+			intent := &DoneIntent{ExitType: "COMPLETED", Timestamp: time.Now().Add(-time.Hour)}
+			witCfg := config.DefaultOperationalConfig().GetWitnessConfig()
+
+			z, found := detectZombieDeadSession(bd, t.TempDir(), t.TempDir(), "testrig", "scavenger", "tr-scavenger",
+				nil, intent, time.Now(), witCfg, &agentBeadSnapshot{}, DetectZombieOptions{NoRestart: noRestart})
+
+			if !found {
+				t.Fatal("zombie not detected")
+			}
+			if z.Classification != ZombieDoneIntentDead {
+				t.Errorf("classification = %q, want %q", z.Classification, ZombieDoneIntentDead)
+			}
+			wantRestarts := 1
+			if noRestart {
+				wantRestarts = 0
+				if want := restartSuppressedAction(ZombieDoneIntentDead); z.Action != want {
+					t.Errorf("action = %q, want %q", z.Action, want)
+				}
+			}
+			if restarts != wantRestarts {
+				t.Errorf("restartPolecatSession called %d times, want %d", restarts, wantRestarts)
+			}
+		})
 	}
 }
