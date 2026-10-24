@@ -228,7 +228,7 @@ func (d *Daemon) reapIdleDogs(mgr *dog.Manager, sm *dog.SessionManager, daemonCf
 }
 
 // dispatchPlugins scans for plugins, evaluates cooldown gates, and dispatches
-// eligible plugins to idle dogs.
+// eligible plugins to idle dogs. Script plugins run in the daemon instead.
 func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsConfig *config.RigsConfig) {
 	// Get rig names for scanner
 	var rigNames []string
@@ -293,6 +293,12 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 			if count > 0 {
 				continue // Still in cooldown
 			}
+		}
+
+		// A script plugin needs no agent, so the daemon runs it itself.
+		if p.IsScript() {
+			d.startScriptPlugin(p, recorder)
+			continue
 		}
 
 		// Find an idle dog that doesn't already have a live tmux session.

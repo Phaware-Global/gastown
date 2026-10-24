@@ -162,6 +162,12 @@ type PluginFrontmatter struct {
 	Execution   *Execution `toml:"execution,omitempty"`
 }
 
+// IsScript returns true if the daemon runs this plugin's run.sh itself
+// instead of dispatching it to a dog.
+func (p *Plugin) IsScript() bool {
+	return p.Execution != nil && p.Execution.Type == ExecTypeScript && p.HasRunScript
+}
+
 // IsExecWrapper returns true if this plugin is an exec-wrapper type.
 func (p *Plugin) IsExecWrapper() bool {
 	return p.Execution != nil && p.Execution.Type == ExecTypeExecWrapper
