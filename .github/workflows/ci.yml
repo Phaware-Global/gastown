@@ -140,6 +140,30 @@ jobs:
         with:
           version: v2.11.4
           args: --timeout=5m
+          # `config verify` fetches its JSON schema from golangci-lint.run, and
+          # that fetch fails intermittently before any code is linted. Verify
+          # in a separate step below that fails on real config errors and only
+          # warns when the schema download fails.
+          verify: false
+
+      - name: golangci-lint config verify
+        # The action put golangci-lint on PATH. Only a failure to download the
+        # schema is tolerated (as a warning). Any other failure, such as a
+        # config that violates the schema, fails the job: `golangci-lint run`
+        # does not catch those, e.g. it silently ignores a misspelled key.
+        if: always()
+        run: |
+          if out=$(golangci-lint config verify 2>&1); then
+            echo "$out"
+          else
+            rc=$?
+            echo "$out"
+            if grep -q 'compile schema: failing loading' <<<"$out"; then
+              echo "::warning::golangci-lint config verify skipped: could not download its JSON schema"
+            else
+              exit "$rc"
+            fi
+          fi
 
   integration:
     name: Integration Tests
