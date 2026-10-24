@@ -308,7 +308,8 @@ func checkBackupHealth(townRoot string) *BackupHealth {
 	}
 
 	// JSONL git backup freshness. The dolt-archive plugin writes its git repo
-	// under the town root.
+	// to $HOME/gt/.dolt-archive/git, which is under the town root only on the
+	// default layout: its run.sh does not read GT_TOWN_ROOT.
 	gitRepo := filepath.Join(townRoot, ".dolt-archive", "git")
 	if _, err := os.Stat(filepath.Join(gitRepo, ".git")); err != nil {
 		bh.JSONLNote = "archive repo not found"
