@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -724,26 +725,13 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	d, err := mgr.Get(name)
-	if err != nil {
-		return fmt.Errorf("getting dog %s: %w", name, err)
+	// The state write goes first: plugin-mail cleanup makes serial bd calls
+	// (up to 120s each), and a process killed by the agent's tool timeout
+	// mid-cleanup must not leave the dog marked working.
+	cleared, err := completeDogDone(os.Stdout, mgr, name, func(clearedAt time.Time) { closePluginMailsBounded(name, clearedAt) })
+	if err != nil || !cleared {
+		return err
 	}
-
-	// Always close accumulated plugin mails, even if dog is already idle.
-	// Plugin dispatch mails accumulate across sessions and must be cleaned up
-	// regardless of current work state.
-	closePluginMails(name)
-
-	if d.State == dog.StateIdle && d.Work == "" {
-		fmt.Printf("Dog %s is already idle with no work\n", name)
-		return nil
-	}
-
-	if err := mgr.ClearWork(name); err != nil {
-		return fmt.Errorf("clearing work for dog %s: %w", name, err)
-	}
-
-	fmt.Printf("✓ Dog %s returned to kennel (idle)\n", name)
 
 	// Auto-terminate the tmux session after a short delay.
 	// Dogs run inside tmux sessions (hq-dog-<name>). Without this, the
@@ -764,7 +752,7 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 	// the tmux package which handles the socket name automatically.
 	go func() {
 		time.Sleep(3 * time.Second)
-		if err := t.KillSession(sessionID); err != nil {
+		if _, err := terminateDogSession(mgr, name, func() error { return t.KillSession(sessionID) }); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to kill session %s: %v\n", sessionID, err)
 		}
 	}()
@@ -773,6 +761,70 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 	time.Sleep(4 * time.Second)
 
 	return nil
+}
+
+// dogDoneStore is the slice of dog.Manager that completeDogDone needs.
+type dogDoneStore interface {
+	Get(name string) (*dog.Dog, error)
+	ClearWorkWithRetry(name string, attempts int, backoff time.Duration) error
+}
+
+// idleLocker is the slice of dog.Manager that terminateDogSession needs.
+type idleLocker interface {
+	WithIdleLock(name string, fn func() error) (bool, error)
+}
+
+// terminateDogSession runs kill only if the dog is still idle. Between going
+// idle and this point a dispatch may have assigned the dog a new job and
+// started its session, which the kill would take with it. The check and the
+// kill share the dog's lock, so no assignment can slip between them.
+func terminateDogSession(mgr idleLocker, name string, kill func() error) (killed bool, err error) {
+	return mgr.WithIdleLock(name, kill)
+}
+
+// completeDogDone returns the dog to idle, then runs the best-effort cleanup
+// with the moment the dog went idle, and reports whether it cleared work (so
+// the caller should end the session).
+// A failed state write is returned (so gt dog done exits non-zero) and nothing
+// is printed that claims success; cleanup does not run in that case.
+// An already-idle dog only gets the cleanup, as plugin mails accumulate
+// regardless of work state.
+func completeDogDone(out io.Writer, mgr dogDoneStore, name string, cleanup func(clearedAt time.Time)) (cleared bool, err error) {
+	d, err := mgr.Get(name)
+	if err != nil {
+		return false, fmt.Errorf("getting dog %s: %w", name, err)
+	}
+
+	if d.State == dog.StateIdle && d.Work == "" {
+		cleanup(time.Now())
+		_, _ = fmt.Fprintf(out, "Dog %s is already idle with no work\n", name)
+		return false, nil
+	}
+
+	if err := mgr.ClearWorkWithRetry(name, 3, 200*time.Millisecond); err != nil {
+		return false, fmt.Errorf("clearing work for dog %s (it is still marked working): %w", name, err)
+	}
+	clearedAt := time.Now()
+	_, _ = fmt.Fprintf(out, "✓ Dog %s returned to kennel (idle)\n", name)
+	cleanup(clearedAt)
+	return true, nil
+}
+
+// pluginMailCleanupBudget caps closePluginMailsBounded; the dog is already idle
+// by then, so abandoning a slow cleanup costs nothing.
+const pluginMailCleanupBudget = 20 * time.Second
+
+func closePluginMailsBounded(dogName string, before time.Time) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		closePluginMails(dogName, before)
+	}()
+	select {
+	case <-done:
+	case <-time.After(pluginMailCleanupBudget):
+		fmt.Fprintf(os.Stderr, "warning: plugin mail cleanup for dog %s still running after %s; continuing\n", dogName, pluginMailCleanupBudget)
+	}
 }
 
 func splitPathComponents(path string) []string {
@@ -785,27 +837,43 @@ func splitPathComponents(path string) []string {
 	})
 }
 
-// closePluginMails archives all open "Plugin: " dispatch mails from a dog's inbox.
+// closePluginMails archives the "Plugin: " dispatch mails from a dog's inbox
+// that were sent before the given time.
 // Plugin dispatch mails sent by the daemon accumulate because gt dog done never
 // closed them. On every UserPromptSubmit hook, gt mail check --inject re-injects
 // ALL open mails, causing context to balloon. This function cleans up eagerly.
 // It is best-effort: failures are logged but do not prevent dog from going idle.
-func closePluginMails(dogName string) {
+// The cutoff keeps a job dispatched after the dog went idle from losing its mail.
+func closePluginMails(dogName string, before time.Time) {
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil {
 		return // not in a Gas Town workspace, skip cleanup
 	}
 
-	dogAddress := fmt.Sprintf("deacon/dogs/%s", dogName)
 	router := mail.NewRouterWithTownRoot(townRoot, townRoot)
-	mailbox, err := router.GetMailbox(dogAddress)
+	mailbox, err := router.GetMailbox(fmt.Sprintf("deacon/dogs/%s", dogName))
 	if err != nil {
 		return
 	}
 
+	if closed := archivePluginMails(mailbox, dogName, before); closed > 0 {
+		fmt.Printf("  Closed %d stale plugin mail(s) from inbox\n", closed)
+	}
+}
+
+// pluginMailbox is the slice of mail.Mailbox that archivePluginMails needs.
+type pluginMailbox interface {
+	List() ([]*mail.Message, error)
+	Archive(id string) error
+}
+
+// archivePluginMails archives the dog's Deacon-dispatched "Plugin: " mails
+// timestamped before the cutoff and returns how many it archived.
+func archivePluginMails(mailbox pluginMailbox, dogName string, before time.Time) int {
+	dogAddress := fmt.Sprintf("deacon/dogs/%s", dogName)
 	messages, err := mailbox.List()
 	if err != nil {
-		return
+		return 0
 	}
 
 	closed := 0
@@ -824,14 +892,14 @@ func closePluginMails(dogName string) {
 		if sender != "deacon/" && sender != "daemon" {
 			continue
 		}
+		if !msg.Timestamp.Before(before) {
+			continue
+		}
 		if archErr := mailbox.Archive(msg.ID); archErr == nil {
 			closed++
 		}
 	}
-
-	if closed > 0 {
-		fmt.Printf("  Closed %d stale plugin mail(s) from inbox\n", closed)
-	}
+	return closed
 }
 
 func runDogStatus(cmd *cobra.Command, args []string) error {
