@@ -67,9 +67,11 @@ type BackupHealth struct {
 	DoltFreshness   string `json:"dolt_freshness,omitempty"`
 	DoltAgeSeconds  int    `json:"dolt_age_seconds,omitempty"`
 	DoltStale       bool   `json:"dolt_stale"`
+	DoltNote        string `json:"dolt_note,omitempty"`
 	JSONLFreshness  string `json:"jsonl_freshness,omitempty"`
 	JSONLAgeSeconds int    `json:"jsonl_age_seconds,omitempty"`
 	JSONLStale      bool   `json:"jsonl_stale"`
+	JSONLNote       string `json:"jsonl_note,omitempty"`
 }
 
 type ProcessHealth struct {
@@ -278,39 +280,50 @@ func checkPollution(port int) []PollutionRecord {
 	return records
 }
 
+// Backup staleness thresholds, each at least twice its plugin's cooldown so a
+// backup that is merely between runs is not reported stale.
+const (
+	// doltBackupStaleAfter: plugins/dolt-backup runs on a 15m cooldown.
+	doltBackupStaleAfter = 30 * time.Minute
+	// jsonlArchiveStaleAfter: plugins/dolt-archive runs on a 1h cooldown and
+	// commits roughly hourly, so a 30m threshold would read stale half of
+	// every hour.
+	jsonlArchiveStaleAfter = 2*time.Hour + 30*time.Minute
+)
+
 func checkBackupHealth(townRoot string) *BackupHealth {
 	bh := &BackupHealth{}
 
 	// Dolt filesystem backup freshness.
 	backupDir := filepath.Join(townRoot, ".dolt-backup")
-	if _, err := os.Stat(backupDir); err == nil {
-		newest := findNewestFile(backupDir)
-		if !newest.IsZero() {
-			age := time.Since(newest)
-			bh.DoltAgeSeconds = int(age.Seconds())
-			bh.DoltFreshness = age.Round(time.Second).String()
-			bh.DoltStale = age > 30*time.Minute
-		}
+	if _, err := os.Stat(backupDir); err != nil {
+		bh.DoltNote = "backup directory not found"
+	} else if newest := findNewestFile(backupDir); newest.IsZero() {
+		bh.DoltNote = "no files in backup directory"
+	} else {
+		age := time.Since(newest)
+		bh.DoltAgeSeconds = int(age.Seconds())
+		bh.DoltFreshness = age.Round(time.Second).String()
+		bh.DoltStale = age > doltBackupStaleAfter
 	}
 
-	// JSONL git backup freshness.
-	homeDir, err := os.UserHomeDir()
-	if err == nil {
-		gitRepo := filepath.Join(homeDir, ".dolt-archive", "git")
-		if _, err := os.Stat(filepath.Join(gitRepo, ".git")); err == nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, "git", "-C", gitRepo, "log", "-1", "--format=%ci")
-			output, err := cmd.Output()
-			if err == nil {
-				commitTimeStr := strings.TrimSpace(string(output))
-				if commitTime, err := time.Parse("2006-01-02 15:04:05 -0700", commitTimeStr); err == nil {
-					age := time.Since(commitTime)
-					bh.JSONLAgeSeconds = int(age.Seconds())
-					bh.JSONLFreshness = age.Round(time.Second).String()
-					bh.JSONLStale = age > 30*time.Minute
-				}
-			}
+	// JSONL git backup freshness. The dolt-archive plugin writes its git repo
+	// under the town root.
+	gitRepo := filepath.Join(townRoot, ".dolt-archive", "git")
+	if _, err := os.Stat(filepath.Join(gitRepo, ".git")); err != nil {
+		bh.JSONLNote = "archive repo not found"
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		output, err := exec.CommandContext(ctx, "git", "-C", gitRepo, "log", "-1", "--format=%ci").Output()
+		commitTime, perr := time.Parse("2006-01-02 15:04:05 -0700", strings.TrimSpace(string(output)))
+		if err != nil || perr != nil {
+			bh.JSONLNote = "archive repo has no readable commits"
+		} else {
+			age := time.Since(commitTime)
+			bh.JSONLAgeSeconds = int(age.Seconds())
+			bh.JSONLFreshness = age.Round(time.Second).String()
+			bh.JSONLStale = age > jsonlArchiveStaleAfter
 		}
 	}
 
@@ -341,6 +354,13 @@ func checkOrphanDBs(townRoot string) []OrphanDB {
 		})
 	}
 	return results
+}
+
+func noteOrNotFound(note string) string {
+	if note == "" {
+		return "not found"
+	}
+	return note
 }
 
 func printHealthReport(r *HealthReport) {
@@ -390,7 +410,7 @@ func printHealthReport(r *HealthReport) {
 		}
 		fmt.Printf("  %s Dolt filesystem: %s ago\n", icon, r.Backups.DoltFreshness)
 	} else {
-		fmt.Printf("  %s Dolt filesystem: not found\n", style.Dim.Render("○"))
+		fmt.Printf("  %s Dolt filesystem: %s\n", style.Dim.Render("○"), noteOrNotFound(r.Backups.DoltNote))
 	}
 	if r.Backups.JSONLFreshness != "" {
 		icon := style.Bold.Render("✓")
@@ -399,7 +419,7 @@ func printHealthReport(r *HealthReport) {
 		}
 		fmt.Printf("  %s JSONL git: %s ago\n", icon, r.Backups.JSONLFreshness)
 	} else {
-		fmt.Printf("  %s JSONL git: not found\n", style.Dim.Render("○"))
+		fmt.Printf("  %s JSONL git: %s\n", style.Dim.Render("○"), noteOrNotFound(r.Backups.JSONLNote))
 	}
 
 	// 5. Processes
