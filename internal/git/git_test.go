@@ -3502,3 +3502,108 @@ func TestGhPrReviews_Validation(t *testing.T) {
 		t.Error("expected error for a non-positive PR number")
 	}
 }
+
+// TestPushAndRemoteQueries_QualifyBareBranch pins that a bare branch name
+// always means refs/heads/<name>: a same-named tag neither hijacks the push nor
+// satisfies the remote lookups, and a name beginning with '-' is never parsed as
+// an option.
+func TestPushAndRemoteQueries_QualifyBareBranch(t *testing.T) {
+	localDir, remoteDir, _ := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	const name = "release"
+
+	// Tag at the initial commit, then a branch of the same name one commit ahead.
+	runGit(t, localDir, "tag", name)
+	runGit(t, localDir, "checkout", "-b", name)
+	if err := os.WriteFile(filepath.Join(localDir, "work.go"), []byte("package work\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	runGit(t, localDir, "add", "work.go")
+	runGit(t, localDir, "commit", "-m", "branch work")
+	head, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev: %v", err)
+	}
+
+	// An ambiguous bare name warns and, unqualified, may resolve to the tag.
+	if err := g.Push("origin", name, false); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	branchTip, err := exec.Command("git", "-C", remoteDir, "rev-parse", "refs/heads/"+name).Output()
+	if err != nil || strings.TrimSpace(string(branchTip)) != head {
+		t.Fatalf("remote refs/heads/%s = %q (err %v), want %s", name, branchTip, err, head)
+	}
+	if out, _ := exec.Command("git", "-C", remoteDir, "tag", "-l", name).Output(); strings.TrimSpace(string(out)) != "" {
+		t.Errorf("Push of a bare branch name created tag %q on the remote", out)
+	}
+
+	pushed, unpushed, err := g.BranchPushedToRemote(name, "origin")
+	if err != nil || !pushed || unpushed != 0 {
+		t.Errorf("BranchPushedToRemote = (%v, %d, %v), want (true, 0, nil)", pushed, unpushed, err)
+	}
+
+	// Only a tag of that name exists on the remote: it is not a pushed branch.
+	runGit(t, localDir, "tag", "tag-only")
+	runGit(t, localDir, "push", "origin", "refs/tags/tag-only")
+	if exists, err := g.RemoteBranchExists("origin", "tag-only"); err != nil || exists {
+		t.Errorf("RemoteBranchExists(tag-only) = (%v, %v), want (false, nil)", exists, err)
+	}
+	if tip, err := g.RemoteBranchTip("origin", "tag-only"); err != nil || tip != "" {
+		t.Errorf("RemoteBranchTip(tag-only) = (%q, %v), want empty", tip, err)
+	}
+
+	// A nested ref must not satisfy a lookup for its tail component.
+	runGit(t, localDir, "push", "origin", "HEAD:refs/heads/team/only-nested")
+	if exists, err := g.RemoteBranchExists("origin", "only-nested"); err != nil || exists {
+		t.Errorf("RemoteBranchExists(only-nested) = (%v, %v), want (false, nil)", exists, err)
+	}
+
+	// Option-shaped names are refused or inert, never read as flags.
+	if err := g.Push("origin", "--delete", false); err == nil {
+		t.Error("Push of an option-shaped name must be refused")
+	}
+
+	// A leading '+' is a branch name, not a forced refspec: Push("+victim") must
+	// not force-update the remote's diverged "victim" branch.
+	const victim = "victim"
+	remoteTip := func(ref string) string {
+		out, _ := exec.Command("git", "-C", remoteDir, "rev-parse", "--verify", "-q", ref).Output()
+		return strings.TrimSpace(string(out))
+	}
+	runGit(t, localDir, "checkout", "-b", victim)
+	if err := g.Push("origin", victim, false); err != nil {
+		t.Fatalf("Push(%s): %v", victim, err)
+	}
+	runGit(t, localDir, "commit", "--amend", "-m", "diverged from the remote's victim")
+	before := remoteTip("refs/heads/" + victim)
+	runGit(t, localDir, "checkout", "-b", "+"+victim)
+	if err := g.Push("origin", "+"+victim, false); err != nil {
+		t.Fatalf("Push(+%s): %v", victim, err)
+	}
+	if after := remoteTip("refs/heads/" + victim); after != before {
+		t.Errorf("Push(+%s, force=false) force-updated remote refs/heads/%s: %s -> %s", victim, victim, before, after)
+	}
+	if remoteTip("refs/heads/+"+victim) == "" {
+		t.Errorf("remote refs/heads/+%s missing after Push", victim)
+	}
+
+	// An explicit '+' refspec is refused rather than forced through.
+	if err := g.Push("origin", "+HEAD:refs/heads/"+victim, false); err == nil {
+		t.Error("Push of a '+' refspec must be refused")
+	}
+	if after := remoteTip("refs/heads/" + victim); after != before {
+		t.Errorf("refused '+' refspec moved remote refs/heads/%s: %s -> %s", victim, before, after)
+	}
+
+	// A mid-name '+' is an ordinary branch character and is qualified.
+	runGit(t, localDir, "checkout", "-b", "feat+x")
+	if err := g.Push("origin", "feat+x", false); err != nil {
+		t.Fatalf("Push(feat+x): %v", err)
+	}
+	if remoteTip("refs/heads/feat+x") == "" {
+		t.Error("remote refs/heads/feat+x missing after Push(feat+x)")
+	}
+	if exists, err := g.RemoteBranchExists("origin", "--exit-code"); err != nil || exists {
+		t.Errorf("RemoteBranchExists(--exit-code) = (%v, %v), want (false, nil)", exists, err)
+	}
+}
