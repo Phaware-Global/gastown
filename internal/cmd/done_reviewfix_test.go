@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
@@ -165,4 +166,90 @@ func TestResolveReviewFixMRLookup(t *testing.T) {
 			t.Errorf("refineryOwnsMerge = true, want false — gt-c9z7 is not this MR's source_issue, so it must still be force-closed")
 		}
 	})
+}
+
+func TestVerifyReviewFixTarget(t *testing.T) {
+	const (
+		branch = "polecat/keeper/gt-q7wrn@abc"
+		head   = "1111111111111111111111111111111111111111"
+		other  = "2222222222222222222222222222222222222222"
+	)
+	probe := func(n int, findErr error, prHead string, shaErr error) reviewFixPRProbe {
+		return reviewFixPRProbe{
+			findPRNumber: func(string) (int, error) { return n, findErr },
+			prHeadSHA:    func(int) (string, error) { return prHead, shaErr },
+		}
+	}
+	tests := []struct {
+		name         string
+		reviewBranch string
+		probe        reviewFixPRProbe
+		wantErr      bool
+	}{
+		{"branch is the PR's branch", "", probe(346, nil, other, nil), false},
+		{"delivered to PR branch: no PR on own branch, head matches", "", probe(0, nil, head, nil), false},
+		{"head match is case-insensitive", "", probe(0, nil, strings.ToUpper(head), nil), false},
+		{"no PR on branch and head differs refuses", "", probe(0, nil, other, nil), true},
+		{"no PR on branch and head unreadable refuses", "", probe(0, nil, "", errors.New("gh: 502")), true},
+		{"branch on a different PR refuses even if head matches", "", probe(99, nil, head, nil), true},
+		{"gh down, review_branch matches", branch, probe(0, errors.New("offline"), "", errors.New("offline")), false},
+		{"gh down, no review_branch refuses", "", probe(0, errors.New("offline"), "", errors.New("offline")), true},
+		{"gh down, review_branch differs refuses", "other", probe(0, errors.New("offline"), "", errors.New("offline")), true},
+		{"branch lookup fails but head matches", "", probe(0, errors.New("flaky"), head, nil), false},
+	}
+	for _, tt := range tests {
+		err := verifyReviewFixTarget(branch, head, tt.reviewBranch, 346, tt.probe)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("%s: err = %v, wantErr %v", tt.name, err, tt.wantErr)
+		}
+	}
+	if err := verifyReviewFixTarget(branch, "", "", 346, probe(0, nil, head, nil)); err == nil {
+		t.Error("empty local HEAD must not match a PR head")
+	}
+	// Both sides empty compare equal as strings; the headSHA != "" guard is
+	// all that stops that counting as a delivered fix.
+	if err := verifyReviewFixTarget(branch, "", "", 346, probe(0, nil, "", nil)); err == nil {
+		t.Error("empty PR head and empty local HEAD must refuse, not match")
+	}
+}
+
+// fakeReviewFixMRStore serves one MR bead and records any write attempted
+// against it. The production interface exposes no write, so the Update method
+// exists only to catch a regression that widens it.
+type fakeReviewFixMRStore struct {
+	mr      *beads.Issue
+	findErr error
+	updates []string
+}
+
+func (f *fakeReviewFixMRStore) FindMRForReviewPR(int) (*beads.Issue, error) { return f.mr, f.findErr }
+
+func (f *fakeReviewFixMRStore) Update(id string, _ beads.UpdateOptions) error {
+	f.updates = append(f.updates, id)
+	return nil
+}
+
+// await-review detects a pushed fix by comparing the MR bead's commit_sha with
+// the PR's live head, so a review-fix completion must leave commit_sha as it
+// found it.
+func TestCompleteReviewFixMRLeavesCommitSHA(t *testing.T) {
+	const desc = "branch: polecat/x\ntarget: main\nsource_issue: gt-q7wrn\nreview_pr: 346\ncommit_sha: aaaa"
+	store := &fakeReviewFixMRStore{mr: &beads.Issue{ID: "gt-wisp-mr", Description: desc}}
+
+	got, err := completeReviewFixMR(store, 346, "gt-q7wrn", "polecat/x")
+	if err != nil {
+		t.Fatalf("completeReviewFixMR: %v", err)
+	}
+	if got.mrID != "gt-wisp-mr" || !got.refineryOwnsMerge || got.mrFailed {
+		t.Errorf("result = %+v, want the live MR found, owned by the refinery, not failed", got)
+	}
+	if len(store.updates) != 0 {
+		t.Errorf("MR bead written %v, want no writes", store.updates)
+	}
+	if store.mr.Description != desc {
+		t.Errorf("MR description changed to %q", store.mr.Description)
+	}
+	if f := beads.ParseMRFields(store.mr); f == nil || f.CommitSHA != "aaaa" {
+		t.Errorf("commit_sha = %+v, want aaaa left unchanged", f)
+	}
 }
