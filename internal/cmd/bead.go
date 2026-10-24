@@ -181,8 +181,7 @@ func runBeadMove(cmd *cobra.Command, args []string) error {
 
 	// Create the new bead
 	createCmd := exec.Command("bd", createArgs...)
-	createCmd.Stderr = os.Stderr
-	newIDBytes, err := createCmd.Output()
+	newIDBytes, err := beads.OutputRelayed(createCmd)
 	if err != nil {
 		return fmt.Errorf("creating new bead: %w", err)
 	}
@@ -193,8 +192,7 @@ func runBeadMove(cmd *cobra.Command, args []string) error {
 	// Close the source bead with reference
 	closeReason := fmt.Sprintf("Moved to %s", newID)
 	closeCmd := exec.Command("bd", "close", sourceID, "--reason", closeReason)
-	closeCmd.Stderr = os.Stderr
-	if err := closeCmd.Run(); err != nil {
+	if err := beads.RunRelayed(closeCmd); err != nil {
 		// Clean up the new bead since we couldn't close the source
 		fmt.Fprintf(os.Stderr, "Warning: failed to close source bead: %v\n", err)
 		cleanupCmd := exec.Command("bd", "close", newID, "--reason", "Cleanup: source bead close failed during move")

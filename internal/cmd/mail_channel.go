@@ -507,7 +507,7 @@ func listChannelMessages(townRoot, channelName string) ([]channelMessage, error)
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
+		errMsg := beads.RedirectDoltStartHint(strings.TrimSpace(stderr.String()))
 		if errMsg != "" {
 			return nil, fmt.Errorf("%s", errMsg)
 		}

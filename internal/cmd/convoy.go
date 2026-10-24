@@ -468,7 +468,7 @@ func runBdJSONWithOptions(dir string, allowStale bool, args ...string) ([]byte, 
 	cmd.Stdout = &stdout
 
 	if err := cmd.Run(); err != nil {
-		if errMsg := strings.TrimSpace(stderr.String()); errMsg != "" {
+		if errMsg := beads.RedirectDoltStartHint(strings.TrimSpace(stderr.String())); errMsg != "" {
 			return nil, fmt.Errorf("bd %s: %s", args[0], errMsg)
 		}
 		return nil, fmt.Errorf("bd %s: %w", args[0], err)
@@ -731,7 +731,7 @@ func runConvoyCreate(cmd *cobra.Command, args []string) error {
 		Dir(townBeads).
 		Stderr(&stderr).
 		Run(); err != nil {
-		return fmt.Errorf("creating convoy: %w (%s)", err, strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("creating convoy: %w (%s)", err, beads.RedirectDoltStartHint(strings.TrimSpace(stderr.String())))
 	}
 
 	// Notify address is stored in description (line 166-168) and read from there

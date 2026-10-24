@@ -1326,7 +1326,7 @@ func sendHandoffMail(subject, message string) (string, error) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
+		errMsg := beads.RedirectDoltStartHint(strings.TrimSpace(stderr.String()))
 		if errMsg != "" {
 			return "", fmt.Errorf("creating handoff mail: %s", errMsg)
 		}
@@ -1450,8 +1450,7 @@ func hookBeadForHandoff(beadID string) error {
 
 	// Pin the bead using bd update (discovery-based approach)
 	pinCmd := exec.Command("bd", "update", beadID, "--status=pinned", "--assignee="+agentID)
-	pinCmd.Stderr = os.Stderr
-	if err := pinCmd.Run(); err != nil {
+	if err := beads.RunRelayed(pinCmd); err != nil {
 		return fmt.Errorf("pinning bead: %w", err)
 	}
 

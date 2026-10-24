@@ -190,7 +190,7 @@ func listUnclaimedQueueMessages(beadsDir, queueName string) ([]queueMessage, err
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
+		errMsg := beads.RedirectDoltStartHint(strings.TrimSpace(stderr.String()))
 		if errMsg != "" {
 			return nil, fmt.Errorf("%s", errMsg)
 		}
@@ -273,7 +273,7 @@ func claimQueueMessage(beadsDir, messageID, claimant string) error {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
+		errMsg := beads.RedirectDoltStartHint(strings.TrimSpace(stderr.String()))
 		if errMsg != "" {
 			return fmt.Errorf("%s", errMsg)
 		}
@@ -351,7 +351,7 @@ func getQueueMessageInfo(beadsDir, messageID string) (*queueMessageInfo, error) 
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
+		errMsg := beads.RedirectDoltStartHint(strings.TrimSpace(stderr.String()))
 		if strings.Contains(errMsg, "not found") {
 			return nil, fmt.Errorf("message not found: %s", messageID)
 		}
@@ -435,7 +435,7 @@ func releaseQueueMessage(beadsDir, messageID, actor string) error {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
+		errMsg := beads.RedirectDoltStartHint(strings.TrimSpace(stderr.String()))
 		if errMsg != "" && !strings.Contains(errMsg, "does not have label") {
 			return fmt.Errorf("%s", errMsg)
 		}
