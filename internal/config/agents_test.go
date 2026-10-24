@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -48,6 +49,13 @@ func TestBuiltinPresets(t *testing.T) {
 		// All presets should have ProcessNames for agent detection
 		if len(info.ProcessNames) == 0 {
 			t.Errorf("preset %s has empty ProcessNames", preset)
+		}
+
+		switch preset {
+		case AgentClaude, AgentCodex, AgentOpenCode:
+			if !reflect.DeepEqual(info, builtinPresets[preset]) {
+				t.Errorf("preset %s differs from builtin: got %+v, want %+v", preset, info, builtinPresets[preset])
+			}
 		}
 	}
 }
@@ -276,7 +284,7 @@ func TestGetProcessNamesRespectsRegistryOverride(t *testing.T) {
 }
 
 func TestResolveProcessNames(t *testing.T) {
-	t.Parallel()
+	// Registry overrides must finish and reset before parallel preset readers run.
 	ResetRegistryForTesting()
 	t.Cleanup(ResetRegistryForTesting)
 
