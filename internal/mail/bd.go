@@ -118,7 +118,7 @@ func runBdCommand(ctx context.Context, args []string, workDir, beadsDir string, 
 	if runErr != nil {
 		return nil, &bdError{
 			Err:    runErr,
-			Stderr: strings.TrimSpace(stderr.String()),
+			Stderr: beads.RedirectDoltStartHint(strings.TrimSpace(stderr.String())),
 		}
 	}
 

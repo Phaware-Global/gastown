@@ -335,8 +335,7 @@ func runHook(_ *cobra.Command, args []string) error {
 						closeArgs = append(closeArgs, "--session="+sessionID)
 					}
 					closeCmd := exec.Command("bd", closeArgs...)
-					closeCmd.Stderr = os.Stderr
-					if err := closeCmd.Run(); err != nil {
+					if err := beads.RunRelayed(closeCmd); err != nil {
 						return fmt.Errorf("closing completed bead %s: %w", existing.ID, err)
 					}
 				} else {

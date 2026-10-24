@@ -638,7 +638,7 @@ func PurgeClosedEphemerals(townRoot, dbName string, dryRun bool) (int, error) {
 		return 0, fmt.Errorf("bd purge for %s: timed out after 60s", dbName)
 	}
 	if err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
+		errMsg := beads.RedirectDoltStartHint(strings.TrimSpace(stderr.String()))
 		if errMsg == "" {
 			errMsg = strings.TrimSpace(stdout.String())
 		}

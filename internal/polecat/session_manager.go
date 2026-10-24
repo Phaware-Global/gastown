@@ -1251,8 +1251,7 @@ func (m *SessionManager) hookIssue(issueID, agentID, workDir string) error {
 	cmd := exec.CommandContext(ctx, "bd", "update", issueID, "--status=hooked", "--assignee="+agentID) //nolint:gosec // G204: bd is a trusted internal tool
 	util.SetDetachedProcessGroup(cmd)
 	cmd.Dir = bdWorkDir
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	if err := beads.RunRelayed(cmd); err != nil {
 		return fmt.Errorf("bd update failed: %w", err)
 	}
 	fmt.Printf("✓ Hooked issue %s to %s\n", issueID, agentID)
