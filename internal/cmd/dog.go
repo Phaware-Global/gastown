@@ -320,6 +320,39 @@ func getDogManager() (*dog.Manager, error) {
 	return dog.NewManager(townRoot, rigsConfig), nil
 }
 
+// newDogTimeoutResolver returns a func mapping a dog's work string to its
+// timeout. Plugin work uses the plugin's [execution] timeout; anything that
+// cannot be resolved (not a plugin, plugin gone, no workspace) gets
+// dog.DefaultWorkTimeout, so timing output never fails the command.
+func newDogTimeoutResolver() func(work string) time.Duration {
+	var scanner *plugin.Scanner
+	if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+		var rigNames []string
+		if rigsConfig, err := config.LoadRigsConfig(filepath.Join(townRoot, "mayor", "rigs.json")); err == nil {
+			for rigName := range rigsConfig.Rigs {
+				rigNames = append(rigNames, rigName)
+			}
+		}
+		scanner = plugin.NewScanner(townRoot, rigNames)
+	}
+
+	lookup := func(name string) (time.Duration, bool) {
+		if scanner == nil {
+			return 0, false
+		}
+		p, err := scanner.GetPlugin(name)
+		if err != nil || p.Execution == nil || p.Execution.Timeout == "" {
+			return 0, false
+		}
+		d, err := time.ParseDuration(p.Execution.Timeout)
+		return d, err == nil
+	}
+
+	return func(work string) time.Duration {
+		return dog.ResolveWorkTimeout(work, lookup)
+	}
+}
+
 func runDogAdd(cmd *cobra.Command, args []string) error {
 	name := args[0]
 
@@ -444,6 +477,50 @@ func runDogRemove(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// dogListItem is one entry of `gt dog list --json`.
+type dogListItem struct {
+	Name          string            `json:"name"`
+	State         dog.State         `json:"state"`
+	Work          string            `json:"work,omitempty"`
+	WorkStartedAt *time.Time        `json:"work_started_at,omitempty"`
+	LastActive    time.Time         `json:"last_active"`
+	Worktrees     map[string]string `json:"worktrees,omitempty"`
+	// Present only while working: elapsed/timeout computed here so callers
+	// never subtract timestamps themselves.
+	*dog.WorkTiming
+}
+
+func buildDogListItems(dogs []*dog.Dog, timeoutFor func(work string) time.Duration, now time.Time) []dogListItem {
+	items := make([]dogListItem, 0, len(dogs))
+	for _, d := range dogs {
+		item := dogListItem{
+			Name:       d.Name,
+			State:      d.State,
+			Work:       d.Work,
+			LastActive: d.LastActive,
+			Worktrees:  d.Worktrees,
+		}
+		if !d.WorkStartedAt.IsZero() {
+			t := d.WorkStartedAt
+			item.WorkStartedAt = &t
+		}
+		item.WorkTiming = dog.TimingFor(d, timeoutFor(d.Work), now)
+		items = append(items, item)
+	}
+	return items
+}
+
+// dogStatusOutput is `gt dog status <name> --json`: the dog's own fields,
+// unchanged, plus WorkTiming while it is working.
+type dogStatusOutput struct {
+	*dog.Dog
+	*dog.WorkTiming
+}
+
+func buildDogStatusOutput(d *dog.Dog, timeoutFor func(work string) time.Duration, now time.Time) dogStatusOutput {
+	return dogStatusOutput{Dog: d, WorkTiming: dog.TimingFor(d, timeoutFor(d.Work), now)}
+}
+
 func runDogList(cmd *cobra.Command, args []string) error {
 	mgr, err := getDogManager()
 	if err != nil {
@@ -465,30 +542,7 @@ func runDogList(cmd *cobra.Command, args []string) error {
 	}
 
 	if dogListJSON {
-		type DogListItem struct {
-			Name          string            `json:"name"`
-			State         dog.State         `json:"state"`
-			Work          string            `json:"work,omitempty"`
-			WorkStartedAt *time.Time        `json:"work_started_at,omitempty"`
-			LastActive    time.Time         `json:"last_active"`
-			Worktrees     map[string]string `json:"worktrees,omitempty"`
-		}
-
-		var items []DogListItem
-		for _, d := range dogs {
-			item := DogListItem{
-				Name:       d.Name,
-				State:      d.State,
-				Work:       d.Work,
-				LastActive: d.LastActive,
-				Worktrees:  d.Worktrees,
-			}
-			if !d.WorkStartedAt.IsZero() {
-				t := d.WorkStartedAt
-				item.WorkStartedAt = &t
-			}
-			items = append(items, item)
-		}
+		items := buildDogListItems(dogs, newDogTimeoutResolver(), time.Now())
 
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -805,7 +859,7 @@ func showDogStatus(mgr *dog.Manager, name string) error {
 	if dogStatusJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(d)
+		return enc.Encode(buildDogStatusOutput(d, newDogTimeoutResolver(), time.Now()))
 	}
 
 	fmt.Printf("Dog: %s\n\n", style.Bold.Render(d.Name))
