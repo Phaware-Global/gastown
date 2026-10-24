@@ -2,6 +2,7 @@ package doltserver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -129,6 +130,15 @@ func AddRemote(dbDir, org, repo string) error {
 // remote if repo creation failed, can't push if the remote wasn't added).
 func SetupDoltHubRemote(dbDir, org, dbName, token string) error {
 	repo := DoltHubRepoName(dbName)
+
+	// Step 0: Clear the push guard before creating anything. The initial push
+	// below is refused for any destination the guard cannot confirm private,
+	// and DoltHub repos can never be confirmed, so creating the repo and the
+	// remote first would leave both behind for a push that cannot happen.
+	remoteURL := DoltHubRemoteURL(org, repo)
+	if allowed, reason := remotePushAllowed(context.Background(), remoteURL); !allowed {
+		return fmt.Errorf("REFUSED: %s: DoltHub remotes are not allowed for town databases (%s); no DoltHub repo or Dolt remote was created", dbName, reason)
+	}
 
 	// Step 1: Create the DoltHub repo
 	if err := CreateDoltHubRepo(org, repo, token); err != nil {
