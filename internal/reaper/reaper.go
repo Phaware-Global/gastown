@@ -1497,3 +1497,25 @@ func FormatJSON(v interface{}) string {
 	}
 	return string(data)
 }
+
+// NotAgentWispJoin exposes notAgentWispJoin so other wisp scanners (gt
+// compact) apply the identical agent-identity exclusion instead of copying it.
+func NotAgentWispJoin(alias string) (joinClause, whereCondition string) {
+	return notAgentWispJoin(alias)
+}
+
+// PurgeableMRWispJoin exposes purgeableMRWispJoin. The join defines mr_wl,
+// which is non-null for merge-request wisps; the condition holds for any
+// non-MR wisp and for an MR wisp that closed as merged or has been closed for
+// MRWispMinPurgeAge.
+func PurgeableMRWispJoin(alias string) (joinClause, whereCondition string) {
+	return purgeableMRWispJoin(alias)
+}
+
+// ParentExcludeJoin exposes the has_parent and open_parent joins of
+// parentExcludeJoin so other scanners read parentage from the same SQL as the
+// reaper. The returned condition is the reaper's own candidate test; callers
+// that only need the has_parent / open_parent flags may ignore it.
+func ParentExcludeJoin(dbName string) (joinClause, whereCondition string) {
+	return parentExcludeJoin(dbName)
+}

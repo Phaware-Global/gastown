@@ -404,6 +404,48 @@ func TestRunWeeklyRollupStopsBeforeMailWhenAuditCloseFails(t *testing.T) {
 	assertNoMailSent(t, mailLog)
 }
 
+// TestRunDailyDigestDryRunDoesNotMutate pins that a previewed digest runs the
+// compaction it reports on as a dry run: a real compaction deletes wisps, and
+// wisps are dolt-ignored so the deletes cannot be recovered.
+func TestRunDailyDigestDryRunDoesNotMutate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script command stubs not supported on Windows")
+	}
+	mailLog := setupCompactReportCommandStubs(t)
+	resetCompactReportFlags(t)
+	compactReportDryRun = true
+	compactReportDate = "2026-05-15"
+
+	if err := runDailyDigest(); err != nil {
+		t.Fatalf("runDailyDigest dry-run: %v", err)
+	}
+	data, err := os.ReadFile(mailLog + ".compact")
+	if err != nil {
+		t.Fatalf("fake gt never saw a compact call: %v", err)
+	}
+	if !strings.Contains(string(data), "--dry-run") {
+		t.Fatalf("digest --dry-run ran a real compaction: gt %s", strings.TrimSpace(string(data)))
+	}
+}
+
+func TestRunDailyDigestRunsRealCompactionWhenNotDryRun(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script command stubs not supported on Windows")
+	}
+	mailLog := setupCompactReportCommandStubs(t)
+	resetCompactReportFlags(t)
+	compactReportDate = "2026-05-15"
+
+	_ = runDailyDigest() // fails at the audit close; only the compact call matters
+	data, err := os.ReadFile(mailLog + ".compact")
+	if err != nil {
+		t.Fatalf("fake gt never saw a compact call: %v", err)
+	}
+	if strings.Contains(string(data), "--dry-run") {
+		t.Fatalf("real digest must not dry-run the compaction: gt %s", strings.TrimSpace(string(data)))
+	}
+}
+
 func resetCompactReportFlags(t *testing.T) {
 	oldDryRun := compactReportDryRun
 	oldWeekly := compactReportWeekly
@@ -433,7 +475,7 @@ func setupCompactReportCommandStubs(t *testing.T) string {
 
 	bdScript := `#!/bin/sh
 case "$1" in
-  list)
+  list|sql)
     printf '[]\n'
     ;;
   create)
@@ -455,6 +497,7 @@ esac
 
 	gtScript := `#!/bin/sh
 if [ "$1" = "compact" ]; then
+  echo "$*" >> "$MAIL_LOG.compact"
   printf '{"promoted":[],"deleted":[],"skipped":0}\n'
   exit 0
 fi
