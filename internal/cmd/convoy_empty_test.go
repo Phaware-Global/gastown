@@ -91,6 +91,7 @@ func TestCheckSingleConvoy_EmptyConvoyDoesNotAutoClose(t *testing.T) {
 	// no tracked issues), closeConvoyIfComplete must NOT auto-close. A 0/0 result
 	// means "could not resolve", not "all done". (GH#hq-439)
 	_, townBeads, closeLogPath := mockBdForConvoyTest(t, "hq-empty1", "Empty test convoy")
+	recordConvoyGT(t) // a regression that auto-closes would notify
 
 	err := checkSingleConvoy(townBeads, "hq-empty1", false)
 	if err != nil {
@@ -106,6 +107,7 @@ func TestCheckSingleConvoy_EmptyConvoyDoesNotAutoClose(t *testing.T) {
 
 func TestCheckSingleConvoy_EmptyConvoyDryRun(t *testing.T) {
 	_, townBeads, closeLogPath := mockBdForConvoyTest(t, "hq-empty2", "Dry run convoy")
+	recordConvoyGT(t) // a regression that closes in dry-run would notify
 
 	err := checkSingleConvoy(townBeads, "hq-empty2", true)
 	if err != nil {
