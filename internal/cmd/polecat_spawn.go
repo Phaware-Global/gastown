@@ -258,18 +258,8 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	// just because the rig is already at the directory cap.
 	maxPolecatDirsPerRig := polecat.EffectivePolecatDirCap(r.GetIntConfig("max_polecats"))
 	rigPolecatDir := filepath.Join(townRoot, rigName, "polecats")
-	if entries, err := os.ReadDir(rigPolecatDir); err == nil {
-		dirCount := 0
-		for _, e := range entries {
-			if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
-				dirCount++
-			}
-		}
-		if dirCount >= maxPolecatDirsPerRig {
-			return nil, fmt.Errorf("rig %s has %d polecat directories (max %d). "+
-				"Resolve recovery-needed polecats before allocating more slots: gt polecat list %s",
-				rigName, dirCount, maxPolecatDirsPerRig, rigName)
-		}
+	if err := polecat.CheckDirCap(rigName, rigPolecatDir, maxPolecatDirsPerRig); err != nil {
+		return nil, err
 	}
 
 	// Determine base branch for polecat worktree.
