@@ -5,6 +5,7 @@ package util
 import (
 	"os/exec"
 	"syscall"
+	"time"
 )
 
 // SetProcessGroup configures a command to run in its own process group
@@ -21,5 +22,11 @@ func SetProcessGroup(cmd *exec.Cmd) {
 
 // SetDetachedProcessGroup is the same as SetProcessGroup on Windows.
 func SetDetachedProcessGroup(cmd *exec.Cmd) {
+	SetProcessGroup(cmd)
+}
+
+// SetGracefulProcessGroup is SetProcessGroup on Windows, which has no SIGTERM
+// to send first; cancellation kills the process.
+func SetGracefulProcessGroup(cmd *exec.Cmd, _ time.Duration) {
 	SetProcessGroup(cmd)
 }

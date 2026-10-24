@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"os"
@@ -429,6 +430,59 @@ func TestDispatchPlugins_SkipsManualGatePlugin(t *testing.T) {
 		t.Errorf("dog work = %q, want empty (manual-gate plugin must not auto-dispatch)", dg.Work)
 	}
 }
+
+// TestDispatchPlugins_RunsScriptPluginWithNoDogFree: a script plugin needs no
+// dog, so an empty kennel must not stop it, whatever order the agent plugins
+// around it come in.
+func TestDispatchPlugins_RunsScriptPluginWithNoDogFree(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a shell-script bd stub")
+	}
+	// The cooldown lookup and receipts shell out to bd: a stub that reports no
+	// earlier runs leaves every gate open.
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte("#!/bin/sh\necho '[]'\n"), 0755); err != nil {
+		t.Fatalf("write stub bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	townRoot := t.TempDir()
+	d := testHandlerDaemon(t, townRoot)
+	d.ctx = context.Background()
+
+	writePlugin := func(name, execution string, runSh bool) string {
+		dir := filepath.Join(townRoot, "plugins", name)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		md := "+++\nname = \"" + name + "\"\ndescription = \"test\"\n\n[gate]\ntype = \"cooldown\"\n" + execution + "+++\n\n# Instructions\n"
+		if err := os.WriteFile(filepath.Join(dir, "plugin.md"), []byte(md), 0644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		if runSh {
+			if err := os.WriteFile(filepath.Join(dir, "run.sh"), []byte("touch ran\n"), 0755); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+		}
+		return dir
+	}
+	for _, name := range []string{"agent-a", "agent-b", "agent-c", "agent-d"} {
+		writePlugin(name, "", false)
+	}
+	scriptDir := writePlugin("script-z", "\n[execution]\ntype = \"script\"\n", true)
+
+	rigsConfig := &config.RigsConfig{Version: 1, Rigs: map[string]config.RigEntry{}}
+	mgr := dog.NewManager(townRoot, rigsConfig)
+	sm := dog.NewSessionManager(tmux.NewTmux(), townRoot, mgr)
+
+	d.dispatchPlugins(mgr, sm, rigsConfig)
+	d.scriptPluginWG.Wait()
+
+	if _, err := os.Stat(filepath.Join(scriptDir, "ran")); err != nil {
+		t.Errorf("script plugin did not run with no dog free: %v", err)
+	}
+}
+
 func TestFindDispatchableDog_PicksFirstIdleWhenNoSessionsLive(t *testing.T) {
 	townRoot := t.TempDir()
 	d := testHandlerDaemon(t, townRoot)

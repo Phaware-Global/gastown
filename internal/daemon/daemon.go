@@ -174,6 +174,13 @@ type Daemon struct {
 	pluginSyncRunning atomic.Bool
 	pluginSyncWG      sync.WaitGroup
 
+	// scriptPluginsRunning holds the names of script plugins whose run.sh is
+	// running right now, so a slow run is never started a second time on the
+	// next dispatch tick. scriptPluginWG tracks those goroutines so shutdown
+	// can wait (bounded) for them to notice context cancellation.
+	scriptPluginsRunning sync.Map
+	scriptPluginWG       sync.WaitGroup
+
 	// lastDoctorMolTime tracks when the last mol-dog-doctor molecule was poured.
 	// Option B throttling: only pour when anomaly detected AND cooldown elapsed.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
@@ -2711,6 +2718,18 @@ func (d *Daemon) shutdown(state *State) error { //nolint:unparam // error return
 	case <-pluginSyncDone:
 	case <-time.After(30 * time.Second):
 		d.logger.Println("plugin_sync: still running after 30s shutdown wait — proceeding with shutdown")
+	}
+
+	// Same for script plugins: d.cancel() kills their process groups.
+	scriptPluginsDone := make(chan struct{})
+	go func() {
+		d.scriptPluginWG.Wait()
+		close(scriptPluginsDone)
+	}()
+	select {
+	case <-scriptPluginsDone:
+	case <-time.After(30 * time.Second):
+		d.logger.Println("script plugins: still running after 30s shutdown wait — proceeding with shutdown")
 	}
 
 	// Stop feed curator
