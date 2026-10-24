@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/witness"
 )
 
@@ -219,5 +220,54 @@ func TestPatrolScanZombieItemSerialization(t *testing.T) {
 	}
 	if parsed.Error != "restart failed: tmux error" {
 		t.Errorf("Error = %q, want %q", parsed.Error, "restart failed: tmux error")
+	}
+}
+
+func TestPatrolScanNoRestartFlagRegistered(t *testing.T) {
+	f := patrolScanCmd.Flags().Lookup("no-restart")
+	if f == nil {
+		t.Fatal("gt patrol scan has no --no-restart flag")
+	}
+	if f.DefValue != "false" {
+		t.Errorf("--no-restart default = %q, want false (restart stays the default)", f.DefValue)
+	}
+}
+
+type zombieNotificationRecorder struct{ messages []*mail.Message }
+
+func (r *zombieNotificationRecorder) Send(m *mail.Message) error {
+	r.messages = append(r.messages, m)
+	return nil
+}
+
+func TestZombieHoldNotifications(t *testing.T) {
+	for _, held := range []bool{true, false} {
+		result := &witness.DetectZombiePolecatsResult{Zombies: []witness.ZombieResult{
+			{PolecatName: "alpha", HookBead: "test-task", WasActive: true, Classification: witness.ZombieSessionDeadActive, Action: "restart-suppressed (--no-restart)"},
+			{PolecatName: "beta", HookBead: "test-live", WasActive: true, Classification: witness.ZombieAgentDeadInSession},
+			{PolecatName: "idle", WasActive: false},
+		}}
+		recorder := &zombieNotificationRecorder{}
+		for scan := 0; scan < 3; scan++ {
+			sendZombieNotification(recorder, "testrig", result, 2, held)
+		}
+		if len(recorder.messages) != 6 {
+			t.Fatalf("messages=%d, want 6", len(recorder.messages))
+		}
+		for _, m := range recorder.messages {
+			if m.To != "testrig/witness" && m.To != "assistant/" {
+				t.Errorf("unexpected recipient: %s", m.To)
+			}
+			if !strings.Contains(m.Body, "alpha") || !strings.Contains(m.Body, "test-live") || strings.Contains(m.Body, "idle") {
+				t.Errorf("incorrect detection details: %s", m.Body)
+			}
+			if held {
+				if !strings.HasPrefix(m.Subject, "ZOMBIE_HELD:") || strings.Contains(m.Body, "--force") || strings.Contains(m.Body, "gt sling") || !strings.Contains(m.Body, "hold") {
+					t.Errorf("unsafe held notice: %+v", m)
+				}
+			} else if m.To == "assistant/" && (!strings.HasPrefix(m.Subject, "POLECAT_DIED:") || !strings.Contains(m.Body, "gt sling <bead-id> <rig> --create --force")) {
+				t.Errorf("normal recovery advice missing: %+v", m)
+			}
+		}
 	}
 }
