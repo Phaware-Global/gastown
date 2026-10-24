@@ -4130,6 +4130,37 @@ func TestIsolatedWithPortOverridesInheritedDoltEnv(t *testing.T) {
 	}
 }
 
+// An isolated wrapper exists for tests. bd's first-run "anonymous usage
+// metrics" notice makes `bd init` exit non-zero, and its spooler writes into
+// the caller's real $HOME/.beads, so isolation must pin metrics off whatever
+// the inherited value is.
+func TestIsolatedEnvDisablesBDMetrics(t *testing.T) {
+	for name, setup := range map[string]func(){
+		"unset": func() { t.Setenv("BD_DISABLE_METRICS", ""); os.Unsetenv("BD_DISABLE_METRICS") },
+		"set 0": func() { t.Setenv("BD_DISABLE_METRICS", "0") },
+		"set 1": func() { t.Setenv("BD_DISABLE_METRICS", "1") },
+		"empty": func() { t.Setenv("BD_DISABLE_METRICS", "") },
+	} {
+		for _, b := range []*Beads{
+			NewIsolated(t.TempDir()),
+			NewIsolatedWithPort(t.TempDir(), 19999),
+		} {
+			setup()
+			for _, env := range []struct {
+				name string
+				got  []string
+			}{
+				{name: "run", got: b.buildRunEnv()},
+				{name: "routing", got: b.buildRoutingEnv()},
+			} {
+				if n := countEnvPrefix(env.got, "BD_DISABLE_METRICS="); n != 1 || !containsEnv(env.got, "BD_DISABLE_METRICS=1") {
+					t.Errorf("%s/%s: BD_DISABLE_METRICS entries = %d, want exactly BD_DISABLE_METRICS=1", name, env.name, n)
+				}
+			}
+		}
+	}
+}
+
 func countEnvPrefix(environ []string, prefix string) int {
 	count := 0
 	for _, env := range environ {

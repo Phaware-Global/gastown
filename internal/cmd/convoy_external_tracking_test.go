@@ -181,6 +181,7 @@ func TestCloseConvoyIfComplete_UnknownBlocksAutoClose(t *testing.T) {
 	// No bd stub — closeConvoyIfComplete does not shell out when the convoy
 	// isn't closable, which is exactly the scenario under test.
 	townBeads := t.TempDir()
+	recordConvoyGT(t) // a regression that closes would notify
 	tracked := []trackedIssueInfo{
 		{ID: "ws-foo", Status: trackedStatusUnknown},
 		{ID: "ws-bar", Status: "closed"},

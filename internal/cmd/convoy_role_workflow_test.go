@@ -130,6 +130,7 @@ func TestFindStrandedConvoys_RoleWorkflowConvoyKeptAsNotFeedable(t *testing.T) {
 // and the stranded scan never offers its steps for feeding.
 func TestRoleWorkflowConvoy_CompletedByTheSweepAndNeverFed(t *testing.T) {
 	townRoot, closeLog := mockBdForRoleWorkflowTest(t, "closed")
+	recordConvoyGT(t) // the sweep closes a convoy, which notifies
 
 	stranded, err := findStrandedConvoys(townRoot)
 	if err != nil {
