@@ -156,6 +156,10 @@ const pushTimeout = 60 * time.Second
 // (gt-y8ts FIX 4).
 const remoteQueryTimeout = 30 * time.Second
 
+// timeoutWaitDelay is how long runWithTimeout waits, after the deadline kills
+// git, for output pipes held open by a surviving child before abandoning them.
+const timeoutWaitDelay = 2 * time.Second
+
 // runWithTimeout executes a git command with a deadline. If the command does
 // not finish within the timeout, the process is killed and an error is returned.
 func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _ error) { //nolint:unparam // string return kept for consistency with Run()
@@ -172,6 +176,9 @@ func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _
 
 	cmd := exec.CommandContext(ctx, "git", args...)
 	util.SetDetachedProcessGroup(cmd)
+	// The deadline kills git, not the transport helper it spawned; a helper
+	// still holding the output pipes would keep Run blocked past the deadline.
+	cmd.WaitDelay = timeoutWaitDelay
 	cmd.Env = nonInteractiveGitEnv()
 	if g.workDir != "" {
 		cmd.Dir = g.workDir
@@ -936,6 +943,19 @@ func (g *Git) CheckoutResetBranch(branch, startPoint string) error {
 func (g *Git) Fetch(remote string) error {
 	_, err := g.run("fetch", remote)
 	return err
+}
+
+// FetchWithTimeout fetches from the remote, giving up after timeout so an
+// unreachable or tarpitting remote cannot hang the caller.
+func (g *Git) FetchWithTimeout(remote string, timeout time.Duration) error {
+	_, err := g.runWithTimeout(timeout, "fetch", remote)
+	return err
+}
+
+// FetchBounded is Fetch limited by remoteQueryTimeout, for callers on a patrol
+// path where one stuck remote must not stall the rest of the sweep.
+func (g *Git) FetchBounded(remote string) error {
+	return g.FetchWithTimeout(remote, remoteQueryTimeout)
 }
 
 // FetchPrune fetches from the remote and prunes stale remote-tracking refs.
@@ -3802,6 +3822,79 @@ func (g *Git) HeadHeldByDurableRef() (bool, error) {
 	return strings.TrimSpace(out) != "", nil
 }
 
+// UnheldMergeCommits counts merge commits reachable from HEAD that no
+// remote-tracking ref of remote holds. `git cherry` skips merge commits, so a
+// patch comparison cannot see a hand-resolved merge; this is how it is found.
+func (g *Git) UnheldMergeCommits(remote string) (int, error) {
+	out, err := g.run("rev-list", "--merges", "--count", "HEAD", "--not", "--remotes="+remote)
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil {
+		return 0, fmt.Errorf("parsing merge count %q: %w", out, err)
+	}
+	return n, nil
+}
+
+// UnheldNonMergeCommits lists the non-merge commits reachable from HEAD that no
+// remote-tracking ref of remote holds by SHA.
+func (g *Git) UnheldNonMergeCommits(remote string) ([]string, error) {
+	out, err := g.run("rev-list", "--no-merges", "HEAD", "--not", "--remotes="+remote)
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(out), nil
+}
+
+// VerbatimPatchIDs maps each non-merge commit that `git log` selects with
+// logArgs to its whitespace-sensitive patch-id. `git cherry` compares patch-ids
+// that ignore whitespace, so two commits it calls equivalent can differ in
+// indentation that matters (Makefile, YAML, Python); this tells them apart.
+// Commits with an empty diff have no patch-id and are absent from the map.
+func (g *Git) VerbatimPatchIDs(logArgs ...string) (map[string]string, error) {
+	patches, err := g.runRaw(nil, append([]string{"log", "-p", "--no-color", "--no-ext-diff", "--no-textconv", "--no-merges"}, logArgs...)...)
+	if err != nil {
+		return nil, err
+	}
+	out, err := g.runRaw(strings.NewReader(patches), "patch-id", "--verbatim")
+	if err != nil {
+		return nil, err
+	}
+	ids := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		if fields := strings.Fields(line); len(fields) == 2 {
+			ids[fields[1]] = fields[0]
+		}
+	}
+	return ids, nil
+}
+
+// runRaw runs git with optional stdin and returns stdout untrimmed, for output
+// whose trailing whitespace is data (a patch).
+func (g *Git) runRaw(stdin io.Reader, args ...string) (string, error) {
+	if err := g.guardUnsafeTownRootMutation(args); err != nil {
+		return "", err
+	}
+	if g.gitDir != "" {
+		args = append([]string{"--git-dir=" + g.gitDir}, args...)
+	}
+	cmd := exec.Command("git", args...)
+	util.SetDetachedProcessGroup(cmd)
+	cmd.Env = nonInteractiveGitEnv()
+	if g.workDir != "" {
+		cmd.Dir = g.workDir
+	}
+	cmd.Stdin = stdin
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", g.wrapError(err, stdout.String(), stderr.String(), args)
+	}
+	return stdout.String(), nil
+}
+
 // remoteBranchContainingHead returns the first branch on remote whose tip
 // contains HEAD, or "" if none does. Used as preservation evidence when HEAD is
 // detached and there is no local branch name to look up on the remote.
@@ -3824,6 +3917,28 @@ func (g *Git) remoteBranchContainingHead(remote string) (string, error) {
 		return ref, nil
 	}
 	return "", nil
+}
+
+// RecentRemoteTrackingRefs returns up to limit of the remote's tracking refs
+// (e.g. "origin/main"), most recently committed first. The remote's symbolic
+// HEAD pointer is skipped.
+func (g *Git) RecentRemoteTrackingRefs(remote string, limit int) ([]string, error) {
+	out, err := g.run("for-each-ref", "--sort=-committerdate", "--format=%(refname:short)", "refs/remotes/"+remote+"/")
+	if err != nil {
+		return nil, err
+	}
+	var refs []string
+	for _, line := range strings.Split(out, "\n") {
+		ref := strings.TrimSpace(line)
+		if ref == "" || ref == remote || ref == remote+"/HEAD" {
+			continue
+		}
+		refs = append(refs, ref)
+		if limit > 0 && len(refs) == limit {
+			break
+		}
+	}
+	return refs, nil
 }
 
 // BranchPreservationStatus describes whether HEAD is already preserved on a

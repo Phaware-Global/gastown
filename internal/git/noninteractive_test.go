@@ -68,3 +68,40 @@ func TestRemoteBranchExists_AuthRequiredFailsFast(t *testing.T) {
 		t.Errorf("ls-remote took %v; should fail fast", elapsed)
 	}
 }
+
+// A remote that accepts the connection and never answers must not hold a
+// bounded fetch past its deadline, even though git's transport helper keeps the
+// stderr pipe open after git itself is killed.
+func TestFetchWithTimeout_HungRemoteIsBounded(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-time.After(10 * time.Second):
+		}
+	}))
+	t.Cleanup(func() { close(release); srv.Close() })
+
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+	dir := initTestRepo(t)
+	cmd := exec.Command("git", "remote", "add", "origin", srv.URL+"/repo.git")
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v: %s", err, out)
+	}
+
+	start := time.Now()
+	err := NewGit(dir).FetchWithTimeout("origin", 300*time.Millisecond)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("fetch from a hung remote succeeded, want a timeout error")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("error = %v, want a timeout", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("fetch held for %v past a 300ms deadline", elapsed)
+	}
+}
