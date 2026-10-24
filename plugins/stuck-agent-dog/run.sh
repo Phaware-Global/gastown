@@ -181,6 +181,79 @@ bead_restartable() {
   return 1
 }
 
+# gt done exits the session after a deferred or normal completion but leaves
+# the hook bead hooked, so a dead session on a hooked bead is not by itself a
+# crash. The polecat's agent bead says whether it exited cleanly:
+#
+#   - exit_type DEFERRED (pushed, awaiting review) or COMPLETED, written by
+#     gt done. The witness clears it on its next patrol (DiscoverCompletions ->
+#     clearCompletionMetadata), so this only covers the first few minutes.
+#   - agent_state idle with last_source_issue equal to the hooked bead. gt done
+#     sets both and the witness never clears them; sling moves the state to
+#     spawning/working and a new hook no longer matches, so this holds exactly
+#     until the polecat is given other work.
+#
+# Anything else, including a missing or unreadable agent bead, keeps the polecat
+# reportable.
+polecat_agent_description() {
+  local rig="$1" prefix="$2" pcat="$3" id=""
+
+  if [ "$rig" = "$prefix" ]; then
+    id="$prefix-polecat-$pcat"
+  else
+    id="$prefix-$rig-polecat-$pcat"
+  fi
+
+  # Agent beads live in the town DB, not the rig's: a lookup from the rig
+  # workdir finds no issue.
+  ( cd "$TOWN_ROOT" 2>/dev/null && bd show "$id" --json 2>/dev/null ) \
+    | jq -r '.[0].description // empty' 2>/dev/null || true
+}
+
+# Prints the value of a "key: value" line of an agent bead description. Keys are
+# matched at line start, as beads.ParseAgentFields does; the last one wins.
+agent_field() {
+  awk -F: -v want="$1" '{
+      key = $1; gsub(/^[ \t]+|[ \t]+$/, "", key)
+      if (tolower(key) == want) {
+        val = substr($0, index($0, ":") + 1); gsub(/^[ \t]+|[ \t]+$/, "", val)
+        found = val
+      }
+    }
+    END { print found }'
+}
+
+# Succeeds, after logging a SKIP, when the polecat exited cleanly and is only
+# waiting on review. Arguments: session rig prefix polecat hook_bead.
+polecat_awaiting_review() {
+  local session="$1" hook_bead="$5" desc="" exit_type="" state="" source=""
+
+  desc=$(polecat_agent_description "$2" "$3" "$4")
+
+  # A failed push or MR leaves the same markers as a clean exit (exit_type
+  # COMPLETED, agent_state idle, last_source_issue set) but the work may exist
+  # only in the worktree, so it stays reportable.
+  if [ "$(printf '%s\n' "$desc" | agent_field push_failed)" = "true" ] \
+    || [ "$(printf '%s\n' "$desc" | agent_field mr_failed)" = "true" ]; then
+    return 1
+  fi
+
+  exit_type=$(printf '%s\n' "$desc" | agent_field exit_type)
+  case "$exit_type" in
+    DEFERRED|COMPLETED)
+      log "  SKIP $session: exited $exit_type, awaiting review"
+      return 0 ;;
+  esac
+
+  state=$(printf '%s\n' "$desc" | agent_field agent_state)
+  source=$(printf '%s\n' "$desc" | agent_field last_source_issue)
+  if [ "$state" = "idle" ] && [ -n "$source" ] && [ "$source" = "$hook_bead" ]; then
+    log "  SKIP $session: finished $hook_bead, awaiting review"
+    return 0
+  fi
+  return 1
+}
+
 # --- Enumerate agents ---------------------------------------------------------
 
 log "=== Checking agent health ==="
@@ -221,7 +294,8 @@ while IFS='|' read -r RIG PREFIX; do
       HOOK_LOC="${HOOK_ROW%%$'\t'*}"
       HOOK_BEAD="${HOOK_ROW#*$'\t'}"
 
-      if [ -n "$HOOK_ROW" ] && bead_restartable "$SESSION_NAME" "$HOOK_LOC" "$HOOK_BEAD"; then
+      if [ -n "$HOOK_ROW" ] && bead_restartable "$SESSION_NAME" "$HOOK_LOC" "$HOOK_BEAD" \
+        && ! polecat_awaiting_review "$SESSION_NAME" "$RIG" "$PREFIX" "$PCAT_NAME" "$HOOK_BEAD"; then
         CRASHED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD")
         log "  CRASHED: $SESSION_NAME (hook=$HOOK_BEAD)"
       fi
