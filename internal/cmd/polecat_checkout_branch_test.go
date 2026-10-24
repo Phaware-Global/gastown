@@ -237,18 +237,34 @@ func TestEnsurePolecatWorkBranch_RejectsRefspecBase(t *testing.T) {
 		"dev\telop",
 		"develop..main",
 		"@{-1}",
+		"HEAD",
 	}
 	for _, base := range bases {
 		t.Run(base, func(t *testing.T) {
 			clone, _ := newRigClone(t, "")
 			gitRun(t, clone, "branch", "keep", "main")
 			keepBefore := revParse(t, clone, "refs/heads/keep")
+			originMainBefore := revParse(t, clone, "refs/remotes/origin/main")
+			if base == "HEAD" {
+				// With a remote branch named HEAD, a fetch of it would write
+				// through the origin/HEAD symref and move origin/main.
+				// Made in the bare origin itself: a push would update the
+				// clone's tracking refs, and origin/HEAD with them.
+				origin, err := exec.Command("git", "-C", clone, "remote", "get-url", "origin").Output()
+				if err != nil {
+					t.Fatal(err)
+				}
+				gitRun(t, strings.TrimSpace(string(origin)), "update-ref", "refs/heads/HEAD", revParse(t, clone, "refs/remotes/origin/develop"))
+			}
 
 			if _, err := ensurePolecatWorkBranch(clone, "nux", "gt-abc", base); err == nil {
 				t.Fatalf("want an error for --base %q", base)
 			}
 			if got := revParse(t, clone, "refs/heads/keep"); got != keepBefore {
 				t.Errorf("refs/heads/keep moved from %s to %s", keepBefore, got)
+			}
+			if got := revParse(t, clone, "refs/remotes/origin/main"); got != originMainBefore {
+				t.Errorf("refs/remotes/origin/main moved from %s to %s", originMainBefore, got)
 			}
 			for _, ref := range []string{"refs/heads/x", "refs/heads/polecat/nux-gt-abc"} {
 				if err := exec.Command("git", "-C", clone, "rev-parse", "--verify", "--quiet", ref).Run(); err == nil {
@@ -268,8 +284,19 @@ func TestValidatePolecatBaseBranch_AcceptsPlainNames(t *testing.T) {
 }
 
 // "@{-1}" and "@{u}" are revision syntax, not branch names, however the
-// process's cwd reflog resolves them.
+// process's cwd reflog resolves them. The test runs from a repo where @{-1}
+// does resolve, so a check that expands it is caught wherever the test runs.
 func TestValidatePolecatBaseBranch_RejectsReflogSyntax(t *testing.T) {
+	repo := t.TempDir()
+	gitRun(t, repo, "init", "-q", "-b", "main")
+	gitRun(t, repo, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-q", "--allow-empty", "-m", "init")
+	gitRun(t, repo, "checkout", "-q", "-b", "other")
+	gitRun(t, repo, "checkout", "-q", "main")
+	t.Chdir(repo)
+	if err := exec.Command("git", "check-ref-format", "--branch", "@{-1}").Run(); err != nil {
+		t.Fatalf("precondition: @{-1} should resolve in %s: %v", repo, err)
+	}
+
 	for _, base := range []string{"@{-1}", "@{u}", "dev@{upstream}", "main@{1}"} {
 		if err := validatePolecatBaseBranch(base); err == nil {
 			t.Errorf("validatePolecatBaseBranch(%q) = nil, want an error", base)

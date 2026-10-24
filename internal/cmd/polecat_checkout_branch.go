@@ -349,7 +349,9 @@ func ensurePolecatWorkBranch(cwd, polecatName, beadID, baseOverride string) (pol
 // branch names (polecat branches carry '@') and are inert inside the explicit
 // refspec the fetch builds, so they are allowed.
 func validatePolecatBaseBranch(base string) error {
-	if base == "" || strings.HasPrefix(base, "-") || strings.HasPrefix(base, "refs/") ||
+	// "HEAD" is a valid refname under refs/heads/ but not a branch name, and a
+	// fetch of it writes through the origin/HEAD symref.
+	if base == "" || base == "HEAD" || strings.HasPrefix(base, "-") || strings.HasPrefix(base, "refs/") ||
 		strings.ContainsAny(base, ":*?[\\^~") || strings.IndexFunc(base, unicode.IsSpace) >= 0 {
 		return fmt.Errorf("invalid base branch %q: want a plain branch name", base)
 	}
