@@ -68,7 +68,7 @@ func TestEnsurePolecatWorkBranch_CreatesFromMain(t *testing.T) {
 		t.Fatalf("precondition: expected to start on main, got %q", got)
 	}
 
-	res, err := ensurePolecatWorkBranch(clone, "nux", "gt-tk5")
+	res, err := ensurePolecatWorkBranch(clone, "nux", "gt-tk5", "")
 	if err != nil {
 		t.Fatalf("ensurePolecatWorkBranch: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestEnsurePolecatWorkBranch_CreatesFromMaster(t *testing.T) {
 		t.Fatalf("precondition: expected to start on master, got %q", got)
 	}
 
-	res, err := ensurePolecatWorkBranch(clone, "nux", "gt-tk5")
+	res, err := ensurePolecatWorkBranch(clone, "nux", "gt-tk5", "")
 	if err != nil {
 		t.Fatalf("ensurePolecatWorkBranch on master-based repo: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestEnsurePolecatWorkBranch_Noop(t *testing.T) {
 	clone := newOriginAndClone(t)
 	gitRun(t, clone, "checkout", "-b", "polecat/nux-gt-tk5")
 
-	res, err := ensurePolecatWorkBranch(clone, "nux", "gt-tk5")
+	res, err := ensurePolecatWorkBranch(clone, "nux", "gt-tk5", "")
 	if err != nil {
 		t.Fatalf("ensurePolecatWorkBranch: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestEnsurePolecatWorkBranch_ResumesExisting(t *testing.T) {
 	clone := newOriginAndClone(t)
 	gitRun(t, clone, "branch", "polecat/nux-gt-tk5", "main") // exists, but not checked out
 
-	res, err := ensurePolecatWorkBranch(clone, "nux", "gt-tk5")
+	res, err := ensurePolecatWorkBranch(clone, "nux", "gt-tk5", "")
 	if err != nil {
 		t.Fatalf("ensurePolecatWorkBranch: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestEnsurePolecatWorkBranch_RefusesOtherPolecatBranch(t *testing.T) {
 	clone := newOriginAndClone(t)
 	gitRun(t, clone, "checkout", "-b", "polecat/rictus-gt-mwy.5")
 
-	_, err := ensurePolecatWorkBranch(clone, "nux", "gt-tk5")
+	_, err := ensurePolecatWorkBranch(clone, "nux", "gt-tk5", "")
 	if err == nil {
 		t.Fatal("expected refusal switching between polecat branches, got nil")
 	}
@@ -153,7 +153,7 @@ func TestEnsurePolecatWorkBranch_RefusesOtherPolecatBranch(t *testing.T) {
 // against branch-name pollution before any git command runs.
 func TestEnsurePolecatWorkBranch_RejectsBadBeadID(t *testing.T) {
 	clone := newOriginAndClone(t)
-	if _, err := ensurePolecatWorkBranch(clone, "nux", "gt-mwy;rm -rf /"); err == nil {
+	if _, err := ensurePolecatWorkBranch(clone, "nux", "gt-mwy;rm -rf /", ""); err == nil {
 		t.Fatal("expected bead-id validation error, got nil")
 	}
 }
