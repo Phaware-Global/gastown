@@ -139,10 +139,11 @@ func TestStuckAgentDogBatchesHookLookups(t *testing.T) {
 	if n := count("gt hook show"); n != 0 {
 		t.Errorf("run.sh spawned `gt hook show` %d times; hook lookups must be batched", n)
 	}
-	// `bd show` re-checks only polecats that already look crashed, never the
-	// ~130 dead sessions with no hooked work.
-	if n := count("bd show"); n > hookedPolecats {
-		t.Errorf("run.sh spawned `bd show` %d times, want at most %d (one per hooked polecat)", n, hookedPolecats)
+	// `bd show` re-checks only polecats that already look crashed (the hook
+	// bead's status, then the agent bead's exit_type), never the ~130 dead
+	// sessions with no hooked work.
+	if n := count("bd show"); n > 2*hookedPolecats {
+		t.Errorf("run.sh spawned `bd show` %d times, want at most %d (two per hooked polecat)", n, 2*hookedPolecats)
 	}
 	if n := count("bd list"); n < 1 || n > maxBdListCalls {
 		t.Errorf("bd list called %d times, want 1..%d (per rig, not per polecat)", n, maxBdListCalls)
@@ -164,7 +165,10 @@ func TestStuckAgentDogBatchesHookLookups(t *testing.T) {
 //
 //	list.<loc>.<status>.json  `bd list --status=<status>`
 //	sql.<loc>.json            `bd sql` (the wisps table)
-//	show.<bead>.json          `bd show <bead>`
+//	show.<bead>.json          `bd show <bead>` for a work bead, from any location
+//	agent.<loc>.<bead>.json   `bd show <bead>` for a polecat agent bead, served
+//	                          only at the location that owns it (agent beads live
+//	                          in the town DB, so only "town" has them)
 type dogFixture struct {
 	t     *testing.T
 	town  string
@@ -185,7 +189,13 @@ case "$1" in
     for a in "$@"; do case "$a" in --status=*) status="${a#--status=}" ;; esac; done
     emit "$DATA/list.$loc.$status.json" ;;
   sql) emit "$DATA/sql.$loc.json" ;;
-  show) emit "$DATA/show.$2.json" ;;
+  show)
+    case "$2" in
+      *-polecat-*)
+        if [ -f "$DATA/agent.$loc.$2.json" ]; then cat "$DATA/agent.$loc.$2.json"
+        else echo "Error fetching $2: no issue found matching \"$2\"" >&2; exit 1; fi ;;
+      *) emit "$DATA/show.$2.json" ;;
+    esac ;;
   create) echo "wisp-1" ;;
 esac
 exit 0
@@ -247,6 +257,19 @@ func (f *dogFixture) wispRows(loc string, rows ...map[string]string) {
 
 func (f *dogFixture) beadStatus(bead, status string) {
 	f.write(filepath.Join(f.data, "show."+bead+".json"), fmt.Sprintf(`[{"id":%q,"status":%q}]`, bead, status))
+}
+
+// agentBead records the polecat's agent bead (<prefix>-<rig>-polecat-<name>)
+// with the given description, as `gt done` leaves it. The bead lives in the
+// town DB, like the real one.
+func (f *dogFixture) agentBead(prefix, rig, name, description string) {
+	f.t.Helper()
+	id := fmt.Sprintf("%s-%s-polecat-%s", prefix, rig, name)
+	b, err := json.Marshal([]map[string]string{{"id": id, "status": "open", "description": description}})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.write(filepath.Join(f.data, "agent.town."+id+".json"), string(b))
 }
 
 // run executes run.sh and returns its output and the stub call log.
@@ -361,5 +384,159 @@ func TestStuckAgentDogRejectsForgedAssigneeRecords(t *testing.T) {
 	}
 	if !strings.Contains(out, "Polecat health: 0 crashed") {
 		t.Errorf("want 0 crashed:\n%s", out)
+	}
+}
+
+// `gt done --status DEFERRED` pushes the work and exits the session while the
+// hook bead stays hooked, so a dead session with a hooked bead is the designed
+// end state. The completion metadata on the agent bead says so.
+func TestStuckAgentDogSkipsPolecatThatExitedAwaitingReview(t *testing.T) {
+	for _, exitType := range []string{"DEFERRED", "COMPLETED"} {
+		t.Run(exitType, func(t *testing.T) {
+			f := newDogFixture(t, map[string]string{"alpha": "al"})
+			f.polecat("alpha", "p1")
+			f.listRows("alpha", "hooked", map[string]string{"assignee": "alpha/polecats/p1", "id": "al-1", "status": "hooked"})
+			f.beadStatus("al-1", "hooked")
+			f.agentBead("al", "alpha", "p1", "role_type: polecat\nrig: alpha\nagent_state: idle\nexit_type: "+exitType+"\nbranch: polecat/p1/al-1")
+
+			out, calls := f.run()
+			if n := restartMails(calls, "alpha"); n != 0 {
+				t.Errorf("restart mails = %d, want 0 for a polecat that exited %s\n%s", n, exitType, out)
+			}
+			if !strings.Contains(out, "Polecat health: 0 crashed, 0 stuck") {
+				t.Errorf("want 0 crashed:\n%s", out)
+			}
+			if want := "SKIP al-p1: exited " + exitType + ", awaiting review"; !strings.Contains(out, want) {
+				t.Errorf("output missing %q:\n%s", want, out)
+			}
+		})
+	}
+}
+
+// Without completion metadata a dead session on a hooked bead is a crash, so
+// a missing or exit-less agent bead must not suppress the report.
+func TestStuckAgentDogReportsCrashWithoutExitType(t *testing.T) {
+	for name, description := range map[string]string{
+		"no agent bead":     "",
+		"no exit_type":      "role_type: polecat\nrig: alpha\nagent_state: working",
+		"escalated exit":    "role_type: polecat\nrig: alpha\nexit_type: ESCALATED",
+		"exit_type in text": "role_type: polecat\nnotes: exit_type: DEFERRED",
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newDogFixture(t, map[string]string{"alpha": "al"})
+			f.polecat("alpha", "p1")
+			f.listRows("alpha", "hooked", map[string]string{"assignee": "alpha/polecats/p1", "id": "al-1", "status": "hooked"})
+			f.beadStatus("al-1", "hooked")
+			if description != "" {
+				f.agentBead("al", "alpha", "p1", description)
+			}
+
+			out, calls := f.run()
+			if n := restartMails(calls, "alpha"); n != 1 {
+				t.Errorf("restart mails = %d, want 1\n%s", n, out)
+			}
+			if !strings.Contains(out, "Polecat health: 1 crashed") {
+				t.Errorf("want 1 crashed:\n%s", out)
+			}
+		})
+	}
+}
+
+// Each witness patrol records a DEFERRED/COMPLETED exit as acknowledged and
+// clears exit_type, completion_time, mr_id and branch from the agent bead
+// (witness.clearCompletionMetadata). What survives is agent_state idle (set by
+// gt done) and last_source_issue, so those carry the skip once exit_type is gone.
+func TestStuckAgentDogSkipsPolecatAfterWitnessClearedExitType(t *testing.T) {
+	f := newDogFixture(t, map[string]string{"alpha": "al"})
+	f.polecat("alpha", "p1")
+	f.listRows("alpha", "hooked", map[string]string{"assignee": "alpha/polecats/p1", "id": "al-1", "status": "hooked"})
+	f.beadStatus("al-1", "hooked")
+	f.agentBead("al", "alpha", "p1", "role_type: polecat\nrig: alpha\nagent_state: idle\nhook_bead: null\ncleanup_status: clean\nlast_source_issue: al-1")
+
+	out, calls := f.run()
+	if n := restartMails(calls, "alpha"); n != 0 {
+		t.Errorf("restart mails = %d, want 0 for an idle polecat that finished al-1\n%s", n, out)
+	}
+	if !strings.Contains(out, "Polecat health: 0 crashed, 0 stuck") {
+		t.Errorf("want 0 crashed:\n%s", out)
+	}
+	if !strings.Contains(out, "SKIP al-p1: finished al-1, awaiting review") {
+		t.Errorf("output should say the polecat finished its hooked bead:\n%s", out)
+	}
+}
+
+// The idle marker only vouches for the bead the polecat finished. A different
+// hooked bead, or a polecat that is not idle, is real work with a dead session.
+func TestStuckAgentDogReportsCrashWhenIdleMarkerDoesNotMatchHook(t *testing.T) {
+	for name, description := range map[string]string{
+		"idle but finished a different bead": "role_type: polecat\nagent_state: idle\nlast_source_issue: al-0",
+		"idle with no last_source_issue":     "role_type: polecat\nagent_state: idle",
+		"working on the same bead":           "role_type: polecat\nagent_state: working\nlast_source_issue: al-1",
+		"spawning on the same bead":          "role_type: polecat\nagent_state: spawning\nlast_source_issue: al-1",
+		"stuck on the same bead":             "role_type: polecat\nagent_state: stuck\nlast_source_issue: al-1",
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newDogFixture(t, map[string]string{"alpha": "al"})
+			f.polecat("alpha", "p1")
+			f.listRows("alpha", "hooked", map[string]string{"assignee": "alpha/polecats/p1", "id": "al-1", "status": "hooked"})
+			f.beadStatus("al-1", "hooked")
+			f.agentBead("al", "alpha", "p1", description)
+
+			out, calls := f.run()
+			if n := restartMails(calls, "alpha"); n != 1 {
+				t.Errorf("restart mails = %d, want 1\n%s", n, out)
+			}
+			if !strings.Contains(out, "Polecat health: 1 crashed") {
+				t.Errorf("want 1 crashed:\n%s", out)
+			}
+		})
+	}
+}
+
+// A failed push or MR leaves exit_type COMPLETED, agent_state idle and
+// last_source_issue set, exactly like a clean exit, but the work may exist only
+// in the worktree. push_failed and mr_failed mark that, and a dead session with
+// either set stays reportable.
+func TestStuckAgentDogReportsCrashWhenPushOrMRFailed(t *testing.T) {
+	for name, description := range map[string]string{
+		"exit_type COMPLETED with push_failed": "role_type: polecat\nagent_state: idle\nexit_type: COMPLETED\npush_failed: true\nlast_source_issue: al-1",
+		"exit_type DEFERRED with push_failed":  "role_type: polecat\nagent_state: idle\nexit_type: DEFERRED\npush_failed: true",
+		"idle marker with mr_failed":           "role_type: polecat\nagent_state: idle\nlast_source_issue: al-1\nmr_failed: true",
+		"exit_type COMPLETED with mr_failed":   "role_type: polecat\nagent_state: idle\nexit_type: COMPLETED\nmr_failed: true",
+		"idle marker with push_failed":         "role_type: polecat\nagent_state: idle\nlast_source_issue: al-1\npush_failed: true",
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newDogFixture(t, map[string]string{"alpha": "al"})
+			f.polecat("alpha", "p1")
+			f.listRows("alpha", "hooked", map[string]string{"assignee": "alpha/polecats/p1", "id": "al-1", "status": "hooked"})
+			f.beadStatus("al-1", "hooked")
+			f.agentBead("al", "alpha", "p1", description)
+
+			out, calls := f.run()
+			if n := restartMails(calls, "alpha"); n != 1 {
+				t.Errorf("restart mails = %d, want 1 for a failed push/MR\n%s", n, out)
+			}
+			if !strings.Contains(out, "Polecat health: 1 crashed") {
+				t.Errorf("want 1 crashed:\n%s", out)
+			}
+			if strings.Contains(out, "awaiting review") {
+				t.Errorf("a failed push/MR must not be logged as awaiting review:\n%s", out)
+			}
+		})
+	}
+}
+
+// push_failed: false is the explicit form of the flag being clear and does not
+// block the skip.
+func TestStuckAgentDogSkipsWhenFailureFlagsAreFalse(t *testing.T) {
+	f := newDogFixture(t, map[string]string{"alpha": "al"})
+	f.polecat("alpha", "p1")
+	f.listRows("alpha", "hooked", map[string]string{"assignee": "alpha/polecats/p1", "id": "al-1", "status": "hooked"})
+	f.beadStatus("al-1", "hooked")
+	f.agentBead("al", "alpha", "p1", "role_type: polecat\nagent_state: idle\nexit_type: DEFERRED\npush_failed: false\nmr_failed: false\nlast_source_issue: al-1")
+
+	out, calls := f.run()
+	if n := restartMails(calls, "alpha"); n != 0 {
+		t.Errorf("restart mails = %d, want 0\n%s", n, out)
 	}
 }
