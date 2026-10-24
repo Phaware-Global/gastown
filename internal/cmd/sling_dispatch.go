@@ -176,6 +176,11 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	// live polecat. Without this, the old polecat becomes a zombie — still running
 	// but unaware it lost its hook. Mirrors the same logic in runSling (sling.go).
 	if (info.Status == "hooked" || info.Status == "in_progress") && params.Force && info.Assignee != "" {
+		// Never shut down a polecat whose worktree holds unpreserved work (gt-a02n).
+		if err := checkReassignPreservesWork(townRoot, info.Assignee); err != nil {
+			result.ErrMsg = "reassign would lose work"
+			return result, err
+		}
 		assigneeParts := strings.Split(info.Assignee, "/")
 		if len(assigneeParts) >= 3 && assigneeParts[1] == "polecats" {
 			oldRigName := assigneeParts[0]
