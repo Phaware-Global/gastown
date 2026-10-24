@@ -235,6 +235,9 @@ else
   ERROR="make build/safe-install failed"
   log "FAILED: $ERROR"
   record_run "Plugin: rebuild-gt [failure]" "failure" "Build failed: $ERROR"
-  gt escalate "Plugin FAILED: rebuild-gt" -s medium 2>/dev/null || true
+  # Same key as the daemon's escalation for this plugin, so a failure the
+  # daemon also reports stays one open escalation.
+  gt escalate "Plugin FAILED: rebuild-gt" -s medium --source plugin:rebuild-gt \
+    --fingerprint plugin-failure:rebuild-gt 2>/dev/null || true
   exit 1
 fi

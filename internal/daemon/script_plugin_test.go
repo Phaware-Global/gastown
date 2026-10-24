@@ -208,3 +208,40 @@ func TestReportScriptPluginFailure_NoEscalationWhenStoppedOrNotAsked(t *testing.
 		})
 	}
 }
+
+// TestStartScriptPlugin_EscalatesATimeoutButNotAShutdown drives the whole
+// path, run through report: a timeout escalates, a daemon shutdown does not.
+func TestStartScriptPlugin_EscalatesATimeoutButNotAShutdown(t *testing.T) {
+	tests := []struct {
+		name         string
+		timeout      string
+		shutdown     bool
+		wantEscalate bool
+	}{
+		{"timeout", "1s", false, true},
+		{"shutdown", "", true, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := stubBdAndGt(t)
+			townRoot := t.TempDir()
+			d := testHandlerDaemon(t, townRoot)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			d.ctx = ctx
+			p := testScriptPlugin(t, "sleep 30 &\nwait\n", tc.timeout)
+			p.Execution.NotifyOnFailure = true
+
+			d.startScriptPlugin(p, plugin.NewRecorder(townRoot))
+			if tc.shutdown {
+				time.AfterFunc(300*time.Millisecond, cancel)
+			}
+			d.scriptPluginWG.Wait()
+
+			_, err := os.Stat(calls)
+			if escalated := err == nil; escalated != tc.wantEscalate {
+				t.Errorf("escalated = %v, want %v", escalated, tc.wantEscalate)
+			}
+		})
+	}
+}
