@@ -8,6 +8,20 @@ import (
 	"testing"
 )
 
+// recordConvoyGT swaps convoyGT for a fake that records each call as the
+// space-joined argument list and never execs anything.
+func recordConvoyGT(t *testing.T) *[]string {
+	t.Helper()
+	var calls []string
+	old := convoyGT
+	convoyGT = func(args ...string) error {
+		calls = append(calls, strings.Join(args, " "))
+		return nil
+	}
+	t.Cleanup(func() { convoyGT = old })
+	return &calls
+}
+
 func TestNotifyConvoyCompletion_StampsAndSkipsDuplicate(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping on windows - shell stubs")
@@ -20,9 +34,7 @@ func TestNotifyConvoyCompletion_StampsAndSkipsDuplicate(t *testing.T) {
 	}
 
 	statePath := filepath.Join(binDir, "notified.state")
-	mailLogPath := filepath.Join(binDir, "mail.log")
 	bdPath := filepath.Join(binDir, "bd")
-	gtPath := filepath.Join(binDir, "gt")
 
 	bdScript := `#!/bin/sh
 STATE="` + statePath + `"
@@ -56,26 +68,20 @@ exit 0
 		t.Fatalf("write bd stub: %v", err)
 	}
 
-	gtScript := `#!/bin/sh
-if [ "$1" = "mail" ] && [ "$2" = "send" ]; then
-  echo "$@" >> "` + mailLogPath + `"
-fi
-exit 0
-`
-	if err := os.WriteFile(gtPath, []byte(gtScript), 0755); err != nil {
-		t.Fatalf("write gt stub: %v", err)
-	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	sent := recordConvoyGT(t)
 
 	notifyConvoyCompletion(townRoot, "hq-cv-dup", "Duplicate Guard")
 	notifyConvoyCompletion(townRoot, "hq-cv-dup", "Duplicate Guard")
 
-	data, err := os.ReadFile(mailLogPath)
-	if err != nil {
-		t.Fatalf("read mail log: %v", err)
+	mails := 0
+	for _, call := range *sent {
+		if strings.HasPrefix(call, "mail send ") {
+			mails++
+		}
 	}
-	if got := strings.Count(string(data), "mail send"); got != 1 {
-		t.Fatalf("mail sends = %d, want 1; log:\n%s", got, string(data))
+	if mails != 1 {
+		t.Fatalf("mail sends = %d, want 1; calls: %q", mails, *sent)
 	}
 	if _, err := os.Stat(statePath); err != nil {
 		t.Fatalf("completion notification state was not recorded: %v", err)

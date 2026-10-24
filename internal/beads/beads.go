@@ -761,7 +761,7 @@ func (b *Beads) buildRunEnv() []string {
 			env = append(env, fmt.Sprintf("BEADS_DOLT_PORT=%d", b.serverPort))
 			env = append(env, "BEADS_DOLT_AUTO_START=0")
 		}
-		return SuppressBDSideEffects(env)
+		return disableBDMetrics(SuppressBDSideEffects(env))
 	}
 	// runWithStdin appends BEADS_DIR after probing bd --allow-stale support, so
 	// keep buildRunEnv focused on Dolt target isolation and avoid duplicate
@@ -769,6 +769,14 @@ func (b *Beads) buildRunEnv() []string {
 	env := BuildPinnedBDEnv(os.Environ(), b.getResolvedBeadsDir())
 	env = StripEnvKey(env, "BEADS_DIR")
 	return StripEnvKey(env, "BEADS_DOLT_SERVER_PORT")
+}
+
+// disableBDMetrics pins bd's anonymous usage metrics off. Isolated wrappers
+// run bd against a scratch store, but bd still keeps its metrics state under
+// the caller's real $HOME/.beads: the first-run notice makes `bd init` exit
+// non-zero, and the spooler writes events (and a detached flusher) there.
+func disableBDMetrics(env []string) []string {
+	return append(StripEnvKey(env, "BD_DISABLE_METRICS"), "BD_DISABLE_METRICS=1")
 }
 
 // buildRoutingEnv builds the environment for runWithRouting() calls.
@@ -783,7 +791,7 @@ func (b *Beads) buildRoutingEnv() []string {
 			env = append(env, fmt.Sprintf("BEADS_DOLT_PORT=%d", b.serverPort))
 			env = append(env, "BEADS_DOLT_AUTO_START=0")
 		}
-		return SuppressBDSideEffects(env)
+		return disableBDMetrics(SuppressBDSideEffects(env))
 	}
 	env := BuildRoutingBDEnv(os.Environ(), b.getResolvedBeadsDir())
 	return StripEnvKey(env, "BEADS_DOLT_SERVER_PORT")
