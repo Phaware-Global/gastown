@@ -1,6 +1,10 @@
 package cmd
 
 import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -110,6 +114,224 @@ func TestValidateBeadID_AcceptsLegitimateIDs(t *testing.T) {
 		t.Run(id, func(t *testing.T) {
 			if err := validateBeadID(id); err != nil {
 				t.Errorf("validateBeadID(%q) = %v; want nil", id, err)
+			}
+		})
+	}
+}
+
+// newRigClone builds a town with one rig whose polecat worktree is a clone of
+// an origin that has main (the remote HEAD), develop, and feature/stack, each
+// at a distinct commit. A non-empty rigDefault is written to the rig's
+// config.json as default_branch. It returns the worktree path and the commit
+// each branch points at.
+func newRigClone(t *testing.T, rigDefault string) (clone string, tips map[string]string) {
+	t.Helper()
+	town := t.TempDir()
+	rigDir := filepath.Join(town, "alpha")
+	if err := os.MkdirAll(filepath.Join(town, "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(town, "mayor", "town.json"), []byte("{}"), 0o644); err != nil { //nolint:gosec // G306: test fixture
+		t.Fatal(err)
+	}
+	clone = filepath.Join(rigDir, "polecats", "nux", "alpha")
+	if err := os.MkdirAll(filepath.Dir(clone), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if rigDefault != "" {
+		cfg := fmt.Sprintf(`{"default_branch":%q}`, rigDefault)
+		if err := os.WriteFile(filepath.Join(rigDir, "config.json"), []byte(cfg), 0o644); err != nil { //nolint:gosec // G306: test fixture
+			t.Fatal(err)
+		}
+	}
+
+	root := t.TempDir()
+	origin := filepath.Join(root, "origin.git")
+	seed := filepath.Join(root, "seed")
+	gitRun(t, root, "init", "--bare", "-b", "main", origin)
+	gitRun(t, root, "init", "-b", "main", seed)
+	gitRun(t, seed, "config", "user.email", "test@example.com")
+	gitRun(t, seed, "config", "user.name", "Test")
+	gitRun(t, seed, "remote", "add", "origin", origin)
+
+	tips = map[string]string{}
+	for _, branch := range []string{"main", "develop", "feature/stack"} {
+		if branch != "main" {
+			gitRun(t, seed, "checkout", "-q", "-b", branch, "main")
+		}
+		gitRun(t, seed, "commit", "--allow-empty", "-m", "tip of "+branch)
+		gitRun(t, seed, "push", "-q", "origin", branch)
+		out, err := exec.Command("git", "-C", seed, "rev-parse", "HEAD").Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		tips[branch] = strings.TrimSpace(string(out))
+	}
+
+	gitRun(t, root, "clone", "-q", origin, clone)
+	gitRun(t, clone, "config", "user.email", "test@example.com")
+	gitRun(t, clone, "config", "user.name", "Test")
+	return clone, tips
+}
+
+func headCommit(t *testing.T, dir string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func TestEnsurePolecatWorkBranch_BaseResolution(t *testing.T) {
+	cases := []struct {
+		name       string
+		rigDefault string
+		base       string
+		wantBase   string
+	}{
+		{"rig base branch develop", "develop", "", "develop"},
+		{"no rig config falls back to origin default", "", "", "main"},
+		{"--base wins over rig config", "develop", "feature/stack", "feature/stack"},
+		{"--base wins without rig config", "", "feature/stack", "feature/stack"},
+		{"--base accepts an origin/ prefix", "", "origin/develop", "develop"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			clone, tips := newRigClone(t, c.rigDefault)
+			res, err := ensurePolecatWorkBranch(clone, "nux", "gt-abc", c.base)
+			if err != nil {
+				t.Fatalf("ensurePolecatWorkBranch: %v", err)
+			}
+			if res.Action != polecatBranchCreated {
+				t.Fatalf("action = %q, want created", res.Action)
+			}
+			if got := headCommit(t, clone); got != tips[c.wantBase] {
+				t.Errorf("new branch is at %s, want tip of %s (%s)", got, c.wantBase, tips[c.wantBase])
+			}
+		})
+	}
+}
+
+func TestEnsurePolecatWorkBranch_RejectsOptionLikeBase(t *testing.T) {
+	clone, _ := newRigClone(t, "")
+	if _, err := ensurePolecatWorkBranch(clone, "nux", "gt-abc", "--orphan"); err == nil {
+		t.Fatal("want an error for a --base that looks like a git option")
+	}
+}
+
+// A --base that is a refspec must be rejected before any fetch, and must not
+// write a ref: the worktree shares its repo with parked polecat branches whose
+// unpushed work a forced fetch would rewind.
+func TestEnsurePolecatWorkBranch_RejectsRefspecBase(t *testing.T) {
+	bases := []string{
+		"+refs/heads/develop:refs/heads/keep",
+		"develop:refs/heads/keep",
+		"main:refs/heads/x",
+		"refs/heads/develop",
+		"origin/refs/heads/develop",
+		"dev*",
+		"dev^",
+		"dev~1",
+		"dev elop",
+		"dev\telop",
+		"develop..main",
+		"@{-1}",
+		"HEAD",
+		"head",
+	}
+	for _, base := range bases {
+		t.Run(base, func(t *testing.T) {
+			clone, _ := newRigClone(t, "")
+			gitRun(t, clone, "branch", "keep", "main")
+			keepBefore := revParse(t, clone, "refs/heads/keep")
+			originMainBefore := revParse(t, clone, "refs/remotes/origin/main")
+			if base == "HEAD" || base == "head" {
+				// With a remote branch named HEAD (or head, on a
+				// case-insensitive disk), a fetch of it would write through
+				// the origin/HEAD symref and move origin/main.
+				// Made in the bare origin itself: a push would update the
+				// clone's tracking refs, and origin/HEAD with them.
+				origin, err := exec.Command("git", "-C", clone, "remote", "get-url", "origin").Output()
+				if err != nil {
+					t.Fatal(err)
+				}
+				gitRun(t, strings.TrimSpace(string(origin)), "update-ref", "refs/heads/"+base, revParse(t, clone, "refs/remotes/origin/develop"))
+			}
+
+			if _, err := ensurePolecatWorkBranch(clone, "nux", "gt-abc", base); err == nil {
+				t.Fatalf("want an error for --base %q", base)
+			}
+			if got := revParse(t, clone, "refs/heads/keep"); got != keepBefore {
+				t.Errorf("refs/heads/keep moved from %s to %s", keepBefore, got)
+			}
+			if got := revParse(t, clone, "refs/remotes/origin/main"); got != originMainBefore {
+				t.Errorf("refs/remotes/origin/main moved from %s to %s", originMainBefore, got)
+			}
+			for _, ref := range []string{"refs/heads/x", "refs/heads/polecat/nux-gt-abc"} {
+				if err := exec.Command("git", "-C", clone, "rev-parse", "--verify", "--quiet", ref).Run(); err == nil {
+					t.Errorf("%s was created", ref)
+				}
+			}
+		})
+	}
+}
+
+func TestValidatePolecatBaseBranch_AcceptsPlainNames(t *testing.T) {
+	for _, base := range []string{"main", "develop", "Develop", "feature/stack", "release-1.2", "user_x/topic", "a+b", "release+2026", "user@topic", "polecat/x/gt-abc@suffix"} {
+		if err := validatePolecatBaseBranch(base); err != nil {
+			t.Errorf("validatePolecatBaseBranch(%q) = %v, want nil", base, err)
+		}
+	}
+}
+
+// "@{-1}" and "@{u}" are revision syntax, not branch names, however the
+// process's cwd reflog resolves them. The test runs from a repo where @{-1}
+// does resolve, so a check that expands it is caught wherever the test runs.
+func TestValidatePolecatBaseBranch_RejectsReflogSyntax(t *testing.T) {
+	repo := t.TempDir()
+	gitRun(t, repo, "init", "-q", "-b", "main")
+	gitRun(t, repo, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-q", "--allow-empty", "-m", "init")
+	gitRun(t, repo, "checkout", "-q", "-b", "other")
+	gitRun(t, repo, "checkout", "-q", "main")
+	t.Chdir(repo)
+	if err := exec.Command("git", "check-ref-format", "--branch", "@{-1}").Run(); err != nil {
+		t.Fatalf("precondition: @{-1} should resolve in %s: %v", repo, err)
+	}
+
+	for _, base := range []string{"@{-1}", "@{u}", "dev@{upstream}", "main@{1}"} {
+		if err := validatePolecatBaseBranch(base); err == nil {
+			t.Errorf("validatePolecatBaseBranch(%q) = nil, want an error", base)
+		}
+	}
+}
+
+func revParse(t *testing.T, dir, ref string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", dir, "rev-parse", ref).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// Polecat branches carry '@' (polecat/<name>/<bead>@<suffix>), and --base
+// exists partly to stack a PR on one. Git accepts '+' and '@' in branch names,
+// and the explicit refspec means neither can act as a force flag.
+func TestEnsurePolecatWorkBranch_AcceptsPlusAndAtInBase(t *testing.T) {
+	for _, base := range []string{"polecat/x/gt-abc@suffix", "release+2026"} {
+		t.Run(base, func(t *testing.T) {
+			clone, tips := newRigClone(t, "")
+			gitRun(t, clone, "push", "-q", "origin", "main:refs/heads/"+base)
+			res, err := ensurePolecatWorkBranch(clone, "nux", "gt-abc", base)
+			if err != nil {
+				t.Fatalf("ensurePolecatWorkBranch(--base %q): %v", base, err)
+			}
+			if res.Action != polecatBranchCreated {
+				t.Fatalf("action = %q, want created", res.Action)
+			}
+			if got := headCommit(t, clone); got != tips["main"] {
+				t.Errorf("new branch is at %s, want %s", got, tips["main"])
 			}
 		})
 	}

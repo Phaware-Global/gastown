@@ -74,7 +74,7 @@ func ensurePolecatOffMain(ctx RoleContext, hookedBead *beads.Issue) error {
 			"(polecat=%q bead=%q) — restore the work branch before proceeding", branch, polecatName, beadID)
 	}
 
-	res, rErr := ensurePolecatWorkBranch(ctx.WorkDir, polecatName, beadID)
+	res, rErr := ensurePolecatWorkBranch(ctx.WorkDir, polecatName, beadID, "")
 	if rErr != nil {
 		printOffMainRefusal(branch, polecatName, beadID)
 		fmt.Fprintf(os.Stderr, "Auto-restore failed: %v\n\n", rErr)
