@@ -1332,34 +1332,22 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					"Retry 'gt done' — falling back to the polecat's own branch here is exactly what produced duplicate PRs #200/#201 and #208/#219", issueID, completionErr)
 			}
 
+			var headSHA string
 			if completion.reusePR > 0 {
+				headSHA, _ = g.Rev("HEAD")
 				// The reuse path force-closes the bead as "completed against
-				// PR #N" without ever pushing anything to that PR — verify
-				// the branch we're actually on is PR #N's head before taking
-				// it, or a review-fix polecat landed on the wrong branch
-				// (e.g. its own polecat/<name>-<bead> branch instead of the
-				// PR's branch) silently reports success while the reviewed
-				// defect merges unfixed. n==0 (no open PR on this branch) is
-				// also a mismatch and fails here.
-				//
-				// FindPRNumber's error return covers real failures (gh
-				// unauthenticated, rate-limited, offline, not installed),
-				// not just "no open PR" — a real failure must not silently
-				// skip verification. Fall back to comparing branch against
-				// the dispatch bead's review_branch (no network needed) and
-				// only accept the reuse when one of the two checks passed.
-				verified := false
-				if n, findErr := g.FindPRNumber(branch); findErr == nil {
-					verified = true
-					if n != completion.reusePR {
-						return fmt.Errorf("review-fix bead targets PR #%d but branch %s is on PR #%d", completion.reusePR, branch, n)
-					}
-				} else {
-					style.PrintWarning("could not verify branch %s is PR #%d via gh: %v", branch, completion.reusePR, findErr)
-				}
-				if !verified && (attachmentFields.ReviewBranch == "" || attachmentFields.ReviewBranch != branch) {
-					return fmt.Errorf("could not verify branch %s is PR #%d's head (gh lookup failed and branch doesn't match the dispatch bead's review_branch %q) — refusing to report success against an unverified branch",
-						branch, completion.reusePR, attachmentFields.ReviewBranch)
+				// PR #N" without pushing anything to that PR itself — verify
+				// the work is on PR #N's head first, or a review-fix polecat
+				// that landed on the wrong branch silently reports success
+				// while the reviewed defect merges unfixed. A fix fast-
+				// forwarded onto the PR branch has no PR under the polecat's
+				// own branch name, so verifyReviewFixTarget also accepts
+				// HEAD == the PR's head commit.
+				if verifyErr := verifyReviewFixTarget(branch, headSHA, attachmentFields.ReviewBranch, completion.reusePR, reviewFixPRProbe{
+					findPRNumber: g.FindPRNumber,
+					prHeadSHA:    g.GhPrHeadSHA,
+				}); verifyErr != nil {
+					return verifyErr
 				}
 				prNumber = completion.reusePR
 				prURL = fmt.Sprintf("#%d", prNumber)
@@ -1533,8 +1521,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// actually live before declaring this a clean completion;
 				// otherwise the PR sits orphaned from the merge pipeline
 				// while gt done reports success.
-				mrIssue, findErr := bd.FindMRForReviewPR(completion.reusePR)
-				lookup, lookupErr := resolveReviewFixMRLookup(mrIssue, findErr, completion.reusePR, issueID, branch)
+				lookup, lookupErr := completeReviewFixMR(bd, completion.reusePR, issueID, branch)
 				if lookupErr != nil {
 					// Fail closed: the lookup couldn't establish whether a
 					// live MR owns this work bead, so neither leave-open nor
@@ -3090,6 +3077,55 @@ func resolveNoMergeCompletion(fields *beads.AttachmentFields, mergeStrategyIsPR 
 	return noMergeCompletionTarget{createPR: mergeStrategyIsPR}, nil
 }
 
+// reviewFixPRProbe is the GitHub lookups verifyReviewFixTarget needs, as
+// function fields so tests can stub them.
+type reviewFixPRProbe struct {
+	findPRNumber func(branch string) (int, error)
+	prHeadSHA    func(prNumber int) (string, error)
+}
+
+// verifyReviewFixTarget confirms the work gt done is about to report as
+// "completed against PR #reusePR" is actually on that PR's head.
+//
+// A review-fix polecat may deliver its fix by fast-forwarding it onto the
+// PR's branch from its own polecat/<name> branch. The PR is then not found
+// by branch name (no PR has the polecat's branch as its head), yet the PR's
+// head commit is the polecat's HEAD. So a missing or unreachable branch
+// lookup falls back to comparing commit SHAs; only an open PR on the
+// polecat's branch that is a DIFFERENT PR is a hard mismatch.
+func verifyReviewFixTarget(branch, headSHA, reviewBranch string, reusePR int, probe reviewFixPRProbe) error {
+	n, findErr := probe.findPRNumber(branch)
+	if findErr == nil && n > 0 {
+		if n != reusePR {
+			return fmt.Errorf("review-fix bead targets PR #%d but branch %s is on PR #%d", reusePR, branch, n)
+		}
+		return nil
+	}
+
+	// No PR on this branch, or the lookup failed: does the PR's head equal
+	// our HEAD? That is the delivered-straight-to-the-PR-branch case.
+	prHead, shaErr := probe.prHeadSHA(reusePR)
+	if shaErr == nil && headSHA != "" && strings.EqualFold(prHead, headSHA) {
+		return nil
+	}
+
+	if findErr != nil {
+		style.PrintWarning("could not verify branch %s is PR #%d via gh: %v", branch, reusePR, findErr)
+		// gh is unusable: accept only when the branch is the one the
+		// dispatch bead named, which needs no network.
+		if reviewBranch != "" && reviewBranch == branch {
+			return nil
+		}
+		return fmt.Errorf("could not verify branch %s is PR #%d's head (gh lookup failed and branch doesn't match the dispatch bead's review_branch %q) — refusing to report success against an unverified branch",
+			branch, reusePR, reviewBranch)
+	}
+	if shaErr != nil {
+		return fmt.Errorf("branch %s has no open PR and PR #%d's head could not be read to compare against HEAD %s: %w", branch, reusePR, headSHA, shaErr)
+	}
+	return fmt.Errorf("review-fix bead targets PR #%d but branch %s has no open PR and HEAD %s is not PR #%d's head (%s) — the fix was not delivered to the PR branch",
+		reusePR, branch, headSHA, reusePR, prHead)
+}
+
 // reviewFixMRLookupResult is what gt done needs from FindMRForReviewPR's
 // answer to complete a reused-PR (review-fix) run correctly.
 type reviewFixMRLookupResult struct {
@@ -3097,6 +3133,24 @@ type reviewFixMRLookupResult struct {
 	refineryOwnsMerge bool   // true: leave the work bead open, don't force-close it
 	mrFailed          bool   // true: lookup didn't confirm a live MR bead
 	errMsg            string // doneErrors entry to record when mrFailed
+}
+
+// reviewFixMRStore is the slice of the beads API completeReviewFixMR reads
+// through. It deliberately has no write method: see completeReviewFixMR.
+type reviewFixMRStore interface {
+	FindMRForReviewPR(prNumber int) (*beads.Issue, error)
+}
+
+// completeReviewFixMR looks up the MR bead tracking the reused PR and
+// resolves the completion state from it. It never writes to the MR bead.
+// In particular it leaves commit_sha alone: await-review detects a pushed fix
+// by comparing the MR bead's commit_sha with the PR's live head, so
+// advancing commit_sha here would make the two equal and the refinery would
+// never re-request review. await-review writes the new value itself once it
+// has dispatched the reviewer.
+func completeReviewFixMR(store reviewFixMRStore, reusePR int, issueID, branch string) (reviewFixMRLookupResult, error) {
+	mrIssue, findErr := store.FindMRForReviewPR(reusePR)
+	return resolveReviewFixMRLookup(mrIssue, findErr, reusePR, issueID, branch)
 }
 
 // resolveReviewFixMRLookup turns FindMRForReviewPR's result into gt done's
