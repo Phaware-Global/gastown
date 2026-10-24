@@ -169,7 +169,7 @@ func TestTerminateDogSession_KillsWhenStillIdle(t *testing.T) {
 	setupTestDog(t, m, root, "delta", idleDogState("delta"))
 
 	kills, nudges := 0, 0
-	killed, err := terminateDogSession(m, "delta", func() error { kills++; return nil }, func() error { nudges++; return nil })
+	killed, err := terminateDogSession(m, "delta", func() error { kills++; return nil }, func(string) error { nudges++; return nil })
 	if err != nil || !killed || kills != 1 || nudges != 0 {
 		t.Fatalf("terminateDogSession = (%v, %v) kills=%d nudges=%d, want (true, nil), one kill and no nudge", killed, err, kills, nudges)
 	}
@@ -184,15 +184,32 @@ func TestTerminateDogSession_SkipsKillWhenReassigned(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	kills, nudges := 0, 0
-	killed, err := terminateDogSession(m, "delta", func() error { kills++; return nil }, func() error { nudges++; return nil })
+	kills := 0
+	var nudged []string
+	killed, err := terminateDogSession(m, "delta", func() error { kills++; return nil }, func(p string) error { nudged = append(nudged, p); return nil })
 	if err != nil || killed || kills != 0 {
 		t.Fatalf("terminateDogSession = (%v, %v) kills=%d, want (false, nil) and no kill", killed, err, kills)
 	}
-	// The reused session's agent sits at its prompt; it must be told to read
-	// the new job's mail.
-	if nudges != 1 {
-		t.Errorf("nudges = %d, want 1 so the reassigned session starts its new job", nudges)
+	// The reused session's agent sits at its prompt; it must be told which
+	// plugin's mail to follow.
+	if strings.Join(nudged, ",") != "y" {
+		t.Errorf("nudged %q, want one nudge naming plugin y", nudged)
+	}
+}
+
+// gt sling injects its own start prompt, so a dog reassigned to slung work
+// gets no plugin-mail nudge.
+func TestTerminateDogSession_NoNudgeForSlungWork(t *testing.T) {
+	m, root := testDogManager(t)
+	setupTestDog(t, m, root, "delta", idleDogState("delta"))
+	if err := m.AssignWork("delta", "gt-abc"); err != nil {
+		t.Fatal(err)
+	}
+
+	nudges := 0
+	killed, err := terminateDogSession(m, "delta", func() error { return nil }, func(string) error { nudges++; return nil })
+	if err != nil || killed || nudges != 0 {
+		t.Fatalf("terminateDogSession = (%v, %v) nudges=%d, want (false, nil) and no nudge", killed, err, nudges)
 	}
 }
 
@@ -205,7 +222,7 @@ func TestTerminateDogSession_ReportsFailedNudge(t *testing.T) {
 	}
 
 	wantErr := errors.New("no such session")
-	killed, err := terminateDogSession(m, "delta", func() error { return nil }, func() error { return wantErr })
+	killed, err := terminateDogSession(m, "delta", func() error { return nil }, func(string) error { return wantErr })
 	if killed || !errors.Is(err, wantErr) {
 		t.Fatalf("terminateDogSession = (%v, %v), want (false, %v)", killed, err, wantErr)
 	}

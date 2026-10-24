@@ -18,6 +18,7 @@ import (
 	"github.com/steveyegge/gastown/internal/plugin"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -753,9 +754,7 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 	go func() {
 		time.Sleep(3 * time.Second)
 		kill := func() error { return t.KillSession(sessionID) }
-		nudge := func() error {
-			return t.NudgeSession(sessionID, "You have been dispatched a new job. Run `gt mail inbox` and follow the Plugin: mail.")
-		}
+		nudge := func(plugin string) error { return startDetachedDogNudge(sessionID, plugin) }
 		if _, err := terminateDogSession(mgr, name, kill, nudge); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to kill or nudge session %s: %v\n", sessionID, err)
 		}
@@ -775,6 +774,7 @@ type dogDoneStore interface {
 
 // idleLocker is the slice of dog.Manager that terminateDogSession needs.
 type idleLocker interface {
+	Get(name string) (*dog.Dog, error)
 	WithIdleLock(name string, fn func() error) (bool, error)
 }
 
@@ -783,15 +783,38 @@ type idleLocker interface {
 // started its session, which the kill would take with it. The check and the
 // kill share the dog's lock, so no assignment can slip between them.
 //
-// A dispatch that wins reuses the live session without a startup prompt, and
-// the agent in it has finished and sits at its prompt, so its new job's mail
-// would go unread. nudge then tells it to check mail.
-func terminateDogSession(mgr idleLocker, name string, kill, nudge func() error) (killed bool, err error) {
+// A plugin dispatch that wins reuses the live session without a startup
+// prompt, and the agent in it has finished and sits at its prompt, so the new
+// plugin's mail would go unread. nudge is then called with that plugin's name.
+// gt sling injects its own start prompt, so other work is not nudged.
+func terminateDogSession(mgr idleLocker, name string, kill func() error, nudge func(plugin string) error) (killed bool, err error) {
 	killed, err = mgr.WithIdleLock(name, kill)
 	if err != nil || killed {
 		return killed, err
 	}
-	return false, nudge()
+	d, err := mgr.Get(name)
+	if err != nil {
+		return false, err
+	}
+	plugin, ok := strings.CutPrefix(d.Work, "plugin:")
+	if !ok {
+		return false, nil
+	}
+	return false, nudge(plugin)
+}
+
+// startDetachedDogNudge tells a reassigned dog session to start the plugin it
+// was dispatched. It runs gt nudge (wait-idle) as a detached process: the
+// session is busy with this gt dog done until it returns, and this process
+// exits about a second after starting the nudge.
+func startDetachedDogNudge(sessionID, plugin string) error {
+	msg := fmt.Sprintf("You were dispatched plugin %s. Run `gt mail inbox` and follow the \"Plugin: %s\" mail.", plugin, plugin)
+	cmd := exec.Command("gt", "nudge", sessionID, msg) //nolint:gosec // G204: session and plugin names come from the dog's own state
+	util.SetDetachedProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return cmd.Process.Release()
 }
 
 // completeDogDone returns the dog to idle, then runs the best-effort cleanup
