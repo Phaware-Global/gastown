@@ -232,13 +232,6 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 		return NewSilentExit(1)
 	}
 
-	// Stage 1b: MR state records no review-fix polecat, but a scoped bead held by
-	// another polecat may already own this PR's fixes. Dispatching on top of it
-	// puts two polecats on one PR branch.
-	if err := reviewFixHolderGate(listReviewFixHolderCandidates(refPrDispatchReviewFixMR), state, refPrDispatchReviewFixMR); err != nil {
-		return err
-	}
-
 	// Stage 2: no polecat in flight — poll unresolved threads. Author-
 	// agnostic: every unresolved thread counts regardless of who opened it.
 	// Filtering by author here would re-introduce the G12b dogfood failure
@@ -247,7 +240,16 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return wrapOperationalErr(fmt.Errorf("polling unresolved threads: %w", err))
 	}
-	if len(threads) == 0 {
+	holderGate := func() error {
+		return reviewFixHolderGate(listReviewFixHolderCandidates(refPrDispatchReviewFixMR),
+			func(name string) (bool, error) { return isReviewFixPolecatAlive(rigName, name) },
+			rigName, state, refPrDispatchReviewFixMR)
+	}
+	step, err := nextReviewFixStep(len(threads), state.ReviewLoopIter, maxIter, holderGate)
+	if err != nil {
+		return err
+	}
+	if step == reviewFixAdvance {
 		// Zero threads is not the same as nothing blocking. The Reviewer can
 		// deliver an unanchorable objection via `disposition`, which posts
 		// REQUEST_CHANGES with no findings and therefore no threads for this loop
@@ -269,8 +271,9 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 	}
 
 	// Stage 3: threads exist. Either dispatch a fresh polecat or escalate
-	// if we've hit the iteration cap.
-	if state.ReviewLoopIter >= maxIter {
+	// if we've hit the iteration cap. nextReviewFixStep has already run the
+	// holder gate for a dispatch.
+	if step == reviewFixEscalateCap {
 		// Escalate. The mayor closes the escalation when a human merges
 		// the PR or kills the loop; the next patrol picks the MR back up.
 		threadsJSON, _ := json.Marshal(threads)
@@ -385,6 +388,37 @@ func runRefineryPrDispatchReviewFix(cmd *cobra.Command, args []string) error {
 	fmt.Fprintf(os.Stdout, "%s PR #%d: dispatched review-fix polecat %s (iter=%d of %d)\n",
 		style.Bold.Render("→"), state.PRNumber, polecatName, newIter, maxIter)
 	return NewSilentExit(1)
+}
+
+// reviewFixStep is what the dispatch does once Stage 1 has found no polecat in
+// flight.
+type reviewFixStep int
+
+const (
+	// reviewFixAdvance: nothing to fix; the formula moves on to wait-approval.
+	reviewFixAdvance reviewFixStep = iota
+	// reviewFixEscalateCap: threads remain and the iteration cap is spent.
+	reviewFixEscalateCap
+	// reviewFixDispatch: threads remain; a fresh polecat is dispatched.
+	reviewFixDispatch
+)
+
+// nextReviewFixStep decides the dispatch's next step from the unresolved-thread
+// count and the iteration budget. holderGate runs only on the way to an actual
+// dispatch: a PR with nothing to fix must still reach wait-approval, and the
+// iteration-cap escalation is a report to a human rather than a second polecat on
+// the branch, so neither waits on another bead's holder.
+func nextReviewFixStep(threads, iter, maxIter int, holderGate func() error) (reviewFixStep, error) {
+	if threads == 0 {
+		return reviewFixAdvance, nil
+	}
+	if iter >= maxIter {
+		return reviewFixEscalateCap, nil
+	}
+	if err := holderGate(); err != nil {
+		return reviewFixDispatch, err
+	}
+	return reviewFixDispatch, nil
 }
 
 // mrAndSourceShower reads an MR or source bead from the database that owns its ID.
