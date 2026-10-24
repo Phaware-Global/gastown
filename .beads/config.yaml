@@ -51,4 +51,6 @@ dolt.idle-timeout: "0"
 # regressions when the bd binary is upgraded. (gt-b48)
 export.auto: "false"
 
-sync.remote: "git+https://github.com/steveyegge/gastown.git"
+# Do not set sync.remote here: bd turns it into a Dolt push remote for the
+# town database, which holds issues and mail. Dolt pushes go through
+# plugins/dolt-archive, which only pushes to confirmed-private repos.

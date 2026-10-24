@@ -136,6 +136,212 @@ log() {
   echo "[compactor-dog] $*"
 }
 
+# INVARIANT: a database with a configured Dolt remote is never flattened in a
+# cycle that cannot push to it. Flatten rewrites the commit graph, so a remote
+# we could not push after it keeps an old HEAD that is no longer in local
+# history; the next cycle that can reach it would read the database as
+# "diverged" and skip it for good. So when the remote exists but the
+# visibility guard refuses it for ANY reason (public, unknown, non-GitHub,
+# DoltHub, unreadable URL or name, or a missing guard, gh or timeout), the
+# database is skipped this cycle (no fetch, no divergence check, no flatten, no
+# push) and escalated once, fingerprinted per db and reason. A database with NO
+# remote compacts locally. There is deliberately no per-reason branching.
+#
+# The push target is decided ONCE per database, up front, by
+# resolve_push_target (remote name, URL and guard verdict in one place);
+# remote_gate applies the invariant. This script and compactor_dog.go both send
+# the town database off the machine, so both clear the dolt-archive visibility
+# guard and fail closed.
+
+# Source the dolt-archive visibility guard from GUARD_FILE; with no guard on
+# disk, install a stub that refuses everything.
+load_visibility_guard() {
+  local guard_file="$1"
+  if [[ -f "$guard_file" ]]; then
+    # shellcheck source=../dolt-archive/visibility_guard.sh
+    source "$guard_file"
+  else
+    remote_push_allowed() { echo "guard-missing"; return 1; }
+  fi
+}
+load_visibility_guard "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../dolt-archive/visibility_guard.sh"
+
+# Run a query and keep the first line of its result in QUERY_OUT. Returns
+# non-zero if the QUERY FAILED; success with an empty result is QUERY_OUT="".
+# Every read in the push-target path goes through this (or checks the status
+# itself) so that "failed" is never mistaken for "empty": under pipefail a
+# failing dolt makes dolt_query fail, and a bare "|| value=''" would turn that
+# into an absence.
+QUERY_OUT=""
+query_first() {
+  local out
+  QUERY_OUT=""
+  if ! out="$(dolt_query "$1" "$2" 2>/dev/null)"; then
+    return 1
+  fi
+  QUERY_OUT="${out%%$'\n'*}"
+}
+
+# After a successful fetch of REMOTE_NAME: is the remote's main HEAD in local
+# history? Returns 0 to proceed (remote HEAD absent, equal to local, or an
+# ancestor), 10 when the remote has commits local lacks (diverged), 11 when the
+# check could not be made (a read failed or returned something unusable) — that
+# is not "no divergence", so the caller must skip the database, not flatten it
+# and force-push over commits that might exist only on the remote. Logs the
+# reason.
+verify_remote_not_diverged() {
+  local db="$1" local_head remote_head is_ancestor
+
+  if ! query_first "$db" "SELECT commit_hash FROM dolt_log ORDER BY date DESC LIMIT 1"; then
+    log "  ERROR: could not read the local HEAD of $db — cannot verify the remote"
+    return 11
+  fi
+  local_head="$QUERY_OUT"
+  if [[ -z "$local_head" ]] || ! validate_hash "$local_head" "local HEAD"; then
+    log "  ERROR: local HEAD of $db is empty or malformed — cannot verify the remote"
+    return 11
+  fi
+
+  if ! query_first "$db" "SELECT hash FROM dolt_remote_branches WHERE name = 'remotes/${REMOTE_NAME}/main'"; then
+    log "  ERROR: could not read the remote HEAD of $db — cannot verify the remote"
+    return 11
+  fi
+  remote_head="$QUERY_OUT"
+  # A successful empty read: the remote has no main branch yet.
+  [[ -n "$remote_head" ]] || return 0
+  if ! validate_hash "$remote_head" "remote HEAD"; then
+    log "  ERROR: remote HEAD of $db is malformed — cannot verify the remote"
+    return 11
+  fi
+  [[ "$remote_head" != "$local_head" ]] || return 0
+
+  # Remote HEAD is an ancestor of local history (local is ahead): safe.
+  if ! query_first "$db" "SELECT COUNT(*) FROM dolt_log WHERE commit_hash = '$remote_head'"; then
+    log "  ERROR: could not check whether the remote HEAD of $db is in local history — cannot verify the remote"
+    return 11
+  fi
+  is_ancestor="$QUERY_OUT"
+  case "$is_ancestor" in
+    0)
+      log "  ERROR: Remote has commits not in local history — skipping compaction to avoid data loss"
+      log "  Local HEAD:  ${local_head:0:12}"
+      log "  Remote HEAD: ${remote_head:0:12}"
+      return 10
+      ;;
+    ''|*[!0-9]*)
+      log "  ERROR: unexpected ancestor-check result '$is_ancestor' for $db — cannot verify the remote"
+      return 11
+      ;;
+  esac
+  return 0
+}
+
+# Decide DB's push target. Sets, for the caller:
+#   HAS_REMOTE           true only for a validly named remote whose URL the
+#                        guard confirms private (the push target)
+#   REMOTE_NAME/URL      that remote (empty otherwise)
+#   PUSH_REFUSED         true when a remote EXISTS but is not a push target
+#   PUSH_REFUSAL_REASON  why (the guard's verdict, or url-unresolvable /
+#                        unsafe-remote-name)
+# No remote at all leaves all of them false/empty.
+HAS_REMOTE=false
+REMOTE_NAME=""
+REMOTE_URL=""
+PUSH_REFUSED=false
+PUSH_REFUSAL_REASON=""
+resolve_push_target() {
+  local db="$1" reason
+  HAS_REMOTE=false
+  REMOTE_NAME=""
+  REMOTE_URL=""
+  PUSH_REFUSED=false
+  PUSH_REFUSAL_REASON=""
+
+  # Only a SUCCESSFUL lookup with an empty result means "no remote"; a failed
+  # lookup leaves the destination unknown, which is a refusal.
+  if ! query_first "$db" "SELECT name FROM dolt_remotes LIMIT 1"; then
+    PUSH_REFUSED=true
+    PUSH_REFUSAL_REASON="remote-lookup-failed"
+    return 0
+  fi
+  local name="$QUERY_OUT"
+  [[ -n "$name" ]] || return 0
+  if ! validate_name "$name" "remote"; then
+    PUSH_REFUSED=true
+    PUSH_REFUSAL_REASON="unsafe-remote-name"
+    return 0
+  fi
+
+  if ! query_first "$db" "SELECT url FROM dolt_remotes WHERE name = '$name'"; then
+    PUSH_REFUSED=true
+    PUSH_REFUSAL_REASON="remote-lookup-failed"
+    return 0
+  fi
+  local url="$QUERY_OUT"
+  if [[ -z "$url" ]]; then
+    PUSH_REFUSED=true
+    PUSH_REFUSAL_REASON="url-unresolvable"
+    return 0
+  fi
+  if ! reason="$(remote_push_allowed "$url")"; then
+    PUSH_REFUSED=true
+    PUSH_REFUSAL_REASON="$reason"
+    return 0
+  fi
+
+  HAS_REMOTE=true
+  REMOTE_NAME="$name"
+  REMOTE_URL="$url"
+}
+
+# Escalate a refused push target once: the fingerprint is per db and reason, so
+# an open escalation suppresses the repeats from later cycles. Never fails the
+# run (set -e).
+escalate_push_refused() {
+  local db="$1" reason="$2" title why
+  if [[ "$reason" == "remote-lookup-failed" ]]; then
+    # The remote's name or URL could not be read, so there is no refusal of a
+    # particular remote to report: say the configuration was unreadable.
+    title="compactor-dog: skipped $db — could not read its Dolt remote configuration ($reason)"
+    why="compactor-dog could not read the Dolt remote configuration of $db ($reason), so it cannot tell whether a push is possible and skipped compaction: flattening a database whose remote it cannot push would leave that remote diverged. Check that the Dolt server is healthy; the skip repeats until the read succeeds."
+  else
+    title="compactor-dog: skipped $db — its Dolt remote cannot be pushed ($reason)"
+    why="$db has a Dolt remote that the push visibility guard refused ($reason), so compaction was skipped: flattening without being able to push would leave the remote diverged. Fix the remote (make it a private GitHub repo or remove it) or the guard environment (gh, timeout)."
+  fi
+  gt escalate "$title" -s MEDIUM \
+    --fingerprint "compactor-dog:push-refused:${db}:${reason}" \
+    --reason "$why" \
+    >/dev/null 2>&1 || true
+}
+
+# Apply the invariant for DB. Returns 0 to go ahead (no remote, or a push
+# target to fetch from and push to); returns 3 to skip the database this cycle,
+# after logging and escalating the refusal.
+remote_gate() {
+  local db="$1"
+  resolve_push_target "$db"
+  if $PUSH_REFUSED; then
+    log "  REFUSED: the Dolt remote of $db cannot be pushed (${PUSH_REFUSAL_REASON}) — skipping compaction this cycle (no fetch, no flatten, no push)"
+    escalate_push_refused "$db" "$PUSH_REFUSAL_REASON"
+    return 3
+  fi
+  return 0
+}
+
+# Force-push the compacted history of DB to REMOTE, which must be the push
+# target resolve_push_target accepted. Flatten rewrites the commit graph, so
+# this must be a force-push; --set-upstream because flatten loses branch
+# tracking metadata. Refuses (return 2) for anything else, so it cannot be
+# called on a remote nobody judged.
+push_compacted_history() {
+  local db="$1" remote="$2"
+  if ! $HAS_REMOTE || [[ "$remote" != "$REMOTE_NAME" ]]; then
+    log "  REFUSED: '$remote' for $db is not the resolved push target — not pushing"
+    return 2
+  fi
+  dolt_exec "$db" "CALL DOLT_PUSH('--force', '--set-upstream', '$remote', 'main')"
+}
+
 # Wait for a PID with a timeout (seconds). Returns 0 if process exits in time.
 # macOS lacks `timeout` command, so we poll with sleep.
 wait_with_timeout() {
@@ -299,16 +505,14 @@ for entry in "${CANDIDATES[@]}"; do
   # NOTE: We use DOLT_FETCH instead of DOLT_PULL because a live Dolt server
   # always has uncommitted working set changes, making DOLT_PULL fail with
   # "cannot merge with uncommitted changes".
-  HAS_REMOTE=false
-  REMOTE_NAME=$(dolt_query "$DB" "SELECT name FROM dolt_remotes LIMIT 1" 2>/dev/null | head -1)
-  if [[ -n "$REMOTE_NAME" ]]; then
-    if ! validate_name "$REMOTE_NAME" "remote"; then
-      log "  [handled] Skipping remote with unsafe name: '$REMOTE_NAME'"
-      REMOTE_NAME=""
-    fi
+  # The invariant (see remote_gate): a database whose configured remote cannot
+  # be pushed this cycle is skipped, never flattened. A database with no remote
+  # compacts locally; one with a push target is fetched, flattened and pushed.
+  if ! remote_gate "$DB"; then
+    SKIPPED+=("$DB (remote cannot be pushed: $PUSH_REFUSAL_REASON)")
+    continue
   fi
-  if [[ -n "$REMOTE_NAME" ]]; then
-    HAS_REMOTE=true
+  if $HAS_REMOTE; then
     log "  Remote detected ('$REMOTE_NAME'). Fetching to check for divergence (60s timeout)..."
     # Run fetch with timeout — DoltHub can hang indefinitely on large databases.
     # macOS lacks `timeout`, so use background + wait + kill pattern.
@@ -337,26 +541,18 @@ for entry in "${CANDIDATES[@]}"; do
     # Verify local HEAD is at or ahead of remote HEAD.
     # If remote has commits we don't have, compaction would lose them.
     # Only check when fetch succeeded — stale remote info gives false positives.
-    LOCAL_HEAD=""
-    REMOTE_HEAD=""
     if $FETCH_OK; then
-      LOCAL_HEAD=$(dolt_query "$DB" "SELECT commit_hash FROM dolt_log ORDER BY date DESC LIMIT 1" 2>/dev/null | head -1) || true
-      REMOTE_HEAD=$(dolt_query "$DB" "SELECT commit_hash FROM dolt_remote_branches WHERE name = '${REMOTE_NAME}/main'" 2>/dev/null | head -1) || true
-      # Validate hashes before using in SQL.
-      # Use if/then — bare && chains return 1 on short-circuit, which set -e kills.
-      if [[ -n "$LOCAL_HEAD" ]] && ! validate_hash "$LOCAL_HEAD" "local HEAD"; then LOCAL_HEAD=""; fi
-      if [[ -n "$REMOTE_HEAD" ]] && ! validate_hash "$REMOTE_HEAD" "remote HEAD"; then REMOTE_HEAD=""; fi
-      if [[ -n "$REMOTE_HEAD" && -n "$LOCAL_HEAD" && "$REMOTE_HEAD" != "$LOCAL_HEAD" ]]; then
-        # Check if remote HEAD is an ancestor of local HEAD (local is ahead — safe)
-        IS_ANCESTOR=$(dolt_query "$DB" "SELECT COUNT(*) FROM dolt_log WHERE commit_hash = '$REMOTE_HEAD'" 2>/dev/null | head -1)
-        if [[ "$IS_ANCESTOR" == "0" ]]; then
-          log "  ERROR: Remote has commits not in local history — skipping compaction to avoid data loss"
-          log "  Local HEAD:  ${LOCAL_HEAD:0:12}"
-          log "  Remote HEAD: ${REMOTE_HEAD:0:12}"
-          ERRORS=$((ERRORS + 1))
-          ERROR_DETAILS="${ERROR_DETAILS}${DB}: remote ahead of local (skipped to avoid data loss)\n"
-          continue
-        fi
+      DIVERGENCE_RC=0
+      verify_remote_not_diverged "$DB" || DIVERGENCE_RC=$?
+      if [[ "$DIVERGENCE_RC" -eq 10 ]]; then
+        ERRORS=$((ERRORS + 1))
+        ERROR_DETAILS="${ERROR_DETAILS}${DB}: remote ahead of local (skipped to avoid data loss)\n"
+        continue
+      elif [[ "$DIVERGENCE_RC" -ne 0 ]]; then
+        # The check could not be made: not the same as "no divergence".
+        ERRORS=$((ERRORS + 1))
+        ERROR_DETAILS="${ERROR_DETAILS}${DB}: could not verify the remote against local history (skipped)\n"
+        continue
       fi
       log "  Remote fetch complete. Local is at or ahead of remote."
     fi
@@ -470,9 +666,9 @@ for entry in "${CANDIDATES[@]}"; do
   # Use --set-upstream because flatten loses branch tracking metadata.
   if $HAS_REMOTE; then
     log "  Pushing compacted history to remote ('$REMOTE_NAME')..."
-    if ! dolt_exec "$DB" "CALL DOLT_PUSH('--force', '--set-upstream', '$REMOTE_NAME', 'main')"; then
-      log "  [handled] Force-push to remote failed for $DB — remote will resync on next cycle"
-      ERROR_DETAILS="${ERROR_DETAILS}${DB}: force-push failed (local compacted, remote diverged)\n"
+    if ! push_compacted_history "$DB" "$REMOTE_NAME"; then
+      log "  [handled] Force-push to remote not completed for $DB (failed or refused by the visibility guard) — remote will resync on next cycle"
+      ERROR_DETAILS="${ERROR_DETAILS}${DB}: force-push not completed (failed or refused; local compacted)\n"
       ERRORS=$((ERRORS + 1))
     else
       log "  Remote push complete."
