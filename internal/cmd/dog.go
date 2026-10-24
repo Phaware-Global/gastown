@@ -752,8 +752,12 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 	// the tmux package which handles the socket name automatically.
 	go func() {
 		time.Sleep(3 * time.Second)
-		if _, err := terminateDogSession(mgr, name, func() error { return t.KillSession(sessionID) }); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to kill session %s: %v\n", sessionID, err)
+		kill := func() error { return t.KillSession(sessionID) }
+		nudge := func() error {
+			return t.NudgeSession(sessionID, "You have been dispatched a new job. Run `gt mail inbox` and follow the Plugin: mail.")
+		}
+		if _, err := terminateDogSession(mgr, name, kill, nudge); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to kill or nudge session %s: %v\n", sessionID, err)
 		}
 	}()
 
@@ -778,8 +782,16 @@ type idleLocker interface {
 // idle and this point a dispatch may have assigned the dog a new job and
 // started its session, which the kill would take with it. The check and the
 // kill share the dog's lock, so no assignment can slip between them.
-func terminateDogSession(mgr idleLocker, name string, kill func() error) (killed bool, err error) {
-	return mgr.WithIdleLock(name, kill)
+//
+// A dispatch that wins reuses the live session without a startup prompt, and
+// the agent in it has finished and sits at its prompt, so its new job's mail
+// would go unread. nudge then tells it to check mail.
+func terminateDogSession(mgr idleLocker, name string, kill, nudge func() error) (killed bool, err error) {
+	killed, err = mgr.WithIdleLock(name, kill)
+	if err != nil || killed {
+		return killed, err
+	}
+	return false, nudge()
 }
 
 // completeDogDone returns the dog to idle, then runs the best-effort cleanup
@@ -875,6 +887,11 @@ func archivePluginMails(mailbox pluginMailbox, dogName string, before time.Time)
 	if err != nil {
 		return 0
 	}
+	// A mail's timestamp is stored to whole seconds, so one sent just after
+	// before can read as earlier than it. Archive only mail from at least a
+	// second before before's second; a stale mail that survives is archived
+	// by the next gt dog done.
+	cutoff := before.Truncate(time.Second).Add(-time.Second)
 
 	closed := 0
 	for _, msg := range messages {
@@ -892,7 +909,7 @@ func archivePluginMails(mailbox pluginMailbox, dogName string, before time.Time)
 		if sender != "deacon/" && sender != "daemon" {
 			continue
 		}
-		if !msg.Timestamp.Before(before) {
+		if !msg.Timestamp.Before(cutoff) {
 			continue
 		}
 		if archErr := mailbox.Archive(msg.ID); archErr == nil {

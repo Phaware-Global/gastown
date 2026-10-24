@@ -142,6 +142,23 @@ func TestArchivePluginMails_KeepsMailSentAfterCutoff(t *testing.T) {
 	}
 }
 
+// Mail timestamps are stored to whole seconds, so a dispatch sent a moment
+// after the cutoff can read as earlier than it. That mail must survive.
+func TestArchivePluginMails_KeepsMailStoredInTheCutoffSecond(t *testing.T) {
+	cutoff := time.Date(2026, 10, 24, 17, 8, 5, 700_000_000, time.UTC)
+	sent := cutoff.Add(150 * time.Millisecond)
+	mb := &fakeMailbox{msgs: []*mail.Message{
+		pluginMail("old", "Plugin: X", "daemon", cutoff.Add(-2*time.Second).Truncate(time.Second)),
+		pluginMail("same-second-job", "Plugin: Y", "daemon", sent.Truncate(time.Second)),
+	}}
+
+	n := archivePluginMails(mb, "delta", cutoff)
+
+	if n != 1 || strings.Join(mb.archived, ",") != "old" {
+		t.Errorf("archived %v (n=%d), want only the mail from before the cutoff's second", mb.archived, n)
+	}
+}
+
 func idleDogState(name string) *dog.DogState {
 	now := time.Now()
 	return &dog.DogState{Name: name, State: dog.StateIdle, LastActive: now, CreatedAt: now, UpdatedAt: now}
@@ -151,10 +168,10 @@ func TestTerminateDogSession_KillsWhenStillIdle(t *testing.T) {
 	m, root := testDogManager(t)
 	setupTestDog(t, m, root, "delta", idleDogState("delta"))
 
-	kills := 0
-	killed, err := terminateDogSession(m, "delta", func() error { kills++; return nil })
-	if err != nil || !killed || kills != 1 {
-		t.Fatalf("terminateDogSession = (%v, %v) kills=%d, want (true, nil) and one kill", killed, err, kills)
+	kills, nudges := 0, 0
+	killed, err := terminateDogSession(m, "delta", func() error { kills++; return nil }, func() error { nudges++; return nil })
+	if err != nil || !killed || kills != 1 || nudges != 0 {
+		t.Fatalf("terminateDogSession = (%v, %v) kills=%d nudges=%d, want (true, nil), one kill and no nudge", killed, err, kills, nudges)
 	}
 }
 
@@ -167,9 +184,29 @@ func TestTerminateDogSession_SkipsKillWhenReassigned(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	kills := 0
-	killed, err := terminateDogSession(m, "delta", func() error { kills++; return nil })
+	kills, nudges := 0, 0
+	killed, err := terminateDogSession(m, "delta", func() error { kills++; return nil }, func() error { nudges++; return nil })
 	if err != nil || killed || kills != 0 {
 		t.Fatalf("terminateDogSession = (%v, %v) kills=%d, want (false, nil) and no kill", killed, err, kills)
+	}
+	// The reused session's agent sits at its prompt; it must be told to read
+	// the new job's mail.
+	if nudges != 1 {
+		t.Errorf("nudges = %d, want 1 so the reassigned session starts its new job", nudges)
+	}
+}
+
+// A failed nudge is reported, so gt dog done can warn about it.
+func TestTerminateDogSession_ReportsFailedNudge(t *testing.T) {
+	m, root := testDogManager(t)
+	setupTestDog(t, m, root, "delta", idleDogState("delta"))
+	if err := m.AssignWork("delta", "plugin:y"); err != nil {
+		t.Fatal(err)
+	}
+
+	wantErr := errors.New("no such session")
+	killed, err := terminateDogSession(m, "delta", func() error { return nil }, func() error { return wantErr })
+	if killed || !errors.Is(err, wantErr) {
+		t.Fatalf("terminateDogSession = (%v, %v), want (false, %v)", killed, err, wantErr)
 	}
 }
