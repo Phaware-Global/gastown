@@ -293,3 +293,43 @@ func TestPickMRForReviewPR(t *testing.T) {
 		})
 	}
 }
+
+// A branch whose PR the refinery already tracks must not get a second MR just
+// because its HEAD moved: the branch+SHA dedup misses it, and supersede only
+// closes MRs of the same source issue (gt-lil3e: a mayor-scoped review-fix bead
+// minted gt-wisp-icn7 beside gt-wisp-lt7s for PR #345).
+func TestPickInFlightPRMRForBranch(t *testing.T) {
+	mk := func(id, status, desc string) *Issue {
+		return &Issue{ID: id, Status: status, Description: desc, Labels: []string{"gt:merge-request"}}
+	}
+	const branch = "polecat/valkyrie/gt-84xe4@mvm5un22"
+	tracked := "branch: " + branch + "\nsource_issue: gt-84xe4\ncommit_sha: old\nreview_pr: 345\n"
+	untracked := "branch: " + branch + "\nsource_issue: gt-84xe4\ncommit_sha: old\n"
+
+	tests := []struct {
+		name   string
+		issues []*Issue
+		branch string
+		wantID string
+	}{
+		{"open MR with a review_pr is in flight", []*Issue{mk("lt7s", "open", tracked)}, branch, "lt7s"},
+		{"MR without a PR yet is not claimed", []*Issue{mk("lt7s", "open", untracked)}, branch, ""},
+		{"closed MR is not in flight", []*Issue{mk("lt7s", "closed", tracked)}, branch, ""},
+		{"tombstoned MR is not in flight", []*Issue{mk("lt7s", "tombstone", tracked)}, branch, ""},
+		{"other branch is not matched", []*Issue{mk("lt7s", "open", tracked)}, "polecat/other", ""},
+		{"a longer branch is a different branch", []*Issue{mk("lt7s", "open", tracked)}, branch + "-v2", ""},
+		{"empty branch matches nothing", []*Issue{mk("lt7s", "open", tracked)}, "", ""},
+		{"skips untracked, finds tracked", []*Issue{mk("a", "open", untracked), mk("b", "open", tracked)}, branch, "b"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := pickInFlightPRMRForBranch(tt.issues, tt.branch)
+			switch {
+			case tt.wantID == "" && got != nil:
+				t.Fatalf("got %s, want nil", got.ID)
+			case tt.wantID != "" && (got == nil || got.ID != tt.wantID):
+				t.Fatalf("got %v, want %s", got, tt.wantID)
+			}
+		})
+	}
+}
