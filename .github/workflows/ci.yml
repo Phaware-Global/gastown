@@ -233,6 +233,17 @@ jobs:
         # restores headroom for runner variance.
         run: gotestsum --format testname --junitfile junit-integration.xml -- -tags=integration -timeout=40m -v ./internal/cmd/...
 
+      - name: Compactor push-target tests (real Dolt)
+        # Runs the compactor's remote/divergence SQL against the dolt binary
+        # installed above (a throwaway server on a free port over temp dirs with
+        # file:// remotes; never port 3307, never a network push), plus the
+        # compactor-dog and dolt-archive shell guard tests, which no other job runs.
+        run: |
+          go test -tags=integration -run 'TestRealDolt_' -timeout=10m -v ./internal/daemon/
+          bash plugins/compactor-dog/realdolt_test.sh
+          bash plugins/compactor-dog/push_guard_test.sh
+          bash plugins/dolt-archive/visibility_guard_test.sh
+
       - name: Test Report
         if: always()
         env:

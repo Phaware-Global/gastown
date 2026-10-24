@@ -1,4 +1,4 @@
-package daemon
+package remoteguard
 
 import (
 	"context"
@@ -65,9 +65,9 @@ func TestGithubOwnerRepo(t *testing.T) {
 	}
 }
 
-// TestRemotePushAllowed ports the guard scenarios from
+// TestPushAllowed ports the guard scenarios from
 // plugins/dolt-archive/visibility_guard_test.sh's assert_guard calls.
-func TestRemotePushAllowed(t *testing.T) {
+func TestPushAllowed(t *testing.T) {
 	tests := []struct {
 		name       string
 		url        string
@@ -111,22 +111,22 @@ func TestRemotePushAllowed(t *testing.T) {
 				return tt.visibility, tt.lookupErr
 			}
 
-			allowed, reason := remotePushAllowed(context.Background(), tt.url)
+			allowed, reason := PushAllowed(context.Background(), tt.url)
 			if allowed != tt.wantAllow || reason != tt.wantReason {
-				t.Errorf("remotePushAllowed(%q) = (%v, %q), want (%v, %q)", tt.url, allowed, reason, tt.wantAllow, tt.wantReason)
+				t.Errorf("PushAllowed(%q) = (%v, %q), want (%v, %q)", tt.url, allowed, reason, tt.wantAllow, tt.wantReason)
 			}
 		})
 	}
 }
 
-// TestRemotePushAllowedHostPinning verifies the lookup is pinned to
+// TestPushAllowedHostPinning verifies the lookup is pinned to
 // github.com: a mismatched-host answer (simulating a GHES default host
 // reporting "private" while the real github.com answer is "public") must
 // not be trusted just because *some* answer came back "private" — the
 // production ghVisibilityLookup always passes --hostname github.com, so
 // this test documents that contract via the reason returned for whatever
 // the injected lookup actually reports.
-func TestRemotePushAllowedHostPinning(t *testing.T) {
+func TestPushAllowedHostPinning(t *testing.T) {
 	origLookPath, origLookup := ghLookPath, ghVisibilityLookup
 	defer func() { ghLookPath, ghVisibilityLookup = origLookPath, origLookup }()
 
@@ -137,17 +137,17 @@ func TestRemotePushAllowedHostPinning(t *testing.T) {
 		return "public", nil
 	}
 
-	allowed, reason := remotePushAllowed(context.Background(), "git+https://github.com/mismatch-owner/repo")
+	allowed, reason := PushAllowed(context.Background(), "git+https://github.com/mismatch-owner/repo")
 	if allowed || reason != "public" {
 		t.Errorf("remotePushAllowed = (%v, %q), want (false, \"public\")", allowed, reason)
 	}
 }
 
-// TestRemotePushAllowedDoltHubNeverConsultsGH verifies a DoltHub remote is
+// TestPushAllowedDoltHubNeverConsultsGH verifies a DoltHub remote is
 // refused before `gh` is ever looked up or called — the guard must not, for
 // example, treat a machine with no `gh` installed as "gh-unavailable" for a
 // DoltHub remote when the real reason is "this isn't GitHub".
-func TestRemotePushAllowedDoltHubNeverConsultsGH(t *testing.T) {
+func TestPushAllowedDoltHubNeverConsultsGH(t *testing.T) {
 	origLookPath, origLookup := ghLookPath, ghVisibilityLookup
 	defer func() { ghLookPath, ghVisibilityLookup = origLookPath, origLookup }()
 
@@ -157,7 +157,7 @@ func TestRemotePushAllowedDoltHubNeverConsultsGH(t *testing.T) {
 		return "", nil
 	}
 
-	allowed, reason := remotePushAllowed(context.Background(), "git+https://doltremoteapi.dolthub.com/priv-owner/repo")
+	allowed, reason := PushAllowed(context.Background(), "git+https://doltremoteapi.dolthub.com/priv-owner/repo")
 	if allowed || reason != "dolthub-unsupported" {
 		t.Errorf("remotePushAllowed = (%v, %q), want (false, \"dolthub-unsupported\")", allowed, reason)
 	}

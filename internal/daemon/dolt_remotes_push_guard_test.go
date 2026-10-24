@@ -60,15 +60,19 @@ exit 0
 	_ = origPath
 }
 
+// stubRemotePushAllowed fixes the destination verdict pushDatabase sees; the
+// verdict logic itself is covered in internal/remoteguard.
+func stubRemotePushAllowed(t *testing.T, allowed bool, reason string) {
+	t.Helper()
+	orig := remotePushAllowed
+	t.Cleanup(func() { remotePushAllowed = orig })
+	remotePushAllowed = func(context.Context, string) (bool, string) { return allowed, reason }
+}
+
 func TestPushDatabaseRefusesPublicRemote(t *testing.T) {
 	installFakeDolt(t, "git+https://github.com/pub-owner/repo")
 
-	origLookPath, origLookup := ghLookPath, ghVisibilityLookup
-	defer func() { ghLookPath, ghVisibilityLookup = origLookPath, origLookup }()
-	ghLookPath = func() error { return nil }
-	ghVisibilityLookup = func(ctx context.Context, ownerRepo string) (string, error) {
-		return "public", nil
-	}
+	stubRemotePushAllowed(t, false, "public")
 
 	dataDir := t.TempDir()
 	d := &Daemon{logger: log.New(io.Discard, "", 0)}
@@ -88,12 +92,7 @@ func TestPushDatabaseRefusesPublicRemote(t *testing.T) {
 func TestPushDatabaseAllowsPrivateRemote(t *testing.T) {
 	installFakeDolt(t, "git+https://github.com/priv-owner/repo")
 
-	origLookPath, origLookup := ghLookPath, ghVisibilityLookup
-	defer func() { ghLookPath, ghVisibilityLookup = origLookPath, origLookup }()
-	ghLookPath = func() error { return nil }
-	ghVisibilityLookup = func(ctx context.Context, ownerRepo string) (string, error) {
-		return "private", nil
-	}
+	stubRemotePushAllowed(t, true, "private")
 
 	dataDir := t.TempDir()
 	d := &Daemon{logger: log.New(io.Discard, "", 0)}
@@ -111,12 +110,7 @@ func TestPushDatabaseStillRefusesTestDatabaseName(t *testing.T) {
 	// adding the destination check above it.
 	installFakeDolt(t, "git+https://github.com/priv-owner/repo")
 
-	origLookPath, origLookup := ghLookPath, ghVisibilityLookup
-	defer func() { ghLookPath, ghVisibilityLookup = origLookPath, origLookup }()
-	ghLookPath = func() error { return nil }
-	ghVisibilityLookup = func(ctx context.Context, ownerRepo string) (string, error) {
-		return "private", nil
-	}
+	stubRemotePushAllowed(t, true, "private")
 
 	dataDir := t.TempDir()
 	d := &Daemon{logger: log.New(io.Discard, "", 0)}

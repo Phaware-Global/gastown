@@ -12,7 +12,64 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/remoteguard"
 )
+
+// remotePushAllowed is the destination check every Dolt push here must clear;
+// a variable so tests can stub the verdict (the check itself is tested in
+// internal/remoteguard).
+var remotePushAllowed = remoteguard.PushAllowed
+
+// refusePushTo returns a non-nil REFUSED error unless remoteURL is a GitHub
+// repo confirmed private. The databases hold the town's issues and mail, so
+// an unresolvable URL is refused like a public one.
+func refusePushTo(db, remote, remoteURL string) error {
+	if remoteURL == "" {
+		return fmt.Errorf("REFUSED: %s: could not resolve the URL of remote %q", db, remote)
+	}
+	if allowed, reason := remotePushAllowed(context.Background(), remoteURL); !allowed {
+		return fmt.Errorf("REFUSED: %s: remote %q is not a confirmed-private GitHub repo (%s)", db, remote, reason)
+	}
+	return nil
+}
+
+// remoteURLByName returns the URL of the named remote in a Dolt database
+// directory, or "" if it has no such remote.
+func remoteURLByName(dbDir, remote string) (string, error) {
+	cmd := exec.Command("dolt", "remote", "-v")
+	cmd.Dir = dbDir
+	setProcessGroup(cmd)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("dolt remote -v: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		parts := strings.Fields(line)
+		if len(parts) >= 2 && parts[0] == remote {
+			return parts[1], nil
+		}
+	}
+	return "", nil
+}
+
+// remoteURLByNameSQL is remoteURLByName through the running server.
+func remoteURLByNameSQL(townRoot, db, remote string) (string, error) {
+	config := DefaultConfig(townRoot)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	query := fmt.Sprintf("USE `%s`; SELECT url FROM dolt_remotes WHERE name = '%s'", db, remote)
+	cmd := buildDoltSQLCmd(ctx, config, "-r", "csv", "-q", query)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("querying remote %s for %s: %w (%s)", remote, db, err, strings.TrimSpace(string(output)))
+	}
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) < 2 {
+		return "", nil
+	}
+	return strings.TrimSpace(lines[1]), nil
+}
 
 // SyncOptions controls the behavior of SyncDatabases.
 type SyncOptions struct {
@@ -116,6 +173,14 @@ func CommitWorkingSet(dbDir string) error {
 // PushDatabase pushes a Dolt database directory to the specified remote's main branch.
 // If force is true, uses --force. Requires the Dolt server to be stopped (CLI mode).
 func PushDatabase(dbDir, remote string, force bool) error {
+	remoteURL, err := remoteURLByName(dbDir, remote)
+	if err != nil {
+		return fmt.Errorf("REFUSED: %s: %w", filepath.Base(dbDir), err)
+	}
+	if err := refusePushTo(filepath.Base(dbDir), remote, remoteURL); err != nil {
+		return err
+	}
+
 	args := []string{"push", remote, "main"}
 	if force {
 		args = append(args, "--force")
@@ -328,6 +393,15 @@ func PushDatabaseSQL(townRoot, db, remote string, force bool) error {
 	}
 	if !validSQLName(remote) {
 		return fmt.Errorf("invalid remote name %q: must match [a-zA-Z0-9_.-]+", remote)
+	}
+
+	// Judge the destination before anything is staged or committed.
+	remoteURL, err := remoteURLByNameSQL(townRoot, db, remote)
+	if err != nil {
+		return fmt.Errorf("REFUSED: %s: %w", db, err)
+	}
+	if err := refusePushTo(db, remote, remoteURL); err != nil {
+		return err
 	}
 
 	// Stage any unstaged changes
