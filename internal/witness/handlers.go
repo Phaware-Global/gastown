@@ -246,22 +246,20 @@ func HandlePolecatDoneFromBead(bd *BdCli, workDir, rigName, polecatName string, 
 		return result
 	}
 
-	// Push failed: branch never reached origin (gas-556). Report recovery needed.
+	// Push failed (gas-556): the flag only records that a push failed once. Check
+	// the worktree and origin before reporting recovery, so work that reached
+	// origin by another route is not reported as lost.
 	if payload.PushFailed {
-		result.Handled = true
-		result.Action = fmt.Sprintf("push-failed-recovery-needed for %s (branch=%s issue=%s) — branch not on origin, worktree may be at risk",
-			polecatName, payload.Branch, payload.IssueID)
-		townRoot, _ := workspace.Find(workDir)
-		if townRoot != "" {
-			mayorMsg := fmt.Sprintf("PUSH_FAILED: polecat=%s branch=%s issue=%s — branch not on origin, possible work loss",
-				polecatName, payload.Branch, payload.IssueID)
-			mayorSession := session.MayorSessionName()
-			t := tmux.NewTmux()
-			if running, err := t.HasSession(mayorSession); err == nil && running {
-				_ = t.NudgeSession(mayorSession, mayorMsg)
-			}
+		a := assessPushFailure(workDir, rigName, polecatName, payload.Branch)
+		if a.AtRisk {
+			result.Handled = true
+			result.Action = fmt.Sprintf("push-failed-recovery-needed for %s (branch=%s issue=%s) — %s",
+				polecatName, a.Branch, payload.IssueID, a.Reason)
+			notifyMayorPushFailed(workDir, polecatName, a.Branch, payload.IssueID, a.Reason)
+			return result
 		}
-		return result
+		payload.PushFailed = false
+		payload.Branch = a.deliveredBranch()
 	}
 
 	hasPendingMR := completionPayloadHasPendingMR(bd, workDir, rigName, payload)
@@ -2663,24 +2661,19 @@ func processDiscoveredCompletion(bd *BdCli, workDir, rigName string, payload *Po
 		return
 	}
 
-	// Push failed: branch never reached origin. Work is committed locally only.
-	// The polecat's worktree may be in /tmp and lost on reboot. Escalate so the
-	// witness agent can investigate and trigger recovery (gas-556).
+	// Push failed: the flag only records that a push failed once. Check the
+	// worktree and origin before escalating, so work that reached origin by
+	// another route is not reported as lost (gas-556).
 	if payload.PushFailed {
-		discovery.Action = fmt.Sprintf("push-failed-recovery-needed (branch=%s issue=%s) — branch not on origin, worktree may be at risk",
-			payload.Branch, payload.IssueID)
-		// Notify mayor so a new polecat can be dispatched if work is lost.
-		townRoot, _ := workspace.Find(workDir)
-		if townRoot != "" {
-			mayorMsg := fmt.Sprintf("PUSH_FAILED: polecat=%s branch=%s issue=%s — branch not on origin, possible work loss",
-				payload.PolecatName, payload.Branch, payload.IssueID)
-			mayorSession := session.MayorSessionName()
-			t := tmux.NewTmux()
-			if running, err := t.HasSession(mayorSession); err == nil && running {
-				_ = t.NudgeSession(mayorSession, mayorMsg)
-			}
+		a := assessPushFailure(workDir, rigName, payload.PolecatName, payload.Branch)
+		if a.AtRisk {
+			discovery.Action = fmt.Sprintf("push-failed-recovery-needed (branch=%s issue=%s) — %s",
+				a.Branch, payload.IssueID, a.Reason)
+			notifyMayorPushFailed(workDir, payload.PolecatName, a.Branch, payload.IssueID, a.Reason)
+			return
 		}
-		return
+		payload.PushFailed = false
+		payload.Branch = a.deliveredBranch()
 	}
 
 	hasMR := false
