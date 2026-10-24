@@ -23,6 +23,7 @@ func testScriptPlugin(t *testing.T, body, timeout string) *plugin.Plugin {
 	return &plugin.Plugin{
 		Name:         "test-script",
 		Path:         dir,
+		Location:     plugin.LocationTown,
 		HasRunScript: true,
 		Execution:    &plugin.Execution{Type: plugin.ExecTypeScript, Timeout: timeout},
 	}
@@ -33,7 +34,9 @@ func TestRunScriptPlugin_RunsRunShInPluginDir(t *testing.T) {
 	d.ctx = context.Background()
 	p := testScriptPlugin(t, "pwd -P > ran\n", "")
 
-	d.runScriptPlugin(p)
+	if failure := d.runScriptPlugin(p); failure != "" {
+		t.Fatalf("runScriptPlugin reported %q for a script that exits 0", failure)
+	}
 
 	got, err := os.ReadFile(filepath.Join(p.Path, "ran"))
 	if err != nil {
@@ -53,9 +56,41 @@ func TestRunScriptPlugin_TimeoutKillsTheScriptsChildren(t *testing.T) {
 	p := testScriptPlugin(t, "sleep 30 &\nwait\n", "1s")
 
 	start := time.Now()
-	d.runScriptPlugin(p)
+	failure := d.runScriptPlugin(p)
 	if elapsed := time.Since(start); elapsed > 8*time.Second {
-		t.Errorf("runScriptPlugin returned after %v; the 1s timeout should have killed the script and its children", elapsed)
+		t.Errorf("runScriptPlugin returned after %v; the 1s timeout should have stopped the script and its children", elapsed)
+	}
+	if !strings.HasPrefix(failure, "timed out after 1s") {
+		t.Errorf("runScriptPlugin reported %q, want a timeout", failure)
+	}
+}
+
+func TestRunScriptPlugin_ReportsANonZeroExitWithTheOutputTail(t *testing.T) {
+	d := testHandlerDaemon(t, t.TempDir())
+	d.ctx = context.Background()
+	p := testScriptPlugin(t, "echo build broke\nexit 3\n", "")
+
+	failure := d.runScriptPlugin(p)
+	if !strings.HasPrefix(failure, "failed: exit status 3") || !strings.Contains(failure, "build broke") {
+		t.Errorf("runScriptPlugin reported %q, want the exit status and the output tail", failure)
+	}
+}
+
+func TestRunsInDaemon_OnlyTownLevelScriptPlugins(t *testing.T) {
+	script := &plugin.Execution{Type: plugin.ExecTypeScript}
+	tests := []struct {
+		name string
+		p    plugin.Plugin
+		want bool
+	}{
+		{"town script", plugin.Plugin{Location: plugin.LocationTown, HasRunScript: true, Execution: script}, true},
+		{"rig script", plugin.Plugin{Location: plugin.LocationRig, HasRunScript: true, Execution: script}, false},
+		{"town agent", plugin.Plugin{Location: plugin.LocationTown, HasRunScript: true}, false},
+	}
+	for _, tc := range tests {
+		if got := runsInDaemon(&tc.p); got != tc.want {
+			t.Errorf("%s: runsInDaemon = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

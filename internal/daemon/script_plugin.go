@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -14,9 +16,22 @@ import (
 // usable timeout.
 const defaultScriptPluginTimeout = 10 * time.Minute
 
+// scriptPluginStopGrace is how long a timed-out or canceled script plugin
+// gets between SIGTERM and SIGKILL, so git and make can remove their lock
+// files. It must stay under shutdown's 30s wait for script plugins.
+const scriptPluginStopGrace = 15 * time.Second
+
 // scriptPluginOutputLines is how much of a run's output reaches the daemon
-// log. The script's own receipts and escalations carry the details.
+// log and a failure receipt.
 const scriptPluginOutputLines = 20
+
+// runsInDaemon reports whether the daemon runs p itself instead of
+// dispatching it to a dog. Only town-level plugins qualify: a rig's plugins/
+// directory comes from that rig's repo, and the daemon's session holds the
+// keychain and the daemon.env secrets.
+func runsInDaemon(p *plugin.Plugin) bool {
+	return p.IsScript() && p.Location == plugin.LocationTown
+}
 
 // startScriptPlugin runs an `[execution] type = "script"` plugin's run.sh in
 // the background, from the daemon's own process tree.
@@ -47,31 +62,75 @@ func (d *Daemon) startScriptPlugin(p *plugin.Plugin, recorder *plugin.Recorder) 
 	go func() {
 		defer d.scriptPluginWG.Done()
 		defer d.scriptPluginsRunning.Delete(p.Name)
-		d.runScriptPlugin(p)
+		if failure := d.runScriptPlugin(p); failure != "" {
+			d.reportScriptPluginFailure(p, recorder, failure)
+		}
 	}()
 }
 
-// runScriptPlugin runs p's run.sh to completion or timeout and logs the
-// outcome. Escalating a failure is the script's job, as it is when a dog runs
-// it: only the script knows which failures matter.
-func (d *Daemon) runScriptPlugin(p *plugin.Plugin) {
-	ctx, cancel := context.WithTimeout(d.ctx, scriptPluginTimeout(p))
+// runScriptPlugin runs p's run.sh to completion, timeout or daemon shutdown,
+// logs the outcome, and returns a description of the failure ("" on success).
+func (d *Daemon) runScriptPlugin(p *plugin.Plugin) string {
+	timeout := scriptPluginTimeout(p)
+	ctx, cancel := context.WithTimeout(d.ctx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bash", "run.sh")
 	cmd.Dir = p.Path
-	util.SetProcessGroup(cmd) // a timeout kills make and go too, not just bash
-	cmd.WaitDelay = 10 * time.Second
+	// A timeout or shutdown stops make and go too, not just bash, and gives
+	// them scriptPluginStopGrace to clean up first.
+	util.SetGracefulProcessGroup(cmd, scriptPluginStopGrace)
+	cmd.WaitDelay = scriptPluginStopGrace + 5*time.Second
 	out, err := cmd.CombinedOutput()
 
 	tail := lastLines(string(out), scriptPluginOutputLines)
+	var failure string
 	switch {
 	case ctx.Err() == context.DeadlineExceeded:
-		d.logger.Printf("Handler: script plugin %s timed out after %v:\n%s", p.Name, scriptPluginTimeout(p), tail)
+		failure = fmt.Sprintf("timed out after %v", timeout)
+	case ctx.Err() != nil:
+		failure = "stopped by daemon shutdown"
 	case err != nil:
-		d.logger.Printf("Handler: script plugin %s failed: %v:\n%s", p.Name, err, tail)
-	default:
+		failure = fmt.Sprintf("failed: %v", err)
+	}
+	if failure == "" {
 		d.logger.Printf("Handler: script plugin %s finished:\n%s", p.Name, tail)
+		return ""
+	}
+	d.logger.Printf("Handler: script plugin %s %s:\n%s", p.Name, failure, tail)
+	return failure + "\n\n" + tail
+}
+
+// reportScriptPluginFailure records a failure receipt for p and, when the
+// plugin asks for it, escalates. The script may have reported the failure
+// itself, but a killed or aborted script cannot, and the receipt recorded at
+// start says success.
+func (d *Daemon) reportScriptPluginFailure(p *plugin.Plugin, recorder *plugin.Recorder, failure string) {
+	if _, err := recorder.RecordRun(plugin.PluginRunRecord{
+		PluginName: p.Name,
+		Result:     plugin.ResultFailure,
+		Body:       failure,
+	}); err != nil {
+		d.logger.Printf("Handler: failed to record failure for plugin %s: %v", p.Name, err)
+	}
+
+	if p.Execution == nil || !p.Execution.NotifyOnFailure {
+		return
+	}
+	severity := p.Execution.Severity
+	if severity == "" {
+		severity = "medium"
+	}
+	summary, _, _ := strings.Cut(failure, "\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gt", "escalate", "-s", severity, //nolint:gosec // G204: plugin name and severity come from a town-level plugin.md
+		fmt.Sprintf("Plugin FAILED: %s", p.Name), "--reason", fmt.Sprintf("Script plugin %s %s (run by the daemon).", p.Name, summary))
+	cmd.Dir = d.config.TownRoot
+	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon")
+	util.SetDetachedProcessGroup(cmd)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		d.logger.Printf("Handler: escalation for plugin %s failed: %v (%s)", p.Name, err, strings.TrimSpace(string(output)))
 	}
 }
 

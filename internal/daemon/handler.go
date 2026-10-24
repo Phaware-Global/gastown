@@ -271,6 +271,9 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 		townSettings = nil
 	}
 
+	// Once no dog is free, agent plugins wait for the next tick, but script
+	// plugins still run: they need no dog.
+	noDogs := false
 	for _, p := range plugins {
 		// Never auto-dispatch manual-gate plugins — they require an explicit trigger.
 		if p.Gate != nil && p.Gate.Type == plugin.GateManual {
@@ -280,6 +283,11 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 
 		// Only dispatch plugins with cooldown gates.
 		if p.Gate == nil || p.Gate.Type != plugin.GateCooldown {
+			continue
+		}
+
+		runInDaemon := runsInDaemon(p)
+		if noDogs && !runInDaemon {
 			continue
 		}
 
@@ -296,7 +304,7 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 		}
 
 		// A script plugin needs no agent, so the daemon runs it itself.
-		if p.IsScript() {
+		if runInDaemon {
 			d.startScriptPlugin(p, recorder)
 			continue
 		}
@@ -310,8 +318,9 @@ func (d *Daemon) dispatchPlugins(mgr *dog.Manager, sm *dog.SessionManager, rigsC
 		// See gt-o24.
 		idleDog := findDispatchableDog(mgr, sm, d.logger)
 		if idleDog == nil {
-			d.logger.Printf("Handler: no dispatchable idle dogs available, deferring remaining plugins")
-			return
+			d.logger.Printf("Handler: no dispatchable idle dogs available, deferring remaining agent plugins")
+			noDogs = true
+			continue
 		}
 
 		// Assign work and start session.
