@@ -236,6 +236,7 @@ func TestEnsurePolecatWorkBranch_RejectsRefspecBase(t *testing.T) {
 		"dev elop",
 		"dev\telop",
 		"develop..main",
+		"@{-1}",
 	}
 	for _, base := range bases {
 		t.Run(base, func(t *testing.T) {
@@ -262,6 +263,16 @@ func TestValidatePolecatBaseBranch_AcceptsPlainNames(t *testing.T) {
 	for _, base := range []string{"main", "develop", "Develop", "feature/stack", "release-1.2", "user_x/topic", "a+b", "release+2026", "user@topic", "polecat/x/gt-abc@suffix"} {
 		if err := validatePolecatBaseBranch(base); err != nil {
 			t.Errorf("validatePolecatBaseBranch(%q) = %v, want nil", base, err)
+		}
+	}
+}
+
+// "@{-1}" and "@{u}" are revision syntax, not branch names, however the
+// process's cwd reflog resolves them.
+func TestValidatePolecatBaseBranch_RejectsReflogSyntax(t *testing.T) {
+	for _, base := range []string{"@{-1}", "@{u}", "dev@{upstream}", "main@{1}"} {
+		if err := validatePolecatBaseBranch(base); err == nil {
+			t.Errorf("validatePolecatBaseBranch(%q) = nil, want an error", base)
 		}
 	}
 }

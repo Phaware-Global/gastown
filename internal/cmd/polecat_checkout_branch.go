@@ -353,7 +353,9 @@ func validatePolecatBaseBranch(base string) error {
 		strings.ContainsAny(base, ":*?[\\^~") || strings.IndexFunc(base, unicode.IsSpace) >= 0 {
 		return fmt.Errorf("invalid base branch %q: want a plain branch name", base)
 	}
-	if err := exec.Command("git", "check-ref-format", "--branch", base).Run(); err != nil {
+	// Check the full refname, not --branch: --branch expands "@{-1}" against
+	// the reflog of gt's cwd and accepts it.
+	if err := exec.Command("git", "check-ref-format", "refs/heads/"+base).Run(); err != nil {
 		return fmt.Errorf("invalid base branch %q: not a valid branch name", base)
 	}
 	return nil
