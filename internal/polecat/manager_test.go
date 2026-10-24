@@ -895,7 +895,7 @@ func TestIsDoltConfigError(t *testing.T) {
 		{"server appears down", fmt.Errorf("server appears down"), true},
 		{"server down", fmt.Errorf("server down"), true},
 		{"server not running", fmt.Errorf("Dolt server is not running"), true},
-		{"server may not be running", fmt.Errorf("Dolt server may not be running"), true},
+		{"server may not be running", fmt.Errorf("Dolt server unreachable at 127.0.0.1:3307: dial tcp: i/o timeout\n\nThe Dolt server may not be running."), true},
 		{"configure custom types", fmt.Errorf("configure custom types in /path: exit 1"), true},
 		{"identity mismatch", fmt.Errorf("identity mismatch: local project_id != database project_id"), true},
 		{"Unknown database", fmt.Errorf("Unknown database 'gastown'"), true},
@@ -3756,5 +3756,43 @@ func TestRemoveWith_MissingWorktreeOnBareRepoHintRunsInTheBareRepo(t *testing.T)
 	out, runErr := exec.Command("sh", "-c", risk.RecoveryCommand()).CombinedOutput()
 	if runErr != nil || !strings.Contains(string(out), "stranded bare-repo work") {
 		t.Fatalf("recovery command %q must list the stranded commit: %v\n%s", risk.RecoveryCommand(), runErr, out)
+	}
+}
+
+// bd's dial errors other than "connection refused" (i/o timeout, no route to
+// host) carry no marker isDoltConfigError matches except bd's "The Dolt server
+// may not be running" diagnosis. The error must keep it after bd's `bd dolt
+// start` advice is rewritten, or the health check retries for ~2 minutes. gt
+// pins BEADS_DOLT_AUTO_START=0, so the auto-start-disabled wording is the one
+// bd actually prints.
+func TestIsDoltConfigError_NonRefusedBdDialError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a sh mock bd")
+	}
+	dial := "Error: failed to open database: Dolt server unreachable at 127.0.0.1:3307: dial tcp 127.0.0.1:3307: i/o timeout\n\n"
+	tests := []struct{ name, stderr string }{
+		{"auto-start disabled", dial + "Dolt server auto-start is disabled (dolt.auto-start: false).\nStart the server manually:\n  bd dolt start\n"},
+		{"auto-start enabled", dial + "The Dolt server may not be running. Try:\n  bd dolt start    # Start a local server\n  gt dolt start    # If using an orchestrator\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			binDir := t.TempDir()
+			script := "#!/bin/sh\ncat >&2 <<'EOF'\n" + tt.stderr + "EOF\nexit 1\n"
+			if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+				t.Fatalf("write mock bd: %v", err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			_, err := beads.New(t.TempDir()).Show("gt-abc")
+			if err == nil {
+				t.Fatal("Show succeeded against a failing mock bd")
+			}
+			if strings.Contains(err.Error(), "bd dolt start") {
+				t.Errorf("error still advises bd dolt start: %v", err)
+			}
+			if !isDoltConfigError(err) {
+				t.Errorf("isDoltConfigError(%v) = false, want true (would retry ~2 min instead of failing fast)", err)
+			}
+		})
 	}
 }
