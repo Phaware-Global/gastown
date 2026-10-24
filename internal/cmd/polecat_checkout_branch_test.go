@@ -238,6 +238,7 @@ func TestEnsurePolecatWorkBranch_RejectsRefspecBase(t *testing.T) {
 		"develop..main",
 		"@{-1}",
 		"HEAD",
+		"head",
 	}
 	for _, base := range bases {
 		t.Run(base, func(t *testing.T) {
@@ -245,16 +246,17 @@ func TestEnsurePolecatWorkBranch_RejectsRefspecBase(t *testing.T) {
 			gitRun(t, clone, "branch", "keep", "main")
 			keepBefore := revParse(t, clone, "refs/heads/keep")
 			originMainBefore := revParse(t, clone, "refs/remotes/origin/main")
-			if base == "HEAD" {
-				// With a remote branch named HEAD, a fetch of it would write
-				// through the origin/HEAD symref and move origin/main.
+			if base == "HEAD" || base == "head" {
+				// With a remote branch named HEAD (or head, on a
+				// case-insensitive disk), a fetch of it would write through
+				// the origin/HEAD symref and move origin/main.
 				// Made in the bare origin itself: a push would update the
 				// clone's tracking refs, and origin/HEAD with them.
 				origin, err := exec.Command("git", "-C", clone, "remote", "get-url", "origin").Output()
 				if err != nil {
 					t.Fatal(err)
 				}
-				gitRun(t, strings.TrimSpace(string(origin)), "update-ref", "refs/heads/HEAD", revParse(t, clone, "refs/remotes/origin/develop"))
+				gitRun(t, strings.TrimSpace(string(origin)), "update-ref", "refs/heads/"+base, revParse(t, clone, "refs/remotes/origin/develop"))
 			}
 
 			if _, err := ensurePolecatWorkBranch(clone, "nux", "gt-abc", base); err == nil {
