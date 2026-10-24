@@ -1,7 +1,7 @@
 +++
 name = "rebuild-gt"
 description = "Rebuild stale gt binary from gastown source"
-version = 4
+version = 5
 
 [gate]
 type = "cooldown"
@@ -12,6 +12,7 @@ labels = ["plugin:rebuild-gt", "rig:gastown", "category:maintenance"]
 digest = true
 
 [execution]
+type = "script"
 timeout = "5m"
 notify_on_failure = true
 severity = "medium"
@@ -55,8 +56,12 @@ grants. The key must allow `codesign` without a prompt (choose Always Allow on
 the first signed install), or an unattended rebuild blocks on the keychain
 dialog. See docs/INSTALLING.md.
 
-The Deacon evaluates the cooldown gate before dispatch. If the gate is closed,
-skip.
+The daemon runs `run.sh` itself (`type = "script"`) once the cooldown gate
+opens; no dog is dispatched. Signing needs the login session's keychain, and
+the daemon, as the town's launchd job, always has it. A dog's shell may not:
+an opencode dog's commands run inside the shared opencode service, and a
+service first started from an ssh login fails `codesign` with
+`errSecInternalComponent`.
 
 ## Run
 

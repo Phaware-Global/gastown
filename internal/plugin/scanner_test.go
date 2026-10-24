@@ -1018,3 +1018,21 @@ func TestShippedSweepPluginGate(t *testing.T) {
 		t.Fatalf("brief plugin gate = %+v, want cooldown with duration_setting=assistant_brief_interval", bp.Gate)
 	}
 }
+
+func TestIsScript(t *testing.T) {
+	tests := []struct {
+		name string
+		p    Plugin
+		want bool
+	}{
+		{"script with run.sh", Plugin{HasRunScript: true, Execution: &Execution{Type: ExecTypeScript}}, true},
+		{"script without run.sh", Plugin{Execution: &Execution{Type: ExecTypeScript}}, false},
+		{"agent with run.sh", Plugin{HasRunScript: true, Execution: &Execution{Type: ExecTypeAgent}}, false},
+		{"no execution section", Plugin{HasRunScript: true}, false},
+	}
+	for _, tc := range tests {
+		if got := tc.p.IsScript(); got != tc.want {
+			t.Errorf("%s: IsScript() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

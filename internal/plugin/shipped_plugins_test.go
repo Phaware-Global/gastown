@@ -31,6 +31,7 @@ type shippedPlugin struct {
 	name         string
 	dir          string
 	hasRunScript bool
+	execType     ExecutionType
 	body         string
 }
 
@@ -62,10 +63,15 @@ func loadShippedPlugins(t *testing.T) []shippedPlugin {
 			t.Fatalf("parsing %s/plugin.md: %v", dir, err)
 		}
 		info, statErr := os.Stat(filepath.Join(dir, "run.sh"))
+		var execType ExecutionType
+		if parsed.Execution != nil {
+			execType = parsed.Execution.Type
+		}
 		plugins = append(plugins, shippedPlugin{
 			name:         e.Name(),
 			dir:          dir,
 			hasRunScript: statErr == nil && !info.IsDir(),
+			execType:     execType,
 			body:         parsed.Instructions,
 		})
 	}
@@ -132,4 +138,31 @@ func TestShippedPlugins_RunScriptPluginsHaveNoInlineCopy(t *testing.T) {
 	if withScript < 2 {
 		t.Fatalf("expected at least 2 shipped plugins with run.sh, found %d", withScript)
 	}
+}
+
+// TestShippedPlugins_ScriptTypeHasRunScript: the daemon runs a script plugin's
+// run.sh itself. Without one, IsScript is false and the plugin quietly goes to
+// a dog as markdown instructions instead.
+func TestShippedPlugins_ScriptTypeHasRunScript(t *testing.T) {
+	for _, p := range loadShippedPlugins(t) {
+		if p.execType == ExecTypeScript && !p.hasRunScript {
+			t.Errorf("plugins/%s/plugin.md sets type = \"script\" but has no run.sh", p.name)
+		}
+	}
+}
+
+// TestShippedPlugins_RebuildGtRunsInDaemon pins rebuild-gt to the daemon: its
+// codesign step needs the login session's keychain, which a dog's shell may
+// not have.
+func TestShippedPlugins_RebuildGtRunsInDaemon(t *testing.T) {
+	for _, p := range loadShippedPlugins(t) {
+		if p.name != "rebuild-gt" {
+			continue
+		}
+		if p.execType != ExecTypeScript || !p.hasRunScript {
+			t.Errorf("rebuild-gt: execution type %q, run.sh %v; want script with run.sh", p.execType, p.hasRunScript)
+		}
+		return
+	}
+	t.Fatal("plugins/rebuild-gt not found")
 }
