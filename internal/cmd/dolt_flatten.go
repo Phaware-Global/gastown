@@ -221,8 +221,14 @@ func flattenGetRowCounts(db *sql.DB, dbName string) (map[string]int, error) {
 }
 
 // findNewestFile walks a directory and returns the most recent file mtime.
+// A symlinked root (the town's .dolt-backup points at .dolt-backup-local) is
+// resolved first: filepath.Walk does not descend into it and would report the
+// link's own mtime.
 func findNewestFile(dir string) time.Time {
 	var newest time.Time
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
 	_ = filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
