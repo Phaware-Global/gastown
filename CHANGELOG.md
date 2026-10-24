@@ -22,6 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   formula now calls instead of raw git. Whatever the strategy, a branch whose
   open PR has an approving review is never force-pushed.
 
+### Security
+
+- **`gt dolt sync` now refuses to push to a remote that is not a confirmed-private
+  GitHub repo.** The check the daemon's `dolt_remotes` patrol and the
+  `dolt-archive` plugin already applied (public, unknown, non-GitHub, DoltHub,
+  or an unreadable visibility all refuse) now also gates `PushDatabase` and
+  `PushDatabaseSQL`, and lives in one shared package, `internal/remoteguard`.
+  The tracked `.beads/config.yaml` no longer sets `sync.remote`, which bd turns
+  into a Dolt push remote for the town database; a test keeps it out.
+
 ## [1.2.1] - 2026-06-06
 
 ### Fixed

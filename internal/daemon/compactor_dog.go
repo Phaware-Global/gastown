@@ -3,8 +3,11 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +15,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/reaper"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // shortHash returns at most 8 characters of a hash for display.
@@ -153,64 +157,13 @@ func (d *Daemon) runCompactorDog() {
 	errors := 0
 
 	for _, dbName := range databases {
-		commitCount, err := d.compactorCountCommits(dbName)
-		if err != nil {
-			d.logger.Printf("compactor_dog: %s: error counting commits: %v", dbName, err)
-			errors++
-			continue
-		}
-
-		if commitCount < threshold {
-			d.logger.Printf("compactor_dog: %s: %d commits (below threshold %d), skipping",
-				dbName, commitCount, threshold)
-			skipped++
-			continue
-		}
-
-		d.logger.Printf("compactor_dog: %s: %d commits (threshold %d) — compacting (mode=%s)",
-			dbName, commitCount, threshold, mode)
-
-		// Pre-flight: fetch from remote and verify local ≥ remote before
-		// compacting. Flatten rewrites the commit graph, so force-push after
-		// compaction would overwrite any remote-only commits. Skip compaction
-		// if the remote has diverged.
-		diverged, fetchErr := d.compactorFetchAndVerify(dbName)
-		if fetchErr != nil {
-			d.logger.Printf("compactor_dog: %s: pre-flight fetch failed: %v (skipping)", dbName, fetchErr)
-			skipped++
-			continue
-		}
-		if diverged {
-			d.logger.Printf("compactor_dog: %s: remote has diverged — skipping compaction to avoid data loss", dbName)
-			skipped++
-			continue
-		}
-
-		var compactErr error
-		if mode == "surgical" {
-			keepRecent := compactorDogKeepRecent(d.patrolConfig)
-			compactErr = d.surgicalRebase(dbName, keepRecent)
-		} else {
-			compactErr = d.compactDatabase(dbName)
-		}
-		if compactErr != nil {
-			d.logger.Printf("compactor_dog: %s: compaction FAILED: %v", dbName, compactErr)
-			d.escalate("compactor_dog", fmt.Sprintf("Compaction failed for %s: %v", dbName, compactErr))
-			errors++
-		} else {
+		switch d.compactorProcessDatabase(dbName, threshold, mode) {
+		case compactorCompacted:
 			compacted++
-			// Run gc after successful compaction to reclaim unreferenced chunks.
-			// Order matters: rebase first (compactDatabase), gc second.
-			if err := d.compactorRunGC(dbName); err != nil {
-				d.logger.Printf("compactor_dog: %s: gc after compaction failed: %v", dbName, err)
-			}
-			// Force-push to DoltHub remote after compaction. Flatten rewrites
-			// the commit graph, so standard push always fails with non-fast-forward.
-			// Safe because compactorFetchAndVerify confirmed local ≥ remote
-			// before compaction, and compactDatabase verified integrity.
-			if err := d.compactorForcePush(dbName); err != nil {
-				d.logger.Printf("compactor_dog: %s: force-push failed: %v", dbName, err)
-			}
+		case compactorSkipped:
+			skipped++
+		case compactorErrored:
+			errors++
 		}
 	}
 
@@ -243,6 +196,128 @@ func (d *Daemon) compactorDatabases() []string {
 		}
 	}
 	return reaper.DefaultDatabases
+}
+
+// compactorOutcome is what one compaction cycle did with one database.
+type compactorOutcome int
+
+const (
+	compactorCompacted compactorOutcome = iota
+	compactorSkipped
+	compactorErrored
+)
+
+// compactorProcessDatabase runs one cycle for one database: threshold check,
+// pre-flight against the remote, compaction, gc, push.
+//
+// INVARIANT: a database with a configured Dolt remote is never flattened in a
+// cycle that cannot push to it. Flatten rewrites the commit graph, so a remote
+// we could not push afterwards keeps an old HEAD that is no longer in local
+// history; the next cycle that can reach it would read the database as
+// diverged and skip it for good. So if the remote exists but the push guard
+// refuses it for ANY reason (public, unknown, non-GitHub, DoltHub, unreadable
+// URL, a failed or unavailable visibility lookup), the database is skipped for
+// the cycle (no fetch, no flatten, no push) and escalated once per db and
+// reason. A database with NO remote compacts locally. There is deliberately no
+// per-reason branching. plugins/compactor-dog/run.sh enforces the same rule.
+func (d *Daemon) compactorProcessDatabase(dbName string, threshold int, mode string) compactorOutcome {
+	commitCount, err := d.compactorCountCommits(dbName)
+	if err != nil {
+		d.logger.Printf("compactor_dog: %s: error counting commits: %v", dbName, err)
+		return compactorErrored
+	}
+
+	if commitCount < threshold {
+		d.logger.Printf("compactor_dog: %s: %d commits (below threshold %d), skipping",
+			dbName, commitCount, threshold)
+		return compactorSkipped
+	}
+
+	d.logger.Printf("compactor_dog: %s: %d commits (threshold %d) — compacting (mode=%s)",
+		dbName, commitCount, threshold, mode)
+
+	// Pre-flight: decide the push target once (remote, URL, guard verdict),
+	// then fetch from it and verify local ≥ remote before compacting.
+	// Flatten rewrites the commit graph, so force-push after compaction
+	// would overwrite any remote-only commits; skip compaction if the
+	// remote has diverged.
+	target, skip, fetchErr := d.compactorPreflightDB(dbName)
+	if fetchErr != nil {
+		d.logger.Printf("compactor_dog: %s: pre-flight fetch failed: %v (skipping)", dbName, fetchErr)
+		return compactorSkipped
+	}
+	switch skip {
+	case compactorSkipPushRefused:
+		logLine, title, reason := compactorRefusalText(dbName, target)
+		d.logger.Print(logLine)
+		compactorEscalate(d, "compactor-dog:push-refused:"+dbName+":"+target.refusal, title, reason)
+		return compactorSkipped
+	case compactorSkipDiverged:
+		d.logger.Printf("compactor_dog: %s: remote has diverged — skipping compaction to avoid data loss", dbName)
+		return compactorSkipped
+	}
+
+	var compactErr error
+	if mode == "surgical" {
+		keepRecent := compactorDogKeepRecent(d.patrolConfig)
+		compactErr = d.surgicalRebase(dbName, keepRecent)
+	} else {
+		compactErr = d.compactDatabase(dbName)
+	}
+	if compactErr != nil {
+		d.logger.Printf("compactor_dog: %s: compaction FAILED: %v", dbName, compactErr)
+		d.escalate("compactor_dog", fmt.Sprintf("Compaction failed for %s: %v", dbName, compactErr))
+		return compactorErrored
+	}
+
+	// Run gc after successful compaction to reclaim unreferenced chunks.
+	// Order matters: rebase first (compactDatabase), gc second.
+	if err := d.compactorRunGC(dbName); err != nil {
+		d.logger.Printf("compactor_dog: %s: gc after compaction failed: %v", dbName, err)
+	}
+	// Force-push to the remote after compaction, but only to the push
+	// target decided in the pre-flight. Flatten rewrites the commit
+	// graph, so standard push always fails with non-fast-forward.
+	// Safe because the pre-flight confirmed local ≥ remote before
+	// compaction, and compactDatabase verified integrity.
+	if target.usable() {
+		if err := d.compactorForcePush(dbName, target); err != nil {
+			d.logger.Printf("compactor_dog: %s: force-push failed: %v", dbName, err)
+		}
+	}
+	return compactorCompacted
+}
+
+// compactorRefusalText words the skip of a database whose push target was
+// refused. A failed remote-name read leaves the remote's name unknown, so it
+// says the configuration could not be read instead of presenting the lookup
+// failure as the guard refusing a remote called "".
+func compactorRefusalText(dbName string, target compactorPushTarget) (logLine, title, reason string) {
+	if target.remote == "" {
+		return fmt.Sprintf("compactor_dog: %s: could not read the Dolt remote configuration (%s) — skipping compaction this cycle (no fetch, no flatten, no push)", dbName, target.refusal),
+			fmt.Sprintf("compactor_dog: skipped %s — could not read its Dolt remote configuration (%s)", dbName, target.refusal),
+			fmt.Sprintf("compactor-dog could not read the Dolt remote configuration of %s (%s), so it cannot tell whether a push is possible and skipped compaction: flattening a database whose remote it cannot push would leave that remote diverged. Check that the Dolt server is healthy; the skip repeats until the read succeeds.", dbName, target.refusal)
+	}
+	return fmt.Sprintf("compactor_dog: %s: REFUSED: remote %q cannot be pushed (%s) — skipping compaction this cycle (no fetch, no flatten, no push)", dbName, target.remote, target.refusal),
+		fmt.Sprintf("compactor_dog: skipped %s — its Dolt remote cannot be pushed (%s)", dbName, target.refusal),
+		fmt.Sprintf("%s has a Dolt remote %q that the push visibility guard refused (%s), so compaction was skipped: flattening without being able to push would leave the remote diverged. Make the remote a private GitHub repo or remove it, or fix the guard environment (gh).", dbName, target.remote, target.refusal)
+}
+
+// compactorEscalate raises a deduplicated escalation: gt escalate suppresses a
+// repeat while one with the same fingerprint is still open. A variable so
+// tests can capture escalations instead of running gt.
+var compactorEscalate = func(d *Daemon, fingerprint, title, reason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "gt", "escalate", title, "-s", "MEDIUM",
+		"--fingerprint", fingerprint, "--reason", reason)
+	cmd.Dir = d.config.TownRoot
+	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon")
+	util.SetDetachedProcessGroup(cmd)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		d.logger.Printf("compactor_dog: escalation failed: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
 }
 
 // compactorCountCommits counts the number of commits in the database's dolt_log.
@@ -599,11 +674,15 @@ func (d *Daemon) compactorCleanup(db *sql.DB, dbName string) {
 	_, _ = db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_BRANCH('-D', '%s')", compactorBranchName))
 }
 
+// compactorOpenDriver is the database/sql driver compactorOpenDB uses; a
+// variable so tests can substitute a fake server.
+var compactorOpenDriver = "mysql"
+
 // compactorOpenDB opens a connection to the Dolt server for the given database.
 func (d *Daemon) compactorOpenDB(dbName string) (*sql.DB, error) {
 	dsn := fmt.Sprintf("root@tcp(%s:%d)/%s?parseTime=true&timeout=5s&readTimeout=30s&writeTimeout=30s",
 		"127.0.0.1", d.doltServerPort(), dbName)
-	return sql.Open("mysql", dsn)
+	return sql.Open(compactorOpenDriver, dsn)
 }
 
 // compactorGetHead returns the current HEAD commit hash of the main branch.
@@ -700,26 +779,116 @@ func (d *Daemon) compactorRunGC(dbName string) error {
 	return nil
 }
 
-// compactorFetchAndVerify fetches from the remote and checks that the local
-// history contains the remote HEAD. Returns (diverged=true, nil) if the remote
-// has commits not in local history — compaction must be skipped to avoid data
-// loss on force-push. Returns (false, nil) if local ≥ remote or no remote.
-// Mirrors the shell script's pre-flight check (run.sh lines 263-300).
-func (d *Daemon) compactorFetchAndVerify(dbName string) (diverged bool, err error) {
-	db, err := d.compactorOpenDB(dbName)
-	if err != nil {
-		return false, err
-	}
-	defer db.Close()
+// compactorPushTarget is a database's push destination, decided once per
+// cycle by compactorResolvePushTarget before anything touches the remote.
+// The zero value means "no remote". A remote the guard refused keeps its name
+// and URL (for the log) and carries the refusal reason; it is not usable, so
+// it is never fetched, diverged-checked or pushed.
+type compactorPushTarget struct {
+	remote  string
+	url     string
+	refusal string // "" = not refused; otherwise the guard's reason
+}
 
+// usable reports whether the remote may be fetched from and pushed to.
+func (t compactorPushTarget) usable() bool { return t.remote != "" && t.refusal == "" }
+
+// compactorResolvePushTarget decides the push target for a database: its
+// remote name, URL and the remoteguard verdict, in one place. The database
+// holds issues and mail, so only a confirmed-private GitHub repo is a target;
+// an unreadable URL is refused like a public one. A database with no remote
+// (or a failed remote lookup) has no target and nothing to refuse.
+func (d *Daemon) compactorResolvePushTarget(db *sql.DB) compactorPushTarget {
 	ctx, cancel := context.WithTimeout(context.Background(), compactorQueryTimeout)
 	defer cancel()
 
-	// Discover remote.
+	// Every read here tells "failed" from "empty". Only a successful lookup
+	// that finds no remote means "no remote"; a failed lookup leaves the
+	// destination unknown, which is a refusal, not an absence.
 	var remoteName string
 	if err := db.QueryRowContext(ctx, "SELECT name FROM dolt_remotes LIMIT 1").Scan(&remoteName); err != nil {
-		return false, nil // No remote — nothing to verify
+		if errors.Is(err, sql.ErrNoRows) {
+			return compactorPushTarget{}
+		}
+		return compactorPushTarget{refusal: "remote-lookup-failed"}
 	}
+	if remoteName == "" {
+		return compactorPushTarget{}
+	}
+
+	var remoteURL string
+	if err := db.QueryRowContext(ctx, "SELECT url FROM dolt_remotes WHERE name = ?", remoteName).Scan(&remoteURL); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return compactorPushTarget{remote: remoteName, refusal: "url-unresolvable"}
+		}
+		return compactorPushTarget{remote: remoteName, refusal: "remote-lookup-failed"}
+	}
+	if remoteURL == "" {
+		return compactorPushTarget{remote: remoteName, refusal: "url-unresolvable"}
+	}
+	if allowed, reason := remotePushAllowed(ctx, remoteURL); !allowed {
+		return compactorPushTarget{remote: remoteName, url: remoteURL, refusal: reason}
+	}
+	return compactorPushTarget{remote: remoteName, url: remoteURL}
+}
+
+// compactorPreflightDB is compactorPreflight on a fresh connection.
+func (d *Daemon) compactorPreflightDB(dbName string) (compactorPushTarget, compactorSkip, error) {
+	db, err := d.compactorOpenDB(dbName)
+	if err != nil {
+		return compactorPushTarget{}, "", err
+	}
+	defer db.Close()
+	return d.compactorPreflight(db, dbName)
+}
+
+// compactorSkip says why a database is not compacted this cycle; "" = go ahead.
+type compactorSkip string
+
+const (
+	// compactorSkipPushRefused: the database has a remote the guard refused.
+	compactorSkipPushRefused compactorSkip = "push-refused"
+	// compactorSkipDiverged: the (allowed) remote has commits local lacks.
+	compactorSkipDiverged compactorSkip = "remote-diverged"
+)
+
+// compactorPreflight resolves the database's push target, then — only for a
+// usable target — fetches it and checks that the local history contains the
+// remote HEAD. A refused remote is never fetched and skips the database
+// (compactorSkipPushRefused); a remote with commits local lacks skips it too
+// (compactorSkipDiverged). The returned target is what the cycle's force-push
+// must use.
+func (d *Daemon) compactorPreflight(db *sql.DB, dbName string) (target compactorPushTarget, skip compactorSkip, err error) {
+	target = d.compactorResolvePushTarget(db)
+	if target.refusal != "" {
+		return target, compactorSkipPushRefused, nil
+	}
+	if !target.usable() {
+		return target, "", nil // No remote — compacts locally
+	}
+	diverged, err := d.compactorFetchAndVerify(db, dbName, target)
+	if err != nil {
+		return target, "", err
+	}
+	if diverged {
+		return target, compactorSkipDiverged, nil
+	}
+	return target, "", nil
+}
+
+// compactorFetchAndVerify fetches the push target and checks that the local
+// history contains the remote HEAD. Returns (diverged=true, nil) if the remote
+// has commits not in local history — compaction must be skipped to avoid data
+// loss on force-push. Returns (false, nil) if local ≥ remote.
+// Mirrors the shell script's pre-flight check (run.sh).
+func (d *Daemon) compactorFetchAndVerify(db *sql.DB, dbName string, target compactorPushTarget) (diverged bool, err error) {
+	if !target.usable() {
+		return false, fmt.Errorf("refusing to fetch %q for %s: not a usable push target", target.remote, dbName)
+	}
+	remoteName := target.remote
+
+	ctx, cancel := context.WithTimeout(context.Background(), compactorQueryTimeout)
+	defer cancel()
 
 	// Fetch from remote.
 	fetchCtx, fetchCancel := context.WithTimeout(context.Background(), compactorPushTimeout)
@@ -728,14 +897,19 @@ func (d *Daemon) compactorFetchAndVerify(dbName string) (diverged bool, err erro
 		return false, fmt.Errorf("DOLT_FETCH %s: %w", remoteName, err)
 	}
 
-	// Get remote HEAD.
+	// Get remote HEAD. Dolt's dolt_remote_branches has columns (name, hash,
+	// ...) and names a tracking ref "remotes/<remote>/<branch>".
 	var remoteHead string
-	remoteRef := remoteName + "/main"
+	remoteRef := "remotes/" + remoteName + "/main"
 	err = db.QueryRowContext(ctx,
-		"SELECT commit_hash FROM dolt_remote_branches WHERE name = ?", remoteRef,
+		"SELECT hash FROM dolt_remote_branches WHERE name = ?", remoteRef,
 	).Scan(&remoteHead)
 	if err != nil {
-		return false, nil // Remote ref not found — skip check
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil // Remote has no main branch yet — nothing to diverge from
+		}
+		// The check could not be made: do not treat that as "no divergence".
+		return false, fmt.Errorf("remote branch lookup %s: %w", remoteRef, err)
 	}
 
 	// Check if remote HEAD is an ancestor of local history.
@@ -755,36 +929,41 @@ func (d *Daemon) compactorFetchAndVerify(dbName string) (diverged bool, err erro
 	return false, nil
 }
 
-// compactorForcePush pushes the compacted database to its DoltHub remote.
+// compactorForcePush pushes the compacted database to its push target.
 // Flatten rewrites the commit graph, so a force-push is required — standard
 // push always fails with non-fast-forward. This mirrors the shell script's
-// DOLT_PUSH('--force', remote) at line 397 of plugins/compactor-dog/run.sh.
-// Non-fatal: remote may not be configured, and push failures don't affect
-// local data integrity.
-func (d *Daemon) compactorForcePush(dbName string) error {
+// DOLT_PUSH('--force', '--set-upstream', remote, 'main') in
+// plugins/compactor-dog/run.sh: flatten loses the branch's tracking metadata,
+// so without --set-upstream and an explicit branch Dolt refuses the push ("The
+// current branch main has no upstream branch").
+// Non-fatal: push failures don't affect local data integrity.
+func (d *Daemon) compactorForcePush(dbName string, target compactorPushTarget) error {
 	db, err := d.compactorOpenDB(dbName)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
+	return d.compactorForcePushDB(db, dbName, target)
+}
 
-	// Discover the remote name (if any).
-	ctx, cancel := context.WithTimeout(context.Background(), compactorQueryTimeout)
-	defer cancel()
-
-	var remoteName string
-	err = db.QueryRowContext(ctx, "SELECT name FROM dolt_remotes LIMIT 1").Scan(&remoteName)
-	if err != nil || remoteName == "" {
+// compactorForcePushDB is compactorForcePush on an open connection. It pushes
+// only to a usable target; no remote is a quiet no-op, and a refused target is
+// an error, so a caller that skipped the pre-flight cannot push anyway.
+func (d *Daemon) compactorForcePushDB(db *sql.DB, dbName string, target compactorPushTarget) error {
+	if !target.usable() && target.refusal == "" {
 		return nil // No remote configured — skip silently
 	}
+	if !target.usable() {
+		return fmt.Errorf("REFUSED: %q: remote %q is not a confirmed-private GitHub repo (%s)", dbName, target.remote, target.refusal)
+	}
+	remoteName := target.remote
 
 	// Force-push to remote.
 	pushCtx, pushCancel := context.WithTimeout(context.Background(), compactorPushTimeout)
 	defer pushCancel()
 
 	start := time.Now()
-	_, err = db.ExecContext(pushCtx, "CALL DOLT_PUSH('--force', ?)", remoteName)
-	if err != nil {
+	if _, err := db.ExecContext(pushCtx, "CALL DOLT_PUSH('--force', '--set-upstream', ?, 'main')", remoteName); err != nil {
 		return fmt.Errorf("DOLT_PUSH --force to %s: %w", remoteName, err)
 	}
 
