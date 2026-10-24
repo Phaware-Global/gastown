@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -1158,9 +1160,7 @@ func sendCloseNotification(addr, convoyID, title, reason string) {
 	subject := fmt.Sprintf("🚚 Convoy closed: %s", title)
 	body := fmt.Sprintf("Convoy %s has been closed.\n\nReason: %s", convoyID, reason)
 
-	mailArgs := []string{"mail", "send", addr, "-s", subject, "-m", body}
-	mailCmd := exec.Command("gt", mailArgs...)
-	if err := mailCmd.Run(); err != nil {
+	if err := convoyGT("mail", "send", addr, "-s", subject, "-m", body); err != nil {
 		style.PrintWarning("couldn't send notification: %v", err)
 	} else {
 		fmt.Printf("  Notified: %s\n", addr)
@@ -1700,6 +1700,20 @@ func checkAndCloseCompletedConvoys(townBeads string, dryRun bool) ([]struct{ ID,
 	return closed, nil
 }
 
+// errConvoyGTRefusedUnderTest is what convoyGT returns inside a test binary.
+var errConvoyGTRefusedUnderTest = errors.New("convoy notification refused under test binary: inject convoyGT instead of running gt from PATH")
+
+// convoyGT runs `gt <args>` for convoy mail and nudges. Inside a test binary
+// it refuses: the gt on PATH is the live town's, and a convoy-close fixture
+// running it mails the real Mayor (gt-yjput). Tests that assert on
+// notifications replace it with a recording fake.
+var convoyGT = func(args ...string) error {
+	if testing.Testing() {
+		return errConvoyGTRefusedUnderTest
+	}
+	return exec.Command("gt", args...).Run()
+}
+
 // notifyConvoyCompletion sends notifications to owner, any notify addresses, and mayor/.
 func notifyConvoyCompletion(townBeads, convoyID, title string) {
 	stdout, err := runBdJSON(townBeads, "show", convoyID, "--json")
@@ -1758,11 +1772,9 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 
 	for _, addr := range fields.NotificationAddresses() {
 		notifiedAddrs[addr] = true
-		mailArgs := []string{"mail", "send", addr,
+		if err := convoyGT("mail", "send", addr,
 			"-s", fmt.Sprintf("🚚 Convoy landed: %s", title),
-			"-m", fmt.Sprintf("Convoy %s has completed.\n\nAll tracked issues are now closed.", convoyID)}
-		mailCmd := exec.Command("gt", mailArgs...)
-		if err := mailCmd.Run(); err != nil {
+			"-m", fmt.Sprintf("Convoy %s has completed.\n\nAll tracked issues are now closed.", convoyID)); err != nil {
 			style.PrintWarning("could not notify %s: %v", addr, err)
 		}
 	}
@@ -1770,19 +1782,16 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 	// Send nudge notifications to nudge watchers.
 	for _, addr := range fields.NudgeNotificationAddresses() {
 		nudgeMsg := fmt.Sprintf("🚚 Convoy landed: %s — Convoy %s has completed. All tracked issues are now closed.", title, convoyID)
-		nudgeCmd := exec.Command("gt", "nudge", addr, "-m", nudgeMsg)
-		if err := nudgeCmd.Run(); err != nil {
+		if err := convoyGT("nudge", addr, "-m", nudgeMsg); err != nil {
 			style.PrintWarning("could not nudge %s: %v", addr, err)
 		}
 	}
 
 	// Always notify mayor/ for strategic visibility, unless already notified above.
 	if !notifiedAddrs["mayor/"] {
-		mailArgs := []string{"mail", "send", "mayor/",
+		if err := convoyGT("mail", "send", "mayor/",
 			"-s", fmt.Sprintf("Convoy complete: %s", title),
-			"-m", mayorBody}
-		mailCmd := exec.Command("gt", mailArgs...)
-		if err := mailCmd.Run(); err != nil {
+			"-m", mayorBody); err != nil {
 			style.PrintWarning("could not notify mayor/ of convoy completion: %v", err)
 		}
 	}
@@ -1804,8 +1813,7 @@ func notifyMayorSession(townBeads, convoyID, title string) {
 	}
 
 	nudgeMsg := fmt.Sprintf("🚚 Convoy landed: %s — Convoy %s has completed. All tracked issues are now closed.", title, convoyID)
-	nudgeCmd := exec.Command("gt", "nudge", "mayor", "-m", nudgeMsg)
-	if err := nudgeCmd.Run(); err != nil {
+	if err := convoyGT("nudge", "mayor", "-m", nudgeMsg); err != nil {
 		style.PrintWarning("could not nudge Mayor session: %v", err)
 	}
 }
