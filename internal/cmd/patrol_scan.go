@@ -16,10 +16,11 @@ import (
 )
 
 var (
-	patrolScanJSON    bool
-	patrolScanNotify  bool
-	patrolScanRig     string
-	patrolScanVerbose bool
+	patrolScanJSON      bool
+	patrolScanNotify    bool
+	patrolScanRig       string
+	patrolScanVerbose   bool
+	patrolScanNoRestart bool
 )
 
 var patrolScanCmd = &cobra.Command{
@@ -38,8 +39,15 @@ Detections:
 
 Actions taken automatically:
   - Zombie restart: Sessions are restarted (not nuked) to preserve worktrees
+    (suppressed by --no-restart)
   - Cleanup wisps: Created for dirty state tracking
   - Completion routing: MR cleanup wisps created, refinery nudged
+
+Use --no-restart to enforce a detect-and-flag-only hold: zombies are still
+detected and reported, but no session is restarted, no already-merged polecat
+is archived, and no convoy failure is recorded. Hold notifications require
+--notify and contain no recovery instructions. Stall and completion handling
+are unchanged.
 
 Use --notify to send mail when zombies with active work are detected.
 Long-running scan phases emit progress diagnostics to stderr so JSON stdout
@@ -49,13 +57,15 @@ Examples:
   gt patrol scan                    # Scan current rig
   gt patrol scan --rig gastown      # Scan specific rig
   gt patrol scan --json             # Machine-readable output
-  gt patrol scan --notify           # Send mail on zombie detection`,
+  gt patrol scan --notify           # Send mail on zombie detection
+  gt patrol scan --no-restart       # Detect and report only; never restart`,
 	RunE: runPatrolScan,
 }
 
 func init() {
 	patrolScanCmd.Flags().BoolVar(&patrolScanJSON, "json", false, "Output as JSON")
 	patrolScanCmd.Flags().BoolVar(&patrolScanNotify, "notify", false, "Send mail to witness/mayor when active-work zombies are detected")
+	patrolScanCmd.Flags().BoolVar(&patrolScanNoRestart, "no-restart", false, "Detect and report zombies but never restart their sessions (for detect-only holds)")
 	patrolScanCmd.Flags().StringVar(&patrolScanRig, "rig", "", "Rig to scan (default: infer from cwd or GT_RIG)")
 	patrolScanCmd.Flags().BoolVarP(&patrolScanVerbose, "verbose", "v", false, "Verbose output")
 
@@ -159,7 +169,7 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	// are sent exclusively below via --notify, avoiding double-send.
 	diagnostics := cmd.ErrOrStderr()
 	zombieResult := runPatrolScanPhase(diagnostics, "zombie detection", func() *witness.DetectZombiePolecatsResult {
-		return witness.DetectZombiePolecats(bd, workDir, rigName, router)
+		return witness.DetectZombiePolecatsWithOptions(bd, workDir, rigName, router, witness.DetectZombieOptions{NoRestart: patrolScanNoRestart})
 	})
 	stallResult := runPatrolScanPhase(diagnostics, "stall detection", func() *witness.DetectStalledPolecatsResult {
 		return witness.DetectStalledPolecats(workDir, rigName)
@@ -171,14 +181,12 @@ func runPatrolScan(cmd *cobra.Command, args []string) error {
 	// Build patrol receipts for zombies
 	receipts := witness.BuildPatrolReceipts(rigName, zombieResult)
 
-	// Notify when zombies with active work are detected.
-	// Always notify the mayor for active-work zombies (dead polecats with hooked
-	// beads) — this is the primary mechanism for detecting failed work. (GH #3584)
-	// Use --notify=false to suppress (e.g., in dry-run/testing contexts).
-	if zombieResult != nil {
+	// Normal recovery always reports active-work zombies. During a hold the
+	// same zombie may persist across scans, so repeated mail requires opt-in.
+	if zombieResult != nil && (!patrolScanNoRestart || patrolScanNotify) {
 		activeZombies := countActiveWorkZombies(zombieResult)
 		if activeZombies > 0 {
-			sendZombieNotification(router, rigName, zombieResult, activeZombies)
+			sendZombieNotification(router, rigName, zombieResult, activeZombies, patrolScanNoRestart)
 		}
 	}
 
@@ -243,7 +251,7 @@ func countActiveWorkZombies(result *witness.DetectZombiePolecatsResult) int {
 	return count
 }
 
-func sendZombieNotification(router *mail.Router, rigName string, result *witness.DetectZombiePolecatsResult, activeCount int) {
+func sendZombieNotification(router interface{ Send(*mail.Message) error }, rigName string, result *witness.DetectZombiePolecatsResult, activeCount int, noRestart bool) {
 	var lines []string
 	lines = append(lines, fmt.Sprintf("Patrol scan detected %d zombie(s) with active work in rig %s:", activeCount, rigName))
 	lines = append(lines, "")
@@ -261,6 +269,10 @@ func sendZombieNotification(router *mail.Router, rigName string, result *witness
 
 	body := strings.Join(lines, "\n")
 	subject := fmt.Sprintf("ZOMBIE_DETECTED: %d active-work zombie(s) in %s", activeCount, rigName)
+	if noRestart {
+		subject = fmt.Sprintf("ZOMBIE_HELD: %d active-work zombie(s) in %s", activeCount, rigName)
+		body += "\n\nDetect-only hold: preserve existing sessions, worktrees, and issue ownership. Recovery requires lifting the hold."
+	}
 
 	// Send to witness (best-effort)
 	witMsg := &mail.Message{
@@ -276,10 +288,15 @@ func sendZombieNotification(router *mail.Router, rigName string, result *witness
 	mayorBody := strings.Join(lines, "\n") +
 		"\n\nResling instructions (for the mayor):\n" +
 		"  gt sling <bead-id> <rig> --create --force"
+	mayorSubject := fmt.Sprintf("POLECAT_DIED: %d polecat(s) died with active work in %s", activeCount, rigName)
+	if noRestart {
+		mayorBody = body
+		mayorSubject = subject
+	}
 	mayorMsg := &mail.Message{
 		From:    fmt.Sprintf("%s/witness", rigName),
 		To:      "assistant/",
-		Subject: fmt.Sprintf("POLECAT_DIED: %d polecat(s) died with active work in %s", activeCount, rigName),
+		Subject: mayorSubject,
 		Body:    mayorBody,
 	}
 	_ = router.Send(mayorMsg)
