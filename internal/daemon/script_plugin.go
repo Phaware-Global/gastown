@@ -62,15 +62,16 @@ func (d *Daemon) startScriptPlugin(p *plugin.Plugin, recorder *plugin.Recorder) 
 	go func() {
 		defer d.scriptPluginWG.Done()
 		defer d.scriptPluginsRunning.Delete(p.Name)
-		if failure := d.runScriptPlugin(p); failure != "" {
-			d.reportScriptPluginFailure(p, recorder, failure)
+		if failure, stopped := d.runScriptPlugin(p); failure != "" {
+			d.reportScriptPluginFailure(p, recorder, failure, !stopped)
 		}
 	}()
 }
 
 // runScriptPlugin runs p's run.sh to completion, timeout or daemon shutdown,
 // logs the outcome, and returns a description of the failure ("" on success).
-func (d *Daemon) runScriptPlugin(p *plugin.Plugin) string {
+// stopped is true when daemon shutdown ended the run.
+func (d *Daemon) runScriptPlugin(p *plugin.Plugin) (failure string, stopped bool) {
 	timeout := scriptPluginTimeout(p)
 	ctx, cancel := context.WithTimeout(d.ctx, timeout)
 	defer cancel()
@@ -84,28 +85,29 @@ func (d *Daemon) runScriptPlugin(p *plugin.Plugin) string {
 	out, err := cmd.CombinedOutput()
 
 	tail := lastLines(string(out), scriptPluginOutputLines)
-	var failure string
 	switch {
 	case ctx.Err() == context.DeadlineExceeded:
 		failure = fmt.Sprintf("timed out after %v", timeout)
 	case ctx.Err() != nil:
-		failure = "stopped by daemon shutdown"
+		failure, stopped = "stopped by daemon shutdown", true
 	case err != nil:
 		failure = fmt.Sprintf("failed: %v", err)
 	}
 	if failure == "" {
 		d.logger.Printf("Handler: script plugin %s finished:\n%s", p.Name, tail)
-		return ""
+		return "", false
 	}
 	d.logger.Printf("Handler: script plugin %s %s:\n%s", p.Name, failure, tail)
-	return failure + "\n\n" + tail
+	return failure + "\n\n" + tail, stopped
 }
 
 // reportScriptPluginFailure records a failure receipt for p and, when the
-// plugin asks for it, escalates. The script may have reported the failure
-// itself, but a killed or aborted script cannot, and the receipt recorded at
-// start says success.
-func (d *Daemon) reportScriptPluginFailure(p *plugin.Plugin, recorder *plugin.Recorder, failure string) {
+// plugin asks for it and escalate is set, escalates. The script may have
+// reported the failure itself, but a killed or aborted script cannot, and the
+// receipt recorded at start says success. A run cut short by daemon shutdown
+// is not escalated: the operator stopped it, and the escalation would race
+// the daemon's exit.
+func (d *Daemon) reportScriptPluginFailure(p *plugin.Plugin, recorder *plugin.Recorder, failure string, escalate bool) {
 	if _, err := recorder.RecordRun(plugin.PluginRunRecord{
 		PluginName: p.Name,
 		Result:     plugin.ResultFailure,
@@ -114,7 +116,7 @@ func (d *Daemon) reportScriptPluginFailure(p *plugin.Plugin, recorder *plugin.Re
 		d.logger.Printf("Handler: failed to record failure for plugin %s: %v", p.Name, err)
 	}
 
-	if p.Execution == nil || !p.Execution.NotifyOnFailure {
+	if !escalate || p.Execution == nil || !p.Execution.NotifyOnFailure {
 		return
 	}
 	severity := p.Execution.Severity
@@ -124,7 +126,10 @@ func (d *Daemon) reportScriptPluginFailure(p *plugin.Plugin, recorder *plugin.Re
 	summary, _, _ := strings.Cut(failure, "\n")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	// The fingerprint keeps a failure that repeats every cooldown to one open
+	// escalation until someone closes it.
 	cmd := exec.CommandContext(ctx, "gt", "escalate", "-s", severity, //nolint:gosec // G204: plugin name and severity come from a town-level plugin.md
+		"--source", "plugin:"+p.Name, "--fingerprint", "plugin-failure:"+p.Name,
 		fmt.Sprintf("Plugin FAILED: %s", p.Name), "--reason", fmt.Sprintf("Script plugin %s %s (run by the daemon).", p.Name, summary))
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon")
